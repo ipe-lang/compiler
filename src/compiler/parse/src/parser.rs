@@ -1410,7 +1410,12 @@ impl<'a> Parser<'a> {
             // tree downstream, so each operator must cost one depth level here or
             // the chain escapes `MAX_DEPTH` and overflows the recursive walkers
             // (and Drop) that traverse the canonical tree.
-            if depth.saturating_add(u32::try_from(ops.len()).unwrap_or(u32::MAX)) >= MAX_DEPTH {
+            let op_depth = depth.saturating_add(
+                u32::try_from(ops.len())
+                    .unwrap_or(u32::MAX)
+                    .saturating_add(1),
+            );
+            if op_depth > MAX_DEPTH {
                 return Err(self.too_deep(Construct::Expression));
             }
             let op_sym = self.intern(op.text())?;
@@ -2351,6 +2356,10 @@ impl<'a> Parser<'a> {
         // The caller has already peeked `if`.
         let if_tok = self.bump(Construct::If)?;
 
+        // Lowering folds the flat `else if` chain into right-nested `If`s, so
+        // each `else if` costs one depth level, as a nested `if` would; the
+        // arm's `parse_expr` refuses the one that crosses the ceiling.
+        let mut arm_depth = depth + 1;
         let mut branches = Vec::new();
         loop {
             // Reject an absent condition cleanly rather than letting the
@@ -2367,7 +2376,7 @@ impl<'a> Parser<'a> {
                 }
                 _ => {}
             }
-            let cond = self.parse_expr(threshold, depth + 1)?;
+            let cond = self.parse_expr(threshold, arm_depth)?;
 
             // `then` after the condition.
             match self.peek() {
@@ -2383,7 +2392,7 @@ impl<'a> Parser<'a> {
                 }
             }
 
-            let branch = self.parse_expr(threshold, depth + 1)?;
+            let branch = self.parse_expr(threshold, arm_depth)?;
             branches.push((cond, branch));
 
             // `else` after the `then` branch (mandatory — every `if` is an
@@ -2404,13 +2413,14 @@ impl<'a> Parser<'a> {
             // `else if` continues the chain with another `(cond, branch)` pair;
             // a plain `else` ends it with the final expression below.
             if self.peek_kind() == Some(&Tok::If) {
+                arm_depth = arm_depth.saturating_add(1);
                 self.bump(Construct::If)?;
                 continue;
             }
             break;
         }
 
-        let else_branch = self.parse_expr(threshold, depth + 1)?;
+        let else_branch = self.parse_expr(threshold, arm_depth)?;
         let span = Self::span_merge(if_tok.span, else_branch.span);
         Ok(Located::new(
             span,

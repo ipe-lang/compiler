@@ -366,8 +366,20 @@ fn assert_block_boundary(build: impl Fn(usize) -> Block, label: &str) -> usize {
     boundary
 }
 
+// The exact boundaries. A declaration body's block opens at depth 4 (the
+// body's expression, application, postfix and atom frames), so its statements
+// start at depth 5, and an operand atom sits four frames below the depth its
+// statement is charged at.
+
+/// Frames between a block's statement depth and its operand atom's depth.
+const STATEMENT_TO_ATOM: usize = 4;
+
+/// Depth a declaration body's block statements start at.
+const FIRST_STATEMENT_DEPTH: usize = 5;
+
 /// A `do` block of binds charges two levels per bind (the `Task.andThen` call
-/// and its continuation lambda), so the ceiling stops it within half the limit.
+/// and its continuation lambda): bind `k`'s operand sits at depth `9 + 2k`, so
+/// the first bind past the ceiling is the boundary.
 #[test]
 fn do_block_of_binds_is_refused_at_the_ceiling() {
     let build = |n: usize| {
@@ -379,26 +391,30 @@ fn do_block_of_binds_is_refused_at_the_ceiling() {
         )
     };
     let boundary = assert_block_boundary(build, "do binds");
-    assert!(
-        boundary <= ceiling() / 2,
-        "each bind charges two levels: refused at {boundary}, past half of {}",
-        ceiling()
+    let first_atom = FIRST_STATEMENT_DEPTH + STATEMENT_TO_ATOM;
+    assert_eq!(
+        boundary,
+        (ceiling() - first_atom) / 2 + 1,
+        "each bind charges two levels"
     );
 }
 
-/// A `do` block of bare runs charges one level per run.
+/// A `do` block of bare runs charges one level per run, and its final run one
+/// more: with `n` runs the final run's operand sits at depth `10 + n`.
 #[test]
 fn do_block_of_runs_is_refused_at_the_ceiling() {
     let build = |n: usize| block_module(n, "    do\n", |i| format!("        t{i}"), "        t\n");
     let boundary = assert_block_boundary(build, "do runs");
-    assert!(
-        boundary <= ceiling(),
-        "each run charges one level: refused at {boundary}, past {}",
-        ceiling()
+    let final_atom = FIRST_STATEMENT_DEPTH + STATEMENT_TO_ATOM + 1;
+    assert_eq!(
+        boundary,
+        ceiling() + 1 - final_atom,
+        "each run charges one level"
     );
 }
 
-/// A `let` block charges one level per binding.
+/// A `let` block charges one level per binding: binding `k`'s operand sits at
+/// depth `9 + k`, and the body below the last binding one level shallower.
 #[test]
 fn let_block_is_refused_at_the_ceiling() {
     let build = |n: usize| {
@@ -410,9 +426,57 @@ fn let_block_is_refused_at_the_ceiling() {
         )
     };
     let boundary = assert_block_boundary(build, "let bindings");
-    assert!(
-        boundary <= ceiling(),
-        "each binding charges one level: refused at {boundary}, past {}",
-        ceiling()
+    let first_atom = FIRST_STATEMENT_DEPTH + STATEMENT_TO_ATOM;
+    assert_eq!(
+        boundary,
+        ceiling() + 1 - first_atom,
+        "each binding charges one level"
+    );
+}
+
+/// An operator chain charges one level per operator from its expression's
+/// depth. A declaration body's expression is at depth 0, so the ceiling admits
+/// exactly that many operators and the next one is refused at that operator.
+#[test]
+fn operator_chain_is_refused_one_past_the_ceiling() {
+    let build = |n: usize| {
+        let mut src = String::from("module Main exposing (main)\n\nmain =\n    1");
+        let mut last = src.len();
+        for _ in 0..n {
+            last = src.len();
+            src.push_str(" + 1");
+        }
+        src.push('\n');
+        let offset = |at: usize| u32::try_from(at).unwrap_or(u32::MAX);
+        let tail = (offset(last), offset(src.len()));
+        (src, tail)
+    };
+    let boundary = assert_block_boundary(build, "operator chain");
+    assert_eq!(boundary, ceiling() + 1, "each operator charges one level");
+}
+
+/// An `else if` chain lowers to right-nested `If`s, so each `else if` charges
+/// one level: the `if` opens at depth 4 and its arms at 5, so the `k`-th
+/// `else if`'s condition atom sits at depth `8 + k`.
+#[test]
+fn else_if_chain_is_refused_at_the_ceiling() {
+    let build = |n: usize| {
+        let mut src = String::from("module Main exposing (main)\n\nmain =\n    if True then 1");
+        let mut last = src.len();
+        for _ in 0..n {
+            last = src.len();
+            src.push_str(" else if True then 1");
+        }
+        src.push_str(" else 1\n");
+        let offset = |at: usize| u32::try_from(at).unwrap_or(u32::MAX);
+        let tail = (offset(last), offset(src.len()));
+        (src, tail)
+    };
+    let boundary = assert_block_boundary(build, "else if chain");
+    let arm_atom = FIRST_STATEMENT_DEPTH + STATEMENT_TO_ATOM - 1;
+    assert_eq!(
+        boundary,
+        ceiling() + 1 - arm_atom,
+        "each `else if` charges one level"
     );
 }

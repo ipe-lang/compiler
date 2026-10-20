@@ -13,9 +13,11 @@ pub use ipe_ir::seq_clone::clone_targets_in_expr;
 /// operands, call arguments, match scrutinee/arm bodies). It is
 /// [`ipe_ir::MAX_IR_RENDER_DEPTH`], the compiler-wide
 /// `ipe_diagnostics::nesting::IR_NESTING_LIMIT` the parser's source ceiling
-/// derives, so a program the parser admits is never refused here. The guard is
-/// defence in depth against a lowering step that manufactures nesting; the
-/// declared compile stack is sized for this depth.
+/// derives. The parser's charge keeps `do`/`let` blocks, operator chains,
+/// pipelines, lambdas and `else if` chains under that ceiling. The clone
+/// `let`s a capture rewrite adds and an interpolation's `++` spine are not
+/// charged at the parser, so they may still be refused here. The declared
+/// compile stack is sized for this depth.
 pub const MAX_EMIT_DEPTH: u16 = MAX_IR_RENDER_DEPTH;
 
 /// The refusal a body nested past [`MAX_EMIT_DEPTH`] gets.

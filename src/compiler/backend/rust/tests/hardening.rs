@@ -16,6 +16,7 @@ use std::collections::BTreeMap;
 
 use ipe_backend::Backend;
 use ipe_backend_rust::{FfiEmit, FfiWrapperGlue, RustBackend};
+use ipe_diagnostics::nesting::{COMPILE_STACK_BYTES, SOURCE_NESTING_LIMIT};
 use ipe_diagnostics::{
     DResult, Diagnostic, EmitSite, IPE_I0201, IPE_L0200, IPE_N0012, LowerError, Span,
 };
@@ -140,6 +141,25 @@ fn reserved_names_are_mangled_in_emitted_output() -> DResult<()> {
     Ok(())
 }
 
+/// Run `body` on a thread of the declared compile stack, the stack every
+/// compile path runs on, so a test measures the bound the build ships with.
+///
+/// A thread the OS refuses, or one whose body panics, fails the test here; the
+/// body's own panic message is reported by the thread as it unwinds.
+fn on_compile_stack(body: fn() -> DResult<()>) -> DResult<()> {
+    std::thread::scope(|scope| {
+        let joined = std::thread::Builder::new()
+            .stack_size(COMPILE_STACK_BYTES)
+            .spawn_scoped(scope, body)
+            .map(std::thread::ScopedJoinHandle::join);
+        assert!(
+            matches!(joined, Ok(Ok(_))),
+            "the compile-stack thread must spawn and finish without panicking"
+        );
+        joined.ok().and_then(Result::ok).unwrap_or(Ok(()))
+    })
+}
+
 /// A deeply nested `BinOp` spine must fail fast with IPE-L0200, not overflow the
 /// native stack. The chain is built well past the backend's emit-depth bound.
 ///
@@ -147,6 +167,11 @@ fn reserved_names_are_mangled_in_emitted_output() -> DResult<()> {
 /// against the module that defines the function, not the entry file.
 #[test]
 fn deeply_nested_expr_fails_fast_not_stack_overflow() -> DResult<()> {
+    on_compile_stack(deeply_nested_expr_fails_fast)
+}
+
+/// The body of [`deeply_nested_expr_fails_fast_not_stack_overflow`].
+fn deeply_nested_expr_fails_fast() -> DResult<()> {
     let mut interner = Interner::new();
     let main_mod = interner.intern("Main")?;
     let func = interner.intern("deep")?;
@@ -195,17 +220,23 @@ fn deeply_nested_expr_fails_fast_not_stack_overflow() -> DResult<()> {
     Ok(())
 }
 
-/// An expression at the depth bound still emits successfully — the guard is a
-/// ceiling, not an off-by-one rejection of legitimate programs.
+/// An operator spine as deep as the source ceiling admits (one `BinOp` per
+/// operator of the longest chain the parser accepts) still emits on the
+/// declared compile stack: the guard is a ceiling, not an off-by-one rejection
+/// of legitimate programs.
 #[test]
 fn nesting_at_the_bound_still_emits() -> DResult<()> {
+    on_compile_stack(nesting_at_the_bound_emits)
+}
+
+/// The body of [`nesting_at_the_bound_still_emits`].
+fn nesting_at_the_bound_emits() -> DResult<()> {
     let mut interner = Interner::new();
     let main_mod = interner.intern("Main")?;
     let func = interner.intern("ok")?;
 
-    // 64 levels: comfortably under the emit-depth ceiling.
     let mut body = Expr::Int(0);
-    for _ in 0..64 {
+    for _ in 0..SOURCE_NESTING_LIMIT {
         body = Expr::BinOp {
             op: BinOp::IntAdd,
             lhs: Box::new(body),

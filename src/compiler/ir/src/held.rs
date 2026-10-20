@@ -21,11 +21,11 @@ pub type EnumPayloadTable = BTreeMap<(ModPath, Symbol), Vec<(Symbol, Vec<IrType>
 
 /// Deepest nesting [`ir_type_holds`] descends before it answers `true`.
 ///
-/// Source type nesting is already bounded by the parser; this ceiling keeps the
-/// walk itself bounded by construction. Past it the walk fails closed: it
-/// reports the leaf as held, the conservative answer for every "holds a
-/// hazardous component" predicate.
-pub const MAX_HELD_WALK_DEPTH: u16 = 512;
+/// Source type nesting is already bounded by the parser; this ceiling, the IR
+/// walkers' one derived ceiling, keeps the walk itself bounded by construction.
+/// Past it the walk fails closed: it reports the leaf as held, the conservative
+/// answer for every "holds a hazardous component" predicate.
+pub const MAX_HELD_WALK_DEPTH: u16 = crate::MAX_IR_RENDER_DEPTH;
 
 /// The payload table of `defs`.
 #[must_use]

@@ -3366,23 +3366,27 @@ pub fn line_col(src: &str, offset: usize) -> (usize, usize) {
 /// replaces the file ([`judge_patch`]), and the file is replaced only while it
 /// still holds the bytes that were diagnosed.
 ///
-/// Writes go through a temp file + atomic rename.
+/// Writes go through a temp file + atomic rename. Every diagnosis and re-check
+/// parses author source, so the whole flow runs on the compile door.
 ///
 /// # Errors
 /// The refusal of a project context that cannot be built (an unreadable or
 /// malformed manifest, a module that cannot be read); [`CliError::Io`] on a
-/// filesystem failure.
-pub fn apply_fixes_cmd<W: Write>(
+/// filesystem failure; [`CliError::ThreadRefused`] when the OS refuses the
+/// compile thread.
+pub fn apply_fixes_cmd<W: Write + Send>(
     root: &ProjectRoot,
     file: Option<&FileArg>,
     auto: bool,
     w: &mut W,
 ) -> Result<(), CliError> {
     let target = analysis_target(root, file)?;
-    for graph in analysis_graphs(&target)? {
-        fix_entry(graph, auto, w)?;
-    }
-    Ok(())
+    crate::threads::run_compile(|| {
+        for graph in analysis_graphs(&target)? {
+            fix_entry(graph, auto, w)?;
+        }
+        Ok(())
+    })?
 }
 
 /// Fix the entry of one source graph; every report names the entry's file.
