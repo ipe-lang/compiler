@@ -77,7 +77,7 @@ Run extensible static analysis over Ipê source (idiom, consistency, safety-by-c
 ipe lint [<path>]
 ```
 
-**Arguments:** A module file under `src/` or `tests/` of the current directory's project, whose findings alone are reported and fixed, or a project directory. Defaults to the current directory's project, every module.
+**Arguments:** A module file of this project, whose findings alone are reported and fixed, or a project directory. Defaults to the current directory's project, every module.
 
 **Flags:**
 
@@ -323,10 +323,10 @@ A group is invoked as `ipe <group> <verb>`; the group fixes the verb's build pos
 Compile a program to a native or WebAssembly development artifact, with Debug.* on.
 
 ```
-ipe dev build [<path>] [<shape>] [<runtime>] [<host>] [<target>]
+ipe dev build [<dir>] [<shape>] [<runtime>] [<host>] [<target>]
 ```
 
-**Arguments:** path: a source file, a project directory, or a package.ipe (default: the current project). shape is derived from `main` and, if written, only cross-checked. runtime/host apply to `web` only: `web` = served (served is the unnamed default, never written), `web solo` = self-contained browser client, and a host is desktop/ios/android. A `desktop`/`ios`/`android` host lays out the app bundle for that host (a fast dev bundle; `release build web <host>` produces the production distributable). With no delivery args, `dev build` builds the default delivery — the fast one-artifact inner loop; `release build` builds every declared delivery. Delivery args select a subset or override for this invocation only and never edit package.ipe.
+**Arguments:** dir: a project directory (default: the current directory). shape is derived from `main` and, if written, only cross-checked. runtime/host apply to `web` only: `web` = served (served is the unnamed default, never written), `web solo` = self-contained browser client, and a host is desktop/ios/android. A `desktop`/`ios`/`android` host lays out the app bundle for that host (a fast dev bundle; `release build web <host>` produces the production distributable). With no delivery args, `dev build` builds the default delivery — the fast one-artifact inner loop; `release build` builds every declared delivery. Delivery args select a subset or override for this invocation only and never edit package.ipe.
 
 **Output:** a native build lands the runnable binary at `out/bin/<project-name>` under the project (copied there within the build), so it is findable even when a shared `CARGO_TARGET_DIR` places cargo's own output outside the project.
 
@@ -349,10 +349,10 @@ ipe dev build [<path>] [<shape>] [<runtime>] [<host>] [<target>]
 Compile a program as a development build and run the resulting binary.
 
 ```
-ipe dev run [<path>]
+ipe dev run [<dir>]
 ```
 
-**Arguments:** A source file, a project directory, or a package.ipe. Defaults to the current project.
+**Arguments:** A project directory (default: the current directory).
 
 **Flags:**
 
@@ -374,10 +374,10 @@ ipe dev run [<path>]
 Rebuild and re-run a development build on every source change.
 
 ```
-ipe dev watch [<path>]
+ipe dev watch [<dir>]
 ```
 
-**Arguments:** A source file, a project directory, or a package.ipe. Defaults to the current project.
+**Arguments:** A project directory (default: the current directory).
 
 **Flags:**
 
@@ -395,10 +395,10 @@ ipe dev watch [<path>]
 Build the production artifact — optimised, Debug.* gated. Native-bearing apps get a jailed bundle; pure-native apps get a plain optimised binary; `web desktop|ios|android` produces a production app bundle; `--target wasm` produces a production browser bundle.
 
 ```
-ipe release build [<path>] [<shape>] [<runtime>] [<host>]
+ipe release build [<dir>] [<shape>] [<runtime>] [<host>]
 ```
 
-**Arguments:** A source file, a project directory, or a package.ipe (default: the current project). shape/runtime/host are the delivery grammar shared with `dev build`: a `desktop`/`ios`/`android` host lays out the production app bundle for that host (a self-contained desktop bundle, or a native mobile system-webview shell). An `android` host produces an unsigned Gradle project: a store build needs your own keystore configured in Gradle. With no delivery args, `release build` builds every delivery declared in package.ipe (`dev build` builds only the default one).
+**Arguments:** A project directory (default: the current directory). shape/runtime/host are the delivery grammar shared with `dev build`: a `desktop`/`ios`/`android` host lays out the production app bundle for that host (a self-contained desktop bundle, or a native mobile system-webview shell). An `android` host produces an unsigned Gradle project: a store build needs your own keystore configured in Gradle. With no delivery args, `release build` builds every delivery declared in package.ipe (`dev build` builds only the default one).
 
 **Flags:**
 
@@ -416,10 +416,10 @@ ipe release build [<path>] [<shape>] [<runtime>] [<host>]
 Build the production artifact (cached), then run exactly that artifact, jailed to its capabilities.
 
 ```
-ipe release run [<path>|<artifact-dir>]
+ipe release run [<dir>|<artifact-dir>]
 ```
 
-**Arguments:** A source file, a project directory, or a package.ipe (default: the current project), or a built artifact directory holding `ipe-wrapper`. Every run is confined: the default single binary jails itself, a bundle is verified against the floor embedded in its app and then jailed, and a pure-native binary runs jailed to its consented capabilities. An artifact directory runs as built, so it takes no build options. A `--target wasm` or `web solo|desktop|ios|android` build has no run form and is refused: build it with `ipe release build`.
+**Arguments:** A project directory (default: the current directory), or a built artifact directory holding `ipe-wrapper`. Every run is confined: the default single binary jails itself, a bundle is verified against the floor embedded in its app and then jailed, and a pure-native binary runs jailed to its consented capabilities. An artifact directory runs as built, so it takes no build options. A `--target wasm` or `web solo|desktop|ios|android` build has no run form and is refused: build it with `ipe release build`.
 
 **Flags:**
 
@@ -433,10 +433,10 @@ ipe release run [<path>|<artifact-dir>]
 Emit a self-contained production Rust project with a tree-shaken runtime.
 
 ```
-ipe release eject [<path>]
+ipe release eject [<dir>]
 ```
 
-**Arguments:** A source file, a project directory, or a package.ipe. Defaults to the current project.
+**Arguments:** A project directory (default: the current directory).
 
 **Flags:**
 

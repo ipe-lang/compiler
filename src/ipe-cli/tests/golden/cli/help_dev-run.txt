@@ -5,10 +5,10 @@ exit: 0
 
   Compile a program as a development build and run the resulting binary.
 
-  ipe dev run [<path>]
+  ipe dev run [<dir>]
 
   Arguments:
-    A source file, a project directory, or a package.ipe. Defaults to the current project.
+    A project directory (default: the current directory).
 
   Options:
     [--out <dir>]                                       put build output under <dir> (default: out/ in the project); on Windows a drive or `\\server\share` path is accepted, a device (`\\.\pipe`), object-namespace (`\\?\GLOBALROOT`), or volume-GUID (`\\?\Volume{..}`) path is not
