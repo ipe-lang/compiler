@@ -125,6 +125,91 @@ impl std::fmt::Display for Error {
 
 impl std::error::Error for Error {}
 
+/// An `https://` URL every call is made to: a host, a port from 1 to 65535
+/// when one is written, and no userinfo, fragment, whitespace or control
+/// character.
+///
+/// Built only by [`HttpsUrl::parse`], so a caller names a request target the
+/// agent can connect to, never one it would refuse at request time.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HttpsUrl(String);
+
+/// Why a value is not an [`HttpsUrl`].
+///
+/// It carries no part of the value, which may hold a credential.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UrlError {
+    /// The value does not parse as a URL.
+    Malformed,
+    /// The value names no scheme, or one other than `https`.
+    NotHttps,
+    /// The value names no host.
+    NoHost,
+    /// The value carries userinfo (`user@`) before its host.
+    Userinfo,
+    /// The value writes a port that is not a number from 1 to 65535.
+    BadPort,
+    /// The value carries a fragment, whitespace, or a control character.
+    ForbiddenChar,
+}
+
+impl HttpsUrl {
+    /// Parse `value` as an [`HttpsUrl`].
+    ///
+    /// # Errors
+    ///
+    /// The [`UrlError`] naming the first part of `value` that is not one.
+    pub fn parse(value: &str) -> Result<Self, UrlError> {
+        if value
+            .chars()
+            .any(|c| c == '#' || c.is_whitespace() || c.is_control())
+        {
+            return Err(UrlError::ForbiddenChar);
+        }
+        let uri: ureq::http::Uri = value.parse().map_err(|_| UrlError::Malformed)?;
+        if uri.scheme() != Some(&ureq::http::uri::Scheme::HTTPS) {
+            return Err(UrlError::NotHttps);
+        }
+        let Some(authority) = uri.authority() else {
+            return Err(UrlError::NoHost);
+        };
+        if authority.as_str().contains('@') {
+            return Err(UrlError::Userinfo);
+        }
+        if authority.host().is_empty() {
+            return Err(UrlError::NoHost);
+        }
+        // `Authority::port` drops a port it cannot read rather than refusing it.
+        let port_written = authority.as_str() != authority.host();
+        let port_valid = authority.port().is_some_and(|port| {
+            port.as_str().bytes().all(|b| b.is_ascii_digit()) && port.as_u16() != 0
+        });
+        if port_written && !port_valid {
+            return Err(UrlError::BadPort);
+        }
+        Ok(Self(value.to_owned()))
+    }
+
+    /// The URL as written.
+    #[must_use]
+    pub const fn as_str(&self) -> &str {
+        self.0.as_str()
+    }
+}
+
+impl From<UrlError> for Error {
+    fn from(fault: UrlError) -> Self {
+        match fault {
+            UrlError::NotHttps => Self::NotHttps,
+            UrlError::Malformed
+            | UrlError::NoHost
+            | UrlError::Userinfo
+            | UrlError::BadPort
+            | UrlError::ForbiddenChar => Self::BadRequest,
+        }
+    }
+}
+
 /// An HTTP answer whose body was read whole under a byte ceiling.
 #[derive(Debug)]
 pub struct Answer {
@@ -168,7 +253,7 @@ impl Answer {
 /// `None` on any failure (DNS, connect, TLS, non-2xx, timeout, oversized body):
 /// a network error is never fatal here — the caller decides how to degrade.
 #[must_use]
-pub fn get(url: &str) -> Option<String> {
+pub fn get(url: &HttpsUrl) -> Option<String> {
     get_with_accept(url, "application/vnd.github+json")
 }
 
@@ -178,15 +263,15 @@ pub fn get(url: &str) -> Option<String> {
 /// The body is read through [`crate::remote_ingest::read_capped`] at
 /// [`crate::remote_ingest::JSON_RESPONSE_MAX_BYTES`].
 ///
-/// `None` on any failure (DNS, connect, TLS, non-2xx, non-HTTPS URL, timeout,
-/// oversized body): a network error is never fatal here — the caller decides
-/// how to degrade. The registry's static Pages read API serves
+/// `None` on any failure (DNS, connect, TLS, non-2xx, a redirect off
+/// `https://`, timeout, oversized body): a network error is never fatal here —
+/// the caller decides how to degrade. The registry's static Pages read API serves
 /// `application/json`, so the registry fetch passes that rather than the
 /// GitHub API media type.
 #[must_use]
-pub fn get_with_accept(url: &str, accept: &str) -> Option<String> {
+pub fn get_with_accept(url: &HttpsUrl, accept: &str) -> Option<String> {
     let response = agent(Duration::from_secs(5))
-        .get(url)
+        .get(url.as_str())
         .header("User-Agent", "ipe-cli")
         .header("Accept", accept)
         .call()
@@ -213,16 +298,16 @@ fn success_body(response: ureq::http::Response<ureq::Body>) -> Option<String> {
 ///
 /// # Errors
 ///
-/// The [`Error`] of a call that got no HTTP answer: a non-HTTPS URL, DNS,
-/// connect, TLS, a redirect past [`MAX_REDIRECTS`], or the timeout.
+/// The [`Error`] of a call that got no HTTP answer: DNS, connect, TLS, a
+/// redirect off `https://` or past [`MAX_REDIRECTS`], or the timeout.
 pub fn post(
-    url: &str,
+    url: &HttpsUrl,
     timeout: Duration,
     headers: &[(&str, &str)],
     body: &str,
     source: IngestSource,
 ) -> Result<Answer, Error> {
-    let mut request = agent(timeout).post(url);
+    let mut request = agent(timeout).post(url.as_str());
     for &(name, value) in headers {
         request = request.header(name, value);
     }
@@ -359,17 +444,63 @@ mod tests {
             matches!(result, Err(ureq::Error::RequireHttpsOnly(_))),
             "a non-HTTPS URL must be refused by the agent"
         );
-        assert_eq!(get("http://127.0.0.1:9/"), None);
-        assert!(matches!(
-            post(
-                "http://127.0.0.1:9/",
-                Duration::from_secs(1),
-                &[],
-                "",
-                IngestSource::GithubApi
-            ),
-            Err(Error::NotHttps)
-        ));
+        assert_eq!(
+            HttpsUrl::parse("http://127.0.0.1:9/"),
+            Err(UrlError::NotHttps)
+        );
+    }
+
+    #[test]
+    fn only_an_https_url_with_a_connectable_authority_parses() {
+        for (value, fault) in [
+            ("https://h:99999/", UrlError::BadPort),
+            ("https://h:65536", UrlError::BadPort),
+            ("https://h:0/", UrlError::BadPort),
+            ("https://h:/", UrlError::BadPort),
+            ("https://h:+1/", UrlError::BadPort),
+            ("https://:443/", UrlError::NoHost),
+            ("https://user:pw@h/", UrlError::Userinfo),
+            ("https://user@h", UrlError::Userinfo),
+            ("http://h/", UrlError::NotHttps),
+            ("ftp://h/", UrlError::NotHttps),
+            ("/path", UrlError::NotHttps),
+            ("h/path", UrlError::Malformed),
+            ("https:///path", UrlError::Malformed),
+            ("https://h/a b", UrlError::ForbiddenChar),
+            ("https://h/\r\nX: y", UrlError::ForbiddenChar),
+            ("https://h/\u{1b}", UrlError::ForbiddenChar),
+            ("https://h/#f", UrlError::ForbiddenChar),
+            ("https://h\u{a0}/", UrlError::ForbiddenChar),
+            ("https://h\u{e9}/", UrlError::Malformed),
+        ] {
+            assert_eq!(HttpsUrl::parse(value), Err(fault), "{value:?}");
+        }
+        for userinfo_only in ["https://user@", "https://user@/p", "https://user:pw@:1/"] {
+            assert!(
+                matches!(
+                    HttpsUrl::parse(userinfo_only),
+                    Err(UrlError::Malformed | UrlError::Userinfo)
+                ),
+                "{userinfo_only:?}"
+            );
+        }
+        for value in [
+            "https://h",
+            "https://h:443/p?q=1",
+            "https://h:1/",
+            "https://h:65535/",
+            "https://[::1]/",
+            "https://[::1]:8443/",
+            "HTTPS://H/",
+        ] {
+            assert_eq!(
+                HttpsUrl::parse(value).map(|url| url.as_str().to_owned()),
+                Ok(value.to_owned()),
+                "{value:?}"
+            );
+        }
+        assert_eq!(Error::from(UrlError::NotHttps), Error::NotHttps);
+        assert_eq!(Error::from(UrlError::BadPort), Error::BadRequest);
     }
 
     #[test]

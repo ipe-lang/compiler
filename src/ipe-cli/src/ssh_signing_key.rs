@@ -792,8 +792,10 @@ fn post_signing_key(
 ) -> Result<(), RegistrationError> {
     let body = serde_json::json!({ "title": title, "key": public_key.as_str() }).to_string();
     let authorization = Zeroizing::new(format!("Bearer {}", token.as_str()));
+    let url = crate::net::HttpsUrl::parse(SIGNING_KEYS_API)
+        .map_err(|fault| RegistrationError::Transport(fault.into()))?;
     let result = crate::net::post(
-        SIGNING_KEYS_API,
+        &url,
         Duration::from_secs(30),
         &[
             ("User-Agent", "ipe-cli"),
@@ -938,6 +940,11 @@ pub(crate) fn run_setup_command() -> Result<(), CliError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_signing_keys_endpoint_is_an_https_url() {
+        assert!(crate::net::HttpsUrl::parse(SIGNING_KEYS_API).is_ok());
+    }
 
     /// A hostile response message loses each escape sequence whole, not just
     /// its `ESC`, and every bidi or zero-width character, before it is echoed.
