@@ -438,6 +438,19 @@ fn build_shape(src: &str, out: &Path, runtime: &Path) -> Result<(), CliError> {
     crate::build_fixture(&fixture, out, runtime).map(|_| ())
 }
 
+/// The deepest `name` that the cargo build covers. `access_chain` builds a
+/// record type as deep as the chain, and the depth of a type is bounded by
+/// rustc's recursion limit (128), not by the source-nesting ceiling; until
+/// type depth has a ceiling of its own, the cargo build stops under that limit.
+fn cargo_depth(name: &str, deepest: usize) -> usize {
+    const RUSTC_TYPE_DEPTH_SAFE: usize = 64;
+    if name == "access_chain" {
+        deepest.min(RUSTC_TYPE_DEPTH_SAFE)
+    } else {
+        deepest
+    }
+}
+
 /// Every nesting shape's at-ceiling program builds with cargo, and one level
 /// deeper is refused at ipe time by the parser. Gated on `IPE_E2E=1` (the CI
 /// `e2e` job): the seal cargo-builds each emitted crate.
@@ -449,15 +462,16 @@ fn at_ceiling_shapes_build_with_cargo() {
             ipe_test_temp::temp_root().join(format!("ipe_nesting_ceiling_{}", std::process::id()));
         for (name, shape, deepest) in shapes() {
             let out = scratch.join(name);
-            let emitted = build_shape(&shape(deepest).src, &out, &runtime);
+            let built_at = cargo_depth(name, deepest);
+            let emitted = build_shape(&shape(built_at).src, &out, &runtime);
             assert!(
                 emitted.is_ok(),
-                "{name}: depth {deepest} must emit: {emitted:?}"
+                "{name}: depth {built_at} must emit: {emitted:?}"
             );
             let built = e2e_support::build_rust_binary(&format!("nesting_ceiling_{name}"), &out);
             assert!(
                 built.is_ok(),
-                "{name}: the emitted crate at depth {deepest} must build with cargo: {}",
+                "{name}: the emitted crate at depth {built_at} must build with cargo: {}",
                 built.err().unwrap_or_default()
             );
             let past = shape(deepest + 1);

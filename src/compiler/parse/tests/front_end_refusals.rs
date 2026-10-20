@@ -606,7 +606,10 @@ fn access_chain_after_do_block_is_refused_at_parse() {
         admitted.is_ok(),
         "{long} segments in a declaration body must parse: {admitted:?}"
     );
-    let (mixed, (lo, hi)) = do_then_access(long);
+    let (mixed, (_, hi)) = do_then_access(long);
+    let lo = mixed.find("        r.a").map_or(0, |at| {
+        u32::try_from(at + "        r".len()).unwrap_or(u32::MAX)
+    });
     let refused = parse_module(&mixed, &mut Interner::new());
     assert!(
         matches!(
