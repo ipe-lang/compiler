@@ -518,6 +518,15 @@ pub enum CliError {
         /// The directory to run ipe from instead.
         root: PathBuf,
     },
+    /// A build command was given a file where it takes a project directory (`IPE-E0012`).
+    DirectoryExpected {
+        /// The build command.
+        verb: crate::verb::Verb,
+        /// The argument as spelled.
+        arg: PathBuf,
+        /// The directory to pass instead.
+        parent: PathBuf,
+    },
     /// A build-output location was refused because ipe cannot prove it owns it.
     ///
     /// A symlink, a directory holding user files, or a path overlapping the
@@ -818,6 +827,7 @@ impl CliError {
             Self::SourceTree(_) => "source-tree",
             Self::SymlinkInSource { .. } => "symlink-in-source",
             Self::FileOutsideRoot { .. } => "file-outside-root",
+            Self::DirectoryExpected { .. } => "directory-expected",
             Self::OutputRefused(_) => "output-refused",
             Self::DiscoveryLimitReached { .. } => "discovery-limit-reached",
             Self::TrustRefused(_) => "trust-refused",
@@ -919,6 +929,7 @@ impl CliError {
             | Self::SourceTree(_)
             | Self::SymlinkInSource { .. }
             | Self::FileOutsideRoot { .. }
+            | Self::DirectoryExpected { .. }
             | Self::OutputRefused(_)
             | Self::DiscoveryLimitReached { .. }
             | Self::TrustRefused(_)
@@ -1259,6 +1270,9 @@ impl std::fmt::Display for CliError {
                 &arg.display(),
                 &root.display(),
             )),
+            Self::DirectoryExpected { verb, arg, parent } => f.write_str(
+                &text::project_directory_expected(&arg.display(), &verb.name(), &parent.display()),
+            ),
             Self::OutputRefused(refusal) => f.write_str(&text::cli_output_refused(refusal)),
             Self::DiscoveryLimitReached { detail } => {
                 f.write_str(&text::cli_discovery_limit_reached(detail))

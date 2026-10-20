@@ -24,6 +24,7 @@ use crate::owner_trust::{self, TrustedCache};
 use crate::package_manifest::{PACKAGE_IPE, parse_package_manifest_source};
 use crate::project::{IPE_TOML, ProjectManifest, parse_entry};
 use crate::text;
+use crate::verb::Verb;
 
 #[cfg(any(test, feature = "test-fixtures"))]
 pub mod fixture;
@@ -172,6 +173,46 @@ impl FileArg {
 }
 
 impl RootArg {
+    /// The root a build command was pointed at: a project directory, or `cwd` when none is named.
+    ///
+    /// The only constructor the build commands call, so none of them can hold
+    /// a file argument. A directory is the root; a path that does not exist is
+    /// the root too, for [`ProjectRoot::resolve`] to refuse as
+    /// [`CliError::NoManifest`]. Anything else (a regular file, `package.ipe`
+    /// included, a FIFO, a device) is refused on its kind alone, never opened.
+    /// The hint is computed from the argument's spelling: no directory above it
+    /// is consulted.
+    ///
+    /// # Errors
+    /// [`CliError::DirectoryExpected`] when `arg` names something other than a
+    /// directory; [`CliError::Io`] when its kind cannot be read.
+    pub fn dir_only(cwd: &Path, arg: Option<&Path>, verb: Verb) -> Result<Self, CliError> {
+        let Some(arg) = arg else {
+            return Ok(Self::at(cwd));
+        };
+        let joined = cwd.join(arg);
+        match std::fs::metadata(&joined) {
+            Ok(kind) if kind.is_dir() => Ok(Self::at(&joined)),
+            Ok(_) => Err(CliError::DirectoryExpected {
+                verb,
+                arg: arg.to_path_buf(),
+                parent: suggested_dir(arg),
+            }),
+            Err(absent)
+                if matches!(
+                    absent.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                ) =>
+            {
+                Ok(Self::at(&joined))
+            }
+            Err(source) => Err(CliError::Io {
+                path: joined,
+                source,
+            }),
+        }
+    }
+
     /// Split a command's optional path argument into the root and a file argument.
     ///
     /// No argument makes `cwd` the root; a directory is the root itself; any
@@ -206,8 +247,9 @@ impl RootArg {
     }
 }
 
-/// Where a module path leads under a held directory.
-enum Located {
+/// Where a module path leads under a project's source directory.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Located {
     /// A file that is neither a directory nor a link.
     Found,
     /// No such file.
@@ -277,7 +319,7 @@ impl ProjectRoot {
                 text::msg::package_manifest_source_root_removed(),
             ));
         }
-        let entries = entry_set(&src, &manifest, &path)?;
+        let entries = entry_set(&manifest, &path, |module| locate(&src, module))?;
         Ok(Self {
             dir,
             fs_root,
@@ -462,17 +504,36 @@ fn read_manifest(root: &ipe_fs_open::HeldDir, dir: &Path) -> Result<String, CliE
     }
 }
 
-/// What the project builds: its declared programs, else `src/Main.ipe`, else its exposed modules.
-fn entry_set(src: &HeldDir, manifest: &ProjectManifest, root: &Path) -> Result<EntrySet, CliError> {
+/// What a project builds: its declared programs, else `src/Main.ipe`, else its exposed modules.
+///
+/// Pure over `manifest` and `locate`, which says where a module path leads
+/// under the project's `src/`: the one derivation [`ProjectRoot::resolve`]
+/// reads over its held `src/` and the audit reads over a captured package, so
+/// the two can never resolve one manifest to different programs. Every
+/// exposed module must be present first; then the declared programs in
+/// manifest order, else `src/Main.ipe` under the package's name, else the
+/// exposed modules; `root` names the project in the refusal of one that
+/// builds nothing.
+///
+/// # Errors
+/// [`CliError::ExposedModuleMissing`], the manifest-entry refusal of a
+/// declared entry naming no module, [`CliError::EntryMissing`],
+/// [`CliError::EntryEscapes`], [`CliError::SymlinkInSource`] and
+/// [`CliError::NoDefaultEntry`], in that order; every refusal of `locate`.
+pub fn entry_set(
+    manifest: &ProjectManifest,
+    root: &Path,
+    locate: impl Fn(&ModulePath) -> Result<Located, CliError>,
+) -> Result<EntrySet, CliError> {
     let mut library = Vec::with_capacity(manifest.exposed_modules.len());
     for name in &manifest.exposed_modules {
-        library.push(exposed_module(src, name)?);
+        library.push(exposed_module(&locate, name)?);
     }
     let mut programs = Vec::with_capacity(manifest.programs.len());
     for program in &manifest.programs {
         let module = parse_entry(&program.entry)
             .map_err(|refusal| CliError::manifest_entry_refused(&program.entry, &refusal))?;
-        match locate(src, &module)? {
+        match locate(&module)? {
             Located::Found => programs.push(ResolvedEntry {
                 name: ProgramName(program.name.clone()),
                 module,
@@ -494,7 +555,7 @@ fn entry_set(src: &HeldDir, manifest: &ProjectManifest, root: &Path) -> Result<E
         return Ok(EntrySet::Programs(programs));
     }
     let main = vec![DEFAULT_ENTRY.to_owned()];
-    match locate(src, &main)? {
+    match locate(&main)? {
         Located::Found => {
             return Ok(EntrySet::Programs(NonEmpty {
                 first: ResolvedEntry {
@@ -514,14 +575,17 @@ fn entry_set(src: &HeldDir, manifest: &ProjectManifest, root: &Path) -> Result<E
         })
 }
 
-/// The module path of the exposed module `name`, its file present under `src/`.
-fn exposed_module(src: &HeldDir, name: &str) -> Result<ModulePath, CliError> {
+/// The module path of the exposed module `name`, its file present where `locate` looks.
+fn exposed_module(
+    locate: &impl Fn(&ModulePath) -> Result<Located, CliError>,
+    name: &str,
+) -> Result<ModulePath, CliError> {
     let missing = || CliError::ExposedModuleMissing {
         module: name.to_owned(),
     };
     let file = format!("{}{MODULE_EXT}", name.replace('.', "/"));
     let module = parse_entry(&file).map_err(|_| missing())?;
-    match locate(src, &module)? {
+    match locate(&module)? {
         Located::Found => Ok(module),
         Located::Missing => Err(missing()),
         Located::Link(path) => Err(CliError::SymlinkInSource { path }),
@@ -586,6 +650,20 @@ fn suggested_root(arg: &Path) -> PathBuf {
     }
     root.or_else(|| arg.parent().map(Path::to_path_buf))
         .unwrap_or_else(|| PathBuf::from("."))
+}
+
+/// The directory a build command should be pointed at instead of the file `arg`.
+///
+/// The lexical parent of a `package.ipe` argument, else the current
+/// directory spelled `.`; computed from the spelling alone, never by opening
+/// a directory above `arg`.
+fn suggested_dir(arg: &Path) -> PathBuf {
+    let parent = arg
+        .file_name()
+        .filter(|name| *name == OsStr::new(PACKAGE_IPE))
+        .and_then(|_| arg.parent())
+        .filter(|parent| !parent.as_os_str().is_empty());
+    parent.map_or_else(|| PathBuf::from("."), Path::to_path_buf)
 }
 
 #[cfg(test)]
@@ -897,6 +975,14 @@ mod tests {
                 },
                 ipe_diagnostics::IPE_E0011,
             ),
+            (
+                CliError::DirectoryExpected {
+                    verb: Verb::DEV_BUILD,
+                    arg: p.join("src/Main.ipe"),
+                    parent: PathBuf::from("."),
+                },
+                ipe_diagnostics::IPE_E0012,
+            ),
         ];
         for (err, code) in cases {
             let shown = err.to_string();
@@ -905,6 +991,103 @@ mod tests {
                 "{shown}"
             );
         }
+    }
+
+    // ── A directory argument ──────────────────────────────────────────────────
+
+    fn dir_only(cwd: &Path, arg: &str) -> Result<RootArg, CliError> {
+        RootArg::dir_only(cwd, Some(Path::new(arg)), Verb::DEV_BUILD)
+    }
+
+    #[test]
+    fn no_argument_is_the_current_directory() {
+        let s = app("dir-only-none");
+        let arg = RootArg::dir_only(s.path(), None, Verb::RELEASE_BUILD).expect("cwd");
+        assert_eq!(arg.dir, s.path());
+    }
+
+    #[test]
+    fn a_directory_argument_is_that_directory() {
+        let s = app("dir-only-dir");
+        s.mkdir("inner");
+        assert_eq!(
+            dir_only(s.path(), ".").expect("dot").dir,
+            s.path().join(".")
+        );
+        assert_eq!(
+            dir_only(s.path(), "inner").expect("inner").dir,
+            s.path().join("inner")
+        );
+    }
+
+    #[test]
+    fn an_absent_argument_is_left_for_the_resolve_to_refuse() {
+        let s = Scratch::new("dir-only-absent");
+        let arg = dir_only(s.path(), "nowhere").expect("an absent path is a directory to resolve");
+        assert_eq!(arg.dir, s.path().join("nowhere"));
+        assert!(matches!(
+            ProjectRoot::resolve(arg),
+            Err(CliError::NoManifest { .. })
+        ));
+    }
+
+    #[test]
+    fn a_module_file_is_refused_with_the_exact_text() {
+        let s = app("dir-only-file");
+        for verb in Verb::ALL {
+            let err = RootArg::dir_only(s.path(), Some(Path::new("src/Main.ipe")), verb)
+                .expect_err("a file is refused");
+            assert!(
+                matches!(&err, CliError::DirectoryExpected { parent, .. } if parent == Path::new("."))
+            );
+            assert_eq!(
+                err.to_string(),
+                format!(
+                    "error[IPE-E0012]: `src/Main.ipe` is a file; `ipe {0}` takes a project \
+                     directory. Pass the directory instead: `ipe {0} .`",
+                    verb.name()
+                )
+            );
+        }
+    }
+
+    #[test]
+    fn a_package_ipe_argument_suggests_its_directory() {
+        let s = Scratch::new("dir-only-manifest");
+        s.write("app/package.ipe", MANIFEST);
+        s.write("app/src/Main.ipe", MODULE);
+        s.write(PACKAGE_IPE, MANIFEST);
+        let nested = dir_only(s.path(), "app/package.ipe").expect_err("refused");
+        assert_eq!(
+            nested.to_string(),
+            "error[IPE-E0012]: `app/package.ipe` is a file; `ipe dev build` takes a project \
+             directory. Pass the directory instead: `ipe dev build app`"
+        );
+        let here = dir_only(s.path(), "package.ipe").expect_err("refused");
+        assert!(
+            matches!(&here, CliError::DirectoryExpected { parent, .. } if parent == Path::new("."))
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_fifo_argument_is_refused_without_being_opened() {
+        let s = Scratch::new("dir-only-fifo");
+        let fifo = s.path().join("pipe");
+        let made = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .expect("run mkfifo");
+        assert!(made.success(), "mkfifo failed");
+        let cwd = s.path().to_path_buf();
+        let (send, recv) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = send.send(dir_only(&cwd, "pipe").map(|_| ()));
+        });
+        let judged = recv
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("the argument is judged without opening the FIFO");
+        assert!(matches!(judged, Err(CliError::DirectoryExpected { .. })));
     }
 
     #[test]
