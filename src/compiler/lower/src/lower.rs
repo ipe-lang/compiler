@@ -55,7 +55,7 @@ use clone_class::{
     reject_nonclone_value_reuse, rewrite_captured_clones, rewrite_multiuse_clones,
     slice_element_alias_refusal, slice_ownership,
 };
-use generic_syms::{collect_ir_generic_syms, default_generics_to_unit};
+use generic_syms::{default_generics_to_unit, signature_generics};
 #[cfg(test)]
 use ir_type_mentions::expr_type_mentions;
 use ir_type_mentions::{
@@ -78,7 +78,7 @@ use record_shapes::{
     is_websocket_cfg_shape, ty_is_int,
 };
 use ty_templates::{
-    GroundTy, canon_type_contains_record_key_set, declared_arg_vars, generic_binding_breaks_clone,
+    GroundTy, canon_type_contains_record_key_set, declared_vars, generic_binding_breaks_clone,
     match_signature_template, ty_contains_fun, ty_contains_record_key_set, ty_fields_mention_var,
     ty_has_fun_in_derive_carrier,
 };
@@ -95,8 +95,8 @@ type IrArrow = (Vec<IrType>, IrType);
 /// at the top of the function body (`let <Pat> = <synthetic>`).
 type ParamPrologue = (Symbol, Pat);
 
-/// An unannotated function's lowered parameters, return type, and body.
-type UnannotatedFnParts = (Vec<IrParam>, IrType, Expr);
+/// An unannotated function's lowered parameters, return type, signature generics, and body.
+type UnannotatedFnParts = (Vec<IrParam>, IrType, BTreeSet<Symbol>, Expr);
 
 /// A used binder's type as the ownership disciplines see it.
 ///
@@ -18150,7 +18150,8 @@ impl<'a> Lowerer<'a> {
                         let mut row_vars = BTreeSet::new();
                         canon_sig_collect_arg_row_vars(ty, &mut row_vars);
                         let def_bounds = self.types.bounds.get(&poly_key);
-                        let folded = self.with_erased_tvars(&params, &ret, def_bounds, || {
+                        let named = signature_generics(&params, &ret);
+                        let folded = self.with_erased_tvars(&named, def_bounds, || {
                             let body_result = self
                                 .reject_generic_app_entries_in(body, &row_vars)
                                 .and_then(|()| {
@@ -18394,14 +18395,7 @@ impl<'a> Lowerer<'a> {
                 //   - INCLUDES it when `any` is the injected UI msg generic
                 //     (`view : Model -> any`) because `ret = Html<Generic(marker)>`.
                 // A param-position `any` was already freshened to a minted symbol.
-                let used_generics: BTreeSet<Symbol> = {
-                    let mut s = BTreeSet::new();
-                    for (_, ty) in &params {
-                        collect_ir_generic_syms(ty, &mut s);
-                    }
-                    collect_ir_generic_syms(&ret, &mut s);
-                    s
-                };
+                let used_generics = signature_generics(&params, &ret);
                 // (AUD-05) keyed by (home, name) — see the `bounds` field doc
                 // on `SolvedTypes` for why a bare-name lookup is unsound here.
                 let var_bounds = self.types.bounds.get(&(def.home().to_vec(), name));
@@ -18540,26 +18534,18 @@ impl<'a> Lowerer<'a> {
                 // 3-module cross-module field-access getter; this filter is
                 // defense-in-depth alongside the `obligation_roots` fix above.
                 // Computed per-branch below, once `params`/`ret` are known.
-                let compute_type_params = |quantified_syms: Option<&Vec<Symbol>>,
-                                           var_bounds: Option<&BTreeMap<Symbol, TyBounds>>,
-                                           params: &[(Symbol, IrType)],
-                                           ret: &IrType| {
-                    let used_generics: BTreeSet<Symbol> = {
-                        let mut s = BTreeSet::new();
-                        for (_, ty) in params {
-                            collect_ir_generic_syms(ty, &mut s);
-                        }
-                        collect_ir_generic_syms(ret, &mut s);
-                        s
+                let compute_type_params =
+                    |quantified_syms: Option<&Vec<Symbol>>,
+                     var_bounds: Option<&BTreeMap<Symbol, TyBounds>>,
+                     used_generics: &BTreeSet<Symbol>| {
+                        quantified_syms
+                            .into_iter()
+                            .flatten()
+                            .copied()
+                            .filter(|v| used_generics.contains(v))
+                            .map(|v| (v, Self::bounds_for(var_bounds, v)))
+                            .collect::<Vec<(Symbol, BoundSet)>>()
                     };
-                    quantified_syms
-                        .into_iter()
-                        .flatten()
-                        .copied()
-                        .filter(|v| used_generics.contains(v))
-                        .map(|v| (v, Self::bounds_for(var_bounds, v)))
-                        .collect::<Vec<(Symbol, BoundSet)>>()
-                };
 
                 if !patterns.is_empty() {
                     // An unannotated top-level function: synthesise the typed
@@ -18584,27 +18570,27 @@ impl<'a> Lowerer<'a> {
                             // Same binder-scope registration as the Typed path.
                             let param_scope =
                                 param_binder_scope(params.iter().map(|(s, _)| *s), patterns);
-                            let folded =
-                                self.with_erased_tvars(&params, &ret, var_bounds, || {
-                                    let body_result = self
-                                        .reject_generic_app_entries_in(body, &BTreeSet::new())
-                                        .and_then(|()| {
-                                            self.with_binders(&param_scope, || {
-                                                self.with_param_binders(&params, patterns, || {
-                                                    self.lower_returned_body(body, &ret)
-                                                })
+                            let named = signature_generics(&params, &ret);
+                            let folded = self.with_erased_tvars(&named, var_bounds, || {
+                                let body_result = self
+                                    .reject_generic_app_entries_in(body, &BTreeSet::new())
+                                    .and_then(|()| {
+                                        self.with_binders(&param_scope, || {
+                                            self.with_param_binders(&params, patterns, || {
+                                                self.lower_returned_body(body, &ret)
                                             })
-                                        });
-                                    self.fn_is_async.set(prev_async);
-                                    // Prologue binders resolve under the def's generics, as in
-                                    // the Typed path.
-                                    body_result
-                                        .and_then(|b| self.fold_param_prologues(prologue, b, body))
-                                })?;
-                            Ok((params, ret, folded))
+                                        })
+                                    });
+                                self.fn_is_async.set(prev_async);
+                                // Prologue binders resolve under the def's generics, as in
+                                // the Typed path.
+                                body_result
+                                    .and_then(|b| self.fold_param_prologues(prologue, b, body))
+                            })?;
+                            Ok((params, ret, named, folded))
                         },
                     );
-                    let (params, ret, mut lowered_body) = scoped?;
+                    let (params, ret, named, mut lowered_body) = scoped?;
                     // Same move-ownership discipline as the Typed path above —
                     // one `apply_param_move_ownership` per param (see that call
                     // site and the fn doc for the collapsed-branch rationale).
@@ -18618,8 +18604,7 @@ impl<'a> Lowerer<'a> {
                     {
                         lowered_body = rewrite_tail_calls(id, arity, params.clone(), lowered_body);
                     }
-                    let type_params =
-                        compute_type_params(quantified_syms, var_bounds, &params, &ret);
+                    let type_params = compute_type_params(quantified_syms, var_bounds, &named);
                     return Ok(DefParts {
                         type_params,
                         // An unannotated def's tvars are all genuine
@@ -18633,20 +18618,21 @@ impl<'a> Lowerer<'a> {
                         body: lowered_body,
                     });
                 }
-                let (ret, lowered_body) = self.with_poly_tvars(
+                let (ret, named, lowered_body) = self.with_poly_tvars(
                     scope_poly,
                     BTreeSet::new(),
-                    || -> DResult<(IrType, Expr)> {
+                    || -> DResult<(IrType, BTreeSet<Symbol>, Expr)> {
                         let ret = self.signature_ir_type(solved_ty, sig_span)?;
                         // Save/set/restore fn_is_async for the 0-param (value-binding) path.
                         let prev_async = self.fn_is_async.get();
                         self.fn_is_async.set(matches!(ret, IrType::Task(_)));
-                        let lowered_body = self.with_erased_tvars(&[], &ret, var_bounds, || {
+                        let named = signature_generics(&[], &ret);
+                        let lowered_body = self.with_erased_tvars(&named, var_bounds, || {
                             self.reject_generic_app_entries_in(body, &BTreeSet::new())
                                 .and_then(|()| self.lower_returned_body(body, &ret))
                         });
                         self.fn_is_async.set(prev_async);
-                        Ok((ret, lowered_body?))
+                        Ok((ret, named, lowered_body?))
                     },
                 )?;
                 // Zero-param generalized value bindings (no value restriction,
@@ -18654,7 +18640,7 @@ impl<'a> Lowerer<'a> {
                 // take the identical `params: []` path the backend already
                 // emits for zero-arg fn calls — no shared mutable cell, no
                 // memoization to break.
-                let mut type_params = compute_type_params(quantified_syms, var_bounds, &[], &ret);
+                let mut type_params = compute_type_params(quantified_syms, var_bounds, &named);
                 apply_tea_carrier_bounds(&mut type_params, &[], &ret);
                 Ok(DefParts {
                     type_params,
@@ -20460,9 +20446,9 @@ impl<'a> Lowerer<'a> {
         out
     }
 
-    /// Run `f` with every generic of the current def that its lowered `params`
-    /// and `ret` do not name read by its [`ErasedTvar`]: `()` for one carrying
-    /// no obligation in `bounds`, a refusal for a bounded one.
+    /// Run `f` with every generic of the current def outside `named` (its
+    /// signature's `signature_generics`) read by its [`ErasedTvar`]: `()` for
+    /// one carrying no obligation in `bounds`, a refusal for a bounded one.
     ///
     /// An argument lowering may erase a generic (`Tag b` lowers to `Tag` when
     /// `Tag` never uses its parameter); the emitted function then has no Rust
@@ -20474,16 +20460,10 @@ impl<'a> Lowerer<'a> {
     /// Restored once `f` returns.
     fn with_erased_tvars<T>(
         &self,
-        params: &[(Symbol, IrType)],
-        ret: &IrType,
+        named: &BTreeSet<Symbol>,
         bounds: Option<&BTreeMap<Symbol, TyBounds>>,
         f: impl FnOnce() -> T,
     ) -> T {
-        let mut named = BTreeSet::new();
-        for (_, ty) in params {
-            collect_ir_generic_syms(ty, &mut named);
-        }
-        collect_ir_generic_syms(ret, &mut named);
         let erased: BTreeMap<ipe_types::SolverVar, ErasedTvar> = {
             let rows = self.current_row_params.borrow();
             self.current_poly_tvars
@@ -23378,7 +23358,7 @@ impl<'a> Lowerer<'a> {
                     // referenced as a value is its own zero-argument call
                     // (`x` → `x()`), its message slot pinned like any call's.
                     let pin = match &callee {
-                        Callee::Func(_) => self.user_func_pin(e, 0),
+                        Callee::Func(_) => self.user_func_pin(e),
                         Callee::Kernel(_) | Callee::Ffi { .. } => CallPin::None,
                     };
                     Ok(Expr::Call {
@@ -24538,8 +24518,9 @@ impl<'a> Lowerer<'a> {
         }
     }
 
-    /// The pin for a use of a user generic function `callee` applied to its
-    /// first `arity` arguments.
+    /// The pin for a direct call of a user generic function `callee`, at any
+    /// arity: saturated, a value reference, or the base call of an
+    /// over-application.
     ///
     /// Two kinds of type parameter are pinned, by the callee's scheme symbol:
     ///
@@ -24547,14 +24528,16 @@ impl<'a> Lowerer<'a> {
     ///   ([`ipe_types::ui_msg_only_vars`]), or the `any` return marker, which
     ///   this use leaves free ([`Self::ty_is_unbound_free`]): pinned to `()`,
     ///   the type the use's own node type lowered that slot to;
-    /// * every other one the declared argument types name: pinned to the
-    ///   use's solved instantiation, lowered as the use's node types are. The
+    /// * every other one the declared type names anywhere on its spine,
+    ///   arguments past the emitted arity and the return included: pinned to
+    ///   the use's solved instantiation, a free variable read as the eta and
+    ///   wildcard binders read it ([`Self::ir_type_from_ty_json`]). The
     ///   backend renders it only when no emitted parameter of the callee names
-    ///   it, which is when an argument lowering erased it.
+    ///   it, so the pin set never depends on the callee's Rust arity.
     ///
     /// Any other callee, or an instantiation the template match cannot align,
     /// pins nothing.
-    fn user_func_pin(&self, callee: &canon::Expr, arity: usize) -> CallPin {
+    fn user_func_pin(&self, callee: &canon::Expr) -> CallPin {
         let canon::Expr_::VarTopLevel { module, name } = &callee.value else {
             return CallPin::None;
         };
@@ -24584,11 +24567,11 @@ impl<'a> Lowerer<'a> {
             )
         };
         let mut pins: BTreeMap<Symbol, UserPin> = BTreeMap::new();
-        for raw in declared_arg_vars(declared, arity).difference(&msg_only) {
+        for raw in declared_vars(declared).difference(&msg_only) {
             let (Some(sym), Some(ty)) = (name_of(*raw), subst.get(raw)) else {
                 continue;
             };
-            let pin = match self.ir_type_from_ty_ui_msg(ty, callee.span) {
+            let pin = match self.ir_type_from_ty_json(ty, callee.span) {
                 Ok(lowered) => UserPin::Instance(lowered),
                 Err(refusal) => UserPin::Unlowered(Box::new(refusal)),
             };
@@ -25481,7 +25464,7 @@ impl<'a> Lowerer<'a> {
                         // free parameter is not an enclosing generic (which would
                         // already pin it — see `kernel_turbofish_pin`).
                         let pin = match &resolved {
-                            Callee::Func(_) => self.user_func_pin(callee, arity),
+                            Callee::Func(_) => self.user_func_pin(callee),
                             Callee::Kernel(_) | Callee::Ffi { .. } => {
                                 self.kernel_turbofish_pin(&resolved, args, call_span)
                             }
@@ -27596,7 +27579,7 @@ impl<'a> Lowerer<'a> {
         // applied; the affected kernels never take this shape, so only a user
         // callee's message slot can need a pin.
         let pin = match &resolved {
-            Callee::Func(_) => self.user_func_pin(callee, arity),
+            Callee::Func(_) => self.user_func_pin(callee),
             Callee::Kernel(_) | Callee::Ffi { .. } => CallPin::None,
         };
         Ok(Expr::Apply {
@@ -27723,12 +27706,16 @@ impl<'a> Lowerer<'a> {
         }
         self.advance_eta(residual);
         let ret = self.ir_type_from_ty_json(ret_ty, call_span)?;
+        let pin = match &resolved {
+            Callee::Func(_) => self.user_func_pin(callee),
+            Callee::Kernel(_) | Callee::Ffi { .. } => CallPin::None,
+        };
         // Body: apply (surplus + residual) args to the direct-call result at once.
         let body = Expr::Apply {
             func: Box::new(Expr::Call {
                 callee: resolved,
                 args: head,
-                pin: CallPin::None,
+                pin,
                 // Over-applied kernel base call — never `onSubmit`.
                 on_form: OnFormKind::NotForm,
             }),

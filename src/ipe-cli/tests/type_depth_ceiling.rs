@@ -22,7 +22,8 @@
 //! arrangement its constructors reach, together, and is refused at the
 //! constructor that permutes them. A parameter no field uses is accepted and
 //! erased from the emitted enum, and a generic its erasure leaves no argument
-//! to infer from is pinned at each call; a bounded generic only an erased
+//! to infer from is pinned at each call, as is one only an argument past the
+//! emitted arity or the return names; a bounded generic only an erased
 //! parameter names is refused with IPE-L0102 where its body reads it. A custom
 //! type whose instantiations grow past the size ceiling is refused with
 //! IPE-T0023 at the constructor applying the one that crosses it.
@@ -609,6 +610,46 @@ fn a_generic_named_only_by_an_erased_argument_is_pinned_at_each_call() {
             built.is_ok(),
             "the emitted crate must build with cargo: {}",
             built.err().unwrap_or_default()
+        );
+    }
+    let _ = std::fs::remove_dir_all(&scratch);
+}
+
+/// `mk` takes one Rust argument and returns a closure over the erased `Tag a`,
+/// so a call applying both arguments names `a` through no emitted argument;
+/// `none`'s `a` is named by its return alone and left free at the use.
+const SPINE_ONLY_PIN: &str = "module Main exposing (main)\n\nimport Ipe.Io as Io\nimport Ipe.List as List\n\n\ntype Tag a\n    = Tag\n\n\nmk : Int -> Tag a -> List a\nmk _ =\n    \\_ -> []\n\n\ncount : Tag Int -> Int\ncount t =\n    List.length (mk 1 t)\n\n\nnone : Int -> List a\nnone _ =\n    []\n\n\ncountNone : Int -> Int\ncountNone n =\n    List.length (none n)\n\n\nmain =\n    Io.println (if count Tag + countNone 3 == 0 then \"zero\" else \"other\")\n";
+
+/// A generic no emitted Rust argument names is pinned at each call whatever
+/// the callee's Rust arity: `i64` where the declared argument past the Rust
+/// arity fixes it, and a pin where only the return names it. The emitted calls
+/// are read in the CI `test-run` job; the crate builds and runs under
+/// `IPE_E2E=1` (the CI `e2e` job).
+#[test]
+fn a_generic_named_past_the_emitted_arity_is_pinned_at_each_call() {
+    let runtime = e2e_support::require_runtime().into_path_buf();
+    let scratch = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("ipe_type_ceiling_spine_pin_{}", std::process::id()));
+    let emitted = ipe::RootFixture::main(SPINE_ONLY_PIN)
+        .and_then(|fixture| ipe::build_fixture(&fixture, &scratch, &runtime).map(|_| ()));
+    assert!(emitted.is_ok(), "must emit: {emitted:?}");
+    let mk = turbofish_calls(&scratch, "mk");
+    assert!(
+        mk.iter().any(|line| line.contains("mk::<i64>(")),
+        "the over-applied `Tag Int` call must pin `i64`: {mk:?}"
+    );
+    let none = turbofish_calls(&scratch, "none");
+    assert!(
+        !none.is_empty(),
+        "the return-only generic must be pinned: {none:?}"
+    );
+    if e2e_support::e2e_tier() == e2e_support::Tier::E2e {
+        let ran = e2e_support::build_and_run_rust("type_ceiling_spine_pin", &scratch);
+        assert!(
+            ran.as_ref()
+                .is_ok_and(|run| run.exit_code == Some(0) && run.stdout == "zero\n"),
+            "the emitted crate must build with cargo and print `zero`: {:?}",
+            ran.map(|run| (run.exit_code, run.stdout))
         );
     }
     let _ = std::fs::remove_dir_all(&scratch);
