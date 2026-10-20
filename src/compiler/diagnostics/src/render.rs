@@ -747,6 +747,9 @@ fn lower_prose(msg: &LowerError) -> String {
         LowerError::BackendNestingTooDeep { .. } => {
             "This expression nests deeper than I can compile.".to_string()
         }
+        LowerError::BackendTypeTooDeep { .. } => {
+            "A type here nests deeper than I can compile.".to_string()
+        }
         LowerError::DecodeSucceedArityTooHigh { .. } => {
             "This decoder builds a value with more fields than I can wire up at once.".to_string()
         }
@@ -1986,6 +1989,15 @@ fn lower_label(msg: &LowerError) -> String {
             |site| {
                 format!(
                     "`{}` nests past the backend limit of {limit}",
+                    site.qualified()
+                )
+            },
+        ),
+        LowerError::BackendTypeTooDeep { limit, func } => func.as_ref().map_or_else(
+            || format!("a type nests past the backend limit of {limit}"),
+            |site| {
+                format!(
+                    "a type in `{}` nests past the backend limit of {limit}",
                     site.qualified()
                 )
             },

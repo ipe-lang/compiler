@@ -812,8 +812,9 @@ pub fn emit_init_hot_for_func(
 /// `pub(crate)` form is seven columns wider than `pub`, so a borderline signature
 /// breaks under one and not the other.
 ///
-/// A nesting refusal raised anywhere in the body leaves here naming this
-/// function ([`LowerError::BackendNestingTooDeep`]'s `func`).
+/// A nesting refusal raised anywhere in the body or signature leaves here
+/// naming this function (the `func` of [`LowerError::BackendNestingTooDeep`]
+/// and [`LowerError::BackendTypeTooDeep`]).
 pub fn emit_func_vis(ctx: &EmitCtx, func: &Func, vis_prefix: &str) -> DResult<String> {
     emit_func_item(ctx, func, vis_prefix).map_err(|diag| name_nesting_site(ctx, func, diag))
 }
@@ -832,6 +833,16 @@ fn name_nesting_site(ctx: &EmitCtx, func: &Func, diag: Diagnostic) -> Diagnostic
         } => Diagnostic::Lower {
             span,
             msg: LowerError::BackendNestingTooDeep {
+                limit,
+                func: emit_site(ctx, func),
+            },
+        },
+        Diagnostic::Lower {
+            span,
+            msg: LowerError::BackendTypeTooDeep { limit, func: None },
+        } => Diagnostic::Lower {
+            span,
+            msg: LowerError::BackendTypeTooDeep {
                 limit,
                 func: emit_site(ctx, func),
             },
