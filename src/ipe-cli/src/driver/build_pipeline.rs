@@ -1399,6 +1399,9 @@ fn emit_site_source<'s>(
         msg:
             ipe_diagnostics::LowerError::BackendNestingTooDeep {
                 func: Some(site), ..
+            }
+            | ipe_diagnostics::LowerError::BackendTypeTooDeep {
+                func: Some(site), ..
             },
         ..
     } = diag

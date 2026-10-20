@@ -704,6 +704,8 @@ code! {
     IPE_L0162 = "IPE-L0162", "`onNavigate` is set but the Model has no `page` field", "IPE-L0162";
     /// expression nests too deeply for the backend
     IPE_L0200 = "IPE-L0200", "expression nests too deeply for the backend", "IPE-L0200";
+    /// a type nests too deeply for the backend
+    IPE_L0201 = "IPE-L0201", "a type nests too deeply for the backend", "IPE-L0201";
 
     // -----------------------------------------------------------------------
     // FFI (IPE-F####)
