@@ -28,7 +28,7 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use ipe_canon::ast as canon;
-use ipe_diagnostics::nesting::{TYPE_DEPTH_LIMIT, TYPE_LEVELS_PER_ARROW};
+use ipe_diagnostics::nesting::{TYPE_DEPTH_LIMIT, TYPE_LEVELS_PER_ARROW, TYPE_SIZE_LIMIT};
 use ipe_diagnostics::{DResult, Diagnostic, Span, TypeError};
 use ipe_intern::{Interner, Symbol};
 
@@ -428,17 +428,80 @@ struct DeclaredTooDeep<'u> {
     depth: u16,
 }
 
-/// `t` with each of `vars` replaced by the type at its position in `vals`,
-/// ticking `budget` once per node of `t`.
+/// A declaration [`nominal_levels`] refuses.
+#[derive(Clone, Copy, Debug)]
+enum Refused<'u> {
+    /// A module's own declaration past [`TYPE_DEPTH_LIMIT`].
+    TooDeep(DeclaredTooDeep<'u>),
+    /// The declaration and constructor that instantiate a member of a group
+    /// with arguments past [`TYPE_SIZE_LIMIT`] nodes.
+    TooLarge(&'u canon::Union, Span),
+}
+
+#[cfg(test)]
+impl<'u> Refused<'u> {
+    /// The depth refusal, if this is one.
+    const fn too_deep(self) -> Option<DeclaredTooDeep<'u>> {
+        match self {
+            Self::TooDeep(found) => Some(found),
+            Self::TooLarge(..) => None,
+        }
+    }
+}
+
+/// A type together with the number of nodes it holds.
+#[derive(Debug, PartialEq, Eq)]
+struct Counted {
+    ty: canon::Type,
+    size: u64,
+}
+
+impl Counted {
+    /// A type variable, one node.
+    const fn var(v: Symbol) -> Self {
+        Self {
+            ty: canon::Type::Var(v),
+            size: 1,
+        }
+    }
+}
+
+/// `t` with each of `vars` replaced by the value at its position in `vals`,
+/// or `None` when the result would hold more than `room` nodes.
 ///
-/// A variable with no value (an application given too few arguments) is left
-/// as written. Iterative: one explicit stack.
+/// The result's size is counted, one budget tick per node of `t`, and charged
+/// to `budget` in full before any value is copied. A variable with no value
+/// (an application given too few arguments) is left as written. Iterative:
+/// one explicit stack.
 fn substitute(
     t: &canon::Type,
     vars: &[Symbol],
-    vals: &[canon::Type],
+    vals: &[Counted],
+    room: u64,
     budget: &mut Budget,
-) -> DResult<canon::Type> {
+) -> DResult<Option<Counted>> {
+    let value = |v: &Symbol| vars.iter().position(|p| p == v).and_then(|i| vals.get(i));
+    let mut size = 0u64;
+    let mut work = vec![t];
+    while let Some(node) = work.pop() {
+        budget.tick()?;
+        let own = match node {
+            canon::Type::Var(v) => value(v).map_or(1, |val| val.size),
+            canon::Type::Wildcard
+            | canon::Type::Unit
+            | canon::Type::Lambda(..)
+            | canon::Type::Con { .. }
+            | canon::Type::Tuple(_)
+            | canon::Type::Record(_)
+            | canon::Type::RecordOpen(..) => 1,
+        };
+        size = size.saturating_add(own);
+        if size > room {
+            return Ok(None);
+        }
+        push_children(node, &mut work);
+    }
+    budget.charge(size)?;
     let mut work: Vec<(&canon::Type, bool)> = vec![(t, false)];
     let mut done: Vec<canon::Type> = Vec::new();
     let mut children = Vec::new();
@@ -446,7 +509,6 @@ fn substitute(
         children.clear();
         push_children(node, &mut children);
         if !expanded {
-            budget.tick()?;
             work.push((node, true));
             work.extend(children.iter().rev().map(|c| (*c, false)));
             continue;
@@ -458,12 +520,7 @@ fn substitute(
         let mut kids = done.split_off(at).into_iter();
         let mut next = || kids.next().ok_or_else(walk_bug);
         let rebuilt = match node {
-            canon::Type::Var(v) => vars
-                .iter()
-                .position(|p| p == v)
-                .and_then(|i| vals.get(i))
-                .cloned()
-                .unwrap_or(canon::Type::Var(*v)),
+            canon::Type::Var(v) => value(v).map_or(canon::Type::Var(*v), |val| val.ty.clone()),
             canon::Type::Wildcard => canon::Type::Wildcard,
             canon::Type::Unit => canon::Type::Unit,
             canon::Type::Lambda(..) => {
@@ -494,7 +551,8 @@ fn substitute(
         };
         done.push(rebuilt);
     }
-    done.pop().ok_or_else(walk_bug)
+    let ty = done.pop().ok_or_else(walk_bug)?;
+    Ok(Some(Counted { ty, size }))
 }
 
 /// One instantiation of a member of a recursive group.
@@ -502,7 +560,9 @@ struct Instance<'u> {
     member: usize,
     /// The member's arguments, written over the parameters of the member the
     /// walk started from.
-    args: Vec<canon::Type>,
+    args: Vec<Counted>,
+    /// The nodes the arguments hold together.
+    size: u64,
     /// The declaration and constructor whose payload applied the member.
     applied_by: Option<(&'u canon::Union, Span)>,
 }
@@ -510,6 +570,15 @@ struct Instance<'u> {
 /// The constructor that applied a member of a group a second time, with other
 /// arguments.
 type Reapplied<'u> = Option<(&'u canon::Union, Span)>;
+
+/// What walking a recursive group's instantiations found.
+enum Orbit<'u> {
+    /// The group's level, and the constructor that reapplied a member.
+    Level(u16, Reapplied<'u>),
+    /// An instantiation whose arguments hold more than [`TYPE_SIZE_LIMIT`]
+    /// nodes, at the declaration and constructor that built it.
+    TooLarge(&'u canon::Union, Span),
+}
 
 /// The level of the recursive group `costs` holds, walked from `root`, and the
 /// constructor that first applied a member a second time with other arguments.
@@ -522,31 +591,40 @@ type Reapplied<'u> = Option<(&'u canon::Union, Span)>;
 /// deepest argument. The walk stops as soon as the sum passes
 /// [`TYPE_DEPTH_LIMIT`]: every member of a recursive group costs at least one
 /// level, so at most `TYPE_DEPTH_LIMIT + 1` instantiations are built however
-/// many the group has.
+/// many the group has. An instantiation whose arguments would hold more than
+/// [`TYPE_SIZE_LIMIT`] nodes is refused before it is built, and every node
+/// built or compared is charged to `budget`.
 fn orbit_level<'u>(
     table: &Table<'u>,
     costs: &BTreeMap<usize, u16>,
     root: usize,
     budget: &mut Budget,
     named: &dyn Fn(&[Symbol], Symbol) -> Named,
-) -> DResult<(u16, Reapplied<'u>)> {
+) -> DResult<Orbit<'u>> {
     let start = table.union(root)?;
+    let size = u64::try_from(start.vars.len()).unwrap_or(u64::MAX);
+    if size > TYPE_SIZE_LIMIT {
+        return Ok(Orbit::TooLarge(start, start.name_span));
+    }
+    budget.charge(size)?;
     let mut pending = VecDeque::from([Instance {
         member: root,
-        args: start.vars.iter().map(|v| canon::Type::Var(*v)).collect(),
+        args: start.vars.iter().copied().map(Counted::var).collect(),
+        size,
         applied_by: None,
     }]);
-    let mut built: Vec<(usize, Vec<canon::Type>)> = Vec::new();
+    let mut built: Vec<Instance<'u>> = Vec::new();
     let mut level = 0u16;
     let mut reapplied = None;
     while let Some(instance) = pending.pop_front() {
         let mut member_seen = false;
         let mut instance_seen = false;
-        for (member, args) in &built {
+        for other in &built {
             budget.tick()?;
-            if *member == instance.member {
+            if other.member == instance.member {
                 member_seen = true;
-                if *args == instance.args {
+                budget.charge(other.size.min(instance.size))?;
+                if other.args == instance.args {
                     instance_seen = true;
                     break;
                 }
@@ -561,7 +639,7 @@ fn orbit_level<'u>(
         let cost = costs.get(&instance.member).copied().ok_or_else(walk_bug)?;
         let mut widest = 0u16;
         for arg in &instance.args {
-            widest = widest.max(declared_depth(arg, budget, named)?);
+            widest = widest.max(declared_depth(&arg.ty, budget, named)?);
         }
         level = level.saturating_add(cost.saturating_add(widest));
         if level > TYPE_DEPTH_LIMIT {
@@ -575,22 +653,31 @@ fn orbit_level<'u>(
                         && let Some(target) = table.find(home, *name)
                         && costs.contains_key(&target)
                     {
-                        let args = args
-                            .iter()
-                            .map(|arg| substitute(arg, &union.vars, &instance.args, budget))
-                            .collect::<DResult<Vec<_>>>()?;
+                        let mut applied = Vec::with_capacity(args.len());
+                        let mut size = 0u64;
+                        for arg in args {
+                            let room = TYPE_SIZE_LIMIT.saturating_sub(size);
+                            let Some(value) =
+                                substitute(arg, &union.vars, &instance.args, room, budget)?
+                            else {
+                                return Ok(Orbit::TooLarge(union, ctor.span));
+                            };
+                            size = size.saturating_add(value.size);
+                            applied.push(value);
+                        }
                         pending.push_back(Instance {
                             member: target,
-                            args,
+                            args: applied,
+                            size,
                             applied_by: Some((union, ctor.span)),
                         });
                     }
                 }
             }
         }
-        built.push((instance.member, instance.args));
+        built.push(instance);
     }
-    Ok((level, reapplied))
+    Ok(Orbit::Level(level, reapplied))
 }
 
 /// The levels of every declaration in the table, plus the shallowest of the
@@ -606,7 +693,7 @@ fn orbit_level<'u>(
 fn nominal_levels<'u>(
     table: &Table<'u>,
     budget: &mut Budget,
-) -> DResult<(NominalLevels, Option<DeclaredTooDeep<'u>>)> {
+) -> DResult<(NominalLevels, Option<Refused<'u>>)> {
     let mut succ: Vec<Vec<usize>> = Vec::with_capacity(table.unions.len());
     for union in &table.unions {
         let mut targets = BTreeSet::new();
@@ -651,7 +738,12 @@ fn nominal_levels<'u>(
         let mut level = 0u16;
         let mut reapplied = None;
         for &root in group {
-            let (from_root, again) = orbit_level(table, &costs, root, budget, &named)?;
+            let (from_root, again) = match orbit_level(table, &costs, root, budget, &named)? {
+                Orbit::Level(from_root, again) => (from_root, again),
+                Orbit::TooLarge(by, span) => {
+                    return Ok((levels, Some(Refused::TooLarge(by, span))));
+                }
+            };
             if from_root > level {
                 level = from_root;
                 reapplied = again;
@@ -697,7 +789,7 @@ fn nominal_levels<'u>(
             }
         }
     }
-    Ok((levels, refused))
+    Ok((levels, refused.map(Refused::TooDeep)))
 }
 
 /// Check the module's declarations and top-level annotations, and return the
@@ -707,7 +799,10 @@ fn nominal_levels<'u>(
 /// ([`TypeError::ExpansiveRecursion`], at its declaration); a custom type whose
 /// level passes [`TYPE_DEPTH_LIMIT`] ([`TypeError::TypeTooDeep`], at the
 /// constructor whose payload crosses it); and a top-level annotation deeper
-/// than the ceiling ([`TypeError::TypeTooDeep`], at the annotated name). Every
+/// than the ceiling ([`TypeError::TypeTooDeep`], at the annotated name); and a
+/// recursive group that instantiates a member with arguments past
+/// [`TYPE_SIZE_LIMIT`] nodes ([`TypeError::TypeTooLarge`], at the constructor
+/// that applies it). Every
 /// declaration and annotation is measured, used or not.
 ///
 /// # Errors
@@ -739,11 +834,17 @@ pub fn check_declarations(
     }
     let table = Table::new(&module.unions, dep_unions);
     let (levels, refused) = nominal_levels(&table, budget).map_err(InferError::unsited)?;
-    if let Some(found) = refused {
-        return Err(InferError::sited_at_path(
-            too_deep(found.span, found.depth),
-            &found.union.home,
-        ));
+    match refused {
+        None => {}
+        Some(Refused::TooDeep(found)) => {
+            return Err(InferError::sited_at_path(
+                too_deep(found.span, found.depth),
+                &found.union.home,
+            ));
+        }
+        Some(Refused::TooLarge(union, span)) => {
+            return Err(InferError::sited_at_path(too_large(span), &union.home));
+        }
     }
     let named = |home: &[Symbol], name: Symbol| Named::Level(levels.level(home, name));
     for def in &module.defs {
@@ -768,6 +869,16 @@ const fn too_deep(span: Span, depth: u16) -> Diagnostic {
     }
 }
 
+/// [`TypeError::TypeTooLarge`] for a declared type built past [`TYPE_SIZE_LIMIT`] at `span`.
+const fn too_large(span: Span) -> Diagnostic {
+    Diagnostic::Type {
+        span,
+        msg: TypeError::TypeTooLarge {
+            limit: TYPE_SIZE_LIMIT,
+        },
+    }
+}
+
 /// A declaration's symbol has no spelling in the interner.
 fn unresolved(s: Symbol) -> Diagnostic {
     Diagnostic::CompilerBug {
@@ -779,6 +890,7 @@ fn unresolved(s: Symbol) -> Diagnostic {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::SolverSteps;
 
     fn budget() -> Budget {
         Budget::unbounded()
@@ -942,7 +1054,9 @@ mod tests {
         assert_eq!(levels.level(&home, ta), deep);
         assert_eq!(levels.level(&home, tb), deep);
         // Refused at a member's payload constructor, over the other's cost.
-        let refused = refused.map(|r| (r.span, r.depth));
+        let refused = refused
+            .and_then(Refused::too_deep)
+            .map(|r| (r.span, r.depth));
         assert!(
             refused.is_some_and(|(span, depth)| depth == deep && payload_spans.contains(&span)),
             "{refused:?}",
@@ -1031,7 +1145,9 @@ mod tests {
         let (_, refused) = nominal_levels(&table, &mut budget())?;
         let past_lo = u32::try_from(past).unwrap_or(u32::MAX);
         assert_eq!(
-            refused.map(|r| (r.union.name, r.span, r.depth)),
+            refused
+                .and_then(Refused::too_deep)
+                .map(|r| (r.union.name, r.span, r.depth)),
             names.get(past).map(|n| (
                 *n,
                 Span::new(past_lo, past_lo.saturating_add(1)),
@@ -1172,7 +1288,11 @@ mod tests {
         let table = Table::new(&past, &[]);
         let (_, refused) = nominal_levels(&table, &mut budget())?;
         assert_eq!(
-            refused.map(|found| (found.union.name, found.span, found.depth)),
+            refused.and_then(Refused::too_deep).map(|found| (
+                found.union.name,
+                found.span,
+                found.depth
+            )),
             Some((r, Span::new(2, 3), TYPE_DEPTH_LIMIT + 2)),
         );
         Ok(())
@@ -1200,6 +1320,75 @@ mod tests {
         assert_eq!(expansive_cycle(&unions, &[], &mut budget())?, None);
         // `A a` and `A a a` are two instantiations, each costing 2.
         assert_eq!(levels_of(&unions)?.level(&home, t), 4);
+        Ok(())
+    }
+
+    /// `type B p1 … pk = B p1 … pk` and `type T a b c d = Z | X (T Int (B a … a)
+    /// (B b … b) (B c … c))`, `X` spanned at byte 7.
+    fn widening(names: &mut Interner, k: usize) -> DResult<[canon::Union; 2]> {
+        let home = [names.intern("Main")?];
+        let (b, t, int) = (names.intern("B")?, names.intern("T")?, names.intern("Int")?);
+        let (z, x) = (names.intern("Z")?, names.intern("X")?);
+        let params = (1..=k)
+            .map(|n| names.intern(&format!("p{n}")))
+            .collect::<DResult<Vec<Symbol>>>()?;
+        let vars = ["a", "b", "c", "d"]
+            .iter()
+            .map(|v| names.intern(v))
+            .collect::<DResult<Vec<Symbol>>>()?;
+        let over = |v: Symbol| con(&home, b, vec![canon::Type::Var(v); k]);
+        let applied = std::iter::once(con(&home, int, vec![]))
+            .chain(vars.iter().take(3).copied().map(over))
+            .collect();
+        let held = params.iter().map(|p| canon::Type::Var(*p)).collect();
+        let mut grows = union(
+            &home,
+            t,
+            vars,
+            vec![(z, vec![]), (x, vec![con(&home, t, applied)])],
+        );
+        if let Some(ctor) = grows.ctors.get_mut(1) {
+            ctor.span = Span::new(7, 8);
+        }
+        Ok([union(&home, b, params, vec![(b, held)]), grows])
+    }
+
+    #[test]
+    fn instantiations_widening_past_the_size_ceiling_are_refused_before_they_are_built()
+    -> DResult<()> {
+        let mut i = Interner::new();
+        // The largest instantiation holds `4 + 3k + 2k^2 + k^3` nodes: 62 482
+        // at 39, 67 324 at 40.
+        let fits = widening(&mut i, 39)?;
+        let table = Table::new(&fits, &[]);
+        let (levels, refused) = nominal_levels(&table, &mut budget())?;
+        assert!(refused.is_none(), "{refused:?}");
+        let home = [i.intern("Main")?];
+        assert_eq!(levels.level(&home, i.intern("T")?), 24);
+        for k in [40, 1500] {
+            let past = widening(&mut i, k)?;
+            let table = Table::new(&past, &[]);
+            // A budget far below the nodes the widest instantiation would copy.
+            let steps = SolverSteps::new(1_000_000).ok_or_else(walk_bug)?;
+            let (_, refused) = nominal_levels(&table, &mut Budget::new(steps))?;
+            let at = match refused {
+                Some(Refused::TooLarge(by, span)) => Some((by.name, span)),
+                Some(Refused::TooDeep(_)) | None => None,
+            };
+            assert_eq!(at, Some((i.intern("T")?, Span::new(7, 8))), "{refused:?}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn a_charge_past_the_budget_exhausts_it() -> DResult<()> {
+        let steps = SolverSteps::new(10).ok_or_else(walk_bug)?;
+        let mut budget = Budget::new(steps);
+        budget.charge(4)?;
+        assert_eq!(budget.spent(), 4);
+        assert!(budget.charge(7).is_err());
+        assert_eq!(budget.spent(), 10);
+        assert!(budget.tick().is_err());
         Ok(())
     }
 }

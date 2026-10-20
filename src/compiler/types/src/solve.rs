@@ -154,6 +154,31 @@ impl Budget {
         self.limit.get().saturating_sub(self.remaining)
     }
 
+    /// Consume `steps` steps at once, all or none.
+    ///
+    /// A refused charge leaves the budget exhausted, as a refused tick does.
+    ///
+    /// # Errors
+    /// [`TypeError::StepBudgetExceeded`] when fewer than `steps` remain,
+    /// carrying the configured `limit`.
+    pub const fn charge(&mut self, steps: u64) -> DResult<()> {
+        match self.remaining.checked_sub(steps) {
+            Some(next) => {
+                self.remaining = next;
+                Ok(())
+            }
+            None => {
+                self.remaining = 0;
+                Err(Diagnostic::Type {
+                    span: Span::DUMMY,
+                    msg: TypeError::StepBudgetExceeded {
+                        budget: self.limit.get(),
+                    },
+                })
+            }
+        }
+    }
+
     /// Consume one step.
     ///
     /// # Errors

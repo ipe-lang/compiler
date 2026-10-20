@@ -21,7 +21,9 @@
 //! A custom type passing its parameters on permuted is as deep as every
 //! arrangement its constructors reach, together, and is refused at the
 //! constructor that permutes them. A parameter no field uses is accepted and
-//! erased from the emitted enum.
+//! erased from the emitted enum. A custom type whose instantiations grow past
+//! the size ceiling is refused with IPE-T0023 at the constructor applying the
+//! one that crosses it.
 
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
@@ -581,6 +583,55 @@ fn a_type_doubling_past_the_size_ceiling_is_refused() {
             },
         })
     );
+}
+
+/// `type B p1 … pk = B p1 … pk` and `type T a b c d = Z | X (T Int (B a … a)
+/// (B b … b) (B c … c))`, and the span of `X`'s name.
+///
+/// Each instantiation of `T` holds `B` over the previous one's arguments, so
+/// the largest, `B (B (B Int …) …) …`, is `1 + k + k^2 + k^3` nodes: shallow,
+/// but `k` times larger at each step.
+fn widening(k: usize) -> Chain {
+    let params: Vec<String> = (1..=k).map(|n| format!("p{n}")).collect();
+    let over = |v: &str| format!("(B{})", format!(" {v}").repeat(k));
+    let src = with_decls(&format!(
+        "type B {params}\n    = B {params}\n\n\ntype T a b c d\n    = Z\n    | X (T Int {} {} {})\n\n\n",
+        over("a"),
+        over("b"),
+        over("c"),
+        params = params.join(" "),
+    ));
+    let at = span_of(&src, "| X (", 0);
+    Chain {
+        refused_at: Span {
+            lo: at.lo + 2,
+            hi: at.lo + 3,
+        },
+        src,
+    }
+}
+
+/// A recursive type whose instantiations widen past [`TYPE_SIZE_LIMIT`] nodes
+/// is refused with IPE-T0023 at the constructor that applies the widening
+/// instantiation, before any of it is built; the widest that fits is accepted.
+#[test]
+fn a_type_whose_instantiations_widen_past_the_size_ceiling_is_refused() {
+    let fits = front_check(&widening(39).src);
+    assert!(fits.is_ok(), "a widening of 39 must be accepted: {fits:?}");
+    for k in [40, 1500] {
+        let past = widening(k);
+        let refused = front_check(&past.src);
+        assert_eq!(
+            refusal(&refused),
+            Some(&Diagnostic::Type {
+                span: past.refused_at,
+                msg: TypeError::TypeTooLarge {
+                    limit: TYPE_SIZE_LIMIT,
+                },
+            }),
+            "a widening of {k} must be refused: {refused:?}"
+        );
+    }
 }
 
 /// `main`'s body comparing the last binding with `0`, a type mismatch for
