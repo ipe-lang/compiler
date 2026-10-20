@@ -293,7 +293,7 @@ fn cfree_contradictions_are_refused_at_the_cli_boundary() {
     let err = ipe::run_cli(&[
         "dev".into(),
         "build".into(),
-        project_arg.clone(),
+        project_arg,
         "--static".into(),
         "--cfree".into(),
     ])
@@ -334,7 +334,7 @@ fn run_subcommand_refuses_like_build() {
     let err = ipe::run_cli(&[
         "dev".into(),
         "run".into(),
-        project_arg.clone(),
+        project_arg,
         "--target".into(),
         "x86_64-unknown-linux-musl".into(),
     ])
