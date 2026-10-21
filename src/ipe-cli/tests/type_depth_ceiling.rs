@@ -643,8 +643,8 @@ fn a_generic_named_past_the_emitted_arity_is_pinned_at_each_call() {
     );
     let none = turbofish_calls(&scratch, "none");
     assert!(
-        !none.is_empty(),
-        "the return-only generic must be pinned: {none:?}"
+        none.iter().any(|line| line.contains("none::<JsonVal>(")),
+        "the unbounded return-only generic must be pinned to `JsonVal`: {none:?}"
     );
     if e2e_support::e2e_tier() == e2e_support::Tier::E2e {
         let ran = e2e_support::build_and_run_rust("type_ceiling_spine_pin", &scratch);
@@ -692,6 +692,37 @@ fn a_bounded_generic_only_an_erased_parameter_names_is_refused_where_it_is_read(
             && (body.lo..=main_at.lo).contains(&s.hi)),
         "refused at {span:?}, not inside doubledCount's body {}..{}: {built:?}",
         body.lo,
+        main_at.lo
+    );
+    let emitted = rust_sources(&scratch);
+    assert!(emitted.is_empty(), "no Rust may be emitted: {emitted:?}");
+    let _ = std::fs::remove_dir_all(&scratch);
+}
+
+/// `empties` returns a `Set` of a variable no argument names, so its one use
+/// reads that variable as `JsonVal`, which has no total order.
+const ORDERED_FREE_PIN: &str = "module Main exposing (main)\n\nimport Ipe.Io as Io\nimport Ipe.Set as Set\n\n\nempties : Int -> Set comparable\nempties _ =\n    Set.fromList []\n\n\nmain =\n    Io.println (if Set.size (empties 1) == 0 then \"zero\" else \"other\")\n";
+
+/// A free variable pinned where the callee bounds it by a trait `JsonVal`
+/// lacks (`Ord` for a `Set` element) is refused with IPE-L0102 at the calling
+/// definition, never emitted as a turbofish cargo refuses (E0277). Read in the
+/// CI `test-run` job.
+#[test]
+fn a_free_variable_pinned_on_an_ordered_parameter_is_refused_at_the_caller() {
+    let runtime = e2e_support::require_runtime().into_path_buf();
+    let scratch = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!(
+        "ipe_type_ceiling_ordered_free_pin_{}",
+        std::process::id()
+    ));
+    let built = ipe::RootFixture::main(ORDERED_FREE_PIN)
+        .and_then(|fixture| ipe::build_fixture(&fixture, &scratch, &runtime).map(|_| ()));
+    let diag = refusal(&built);
+    assert_eq!(diag.map(Diagnostic::code), Some(IPE_L0102), "{built:?}");
+    let main_at = span_of(ORDERED_FREE_PIN, "main =", 0);
+    let span = diag.map(Diagnostic::primary_span);
+    assert!(
+        span.is_some_and(|s| s.lo == main_at.lo && s.lo < s.hi),
+        "refused at {span:?}, not at `main` {}: {built:?}",
         main_at.lo
     );
     let emitted = rust_sources(&scratch);

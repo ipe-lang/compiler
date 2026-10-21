@@ -673,6 +673,17 @@ impl BoundSet {
         self.0 == 0
     }
 
+    /// Whether every bound in this set holds for [`IrType::Json`] (`JsonVal`,
+    /// which is `Clone + PartialEq + Eq + Hash + Send + Sync + 'static` and
+    /// nothing more). An ordering, `Copy`, arithmetic, rendering, row or
+    /// bind-parameter bound does not.
+    #[must_use]
+    pub const fn met_by_json(self) -> bool {
+        let json_traits =
+            Self::CLONE | Self::EQ | Self::HASH | Self::STATIC | Self::SEND | Self::SYNC;
+        self.0 & !json_traits == 0
+    }
+
     /// This set with the `::core::ops::Add<Output = Self>` (Number `+`) bound.
     #[must_use]
     pub const fn with_add(self) -> Self {
@@ -900,6 +911,167 @@ pub struct Func {
     pub params: Vec<crate::Param>,
     pub ret: IrType,
     pub body: Expr,
+}
+
+impl Func {
+    /// The type parameters some parameter type names. A call's arguments let
+    /// rustc infer each of them, so a pin on one renders only when it is
+    /// [`UserPin::Unit`] ([`UserPin::renders`]).
+    #[must_use]
+    pub fn generics_named_by_params(&self) -> BTreeSet<Symbol> {
+        let mut named: Vec<Symbol> = Vec::new();
+        for param in &self.params {
+            collect_generics(&param.ty, &mut named);
+        }
+        named.into_iter().collect()
+    }
+}
+
+/// Collect the distinct [`IrType::Generic`] symbols in `ty`, appending each (in
+/// first-occurrence order) to `out` if not already present.
+#[allow(clippy::too_many_lines)] // one exhaustive arm per IrType variant — the completeness is the point
+pub fn collect_generics(ty: &IrType, out: &mut Vec<Symbol>) {
+    match ty {
+        IrType::Generic(s) => {
+            if !out.contains(s) {
+                out.push(*s);
+            }
+        }
+        IrType::Tuple(elems) => {
+            for e in elems {
+                collect_generics(e, out);
+            }
+        }
+        IrType::Record(map) => {
+            for v in map.values() {
+                collect_generics(v, out);
+            }
+        }
+        IrType::Fun(params, ret)
+        | IrType::SharedFun(params, ret)
+        | IrType::FnOnceChain(params, ret) => {
+            for p in params {
+                collect_generics(p, out);
+            }
+            collect_generics(ret, out);
+        }
+        IrType::Enum { args, .. } => {
+            for a in args {
+                collect_generics(a, out);
+            }
+        }
+        IrType::Maybe(elem) | IrType::List(elem) => collect_generics(elem, out),
+        IrType::Result(err, ok) => {
+            collect_generics(err, out);
+            collect_generics(ok, out);
+        }
+        IrType::Dict(k, v) => {
+            collect_generics(k, out);
+            collect_generics(v, out);
+        }
+        IrType::Set(a) => collect_generics(a, out),
+        IrType::Decoder(inner) | IrType::Task(inner) | IrType::Cmd(inner) | IrType::Sub(inner) => {
+            collect_generics(inner, out);
+        }
+        IrType::Int
+        | IrType::Float
+        | IrType::Bool
+        | IrType::Str
+        | IrType::Char
+        | IrType::Unit
+        | IrType::Bytes
+        | IrType::Json
+        // `Db` is monomorphic — no generic parameters to collect.
+        | IrType::Db
+        // Opaque server types are monomorphic.
+        | IrType::ServerRequest
+        | IrType::ServerResponse
+        | IrType::ServerRoute
+        | IrType::ServerCookie
+        // `StreamWriter` is monomorphic — no generics to collect.
+        | IrType::StreamWriter
+        // `HttpRequest` is monomorphic — no generics to collect.
+        | IrType::HttpRequest
+        // `Regex` is a monomorphic opaque handle — no generics to collect.
+        | IrType::Regex
+        // `WsHandle` / `WsServerCfg` are monomorphic — no generics to collect.
+        | IrType::WebSocketServer
+        | IrType::WebSocketServerCfg
+        // nullary plain types and the opaque live request handle
+        // contribute no generics.
+        | IrType::UiPlain(_)
+        | IrType::WebReq
+        | IrType::SessionHandle
+        // `Order` is monomorphic — no generics to collect.
+        // `HttpMethod` is monomorphic — no generics to collect.
+        // `Decimal` is monomorphic — no generics to collect.
+        // `BackoffStrategy` is monomorphic — no generics to collect.
+        | IrType::BackoffStrategy
+        | IrType::Order
+        | IrType::HttpMethod
+        | IrType::Decimal
+        | IrType::ErrorKind
+        | IrType::Error
+        | IrType::ErrorDetails
+        // Nominal error-payload leaves (SEAL fix) — monomorphic
+        // runtime structs, same classification as `Error`/`ErrorDetails`.
+        | IrType::ErrorInfo
+        | IrType::PanicInfo
+        | IrType::TypeInfo
+        // `SqlFragment` is monomorphic — no generics to collect.
+        // `Secret` is monomorphic — no generics to collect.
+        | IrType::SqlFragment
+        | IrType::Secret
+        | IrType::Path
+        // `Url` is a monomorphic opaque wrapper — no generics to collect.
+        | IrType::Url
+        | IrType::UrlRelative
+        // `Dsn` is a monomorphic opaque wrapper — no generics to collect.
+        | IrType::Dsn
+        | IrType::DbLocation
+        | IrType::Connection
+        | IrType::ConnReadOnly
+        | IrType::ConnReadWrite
+        | IrType::Setting | IrType::ShapeWeb | IrType::ShapeWebView | IrType::ShapeTerminal
+        // Process-run-with cfg + Cache config / stats + Csv document are
+        // monomorphic — no generics to collect.
+        | IrType::ProcessRunWithCfg
+        | IrType::ProcessRunInPtyCfg
+        | IrType::CacheCfg
+        | IrType::WebSocketClientCfg
+        | IrType::CacheStats
+        | IrType::CsvDoc
+        // Ipe.Email records + provider ADT are monomorphic — no generics.
+        | IrType::EmailMessage
+        | IrType::EmailAttachment
+        | IrType::EmailSesConfig
+        | IrType::EmailSmtpConfig
+        | IrType::EmailProvider
+        // Typed security newtypes are monomorphic opaque wrappers — no generics.
+        | IrType::CryptoKey
+        | IrType::CryptoMac
+        | IrType::EmailAddress
+        // `Locale` is monomorphic — no generics to collect.
+        | IrType::Locale
+        // `Principal` is monomorphic — no generics to collect.
+        | IrType::Principal
+        // `AuthConfig` / `TokenSource` are monomorphic — no generics to collect.
+        | IrType::AuthConfig
+        | IrType::TokenSource
+        // Shape opaque app leaves — monomorphic, no generics to collect.
+        | IrType::WebApp | IrType::TuiApp | IrType::CliApp | IrType::WorkerApp
+        // A row variable is a separate row generic (`R{n}`), tracked in
+        // `Func::row_params`, never in the ordinary `T{n}` scope collected here.
+        | IrType::RowGeneric(_) => {}
+        // `WebRoute page` may carry generic parameters through `page`.
+        IrType::WebRoute(page) => collect_generics(page, out),
+        IrType::CustomElement { down, up } => {
+            collect_generics(down, out);
+            collect_generics(up, out);
+        }
+        // `Ui { ctor, msg }` may carry generic parameters through `msg`.
+        IrType::Ui { msg, .. } => collect_generics(msg, out),
+    }
 }
 
 /// A row variable's required-field contract — the single source of truth for
@@ -3330,6 +3502,21 @@ pub enum UserPin {
     /// and a cached program never deserializes into one.
     #[serde(skip)]
     Unlowered(Box<Diagnostic>),
+}
+
+impl UserPin {
+    /// Whether a call renders this pin for a callee type parameter, given
+    /// whether some callee parameter type names it
+    /// ([`Func::generics_named_by_params`]): the one rule the backend renders
+    /// by and the lowerer prunes by, so an unrendered pin never reaches the
+    /// type-mention walkers.
+    #[must_use]
+    pub const fn renders(&self, named_by_params: bool) -> bool {
+        match self {
+            Self::Unit => true,
+            Self::Instance(_) | Self::Unlowered(_) => !named_by_params,
+        }
+    }
 }
 
 impl CallPin {

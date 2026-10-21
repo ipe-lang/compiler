@@ -46,6 +46,7 @@ mod generic_syms;
 mod ir_type_mentions;
 mod record_shapes;
 mod ty_templates;
+mod user_pins;
 
 use capture_rewrite::force_shared_capture_clones;
 use clone_class::CaptureWalk;
@@ -16633,6 +16634,14 @@ impl<'a> Lowerer<'a> {
         // proves the bound instead of cargo-failing E0277 (an
         // exit-0-then-cargo-fail SEAL break).
         propagate_call_site_bounds(&mut funcs, &callee_instances);
+        // Pins settle against the final signatures: only rendered entries stay,
+        // and a `JsonVal` reading on a bound `JsonVal` cannot meet is refused.
+        user_pins::settle_user_pins(&mut funcs, |id| {
+            usize::try_from(id.as_raw())
+                .ok()
+                .and_then(|idx| self.m.defs.get(idx))
+                .map(|def| def.name().span)
+        });
 
         // when any Db kernel call is present, inject the synthetic
         // `SqlValue` and `SqlField` `EnumDef`s into `module.types`.  They are
@@ -34644,6 +34653,64 @@ mod tests {
             ),
             "a non-phantom enum declaring no parameters must refuse an argument: {refused:?}"
         );
+    }
+
+    /// The `Ipe.Cache.Cache` handle drops every source argument, so an
+    /// application holding its `k` and `v` is admitted whatever its table entry
+    /// declares, and emits no argument.
+    #[test]
+    fn a_cache_handle_application_holding_its_source_arguments_is_admitted() {
+        let mut interner = Interner::new();
+        let builtins = build_test_builtin_ctors(&mut interner);
+        let (ipe, cache, handle) = (
+            interner.intern("Ipe").unwrap(),
+            interner.intern("Cache").unwrap(),
+            interner.intern("Handle").unwrap(),
+        );
+        let module = canon::Module {
+            imports_unsafe_submodule: false,
+            imported_web_capabilities: BTreeSet::new(),
+            name: vec![],
+            unions: vec![],
+            defs: vec![],
+        };
+        let types = empty_solved_types();
+        let mut lowerer = Lowerer::new(
+            &module,
+            &types,
+            &interner,
+            SymbolPools {
+                eta_params: vec![],
+                cap_params: vec![],
+                param_binders: vec![],
+                any_param_binders: vec![],
+                projection_decode_binders: vec![],
+                destructure_thunk_binders: vec![],
+                nested_cons_binders: vec![],
+                nested_strlit_binders: vec![],
+                tuple_elem_binders: vec![],
+                wildcard_marker: super::WildcardMarker(ipe_intern::Symbol::from_raw(u32::MAX)),
+            },
+            &builtins,
+            "",
+            "",
+        );
+        let home = [ipe, cache];
+        let opaque = ipe_ir::EnumDef {
+            name: cache,
+            home: ipe_ir::ModPath(home.to_vec()),
+            type_params: vec![],
+            variants: vec![ipe_ir::Variant {
+                name: handle,
+                fields: vec![ipe_ir::IrType::Int],
+            }],
+        };
+        lowerer.enum_param_use = ipe_ir::EnumParamUse::of([&opaque]);
+        assert!(lowerer.is_cache_handle_con(&home, cache));
+        let kept = lowerer
+            .emitted_type_args(&home, cache, &[1u8, 2u8][..])
+            .map(|args| args.copied().collect::<Vec<u8>>());
+        assert_eq!(kept, Ok(vec![]));
     }
 
     /// A nullary built-in `Ty::Con` named `name`.

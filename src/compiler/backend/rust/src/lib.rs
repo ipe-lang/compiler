@@ -78,7 +78,7 @@ use ipe_diagnostics::{DResult, Diagnostic, NameError, RustNameFoldKind, Span};
 use ipe_intern::{Interner, Symbol};
 use ipe_ir::{
     CallPin, Callee, EnumTraits, Expr, FuncId, IrType, KernelFn, ModPath, Program,
-    RuntimeBridgedEnum, TypeDef, UserPin,
+    RuntimeBridgedEnum, TypeDef, UserPin, collect_generics,
 };
 
 pub use emit_doc::{SweepDivergence, native_vs_legacy_sweep};
@@ -1907,13 +1907,9 @@ impl<'a> EmitCtx<'a> {
                 // ONCE here (from the same `Func`) so signature and call site can
                 // never disagree on the carrier.
                 let idxs = crate::emit_expr::impl_fn_param_indices(func);
-                let mut named_by_params: Vec<Symbol> = Vec::new();
-                for param in &func.params {
-                    collect_generics(&param.ty, &mut named_by_params);
-                }
                 let layout = GenericLayout {
                     type_params: func.type_params.iter().map(|(sym, _)| *sym).collect(),
-                    named_by_params: named_by_params.into_iter().collect(),
+                    named_by_params: func.generics_named_by_params(),
                     inferred_tail: idxs.len().saturating_add(func.row_params.len()),
                 };
                 if !layout.type_params.is_empty() {
@@ -3880,14 +3876,12 @@ impl<'a> EmitCtx<'a> {
         for sym in &layout.type_params {
             let inferable = layout.named_by_params.contains(sym);
             let entry = match pins.get(sym) {
-                Some(UserPin::Unit) => Some("()".to_owned()),
-                Some(UserPin::Instance(ty)) if !inferable => {
-                    Some(emit_types::render_type(self, ty, generics)?)
-                }
-                Some(UserPin::Unlowered(refusal)) if !inferable => {
-                    return Err(Diagnostic::clone(refusal));
-                }
-                Some(UserPin::Instance(_) | UserPin::Unlowered(_)) | None => None,
+                Some(pin) if pin.renders(inferable) => match pin {
+                    UserPin::Unit => Some("()".to_owned()),
+                    UserPin::Instance(ty) => Some(emit_types::render_type(self, ty, generics)?),
+                    UserPin::Unlowered(refusal) => return Err(Diagnostic::clone(refusal)),
+                },
+                Some(_) | None => None,
             };
             any_pinned |= entry.is_some();
             entries.push(entry.unwrap_or_else(|| "_".to_owned()));
@@ -4605,153 +4599,6 @@ fn contains_generic(ty: &IrType) -> bool {
         // `Ui { ctor, msg }` is parametric on `msg`; check if `msg` carries
         // a generic.
         IrType::Ui { msg, .. } => contains_generic(msg),
-    }
-}
-
-/// Collect the distinct [`IrType::Generic`] symbols in `ty`, appending each (in
-/// first-occurrence order) to `out` if not already present.
-#[allow(clippy::too_many_lines)] // one exhaustive arm per IrType variant — the completeness is the point
-fn collect_generics(ty: &IrType, out: &mut Vec<Symbol>) {
-    match ty {
-        IrType::Generic(s) => {
-            if !out.contains(s) {
-                out.push(*s);
-            }
-        }
-        IrType::Tuple(elems) => {
-            for e in elems {
-                collect_generics(e, out);
-            }
-        }
-        IrType::Record(map) => {
-            for v in map.values() {
-                collect_generics(v, out);
-            }
-        }
-        IrType::Fun(params, ret)
-        | IrType::SharedFun(params, ret)
-        | IrType::FnOnceChain(params, ret) => {
-            for p in params {
-                collect_generics(p, out);
-            }
-            collect_generics(ret, out);
-        }
-        IrType::Enum { args, .. } => {
-            for a in args {
-                collect_generics(a, out);
-            }
-        }
-        IrType::Maybe(elem) | IrType::List(elem) => collect_generics(elem, out),
-        IrType::Result(err, ok) => {
-            collect_generics(err, out);
-            collect_generics(ok, out);
-        }
-        IrType::Dict(k, v) => {
-            collect_generics(k, out);
-            collect_generics(v, out);
-        }
-        IrType::Set(a) => collect_generics(a, out),
-        IrType::Decoder(inner) | IrType::Task(inner) | IrType::Cmd(inner) | IrType::Sub(inner) => {
-            collect_generics(inner, out);
-        }
-        IrType::Int
-        | IrType::Float
-        | IrType::Bool
-        | IrType::Str
-        | IrType::Char
-        | IrType::Unit
-        | IrType::Bytes
-        | IrType::Json
-        // `Db` is monomorphic — no generic parameters to collect.
-        | IrType::Db
-        // Opaque server types are monomorphic.
-        | IrType::ServerRequest
-        | IrType::ServerResponse
-        | IrType::ServerRoute
-        | IrType::ServerCookie
-        // `StreamWriter` is monomorphic — no generics to collect.
-        | IrType::StreamWriter
-        // `HttpRequest` is monomorphic — no generics to collect.
-        | IrType::HttpRequest
-        // `Regex` is a monomorphic opaque handle — no generics to collect.
-        | IrType::Regex
-        // `WsHandle` / `WsServerCfg` are monomorphic — no generics to collect.
-        | IrType::WebSocketServer
-        | IrType::WebSocketServerCfg
-        // nullary plain types and the opaque live request handle
-        // contribute no generics.
-        | IrType::UiPlain(_)
-        | IrType::WebReq
-        | IrType::SessionHandle
-        // `Order` is monomorphic — no generics to collect.
-        // `HttpMethod` is monomorphic — no generics to collect.
-        // `Decimal` is monomorphic — no generics to collect.
-        // `BackoffStrategy` is monomorphic — no generics to collect.
-        | IrType::BackoffStrategy
-        | IrType::Order
-        | IrType::HttpMethod
-        | IrType::Decimal
-        | IrType::ErrorKind
-        | IrType::Error
-        | IrType::ErrorDetails
-        // Nominal error-payload leaves (SEAL fix) — monomorphic
-        // runtime structs, same classification as `Error`/`ErrorDetails`.
-        | IrType::ErrorInfo
-        | IrType::PanicInfo
-        | IrType::TypeInfo
-        // `SqlFragment` is monomorphic — no generics to collect.
-        // `Secret` is monomorphic — no generics to collect.
-        | IrType::SqlFragment
-        | IrType::Secret
-        | IrType::Path
-        // `Url` is a monomorphic opaque wrapper — no generics to collect.
-        | IrType::Url
-        | IrType::UrlRelative
-        // `Dsn` is a monomorphic opaque wrapper — no generics to collect.
-        | IrType::Dsn
-        | IrType::DbLocation
-        | IrType::Connection
-        | IrType::ConnReadOnly
-        | IrType::ConnReadWrite
-        | IrType::Setting | IrType::ShapeWeb | IrType::ShapeWebView | IrType::ShapeTerminal
-        // Process-run-with cfg + Cache config / stats + Csv document are
-        // monomorphic — no generics to collect.
-        | IrType::ProcessRunWithCfg
-        | IrType::ProcessRunInPtyCfg
-        | IrType::CacheCfg
-        | IrType::WebSocketClientCfg
-        | IrType::CacheStats
-        | IrType::CsvDoc
-        // Ipe.Email records + provider ADT are monomorphic — no generics.
-        | IrType::EmailMessage
-        | IrType::EmailAttachment
-        | IrType::EmailSesConfig
-        | IrType::EmailSmtpConfig
-        | IrType::EmailProvider
-        // Typed security newtypes are monomorphic opaque wrappers — no generics.
-        | IrType::CryptoKey
-        | IrType::CryptoMac
-        | IrType::EmailAddress
-        // `Locale` is monomorphic — no generics to collect.
-        | IrType::Locale
-        // `Principal` is monomorphic — no generics to collect.
-        | IrType::Principal
-        // `AuthConfig` / `TokenSource` are monomorphic — no generics to collect.
-        | IrType::AuthConfig
-        | IrType::TokenSource
-        // Shape opaque app leaves — monomorphic, no generics to collect.
-        | IrType::WebApp | IrType::TuiApp | IrType::CliApp | IrType::WorkerApp
-        // A row variable is a separate row generic (`R{n}`), tracked in
-        // `Func::row_params`, never in the ordinary `T{n}` scope collected here.
-        | IrType::RowGeneric(_) => {}
-        // `WebRoute page` may carry generic parameters through `page`.
-        IrType::WebRoute(page) => collect_generics(page, out),
-        IrType::CustomElement { down, up } => {
-            collect_generics(down, out);
-            collect_generics(up, out);
-        }
-        // `Ui { ctor, msg }` may carry generic parameters through `msg`.
-        IrType::Ui { msg, .. } => collect_generics(msg, out),
     }
 }
 
