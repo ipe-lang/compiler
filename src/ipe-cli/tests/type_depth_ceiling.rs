@@ -706,8 +706,8 @@ const ORDERED_FREE_PIN: &str = "module Main exposing (main)\n\nimport Ipe.Io as 
 /// A free variable under an order class (`comparable`, `Ord` for a `Set`
 /// element) never reaches lowering: inference refuses it at the use with
 /// IPE-T0014, so no turbofish cargo refuses (E0277) can be emitted. The
-/// lowering's own refusal for a bound `JsonVal` lacks is proved by
-/// `a_bounded_generic_only_an_erased_parameter_names_is_refused_where_it_is_read`.
+/// lowering's own refusal for a bound `JsonVal` lacks is proved by the
+/// `ipe_lower` unit test `a_json_reading_on_an_ordered_parameter_becomes_the_refusal`.
 /// Read in the CI `test-run` job.
 #[test]
 fn a_free_variable_under_an_order_class_is_refused_by_inference_at_its_use() {
