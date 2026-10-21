@@ -342,7 +342,7 @@ mod tests {
         assert_eq!(
             pin,
             Some(CallPin::User(
-                [(a, UserPin::Instance(IrType::Json))].into_iter().collect()
+                std::iter::once((a, UserPin::Instance(IrType::Json))).collect()
             ))
         );
     }
@@ -383,7 +383,7 @@ mod tests {
         let pin = settled_pin(&mut funcs).cloned();
         assert_eq!(
             pin,
-            Some(CallPin::User([(a, UserPin::Unit)].into_iter().collect()))
+            Some(CallPin::User(std::iter::once((a, UserPin::Unit)).collect()))
         );
     }
 
