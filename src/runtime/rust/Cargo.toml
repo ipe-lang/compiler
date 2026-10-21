@@ -115,7 +115,11 @@ md-5 = { version = "0.10", optional = true }
 # The sqlx driver features (`sqlite`/`postgres`) are activated by `db`, not
 # here; the `db-sqlite` / `db-postgres` selectors pick which driver's aliases
 # the crate root compiles (see `db-postgres`).
-sqlx = { version = "0.8", features = ["runtime-tokio-rustls"], optional = true }
+# `default-features = false` keeps `any`, `macros` and `migrate` out: the
+# runtime builds every query at run time and runs its own migration ledger.
+# `tls-rustls-ring-webpki`: rustls on the `ring` provider with webpki-roots 1.x
+# roots, never the OS store.
+sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "tls-rustls-ring-webpki", "json"], optional = true }
 redis = { version = "0.27", features = ["tokio-comp"], optional = true }
 # `Ipe.Regex` regex kernels + `String.isUrl`, behind the `regex` feature. A
 # program that reaches neither drops `regex` and its aho-corasick / regex-automata
@@ -407,7 +411,7 @@ json = ["dep:serde_json", "serde"]
 # cross-backend byte-exact contract).
 # `tokio/net`: the `ssrf` gate resolves a Postgres host through
 # `tokio::net::lookup_host` (non-blocking, deadline-bounded).
-db = ["sqlx", "sqlx?/sqlite", "sqlx?/postgres", "tokio", "tokio/sync", "tokio/net", "dep:serde_json", "json", "serde", "encoding", "random", "time-core", "decimal", "crypto-core", "url", "secret"]
+db = ["sqlx", "sqlx?/sqlite-bundled", "sqlx?/postgres", "tokio", "tokio/sync", "tokio/net", "dep:serde_json", "json", "serde", "encoding", "random", "time-core", "decimal", "crypto-core", "url", "secret"]
 # `db-sqlite` / `db-postgres`: driver alias selectors. `db-postgres` makes the
 # crate root compile `config_postgres.rs` as `config`; any other build compiles
 # the sqlite `config.rs`. The emitter enables exactly one, and the crate links

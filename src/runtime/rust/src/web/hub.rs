@@ -131,7 +131,7 @@ fn reject_cross_tenant_svc(svc: &str, tenant: Option<&TenantPrefix>) -> Result<S
 
 /// A query over the SQLite telemetry spill.
 type SpillQuery<'q> =
-    sqlx::query::Query<'q, sqlx::Sqlite, <sqlx::Sqlite as sqlx::Database>::Arguments<'q>>;
+    sqlx::query::Query<'q, sqlx::Sqlite, <sqlx::Sqlite as sqlx::Database>::Arguments>;
 
 /// The tenant-scoping predicate of one spill query.
 ///

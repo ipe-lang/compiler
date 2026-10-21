@@ -395,8 +395,7 @@ fn current_txn_conn_for(pool: &Db) -> Option<TxnConn> {
 }
 
 // The query type produced by `sqlx::query(&sql)` for the configured backend.
-type DbQuery<'q> =
-    sqlx::query::Query<'q, DbDatabase, <DbDatabase as sqlx::Database>::Arguments<'q>>;
+type DbQuery<'q> = sqlx::query::Query<'q, DbDatabase, <DbDatabase as sqlx::Database>::Arguments>;
 
 /// The one place that decides where a routed query runs. Either the pool (no
 /// transaction active on `pool`, or one active on a *different* pool that the
@@ -1694,7 +1693,7 @@ async fn enforce_engine_floor_on<DB>(pool: &sqlx::Pool<DB>) -> Result<EngineVers
 where
     DB: sqlx::Database,
     for<'c> &'c mut DB::Connection: sqlx::Executor<'c, Database = DB>,
-    for<'q> <DB as sqlx::Database>::Arguments<'q>: sqlx::IntoArguments<'q, DB>,
+    <DB as sqlx::Database>::Arguments: sqlx::IntoArguments<DB>,
     (String,): for<'r> sqlx::FromRow<'r, DB::Row>,
 {
     let engine = DbEngine::for_driver::<DB>().map_err(DbConnectError::EngineRefused)?;
@@ -2139,7 +2138,7 @@ impl<DB> VettedPool<DB>
 where
     DB: GatedDial,
     for<'c> &'c mut DB::Connection: sqlx::Executor<'c, Database = DB>,
-    for<'q> <DB as sqlx::Database>::Arguments<'q>: sqlx::IntoArguments<'q, DB>,
+    <DB as sqlx::Database>::Arguments: sqlx::IntoArguments<DB>,
     (String,): for<'r> sqlx::FromRow<'r, DB::Row>,
 {
     /// Open a pool of at most `max_connections` to `url` through every gate.
@@ -6024,9 +6023,9 @@ fn external_format_sql_postgres(sql: &str) -> String {
 /// Postgres the correct per-parameter type OID.
 #[cfg(feature = "db")]
 fn external_bind_sql_param<'q, DB>(
-    q: sqlx::query::Query<'q, DB, <DB as sqlx::Database>::Arguments<'q>>,
+    q: sqlx::query::Query<'q, DB, <DB as sqlx::Database>::Arguments>,
     p: SqlParam,
-) -> sqlx::query::Query<'q, DB, <DB as sqlx::Database>::Arguments<'q>>
+) -> sqlx::query::Query<'q, DB, <DB as sqlx::Database>::Arguments>
 where
     DB: sqlx::Database,
     String: sqlx::Encode<'q, DB> + sqlx::Type<DB>,
