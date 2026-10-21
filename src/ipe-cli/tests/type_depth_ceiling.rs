@@ -732,6 +732,36 @@ fn a_free_variable_under_an_order_class_is_refused_by_inference_at_its_use() {
     let _ = std::fs::remove_dir_all(&scratch);
 }
 
+/// An unannotated helper returns a `Set` of a variable no argument names, so
+/// its element class is only inferred: the program is refused at ipe time or
+/// its emitted project builds, never accepted and then refused by cargo.
+const UNANNOTATED_ORDER_CLASS: &str = "module Main exposing (main)\n\nimport Ipe.Io as Io\nimport Ipe.Set as Set\n\n\nempties _ =\n    Set.fromList []\n\n\nmain =\n    Io.println (if Set.size (empties 1) == 0 then \"zero\" else \"other\")\n";
+
+/// Read in the CI `test-run` job.
+#[test]
+fn an_unannotated_helper_with_a_free_order_class_never_fails_at_cargo() {
+    let checked = front_check(UNANNOTATED_ORDER_CLASS);
+    if checked.is_ok() && e2e_support::e2e_tier() == e2e_support::Tier::E2e {
+        let runtime = e2e_support::require_runtime().into_path_buf();
+        let scratch = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!(
+            "ipe_type_ceiling_unannotated_order_{}",
+            std::process::id()
+        ));
+        assert_builds_with_cargo(
+            UNANNOTATED_ORDER_CLASS,
+            &scratch,
+            &runtime,
+            "type_ceiling_unannotated_order",
+        );
+        let _ = std::fs::remove_dir_all(&scratch);
+    } else {
+        assert!(
+            refusal(&checked).is_some(),
+            "neither accepted nor refused: {checked:?}"
+        );
+    }
+}
+
 /// The byte offset `span` starts at.
 fn offset_of(span: Span) -> usize {
     usize::try_from(span.lo).unwrap_or(usize::MAX)
