@@ -34,7 +34,7 @@ use std::path::{Path, PathBuf};
 use ipe::CliError;
 use ipe_diagnostics::nesting::{TYPE_DEPTH_LIMIT, TYPE_SIZE_LIMIT};
 use ipe_diagnostics::{
-    Diagnostic, HelpLine, IPE_L0102, IPE_T0022, IPE_T0023, IPE_T0024, Span, TypeError,
+    Diagnostic, HelpLine, IPE_L0102, IPE_T0014, IPE_T0022, IPE_T0023, IPE_T0024, Span, TypeError,
     TypeSizeOrigin,
 };
 
@@ -699,16 +699,18 @@ fn a_bounded_generic_only_an_erased_parameter_names_is_refused_where_it_is_read(
     let _ = std::fs::remove_dir_all(&scratch);
 }
 
-/// `empties` returns a `Set` of a variable no argument names, so its one use
-/// reads that variable as `JsonVal`, which has no total order.
+/// `empties` returns a `Set` of a variable no argument names: its one use
+/// leaves an order-classed variable unresolved.
 const ORDERED_FREE_PIN: &str = "module Main exposing (main)\n\nimport Ipe.Io as Io\nimport Ipe.Set as Set\n\n\nempties : Int -> Set comparable\nempties _ =\n    Set.fromList []\n\n\nmain =\n    Io.println (if Set.size (empties 1) == 0 then \"zero\" else \"other\")\n";
 
-/// A free variable pinned where the callee bounds it by a trait `JsonVal`
-/// lacks (`Ord` for a `Set` element) is refused with IPE-L0102 at the calling
-/// definition, never emitted as a turbofish cargo refuses (E0277). Read in the
-/// CI `test-run` job.
+/// A free variable under an order class (`comparable`, `Ord` for a `Set`
+/// element) never reaches lowering: inference refuses it at the use with
+/// IPE-T0014, so no turbofish cargo refuses (E0277) can be emitted. The
+/// lowering's own refusal for a bound `JsonVal` lacks is proved by
+/// `a_bounded_generic_only_an_erased_parameter_names_is_refused_where_it_is_read`.
+/// Read in the CI `test-run` job.
 #[test]
-fn a_free_variable_pinned_on_an_ordered_parameter_is_refused_at_the_caller() {
+fn a_free_variable_under_an_order_class_is_refused_by_inference_at_its_use() {
     let runtime = e2e_support::require_runtime().into_path_buf();
     let scratch = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!(
         "ipe_type_ceiling_ordered_free_pin_{}",
@@ -717,12 +719,12 @@ fn a_free_variable_pinned_on_an_ordered_parameter_is_refused_at_the_caller() {
     let built = ipe::RootFixture::main(ORDERED_FREE_PIN)
         .and_then(|fixture| ipe::build_fixture(&fixture, &scratch, &runtime).map(|_| ()));
     let diag = refusal(&built);
-    assert_eq!(diag.map(Diagnostic::code), Some(IPE_L0102), "{built:?}");
+    assert_eq!(diag.map(Diagnostic::code), Some(IPE_T0014), "{built:?}");
     let main_at = span_of(ORDERED_FREE_PIN, "main =", 0);
     let span = diag.map(Diagnostic::primary_span);
     assert!(
-        span.is_some_and(|s| s.lo == main_at.lo && s.lo < s.hi),
-        "refused at {span:?}, not at `main` {}: {built:?}",
+        span.is_some_and(|s| s.lo >= main_at.lo && s.lo < s.hi),
+        "refused at {span:?}, not inside `main` from {}: {built:?}",
         main_at.lo
     );
     let emitted = rust_sources(&scratch);
