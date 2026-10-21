@@ -257,7 +257,7 @@ async fn read_logs_value(
     }
     sql.push_str(" ORDER BY time DESC, id DESC LIMIT ?");
 
-    let mut q = sqlx::query(&sql);
+    let mut q = sqlx::query(crate::sql_text::assembled(sql));
     if !service.is_empty() {
         q = q.bind(service);
     }
@@ -413,7 +413,7 @@ async fn read_metrics_value(db_path: &str, service: &str, tenant: Option<&Tenant
     }
     let tenant_filter = TenantFilter::push(&mut sql, tenant);
     sql.push_str(" ORDER BY time DESC, id DESC LIMIT ?");
-    let mut q = sqlx::query(&sql);
+    let mut q = sqlx::query(crate::sql_text::assembled(sql));
     if !service.is_empty() {
         q = q.bind(service);
     }
@@ -481,7 +481,7 @@ async fn read_traces_value(db_path: &str, service: &str, tenant: Option<&TenantP
     }
     let tenant_filter = TenantFilter::push(&mut sql, tenant);
     sql.push_str(" ORDER BY time DESC, id DESC LIMIT ?");
-    let mut q = sqlx::query(&sql);
+    let mut q = sqlx::query(crate::sql_text::assembled(sql));
     if !service.is_empty() {
         q = q.bind(service);
     }
@@ -528,7 +528,7 @@ async fn read_errors_value(db_path: &str, service: &str, tenant: Option<&TenantP
     }
     let tenant_filter = TenantFilter::push(&mut sql, tenant);
     sql.push_str(" ORDER BY time DESC, id DESC LIMIT ?");
-    let mut q = sqlx::query(&sql);
+    let mut q = sqlx::query(crate::sql_text::assembled(sql));
     if !service.is_empty() {
         q = q.bind(service);
     }
@@ -697,7 +697,7 @@ async fn count_table(
     // interpolation cannot carry attacker input.
     let mut sql = format!("SELECT COUNT(*) AS n FROM {} WHERE 1=1", table.name());
     let tenant_filter = TenantFilter::push(&mut sql, tenant);
-    let mut q = sqlx::query(&sql);
+    let mut q = sqlx::query(crate::sql_text::assembled(sql));
     if let Some(tf) = tenant_filter {
         q = tf.bind(q);
     }
@@ -1009,7 +1009,7 @@ async fn distinct_services(
     );
     let tenant_filter = TenantFilter::push(&mut sql, tenant);
     sql.push_str(" ORDER BY service_name LIMIT 200");
-    let mut q = sqlx::query(&sql);
+    let mut q = sqlx::query(crate::sql_text::assembled(sql));
     if let Some(tf) = tenant_filter {
         q = tf.bind(q);
     }
@@ -1081,18 +1081,12 @@ mod tests {
         let path = dir.to_string_lossy().to_string();
         let _ = std::fs::remove_file(&path);
         let pool = seed(&path).await;
-        for (tbl, svc) in [
-            ("telemetry_log", "b"),
-            ("telemetry_log", "a"),
-            ("telemetry_span", "a"),
-        ] {
-            sqlx::query(&format!(
-                "INSERT INTO {tbl} (service_name, time) VALUES (?, '2026-01-01T00:00:00Z')"
-            ))
-            .bind(svc)
-            .execute(&pool)
-            .await
-            .unwrap();
+        let log =
+            "INSERT INTO telemetry_log (service_name, time) VALUES (?, '2026-01-01T00:00:00Z')";
+        let span =
+            "INSERT INTO telemetry_span (service_name, time) VALUES (?, '2026-01-01T00:00:00Z')";
+        for (sql, svc) in [(log, "b"), (log, "a"), (span, "a")] {
+            sqlx::query(sql).bind(svc).execute(&pool).await.unwrap();
         }
         let res: IpeResult<String, Vec<String>> = hub_list_services(path.clone()).await;
         match res {
