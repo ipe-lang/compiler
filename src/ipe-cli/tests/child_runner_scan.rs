@@ -2304,6 +2304,20 @@ const CLIENT_NAMERS: &[&str] = &[
     "Cargo.lock",
 ];
 
+/// Generated prose, relative to the workspace root, that may name
+/// [`HTTP_CLIENT`] while [`no_rust_opens`] holds of it: release notes are
+/// written from commit subjects, and a dependency fix names its crate.
+const PROSE_NAMERS: &[&str] = &["CHANGELOG.md"];
+
+/// Whether no Rust item or expression can open `text`: it starts with a `#`
+/// followed by a letter, never the `[` or `!` of an attribute, so an
+/// `include!` of it cannot compile.
+fn no_rust_opens(text: &str) -> bool {
+    text.strip_prefix('#')
+        .and_then(|rest| rest.trim_start().chars().next())
+        .is_some_and(char::is_alphabetic)
+}
+
 /// The workspace's proc-macro package: a macro that can assemble
 /// [`HTTP_CLIENT`]'s path from strings no token scan reads, so no workspace
 /// package may depend on it.
@@ -2325,7 +2339,9 @@ fn client_namers(
             Err(fault) if fault.kind() == std::io::ErrorKind::NotFound => continue,
             Err(fault) => return Err(fault.into()),
         };
-        if names_client(&String::from_utf8_lossy(&bytes)) {
+        let text = String::from_utf8_lossy(&bytes);
+        let prose = PROSE_NAMERS.contains(&rel.as_str()) && no_rust_opens(&text);
+        if names_client(&text) && !prose {
             found.push(format!("{rel}: names the HTTP client"));
         }
     }
@@ -2445,6 +2461,7 @@ fn a_client_path_in_any_file_a_splice_can_reach_is_refused() {
     let call = format!("macro_rules! f {{ ($u:expr) => {{ ::{HTTP_CLIENT}::get($u).call() }} }}");
     let owner_source = format!("use {HTTP_CLIENT}::Agent;");
     let longer = format!("fn {HTTP_CLIENT}ish() {{}}");
+    let changelog = format!("# Changelog\n\n* move to {HTTP_CLIENT} 3\n");
     let root = tree(
         "splices",
         &[
@@ -2456,6 +2473,8 @@ fn a_client_path_in_any_file_a_splice_can_reach_is_refused() {
             ("x/m.rs", &call),
             ("other/src/longer.rs", &longer),
             ("other/README.md", "no client here"),
+            ("CHANGELOG.md", &changelog),
+            ("other/CHANGELOG.md", &changelog),
         ],
     );
     let mut paths = Vec::new();
@@ -2469,6 +2488,7 @@ fn a_client_path_in_any_file_a_splice_can_reach_is_refused() {
     assert_eq!(
         found,
         [
+            "other/CHANGELOG.md: names the HTTP client",
             "other/payload.txt: names the HTTP client",
             "x/m.rs: names the HTTP client"
         ],
@@ -2484,6 +2504,35 @@ fn a_client_path_in_any_file_a_splice_can_reach_is_refused() {
     assert_eq!(
         client_namers(&root, &missing, &[]).expect("a missing file is skipped"),
         Vec::<String>::new()
+    );
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn only_prose_no_rust_can_open_may_name_the_client() {
+    for prose in ["# Changelog\n", "#  Release notes", "#\tChangelog"] {
+        assert!(no_rust_opens(prose), "{prose:?}");
+    }
+    for code in [
+        "#[path = \"x.rs\"] mod m;",
+        "# [allow(dead_code)] fn f() {}",
+        "#![allow(dead_code)]",
+        "#",
+        "# 1",
+        " # Changelog",
+        "macro_rules! f { () => {} }",
+        "",
+    ] {
+        assert!(!no_rust_opens(code), "{code:?}");
+    }
+    let code =
+        format!("#[macro_export] macro_rules! f {{ () => {{ ::{HTTP_CLIENT}::get(\"\") }} }}");
+    let root = tree("prose", &[("CHANGELOG.md", &code)]);
+    let files = ["CHANGELOG.md".to_owned()];
+    assert_eq!(
+        client_namers(&root, &files, &[]).expect("tree readable"),
+        ["CHANGELOG.md: names the HTTP client"],
+        "a changelog Rust can open is scanned like any file"
     );
     let _ = std::fs::remove_dir_all(root);
 }
