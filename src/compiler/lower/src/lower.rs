@@ -19250,7 +19250,9 @@ impl<'a> Lowerer<'a> {
         let erase_all =
             self.is_cache_handle_con(home, name) || self.is_store_row_phantom_con(home, name);
         let path = ModPath(home.to_vec());
-        if let Some(declared) = self.enum_param_use.declared_arity(&path, name)
+        // An erase-all declaration drops every source parameter, so its table arity is not its source arity.
+        if !erase_all
+            && let Some(declared) = self.enum_param_use.declared_arity(&path, name)
             && declared != args.len()
         {
             return Err(bug(
@@ -34561,6 +34563,87 @@ mod tests {
                 args.len()
             );
         }
+    }
+
+    /// A store-row phantom union is declared without its source `row`
+    /// parameter, so its one-argument application is admitted and emits none.
+    #[test]
+    fn a_store_row_phantom_application_holding_its_source_argument_is_admitted() {
+        let mut interner = Interner::new();
+        let builtins = build_test_builtin_ctors(&mut interner);
+        let (ipe, db, store, cond, compare, plain) = (
+            interner.intern("Ipe").unwrap(),
+            interner.intern("Db").unwrap(),
+            interner.intern("Store").unwrap(),
+            interner.intern("Cond").unwrap(),
+            interner.intern("Compare").unwrap(),
+            interner.intern("Plain").unwrap(),
+        );
+        let module = canon::Module {
+            imports_unsafe_submodule: false,
+            imported_web_capabilities: BTreeSet::new(),
+            name: vec![],
+            unions: vec![],
+            defs: vec![],
+        };
+        let types = empty_solved_types();
+        let mut lowerer = Lowerer::new(
+            &module,
+            &types,
+            &interner,
+            SymbolPools {
+                eta_params: vec![],
+                cap_params: vec![],
+                param_binders: vec![],
+                any_param_binders: vec![],
+                projection_decode_binders: vec![],
+                destructure_thunk_binders: vec![],
+                nested_cons_binders: vec![],
+                nested_strlit_binders: vec![],
+                tuple_elem_binders: vec![],
+                wildcard_marker: super::WildcardMarker(ipe_intern::Symbol::from_raw(u32::MAX)),
+            },
+            &builtins,
+            "",
+            "",
+        );
+        let home = [ipe, db, store];
+        let phantom = ipe_ir::EnumDef {
+            name: cond,
+            home: ipe_ir::ModPath(home.to_vec()),
+            type_params: vec![],
+            variants: vec![ipe_ir::Variant {
+                name: compare,
+                fields: vec![ipe_ir::IrType::Int],
+            }],
+        };
+        let nongeneric = ipe_ir::EnumDef {
+            name: plain,
+            home: ipe_ir::ModPath(home.to_vec()),
+            type_params: vec![],
+            variants: vec![ipe_ir::Variant {
+                name: plain,
+                fields: vec![ipe_ir::IrType::Int],
+            }],
+        };
+        lowerer.enum_param_use = ipe_ir::EnumParamUse::of([&phantom, &nongeneric]);
+        let kept = lowerer
+            .emitted_type_args(&home, cond, &[1u8][..])
+            .map(|args| args.copied().collect::<Vec<u8>>());
+        assert_eq!(kept, Ok(vec![]));
+        let refused = lowerer
+            .emitted_type_args(&home, plain, &[1u8][..])
+            .map(|_| ());
+        assert!(
+            matches!(
+                refused,
+                Err(ipe_diagnostics::Diagnostic::CompilerBug {
+                    where_: "ipe_lower::emitted_type_args",
+                    ..
+                })
+            ),
+            "a non-phantom enum declaring no parameters must refuse an argument: {refused:?}"
+        );
     }
 
     /// A nullary built-in `Ty::Con` named `name`.
