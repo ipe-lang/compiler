@@ -56,11 +56,13 @@
 //! `remote_ingest::read_capped` by a whitespace-free text match.
 //!
 //! The HTTP client crate is named only in `src/net.rs`, whose policy every
-//! call takes: any other source of any workspace member naming it as a token — a path,
+//! call takes: any other git-tracked file of the workspace, of any
+//! extension, naming it as a token — a path,
 //! an import, a rename, a raw identifier, a comment — is refused, as is an
 //! exported `net` item whose surface carries a client type, a `package =`
 //! rename of it in `Cargo.toml`, and any other workspace package depending on
-//! it in `Cargo.lock`.
+//! it in `Cargo.lock`. No workspace package may depend on the workspace proc
+//! macro, which could assemble the client path from strings.
 
 #![cfg(not(target_arch = "wasm32"))]
 
@@ -1375,6 +1377,21 @@ fn crate_roots(root: &Path) -> std::io::Result<Vec<(PathBuf, PathBuf)>> {
 
 /// Every `.rs` file under `dir`, recursively.
 fn rust_files(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) -> std::io::Result<()> {
+    files_under(
+        dir,
+        depth,
+        &|path| path.extension().is_some_and(|ext| ext == "rs"),
+        out,
+    )
+}
+
+/// Every file under `dir` that `keep` admits, recursively.
+fn files_under(
+    dir: &Path,
+    depth: usize,
+    keep: &dyn Fn(&Path) -> bool,
+    out: &mut Vec<PathBuf>,
+) -> std::io::Result<()> {
     if depth > MAX_DIR_DEPTH {
         return Err(std::io::Error::other(format!(
             "source tree deeper than {MAX_DIR_DEPTH}: {}",
@@ -1384,8 +1401,8 @@ fn rust_files(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) -> std::io::Resu
     for entry in std::fs::read_dir(dir)? {
         let path = entry?.path();
         if path.is_dir() {
-            rust_files(&path, depth.saturating_add(1), out)?;
-        } else if path.extension().is_some_and(|ext| ext == "rs") {
+            files_under(&path, depth.saturating_add(1), keep, out)?;
+        } else if keep(&path) {
             out.push(path);
         }
     }
@@ -2172,30 +2189,30 @@ fn manifest_renames(manifest: &str) -> Vec<String> {
         .collect()
 }
 
-/// Whether one `dependencies` line of a lockfile names [`HTTP_CLIENT`], with
-/// or without a version.
-fn lock_dependency_is_client(line: &str) -> bool {
+/// Whether one `dependencies` line of a lockfile names the package `name`,
+/// with or without a version.
+fn lock_dependency_is(line: &str, name: &str) -> bool {
     line.trim()
         .trim_end_matches(',')
         .strip_prefix('"')
         .and_then(|dep| dep.strip_suffix('"'))
-        .is_some_and(|dep| dep.split(' ').next() == Some(HTTP_CLIENT))
+        .is_some_and(|dep| dep.split(' ').next() == Some(name))
 }
 
 /// The workspace packages of a lockfile — those with no `source` — that
-/// depend on [`HTTP_CLIENT`]. The lockfile records the real crate name, so a
-/// renaming dependency key cannot hide one.
-fn client_dependents(lock: &str) -> Vec<String> {
+/// depend on the package `name`. The lockfile records the real crate name, so
+/// a renaming dependency key cannot hide one.
+fn workspace_dependents(lock: &str, name: &str) -> Vec<String> {
     lock.split("[[package]]")
         .filter(|block| !block.lines().any(|line| line.starts_with("source =")))
-        .filter(|block| block.lines().any(lock_dependency_is_client))
+        .filter(|block| block.lines().any(|line| lock_dependency_is(line, name)))
         .map(|block| {
             block
                 .lines()
                 .find_map(|line| line.strip_prefix("name = "))
                 .map_or_else(
                     || "<unnamed>".to_owned(),
-                    |name| name.trim_matches('"').to_owned(),
+                    |package| package.trim_matches('"').to_owned(),
                 )
         })
         .collect()
@@ -2279,50 +2296,57 @@ fn no_http_body_read_is_unbounded() {
     );
 }
 
-/// The member directories the workspace `manifest` lists, relative to the
-/// workspace root; a glob member is refused, since this listing cannot expand it.
-fn workspace_members(manifest: &str) -> Result<Vec<String>, Box<dyn std::error::Error>> {
-    let table = manifest.parse::<toml::Table>()?;
-    let members = table
-        .get("workspace")
-        .and_then(|workspace| workspace.get("members"))
-        .and_then(toml::Value::as_array)
-        .ok_or("the workspace manifest lists no members")?;
-    members
-        .iter()
-        .map(|member| -> Result<String, Box<dyn std::error::Error>> {
-            let member = member
-                .as_str()
-                .ok_or("a workspace member that is not a string")?;
-            if member.contains(['*', '?', '[']) {
-                return Err(format!("a glob workspace member `{member}`").into());
-            }
-            Ok(member.to_owned())
-        })
-        .collect()
-}
+/// The files, relative to the workspace root, that may name [`HTTP_CLIENT`]:
+/// its owner, the manifest that declares it, and the lockfile.
+const CLIENT_NAMERS: &[&str] = &[
+    "src/ipe-cli/src/net.rs",
+    "src/ipe-cli/Cargo.toml",
+    "Cargo.lock",
+];
 
-/// Every `.rs` file of every member of the workspace at `root`, `owner`
-/// aside, that names [`HTTP_CLIENT`]: a macro another crate exports expands
-/// where it is called, so a client path in any member can reach this crate.
-fn client_namers(root: &Path, owner: &Path) -> Result<Vec<String>, Box<dyn std::error::Error>> {
-    let manifest = std::fs::read_to_string(root.join("Cargo.toml"))?;
-    let mut paths = BTreeSet::new();
-    for member in workspace_members(&manifest)? {
-        let mut files = Vec::new();
-        rust_files(&root.join(member), 0, &mut files)?;
-        paths.extend(files);
-    }
-    if !paths.contains(owner) {
-        return Err(format!("the listing must see {}", owner.display()).into());
-    }
+/// The workspace's proc-macro package: a macro that can assemble
+/// [`HTTP_CLIENT`]'s path from strings no token scan reads, so no workspace
+/// package may depend on it.
+const PROC_MACRO_PACKAGE: &str = "ipe_bindgen";
+
+/// Every file of `files` (relative to `root`), `allowed` aside, that names
+/// [`HTTP_CLIENT`]. Every extension counts, since an `include!` or a
+/// `#[path]` compiles a file of any name from any directory; a listed file
+/// absent from the tree cannot be compiled in, so it is skipped.
+fn client_namers(
+    root: &Path,
+    files: &[String],
+    allowed: &[&str],
+) -> Result<Vec<String>, Box<dyn std::error::Error>> {
     let mut found = Vec::new();
-    for path in paths.iter().filter(|path| *path != owner) {
-        if names_client(&String::from_utf8_lossy(&std::fs::read(path)?)) {
-            found.push(format!("{}: names the HTTP client", path.display()));
+    for rel in files.iter().filter(|rel| !allowed.contains(&rel.as_str())) {
+        let bytes = match std::fs::read(root.join(rel)) {
+            Ok(bytes) => bytes,
+            Err(fault) if fault.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(fault) => return Err(fault.into()),
+        };
+        if names_client(&String::from_utf8_lossy(&bytes)) {
+            found.push(format!("{rel}: names the HTTP client"));
         }
     }
     Ok(found)
+}
+
+/// Every git-tracked file of the checkout at `root`, relative to it.
+fn tracked_files(root: &Path) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+    let listed = std::process::Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["ls-files", "-z"])
+        .output()?;
+    if !listed.status.success() {
+        return Err(format!("git ls-files failed: {}", listed.status).into());
+    }
+    Ok(String::from_utf8(listed.stdout)?
+        .split('\0')
+        .filter(|rel| !rel.is_empty())
+        .map(str::to_owned)
+        .collect())
 }
 
 #[test]
@@ -2333,7 +2357,14 @@ fn only_net_names_the_http_client() {
         .nth(2)
         .expect("crate sits two levels under the workspace");
     let owner = crate_dir.join(CLIENT_OWNER);
-    let mut found = client_namers(root, &owner).expect("workspace sources listable");
+    let files = tracked_files(root).expect("git lists the workspace checkout");
+    for allowed in CLIENT_NAMERS {
+        assert!(
+            files.iter().any(|rel| rel == allowed),
+            "{allowed} must be tracked, or the listing reads the wrong tree"
+        );
+    }
+    let mut found = client_namers(root, &files, CLIENT_NAMERS).expect("tracked files readable");
     let net = std::fs::read_to_string(&owner).expect("net source readable");
     assert!(
         names_client(&net),
@@ -2362,7 +2393,7 @@ fn only_net_names_the_http_client() {
             .map(|line| format!("Cargo.toml: `{line}` is not the plain client entry")),
     );
     let lock = std::fs::read_to_string(root.join("Cargo.lock")).expect("lockfile readable");
-    let dependents = client_dependents(&lock);
+    let dependents = workspace_dependents(&lock, HTTP_CLIENT);
     assert!(
         dependents.iter().any(|name| name == CLIENT_PACKAGE),
         "Cargo.lock must show `{CLIENT_PACKAGE}` depending on the HTTP client, or the \
@@ -2373,6 +2404,17 @@ fn only_net_names_the_http_client() {
             .into_iter()
             .filter(|name| name != CLIENT_PACKAGE)
             .map(|name| format!("Cargo.lock: workspace package `{name}` depends on the client")),
+    );
+    assert!(
+        lock.contains(&format!("name = \"{PROC_MACRO_PACKAGE}\"")),
+        "Cargo.lock must hold `{PROC_MACRO_PACKAGE}`, or the proc-macro check matches nothing"
+    );
+    found.extend(
+        workspace_dependents(&lock, PROC_MACRO_PACKAGE)
+            .into_iter()
+            .map(|name| {
+                format!("Cargo.lock: workspace package `{name}` depends on `{PROC_MACRO_PACKAGE}`")
+            }),
     );
     assert!(
         found.is_empty(),
@@ -2399,56 +2441,67 @@ fn tree(label: &str, files: &[(&str, &str)]) -> PathBuf {
 }
 
 #[test]
-fn a_client_path_in_any_workspace_member_is_refused() {
+fn a_client_path_in_any_file_a_splice_can_reach_is_refused() {
     let call = format!("macro_rules! f {{ ($u:expr) => {{ ::{HTTP_CLIENT}::get($u).call() }} }}");
     let owner_source = format!("use {HTTP_CLIENT}::Agent;");
+    let longer = format!("fn {HTTP_CLIENT}ish() {{}}");
     let root = tree(
-        "members",
+        "splices",
         &[
-            (
-                "Cargo.toml",
-                "[workspace]\nmembers = [\"cli\", \"other\"]\n",
-            ),
             ("cli/src/net.rs", &owner_source),
             ("cli/src/lib.rs", "mod net;"),
-            ("other/src/lib.rs", &call),
-            ("other/build.rs", "fn main() {}"),
-            ("unlisted/src/lib.rs", &call),
+            ("other/src/lib.rs", "include!(\"../payload.txt\");"),
+            ("other/payload.txt", &call),
+            ("other/src/deep.rs", "#[path = \"../../x/m.rs\"] mod m;"),
+            ("x/m.rs", &call),
+            ("other/src/longer.rs", &longer),
+            ("other/README.md", "no client here"),
         ],
     );
-    let found = client_namers(&root, &root.join("cli/src/net.rs")).expect("tree listable");
-    assert_eq!(found.len(), 1, "{found:?}");
+    let mut paths = Vec::new();
+    files_under(&root, 0, &|_| true, &mut paths).expect("tree listable");
+    let files: Vec<String> = paths
+        .iter()
+        .map(|path| relative(&root, path).expect("listed under the root"))
+        .collect();
+    let mut found = client_namers(&root, &files, &["cli/src/net.rs"]).expect("tree readable");
+    found.sort();
+    assert_eq!(
+        found,
+        [
+            "other/payload.txt: names the HTTP client",
+            "x/m.rs: names the HTTP client"
+        ],
+    );
+    let unexempt = client_namers(&root, &files, &[]).expect("tree readable");
     assert!(
-        found
+        unexempt
             .iter()
-            .all(|line| line.contains("other") && line.contains("lib.rs")),
-        "{found:?}"
+            .any(|line| line.starts_with("cli/src/net.rs")),
+        "the owner is admitted only by its allowlist row: {unexempt:?}"
     );
-    let globbed = tree(
-        "glob",
-        &[
-            ("Cargo.toml", "[workspace]\nmembers = [\"crates/*\"]\n"),
-            ("crates/a/src/lib.rs", &call),
-        ],
+    let missing = ["gone.rs".to_owned()];
+    assert_eq!(
+        client_namers(&root, &missing, &[]).expect("a missing file is skipped"),
+        Vec::<String>::new()
     );
-    assert!(
-        client_namers(&globbed, &globbed.join("crates/a/src/net.rs")).is_err(),
-        "a glob member must be refused, not skipped"
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn a_workspace_dependent_of_the_proc_macro_is_refused() {
+    let lock = format!(
+        "[[package]]\nname = \"{PROC_MACRO_PACKAGE}\"\nversion = \"0.7.0\"\n\n\
+         [[package]]\nname = \"ipe_docs\"\ndependencies = [\n \"{PROC_MACRO_PACKAGE}\",\n]\n\n\
+         [[package]]\nname = \"ipe\"\ndependencies = [\n \"{PROC_MACRO_PACKAGE} 0.7.0\",\n]\n\n\
+         [[package]]\nname = \"ipe_ffi\"\ndependencies = [\n \"{PROC_MACRO_PACKAGE}_extra\",\n]\n\n\
+         [[package]]\nname = \"vendored\"\nsource = \"registry+https://x\"\n\
+         dependencies = [\n \"{PROC_MACRO_PACKAGE}\",\n]\n"
     );
-    let unowned = tree(
-        "unowned",
-        &[
-            ("Cargo.toml", "[workspace]\nmembers = [\"other\"]\n"),
-            ("other/src/lib.rs", ""),
-        ],
+    assert_eq!(
+        workspace_dependents(&lock, PROC_MACRO_PACKAGE),
+        ["ipe_docs", "ipe"]
     );
-    assert!(
-        client_namers(&unowned, &unowned.join("cli/src/net.rs")).is_err(),
-        "a listing that misses the owner scans the wrong tree"
-    );
-    for dir in [root, globbed, unowned] {
-        let _ = std::fs::remove_dir_all(dir);
-    }
 }
 
 #[test]
@@ -2571,7 +2624,7 @@ fn surface_checks_refuse_each_export() {
     }
     let lock = "[[package]]\nname = \"ipe-lsp\"\ndependencies = [\n \"CLIENT 3.4.2\",\n]\n"
         .replace("CLIENT", HTTP_CLIENT);
-    assert_eq!(client_dependents(&lock), ["ipe-lsp"]);
+    assert_eq!(workspace_dependents(&lock, HTTP_CLIENT), ["ipe-lsp"]);
 }
 
 #[test]
@@ -2643,7 +2696,7 @@ fn surface_checks_admit_the_private_forms() {
     );
     let lock = "[[package]]\nname = \"tls\"\nsource = \"registry+https://x\"\ndependencies = [\n \"CLIENT\",\n]\n\n[[package]]\nname = \"ipe\"\ndependencies = [\n \"CLIENT-proto\",\n \"CLIENT\",\n]\n"
         .replace("CLIENT", HTTP_CLIENT);
-    assert_eq!(client_dependents(&lock), ["ipe"]);
+    assert_eq!(workspace_dependents(&lock, HTTP_CLIENT), ["ipe"]);
 }
 
 /// The ceilings of the sample crate: one named ceiling and one const of another type.
