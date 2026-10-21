@@ -40,8 +40,9 @@
 //! A renaming `use` of, or to, `Command`, `CommandExt`, `Child`,
 //! `LocalCeiling`, `InheritedRole` or a runner fn, a type alias naming
 //! `Command`, `CommandExt` or `Child`, a `Command::new` not called in place,
-//! and an `include!` by any path, by a renaming `use`, or inside a
-//! token-matched macro body are refused.
+//! an `include` identifier anywhere in production code (so an `include!` by
+//! any path, rename or macro argument), and a macro name a macro metavariable
+//! supplies are refused.
 //!
 //! A ceiling is named only by the top-level `LocalCeiling` consts of
 //! `remote_ingest.rs`: a `LocalCeiling` const elsewhere, any const, static,
@@ -55,7 +56,7 @@
 //! `remote_ingest::read_capped` by a whitespace-free text match.
 //!
 //! The HTTP client crate is named only in `src/net.rs`, whose policy every
-//! call takes: any other source of this crate naming it as a token — a path,
+//! call takes: any other source of any workspace member naming it as a token — a path,
 //! an import, a rename, a raw identifier, a comment — is refused, as is an
 //! exported `net` item whose surface carries a client type, a `package =`
 //! rename of it in `Cargo.toml`, and any other workspace package depending on
@@ -567,12 +568,19 @@ fn is_test_only(attrs: &[Attribute]) -> bool {
 fn names_a_path(attr: &Attribute) -> bool {
     attr.path().is_ident("path")
         || (attr.path().is_ident("cfg_attr")
-            && attr.meta.require_list().is_ok_and(|list| {
-                list.tokens
-                    .clone()
-                    .into_iter()
-                    .any(|tree| matches!(tree, TokenTree::Ident(ident) if ident == "path"))
-            }))
+            && attr
+                .meta
+                .require_list()
+                .is_ok_and(|list| tokens_name_path(list.tokens.clone())))
+}
+
+/// Whether `tokens`, nested groups included, hold a `path` identifier.
+fn tokens_name_path(tokens: TokenStream) -> bool {
+    tokens.into_iter().any(|tree| match tree {
+        TokenTree::Ident(ident) => name_of(&ident) == "path",
+        TokenTree::Group(group) => tokens_name_path(group.stream()),
+        TokenTree::Punct(_) | TokenTree::Literal(_) => false,
+    })
 }
 
 /// The last identifier of `ty`'s path, if it is a path type, parentheses and
@@ -1059,13 +1067,16 @@ impl Scanner<'_> {
         let key = self.key();
         self.out.macro_idents.push((key, name.clone()));
         self.out.values.push(name.clone());
-        if name == INCLUDE_MACRO && next.is_some_and(|tree| is_punct(tree, '!')) {
-            self.refuse("an `include!`");
+        if name == INCLUDE_MACRO {
+            self.refuse("an `include` identifier");
             return;
         }
         if let [rest @ .., dollar] = before
             && is_punct(dollar, '$')
         {
+            if next.is_some_and(|tree| is_punct(tree, '!')) {
+                self.refuse("a macro name a macro metavariable supplies");
+            }
             let child_path =
                 qualifier_of(rest).is_some_and(|q| child_qualifier(&self.resolved(&q)));
             if follows_dot(rest) || child_path {
@@ -1213,6 +1224,9 @@ impl<'ast> Visit<'ast> for Scanner<'_> {
         if self.production && self.in_alias > 0 && listed(CHILD_TYPES, &name) {
             self.refuse(&format!("a type alias naming `{name}`"));
         }
+        if self.production && name == INCLUDE_MACRO {
+            self.refuse("an `include` identifier");
+        }
     }
 
     fn visit_pat_ident(&mut self, pat: &'ast PatIdent) {
@@ -1256,7 +1270,13 @@ impl<'ast> Visit<'ast> for Scanner<'_> {
                     self.import(to);
                 }
             }
-            UseTree::Name(used) => self.import(name_of(&used.ident)),
+            UseTree::Name(used) => {
+                let name = name_of(&used.ident);
+                if self.production && name == INCLUDE_MACRO {
+                    self.refuse("an `include` identifier");
+                }
+                self.import(name);
+            }
             UseTree::Glob(_) => self.import(GLOB_BINDING.to_owned()),
             UseTree::Path(_) | UseTree::Group(_) => visit::visit_use_tree(self, tree),
         }
@@ -2259,25 +2279,61 @@ fn no_http_body_read_is_unbounded() {
     );
 }
 
+/// The member directories the workspace `manifest` lists, relative to the
+/// workspace root; a glob member is refused, since this listing cannot expand it.
+fn workspace_members(manifest: &str) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+    let table = manifest.parse::<toml::Table>()?;
+    let members = table
+        .get("workspace")
+        .and_then(|workspace| workspace.get("members"))
+        .and_then(toml::Value::as_array)
+        .ok_or("the workspace manifest lists no members")?;
+    members
+        .iter()
+        .map(|member| -> Result<String, Box<dyn std::error::Error>> {
+            let member = member
+                .as_str()
+                .ok_or("a workspace member that is not a string")?;
+            if member.contains(['*', '?', '[']) {
+                return Err(format!("a glob workspace member `{member}`").into());
+            }
+            Ok(member.to_owned())
+        })
+        .collect()
+}
+
+/// Every `.rs` file of every member of the workspace at `root`, `owner`
+/// aside, that names [`HTTP_CLIENT`]: a macro another crate exports expands
+/// where it is called, so a client path in any member can reach this crate.
+fn client_namers(root: &Path, owner: &Path) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+    let manifest = std::fs::read_to_string(root.join("Cargo.toml"))?;
+    let mut paths = BTreeSet::new();
+    for member in workspace_members(&manifest)? {
+        let mut files = Vec::new();
+        rust_files(&root.join(member), 0, &mut files)?;
+        paths.extend(files);
+    }
+    if !paths.contains(owner) {
+        return Err(format!("the listing must see {}", owner.display()).into());
+    }
+    let mut found = Vec::new();
+    for path in paths.iter().filter(|path| *path != owner) {
+        if names_client(&String::from_utf8_lossy(&std::fs::read(path)?)) {
+            found.push(format!("{}: names the HTTP client", path.display()));
+        }
+    }
+    Ok(found)
+}
+
 #[test]
 fn only_net_names_the_http_client() {
     let crate_dir = e2e_support::manifest_dir!();
-    let mut paths = Vec::new();
-    rust_files(&crate_dir, 0, &mut paths).expect("crate tree listable");
+    let root = crate_dir
+        .ancestors()
+        .nth(2)
+        .expect("crate sits two levels under the workspace");
     let owner = crate_dir.join(CLIENT_OWNER);
-    assert!(
-        paths.contains(&owner),
-        "the scan must see {CLIENT_OWNER}, or it is scanning the wrong tree"
-    );
-    let mut found: Vec<String> = paths
-        .iter()
-        .filter(|path| **path != owner)
-        .filter(|path| {
-            let bytes = std::fs::read(path).expect("source readable");
-            names_client(&String::from_utf8_lossy(&bytes))
-        })
-        .map(|path| format!("{}: names the HTTP client", path.display()))
-        .collect();
+    let mut found = client_namers(root, &owner).expect("workspace sources listable");
     let net = std::fs::read_to_string(&owner).expect("net source readable");
     assert!(
         names_client(&net),
@@ -2305,10 +2361,6 @@ fn only_net_names_the_http_client() {
             .into_iter()
             .map(|line| format!("Cargo.toml: `{line}` is not the plain client entry")),
     );
-    let root = crate_dir
-        .ancestors()
-        .nth(2)
-        .expect("crate sits two levels under the workspace");
     let lock = std::fs::read_to_string(root.join("Cargo.lock")).expect("lockfile readable");
     let dependents = client_dependents(&lock);
     assert!(
@@ -2327,6 +2379,76 @@ fn only_net_names_the_http_client() {
         "the HTTP client is named only in {CLIENT_OWNER}, whose policy every call takes:\n{}",
         found.join("\n")
     );
+}
+
+/// A fresh tree holding `files` (path relative to the tree, contents).
+#[allow(clippy::expect_used)] // a failed scratch-tree setup is the test failure
+fn tree(label: &str, files: &[(&str, &str)]) -> PathBuf {
+    let root = ipe_test_temp::temp_root().join(format!(
+        "ipe_child_runner_scan_{label}_{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&root);
+    for (rel, text) in files {
+        let path = root.join(rel);
+        let parent = path.parent().expect("a tree file has a parent");
+        std::fs::create_dir_all(parent).expect("tree dir is created");
+        std::fs::write(&path, text).expect("tree file is written");
+    }
+    root
+}
+
+#[test]
+fn a_client_path_in_any_workspace_member_is_refused() {
+    let call = format!("macro_rules! f {{ ($u:expr) => {{ ::{HTTP_CLIENT}::get($u).call() }} }}");
+    let owner_source = format!("use {HTTP_CLIENT}::Agent;");
+    let root = tree(
+        "members",
+        &[
+            (
+                "Cargo.toml",
+                "[workspace]\nmembers = [\"cli\", \"other\"]\n",
+            ),
+            ("cli/src/net.rs", &owner_source),
+            ("cli/src/lib.rs", "mod net;"),
+            ("other/src/lib.rs", &call),
+            ("other/build.rs", "fn main() {}"),
+            ("unlisted/src/lib.rs", &call),
+        ],
+    );
+    let found = client_namers(&root, &root.join("cli/src/net.rs")).expect("tree listable");
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert!(
+        found
+            .iter()
+            .all(|line| line.contains("other") && line.contains("lib.rs")),
+        "{found:?}"
+    );
+    let globbed = tree(
+        "glob",
+        &[
+            ("Cargo.toml", "[workspace]\nmembers = [\"crates/*\"]\n"),
+            ("crates/a/src/lib.rs", &call),
+        ],
+    );
+    assert!(
+        client_namers(&globbed, &globbed.join("crates/a/src/net.rs")).is_err(),
+        "a glob member must be refused, not skipped"
+    );
+    let unowned = tree(
+        "unowned",
+        &[
+            ("Cargo.toml", "[workspace]\nmembers = [\"other\"]\n"),
+            ("other/src/lib.rs", ""),
+        ],
+    );
+    assert!(
+        client_namers(&unowned, &unowned.join("cli/src/net.rs")).is_err(),
+        "a listing that misses the owner scans the wrong tree"
+    );
+    for dir in [root, globbed, unowned] {
+        let _ = std::fs::remove_dir_all(dir);
+    }
 }
 
 #[test]
@@ -2659,6 +2781,16 @@ fn a_hidden_or_renamed_child_start_is_refused() {
             "the scan must refuse: {sample}"
         );
     }
+    for sample in [
+        "#[path = \"x.rs\"] mod x {}",
+        "#[cfg_attr(all(), path = \"x.rs\")] mod x {}",
+        "#[cfg_attr(all(), cfg_attr(all(), path = \"../../x.rs\"))] mod x {}",
+    ] {
+        assert!(
+            refused_for(&sample_verdict(sample), "a `#[path]` module"),
+            "the scan must refuse: {sample}"
+        );
+    }
 }
 
 #[test]
@@ -2671,6 +2803,9 @@ fn an_include_of_any_file_by_any_spelling_is_refused() {
         "macro_rules! splice { ($f:literal) => { include!($f) }; }",
         "fn f() { m!(a b include!(\"x.txt\")); }",
         "fn f() { m!(a b std::include!(\"x.txt\")); }",
+        "fn f() { s!(include); }",
+        "fn f() { s!(a b include); }",
+        "use std::include;",
     ];
     for sample in refused {
         assert!(
@@ -2678,6 +2813,14 @@ fn an_include_of_any_file_by_any_spelling_is_refused() {
             "the scan must refuse: {sample}"
         );
     }
+    let spliced = "macro_rules! s { ($m:ident) => { $m!(\"x.txt\") }; }";
+    assert!(
+        refused_for(
+            &sample_verdict(spliced),
+            "a macro name a macro metavariable"
+        ),
+        "the scan must refuse: {spliced}"
+    );
     assert!(
         !refused_for(
             &sample_verdict("const PAGE: &str = \"include\";"),

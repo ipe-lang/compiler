@@ -472,6 +472,7 @@ mod tests {
             ("https://h/#f", UrlError::ForbiddenChar),
             ("https://h\u{a0}/", UrlError::ForbiddenChar),
             ("https://h\u{e9}/", UrlError::Malformed),
+            ("https://h\\@e/", UrlError::Malformed),
         ] {
             assert_eq!(HttpsUrl::parse(value), Err(fault), "{value:?}");
         }
