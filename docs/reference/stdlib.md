@@ -3350,7 +3350,7 @@ Ipe.WebSocket — outbound WebSocket client.
 | `withPingInterval` | Override the ping interval (default 30 s).  Takes a typed `Ipe.Duration`; |
 | `connect` | `connect wsUrl` — open a new WebSocket to `wsUrl` (`ws://` or `wss://`). |
 | `connectWith` | `connectWith cfg` — connect with custom headers / timeout / |
-| `send` | `send sock text` — write a text frame.  Blocks up to 30 s if |
+| `send` | `send sock text` — queue a text frame.  Never blocks: a full |
 | `sendBinary` | `sendBinary sock bytes` — write a binary frame.  Takes `Bytes` |
 | `close` | `close sock` — release the connection (sends a Normal close |
 | `closeWithCode` | `closeWithCode code reason sock` — release the connection with |

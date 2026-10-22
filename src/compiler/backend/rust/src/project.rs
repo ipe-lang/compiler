@@ -732,7 +732,12 @@ fn assert_wasm_admissible(ctx: &EmitCtx) -> DResult<()> {
 /// The full runtime source tree is copied into the emitted project by the
 /// driver; this addition wires `db.rs` (which lives in that tree) into the
 /// module namespace so the generated `main.rs` can call the db functions.
-const RUNTIME_MOD_RS_DB_APPEND: &str = "pub mod db;\npub use db::*;\npub mod telemetry_spill;\n";
+/// `sql_text` is the one place SQL text becomes a `sqlx` statement. It stays
+/// private, as in the runtime crate: `db`, `external_conn`, and the db-gated
+/// arms of `auth` and `web::hub` reach it by a relative `super::` path, so the
+/// generated code outside `ipe_runtime` cannot name it.
+const RUNTIME_MOD_RS_DB_APPEND: &str =
+    "pub mod db;\npub use db::*;\npub mod telemetry_spill;\nmod sql_text;\n";
 
 /// Lines appended to `ipe_runtime/mod.rs` for the typed DSN descriptor and the
 /// external-connection pool when the program uses Db kernels.
@@ -3881,10 +3886,12 @@ fn pub_crate_item(rendered: &str) -> String {
 /// Build the db-enabled `Cargo.toml` from the base manifest by:
 ///
 /// 1. Adding `"db"` to the `default` feature list.
-/// 2. Appending the `sqlx` dependency line, with BOTH `"sqlite"` AND `"postgres"`
-///    ALWAYS enabled, regardless of the configured driver.
+/// 2. Appending the `sqlx` dependency line rendered from
+///    [`crate_specs::SQLX`], with BOTH drivers of [`crate_specs::SQLX_DRIVERS`]
+///    (`"sqlite-bundled"` AND `"postgres"`) ALWAYS enabled, regardless of the
+///    configured driver.
 ///
-///    `"sqlite"` is always required: the always-emitted `telemetry_spill` /
+///    The sqlite driver is always required: the always-emitted `telemetry_spill` /
 ///    `web::hub` / `web::store` runtime modules hardcode `SqlitePool` for their
 ///    local spill/session persistence (independent of the app's `[database]`
 ///    driver choice).
@@ -3906,15 +3913,13 @@ fn db_cargo_toml(base: &str, driver: crate::DbDriver) -> DResult<String> {
     // The sqlx line is appended right before the dev/release profile sections.
     // Anchoring on `[profile.dev]` is stable (always present in the template).
     const PROFILE_ANCHOR: &str = "[profile.dev]";
-    // Both `"sqlite"` and `"postgres"` are unconditional — see the doc comment
-    // above for why. The `driver` parameter controls which config.rs alias is
-    // used (DbPool / DbRow), not which sqlx features link.
+    // Both drivers are unconditional — see the doc comment above for why. The
+    // `driver` parameter controls which config.rs alias is used (DbPool /
+    // DbRow), not which sqlx features link.
     let _ = driver;
-    let sqlx_features = r#""sqlite", "postgres""#;
     let sqlx_line = format!(
-        "{} = {{ version = \"{}\", features = [\"runtime-tokio-rustls\", {sqlx_features}] }}\n\n",
-        crate_specs::SQLX.name,
-        crate_specs::SQLX.version,
+        "{}\n\n",
+        crate_specs::SQLX.dependency_line(crate_specs::SQLX_DRIVERS)
     );
 
     let step1 = base.replacen(DEFAULT_LINE, DEFAULT_LINE_DB, 1);
@@ -4030,13 +4035,9 @@ fn server_cargo_toml(base: &str) -> DResult<String> {
     // runtime crate, so it is omitted here (the vendored module's `#[cfg(test)]`
     // blocks never compile in the app crate build).
     let server_deps = format!(
-        "{} = {{ version = \"{}\", features = [\"ws\"] }}\n\
-         {} = {{ version = \"{}\", features = [\"fs\", \"catch-panic\", \"timeout\"] }}\n\
-         {} = {{ version = \"{}\", features = [\"limit\"] }}\n\n",
-        crate_specs::AXUM.name,
-        crate_specs::AXUM.version,
-        crate_specs::TOWER_HTTP.name,
-        crate_specs::TOWER_HTTP.version,
+        "{}\n{}\n{} = {{ version = \"{}\", features = [\"limit\"] }}\n\n",
+        crate_specs::AXUM.dependency_line(&[]),
+        crate_specs::TOWER_HTTP.dependency_line(&[]),
         crate_specs::TOWER.name,
         crate_specs::TOWER.version,
     );
@@ -4151,15 +4152,6 @@ fn web_cargo_toml(base: &str) -> DResult<String> {
     // `net`+`sync`+`signal` for the HTTP server, so add the one missing feature.
     const TOKIO_NET_SYNC_FEATURES: &str = "\"time\", \"net\", \"sync\", \"signal\"]";
     const TOKIO_LIVE_FEATURES: &str = "\"time\", \"net\", \"sync\", \"signal\", \"process\"]";
-    // `db_cargo_toml` now always emits both `"sqlite"` and `"postgres"` sqlx
-    // features (since `external_conn.rs` uses `sqlx::postgres` unconditionally).
-    // The replacen below is kept as a safety net for Db+Web combinations but is a
-    // no-op in practice — `SQLX_SQLITE_FEATURES` no longer appears in the manifest
-    // after `db_cargo_toml` runs. Fail-open (no CompilerBug guard) applies in both
-    // the no-Db case (sqlx absent) and the always-both case (pattern not found).
-    const SQLX_SQLITE_FEATURES: &str = "features = [\"runtime-tokio-rustls\", \"sqlite\"]";
-    const SQLX_POSTGRES_FEATURES: &str =
-        "features = [\"runtime-tokio-rustls\", \"sqlite\", \"postgres\"]";
     // Versions + names from the SSOT; this is a bare `name = "ver"` dep.
     // `serde_urlencoded` is NOT appended here: it is an unconditional base
     // manifest dep now (`dom/form.rs` is always vendored). `rustix` is NOT
@@ -4218,13 +4210,6 @@ fn web_cargo_toml(base: &str) -> DResult<String> {
     result.push_str(step1.get(..anchor_pos).unwrap_or(""));
     result.push_str(&web_deps);
     result.push_str(step1.get(anchor_pos..).unwrap_or(""));
-
-    // Step 3 — extend the sqlx dep with the `postgres` feature when the
-    // program also uses Db (db_cargo_toml ran before web_cargo_toml and
-    // injected the sqlite-only sqlx dep; we promote it here so the live
-    // session-store's `PostgresStore` — which references `sqlx::PgPool` — can
-    // compile).  No-op when sqlx is absent (Web-only, no Db).
-    let result = result.replacen(SQLX_SQLITE_FEATURES, SQLX_POSTGRES_FEATURES, 1);
     Ok(result)
 }
 
@@ -4446,8 +4431,11 @@ fn webview_cargo_toml(base: &str) -> DResult<String> {
 /// 2. Adding `"sync"` to tokio (the `ws_client` writer/reader tasks use
 ///    `tokio::sync::mpsc` / `broadcast`) when not already present — idempotent,
 ///    same strategy as `tui_cargo_toml`.
-/// 3. Appending `tokio-tungstenite` as a plain dependency before `[profile.dev]`
-///    (`futures-util` and `url`, its other deps, are already in the base).
+/// 3. Appending `tokio-tungstenite` (the handshake only), `tokio-rustls`,
+///    `rustls` and `webpki-roots` before `[profile.dev]`, each rendered from its
+///    [`crate_specs`] pin: the runtime owns the `wss://` TLS and trusts
+///    `webpki-roots` alone (`futures-util` and `url`, its other deps, are
+///    already in the base).
 ///
 /// # Errors
 ///
@@ -4467,11 +4455,15 @@ fn websocket_cargo_toml(base: &str) -> DResult<String> {
         crate_specs::TOKIO.name,
         crate_specs::TOKIO.version,
     );
-    let ws_dep = format!(
-        "{} = \"{}\"\n",
-        crate_specs::TOKIO_TUNGSTENITE.name,
-        crate_specs::TOKIO_TUNGSTENITE.version,
-    );
+    let ws_dep: String = [
+        crate_specs::TOKIO_TUNGSTENITE,
+        crate_specs::TOKIO_RUSTLS,
+        crate_specs::RUSTLS,
+        crate_specs::WEBPKI_ROOTS,
+    ]
+    .iter()
+    .map(|pinned| pinned.dependency_line(&[]) + "\n")
+    .collect();
 
     // Step 1 — promote `websocket_client` to the default feature list.
     let pfx = base
@@ -4512,7 +4504,7 @@ fn websocket_cargo_toml(base: &str) -> DResult<String> {
         replaced
     };
 
-    // Step 3 — append tokio-tungstenite before `[profile.dev]`.
+    // Step 3 — append the socket and TLS crates before `[profile.dev]`.
     let anchor_pos = step2
         .find(PROFILE_ANCHOR)
         .ok_or_else(|| Diagnostic::CompilerBug {
@@ -4585,10 +4577,8 @@ fn tea_cargo_toml(base: &str) -> DResult<String> {
 /// The dependency line is inserted before the
 /// `[target.'cfg(unix)'.dependencies]` header so it lands in the cross-platform
 /// `[dependencies]` table — `reqwest` must compile on every target, not only
-/// unix. Its feature list + `default-features = false` mirror
-/// `runtime/Cargo.toml` (the vendored source was tested against exactly that
-/// shape); the version comes from the [`crate_specs`] SSOT (drift-guarded
-/// against `runtime/Cargo.toml`).
+/// unix. The line renders from [`crate_specs::REQWEST`], drift-guarded against
+/// `runtime/Cargo.toml`.
 ///
 /// # Errors
 ///
@@ -4599,12 +4589,7 @@ fn http_client_cargo_toml(base: &str) -> DResult<String> {
     // `reqwest` joins the main, cross-platform `[dependencies]` table — never
     // the `cfg(unix)` one — and the unix comment stays attached to its header.
     const DEPS_END_ANCHOR: &str = "\n\n# Unix-only:";
-    let reqwest_dep = format!(
-        "\n{} = {{ version = \"{}\", default-features = false, \
-         features = [\"rustls-tls\", \"gzip\", \"stream\"] }}",
-        crate_specs::REQWEST.name,
-        crate_specs::REQWEST.version,
-    );
+    let reqwest_dep = format!("\n{}", crate_specs::REQWEST.dependency_line(&[]));
     let anchor_pos = base
         .find(DEPS_END_ANCHOR)
         .ok_or_else(|| Diagnostic::CompilerBug {
@@ -4753,10 +4738,8 @@ fn chrono_tz_cargo_toml(base: &str) -> DResult<String> {
 /// crate declares the `email` module through the `mod.rs` append; the `email`
 /// feature is promoted as well, mirroring the runtime crate, because the
 /// vendored `ssrf.rs` gates the dial helpers `email.rs` reaches on it.
-/// `lettre`'s feature list +
-/// `default-features = false` mirror `runtime/Cargo.toml` (the vendored source
-/// was tested against exactly that shape). The version comes from the
-/// [`crate_specs`] SSOT (drift-guarded against `runtime/Cargo.toml`).
+/// The `lettre` line renders from [`crate_specs::LETTRE`], drift-guarded
+/// against `runtime/Cargo.toml`.
 ///
 /// # Errors
 ///
@@ -4764,12 +4747,7 @@ fn chrono_tz_cargo_toml(base: &str) -> DResult<String> {
 /// a golden-drift invariant violation (fail-loud, never a silent no-op).
 fn email_cargo_toml(base: &str) -> DResult<String> {
     const PROFILE_ANCHOR: &str = "[profile.dev]";
-    let lettre_dep = format!(
-        "{} = {{ version = \"{}\", default-features = false, features = [\"builder\", \
-         \"hostname\", \"smtp-transport\", \"pool\", \"tokio1\", \"tokio1-rustls-tls\"] }}\n\n",
-        crate_specs::LETTRE.name,
-        crate_specs::LETTRE.version,
-    );
+    let lettre_dep = format!("{}\n\n", crate_specs::LETTRE.dependency_line(&[]));
     let anchor_pos = base
         .find(PROFILE_ANCHOR)
         .ok_or_else(|| Diagnostic::CompilerBug {
@@ -4937,17 +4915,11 @@ fn url_cargo_toml(base: &str) -> DResult<String> {
 /// a golden-drift invariant violation (fail-loud, never a silent no-op).
 fn config_cargo_toml(base: &str) -> DResult<String> {
     const PROFILE_ANCHOR: &str = "[profile.dev]";
-    let yaml_features = crate_specs::SERDE_SAPHYR_FEATURES
-        .iter()
-        .map(|feature| format!("{feature:?}"))
-        .collect::<Vec<_>>()
-        .join(", ");
     let deps = format!(
-        "{} = \"{}\"\n{} = {{ version = \"{}\", default-features = false, features = [{yaml_features}] }}\n\n",
+        "{} = \"{}\"\n{}\n\n",
         crate_specs::TOML.name,
         crate_specs::TOML.version,
-        crate_specs::SERDE_SAPHYR.name,
-        crate_specs::SERDE_SAPHYR.version,
+        crate_specs::SERDE_SAPHYR.dependency_line(&[]),
     );
     let anchor_pos = base
         .find(PROFILE_ANCHOR)
@@ -5084,11 +5056,7 @@ fn crypto_core_heavy_cargo_toml(base: &str) -> DResult<String> {
     // Anchor the `rsa` line to the `zeroize` base dep it originally followed, so
     // its slot in `[dependencies]` is unchanged for a crypto-using program.
     const ZEROIZE_ANCHOR: &str = "zeroize = \"1\"\n";
-    let rsa_dep = format!(
-        "{} = {{ version = \"{}\", features = [\"sha2\"] }}\n",
-        crate_specs::RSA.name,
-        crate_specs::RSA.version,
-    );
+    let rsa_dep = format!("{}\n", crate_specs::RSA.dependency_line(&[]));
 
     // Step 1 — insert `"crypto"` into the default feature list. Anchor on
     // `"tokio"` when present (keeping the `["tokio", "crypto", "json"]` order
@@ -5832,7 +5800,8 @@ mod tests {
         dev_posture_cargo_toml, email_cargo_toml, http_client_cargo_toml,
         insert_wasi_linker_config, jwt_cargo_toml, promote_default_feature, runtime_bindings,
         server_cargo_toml, shake_ffi_by_fn_ident, ssrf_cargo_toml, wasm_hydrate_entry,
-        wasm_present_modules, wasm_runtime_bindings, web_cargo_toml, wrapper_call_paths,
+        wasm_present_modules, wasm_runtime_bindings, web_cargo_toml, websocket_cargo_toml,
+        wrapper_call_paths,
     };
     use crate::DbDriver;
     use crate::crate_specs;
@@ -6090,34 +6059,43 @@ mod tests {
         )
         .expect("db_cargo_toml");
         assert!(
-            db.contains(&format!(
-                "{} = {{ version = \"{}\"",
-                crate_specs::SQLX.name,
-                crate_specs::SQLX.version
-            )),
-            "db manifest must emit SSOT sqlx version:\n{db}"
+            db.lines()
+                .any(|line| line == crate_specs::SQLX.dependency_line(crate_specs::SQLX_DRIVERS)),
+            "db manifest must emit the SSOT sqlx line:\n{db}"
         );
         let srv = server_cargo_toml(&async_runtime_cargo_toml(CARGO_TOML).expect("async base"))
             .expect("server_cargo_toml");
-        assert!(
-            srv.contains(&format!(
-                "{} = {{ version = \"{}\", features = [\"ws\"]",
-                crate_specs::AXUM.name,
-                crate_specs::AXUM.version
-            )),
-            "server manifest must emit SSOT axum version:\n{srv}"
-        );
+        for pinned in [crate_specs::AXUM, crate_specs::TOWER_HTTP] {
+            assert!(
+                srv.lines().any(|line| line == pinned.dependency_line(&[])),
+                "server manifest must emit the SSOT {} line:\n{srv}",
+                pinned.spec.name
+            );
+        }
         let heavy = crypto_core_heavy_cargo_toml(
             &async_runtime_cargo_toml(CARGO_TOML).expect("async base"),
         )
         .expect("crypto_core_heavy_cargo_toml");
         assert!(
-            heavy.contains(&format!(
-                "{} = {{ version = \"{}\", features = [\"sha2\"] }}",
-                crate_specs::RSA.name,
-                crate_specs::RSA.version
-            )),
-            "heavy-crypto manifest must emit the SSOT rsa version:\n{heavy}"
+            heavy
+                .lines()
+                .any(|line| line == crate_specs::RSA.dependency_line(&[])),
+            "heavy-crypto manifest must emit the SSOT rsa line:\n{heavy}"
+        );
+        let http =
+            http_client_cargo_toml(&async_runtime_cargo_toml(CARGO_TOML).expect("async base"))
+                .expect("http_client_cargo_toml");
+        assert!(
+            http.lines()
+                .any(|line| line == crate_specs::REQWEST.dependency_line(&[])),
+            "http-client manifest must emit the SSOT reqwest line:\n{http}"
+        );
+        let email = email_cargo_toml(CARGO_TOML).expect("email_cargo_toml");
+        assert!(
+            email
+                .lines()
+                .any(|line| line == crate_specs::LETTRE.dependency_line(&[])),
+            "email manifest must emit the SSOT lettre line:\n{email}"
         );
     }
 
@@ -6358,15 +6336,14 @@ mod tests {
 
     // ── seal tests: Db+Web closure ─────────────────────────────────────
 
-    /// `web_cargo_toml` on a DB+Server base manifest must extend the sqlx dep
-    /// with the `"postgres"` feature.
+    /// `web_cargo_toml` on a DB+Server base manifest keeps the sqlx dep with
+    /// both drivers.
     ///
-    /// Root cause: `live/store.rs`'s `PostgresStore` references `sqlx::PgPool`
-    /// gated on `#[cfg(feature = "db")]`.  The runtime's own `Cargo.toml` has
-    /// `["runtime-tokio-rustls", "sqlite", "postgres"]`; the emitted project must
-    /// match.  Without this, a Db+Web program passes `ipe` then fails `cargo
-    /// build` with E0433 (`use of undeclared crate or module sqlx` in
-    /// `PgPool::connect`).
+    /// `live/store.rs`'s `PostgresStore` references `sqlx::PgPool` gated on
+    /// `#[cfg(feature = "db")]`, and the runtime's `db` feature enables both
+    /// drivers; the emitted project must match. Without the postgres driver, a
+    /// Db+Web program passes `ipe` then fails `cargo build` with E0433 (`use of
+    /// undeclared crate or module sqlx` in `PgPool::connect`).
     ///
     /// Note: in `emit_program` the call chain is always
     /// `db_cargo_toml → server_cargo_toml → web_cargo_toml` when a program
@@ -6387,20 +6364,24 @@ mod tests {
             server_cargo_toml(&db_base).expect("server_cargo_toml on db base must succeed");
         let out =
             web_cargo_toml(&server_base).expect("web_cargo_toml on db+server base must succeed");
-        // The sqlx line must carry the postgres feature.
-        let sqlx_line = out
+        let sqlx_key = format!("{} = ", crate_specs::SQLX.spec.name);
+        let sqlx_lines: Vec<&str> = out
             .lines()
-            .find(|l| l.trim_start().starts_with(crate_specs::SQLX.name))
-            .expect("sqlx dep must be present in a db+live manifest");
-        assert!(
-            sqlx_line.contains("\"postgres\""),
-            "sqlx dep must include the postgres feature (E0433 fix): {sqlx_line}"
+            .filter(|l| l.trim_start().starts_with(&sqlx_key))
+            .collect();
+        assert_eq!(
+            sqlx_lines,
+            [crate_specs::SQLX
+                .dependency_line(crate_specs::SQLX_DRIVERS)
+                .as_str()],
+            "a db+live manifest must carry exactly the SSOT sqlx line:\n{out}"
         );
-        // Regression: sqlite must still be present.
-        assert!(
-            sqlx_line.contains("\"sqlite\""),
-            "sqlx dep must still include the sqlite feature (no regression): {sqlx_line}"
-        );
+        for driver in ["\"postgres\"", "\"sqlite-bundled\""] {
+            assert!(
+                sqlx_lines.iter().all(|line| line.contains(driver)),
+                "the sqlx dep must enable {driver}: {sqlx_lines:?}"
+            );
+        }
         // Regression: the web feature must be in the default list.
         let def_line = out
             .lines()
@@ -6452,8 +6433,8 @@ mod tests {
 
     // ── Class 7 §3: Postgres driver structural reachability ─────────────────
 
-    /// Both sqlite and postgres drivers must emit `"sqlite"` AND `"postgres"` in
-    /// the sqlx feature list. `external_conn.rs` uses `sqlx::postgres::PgPool`
+    /// Both sqlite and postgres drivers must emit `"sqlite-bundled"` AND
+    /// `"postgres"` in the sqlx feature list. `external_conn.rs` uses `sqlx::postgres::PgPool`
     /// unconditionally (it handles any externally-configured DSN regardless of the
     /// app's own fixed driver), so `"postgres"` is required even for a
     /// sqlite-driver program — omitting it causes E0433 at `cargo build`.
@@ -6464,11 +6445,7 @@ mod tests {
             DbDriver::Sqlite,
         )
         .expect("db_cargo_toml(Sqlite) must succeed");
-        assert!(
-            out.contains(r#"features = ["runtime-tokio-rustls", "sqlite", "postgres"]"#),
-            "sqlite driver must enable both sqlite and postgres sqlx features \
-             (external_conn.rs uses sqlx::postgres unconditionally): {out}"
-        );
+        assert_both_sqlx_drivers(&out);
     }
 
     /// The actual structural fix under test: `driver = "postgres"` must
@@ -6491,11 +6468,22 @@ mod tests {
             DbDriver::Postgres,
         )
         .expect("db_cargo_toml(Postgres) must succeed");
+        assert_both_sqlx_drivers(&out);
+    }
+
+    /// `out` carries the SSOT sqlx line, and that line enables the bundled
+    /// sqlite driver and the postgres driver, never the wider `sqlite` arm.
+    fn assert_both_sqlx_drivers(out: &str) {
+        let line = crate_specs::SQLX.dependency_line(crate_specs::SQLX_DRIVERS);
         assert!(
-            out.contains(r#"features = ["runtime-tokio-rustls", "sqlite", "postgres"]"#),
-            "postgres driver must enable both the sqlite sqlx feature (always \
-             needed by telemetry_spill/hub/store) and the postgres feature: {out}"
+            out.lines().any(|emitted| emitted == line),
+            "the db manifest must carry the SSOT sqlx line `{line}`:\n{out}"
         );
+        assert!(
+            line.contains("\"sqlite-bundled\"") && line.contains("\"postgres\""),
+            "both drivers must link whatever the configured driver: {line}"
+        );
+        assert!(!line.contains("\"sqlite\""), "{line}");
     }
 
     /// The sqlite `config.rs` template is unchanged by this feature (byte
@@ -6765,6 +6753,29 @@ mod tests {
         );
         assert!(!yaml_line.contains("include"), "{yaml_line}");
         assert!(!yaml_line.contains("properties"), "{yaml_line}");
+    }
+
+    /// The websocket manifest names tungstenite for the handshake only, and the
+    /// TLS stack and root store the runtime's `wss://` client uses, each as its
+    /// SSOT line.
+    #[test]
+    fn websocket_toml_renders_the_pinned_tls_lines() {
+        let base = async_runtime_cargo_toml(CARGO_TOML).expect("async base");
+        let out = websocket_cargo_toml(&base).expect("websocket_cargo_toml must succeed");
+        for pinned in [
+            crate_specs::TOKIO_TUNGSTENITE,
+            crate_specs::TOKIO_RUSTLS,
+            crate_specs::RUSTLS,
+            crate_specs::WEBPKI_ROOTS,
+        ] {
+            let key = format!("{} = ", pinned.spec.name);
+            let lines: Vec<&str> = out.lines().filter(|l| l.starts_with(&key)).collect();
+            assert_eq!(
+                lines,
+                [pinned.dependency_line(&[]).as_str()],
+                "the websocket manifest must carry exactly the SSOT line:\n{out}"
+            );
+        }
     }
 
     /// Promotion is idempotent and refuses a manifest with no default list.

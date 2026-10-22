@@ -164,9 +164,6 @@ const SCHEMA_HASH: &str =
 const SKELETON_KEY: &str = "a skeleton key from a leaf type's variant name, never emitted";
 const ENV_NAME_LITERAL: &str = "quotes a public env name into emitted Rust; a `str`'s `Debug` \
      escapes are Rust string-literal escapes";
-const DIAGNOSTIC_AND_FEATURE_LITERAL: &str = "a compiler diagnostic's text, never emitted; and a \
-     pinned crate feature name quoted into an emitted manifest, where a `str`'s `Debug` escapes \
-     are TOML basic-string escapes";
 const SERDE_REFUSAL: &str = "a serde error carrying a path-refusal diagnostic, never emitted";
 const CACHE_KEY: &str = "bytes folded into a build-cache key from non-secret emit settings, never \
      emitted";
@@ -334,8 +331,8 @@ const DEBUG_SITES: &[DebugSite] = &[
     DebugSite {
         file: "rust/src/project.rs",
         func: "config_cargo_toml",
-        count: 2,
-        why: DIAGNOSTIC_AND_FEATURE_LITERAL,
+        count: 1,
+        why: DIAGNOSTIC,
     },
     DebugSite {
         file: "rust/src/project.rs",

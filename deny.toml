@@ -95,6 +95,16 @@ multiple-versions = "warn"
 wildcards = "allow"
 workspace-default-features = "allow"
 external-default-features = "allow"
+# Roots come from `webpki-roots` 1.x only. A spec is `name:<semver req>`
+# (`name@<version>` is an exact version, so `@<1` bans 1.x and `@<1.0.0`
+# bans nothing). The OS root stores reach the tree only through the CLI's
+# `reqwest` 0.13 chain, named by `wrappers`; the runtime's own closure is
+# walked exactly in the `ipe` test `legacy_roots_are_refused_in_every_lock`.
+deny = [
+    { crate = "webpki-roots:<1", reason = "RUSTSEC-2026-0381: roots come from webpki-roots 1.x only" },
+    { crate = "rustls-native-certs", wrappers = ["rustls-platform-verifier"], reason = "runtime roots are webpki-roots, never the OS store" },
+    { crate = "rustls-platform-verifier", wrappers = ["reqwest"], reason = "runtime roots are webpki-roots, never the OS store" },
+]
 
 # https://embarkstudios.github.io/cargo-deny/checks/sources/cfg.html
 # Every dependency MUST come from the official crates.io index — no ad-hoc git

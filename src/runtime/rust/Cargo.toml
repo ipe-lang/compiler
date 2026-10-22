@@ -66,11 +66,13 @@ url = { version = "2", optional = true }
 # do not activate `url`.
 tinyvec = { version = "1", features = ["std"], optional = true }
 lettre = { version = "0.11", default-features = false, features = ["builder", "hostname", "smtp-transport", "pool", "tokio1", "tokio1-rustls-tls"], optional = true }
-# `rustls-tls-webpki-roots`: enables `MaybeTlsStream::Rustls` so `wss://`
-# connections use the same rustls backend as reqwest/sqlx/lettre — no native
-# TLS dependency added. The `native-tls` feature is deliberately NOT listed;
-# rustls-only TLS: no native-tls dependency added (deliberate divergence: §B-WS-TLS).
-tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"], optional = true }
+# Handshake only: the runtime owns the `wss://` TLS (`tokio-rustls` over the
+# `ring` provider, trusting `webpki-roots`), so tungstenite carries no TLS or
+# root-store feature of its own, and no native-tls dependency enters.
+tokio-tungstenite = { version = "0.30", default-features = false, features = ["handshake"], optional = true }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"], optional = true }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"], optional = true }
+webpki-roots = { version = "1", optional = true }
 futures-util = { version = "0.3", optional = true }
 # The floor types (`IpeMaybe`/`IpeResult` in `core.rs`, the `IpeError` family in
 # `error.rs`, `IpeOrder` in `basics.rs`, `Decimal`, the `dom::diff::Patch` wire)
@@ -115,7 +117,11 @@ md-5 = { version = "0.10", optional = true }
 # The sqlx driver features (`sqlite`/`postgres`) are activated by `db`, not
 # here; the `db-sqlite` / `db-postgres` selectors pick which driver's aliases
 # the crate root compiles (see `db-postgres`).
-sqlx = { version = "0.8", features = ["runtime-tokio-rustls"], optional = true }
+# `default-features = false` keeps `any`, `macros` and `migrate` out: the
+# runtime builds every query at run time and runs its own migration ledger.
+# `tls-rustls-ring-webpki`: rustls on the `ring` provider with webpki-roots 1.x
+# roots, never the OS store.
+sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "tls-rustls-ring-webpki", "json"], optional = true }
 redis = { version = "0.27", features = ["tokio-comp"], optional = true }
 # `Ipe.Regex` regex kernels + `String.isUrl`, behind the `regex` feature. A
 # program that reaches neither drops `regex` and its aho-corasick / regex-automata
@@ -415,7 +421,7 @@ json = ["dep:serde_json", "serde"]
 # cross-backend byte-exact contract).
 # `tokio/net`: the `ssrf` gate resolves a Postgres host through
 # `tokio::net::lookup_host` (non-blocking, deadline-bounded).
-db = ["sqlx", "sqlx?/sqlite", "sqlx?/postgres", "tokio", "tokio/sync", "tokio/net", "dep:serde_json", "json", "serde", "encoding", "random", "time-core", "decimal", "crypto-core", "url", "secret"]
+db = ["sqlx", "sqlx?/sqlite-bundled", "sqlx?/postgres", "tokio", "tokio/sync", "tokio/net", "dep:serde_json", "json", "serde", "encoding", "random", "time-core", "decimal", "crypto-core", "url", "secret"]
 # `db-sqlite` / `db-postgres`: driver alias selectors. `db-postgres` makes the
 # crate root compile `config_postgres.rs` as `config`; any other build compiles
 # the sqlite `config.rs`. The emitter enables exactly one, and the crate links
@@ -495,7 +501,7 @@ email = ["tokio", "reqwest", "lettre", "dep:serde_json", "json", "serde", "http_
 # `url` feature), NOT the reqwest HTTP client — so it does not pull
 # `http_client`. `tokio/net`: `ws_client.rs` opens the pinned TCP socket.
 # `serde`: `ws_client.rs` derives Serialize/Deserialize on its frame wire types.
-websocket_client = ["tokio", "tokio/net", "tokio/sync", "tokio-tungstenite", "futures-util", "url", "random", "serde"]
+websocket_client = ["tokio", "tokio/net", "tokio/sync", "tokio-tungstenite", "tokio-rustls", "rustls", "webpki-roots", "futures-util", "url", "random", "serde"]
 # The session-id / CSRF-token mints draw from `entropy::fill_entropy`, so `web`
 # needs no `aes-gcm`; `subtle` (constant-time compare) and `sha2` (client-JS SRI
 # integrity hash) ride the `crypto-core` feature `web` lists below. `serde` (the

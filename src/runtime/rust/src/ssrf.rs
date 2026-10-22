@@ -770,8 +770,9 @@ impl VettedAddr {
         self.0
     }
 
-    /// Treat `addr` as vetted, for tests that stand up a local server.
-    #[cfg(test)]
+    /// Treat `addr` as vetted, for the pinned-relay tests that stand up a
+    /// local server; gated exactly as those tests are.
+    #[cfg(all(test, feature = "db", unix))]
     pub(crate) const fn assume_vetted_for_test(addr: SocketAddr) -> Self {
         Self(addr)
     }

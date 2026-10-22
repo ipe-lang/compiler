@@ -8,8 +8,8 @@ Ipe.WebSocket — outbound WebSocket client.
 
 Opens a long-lived bidirectional connection to a peer.  Incoming
 frames surface as `Sub` events on a Ipe.Web update loop (mirror
-of `Ipe.Http.Stream.chunks`); outbound `send` writes a text
-or binary frame from the calling goroutine.
+of `Ipe.Http.Stream.chunks`); outbound `send` queues a text
+or binary frame for the socket's writer.
 
 Driving use cases: bidirectional LLM chat, collab editor ops,
 multiplayer game state, financial feeds.  When you need request
@@ -35,25 +35,34 @@ Lifecycle:
     subscribe to incoming frames.  Each `Text String` or
     `Binary String` Msg flows through `update`.
 
- 3. `WebSocket.send sock "hello"` — write a text frame.  Blocks
-    up to 30 s if the underlying write buffer is full.
+ 3. `WebSocket.send sock "hello"` — queue a text frame.  Never
+    blocks: a full outbound queue fails the task at once.
 
  4. `WebSocket.close sock` — release the connection.  Idempotent.
 
-Session lifecycle: when a Ipe.Web session is evicted (TTL OR
-explicit Delete) the runtime closes every owned socket
-automatically — app code is NEVER responsible for cleanup on
-disconnect.
+Ownership: a socket belongs to no Ipe.Web session.  It stays open
+until `close`, a close from the peer, or a failed read or write
+ends it; evicting a session does not close it, so close a socket
+in `update` once the program no longer needs it.
 
-Heartbeat: built-in ping every 30 s by default (configurable via
-`connectWith.pingInterval`).  A peer that doesn't pong within
-the timeout triggers `onClose` automatically.
+Heartbeat: `connect` sends no pings.  `connectWith` pings every
+`pingInterval` milliseconds when it is positive; `defaultCfg`
+sets 30 s.  Pings from the peer are answered automatically.
+Pongs are not tracked: a peer that stops answering pings is not
+detected by the heartbeat.
 
-Backpressure: `send` blocks up to the consumer-stall timeout
-(30 s).  The bounded read channel (64 frames) provides
-per-socket backpressure to the upstream when the user's update
-loop falls behind — Ipe.Web's existing
-`ipe_web_sse_drops_total` covers spillover.
+Backpressure: `send` never blocks.  Each socket queues at most
+1024 outbound frames; past that `send` fails at once, and a
+message past `IPE_WS_MAX_MESSAGE_BYTES` fails with
+`LimitExceeded`.  A peer that stops reading cannot stall the
+program: a close it never answers ends the socket within 5 s,
+the reply to a close it sends is given at most 5 s to go out,
+and a write that fails tears the socket down through `onError`.
+Incoming frames never wait for the program: each subscription
+buffers up to 64 of them, a subscription that falls further
+behind skips the frames it missed, and a frame that arrives while
+no subscription is listening is dropped.  Skipped and dropped
+frames are not counted.
 
 See `examples/33-websocket-echo` for the canonical pattern.
 
@@ -175,8 +184,8 @@ ping cadence.  Build the cfg via `defaultCfg url |> withHeaders
 send : WebSocket -> String -> Task Error ()
 ```
 
-`send sock text` — write a text frame.  Blocks up to 30 s if
-the write buffer is full.
+`send sock text` — queue a text frame.  Never blocks: a full
+outbound queue fails the task at once.
 
 ## `sendBinary`
 
@@ -204,7 +213,9 @@ closeWithCode : CloseCode -> String -> WebSocket -> Task Error ()
 ```
 
 `closeWithCode code reason sock` — release the connection with
-a custom close code + reason.
+a custom close code + reason.  The reason is cut to its first
+123 bytes (at a character boundary), the most a close frame
+carries.
 
 ## `onOpen`
 
