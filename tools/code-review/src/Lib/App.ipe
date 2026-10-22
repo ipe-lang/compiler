@@ -55,7 +55,10 @@ type alias Model =
 -- offer `decidableRow` makes on it (Nothing when the card draws no control),
 -- and the open refusal panel's row as the page offers it. The root key
 -- handler bakes them, so a key acts only on what that render drew, never on
--- what the model selects when the key arrives.
+-- what the model selects when the key arrives. A key is read as typed into
+-- a refusal panel when its render drew one or one is open when it arrives,
+-- so a reason typed into a panel that has since closed, or the first letter
+-- typed before an opening panel was drawn, records and opens nothing.
 type alias KeyOffers =
     { selected : Maybe ( Uid, Maybe DecidableRow )
     , panel : Maybe DecidableRow
@@ -403,7 +406,7 @@ step settings msg model =
 
         KeyDown offers key ->
             if model.page == QueuePage then
-                keyActionMsg settings offers (Keys.keyAction (Queue.openPanel model.decision /= Nothing) (List.length (queueList model)) model.selected key) model
+                keyActionMsg settings offers (Keys.keyAction (offers.panel /= Nothing || Queue.openPanel model.decision /= Nothing) (List.length (queueList model)) model.selected key) model
 
             else
                 ( model, Cmd.none )

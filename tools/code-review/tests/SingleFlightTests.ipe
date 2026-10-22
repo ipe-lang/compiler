@@ -2178,6 +2178,37 @@ confirmRefuseBindsDrawnPanelRow r =
         && Queue.openPanel drafted.decision == Just ( ua, { refuseDraft = Draft.draft "needs a test", refuseError = Nothing } )
 
 
+-- A key typed into a refusal panel stays panel input on either side of the
+-- panel's drawing: `a` and `r` pressed on a render that drew the panel and
+-- received after it closed, and `a` pressed on a render that drew no panel
+-- and received after one opened, each leave the model as it was. Red if the
+-- key is read by the panel the model holds when it arrives alone.
+panelKeysNeverDecideAcrossPanelDrawing : Reshown -> Bool
+panelKeysNeverDecideAcrossPanelDrawing r =
+    let
+        ua =
+            r.a.unit.uid
+
+        ( _, reloaded ) =
+            reshownCard r
+
+        drafted =
+            after r.settings (drawnOn reloaded ua RefuseStart ++ [ RefuseDraft ua "awkward" ]) reloaded
+
+        cancelled =
+            after r.settings [ RefuseCancel ] drafted
+
+        opened =
+            after r.settings (drawnOn reloaded ua RefuseStart) reloaded
+    in
+    (App.keyOffers drafted).panel /= Nothing
+        && Queue.openPanel cancelled.decision == Nothing
+        && after r.settings [ press drafted "a" ] cancelled == cancelled
+        && after r.settings [ press drafted "r" ] cancelled == cancelled
+        && Queue.openPanel opened.decision /= Nothing
+        && after r.settings [ press reloaded "a" ] opened == opened
+
+
 -- `decisionTask` binds the offer's digest on its own: an offer of `a` run
 -- on a model showing `a2`, and an offer of the file's first digest run on a
 -- page listing the second, are each refused as `DrawnChanged` before any
@@ -2224,5 +2255,6 @@ reshownRows r unitDrift fileDrift =
     , ( "an acknowledgement drawn before the file's digest changed decides nothing", staleAckAfterDigestChangeDecidesNothing r )
     , ( "a refusal drawn before the source was read again opens no panel", staleRefuseStartOpensNoPanel r )
     , ( "Confirm submits only the panel row its render drew", confirmRefuseBindsDrawnPanelRow r )
+    , ( "a key typed into a refusal panel records nothing after the panel closes or before it is drawn", panelKeysNeverDecideAcrossPanelDrawing r )
     , ( "a decision task binds the drawn source and digest before any read", reshownTaskRefusals unitDrift fileDrift )
     ]
