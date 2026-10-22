@@ -528,7 +528,7 @@ const fn unclosed_isolate(open: OpenIsolate) -> HazardHit {
 }
 
 /// Open an isolate at `at`: the outermost one, or one more nested inside it.
-fn open_isolate(open: &mut Option<OpenIsolate>, at: usize, ch: char) {
+const fn open_isolate(open: &mut Option<OpenIsolate>, at: usize, ch: char) {
     match open {
         Some(outer) => outer.nested = outer.nested.saturating_add(1),
         None => *open = Some(OpenIsolate { at, ch, nested: 0 }),
@@ -536,7 +536,7 @@ fn open_isolate(open: &mut Option<OpenIsolate>, at: usize, ch: char) {
 }
 
 /// Close the innermost open isolate, or report that none is open.
-fn close_isolate(open: &mut Option<OpenIsolate>) -> bool {
+const fn close_isolate(open: &mut Option<OpenIsolate>) -> bool {
     match open {
         Some(outer) => {
             match outer.nested.checked_sub(1) {
@@ -1014,17 +1014,16 @@ fn one_or_two(lx: &mut Lexer, second: char, two: Tok, one: Tok) -> Tok {
 
 /// The refusal of `c` where code expects a token: a display hazard, or an unknown character.
 fn unknown_char(c: char) -> ParseError {
-    match SourceHazard::of(c) {
-        None => ParseError::UnknownChar(c),
-        Some(hazard) => ParseError::SourceDisplayHazard {
+    SourceHazard::of(c).map_or(ParseError::UnknownChar(c), |hazard| {
+        ParseError::SourceDisplayHazard {
             ch: c,
             refusal: if hazard.admitted_in_literal() {
                 HazardRefusal::OutsideLiteral
             } else {
                 HazardRefusal::Anywhere
             },
-        },
-    }
+        }
+    })
 }
 
 /// Lex a punctuation / operator token. `c` is the already-peeked first
@@ -1391,9 +1390,10 @@ mod display_hazard_tests {
     #[test]
     fn every_hazard_is_refused_outside_a_literal() {
         for ch in hazards() {
-            let reason = match SourceHazard::of(ch) {
-                Some(hazard) if hazard.admitted_in_literal() => HazardRefusal::OutsideLiteral,
-                _ => HazardRefusal::Anywhere,
+            let reason = if SourceHazard::of(ch).is_some_and(SourceHazard::admitted_in_literal) {
+                HazardRefusal::OutsideLiteral
+            } else {
+                HazardRefusal::Anywhere
             };
             for shape in NON_TEXT {
                 let src = shape.replace("{}", &ch.to_string());
