@@ -128,6 +128,68 @@ pub const SOURCE_DISPLAY_HAZARDS: &[(RangeInclusive<char>, SourceHazard)] = &[
     (C1_CONTROLS_AFTER_NEXT_LINE, SourceHazard::TerminalControl),
 ];
 
+// IPE-RUST-AUDIT:ACCEPTED (Arthur Maciel) — compile-time `const` assertion (not a runtime panic); fails the BUILD if the source table's control roles stop being exactly the `Cc` controls the sanitiser drops, bar TAB, LF and CR [ledger #boundary]
+const _: () = assert!(controls_are_refused_exactly());
+
+/// Whether `code` is a `Cc` control (C0, `DEL` or C1) other than TAB, LF and CR.
+///
+/// The Unicode stability policy fixes the `Cc` set to these code points, the
+/// ones [`char::is_control`] accepts.
+const fn is_refused_control(code: u32) -> bool {
+    matches!(code, 0x00..=0x08 | 0x0B..=0x0C | 0x0E..=0x1F | 0x7F..=0x9F)
+}
+
+/// Whether `role` is one a control character plays.
+const fn is_control_role(role: SourceHazard) -> bool {
+    matches!(
+        role,
+        SourceHazard::ControlBreak | SourceHazard::TerminalControl
+    )
+}
+
+/// Whether some control role of [`SOURCE_DISPLAY_HAZARDS`] covers `code`.
+const fn has_control_role(code: u32) -> bool {
+    let mut rest = SOURCE_DISPLAY_HAZARDS;
+    while let Some(((range, role), tail)) = rest.split_first() {
+        if is_control_role(*role) && *range.start() as u32 <= code && code <= *range.end() as u32 {
+            return true;
+        }
+        rest = tail;
+    }
+    false
+}
+
+/// Whether the control roles of [`SOURCE_DISPLAY_HAZARDS`] cover every refused
+/// control and nothing else, and no literal admits either role.
+const fn controls_are_refused_exactly() -> bool {
+    if SourceHazard::ControlBreak.admitted_in_literal()
+        || SourceHazard::TerminalControl.admitted_in_literal()
+    {
+        return false;
+    }
+    let mut rest = SOURCE_DISPLAY_HAZARDS;
+    while let Some(((range, role), tail)) = rest.split_first() {
+        if is_control_role(*role) {
+            let mut code = *range.start() as u32;
+            while code <= *range.end() as u32 {
+                if !is_refused_control(code) {
+                    return false;
+                }
+                code += 1;
+            }
+        }
+        rest = tail;
+    }
+    let mut code = 0;
+    while code <= 0x9F {
+        if is_refused_control(code) && !has_control_role(code) {
+            return false;
+        }
+        code += 1;
+    }
+    true
+}
+
 impl SourceHazard {
     /// The role `c` plays, or `None` for a character no viewer draws as structure or runs.
     #[must_use]
@@ -616,8 +678,13 @@ mod tests {
             let code = u32::from(c);
             let control = matches!(get_general_category(c), GeneralCategory::Control);
             assert_eq!(control, c.is_control(), "U+{code:04X}");
+            let line_model = matches!(c, '\t' | '\n' | '\r');
+            assert_eq!(
+                is_refused_control(code),
+                control && !line_model,
+                "U+{code:04X}"
+            );
             if control {
-                let line_model = matches!(c, '\t' | '\n' | '\r');
                 assert_eq!(SourceHazard::of(c).is_some(), !line_model, "U+{code:04X}");
             }
         }

@@ -1556,12 +1556,15 @@ mod terminal_control_tests {
         }
     }
 
-    /// ESC and CSI, the openers of a cursor-up and erase-line sequence, are refused whole.
+    /// ESC and CSI, the openers of a cursor-up and erase-line sequence, are refused whole,
+    /// as is a control at the first or the last byte.
     #[test]
     fn an_escape_sequence_that_hides_a_line_is_refused() {
         assert_refused_at_first("x = 1 -- ok\u{1b}[1A\u{1b}[2K\ny = 2", '\u{1b}');
         assert_refused_at_first("x = \"a\u{9b}2Kb\"", '\u{9b}');
         assert_refused_at_first("x = 1 {- a\u{8}\u{8}b -}", '\u{8}');
+        assert_refused_at_first("\u{0}x = 1", '\u{0}');
+        assert_refused_at_first("x = 1 --\u{7f}", '\u{7f}');
     }
 
     /// TAB, LF and CRLF stay the line model, and an ESC built by `Char.fromCode` lexes.
