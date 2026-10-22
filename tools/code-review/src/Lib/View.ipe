@@ -14,6 +14,7 @@ import Ipe.Ui.Font as Font
 import Ipe.Ui.Input as Input
 import Lib.App as App exposing (Model, Msg(..), Page(..), queueList)
 import Lib.Db as LibDb exposing (LogShown(..), ReviewEntry(..), StoredDecision(..), Unverified(..))
+import Lib.Draft as Draft
 import Lib.Drawn as Drawn exposing (DrawnSource, Drawing(..), Hue(..), LayoutNote(..), Mode(..), Part(..), Piece(..), Run(..), SpelledRow(..))
 import Lib.Failure as Failure exposing (LoadFailure)
 import Lib.Format as Format
@@ -1243,9 +1244,9 @@ refusePanel uid draft submit =
     Ui.column
         [ Ui.width (Ui.px 240), Ui.spacing 6 ]
         [ Input.text
-            [ Ui.width Ui.fill ]
+            [ Ui.width Ui.fill, Ui.htmlAttribute "maxlength" (String.fromInt Draft.inputMaxUnits) ]
             { label = Input.labelAbove [ Font.size 11 ] (Ui.text "Reason")
-            , text = draft.refuseDraft
+            , text = Draft.draftText draft.refuseDraft
             , onChange = RefuseDraft uid
             , placeholder = Just (Input.placeholder [ Font.size 12 ] (Ui.text "Why refuse?"))
             }

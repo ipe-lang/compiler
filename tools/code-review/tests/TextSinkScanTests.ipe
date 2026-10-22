@@ -641,9 +641,10 @@ literalConstants =
 
 
 -- Each site where a markup sink takes text not written at the call, once
--- per call it holds: the operator's own URL path and draft, a link target
--- the stdlib parses, the title the page names, and the view's own style
--- constants.
+-- per call it holds: the operator's own URL path and draft, the refusal
+-- input's `maxlength` (a number derived from the reason limit), a link
+-- target the stdlib parses, the title the page names, and the view's own
+-- style constants.
 admittedMarkup : List String
 admittedMarkup =
     [ "Lib/View.ipe:codeHtml"
@@ -654,6 +655,7 @@ admittedMarkup =
     , "Lib/View.ipe:linkEl"
     , "Lib/View.ipe:partHtml"
     , "Lib/View.ipe:pieceHtml"
+    , "Lib/View.ipe:refusePanel"
     , "Lib/View.ipe:refusePanel"
     , "Lib/View.ipe:runHtml"
     , "Lib/View.ipe:safeTextHtml"

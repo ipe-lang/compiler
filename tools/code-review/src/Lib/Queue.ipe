@@ -10,6 +10,7 @@ import Ipe.Result as Result exposing (Result(..))
 import Ipe.String as String
 import Ipe.Task as Task
 import Lib.Db as LibDb exposing (BreakAt(..), HistoryCursor(..), LogShown(..), LogVerdict(..), ReviewEntry(..))
+import Lib.Draft as Draft
 import Lib.Epoch exposing (Epoch)
 import Lib.Failure as Failure exposing (DecideRefusal, LoadFailure, RefuseFailure, SaveFailure)
 import Lib.Format as Format
@@ -1314,9 +1315,10 @@ type RefusalPanel
     | PanelOpen DecidableRow Draft
 
 
--- The reviewer's refusal draft, and why it stays open, if it was refused.
+-- The reviewer's refusal draft, bounded where it enters, and what the panel
+-- says of it: why it was refused, or that it was cut.
 type alias Draft =
-    { refuseDraft : String, refuseError : Maybe RefuseFailure }
+    { refuseDraft : Draft.Draft, refuseError : Maybe RefuseFailure }
 
 
 -- The decision on `uid` and the process `epoch` runs it in, while that
@@ -1370,7 +1372,7 @@ openRefusal epoch row slot =
             slot
 
         Nothing ->
-            withPanel (PanelOpen row { refuseDraft = "", refuseError = Nothing }) (ownedSlot epoch slot)
+            withPanel (PanelOpen row { refuseDraft = Draft.empty, refuseError = Nothing }) (ownedSlot epoch slot)
 
 
 -- The slot with its refusal panel closed.
@@ -1380,14 +1382,15 @@ closeRefusal slot =
 
 
 -- The draft of the panel open on `uid` replaced by `text`, which clears
--- why it was refused; a slot with no panel open on `uid` is unchanged, so
--- an edit sent for another row's panel writes into none.
-editDraft : Uid -> String -> DecisionSlot -> DecisionSlot
+-- why it was refused and says, on this edit, whether it was cut; a slot with
+-- no panel open on `uid` is unchanged, so an edit sent for another row's
+-- panel writes into none.
+editDraft : Uid -> Draft.Draft -> DecisionSlot -> DecisionSlot
 editDraft uid text slot =
     case openRow slot of
         Just ( row, _ ) ->
             if rowUid row == uid then
-                mapOpenDraft (\_ -> { refuseDraft = text, refuseError = Nothing }) slot
+                mapOpenDraft (\_ -> { refuseDraft = text, refuseError = Draft.notice text }) slot
 
             else
                 slot
