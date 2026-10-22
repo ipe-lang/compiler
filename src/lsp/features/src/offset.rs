@@ -59,6 +59,15 @@ fn floor_position_boundary(text: &str, byte: usize) -> usize {
     if inside_pair { b - 1 } else { b }
 }
 
+/// Whether `byte` names a position of `text`: within it, on a char boundary,
+/// and not between the `\r` and `\n` of a pair.
+///
+/// An edit sink that proved its splice at raw bytes refuses any other byte,
+/// since the client would splice where the byte clamps to instead.
+pub(crate) fn is_position_boundary(text: &str, byte: usize) -> bool {
+    byte <= text.len() && floor_position_boundary(text, byte) == byte
+}
+
 /// The byte range of the first line break in `text`: `\r\n`, `\n` or a lone `\r`.
 fn first_line_break(text: &str) -> Option<(usize, usize)> {
     let at = text.find(['\n', '\r'])?;
@@ -303,7 +312,7 @@ mod tests {
     ];
 
     /// Whether `byte` is a position: a char boundary not between a `\r` and its `\n`.
-    fn is_position_boundary(text: &str, byte: usize) -> bool {
+    fn oracle_is_position(text: &str, byte: usize) -> bool {
         let bytes = text.as_bytes();
         let inside_pair =
             byte > 0 && bytes.get(byte - 1) == Some(&b'\r') && bytes.get(byte) == Some(&b'\n');
@@ -346,11 +355,24 @@ mod tests {
     }
 
     #[test]
+    fn position_boundary_agrees_with_the_oracle_past_the_end() {
+        for text in NASTY {
+            for byte in 0..=text.len() + 4 {
+                assert_eq!(
+                    is_position_boundary(text, byte),
+                    oracle_is_position(text, byte),
+                    "byte {byte} of {text:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn round_trip_identity_on_every_char_boundary() {
         for text in NASTY {
             for encoding in [PositionEncoding::Utf8, PositionEncoding::Utf16] {
                 for byte in 0..=text.len() {
-                    if !is_position_boundary(text, byte) {
+                    if !oracle_is_position(text, byte) {
                         continue;
                     }
                     let pos = offset_to_position(text, byte, encoding);
@@ -478,7 +500,7 @@ mod tests {
                         scalar,
                         "{text:?} @ {byte}"
                     );
-                    if is_position_boundary(&text, byte) {
+                    if oracle_is_position(&text, byte) {
                         assert_eq!(
                             scalar,
                             oracle_position(&text, byte, encoding),
@@ -532,37 +554,154 @@ mod tests {
         }
     }
 
+    /// The part of a source file before its `#[cfg(test)] mod tests` module.
+    ///
+    /// Only the test module is cut: a `#[cfg(test)]` on any other item leaves
+    /// the code after it scanned.
+    fn production_part(source: &str) -> &str {
+        const GATE: &str = "#[cfg(test)]";
+        source
+            .match_indices(GATE)
+            .map(|(at, _)| at)
+            .find(|&at| {
+                source
+                    .get(at + GATE.len()..)
+                    .is_some_and(|rest| rest.trim_start().starts_with("mod tests"))
+            })
+            .and_then(|at| source.get(..at))
+            .unwrap_or(source)
+    }
+
+    /// Whether `lowered` holds a `\x` or `\u{..}` escape spelling a line break.
+    fn names_a_break_escape(lowered: &str) -> bool {
+        if lowered.contains(r"\x0a") || lowered.contains(r"\x0d") {
+            return true;
+        }
+        lowered.split(r"\u{").skip(1).any(|rest| {
+            let digits = rest.split('}').next().unwrap_or("");
+            matches!(digits.trim_start_matches('0'), "a" | "d")
+        })
+    }
+
+    /// The line-model needle one production line of a feature names, if any.
+    ///
+    /// Whitespace is dropped first, so `. lines ()` reads as `.lines()`. Each
+    /// counts: a `\n` or `\r` char or byte, a whole `"\n"`, `"\r"` or `"\r\n"`
+    /// string or byte string, an escape spelling either break, and `lines`
+    /// called as a method or named as a path. Writing text is not reading
+    /// lines, so `.join("\n")` and a break inside a longer literal pass. A
+    /// comment line is skipped.
+    fn line_model_offense(line: &str) -> Option<&'static str> {
+        const NEEDLES: [&str; 7] = [
+            r"'\n'",
+            r"'\r'",
+            r#""\n""#,
+            r#""\r""#,
+            r#""\r\n""#,
+            ".lines(",
+            "::lines",
+        ];
+        if line.trim_start().starts_with("//") {
+            return None;
+        }
+        let squeezed: String = line.chars().filter(|ch| !ch.is_whitespace()).collect();
+        let squeezed = squeezed.replace(r#".join("\n")"#, "");
+        if names_a_break_escape(&squeezed.to_lowercase()) {
+            return Some("a line-break escape");
+        }
+        NEEDLES.into_iter().find(|needle| squeezed.contains(needle))
+    }
+
+    /// Every `.rs` file under `dir`, subdirectories included.
+    fn rust_sources(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+        for entry in std::fs::read_dir(dir).expect("features src dir") {
+            let path = entry.expect("dir entry").path();
+            if path.is_dir() {
+                rust_sources(&path, out);
+            } else if path.extension().is_some_and(|ext| ext == "rs") {
+                out.push(path);
+            }
+        }
+    }
+
     /// No feature outside this module splits lines on its own.
     ///
-    /// The production part of every other source file names no `\n` or `\r`
-    /// char and calls no `.lines()`: line structure is read only through this
-    /// module. Compiled by ci.yml nextest `-p ipe_lsp_features`.
+    /// The production part of every other source file, subdirectories
+    /// included, names no line-break char, string or escape and calls no
+    /// `lines`: line structure is read only through this module. Compiled by
+    /// ci.yml nextest `-p ipe_lsp_features`.
     #[test]
     fn no_feature_keeps_a_private_line_model() {
-        const NEEDLES: [&str; 3] = [".lines()", "'\\n'", "'\\r'"];
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut sources = Vec::new();
+        rust_sources(&dir, &mut sources);
+        sources.retain(|path| path.file_name().is_none_or(|name| name != "offset.rs"));
+        assert!(sources.len() > 10, "the scan must see the feature sources");
         let mut offenders: Vec<String> = Vec::new();
-        let mut scanned = 0usize;
-        for entry in std::fs::read_dir(&dir).expect("features src dir") {
-            let path = entry.expect("dir entry").path();
-            let is_rust = path.extension().is_some_and(|ext| ext == "rs");
-            if !is_rust || path.file_name().is_some_and(|name| name == "offset.rs") {
-                continue;
-            }
-            let source = std::fs::read_to_string(&path).expect("source file");
-            let production = source.split("#[cfg(test)]").next().unwrap_or("");
-            scanned += 1;
-            for (number, line) in production.lines().enumerate() {
-                if NEEDLES.iter().any(|needle| line.contains(needle)) {
-                    offenders.push(format!("{}:{}: {line}", path.display(), number + 1));
+        for path in &sources {
+            let source = std::fs::read_to_string(path).expect("source file");
+            for (number, line) in production_part(&source).split('\n').enumerate() {
+                if let Some(needle) = line_model_offense(line) {
+                    let at = number + 1;
+                    offenders.push(format!("{}:{at}: {needle}: {line}", path.display()));
                 }
             }
         }
-        assert!(scanned > 10, "the scan must see the feature sources");
         assert!(
             offenders.is_empty(),
             "a private line model outside offset.rs:\n{}",
             offenders.join("\n")
         );
+    }
+
+    /// Each spelling of a private line model is caught.
+    #[test]
+    fn the_line_model_scan_sees_every_spelling() {
+        let evasions = [
+            "text.lines().next()",
+            "text . lines ( )",
+            "str::lines(text)",
+            ".map(str::lines)",
+            r#"text.split("\n")"#,
+            r#"text.rfind("\r\n")"#,
+            r#"text.find("\r")"#,
+            r"bytes.iter().filter(|b| **b == b'\n')",
+            r#"bytes.windows(1).position(|w| w == b"\n")"#,
+            r"text.split('\r')",
+            r"c == '\x0a'",
+            r"c == b'\x0D'",
+            r"c == '\u{a}'",
+            r"c == '\u{000D}'",
+        ];
+        for line in evasions {
+            assert!(line_model_offense(line).is_some(), "{line}");
+        }
+    }
+
+    /// Text an edit writes and prose a comment holds are not a line model.
+    #[test]
+    fn the_line_model_scan_allows_writers_and_comments() {
+        let allowed = [
+            r#"format!("{name} : {ty}\n")"#,
+            r#"format!("\nimport {m}\n")"#,
+            r#"help.join("\n")"#,
+            r"/// a line ends at `'\n'` or `.lines()`",
+            r"c == '\u{2026}'",
+            "first_line(text)",
+        ];
+        for line in allowed {
+            assert_eq!(line_model_offense(line), None, "{line}");
+        }
+    }
+
+    /// A `#[cfg(test)]` on one item does not hide the production code after it.
+    #[test]
+    fn only_the_test_module_leaves_the_scan() {
+        let source = "#[cfg(test)]\nfn helper() {}\nfn real(t: &str) { t.lines(); }\n\
+                      #[cfg(test)]\r\nmod tests {\n    fn t(s: &str) { s.lines(); }\n}\n";
+        let production = production_part(source);
+        assert!(production.contains("fn real"), "{production:?}");
+        assert!(!production.contains("mod tests"), "{production:?}");
+        assert_eq!(production_part("fn only() {}"), "fn only() {}");
     }
 }

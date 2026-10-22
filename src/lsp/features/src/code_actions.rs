@@ -56,7 +56,9 @@ use lsp_types::{
 
 use ipe_db::{Db as _, IpeDatabase, SourceRoot};
 
-use crate::offset::{LineEnding, PositionEncoding, first_line, line_span, offset_to_position};
+use crate::offset::{
+    LineEnding, PositionEncoding, first_line, is_position_boundary, line_span, offset_to_position,
+};
 use crate::workspace_edit::{Document, single_edit};
 
 /// The salsa database view a quick-fix reads from.
@@ -665,8 +667,9 @@ fn wrap_in_ui_html_action(
 /// per-rule code in this file.
 ///
 /// Fail-closed: a diagnostic with no `data`, a malformed `fix` payload, or a
-/// span that is out of range or lands off a UTF-8 char boundary yields no
-/// action rather than guessing or slicing unsafely.
+/// span that is out of range, inverted, or off a position boundary (inside a
+/// UTF-8 character or between a `\r` and its `\n`) yields no action rather
+/// than an edit the client would apply at a clamped position.
 fn lint_fix_action(
     diag: &Diagnostic,
     uri: &Url,
@@ -680,7 +683,7 @@ fn lint_fix_action(
     let lo = usize::try_from(fix.get("lo")?.as_u64()?).ok()?;
     let hi = usize::try_from(fix.get("hi")?.as_u64()?).ok()?;
     let replacement = fix.get("replacement")?.as_str()?;
-    if lo > hi || hi > text.len() || !text.is_char_boundary(lo) || !text.is_char_boundary(hi) {
+    if lo > hi || !is_position_boundary(text, lo) || !is_position_boundary(text, hi) {
         return None;
     }
 
@@ -1303,5 +1306,41 @@ mod tests {
             assert!(new_text.ends_with("import Lib.Utils\r\n"), "{new_text:?}");
             assert!(uniform_crlf(&applied), "{applied:?}");
         }
+    }
+
+    /// A lint fix whose span ends between a `\r` and its `\n` is refused: the
+    /// client would clamp the end before the `\r` and splice other text.
+    #[test]
+    fn lint_fix_inside_a_crlf_pair_is_refused() {
+        let text = "module Main exposing (main)\r\n\r\nmain = 1\r\n";
+        let mid = text.find("1\r\n").expect("literal") + 2;
+        let uri = Url::parse("file:///Main.ipe").expect("uri");
+        let with_fix = |lo: usize, hi: usize| {
+            let mut diag = diag_at(2, "lint/test");
+            diag.data = Some(serde_json::json!({
+                "fix": { "describe": "drop it", "lo": lo, "hi": hi, "replacement": "" }
+            }));
+            super::lint_fix_action(&diag, &uri, text, PositionEncoding::Utf8, None)
+        };
+        assert!(
+            with_fix(mid - 1, mid - 1).is_some(),
+            "a boundary span offers the fix"
+        );
+        assert!(
+            with_fix(mid - 1, mid).is_none(),
+            "an end mid-pair is refused"
+        );
+        assert!(
+            with_fix(mid, mid + 1).is_none(),
+            "a start mid-pair is refused"
+        );
+        assert!(
+            with_fix(mid - 1, mid - 2).is_none(),
+            "an inverted span is refused"
+        );
+        assert!(
+            with_fix(0, text.len() + 1).is_none(),
+            "a span past the end is refused"
+        );
     }
 }

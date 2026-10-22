@@ -194,7 +194,13 @@ const fn class_to_lsp(class: TokenClass) -> Option<u32> {
 // ---------------------------------------------------------------------------
 
 /// Delta-encode `raw`, reading each token's position from the shared [`LineIndex`].
-fn encode(raw: Vec<RawToken>, text: &str, encoding: PositionEncoding) -> Vec<SemanticToken> {
+///
+/// A delta is the distance from the previous token, so the tokens are put in
+/// source order first; a position is monotone in its byte, so no delta is
+/// negative. A token whose delta would still be negative, or whose end lies
+/// past `u32::MAX`, is dropped rather than encoded wrong.
+fn encode(mut raw: Vec<RawToken>, text: &str, encoding: PositionEncoding) -> Vec<SemanticToken> {
+    raw.sort_by_key(|tok| tok.byte);
     let mut out: Vec<SemanticToken> = Vec::with_capacity(raw.len());
     let index = LineIndex::new(text);
     let mut prev_line: u32 = 0;
@@ -206,15 +212,21 @@ fn encode(raw: Vec<RawToken>, text: &str, encoding: PositionEncoding) -> Vec<Sem
             character: pos_char,
         } = index.position_of(tok.byte as usize, encoding);
 
-        let delta_line = pos_line - prev_line;
+        let Some(delta_line) = pos_line.checked_sub(prev_line) else {
+            continue;
+        };
         let delta_start = if delta_line == 0 {
-            pos_char - prev_char
+            let Some(delta) = pos_char.checked_sub(prev_char) else {
+                continue;
+            };
+            delta
         } else {
             pos_char
         };
-        let slice = text
-            .get(tok.byte as usize..(tok.byte + tok.len) as usize)
-            .unwrap_or("");
+        let Some(end) = tok.byte.checked_add(tok.len) else {
+            continue;
+        };
+        let slice = text.get(tok.byte as usize..end as usize).unwrap_or("");
         let length = match encoding {
             PositionEncoding::Utf8 => tok.len,
             PositionEncoding::Utf16 => slice
@@ -413,6 +425,38 @@ mod tests {
                 at
             })
             .collect()
+    }
+
+    /// Tokens handed over out of source order are encoded in source order,
+    /// never as a negative delta.
+    #[test]
+    fn tokens_out_of_order_encode_in_source_order() {
+        let text = "ab\ncd\nef";
+        let token = |byte: u32| super::RawToken {
+            byte,
+            len: 1,
+            token_type: 0,
+        };
+        let raw = vec![token(7), token(1), token(4), token(0)];
+        let got = decoded(&super::encode(raw, text, PositionEncoding::Utf16));
+        let at = |line, character| Position { line, character };
+        assert_eq!(got, vec![at(0, 0), at(0, 1), at(1, 1), at(2, 1)]);
+    }
+
+    /// A token whose end would pass `u32::MAX` is dropped, not encoded.
+    #[test]
+    fn a_token_ending_past_u32_max_is_dropped() {
+        let token = |byte: u32| super::RawToken {
+            byte,
+            len: 1,
+            token_type: 0,
+        };
+        let got = super::encode(
+            vec![token(0), token(u32::MAX)],
+            "a",
+            PositionEncoding::Utf16,
+        );
+        assert_eq!(got.len(), 1, "{got:?}");
     }
 
     /// A token at every char boundary of every mix of line breaks sits where

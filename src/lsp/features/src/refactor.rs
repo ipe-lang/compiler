@@ -46,7 +46,8 @@ use lsp_types::{CodeAction, CodeActionKind, CodeActionOrCommand, Range, TextEdit
 
 use crate::code_actions::DbView;
 use crate::offset::{
-    LineEnding, PositionEncoding, offset_to_position, position_to_offset, span_to_range,
+    LineEnding, PositionEncoding, is_position_boundary, offset_to_position, position_to_offset,
+    span_to_range,
 };
 use crate::workspace_edit::{Document, single_edit};
 
@@ -298,6 +299,11 @@ fn proven_action(
     let new_text = LineEnding::of(text).apply(new_text);
     let lo = span.lo as usize;
     let hi = span.hi as usize;
+    // The client splices where each end clamps to; a byte between a `\r` and
+    // its `\n` clamps elsewhere, so the proof would cover text never sent.
+    if lo > hi || !is_position_boundary(text, lo) || !is_position_boundary(text, hi) {
+        return None;
+    }
     let mut spliced = String::with_capacity(text.len() + new_text.len());
     spliced.push_str(text.get(..lo)?);
     spliced.push_str(&new_text);
@@ -397,7 +403,13 @@ mod tests {
 
     use crate::offset::{PositionEncoding, offset_to_position};
 
-    use super::{DbView, function_lambda_rewrite_action, if_case_bool_rewrite_action};
+    use ipe_diagnostics::Span;
+
+    use crate::workspace_edit::Document;
+
+    use super::{
+        DbView, function_lambda_rewrite_action, if_case_bool_rewrite_action, proven_action,
+    };
 
     fn file(db: &IpeDatabase, path: &[&str], text: &str) -> SourceFile {
         let path: Vec<String> = path.iter().map(|s| (*s).to_owned()).collect();
@@ -850,5 +862,30 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// The reparse proof covers the bytes the client splices, so a span end
+    /// between a `\r` and its `\n`, or an inverted span, offers nothing.
+    #[test]
+    fn proven_action_refuses_a_span_the_client_would_clamp() {
+        const SRC: &str = "module Main exposing (main)\r\n\r\nmain = 1\r\n";
+        let db = IpeDatabase::new();
+        let uri = lsp_types::Url::parse(URI).expect("uri");
+        let doc = Document {
+            uri: &uri,
+            text: SRC,
+            version: None,
+        };
+        let one = u32::try_from(SRC.find("1\r\n").expect("literal")).expect("small");
+        let prove = |lo: u32, hi: u32| {
+            proven_action(&db, doc, Span { lo, hi }, "2", "t", PositionEncoding::Utf8)
+        };
+        assert!(prove(one, one + 1).is_some(), "a boundary span is offered");
+        assert!(prove(one, one + 2).is_none(), "an end mid-pair is refused");
+        assert!(
+            prove(one + 2, one + 2).is_none(),
+            "a start mid-pair is refused"
+        );
+        assert!(prove(one + 1, one).is_none(), "an inverted span is refused");
     }
 }
