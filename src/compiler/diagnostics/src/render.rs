@@ -368,30 +368,6 @@ fn parse_prose(msg: &ParseError) -> String {
         ParseError::NestingTooDeep { .. } | ParseError::TooDeep => {
             "This expression nests deeper than I can follow.".to_string()
         }
-        ParseError::UnknownChar(c) => {
-            format!("I don't recognise the character {} here.", char_repr(*c))
-        }
-        ParseError::StrayDot | ParseError::SpaceBeforeDot => {
-            "This `.` isn't attached to anything I can read as a field access.".to_string()
-        }
-        ParseError::NumberJoinedToName(_) => {
-            "This number runs straight into a name, so I can't tell where one ends and the \
-             other begins."
-                .to_string()
-        }
-        ParseError::IntLiteralOutOfRange => {
-            "This whole number does not fit in Ipê's `Int`.".to_string()
-        }
-        ParseError::FloatLiteralOutOfRange => {
-            "This number is too large for Ipê's `Float` to hold.".to_string()
-        }
-        ParseError::UnterminatedString => {
-            "This string opens with a `\"` but never closes.".to_string()
-        }
-        ParseError::MalformedChar => "I can't read this as a character literal.".to_string(),
-        ParseError::UnterminatedBlockComment => {
-            "This block comment opens with `{-` but never closes.".to_string()
-        }
         ParseError::MalformedModuleHeader(_) => {
             "I couldn't read the module header at the top of this file.".to_string()
         }
@@ -444,6 +420,48 @@ fn parse_prose(msg: &ParseError) -> String {
                  one declared type."
             )
         }
+        ParseError::UnknownChar(_)
+        | ParseError::StrayDot
+        | ParseError::SpaceBeforeDot
+        | ParseError::NumberJoinedToName(_)
+        | ParseError::IntLiteralOutOfRange
+        | ParseError::FloatLiteralOutOfRange
+        | ParseError::UnterminatedString
+        | ParseError::MalformedChar
+        | ParseError::UnterminatedBlockComment
+        | ParseError::SourceTooLarge { .. }
+        | ParseError::LoneCarriageReturn => lexical_prose(msg),
+        ParseError::Unexpected => "I couldn't make sense of this part of the file.".to_string(),
+    }
+}
+
+/// The prose band for a defect the lexer raises while it reads the source bytes.
+fn lexical_prose(msg: &ParseError) -> String {
+    match msg {
+        ParseError::UnknownChar(c) => {
+            format!("I don't recognise the character {} here.", char_repr(*c))
+        }
+        ParseError::StrayDot | ParseError::SpaceBeforeDot => {
+            "This `.` isn't attached to anything I can read as a field access.".to_string()
+        }
+        ParseError::NumberJoinedToName(_) => {
+            "This number runs straight into a name, so I can't tell where one ends and the \
+             other begins."
+                .to_string()
+        }
+        ParseError::IntLiteralOutOfRange => {
+            "This whole number does not fit in Ipê's `Int`.".to_string()
+        }
+        ParseError::FloatLiteralOutOfRange => {
+            "This number is too large for Ipê's `Float` to hold.".to_string()
+        }
+        ParseError::UnterminatedString => {
+            "This string opens with a `\"` but never closes.".to_string()
+        }
+        ParseError::MalformedChar => "I can't read this as a character literal.".to_string(),
+        ParseError::UnterminatedBlockComment => {
+            "This block comment opens with `{-` but never closes.".to_string()
+        }
         ParseError::SourceTooLarge { bytes } => {
             format!(
                 "this source file is {bytes} bytes, larger than I can compile — a file \
@@ -456,7 +474,30 @@ fn parse_prose(msg: &ParseError) -> String {
              to you and to me."
                 .to_string()
         }
-        ParseError::Unexpected => "I couldn't make sense of this part of the file.".to_string(),
+        // A grammar defect: `parse_prose` answers each of these in its own arm.
+        ParseError::Unexpected
+        | ParseError::TooDeep
+        | ParseError::UnexpectedToken { .. }
+        | ParseError::UnexpectedEof { .. }
+        | ParseError::NestingTooDeep { .. }
+        | ParseError::MalformedModuleHeader(_)
+        | ParseError::MalformedExposingList(_)
+        | ParseError::MissingEquals { .. }
+        | ParseError::MalformedTypeDeclaration(_)
+        | ParseError::TypeArgsOnNonConstructor
+        | ParseError::ExpectedType
+        | ParseError::UnclosedDelimiter { .. }
+        | ParseError::MalformedCase(_)
+        | ParseError::MalformedLet(_)
+        | ParseError::MalformedIf(_)
+        | ParseError::InvalidPathLiteral { .. }
+        | ParseError::SteplessDo
+        | ParseError::DocOnUnexported { .. }
+        | ParseError::MissingDocString { .. }
+        | ParseError::AnnotationWithoutBinding { .. }
+        | ParseError::DuplicateAnnotation { .. } => {
+            "I couldn't make sense of this part of the file.".to_string()
+        }
     }
 }
 
@@ -3895,5 +3936,31 @@ mod tests {
                 "the bare name should be the wrapped tail: {out:?}"
             );
         }
+    }
+
+    /// Each lexer defect reaches its own prose through `lexical_prose`, never
+    /// the grammar fallback that function answers for a non-lexical defect.
+    #[test]
+    fn every_lexical_defect_has_its_own_prose() {
+        let fallback = parse_prose(&ParseError::Unexpected);
+        let lexical = [
+            ParseError::UnknownChar('\u{7}'),
+            ParseError::StrayDot,
+            ParseError::SpaceBeforeDot,
+            ParseError::IntLiteralOutOfRange,
+            ParseError::FloatLiteralOutOfRange,
+            ParseError::UnterminatedString,
+            ParseError::MalformedChar,
+            ParseError::UnterminatedBlockComment,
+            ParseError::SourceTooLarge { bytes: 1 },
+            ParseError::LoneCarriageReturn,
+        ];
+        for msg in &lexical {
+            assert_ne!(parse_prose(msg), fallback, "{msg:?}");
+        }
+        assert!(
+            parse_prose(&ParseError::LoneCarriageReturn).contains("carriage return"),
+            "the lone `\\r` prose names the byte"
+        );
     }
 }
