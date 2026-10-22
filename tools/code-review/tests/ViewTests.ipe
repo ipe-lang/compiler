@@ -983,11 +983,13 @@ testKeys =
 
 
 -- A decision reaches `Queue.decide` only through the shown source
--- `Queue.decidableSource` gives: `Queue.decide ` appears once in the app
+-- `Queue.offeredSource` gives (the decidable source, kept only while its
+-- digest is the one the offer drew): `Queue.decide ` appears once in the app
 -- (inside `decideOn`), `decideOn ` exactly three times (its signature, its
 -- definition and the one call in the `Just shown` arm), and neither in
 -- `Main`; `Queue.decideRefusal ` appears once in the app, in the arm of a
--- refusal listed on the page with its digest, and never in `Main`. The arms
+-- refusal listed on the page under the digest the offer drew, and never in
+-- `Main`. The arms
 -- are matched with whitespace runs collapsed, so re-indenting them keeps the
 -- scan. A site list with exact counts, since `ipe test` builds no `update`.
 -- Red if a second path to either decision is added.
@@ -1002,10 +1004,10 @@ decisionReachedOnlyThroughDecidableSource =
             \text -> String.join " " (String.words text)
 
         oneCall =
-            "case Queue.decidableSource uid model.selectedView of Just shown -> decideOn settings macKey shown decision "
+            "case Queue.offeredSource row model.selectedView of Just shown -> decideOn settings macKey shown decision "
 
         oneRefusalCall =
-            "case pageRefusal model uid of Just row -> case row.digest of Just digest -> LibDb.openAt settings.review |> Task.andThen (\\db -> Queue.decideRefusal macKey settings.index db uid digest decision) "
+            "case Maybe.map (\\listed -> listed.digest) (pageRefusal model uid) of Just (Just listed) -> if listed == digest then LibDb.openAt settings.review |> Task.andThen (\\db -> Queue.decideRefusal macKey settings.index db uid digest decision) "
     in
     do
         cwd <- System.cwd ()
