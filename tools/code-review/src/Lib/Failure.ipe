@@ -77,11 +77,10 @@ type ReasonRefusal
     | ReasonOverlong { chars : Int, limit : Int }
 
 
--- Why a refusal draft stays open: its reason is refused, or another decision
--- is still saving.
+-- Why a refusal draft stays open: its reason is refused. A draft is open only
+-- while no decision is busy, so no other case exists.
 type RefuseFailure
     = DraftRefused ReasonRefusal
-    | DraftWhileSaving
 
 
 -- What an error's cause says to a page: the closed cases its details and
@@ -287,7 +286,7 @@ decideRefusalText refusal =
             "the name or path this decision would record is not whole text in the index, so it cannot be decided"
 
         NotQueued ->
-            "the unit is no longer in the queue"
+            "the unit left the queue before this click arrived (it was decided, or the index no longer lists it); nothing was saved, and the queue shown is current"
 
         SourceNotShown ->
             "this unit's source is not shown, so it cannot be decided"
@@ -314,7 +313,7 @@ decideRefusalText refusal =
             "the file now reads as text; re-run the index"
 
         FileNotQueued ->
-            "the file is no longer in the queue"
+            "the file left the queue before this click arrived (it was acknowledged, or the index no longer lists it); nothing was saved, and the queue shown is current"
 
 
 refuseFailureText : RefuseFailure -> String
@@ -325,6 +324,3 @@ refuseFailureText failure =
 
         DraftRefused (ReasonOverlong over) ->
             "a refusal reason is at most " ++ String.fromInt over.limit ++ " characters; this one has " ++ String.fromInt over.chars
-
-        DraftWhileSaving ->
-            "a decision is still being saved; try again once it settles"

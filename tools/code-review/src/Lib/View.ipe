@@ -200,7 +200,7 @@ notSavedBanner : Model -> Ui.Element Msg
 notSavedBanner model =
     case Queue.notSavedOf model.decision of
         Just failure ->
-            Ui.el [ Font.size 13, Font.color (Ui.rgb 230 120 120) ] (safeText (SafeText.literal ("Decision save failed: " ++ Failure.saveFailureText failure)))
+            Ui.el [ Font.size 13, Font.color (Ui.rgb 230 120 120) ] (safeText (SafeText.literal ("Decision not saved: " ++ Failure.saveFailureText failure)))
 
         Nothing ->
             Ui.none
@@ -315,8 +315,9 @@ nextPageButton next =
             Ui.none
 
 
--- What the decision controls read of the model: which row has its refusal
--- panel open, the draft and its failure, and the decision in flight.
+-- What the decision controls read of the model: the decision slot, and the
+-- row its refusal panel is open on with the draft and its failure, read from
+-- the slot, which holds a panel only while no decision is busy.
 type alias RefuseControls =
     { refusingUid : Maybe Uid
     , refuseDraft : String
@@ -327,11 +328,20 @@ type alias RefuseControls =
 
 refuseControlsOf : Model -> RefuseControls
 refuseControlsOf model =
-    { refusingUid = model.refusingUid
-    , refuseDraft = model.refuseDraft
-    , refuseError = model.refuseError
-    , decision = model.decision
-    }
+    case Queue.openPanel model.decision of
+        Just ( uid, draft ) ->
+            { refusingUid = Just uid
+            , refuseDraft = draft.refuseDraft
+            , refuseError = draft.refuseError
+            , decision = model.decision
+            }
+
+        Nothing ->
+            { refusingUid = Nothing
+            , refuseDraft = ""
+            , refuseError = Nothing
+            , decision = model.decision
+            }
 
 
 queueUnits : Model -> Ui.Element Msg
@@ -1137,20 +1147,20 @@ verifiedDecisionButtons controls unit =
 
 
 -- The one place a row's decision controls are drawn, for a queued unit and
--- an unreviewable file alike: the open refusal panel, the pending state
--- while a decision is busy, or the approve control (`approveLabel` sending
--- `approve`) beside Refuse.
+-- an unreviewable file alike: the pending state while a decision is busy,
+-- else the open refusal panel, or the approve control (`approveLabel`
+-- sending `approve`) beside Refuse.
 decisionControls : RefuseControls -> Uid -> SafeText -> Msg -> Msg -> Ui.Element Msg
 decisionControls controls uid approveLabel approve submit =
-    if controls.refusingUid == Just uid then
-        refusePanel controls submit
+    case Queue.pendingText uid controls.decision of
+        Just text ->
+            Ui.el [ Font.size 12, Font.color (Ui.rgb 150 150 165) ] (safeText text)
 
-    else
-        case Queue.pendingText uid controls.decision of
-            Just text ->
-                Ui.el [ Font.size 12, Font.color (Ui.rgb 150 150 165) ] (safeText text)
+        Nothing ->
+            if controls.refusingUid == Just uid then
+                refusePanel controls submit
 
-            Nothing ->
+            else
                 Ui.row
                     [ Ui.spacing 8 ]
                     [ approveButton approveLabel approve

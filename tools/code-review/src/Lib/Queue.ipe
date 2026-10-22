@@ -1,4 +1,4 @@
-module Lib.Queue exposing (DecisionSlot(..), HistoryLabel(..), HistoryPage, HistoryRow, HistoryState(..), LoadTicket, Place(..), Presence(..), Progress, QueuePage, QueueState(..), QueuedUnit, ResyncBound, SelectedView(..), Standing(..), StandingRead(..), UnitLabel, UnitPageState(..), chainBanner, clearView, decidableSource, decide, decideRefusal, decisionNotSaved, decisionRefused, decisionWritten, drainThenLoad, entryUid, firstTicket, historyStateFromResult, historyStatusText, isCurrentLoad, loadHistoryPage, loadPage, loadStanding, makeResyncBound, notSavedOf, ownedSlot, pendingText, nextTicket, loadUnitView, pageHeaderText, queueLabels, queueSettled, queueStatusText, refusalReasonText, reloadView, resyncBound, resyncPageCeiling, resyncReviewed, resyncReviewedWithin, selectView, selectedViewOf, selectedViewStatusText, sourceStatusText, standingArrived, standingFor, standingOf, startDecision, stateFromResult, unitLabel, unitPageEntry, unitPageOf, unitPageStatusText, viewArrived)
+module Lib.Queue exposing (DecisionSlot(..), Draft, HistoryLabel(..), HistoryPage, HistoryRow, HistoryState(..), LoadTicket, Place(..), Presence(..), Progress, QueuePage, QueueState(..), QueuedUnit, RefusalPanel(..), ResyncBound, SelectedView(..), Standing(..), StandingRead(..), UnitLabel, UnitPageState(..), chainBanner, clearView, closeRefusal, decidableSource, decide, decideRefusal, decisionNotSaved, decisionRefused, decisionWritten, draftRefused, drainThenLoad, editDraft, entryUid, firstTicket, historyStateFromResult, historyStatusText, isCurrentLoad, loadHistoryPage, loadPage, loadStanding, makeResyncBound, notSavedOf, openPanel, openRefusal, ownedSlot, pendingText, nextTicket, loadUnitView, pageHeaderText, queueLabels, queueSettled, queueStatusText, refusalReasonText, reloadView, resyncBound, resyncPageCeiling, resyncReviewed, resyncReviewedWithin, selectView, selectedViewOf, selectedViewStatusText, sourceStatusText, standingArrived, standingFor, standingOf, startDecision, stateFromResult, unitLabel, unitPageEntry, unitPageOf, unitPageStatusText, viewArrived)
 
 import Ipe.ByteSize as ByteSize
 import Ipe.Db as Db
@@ -11,7 +11,7 @@ import Ipe.String as String
 import Ipe.Task as Task
 import Lib.Db as LibDb exposing (BreakAt(..), HistoryCursor(..), LogShown(..), LogVerdict(..), ReviewEntry(..))
 import Lib.Epoch exposing (Epoch)
-import Lib.Failure as Failure exposing (DecideRefusal, LoadFailure, SaveFailure)
+import Lib.Failure as Failure exposing (DecideRefusal, LoadFailure, RefuseFailure, SaveFailure)
 import Lib.Format as Format
 -- `Index.Unit` names `Highlight.Lang` and `Index.UnitView` names
 -- `Links.LinkSet`, and an imported alias resolves its qualified names in this
@@ -1152,11 +1152,25 @@ unitPageOf uid state =
 -- was raised; the next decision started, or a queue load started after it
 -- that succeeds, replaces it, so a reload clears it as its text advises,
 -- and a load that read the queue before the failure was known does not.
+-- The refusal panel lives only in the two idle cases, so a panel open
+-- beside a busy decision, or a draft with no panel, has no representation.
 type DecisionSlot
-    = DecisionIdle
+    = DecisionIdle RefusalPanel
     | DecisionSaving Uid Epoch
     | DecisionRefreshing Uid Epoch
-    | DecisionNotSaved SaveFailure LoadTicket
+    | DecisionNotSaved SaveFailure LoadTicket RefusalPanel
+
+
+-- The refusal panel of an idle slot: closed, or open on one row with its
+-- draft.
+type RefusalPanel
+    = PanelClosed
+    | PanelOpen Uid Draft
+
+
+-- The reviewer's refusal draft, and why it stays open, if it was refused.
+type alias Draft =
+    { refuseDraft : String, refuseError : Maybe RefuseFailure }
 
 
 -- The decision on `uid` and the process `epoch` runs it in, while that
@@ -1178,16 +1192,16 @@ busyOwnedBy epoch slot =
             else
                 Nothing
 
-        DecisionIdle ->
+        DecisionIdle _ ->
             Nothing
 
-        DecisionNotSaved _ _ ->
+        DecisionNotSaved _ _ _ ->
             Nothing
 
 
 -- The slot holding a decision on `uid` run by process `epoch`; Nothing
 -- while another decision of that process is busy. Starting a decision drops
--- the last one's not-saved notice.
+-- the last one's not-saved notice and closes any open refusal panel.
 startDecision : Epoch -> Uid -> DecisionSlot -> Maybe DecisionSlot
 startDecision epoch uid slot =
     case busyOwnedBy epoch slot of
@@ -1196,6 +1210,96 @@ startDecision epoch uid slot =
 
         Nothing ->
             Just (DecisionSaving uid epoch)
+
+
+-- The slot with the refusal panel open on `uid`, its draft empty, by the
+-- same busy check `startDecision` makes: while a decision of process
+-- `epoch` is busy the slot is unchanged, and a busy decision another process
+-- left behind is idle.
+openRefusal : Epoch -> Uid -> DecisionSlot -> DecisionSlot
+openRefusal epoch uid slot =
+    case busyOwnedBy epoch slot of
+        Just _ ->
+            slot
+
+        Nothing ->
+            withPanel (PanelOpen uid { refuseDraft = "", refuseError = Nothing }) (ownedSlot epoch slot)
+
+
+-- The slot with its refusal panel closed.
+closeRefusal : DecisionSlot -> DecisionSlot
+closeRefusal slot =
+    withPanel PanelClosed slot
+
+
+-- The open panel's draft replaced by `text`, which clears why it was
+-- refused; a slot with no open panel is unchanged.
+editDraft : String -> DecisionSlot -> DecisionSlot
+editDraft text slot =
+    mapOpenDraft (\_ -> { refuseDraft = text, refuseError = Nothing }) slot
+
+
+-- The open panel's draft refused for `failure`; a slot with no open panel
+-- is unchanged.
+draftRefused : RefuseFailure -> DecisionSlot -> DecisionSlot
+draftRefused failure slot =
+    mapOpenDraft (\draft -> { draft | refuseError = Just failure }) slot
+
+
+-- The row the refusal panel is open on, with its draft, if it is open.
+openPanel : DecisionSlot -> Maybe ( Uid, Draft )
+openPanel slot =
+    case panelOf slot of
+        PanelOpen uid draft ->
+            Just ( uid, draft )
+
+        PanelClosed ->
+            Nothing
+
+
+-- The refusal panel the slot holds; a busy slot holds none.
+panelOf : DecisionSlot -> RefusalPanel
+panelOf slot =
+    case slot of
+        DecisionIdle panel ->
+            panel
+
+        DecisionNotSaved _ _ panel ->
+            panel
+
+        DecisionSaving _ _ ->
+            PanelClosed
+
+        DecisionRefreshing _ _ ->
+            PanelClosed
+
+
+-- An idle slot holding `panel` in place of its own, its notice kept; a
+-- busy slot holds no panel and is unchanged.
+withPanel : RefusalPanel -> DecisionSlot -> DecisionSlot
+withPanel panel slot =
+    case slot of
+        DecisionIdle _ ->
+            DecisionIdle panel
+
+        DecisionNotSaved failure raisedAt _ ->
+            DecisionNotSaved failure raisedAt panel
+
+        DecisionSaving _ _ ->
+            slot
+
+        DecisionRefreshing _ _ ->
+            slot
+
+
+mapOpenDraft : (Draft -> Draft) -> DecisionSlot -> DecisionSlot
+mapOpenDraft change slot =
+    case panelOf slot of
+        PanelOpen uid draft ->
+            withPanel (PanelOpen uid (change draft)) slot
+
+        PanelClosed ->
+            slot
 
 
 -- The slot as this process `epoch` owns it: a busy decision another process
@@ -1208,17 +1312,17 @@ ownedSlot epoch slot =
 
         Nothing ->
             case slot of
-                DecisionNotSaved _ _ ->
+                DecisionNotSaved _ _ _ ->
                     slot
 
-                DecisionIdle ->
+                DecisionIdle _ ->
                     slot
 
                 DecisionSaving _ _ ->
-                    DecisionIdle
+                    DecisionIdle PanelClosed
 
                 DecisionRefreshing _ _ ->
-                    DecisionIdle
+                    DecisionIdle PanelClosed
 
 
 -- The decision on `uid` run by process `epoch` was written: it stays busy
@@ -1239,7 +1343,7 @@ decisionWritten epoch uid slot =
 decisionNotSaved : Epoch -> Uid -> SaveFailure -> LoadTicket -> DecisionSlot -> DecisionSlot
 decisionNotSaved epoch uid failure latest slot =
     if isSaving epoch uid slot then
-        DecisionNotSaved failure latest
+        DecisionNotSaved failure latest PanelClosed
 
     else
         slot
@@ -1254,16 +1358,17 @@ isSaving epoch uid slot =
         DecisionRefreshing _ _ ->
             False
 
-        DecisionIdle ->
+        DecisionIdle _ ->
             False
 
-        DecisionNotSaved _ _ ->
+        DecisionNotSaved _ _ _ ->
             False
 
 
 -- A decision refused before it started, for `failure`, while `latest` is
 -- the queue's latest load: the notice replaces an idle slot or an older
--- notice, never a busy decision of process `epoch`.
+-- notice, keeping its refusal panel, never a busy decision of process
+-- `epoch`.
 decisionRefused : Epoch -> SaveFailure -> LoadTicket -> DecisionSlot -> DecisionSlot
 decisionRefused epoch failure latest slot =
     case busyOwnedBy epoch slot of
@@ -1271,7 +1376,7 @@ decisionRefused epoch failure latest slot =
             slot
 
         Nothing ->
-            DecisionNotSaved failure latest
+            DecisionNotSaved failure latest (panelOf slot)
 
 
 -- The current queue load `load` settled with `result`. The reloaded queue
@@ -1280,30 +1385,31 @@ decisionRefused epoch failure latest slot =
 -- notice that succeeds also clears it, the reload its text advises, while
 -- a load started before it read the queue before the failure was known
 -- and leaves it. A decision still saving stays: its row is re-proved at
--- the write, and its own result settles it.
+-- the write, and its own result settles it. Every idle slot it settles
+-- closes its refusal panel, since the rows it was opened on are re-read.
 queueSettled : LoadTicket -> Result e a -> DecisionSlot -> DecisionSlot
 queueSettled load result slot =
     case slot of
         DecisionRefreshing _ _ ->
-            DecisionIdle
+            DecisionIdle PanelClosed
 
-        DecisionNotSaved _ raisedAt ->
+        DecisionNotSaved failure raisedAt _ ->
             case result of
                 Ok _ ->
                     if ticketNumber load > ticketNumber raisedAt then
-                        DecisionIdle
+                        DecisionIdle PanelClosed
 
                     else
-                        slot
+                        DecisionNotSaved failure raisedAt PanelClosed
 
                 Err _ ->
-                    slot
+                    DecisionNotSaved failure raisedAt PanelClosed
 
         DecisionSaving _ _ ->
             slot
 
-        DecisionIdle ->
-            slot
+        DecisionIdle _ ->
+            DecisionIdle PanelClosed
 
 
 -- What a row's decision controls show while a decision is busy, in place of
@@ -1327,10 +1433,10 @@ pendingText uid slot =
             else
                 Just (SafeText.literal "Refreshing the queue after a decision…")
 
-        DecisionIdle ->
+        DecisionIdle _ ->
             Nothing
 
-        DecisionNotSaved _ _ ->
+        DecisionNotSaved _ _ _ ->
             Nothing
 
 
@@ -1338,10 +1444,10 @@ pendingText uid slot =
 notSavedOf : DecisionSlot -> Maybe SaveFailure
 notSavedOf slot =
     case slot of
-        DecisionNotSaved failure _ ->
+        DecisionNotSaved failure _ _ ->
             Just failure
 
-        DecisionIdle ->
+        DecisionIdle _ ->
             Nothing
 
         DecisionSaving _ _ ->

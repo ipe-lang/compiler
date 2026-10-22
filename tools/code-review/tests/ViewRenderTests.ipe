@@ -16,13 +16,14 @@ import Ipe.Time.Timestamp as Timestamp
 import Ipe.Ui as Ui
 import Lib.App exposing (Model, Page(..), initialModel)
 import Lib.Db as LibDb exposing (BreakAt(..), HistoryCursor(..), LogShown(..), ReviewEntry(..), StoredDecision(..), Unverified(..))
+import Lib.Epoch as Epoch exposing (Epoch)
 import Lib.Failure as Failure exposing (DecideRefusal(..), LoadFailure(..), ReasonRefusal(..), RefuseFailure(..), SaveFailure(..))
 import Lib.Format as Format
 import Lib.Index as Index exposing (Change(..), Oversize(..), ReadFailure(..), RefusalReason(..), SourceView(..), StaleReason(..))
 import Lib.Label as Label exposing (Label)
 import Lib.Links exposing (Hidden(..), Link(..))
 import Lib.PageSize as PageSize
-import Lib.Queue as Queue exposing (DecisionSlot(..), HistoryState(..), QueueState(..), SelectedView(..), UnitPageState(..))
+import Lib.Queue as Queue exposing (DecisionSlot(..), HistoryState(..), QueueState(..), RefusalPanel(..), SelectedView(..), UnitPageState(..))
 import Lib.RepoPath exposing (PathError(..))
 import Lib.SafeText as SafeText
 import Lib.Uid as Uid
@@ -103,14 +104,15 @@ changedModel loaded old =
     }
 
 
--- The queue card with its refusal panel open.
-refusingModel : Index.UnitView -> Model
-refusingModel loaded =
+-- The queue card with its refusal panel open, opened as the app opens it
+-- for process `epoch`.
+refusingModel : Epoch -> Index.UnitView -> Model
+refusingModel epoch loaded =
     let
         card =
             cardModel loaded
     in
-    { card | refusingUid = Just loaded.unit.uid }
+    { card | decision = Queue.openRefusal epoch loaded.unit.uid card.decision }
 
 
 -- The unit page of `loaded`'s own address, with its read settled.
@@ -454,14 +456,14 @@ withheldRefuses loaded entry =
 
 
 -- A withheld card whose refusal panel is open still offers no decision.
-withheldRefusePanelRefuses : Index.UnitView -> Withheld -> Bool
-withheldRefusePanelRefuses loaded entry =
+withheldRefusePanelRefuses : Epoch -> Index.UnitView -> Withheld -> Bool
+withheldRefusePanelRefuses epoch loaded entry =
     let
         withheld =
             { loaded | view = entry.view }
 
         html =
-            page (refusingModel withheld)
+            page (refusingModel epoch withheld)
     in
     has entry.reason html && noDecisionButtons html
 
@@ -543,20 +545,19 @@ countsFollowModel a b =
 -- A refused draft shows its case's fixed text in the open refusal panel,
 -- beside the Confirm button, and no other case's text. Red if a case renders
 -- another's text or the panel loses its control.
-refuseErrorFixedText : Index.UnitView -> Bool
-refuseErrorFixedText loaded =
+refuseErrorFixedText : Epoch -> Index.UnitView -> Bool
+refuseErrorFixedText epoch loaded =
     let
         opened =
-            refusingModel loaded
+            refusingModel epoch loaded
 
         cases =
             [ DraftRefused ReasonBlank
             , DraftRefused (ReasonOverlong { chars = LibDb.reasonMaxChars + 1, limit = LibDb.reasonMaxChars })
-            , DraftWhileSaving
             ]
 
         rendered failure =
-            page { opened | refuseError = Just failure }
+            page { opened | decision = Queue.draftRefused failure opened.decision }
 
         showsItsOwn failure =
             let
@@ -581,7 +582,7 @@ decisionErrorFixedText loaded =
             cardModel loaded
     in
     List.all
-        (\failure -> has (Html.escapeHtml ("Decision save failed: " ++ Failure.saveFailureText failure)) (page { card | decision = DecisionNotSaved failure Queue.firstTicket }))
+        (\failure -> has (Html.escapeHtml ("Decision not saved: " ++ Failure.saveFailureText failure)) (page { card | decision = DecisionNotSaved failure Queue.firstTicket PanelClosed }))
         [ SaveOffQueue
         , SaveReadOnly
         , SaveContended
@@ -603,7 +604,7 @@ decisionErrorFixedText loaded =
         , SaveRefused FileReadsAsText
         , SaveRefused FileNotQueued
         ]
-        && not (has "Decision save failed: " (page card))
+        && not (has "Decision not saved: " (page card))
 
 
 -- ── the address the page reports ────────────────────────────────────
@@ -763,8 +764,8 @@ maxLinksFitBudget loaded =
 
 
 -- ── checks on the seeded fixture units ──────────────────────────────────
-seededChecks : Index.UnitView -> Index.UnitView -> List ( String, Bool )
-seededChecks a b =
+seededChecks : Epoch -> Index.UnitView -> Index.UnitView -> List ( String, Bool )
+seededChecks epoch a b =
     let
         shownCard =
             page (cardModel a)
@@ -782,7 +783,7 @@ seededChecks a b =
             { a | unit = { unit | path = labelOf hostileText } }
 
         opened =
-            page (refusingModel a)
+            page (refusingModel epoch a)
 
         hostileHistory =
             historyModel [ { entry = Unverified { uid = Just a.unit.uid, bodyHash = "h", reviewedAt = Timestamp.fromUnixMillis 0, why = Legacy }, label = Queue.FileLabelled (labelOf hostileText) Queue.Indexed } ]
@@ -851,7 +852,7 @@ seededChecks a b =
     in
     [ ( "a verified source shows Approve, Refuse and its source text", button "Approve" shownCard && button "Refuse" shownCard && has sourceMarker shownCard )
     , ( "a withheld source shows its reason, no decision button and no source text, for every stale reason and an unreadable file", List.all (withheldRefuses a) withheldCases )
-    , ( "a withheld source offers no decision with the refusal panel open", List.all (withheldRefusePanelRefuses a) withheldCases )
+    , ( "a withheld source offers no decision with the refusal panel open", List.all (withheldRefusePanelRefuses epoch a) withheldCases )
     , ( "the unit page shows a verified source and never a decision button", has sourceMarker shownPage && noDecisionButtons shownPage )
     , ( "an open refusal panel shows Confirm and Cancel in place of Approve and Refuse", button "Confirm" opened && button "Cancel" opened && not (button "Approve" opened) && not (button "Refuse" opened) )
     , ( "the escaped needle differs from the raw hostile text, and a benign render holds no script tag, no href and shows the unit name", hostileEscaped /= hostileText && renderedForeign (codeText 8238) /= codeText 8238 && not (has "<script" shownCard) && not (has "href=" shownCard) && has "Lib.answer" shownCard )
@@ -900,7 +901,7 @@ seededChecks a b =
     , ( "each queue state renders its own text and no other state's", List.all showsOnly stateCases )
     , ( "a queue with open units renders none of the state texts and its header", showsNoStateText (page (cardModel a)) && has (showingLine (queuePage [ queued a ] 1 { reviewed = 0, total = 1 })) shownCard )
     , ( "the progress line and the showing header follow the model's counts", countsFollowModel a b )
-    , ( "a refused draft shows its case's fixed text in the open refusal panel", refuseErrorFixedText a )
+    , ( "a refused draft shows its case's fixed text in the open refusal panel", refuseErrorFixedText epoch a )
     , ( "a failed decision save shows its case's fixed text in the queue banner", decisionErrorFixedText a )
     , ( "the reported address is escaped as an attribute value", pathAttributeEscaped a )
     , ( "an unsafe link target renders as plain text with no href", List.all (unsafeLinkHasNoHref a) unsafeTargets )
@@ -1565,7 +1566,7 @@ queueBudgetChecks loaded =
 checks : Task.Task Error (List ( String, Bool ))
 checks =
     Task.sequence
-        [ group "view fixtures" (withSeededIndex "ipe-view-render-seeded" (\a b -> Task.succeed (seededChecks a b ++ untrustedSinkChecks a ++ queueBudgetChecks a ++ maxLinksFitBudget a)))
+        [ group "view fixtures" (withSeededIndex "ipe-view-render-seeded" (\a b -> Epoch.mint |> Task.map (\epoch -> seededChecks epoch a b ++ untrustedSinkChecks a ++ queueBudgetChecks a ++ maxLinksFitBudget a)))
         , group "hostile source fixture" hostileSourceChecks
         , group "stored decision fixture" storedChecks
         , group "unreviewable file fixture" refusalChecks
