@@ -1,8 +1,9 @@
-module Lib.Links exposing (Candidates, ExternalUrl, Hidden(..), Link(..), LinkSet, Reach(..), Reference(..), UnitName, assemble, candidates, external, hiddenNote, href, hrefByteCeiling, internal, label, linkByteCeiling, linkCandidateCeiling, linkCeiling, linkKey, mark, noLinks, references, resolveCandidates, sourceUrls)
+module Lib.Links exposing (Candidates, ExternalUrl, Hidden(..), Link(..), LinkKey(..), LinkSet, Reach(..), Reference(..), UnitName, assemble, candidates, external, hiddenNote, href, hrefByteCeiling, internal, label, linkByteCeiling, linkCandidateCeiling, linkCeiling, linkKey, linkKeyOrder, mark, noLinks, references, resolveCandidates, sourceUrls)
 
 import Ipe.Char as Char
 import Ipe.Dict as Dict
 import Ipe.List as List
+import Ipe.Maybe as Maybe
 import Ipe.Result as Result exposing (Result(..))
 import Ipe.Set as Set
 import Ipe.String as String
@@ -600,27 +601,32 @@ distinctNew seen alts =
 
 distinctReferences : List Reference -> List Reference
 distinctReferences refs =
-    firstByKey referenceKey refs
+    firstByKey referenceKey compare refs
 
 
 -- The items of `xs` whose key no earlier item has, in their order. One
 -- stable sort by key puts each key's items together in input order, the
 -- first of each run is kept, and a sort by position restores the order:
 -- `O(n log n)`, and no step copies what the walk has built so far.
-firstByKey : (a -> String) -> List a -> List a
-firstByKey key xs =
-    case List.foldl keepRunHead ( Nothing, [] ) (List.sortBy (\( k, _ ) -> k) (List.indexedMap (\i x -> ( key x, ( i, x ) )) xs)) of
+firstByKey : (a -> k) -> (k -> k -> Order) -> List a -> List a
+firstByKey key order xs =
+    case List.foldl (keepRunHead order) ( Nothing, [] ) (List.sortWith (\( j, _ ) ( k, _ ) -> order j k) (List.indexedMap (\i x -> ( key x, ( i, x ) )) xs)) of
         ( _, kept ) ->
             List.map (\( _, x ) -> x) (List.sortBy (\( i, _ ) -> i) kept)
 
 
-keepRunHead : ( String, ( Int, a ) ) -> ( Maybe String, List ( Int, a ) ) -> ( Maybe String, List ( Int, a ) )
-keepRunHead ( k, item ) ( previous, kept ) =
-    if previous == Just k then
-        ( previous, kept )
+keepRunHead : (k -> k -> Order) -> ( k, ( Int, a ) ) -> ( Maybe k, List ( Int, a ) ) -> ( Maybe k, List ( Int, a ) )
+keepRunHead order ( k, item ) ( previous, kept ) =
+    case previous of
+        Just p ->
+            if order p k == EQ then
+                ( previous, kept )
 
-    else
-        ( Just k, kept ++ [ item ] )
+            else
+                ( Just k, item :: kept )
+
+        Nothing ->
+            ( Just k, item :: kept )
 
 
 referenceKey : Reference -> String
@@ -840,7 +846,7 @@ isPunct c =
 -- comparable `linkKey`.
 dedup : List Link -> List Link
 dedup links =
-    firstByKey linkKey links
+    firstByKey linkKey linkKeyOrder links
 
 
 -- The name a link shows, a bounded label: an internal or unlinked target's
@@ -883,23 +889,112 @@ href url =
 
 -- A link's dedup key: a unit's uid, a targeted URL whole, or the label of
 -- an untargeted URL or an unlinked name, which tells two names apart as far
--- as their labels do.
-linkKey : Link -> String
+-- as their labels do. Each kind is a constructor of its own, so keys of two
+-- kinds never meet, and a unit's key holds its uid as a `UidKey`, never as
+-- text.
+type LinkKey
+    = InternalKey Uid.UidKey
+    | TargetedKey String
+    | UntargetedKey String
+    | UnlinkedKey String
+
+
+linkKey : Link -> LinkKey
 linkKey link =
     case link of
         Internal _ uid ->
-            "i:" ++ Uid.toString uid
+            InternalKey (Uid.key uid)
 
         External (ExternalUrl url) ->
             case url.href of
                 Just raw ->
-                    "e:" ++ raw
+                    TargetedKey raw
 
                 Nothing ->
-                    "f:" ++ Label.key url.shown
+                    UntargetedKey (Label.key url.shown)
 
         Unlinked name ->
-            "t:" ++ Label.key name
+            UnlinkedKey (Label.key name)
+
+
+-- A total order on link keys: by kind, then by the key within its kind.
+linkKeyOrder : LinkKey -> LinkKey -> Order
+linkKeyOrder a b =
+    case compare (keyKind a) (keyKind b) of
+        LT ->
+            LT
+
+        EQ ->
+            withinKind a b
+
+        GT ->
+            GT
+
+
+-- The order of two keys of one kind: `a`'s key against `b`'s, read through
+-- the projection of `a`'s kind.
+withinKind : LinkKey -> LinkKey -> Order
+withinKind a b =
+    case a of
+        InternalKey x ->
+            Maybe.withDefault EQ (Maybe.map (Uid.keyOrder x) (internalOf b))
+
+        TargetedKey x ->
+            Maybe.withDefault EQ (Maybe.map (compare x) (textOf b))
+
+        UntargetedKey x ->
+            Maybe.withDefault EQ (Maybe.map (compare x) (textOf b))
+
+        UnlinkedKey x ->
+            Maybe.withDefault EQ (Maybe.map (compare x) (textOf b))
+
+
+internalOf : LinkKey -> Maybe Uid.UidKey
+internalOf key =
+    case key of
+        InternalKey x ->
+            Just x
+
+        TargetedKey _ ->
+            Nothing
+
+        UntargetedKey _ ->
+            Nothing
+
+        UnlinkedKey _ ->
+            Nothing
+
+
+textOf : LinkKey -> Maybe String
+textOf key =
+    case key of
+        InternalKey _ ->
+            Nothing
+
+        TargetedKey x ->
+            Just x
+
+        UntargetedKey x ->
+            Just x
+
+        UnlinkedKey x ->
+            Just x
+
+
+keyKind : LinkKey -> Int
+keyKind key =
+    case key of
+        InternalKey _ ->
+            0
+
+        TargetedKey _ ->
+            1
+
+        UntargetedKey _ ->
+            2
+
+        UnlinkedKey _ ->
+            3
 
 
 isCut : LabelPart -> Bool

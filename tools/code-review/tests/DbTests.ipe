@@ -689,10 +689,10 @@ historyWalkMatchesOrder db =
             Db.exec db "INSERT INTO review (uid, body_hash, decision, reason, reviewed_at) VALUES (?,?,?,?,?)" [ Uid.toSql (uid label), SqlString bodyHash, SqlString "refuse", SqlString "r", SqlInt at ]
 
         walkKey ( label, bodyHash ) =
-            ( Uid.toString (uid label), bodyHash )
+            ( TestSupport.uidHex (uid label), bodyHash )
 
         walkUids =
-            List.map (\( label, _, _ ) -> Uid.toString (uid label)) (seeded ++ legacy)
+            List.map (\( label, _, _ ) -> TestSupport.uidHex (uid label)) (seeded ++ legacy)
 
         keyDecoder =
             Db.Decode.succeed (\unit bodyHash -> ( unit, bodyHash ))
@@ -718,10 +718,10 @@ entryKey : ReviewEntry -> ( String, String )
 entryKey entry =
     case entry of
         Verified row ->
-            ( Uid.toString (LibDb.verifiedUid row), LibDb.verifiedHash row )
+            ( TestSupport.uidHex (LibDb.verifiedUid row), LibDb.verifiedHash row )
 
         Unverified row ->
-            ( Maybe.withDefault "" (Maybe.map Uid.toString row.uid), row.bodyHash )
+            ( Maybe.withDefault "" (Maybe.map TestSupport.uidHex row.uid), row.bodyHash )
 
 
 -- The state one History walk step carries: where the next page starts, the
@@ -2125,10 +2125,10 @@ macInputVectorsPinned =
             "0123456789abcdef0123456789abcdef"
 
         tool recorded =
-            LibDb.macInput logId 2 "prevhead" (LibDb.storedUid unitRow.uid) unitRow.bodyHash unitRow.decision unitRow.reason unitRow.reviewedAt recorded
+            LibDb.macInput logId 2 "prevhead" (Uid.macField unitRow.uid) unitRow.bodyHash unitRow.decision unitRow.reason unitRow.reviewedAt recorded
 
         fields =
-            "29:ipe-code-review/review-row/v2" ++ "32:" ++ logId ++ "1:2" ++ "8:prevhead" ++ "64:" ++ Uid.toString unitRow.uid ++ "2:hV" ++ "6:refuse" ++ "3:+no" ++ "1:7"
+            "29:ipe-code-review/review-row/v2" ++ "32:" ++ logId ++ "1:2" ++ "8:prevhead" ++ "64:" ++ TestSupport.uidHex unitRow.uid ++ "2:hV" ++ "6:refuse" ++ "3:+no" ++ "1:7"
 
         unitVector =
             fields ++ "4:unit" ++ "2:fn" ++ "10:Lib.answer" ++ "14:ipe:src/Lib.rs" ++ "1:3"
@@ -2142,7 +2142,7 @@ macInputVectorsPinned =
                 && rawMacInput logId 2 "prevhead" unitRow == unitVector
                 && tool file == fileVector
                 && rawMacInput logId 2 "prevhead" fileRow == fileVector
-                && String.length (Uid.toString unitRow.uid) == 64
+                && String.length (TestSupport.uidHex unitRow.uid) == 64
 
         _ ->
             False
