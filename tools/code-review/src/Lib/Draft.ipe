@@ -66,9 +66,13 @@ draftReason bounded =
 
 
 -- The page-side bound on the reason input, in the UTF-16 units `maxlength`
--- counts: one code point is at most two units, so a reason of
--- `LibDb.reasonMaxChars` code points always fits, and no input event the
--- page sends carries more than a few KB.
+-- counts. A code point is at least one unit, so a value the input admits is
+-- never past `LibDb.reasonMaxChars` code points: the draft never cuts what
+-- an honest page holds, and the focused input, whose value the page keeps
+-- as typed, shows exactly the text Confirm records. A reason of characters
+-- outside the Basic Multilingual Plane, two units each, is held to half the
+-- limit by the page; the draft's own cut stays the bound for any other
+-- sender.
 inputMaxUnits : Int
 inputMaxUnits =
-    2 * LibDb.reasonMaxChars
+    LibDb.reasonMaxChars
