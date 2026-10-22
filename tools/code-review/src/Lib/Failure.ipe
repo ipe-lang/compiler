@@ -70,15 +70,16 @@ type SaveFailure
     | SaveFailed
 
 
--- Why the reviewer's draft is not a refusal reason: blank, or `chars`
--- characters where at most `limit` are kept.
+-- Why the reviewer's text is not a refusal reason as given: blank, or
+-- `chars` characters where at most `limit` are kept.
 type ReasonRefusal
     = ReasonBlank
     | ReasonOverlong { chars : Int, limit : Int }
 
 
--- Why a refusal draft stays open: its reason is refused. A draft is open only
--- while no decision is busy, so no other case exists.
+-- What the open refusal panel says of its draft: its reason is refused at
+-- Confirm (blank), or it was cut to the limit as it was typed. A draft is
+-- open only while no decision is busy, so no other case exists.
 type RefuseFailure
     = DraftRefused ReasonRefusal
 
@@ -323,4 +324,4 @@ refuseFailureText failure =
             "a refusal needs a reason"
 
         DraftRefused (ReasonOverlong over) ->
-            "a refusal reason is at most " ++ String.fromInt over.limit ++ " characters; this one has " ++ String.fromInt over.chars
+            "this reason had " ++ String.fromInt over.chars ++ " characters; a reason holds at most " ++ String.fromInt over.limit ++ ", so only the first " ++ String.fromInt over.limit ++ " are kept and the rest was cut"
