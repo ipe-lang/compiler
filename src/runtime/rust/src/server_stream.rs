@@ -430,8 +430,8 @@ impl ServerPendingStream {
     /// is returned, before the first chunk, as SSE requires.
     ///
     /// A body opened under the credentials the request bound ends on a
-    /// coalesced revocation and at the earliest deadline; the receiver drops,
-    /// so the handler's next `emit` reports the client gone. A gate that
+    /// coalesced revocation and at the earliest deadline; the body ends and its
+    /// handler is cancelled. A gate that
     /// cannot prove those credentials now answers 401 and never runs the
     /// handler (fail closed).
     ///
@@ -603,7 +603,9 @@ mod tests {
         assert!(matches!(end, Ok(None)), "the body ends on the drain");
         drop(body);
         assert_eq!(armed.live_count(), 0, "the ended body is no longer live");
-        tokio::task::yield_now().await;
+        for _ in 0..16 {
+            tokio::task::yield_now().await;
+        }
         assert!(
             !idle.is_finished(),
             "a body the drain ends leaves its handler to the grace"
