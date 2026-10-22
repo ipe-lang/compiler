@@ -250,12 +250,13 @@ uncheckedLogId =
     "00112233445566778899aabbccddeeff"
 
 
--- True when `task` fails with an error that names `unit`.
-failsNaming : Uid -> String -> Task.Task Error a -> Task.Task Error Bool
-failsNaming unit stored task =
+-- True when `task` fails with an error that repeats neither `unit`'s text
+-- nor `stored`.
+failsUnnamed : Uid -> String -> Task.Task Error a -> Task.Task Error Bool
+failsUnnamed unit stored task =
     task
         |> Task.map (\_ -> False)
-        |> Task.onError (\e -> Task.succeed (String.contains (TestSupport.uidHex unit) (Error.toString e) && not (String.contains stored (Error.toString e))))
+        |> Task.onError (\e -> Task.succeed (not (String.contains (TestSupport.uidHex unit) (Error.toString e)) && not (String.contains stored (Error.toString e))))
 
 
 -- True when `task` fails with an error that does not repeat `stored`.
@@ -267,18 +268,20 @@ failsWithout stored task =
 
 
 -- A legacy decision that is neither `approve` nor `refuse` fails every read
--- of its row with a typed error naming the row's uid; a legacy uid that is
--- not a unit id fails the History page. Neither error repeats the stored
--- text. A signed log entry holding such a decision is never counted: it
--- reads `Tampered`, and the uid has no previous review.
--- Red if an unknown decision reads as any decision.
+-- of its row with a typed error; a legacy uid that is not a unit id fails
+-- the History page. Neither error repeats the stored text, and the first
+-- repeats no uid: a uid leaves its type only through its sink exits. A
+-- signed log entry holding such a decision is never counted: it reads
+-- `Tampered`, and the uid has no previous review.
+-- Red if an unknown decision reads as any decision, or its error names the
+-- uid.
 unknownStoredDecisionRefused : Task.Task Error Bool
 unknownStoredDecisionRefused =
     do
         db <- uncheckedReview "ipe-review-unknown-decision" [ [ Uid.toSql (uid "u-m"), SqlString "h", SqlString "maybe", SqlNull (SqlString ""), SqlInt 1 ] ]
         verify <- countingVerifier db
-        byPair <- failsNaming (uid "u-m") "maybe" (LibDb.findDecision verify db (uid "u-m") "h")
-        page <- failsNaming (uid "u-m") "maybe" (LibDb.historyPage verify db PageSize.history HistoryStart)
+        byPair <- failsUnnamed (uid "u-m") "maybe" (LibDb.findDecision verify db (uid "u-m") "h")
+        page <- failsUnnamed (uid "u-m") "maybe" (LibDb.historyPage verify db PageSize.history HistoryStart)
         bad <- uncheckedReview "ipe-review-bad-uid" [ [ SqlString "zz", SqlString "h", SqlString "approve", SqlNull (SqlString ""), SqlInt 1 ] ]
         badVerify <- countingVerifier bad
         badUid <- failsWithout "zz" (LibDb.historyPage badVerify bad PageSize.history HistoryStart)
@@ -356,6 +359,6 @@ checks =
         , Task.succeed ( "a page size below one row or past the ceiling has no representation", pageSizeRefuses )
         , Task.succeed ( "a rebuild bound that passes the largest integer has no representation", resyncBoundRefusesOverflow )
         , Task.succeed ( "a rebuild bound below one page has no representation", resyncBoundRefusesZeroCeiling )
-        , check "a stored decision this reviewer does not know fails its reads, naming the uid" unknownStoredDecisionRefused
+        , check "a stored decision this reviewer does not know fails its reads, naming neither the uid nor the decision" unknownStoredDecisionRefused
         , check "a stored refusal with no reason reads as a blank refusal" refuseWithNullReasonIsBlank
         ]
