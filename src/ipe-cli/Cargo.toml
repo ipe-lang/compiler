@@ -116,7 +116,7 @@ semver = "1"
 # (`src/net.rs`). A small blocking, pure-Rust client with the same rustls TLS
 # backend the runtime already uses — no `curl` subprocess, and no async runtime
 # pulled into the CLI for a single one-shot GET.
-ureq = { version = "2", default-features = false, features = ["tls"] }
+ureq = { version = "3", default-features = false, features = ["rustls"] }
 # The Tier-2 wrapper capability gate reads a wrapper crate's `Cargo.toml`
 # dependency tables STRUCTURALLY (parse, don't validate): a hand-rolled line
 # scan under-refuses on valid-but-unusual TOML (a trailing comment on a header,

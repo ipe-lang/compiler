@@ -71,5 +71,5 @@ jobs:
       - uses: ./.github/actions/rust-toolchain-pinned
       - uses: taiki-e/install-action@4cef1412cce204788f482e778a0b9187f9626a29 # v2
         with:
-          tool: cargo-deny
+          tool: cargo-deny@0.20.2
       - run: cargo deny check advisories bans licenses sources

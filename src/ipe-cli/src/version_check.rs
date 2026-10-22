@@ -91,7 +91,7 @@ fn evaluate(current: Version, fetched: Option<Version>) -> VersionCheck {
 /// Fetch the latest release tag over HTTPS and parse it. Any failure (network,
 /// non-2xx, non-JSON body, missing/blank/malformed tag) ⇒ `None`.
 fn fetch_latest_tag() -> Option<Version> {
-    let body = crate::net::get(RELEASES_LATEST_API)?;
+    let body = crate::net::get(&crate::net::HttpsUrl::parse(RELEASES_LATEST_API).ok()?)?;
     let json: serde_json::Value = serde_json::from_str(&body).ok()?;
     parse_tag(json.get("tag_name")?.as_str()?)
 }
@@ -108,6 +108,11 @@ mod tests {
 
     fn v(s: &str) -> Version {
         Version::parse(s).expect("test version literal is valid semver")
+    }
+
+    #[test]
+    fn the_releases_feed_is_an_https_url() {
+        assert!(crate::net::HttpsUrl::parse(RELEASES_LATEST_API).is_ok());
     }
 
     #[test]

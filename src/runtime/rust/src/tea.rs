@@ -2474,9 +2474,9 @@ mod source_spawn_scan_tests {
     /// Every task-starting name the production text of these files may hold,
     /// by file, enclosing fn and name: the loop's own starts through the scope
     /// carrier, its stdin reader thread, the source closure the loop and
-    /// `sub_map` invoke (a binding named `spawn`), and the socket pumps, which
-    /// run no user code. Sorted.
-    const ADMITTED_SPAWNS: [(&str, &str, &str); 16] = [
+    /// `sub_map` invoke (a binding named `spawn`), and the one task a socket
+    /// runs on, which runs no user code. Sorted.
+    const ADMITTED_SPAWNS: [(&str, &str, &str); 15] = [
         ("tea.rs", "add", "spawn"),
         ("tea.rs", "add", "spawn"),
         ("tea.rs", "apply", "spawn"),
@@ -2491,8 +2491,7 @@ mod source_spawn_scan_tests {
         ("tea.rs", "sub_map_rc", "spawn"),
         ("tea.rs", "sub_map_rc", "spawn"),
         ("tea.rs", "worker_run_cmd", "spawn_in_current_scope"),
-        ("ws_client.rs", "do_connect", "spawn"),
-        ("ws_client.rs", "do_connect", "spawn"),
+        ("ws_client.rs", "start_socket", "spawn"),
     ];
 
     /// Source files under `src/` that build a subscription source and are not

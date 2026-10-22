@@ -161,12 +161,14 @@ pub fn db_conn_unsafe_exec_raw_on<E: Send + From<String> + crate::FromIpeError +
         // Each dialect's `execute` yields a distinct `QueryResult`; reduce each to
         // the shared `u64` rows-affected in-arm so the match unifies on one type.
         let affected: Result<u64, (DbEngine, sqlx::Error)> = match &conn {
-            ExternalConnection::Postgres(pool) => sqlx::query(&sql)
-                .execute(pool)
-                .await
-                .map(|d| d.rows_affected())
-                .map_err(|e| (DbEngine::Postgres, e)),
-            ExternalConnection::Sqlite(pool) => sqlx::query(&sql)
+            ExternalConnection::Postgres(pool) => {
+                sqlx::query(super::sql_text::program_authored(sql))
+                    .execute(pool)
+                    .await
+                    .map(|d| d.rows_affected())
+                    .map_err(|e| (DbEngine::Postgres, e))
+            }
+            ExternalConnection::Sqlite(pool) => sqlx::query(super::sql_text::program_authored(sql))
                 .execute(pool)
                 .await
                 .map(|d| d.rows_affected())
