@@ -215,7 +215,8 @@ autofocus : Bool -> Attribute msg
 when it appears in answer to the user's own action in that tab while focus
 has not moved since. A render the tab did not cause never moves focus: after
 load the attribute never reaches the live page, so only the runtime moves
-focus.
+focus. An event a widget or a page script raises is not the user's own
+action, so its render never moves focus.
 
 ## `tabindex`
 

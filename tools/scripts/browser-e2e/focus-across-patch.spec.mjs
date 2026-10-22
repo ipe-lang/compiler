@@ -593,6 +593,22 @@ const settle = (page) =>
 /** Whether focus is on `body` itself. */
 const onBody = (page) => page.evaluate(() => document.activeElement === document.body);
 
+test("focus-across-patch: an event a widget's script raises never moves focus", async ({ page }) => {
+  await open(page);
+  await expect.poll(() => focusedId(page)).toBe("root");
+  // The send a widget's up emit makes: the epoch current at the call, no user act.
+  await page.evaluate(() => {
+    const root = document.getElementById("root");
+    __ipeSend(root.getAttribute("ipe-keydown"), ["F2"], root.getAttribute("data-ipe-hid"), {
+      noLoader: true,
+      epoch: __ipeEpoch,
+    });
+  });
+  await expect(page.locator("input#ask")).toHaveCount(1);
+  await settle(page);
+  expect(await focusedId(page)).toBe("root");
+});
+
 test("focus-across-patch: a timer's autofocus field never takes focus from the body", async ({ page }) => {
   // No load autofocus and focus on the body: the browser would focus an
   // inserted `autofocus` element itself.

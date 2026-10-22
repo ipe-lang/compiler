@@ -319,8 +319,11 @@ type WasmRouter<Model, Msg> = dyn Fn(
 /// Where a queued Msg came from.
 #[derive(Clone, Copy)]
 enum Source {
-    /// A DOM or widget event the user raised in this document.
+    /// A DOM event the user raised in this document.
     User,
+    /// A widget's own up event: its script raises it, so it proves no act of
+    /// the user's.
+    Widget,
     /// A Cmd result or a Sub delivery.
     Effect,
 }
@@ -351,7 +354,7 @@ impl<F: PartialEq> Cause<F> {
         match (self, source) {
             (Self::Idle, Source::User) => Self::User(mark()),
             (Self::User(at), Source::User) => Self::User(at),
-            (Self::Idle | Self::User(_) | Self::Effect, Source::Effect)
+            (Self::Idle | Self::User(_) | Self::Effect, Source::Widget | Source::Effect)
             | (Self::Effect, Source::User) => Self::Effect,
         }
     }
@@ -1005,7 +1008,7 @@ where
                 .borrow()
                 .resolve(&ipe_id, widget::UP_WIRE_NAME, &args)
             {
-                enqueue(app, msg, Source::User);
+                enqueue(app, msg, Source::Widget);
                 return;
             }
         }
@@ -1678,6 +1681,16 @@ mod tests {
             .with(Source::User, || mark(0, 1));
         assert!(!after.addressed(&mark(0, 1)));
         assert!(!Cause::<u8>::Idle.addressed(&mark(0, 1)));
+    }
+
+    #[wasm_bindgen_test]
+    fn a_widget_event_never_counts_as_the_users() {
+        let alone = Cause::Idle.with(Source::Widget, || mark(0, 1));
+        assert!(!alone.addressed(&mark(0, 1)));
+        let joined = Cause::Idle
+            .with(Source::User, || mark(0, 1))
+            .with(Source::Widget, || mark(0, 1));
+        assert!(!joined.addressed(&mark(0, 1)));
     }
 
     #[wasm_bindgen_test]
