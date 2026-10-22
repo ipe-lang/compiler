@@ -192,8 +192,7 @@ admittedConversions : List String
 admittedConversions =
     [ "Lib/RepoPath.ipe:parseRoot"
     , "Lib/ServerLog.ipe:logged"
-    , "Main.ipe:requireReviewKey"
-    , "Main.ipe:requireSettings"
+    , "Main.ipe:printStartupFailure"
     ]
 
 

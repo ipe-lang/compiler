@@ -81,13 +81,17 @@ optionalEnv key =
 -- the server read-only, with a notice saying so.
 requireReviewKey : Task Error ReviewKey
 requireReviewKey =
-    Task.onError
-        (\e ->
-            do
-                Io.eprintln ("code-review: " ++ Error.message e)
-                System.exit 1
-        )
+    Task.onError printStartupFailure
         (ReviewKey.readReviewKey |> Task.andThen announceKey)
+
+
+-- A startup refusal printed on one line under the tool's name, its text
+-- rendered so no control character reaches the terminal, then exit 1.
+printStartupFailure : Error -> Task Error a
+printStartupFailure e =
+    do
+        Io.eprintln ("code-review: " ++ SafeText.toString (SafeText.renderForeign (Error.message e)))
+        System.exit 1
 
 
 announceKey : ReviewKey -> Task Error ReviewKey
@@ -116,12 +120,7 @@ announceKey key =
 -- Returns the settings, the one value the app serves from.
 requireSettings : ReviewKey -> String -> String -> Settings.EnvValue -> Settings.EnvValue -> Task Error Settings.AppSettings
 requireSettings key rawDb rawRoot rawRepos rawReview =
-    Task.onError
-        (\e ->
-            do
-                Io.eprintln ("code-review: " ++ SafeText.toString (SafeText.renderForeign (Error.message e)))
-                System.exit 1
-        )
+    Task.onError printStartupFailure
         (do
             index <- Settings.parseIndexSettings rawDb rawRoot rawRepos
             Index.probe index

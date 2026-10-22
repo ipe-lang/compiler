@@ -1,6 +1,8 @@
-module Lib.EnvLookup exposing (isUnset, requiredVarRefusal)
+module Lib.EnvLookup exposing (StartupRefusal, StartupVar(..), isUnset, requiredVarRefusal, startupRefusal, startupVarName, startupVars)
 
 import Ipe.Error as Error exposing (Error)
+import Ipe.Path as Path exposing (Path)
+import Lib.SafeText as SafeText exposing (SafeText)
 
 
 -- Whether a failed environment read means the variable is not set, decided
@@ -23,3 +25,79 @@ requiredVarRefusal key fix failure =
 
     else
         "code-review: required environment variable " ++ key ++ " could not be read from the environment.\n  " ++ fix
+
+
+-- Each environment variable a startup refusal can name.
+type StartupVar
+    = IndexDbVar
+    | IndexRootVar
+    | IndexReposVar
+    | ReviewDbVar
+    | ReviewKeyVar
+
+
+-- The one spelling of each variable.
+startupVarName : StartupVar -> String
+startupVarName var =
+    case var of
+        IndexDbVar ->
+            "IPE_INDEX_DB"
+
+        IndexRootVar ->
+            "IPE_INDEX_ROOT"
+
+        IndexReposVar ->
+            "IPE_INDEX_REPOS"
+
+        ReviewDbVar ->
+            "IPE_REVIEW_DB"
+
+        ReviewKeyVar ->
+            "IPE_REVIEW_MAC_KEY"
+
+
+-- Every `StartupVar`, for the checks that cover each one.
+startupVars : List StartupVar
+startupVars =
+    [ IndexDbVar, IndexRootVar, IndexReposVar, ReviewDbVar, ReviewKeyVar ]
+
+
+-- A startup refusal as its parts: the variable it is about, the file that
+-- variable resolved to when there is one, what is wrong, and the one fix.
+-- `problem` and `fix` are this tool's own one-line text.
+type alias StartupRefusal =
+    { var : StartupVar
+    , file : Maybe Path
+    , problem : String
+    , fix : String
+    }
+
+
+-- The one rendering of a startup refusal, on one line:
+-- `VAR: cannot use "<file>": <problem>; fix: <fix>`, the file part left out
+-- when there is none. The file came from the environment, so it is quoted
+-- with its hazards escaped; no producer lays this text out by hand.
+startupRefusal : StartupRefusal -> Error
+startupRefusal refusal =
+    Error.invalidInput
+        (SafeText.toString
+            (SafeText.concat
+                [ SafeText.literal (startupVarName refusal.var)
+                , filePart refusal.file
+                , SafeText.literal ": "
+                , SafeText.literal refusal.problem
+                , SafeText.literal "; fix: "
+                , SafeText.literal refusal.fix
+                ]
+            )
+        )
+
+
+filePart : Maybe Path -> SafeText
+filePart file =
+    case file of
+        Just path ->
+            SafeText.concat [ SafeText.literal ": cannot use ", SafeText.quoted (Path.toString path) ]
+
+        Nothing ->
+            SafeText.literal ""

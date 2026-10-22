@@ -1512,10 +1512,48 @@ wrongKeyRefusesStartupIn base =
         bound <- rawKeyCheck db
         loc <- Settings.parseReviewDb dbPath
         other <- otherMacKey
-        refused <- refusedWith LibDb.keyMismatchRefusal (LibDb.probe (ReviewKey.Signing other) loc)
+        refused <- refusedWith (LibDb.keyMismatchRefusal loc.path) (LibDb.probe (ReviewKey.Signing other) loc)
         kept <- rawKeyCheck db
         removeReviewFiles dbPath
-        Task.succeed (refused && String.contains "IPE_REVIEW_MAC_KEY" (Error.message LibDb.keyMismatchRefusal) && bound /= Nothing && kept == bound)
+        Task.succeed (refused && String.contains "IPE_REVIEW_MAC_KEY" (Error.message (LibDb.keyMismatchRefusal loc.path)) && bound /= Nothing && kept == bound)
+
+
+-- The key-mismatch refusal is one line in the startup layout: it starts
+-- with the key's variable, names the review file it could not use, states
+-- one fix, and carries neither key nor the head's stored check. Red if the
+-- refusal drops the file, embeds a line break, or leaves the shared layout.
+keyMismatchNamesFile : Task.Task Error Bool
+keyMismatchNamesFile =
+    freshDir "ipe-review-key-mismatch-names-file" |> Task.andThen keyMismatchNamesFileIn
+
+
+keyMismatchNamesFileIn : String -> Task.Task Error Bool
+keyMismatchNamesFileIn base =
+    let
+        dbPath =
+            base ++ "/review.db"
+    in
+    do
+        db <- migratedReviewAt dbPath
+        appendSigned db (rawRow "bound-1" "h" "approve" Nothing)
+        stored <- rawKeyCheck db
+        loc <- Settings.parseReviewDb dbPath
+        other <- otherMacKey
+        message <- probeMessage (LibDb.probe (ReviewKey.Signing other) loc)
+        removeReviewFiles dbPath
+        let
+            secrets =
+                [ testKeyHex, String.toUpper testKeyHex, otherKeyHex, String.toUpper otherKeyHex ] ++ Maybe.withDefault [] (Maybe.map List.singleton stored)
+        in
+        Task.succeed
+            (probeNames "IPE_REVIEW_MAC_KEY" dbPath message
+                && message == Just (Error.message (LibDb.keyMismatchRefusal loc.path))
+                && maybeContains "signed by a different key" message
+                && not (maybeContains "\n" message)
+                && List.length (String.split "; fix: " (Maybe.withDefault "" message)) == 2
+                && stored /= Nothing
+                && not (List.any (\secret -> maybeContains secret message) secrets)
+            )
 
 
 -- A decision recorded straight through `insertDecision` under a second
@@ -1558,17 +1596,55 @@ legacyHeadAdoptsOnlyOnProofIn base =
         tampered <- legacyProbe (base ++ "/tampered.db") [ "UPDATE review_log SET reviewed_at = 99 WHERE seq = 1" ] key
         otherKey <- legacyProbe (base ++ "/other-key.db") [] other
         pastHead <- legacyProbe (base ++ "/past-head.db") [ "INSERT INTO review_log (seq, uid, body_hash, decision, reason, reviewed_at, prev, mac, unit_kind, unit_qualified, unit_path, unit_line) VALUES (3, 'x', 'hX', 'approve', NULL, 0, 'genesis', '" ++ String.repeat 64 "e" ++ "', 'fn', 'Lib.answer', 'ipe:src/Lib.rs', 3)" ] key
+        tamperedRefusal <- mismatchAt (base ++ "/tampered.db")
+        otherKeyRefusal <- mismatchAt (base ++ "/other-key.db")
+        pastHeadRefusal <- mismatchAt (base ++ "/past-head.db")
         Task.succeed
             (intact.unbound == KeyMismatch
                 && intact.refusal == Nothing
                 && intact.check /= Nothing
                 && isProven intact.after
-                && tampered.refusal == Just (Error.message LibDb.keyMismatchRefusal)
+                && tampered.refusal == Just tamperedRefusal
                 && tampered.check == Nothing
-                && otherKey.refusal == Just (Error.message LibDb.keyMismatchRefusal)
+                && otherKey.refusal == Just otherKeyRefusal
                 && otherKey.check == Nothing
-                && pastHead.refusal == Just (Error.message LibDb.keyMismatchRefusal)
+                && pastHead.refusal == Just pastHeadRefusal
                 && pastHead.check == Nothing
+            )
+
+
+-- The key-mismatch refusal text for the review file at `dbPath`.
+mismatchAt : String -> Task.Task Error String
+mismatchAt dbPath =
+    Settings.parseReviewDb dbPath |> Task.map (\loc -> Error.message (LibDb.keyMismatchRefusal loc.path))
+
+
+-- A log already past the names migration that holds a row with no name is
+-- refused with the one fix that clears it, a new file, never a restored
+-- copy, which would hold the same rows; following that fix, the probe of a
+-- new `IPE_REVIEW_DB` path passes. Red if the refusal offers a remedy that
+-- cannot clear it, or states two.
+unnamedRowsRemedyClears : Task.Task Error Bool
+unnamedRowsRemedyClears =
+    do
+        base <- freshDir "ipe-review-unnamed-remedy"
+        refused <- probeAfterEdits
+                    (base ++ "/after.db")
+                    [ "DROP TRIGGER review_log_name_whole"
+                    , "INSERT INTO review_log (seq, uid, body_hash, decision, reason, reviewed_at, prev, mac) VALUES (1, 'x', 'h', 'approve', NULL, 0, 'genesis', '" ++ String.repeat 64 "e" ++ "')"
+                    , "CREATE TRIGGER review_log_name_whole BEFORE INSERT ON review_log BEGIN SELECT 1; END"
+                    ]
+        fresh <- Settings.parseReviewDb (base ++ "/fresh.db")
+        key <- testReviewKey
+        followed <- probeMessage (LibDb.probe key fresh)
+        removeReviewFiles (base ++ "/fresh.db")
+        Task.succeed
+            (probeNames "IPE_REVIEW_DB" (base ++ "/after.db") refused
+                && maybeContains "recorded before unit names were kept" refused
+                && Maybe.map (String.endsWith "; fix: point IPE_REVIEW_DB at a new file to start a fresh log") refused == Just True
+                && List.length (String.split "fix:" (Maybe.withDefault "" refused)) == 2
+                && not (maybeContains "restore" refused)
+                && followed == Nothing
             )
 
 
@@ -1714,6 +1790,8 @@ reviewLogChecks =
         , check "a different key is refused at startup" wrongKeyRefusesStartup
         , check "a different key cannot append" (onFreshReview "ipe-review-wrongKeyCannotAppend" wrongKeyCannotAppend)
         , check "a head with no key check is bound only on proof" legacyHeadAdoptsOnlyOnProof
+        , check "the key-mismatch refusal names the review file on one line" keyMismatchNamesFile
+        , check "a log with unnamed rows is refused with the one fix that clears it" unnamedRowsRemedyClears
         , check "a genesis head with no key check is bound" legacyGenesisAdopts
         , check "the head compare-and-set covers the key check" (onFreshReview "ipe-review-headCasPinsKeyCheck" headCasPinsKeyCheck)
         , check "the key-mismatch messages carry no key material" keyCheckMismatchMessageIsSecretFree

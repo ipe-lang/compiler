@@ -6,18 +6,20 @@ import Ipe.Db.Decode
 import Ipe.Error as Error
 import Ipe.List as List
 import Ipe.Maybe as Maybe
+import Ipe.Path exposing (Path)
 import Ipe.Result as Result exposing (Result(..))
 import Ipe.String as String
 import Ipe.Task as Task
 import Ipe.Time as Time
 import Ipe.Time.Timestamp as Timestamp exposing (Timestamp)
+import Lib.EnvLookup as EnvLookup exposing (StartupVar(..))
 import Lib.Failure exposing (DecideRefusal(..), ReasonRefusal(..))
 import Lib.Index as Index exposing (Attested, ChainVerdict(..), DecidedPair, LogStatus(..))
 import Lib.PageSize as PageSize exposing (PageSize)
 import Lib.ReviewKey as ReviewKey exposing (MacKey, ReviewKey(..))
 import Lib.SafeText as SafeText exposing (SafeText)
 import Lib.SetDigest as SetDigest exposing (SetDigest)
-import Lib.Settings as Settings exposing (DbRole(..), ReviewFile)
+import Lib.Settings as Settings exposing (DbRole(..), LogBreak(..), ReviewFile)
 import Lib.Uid as Uid exposing (Uid)
 import Lib.UnitName as UnitName exposing (RecordedName)
 import Migrations exposing (all)
@@ -569,15 +571,15 @@ probe key loc =
                 Task.succeed ()
 
             Signing macKey ->
-                writeTransaction db (requireKeyCheck macKey)
+                writeTransaction db (requireKeyCheck loc.path macKey)
 
 
 -- The head bound to `key`: its key check verifies, or, absent, is written
 -- once the walk proves the log under `key`. A log the walk does not prove
 -- is refused and keeps no key check, since a different key and an edited
 -- log read alike.
-requireKeyCheck : MacKey -> Db -> Task.Task Error ()
-requireKeyCheck key tx =
+requireKeyCheck : Path -> MacKey -> Db -> Task.Task Error ()
+requireKeyCheck file key tx =
     do
         head <- currentHead tx
         case Index.chainKeyCheck head of
@@ -586,7 +588,7 @@ requireKeyCheck key tx =
                     Task.succeed ()
 
                 else
-                    Task.fail keyMismatchRefusal
+                    Task.fail (keyMismatchRefusal file)
 
             Nothing ->
                 do
@@ -596,13 +598,13 @@ requireKeyCheck key tx =
                             adoptLog key tx head
 
                         Broken _ ->
-                            Task.fail keyMismatchRefusal
+                            Task.fail (keyMismatchRefusal file)
 
                         KeyMismatch ->
-                            Task.fail keyMismatchRefusal
+                            Task.fail (keyMismatchRefusal file)
 
                         Unkeyed ->
-                            Task.fail keyMismatchRefusal
+                            Task.fail (keyMismatchRefusal file)
 
 
 -- The key check written on a head that still has none and still reads as
@@ -657,11 +659,16 @@ signedBy key message macHex =
             ReviewKey.verifies key message mac
 
 
--- The refusal of a key that did not sign the review log. It names the
--- variable only, never the key nor the head's stored check.
-keyMismatchRefusal : Error
-keyMismatchRefusal =
-    Error.invalidInput ("the review log was signed by a different " ++ ReviewKey.keyVar ++ ", so this key can neither verify nor record its decisions.\n  fix: start with the key that signed it.")
+-- The refusal of a key that did not sign the review log in `file`. It names
+-- the variable and the file, never the key nor the head's stored check.
+keyMismatchRefusal : Path -> Error
+keyMismatchRefusal file =
+    EnvLookup.startupRefusal
+        { var = ReviewKeyVar
+        , file = Just file
+        , problem = "its review log was signed by a different key, so this key can neither verify nor record its decisions"
+        , fix = "start with the key that signed it"
+        }
 
 
 -- The review file opened and migrated, once it is known to hold no decision
@@ -686,7 +693,7 @@ headAt : ReviewFile -> Db -> Task.Task Error Index.ChainHead
 headAt loc db =
     headRows db
         |> Task.onError (Settings.openFailure ReviewDb loc.path)
-        |> Task.andThen (\rows -> Task.mapError (\_ -> Settings.brokenLog loc.path "its review log has no single head row") (oneHead rows))
+        |> Task.andThen (\rows -> Task.mapError (\_ -> Settings.brokenLog loc.path HeadMissing) (oneHead rows))
 
 
 -- The integrity guards of the review log, each named with the table it
@@ -728,7 +735,7 @@ requireGuards loc db =
             Task.succeed ()
 
         else
-            Task.fail (Settings.brokenLog loc.path "its review log has lost an append-only trigger, so its decisions could be rewritten unseen")
+            Task.fail (Settings.brokenLog loc.path GuardLost)
 
 
 -- A log holding a row with no subject name was recorded before names were
@@ -744,7 +751,7 @@ requireNamedRows loc db =
                 Task.succeed ()
 
             _ ->
-                Task.fail (Settings.brokenLog loc.path unnamedRowsReason)
+                Task.fail (Settings.brokenLog loc.path UnnamedRows)
 
 
 -- A log whose table predates the name columns and holds a decision is
@@ -767,13 +774,7 @@ requireNamedBeforeMigration loc db =
                             Task.succeed ()
 
                         _ ->
-                            Task.fail (Settings.brokenLog loc.path unnamedRowsReason)
-
-
--- Why a log holding rows recorded before names were kept is refused.
-unnamedRowsReason : String
-unnamedRowsReason =
-    "its review log holds decisions recorded before unit names were kept, which this reviewer cannot verify; start a fresh review database"
+                            Task.fail (Settings.brokenLog loc.path UnnamedRows)
 
 
 unnamedDecoder : Db.Decode.Decoder Bool
