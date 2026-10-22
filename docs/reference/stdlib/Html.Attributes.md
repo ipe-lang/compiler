@@ -212,7 +212,10 @@ autofocus : Bool -> Attribute msg
 ```
 
 `autofocus True` — a control with `autofocus` takes focus at load, and
-when it appears in answer to the user's own action in that tab.
+when it appears in answer to the user's own action in that tab while focus
+has not moved since. A render the tab did not cause never moves focus: after
+load the attribute never reaches the live page, so only the runtime moves
+focus.
 
 ## `tabindex`
 
