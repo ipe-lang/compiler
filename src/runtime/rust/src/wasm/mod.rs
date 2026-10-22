@@ -317,7 +317,7 @@ type WasmRouter<Model, Msg> = dyn Fn(
 ) -> Option<crate::web::route::Entered<Model, IpeCmd<Msg>>>;
 
 /// Where a queued Msg came from.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Source {
     /// A DOM event the user raised in this document.
     User,
@@ -996,24 +996,16 @@ where
         return;
     };
     let args = [detail];
-    let mut cur: Option<web_sys::Element> = ev
+    let target = ev
         .target()
         .and_then(|t| t.dyn_into::<web_sys::Element>().ok());
-    while let Some(el) = cur {
-        if let Some(ipe_id) = el.get_attribute("ipe-id") {
-            // The generated `OnWidget` closure runs the total, fail-closed seal
-            // up-decoder over `detail`; a mismatch yields `None` (clean drop).
-            if let Some(msg) = app
-                .index
-                .borrow()
-                .resolve(&ipe_id, widget::UP_WIRE_NAME, &args)
-            {
-                enqueue(app, msg, Source::Widget);
-                return;
-            }
-        }
-        cur = el.parent_element();
-    }
+    // The generated `OnWidget` closure runs the total, fail-closed seal
+    // up-decoder over `detail`; a mismatch yields `None` (clean drop).
+    dispatch(app, target, widget::UP_WIRE_NAME, |_, ipe_id| {
+        app.index
+            .borrow()
+            .resolve(ipe_id, widget::UP_WIRE_NAME, &args)
+    });
 }
 
 /// Decode + dispatch one delegated DOM event: climb from the target to the
@@ -1027,21 +1019,48 @@ where
         .target()
         .and_then(|t| t.dyn_into::<web_sys::Element>().ok());
     let args = decode_event_args(name, ev, target.as_ref());
+    dispatch(app, target, name, |el, ipe_id| {
+        if name == "submit" {
+            ev.prevent_default();
+            let fd = collect_form_data(el);
+            app.index.borrow().resolve_form(ipe_id, name, fd)
+        } else {
+            app.index.borrow().resolve(ipe_id, name, &args)
+        }
+    });
+}
 
+/// The source of a Msg a delegated listener resolved under `wire`: the
+/// user's only for a DOM event the user raises. Every other wire, a widget's
+/// up event or any name outside [`DELEGATED_EVENTS`], is not the user's act,
+/// so its render never moves focus.
+fn listener_source(wire: &str) -> Source {
+    if DELEGATED_EVENTS.contains(&wire) {
+        Source::User
+    } else {
+        Source::Widget
+    }
+}
+
+/// Climb from `target` to the nearest `ipe-id` ancestor whose handler
+/// `resolve` turns into a Msg, and queue that Msg with the source
+/// [`listener_source`] assigns `wire`.
+fn dispatch<Model, Msg>(
+    app: &Rc<App<Model, Msg>>,
+    target: Option<web_sys::Element>,
+    wire: &'static str,
+    resolve: impl Fn(&web_sys::Element, &str) -> Option<Msg>,
+) where
+    Model: Clone + 'static,
+    Msg: Clone + 'static,
+{
     let mut cur = target;
     while let Some(el) = cur {
-        if let Some(ipe_id) = el.get_attribute("ipe-id") {
-            let resolved = if name == "submit" {
-                ev.prevent_default();
-                let fd = collect_form_data(&el);
-                app.index.borrow().resolve_form(&ipe_id, name, fd)
-            } else {
-                app.index.borrow().resolve(&ipe_id, name, &args)
-            };
-            if let Some(msg) = resolved {
-                enqueue(app, msg, Source::User);
-                return;
-            }
+        if let Some(ipe_id) = el.get_attribute("ipe-id")
+            && let Some(msg) = resolve(&el, &ipe_id)
+        {
+            enqueue(app, msg, listener_source(wire));
+            return;
         }
         cur = el.parent_element();
     }
@@ -1691,6 +1710,12 @@ mod tests {
             .with(Source::User, || mark(0, 1))
             .with(Source::Widget, || mark(0, 1));
         assert!(!joined.addressed(&mark(0, 1)));
+        assert_eq!(listener_source(widget::UP_WIRE_NAME), Source::Widget);
+        assert_eq!(listener_source(widget::up_event_name()), Source::Widget);
+        assert_eq!(listener_source("focusin"), Source::Widget);
+        for name in DELEGATED_EVENTS {
+            assert_eq!(listener_source(name), Source::User, "{name}");
+        }
     }
 
     #[wasm_bindgen_test]
