@@ -2648,6 +2648,128 @@ mod zonk_sharing_tests {
 }
 
 #[cfg(test)]
+mod type_measure_tests {
+    use super::super::{
+        Budget, Content, Diagnostic, FlatType, Span, TypeError, TypeMeasures, UnionFind, VarId,
+        zonk,
+    };
+    use ipe_diagnostics::nesting::{TYPE_DEPTH_LIMIT, TYPE_SIZE_LIMIT};
+
+    /// A chain of `levels` arrows `() -> () -> … -> ()`, nested in the result.
+    fn arrow_chain(uf: &mut UnionFind<Content>, levels: usize) -> VarId {
+        let leaf = uf
+            .fresh(Content::Structure(FlatType::Unit))
+            .expect("fresh leaf must not fail");
+        let mut cur = leaf;
+        for _ in 0..levels {
+            cur = uf
+                .fresh(Content::Structure(FlatType::Fun(leaf, cur)))
+                .expect("fresh arrow must not fail");
+        }
+        cur
+    }
+
+    /// `pN = (p{N-1}, p{N-1})` over a `()` leaf: `depth + 1` distinct nodes
+    /// that unfold to `2^(depth + 1) - 1`.
+    fn doubling_chain(uf: &mut UnionFind<Content>, depth: usize) -> VarId {
+        let mut cur = uf
+            .fresh(Content::Structure(FlatType::Unit))
+            .expect("fresh leaf must not fail");
+        for _ in 0..depth {
+            cur = uf
+                .fresh(Content::Structure(FlatType::Tuple(vec![cur, cur])))
+                .expect("fresh tuple must not fail");
+        }
+        cur
+    }
+
+    /// The refusal the measure of `var` earns.
+    fn refusal_of(uf: &mut UnionFind<Content>, var: VarId) -> Option<Diagnostic> {
+        TypeMeasures::default()
+            .measure(uf, &mut Budget::unbounded(), var)
+            .expect("a solved acyclic type must measure")
+            .refusal(Span::DUMMY)
+    }
+
+    /// The ceiling's own depth is accepted; one level more is refused with the
+    /// depth it reached.
+    #[test]
+    fn measure_accepts_the_ceiling_and_refuses_one_level_more() {
+        let limit = usize::from(TYPE_DEPTH_LIMIT);
+        let mut uf = UnionFind::<Content>::new();
+        let at = arrow_chain(&mut uf, limit);
+        assert_eq!(refusal_of(&mut uf, at), None);
+        let past = arrow_chain(&mut uf, limit + 1);
+        assert_eq!(
+            refusal_of(&mut uf, past),
+            Some(Diagnostic::Type {
+                span: Span::DUMMY,
+                msg: TypeError::TypeTooDeep {
+                    depth: TYPE_DEPTH_LIMIT + 1,
+                    limit: TYPE_DEPTH_LIMIT,
+                },
+            })
+        );
+    }
+
+    /// A shared sub-type is measured once: the walk visits each tuple's two
+    /// slots, and the second visit is a memo hit, never a re-walk.
+    #[test]
+    fn measure_walks_a_shared_dag_once() {
+        let mut uf = UnionFind::<Content>::new();
+        let root = doubling_chain(&mut uf, 14);
+        let mut budget = Budget::unbounded();
+        let measure = TypeMeasures::default()
+            .measure(&mut uf, &mut budget, root)
+            .expect("a shared DAG must measure");
+        assert_eq!(measure.depth, 14);
+        assert_eq!(measure.size, (1 << 15) - 1);
+        assert_eq!(budget.spent(), 2 * 14 + 1, "one visit per slot");
+    }
+
+    /// A chain far past the ceiling is measured on the default test thread's
+    /// stack (the walk is iterative), its depth saturating, never overflowing.
+    #[test]
+    fn measure_of_a_hundred_thousand_levels_needs_no_stack() {
+        let mut uf = UnionFind::<Content>::new();
+        let root = arrow_chain(&mut uf, 100_000);
+        assert_eq!(
+            refusal_of(&mut uf, root),
+            Some(Diagnostic::Type {
+                span: Span::DUMMY,
+                msg: TypeError::TypeTooDeep {
+                    depth: u16::MAX,
+                    limit: TYPE_DEPTH_LIMIT,
+                },
+            })
+        );
+    }
+
+    /// A shallow type that unfolds past the size ceiling is refused by the
+    /// measure, and its read-back, which clones each reused subtree, refuses it
+    /// too; one doubling less fits both.
+    #[test]
+    fn a_doubling_type_past_the_size_ceiling_is_refused() {
+        let too_large = Diagnostic::Type {
+            span: Span::DUMMY,
+            msg: TypeError::TypeTooLarge {
+                limit: TYPE_SIZE_LIMIT,
+            },
+        };
+        let mut uf = UnionFind::<Content>::new();
+        let fits = doubling_chain(&mut uf, 15);
+        assert_eq!(refusal_of(&mut uf, fits), None);
+        assert!(zonk(&mut uf, &mut Budget::unbounded(), fits).is_ok());
+        let past = doubling_chain(&mut uf, 16);
+        assert_eq!(refusal_of(&mut uf, past), Some(too_large.clone()));
+        assert_eq!(
+            zonk(&mut uf, &mut Budget::unbounded(), past),
+            Err(too_large)
+        );
+    }
+}
+
+#[cfg(test)]
 mod zonk_row_tail_tests {
     use super::super::{
         BTreeMap, Budget, Builder, Content, Diagnostic, FlatType, RowTail, Ty, TyBounds, TypeError,

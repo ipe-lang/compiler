@@ -851,6 +851,8 @@ messages! {
     cli_cache_home_unknown = "cli-cache-home-unknown";
     /// A directory environment variable is set to a relative path.
     cli_env_dir_not_absolute(var) = "cli-env-dir-not-absolute";
+    /// The registry URL environment variable is set to a value that is not an `https://` base URL.
+    cli_registry_url_not_https(var, reason) = "cli-registry-url-not-https";
     /// `$IPE_RUNTIME_DIR` does not name a runtime crate root.
     cli_runtime_dir_invalid(path) = "cli-runtime-dir-invalid";
     /// The invalid runtime dir looks like the inner module directory.

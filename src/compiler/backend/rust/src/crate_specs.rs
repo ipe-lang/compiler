@@ -1,4 +1,5 @@
-//! Single source of truth for the crate VERSIONS the Rust codegen emits.
+//! Single source of truth for the crate versions, and the fixed feature sets,
+//! the Rust codegen emits.
 //!
 //! The default native emit is the dependency model: third-party versions live
 //! in the runtime crate's own `runtime/rust/Cargo.toml`, and the emitted native
@@ -7,36 +8,96 @@
 //! fallback and the WASM template surgeries emit, so they must not drift from
 //! the runtime crate's manifest.
 //!
-//! Feature lists + `optional` flags stay inline in `project.rs` (they depend on
-//! usage). Only the version SPEC lives here. The `crate_specs_match_manifests`
-//! test below is the drift tripwire: it pins every spec against
-//! `runtime/rust/Cargo.toml` and, for any crate the golden base manifest still
-//! declares, against `tests/golden/basics/Cargo.toml` (empty under the
-//! dependency model, so that arm is inert until the vendored/WASM surface
-//! reintroduces one).
+//! A [`CrateSpec`] fixes a version only; the emitter composes that crate's
+//! features per program. A [`PinnedCrate`] also fixes `default-features` and the
+//! exact feature set, and renders its whole dependency line, so a manifest can
+//! only spell the set the runtime is built and audited with (a TLS or root-store
+//! feature arm is part of that set). The `crate_specs_match_manifests` test
+//! below is the drift tripwire: it pins every version against
+//! `runtime/rust/Cargo.toml`, every pinned feature set against the runtime line
+//! in both directions, and, for any crate the golden base manifest still
+//! declares, the version against `tests/golden/basics/Cargo.toml`.
 
-/// One authoritative crate version. Feature lists + `optional` flags stay in the
-/// emitter (`project.rs`); only the version SPEC lives here.
+/// One authoritative crate version. The emitter composes this crate's features.
+#[derive(Clone, Copy, Debug)]
 pub struct CrateSpec {
     pub name: &'static str,
     pub version: &'static str,
+}
+
+/// A crate whose version, `default-features` and exact feature set are all
+/// fixed here: every manifest that names it spells this line.
+#[derive(Clone, Copy, Debug)]
+pub struct PinnedCrate {
+    pub spec: CrateSpec,
+    /// Whether the crate's default features stay on.
+    pub default_features: bool,
+    /// The exact features enabled on top of the defaults (or of none).
+    pub features: &'static [&'static str],
+}
+
+impl PinnedCrate {
+    /// The `name = ...` dependency line, enabling `features` followed by
+    /// `extra` (program-specific additions the caller owns, such as the
+    /// database drivers).
+    #[must_use]
+    pub fn dependency_line(&self, extra: &[&str]) -> String {
+        let mut list = String::new();
+        for (at, feature) in self.features.iter().chain(extra).enumerate() {
+            if at > 0 {
+                list.push_str(", ");
+            }
+            list.push('"');
+            list.push_str(feature);
+            list.push('"');
+        }
+        let name = self.spec.name;
+        let version = self.spec.version;
+        match (self.default_features, list.is_empty()) {
+            (true, true) => format!("{name} = \"{version}\""),
+            (true, false) => format!("{name} = {{ version = \"{version}\", features = [{list}] }}"),
+            (false, _) => format!(
+                "{name} = {{ version = \"{version}\", default-features = false, features = [{list}] }}"
+            ),
+        }
+    }
 }
 
 pub const TOKIO: CrateSpec = CrateSpec {
     name: "tokio",
     version: "1",
 };
-pub const SQLX: CrateSpec = CrateSpec {
-    name: "sqlx",
-    version: "0.8",
+/// `sqlx` with defaults off (no `any`, `macros` or `migrate`), on tokio, with
+/// TLS through rustls on `ring` trusting `webpki-roots` 1.x.
+pub const SQLX: PinnedCrate = PinnedCrate {
+    spec: CrateSpec {
+        name: "sqlx",
+        version: "0.9",
+    },
+    default_features: false,
+    features: &["runtime-tokio", "tls-rustls-ring-webpki", "json"],
 };
-pub const AXUM: CrateSpec = CrateSpec {
-    name: "axum",
-    version: "0.7",
+/// The database drivers every database program links, after [`SQLX`]'s features.
+///
+/// `sqlite-bundled` rather than `sqlite`, which also enables deserialize,
+/// load-extension and unlock-notify. Mirrors the `sqlx?/` entries of the
+/// runtime's `db` feature.
+pub const SQLX_DRIVERS: &[&str] = &["sqlite-bundled", "postgres"];
+pub const AXUM: PinnedCrate = PinnedCrate {
+    spec: CrateSpec {
+        name: "axum",
+        version: "0.7",
+    },
+    default_features: true,
+    features: &["ws"],
 };
-pub const TOWER_HTTP: CrateSpec = CrateSpec {
-    name: "tower-http",
-    version: "0.5",
+pub const TOWER_HTTP: PinnedCrate = PinnedCrate {
+    spec: CrateSpec {
+        name: "tower-http",
+        version: "0.5",
+    },
+    default_features: true,
+    features: &["fs", "catch-panic", "timeout"],
 };
 // `tower` (the `limit` layer) backs the server front-door DoS ceiling:
 // `GlobalConcurrencyLimitLayer` bounds in-flight requests. The vendored server
@@ -75,13 +136,56 @@ pub const TAO: CrateSpec = CrateSpec {
     name: "tao",
     version: "0.35",
 };
-pub const TOKIO_TUNGSTENITE: CrateSpec = CrateSpec {
-    name: "tokio-tungstenite",
-    version: "0.24",
+/// The `WebSocket` handshake only: the runtime owns the `wss://` TLS through
+/// [`TOKIO_RUSTLS`], so tungstenite carries no TLS or root-store feature.
+pub const TOKIO_TUNGSTENITE: PinnedCrate = PinnedCrate {
+    spec: CrateSpec {
+        name: "tokio-tungstenite",
+        version: "0.30",
+    },
+    default_features: false,
+    features: &["handshake"],
 };
-pub const LETTRE: CrateSpec = CrateSpec {
-    name: "lettre",
-    version: "0.11",
+pub const TOKIO_RUSTLS: PinnedCrate = PinnedCrate {
+    spec: CrateSpec {
+        name: "tokio-rustls",
+        version: "0.26",
+    },
+    default_features: false,
+    features: &["ring", "tls12", "logging"],
+};
+pub const RUSTLS: PinnedCrate = PinnedCrate {
+    spec: CrateSpec {
+        name: "rustls",
+        version: "0.23",
+    },
+    default_features: false,
+    features: &["ring", "std", "tls12"],
+};
+/// The one root store a runtime TLS client trusts.
+pub const WEBPKI_ROOTS: PinnedCrate = PinnedCrate {
+    spec: CrateSpec {
+        name: "webpki-roots",
+        version: "1",
+    },
+    default_features: true,
+    features: &[],
+};
+/// SMTP over rustls trusting `webpki-roots`, never the OS store.
+pub const LETTRE: PinnedCrate = PinnedCrate {
+    spec: CrateSpec {
+        name: "lettre",
+        version: "0.11",
+    },
+    default_features: false,
+    features: &[
+        "builder",
+        "hostname",
+        "smtp-transport",
+        "pool",
+        "tokio1",
+        "tokio1-rustls-tls",
+    ],
 };
 // `icu_casemap` and `icu_locale_core`: locale-aware case mapping behind the
 // `locale` cargo feature. The dep-model runtime pulls them transitively via
@@ -94,23 +198,31 @@ pub const ICU_LOCALE_CORE: CrateSpec = CrateSpec {
     name: "icu_locale_core",
     version: "2.2",
 };
-pub const REQWEST: CrateSpec = CrateSpec {
-    name: "reqwest",
-    version: "0.12",
+/// Defaults off, so no `default-tls` (native-tls); `rustls-tls` trusts
+/// `webpki-roots`.
+pub const REQWEST: PinnedCrate = PinnedCrate {
+    spec: CrateSpec {
+        name: "reqwest",
+        version: "0.12",
+    },
+    default_features: false,
+    features: &["rustls-tls", "gzip", "stream"],
 };
 pub const TOML: CrateSpec = CrateSpec {
     name: "toml",
     version: "0.8",
 };
-pub const SERDE_SAPHYR: CrateSpec = CrateSpec {
-    name: "serde-saphyr",
-    version: "1.3",
+/// The YAML parser, defaults off. `include` (file inclusion) and `properties`
+/// (environment interpolation) widen what a config source can reach, so
+/// neither is ever enabled.
+pub const SERDE_SAPHYR: PinnedCrate = PinnedCrate {
+    spec: CrateSpec {
+        name: "serde-saphyr",
+        version: "1.3",
+    },
+    default_features: false,
+    features: &["deserialize"],
 };
-/// The exact `serde-saphyr` feature set every manifest enables, defaults off.
-///
-/// `include` (file inclusion) and `properties` (environment interpolation)
-/// widen what a config source can reach, so neither is ever enabled.
-pub const SERDE_SAPHYR_FEATURES: &[&str] = &["deserialize"];
 pub const FLATE2: CrateSpec = CrateSpec {
     name: "flate2",
     version: "1",
@@ -151,9 +263,13 @@ pub const URL: CrateSpec = CrateSpec {
     name: "url",
     version: "2",
 };
-pub const RSA: CrateSpec = CrateSpec {
-    name: "rsa",
-    version: "0.9",
+pub const RSA: PinnedCrate = PinnedCrate {
+    spec: CrateSpec {
+        name: "rsa",
+        version: "0.9",
+    },
+    default_features: true,
+    features: &["sha2"],
 };
 pub const FUTURES_UTIL: CrateSpec = CrateSpec {
     name: "futures-util",
@@ -195,9 +311,9 @@ pub const UNICODE_GENERAL_CATEGORY: CrateSpec = CrateSpec {
 #[cfg(test)]
 pub const ALL: &[CrateSpec] = &[
     TOKIO,
-    SQLX,
-    AXUM,
-    TOWER_HTTP,
+    SQLX.spec,
+    AXUM.spec,
+    TOWER_HTTP.spec,
     TOWER,
     ASYNC_TRAIT,
     RUSTIX,
@@ -205,13 +321,16 @@ pub const ALL: &[CrateSpec] = &[
     UNICODE_WIDTH,
     WRY,
     TAO,
-    TOKIO_TUNGSTENITE,
-    LETTRE,
+    TOKIO_TUNGSTENITE.spec,
+    TOKIO_RUSTLS.spec,
+    RUSTLS.spec,
+    WEBPKI_ROOTS.spec,
+    LETTRE.spec,
     ICU_CASEMAP,
     ICU_LOCALE_CORE,
-    REQWEST,
+    REQWEST.spec,
     TOML,
-    SERDE_SAPHYR,
+    SERDE_SAPHYR.spec,
     FLATE2,
     ZSTD,
     CSV,
@@ -222,7 +341,7 @@ pub const ALL: &[CrateSpec] = &[
     PBKDF2,
     JSONWEBTOKEN,
     URL,
-    RSA,
+    RSA.spec,
     FUTURES_UTIL,
     CHRONO,
     CHRONO_TZ,
@@ -230,13 +349,34 @@ pub const ALL: &[CrateSpec] = &[
     UNICODE_GENERAL_CATEGORY,
 ];
 
+/// Every crate whose feature set is fixed here.
+///
+/// The manifest tripwires in this crate and in the `ipe` CLI tests walk it.
+pub const ALL_PINNED: &[PinnedCrate] = &[
+    SQLX,
+    TOKIO_TUNGSTENITE,
+    TOKIO_RUSTLS,
+    RUSTLS,
+    WEBPKI_ROOTS,
+    SERDE_SAPHYR,
+    REQWEST,
+    LETTRE,
+    AXUM,
+    TOWER_HTTP,
+    RSA,
+];
+
 #[cfg(test)]
 mod tests {
-    use super::{ALL, SERDE_SAPHYR, SERDE_SAPHYR_FEATURES};
-    use std::collections::BTreeMap;
+    use super::{
+        ALL, ALL_PINNED, LETTRE, PinnedCrate, REQWEST, SERDE_SAPHYR, SQLX, SQLX_DRIVERS,
+        WEBPKI_ROOTS,
+    };
+    use std::collections::{BTreeMap, BTreeSet};
     use std::path::PathBuf;
 
-    /// The table is non-empty and every entry has a non-empty name + version.
+    /// The table is non-empty, every entry has a non-empty name + version, and
+    /// every pinned crate is also walked by the version check.
     #[test]
     fn table_is_well_formed() {
         assert!(!ALL.is_empty(), "crate spec table must not be empty");
@@ -244,7 +384,14 @@ mod tests {
             assert!(!spec.name.is_empty(), "empty crate name in ALL");
             assert!(!spec.version.is_empty(), "empty version for {}", spec.name);
         }
-        assert_eq!(ALL.len(), 34, "expected 34 surgery-emitted crate specs");
+        assert_eq!(ALL.len(), 37, "expected 37 surgery-emitted crate specs");
+        for pinned in ALL_PINNED {
+            assert!(
+                ALL.iter().any(|spec| spec.name == pinned.spec.name),
+                "{} is pinned but absent from ALL",
+                pinned.spec.name
+            );
+        }
     }
 
     /// Extract the version from a Cargo dependency value: `"0.4"` or
@@ -301,13 +448,13 @@ mod tests {
         out
     }
 
-    /// The SSOT versions MUST match `runtime/Cargo.toml` for every crate (the
-    /// generated project vendors that runtime and must compile against the
-    /// versions it was tested with), and the golden base manifest for every
-    /// SSOT crate it declares (tokio). Bump a version in ONE place and this
-    /// fails until the others are updated — the invalid "manifest requests a
-    /// version the runtime was not built against" state is unrepresentable
-    /// without going red here.
+    /// The SSOT MUST match `runtime/Cargo.toml` for every crate (the generated
+    /// project vendors that runtime and must compile against the versions and
+    /// features it was tested with), and the golden base manifest for every
+    /// SSOT crate it declares. Every pinned feature set is compared in both
+    /// directions, and so are the database drivers against the runtime's `db`
+    /// feature. Bump a version or a feature in ONE place and this fails until
+    /// the others are updated.
     #[test]
     fn crate_specs_match_manifests() {
         let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
@@ -345,30 +492,40 @@ mod tests {
                 ));
             }
         }
+        for pinned in ALL_PINNED {
+            problems.extend(pin_drift(pinned, &runtime_txt, "runtime/Cargo.toml"));
+        }
+        problems.extend(driver_drift(&runtime_txt, "runtime/Cargo.toml"));
         let jail_path = manifest.join(
             "../../../../examples/wasm/language-playground/jail-runner/src/crate_template/Cargo.toml",
         );
         let jail_txt = std::fs::read_to_string(&jail_path)
             .expect("crate_specs drift guard: cannot read the jail-runner crate template");
-        for (origin, text) in [
-            ("runtime/Cargo.toml", runtime_txt.as_str()),
-            ("jail-runner crate template", jail_txt.as_str()),
-        ] {
-            problems.extend(yaml_parser_pin_drift(text, origin));
+        // The jail template must carry the YAML parser; any other pinned crate
+        // it names must carry its pinned line too.
+        for pinned in ALL_PINNED {
+            if pinned.spec.name == SERDE_SAPHYR.spec.name
+                || dep_line(&jail_txt, pinned.spec.name).is_some()
+            {
+                problems.extend(pin_drift(pinned, &jail_txt, "jail-runner crate template"));
+            }
         }
         assert!(
             problems.is_empty(),
-            "crate-version drift between the SSOT and the manifests:\n  {}",
+            "crate drift between the SSOT and the manifests:\n  {}",
             problems.join("\n  ")
         );
     }
 
-    /// The `serde-saphyr` dependency line of a manifest, trimmed.
-    fn yaml_parser_line(text: &str) -> Option<&str> {
-        text.lines().map(str::trim).find(|line| {
-            line.split_once('=')
-                .is_some_and(|(name, _)| name.trim() == SERDE_SAPHYR.name)
-        })
+    /// The first non-comment `name = ...` line of a manifest, trimmed.
+    fn dep_line<'a>(text: &'a str, name: &str) -> Option<&'a str> {
+        text.lines()
+            .map(str::trim)
+            .filter(|line| !line.starts_with('#'))
+            .find(|line| {
+                line.split_once('=')
+                    .is_some_and(|(key, _)| key.trim() == name)
+            })
     }
 
     /// The quoted entries of the `features = [...]` list on one dependency line.
@@ -393,47 +550,124 @@ mod tests {
         )
     }
 
-    /// Every way a manifest's `serde-saphyr` pin departs from the SSOT.
-    ///
-    /// The version, `default-features = false`, and exactly
-    /// `SERDE_SAPHYR_FEATURES` — so `include` / `properties` can never be
-    /// switched on in one manifest alone.
-    fn yaml_parser_pin_drift(text: &str, origin: &str) -> Vec<String> {
-        let name = SERDE_SAPHYR.name;
-        let Some(line) = yaml_parser_line(text) else {
+    /// Every way a manifest's line for `pinned` departs from the SSOT: the
+    /// version, `default-features`, and the feature set in both directions (a
+    /// feature the SSOT names but the line lacks, and one the line enables but
+    /// the SSOT does not).
+    fn pin_drift(pinned: &PinnedCrate, text: &str, origin: &str) -> Vec<String> {
+        let name = pinned.spec.name;
+        let Some(line) = dep_line(text, name) else {
             return vec![format!("{name}: absent from {origin}")];
         };
         let mut problems = Vec::new();
         if version_of(line.split_once('=').map_or("", |(_, value)| value)).as_deref()
-            != Some(SERDE_SAPHYR.version)
+            != Some(pinned.spec.version)
         {
             problems.push(format!(
                 "{name}: SSOT = {}, {origin} = `{line}`",
-                SERDE_SAPHYR.version
+                pinned.spec.version
             ));
         }
-        if !line.contains("default-features = false") {
+        let defaults_off = line.contains("default-features = false");
+        if pinned.default_features == defaults_off {
             problems.push(format!(
-                "{name}: {origin} must set `default-features = false`"
+                "{name}: SSOT default features {}, {origin} = `{line}`",
+                if pinned.default_features { "on" } else { "off" }
             ));
         }
-        if features_of(line).as_deref() != Some(SERDE_SAPHYR_FEATURES) {
+        let want: BTreeSet<&str> = pinned.features.iter().copied().collect();
+        let got: BTreeSet<&str> = features_of(line).unwrap_or_default().into_iter().collect();
+        for missing in want.difference(&got) {
             problems.push(format!(
-                "{name}: {origin} features must be exactly {SERDE_SAPHYR_FEATURES:?}, got `{line}`"
+                "{name}: SSOT feature `{missing}` absent from {origin}"
+            ));
+        }
+        for extra in got.difference(&want) {
+            problems.push(format!(
+                "{name}: {origin} enables `{extra}`, which the SSOT does not"
             ));
         }
         problems
     }
 
-    /// A pin that turns on `include`, keeps default features, or moves the
-    /// version is drift; the exact pin is not.
+    /// The `sqlx?/` entries of the `[features]` table's `db` feature.
+    fn sqlx_drivers_of(text: &str) -> Option<BTreeSet<&str>> {
+        let mut in_features = false;
+        for raw in text.lines() {
+            let line = raw.trim();
+            if line.starts_with('[') {
+                in_features = line == "[features]";
+                continue;
+            }
+            if !in_features {
+                continue;
+            }
+            let Some((key, value)) = line.split_once('=') else {
+                continue;
+            };
+            if key.trim() != "db" {
+                continue;
+            }
+            let list = value.trim().strip_prefix('[')?;
+            let list = list.get(..list.find(']')?)?;
+            return Some(
+                list.split(',')
+                    .map(|entry| entry.trim().trim_matches('"'))
+                    .filter_map(|entry| entry.strip_prefix("sqlx?/"))
+                    .collect(),
+            );
+        }
+        None
+    }
+
+    /// Every way the `db` feature's `sqlx?/` drivers depart from
+    /// [`SQLX_DRIVERS`], in both directions.
+    fn driver_drift(text: &str, origin: &str) -> Vec<String> {
+        let Some(got) = sqlx_drivers_of(text) else {
+            return vec![format!("db feature: absent from {origin}")];
+        };
+        let want: BTreeSet<&str> = SQLX_DRIVERS.iter().copied().collect();
+        let mut problems = Vec::new();
+        for missing in want.difference(&got) {
+            problems.push(format!(
+                "db feature: SSOT driver `sqlx?/{missing}` absent from {origin}"
+            ));
+        }
+        for extra in got.difference(&want) {
+            problems.push(format!(
+                "db feature: {origin} enables `sqlx?/{extra}`, which the SSOT does not"
+            ));
+        }
+        problems
+    }
+
+    /// The rendered line of every pinned crate passes its own drift check, and
+    /// the database line spells the drivers after the pinned set.
     #[test]
-    fn yaml_parser_pin_drift_is_caught() {
+    fn rendered_lines_are_the_pinned_lines() {
+        for pinned in ALL_PINNED {
+            let line = pinned.dependency_line(&[]);
+            assert!(
+                pin_drift(pinned, &line, "rendered").is_empty(),
+                "`{line}` must pass its own drift check"
+            );
+        }
+        assert_eq!(
+            SQLX.dependency_line(SQLX_DRIVERS),
+            r#"sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "tls-rustls-ring-webpki", "json", "sqlite-bundled", "postgres"] }"#
+        );
+        assert_eq!(WEBPKI_ROOTS.dependency_line(&[]), r#"webpki-roots = "1""#);
+    }
+
+    /// A pin that adds or drops a feature, keeps default features on, or moves
+    /// the version is drift; the exact pin, in any key order, is not.
+    #[test]
+    fn pin_drift_is_caught() {
         let exact = r#"serde-saphyr = { version = "1.3", default-features = false, features = ["deserialize"] }"#;
-        assert!(yaml_parser_pin_drift(exact, "fixture").is_empty());
+        assert!(pin_drift(&SERDE_SAPHYR, exact, "fixture").is_empty());
         assert_eq!(features_of(exact), Some(vec!["deserialize"]));
         let reordered = r#"serde-saphyr = { version = "1.3", features = ["deserialize"], default-features = false }"#;
-        assert!(yaml_parser_pin_drift(reordered, "fixture").is_empty());
+        assert!(pin_drift(&SERDE_SAPHYR, reordered, "fixture").is_empty());
         for drifted in [
             r#"serde-saphyr = { version = "1.3", default-features = false, features = ["deserialize", "include"] }"#,
             r#"serde-saphyr = { version = "1.3", features = ["deserialize"] }"#,
@@ -442,7 +676,74 @@ mod tests {
             "toml = \"0.8\"",
         ] {
             assert!(
-                !yaml_parser_pin_drift(drifted, "fixture").is_empty(),
+                !pin_drift(&SERDE_SAPHYR, drifted, "fixture").is_empty(),
+                "{drifted} must be reported as drift"
+            );
+        }
+
+        let sqlx = r#"sqlx = { version = "0.9", default-features = false, features = ["json", "runtime-tokio", "tls-rustls-ring-webpki"], optional = true }"#;
+        assert!(pin_drift(&SQLX, sqlx, "fixture").is_empty());
+        for drifted in [
+            r#"sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "tls-rustls-ring-webpki", "json", "macros"] }"#,
+            r#"sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "tls-rustls-ring-webpki"] }"#,
+            r#"sqlx = { version = "0.9", features = ["runtime-tokio", "tls-rustls-ring-webpki", "json"] }"#,
+            r#"sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "tls-rustls-ring-webpki", "json"] }"#,
+            r#"sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio-rustls", "json"] }"#,
+        ] {
+            assert!(
+                !pin_drift(&SQLX, drifted, "fixture").is_empty(),
+                "{drifted} must be reported as drift"
+            );
+        }
+    }
+
+    /// The HTTP and SMTP client lines are drift-checked.
+    ///
+    /// Each refuses an OS root store or native-tls feature, and its TLS
+    /// defaults turned on; every fixture derives from the pinned line itself.
+    #[test]
+    fn tls_client_pin_drift_is_caught() {
+        for pinned in [REQWEST, LETTRE] {
+            let name = pinned.spec.name;
+            assert!(
+                ALL_PINNED.iter().any(|entry| entry.spec.name == name),
+                "{name} must be in the drift-checked set"
+            );
+            let exact = pinned.dependency_line(&[]);
+            assert!(pin_drift(&pinned, &exact, "fixture").is_empty(), "{exact}");
+            for widening in [
+                "rustls-platform-verifier",
+                "rustls-native-certs",
+                "native-tls",
+            ] {
+                let widened = pinned.dependency_line(&[widening]);
+                assert!(
+                    !pin_drift(&pinned, &widened, "fixture").is_empty(),
+                    "{widened} must be reported as drift"
+                );
+            }
+            let defaults_on = exact.replace("default-features = false, ", "");
+            assert_ne!(defaults_on, exact, "{name} must pin its defaults off");
+            assert!(
+                !pin_drift(&pinned, &defaults_on, "fixture").is_empty(),
+                "{defaults_on} must be reported as drift"
+            );
+        }
+    }
+
+    /// The `db` feature must enable exactly the SSOT drivers.
+    #[test]
+    fn driver_drift_is_caught() {
+        let exact = "[features]\ndb = [\"sqlx\", \"sqlx?/sqlite-bundled\", \"sqlx?/postgres\", \"tokio\"]\n";
+        assert!(driver_drift(exact, "fixture").is_empty());
+        for drifted in [
+            "[features]\ndb = [\"sqlx\", \"sqlx?/sqlite\", \"sqlx?/postgres\"]\n",
+            "[features]\ndb = [\"sqlx\", \"sqlx?/sqlite-bundled\"]\n",
+            "[features]\ndb = [\"sqlx\", \"sqlx?/sqlite-bundled\", \"sqlx?/postgres\", \"sqlx?/mysql\"]\n",
+            "[dependencies]\ndb = [\"sqlx?/sqlite-bundled\", \"sqlx?/postgres\"]\n",
+        ] {
+            assert!(
+                !driver_drift(drifted, "fixture").is_empty(),
                 "{drifted} must be reported as drift"
             );
         }

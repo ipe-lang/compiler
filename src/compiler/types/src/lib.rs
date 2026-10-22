@@ -58,7 +58,8 @@ pub use ty::{
 
 use constrain::{
     Builder, FieldAccess, RecordUpdate, RouteWitnessCheck, RoutedWebCheck, SchemeApp, SuperVar,
-    promote_untyped_boundaries, reify_scheme, zonk, zonk_emitted,
+    measure_type_depth, promote_untyped_boundaries, reify_scheme, zonk, zonk_emitted,
+    zonk_reported,
 };
 use solve::solve_attributed;
 use ty::{Content, FlatType};
@@ -837,6 +838,11 @@ fn infer_core(
     // sound for that use. The map consumed by downstream tooling (`SolvedTypes`)
     // is built separately AFTER defaulting, so emit still sees fully-defaulted
     // region types. Iterated by reference to leave `generated.regions` intact.
+    //
+    // Every solved type is measured first: a type past the depth or size
+    // ceiling is refused at the span that built it, so no read-back below, no
+    // downstream walker and no rustc build meets it.
+    measure_type_depth(&mut uf, budget, &generated)?;
     let mut regions_for_exhaust: BTreeMap<(Vec<Symbol>, Span), Ty> = BTreeMap::new();
     for ((home, span), var) in &generated.regions {
         regions_for_exhaust.insert((home.clone(), *span), lift!(zonk(&mut uf, budget, *var)));
@@ -3824,7 +3830,7 @@ fn no_such_field(
             };
         }
     };
-    let record_ty = match zonk(uf, budget, record) {
+    let record_ty = match zonk_reported(uf, budget, record, span) {
         Ok(t) => t,
         Err(bug) => return bug,
     };
@@ -6916,7 +6922,7 @@ mod tests {
         // budget bounds the fixpoint's work, not only the unifications inside
         // it: the riders cost at least `riders * depth` steps over the chain
         // alone, where their own unifications cost a constant each.
-        let (depth, riders) = (64_usize, 8_usize);
+        let (depth, riders) = (32_usize, 8_usize);
         let alone = min_solver_steps(&chain_with_riders(depth, 0));
         let ridden = min_solver_steps(&chain_with_riders(depth, riders));
         assert!(

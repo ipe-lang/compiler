@@ -8,6 +8,7 @@ import Ipe.List as List
 import Ipe.Maybe as Maybe
 import Ipe.Path as Path exposing (Path)
 import Ipe.Result as Result exposing (Result(..))
+import Ipe.Set as Set
 import Ipe.String as String
 import Ipe.System as System
 import Ipe.Task as Task
@@ -455,11 +456,13 @@ importFrom line =
 
 
 -- A module of `src` as the scans read it, split and lexed once: its text,
--- its imports, its conversion sites, whether a line imports `Ipe.Error`,
--- and its declarations. A scan reads the index, never the text; a changed
--- text is a new index.
+-- its imports, its conversion sites, its uid-text sites, its reads that
+-- carry no bound, whether a line imports `Ipe.Error`, and its
+-- declarations. A scan reads the index, never the text; a changed text is
+-- a new index, so a scan of a changed tree reads every other module's
+-- index as it stands.
 type alias ScanModule =
-    { rel : String, text : String, imports : List Import, sites : List String, importsError : Bool, decls : List Decl }
+    { rel : String, text : String, imports : List Import, sites : List String, uidSites : List String, reads : List ( String, Bool ), importsError : Bool, decls : List Decl }
 
 
 indexModule : ( String, String ) -> ScanModule
@@ -477,6 +480,8 @@ indexModule source =
             , text = text
             , imports = imports
             , sites = conversionSitesOf rel imports lines
+            , uidSites = uidTextSitesOf rel imports lines
+            , reads = unboundedReadsOf rel lines
             , importsError = List.any (String.startsWith "import Ipe.Error") lines
             , decls = declsOf lines
             }
@@ -758,9 +763,9 @@ admittedUidTexts =
 
 -- Each `Uid.toString` token of a module, keyed `rel:name` by the last
 -- column-0 lowercase line above it.
-uidTextSitesIn : ScanModule -> List String
-uidTextSitesIn scanned =
-    (List.foldl (uidTextStep (uidTextNames scanned.imports) scanned.rel) { name = "", sites = [] } (String.lines scanned.text)).sites
+uidTextSitesOf : String -> List Import -> List String -> List String
+uidTextSitesOf rel imports lines =
+    (List.foldl (uidTextStep (uidTextNames imports) rel) { name = "", sites = [] } lines).sites
 
 
 uidTextStep : List String -> String -> String -> SiteScan -> SiteScan
@@ -785,7 +790,7 @@ uidTextViolations : List String -> List ScanModule -> List String
 uidTextViolations admitted modules =
     let
         found =
-            List.unique (List.concatMap uidTextSitesIn (List.filter (\scanned -> String.startsWith "Lib/" scanned.rel && scanned.rel /= "Lib/Uid.ipe") modules))
+            List.unique (List.concatMap (\scanned -> scanned.uidSites) (List.filter (\scanned -> String.startsWith "Lib/" scanned.rel && scanned.rel /= "Lib/Uid.ipe") modules))
     in
     List.map (\site -> "a uid becomes text at " ++ site ++ ", which is not admitted") (List.filter (\site -> not (List.member site admitted)) found)
         ++ List.map (\site -> "the admitted site " ++ site ++ " holds no uid text") (List.filter (\site -> not (List.member site found)) admitted)
@@ -796,23 +801,18 @@ uidTextViolations admitted modules =
 -- bare, an admitted site removed from the source. A token that only
 -- contains the name is no site. Red if a page can draw a uid in a unit's
 -- place, or the scan stops seeing it.
-uidTextScanRefuses : Task.Task Error Bool
-uidTextScanRefuses =
-    srcSources
-        |> Task.map (List.map indexModule)
-        |> Task.map
-            (\sources ->
-                List.isEmpty (uidTextViolations admittedUidTexts sources)
-                    && uidCaught (appendTo "Lib/View.ipe" "heading uid =\n    Uid.toString uid" sources)
-                    && uidCaught (appendTo "Lib/Queue.ipe" "labelOf uid =\n    Lib.Uid.toString uid" sources)
-                    && uidCaught (prependTo "Lib/Queue.ipe" "import Lib.Uid as U" (appendTo "Lib/Queue.ipe" "labelOf uid =\n    U.toString uid" sources))
-                    && uidCaught (prependTo "Lib/Queue.ipe" "import Lib.Uid exposing (toString)" (appendTo "Lib/Queue.ipe" "labelOf uid =\n    toString uid" sources))
-                    && uidCaught (appendTo "Lib/UnitName.ipe" "shown name =\n    Uid.toString (uid name)" sources)
-                    && uidCaught (appendTo "Lib/Db.ipe" "legacyKey uid =\n    Uid.toString uid" sources)
-                    && uidCaught (List.filter (\scanned -> scanned.rel /= "Lib/Links.ipe") sources)
-                    && List.isEmpty (uidTextViolations admittedUidTexts (appendTo "Lib/Queue.ipe" "labelOf uid =\n    myUid.toStringLabel uid" sources))
-                    && List.isEmpty (uidTextViolations admittedUidTexts (appendTo "Lib/Uid.ipe" "shown uid =\n    Uid.toString uid" sources))
-            )
+uidTextScanRefuses : List ScanModule -> Bool
+uidTextScanRefuses sources =
+    List.isEmpty (uidTextViolations admittedUidTexts sources)
+        && uidCaught (appendTo "Lib/View.ipe" "heading uid =\n    Uid.toString uid" sources)
+        && uidCaught (appendTo "Lib/Queue.ipe" "labelOf uid =\n    Lib.Uid.toString uid" sources)
+        && uidCaught (prependTo "Lib/Queue.ipe" "import Lib.Uid as U" (appendTo "Lib/Queue.ipe" "labelOf uid =\n    U.toString uid" sources))
+        && uidCaught (prependTo "Lib/Queue.ipe" "import Lib.Uid exposing (toString)" (appendTo "Lib/Queue.ipe" "labelOf uid =\n    toString uid" sources))
+        && uidCaught (appendTo "Lib/UnitName.ipe" "shown name =\n    Uid.toString (uid name)" sources)
+        && uidCaught (appendTo "Lib/Db.ipe" "legacyKey uid =\n    Uid.toString uid" sources)
+        && uidCaught (List.filter (\scanned -> scanned.rel /= "Lib/Links.ipe") sources)
+        && List.isEmpty (uidTextViolations admittedUidTexts (appendTo "Lib/Queue.ipe" "labelOf uid =\n    myUid.toStringLabel uid" sources))
+        && List.isEmpty (uidTextViolations admittedUidTexts (appendTo "Lib/Uid.ipe" "shown uid =\n    Uid.toString uid" sources))
 
 
 uidCaught : List ScanModule -> Bool
@@ -843,16 +843,20 @@ type alias TopDef =
     { name : String, lines : List String }
 
 
--- The top-level definitions of `text` in order. Consecutive column-0 lines
--- of one name, a type annotation and its definition, are one definition;
--- every other line belongs to the definition above it.
-topDefsOf : String -> List TopDef
-topDefsOf text =
-    List.reverse (List.foldl topDefStep [] (String.lines text))
+-- The top-level definitions of `lines` in order. Consecutive column-0
+-- lines of one name, a type annotation and its definition, are one
+-- definition; every other line belongs to the definition above it. One
+-- pass carries the definitions closed, the name of the open one, and its
+-- lines so far, so each line is appended once.
+topDefsOf : List String -> List TopDef
+topDefsOf lines =
+    case List.foldl topDefStep ( [], Nothing, [] ) lines of
+        ( defs, current, currentLines ) ->
+            closeTopDef defs current currentLines
 
 
-topDefStep : String -> List TopDef -> List TopDef
-topDefStep line defs =
+topDefStep : String -> ( List TopDef, Maybe String, List String ) -> ( List TopDef, Maybe String, List String )
+topDefStep line ( defs, current, currentLines ) =
     let
         code =
             codeOf line
@@ -864,26 +868,32 @@ topDefStep line defs =
             else
                 Nothing
     in
-    case defs of
-        current :: rest ->
-            case opened of
-                Just name ->
-                    if name == current.name then
-                        { current | lines = current.lines ++ [ code ] } :: rest
+    case opened of
+        Just _ ->
+            if opened == current then
+                ( defs, current, currentLines ++ [ code ] )
 
-                    else
-                        { name = name, lines = [ code ] } :: defs
+            else
+                ( closeTopDef defs current currentLines, opened, [ code ] )
 
-                Nothing ->
-                    { current | lines = current.lines ++ [ code ] } :: rest
-
-        [] ->
-            case opened of
-                Just name ->
-                    [ { name = name, lines = [ code ] } ]
+        Nothing ->
+            case current of
+                Just _ ->
+                    ( defs, current, currentLines ++ [ code ] )
 
                 Nothing ->
-                    []
+                    ( defs, current, currentLines )
+
+
+-- `defs` with the open definition, if any, closed after them.
+closeTopDef : List TopDef -> Maybe String -> List String -> List TopDef
+closeTopDef defs current currentLines =
+    case current of
+        Just name ->
+            defs ++ [ { name = name, lines = currentLines } ]
+
+        Nothing ->
+            defs
 
 
 defTokens : TopDef -> List String
@@ -1044,9 +1054,11 @@ isReadCall token =
     token == "queryDecode" || String.endsWith ".queryDecode" token || isStoreRun token
 
 
+-- Each spelling of a `Store` run holds `Store.`, so a token without it is
+-- no run and is not matched against each.
 isStoreRun : String -> Bool
 isStoreRun token =
-    List.any (\run -> token == "Store." ++ run || String.endsWith (".Store." ++ run) token) storeRuns
+    String.contains "Store." token && List.any (\run -> token == "Store." ++ run || String.endsWith (".Store." ++ run) token) storeRuns
 
 
 -- Every `Ipe.Db.Store` function that runs a query and returns its rows.
@@ -1096,22 +1108,47 @@ readReachDepth =
     3
 
 
--- The definitions in `defs` that `toks` name and `seen` does not hold,
--- followed `depth` more steps through the tokens of each.
-reachedDefs : List TopDef -> Int -> List String -> List String -> List TopDef
-reachedDefs defs depth seen toks =
+-- A definition as a read's reach sees it: its name, whether its SQL text
+-- holds a `LIMIT` outside every parenthesis, whether it names `GROUP`, and
+-- the definitions of its module it names. Each is read from the
+-- definition's lines once, however many reads reach it.
+type alias Reach =
+    { name : String, limited : Bool, grouped : Bool, names : Set String }
+
+
+reachOf : Set String -> TopDef -> Reach
+reachOf defNames def =
+    let
+        defToks =
+            defTokens def
+    in
+    { name = def.name
+    , limited = limitAtTop (literalsOf def.lines)
+    , grouped = List.member "GROUP" defToks
+    , names = Set.intersect (Set.fromList defToks) defNames
+    }
+
+
+-- The definitions in `reaches` that `frontier` names, followed `depth`
+-- more steps through the definitions each names, none `seen` before.
+-- `frontier` holds only definition names, none in `seen`.
+reachedFrom : List Reach -> Int -> Set String -> Set String -> List Reach
+reachedFrom reaches depth seen frontier =
     let
         named =
-            List.filter (\def -> List.member def.name toks && not (List.member def.name seen)) defs
+            List.filter (\reach -> Set.member reach.name frontier) reaches
 
-        found =
-            List.unique (List.map (\def -> def.name) named)
+        nextSeen =
+            Set.union seen frontier
+
+        next =
+            Set.diff (List.foldl (\reach acc -> Set.union reach.names acc) Set.empty named) nextSeen
     in
     if depth <= 0 || List.isEmpty named then
         []
 
     else
-        named ++ reachedDefs defs (depth - 1) (seen ++ found) (List.concatMap defTokens named)
+        named ++ reachedFrom reaches (depth - 1) nextSeen next
 
 
 -- A single-row aggregate read holds one of these in its seed.
@@ -1120,15 +1157,39 @@ aggregateTokens =
     [ "COUNT", "count", "EXISTS", "MIN", "MAX", "pragma_page_count" ]
 
 
--- Each read that carries no bound: its key and whether it is one aggregate
--- row.
-unboundedReadsIn : ScanModule -> List ( String, Bool )
-unboundedReadsIn scanned =
+-- Each read of module `rel` that carries no bound: its key and whether it
+-- is one aggregate row.
+unboundedReadsOf : String -> List String -> List ( String, Bool )
+unboundedReadsOf rel lines =
     let
         defs =
-            topDefsOf scanned.text
+            topDefsOf lines
 
-        judged def seed =
+        defNames =
+            Set.fromList (List.map (\def -> def.name) defs)
+
+        reaches =
+            List.map (reachOf defNames) defs
+    in
+    List.concatMap (judgedRead rel defNames reaches) (List.concatMap namedSeedsOf defs)
+
+
+-- The seed of each read `def` issues, with the definition's name.
+namedSeedsOf : TopDef -> List ( String, ReadSeed )
+namedSeedsOf def =
+    let
+        name =
+            def.name
+    in
+    List.map (\seed -> ( name, seed )) (readSeedsOf def)
+
+
+-- The read of `seed`, in the definition `name` of module `rel`, when it
+-- carries no bound.
+judgedRead : String -> Set String -> List Reach -> ( String, ReadSeed ) -> List ( String, Bool )
+judgedRead rel defNames reaches named =
+    case named of
+        ( name, seed ) ->
             let
                 seedLines =
                     seed.statement ++ seed.bindings
@@ -1137,22 +1198,20 @@ unboundedReadsIn scanned =
                     List.concatMap tokens seedLines
 
                 reached =
-                    reachedDefs defs readReachDepth [ def.name ] seedTokens
+                    reachedFrom reaches readReachDepth (Set.singleton name) (Set.remove name (Set.intersect (Set.fromList seedTokens) defNames))
 
                 bounded =
                     if List.any isStoreRun seed.calls then
                         False
 
                     else
-                        limitAtTop (literalsOf seedLines) || List.any (\named -> limitAtTop (literalsOf named.lines)) reached
+                        limitAtTop (literalsOf seedLines) || List.any (\reach -> reach.limited) reached
             in
             if bounded then
                 []
 
             else
-                [ ( scanned.rel ++ ":" ++ def.name, List.any (\token -> List.member token seedTokens) aggregateTokens && not (List.member "GROUP" (seedTokens ++ List.concatMap defTokens reached)) ) ]
-    in
-    List.concatMap (\def -> List.concatMap (judged def) (readSeedsOf def)) defs
+                [ ( rel ++ ":" ++ name, List.any (\token -> List.member token seedTokens) aggregateTokens && not (List.member "GROUP" seedTokens || List.any (\reach -> reach.grouped) reached) ) ]
 
 
 -- The reads admitted without a `LIMIT`, each a single aggregate row, by
@@ -1183,7 +1242,7 @@ readViolations : List ( String, Int ) -> List ScanModule -> List String
 readViolations admitted modules =
     let
         found =
-            List.concatMap unboundedReadsIn (List.filter (\scanned -> String.startsWith "Lib/" scanned.rel) modules)
+            List.concatMap (\scanned -> scanned.reads) (List.filter (\scanned -> String.startsWith "Lib/" scanned.rel) modules)
 
         admittedKeys =
             List.map Tuple.first admitted
@@ -1206,29 +1265,24 @@ readViolations admitted modules =
 -- counts.
 -- Red if a read can take its size from the database, or the scan stops
 -- seeing one.
-readsCarryLimit : Task.Task Error Bool
-readsCarryLimit =
-    srcSources
-        |> Task.map (List.map indexModule)
-        |> Task.map
-            (\sources ->
-                List.isEmpty (readViolations admittedAggregates sources)
-                    && readCaught (appendTo "Lib/Db.ipe" "leakedRead conn =\n    Db.queryDecode conn \"SELECT seq FROM review_log\" [] leakedDecoder" sources)
-                    && readCaught (appendTo "Lib/Db.ipe" "entriesBefore db =\n    Db.queryDecode db \"SELECT seq AS entries FROM review_log\" [] entriesDecoder" sources)
-                    && readCaught (replaceIn "Lib/Db.ipe" "count(*) AS entries FROM review_log WHERE seq < 1" "seq AS entries FROM review_log WHERE seq < 1" sources)
-                    && readCaught (replaceIn "Lib/Db.ipe" "count(*) AS entries FROM review_log WHERE seq > ?" "count(*) AS entries FROM review_log WHERE seq > ? GROUP BY uid" sources)
-                    && readCaught (replaceIn "Lib/Db.ipe" "review_log_head WHERE one = 1 LIMIT 2" "review_log_head WHERE one = 1" sources)
-                    && readCaught (replaceIn "Lib/Index.ipe" "reviewed_stamp WHERE one = 1 LIMIT 2" "reviewed_stamp WHERE one = 1" sources)
-                    && readCaught (replaceIn "Lib/Index.ipe" "(sql ++ \" LIMIT 2\")" "sql" sources)
-                    && readCaught (replaceIn "Lib/Db.ipe" "\" WHERE uid = ? AND body_hash = ? LIMIT 1\"" "\" WHERE uid = ? AND body_hash = ?\"" sources)
-                    && readCaught (appendTo "Lib/Db.ipe" "leakedRows db =\n    Store.all db reviews" sources)
-                    && readCaught (appendTo "Lib/Db.ipe" "leakedFind db =\n    Store.findBy db reviews \"uid\" (SqlString \"u\")" sources)
-                    && readCaught (appendTo "Lib/Db.ipe" "leakedRead conn =\n    Db.queryDecode conn \"SELECT seq FROM review_log WHERE seq IN (SELECT seq FROM review_log LIMIT 1)\" [] leakedDecoder" sources)
-                    && readCaught (appendTo "Lib/Db.ipe" "leakedRead conn =\n    do\n        rows <- Db.queryDecode conn \"SELECT seq FROM review_log\" [] leakedDecoder\n        Task.succeed (List.take 1 rows ++ [ \"LIMIT 1\" ])" sources)
-                    && not (List.isEmpty (readViolations (( "Lib/Db.ipe:gone", 1 ) :: admittedAggregates) sources))
-                    && List.isEmpty (readViolations admittedAggregates (appendTo "Lib/Db.ipe" "boundedRead conn =\n    Db.queryDecode conn boundedSql [] boundedDecoder\n\n\nboundedSql =\n    \"SELECT seq FROM review_log LIMIT 1\"" sources))
-                    && readCaught (appendTo "Lib/Db.ipe" "boundedRows db =\n    Store.all reviews\n        |> Store.limit 1\n        |> Store.toList db" sources)
-            )
+readsCarryLimit : List ScanModule -> Bool
+readsCarryLimit sources =
+    List.isEmpty (readViolations admittedAggregates sources)
+        && readCaught (appendTo "Lib/Db.ipe" "leakedRead conn =\n    Db.queryDecode conn \"SELECT seq FROM review_log\" [] leakedDecoder" sources)
+        && readCaught (appendTo "Lib/Db.ipe" "entriesBefore db =\n    Db.queryDecode db \"SELECT seq AS entries FROM review_log\" [] entriesDecoder" sources)
+        && readCaught (replaceIn "Lib/Db.ipe" "count(*) AS entries FROM review_log WHERE seq < 1" "seq AS entries FROM review_log WHERE seq < 1" sources)
+        && readCaught (replaceIn "Lib/Db.ipe" "count(*) AS entries FROM review_log WHERE seq > ?" "count(*) AS entries FROM review_log WHERE seq > ? GROUP BY uid" sources)
+        && readCaught (replaceIn "Lib/Db.ipe" "review_log_head WHERE one = 1 LIMIT 2" "review_log_head WHERE one = 1" sources)
+        && readCaught (replaceIn "Lib/Index.ipe" "reviewed_stamp WHERE one = 1 LIMIT 2" "reviewed_stamp WHERE one = 1" sources)
+        && readCaught (replaceIn "Lib/Index.ipe" "(sql ++ \" LIMIT 2\")" "sql" sources)
+        && readCaught (replaceIn "Lib/Db.ipe" "\" WHERE uid = ? AND body_hash = ? LIMIT 1\"" "\" WHERE uid = ? AND body_hash = ?\"" sources)
+        && readCaught (appendTo "Lib/Db.ipe" "leakedRows db =\n    Store.all db reviews" sources)
+        && readCaught (appendTo "Lib/Db.ipe" "leakedFind db =\n    Store.findBy db reviews \"uid\" (SqlString \"u\")" sources)
+        && readCaught (appendTo "Lib/Db.ipe" "leakedRead conn =\n    Db.queryDecode conn \"SELECT seq FROM review_log WHERE seq IN (SELECT seq FROM review_log LIMIT 1)\" [] leakedDecoder" sources)
+        && readCaught (appendTo "Lib/Db.ipe" "leakedRead conn =\n    do\n        rows <- Db.queryDecode conn \"SELECT seq FROM review_log\" [] leakedDecoder\n        Task.succeed (List.take 1 rows ++ [ \"LIMIT 1\" ])" sources)
+        && not (List.isEmpty (readViolations (( "Lib/Db.ipe:gone", 1 ) :: admittedAggregates) sources))
+        && List.isEmpty (readViolations admittedAggregates (appendTo "Lib/Db.ipe" "boundedRead conn =\n    Db.queryDecode conn boundedSql [] boundedDecoder\n\n\nboundedSql =\n    \"SELECT seq FROM review_log LIMIT 1\"" sources))
+        && readCaught (appendTo "Lib/Db.ipe" "boundedRows db =\n    Store.all reviews\n        |> Store.limit 1\n        |> Store.toList db" sources)
 
 
 readCaught : List ScanModule -> Bool
@@ -1262,30 +1316,25 @@ replaceIn rel from to sources =
 -- a record field of that name that is not a pattern, are no site.
 -- Red if a page can show an error's text, or a scan stops seeing a way
 -- around it.
-realTreeClean : Task.Task Error Bool
-realTreeClean =
-    srcSources |> Task.map (\sources -> List.isEmpty (scanViolations (List.map indexModule sources)))
+realTreeClean : List ScanModule -> Bool
+realTreeClean sources =
+    List.isEmpty (scanViolations sources)
 
 
-scansRefuseEvasions : Task.Task Error Bool
-scansRefuseEvasions =
-    srcSources
-        |> Task.map (List.map indexModule)
-        |> Task.map
-            (\sources ->
-                caught (appendTo "Lib/Queue.ipe" "show e =\n    Error.toString e" sources)
-                    && caught (appendTo "Main.ipe" "moved e =\n    Error.message e" sources)
-                    && caught (appendTo "Lib/App.ipe" "named e =\n    Error.kindName e" sources)
-                    && not (List.isEmpty (conversionViolations (List.filter (\site -> site /= "Lib/ServerLog.ipe:logged") admittedConversions) sources))
-                    && not (List.isEmpty (conversionViolations admittedConversions (List.filter (\scanned -> scanned.rel /= "Lib/ServerLog.ipe") sources)))
-                    && caught (prependTo "Lib/View.ipe" "import Ipe.Error as Error" sources)
-                    && caught (prependTo "Lib/Queue.ipe" "import Ipe.Error as E" (appendTo "Lib/Queue.ipe" "shown e =\n    E.message e" sources))
-                    && caught (prependTo "Lib/Queue.ipe" "import Ipe.Error exposing (toString)" (appendTo "Lib/Queue.ipe" "shown e =\n    toString e" sources))
-                    && caught (appendTo "Lib/Queue.ipe" "shown e =\n    case e of\n        Error _ info ->\n            info.message" sources)
-                    && caught (appendTo "Lib/Queue.ipe" "shown e =\n    case e of\n        Error _ { message } ->\n            message" sources)
-                    && caught (appendTo "Lib/Queue.ipe" "shown d =\n    case d of\n        Custom text ->\n            text" sources)
-                    && List.isEmpty (scanViolations (appendTo "Lib/Queue.ipe" "label =\n    errorToStringLabel refuseError.messages { messageCount = 1, message = \"x\" }\n\n\ntype alias Note =\n    { message : String }" sources))
-            )
+scansRefuseEvasions : List ScanModule -> Bool
+scansRefuseEvasions sources =
+    caught (appendTo "Lib/Queue.ipe" "show e =\n    Error.toString e" sources)
+        && caught (appendTo "Main.ipe" "moved e =\n    Error.message e" sources)
+        && caught (appendTo "Lib/App.ipe" "named e =\n    Error.kindName e" sources)
+        && not (List.isEmpty (conversionViolations (List.filter (\site -> site /= "Lib/ServerLog.ipe:logged") admittedConversions) sources))
+        && not (List.isEmpty (conversionViolations admittedConversions (List.filter (\scanned -> scanned.rel /= "Lib/ServerLog.ipe") sources)))
+        && caught (prependTo "Lib/View.ipe" "import Ipe.Error as Error" sources)
+        && caught (prependTo "Lib/Queue.ipe" "import Ipe.Error as E" (appendTo "Lib/Queue.ipe" "shown e =\n    E.message e" sources))
+        && caught (prependTo "Lib/Queue.ipe" "import Ipe.Error exposing (toString)" (appendTo "Lib/Queue.ipe" "shown e =\n    toString e" sources))
+        && caught (appendTo "Lib/Queue.ipe" "shown e =\n    case e of\n        Error _ info ->\n            info.message" sources)
+        && caught (appendTo "Lib/Queue.ipe" "shown e =\n    case e of\n        Error _ { message } ->\n            message" sources)
+        && caught (appendTo "Lib/Queue.ipe" "shown d =\n    case d of\n        Custom text ->\n            text" sources)
+        && List.isEmpty (scanViolations (appendTo "Lib/Queue.ipe" "label =\n    errorToStringLabel refuseError.messages { messageCount = 1, message = \"x\" }\n\n\ntype alias Note =\n    { message : String }" sources))
 
 
 caught : List ScanModule -> Bool
@@ -1388,13 +1437,33 @@ conversionScanRefuses =
         && Result.toMaybe (withinFileCeiling (List.repeat fileCeiling "")) /= Nothing
 
 
+-- `src` read and indexed once, for every check of the tree.
+indexedTree : Task.Task Error (List ScanModule)
+indexedTree =
+    srcSources |> Task.map (List.map indexModule)
+
+
+-- `scan` of the indexed tree, or the read's failure.
+onTree : (List ScanModule -> Bool) -> Result Error (List ScanModule) -> Task.Task Error Bool
+onTree scan tree =
+    Task.fromResult (Result.map scan tree)
+
+
+-- Each check of the tree reads the one index; a failed read fails each of
+-- them.
 checks : Task.Task Error (List ( String, Bool ))
 checks =
-    Task.sequence
-        [ check "no page can show an error's text: the source scans find no violation" realTreeClean
-        , check "each way around the source scans is a violation" scansRefuseEvasions
-        , Task.succeed ( "the type walk refuses every path an error reaches a page by", typeWalkRefuses )
-        , Task.succeed ( "the conversion scan admits only the listed sites, by token", conversionScanRefuses )
-        , check "a uid becomes text only at the admitted sites, and a uid in a heading is a violation" uidTextScanRefuses
-        , check "every read under src/Lib carries a LIMIT or is an admitted aggregate row" readsCarryLimit
-        ]
+    indexedTree
+        |> Task.map Ok
+        |> Task.onError (\e -> Task.succeed (Err e))
+        |> Task.andThen
+            (\tree ->
+                Task.sequence
+                    [ check "no page can show an error's text: the source scans find no violation" (onTree realTreeClean tree)
+                    , check "each way around the source scans is a violation" (onTree scansRefuseEvasions tree)
+                    , Task.succeed ( "the type walk refuses every path an error reaches a page by", typeWalkRefuses )
+                    , Task.succeed ( "the conversion scan admits only the listed sites, by token", conversionScanRefuses )
+                    , check "a uid becomes text only at the admitted sites, and a uid in a heading is a violation" (onTree uidTextScanRefuses tree)
+                    , check "every read under src/Lib carries a LIMIT or is an admitted aggregate row" (onTree readsCarryLimit tree)
+                    ]
+            )

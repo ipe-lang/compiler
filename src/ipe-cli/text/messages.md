@@ -501,6 +501,10 @@ could not determine the per-user cache directory: neither XDG_CACHE_HOME nor the
 
 {var} is set but is not an absolute path; set it to an absolute directory or unset it to use the default location
 
+## cli-registry-url-not-https
+
+{var} must be an https:// URL ({reason}); set it to an https:// base URL, set it to empty to read only the local registry checkout, or unset it to use the default registry
+
 ## cli-runtime-dir-invalid
 
 IPE_RUNTIME_DIR points at {path}, which is not an Ipe runtime crate root (its Cargo.toml must declare `name = "ipe-runtime-rust"`)

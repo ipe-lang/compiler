@@ -21,7 +21,7 @@ pub use const_fold::fold_program;
 pub use emit_expr::rust_str_lit;
 /// The typed mount base the emitted browser shell is served under.
 pub use ipe_runtime_rust::encoding::MountBase;
-mod crate_specs;
+pub mod crate_specs;
 #[macro_use]
 mod doc;
 mod emit_console;
@@ -3259,6 +3259,7 @@ impl<'a> EmitCtx<'a> {
         &self,
         fields: &BTreeMap<Symbol, IrType>,
         generics: emit_types::GenericScope,
+        depth: emit_types::TypeDepth,
     ) -> DResult<String> {
         let mut key = Vec::with_capacity(fields.len());
         for sym in fields.keys() {
@@ -3303,7 +3304,7 @@ impl<'a> EmitCtx<'a> {
                     param.as_raw()
                 ),
             })?;
-            args.push(emit_types::render_type(self, arg_ty, generics)?);
+            args.push(emit_types::render_type_at(self, arg_ty, generics, depth)?);
         }
         Ok(format!("{}<{}>", rec.name, args.join(", ")))
     }

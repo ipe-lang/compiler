@@ -1015,7 +1015,10 @@ async fn ensure_users_schema<E: crate::FromIpeError + Send>(conn: &Db) -> IpeRes
         )",
         db_auto_id_column()
     );
-    match sqlx::query(&schema).execute(conn).await {
+    match sqlx::query(super::sql_text::assembled(schema))
+        .execute(conn)
+        .await
+    {
         Ok(_) => IpeResult::Ok(()),
         Err(e) => IpeResult::Err(auth_db_error("auth.users schema: db: ", &e)),
     }
@@ -1067,7 +1070,7 @@ pub fn auth_register<
             "INSERT INTO users (email, password_hash, role, created_at) VALUES (?, ?, ?, ?)"
                 .to_string(),
         );
-        let result = sqlx::query(&sql)
+        let result = sqlx::query(super::sql_text::assembled(sql))
             .bind(&email)
             .bind(&hash)
             .bind("user")
@@ -1126,7 +1129,11 @@ pub fn auth_login<
             return IpeResult::Err(e);
         }
         let sql = db_format_sql("SELECT id, password_hash FROM users WHERE email = ?".to_string());
-        match sqlx::query(&sql).bind(&email).fetch_optional(&conn).await {
+        match sqlx::query(super::sql_text::assembled(sql))
+            .bind(&email)
+            .fetch_optional(&conn)
+            .await
+        {
             Ok(Some(row)) => {
                 use sqlx::Row;
                 // A failed id-column read MUST NOT silently default to user 0
@@ -1194,7 +1201,7 @@ pub fn auth_set_role<E: Send + From<String> + crate::FromIpeError + 'static>(
             return IpeResult::Err(e);
         }
         let sql = db_format_sql("UPDATE users SET role = ? WHERE id = ?".to_string());
-        match sqlx::query(&sql)
+        match sqlx::query(super::sql_text::assembled(sql))
             .bind(&role)
             .bind(user_id)
             .execute(&conn)
@@ -1481,7 +1488,7 @@ mod tests {
     /// A pool over a fresh in-memory database whose `users` object is built by
     /// `setup` before any kernel runs.
     #[cfg(feature = "db")]
-    async fn pool_with(setup: &str) -> DbPool {
+    async fn pool_with(setup: &'static str) -> DbPool {
         let pool = DbPool::connect("sqlite::memory:")
             .await
             .expect("in-memory connect");

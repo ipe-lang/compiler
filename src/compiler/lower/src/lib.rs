@@ -117,14 +117,15 @@ pub fn lower(
     // conflict within one `fresh_symbols` expression). Each field equals its
     // former standalone `count_*` / `max_*` walker.
     let pool_counts = lower::module_symbol_pool_counts(m, interner);
-    // Mapper wraps draw an eta block sized by the mapper's solved type, which
-    // the per-site charges above do not see; reserve it on top.
+    // Mapper wraps and flattened arrows draw eta blocks sized by solved types,
+    // which the per-site charges above do not see; reserve both on top.
     let eta_params = interner
         .fresh_symbols(
             SynthStem::Eta,
             pool_counts
                 .max_live_eta_params
                 .saturating_add(lower::max_mapper_wrap_eta_demand(m, types))
+                .saturating_add(lower::max_arrow_eta_demand(m, types))
                 .max(max_ctor_arity)
                 .max(MAX_CALLEE_ARITY),
         )

@@ -40,7 +40,9 @@
 //! A renaming `use` of, or to, `Command`, `CommandExt`, `Child`,
 //! `LocalCeiling`, `InheritedRole` or a runner fn, a type alias naming
 //! `Command`, `CommandExt` or `Child`, a `Command::new` not called in place,
-//! and an `include!` by any path are refused.
+//! an `include` identifier anywhere in production code (so an `include!` by
+//! any path, rename or macro argument), and a macro name a macro metavariable
+//! supplies are refused.
 //!
 //! A ceiling is named only by the top-level `LocalCeiling` consts of
 //! `remote_ingest.rs`: a `LocalCeiling` const elsewhere, any const, static,
@@ -50,8 +52,17 @@
 //! cannot stand for another value. A ceiling parameter or a helper's ceiling
 //! parameter must be bound once in its fn and not `mut`, a fn a renaming `use`
 //! imports has no provable callers, and a fn key two items share proves
-//! nothing. A `ureq` body read is held to
+//! nothing. An HTTP body read is held to
 //! `remote_ingest::read_capped` by a whitespace-free text match.
+//!
+//! The HTTP client crate is named only in `src/net.rs`, whose policy every
+//! call takes: any other git-tracked file of the workspace, of any
+//! extension, naming it as a token — a path,
+//! an import, a rename, a raw identifier, a comment — is refused, as is an
+//! exported `net` item whose surface carries a client type, a `package =`
+//! rename of it in `Cargo.toml`, and any other workspace package depending on
+//! it in `Cargo.lock`. No workspace package may depend on the workspace proc
+//! macro, which could assemble the client path from strings.
 
 #![cfg(not(target_arch = "wasm32"))]
 
@@ -320,12 +331,8 @@ const RUNNER_BODIES: &[NameRow] = &[
 /// its rendered receiver and name: a non-child receiver (an HTTP response's
 /// `status()`) or a runner's own method.
 const METHODS: &[NameRow] = &[
-    (
-        "ssh_signing_key.rs",
-        "post_signing_key",
-        "response.status",
-        2,
-    ),
+    ("net.rs", "Answer::read", "response.status", 1),
+    ("net.rs", "success_body", "response.status", 1),
     ("watch.rs", "spawn_cargo_build", "build.spawn", 1),
 ];
 
@@ -522,6 +529,7 @@ fn rename_refused(name: &str) -> bool {
         || listed(SINK_FNS, name)
         || name == CEILING_TYPE
         || name == ROLE_TYPE
+        || name == INCLUDE_MACRO
 }
 
 /// Whether the `cfg` predicate `meta` holds only under `cfg(test)`.
@@ -562,12 +570,19 @@ fn is_test_only(attrs: &[Attribute]) -> bool {
 fn names_a_path(attr: &Attribute) -> bool {
     attr.path().is_ident("path")
         || (attr.path().is_ident("cfg_attr")
-            && attr.meta.require_list().is_ok_and(|list| {
-                list.tokens
-                    .clone()
-                    .into_iter()
-                    .any(|tree| matches!(tree, TokenTree::Ident(ident) if ident == "path"))
-            }))
+            && attr
+                .meta
+                .require_list()
+                .is_ok_and(|list| tokens_name_path(list.tokens.clone())))
+}
+
+/// Whether `tokens`, nested groups included, hold a `path` identifier.
+fn tokens_name_path(tokens: TokenStream) -> bool {
+    tokens.into_iter().any(|tree| match tree {
+        TokenTree::Ident(ident) => name_of(&ident) == "path",
+        TokenTree::Group(group) => tokens_name_path(group.stream()),
+        TokenTree::Punct(_) | TokenTree::Literal(_) => false,
+    })
 }
 
 /// The last identifier of `ty`'s path, if it is a path type, parentheses and
@@ -1054,9 +1069,16 @@ impl Scanner<'_> {
         let key = self.key();
         self.out.macro_idents.push((key, name.clone()));
         self.out.values.push(name.clone());
+        if name == INCLUDE_MACRO {
+            self.refuse("an `include` identifier");
+            return;
+        }
         if let [rest @ .., dollar] = before
             && is_punct(dollar, '$')
         {
+            if next.is_some_and(|tree| is_punct(tree, '!')) {
+                self.refuse("a macro name a macro metavariable supplies");
+            }
             let child_path =
                 qualifier_of(rest).is_some_and(|q| child_qualifier(&self.resolved(&q)));
             if follows_dot(rest) || child_path {
@@ -1204,6 +1226,9 @@ impl<'ast> Visit<'ast> for Scanner<'_> {
         if self.production && self.in_alias > 0 && listed(CHILD_TYPES, &name) {
             self.refuse(&format!("a type alias naming `{name}`"));
         }
+        if self.production && name == INCLUDE_MACRO {
+            self.refuse("an `include` identifier");
+        }
     }
 
     fn visit_pat_ident(&mut self, pat: &'ast PatIdent) {
@@ -1247,7 +1272,13 @@ impl<'ast> Visit<'ast> for Scanner<'_> {
                     self.import(to);
                 }
             }
-            UseTree::Name(used) => self.import(name_of(&used.ident)),
+            UseTree::Name(used) => {
+                let name = name_of(&used.ident);
+                if self.production && name == INCLUDE_MACRO {
+                    self.refuse("an `include` identifier");
+                }
+                self.import(name);
+            }
             UseTree::Glob(_) => self.import(GLOB_BINDING.to_owned()),
             UseTree::Path(_) | UseTree::Group(_) => visit::visit_use_tree(self, tree),
         }
@@ -1346,6 +1377,21 @@ fn crate_roots(root: &Path) -> std::io::Result<Vec<(PathBuf, PathBuf)>> {
 
 /// Every `.rs` file under `dir`, recursively.
 fn rust_files(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) -> std::io::Result<()> {
+    files_under(
+        dir,
+        depth,
+        &|path| path.extension().is_some_and(|ext| ext == "rs"),
+        out,
+    )
+}
+
+/// Every file under `dir` that `keep` admits, recursively.
+fn files_under(
+    dir: &Path,
+    depth: usize,
+    keep: &dyn Fn(&Path) -> bool,
+    out: &mut Vec<PathBuf>,
+) -> std::io::Result<()> {
     if depth > MAX_DIR_DEPTH {
         return Err(std::io::Error::other(format!(
             "source tree deeper than {MAX_DIR_DEPTH}: {}",
@@ -1355,8 +1401,8 @@ fn rust_files(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) -> std::io::Resu
     for entry in std::fs::read_dir(dir)? {
         let path = entry?.path();
         if path.is_dir() {
-            rust_files(&path, depth.saturating_add(1), out)?;
-        } else if path.extension().is_some_and(|ext| ext == "rs") {
+            files_under(&path, depth.saturating_add(1), keep, out)?;
+        } else if keep(&path) {
             out.push(path);
         }
     }
@@ -1862,8 +1908,24 @@ fn proofs(scans: &Scans, inventory: &Inventory<'_>) -> Vec<String> {
         .collect()
 }
 
-/// Unbounded `ureq` body reads, whitespace removed.
-const UNBOUNDED_BODY_READS: &[&str] = &[".into_json(", ".into_string()"];
+/// Unbounded HTTP client body reads, whitespace removed, refused in every file
+/// whether or not it names the client: a body reaches a file through a value,
+/// not through an import.
+const UNBOUNDED_BODY_READS: &[&str] = &[
+    ".read_to_string()",
+    ".read_to_vec()",
+    ".read_json(",
+    ".as_reader()",
+    ".with_config()",
+    ".into_with_config()",
+    "::into_reader",
+    "::into_with_config",
+    "::as_reader",
+    "::read_to_vec",
+    "::read_json",
+    "Body::with_config",
+    "Body::read_to_string",
+];
 
 /// The one bounded body read: a response reader handed straight to `read_capped`.
 const READER: &str = ".into_reader()";
@@ -1882,23 +1944,278 @@ fn reader_is_capped(before: &str) -> bool {
     receiver.len() < before.len() && receiver.ends_with(CAPPED_CALL)
 }
 
-/// Every unbounded `ureq` body read in one flattened source.
+/// Every unbounded HTTP client body read in one flattened source.
 fn violations(flat: &str) -> Vec<String> {
-    let mut found = Vec::new();
-    if flat.contains("ureq") {
-        found.extend(
-            UNBOUNDED_BODY_READS
-                .iter()
-                .filter(|needle| flat.contains(*needle))
-                .map(|needle| (*needle).to_owned()),
-        );
-    }
+    let mut found: Vec<String> = UNBOUNDED_BODY_READS
+        .iter()
+        .filter(|needle| flat.contains(*needle))
+        .map(|needle| (*needle).to_owned())
+        .collect();
     found.extend(
         flat.match_indices(READER)
             .filter(|(at, _)| !flat.get(..*at).is_some_and(reader_is_capped))
             .map(|_| READER.to_owned()),
     );
     found
+}
+
+/// The HTTP client crate's name, spelled in two pieces so this file never
+/// names it: only [`CLIENT_OWNER`] may.
+const HTTP_CLIENT: &str = concat!("ur", "eq");
+
+/// The one source, relative to the crate directory, that names [`HTTP_CLIENT`].
+const CLIENT_OWNER: &str = "src/net.rs";
+
+/// The one workspace package that depends on [`HTTP_CLIENT`].
+const CLIENT_PACKAGE: &str = "ipe";
+
+/// Whether `source` names [`HTTP_CLIENT`] as a whole token, not as a piece of
+/// a longer identifier.
+fn names_client(source: &str) -> bool {
+    let ident_char = |ch: char| ch.is_alphanumeric() || ch == '_';
+    source.match_indices(HTTP_CLIENT).any(|(at, _)| {
+        let before = source.get(..at).and_then(|head| head.chars().next_back());
+        let after = source
+            .get(at..)
+            .and_then(|tail| tail.strip_prefix(HTTP_CLIENT))
+            .and_then(|tail| tail.chars().next());
+        !before.is_some_and(ident_char) && !after.is_some_and(ident_char)
+    })
+}
+
+/// Whether an item with `vis` is visible outside its module.
+const fn exported(vis: &syn::Visibility) -> bool {
+    !matches!(vis, syn::Visibility::Inherited)
+}
+
+/// Whether the identifiers a visit reaches include [`HTTP_CLIENT`].
+#[derive(Default)]
+struct ClientNamed(bool);
+
+impl<'ast> Visit<'ast> for ClientNamed {
+    fn visit_ident(&mut self, ident: &'ast Ident) {
+        if name_of(ident) == HTTP_CLIENT {
+            self.0 = true;
+        }
+    }
+}
+
+/// Whether `visit` reaches [`HTTP_CLIENT`].
+fn reaches_client(visit: impl FnOnce(&mut ClientNamed)) -> bool {
+    let mut named = ClientNamed::default();
+    visit(&mut named);
+    named.0
+}
+
+/// Whether `path` is exactly `names`, segment by segment, with no generic
+/// arguments, a leading `::` or not.
+fn plain_path(path: &syn::Path, names: &[&str]) -> bool {
+    path.segments.len() == names.len()
+        && path
+            .segments
+            .iter()
+            .zip(names)
+            .all(|(segment, name)| segment.arguments.is_none() && name_of(&segment.ident) == *name)
+}
+
+/// Whether `ty` is the plain path `names`.
+fn is_plain_type(ty: &Type, names: &[&str]) -> bool {
+    matches!(ty, Type::Path(p) if p.qself.is_none() && plain_path(&p.path, names))
+}
+
+/// Whether `ty` is the client's error type.
+fn is_client_error(ty: &Type) -> bool {
+    is_plain_type(ty, &[HTTP_CLIENT, "Error"])
+}
+
+/// Whether `path` is `From<CLIENT::Error>`.
+fn is_from_client_error(path: &syn::Path) -> bool {
+    path.segments.len() == 1
+        && path.segments.first().is_some_and(|segment| {
+            name_of(&segment.ident) == "From" && match &segment.arguments {
+                syn::PathArguments::AngleBracketed(args) => args.args.len() == 1
+                    && args.args.first().is_some_and(
+                        |arg| matches!(arg, syn::GenericArgument::Type(ty) if is_client_error(ty)),
+                    ),
+                syn::PathArguments::None | syn::PathArguments::Parenthesized(_) => false,
+            }
+        })
+}
+
+/// Whether `sig` is `fn from(_: CLIENT::Error) -> Self`.
+fn is_conversion_fn(sig: &Signature) -> bool {
+    name_of(&sig.ident) == "from"
+        && sig.generics.params.is_empty()
+        && sig.generics.where_clause.is_none()
+        && sig.variadic.is_none()
+        && sig.inputs.len() == 1
+        && sig
+            .inputs
+            .first()
+            .is_some_and(|input| matches!(input, FnArg::Typed(arg) if is_client_error(&arg.ty)))
+        && matches!(&sig.output, ReturnType::Type(_, ty) if is_plain_type(ty, &["Self"]))
+}
+
+/// Whether `i` is `impl From<CLIENT::Error> for Error`, the conversion of a
+/// client failure into `net`'s typed error: the one trait impl whose surface
+/// may name the client, as it only takes a client value in, by value.
+fn is_error_conversion(i: &ItemImpl) -> bool {
+    i.trait_
+        .as_ref()
+        .is_some_and(|(path, _)| is_from_client_error(path))
+        && i.unsafety.is_none()
+        && i.modifiers.defaultness.is_none()
+        && i.modifiers.polarity.is_none()
+        && i.generics.params.is_empty()
+        && i.generics.where_clause.is_none()
+        && is_plain_type(&i.self_ty, &["Error"])
+        && i.items.len() == 1
+        && i.items
+            .first()
+            .is_some_and(|item| matches!(item, ImplItem::Fn(f) if is_conversion_fn(&f.sig)))
+}
+
+/// Whether an impl block's surface carries a client type: its generics, its
+/// self type, its trait path, and each item by [`impl_item_exports_client`].
+/// A trait impl is reachable wherever its trait and self type are, so it is
+/// read whole, save the one [`is_error_conversion`] shape.
+fn impl_exports_client(i: &ItemImpl) -> bool {
+    if is_error_conversion(i) {
+        return false;
+    }
+    let trait_impl = i.trait_.is_some();
+    reaches_client(|n| {
+        n.visit_generics(&i.generics);
+        n.visit_type(&i.self_ty);
+        if let Some((path, _)) = &i.trait_ {
+            n.visit_path(path);
+        }
+    }) || i
+        .items
+        .iter()
+        .any(|member| impl_item_exports_client(member, trait_impl))
+}
+
+/// Whether one item of an impl block carries a client type: the whole
+/// signature of every fn of a trait impl — a callback input hands a client
+/// value out as surely as a return type does — and of an exported fn of an
+/// inherent impl, and any associated type or const.
+fn impl_item_exports_client(item: &ImplItem, trait_impl: bool) -> bool {
+    match item {
+        ImplItem::Fn(f) => {
+            (trait_impl || exported(&f.vis)) && reaches_client(|n| n.visit_signature(&f.sig))
+        }
+        ImplItem::Const(c) => reaches_client(|n| {
+            n.visit_generics(&c.generics);
+            n.visit_type(&c.ty);
+        }),
+        ImplItem::Type(t) => reaches_client(|n| {
+            n.visit_generics(&t.generics);
+            n.visit_type(&t.ty);
+        }),
+        ImplItem::Macro(m) => names_client(&m.mac.tokens.to_string()),
+        ImplItem::Verbatim(tokens) => names_client(&tokens.to_string()),
+        // `ImplItem` is non-exhaustive: an item kind this scan cannot read is
+        // refused, never admitted unread.
+        _ => true,
+    }
+}
+
+/// Whether `item`'s surface outside its module carries a client type. A
+/// module is judged item by item, by [`leaked_client`].
+fn exports_client(item: &Item) -> bool {
+    match item {
+        Item::Const(c) => exported(&c.vis) && reaches_client(|n| n.visit_type(&c.ty)),
+        Item::Enum(e) => exported(&e.vis) && reaches_client(|n| n.visit_item_enum(e)),
+        Item::ExternCrate(e) => {
+            exported(&e.vis) && reaches_client(|n| n.visit_item_extern_crate(e))
+        }
+        Item::Fn(f) => exported(&f.vis) && reaches_client(|n| n.visit_signature(&f.sig)),
+        Item::ForeignMod(f) => reaches_client(|n| n.visit_item_foreign_mod(f)),
+        Item::Impl(i) => impl_exports_client(i),
+        Item::Macro(m) => names_client(&m.mac.tokens.to_string()),
+        Item::Mod(_) => false,
+        Item::Static(st) => exported(&st.vis) && reaches_client(|n| n.visit_type(&st.ty)),
+        Item::Struct(st) => {
+            exported(&st.vis)
+                && reaches_client(|n| {
+                    n.visit_generics(&st.generics);
+                    st.fields
+                        .iter()
+                        .filter(|field| exported(&field.vis))
+                        .for_each(|field| n.visit_type(&field.ty));
+                })
+        }
+        Item::Trait(t) => exported(&t.vis) && reaches_client(|n| n.visit_item_trait(t)),
+        Item::TraitAlias(t) => exported(&t.vis) && reaches_client(|n| n.visit_item_trait_alias(t)),
+        Item::Type(t) => exported(&t.vis) && reaches_client(|n| n.visit_item_type(t)),
+        Item::Union(u) => exported(&u.vis) && reaches_client(|n| n.visit_item_union(u)),
+        Item::Use(u) => exported(&u.vis) && reaches_client(|n| n.visit_item_use(u)),
+        Item::Verbatim(tokens) => names_client(&tokens.to_string()),
+        // `Item` is non-exhaustive: an item kind this scan cannot read is
+        // refused, never admitted unread.
+        _ => true,
+    }
+}
+
+/// Every item of `items`, nested modules included, whose surface outside its
+/// module carries a client type, by its position in its module.
+fn leaked_client(items: &[Item], module: &str, out: &mut Vec<String>) {
+    for (at, item) in items.iter().enumerate() {
+        if let Item::Mod(inner) = item
+            && let Some((_, nested)) = &inner.content
+        {
+            leaked_client(nested, &format!("{module}::{}", name_of(&inner.ident)), out);
+        } else if exports_client(item) {
+            out.push(format!("item {at} of `{module}`"));
+        }
+    }
+}
+
+/// Every line of a crate manifest naming [`HTTP_CLIENT`] other than its plain
+/// dependency entry: a `package =` key would let another name stand for it.
+fn manifest_renames(manifest: &str) -> Vec<String> {
+    manifest
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.starts_with('#') && names_client(line))
+        .filter(|line| {
+            line.contains("package")
+                || !line
+                    .strip_prefix(HTTP_CLIENT)
+                    .is_some_and(|rest| rest.trim_start().starts_with('='))
+        })
+        .map(str::to_owned)
+        .collect()
+}
+
+/// Whether one `dependencies` line of a lockfile names the package `name`,
+/// with or without a version.
+fn lock_dependency_is(line: &str, name: &str) -> bool {
+    line.trim()
+        .trim_end_matches(',')
+        .strip_prefix('"')
+        .and_then(|dep| dep.strip_suffix('"'))
+        .is_some_and(|dep| dep.split(' ').next() == Some(name))
+}
+
+/// The workspace packages of a lockfile — those with no `source` — that
+/// depend on the package `name`. The lockfile records the real crate name, so
+/// a renaming dependency key cannot hide one.
+fn workspace_dependents(lock: &str, name: &str) -> Vec<String> {
+    lock.split("[[package]]")
+        .filter(|block| !block.lines().any(|line| line.starts_with("source =")))
+        .filter(|block| block.lines().any(|line| lock_dependency_is(line, name)))
+        .map(|block| {
+            block
+                .lines()
+                .find_map(|line| line.strip_prefix("name = "))
+                .map_or_else(
+                    || "<unnamed>".to_owned(),
+                    |package| package.trim_matches('"').to_owned(),
+                )
+        })
+        .collect()
 }
 
 #[test]
@@ -1953,7 +2270,7 @@ fn each_row_is_proved_by_its_runner_call() {
 }
 
 #[test]
-fn no_ureq_body_read_is_unbounded() {
+fn no_http_body_read_is_unbounded() {
     let root = src_root();
     let mut paths = Vec::new();
     rust_files(&root, 0, &mut paths).expect("source tree listable");
@@ -1979,11 +2296,293 @@ fn no_ureq_body_read_is_unbounded() {
     );
 }
 
+/// The files, relative to the workspace root, that may name [`HTTP_CLIENT`]:
+/// its owner, the manifest that declares it, and the lockfile.
+const CLIENT_NAMERS: &[&str] = &[
+    "src/ipe-cli/src/net.rs",
+    "src/ipe-cli/Cargo.toml",
+    "Cargo.lock",
+];
+
+/// Generated prose, relative to the workspace root, that may name
+/// [`HTTP_CLIENT`] while [`no_rust_opens`] holds of it: release notes are
+/// written from commit subjects, and a dependency fix names its crate.
+const PROSE_NAMERS: &[&str] = &["CHANGELOG.md"];
+
+/// Whether no Rust item or expression can open `text`: it starts with a `#`
+/// followed by a letter, never the `[` or `!` of an attribute, so an
+/// `include!` of it cannot compile.
+fn no_rust_opens(text: &str) -> bool {
+    text.strip_prefix('#')
+        .and_then(|rest| rest.trim_start().chars().next())
+        .is_some_and(char::is_alphabetic)
+}
+
+/// The workspace's proc-macro package: a macro that can assemble
+/// [`HTTP_CLIENT`]'s path from strings no token scan reads, so no workspace
+/// package may depend on it.
+const PROC_MACRO_PACKAGE: &str = "ipe_bindgen";
+
+/// Every file of `files` (relative to `root`), `allowed` aside, that names
+/// [`HTTP_CLIENT`]. Every extension counts, since an `include!` or a
+/// `#[path]` compiles a file of any name from any directory; a listed file
+/// absent from the tree cannot be compiled in, so it is skipped.
+fn client_namers(
+    root: &Path,
+    files: &[String],
+    allowed: &[&str],
+) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+    let mut found = Vec::new();
+    for rel in files.iter().filter(|rel| !allowed.contains(&rel.as_str())) {
+        let bytes = match std::fs::read(root.join(rel)) {
+            Ok(bytes) => bytes,
+            Err(fault) if fault.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(fault) => return Err(fault.into()),
+        };
+        let text = String::from_utf8_lossy(&bytes);
+        let prose = PROSE_NAMERS.contains(&rel.as_str()) && no_rust_opens(&text);
+        if names_client(&text) && !prose {
+            found.push(format!("{rel}: names the HTTP client"));
+        }
+    }
+    Ok(found)
+}
+
+/// Every git-tracked file of the checkout at `root`, relative to it.
+fn tracked_files(root: &Path) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+    let listed = std::process::Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["ls-files", "-z"])
+        .output()?;
+    if !listed.status.success() {
+        return Err(format!("git ls-files failed: {}", listed.status).into());
+    }
+    Ok(String::from_utf8(listed.stdout)?
+        .split('\0')
+        .filter(|rel| !rel.is_empty())
+        .map(str::to_owned)
+        .collect())
+}
+
+#[test]
+fn only_net_names_the_http_client() {
+    let crate_dir = e2e_support::manifest_dir!();
+    let root = crate_dir
+        .ancestors()
+        .nth(2)
+        .expect("crate sits two levels under the workspace");
+    let owner = crate_dir.join(CLIENT_OWNER);
+    let files = tracked_files(root).expect("git lists the workspace checkout");
+    for allowed in CLIENT_NAMERS {
+        assert!(
+            files.iter().any(|rel| rel == allowed),
+            "{allowed} must be tracked, or the listing reads the wrong tree"
+        );
+    }
+    let mut found = client_namers(root, &files, CLIENT_NAMERS).expect("tracked files readable");
+    let net = std::fs::read_to_string(&owner).expect("net source readable");
+    assert!(
+        names_client(&net),
+        "{CLIENT_OWNER} must name the HTTP client, or the token matcher matches nothing"
+    );
+    let mut leaked = Vec::new();
+    leaked_client(
+        &syn::parse_file(&net).expect("net source parses").items,
+        "net",
+        &mut leaked,
+    );
+    found.extend(
+        leaked
+            .into_iter()
+            .map(|item| format!("{CLIENT_OWNER}: {item} exports a client type")),
+    );
+    let manifest =
+        std::fs::read_to_string(crate_dir.join("Cargo.toml")).expect("manifest readable");
+    assert!(
+        names_client(&manifest),
+        "Cargo.toml must name the HTTP client, or the rename check matches nothing"
+    );
+    found.extend(
+        manifest_renames(&manifest)
+            .into_iter()
+            .map(|line| format!("Cargo.toml: `{line}` is not the plain client entry")),
+    );
+    let lock = std::fs::read_to_string(root.join("Cargo.lock")).expect("lockfile readable");
+    let dependents = workspace_dependents(&lock, HTTP_CLIENT);
+    assert!(
+        dependents.iter().any(|name| name == CLIENT_PACKAGE),
+        "Cargo.lock must show `{CLIENT_PACKAGE}` depending on the HTTP client, or the \
+         dependents check matches nothing"
+    );
+    found.extend(
+        dependents
+            .into_iter()
+            .filter(|name| name != CLIENT_PACKAGE)
+            .map(|name| format!("Cargo.lock: workspace package `{name}` depends on the client")),
+    );
+    assert!(
+        lock.contains(&format!("name = \"{PROC_MACRO_PACKAGE}\"")),
+        "Cargo.lock must hold `{PROC_MACRO_PACKAGE}`, or the proc-macro check matches nothing"
+    );
+    found.extend(
+        workspace_dependents(&lock, PROC_MACRO_PACKAGE)
+            .into_iter()
+            .map(|name| {
+                format!("Cargo.lock: workspace package `{name}` depends on `{PROC_MACRO_PACKAGE}`")
+            }),
+    );
+    assert!(
+        found.is_empty(),
+        "the HTTP client is named only in {CLIENT_OWNER}, whose policy every call takes:\n{}",
+        found.join("\n")
+    );
+}
+
+/// A fresh tree holding `files` (path relative to the tree, contents).
+#[allow(clippy::expect_used)] // a failed scratch-tree setup is the test failure
+fn tree(label: &str, files: &[(&str, &str)]) -> PathBuf {
+    let root = ipe_test_temp::temp_root().join(format!(
+        "ipe_child_runner_scan_{label}_{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&root);
+    for (rel, text) in files {
+        let path = root.join(rel);
+        let parent = path.parent().expect("a tree file has a parent");
+        std::fs::create_dir_all(parent).expect("tree dir is created");
+        std::fs::write(&path, text).expect("tree file is written");
+    }
+    root
+}
+
+#[test]
+fn a_client_path_in_any_file_a_splice_can_reach_is_refused() {
+    let call = format!("macro_rules! f {{ ($u:expr) => {{ ::{HTTP_CLIENT}::get($u).call() }} }}");
+    let owner_source = format!("use {HTTP_CLIENT}::Agent;");
+    let longer = format!("fn {HTTP_CLIENT}ish() {{}}");
+    let changelog = format!("# Changelog\n\n* move to {HTTP_CLIENT} 3\n");
+    let root = tree(
+        "splices",
+        &[
+            ("cli/src/net.rs", &owner_source),
+            ("cli/src/lib.rs", "mod net;"),
+            ("other/src/lib.rs", "include!(\"../payload.txt\");"),
+            ("other/payload.txt", &call),
+            ("other/src/deep.rs", "#[path = \"../../x/m.rs\"] mod m;"),
+            ("x/m.rs", &call),
+            ("other/src/longer.rs", &longer),
+            ("other/README.md", "no client here"),
+            ("CHANGELOG.md", &changelog),
+            ("other/CHANGELOG.md", &changelog),
+        ],
+    );
+    let mut paths = Vec::new();
+    files_under(&root, 0, &|_| true, &mut paths).expect("tree listable");
+    let files: Vec<String> = paths
+        .iter()
+        .map(|path| relative(&root, path).expect("listed under the root"))
+        .collect();
+    let mut found = client_namers(&root, &files, &["cli/src/net.rs"]).expect("tree readable");
+    found.sort();
+    assert_eq!(
+        found,
+        [
+            "other/CHANGELOG.md: names the HTTP client",
+            "other/payload.txt: names the HTTP client",
+            "x/m.rs: names the HTTP client"
+        ],
+    );
+    let unexempt = client_namers(&root, &files, &[]).expect("tree readable");
+    assert!(
+        unexempt
+            .iter()
+            .any(|line| line.starts_with("cli/src/net.rs")),
+        "the owner is admitted only by its allowlist row: {unexempt:?}"
+    );
+    let missing = ["gone.rs".to_owned()];
+    assert_eq!(
+        client_namers(&root, &missing, &[]).expect("a missing file is skipped"),
+        Vec::<String>::new()
+    );
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn only_prose_no_rust_can_open_may_name_the_client() {
+    for prose in ["# Changelog\n", "#  Release notes", "#\tChangelog"] {
+        assert!(no_rust_opens(prose), "{prose:?}");
+    }
+    for code in [
+        "#[path = \"x.rs\"] mod m;",
+        "# [allow(dead_code)] fn f() {}",
+        "#![allow(dead_code)]",
+        "#",
+        "# 1",
+        " # Changelog",
+        "macro_rules! f { () => {} }",
+        "",
+    ] {
+        assert!(!no_rust_opens(code), "{code:?}");
+    }
+    let code =
+        format!("#[macro_export] macro_rules! f {{ () => {{ ::{HTTP_CLIENT}::get(\"\") }} }}");
+    let root = tree("prose", &[("CHANGELOG.md", &code)]);
+    let files = ["CHANGELOG.md".to_owned()];
+    assert_eq!(
+        client_namers(&root, &files, &[]).expect("tree readable"),
+        ["CHANGELOG.md: names the HTTP client"],
+        "a changelog Rust can open is scanned like any file"
+    );
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn a_workspace_dependent_of_the_proc_macro_is_refused() {
+    let lock = format!(
+        "[[package]]\nname = \"{PROC_MACRO_PACKAGE}\"\nversion = \"0.7.0\"\n\n\
+         [[package]]\nname = \"ipe_docs\"\ndependencies = [\n \"{PROC_MACRO_PACKAGE}\",\n]\n\n\
+         [[package]]\nname = \"ipe\"\ndependencies = [\n \"{PROC_MACRO_PACKAGE} 0.7.0\",\n]\n\n\
+         [[package]]\nname = \"ipe_ffi\"\ndependencies = [\n \"{PROC_MACRO_PACKAGE}_extra\",\n]\n\n\
+         [[package]]\nname = \"vendored\"\nsource = \"registry+https://x\"\n\
+         dependencies = [\n \"{PROC_MACRO_PACKAGE}\",\n]\n"
+    );
+    assert_eq!(
+        workspace_dependents(&lock, PROC_MACRO_PACKAGE),
+        ["ipe_docs", "ipe"]
+    );
+}
+
 #[test]
 fn matcher_refuses_each_bypass() {
+    let named = [
+        "CLIENT::get(url).call()",
+        "use CLIENT::Body as B;",
+        "::CLIENT::agent()",
+        "extern crate CLIENT as http;",
+        "let a = r#CLIENT::agent();",
+        "// the CLIENT agent",
+    ];
+    for sample in named {
+        let sample = sample.replace("CLIENT", HTTP_CLIENT);
+        assert!(names_client(&sample), "matcher must refuse: {sample}");
+    }
     let refused = [
-        "use ureq; let v: Value = resp.into_json()?;",
-        "use ureq; let s = resp.into_string()?;",
+        "use http; let s = resp.body_mut().read_to_string()?;",
+        "use http; let v = resp.body_mut().read_to_vec()?;",
+        "use http; let v: Value = resp.body_mut().read_json()?;",
+        "use http; let r = resp.body_mut().as_reader();",
+        "use http; let r = resp.body_mut().with_config().reader();",
+        "use http; let r = resp.into_body().into_with_config().reader();",
+        "let r = response.into_body().as_reader();",
+        "let b = response.into_body().into_with_config().limit(u64::MAX).read_to_vec();",
+        "let v: Value = response.body_mut().read_json()?;",
+        "let v = response.body_mut().read_to_vec()?;",
+        "read_capped(http::Body::into_reader(body), MAX)",
+        "read_capped(Body::into_reader(body), MAX)",
+        "let r = body.map(Body::into_reader);",
+        "let c = Body::into_with_config(body);",
+        "read_capped(resp.into_body().into_reader(), MAX)",
         "let r = resp.into_reader();",
         "read_capped(std::io::empty()).and(resp.into_reader())",
         "read_capped(\n  (resp).into_reader(), 4)",
@@ -2000,9 +2599,13 @@ fn matcher_refuses_each_bypass() {
 fn matcher_admits_the_bounded_forms() {
     let admitted = [
         "remote_ingest::read_capped(\n    response.into_reader(),\n    MAX,\n)",
+        "use http; let body = response.into_body(); read_capped(body.into_reader(), MAX)",
         "Git::isolated(dir).args([\"fetch\"])",
         "use std::process::Command;",
         "let s = value.into_string();",
+        "let s = std::fs::read_to_string(path)?;",
+        "let s = std::io::read_to_string(reader)?;",
+        "let r = file.into_reader(one_past);",
     ];
     for sample in admitted {
         assert!(
@@ -2010,6 +2613,139 @@ fn matcher_admits_the_bounded_forms() {
             "matcher must admit: {sample}"
         );
     }
+    for sample in [
+        "pCLIENT::get()",
+        "CLIENT_proto::parse()",
+        "let CLIENTs = 1;",
+    ] {
+        let sample = sample.replace("CLIENT", HTTP_CLIENT);
+        assert!(!names_client(&sample), "matcher must admit: {sample}");
+    }
+}
+
+#[test]
+fn surface_checks_refuse_each_export() {
+    let exported_samples = [
+        "pub fn agent() -> CLIENT::Agent { x() }",
+        "pub use CLIENT::Agent as A;",
+        "pub use ::CLIENT;",
+        "pub struct S { pub body: CLIENT::Body }",
+        "pub struct S<B: Into<CLIENT::Body>>(B);",
+        "pub(crate) mod m { pub fn f(x: CLIENT::Body) {} }",
+        "pub struct A; impl A { pub fn f(&self) -> ::CLIENT::Body { x() } }",
+        "pub fn with<F: FnOnce(CLIENT::Body)>(f: F) {}",
+        "impl From<Answer> for CLIENT::Body { fn from(a: Answer) -> Self { x() } }",
+        "impl Deref for A { type Target = CLIENT::Body; fn deref(&self) -> &Self::Target { x() } }",
+        "impl Tr for A { fn get(&self) -> CLIENT::Agent { x() } }",
+        "pub type B = CLIENT::Body;",
+        "pub const C: Option<CLIENT::Agent> = None;",
+        "pub enum E { Body(CLIENT::Body) }",
+        "macro_rules! m { () => { CLIENT::agent() } }",
+        "impl crate::x::WithBody<CLIENT::Body> for Answer { fn with(&self, f: &mut dyn FnMut(CLIENT::Body)) {} }",
+        "impl crate::x::WithBody for Answer { fn with(&self, f: &mut dyn FnMut(CLIENT::Body)) {} }",
+        "impl crate::x::Tr<CLIENT::Body> for Answer {}",
+        "impl<F: FnOnce(CLIENT::Body)> Tr for A<F> {}",
+        "impl<F> Tr for A<F> where F: FnOnce(CLIENT::Body) {}",
+        "impl<F: FnOnce(CLIENT::Body)> A<F> { pub fn run(self) {} }",
+        "mod tests { impl Tr for A { fn with(&self, f: impl FnOnce(CLIENT::Body)) {} } }",
+    ];
+    for sample in exported_samples {
+        let sample = sample.replace("CLIENT", HTTP_CLIENT);
+        let mut leaked = Vec::new();
+        leaked_client(
+            &syn::parse_file(&sample).expect("sample parses").items,
+            "net",
+            &mut leaked,
+        );
+        assert!(!leaked.is_empty(), "surface check must refuse: {sample}");
+    }
+    for sample in [
+        "http = { package = \"CLIENT\", version = \"3\" }",
+        "CLIENT = { package = \"other\" }",
+        "package = \"CLIENT\"",
+        "[dependencies.CLIENT]",
+    ] {
+        let sample = sample.replace("CLIENT", HTTP_CLIENT);
+        assert!(
+            !manifest_renames(&sample).is_empty(),
+            "manifest check must refuse: {sample}"
+        );
+    }
+    let lock = "[[package]]\nname = \"ipe-lsp\"\ndependencies = [\n \"CLIENT 3.4.2\",\n]\n"
+        .replace("CLIENT", HTTP_CLIENT);
+    assert_eq!(workspace_dependents(&lock, HTTP_CLIENT), ["ipe-lsp"]);
+}
+
+#[test]
+fn surface_checks_admit_only_the_error_conversion() {
+    let leaks = |sample: &str| {
+        let sample = sample.replace("CLIENT", HTTP_CLIENT);
+        let mut leaked = Vec::new();
+        leaked_client(
+            &syn::parse_file(&sample).expect("sample parses").items,
+            "net",
+            &mut leaked,
+        );
+        !leaked.is_empty()
+    };
+    let conversion =
+        "impl From<CLIENT::Error> for Error { fn from(e: CLIENT::Error) -> Self { x(e) } }";
+    assert!(!leaks(conversion), "the error conversion must be admitted");
+    for mutated in [
+        "impl From<CLIENT::Body> for Error { fn from(e: CLIENT::Body) -> Self { x(e) } }",
+        "impl Into<CLIENT::Error> for Error { fn from(e: CLIENT::Error) -> Self { x(e) } }",
+        "impl From<CLIENT::Error> for Other { fn from(e: CLIENT::Error) -> Self { x(e) } }",
+        "impl From<CLIENT::Error> for Error<T> { fn from(e: CLIENT::Error) -> Self { x(e) } }",
+        "impl<T> From<CLIENT::Error> for Error { fn from(e: CLIENT::Error) -> Self { x(e) } }",
+        "impl From<CLIENT::Error> for Error where CLIENT::Body: Sized { fn from(e: CLIENT::Error) -> Self { x(e) } }",
+        "impl From<CLIENT::Error> for Error { fn from(e: &mut dyn FnMut(CLIENT::Error)) -> Self { x(e) } }",
+        "impl From<CLIENT::Error> for Error { fn from(e: CLIENT::Error) -> CLIENT::Error { e } }",
+        "impl From<CLIENT::Error> for Error { fn from<F: FnOnce(CLIENT::Body)>(e: CLIENT::Error) -> Self { x(e) } }",
+        "impl From<CLIENT::Error> for Error { fn from(e: CLIENT::Error) -> Self { x(e) } fn body(&self, f: impl FnOnce(CLIENT::Body)) {} }",
+        "impl From<CLIENT::Error> for Error { fn from(e: CLIENT::Error) -> Self { x(e) } type Body = CLIENT::Body; }",
+        "impl From<CLIENT::Error<CLIENT::Body>> for Error { fn from(e: CLIENT::Error) -> Self { x(e) } }",
+        "impl From<CLIENT::Error, CLIENT::Body> for Error { fn from(e: CLIENT::Error) -> Self { x(e) } }",
+        "impl x::From<CLIENT::Error> for Error { fn from(e: CLIENT::Error) -> Self { x(e) } }",
+        "unsafe impl From<CLIENT::Error> for Error { fn from(e: CLIENT::Error) -> Self { x(e) } }",
+    ] {
+        assert!(
+            leaks(mutated),
+            "only the exact error conversion is admitted: {mutated}"
+        );
+    }
+}
+
+#[test]
+fn surface_checks_admit_the_private_forms() {
+    for sample in [
+        "fn agent() -> CLIENT::Agent { x() }",
+        "impl From<CLIENT::Error> for Error { fn from(e: CLIENT::Error) -> Self { x(e) } }",
+        "pub struct S { body: CLIENT::Body }",
+        "pub fn post(url: &str) -> Result<Answer, Error> { CLIENT::get(url); x() }",
+        "mod tests { fn response() -> CLIENT::Body { x() } }",
+        "pub(crate) mod testing { pub fn answer(status: u16) -> Answer { super::response(status) } }",
+    ] {
+        let sample = sample.replace("CLIENT", HTTP_CLIENT);
+        let mut leaked = Vec::new();
+        leaked_client(
+            &syn::parse_file(&sample).expect("sample parses").items,
+            "net",
+            &mut leaked,
+        );
+        assert!(
+            leaked.is_empty(),
+            "surface check must admit: {sample}: {leaked:?}"
+        );
+    }
+    let entry = "CLIENT = { version = \"3\", default-features = false, features = [\"rustls\"] }"
+        .replace("CLIENT", HTTP_CLIENT);
+    assert!(
+        manifest_renames(&entry).is_empty(),
+        "manifest check must admit: {entry}"
+    );
+    let lock = "[[package]]\nname = \"tls\"\nsource = \"registry+https://x\"\ndependencies = [\n \"CLIENT\",\n]\n\n[[package]]\nname = \"ipe\"\ndependencies = [\n \"CLIENT-proto\",\n \"CLIENT\",\n]\n"
+        .replace("CLIENT", HTTP_CLIENT);
+    assert_eq!(workspace_dependents(&lock, HTTP_CLIENT), ["ipe"]);
 }
 
 /// The ceilings of the sample crate: one named ceiling and one const of another type.
@@ -2147,6 +2883,53 @@ fn a_hidden_or_renamed_child_start_is_refused() {
             "the scan must refuse: {sample}"
         );
     }
+    for sample in [
+        "#[path = \"x.rs\"] mod x {}",
+        "#[cfg_attr(all(), path = \"x.rs\")] mod x {}",
+        "#[cfg_attr(all(), cfg_attr(all(), path = \"../../x.rs\"))] mod x {}",
+    ] {
+        assert!(
+            refused_for(&sample_verdict(sample), "a `#[path]` module"),
+            "the scan must refuse: {sample}"
+        );
+    }
+}
+
+#[test]
+fn an_include_of_any_file_by_any_spelling_is_refused() {
+    let refused = [
+        "fn f() { let _ = include!(\"generated.txt\"); }",
+        "include!(concat!(env!(\"OUT_DIR\"), \"/spawn.in\"));",
+        "use std::include as splice;",
+        "use core::{include as splice};",
+        "macro_rules! splice { ($f:literal) => { include!($f) }; }",
+        "fn f() { m!(a b include!(\"x.txt\")); }",
+        "fn f() { m!(a b std::include!(\"x.txt\")); }",
+        "fn f() { s!(include); }",
+        "fn f() { s!(a b include); }",
+        "use std::include;",
+    ];
+    for sample in refused {
+        assert!(
+            refused_for(&sample_verdict(sample), "include"),
+            "the scan must refuse: {sample}"
+        );
+    }
+    let spliced = "macro_rules! s { ($m:ident) => { $m!(\"x.txt\") }; }";
+    assert!(
+        refused_for(
+            &sample_verdict(spliced),
+            "a macro name a macro metavariable"
+        ),
+        "the scan must refuse: {spliced}"
+    );
+    assert!(
+        !refused_for(
+            &sample_verdict("const PAGE: &str = \"include\";"),
+            "include"
+        ),
+        "a string naming include is not an `include!`"
+    );
 }
 
 #[test]
