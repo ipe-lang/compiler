@@ -1456,14 +1456,15 @@ pub enum Feature {
     /// non-`Clone`-reuse SEAL, for the effect-carrier payload those two do not
     /// cover. Thread the value linearly (use it once) instead. [IPE-L0135]
     NonCloneValueReuse,
-    /// A `Stream.stream` handler captured a value the per-request re-wrap cannot copy.
+    /// A shared handler captured a value it cannot copy per call.
     ///
-    /// The handler is rebuilt for every request and each captured local is
-    /// cloned into it, so a capture must be `Clone`: a destructure-bound
-    /// function, a `Task`/`Cmd`/`Sub`, or a capture whose type could not be
-    /// resolved is refused. Bind a captured function with a plain `let` or take
+    /// A `Stream.stream` request handler or a `Ui`/`Html` event handler (the
+    /// `requires_sync_capture` kernels) is shared and called again and again,
+    /// and each captured local is cloned into it, so a capture must be `Clone`:
+    /// a destructure-bound function, a `Task`/`Cmd`/`Sub`, or a capture whose
+    /// type could not be resolved is refused. Bind a captured function with a plain `let` or take
     /// it as a parameter, and build a captured task inside the handler. A
-    /// partially-applied or point-free `Stream.stream` is a separate fact,
+    /// partially-applied or point-free handler kernel is a separate fact,
     /// [`LowerError::UnsaturatedHandlerKernel`]. [IPE-L0126]
     StreamHandlerCapture,
     /// A closure a partial application rebuilds would move a value it cannot copy.
@@ -1813,13 +1814,15 @@ pub enum LowerError {
     },
     /// A kernel whose handler the backend re-wraps per call was used unsaturated.
     ///
-    /// `Stream.stream` rebuilds its handler for every request and clones each
-    /// capture into it, which needs the handler expression in hand at the call.
-    /// Point-free or partially applied, the handler is the synthesized
-    /// closure's own parameter — a bare function value with no copyable form —
-    /// so the kernel is legal only as a saturated call (`<|` / `|>` spines are
-    /// flattened to one first). `kernel` is the dotted name from the kernel
-    /// registry (e.g. `Stream.stream`). [IPE-L0152]
+    /// A kernel with an adapted handler slot (`Stream.stream`, `Ui.onKeyDown`,
+    /// `Lazy.lazy`, `Task.retryWith`, …) calls its handler again and again and
+    /// needs the handler expression in hand at the call to classify its
+    /// captures. Point-free or partially applied before its handler, the
+    /// handler is the synthesized closure's own parameter — a bare function
+    /// value with no copyable form — so the kernel is legal only with its
+    /// handler supplied (`<|` / `|>` spines are flattened to one call first).
+    /// `kernel` is the dotted name from the kernel registry (e.g.
+    /// `Stream.stream`). [IPE-L0152]
     UnsaturatedHandlerKernel {
         /// The dotted kernel name that was used unsaturated (e.g. `Stream.stream`).
         kernel: Box<str>,
@@ -3499,12 +3502,11 @@ fn foreign_type_variable_help(helper: &str, owner: &str, var: &str) -> Vec<HelpL
 fn unsaturated_handler_kernel_help(kernel: &str) -> Vec<HelpLine> {
     vec![HelpLine::Note(
         format!(
-            "`{kernel}` rebuilds its handler for every request, so it needs the \
-             handler in hand where it is called: apply it to all its arguments, \
-             `{kernel} contentType handler`, or pipe the handler in with \
-             `{kernel} contentType <| handler` / `handler |> {kernel} contentType`. \
-             Do not bind `{kernel}` (or `{kernel} contentType`) to a name or pass it \
-             as a value."
+            "`{kernel}` calls its handler again and again, so it needs the handler \
+             in hand where it is called: apply it to its handler at the call, or pipe \
+             the handler in with `<|` / `|>`. Do not bind `{kernel}` (or a partial \
+             application of it that still lacks the handler) to a name or pass it as \
+             a value."
         )
         .into_boxed_str(),
     )]

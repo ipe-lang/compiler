@@ -885,8 +885,8 @@ fn lower_prose(msg: &LowerError) -> String {
         }
         LowerError::UnsaturatedHandlerKernel { kernel } => {
             format!(
-                "`{kernel}` has to be called with all its arguments — you can't \
-                 store it under a name or pass it around before its handler is given."
+                "`{kernel}` has to be called with its handler — you can't store it \
+                 under a name or pass it around before its handler is given."
             )
         }
         LowerError::ForeignTypeVariable { helper, owner, var } => {
@@ -2142,9 +2142,9 @@ fn lower_label(msg: &LowerError) -> String {
         }
         LowerError::UnsaturatedHandlerKernel { kernel } => {
             format!(
-                "`{kernel}` must be applied to all its arguments here — it rebuilds its \
-                 handler for every request, so the handler must be given at the call: \
-                 write `{kernel} contentType handler` (piping the handler in with \
+                "`{kernel}` must be given its handler here — the handler is called \
+                 again and again, so the compiler needs the handler expression at the \
+                 call: apply `{kernel}` to its handler (piping the handler in with \
                  `<|` / `|>` is fine) instead of binding `{kernel}` or a partial \
                  application of it to a name or passing it as a value"
             )
@@ -2651,8 +2651,9 @@ const fn feature_label(f: Feature) -> &'static str {
              [feature: task-loop-function-state]"
         }
         Feature::StreamHandlerCapture => {
-            "a `Stream.stream` handler is rebuilt for every request, so each value \
-             it captures is copied into it — this capture cannot be copied (a \
+            "this handler (a `Stream.stream` request handler or a `Ui`/`Html` \
+             event handler) is shared and called again and again, so each value it \
+             captures is copied into it — this capture cannot be copied (a \
              function bound through a tuple/record destructure, a `Task`/`Cmd`/\
              `Sub`, or a value whose type could not be determined); bind a \
              captured function with a plain `let f = …` or take it as a parameter, \
