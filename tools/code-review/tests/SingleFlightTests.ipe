@@ -995,7 +995,9 @@ refuseDraftTyped settings a b =
 -- opened, and the save's banner the refusal's fixed text, which says
 -- nothing was saved rather than that a save failed. Red if `decisionTask`
 -- decides a unit or file the reviewer was not shown, a refusal is read as a
--- failure, or a stale click's banner says anything else.
+-- failure, or a stale click's banner says anything else. A click on a
+-- still-queued unit while the queue reloads is refused the same way, so the
+-- refusal's text names that cause too.
 decisionRefusedBeforeReading : Task.Task Error Bool
 decisionRefusedBeforeReading =
     do
@@ -1009,6 +1011,7 @@ decisionRefusedBeforeReading =
         notShown <- App.decisionTask settings macKey (queueModel [ a, b ] (ViewShown a)) OnUnit b.unit.uid LibDb.Approved
         fileOffList <- App.decisionTask settings macKey (queueModel [ a, b ] (ViewShown a)) OnRefusal (uid "r-blocking") LibDb.Approved
         fileBlocking <- App.decisionTask settings macKey (withRefusal blockingRow (queueModel [ a, b ] (ViewShown a))) OnRefusal (uid "r-blocking") LibDb.Approved
+        whileReloading <- App.decisionTask settings macKey (reloadingModel a) OnUnit a.unit.uid LibDb.Approved
         cleanupIndex at.indexDb at.repo
         Task.succeed
             (staleBannerShown settings (queueModel [ a ] (ViewShown a)) OnUnit b.unit.uid offList (SaveRefused NotQueued)
@@ -1017,10 +1020,32 @@ decisionRefusedBeforeReading =
                 && refusalOf notShown == Just SourceNotShown
                 && refusalOf fileOffList == Just FileNotQueued
                 && refusalOf fileBlocking == Just FileNotAcknowledgeable
+                && refusalOf whileReloading == Just NotQueued
+                && stillQueuedCauseAdmitted (Failure.saveFailureText (SaveRefused NotQueued))
+                && stillQueuedCauseAdmitted (Failure.saveFailureText (SaveRefused FileNotQueued))
                 && savedRefusal (Failure.saved (Ok fileBlocking)) == Just FileNotAcknowledgeable
                 && savedRefusal (Failure.saved (Ok offList)) == Just NotQueued
                 && savedRefusal (Failure.saved (Ok notShown)) == Just SourceNotShown
             )
+
+
+-- The queue page of `a` while it reloads, so no row is listed though `a` is
+-- still queued.
+reloadingModel : Index.UnitView -> Model
+reloadingModel a =
+    { initialModel | queueState = Loading, selectedView = ViewShown a }
+
+
+-- Whether a stale-click refusal's text holds for a row that is still queued
+-- but not on the page shown, as a click during a reload or after a page
+-- change is: it claims neither that the row left the queue nor that the
+-- queue shown is current. Red if the text asserts a cause only some of its
+-- producers have.
+stillQueuedCauseAdmitted : String -> Bool
+stillQueuedCauseAdmitted text =
+    String.contains "page changed or was reloading" text
+        && not (String.contains "left the queue" text)
+        && not (String.contains "is current" text)
 
 
 -- The banner a stale click on `target` leaves once its refusal `refused`
