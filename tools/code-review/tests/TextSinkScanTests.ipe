@@ -500,16 +500,16 @@ sanctionedHtmlText =
 -- in the view.
 admittedFlattening : List String
 admittedFlattening =
-    [ "Lib/Index.ipe:noTaggedPath"
+    [ "Lib/EnvLookup.ipe:startupRefusal"
+    , "Lib/Index.ipe:noTaggedPath"
     , "Lib/Index.ipe:probeRepos"
     , "Lib/Index.ipe:rootMismatch"
     , "Lib/RepoPath.ipe:reposToError"
     , "Lib/RepoPath.ipe:rootRefusal"
     , "Lib/RepoPath.ipe:toError"
     , "Lib/Settings.ipe:rootsRefusal"
-    , "Lib/Settings.ipe:useRefusal"
+    , "Main.ipe:printStartupFailure"
     , "Main.ipe:requireLoopbackBind"
-    , "Main.ipe:requireSettings"
     ]
 
 
