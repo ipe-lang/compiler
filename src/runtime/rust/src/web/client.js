@@ -72,6 +72,7 @@ var __ipeNode = (function() {
   var appendChild = own(Node.prototype.appendChild);
   var replaceChild = own(Node.prototype.replaceChild);
   var queryAll = own(Element.prototype.querySelectorAll);
+  var fragmentQueryAll = own(DocumentFragment.prototype.querySelectorAll);
   var on = own(EventTarget.prototype.addEventListener);
   var controls = getter(HTMLFormElement.prototype, "elements");
   var parentElement = getter(Node.prototype, "parentElement");
@@ -83,7 +84,6 @@ var __ipeNode = (function() {
   var previousElementSibling = getter(Element.prototype, "previousElementSibling");
   var tagName = getter(Element.prototype, "tagName");
   var namespaceURI = getter(Element.prototype, "namespaceURI");
-  var queryOne = own(Element.prototype.querySelector);
   var closest = own(Element.prototype.closest);
   // `focus()` per element interface: HTML, SVG and MathML elements are every
   // element that has one. An interface the browser lacks is left out.
@@ -148,7 +148,18 @@ var __ipeNode = (function() {
       }
       return {node: node, depth: depth};
     },
-    firstAutofocus: function(root) { return queryOne.call(root, "[autofocus]"); },
+    // Removes `autofocus` from every element below the detached holder `tmp`
+    // (an element or a fragment), returning them in document order.
+    stripAutofocus: function(tmp) {
+      var query = tmp instanceof DocumentFragment ? fragmentQueryAll : queryAll;
+      var found = query.call(tmp, "[autofocus]");
+      var stripped = [];
+      for (var i = 0; i < found.length; i++) {
+        removeAttribute.call(found[i], "autofocus");
+        stripped.push(found[i]);
+      }
+      return stripped;
+    },
     // Whether `el` took focus: a node that cannot be focused stays unfocused.
     focus: function(el) {
       var run = null;
@@ -651,7 +662,12 @@ function __ipeReplaceHTMLPreservingFocus(container, newHTML) {
 
 // `html` parsed into a detached holder in `container`'s namespace, by the
 // document's own parser: scripting is on, as for the markup it replaces.
-function __ipeParseFor(container, html) {
+// Every `autofocus` attribute is removed before the holder's nodes connect:
+// the browser focuses an autofocus element on insertion while focus is on the
+// body, so a render the user did not cause would move focus. The runtime moves
+// focus itself (`__ipeFocusAutofocus`, `__ipeFocusAddressed`). The stripped
+// elements are pushed onto `stripped` when given.
+function __ipeParseFor(container, html, stripped) {
   // Parse the new HTML into a detached element so we can splice
   // preserved live nodes into it before committing.
   //
@@ -688,6 +704,8 @@ function __ipeParseFor(container, html) {
     tmp = __ipeDoc.create("div");
     tmp.innerHTML = html;
   }
+  var found = __ipeNode.stripAutofocus(tmp);
+  if (stripped) for (var i = 0; i < found.length; i++) stripped.push(found[i]);
   return tmp;
 }
 
@@ -835,10 +853,12 @@ function __ipeRestoreFocus(container, path, ids) {
 }
 
 // The first mount of the page focuses the element the browser would have
-// focused at load (the first `[autofocus]` below `root`) only while the load's
-// own autofocus is still due: nothing has held focus since the client started,
-// the user has not pressed a key or a pointer, and the URL names no fragment
-// target (the browser skips autofocus for one too). A later full frame only
+// focused at load (the first element its markup marks `autofocus`) only while
+// the load's own autofocus is still due: nothing has held focus since the
+// client started, the user has not pressed a key or a pointer, and the URL
+// names no fragment target (the browser skips autofocus for one too). No
+// `autofocus` attribute reaches the live DOM from a swap or a patch, so the
+// browser never focuses an inserted element itself. A later full frame only
 // puts lost focus back (`__ipeRestoreFocus`). A later patches frame moves focus
 // only through `__ipeFocusAddressed`: onto the element the server named as
 // newly autofocused, when the frame answers this tab's own event, applies as
@@ -905,11 +925,20 @@ function __ipeFragmentTarget() {
 function __ipeAutofocusDue() {
   return !__ipeMounted && !__ipeAutofocusSpent && !__ipeFragmentTarget();
 }
-function __ipeFocusAutofocus(root) {
+// Focuses `el`, the mount's first autofocus element, once the swap has landed
+// below `root`. A live field the swap spliced in its place is found by its
+// `ipe-id`; an element that did not land takes no focus.
+function __ipeFocusAutofocus(root, el) {
   var now = __ipeDoc.active();
   if (__ipeAutofocusSpent || (now && now !== __ipeDoc.body())) return;
-  var el = __ipeNode.firstAutofocus(root);
-  if (el) __ipeNode.focus(el);
+  if (!__ipeNode.contains(root, el)) {
+    var id = __ipeNode.attr(el, "ipe-id");
+    el = null;
+    if (id !== null) {
+      try { el = __ipeDoc.query("[ipe-id=" + __ipeCssString(id) + "]"); } catch (_) { el = null; }
+    }
+  }
+  if (el && __ipeNode.contains(root, el)) __ipeNode.focus(el);
 }
 
 // __ipeCopyAttrsExceptAuthority — mirror attrs from src onto dst,
@@ -951,13 +980,18 @@ function __ipePatch(t, mode) {
   // A full page (an ipe-nav or popstate fetch) contributes only its
   // `#ipe-root` contents: its head, boot block and scripts never enter the
   // live root, where script revival would run a second client.
-  var parsed = __ipeShellRoot(__ipeParseFor(root, t), t);
+  var stripped = [];
+  var parsed = __ipeShellRoot(__ipeParseFor(root, t, stripped), t);
+  var first = null;
+  for (var i = 0; i < stripped.length && first === null; i++) {
+    if (__ipeNode.contains(parsed, stripped[i])) first = stripped[i];
+  }
   var scrollX = window.scrollX, scrollY = window.scrollY;
   // Read before the swap: a fragment target the swap replaces stops matching.
   var autofocus = __ipeAutofocusDue();
   __ipeMounted = true;
   __ipeSwapPreservingFocus(root, parsed);
-  if (autofocus) __ipeFocusAutofocus(root);
+  if (autofocus && first !== null) __ipeFocusAutofocus(root, first);
   // behavior:"instant" keeps this housekeeping scroll a synchronous jump
   // even under a global `scroll-behavior: smooth`, which would otherwise
   // animate every restore and fight the caret on per-keystroke re-renders.
@@ -1589,6 +1623,11 @@ function __ipeApplyPatches(patches) {
       var valueChanged = false;
       for (var j = 0; j < keys.length; j++) {
         var k = keys[j], v = p.attrs[k];
+        // No `autofocus` reaches a live node: a later move would focus it.
+        if (String(k).toLowerCase() === "autofocus") {
+          __ipeNode.removeAttr(el, k);
+          continue;
+        }
         // Authority filter: the user is currently editing this
         // field, so the server's proposed value/checked/selected
         // would stomp in-flight keystrokes. Drop them and let the

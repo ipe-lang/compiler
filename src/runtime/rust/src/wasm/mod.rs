@@ -325,32 +325,106 @@ enum Source {
     Effect,
 }
 
+/// Where focus stood at one moment: the count of the user's focus moves so far
+/// and the element holding focus.
+#[derive(Debug, PartialEq, Eq)]
+struct FocusMark<F> {
+    epoch: u64,
+    at: Option<F>,
+}
+
 /// What caused the Msgs queued since the last render.
-enum Cause {
+enum Cause<F = web_sys::Element> {
     /// No Msg is queued.
     Idle,
-    /// Only the user's own events, with the element focused when the first
-    /// was queued.
-    User(Option<web_sys::Element>),
+    /// Only the user's own events, with focus as it stood when the first was
+    /// queued.
+    User(FocusMark<F>),
     /// At least one Cmd result or Sub delivery.
     Effect,
 }
 
-impl Cause {
-    /// The cause once a Msg from `source` joins the queue.
-    fn with(self, source: Source) -> Self {
+impl<F: PartialEq> Cause<F> {
+    /// The cause once a Msg from `source` joins the queue; `mark` reads focus
+    /// only when this Msg is the first of the user's.
+    fn with(self, source: Source, mark: impl FnOnce() -> FocusMark<F>) -> Self {
         match (self, source) {
-            (Self::Idle, Source::User) => Self::User(active_element()),
+            (Self::Idle, Source::User) => Self::User(mark()),
             (Self::User(at), Source::User) => Self::User(at),
             (Self::Idle | Self::User(_) | Self::Effect, Source::Effect)
             | (Self::Effect, Source::User) => Self::Effect,
         }
     }
+
+    /// Whether the render of these Msgs may move focus: they are all the
+    /// user's own, and focus stands at `now` where it stood when the first
+    /// was queued.
+    fn addressed(&self, now: &FocusMark<F>) -> bool {
+        match self {
+            Self::User(then) => then == now,
+            Self::Idle | Self::Effect => false,
+        }
+    }
 }
 
-/// The element holding focus in this document, when one does.
-fn active_element() -> Option<web_sys::Element> {
-    document().ok().and_then(|d| d.active_element())
+thread_local! {
+    /// The user's focus moves in this tab: each focus change or pointer press
+    /// the runtime did not cause itself, as `client.js` counts them.
+    static FOCUS_EPOCH: Cell<u64> = const { Cell::new(0) };
+    /// Set while the runtime itself moves focus.
+    static RUNTIME_FOCUSING: Cell<bool> = const { Cell::new(false) };
+    /// One-time guard for the focus-move listeners every mount shares.
+    static FOCUS_EPOCH_INSTALLED: Cell<bool> = const { Cell::new(false) };
+}
+
+/// The events that count a focus move. A key press is not one: it is what
+/// raises the user's event.
+const FOCUS_MOVE_EVENTS: &[&str] = &["focusin", "pointerdown", "mousedown", "touchstart"];
+
+/// Counts one focus move unless the runtime is moving focus itself.
+fn note_focus_move() {
+    if !RUNTIME_FOCUSING.with(Cell::get) {
+        FOCUS_EPOCH.with(|c| c.set(c.get().wrapping_add(1)));
+    }
+}
+
+/// Runs `move_focus` as the runtime's own focus move, which the epoch skips.
+fn runtime_focus(move_focus: impl FnOnce()) {
+    let was = RUNTIME_FOCUSING.with(|c| c.replace(true));
+    move_focus();
+    RUNTIME_FOCUSING.with(|c| c.set(was));
+}
+
+/// Install the capture listeners that count focus moves, once per tab.
+fn install_focus_epoch(document: &web_sys::Document) -> Result<(), MountRefusal> {
+    if FOCUS_EPOCH_INSTALLED.with(Cell::get) {
+        return Ok(());
+    }
+    for name in FOCUS_MOVE_EVENTS {
+        let event_name: &'static str = name;
+        let closure = Closure::<dyn Fn(web_sys::Event)>::new(move |_: web_sys::Event| {
+            note_focus_move();
+        });
+        document
+            .add_event_listener_with_callback_and_bool(
+                event_name,
+                closure.as_ref().unchecked_ref(),
+                true,
+            )
+            .map_err(|e| listener_refusal(event_name, &e))?;
+        // The counting listeners live for the whole tab lifetime.
+        closure.forget();
+    }
+    FOCUS_EPOCH_INSTALLED.with(|c| c.set(true));
+    Ok(())
+}
+
+/// Where focus stands in this document now.
+fn focus_mark() -> FocusMark<web_sys::Element> {
+    FocusMark {
+        epoch: FOCUS_EPOCH.with(Cell::get),
+        at: document().ok().and_then(|d| d.active_element()),
+    }
 }
 
 struct App<Model, Msg> {
@@ -474,6 +548,7 @@ where
 
     #[cfg(feature = "debugger")]
     attach_overlay_listeners(&app);
+    install_focus_epoch(&document)?;
     attach_delegated_listeners(&body, &app)?;
     attach_widget_up_listener(&body, &app)?;
     // The first paint went through `set_inner_html`, not the attribute-patch
@@ -572,6 +647,7 @@ where
 
     #[cfg(feature = "debugger")]
     attach_overlay_listeners(&app);
+    install_focus_epoch(&document)?;
     attach_delegated_listeners(&body, &app)?;
     attach_widget_up_listener(&body, &app)?;
     // Adopt does NOT repaint (the server DOM is trusted), so the widget's `state`
@@ -699,6 +775,7 @@ where
 
     #[cfg(feature = "debugger")]
     attach_overlay_listeners(&app);
+    install_focus_epoch(&document)?;
     attach_delegated_listeners(&body, &app)?;
     attach_widget_up_listener(&body, &app)?;
     attach_popstate_listener(&app, base)?;
@@ -1036,7 +1113,7 @@ where
 {
     app.queue.borrow_mut().push_back(msg);
     let cause = app.cause.replace(Cause::Idle);
-    app.cause.replace(cause.with(source));
+    app.cause.replace(cause.with(source, focus_mark));
     if app.frame_scheduled.get() {
         return;
     }
@@ -1123,13 +1200,7 @@ where
     if !scrub_active {
         let mut new_tree = (app.view)(model);
         assign_ipe_ids(&mut new_tree, ROOT_IPE_ID);
-        // Focus moves only for a render of the user's own events, and only
-        // while focus is where it was when the first of them was queued.
-        let addressed = match cause {
-            Cause::User(at) => at == active_element(),
-            Cause::Idle | Cause::Effect => false,
-        };
-        let target = if addressed {
+        let target = if cause.addressed(&focus_mark()) {
             focus_target(&app.tree.borrow(), &new_tree)
         } else {
             None
@@ -1286,15 +1357,89 @@ where
 }
 
 /// Focus the element stamped `id`; an absent or unfocusable one is left alone.
+/// The move is the runtime's own: it does not count as the user's.
 fn focus_stamped(id: &str) {
     let Ok(document) = document() else {
         return;
     };
-    let selector = format!("[ipe-id=\"{}\"]", id.replace('"', "\\\""));
-    if let Ok(Some(el)) = document.query_selector(&selector)
+    if let Ok(Some(el)) = document.query_selector(&ipe_id_selector(id))
         && let Some(html) = el.dyn_ref::<web_sys::HtmlElement>()
     {
-        let _ = html.focus();
+        runtime_focus(|| {
+            let _ = html.focus();
+        });
+    }
+}
+
+/// The selector matching the element whose `ipe-id` is exactly `id`: the id is
+/// a CSS string, `"` and `\` escaped, NUL replaced as CSS parses it, and every
+/// other control character written as its code point.
+fn ipe_id_selector(id: &str) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::with_capacity(id.len().saturating_add(12));
+    out.push_str("[ipe-id=\"");
+    for c in id.chars() {
+        match c {
+            '"' | '\\' => {
+                out.push('\\');
+                out.push(c);
+            }
+            '\0' => out.push('\u{FFFD}'),
+            c if c.is_control() => {
+                let _ = write!(out, "\\{:x} ", u32::from(c));
+            }
+            c => out.push(c),
+        }
+    }
+    out.push_str("\"]");
+    out
+}
+
+/// How a patch writes one attribute.
+#[derive(Debug, PartialEq, Eq)]
+enum AttrWrite {
+    Set,
+    Remove,
+}
+
+/// The write for attribute `key` patched to `value`: an empty value removes,
+/// and `autofocus` never reaches a live node, where a later move would focus it.
+const fn attr_write(key: &str, value: &str) -> AttrWrite {
+    if value.is_empty() || key.eq_ignore_ascii_case("autofocus") {
+        AttrWrite::Remove
+    } else {
+        AttrWrite::Set
+    }
+}
+
+/// Replace `el`'s children with `html`, parsed detached in `el`'s own context,
+/// every `autofocus` removed before the nodes connect: the browser focuses an
+/// autofocus element on insertion while focus is on the body.
+fn replace_children_html(document: &web_sys::Document, el: &web_sys::Element, html: &str) {
+    let local = el.local_name();
+    let ns = el.namespace_uri();
+    // A template's markup lands in its inert content, never in the document.
+    if local == "template" && ns.as_deref() == Some("http://www.w3.org/1999/xhtml") {
+        el.set_inner_html(html);
+        return;
+    }
+    let Ok(holder) = document.create_element_ns(ns.as_deref(), &local) else {
+        console_fatal("PatchTargetLost", "detached patch holder refused");
+        return;
+    };
+    holder.set_inner_html(html);
+    while let Ok(Some(found)) = holder.query_selector("[autofocus]") {
+        if found.remove_attribute("autofocus").is_err() {
+            console_fatal("PatchTargetLost", "autofocus could not be removed");
+            return;
+        }
+    }
+    el.set_text_content(None);
+    while let Some(child) = holder.first_child() {
+        if el.append_child(&child).is_err() {
+            console_fatal("PatchTargetLost", "patched node could not be attached");
+            return;
+        }
     }
 }
 
@@ -1306,8 +1451,7 @@ fn apply_patches(patches: &[Patch]) {
         return;
     };
     for p in patches {
-        let selector = format!("[ipe-id=\"{}\"]", p.id.replace('"', "\\\""));
-        let Ok(Some(el)) = document.query_selector(&selector) else {
+        let Ok(Some(el)) = document.query_selector(&ipe_id_selector(&p.id)) else {
             // A stale id can appear when a parent html-replace in this same
             // batch already rewrote the subtree — benign, matching client.js.
             continue;
@@ -1322,7 +1466,7 @@ fn apply_patches(patches: &[Patch]) {
         if let Some(html) = &p.html {
             // Sanitiser-gated: `Patch.html` is produced exclusively by
             // `render_html` over the new subtree.
-            el.set_inner_html(html);
+            replace_children_html(&document, &el, html);
         }
         for (k, v) in &p.attrs {
             // `CustomElement.node` down-state: on a compiler-generated `ipe-ce-*` node the
@@ -1334,11 +1478,14 @@ fn apply_patches(patches: &[Patch]) {
                 widget::set_widget_down_property(&el, v);
                 continue;
             }
-            if v.is_empty() {
-                let _ = el.remove_attribute(k);
-            } else {
-                let _ = el.set_attribute(k, v);
-                sync_dom_property(&el, k, v);
+            match attr_write(k, v) {
+                AttrWrite::Remove => {
+                    let _ = el.remove_attribute(k);
+                }
+                AttrWrite::Set => {
+                    let _ = el.set_attribute(k, v);
+                    sync_dom_property(&el, k, v);
+                }
             }
         }
     }
@@ -1369,5 +1516,79 @@ fn sync_dom_property(el: &web_sys::Element, key: &str, val: &str) {
             }
         }
         _ => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use wasm_bindgen_test::wasm_bindgen_test;
+
+    fn mark(epoch: u64, at: u8) -> FocusMark<u8> {
+        FocusMark {
+            epoch,
+            at: Some(at),
+        }
+    }
+
+    #[wasm_bindgen_test]
+    fn a_batch_of_the_users_own_events_with_focus_unmoved_is_addressed() {
+        let cause = Cause::Idle
+            .with(Source::User, || mark(3, 1))
+            .with(Source::User, || mark(4, 2));
+        assert!(cause.addressed(&mark(3, 1)));
+        assert!(!cause.addressed(&mark(4, 2)));
+    }
+
+    #[wasm_bindgen_test]
+    fn a_batch_an_effect_joined_never_moves_focus() {
+        let before = Cause::Idle
+            .with(Source::Effect, || mark(0, 1))
+            .with(Source::User, || mark(0, 1));
+        assert!(!before.addressed(&mark(0, 1)));
+        let after = Cause::Idle
+            .with(Source::User, || mark(0, 1))
+            .with(Source::Effect, || mark(0, 1))
+            .with(Source::User, || mark(0, 1));
+        assert!(!after.addressed(&mark(0, 1)));
+        assert!(!Cause::<u8>::Idle.addressed(&mark(0, 1)));
+    }
+
+    #[wasm_bindgen_test]
+    fn focus_moved_between_queue_and_frame_is_not_addressed() {
+        let cause = Cause::Idle.with(Source::User, || mark(5, 1));
+        assert!(!cause.addressed(&mark(6, 1)));
+        assert!(!cause.addressed(&mark(5, 2)));
+        assert!(!cause.addressed(&FocusMark { epoch: 5, at: None }));
+    }
+
+    #[wasm_bindgen_test]
+    fn the_runtimes_own_focus_move_is_not_the_users() {
+        let start = FOCUS_EPOCH.with(Cell::get);
+        runtime_focus(note_focus_move);
+        assert_eq!(FOCUS_EPOCH.with(Cell::get), start);
+        assert!(!RUNTIME_FOCUSING.with(Cell::get));
+        note_focus_move();
+        assert_eq!(FOCUS_EPOCH.with(Cell::get), start.wrapping_add(1));
+    }
+
+    #[wasm_bindgen_test]
+    fn an_ipe_id_selector_cannot_leave_its_string() {
+        assert_eq!(ipe_id_selector("r_0_1"), r#"[ipe-id="r_0_1"]"#);
+        assert_eq!(
+            ipe_id_selector(r#"a"],[autofocus"#),
+            r#"[ipe-id="a\"],[autofocus"]"#
+        );
+        assert_eq!(ipe_id_selector(r#"a\"b"#), r#"[ipe-id="a\\\"b"]"#);
+        assert_eq!(ipe_id_selector("a\nb\0"), "[ipe-id=\"a\\a b\u{FFFD}\"]");
+    }
+
+    #[wasm_bindgen_test]
+    fn a_patch_never_writes_autofocus() {
+        assert_eq!(attr_write("autofocus", ""), AttrWrite::Remove);
+        assert_eq!(attr_write("autofocus", "autofocus"), AttrWrite::Remove);
+        assert_eq!(attr_write("AutoFocus", "true"), AttrWrite::Remove);
+        assert_eq!(attr_write("class", "a"), AttrWrite::Set);
+        assert_eq!(attr_write("class", ""), AttrWrite::Remove);
     }
 }
