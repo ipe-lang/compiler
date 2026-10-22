@@ -9209,7 +9209,7 @@ mod base_path_tests {
     }
 
     /// The text of `function {name}(` in `js`, up to its closing line.
-    fn js_function(js: &str, name: &str) -> Option<&str> {
+    fn js_function<'a>(js: &'a str, name: &str) -> Option<&'a str> {
         let open = format!("\nfunction {name}(");
         let rest = js.get(js.find(&open)?..)?;
         rest.get(..rest.find("\n}\n")?)
