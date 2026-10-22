@@ -23,6 +23,9 @@ module TestSupport exposing
     , check
     , checkReporting
     , onFreshReview
+    , withReviewDb
+    , bracketDb
+    , applyEdits
     , indexSchemaStatements
     , execIndexSchema
     , seedIndexDb
@@ -425,12 +428,57 @@ onFreshReview name f =
 onReviewAt : String -> (Db -> Task.Task Error Bool) -> Task.Task Error Bool
 onReviewAt reviewDb f =
     do
-        db <- migratedReviewAt reviewDb
-        ok <- f db
+        loc <- Settings.parseReviewDb reviewDb
+        key <- testReviewKey
+        LibDb.probe key loc
+        ok <- withReviewDb loc f
         removeFileIfAny reviewDb
         removeFileIfAny (reviewDb ++ "-wal")
         removeFileIfAny (reviewDb ++ "-shm")
         Task.succeed ok
+
+
+-- The review database at `loc` handed to `body`, and closed once `body`
+-- settles, on success and on failure alike; `body`'s result or error is then
+-- passed on unchanged.
+withReviewDb : Settings.ReviewFile -> (Db -> Task.Task Error a) -> Task.Task Error a
+withReviewDb loc body =
+    bracketDb (LibDb.openAt loc) body
+
+
+-- The database `open` yields handed to `body`, then closed whichever way
+-- `body` settles: the outcome is held as a `Result` across the one close, so
+-- the success and the failure path share it. A test that opens through here
+-- leaves no pool open on its file, so it never deletes the file under a live
+-- pool, nor reads through a pool opened before another one changed the file.
+bracketDb : Task.Task Error Db -> (Db -> Task.Task Error a) -> Task.Task Error a
+bracketDb open body =
+    open
+        |> Task.andThen
+            (\db ->
+                body db
+                    |> Task.map Ok
+                    |> Task.onError (\e -> Task.succeed (Err e))
+                    |> Task.andThen (\outcome -> Db.close db |> Task.andThen (\_ -> Task.fromResult outcome))
+            )
+
+
+-- `edits`, made outside the tool, run in order on one connection of `db`
+-- in one transaction, after a read of the schema table. A pooled connection
+-- keeps the schema it last read, and SQLite refuses a `CREATE TRIGGER` or a
+-- rename onto a name that stale schema still holds without reading it
+-- again, so an edit run on whichever connection the pool hands out passes or
+-- fails by which one it got. The read loads the file's schema as it stands,
+-- and the transaction holds every edit on that connection.
+applyEdits : Db -> List String -> Task.Task Error ()
+applyEdits db edits =
+    Db.withTransaction db
+        (\tx ->
+            do
+                Db.queryDecode tx "SELECT COUNT(*) AS total FROM sqlite_master" [] totalDecoder
+                Task.sequence (List.map (\sql -> Db.exec tx sql []) edits)
+                Task.succeed ()
+        )
 
 
 -- One named check. A check whose task fails is reported by name with its
