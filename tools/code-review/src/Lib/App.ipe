@@ -524,8 +524,9 @@ keyActionMsg settings action model =
 -- The open panel's draft is parsed into a bounded `Reason` here, the one
 -- point where the reviewer's text enters; a blank or over-long draft stays
 -- open with why. A submit for any row or target but the one the panel is
--- open on decides nothing and keeps the draft. The panel is closed before the
--- decision is asked, so the decision's own state is what the row shows.
+-- open on decides nothing and keeps the draft. The panel closes only when a
+-- save starts (the saving state holds no panel); a refused save keeps the
+-- panel and the draft.
 submitRefuse : Settings.AppSettings -> Model -> DecisionTarget -> Uid -> ( Model, Cmd Msg )
 submitRefuse settings model target uid =
     case Queue.openRow model.decision of
