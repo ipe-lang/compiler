@@ -7,6 +7,7 @@ import Ipe.Io as Io
 import Ipe.List as List
 import Ipe.Maybe as Maybe
 import Ipe.String as String
+import Ipe.System as System
 import Ipe.Task as Task
 import Ipe.Ui as Ui
 import Lib.App as App exposing (Model, Msg(..), Page(..))
@@ -337,7 +338,7 @@ refusalPanelLivesInIdleSlot settings a b =
             { shown | selected = 1, selectedView = ViewShown b }
 
         otherSaving =
-            after settings [ ApproveUnit ua ] secondShown
+            { secondShown | decision = DecisionSaving ua settings.epoch }
 
         otherRefused =
             after settings [ RefuseStart ub ] otherSaving
@@ -1476,12 +1477,15 @@ enterRefusesOpenFile =
     do
         at <- freshScratch "ipe-single-flight-enter"
         seedIndex at.indexDb at.repo
+        System.setenv "IPE_REVIEW_DB" at.reviewDb
+        _ <- migratedReviewAt at.reviewDb
         execIndex at.indexDb
             "INSERT INTO refusals (uid, path, lang, reason, size, digest) VALUES (?, ?, 'other', 'symlink-entry', NULL, ?)"
             [ Uid.toSql (uid "r-link"), SqlString "ipe:src/link.txt", SqlString ("refusal-blake3:" ++ String.repeat 64 "a") ]
         settings <- envAppSettings
         loaded <- loadPageNow Index.Start
         cleanupIndex at.indexDb at.repo
+        removeFileIfAny at.reviewDb
         Task.succeed (enteredOnFile settings { initialModel | queueState = Loaded { loaded | log = LibDb.ShownProven } })
 
 
