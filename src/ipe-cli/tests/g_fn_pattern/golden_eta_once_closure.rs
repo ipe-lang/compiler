@@ -491,3 +491,158 @@ fn destructure_thunk_over_a_function_param_builds_and_runs() {
         outcome.stdout
     );
 }
+
+/// A `Ui.onKeyDown` handler built as a partial over a task parameter.
+///
+/// The handler normal form wraps the partial in the callback closure itself,
+/// which moves the non-`Clone` task out on its first key press.
+const UI_HANDLER_MOVES_TASK: &str = r#"module Main exposing (main)
+
+import Ipe.Error as Error exposing (Error)
+import Ipe.Html as Html
+import Ipe.Io as Io
+import Ipe.Task as Task
+import Ipe.Ui as Ui exposing (Element)
+
+
+type Msg
+    = KeyDown Int String
+
+
+h : Task Error Int -> String -> Msg
+h _ key =
+    KeyDown 0 key
+
+
+view : Task Error Int -> Element Msg
+view t =
+    Ui.column [ Ui.onKeyDown (h t) ] []
+
+
+main : Task Error ()
+main =
+    Io.println (Html.render (Ui.layout [] (view (Task.succeed 1))))
+"#;
+
+/// A `Lazy.lazy` view built as a partial over a task parameter.
+const LAZY_VIEW_MOVES_TASK: &str = r#"module Main exposing (main)
+
+import Ipe.Error as Error exposing (Error)
+import Ipe.Html as Html
+import Ipe.Io as Io
+import Ipe.Task as Task
+import Ipe.Ui as Ui exposing (Element)
+import Ipe.Ui.Lazy as Lazy
+
+
+type Msg
+    = NoOp
+
+
+h : Task Error Int -> String -> Element Msg
+h _ label =
+    Ui.text label
+
+
+view : Task Error Int -> Element Msg
+view t =
+    Ui.column [] [ Lazy.lazy (h t) "x" ]
+
+
+main : Task Error ()
+main =
+    Io.println (Html.render (Ui.layout [] (view (Task.succeed 1))))
+"#;
+
+/// A `Task.retryWith` over a task parameter: each retry re-runs the moved task.
+const RETRY_MOVES_TASK: &str = r#"module Main exposing (main)
+
+import Ipe.Error as Error exposing (Error)
+import Ipe.Io as Io
+import Ipe.String
+import Ipe.Task as Task
+
+
+retried : Task Error Int -> Task Error Int
+retried t =
+    Task.retryWith Task.defaultRetryPolicy t
+
+
+main : Task Error ()
+main =
+    Task.andThen (\n -> Io.println (String.fromInt n)) (retried (Task.succeed 1))
+"#;
+
+/// `Ui.onKeyDown`: the eta-wrapped key handler moves `t` out of the callback.
+#[test]
+fn ui_on_key_down_handler_moving_a_task_is_refused_at_the_capture() {
+    assert_source_refused_at_capture(
+        "eta_once_ui_on_key_down_task",
+        UI_HANDLER_MOVES_TASK,
+        "t) ]",
+    );
+}
+
+/// `Lazy.lazy`: the view closure moves `t` out on its first render.
+#[test]
+fn lazy_lazy_view_moving_a_task_is_refused_at_the_capture() {
+    assert_source_refused_at_capture("eta_once_lazy_lazy_task", LAZY_VIEW_MOVES_TASK, "t) \"x\"");
+}
+
+/// `Task.retryWith`: the re-run thunk moves `t` out on its first attempt.
+#[test]
+fn task_retry_with_moving_a_task_is_refused_at_the_capture() {
+    assert_source_refused_at_capture(
+        "eta_once_task_retry_with_task",
+        RETRY_MOVES_TASK,
+        "t\n\n\nmain",
+    );
+}
+
+/// `Ui.onKeyDown` used point-free: its handler is never in the lowerer's hands.
+const UI_ON_KEY_DOWN_POINT_FREE: &str = r#"module Main exposing (main)
+
+import Ipe.Error as Error exposing (Error)
+import Ipe.Html as Html
+import Ipe.Io as Io
+import Ipe.List as List
+import Ipe.Task as Task
+import Ipe.Ui as Ui exposing (Element)
+
+
+type Msg
+    = KeyDown String
+
+
+view : Element Msg
+view =
+    Ui.column (List.map Ui.onKeyDown [ KeyDown ]) []
+
+
+main : Task Error ()
+main =
+    Io.println (Html.render (Ui.layout [] view))
+"#;
+
+/// `Ui.onKeyDown` point-free fails closed with IPE-L0152, naming the kernel.
+#[test]
+fn ui_on_key_down_point_free_is_refused_as_unsaturated() {
+    let (built, _) = build_source(
+        "eta_once_ui_on_key_down_point_free",
+        UI_ON_KEY_DOWN_POINT_FREE,
+    );
+    assert!(
+        matches!(
+            &built,
+            Err(CliError::Pipeline { diag, .. })
+                if matches!(
+                    diag.as_ref(),
+                    Diagnostic::Lower {
+                        msg: LowerError::UnsaturatedHandlerKernel { kernel },
+                        ..
+                    } if kernel.as_ref() == "Ui.onKeyDown"
+                )
+        ),
+        "a point-free `Ui.onKeyDown` must fail closed with IPE-L0152, got {built:?}"
+    );
+}

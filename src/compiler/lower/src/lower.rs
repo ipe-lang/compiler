@@ -10886,20 +10886,43 @@ fn reject_off_intercept_store_kernel(callee: &Callee, span: Span) -> DResult<()>
     Ok(())
 }
 
-/// Fail-closed SEAL gate for a partial or point-free capture-cloned handler kernel (`Stream.stream`).
+/// The core of `expr` under its leading plain `let`s (every binder a `PVar`).
 ///
-/// The backend re-wraps the handler argument with a per-call `.clone()` of
-/// every free local. In a partial application (eta-expanded) or a point-free
-/// reify, the handler is the synthesized closure's own parameter — a bare
-/// `Box<dyn Fn>` with no `Clone` (E0599) and no `Sync` (E0277) — and the
-/// handler-capture gate never sees the handler's captures. Refuse with
-/// IPE-L0152 (the kernel is legal only saturated — a distinct fact from the
-/// non-`Clone` capture refusal, IPE-L0126); a piped `<|` / `|>` spine is
-/// flattened to the saturated call first, so only a genuinely unsaturated use
-/// reaches here. A no-op (`Ok`) for every other callee.
-fn reject_unsaturated_handler_kernel(callee: &Callee, span: Span) -> DResult<()> {
+/// A plain `let` lowers to an IR `Let` of the same name, so the core is the
+/// canon source of the IR core [`Lowerer::normalize_handler`] peels; a
+/// destructuring `let` stays part of the core, as it does in the IR.
+fn plain_let_core(expr: &canon::Expr) -> &canon::Expr {
+    let mut core = expr;
+    while let canon::Expr_::Let(bindings, body) = &core.value
+        && bindings
+            .iter()
+            .all(|b| matches!(b.pat.value, canon::Pattern_::PVar(_)))
+    {
+        core = body;
+    }
+    core
+}
+
+/// Fail-closed SEAL gate for an adapted-callback kernel whose handler is not supplied.
+///
+/// Every adapted slot ([`KernelFn::adapted_slots`]) must hold a closure
+/// literal the capture analysis classified
+/// ([`Lowerer::normalize_adapted_handler_args`]). A slot at or past the
+/// `supplied` argument count is bound later: in a partial application
+/// (eta-expanded) or a point-free reify (`supplied` is zero) the handler is
+/// the synthesized closure's own parameter, a bare `Box<dyn Fn>` the backend
+/// could only re-embed inside a closure of its own, whose `Clone`, `Sync` and
+/// per-call move the analysis never saw. Refuse with IPE-L0152 (the handler
+/// is legal only supplied at the call, a distinct fact from the non-`Clone`
+/// capture refusal, IPE-L0126). A partial application whose handlers are all
+/// supplied (`List.map (Lazy.lazy view) items`) passes, and a piped `<|` /
+/// `|>` spine is flattened to the saturated call first. A no-op (`Ok`) for
+/// every other callee.
+fn reject_unsaturated_handler_kernel(callee: &Callee, supplied: usize, span: Span) -> DResult<()> {
     if let Callee::Kernel(k) = callee
-        && k.capture_cloned_handler_arg().is_some()
+        && k.adapted_slots()
+            .iter()
+            .any(|slot| usize::from(slot.arg()) >= supplied)
     {
         let d = k.decl();
         let kernel = format!("{}.{}", d.qualifier, d.name).into_boxed_str();
@@ -20385,22 +20408,24 @@ impl<'a> Lowerer<'a> {
         out
     }
 
-    /// Refuse a non-`Clone` capture of a kernel handler the backend re-wraps with capture clones.
+    /// Refuse a non-`Clone` capture of a source-lambda handler of a `+Sync` callback kernel.
     ///
-    /// The backend rebuilds the handler at `KernelFn::capture_cloned_handler_arg`
-    /// inside a fresh `move` closure and shadows each free local with
-    /// `.clone()`. Every capture is classified by [`classify_handler_capture`]:
-    /// a `Copy` leaf, a `Clone` carrier, or a promotable pure-`Fun` binder (its
-    /// binder site promotes it to the `Arc` carrier; recorded as a deferred
-    /// capture, so a binder that cannot promote re-raises IPE-L0126) pass. A
-    /// non-`Clone` capture (a destructure-bound `Box<dyn Fn>`, a task, a
-    /// decoder) fails closed with IPE-L0126 at the capture instead of a
-    /// cargo-time E0599; a capture whose type does not resolve is refused by
-    /// [`Self::used_binder_ir_type`] before classification. The saturated call is the
-    /// only shape that reaches the handler: a piped spine is flattened in
-    /// [`Self::lower_call`] and a partial or point-free use is refused by
-    /// [`reject_unsaturated_handler_kernel`].
-    fn reject_nonclone_handler_capture(
+    /// A [`KernelFn::requires_sync_capture`] kernel drives the `Arc<dyn Fn>`
+    /// carrier promotion of a pure-`Fun` binder its handler captures, so each
+    /// capture of a source-lambda handler in one of its adapted slots
+    /// ([`KernelFn::adapted_slots`]) is classified by
+    /// [`classify_handler_capture`]: a `Copy` leaf, a `Clone` carrier, or a
+    /// promotable pure-`Fun` binder (recorded as a deferred capture, so a binder
+    /// that cannot promote re-raises IPE-L0126) pass. A non-`Clone` capture (a
+    /// destructure-bound `Box<dyn Fn>`, a task, a decoder) fails closed with
+    /// IPE-L0126 at the capture; a capture whose type does not resolve is
+    /// refused by [`Self::used_binder_ir_type`] before classification. Every
+    /// other handler shape is classified where
+    /// [`Self::normalize_adapted_handler_args`] builds its closure. The
+    /// saturated call is the only shape that reaches a handler: a piped spine
+    /// is flattened in [`Self::lower_call`] and an unsupplied handler is
+    /// refused by [`reject_unsaturated_handler_kernel`].
+    fn reject_nonclone_sync_handler_capture(
         &self,
         callee: &Callee,
         args: &[canon::Expr],
@@ -20408,30 +20433,193 @@ impl<'a> Lowerer<'a> {
         let Callee::Kernel(kernel) = callee else {
             return Ok(());
         };
-        let Some(handler) = kernel
-            .capture_cloned_handler_arg()
-            .and_then(|i| args.get(i))
-        else {
+        if !kernel.requires_sync_capture() {
             return Ok(());
-        };
-        for (sym, capture_span, binder_ty) in self.captured_locals_at(&[], handler)? {
-            let promotable = self.promotable_fn_binders.borrow().contains(&sym);
-            let class = classify_handler_capture(
-                self.clone_env(),
-                Some(binder_ty.classified()),
-                promotable,
-            );
-            if !class.admitted() {
-                return Err(unsupported(capture_span, Feature::StreamHandlerCapture));
+        }
+        for slot in kernel.adapted_slots() {
+            let Some(handler) = args.get(usize::from(slot.arg())) else {
+                continue;
+            };
+            if !matches!(handler.value, canon::Expr_::Lambda(..)) {
+                continue;
             }
-            if class == HandlerCapture::ArcCarrier {
-                self.deferred_fun_captures
-                    .borrow_mut()
-                    .entry(sym)
-                    .or_insert(capture_span);
+            for (sym, capture_span, binder_ty) in self.captured_locals_at(&[], handler)? {
+                let promotable = self.promotable_fn_binders.borrow().contains(&sym);
+                let class = classify_handler_capture(
+                    self.clone_env(),
+                    Some(binder_ty.classified()),
+                    promotable,
+                );
+                if !class.admitted() {
+                    return Err(unsupported(capture_span, Feature::StreamHandlerCapture));
+                }
+                if class == HandlerCapture::ArcCarrier {
+                    self.deferred_fun_captures
+                        .borrow_mut()
+                        .entry(sym)
+                        .or_insert(capture_span);
+                }
             }
         }
         Ok(())
+    }
+
+    /// Put every supplied adapted-callback slot of `callee` in handler normal form.
+    ///
+    /// The backend emits the closure an adapted slot
+    /// ([`KernelFn::adapted_slots`]) holds as the runtime callback itself, so
+    /// each slot must hold leading `let`s around one closure literal: the
+    /// capture analysis then classifies the closure the program actually
+    /// runs, and the backend never re-embeds an argument's code inside a
+    /// `move` of its own. A function-valued slot ([`AdaptedSlot::Arg`], an
+    /// arrow-typed [`AdaptedSlot::FormHandler`], each function field of an
+    /// [`AdaptedSlot::Field`] record literal) goes through
+    /// [`Self::normalize_handler`]; a [`AdaptedSlot::Thunk`] task becomes the
+    /// zero-parameter closure that re-runs it. Each eta block drawn is charged
+    /// to `site` and the grown demand returned; a site past
+    /// [`MAX_ETA_PER_SITE`] fails closed with IPE-L0155. A slot past the
+    /// supplied arguments is left alone (refused by
+    /// [`reject_unsaturated_handler_kernel`]), and a record argument that is
+    /// not a literal is left for the backend to refuse.
+    fn normalize_adapted_handler_args(
+        &self,
+        callee: &Callee,
+        args: &[canon::Expr],
+        lowered_args: &mut [Expr],
+        site: EtaDemand,
+        span: Span,
+    ) -> DResult<EtaDemand> {
+        const SITE: &str = "ipe_lower::normalize_adapted_handler_args";
+        let Callee::Kernel(kernel) = callee else {
+            return Ok(site);
+        };
+        let mut site = site;
+        for &slot in kernel.adapted_slots() {
+            let index = usize::from(slot.arg());
+            let (Some(canon_arg), Some(lowered)) = (args.get(index), lowered_args.get_mut(index))
+            else {
+                continue;
+            };
+            let arity = kernel
+                .adapted_slot_arity(slot)
+                .ok_or_else(|| bug(SITE, "an adapted slot does not fit its kernel's scheme"))?;
+            match slot {
+                ipe_kernels::AdaptedSlot::Arg(_) => {
+                    site = self.normalize_handler(canon_arg, lowered, arity, site, span)?;
+                }
+                ipe_kernels::AdaptedSlot::FormHandler(_) => {
+                    if matches!(self.region_ty(canon_arg.span), Some(Ty::Fun(..))) {
+                        site = self.normalize_handler(canon_arg, lowered, arity, site, span)?;
+                    }
+                }
+                ipe_kernels::AdaptedSlot::Field { .. } => {
+                    let (canon::Expr_::Record(canon_fields), Expr::Record { fields, .. }) =
+                        (&canon_arg.value, lowered)
+                    else {
+                        continue;
+                    };
+                    for (name, field) in fields.iter_mut() {
+                        let Some((_, canon_field)) = canon_fields.iter().find(|(n, _)| *n == *name)
+                        else {
+                            continue;
+                        };
+                        if matches!(self.region_ty(canon_field.span), Some(Ty::Fun(..))) {
+                            site = self.normalize_handler(canon_field, field, arity, site, span)?;
+                        }
+                    }
+                }
+                ipe_kernels::AdaptedSlot::Thunk(_) => {
+                    let task_ty = self
+                        .region_ty(canon_arg.span)
+                        .ok_or_else(|| bug(SITE, "no inferred type for a re-run task argument"))?;
+                    let ret = self.ir_type_from_ty_json(task_ty, canon_arg.span)?;
+                    let task = std::mem::replace(lowered, Expr::Unit);
+                    *lowered = self.clone_eta_body_captures(
+                        &[canon_arg],
+                        canon_arg.span,
+                        Vec::new(),
+                        ret,
+                        task,
+                    )?;
+                }
+            }
+        }
+        Ok(site)
+    }
+
+    /// Rewrite the function-valued handler `slot` (canon source `canon`) into handler normal form.
+    ///
+    /// The leading `let`s are kept outside, evaluated once where the handler
+    /// is built. A closure-literal core stays as it is; any other core (a
+    /// variable, a call returning a function, an `if`, a `case`) is
+    /// eta-wrapped into `\x1..xn -> core x1..xn` over the slot's `arity`
+    /// parameters, re-evaluated per call exactly as the kernel would call it.
+    /// The wrap's captures are the locals free in the canon core (the source
+    /// under its leading plain `let`s) and are classified by
+    /// [`Self::clone_eta_body_captures`]: a `Clone` capture clones, a moved
+    /// non-`Clone` one makes the closure an [`Expr::OnceLambda`] the once check
+    /// refuses with IPE-L0126. The wrap's eta block is charged to `site`.
+    fn normalize_handler(
+        &self,
+        canon: &canon::Expr,
+        slot: &mut Expr,
+        arity: usize,
+        site: EtaDemand,
+        span: Span,
+    ) -> DResult<EtaDemand> {
+        let mut lets: Vec<(Symbol, Expr)> = Vec::new();
+        let mut core = std::mem::replace(slot, Expr::Unit);
+        while let Expr::Let { name, value, body } = core {
+            lets.push((name, *value));
+            core = *body;
+        }
+        let mut site = site;
+        if !matches!(
+            core,
+            Expr::Lambda { .. } | Expr::SharedLambda { .. } | Expr::OnceLambda { .. }
+        ) {
+            site = site
+                .charge(arity)
+                .ok_or_else(|| unsupported(span, Feature::EtaSiteLimit))?;
+            let (arg_tys, ret_ty) = self.callee_arrow(
+                canon.span,
+                arity,
+                "ipe_lower::normalize_handler",
+                (
+                    "no inferred type for an adapted handler",
+                    "adapted handler type has fewer arrows than its slot",
+                ),
+            )?;
+            let mut params: Vec<(Symbol, IrType)> = Vec::with_capacity(arity);
+            for (offset, arg_ty) in arg_tys.into_iter().enumerate() {
+                params.push((
+                    self.eta_sym(offset)?,
+                    self.ir_type_from_ty_json(arg_ty, canon.span)?,
+                ));
+            }
+            self.advance_eta(arity);
+            let ret = self.ir_type_from_ty_json(ret_ty, canon.span)?;
+            let body = Expr::Apply {
+                func: Box::new(core),
+                args: params.iter().map(|&(sym, _)| Expr::Var(sym)).collect(),
+            };
+            core = self.clone_eta_body_captures(
+                &[plain_let_core(canon)],
+                canon.span,
+                params,
+                ret,
+                body,
+            )?;
+        }
+        *slot = lets
+            .into_iter()
+            .rev()
+            .fold(core, |body, (name, value)| Expr::Let {
+                name,
+                value: Box::new(value),
+                body: Box::new(body),
+            });
+        Ok(site)
     }
 
     /// Install `scope` into `promotable_fn_binders` and return the displaced state.
@@ -23144,7 +23332,7 @@ impl<'a> Lowerer<'a> {
                 // [`reject_point_free_store_kernel`].
                 reject_point_free_store_kernel(&callee, e.span)?;
                 self.reject_unintercepted_select_to(&callee, e.span)?;
-                reject_unsaturated_handler_kernel(&callee, e.span)?;
+                reject_unsaturated_handler_kernel(&callee, 0, e.span)?;
                 // A point-free collection kernel receives its collection later,
                 // so the element-capability gate reads the reference's arrow.
                 self.reject_fn_element_for_capability_kernel(&callee, e.span, &[])?;
@@ -23728,9 +23916,9 @@ impl<'a> Lowerer<'a> {
         // `Call(Call(Store.mask, [.col, pred]), [base])`; the accessor intercept
         // keys on a bare `VarKernel` callee saturated to ALL its arguments, else
         // the kernel is reified point-free and rejected, IPE-L0146), or a
-        // capture-cloned handler kernel (`Stream.stream ct <| h` / `h |>
-        // Stream.stream ct`; the handler-capture gate reads the handler argument
-        // of the saturated call, else the partial is refused, IPE-L0152), or a
+        // adapted-callback kernel (`Stream.stream ct <| h` / `h |>
+        // Stream.stream ct`; the handler is normalized as an argument of the
+        // saturated call, else the partial is refused, IPE-L0152), or a
         // spine whose outer argument is a stored function read landing in a
         // direct function slot (`r.step |> Task.loop n s`; the partial's eta
         // parameter is typed on the direct carrier, so the stored read must be
@@ -23768,7 +23956,7 @@ impl<'a> Lowerer<'a> {
     /// `k a b outer`), so the slot `outer[j]` fills is the argument count of
     /// every spine level plus `j`. The rule is [`Self::spine_level_saturates`]:
     /// an accessor-intercept placeholder (`Store.mask`, `Store.eq`, …) or a
-    /// capture-cloned handler kernel (`Stream.stream`), whose saturated-call
+    /// adapted-callback kernel (`Stream.stream`, `Ui.onKeyDown`), whose saturated-call
     /// gate must observe every argument, a `selectTo*` head (always — its
     /// intercept owns every argument count), and an argument of `outer` whose
     /// carrier only the saturated call converts. Never a general currying
@@ -25270,7 +25458,7 @@ impl<'a> Lowerer<'a> {
                 // open mapper frontier (fail-closed IPE-L0134 at `ipe` time; see
                 // the method doc).
                 self.reject_fn_element_for_capability_kernel(&resolved, callee.span, args)?;
-                self.reject_nonclone_handler_capture(&resolved, args)?;
+                self.reject_nonclone_sync_handler_capture(&resolved, args)?;
                 let arity = self.callee_arity(&resolved)?;
                 // An intercept-only placeholder that is saturated or over-applied
                 // here escaped its rewrite; refuse it before any arity shape can
@@ -25317,6 +25505,16 @@ impl<'a> Lowerer<'a> {
                     )?,
                     _ => site,
                 };
+                // Every supplied adapted-callback slot takes handler normal form
+                // at the same choke point, so the saturated, partial, and
+                // over-applied shapes all hand the backend a closure literal.
+                let site = self.normalize_adapted_handler_args(
+                    &resolved,
+                    args,
+                    &mut lowered_args,
+                    site,
+                    call_span,
+                )?;
                 match args.len().cmp(&arity) {
                     std::cmp::Ordering::Equal => {
                         // pin a polymorphic kernel's genuinely-free result
@@ -26196,8 +26394,8 @@ impl<'a> Lowerer<'a> {
     /// Whether the curried spine of `kernel` (headed by `head`) whose outer `outer_len` arguments start at slot `offset` lowers as one saturated call.
     ///
     /// `carried(j)` is the carrier of outer argument `j`. True when the
-    /// kernel is an accessor-intercept placeholder or a capture-cloned
-    /// handler kernel, whose saturated-call gate must observe every argument;
+    /// kernel is an accessor-intercept placeholder or an adapted-callback
+    /// kernel, whose saturated-call gate must observe every argument;
     /// when an outer argument on `Arc` lands in a [`FnSlotCarrier::Direct`]
     /// slot; and when an outer argument in any other non-function slot is
     /// emitted on carriers the slot's eta binder ([`Self::eta_param_type`])
@@ -26211,9 +26409,7 @@ impl<'a> Lowerer<'a> {
         outer_len: usize,
         carried: impl Fn(usize) -> Carried,
     ) -> bool {
-        if kernel.is_accessor_intercept_placeholder()
-            || kernel.capture_cloned_handler_arg().is_some()
-        {
+        if kernel.is_accessor_intercept_placeholder() || kernel.has_adapted_slot() {
             return true;
         }
         let arity = usize::from(kernel.decl().arity);
@@ -26822,7 +27018,7 @@ impl<'a> Lowerer<'a> {
         // Parity twin of the reify-site refusal: a partial `selectTo*` that
         // reaches eta-expansion has no projection to decode by.
         self.reject_unintercepted_select_to(&resolved, call_span)?;
-        reject_unsaturated_handler_kernel(&resolved, call_span)?;
+        reject_unsaturated_handler_kernel(&resolved, lowered_args.len(), call_span)?;
         let (arg_tys, ret_ty) = self.callee_arrow(
             callee.span,
             arity,

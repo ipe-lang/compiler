@@ -308,13 +308,13 @@ pub(super) fn classify_capture_clone(env: CloneEnv<'_>, ir_ty: &IrType) -> Optio
     }
 }
 
-/// How a free local of a capture-cloned kernel handler survives the emitted `.clone()`.
+/// How a free local of a source-lambda handler of a `+Sync` callback kernel is admitted.
 ///
-/// The backend shadows every such capture with `let v = v.clone();` inside a
-/// fresh wrapper closure (`KernelFn::capture_cloned_handler_arg`), so only a
-/// capture proven `Clone` (or `Copy`) is sound there. `NonClone` and
-/// `Unresolved` are the refused classes: absent a resolved type there is no
-/// proof the emitted clone type-checks, so the gate fails closed.
+/// A `KernelFn::requires_sync_capture` kernel's adapted handler
+/// (`KernelFn::adapted_slots`) admits only a capture proven `Copy`, `Clone`,
+/// or promotable to the `Clone` `Arc` fn carrier. `NonClone` and `Unresolved`
+/// are the refused classes: absent a resolved type there is no proof the
+/// capture is sound in the callback, so the gate fails closed.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(super) enum HandlerCapture {
     /// A `Copy` leaf.
@@ -330,7 +330,7 @@ pub(super) enum HandlerCapture {
 }
 
 impl HandlerCapture {
-    /// Whether the emitted per-call `.clone()` of this capture is proven to type-check.
+    /// Whether this capture is proven sound in a `+Sync` callback handler.
     pub(super) const fn admitted(self) -> bool {
         match self {
             Self::CopyLeaf | Self::CloneOk | Self::ArcCarrier => true,
@@ -339,7 +339,7 @@ impl HandlerCapture {
     }
 }
 
-/// Classify one handler capture of type `ir_ty` for the capture-clone prologue.
+/// Classify one handler capture of type `ir_ty` for the `+Sync` handler-capture gate.
 ///
 /// `promotable_binder` is whether the capture's binder runs the `Arc<dyn Fn>`
 /// carrier promotion (a `let` name, a def/lambda param, a match-arm binder):
