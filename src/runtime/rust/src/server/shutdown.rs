@@ -231,20 +231,13 @@ struct Live {
 ///
 /// The count and the closing mark share one atomic, so a unit either is
 /// counted before the mark is set, or sees the mark and is born cancelled.
+#[derive(Default)]
 struct Work {
     state: AtomicUsize,
     idle: Notify,
 }
 
 impl Work {
-    /// A work count with nothing in flight.
-    const fn new() -> Self {
-        Self {
-            state: AtomicUsize::new(0),
-            idle: Notify::new(),
-        }
-    }
-
     /// The units in flight.
     fn count(&self) -> usize {
         self.state.load(Ordering::SeqCst) & !CLOSING_BIT
@@ -640,7 +633,7 @@ fn arm_in(
             count: AtomicUsize::new(0),
             idle: Notify::new(),
         }),
-        work: Arc::new(Work::new()),
+        work: Arc::new(Work::default()),
         pools,
     });
     runtime.spawn(run_signals(Arc::clone(&shutdown), source, exit));

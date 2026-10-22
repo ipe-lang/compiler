@@ -5487,7 +5487,7 @@ mod tests {
             .await
             .expect("the cancelled request is answered and closed")
             .expect("the answer reads");
-        let answer = String::from_utf8_lossy(&answer);
+        let answer = String::from_utf8(answer).expect("the answer is UTF-8");
         assert!(answer.starts_with("HTTP/1.1 503"), "got {answer:?}");
         assert!(answer.to_ascii_lowercase().contains("connection: close"));
         tokio::time::sleep(std::time::Duration::from_millis(600)).await;
