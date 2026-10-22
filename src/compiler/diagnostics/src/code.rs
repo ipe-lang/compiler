@@ -351,6 +351,8 @@ code! {
     IPE_P0069 = "IPE-P0069", "duplicate type annotation for one name", "IPE-P0069";
     /// source exceeds the addressable span range (u32 byte offsets)
     IPE_P0070 = "IPE-P0070", "source file is too large to compile", "IPE-P0070";
+    /// a `\r` not followed by `\n` — a line break the lexer and editors disagree on
+    IPE_P0071 = "IPE-P0071", "a carriage return must be followed by a newline", "IPE-P0071";
 
     // -----------------------------------------------------------------------
     // Name resolution (IPE-N####)

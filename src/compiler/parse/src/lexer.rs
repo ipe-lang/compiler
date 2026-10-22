@@ -12,6 +12,11 @@
 //! [`ParseError::NumberJoinedToName`] for `123abc`, and
 //! [`ParseError::IntLiteralOutOfRange`] for a magnitude past `2^63` (the
 //! parser refuses `2^63` itself unless a unary minus makes it `i64::MIN`).
+//!
+//! A line ends at `\n` or at a `\r\n` pair, the breaks every editor and LSP
+//! client agrees on. A `\r` not followed by `\n` ends a line for a client but
+//! would not for this lexer, so [`lex`] refuses it wherever it stands
+//! ([`ParseError::LoneCarriageReturn`]) before reading any token.
 
 use ipe_diagnostics::{DResult, Diagnostic, ParseError, Span};
 use ipe_syntax::ESCAPES;
@@ -399,7 +404,19 @@ keywords! {
     "do" => Do,
 }
 
-/// Lex `src` into tokens, or fail with a typed diagnostic.
+/// The byte offset of the first `\r` in `src` not followed by `\n`.
+///
+/// Such a byte is a line break to an LSP client and to most viewers, and is
+/// none to the lexer, so a source holding one has no single line structure.
+fn lone_carriage_return(src: &str) -> Option<usize> {
+    let bytes = src.as_bytes();
+    bytes
+        .iter()
+        .enumerate()
+        .find(|&(at, &byte)| byte == b'\r' && bytes.get(at.saturating_add(1)) != Some(&b'\n'))
+        .map(|(at, _)| at)
+}
+
 /// Whether a source of `byte_len` bytes can be spanned: every byte offset the
 /// lexer records is a `u32`, so the source must fit in `u32::MAX` bytes. The
 /// boundary is a named predicate so the refusal is testable without allocating a
@@ -408,6 +425,7 @@ fn source_offset_range_admits(byte_len: usize) -> bool {
     u32::try_from(byte_len).is_ok()
 }
 
+/// Lex `src` into tokens, or fail with a typed diagnostic.
 pub fn lex(src: &str) -> DResult<Vec<Token>> {
     // Byte offsets are stored as `u32`; a source larger than `u32::MAX` bytes
     // cannot be spanned. Refuse it here rather than clamp offsets downstream —
@@ -416,6 +434,14 @@ pub fn lex(src: &str) -> DResult<Vec<Token>> {
         return Err(Diagnostic::Parse {
             span: Span::new(0, 0),
             msg: ParseError::SourceTooLarge { bytes: src.len() },
+        });
+    }
+    if let Some(at) = lone_carriage_return(src) {
+        // `at` is below `src.len()`, which the guard above bounds by `u32::MAX`.
+        let at = u32::try_from(at).unwrap_or(u32::MAX);
+        return Err(Diagnostic::Parse {
+            span: Span::from_start_width(at, 1),
+            msg: ParseError::LoneCarriageReturn,
         });
     }
     let mut lx = Lexer::new(src);
@@ -1082,5 +1108,67 @@ mod escape_round_trip_tests {
     fn a_backslash_char_is_escaped() {
         assert_eq!(escape_char_body("\\"), "\\\\");
         assert!(lex("'\\'").is_err(), "a bare backslash char stays refused");
+    }
+}
+
+#[cfg(test)]
+mod lone_carriage_return_tests {
+    use super::lex;
+    use ipe_diagnostics::{Diagnostic, IPE_P0071, ParseError};
+
+    /// Each position a lone `\r` can stand in, as `(source, offset of the \r)`.
+    const LONE: [(&str, u32); 7] = [
+        ("x\r= 1", 1),
+        ("x = 1 -- note\rif", 13),
+        ("x = {- a\rb -} 1", 8),
+        ("x = \"\"\"\na\rb\n\"\"\"", 9),
+        ("x = 1\r", 5),
+        ("x = \"a\rb\"", 6),
+        ("x = '\r'", 5),
+    ];
+
+    /// A lone `\r` is refused with its typed error, code and one-byte span.
+    ///
+    /// The positions are whitespace, a `--` comment, a `{- -}` comment, a
+    /// `"""` body, end of input, and a one-line string or char literal.
+    #[test]
+    fn a_lone_carriage_return_is_refused_everywhere() {
+        for (src, at) in LONE {
+            let verdict = lex(src);
+            let Err(diag) = &verdict else {
+                assert!(verdict.is_err(), "{src:?} must be refused");
+                return;
+            };
+            assert_eq!(diag.code(), IPE_P0071, "{src:?}");
+            let Diagnostic::Parse { span, msg } = diag else {
+                assert!(matches!(diag, Diagnostic::Parse { .. }), "{src:?}");
+                return;
+            };
+            assert!(matches!(msg, ParseError::LoneCarriageReturn), "{src:?}");
+            assert_eq!((span.lo, span.hi), (at, at + 1), "{src:?}");
+        }
+    }
+
+    /// The `\r\n` mirror of each whitespace, comment, `"""` and end position lexes.
+    #[test]
+    fn a_carriage_return_line_feed_pair_is_accepted() {
+        for (src, _) in LONE.iter().take(5) {
+            let mirror = src.replace('\r', "\r\n");
+            assert!(lex(&mirror).is_ok(), "{mirror:?} must lex");
+        }
+    }
+
+    /// The first lone `\r` is reported even after an accepted `\r\n` pair.
+    #[test]
+    fn the_refusal_points_at_the_first_lone_carriage_return() {
+        let verdict = lex("a\r\nb\rc\r");
+        let Err(Diagnostic::Parse { span, .. }) = &verdict else {
+            assert!(
+                matches!(verdict, Err(Diagnostic::Parse { .. })),
+                "a lone `\\r` after a pair must be refused"
+            );
+            return;
+        };
+        assert_eq!(span.lo, 4);
     }
 }

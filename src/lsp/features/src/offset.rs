@@ -10,6 +10,13 @@
 //! Every function is total: out-of-range offsets, positions past the end of a
 //! line or file, and mid-code-point byte offsets all clamp to the nearest
 //! valid boundary instead of panicking.
+//!
+//! A line ends at `\n`, at a `\r\n` pair, or at a lone `\r` — the three breaks
+//! an LSP client counts. The lexer refuses a lone `\r`, so a source the
+//! compiler accepted only ever holds the first two; the mapper still counts the
+//! third so its line numbers match the client's on any buffer it is handed. A
+//! byte offset between the `\r` and the `\n` of a pair is not a position and
+//! clamps down to the `\r`.
 
 use ipe_diagnostics::Span;
 use lsp_types::{Position, Range};
@@ -42,6 +49,50 @@ fn floor_char_boundary(text: &str, byte: usize) -> usize {
     b
 }
 
+/// The largest position boundary `<= byte`: a char boundary not inside a `\r\n` pair.
+fn floor_position_boundary(text: &str, byte: usize) -> usize {
+    let b = floor_char_boundary(text, byte);
+    let bytes = text.as_bytes();
+    let inside_pair = b
+        .checked_sub(1)
+        .is_some_and(|prev| bytes.get(prev) == Some(&b'\r') && bytes.get(b) == Some(&b'\n'));
+    if inside_pair { b - 1 } else { b }
+}
+
+/// The byte range of the first line break in `text`: `\r\n`, `\n` or a lone `\r`.
+fn first_line_break(text: &str) -> Option<(usize, usize)> {
+    let at = text.find(['\n', '\r'])?;
+    let pair = text.as_bytes().get(at..at.saturating_add(2)) == Some(b"\r\n");
+    Some((at, at + if pair { 2 } else { 1 }))
+}
+
+/// The byte offset just past each line break in `text`, in order.
+fn line_break_ends(text: &str) -> impl Iterator<Item = usize> {
+    let mut start = 0usize;
+    std::iter::from_fn(move || {
+        let (_, end) = first_line_break(text.get(start..)?)?;
+        start += end;
+        Some(start)
+    })
+}
+
+/// The `(line, column)` of position boundary `byte`, counting breaks in its prefix.
+fn line_and_column(text: &str, byte: usize, encoding: PositionEncoding) -> Position {
+    let before = text.get(..byte).unwrap_or("");
+    let (line, line_start) =
+        line_break_ends(before).fold((0usize, 0usize), |(n, _), end| (n + 1, end));
+    let column: usize = before
+        .get(line_start..)
+        .unwrap_or("")
+        .chars()
+        .map(|ch| encoding.width(ch))
+        .sum();
+    Position {
+        line: u32::try_from(line).unwrap_or(u32::MAX),
+        character: u32::try_from(column).unwrap_or(u32::MAX),
+    }
+}
+
 /// A one-pass index of a document's line-start byte offsets.
 ///
 /// A feature that converts many spans in one request resolves each in
@@ -59,12 +110,7 @@ impl<'a> LineIndex<'a> {
     /// Build the index over `text` in one linear pass.
     #[must_use]
     pub fn new(text: &'a str) -> Self {
-        let mut line_starts = vec![0usize];
-        for (i, b) in text.bytes().enumerate() {
-            if b == b'\n' {
-                line_starts.push(i + 1);
-            }
-        }
+        let line_starts = std::iter::once(0).chain(line_break_ends(text)).collect();
         Self { text, line_starts }
     }
 
@@ -72,7 +118,7 @@ impl<'a> LineIndex<'a> {
     /// [`offset_to_position`] but using the prebuilt line table.
     #[must_use]
     pub fn position_of(&self, byte: usize, encoding: PositionEncoding) -> Position {
-        let byte = floor_char_boundary(self.text, byte);
+        let byte = floor_position_boundary(self.text, byte);
         // The containing line is the last line start `<= byte`.
         let line = match self.line_starts.binary_search(&byte) {
             Ok(l) => l,
@@ -102,40 +148,29 @@ impl<'a> LineIndex<'a> {
     }
 }
 
-/// Convert a byte offset into `text` to an LSP position. Clamps out-of-range
-/// and mid-code-point offsets down to the nearest char boundary.
+/// Convert a byte offset into `text` to an LSP position.
+///
+/// Out-of-range, mid-code-point and mid-`\r\n` offsets clamp down to the
+/// nearest position boundary.
 #[must_use]
 pub fn offset_to_position(text: &str, byte: usize, encoding: PositionEncoding) -> Position {
-    let byte = floor_char_boundary(text, byte);
-    let before = text.get(..byte).unwrap_or("");
-    let line = before.bytes().filter(|&b| b == b'\n').count();
-    let line_start = before.rfind('\n').map_or(0, |i| i + 1);
-    let column: usize = before
-        .get(line_start..)
-        .unwrap_or("")
-        .chars()
-        .map(|ch| encoding.width(ch))
-        .sum();
-    Position {
-        line: u32::try_from(line).unwrap_or(u32::MAX),
-        character: u32::try_from(column).unwrap_or(u32::MAX),
-    }
+    line_and_column(text, floor_position_boundary(text, byte), encoding)
 }
 
 /// Convert an LSP position to a byte offset into `text`. A line past the end
 /// of the file clamps to `text.len()`; a character past the end of its line
-/// clamps to the end of that line (before the newline).
+/// clamps to the end of that line (before its line break).
 #[must_use]
 pub fn position_to_offset(text: &str, position: Position, encoding: PositionEncoding) -> usize {
     let mut line_start = 0usize;
     for _ in 0..position.line {
-        match text.get(line_start..).and_then(|rest| rest.find('\n')) {
-            Some(nl) => line_start += nl + 1,
+        match text.get(line_start..).and_then(first_line_break) {
+            Some((_, end)) => line_start += end,
             None => return text.len(),
         }
     }
     let rest = text.get(line_start..).unwrap_or("");
-    let line_end = rest.find('\n').unwrap_or(rest.len());
+    let line_end = first_line_break(rest).map_or(rest.len(), |(at, _)| at);
     let line_text = rest.get(..line_end).unwrap_or("");
 
     let target = position.character as usize;
@@ -176,7 +211,35 @@ mod tests {
         "combining e\u{301} mark\ne\u{301}\u{301}\n",
         "mixed 😀漢e\u{301}x\r\ntail",
         "\u{10FFFF}\n\u{10FFFF}ascii",
+        "lone\rcr\r",
+        "\r",
+        "\r\r\n\n\r",
+        "mixed\nall\r\nthree\rends 😀",
     ];
+
+    /// Whether `byte` is a position: a char boundary not between a `\r` and its `\n`.
+    fn is_position_boundary(text: &str, byte: usize) -> bool {
+        let bytes = text.as_bytes();
+        let inside_pair =
+            byte > 0 && bytes.get(byte - 1) == Some(&b'\r') && bytes.get(byte) == Some(&b'\n');
+        text.is_char_boundary(byte) && !inside_pair
+    }
+
+    /// The client's reading of `byte`: every break normalised to `\n`, then counted.
+    fn oracle_position(text: &str, byte: usize, encoding: PositionEncoding) -> Position {
+        let prefix = text
+            .get(..byte)
+            .unwrap_or("")
+            .replace("\r\n", "\n")
+            .replace('\r', "\n");
+        let line = prefix.matches('\n').count();
+        let last_line = prefix.rsplit('\n').next().unwrap_or("");
+        let column: usize = last_line.chars().map(|ch| encoding.width(ch)).sum();
+        Position {
+            line: u32::try_from(line).unwrap(),
+            character: u32::try_from(column).unwrap(),
+        }
+    }
 
     #[test]
     fn line_index_matches_the_scalar_mapper_everywhere() {
@@ -202,7 +265,7 @@ mod tests {
         for text in NASTY {
             for encoding in [PositionEncoding::Utf8, PositionEncoding::Utf16] {
                 for byte in 0..=text.len() {
-                    if !text.is_char_boundary(byte) {
+                    if !is_position_boundary(text, byte) {
                         continue;
                     }
                     let pos = offset_to_position(text, byte, encoding);
@@ -296,5 +359,91 @@ mod tests {
         let text = "abcdef";
         let range = span_to_range(text, Span { lo: 4, hi: 2 }, PositionEncoding::Utf16);
         assert_eq!(range.start, range.end);
+    }
+
+    /// Every text over `a`, `\r`, `\n` and an astral char up to six chars long.
+    fn every_short_text() -> Vec<String> {
+        let alphabet = ['a', '\r', '\n', '😀'];
+        let mut texts = vec![String::new()];
+        let mut frontier = vec![String::new()];
+        for _ in 0..6 {
+            frontier = frontier
+                .iter()
+                .flat_map(|t| alphabet.iter().map(move |ch| format!("{t}{ch}")))
+                .collect();
+            texts.extend(frontier.iter().cloned());
+        }
+        texts
+    }
+
+    /// On every mix of the three line breaks, both mappers read each position as
+    /// a client does, the round trip is the identity, and mid-pair bytes clamp.
+    #[test]
+    fn every_mix_of_line_breaks_maps_like_a_client() {
+        for text in every_short_text() {
+            let index = LineIndex::new(&text);
+            for encoding in [PositionEncoding::Utf8, PositionEncoding::Utf16] {
+                for byte in 0..=text.len() {
+                    if !text.is_char_boundary(byte) {
+                        continue;
+                    }
+                    let scalar = offset_to_position(&text, byte, encoding);
+                    assert_eq!(
+                        index.position_of(byte, encoding),
+                        scalar,
+                        "{text:?} @ {byte}"
+                    );
+                    if is_position_boundary(&text, byte) {
+                        assert_eq!(
+                            scalar,
+                            oracle_position(&text, byte, encoding),
+                            "{text:?} @ {byte}"
+                        );
+                        assert_eq!(
+                            position_to_offset(&text, scalar, encoding),
+                            byte,
+                            "{text:?} @ {byte}"
+                        );
+                    } else {
+                        assert_eq!(
+                            scalar,
+                            offset_to_position(&text, byte - 1, encoding),
+                            "{text:?} @ {byte}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// A position past a lone `\r` is on the next line and round-trips.
+    #[test]
+    fn a_lone_carriage_return_ends_a_line() {
+        let text = "a\rb\r\nc";
+        for encoding in [PositionEncoding::Utf8, PositionEncoding::Utf16] {
+            let b = Position {
+                line: 1,
+                character: 0,
+            };
+            let c = Position {
+                line: 2,
+                character: 0,
+            };
+            assert_eq!(offset_to_position(text, 2, encoding), b);
+            assert_eq!(position_to_offset(text, b, encoding), 2);
+            assert_eq!(offset_to_position(text, 5, encoding), c);
+            assert_eq!(position_to_offset(text, c, encoding), 5);
+            // A character past the end of line 0 stops before its `\r`.
+            let past = Position {
+                line: 0,
+                character: 9,
+            };
+            assert_eq!(position_to_offset(text, past, encoding), 1);
+            // The byte between the `\r` and `\n` of a pair clamps to the `\r`.
+            assert_eq!(
+                offset_to_position(text, 4, encoding),
+                offset_to_position(text, 3, encoding)
+            );
+        }
     }
 }

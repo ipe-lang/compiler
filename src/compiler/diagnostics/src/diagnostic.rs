@@ -29,10 +29,10 @@ use crate::code::{
     IPE_P0003, IPE_P0010, IPE_P0011, IPE_P0012, IPE_P0013, IPE_P0014, IPE_P0015, IPE_P0016,
     IPE_P0017, IPE_P0018, IPE_P0020, IPE_P0021, IPE_P0030, IPE_P0031, IPE_P0040, IPE_P0041,
     IPE_P0050, IPE_P0060, IPE_P0061, IPE_P0062, IPE_P0063, IPE_P0064, IPE_P0065, IPE_P0066,
-    IPE_P0067, IPE_P0068, IPE_P0069, IPE_P0070, IPE_S0001, IPE_S0002, IPE_S0003, IPE_S0004,
-    IPE_T0001, IPE_T0002, IPE_T0003, IPE_T0004, IPE_T0010, IPE_T0011, IPE_T0012, IPE_T0013,
-    IPE_T0014, IPE_T0015, IPE_T0016, IPE_T0017, IPE_T0018, IPE_T0019, IPE_T0020, IPE_T0021,
-    IPE_T0022, IPE_T0023, Severity,
+    IPE_P0067, IPE_P0068, IPE_P0069, IPE_P0070, IPE_P0071, IPE_S0001, IPE_S0002, IPE_S0003,
+    IPE_S0004, IPE_T0001, IPE_T0002, IPE_T0003, IPE_T0004, IPE_T0010, IPE_T0011, IPE_T0012,
+    IPE_T0013, IPE_T0014, IPE_T0015, IPE_T0016, IPE_T0017, IPE_T0018, IPE_T0019, IPE_T0020,
+    IPE_T0021, IPE_T0022, IPE_T0023, Severity,
 };
 use crate::span::Span;
 use crate::suggest::{Confidence, Hit};
@@ -464,6 +464,11 @@ pub enum ParseError {
     /// accurate spans. Rather than clamp offsets (which would misreport every
     /// position past the limit), the lexer turns the file away. [IPE-P0070]
     SourceTooLarge { bytes: usize },
+    /// A `\r` not followed by `\n`. An editor or viewer ends a line there and the
+    /// compiler does not, so the two would read different line structures
+    /// (code a reader sees on its own line the compiler reads as part of a
+    /// comment). A `\r\n` pair is one line break and stays accepted. [IPE-P0071]
+    LoneCarriageReturn,
 }
 
 /// Errors raised during name resolution / canonicalisation.
@@ -2759,6 +2764,7 @@ const fn parse_code(msg: &ParseError) -> Code {
         ParseError::AnnotationWithoutBinding { .. } => IPE_P0068,
         ParseError::DuplicateAnnotation { .. } => IPE_P0069,
         ParseError::SourceTooLarge { .. } => IPE_P0070,
+        ParseError::LoneCarriageReturn => IPE_P0071,
     })
 }
 
@@ -2968,7 +2974,8 @@ fn parse_help(msg: &ParseError) -> Vec<HelpLine> {
         | ParseError::MissingDocString { .. }
         | ParseError::AnnotationWithoutBinding { .. }
         | ParseError::DuplicateAnnotation { .. }
-        | ParseError::SourceTooLarge { .. } => Vec::new(),
+        | ParseError::SourceTooLarge { .. }
+        | ParseError::LoneCarriageReturn => Vec::new(),
     }
 }
 

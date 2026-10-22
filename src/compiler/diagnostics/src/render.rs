@@ -450,6 +450,12 @@ fn parse_prose(msg: &ParseError) -> String {
                  must fit in a 32-bit byte offset (under 4 GiB)."
             )
         }
+        ParseError::LoneCarriageReturn => {
+            "This carriage return (`\\r`) is not followed by a newline (`\\n`). An editor \
+             starts a new line here and I do not, so the file would read differently \
+             to you and to me."
+                .to_string()
+        }
         ParseError::Unexpected => "I couldn't make sense of this part of the file.".to_string(),
     }
 }
@@ -1499,6 +1505,9 @@ fn parse_label(msg: &ParseError) -> Option<String> {
                 ),
             };
             Some(detail)
+        }
+        ParseError::LoneCarriageReturn => {
+            Some("a `\\r` here must be followed by `\\n`".to_string())
         }
         ParseError::AnnotationWithoutBinding { .. } => {
             Some("this annotation has no matching definition".to_string())
