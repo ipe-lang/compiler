@@ -1777,6 +1777,90 @@ where
     }
 }
 
+/// The layer that counts each admitted request as shutdown work.
+///
+/// It wraps the router inside the Host admission, so a refused request holds
+/// nothing.
+#[derive(Clone)]
+struct WorkLayer {
+    count: shutdown::WorkCount,
+}
+
+impl<S> tower::Layer<S> for WorkLayer {
+    type Service = WorkService<S>;
+
+    fn layer(&self, inner: S) -> Self::Service {
+        WorkService {
+            inner,
+            count: self.count.clone(),
+        }
+    }
+}
+
+/// Each request holds one [`shutdown::WorkGuard`] until its response head
+/// exists; a request past the work ceiling, or one still running when the
+/// shutdown closes, is answered 503 with `Connection: close`.
+///
+/// The cancel arm is polled first, so a request that arrives once the phase
+/// is closing never reaches its handler.
+#[derive(Clone)]
+struct WorkService<S> {
+    inner: S,
+    count: shutdown::WorkCount,
+}
+
+impl<S> tower::Service<axum::extract::Request> for WorkService<S>
+where
+    S: tower::Service<
+            axum::extract::Request,
+            Response = axum::response::Response,
+            Error = std::convert::Infallible,
+        >,
+    S::Future: Send + 'static,
+{
+    type Response = axum::response::Response;
+    type Error = std::convert::Infallible;
+    type Future =
+        futures_util::future::BoxFuture<'static, Result<Self::Response, std::convert::Infallible>>;
+
+    fn poll_ready(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), Self::Error>> {
+        self.inner.poll_ready(cx)
+    }
+
+    fn call(&mut self, request: axum::extract::Request) -> Self::Future {
+        let Ok(mut guard) = self.count.guard() else {
+            return Box::pin(std::future::ready(Ok(work_cancelled())));
+        };
+        let handled = self.inner.call(request);
+        Box::pin(async move {
+            tokio::select! {
+                biased;
+                () = guard.cancelled() => Ok(work_cancelled()),
+                response = handled => response,
+            }
+        })
+    }
+}
+
+/// The 503 a request the shutdown cancels, or the work ceiling refuses, reads.
+fn work_cancelled() -> axum::response::Response {
+    use axum::response::IntoResponse;
+    let mut resp = with_security_headers(
+        RequestRejection::Unavailable
+            .status_and_reason()
+            .into_response(),
+        response_security_headers(),
+    );
+    resp.headers_mut().insert(
+        axum::http::header::CONNECTION,
+        axum::http::HeaderValue::from_static("close"),
+    );
+    resp
+}
+
 /// Parse `request`'s URL once, respell its path canonically and record the
 /// parse as its [`StrictUrl`] extension.
 ///
@@ -2767,10 +2851,14 @@ pub(crate) async fn bind_app_listener(
 /// the fallback are refused alike and a refused request reaches no handler,
 /// session or concurrency permit.
 ///
+/// Every admitted request is counted as shutdown work until its response head
+/// exists.
+///
 /// Its only success is [`shutdown::Stopped`]: after the first signal the
-/// in-flight requests and long-lived tasks get what is left of the grace, every
-/// other serve site sharing the owner drains too, the exporters flush, and
-/// every owned pool closes under its deadline. A signal
+/// in-flight requests, the counted work and the long-lived tasks get what is
+/// left of the grace, and every other serve site sharing the owner drains too.
+/// Then the work still running is cancelled (a request reads 503), the
+/// exporters flush, and every owned pool closes under its deadline. A signal
 /// that arrived before the serve skips accepting altogether.
 ///
 /// # Errors
@@ -2793,8 +2881,11 @@ pub(crate) async fn serve_app(
             admission,
             tag,
         } = app;
+        let work = WorkLayer {
+            count: armed.work_count(),
+        };
         let svc = crate::inbound_authority::HostAdmissionLayer::new(admission, tag)
-            .layer(CanonicalUrl::new(router));
+            .layer(work.layer(CanonicalUrl::new(router)));
         let mut stop = armed.drain();
         let serve = std::future::IntoFuture::into_future(
             axum::serve(
@@ -2817,9 +2908,10 @@ pub(crate) async fn serve_app(
         drop(serving);
     }
     armed.settle_live().await;
+    let settled = armed.cancel_work().await;
     #[cfg(all(feature = "web", feature = "http_client"))]
     crate::web::flush_exporters().await;
-    let closed = shutdown::close_owned_pools(&armed).await;
+    let closed = shutdown::close_owned_pools(&armed, settled).await;
     Ok(shutdown::Stopped::after(closed))
 }
 
@@ -5319,6 +5411,90 @@ mod tests {
             .expect("the idle site stops");
         assert!(matches!(idle, Ok(Ok(shutdown::Stopped { .. }))));
         drop(client);
+    }
+
+    /// Sets its flag when the future holding it is dropped.
+    struct DropFlag(Arc<std::sync::atomic::AtomicBool>);
+
+    impl Drop for DropFlag {
+        fn drop(&mut self) {
+            self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_request_running_past_the_grace_is_cancelled_before_the_stop() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let budget = std::time::Duration::from_secs(5);
+        let (armed, signals) = shutdown::tests::armed_with(
+            shutdown::ShutdownPlan::bare("test"),
+            std::time::Duration::ZERO,
+            Arc::new(std::sync::atomic::AtomicI32::new(0)),
+        );
+        let host = RecordedHost::record(crate::app_config::ListenHost::Loopback(
+            crate::app_config::LoopbackIp::DEFAULT,
+        ));
+        let app = bind_app_listener("test", host, 0)
+            .await
+            .expect("a loopback port binds");
+        let port = app.listener.local_addr().expect("a bound port").port();
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let finished = Arc::new(AtomicBool::new(false));
+        let dropped = Arc::new(AtomicBool::new(false));
+        let (entering, finishing, dropping) = (
+            Arc::clone(&entered),
+            Arc::clone(&finished),
+            Arc::clone(&dropped),
+        );
+        let router = axum::Router::new().route(
+            "/slow",
+            axum::routing::get(move || {
+                let (entering, finishing) = (Arc::clone(&entering), Arc::clone(&finishing));
+                let sentinel = DropFlag(Arc::clone(&dropping));
+                async move {
+                    let _sentinel = sentinel;
+                    entering.notify_one();
+                    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                    finishing.store(true, Ordering::SeqCst);
+                    "done"
+                }
+            }),
+        );
+        let served = tokio::spawn(serve_app(app, router, armed));
+        let mut client = tokio::net::TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, port))
+            .await
+            .expect("the app accepts");
+        let request = format!("GET /slow HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n\r\n");
+        client
+            .write_all(request.as_bytes())
+            .await
+            .expect("the request is sent");
+        tokio::time::timeout(budget, entered.notified())
+            .await
+            .expect("the handler runs");
+        assert!(signals.send(shutdown::Signal::Terminate).await.is_ok());
+        let stopped = tokio::time::timeout(budget, served)
+            .await
+            .expect("the app stops");
+        assert!(matches!(stopped, Ok(Ok(shutdown::Stopped { .. }))));
+        assert!(
+            dropped.load(Ordering::SeqCst),
+            "the handler's future is dropped before the pools close"
+        );
+        let mut answer = Vec::new();
+        tokio::time::timeout(budget, client.read_to_end(&mut answer))
+            .await
+            .expect("the cancelled request is answered and closed")
+            .expect("the answer reads");
+        let answer = String::from_utf8_lossy(&answer);
+        assert!(answer.starts_with("HTTP/1.1 503"), "got {answer:?}");
+        assert!(answer.to_ascii_lowercase().contains("connection: close"));
+        tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+        assert!(
+            !finished.load(Ordering::SeqCst),
+            "a request past the grace never runs on after the stop"
+        );
     }
 
     /// `Ipe.Http.Server` resolves through the shared resolver under its own

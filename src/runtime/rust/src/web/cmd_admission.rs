@@ -6,13 +6,22 @@
 //! has no other constructor, so a started web Cmd always holds a unit and the
 //! unit returns when the Cmd's result is handed to the session queue, or when
 //! the task is dropped.
+//!
+//! Every admitted Cmd is also one unit of shutdown work: a Cmd still running
+//! when the shutdown closes is cancelled before the pools it may use close.
+
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use tokio::sync::mpsc::Sender;
 use tokio::sync::mpsc::error::SendError;
 
-use super::budget::{CmdPermit, OverBudget, SESSION_CMD_CEILING, SessionCmds};
+use super::budget::{CmdPermit, OverBudget, PROCESS_CMD_BUDGET, SESSION_CMD_CEILING, SessionCmds};
 use crate::LimitRefusal;
+use crate::server::shutdown::{self, WORK_CEILING, WorkFull, WorkGuard};
 use crate::tea::{PerformBody, PerformFuture};
+
+// IPE-RUST-AUDIT:ACCEPTED (Arthur Maciel) — compile-time `const` assertion (not a runtime panic); fails the BUILD if the shutdown's work ceiling, not the process Cmd budget, could bound a well-behaved load [ledger #boundary]
+const _: () = assert!(PROCESS_CMD_BUDGET.get() < WORK_CEILING as u64);
 
 /// What [`admit`] made of one `Perform` body.
 pub enum Admit<M> {
@@ -22,24 +31,62 @@ pub enum Admit<M> {
     Refused(M),
 }
 
-/// A started `Perform` body and the permit it holds until its Msg is handed over.
+/// A started `Perform` body, the permit it holds until its Msg is handed over,
+/// and the shutdown work unit that cancels it once the shutdown closes.
 pub struct AdmittedCmd<M> {
     fut: PerformFuture<M>,
     permit: CmdPermit,
+    work: WorkGuard,
 }
 
-/// Start `body` under one of the session's Cmd units, or refuse it unstarted.
+/// What [`AdmittedCmd::finish`] did with the Cmd.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Delivery {
+    /// The Cmd's Msg reached the session queue.
+    Delivered,
+    /// The shutdown cancelled the Cmd; no Msg was produced.
+    Cancelled,
+}
+
+/// Whether a Cmd refused at the work ceiling was logged yet.
+static WORK_FULL_LOGGED: AtomicBool = AtomicBool::new(false);
+
+/// Start `body` under one of the session's Cmd units and one unit of shutdown
+/// work, or refuse it unstarted.
 pub fn admit<M>(body: Box<dyn PerformBody<M>>, cmds: &SessionCmds) -> Admit<M> {
-    match cmds.try_permit() {
-        Ok(permit) => Admit::Run(AdmittedCmd {
-            fut: body.run(),
-            permit,
-        }),
+    admit_under(body, cmds, shutdown::work)
+}
+
+/// [`admit`], its shutdown work unit taken from `work` once the permit is held.
+fn admit_under<M>(
+    body: Box<dyn PerformBody<M>>,
+    cmds: &SessionCmds,
+    work: impl FnOnce() -> Result<WorkGuard, WorkFull>,
+) -> Admit<M> {
+    let permit = match cmds.try_permit() {
+        Ok(permit) => permit,
         Err(why) => {
             if cmds.first_refusal(why) {
                 crate::system::emit_runtime_log("live", refusal_log(why));
             }
-            Admit::Refused(body.refuse(refusal(why)))
+            return Admit::Refused(body.refuse(refusal(why)));
+        }
+    };
+    match work() {
+        Ok(work) => Admit::Run(AdmittedCmd {
+            fut: body.run(),
+            permit,
+            work,
+        }),
+        Err(WorkFull) => {
+            drop(permit);
+            if !WORK_FULL_LOGGED.swap(true, Ordering::Relaxed) {
+                crate::system::emit_runtime_log(
+                    "live",
+                    "run_cmd: the server reached its in-flight work ceiling; further commands are refused until one finishes",
+                );
+            }
+            Admit::Refused(body.refuse(work_refusal()))
         }
     }
 }
@@ -58,6 +105,14 @@ fn refusal(why: OverBudget) -> LimitRefusal {
     LimitRefusal::new(text).context("web session commands")
 }
 
+/// The program-facing refusal of a Cmd past the shutdown's work ceiling.
+fn work_refusal() -> LimitRefusal {
+    LimitRefusal::new(
+        "the server already has the maximum amount of work running; this command was not started",
+    )
+    .context("web session commands")
+}
+
 /// The operator log line for the first refusal by the bound `why` names.
 const fn refusal_log(why: OverBudget) -> &'static str {
     match why {
@@ -73,15 +128,30 @@ const fn refusal_log(why: OverBudget) -> &'static str {
 impl<M: Send> AdmittedCmd<M> {
     /// Run the Cmd to its Msg and hand the Msg to `tx`, then return the unit.
     ///
+    /// The shutdown's cancel races both the body and the send, and is polled
+    /// first: a Cmd cancelled before its first poll never starts its body.
+    /// A cancelled Cmd drops its body and hands nothing over.
+    ///
     /// # Errors
     ///
     /// The Msg back when the session queue is closed; the unit returns then too.
-    pub async fn finish(self, tx: &Sender<M>) -> Result<(), SendError<M>> {
-        let Self { fut, permit } = self;
-        let msg = fut.await;
-        let sent = tx.send(msg).await;
+    pub async fn finish(self, tx: &Sender<M>) -> Result<Delivery, SendError<M>> {
+        let Self {
+            fut,
+            permit,
+            mut work,
+        } = self;
+        let delivered = tokio::select! {
+            biased;
+            () = work.cancelled() => Ok(Delivery::Cancelled),
+            sent = async {
+                let msg = fut.await;
+                tx.send(msg).await.map(|()| Delivery::Delivered)
+            } => sent,
+        };
+        drop(work);
         drop(permit);
-        sent
+        delivered
     }
 }
 
@@ -110,7 +180,8 @@ mod tests {
         IpeError, IpeResult, IpeTask, ipe_error_kind, ipe_error_kind_name, ipe_error_message,
     };
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicI32, AtomicUsize};
+    use std::time::Duration;
     use tokio::sync::{Semaphore, mpsc};
 
     #[derive(Debug, PartialEq, Eq)]
@@ -264,6 +335,142 @@ mod tests {
             matches!(next, Some(Admit::Run(_))),
             "a returned unit admits the next Cmd"
         );
+    }
+
+    /// Sets its flag when the body holding it is dropped.
+    struct DropFlag(Arc<AtomicBool>);
+
+    impl Drop for DropFlag {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    /// A body that counts its start, then never ends; `dropped` marks its drop.
+    fn endless(
+        started: &Arc<AtomicUsize>,
+        dropped: &Arc<AtomicBool>,
+    ) -> Option<Box<dyn PerformBody<Msg>>> {
+        let started = Arc::clone(started);
+        let flag = DropFlag(Arc::clone(dropped));
+        let task: IpeTask<IpeError, i64> = Box::pin(async move {
+            let _flag = flag;
+            started.fetch_add(1, Ordering::SeqCst);
+            std::future::pending::<IpeResult<IpeError, i64>>().await
+        });
+        perform(cmd_perform(task, decode))
+    }
+
+    /// An owner armed over an injected signal source.
+    fn owner(grace: Duration) -> (shutdown::Armed, mpsc::Sender<shutdown::Signal>) {
+        shutdown::tests::armed_with(
+            shutdown::ShutdownPlan::bare("test"),
+            grace,
+            Arc::new(AtomicI32::new(0)),
+        )
+    }
+
+    /// A running Cmd the shutdown cancels drops its body, returns its unit and
+    /// hands the session queue nothing.
+    #[tokio::test]
+    async fn a_running_cmd_is_cancelled_by_the_close() {
+        let (armed, _signals) = owner(Duration::ZERO);
+        let count = armed.work_count();
+        let cmds = SessionCmds::new();
+        let started = Arc::new(AtomicUsize::new(0));
+        let dropped = Arc::new(AtomicBool::new(false));
+        let (tx, mut rx) = mpsc::channel::<Msg>(4);
+        let body = endless(&started, &dropped);
+        let admitted = body.map(|body| admit_under(body, &cmds, || count.guard()));
+        assert!(
+            matches!(admitted, Some(Admit::Run(_))),
+            "an idle owner admits the Cmd"
+        );
+        let Some(Admit::Run(cmd)) = admitted else {
+            return;
+        };
+        let running = tokio::spawn(async move { cmd.finish(&tx).await.ok() });
+        until_started(&started, 1).await;
+        assert_eq!(started.load(Ordering::SeqCst), 1, "the body runs");
+        let _settled = armed.cancel_work().await;
+        let finished = tokio::time::timeout(Duration::from_secs(5), running).await;
+        assert!(
+            matches!(finished, Ok(Ok(Some(Delivery::Cancelled)))),
+            "the close cancels the Cmd: {finished:?}"
+        );
+        assert!(dropped.load(Ordering::SeqCst), "the body is dropped");
+        assert_eq!(cmds.used(), Cmds::new(0), "the unit returns");
+        assert!(rx.try_recv().is_err(), "the queue gets nothing");
+    }
+
+    /// A Cmd admitted once the shutdown is closing never polls its body.
+    #[tokio::test]
+    async fn a_cmd_admitted_at_the_close_never_starts() {
+        let (armed, _signals) = owner(Duration::ZERO);
+        let count = armed.work_count();
+        let _settled = armed.cancel_work().await;
+        let cmds = SessionCmds::new();
+        let started = Arc::new(AtomicUsize::new(0));
+        let gate = Arc::new(Semaphore::new(1));
+        let (tx, mut rx) = mpsc::channel::<Msg>(4);
+        let body = gated(&started, &gate);
+        let admitted = body.map(|body| admit_under(body, &cmds, || count.guard()));
+        assert!(
+            matches!(admitted, Some(Admit::Run(_))),
+            "a Cmd past the close is admitted, born cancelled"
+        );
+        let Some(Admit::Run(cmd)) = admitted else {
+            return;
+        };
+        assert_eq!(cmd.finish(&tx).await.ok(), Some(Delivery::Cancelled));
+        assert_eq!(
+            started.load(Ordering::SeqCst),
+            0,
+            "the body is never polled"
+        );
+        assert!(rx.try_recv().is_err(), "there is no Msg");
+        assert_eq!(cmds.used(), Cmds::new(0), "the permit is returned");
+    }
+
+    /// A Cmd that ends while the shutdown drains, inside the grace, delivers.
+    #[tokio::test]
+    async fn a_cmd_ending_inside_the_grace_delivers_its_msg() {
+        let (armed, signals) = owner(Duration::from_secs(3600));
+        let count = armed.work_count();
+        let mut drain = armed.drain();
+        assert!(signals.send(shutdown::Signal::Terminate).await.is_ok());
+        let drained = tokio::time::timeout(Duration::from_secs(5), drain.wait()).await;
+        assert!(drained.is_ok(), "the signal drains");
+        let cmds = SessionCmds::new();
+        let (tx, mut rx) = mpsc::channel::<Msg>(4);
+        let admitted = ready(5).map(|body| admit_under(body, &cmds, || count.guard()));
+        assert!(
+            matches!(admitted, Some(Admit::Run(_))),
+            "a draining owner admits the Cmd"
+        );
+        let Some(Admit::Run(cmd)) = admitted else {
+            return;
+        };
+        assert_eq!(cmd.finish(&tx).await.ok(), Some(Delivery::Delivered));
+        assert_eq!(rx.recv().await, Some(Msg::Done(5)));
+    }
+
+    /// A Cmd past the work ceiling is refused unstarted and holds no unit.
+    #[tokio::test]
+    async fn a_cmd_past_the_work_ceiling_is_refused() {
+        let cmds = SessionCmds::new();
+        let started = Arc::new(AtomicUsize::new(0));
+        let gate = Arc::new(Semaphore::new(1));
+        let refused = gated(&started, &gate).map(|body| admit_under(body, &cmds, || Err(WorkFull)));
+        assert!(
+            matches!(
+                refused,
+                Some(Admit::Refused(Msg::Failed { ref kind, .. })) if kind == "LimitExceeded"
+            ),
+            "the work ceiling refuses with a limit"
+        );
+        assert_eq!(cmds.used(), Cmds::new(0), "a refusal holds no unit");
+        assert_eq!(started.load(Ordering::SeqCst), 0);
     }
 
     /// Permits return when the session queue is closed, and when the runtime

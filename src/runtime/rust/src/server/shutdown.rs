@@ -13,6 +13,12 @@
 //! process at once with `128 + signo`. Every wait is bounded by the grace
 //! window, measured from the first signal, or by an internal deadline.
 //!
+//! Work that can reach an owned pool (a request, a web Cmd) holds a
+//! [`WorkGuard`]. The drain lets that work finish within the grace; then
+//! [`Armed::cancel_work`] flips the phase to closing, which cancels the work
+//! still running, and mints the [`WorkSettled`] proof [`close_owned_pools`]
+//! requires, so no counted work outlives the pools it uses.
+//!
 //! A signal the process inherited as ignored stays ignored (Linux).
 
 use std::future::Future;
@@ -28,18 +34,33 @@ use tokio::time::Instant;
 #[cfg(feature = "db")]
 pub const DB_CLOSE_DEADLINE: Duration = Duration::from_secs(2);
 
-/// The longest closing every owned pool may take: one [`DB_CLOSE_DEADLINE`]
-/// per close stage, the stages running one after another. The bound the
-/// shutdown tests hold the exit to; `server_shutdown_e2e` mirrors it.
+/// How long cancelled work may take to stop before the pools close anyway.
+pub const WORK_CANCEL_DEADLINE: Duration = Duration::from_millis(500);
+
+/// The longest the stop may take past the grace: the work-cancel deadline,
+/// then one [`DB_CLOSE_DEADLINE`] per close stage, the stages running one
+/// after another. The bound the shutdown tests hold the exit to;
+/// `server_shutdown_e2e` mirrors it.
 #[cfg(all(feature = "db", test))]
-pub const POOLS_CLOSE_BOUND: Duration =
-    DB_CLOSE_DEADLINE.saturating_mul(crate::db::CLOSE_STAGES as u32);
+pub const POOLS_CLOSE_BOUND: Duration = DB_CLOSE_DEADLINE
+    .saturating_mul(crate::db::CLOSE_STAGES as u32)
+    .saturating_add(WORK_CANCEL_DEADLINE);
 
 /// How long a draining WebSocket's close frame may take to send.
 pub const WS_CLOSE_DEADLINE: Duration = Duration::from_secs(1);
 
 /// The most long-lived tasks the drain tracks at once.
 const LIVE_CEILING: usize = 1 << 20;
+
+/// The most units of pool-reaching work the shutdown counts at once.
+pub const WORK_CEILING: usize = 1 << 20;
+
+/// The bit of the work state that marks the phase closing; the bits below
+/// it are the count.
+const CLOSING_BIT: usize = 1 << (usize::BITS - 1);
+
+// IPE-RUST-AUDIT:ACCEPTED (Arthur Maciel) — compile-time `const` assertion (not a runtime panic); fails the BUILD if the work ceiling could reach the closing bit [ledger #boundary]
+const _: () = assert!(WORK_CEILING < CLOSING_BIT);
 
 /// The most signals queued between the OS listeners and the owner.
 const SIGNAL_QUEUE: usize = 8;
@@ -69,8 +90,10 @@ pub fn shutdown_grace() -> Result<Duration, crate::system::EnvCeilingRefusal> {
 pub enum Phase {
     /// Accepting connections.
     Serving,
-    /// Draining after the first signal.
+    /// Draining after the first signal: streams end, work may still finish.
     Draining,
+    /// Closing after the grace: work still running is cancelled.
+    Closing,
 }
 
 /// A request to stop the process.
@@ -91,6 +114,13 @@ impl Signal {
             Self::Terminate => 143,
         }
     }
+}
+
+/// Proof that the phase is closing and the counted work was given its
+/// deadline to stop; only [`Armed::cancel_work`] mints one.
+#[derive(Debug)]
+pub struct WorkSettled {
+    _private: (),
 }
 
 /// Proof that every owned pool's close ran under its deadline.
@@ -197,6 +227,43 @@ struct Live {
     idle: Notify,
 }
 
+/// The pool-reaching work in flight and the wake-up for its last end.
+///
+/// The count and the closing mark share one atomic, so a unit either is
+/// counted before the mark is set, or sees the mark and is born cancelled.
+struct Work {
+    state: AtomicUsize,
+    idle: Notify,
+}
+
+impl Work {
+    /// A work count with nothing in flight.
+    const fn new() -> Self {
+        Self {
+            state: AtomicUsize::new(0),
+            idle: Notify::new(),
+        }
+    }
+
+    /// The units in flight.
+    fn count(&self) -> usize {
+        self.state.load(Ordering::SeqCst) & !CLOSING_BIT
+    }
+
+    /// Resolve once no unit is in flight.
+    async fn settled(&self) {
+        loop {
+            let idle = self.idle.notified();
+            tokio::pin!(idle);
+            idle.as_mut().enable();
+            if self.count() == 0 {
+                return;
+            }
+            idle.await;
+        }
+    }
+}
+
 /// The shutdown state one armed owner keeps.
 struct Shutdown {
     tag: &'static str,
@@ -205,6 +272,7 @@ struct Shutdown {
     signalled_at: OnceLock<Instant>,
     grace: Duration,
     live: Arc<Live>,
+    work: Arc<Work>,
     pools: PoolSet,
 }
 
@@ -224,7 +292,13 @@ impl Shutdown {
             let _ = tokio::time::timeout(self.remaining_grace(), hook()).await;
         }
         crate::system::emit_runtime_log_stdout(self.tag, "shutting down");
-        self.phase.send_replace(Phase::Draining);
+        self.phase.send_if_modified(|phase| {
+            let serving = *phase == Phase::Serving;
+            if serving {
+                *phase = Phase::Draining;
+            }
+            serving
+        });
     }
 
     /// A drain handle over this owner.
@@ -232,6 +306,33 @@ impl Shutdown {
         Drain {
             phase: Some(self.phase.subscribe()),
             live: Some(Arc::clone(&self.live)),
+        }
+    }
+
+    /// Count one unit of work, cancelled once the phase is closing.
+    ///
+    /// A unit started after the closing mark is uncounted and born cancelled.
+    fn work_guard(&self) -> Result<WorkGuard, WorkFull> {
+        let counted = self
+            .work
+            .state
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |state| {
+                if state & CLOSING_BIT == 0 {
+                    state.checked_add(1).filter(|_| state < WORK_CEILING)
+                } else {
+                    None
+                }
+            });
+        match counted {
+            Ok(_) => Ok(WorkGuard {
+                cancel: Cancel::OnClosing(self.phase.subscribe()),
+                work: Some(Arc::clone(&self.work)),
+            }),
+            Err(state) if state & CLOSING_BIT != 0 => Ok(WorkGuard {
+                cancel: Cancel::Already,
+                work: None,
+            }),
+            Err(_) => Err(WorkFull),
         }
     }
 }
@@ -290,7 +391,15 @@ impl Armed {
     /// Whether the first signal already flipped the phase.
     #[must_use]
     pub fn is_draining(&self) -> bool {
-        *self.shutdown.phase.borrow() == Phase::Draining
+        *self.shutdown.phase.borrow() != Phase::Serving
+    }
+
+    /// The work count of the armed owner, for a serve site's own work.
+    #[must_use]
+    pub fn work_count(&self) -> WorkCount {
+        WorkCount {
+            shutdown: Some(Arc::clone(&self.shutdown)),
+        }
     }
 
     /// The grace left since the first signal.
@@ -306,21 +415,172 @@ impl Armed {
         self.shutdown.live.count.load(Ordering::SeqCst)
     }
 
-    /// Wait until no long-lived task is in flight, at most the grace left.
+    /// Wait until no long-lived task and no unit of work is in flight, at
+    /// most the grace left.
     pub async fn settle_live(&self) {
         let live = &self.shutdown.live;
+        let work = &self.shutdown.work;
         let settled = async {
             loop {
-                let idle = live.idle.notified();
-                tokio::pin!(idle);
-                idle.as_mut().enable();
-                if live.count.load(Ordering::SeqCst) == 0 {
+                let live_idle = live.idle.notified();
+                let work_idle = work.idle.notified();
+                tokio::pin!(live_idle, work_idle);
+                live_idle.as_mut().enable();
+                work_idle.as_mut().enable();
+                if live.count.load(Ordering::SeqCst) == 0 && work.count() == 0 {
                     return;
                 }
-                idle.await;
+                tokio::select! {
+                    () = live_idle => {}
+                    () = work_idle => {}
+                }
             }
         };
         let _ = tokio::time::timeout(self.remaining_grace(), settled).await;
+    }
+
+    /// Flip the phase to closing, cancelling the work still running, and wait
+    /// at most [`WORK_CANCEL_DEADLINE`] for it to stop.
+    ///
+    /// The first call logs the units it cancelled and any that did not stop.
+    pub async fn cancel_work(&self) -> WorkSettled {
+        let tag = self.shutdown.tag;
+        self.cancel_logging(|line| crate::system::emit_runtime_log(tag, &line))
+            .await
+    }
+
+    /// [`Armed::cancel_work`], its log lines written through `log`.
+    async fn cancel_logging(&self, mut log: impl FnMut(String)) -> WorkSettled {
+        let shutdown = &self.shutdown;
+        let before = shutdown.work.state.fetch_or(CLOSING_BIT, Ordering::SeqCst);
+        shutdown.phase.send_replace(Phase::Closing);
+        let first = before & CLOSING_BIT == 0;
+        let running = before & !CLOSING_BIT;
+        if first && running > 0 {
+            log(cancelled_line(running, shutdown.grace));
+        }
+        let _ = tokio::time::timeout(WORK_CANCEL_DEADLINE, shutdown.work.settled()).await;
+        let left = shutdown.work.count();
+        if first && left > 0 {
+            log(stuck_line(left));
+        }
+        WorkSettled { _private: () }
+    }
+}
+
+/// The line naming the work the grace cut.
+fn cancelled_line(running: usize, grace: Duration) -> String {
+    format!(
+        "shutting down: cancelled {running} tasks still running after the {} ms grace ({})",
+        grace.as_millis(),
+        SHUTDOWN_GRACE_CEILING.name(),
+    )
+}
+
+/// The line naming the work that outlived its cancel deadline.
+fn stuck_line(left: usize) -> String {
+    format!(
+        "{left} tasks did not stop within {} ms; closing the pools anyway",
+        WORK_CANCEL_DEADLINE.as_millis(),
+    )
+}
+
+/// A handle that counts work on one armed owner, or on none.
+#[derive(Clone)]
+pub struct WorkCount {
+    shutdown: Option<Arc<Shutdown>>,
+}
+
+impl WorkCount {
+    /// Count one unit of work on this owner.
+    ///
+    /// # Errors
+    ///
+    /// [`WorkFull`] when the owner already counts [`WORK_CEILING`] units.
+    pub fn guard(&self) -> Result<WorkGuard, WorkFull> {
+        self.shutdown
+            .as_ref()
+            .map_or_else(|| Ok(WorkGuard::never()), |shutdown| shutdown.work_guard())
+    }
+}
+
+/// The work count of the process's armed owner, or of none.
+#[must_use]
+pub fn work_count() -> WorkCount {
+    WorkCount {
+        shutdown: PROCESS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .cloned(),
+    }
+}
+
+/// Count one unit of pool-reaching work on the process's armed owner.
+///
+/// With no armed owner the guard is never cancelled.
+///
+/// # Errors
+///
+/// [`WorkFull`] when the owner already counts [`WORK_CEILING`] units.
+pub fn work() -> Result<WorkGuard, WorkFull> {
+    work_count().guard()
+}
+
+/// The refusal of a unit of work past [`WORK_CEILING`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WorkFull;
+
+/// When a unit of work is cancelled.
+enum Cancel {
+    /// No armed owner: never.
+    Never,
+    /// When the owner's phase turns closing.
+    OnClosing(watch::Receiver<Phase>),
+    /// Started after the closing mark: at once.
+    Already,
+}
+
+/// One unit of pool-reaching work, counted until it drops.
+pub struct WorkGuard {
+    cancel: Cancel,
+    work: Option<Arc<Work>>,
+}
+
+impl WorkGuard {
+    /// A guard no owner counts or cancels.
+    #[must_use]
+    pub const fn never() -> Self {
+        Self {
+            cancel: Cancel::Never,
+            work: None,
+        }
+    }
+
+    /// Resolve once this work is cancelled; never for an unarmed guard.
+    ///
+    /// Cancel-safe: the current phase is read on every call. An owner gone
+    /// before the close cancels too.
+    pub async fn cancelled(&mut self) {
+        match &mut self.cancel {
+            Cancel::Never => std::future::pending::<()>().await,
+            Cancel::Already => {}
+            Cancel::OnClosing(phase) => {
+                let _ = phase.wait_for(|p| *p == Phase::Closing).await;
+            }
+        }
+    }
+}
+
+impl Drop for WorkGuard {
+    fn drop(&mut self) {
+        let Some(work) = self.work.as_ref() else {
+            return;
+        };
+        let before = work.state.fetch_sub(1, Ordering::SeqCst);
+        if before & !CLOSING_BIT == 1 {
+            work.idle.notify_waiters();
+        }
     }
 }
 
@@ -380,6 +640,7 @@ fn arm_in(
             count: AtomicUsize::new(0),
             idle: Notify::new(),
         }),
+        work: Arc::new(Work::new()),
         pools,
     });
     runtime.spawn(run_signals(Arc::clone(&shutdown), source, exit));
@@ -388,7 +649,10 @@ fn arm_in(
 }
 
 /// Close every owned pool, each under the pool-close deadline; the spill pool last.
-pub async fn close_owned_pools(armed: &Armed) -> PoolsClosed {
+///
+/// The [`WorkSettled`] proof orders the close after the work that may reach
+/// a pool was cancelled.
+pub async fn close_owned_pools(armed: &Armed, _settled: WorkSettled) -> PoolsClosed {
     #[cfg(feature = "db")]
     armed.shutdown.pools.close_all(DB_CLOSE_DEADLINE).await;
     #[cfg(not(feature = "db"))]
@@ -413,12 +677,12 @@ impl Drain {
         }
     }
 
-    /// Resolve once the phase is draining; never for an unarmed handle.
+    /// Resolve once the phase is past serving; never for an unarmed handle.
     ///
     /// Cancel-safe: the current phase is read on every call.
     pub async fn wait(&mut self) {
         if let Some(phase) = self.phase.as_mut()
-            && phase.wait_for(|p| *p == Phase::Draining).await.is_ok()
+            && phase.wait_for(|p| *p != Phase::Serving).await.is_ok()
         {
             return;
         }
@@ -796,12 +1060,124 @@ pub mod tests {
         assert_eq!(live.count.load(Ordering::SeqCst), 0);
     }
 
+    /// An owner armed over an injected source that never signals.
+    fn quiet_owner(grace: Duration) -> (Armed, mpsc::Sender<Signal>) {
+        armed_with(
+            ShutdownPlan::bare("test"),
+            grace,
+            Arc::new(AtomicI32::new(0)),
+        )
+    }
+
+    #[allow(clippy::expect_used)] // a refused guard fails the test
+    #[tokio::test(start_paused = true)]
+    async fn counted_work_holds_the_settle_until_its_guard_drops() {
+        let (armed, _tx) = quiet_owner(Duration::from_secs(3600));
+        let guard = armed.work_count().guard().expect("one unit fits");
+        assert_eq!(armed.shutdown.work.count(), 1);
+        let settle = armed.settle_live();
+        tokio::pin!(settle);
+        let held = tokio::time::timeout(Duration::from_secs(1), settle.as_mut()).await;
+        assert!(held.is_err(), "a counted unit holds the settle");
+        drop(guard);
+        tokio::time::timeout(Duration::from_secs(1), settle)
+            .await
+            .expect("the last unit's drop ends the settle");
+    }
+
+    #[allow(clippy::expect_used)] // a refused guard fails the test
+    #[tokio::test(start_paused = true)]
+    async fn past_the_grace_the_cancel_ends_the_work_still_running() {
+        let (armed, _tx) = quiet_owner(Duration::ZERO);
+        let mut guard = armed.work_count().guard().expect("one unit fits");
+        let unit = tokio::spawn(async move { guard.cancelled().await });
+        armed.settle_live().await;
+        let started = Instant::now();
+        let mut lines = Vec::new();
+        let _settled = armed.cancel_logging(|line| lines.push(line)).await;
+        assert!(
+            started.elapsed() < WORK_CANCEL_DEADLINE,
+            "a cancelled unit stops before the deadline"
+        );
+        assert_eq!(*armed.shutdown.phase.borrow(), Phase::Closing);
+        assert_eq!(armed.shutdown.work.count(), 0);
+        assert_eq!(
+            lines,
+            [
+                "shutting down: cancelled 1 tasks still running after the 0 ms grace \
+                 (IPE_WEB_SHUTDOWN_GRACE_MS)"
+            ]
+        );
+        unit.await.expect("the cancelled unit ends");
+    }
+
+    #[allow(clippy::expect_used)] // a refused guard fails the test
+    #[tokio::test(start_paused = true)]
+    async fn work_that_never_stops_holds_the_cancel_only_to_its_deadline() {
+        let (armed, _tx) = quiet_owner(Duration::ZERO);
+        let _stuck = armed.work_count().guard().expect("one unit fits");
+        let started = Instant::now();
+        let mut lines = Vec::new();
+        let _settled = tokio::time::timeout(
+            WORK_CANCEL_DEADLINE.saturating_add(Duration::from_secs(1)),
+            armed.cancel_logging(|line| lines.push(line)),
+        )
+        .await
+        .expect("the cancel wait is bounded");
+        assert!(started.elapsed() >= WORK_CANCEL_DEADLINE);
+        assert_eq!(
+            lines,
+            [
+                "shutting down: cancelled 1 tasks still running after the 0 ms grace \
+                 (IPE_WEB_SHUTDOWN_GRACE_MS)",
+                "1 tasks did not stop within 500 ms; closing the pools anyway",
+            ]
+        );
+    }
+
+    #[allow(clippy::expect_used)] // a refused guard fails the test
+    #[tokio::test(start_paused = true)]
+    async fn work_after_the_close_is_born_cancelled_and_the_ceiling_refuses() {
+        let (armed, _tx) = quiet_owner(Duration::ZERO);
+        let count = armed.work_count();
+        armed
+            .shutdown
+            .work
+            .state
+            .store(WORK_CEILING, Ordering::SeqCst);
+        assert_eq!(count.guard().err(), Some(WorkFull), "the ceiling refuses");
+        armed.shutdown.work.state.store(0, Ordering::SeqCst);
+        let _settled = armed.cancel_work().await;
+        let mut late = count.guard().expect("a unit past the close is admitted");
+        assert_eq!(armed.shutdown.work.count(), 0, "it is not counted");
+        tokio::time::timeout(Duration::from_millis(1), late.cancelled())
+            .await
+            .expect("it is born cancelled");
+        let mut unowned = WorkGuard::never();
+        let waited = tokio::time::timeout(Duration::from_secs(1), unowned.cancelled()).await;
+        assert!(waited.is_err(), "work no owner counts is never cancelled");
+    }
+
+    #[tokio::test]
+    async fn a_closing_phase_still_drains_and_a_late_signal_keeps_it() {
+        let (armed, tx) = quiet_owner(Duration::ZERO);
+        let mut drain = armed.drain();
+        let _settled = armed.cancel_work().await;
+        tokio::time::timeout(BUDGET, drain.wait())
+            .await
+            .expect("closing is past serving");
+        assert!(armed.is_draining());
+        tx.send(Signal::Terminate).await.expect("the owner listens");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(*armed.shutdown.phase.borrow(), Phase::Closing);
+    }
+
     /// `server_shutdown_e2e` restates this bound as a literal; a change here
     /// must change it there.
     #[cfg(feature = "db")]
     #[test]
     fn the_pools_close_bound_is_the_one_the_e2e_mirrors() {
-        assert_eq!(POOLS_CLOSE_BOUND, Duration::from_secs(4));
+        assert_eq!(POOLS_CLOSE_BOUND, Duration::from_millis(4500));
     }
 
     #[cfg(unix)]
