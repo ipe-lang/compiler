@@ -97,14 +97,37 @@ struct AllowedDial {
     func: &'static str,
     /// The dial's path, as written.
     dial: &'static str,
+    /// For a method dial, the one call shape admitted; `None` for a path dial.
+    method: Option<AllowedMethod>,
     /// Why the dial needs no gate.
     why: &'static str,
+}
+
+/// The one shape of an admitted method dial: `receiver_fn(..).method(..)`.
+struct AllowedMethod {
+    /// The function whose call result the method is called on, as written.
+    receiver_fn: &'static str,
+    /// How many arguments that call takes.
+    receiver_args: usize,
+    /// How many arguments the method takes.
+    args: usize,
 }
 
 impl AllowedDial {
     /// Whether `dial` is this entry's.
     fn admits(&self, dial: &Dial) -> bool {
-        dial.path == self.dial
+        let shaped = match (&self.method, &dial.method) {
+            (None, None) => true,
+            (Some(want), Some(got)) => {
+                got.args == want.args
+                    && got.receiver.as_ref().is_some_and(|receiver| {
+                        receiver.path == want.receiver_fn && receiver.args == want.receiver_args
+                    })
+            }
+            (None, Some(_)) | (Some(_), None) => false,
+        };
+        shaped
+            && dial.path == self.dial
             && dial.within.impl_of.is_none()
             && dial.within.func.as_deref() == Some(self.func)
     }
@@ -116,18 +139,21 @@ const ALLOWED_DIALS: [AllowedDial; 6] = [
         file: "web/hub.rs",
         func: "open_spill",
         dial: "SqlitePool::connect_with",
+        method: None,
         why: "opens the console's local SQLite spill file from a filesystem path, not a URL",
     },
     AllowedDial {
         file: "telemetry_spill.rs",
         func: "open_spill_pool",
         dial: "SqlitePool::connect_with",
+        method: None,
         why: "opens the local SQLite spill file the runtime's own environment names",
     },
     AllowedDial {
         file: "ws_client.rs",
         func: "do_connect",
         dial: "tokio::net::TcpStream::connect",
+        method: None,
         why: "the WebSocket TCP dial: of the address `VettedDial::Pinned` proved, or, only under \
               `VettedDial::Unrestricted`, of the URL's own host; not a sqlx dial",
     },
@@ -135,6 +161,11 @@ const ALLOWED_DIALS: [AllowedDial; 6] = [
         file: "ws_client.rs",
         func: "tls_handshake",
         dial: ".connect",
+        method: Some(AllowedMethod {
+            receiver_fn: "tokio_rustls::TlsConnector::from",
+            receiver_args: 1,
+            args: 2,
+        }),
         why: "`tokio_rustls::TlsConnector::connect`, the TLS handshake over the TCP stream \
               `do_connect` already dialled; it opens no network target",
     },
@@ -142,12 +173,14 @@ const ALLOWED_DIALS: [AllowedDial; 6] = [
         file: "ssrf.rs",
         func: "dial_relay_target",
         dial: "tokio::net::TcpStream::connect",
+        method: None,
         why: "the pinned relay's TCP dial of a `VettedAddr`, which only `VettedDial::Pinned` can mint, not a sqlx dial",
     },
     AllowedDial {
         file: "web/console_proxy.rs",
         func: "wait_ready",
         dial: "tokio::net::TcpStream::connect",
+        method: None,
         why: "a loopback readiness probe of the child this process spawned, not a sqlx dial",
     },
 ];
@@ -254,7 +287,50 @@ struct Dial {
     gated: bool,
     /// The first argument, when it is a bare local name.
     arg: Option<String>,
+    /// For a method dial, its call shape.
+    method: Option<MethodShape>,
     within: Scope,
+}
+
+/// The call shape of a method dial.
+#[derive(Clone, Debug)]
+struct MethodShape {
+    /// The receiver, when it is a call of a plain path.
+    receiver: Option<PathCall>,
+    /// How many arguments the method takes.
+    args: usize,
+}
+
+/// A call of a path with no qualified self, leading `::` or generic arguments.
+#[derive(Clone, Debug)]
+struct PathCall {
+    /// The called path, as written.
+    path: String,
+    /// How many arguments the call takes.
+    args: usize,
+}
+
+/// `expr` as a call of a plain path, if it is one.
+fn path_call(expr: &Expr) -> Option<PathCall> {
+    let Expr::Call(call) = expr else {
+        return None;
+    };
+    let Expr::Path(func) = &*call.func else {
+        return None;
+    };
+    let plain = func.qself.is_none()
+        && func.path.leading_colon.is_none()
+        && func.path.segments.iter().all(|s| s.arguments.is_none());
+    plain.then(|| PathCall {
+        path: func
+            .path
+            .segments
+            .iter()
+            .map(|s| name_of(&s.ident))
+            .collect::<Vec<_>>()
+            .join("::"),
+        args: call.args.len(),
+    })
 }
 
 /// One SMTP transport constructor in production code.
@@ -378,12 +454,25 @@ impl Scan {
         gated: bool,
         arg: Option<String>,
     ) {
+        self.record_dial_shaped(name, path, kind, gated, arg, None);
+    }
+
+    fn record_dial_shaped(
+        &mut self,
+        name: String,
+        path: String,
+        kind: DialKind,
+        gated: bool,
+        arg: Option<String>,
+        method: Option<MethodShape>,
+    ) {
         self.dials.push(Dial {
             name,
             path,
             kind,
             gated,
             arg,
+            method,
             within: self.scope.clone(),
         });
     }
@@ -729,12 +818,17 @@ impl<'ast> Visit<'ast> for Scan {
         let method = name_of(&call.method);
         if DIAL_FNS.contains(&method.as_str()) {
             let arg = call.args.first().and_then(local_name);
-            self.record_dial(
+            let shape = MethodShape {
+                receiver: path_call(&call.receiver),
+                args: call.args.len(),
+            };
+            self.record_dial_shaped(
                 method.clone(),
                 format!(".{method}"),
                 DialKind::Sqlx,
                 false,
                 arg,
+                Some(shape),
             );
         } else if SMTP_TRANSPORT_FNS.contains(&method.as_str()) {
             let vetted = call.args.first().is_some_and(is_vetted_host);
@@ -1759,7 +1853,7 @@ fn the_tls_handshake_admits_only_its_own_connect() {
 }
 ";
     const HANDSHAKE: &str = "async fn tls_handshake(tcp: TcpStream) {
-    let _ = TlsConnector::from(config).connect(name, tcp).await;
+    let _ = tokio_rustls::TlsConnector::from(config).connect(name, tcp).await;
 }
 ";
     assert_eq!(
@@ -1767,12 +1861,22 @@ fn the_tls_handshake_admits_only_its_own_connect() {
         Vec::<String>::new()
     );
     let second = "async fn tls_handshake(tcp: TcpStream) {
-    let _ = TlsConnector::from(config).connect(name, tcp).await;
+    let _ = tokio_rustls::TlsConnector::from(config).connect(name, tcp).await;
     let _ = options.connect(url).await;
 }
 ";
     assert_violations(
         &tree_violations("ws_client.rs", &format!("{DIAL}{second}")),
+        1,
+        "fn tls_handshake: raw dial `connect`",
+    );
+    let twice = "async fn tls_handshake(tcp: TcpStream) {
+    let _ = tokio_rustls::TlsConnector::from(config).connect(name, tcp).await;
+    let _ = tokio_rustls::TlsConnector::from(config).connect(name, tcp).await;
+}
+";
+    assert_violations(
+        &tree_violations("ws_client.rs", &format!("{DIAL}{twice}")),
         1,
         "allowed dial `.connect` in fn tls_handshake",
     );
@@ -1801,6 +1905,52 @@ fn the_tls_handshake_admits_only_its_own_connect() {
         violations.iter().any(|v| v.contains("matches 0 dials")),
         "{violations:#?}"
     );
+}
+
+/// The handshake's `.connect` is admitted only on a one-argument
+/// `tokio_rustls::TlsConnector::from` call and with two arguments: any other
+/// `.connect` in `tls_handshake`, a sqlx one included, is a raw dial.
+#[test]
+fn the_tls_handshake_connect_is_admitted_only_in_its_own_shape() {
+    const DIAL: &str = "async fn do_connect() {
+    let _ = tokio::net::TcpStream::connect(addrs).await;
+}
+";
+    for body in [
+        "PgConnectOptions::from_str(url)?.connect()",
+        "PgConnectOptions::from(url).connect(name, tcp)",
+        "TlsConnector::from(config).connect(name, tcp)",
+        "::tokio_rustls::TlsConnector::from(config).connect(name, tcp)",
+        "tokio_rustls::TlsConnector::<C>::from(config).connect(name, tcp)",
+        "<tokio_rustls::TlsConnector>::from(config).connect(name, tcp)",
+        "tokio_rustls::TlsConnector::from(config, more).connect(name, tcp)",
+        "tokio_rustls::TlsConnector::from(config).connect(url)",
+        "tokio_rustls::TlsConnector::from(config).connect(name, tcp, more)",
+        "connector.connect(name, tcp)",
+        "(tokio_rustls::TlsConnector::from(config)).connect(name, tcp)",
+    ] {
+        let handshake = format!(
+            "async fn tls_handshake(tcp: TcpStream) {{
+    let _ = {body}.await;
+}}
+"
+        );
+        let violations = tree_violations("ws_client.rs", &format!("{DIAL}{handshake}"));
+        assert_eq!(violations.len(), 2, "{body}: {violations:#?}");
+        assert!(
+            violations
+                .iter()
+                .any(|v| v.contains("fn tls_handshake: raw dial `connect`")),
+            "{body}: {violations:#?}"
+        );
+        assert!(
+            violations.iter().any(
+                |v| v.contains("allowed dial `.connect` in fn tls_handshake")
+                    && v.contains("matches 0 dials")
+            ),
+            "{body}: {violations:#?}"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
