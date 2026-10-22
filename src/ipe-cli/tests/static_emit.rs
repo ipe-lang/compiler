@@ -407,14 +407,15 @@ fn package_ipe_rust_stages_parse_and_reject_typos() {
 /// silently breaks the fully-static musl artifact (dynamic libssl) or makes
 /// it host-dependent (no `/etc/ssl` in a `scratch` container).
 ///
-/// Three sources write dependency lines into an emitted `Cargo.toml`:
-/// the golden base manifest, the vendored runtime's manifest, and the
-/// surgery strings in the backend's `project.rs`. All three are scanned.
+/// Four sources write dependency lines into an emitted `Cargo.toml`:
+/// the golden base manifest, the vendored runtime's manifest, the surgery
+/// strings in the backend's `project.rs`, and the crate names, versions, pins
+/// and drivers of `crate_specs.rs`. All four are scanned.
 ///
 /// The check has two halves, and the POSITIVE half is what makes it sound:
 ///
 /// * **Negative** — no source's effective (non-comment) content may contain a
-///   forbidden backend (`native-tls`, `openssl`, `rustls-tls-native-roots`).
+///   native backend or OS root-store spelling ([`native_backend_in`]).
 ///   Comment lines are stripped so a comment DOCUMENTING a deliberate exclusion
 ///   (the runtime manifest says "the `native-tls` feature is deliberately NOT
 ///   listed") is not a false positive.
@@ -457,14 +458,29 @@ fn tls_stays_rustls_with_bundled_roots_in_every_manifest_source() {
             .join("\n")
     }
 
+    // `crate_specs.rs` names every emitted crate; its test module spells the
+    // refused backends as fixtures, so only the code before it is scanned.
+    fn production(text: &str, path: &Path) -> String {
+        const TESTS: &str = "\n#[cfg(test)]\nmod tests {";
+        let cut = text.find(TESTS);
+        assert!(cut.is_some(), "{}: no `{TESTS}` to cut at", path.display());
+        text.get(..cut.unwrap_or(0)).unwrap_or_default().to_owned()
+    }
+
     let root = repo_root();
     let sources = [
         root.join("tests/golden/basics/Cargo.toml"),
         root.join("src/runtime/rust/Cargo.toml"),
         root.join("src/compiler/backend/rust/src/project.rs"),
+        root.join("src/compiler/backend/rust/src/crate_specs.rs"),
     ];
     for path in &sources {
-        let text = effective(&read(path));
+        let whole = read(path);
+        let text = if path.ends_with("crate_specs.rs") {
+            effective(&production(&whole, path))
+        } else {
+            effective(&whole)
+        };
         assert_eq!(
             native_backend_in(&text),
             None,
@@ -1007,8 +1023,8 @@ const NATIVE_BACKEND_SPELLINGS: [&str; 5] = [
 
 /// The first native TLS backend or OS trust-store spelling in `text`.
 ///
-/// One closed set serves the manifest scan, the pinned-feature scan and the
-/// lock walk, so a backend added to one is refused by all.
+/// One closed set serves the manifest scan and the pinned-feature scan; the
+/// lock walk matches its two crate-name halves by exact package name.
 fn native_backend_in(text: &str) -> Option<&'static str> {
     OS_ROOT_STORES
         .into_iter()
