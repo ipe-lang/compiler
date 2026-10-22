@@ -862,8 +862,8 @@ function __ipeRestoreFocus(container, path, ids) {
 // browser never focuses an inserted element itself. A later full frame only
 // puts lost focus back (`__ipeRestoreFocus`). A later patches frame moves focus
 // only through `__ipeFocusAddressed`: onto the element the server named as
-// newly autofocused, when the frame answers this tab's own event, applies as
-// the next step, and focus has not moved since that event was sent.
+// newly autofocused, when the frame answers this tab's own user act, applies
+// as the next step, and focus has not moved since that act.
 var __ipeMounted = false;
 // The `ipe-id` of the first element the server's page marks `autofocus`, read
 // as the client starts; null when it marks none, or one with no `ipe-id`.
@@ -887,18 +887,24 @@ var __ipeRuntimeFocusing = false;
     if (!__ipeRuntimeFocusing) __ipeFocusEpoch += 1;
   }, true);
 });
-// The focus epoch each of this tab's recent events was sent in, by the tab's
-// own seq. A frame names the seq of the event it answers, so the check binds to
-// that event alone, never to acks or to the other events in flight. At the cap
-// the oldest record is dropped: a frame whose record is gone moves no focus.
+// The focus epoch of the user act behind each of this tab's recent events, by
+// the tab's own seq. The epoch is read at the act itself (the key, the click,
+// the file pick), never at the send: a file read, a resize or a debounce sends
+// later, after the user may have moved focus. A frame names the seq of the
+// event it answers, so the check binds to that event alone, never to acks or to
+// the other events in flight. An event no user act of this document raised (a
+// widget's emit, a page script's `__ipe_send`) keeps no record, so its render
+// moves no focus: the runtime cannot prove a user drove it. At the cap the
+// oldest record is dropped: a frame whose record is gone moves no focus.
 var __IPE_FOCUS_SENDS_MAX = 64;
 var __ipeFocusSends = [];
-function __ipeFocusSent(seq) {
+function __ipeFocusSent(seq, actEpoch) {
+  if (typeof actEpoch !== "number") return;
   if (__ipeFocusSends.length >= __IPE_FOCUS_SENDS_MAX) __ipeFocusSends.shift();
-  __ipeFocusSends.push({seq: seq, epoch: __ipeFocusEpoch});
+  __ipeFocusSends.push({seq: seq, epoch: actEpoch});
 }
-// The focus epoch the event at `seq` was sent in, taking its record out (one
-// event commits one render); null when this tab holds no record of it.
+// The focus epoch of the act behind the event at `seq`, taking its record out
+// (one event commits one render); null when this tab holds no record of it.
 function __ipeFocusTakeSent(seq) {
   for (var i = 0; i < __ipeFocusSends.length; i++) {
     if (__ipeFocusSends[i].seq === seq) return __ipeFocusSends.splice(i, 1)[0].epoch;
@@ -906,8 +912,8 @@ function __ipeFocusTakeSent(seq) {
   return null;
 }
 // A patches frame just applied as the next step moves focus onto the element
-// it names only when it answers an event of this tab and focus has not moved
-// since that event was sent. A target the frame's own patches removed, or one
+// it names only when it answers a user act of this tab and focus has not moved
+// since that act. A target the frame's own patches removed, or one
 // that cannot take focus, leaves focus alone.
 function __ipeFocusAddressed(frame) {
   if (!__ipeTabId || frame.tab !== __ipeTabId) return;
@@ -1168,14 +1174,15 @@ function __ipeLoaderEnd() {
 // ── Debounce ─────────────────────────────────────────────────
 var __ipeInputTimers = {};
 var __ipeInputPending = {};
-// `epoch` is the render epoch read with `hid` at the keystroke.
-function __ipeDebouncedSend(msgName, args, hid, delay, epoch) {
+// `epoch` is the render epoch read with `hid` at the keystroke, and `focus` the
+// focus epoch read at that keystroke.
+function __ipeDebouncedSend(msgName, args, hid, delay, epoch, focus) {
   var key = hid || msgName;
   clearTimeout(__ipeInputTimers[key]);
-  __ipeInputPending[key] = { msgName: msgName, args: args, hid: hid, epoch: epoch };
+  __ipeInputPending[key] = { msgName: msgName, args: args, hid: hid, epoch: epoch, focus: focus };
   __ipeInputTimers[key] = setTimeout(function() {
     delete __ipeInputPending[key];
-    __ipeSend(msgName, args, hid, { noLoader: true, epoch: epoch });
+    __ipeSend(msgName, args, hid, { noLoader: true, epoch: epoch, focus: focus });
   }, delay);
 }
 // Flush pending debounced input on blur (tab away / click elsewhere).
@@ -1191,7 +1198,7 @@ __ipeDoc.on("focusout", function(ev) {
     clearTimeout(__ipeInputTimers[key]);
     var p = __ipeInputPending[key];
     delete __ipeInputPending[key];
-    __ipeSend(p.msgName, p.args, p.hid, { noLoader: true, epoch: p.epoch });
+    __ipeSend(p.msgName, p.args, p.hid, { noLoader: true, epoch: p.epoch, focus: p.focus });
   }
 }, true);
 
@@ -1277,6 +1284,8 @@ function __ipeFlushPendingBeacon() {
 // transitions where sendBeacon is overkill. Calls __ipeSend for
 // each pending entry; the fetch requests are fire-and-forget and
 // the browser keeps them alive across same-origin navigation.
+// A flushed entry keeps no focus record: the link activation that flushes it
+// is a later act than its keystroke.
 function __ipeFlushPendingSync() {
   var batch = __ipeCollectPendingBatch();
   if (!batch) return;
@@ -1322,6 +1331,8 @@ window.addEventListener("pagehide", __ipeFlushPendingBeacon);
 //     the inputState snapshot that produced them; with tab it marks a
 //     re-delivered event as a duplicate.
 //   * epoch names the render handlerId was read from.
+//   * opts.focus (client-only, never posted) is the focus epoch read at the
+//     user act that raised the event; without it the event records no focus.
 //   * inputState carries the user's current DOM values for every
 //     dirty input so the server's diff can align against reality
 //     before emitting patches.
@@ -1354,7 +1365,7 @@ function __ipeSend(msgName, args, handlerId, opts) {
   if (epoch) body.epoch = epoch;
   if (__ipeTabId) body.tab = __ipeTabId;
   if (snapshot) body.inputState = snapshot;
-  __ipeFocusSent(mySeq);
+  __ipeFocusSent(mySeq, opts.focus);
   __ipePostEvent(body);
 }
 
@@ -1761,6 +1772,7 @@ function __ipeBindOne(eventName) {
       var msgName = __ipeNode.attr(target, "ipe-" + ev.type);
       var hid     = __ipeNode.attr(target, "data-ipe-hid");
       var epoch   = __ipeEpoch;
+      var focus   = __ipeFocusEpoch;
       if (!msgName && !hid) return;
       var args = __ipeExtractArgs(ev);
       if (ev.type === "input") {
@@ -1772,10 +1784,10 @@ function __ipeBindOne(eventName) {
           var e = __ipeInputEntry(sid);
           e.liveValue = args && args.length > 0 ? String(args[0]) : "";
         }
-        __ipeDebouncedSend(msgName, args, hid, 150, epoch);
+        __ipeDebouncedSend(msgName, args, hid, 150, epoch, focus);
         return;
       }
-      __ipeSend(msgName, args, hid, { epoch: epoch });
+      __ipeSend(msgName, args, hid, { epoch: epoch, focus: focus });
     });
   }
 }
@@ -1865,8 +1877,10 @@ __ipeDoc.on("change", function(ev) {
   var fileEv  = el.getAttribute("data-ipe-ev-ipe-file");
   var imageEv = el.getAttribute("data-ipe-ev-ipe-image");
   var hid     = el.getAttribute("data-ipe-hid");
-  // Read with the id, before the asynchronous read below.
+  // Read with the id and at the pick, before the asynchronous read below: the
+  // user may move focus while the file is read.
   var epoch   = __ipeEpoch;
+  var focus   = __ipeFocusEpoch;
   var f = el.files && el.files[0];
   if (!f) return;
   // Client-side size guard via fileMaxSize. Saves the round-trip when
@@ -1891,7 +1905,9 @@ __ipeDoc.on("change", function(ev) {
     // []json.RawMessage); a bare string would unmarshal-fail. Wrap
     // the data URL in a single-element array — the Ipe-side Msg
     // constructor declared as 'String -> Msg' reads args[0].
-    r.onload = function(e) { __ipeSend(fileEv, [e.target.result], hid, { epoch: epoch }); };
+    r.onload = function(e) {
+      __ipeSend(fileEv, [e.target.result], hid, { epoch: epoch, focus: focus });
+    };
     r.readAsDataURL(f);
   }
   if (imageEv) {
@@ -1899,7 +1915,7 @@ __ipeDoc.on("change", function(ev) {
     var maxH = parseInt(el.getAttribute("data-ipe-ev-ipe-file-max-height") || "1200");
     __ipeResizeImage(f, maxW, maxH, function(dataUrl) {
       // Same wire-format reason as the onFile branch — wrap in array.
-      __ipeSend(imageEv, [dataUrl], hid, { epoch: epoch });
+      __ipeSend(imageEv, [dataUrl], hid, { epoch: epoch, focus: focus });
     });
   }
 });
@@ -1926,7 +1942,8 @@ function __ipeResizeImage(file, maxW, maxH, cb) {
 // registered handler by id, so the id maps to __ipeSend's handlerId slot
 // (not msgName) and value maps to args.
 // The caller reads no id from the DOM, so the event carries the epoch current
-// at the call.
+// at the call. A page script may call it with no user act, so its event keeps
+// no focus record and its render moves no focus.
 window.__ipe_send = function(id, value, opts) {
   __ipeSend("", value, id, { noLoader: !!(opts && opts.noLoader), epoch: __ipeEpoch });
 };

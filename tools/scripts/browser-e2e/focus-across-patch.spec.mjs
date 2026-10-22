@@ -606,6 +606,56 @@ test("focus-across-patch: a render landing after the user moved focus never move
   expect(await focusedId(page)).toBe("note");
 });
 
+/**
+ * Holds every file read the page starts: `readAsDataURL` queues the call, and
+ * `__testReleaseReads` makes the queued reads in order.
+ */
+function holdFileReads() {
+  const read = FileReader.prototype.readAsDataURL;
+  window.__testReads = [];
+  FileReader.prototype.readAsDataURL = function (blob) {
+    window.__testReads.push(() => read.call(this, blob));
+  };
+  window.__testReleaseReads = () => {
+    const reads = window.__testReads;
+    window.__testReads = [];
+    for (const run of reads) run();
+  };
+}
+
+/** Picks a small text file in `input#pick` and waits until its read is held. */
+async function pickHeld(page) {
+  await page.setInputFiles("input#pick", {
+    name: "pick.txt",
+    mimeType: "text/plain",
+    buffer: Buffer.from("x"),
+  });
+  await expect.poll(() => page.evaluate(() => window.__testReads.length)).toBe(1);
+}
+
+test("focus-across-patch: a file read finishing after the user moved focus never moves it", async ({ page }) => {
+  // The read finishes after the pick: the event is sent then, and only the
+  // act's own focus epoch tells that focus moved in between.
+  await page.addInitScript(holdFileReads);
+  await open(page);
+  await pickHeld(page);
+  await page.click("input#note");
+  expect(await focusedId(page)).toBe("note");
+  await page.evaluate(() => window.__testReleaseReads());
+  await expect(page.locator("input#fileask")).toHaveCount(1);
+  await settle(page);
+  expect(await focusedId(page)).toBe("note");
+});
+
+test("focus-across-patch: a file read the user waited on focuses its autofocus field", async ({ page }) => {
+  await page.addInitScript(holdFileReads);
+  await open(page);
+  await pickHeld(page);
+  await page.evaluate(() => window.__testReleaseReads());
+  await expect(page.locator("input#fileask")).toHaveCount(1);
+  await expect.poll(() => focusedId(page)).toBe("fileask");
+});
+
 test("focus-across-patch: a frame behind the render on screen never moves focus", async ({ page }) => {
   await open(page);
   await expect.poll(() => focusedId(page)).toBe("root");

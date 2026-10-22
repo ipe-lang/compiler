@@ -27,7 +27,8 @@ module Main exposing (main)
 -- key press. `F3` arms a timer whose tick adds the `autofocus` field `subask`,
 -- a render no event of the tab caused. A query holding `noauto` leaves the
 -- root without `autofocus`, so focus stays on the body at load; one holding
--- `tick` arms the timer from the start.
+-- `tick` arms the timer from the start. Picking a file in `pick` adds the
+-- `autofocus` field `fileask` once the file is read.
 --
 -- Co-located, no capabilities, no JS ports.
 
@@ -59,6 +60,7 @@ type alias Model =
     , ticking : Bool
     , subAsk : Bool
     , loadAuto : Bool
+    , picked : Bool
     }
 
 
@@ -75,12 +77,13 @@ type Msg
     | FormDrop
     | Answer String
     | Tick
+    | Picked String
     | NoOp
 
 
 init : WebReq -> ( Model, Cmd.Cmd Msg )
 init req =
-    ( { keys = "", row = False, drop = True, note = "", swapped = False, pressed = False, deep = False, tagSwapped = False, hostRow = False, formDrop = True, mathRow = False, ask = False, answer = "", ticking = String.contains "tick" req.query, subAsk = False, loadAuto = not (String.contains "noauto" req.query) }, Cmd.none )
+    ( { keys = "", row = False, drop = True, note = "", swapped = False, pressed = False, deep = False, tagSwapped = False, hostRow = False, formDrop = True, mathRow = False, ask = False, answer = "", ticking = String.contains "tick" req.query, subAsk = False, loadAuto = not (String.contains "noauto" req.query), picked = False }, Cmd.none )
 
 
 update : Msg -> Model -> ( Model, Cmd.Cmd Msg )
@@ -134,6 +137,9 @@ update msg model =
 
         Tick ->
             ( { model | ticking = False, subAsk = True }, Cmd.none )
+
+        Picked _ ->
+            ( { model | picked = True }, Cmd.none )
 
         NoOp ->
             ( model, Cmd.none )
@@ -440,6 +446,16 @@ view model =
             )
         , Ui.column [ Ui.id "askhost" ] (askPanel model.ask "ask" model)
         , Ui.column [ Ui.id "subaskhost" ] (askPanel model.subAsk "subask" model)
+        , Ui.column
+            [ Ui.id "pickhost" ]
+            (Ui.input
+                [ Ui.id "pick"
+                , Ui.htmlAttribute "type" "file"
+                , Ui.htmlAttribute "aria-label" "Pick"
+                , Ui.onFile Picked
+                ]
+                :: askPanel model.picked "fileask" model
+            )
         ]
 
 
