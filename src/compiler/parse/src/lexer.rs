@@ -24,6 +24,12 @@
 //! and line, inside a string or char literal. Every other position refuses it
 //! ([`ParseError::SourceDisplayHazard`]), and the hazards no literal may carry
 //! are refused before reading any token.
+//!
+//! A raw control a terminal runs as a command (every C0 control, `DEL` and C1
+//! control but TAB, LF, CR and the line breaks above) stands nowhere, literals
+//! included, so `cat` of an accepted file never moves the cursor or erases a
+//! line ([`ParseError::SourceTerminalControl`]); a program builds one with
+//! `Char.fromCode`.
 
 use ipe_diagnostics::terminal::{SourceHazard, ends_bidi_paragraph};
 use ipe_diagnostics::{DResult, Diagnostic, HazardRefusal, ParseError, Span};
@@ -516,9 +522,9 @@ fn literal_char(open: &mut Option<OpenIsolate>, at: usize, c: char) -> Option<Ha
         Some(SourceHazard::IsolateClose) => {
             (!close_isolate(open)).then_some((at, c, HazardRefusal::UnopenedIsolate))
         }
-        Some(SourceHazard::ControlBreak | SourceHazard::BidiOverride) => {
-            Some((at, c, HazardRefusal::Anywhere))
-        }
+        Some(
+            SourceHazard::ControlBreak | SourceHazard::BidiOverride | SourceHazard::TerminalControl,
+        ) => Some((at, c, HazardRefusal::Anywhere)),
     }
 }
 
@@ -549,13 +555,25 @@ const fn close_isolate(open: &mut Option<OpenIsolate>) -> bool {
     }
 }
 
+/// The error refusing the source hazard `ch` for `refusal`.
+///
+/// A terminal control is admitted nowhere, so its own code answers whatever
+/// position refuses it.
+fn hazard_refusal(ch: char, refusal: HazardRefusal) -> ParseError {
+    if SourceHazard::of(ch) == Some(SourceHazard::TerminalControl) {
+        ParseError::SourceTerminalControl { ch }
+    } else {
+        ParseError::SourceDisplayHazard { ch, refusal }
+    }
+}
+
 /// The diagnostic for a refused source display hazard at byte `at`.
 fn display_hazard_error((at, ch, refusal): HazardHit) -> Diagnostic {
     // `at` is below `src.len()`, which `lex` bounds by `u32::MAX` first.
     let at = u32::try_from(at).unwrap_or(u32::MAX);
     Diagnostic::Parse {
         span: Span::from_start_width(at, char_width(ch)),
-        msg: ParseError::SourceDisplayHazard { ch, refusal },
+        msg: hazard_refusal(ch, refusal),
     }
 }
 
@@ -1015,14 +1033,12 @@ fn one_or_two(lx: &mut Lexer, second: char, two: Tok, one: Tok) -> Tok {
 /// The refusal of `c` where code expects a token: a display hazard, or an unknown character.
 fn unknown_char(c: char) -> ParseError {
     SourceHazard::of(c).map_or(ParseError::UnknownChar(c), |hazard| {
-        ParseError::SourceDisplayHazard {
-            ch: c,
-            refusal: if hazard.admitted_in_literal() {
-                HazardRefusal::OutsideLiteral
-            } else {
-                HazardRefusal::Anywhere
-            },
-        }
+        let refusal = if hazard.admitted_in_literal() {
+            HazardRefusal::OutsideLiteral
+        } else {
+            HazardRefusal::Anywhere
+        };
+        hazard_refusal(c, refusal)
     })
 }
 
@@ -1369,15 +1385,16 @@ mod display_hazard_tests {
         Some((at, at + width, ch, reason))
     }
 
-    /// Every source display hazard.
+    /// Every source display hazard but the terminal controls, which answer `IPE-P0073`.
     fn hazards() -> impl Iterator<Item = char> {
         SOURCE_DISPLAY_HAZARDS
             .iter()
+            .filter(|(_, role)| *role != SourceHazard::TerminalControl)
             .flat_map(|(range, _)| range.clone())
     }
 
     /// Each position the compiler reads as no text, with `{}` for the hazard.
-    const NON_TEXT: [&str; 6] = [
+    pub(super) const NON_TEXT: [&str; 6] = [
         "x = 1 -- a{}b\ny = 2",
         "x = {- a{}b -} 1",
         "{-| a{}b -}\nx = 1",
@@ -1405,7 +1422,7 @@ mod display_hazard_tests {
     }
 
     /// Each literal a hazard can stand in, with `{}` for the hazard.
-    const LITERALS: [&str; 3] = ["x = \"a{}b\"", "x = \"\"\"\na{}b\n\"\"\"", "x = '{}'"];
+    pub(super) const LITERALS: [&str; 3] = ["x = \"a{}b\"", "x = \"\"\"\na{}b\n\"\"\"", "x = '{}'"];
 
     /// VT, FF, NEL and every embedding, pop or override is refused in a literal too.
     #[test]
@@ -1474,6 +1491,90 @@ mod display_hazard_tests {
             "x = '\u{2028}'",
             "x = '\u{2029}'",
             "x = \"say \\\"hi\\\" a<b>c&d\u{2028}e\u{2029}f\"",
+        ];
+        for src in accepted {
+            assert!(lex(src).is_ok(), "{src:?} must lex: {:?}", lex(src));
+        }
+    }
+}
+
+#[cfg(test)]
+mod terminal_control_tests {
+    use super::display_hazard_tests::{LITERALS, NON_TEXT};
+    use super::lex;
+    use ipe_diagnostics::terminal::{SOURCE_DISPLAY_HAZARDS, SourceHazard};
+    use ipe_diagnostics::{Diagnostic, IPE_P0073, ParseError};
+
+    /// Every control a terminal runs as a command.
+    fn controls() -> impl Iterator<Item = char> {
+        SOURCE_DISPLAY_HAZARDS
+            .iter()
+            .filter(|(_, role)| *role == SourceHazard::TerminalControl)
+            .flat_map(|(range, _)| range.clone())
+    }
+
+    /// Assert `src` is refused with `IPE-P0073` at its first `ch`.
+    fn assert_refused_at_first(src: &str, ch: char) {
+        let verdict = lex(src);
+        let Err(diag) = &verdict else {
+            assert!(verdict.is_err(), "{src:?} must be refused");
+            return;
+        };
+        assert_eq!(diag.code(), IPE_P0073, "{src:?}: {diag:?}");
+        let Diagnostic::Parse {
+            span,
+            msg: ParseError::SourceTerminalControl { ch: found },
+        } = diag
+        else {
+            assert!(matches!(diag, Diagnostic::Parse { .. }), "{src:?}");
+            return;
+        };
+        let at = src.find(ch).and_then(|at| u32::try_from(at).ok());
+        let width = u32::try_from(ch.len_utf8()).ok();
+        assert_eq!(*found, ch, "{src:?}");
+        assert_eq!(Some(span.lo), at, "{src:?}");
+        assert_eq!(Some(span.hi - span.lo), width, "{src:?}");
+    }
+
+    /// Every terminal control is refused in a comment, a doc comment and among code.
+    #[test]
+    fn every_terminal_control_is_refused_outside_a_literal() {
+        for ch in controls() {
+            for shape in NON_TEXT {
+                assert_refused_at_first(&shape.replace("{}", &ch.to_string()), ch);
+            }
+        }
+    }
+
+    /// Every terminal control is refused in a string, a `"""` body and a char literal.
+    #[test]
+    fn every_terminal_control_is_refused_in_every_literal() {
+        for ch in controls() {
+            for shape in LITERALS {
+                assert_refused_at_first(&shape.replace("{}", &ch.to_string()), ch);
+            }
+        }
+    }
+
+    /// ESC and CSI, the openers of a cursor-up and erase-line sequence, are refused whole.
+    #[test]
+    fn an_escape_sequence_that_hides_a_line_is_refused() {
+        assert_refused_at_first("x = 1 -- ok\u{1b}[1A\u{1b}[2K\ny = 2", '\u{1b}');
+        assert_refused_at_first("x = \"a\u{9b}2Kb\"", '\u{9b}');
+        assert_refused_at_first("x = 1 {- a\u{8}\u{8}b -}", '\u{8}');
+    }
+
+    /// TAB, LF and CRLF stay the line model, and an ESC built by `Char.fromCode` lexes.
+    #[test]
+    fn the_line_model_and_a_built_escape_are_accepted() {
+        let accepted = [
+            "x = \"a\tb\"",
+            "x = '\t'",
+            "x = \"\"\"\na\tb\r\nc\n\"\"\"",
+            "x = 1 -- a\tb\r\ny = 2\n",
+            "x = {- a\tb\r\nc -} 1",
+            "x = \"plain text, no control\"",
+            "esc = Char.fromCode 27\nred = String.fromChar esc ++ \"[31m\"\n",
         ];
         for src in accepted {
             assert!(lex(src).is_ok(), "{src:?} must lex: {:?}", lex(src));

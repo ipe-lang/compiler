@@ -432,7 +432,8 @@ fn parse_prose(msg: &ParseError) -> String {
         | ParseError::UnterminatedBlockComment
         | ParseError::SourceTooLarge { .. }
         | ParseError::LoneCarriageReturn
-        | ParseError::SourceDisplayHazard { .. } => lexical_prose(msg),
+        | ParseError::SourceDisplayHazard { .. }
+        | ParseError::SourceTerminalControl { .. } => lexical_prose(msg),
         ParseError::Unexpected => "I couldn't make sense of this part of the file.".to_string(),
     }
 }
@@ -461,6 +462,18 @@ fn display_hazard_prose(ch: char, refusal: HazardRefusal) -> String {
              line, so a viewer would reorder the text around it."
         ),
     }
+}
+
+/// The prose band for a raw terminal control: what a terminal does with it, and the fix.
+fn terminal_control_prose(ch: char) -> String {
+    format!(
+        "The control character {} is one a terminal that shows this file may run as a \
+         command (controls such as escape move the cursor, erase a line or step back \
+         over text), so the file could show you other code than I read. It is refused \
+         anywhere in a source file, literals included; build it in a value with \
+         `Char.fromCode` instead.",
+        char_repr(ch)
+    )
 }
 
 /// The primary label for a source display hazard.
@@ -516,6 +529,7 @@ fn lexical_prose(msg: &ParseError) -> String {
                 .to_string()
         }
         ParseError::SourceDisplayHazard { ch, refusal } => display_hazard_prose(*ch, *refusal),
+        ParseError::SourceTerminalControl { ch } => terminal_control_prose(*ch),
         // A grammar defect: `parse_prose` answers each of these in its own arm.
         ParseError::Unexpected
         | ParseError::TooDeep
@@ -1595,6 +1609,10 @@ fn parse_label(msg: &ParseError) -> Option<String> {
         ParseError::SourceDisplayHazard { ch, refusal } => {
             Some(display_hazard_label(*ch, *refusal))
         }
+        ParseError::SourceTerminalControl { ch } => Some(format!(
+            "{} is a terminal control, refused anywhere in source",
+            char_repr(*ch)
+        )),
         ParseError::AnnotationWithoutBinding { .. } => {
             Some("this annotation has no matching definition".to_string())
         }
@@ -4003,6 +4021,7 @@ mod tests {
                 ch: '\u{2028}',
                 refusal: HazardRefusal::OutsideLiteral,
             },
+            ParseError::SourceTerminalControl { ch: '\u{1b}' },
         ];
         for msg in &lexical {
             assert_ne!(parse_prose(msg), fallback, "{msg:?}");
@@ -4027,8 +4046,11 @@ mod tests {
         for (range, _) in crate::terminal::SOURCE_DISPLAY_HAZARDS {
             for ch in range.clone() {
                 let code = format!("U+{:04X}", u32::from(ch));
-                for refusal in refusals {
-                    let msg = ParseError::SourceDisplayHazard { ch, refusal };
+                let messages = refusals
+                    .map(|refusal| ParseError::SourceDisplayHazard { ch, refusal })
+                    .into_iter()
+                    .chain([ParseError::SourceTerminalControl { ch }]);
+                for msg in messages {
                     let prose = parse_prose(&msg);
                     let label = parse_label(&msg).unwrap_or_default();
                     for text in [&prose, &label] {

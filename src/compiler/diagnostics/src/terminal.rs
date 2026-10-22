@@ -70,11 +70,24 @@ pub const CONTROL_LINE_BREAKS: RangeInclusive<char> = '\u{000B}'..='\u{000C}';
 /// NEXT LINE (NEL), the C1 control a viewer draws as a line break.
 pub const NEXT_LINE: char = '\u{0085}';
 
+/// The C0 controls before TAB: NUL through BS, which moves the cursor back.
+pub const C0_CONTROLS_BEFORE_TAB: RangeInclusive<char> = '\u{0000}'..='\u{0008}';
+
+/// The C0 controls after CR: SO through US, with ESC, which opens a cursor or erase sequence.
+pub const C0_CONTROLS_AFTER_CR: RangeInclusive<char> = '\u{000E}'..='\u{001F}';
+
+/// `DEL` and the C1 controls before [`NEXT_LINE`].
+pub const DEL_AND_C1_BEFORE_NEXT_LINE: RangeInclusive<char> = '\u{007F}'..='\u{0084}';
+
+/// The C1 controls after [`NEXT_LINE`], with CSI, which opens a cursor or erase sequence.
+pub const C1_CONTROLS_AFTER_NEXT_LINE: RangeInclusive<char> = '\u{0086}'..='\u{009F}';
+
 /// The role a source display hazard plays.
 ///
 /// A source display hazard is a character a viewer draws as structure (a line
-/// break, or text reordered around it) while the compiler reads none there. The
-/// lexer refuses each one by its role, and every one is also an
+/// break, or text reordered around it) while the compiler reads none there, or
+/// a control a terminal showing the raw file runs as a command. The lexer
+/// refuses each one by its role, and every one is also an
 /// [`is_display_hazard`] character, so a sink that prints source text escapes
 /// it too.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -89,6 +102,13 @@ pub enum SourceHazard {
     IsolateOpen,
     /// The isolate closer, admitted only in a literal that opened its isolate.
     IsolateClose,
+    /// A C0 control, `DEL` or a C1 control a terminal executes, admitted nowhere in source.
+    ///
+    /// Every `Cc` character except the line model's TAB, LF and CR and the
+    /// [`Self::ControlBreak`]s: a terminal showing the raw file runs it as a
+    /// command (ESC and CSI move the cursor or erase a line, BS steps back), so
+    /// it could overwrite or hide the code around it.
+    TerminalControl,
 }
 
 /// Every source display hazard, as the code points it covers and its role.
@@ -102,10 +122,14 @@ pub const SOURCE_DISPLAY_HAZARDS: &[(RangeInclusive<char>, SourceHazard)] = &[
         BIDI_ISOLATE_CLOSER..=BIDI_ISOLATE_CLOSER,
         SourceHazard::IsolateClose,
     ),
+    (C0_CONTROLS_BEFORE_TAB, SourceHazard::TerminalControl),
+    (C0_CONTROLS_AFTER_CR, SourceHazard::TerminalControl),
+    (DEL_AND_C1_BEFORE_NEXT_LINE, SourceHazard::TerminalControl),
+    (C1_CONTROLS_AFTER_NEXT_LINE, SourceHazard::TerminalControl),
 ];
 
 impl SourceHazard {
-    /// The role `c` plays, or `None` for a character no viewer draws as structure.
+    /// The role `c` plays, or `None` for a character no viewer draws as structure or runs.
     #[must_use]
     pub fn of(c: char) -> Option<Self> {
         SOURCE_DISPLAY_HAZARDS
@@ -533,10 +557,11 @@ mod tests {
         assert!(!is_display_hazard('\u{FFFC}'));
     }
 
-    /// The source display hazards are exactly the line-like breaks and bidi
-    /// controls, each with its role, and no other character has a role.
+    /// The source display hazards are exactly the line-like breaks, the bidi
+    /// controls and the terminal controls, each with its role, and no other
+    /// character has a role.
     #[test]
-    fn source_display_hazards_are_the_breaks_and_bidi_controls() {
+    fn source_display_hazards_are_the_breaks_bidi_and_terminal_controls() {
         let expected: [(char, SourceHazard); 14] = [
             ('\u{000B}', SourceHazard::ControlBreak),
             ('\u{000C}', SourceHazard::ControlBreak),
@@ -554,10 +579,12 @@ mod tests {
             ('\u{2069}', SourceHazard::IsolateClose),
         ];
         for c in char::MIN..=char::MAX {
+            let terminal = c.is_control() && !matches!(c, '\t' | '\n' | '\r');
             let want = expected
                 .iter()
                 .find(|(hazard, _)| *hazard == c)
-                .map(|&(_, role)| role);
+                .map(|&(_, role)| role)
+                .or_else(|| terminal.then_some(SourceHazard::TerminalControl));
             assert_eq!(SourceHazard::of(c), want, "U+{:04X}", u32::from(c));
         }
     }
@@ -577,6 +604,33 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The source refuses every `Cc` control the terminal sanitiser drops, except
+    /// the line model's TAB, LF and CR, so the lexer's control set and the
+    /// sanitiser's are one set.
+    #[test]
+    fn every_control_but_the_line_model_is_a_source_hazard() {
+        use unicode_general_category::{GeneralCategory, get_general_category};
+        for c in char::MIN..=char::MAX {
+            let code = u32::from(c);
+            let control = matches!(get_general_category(c), GeneralCategory::Control);
+            assert_eq!(control, c.is_control(), "U+{code:04X}");
+            if control {
+                let line_model = matches!(c, '\t' | '\n' | '\r');
+                assert_eq!(SourceHazard::of(c).is_some(), !line_model, "U+{code:04X}");
+            }
+        }
+        let terminal = SOURCE_DISPLAY_HAZARDS
+            .iter()
+            .filter(|(_, role)| *role == SourceHazard::TerminalControl)
+            .flat_map(|(range, _)| range.clone());
+        assert_eq!(
+            terminal.count(),
+            59,
+            "65 `Cc` less TAB, LF, CR, VT, FF and NEL"
+        );
+        assert!(!SourceHazard::TerminalControl.admitted_in_literal());
     }
 
     /// Only the separators and isolates may stand in a literal, and the bidi
