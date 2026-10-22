@@ -111,7 +111,7 @@ impl AllowedDial {
 }
 
 /// Every raw dial admitted outside `db.rs`; each must match exactly one dial.
-const ALLOWED_DIALS: [AllowedDial; 5] = [
+const ALLOWED_DIALS: [AllowedDial; 6] = [
     AllowedDial {
         file: "web/hub.rs",
         func: "open_spill",
@@ -128,7 +128,15 @@ const ALLOWED_DIALS: [AllowedDial; 5] = [
         file: "ws_client.rs",
         func: "do_connect",
         dial: "tokio::net::TcpStream::connect",
-        why: "a TCP dial of the address `VettedDial::Pinned` proved, not a sqlx dial",
+        why: "the WebSocket TCP dial: of the address `VettedDial::Pinned` proved, or, only under \
+              `VettedDial::Unrestricted`, of the URL's own host; not a sqlx dial",
+    },
+    AllowedDial {
+        file: "ws_client.rs",
+        func: "tls_handshake",
+        dial: ".connect",
+        why: "`tokio_rustls::TlsConnector::connect`, the TLS handshake over the TCP stream \
+              `do_connect` already dialled; it opens no network target",
     },
     AllowedDial {
         file: "ssrf.rs",
@@ -1738,6 +1746,60 @@ fn allowed_dials_admit_only_their_own_dial_once() {
         &tree_violations("other.rs", admitted),
         1,
         "fn wait_ready: raw dial `connect`",
+    );
+}
+
+/// The `wss://` handshake's `.connect` is admitted once, in `tls_handshake`
+/// only: a second `.connect` there, a path dial there, or a `.connect` in any
+/// other function of `ws_client.rs` is refused.
+#[test]
+fn the_tls_handshake_admits_only_its_own_connect() {
+    const DIAL: &str = "async fn do_connect() {
+    let _ = tokio::net::TcpStream::connect(addrs).await;
+}
+";
+    const HANDSHAKE: &str = "async fn tls_handshake(tcp: TcpStream) {
+    let _ = TlsConnector::from(config).connect(name, tcp).await;
+}
+";
+    assert_eq!(
+        tree_violations("ws_client.rs", &format!("{DIAL}{HANDSHAKE}")),
+        Vec::<String>::new()
+    );
+    let second = "async fn tls_handshake(tcp: TcpStream) {
+    let _ = TlsConnector::from(config).connect(name, tcp).await;
+    let _ = options.connect(url).await;
+}
+";
+    assert_violations(
+        &tree_violations("ws_client.rs", &format!("{DIAL}{second}")),
+        1,
+        "allowed dial `.connect` in fn tls_handshake",
+    );
+    let elsewhere = "async fn reconnect() {
+    let _ = options.connect(url).await;
+}
+";
+    assert_violations(
+        &tree_violations("ws_client.rs", &format!("{DIAL}{HANDSHAKE}{elsewhere}")),
+        1,
+        "fn reconnect: raw dial `connect`",
+    );
+    let pathed = "async fn tls_handshake(tcp: TcpStream) {
+    let _ = PgPool::connect(url).await;
+}
+";
+    let violations = tree_violations("ws_client.rs", &format!("{DIAL}{pathed}"));
+    assert_eq!(violations.len(), 2, "{violations:#?}");
+    assert!(
+        violations
+            .iter()
+            .any(|v| v.contains("fn tls_handshake: raw dial `connect`")),
+        "{violations:#?}"
+    );
+    assert!(
+        violations.iter().any(|v| v.contains("matches 0 dials")),
+        "{violations:#?}"
     );
 }
 
