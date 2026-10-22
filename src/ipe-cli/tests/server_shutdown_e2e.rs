@@ -341,15 +341,15 @@ main =
         }
 "#;
 
-/// A `Web.tea` app whose `init` Cmd opens the `STORE_DB` file through `Ipe.Db`
-/// and queries it every 20 ms, writing a failed query to stderr: a Cmd still
-/// running on its owned pool when the grace ends.
+/// A `Web.tea` app whose `init` Cmd opens the `STORE_DB` file through `Ipe.Db`,
+/// writes a row (so the file has a `-wal`), logs that it opened, then queries
+/// the table back to back, writing a failed query to stderr: a Cmd always on
+/// its owned pool when the grace ends.
 const WEB_CMD_DB: &str = r#"module Main exposing (main)
 
 import Ipe.Db as Db exposing (Db)
 import Ipe.Db.Location as Location exposing (Mode(..))
 import Ipe.Db.Unsafe as Unsafe
-import Ipe.Duration as Duration
 import Ipe.Error as Error exposing (Error)
 import Ipe.Log as Log
 import Ipe.Path as Path
@@ -360,7 +360,6 @@ import Ipe.Task as Task exposing (Step(..), Task)
 import Ipe.Tea.Web as Web
 import Ipe.Tea.Web.Cmd
 import Ipe.Tea.Web.Sub
-import Ipe.Time as Time
 import Ipe.Ui as Ui
 
 type Msg = Increment | Probed (Result Error ())
@@ -374,16 +373,23 @@ connect =
         |> Task.fromResult
         |> Task.andThen (\location -> Db.open location)
 
+setup : Db -> Task Error Db
+setup db =
+    Unsafe.unsafeExecRaw db "CREATE TABLE IF NOT EXISTS probe (v INTEGER NOT NULL)"
+        |> Task.andThen (\_ -> Unsafe.unsafeExecRaw db "INSERT INTO probe (v) VALUES (1)")
+        |> Task.andThen (\_ -> Log.info "probe opened its pool")
+        |> Task.map (\_ -> db)
+
 probeOnce : Db -> Int -> Task Error (Step Int ())
 probeOnce db n =
-    Time.sleep (Duration.millis 20)
-        |> Task.andThen (\_ -> Unsafe.unsafeQuery db "SELECT 1 AS one" [])
+    Unsafe.unsafeQuery db "SELECT v FROM probe" []
         |> Task.map (\_ -> Continue (n + 1))
 
 probe : Task Error ()
 probe =
     connect
-        |> Task.andThen (\db -> Task.loop 100000 0 (probeOnce db))
+        |> Task.andThen setup
+        |> Task.andThen (\db -> Task.loop 1000000000 0 (probeOnce db))
         |> Task.onError (\e -> Log.warnWith "probe failed" [ Error.toString e ])
 
 init : WebReq -> ( Model, Cmd Msg )
@@ -1280,18 +1286,22 @@ fn a_web_cmd_past_the_grace_is_cancelled_before_the_pools_close() -> Result<(), 
         page.starts_with("HTTP/1.1 200"),
         "{test_name}: the page renders: {page}"
     );
-    let opened = Instant::now() + LINE_BUDGET;
-    while !sidecar(&db, "-wal").exists() {
-        assert!(
-            Instant::now() < opened,
-            "{test_name}: the init Cmd never opened its pool; seen {:?}",
-            served.seen
-        );
-        std::thread::sleep(Duration::from_millis(50));
-    }
+    served.wait_for("probe opened its pool", LINE_BUDGET)?;
+    assert!(
+        sidecar(&db, "-wal").exists(),
+        "{test_name}: the init Cmd's write opened the file's WAL; seen {:?}",
+        served.seen
+    );
     std::thread::sleep(Duration::from_millis(200));
     served.signal("-TERM")?;
     let status = served.wait_exit(EXIT_BUDGET)?;
+    let closed_pool = served.containing(Pipe::Err, "connection pool closed")
+        + served.containing(Pipe::Out, "connection pool closed");
+    assert_eq!(
+        closed_pool, 0,
+        "{test_name}: no Cmd outlives the pool it uses; seen {:?}",
+        served.seen
+    );
     assert_eq!(
         status.code(),
         Some(0),
@@ -1304,15 +1314,8 @@ fn a_web_cmd_past_the_grace_is_cancelled_before_the_pools_close() -> Result<(), 
         "{test_name}: one shutdown line; seen {:?}",
         served.seen
     );
-    let closed_pool = served.containing(Pipe::Err, "connection pool closed")
-        + served.containing(Pipe::Out, "connection pool closed");
     assert_eq!(
-        closed_pool, 0,
-        "{test_name}: no Cmd outlives the pool it uses; seen {:?}",
-        served.seen
-    );
-    assert_eq!(
-        served.containing(Pipe::Err, "cancelled 1 tasks"),
+        served.containing(Pipe::Err, "cancelled 1 task still running"),
         1,
         "{test_name}: the grace's end cancels the running Cmd; seen {:?}",
         served.seen

@@ -392,6 +392,12 @@ impl Armed {
         *self.shutdown.phase.borrow() != Phase::Serving
     }
 
+    /// Whether a signal started this owner's shutdown.
+    #[must_use]
+    pub fn signalled(&self) -> bool {
+        self.shutdown.signalled_at.get().is_some()
+    }
+
     /// The work count of the armed owner, for a serve site's own work.
     #[must_use]
     pub fn work_count(&self) -> WorkCount {
@@ -404,6 +410,19 @@ impl Armed {
     #[must_use]
     pub fn remaining_grace(&self) -> Duration {
         self.shutdown.remaining_grace()
+    }
+
+    /// Set the owner's raw work state, so a test can stand at the ceiling.
+    #[cfg(test)]
+    pub fn force_work_state(&self, state: usize) {
+        self.shutdown.work.state.store(state, Ordering::SeqCst);
+    }
+
+    /// The units of work in flight.
+    #[cfg(test)]
+    #[must_use]
+    pub fn work_in_flight(&self) -> usize {
+        self.shutdown.work.count()
     }
 
     /// The long-lived tasks in flight.
@@ -469,7 +488,8 @@ impl Armed {
 /// The line naming the work the grace cut.
 fn cancelled_line(running: usize, grace: Duration) -> String {
     format!(
-        "shutting down: cancelled {running} tasks still running after the {} ms grace ({})",
+        "shutting down: cancelled {running} {} still running after the {} ms grace ({})",
+        tasks(running),
         grace.as_millis(),
         SHUTDOWN_GRACE_CEILING.name(),
     )
@@ -478,9 +498,15 @@ fn cancelled_line(running: usize, grace: Duration) -> String {
 /// The line naming the work that outlived its cancel deadline.
 fn stuck_line(left: usize) -> String {
     format!(
-        "{left} tasks did not stop within {} ms; closing the pools anyway",
+        "{left} {} did not stop within {} ms; closing the pools anyway",
+        tasks(left),
         WORK_CANCEL_DEADLINE.as_millis(),
     )
+}
+
+/// The noun for `count` tasks.
+const fn tasks(count: usize) -> &'static str {
+    if count == 1 { "task" } else { "tasks" }
 }
 
 /// A handle that counts work on one armed owner, or on none.
@@ -1130,7 +1156,7 @@ pub mod tests {
         assert_eq!(
             lines,
             [
-                "shutting down: cancelled 1 tasks still running after the 0 ms grace \
+                "shutting down: cancelled 1 task still running after the 0 ms grace \
                  (IPE_WEB_SHUTDOWN_GRACE_MS)"
             ]
         );
@@ -1154,9 +1180,9 @@ pub mod tests {
         assert_eq!(
             lines,
             [
-                "shutting down: cancelled 1 tasks still running after the 0 ms grace \
+                "shutting down: cancelled 1 task still running after the 0 ms grace \
                  (IPE_WEB_SHUTDOWN_GRACE_MS)",
-                "1 tasks did not stop within 500 ms; closing the pools anyway",
+                "1 task did not stop within 500 ms; closing the pools anyway",
             ]
         );
     }
@@ -1182,6 +1208,33 @@ pub mod tests {
         let mut unowned = WorkGuard::never();
         let waited = tokio::time::timeout(Duration::from_secs(1), unowned.cancelled()).await;
         assert!(waited.is_err(), "work no owner counts is never cancelled");
+    }
+
+    #[allow(clippy::expect_used)] // a refused guard fails the test
+    #[tokio::test]
+    async fn the_last_unit_under_the_ceiling_is_admitted_and_the_next_refused() {
+        let (armed, _tx) = quiet_owner(Duration::ZERO);
+        let count = armed.work_count();
+        armed.force_work_state(WORK_CEILING - 1);
+        let last = count.guard().expect("one below the ceiling admits");
+        assert_eq!(armed.work_in_flight(), WORK_CEILING, "it is counted");
+        assert_eq!(count.guard().err(), Some(WorkFull), "the ceiling refuses");
+        assert_eq!(
+            armed.work_in_flight(),
+            WORK_CEILING,
+            "a refusal counts nothing"
+        );
+        drop(last);
+        assert_eq!(armed.work_in_flight(), WORK_CEILING - 1);
+    }
+
+    #[test]
+    fn the_lines_name_one_task_and_many_tasks() {
+        let grace = Duration::ZERO;
+        assert!(cancelled_line(1, grace).starts_with("shutting down: cancelled 1 task still"));
+        assert!(cancelled_line(2, grace).starts_with("shutting down: cancelled 2 tasks still"));
+        assert!(stuck_line(1).starts_with("1 task did not stop"));
+        assert!(stuck_line(3).starts_with("3 tasks did not stop"));
     }
 
     #[tokio::test]
