@@ -36,7 +36,10 @@ use wasm_bindgen::JsCast;
 use wasm_bindgen::prelude::*;
 
 use crate::core::{IpeResult, IpeTask};
-use crate::dom::{HandlerIndex, WebReq, build_index, diff::Patch, diff::diff};
+use crate::dom::{
+    HandlerIndex, WebReq, build_index,
+    diff::{Patch, diff, focus_target},
+};
 use crate::html::{FormData, Html, RenderCtx, assign_ipe_ids, render_html};
 use crate::tea::{IpeCmd, IpeSub};
 use crate::web::route::MountRefusal;
@@ -313,11 +316,50 @@ type WasmRouter<Model, Msg> = dyn Fn(
     Model,
 ) -> Option<crate::web::route::Entered<Model, IpeCmd<Msg>>>;
 
+/// Where a queued Msg came from.
+#[derive(Clone, Copy)]
+enum Source {
+    /// A DOM or widget event the user raised in this document.
+    User,
+    /// A Cmd result or a Sub delivery.
+    Effect,
+}
+
+/// What caused the Msgs queued since the last render.
+enum Cause {
+    /// No Msg is queued.
+    Idle,
+    /// Only the user's own events, with the element focused when the first
+    /// was queued.
+    User(Option<web_sys::Element>),
+    /// At least one Cmd result or Sub delivery.
+    Effect,
+}
+
+impl Cause {
+    /// The cause once a Msg from `source` joins the queue.
+    fn with(self, source: Source) -> Self {
+        match (self, source) {
+            (Self::Idle, Source::User) => Self::User(active_element()),
+            (Self::User(at), Source::User) => Self::User(at),
+            (Self::Idle | Self::User(_) | Self::Effect, Source::Effect)
+            | (Self::Effect, Source::User) => Self::Effect,
+        }
+    }
+}
+
+/// The element holding focus in this document, when one does.
+fn active_element() -> Option<web_sys::Element> {
+    document().ok().and_then(|d| d.active_element())
+}
+
 struct App<Model, Msg> {
     model: RefCell<Model>,
     tree: RefCell<Html<Msg>>,
     index: RefCell<HandlerIndex<Msg>>,
     queue: RefCell<VecDeque<Msg>>,
+    /// What caused the Msgs in `queue`.
+    cause: RefCell<Cause>,
     frame_scheduled: Cell<bool>,
     update: Box<dyn Fn(Msg, Model) -> (Model, IpeCmd<Msg>)>,
     view: Box<dyn Fn(Model) -> Html<Msg>>,
@@ -367,7 +409,7 @@ where
     let model = app.model.borrow().clone();
     let sub = pubsub::with_origin(&app.origin, || (app.subscriptions)(model));
     let app2 = Rc::clone(app);
-    let emit: Rc<dyn Fn(Msg)> = Rc::new(move |msg| enqueue(&app2, msg));
+    let emit: Rc<dyn Fn(Msg)> = Rc::new(move |msg| enqueue(&app2, msg, Source::Effect));
     app.submgr.borrow_mut().update(sub, &emit);
 }
 
@@ -409,6 +451,7 @@ where
         tree: RefCell::new(tree),
         index: RefCell::new(index),
         queue: RefCell::new(VecDeque::new()),
+        cause: RefCell::new(Cause::Idle),
         frame_scheduled: Cell::new(false),
         update: Box::new(update),
         view: Box::new(view),
@@ -506,6 +549,7 @@ where
         tree: RefCell::new(tree),
         index: RefCell::new(index),
         queue: RefCell::new(VecDeque::new()),
+        cause: RefCell::new(Cause::Idle),
         frame_scheduled: Cell::new(false),
         update: Box::new(update),
         view: Box::new(view),
@@ -632,6 +676,7 @@ where
         tree: RefCell::new(tree),
         index: RefCell::new(index),
         queue: RefCell::new(VecDeque::new()),
+        cause: RefCell::new(Cause::Idle),
         frame_scheduled: Cell::new(false),
         update: Box::new(update),
         view: Box::new(view),
@@ -884,7 +929,7 @@ where
                 .borrow()
                 .resolve(&ipe_id, widget::UP_WIRE_NAME, &args)
             {
-                enqueue(app, msg);
+                enqueue(app, msg, Source::User);
                 return;
             }
         }
@@ -915,7 +960,7 @@ where
                 app.index.borrow().resolve(&ipe_id, name, &args)
             };
             if let Some(msg) = resolved {
-                enqueue(app, msg);
+                enqueue(app, msg, Source::User);
                 return;
             }
         }
@@ -984,12 +1029,14 @@ fn collect_form_data(el: &web_sys::Element) -> FormData {
 /// Queue a message and coalesce processing into one rAF tick — one
 /// update+view+diff+patch per animation frame (the browser analogue of the
 /// SSE wire's seq-ordered batching).
-fn enqueue<Model, Msg>(app: &Rc<App<Model, Msg>>, msg: Msg)
+fn enqueue<Model, Msg>(app: &Rc<App<Model, Msg>>, msg: Msg, source: Source)
 where
     Model: Clone + 'static,
     Msg: Clone + 'static,
 {
     app.queue.borrow_mut().push_back(msg);
+    let cause = app.cause.replace(Cause::Idle);
+    app.cause.replace(cause.with(source));
     if app.frame_scheduled.get() {
         return;
     }
@@ -1020,6 +1067,7 @@ where
     Msg: Clone + 'static,
 {
     let msgs: Vec<Msg> = app.queue.borrow_mut().drain(..).collect();
+    let cause = app.cause.replace(Cause::Idle);
     if msgs.is_empty() {
         return;
     }
@@ -1075,8 +1123,22 @@ where
     if !scrub_active {
         let mut new_tree = (app.view)(model);
         assign_ipe_ids(&mut new_tree, ROOT_IPE_ID);
+        // Focus moves only for a render of the user's own events, and only
+        // while focus is where it was when the first of them was queued.
+        let addressed = match cause {
+            Cause::User(at) => at == active_element(),
+            Cause::Idle | Cause::Effect => false,
+        };
+        let target = if addressed {
+            focus_target(&app.tree.borrow(), &new_tree)
+        } else {
+            None
+        };
         let patches = diff(&app.tree.borrow(), &new_tree, &RenderCtx::Unstamped);
         apply_patches(&patches);
+        if let Some(target) = target {
+            focus_stamped(target.as_str());
+        }
         *app.index.borrow_mut() = build_index(&new_tree);
         *app.tree.borrow_mut() = new_tree;
         // A widget that first appears via an `html`-subtree replace bypasses the
@@ -1120,7 +1182,7 @@ where
             let app = Rc::clone(app);
             wasm_bindgen_futures::spawn_local(async move {
                 let msg = body.run().await;
-                enqueue(&app, msg);
+                enqueue(&app, msg, Source::Effect);
             });
         }
         IpeCmd::Publish(thunk) => {
@@ -1221,6 +1283,19 @@ where
     let selected = overlay.scrub_step();
     let labels: Vec<String> = app.label_log.borrow().iter().cloned().collect();
     debugger_overlay::render_overlay(overlay, labels.into_iter(), len, selected);
+}
+
+/// Focus the element stamped `id`; an absent or unfocusable one is left alone.
+fn focus_stamped(id: &str) {
+    let Ok(document) = document() else {
+        return;
+    };
+    let selector = format!("[ipe-id=\"{}\"]", id.replace('"', "\\\""));
+    if let Ok(Some(el)) = document.query_selector(&selector)
+        && let Some(html) = el.dyn_ref::<web_sys::HtmlElement>()
+    {
+        let _ = html.focus();
+    }
 }
 
 /// Apply the same `Vec<Patch>` the SSE wire serialises, via typed web-sys

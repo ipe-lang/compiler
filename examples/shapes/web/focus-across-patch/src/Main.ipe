@@ -23,6 +23,9 @@ module Main exposing (main)
 -- next id segment, so a node at the same depth carries the same id under a
 -- different chain. `tbutton` (a `button` named `x`) is replaced by an element
 -- whose tag is `button:x`, which carries the same id under another tag.
+-- `F2` toggles a panel whose `autofocus` field `ask` appears in answer to the
+-- key press. `F3` arms a timer whose tick adds the `autofocus` field `subask`,
+-- a render no event of the tab caused.
 --
 -- Co-located, no capabilities, no JS ports.
 
@@ -48,6 +51,10 @@ type alias Model =
     , hostRow : Bool
     , formDrop : Bool
     , mathRow : Bool
+    , ask : Bool
+    , answer : String
+    , ticking : Bool
+    , subAsk : Bool
     }
 
 
@@ -62,12 +69,14 @@ type Msg
     | TagSwap
     | Grow
     | FormDrop
+    | Answer String
+    | Tick
     | NoOp
 
 
 init : WebReq -> ( Model, Cmd.Cmd Msg )
 init _req =
-    ( { keys = "", row = False, drop = True, note = "", swapped = False, pressed = False, deep = False, tagSwapped = False, hostRow = False, formDrop = True, mathRow = False }, Cmd.none )
+    ( { keys = "", row = False, drop = True, note = "", swapped = False, pressed = False, deep = False, tagSwapped = False, hostRow = False, formDrop = True, mathRow = False, ask = False, answer = "", ticking = False, subAsk = False }, Cmd.none )
 
 
 update : Msg -> Model -> ( Model, Cmd.Cmd Msg )
@@ -79,6 +88,12 @@ update msg model =
 
             else if key == "m" then
                 ( { model | keys = key, mathRow = not model.mathRow }, Cmd.none )
+
+            else if key == "F2" then
+                ( { model | keys = key, ask = not model.ask }, Cmd.none )
+
+            else if key == "F3" then
+                ( { model | keys = key, ticking = True }, Cmd.none )
 
             else
                 ( { model | keys = key }, Cmd.none )
@@ -110,13 +125,23 @@ update msg model =
         FormDrop ->
             ( { model | formDrop = False }, Cmd.none )
 
+        Answer text ->
+            ( { model | answer = text }, Cmd.none )
+
+        Tick ->
+            ( { model | ticking = False, subAsk = True }, Cmd.none )
+
         NoOp ->
             ( model, Cmd.none )
 
 
 subscriptions : Model -> Sub.Sub Msg
-subscriptions _model =
-    Sub.none
+subscriptions model =
+    if model.ticking then
+        Sub.every 100 Tick
+
+    else
+        Sub.none
 
 
 panelRow : Model -> List (Ui.Element Msg)
@@ -321,6 +346,27 @@ mathRow model =
         []
 
 
+askField : String -> Model -> Ui.Element Msg
+askField name model =
+    Input.text
+        [ Ui.id name, Ui.htmlAttribute "autofocus" "" ]
+        { label = Input.labelHidden name
+        , text = model.answer
+        , onChange = Answer
+        , placeholder = Nothing
+        }
+
+
+-- `name` while `shown`, else nothing.
+askPanel : Bool -> String -> Model -> List (Ui.Element Msg)
+askPanel shown name model =
+    if shown then
+        [ askField name model ]
+
+    else
+        []
+
+
 view : Model -> Ui.Element Msg
 view model =
     Ui.column
@@ -377,6 +423,8 @@ view model =
                 )
                 :: mathRow model
             )
+        , Ui.column [ Ui.id "askhost" ] (askPanel model.ask "ask" model)
+        , Ui.column [ Ui.id "subaskhost" ] (askPanel model.subAsk "subask" model)
         ]
 
 

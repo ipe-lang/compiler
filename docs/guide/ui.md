@@ -88,6 +88,15 @@ sequence automatically. Tab moves focus forward; Shift+Tab moves it backward.
 **Activation.** A focused `Ui.button` activates on Enter and Space (native
 `<button>` behaviour). A focused `Ui.link` activates on Enter.
 
+**Autofocus.** A control with `autofocus` takes focus at load, and when it
+appears in answer to the user's own action in that tab: a panel opened by a key
+press focuses its `autofocus` input. Focus moves only onto a control that was
+not already `autofocus` in the render before, so a re-render while the user
+types never moves the caret. A render the user did not cause in that tab (a
+timer or subscription, another tab of the same session, a page reconnecting)
+never moves focus, and neither does one that lands after the user has moved
+focus elsewhere.
+
 **Focus ring.** The runtime injects a visible focus ring — a 3 px solid accent
 outline with a white halo — into every page via the global CSS reset. The ring
 appears only on `:focus-visible` (keyboard focus), not on mouse clicks. It meets

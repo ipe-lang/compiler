@@ -1,4 +1,6 @@
-use crate::html::{Attribute, ElementBody, Html, ParseContext, RenderCtx, admit_rendered_in};
+use crate::html::{
+    Attribute, ElementBody, Html, ParseContext, RenderCtx, RenderedElement, admit_rendered_in,
+};
 use std::collections::HashMap;
 
 /// A single DOM patch emitted by `diff` (JSON: `id`, `text`, `html`, `attrs`,
@@ -64,6 +66,102 @@ pub fn diff<M>(old: &Html<M>, new: &Html<M>, stamp: &RenderCtx<'_>) -> Vec<Patch
     let (Reach::Patched | Reach::Unaddressed) =
         diff_node_depth(old, new, ParseContext::Data, &mut out, 0, stamp);
     out
+}
+
+/// The server identity of a stamped element that a render asks to focus.
+///
+/// It is built only from the `ipe-id` the stamper wrote on an element of a
+/// rendered tree, never from program text, so the client resolves it with the
+/// same `[ipe-id=…]` lookup a patch uses.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize), serde(transparent))]
+pub struct StampedId(String);
+
+impl StampedId {
+    /// The stamped `ipe-id`.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// The element a render moves keyboard focus onto, if any.
+///
+/// It is the first element of `new`, in document order, that is on the page,
+/// carries a stamped `ipe-id` and an `autofocus` attribute, and whose identity
+/// carried no `autofocus` in `old`. The answer depends only on the two trees,
+/// never on how `diff` patches between them.
+#[must_use]
+pub fn focus_target<M>(old: &Html<M>, new: &Html<M>) -> Option<StampedId> {
+    let mut before = std::collections::HashSet::new();
+    for_each_autofocus(old, |id| {
+        before.insert(id);
+        false
+    });
+    let mut found = None;
+    for_each_autofocus(new, |id| {
+        if before.contains(id) {
+            return false;
+        }
+        found = Some(StampedId(id.to_owned()));
+        true
+    });
+    found
+}
+
+/// Whether `attrs` render an `autofocus` attribute.
+///
+/// A `BoolAttr(_, false)` renders nothing, so it neither adds nor removes one.
+fn has_autofocus<M>(attrs: &[Attribute<M>]) -> bool {
+    attrs.iter().any(|a| match a {
+        Attribute::Attr(k, _) | Attribute::BoolAttr(k, true) => k.eq_ignore_ascii_case("autofocus"),
+        Attribute::BoolAttr(_, false) | Attribute::EventAttr(_) | Attribute::NoAttr => false,
+    })
+}
+
+/// Visit the stamped `ipe-id` of each autofocus element of `root`, in document
+/// order, until `visit` returns true.
+///
+/// The walk admits nodes as the render sink does: a refused element is absent
+/// with its subtree, the `Html.doctype` wrapper is no element of its own, a
+/// raw-text body and the children of an RCDATA or RAWTEXT element are text, a
+/// `<template>`'s children are not in the document, and `HText` and `HRaw` are
+/// opaque. It stops at `MAX_HTML_DEPTH`, past which nothing is rendered, and
+/// keeps its own worklist, so the tree's depth never reaches the thread stack.
+fn for_each_autofocus<'a, M>(root: &'a Html<M>, mut visit: impl FnMut(&'a str) -> bool) {
+    let mut work: Vec<(&'a Html<M>, ParseContext, usize)> = vec![(root, ParseContext::Data, 0)];
+    while let Some((node, ctx, depth)) = work.pop() {
+        if depth >= crate::html::MAX_HTML_DEPTH {
+            continue;
+        }
+        let Html::HElement(tag, attrs, kids) = node else {
+            continue;
+        };
+        let Ok(rendered) = admit_rendered_in(ctx, tag, kids) else {
+            continue;
+        };
+        let child_ctx = match rendered {
+            RenderedElement::Doctype => ctx,
+            RenderedElement::Element(ElementBody::Script | ElementBody::Style) => continue,
+            RenderedElement::Element(ElementBody::Markup) => {
+                if has_autofocus(attrs)
+                    && let Some(id) = address(node)
+                    && visit(id)
+                {
+                    return;
+                }
+                if tag.eq_ignore_ascii_case("template") {
+                    continue;
+                }
+                ctx.enter(tag)
+            }
+        };
+        if child_ctx == ParseContext::RawOrRcdata {
+            continue;
+        }
+        let child_depth = depth.saturating_add(1);
+        work.extend(kids.iter().rev().map(|k| (k, child_ctx, child_depth)));
+    }
 }
 
 /// Whether every change between an element pair reached the patch list.
@@ -1431,5 +1529,264 @@ mod tests {
         ids(&mut new);
         let patches = plain(&old, &new);
         assert!(patches.is_empty(), "{patches:?}");
+    }
+
+    // ── focus_target ──────────────────────────────────────────────────────
+
+    fn el(tag: &str, attrs: Vec<Attribute<()>>, kids: Vec<Html<()>>) -> Html<()> {
+        Html::HElement(tag.into(), attrs, kids)
+    }
+
+    fn dom_id(id: &str) -> Attribute<()> {
+        Attribute::Attr("id".into(), id.into())
+    }
+
+    fn autofocus() -> Attribute<()> {
+        Attribute::Attr("autofocus".into(), String::new())
+    }
+
+    fn input(id: &str, focus: bool) -> Html<()> {
+        let mut attrs = vec![dom_id(id)];
+        if focus {
+            attrs.push(autofocus());
+        }
+        el("input", attrs, vec![])
+    }
+
+    /// A tree stamped as every render is.
+    fn stamped(mut h: Html<()>) -> Html<()> {
+        ids(&mut h);
+        h
+    }
+
+    /// The stamped `ipe-id` of the element whose `id` attribute is `id`.
+    fn stamp_of(h: &Html<()>, id: &str) -> Option<String> {
+        let mut work = vec![h];
+        while let Some(node) = work.pop() {
+            if let Html::HElement(_, attrs, kids) = node {
+                let named = attrs
+                    .iter()
+                    .any(|a| matches!(a, Attribute::Attr(k, v) if k == "id" && v == id));
+                if named {
+                    return address(node).map(str::to_owned);
+                }
+                work.extend(kids.iter());
+            }
+        }
+        None
+    }
+
+    fn target(old: &Html<()>, new: &Html<()>) -> Option<String> {
+        focus_target(old, new).map(|s| s.as_str().to_owned())
+    }
+
+    /// U1: a stamped element that appears with `autofocus` is the target.
+    #[test]
+    fn focus_target_is_a_newly_appearing_autofocus_element() {
+        let old = stamped(el("div", vec![], vec![input("other", false)]));
+        let new = stamped(el(
+            "div",
+            vec![],
+            vec![input("other", false), input("x", true)],
+        ));
+        let want = stamp_of(&new, "x");
+        assert!(want.is_some(), "the fixture stamps the input");
+        assert_eq!(target(&old, &new), want);
+    }
+
+    /// U2: a re-render that keeps an element's `autofocus`, as each keystroke
+    /// in it does, moves no focus.
+    #[test]
+    fn focus_target_refuses_an_element_already_autofocused() {
+        let typed = |value: &str| {
+            stamped(el(
+                "div",
+                vec![],
+                vec![el(
+                    "input",
+                    vec![
+                        dom_id("x"),
+                        autofocus(),
+                        Attribute::Attr("value".into(), value.into()),
+                    ],
+                    vec![],
+                )],
+            ))
+        };
+        let old = typed("ab");
+        let new = typed("abc");
+        assert!(
+            !plain(&old, &new).is_empty(),
+            "the re-render patches the field"
+        );
+        assert_eq!(target(&old, &new), None);
+    }
+
+    /// U3: `autofocus` moved from one element to a new one targets the new one.
+    #[test]
+    fn focus_target_follows_autofocus_onto_a_new_element() {
+        let old = stamped(el("div", vec![], vec![input("a", true)]));
+        let new = stamped(el("div", vec![], vec![input("a", false), input("b", true)]));
+        let want = stamp_of(&new, "b");
+        assert!(want.is_some(), "the fixture stamps the input");
+        assert_eq!(target(&old, &new), want);
+    }
+
+    /// U4: of two new targets the first in document order wins, a deeper one
+    /// ahead of a shallower later sibling included.
+    #[test]
+    fn focus_target_takes_the_first_new_target_in_document_order() {
+        let old = stamped(el("div", vec![], vec![]));
+        let new = stamped(el(
+            "div",
+            vec![],
+            vec![el("div", vec![], vec![input("a", true)]), input("b", true)],
+        ));
+        let want = stamp_of(&new, "a");
+        assert!(want.is_some(), "the fixture stamps the input");
+        assert_eq!(target(&old, &new), want);
+    }
+
+    /// U5: an `autofocus` spelled inside trusted raw markup, with an `ipe-id`
+    /// of its own, is never a target.
+    #[test]
+    fn focus_target_refuses_autofocus_inside_raw_markup() {
+        let old = stamped(el("div", vec![], vec![]));
+        let new = stamped(el(
+            "div",
+            vec![],
+            vec![Html::HRaw(r#"<input autofocus ipe-id="r">"#.into())],
+        ));
+        assert_eq!(target(&old, &new), None);
+    }
+
+    /// An element written below an RCDATA element is that element's text,
+    /// never a page element.
+    #[test]
+    fn focus_target_refuses_an_element_below_rcdata() {
+        let old = stamped(el("div", vec![], vec![el("textarea", vec![], vec![])]));
+        let new = stamped(el(
+            "div",
+            vec![],
+            vec![el("textarea", vec![], vec![input("x", true)])],
+        ));
+        assert!(
+            stamp_of(&new, "x").is_some(),
+            "the stamper reaches the input"
+        );
+        assert_eq!(target(&old, &new), None);
+    }
+
+    /// An element the render sink refuses is absent, its subtree included.
+    #[test]
+    fn focus_target_refuses_an_element_the_sink_refuses() {
+        let old = stamped(el("div", vec![], vec![]));
+        let new = stamped(el(
+            "div",
+            vec![],
+            vec![el("plaintext", vec![autofocus()], vec![input("x", true)])],
+        ));
+        assert!(
+            stamp_of(&new, "x").is_some(),
+            "the stamper reaches the input"
+        );
+        assert_eq!(target(&old, &new), None);
+    }
+
+    /// A `<template>`'s children are not in the document.
+    #[test]
+    fn focus_target_refuses_an_element_inside_a_template() {
+        let old = stamped(el("div", vec![], vec![]));
+        let new = stamped(el(
+            "div",
+            vec![],
+            vec![el("template", vec![], vec![input("x", true)])],
+        ));
+        assert!(
+            stamp_of(&new, "x").is_some(),
+            "the stamper reaches the input"
+        );
+        assert_eq!(target(&old, &new), None);
+    }
+
+    /// An element past the depth ceiling is not rendered, so it is no target.
+    #[test]
+    fn focus_target_refuses_an_element_past_the_depth_ceiling() {
+        let mut deep = input("x", true);
+        for _ in 0..crate::html::MAX_HTML_DEPTH {
+            deep = el("div", vec![], vec![deep]);
+        }
+        let old = stamped(el("div", vec![], vec![]));
+        let new = stamped(deep);
+        assert_eq!(target(&old, &new), None);
+    }
+
+    /// The target is the stamper's identity, never an `ipe-id` the program
+    /// wrote.
+    #[test]
+    fn focus_target_is_the_stamped_identity_not_program_text() {
+        let old = stamped(el("div", vec![], vec![]));
+        let new = stamped(el(
+            "div",
+            vec![],
+            vec![el(
+                "input",
+                vec![
+                    dom_id("x"),
+                    Attribute::Attr("ipe-id".into(), "victim".into()),
+                    autofocus(),
+                ],
+                vec![],
+            )],
+        ));
+        let got = target(&old, &new);
+        assert!(got.is_some(), "the input is a target");
+        assert_ne!(got.as_deref(), Some("victim"));
+        assert_eq!(got, stamp_of(&new, "x"));
+    }
+
+    /// U6: the same change answers the same whether `diff` sends it as an
+    /// in-place attribute patch or as a subtree replace.
+    #[test]
+    fn focus_target_is_independent_of_patch_granularity() {
+        let new = stamped(el("div", vec![], vec![input("x", true)]));
+        let in_place = stamped(el("div", vec![], vec![input("x", false)]));
+        let replaced = stamped(el("div", vec![], vec![]));
+        let attr_patch = plain(&in_place, &new);
+        assert!(
+            attr_patch.iter().any(|p| p.attrs.contains_key("autofocus"))
+                && attr_patch.iter().all(|p| p.html.is_none()),
+            "{attr_patch:?}"
+        );
+        let html_patch = plain(&replaced, &new);
+        assert!(
+            html_patch.iter().any(|p| p.html.is_some()),
+            "{html_patch:?}"
+        );
+        let want = stamp_of(&new, "x");
+        assert!(want.is_some(), "the fixture stamps the input");
+        assert_eq!(target(&in_place, &new), want);
+        assert_eq!(target(&replaced, &new), want);
+    }
+
+    /// U7: `BoolAttr("autofocus", false)` renders nothing, so it is no target.
+    #[test]
+    fn focus_target_refuses_a_false_bool_autofocus() {
+        let with = |on: bool| {
+            stamped(el(
+                "div",
+                vec![],
+                vec![el(
+                    "input",
+                    vec![dom_id("x"), Attribute::BoolAttr("autofocus".into(), on)],
+                    vec![],
+                )],
+            ))
+        };
+        let old = stamped(el("div", vec![], vec![]));
+        assert_eq!(target(&old, &with(false)), None);
+        let on = with(true);
+        assert!(stamp_of(&on, "x").is_some(), "the fixture stamps the input");
+        assert_eq!(target(&old, &on), stamp_of(&on, "x"));
     }
 }

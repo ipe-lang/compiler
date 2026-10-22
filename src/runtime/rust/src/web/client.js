@@ -156,7 +156,9 @@ var __ipeNode = (function() {
         if (el instanceof focusers[i].of) run = focusers[i].run;
       }
       if (run === null) return false;
+      __ipeRuntimeFocusing = true;
       try { run.call(el, {preventScroll: true}); } catch (_) { return false; }
+      finally { __ipeRuntimeFocusing = false; }
       return __ipeDoc.active() === el;
     }
   };
@@ -776,9 +778,10 @@ function __ipeSwapPreservingFocus(container, tmp) {
   // composition buffer survive untouched. removeChild + appendChild
   // drop focus, so we re-set it now.
   if (preservedFocus) {
+    __ipeRuntimeFocusing = true;
     try { preservedFocus.focus({preventScroll: true}); } catch (_) {
       try { preservedFocus.focus(); } catch (_) {}
-    }
+    } finally { __ipeRuntimeFocusing = false; }
     if (typeof preservedFocus.setSelectionRange === "function" &&
         selStart !== null && selEnd !== null) {
       try { preservedFocus.setSelectionRange(selStart, selEnd, selDir); } catch (_) {}
@@ -835,9 +838,11 @@ function __ipeRestoreFocus(container, path, ids) {
 // focused at load (the first `[autofocus]` below `root`) only while the load's
 // own autofocus is still due: nothing has held focus since the client started,
 // the user has not pressed a key or a pointer, and the URL names no fragment
-// target (the browser skips autofocus for one too). Any later frame only puts
-// lost focus back (`__ipeRestoreFocus`): an element is never autofocused after
-// the user has acted or focus has been somewhere.
+// target (the browser skips autofocus for one too). A later full frame only
+// puts lost focus back (`__ipeRestoreFocus`). A later patches frame moves focus
+// only through `__ipeFocusAddressed`: onto the element the server named as
+// newly autofocused, when the frame answers this tab's own event, applies as
+// the next step, and focus has not moved since that event was sent.
 var __ipeMounted = false;
 var __ipeAutofocusSpent = (function() {
   var now = __ipeDoc.active();
@@ -846,6 +851,49 @@ var __ipeAutofocusSpent = (function() {
 ["focusin", "pointerdown", "mousedown", "touchstart", "keydown"].forEach(function(type) {
   __ipeDoc.on(type, function() { __ipeAutofocusSpent = true; }, true);
 });
+// Counts the user's focus moves: a focus change or a pointer press the runtime
+// did not cause itself. A key press is not a move: it is what sends the event.
+var __ipeFocusEpoch = 0;
+var __ipeRuntimeFocusing = false;
+["focusin", "pointerdown", "mousedown", "touchstart"].forEach(function(type) {
+  __ipeDoc.on(type, function() {
+    if (!__ipeRuntimeFocusing) __ipeFocusEpoch += 1;
+  }, true);
+});
+// This tab's sent events in send order, each with the focus epoch it was sent
+// in: every one not yet answered, plus the newest answered one. The head holds
+// the oldest epoch any frame of this tab can still be answering. At the cap the
+// second record is dropped, so the head keeps the oldest epoch: an overflow can
+// only withhold a focus move, never permit one.
+var __IPE_FOCUS_SENDS_MAX = 64;
+var __ipeFocusSends = [];
+function __ipeFocusSent(seq) {
+  if (__ipeFocusSends.length >= __IPE_FOCUS_SENDS_MAX) __ipeFocusSends.splice(1, 1);
+  __ipeFocusSends.push({seq: seq, epoch: __ipeFocusEpoch, answered: false});
+}
+function __ipeFocusAnswered(seq) {
+  var newest = -1;
+  for (var i = 0; i < __ipeFocusSends.length; i++) {
+    if (__ipeFocusSends[i].seq === seq) __ipeFocusSends[i].answered = true;
+    if (__ipeFocusSends[i].answered) newest = i;
+  }
+  __ipeFocusSends = __ipeFocusSends.filter(function(r, i) {
+    return !r.answered || i === newest;
+  });
+}
+// A patches frame just applied as the next step moves focus onto the element
+// it names only when it answers this tab and focus has not moved since the
+// oldest event it can be answering was sent. A target the frame's own patches
+// removed, or one that cannot take focus, leaves focus alone.
+function __ipeFocusAddressed(frame) {
+  if (!__ipeTabId || frame.tab !== __ipeTabId) return;
+  if (typeof frame.focus !== "string") return;
+  if (__ipeFocusSends.length === 0) return;
+  if (__ipeFocusEpoch !== __ipeFocusSends[0].epoch) return;
+  var el = null;
+  try { el = __ipeDoc.query("[ipe-id=" + __ipeCssString(frame.focus) + "]"); } catch (_) { return; }
+  if (el) __ipeNode.focus(el);
+}
 // The element the URL fragment names, resolved from the URL itself: `:target`
 // matches only once the browser has applied the fragment, which can follow the
 // first frame.
@@ -1263,6 +1311,7 @@ function __ipeSend(msgName, args, handlerId, opts) {
   if (epoch) body.epoch = epoch;
   if (__ipeTabId) body.tab = __ipeTabId;
   if (snapshot) body.inputState = snapshot;
+  __ipeFocusSent(mySeq);
   __ipePostEvent(body);
 }
 
@@ -1306,6 +1355,7 @@ function __ipePostEvent(body) {
       return r.json().then(function(data) {
         __ipeLoaderEnd();
         __ipeOnPostSuccess();
+        __ipeFocusAnswered(body.seq);
         if (!data || typeof data.body !== "string") return;
         // The epoch gate orders this render against the DOM on screen; the
         // seq it carries is the session's, which an earlier ack may equal.
@@ -1346,6 +1396,7 @@ function __ipePostEvent(body) {
         }
         __ipeLoaderEnd();
         __ipeOnPostSuccess();
+        __ipeFocusAnswered(body.seq);
         if (!data) return;
         // An accepted event is acked with its seq; its render arrives over
         // the stream, whose frames name the epochs they move between. Any
@@ -2574,7 +2625,7 @@ var __ipeLiveFrames = {
       return;
     }
     __ipeHandleResponse(frame.seq, relayed ? null : frame.ackInputs, function() {
-      __ipeAdoptPatches(frame.from, frame.to, frame.patches);
+      if (__ipeAdoptPatches(frame.from, frame.to, frame.patches)) __ipeFocusAddressed(frame);
     }, frame.globalSeq);
   },
   // Dev-watch blue-green cutover cue. The watch server sends this right after

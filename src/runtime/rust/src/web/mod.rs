@@ -677,6 +677,8 @@ use tokio::sync::mpsc::{self, Receiver, Sender};
 pub struct QueuedEvent<Msg> {
     msg: Msg,
     charge: budget::Charge,
+    /// The tab the event named, when it named one.
+    tab: Option<TabId>,
 }
 
 /// How many browser events one session's driver queue holds.
@@ -1513,6 +1515,34 @@ struct PatchEnvelope<'a> {
     from: String,
     to: String,
     patches: &'a [crate::web::diff::Patch],
+    /// The tab whose own event produced the render.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tab: Option<String>,
+    /// The element that tab focuses once the patches apply.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    focus: Option<&'a crate::web::diff::StampedId>,
+}
+
+/// The tab a render answers, with the element it asks that tab to focus.
+#[cfg(feature = "web")]
+struct Addressed {
+    tab: TabId,
+    focus: Option<crate::web::diff::StampedId>,
+}
+
+#[cfg(feature = "web")]
+impl Addressed {
+    /// The address of a render of `origin` from `old` to `new`; `None` unless
+    /// one tab's own event produced it.
+    fn of<M>(origin: Origin, old: &Html<M>, new: &Html<M>) -> Option<Self> {
+        match origin {
+            Origin::Tab(tab) => Some(Self {
+                tab,
+                focus: crate::web::diff::focus_target(old, new),
+            }),
+            Origin::None => None,
+        }
+    }
 }
 
 /// Push one commit's `patches` frame, empty patches included, so the client's
@@ -1523,6 +1553,7 @@ async fn send_patches_frame(
     global_seq: u64,
     step: EpochStep,
     patches: &[crate::web::diff::Patch],
+    addressed: Option<&Addressed>,
 ) {
     let Some(sse) = sse else {
         return;
@@ -1532,6 +1563,8 @@ async fn send_patches_frame(
         from: step.from.to_token(),
         to: step.to.to_token(),
         patches,
+        tab: addressed.map(|a| a.tab.to_token()),
+        focus: addressed.and_then(|a| a.focus.as_ref()),
     };
     if let Ok(json) = serde_json::to_string(&env) {
         let _ = sse.send(SsePatch(sse::frame("patches", &json))).await;
@@ -1560,6 +1593,44 @@ impl TabId {
             return None;
         }
         u128::from_str_radix(token, 16).ok().map(Self)
+    }
+
+    /// The 32 lowercase hex characters `parse` reads back.
+    #[must_use]
+    pub fn to_token(self) -> String {
+        format!("{:032x}", self.0)
+    }
+}
+
+/// Which tab's own action produced a render.
+#[cfg(feature = "web")]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Origin {
+    /// Every Msg the render folds came from events of this one tab.
+    Tab(TabId),
+    /// The render folds a Msg no single tab's event produced: a Cmd or Sub
+    /// result, an event that named no tab, or events of more than one tab.
+    None,
+}
+
+#[cfg(feature = "web")]
+impl Origin {
+    /// The origin of one Msg: the tab its browser event named, else `None`.
+    #[must_use]
+    pub const fn of(tab: Option<TabId>) -> Self {
+        match tab {
+            Some(tab) => Self::Tab(tab),
+            None => Self::None,
+        }
+    }
+
+    /// The origin of a render that folds a Msg of `self`, then one of `next`.
+    #[must_use]
+    pub fn and(self, next: Self) -> Self {
+        match (self, next) {
+            (Self::Tab(a), Self::Tab(b)) if a == b => self,
+            (Self::Tab(_) | Self::None, _) => Self::None,
+        }
     }
 }
 
@@ -2872,13 +2943,15 @@ async fn drive_session<Model, Msg, FUpdate, FView, FSubs>(
         // Each input is taken with its turn, held until the Cmds it produced
         // hold their own units: dropped at the end of the iteration, after
         // `run_cmd`, or on the way out.
-        let (msg, queued, _turn) = tokio::select! {
+        let (msg, queued, origin, _turn) = tokio::select! {
             taken = take_input(&entry, &cmds, &mut msg_rx) => match taken {
-                Taken::Input(m, turn) => (m, None, turn),
+                Taken::Input(m, turn) => (m, None, Origin::None, turn),
                 Taken::Closed | Taken::Gone => break,
             },
             taken = take_input(&entry, &cmds, &mut event_rx), if events_open => match taken {
-                Taken::Input(QueuedEvent { msg, charge }, turn) => (msg, Some(charge), turn),
+                Taken::Input(QueuedEvent { msg, charge, tab }, turn) => {
+                    (msg, Some(charge), Origin::of(tab), turn)
+                }
                 Taken::Closed => {
                     events_open = false;
                     continue;
@@ -3000,6 +3073,8 @@ async fn drive_session<Model, Msg, FUpdate, FView, FSubs>(
         let committed = {
             let mut e = strong.lock().unwrap_or_else(|e| e.into_inner());
             let patches = e.rendered.diff_to(&tree);
+            // Each commit folds exactly one Msg, so its origin is that Msg's.
+            let addressed = Addressed::of(origin, e.rendered.last_view(), &tree);
             // noop. Here
             // `e.model` STILL holds the OLD model (top-of-loop cloned it OUT; the
             // store isn't updated until the assignment below), so `e.model ==
@@ -3019,12 +3094,12 @@ async fn drive_session<Model, Msg, FUpdate, FView, FSubs>(
                         e.history
                             .record(msg_for_history, next.clone(), &|m, mdl| (*update)(m, mdl));
                     });
-                    Some((patches, step, e.seq, e.sse_tx.clone(), noop))
+                    Some((patches, step, e.seq, e.sse_tx.clone(), noop, addressed))
                 }
                 Err(EpochExhausted) => None,
             }
         };
-        let Some((patches, step, seq, sse, noop)) = committed else {
+        let Some((patches, step, seq, sse, noop, addressed)) = committed else {
             // The render history cannot mint another epoch: close the session so
             // the next request takes the session-lost path.
             close_session(&store, &sid, Some(&strong), CloseReason::Ended).await;
@@ -3050,7 +3125,7 @@ async fn drive_session<Model, Msg, FUpdate, FView, FSubs>(
             1,
         );
 
-        send_patches_frame(sse, seq, step, &patches).await;
+        send_patches_frame(sse, seq, step, &patches, addressed.as_ref()).await;
 
         // Write-through: checkpoint the committed model to the store (a touch
         // for memory; a re-serialize for persistent backends) on every commit.
@@ -3775,7 +3850,7 @@ async fn apply_literal_patch_to_web_sessions<Model, Msg, FView>(
             close_session(store, scope.sid(), Some(&handle), CloseReason::OverCeiling).await;
             continue;
         }
-        send_patches_frame(sse, seq, step, &patches).await;
+        send_patches_frame(sse, seq, step, &patches, None).await;
     }
 }
 
@@ -5589,7 +5664,7 @@ mod handlers {
                     .ok_or(budget::OverBudget::Session)
                     .and_then(|bytes| e.charge.budget().try_charge(bytes));
                 match charged {
-                    Ok(charge) => Some(QueuedEvent { msg, charge }),
+                    Ok(charge) => Some(QueuedEvent { msg, charge, tab }),
                     Err(why) => return refused_charge(why),
                 }
             }
@@ -13915,6 +13990,7 @@ mod emitted_router_behavior_tests {
             tx.try_send(QueuedEvent {
                 msg: Msg::Decrement,
                 charge,
+                tab: None,
             })
             .map_err(|_| ())
             .expect("the one slot is free");
@@ -17102,6 +17178,91 @@ mod tab_seq_window_tests {
             seqs.record(TabId(u128::try_from(k).unwrap_or(u128::MAX)), 1);
         }
         assert!(!seqs.is_duplicate(TAB, 1), "the oldest tab was evicted");
+    }
+}
+
+#[cfg(all(test, feature = "web"))]
+#[cfg(not(target_arch = "wasm32"))]
+mod render_origin_tests {
+    use super::{Addressed, Attribute, Html, Origin, PatchEnvelope, TabId, assign_ipe_ids};
+
+    const A: TabId = TabId(0x0011_2233_4455_6677_8899_aabb_ccdd_eeff);
+    const B: TabId = TabId(0xffee_ddcc_bbaa_9988_7766_5544_3322_1100);
+
+    /// U8: a render folding events of two tabs answers neither.
+    #[test]
+    fn events_of_two_tabs_have_no_origin() {
+        assert_eq!(Origin::of(Some(A)).and(Origin::of(Some(B))), Origin::None);
+    }
+
+    /// U8: a Msg no tab's event produced (a Cmd or Sub result) has no origin,
+    /// on either side of a fold.
+    #[test]
+    fn a_msg_of_no_tab_has_no_origin() {
+        assert_eq!(Origin::of(None), Origin::None);
+        assert_eq!(Origin::of(Some(A)).and(Origin::None), Origin::None);
+        assert_eq!(Origin::None.and(Origin::of(Some(A))), Origin::None);
+    }
+
+    /// U8: events of one tab only answer that tab.
+    #[test]
+    fn events_of_one_tab_have_its_origin() {
+        assert_eq!(Origin::of(Some(A)), Origin::Tab(A));
+        assert_eq!(Origin::of(Some(A)).and(Origin::of(Some(A))), Origin::Tab(A));
+    }
+
+    #[test]
+    fn a_tab_token_reads_back_as_its_tab() {
+        let small = TabId(1);
+        assert_eq!(small.to_token().len(), 32);
+        assert_eq!(TabId::parse(&small.to_token()), Some(small));
+        assert_eq!(TabId::parse(&A.to_token()), Some(A));
+    }
+
+    fn panel(open: bool) -> Html<()> {
+        let kids = if open {
+            vec![Html::HElement(
+                "input".into(),
+                vec![Attribute::Attr("autofocus".into(), String::new())],
+                vec![],
+            )]
+        } else {
+            vec![]
+        };
+        let mut h = Html::HElement("div".into(), vec![], kids);
+        assign_ipe_ids(&mut h, "r");
+        h
+    }
+
+    fn frame(origin: Origin) -> serde_json::Value {
+        let old = panel(false);
+        let new = panel(true);
+        let addressed = Addressed::of(origin, &old, &new);
+        let env = PatchEnvelope {
+            global_seq: 1,
+            from: String::new(),
+            to: String::new(),
+            patches: &[],
+            tab: addressed.as_ref().map(|a| a.tab.to_token()),
+            focus: addressed.as_ref().and_then(|a| a.focus.as_ref()),
+        };
+        serde_json::to_value(&env).unwrap_or_default()
+    }
+
+    /// A render of one tab's event names that tab and the element it focuses.
+    #[test]
+    fn a_tab_render_frame_names_its_tab_and_focus() {
+        let f = frame(Origin::Tab(A));
+        assert_eq!(f["tab"].as_str(), Some(A.to_token().as_str()));
+        assert!(f["focus"].as_str().is_some_and(|id| !id.is_empty()), "{f}");
+    }
+
+    /// A render no single tab's event produced names no tab and no focus.
+    #[test]
+    fn a_render_of_no_tab_names_no_tab_and_no_focus() {
+        let f = frame(Origin::None);
+        assert!(f.get("tab").is_none(), "{f}");
+        assert!(f.get("focus").is_none(), "{f}");
     }
 }
 

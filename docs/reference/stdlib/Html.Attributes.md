@@ -211,6 +211,9 @@ selected : Bool -> Attribute msg
 autofocus : Bool -> Attribute msg
 ```
 
+`autofocus True` — a control with `autofocus` takes focus at load, and
+when it appears in answer to the user's own action in that tab.
+
 ## `tabindex`
 
 ```ipe

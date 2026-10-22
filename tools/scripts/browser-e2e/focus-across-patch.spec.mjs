@@ -12,7 +12,9 @@
  * focus that sits outside the swapped container.
  *
  * The first mount focuses the root's `autofocus` only while the load's own
- * autofocus is still due; a later frame only puts lost focus back. A form's
+ * autofocus is still due; a later frame puts lost focus back, and moves focus
+ * onto a newly `autofocus` field only when it answers this tab's own key,
+ * applies as the next step, and focus has not moved since the key. A form's
  * named controls shadow its members, so every member read on a node that may
  * be a form goes through the element prototypes: one test per read proves it.
  *
@@ -427,4 +429,182 @@ test("focus-across-patch: a backward selection keeps its direction across a patc
   expect(
     await field.evaluate((el) => [el.selectionStart, el.selectionEnd, el.selectionDirection]),
   ).toEqual([3, 5, "backward"]);
+});
+
+/** Holds every patches frame the stream delivers until `deliverHeld`. */
+async function holdPatches(page) {
+  await page.evaluate(() => {
+    window.__testDeliver = window.__ipeLiveFrames.patches;
+    window.__testHeld = [];
+    window.__ipeLiveFrames.patches = (text, relayed) => {
+      window.__testHeld.push([text, relayed]);
+    };
+  });
+}
+
+/** Hands the held frames to the client in order and stops holding. */
+async function deliverHeld(page) {
+  await page.evaluate(() => {
+    window.__ipeLiveFrames.patches = window.__testDeliver;
+    for (const [text, relayed] of window.__testHeld) window.__testDeliver(text, relayed);
+    window.__testHeld = [];
+  });
+}
+
+/** Waits for the first held frame and returns it parsed, holding it still. */
+async function firstHeld(page) {
+  await expect.poll(() => page.evaluate(() => window.__testHeld.length)).toBeGreaterThan(0);
+  return page.evaluate(() => JSON.parse(window.__testHeld[0][0]));
+}
+
+test("focus-across-patch: an autofocus field the user's key opens takes focus", async ({ page }) => {
+  await open(page);
+  await expect.poll(() => focusedId(page)).toBe("root");
+  await page.keyboard.press("F2");
+  await expect(page.locator("input#ask")).toHaveCount(1);
+  await expect.poll(() => focusedId(page)).toBe("ask");
+  await page.keyboard.type("abc");
+  await expect(page.locator("input#ask")).toHaveValue("abc");
+});
+
+test("focus-across-patch: an autofocus field reopened by the user takes focus again", async ({ page }) => {
+  await open(page);
+  await expect.poll(() => focusedId(page)).toBe("root");
+  await page.keyboard.press("F2");
+  await expect.poll(() => focusedId(page)).toBe("ask");
+  // The key reaches the root's handler from the field: the panel closes and
+  // focus falls back to the root.
+  await page.keyboard.press("F2");
+  await expect(page.locator("input#ask")).toHaveCount(0);
+  await expect.poll(() => focusedId(page)).toBe("root");
+  await page.keyboard.press("F2");
+  await expect(page.locator("input#ask")).toHaveCount(1);
+  await expect.poll(() => focusedId(page)).toBe("ask");
+});
+
+test("focus-across-patch: typing in an autofocus field never moves its caret", async ({ page }) => {
+  await open(page);
+  await expect.poll(() => focusedId(page)).toBe("root");
+  await page.keyboard.press("F2");
+  await expect.poll(() => focusedId(page)).toBe("ask");
+  const field = page.locator("input#ask");
+  // Each key re-renders the root's key line while the field stays autofocus.
+  await page.keyboard.type("hello");
+  await page.waitForTimeout(500);
+  await page.keyboard.press("ArrowLeft");
+  await page.keyboard.press("ArrowLeft");
+  await page.keyboard.type("X");
+  await expect(page.locator("#keys")).toHaveText("keys: X");
+  await expect(field).toBeFocused();
+  await expect(field).toHaveValue("helXlo");
+  expect(await field.evaluate((el) => [el.selectionStart, el.selectionEnd])).toEqual([4, 4]);
+});
+
+test("focus-across-patch: a render another tab's key caused never moves focus", async ({ browser }) => {
+  const ctx = await browser.newContext();
+  const a = await ctx.newPage();
+  await open(a);
+  await expect.poll(() => focusedId(a)).toBe("root");
+  // Tab A has an answered event of its own, sent with focus where it still is.
+  await a.keyboard.press("j");
+  await expect(a.locator("#keys")).toHaveText("keys: j");
+  const b = await ctx.newPage();
+  await open(b);
+  await expect.poll(() => focusedId(b)).toBe("root");
+  await b.keyboard.press("F2");
+  await expect.poll(() => focusedId(b)).toBe("ask");
+  // The same render reaches tab A, which leaves its focus alone.
+  await expect(a.locator("input#ask")).toHaveCount(1);
+  expect(await focusedId(a)).toBe("root");
+  await ctx.close();
+});
+
+test("focus-across-patch: a render a timer caused never moves focus", async ({ page }) => {
+  await open(page);
+  await expect.poll(() => focusedId(page)).toBe("root");
+  // The key arms the timer; the tick's render adds the autofocus field.
+  await page.keyboard.press("F3");
+  await expect(page.locator("input#subask")).toHaveCount(1, { timeout: 5000 });
+  expect(await focusedId(page)).toBe("root");
+});
+
+test("focus-across-patch: a render landing after the user moved focus never moves it", async ({ page }) => {
+  await open(page);
+  await expect.poll(() => focusedId(page)).toBe("root");
+  await holdPatches(page);
+  await page.keyboard.press("F2");
+  const frame = await firstHeld(page);
+  expect(typeof frame.focus).toBe("string");
+  // The user clicks another field before the render lands.
+  await page.click("input#note");
+  expect(await focusedId(page)).toBe("note");
+  await deliverHeld(page);
+  await expect(page.locator("input#ask")).toHaveCount(1);
+  expect(await focusedId(page)).toBe("note");
+});
+
+test("focus-across-patch: a frame behind the render on screen never moves focus", async ({ page }) => {
+  await open(page);
+  await expect.poll(() => focusedId(page)).toBe("root");
+  await holdPatches(page);
+  await page.keyboard.press("F2");
+  const frame = await firstHeld(page);
+  expect(frame.tab).toBe(await page.evaluate(() => window.__ipeTabId));
+  expect(typeof frame.focus).toBe("string");
+  // The same frame diffed from a later render than the one on screen.
+  const [inc, n] = frame.to.split(".");
+  const behind = { ...frame, from: `${inc}.${Number(n) + 1}`, to: `${inc}.${Number(n) + 2}` };
+  await page.evaluate((text) => {
+    window.__ipeLiveFrames.patches = window.__testDeliver;
+    window.__ipeLiveFrames.patches(text, false);
+  }, JSON.stringify(behind));
+  // The client resyncs to the full current render, which shows the field.
+  await expect(page.locator("input#ask")).toHaveCount(1, { timeout: 10000 });
+  expect(await focusedId(page)).toBe("root");
+});
+
+test("focus-across-patch: a stale frame never moves focus", async ({ page }) => {
+  await open(page);
+  await expect.poll(() => focusedId(page)).toBe("root");
+  await page.keyboard.press("j");
+  await expect(page.locator("#keys")).toHaveText("keys: j");
+  await holdPatches(page);
+  await page.keyboard.press("F2");
+  const frame = await firstHeld(page);
+  expect(typeof frame.focus).toBe("string");
+  const last = await page.evaluate(() => window.__ipeLastGlobalSeq);
+  expect(last).toBeGreaterThan(0);
+  const stale = { ...frame, globalSeq: last };
+  await page.evaluate((text) => {
+    window.__testDeliver(text, false);
+  }, JSON.stringify(stale));
+  await expect(page.locator("input#ask")).toHaveCount(0);
+  expect(await focusedId(page)).toBe("root");
+  // The frame itself, in order, applies and focuses the field.
+  await deliverHeld(page);
+  await expect.poll(() => focusedId(page)).toBe("ask");
+});
+
+test("focus-across-patch: a target a later patch of the frame removes never takes focus", async ({ page }) => {
+  const errors = [];
+  page.on("pageerror", (e) => errors.push(e));
+  await open(page);
+  await expect.poll(() => focusedId(page)).toBe("root");
+  const host = await page.evaluate(() => document.getElementById("askhost").getAttribute("ipe-id"));
+  expect(host).not.toBeNull();
+  await holdPatches(page);
+  await page.keyboard.press("F2");
+  const frame = await firstHeld(page);
+  expect(typeof frame.focus).toBe("string");
+  // A last patch empties the field's host.
+  const emptied = { ...frame, patches: [...frame.patches, { id: host, html: "" }] };
+  await page.evaluate((text) => {
+    window.__ipeLiveFrames.patches = window.__testDeliver;
+    window.__testHeld = [];
+    window.__ipeLiveFrames.patches(text, false);
+  }, JSON.stringify(emptied));
+  await expect.poll(() => page.evaluate(() => window.__ipeEpoch)).toBe(frame.to);
+  await expect(page.locator("input#ask")).toHaveCount(0);
+  expect(await focusedId(page)).toBe("root");
+  expect(errors).toEqual([]);
 });

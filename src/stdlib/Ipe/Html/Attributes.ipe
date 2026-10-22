@@ -262,6 +262,8 @@ selected =
     boolAttribute "selected"
 
 
+-- | `autofocus True` — a control with `autofocus` takes focus at load, and
+-- when it appears in answer to the user's own action in that tab.
 autofocus : Bool -> Attribute msg
 autofocus =
     boolAttribute "autofocus"
