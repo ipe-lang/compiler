@@ -37,11 +37,30 @@ const FORMS: [Form; 2] = [Form::Closure, Form::TaskSeqRest];
 enum Producer {
     /// An IR closure node, whose kind is `boundary_kind` of that node.
     Boundary(Form),
-    /// An already-emitted expression wrapped by a kernel or wiring adapter;
-    /// no IR node marks the closure, so the capture verdict does not see it.
-    Adapter,
+    /// A kernel or wiring adapter closure no IR node marks, so the capture
+    /// verdict does not see it; the reason proves it wraps no source local.
+    Adapter(AdapterReason),
     /// A layout check that matches a printed closure head and prints none.
     Recognizer,
+}
+
+/// Why a [`Producer::Adapter`] closure the capture verdict does not see is sound.
+///
+/// An adapted kernel slot has no reason here: it is emitted from its handler
+/// normal form, its closure printed by the IR closure printer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AdapterReason {
+    /// The closure body names only a top-level item (the `update` fn, a page
+    /// constructor) or fixed runtime text, never a source local.
+    TopLevelFn,
+    /// The closure captures only fresh `__`-prefixed bindings whose emitted
+    /// value is bound by a `let` before the `move`, so the value is evaluated
+    /// once outside the closure and no source local is captured.
+    RuntimeValue,
+    /// The closure is the single `FnOnce` effect thunk of a `Cmd.perform` arm:
+    /// `CompileArmWiring.effects` holds at most one effect, emitted after the
+    /// arm's model, so the plain path's clone verdict for the arm holds.
+    SoleEffectThunk,
 }
 
 /// Where a producer sits: the file relative to `src`, and the innermost named
@@ -57,7 +76,7 @@ const INVENTORY: &[(&str, &str, usize, Producer)] = &[
         "emit_console.rs",
         "line_handler_bridge",
         1,
-        Producer::Adapter,
+        Producer::Adapter(AdapterReason::RuntimeValue),
     ),
     (
         "emit_doc.rs",
@@ -75,7 +94,7 @@ const INVENTORY: &[(&str, &str, usize, Producer)] = &[
         "emit_expr/expr.rs",
         "emit_cmd_wiring_arm",
         1,
-        Producer::Adapter,
+        Producer::Adapter(AdapterReason::SoleEffectThunk),
     ),
     (
         "emit_expr/expr.rs",
@@ -91,40 +110,52 @@ const INVENTORY: &[(&str, &str, usize, Producer)] = &[
     ),
     (
         "emit_expr/kernel_calls.rs",
-        "arc_callback_wrap",
-        1,
-        Producer::Adapter,
-    ),
-    (
-        "emit_expr/kernel_calls.rs",
         "emit_json_decoder_call",
         2,
-        Producer::Adapter,
-    ),
-    (
-        "emit_expr/kernel_calls.rs",
-        "emit_server_call",
-        1,
-        Producer::Adapter,
+        Producer::Adapter(AdapterReason::RuntimeValue),
     ),
     (
         "emit_expr/kernel_calls.rs",
         "emit_task_retry_call",
-        3,
-        Producer::Adapter,
+        1,
+        Producer::Adapter(AdapterReason::RuntimeValue),
     ),
     (
-        "emit_expr/kernel_calls.rs",
-        "emit_ui_plan",
-        10,
-        Producer::Adapter,
+        "emit_tui.rs",
+        "key_event_bridge",
+        1,
+        Producer::Adapter(AdapterReason::RuntimeValue),
     ),
-    ("emit_tui.rs", "key_event_bridge", 1, Producer::Adapter),
-    ("emit_web.rs", "emit_route_render", 1, Producer::Adapter),
-    ("emit_web.rs", "emit_web_route", 2, Producer::Adapter),
-    ("emit_web.rs", "new", 1, Producer::Adapter),
-    ("emit_web.rs", "set_page_closure", 2, Producer::Adapter),
-    ("emit_web.rs", "wrap_view", 1, Producer::Adapter),
+    (
+        "emit_web.rs",
+        "emit_route_render",
+        1,
+        Producer::Adapter(AdapterReason::RuntimeValue),
+    ),
+    (
+        "emit_web.rs",
+        "emit_web_route",
+        2,
+        Producer::Adapter(AdapterReason::TopLevelFn),
+    ),
+    (
+        "emit_web.rs",
+        "new",
+        1,
+        Producer::Adapter(AdapterReason::TopLevelFn),
+    ),
+    (
+        "emit_web.rs",
+        "set_page_closure",
+        2,
+        Producer::Adapter(AdapterReason::RuntimeValue),
+    ),
+    (
+        "emit_web.rs",
+        "wrap_view",
+        1,
+        Producer::Adapter(AdapterReason::RuntimeValue),
+    ),
     ("render.rs", "is_closure_head", 1, Producer::Recognizer),
     (
         "render/reference.rs",
@@ -367,8 +398,8 @@ fn every_emitted_move_closure_has_an_inventory_row() -> Result<(), String> {
         unexpected.is_empty() && stale.is_empty(),
         "a `move` closure printed by the backend needs an INVENTORY row: \
          `Producer::Boundary` when it prints around an IR node `boundary_kind` \
-         classifies, `Producer::Adapter` when it wraps an already-emitted \
-         expression, `Producer::Recognizer` when it only matches a printed \
+         classifies, `Producer::Adapter` with the `AdapterReason` proving it \
+         wraps no source local, `Producer::Recognizer` when it only matches a printed \
          head.\nunexpected (site, count): {unexpected:?}\nstale rows (site, \
          count): {stale:?}"
     );
@@ -533,15 +564,48 @@ fn a_producer_without_a_row_and_a_row_without_a_producer_both_drift() -> Result<
         "emit_expr/new.rs",
         r#"fn emit_new(b: &str) -> String { format!("Box::new(move || {b})") }"#,
     )?;
-    let gone = [("emit_expr/old.rs", "emit_old", 1, Producer::Adapter)];
+    let gone = [(
+        "emit_expr/old.rs",
+        "emit_old",
+        1,
+        Producer::Adapter(AdapterReason::RuntimeValue),
+    )];
     let (unexpected, stale) = drift(&found, &gone);
     let new_site = ("emit_expr/new.rs".to_owned(), "emit_new".to_owned());
     let old_site = ("emit_expr/old.rs".to_owned(), "emit_old".to_owned());
     assert_eq!(unexpected, vec![(new_site.clone(), 1)]);
     assert_eq!(stale, vec![(old_site, 1)]);
-    let recount = [("emit_expr/new.rs", "emit_new", 2, Producer::Adapter)];
+    let recount = [(
+        "emit_expr/new.rs",
+        "emit_new",
+        2,
+        Producer::Adapter(AdapterReason::RuntimeValue),
+    )];
     let (unexpected, stale) = drift(&found, &recount);
     assert_eq!(unexpected, vec![(new_site.clone(), 1)]);
     assert_eq!(stale, vec![(new_site, 2)]);
+    Ok(())
+}
+
+/// An adapted-slot re-wrap of emitted handler text in `kernel_calls.rs` has no row.
+#[test]
+fn a_kernel_call_rewrap_of_emitted_handler_text_drifts() -> Result<(), String> {
+    let found = scan_source(
+        "emit_expr/kernel_calls.rs",
+        r#"fn emit_ui_plan(h: &str) -> String { format!("ui_on_key_down_(::std::sync::Arc::new(move |_x| ({h})(_x)))") }"#,
+    )?;
+    let (unexpected, stale) = drift(&found, INVENTORY);
+    let site = (
+        "emit_expr/kernel_calls.rs".to_owned(),
+        "emit_ui_plan".to_owned(),
+    );
+    assert!(
+        unexpected.contains(&(site, 1)),
+        "unexpected: {unexpected:?}"
+    );
+    assert!(
+        !stale.is_empty(),
+        "the real rows are absent from the synthetic scan"
+    );
     Ok(())
 }
