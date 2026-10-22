@@ -10993,9 +10993,17 @@ mod tests {
         }
 
         #[tokio::test(start_paused = true)]
-        async fn stream_ends_after_revoke_and_emit_reports_closed() {
+        async fn stream_ends_after_revoke_and_its_handler_is_aborted() {
             use futures_util::StreamExt;
             type Emits = (IpeResult<String, ()>, IpeResult<String, ()>);
+            struct Dropped(Arc<std::sync::atomic::AtomicBool>);
+            impl Drop for Dropped {
+                fn drop(&mut self) {
+                    self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+                }
+            }
+            let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let dropped_in = Arc::clone(&dropped);
             let cap = crate::jwt::now_unix_seconds() + 7200;
             let claims = session_claims("stream-revoke-subject", "stream-revoke-jti", cap);
             let (emits_tx, mut emits) = tokio::sync::mpsc::unbounded_channel::<Emits>();
@@ -11007,12 +11015,15 @@ mod tests {
                 move |_req, _p| {
                     let emits_tx = emits_tx.clone();
                     let release = Arc::clone(&release_in);
+                    let dropped = Arc::clone(&dropped_in);
                     crate::server_stream::server_stream_stream::<String, _>(
                         "text/plain".to_string(),
                         move |writer| {
                             let emits_tx = emits_tx.clone();
                             let release = Arc::clone(&release);
+                            let guard = Dropped(Arc::clone(&dropped));
                             Box::pin(async move {
+                                let _guard = guard;
                                 let first = crate::server_stream::server_stream_emit::<String>(
                                     "first".to_string(),
                                     writer,
@@ -11052,15 +11063,21 @@ mod tests {
                 matches!(ended, Ok(None)),
                 "the body ends within the coalesce bound"
             );
+            let aborted = tokio::time::timeout(RECHECK_COALESCE, async {
+                while !dropped.load(std::sync::atomic::Ordering::SeqCst) {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await;
+            assert!(
+                aborted.is_ok(),
+                "a body that ended on the revocation aborts its handler"
+            );
             release.notify_one();
             let reported = tokio::time::timeout(RECHECK_COALESCE, emits.recv()).await;
             assert!(
-                matches!(
-                    reported,
-                    Ok(Some((IpeResult::Ok(()), IpeResult::Err(ref late))))
-                        if late == "server.stream emit: client disconnected"
-                ),
-                "the handler's next emit reports the client gone"
+                reported.is_err(),
+                "the aborted handler never reaches its late emit: {reported:?}"
             );
         }
 
