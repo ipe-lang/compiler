@@ -93,6 +93,90 @@ fn line_and_column(text: &str, byte: usize, encoding: PositionEncoding) -> Posit
     }
 }
 
+/// The first line of `text`, without its line break.
+pub(crate) fn first_line(text: &str) -> &str {
+    first_line_break(text).map_or(text, |(at, _)| text.get(..at).unwrap_or(text))
+}
+
+/// The byte range of line `line` of `text`, its line break included.
+///
+/// `None` past the last line. A text that ends in a break has one more, empty
+/// line after it.
+pub(crate) fn line_span(text: &str, line: usize) -> Option<std::ops::Range<usize>> {
+    let start = match line.checked_sub(1) {
+        None => 0,
+        Some(previous) => line_break_ends(text).nth(previous)?,
+    };
+    let rest = text.get(start..)?;
+    let end = first_line_break(rest).map_or(text.len(), |(_, end)| start + end);
+    Some(start..end)
+}
+
+/// Whether `text` holds no `\r` without a `\n` after it.
+///
+/// Such a byte ends a line for a client; the lexer refuses it, so the
+/// formatting engine should never accept such a buffer, and an edit sink
+/// refuses it on its own.
+pub(crate) fn lines_agree(text: &str) -> bool {
+    let mut bytes = text.bytes().peekable();
+    while let Some(byte) = bytes.next() {
+        if byte == b'\r' && bytes.peek() != Some(&b'\n') {
+            return false;
+        }
+    }
+    true
+}
+
+/// The line break an edit's text uses in a buffer.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum LineEnding {
+    /// `\n`, the engine's own break.
+    Lf,
+    /// `\r\n`, for a buffer with at least one break and every one `\r\n`.
+    Crlf,
+}
+
+impl LineEnding {
+    /// The ending of `text`: [`Self::Crlf`] only when every `\n` follows a `\r`.
+    pub(crate) fn of(text: &str) -> Self {
+        let bytes = text.as_bytes();
+        let mut breaks = bytes
+            .iter()
+            .enumerate()
+            .filter(|&(_, &byte)| byte == b'\n')
+            .peekable();
+        let after_cr =
+            |at: usize| at.checked_sub(1).and_then(|prev| bytes.get(prev)) == Some(&b'\r');
+        if breaks.peek().is_some() && breaks.all(|(at, _)| after_cr(at)) {
+            Self::Crlf
+        } else {
+            Self::Lf
+        }
+    }
+
+    /// `text` with each `\n` not already after a `\r` written in this ending.
+    ///
+    /// A `\r\n` carried over verbatim (inside a block comment, a `"""` body, or
+    /// source text an edit copies) is left as it is, never doubled.
+    pub(crate) fn apply(self, text: &str) -> String {
+        match self {
+            Self::Lf => text.to_owned(),
+            Self::Crlf => {
+                let mut out = String::with_capacity(text.len().saturating_add(text.len() / 8));
+                let mut prev = None;
+                for ch in text.chars() {
+                    if ch == '\n' && prev != Some('\r') {
+                        out.push('\r');
+                    }
+                    out.push(ch);
+                    prev = Some(ch);
+                }
+                out
+            }
+        }
+    }
+}
+
 /// A one-pass index of a document's line-start byte offsets.
 ///
 /// A feature that converts many spans in one request resolves each in
@@ -446,5 +530,39 @@ mod tests {
                 offset_to_position(text, 3, encoding)
             );
         }
+    }
+
+    /// No feature outside this module splits lines on its own.
+    ///
+    /// The production part of every other source file names no `\n` or `\r`
+    /// char and calls no `.lines()`: line structure is read only through this
+    /// module. Compiled by ci.yml nextest `-p ipe_lsp_features`.
+    #[test]
+    fn no_feature_keeps_a_private_line_model() {
+        const NEEDLES: [&str; 3] = [".lines()", "'\\n'", "'\\r'"];
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut offenders: Vec<String> = Vec::new();
+        let mut scanned = 0usize;
+        for entry in std::fs::read_dir(&dir).expect("features src dir") {
+            let path = entry.expect("dir entry").path();
+            let is_rust = path.extension().is_some_and(|ext| ext == "rs");
+            if !is_rust || path.file_name().is_some_and(|name| name == "offset.rs") {
+                continue;
+            }
+            let source = std::fs::read_to_string(&path).expect("source file");
+            let production = source.split("#[cfg(test)]").next().unwrap_or("");
+            scanned += 1;
+            for (number, line) in production.lines().enumerate() {
+                if NEEDLES.iter().any(|needle| line.contains(needle)) {
+                    offenders.push(format!("{}:{}: {line}", path.display(), number + 1));
+                }
+            }
+        }
+        assert!(scanned > 10, "the scan must see the feature sources");
+        assert!(
+            offenders.is_empty(),
+            "a private line model outside offset.rs:\n{}",
+            offenders.join("\n")
+        );
     }
 }

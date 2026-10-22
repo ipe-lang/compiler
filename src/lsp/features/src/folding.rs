@@ -4,7 +4,7 @@
 use ipe_db::{IpeDatabase, SourceFile};
 use lsp_types::{FoldingRange, FoldingRangeKind};
 
-use crate::offset::{PositionEncoding, offset_to_position};
+use crate::offset::{PositionEncoding, first_line, offset_to_position};
 
 /// The foldable regions of one module, in source order.
 #[must_use]
@@ -79,7 +79,7 @@ fn push_range(
 /// inline when the region is collapsed so the user can see what is hidden.
 fn first_line_preview(text: &str, offset: usize) -> String {
     let slice = text.get(offset..).unwrap_or("");
-    let first_line = slice.lines().next().unwrap_or("").trim_end();
+    let first_line = first_line(slice).trim_end();
     if first_line.len() <= 40 {
         first_line.to_owned()
     } else {
@@ -170,5 +170,14 @@ mod tests {
             "truncated prefix must be ≤ 40 bytes: {}",
             without_ellipsis.len()
         );
+    }
+
+    /// The preview stops at the first line break a client counts, a lone `\r` included.
+    #[test]
+    fn collapsed_text_stops_at_every_line_break() {
+        use super::first_line_preview;
+        for text in ["main =\n    1", "main =\r\n    1", "main =\r    1"] {
+            assert_eq!(first_line_preview(text, 0), "main =", "{text:?}");
+        }
     }
 }

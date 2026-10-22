@@ -30,7 +30,9 @@
 use ipe_db::{IpeDatabase, SourceFile};
 use lsp_types::{Range, TextEdit};
 
-use crate::offset::{PositionEncoding, offset_to_position, position_to_offset};
+use crate::offset::{
+    LineEnding, PositionEncoding, lines_agree, offset_to_position, position_to_offset,
+};
 
 /// Format the full text of `file`.
 ///
@@ -92,70 +94,6 @@ fn engine_output(text: &str) -> Option<ipe_fmt::Formatted> {
         return None;
     }
     accepted(ipe_fmt::format_with_segments(text))
-}
-
-/// Whether `text` holds no `\r` without a `\n` after it.
-///
-/// Such a byte ends a line for a client; the lexer refuses it, so the engine
-/// should never accept such a buffer, and this sink refuses it on its own.
-fn lines_agree(text: &str) -> bool {
-    let mut bytes = text.bytes().peekable();
-    while let Some(byte) = bytes.next() {
-        if byte == b'\r' && bytes.peek() != Some(&b'\n') {
-            return false;
-        }
-    }
-    true
-}
-
-/// The line break a range edit's text uses in a buffer.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum LineEnding {
-    /// `\n`, the engine's own break.
-    Lf,
-    /// `\r\n`, for a buffer with at least one break and every one `\r\n`.
-    Crlf,
-}
-
-impl LineEnding {
-    /// The ending of `text`: [`Self::Crlf`] only when every `\n` follows a `\r`.
-    fn of(text: &str) -> Self {
-        let bytes = text.as_bytes();
-        let mut breaks = bytes
-            .iter()
-            .enumerate()
-            .filter(|&(_, &byte)| byte == b'\n')
-            .peekable();
-        let after_cr =
-            |at: usize| at.checked_sub(1).and_then(|prev| bytes.get(prev)) == Some(&b'\r');
-        if breaks.peek().is_some() && breaks.all(|(at, _)| after_cr(at)) {
-            Self::Crlf
-        } else {
-            Self::Lf
-        }
-    }
-
-    /// `text` with each `\n` not already after a `\r` written in this ending.
-    ///
-    /// A `\r\n` the engine carried over verbatim (inside a block comment or a
-    /// `"""` body) is left as it is, never doubled.
-    fn apply(self, text: &str) -> String {
-        match self {
-            Self::Lf => text.to_owned(),
-            Self::Crlf => {
-                let mut out = String::with_capacity(text.len().saturating_add(text.len() / 8));
-                let mut prev = None;
-                for ch in text.chars() {
-                    if ch == '\n' && prev != Some('\r') {
-                        out.push('\r');
-                    }
-                    out.push(ch);
-                    prev = Some(ch);
-                }
-                out
-            }
-        }
-    }
 }
 
 /// The engine's verdict as an edit decision: every refusal is no edit.

@@ -45,7 +45,9 @@ use ipe_syntax::{Expr, Expr_, Pattern_};
 use lsp_types::{CodeAction, CodeActionKind, CodeActionOrCommand, Range, TextEdit, Url};
 
 use crate::code_actions::DbView;
-use crate::offset::{PositionEncoding, position_to_offset, span_to_range};
+use crate::offset::{
+    LineEnding, PositionEncoding, offset_to_position, position_to_offset, span_to_range,
+};
 use crate::workspace_edit::{Document, single_edit};
 
 type Provider = fn(
@@ -281,7 +283,9 @@ fn if_case_bool_rewrite_action(
 /// `refactor.rewrite` action only when it parses.
 ///
 /// This is the one chokepoint every provider's edit passes through — a
-/// provider has no path to a [`CodeAction`] that skips the reparse proof.
+/// provider has no path to a [`CodeAction`] that skips the reparse proof. The
+/// edit's line breaks follow the buffer's [`LineEnding`], so a uniform `\r\n`
+/// buffer stays uniform.
 fn proven_action(
     db: &IpeDatabase,
     doc: Document<'_>,
@@ -291,11 +295,12 @@ fn proven_action(
     encoding: PositionEncoding,
 ) -> Option<CodeAction> {
     let Document { uri, text, version } = doc;
+    let new_text = LineEnding::of(text).apply(new_text);
     let lo = span.lo as usize;
     let hi = span.hi as usize;
     let mut spliced = String::with_capacity(text.len() + new_text.len());
     spliced.push_str(text.get(..lo)?);
-    spliced.push_str(new_text);
+    spliced.push_str(&new_text);
     spliced.push_str(text.get(hi..)?);
 
     let mut interner = db.interner().lock();
@@ -307,7 +312,7 @@ fn proven_action(
 
     let edit = TextEdit {
         range: span_to_range(text, span, encoding),
-        new_text: new_text.to_owned(),
+        new_text,
     };
     Some(CodeAction {
         title: title.to_owned(),
@@ -382,11 +387,7 @@ const fn contains(span: Span, byte: u32) -> bool {
 /// but an overestimate still indents deeper than the true column, which the
 /// off-side layout rule accepts.
 fn byte_column(text: &str, byte: usize) -> usize {
-    let line_start = text
-        .get(..byte)
-        .and_then(|s| s.rfind('\n'))
-        .map_or(0, |i| i + 1);
-    byte.saturating_sub(line_start)
+    offset_to_position(text, byte, PositionEncoding::Utf8).character as usize
 }
 
 #[cfg(test)]
@@ -781,5 +782,73 @@ mod tests {
             matches!(&edit.changes, Some(m) if !m.is_empty()),
             "{edit:?}"
         );
+    }
+
+    /// The `if`-to-`case` rewrite in a uniform `\r\n` buffer breaks its lines
+    /// with `\r\n`, so the buffer keeps one line ending.
+    #[test]
+    fn if_to_case_in_crlf_buffer_writes_crlf() {
+        const SRC: &str =
+            "module Main exposing (main)\r\n\r\nmain b =\r\n    if b then 1 else 2\r\n";
+        let db = IpeDatabase::new();
+        let f = file(&db, &["Main"], SRC);
+        let root = root_of(&db, &[(&["Main"], f)]);
+        let view = DbView {
+            db: &db,
+            root,
+            entry: f,
+        };
+        let uri = lsp_types::Url::parse(URI).expect("uri");
+        let action = if_case_bool_rewrite_action(
+            view,
+            &["Main".to_owned()],
+            &uri,
+            range_at(SRC, "if b"),
+            SRC,
+            PositionEncoding::Utf8,
+            None,
+        )
+        .expect("single-branch if offers a rewrite to case");
+        assert_eq!(
+            apply(SRC, &action, &uri),
+            "module Main exposing (main)\r\n\r\nmain b =\r\n    case b of\r\n        True -> 1\r\n        False -> 2\r\n",
+        );
+    }
+
+    /// The client's byte column of position boundary `byte`: bytes since the
+    /// last `\n`, `\r\n` or lone `\r` before it.
+    fn client_byte_column(text: &str, byte: usize) -> usize {
+        let prefix = text.get(..byte).expect("a char boundary");
+        prefix.rsplit(['\n', '\r']).next().map_or(0, str::len)
+    }
+
+    /// `byte_column` counts from the line start the shared line model reads:
+    /// a lone `\r` ends a line, and a mid-`\r\n` byte clamps to the `\r`.
+    #[test]
+    fn refactor_column_matches_line_and_column() {
+        let pieces = ["a", "\r\n", "\n", "\r", "😀"];
+        let mut frontier = vec![String::new()];
+        for _ in 0..4 {
+            frontier = frontier
+                .iter()
+                .flat_map(|t| pieces.iter().map(move |piece| format!("{t}{piece}")))
+                .collect();
+            for text in &frontier {
+                for byte in (0..=text.len()).filter(|&b| text.is_char_boundary(b)) {
+                    let mid_pair = text.get(..byte).is_some_and(|p| p.ends_with('\r'))
+                        && text.get(byte..).is_some_and(|r| r.starts_with('\n'));
+                    let expected = if mid_pair {
+                        client_byte_column(text, byte - 1)
+                    } else {
+                        client_byte_column(text, byte)
+                    };
+                    assert_eq!(
+                        super::byte_column(text, byte),
+                        expected,
+                        "{text:?} @ {byte}"
+                    );
+                }
+            }
+        }
     }
 }
