@@ -476,8 +476,9 @@ errorTextNames =
     [ "Error.toString", "Error.message", "Ipe.Error.toString", "Ipe.Error.message" ]
 
 
--- The renderers that draw a `SafeText`'s parts, a label's parts and a
--- source's tokens, each once per `Html.text` it holds.
+-- The renderers that draw a `SafeText`'s parts, a label's parts, a
+-- source's tokens and its spelled-out text, each once per `Html.text` it
+-- holds.
 sanctionedHtmlText : List String
 sanctionedHtmlText =
     [ "Lib/View.ipe:segmentHtml"
@@ -487,6 +488,7 @@ sanctionedHtmlText =
     , "Lib/View.ipe:codeChildren"
     , "Lib/View.ipe:pieceHtml"
     , "Lib/View.ipe:pieceHtml"
+    , "Lib/View.ipe:spelledText"
     , "Lib/View.ipe:labelPartHtml"
     , "Lib/View.ipe:labelPartHtml"
     , "Lib/View.ipe:labelPartHtml"
@@ -650,11 +652,13 @@ admittedMarkup =
     , "Lib/View.ipe:labelPartHtml"
     , "Lib/View.ipe:linkEl"
     , "Lib/View.ipe:linkEl"
+    , "Lib/View.ipe:partHtml"
     , "Lib/View.ipe:pieceHtml"
     , "Lib/View.ipe:refusePanel"
     , "Lib/View.ipe:runHtml"
     , "Lib/View.ipe:safeTextHtml"
     , "Lib/View.ipe:segmentHtml"
+    , "Lib/View.ipe:spelledHtml"
     , "Lib/View.ipe:urlSync"
     , "Lib/View.ipe:view"
     ]

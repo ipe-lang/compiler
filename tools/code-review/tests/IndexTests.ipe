@@ -1,6 +1,7 @@
 module IndexTests exposing (checks)
 
 import Ipe.ByteSize as ByteSize
+import Ipe.Bytes as Bytes
 import Ipe.Char as Char
 import Ipe.Crypto as Crypto
 import Ipe.Db as Db
@@ -602,9 +603,6 @@ classifyRefusesPastLineCeiling =
         TooLarge (ChildSpans _) ->
             False
 
-        TooLarge (ViewNodes _) ->
-            False
-
         Shown _ ->
             False
 
@@ -627,39 +625,13 @@ classifyLine line =
     Index.classifyView (uid "u-n") Rust (Index.attest line) (LineRange 1 1) line
 
 
--- The element count a view past the element ceiling was withheld with.
-nodesOver : SourceView -> Maybe Int
-nodesOver view =
-    case view of
-        TooLarge (ViewNodes o) ->
-            Just o.nodes
-
-        TooLarge (SpanLines _) ->
-            Nothing
-
-        TooLarge (ViewBytes _) ->
-            Nothing
-
-        TooLarge (ChildSpans _) ->
-            Nothing
-
-        Shown _ ->
-            Nothing
-
-        Stale _ ->
-            Nothing
-
-        Unreadable _ ->
-            Nothing
-
-
 -- The elements and mode of a shown view's drawing.
 drawnShape : SourceView -> Maybe ( Int, Mode )
 drawnShape view =
     Maybe.map (\shown -> ( Drawn.elements (Index.shownDrawn shown), Drawn.mode (Index.shownDrawn shown) )) (shownOf view)
 
 
--- The control for `viewPastNodeCeilingWithheld`: a line drawn in exactly
+-- The control for `viewPastNodeCeilingSpelled`: a line drawn in exactly
 -- `viewNodeCeiling` elements, too many to highlight, is shown plain with
 -- that count. Red if the ceiling is compared with `<`.
 viewAtNodeCeilingShown : Bool
@@ -668,22 +640,24 @@ viewAtNodeCeilingShown =
         == Just ( Index.viewNodeCeiling, Unhighlighted )
 
 
--- One element past the ceiling, with one line and a few KiB, under the line
--- and byte ceilings, is withheld with its exact element count. Red if the
--- element check is removed.
-viewPastNodeCeilingWithheld : Bool
-viewPastNodeCeilingWithheld =
+-- One element past the ceiling plain, with one line and a few KiB, under
+-- the line and byte ceilings, is shown spelled out in four elements, never
+-- withheld. Red if the spelled drawing is not tried, or a drawing past the
+-- ceiling is kept.
+viewPastNodeCeilingSpelled : Bool
+viewPastNodeCeilingSpelled =
     let
         line =
             escapeLine (Index.viewNodeCeiling - 3)
     in
-    nodesOver (classifyLine line) == Just (Index.viewNodeCeiling + 1)
+    drawnShape (classifyLine line) == Just ( 4, SpelledOut )
         && String.length line < ByteSize.toBytes Index.viewByteCeiling
 
 
 -- A line of 7000 keywords takes more elements coloured than the ceiling and
--- four plain, so it is shown plain; a short line is shown coloured. Red if
--- the plain drawing is not tried, or tried first.
+-- four plain, so it is shown plain, not spelled out; a short line is shown
+-- coloured. Red if the plain drawing is not tried, or tried first, or the
+-- spelled one is tried first.
 plainFallbackWhenColorsTooMany : Bool
 plainFallbackWhenColorsTooMany =
     let
@@ -696,8 +670,8 @@ plainFallbackWhenColorsTooMany =
 
 
 -- A 14 KB line of one token per byte, and a 129 KiB one, are shown plain
--- or withheld, never coloured past the ceiling; a 129 KiB line of escapes
--- is withheld by its element count. Red if the element check is removed.
+-- or spelled out, never coloured past the ceiling; a 129 KiB line of escapes
+-- is shown spelled out. Red if a drawing past the ceiling is kept.
 longTokenLinesNeverHighlighted : Bool
 longTokenLinesNeverHighlighted =
     let
@@ -705,6 +679,9 @@ longTokenLinesNeverHighlighted =
             case drawnShape view of
                 Just ( count, Unhighlighted ) ->
                     count <= Index.viewNodeCeiling
+
+                Just ( count, SpelledOut ) ->
+                    count == 4
 
                 Just ( _, Highlighted ) ->
                     False
@@ -717,32 +694,74 @@ longTokenLinesNeverHighlighted =
     in
     withinCeiling (classifyLine (String.repeat 7000 "1 "))
         && withinCeiling (classifyLine (String.repeat 66048 "1 "))
-        && nodesOver (classifyLine escapes) == Just 33028
+        && drawnShape (classifyLine escapes) == Just ( 4, SpelledOut )
         && 4 * 33024 < ByteSize.toBytes Index.viewByteCeiling
 
 
--- A view past the element ceiling under a wrong hash is too large, not
--- drifted: it is counted before it is hashed.
-nodeOversizeRanksBeforeDrift : Bool
-nodeOversizeRanksBeforeDrift =
+-- An escape-dense view under a wrong hash is drifted: with no element
+-- refusal left, the attestation compare follows the byte check.
+escapeDenseWrongHashDrifted : Bool
+escapeDenseWrongHashDrifted =
     let
         line =
             escapeLine Index.viewNodeCeiling
     in
-    nodesOver (Index.classifyView (uid "u-n") Rust (Index.attest "another view") (LineRange 1 1) line)
-        == Just (Index.viewNodeCeiling + 4)
+    viewTag (Index.classifyView (uid "u-n") Rust (Index.attest "another view") (LineRange 1 1) line) == "drifted"
+
+
+-- A thousand lines of thirty escapes each, past the element ceiling drawn
+-- plain and under the line and byte ceilings, are shown spelled out in four
+-- elements, never withheld for their escapes. Red if the spelled drawing is
+-- dropped or an element refusal returns.
+escapeDenseUnitShownSpelled : Bool
+escapeDenseUnitShownSpelled =
+    let
+        text =
+            String.join "\n" (List.repeat 1000 (escapeLine 30))
+
+        view =
+            Index.classifyView (uid "u-d") Rust (Index.attest text) (LineRange 1 1000) text
+    in
+    drawnShape view == Just ( 4, SpelledOut )
+        && Maybe.map Index.shownText (shownOf view) == Just text
+        && Bytes.length (Bytes.fromString text) < ByteSize.toBytes Index.viewByteCeiling
+
+
+-- A file unit whose every other line another unit covers, 4999 lines with
+-- 2499 covered runs, inside the line and child-span ceilings, draws plain
+-- past the element ceiling and is shown spelled out in four elements. Red
+-- if a residual's gaps are drawn one element each past the ceiling.
+alternatingResidualShownSpelled : Bool
+alternatingResidualShownSpelled =
+    let
+        src =
+            xLines 4999
+
+        spans =
+            List.map (\k -> ( 2 * k, 2 * k )) (List.range 1 2499)
+
+        view =
+            Index.classifyView (uid "u-file") Rust (Index.attestResidual (Index.residualText spans src)) (Residual spans) src
+    in
+    List.length spans <= Index.childSpanCeiling
+        && drawnShape view == Just ( 4, SpelledOut )
 
 
 -- The relation the element ceiling is chosen by: its elements at the cost
 -- of one, plus the reserve, fit three quarters of the runtime's session
 -- ceiling, and the reserve holds the largest view's text sixteen times over
--- with 128 bytes for each of its lines. Red if a ceiling or a cost moves
--- without the other.
+-- with 128 bytes for each of its lines, and a spelled drawing's gap text,
+-- gap mark and two line breaks for each line. Red if a ceiling or a cost
+-- moves without the other.
 nodeCeilingFitsSessionCeiling : Bool
 nodeCeilingFitsSessionCeiling =
+    let
+        spelledLineBytes =
+            Bytes.length (Bytes.fromString Drawn.spelledGapText) + Bytes.length (Bytes.fromString Drawn.spelledGapMark) + 2
+    in
     0 < Index.viewNodeCeiling
         && Index.viewNodeCeiling * ByteSize.toBytes Index.elementResidentBytes + ByteSize.toBytes Index.viewReserve <= ByteSize.toBytes Index.runtimeSessionCeiling // 4 * 3
-        && 16 * ByteSize.toBytes Index.viewByteCeiling + 128 * Index.viewLineCeiling <= ByteSize.toBytes Index.viewReserve
+        && 16 * ByteSize.toBytes Index.viewByteCeiling + 128 * Index.viewLineCeiling + spelledLineBytes * Index.viewLineCeiling <= ByteSize.toBytes Index.viewReserve
 
 
 -- The relation the queue page is sized by: a full page's elements at the
@@ -1935,10 +1954,12 @@ checks =
         , Task.succeed ( "the view ceilings are positive and within the read ceiling", viewCeilingsWellFormed )
         , Task.succeed ( "the drawn lines are the attested lines", shownLinesAreAttestedLines )
         , Task.succeed ( "a view drawn in exactly the element ceiling is shown", viewAtNodeCeilingShown )
-        , Task.succeed ( "a view one element past the element ceiling is withheld, counted in elements", viewPastNodeCeilingWithheld )
+        , Task.succeed ( "a view one element past the element ceiling plain is shown spelled out", viewPastNodeCeilingSpelled )
         , Task.succeed ( "a view too many elements to highlight is shown plain, a small one highlighted", plainFallbackWhenColorsTooMany )
-        , Task.succeed ( "a long line of one token per byte is never shown highlighted, and one of escapes is withheld", longTokenLinesNeverHighlighted )
-        , Task.succeed ( "a view past the element ceiling is too large, never drifted", nodeOversizeRanksBeforeDrift )
+        , Task.succeed ( "a long line of one token per byte is never shown highlighted, and one of escapes is shown spelled out", longTokenLinesNeverHighlighted )
+        , Task.succeed ( "an escape-dense view under a wrong hash is drifted", escapeDenseWrongHashDrifted )
+        , Task.succeed ( "a unit of a thousand escape-dense lines is shown spelled out, never withheld", escapeDenseUnitShownSpelled )
+        , Task.succeed ( "a file unit with every other line covered is shown spelled out", alternatingResidualShownSpelled )
         , Task.succeed ( "the element ceiling, at the cost per element, fits three quarters of the runtime's session ceiling", nodeCeilingFitsSessionCeiling )
         , Task.succeed ( "a full queue page's elements and label bytes fit the quarter of the session ceiling the unit view leaves", queueCeilingFitsQuarter )
         , check "a mebibyte purpose reaches the queue page and the unit page cut to the purpose cap, its marker counting the dropped bytes" purposeOfOneMibIsBounded

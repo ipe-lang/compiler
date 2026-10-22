@@ -268,6 +268,38 @@ quoteCannotForgeBoundary =
         ]
 
 
+-- `spelled` escapes every character outside printable ASCII and every `\`,
+-- never `"`, so source text spelling an escape reads apart from the
+-- character it names, and no character drawing like `\` (U+29F5, U+FF3C)
+-- is left raw to make an escape read as source text; `render` and
+-- `renderForeign` keep their own sets. Red if the three sets' arms are
+-- swapped, `spelled` stops escaping `\`, or it leaves a character outside
+-- printable ASCII raw.
+spelledEscapesBackslashNotQuote : Bool
+spelledEscapesBackslashNotQuote =
+    let
+        spelledText raw =
+            SafeText.toString (SafeText.spelled raw)
+    in
+    List.all identity
+        [ SafeText.segments (SafeText.spelled "a\\b\"") == [ Verbatim "a", Escaped '\\', Verbatim "b\"" ]
+        , spelledText "\\u{1b}" == "\\\\u{1b}"
+        , spelledText (codeText 27) == "\\u{1b}"
+        , spelledText (codeText 8238) == "\\u{202e}"
+        , spelledText "\t" == "\\t"
+        , spelledText "\"q\"" == "\"q\""
+        , spelledText "a\\nb" /= spelledText "a\nb"
+        , spelledText (codeText 10741) == "\\u{29f5}"
+        , spelledText (codeText 65340) == "\\u{ff3c}"
+        , spelledText (codeText 233 ++ " ~") == "\\u{e9} ~"
+        , List.all (\c -> Char.toCode c >= 32 && Char.toCode c <= 126) (String.toList (spelledText (codeText 10741 ++ codeText 8238 ++ codeText 128512)))
+        , rendered "\"" == "\\\""
+        , renderedForeign "\\" == "\\"
+        , renderedForeign "\"" == "\""
+        , rendered "\\" == "\\\\"
+        ]
+
+
 -- ── text from the index never reaches a page raw ─────────────────────────
 --
 -- Every displayed index column is `SafeText` from the decode point on, and
@@ -548,6 +580,7 @@ checks =
         , Task.succeed ( "segments hold their role and spell back to the flat form", segmentsSpellRenderForeign )
         , Task.succeed ( "a literal backslash cannot forge an escape", backslashCannotForge )
         , Task.succeed ( "a quote cannot forge a quoted boundary", quoteCannotForgeBoundary )
+        , Task.succeed ( "spelled text escapes the hazards and backslash, never the quote", spelledEscapesBackslashNotQuote )
         , check "index text is rendered at the decode point" indexTextRendered
         , Task.succeed ( "source tokens and link labels render bidi visibly", sourceTokensRendered )
         , check "the hazard set equals the shared display-hazard vectors" hazardSetMatchesVectors

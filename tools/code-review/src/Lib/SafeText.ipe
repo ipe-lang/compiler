@@ -1,4 +1,4 @@
-module Lib.SafeText exposing (SafeText, Segment(..), concat, escapeSpelling, isHazard, literal, quoted, render, renderForeign, segments, toString)
+module Lib.SafeText exposing (SafeText, Segment(..), concat, escapeSpelling, isHazard, literal, quoted, render, renderForeign, segments, spelled, toString)
 
 -- Text that is safe to write to an operator's terminal or show on a page:
 -- every display-hazard character is spelled out as a visible escape. Untrusted
@@ -20,7 +20,12 @@ module Lib.SafeText exposing (SafeText, Segment(..), concat, escapeSpelling, isH
 -- character, and a `"` as `\"`, so a `quoted` value cannot close its own
 -- quotes. With `\` escaped the mapping stays injective. `renderForeign` leaves
 -- `\` and `"` alone: it is the sink-side pass over text that may already be
--- rendered, where doubling every `\` again would garble it.
+-- rendered, where doubling every `\` again would garble it. `spelled`
+-- escapes every character outside printable ASCII and `\`, but not `"`: it
+-- is for source text spelled out in a code block, where no element marks an
+-- escape, no quote delimits the text, and `\` alone keeps the mapping
+-- injective. Its output is printable ASCII, so no character can draw like
+-- a `\` (U+29F5, U+FF3C) and make an escape read as source text.
 --
 -- A `SafeText` is a list of `Segment`s, so each escape the tool writes keeps
 -- its role: `Verbatim` is text exactly as it arrived, `Escaped` a character
@@ -54,7 +59,7 @@ isHazard c =
         code =
             Char.toCode c
     in
-    if code >= 32 && code <= 126 then
+    if isPrintableAscii c then
         False
 
     else
@@ -117,14 +122,23 @@ hazardRanges =
 -- Untrusted text with every hazard, every `\` and every `"` escaped.
 render : String -> SafeText
 render raw =
-    SafeText (escapeWith True raw)
+    SafeText (escapeWith HazardsBackslashQuote raw)
 
 
 -- Untrusted text that may already hold rendered escapes: every hazard is
 -- escaped, `\` and `"` are kept as is.
 renderForeign : String -> SafeText
 renderForeign raw =
-    SafeText (escapeWith False raw)
+    SafeText (escapeWith Hazards raw)
+
+
+-- Untrusted source text spelled out: every character outside printable
+-- ASCII and every `\` escaped, `"` kept as is. Each escape starts with `\`,
+-- so no source text spells another, and the text is printable ASCII, so no
+-- source character draws like the `\` that starts one.
+spelled : String -> SafeText
+spelled raw =
+    SafeText (escapeWith NonAsciiBackslash raw)
 
 
 -- Untrusted text rendered and wrapped in double quotes, the form a diagnostic
@@ -179,8 +193,8 @@ toString text =
 
 
 -- How an escaped character is spelled: `\n`, `\r` and `\t` by name, `\\` and
--- `\"` for the two characters `render` escapes, every hazard as `\u{hex}` in
--- lowercase.
+-- `\"` for the two characters `render` escapes, every other escaped character
+-- as `\u{hex}` in lowercase.
 escapeSpelling : Char -> String
 escapeSpelling c =
     if c == '\n' then
@@ -221,15 +235,37 @@ verbatim text =
         [ Verbatim text ]
 
 
-needsEscape : Bool -> Char -> Bool
-needsEscape escapeBackslash c =
-    isHazard c || (escapeBackslash && (c == '\\' || c == '"'))
+-- Which characters a rendering escapes: the hazards; every character
+-- outside printable ASCII, which holds every hazard, and `\`; or the
+-- hazards, `\` and `"`.
+type EscapeSet
+    = Hazards
+    | NonAsciiBackslash
+    | HazardsBackslashQuote
 
 
-escapeWith : Bool -> String -> List Segment
-escapeWith escapeBackslash raw =
-    if String.any (needsEscape escapeBackslash) raw then
-        case String.foldl (scanChar escapeBackslash) ( "", [] ) raw of
+isPrintableAscii : Char -> Bool
+isPrintableAscii c =
+    Char.toCode c >= 32 && Char.toCode c <= 126
+
+
+needsEscape : EscapeSet -> Char -> Bool
+needsEscape escapes c =
+    case escapes of
+        Hazards ->
+            isHazard c
+
+        NonAsciiBackslash ->
+            not (isPrintableAscii c) || c == '\\'
+
+        HazardsBackslashQuote ->
+            isHazard c || c == '\\' || c == '"'
+
+
+escapeWith : EscapeSet -> String -> List Segment
+escapeWith escapes raw =
+    if String.any (needsEscape escapes) raw then
+        case String.foldl (scanChar escapes) ( "", [] ) raw of
             ( pending, done ) ->
                 flushed pending done
 
@@ -241,9 +277,9 @@ escapeWith escapeBackslash raw =
 -- since the last escape; `done` the segments before it, in order. Both grow
 -- at their end in place, so the scan is linear in the text; a segment consed
 -- onto the head would copy the whole list each step.
-scanChar : Bool -> Char -> ( String, List Segment ) -> ( String, List Segment )
-scanChar escapeBackslash c ( pending, done ) =
-    if needsEscape escapeBackslash c then
+scanChar : EscapeSet -> Char -> ( String, List Segment ) -> ( String, List Segment )
+scanChar escapes c ( pending, done ) =
+    if needsEscape escapes c then
         ( "", flushed pending done ++ [ Escaped c ] )
 
     else
