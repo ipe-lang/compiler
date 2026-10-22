@@ -126,7 +126,7 @@ view model =
         [ Ui.width Ui.fill
         , Ui.height Ui.fill
         , Background.color (Ui.rgb 16 16 22)
-        , Ui.onKeyDown KeyDown
+        , Ui.onKeyDown (KeyDown (App.keyOffers model))
         , Ui.htmlAttribute "tabindex" "0"
         , Ui.htmlAttribute "autofocus" ""
         , Ui.htmlAttribute "lang" "en"
@@ -1167,7 +1167,7 @@ offeredControls controls row =
     case controls.panel of
         Just ( open, draft ) ->
             if open == row then
-                refusePanel uid draft (submitOf row)
+                refusePanel uid draft (RefuseSubmit row)
 
             else
                 offeredButtons row
@@ -1176,27 +1176,12 @@ offeredControls controls row =
             offeredButtons row
 
 
--- What a refusal of `row` submits: a unit's refusal or a file's.
-submitOf : Queue.DecidableRow -> Msg
-submitOf row =
-    case Queue.rowTarget row of
-        OnUnit ->
-            RefuseSubmit (Queue.rowUid row)
-
-        OnRefusal ->
-            RefuseRefusalSubmit (Queue.rowUid row)
-
-
 offeredButtons : Queue.DecidableRow -> Ui.Element Msg
 offeredButtons row =
-    let
-        uid =
-            Queue.rowUid row
-    in
     Ui.row
         [ Ui.spacing 8 ]
         [ approveOf row
-        , refuseButton (SafeText.literal "Refuse") (RefuseStart uid)
+        , refuseButton (SafeText.literal "Refuse") (RefuseStart row)
         ]
 
 
@@ -1205,10 +1190,10 @@ approveOf : Queue.DecidableRow -> Ui.Element Msg
 approveOf row =
     case Queue.rowTarget row of
         OnUnit ->
-            approveButton (SafeText.literal "Approve") (ApproveUnit (Queue.rowUid row))
+            approveButton (SafeText.literal "Approve") (ApproveRow row)
 
         OnRefusal ->
-            approveButton (SafeText.literal "Acknowledge") (AckRefusal (Queue.rowUid row))
+            approveButton (SafeText.literal "Acknowledge") (ApproveRow row)
 
 
 approveButton : SafeText -> Msg -> Ui.Element Msg
