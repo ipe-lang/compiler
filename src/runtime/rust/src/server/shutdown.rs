@@ -497,18 +497,6 @@ impl WorkCount {
     }
 }
 
-/// The work count of the process's armed owner, or of none.
-#[must_use]
-pub fn work_count() -> WorkCount {
-    WorkCount {
-        shutdown: PROCESS
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .as_ref()
-            .cloned(),
-    }
-}
-
 /// Count one unit of pool-reaching work on the process's armed owner.
 ///
 /// With no armed owner the guard is never cancelled.
@@ -516,8 +504,16 @@ pub fn work_count() -> WorkCount {
 /// # Errors
 ///
 /// [`WorkFull`] when the owner already counts [`WORK_CEILING`] units.
+#[cfg(feature = "web")]
 pub fn work() -> Result<WorkGuard, WorkFull> {
-    work_count().guard()
+    WorkCount {
+        shutdown: PROCESS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .cloned(),
+    }
+    .guard()
 }
 
 /// The refusal of a unit of work past [`WORK_CEILING`].
