@@ -59,7 +59,7 @@ isHazard c =
         code =
             Char.toCode c
     in
-    if code >= 32 && code <= 126 then
+    if isPrintableAscii c then
         False
 
     else
@@ -193,8 +193,8 @@ toString text =
 
 
 -- How an escaped character is spelled: `\n`, `\r` and `\t` by name, `\\` and
--- `\"` for the two characters `render` escapes, every hazard as `\u{hex}` in
--- lowercase.
+-- `\"` for the two characters `render` escapes, every other escaped character
+-- as `\u{hex}` in lowercase.
 escapeSpelling : Char -> String
 escapeSpelling c =
     if c == '\n' then

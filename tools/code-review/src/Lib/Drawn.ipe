@@ -24,8 +24,9 @@ type DrawnSource
 
 
 -- A view drawn with its tokens coloured; as plain text, each run of escapes
--- its own marked element; or spelled out as one block of text, every `\`
--- doubled, whose elements are a constant whatever the rows hold.
+-- its own marked element; or spelled out as one block of printable ASCII,
+-- every other character but a tab written as an escape and every `\` doubled,
+-- whose elements are a constant whatever the rows hold.
 type Drawing
     = Colored (List (Part (List (List Run))))
     | Uncolored (List (Part (List Piece)))
