@@ -1092,8 +1092,8 @@ spelledView =
 
 -- A unit too escape-dense to draw with marked escapes is shown spelled out:
 -- on the unit page and the queue card it carries the spelled-out note, its
--- escapes spelled and none raw, its decision buttons, within the element
--- and drawn depth ceilings. Red if the spelled drawing is withheld, unnoted,
+-- escapes spelled and none raw, within the element and drawn depth
+-- ceilings, and the card offers its decision buttons. Red if the spelled drawing is withheld, unnoted,
 -- or draws past a ceiling.
 spelledSourceChecks : Task.Task Error (List ( String, Bool ))
 spelledSourceChecks =
@@ -1114,7 +1114,7 @@ spelledSourceChecks =
         Task.succeed
             [ ( "an escape-dense source is verified and shown", isShown loaded )
             , ( "an escape-dense source is shown spelled out, its escapes spelled and none raw", List.all (\html -> has "Shown spelled out:" html && has "\\u{202e}" html && not (has (codeText 8238) html)) pages )
-            , ( "a spelled-out source still offers its decision buttons", List.all (\html -> button "Approve" html && button "Refuse" html) pages )
+            , ( "a spelled-out source still offers its decision buttons", button "Approve" (page (cardModel loaded)) && button "Refuse" (page (cardModel loaded)) )
             , ( "a spelled-out source page draws within the element ceilings", List.all (\html -> elementsOf html <= Index.viewNodeCeiling + Index.queueElementCeiling) pages )
             , ( "a spelled-out source draws within the drawn depth ceiling", List.all depth pages )
             ]

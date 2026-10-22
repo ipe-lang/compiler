@@ -142,7 +142,7 @@ plain : Highlight.Lang -> List SourceRow -> DrawnSource
 plain lang rows =
     let
         layout =
-            layoutOf lang
+            Highlight.layoutOf lang
     in
     drawnOf lang rows (Uncolored (List.map plainPart (groupRuns (rowEntry layout) rows)))
 
@@ -153,7 +153,7 @@ spelled : Highlight.Lang -> List SourceRow -> DrawnSource
 spelled lang rows =
     let
         layout =
-            layoutOf lang
+            Highlight.layoutOf lang
     in
     drawnOf lang rows (Spelled (List.map (spelledRow layout) rows))
 
@@ -470,7 +470,7 @@ layoutNotes : Highlight.Lang -> List SourceRow -> List LayoutNote
 layoutNotes lang rows =
     let
         layout =
-            layoutOf lang
+            Highlight.layoutOf lang
     in
     noteIf (List.any (leadingMarkRow layout) rows) ByteOrderMark ++ noteIf (List.any (crlfRow layout) rows) CrlfLineEnds
 
