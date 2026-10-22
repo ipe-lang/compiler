@@ -210,7 +210,7 @@ struct ClientEntry {
     // Wakes the socket's task once a close is requested, queued or not, so it
     // bounds the closing handshake even while the writer is wedged on a peer
     // that stopped reading. That task is the socket's one way out: nothing
-    // else ends it, deregisters it, or reports it ended. See `run_socket`.
+    // else ends it or reports it ended. See `run_socket`.
     closing: std::sync::Arc<tokio::sync::Notify>,
     /// The message ceiling the socket was opened under; an outbound payload
     /// past it is refused before it is queued.
