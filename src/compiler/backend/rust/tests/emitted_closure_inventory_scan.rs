@@ -58,7 +58,7 @@ enum AdapterReason {
     /// once outside the closure and no source local is captured.
     RuntimeValue,
     /// The closure is the single `FnOnce` effect thunk of a `Cmd.perform` arm:
-    /// `CompileArmWiring.effects` holds at most one effect, emitted after the
+    /// `ArmWiring.effect` holds at most one effect, emitted after the
     /// arm's model, so the plain path's clone verdict for the arm holds.
     SoleEffectThunk,
 }

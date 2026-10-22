@@ -543,20 +543,21 @@ impl CompileCmdWiring {
     }
 }
 
-/// An `update` arm's Cmd position reduced to a wiring datum PLUS the arm's ordered
-/// table of compiled effect expressions (stable id = index).
+/// An `update` arm's Cmd position reduced to a wiring datum PLUS the arm's sole
+/// compiled effect expression (stable id 0).
 ///
-/// The datum names WHICH effect fires (or none); the effect expressions stay
-/// compiled — the backend emits each as a lazy thunk and the runtime fires only the
-/// selected one.
+/// The datum names WHICH effect fires (or none); the effect expression stays
+/// compiled — the backend emits it as a lazy `FnOnce` thunk and the runtime fires
+/// it only when selected. At most one effect has a representation, so no two
+/// thunks can move the same binding.
 #[derive(Clone, Debug)]
 pub struct ArmWiring<'e> {
     /// Which compiled effect the arm fires, or `None` (`Cmd.none`).
     pub wiring: CompileCmdWiring,
-    /// The arm's compiled effect expressions, indexed by stable id. Empty for
-    /// `Cmd.none`; one entry for a single `Cmd.perform`. A `wiring.effect` id, when
-    /// present, is a valid index into this table by construction.
-    pub effects: Vec<&'e Expr>,
+    /// The arm's compiled effect expression, id 0: `None` for `Cmd.none`, the
+    /// `Cmd.perform` itself for a single literal `Cmd.perform`. A `wiring.effect`
+    /// id, when present, is 0 and names this effect by construction.
+    pub effect: Option<&'e Expr>,
 }
 
 /// Classify an `update` arm's Cmd position (the second tuple element) into an
@@ -598,14 +599,14 @@ pub fn arm_wiring_of_arm(body: &Expr) -> Option<ArmWiring<'_>> {
     if is_cmd_none(cmd_expr) {
         return Some(ArmWiring {
             wiring: CompileCmdWiring { effect: None },
-            effects: Vec::new(),
+            effect: None,
         });
     }
     if is_literal_perform(cmd_expr) {
         // A single literal `Cmd.perform` is the arm's sole compiled effect, id 0.
         return Some(ArmWiring {
             wiring: CompileCmdWiring { effect: Some(0) },
-            effects: vec![cmd_expr],
+            effect: Some(cmd_expr),
         });
     }
     None
@@ -1133,7 +1134,8 @@ mod tests {
         let body = Expr::Tuple(vec![Expr::Int(0), cmd_perform()]);
         let arm = arm_wiring_of_arm(&body).expect("a literal Cmd.perform arm is enumerable");
         assert_eq!(arm.wiring, CompileCmdWiring { effect: Some(0) });
-        assert_eq!(arm.effects.len(), 1, "the perform is the arm's sole effect");
+        let sole: Option<&Expr> = arm.effect;
+        assert!(sole.is_some(), "the perform is the arm's sole effect");
     }
 
     #[test]
@@ -1142,7 +1144,7 @@ mod tests {
         let body = Expr::Tuple(vec![Expr::Int(0), cmd_none()]);
         let arm = arm_wiring_of_arm(&body).expect("Cmd.none is enumerable");
         assert_eq!(arm.wiring, CompileCmdWiring { effect: None });
-        assert!(arm.effects.is_empty());
+        assert!(arm.effect.is_none());
     }
 
     #[test]
