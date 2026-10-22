@@ -205,7 +205,7 @@ web-sys = { version = "0.3", features = [
   "Window", "Document", "Element", "HtmlElement", "Node", "Text",
   "Event", "EventTarget", "console", "HtmlInputElement",
   "HtmlTextAreaElement", "HtmlSelectElement", "HtmlFormElement",
-  "FormData", "KeyboardEvent", "Location", "HtmlDocument",
+  "FormData", "KeyboardEvent", "InputEvent", "Location", "HtmlDocument",
   "CustomEvent",
   # A patch's markup is parsed detached in its target's own context and its
   # autofocus elements found in one query (mirrors the runtime crate).

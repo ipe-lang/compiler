@@ -325,7 +325,8 @@ enum Source {
     /// An event that proves no act of the user's: a widget's up event (its
     /// script raises it), an untrusted event, an incidental kind a render can
     /// raise (a pointer crossing), one raised while the runtime moves focus,
-    /// or any wire outside [`DELEGATED_EVENTS`].
+    /// an edit or key an input method is still composing, or any wire outside
+    /// [`DELEGATED_EVENTS`].
     Unproven,
     /// A Cmd result or a Sub delivery.
     Effect,
@@ -1016,12 +1017,42 @@ where
         .and_then(|t| t.dyn_into::<web_sys::Element>().ok());
     // The generated `OnWidget` closure runs the total, fail-closed seal
     // up-decoder over `detail`; a mismatch yields `None` (clean drop).
-    let source = listener_source(widget::UP_WIRE_NAME, ev.is_trusted());
+    let source = listener_source(widget::UP_WIRE_NAME, Arrival::of(ev));
     dispatch(app, target, source, |_, ipe_id| {
         app.index
             .borrow()
             .resolve(ipe_id, widget::UP_WIRE_NAME, &args)
     });
+}
+
+/// What a delegated event says of itself as it arrives, read once.
+#[derive(Clone, Copy, Debug)]
+struct Arrival {
+    /// The browser raised it, not a page script.
+    trusted: bool,
+    /// An input method is still composing the edit or key it carries.
+    composing: bool,
+}
+
+impl Arrival {
+    fn of(ev: &web_sys::Event) -> Self {
+        Self {
+            trusted: ev.is_trusted(),
+            composing: composing(ev),
+        }
+    }
+}
+
+/// Whether `ev` is an edit or a key an input method is still composing.
+fn composing(ev: &web_sys::Event) -> bool {
+    ev.dyn_ref::<web_sys::InputEvent>().map_or_else(
+        || {
+            ev.dyn_ref::<web_sys::KeyboardEvent>().is_some_and(|key| {
+                key.is_composing() || key.key_code() == crate::dom::diff::COMPOSING_KEY_CODE
+            })
+        },
+        web_sys::InputEvent::is_composing,
+    )
 }
 
 /// Decode + dispatch one delegated DOM event: climb from the target to the
@@ -1035,7 +1066,7 @@ where
         .target()
         .and_then(|t| t.dyn_into::<web_sys::Element>().ok());
     let args = decode_event_args(name, ev, target.as_ref());
-    let source = listener_source(name, ev.is_trusted());
+    let source = listener_source(name, Arrival::of(ev));
     dispatch(app, target, source, |el, ipe_id| {
         if name == "submit" {
             ev.prevent_default();
@@ -1048,17 +1079,18 @@ where
 }
 
 /// The source of a Msg a listener resolved under `wire`, read as the event
-/// arrives: the user's only for a `trusted` event of a deliberate kind in
-/// [`DELEGATED_EVENTS`] raised while the runtime is not moving focus. An event
-/// the runtime or a render can raise proves no act of the user's, so its
-/// render never moves focus: a widget's up event, an untrusted event, a
+/// arrives: the user's only for a trusted, uncomposed event of a deliberate
+/// kind in [`DELEGATED_EVENTS`] raised while the runtime is not moving focus.
+/// An event the runtime or a render can raise proves no act of the user's, so
+/// its render never moves focus: a widget's up event, an untrusted event, a
 /// pointer crossing, the `change` a runtime focus move commits, or any name
-/// outside the table.
-fn listener_source(wire: &str, trusted: bool) -> Source {
+/// outside the table. Nor does an edit or key an input method is composing:
+/// moving focus would cut the composition off.
+fn listener_source(wire: &str, arrival: Arrival) -> Source {
     let deliberate = DELEGATED_EVENTS
         .iter()
         .any(|&(name, input)| name == wire && input == Input::Deliberate);
-    if deliberate && trusted && !RUNTIME_FOCUSING.with(Cell::get) {
+    if deliberate && arrival.trusted && !arrival.composing && !RUNTIME_FOCUSING.with(Cell::get) {
         Source::User
     } else {
         Source::Unproven
@@ -1709,6 +1741,19 @@ mod tests {
     use super::*;
     use wasm_bindgen_test::wasm_bindgen_test;
 
+    const TRUSTED: Arrival = Arrival {
+        trusted: true,
+        composing: false,
+    };
+    const UNTRUSTED: Arrival = Arrival {
+        trusted: false,
+        composing: false,
+    };
+    const COMPOSING: Arrival = Arrival {
+        trusted: true,
+        composing: true,
+    };
+
     fn mark(epoch: u64, at: u8) -> FocusMark<u8> {
         FocusMark {
             epoch,
@@ -1761,19 +1806,24 @@ mod tests {
             "CLICK",
         ];
         for name in raised {
-            assert_eq!(listener_source(name, true), Source::Unproven, "{name}");
+            assert_eq!(listener_source(name, TRUSTED), Source::Unproven, "{name}");
         }
         let acts = ["click", "input", "change", "submit", "keydown", "keyup"];
         for name in acts {
-            assert_eq!(listener_source(name, true), Source::User, "{name}");
-            assert_eq!(listener_source(name, false), Source::Unproven, "{name}");
+            assert_eq!(listener_source(name, TRUSTED), Source::User, "{name}");
+            assert_eq!(listener_source(name, UNTRUSTED), Source::Unproven, "{name}");
+            assert_eq!(listener_source(name, COMPOSING), Source::Unproven, "{name}");
             runtime_focus(|| {
-                assert_eq!(listener_source(name, true), Source::Unproven, "{name}");
+                assert_eq!(listener_source(name, TRUSTED), Source::Unproven, "{name}");
             });
         }
         for &(name, input) in DELEGATED_EVENTS {
             let user = input == Input::Deliberate;
-            assert_eq!(listener_source(name, true) == Source::User, user, "{name}");
+            assert_eq!(
+                listener_source(name, TRUSTED) == Source::User,
+                user,
+                "{name}"
+            );
             assert_eq!(acts.contains(&name), user, "{name}");
         }
     }

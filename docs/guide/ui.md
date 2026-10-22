@@ -100,7 +100,9 @@ user's own action either, so its render never moves focus. Only a deliberate
 input counts as the user's action: a click, a key, an edit, a submit. A focus
 or blur event (the runtime raises one when it puts focus back) and a pointer
 crossing (`onMouseOver`, `onMouseOut`, which a layout shift raises under a
-pointer at rest) do not, so their render never moves focus. The load's own
+pointer at rest) do not, so their render never moves focus. Nor does a key or
+an edit an input method is still composing (an accented letter, a CJK
+character): moving focus would cut the composition off. The load's own
 `autofocus` is spent once the user presses a key or the pointer, or moves
 focus, before the page is ready. After load the
 runtime alone moves focus: the `autofocus`

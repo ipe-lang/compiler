@@ -84,6 +84,10 @@ pub const AUTOFOCUS_SPENDING_EVENTS: [&str; 5] = [
 /// [`AUTOFOCUS_SPENDING_EVENTS`] fires; the wasm first paint reads it.
 pub const AUTOFOCUS_SPENT_GLOBAL: &str = "__ipeAutofocusSpent";
 
+/// The `keyCode` a browser gives a key an input method takes for its
+/// composition; neither client counts such a key as the user's act.
+pub const COMPOSING_KEY_CODE: u32 = 229;
+
 /// [`AUTOFOCUS_SPENDING_EVENTS`] as a JavaScript array literal.
 #[must_use]
 pub fn autofocus_spending_events_js() -> String {
@@ -93,7 +97,7 @@ pub fn autofocus_spending_events_js() -> String {
             out.push_str(", ");
         }
         out.push('"');
-        out.push_str(name);
+        crate::escape::json_str_body_into(name, &mut out);
         out.push('"');
     }
     out.push(']');

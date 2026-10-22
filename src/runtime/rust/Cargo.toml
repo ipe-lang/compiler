@@ -267,7 +267,9 @@ web-sys = { version = "0.3", optional = true, features = [
     "HtmlTemplateElement",
     "DocumentFragment",
     "NodeList",
+    # A key or edit an input method is still composing is no user act.
     "KeyboardEvent",
+    "InputEvent",
     # Debugger overlay: a keyboard toggle, a draggable floating window (pointer
     # events + element geometry), and per-element inline style writes.
     "PointerEvent",

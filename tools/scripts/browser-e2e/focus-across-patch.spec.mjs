@@ -32,6 +32,7 @@
  * see geo-clipboard.spec.mjs.
  */
 
+import { writeFileSync } from "node:fs";
 import { test, expect } from "@playwright/test";
 
 const PORT = process.env.IPE_FOCUS_ACROSS_PATCH_PORT ?? "18082";
@@ -680,13 +681,16 @@ function holdFileReads() {
   };
 }
 
-/** Picks a small text file in `input#pick` and waits until its read is held. */
+/**
+ * Picks a small text file in `input#pick` and waits until its read is held.
+ * The file is a path on disk: Playwright sets a path through the browser, so
+ * the pick's `change` is trusted, while a buffer payload's `change` is raised
+ * by an injected script and is not.
+ */
 async function pickHeld(page) {
-  await page.setInputFiles("input#pick", {
-    name: "pick.txt",
-    mimeType: "text/plain",
-    buffer: Buffer.from("x"),
-  });
+  const file = test.info().outputPath("pick.txt");
+  writeFileSync(file, "x");
+  await page.setInputFiles("input#pick", file);
   await expect.poll(() => page.evaluate(() => window.__testReads.length)).toBe(1);
 }
 
@@ -698,7 +702,19 @@ test("focus-across-patch: a file read finishing after the user moved focus never
   await pickHeld(page);
   await page.click("input#note");
   expect(await focusedId(page)).toBe("note");
+  await holdPatches(page);
   await page.evaluate(() => window.__testReleaseReads());
+  // The pick counted as the user's act: its send keeps a record of the
+  // epoch read at the pick, which the click has since moved past.
+  const frame = await firstHeld(page);
+  expect(typeof frame.focus).toBe("string");
+  const sent = await page.evaluate(() => ({
+    records: window.__ipeFocusSends.map((r) => r.epoch),
+    now: window.__ipeFocusEpoch,
+  }));
+  expect(sent.records).toHaveLength(1);
+  expect(sent.records[0]).toBeLessThan(sent.now);
+  await deliverHeld(page);
   await expect(page.locator("input#fileask")).toHaveCount(1);
   await settle(page);
   expect(await focusedId(page)).toBe("note");

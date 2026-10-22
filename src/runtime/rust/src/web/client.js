@@ -184,10 +184,10 @@ var __ipeNode = (function() {
         if (el instanceof focusers[i].of) run = focusers[i].run;
       }
       if (run === null) return false;
-      __ipeRuntimeFocusing = true;
-      try { run.call(el, {preventScroll: true}); } catch (_) { return false; }
-      finally { __ipeRuntimeFocusing = false; }
-      return __ipeDoc.active() === el;
+      var ran = __ipeAsRuntimeFocus(function() {
+        try { run.call(el, {preventScroll: true}); return true; } catch (_) { return false; }
+      });
+      return ran && __ipeDoc.active() === el;
     }
   };
 })();
@@ -836,10 +836,11 @@ function __ipeSwapPreservingFocus(container, tmp) {
   // composition buffer survive untouched. removeChild + appendChild
   // drop focus, so we re-set it now.
   if (preservedFocus) {
-    __ipeRuntimeFocusing = true;
-    try { preservedFocus.focus({preventScroll: true}); } catch (_) {
-      try { preservedFocus.focus(); } catch (_) {}
-    } finally { __ipeRuntimeFocusing = false; }
+    __ipeAsRuntimeFocus(function() {
+      try { preservedFocus.focus({preventScroll: true}); } catch (_) {
+        try { preservedFocus.focus(); } catch (_) {}
+      }
+    });
     if (typeof preservedFocus.setSelectionRange === "function" &&
         selStart !== null && selEnd !== null) {
       try { preservedFocus.setSelectionRange(selStart, selEnd, selDir); } catch (_) {}
@@ -925,6 +926,13 @@ __IPE_AUTOFOCUS_SPENDING.forEach(function(type) {
 // did not cause itself. A key press is not a move: it is what sends the event.
 var __ipeFocusEpoch = 0;
 var __ipeRuntimeFocusing = false;
+// Runs `move` as the runtime's own focus move and returns its result. The flag
+// is restored, never cleared: a move nested in another keeps the outer one's.
+function __ipeAsRuntimeFocus(move) {
+  var was = __ipeRuntimeFocusing;
+  __ipeRuntimeFocusing = true;
+  try { return move(); } finally { __ipeRuntimeFocusing = was; }
+}
 ["focusin", "pointerdown", "mousedown", "touchstart"].forEach(function(type) {
   __ipeDoc.on(type, function() {
     if (!__ipeRuntimeFocusing) __ipeFocusEpoch += 1;
@@ -942,10 +950,13 @@ var __IPE_USER_ACTS = Object.freeze({
 // The focus epoch of the user act `ev` is, read as it arrives; undefined when
 // `ev` proves no act of the user's: an event the runtime or a render can
 // raise, an untrusted one, or one raised while the runtime moves focus (the
-// `change` a field commits as the runtime focuses another node). An event
-// with no epoch keeps no record, so its render moves no focus.
+// `change` a field commits as the runtime focuses another node), or an edit or
+// key an input method is still composing (moving focus would cut the
+// composition off). An event with no epoch keeps no record, so its render
+// moves no focus.
 function __ipeUserActEpoch(ev) {
   if (!ev.isTrusted || __ipeRuntimeFocusing) return undefined;
+  if (ev.isComposing === true || ev.keyCode === 229) return undefined;
   if (!Object.prototype.hasOwnProperty.call(__IPE_USER_ACTS, ev.type)) return undefined;
   return __ipeFocusEpoch;
 }

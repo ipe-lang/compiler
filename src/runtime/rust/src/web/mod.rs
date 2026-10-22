@@ -9208,6 +9208,75 @@ mod base_path_tests {
         }
     }
 
+    /// The text of `function {name}(` in `js`, up to its closing line.
+    fn js_function(js: &str, name: &str) -> Option<&str> {
+        let open = format!("\nfunction {name}(");
+        let rest = js.get(js.find(&open)?..)?;
+        rest.get(..rest.find("\n}\n")?)
+    }
+
+    /// A key or edit an input method is still composing is no user act: the
+    /// client refuses it, on the key code the wasm client reads, before it
+    /// reads the act's epoch.
+    #[test]
+    fn client_refuses_a_composing_input_as_a_user_act() {
+        let body = js_function(super::CLIENT_JS, "__ipeUserActEpoch").unwrap_or_default();
+        let refusal = format!(
+            "if (ev.isComposing === true || ev.keyCode === {}) return undefined;",
+            crate::dom::diff::COMPOSING_KEY_CODE
+        );
+        let refused = body.find(&refusal);
+        let read = body.find("return __ipeFocusEpoch;");
+        assert!(
+            refused.is_some(),
+            "`__ipeUserActEpoch` refuses a composing input"
+        );
+        assert!(read.is_some(), "`__ipeUserActEpoch` reads the epoch");
+        assert!(refused < read, "the refusal comes before the epoch is read");
+    }
+
+    /// The runtime-focusing flag is written only where it is declared and in
+    /// `__ipeAsRuntimeFocus`, which restores the value it found, so a focus
+    /// move nested in another never clears the outer one's flag early.
+    #[test]
+    fn client_runtime_focus_restores_the_flag_it_found() {
+        let js = super::CLIENT_JS;
+        let name = "__ipeRuntimeFocusing";
+        let mut writes = Vec::new();
+        for (at, _) in js.match_indices(name) {
+            let after = js.get(at + name.len()..).unwrap_or_default().trim_start();
+            if after.starts_with('=') && !after.starts_with("==") {
+                let start = js
+                    .get(..at)
+                    .and_then(|head| head.rfind('\n'))
+                    .map_or(0, |n| n + 1);
+                let end = js
+                    .get(at..)
+                    .and_then(|tail| tail.find('\n'))
+                    .map_or(js.len(), |n| at + n);
+                writes.push(js.get(start..end).unwrap_or_default().trim());
+            }
+        }
+        assert_eq!(
+            writes,
+            [
+                "var __ipeRuntimeFocusing = false;",
+                "__ipeRuntimeFocusing = true;",
+                "try { return move(); } finally { __ipeRuntimeFocusing = was; }",
+            ]
+        );
+        let guard = js_function(js, "__ipeAsRuntimeFocus").unwrap_or_default();
+        assert!(
+            guard.contains("var was = __ipeRuntimeFocusing;\n  __ipeRuntimeFocusing = true;"),
+            "the guard saves the flag before it sets it"
+        );
+        assert_eq!(
+            js.matches("__ipeAsRuntimeFocus(function() {").count(),
+            2,
+            "the node focus and the swap's focus restore both go through the guard"
+        );
+    }
+
     /// The byte offset just past the boot block's closing `</script>`.
     fn boot_block_end(html: &str) -> Option<usize> {
         let open = boot_open_tag();
