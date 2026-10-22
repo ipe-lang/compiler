@@ -289,7 +289,7 @@ wordHeadInputs : List String
 wordHeadInputs =
     List.concatMap
         (\head -> [ head, head ++ "\n", head ++ "\nz" ])
-        [ "b", "c", "br\"x\"", "cr\"x\"", "b\"x\"", "bx", "brr", "bR\"x\"", "r#\"x\"#", "br##\"a\"#\"##", "c'x'" ]
+        [ "b", "c", "br\"x\"", "cr\"x\"", "b\"x\"", "bx", "brr", "bR\"x\"", "Br\"x\"", "Cr\"x\"", "r#\"x\"#", "br##\"a\"#\"##", "c'x'" ]
 
 
 handPickedInputs : List String
