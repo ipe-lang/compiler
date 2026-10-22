@@ -1,4 +1,4 @@
-module TextSinkScanTests exposing (checks)
+module TextSinkScanTests exposing (Kind(..), Lexed, Token, checks, lex)
 
 import Ipe.ByteSize as ByteSize
 import Ipe.Char as Char
