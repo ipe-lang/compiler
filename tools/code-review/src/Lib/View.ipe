@@ -20,7 +20,7 @@ import Lib.Format as Format
 import Lib.Index as Index exposing (Change(..), SourceView(..))
 import Lib.Label as Label exposing (Label, LabelPart(..), LabelPiece(..))
 import Lib.Links as Links exposing (Link(..))
-import Lib.Queue as Queue exposing (HistoryLabel(..), HistoryState(..), Place(..), Presence(..), QueueState(..), Standing(..), UnitLabel, UnitPageState(..))
+import Lib.Queue as Queue exposing (DecisionTarget(..), HistoryLabel(..), HistoryState(..), Place(..), Presence(..), QueueState(..), Standing(..), UnitLabel, UnitPageState(..))
 import Lib.ReviewKey as ReviewKey
 import Lib.SafeText as SafeText exposing (SafeText, Segment(..))
 import Lib.Uid exposing (Uid)
@@ -302,7 +302,7 @@ refusalControls controls offered shown row =
                     Ui.el [ Font.size 12, Font.color (Ui.rgb 220 170 90) ] (safeText (SafeText.literal why))
 
                 Nothing ->
-                    decisionControls controls row.uid offered (SafeText.literal "Acknowledge") (AckRefusal row.uid) (RefuseRefusalSubmit row.uid)
+                    decisionControls controls row.uid offered
 
 
 nextPageButton : Maybe Index.Cursor -> Ui.Element Msg
@@ -1128,16 +1128,16 @@ decisionButtons controls offered queueState loaded =
 
 verifiedDecisionButtons : RefuseControls -> Maybe Queue.DecidableRow -> Index.Unit -> Ui.Element Msg
 verifiedDecisionButtons controls offered unit =
-    decisionControls controls unit.uid offered (SafeText.literal "Approve") (ApproveUnit unit.uid) (RefuseSubmit unit.uid)
+    decisionControls controls unit.uid offered
 
 
 -- The one place a row's decision controls are drawn, for a queued unit and
--- an unreviewable file alike: the pending state while a decision is busy,
--- else, for a row the page offers a decision on (`offered`, the same row
--- the refusal panel opens on), the open refusal panel, or the approve
--- control (`approveLabel` sending `approve`) beside Refuse.
-decisionControls : RefuseControls -> Uid -> Maybe Queue.DecidableRow -> SafeText -> Msg -> Msg -> Ui.Element Msg
-decisionControls controls uid offered approveLabel approve submit =
+-- an unreviewable file alike: the pending state of row `uid` while a
+-- decision is busy, else, when the page offers a decision on it (`offered`,
+-- the same row the refusal panel opens on), that row's controls. A row
+-- offered under another uid draws none.
+decisionControls : RefuseControls -> Uid -> Maybe Queue.DecidableRow -> Ui.Element Msg
+decisionControls controls uid offered =
     case Queue.pendingText uid controls.decision of
         Just text ->
             Ui.el [ Font.size 12, Font.color (Ui.rgb 150 150 165) ] (safeText text)
@@ -1145,28 +1145,69 @@ decisionControls controls uid offered approveLabel approve submit =
         Nothing ->
             case offered of
                 Just row ->
-                    case controls.panel of
-                        Just ( open, draft ) ->
-                            if open == row then
-                                refusePanel uid draft submit
+                    if Queue.rowUid row == uid then
+                        offeredControls controls row
 
-                            else
-                                offeredButtons uid approveLabel approve
-
-                        Nothing ->
-                            offeredButtons uid approveLabel approve
+                    else
+                        Ui.none
 
                 Nothing ->
                     Ui.none
 
 
-offeredButtons : Uid -> SafeText -> Msg -> Ui.Element Msg
-offeredButtons uid approveLabel approve =
+-- An offered row's controls, each message and label read from the row
+-- itself: its open refusal panel, or its approve control beside Refuse.
+offeredControls : RefuseControls -> Queue.DecidableRow -> Ui.Element Msg
+offeredControls controls row =
+    let
+        uid =
+            Queue.rowUid row
+    in
+    case controls.panel of
+        Just ( open, draft ) ->
+            if open == row then
+                refusePanel uid draft (submitOf row)
+
+            else
+                offeredButtons row
+
+        Nothing ->
+            offeredButtons row
+
+
+-- What a refusal of `row` submits: a unit's refusal or a file's.
+submitOf : Queue.DecidableRow -> Msg
+submitOf row =
+    case Queue.rowTarget row of
+        OnUnit ->
+            RefuseSubmit (Queue.rowUid row)
+
+        OnRefusal ->
+            RefuseRefusalSubmit (Queue.rowUid row)
+
+
+offeredButtons : Queue.DecidableRow -> Ui.Element Msg
+offeredButtons row =
+    let
+        uid =
+            Queue.rowUid row
+    in
     Ui.row
         [ Ui.spacing 8 ]
-        [ approveButton approveLabel approve
+        [ approveOf row
         , refuseButton (SafeText.literal "Refuse") (RefuseStart uid)
         ]
+
+
+-- The approve control of `row`: Approve on a unit, Acknowledge on a file.
+approveOf : Queue.DecidableRow -> Ui.Element Msg
+approveOf row =
+    case Queue.rowTarget row of
+        OnUnit ->
+            approveButton (SafeText.literal "Approve") (ApproveUnit (Queue.rowUid row))
+
+        OnRefusal ->
+            approveButton (SafeText.literal "Acknowledge") (AckRefusal (Queue.rowUid row))
 
 
 approveButton : SafeText -> Msg -> Ui.Element Msg
