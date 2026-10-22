@@ -226,7 +226,7 @@ impl WsFailure {
             Error::Capacity(_) => Self::Capacity,
             Error::Protocol(_) => Self::Protocol,
             Error::WriteBufferFull(_) => Self::WriteBufferFull,
-            Error::Utf8 => Self::Utf8,
+            Error::Utf8(_) => Self::Utf8,
             Error::AttackAttempt => Self::AttackAttempt,
             Error::Url(_) => Self::Url,
             Error::Http(response) => Self::HttpStatus(response.status().as_u16()),
@@ -316,6 +316,10 @@ enum WsConnectError {
     },
     /// A `wss://` URL under deny-private, whose pinned dial carries no TLS.
     TlsUnderPin(super::ssrf::DisplayableUrl),
+    /// The TLS provider admits none of the safe default protocol versions.
+    TlsSetup(super::ssrf::DisplayableUrl),
+    /// A `wss://` URL whose host is no name a certificate can be valid for.
+    TlsServerName(super::ssrf::DisplayableUrl),
     /// The dial or handshake failed.
     Failed {
         /// The URL as it may be shown.
@@ -353,6 +357,14 @@ impl std::fmt::Display for WsConnectError {
                  (SSRF-pinned dial bypasses TLS; disable IPE_HTTP_DENY_PRIVATE or use ws:// \
                  for this endpoint)"
             ),
+            Self::TlsSetup(url) => write!(
+                f,
+                "WebSocket.connect {url}: no safe TLS protocol version is available"
+            ),
+            Self::TlsServerName(url) => write!(
+                f,
+                "WebSocket.connect {url}: the host is not a valid TLS server name"
+            ),
             Self::Failed { url, failure } => write!(f, "WebSocket.connect {url}: {failure}"),
             Self::TimedOut { url, after_ms } => write!(
                 f,
@@ -374,6 +386,8 @@ impl WsConnectError {
             | Self::InvalidHeaderName { .. }
             | Self::InvalidHeaderValue { .. }
             | Self::TlsUnderPin(_)
+            | Self::TlsSetup(_)
+            | Self::TlsServerName(_)
             | Self::TimedOut { .. } => false,
         }
     }
@@ -398,6 +412,166 @@ const WS_MESSAGE_CEILING: crate::system::EnvCeiling = crate::system::EnvCeiling:
     "decimal byte count",
 );
 
+/// The write-buffer fill tungstenite reaches before it writes to the socket.
+#[cfg(not(target_arch = "wasm32"))]
+const WS_WRITE_BUFFER_TARGET: usize = 128 * 1024;
+
+/// The largest header a WebSocket frame carries, in bytes.
+#[cfg(not(target_arch = "wasm32"))]
+const WS_FRAME_HEADER_MAX: usize = 14;
+
+/// The most bytes the outbound buffer may hold when messages are capped at
+/// `ceiling` bytes: the write target plus one framed message.
+///
+/// Always above [`WS_WRITE_BUFFER_TARGET`], which tungstenite requires of it.
+#[cfg(not(target_arch = "wasm32"))]
+const fn ws_write_buffer_bound(ceiling: usize) -> usize {
+    WS_WRITE_BUFFER_TARGET
+        .saturating_add(ceiling)
+        .saturating_add(WS_FRAME_HEADER_MAX)
+}
+
+/// The socket configuration for messages and frames capped at `ceiling` bytes.
+///
+/// Caps the inbound message and frame at `ceiling` and the outbound buffer at
+/// [`ws_write_buffer_bound`], so neither side of the socket can grow without a
+/// limit.
+#[cfg(not(target_arch = "wasm32"))]
+fn ws_config(ceiling: usize) -> tokio_tungstenite::tungstenite::protocol::WebSocketConfig {
+    tokio_tungstenite::tungstenite::protocol::WebSocketConfig::default()
+        .write_buffer_size(WS_WRITE_BUFFER_TARGET)
+        .max_write_buffer_size(ws_write_buffer_bound(ceiling))
+        .max_message_size(Some(ceiling))
+        .max_frame_size(Some(ceiling))
+}
+
+/// A client TLS configuration over the `ring` provider that trusts exactly `roots`.
+///
+/// `None` when the provider admits none of the safe default protocol versions.
+#[cfg(not(target_arch = "wasm32"))]
+fn tls_client_config(roots: rustls::RootCertStore) -> Option<rustls::ClientConfig> {
+    rustls::ClientConfig::builder_with_provider(std::sync::Arc::new(
+        rustls::crypto::ring::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .ok()
+    .map(|builder| builder.with_root_certificates(roots).with_no_client_auth())
+}
+
+/// The `wss://` client TLS configuration, trusting the webpki root store.
+///
+/// Built once per process.
+#[cfg(not(target_arch = "wasm32"))]
+fn wss_tls_config() -> Option<std::sync::Arc<rustls::ClientConfig>> {
+    static CONFIG: OnceLock<Option<std::sync::Arc<rustls::ClientConfig>>> = OnceLock::new();
+    CONFIG
+        .get_or_init(|| {
+            tls_client_config(rustls::RootCertStore {
+                roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
+            })
+            .map(std::sync::Arc::new)
+        })
+        .clone()
+}
+
+/// The TLS handshake of a `wss://` dial over `tcp`, verifying the server's
+/// certificate for `name` against `config`'s roots.
+#[cfg(not(target_arch = "wasm32"))]
+async fn tls_handshake(
+    tcp: tokio::net::TcpStream,
+    name: rustls::pki_types::ServerName<'static>,
+    config: std::sync::Arc<rustls::ClientConfig>,
+) -> Result<tokio_rustls::client::TlsStream<tokio::net::TcpStream>, WsFailure> {
+    tokio_rustls::TlsConnector::from(config)
+        .connect(name, tcp)
+        .await
+        .map_err(|_| WsFailure::Tls)
+}
+
+/// Where the TCP dial of a connect goes.
+#[cfg(not(target_arch = "wasm32"))]
+enum DialTarget {
+    /// The address the SSRF gate vetted.
+    Vetted(std::net::SocketAddr),
+    /// A host the policy lets the dial resolve by name.
+    Named {
+        /// The URL's host, IPv6 brackets stripped.
+        host: String,
+        /// The URL's port, or its scheme's default.
+        port: u16,
+    },
+}
+
+/// What runs over the TCP stream before the WebSocket handshake.
+#[cfg(not(target_arch = "wasm32"))]
+enum Transport {
+    /// The handshake runs on the TCP stream itself (`ws://`).
+    Plain,
+    /// The handshake runs inside TLS to `name` (`wss://`).
+    Tls {
+        /// The name the server's certificate must be valid for.
+        name: rustls::pki_types::ServerName<'static>,
+        /// The client TLS configuration.
+        config: std::sync::Arc<rustls::ClientConfig>,
+    },
+}
+
+/// Dial `target`, run `transport` and the WebSocket handshake for `req`, then
+/// start the socket; returns its id.
+#[cfg(not(target_arch = "wasm32"))]
+async fn dial_and_open(
+    target: DialTarget,
+    transport: Transport,
+    req: tokio_tungstenite::tungstenite::handshake::client::Request,
+    config: tokio_tungstenite::tungstenite::protocol::WebSocketConfig,
+    ping_interval_ms: i64,
+) -> Result<i64, WsFailure> {
+    // A vetted dial keeps only its class: the address may re-encode an
+    // IP-literal host the displayable URL withholds.
+    let (addrs, dial_failure): (
+        Vec<std::net::SocketAddr>,
+        fn(std::io::ErrorKind) -> WsFailure,
+    ) = match target {
+        DialTarget::Vetted(addr) => (vec![addr], WsFailure::Dial),
+        DialTarget::Named { host, port } => (
+            tokio::net::lookup_host((host.as_str(), port))
+                .await
+                .map_err(|e| WsFailure::Io(e.kind()))?
+                .collect(),
+            WsFailure::Io,
+        ),
+    };
+    let tcp = tokio::net::TcpStream::connect(addrs.as_slice())
+        .await
+        .map_err(|e| dial_failure(e.kind()))?;
+    match transport {
+        Transport::Plain => open_socket(req, tcp, config, ping_interval_ms).await,
+        Transport::Tls { name, config: tls } => {
+            let stream = tls_handshake(tcp, name, tls).await?;
+            open_socket(req, stream, config, ping_interval_ms).await
+        }
+    }
+}
+
+/// Run the WebSocket handshake for `req` over `stream`, then start the socket;
+/// returns its id.
+#[cfg(not(target_arch = "wasm32"))]
+async fn open_socket<S>(
+    req: tokio_tungstenite::tungstenite::handshake::client::Request,
+    stream: S,
+    config: tokio_tungstenite::tungstenite::protocol::WebSocketConfig,
+    ping_interval_ms: i64,
+) -> Result<i64, WsFailure>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    let (socket, _response) =
+        tokio_tungstenite::client_async_with_config(req, stream, Some(config))
+            .await
+            .map_err(|e| WsFailure::of(&e))?;
+    Ok(start_socket(socket, ping_interval_ms))
+}
+
 #[cfg(not(target_arch = "wasm32"))]
 async fn do_connect<E: From<String> + FromLimitExceeded + Send + 'static>(
     url: String,
@@ -412,7 +586,7 @@ async fn do_connect<E: From<String> + FromLimitExceeded + Send + 'static>(
     // SSRF gate, before the handshake: under deny-private the host is resolved
     // ONCE through the shared gate (bounded deadline, a host with any blocked
     // answer refused whole) and the dial below is pinned to the vetted address,
-    // so tokio-tungstenite never re-resolves the name to a rebind target.
+    // so the dial never re-resolves the name to a rebind target.
     let dial = match super::ssrf::VettedDial::for_url(&url).await {
         Ok(dial) => dial,
         Err(refusal) => return WsConnectError::Refused(refusal).into_task(),
@@ -422,6 +596,15 @@ async fn do_connect<E: From<String> + FromLimitExceeded + Send + 'static>(
     let Ok(mut req) = url.as_str().into_client_request() else {
         return WsConnectError::BadUrl(safe_url).into_task();
     };
+    // The host, port and scheme come from the parse the gate vetted, never from
+    // the raw text, which may differ in case or leading whitespace.
+    let Ok(parsed) = ::url::Url::parse(&url) else {
+        return WsConnectError::BadUrl(safe_url).into_task();
+    };
+    let (Some(host), Some(port)) = (parsed.host_str(), parsed.port_or_known_default()) else {
+        return WsConnectError::BadUrl(safe_url).into_task();
+    };
+    let host = super::ssrf::strip_ipv6_brackets(host).to_owned();
     // Fail CLOSED on an unparseable caller-supplied header: a credential (e.g.
     // an Authorization bearer) that can't be attached must abort the connect,
     // never connect unauthenticated. The header is named only by its position:
@@ -446,98 +629,83 @@ async fn do_connect<E: From<String> + FromLimitExceeded + Send + 'static>(
     }
     // Cap inbound frame/message size to prevent a remote server from forcing the
     // client to buffer an arbitrarily large payload. Default 1 MiB (matches the
-    // server-side cap): the prior 16 MiB × the 64-deep broadcast buffer below was
-    // ~1 GiB worst-case retained per socket under a lagging subscriber. Override
-    // via IPE_WS_MAX_MESSAGE_BYTES for apps that legitimately need larger frames.
-    //
-    // tokio-tungstenite 0.24 exposes connect_async_with_config which passes a
-    // tungstenite::protocol::WebSocketConfig directly to the handshake.
+    // server-side cap): with the 64-deep broadcast buffer below, a larger cap
+    // multiplies the worst-case retention per socket under a lagging
+    // subscriber. Override via IPE_WS_MAX_MESSAGE_BYTES for apps that
+    // legitimately need larger frames.
     let max_msg: usize = match WS_MESSAGE_CEILING.read() {
         Ok(cap) => cap,
         Err(refusal) => return WsConnectError::Ceiling(refusal).into_task(),
     };
-    let ws_config = tokio_tungstenite::tungstenite::protocol::WebSocketConfig {
-        max_message_size: Some(max_msg),
-        max_frame_size: Some(max_msg),
-        ..Default::default()
-    };
-    type WsConnOut = Result<
-        (
-            tokio_tungstenite::WebSocketStream<
-                tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
-            >,
-            tokio_tungstenite::tungstenite::handshake::client::Response,
-        ),
-        WsFailure,
-    >;
-    let connect_fut: std::pin::Pin<Box<dyn std::future::Future<Output = WsConnOut> + Send>> =
-        match dial {
-            super::ssrf::VettedDial::Pinned(addr) => {
-                // When SSRF-pinning is active (IPE_HTTP_DENY_PRIVATE), we dial
-                // the already-vetted IP directly via a raw TCP socket, bypassing
-                // the name-resolution step. A raw TCP socket carries no TLS
-                // context, so a `wss://` URL cannot be serviced here — TLS
-                // requires the full resolver path (`connect_async_with_config`,
-                // the `Unrestricted` arm below). Refuse rather than dial plaintext
-                // to what the caller believes is a secure endpoint. The scheme is
-                // read from the parse the gate vetted, never from the raw text,
-                // which may differ in case or leading whitespace.
-                if !::url::Url::parse(&url).is_ok_and(|parsed| parsed.scheme() == "ws") {
-                    return WsConnectError::TlsUnderPin(safe_url).into_task();
-                }
-                // Dial INSIDE the future so the single handshake timeout below
-                // also bounds the pinned TCP connect — otherwise an unreachable
-                // / silently-stalling pinned addr would hang here, outside the
-                // timeout guard, leaking the task + FD. The failure keeps only
-                // its class: the address may re-encode an IP-literal host the
-                // displayable URL withholds.
-                Box::pin(async move {
-                    let tcp = tokio::net::TcpStream::connect(addr.socket_addr())
-                        .await
-                        .map_err(|e| WsFailure::Dial(e.kind()))?;
-                    tokio_tungstenite::client_async_with_config(
-                        req,
-                        tokio_tungstenite::MaybeTlsStream::Plain(tcp),
-                        Some(ws_config),
-                    )
-                    .await
-                    .map_err(|e| WsFailure::of(&e))
-                })
+    let (target, transport) = match dial {
+        super::ssrf::VettedDial::Pinned(addr) => {
+            // When SSRF-pinning is active (IPE_HTTP_DENY_PRIVATE), the dial goes
+            // to the already-vetted IP, never to the name. The pinned dial
+            // carries no TLS context, so a `wss://` URL cannot be serviced here:
+            // refuse rather than dial plaintext to what the caller believes is a
+            // secure endpoint.
+            if parsed.scheme() != "ws" {
+                return WsConnectError::TlsUnderPin(safe_url).into_task();
             }
-            super::ssrf::VettedDial::Unrestricted => Box::pin(async move {
-                tokio_tungstenite::connect_async_with_config(req, Some(ws_config), false)
-                    .await
-                    .map_err(|e| WsFailure::of(&e))
-            }),
-        };
+            (DialTarget::Vetted(addr.socket_addr()), Transport::Plain)
+        }
+        super::ssrf::VettedDial::Unrestricted => {
+            let transport = match parsed.scheme() {
+                "ws" => Transport::Plain,
+                "wss" => {
+                    let Some(config) = wss_tls_config() else {
+                        return WsConnectError::TlsSetup(safe_url).into_task();
+                    };
+                    let Ok(name) = rustls::pki_types::ServerName::try_from(host.clone()) else {
+                        return WsConnectError::TlsServerName(safe_url).into_task();
+                    };
+                    Transport::Tls { name, config }
+                }
+                _ => {
+                    return WsConnectError::Failed {
+                        url: safe_url,
+                        failure: WsFailure::Url,
+                    }
+                    .into_task();
+                }
+            };
+            (DialTarget::Named { host, port }, transport)
+        }
+    };
     // Floor the handshake timeout: a non-positive cfg.timeout must NOT disable it
-    // (an unreachable / silently-stalling host would otherwise hang connect_async
-    // forever, leaking the task + FD). Default 30 s.
+    // (an unreachable / silently-stalling host would otherwise hang the connect
+    // forever, leaking the task + FD). Default 30 s. The one deadline bounds the
+    // name lookup, the TCP dial, the TLS handshake and the WebSocket handshake.
     let to_ms: u64 = if timeout_ms > 0 {
         timeout_ms as u64
     } else {
         30_000
     };
-    let (stream, _resp) =
-        match tokio::time::timeout(std::time::Duration::from_millis(to_ms), connect_fut).await {
-            Ok(Ok(ok)) => ok,
-            Ok(Err(failure)) => {
-                return WsConnectError::Failed {
-                    url: safe_url,
-                    failure,
-                }
-                .into_task();
-            }
-            Err(_) => {
-                return WsConnectError::TimedOut {
-                    url: safe_url,
-                    after_ms: to_ms,
-                }
-                .into_task();
-            }
-        };
+    let connect = dial_and_open(target, transport, req, ws_config(max_msg), ping_interval_ms);
+    match tokio::time::timeout(std::time::Duration::from_millis(to_ms), connect).await {
+        Ok(Ok(id)) => ok_res(id),
+        Ok(Err(failure)) => WsConnectError::Failed {
+            url: safe_url,
+            failure,
+        }
+        .into_task(),
+        Err(_) => WsConnectError::TimedOut {
+            url: safe_url,
+            after_ms: to_ms,
+        }
+        .into_task(),
+    }
+}
+
+/// Start the reader and writer tasks of an open `socket` and register it;
+/// returns its id.
+#[cfg(not(target_arch = "wasm32"))]
+fn start_socket<S>(socket: tokio_tungstenite::WebSocketStream<S>, ping_interval_ms: i64) -> i64
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
     let id = WS_CLIENT_NEXT_ID.fetch_add(1, Ordering::Relaxed);
-    let (mut write, mut read) = stream.split();
+    let (mut write, mut read) = socket.split();
     let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::channel::<WsCmd>(1024);
     let (frames_tx, _) = tokio::sync::broadcast::channel::<WsEvent>(64);
 
@@ -561,7 +729,8 @@ async fn do_connect<E: From<String> + FromLimitExceeded + Send + 'static>(
                 Some(iv) => tokio::select! {
                     _ = iv.tick() => {
                         if first_tick { first_tick = false; continue; }
-                        if write.send(Message::Ping(Vec::new())).await.is_err() { break; }
+                        let ping = Message::Ping(tokio_tungstenite::tungstenite::Bytes::new());
+                        if write.send(ping).await.is_err() { break; }
                         continue;
                     }
                     c = cmd_rx.recv() => c,
@@ -573,8 +742,8 @@ async fn do_connect<E: From<String> + FromLimitExceeded + Send + 'static>(
                 None => break,
             };
             let msg = match cmd {
-                WsCmd::Text(s) => Message::Text(s),
-                WsCmd::Binary(b) => Message::Binary(b),
+                WsCmd::Text(s) => Message::Text(s.into()),
+                WsCmd::Binary(b) => Message::Binary(b.into()),
                 WsCmd::Close => {
                     let _ = write.send(Message::Close(None)).await;
                     break;
@@ -604,11 +773,11 @@ async fn do_connect<E: From<String> + FromLimitExceeded + Send + 'static>(
         while let Some(item) = read.next().await {
             match item {
                 Ok(Message::Text(t)) => {
-                    let _ = frames.send(WsEvent::Message(WsClientMessage::Text(t)));
+                    let text = t.as_str().to_owned();
+                    let _ = frames.send(WsEvent::Message(WsClientMessage::Text(text)));
                 }
                 Ok(Message::Binary(b)) => {
-                    // `b` is already `Vec<u8>` from tungstenite — no conversion needed.
-                    let _ = frames.send(WsEvent::Message(WsClientMessage::Binary(b)));
+                    let _ = frames.send(WsEvent::Message(WsClientMessage::Binary(Vec::from(b))));
                 }
                 Ok(Message::Close(cf)) => {
                     let code = cf.map(|f| u16::from(f.code) as i64).unwrap_or(1000);
@@ -635,7 +804,7 @@ async fn do_connect<E: From<String> + FromLimitExceeded + Send + 'static>(
             reader_abort,
         },
     );
-    ok_res(id)
+    id
 }
 
 /// WebSocket.connect : String -> Task Error Int (raw id; Ipê wraps in WebSocket)
@@ -1004,6 +1173,8 @@ mod tests {
                     position: 2,
                 },
                 WsConnectError::TlsUnderPin(url()),
+                WsConnectError::TlsSetup(url()),
+                WsConnectError::TlsServerName(url()),
                 WsConnectError::Failed {
                     url: url(),
                     failure: WsFailure::Dial(std::io::ErrorKind::ConnectionRefused),
