@@ -122,11 +122,15 @@ progressBar k n =
 -- handler before and after any click, since key events bubble to the root.
 view : Model -> Ui.Element Msg
 view model =
+    let
+        offers =
+            App.keyOffers model
+    in
     Ui.column
         [ Ui.width Ui.fill
         , Ui.height Ui.fill
         , Background.color (Ui.rgb 16 16 22)
-        , Ui.onKeyDown (KeyDown (App.keyOffers model))
+        , Ui.onKeyDown (KeyDown offers)
         , Ui.htmlAttribute "tabindex" "0"
         , Ui.htmlAttribute "autofocus" ""
         , Ui.htmlAttribute "lang" "en"
