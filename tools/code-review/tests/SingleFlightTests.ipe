@@ -24,7 +24,7 @@ import Lib.SafeText as SafeText
 import Lib.Settings as Settings
 import Lib.Uid as Uid exposing (Uid)
 import Lib.View as View
-import TestSupport exposing (check, checkReporting, cleanupIndex, decideNow, envAppSettings, execIndex, fixtureLibRs, freshScratch, loadPageNow, loadUnitNow, migratedReviewAt, refusalOf, removeFileIfAny, seedIndex, testMacKey, uid, labelOf, labelText, viewA, writeFileText)
+import TestSupport exposing (Scratch, check, checkReporting, cleanupIndex, decideNow, envAppSettings, execIndex, fixtureLibRs, freshScratch, loadPageNow, loadUnitNow, migratedReviewAt, refusalOf, removeFileIfAny, seedIndex, testMacKey, uid, labelOf, labelText, viewA, writeFileText)
 
 
 -- Every check drives the app's own `App.update`, the dispatch `src/Main.ipe`
@@ -1486,6 +1486,7 @@ decisionRefusedBeforeReading =
         at <- freshScratch "ipe-single-flight-refused"
         seedIndex at.indexDb at.repo
         insertLinkRefusal at.indexDb "a"
+        reviewStoreAt at
         settings <- envAppSettings
         macKey <- testMacKey
         a <- loadUnitNow (uid "u-a") |> Task.andThen requireUnit
@@ -1500,6 +1501,7 @@ decisionRefusedBeforeReading =
         fileBlocking <- App.decisionTask settings macKey (withRefusal { file | digest = Nothing } (queueModel [ a, b ] (ViewShown a))) offerFile LibDb.Approved
         whileReloading <- App.decisionTask settings macKey (reloadingModel a) offerA LibDb.Approved
         cleanupIndex at.indexDb at.repo
+        removeFileIfAny at.reviewDb
         Task.succeed
             (staleBannerShown settings (queueModel [ a ] (ViewShown a)) offerB offList (SaveRefused NotQueued) notQueuedText
                 && staleBannerShown settings (queueModel [ a, b ] (ViewShown a)) offerFile fileOffList (SaveRefused FileNotQueued) fileNotQueuedText
@@ -1604,6 +1606,15 @@ linkDigest digit =
     "refusal-blake3:" ++ String.repeat 64 digit
 
 
+-- A migrated review store at `at`, the one the environment names, so a
+-- page load reads this check's own log.
+reviewStoreAt : Scratch -> Task.Task Error ()
+reviewStoreAt at =
+    System.setenv "IPE_REVIEW_DB" at.reviewDb
+        |> Task.andThen (\_ -> migratedReviewAt at.reviewDb)
+        |> Task.map (\_ -> ())
+
+
 -- The `r-link` row as the first queue page lists it, digest included.
 linkRow : Task.Task Error Index.RefusalRow
 linkRow =
@@ -1669,12 +1680,14 @@ withSeeded name body =
         at <- freshScratch name
         seedIndex at.indexDb at.repo
         insertLinkRefusal at.indexDb "a"
+        reviewStoreAt at
         settings <- envAppSettings
         otherEpoch <- Epoch.mint
         a <- loadUnitNow (uid "u-a") |> Task.andThen requireUnit
         b <- loadUnitNow (uid "u-b") |> Task.andThen requireUnit
         file <- linkRow
         cleanupIndex at.indexDb at.repo
+        removeFileIfAny at.reviewDb
         Task.succeed (body settings otherEpoch a b file)
 
 
@@ -1833,11 +1846,12 @@ writtenChecks =
         removeFileIfAny at.reviewDb
         seedIndex at.indexDb at.repo
         insertLinkRefusal at.indexDb "a"
+        System.setenv "IPE_REVIEW_DB" at.reviewDb
+        db <- migratedReviewAt at.reviewDb
         settings <- envAppSettings
         a <- loadUnitNow (uid "u-a") |> Task.andThen requireUnit
         b <- loadUnitNow (uid "u-b") |> Task.andThen requireUnit
         file <- linkRow
-        db <- migratedReviewAt at.reviewDb
         pair <- decideNow db (uid "u-a") Approved
         cleanupIndex at.indexDb at.repo
         removeFileIfAny at.reviewDb
@@ -2181,6 +2195,7 @@ reshownChecks =
         at <- freshScratch "ipe-single-flight-reshown"
         seedIndex at.indexDb at.repo
         insertLinkRefusal at.indexDb "a"
+        reviewStoreAt at
         settings <- envAppSettings
         macKey <- testMacKey
         a <- loadUnitNow (uid "u-a") |> Task.andThen requireUnit
@@ -2196,6 +2211,7 @@ reshownChecks =
         unitDrift <- App.decisionTask settings macKey (queueModel [ a2, b ] (ViewShown a2)) offerA LibDb.Approved
         fileDrift <- App.decisionTask settings macKey (withRefusal file2 (queueModel [ a, b ] (ViewShown a))) offerFile LibDb.Approved
         cleanupIndex at.indexDb at.repo
+        removeFileIfAny at.reviewDb
         Task.succeed (reshownRows { settings = settings, a = a, a2 = a2, b = b, file = file, file2 = file2 } unitDrift fileDrift)
 
 
