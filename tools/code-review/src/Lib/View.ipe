@@ -702,7 +702,7 @@ linkEl : Links.Link -> Ui.Element Msg
 linkEl link =
     case link of
         Internal _ uid ->
-            linkOrText (Result.toMaybe (Ui.linkTarget ("/unit/" ++ Uid.toString uid))) (linkPieces link)
+            linkOrText (Uid.linkTarget uid) (linkPieces link)
 
         External url ->
             linkOrText (Maybe.andThen (\raw -> Result.toMaybe (Ui.linkTarget raw)) (Links.href url)) (linkPieces link)
@@ -910,7 +910,7 @@ placeEls size place =
             [ placeEl size (placeText path line) ]
 
         AtUnit path line uid ->
-            [ placeEl size (placeText path line ++ [ ToolText (SafeText.literal " · "), ToolText (SafeText.renderForeign (Uid.toString uid)) ]) ]
+            [ placeEl size (placeText path line ++ [ ToolText (SafeText.literal " · "), ToolText (Uid.placeText uid) ]) ]
 
 
 placeEl : Int -> List LabelPiece -> Ui.Element Msg

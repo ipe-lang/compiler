@@ -647,11 +647,11 @@ literalConstants =
 -- style constants.
 admittedMarkup : List String
 admittedMarkup =
-    [ "Lib/View.ipe:codeHtml"
+    [ "Lib/Uid.ipe:linkTarget"
+    , "Lib/View.ipe:codeHtml"
     , "Lib/View.ipe:labelHtml"
     , "Lib/View.ipe:labelPartHtml"
     , "Lib/View.ipe:labelPartHtml"
-    , "Lib/View.ipe:linkEl"
     , "Lib/View.ipe:linkEl"
     , "Lib/View.ipe:partHtml"
     , "Lib/View.ipe:pieceHtml"

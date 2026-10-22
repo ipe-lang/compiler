@@ -1,4 +1,4 @@
-module Lib.Db exposing (BreakAt(..), CellCeiling, Decision(..), HistoryCursor(..), HistoryRows, LogRow, LogShown(..), LogState, LogVerdict(..), ProvenHead, Reason, ReviewEntry(..), RowName(..), StoredDecision(..), StoredReason, Unverified(..), UnverifiedRow, VerifiedRow, Verifier, advanceHead, cellHeld, copyCurrent, copyHolds, copyStamp, countedRows, currentHead, findDecision, findLatestForUid, headMoved, headCellCeilings, historyPage, historyPlan, insertDecision, lastSeq, keyMismatchRefusal, logCellCeilings, logPageCeiling, logRowsAfter, logShown, logVerdict, logVerdictWithin, macInput, openAt, parseReason, probe, reasonMaxChars, reasonText, rowNameOf, stateHead, stateVerdict, storedReasonMaxBytes, storedReasonText, storedUid, verifiedAt, verifiedDecision, verifiedHash, verifiedName, verifiedPair, verifiedUid, verifier, writeTransaction)
+module Lib.Db exposing (BreakAt(..), CellCeiling, Decision(..), HistoryCursor(..), HistoryRows, LogRow, LogShown(..), LogState, LogVerdict(..), ProvenHead, Reason, ReviewEntry(..), RowName(..), StoredDecision(..), StoredReason, Unverified(..), UnverifiedRow, VerifiedRow, Verifier, advanceHead, cellHeld, copyCurrent, copyHolds, copyStamp, countedRows, currentHead, findDecision, findLatestForUid, headMoved, headCellCeilings, historyPage, historyPlan, insertDecision, lastSeq, keyMismatchRefusal, logCellCeilings, logPageCeiling, logRowsAfter, logShown, logVerdict, logVerdictWithin, macInput, openAt, parseReason, probe, reasonMaxChars, reasonText, rowNameOf, stateHead, stateVerdict, storedReasonMaxBytes, storedReasonText, verifiedAt, verifiedDecision, verifiedHash, verifiedName, verifiedPair, verifiedUid, verifier, writeTransaction)
 
 import Ipe.Crypto as Crypto
 import Ipe.Db as Db
@@ -497,11 +497,10 @@ makeRecord uid bodyHash decision reason reviewedAt held =
 
 
 -- The one parser of a stored row. Every cell must be held, the uid a unit
--- id and the decision `approve` or `refuse`; any other row fails, naming the
--- row by its uid only once it is a unit id and never echoing the column
--- text. A refusal's reason is classified by `storedReason`, a NULL one as
--- blank, so a row breaking the reason bound still reads; an approval's
--- reason column is never read.
+-- id and the decision `approve` or `refuse`; any other row fails without
+-- echoing any cell, its uid included. A refusal's reason is classified by
+-- `storedReason`, a NULL one as blank, so a row breaking the reason bound
+-- still reads; an approval's reason column is never read.
 fromRecord : ReviewRecord -> Result Error LegacyRow
 fromRecord record =
     if not record.held then
@@ -515,11 +514,11 @@ fromRecord record =
             Ok uid ->
                 Result.map
                     (\decision -> { uid = uid, bodyHash = record.bodyHash, decision = decision, reviewedAt = record.reviewedAt })
-                    (storedDecision uid record)
+                    (storedDecision record)
 
 
-storedDecision : Uid -> ReviewRecord -> Result Error StoredDecision
-storedDecision uid record =
+storedDecision : ReviewRecord -> Result Error StoredDecision
+storedDecision record =
     if record.decision == "approve" then
         Ok StoredApproved
 
@@ -527,7 +526,7 @@ storedDecision uid record =
         Ok (StoredRefused (storedReason (Maybe.withDefault "" record.reason)))
 
     else
-        Err (Error.unexpected ("review row " ++ Uid.toString uid ++ " holds a decision this reviewer does not know"))
+        Err (Error.unexpected "a review row holds a decision this reviewer does not know")
 
 
 -- A one-row read's row, parsed.
@@ -928,16 +927,11 @@ headMoved =
     Error.conflict "the review log's head moved while a decision was recorded; decide again"
 
 
--- A `uid` column as stored: the signer writes a unit id's text, while the
--- walk reads whatever text the row holds. A type of its own, so the mac
--- input's uid can be neither the link, the body hash nor the decision.
+-- A `uid` column as a read holds it: whatever text the row stores,
+-- unverified, never built from a `Uid`. A type of its own, so it can be
+-- neither the body hash nor the decision.
 type StoredUid
     = StoredUid String
-
-
-storedUid : Uid -> StoredUid
-storedUid uid =
-    StoredUid (Uid.toString uid)
 
 
 storedUidText : StoredUid -> String
@@ -964,14 +958,14 @@ storedIsUnitId stored =
 -- path and line, or a file's path). A NULL reason (`-`) and an empty one
 -- (`+`) differ, and `Index.lengthPrefixed` keeps any two field lists apart,
 -- so no edit of any column keeps the mac.
-macInput : String -> Int -> String -> StoredUid -> String -> String -> Maybe String -> Int -> RecordedName -> String
+macInput : String -> Int -> String -> Uid.MacField -> String -> String -> Maybe String -> Int -> RecordedName -> String
 macInput logId seq prev uid bodyHash decision reason reviewedAt name =
     Index.lengthPrefixed
         ([ "ipe-code-review/review-row/v2"
          , logId
          , String.fromInt seq
          , prev
-         , storedUidText uid
+         , Uid.macFieldText uid
          , bodyHash
          , decision
          , reasonField reason
@@ -988,7 +982,7 @@ rowSignedBy : MacKey -> String -> Int -> String -> StoredUid -> String -> String
 rowSignedBy key logId seq prev uid bodyHash decision reason reviewedAt name macHex =
     case name of
         Named recorded ->
-            signedBy key (macInput logId seq prev uid bodyHash decision reason reviewedAt recorded) macHex
+            signedBy key (macInput logId seq prev (Uid.storedMacField (storedUidText uid)) bodyHash decision reason reviewedAt recorded) macHex
 
         NameMalformed ->
             False
@@ -1751,7 +1745,7 @@ appendDecision key tx head attested decision at =
             Index.chainMac head
 
         mac =
-            ReviewKey.sign key (macInput (Index.chainLogId head) seq prev (storedUid uid) bodyHash decisionText reason at name)
+            ReviewKey.sign key (macInput (Index.chainLogId head) seq prev (Uid.macField uid) bodyHash decisionText reason at name)
 
         next =
             Index.chainNext head mac
