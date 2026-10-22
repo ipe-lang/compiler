@@ -268,10 +268,13 @@ quoteCannotForgeBoundary =
         ]
 
 
--- `spelled` escapes every hazard and every `\`, never `"`, so source text
--- spelling an escape reads apart from the character it names; `render` and
+-- `spelled` escapes every character outside printable ASCII and every `\`,
+-- never `"`, so source text spelling an escape reads apart from the
+-- character it names, and no character drawing like `\` (U+29F5, U+FF3C)
+-- is left raw to make an escape read as source text; `render` and
 -- `renderForeign` keep their own sets. Red if the three sets' arms are
--- swapped or `spelled` stops escaping `\`.
+-- swapped, `spelled` stops escaping `\`, or it leaves a character outside
+-- printable ASCII raw.
 spelledEscapesBackslashNotQuote : Bool
 spelledEscapesBackslashNotQuote =
     let
@@ -286,6 +289,10 @@ spelledEscapesBackslashNotQuote =
         , spelledText "\t" == "\\t"
         , spelledText "\"q\"" == "\"q\""
         , spelledText "a\\nb" /= spelledText "a\nb"
+        , spelledText (codeText 10741) == "\\u{29f5}"
+        , spelledText (codeText 65340) == "\\u{ff3c}"
+        , spelledText (codeText 233 ++ " ~") == "\\u{e9} ~"
+        , List.all (\c -> Char.toCode c >= 32 && Char.toCode c <= 126) (String.toList (spelledText (codeText 10741 ++ codeText 8238 ++ codeText 128512)))
         , rendered "\"" == "\\\""
         , renderedForeign "\\" == "\\"
         , renderedForeign "\"" == "\""

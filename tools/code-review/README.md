@@ -119,10 +119,12 @@ overrides therefore shows each one as `\u{202e}`-style text instead of
 rendering reordered (Trojan Source). `\` and `"` are shown as written.
 
 A unit too large to draw with each escape marked is shown spelled out
-instead, one block of plain text where every `\` of the source is doubled,
-so the display stays exact: `\\` is one `\` of the source, `\u{202e}` is a
-character it holds, and a line `\…` stands for lines reviewed as their own
-units. A unit is never withheld for its escapes.
+instead, one block of plain text where every `\` of the source is doubled
+and every character outside printable ASCII but a tab is escaped, so the
+display stays exact and no character can pass for the `\` of an escape:
+`\\` is one `\` of the source, `\r` and `\u{202e}` are characters it
+holds, and a line `\…` stands for lines reviewed as their own units. A
+unit is never withheld for its escapes.
 
 A refusal needs a reason of at most 500 characters; a blank or longer one is
 refused before anything is saved. A stored refusal whose reason breaks that

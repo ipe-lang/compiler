@@ -627,8 +627,9 @@ sameColourTokensShareOneElement =
 
 -- Rows a spelled drawing must keep apart: an ASCII `\u{200b}` and a real
 -- U+200B, a doubled backslash, a source line spelling the gap text and one
--- holding only `…`, quotes, tabs, a `\r` inside a shell line, and the
--- characters the markup escapes.
+-- holding only `…`, quotes, tabs, a `\r` inside a shell line, the
+-- characters the markup escapes, and characters drawing like `\` (U+29F5,
+-- U+FF3C) before a real U+202E, before `…`, and before an ASCII escape.
 hostileRows : List (List SourceRow)
 hostileRows =
     [ [ Numbered 1 "\\u{200b}" ]
@@ -640,6 +641,8 @@ hostileRows =
     , [ Numbered 1 "cd /x\ry", Numbered 2 "cd /z\r" ]
     , [ Numbered 1 "'<&>' &amp; &#39;" ]
     , [ Numbered 1 ("\\n" ++ "\n" ++ "\\u{" ++ codeText 8238 ++ "}") ]
+    , [ Numbered 1 ("s = \"" ++ codeText 10741 ++ codeText 8238 ++ "\"") ]
+    , [ Numbered 1 (codeText 10741 ++ "…"), Covered, Numbered 3 (codeText 65340 ++ "u{202e} ção") ]
     ]
 
 
@@ -788,18 +791,24 @@ spelledIsInjective =
 
 
 -- A spelled drawing's markup holds no display hazard but the newlines that
--- join its lines and the tabs it keeps, and its code block draws in byte
--- order. Red if the spelled builder bypasses `SafeText.spelled`, or the
--- block loses `displayOrderCss`.
+-- join its lines and the tabs it keeps, every line of its text but the gap
+-- text is printable ASCII and tabs, so no source character draws like the
+-- `\` of an escape, and its code block draws in byte order. Red if the
+-- spelled builder bypasses `SafeText.spelled`, `spelled` leaves a character
+-- outside printable ASCII raw, or the block loses `displayOrderCss`.
 spelledDrawsNoRawHazard : Bool
 spelledDrawsNoRawHazard =
     let
+        asciiLine line =
+            line == Drawn.spelledGapText || List.all (\c -> c == '\t' || (Char.toCode c >= 32 && Char.toCode c <= 126)) (String.toList line)
+
         clean lang rows =
             let
                 html =
                     Html.render (View.drawnHtml (Drawn.spelled lang rows))
             in
             List.all (\c -> c == '\n' || c == '\t' || not (SafeText.isHazard c)) (String.toList html)
+                && List.all asciiLine (String.split "\n" (spelledCodeText (Drawn.spelled lang rows)))
                 && String.startsWith ("<code style=\"" ++ View.codeCss ++ ";") (codeOf (Drawn.spelled lang rows))
     in
     List.all (\lang -> List.all (clean lang) (drawnFixtures ++ hostileRows)) [ Rust, Ipe, Shell, Unknown ]

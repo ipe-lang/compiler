@@ -21,9 +21,11 @@ module Lib.SafeText exposing (SafeText, Segment(..), concat, escapeSpelling, isH
 -- quotes. With `\` escaped the mapping stays injective. `renderForeign` leaves
 -- `\` and `"` alone: it is the sink-side pass over text that may already be
 -- rendered, where doubling every `\` again would garble it. `spelled`
--- escapes the hazards and `\` but not `"`: it is for source text spelled out
--- in a code block, where no quote delimits it and `\` alone keeps the
--- mapping injective.
+-- escapes every character outside printable ASCII and `\`, but not `"`: it
+-- is for source text spelled out in a code block, where no element marks an
+-- escape, no quote delimits the text, and `\` alone keeps the mapping
+-- injective. Its output is printable ASCII, so no character can draw like
+-- a `\` (U+29F5, U+FF3C) and make an escape read as source text.
 --
 -- A `SafeText` is a list of `Segment`s, so each escape the tool writes keeps
 -- its role: `Verbatim` is text exactly as it arrived, `Escaped` a character
@@ -130,11 +132,13 @@ renderForeign raw =
     SafeText (escapeWith Hazards raw)
 
 
--- Untrusted source text spelled out: every hazard and every `\` escaped, `"`
--- kept as is. Each escape starts with `\`, so no source text spells another.
+-- Untrusted source text spelled out: every character outside printable
+-- ASCII and every `\` escaped, `"` kept as is. Each escape starts with `\`,
+-- so no source text spells another, and the text is printable ASCII, so no
+-- source character draws like the `\` that starts one.
 spelled : String -> SafeText
 spelled raw =
-    SafeText (escapeWith HazardsBackslash raw)
+    SafeText (escapeWith NonAsciiBackslash raw)
 
 
 -- Untrusted text rendered and wrapped in double quotes, the form a diagnostic
@@ -231,11 +235,18 @@ verbatim text =
         [ Verbatim text ]
 
 
--- Which characters a rendering escapes beyond the hazards.
+-- Which characters a rendering escapes: the hazards; every character
+-- outside printable ASCII, which holds every hazard, and `\`; or the
+-- hazards, `\` and `"`.
 type EscapeSet
     = Hazards
-    | HazardsBackslash
+    | NonAsciiBackslash
     | HazardsBackslashQuote
+
+
+isPrintableAscii : Char -> Bool
+isPrintableAscii c =
+    Char.toCode c >= 32 && Char.toCode c <= 126
 
 
 needsEscape : EscapeSet -> Char -> Bool
@@ -244,8 +255,8 @@ needsEscape escapes c =
         Hazards ->
             isHazard c
 
-        HazardsBackslash ->
-            isHazard c || c == '\\'
+        NonAsciiBackslash ->
+            not (isPrintableAscii c) || c == '\\'
 
         HazardsBackslashQuote ->
             isHazard c || c == '\\' || c == '"'

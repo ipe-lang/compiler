@@ -1274,7 +1274,7 @@ modeNote drawnMode =
             [ Ui.el [ Font.size 12, Font.color (Ui.rgb 150 150 165) ] (Ui.text "Shown without highlighting: highlighted, this unit would draw past the review ceiling.") ]
 
         SpelledOut ->
-            [ Ui.el [ Font.size 12, Font.color (Ui.rgb 150 150 165) ] (Ui.text "Shown spelled out: with each escape marked, this unit would draw past the review ceiling. Here \\\\ is one \\ of the source, \\n, \\r, \\t and \\u{…} are characters the source holds, and a line \\… stands for lines reviewed as their own units.") ]
+            [ Ui.el [ Font.size 12, Font.color (Ui.rgb 150 150 165) ] (Ui.text "Shown spelled out: with each escape marked, this unit would draw past the review ceiling. Here \\\\ is one \\ of the source, \\r and \\u{…} are characters the source holds (every character outside printable ASCII but a tab is spelled so), and a line \\… stands for lines reviewed as their own units.") ]
 
 
 layoutNoteEl : LayoutNote -> Ui.Element Msg

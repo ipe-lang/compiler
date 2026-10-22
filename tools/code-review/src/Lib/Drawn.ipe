@@ -69,8 +69,9 @@ type Hue
 
 
 -- Text drawn as itself, or a run of escaped characters drawn as their
--- escapes: display hazards, and in a spelled drawing `\` too. No two `Chars` or two `Escapes` are adjacent, and a
--- `Chars` is never empty.
+-- escapes: display hazards, and in a spelled drawing `\` and every other
+-- character outside printable ASCII. No two `Chars` or two `Escapes` are
+-- adjacent, and a `Chars` is never empty.
 type Piece
     = Chars String
     | Escapes (List Char)
