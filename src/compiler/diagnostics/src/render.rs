@@ -32,13 +32,14 @@ use core::fmt::Write as _;
 use crate::code::{Severity, issue_tracker_url, title};
 use crate::diagnostic::{
     AppShape, Applicability, CaseDefect, CodecAutoRejection, ConsentError, Diagnostic, Expected,
-    ExpectedSet, ExposingDefect, Feature, FfiError, GenericAppEntryReach, HeaderDefect, HelpLine,
-    Hint, IfDefect, ImportedAs, LetDefect, LowerError, MountPrefixFault, NameError, ParseError,
-    RoutePatternDefect, SandboxError, SealRejection, SpanRole, StoreEqAccessorDefect,
-    StoreSelectProjectionDefect, Suggestion, TokenKind, TyDoc, TypeDeclDefect, TypeError,
-    WildcardDependence, intercept_context_phrase,
+    ExpectedSet, ExposingDefect, Feature, FfiError, GenericAppEntryReach, HazardRefusal,
+    HeaderDefect, HelpLine, Hint, IfDefect, ImportedAs, LetDefect, LowerError, MountPrefixFault,
+    NameError, ParseError, RoutePatternDefect, SandboxError, SealRejection, SpanRole,
+    StoreEqAccessorDefect, StoreSelectProjectionDefect, Suggestion, TokenKind, TyDoc,
+    TypeDeclDefect, TypeError, WildcardDependence, intercept_context_phrase,
 };
 use crate::span::Span;
+use crate::terminal::BIDI_ISOLATE_CLOSER;
 
 // ANSI escape sequences. Colour only ever *wraps* text, so stripping these
 // yields byte-identical output to the plain (non-tty / `NO_COLOR`) path.
@@ -430,8 +431,48 @@ fn parse_prose(msg: &ParseError) -> String {
         | ParseError::MalformedChar
         | ParseError::UnterminatedBlockComment
         | ParseError::SourceTooLarge { .. }
-        | ParseError::LoneCarriageReturn => lexical_prose(msg),
+        | ParseError::LoneCarriageReturn
+        | ParseError::SourceDisplayHazard { .. } => lexical_prose(msg),
         ParseError::Unexpected => "I couldn't make sense of this part of the file.".to_string(),
+    }
+}
+
+/// The prose band for a source display hazard: what the character does, and why here.
+fn display_hazard_prose(ch: char, refusal: HazardRefusal) -> String {
+    let ch = char_repr(ch);
+    let closer = char_repr(BIDI_ISOLATE_CLOSER);
+    match refusal {
+        HazardRefusal::Anywhere => format!(
+            "The invisible character {ch} makes a viewer break the line or reorder the text \
+             around it, and I do not, so this file would read differently to you and to me. \
+             It is refused anywhere in a source file."
+        ),
+        HazardRefusal::OutsideLiteral => format!(
+            "The invisible character {ch} makes a viewer break the line or reorder the text \
+             around it, and I do not, so this file would read differently to you and to me. \
+             Only a string or character literal may hold it."
+        ),
+        HazardRefusal::UnclosedIsolate => format!(
+            "The bidirectional isolate {ch} is not closed by {closer} before its literal or \
+             line ends, so a viewer would reorder the text that follows it."
+        ),
+        HazardRefusal::UnopenedIsolate => format!(
+            "This {ch} closes no bidirectional isolate opened before it in its literal and \
+             line, so a viewer would reorder the text around it."
+        ),
+    }
+}
+
+/// The primary label for a source display hazard.
+fn display_hazard_label(ch: char, refusal: HazardRefusal) -> String {
+    let ch = char_repr(ch);
+    match refusal {
+        HazardRefusal::Anywhere => format!("{ch} is refused anywhere in source"),
+        HazardRefusal::OutsideLiteral => format!("{ch} may stand only inside a literal"),
+        HazardRefusal::UnclosedIsolate => {
+            format!("{ch} is never closed by {}", char_repr(BIDI_ISOLATE_CLOSER))
+        }
+        HazardRefusal::UnopenedIsolate => format!("this {ch} closes no isolate"),
     }
 }
 
@@ -474,6 +515,7 @@ fn lexical_prose(msg: &ParseError) -> String {
              to you and to me."
                 .to_string()
         }
+        ParseError::SourceDisplayHazard { ch, refusal } => display_hazard_prose(*ch, *refusal),
         // A grammar defect: `parse_prose` answers each of these in its own arm.
         ParseError::Unexpected
         | ParseError::TooDeep
@@ -1549,6 +1591,9 @@ fn parse_label(msg: &ParseError) -> Option<String> {
         }
         ParseError::LoneCarriageReturn => {
             Some("a `\\r` here must be followed by `\\n`".to_string())
+        }
+        ParseError::SourceDisplayHazard { ch, refusal } => {
+            Some(display_hazard_label(*ch, *refusal))
         }
         ParseError::AnnotationWithoutBinding { .. } => {
             Some("this annotation has no matching definition".to_string())
@@ -3954,6 +3999,10 @@ mod tests {
             ParseError::UnterminatedBlockComment,
             ParseError::SourceTooLarge { bytes: 1 },
             ParseError::LoneCarriageReturn,
+            ParseError::SourceDisplayHazard {
+                ch: '\u{2028}',
+                refusal: HazardRefusal::OutsideLiteral,
+            },
         ];
         for msg in &lexical {
             assert_ne!(parse_prose(msg), fallback, "{msg:?}");
@@ -3962,5 +4011,32 @@ mod tests {
             parse_prose(&ParseError::LoneCarriageReturn).contains("carriage return"),
             "the lone `\\r` prose names the byte"
         );
+    }
+
+    /// A source display hazard's prose and label name it by code point, never raw.
+    ///
+    /// The raw character would break or reorder the very line that reports it.
+    #[test]
+    fn a_display_hazard_is_named_by_its_code_point() {
+        let refusals = [
+            HazardRefusal::Anywhere,
+            HazardRefusal::OutsideLiteral,
+            HazardRefusal::UnclosedIsolate,
+            HazardRefusal::UnopenedIsolate,
+        ];
+        for (range, _) in crate::terminal::SOURCE_DISPLAY_HAZARDS {
+            for ch in range.clone() {
+                let code = format!("U+{:04X}", u32::from(ch));
+                for refusal in refusals {
+                    let msg = ParseError::SourceDisplayHazard { ch, refusal };
+                    let prose = parse_prose(&msg);
+                    let label = parse_label(&msg).unwrap_or_default();
+                    for text in [&prose, &label] {
+                        assert!(text.contains(&code), "{text:?} names {code}");
+                        assert!(!text.contains(ch), "{text:?} carries {code} raw");
+                    }
+                }
+            }
+        }
     }
 }
