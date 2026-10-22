@@ -156,6 +156,35 @@ struct ClientEntry {
     // close request can never strand an open socket. See send_cmd.
     writer_abort: tokio::task::AbortHandle,
     reader_abort: tokio::task::AbortHandle,
+    /// The message ceiling the socket was opened under; an outbound payload
+    /// past it is refused before it is queued.
+    ceiling: usize,
+}
+
+/// Why `send_cmd` did not queue a command.
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SendRefusal {
+    /// No open socket has this id.
+    NoSocket,
+    /// The outbound queue is full: the peer is not reading.
+    QueueFull,
+    /// The payload is larger than the socket's message ceiling.
+    TooLarge { len: usize, ceiling: usize },
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl SendRefusal {
+    /// This refusal as the error of the `op` kernel on socket `id`.
+    fn into_error<E: From<String> + FromLimitExceeded>(self, op: &str, id: i64) -> E {
+        match self {
+            Self::NoSocket => format!("{op}: no socket {id}").into(),
+            Self::QueueFull => format!("{op}: socket {id} outbound queue is full").into(),
+            Self::TooLarge { len, ceiling } => E::from_limit_exceeded(format!(
+                "{op}: message of {len} bytes exceeds the {ceiling}-byte limit"
+            )),
+        }
+    }
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -546,35 +575,35 @@ async fn open_over(
     tcp: tokio::net::TcpStream,
     transport: Transport,
     req: tokio_tungstenite::tungstenite::handshake::client::Request,
-    config: tokio_tungstenite::tungstenite::protocol::WebSocketConfig,
+    ceiling: usize,
     ping_interval_ms: i64,
 ) -> Result<i64, WsFailure> {
     match transport {
-        Transport::Plain => open_socket(req, tcp, config, ping_interval_ms).await,
-        Transport::Tls { name, config: tls } => {
-            let stream = tls_handshake(tcp, name, tls).await?;
-            open_socket(req, stream, config, ping_interval_ms).await
+        Transport::Plain => open_socket(req, tcp, ceiling, ping_interval_ms).await,
+        Transport::Tls { name, config } => {
+            let stream = tls_handshake(tcp, name, config).await?;
+            open_socket(req, stream, ceiling, ping_interval_ms).await
         }
     }
 }
 
-/// Run the WebSocket handshake for `req` over `stream`, then start the socket;
-/// returns its id.
+/// Run the WebSocket handshake for `req` over `stream` with messages capped at
+/// `ceiling`, then start the socket; returns its id.
 #[cfg(not(target_arch = "wasm32"))]
 async fn open_socket<S>(
     req: tokio_tungstenite::tungstenite::handshake::client::Request,
     stream: S,
-    config: tokio_tungstenite::tungstenite::protocol::WebSocketConfig,
+    ceiling: usize,
     ping_interval_ms: i64,
 ) -> Result<i64, WsFailure>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
     let (socket, _response) =
-        tokio_tungstenite::client_async_with_config(req, stream, Some(config))
+        tokio_tungstenite::client_async_with_config(req, stream, Some(ws_config(ceiling)))
             .await
             .map_err(|e| WsFailure::of(&e))?;
-    Ok(start_socket(socket, ping_interval_ms))
+    Ok(start_socket(socket, ceiling, ping_interval_ms))
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -686,13 +715,12 @@ async fn do_connect<E: From<String> + FromLimitExceeded + Send + 'static>(
     } else {
         30_000
     };
-    let config = ws_config(max_msg);
     let opening = async move {
         let (addrs, dial_failure) = dial_addrs(target).await?;
         let tcp = tokio::net::TcpStream::connect(addrs.as_slice())
             .await
             .map_err(|e| dial_failure(e.kind()))?;
-        open_over(tcp, transport, req, config, ping_interval_ms).await
+        open_over(tcp, transport, req, max_msg, ping_interval_ms).await
     };
     match tokio::time::timeout(std::time::Duration::from_millis(to_ms), opening).await {
         Ok(Ok(id)) => ok_res(id),
@@ -709,10 +737,14 @@ async fn do_connect<E: From<String> + FromLimitExceeded + Send + 'static>(
     }
 }
 
-/// Start the reader and writer tasks of an open `socket` and register it;
-/// returns its id.
+/// Start the reader and writer tasks of an open `socket` whose messages are
+/// capped at `ceiling`, and register it; returns its id.
 #[cfg(not(target_arch = "wasm32"))]
-fn start_socket<S>(socket: tokio_tungstenite::WebSocketStream<S>, ping_interval_ms: i64) -> i64
+fn start_socket<S>(
+    socket: tokio_tungstenite::WebSocketStream<S>,
+    ceiling: usize,
+    ping_interval_ms: i64,
+) -> i64
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
@@ -814,6 +846,7 @@ where
             frames_tx,
             writer_abort,
             reader_abort,
+            ceiling,
         },
     );
     id
@@ -844,7 +877,7 @@ pub fn web_socket_connect_with<E: From<String> + FromLimitExceeded + Send + 'sta
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-fn send_cmd(id: i64, cmd: WsCmd) -> bool {
+fn send_cmd(id: i64, cmd: WsCmd) -> Result<(), SendRefusal> {
     let is_close = matches!(cmd, WsCmd::Close | WsCmd::CloseWithCode(..));
     // Clone what we need, then RELEASE the registry lock before try_send / abort /
     // deregister (deregister re-locks the registry — holding it here would deadlock).
@@ -856,17 +889,23 @@ fn send_cmd(id: i64, cmd: WsCmd) -> bool {
                 e.frames_tx.clone(),
                 e.writer_abort.clone(),
                 e.reader_abort.clone(),
+                e.ceiling,
             )
         })
     };
-    let (tx, frames, writer_abort, reader_abort) = match handles {
-        Some(h) => h,
-        None => return false,
+    let (tx, frames, writer_abort, reader_abort, ceiling) = handles.ok_or(SendRefusal::NoSocket)?;
+    let len = match &cmd {
+        WsCmd::Text(text) => text.len(),
+        WsCmd::Binary(bytes) => bytes.len(),
+        WsCmd::Close | WsCmd::CloseWithCode(..) => 0,
     };
+    if len > ceiling {
+        return Err(SendRefusal::TooLarge { len, ceiling });
+    }
     match tx.try_send(cmd) {
-        Ok(()) => true,
+        Ok(()) => Ok(()),
         Err(_) => {
-            // Queue full. For a non-close command we drop it (caller sees false).
+            // Queue full. A non-close command is dropped and refused.
             // For a Close, the full queue means the writer is wedged on a stalled
             // peer, so a queued Close would never be sent — guarantee teardown by
             // aborting BOTH halves (drops the split stream → the connection
@@ -876,9 +915,9 @@ fn send_cmd(id: i64, cmd: WsCmd) -> bool {
                 reader_abort.abort();
                 let _ = frames.send(WsEvent::Closed(1000));
                 deregister(id);
-                true
+                Ok(())
             } else {
-                false
+                Err(SendRefusal::QueueFull)
             }
         }
     }
@@ -886,27 +925,28 @@ fn send_cmd(id: i64, cmd: WsCmd) -> bool {
 
 /// WebSocket.send : Int -> String -> Task Error ()
 #[cfg(not(target_arch = "wasm32"))]
-pub fn web_socket_send<E: From<String> + Send + 'static>(id: i64, msg: String) -> IpeTask<E, ()> {
+pub fn web_socket_send<E: From<String> + FromLimitExceeded + Send + 'static>(
+    id: i64,
+    msg: String,
+) -> IpeTask<E, ()> {
     Box::pin(async move {
-        if send_cmd(id, WsCmd::Text(msg)) {
-            ok_res(())
-        } else {
-            IpeResult::Err(format!("WebSocket.send: no socket {}", id).into())
+        match send_cmd(id, WsCmd::Text(msg)) {
+            Ok(()) => ok_res(()),
+            Err(refusal) => IpeResult::Err(refusal.into_error("WebSocket.send", id)),
         }
     })
 }
 
 /// WebSocket.sendBinary : Int -> Bytes -> Task Error ()
 #[cfg(not(target_arch = "wasm32"))]
-pub fn web_socket_send_binary<E: From<String> + Send + 'static>(
+pub fn web_socket_send_binary<E: From<String> + FromLimitExceeded + Send + 'static>(
     id: i64,
     msg: Vec<u8>,
 ) -> IpeTask<E, ()> {
     Box::pin(async move {
-        if send_cmd(id, WsCmd::Binary(msg)) {
-            ok_res(())
-        } else {
-            IpeResult::Err(format!("WebSocket.sendBinary: no socket {}", id).into())
+        match send_cmd(id, WsCmd::Binary(msg)) {
+            Ok(()) => ok_res(()),
+            Err(refusal) => IpeResult::Err(refusal.into_error("WebSocket.sendBinary", id)),
         }
     })
 }
@@ -1497,6 +1537,64 @@ mod tests {
         }
     }
 
+    /// An outbound payload past the socket's ceiling is a `LimitExceeded`
+    /// refusal and is never queued; one at the ceiling is queued, and a full
+    /// queue or an unknown id is refused by name.
+    #[tokio::test]
+    async fn an_outbound_message_past_the_ceiling_is_refused_before_queueing() {
+        let id = WS_CLIENT_NEXT_ID.fetch_add(1, Ordering::Relaxed);
+        let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::channel::<WsCmd>(1);
+        let (frames_tx, _) = tokio::sync::broadcast::channel::<WsEvent>(8);
+        let writer = tokio::spawn(std::future::pending::<()>());
+        let reader = tokio::spawn(std::future::pending::<()>());
+        registry().lock().unwrap_or_else(|e| e.into_inner()).insert(
+            id,
+            ClientEntry {
+                cmd_tx,
+                frames_tx,
+                writer_abort: writer.abort_handle(),
+                reader_abort: reader.abort_handle(),
+                ceiling: 4,
+            },
+        );
+
+        assert_eq!(
+            web_socket_send::<IpeError>(id, "12345".to_owned()).await,
+            IpeResult::Err(IpeError::limit_exceeded(
+                "WebSocket.send: message of 5 bytes exceeds the 4-byte limit"
+            ))
+        );
+        assert_eq!(
+            web_socket_send_binary::<IpeError>(id, vec![0; 5]).await,
+            IpeResult::Err(IpeError::limit_exceeded(
+                "WebSocket.sendBinary: message of 5 bytes exceeds the 4-byte limit"
+            ))
+        );
+        assert!(cmd_rx.try_recv().is_err(), "a refused payload was queued");
+
+        assert_eq!(
+            web_socket_send::<IpeError>(id, "1234".to_owned()).await,
+            ok_res(())
+        );
+        assert_eq!(
+            web_socket_send_binary::<IpeError>(id, vec![0; 4]).await,
+            IpeResult::Err(IpeError::unexpected(format!(
+                "WebSocket.sendBinary: socket {id} outbound queue is full"
+            )))
+        );
+        assert!(matches!(cmd_rx.try_recv(), Ok(WsCmd::Text(t)) if t == "1234"));
+
+        deregister(id);
+        writer.abort();
+        reader.abort();
+        assert_eq!(
+            web_socket_send::<IpeError>(id, String::new()).await,
+            IpeResult::Err(IpeError::unexpected(format!(
+                "WebSocket.send: no socket {id}"
+            )))
+        );
+    }
+
     /// The `onMessage` listener started by the first subscribe keeps running
     /// when the loop re-evaluates its subscriptions, and a re-subscribe starts
     /// no second listener.
@@ -1515,6 +1613,7 @@ mod tests {
                 frames_tx: frames_tx.clone(),
                 writer_abort: writer.abort_handle(),
                 reader_abort: reader.abort_handle(),
+                ceiling: 1024,
             },
         );
 
