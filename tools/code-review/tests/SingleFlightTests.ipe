@@ -7,20 +7,22 @@ import Ipe.Io as Io
 import Ipe.List as List
 import Ipe.Maybe as Maybe
 import Ipe.String as String
+import Ipe.System as System
 import Ipe.Task as Task
 import Ipe.Ui as Ui
-import Lib.App as App exposing (DecisionTarget(..), Model, Msg(..), Page(..))
+import Lib.App as App exposing (Model, Msg(..), Page(..))
 import Lib.Db as LibDb exposing (Decision(..))
 import Lib.Epoch as Epoch exposing (Epoch)
 import Lib.Failure as Failure exposing (DecideRefusal(..), LoadFailure(..), ReasonRefusal(..), RefuseFailure(..), SaveFailure(..))
-import Lib.Index as Index exposing (Change(..), RefusalReason(..))
-import Lib.Queue as Queue exposing (DecisionSlot(..), HistoryState(..), QueueState(..), SelectedView(..), StandingRead(..), UnitPageState(..))
+import Lib.Index as Index exposing (Change(..), RefusalReason(..), SourceView(..), StaleReason(..))
+import Lib.Keys as Keys
+import Lib.Queue as Queue exposing (DecisionSlot(..), DecisionTarget(..), HistoryState(..), QueueState(..), RefusalPanel(..), SelectedView(..), StandingRead(..), UnitPageState(..))
 import Lib.ReviewKey as ReviewKey exposing (ReviewKey(..))
 import Lib.SafeText as SafeText
 import Lib.Settings as Settings
 import Lib.Uid as Uid exposing (Uid)
 import Lib.View as View
-import TestSupport exposing (check, checkReporting, cleanupIndex, decideNow, envAppSettings, freshScratch, loadUnitNow, migratedReviewAt, refusalOf, removeFileIfAny, seedIndex, testMacKey, uid, labelOf, labelText)
+import TestSupport exposing (check, checkReporting, cleanupIndex, decideNow, envAppSettings, execIndex, freshScratch, loadPageNow, loadUnitNow, migratedReviewAt, refusalOf, removeFileIfAny, seedIndex, testMacKey, uid, labelOf, labelText)
 
 
 -- Every check drives the app's own `App.update`, the dispatch `src/Main.ipe`
@@ -203,7 +205,7 @@ oneReadSlotAcrossPages settings a b =
     inFlight onUnitPage == Just ( ua, Just ub )
         && inFlight keysOnUnitPage == Just ( ua, Just ub )
         && keysOnUnitPage.selected == 0
-        && keysOnUnitPage.decision == DecisionIdle
+        && keysOnUnitPage.decision == DecisionIdle PanelClosed
         && inFlight unitReading == Just ( ub, Nothing )
         && inFlight queueLoaded == Just ( ub, Just ua )
 
@@ -260,9 +262,10 @@ unitPageSettlesOnItsOwnRead settings a b =
 
 -- One decision is in flight per session: a decision asked, by button or key,
 -- while one is saving starts nothing and leaves the saving one's pending
--- state; one asked by refusal says why and keeps the draft. A save that
--- failed leaves its notice, and the next decision starts and drops it. Red
--- if a second decision, with its source re-read, starts beside the first.
+-- state; a refusal asked then opens no panel, so no draft can be submitted.
+-- A save that failed leaves its notice, and the next decision starts and
+-- drops it. Red if a second decision, with its source re-read, starts beside
+-- the first.
 decisionsSingleFlight : Settings.AppSettings -> Index.UnitView -> Index.UnitView -> Bool
 decisionsSingleFlight settings a b =
     let
@@ -279,7 +282,7 @@ decisionsSingleFlight settings a b =
             after settings [ ApproveUnit ua, KeyDown "a" ] saving
 
         refusing =
-            after settings [ RefuseStart ua, RefuseDraft "needs a test", RefuseSubmit ua ] saving
+            after settings [ RefuseStart ua, RefuseDraft ua "needs a test", RefuseSubmit ua ] saving
 
         settled =
             after settings [ App.decisionSaved ua settings.epoch (Err (Error.conflict "boom")) ] pressedAgain
@@ -294,12 +297,290 @@ decisionsSingleFlight settings a b =
         && saving.decision == DecisionSaving ua settings.epoch
         && pressedAgain.decision == DecisionSaving ua settings.epoch
         && refusing.decision == DecisionSaving ua settings.epoch
-        && refusing.refuseError == Just DraftWhileSaving
-        && refusing.refusingUid == Just ua
-        && refusing.refuseDraft == "needs a test"
+        && Queue.openPanel refusing.decision == Nothing
         && Queue.notSavedOf settled.decision == Just SaveFailed
         && next.decision == DecisionSaving ua settings.epoch
         && lateOther.decision == DecisionSaving ua settings.epoch
+
+
+-- The refusal panel opens only on an idle slot, through the busy check a
+-- decision start makes: a refusal asked by key or button while a decision
+-- is saving leaves the slot as it was, and the rows show the pending state
+-- alone, with no reason field or Confirm. A cancel while busy leaves the
+-- busy decision. A decision started in another tab closes an open panel; an
+-- approval of a row the page offers no decision on is refused before it
+-- takes the slot and keeps the panel and its draft; a submit for a row the
+-- panel is not open on decides nothing and keeps the draft; a queue load
+-- closes the panel. Red if a panel can be open beside a busy decision, or a
+-- click or submit for a row other than the panel's discards its draft.
+refusalPanelLivesInIdleSlot : Settings.AppSettings -> Index.UnitView -> Index.UnitView -> Bool
+refusalPanelLivesInIdleSlot settings a b =
+    let
+        ua =
+            a.unit.uid
+
+        ub =
+            b.unit.uid
+
+        shown =
+            queueModel [ a, b ] (ViewShown a)
+
+        saving =
+            after settings [ ApproveUnit ua ] shown
+
+        keyed =
+            after settings [ KeyDown "r" ] saving
+
+        cancelled =
+            after settings [ RefuseCancel, KeyDown "Escape" ] saving
+
+        secondShown =
+            { shown | selected = 1, selectedView = ViewShown b }
+
+        otherSaving =
+            { secondShown | decision = DecisionSaving ua settings.epoch }
+
+        otherRefused =
+            after settings [ RefuseStart ub ] otherSaving
+
+        opened =
+            after settings [ RefuseStart ua, RefuseDraft ua "needs a test" ] shown
+
+        draft =
+            { refuseDraft = "needs a test", refuseError = Nothing }
+
+        elsewhere =
+            after settings [ ApproveUnit ub ] opened
+
+        strayUnit =
+            after settings [ RefuseSubmit ub ] opened
+
+        strayFile =
+            after settings [ RefuseRefusalSubmit ub ] opened
+
+        reloading =
+            after settings [ Navigated QueuePage ] opened
+
+        reloaded =
+            after settings [ PendingLoaded reloading.queueLoad (Ok (queuePageOf [ a, b ])) ] reloading
+    in
+    Keys.label (Keys.keyAction (Queue.openPanel saving.decision /= Nothing) 2 0 "r") == "refuse"
+        && keyed == saving
+        && keyed.decision == DecisionSaving ua settings.epoch
+        && String.contains "Saving the decision…" (page keyed)
+        && not (panelDrawn (page keyed))
+        && cancelled.decision == DecisionSaving ua settings.epoch
+        && otherRefused == otherSaving
+        && String.contains "Another decision is saving…" (page otherRefused)
+        && not (panelDrawn (page otherRefused))
+        && Queue.openPanel opened.decision == Just ( ua, draft )
+        && panelDrawn (page opened)
+        && Queue.notSavedOf elsewhere.decision == Just (SaveRefused SourceNotShown)
+        && Queue.openPanel elsewhere.decision == Just ( ua, draft )
+        && strayUnit == opened
+        && strayFile == opened
+        && Queue.openPanel reloading.decision == Just ( ua, draft )
+        && Queue.openPanel reloaded.decision == Nothing
+
+
+-- The refusal panel opens only on a row the shown page draws decision
+-- controls for, and stays open only while it is drawn: a refusal asked by
+-- key or button on a withheld card, on a page whose log is broken, on a
+-- uid the page does not list, on a listed unit off the card, or on a file
+-- no decision binds leaves the model as it was, and the next key still
+-- moves the selection. Selecting another card, moving to the next page,
+-- leaving for History, and a source read that settles the card withheld
+-- each close the panel, while the same read settling it shown keeps it. A
+-- submit for another row or another target, and a draft edit for another
+-- row, leave the open panel and its draft as they were. Red if a panel can
+-- be open on a row the page does not draw, or a message for one row's panel
+-- acts on another's.
+refusalPanelOnlyOnOfferedRow : Settings.AppSettings -> Index.UnitView -> Index.UnitView -> Bool
+refusalPanelOnlyOnOfferedRow settings a b =
+    let
+        ua =
+            a.unit.uid
+
+        ub =
+            b.unit.uid
+
+        shown =
+            queueModel [ a, b ] (ViewShown a)
+
+        withheld =
+            queueModel [ a, b ] (ViewShown { a | view = Stale Drifted })
+
+        withheldKeyed =
+            after settings [ KeyDown "r" ] withheld
+
+        brokenPage =
+            queuePageOf [ a, b ]
+
+        broken =
+            { shown | queueState = Loaded { brokenPage | log = LibDb.ShownBroken (LibDb.BreaksAt 2) } }
+
+        brokenKeyed =
+            after settings [ KeyDown "r" ] broken
+
+        blocking =
+            withRefusal blockingRow shown
+
+        opened =
+            after settings [ RefuseStart ua ] shown
+
+        drafted =
+            after settings [ RefuseDraft ua "needs a test" ] opened
+
+        movedAway =
+            after settings [ SelectUnit 1 ] drafted
+
+        nextPage =
+            after settings [ NextPage Index.Start ] drafted
+
+        toHistory =
+            after settings [ ShowHistory ] drafted
+
+        reading =
+            { drafted | selectedView = ViewLoading { uid = ua, wanted = Nothing, fresh = True, owner = settings.epoch } }
+
+        readWithheld =
+            after settings [ SelectedViewLoaded ua settings.epoch (Ok (Just { a | view = Stale Drifted })) ] reading
+
+        readShown =
+            after settings [ SelectedViewLoaded ua settings.epoch (Ok (Just a)) ] reading
+    in
+    withheldKeyed == withheld
+        && after settings [ RefuseStart ua ] withheld == withheld
+        && (after settings [ KeyDown "j" ] withheldKeyed).selected == 1
+        && brokenKeyed == broken
+        && after settings [ RefuseStart ua ] broken == broken
+        && (after settings [ KeyDown "j" ] brokenKeyed).selected == 1
+        && after settings [ RefuseStart (uid "u-unlisted") ] shown == shown
+        && after settings [ RefuseStart ub ] shown == shown
+        && after settings [ RefuseStart (uid "r-blocking") ] blocking == blocking
+        && Queue.openPanel opened.decision == Just ( ua, { refuseDraft = "", refuseError = Nothing } )
+        && Queue.openPanel drafted.decision == Just ( ua, { refuseDraft = "needs a test", refuseError = Nothing } )
+        && movedAway.selected == 1
+        && Queue.openPanel movedAway.decision == Nothing
+        && nextPage.queueState == Loading
+        && Queue.openPanel nextPage.decision == Nothing
+        && toHistory.page == HistoryPage
+        && Queue.openPanel toHistory.decision == Nothing
+        && Queue.openPanel reading.decision /= Nothing
+        && Queue.decidableSource ua readWithheld.selectedView == Nothing
+        && Queue.openPanel readWithheld.decision == Nothing
+        && Queue.openPanel readShown.decision == Just ( ua, { refuseDraft = "needs a test", refuseError = Nothing } )
+        && after settings [ RefuseSubmit ub ] drafted == drafted
+        && after settings [ RefuseRefusalSubmit ua ] drafted == drafted
+        && after settings [ RefuseDraft ub "elsewhere" ] drafted == drafted
+
+
+-- Whether a rendered page draws the refusal panel's reason field or Confirm.
+panelDrawn : String -> Bool
+panelDrawn html =
+    String.contains "Why refuse?" html || String.contains ">Confirm<" html
+
+
+-- A decision asked on a row the page offers no decision on, by the same
+-- predicate the view draws the row's controls by, is refused before it
+-- takes the slot, with the notice saying why: an approval of a listed unit
+-- off the card while the panel is open on the card, an acknowledgement of
+-- a unit or of a file no decision binds, an approval of a uid the page does
+-- not list, the approve key on a withheld card or a page whose log is
+-- broken, signed by another key or unkeyed, and an approval or
+-- acknowledgement while the queue reloads or after its load failed. None
+-- starts a save, each shows its notice, and an open panel keeps its draft;
+-- a refusal submitted from the panel and refused before it starts (a server
+-- with no signing key) keeps the panel and its draft too. Red if a click
+-- that arrived after its row stopped offering a decision takes the slot or
+-- discards the panel's draft.
+staleDecisionTakesNoSlot : Settings.AppSettings -> Index.UnitView -> Index.UnitView -> Bool
+staleDecisionTakesNoSlot settings a b =
+    let
+        ua =
+            a.unit.uid
+
+        ub =
+            b.unit.uid
+
+        shown =
+            queueModel [ a, b ] (ViewShown a)
+
+        draft =
+            { refuseDraft = "needs a test", refuseError = Nothing }
+
+        drafted =
+            after settings [ RefuseStart ua, RefuseDraft ua "needs a test" ] shown
+
+        approvedElsewhere =
+            after settings [ ApproveUnit ub ] drafted
+
+        ackedUnit =
+            after settings [ AckRefusal ua ] drafted
+
+        ackedBlocking =
+            after settings [ AckRefusal (uid "r-blocking") ] (withRefusal blockingRow shown)
+
+        withheld =
+            after settings [ KeyDown "a" ] (queueModel [ a, b ] (ViewShown { a | view = Stale Drifted }))
+
+        brokenPage =
+            queuePageOf [ a, b ]
+
+        broken =
+            after settings [ KeyDown "a" ] { shown | queueState = Loaded { brokenPage | log = LibDb.ShownBroken (LibDb.BreaksAt 2) } }
+
+        logged log =
+            after settings [ KeyDown "a" ] { shown | queueState = Loaded { brokenPage | log = log } }
+
+        absent =
+            after settings [ ApproveUnit (uid "absent") ] shown
+
+        keyMismatch =
+            logged LibDb.ShownKeyMismatch
+
+        unkeyed =
+            logged LibDb.ShownUnkeyed
+
+        reloading =
+            after settings [ ApproveUnit ua ] { shown | queueState = Loading }
+
+        reloadingFile =
+            after settings [ AckRefusal (uid "r-blocking") ] { shown | queueState = Loading }
+
+        loadFailed =
+            after settings [ ApproveUnit ua ] { shown | queueState = Failed LoadFailed }
+
+        readOnly =
+            { settings | key = ReadOnly }
+
+        refusedSubmit =
+            after readOnly [ RefuseStart ua, RefuseDraft ua "needs a test", RefuseSubmit ua ] shown
+
+        idleNotice failure model =
+            Queue.notSavedOf model.decision == Just failure
+                && Queue.pendingText ua model.decision == Nothing
+                && Queue.pendingText ub model.decision == Nothing
+                && String.contains (Html.escapeHtml ("Decision not saved: " ++ Failure.saveFailureText failure)) (page model)
+    in
+    App.decidableRow drafted ub == Nothing
+        && idleNotice (SaveRefused SourceNotShown) approvedElsewhere
+        && Queue.openPanel approvedElsewhere.decision == Just ( ua, draft )
+        && panelDrawn (page approvedElsewhere)
+        && idleNotice (SaveRefused FileNotQueued) ackedUnit
+        && Queue.openPanel ackedUnit.decision == Just ( ua, draft )
+        && idleNotice (SaveRefused FileNotAcknowledgeable) ackedBlocking
+        && idleNotice (SaveRefused SourceNotShown) withheld
+        && idleNotice (SaveRefused LogBroken) broken
+        && idleNotice (SaveRefused NotQueued) absent
+        && idleNotice (SaveRefused LogKeyMismatch) keyMismatch
+        && idleNotice SaveReadOnly unkeyed
+        && idleNotice (SaveRefused NotQueued) reloading
+        && idleNotice (SaveRefused FileNotQueued) reloadingFile
+        && idleNotice (SaveRefused NotQueued) loadFailed
+        && idleNotice SaveReadOnly refusedSubmit
+        && Queue.openPanel refusedSubmit.decision == Just ( ua, draft )
+        && String.contains (Html.escapeHtml ("Decision not saved: " ++ Failure.saveFailureText (SaveRefused LogBroken))) (page broken)
 
 
 -- A slot left taken by another process, whose completion died with it, is
@@ -329,8 +610,11 @@ foreignDecisionIsIdle settings otherEpoch a b =
         approved =
             after settings [ ApproveUnit ua ] stale
 
+        opened =
+            after settings [ RefuseStart ua ] stale
+
         refused =
-            after settings [ RefuseStart ua, RefuseDraft "needs a test", RefuseSubmit ua ] stale
+            after settings [ RefuseDraft ua "needs a test", RefuseSubmit ua ] opened
 
         foreignResult =
             after settings [ App.decisionSaved ua otherEpoch (Err (Error.conflict "boom")) ] approved
@@ -348,11 +632,12 @@ foreignDecisionIsIdle settings otherEpoch a b =
         && Queue.startDecision settings.epoch ua (DecisionRefreshing ub otherEpoch) == Just (DecisionSaving ua settings.epoch)
         && Queue.startDecision settings.epoch ua (DecisionSaving ub settings.epoch) == Nothing
         && Queue.startDecision settings.epoch ua (DecisionRefreshing ub settings.epoch) == Nothing
-        && entered.decision == DecisionIdle
+        && entered.decision == DecisionIdle PanelClosed
         && ownEntered.decision == DecisionRefreshing ub settings.epoch
         && approved.decision == DecisionSaving ua settings.epoch
+        && Queue.openPanel opened.decision == Just ( ua, { refuseDraft = "", refuseError = Nothing } )
         && refused.decision == DecisionSaving ua settings.epoch
-        && refused.refuseError == Nothing
+        && Queue.openPanel refused.decision == Nothing
         && foreignResult.decision == DecisionSaving ua settings.epoch
         && Queue.notSavedOf ownResult.decision == Just SaveFailed
 
@@ -857,8 +1142,10 @@ standingLoadFailureTyped settings a =
 
 
 -- A blank or over-long refusal draft stays open as a typed case, its panel
--- the case's fixed text; a reason within the ceiling starts the decision.
--- Red if a refused draft starts a decision or shows any other text.
+-- the case's fixed text; a reason within the ceiling starts the decision,
+-- which closes the panel, so the row shows the pending state alone. Red if
+-- a refused draft starts a decision or shows any other text, or a started
+-- decision leaves the panel drawn.
 refuseDraftTyped : Settings.AppSettings -> Index.UnitView -> Index.UnitView -> Bool
 refuseDraftTyped settings a b =
     let
@@ -869,7 +1156,7 @@ refuseDraftTyped settings a b =
             queueModel [ a, b ] (ViewShown a)
 
         submit draft =
-            after settings [ RefuseStart ua, RefuseDraft draft, RefuseSubmit ua ] shown
+            after settings [ RefuseStart ua, RefuseDraft ua draft, RefuseSubmit ua ] shown
 
         blank =
             submit "   "
@@ -885,15 +1172,18 @@ refuseDraftTyped settings a b =
 
         kept =
             submit "needs a test"
+
+        idleOpen draft =
+            Maybe.map (\row -> DecisionIdle (PanelOpen row draft)) (App.decidableRow shown ua)
     in
-    blank.refuseError == Just (DraftRefused ReasonBlank)
-        && blank.decision == DecisionIdle
+    Just blank.decision == idleOpen { refuseDraft = "   ", refuseError = Just (DraftRefused ReasonBlank) }
         && String.contains (Failure.refuseFailureText (DraftRefused ReasonBlank)) (page blank)
-        && overlong.refuseError == Just overlongCase
-        && overlong.decision == DecisionIdle
+        && Just overlong.decision == idleOpen { refuseDraft = String.repeat overChars "x", refuseError = Just overlongCase }
         && String.contains (Failure.refuseFailureText overlongCase) (page overlong)
-        && kept.refuseError == Nothing
         && kept.decision == DecisionSaving ua settings.epoch
+        && Queue.openPanel kept.decision == Nothing
+        && String.contains "Saving the decision…" (page kept)
+        && not (panelDrawn (page kept))
 
 
 -- A decision on a unit off the shown queue page is refused as `NotQueued`,
@@ -901,9 +1191,12 @@ refuseDraftTyped settings a b =
 -- `SourceNotShown`, an acknowledgement of a file off the page as
 -- `FileNotQueued`, and one of a listed file with no digest as
 -- `FileNotAcknowledgeable`, each a value decided before any database is
--- opened, and the save's banner the refusal's fixed text. Red if
--- `decisionTask` decides a unit or file the reviewer was not shown, or a
--- refusal is read as a failure.
+-- opened, and the save's banner the refusal's fixed text, which says
+-- nothing was saved rather than that a save failed. Red if `decisionTask`
+-- decides a unit or file the reviewer was not shown, a refusal is read as a
+-- failure, or a stale click's banner says anything else. A click on a
+-- still-queued unit while the queue reloads is refused the same way, so the
+-- refusal's text names that cause too.
 decisionRefusedBeforeReading : Task.Task Error Bool
 decisionRefusedBeforeReading =
     do
@@ -917,16 +1210,81 @@ decisionRefusedBeforeReading =
         notShown <- App.decisionTask settings macKey (queueModel [ a, b ] (ViewShown a)) OnUnit b.unit.uid LibDb.Approved
         fileOffList <- App.decisionTask settings macKey (queueModel [ a, b ] (ViewShown a)) OnRefusal (uid "r-blocking") LibDb.Approved
         fileBlocking <- App.decisionTask settings macKey (withRefusal blockingRow (queueModel [ a, b ] (ViewShown a))) OnRefusal (uid "r-blocking") LibDb.Approved
+        whileReloading <- App.decisionTask settings macKey (reloadingModel a) OnUnit a.unit.uid LibDb.Approved
         cleanupIndex at.indexDb at.repo
         Task.succeed
-            (refusalOf offList == Just NotQueued
+            (staleBannerShown settings (queueModel [ a ] (ViewShown a)) OnUnit b.unit.uid offList (SaveRefused NotQueued) notQueuedText
+                && staleBannerShown settings (queueModel [ a, b ] (ViewShown a)) OnRefusal (uid "r-blocking") fileOffList (SaveRefused FileNotQueued) fileNotQueuedText
+                && refusalOf offList == Just NotQueued
                 && refusalOf notShown == Just SourceNotShown
                 && refusalOf fileOffList == Just FileNotQueued
                 && refusalOf fileBlocking == Just FileNotAcknowledgeable
+                && refusalOf whileReloading == Just NotQueued
+                && stillQueuedCauseAdmitted (Failure.saveFailureText (SaveRefused NotQueued))
+                && stillQueuedCauseAdmitted (Failure.saveFailureText (SaveRefused FileNotQueued))
                 && savedRefusal (Failure.saved (Ok fileBlocking)) == Just FileNotAcknowledgeable
                 && savedRefusal (Failure.saved (Ok offList)) == Just NotQueued
                 && savedRefusal (Failure.saved (Ok notShown)) == Just SourceNotShown
             )
+
+
+-- The queue page of `a` while it reloads, so no row is listed though `a` is
+-- still queued.
+reloadingModel : Index.UnitView -> Model
+reloadingModel a =
+    { initialModel | queueState = Loading, selectedView = ViewShown a }
+
+
+-- Whether a stale-click refusal's text holds for a row that is still queued
+-- but not on the page shown, as a click during a reload or after a page
+-- change is: it claims neither that the row left the queue nor that the
+-- queue shown is current. Red if the text asserts a cause only some of its
+-- producers have.
+stillQueuedCauseAdmitted : String -> Bool
+stillQueuedCauseAdmitted text =
+    String.contains "page changed or was reloading" text
+        && not (String.contains "left the queue" text)
+        && not (String.contains "is current" text)
+
+
+-- The fixed texts of the two stale-click refusals, spelled out so the
+-- banner check compares against the text itself, not the function that
+-- produces it.
+notQueuedText : String
+notQueuedText =
+    "the unit was not on the queue page shown when this click arrived (it was decided, the index no longer lists it, or the page changed or was reloading); nothing was saved"
+
+
+fileNotQueuedText : String
+fileNotQueuedText =
+    "the file was not on the queue page shown when this click arrived (it was acknowledged, the index no longer lists it, or the page changed or was reloading); nothing was saved"
+
+
+-- The banner a stale click on `target` leaves, refused at the click before
+-- it takes the slot, and kept when a save's late refusal `refused` for it
+-- arrives: the not-saved notice of `expected`, whose fixed text is `shown`,
+-- and none of the failed-save lead.
+staleBannerShown : Settings.AppSettings -> Model -> DecisionTarget -> Uid -> Result DecideRefusal ( Index.Attested, Index.Written ) -> SaveFailure -> String -> Bool
+staleBannerShown settings model target clicked refused expected shown =
+    let
+        start =
+            case target of
+                OnUnit ->
+                    ApproveUnit clicked
+
+                OnRefusal ->
+                    AckRefusal clicked
+
+        settled =
+            after settings [ start, App.decisionSaved clicked settings.epoch (Ok refused) ] model
+
+        html =
+            page settled
+    in
+    Queue.notSavedOf settled.decision == Just expected
+        && Failure.saveFailureText expected == shown
+        && String.contains (Html.escapeHtml ("Decision not saved: " ++ shown)) html
+        && not (String.contains "Decision save failed" html)
 
 
 -- A file the index refuses for a blocking reason, so it carries no digest.
@@ -1048,10 +1406,10 @@ writtenStaysPending settings a b pair =
         && String.contains "Decision saved; refreshing the queue…" writtenPage
         && not (String.contains ">Approve<" writtenPage)
         && olderLoad.decision == DecisionRefreshing ua settings.epoch
-        && reloaded.decision == DecisionIdle
-        && reloadFailed.decision == DecisionIdle
+        && reloaded.decision == DecisionIdle PanelClosed
+        && reloadFailed.decision == DecisionIdle PanelClosed
         && superseding.decision == DecisionRefreshing ua settings.epoch
-        && superseded.decision == DecisionIdle
+        && superseded.decision == DecisionIdle PanelClosed
 
 
 -- The notice of a decision that was not saved advises a reload, and the
@@ -1077,12 +1435,12 @@ notSavedClearedByReload settings a b =
             after settings [ App.queueLoaded reloading.queueLoad (Err (Error.conflict "boom")) ] reloading
 
         banner =
-            Html.escapeHtml ("Decision save failed: " ++ Failure.saveFailureText SaveFailed)
+            Html.escapeHtml ("Decision not saved: " ++ Failure.saveFailureText SaveFailed)
     in
     Queue.notSavedOf failed.decision == Just SaveFailed
         && String.contains banner (page failed)
         && Queue.notSavedOf reloading.decision == Just SaveFailed
-        && reloaded.decision == DecisionIdle
+        && reloaded.decision == DecisionIdle PanelClosed
         && not (String.contains banner (page reloaded))
         && Queue.notSavedOf reloadFailed.decision == Just SaveFailed
 
@@ -1115,12 +1473,12 @@ notSavedOutlivesOlderLoad settings a b =
             after settings [ PendingLoaded reloading.queueLoad (Ok (queuePageOf [ a, b ])) ] reloading
 
         banner =
-            Html.escapeHtml ("Decision save failed: " ++ Failure.saveFailureText SaveFailed)
+            Html.escapeHtml ("Decision not saved: " ++ Failure.saveFailureText SaveFailed)
     in
     Queue.notSavedOf failed.decision == Just SaveFailed
         && Queue.notSavedOf olderLoaded.decision == Just SaveFailed
         && String.contains banner (page olderLoaded)
-        && reloaded.decision == DecisionIdle
+        && reloaded.decision == DecisionIdle PanelClosed
         && not (String.contains banner (page reloaded))
 
 
@@ -1150,6 +1508,46 @@ checks =
         (\seeded refused -> seeded ++ [ refused ])
         seededChecks
         (check "a decision off the shown list or source is refused before any read" decisionRefusedBeforeReading)
+        |> Task.andThen (\rows -> check "Enter in an unreviewable file's refusal panel submits that file's refusal" enterRefusesOpenFile |> Task.map (\entered -> rows ++ [ entered ]))
+
+
+-- Enter in the refusal panel open on an acknowledgeable file the page lists
+-- submits the refusal of that file, through the panel's own row: the save
+-- starts on the file. Red if the key submits the unit refusal, which is
+-- refused for a file and leaves the panel open with nothing saving.
+enterRefusesOpenFile : Task.Task Error Bool
+enterRefusesOpenFile =
+    do
+        at <- freshScratch "ipe-single-flight-enter"
+        seedIndex at.indexDb at.repo
+        System.setenv "IPE_REVIEW_DB" at.reviewDb
+        _ <- migratedReviewAt at.reviewDb
+        execIndex at.indexDb
+            "INSERT INTO refusals (uid, path, lang, reason, size, digest) VALUES (?, ?, 'other', 'symlink-entry', NULL, ?)"
+            [ Uid.toSql (uid "r-link"), SqlString "ipe:src/link.txt", SqlString ("refusal-blake3:" ++ String.repeat 64 "a") ]
+        settings <- envAppSettings
+        loaded <- loadPageNow Index.Start
+        cleanupIndex at.indexDb at.repo
+        removeFileIfAny at.reviewDb
+        Task.succeed (enteredOnFile settings { initialModel | queueState = Loaded { loaded | log = LibDb.ShownProven } })
+
+
+enteredOnFile : Settings.AppSettings -> Model -> Bool
+enteredOnFile settings listed =
+    let
+        file =
+            uid "r-link"
+
+        drafted =
+            after settings [ RefuseStart file, RefuseDraft file "not ours" ] listed
+
+        entered =
+            after settings [ KeyDown "Enter" ] drafted
+    in
+    Maybe.map Queue.rowTarget (App.decidableRow listed file) == Just OnRefusal
+        && Queue.openPanel drafted.decision == Just ( file, { refuseDraft = "not ours", refuseError = Nothing } )
+        && entered.decision == DecisionSaving file settings.epoch
+        && Queue.openPanel entered.decision == Nothing
 
 
 seededChecks : Task.Task Error (List ( String, Bool ))
@@ -1161,6 +1559,9 @@ seededChecks =
             , ( "the unit page settles only on its own unit's read", unitPageSettlesOnItsOwnRead settings a b )
             , ( "a decision asked while one is saving starts no second decision", decisionsSingleFlight settings a b )
             , ( "a decision saving under another process's epoch blocks no decision", foreignDecisionIsIdle settings otherEpoch a b )
+            , ( "the refusal panel opens only on an idle decision slot", refusalPanelLivesInIdleSlot settings a b )
+            , ( "the refusal panel opens and stays open only on a row the page offers a decision on", refusalPanelOnlyOnOfferedRow settings a b )
+            , ( "a decision on a row the page offers no decision on takes no slot and keeps the panel", staleDecisionTakesNoSlot settings a b )
             , ( "a source read in flight under another process's epoch blocks no read", foreignReadIsIdle settings otherEpoch a b )
             , ( "a decision asked off the queue page takes no decision slot", decisionOffQueueHoldsNoSlot settings a b )
             , ( "a refused decision and a unit page awaiting its read render as such", busyRendered settings a b )

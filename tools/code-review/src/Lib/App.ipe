@@ -1,4 +1,4 @@
-module Lib.App exposing (DecisionTarget(..), Model, Msg(..), Page(..), decisionSaved, decisionTask, historyLoaded, initialModel, queueList, queueLoaded, selectedUid, selectedUnit, standingLoaded, unitPageState, update, viewLoaded)
+module Lib.App exposing (Model, Msg(..), Page(..), decidableRow, decisionSaved, decisionTask, historyLoaded, initialModel, queueList, queueLoaded, selectedUid, selectedUnit, standingLoaded, unitPageState, update, viewLoaded)
 
 import Ipe.Error as Error exposing (Error)
 import Ipe.List as List
@@ -10,7 +10,7 @@ import Lib.Epoch exposing (Epoch)
 import Lib.Failure as Failure exposing (DecideRefusal(..), LoadFailure, RefuseFailure(..), SaveFailure(..))
 import Lib.Index as Index
 import Lib.Keys as Keys exposing (KeyAction(..))
-import Lib.Queue as Queue exposing (DecisionSlot(..), HistoryState(..), QueueState(..), SelectedView(..), UnitPageState(..))
+import Lib.Queue as Queue exposing (DecidableRow, DecisionSlot(..), DecisionTarget(..), HistoryState(..), RefusalPanel(..), QueueState(..), SelectedView(..), UnitPageState(..))
 import Lib.ReviewKey exposing (MacKey, ReviewKey(..))
 import Lib.ServerLog as ServerLog
 import Lib.Settings as Settings
@@ -30,17 +30,15 @@ type Page
 -- read slot, read by the queue card and the unit page alike, and `decision`
 -- its one decision slot, so a second read or decision in flight has no
 -- representation; the slot also holds the notice of a decision that was not
--- saved, so a notice and a busy decision are never both shown. `standing` is
--- the unit page's read of where its shown body stands in the review log.
--- `refuseError` is why the refusal draft stays open. Like every failure the
--- Model holds, each is a typed case that never holds an error's text.
+-- saved, so a notice and a busy decision are never both shown, and the
+-- refusal panel with its draft, so a panel open beside a busy decision is
+-- never shown either. `standing` is the unit page's read of where its shown
+-- body stands in the review log. Like every failure the Model holds, each
+-- is a typed case that never holds an error's text.
 type alias Model =
     { page : Page
     , queueState : Queue.QueueState
     , queueCursor : Index.Cursor
-    , refusingUid : Maybe Uid
-    , refuseDraft : String
-    , refuseError : Maybe RefuseFailure
     , queueLoad : Queue.LoadTicket
     , history : Queue.HistoryState
     , historyLoad : Queue.LoadTicket
@@ -58,7 +56,7 @@ type Msg
     | NextPage Index.Cursor
     | ApproveUnit Uid
     | RefuseStart Uid
-    | RefuseDraft String
+    | RefuseDraft Uid String
     | RefuseCancel
     | RefuseSubmit Uid
     | AckRefusal Uid
@@ -111,15 +109,12 @@ initialModel =
     { page = QueuePage
     , queueState = Loading
     , queueCursor = Index.Start
-    , refusingUid = Nothing
-    , refuseDraft = ""
-    , refuseError = Nothing
     , queueLoad = Queue.firstTicket
     , history = HistoryLoading
     , historyLoad = Queue.firstTicket
     , selected = 0
     , selectedView = NoneSelected
-    , decision = DecisionIdle
+    , decision = DecisionIdle PanelClosed
     , standing = Queue.StandingUnread
     }
 
@@ -255,14 +250,64 @@ loadUnit settings uid model =
     viewStep settings (Queue.reloadView settings.epoch uid model.selectedView) model
 
 
+-- Every step ends with the refusal panel closed unless the row it is open
+-- on is still one the shown page offers a decision on, so a selection,
+-- page or load that stops drawing that row closes its panel at this one
+-- point.
 update : Settings.AppSettings -> Msg -> Model -> ( Model, Cmd Msg )
 update settings msg model =
+    let
+        ( stepped, cmd ) =
+            step settings msg model
+    in
+    ( shownPanel stepped, cmd )
+
+
+shownPanel : Model -> Model
+shownPanel model =
+    case Queue.openRow model.decision of
+        Just ( row, _ ) ->
+            if decidableRow model (Queue.rowUid row) == Just row then
+                model
+
+            else
+                { model | decision = Queue.closeRefusal model.decision }
+
+        Nothing ->
+            model
+
+
+-- The row `uid` when the queue page shows it with decision controls: the
+-- one predicate the view draws them by and the refusal panel opens by.
+decidableRow : Model -> Uid -> Maybe DecidableRow
+decidableRow model uid =
+    if model.page == QueuePage then
+        Queue.decidableRow model.selected model.queueState model.selectedView uid
+
+    else
+        Nothing
+
+
+-- The slot with the refusal panel open on `uid`, when the shown page offers
+-- a decision on it; unchanged otherwise.
+startRefusal : Settings.AppSettings -> Uid -> Model -> ( Model, Cmd Msg )
+startRefusal settings uid model =
+    case decidableRow model uid of
+        Just row ->
+            ( { model | decision = Queue.openRefusal settings.epoch row model.decision }, Cmd.none )
+
+        Nothing ->
+            ( model, Cmd.none )
+
+
+step : Settings.AppSettings -> Msg -> Model -> ( Model, Cmd Msg )
+step settings msg model =
     case msg of
         PendingLoaded load result ->
             if Queue.isCurrentLoad load model.queueLoad then
                 let
                     loaded =
-                        { model | queueState = Queue.stateFromResult result, refusingUid = Nothing, decision = Queue.queueSettled load result model.decision }
+                        { model | queueState = Queue.stateFromResult result, decision = Queue.queueSettled load result model.decision }
                 in
                 viewAfterLoad settings { loaded | selected = clampIndex model.selected (List.length (queueList loaded)) }
 
@@ -279,13 +324,13 @@ update settings msg model =
             saveDecision settings model OnRefusal uid Approved
 
         RefuseStart uid ->
-            ( { model | refusingUid = Just uid, refuseDraft = "", refuseError = Nothing }, Cmd.none )
+            startRefusal settings uid model
 
-        RefuseDraft text ->
-            ( { model | refuseDraft = text, refuseError = Nothing }, Cmd.none )
+        RefuseDraft uid text ->
+            ( { model | decision = Queue.editDraft uid text model.decision }, Cmd.none )
 
         RefuseCancel ->
-            ( { model | refusingUid = Nothing, refuseDraft = "", refuseError = Nothing }, Cmd.none )
+            ( { model | decision = Queue.closeRefusal model.decision }, Cmd.none )
 
         RefuseSubmit uid ->
             submitRefuse settings model OnUnit uid
@@ -336,7 +381,7 @@ update settings msg model =
 
         KeyDown key ->
             if model.page == QueuePage then
-                keyActionMsg settings (Keys.keyAction (model.refusingUid /= Nothing) (List.length (queueList model)) model.selected key) model
+                keyActionMsg settings (Keys.keyAction (Queue.openPanel model.decision /= Nothing) (List.length (queueList model)) model.selected key) model
 
             else
                 ( model, Cmd.none )
@@ -453,7 +498,7 @@ keyActionMsg settings action model =
         RefuseSelected ->
             case selectedUid model of
                 Just uid ->
-                    ( { model | refusingUid = Just uid, refuseDraft = "", refuseError = Nothing }, Cmd.none )
+                    startRefusal settings uid model
 
                 Nothing ->
                     ( model, Cmd.none )
@@ -462,61 +507,47 @@ keyActionMsg settings action model =
             selectAt settings i model
 
         ConfirmRefuse ->
-            case model.refusingUid of
-                Just uid ->
-                    submitRefuse settings model (targetOf model uid) uid
+            case Queue.openRow model.decision of
+                Just ( row, _ ) ->
+                    submitRefuse settings model (Queue.rowTarget row) (Queue.rowUid row)
 
                 Nothing ->
                     ( model, Cmd.none )
 
         CancelRefuse ->
-            ( { model | refusingUid = Nothing, refuseDraft = "", refuseError = Nothing }, Cmd.none )
+            ( { model | decision = Queue.closeRefusal model.decision }, Cmd.none )
 
         Ignore ->
             ( model, Cmd.none )
 
 
--- The draft is parsed into a bounded `Reason` here, the one point where the
--- reviewer's text enters; a blank or over-long draft stays open with why,
--- and so does a draft submitted while another decision is saving.
+-- The open panel's draft is parsed into a bounded `Reason` here, the one
+-- point where the reviewer's text enters; a blank or over-long draft stays
+-- open with why. A submit for any row or target but the one the panel is
+-- open on decides nothing and keeps the draft. The panel is closed before the
+-- decision is asked, so the decision's own state is what the row shows.
 submitRefuse : Settings.AppSettings -> Model -> DecisionTarget -> Uid -> ( Model, Cmd Msg )
 submitRefuse settings model target uid =
-    case LibDb.parseReason model.refuseDraft of
-        Err refused ->
-            ( { model | refuseError = Just (DraftRefused refused) }, Cmd.none )
+    case Queue.openRow model.decision of
+        Just ( row, draft ) ->
+            if Queue.rowUid row == uid && Queue.rowTarget row == target then
+                case LibDb.parseReason draft.refuseDraft of
+                    Err refused ->
+                        ( { model | decision = Queue.draftRefused (DraftRefused refused) model.decision }, Cmd.none )
 
-        Ok reason ->
-            case Queue.startDecision settings.epoch uid model.decision of
-                Just _ ->
-                    saveDecision settings { model | refusingUid = Nothing, refuseDraft = "" } target uid (Refused reason)
+                    Ok reason ->
+                        saveDecision settings model target uid (Refused reason)
 
-                Nothing ->
-                    ( { model | refuseError = Just DraftWhileSaving }, Cmd.none )
+            else
+                ( model, Cmd.none )
+
+        Nothing ->
+            ( model, Cmd.none )
 
 
 clampIndex : Int -> Int -> Int
 clampIndex i len =
     max 0 (min i (len - 1))
-
-
--- What a decision is asked on: a queued unit, decided on its shown source,
--- or an unreviewable file the loaded page lists, decided on its digest.
-type DecisionTarget
-    = OnUnit
-    | OnRefusal
-
-
--- The target of a decision asked by uid alone (the refusal panel's key):
--- an unreviewable file when the loaded page lists one under `uid`, a unit
--- otherwise.
-targetOf : Model -> Uid -> DecisionTarget
-targetOf model uid =
-    case pageRefusal model uid of
-        Just _ ->
-            OnRefusal
-
-        Nothing ->
-            OnUnit
 
 
 pageRefusal : Model -> Uid -> Maybe Index.RefusalRow
@@ -537,8 +568,10 @@ pageRefusal model uid =
 -- or `Queue.decideRefusal` on a listed unreviewable file's digest, each
 -- re-proved before writing. A decision asked off the queue page is
 -- refused before it takes the slot, and so is one asked on a server with no
--- signing key, each with a notice saying why; one asked while another is
--- busy starts nothing, and that decision's pending state stays shown.
+-- signing key, or on a row the page does not offer that decision on (the
+-- view's own `decidableRow`), each with a notice saying why and the refusal
+-- panel kept; one asked while another is busy starts nothing, and that
+-- decision's pending state stays shown.
 saveDecision : Settings.AppSettings -> Model -> DecisionTarget -> Uid -> LibDb.Decision -> ( Model, Cmd Msg )
 saveDecision settings model target uid decision =
     if model.page /= QueuePage then
@@ -550,14 +583,19 @@ saveDecision settings model target uid decision =
                 ( { model | decision = Queue.decisionRefused settings.epoch SaveReadOnly model.queueLoad model.decision }, Cmd.none )
 
             Signing macKey ->
-                case Queue.startDecision settings.epoch uid model.decision of
-                    Just saving ->
-                        ( { model | decision = saving }
-                        , Cmd.perform (ServerLog.logged "decision save failed" (decisionTask settings macKey model target uid decision)) (decisionSaved uid settings.epoch)
-                        )
+                case Queue.decidableAs model.selected model.queueState model.selectedView target uid of
+                    Ok _ ->
+                        case Queue.startDecision settings.epoch uid model.decision of
+                            Just saving ->
+                                ( { model | decision = saving }
+                                , Cmd.perform (ServerLog.logged "decision save failed" (decisionTask settings macKey model target uid decision)) (decisionSaved uid settings.epoch)
+                                )
 
-                    Nothing ->
-                        ( model, Cmd.none )
+                            Nothing ->
+                                ( model, Cmd.none )
+
+                    Err failure ->
+                        ( { model | decision = Queue.decisionRefused settings.epoch failure model.queueLoad model.decision }, Cmd.none )
 
 
 -- The decision on `uid`'s shown source or listed unreviewable file, or its
