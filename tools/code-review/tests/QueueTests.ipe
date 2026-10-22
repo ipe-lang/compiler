@@ -423,7 +423,7 @@ fixtureNameOf unit =
             label
 
         Nothing ->
-            Uid.toString unit
+            TestSupport.uidHex unit
 
 
 -- ── bounded queue pages ─────────────────────────────────────────────────
@@ -489,7 +489,7 @@ isLastPage next =
 distinctUids : List Queue.QueuedUnit -> Int
 distinctUids units =
     units
-        |> List.map (\q -> ( Uid.toString q.unit.uid, () ))
+        |> List.map (\q -> ( TestSupport.uidHex q.unit.uid, () ))
         |> Dict.fromList
         |> Dict.size
 
@@ -1361,8 +1361,8 @@ removedUnitReturnsReviewed =
     do
         at <- freshScratch "ipe-index-progress-removed"
         d <- decideAndDrainA at
-        execIndex at.indexDb ("CREATE TABLE units_kept AS SELECT * FROM units WHERE uid = '" ++ Uid.toString (uid "u-a") ++ "'") []
-        execIndex at.indexDb ("DELETE FROM units WHERE uid = '" ++ Uid.toString (uid "u-a") ++ "'") []
+        execIndex at.indexDb ("CREATE TABLE units_kept AS SELECT * FROM units WHERE uid = '" ++ TestSupport.uidHex (uid "u-a") ++ "'") []
+        execIndex at.indexDb ("DELETE FROM units WHERE uid = '" ++ TestSupport.uidHex (uid "u-a") ++ "'") []
         gone <- currentProgressOf
         execIndex at.indexDb "INSERT INTO units SELECT * FROM units_kept" []
         back <- currentProgressOf
@@ -1425,7 +1425,7 @@ refillDrainsOnlyReviewPairs =
         conn <- openFileAt WriteExisting at.indexDb
         mirrored <- Db.queryDecode conn "SELECT uid, body_hash FROM reviewed ORDER BY uid, body_hash" [] pairDecoder
         cleanupProgressScratch at
-        Task.succeed (copied == List.length pairs && mirrored == List.map (\( label, hash ) -> ( Uid.toString (uid label), hash )) pairs)
+        Task.succeed (copied == List.length pairs && mirrored == List.map (\( label, hash ) -> ( TestSupport.uidHex (uid label), hash )) pairs)
 
 
 -- The copy holding as many pairs as the review log, but different ones, is

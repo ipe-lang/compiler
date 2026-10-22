@@ -82,7 +82,7 @@ pageTag model =
                     "loading"
 
                 UnitLoaded loaded ->
-                    "loaded " ++ Uid.toString loaded.unit.uid
+                    "loaded " ++ TestSupport.uidHex loaded.unit.uid
 
                 UnitNotFound ->
                     "not found"
@@ -102,7 +102,7 @@ pageTag model =
 
 unitAt : Uid -> Page
 unitAt unit =
-    UnitPage (Uid.toString unit)
+    UnitPage (TestSupport.uidHex unit)
 
 
 queued : Index.UnitView -> Queue.QueuedUnit
@@ -303,8 +303,8 @@ unitPageSettlesOnItsOwnRead settings a b =
     pageTag waiting == "loading"
         && pageTag otherReturned == "loading"
         && inFlight queueLoaded == Just ( ub, Nothing )
-        && pageTag ownReturned == ("loaded " ++ Uid.toString ub)
-        && pageTag lateOther == ("loaded " ++ Uid.toString ub)
+        && pageTag ownReturned == ("loaded " ++ TestSupport.uidHex ub)
+        && pageTag lateOther == ("loaded " ++ TestSupport.uidHex ub)
         && pageTag shownElsewhere == "loading"
         && pageTag missing == "not found"
         && pageTag refused == "refused"
@@ -1219,7 +1219,7 @@ unitLoadFailureTyped settings a =
         && unitFailure limit == Just LoadPastLimit
         && showsOnly (lead ++ Failure.loadFailureText LoadPastLimit) limit
         && unitFailure succeeded == Nothing
-        && pageTag succeeded == ("loaded " ++ Uid.toString ua)
+        && pageTag succeeded == ("loaded " ++ TestSupport.uidHex ua)
 
 
 -- The unit page's standing read that fails shows the case's fixed text in

@@ -44,8 +44,8 @@ uidParseRefuses =
         , String.repeat 63 "a" ++ codeText 65345
         , String.repeat 63 "a" ++ codeText 1635
         ]
-        && Result.map Uid.toString (Uid.parse hex) == Ok hex
-        && Result.map Uid.toString (Uid.parse "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef") == Ok "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+        && Result.map TestSupport.uidHex (Uid.parse hex) == Ok hex
+        && Result.map TestSupport.uidHex (Uid.parse "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef") == Ok "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
 
 
 -- True when `raw` is refused as invalid input.
@@ -87,7 +87,7 @@ entryRefused raw =
 
 entryAccepted : Uid -> Bool
 entryAccepted unit =
-    case Queue.unitPageEntry (Uid.toString unit) of
+    case Queue.unitPageEntry (TestSupport.uidHex unit) of
         Ok entered ->
             entered == unit
 
@@ -114,10 +114,10 @@ badLinkUidRendersText =
     isUnlinked edge
         && Links.label edge == name
         && Label.parts name == [ LabelText "app::x" ]
-        && Links.linkKey edge == "t:" ++ Label.key name
+        && Links.linkKey edge == Links.UnlinkedKey (Label.key name)
         && List.all isUnlinked resolved
         && List.length resolved == 1
-        && not (isUnlinked (Links.internal (Label.fromText Label.labelCap "app::y") (Uid.toString (uid "u-y"))))
+        && not (isUnlinked (Links.internal (Label.fromText Label.labelCap "app::y") (TestSupport.uidHex (uid "u-y"))))
 
 
 isUnlinked : Link -> Bool
@@ -255,7 +255,7 @@ failsNaming : Uid -> String -> Task.Task Error a -> Task.Task Error Bool
 failsNaming unit stored task =
     task
         |> Task.map (\_ -> False)
-        |> Task.onError (\e -> Task.succeed (String.contains (Uid.toString unit) (Error.toString e) && not (String.contains stored (Error.toString e))))
+        |> Task.onError (\e -> Task.succeed (String.contains (TestSupport.uidHex unit) (Error.toString e) && not (String.contains stored (Error.toString e))))
 
 
 -- True when `task` fails with an error that does not repeat `stored`.

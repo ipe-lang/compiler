@@ -367,7 +367,7 @@ sourceTokensRendered =
             String.concat (List.map (\tok -> SafeText.toString (Highlight.tokenText tok)) (Highlight.tokenize lang line))
 
         label =
-            [ Links.internal (Label.fromText Label.labelCap ("Lib." ++ rlo ++ "x")) (Uid.toString (uid "u-x")) ]
+            [ Links.internal (Label.fromText Label.labelCap ("Lib." ++ rlo ++ "x")) (TestSupport.uidHex (uid "u-x")) ]
                 |> List.map (\l -> Label.parts (Links.label l))
     in
     List.all

@@ -89,6 +89,7 @@ module TestSupport exposing
     , carriesFailure
     , carriesNoFailure
     , uid
+    , uidHex
     , resyncBoundOf
     , testKeyHex
     , testMacKey
@@ -183,6 +184,40 @@ uid label =
 
         Err _ ->
             uid ""
+
+
+-- A unit id's hex, for a test's fixture text and messages. `Lib.Uid` has
+-- no text exit, so this reads the text back from its SQL bind form; the
+-- source scans cover `src/Lib` only, which keeps the helper out of the app.
+uidHex : Uid -> String
+uidHex id =
+    case Uid.toSql id of
+        SqlString hex ->
+            hex
+
+        SqlInt _ ->
+            ""
+
+        SqlFloat _ ->
+            ""
+
+        SqlBool _ ->
+            ""
+
+        SqlBytes _ ->
+            ""
+
+        SqlTime _ ->
+            ""
+
+        SqlDecimal _ ->
+            ""
+
+        SqlMoney _ ->
+            ""
+
+        SqlNull _ ->
+            ""
 
 
 fixtureHex : String -> String
@@ -824,7 +859,7 @@ pageEntry conn roots row =
                         Task.succeed { uid = unit, unit = loaded.unit, change = row.change, view = loaded.view }
 
                     Nothing ->
-                        Task.fail (Error.conflict ("queued unit " ++ Uid.toString unit ++ " has no view"))
+                        Task.fail (Error.conflict ("queued unit " ++ uidHex unit ++ " has no view"))
             )
 
 
@@ -848,7 +883,7 @@ loadUnitNow unit =
 -- the run.
 decideNow : Db -> Uid -> LibDb.Decision -> Task.Task Error ( Index.Attested, Index.Written )
 decideNow db unit decision =
-    accepted ("the decision on " ++ Uid.toString unit) (decidedNow db unit decision)
+    accepted ("the decision on " ++ uidHex unit) (decidedNow db unit decision)
 
 
 -- `decideNow`'s result with a refusal kept as a value.
@@ -862,7 +897,7 @@ decidedNow db unit decision =
                         decideShownNow db shown decision
 
                     Nothing ->
-                        Task.fail (Error.conflict ("unit " ++ Uid.toString unit ++ " is not shown"))
+                        Task.fail (Error.conflict ("unit " ++ uidHex unit ++ " is not shown"))
             )
 
 
@@ -1246,7 +1281,7 @@ rawReason reason =
 -- absent, then the row's name.
 rawMacInput : String -> Int -> String -> RawRow -> String
 rawMacInput logId seq prev row =
-    rawMacInputWith logId seq prev (Uid.toString row.uid) row
+    rawMacInputWith logId seq prev (uidHex row.uid) row
 
 
 -- `rawMacInput` with `uidText` as the uid field.
@@ -1500,19 +1535,19 @@ reverifyShown unit found =
         Just loaded ->
             case loaded.view of
                 Shown shown ->
-                    envSettings |> Task.andThen (\settings -> accepted ("fixture unit " ++ Uid.toString unit) (Index.reverify settings shown))
+                    envSettings |> Task.andThen (\settings -> accepted ("fixture unit " ++ uidHex unit) (Index.reverify settings shown))
 
                 Stale _ ->
-                    Task.fail (Error.conflict ("fixture unit " ++ Uid.toString unit ++ " is stale"))
+                    Task.fail (Error.conflict ("fixture unit " ++ uidHex unit ++ " is stale"))
 
                 Unreadable _ ->
-                    Task.fail (Error.conflict ("fixture unit " ++ Uid.toString unit ++ " is unreadable"))
+                    Task.fail (Error.conflict ("fixture unit " ++ uidHex unit ++ " is unreadable"))
 
                 TooLarge _ ->
-                    Task.fail (Error.conflict ("fixture unit " ++ Uid.toString unit ++ " is too large"))
+                    Task.fail (Error.conflict ("fixture unit " ++ uidHex unit ++ " is too large"))
 
         Nothing ->
-            Task.fail (Error.conflict ("fixture unit " ++ Uid.toString unit ++ " is not in the index"))
+            Task.fail (Error.conflict ("fixture unit " ++ uidHex unit ++ " is not in the index"))
 
 
 -- A test file path opened read-only through the location the app builds
