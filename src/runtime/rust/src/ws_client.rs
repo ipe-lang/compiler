@@ -516,34 +516,39 @@ enum Transport {
     },
 }
 
-/// Dial `target`, run `transport` and the WebSocket handshake for `req`, then
-/// start the socket; returns its id.
+/// How a failed dial of a [`DialTarget`] is classed.
 #[cfg(not(target_arch = "wasm32"))]
-async fn dial_and_open(
+type DialFailure = fn(std::io::ErrorKind) -> WsFailure;
+
+/// The addresses to dial for `target`, and how a failed dial of them is classed.
+///
+/// A vetted dial keeps only its class: the address may re-encode an IP-literal
+/// host the displayable URL withholds.
+#[cfg(not(target_arch = "wasm32"))]
+async fn dial_addrs(
     target: DialTarget,
+) -> Result<(Vec<std::net::SocketAddr>, DialFailure), WsFailure> {
+    match target {
+        DialTarget::Vetted(addr) => Ok((vec![addr], WsFailure::Dial)),
+        DialTarget::Named { host, port } => {
+            let addrs = tokio::net::lookup_host((host.as_str(), port))
+                .await
+                .map_err(|e| WsFailure::Io(e.kind()))?;
+            Ok((addrs.collect(), WsFailure::Io))
+        }
+    }
+}
+
+/// Run `transport` and the WebSocket handshake for `req` over the dialled
+/// `tcp`, then start the socket; returns its id.
+#[cfg(not(target_arch = "wasm32"))]
+async fn open_over(
+    tcp: tokio::net::TcpStream,
     transport: Transport,
     req: tokio_tungstenite::tungstenite::handshake::client::Request,
     config: tokio_tungstenite::tungstenite::protocol::WebSocketConfig,
     ping_interval_ms: i64,
 ) -> Result<i64, WsFailure> {
-    // A vetted dial keeps only its class: the address may re-encode an
-    // IP-literal host the displayable URL withholds.
-    let (addrs, dial_failure): (
-        Vec<std::net::SocketAddr>,
-        fn(std::io::ErrorKind) -> WsFailure,
-    ) = match target {
-        DialTarget::Vetted(addr) => (vec![addr], WsFailure::Dial),
-        DialTarget::Named { host, port } => (
-            tokio::net::lookup_host((host.as_str(), port))
-                .await
-                .map_err(|e| WsFailure::Io(e.kind()))?
-                .collect(),
-            WsFailure::Io,
-        ),
-    };
-    let tcp = tokio::net::TcpStream::connect(addrs.as_slice())
-        .await
-        .map_err(|e| dial_failure(e.kind()))?;
     match transport {
         Transport::Plain => open_socket(req, tcp, config, ping_interval_ms).await,
         Transport::Tls { name, config: tls } => {
@@ -681,8 +686,15 @@ async fn do_connect<E: From<String> + FromLimitExceeded + Send + 'static>(
     } else {
         30_000
     };
-    let connect = dial_and_open(target, transport, req, ws_config(max_msg), ping_interval_ms);
-    match tokio::time::timeout(std::time::Duration::from_millis(to_ms), connect).await {
+    let config = ws_config(max_msg);
+    let opening = async move {
+        let (addrs, dial_failure) = dial_addrs(target).await?;
+        let tcp = tokio::net::TcpStream::connect(addrs.as_slice())
+            .await
+            .map_err(|e| dial_failure(e.kind()))?;
+        open_over(tcp, transport, req, config, ping_interval_ms).await
+    };
+    match tokio::time::timeout(std::time::Duration::from_millis(to_ms), opening).await {
         Ok(Ok(id)) => ok_res(id),
         Ok(Err(failure)) => WsConnectError::Failed {
             url: safe_url,

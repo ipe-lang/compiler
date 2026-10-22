@@ -64,18 +64,19 @@ fn count_tokens(
                     trees.get(at.saturating_add(1)),
                     Some(TokenTree::Punct(p)) if p.as_char() == '!'
                 );
-                if name == "include" && bang {
-                    if let Some(TokenTree::Group(args)) = trees.get(at.saturating_add(2)) {
-                        includes.extend(args.stream().into_iter().filter_map(|t| match t {
-                            TokenTree::Literal(lit) => {
-                                let text = lit.to_string();
-                                text.strip_prefix('"')
-                                    .and_then(|s| s.strip_suffix('"'))
-                                    .map(str::to_owned)
-                            }
-                            _ => None,
-                        }));
-                    }
+                if name == "include"
+                    && bang
+                    && let Some(TokenTree::Group(args)) = trees.get(at.saturating_add(2))
+                {
+                    includes.extend(args.stream().into_iter().filter_map(|t| match t {
+                        TokenTree::Literal(lit) => {
+                            let text = lit.to_string();
+                            text.strip_prefix('"')
+                                .and_then(|s| s.strip_suffix('"'))
+                                .map(str::to_owned)
+                        }
+                        _ => None,
+                    }));
                 }
             }
             TokenTree::Punct(_) | TokenTree::Literal(_) => {}
