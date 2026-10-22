@@ -443,12 +443,14 @@ tableRows on =
         []
 
 
--- `fhost`'s child: a focusable `fchild`, or after the `F4` tick a row in its
--- place, so focus on `fchild` falls back to `fhost`.
+-- `fhost`'s child: a focusable `fchild`, or after the `F4` tick a row of
+-- another tag in its place, so the tick's patch swaps `fhost`'s children and
+-- focus on `fchild` falls back to `fhost`. A row of the same tag would be
+-- patched in place, and focus would drop to the body with nothing to put back.
 shiftSlot : Bool -> Ui.Element Msg
 shiftSlot shifted =
     if shifted then
-        Ui.el [ Ui.id "shiftrow" ] (Ui.text "shifted")
+        Ui.html (Html.node "p" [ Attr.id "shiftrow" ] [ Html.text "shifted" ])
 
     else
         Ui.el [ Ui.id "fchild", Ui.htmlAttribute "tabindex" "0" ] (Ui.text "child")
