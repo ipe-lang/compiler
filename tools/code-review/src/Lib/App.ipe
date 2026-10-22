@@ -1,4 +1,4 @@
-module Lib.App exposing (DecisionTarget(..), Model, Msg(..), Page(..), decisionSaved, decisionTask, historyLoaded, initialModel, queueList, queueLoaded, selectedUid, selectedUnit, standingLoaded, unitPageState, update, viewLoaded)
+module Lib.App exposing (Model, Msg(..), Page(..), decidableRow, decisionSaved, decisionTask, historyLoaded, initialModel, queueList, queueLoaded, selectedUid, selectedUnit, standingLoaded, unitPageState, update, viewLoaded)
 
 import Ipe.Error as Error exposing (Error)
 import Ipe.List as List
@@ -10,7 +10,7 @@ import Lib.Epoch exposing (Epoch)
 import Lib.Failure as Failure exposing (DecideRefusal(..), LoadFailure, RefuseFailure(..), SaveFailure(..))
 import Lib.Index as Index
 import Lib.Keys as Keys exposing (KeyAction(..))
-import Lib.Queue as Queue exposing (DecisionSlot(..), HistoryState(..), RefusalPanel(..), QueueState(..), SelectedView(..), UnitPageState(..))
+import Lib.Queue as Queue exposing (DecidableRow, DecisionSlot(..), DecisionTarget(..), HistoryState(..), RefusalPanel(..), QueueState(..), SelectedView(..), UnitPageState(..))
 import Lib.ReviewKey exposing (MacKey, ReviewKey(..))
 import Lib.ServerLog as ServerLog
 import Lib.Settings as Settings
@@ -56,7 +56,7 @@ type Msg
     | NextPage Index.Cursor
     | ApproveUnit Uid
     | RefuseStart Uid
-    | RefuseDraft String
+    | RefuseDraft Uid String
     | RefuseCancel
     | RefuseSubmit Uid
     | AckRefusal Uid
@@ -250,8 +250,58 @@ loadUnit settings uid model =
     viewStep settings (Queue.reloadView settings.epoch uid model.selectedView) model
 
 
+-- Every step ends with the refusal panel closed unless the row it is open
+-- on is still one the shown page offers a decision on, so a selection,
+-- page or load that stops drawing that row closes its panel at this one
+-- point.
 update : Settings.AppSettings -> Msg -> Model -> ( Model, Cmd Msg )
 update settings msg model =
+    let
+        ( stepped, cmd ) =
+            step settings msg model
+    in
+    ( shownPanel stepped, cmd )
+
+
+shownPanel : Model -> Model
+shownPanel model =
+    case Queue.openRow model.decision of
+        Just ( row, _ ) ->
+            if decidableRow model (Queue.rowUid row) == Just row then
+                model
+
+            else
+                { model | decision = Queue.closeRefusal model.decision }
+
+        Nothing ->
+            model
+
+
+-- The row `uid` when the queue page shows it with decision controls: the
+-- one predicate the view draws them by and the refusal panel opens by.
+decidableRow : Model -> Uid -> Maybe DecidableRow
+decidableRow model uid =
+    if model.page == QueuePage then
+        Queue.decidableRow model.selected model.queueState model.selectedView uid
+
+    else
+        Nothing
+
+
+-- The slot with the refusal panel open on `uid`, when the shown page offers
+-- a decision on it; unchanged otherwise.
+startRefusal : Settings.AppSettings -> Uid -> Model -> ( Model, Cmd Msg )
+startRefusal settings uid model =
+    case decidableRow model uid of
+        Just row ->
+            ( { model | decision = Queue.openRefusal settings.epoch row model.decision }, Cmd.none )
+
+        Nothing ->
+            ( model, Cmd.none )
+
+
+step : Settings.AppSettings -> Msg -> Model -> ( Model, Cmd Msg )
+step settings msg model =
     case msg of
         PendingLoaded load result ->
             if Queue.isCurrentLoad load model.queueLoad then
@@ -274,10 +324,10 @@ update settings msg model =
             saveDecision settings model OnRefusal uid Approved
 
         RefuseStart uid ->
-            ( { model | decision = Queue.openRefusal settings.epoch uid model.decision }, Cmd.none )
+            startRefusal settings uid model
 
-        RefuseDraft text ->
-            ( { model | decision = Queue.editDraft text model.decision }, Cmd.none )
+        RefuseDraft uid text ->
+            ( { model | decision = Queue.editDraft uid text model.decision }, Cmd.none )
 
         RefuseCancel ->
             ( { model | decision = Queue.closeRefusal model.decision }, Cmd.none )
@@ -448,7 +498,7 @@ keyActionMsg settings action model =
         RefuseSelected ->
             case selectedUid model of
                 Just uid ->
-                    ( { model | decision = Queue.openRefusal settings.epoch uid model.decision }, Cmd.none )
+                    startRefusal settings uid model
 
                 Nothing ->
                     ( model, Cmd.none )
@@ -457,9 +507,9 @@ keyActionMsg settings action model =
             selectAt settings i model
 
         ConfirmRefuse ->
-            case Queue.openPanel model.decision of
-                Just ( uid, _ ) ->
-                    submitRefuse settings model (targetOf model uid) uid
+            case Queue.openRow model.decision of
+                Just ( row, _ ) ->
+                    submitRefuse settings model (Queue.rowTarget row) (Queue.rowUid row)
 
                 Nothing ->
                     ( model, Cmd.none )
@@ -473,14 +523,14 @@ keyActionMsg settings action model =
 
 -- The open panel's draft is parsed into a bounded `Reason` here, the one
 -- point where the reviewer's text enters; a blank or over-long draft stays
--- open with why. A submit for any row but the one the panel is open on
--- decides nothing and keeps the draft. The panel is closed before the
+-- open with why. A submit for any row or target but the one the panel is
+-- open on decides nothing and keeps the draft. The panel is closed before the
 -- decision is asked, so the decision's own state is what the row shows.
 submitRefuse : Settings.AppSettings -> Model -> DecisionTarget -> Uid -> ( Model, Cmd Msg )
 submitRefuse settings model target uid =
-    case Queue.openPanel model.decision of
-        Just ( open, draft ) ->
-            if open == uid then
+    case Queue.openRow model.decision of
+        Just ( row, draft ) ->
+            if Queue.rowUid row == uid && Queue.rowTarget row == target then
                 case LibDb.parseReason draft.refuseDraft of
                     Err refused ->
                         ( { model | decision = Queue.draftRefused (DraftRefused refused) model.decision }, Cmd.none )
@@ -498,26 +548,6 @@ submitRefuse settings model target uid =
 clampIndex : Int -> Int -> Int
 clampIndex i len =
     max 0 (min i (len - 1))
-
-
--- What a decision is asked on: a queued unit, decided on its shown source,
--- or an unreviewable file the loaded page lists, decided on its digest.
-type DecisionTarget
-    = OnUnit
-    | OnRefusal
-
-
--- The target of a decision asked by uid alone (the refusal panel's key):
--- an unreviewable file when the loaded page lists one under `uid`, a unit
--- otherwise.
-targetOf : Model -> Uid -> DecisionTarget
-targetOf model uid =
-    case pageRefusal model uid of
-        Just _ ->
-            OnRefusal
-
-        Nothing ->
-            OnUnit
 
 
 pageRefusal : Model -> Uid -> Maybe Index.RefusalRow

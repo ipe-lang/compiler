@@ -14,7 +14,7 @@ import Ipe.System as System
 import Ipe.Task as Task
 import Ipe.Time.Timestamp as Timestamp
 import Ipe.Ui as Ui
-import Lib.App exposing (Model, Page(..), initialModel)
+import Lib.App exposing (Model, Page(..), decidableRow, initialModel)
 import Lib.Db as LibDb exposing (BreakAt(..), HistoryCursor(..), LogShown(..), ReviewEntry(..), StoredDecision(..), Unverified(..))
 import Lib.Epoch as Epoch exposing (Epoch)
 import Lib.Failure as Failure exposing (DecideRefusal(..), LoadFailure(..), ReasonRefusal(..), RefuseFailure(..), SaveFailure(..))
@@ -104,15 +104,21 @@ changedModel loaded old =
     }
 
 
--- The queue card with its refusal panel open, opened as the app opens it
--- for process `epoch`.
+-- The queue card after a refusal asked on it, opened as the app opens it
+-- for process `epoch`: the panel opens only on a card that offers a
+-- decision, so a withheld card stays as it was.
 refusingModel : Epoch -> Index.UnitView -> Model
 refusingModel epoch loaded =
     let
         card =
             cardModel loaded
     in
-    { card | decision = Queue.openRefusal epoch loaded.unit.uid card.decision }
+    case decidableRow card loaded.unit.uid of
+        Just row ->
+            { card | decision = Queue.openRefusal epoch row card.decision }
+
+        Nothing ->
+            card
 
 
 -- The unit page of `loaded`'s own address, with its read settled.
@@ -455,17 +461,21 @@ withheldRefuses loaded entry =
         && not (has sourceMarker onPage)
 
 
--- A withheld card whose refusal panel is open still offers no decision.
+-- A refusal asked on a withheld card opens no panel and offers no
+-- decision.
 withheldRefusePanelRefuses : Epoch -> Index.UnitView -> Withheld -> Bool
 withheldRefusePanelRefuses epoch loaded entry =
     let
         withheld =
             { loaded | view = entry.view }
 
+        refused =
+            refusingModel epoch withheld
+
         html =
-            page (refusingModel epoch withheld)
+            page refused
     in
-    has entry.reason html && noDecisionButtons html
+    Queue.openPanel refused.decision == Nothing && has entry.reason html && noDecisionButtons html
 
 
 -- ── queue states and counts ─────────────────────────────────────

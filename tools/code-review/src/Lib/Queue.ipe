@@ -1,4 +1,4 @@
-module Lib.Queue exposing (DecisionSlot(..), Draft, HistoryLabel(..), HistoryPage, HistoryRow, HistoryState(..), LoadTicket, Place(..), Presence(..), Progress, QueuePage, QueueState(..), QueuedUnit, RefusalPanel(..), ResyncBound, SelectedView(..), Standing(..), StandingRead(..), UnitLabel, UnitPageState(..), chainBanner, clearView, closeRefusal, decidableSource, decide, decideRefusal, decisionNotSaved, decisionRefused, decisionWritten, draftRefused, drainThenLoad, editDraft, entryUid, firstTicket, historyStateFromResult, historyStatusText, isCurrentLoad, loadHistoryPage, loadPage, loadStanding, makeResyncBound, notSavedOf, openPanel, openRefusal, ownedSlot, pendingText, nextTicket, loadUnitView, pageHeaderText, queueLabels, queueSettled, queueStatusText, refusalReasonText, reloadView, resyncBound, resyncPageCeiling, resyncReviewed, resyncReviewedWithin, selectView, selectedViewOf, selectedViewStatusText, sourceStatusText, standingArrived, standingFor, standingOf, startDecision, stateFromResult, unitLabel, unitPageEntry, unitPageOf, unitPageStatusText, viewArrived)
+module Lib.Queue exposing (DecidableRow, DecisionSlot(..), DecisionTarget(..), Draft, HistoryLabel(..), HistoryPage, HistoryRow, HistoryState(..), LoadTicket, Place(..), Presence(..), Progress, QueuePage, QueueState(..), QueuedUnit, RefusalPanel(..), ResyncBound, SelectedView(..), Standing(..), StandingRead(..), UnitLabel, UnitPageState(..), chainBanner, clearView, closeRefusal, decidableRow, decidableSource, decide, decideRefusal, decisionNotSaved, decisionRefused, decisionWritten, draftRefused, drainThenLoad, editDraft, entryUid, firstTicket, historyStateFromResult, historyStatusText, isCurrentLoad, loadHistoryPage, loadPage, loadStanding, makeResyncBound, notSavedOf, openPanel, openRefusal, openRow, ownedSlot, pendingText, nextTicket, loadUnitView, pageHeaderText, queueLabels, queueSettled, queueStatusText, refusalReasonText, reloadView, rowTarget, rowUid, resyncBound, resyncPageCeiling, resyncReviewed, resyncReviewedWithin, selectView, selectedViewOf, selectedViewStatusText, sourceStatusText, standingArrived, standingFor, standingOf, startDecision, stateFromResult, unitLabel, unitPageEntry, unitPageOf, unitPageStatusText, viewArrived)
 
 import Ipe.ByteSize as ByteSize
 import Ipe.Db as Db
@@ -1140,6 +1140,78 @@ unitPageOf uid state =
             UnitLoading
 
 
+-- What a decision is asked on: a queued unit, decided on its shown source,
+-- or an unreviewable file the loaded page lists, decided on its digest.
+type DecisionTarget
+    = OnUnit
+    | OnRefusal
+
+
+-- A row the shown queue page draws decision controls for, with what a
+-- decision on it is asked on. Only `decidableRow` builds one, so the view
+-- draws a row's controls, and the refusal panel opens, by one predicate.
+type DecidableRow
+    = DecidableRow Uid DecisionTarget
+
+
+rowUid : DecidableRow -> Uid
+rowUid row =
+    case row of
+        DecidableRow uid _ ->
+            uid
+
+
+rowTarget : DecidableRow -> DecisionTarget
+rowTarget row =
+    case row of
+        DecidableRow _ target ->
+            target
+
+
+-- The row `uid` as the queue page shows it with card `selected` selected
+-- and `view` in the source slot, when it offers a decision: an
+-- acknowledgeable file the page lists, or the selected card's unit with its
+-- verified source shown, each over a proven log. Nothing for a withheld
+-- source, a file no decision binds, a log that records no decision, a page
+-- not loaded, or a uid the page does not show.
+decidableRow : Int -> QueueState -> SelectedView -> Uid -> Maybe DecidableRow
+decidableRow selected state view uid =
+    case state of
+        Loaded page ->
+            case page.log of
+                ShownProven ->
+                    case List.find (\row -> row.uid == uid) page.refusals of
+                        Just row ->
+                            Maybe.map (\_ -> DecidableRow uid OnRefusal) row.digest
+
+                        Nothing ->
+                            case List.head (List.drop selected page.units) of
+                                Just q ->
+                                    if q.unit.uid == uid then
+                                        Maybe.map (\_ -> DecidableRow uid OnUnit) (decidableSource uid view)
+
+                                    else
+                                        Nothing
+
+                                Nothing ->
+                                    Nothing
+
+                ShownBroken _ ->
+                    Nothing
+
+                ShownKeyMismatch ->
+                    Nothing
+
+                ShownUnkeyed ->
+                    Nothing
+
+        Loading ->
+            Nothing
+
+        Failed _ ->
+            Nothing
+
+
 -- The session's one decision slot, and what the reviewer sees of it. A
 -- decision re-reads its source to re-prove it, so at most one is in flight:
 -- a decision asked while one is busy starts nothing. Busy is two cases: the
@@ -1161,11 +1233,11 @@ type DecisionSlot
     | DecisionNotSaved SaveFailure LoadTicket RefusalPanel
 
 
--- The refusal panel of an idle slot: closed, or open on one row with its
--- draft.
+-- The refusal panel of an idle slot: closed, or open on one row the shown
+-- page offers a decision on, with its draft.
 type RefusalPanel
     = PanelClosed
-    | PanelOpen Uid Draft
+    | PanelOpen DecidableRow Draft
 
 
 -- The reviewer's refusal draft, and why it stays open, if it was refused.
@@ -1212,18 +1284,19 @@ startDecision epoch uid slot =
             Just (DecisionSaving uid epoch)
 
 
--- The slot with the refusal panel open on `uid`, its draft empty, by the
+-- The slot with the refusal panel open on `row`, its draft empty, by the
 -- same busy check `startDecision` makes: while a decision of process
 -- `epoch` is busy the slot is unchanged, and a busy decision another process
--- left behind is idle.
-openRefusal : Epoch -> Uid -> DecisionSlot -> DecisionSlot
-openRefusal epoch uid slot =
+-- left behind is idle. Only a row the shown page offers a decision on can
+-- hold the panel, so a panel no row draws has no representation.
+openRefusal : Epoch -> DecidableRow -> DecisionSlot -> DecisionSlot
+openRefusal epoch row slot =
     case busyOwnedBy epoch slot of
         Just _ ->
             slot
 
         Nothing ->
-            withPanel (PanelOpen uid { refuseDraft = "", refuseError = Nothing }) (ownedSlot epoch slot)
+            withPanel (PanelOpen row { refuseDraft = "", refuseError = Nothing }) (ownedSlot epoch slot)
 
 
 -- The slot with its refusal panel closed.
@@ -1232,11 +1305,21 @@ closeRefusal slot =
     withPanel PanelClosed slot
 
 
--- The open panel's draft replaced by `text`, which clears why it was
--- refused; a slot with no open panel is unchanged.
-editDraft : String -> DecisionSlot -> DecisionSlot
-editDraft text slot =
-    mapOpenDraft (\_ -> { refuseDraft = text, refuseError = Nothing }) slot
+-- The draft of the panel open on `uid` replaced by `text`, which clears
+-- why it was refused; a slot with no panel open on `uid` is unchanged, so
+-- an edit sent for another row's panel writes into none.
+editDraft : Uid -> String -> DecisionSlot -> DecisionSlot
+editDraft uid text slot =
+    case openRow slot of
+        Just ( row, _ ) ->
+            if rowUid row == uid then
+                mapOpenDraft (\_ -> { refuseDraft = text, refuseError = Nothing }) slot
+
+            else
+                slot
+
+        Nothing ->
+            slot
 
 
 -- The open panel's draft refused for `failure`; a slot with no open panel
@@ -1247,14 +1330,20 @@ draftRefused failure slot =
 
 
 -- The row the refusal panel is open on, with its draft, if it is open.
-openPanel : DecisionSlot -> Maybe ( Uid, Draft )
-openPanel slot =
+openRow : DecisionSlot -> Maybe ( DecidableRow, Draft )
+openRow slot =
     case panelOf slot of
-        PanelOpen uid draft ->
-            Just ( uid, draft )
+        PanelOpen row draft ->
+            Just ( row, draft )
 
         PanelClosed ->
             Nothing
+
+
+-- The uid of the row the refusal panel is open on, with its draft.
+openPanel : DecisionSlot -> Maybe ( Uid, Draft )
+openPanel slot =
+    Maybe.map (\( row, draft ) -> ( rowUid row, draft )) (openRow slot)
 
 
 -- The refusal panel the slot holds; a busy slot holds none.
@@ -1295,8 +1384,8 @@ withPanel panel slot =
 mapOpenDraft : (Draft -> Draft) -> DecisionSlot -> DecisionSlot
 mapOpenDraft change slot =
     case panelOf slot of
-        PanelOpen uid draft ->
-            withPanel (PanelOpen uid (change draft)) slot
+        PanelOpen row draft ->
+            withPanel (PanelOpen row (change draft)) slot
 
         PanelClosed ->
             slot

@@ -220,7 +220,7 @@ queueStateBody model =
                     , nextPageButton page.next
                     ]
                 , chainBannerLine page.log
-                , refusalBlock (refuseControlsOf model) page
+                , refusalBlock model page
                 , queueUnits model
                 ]
 
@@ -236,8 +236,8 @@ queueStateBody model =
 -- size and its digest's first characters, never a byte of the file. An
 -- acknowledgeable file on a page that records decisions offers Acknowledge
 -- and Refuse; a blocking one says only a change to the tree closes it.
-refusalBlock : RefuseControls -> Queue.QueuePage -> Ui.Element Msg
-refusalBlock controls page =
+refusalBlock : Model -> Queue.QueuePage -> Ui.Element Msg
+refusalBlock model page =
     if List.isEmpty page.refusals then
         Ui.none
 
@@ -245,12 +245,12 @@ refusalBlock controls page =
         Ui.column
             [ Ui.width Ui.fill, Ui.spacing 8 ]
             (Ui.el [ Font.size 13, Font.bold, Font.color (Ui.rgb 220 170 90) ] (Ui.text "Unreviewable files")
-                :: List.map (refusalCard controls page.log) page.refusals
+                :: List.map (\row -> refusalCard (refuseControlsOf model) (App.decidableRow model row.uid) page.log row) page.refusals
             )
 
 
-refusalCard : RefuseControls -> LogShown -> Index.RefusalRow -> Ui.Element Msg
-refusalCard controls shown row =
+refusalCard : RefuseControls -> Maybe Queue.DecidableRow -> LogShown -> Index.RefusalRow -> Ui.Element Msg
+refusalCard controls offered shown row =
     Ui.column
         [ Ui.width Ui.fill
         , Ui.padding 12
@@ -268,7 +268,7 @@ refusalCard controls shown row =
                 [ Ui.paddingXY 8 3, Background.color (Ui.rgb 40 40 52), Border.rounded 4, Font.size 11, Font.bold, Font.color (Ui.rgb 220 220 230) ]
                 (safeText (Queue.refusalReasonText row.reason))
             , Ui.el [ Ui.width Ui.fill ] Ui.none
-            , refusalControls controls shown row
+            , refusalControls controls offered shown row
             ]
         , Ui.row
             [ Ui.spacing 10, Font.size 12, Font.color (Ui.rgb 150 150 165) ]
@@ -290,8 +290,8 @@ refusalCard controls shown row =
 
 -- Acknowledge and Refuse for a file a decision can bind on a page that
 -- records decisions; otherwise why there is no control.
-refusalControls : RefuseControls -> LogShown -> Index.RefusalRow -> Ui.Element Msg
-refusalControls controls shown row =
+refusalControls : RefuseControls -> Maybe Queue.DecidableRow -> LogShown -> Index.RefusalRow -> Ui.Element Msg
+refusalControls controls offered shown row =
     case row.digest of
         Nothing ->
             Ui.el [ Font.size 12, Font.color (Ui.rgb 220 170 90) ] (Ui.text "Cannot be acknowledged: fix it in the tree.")
@@ -302,7 +302,7 @@ refusalControls controls shown row =
                     Ui.el [ Font.size 12, Font.color (Ui.rgb 220 170 90) ] (safeText (SafeText.literal why))
 
                 Nothing ->
-                    decisionControls controls row.uid (SafeText.literal "Acknowledge") (AckRefusal row.uid) (RefuseRefusalSubmit row.uid)
+                    decisionControls controls row.uid offered (SafeText.literal "Acknowledge") (AckRefusal row.uid) (RefuseRefusalSubmit row.uid)
 
 
 nextPageButton : Maybe Index.Cursor -> Ui.Element Msg
@@ -316,32 +316,17 @@ nextPageButton next =
 
 
 -- What the decision controls read of the model: the decision slot, and the
--- row its refusal panel is open on with the draft and its failure, read from
--- the slot, which holds a panel only while no decision is busy.
+-- row its refusal panel is open on with its draft, read from the slot, which
+-- holds a panel only while no decision is busy.
 type alias RefuseControls =
-    { refusingUid : Maybe Uid
-    , refuseDraft : String
-    , refuseError : Maybe Failure.RefuseFailure
+    { panel : Maybe ( Queue.DecidableRow, Queue.Draft )
     , decision : Queue.DecisionSlot
     }
 
 
 refuseControlsOf : Model -> RefuseControls
 refuseControlsOf model =
-    case Queue.openPanel model.decision of
-        Just ( uid, draft ) ->
-            { refusingUid = Just uid
-            , refuseDraft = draft.refuseDraft
-            , refuseError = draft.refuseError
-            , decision = model.decision
-            }
-
-        Nothing ->
-            { refusingUid = Nothing
-            , refuseDraft = ""
-            , refuseError = Nothing
-            , decision = model.decision
-            }
+    { panel = Queue.openRow model.decision, decision = model.decision }
 
 
 queueUnits : Model -> Ui.Element Msg
@@ -366,7 +351,7 @@ queueUnits model =
                     [ hintLine (recordsDecisions model.queueState)
                     , case current of
                         Just ( q, label ) ->
-                            unitCard (refuseControlsOf model) model.queueState model.selectedView label q
+                            unitCard (refuseControlsOf model) (App.decidableRow model q.unit.uid) model.queueState model.selectedView label q
 
                         Nothing ->
                             Ui.none
@@ -829,8 +814,8 @@ urlSync model =
         (Html.node "div" [ Attr.attribute "data-ipe-path" (currentPath model) ] [])
 
 
-unitCard : RefuseControls -> Queue.QueueState -> Queue.SelectedView -> UnitLabel -> Queue.QueuedUnit -> Ui.Element Msg
-unitCard controls queueState selectedView label q =
+unitCard : RefuseControls -> Maybe Queue.DecidableRow -> Queue.QueueState -> Queue.SelectedView -> UnitLabel -> Queue.QueuedUnit -> Ui.Element Msg
+unitCard controls offered queueState selectedView label q =
     let
         unit =
             q.unit
@@ -858,7 +843,7 @@ unitCard controls queueState selectedView label q =
             , Ui.el [ Ui.width Ui.fill ] Ui.none
             , case loaded of
                 Just v ->
-                    decisionButtons controls queueState v
+                    decisionButtons controls offered queueState v
 
                 Nothing ->
                     Ui.none
@@ -1118,8 +1103,8 @@ chipAround bg content =
 
 -- Approve and Refuse exist only for a verified view on a server that signs
 -- decisions; any other view shows why it cannot be decided instead.
-decisionButtons : RefuseControls -> Queue.QueueState -> Index.UnitView -> Ui.Element Msg
-decisionButtons controls queueState loaded =
+decisionButtons : RefuseControls -> Maybe Queue.DecidableRow -> Queue.QueueState -> Index.UnitView -> Ui.Element Msg
+decisionButtons controls offered queueState loaded =
     case Queue.sourceStatusText loaded.view of
         Just why ->
             Ui.el [ Font.size 12, Font.color (Ui.rgb 220 170 90) ] (shownLabel why)
@@ -1129,7 +1114,7 @@ decisionButtons controls queueState loaded =
                 Loaded page ->
                     case noDecisionReason page.log of
                         Nothing ->
-                            verifiedDecisionButtons controls loaded.unit
+                            verifiedDecisionButtons controls offered loaded.unit
 
                         Just why ->
                             Ui.el [ Font.size 12, Font.color (Ui.rgb 220 170 90) ] (safeText (SafeText.literal why))
@@ -1141,31 +1126,47 @@ decisionButtons controls queueState loaded =
                     Ui.none
 
 
-verifiedDecisionButtons : RefuseControls -> Index.Unit -> Ui.Element Msg
-verifiedDecisionButtons controls unit =
-    decisionControls controls unit.uid (SafeText.literal "Approve") (ApproveUnit unit.uid) (RefuseSubmit unit.uid)
+verifiedDecisionButtons : RefuseControls -> Maybe Queue.DecidableRow -> Index.Unit -> Ui.Element Msg
+verifiedDecisionButtons controls offered unit =
+    decisionControls controls unit.uid offered (SafeText.literal "Approve") (ApproveUnit unit.uid) (RefuseSubmit unit.uid)
 
 
 -- The one place a row's decision controls are drawn, for a queued unit and
 -- an unreviewable file alike: the pending state while a decision is busy,
--- else the open refusal panel, or the approve control (`approveLabel`
--- sending `approve`) beside Refuse.
-decisionControls : RefuseControls -> Uid -> SafeText -> Msg -> Msg -> Ui.Element Msg
-decisionControls controls uid approveLabel approve submit =
+-- else, for a row the page offers a decision on (`offered`, the same row
+-- the refusal panel opens on), the open refusal panel, or the approve
+-- control (`approveLabel` sending `approve`) beside Refuse.
+decisionControls : RefuseControls -> Uid -> Maybe Queue.DecidableRow -> SafeText -> Msg -> Msg -> Ui.Element Msg
+decisionControls controls uid offered approveLabel approve submit =
     case Queue.pendingText uid controls.decision of
         Just text ->
             Ui.el [ Font.size 12, Font.color (Ui.rgb 150 150 165) ] (safeText text)
 
         Nothing ->
-            if controls.refusingUid == Just uid then
-                refusePanel controls submit
+            case offered of
+                Just row ->
+                    case controls.panel of
+                        Just ( open, draft ) ->
+                            if open == row then
+                                refusePanel uid draft submit
 
-            else
-                Ui.row
-                    [ Ui.spacing 8 ]
-                    [ approveButton approveLabel approve
-                    , refuseButton (SafeText.literal "Refuse") (RefuseStart uid)
-                    ]
+                            else
+                                offeredButtons uid approveLabel approve
+
+                        Nothing ->
+                            offeredButtons uid approveLabel approve
+
+                Nothing ->
+                    Ui.none
+
+
+offeredButtons : Uid -> SafeText -> Msg -> Ui.Element Msg
+offeredButtons uid approveLabel approve =
+    Ui.row
+        [ Ui.spacing 8 ]
+        [ approveButton approveLabel approve
+        , refuseButton (SafeText.literal "Refuse") (RefuseStart uid)
+        ]
 
 
 approveButton : SafeText -> Msg -> Ui.Element Msg
@@ -1194,19 +1195,20 @@ refuseButton label msg =
         { onPress = Just msg, label = safeText label }
 
 
--- The refusal reason input with Confirm, which sends `submit`, and Cancel.
-refusePanel : RefuseControls -> Msg -> Ui.Element Msg
-refusePanel controls submit =
+-- The refusal reason input of the panel open on `uid` with Confirm, which
+-- sends `submit`, and Cancel.
+refusePanel : Uid -> Queue.Draft -> Msg -> Ui.Element Msg
+refusePanel uid draft submit =
     Ui.column
         [ Ui.width (Ui.px 240), Ui.spacing 6 ]
         [ Input.text
             [ Ui.width Ui.fill ]
             { label = Input.labelAbove [ Font.size 11 ] (Ui.text "Reason")
-            , text = controls.refuseDraft
-            , onChange = RefuseDraft
+            , text = draft.refuseDraft
+            , onChange = RefuseDraft uid
             , placeholder = Just (Input.placeholder [ Font.size 12 ] (Ui.text "Why refuse?"))
             }
-        , case controls.refuseError of
+        , case draft.refuseError of
             Just failure ->
                 Ui.el [ Font.size 11, Font.color (Ui.rgb 220 110 110) ] (safeText (SafeText.literal (Failure.refuseFailureText failure)))
 
