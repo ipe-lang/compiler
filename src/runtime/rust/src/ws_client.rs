@@ -1290,6 +1290,187 @@ mod tests {
         assert!(!WsFailure::of(&io).to_string().contains("73.150.2.210"));
     }
 
+    /// A message at the ceiling is read whole and one byte past it is a
+    /// capacity failure, under the configuration every connect uses.
+    #[tokio::test]
+    async fn a_message_past_the_ceiling_is_a_capacity_failure() {
+        use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let server = tokio::spawn(async move {
+            let mut socket = tokio_tungstenite::accept_async(server_io).await.ok()?;
+            for len in [16, 17] {
+                socket
+                    .send(Message::Text("x".repeat(len).into()))
+                    .await
+                    .ok()?;
+            }
+            Some(socket)
+        });
+        let req = "ws://peer.example/".into_client_request();
+        assert!(req.is_ok(), "{req:?}");
+        let Ok(req) = req else { return };
+        let opened =
+            tokio_tungstenite::client_async_with_config(req, client_io, Some(ws_config(16))).await;
+        assert!(opened.is_ok(), "{:?}", opened.as_ref().err());
+        let Ok((mut socket, _)) = opened else { return };
+        let at_ceiling = socket.next().await;
+        assert!(
+            matches!(at_ceiling, Some(Ok(Message::Text(ref t))) if t.len() == 16),
+            "{at_ceiling:?}"
+        );
+        let past_ceiling = socket.next().await;
+        let failure = match past_ceiling {
+            Some(Err(ref e)) => Some(WsFailure::of(e)),
+            _ => None,
+        };
+        assert_eq!(failure, Some(WsFailure::Capacity), "{past_ceiling:?}");
+        drop(socket);
+        let _server = server.await;
+    }
+
+    /// The outbound buffer is finite: the write target plus one framed message.
+    #[test]
+    fn the_write_buffer_is_bounded_by_the_ceiling() {
+        for ceiling in [1, 1024 * 1024, usize::MAX] {
+            let config = ws_config(ceiling);
+            assert_eq!(
+                config.max_write_buffer_size,
+                (128 * 1024_usize)
+                    .saturating_add(ceiling)
+                    .saturating_add(14),
+                "ceiling {ceiling}"
+            );
+            assert!(
+                config.max_write_buffer_size > config.write_buffer_size,
+                "ceiling {ceiling}: tungstenite refuses a bound at or below the write target"
+            );
+            assert_eq!(config.max_message_size, Some(ceiling));
+            assert_eq!(config.max_frame_size, Some(ceiling));
+        }
+        assert!(ws_config(1024 * 1024).max_write_buffer_size < usize::MAX);
+    }
+
+    /// The CA that signed [`TLS_SERVER_PEM`]; in no public root store.
+    const TLS_CA_PEM: &[u8] = include_bytes!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/pg_tls/ca.pem"
+    ));
+
+    /// A server certificate valid only for [`TLS_HOST`].
+    const TLS_SERVER_PEM: &[u8] = include_bytes!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/pg_tls/server.pem"
+    ));
+
+    /// The private key of [`TLS_SERVER_PEM`].
+    const TLS_SERVER_KEY: &[u8] = include_bytes!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/pg_tls/server.key"
+    ));
+
+    /// The only name [`TLS_SERVER_PEM`] is valid for.
+    const TLS_HOST: &str = "db.example.test";
+
+    /// The local TLS server's configuration, serving [`TLS_SERVER_PEM`].
+    fn tls_server_config() -> Option<rustls::ServerConfig> {
+        use rustls::pki_types::pem::PemObject;
+        use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+        let certs = CertificateDer::pem_slice_iter(TLS_SERVER_PEM)
+            .collect::<Result<Vec<_>, _>>()
+            .ok()?;
+        let key = PrivateKeyDer::from_pem_slice(TLS_SERVER_KEY).ok()?;
+        rustls::ServerConfig::builder_with_provider(std::sync::Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .ok()?
+        .with_no_client_auth()
+        .with_single_cert(certs, key)
+        .ok()
+    }
+
+    /// Serve one TLS client on `listener`; whether its handshake completed.
+    fn serve_one_tls_client(listener: std::net::TcpListener) -> Option<bool> {
+        let (mut tcp, _) = listener.accept().ok()?;
+        tcp.set_read_timeout(Some(std::time::Duration::from_secs(10)))
+            .ok()?;
+        let mut tls =
+            rustls::ServerConnection::new(std::sync::Arc::new(tls_server_config()?)).ok()?;
+        while tls.is_handshaking() {
+            if tls.complete_io(&mut tcp).is_err() {
+                break;
+            }
+        }
+        Some(!tls.is_handshaking())
+    }
+
+    /// The runtime's TLS handshake as [`TLS_HOST`] against a local server, under
+    /// `config`; and whether the server finished its side.
+    async fn tls_handshake_with(
+        config: std::sync::Arc<rustls::ClientConfig>,
+    ) -> (Result<(), WsFailure>, Option<bool>) {
+        let setup = Err(WsFailure::Io(std::io::ErrorKind::Other));
+        let listener = std::net::TcpListener::bind("127.0.0.1:0");
+        assert!(listener.is_ok(), "{:?}", listener.as_ref().err());
+        let Ok(listener) = listener else {
+            return (setup, None);
+        };
+        let Ok(addr) = listener.local_addr() else {
+            return (setup, None);
+        };
+        #[allow(clippy::expect_used)] // a test thread that cannot start must fail the test
+        let server = std::thread::Builder::new()
+            .spawn(move || serve_one_tls_client(listener))
+            .expect("spawn test thread");
+        let tcp = tokio::net::TcpStream::connect(addr).await;
+        assert!(tcp.is_ok(), "{:?}", tcp.as_ref().err());
+        let Ok(tcp) = tcp else {
+            return (setup, None);
+        };
+        let name = rustls::pki_types::ServerName::try_from(TLS_HOST);
+        assert!(name.is_ok(), "{name:?}");
+        let Ok(name) = name else {
+            return (setup, None);
+        };
+        let outcome = tls_handshake(tcp, name, config).await.map(drop);
+        (outcome, server.join().ok().flatten())
+    }
+
+    /// A `wss://` server whose certificate chains to no webpki root is refused
+    /// with the typed TLS failure; the same server passes under a store that
+    /// trusts its CA, so the refusal is the root store's.
+    #[tokio::test]
+    async fn wss_refuses_a_certificate_outside_the_webpki_roots() {
+        let webpki = wss_tls_config();
+        assert!(
+            webpki.is_some(),
+            "the ring provider admits a safe protocol version"
+        );
+        let Some(webpki) = webpki else { return };
+        let (refused, server_done) = tls_handshake_with(webpki).await;
+        assert_eq!(refused, Err(WsFailure::Tls));
+        assert_eq!(
+            server_done,
+            Some(false),
+            "the server saw a completed handshake"
+        );
+
+        use rustls::pki_types::CertificateDer;
+        use rustls::pki_types::pem::PemObject;
+        let mut roots = rustls::RootCertStore::empty();
+        for ca in CertificateDer::pem_slice_iter(TLS_CA_PEM) {
+            assert!(ca.is_ok(), "{:?}", ca.as_ref().err());
+            if let Ok(ca) = ca {
+                assert!(roots.add(ca).is_ok(), "the test CA parses");
+            }
+        }
+        let trusting = tls_client_config(roots).map(std::sync::Arc::new);
+        assert!(trusting.is_some());
+        let Some(trusting) = trusting else { return };
+        let (accepted, _) = tls_handshake_with(trusting).await;
+        assert_eq!(accepted, Ok(()), "a trusted server must pass");
+    }
+
     /// A subscription sink collecting every emitted message.
     #[derive(Clone)]
     struct Inbox(tokio::sync::mpsc::UnboundedSender<WsClientMessage>);
