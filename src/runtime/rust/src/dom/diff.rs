@@ -80,6 +80,28 @@ pub const AUTOFOCUS_SPENDING_EVENTS: [&str; 5] = [
     "keydown",
 ];
 
+/// Whether every name is non-empty ASCII lowercase letters, which need no
+/// escaping inside a JavaScript string in a `<script>`.
+const fn spending_events_plain() -> bool {
+    let mut names: &[&str] = &AUTOFOCUS_SPENDING_EVENTS;
+    while let [name, rest @ ..] = names {
+        let mut bytes = name.as_bytes();
+        if bytes.is_empty() {
+            return false;
+        }
+        while let [byte, tail @ ..] = bytes {
+            if !byte.is_ascii_lowercase() {
+                return false;
+            }
+            bytes = tail;
+        }
+        names = rest;
+    }
+    true
+}
+// IPE-RUST-AUDIT:ACCEPTED (Arthur Maciel) — compile-time `const` assertion (not a runtime panic); fails the BUILD if an autofocus-spending event name is empty or holds a byte other than an ASCII lowercase letter [ledger #boundary]
+const _: () = assert!(spending_events_plain());
+
 /// The page global the wasm loader sets once one of
 /// [`AUTOFOCUS_SPENDING_EVENTS`] fires; the wasm first paint reads it.
 pub const AUTOFOCUS_SPENT_GLOBAL: &str = "__ipeAutofocusSpent";

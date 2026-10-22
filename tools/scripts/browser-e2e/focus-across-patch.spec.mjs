@@ -26,7 +26,8 @@
  * root, so a `keys: j` line proves focus survived the patch. A read no
  * fixture event reaches (the namespace the form's content is parsed in, a
  * script revived inside the form, a full re-render) is driven by calling the
- * client's own function from the page.
+ * client's own function from the page. An input method's composition, which
+ * no key press makes, goes through the DevTools protocol's input commands.
  *
  * Runs against the focus-across-patch example. Prerequisites and local run:
  * see geo-clipboard.spec.mjs.
@@ -882,4 +883,69 @@ test("focus-across-patch: a pointer crossing a layout shift brings never moves f
   await expect(page.locator("input#hoverask")).toHaveCount(1);
   await settle(page);
   expect(await focusedId(page)).toBe("root");
+});
+
+/**
+ * Holds every event POST the page makes and records its body, so no frame
+ * answers a send and takes its focus record. `release` lets the held POSTs go.
+ */
+async function holdEvents(page) {
+  const posts = [];
+  let release;
+  const held = new Promise((resolve) => {
+    release = resolve;
+  });
+  await page.route("**/_ipe/event", async (route) => {
+    posts.push(JSON.parse(route.request().postData() ?? "{}"));
+    await held;
+    await route.continue().catch(() => {});
+  });
+  return { posts, release };
+}
+
+/** The seq of the first held POST whose first argument is `arg`. */
+async function sentWith(events, arg) {
+  await expect.poll(() => events.posts.some((b) => b.args?.[0] === arg)).toBe(true);
+  return events.posts.find((b) => b.args?.[0] === arg).seq;
+}
+
+/** Whether the send at `seq` keeps a record of a user act. */
+const recorded = (page, seq) => page.evaluate((s) => window.__ipeFocusSends.some((r) => r.seq === s), seq);
+
+test("focus-across-patch: an edit an input method is still composing is no act of the user's", async ({ page }) => {
+  await open(page);
+  const field = page.locator("input#note");
+  await field.click();
+  const events = await holdEvents(page);
+  // The DevTools protocol raises the composition as the browser's own trusted input.
+  const cdp = await page.context().newCDPSession(page);
+  await cdp.send("Input.imeSetComposition", { text: "a", selectionStart: 1, selectionEnd: 1 });
+  const composed = await sentWith(events, "a");
+  expect(await recorded(page, composed)).toBe(false);
+  // Committing ends the composition: the next edit is the user's own.
+  await cdp.send("Input.insertText", { text: "a" });
+  await cdp.send("Input.insertText", { text: "b" });
+  const typed = await sentWith(events, "ab");
+  expect(await recorded(page, typed)).toBe(true);
+  await expect(field).toBeFocused();
+  events.release();
+});
+
+test("focus-across-patch: a key an input method takes is no act of the user's", async ({ page }) => {
+  await open(page);
+  await expect.poll(() => focusedId(page)).toBe("root");
+  const events = await holdEvents(page);
+  // A trusted key with the `keyCode` an input method gives the keys it takes.
+  const cdp = await page.context().newCDPSession(page);
+  const ime = { key: "Process", code: "KeyA", windowsVirtualKeyCode: 229, nativeVirtualKeyCode: 229 };
+  await cdp.send("Input.dispatchKeyEvent", { type: "rawKeyDown", ...ime });
+  await cdp.send("Input.dispatchKeyEvent", { type: "keyUp", ...ime });
+  const taken = await sentWith(events, "Process");
+  expect(await recorded(page, taken)).toBe(false);
+  // A plain key is the user's own.
+  await page.keyboard.press("j");
+  const pressed = await sentWith(events, "j");
+  expect(await recorded(page, pressed)).toBe(true);
+  expect(await focusedId(page)).toBe("root");
+  events.release();
 });
