@@ -299,34 +299,39 @@ impl Shutdown {
         Drain {
             phase: Some(self.phase.subscribe()),
             live: Some(Arc::clone(&self.live)),
+            work: Some(Arc::clone(&self.work)),
         }
     }
 
     /// Count one unit of work, cancelled once the phase is closing.
-    ///
-    /// A unit started after the closing mark is uncounted and born cancelled.
     fn work_guard(&self) -> Result<WorkGuard, WorkFull> {
-        let counted = self
-            .work
-            .state
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |state| {
-                if state & CLOSING_BIT == 0 {
-                    state.checked_add(1).filter(|_| state < WORK_CEILING)
-                } else {
-                    None
-                }
-            });
-        match counted {
-            Ok(_) => Ok(WorkGuard {
-                cancel: Cancel::OnClosing(self.phase.subscribe()),
-                work: Some(Arc::clone(&self.work)),
-            }),
-            Err(state) if state & CLOSING_BIT != 0 => Ok(WorkGuard {
-                cancel: Cancel::Already,
-                work: None,
-            }),
-            Err(_) => Err(WorkFull),
-        }
+        count_work(&self.work, self.phase.subscribe())
+    }
+}
+
+/// Count one unit of `work`, cancelled once `phase` turns closing.
+///
+/// A unit started after the closing mark is uncounted and born cancelled.
+fn count_work(work: &Arc<Work>, phase: watch::Receiver<Phase>) -> Result<WorkGuard, WorkFull> {
+    let counted = work
+        .state
+        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |state| {
+            if state & CLOSING_BIT == 0 {
+                state.checked_add(1).filter(|_| state < WORK_CEILING)
+            } else {
+                None
+            }
+        });
+    match counted {
+        Ok(_) => Ok(WorkGuard {
+            cancel: Cancel::OnClosing(phase),
+            work: Some(Arc::clone(work)),
+        }),
+        Err(state) if state & CLOSING_BIT != 0 => Ok(WorkGuard {
+            cancel: Cancel::Already,
+            work: None,
+        }),
+        Err(_) => Err(WorkFull),
     }
 }
 
@@ -546,6 +551,17 @@ impl WorkGuard {
         }
     }
 
+    /// Run `fut` unless this work is cancelled first; `None` once it is.
+    ///
+    /// The cancel is polled first, so a unit born cancelled never polls `fut`.
+    pub async fn unless_cancelled<F: Future>(&mut self, fut: F) -> Option<F::Output> {
+        tokio::select! {
+            biased;
+            () = self.cancelled() => None,
+            out = fut => Some(out),
+        }
+    }
+
     /// Resolve once this work is cancelled; never for an unarmed guard.
     ///
     /// Cancel-safe: the current phase is read on every call. An owner gone
@@ -654,6 +670,7 @@ pub async fn close_owned_pools(armed: &Armed, _settled: WorkSettled) -> PoolsClo
 pub struct Drain {
     phase: Option<watch::Receiver<Phase>>,
     live: Option<Arc<Live>>,
+    work: Option<Arc<Work>>,
 }
 
 impl Drain {
@@ -663,6 +680,24 @@ impl Drain {
         Self {
             phase: None,
             live: None,
+            work: None,
+        }
+    }
+
+    /// Count one unit of pool-reaching work on this drain's owner, cancelled
+    /// once the shutdown closes; never cancelled for an unarmed handle.
+    ///
+    /// A long-lived task that runs user code (a socket callback, a stream
+    /// handler) holds one beside its [`LiveGuard`], so the close cuts that
+    /// code before the pools it may use close.
+    ///
+    /// # Errors
+    ///
+    /// [`WorkFull`] when the owner already counts [`WORK_CEILING`] units.
+    pub fn work(&self) -> Result<WorkGuard, WorkFull> {
+        match (self.work.as_ref(), self.phase.as_ref()) {
+            (Some(work), Some(phase)) => count_work(work, phase.clone()),
+            (None, _) | (_, None) => Ok(WorkGuard::never()),
         }
     }
 
@@ -855,6 +890,7 @@ pub mod tests {
                 count: AtomicUsize::new(LIVE_CEILING),
                 idle: Notify::new(),
             })),
+            work: None,
         }
     }
 
@@ -1039,6 +1075,7 @@ pub mod tests {
         let drain = Drain {
             phase: None,
             live: Some(Arc::clone(&live)),
+            work: None,
         };
         assert!(drain.hold().is_none(), "the ceiling refuses one more");
         live.count.store(0, Ordering::SeqCst);

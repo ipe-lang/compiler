@@ -436,8 +436,9 @@ impl ServerPendingStream {
     /// handler (fail closed).
     ///
     /// The body ends once the server drains, and counts as live until it
-    /// ends. A server already past its live ceiling answers 503 and never
-    /// runs the handler.
+    /// ends. The handler is one unit of shutdown work: it may finish within the
+    /// grace, and is cancelled once the shutdown closes. A server already past
+    /// its live or work ceiling answers 503 and never runs the handler.
     #[must_use]
     pub fn serve(self, head: ServerResponseHead) -> axum::response::Response {
         use axum::response::IntoResponse;
@@ -452,6 +453,9 @@ impl ServerPendingStream {
         let Some(live) = drain.hold() else {
             return axum::http::StatusCode::SERVICE_UNAVAILABLE.into_response();
         };
+        let Ok(work) = drain.work() else {
+            return axum::http::StatusCode::SERVICE_UNAVAILABLE.into_response();
+        };
         let (tx, rx) = tokio::sync::mpsc::channel::<String>(STREAM_CHAN_BUFFER);
         let id = loop {
             let n = NEXT_STREAM_ID.fetch_add(1, Ordering::Relaxed);
@@ -464,24 +468,36 @@ impl ServerPendingStream {
             .unwrap_or_else(PoisonError::into_inner)
             .insert(id, tx);
 
-        // Drive the handler in its own task, inside the request's binding set
-        // so a token it verifies binds to this stream; on completion drop the
-        // sender so the body stream terminates even if the handler forgot to
-        // call `finish`. The task runs outside the request's stream table, so
-        // a `stream` call inside the handler is refused.
-        tokio::spawn(async move {
-            credentials
-                .scoped(|| handler(StreamWriter::StreamWriter(id)))
-                .await;
-            stream_senders()
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .remove(&id);
-        });
+        spawn_stream_handler(handler, credentials, id, work);
 
         let body_stream = stream_body(rx, gate, drain, live);
         head.into_response(axum::body::Body::from_stream(body_stream))
     }
+}
+
+/// Drive the stream handler `id` names in its own task, under `work`.
+///
+/// The task runs inside the request's binding set, so a token the handler
+/// verifies binds to this stream; on completion, or once the shutdown cancels
+/// it, the sender drops so the body stream terminates even if the handler
+/// forgot to call `finish`. The task runs outside the request's stream table,
+/// so a `stream` call inside the handler is refused.
+fn spawn_stream_handler(
+    handler: ErasedStreamHandler,
+    credentials: crate::server::ChannelCredentials,
+    id: i64,
+    mut work: crate::server::shutdown::WorkGuard,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let _ = work
+            .unless_cancelled(credentials.scoped(|| handler(StreamWriter::StreamWriter(id))))
+            .await;
+        drop(work);
+        stream_senders()
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&id);
+    })
 }
 
 /// A served stream's body: the handler's chunks until it ends, the gate denies, or the server drains.
@@ -562,6 +578,69 @@ mod tests {
                 crate::ipe_error_message(e),
             )),
         }
+    }
+
+    /// A stream handler still running when the shutdown closes is cancelled,
+    /// and its sender is unregistered.
+    #[tokio::test(start_paused = true)]
+    async fn a_stream_handler_running_past_the_grace_is_cancelled_by_the_close() {
+        let (armed, _signals) = crate::server::shutdown::tests::armed_with(
+            crate::server::shutdown::ShutdownPlan::bare("test"),
+            std::time::Duration::ZERO,
+            Arc::new(std::sync::atomic::AtomicI32::new(0)),
+        );
+        let work = armed.drain().work();
+        assert!(work.is_ok(), "an idle owner counts the handler");
+        let Ok(work) = work else {
+            return;
+        };
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let entering = Arc::clone(&entered);
+        let handler: ErasedStreamHandler = Arc::new(move |_w: StreamWriter| {
+            let entering = Arc::clone(&entering);
+            Box::pin(async move {
+                entering.notify_one();
+                std::future::pending::<()>().await;
+            }) as Pin<Box<dyn Future<Output = ()> + Send>>
+        });
+        let (tx, _rx) = tokio::sync::mpsc::channel::<String>(STREAM_CHAN_BUFFER);
+        let id = loop {
+            let n = NEXT_STREAM_ID.fetch_add(1, Ordering::Relaxed);
+            if n != 0 {
+                break n;
+            }
+        };
+        stream_senders()
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(id, tx);
+        let task = spawn_stream_handler(
+            handler,
+            crate::server::ChannelCredentials::of_request(),
+            id,
+            work,
+        );
+        let began =
+            tokio::time::timeout(std::time::Duration::from_secs(1), entered.notified()).await;
+        assert!(began.is_ok(), "the handler runs");
+        let started = tokio::time::Instant::now();
+        let _settled = armed.cancel_work().await;
+        assert!(
+            started.elapsed() < crate::server::shutdown::WORK_CANCEL_DEADLINE,
+            "the cancelled handler releases its unit before the cancel deadline"
+        );
+        let ended = tokio::time::timeout(std::time::Duration::from_secs(1), task).await;
+        assert!(
+            matches!(ended, Ok(Ok(()))),
+            "the close ends the handler task"
+        );
+        assert!(
+            !stream_senders()
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .contains_key(&id),
+            "the cancelled handler's sender is unregistered"
+        );
     }
 
     /// A stream handler that emits nothing.
