@@ -860,36 +860,34 @@ var __ipeRuntimeFocusing = false;
     if (!__ipeRuntimeFocusing) __ipeFocusEpoch += 1;
   }, true);
 });
-// This tab's sent events in send order, each with the focus epoch it was sent
-// in: every one not yet answered, plus the newest answered one. The head holds
-// the oldest epoch any frame of this tab can still be answering. At the cap the
-// second record is dropped, so the head keeps the oldest epoch: an overflow can
-// only withhold a focus move, never permit one.
+// The focus epoch each of this tab's recent events was sent in, by the tab's
+// own seq. A frame names the seq of the event it answers, so the check binds to
+// that event alone, never to acks or to the other events in flight. At the cap
+// the oldest record is dropped: a frame whose record is gone moves no focus.
 var __IPE_FOCUS_SENDS_MAX = 64;
 var __ipeFocusSends = [];
 function __ipeFocusSent(seq) {
-  if (__ipeFocusSends.length >= __IPE_FOCUS_SENDS_MAX) __ipeFocusSends.splice(1, 1);
-  __ipeFocusSends.push({seq: seq, epoch: __ipeFocusEpoch, answered: false});
+  if (__ipeFocusSends.length >= __IPE_FOCUS_SENDS_MAX) __ipeFocusSends.shift();
+  __ipeFocusSends.push({seq: seq, epoch: __ipeFocusEpoch});
 }
-function __ipeFocusAnswered(seq) {
-  var newest = -1;
+// The focus epoch the event at `seq` was sent in, taking its record out (one
+// event commits one render); null when this tab holds no record of it.
+function __ipeFocusTakeSent(seq) {
   for (var i = 0; i < __ipeFocusSends.length; i++) {
-    if (__ipeFocusSends[i].seq === seq) __ipeFocusSends[i].answered = true;
-    if (__ipeFocusSends[i].answered) newest = i;
+    if (__ipeFocusSends[i].seq === seq) return __ipeFocusSends.splice(i, 1)[0].epoch;
   }
-  __ipeFocusSends = __ipeFocusSends.filter(function(r, i) {
-    return !r.answered || i === newest;
-  });
+  return null;
 }
 // A patches frame just applied as the next step moves focus onto the element
-// it names only when it answers this tab and focus has not moved since the
-// oldest event it can be answering was sent. A target the frame's own patches
-// removed, or one that cannot take focus, leaves focus alone.
+// it names only when it answers an event of this tab and focus has not moved
+// since that event was sent. A target the frame's own patches removed, or one
+// that cannot take focus, leaves focus alone.
 function __ipeFocusAddressed(frame) {
   if (!__ipeTabId || frame.tab !== __ipeTabId) return;
+  if (typeof frame.tabSeq !== "number") return;
+  var sentIn = __ipeFocusTakeSent(frame.tabSeq);
+  if (sentIn === null || sentIn !== __ipeFocusEpoch) return;
   if (typeof frame.focus !== "string") return;
-  if (__ipeFocusSends.length === 0) return;
-  if (__ipeFocusEpoch !== __ipeFocusSends[0].epoch) return;
   var el = null;
   try { el = __ipeDoc.query("[ipe-id=" + __ipeCssString(frame.focus) + "]"); } catch (_) { return; }
   if (el) __ipeNode.focus(el);
@@ -1355,7 +1353,6 @@ function __ipePostEvent(body) {
       return r.json().then(function(data) {
         __ipeLoaderEnd();
         __ipeOnPostSuccess();
-        __ipeFocusAnswered(body.seq);
         if (!data || typeof data.body !== "string") return;
         // The epoch gate orders this render against the DOM on screen; the
         // seq it carries is the session's, which an earlier ack may equal.
@@ -1396,7 +1393,6 @@ function __ipePostEvent(body) {
         }
         __ipeLoaderEnd();
         __ipeOnPostSuccess();
-        __ipeFocusAnswered(body.seq);
         if (!data) return;
         // An accepted event is acked with its seq; its render arrives over
         // the stream, whose frames name the epochs they move between. Any

@@ -551,9 +551,17 @@ test("focus-across-patch: a frame behind the render on screen never moves focus"
   const frame = await firstHeld(page);
   expect(frame.tab).toBe(await page.evaluate(() => window.__ipeTabId));
   expect(typeof frame.focus).toBe("string");
-  // The same frame diffed from a later render than the one on screen.
+  // The same frame diffed from a later render than the one on screen, naming
+  // a target already on screen: only the step gate keeps focus where it is.
+  const note = await page.evaluate(() => document.getElementById("note").getAttribute("ipe-id"));
+  expect(note).not.toBeNull();
   const [inc, n] = frame.to.split(".");
-  const behind = { ...frame, from: `${inc}.${Number(n) + 1}`, to: `${inc}.${Number(n) + 2}` };
+  const behind = {
+    ...frame,
+    focus: note,
+    from: `${inc}.${Number(n) + 1}`,
+    to: `${inc}.${Number(n) + 2}`,
+  };
   await page.evaluate((text) => {
     window.__ipeLiveFrames.patches = window.__testDeliver;
     window.__ipeLiveFrames.patches(text, false);
@@ -574,7 +582,10 @@ test("focus-across-patch: a stale frame never moves focus", async ({ page }) => 
   expect(typeof frame.focus).toBe("string");
   const last = await page.evaluate(() => window.__ipeLastGlobalSeq);
   expect(last).toBeGreaterThan(0);
-  const stale = { ...frame, globalSeq: last };
+  // It names a target already on screen: only the stale gate keeps focus.
+  const note = await page.evaluate(() => document.getElementById("note").getAttribute("ipe-id"));
+  expect(note).not.toBeNull();
+  const stale = { ...frame, globalSeq: last, focus: note };
   await page.evaluate((text) => {
     window.__testDeliver(text, false);
   }, JSON.stringify(stale));
@@ -607,4 +618,35 @@ test("focus-across-patch: a target a later patch of the frame removes never take
   await expect(page.locator("input#ask")).toHaveCount(0);
   expect(await focusedId(page)).toBe("root");
   expect(errors).toEqual([]);
+});
+
+test("focus-across-patch: an event no frame answers never withholds focus from a later one", async ({ page }) => {
+  await open(page);
+  await expect.poll(() => focusedId(page)).toBe("root");
+  // The answer to this key cannot be read, so the client abandons the event
+  // and no frame ever answers it.
+  let abandoned = false;
+  await page.route(
+    "**/_ipe/event",
+    (route) => {
+      abandoned = true;
+      return route.fulfill({
+        status: 409,
+        headers: { "X-Ipe-Web": "1", "Content-Type": "application/json" },
+        body: "{",
+      });
+    },
+    { times: 1 },
+  );
+  await page.keyboard.press("j");
+  await expect.poll(() => abandoned).toBe(true);
+  // Focus moves after that event was sent, then comes back to the root.
+  await page.click("input#note");
+  expect(await focusedId(page)).toBe("note");
+  await page.click("#keys");
+  await expect.poll(() => focusedId(page)).toBe("root");
+  // The next key's own render focuses its field.
+  await page.keyboard.press("F2");
+  await expect(page.locator("input#ask")).toHaveCount(1);
+  await expect.poll(() => focusedId(page)).toBe("ask");
 });
