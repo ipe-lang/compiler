@@ -1,4 +1,4 @@
-module Lib.Queue exposing (DecidableRow, DecisionSlot(..), DecisionTarget(..), Draft, HistoryLabel(..), HistoryPage, HistoryRow, HistoryState(..), LoadTicket, Place(..), Presence(..), Progress, QueuePage, QueueState(..), QueuedUnit, RefusalPanel(..), ResyncBound, SelectedView(..), Standing(..), StandingRead(..), UnitLabel, UnitPageState(..), chainBanner, clearView, closeRefusal, decidableRow, decidableSource, decide, decideRefusal, decisionNotSaved, decisionRefused, decisionWritten, draftRefused, drainThenLoad, editDraft, entryUid, firstTicket, historyStateFromResult, historyStatusText, isCurrentLoad, loadHistoryPage, loadPage, loadStanding, makeResyncBound, notSavedOf, openPanel, openRefusal, openRow, ownedSlot, pendingText, nextTicket, loadUnitView, pageHeaderText, queueLabels, queueSettled, queueStatusText, refusalReasonText, reloadView, rowTarget, rowUid, resyncBound, resyncPageCeiling, resyncReviewed, resyncReviewedWithin, selectView, selectedViewOf, selectedViewStatusText, sourceStatusText, standingArrived, standingFor, standingOf, startDecision, stateFromResult, unitLabel, unitPageEntry, unitPageOf, unitPageStatusText, viewArrived)
+module Lib.Queue exposing (DecidableRow, DecisionSlot(..), DecisionTarget(..), Draft, HistoryLabel(..), HistoryPage, HistoryRow, HistoryState(..), LoadTicket, Place(..), Presence(..), Progress, QueuePage, QueueState(..), QueuedUnit, RefusalPanel(..), ResyncBound, SelectedView(..), Standing(..), StandingRead(..), UnitLabel, UnitPageState(..), chainBanner, clearView, closeRefusal, decidableAs, decidableRow, decidableSource, decide, decideRefusal, decisionNotSaved, decisionRefused, decisionWritten, draftRefused, drainThenLoad, editDraft, entryUid, firstTicket, historyStateFromResult, historyStatusText, isCurrentLoad, loadHistoryPage, loadPage, loadStanding, makeResyncBound, notSavedOf, openPanel, openRefusal, openRow, ownedSlot, pendingText, nextTicket, loadUnitView, pageHeaderText, queueLabels, queueSettled, queueStatusText, refusalReasonText, reloadView, rowTarget, rowUid, resyncBound, resyncPageCeiling, resyncReviewed, resyncReviewedWithin, selectView, selectedViewOf, selectedViewStatusText, sourceStatusText, standingArrived, standingFor, standingOf, startDecision, stateFromResult, unitLabel, unitPageEntry, unitPageOf, unitPageStatusText, viewArrived)
 
 import Ipe.ByteSize as ByteSize
 import Ipe.Db as Db
@@ -1210,6 +1210,80 @@ decidableRow selected state view uid =
 
         Failed _ ->
             Nothing
+
+
+-- The row `uid` when it offers a decision on `target` by `decidableRow`,
+-- the predicate the view draws the row's controls by, or why a decision on
+-- it is refused before it starts: a click that arrived after its row
+-- stopped offering one.
+decidableAs : Int -> QueueState -> SelectedView -> DecisionTarget -> Uid -> Result SaveFailure DecidableRow
+decidableAs selected state view target uid =
+    case decidableRow selected state view uid of
+        Just row ->
+            if rowTarget row == target then
+                Ok row
+
+            else
+                Err (undecidable state target uid)
+
+        Nothing ->
+            Err (undecidable state target uid)
+
+
+-- Why `uid` offers no decision on `target` on the queue page `state`: the
+-- log records no decision, the unit's source is not shown, or the unit or
+-- file is not one the page offers a decision on.
+undecidable : QueueState -> DecisionTarget -> Uid -> SaveFailure
+undecidable state target uid =
+    case state of
+        Loaded page ->
+            case page.log of
+                ShownProven ->
+                    case target of
+                        OnUnit ->
+                            if List.any (\q -> q.unit.uid == uid) page.units then
+                                Failure.SaveRefused Failure.SourceNotShown
+
+                            else
+                                Failure.SaveRefused Failure.NotQueued
+
+                        OnRefusal ->
+                            case List.find (\row -> row.uid == uid) page.refusals of
+                                Just row ->
+                                    case row.digest of
+                                        Just _ ->
+                                            Failure.SaveRefused Failure.FileNotQueued
+
+                                        Nothing ->
+                                            Failure.SaveRefused Failure.FileNotAcknowledgeable
+
+                                Nothing ->
+                                    Failure.SaveRefused Failure.FileNotQueued
+
+                ShownBroken _ ->
+                    Failure.SaveRefused Failure.LogBroken
+
+                ShownKeyMismatch ->
+                    Failure.SaveRefused Failure.LogKeyMismatch
+
+                ShownUnkeyed ->
+                    Failure.SaveReadOnly
+
+        Loading ->
+            notListed target
+
+        Failed _ ->
+            notListed target
+
+
+notListed : DecisionTarget -> SaveFailure
+notListed target =
+    case target of
+        OnUnit ->
+            Failure.SaveRefused Failure.NotQueued
+
+        OnRefusal ->
+            Failure.SaveRefused Failure.FileNotQueued
 
 
 -- The session's one decision slot, and what the reviewer sees of it. A

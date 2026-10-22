@@ -568,8 +568,10 @@ pageRefusal model uid =
 -- or `Queue.decideRefusal` on a listed unreviewable file's digest, each
 -- re-proved before writing. A decision asked off the queue page is
 -- refused before it takes the slot, and so is one asked on a server with no
--- signing key, each with a notice saying why; one asked while another is
--- busy starts nothing, and that decision's pending state stays shown.
+-- signing key, or on a row the page does not offer that decision on (the
+-- view's own `decidableRow`), each with a notice saying why and the refusal
+-- panel kept; one asked while another is busy starts nothing, and that
+-- decision's pending state stays shown.
 saveDecision : Settings.AppSettings -> Model -> DecisionTarget -> Uid -> LibDb.Decision -> ( Model, Cmd Msg )
 saveDecision settings model target uid decision =
     if model.page /= QueuePage then
@@ -581,14 +583,19 @@ saveDecision settings model target uid decision =
                 ( { model | decision = Queue.decisionRefused settings.epoch SaveReadOnly model.queueLoad model.decision }, Cmd.none )
 
             Signing macKey ->
-                case Queue.startDecision settings.epoch uid model.decision of
-                    Just saving ->
-                        ( { model | decision = saving }
-                        , Cmd.perform (ServerLog.logged "decision save failed" (decisionTask settings macKey model target uid decision)) (decisionSaved uid settings.epoch)
-                        )
+                case Queue.decidableAs model.selected model.queueState model.selectedView target uid of
+                    Ok _ ->
+                        case Queue.startDecision settings.epoch uid model.decision of
+                            Just saving ->
+                                ( { model | decision = saving }
+                                , Cmd.perform (ServerLog.logged "decision save failed" (decisionTask settings macKey model target uid decision)) (decisionSaved uid settings.epoch)
+                                )
 
-                    Nothing ->
-                        ( model, Cmd.none )
+                            Nothing ->
+                                ( model, Cmd.none )
+
+                    Err failure ->
+                        ( { model | decision = Queue.decisionRefused settings.epoch failure model.queueLoad model.decision }, Cmd.none )
 
 
 -- The decision on `uid`'s shown source or listed unreviewable file, or its
