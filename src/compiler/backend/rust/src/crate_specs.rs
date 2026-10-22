@@ -349,8 +349,9 @@ pub const ALL: &[CrateSpec] = &[
     UNICODE_GENERAL_CATEGORY,
 ];
 
-/// Every crate whose feature set is fixed here, for drift-test iteration.
-#[cfg(test)]
+/// Every crate whose feature set is fixed here.
+///
+/// The manifest tripwires in this crate and in the `ipe` CLI tests walk it.
 pub const ALL_PINNED: &[PinnedCrate] = &[
     SQLX,
     TOKIO_TUNGSTENITE,
