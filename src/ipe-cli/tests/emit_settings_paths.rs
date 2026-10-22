@@ -213,7 +213,7 @@ fn split_debugger_builds() -> Result<(), BoxError> {
         &[
             OsStr::new("dev"),
             OsStr::new("build"),
-            fixture.manifest_path().as_os_str(),
+            fixture.path().as_os_str(),
             OsStr::new("--out"),
             out.as_os_str(),
             OsStr::new("--debugger"),
@@ -296,7 +296,7 @@ fn shared_cache_keeps_identity() -> Result<(), BoxError> {
             &[
                 OsStr::new("release"),
                 OsStr::new("eject"),
-                fixture.manifest_path().as_os_str(),
+                fixture.path().as_os_str(),
                 OsStr::new("--out"),
                 out.as_os_str(),
             ],

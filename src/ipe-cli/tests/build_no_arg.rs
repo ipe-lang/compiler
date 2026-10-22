@@ -50,10 +50,10 @@ macro_rules! in_dir {
 // CLI-parsing: no-project directory → usage error (no package.ipe, no src/Main.ipe)
 // ---------------------------------------------------------------------------
 
-/// `ipe dev build` with no argument in an empty temp directory returns a usage
-/// error, not a panic.
+/// `ipe dev build` with no argument in a directory without `package.ipe` is
+/// refused as `NoManifest`, not a panic.
 #[test]
-fn build_no_arg_empty_dir_returns_usage_error() {
+fn build_no_arg_empty_dir_is_refused_as_no_manifest() {
     let dir = fresh_dir("build_empty");
     fs::create_dir_all(&dir).unwrap();
 
@@ -62,18 +62,15 @@ fn build_no_arg_empty_dir_returns_usage_error() {
     let _ = fs::remove_dir_all(&dir);
 
     assert!(
-        matches!(
-            &result,
-            Err(ipe::CliError::CommandUsage { command, .. }) if *command == "dev build"
-        ),
-        "bare `ipe dev build` in an empty dir must yield a build command-usage error, got: {result:?}"
+        matches!(&result, Err(ipe::CliError::NoManifest { .. })),
+        "bare `ipe dev build` in an empty dir must yield NoManifest, got: {result:?}"
     );
 }
 
-/// `ipe dev run` with no argument in an empty temp directory returns a usage
-/// error, not a panic.
+/// `ipe dev run` with no argument in a directory without `package.ipe` is
+/// refused as `NoManifest`, not a panic.
 #[test]
-fn run_no_arg_empty_dir_returns_usage_error() {
+fn run_no_arg_empty_dir_is_refused_as_no_manifest() {
     let dir = fresh_dir("run_empty");
     fs::create_dir_all(&dir).unwrap();
 
@@ -82,11 +79,8 @@ fn run_no_arg_empty_dir_returns_usage_error() {
     let _ = fs::remove_dir_all(&dir);
 
     assert!(
-        matches!(
-            &result,
-            Err(ipe::CliError::CommandUsage { command, .. }) if *command == "dev run"
-        ),
-        "bare `ipe dev run` in an empty dir must yield a run command-usage error, got: {result:?}"
+        matches!(&result, Err(ipe::CliError::NoManifest { .. })),
+        "bare `ipe dev run` in an empty dir must yield NoManifest, got: {result:?}"
     );
 }
 

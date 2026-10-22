@@ -771,6 +771,8 @@ code! {
     IPE_E0010 = "IPE-E0010", "a symbolic link inside the project", "IPE-E0010";
     /// a file argument lies outside the project's `src/` and `tests/`
     IPE_E0011 = "IPE-E0011", "a file argument outside the project sources", "IPE-E0011";
+    /// a build command was given a file where it takes a project directory
+    IPE_E0012 = "IPE-E0012", "a build command given a file", "IPE-E0012";
 
     // -----------------------------------------------------------------------
     // Internal (IPE-I####)

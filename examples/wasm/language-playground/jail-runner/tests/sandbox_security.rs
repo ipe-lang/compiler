@@ -112,6 +112,39 @@ impl Staged {
     }
 }
 
+/// Make `project` an `ipe-app` project, returning its entry `src/Main.ipe`.
+fn app_project(project: &Path) -> PathBuf {
+    std::fs::create_dir_all(project.join("src")).unwrap();
+    std::fs::write(
+        project.join("package.ipe"),
+        "module Package exposing (package)\n\n\npackage =\n    { name = \"ipe-app\" }\n",
+    )
+    .unwrap();
+    project.join("src").join("Main.ipe")
+}
+
+/// Rename the emitted crate to the fixed `ipe-app` the server stages, so the
+/// jailed build lands the binary where `app_binary_path` expects it. A manifest
+/// project's crate name carries a per-project identity suffix.
+fn pin_crate_name(crate_dir: &Path) {
+    let manifest = crate_dir.join("Cargo.toml");
+    let text = std::fs::read_to_string(&manifest).expect("read emitted Cargo.toml");
+    let mut pinned = false;
+    let lines: Vec<String> = text
+        .lines()
+        .map(|line| {
+            if !pinned && line.starts_with("name = \"") {
+                pinned = true;
+                "name = \"ipe-app\"".to_owned()
+            } else {
+                line.to_owned()
+            }
+        })
+        .collect();
+    assert!(pinned, "emitted Cargo.toml has no package name line");
+    std::fs::write(&manifest, lines.join("\n") + "\n").expect("write Cargo.toml");
+}
+
 /// Emit a native crate from Ipê `source` with the trusted compiler, then
 /// pre-warm + seed the offline dependency cache — leaving a crate ready to build
 /// offline in the jail.
@@ -121,15 +154,14 @@ fn stage_ipe(source: &str) -> Staged {
     // crate is its `rust/` area.
     let out_root = scratch.path().join("out");
     let crate_dir = out_root.join("rust");
-    let src_dir = scratch.path().join("src-ipe");
-    let entry = src_dir.join("Main.ipe");
-    std::fs::create_dir_all(&src_dir).unwrap();
+    let project = scratch.path().join("src-ipe");
+    let entry = app_project(&project);
     std::fs::write(&entry, source).unwrap();
 
     let emit = Command::new(ipe_bin())
         .arg("dev")
         .arg("build")
-        .arg(&entry)
+        .arg(&project)
         .arg("--out")
         .arg(&out_root)
         .arg("--runtime")
@@ -169,9 +201,8 @@ fn stage_scaffold_only() -> Staged {
     // crate is its `rust/` area.
     let out_root = scratch.path().join("out");
     let crate_dir = out_root.join("rust");
-    let src_dir = scratch.path().join("src-ipe");
-    let entry = src_dir.join("Main.ipe");
-    std::fs::create_dir_all(&src_dir).unwrap();
+    let project = scratch.path().join("src-ipe");
+    let entry = app_project(&project);
     std::fs::write(
         &entry,
         "module Main exposing (main)\n\nimport Ipe.Io as Io\n\nmain =\n    Io.println \"scaffold\"\n",
@@ -180,7 +211,7 @@ fn stage_scaffold_only() -> Staged {
     let emit = Command::new(ipe_bin())
         .arg("dev")
         .arg("build")
-        .arg(&entry)
+        .arg(&project)
         .arg("--out")
         .arg(&out_root)
         .arg("--runtime")
@@ -205,6 +236,7 @@ fn stage_scaffold_only() -> Staged {
 /// A repo-level warm target (`IPE_PLAYGROUND_WARM_TARGET`, else a shared cache
 /// dir) is reused across tests so only the FIRST test pays the closure build.
 fn warm_and_seed(crate_dir: &Path) {
+    pin_crate_name(crate_dir);
     let warm_home = warm_root().join("cargo-home");
     let warm_target = warm_root().join("target");
     std::fs::create_dir_all(&warm_home).unwrap();

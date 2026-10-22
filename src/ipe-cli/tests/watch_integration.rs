@@ -610,14 +610,19 @@ fn operator_port_vars_never_relocate_a_watched_child() -> Result<(), BoxError> {
         return Ok(());
     }
     let (ipe_dir, out_dir) = fresh_dirs("operator_port_vars")?;
-    write_main(&ipe_dir, &server_fixture("OPERATOR-V1"))?;
+    std::fs::create_dir_all(ipe_dir.join("src"))?;
+    std::fs::write(
+        ipe_dir.join("package.ipe"),
+        "module Package exposing (package)\n\n\npackage =\n    { name = \"operator-port\" }\n",
+    )?;
+    write_main(&ipe_dir.join("src"), &server_fixture("OPERATOR-V1"))?;
     let port: u16 = 19165;
     let operator: u16 = 19166;
     let runtime_dir = e2e_support::require_runtime().into_path_buf();
     let mut cmd = std::process::Command::new(e2e_support::cargo_bin!("ipe").into_path_buf());
     cmd.arg("dev")
         .arg("watch")
-        .arg(ipe_dir.join("Main.ipe"))
+        .arg(&ipe_dir)
         .arg("--out")
         .arg(&out_dir)
         .arg("--runtime")

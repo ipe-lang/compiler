@@ -547,8 +547,8 @@ pub fn build_with_options_into(
 /// Build a loose `.ipe` entry file plus the sibling modules it imports.
 ///
 /// When no manifest is present, an import `A.B` resolves to `A/B.ipe` under
-/// the entry file's directory, so a multi-file program builds via the
-/// file-path shorthand (`ipe dev build src/Main.ipe`).
+/// the entry file's directory, so a multi-file program builds from its entry
+/// file alone.
 ///
 /// The module set is the entry plus the sibling modules its imports reach,
 /// resolved by [`crate::loose_file::resolve_loose_file`] (see
@@ -676,8 +676,7 @@ pub struct CollectedSources {
 /// Collect a loose entry plus the transitive closure of sibling modules it imports.
 ///
 /// This is the file-path shorthand's source-collection step, shared by the
-/// build path ([`build_loose_file_with_options`]) and
-/// [`crate::build_source_graph`] so both see the SAME module set. It
+/// build path ([`build_loose_file_with_options`]). It
 /// delegates to
 /// [`crate::loose_file::resolve_loose_file`] — the one loose-file resolver
 /// `ipe dev watch` and `ipe lsp` also use — so every surface compiles the same
@@ -685,7 +684,7 @@ pub struct CollectedSources {
 /// the entry's directory only, within
 /// [`crate::loose_file::LooseFileLimits::DEFAULT`], and no directory
 /// listing. The compiled-source stdlib closure is injected downstream (in
-/// [`compile_modules_observed`] / [`crate::build_source_graph`]), not here, so
+/// [`compile_modules_observed`]), not here, so
 /// the injection routine stays single-sourced.
 ///
 /// # Errors
@@ -2893,6 +2892,43 @@ pub fn build_parsed_project_into(
         manifest,
         manifest_path,
         source_set,
+        out,
+        runtime_dir,
+        options,
+        host,
+    )
+}
+
+/// Build the project `held` holds into `out`, for the host `host` asks for.
+///
+/// The program is compiled exactly as `held` read it: its modules, the stdlib
+/// closure and the FFI preparation came from one read of the tree its root
+/// holds, and its shape is the one that read pinned, so nothing is discovered
+/// or read again here and a file swapped after the read is never compiled.
+///
+/// # Errors
+/// [`CliError::Usage`] for a debugger request with no runtime dependency, or
+/// for a webview request whose held shape is not a web program;
+/// [`CliError::TrustRefused`] for a wrapper crate the held catalog binds by
+/// path that is no longer below the held root
+/// ([`crate::ffi::hold_wrapper_deps`]); otherwise as [`build_from_sources`].
+pub fn build_root_into(
+    held: &super::HeldBuild,
+    out: OutTarget<'_>,
+    runtime_dir: &Path,
+    options: &BuildOptions,
+    host: crate::delivery::HostIntent,
+) -> Result<EmittedCrate, CliError> {
+    refuse_debugger_without_runtime_dep(options)?;
+    if let crate::delivery::HostIntent::WebView(_) = host {
+        crate::pack::desktop::require_webview(super::desktop_app_shape(held.shape()))
+            .map_err(|refusal| CliError::Usage(text::Message::relay(&refusal)))?;
+    }
+    crate::ffi::hold_wrapper_deps(held.root(), &held.snapshot().ffi().catalog)?;
+    build_from_sources_for(
+        held.root().manifest(),
+        held.manifest_path(),
+        super::PackageSourceSet::from_build_snapshot(held.snapshot()),
         out,
         runtime_dir,
         options,
