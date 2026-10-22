@@ -207,13 +207,10 @@ struct ClientEntry {
     // command (try_send) rather than buffering forever.
     cmd_tx: tokio::sync::mpsc::Sender<WsCmd>,
     frames_tx: tokio::sync::broadcast::Sender<WsEvent>,
-    // The one task that owns both halves of the socket. A Close that can't be
-    // enqueued (full queue ⇒ the writer is wedged on a stalled peer) is
-    // honoured by aborting it, which drops both halves at once, so a close
-    // request can never strand an open socket. See send_cmd.
-    task: tokio::task::AbortHandle,
-    // Wakes the socket task once a close is queued, so it bounds the closing
-    // handshake even while the writer is still draining.
+    // Wakes the socket's task once a close is requested, queued or not, so it
+    // bounds the closing handshake even while the writer is wedged on a peer
+    // that stopped reading. That task is the socket's one way out: nothing
+    // else ends it, deregisters it, or reports it ended. See `run_socket`.
     closing: std::sync::Arc<tokio::sync::Notify>,
     /// The message ceiling the socket was opened under; an outbound payload
     /// past it is refused before it is queued.
@@ -835,7 +832,8 @@ enum WriterEnd {
 /// How a socket's reader stopped.
 #[cfg(not(target_arch = "wasm32"))]
 enum ReaderEnd {
-    /// The peer sent a close frame with this code.
+    /// The peer sent a close frame with this code; tungstenite has queued the
+    /// reply, which `run_socket` writes before the socket is dropped.
     Closed(i64),
     /// A read failed.
     Failed(WsFailure),
@@ -851,6 +849,29 @@ impl ReaderEnd {
             Self::Closed(code) => WsEvent::Closed(code),
             Self::Failed(failure) => WsEvent::Error(WsSide::Read, failure),
             Self::Ended => WsEvent::Closed(WS_ABNORMAL_CLOSURE),
+        }
+    }
+}
+
+/// How a socket ended.
+#[cfg(not(target_arch = "wasm32"))]
+enum SocketEnd {
+    /// The reader stopped.
+    Reader(ReaderEnd),
+    /// A write failed.
+    WriteFailed(WsFailure),
+    /// The peer did not finish the closing handshake within [`WS_CLOSE_GRACE`].
+    CloseUnanswered,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl SocketEnd {
+    /// The event that reports this end to the socket's subscribers.
+    const fn into_event(self) -> WsEvent {
+        match self {
+            Self::Reader(end) => end.into_event(),
+            Self::WriteFailed(failure) => WsEvent::Error(WsSide::Write, failure),
+            Self::CloseUnanswered => WsEvent::Closed(WS_ABNORMAL_CLOSURE),
         }
     }
 }
@@ -993,7 +1014,7 @@ async fn closing_handshake<W, R>(
     mut writer: std::pin::Pin<&mut W>,
     mut writer_done: bool,
     mut reader: std::pin::Pin<&mut R>,
-) -> WsEvent
+) -> SocketEnd
 where
     W: std::future::Future<Output = WriterEnd>,
     R: std::future::Future<Output = ReaderEnd>,
@@ -1003,22 +1024,23 @@ where
             tokio::select! {
                 end = writer.as_mut(), if !writer_done => match end {
                     WriterEnd::Closing => writer_done = true,
-                    WriterEnd::Failed(failure) => return WsEvent::Error(WsSide::Write, failure),
+                    WriterEnd::Failed(failure) => return SocketEnd::WriteFailed(failure),
                 },
-                end = reader.as_mut() => return end.into_event(),
+                end = reader.as_mut() => return SocketEnd::Reader(end),
             }
         }
     };
     tokio::time::timeout(WS_CLOSE_GRACE, handshake)
         .await
-        .unwrap_or(WsEvent::Closed(WS_ABNORMAL_CLOSURE))
+        .unwrap_or(SocketEnd::CloseUnanswered)
 }
 
 /// The one task that owns socket `id`: it writes, reads, and tears down.
 ///
-/// Every way the socket ends leaves through the same exit: the socket is
-/// deregistered, the event that ended it goes to its subscribers, and both
-/// halves are dropped together.
+/// Every way the socket ends leaves through the same exit: the reply to a
+/// close the peer sent is written, the socket is deregistered, the one event
+/// that ended it goes to its subscribers, and both halves are dropped
+/// together. Nothing else ends the socket or reports it ended.
 #[cfg(not(target_arch = "wasm32"))]
 async fn run_socket<S>(
     id: i64,
@@ -1035,24 +1057,36 @@ async fn run_socket<S>(
     // finds the entry it removes.
     let _ = registered.await;
     let (mut write, mut read) = socket.split();
-    let writer = run_writer(&mut write, cmd_rx, ping_interval_ms);
-    let reader = run_reader(&mut read, &frames);
-    tokio::pin!(writer, reader);
-    let first = tokio::select! {
-        end = writer.as_mut() => FirstEnd::Writer(end),
-        end = reader.as_mut() => FirstEnd::Reader(end),
-        () = closing.notified() => FirstEnd::Closing,
-    };
-    let event = match first {
-        FirstEnd::Writer(WriterEnd::Failed(failure)) => WsEvent::Error(WsSide::Write, failure),
-        FirstEnd::Writer(WriterEnd::Closing) => {
-            closing_handshake(writer.as_mut(), true, reader.as_mut()).await
+    let end = {
+        let writer = run_writer(&mut write, cmd_rx, ping_interval_ms);
+        let reader = run_reader(&mut read, &frames);
+        tokio::pin!(writer, reader);
+        let first = tokio::select! {
+            end = writer.as_mut() => FirstEnd::Writer(end),
+            end = reader.as_mut() => FirstEnd::Reader(end),
+            () = closing.notified() => FirstEnd::Closing,
+        };
+        match first {
+            FirstEnd::Writer(WriterEnd::Failed(failure)) => SocketEnd::WriteFailed(failure),
+            FirstEnd::Writer(WriterEnd::Closing) => {
+                closing_handshake(writer.as_mut(), true, reader.as_mut()).await
+            }
+            FirstEnd::Reader(end) => SocketEnd::Reader(end),
+            FirstEnd::Closing => closing_handshake(writer.as_mut(), false, reader.as_mut()).await,
         }
-        FirstEnd::Reader(end) => end.into_event(),
-        FirstEnd::Closing => closing_handshake(writer.as_mut(), false, reader.as_mut()).await,
     };
+    if let SocketEnd::Reader(ReaderEnd::Closed(_)) = end {
+        // tungstenite queues the reply to the peer's close and writes it on the
+        // next write or flush. The first flush empties the outbound buffer; a
+        // reply that did not fit beside what it held goes out on the second.
+        let reply = async {
+            write.flush().await?;
+            write.flush().await
+        };
+        let _ = tokio::time::timeout(WS_CLOSE_GRACE, reply).await;
+    }
     deregister(id);
-    let _ = frames.send(event);
+    let _ = frames.send(end.into_event());
 }
 
 /// Start the task of an open `socket` whose messages are capped at `ceiling`,
@@ -1071,7 +1105,7 @@ where
     let (frames_tx, _) = tokio::sync::broadcast::channel::<WsEvent>(64);
     let closing = std::sync::Arc::new(tokio::sync::Notify::new());
     let (registered_tx, registered) = tokio::sync::oneshot::channel();
-    let task = tokio::spawn(run_socket(
+    tokio::spawn(run_socket(
         id,
         socket,
         cmd_rx,
@@ -1085,7 +1119,6 @@ where
         ClientEntry {
             cmd_tx,
             frames_tx,
-            task: task.abort_handle(),
             closing,
             ceiling,
         },
@@ -1122,21 +1155,19 @@ pub fn web_socket_connect_with<E: From<String> + FromLimitExceeded + Send + 'sta
 fn send_cmd(id: i64, cmd: WsCmd) -> Result<(), SendRefusal> {
     use tokio::sync::mpsc::error::TrySendError;
     let is_close = matches!(cmd, WsCmd::Close | WsCmd::CloseWithCode(..));
-    // Clone what we need, then RELEASE the registry lock before try_send / abort /
+    // Clone what we need, then RELEASE the registry lock before try_send /
     // deregister (deregister re-locks the registry — holding it here would deadlock).
     let handles = {
         let reg = registry().lock().unwrap_or_else(|e| e.into_inner());
         reg.get(&id).map(|e| {
             (
                 e.cmd_tx.clone(),
-                e.frames_tx.clone(),
-                e.task.clone(),
                 std::sync::Arc::clone(&e.closing),
                 e.ceiling,
             )
         })
     };
-    let (tx, frames, task, closing, ceiling) = handles.ok_or(SendRefusal::NoSocket)?;
+    let (tx, closing, ceiling) = handles.ok_or(SendRefusal::NoSocket)?;
     // A close reason is bounded by `CloseReason`, not by the message ceiling.
     let len = match &cmd {
         WsCmd::Text(text) => text.len(),
@@ -1153,14 +1184,12 @@ fn send_cmd(id: i64, cmd: WsCmd) -> Result<(), SendRefusal> {
             }
             Ok(())
         }
-        // For a Close, the full queue means the writer is wedged on a stalled
-        // peer, so a queued Close would never be sent — guarantee teardown by
-        // aborting the socket's task (drops both halves → the connection
-        // closes), notifying subscribers, and deregistering. Close "succeeds".
+        // For a Close, the full queue means the writer is wedged on a peer that
+        // stopped reading. The close is not queued: waking the task starts its
+        // closing handshake, which the grace period bounds, and the task tears
+        // the socket down through its one exit.
         Err(TrySendError::Full(_)) if is_close => {
-            task.abort();
-            let _ = frames.send(WsEvent::Closed(1000));
-            deregister(id);
+            closing.notify_one();
             Ok(())
         }
         Err(TrySendError::Full(_)) => Err(SendRefusal::QueueFull),
@@ -1799,13 +1828,11 @@ mod tests {
         let id = WS_CLIENT_NEXT_ID.fetch_add(1, Ordering::Relaxed);
         let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::channel::<WsCmd>(1);
         let (frames_tx, _) = tokio::sync::broadcast::channel::<WsEvent>(8);
-        let task = tokio::spawn(std::future::pending::<()>());
         registry().lock().unwrap_or_else(|e| e.into_inner()).insert(
             id,
             ClientEntry {
                 cmd_tx,
                 frames_tx,
-                task: task.abort_handle(),
                 closing: std::sync::Arc::new(tokio::sync::Notify::new()),
                 ceiling: 4,
             },
@@ -1838,7 +1865,6 @@ mod tests {
         assert!(matches!(cmd_rx.try_recv(), Ok(WsCmd::Text(t)) if t == "1234"));
 
         deregister(id);
-        task.abort();
         assert_eq!(
             web_socket_send::<IpeError>(id, String::new()).await,
             IpeResult::Err(IpeError::unexpected(format!(
@@ -1856,13 +1882,11 @@ mod tests {
         let id = WS_CLIENT_NEXT_ID.fetch_add(1, Ordering::Relaxed);
         let (cmd_tx, _cmd_rx) = tokio::sync::mpsc::channel::<WsCmd>(1);
         let (frames_tx, _) = tokio::sync::broadcast::channel::<WsEvent>(8);
-        let task = tokio::spawn(std::future::pending::<()>());
         registry().lock().unwrap_or_else(|e| e.into_inner()).insert(
             id,
             ClientEntry {
                 cmd_tx,
                 frames_tx: frames_tx.clone(),
-                task: task.abort_handle(),
                 closing: std::sync::Arc::new(tokio::sync::Notify::new()),
                 ceiling: 1024,
             },
@@ -1903,7 +1927,6 @@ mod tests {
 
         drop(subs);
         deregister(id);
-        task.abort();
     }
 
     /// A started client socket over `client` with messages capped at
@@ -2105,13 +2128,11 @@ mod tests {
         let (cmd_tx, cmd_rx) = tokio::sync::mpsc::channel::<WsCmd>(1);
         drop(cmd_rx);
         let (frames_tx, _) = tokio::sync::broadcast::channel::<WsEvent>(8);
-        let task = tokio::spawn(std::future::ready(()));
         registry().lock().unwrap_or_else(|e| e.into_inner()).insert(
             id,
             ClientEntry {
                 cmd_tx,
                 frames_tx,
-                task: task.abort_handle(),
                 closing: std::sync::Arc::new(tokio::sync::Notify::new()),
                 ceiling: 16,
             },
@@ -2165,6 +2186,91 @@ mod tests {
         };
         assert_eq!(u16::from(frame.code), 4000);
         assert_eq!(frame.reason.as_str(), "é".repeat(61));
+    }
+
+    /// A close that meets a full queue while the peer closes too ends the
+    /// socket through its one exit: one terminal event, the peer's close.
+    #[tokio::test(start_paused = true)]
+    async fn a_close_behind_a_full_queue_ends_the_socket_once() {
+        use tokio_tungstenite::tungstenite::protocol::CloseFrame;
+        let wait = WS_CLOSE_GRACE.saturating_mul(4);
+        // Too small for the queued frames, and never read: the writer wedges.
+        let (client_io, server_io) = tokio::io::duplex(64);
+        let pair = started_pair(client_io, server_io, 16).await;
+        assert!(pair.is_some(), "the socket opens");
+        let Some((id, mut peer)) = pair else { return };
+        let events = subscribe_events(id);
+        assert!(events.is_some(), "the socket is registered");
+        let Some(mut events) = events else { return };
+
+        let frame = CloseFrame {
+            code: 4001.into(),
+            reason: "".into(),
+        };
+        let sent = tokio::time::timeout(wait, peer.send(Message::Close(Some(frame)))).await;
+        assert!(matches!(sent, Ok(Ok(()))), "the peer closes: {sent:?}");
+        // Nothing awaits between these sends and the close, so the socket's
+        // task drains none of them.
+        let mut queued = 0_usize;
+        while queued < 4096 && send_cmd(id, WsCmd::Text("x".repeat(16))).is_ok() {
+            queued += 1;
+        }
+        assert_eq!(
+            send_cmd(id, WsCmd::Text(String::new())),
+            Err(SendRefusal::QueueFull),
+            "the queue is full after {queued} sends"
+        );
+        assert_eq!(send_cmd(id, WsCmd::Close), Ok(()));
+
+        let closed = tokio::time::timeout(wait, events.recv()).await;
+        assert!(
+            matches!(closed, Ok(Ok(WsEvent::Closed(4001)))),
+            "the peer's close ends the socket: {closed:?}"
+        );
+        let ended = tokio::time::timeout(wait, events.recv()).await;
+        assert!(
+            matches!(
+                ended,
+                Ok(Err(tokio::sync::broadcast::error::RecvError::Closed))
+            ),
+            "one terminal event, then the socket's task ended: {ended:?}"
+        );
+        assert!(!ws_registered(id), "the socket is deregistered");
+    }
+
+    /// The reply to a close the peer sends reaches the peer before the
+    /// socket is dropped.
+    #[tokio::test]
+    async fn a_close_from_the_peer_is_answered() {
+        use tokio_tungstenite::tungstenite::protocol::CloseFrame;
+        const DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let pair = started_pair(client_io, server_io, 16).await;
+        assert!(pair.is_some(), "the socket opens");
+        let Some((id, mut peer)) = pair else { return };
+        let events = subscribe_events(id);
+        assert!(events.is_some(), "the socket is registered");
+        let Some(mut events) = events else { return };
+
+        let frame = CloseFrame {
+            code: 1000.into(),
+            reason: "".into(),
+        };
+        let sent = tokio::time::timeout(DEADLINE, peer.send(Message::Close(Some(frame)))).await;
+        assert!(matches!(sent, Ok(Ok(()))), "the peer closes: {sent:?}");
+        let reply = tokio::time::timeout(DEADLINE, peer.next()).await;
+        assert!(
+            matches!(
+                &reply,
+                Ok(Some(Ok(Message::Close(Some(f))))) if u16::from(f.code) == 1000
+            ),
+            "the peer's close was not answered: {reply:?}"
+        );
+        let closed = tokio::time::timeout(DEADLINE, events.recv()).await;
+        assert!(
+            matches!(closed, Ok(Ok(WsEvent::Closed(1000)))),
+            "{closed:?}"
+        );
     }
 
     #[test]
