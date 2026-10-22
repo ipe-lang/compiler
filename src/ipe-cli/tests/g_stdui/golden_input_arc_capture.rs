@@ -2,18 +2,15 @@
 //! callback AND reused by a sibling.
 //!
 //! Without the fix, `ipe dev build` exits 0, but the emitted Rust fails `cargo build` with
-//! E0382 ("use of moved value: `habit`"). The lowerer pre-clones the checkbox
-//! `onChange` callback's captured `habit`
-//! (`let habit = habit.clone(); Lambda { … }`), but `arc_callback_wrap` then
-//! re-wrapped the WHOLE block in
-//! `Arc::new(move |_x| ({ let habit = habit.clone(); … })(_x))` — the outer
-//! `move` still move-captured the FREE outer `habit`, so a later sibling use
-//! (`RemoveHabit habit.id`, the button `onPress`) hit use-after-move.
+//! E0382 ("use of moved value: `habit`") whenever the checkbox `onChange`
+//! callback's capture-clone `let habit = habit.clone();` lands inside a `move`
+//! closure that captures the FREE outer `habit`, so a later sibling use
+//! (`RemoveHabit habit.id`, the button `onPress`) hits use-after-move.
 //!
-//! Fix (`emit_arc_callback_field` in `crates/ipe_backend_rust/src/emit_expr.rs`):
-//! hoist the leading capture-clone `let`s OUTSIDE the `Arc`'s `move` closure —
-//! `{ let habit = habit.clone(); ::std::sync::Arc::new(move |_x| (INNER)(_x)) }`
-//! — so the `Arc` owns the pre-made clone and the original binding survives for
+//! The callback field is an adapted slot in handler normal form: the emitter
+//! emits its leading `let`s OUTSIDE the closure it places in the `Arc` —
+//! `{ let habit = habit.clone(); ::std::sync::Arc::new(move |..| ..) }` — so
+//! the `Arc` owns the pre-made clone and the original binding survives for
 //! the sibling.
 //!
 //! Run:

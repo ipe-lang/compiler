@@ -4,9 +4,10 @@
 // the wiring VOCABULARY in [`crate::transition_classify`]'s `tests`, so no
 // standalone emit test lives here.
 
-use super::{BoxedSub, DResult, IrType, ModPath, Pat};
+use super::{AdaptedHandler, BoxedSub, DResult, Expr, IrType, ModPath, Pat};
 use ipe_diagnostics::Diagnostic;
 use ipe_intern::Interner;
+use ipe_ir::once_closure::MovedCapture;
 use ipe_ir::{SharedAlts, SliceOwnership};
 
 #[test]
@@ -91,5 +92,56 @@ fn a_test_nested_in_a_boxed_destructure_dispatches() -> DResult<()> {
         BoxedSub::of(&alias_over_pair),
         BoxedSub::Destructure(&alias_over_pair)
     );
+    Ok(())
+}
+
+/// An adapted slot is read only in handler normal form: `let`s around one closure literal.
+#[test]
+fn an_adapted_slot_outside_handler_normal_form_is_a_compiler_bug() -> DResult<()> {
+    let mut interner = Interner::new();
+    let f = interner.intern("f")?;
+    let key = interner.intern("key")?;
+    let t = interner.intern("t")?;
+    let params = vec![(key, IrType::Str)];
+    let lambda = Expr::Lambda {
+        params: params.clone(),
+        ret: IrType::Unit,
+        body: Box::new(Expr::Unit),
+    };
+    let let_wrapped = Expr::Let {
+        name: t,
+        value: Box::new(Expr::Var(f)),
+        body: Box::new(lambda.clone()),
+    };
+    assert!(AdaptedHandler::from_ir(&lambda, "emit_expr::tests").is_ok());
+    assert!(AdaptedHandler::from_ir(&let_wrapped, "emit_expr::tests").is_ok());
+    let once = Expr::Let {
+        name: t,
+        value: Box::new(Expr::Var(f)),
+        body: Box::new(Expr::OnceLambda {
+            params,
+            ret: IrType::Unit,
+            body: Box::new(Expr::Var(t)),
+            capture: MovedCapture {
+                name: t,
+                lo: 0,
+                hi: 1,
+            },
+        }),
+    };
+    let variable_core = Expr::Let {
+        name: t,
+        value: Box::new(Expr::Unit),
+        body: Box::new(Expr::Var(f)),
+    };
+    for slot in [&Expr::Var(f), &Expr::Unit, &variable_core, &once] {
+        assert!(
+            matches!(
+                AdaptedHandler::from_ir(slot, "emit_expr::tests"),
+                Err(Diagnostic::CompilerBug { .. })
+            ),
+            "{slot:?} is not in handler normal form"
+        );
+    }
     Ok(())
 }

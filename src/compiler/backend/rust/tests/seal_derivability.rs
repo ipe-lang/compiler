@@ -445,16 +445,16 @@ fn web_html_helper_record_gets_cdpeq_without_serde() -> DResult<()> {
 // `Event.onBool` is preceded by a capture-clone `Let` (the lowerer hoists
 // `let sym = sym.clone()` before the lambda when `sym` is also used by a
 // sibling attribute on the same element), the emit must PEEL that let OUTSIDE
-// the synthesised `Arc::new(move |_x| …)`.
+// the arm's `Arc::new(move |…| …)`.
 //
 // Without the peel (the pre-fix code path), the outer `move` closure
 // move-captures the free binding and a sibling use of it hits E0382 at
 // `cargo build` — ipe exit-0 then cargo-fail, the cardinal SEAL breach.
 //
-// The fix routes these arms through `emit_arc_callback_field`, identical to
-// the already-correct `Ui.onInput` / `Ui.onChange` arms. The emitted text
-// must contain the peel `let pfx` BEFORE the `Arc::new(` that follows it,
-// proving the let was hoisted outside the closure boundary.
+// Every adapted arm emits its slot's leading `let`s once, before the closure
+// it places in the runtime slot (`AdaptedHandler`). The emitted text must
+// contain the `let pfx` BEFORE the `Arc::new(` that follows it, proving the
+// let sits outside the closure boundary.
 
 /// Build:
 ///   ```
@@ -977,7 +977,7 @@ fn assert_peeled_before_move(src: &str, runtime_path: &str) {
     );
 }
 
-/// `Ui.onSubmit` (bare, non-Arc `ui_on_submit_(move |_x| …)`).
+/// `Ui.onSubmit` (bare, non-Arc `ui_on_submit_(move |…| …)`).
 #[test]
 fn on_submit_capture_clone_peeled_outside_closure() -> DResult<()> {
     let mut interner = Interner::new();
@@ -1004,7 +1004,7 @@ fn on_submit_capture_clone_peeled_outside_closure() -> DResult<()> {
 }
 
 /// `Event.onKeyDown` / String shape
-/// (`html_on_string_(…, Arc::new(move |_x| …))`).
+/// (`html_on_string_(…, Arc::new(move |…| …))`).
 #[test]
 fn html_on_string_capture_clone_peeled_outside_closure() -> DResult<()> {
     let mut interner = Interner::new();
@@ -1031,7 +1031,7 @@ fn html_on_string_capture_clone_peeled_outside_closure() -> DResult<()> {
 }
 
 /// `Event.onBool` / Bool shape
-/// (`html_on_bool_(…, Arc::new(move |_x| …))`).
+/// (`html_on_bool_(…, Arc::new(move |…| …))`).
 #[test]
 fn html_on_bool_capture_clone_peeled_outside_closure() -> DResult<()> {
     let mut interner = Interner::new();
@@ -1059,7 +1059,7 @@ fn html_on_bool_capture_clone_peeled_outside_closure() -> DResult<()> {
 }
 
 /// `Event.onSubmit` / Raw decoder shape
-/// (bare, non-Arc `html_on_raw_(…, move |_x| …)`).
+/// (bare, non-Arc `html_on_raw_(…, move |…| …)`).
 #[test]
 fn html_on_raw_capture_clone_peeled_outside_closure() -> DResult<()> {
     let mut interner = Interner::new();
@@ -1085,7 +1085,7 @@ fn html_on_raw_capture_clone_peeled_outside_closure() -> DResult<()> {
     Ok(())
 }
 
-/// `Lazy.lazy` (bare, non-Arc, MULTI-ARG `lazy_lazy_(move |_a| …, key)`). The
+/// `Lazy.lazy` (bare, non-Arc, MULTI-ARG `lazy_lazy_(move |…| …, key)`). The
 /// captured `pfx` is shared with the POSITIONAL key arg — the peel must hoist
 /// the clone-let OUTSIDE the thunk `move` closure while leaving the key arg
 /// (which reads `pfx`) intact.
@@ -1112,5 +1112,197 @@ fn lazy_capture_clone_peeled_outside_closure() -> DResult<()> {
     let prog = ui_view_program(&mut interner, IrType::Str, body)?;
     let src = emit(&interner, &prog)?;
     assert_peeled_before_move(&src, "ipe_runtime::ui::lazy::lazy_lazy_(");
+    Ok(())
+}
+
+// ── Handler normal form: every adapted slot is `let`s around one closure ─────
+//
+// Lowering puts every adapted kernel slot (`KernelFn::adapted_slots`) in
+// handler normal form, keeping a computed capture's `let` (a partial's
+// `let cap_0 = offers(model)`) in the slot. The arm emits those `let`s once,
+// outside the callback closure it builds, and the closure is the IR closure
+// itself. A slot in any other shape is a compiler bug at ipe time, never text
+// re-embedded inside a `move` the capture analysis did not see.
+
+/// One adapted-slot arm: its kernel, runtime path, handler parameter and return
+/// types, form classification, and the arguments after the handler.
+type AdaptedArm = (KernelFn, &'static str, IrType, IrType, OnFormKind, usize);
+
+/// The single-handler arms whose handler is argument 0, with their trailing
+/// `Str` argument count.
+fn adapted_arms() -> Vec<AdaptedArm> {
+    vec![
+        (
+            KernelFn::UiOnInput,
+            "ipe_runtime::ui::helpers::ui_on_input_(",
+            IrType::Str,
+            IrType::Str,
+            OnFormKind::NotForm,
+            0,
+        ),
+        (
+            KernelFn::UiOnChange,
+            "ipe_runtime::ui::helpers::ui_on_change_(",
+            IrType::Str,
+            IrType::Str,
+            OnFormKind::NotForm,
+            0,
+        ),
+        (
+            KernelFn::UiOnKeyDown,
+            "ipe_runtime::ui::helpers::ui_on_key_down_(",
+            IrType::Str,
+            IrType::Str,
+            OnFormKind::NotForm,
+            0,
+        ),
+        (
+            KernelFn::UiOnKeyUp,
+            "ipe_runtime::ui::helpers::ui_on_key_up_(",
+            IrType::Str,
+            IrType::Str,
+            OnFormKind::NotForm,
+            0,
+        ),
+        (
+            KernelFn::UiOnFile,
+            "ipe_runtime::ui::helpers::ui_on_file_(",
+            IrType::Str,
+            IrType::Str,
+            OnFormKind::NotForm,
+            0,
+        ),
+        (
+            KernelFn::UiOnBool,
+            "ipe_runtime::ui::helpers::ui_on_bool_(",
+            IrType::Bool,
+            IrType::Str,
+            OnFormKind::NotForm,
+            0,
+        ),
+        (
+            KernelFn::UiOnSubmit,
+            "ipe_runtime::ui::helpers::ui_on_submit_(",
+            IrType::Str,
+            IrType::Str,
+            OnFormKind::Decoder,
+            0,
+        ),
+        (
+            KernelFn::HtmlOnKeyDown,
+            "ipe_runtime::html::html_on_string_(",
+            IrType::Str,
+            IrType::Str,
+            OnFormKind::NotForm,
+            0,
+        ),
+        (
+            KernelFn::HtmlOnBool,
+            "ipe_runtime::html::html_on_bool_(",
+            IrType::Bool,
+            IrType::Str,
+            OnFormKind::NotForm,
+            0,
+        ),
+        (
+            KernelFn::HtmlOnSubmit,
+            "ipe_runtime::html::html_on_raw_(",
+            IrType::Str,
+            IrType::Str,
+            OnFormKind::Decoder,
+            0,
+        ),
+        (
+            KernelFn::LazyLazy,
+            "ipe_runtime::ui::lazy::lazy_lazy_(",
+            IrType::Str,
+            IrType::Str,
+            OnFormKind::NotForm,
+            1,
+        ),
+    ]
+}
+
+/// `Call(kernel, [handler] ++ tail)`, each tail argument a read of `pfx`.
+fn adapted_call(
+    kernel: KernelFn,
+    handler: Expr,
+    on_form: OnFormKind,
+    pfx: Symbol,
+    tail: usize,
+) -> Expr {
+    let mut args = vec![handler];
+    args.extend((0..tail).map(|_| Expr::Var(pfx)));
+    Expr::Call {
+        callee: Callee::Kernel(kernel),
+        args,
+        pin: CallPin::None,
+        on_form,
+    }
+}
+
+/// A partial's computed capture `let cap_0 = pfx ++ "!"` is emitted once,
+/// before the arm's `move |` closure, which reads the bound `cap_0`.
+#[test]
+fn computed_capture_let_is_emitted_outside_every_adapted_closure() -> DResult<()> {
+    for (kernel, runtime_path, param_ty, ret, on_form, tail) in adapted_arms() {
+        let mut interner = Interner::new();
+        let pfx = interner.intern("pfx")?;
+        let cap = interner.intern("cap_0")?;
+        let x = interner.intern("x")?;
+        let body = if matches!(param_ty, IrType::Bool) {
+            Expr::Var(cap)
+        } else {
+            Expr::BinOp {
+                op: ipe_ir::BinOp::Append,
+                lhs: Box::new(Expr::CloneVar(cap)),
+                rhs: Box::new(Expr::Var(x)),
+            }
+        };
+        let handler = Expr::Let {
+            name: cap,
+            value: Box::new(Expr::BinOp {
+                op: ipe_ir::BinOp::Append,
+                lhs: Box::new(Expr::CloneVar(pfx)),
+                rhs: Box::new(Expr::Str("!".to_owned())),
+            }),
+            body: Box::new(Expr::Lambda {
+                params: vec![(x, param_ty)],
+                ret: ret.clone(),
+                body: Box::new(body),
+            }),
+        };
+        let call = adapted_call(kernel, handler, on_form, pfx, tail);
+        let prog = ui_view_program(&mut interner, ret, call)?;
+        let src = emit(&interner, &prog)?;
+        let (_, after) = src.split_once(runtime_path).unwrap_or(("", ""));
+        let (head, tail_text) = after.split_once("move |").unwrap_or(("", ""));
+        assert!(
+            head.contains("let cap_0 ="),
+            "{kernel:?}: the computed capture `let` must precede the arm's `move |`:\n{src}"
+        );
+        assert!(
+            !tail_text.contains("let cap_0 ="),
+            "{kernel:?}: the computed capture `let` must not re-run inside the closure:\n{src}"
+        );
+    }
+    Ok(())
+}
+
+/// A slot outside handler normal form (a bare variable) fails closed as a compiler bug.
+#[test]
+fn adapted_slot_outside_handler_normal_form_fails_closed() -> DResult<()> {
+    for (kernel, _, _, ret, on_form, tail) in adapted_arms() {
+        let mut interner = Interner::new();
+        let pfx = interner.intern("pfx")?;
+        let call = adapted_call(kernel, Expr::Var(pfx), on_form, pfx, tail);
+        let prog = ui_view_program(&mut interner, ret, call)?;
+        let emitted = emit(&interner, &prog);
+        assert!(
+            matches!(emitted, Err(Diagnostic::CompilerBug { .. })),
+            "{kernel:?}: a bare-variable handler slot must be refused at ipe time, got \
+             {emitted:?}"
+        );
+    }
     Ok(())
 }

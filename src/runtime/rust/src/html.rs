@@ -1304,7 +1304,7 @@ pub fn html_on_msg_<M>(name: String, msg: M) -> Attribute<M> {
 
 /// `Ipe.Html.Events.{onInput,onChange,onKeyDown,onKeyUp}` — a
 /// value-carrying event; the handler receives the input string. The compiler
-/// Arc-wraps the emitted Ipê fn before this call.
+/// passes the handler closure in its `Arc`.
 #[must_use]
 pub fn html_on_string_<M>(
     name: String,
