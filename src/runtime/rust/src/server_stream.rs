@@ -430,27 +430,51 @@ impl ServerPendingStream {
     /// is returned, before the first chunk, as SSE requires.
     ///
     /// A body opened under the credentials the request bound ends on a
-    /// coalesced revocation and at the earliest deadline; the receiver drops,
-    /// so the handler's next `emit` reports the client gone. A gate that
+    /// coalesced revocation and at the earliest deadline; the body ends and its
+    /// handler is cancelled. A gate that
     /// cannot prove those credentials now answers 401 and never runs the
     /// handler (fail closed).
     ///
     /// The body ends once the server drains, and counts as live until it
-    /// ends. A server already past its live ceiling answers 503 and never
-    /// runs the handler.
+    /// ends. The handler is one unit of shutdown work: it may finish within the
+    /// grace, and is cancelled once the shutdown closes. A server already past
+    /// its live or work ceiling answers 503 and never runs the handler. The
+    /// handler lives no longer than its body, save that a body the drain ends
+    /// leaves it to the grace.
     #[must_use]
     pub fn serve(self, head: ServerResponseHead) -> axum::response::Response {
         use axum::response::IntoResponse;
+        match self.open(crate::server::shutdown::drain()) {
+            Ok(body) => head.into_response(axum::body::Body::from_stream(body)),
+            Err(refused) => refused.into_response(),
+        }
+    }
+
+    /// Spawn the handler under `drain` and return the body that streams it.
+    ///
+    /// # Errors
+    ///
+    /// 401 for a gate that cannot prove the credentials; 503 past the live or
+    /// work ceiling. Neither runs the handler.
+    fn open(
+        self,
+        drain: crate::server::shutdown::Drain,
+    ) -> Result<
+        impl futures_util::Stream<Item = Result<String, std::io::Error>> + Send + 'static,
+        axum::http::StatusCode,
+    > {
         let Self {
             handler,
             credentials,
         } = self;
         let Some(gate) = crate::server::ChannelGate::open(&credentials).ok() else {
-            return axum::http::StatusCode::UNAUTHORIZED.into_response();
+            return Err(axum::http::StatusCode::UNAUTHORIZED);
         };
-        let drain = crate::server::shutdown::drain();
         let Some(live) = drain.hold() else {
-            return axum::http::StatusCode::SERVICE_UNAVAILABLE.into_response();
+            return Err(axum::http::StatusCode::SERVICE_UNAVAILABLE);
+        };
+        let Ok(work) = drain.work() else {
+            return Err(axum::http::StatusCode::SERVICE_UNAVAILABLE);
         };
         let (tx, rx) = tokio::sync::mpsc::channel::<String>(STREAM_CHAN_BUFFER);
         let id = loop {
@@ -463,50 +487,77 @@ impl ServerPendingStream {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .insert(id, tx);
-
-        // Drive the handler in its own task, inside the request's binding set
-        // so a token it verifies binds to this stream; on completion drop the
-        // sender so the body stream terminates even if the handler forgot to
-        // call `finish`. The task runs outside the request's stream table, so
-        // a `stream` call inside the handler is refused.
-        tokio::spawn(async move {
-            credentials
-                .scoped(|| handler(StreamWriter::StreamWriter(id)))
-                .await;
-            stream_senders()
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .remove(&id);
-        });
-
-        let body_stream = stream_body(rx, gate, drain, live);
-        head.into_response(axum::body::Body::from_stream(body_stream))
+        let slot = StreamSlot(id);
+        let task = spawn_stream_handler(handler, credentials, slot, work);
+        let handler = crate::task::AbortOnDrop::new(task.abort_handle());
+        Ok(stream_body(rx, gate, drain, live, handler))
     }
+}
+
+/// The stream table entry for one stream id, removed when the slot drops.
+struct StreamSlot(i64);
+
+impl Drop for StreamSlot {
+    fn drop(&mut self) {
+        stream_senders()
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&self.0);
+    }
+}
+
+/// Drive the stream handler `slot` names in its own task, under `work`.
+///
+/// The task runs inside the request's binding set, so a token the handler
+/// verifies binds to this stream; on completion, once the shutdown cancels
+/// it, or once the task is aborted, the slot's sender drops so the body
+/// stream terminates even if the handler forgot to call `finish`. The task
+/// runs outside the request's stream table, so a `stream` call inside the
+/// handler is refused.
+fn spawn_stream_handler(
+    handler: ErasedStreamHandler,
+    credentials: crate::server::ChannelCredentials,
+    slot: StreamSlot,
+    mut work: crate::server::shutdown::WorkGuard,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let id = slot.0;
+        let _ = work
+            .unless_cancelled(credentials.scoped(|| handler(StreamWriter::StreamWriter(id))))
+            .await;
+        drop(work);
+        drop(slot);
+    })
 }
 
 /// A served stream's body: the handler's chunks until it ends, the gate denies, or the server drains.
 ///
 /// `None` ends the body once every sender has dropped (finish / handler
 /// exit), once the gate denies, or once the server drains; each drops the
-/// receiver, and the end drops `live`. A chunk is written only after the gate
-/// settles, so a credential the handler bound, or a revocation already due,
-/// is proved before the chunk leaves.
+/// receiver, and the end drops `live`. A body the drain ends leaves `handler`
+/// to the grace; any other end, or a drop unended, aborts it. A chunk is
+/// written only after the gate settles, so a credential the handler bound, or
+/// a revocation already due, is proved before the chunk leaves.
 fn stream_body(
     rx: tokio::sync::mpsc::Receiver<String>,
     gate: Option<crate::server::ChannelGate>,
     drain: crate::server::shutdown::Drain,
     live: crate::server::shutdown::LiveGuard,
-) -> impl futures_util::Stream<Item = Result<String, std::io::Error>> + Send {
+    handler: crate::task::AbortOnDrop,
+) -> impl futures_util::Stream<Item = Result<String, std::io::Error>> + Send + 'static {
     futures_util::stream::unfold(
-        (rx, gate, drain, live),
-        |(mut rx, mut gate, mut drain, live)| async move {
+        (rx, gate, drain, live, handler),
+        |(mut rx, mut gate, mut drain, live, handler)| async move {
             tokio::select! {
                 biased;
                 () = crate::server::channel_denial(&mut gate) => None,
-                () = drain.wait() => None,
+                () = drain.wait() => {
+                    handler.defuse();
+                    None
+                }
                 chunk = rx.recv() => match chunk {
                     Some(chunk) if !crate::server::channel_unsettled(&mut gate) => {
-                        Some((Ok(chunk), (rx, gate, drain, live)))
+                        Some((Ok(chunk), (rx, gate, drain, live, handler)))
                     }
                     Some(_) | None => None,
                 },
@@ -535,7 +586,9 @@ mod tests {
             return;
         };
         let (tx, rx) = tokio::sync::mpsc::channel::<String>(STREAM_CHAN_BUFFER);
-        let mut body = Box::pin(stream_body(rx, None, drain, live));
+        let idle = tokio::spawn(std::future::pending::<()>());
+        let handler = crate::task::AbortOnDrop::new(idle.abort_handle());
+        let mut body = Box::pin(stream_body(rx, None, drain, live, handler));
         assert!(tx.send("chunk".to_owned()).await.is_ok());
         let first = body.next().await;
         assert!(matches!(first, Some(Ok(ref c)) if c == "chunk"));
@@ -550,6 +603,13 @@ mod tests {
         assert!(matches!(end, Ok(None)), "the body ends on the drain");
         drop(body);
         assert_eq!(armed.live_count(), 0, "the ended body is no longer live");
+        for _ in 0..16 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            !idle.is_finished(),
+            "a body the drain ends leaves its handler to the grace"
+        );
         drop(tx);
     }
 
@@ -562,6 +622,161 @@ mod tests {
                 crate::ipe_error_message(e),
             )),
         }
+    }
+
+    /// A stream handler still running when the shutdown closes is cancelled,
+    /// and its sender is unregistered.
+    #[tokio::test(start_paused = true)]
+    async fn a_stream_handler_running_past_the_grace_is_cancelled_by_the_close() {
+        let (armed, _signals) = crate::server::shutdown::tests::armed_with(
+            crate::server::shutdown::ShutdownPlan::bare("test"),
+            std::time::Duration::ZERO,
+            Arc::new(std::sync::atomic::AtomicI32::new(0)),
+        );
+        let work = armed.drain().work();
+        assert!(work.is_ok(), "an idle owner counts the handler");
+        let Ok(work) = work else {
+            return;
+        };
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let entering = Arc::clone(&entered);
+        let handler: ErasedStreamHandler = Arc::new(move |_w: StreamWriter| {
+            let entering = Arc::clone(&entering);
+            Box::pin(async move {
+                entering.notify_one();
+                std::future::pending::<()>().await;
+            }) as Pin<Box<dyn Future<Output = ()> + Send>>
+        });
+        let (tx, _rx) = tokio::sync::mpsc::channel::<String>(STREAM_CHAN_BUFFER);
+        let id = loop {
+            let n = NEXT_STREAM_ID.fetch_add(1, Ordering::Relaxed);
+            if n != 0 {
+                break n;
+            }
+        };
+        stream_senders()
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(id, tx);
+        let task = spawn_stream_handler(
+            handler,
+            crate::server::ChannelCredentials::of_request(),
+            StreamSlot(id),
+            work,
+        );
+        let began =
+            tokio::time::timeout(std::time::Duration::from_secs(1), entered.notified()).await;
+        assert!(began.is_ok(), "the handler runs");
+        let started = tokio::time::Instant::now();
+        let _settled = armed.cancel_work().await;
+        assert!(
+            started.elapsed() < crate::server::shutdown::WORK_CANCEL_DEADLINE,
+            "the cancelled handler releases its unit before the cancel deadline"
+        );
+        let ended = tokio::time::timeout(std::time::Duration::from_secs(1), task).await;
+        assert!(
+            matches!(ended, Ok(Ok(()))),
+            "the close ends the handler task"
+        );
+        assert!(
+            !stream_senders()
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .contains_key(&id),
+            "the cancelled handler's sender is unregistered"
+        );
+    }
+
+    /// Sets its flag when the future holding it is dropped.
+    struct DropFlag(Arc<std::sync::atomic::AtomicBool>);
+
+    impl Drop for DropFlag {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    /// A handler that flags `entered` when it runs and `dropped` when its
+    /// future drops, and otherwise never ends.
+    fn pending_handler(
+        entered: &Arc<std::sync::atomic::AtomicBool>,
+        dropped: &Arc<std::sync::atomic::AtomicBool>,
+    ) -> ErasedStreamHandler {
+        let (entered, dropped) = (Arc::clone(entered), Arc::clone(dropped));
+        Arc::new(move |_w: StreamWriter| {
+            let entered = Arc::clone(&entered);
+            let flag = DropFlag(Arc::clone(&dropped));
+            Box::pin(async move {
+                let _flag = flag;
+                entered.store(true, Ordering::SeqCst);
+                std::future::pending::<()>().await;
+            }) as Pin<Box<dyn Future<Output = ()> + Send>>
+        })
+    }
+
+    /// A dropped body aborts its handler: the handler's future drops, its
+    /// work unit and its sender are released.
+    #[tokio::test]
+    async fn a_dropped_stream_body_aborts_its_handler() {
+        use std::sync::atomic::AtomicBool;
+        let (armed, _signals) = crate::server::shutdown::tests::armed_with(
+            crate::server::shutdown::ShutdownPlan::bare("test"),
+            std::time::Duration::from_secs(30),
+            Arc::new(std::sync::atomic::AtomicI32::new(0)),
+        );
+        let entered = Arc::new(AtomicBool::new(false));
+        let dropped = Arc::new(AtomicBool::new(false));
+        let pending = ServerPendingStream {
+            handler: pending_handler(&entered, &dropped),
+            credentials: crate::server::ChannelCredentials::of_request(),
+        };
+        let opened = pending.open(armed.drain());
+        assert!(opened.is_ok(), "a serving owner opens the stream");
+        let Ok(body) = opened else {
+            return;
+        };
+        let budget = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !entered.load(Ordering::SeqCst) {
+            assert!(tokio::time::Instant::now() < budget, "the handler runs");
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+        assert_eq!(armed.work_in_flight(), 1, "the running handler is counted");
+        drop(body);
+        while !(dropped.load(Ordering::SeqCst) && armed.work_in_flight() == 0) {
+            assert!(
+                tokio::time::Instant::now() < budget,
+                "a dropped body aborts its handler and releases its unit"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+        assert_eq!(armed.live_count(), 0, "the dropped body is no longer live");
+    }
+
+    /// A stream past the work ceiling answers 503 and never runs its handler.
+    #[tokio::test]
+    async fn a_stream_past_the_work_ceiling_is_refused_before_its_handler() {
+        use std::sync::atomic::AtomicBool;
+        let (armed, _signals) = crate::server::shutdown::tests::armed_with(
+            crate::server::shutdown::ShutdownPlan::bare("test"),
+            std::time::Duration::from_secs(30),
+            Arc::new(std::sync::atomic::AtomicI32::new(0)),
+        );
+        armed.force_work_state(crate::server::shutdown::WORK_CEILING);
+        let entered = Arc::new(AtomicBool::new(false));
+        let dropped = Arc::new(AtomicBool::new(false));
+        let pending = ServerPendingStream {
+            handler: pending_handler(&entered, &dropped),
+            credentials: crate::server::ChannelCredentials::of_request(),
+        };
+        let refused = pending.open(armed.drain()).err();
+        assert_eq!(
+            refused,
+            Some(axum::http::StatusCode::SERVICE_UNAVAILABLE),
+            "a full owner answers 503"
+        );
+        tokio::task::yield_now().await;
+        assert!(!entered.load(Ordering::SeqCst), "the handler never runs");
+        assert_eq!(armed.live_count(), 0, "a refused stream holds nothing");
     }
 
     /// A stream handler that emits nothing.

@@ -40,10 +40,10 @@ const LINE_BUDGET: Duration = Duration::from_secs(10);
 /// Budget for any one client read.
 const CLIENT_BUDGET: Duration = Duration::from_secs(20);
 
-/// The longest the runtime takes to close every owned pool
-/// (`shutdown::POOLS_CLOSE_BOUND`): one 2 s deadline per close stage, two
-/// stages one after another.
-const POOLS_CLOSE_BOUND: Duration = Duration::from_secs(4);
+/// The longest the runtime's stop takes past the grace
+/// (`shutdown::POOLS_CLOSE_BOUND`): the 500 ms work-cancel deadline, then one
+/// 2 s deadline per close stage, two stages one after another.
+const POOLS_CLOSE_BOUND: Duration = Duration::from_millis(4500);
 
 /// The stdout line the first signal writes.
 const SHUTDOWN_LINE: &str = "shutting down";
@@ -320,6 +320,89 @@ update msg model =
             ( { model | count = model.count + 1 }, Cmd.none )
 
         Opened _result ->
+            ( model, Cmd.none )
+
+subscriptions : Model -> Sub Msg
+subscriptions _model =
+    Sub.none
+
+view : Model -> Element Msg
+view model =
+    Ui.el [ Ui.onClick Increment ] (Ui.text (String.fromInt model.count))
+
+main =
+    Web.tea
+        { init = init
+        , update = update
+        , view = view
+        , subscriptions = subscriptions
+        , routes = []
+        , notFound = Increment
+        }
+"#;
+
+/// A `Web.tea` app whose `init` Cmd opens the `STORE_DB` file through `Ipe.Db`,
+/// writes a row (so the file has a `-wal`), logs that it opened, then queries
+/// the table back to back, writing a failed query to stderr: a Cmd always on
+/// its owned pool when the grace ends.
+const WEB_CMD_DB: &str = r#"module Main exposing (main)
+
+import Ipe.Db as Db exposing (Db)
+import Ipe.Db.Location as Location exposing (Mode(..))
+import Ipe.Db.Unsafe as Unsafe
+import Ipe.Error as Error exposing (Error)
+import Ipe.Log as Log
+import Ipe.Path as Path
+import Ipe.Result as Result
+import Ipe.String
+import Ipe.System as System
+import Ipe.Task as Task exposing (Step(..), Task)
+import Ipe.Tea.Web as Web
+import Ipe.Tea.Web.Cmd
+import Ipe.Tea.Web.Sub
+import Ipe.Ui as Ui
+
+type Msg = Increment | Probed (Result Error ())
+
+type alias Model = { count : Int }
+
+connect : Task Error Db
+connect =
+    Path.fromString (System.getenvOr "STORE_DB" "shutdown-e2e.db")
+        |> Result.andThen (Location.file CreateIfMissing)
+        |> Task.fromResult
+        |> Task.andThen (\location -> Db.open location)
+
+setup : Db -> Task Error Db
+setup db =
+    Unsafe.unsafeExecRaw db "CREATE TABLE IF NOT EXISTS probe (v INTEGER NOT NULL)"
+        |> Task.andThen (\_ -> Unsafe.unsafeExecRaw db "INSERT INTO probe (v) VALUES (1)")
+        |> Task.andThen (\_ -> Log.info "probe opened its pool")
+        |> Task.map (\_ -> db)
+
+probeOnce : Db -> Int -> Task Error (Step Int ())
+probeOnce db n =
+    Unsafe.unsafeQuery db "SELECT v FROM probe" []
+        |> Task.map (\_ -> Continue (n + 1))
+
+probe : Task Error ()
+probe =
+    connect
+        |> Task.andThen setup
+        |> Task.andThen (\db -> Task.loop 1000000000 0 (probeOnce db))
+        |> Task.onError (\e -> Log.warnWith "probe failed" [ Error.toString e ])
+
+init : WebReq -> ( Model, Cmd Msg )
+init _req =
+    ( { count = 0 }, Cmd.perform probe Probed )
+
+update : Msg -> Model -> ( Model, Cmd Msg )
+update msg model =
+    case msg of
+        Increment ->
+            ( { model | count = model.count + 1 }, Cmd.none )
+
+        Probed _result ->
             ( model, Cmd.none )
 
 subscriptions : Model -> Sub Msg
@@ -1172,6 +1255,72 @@ fn a_sqlite_session_store_closes_on_sigterm() -> Result<(), BoxError> {
         "{test_name}: the SQLite session store opened; seen {:?}",
         served.seen
     );
+    assert_no_sidecars(test_name, &db);
+    Ok(())
+}
+
+/// E11: a web Cmd still running on an owned pool past the grace is cancelled
+/// before the pools close: it never reports a closed pool, the one cancel line
+/// counts it, and the database keeps no `-wal` or `-shm`.
+#[test]
+fn a_web_cmd_past_the_grace_is_cancelled_before_the_pools_close() -> Result<(), BoxError> {
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
+        return Ok(());
+    }
+    let test_name = "web_cmd_db";
+    let exe = compile(test_name, WEB_CMD_DB)?;
+    let db = fresh_db(test_name);
+    let db_env = db.to_string_lossy().into_owned();
+    let port = pick_ephemeral_port()?;
+    let port_env = port.to_string();
+    let env = [
+        ("IPE_WEB_PORT", port_env.as_str()),
+        ("IPE_CSRF", "off"),
+        ("IPE_CONSOLE_EMBED", "off"),
+        ("IPE_WEB_SHUTDOWN_GRACE_MS", "300"),
+        ("STORE_DB", db_env.as_str()),
+    ];
+    let mut served = Served::ready(&exe, port, &env)?;
+    let page = get(port, "/")?;
+    assert!(
+        page.starts_with("HTTP/1.1 200"),
+        "{test_name}: the page renders: {page}"
+    );
+    served.wait_for("probe opened its pool", LINE_BUDGET)?;
+    assert!(
+        sidecar(&db, "-wal").exists(),
+        "{test_name}: the init Cmd's write opened the file's WAL; seen {:?}",
+        served.seen
+    );
+    std::thread::sleep(Duration::from_millis(200));
+    served.signal("-TERM")?;
+    let status = served.wait_exit(EXIT_BUDGET)?;
+    let closed_pool = served.containing(Pipe::Err, "connection pool closed")
+        + served.containing(Pipe::Out, "connection pool closed");
+    assert_eq!(
+        closed_pool, 0,
+        "{test_name}: no Cmd outlives the pool it uses; seen {:?}",
+        served.seen
+    );
+    assert_eq!(
+        status.code(),
+        Some(0),
+        "{test_name}: {status}; seen {:?}",
+        served.seen
+    );
+    assert_eq!(
+        served.ending_with(Pipe::Out, SHUTDOWN_LINE),
+        1,
+        "{test_name}: one shutdown line; seen {:?}",
+        served.seen
+    );
+    assert_eq!(
+        served.containing(Pipe::Err, "cancelled 1 task still running"),
+        1,
+        "{test_name}: the grace's end cancels the running Cmd; seen {:?}",
+        served.seen
+    );
+    assert_eq!(served.containing(Pipe::Err, FORCING_LINE), 0);
     assert_no_sidecars(test_name, &db);
     Ok(())
 }
