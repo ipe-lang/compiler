@@ -465,14 +465,13 @@ fn tls_stays_rustls_with_bundled_roots_in_every_manifest_source() {
     ];
     for path in &sources {
         let text = effective(&read(path));
-        for forbidden in ["native-tls", "openssl", "rustls-tls-native-roots"] {
-            assert!(
-                !text.contains(forbidden),
-                "{}: contains {forbidden:?} — TLS must stay rustls-only with bundled \
-                 webpki roots (static-compilation contract)",
-                path.display()
-            );
-        }
+        assert_eq!(
+            native_backend_in(&text),
+            None,
+            "{}: TLS must stay rustls-only with bundled webpki roots \
+             (static-compilation contract)",
+            path.display()
+        );
     }
 
     // The emitter renders every TLS-capable line from its `crate_specs` pin, so
@@ -490,10 +489,9 @@ fn tls_stays_rustls_with_bundled_roots_in_every_manifest_source() {
     }
     for pin in ipe_backend_rust::crate_specs::ALL_PINNED {
         for feature in pin.features {
-            assert!(
-                ["native-tls", "openssl", "native-roots"]
-                    .iter()
-                    .all(|native| !feature.contains(native)),
+            assert_eq!(
+                native_backend_in(feature),
+                None,
                 "{}: native TLS feature {feature:?}",
                 pin.spec.name
             );
@@ -727,12 +725,34 @@ fn refuse_legacy_tls_manifest(text: &str) -> Vec<ManifestViolation> {
     found
 }
 
-/// The manifest checker refuses each arm outside the admitted set on its own,
-/// in any dependency table, and accepts the real runtime manifest.
+/// Every native backend spelling is found, and the rustls arms are not.
 #[test]
-fn legacy_tls_manifest_arms_are_refused() {
+fn native_backend_needles_cover_every_spelling() {
+    for needle in OS_ROOT_STORES
+        .into_iter()
+        .chain(NATIVE_TLS_STACK)
+        .chain(NATIVE_BACKEND_SPELLINGS)
+    {
+        assert!(
+            native_backend_in(&format!("dep = {{ features = [\"{needle}\"] }}")).is_some(),
+            "{needle}"
+        );
+    }
+    for admitted in [
+        "rustls-tls",
+        "tokio1-rustls-tls",
+        "webpki-roots",
+        "handshake",
+    ] {
+        assert_eq!(native_backend_in(admitted), None, "{admitted}");
+    }
+}
+
+/// A manifest holding exactly the admitted pins, features and an empty target
+/// table for the refusal fixtures to extend.
+fn admitted_tls_manifest() -> String {
     use ipe_backend_rust::crate_specs::{RUSTLS, SQLX, TOKIO_TUNGSTENITE};
-    let base = format!(
+    format!(
         "[dependencies]\n{}\n{}\n{}\n\
          [target.'cfg(unix)'.dev-dependencies]\n\
          [features]\n\
@@ -741,7 +761,15 @@ fn legacy_tls_manifest_arms_are_refused() {
         SQLX.dependency_line(&[]),
         TOKIO_TUNGSTENITE.dependency_line(&[]),
         RUSTLS.dependency_line(&[]),
-    );
+    )
+}
+
+/// The checker accepts the admitted manifest and refuses each `[dependencies]`
+/// and `[features]` arm outside the admitted set on its own.
+#[test]
+fn legacy_tls_manifest_feature_arms_are_refused() {
+    use ipe_backend_rust::crate_specs::{SQLX, TOKIO_TUNGSTENITE};
+    let base = admitted_tls_manifest();
     assert_eq!(
         refuse_legacy_tls_manifest(&base),
         Vec::<ManifestViolation>::new()
@@ -813,7 +841,14 @@ fn legacy_tls_manifest_arms_are_refused() {
             },
         ]
     );
+}
 
+/// The checker refuses an out-of-set pin in target, build, renamed and
+/// inherited spellings, not only in plain `[dependencies]`.
+#[test]
+fn legacy_tls_manifest_other_tables_are_refused() {
+    use ipe_backend_rust::crate_specs::{RUSTLS, TOKIO_TUNGSTENITE};
+    let base = admitted_tls_manifest();
     let target_table = "target.'cfg(unix)'.dev-dependencies";
     let target_header = format!("[{target_table}]\n");
     let target_wide = base.replace(
@@ -885,7 +920,11 @@ fn legacy_tls_manifest_arms_are_refused() {
             table: "target.cfg(unix).dev-dependencies".to_owned(),
         }]
     );
+}
 
+/// The shipped runtime manifest passes the same checker.
+#[test]
+fn shipped_runtime_manifest_has_no_legacy_tls_arm() {
     let runtime_path = repo_root().join("src/runtime/rust/Cargo.toml");
     let runtime = std::fs::read_to_string(&runtime_path).unwrap_or_default();
     assert!(!runtime.is_empty(), "read {}", runtime_path.display());
@@ -946,13 +985,37 @@ const OS_ROOT_STORES: [&str; 2] = ["rustls-native-certs", "rustls-platform-verif
 /// Workspace tools outside the runtime lock some of these through
 /// `rustls-native-certs`, so `deny.toml` cannot ban them; the runtime closure
 /// walk refuses them.
-const NATIVE_TLS_STACK: [&str; 5] = [
+const NATIVE_TLS_STACK: [&str; 8] = [
     "native-tls",
     "openssl-sys",
     "openssl-probe",
     "security-framework",
     "schannel",
+    "boring",
+    "boring-sys",
+    "tokio-boring",
 ];
+/// Spellings of a native backend that are not crate names: a feature or a
+/// manifest key that selects one.
+const NATIVE_BACKEND_SPELLINGS: [&str; 5] = [
+    "openssl",
+    "native-certs",
+    "native-roots",
+    "platform-verifier",
+    "rustls-tls-native-roots",
+];
+
+/// The first native TLS backend or OS trust-store spelling in `text`.
+///
+/// One closed set serves the manifest scan, the pinned-feature scan and the
+/// lock walk, so a backend added to one is refused by all.
+fn native_backend_in(text: &str) -> Option<&'static str> {
+    OS_ROOT_STORES
+        .into_iter()
+        .chain(NATIVE_TLS_STACK)
+        .chain(NATIVE_BACKEND_SPELLINGS)
+        .find(|needle| text.contains(*needle))
+}
 
 /// Parse a `Cargo.lock` text once into typed packages.
 fn parse_lock(text: &str) -> Result<Lock, RootsViolation> {
