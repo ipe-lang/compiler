@@ -147,7 +147,7 @@ where
 /// the caller, it falls back to calling `init` instead — this function is
 /// therefore always called with a valid, fully-typed model.
 ///
-/// The **adopt path** — unlike `mount_app`, does NOT call `set_inner_html`.
+/// The **adopt path** — unlike `mount_app`, does NOT repaint the body.
 /// The server-rendered DOM is already correct; we compute the virtual tree
 /// from `view(model)`, build the handler index, and wire delegated event
 /// listeners. The first user interaction triggers the normal diff→patch cycle.
@@ -511,7 +511,7 @@ where
     assign_ipe_ids(&mut tree, ROOT_IPE_ID);
     // One renderer: the DOM starts as exactly the bytes `render_html`
     // produces, so every later `diff` runs against known ground truth.
-    body.set_inner_html(&render_html(&tree));
+    paint_first(&document, &body, &render_html(&tree))?;
 
     let index = build_index(&tree);
     // Under the `debugger` feature the recorder seeds from the initial model, so
@@ -551,8 +551,7 @@ where
     install_focus_epoch(&document)?;
     attach_delegated_listeners(&body, &app)?;
     attach_widget_up_listener(&body, &app)?;
-    // The first paint went through `set_inner_html`, not the attribute-patch
-    // path, so deliver each `CustomElement.node`'s decoded down-state PROPERTY once here.
+    // The first paint parsed markup, not the attribute-patch path, so deliver each `CustomElement.node`'s decoded down-state PROPERTY once here.
     widget::sync_widget_properties(&document, &app.tree.borrow());
     // Wire the `Ipe.Ffi.Js` port inbound seam before the first `resync` spawns any
     // `Js.subscribe` drain, so no early page-JS frame is lost.
@@ -716,7 +715,7 @@ where
 
     let mut tree = view(model.clone());
     assign_ipe_ids(&mut tree, ROOT_IPE_ID);
-    body.set_inner_html(&render_html(&tree));
+    paint_first(&document, &body, &render_html(&tree))?;
 
     let index = build_index(&tree);
 
@@ -779,7 +778,7 @@ where
     attach_delegated_listeners(&body, &app)?;
     attach_widget_up_listener(&body, &app)?;
     attach_popstate_listener(&app, base)?;
-    // First paint went through `set_inner_html`; deliver each widget's decoded
+    // The first paint parsed markup; deliver each widget's decoded
     // down-state PROPERTY once here (later changes ride the diff/patch route).
     widget::sync_widget_properties(&document, &app.tree.borrow());
     install_port_inbound_seam();
@@ -1412,35 +1411,162 @@ const fn attr_write(key: &str, value: &str) -> AttrWrite {
     }
 }
 
-/// Replace `el`'s children with `html`, parsed detached in `el`'s own context,
-/// every `autofocus` removed before the nodes connect: the browser focuses an
-/// autofocus element on insertion while focus is on the body.
-fn replace_children_html(document: &web_sys::Document, el: &web_sys::Element, html: &str) {
+/// The HTML namespace.
+const HTML_NS: &str = "http://www.w3.org/1999/xhtml";
+
+/// Markup parsed detached, every `autofocus` already removed.
+struct Detached {
+    /// The holder whose children are the parsed nodes.
+    nodes: web_sys::Node,
+    /// The first element that carried `autofocus`, in document order.
+    autofocus: Option<web_sys::Element>,
+}
+
+/// `html` parsed detached in `el`'s own namespace and context, with every
+/// `autofocus` removed before the nodes connect: the browser focuses an
+/// autofocus element on insertion while focus is on the body. The holder is an
+/// element of `el`'s own tag, so the parser reads the markup in the insertion
+/// mode `el` sets (a `<tr>` below a `<tbody>`); a custom element's name would
+/// run its constructor on the holder, so it gets a `div`, and a template's
+/// markup is parsed into a template's inert content.
+fn parse_detached(
+    document: &web_sys::Document,
+    el: &web_sys::Element,
+    html: &str,
+) -> Result<Detached, &'static str> {
     let local = el.local_name();
     let ns = el.namespace_uri();
-    // A template's markup lands in its inert content, never in the document.
-    if local == "template" && ns.as_deref() == Some("http://www.w3.org/1999/xhtml") {
-        el.set_inner_html(html);
-        return;
-    }
-    let Ok(holder) = document.create_element_ns(ns.as_deref(), &local) else {
-        console_fatal("PatchTargetLost", "detached patch holder refused");
-        return;
+    let html_ns = ns.as_deref() == Some(HTML_NS);
+    let tag = if html_ns && local.contains('-') {
+        "div"
+    } else {
+        local.as_str()
     };
+    let holder = document
+        .create_element_ns(ns.as_deref(), tag)
+        .map_err(|_| "detached patch holder refused")?;
     holder.set_inner_html(html);
-    while let Ok(Some(found)) = holder.query_selector("[autofocus]") {
-        if found.remove_attribute("autofocus").is_err() {
-            console_fatal("PatchTargetLost", "autofocus could not be removed");
-            return;
+    let template = if html_ns {
+        holder.dyn_ref::<web_sys::HtmlTemplateElement>()
+    } else {
+        None
+    };
+    let (nodes, found): (web_sys::Node, _) = if let Some(template) = template {
+        let content = template.content();
+        let found = content.query_selector_all("[autofocus]");
+        (content.into(), found)
+    } else {
+        let found = holder.query_selector_all("[autofocus]");
+        (holder.into(), found)
+    };
+    let found = found.map_err(|_| "autofocus query refused")?;
+    let mut autofocus = None;
+    for i in 0..found.length() {
+        let Some(element) = found
+            .item(i)
+            .and_then(|node| node.dyn_into::<web_sys::Element>().ok())
+        else {
+            continue;
+        };
+        element
+            .remove_attribute("autofocus")
+            .map_err(|_| "autofocus could not be removed")?;
+        if autofocus.is_none() {
+            autofocus = Some(element);
         }
     }
-    el.set_text_content(None);
-    while let Some(child) = holder.first_child() {
-        if el.append_child(&child).is_err() {
-            console_fatal("PatchTargetLost", "patched node could not be attached");
-            return;
-        }
+    Ok(Detached { nodes, autofocus })
+}
+
+/// Move every child of `from` to the end of `to`, in order.
+fn move_children(from: &web_sys::Node, to: &web_sys::Node) -> Result<(), &'static str> {
+    while let Some(child) = from.first_child() {
+        to.append_child(&child)
+            .map_err(|_| "patched node could not be attached")?;
     }
+    Ok(())
+}
+
+/// The node whose children are `el`'s markup: a template's inert content, or
+/// `el` itself.
+fn markup_parent(el: &web_sys::Element) -> web_sys::Node {
+    match el.dyn_ref::<web_sys::HtmlTemplateElement>() {
+        Some(template) if el.namespace_uri().as_deref() == Some(HTML_NS) => {
+            template.content().into()
+        }
+        _ => el.clone().into(),
+    }
+}
+
+/// Replace `el`'s children with `html`, parsed by [`parse_detached`].
+pub fn replace_children_html(document: &web_sys::Document, el: &web_sys::Element, html: &str) {
+    let replaced = parse_detached(document, el, html).and_then(|parsed| {
+        let live = markup_parent(el);
+        live.set_text_content(None);
+        move_children(&parsed.nodes, &live)
+    });
+    if let Err(why) = replaced {
+        console_fatal("PatchTargetLost", why);
+    }
+}
+
+/// Paint `html` as the mount root's first content, parsed by
+/// [`parse_detached`], and focus its first `autofocus` element only while the
+/// load's own autofocus is still due: focus is on the body, and the URL
+/// fragment names no element. The runtime makes the move, as `client.js` does
+/// at mount, so no render-inserted `autofocus` reaches the browser's own
+/// focus-on-insertion.
+///
+/// # Errors
+///
+/// [`MountRefusal::Dom`] when the browser refuses a step of the detached parse
+/// or the move into `root`.
+pub fn paint_first(
+    document: &web_sys::Document,
+    root: &web_sys::HtmlElement,
+    html: &str,
+) -> Result<(), MountRefusal> {
+    let refusal = |step: &'static str| MountRefusal::Dom { step, detail: None };
+    let due = focus_on_body(document) && fragment_target(document).is_none();
+    let parsed = parse_detached(document, root, html).map_err(refusal)?;
+    root.set_text_content(None);
+    move_children(&parsed.nodes, root).map_err(refusal)?;
+    if due
+        && fragment_target(document).is_none()
+        && let Some(target) = parsed.autofocus
+        && let Some(target) = target.dyn_ref::<web_sys::HtmlElement>()
+    {
+        runtime_focus(|| {
+            let _ = target.focus();
+        });
+    }
+    Ok(())
+}
+
+/// Whether focus is on the body, or on nothing.
+fn focus_on_body(document: &web_sys::Document) -> bool {
+    match (document.active_element(), document.body()) {
+        (None, _) => true,
+        (Some(active), Some(body)) => {
+            let body: &web_sys::Element = body.as_ref();
+            active == *body
+        }
+        (Some(_), None) => false,
+    }
+}
+
+/// The element the URL fragment names, raw or percent-decoded, read from the
+/// URL itself: `:target` matches only once the browser has applied it.
+fn fragment_target(document: &web_sys::Document) -> Option<web_sys::Element> {
+    let hash = document.location()?.hash().ok()?;
+    let raw = hash.strip_prefix('#').unwrap_or(&hash);
+    if raw.is_empty() {
+        return None;
+    }
+    document.get_element_by_id(raw).or_else(|| {
+        let decoded: String = js_sys::decode_uri_component(raw).ok()?.into();
+        document.get_element_by_id(&decoded)
+    })
 }
 
 /// Apply the same `Vec<Patch>` the SSE wire serialises, via typed web-sys

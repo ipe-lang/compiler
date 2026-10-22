@@ -207,6 +207,9 @@ web-sys = { version = "0.3", features = [
   "HtmlTextAreaElement", "HtmlSelectElement", "HtmlFormElement",
   "FormData", "KeyboardEvent", "Location", "HtmlDocument",
   "CustomEvent",
+  # A patch's markup is parsed detached in its target's own context and its
+  # autofocus elements found in one query (mirrors the runtime crate).
+  "HtmlTemplateElement", "DocumentFragment", "NodeList",
   "Request", "RequestInit", "RequestMode", "RequestRedirect",
   "Response", "Headers", "AbortController", "AbortSignal",
   # Incremental capped body read (fetch arm): Response.body() ->
