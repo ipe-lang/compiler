@@ -143,6 +143,7 @@ impl CloseReason {
     }
 
     /// The reason text.
+    #[cfg(any(test, target_arch = "wasm32"))]
     fn as_str(&self) -> &str {
         &self.0
     }
@@ -2205,7 +2206,7 @@ mod tests {
 // does not build for wasm), so on WASI this substitute stays absent entirely.
 #[cfg(all(target_arch = "wasm32", feature = "wasm-client"))]
 mod wasm_client {
-    use super::{HashMap, IpeResult, IpeSub, IpeTask, ok_res};
+    use super::{CloseReason, HashMap, IpeResult, IpeSub, IpeTask, ok_res};
     use std::cell::{Cell, RefCell};
     use std::collections::HashSet;
     use std::rc::Rc;
