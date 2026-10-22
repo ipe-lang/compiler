@@ -31,7 +31,7 @@ import Lib.Keys as Keys exposing (KeyAction(..))
 import Lib.Label as Label
 import Lib.Links as Links exposing (Link(..))
 import Lib.PageSize as PageSize
-import Lib.Queue as Queue exposing (HistoryLabel(..), HistoryState(..), Place(..), Presence(..), QueueState(..), SelectedView(..), UnitPageState(..))
+import Lib.Queue as Queue exposing (DecisionTarget(..), HistoryLabel(..), HistoryState(..), Place(..), Presence(..), QueueState(..), SelectedView(..), UnitPageState(..))
 import Lib.RepoPath as RepoPath exposing (PathError(..), Root, RootMap)
 import Lib.ReviewKey as ReviewKey exposing (ReviewKey(..))
 import Lib.SafeText as SafeText
@@ -2456,7 +2456,7 @@ saveFailureTyped =
             "database is locked [5]"
 
         refusals =
-            [ SourceGone, SourceChanged, SourcePastCeiling, NamePastCeiling, NameUnreadable, NotQueued, SourceNotShown, LogBroken, LogKeyMismatch, FileGone, FileChanged, FileNotAcknowledgeable, FileNotReprobed, FileReadsAsText, FileNotQueued ]
+            [ SourceGone, SourceChanged, SourcePastCeiling, NamePastCeiling, NameUnreadable, NotQueued, SourceNotShown, LogBroken, LogKeyMismatch, FileGone, FileChanged, FileNotAcknowledgeable, FileNotReprobed, FileReadsAsText, FileNotQueued, DrawnChanged ]
 
         cases =
             [ SaveOffQueue, SaveReadOnly, SaveContended, SavePastLimit, SaveFailed ] ++ List.map SaveRefused refusals
@@ -2899,7 +2899,139 @@ checks =
                     , check "a decision on a file unit that starts at a negative line is refused and writes nothing, and lands at line 0" decideRefusedWhenLineNegative
                     , check "an acknowledgement of a file whose path is past the ceiling is refused and writes nothing" refusalDecisionRefusedWhenPathPastCeiling
                     ]
-        Task.succeed (first ++ rest ++ named)
+        gated <- drawnGateChecks
+        Task.succeed (first ++ rest ++ named ++ gated)
+
+
+-- ── the decision gate binds the drawn offer ─────────────────────────────
+-- `a` and `a2`, the unit `u-a` before and after its file and index row
+-- change under it, and the first queue page listing the file `r-big` under
+-- one digest (`page1`) and then another (`page2`).
+type alias DrawnGate =
+    { a : Index.UnitView
+    , a2 : Index.UnitView
+    , page1 : Queue.QueuePage
+    , page2 : Queue.QueuePage
+    }
+
+
+drawnGateFixture : Task.Task Error DrawnGate
+drawnGateFixture =
+    do
+        at <- freshScratch "ipe-queue-drawn-gate"
+        _ <- seedProgressScratch at
+        insertRefusal at.indexDb "r-big" "ipe:src/big.txt" "too-large" (SqlInt 10) (refusalDigestOf "a")
+        a <- loadUnitNow (uid "u-a") |> Task.andThen requireView
+        page1 <- loadPageNow Index.Start
+        execIndex at.indexDb "UPDATE refusals SET digest = ? WHERE uid = ?" [ refusalDigestOf "b", Uid.toSql (uid "r-big") ]
+        page2 <- loadPageNow Index.Start
+        writeFileText (at.repo ++ "/src/Lib.rs") (String.replace "42" "43" fixtureLibRs)
+        execIndex at.indexDb "UPDATE units SET body_hash = ? WHERE uid = ?" [ SqlString (Index.attest (String.replace "42" "43" viewA)), Uid.toSql (uid "u-a") ]
+        a2 <- loadUnitNow (uid "u-a") |> Task.andThen requireView
+        cleanupProgressScratch at
+        Task.succeed { a = a, a2 = a2, page1 = page1, page2 = page2 }
+
+
+requireView : Maybe Index.UnitView -> Task.Task Error Index.UnitView
+requireView found =
+    case found of
+        Just loaded ->
+            Task.succeed loaded
+
+        Nothing ->
+            Task.fail (Error.conflict "a fixture unit is missing from the seeded index")
+
+
+-- `page` with a proven log and `u-a` its only unit, so card 0 is `u-a`.
+onlyUnitA : Queue.QueuePage -> Queue.QueuePage
+onlyUnitA page =
+    { page | log = ShownProven, units = List.filter (\q -> q.unit.uid == uid "u-a") page.units }
+
+
+drawnGateChecks : Task.Task Error (List ( String, Bool ))
+drawnGateChecks =
+    drawnGateFixture
+        |> Task.map drawnGateRows
+        |> Task.onError (\e -> check "the drawn-offer gate fixture" (Task.fail e) |> Task.map (\failed -> [ failed ]))
+
+
+-- `Queue.decidableAs` admits a decision only on the offer the page makes
+-- now: an offer drawn over other content under the same row, or a decision
+-- asked where no control was drawn, is `DrawnChanged`; a row no longer
+-- listed keeps its own refusal, never `DrawnChanged`. Red if the gate
+-- compares the offer's uid and target only.
+drawnGateRows : DrawnGate -> List ( String, Bool )
+drawnGateRows g =
+    let
+        ua =
+            uid "u-a"
+
+        file =
+            uid "r-big"
+
+        listed1 =
+            onlyUnitA g.page1
+
+        st1 =
+            Loaded listed1
+
+        st2 =
+            Loaded (onlyUnitA g.page2)
+
+        unlisted =
+            Loaded { listed1 | units = [], refusals = [] }
+
+        v1 =
+            ViewShown g.a
+
+        v2 =
+            ViewShown g.a2
+
+        offerV1 =
+            Queue.decidableRow 0 st1 v1 ua
+
+        offerV2 =
+            Queue.decidableRow 0 st1 v2 ua
+
+        fileD1 =
+            Queue.decidableRow 0 st1 v1 file
+
+        fileD2 =
+            Queue.decidableRow 0 st2 v1 file
+
+        drawnChanged =
+            Err (SaveRefused DrawnChanged)
+
+        offeredSourceBinds =
+            case ( offerV1, fileD1 ) of
+                ( Just unitOffer, Just fileOffer ) ->
+                    isNothing (Queue.offeredSource unitOffer v2)
+                        && not (isNothing (Queue.offeredSource unitOffer v1))
+                        && isNothing (Queue.offeredSource fileOffer v1)
+
+                _ ->
+                    False
+    in
+    [ ( "a decision drawn on one source and received on another is refused as changed"
+      , offerV1 /= Nothing && offerV2 /= Nothing && offerV1 /= offerV2 && Queue.decidableAs 0 st1 v2 OnUnit ua offerV1 == drawnChanged
+      )
+    , ( "a decision drawn on the page's current offer passes the gate"
+      , offerV2 /= Nothing
+            && Maybe.map Ok offerV2 == Just (Queue.decidableAs 0 st1 v2 OnUnit ua offerV2)
+            && fileD2 /= Nothing
+            && Maybe.map Ok fileD2 == Just (Queue.decidableAs 0 st2 v1 OnRefusal file fileD2)
+      )
+    , ( "a decision asked where no control was drawn is refused as changed once the page offers one"
+      , Queue.decidableAs 0 st1 v2 OnUnit ua Nothing == drawnChanged && Queue.decidableAs 0 st2 v1 OnRefusal file Nothing == drawnChanged
+      )
+    , ( "an acknowledgement drawn on one digest and received on another is refused as changed"
+      , fileD1 /= Nothing && fileD2 /= Nothing && fileD1 /= fileD2 && Queue.decidableAs 0 st2 v1 OnRefusal file fileD1 == drawnChanged
+      )
+    , ( "a decision drawn on a row no longer listed keeps that row's own refusal"
+      , Queue.decidableAs 0 unlisted v2 OnUnit ua offerV1 == Err (SaveRefused NotQueued) && Queue.decidableAs 0 unlisted v1 OnRefusal file fileD1 == Err (SaveRefused FileNotQueued)
+      )
+    , ( "the source a decision binds is the one its offer drew", offeredSourceBinds )
+    ]
 
 
 -- ── History names ───────────────────────────────────────────────────────

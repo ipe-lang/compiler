@@ -1,4 +1,4 @@
-module Lib.Queue exposing (DecidableRow, DecisionSlot(..), DecisionTarget(..), Draft, HistoryLabel(..), HistoryPage, HistoryRow, HistoryState(..), LoadTicket, Place(..), Presence(..), Progress, QueuePage, QueueState(..), QueuedUnit, RefusalPanel(..), ResyncBound, SelectedView(..), Standing(..), StandingRead(..), UnitLabel, UnitPageState(..), chainBanner, clearView, closeRefusal, decidableAs, decidableRow, decidableSource, decide, decideRefusal, decisionNotSaved, decisionRefused, decisionWritten, draftRefused, drainThenLoad, editDraft, entryUid, firstTicket, historyStateFromResult, historyStatusText, isCurrentLoad, loadHistoryPage, loadPage, loadStanding, makeResyncBound, notSavedOf, openPanel, openRefusal, openRow, ownedSlot, pendingText, nextTicket, loadUnitView, pageHeaderText, queueLabels, queueSettled, queueStatusText, refusalReasonText, reloadView, rowTarget, rowUid, resyncBound, resyncPageCeiling, resyncReviewed, resyncReviewedWithin, selectView, selectedViewOf, selectedViewStatusText, sourceStatusText, standingArrived, standingFor, standingOf, startDecision, stateFromResult, unitLabel, unitPageEntry, unitPageOf, unitPageStatusText, viewArrived)
+module Lib.Queue exposing (DecidableRow, DecisionSlot(..), DecisionTarget(..), Draft, HistoryLabel(..), HistoryPage, HistoryRow, HistoryState(..), LoadTicket, Place(..), Presence(..), Progress, QueuePage, QueueState(..), QueuedUnit, RefusalPanel(..), ResyncBound, SelectedView(..), Standing(..), StandingRead(..), UnitLabel, UnitPageState(..), chainBanner, clearView, closeRefusal, decidableAs, decidableRow, decidableSource, decide, decideRefusal, decisionNotSaved, decisionRefused, decisionWritten, draftRefused, drainThenLoad, editDraft, entryUid, firstTicket, historyStateFromResult, historyStatusText, isCurrentLoad, loadHistoryPage, loadPage, loadStanding, makeResyncBound, notSavedOf, openPanel, openRefusal, openRow, ownedSlot, pendingText, nextTicket, loadUnitView, offeredRefusal, offeredSource, pageHeaderText, queueLabels, queueSettled, queueStatusText, refusalReasonText, reloadView, rowTarget, rowUid, sameSubject, resyncBound, resyncPageCeiling, resyncReviewed, resyncReviewedWithin, selectView, selectedViewOf, selectedViewStatusText, sourceStatusText, standingArrived, standingFor, standingOf, startDecision, stateFromResult, unitLabel, unitPageEntry, unitPageOf, unitPageStatusText, viewArrived)
 
 import Ipe.ByteSize as ByteSize
 import Ipe.Db as Db
@@ -1149,24 +1149,43 @@ type DecisionTarget
 
 
 -- A row the shown queue page draws decision controls for, with what a
--- decision on it is asked on. Only `decidableRow` builds one, so the view
--- draws a row's controls, and the refusal panel opens, by one predicate.
+-- decision on it is asked on and the digest of the content drawn: a unit's
+-- shown-source hash or a file's refusal digest, each the hash the log signs.
+-- The constructor is the target, so a row and a target cannot disagree. Only
+-- `decidableRow` builds one, so the view draws a row's controls, and the
+-- refusal panel opens, by one predicate, and a message carrying the row the
+-- render drew proceeds only while the page still offers that same content.
 type DecidableRow
-    = DecidableRow Uid DecisionTarget
+    = UnitOffer Uid Index.ShownHash
+    | FileOffer Uid Index.RefusalDigest
 
 
 rowUid : DecidableRow -> Uid
 rowUid row =
     case row of
-        DecidableRow uid _ ->
+        UnitOffer uid _ ->
+            uid
+
+        FileOffer uid _ ->
             uid
 
 
 rowTarget : DecidableRow -> DecisionTarget
 rowTarget row =
     case row of
-        DecidableRow _ target ->
-            target
+        UnitOffer _ _ ->
+            OnUnit
+
+        FileOffer _ _ ->
+            OnRefusal
+
+
+-- Whether two offers name the same row and target, whatever content each
+-- drew. No gate reads it: it picks why an offer that is not the current one
+-- is refused.
+sameSubject : DecidableRow -> DecidableRow -> Bool
+sameSubject a b =
+    rowUid a == rowUid b && rowTarget a == rowTarget b
 
 
 -- The row `uid` as the queue page shows it with card `selected` selected
@@ -1183,13 +1202,13 @@ decidableRow selected state view uid =
                 ShownProven ->
                     case List.find (\row -> row.uid == uid) page.refusals of
                         Just row ->
-                            Maybe.map (\_ -> DecidableRow uid OnRefusal) row.digest
+                            Maybe.map (FileOffer uid) row.digest
 
                         Nothing ->
                             case List.head (List.drop selected page.units) of
                                 Just q ->
                                     if q.unit.uid == uid then
-                                        Maybe.map (\_ -> DecidableRow uid OnUnit) (decidableSource uid view)
+                                        Maybe.map (\shown -> UnitOffer uid (Index.shownDigest shown)) (decidableSource uid view)
 
                                     else
                                         Nothing
@@ -1214,21 +1233,73 @@ decidableRow selected state view uid =
 
 
 -- The row `uid` when it offers a decision on `target` by `decidableRow`,
--- the predicate the view draws the row's controls by, or why a decision on
--- it is refused before it starts: a click that arrived after its row
--- stopped offering one.
-decidableAs : Int -> QueueState -> SelectedView -> DecisionTarget -> Uid -> Result SaveFailure DecidableRow
-decidableAs selected state view target uid =
+-- the predicate the view draws the row's controls by, and that offer is the
+-- one the render drew (`drawn`, Nothing when it drew no control), or why a
+-- decision on it is refused before it starts: a click that arrived after its
+-- row stopped offering one, or an offer on the same row whose content changed
+-- since it was drawn (or that was never drawn), `DrawnChanged`.
+decidableAs : Int -> QueueState -> SelectedView -> DecisionTarget -> Uid -> Maybe DecidableRow -> Result SaveFailure DecidableRow
+decidableAs selected state view target uid drawn =
     case decidableRow selected state view uid of
-        Just row ->
-            if rowTarget row == target then
-                Ok row
+        Just current ->
+            if Just current == drawn && rowTarget current == target && rowUid current == uid then
+                Ok current
+
+            else if drawnChanged current drawn then
+                Err (Failure.SaveRefused Failure.DrawnChanged)
 
             else
                 Err (undecidable state target uid)
 
         Nothing ->
             Err (undecidable state target uid)
+
+
+-- Whether the page offers `current` where the render drew no control, or
+-- drew the same row with other content.
+drawnChanged : DecidableRow -> Maybe DecidableRow -> Bool
+drawnChanged current drawn =
+    case drawn of
+        Nothing ->
+            True
+
+        Just d ->
+            sameSubject current d && current /= d
+
+
+-- The one source a decision on `row` may be made on: the selected unit's
+-- verified view, kept only while its digest is the one `row` drew, so the
+-- bytes re-proved and signed are the bytes drawn. Nothing for a file's
+-- offer, or a view whose content changed since the offer was drawn.
+offeredSource : DecidableRow -> SelectedView -> Maybe Index.ShownSource
+offeredSource row view =
+    case row of
+        UnitOffer uid hash ->
+            case decidableSource uid view of
+                Just shown ->
+                    if Index.shownDigest shown == hash then
+                        Just shown
+
+                    else
+                        Nothing
+
+                Nothing ->
+                    Nothing
+
+        FileOffer _ _ ->
+            Nothing
+
+
+-- The digest a decision on `row` acknowledges: the refusal digest the
+-- file's offer drew, never the page's copy. Nothing for a unit's offer.
+offeredRefusal : DecidableRow -> Maybe Index.RefusalDigest
+offeredRefusal row =
+    case row of
+        FileOffer _ digest ->
+            Just digest
+
+        UnitOffer _ _ ->
+            Nothing
 
 
 -- Why `uid` offers no decision on `target` on the queue page `state`: the
