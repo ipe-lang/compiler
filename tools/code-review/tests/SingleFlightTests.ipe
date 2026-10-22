@@ -1084,8 +1084,8 @@ decisionRefusedBeforeReading =
         whileReloading <- App.decisionTask settings macKey (reloadingModel a) OnUnit a.unit.uid LibDb.Approved
         cleanupIndex at.indexDb at.repo
         Task.succeed
-            (staleBannerShown settings (queueModel [ a ] (ViewShown a)) OnUnit b.unit.uid offList (SaveRefused NotQueued)
-                && staleBannerShown settings (queueModel [ a, b ] (ViewShown a)) OnRefusal (uid "r-blocking") fileOffList (SaveRefused FileNotQueued)
+            (staleBannerShown settings (queueModel [ a ] (ViewShown a)) OnUnit b.unit.uid offList (SaveRefused NotQueued) notQueuedText
+                && staleBannerShown settings (queueModel [ a, b ] (ViewShown a)) OnRefusal (uid "r-blocking") fileOffList (SaveRefused FileNotQueued) fileNotQueuedText
                 && refusalOf offList == Just NotQueued
                 && refusalOf notShown == Just SourceNotShown
                 && refusalOf fileOffList == Just FileNotQueued
@@ -1118,11 +1118,24 @@ stillQueuedCauseAdmitted text =
         && not (String.contains "is current" text)
 
 
+-- The fixed texts of the two stale-click refusals, spelled out so the
+-- banner check compares against the text itself, not the function that
+-- produces it.
+notQueuedText : String
+notQueuedText =
+    "the unit was not on the queue page shown when this click arrived (it was decided, the index no longer lists it, or the page changed or was reloading); nothing was saved"
+
+
+fileNotQueuedText : String
+fileNotQueuedText =
+    "the file was not on the queue page shown when this click arrived (it was acknowledged, the index no longer lists it, or the page changed or was reloading); nothing was saved"
+
+
 -- The banner a stale click on `target` leaves once its refusal `refused`
 -- settles the decision `model` started: the not-saved notice of `expected`,
--- in its own fixed text, and none of the failed-save lead.
-staleBannerShown : Settings.AppSettings -> Model -> DecisionTarget -> Uid -> Result DecideRefusal ( Index.Attested, Index.Written ) -> SaveFailure -> Bool
-staleBannerShown settings model target clicked refused expected =
+-- whose fixed text is `shown`, and none of the failed-save lead.
+staleBannerShown : Settings.AppSettings -> Model -> DecisionTarget -> Uid -> Result DecideRefusal ( Index.Attested, Index.Written ) -> SaveFailure -> String -> Bool
+staleBannerShown settings model target clicked refused expected shown =
     let
         start =
             case target of
@@ -1139,7 +1152,8 @@ staleBannerShown settings model target clicked refused expected =
             page settled
     in
     Queue.notSavedOf settled.decision == Just expected
-        && String.contains (Html.escapeHtml ("Decision not saved: " ++ Failure.saveFailureText expected)) html
+        && Failure.saveFailureText expected == shown
+        && String.contains (Html.escapeHtml ("Decision not saved: " ++ shown)) html
         && not (String.contains "Decision save failed" html)
 
 
