@@ -161,7 +161,7 @@ fn scan_with(extra: &[(&str, &str)]) -> Vec<String> {
 }
 
 fn src_root() -> std::path::PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("src")
+    e2e_support::manifest_dir!().join("src")
 }
 
 fn runtime_sources() -> Vec<(String, String)> {
