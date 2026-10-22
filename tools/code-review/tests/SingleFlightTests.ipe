@@ -485,10 +485,15 @@ panelDrawn html =
 -- predicate the view draws the row's controls by, is refused before it
 -- takes the slot, with the notice saying why: an approval of a listed unit
 -- off the card while the panel is open on the card, an acknowledgement of
--- a unit or of a file no decision binds, and the approve key on a withheld
--- card or a page whose log is broken. None starts a save, and an open
--- panel keeps its draft. Red if a click that arrived after its row stopped
--- offering a decision takes the slot or discards the panel's draft.
+-- a unit or of a file no decision binds, an approval of a uid the page does
+-- not list, the approve key on a withheld card or a page whose log is
+-- broken, signed by another key or unkeyed, and an approval or
+-- acknowledgement while the queue reloads or after its load failed. None
+-- starts a save, each shows its notice, and an open panel keeps its draft;
+-- a refusal submitted from the panel and refused before it starts (a server
+-- with no signing key) keeps the panel and its draft too. Red if a click
+-- that arrived after its row stopped offering a decision takes the slot or
+-- discards the panel's draft.
 staleDecisionTakesNoSlot : Settings.AppSettings -> Index.UnitView -> Index.UnitView -> Bool
 staleDecisionTakesNoSlot settings a b =
     let
@@ -525,8 +530,38 @@ staleDecisionTakesNoSlot settings a b =
         broken =
             after settings [ KeyDown "a" ] { shown | queueState = Loaded { brokenPage | log = LibDb.ShownBroken (LibDb.BreaksAt 2) } }
 
+        logged log =
+            after settings [ KeyDown "a" ] { shown | queueState = Loaded { brokenPage | log = log } }
+
+        absent =
+            after settings [ ApproveUnit (uid "absent") ] shown
+
+        keyMismatch =
+            logged LibDb.ShownKeyMismatch
+
+        unkeyed =
+            logged LibDb.ShownUnkeyed
+
+        reloading =
+            after settings [ ApproveUnit ua ] { shown | queueState = Loading }
+
+        reloadingFile =
+            after settings [ AckRefusal (uid "r-blocking") ] { shown | queueState = Loading }
+
+        loadFailed =
+            after settings [ ApproveUnit ua ] { shown | queueState = Failed LoadFailed }
+
+        readOnly =
+            { settings | key = ReadOnly }
+
+        refusedSubmit =
+            after readOnly [ RefuseStart ua, RefuseDraft ua "needs a test", RefuseSubmit ua ] shown
+
         idleNotice failure model =
-            Queue.notSavedOf model.decision == Just failure && Queue.pendingText ua model.decision == Nothing && Queue.pendingText ub model.decision == Nothing
+            Queue.notSavedOf model.decision == Just failure
+                && Queue.pendingText ua model.decision == Nothing
+                && Queue.pendingText ub model.decision == Nothing
+                && String.contains (Html.escapeHtml ("Decision not saved: " ++ Failure.saveFailureText failure)) (page model)
     in
     App.decidableRow drafted ub == Nothing
         && idleNotice (SaveRefused SourceNotShown) approvedElsewhere
@@ -537,6 +572,14 @@ staleDecisionTakesNoSlot settings a b =
         && idleNotice (SaveRefused FileNotAcknowledgeable) ackedBlocking
         && idleNotice (SaveRefused SourceNotShown) withheld
         && idleNotice (SaveRefused LogBroken) broken
+        && idleNotice (SaveRefused NotQueued) absent
+        && idleNotice (SaveRefused LogKeyMismatch) keyMismatch
+        && idleNotice SaveReadOnly unkeyed
+        && idleNotice (SaveRefused NotQueued) reloading
+        && idleNotice (SaveRefused FileNotQueued) reloadingFile
+        && idleNotice (SaveRefused NotQueued) loadFailed
+        && idleNotice SaveReadOnly refusedSubmit
+        && Queue.openPanel refusedSubmit.decision == Just ( ua, draft )
         && String.contains (Html.escapeHtml ("Decision not saved: " ++ Failure.saveFailureText (SaveRefused LogBroken))) (page broken)
 
 

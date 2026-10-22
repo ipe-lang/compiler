@@ -536,7 +536,7 @@ submitRefuse settings model target uid =
                         ( { model | decision = Queue.draftRefused (DraftRefused refused) model.decision }, Cmd.none )
 
                     Ok reason ->
-                        saveDecision settings { model | decision = Queue.closeRefusal model.decision } target uid (Refused reason)
+                        saveDecision settings model target uid (Refused reason)
 
             else
                 ( model, Cmd.none )
