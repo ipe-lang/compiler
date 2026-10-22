@@ -31,6 +31,12 @@ module Main exposing (main)
 -- `autofocus` field `fileask` once the file is read. `q` toggles `autofocus`
 -- on the element `flag` already on screen. `z` adds a second row to the table
 -- body `tb`.
+-- `F4` arms a timer whose tick replaces `fchild` inside the focusable column
+-- `fhost`; once that tick has landed, `fhost`'s `onFocus` adds the `autofocus`
+-- field `focusask`, so focus the runtime puts back on `fhost` raises it. `F5`
+-- arms a timer whose tick puts a row ahead of `hovertarget`, moving it to
+-- where `hoverbelow` was; once that tick has landed, a pointer crossing into
+-- `hovertarget` adds the `autofocus` field `hoverask`.
 --
 -- Co-located, no capabilities, no JS ports.
 
@@ -65,6 +71,12 @@ type alias Model =
     , picked : Bool
     , flag : Bool
     , tableRow : Bool
+    , shifting : Bool
+    , shifted : Bool
+    , focusAsk : Bool
+    , hovering : Bool
+    , hoverShift : Bool
+    , hoverAsk : Bool
     }
 
 
@@ -82,12 +94,14 @@ type Msg
     | Answer String
     | Tick
     | Picked String
+    | Focused
+    | Hovered
     | NoOp
 
 
 init : WebReq -> ( Model, Cmd.Cmd Msg )
 init req =
-    ( { keys = "", row = False, drop = True, note = "", swapped = False, pressed = False, deep = False, tagSwapped = False, hostRow = False, formDrop = True, mathRow = False, ask = False, answer = "", ticking = String.contains "tick" req.query, subAsk = False, loadAuto = not (String.contains "noauto" req.query), picked = False, flag = False, tableRow = False }, Cmd.none )
+    ( { keys = "", row = False, drop = True, note = "", swapped = False, pressed = False, deep = False, tagSwapped = False, hostRow = False, formDrop = True, mathRow = False, ask = False, answer = "", ticking = String.contains "tick" req.query, subAsk = False, loadAuto = not (String.contains "noauto" req.query), picked = False, flag = False, tableRow = False, shifting = False, shifted = False, focusAsk = False, hovering = False, hoverShift = False, hoverAsk = False }, Cmd.none )
 
 
 update : Msg -> Model -> ( Model, Cmd.Cmd Msg )
@@ -111,6 +125,12 @@ update msg model =
 
             else if key == "z" then
                 ( { model | keys = key, tableRow = not model.tableRow }, Cmd.none )
+
+            else if key == "F4" then
+                ( { model | keys = key, shifting = True }, Cmd.none )
+
+            else if key == "F5" then
+                ( { model | keys = key, hovering = True }, Cmd.none )
 
             else
                 ( { model | keys = key }, Cmd.none )
@@ -146,10 +166,25 @@ update msg model =
             ( { model | answer = text }, Cmd.none )
 
         Tick ->
-            ( { model | ticking = False, subAsk = True }, Cmd.none )
+            ( { model
+                | ticking = False
+                , subAsk = model.subAsk || model.ticking
+                , shifting = False
+                , shifted = model.shifted || model.shifting
+                , hovering = False
+                , hoverShift = model.hoverShift || model.hovering
+              }
+            , Cmd.none
+            )
 
         Picked _ ->
             ( { model | picked = True }, Cmd.none )
+
+        Focused ->
+            ( { model | focusAsk = model.focusAsk || model.shifted }, Cmd.none )
+
+        Hovered ->
+            ( { model | hoverAsk = model.hoverAsk || model.hoverShift }, Cmd.none )
 
         NoOp ->
             ( model, Cmd.none )
@@ -157,7 +192,7 @@ update msg model =
 
 subscriptions : Model -> Sub.Sub Msg
 subscriptions model =
-    if model.ticking then
+    if model.ticking || model.shifting || model.hovering then
         Sub.every 100 Tick
 
     else
@@ -408,6 +443,27 @@ tableRows on =
         []
 
 
+-- `fhost`'s child: a focusable `fchild`, or after the `F4` tick a row in its
+-- place, so focus on `fchild` falls back to `fhost`.
+shiftSlot : Bool -> Ui.Element Msg
+shiftSlot shifted =
+    if shifted then
+        Ui.el [ Ui.id "shiftrow" ] (Ui.text "shifted")
+
+    else
+        Ui.el [ Ui.id "fchild", Ui.htmlAttribute "tabindex" "0" ] (Ui.text "child")
+
+
+-- A row ahead of `hovertarget` once the `F5` tick has landed, as tall as it.
+hoverPad : Bool -> List (Ui.Element Msg)
+hoverPad shifted =
+    if shifted then
+        [ Ui.el [ Ui.id "hoverpad" ] (Ui.text "pad") ]
+
+    else
+        []
+
+
 -- The root's `autofocus` unless the page loaded with `noauto`.
 rootAutofocus : Model -> List (Ui.Attribute Msg)
 rootAutofocus model =
@@ -500,6 +556,18 @@ view model =
                     )
                 ]
             )
+        , Ui.column
+            [ Ui.id "fhost", Ui.htmlAttribute "tabindex" "0", Ui.onFocus Focused ]
+            [ shiftSlot model.shifted ]
+        , Ui.column [ Ui.id "focusaskhost" ] (askPanel model.focusAsk "focusask" model)
+        , Ui.column
+            [ Ui.id "hoverhost" ]
+            (hoverPad model.hoverShift
+                ++ [ Ui.el [ Ui.id "hovertarget", Ui.onMouseOver Hovered ] (Ui.text "hover")
+                   , Ui.el [ Ui.id "hoverbelow" ] (Ui.text "below")
+                   ]
+            )
+        , Ui.column [ Ui.id "hoveraskhost" ] (askPanel model.hoverAsk "hoverask" model)
         ]
 
 

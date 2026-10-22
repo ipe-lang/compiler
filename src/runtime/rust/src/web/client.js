@@ -915,7 +915,10 @@ var __ipeAutofocusSpent = (function() {
   var now = __ipeDoc.active();
   return !!now && now !== __ipeDoc.body();
 })();
-["focusin", "pointerdown", "mousedown", "touchstart", "keydown"].forEach(function(type) {
+// The page events after which the load's own autofocus is spent; the wasm
+// loader hears the same list (`dom::diff::AUTOFOCUS_SPENDING_EVENTS`).
+var __IPE_AUTOFOCUS_SPENDING = ["focusin", "pointerdown", "mousedown", "touchstart", "keydown"];
+__IPE_AUTOFOCUS_SPENDING.forEach(function(type) {
   __ipeDoc.on(type, function() { __ipeAutofocusSpent = true; }, true);
 });
 // Counts the user's focus moves: a focus change or a pointer press the runtime
@@ -927,6 +930,25 @@ var __ipeRuntimeFocusing = false;
     if (!__ipeRuntimeFocusing) __ipeFocusEpoch += 1;
   }, true);
 });
+// The event kinds that are a deliberate act of the user: a key, a click, an
+// edit, a submit. A pointer crossing (`mouseover`, `mouseout`) is not one: a
+// render that shifts layout under a pointer at rest raises a trusted one. Nor
+// is a focus change (`focus`, `blur`): the runtime raises one when it puts
+// focus back.
+var __IPE_USER_ACTS = Object.freeze({
+  click: 1, dblclick: 1, input: 1, change: 1, submit: 1,
+  keydown: 1, keyup: 1, keypress: 1, mousedown: 1, mouseup: 1
+});
+// The focus epoch of the user act `ev` is, read as it arrives; undefined when
+// `ev` proves no act of the user's: an event the runtime or a render can
+// raise, an untrusted one, or one raised while the runtime moves focus (the
+// `change` a field commits as the runtime focuses another node). An event
+// with no epoch keeps no record, so its render moves no focus.
+function __ipeUserActEpoch(ev) {
+  if (!ev.isTrusted || __ipeRuntimeFocusing) return undefined;
+  if (!Object.prototype.hasOwnProperty.call(__IPE_USER_ACTS, ev.type)) return undefined;
+  return __ipeFocusEpoch;
+}
 // The focus epoch of the user act behind each of this tab's recent events, by
 // the tab's own seq. The epoch is read at the act itself (the key, the click,
 // the file pick), never at the send: a file read, a resize or a debounce sends
@@ -1759,12 +1781,14 @@ function __ipeEscapeHTML(s) {
 // Walks the DOM for ipe-<event> attributes and binds a native listener
 // that extracts args and dispatches through the TEA update cycle.
 // Re-run after every DOM patch because new ipe-* attrs may have appeared.
+// The events a node binds through an `ipe-<event>` attribute; the user acts
+// (`__IPE_USER_ACTS`) are a subset of them.
+var __IPE_BOUND_EVENTS = ["click", "dblclick", "input", "change", "submit", "focus", "blur",
+                          "keydown", "keyup", "keypress", "mouseover", "mouseout",
+                          "mousedown", "mouseup"];
 function __ipeBindEvents() {
-  var events = ["click", "dblclick", "input", "change", "submit", "focus", "blur",
-                "keydown", "keyup", "keypress", "mouseover", "mouseout",
-                "mousedown", "mouseup"];
-  for (var i = 0; i < events.length; i++) {
-    __ipeBindOne(events[i]);
+  for (var i = 0; i < __IPE_BOUND_EVENTS.length; i++) {
+    __ipeBindOne(__IPE_BOUND_EVENTS[i]);
   }
 }
 
@@ -1812,7 +1836,7 @@ function __ipeBindOne(eventName) {
       var msgName = __ipeNode.attr(target, "ipe-" + ev.type);
       var hid     = __ipeNode.attr(target, "data-ipe-hid");
       var epoch   = __ipeEpoch;
-      var focus   = __ipeFocusEpoch;
+      var focus   = __ipeUserActEpoch(ev);
       if (!msgName && !hid) return;
       var args = __ipeExtractArgs(ev);
       if (ev.type === "input") {
@@ -1920,7 +1944,7 @@ __ipeDoc.on("change", function(ev) {
   // Read with the id and at the pick, before the asynchronous read below: the
   // user may move focus while the file is read.
   var epoch   = __ipeEpoch;
-  var focus   = __ipeFocusEpoch;
+  var focus   = __ipeUserActEpoch(ev);
   var f = el.files && el.files[0];
   if (!f) return;
   // Client-side size guard via fileMaxSize. Saves the round-trip when

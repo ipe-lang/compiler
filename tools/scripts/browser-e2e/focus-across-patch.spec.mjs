@@ -836,3 +836,34 @@ test("focus-across-patch: an event no frame answers never withholds focus from a
   await expect(page.locator("input#ask")).toHaveCount(1);
   await expect.poll(() => focusedId(page)).toBe("ask");
 });
+
+test("focus-across-patch: a focus the runtime puts back never moves focus by its handler's render", async ({ page }) => {
+  await open(page);
+  await clickAt(page, "#fchild");
+  await expect.poll(() => focusedId(page)).toBe("fchild");
+  // The key arms the timer; the tick swaps `fchild` out, the runtime puts
+  // focus back on `fhost`, and `fhost`'s focus handler adds the autofocus field.
+  await page.keyboard.press("F4");
+  await expect(page.locator("#shiftrow")).toHaveCount(1, { timeout: 5000 });
+  await expect(page.locator("input#focusask")).toHaveCount(1);
+  await settle(page);
+  expect(await focusedId(page)).toBe("fhost");
+});
+
+test("focus-across-patch: a pointer crossing a layout shift brings never moves focus", async ({ page }) => {
+  await open(page);
+  await expect.poll(() => focusedId(page)).toBe("root");
+  // The pointer rests where `hovertarget` lands once the tick's row pushes it down.
+  const box = await page.locator("#hoverbelow").boundingBox();
+  expect(box).not.toBeNull();
+  const y = box.y + box.height / 2;
+  await page.mouse.move(box.x + 2, y);
+  await page.keyboard.press("F5");
+  await expect(page.locator("#hoverpad")).toHaveCount(1, { timeout: 5000 });
+  // A one-pixel drift: the browser raises the trusted crossing into the node
+  // now under the pointer, whether or not it already did on the layout shift.
+  await page.mouse.move(box.x + 3, y);
+  await expect(page.locator("input#hoverask")).toHaveCount(1);
+  await settle(page);
+  expect(await focusedId(page)).toBe("root");
+});

@@ -38,7 +38,7 @@ use wasm_bindgen::prelude::*;
 use crate::core::{IpeResult, IpeTask};
 use crate::dom::{
     HandlerIndex, WebReq, build_index,
-    diff::{Patch, diff, focus_target},
+    diff::{AUTOFOCUS_SPENT_GLOBAL, Patch, diff, focus_target},
 };
 use crate::html::{FormData, Html, RenderCtx, assign_ipe_ids, render_html};
 use crate::tea::{IpeCmd, IpeSub};
@@ -319,11 +319,14 @@ type WasmRouter<Model, Msg> = dyn Fn(
 /// Where a queued Msg came from.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Source {
-    /// A DOM event the user raised in this document.
+    /// A trusted DOM event of a deliberate input kind (see
+    /// [`DELEGATED_EVENTS`]) raised while the runtime was not moving focus.
     User,
-    /// A widget's own up event: its script raises it, so it proves no act of
-    /// the user's.
-    Widget,
+    /// An event that proves no act of the user's: a widget's up event (its
+    /// script raises it), an untrusted event, an incidental kind a render can
+    /// raise (a pointer crossing), one raised while the runtime moves focus,
+    /// or any wire outside [`DELEGATED_EVENTS`].
+    Unproven,
     /// A Cmd result or a Sub delivery.
     Effect,
 }
@@ -354,7 +357,7 @@ impl<F: PartialEq> Cause<F> {
         match (self, source) {
             (Self::Idle, Source::User) => Self::User(mark()),
             (Self::User(at), Source::User) => Self::User(at),
-            (Self::Idle | Self::User(_) | Self::Effect, Source::Widget | Source::Effect)
+            (Self::Idle | Self::User(_) | Self::Effect, Source::Unproven | Source::Effect)
             | (Self::Effect, Source::User) => Self::Effect,
         }
     }
@@ -914,18 +917,30 @@ fn synthesize_req(document: &web_sys::Document) -> Result<(WebReq, Option<String
     Ok((req, pathname))
 }
 
+/// What a trusted delegated event says of the user.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Input {
+    /// A deliberate act: a key, a click, an edit, a submit. Only the user
+    /// raises a trusted one, outside the runtime's own focus moves.
+    Deliberate,
+    /// A pointer crossing: a render that shifts layout under a pointer at rest
+    /// raises a trusted one with no act of the user's.
+    Incidental,
+}
+
 /// The delegated event names — one listener per name on `<body>`, so nodes
 /// inserted by later patches need no re-wiring and no per-node `Closure`
-/// lifecycle exists to leak.
-const DELEGATED_EVENTS: &[&str] = &[
-    "click",
-    "input",
-    "change",
-    "submit",
-    "keydown",
-    "keyup",
-    "mouseover",
-    "mouseout",
+/// lifecycle exists to leak — each with what a trusted one says of the user.
+/// The deliberate kinds are the only ones whose render may move focus.
+const DELEGATED_EVENTS: &[(&str, Input)] = &[
+    ("click", Input::Deliberate),
+    ("input", Input::Deliberate),
+    ("change", Input::Deliberate),
+    ("submit", Input::Deliberate),
+    ("keydown", Input::Deliberate),
+    ("keyup", Input::Deliberate),
+    ("mouseover", Input::Incidental),
+    ("mouseout", Input::Incidental),
 ];
 
 fn attach_delegated_listeners<Model, Msg>(
@@ -936,7 +951,7 @@ where
     Model: Clone + 'static,
     Msg: Clone + 'static,
 {
-    for name in DELEGATED_EVENTS {
+    for &(name, _) in DELEGATED_EVENTS {
         let app = Rc::clone(app);
         let event_name: &'static str = name;
         let closure = Closure::<dyn Fn(web_sys::Event)>::new(move |ev: web_sys::Event| {
@@ -1001,7 +1016,8 @@ where
         .and_then(|t| t.dyn_into::<web_sys::Element>().ok());
     // The generated `OnWidget` closure runs the total, fail-closed seal
     // up-decoder over `detail`; a mismatch yields `None` (clean drop).
-    dispatch(app, target, widget::UP_WIRE_NAME, |_, ipe_id| {
+    let source = listener_source(widget::UP_WIRE_NAME, ev.is_trusted());
+    dispatch(app, target, source, |_, ipe_id| {
         app.index
             .borrow()
             .resolve(ipe_id, widget::UP_WIRE_NAME, &args)
@@ -1019,7 +1035,8 @@ where
         .target()
         .and_then(|t| t.dyn_into::<web_sys::Element>().ok());
     let args = decode_event_args(name, ev, target.as_ref());
-    dispatch(app, target, name, |el, ipe_id| {
+    let source = listener_source(name, ev.is_trusted());
+    dispatch(app, target, source, |el, ipe_id| {
         if name == "submit" {
             ev.prevent_default();
             let fd = collect_form_data(el);
@@ -1030,25 +1047,30 @@ where
     });
 }
 
-/// The source of a Msg a delegated listener resolved under `wire`: the
-/// user's only for a DOM event the user raises. Every other wire, a widget's
-/// up event or any name outside [`DELEGATED_EVENTS`], is not the user's act,
-/// so its render never moves focus.
-fn listener_source(wire: &str) -> Source {
-    if DELEGATED_EVENTS.contains(&wire) {
+/// The source of a Msg a listener resolved under `wire`, read as the event
+/// arrives: the user's only for a `trusted` event of a deliberate kind in
+/// [`DELEGATED_EVENTS`] raised while the runtime is not moving focus. An event
+/// the runtime or a render can raise proves no act of the user's, so its
+/// render never moves focus: a widget's up event, an untrusted event, a
+/// pointer crossing, the `change` a runtime focus move commits, or any name
+/// outside the table.
+fn listener_source(wire: &str, trusted: bool) -> Source {
+    let deliberate = DELEGATED_EVENTS
+        .iter()
+        .any(|&(name, input)| name == wire && input == Input::Deliberate);
+    if deliberate && trusted && !RUNTIME_FOCUSING.with(Cell::get) {
         Source::User
     } else {
-        Source::Widget
+        Source::Unproven
     }
 }
 
 /// Climb from `target` to the nearest `ipe-id` ancestor whose handler
-/// `resolve` turns into a Msg, and queue that Msg with the source
-/// [`listener_source`] assigns `wire`.
+/// `resolve` turns into a Msg, and queue that Msg with `source`.
 fn dispatch<Model, Msg>(
     app: &Rc<App<Model, Msg>>,
     target: Option<web_sys::Element>,
-    wire: &'static str,
+    source: Source,
     resolve: impl Fn(&web_sys::Element, &str) -> Option<Msg>,
 ) where
     Model: Clone + 'static,
@@ -1059,7 +1081,7 @@ fn dispatch<Model, Msg>(
         if let Some(ipe_id) = el.get_attribute("ipe-id")
             && let Some(msg) = resolve(&el, &ipe_id)
         {
-            enqueue(app, msg, listener_source(wire));
+            enqueue(app, msg, source);
             return;
         }
         cur = el.parent_element();
@@ -1534,10 +1556,11 @@ pub fn replace_children_html(document: &web_sys::Document, el: &web_sys::Element
 
 /// Paint `html` as the mount root's first content, parsed by
 /// [`parse_detached`], and focus its first `autofocus` element only while the
-/// load's own autofocus is still due: focus is on the body, and the URL
-/// fragment names no element. The runtime makes the move, as `client.js` does
-/// at mount, so no render-inserted `autofocus` reaches the browser's own
-/// focus-on-insertion.
+/// load's own autofocus is still due: focus is on the body, the user has not
+/// pressed a key or the pointer or moved focus since the loader ran
+/// ([`load_autofocus_spent`]), and the URL fragment names no element. The
+/// runtime makes the move, as `client.js` does at mount, so no render-inserted
+/// `autofocus` reaches the browser's own focus-on-insertion.
 ///
 /// # Errors
 ///
@@ -1549,7 +1572,8 @@ pub fn paint_first(
     html: &str,
 ) -> Result<(), MountRefusal> {
     let refusal = |step: &'static str| MountRefusal::Dom { step, detail: None };
-    let due = focus_on_body(document) && fragment_target(document).is_none();
+    let due =
+        focus_on_body(document) && !load_autofocus_spent() && fragment_target(document).is_none();
     let parsed = parse_detached(document, root, html).map_err(refusal)?;
     root.set_text_content(None);
     move_children(&parsed.nodes, root).map_err(refusal)?;
@@ -1563,6 +1587,19 @@ pub fn paint_first(
         });
     }
     Ok(())
+}
+
+/// Whether the loader heard one of
+/// [`AUTOFOCUS_SPENDING_EVENTS`](crate::dom::diff::AUTOFOCUS_SPENDING_EVENTS): it sets
+/// [`AUTOFOCUS_SPENT_GLOBAL`]. A global that cannot be read counts as spent.
+fn load_autofocus_spent() -> bool {
+    match js_sys::Reflect::get(
+        &js_sys::global(),
+        &JsValue::from_str(AUTOFOCUS_SPENT_GLOBAL),
+    ) {
+        Ok(value) => value.is_truthy(),
+        Err(_) => true,
+    }
 }
 
 /// Whether focus is on the body, or on nothing.
@@ -1703,18 +1740,41 @@ mod tests {
     }
 
     #[wasm_bindgen_test]
-    fn a_widget_event_never_counts_as_the_users() {
-        let alone = Cause::Idle.with(Source::Widget, || mark(0, 1));
+    fn only_a_trusted_deliberate_input_counts_as_the_users() {
+        let alone = Cause::Idle.with(Source::Unproven, || mark(0, 1));
         assert!(!alone.addressed(&mark(0, 1)));
         let joined = Cause::Idle
             .with(Source::User, || mark(0, 1))
-            .with(Source::Widget, || mark(0, 1));
+            .with(Source::Unproven, || mark(0, 1));
         assert!(!joined.addressed(&mark(0, 1)));
-        assert_eq!(listener_source(widget::UP_WIRE_NAME), Source::Widget);
-        assert_eq!(listener_source(widget::up_event_name()), Source::Widget);
-        assert_eq!(listener_source("focusin"), Source::Widget);
-        for name in DELEGATED_EVENTS {
-            assert_eq!(listener_source(name), Source::User, "{name}");
+        let raised = [
+            widget::UP_WIRE_NAME,
+            widget::up_event_name(),
+            "mouseover",
+            "mouseout",
+            "focus",
+            "blur",
+            "focusin",
+            "focusout",
+            "dblclick",
+            "",
+            "CLICK",
+        ];
+        for name in raised {
+            assert_eq!(listener_source(name, true), Source::Unproven, "{name}");
+        }
+        let acts = ["click", "input", "change", "submit", "keydown", "keyup"];
+        for name in acts {
+            assert_eq!(listener_source(name, true), Source::User, "{name}");
+            assert_eq!(listener_source(name, false), Source::Unproven, "{name}");
+            runtime_focus(|| {
+                assert_eq!(listener_source(name, true), Source::Unproven, "{name}");
+            });
+        }
+        for &(name, input) in DELEGATED_EVENTS {
+            let user = input == Input::Deliberate;
+            assert_eq!(listener_source(name, true) == Source::User, user, "{name}");
+            assert_eq!(acts.contains(&name), user, "{name}");
         }
     }
 

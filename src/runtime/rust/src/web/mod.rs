@@ -9154,6 +9154,60 @@ mod base_path_tests {
             .collect()
     }
 
+    /// `client.js` spends the load's autofocus on the same events the wasm
+    /// loader hears, so both clients leave it alone after the same acts.
+    #[test]
+    fn both_clients_spend_the_load_autofocus_on_the_same_events() {
+        let listed = js_string_array(super::CLIENT_JS, "__IPE_AUTOFOCUS_SPENDING");
+        let shared: Vec<String> = crate::dom::diff::AUTOFOCUS_SPENDING_EVENTS
+            .iter()
+            .map(|name| (*name).to_string())
+            .collect();
+        assert_eq!(listed, Some(shared));
+    }
+
+    /// The keys of `var {name} = Object.freeze({ key: 1, … });` in `js`.
+    fn js_flag_keys(js: &str, name: &str) -> Option<Vec<String>> {
+        let open = format!("var {name} = Object.freeze({{");
+        let rest = js.get(js.find(&open)? + open.len()..)?;
+        let body = rest.get(..rest.find("});")?)?;
+        body.split(',')
+            .map(str::trim)
+            .filter(|item| !item.is_empty())
+            .map(|item| item.strip_suffix(": 1").map(str::to_string))
+            .collect()
+    }
+
+    /// Only a bound event can be a user act, and no event the runtime or a
+    /// render raises is one: a focus change the runtime puts back, a pointer
+    /// crossing a layout shift brings under a pointer at rest.
+    #[test]
+    fn client_user_acts_are_bound_deliberate_inputs() {
+        let bound = js_string_array(super::CLIENT_JS, "__IPE_BOUND_EVENTS");
+        let acts = js_flag_keys(super::CLIENT_JS, "__IPE_USER_ACTS");
+        assert!(bound.is_some() && acts.is_some(), "both tables parse");
+        let (Some(bound), Some(acts)) = (bound, acts) else {
+            return;
+        };
+        assert!(!acts.is_empty());
+        for act in &acts {
+            assert!(bound.contains(act), "user act `{act}` is not a bound event");
+        }
+        for raised in [
+            "focus",
+            "blur",
+            "focusin",
+            "focusout",
+            "mouseover",
+            "mouseout",
+        ] {
+            assert!(
+                !acts.iter().any(|act| act == raised),
+                "`{raised}` counts as a user act"
+            );
+        }
+    }
+
     /// The byte offset just past the boot block's closing `</script>`.
     fn boot_block_end(html: &str) -> Option<usize> {
         let open = boot_open_tag();

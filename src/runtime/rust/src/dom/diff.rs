@@ -68,6 +68,51 @@ pub fn diff<M>(old: &Html<M>, new: &Html<M>, stamp: &RenderCtx<'_>) -> Vec<Patch
     out
 }
 
+/// The page events after which the load's own autofocus is spent: the user
+/// pressed a key or the pointer, or focus moved, before the first paint could
+/// focus anything. `client.js` listens for the same list at load; the wasm
+/// loader hears them through [`autofocus_spent_listener_js`].
+pub const AUTOFOCUS_SPENDING_EVENTS: [&str; 5] = [
+    "focusin",
+    "pointerdown",
+    "mousedown",
+    "touchstart",
+    "keydown",
+];
+
+/// The page global the wasm loader sets once one of
+/// [`AUTOFOCUS_SPENDING_EVENTS`] fires; the wasm first paint reads it.
+pub const AUTOFOCUS_SPENT_GLOBAL: &str = "__ipeAutofocusSpent";
+
+/// [`AUTOFOCUS_SPENDING_EVENTS`] as a JavaScript array literal.
+#[must_use]
+pub fn autofocus_spending_events_js() -> String {
+    let mut out = String::from("[");
+    for (i, name) in AUTOFOCUS_SPENDING_EVENTS.iter().enumerate() {
+        if i > 0 {
+            out.push_str(", ");
+        }
+        out.push('"');
+        out.push_str(name);
+        out.push('"');
+    }
+    out.push(']');
+    out
+}
+
+/// The loader statements that set [`AUTOFOCUS_SPENT_GLOBAL`] on the first of
+/// [`AUTOFOCUS_SPENDING_EVENTS`], each heard in the capture phase from the
+/// moment the loader runs, before the wasm module is fetched.
+#[must_use]
+pub fn autofocus_spent_listener_js() -> String {
+    let mut out = String::from("for (const type of ");
+    out.push_str(&autofocus_spending_events_js());
+    out.push_str(") {\n  document.addEventListener(type, () => { globalThis.");
+    out.push_str(AUTOFOCUS_SPENT_GLOBAL);
+    out.push_str(" = true; }, true);\n}\n");
+    out
+}
+
 /// The server identity of a stamped element that a render asks to focus.
 ///
 /// It is built only from the `ipe-id` the stamper wrote on an element of a

@@ -96,7 +96,13 @@ types never moves the caret. A render the user did not cause in that tab (a
 timer or subscription, another tab of the same session, a page reconnecting)
 never moves focus, and neither does one that lands after the user has moved
 focus elsewhere. An event a widget or a page script raises is not the
-user's own action either, so its render never moves focus. After load the
+user's own action either, so its render never moves focus. Only a deliberate
+input counts as the user's action: a click, a key, an edit, a submit. A focus
+or blur event (the runtime raises one when it puts focus back) and a pointer
+crossing (`onMouseOver`, `onMouseOut`, which a layout shift raises under a
+pointer at rest) do not, so their render never moves focus. The load's own
+`autofocus` is spent once the user presses a key or the pointer, or moves
+focus, before the page is ready. After load the
 runtime alone moves focus: the `autofocus`
 attribute never reaches the live page from a later render, so the browser's
 own focus-on-insertion never fires, and a CSS `[autofocus]` selector matches

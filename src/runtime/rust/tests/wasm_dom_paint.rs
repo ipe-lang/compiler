@@ -16,6 +16,7 @@
 
 #![cfg(all(target_arch = "wasm32", feature = "wasm-client"))]
 
+use ipe_runtime_rust::dom::diff::AUTOFOCUS_SPENT_GLOBAL;
 use ipe_runtime_rust::wasm::{paint_first, replace_children_html};
 use wasm_bindgen::JsCast;
 use wasm_bindgen_test::*;
@@ -91,6 +92,35 @@ fn the_first_paint_never_takes_focus_the_user_moved() {
     assert_eq!(focused_id(&doc), "moved-here");
     root.remove();
     held.remove();
+}
+
+/// Sets the global the loader writes once the user pressed a key or the
+/// pointer; `None` removes it.
+fn set_spent(spent: Option<bool>) -> bool {
+    let global = js_sys::global();
+    let key = wasm_bindgen::JsValue::from_str(AUTOFOCUS_SPENT_GLOBAL);
+    match spent {
+        Some(on) => js_sys::Reflect::set(&global, &key, &on.into()).unwrap_or(false),
+        None => js_sys::Reflect::delete_property(&global, &key).unwrap_or(false),
+    }
+}
+
+#[wasm_bindgen_test]
+fn the_first_paint_never_autofocuses_after_the_user_acted() {
+    let doc = document();
+    assert!(doc.is_some(), "run_in_browser must provide a document");
+    let Some(doc) = doc else { return };
+    let root = fresh(&doc, "div");
+    assert!(root.is_some(), "the mount root must attach");
+    let Some(root) = root else { return };
+    // The loader heard a key or a pointer press; focus is back on the body.
+    assert!(set_spent(Some(true)));
+    let painted = paint_first(&doc, &root, r#"<input id="acted-a" autofocus>"#);
+    assert!(set_spent(None));
+    assert!(painted.is_ok());
+    assert!(!holds_autofocus(&root));
+    assert_eq!(focused_id(&doc), "");
+    root.remove();
 }
 
 #[wasm_bindgen_test]
