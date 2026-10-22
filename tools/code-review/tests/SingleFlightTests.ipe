@@ -1286,10 +1286,12 @@ hugeDraftBounded settings a b =
 
 
 -- A reason of `reasonMaxChars` characters outside the Basic Multilingual
--- Plane, two UTF-16 units each, is held whole with no notice, and the
--- input's `maxlength`, which counts UTF-16 units, admits all of it. Red if
--- the page bound or the draft bound counts units where the reason limit
--- counts characters.
+-- Plane, two UTF-16 units each, is held whole with no notice: the draft
+-- bound counts characters, not units. The input's `maxlength`, which counts
+-- UTF-16 units, admits no value past the reason limit, so the text a focused
+-- input shows is never more than the draft holds. Red if the draft bound
+-- counts units, or the page bound admits more units than the limit has
+-- characters.
 astralDraftWithinMaxlength : Settings.AppSettings -> Index.UnitView -> Index.UnitView -> Bool
 astralDraftWithinMaxlength settings a b =
     let
@@ -1302,20 +1304,20 @@ astralDraftWithinMaxlength settings a b =
     String.length astral == LibDb.reasonMaxChars
         && heldText typed == Just astral
         && noNotice typed
-        && Draft.inputMaxUnits >= 2 * String.length astral
+        && Draft.inputMaxUnits <= LibDb.reasonMaxChars
 
 
--- The reason input carries a `maxlength` of two UTF-16 units per character
--- of the reason limit, derived from the one limit. Red if the page bound is
--- dropped, or drifts from `reasonMaxChars`.
+-- The reason input carries a `maxlength` of the reason limit, derived from
+-- the one limit. Red if the page bound is dropped, or drifts from
+-- `reasonMaxChars`.
 refusePanelMaxlengthFromSsot : Settings.AppSettings -> Index.UnitView -> Index.UnitView -> Bool
 refusePanelMaxlengthFromSsot settings a b =
     let
         tag =
             reasonInputTag (page (typedDraft settings a b "needs a test"))
     in
-    Draft.inputMaxUnits == 2 * LibDb.reasonMaxChars
-        && String.contains ("maxlength=\"" ++ String.fromInt (2 * LibDb.reasonMaxChars) ++ "\"") tag
+    Draft.inputMaxUnits == LibDb.reasonMaxChars
+        && String.contains ("maxlength=\"" ++ String.fromInt LibDb.reasonMaxChars ++ "\"") tag
         && String.contains "value=\"needs a test\"" tag
 
 
@@ -1743,7 +1745,7 @@ seededChecks =
             , ( "a refusal draft at the reason limit is held and shown whole with no notice", draftAtLimitKept settings a b )
             , ( "a refusal draft past the reason limit is cut on the edit and the panel says so", draftPastLimitCutWithNotice settings a b )
             , ( "a 5 MiB refusal draft is held and drawn only to the reason limit", hugeDraftBounded settings a b )
-            , ( "a reason of astral characters at the limit fits the draft and the input maxlength", astralDraftWithinMaxlength settings a b )
+            , ( "a reason of astral characters at the limit fits the draft, and the input maxlength admits no more than the draft holds", astralDraftWithinMaxlength settings a b )
             , ( "the reason input's maxlength derives from the reason limit", refusePanelMaxlengthFromSsot settings a b )
             , ( "Confirm after a cut records exactly the shown text", confirmRecordsShownText settings a b )
             ]
