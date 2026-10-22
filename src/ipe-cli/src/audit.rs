@@ -1954,6 +1954,8 @@ fn verify_locked_dependency_hashes(prepared: &Prepared) -> Result<(), CliError> 
 /// [`CliError::AdvisoryVulnerable`] on a `high`/`critical` match.
 /// [`CliError::AdvisoryDbMalformed`] on a malformed advisory file.
 /// [`CliError::AdvisoryDbUnreachable`] on an unreadable advisory directory.
+/// [`CliError::Usage`] when `IPE_REGISTRY_URL` is neither empty nor an
+/// `https://` base URL.
 fn advisory_check(
     lockfile: &crate::lockfile::Lockfile,
     advisory_db: Option<&Path>,
@@ -1971,12 +1973,13 @@ fn advisory_check(
         return Ok(());
     };
 
-    advisory_check_with_base(lockfile, db_root, &crate::registry::registry_base_url())
+    advisory_check_with_base(lockfile, db_root, &crate::registry::registry_source()?)
 }
 
-/// The base-URL-injected core of [`advisory_check`]: cross-checks every dep of
-/// the captured `lockfile`, using `base_url` as the registry Pages read
-/// API. Tests pass an empty `base_url` to disable the HTTP attempt (immediate
+/// The registry-source-injected core of [`advisory_check`]: cross-checks every
+/// dep of the captured `lockfile`, reading the registry Pages read API from
+/// `source`. Tests pass [`crate::registry::RegistrySource::Disabled`] to skip
+/// the HTTP attempt (immediate
 /// unreachable → the git-checkout DB is authoritative), keeping them hermetic and
 /// off the network.
 ///
@@ -1986,14 +1989,14 @@ fn advisory_check(
 fn advisory_check_with_base(
     lockfile: &crate::lockfile::Lockfile,
     db_root: &Path,
-    base_url: &str,
+    source: &crate::registry::RegistrySource,
 ) -> Result<(), CliError> {
     for dep in lockfile.packages() {
         // The lockfile parse turns each `name` into a `PackageName` — a single
         // non-traversing path component by construction — so a hand-edited
         // `ipe.lock` name never reaches the registry URL segment or the
         // advisory-DB path join raw.
-        check_one_dep_advisories(db_root, &dep.name, dep.version.as_semver(), base_url)?;
+        check_one_dep_advisories(db_root, &dep.name, dep.version.as_semver(), source)?;
     }
     Ok(())
 }
@@ -2004,7 +2007,7 @@ fn advisory_check_with_base(
 /// The Pages fast-path fetches `/advisories/index.json` + the per-advisory
 /// records. A reachable index is authoritative for this run — even an empty
 /// result proves the dep clean. When the index (or a named record) is unreachable
-/// (offline / air-gapped / an empty `base_url` opt-out), this is a WARN, never a
+/// (offline / air-gapped / the [`crate::registry::RegistrySource::Disabled`] opt-out), this is a WARN, never a
 /// silent all-clear: the check falls back to the git-checkout advisory DB, which
 /// is itself fail-closed on a malformed or unreadable file.
 ///
@@ -2016,12 +2019,12 @@ fn check_one_dep_advisories(
     db_root: &Path,
     name: &crate::package_name::PackageName,
     version: &semver::Version,
-    base_url: &str,
+    source: &crate::registry::RegistrySource,
 ) -> Result<(), CliError> {
     let name = name.as_str();
     let outcome = crate::registry::fetch_advisories_via_pages_with(
         name,
-        base_url,
+        source,
         &crate::registry::net_fetch,
     )?;
     match outcome {
@@ -3684,8 +3687,9 @@ mod tests {
 
     /// The advisory check over the `ipe.lock` written under `dir`, against the DB at `db`.
     fn advisory_over(dir: &Path, db: &Path) -> Result<(), CliError> {
-        crate::lockfile::Lockfile::read(dir)
-            .and_then(|lock| advisory_check_with_base(&lock, db, ""))
+        crate::lockfile::Lockfile::read(dir).and_then(|lock| {
+            advisory_check_with_base(&lock, db, &crate::registry::RegistrySource::Disabled)
+        })
     }
 
     /// A digest literal for a verdict that judged no tree.

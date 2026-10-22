@@ -40,6 +40,8 @@ const FORMAT_MACROS: [&str; 4] = ["format", "format_args", "write", "writeln"];
 /// Each is an encoder whose output is TOML or JSON, never Rust, or the
 /// diagnostic excerpt `route_grammar::excerpt`.
 const ALLOWED: &[(&str, &str, Breach, usize)] = &[
+    ("crate_specs.rs", "dependency_line", Breach::HandQuote, 3),
+    ("crate_specs.rs", "dependency_line", Breach::LoneQuote, 2),
     (
         "emit_template.rs",
         "write_json_string",
@@ -57,16 +59,7 @@ const ALLOWED: &[(&str, &str, Breach, usize)] = &[
     ("project.rs", "compression_cargo_toml", Breach::HandQuote, 1),
     ("project.rs", "config_cargo_toml", Breach::HandQuote, 1),
     ("project.rs", "crypto_cargo_toml", Breach::HandQuote, 1),
-    (
-        "project.rs",
-        "crypto_core_heavy_cargo_toml",
-        Breach::HandQuote,
-        1,
-    ),
     ("project.rs", "csv_cargo_toml", Breach::HandQuote, 1),
-    ("project.rs", "db_cargo_toml", Breach::HandQuote, 1),
-    ("project.rs", "email_cargo_toml", Breach::HandQuote, 1),
-    ("project.rs", "http_client_cargo_toml", Breach::HandQuote, 1),
     ("project.rs", "json_string", Breach::LoneQuote, 2),
     (
         "project.rs",
@@ -88,7 +81,7 @@ const ALLOWED: &[(&str, &str, Breach, usize)] = &[
     ("project.rs", "tui_cargo_toml", Breach::HandQuote, 3),
     ("project.rs", "url_cargo_toml", Breach::HandQuote, 1),
     ("project.rs", "web_cargo_toml", Breach::HandQuote, 1),
-    ("project.rs", "websocket_cargo_toml", Breach::HandQuote, 3),
+    ("project.rs", "websocket_cargo_toml", Breach::HandQuote, 2),
     ("project.rs", "webview_cargo_toml", Breach::HandQuote, 1),
     ("route_grammar.rs", "excerpt", Breach::EscapeMethod, 1),
     ("static_build.rs", "cargo_config", Breach::HandQuote, 1),
