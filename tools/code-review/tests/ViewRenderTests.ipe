@@ -14,15 +14,16 @@ import Ipe.System as System
 import Ipe.Task as Task
 import Ipe.Time.Timestamp as Timestamp
 import Ipe.Ui as Ui
-import Lib.App exposing (Model, Page(..), initialModel)
+import Lib.App exposing (Model, Page(..), decidableRow, initialModel)
 import Lib.Db as LibDb exposing (BreakAt(..), HistoryCursor(..), LogShown(..), ReviewEntry(..), StoredDecision(..), Unverified(..))
+import Lib.Epoch as Epoch exposing (Epoch)
 import Lib.Failure as Failure exposing (DecideRefusal(..), LoadFailure(..), ReasonRefusal(..), RefuseFailure(..), SaveFailure(..))
 import Lib.Format as Format
 import Lib.Index as Index exposing (Change(..), Oversize(..), ReadFailure(..), RefusalReason(..), SourceView(..), StaleReason(..))
 import Lib.Label as Label exposing (Label)
 import Lib.Links exposing (Hidden(..), Link(..))
 import Lib.PageSize as PageSize
-import Lib.Queue as Queue exposing (DecisionSlot(..), HistoryState(..), QueueState(..), SelectedView(..), UnitPageState(..))
+import Lib.Queue as Queue exposing (DecisionSlot(..), HistoryState(..), QueueState(..), RefusalPanel(..), SelectedView(..), UnitPageState(..))
 import Lib.RepoPath exposing (PathError(..))
 import Lib.SafeText as SafeText
 import Lib.Uid as Uid
@@ -103,14 +104,21 @@ changedModel loaded old =
     }
 
 
--- The queue card with its refusal panel open.
-refusingModel : Index.UnitView -> Model
-refusingModel loaded =
+-- The queue card after a refusal asked on it, opened as the app opens it
+-- for process `epoch`: the panel opens only on a card that offers a
+-- decision, so a withheld card stays as it was.
+refusingModel : Epoch -> Index.UnitView -> Model
+refusingModel epoch loaded =
     let
         card =
             cardModel loaded
     in
-    { card | refusingUid = Just loaded.unit.uid }
+    case decidableRow card loaded.unit.uid of
+        Just row ->
+            { card | decision = Queue.openRefusal epoch row card.decision }
+
+        Nothing ->
+            card
 
 
 -- The unit page of `loaded`'s own address, with its read settled.
@@ -286,9 +294,6 @@ oversizeCase over =
         ChildSpans { atLeast } ->
             { view = TooLarge over, reason = "holds at least " ++ String.fromInt atLeast ++ " other units, past the " ++ String.fromInt Index.childSpanCeiling ++ "-unit review ceiling" }
 
-        ViewNodes { nodes } ->
-            { view = TooLarge over, reason = "draws as " ++ String.fromInt nodes ++ " elements even without highlighting, past the " ++ String.fromInt Index.viewNodeCeiling ++ "-element review ceiling" }
-
 
 -- Every way a source is withheld.
 withheldCases : List Withheld
@@ -305,7 +310,6 @@ withheldCases =
     , oversizeCase (SpanLines { lines = Index.viewLineCeiling + 1 })
     , oversizeCase (ViewBytes { size = ByteSize.bytes (ByteSize.toBytes Index.viewByteCeiling + 1) })
     , oversizeCase (ChildSpans { atLeast = Index.childSpanCeiling + 1 })
-    , oversizeCase (ViewNodes { nodes = Index.viewNodeCeiling + 1 })
     ]
 
 
@@ -353,9 +357,6 @@ withheldName view =
 
         TooLarge (ChildSpans _) ->
             Just "ChildSpans"
-
-        TooLarge (ViewNodes _) ->
-            Just "ViewNodes"
 
 
 -- The constructors `type <name>` declares in `source`, read off its `=` and
@@ -453,17 +454,21 @@ withheldRefuses loaded entry =
         && not (has sourceMarker onPage)
 
 
--- A withheld card whose refusal panel is open still offers no decision.
-withheldRefusePanelRefuses : Index.UnitView -> Withheld -> Bool
-withheldRefusePanelRefuses loaded entry =
+-- A refusal asked on a withheld card opens no panel and offers no
+-- decision.
+withheldRefusePanelRefuses : Epoch -> Index.UnitView -> Withheld -> Bool
+withheldRefusePanelRefuses epoch loaded entry =
     let
         withheld =
             { loaded | view = entry.view }
 
+        refused =
+            refusingModel epoch withheld
+
         html =
-            page (refusingModel withheld)
+            page refused
     in
-    has entry.reason html && noDecisionButtons html
+    Queue.openPanel refused.decision == Nothing && has entry.reason html && noDecisionButtons html
 
 
 -- ── queue states and counts ─────────────────────────────────────
@@ -543,20 +548,19 @@ countsFollowModel a b =
 -- A refused draft shows its case's fixed text in the open refusal panel,
 -- beside the Confirm button, and no other case's text. Red if a case renders
 -- another's text or the panel loses its control.
-refuseErrorFixedText : Index.UnitView -> Bool
-refuseErrorFixedText loaded =
+refuseErrorFixedText : Epoch -> Index.UnitView -> Bool
+refuseErrorFixedText epoch loaded =
     let
         opened =
-            refusingModel loaded
+            refusingModel epoch loaded
 
         cases =
             [ DraftRefused ReasonBlank
             , DraftRefused (ReasonOverlong { chars = LibDb.reasonMaxChars + 1, limit = LibDb.reasonMaxChars })
-            , DraftWhileSaving
             ]
 
         rendered failure =
-            page { opened | refuseError = Just failure }
+            page { opened | decision = Queue.draftRefused failure opened.decision }
 
         showsItsOwn failure =
             let
@@ -581,7 +585,7 @@ decisionErrorFixedText loaded =
             cardModel loaded
     in
     List.all
-        (\failure -> has (Html.escapeHtml ("Decision save failed: " ++ Failure.saveFailureText failure)) (page { card | decision = DecisionNotSaved failure Queue.firstTicket }))
+        (\failure -> has (Html.escapeHtml ("Decision not saved: " ++ Failure.saveFailureText failure)) (page { card | decision = DecisionNotSaved failure Queue.firstTicket PanelClosed }))
         [ SaveOffQueue
         , SaveReadOnly
         , SaveContended
@@ -603,7 +607,7 @@ decisionErrorFixedText loaded =
         , SaveRefused FileReadsAsText
         , SaveRefused FileNotQueued
         ]
-        && not (has "Decision save failed: " (page card))
+        && not (has "Decision not saved: " (page card))
 
 
 -- ── the address the page reports ────────────────────────────────────
@@ -763,8 +767,8 @@ maxLinksFitBudget loaded =
 
 
 -- ── checks on the seeded fixture units ──────────────────────────────────
-seededChecks : Index.UnitView -> Index.UnitView -> List ( String, Bool )
-seededChecks a b =
+seededChecks : Epoch -> Index.UnitView -> Index.UnitView -> List ( String, Bool )
+seededChecks epoch a b =
     let
         shownCard =
             page (cardModel a)
@@ -782,7 +786,7 @@ seededChecks a b =
             { a | unit = { unit | path = labelOf hostileText } }
 
         opened =
-            page (refusingModel a)
+            page (refusingModel epoch a)
 
         hostileHistory =
             historyModel [ { entry = Unverified { uid = Just a.unit.uid, bodyHash = "h", reviewedAt = Timestamp.fromUnixMillis 0, why = Legacy }, label = Queue.FileLabelled (labelOf hostileText) Queue.Indexed } ]
@@ -851,7 +855,7 @@ seededChecks a b =
     in
     [ ( "a verified source shows Approve, Refuse and its source text", button "Approve" shownCard && button "Refuse" shownCard && has sourceMarker shownCard )
     , ( "a withheld source shows its reason, no decision button and no source text, for every stale reason and an unreadable file", List.all (withheldRefuses a) withheldCases )
-    , ( "a withheld source offers no decision with the refusal panel open", List.all (withheldRefusePanelRefuses a) withheldCases )
+    , ( "a withheld source offers no decision with the refusal panel open", List.all (withheldRefusePanelRefuses epoch a) withheldCases )
     , ( "the unit page shows a verified source and never a decision button", has sourceMarker shownPage && noDecisionButtons shownPage )
     , ( "an open refusal panel shows Confirm and Cancel in place of Approve and Refuse", button "Confirm" opened && button "Cancel" opened && not (button "Approve" opened) && not (button "Refuse" opened) )
     , ( "the escaped needle differs from the raw hostile text, and a benign render holds no script tag, no href and shows the unit name", hostileEscaped /= hostileText && renderedForeign (codeText 8238) /= codeText 8238 && not (has "<script" shownCard) && not (has "href=" shownCard) && has "Lib.answer" shownCard )
@@ -900,7 +904,7 @@ seededChecks a b =
     , ( "each queue state renders its own text and no other state's", List.all showsOnly stateCases )
     , ( "a queue with open units renders none of the state texts and its header", showsNoStateText (page (cardModel a)) && has (showingLine (queuePage [ queued a ] 1 { reviewed = 0, total = 1 })) shownCard )
     , ( "the progress line and the showing header follow the model's counts", countsFollowModel a b )
-    , ( "a refused draft shows its case's fixed text in the open refusal panel", refuseErrorFixedText a )
+    , ( "a refused draft shows its case's fixed text in the open refusal panel", refuseErrorFixedText epoch a )
     , ( "a failed decision save shows its case's fixed text in the queue banner", decisionErrorFixedText a )
     , ( "the reported address is escaped as an attribute value", pathAttributeEscaped a )
     , ( "an unsafe link target renders as plain text with no href", List.all (unsafeLinkHasNoHref a) unsafeTargets )
@@ -1087,6 +1091,43 @@ hostileSourceChecks =
             , ( "source text spelling an escape draws as plain text, the real character it names as a marked escape", has (hostileEscaped ++ asciiSpelling ++ escapeMarkup "\\u{200b}") (page (cardModel loaded)) && not (has (codeText 8203) (page (cardModel loaded))) )
             , ( "a hostile source still offers its decision buttons", button "Approve" (page (cardModel loaded)) && button "Refuse" (page (cardModel loaded)) )
             , ( "the unit page and the queue card draw their source within the drawn depth ceiling", drawnDepthWithinBound (page (unitPageModel loaded)) && drawnDepthWithinBound (page (cardModel loaded)) )
+            ]
+
+
+-- The fixture unit's four lines, each of 1100 escapes after an `a`: past
+-- the element ceiling drawn plain, so the view is shown spelled out.
+spelledView : String
+spelledView =
+    String.join "\n" (List.repeat 4 (String.repeat 1100 ("a" ++ codeText 8238)))
+
+
+-- A unit too escape-dense to draw with marked escapes is shown spelled out:
+-- on the unit page and the queue card it carries the spelled-out note, its
+-- escapes spelled and none raw, within the element and drawn depth
+-- ceilings, and the card offers its decision buttons. Red if the spelled drawing is withheld, unnoted,
+-- or draws past a ceiling.
+spelledSourceChecks : Task.Task Error (List ( String, Bool ))
+spelledSourceChecks =
+    do
+        at <- freshScratch "ipe-view-render-spelled-source"
+        seedIndex at.indexDb at.repo
+        writeFileText (at.repo ++ "/src/Lib.rs") ("// fixture library\n\n" ++ spelledView ++ "\n")
+        execIndex at.indexDb "UPDATE units SET body_hash = ? WHERE uid = ?" [ SqlString (Index.attest spelledView), Uid.toSql (uid "u-a") ]
+        loaded <- loadUnitNow (uid "u-a") |> Task.andThen requireUnit
+        cleanupIndex at.indexDb at.repo
+        let
+            pages =
+                [ page (unitPageModel loaded), page (cardModel loaded) ]
+
+            depth html =
+                0 < deepestDrawnDepth html && deepestDrawnDepth html <= Index.drawnDepthCeiling
+        in
+        Task.succeed
+            [ ( "an escape-dense source is verified and shown", isShown loaded )
+            , ( "an escape-dense source is shown spelled out, its escapes spelled and none raw", List.all (\html -> has "Shown spelled out:" html && has "\\u{202e}" html && not (has (codeText 8238) html)) pages )
+            , ( "a spelled-out source still offers its decision buttons", button "Approve" (page (cardModel loaded)) && button "Refuse" (page (cardModel loaded)) )
+            , ( "a spelled-out source page draws within the element ceilings", List.all (\html -> elementsOf html <= Index.viewNodeCeiling + Index.queueElementCeiling) pages )
+            , ( "a spelled-out source draws within the drawn depth ceiling", List.all depth pages )
             ]
 
 
@@ -1565,8 +1606,9 @@ queueBudgetChecks loaded =
 checks : Task.Task Error (List ( String, Bool ))
 checks =
     Task.sequence
-        [ group "view fixtures" (withSeededIndex "ipe-view-render-seeded" (\a b -> Task.succeed (seededChecks a b ++ untrustedSinkChecks a ++ queueBudgetChecks a ++ maxLinksFitBudget a)))
+        [ group "view fixtures" (withSeededIndex "ipe-view-render-seeded" (\a b -> Epoch.mint |> Task.map (\epoch -> seededChecks epoch a b ++ untrustedSinkChecks a ++ queueBudgetChecks a ++ maxLinksFitBudget a)))
         , group "hostile source fixture" hostileSourceChecks
+        , group "spelled source fixture" spelledSourceChecks
         , group "stored decision fixture" storedChecks
         , group "unreviewable file fixture" refusalChecks
         , Task.succeed [ ( "the shortcut root takes focus on page load", shortcutRootAutofocused ) ]

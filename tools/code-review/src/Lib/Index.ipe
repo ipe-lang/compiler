@@ -2292,11 +2292,10 @@ storedPathText stored problem =
 
 
 -- The one judgement of a unit's view, in precedence order: a body past the
--- line ceiling, a range outside `text`, a view past the byte ceiling, a view
--- whose drawing takes more elements than the element ceiling, then the
--- attestation compare. The rows drawn and the text hashed come from one
+-- line ceiling, a range outside `text`, a view past the byte ceiling, then
+-- the attestation compare. The rows drawn and the text hashed come from one
 -- `bodyRows` list, joined by `bodyText`, and the rows are drawn here once, in
--- `lang`: coloured when that fits the element ceiling, else as plain text.
+-- `lang`, by `fittingDrawing`, which always fits the element ceiling.
 -- `ShownSource` is built only here, so holding one proves the view is within
 -- every ceiling, re-hashes to `stored`, and carries the drawing that was
 -- counted. An oversized view is never hashed: re-indexing cannot make it
@@ -2327,44 +2326,36 @@ classifyView uid lang stored body text =
                     if size > ByteSize.toBytes viewByteCeiling then
                         TooLarge (ViewBytes { size = ByteSize.bytes size })
 
+                    else if bodyAttest body view == stored then
+                        Shown (ShownSource { uid = uid, rows = rows, text = view, hash = stored, drawn = fittingDrawing lang rows })
+
                     else
-                        case fittingDrawing lang rows of
-                            Err over ->
-                                TooLarge over
-
-                            Ok drawn ->
-                                if bodyAttest body view == stored then
-                                    Shown (ShownSource { uid = uid, rows = rows, text = view, hash = stored, drawn = drawn })
-
-                                else
-                                    Stale Drifted
+                        Stale Drifted
 
 
 -- The rows drawn coloured when that takes at most `viewNodeCeiling`
--- elements, else drawn plain when that does; past both, the plain drawing's
--- count, the fewest elements the view can be drawn in.
-fittingDrawing : Highlight.Lang -> List SourceRow -> Result Oversize DrawnSource
+-- elements, else drawn plain when that does, else spelled out, whose four
+-- elements fit whatever the rows hold. The plain drawing is built only when
+-- the coloured one is over.
+fittingDrawing : Highlight.Lang -> List SourceRow -> DrawnSource
 fittingDrawing lang rows =
     let
         colored =
             Drawn.highlighted lang rows
     in
     if Drawn.elements colored <= viewNodeCeiling then
-        Ok colored
+        colored
 
     else
         let
             uncolored =
                 Drawn.plain lang rows
-
-            nodes =
-                Drawn.elements uncolored
         in
-        if nodes <= viewNodeCeiling then
-            Ok uncolored
+        if Drawn.elements uncolored <= viewNodeCeiling then
+            uncolored
 
         else
-            Err (ViewNodes { nodes = nodes })
+            Drawn.spelled lang rows
 
 
 -- A line range past the line ceiling, or a file unit whose file is: the
@@ -2563,7 +2554,9 @@ drawnDepthCeiling =
 -- the rows and again whole in the model, the drawing's escaped characters
 -- at four bytes each with up to as much again of spare capacity, and the
 -- tree's escape spelling, six bytes for one source byte; sixteen copies in
--- all, plus each line's row, string and line number.
+-- all, plus each line's row, string and line number, plus a spelled
+-- drawing's `Drawn.spelledGapText` and `Drawn.spelledGapMark` with their two
+-- line breaks for each line.
 viewReserve : ByteSize
 viewReserve =
     ByteSize.mib 5
@@ -3172,7 +3165,6 @@ type Oversize
     = SpanLines { lines : Int }
     | ViewBytes { size : ByteSize }
     | ChildSpans { atLeast : Int }
-    | ViewNodes { nodes : Int }
 
 
 -- What a unit's attestation covers: a span unit its line range (1-based,

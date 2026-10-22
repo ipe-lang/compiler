@@ -764,7 +764,6 @@ unitPageStatesDistinct =
             , TooLarge (SpanLines { lines = Index.viewLineCeiling + 1 })
             , TooLarge (ViewBytes { size = ByteSize.bytes (ByteSize.toBytes Index.viewByteCeiling + 1) })
             , TooLarge (ChildSpans { atLeast = Index.childSpanCeiling + 1 })
-            , TooLarge (ViewNodes { nodes = Index.viewNodeCeiling + 1 })
             ]
 
         sourceTexts =
