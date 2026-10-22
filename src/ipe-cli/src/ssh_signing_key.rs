@@ -351,7 +351,7 @@ pub(crate) enum RegistrationError {
     /// GitHub answered with a status other than `201 Created`.
     Refused { status: u16, message: String },
     /// The request never got an HTTP answer.
-    Transport(String),
+    Transport(crate::net::Error),
 }
 
 impl RegistrationError {
@@ -365,9 +365,9 @@ impl RegistrationError {
             Self::Refused { status, message } => {
                 crate::text::msg::signing_key_refused(status, &TerminalSafe::sanitize(message))
             }
-            Self::Transport(reason) => {
-                crate::text::msg::signing_key_unreachable(&TerminalSafe::sanitize(reason))
-            }
+            Self::Transport(reason) => crate::text::msg::signing_key_unreachable(
+                &TerminalSafe::sanitize(&reason.to_string()),
+            ),
         }
     }
 }
@@ -792,53 +792,58 @@ fn post_signing_key(
 ) -> Result<(), RegistrationError> {
     let body = serde_json::json!({ "title": title, "key": public_key.as_str() }).to_string();
     let authorization = Zeroizing::new(format!("Bearer {}", token.as_str()));
-    let agent = ureq::AgentBuilder::new()
-        .timeout(Duration::from_secs(30))
-        .build();
-    let result = agent
-        .post(SIGNING_KEYS_API)
-        .set("User-Agent", "ipe-cli")
-        .set("Accept", "application/vnd.github+json")
-        .set("X-GitHub-Api-Version", "2022-11-28")
-        .set("Content-Type", "application/json")
-        .set("Authorization", &authorization)
-        .send_string(&body);
+    let url = crate::net::HttpsUrl::parse(SIGNING_KEYS_API)
+        .map_err(|fault| RegistrationError::Transport(fault.into()))?;
+    let result = crate::net::post(
+        &url,
+        Duration::from_secs(30),
+        &[
+            ("User-Agent", "ipe-cli"),
+            ("Accept", "application/vnd.github+json"),
+            ("X-GitHub-Api-Version", "2022-11-28"),
+            ("Content-Type", "application/json"),
+            ("Authorization", authorization.as_str()),
+        ],
+        body.as_str(),
+        crate::remote_ingest::IngestSource::GithubApi,
+    );
+    registration_outcome(result)
+}
+
+/// The registration verdict of one `POST` answer: only `201 Created` counts.
+fn registration_outcome(
+    result: Result<crate::net::Answer, crate::net::Error>,
+) -> Result<(), RegistrationError> {
     match result {
-        Ok(response) if response.status() == 201 => Ok(()),
-        Ok(response) => Err(RegistrationError::Refused {
-            status: response.status(),
-            message: github_message(response),
+        Ok(answer) if answer.status_code() == 201 => Ok(()),
+        Ok(answer) => Err(RegistrationError::Refused {
+            status: answer.status_code(),
+            message: github_message(&answer),
         }),
-        Err(ureq::Error::Status(status, response)) => Err(RegistrationError::Refused {
+        Err(crate::net::Error::Status(status)) => Err(RegistrationError::Refused {
             status,
-            message: github_message(response),
+            message: echoed_message(""),
         }),
-        Err(ureq::Error::Transport(transport)) => {
-            Err(RegistrationError::Transport(transport.to_string()))
-        }
+        Err(transport) => Err(RegistrationError::Transport(transport)),
     }
 }
 
 /// GitHub's `message` field as one capped terminal line, so a hostile
 /// response cannot drive the terminal; see [`echoed_message`].
 ///
-/// The body is read through [`crate::remote_ingest::read_capped`] at
-/// [`crate::remote_ingest::JSON_RESPONSE_MAX_BYTES`]; an over-budget body
-/// carries no message.
-fn github_message(response: ureq::Response) -> String {
-    let message = crate::remote_ingest::read_capped(
-        response.into_reader(),
-        crate::remote_ingest::JSON_RESPONSE_MAX_BYTES,
-        crate::remote_ingest::IngestSource::GithubApi,
-    )
-    .ok()
-    .and_then(|body| serde_json::from_slice::<serde_json::Value>(&body).ok())
-    .and_then(|json| {
-        json.get("message")
-            .and_then(serde_json::Value::as_str)
-            .map(str::to_owned)
-    })
-    .unwrap_or_default();
+/// The body was read at [`crate::remote_ingest::JSON_RESPONSE_MAX_BYTES`]; an
+/// over-budget body carries no message.
+fn github_message(answer: &crate::net::Answer) -> String {
+    let message = answer
+        .body()
+        .ok()
+        .and_then(|body| serde_json::from_slice::<serde_json::Value>(body).ok())
+        .and_then(|json| {
+            json.get("message")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)
+        })
+        .unwrap_or_default();
     echoed_message(&message)
 }
 
@@ -935,6 +940,11 @@ pub(crate) fn run_setup_command() -> Result<(), CliError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_signing_keys_endpoint_is_an_https_url() {
+        assert!(crate::net::HttpsUrl::parse(SIGNING_KEYS_API).is_ok());
+    }
 
     /// A hostile response message loses each escape sequence whole, not just
     /// its `ESC`, and every bidi or zero-width character, before it is echoed.
@@ -1744,7 +1754,7 @@ mod tests {
         let forged = "offline\nipe login: forged success\u{1b}[2K";
         for error in [
             RegistrationError::Authorization(forged.to_owned()),
-            RegistrationError::Transport(forged.to_owned()),
+            RegistrationError::Transport(crate::net::Error::BadRequest),
             RegistrationError::Refused {
                 status: 500,
                 message: forged.to_owned(),
@@ -1774,5 +1784,47 @@ mod tests {
         let missing = status_line(None, Some(dir.as_path()));
         assert!(missing.contains("ipe login --signing-key"), "{missing:?}");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An HTTP answer with `status` and `body`, as the agent hands it back.
+    fn answer(status: u16, body: &str) -> crate::net::Answer {
+        crate::net::testing::answer(
+            status,
+            body.as_bytes(),
+            crate::remote_ingest::JSON_RESPONSE_MAX_BYTES,
+            crate::remote_ingest::IngestSource::GithubApi,
+        )
+    }
+
+    #[test]
+    fn only_created_counts_as_registered() {
+        assert!(registration_outcome(Ok(answer(201, ""))).is_ok());
+        for status in [200, 204, 302, 422, 500] {
+            let outcome = registration_outcome(Ok(answer(status, r#"{"message":"no"}"#)));
+            assert!(
+                matches!(
+                    &outcome,
+                    Err(RegistrationError::Refused { status: s, message })
+                        if *s == status && message == "no"
+                ),
+                "status {status} must be refused with its message: {outcome:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn status_and_transport_errors_are_refusals() {
+        assert!(matches!(
+            registration_outcome(Err(crate::net::Error::Status(401))),
+            Err(RegistrationError::Refused { status: 401, .. })
+        ));
+        assert!(matches!(
+            registration_outcome(Err(crate::net::Error::Timeout)),
+            Err(RegistrationError::Transport(_))
+        ));
+        assert!(matches!(
+            registration_outcome(Err(crate::net::Error::Redirect)),
+            Err(RegistrationError::Transport(_))
+        ));
     }
 }
