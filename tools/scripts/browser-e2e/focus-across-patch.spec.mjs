@@ -656,6 +656,22 @@ test("focus-across-patch: a file read the user waited on focuses its autofocus f
   await expect.poll(() => focusedId(page)).toBe("fileask");
 });
 
+test("focus-across-patch: an autofocus attribute patched onto a node on screen never reaches the DOM", async ({ page }) => {
+  await open(page);
+  await expect.poll(() => focusedId(page)).toBe("root");
+  const flag = await page.evaluate(() => document.getElementById("flag").getAttribute("ipe-id"));
+  expect(flag).not.toBeNull();
+  await holdPatches(page);
+  await page.keyboard.press("q");
+  const frame = await firstHeld(page);
+  // The frame patches the attribute, with a non-empty value, onto the node.
+  const set = frame.patches.find((p) => p.id === flag && p.attrs);
+  expect(set?.attrs?.autofocus).toBe("autofocus");
+  await deliverHeld(page);
+  await expect(page.locator("#flag[data-on]")).toHaveCount(1);
+  expect(await page.locator("#ipe-root [autofocus]").count()).toBe(0);
+});
+
 test("focus-across-patch: a frame behind the render on screen never moves focus", async ({ page }) => {
   await open(page);
   await expect.poll(() => focusedId(page)).toBe("root");

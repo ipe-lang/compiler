@@ -28,7 +28,8 @@ module Main exposing (main)
 -- a render no event of the tab caused. A query holding `noauto` leaves the
 -- root without `autofocus`, so focus stays on the body at load; one holding
 -- `tick` arms the timer from the start. Picking a file in `pick` adds the
--- `autofocus` field `fileask` once the file is read.
+-- `autofocus` field `fileask` once the file is read. `q` toggles `autofocus`
+-- on the element `flag` already on screen.
 --
 -- Co-located, no capabilities, no JS ports.
 
@@ -61,6 +62,7 @@ type alias Model =
     , subAsk : Bool
     , loadAuto : Bool
     , picked : Bool
+    , flag : Bool
     }
 
 
@@ -83,7 +85,7 @@ type Msg
 
 init : WebReq -> ( Model, Cmd.Cmd Msg )
 init req =
-    ( { keys = "", row = False, drop = True, note = "", swapped = False, pressed = False, deep = False, tagSwapped = False, hostRow = False, formDrop = True, mathRow = False, ask = False, answer = "", ticking = String.contains "tick" req.query, subAsk = False, loadAuto = not (String.contains "noauto" req.query), picked = False }, Cmd.none )
+    ( { keys = "", row = False, drop = True, note = "", swapped = False, pressed = False, deep = False, tagSwapped = False, hostRow = False, formDrop = True, mathRow = False, ask = False, answer = "", ticking = String.contains "tick" req.query, subAsk = False, loadAuto = not (String.contains "noauto" req.query), picked = False, flag = False }, Cmd.none )
 
 
 update : Msg -> Model -> ( Model, Cmd.Cmd Msg )
@@ -101,6 +103,9 @@ update msg model =
 
             else if key == "F3" then
                 ( { model | keys = key, ticking = True }, Cmd.none )
+
+            else if key == "q" then
+                ( { model | keys = key, flag = not model.flag }, Cmd.none )
 
             else
                 ( { model | keys = key }, Cmd.none )
@@ -377,6 +382,17 @@ askPanel shown name model =
         []
 
 
+-- While `on`, a mark and an `autofocus` with a non-empty value: the client
+-- patches both onto the element already on screen.
+flagAttrs : Bool -> List (Ui.Attribute Msg)
+flagAttrs on =
+    if on then
+        [ Ui.htmlAttribute "data-on" "yes", Ui.htmlAttribute "autofocus" "autofocus" ]
+
+    else
+        []
+
+
 -- The root's `autofocus` unless the page loaded with `noauto`.
 rootAutofocus : Model -> List (Ui.Attribute Msg)
 rootAutofocus model =
@@ -456,6 +472,7 @@ view model =
                 ]
                 :: askPanel model.picked "fileask" model
             )
+        , Ui.el (Ui.id "flag" :: flagAttrs model.flag) (Ui.text "flag")
         ]
 
 
