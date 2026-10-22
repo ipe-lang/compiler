@@ -6,6 +6,7 @@ import Ipe.Result exposing (Result(..))
 import Ipe.Task as Task
 import Ipe.Tea.Web.Cmd as Cmd
 import Lib.Db as LibDb exposing (Decision(..), HistoryCursor(..))
+import Lib.Draft as Draft
 import Lib.Epoch exposing (Epoch)
 import Lib.Failure as Failure exposing (DecideRefusal(..), LoadFailure, RefuseFailure(..), SaveFailure(..))
 import Lib.Index as Index
@@ -327,7 +328,7 @@ step settings msg model =
             startRefusal settings uid model
 
         RefuseDraft uid text ->
-            ( { model | decision = Queue.editDraft uid text model.decision }, Cmd.none )
+            ( { model | decision = Queue.editDraft uid (Draft.draft text) model.decision }, Cmd.none )
 
         RefuseCancel ->
             ( { model | decision = Queue.closeRefusal model.decision }, Cmd.none )
@@ -521,9 +522,9 @@ keyActionMsg settings action model =
             ( model, Cmd.none )
 
 
--- The open panel's draft is parsed into a bounded `Reason` here, the one
--- point where the reviewer's text enters; a blank or over-long draft stays
--- open with why. A submit for any row or target but the one the panel is
+-- The open panel's draft, already cut to the reason limit where it entered
+-- (`RefuseDraft`), is parsed into a `Reason` here, so Confirm records the
+-- text the panel shows; a blank draft stays open with why. A submit for any row or target but the one the panel is
 -- open on decides nothing and keeps the draft. The panel is closed before the
 -- decision is asked, so the decision's own state is what the row shows.
 submitRefuse : Settings.AppSettings -> Model -> DecisionTarget -> Uid -> ( Model, Cmd Msg )
@@ -531,7 +532,7 @@ submitRefuse settings model target uid =
     case Queue.openRow model.decision of
         Just ( row, draft ) ->
             if Queue.rowUid row == uid && Queue.rowTarget row == target then
-                case LibDb.parseReason draft.refuseDraft of
+                case Draft.draftReason draft.refuseDraft of
                     Err refused ->
                         ( { model | decision = Queue.draftRefused (DraftRefused refused) model.decision }, Cmd.none )
 

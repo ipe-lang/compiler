@@ -6,12 +6,14 @@ import Ipe.Html as Html
 import Ipe.Io as Io
 import Ipe.List as List
 import Ipe.Maybe as Maybe
+import Ipe.Result exposing (Result(..))
 import Ipe.String as String
 import Ipe.System as System
 import Ipe.Task as Task
 import Ipe.Ui as Ui
 import Lib.App as App exposing (Model, Msg(..), Page(..))
 import Lib.Db as LibDb exposing (Decision(..))
+import Lib.Draft as Draft
 import Lib.Epoch as Epoch exposing (Epoch)
 import Lib.Failure as Failure exposing (DecideRefusal(..), LoadFailure(..), ReasonRefusal(..), RefuseFailure(..), SaveFailure(..))
 import Lib.Index as Index exposing (Change(..), RefusalReason(..), SourceView(..), StaleReason(..))
@@ -347,7 +349,7 @@ refusalPanelLivesInIdleSlot settings a b =
             after settings [ RefuseStart ua, RefuseDraft ua "needs a test" ] shown
 
         draft =
-            { refuseDraft = "needs a test", refuseError = Nothing }
+            { refuseDraft = Draft.draft "needs a test", refuseError = Nothing }
 
         elsewhere =
             after settings [ ApproveUnit ub ] opened
@@ -458,8 +460,8 @@ refusalPanelOnlyOnOfferedRow settings a b =
         && after settings [ RefuseStart (uid "u-unlisted") ] shown == shown
         && after settings [ RefuseStart ub ] shown == shown
         && after settings [ RefuseStart (uid "r-blocking") ] blocking == blocking
-        && Queue.openPanel opened.decision == Just ( ua, { refuseDraft = "", refuseError = Nothing } )
-        && Queue.openPanel drafted.decision == Just ( ua, { refuseDraft = "needs a test", refuseError = Nothing } )
+        && Queue.openPanel opened.decision == Just ( ua, { refuseDraft = Draft.empty, refuseError = Nothing } )
+        && Queue.openPanel drafted.decision == Just ( ua, { refuseDraft = Draft.draft "needs a test", refuseError = Nothing } )
         && movedAway.selected == 1
         && Queue.openPanel movedAway.decision == Nothing
         && nextPage.queueState == Loading
@@ -469,7 +471,7 @@ refusalPanelOnlyOnOfferedRow settings a b =
         && Queue.openPanel reading.decision /= Nothing
         && Queue.decidableSource ua readWithheld.selectedView == Nothing
         && Queue.openPanel readWithheld.decision == Nothing
-        && Queue.openPanel readShown.decision == Just ( ua, { refuseDraft = "needs a test", refuseError = Nothing } )
+        && Queue.openPanel readShown.decision == Just ( ua, { refuseDraft = Draft.draft "needs a test", refuseError = Nothing } )
         && after settings [ RefuseSubmit ub ] drafted == drafted
         && after settings [ RefuseRefusalSubmit ua ] drafted == drafted
         && after settings [ RefuseDraft ub "elsewhere" ] drafted == drafted
@@ -507,7 +509,7 @@ staleDecisionTakesNoSlot settings a b =
             queueModel [ a, b ] (ViewShown a)
 
         draft =
-            { refuseDraft = "needs a test", refuseError = Nothing }
+            { refuseDraft = Draft.draft "needs a test", refuseError = Nothing }
 
         drafted =
             after settings [ RefuseStart ua, RefuseDraft ua "needs a test" ] shown
@@ -635,7 +637,7 @@ foreignDecisionIsIdle settings otherEpoch a b =
         && entered.decision == DecisionIdle PanelClosed
         && ownEntered.decision == DecisionRefreshing ub settings.epoch
         && approved.decision == DecisionSaving ua settings.epoch
-        && Queue.openPanel opened.decision == Just ( ua, { refuseDraft = "", refuseError = Nothing } )
+        && Queue.openPanel opened.decision == Just ( ua, { refuseDraft = Draft.empty, refuseError = Nothing } )
         && refused.decision == DecisionSaving ua settings.epoch
         && Queue.openPanel refused.decision == Nothing
         && foreignResult.decision == DecisionSaving ua settings.epoch
@@ -1141,11 +1143,11 @@ standingLoadFailureTyped settings a =
         && not (String.contains lead (page succeeded))
 
 
--- A blank or over-long refusal draft stays open as a typed case, its panel
--- the case's fixed text; a reason within the ceiling starts the decision,
--- which closes the panel, so the row shows the pending state alone. Red if
--- a refused draft starts a decision or shows any other text, or a started
--- decision leaves the panel drawn.
+-- A blank refusal draft stays open as a typed case, its panel the case's
+-- fixed text; a reason within the ceiling starts the decision, which closes
+-- the panel, so the row shows the pending state alone. Red if a refused
+-- draft starts a decision or shows any other text, or a started decision
+-- leaves the panel drawn.
 refuseDraftTyped : Settings.AppSettings -> Index.UnitView -> Index.UnitView -> Bool
 refuseDraftTyped settings a b =
     let
@@ -1161,29 +1163,192 @@ refuseDraftTyped settings a b =
         blank =
             submit "   "
 
-        overChars =
-            LibDb.reasonMaxChars + 1
-
-        overlong =
-            submit (String.repeat overChars "x")
-
-        overlongCase =
-            DraftRefused (ReasonOverlong { chars = overChars, limit = LibDb.reasonMaxChars })
-
         kept =
             submit "needs a test"
 
         idleOpen draft =
             Maybe.map (\row -> DecisionIdle (PanelOpen row draft)) (App.decidableRow shown ua)
     in
-    Just blank.decision == idleOpen { refuseDraft = "   ", refuseError = Just (DraftRefused ReasonBlank) }
+    Just blank.decision == idleOpen { refuseDraft = Draft.draft "   ", refuseError = Just (DraftRefused ReasonBlank) }
         && String.contains (Failure.refuseFailureText (DraftRefused ReasonBlank)) (page blank)
-        && Just overlong.decision == idleOpen { refuseDraft = String.repeat overChars "x", refuseError = Just overlongCase }
-        && String.contains (Failure.refuseFailureText overlongCase) (page overlong)
         && kept.decision == DecisionSaving ua settings.epoch
         && Queue.openPanel kept.decision == Nothing
         && String.contains "Saving the decision…" (page kept)
         && not (panelDrawn (page kept))
+
+
+-- ── the bounded refusal draft ───────────────────────────────────────
+-- The model and page after the reviewer types `text` into the refusal panel
+-- open on `a`'s card.
+typedDraft : Settings.AppSettings -> Index.UnitView -> Index.UnitView -> String -> Model
+typedDraft settings a b text =
+    after settings [ RefuseStart a.unit.uid, RefuseDraft a.unit.uid text ] (queueModel [ a, b ] (ViewShown a))
+
+
+-- The open panel's draft as the model holds it.
+heldDraft : Model -> Maybe Queue.Draft
+heldDraft model =
+    Maybe.map (\( _, draft ) -> draft) (Queue.openPanel model.decision)
+
+
+-- The cut notice for a text of `chars` code points.
+cutNotice : Int -> RefuseFailure
+cutNotice chars =
+    DraftRefused (ReasonOverlong { chars = chars, limit = LibDb.reasonMaxChars })
+
+
+-- The panel's notice, drawn on the page and held by the model.
+noticeDrawn : RefuseFailure -> Model -> Bool
+noticeDrawn failure model =
+    Maybe.andThen (\draft -> draft.refuseError) (heldDraft model) == Just failure
+        && String.contains (Html.escapeHtml (Failure.refuseFailureText failure)) (page model)
+
+
+-- No refusal notice of either kind is drawn or held.
+noNotice : Model -> Bool
+noNotice model =
+    Maybe.andThen (\draft -> draft.refuseError) (heldDraft model) == Nothing
+        && not (String.contains "the rest was cut" (page model))
+        && not (String.contains (Failure.refuseFailureText (DraftRefused ReasonBlank)) (page model))
+
+
+heldText : Model -> Maybe String
+heldText model =
+    Maybe.map (\draft -> Draft.draftText draft.refuseDraft) (heldDraft model)
+
+
+-- The reason input as the page draws it: the `<input` tag's own attributes.
+reasonInputTag : String -> String
+reasonInputTag html =
+    case String.split "<input" html of
+        _ :: rest :: _ ->
+            Maybe.withDefault rest (List.head (String.split ">" rest))
+
+        _ ->
+            ""
+
+
+-- A draft of exactly `reasonMaxChars` characters is held and shown whole,
+-- with no notice. Red if the bound cuts at or under the limit.
+draftAtLimitKept : Settings.AppSettings -> Index.UnitView -> Index.UnitView -> Bool
+draftAtLimitKept settings a b =
+    let
+        atLimit =
+            String.repeat LibDb.reasonMaxChars "x"
+
+        typed =
+            typedDraft settings a b atLimit
+    in
+    heldText typed == Just atLimit
+        && String.contains ("value=\"" ++ atLimit ++ "\"") (reasonInputTag (page typed))
+        && noNotice typed
+
+
+-- A draft one character past the limit is cut to the limit on the edit
+-- itself, and the panel says so with the length it had, before any Confirm;
+-- the next edit back under the limit clears the notice. Red if the draft is
+-- held whole, or the cut is said only at Confirm or never.
+draftPastLimitCutWithNotice : Settings.AppSettings -> Index.UnitView -> Index.UnitView -> Bool
+draftPastLimitCutWithNotice settings a b =
+    let
+        atLimit =
+            String.repeat LibDb.reasonMaxChars "x"
+
+        typed =
+            typedDraft settings a b (atLimit ++ "y")
+
+        shortened =
+            after settings [ RefuseDraft a.unit.uid "needs a test" ] typed
+    in
+    heldText typed == Just atLimit
+        && noticeDrawn (cutNotice (LibDb.reasonMaxChars + 1)) typed
+        && String.contains ("value=\"" ++ atLimit ++ "\"") (reasonInputTag (page typed))
+        && not (String.contains (atLimit ++ "y") (page typed))
+        && heldText shortened == Just "needs a test"
+        && noNotice shortened
+
+
+-- A draft of 5 MiB is held as the limit's first characters, the page draws
+-- no more of it, and the notice names its full length. Red if any layer
+-- holds or draws a draft past the limit.
+hugeDraftBounded : Settings.AppSettings -> Index.UnitView -> Index.UnitView -> Bool
+hugeDraftBounded settings a b =
+    let
+        hugeChars =
+            5 * 1024 * 1024
+
+        typed =
+            typedDraft settings a b (String.repeat hugeChars "z")
+    in
+    Maybe.map String.length (heldText typed) == Just LibDb.reasonMaxChars
+        && noticeDrawn (cutNotice hugeChars) typed
+        && not (String.contains (String.repeat (LibDb.reasonMaxChars + 1) "z") (page typed))
+
+
+-- A reason of `reasonMaxChars` characters outside the Basic Multilingual
+-- Plane, two UTF-16 units each, is held whole with no notice, and the
+-- input's `maxlength`, which counts UTF-16 units, admits all of it. Red if
+-- the page bound or the draft bound counts units where the reason limit
+-- counts characters.
+astralDraftWithinMaxlength : Settings.AppSettings -> Index.UnitView -> Index.UnitView -> Bool
+astralDraftWithinMaxlength settings a b =
+    let
+        astral =
+            String.repeat LibDb.reasonMaxChars "😀"
+
+        typed =
+            typedDraft settings a b astral
+    in
+    String.length astral == LibDb.reasonMaxChars
+        && heldText typed == Just astral
+        && noNotice typed
+        && Draft.inputMaxUnits >= 2 * String.length astral
+
+
+-- The reason input carries a `maxlength` of two UTF-16 units per character
+-- of the reason limit, derived from the one limit. Red if the page bound is
+-- dropped, or drifts from `reasonMaxChars`.
+refusePanelMaxlengthFromSsot : Settings.AppSettings -> Index.UnitView -> Index.UnitView -> Bool
+refusePanelMaxlengthFromSsot settings a b =
+    let
+        tag =
+            reasonInputTag (page (typedDraft settings a b "needs a test"))
+    in
+    Draft.inputMaxUnits == 2 * LibDb.reasonMaxChars
+        && String.contains ("maxlength=\"" ++ String.fromInt (2 * LibDb.reasonMaxChars) ++ "\"") tag
+        && String.contains "value=\"needs a test\"" tag
+
+
+-- Confirm after a cut records the reason the panel shows: the decision
+-- starts, and the reason it parses is exactly the kept text. Red if Confirm
+-- refuses the shown text, or records more or other than it.
+confirmRecordsShownText : Settings.AppSettings -> Index.UnitView -> Index.UnitView -> Bool
+confirmRecordsShownText settings a b =
+    let
+        atLimit =
+            String.repeat LibDb.reasonMaxChars "x"
+
+        typed =
+            typedDraft settings a b (atLimit ++ "tail past the limit")
+
+        confirmed =
+            after settings [ RefuseSubmit a.unit.uid ] typed
+
+        recorded =
+            Maybe.map (\draft -> Draft.draftReason draft.refuseDraft) (heldDraft typed)
+    in
+    String.contains ("value=\"" ++ atLimit ++ "\"") (reasonInputTag (page typed))
+        && (case recorded of
+                Just (Ok reason) ->
+                    SafeText.toString (LibDb.reasonText reason) == atLimit
+
+                Just (Err _) ->
+                    False
+
+                Nothing ->
+                    False
+           )
+        && confirmed.decision == DecisionSaving a.unit.uid settings.epoch
 
 
 -- A decision on a unit off the shown queue page is refused as `NotQueued`,
@@ -1545,7 +1710,7 @@ enteredOnFile settings listed =
             after settings [ KeyDown "Enter" ] drafted
     in
     Maybe.map Queue.rowTarget (App.decidableRow listed file) == Just OnRefusal
-        && Queue.openPanel drafted.decision == Just ( file, { refuseDraft = "not ours", refuseError = Nothing } )
+        && Queue.openPanel drafted.decision == Just ( file, { refuseDraft = Draft.draft "not ours", refuseError = Nothing } )
         && entered.decision == DecisionSaving file settings.epoch
         && Queue.openPanel entered.decision == Nothing
 
@@ -1575,6 +1740,12 @@ seededChecks =
             , ( "a failed unit-page read is a typed case whose page holds no error text", unitLoadFailureTyped settings a )
             , ( "a failed standing read is a typed case whose page holds no error text", standingLoadFailureTyped settings a )
             , ( "a refused refusal draft is a typed case with a fixed text", refuseDraftTyped settings a b )
+            , ( "a refusal draft at the reason limit is held and shown whole with no notice", draftAtLimitKept settings a b )
+            , ( "a refusal draft past the reason limit is cut on the edit and the panel says so", draftPastLimitCutWithNotice settings a b )
+            , ( "a 5 MiB refusal draft is held and drawn only to the reason limit", hugeDraftBounded settings a b )
+            , ( "a reason of astral characters at the limit fits the draft and the input maxlength", astralDraftWithinMaxlength settings a b )
+            , ( "the reason input's maxlength derives from the reason limit", refusePanelMaxlengthFromSsot settings a b )
+            , ( "Confirm after a cut records exactly the shown text", confirmRecordsShownText settings a b )
             ]
         )
         |> Task.andThen (\rows -> writtenChecks |> Task.map (\written -> rows ++ written))
