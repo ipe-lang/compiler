@@ -157,9 +157,10 @@ pub fn offset_to_position(text: &str, byte: usize, encoding: PositionEncoding) -
     line_and_column(text, floor_position_boundary(text, byte), encoding)
 }
 
-/// Convert an LSP position to a byte offset into `text`. A line past the end
-/// of the file clamps to `text.len()`; a character past the end of its line
-/// clamps to the end of that line (before its line break).
+/// Convert an LSP position to a byte offset into `text`.
+///
+/// A line past the end of the file clamps to `text.len()`; a character past
+/// the end of its line clamps to the end of that line (before its line break).
 #[must_use]
 pub fn position_to_offset(text: &str, position: Position, encoding: PositionEncoding) -> usize {
     let mut line_start = 0usize;
