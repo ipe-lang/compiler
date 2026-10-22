@@ -29,7 +29,8 @@ module Main exposing (main)
 -- root without `autofocus`, so focus stays on the body at load; one holding
 -- `tick` arms the timer from the start. Picking a file in `pick` adds the
 -- `autofocus` field `fileask` once the file is read. `q` toggles `autofocus`
--- on the element `flag` already on screen.
+-- on the element `flag` already on screen. `z` adds a second row to the table
+-- body `tb`.
 --
 -- Co-located, no capabilities, no JS ports.
 
@@ -63,6 +64,7 @@ type alias Model =
     , loadAuto : Bool
     , picked : Bool
     , flag : Bool
+    , tableRow : Bool
     }
 
 
@@ -85,7 +87,7 @@ type Msg
 
 init : WebReq -> ( Model, Cmd.Cmd Msg )
 init req =
-    ( { keys = "", row = False, drop = True, note = "", swapped = False, pressed = False, deep = False, tagSwapped = False, hostRow = False, formDrop = True, mathRow = False, ask = False, answer = "", ticking = String.contains "tick" req.query, subAsk = False, loadAuto = not (String.contains "noauto" req.query), picked = False, flag = False }, Cmd.none )
+    ( { keys = "", row = False, drop = True, note = "", swapped = False, pressed = False, deep = False, tagSwapped = False, hostRow = False, formDrop = True, mathRow = False, ask = False, answer = "", ticking = String.contains "tick" req.query, subAsk = False, loadAuto = not (String.contains "noauto" req.query), picked = False, flag = False, tableRow = False }, Cmd.none )
 
 
 update : Msg -> Model -> ( Model, Cmd.Cmd Msg )
@@ -106,6 +108,9 @@ update msg model =
 
             else if key == "q" then
                 ( { model | keys = key, flag = not model.flag }, Cmd.none )
+
+            else if key == "z" then
+                ( { model | keys = key, tableRow = not model.tableRow }, Cmd.none )
 
             else
                 ( { model | keys = key }, Cmd.none )
@@ -393,6 +398,16 @@ flagAttrs on =
         []
 
 
+-- The body's second row while `on`: the client swaps the body's children.
+tableRows : Bool -> List (Html.Html Msg)
+tableRows on =
+    if on then
+        [ Html.node "tr" [] [ Html.node "td" [ Attr.id "two" ] [ Html.text "two" ] ] ]
+
+    else
+        []
+
+
 -- The root's `autofocus` unless the page loaded with `noauto`.
 rootAutofocus : Model -> List (Ui.Attribute Msg)
 rootAutofocus model =
@@ -473,6 +488,18 @@ view model =
                 :: askPanel model.picked "fileask" model
             )
         , Ui.el (Ui.id "flag" :: flagAttrs model.flag) (Ui.text "flag")
+        , Ui.html
+            (Html.node
+                "table"
+                [ Attr.id "table" ]
+                [ Html.node
+                    "tbody"
+                    [ Attr.id "tb" ]
+                    (Html.node "tr" [] [ Html.node "td" [ Attr.id "one" ] [ Html.text "one" ] ]
+                        :: tableRows model.tableRow
+                    )
+                ]
+            )
         ]
 
 

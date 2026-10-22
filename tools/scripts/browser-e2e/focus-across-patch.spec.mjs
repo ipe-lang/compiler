@@ -304,7 +304,48 @@ test("focus-across-patch: a form's content is parsed in the HTML namespace", asy
     const t = __ipeParseFor(document.getElementById("form"), "<i>x</i>");
     return t instanceof Element ? t.tagName : "fragment";
   });
-  expect(holder).toBe("DIV");
+  // The holder is a form: the markup is parsed in the form's own context.
+  expect(holder).toBe("FORM");
+});
+
+test("focus-across-patch: a table body's content is parsed in the table body's context", async ({ page }) => {
+  // Reverted to a `div` holder, the parser drops the row and cell tags and
+  // keeps only their text.
+  await open(page);
+  const parsed = await page.evaluate(() => {
+    const t = __ipeParseFor(document.getElementById("tb"), "<tr><td id='p'>x</td></tr>");
+    const cell = t.querySelector("td#p");
+    return cell ? cell.parentElement.tagName : "lost";
+  });
+  expect(parsed).toBe("TR");
+});
+
+test("focus-across-patch: a row added to a table body keeps its row and cell", async ({ page }) => {
+  await open(page);
+  await expect.poll(() => focusedId(page)).toBe("root");
+  await page.keyboard.press("z");
+  await expect(page.locator("#keys")).toHaveText("keys: z");
+  await expect(page.locator("#tb > tr")).toHaveCount(2);
+  await expect(page.locator("#tb > tr > td#two")).toHaveText("two");
+  await expect(page.locator("#tb > tr > td#one")).toHaveText("one");
+});
+
+test("focus-across-patch: a template's content is parsed into its inert content", async ({ page }) => {
+  await open(page);
+  const placed = await page.evaluate(() => {
+    const host = document.createElement("template");
+    document.getElementById("ipe-root").appendChild(host);
+    __ipeReplaceHTMLPreservingFocus(host, "<tr><td id='tp' autofocus>x</td></tr>");
+    const cell = host.content.querySelector("td#tp");
+    const out = {
+      children: host.childNodes.length,
+      row: cell ? cell.parentElement.tagName : "lost",
+      autofocus: cell ? cell.hasAttribute("autofocus") : true,
+    };
+    host.remove();
+    return out;
+  });
+  expect(placed).toEqual({ children: 0, row: "TR", autofocus: false });
 });
 
 test("focus-across-patch: a script inside a form is revived", async ({ page }) => {

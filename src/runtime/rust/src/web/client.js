@@ -11,6 +11,8 @@ function __ipeDocProp(doc, name) {
   var d = Object.getOwnPropertyDescriptor(Document.prototype, name);
   return d && d.get ? d.get.call(doc) : null;
 }
+// The HTML namespace.
+var __IPE_HTML_NS = "http://www.w3.org/1999/xhtml";
 // The document members the client reads, bound from the prototypes before any
 // page content is consulted. A document's named properties (an `img`, `form`,
 // `embed`, `object` or `iframe` with that `name`) shadow its built-in members
@@ -71,6 +73,8 @@ var __ipeNode = (function() {
   var removeChild = own(Node.prototype.removeChild);
   var appendChild = own(Node.prototype.appendChild);
   var replaceChild = own(Node.prototype.replaceChild);
+  var query = own(Element.prototype.querySelector);
+  var fragmentQuery = own(DocumentFragment.prototype.querySelector);
   var queryAll = own(Element.prototype.querySelectorAll);
   var fragmentQueryAll = own(DocumentFragment.prototype.querySelectorAll);
   var on = own(EventTarget.prototype.addEventListener);
@@ -84,6 +88,9 @@ var __ipeNode = (function() {
   var previousElementSibling = getter(Element.prototype, "previousElementSibling");
   var tagName = getter(Element.prototype, "tagName");
   var namespaceURI = getter(Element.prototype, "namespaceURI");
+  var localName = getter(Element.prototype, "localName");
+  var templateContent = typeof HTMLTemplateElement === "function"
+      ? getter(HTMLTemplateElement.prototype, "content") : missing;
   var closest = own(Element.prototype.closest);
   // `focus()` per element interface: HTML, SVG and MathML elements are every
   // element that has one. An interface the browser lacks is left out.
@@ -118,6 +125,17 @@ var __ipeNode = (function() {
     setText: function(el, text) { textContent.call(el, text); },
     tag: function(el) { return tagName.call(el); },
     ns: function(el) { return namespaceURI.call(el); },
+    local: function(el) { return localName.call(el); },
+    // A template's inert content fragment.
+    content: function(el) { return templateContent.call(el); },
+    // The first, or every, match below the detached holder `tmp` (an element
+    // or a fragment).
+    queryIn: function(tmp, sel) {
+      return (tmp instanceof DocumentFragment ? fragmentQuery : query).call(tmp, sel);
+    },
+    queryAllIn: function(tmp, sel) {
+      return (tmp instanceof DocumentFragment ? fragmentQueryAll : queryAll).call(tmp, sel);
+    },
     // The child-element indices leading from `root` down to `el`; null when
     // `el` is not below `root`.
     pathFrom: function(root, el) {
@@ -151,8 +169,7 @@ var __ipeNode = (function() {
     // Removes `autofocus` from every element below the detached holder `tmp`
     // (an element or a fragment), returning them in document order.
     stripAutofocus: function(tmp) {
-      var query = tmp instanceof DocumentFragment ? fragmentQueryAll : queryAll;
-      var found = query.call(tmp, "[autofocus]");
+      var found = (tmp instanceof DocumentFragment ? fragmentQueryAll : queryAll).call(tmp, "[autofocus]");
       var stripped = [];
       for (var i = 0; i < found.length; i++) {
         removeAttribute.call(found[i], "autofocus");
@@ -633,13 +650,13 @@ function __ipeCssString(s) {
 function __ipeFindPlaceholder(tmp, live) {
   var sid = live.getAttribute && live.getAttribute("ipe-id");
   if (sid) {
-    var bySid = tmp.querySelector("[ipe-id=" + __ipeCssString(sid) + "]");
+    var bySid = __ipeNode.queryIn(tmp, "[ipe-id=" + __ipeCssString(sid) + "]");
     if (bySid) return bySid;
   }
   var name = live.getAttribute && live.getAttribute("name");
   if (!name) return null;
   var tag = live.tagName.toLowerCase();
-  var matches = tmp.querySelectorAll(tag + "[name=" + __ipeCssString(name) + "]");
+  var matches = __ipeNode.queryAllIn(tmp, tag + "[name=" + __ipeCssString(name) + "]");
   if (matches.length === 1) return matches[0];
   return null;
 }
@@ -657,11 +674,32 @@ function __ipeFindPlaceholder(tmp, live) {
 // call; __ipePatch (full body) takes the two steps apart to pick the page
 // shell's root out of its one parse.
 function __ipeReplaceHTMLPreservingFocus(container, newHTML) {
-  __ipeSwapPreservingFocus(container, __ipeParseFor(container, newHTML));
+  var parsed = __ipeParseFor(container, newHTML);
+  if (__ipeIsTemplate(container)) {
+    // A template's markup lives in its inert content, never in the document:
+    // no field or focus is there to keep.
+    var content = __ipeNode.content(container);
+    var gone;
+    while ((gone = __ipeNode.firstChild(content))) __ipeNode.removeChild(content, gone);
+    var moved;
+    while ((moved = __ipeNode.firstChild(parsed))) __ipeNode.append(content, moved);
+    return;
+  }
+  __ipeSwapPreservingFocus(container, parsed);
 }
 
-// `html` parsed into a detached holder in `container`'s namespace, by the
-// document's own parser: scripting is on, as for the markup it replaces.
+function __ipeIsTemplate(el) {
+  return __ipeNode.ns(el) === __IPE_HTML_NS && __ipeNode.local(el) === "template";
+}
+
+// `html` parsed into a detached holder in `container`'s namespace and context,
+// by the document's own parser: scripting is on, as for the markup it
+// replaces. An HTML holder is an element of `container`'s own tag, so the
+// parser reads the markup in the insertion mode `container` sets (a `<tr>`
+// below a `<tbody>`, an `<option>` below a `<select>`, text below a
+// `<textarea>`); a `div` would drop the table tags and keep only their text.
+// A custom element's name would run its constructor on the holder, so it gets
+// a `div`; a template's markup is parsed into a template's inert content.
 // Every `autofocus` attribute is removed before the holder's nodes connect:
 // the browser focuses an autofocus element on insertion while focus is on the
 // body, so a render the user did not cause would move focus. The runtime moves
@@ -696,13 +734,15 @@ function __ipeParseFor(container, html, stripped) {
   // inline-SVG icon <path> children are the common victims.
   var tmp;
   var ns = __ipeNode.ns(container);
-  if (ns && ns !== "http://www.w3.org/1999/xhtml") {
+  if (ns && ns !== __IPE_HTML_NS) {
     var range = __ipeDoc.range();
     range.selectNodeContents(container);
     tmp = range.createContextualFragment(html);
   } else {
-    tmp = __ipeDoc.create("div");
-    tmp.innerHTML = html;
+    var local = __ipeNode.local(container);
+    var holder = __ipeDoc.create(local.indexOf("-") >= 0 ? "div" : local);
+    holder.innerHTML = html;
+    tmp = __ipeIsTemplate(container) ? __ipeNode.content(holder) : holder;
   }
   var found = __ipeNode.stripAutofocus(tmp);
   if (stripped) for (var i = 0; i < found.length; i++) stripped.push(found[i]);
