@@ -7,8 +7,9 @@
 //! it runs — is gated behind `IPE_E2E_STATIC=1` (it needs the musl target, a
 //! musl-capable C compiler, and a cold multi-minute dependency build).
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 use ipe::{BuildOptions, CliError, RootFixture, build_fixture_with_options, build_plan};
 use ipe_backend_rust::static_build::{
@@ -474,17 +475,30 @@ fn tls_stays_rustls_with_bundled_roots_in_every_manifest_source() {
         }
     }
 
-    // The reqwest dep line itself: rustls backend, default features off (the
-    // default feature set would pull no TLS at all — `rustls-tls` bundles
-    // webpki-roots, keeping cert verification host-independent).
-    //
-    // `reqwest` is only linked when a program reaches the outbound HTTP surface,
-    // so it is NOT in the base `tests/golden/basics/Cargo.toml` (a pure
-    // hello-world). The canonical `reqwest` dep line lives in
-    // `src/runtime/rust/Cargo.toml` (the vendored source); the emitter's
-    // `http_client_cargo_toml` reproduces the same rustls feature set (its
-    // `"rustls-tls"` literal is covered by the forbidden-backend scan above,
-    // which includes `project.rs`).
+    // The emitter renders every TLS-capable line from its `crate_specs` pin, so
+    // the pins carry the rustls arm with defaults off and no native backend;
+    // `pin_drift` holds the runtime lines to the same pins.
+    for (pin, arm) in [
+        (ipe_backend_rust::crate_specs::REQWEST, "rustls-tls"),
+        (ipe_backend_rust::crate_specs::LETTRE, "tokio1-rustls-tls"),
+    ] {
+        assert!(
+            !pin.default_features && pin.features.contains(&arm),
+            "{}: must be default-features = false + {arm}",
+            pin.dependency_line(&[])
+        );
+    }
+    for pin in ipe_backend_rust::crate_specs::ALL_PINNED {
+        for feature in pin.features {
+            assert!(
+                ["native-tls", "openssl", "native-roots"]
+                    .iter()
+                    .all(|native| !feature.contains(native)),
+                "{}: native TLS feature {feature:?}",
+                pin.spec.name
+            );
+        }
+    }
     {
         let path = root.join("src/runtime/rust/Cargo.toml");
         let text = read(&path);
@@ -530,11 +544,21 @@ enum ManifestViolation {
     SqlxFeatures(BTreeSet<String>),
     /// The pre-0.9 `runtime-tokio-rustls` arm, which pins webpki-roots 0.x.
     LegacySqlxArm,
-    /// A `tokio-tungstenite` TLS or root-store feature: the runtime owns TLS.
-    TungsteniteTls(String),
-    /// The wide `sqlite` driver, which also enables deserialize,
-    /// load-extension and unlock-notify.
-    WideSqliteDriver(String),
+    /// A pinned crate under another key, which hides it from the checks.
+    PinRenamed { krate: &'static str, key: String },
+    /// A pinned crate inherited from a workspace table no check reads.
+    PinInherited { krate: &'static str, table: String },
+    /// A pinned crate with defaults on where the pin turns them off.
+    PinDefaultsOn { krate: &'static str, table: String },
+    /// A pinned crate feature outside the pin, on any dependency table.
+    PinFeatureNotAdmitted {
+        krate: &'static str,
+        table: String,
+        feature: String,
+    },
+    /// A `[features]` entry enabling a pinned crate feature outside the pin
+    /// (for `sqlx`, outside [`ipe_backend_rust::crate_specs::SQLX_DRIVERS`]).
+    FeatureEntryNotAdmitted(String),
 }
 
 /// The feature names a dependency table enables, or none.
@@ -570,35 +594,105 @@ fn sqlx_violations(sqlx: Option<&toml::Value>) -> Vec<ManifestViolation> {
     found
 }
 
-/// Every legacy TLS arm `text` (a runtime `Cargo.toml`) admits: the sqlx line
-/// is exactly the SSOT set with defaults off, tungstenite carries no TLS or
-/// root-store feature (on its line or through a `[features]` entry), no
-/// effective line names `runtime-tokio-rustls`, and no feature enables the
-/// wide sqlite driver.
+/// Every dependency table of a manifest, named by its TOML path.
+///
+/// The three top-level kinds and the same three under each `target.<cfg>`.
+fn dependency_tables(table: &toml::Table) -> Vec<(String, &toml::Table)> {
+    const KINDS: [&str; 3] = ["dependencies", "dev-dependencies", "build-dependencies"];
+    let mut tables = Vec::new();
+    for kind in KINDS {
+        if let Some(deps) = table.get(kind).and_then(toml::Value::as_table) {
+            tables.push((kind.to_owned(), deps));
+        }
+    }
+    let targets = table
+        .get("target")
+        .and_then(toml::Value::as_table)
+        .into_iter()
+        .flatten();
+    for (cfg, target) in targets {
+        for kind in KINDS {
+            if let Some(deps) = target.get(kind).and_then(toml::Value::as_table) {
+                tables.push((format!("target.{cfg}.{kind}"), deps));
+            }
+        }
+    }
+    tables
+}
+
+/// The pin naming `krate`, if any.
+fn pin_of(krate: &str) -> Option<&'static ipe_backend_rust::crate_specs::PinnedCrate> {
+    ipe_backend_rust::crate_specs::ALL_PINNED
+        .iter()
+        .find(|pin| pin.spec.name == krate)
+}
+
+/// How one occurrence of a pinned crate widens its pin.
+fn pin_occurrence_violations(
+    pin: &'static ipe_backend_rust::crate_specs::PinnedCrate,
+    table: &str,
+    dep: &toml::Value,
+) -> Vec<ManifestViolation> {
+    let krate = pin.spec.name;
+    let mut found = Vec::new();
+    if dep.get("workspace").is_some() {
+        found.push(ManifestViolation::PinInherited {
+            krate,
+            table: table.to_owned(),
+        });
+    }
+    if !pin.default_features
+        && dep.get("default-features").and_then(toml::Value::as_bool) != Some(false)
+    {
+        found.push(ManifestViolation::PinDefaultsOn {
+            krate,
+            table: table.to_owned(),
+        });
+    }
+    for feature in dep_features(dep) {
+        if !pin.features.contains(&feature.as_str()) {
+            found.push(ManifestViolation::PinFeatureNotAdmitted {
+                krate,
+                table: table.to_owned(),
+                feature,
+            });
+        }
+    }
+    found
+}
+
+/// Every legacy TLS arm `text` (a runtime `Cargo.toml`) admits.
+///
+/// The checks admit a closed set rather than refuse spellings: the `[dependencies]` sqlx
+/// line is exactly the SSOT set with defaults off; every occurrence of a
+/// pinned crate, in every dependency table including `target.<cfg>` ones,
+/// keeps the pin's defaults and enables only pin features, under its own
+/// name; every `[features]` entry naming a pinned crate enables only a pin
+/// feature (a [`ipe_backend_rust::crate_specs::SQLX_DRIVERS`] driver for
+/// sqlx); and no effective line names `runtime-tokio-rustls`.
 fn refuse_legacy_tls_manifest(text: &str) -> Vec<ManifestViolation> {
     let table = match text.parse::<toml::Table>() {
         Ok(table) => table,
         Err(error) => return vec![ManifestViolation::Unparsed(error.to_string())],
     };
-    let mut found = sqlx_violations(
-        table
-            .get("dependencies")
-            .and_then(|deps| deps.get(ipe_backend_rust::crate_specs::SQLX.spec.name)),
-    );
-    let tls_arm = |feature: &str| {
-        ["rustls", "native-tls", "webpki"]
-            .iter()
-            .any(|arm| feature.contains(arm))
-    };
-    let tungstenite = ipe_backend_rust::crate_specs::TOKIO_TUNGSTENITE.spec.name;
-    for section in ["dependencies", "dev-dependencies"] {
-        if let Some(dep) = table.get(section).and_then(|deps| deps.get(tungstenite)) {
-            for feature in dep_features(dep)
-                .into_iter()
-                .filter(|f| tls_arm(f.as_str()))
-            {
-                found.push(ManifestViolation::TungsteniteTls(feature));
+    let sqlx = ipe_backend_rust::crate_specs::SQLX.spec.name;
+    let mut found = sqlx_violations(table.get("dependencies").and_then(|deps| deps.get(sqlx)));
+    for (path, deps) in dependency_tables(&table) {
+        for (key, dep) in deps {
+            let package = dep
+                .get("package")
+                .and_then(toml::Value::as_str)
+                .unwrap_or(key.as_str());
+            let Some(pin) = pin_of(package) else {
+                continue;
+            };
+            if package != key.as_str() {
+                found.push(ManifestViolation::PinRenamed {
+                    krate: pin.spec.name,
+                    key: key.clone(),
+                });
             }
+            found.extend(pin_occurrence_violations(pin, &path, dep));
         }
     }
     let features = table
@@ -612,12 +706,16 @@ fn refuse_legacy_tls_manifest(text: &str) -> Vec<ManifestViolation> {
         let Some((krate, feature)) = entry.split_once('/') else {
             continue;
         };
-        let krate = krate.trim_end_matches('?');
-        if krate == tungstenite && tls_arm(feature) {
-            found.push(ManifestViolation::TungsteniteTls(entry.to_owned()));
-        }
-        if krate == ipe_backend_rust::crate_specs::SQLX.spec.name && feature == "sqlite" {
-            found.push(ManifestViolation::WideSqliteDriver(entry.to_owned()));
+        let Some(pin) = pin_of(krate.strip_suffix('?').unwrap_or(krate)) else {
+            continue;
+        };
+        let admitted = if pin.spec.name == sqlx {
+            ipe_backend_rust::crate_specs::SQLX_DRIVERS
+        } else {
+            pin.features
+        };
+        if !admitted.contains(&feature) {
+            found.push(ManifestViolation::FeatureEntryNotAdmitted(entry.to_owned()));
         }
     }
     let mut effective = text
@@ -629,18 +727,23 @@ fn refuse_legacy_tls_manifest(text: &str) -> Vec<ManifestViolation> {
     found
 }
 
-/// The manifest checker refuses each legacy arm on its own and accepts the
-/// real runtime manifest.
+/// The manifest checker refuses each arm outside the admitted set on its own,
+/// in any dependency table, and accepts the real runtime manifest.
 #[test]
 fn legacy_tls_manifest_arms_are_refused() {
-    let base = "[dependencies]\n\
-        sqlx = { version = \"0.9\", default-features = false, features = [\"runtime-tokio\", \"tls-rustls-ring-webpki\", \"json\"], optional = true }\n\
-        tokio-tungstenite = { version = \"0.30\", default-features = false, features = [\"handshake\"], optional = true }\n\
-        [features]\n\
-        db = [\"sqlx\", \"sqlx?/sqlite-bundled\", \"sqlx?/postgres\"]\n\
-        websocket_client = [\"tokio-tungstenite\"]\n";
+    use ipe_backend_rust::crate_specs::{RUSTLS, SQLX, TOKIO_TUNGSTENITE};
+    let base = format!(
+        "[dependencies]\n{}\n{}\n{}\n\
+         [target.'cfg(unix)'.dev-dependencies]\n\
+         [features]\n\
+         db = [\"sqlx\", \"sqlx?/sqlite-bundled\", \"sqlx?/postgres\"]\n\
+         websocket_client = [\"tokio-tungstenite\", \"tokio-tungstenite?/handshake\"]\n",
+        SQLX.dependency_line(&[]),
+        TOKIO_TUNGSTENITE.dependency_line(&[]),
+        RUSTLS.dependency_line(&[]),
+    );
     assert_eq!(
-        refuse_legacy_tls_manifest(base),
+        refuse_legacy_tls_manifest(&base),
         Vec::<ManifestViolation>::new()
     );
 
@@ -649,40 +752,138 @@ fn legacy_tls_manifest_arms_are_refused() {
         refuse_legacy_tls_manifest(&legacy_arm).contains(&ManifestViolation::LegacySqlxArm),
         "{legacy_arm}"
     );
+    let tungstenite_line = TOKIO_TUNGSTENITE.dependency_line(&[]);
     let tungstenite_roots = base.replace(
-        "[\"handshake\"]",
-        "[\"handshake\", \"rustls-tls-webpki-roots\"]",
+        &tungstenite_line,
+        &TOKIO_TUNGSTENITE.dependency_line(&["__rustls-tls"]),
     );
     assert_eq!(
         refuse_legacy_tls_manifest(&tungstenite_roots),
-        [ManifestViolation::TungsteniteTls(
-            "rustls-tls-webpki-roots".to_owned()
-        )]
+        [ManifestViolation::PinFeatureNotAdmitted {
+            krate: TOKIO_TUNGSTENITE.spec.name,
+            table: "dependencies".to_owned(),
+            feature: "__rustls-tls".to_owned(),
+        }]
     );
     let tungstenite_by_feature = base.replace(
-        "[\"tokio-tungstenite\"]",
-        "[\"tokio-tungstenite\", \"tokio-tungstenite?/native-tls\"]",
+        "\"tokio-tungstenite?/handshake\"",
+        "\"tokio-tungstenite?/handshake\", \"tokio-tungstenite?/url\"",
     );
     assert_eq!(
         refuse_legacy_tls_manifest(&tungstenite_by_feature),
-        [ManifestViolation::TungsteniteTls(
-            "tokio-tungstenite?/native-tls".to_owned()
+        [ManifestViolation::FeatureEntryNotAdmitted(
+            "tokio-tungstenite?/url".to_owned()
         )]
     );
     let wide_sqlite = base.replace("sqlx?/sqlite-bundled", "sqlx?/sqlite");
     assert_eq!(
         refuse_legacy_tls_manifest(&wide_sqlite),
-        [ManifestViolation::WideSqliteDriver(
+        [ManifestViolation::FeatureEntryNotAdmitted(
             "sqlx?/sqlite".to_owned()
         )]
     );
+    let sqlx_line_feature = base.replace("sqlx?/sqlite-bundled", "sqlx/sqlite-bundled");
+    assert_eq!(
+        refuse_legacy_tls_manifest(&sqlx_line_feature),
+        Vec::<ManifestViolation>::new()
+    );
+    let sqlx_tls_entry = base.replace(
+        "\"sqlx?/postgres\"",
+        "\"sqlx?/postgres\", \"sqlx/tls-native-tls\"",
+    );
+    assert_eq!(
+        refuse_legacy_tls_manifest(&sqlx_tls_entry),
+        [ManifestViolation::FeatureEntryNotAdmitted(
+            "sqlx/tls-native-tls".to_owned()
+        )]
+    );
     let defaults_on = base.replace(
-        "default-features = false, features = [\"runtime-tokio\"",
-        "features = [\"runtime-tokio\"",
+        &SQLX.dependency_line(&[]),
+        &SQLX
+            .dependency_line(&[])
+            .replace("default-features = false, ", ""),
     );
     assert_eq!(
         refuse_legacy_tls_manifest(&defaults_on),
-        [ManifestViolation::SqlxDefaultsOn]
+        [
+            ManifestViolation::SqlxDefaultsOn,
+            ManifestViolation::PinDefaultsOn {
+                krate: SQLX.spec.name,
+                table: "dependencies".to_owned(),
+            },
+        ]
+    );
+
+    let target_table = "target.'cfg(unix)'.dev-dependencies";
+    let target_header = format!("[{target_table}]\n");
+    let target_wide = base.replace(
+        &target_header,
+        &format!(
+            "{target_header}{}\n",
+            TOKIO_TUNGSTENITE.dependency_line(&["native-tls"])
+        ),
+    );
+    assert_eq!(
+        refuse_legacy_tls_manifest(&target_wide),
+        [ManifestViolation::PinFeatureNotAdmitted {
+            krate: TOKIO_TUNGSTENITE.spec.name,
+            table: "target.cfg(unix).dev-dependencies".to_owned(),
+            feature: "native-tls".to_owned(),
+        }]
+    );
+    let target_defaults = base.replace(
+        &target_header,
+        &format!(
+            "{target_header}{} = \"{}\"\n",
+            RUSTLS.spec.name, RUSTLS.spec.version
+        ),
+    );
+    assert_eq!(
+        refuse_legacy_tls_manifest(&target_defaults),
+        [ManifestViolation::PinDefaultsOn {
+            krate: RUSTLS.spec.name,
+            table: "target.cfg(unix).dev-dependencies".to_owned(),
+        }]
+    );
+    let build_dep = format!(
+        "{base}[build-dependencies]\n{}\n",
+        RUSTLS.dependency_line(&["aws-lc-rs"])
+    );
+    assert_eq!(
+        refuse_legacy_tls_manifest(&build_dep),
+        [ManifestViolation::PinFeatureNotAdmitted {
+            krate: RUSTLS.spec.name,
+            table: "build-dependencies".to_owned(),
+            feature: "aws-lc-rs".to_owned(),
+        }]
+    );
+    let renamed = base.replace(
+        &target_header,
+        &format!(
+            "{target_header}tls = {{ package = \"{}\", version = \"{}\", default-features = false }}\n",
+            RUSTLS.spec.name, RUSTLS.spec.version
+        ),
+    );
+    assert_eq!(
+        refuse_legacy_tls_manifest(&renamed),
+        [ManifestViolation::PinRenamed {
+            krate: RUSTLS.spec.name,
+            key: "tls".to_owned(),
+        }]
+    );
+    let inherited = base.replace(
+        &target_header,
+        &format!(
+            "{target_header}{} = {{ workspace = true, default-features = false }}\n",
+            RUSTLS.spec.name
+        ),
+    );
+    assert_eq!(
+        refuse_legacy_tls_manifest(&inherited),
+        [ManifestViolation::PinInherited {
+            krate: RUSTLS.spec.name,
+            table: "target.cfg(unix).dev-dependencies".to_owned(),
+        }]
     );
 
     let runtime_path = repo_root().join("src/runtime/rust/Cargo.toml");
@@ -712,7 +913,8 @@ struct Lock {
 enum LockScope {
     /// The lock resolves the runtime crate: walk its closure.
     WithRuntime,
-    /// The lock has no runtime crate: only the roots version is checked.
+    /// The lock has no runtime crate: only the roots version is checked,
+    /// and a runtime in it is refused.
     RootsOnly,
 }
 
@@ -729,13 +931,28 @@ enum RootsViolation {
     RuntimeAmbiguous,
     /// An edge names no package, or more than one.
     UnresolvedEdge { from: String, edge: String },
-    /// The runtime closure reaches an OS root store crate.
+    /// The runtime closure reaches an OS root store or native TLS crate.
     RuntimeReaches(String),
+    /// A lock scoped [`LockScope::RootsOnly`] resolves the runtime, whose
+    /// closure that scope never walks.
+    RuntimeInRootsOnlyLock,
 }
 
 const RUNTIME_PACKAGE: &str = "ipe-runtime-rust";
 const LEGACY_ROOTS: &str = "webpki-roots";
 const OS_ROOT_STORES: [&str; 2] = ["rustls-native-certs", "rustls-platform-verifier"];
+/// The native TLS stack and the OS trust stores it reaches.
+///
+/// Workspace tools outside the runtime lock some of these through
+/// `rustls-native-certs`, so `deny.toml` cannot ban them; the runtime closure
+/// walk refuses them.
+const NATIVE_TLS_STACK: [&str; 5] = [
+    "native-tls",
+    "openssl-sys",
+    "openssl-probe",
+    "security-framework",
+    "schannel",
+];
 
 /// Parse a `Cargo.lock` text once into typed packages.
 fn parse_lock(text: &str) -> Result<Lock, RootsViolation> {
@@ -798,9 +1015,11 @@ fn resolve_edge(lock: &Lock, from: &str, edge: &str) -> Result<usize, RootsViola
     }
 }
 
-/// No `webpki-roots` 0.x anywhere in `lock`, and, under
-/// [`LockScope::WithRuntime`], no OS root store in the runtime's dependency
-/// closure.
+/// No `webpki-roots` 0.x anywhere in `lock`, and the runtime where `scope` says.
+///
+/// Under [`LockScope::WithRuntime`] no OS root store or native TLS crate is in
+/// the runtime's dependency closure; under [`LockScope::RootsOnly`] the lock
+/// has no runtime at all.
 fn refuse_legacy_roots(lock: &Lock, scope: LockScope) -> Result<(), RootsViolation> {
     if let Some(legacy) = lock
         .packages
@@ -809,15 +1028,20 @@ fn refuse_legacy_roots(lock: &Lock, scope: LockScope) -> Result<(), RootsViolati
     {
         return Err(RootsViolation::LegacyRoots(legacy.version.clone()));
     }
-    if matches!(scope, LockScope::RootsOnly) {
-        return Ok(());
-    }
     let mut runtimes = lock
         .packages
         .iter()
         .enumerate()
         .filter(|(_, package)| package.name == RUNTIME_PACKAGE);
-    let runtime = match (runtimes.next(), runtimes.next()) {
+    let first = runtimes.next();
+    if matches!(scope, LockScope::RootsOnly) {
+        return if first.is_some() {
+            Err(RootsViolation::RuntimeInRootsOnlyLock)
+        } else {
+            Ok(())
+        };
+    }
+    let runtime = match (first, runtimes.next()) {
         (Some((at, _)), None) => at,
         (None, _) => return Err(RootsViolation::RuntimeAbsent),
         (Some(_), Some(_)) => return Err(RootsViolation::RuntimeAmbiguous),
@@ -834,7 +1058,8 @@ fn refuse_legacy_roots(lock: &Lock, scope: LockScope) -> Result<(), RootsViolati
         if let Some(mark) = seen.get_mut(at) {
             *mark = true;
         }
-        if OS_ROOT_STORES.contains(&package.name.as_str()) {
+        let name = package.name.as_str();
+        if OS_ROOT_STORES.contains(&name) || NATIVE_TLS_STACK.contains(&name) {
             return Err(RootsViolation::RuntimeReaches(package.name.clone()));
         }
         for edge in &package.dependencies {
@@ -844,14 +1069,38 @@ fn refuse_legacy_roots(lock: &Lock, scope: LockScope) -> Result<(), RootsViolati
     Ok(())
 }
 
-/// The lock assertion refuses legacy roots and an OS root store reached from
-/// the runtime, and accepts the three real repo locks.
+/// Every tracked `Cargo.lock`, repository-root-relative, as `git` lists it.
+fn tracked_locks() -> BTreeSet<String> {
+    let result = Command::new("git")
+        .arg("-C")
+        .arg(repo_root())
+        .args(["ls-files", "--", "*Cargo.lock"])
+        .output();
+    assert!(result.is_ok(), "run `git ls-files`: {result:?}");
+    let Ok(out) = result else {
+        return BTreeSet::new();
+    };
+    assert!(
+        out.status.success(),
+        "`git ls-files` failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .map(str::to_owned)
+        .collect()
+}
+
+/// The lock assertion refuses legacy roots, an OS store or native TLS crate
+/// reached from the runtime, and a runtime in a roots-only lock.
+///
+/// It accepts every tracked repo lock, each under its declared scope.
 #[test]
 fn legacy_roots_are_refused_in_every_lock() {
     let lock = |body: &str| {
         let parsed = parse_lock(&format!("version = 4\n{body}"));
         assert!(parsed.is_ok(), "fixture lock must parse: {body}");
-        parsed.unwrap_or(Lock {
+        parsed.unwrap_or_else(|_| Lock {
             packages: Vec::new(),
         })
     };
@@ -880,7 +1129,7 @@ fn legacy_roots_are_refused_in_every_lock() {
         refuse_legacy_roots(&legacy, LockScope::RootsOnly),
         Err(RootsViolation::LegacyRoots(semver::Version::new(0, 26, 11)))
     );
-    for store in OS_ROOT_STORES {
+    for store in OS_ROOT_STORES.into_iter().chain(NATIVE_TLS_STACK) {
         let reached = lock(
             &(runtime_with(store)
                 + &format!("[[package]]\nname = \"{store}\"\nversion = \"0.8.0\"\n")),
@@ -916,13 +1165,33 @@ fn legacy_roots_are_refused_in_every_lock() {
         refuse_legacy_roots(&no_runtime, LockScope::WithRuntime),
         Err(RootsViolation::RuntimeAbsent)
     );
+    assert_eq!(
+        refuse_legacy_roots(&no_runtime, LockScope::RootsOnly),
+        Ok(())
+    );
+    assert_eq!(
+        refuse_legacy_roots(&roots_1, LockScope::RootsOnly),
+        Err(RootsViolation::RuntimeInRootsOnlyLock)
+    );
 
-    for (path, scope) in [
-        ("Cargo.lock", LockScope::WithRuntime),
-        ("editors/zed-ipe/Cargo.lock", LockScope::RootsOnly),
-        ("tools/ipe-index/Cargo.lock", LockScope::RootsOnly),
-    ] {
-        let text = std::fs::read_to_string(repo_root().join(path)).unwrap_or_default();
+    let scopes = BTreeMap::from([
+        ("Cargo.lock".to_owned(), LockScope::WithRuntime),
+        (
+            "editors/zed-ipe/Cargo.lock".to_owned(),
+            LockScope::RootsOnly,
+        ),
+        (
+            "tools/ipe-index/Cargo.lock".to_owned(),
+            LockScope::RootsOnly,
+        ),
+    ]);
+    assert_eq!(
+        tracked_locks(),
+        scopes.keys().cloned().collect::<BTreeSet<_>>(),
+        "every tracked Cargo.lock needs a scope here, and only those"
+    );
+    for (path, scope) in scopes {
+        let text = std::fs::read_to_string(repo_root().join(&path)).unwrap_or_default();
         assert!(!text.is_empty(), "read {path}");
         let parsed = parse_lock(&text);
         assert!(parsed.is_ok(), "{path}: {:?}", parsed.as_ref().err());
@@ -975,9 +1244,12 @@ fn refuse_weak_roots_ban(text: &str) -> Result<(), DenyViolation> {
         .iter()
         .find(|spec| spec.starts_with(LEGACY_ROOTS))
         .ok_or(DenyViolation::EntryAbsent(LEGACY_ROOTS))?;
-    let req = match roots.split_once(':') {
-        Some((name, req)) if name == LEGACY_ROOTS => req,
-        _ => return Err(DenyViolation::NotNameColonReq(roots.clone())),
+    let Some(req) = roots
+        .split_once(':')
+        .filter(|(name, _)| *name == LEGACY_ROOTS)
+        .map(|(_, req)| req)
+    else {
+        return Err(DenyViolation::NotNameColonReq(roots.clone()));
     };
     let req = semver::VersionReq::parse(req).map_err(|_| DenyViolation::BadReq(roots.clone()))?;
     if !req.matches(&semver::Version::new(0, 26, 11)) {

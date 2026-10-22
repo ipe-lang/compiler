@@ -3027,7 +3027,7 @@ pub fn db_exec_raw<E: Send + From<String> + crate::FromIpeError + 'static>(
         // parameterisable statements go through `db_exec`/`db_query`). Int is the
         // rows-affected count. `as i64` matches the insert/update/delete sites;
         // rows-affected can never realistically exceed i64::MAX.
-        match exec_routed(&conn, sqlx::query(crate::sql_text::program_authored(sql))).await {
+        match exec_routed(&conn, sqlx::query(super::sql_text::program_authored(sql))).await {
             Ok(res) => ok_res(res.rows_affected() as i64),
             Err(e) => IpeResult::Err(ipe_err(KERNEL_ENGINE, &e)),
         }
@@ -3045,7 +3045,7 @@ pub fn db_exec<E: Send + From<String> + crate::FromIpeError + 'static>(
         // escaping; a placeholder/param count mismatch surfaces as Err.
         // `exec : ... -> Task Error Int` returns rows-affected .
         let final_sql = db_format_sql(sql);
-        let mut q = sqlx::query(crate::sql_text::program_authored(final_sql));
+        let mut q = sqlx::query(super::sql_text::program_authored(final_sql));
         for p in params {
             q = q.bind(p);
         }
@@ -3063,7 +3063,7 @@ pub fn db_query<E: Send + From<String> + crate::FromIpeError + 'static>(
 ) -> IpeTask<E, Vec<RowCells>> {
     Box::pin(async move {
         let final_sql = db_format_sql(sql);
-        let mut q = sqlx::query(crate::sql_text::program_authored(final_sql));
+        let mut q = sqlx::query(super::sql_text::program_authored(final_sql));
         for p in params {
             q = q.bind(p);
         }
@@ -3097,7 +3097,7 @@ pub fn db_exec_params<E: Send + From<String> + crate::FromIpeError + 'static>(
 ) -> IpeTask<E, i64> {
     Box::pin(async move {
         let final_sql = db_format_sql(sql);
-        let mut q = sqlx::query(crate::sql_text::program_authored(final_sql));
+        let mut q = sqlx::query(super::sql_text::program_authored(final_sql));
         for p in params {
             q = bind_sql_param(q, p);
         }
@@ -3116,7 +3116,7 @@ pub fn db_query_params<E: Send + From<String> + crate::FromIpeError + 'static>(
 ) -> IpeTask<E, Vec<RowCells>> {
     Box::pin(async move {
         let final_sql = db_format_sql(sql);
-        let mut q = sqlx::query(crate::sql_text::program_authored(final_sql));
+        let mut q = sqlx::query(super::sql_text::program_authored(final_sql));
         for p in params {
             q = bind_sql_param(q, p);
         }
@@ -3624,7 +3624,7 @@ pub fn db_insert_row<E: Send + From<String> + crate::FromIpeError + 'static>(
             // fabricated `0` — when the id column isn't integer-decodable at
             // all (non-integer/composite primary key).
             let sql = db_format_sql(format!("{} RETURNING id", base));
-            let mut q = sqlx::query(crate::sql_text::assembled(sql));
+            let mut q = sqlx::query(super::sql_text::assembled(sql));
             for k in &keys {
                 q = q.bind(row.get(*k).cloned().unwrap_or_default());
             }
@@ -3637,7 +3637,7 @@ pub fn db_insert_row<E: Send + From<String> + crate::FromIpeError + 'static>(
             }
         } else {
             let sql = db_format_sql(base);
-            let mut q = sqlx::query(crate::sql_text::assembled(sql));
+            let mut q = sqlx::query(super::sql_text::assembled(sql));
             for k in &keys {
                 q = q.bind(row.get(*k).cloned().unwrap_or_default());
             }
@@ -3668,7 +3668,7 @@ pub fn db_get_by_id<E: Send + From<String> + crate::FromIpeError + 'static>(
             "SELECT * FROM {} WHERE id = ? LIMIT 1",
             qtable.as_str()
         ));
-        match fetch_optional_routed(&conn, sqlx::query(crate::sql_text::assembled(sql)).bind(id))
+        match fetch_optional_routed(&conn, sqlx::query(super::sql_text::assembled(sql)).bind(id))
             .await
         {
             Ok(Some(r)) => raw_read(KERNEL_ENGINE, row_cells(&r).map(IpeMaybe::Just)),
@@ -3715,7 +3715,7 @@ pub fn db_update_by_id<E: Send + From<String> + crate::FromIpeError + 'static>(
             qtable.as_str(),
             sets.join(", ")
         ));
-        let mut q = sqlx::query(crate::sql_text::assembled(sql));
+        let mut q = sqlx::query(super::sql_text::assembled(sql));
         for k in &keys {
             q = q.bind(row.get(*k).cloned().unwrap_or_default());
         }
@@ -3744,7 +3744,7 @@ pub fn db_delete_by_id<E: Send + From<String> + crate::FromIpeError + 'static>(
             }
         };
         let sql = db_format_sql(format!("DELETE FROM {} WHERE id = ?", qtable.as_str()));
-        match exec_routed(&conn, sqlx::query(crate::sql_text::assembled(sql)).bind(id)).await {
+        match exec_routed(&conn, sqlx::query(super::sql_text::assembled(sql)).bind(id)).await {
             Ok(res) => ok_res(res.rows_affected() as i64),
             Err(e) => IpeResult::Err(ipe_err(KERNEL_ENGINE, &e)),
         }
@@ -3779,7 +3779,7 @@ pub fn db_find_one_by_field<E: Send + From<String> + crate::FromIpeError + 'stat
         ));
         match fetch_optional_routed(
             &conn,
-            sqlx::query(crate::sql_text::assembled(sql)).bind(value),
+            sqlx::query(super::sql_text::assembled(sql)).bind(value),
         )
         .await
         {
@@ -3818,7 +3818,7 @@ pub fn db_find_many_by_field<E: Send + From<String> + crate::FromIpeError + 'sta
         ));
         match fetch_all_routed(
             &conn,
-            sqlx::query(crate::sql_text::assembled(sql)).bind(value),
+            sqlx::query(super::sql_text::assembled(sql)).bind(value),
         )
         .await
         {
@@ -3879,7 +3879,7 @@ pub fn db_find_by_conditions<E: Send + From<String> + crate::FromIpeError + 'sta
             qtable.as_str(),
             wheres.join(" AND ")
         ));
-        let mut q = sqlx::query(crate::sql_text::assembled(sql));
+        let mut q = sqlx::query(super::sql_text::assembled(sql));
         for k in &keys {
             q = q.bind(conditions.get(*k).cloned().unwrap_or_default());
         }
@@ -3909,7 +3909,7 @@ pub fn db_query_decode<
 ) -> IpeTask<E, Vec<A>> {
     Box::pin(async move {
         let final_sql = db_format_sql(sql);
-        let mut q = sqlx::query(crate::sql_text::program_authored(final_sql));
+        let mut q = sqlx::query(super::sql_text::program_authored(final_sql));
         for p in params {
             q = q.bind(p);
         }
@@ -3949,7 +3949,7 @@ pub fn db_query_decode_params<
 ) -> IpeTask<E, Vec<A>> {
     Box::pin(async move {
         let final_sql = db_format_sql(sql);
-        let mut q = sqlx::query(crate::sql_text::program_authored(final_sql));
+        let mut q = sqlx::query(super::sql_text::program_authored(final_sql));
         for p in params {
             q = bind_sql_param(q, p);
         }
@@ -4001,7 +4001,7 @@ pub fn db_get_by_id_decode<
             "SELECT * FROM {} WHERE id = ? LIMIT 1",
             qtable.as_str()
         ));
-        match fetch_optional_routed(&conn, sqlx::query(crate::sql_text::assembled(sql)).bind(id))
+        match fetch_optional_routed(&conn, sqlx::query(super::sql_text::assembled(sql)).bind(id))
             .await
         {
             Ok(None) => ok_res(IpeMaybe::Nothing),
@@ -4906,7 +4906,7 @@ pub fn db_find_where<E: Send + From<String> + crate::FromIpeError + 'static>(
             qtable.as_str(),
             frag.sql
         ));
-        let mut q = sqlx::query(crate::sql_text::assembled(sql));
+        let mut q = sqlx::query(super::sql_text::assembled(sql));
         for p in frag.binds {
             q = bind_sql_param(q, p);
         }
@@ -4987,7 +4987,7 @@ pub fn db_find_where_masked<
             qtable.as_str(),
             frag.sql
         ));
-        let mut q = sqlx::query(crate::sql_text::assembled(sql));
+        let mut q = sqlx::query(super::sql_text::assembled(sql));
         // Projection (SELECT `?`) binds first — they precede the WHERE `?` binds.
         for p in projections {
             for b in p.binds {
@@ -5154,7 +5154,7 @@ pub fn db_find_join<E: Send + From<String> + crate::FromIpeError + 'static>(
             Ok(s) => s,
             Err(reason) => return IpeResult::Err(format!("db.findJoin: {reason}").into()),
         };
-        let mut q = sqlx::query(crate::sql_text::assembled(sql));
+        let mut q = sqlx::query(super::sql_text::assembled(sql));
         for p in frag.binds {
             q = bind_sql_param(q, p);
         }
@@ -5321,7 +5321,7 @@ pub fn db_find_projection<E: Send + From<String> + crate::FromIpeError + 'static
                 .into(),
             );
         }
-        let mut q = sqlx::query(crate::sql_text::assembled(sql));
+        let mut q = sqlx::query(super::sql_text::assembled(sql));
         // Bind literal (SELECT `?`) params first — they appear before WHERE `?` params.
         for p in extra_binds {
             q = bind_sql_param(q, p);
@@ -5380,7 +5380,7 @@ pub fn db_find_join_ordered<E: Send + From<String> + crate::FromIpeError + 'stat
             Ok(s) => s,
             Err(reason) => return IpeResult::Err(format!("db.findJoinOrdered: {reason}").into()),
         };
-        let mut q = sqlx::query(crate::sql_text::assembled(sql));
+        let mut q = sqlx::query(super::sql_text::assembled(sql));
         for p in frag.binds {
             q = bind_sql_param(q, p);
         }
@@ -5454,7 +5454,7 @@ pub fn db_find_projection_ordered<E: Send + From<String> + crate::FromIpeError +
                 .into(),
             );
         }
-        let mut q = sqlx::query(crate::sql_text::assembled(sql));
+        let mut q = sqlx::query(super::sql_text::assembled(sql));
         for p in extra_binds {
             q = bind_sql_param(q, p);
         }
@@ -5715,7 +5715,7 @@ pub fn db_delete_where<E: Send + From<String> + crate::FromIpeError + 'static>(
             qtable.as_str(),
             frag.sql
         ));
-        let mut q = sqlx::query(crate::sql_text::assembled(sql));
+        let mut q = sqlx::query(super::sql_text::assembled(sql));
         for p in frag.binds {
             q = bind_sql_param(q, p);
         }
@@ -5805,7 +5805,7 @@ pub fn db_update_where<E: Send + From<String> + crate::FromIpeError + 'static>(
             Err(e) => return IpeResult::Err(build_refusal("db.updateWhere", &e)),
         };
         let sql = db_format_sql(sql);
-        let mut q = sqlx::query(crate::sql_text::assembled(sql));
+        let mut q = sqlx::query(super::sql_text::assembled(sql));
         for p in args {
             q = bind_sql_param(q, p);
         }
@@ -5940,7 +5940,7 @@ async fn run_checked_write<E: From<String> + crate::FromIpeError + Send>(
     args: Vec<SqlParam>,
 ) -> IpeResult<E, i64> {
     let sql = db_format_sql(sql);
-    let mut q = sqlx::query(crate::sql_text::assembled(sql));
+    let mut q = sqlx::query(super::sql_text::assembled(sql));
     for p in args {
         q = bind_sql_param(q, p);
     }
@@ -6097,7 +6097,7 @@ pub fn db_conn_find_where<E: Send + From<String> + crate::FromIpeError + 'static
         match conn {
             ExternalConnection::Postgres(pool) => {
                 let sql = external_format_sql_postgres(&base);
-                let mut q = sqlx::query(crate::sql_text::assembled(sql));
+                let mut q = sqlx::query(super::sql_text::assembled(sql));
                 for p in frag.binds {
                     q = external_bind_sql_param(q, p);
                 }
@@ -6107,7 +6107,7 @@ pub fn db_conn_find_where<E: Send + From<String> + crate::FromIpeError + 'static
                 }
             }
             ExternalConnection::Sqlite(pool) => {
-                let mut q = sqlx::query(crate::sql_text::assembled(base));
+                let mut q = sqlx::query(super::sql_text::assembled(base));
                 for p in frag.binds {
                     q = external_bind_sql_param(q, p);
                 }
@@ -6140,7 +6140,7 @@ pub fn db_conn_query_decode_params<
         let rows_json: Result<Vec<JsonVal>, (DbEngine, sqlx::Error)> = match conn {
             ExternalConnection::Postgres(pool) => {
                 let final_sql = external_format_sql_postgres(&sql);
-                let mut q = sqlx::query(crate::sql_text::program_authored(final_sql));
+                let mut q = sqlx::query(super::sql_text::program_authored(final_sql));
                 for p in params {
                     q = external_bind_sql_param(q, p);
                 }
@@ -6153,7 +6153,7 @@ pub fn db_conn_query_decode_params<
                 }
             }
             ExternalConnection::Sqlite(pool) => {
-                let mut q = sqlx::query(crate::sql_text::program_authored(sql));
+                let mut q = sqlx::query(super::sql_text::program_authored(sql));
                 for p in params {
                     q = external_bind_sql_param(q, p);
                 }
@@ -6203,7 +6203,7 @@ pub fn db_conn_get_by_id<E: Send + From<String> + crate::FromIpeError + 'static>
         match conn {
             ExternalConnection::Postgres(pool) => {
                 let sql = external_format_sql_postgres(&base);
-                match sqlx::query(crate::sql_text::assembled(sql))
+                match sqlx::query(super::sql_text::assembled(sql))
                     .bind(id)
                     .fetch_optional(&pool)
                     .await
@@ -6214,7 +6214,7 @@ pub fn db_conn_get_by_id<E: Send + From<String> + crate::FromIpeError + 'static>
                 }
             }
             ExternalConnection::Sqlite(pool) => {
-                match sqlx::query(crate::sql_text::assembled(base))
+                match sqlx::query(super::sql_text::assembled(base))
                     .bind(id)
                     .fetch_optional(&pool)
                     .await
@@ -6436,7 +6436,7 @@ pub fn db_insert_fields<E: Send + From<String> + crate::FromIpeError + 'static>(
             // is a stub returning a fabricated `0` on the Postgres config
             // template — see `config_postgres.rs`).
             let sql = db_format_sql(format!("{base_sql} RETURNING id"));
-            let mut q = sqlx::query(crate::sql_text::assembled(sql));
+            let mut q = sqlx::query(super::sql_text::assembled(sql));
             for p in args {
                 q = bind_sql_param(q, p);
             }
@@ -6449,7 +6449,7 @@ pub fn db_insert_fields<E: Send + From<String> + crate::FromIpeError + 'static>(
             }
         } else {
             let sql = db_format_sql(base_sql);
-            let mut q = sqlx::query(crate::sql_text::assembled(sql));
+            let mut q = sqlx::query(super::sql_text::assembled(sql));
             for p in args {
                 q = bind_sql_param(q, p);
             }
@@ -6544,7 +6544,7 @@ pub fn db_update_fields<E: Send + From<String> + crate::FromIpeError + 'static>(
             where_clauses.join(" AND ")
         );
         let sql = db_format_sql(sql);
-        let mut q = sqlx::query(crate::sql_text::assembled(sql));
+        let mut q = sqlx::query(super::sql_text::assembled(sql));
         for p in args {
             q = bind_sql_param(q, p);
         }
@@ -6711,7 +6711,7 @@ pub fn db_upsert_fields<E: Send + From<String> + crate::FromIpeError + 'static>(
             Err(e) => return IpeResult::Err(build_refusal("db.upsertFields", &e)),
         };
         let sql = db_format_sql(sql);
-        let mut q = sqlx::query(crate::sql_text::assembled(sql));
+        let mut q = sqlx::query(super::sql_text::assembled(sql));
         for p in args {
             q = bind_sql_param(q, p);
         }
@@ -6779,7 +6779,7 @@ pub fn db_insert_fields_returning<
             );
         }
         let sql = db_format_sql(format!("{} RETURNING {}", base_sql, projection));
-        let mut q = sqlx::query(crate::sql_text::assembled(sql));
+        let mut q = sqlx::query(super::sql_text::assembled(sql));
         for p in args {
             q = bind_sql_param(q, p);
         }

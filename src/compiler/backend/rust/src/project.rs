@@ -729,11 +729,12 @@ fn assert_wasm_admissible(ctx: &EmitCtx) -> DResult<()> {
 /// The full runtime source tree is copied into the emitted project by the
 /// driver; this addition wires `db.rs` (which lives in that tree) into the
 /// module namespace so the generated `main.rs` can call the db functions.
-/// `sql_text` is the one place SQL text becomes a `sqlx` statement; `db`,
-/// `external_conn`, and the db-gated arms of `auth` and `web::hub` call it as
-/// `crate::sql_text`.
+/// `sql_text` is the one place SQL text becomes a `sqlx` statement. It stays
+/// private, as in the runtime crate: `db`, `external_conn`, and the db-gated
+/// arms of `auth` and `web::hub` reach it by a relative `super::` path, so the
+/// generated code outside `ipe_runtime` cannot name it.
 const RUNTIME_MOD_RS_DB_APPEND: &str =
-    "pub mod db;\npub use db::*;\npub mod telemetry_spill;\npub mod sql_text;\n";
+    "pub mod db;\npub use db::*;\npub mod telemetry_spill;\nmod sql_text;\n";
 
 /// Lines appended to `ipe_runtime/mod.rs` for the typed DSN descriptor and the
 /// external-connection pool when the program uses Db kernels.
@@ -4027,13 +4028,9 @@ fn server_cargo_toml(base: &str) -> DResult<String> {
     // runtime crate, so it is omitted here (the vendored module's `#[cfg(test)]`
     // blocks never compile in the app crate build).
     let server_deps = format!(
-        "{} = {{ version = \"{}\", features = [\"ws\"] }}\n\
-         {} = {{ version = \"{}\", features = [\"fs\", \"catch-panic\", \"timeout\"] }}\n\
-         {} = {{ version = \"{}\", features = [\"limit\"] }}\n\n",
-        crate_specs::AXUM.name,
-        crate_specs::AXUM.version,
-        crate_specs::TOWER_HTTP.name,
-        crate_specs::TOWER_HTTP.version,
+        "{}\n{}\n{} = {{ version = \"{}\", features = [\"limit\"] }}\n\n",
+        crate_specs::AXUM.dependency_line(&[]),
+        crate_specs::TOWER_HTTP.dependency_line(&[]),
         crate_specs::TOWER.name,
         crate_specs::TOWER.version,
     );
@@ -4573,10 +4570,8 @@ fn tea_cargo_toml(base: &str) -> DResult<String> {
 /// The dependency line is inserted before the
 /// `[target.'cfg(unix)'.dependencies]` header so it lands in the cross-platform
 /// `[dependencies]` table — `reqwest` must compile on every target, not only
-/// unix. Its feature list + `default-features = false` mirror
-/// `runtime/Cargo.toml` (the vendored source was tested against exactly that
-/// shape); the version comes from the [`crate_specs`] SSOT (drift-guarded
-/// against `runtime/Cargo.toml`).
+/// unix. The line renders from [`crate_specs::REQWEST`], drift-guarded against
+/// `runtime/Cargo.toml`.
 ///
 /// # Errors
 ///
@@ -4587,12 +4582,7 @@ fn http_client_cargo_toml(base: &str) -> DResult<String> {
     // `reqwest` joins the main, cross-platform `[dependencies]` table — never
     // the `cfg(unix)` one — and the unix comment stays attached to its header.
     const DEPS_END_ANCHOR: &str = "\n\n# Unix-only:";
-    let reqwest_dep = format!(
-        "\n{} = {{ version = \"{}\", default-features = false, \
-         features = [\"rustls-tls\", \"gzip\", \"stream\"] }}",
-        crate_specs::REQWEST.name,
-        crate_specs::REQWEST.version,
-    );
+    let reqwest_dep = format!("\n{}", crate_specs::REQWEST.dependency_line(&[]));
     let anchor_pos = base
         .find(DEPS_END_ANCHOR)
         .ok_or_else(|| Diagnostic::CompilerBug {
@@ -4741,10 +4731,8 @@ fn chrono_tz_cargo_toml(base: &str) -> DResult<String> {
 /// crate declares the `email` module through the `mod.rs` append; the `email`
 /// feature is promoted as well, mirroring the runtime crate, because the
 /// vendored `ssrf.rs` gates the dial helpers `email.rs` reaches on it.
-/// `lettre`'s feature list +
-/// `default-features = false` mirror `runtime/Cargo.toml` (the vendored source
-/// was tested against exactly that shape). The version comes from the
-/// [`crate_specs`] SSOT (drift-guarded against `runtime/Cargo.toml`).
+/// The `lettre` line renders from [`crate_specs::LETTRE`], drift-guarded
+/// against `runtime/Cargo.toml`.
 ///
 /// # Errors
 ///
@@ -4752,12 +4740,7 @@ fn chrono_tz_cargo_toml(base: &str) -> DResult<String> {
 /// a golden-drift invariant violation (fail-loud, never a silent no-op).
 fn email_cargo_toml(base: &str) -> DResult<String> {
     const PROFILE_ANCHOR: &str = "[profile.dev]";
-    let lettre_dep = format!(
-        "{} = {{ version = \"{}\", default-features = false, features = [\"builder\", \
-         \"hostname\", \"smtp-transport\", \"pool\", \"tokio1\", \"tokio1-rustls-tls\"] }}\n\n",
-        crate_specs::LETTRE.name,
-        crate_specs::LETTRE.version,
-    );
+    let lettre_dep = format!("{}\n\n", crate_specs::LETTRE.dependency_line(&[]));
     let anchor_pos = base
         .find(PROFILE_ANCHOR)
         .ok_or_else(|| Diagnostic::CompilerBug {
@@ -5066,11 +5049,7 @@ fn crypto_core_heavy_cargo_toml(base: &str) -> DResult<String> {
     // Anchor the `rsa` line to the `zeroize` base dep it originally followed, so
     // its slot in `[dependencies]` is unchanged for a crypto-using program.
     const ZEROIZE_ANCHOR: &str = "zeroize = \"1\"\n";
-    let rsa_dep = format!(
-        "{} = {{ version = \"{}\", features = [\"sha2\"] }}\n",
-        crate_specs::RSA.name,
-        crate_specs::RSA.version,
-    );
+    let rsa_dep = format!("{}\n", crate_specs::RSA.dependency_line(&[]));
 
     // Step 1 — insert `"crypto"` into the default feature list. Anchor on
     // `"tokio"` when present (keeping the `["tokio", "crypto", "json"]` order
@@ -6079,25 +6058,37 @@ mod tests {
         );
         let srv = server_cargo_toml(&async_runtime_cargo_toml(CARGO_TOML).expect("async base"))
             .expect("server_cargo_toml");
-        assert!(
-            srv.contains(&format!(
-                "{} = {{ version = \"{}\", features = [\"ws\"]",
-                crate_specs::AXUM.name,
-                crate_specs::AXUM.version
-            )),
-            "server manifest must emit SSOT axum version:\n{srv}"
-        );
+        for pinned in [crate_specs::AXUM, crate_specs::TOWER_HTTP] {
+            assert!(
+                srv.lines().any(|line| line == pinned.dependency_line(&[])),
+                "server manifest must emit the SSOT {} line:\n{srv}",
+                pinned.spec.name
+            );
+        }
         let heavy = crypto_core_heavy_cargo_toml(
             &async_runtime_cargo_toml(CARGO_TOML).expect("async base"),
         )
         .expect("crypto_core_heavy_cargo_toml");
         assert!(
-            heavy.contains(&format!(
-                "{} = {{ version = \"{}\", features = [\"sha2\"] }}",
-                crate_specs::RSA.name,
-                crate_specs::RSA.version
-            )),
-            "heavy-crypto manifest must emit the SSOT rsa version:\n{heavy}"
+            heavy
+                .lines()
+                .any(|line| line == crate_specs::RSA.dependency_line(&[])),
+            "heavy-crypto manifest must emit the SSOT rsa line:\n{heavy}"
+        );
+        let http =
+            http_client_cargo_toml(&async_runtime_cargo_toml(CARGO_TOML).expect("async base"))
+                .expect("http_client_cargo_toml");
+        assert!(
+            http.lines()
+                .any(|line| line == crate_specs::REQWEST.dependency_line(&[])),
+            "http-client manifest must emit the SSOT reqwest line:\n{http}"
+        );
+        let email = email_cargo_toml(CARGO_TOML).expect("email_cargo_toml");
+        assert!(
+            email
+                .lines()
+                .any(|line| line == crate_specs::LETTRE.dependency_line(&[])),
+            "email manifest must emit the SSOT lettre line:\n{email}"
         );
     }
 

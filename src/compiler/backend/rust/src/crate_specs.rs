@@ -83,13 +83,21 @@ pub const SQLX: PinnedCrate = PinnedCrate {
 /// load-extension and unlock-notify. Mirrors the `sqlx?/` entries of the
 /// runtime's `db` feature.
 pub const SQLX_DRIVERS: &[&str] = &["sqlite-bundled", "postgres"];
-pub const AXUM: CrateSpec = CrateSpec {
-    name: "axum",
-    version: "0.7",
+pub const AXUM: PinnedCrate = PinnedCrate {
+    spec: CrateSpec {
+        name: "axum",
+        version: "0.7",
+    },
+    default_features: true,
+    features: &["ws"],
 };
-pub const TOWER_HTTP: CrateSpec = CrateSpec {
-    name: "tower-http",
-    version: "0.5",
+pub const TOWER_HTTP: PinnedCrate = PinnedCrate {
+    spec: CrateSpec {
+        name: "tower-http",
+        version: "0.5",
+    },
+    default_features: true,
+    features: &["fs", "catch-panic", "timeout"],
 };
 // `tower` (the `limit` layer) backs the server front-door DoS ceiling:
 // `GlobalConcurrencyLimitLayer` bounds in-flight requests. The vendored server
@@ -163,9 +171,21 @@ pub const WEBPKI_ROOTS: PinnedCrate = PinnedCrate {
     default_features: true,
     features: &[],
 };
-pub const LETTRE: CrateSpec = CrateSpec {
-    name: "lettre",
-    version: "0.11",
+/// SMTP over rustls trusting `webpki-roots`, never the OS store.
+pub const LETTRE: PinnedCrate = PinnedCrate {
+    spec: CrateSpec {
+        name: "lettre",
+        version: "0.11",
+    },
+    default_features: false,
+    features: &[
+        "builder",
+        "hostname",
+        "smtp-transport",
+        "pool",
+        "tokio1",
+        "tokio1-rustls-tls",
+    ],
 };
 // `icu_casemap` and `icu_locale_core`: locale-aware case mapping behind the
 // `locale` cargo feature. The dep-model runtime pulls them transitively via
@@ -178,9 +198,15 @@ pub const ICU_LOCALE_CORE: CrateSpec = CrateSpec {
     name: "icu_locale_core",
     version: "2.2",
 };
-pub const REQWEST: CrateSpec = CrateSpec {
-    name: "reqwest",
-    version: "0.12",
+/// Defaults off, so no `default-tls` (native-tls); `rustls-tls` trusts
+/// `webpki-roots`.
+pub const REQWEST: PinnedCrate = PinnedCrate {
+    spec: CrateSpec {
+        name: "reqwest",
+        version: "0.12",
+    },
+    default_features: false,
+    features: &["rustls-tls", "gzip", "stream"],
 };
 pub const TOML: CrateSpec = CrateSpec {
     name: "toml",
@@ -237,9 +263,13 @@ pub const URL: CrateSpec = CrateSpec {
     name: "url",
     version: "2",
 };
-pub const RSA: CrateSpec = CrateSpec {
-    name: "rsa",
-    version: "0.9",
+pub const RSA: PinnedCrate = PinnedCrate {
+    spec: CrateSpec {
+        name: "rsa",
+        version: "0.9",
+    },
+    default_features: true,
+    features: &["sha2"],
 };
 pub const FUTURES_UTIL: CrateSpec = CrateSpec {
     name: "futures-util",
@@ -282,8 +312,8 @@ pub const UNICODE_GENERAL_CATEGORY: CrateSpec = CrateSpec {
 pub const ALL: &[CrateSpec] = &[
     TOKIO,
     SQLX.spec,
-    AXUM,
-    TOWER_HTTP,
+    AXUM.spec,
+    TOWER_HTTP.spec,
     TOWER,
     ASYNC_TRAIT,
     RUSTIX,
@@ -295,10 +325,10 @@ pub const ALL: &[CrateSpec] = &[
     TOKIO_RUSTLS.spec,
     RUSTLS.spec,
     WEBPKI_ROOTS.spec,
-    LETTRE,
+    LETTRE.spec,
     ICU_CASEMAP,
     ICU_LOCALE_CORE,
-    REQWEST,
+    REQWEST.spec,
     TOML,
     SERDE_SAPHYR.spec,
     FLATE2,
@@ -311,7 +341,7 @@ pub const ALL: &[CrateSpec] = &[
     PBKDF2,
     JSONWEBTOKEN,
     URL,
-    RSA,
+    RSA.spec,
     FUTURES_UTIL,
     CHRONO,
     CHRONO_TZ,
@@ -328,11 +358,19 @@ pub const ALL_PINNED: &[PinnedCrate] = &[
     RUSTLS,
     WEBPKI_ROOTS,
     SERDE_SAPHYR,
+    REQWEST,
+    LETTRE,
+    AXUM,
+    TOWER_HTTP,
+    RSA,
 ];
 
 #[cfg(test)]
 mod tests {
-    use super::{ALL, ALL_PINNED, PinnedCrate, SERDE_SAPHYR, SQLX, SQLX_DRIVERS, WEBPKI_ROOTS};
+    use super::{
+        ALL, ALL_PINNED, LETTRE, PinnedCrate, REQWEST, SERDE_SAPHYR, SQLX, SQLX_DRIVERS,
+        WEBPKI_ROOTS,
+    };
     use std::collections::{BTreeMap, BTreeSet};
     use std::path::PathBuf;
 
@@ -654,6 +692,40 @@ mod tests {
             assert!(
                 !pin_drift(&SQLX, drifted, "fixture").is_empty(),
                 "{drifted} must be reported as drift"
+            );
+        }
+    }
+
+    /// The HTTP and SMTP client lines are drift-checked.
+    ///
+    /// Each refuses an OS root store or native-tls feature, and its TLS
+    /// defaults turned on; every fixture derives from the pinned line itself.
+    #[test]
+    fn tls_client_pin_drift_is_caught() {
+        for pinned in [REQWEST, LETTRE] {
+            let name = pinned.spec.name;
+            assert!(
+                ALL_PINNED.iter().any(|entry| entry.spec.name == name),
+                "{name} must be in the drift-checked set"
+            );
+            let exact = pinned.dependency_line(&[]);
+            assert!(pin_drift(&pinned, &exact, "fixture").is_empty(), "{exact}");
+            for widening in [
+                "rustls-platform-verifier",
+                "rustls-native-certs",
+                "native-tls",
+            ] {
+                let widened = pinned.dependency_line(&[widening]);
+                assert!(
+                    !pin_drift(&pinned, &widened, "fixture").is_empty(),
+                    "{widened} must be reported as drift"
+                );
+            }
+            let defaults_on = exact.replace("default-features = false, ", "");
+            assert_ne!(defaults_on, exact, "{name} must pin its defaults off");
+            assert!(
+                !pin_drift(&pinned, &defaults_on, "fixture").is_empty(),
+                "{defaults_on} must be reported as drift"
             );
         }
     }

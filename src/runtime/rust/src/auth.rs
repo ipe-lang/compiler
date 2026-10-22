@@ -1015,7 +1015,7 @@ async fn ensure_users_schema<E: crate::FromIpeError + Send>(conn: &Db) -> IpeRes
         )",
         db_auto_id_column()
     );
-    match sqlx::query(crate::sql_text::assembled(schema))
+    match sqlx::query(super::sql_text::assembled(schema))
         .execute(conn)
         .await
     {
@@ -1070,7 +1070,7 @@ pub fn auth_register<
             "INSERT INTO users (email, password_hash, role, created_at) VALUES (?, ?, ?, ?)"
                 .to_string(),
         );
-        let result = sqlx::query(crate::sql_text::assembled(sql))
+        let result = sqlx::query(super::sql_text::assembled(sql))
             .bind(&email)
             .bind(&hash)
             .bind("user")
@@ -1129,7 +1129,7 @@ pub fn auth_login<
             return IpeResult::Err(e);
         }
         let sql = db_format_sql("SELECT id, password_hash FROM users WHERE email = ?".to_string());
-        match sqlx::query(crate::sql_text::assembled(sql))
+        match sqlx::query(super::sql_text::assembled(sql))
             .bind(&email)
             .fetch_optional(&conn)
             .await
@@ -1201,7 +1201,7 @@ pub fn auth_set_role<E: Send + From<String> + crate::FromIpeError + 'static>(
             return IpeResult::Err(e);
         }
         let sql = db_format_sql("UPDATE users SET role = ? WHERE id = ?".to_string());
-        match sqlx::query(crate::sql_text::assembled(sql))
+        match sqlx::query(super::sql_text::assembled(sql))
             .bind(&role)
             .bind(user_id)
             .execute(&conn)

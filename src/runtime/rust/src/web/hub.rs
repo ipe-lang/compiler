@@ -257,7 +257,7 @@ async fn read_logs_value(
     }
     sql.push_str(" ORDER BY time DESC, id DESC LIMIT ?");
 
-    let mut q = sqlx::query(crate::sql_text::assembled(sql));
+    let mut q = sqlx::query(super::super::sql_text::assembled(sql));
     if !service.is_empty() {
         q = q.bind(service);
     }
@@ -413,7 +413,7 @@ async fn read_metrics_value(db_path: &str, service: &str, tenant: Option<&Tenant
     }
     let tenant_filter = TenantFilter::push(&mut sql, tenant);
     sql.push_str(" ORDER BY time DESC, id DESC LIMIT ?");
-    let mut q = sqlx::query(crate::sql_text::assembled(sql));
+    let mut q = sqlx::query(super::super::sql_text::assembled(sql));
     if !service.is_empty() {
         q = q.bind(service);
     }
@@ -481,7 +481,7 @@ async fn read_traces_value(db_path: &str, service: &str, tenant: Option<&TenantP
     }
     let tenant_filter = TenantFilter::push(&mut sql, tenant);
     sql.push_str(" ORDER BY time DESC, id DESC LIMIT ?");
-    let mut q = sqlx::query(crate::sql_text::assembled(sql));
+    let mut q = sqlx::query(super::super::sql_text::assembled(sql));
     if !service.is_empty() {
         q = q.bind(service);
     }
@@ -528,7 +528,7 @@ async fn read_errors_value(db_path: &str, service: &str, tenant: Option<&TenantP
     }
     let tenant_filter = TenantFilter::push(&mut sql, tenant);
     sql.push_str(" ORDER BY time DESC, id DESC LIMIT ?");
-    let mut q = sqlx::query(crate::sql_text::assembled(sql));
+    let mut q = sqlx::query(super::super::sql_text::assembled(sql));
     if !service.is_empty() {
         q = q.bind(service);
     }
@@ -697,7 +697,7 @@ async fn count_table(
     // interpolation cannot carry attacker input.
     let mut sql = format!("SELECT COUNT(*) AS n FROM {} WHERE 1=1", table.name());
     let tenant_filter = TenantFilter::push(&mut sql, tenant);
-    let mut q = sqlx::query(crate::sql_text::assembled(sql));
+    let mut q = sqlx::query(super::super::sql_text::assembled(sql));
     if let Some(tf) = tenant_filter {
         q = tf.bind(q);
     }
@@ -1009,7 +1009,7 @@ async fn distinct_services(
     );
     let tenant_filter = TenantFilter::push(&mut sql, tenant);
     sql.push_str(" ORDER BY service_name LIMIT 200");
-    let mut q = sqlx::query(crate::sql_text::assembled(sql));
+    let mut q = sqlx::query(super::super::sql_text::assembled(sql));
     if let Some(tf) = tenant_filter {
         q = tf.bind(q);
     }
