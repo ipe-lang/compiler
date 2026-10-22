@@ -1,14 +1,11 @@
 module SingleFlightTests exposing (checks)
 
-import Ipe.ByteSize as ByteSize
 import Ipe.Db as Db
 import Ipe.Error as Error exposing (Error)
-import Ipe.File as File
 import Ipe.Html as Html
 import Ipe.Io as Io
 import Ipe.List as List
 import Ipe.Maybe as Maybe
-import Ipe.Path as Path
 import Ipe.Result exposing (Result(..))
 import Ipe.String as String
 import Ipe.System as System
@@ -2605,30 +2602,53 @@ ceilingRefusalReleasesSlot settings =
 
 
 -- ── every task starts at its slot ───────────────────────────────────────
--- `Cmd.perform` appears in `src` only inside the slot-transition
--- definitions, each the one start site of its slot, and the Cmd module is
--- imported under its own name exposing nothing, so no other spelling
--- starts a task. The modules are lexed as Ipê reads them, so a mention in a
--- comment or a string is no site.
+-- A task starts in `src` only through `Cmd.perform`, and only inside the
+-- slot-transition definitions of `Lib/App.ipe`, each the one start site of
+-- its slot. `Task.attempt` lowers to the same start, so any use of it is
+-- stray, and the Cmd module is imported under its own name exposing
+-- nothing, so no other spelling starts a task. The modules are lexed as Ipê
+-- reads them, so a mention in a comment or a string is no site.
 taskStartSites : List String
 taskStartSites =
     [ "loadViewCmd", "saveDecision", "queueStep", "historyStep", "standingStep" ]
 
 
--- The declarations of `text` that start a task outside the start sites,
--- and whether it imports the Cmd module under another name or exposing
--- its names.
-strayTaskStarts : String -> List String
-strayTaskStarts text =
+-- The module, relative to `src`, that holds every start site.
+taskStartModule : String
+taskStartModule =
+    "Lib/App.ipe"
+
+
+-- The start sites a module at `path` may hold: all of them in the start
+-- module, none anywhere else.
+sitesOf : String -> List String
+sitesOf path =
+    if path == taskStartModule then
+        taskStartSites
+
+    else
+        []
+
+
+startsTask : String -> Bool
+startsTask text =
+    text == "perform" || String.endsWith ".perform" text || text == "attempt" || String.endsWith ".attempt" text
+
+
+-- The declarations of `text` that start a task outside `sites`, and
+-- whether it imports the Cmd module under another name or exposing its
+-- names.
+strayTaskStarts : List String -> String -> List String
+strayTaskStarts sites text =
     let
         lexed =
             TextSinkScanTests.lex text
 
         starts =
-            List.filter (\token -> token.kind == TextSinkScanTests.WordToken && (token.text == "perform" || String.endsWith ".perform" token.text)) lexed.code
+            List.filter (\token -> token.kind == TextSinkScanTests.WordToken && startsTask token.text) lexed.code
 
         stray =
-            List.filter (\token -> token.text /= "Cmd.perform" || not (List.member token.name taskStartSites)) starts
+            List.filter (\token -> token.text /= "Cmd.perform" || not (List.member token.name sites)) starts
 
         renamed =
             List.filter (\i -> String.endsWith ".Cmd" i.moduleName && (i.qualifier /= "Cmd" || i.opensAll || not (List.isEmpty i.exposed))) lexed.imports
@@ -2648,55 +2668,36 @@ scanFixture =
     "module Fixture exposing (update)\n\nimport Ipe.Tea.Web.Cmd as Cmd\n\n\n-- Cmd.perform in a comment starts nothing\nqueueStep settings next model =\n    ( model, Cmd.perform task done )\n"
 
 
+-- Red cases: a task started in another definition, one behind a
+-- `Cmd.batch`, one through a renamed Cmd import, one through
+-- `Task.attempt` (inside a start site too), and a start site's name
+-- defined in another module.
 everyTaskStartsAtItsSlotFixtures : Bool
 everyTaskStartsAtItsSlotFixtures =
-    strayTaskStarts scanFixture == []
-        && strayTaskStarts (scanFixture ++ "\n\nelsewhere model =\n    ( model, Cmd.perform task done )\n") == [ "elsewhere" ]
-        && strayTaskStarts (scanFixture ++ "\n\nbatched model =\n    ( model, Cmd.batch [ Cmd.none, Cmd.perform task done ] )\n") == [ "batched" ]
-        && strayTaskStarts (String.replace "Cmd.perform task" "Effect.perform task" (String.replace "as Cmd" "as Effect" scanFixture)) == [ "queueStep", "Ipe.Tea.Web.Cmd" ]
+    strayTaskStarts taskStartSites scanFixture == []
+        && strayTaskStarts taskStartSites (scanFixture ++ "\n\nelsewhere model =\n    ( model, Cmd.perform task done )\n") == [ "elsewhere" ]
+        && strayTaskStarts taskStartSites (scanFixture ++ "\n\nbatched model =\n    ( model, Cmd.batch [ Cmd.none, Cmd.perform task done ] )\n") == [ "batched" ]
+        && strayTaskStarts taskStartSites (String.replace "Cmd.perform task" "Effect.perform task" (String.replace "as Cmd" "as Effect" scanFixture)) == [ "queueStep", "Ipe.Tea.Web.Cmd" ]
+        && strayTaskStarts taskStartSites (scanFixture ++ "\n\nattempted model =\n    ( model, Task.attempt done task )\n") == [ "attempted" ]
+        && strayTaskStarts taskStartSites (String.replace "Cmd.perform task" "Task.attempt done task" scanFixture) == [ "queueStep" ]
+        && strayTaskStarts (sitesOf "Lib/View.ipe") scanFixture == [ "queueStep" ]
 
 
--- The modules of `src`, each by its path with its text. A file past
--- `srcFileCeiling` or a module past `srcModuleCeiling` fails the read.
-srcModules : Task.Task Error (List ( String, String ))
-srcModules =
-    do
-        cwd <- System.cwd ()
-        root <- Task.fromResult (Path.fromString (cwd ++ "/src"))
-        files <- File.walk root
-        bounded <- if List.length files > srcFileCeiling then
-                    Task.fail (Error.limitExceeded ("src holds more than " ++ String.fromInt srcFileCeiling ++ " files"))
-
-                   else
-                    Task.succeed files
-        Task.sequence (List.map (\path -> File.readFileLimit path srcModuleCeiling |> Task.map (\text -> ( Path.toString path, text ))) (List.filter (\path -> String.endsWith ".ipe" (Path.toString path)) bounded))
-
-
-srcFileCeiling : Int
-srcFileCeiling =
-    64
-
-
-srcModuleCeiling : ByteSize.ByteSize
-srcModuleCeiling =
-    ByteSize.kib 512
-
-
--- Every module of `src` starts its tasks only at the start sites, every
--- start site is a definition that exists, and the fixtures go red: a task
--- started in another definition, one behind a `Cmd.batch`, and one through
--- a renamed Cmd import. Red if a `Cmd.perform` is added outside a slot
--- transition.
+-- Every module of `src`, read through the text-sink scan's bounded reader,
+-- starts its tasks only at the start sites, every start site is a
+-- definition of the start module, and the fixtures go red. Red if a task is
+-- started outside a slot transition.
 everyTaskStartsAtItsSlot : Task.Task Error Bool
 everyTaskStartsAtItsSlot =
-    srcModules
+    TextSinkScanTests.srcSources
         |> Task.map
             (\modules ->
                 let
                     names =
-                        List.concatMap (\( _, text ) -> List.map .name (TextSinkScanTests.lex text).code) modules
+                        List.concatMap (\( _, text ) -> List.map .name (TextSinkScanTests.lex text).code) (List.filter (\( path, _ ) -> path == taskStartModule) modules)
                 in
-                List.all (\( _, text ) -> List.isEmpty (strayTaskStarts text)) modules
+                List.any (\( path, _ ) -> path == taskStartModule) modules
+                    && List.all (\( path, text ) -> List.isEmpty (strayTaskStarts (sitesOf path) text)) modules
                     && List.all (\site -> List.member site names) taskStartSites
                     && everyTaskStartsAtItsSlotFixtures
             )
