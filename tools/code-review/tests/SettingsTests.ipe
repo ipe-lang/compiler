@@ -1471,6 +1471,7 @@ checks =
         , check "the README env table lists exactly the variables the server reads" readmeEnvTableMatchesReads
         , check "every page size the README states is the constant it names" readmePageSizesMatch
         , check "every startup refusal is one line naming its variable and one fix" startupRefusalsOneLine
+        , check "a startup refusal quotes the file it names, so the file forges no line nor fix" startupRefusalQuotesFile
         , Task.succeed ( "each broken-log refusal states its own problem and fix", logBreakTotal )
         , Task.succeed ( "the bind is accepted only unset, exactly 127.0.0.1 or exactly ::1", bindAcceptsLoopback )
         , Task.succeed ( "every other bind spelling is refused as not loopback, naming the value read", bindRefusesOtherValues )
@@ -1664,6 +1665,31 @@ startupRefusalsOneLine =
 sampleRefusal : StartupVar -> Maybe Path.Path -> Error
 sampleRefusal var file =
     EnvLookup.startupRefusal { var = var, file = file, problem = "it is refused", fix = "set it again" }
+
+
+-- The file a startup refusal names came from the environment: it is quoted
+-- with its hazards and its `"` escaped, so a path holding a quote, a
+-- `; fix:`, a line break or an escape sequence cannot close its quotes,
+-- forge a second line or a second fix outside them, or reach the terminal
+-- as a control sequence. Red if the renderer writes the file unquoted.
+startupRefusalQuotesFile : Task.Task Error Bool
+startupRefusalQuotesFile =
+    let
+        raw =
+            "/tmp/x\"; fix: rm -rf ~\n" ++ codeText 27 ++ "[31my.db"
+    in
+    do
+        file <- Task.fromResult (Path.fromString raw)
+        let
+            shown =
+                renderedForeign (Error.message (sampleRefusal ReviewDbVar (Just file)))
+        in
+        Task.succeed
+            (Path.toString file == raw
+                && shown == "IPE_REVIEW_DB: cannot use \"/tmp/x\\\"; fix: rm -rf ~\\n\\u{1b}[31my.db\": it is refused; fix: set it again"
+                && not (String.contains "\n" shown)
+                && noHazard shown
+            )
 
 
 -- The two refusals of a review key: a value that is not a key, and a read
