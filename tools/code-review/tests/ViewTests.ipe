@@ -22,7 +22,7 @@ import Ipe.System as System
 import Ipe.Task as Task
 import Ipe.Time.Timestamp as Timestamp
 import Lib.Db as LibDb exposing (Decision(..), HistoryCursor(..))
-import Lib.Drawn as Drawn exposing (Code(..), Hue(..), LayoutNote(..), Part(..), Piece(..), RowLine(..), Run(..), SourceRow(..))
+import Lib.Drawn as Drawn exposing (Drawing(..), Hue(..), LayoutNote(..), Mode(..), Part(..), Piece(..), RowLine(..), Run(..), SourceRow(..), SpelledRow(..))
 import Lib.Format as Format
 import Lib.Highlight as Highlight exposing (Lang(..), LeadingMark(..), LineEnds(..), Token(..))
 import Lib.Index as Index exposing (SourceView(..), StaleReason(..))
@@ -479,19 +479,25 @@ crlfByLanguage =
             False
 
 
--- The rendered code blocks of a drawing, in order.
+-- The rendered code blocks of a drawing, in order, each from its `<code` to
+-- its `</code>`.
 codeOf : Drawn.DrawnSource -> String
 codeOf drawn =
-    String.concat (List.map partCode (Drawn.parts drawn))
+    case String.split "<code" (Html.render (View.drawnHtml drawn)) of
+        _ :: blocks ->
+            String.concat (List.map (\block -> "<code" ++ codeBlock block) blocks)
+
+        [] ->
+            ""
 
 
-partCode : Part -> String
-partCode part =
-    case part of
-        LineRun _ code ->
-            Html.render (View.codeHtml code)
+codeBlock : String -> String
+codeBlock block =
+    case String.split "</code>" block of
+        inner :: _ ->
+            inner ++ "</code>"
 
-        CoveredRun ->
+        [] ->
             ""
 
 
@@ -529,7 +535,7 @@ sourceCopiesAsWritten =
             codeOf (Drawn.highlighted Rust [ Numbered 1 "fn a() {", Numbered 2 "\tlet  x = 1;", Numbered 3 "}" ])
 
         gutter =
-            Html.render (View.gutterHtml [ 1, 2, 3 ])
+            Html.render (View.gutterHtml [ "1", "2", "3" ])
     in
     markupText code == "fn a() {\n\tlet  x = 1;\n}"
         && List.length (String.split "<span style=\"white-space:pre\">" code) == 4
@@ -571,8 +577,8 @@ drawnFixtures =
 
 
 -- Each drawing renders exactly the elements `Drawn.elements` counts, in
--- both modes and every language, and plain draws no more than coloured.
--- Red if the drawing adds an element the count does not.
+-- every mode and language; plain draws no more than coloured, and spelled
+-- out always four. Red if the drawing adds an element the count does not.
 drawnCountIsRenderedCount : Bool
 drawnCountIsRenderedCount =
     let
@@ -582,9 +588,11 @@ drawnCountIsRenderedCount =
         both lang rows =
             agrees (Drawn.highlighted lang rows)
                 && agrees (Drawn.plain lang rows)
+                && agrees (Drawn.spelled lang rows)
+                && Drawn.elements (Drawn.spelled lang rows) == 4
                 && Drawn.elements (Drawn.plain lang rows) <= Drawn.elements (Drawn.highlighted lang rows)
     in
-    List.all (\lang -> List.all (both lang) drawnFixtures) [ Rust, Ipe, Shell, Unknown ]
+    List.all (\lang -> List.all (both lang) (drawnFixtures ++ hostileRows)) [ Rust, Ipe, Shell, Unknown ]
         && Drawn.elements (Drawn.highlighted Rust [ Numbered 1 "fn x" ]) == 6
 
 
@@ -611,10 +619,191 @@ sameColourTokensShareOneElement =
         rows =
             [ Numbered 1 "a b" ]
     in
-    Drawn.parts (Drawn.highlighted Rust rows) == [ LineRun [ 1 ] (ColoredLines [ [ Run TextHue [ Chars "a b" ] ] ]) ]
+    Drawn.drawing (Drawn.highlighted Rust rows) == Colored [ LineRun [ 1 ] [ [ Run TextHue [ Chars "a b" ] ] ] ]
         && occurrences "<span" (codeOf (Drawn.highlighted Rust rows)) == 1
         && occurrences "<span" (codeOf (Drawn.highlighted Rust [ Numbered 1 "fn fn" ])) == 3
-        && Drawn.parts (Drawn.plain Rust rows) == [ LineRun [ 1 ] (PlainText [ Chars "a b" ]) ]
+        && Drawn.drawing (Drawn.plain Rust rows) == Uncolored [ LineRun [ 1 ] [ Chars "a b" ] ]
+
+
+-- Rows a spelled drawing must keep apart: an ASCII `\u{200b}` and a real
+-- U+200B, a doubled backslash, a source line spelling the gap text and one
+-- holding only `…`, quotes, tabs, a `\r` inside a shell line, and the
+-- characters the markup escapes.
+hostileRows : List (List SourceRow)
+hostileRows =
+    [ [ Numbered 1 "\\u{200b}" ]
+    , [ Numbered 1 (codeText 8203) ]
+    , [ Numbered 1 "\\\\", Numbered 2 "\\" ]
+    , [ Numbered 1 "\\…", Covered, Numbered 3 "…" ]
+    , [ Numbered 1 "say \"hi\" \\\"" ]
+    , [ Numbered 1 "\ta\t\tb\t" ]
+    , [ Numbered 1 "cd /x\ry", Numbered 2 "cd /z\r" ]
+    , [ Numbered 1 "'<&>' &amp; &#39;" ]
+    , [ Numbered 1 ("\\n" ++ "\n" ++ "\\u{" ++ codeText 8238 ++ "}") ]
+    ]
+
+
+-- The text of a drawing's one code block, its markup escapes undone.
+spelledCodeText : Drawn.DrawnSource -> String
+spelledCodeText drawn =
+    case String.split ">" (codeOf drawn) of
+        _ :: textAndClose :: _ ->
+            textAndClose
+                |> String.replace "</code" ""
+                |> String.replace "&lt;" "<"
+                |> String.replace "&gt;" ">"
+                |> String.replace "&#39;" "'"
+                |> String.replace "&amp;" "&"
+
+        _ ->
+            ""
+
+
+-- The rows a spelled text stands for, read by the spelling alone: each line
+-- between the newline joins, `Drawn.spelledGapText` a covered run (`Nothing`),
+-- every other line unspelled, or `Nothing` for the whole when a `\` starts no
+-- spelling.
+unspellRows : String -> Maybe (List (Maybe String))
+unspellRows text =
+    List.foldr (\line acc -> Maybe.map2 (\row rest -> row :: rest) (unspellRow line) acc) (Just []) (String.split "\n" text)
+
+
+unspellRow : String -> Maybe (Maybe String)
+unspellRow line =
+    if line == Drawn.spelledGapText then
+        Just Nothing
+
+    else
+        Maybe.map Just (unspell (String.toList line))
+
+
+unspell : List Char -> Maybe String
+unspell chars =
+    case chars of
+        [] ->
+            Just ""
+
+        c :: rest ->
+            if c == '\\' then
+                unspellEscape rest
+
+            else
+                Maybe.map (String.append (String.fromChar c)) (unspell rest)
+
+
+unspellEscape : List Char -> Maybe String
+unspellEscape chars =
+    case chars of
+        [] ->
+            Nothing
+
+        c :: rest ->
+            if c == 'u' then
+                unspellCode rest
+
+            else
+                Maybe.andThen (\s -> Maybe.map (String.append s) (unspell rest)) (namedSpelling c)
+
+
+namedSpelling : Char -> Maybe String
+namedSpelling c =
+    if c == 'n' then
+        Just "\n"
+
+    else if c == 'r' then
+        Just "\r"
+
+    else if c == 't' then
+        Just "\t"
+
+    else if c == '\\' then
+        Just "\\"
+
+    else
+        Nothing
+
+
+unspellCode : List Char -> Maybe String
+unspellCode chars =
+    case chars of
+        open :: rest ->
+            if open == '{' then
+                hexCode 0 rest
+
+            else
+                Nothing
+
+        [] ->
+            Nothing
+
+
+hexCode : Int -> List Char -> Maybe String
+hexCode acc chars =
+    case chars of
+        [] ->
+            Nothing
+
+        c :: rest ->
+            if c == '}' then
+                Maybe.map (String.append (String.fromChar (Char.fromCode acc))) (unspell rest)
+
+            else
+                Maybe.andThen (\d -> hexCode (acc * 16 + d) rest) (List.head (String.indexes (String.fromChar c) "0123456789abcdef"))
+
+
+-- What a spelled drawing must give back: each numbered line as its
+-- language's layout reads it, each covered run as a gap.
+laidOutRows : Lang -> List SourceRow -> List (Maybe String)
+laidOutRows lang rows =
+    List.map
+        (\row ->
+            case row of
+                Numbered n line ->
+                    Just (Drawn.layoutLine (Highlight.layoutOf lang) n line)
+
+                Covered ->
+                    Nothing
+        )
+        rows
+
+
+-- A spelled drawing's text alone gives back the rows it draws, so no two
+-- views draw alike: every fixture and hostile row in every language, and an
+-- ASCII `\u{200b}` draws apart from a real U+200B. The fixture with no rows
+-- is left out: its text is the one empty line's, and the gutter, which
+-- numbers that line, tells them apart. Red if `\` is not doubled, or the gap
+-- text is one a source line can spell.
+spelledIsInjective : Bool
+spelledIsInjective =
+    let
+        roundTrips lang rows =
+            unspellRows (spelledCodeText (Drawn.spelled lang rows)) == Just (laidOutRows lang rows)
+
+        rowsets =
+            List.filter (\rows -> rows /= []) (drawnFixtures ++ hostileRows)
+    in
+    List.all (\lang -> List.all (roundTrips lang) rowsets) [ Rust, Ipe, Shell, Unknown ]
+        && spelledCodeText (Drawn.spelled Unknown [ Numbered 1 "\\u{200b}" ]) /= spelledCodeText (Drawn.spelled Unknown [ Numbered 1 (codeText 8203) ])
+        && spelledCodeText (Drawn.spelled Unknown [ Numbered 1 "\\…" ]) /= spelledCodeText (Drawn.spelled Unknown [ Covered ])
+
+
+-- A spelled drawing's markup holds no display hazard but the newlines that
+-- join its lines and the tabs it keeps, and its code block draws in byte
+-- order. Red if the spelled builder bypasses `SafeText.spelled`, or the
+-- block loses `displayOrderCss`.
+spelledDrawsNoRawHazard : Bool
+spelledDrawsNoRawHazard =
+    let
+        clean lang rows =
+            let
+                html =
+                    Html.render (View.drawnHtml (Drawn.spelled lang rows))
+            in
+            List.all (\c -> c == '\n' || c == '\t' || not (SafeText.isHazard c)) (String.toList html)
+                && String.startsWith ("<code style=\"" ++ View.codeCss ++ ";") (codeOf (Drawn.spelled lang rows))
+    in
+    List.all (\lang -> List.all (clean lang) (drawnFixtures ++ hostileRows)) [ Rust, Ipe, Shell, Unknown ]
+        && String.contains View.displayOrderCss View.codeCss
 
 
 -- A line holding U+202E and U+2066 draws in byte order by its code block:
@@ -899,7 +1088,9 @@ checks =
         , Task.succeed ( "a million-line residual keeps every uncovered line", hugeResidual )
         , Task.succeed ( "a CRLF \\r is a line break in Rust and text in shell", crlfByLanguage )
         , Task.succeed ( "a run of source lines copies as the source spells it, line numbers apart", sourceCopiesAsWritten )
-        , Task.succeed ( "a drawing renders exactly the elements it counts, in both modes and every language", drawnCountIsRenderedCount )
+        , Task.succeed ( "a drawing renders exactly the elements it counts, in every mode and language", drawnCountIsRenderedCount )
+        , Task.succeed ( "a spelled drawing's text alone gives back the rows it draws", spelledIsInjective )
+        , Task.succeed ( "a spelled drawing holds no raw display hazard and draws in byte order", spelledDrawsNoRawHazard )
         , Task.succeed ( "a run of fifty escapes draws as one marked element", escapeRunIsOneElement )
         , Task.succeed ( "tokens of one colour draw as one run, the text colour without an element", sameColourTokensShareOneElement )
         , Task.succeed ( "the code block alone carries the byte-order override", codeBlockHoldsDisplayOrder )

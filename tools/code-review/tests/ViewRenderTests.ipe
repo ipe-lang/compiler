@@ -286,9 +286,6 @@ oversizeCase over =
         ChildSpans { atLeast } ->
             { view = TooLarge over, reason = "holds at least " ++ String.fromInt atLeast ++ " other units, past the " ++ String.fromInt Index.childSpanCeiling ++ "-unit review ceiling" }
 
-        ViewNodes { nodes } ->
-            { view = TooLarge over, reason = "draws as " ++ String.fromInt nodes ++ " elements even without highlighting, past the " ++ String.fromInt Index.viewNodeCeiling ++ "-element review ceiling" }
-
 
 -- Every way a source is withheld.
 withheldCases : List Withheld
@@ -305,7 +302,6 @@ withheldCases =
     , oversizeCase (SpanLines { lines = Index.viewLineCeiling + 1 })
     , oversizeCase (ViewBytes { size = ByteSize.bytes (ByteSize.toBytes Index.viewByteCeiling + 1) })
     , oversizeCase (ChildSpans { atLeast = Index.childSpanCeiling + 1 })
-    , oversizeCase (ViewNodes { nodes = Index.viewNodeCeiling + 1 })
     ]
 
 
@@ -353,9 +349,6 @@ withheldName view =
 
         TooLarge (ChildSpans _) ->
             Just "ChildSpans"
-
-        TooLarge (ViewNodes _) ->
-            Just "ViewNodes"
 
 
 -- The constructors `type <name>` declares in `source`, read off its `=` and
@@ -1090,6 +1083,43 @@ hostileSourceChecks =
             ]
 
 
+-- The fixture unit's four lines, each of 1100 escapes after an `a`: past
+-- the element ceiling drawn plain, so the view is shown spelled out.
+spelledView : String
+spelledView =
+    String.join "\n" (List.repeat 4 (String.repeat 1100 ("a" ++ codeText 8238)))
+
+
+-- A unit too escape-dense to draw with marked escapes is shown spelled out:
+-- on the unit page and the queue card it carries the spelled-out note, its
+-- escapes spelled and none raw, its decision buttons, within the element
+-- and drawn depth ceilings. Red if the spelled drawing is withheld, unnoted,
+-- or draws past a ceiling.
+spelledSourceChecks : Task.Task Error (List ( String, Bool ))
+spelledSourceChecks =
+    do
+        at <- freshScratch "ipe-view-render-spelled-source"
+        seedIndex at.indexDb at.repo
+        writeFileText (at.repo ++ "/src/Lib.rs") ("// fixture library\n\n" ++ spelledView ++ "\n")
+        execIndex at.indexDb "UPDATE units SET body_hash = ? WHERE uid = ?" [ SqlString (Index.attest spelledView), Uid.toSql (uid "u-a") ]
+        loaded <- loadUnitNow (uid "u-a") |> Task.andThen requireUnit
+        cleanupIndex at.indexDb at.repo
+        let
+            pages =
+                [ page (unitPageModel loaded), page (cardModel loaded) ]
+
+            depth html =
+                0 < deepestDrawnDepth html && deepestDrawnDepth html <= Index.drawnDepthCeiling
+        in
+        Task.succeed
+            [ ( "an escape-dense source is verified and shown", isShown loaded )
+            , ( "an escape-dense source is shown spelled out, its escapes spelled and none raw", List.all (\html -> has "Shown spelled out:" html && has "\\u{202e}" html && not (has (codeText 8238) html)) pages )
+            , ( "a spelled-out source still offers its decision buttons", List.all (\html -> button "Approve" html && button "Refuse" html) pages )
+            , ( "a spelled-out source page draws within the element ceilings", List.all (\html -> elementsOf html <= Index.viewNodeCeiling + Index.queueElementCeiling) pages )
+            , ( "a spelled-out source draws within the drawn depth ceiling", List.all depth pages )
+            ]
+
+
 -- ── stored decisions ────────────────────────────────────────────
 -- A reason one character past the bound, signed into the review log as an
 -- older file may hold it.
@@ -1567,6 +1597,7 @@ checks =
     Task.sequence
         [ group "view fixtures" (withSeededIndex "ipe-view-render-seeded" (\a b -> Task.succeed (seededChecks a b ++ untrustedSinkChecks a ++ queueBudgetChecks a ++ maxLinksFitBudget a)))
         , group "hostile source fixture" hostileSourceChecks
+        , group "spelled source fixture" spelledSourceChecks
         , group "stored decision fixture" storedChecks
         , group "unreviewable file fixture" refusalChecks
         , Task.succeed [ ( "the shortcut root takes focus on page load", shortcutRootAutofocused ) ]

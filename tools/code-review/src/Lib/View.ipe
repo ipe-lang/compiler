@@ -14,7 +14,7 @@ import Ipe.Ui.Font as Font
 import Ipe.Ui.Input as Input
 import Lib.App as App exposing (Model, Msg(..), Page(..), queueList)
 import Lib.Db as LibDb exposing (LogShown(..), ReviewEntry(..), StoredDecision(..), Unverified(..))
-import Lib.Drawn as Drawn exposing (Code(..), DrawnSource, Hue(..), LayoutNote(..), Mode(..), Part(..), Piece(..), Run(..))
+import Lib.Drawn as Drawn exposing (DrawnSource, Drawing(..), Hue(..), LayoutNote(..), Mode(..), Part(..), Piece(..), Run(..), SpelledRow(..))
 import Lib.Failure as Failure exposing (LoadFailure)
 import Lib.Format as Format
 import Lib.Index as Index exposing (Change(..), SourceView(..))
@@ -1257,7 +1257,8 @@ withheldSource view =
 
 
 -- A shown view: the notes on its file's layout, a note when it is drawn
--- without highlighting, then the drawing the view was proved with.
+-- without highlighting or spelled out, then the drawing the view was proved
+-- with.
 shownSource : DrawnSource -> List (Ui.Element Msg)
 shownSource drawn =
     List.map layoutNoteEl (Drawn.notes drawn) ++ modeNote (Drawn.mode drawn) ++ [ Ui.html (drawnHtml drawn) ]
@@ -1271,6 +1272,9 @@ modeNote drawnMode =
 
         Unhighlighted ->
             [ Ui.el [ Font.size 12, Font.color (Ui.rgb 150 150 165) ] (Ui.text "Shown without highlighting: highlighted, this unit would draw past the review ceiling.") ]
+
+        SpelledOut ->
+            [ Ui.el [ Font.size 12, Font.color (Ui.rgb 150 150 165) ] (Ui.text "Shown spelled out: with each escape marked, this unit would draw past the review ceiling. Here \\\\ is one \\ of the source, \\n, \\r, \\t and \\u{…} are characters the source holds, and a line \\… stands for lines reviewed as their own units.") ]
 
 
 layoutNoteEl : LayoutNote -> Ui.Element Msg
@@ -1290,41 +1294,61 @@ layoutNoteText note =
 
 -- A shown view's drawing: each run of numbered lines as one block of text
 -- beside its gutter, and a marker for each run of lines other units cover,
--- which those units' own pages show. It draws exactly the elements
--- `Drawn.elements` counts, each in markup with its style inline.
+-- which those units' own pages show; or, spelled out, the whole view as one
+-- block beside one gutter. It draws exactly the elements `Drawn.elements`
+-- counts, each in markup with its style inline.
 drawnHtml : DrawnSource -> Html.Html msg
 drawnHtml drawn =
-    Html.div [ Attr.style "display:flex;flex-direction:column;gap:2px" ] (List.map partHtml (Drawn.parts drawn))
+    Html.div [ Attr.style "display:flex;flex-direction:column;gap:2px" ] (drawingHtml (Drawn.drawing drawn))
 
 
-partHtml : Part -> Html.Html msg
-partHtml part =
+drawingHtml : Drawing -> List (Html.Html msg)
+drawingHtml drawing =
+    case drawing of
+        Colored drawnParts ->
+            List.map (partHtml codeChildren) drawnParts
+
+        Uncolored drawnParts ->
+            List.map (partHtml (List.map pieceHtml)) drawnParts
+
+        Spelled rows ->
+            [ spelledHtml rows ]
+
+
+partHtml : (code -> List (Html.Html msg)) -> Part code -> Html.Html msg
+partHtml children part =
     case part of
         LineRun numbers code ->
-            Html.div [ Attr.style "display:flex;gap:8px;font-family:monospace;font-size:12px" ] [ gutterHtml numbers, codeHtml code ]
+            Html.div [ Attr.style rowCss ] [ gutterHtml (List.map String.fromInt numbers), codeHtml [] (children code) ]
 
         CoveredRun ->
             Html.div [ Attr.style "font-family:monospace;font-size:12px;color:rgb(120,120,135)" ] [ Html.text "... lines reviewed as their own units" ]
 
 
--- The line numbers of a run, one per line, outside the copied text.
-gutterHtml : List Int -> Html.Html msg
-gutterHtml numbers =
+rowCss : String
+rowCss =
+    "display:flex;gap:8px;font-family:monospace;font-size:12px"
+
+
+-- The gutter's entries, one per line, outside the copied text.
+gutterHtml : List String -> Html.Html msg
+gutterHtml entries =
     Html.div
         [ Attr.style "white-space:pre;text-align:right;user-select:none;flex:none;width:40px;color:rgb(120,120,135)"
         , Attr.attribute "aria-hidden" "true"
         ]
-        [ Html.text (String.join "\n" (List.map String.fromInt numbers)) ]
+        [ Html.text (String.join "\n" entries) ]
 
 
 -- A run's lines as one block whose text is the lines joined by newlines, so
 -- copying it gives the source as written: its spaces and tabs kept, a
 -- coloured run one line element per line. The block draws its text in byte
--- order (`displayOrderCss`); the override holds for every inline element
--- inside it, so no line, run or escape element carries it again.
-codeHtml : Code -> Html.Html msg
-codeHtml code =
-    Html.node "code" [ Attr.style codeCss ] (codeChildren code)
+-- order (`displayOrderCss`) whatever declarations `extraCss` adds; the
+-- override holds for every inline element inside it, so no line, run or
+-- escape element carries it again.
+codeHtml : List String -> List (Html.Html msg) -> Html.Html msg
+codeHtml extraCss children =
+    Html.node "code" [ Attr.style (String.join ";" (codeCss :: extraCss)) ] children
 
 
 codeCss : String
@@ -1332,14 +1356,61 @@ codeCss =
     "display:block;flex:1;white-space:pre;color:#cdcdd7;" ++ displayOrderCss
 
 
-codeChildren : Code -> List (Html.Html msg)
-codeChildren code =
-    case code of
-        ColoredLines lines ->
-            List.intersperse (Html.text "\n") (List.map lineHtml lines)
+codeChildren : List (List Run) -> List (Html.Html msg)
+codeChildren lines =
+    List.intersperse (Html.text "\n") (List.map lineHtml lines)
 
-        PlainText pieces ->
-            List.map pieceHtml pieces
+
+-- A spelled view: one row, its gutter numbering each line and marking each
+-- covered run with `Drawn.spelledGapMark`, and one code block holding one
+-- text node, the rows joined by newlines.
+spelledHtml : List SpelledRow -> Html.Html msg
+spelledHtml rows =
+    Html.div [ Attr.style rowCss ] [ gutterHtml (List.map spelledGutterEntry rows), codeHtml [ spelledCss ] [ spelledText rows ] ]
+
+
+spelledText : List SpelledRow -> Html.Html msg
+spelledText rows =
+    Html.text (String.join "\n" (List.map spelledRowText rows))
+
+
+spelledGutterEntry : SpelledRow -> String
+spelledGutterEntry row =
+    case row of
+        SpelledLine n _ ->
+            String.fromInt n
+
+        SpelledGap ->
+            Drawn.spelledGapMark
+
+
+-- A spelled line's text: its characters as themselves, each escaped
+-- character as its `SafeText.escapeSpelling`; a covered run as
+-- `Drawn.spelledGapText`.
+spelledRowText : SpelledRow -> String
+spelledRowText row =
+    case row of
+        SpelledLine _ pieces ->
+            String.concat (List.map pieceSpelling pieces)
+
+        SpelledGap ->
+            Drawn.spelledGapText
+
+
+pieceSpelling : Piece -> String
+pieceSpelling piece =
+    case piece of
+        Chars s ->
+            s
+
+        Escapes cs ->
+            String.concat (List.map SafeText.escapeSpelling cs)
+
+
+-- The mark of a spelled block: a dashed rule on its left.
+spelledCss : String
+spelledCss =
+    "border-left:1px dashed rgb(120,120,135);padding-left:6px"
 
 
 -- One source line as a single run of inline text, so it copies as the
