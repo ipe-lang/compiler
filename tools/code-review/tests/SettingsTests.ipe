@@ -1548,13 +1548,14 @@ pageSizeLineAgrees pageSource constants line =
         Nothing ->
             False
 
-        Just [] ->
-            List.isEmpty numbers || not (List.any (\word -> String.contains word (String.toLower line)) [ "page", "open files", "open units" ])
-
         Just names ->
-            not (List.isEmpty numbers)
-                && List.all (\name -> sizeOf constants name /= Nothing && pageSizeDeclared pageSource name) names
-                && List.all (\number -> List.any (\name -> sizeOf constants name == Just number) names) numbers
+            if List.isEmpty names then
+                List.isEmpty numbers || not (List.any (\word -> String.contains word (String.toLower line)) [ "page", "open files", "open units" ])
+
+            else
+                not (List.isEmpty numbers)
+                    && List.all (\name -> sizeOf constants name /= Nothing && pageSizeDeclared pageSource name) names
+                    && List.all (\number -> List.any (\name -> sizeOf constants name == Just number) names) numbers
 
 
 -- The constant names a line holds as "`PageSize.<name>`"; `Nothing` when one
@@ -1563,16 +1564,18 @@ pageSizeNames : String -> Maybe (List String)
 pageSizeNames line =
     List.foldr
         (\piece names ->
-            case String.split "`" piece of
-                name :: _ :: _ ->
-                    if name /= "" && List.all Char.isAlpha (String.toList name) then
-                        Maybe.map (\rest -> name :: rest) names
+            let
+                parts =
+                    String.split "`" piece
 
-                    else
-                        Nothing
+                name =
+                    Maybe.withDefault "" (List.head parts)
+            in
+            if List.length parts >= 2 && name /= "" && List.all Char.isAlpha (String.toList name) then
+                Maybe.map (\rest -> name :: rest) names
 
-                _ ->
-                    Nothing
+            else
+                Nothing
         )
         (Just [])
         (List.drop 1 (String.split "`PageSize." line))
