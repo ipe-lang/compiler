@@ -7,6 +7,7 @@
 //! it runs — is gated behind `IPE_E2E_STATIC=1` (it needs the musl target, a
 //! musl-capable C compiler, and a cold multi-minute dependency build).
 
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 use ipe::{BuildOptions, CliError, RootFixture, build_fixture_with_options, build_plan};
@@ -417,7 +418,8 @@ fn package_ipe_rust_stages_parse_and_reject_typos() {
 ///   (the runtime manifest says "the `native-tls` feature is deliberately NOT
 ///   listed") is not a false positive.
 /// * **Positive** — every TLS-capable dep's effective line must carry its
-///   rustls arm (`reqwest`/`lettre`/`sqlx`/`tokio-tungstenite`). This is the
+///   rustls arm (`reqwest`/`lettre`), `sqlx` must carry exactly its SSOT
+///   features, and `tokio-tungstenite` none of its own TLS features. This is the
 ///   guard that survives the comment-stripping: a negative-only scan could not
 ///   tell a documented exclusion from an actual flip to native-tls, but a
 ///   flipped backend loses its rustls feature and fails the positive assert.
@@ -502,27 +504,551 @@ fn tls_stays_rustls_with_bundled_roots_in_every_manifest_source() {
         lettre.contains("default-features = false") && lettre.contains(r#""tokio1-rustls-tls""#),
         "lettre must be default-features = false + tokio1-rustls-tls: {lettre}"
     );
-    let sqlx = dep_line(&runtime, "sqlx", &runtime_path);
-    assert!(
-        sqlx.contains(r#""runtime-tokio-rustls""#),
-        "sqlx must use the runtime-tokio-rustls arm: {sqlx}"
+    // `sqlx` and `tokio-tungstenite` are checked structurally: the sqlx line is
+    // the SSOT feature set with defaults off (its TLS arm is
+    // `tls-rustls-ring-webpki`), and tungstenite carries no TLS feature at all:
+    // the runtime owns the socket's TLS through `tokio-rustls`, whose lines
+    // `crate_specs` pins.
+    assert_eq!(
+        refuse_legacy_tls_manifest(&runtime),
+        Vec::<ManifestViolation>::new(),
+        "{}: legacy TLS arm",
+        runtime_path.display()
+    );
+}
+
+/// One way a runtime manifest lets a legacy TLS or root-store arm back in.
+#[derive(Debug, PartialEq, Eq)]
+enum ManifestViolation {
+    /// The text is not a TOML table.
+    Unparsed(String),
+    /// No `sqlx` dependency to check.
+    SqlxAbsent,
+    /// `sqlx` keeps its default features (`any`, `macros`, `migrate`).
+    SqlxDefaultsOn,
+    /// `sqlx`'s own features differ from the SSOT set.
+    SqlxFeatures(BTreeSet<String>),
+    /// The pre-0.9 `runtime-tokio-rustls` arm, which pins webpki-roots 0.x.
+    LegacySqlxArm,
+    /// A `tokio-tungstenite` TLS or root-store feature: the runtime owns TLS.
+    TungsteniteTls(String),
+    /// The wide `sqlite` driver, which also enables deserialize,
+    /// load-extension and unlock-notify.
+    WideSqliteDriver(String),
+}
+
+/// The feature names a dependency table enables, or none.
+fn dep_features(dep: &toml::Value) -> BTreeSet<String> {
+    dep.get("features")
+        .and_then(toml::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(toml::Value::as_str)
+        .map(str::to_owned)
+        .collect()
+}
+
+/// How the `sqlx` dependency table leaves the SSOT line: defaults on, or a
+/// feature set other than exactly [`ipe_backend_rust::crate_specs::SQLX`]'s.
+fn sqlx_violations(sqlx: Option<&toml::Value>) -> Vec<ManifestViolation> {
+    let Some(sqlx) = sqlx else {
+        return vec![ManifestViolation::SqlxAbsent];
+    };
+    let mut found = Vec::new();
+    if sqlx.get("default-features").and_then(toml::Value::as_bool) != Some(false) {
+        found.push(ManifestViolation::SqlxDefaultsOn);
+    }
+    let got = dep_features(sqlx);
+    let want: BTreeSet<String> = ipe_backend_rust::crate_specs::SQLX
+        .features
+        .iter()
+        .map(|feature| (*feature).to_owned())
+        .collect();
+    if got != want {
+        found.push(ManifestViolation::SqlxFeatures(got));
+    }
+    found
+}
+
+/// Every legacy TLS arm `text` (a runtime `Cargo.toml`) admits: the sqlx line
+/// is exactly the SSOT set with defaults off, tungstenite carries no TLS or
+/// root-store feature (on its line or through a `[features]` entry), no
+/// effective line names `runtime-tokio-rustls`, and no feature enables the
+/// wide sqlite driver.
+fn refuse_legacy_tls_manifest(text: &str) -> Vec<ManifestViolation> {
+    let table = match text.parse::<toml::Table>() {
+        Ok(table) => table,
+        Err(error) => return vec![ManifestViolation::Unparsed(error.to_string())],
+    };
+    let mut found = sqlx_violations(
+        table
+            .get("dependencies")
+            .and_then(|deps| deps.get(ipe_backend_rust::crate_specs::SQLX.spec.name)),
+    );
+    let tls_arm = |feature: &str| {
+        ["rustls", "native-tls", "webpki"]
+            .iter()
+            .any(|arm| feature.contains(arm))
+    };
+    let tungstenite = ipe_backend_rust::crate_specs::TOKIO_TUNGSTENITE.spec.name;
+    for section in ["dependencies", "dev-dependencies"] {
+        if let Some(dep) = table.get(section).and_then(|deps| deps.get(tungstenite)) {
+            for feature in dep_features(dep)
+                .into_iter()
+                .filter(|f| tls_arm(f.as_str()))
+            {
+                found.push(ManifestViolation::TungsteniteTls(feature));
+            }
+        }
+    }
+    let features = table
+        .get("features")
+        .and_then(toml::Value::as_table)
+        .into_iter()
+        .flatten()
+        .flat_map(|(_, list)| list.as_array().into_iter().flatten())
+        .filter_map(toml::Value::as_str);
+    for entry in features {
+        let Some((krate, feature)) = entry.split_once('/') else {
+            continue;
+        };
+        let krate = krate.trim_end_matches('?');
+        if krate == tungstenite && tls_arm(feature) {
+            found.push(ManifestViolation::TungsteniteTls(entry.to_owned()));
+        }
+        if krate == ipe_backend_rust::crate_specs::SQLX.spec.name && feature == "sqlite" {
+            found.push(ManifestViolation::WideSqliteDriver(entry.to_owned()));
+        }
+    }
+    let mut effective = text
+        .lines()
+        .filter(|line| !line.trim_start().starts_with('#'));
+    if effective.any(|line| line.contains("runtime-tokio-rustls")) {
+        found.push(ManifestViolation::LegacySqlxArm);
+    }
+    found
+}
+
+/// The manifest checker refuses each legacy arm on its own and accepts the
+/// real runtime manifest.
+#[test]
+fn legacy_tls_manifest_arms_are_refused() {
+    let base = "[dependencies]\n\
+        sqlx = { version = \"0.9\", default-features = false, features = [\"runtime-tokio\", \"tls-rustls-ring-webpki\", \"json\"], optional = true }\n\
+        tokio-tungstenite = { version = \"0.30\", default-features = false, features = [\"handshake\"], optional = true }\n\
+        [features]\n\
+        db = [\"sqlx\", \"sqlx?/sqlite-bundled\", \"sqlx?/postgres\"]\n\
+        websocket_client = [\"tokio-tungstenite\"]\n";
+    assert_eq!(
+        refuse_legacy_tls_manifest(base),
+        Vec::<ManifestViolation>::new()
     );
 
-    // POSITIVE proof for the WebSocket TLS dep — the strengthening that makes
-    // this test robust against the comment-stripping in `effective()`. The
-    // negative forbidden-backend scan above filters out comment lines so a
-    // comment DOCUMENTING the `native-tls` exclusion is not a false positive;
-    // but that same filtering means a negative scan alone could not tell a
-    // documented exclusion apart from an actual flip. Asserting the POSITIVE —
-    // `tokio-tungstenite` carries its rustls feature on its effective (non-
-    // comment) dep line — cannot be defeated by any comment: if the backend were
-    // flipped to native-tls, the rustls feature would be gone and this fails.
-    let tungstenite = dep_line(&runtime, "tokio-tungstenite", &runtime_path);
+    let legacy_arm = base.replace("\"runtime-tokio\", ", "\"runtime-tokio-rustls\", ");
     assert!(
-        tungstenite.contains(r#""rustls-tls-webpki-roots""#),
-        "tokio-tungstenite must carry the rustls-tls-webpki-roots arm (rustls-only \
-         TLS, bundled webpki roots — no native-tls): {tungstenite}"
+        refuse_legacy_tls_manifest(&legacy_arm).contains(&ManifestViolation::LegacySqlxArm),
+        "{legacy_arm}"
     );
+    let tungstenite_roots = base.replace(
+        "[\"handshake\"]",
+        "[\"handshake\", \"rustls-tls-webpki-roots\"]",
+    );
+    assert_eq!(
+        refuse_legacy_tls_manifest(&tungstenite_roots),
+        [ManifestViolation::TungsteniteTls(
+            "rustls-tls-webpki-roots".to_owned()
+        )]
+    );
+    let tungstenite_by_feature = base.replace(
+        "[\"tokio-tungstenite\"]",
+        "[\"tokio-tungstenite\", \"tokio-tungstenite?/native-tls\"]",
+    );
+    assert_eq!(
+        refuse_legacy_tls_manifest(&tungstenite_by_feature),
+        [ManifestViolation::TungsteniteTls(
+            "tokio-tungstenite?/native-tls".to_owned()
+        )]
+    );
+    let wide_sqlite = base.replace("sqlx?/sqlite-bundled", "sqlx?/sqlite");
+    assert_eq!(
+        refuse_legacy_tls_manifest(&wide_sqlite),
+        [ManifestViolation::WideSqliteDriver(
+            "sqlx?/sqlite".to_owned()
+        )]
+    );
+    let defaults_on = base.replace(
+        "default-features = false, features = [\"runtime-tokio\"",
+        "features = [\"runtime-tokio\"",
+    );
+    assert_eq!(
+        refuse_legacy_tls_manifest(&defaults_on),
+        [ManifestViolation::SqlxDefaultsOn]
+    );
+
+    let runtime_path = repo_root().join("src/runtime/rust/Cargo.toml");
+    let runtime = std::fs::read_to_string(&runtime_path).unwrap_or_default();
+    assert!(!runtime.is_empty(), "read {}", runtime_path.display());
+    assert_eq!(
+        refuse_legacy_tls_manifest(&runtime),
+        Vec::<ManifestViolation>::new()
+    );
+}
+
+/// One package of a parsed `Cargo.lock`.
+struct LockedPackage {
+    name: String,
+    version: semver::Version,
+    /// The raw `dependencies` edges: `name` or `name version [(source)]`.
+    dependencies: Vec<String>,
+}
+
+/// A parsed `Cargo.lock`.
+struct Lock {
+    packages: Vec<LockedPackage>,
+}
+
+/// Which closure a lock must prove.
+#[derive(Clone, Copy)]
+enum LockScope {
+    /// The lock resolves the runtime crate: walk its closure.
+    WithRuntime,
+    /// The lock has no runtime crate: only the roots version is checked.
+    RootsOnly,
+}
+
+/// One way a lock lets the legacy roots or an OS root store in.
+#[derive(Debug, PartialEq, Eq)]
+enum RootsViolation {
+    /// The text is not a lock this check can read.
+    Unparsed(String),
+    /// A `webpki-roots` 0.x (RUSTSEC-2026-0381).
+    LegacyRoots(semver::Version),
+    /// The scope names the runtime, but the lock does not resolve it.
+    RuntimeAbsent,
+    /// The runtime resolves more than once: its closure is ambiguous.
+    RuntimeAmbiguous,
+    /// An edge names no package, or more than one.
+    UnresolvedEdge { from: String, edge: String },
+    /// The runtime closure reaches an OS root store crate.
+    RuntimeReaches(String),
+}
+
+const RUNTIME_PACKAGE: &str = "ipe-runtime-rust";
+const LEGACY_ROOTS: &str = "webpki-roots";
+const OS_ROOT_STORES: [&str; 2] = ["rustls-native-certs", "rustls-platform-verifier"];
+
+/// Parse a `Cargo.lock` text once into typed packages.
+fn parse_lock(text: &str) -> Result<Lock, RootsViolation> {
+    let table = text
+        .parse::<toml::Table>()
+        .map_err(|error| RootsViolation::Unparsed(error.to_string()))?;
+    let entries = table
+        .get("package")
+        .and_then(toml::Value::as_array)
+        .ok_or_else(|| RootsViolation::Unparsed("no [[package]] array".to_owned()))?;
+    let mut packages = Vec::with_capacity(entries.len());
+    for entry in entries {
+        let field = |key: &str| entry.get(key).and_then(toml::Value::as_str);
+        let (Some(name), Some(version)) = (field("name"), field("version")) else {
+            return Err(RootsViolation::Unparsed(format!(
+                "package without name/version: {entry}"
+            )));
+        };
+        let version = semver::Version::parse(version)
+            .map_err(|error| RootsViolation::Unparsed(format!("{name} {version}: {error}")))?;
+        let dependencies = match entry.get("dependencies") {
+            None => Vec::new(),
+            Some(list) => list
+                .as_array()
+                .ok_or_else(|| {
+                    RootsViolation::Unparsed(format!("{name}: dependencies not a list"))
+                })?
+                .iter()
+                .map(|edge| {
+                    edge.as_str()
+                        .map(str::to_owned)
+                        .ok_or_else(|| RootsViolation::Unparsed(format!("{name}: non-string edge")))
+                })
+                .collect::<Result<_, _>>()?,
+        };
+        packages.push(LockedPackage {
+            name: name.to_owned(),
+            version,
+            dependencies,
+        });
+    }
+    Ok(Lock { packages })
+}
+
+/// The one package `edge` names. An edge that names none or several is
+/// refused: the walk fails closed rather than skip a branch.
+fn resolve_edge(lock: &Lock, from: &str, edge: &str) -> Result<usize, RootsViolation> {
+    let mut words = edge.split_whitespace();
+    let name = words.next().unwrap_or_default();
+    let version = words.next();
+    let mut hits = lock.packages.iter().enumerate().filter(|(_, package)| {
+        package.name == name && version.is_none_or(|v| package.version.to_string() == v)
+    });
+    match (hits.next(), hits.next()) {
+        (Some((at, _)), None) => Ok(at),
+        _ => Err(RootsViolation::UnresolvedEdge {
+            from: from.to_owned(),
+            edge: edge.to_owned(),
+        }),
+    }
+}
+
+/// No `webpki-roots` 0.x anywhere in `lock`, and, under
+/// [`LockScope::WithRuntime`], no OS root store in the runtime's dependency
+/// closure.
+fn refuse_legacy_roots(lock: &Lock, scope: LockScope) -> Result<(), RootsViolation> {
+    if let Some(legacy) = lock
+        .packages
+        .iter()
+        .find(|package| package.name == LEGACY_ROOTS && package.version.major == 0)
+    {
+        return Err(RootsViolation::LegacyRoots(legacy.version.clone()));
+    }
+    if matches!(scope, LockScope::RootsOnly) {
+        return Ok(());
+    }
+    let mut runtimes = lock
+        .packages
+        .iter()
+        .enumerate()
+        .filter(|(_, package)| package.name == RUNTIME_PACKAGE);
+    let runtime = match (runtimes.next(), runtimes.next()) {
+        (Some((at, _)), None) => at,
+        (None, _) => return Err(RootsViolation::RuntimeAbsent),
+        (Some(_), Some(_)) => return Err(RootsViolation::RuntimeAmbiguous),
+    };
+    let mut seen = vec![false; lock.packages.len()];
+    let mut pending = vec![runtime];
+    while let Some(at) = pending.pop() {
+        let Some(package) = lock.packages.get(at) else {
+            continue;
+        };
+        if seen.get(at).copied().unwrap_or(true) {
+            continue;
+        }
+        if let Some(mark) = seen.get_mut(at) {
+            *mark = true;
+        }
+        if OS_ROOT_STORES.contains(&package.name.as_str()) {
+            return Err(RootsViolation::RuntimeReaches(package.name.clone()));
+        }
+        for edge in &package.dependencies {
+            pending.push(resolve_edge(lock, &package.name, edge)?);
+        }
+    }
+    Ok(())
+}
+
+/// The lock assertion refuses legacy roots and an OS root store reached from
+/// the runtime, and accepts the three real repo locks.
+#[test]
+fn legacy_roots_are_refused_in_every_lock() {
+    let lock = |body: &str| {
+        let parsed = parse_lock(&format!("version = 4\n{body}"));
+        assert!(parsed.is_ok(), "fixture lock must parse: {body}");
+        parsed.unwrap_or(Lock {
+            packages: Vec::new(),
+        })
+    };
+    let runtime_with = |dep: &str| {
+        format!(
+            "[[package]]\nname = \"ipe-runtime-rust\"\nversion = \"0.7.0\"\ndependencies = [\"sqlx-core\"]\n\
+             [[package]]\nname = \"sqlx-core\"\nversion = \"0.9.0\"\ndependencies = [\"{dep}\"]\n"
+        )
+    };
+
+    let roots_1 = lock(
+        &(runtime_with("webpki-roots")
+            + "[[package]]\nname = \"webpki-roots\"\nversion = \"1.0.10\"\n"),
+    );
+    assert_eq!(
+        refuse_legacy_roots(&roots_1, LockScope::WithRuntime),
+        Ok(())
+    );
+
+    let legacy = lock(
+        &(runtime_with("webpki-roots 0.26.11")
+            + "[[package]]\nname = \"webpki-roots\"\nversion = \"0.26.11\"\n\
+           [[package]]\nname = \"webpki-roots\"\nversion = \"1.0.10\"\n"),
+    );
+    assert_eq!(
+        refuse_legacy_roots(&legacy, LockScope::RootsOnly),
+        Err(RootsViolation::LegacyRoots(semver::Version::new(0, 26, 11)))
+    );
+    for store in OS_ROOT_STORES {
+        let reached = lock(
+            &(runtime_with(store)
+                + &format!("[[package]]\nname = \"{store}\"\nversion = \"0.8.0\"\n")),
+        );
+        assert_eq!(
+            refuse_legacy_roots(&reached, LockScope::WithRuntime),
+            Err(RootsViolation::RuntimeReaches(store.to_owned()))
+        );
+        // Outside the runtime closure an OS store is cargo-deny's to scope.
+        let elsewhere = lock(
+            &(runtime_with("webpki-roots")
+                + "[[package]]\nname = \"webpki-roots\"\nversion = \"1.0.10\"\n"
+                + &format!(
+                    "[[package]]\nname = \"ipe\"\nversion = \"0.7.0\"\ndependencies = [\"{store}\"]\n\
+                 [[package]]\nname = \"{store}\"\nversion = \"0.8.0\"\n"
+                )),
+        );
+        assert_eq!(
+            refuse_legacy_roots(&elsewhere, LockScope::WithRuntime),
+            Ok(())
+        );
+    }
+    let dangling = lock(&runtime_with("webpki-roots"));
+    assert!(
+        matches!(
+            refuse_legacy_roots(&dangling, LockScope::WithRuntime),
+            Err(RootsViolation::UnresolvedEdge { .. })
+        ),
+        "an edge to no package must fail closed"
+    );
+    let no_runtime = lock("[[package]]\nname = \"webpki-roots\"\nversion = \"1.0.10\"\n");
+    assert_eq!(
+        refuse_legacy_roots(&no_runtime, LockScope::WithRuntime),
+        Err(RootsViolation::RuntimeAbsent)
+    );
+
+    for (path, scope) in [
+        ("Cargo.lock", LockScope::WithRuntime),
+        ("editors/zed-ipe/Cargo.lock", LockScope::RootsOnly),
+        ("tools/ipe-index/Cargo.lock", LockScope::RootsOnly),
+    ] {
+        let text = std::fs::read_to_string(repo_root().join(path)).unwrap_or_default();
+        assert!(!text.is_empty(), "read {path}");
+        let parsed = parse_lock(&text);
+        assert!(parsed.is_ok(), "{path}: {:?}", parsed.as_ref().err());
+        if let Ok(parsed) = parsed {
+            assert_eq!(refuse_legacy_roots(&parsed, scope), Ok(()), "{path}");
+        }
+    }
+}
+
+/// One way the `deny.toml` roots ban fails to mean "webpki-roots below 1".
+#[derive(Debug, PartialEq, Eq)]
+enum DenyViolation {
+    /// The text is not a TOML table with a `bans.deny` list.
+    Unparsed(String),
+    /// No `bans.deny` entry names the crate.
+    EntryAbsent(&'static str),
+    /// The roots entry is not spelled `name:<req>` (`@` bans every version or
+    /// none, depending on the requirement).
+    NotNameColonReq(String),
+    /// The requirement does not parse as a semver requirement.
+    BadReq(String),
+    /// The requirement lets the legacy roots through.
+    AdmitsLegacy(String),
+    /// The requirement bans the current roots.
+    BansCurrent(String),
+}
+
+/// The `crate` spellings of `deny.toml`'s `bans.deny` entries.
+fn deny_entries(text: &str) -> Result<Vec<String>, DenyViolation> {
+    let table = text
+        .parse::<toml::Table>()
+        .map_err(|error| DenyViolation::Unparsed(error.to_string()))?;
+    let list = table
+        .get("bans")
+        .and_then(|bans| bans.get("deny"))
+        .and_then(toml::Value::as_array)
+        .ok_or_else(|| DenyViolation::Unparsed("no bans.deny list".to_owned()))?;
+    Ok(list
+        .iter()
+        .filter_map(|entry| entry.get("crate").and_then(toml::Value::as_str))
+        .map(str::to_owned)
+        .collect())
+}
+
+/// The roots ban is `webpki-roots:<req>` with `<req>` matching 0.26.11 and not
+/// 1.0.10, and both OS root stores are banned by name.
+fn refuse_weak_roots_ban(text: &str) -> Result<(), DenyViolation> {
+    let entries = deny_entries(text)?;
+    let roots = entries
+        .iter()
+        .find(|spec| spec.starts_with(LEGACY_ROOTS))
+        .ok_or(DenyViolation::EntryAbsent(LEGACY_ROOTS))?;
+    let req = match roots.split_once(':') {
+        Some((name, req)) if name == LEGACY_ROOTS => req,
+        _ => return Err(DenyViolation::NotNameColonReq(roots.clone())),
+    };
+    let req = semver::VersionReq::parse(req).map_err(|_| DenyViolation::BadReq(roots.clone()))?;
+    if !req.matches(&semver::Version::new(0, 26, 11)) {
+        return Err(DenyViolation::AdmitsLegacy(roots.clone()));
+    }
+    if req.matches(&semver::Version::new(1, 0, 10)) {
+        return Err(DenyViolation::BansCurrent(roots.clone()));
+    }
+    for store in OS_ROOT_STORES {
+        if !entries.iter().any(|spec| spec == store) {
+            return Err(DenyViolation::EntryAbsent(store));
+        }
+    }
+    Ok(())
+}
+
+/// The `deny.toml` roots ban keeps the `name:<req>` meaning, and the repo's
+/// ban is that one.
+#[test]
+fn roots_ban_is_spelled_name_colon_req() {
+    let ban = |roots: &str| {
+        format!(
+            "[bans]\ndeny = [\n  {{ crate = \"{roots}\" }},\n  \
+             {{ crate = \"rustls-native-certs\", wrappers = [\"rustls-platform-verifier\"] }},\n  \
+             {{ crate = \"rustls-platform-verifier\", wrappers = [\"reqwest\"] }},\n]\n"
+        )
+    };
+    assert_eq!(refuse_weak_roots_ban(&ban("webpki-roots:<1")), Ok(()));
+    assert_eq!(refuse_weak_roots_ban(&ban("webpki-roots:0.26")), Ok(()));
+    for (spelling, refusal) in [
+        (
+            "webpki-roots@<1",
+            DenyViolation::NotNameColonReq("webpki-roots@<1".to_owned()),
+        ),
+        (
+            "webpki-roots@<1.0.0",
+            DenyViolation::NotNameColonReq("webpki-roots@<1.0.0".to_owned()),
+        ),
+        (
+            "webpki-roots:<0.26",
+            DenyViolation::AdmitsLegacy("webpki-roots:<0.26".to_owned()),
+        ),
+        (
+            "webpki-roots:*",
+            DenyViolation::BansCurrent("webpki-roots:*".to_owned()),
+        ),
+        (
+            "webpki-roots:<<1",
+            DenyViolation::BadReq("webpki-roots:<<1".to_owned()),
+        ),
+    ] {
+        assert_eq!(
+            refuse_weak_roots_ban(&ban(spelling)),
+            Err(refusal),
+            "{spelling}"
+        );
+    }
+    assert_eq!(
+        refuse_weak_roots_ban("[bans]\ndeny = [{ crate = \"rustls-native-certs\" }]\n"),
+        Err(DenyViolation::EntryAbsent(LEGACY_ROOTS))
+    );
+    let without_store =
+        "[bans]\ndeny = [{ crate = \"webpki-roots:<1\" }, { crate = \"rustls-native-certs\" }]\n";
+    assert_eq!(
+        refuse_weak_roots_ban(without_store),
+        Err(DenyViolation::EntryAbsent("rustls-platform-verifier"))
+    );
+
+    let text = std::fs::read_to_string(repo_root().join("deny.toml")).unwrap_or_default();
+    assert!(!text.is_empty(), "read deny.toml");
+    assert_eq!(refuse_weak_roots_ban(&text), Ok(()));
 }
 
 /// Full static proof (THE SEAL, end to end): emit `examples/shapes/non-tea/hello-world`
