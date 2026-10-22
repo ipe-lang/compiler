@@ -314,6 +314,10 @@ pub use db::*;
 // db feature; the always-compiled telemetry sink calls its cfg-stubbed hook.
 #[cfg(feature = "db")]
 pub mod telemetry_spill;
+// `sql_text`: the single `sqlx::AssertSqlSafe` site. Behind `db`, the feature
+// that links sqlx for every query user (db, auth, web store and hub, spill).
+#[cfg(feature = "db")]
+mod sql_text;
 
 pub use config::*;
 #[cfg(feature = "config")]

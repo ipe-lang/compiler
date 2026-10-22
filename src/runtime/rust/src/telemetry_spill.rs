@@ -211,9 +211,14 @@ async fn pruner(pool: SqlitePool) {
     loop {
         tick.tick().await;
         let cutoff = (chrono::Utc::now() - chrono::Duration::hours(RETENTION_HOURS)).to_rfc3339();
-        for table in ["telemetry_log", "telemetry_span"] {
-            let sql = format!("DELETE FROM {table} WHERE time < ?");
-            if let Err(e) = sqlx::query(&sql).bind(&cutoff).execute(&pool).await {
+        for (table, sql) in [
+            ("telemetry_log", "DELETE FROM telemetry_log WHERE time < ?"),
+            (
+                "telemetry_span",
+                "DELETE FROM telemetry_span WHERE time < ?",
+            ),
+        ] {
+            if let Err(e) = sqlx::query(sql).bind(&cutoff).execute(&pool).await {
                 crate::system::emit_runtime_log("spill", &format!("prune {table}: {e}"));
             }
         }
