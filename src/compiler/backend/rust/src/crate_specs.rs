@@ -77,10 +77,11 @@ pub const SQLX: PinnedCrate = PinnedCrate {
     default_features: false,
     features: &["runtime-tokio", "tls-rustls-ring-webpki", "json"],
 };
-/// The database drivers every database program links, after [`SQLX`]'s own
-/// features: `sqlite-bundled` rather than `sqlite`, which also enables
-/// deserialize, load-extension and unlock-notify. Mirrors the `sqlx?/` entries
-/// of the runtime's `db` feature.
+/// The database drivers every database program links, after [`SQLX`]'s features.
+///
+/// `sqlite-bundled` rather than `sqlite`, which also enables deserialize,
+/// load-extension and unlock-notify. Mirrors the `sqlx?/` entries of the
+/// runtime's `db` feature.
 pub const SQLX_DRIVERS: &[&str] = &["sqlite-bundled", "postgres"];
 pub const AXUM: CrateSpec = CrateSpec {
     name: "axum",
