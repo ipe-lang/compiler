@@ -9,8 +9,8 @@ module Lib.Uid exposing (MacField, Uid, UidKey, decoder, isLowerHex, key, keyOrd
 -- unit page, `placeText` shows the disambiguator beside a unit's place,
 -- `key` dedupes links, and `macField` is the uid field of a row's mac input.
 -- `toSql`, `placeText` and `macFieldText` return a type the stdlib or the
--- tool can read back as text, so `FailureScanTests` admits each of their
--- call sites by name.
+-- tool can read back as text, and `storedMacField` takes unchecked text,
+-- so `FailureScanTests` admits each of their call sites by name.
 
 import Ipe.Char as Char
 import Ipe.Db

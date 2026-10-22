@@ -13,6 +13,7 @@ import Ipe.String as String
 import Ipe.System as System
 import Ipe.Task as Task
 import Ipe.Tuple as Tuple
+import Lib.Highlight as Highlight exposing (Token(..))
 import TestSupport exposing (check)
 
 
@@ -750,17 +751,52 @@ isSqlConstructor token =
 
 
 -- Each `SqlValue` constructor of a module in a pattern, keyed `rel:name`:
--- a constructor token with a `->` after it on its line, comment dropped,
--- which holds for a case arm (`SqlString s ->`), a nested one
--- (`Just (SqlString s) ->`) and a case on one line (`\v -> case v of
--- SqlString s -> s`), while a constructor applied after the last arrow
--- builds a value.
+-- a constructor token with a `->` after it on its line, which holds for a
+-- case arm (`SqlString s ->`), a nested one (`Just (SqlString s) ->`) and a
+-- case on one line (`\v -> case v of SqlString s -> s`), while a
+-- constructor applied after the last arrow builds a value. The line is read
+-- through the tool's Ipê lexer, each line with the carry out of the one
+-- before it, and only its code is searched: a string literal or a comment,
+-- line or block, is a gap, so neither a `--` inside a literal pattern nor a
+-- comment hides the arrow, and an arrow written in a literal is none.
 sqlPatternSitesOf : String -> List String -> List String
 sqlPatternSitesOf rel lines =
-    (List.foldl (sqlPatternStep rel) { name = "", sites = [] } lines).sites
+    (List.foldl (sqlPatternStep rel) { name = "", sites = [], carry = Highlight.lineStart } lines).sites
 
 
-sqlPatternStep : String -> String -> SiteScan -> SiteScan
+type alias PatternScan =
+    { name : String, sites : List String, carry : Highlight.Carry }
+
+
+-- The code of a lexed line: each string literal and comment a space.
+lexedCode : List Highlight.Token -> String
+lexedCode toks =
+    String.concat (List.map codePiece toks)
+
+
+codePiece : Highlight.Token -> String
+codePiece tok =
+    case tok of
+        Keyword s ->
+            s
+
+        Ident s ->
+            s
+
+        Num s ->
+            s
+
+        Plain s ->
+            s
+
+        Str _ ->
+            " "
+
+        Comment _ ->
+            " "
+
+
+sqlPatternStep : String -> String -> PatternScan -> PatternScan
 sqlPatternStep rel line scan =
     let
         name =
@@ -770,8 +806,11 @@ sqlPatternStep rel line scan =
             else
                 scan.name
 
+        lexed =
+            Highlight.lexLine Highlight.Ipe scan.carry line
+
         segments =
-            String.split "->" (codeOf line)
+            String.split "->" (lexedCode (Tuple.first lexed))
 
         beforeAnArrow =
             List.take (List.length segments - 1) segments
@@ -779,7 +818,7 @@ sqlPatternStep rel line scan =
         found =
             List.filter isSqlConstructor (List.concatMap tokens beforeAnArrow)
     in
-    { name = name, sites = List.map (\_ -> rel ++ ":" ++ name) found ++ scan.sites }
+    { name = name, sites = List.map (\_ -> rel ++ ":" ++ name) found ++ scan.sites, carry = Tuple.second lexed }
 
 
 -- Every `SqlValue` taken apart outside `Lib/Uid.ipe`; none is admitted.
@@ -788,11 +827,13 @@ sqlPatternViolations modules =
     List.map (\site -> "a SqlValue is taken apart at " ++ site) (List.unique (List.concatMap (\scanned -> scanned.sqlPatterns) (List.filter (\scanned -> scanned.rel /= "Lib/Uid.ipe") modules)))
 
 
--- The exits of `Lib.Uid` whose result can be read back as text, and
--- `toString`, which no site may name.
+-- The exits of `Lib.Uid` whose result can be read back as text; its one
+-- entrance from unchecked text, `storedMacField`, which frames a stored
+-- row's own uid cell for the mac that verifies it and never a written
+-- row's; and `toString`, which no site may name.
 uidTextExits : List String
 uidTextExits =
-    [ "toSql", "placeText", "macFieldText", "toString" ]
+    [ "toSql", "placeText", "macFieldText", "storedMacField", "toString" ]
 
 
 -- The names each text exit goes by in a module, paired with the exit:
@@ -820,8 +861,8 @@ uidExitNames imports =
 
 -- Every site a uid's text leaves through an exit, `rel:name exit`: each
 -- SQL bind parameter, which feeds only a query's parameter list, the
--- disambiguator a page shows beside a unit's place, and the uid field of a
--- row's mac input.
+-- disambiguator a page shows beside a unit's place, the uid field of a
+-- row's mac input, and the one read whose stored uid cell enters it.
 admittedUidExits : List String
 admittedUidExits =
     [ "Lib/Db.ipe:appendDecision toSql"
@@ -831,6 +872,7 @@ admittedUidExits =
     , "Lib/Db.ipe:legacyParams toSql"
     , "Lib/Db.ipe:macInput macFieldText"
     , "Lib/Db.ipe:pairVerifies toSql"
+    , "Lib/Db.ipe:rowSignedBy storedMacField"
     , "Lib/Index.ipe:candidateQuery toSql"
     , "Lib/Index.ipe:drainPair toSql"
     , "Lib/Index.ipe:edgeLinks toSql"
@@ -936,6 +978,10 @@ uidLaunderingRefused sources =
         && laundered (appendTo "Lib/Queue.ipe" "labelOf =\n    \\v -> case v of SqlString s -> s" sources)
         && laundered (appendTo "Lib/View.ipe" "heading v =\n    case v of\n        SqlInt n ->\n            n" sources)
         && laundered (appendTo "Main.ipe" "shown v =\n    case v of\n        SqlString s ->\n            s" sources)
+        && laundered (appendTo "Lib/Queue.ipe" "labelOf u =\n    case ( Uid.toSql u, \"--\" ) of\n        ( SqlString s, \"--\" ) ->\n            s\n\n        ( _, _ ) ->\n            \"\"" sources)
+        && laundered (appendTo "Lib/Queue.ipe" "labelOf u =\n    case Uid.toSql u of\n        SqlString s {- -- -} ->\n            s" sources)
+        && laundered (appendTo "Lib/Queue.ipe" "note =\n    \"\"\"\n    -- \"\"\"\n\n\nlabelOf u =\n    case Uid.toSql u of\n        SqlString s ->\n            s" sources)
+        && List.isEmpty (sqlPatternViolations (appendTo "Lib/Queue.ipe" "note =\n    \"SqlString s -> s\"\n\n\nother =\n    {- case v of\n    SqlString s -> s -}\n    1" sources))
         && List.isEmpty (sqlPatternViolations (appendTo "Lib/Queue.ipe" "bind s =\n    SqlString s\n\n\nbound =\n    List.map (\\s -> SqlString s) [ \"a\" ]" sources))
         && List.isEmpty (sqlPatternViolations (appendTo "Lib/Queue.ipe" "labelOf v =\n    case v of\n        MySqlString s ->\n            s" sources))
         && List.isEmpty (sqlPatternViolations (appendTo "Lib/Uid.ipe" "shown v =\n    case v of\n        SqlString s ->\n            s" sources))
@@ -964,6 +1010,8 @@ uidBindSitesAdmitted sources =
         && exitCaught (appendTo "Lib/View.ipe" "heading uid =\n    Uid.placeText uid" sources)
         && exitCaught (appendTo "Lib/Db.ipe" "legacyKey uid =\n    Uid.macFieldText (Uid.macField uid)" sources)
         && exitCaught (editIn "Lib/Db.ipe" "Uid.macFieldText uid" "\"\"" sources)
+        && exitCaught (appendTo "Lib/Db.ipe" "forgedField =\n    Uid.storedMacField \"not a uid\"" sources)
+        && exitCaught (editIn "Lib/Db.ipe" "Uid.storedMacField (storedUidText uid)" "Uid.macField uid" sources)
         && exitCaught (editIn "Lib/View.ipe" "Uid.placeText uid" "SafeText.literal \"\"" sources)
         && exitCaught (List.filter (\scanned -> scanned.rel /= "Lib/Index.ipe") sources)
         && List.isEmpty (uidTextViolations admittedUidExits (appendTo "Lib/Queue.ipe" "labelOf uid =\n    myUid.toSqlLabel uid" sources))
