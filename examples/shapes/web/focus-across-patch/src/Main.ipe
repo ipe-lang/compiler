@@ -25,12 +25,15 @@ module Main exposing (main)
 -- whose tag is `button:x`, which carries the same id under another tag.
 -- `F2` toggles a panel whose `autofocus` field `ask` appears in answer to the
 -- key press. `F3` arms a timer whose tick adds the `autofocus` field `subask`,
--- a render no event of the tab caused.
+-- a render no event of the tab caused. A query holding `noauto` leaves the
+-- root without `autofocus`, so focus stays on the body at load; one holding
+-- `tick` arms the timer from the start.
 --
 -- Co-located, no capabilities, no JS ports.
 
 import Ipe.Html as Html
 import Ipe.Html.Attributes as Attr
+import Ipe.String as String
 import Ipe.Tea.Web as Web
 import Ipe.Tea.Web.Cmd as Cmd
 import Ipe.Tea.Web.Sub as Sub
@@ -55,6 +58,7 @@ type alias Model =
     , answer : String
     , ticking : Bool
     , subAsk : Bool
+    , loadAuto : Bool
     }
 
 
@@ -75,8 +79,8 @@ type Msg
 
 
 init : WebReq -> ( Model, Cmd.Cmd Msg )
-init _req =
-    ( { keys = "", row = False, drop = True, note = "", swapped = False, pressed = False, deep = False, tagSwapped = False, hostRow = False, formDrop = True, mathRow = False, ask = False, answer = "", ticking = False, subAsk = False }, Cmd.none )
+init req =
+    ( { keys = "", row = False, drop = True, note = "", swapped = False, pressed = False, deep = False, tagSwapped = False, hostRow = False, formDrop = True, mathRow = False, ask = False, answer = "", ticking = String.contains "tick" req.query, subAsk = False, loadAuto = not (String.contains "noauto" req.query) }, Cmd.none )
 
 
 update : Msg -> Model -> ( Model, Cmd.Cmd Msg )
@@ -367,14 +371,25 @@ askPanel shown name model =
         []
 
 
+-- The root's `autofocus` unless the page loaded with `noauto`.
+rootAutofocus : Model -> List (Ui.Attribute Msg)
+rootAutofocus model =
+    if model.loadAuto then
+        [ Ui.htmlAttribute "autofocus" "" ]
+
+    else
+        []
+
+
 view : Model -> Ui.Element Msg
 view model =
     Ui.column
-        [ Ui.id "root"
-        , Ui.onKeyDown KeyDown
-        , Ui.htmlAttribute "tabindex" "0"
-        , Ui.htmlAttribute "autofocus" ""
-        ]
+        ([ Ui.id "root"
+         , Ui.onKeyDown KeyDown
+         , Ui.htmlAttribute "tabindex" "0"
+         ]
+            ++ rootAutofocus model
+        )
         [ Ui.el [ Ui.id "keys" ] (Ui.text ("keys: " ++ model.keys))
         , Ui.column
             [ Ui.id "panel" ]

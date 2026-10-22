@@ -853,10 +853,11 @@ function __ipeRestoreFocus(container, path, ids) {
 }
 
 // The first mount of the page focuses the element the browser would have
-// focused at load (the first element its markup marks `autofocus`) only while
-// the load's own autofocus is still due: nothing has held focus since the
-// client started, the user has not pressed a key or a pointer, and the URL
-// names no fragment target (the browser skips autofocus for one too). No
+// focused at load (the first element the server's page marks `autofocus`,
+// found again by its `ipe-id`) only while the load's own autofocus is still
+// due: nothing has held focus since the client started, the user has not
+// pressed a key or a pointer, and the URL names no fragment target (the
+// browser skips autofocus for one too). No
 // `autofocus` attribute reaches the live DOM from a swap or a patch, so the
 // browser never focuses an inserted element itself. A later full frame only
 // puts lost focus back (`__ipeRestoreFocus`). A later patches frame moves focus
@@ -864,6 +865,12 @@ function __ipeRestoreFocus(container, path, ids) {
 // newly autofocused, when the frame answers this tab's own event, applies as
 // the next step, and focus has not moved since that event was sent.
 var __ipeMounted = false;
+// The `ipe-id` of the first element the server's page marks `autofocus`, read
+// as the client starts; null when it marks none, or one with no `ipe-id`.
+var __ipeLoadAutofocus = (function() {
+  var el = __ipeDoc.query("#ipe-root [autofocus]");
+  return el ? __ipeNode.attr(el, "ipe-id") : null;
+})();
 var __ipeAutofocusSpent = (function() {
   var now = __ipeDoc.active();
   return !!now && now !== __ipeDoc.body();
@@ -923,11 +930,12 @@ function __ipeFragmentTarget() {
   try { return __ipeDoc.byId(decodeURIComponent(raw)); } catch (_) { return null; }
 }
 function __ipeAutofocusDue() {
-  return !__ipeMounted && !__ipeAutofocusSpent && !__ipeFragmentTarget();
+  return !__ipeMounted && __ipeLoadAutofocus !== null && !__ipeAutofocusSpent &&
+      !__ipeFragmentTarget();
 }
-// Focuses `el`, the mount's first autofocus element, once the swap has landed
-// below `root`. A live field the swap spliced in its place is found by its
-// `ipe-id`; an element that did not land takes no focus.
+// Focuses `el`, the mount's copy of the load's autofocus element, once the
+// swap has landed below `root`. A live field the swap spliced in its place is
+// found by its `ipe-id`; an element that did not land takes no focus.
 function __ipeFocusAutofocus(root, el) {
   var now = __ipeDoc.active();
   if (__ipeAutofocusSpent || (now && now !== __ipeDoc.body())) return;
@@ -982,16 +990,19 @@ function __ipePatch(t, mode) {
   // live root, where script revival would run a second client.
   var stripped = [];
   var parsed = __ipeShellRoot(__ipeParseFor(root, t, stripped), t);
-  var first = null;
-  for (var i = 0; i < stripped.length && first === null; i++) {
-    if (__ipeNode.contains(parsed, stripped[i])) first = stripped[i];
+  var loadTarget = null;
+  for (var i = 0; i < stripped.length && loadTarget === null; i++) {
+    if (__ipeNode.contains(parsed, stripped[i]) &&
+        __ipeNode.attr(stripped[i], "ipe-id") === __ipeLoadAutofocus) {
+      loadTarget = stripped[i];
+    }
   }
   var scrollX = window.scrollX, scrollY = window.scrollY;
   // Read before the swap: a fragment target the swap replaces stops matching.
   var autofocus = __ipeAutofocusDue();
   __ipeMounted = true;
   __ipeSwapPreservingFocus(root, parsed);
-  if (autofocus && first !== null) __ipeFocusAutofocus(root, first);
+  if (autofocus && loadTarget !== null) __ipeFocusAutofocus(root, loadTarget);
   // behavior:"instant" keeps this housekeeping scroll a synchronous jump
   // even under a global `scroll-behavior: smooth`, which would otherwise
   // animate every restore and fight the caret on per-keystroke re-renders.

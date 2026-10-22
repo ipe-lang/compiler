@@ -95,7 +95,10 @@ not already `autofocus` in the render before, so a re-render while the user
 types never moves the caret. A render the user did not cause in that tab (a
 timer or subscription, another tab of the same session, a page reconnecting)
 never moves focus, and neither does one that lands after the user has moved
-focus elsewhere.
+focus elsewhere. After load the runtime alone moves focus: the `autofocus`
+attribute never reaches the live page from a later render, so the browser's
+own focus-on-insertion never fires, and a CSS `[autofocus]` selector matches
+only the page as loaded.
 
 **Focus ring.** The runtime injects a visible focus ring — a 3 px solid accent
 outline with a white halo — into every page via the global CSS reset. The ring

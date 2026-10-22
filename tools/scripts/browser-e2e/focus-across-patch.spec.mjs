@@ -14,7 +14,10 @@
  * The first mount focuses the root's `autofocus` only while the load's own
  * autofocus is still due; a later frame puts lost focus back, and moves focus
  * onto a newly `autofocus` field only when it answers this tab's own key,
- * applies as the next step, and focus has not moved since the key. A form's
+ * applies as the next step, and focus has not moved since the key. No
+ * `autofocus` attribute reaches the live DOM after load, so the browser's own
+ * focus-on-insertion never fires: a page loaded with focus on the body keeps
+ * it there through a render it did not cause. A form's
  * named controls shadow its members, so every member read on a node that may
  * be a form goes through the element prototypes: one test per read proves it.
  *
@@ -37,8 +40,9 @@ const BASE = `http://127.0.0.1:${PORT}`;
 /** The id of the focused element, "" when focus is on `body`. */
 const focusedId = (page) => page.evaluate(() => document.activeElement?.id ?? "");
 
-async function open(page) {
-  await page.goto(BASE);
+/** Opens the fixture; `query` (`noauto`, `tick`) picks its load state. */
+async function open(page, query = "") {
+  await page.goto(query ? `${BASE}/?${query}` : BASE);
   await page.waitForSelector('html[data-ipe-live="1"]', { timeout: 15000 });
 }
 
@@ -505,17 +509,76 @@ test("focus-across-patch: a render another tab's key caused never moves focus", 
   const a = await ctx.newPage();
   await open(a);
   await expect.poll(() => focusedId(a)).toBe("root");
-  // Tab A has an answered event of its own, sent with focus where it still is.
+  // Tab A's own key is sent, with focus where it still is, and its POST is
+  // held: A keeps the untaken record of its seq 1, and the server renders
+  // tab B's key as the next step on A's screen.
+  let release;
+  const held = new Promise((resolve) => {
+    release = resolve;
+  });
+  await a.route(
+    "**/_ipe/event",
+    async (route) => {
+      await held;
+      await route.continue();
+    },
+    { times: 1 },
+  );
   await a.keyboard.press("j");
-  await expect(a.locator("#keys")).toHaveText("keys: j");
+  await expect.poll(() => a.evaluate(() => window.__ipeFocusSends.map((r) => r.seq))).toEqual([1]);
+  await holdPatches(a);
   const b = await ctx.newPage();
   await open(b);
   await expect.poll(() => focusedId(b)).toBe("root");
   await b.keyboard.press("F2");
   await expect.poll(() => focusedId(b)).toBe("ask");
-  // The same render reaches tab A, which leaves its focus alone.
+  // B's frame reaches A naming B's tab and B's seq, the seq A holds a record of.
+  const frame = await firstHeld(a);
+  expect(frame.tab).not.toBe(await a.evaluate(() => window.__ipeTabId));
+  expect(frame.tabSeq).toBe(1);
+  expect(typeof frame.focus).toBe("string");
+  await deliverHeld(a);
   await expect(a.locator("input#ask")).toHaveCount(1);
   expect(await focusedId(a)).toBe("root");
+  expect(await a.evaluate(() => window.__ipeFocusSends.map((r) => r.seq))).toEqual([1]);
+  release();
+  await ctx.close();
+});
+
+/** Waits two rendering steps: the browser focuses an autofocus candidate in one. */
+const settle = (page) =>
+  page.evaluate(() => new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve))));
+
+/** Whether focus is on `body` itself. */
+const onBody = (page) => page.evaluate(() => document.activeElement === document.body);
+
+test("focus-across-patch: a timer's autofocus field never takes focus from the body", async ({ page }) => {
+  // No load autofocus and focus on the body: the browser would focus an
+  // inserted `autofocus` element itself.
+  await open(page, "noauto&tick");
+  expect(await page.locator("#root[autofocus]").count()).toBe(0);
+  await expect(page.locator("input#subask")).toHaveCount(1, { timeout: 5000 });
+  await settle(page);
+  expect(await onBody(page)).toBe(true);
+  expect(await page.locator("#ipe-root [autofocus]").count()).toBe(0);
+});
+
+test("focus-across-patch: another tab's autofocus field never takes focus from the body", async ({ browser }) => {
+  const ctx = await browser.newContext();
+  const a = await ctx.newPage();
+  await open(a, "noauto");
+  expect(await onBody(a)).toBe(true);
+  const b = await ctx.newPage();
+  await open(b, "noauto");
+  await b.click("#keys");
+  await expect.poll(() => focusedId(b)).toBe("root");
+  await b.keyboard.press("F2");
+  await expect.poll(() => focusedId(b)).toBe("ask");
+  await a.bringToFront();
+  await expect(a.locator("input#ask")).toHaveCount(1);
+  await settle(a);
+  expect(await onBody(a)).toBe(true);
+  expect(await a.locator("#ipe-root [autofocus]").count()).toBe(0);
   await ctx.close();
 });
 
