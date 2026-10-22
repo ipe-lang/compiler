@@ -780,20 +780,12 @@ pub fn emit_task_retry_call(
     child: u16,
     generics: GenericScope,
 ) -> DResult<Option<String>> {
-    let Callee::Kernel(
-        k @ (KernelFn::TaskRetryWith
-        | KernelFn::TaskLinearBackoff
-        | KernelFn::TaskExponentialBackoff
-        | KernelFn::TaskWithJitter
-        | KernelFn::TaskRetryOn
-        | KernelFn::TaskWithRetryOn
-        | KernelFn::TaskDefaultRetryPolicy
-        | KernelFn::TaskWithMaxAttempts
-        | KernelFn::TaskWithBaseMs),
-    ) = callee
-    else {
+    let Callee::Kernel(k) = callee else {
         return Ok(None);
     };
+    if !k.names_retry_policy_struct() {
+        return Ok(None);
+    }
 
     // `RetryPolicy e = { baseMs, maxAttempts, shouldRetry, strategy }` —
     // alphabetical BTreeMap order matches the emitted struct name.
@@ -995,7 +987,8 @@ pub fn emit_task_retry_call(
         }
         _ => Err(Diagnostic::CompilerBug {
             where_: "ipe_backend_rust::emit_task_retry_call",
-            detail: "non-retry kernel reached retry dispatch arm — guard should have excluded it"
+            detail: "`KernelFn::names_retry_policy_struct` lists a kernel the retry dispatch \
+                     has no arm for"
                 .to_owned(),
         }),
     }
@@ -3096,8 +3089,8 @@ pub fn emit_ui_plan(
             let Expr::Record { fields, .. } = cfg_e else {
                 return Err(Diagnostic::CompilerBug {
                     where_: "ipe_backend_rust::emit_ui_call::UiLayoutWith",
-                    detail: "Ui.layoutWith cfg must be an inline record literal \
-                             in Phase 0; non-literal cfg is deferred to Phase 1"
+                    detail: "Ui.layoutWith cfg must be an inline record literal; \
+                             lowering passes no other cfg shape"
                         .into(),
                 });
             };
@@ -3147,8 +3140,8 @@ pub fn emit_ui_plan(
             let Expr::Record { fields, .. } = cfg_e else {
                 return Err(Diagnostic::CompilerBug {
                     where_: "ipe_backend_rust::emit_ui_call::UiButton",
-                    detail: "Ui.button cfg must be an inline record literal \
-                             in Phase 0; non-literal cfg is deferred to Phase 1"
+                    detail: "Ui.button cfg must be an inline record literal; \
+                             lowering passes no other cfg shape"
                         .into(),
                 });
             };
@@ -3178,8 +3171,8 @@ pub fn emit_ui_plan(
             let Expr::Record { fields, .. } = cfg_e else {
                 return Err(Diagnostic::CompilerBug {
                     where_: "ipe_backend_rust::emit_ui_call::UiLink",
-                    detail: "Ui.link cfg must be an inline record literal \
-                             in Phase 0; non-literal cfg is deferred to Phase 1"
+                    detail: "Ui.link cfg must be an inline record literal; \
+                             lowering passes no other cfg shape"
                         .into(),
                 });
             };
@@ -3209,8 +3202,8 @@ pub fn emit_ui_plan(
             let Expr::Record { fields, .. } = cfg_e else {
                 return Err(Diagnostic::CompilerBug {
                     where_: "ipe_backend_rust::emit_ui_call::UiImage",
-                    detail: "Ui.image cfg must be an inline record literal \
-                             in Phase 0; non-literal cfg is deferred to Phase 1"
+                    detail: "Ui.image cfg must be an inline record literal; \
+                             lowering passes no other cfg shape"
                         .into(),
                 });
             };
@@ -3468,8 +3461,8 @@ pub fn emit_ui_plan(
             let Expr::Record { fields, .. } = cfg_e else {
                 return Err(Diagnostic::CompilerBug {
                     where_: "ipe_backend_rust::emit_ui_call::InputText",
-                    detail: "Input.text cfg must be an inline record literal in Phase 0; \
-                             non-literal cfg is deferred to Phase 1"
+                    detail: "Input.text cfg must be an inline record literal; \
+                             lowering passes no other cfg shape"
                         .into(),
                 });
             };
@@ -3531,7 +3524,7 @@ pub fn emit_ui_plan(
             let Expr::Record { fields, .. } = cfg_e else {
                 return Err(Diagnostic::CompilerBug {
                     where_: "ipe_backend_rust::emit_ui_call::InputMultiline",
-                    detail: "Input.multiline cfg must be an inline record literal in Phase 0"
+                    detail: "Input.multiline cfg must be an inline record literal; lowering passes no other cfg shape"
                         .into(),
                 });
             };
@@ -3592,7 +3585,7 @@ pub fn emit_ui_plan(
             let Expr::Record { fields, .. } = cfg_e else {
                 return Err(Diagnostic::CompilerBug {
                     where_: "ipe_backend_rust::emit_ui_call::InputCheckbox",
-                    detail: "Input.checkbox cfg must be an inline record literal in Phase 0".into(),
+                    detail: "Input.checkbox cfg must be an inline record literal; lowering passes no other cfg shape".into(),
                 });
             };
             let on_change_e = lookup_field(
@@ -3646,7 +3639,7 @@ pub fn emit_ui_plan(
             let Expr::Record { fields, .. } = cfg_e else {
                 return Err(Diagnostic::CompilerBug {
                     where_: "ipe_backend_rust::emit_ui_call::InputSlider",
-                    detail: "Input.slider cfg must be an inline record literal in Phase 0".into(),
+                    detail: "Input.slider cfg must be an inline record literal; lowering passes no other cfg shape".into(),
                 });
             };
             let on_change_e = lookup_field(
@@ -3714,7 +3707,7 @@ pub fn emit_ui_plan(
             let Expr::Record { fields, .. } = cfg_e else {
                 return Err(Diagnostic::CompilerBug {
                     where_: "ipe_backend_rust::emit_ui_call::InputRadio",
-                    detail: "Input.radio cfg must be an inline record literal in Phase 0".into(),
+                    detail: "Input.radio cfg must be an inline record literal; lowering passes no other cfg shape".into(),
                 });
             };
             let on_change_e = lookup_field(
@@ -3768,7 +3761,7 @@ pub fn emit_ui_plan(
             let Expr::Record { fields, .. } = cfg_e else {
                 return Err(Diagnostic::CompilerBug {
                     where_: "ipe_backend_rust::emit_ui_call::InputRadioRow",
-                    detail: "Input.radioRow cfg must be an inline record literal in Phase 0".into(),
+                    detail: "Input.radioRow cfg must be an inline record literal; lowering passes no other cfg shape".into(),
                 });
             };
             let on_change_e = lookup_field(

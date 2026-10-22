@@ -589,7 +589,7 @@ pub fn cmd_wiring_of_arm(body: &Expr) -> Option<CompileCmdWiring> {
 /// that wired the wrong effect crosses the Msg/effect trust boundary, so every
 /// non-enumerable Cmd refuses.
 #[must_use]
-pub fn arm_wiring_of_arm(body: &Expr) -> Option<ArmWiring<'_>> {
+pub const fn arm_wiring_of_arm(body: &Expr) -> Option<ArmWiring<'_>> {
     let Expr::Tuple(elems) = body else {
         return None;
     };

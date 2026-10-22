@@ -854,21 +854,28 @@ fn retry_policy_concrete_ir(interner: &Interner, ty: &Ty) -> Option<IrType> {
     // identity is the key used by `record_struct_by_key`.
     let mut ir_fields = BTreeMap::new();
     for sym in fields.keys() {
-        let name = interner.resolve(*sym)?;
-        let ir = match name {
-            "baseMs" | "maxAttempts" => IrType::Int,
-            // `shouldRetry : e -> Bool` — fix `e` to `IrType::Error` and carry
-            // the field on the `Arc<dyn Fn>` carrier. The kernel arrow type is
-            // already verified by `is_retry_policy_record` (the gate above).
-            "shouldRetry" => IrType::SharedFun(vec![IrType::Error], Box::new(IrType::Bool)),
-            // `strategy : BackoffStrategy` — dedicated IR leaf; the emitter
-            // renders `ipe_runtime::task::BackoffStrategy::*` constructors.
-            "strategy" => IrType::BackoffStrategy,
-            _ => return None,
-        };
+        let ir = retry_policy_field_ir(interner.resolve(*sym)?)?;
         ir_fields.insert(*sym, ir);
     }
     Some(IrType::Record(ir_fields))
+}
+
+/// The concrete IR type of the `RetryPolicy` field `name`, or `None` for a name outside the policy.
+fn retry_policy_field_ir(name: &str) -> Option<IrType> {
+    match name {
+        "baseMs" | "maxAttempts" => Some(IrType::Int),
+        // `shouldRetry : e -> Bool` — fix `e` to `IrType::Error` and carry
+        // the field on the `Arc<dyn Fn>` carrier. The kernel arrow type is
+        // verified by `is_retry_policy_record`.
+        "shouldRetry" => Some(IrType::SharedFun(
+            vec![IrType::Error],
+            Box::new(IrType::Bool),
+        )),
+        // `strategy : BackoffStrategy` — dedicated IR leaf; the emitter
+        // renders `ipe_runtime::task::BackoffStrategy::*` constructors.
+        "strategy" => Some(IrType::BackoffStrategy),
+        _ => None,
+    }
 }
 
 fn embeds_nonderivable_function(interner: &Interner, ty: &Ty) -> bool {
@@ -7016,11 +7023,10 @@ fn ir_type_has_ffi_foreign_handle(env: CloneEnv<'_>, ty: &IrType) -> bool {
 //     move |a| v(a) }` re-dispatch, in IR form.
 
 /// Positional facts about the live reads of a fn-typed binding `sym` in its
-/// scope, gathered by [`fn_value_read_flags`]. Reads inside a
-/// `requires_sync_capture` kernel-call argument are excluded — those slots are
-/// served by the dedicated sync-capture promotion path
-/// (`flows_into_sync_kernel_call` + `promote_unification_sibling_lambdas`),
-/// whose output is byte-pinned.
+/// scope, gathered by [`fn_value_read_flags`]. Every kernel-call argument is
+/// walked, a `requires_sync_capture` one included: an adapted slot is in
+/// handler normal form, so a read inside it sits in an ordinary closure the
+/// kernel calls per event.
 #[derive(Clone, Copy, Default)]
 struct FnValueReadFlags {
     /// A non-callee `Var`/`CloneVar` read inside a `Recallable` closure exists.
@@ -7290,15 +7296,6 @@ fn fn_value_read_flags_walk(
                 fn_value_read_flags_walk(sym, a, scope, flags);
             }
         }
-        // A sync-capture kernel argument is the sync-promotion path's slot —
-        // reads there are not this promotion's concern (see the struct doc).
-        Expr::Call { callee, args, .. } => {
-            if !matches!(callee, Callee::Kernel(k) if k.requires_sync_capture()) {
-                for a in args {
-                    fn_value_read_flags_walk(sym, a, scope, flags);
-                }
-            }
-        }
         Expr::Let { name, value, body } => {
             fn_value_read_flags_walk(sym, value, scope, flags);
             if *name != sym {
@@ -7337,7 +7334,7 @@ fn fn_value_read_flags_walk(
             fn_value_read_flags_walk(sym, then_, scope, flags);
             fn_value_read_flags_walk(sym, else_, scope, flags);
         }
-        Expr::Ctor { args, .. } | Expr::TailRecur { args } => {
+        Expr::Call { args, .. } | Expr::Ctor { args, .. } | Expr::TailRecur { args } => {
             for a in args {
                 fn_value_read_flags_walk(sym, a, scope, flags);
             }
@@ -7504,9 +7501,9 @@ fn eta_shared_rebind(
 /// Rewrite every live NON-CALLEE `Var(sym)` / `CloneVar(sym)` read in `expr`
 /// into the [`fn_read_shim`] re-dispatch closure. Direct callee reads
 /// (`Apply { func: sym, .. }`) stay — the `Arc` is called by auto-deref.
-/// Reads inside a `requires_sync_capture` kernel-call argument stay — the
-/// sync-capture promotion path owns those slots (mirrors
-/// [`fn_value_read_flags`], so trigger and rewrite cover the same read set).
+/// Reads inside every kernel-call argument are rewritten, a
+/// `requires_sync_capture` one included (the read set of
+/// [`fn_value_read_flags`], so trigger and rewrite cover the same reads).
 /// Shadow discipline mirrors [`count_fn_value_uses`]; enumerated exhaustively
 /// (no `_` catch-all).
 fn shim_fn_value_reads(
@@ -8524,24 +8521,12 @@ fn shim_fn_value_reads_at(site: &ShimSite<'_>, expr: Expr, in_storage: bool) -> 
             args,
             pin,
             on_form,
-        } => {
-            // Sync-capture kernel args stay untouched (see the fn doc).
-            if matches!(&callee, Callee::Kernel(k) if k.requires_sync_capture()) {
-                Ok(Expr::Call {
-                    callee,
-                    args,
-                    pin,
-                    on_form,
-                })
-            } else {
-                Ok(Expr::Call {
-                    callee,
-                    args: recurse_all(args)?,
-                    pin,
-                    on_form,
-                })
-            }
-        }
+        } => Ok(Expr::Call {
+            callee,
+            args: recurse_all(args)?,
+            pin,
+            on_form,
+        }),
         Expr::Lambda {
             params,
             ret: lret,
@@ -9544,13 +9529,21 @@ fn collect_func_edges(expr: &Expr, out: &mut BTreeSet<FuncId>) {
 /// traversal mirrors [`collect_func_edges`] arm-for-arm so a new `Expr` variant
 /// that could nest a call is a compile error here too, not a silent miss.
 fn body_uses_kernel(expr: &Expr, kernel: KernelFn) -> bool {
-    let recur = |e: &Expr| body_uses_kernel(e, kernel);
+    body_uses_kernel_where(expr, |k| k == kernel)
+}
+
+/// Whether `expr` calls or references, anywhere in its tree, a kernel `wanted` selects.
+///
+/// The one traversal behind [`body_uses_kernel`], for a kernel set such as
+/// [`KernelFn::names_retry_policy_struct`].
+fn body_uses_kernel_where(expr: &Expr, wanted: impl Fn(KernelFn) -> bool + Copy) -> bool {
+    let recur = |e: &Expr| body_uses_kernel_where(e, wanted);
     match expr {
         Expr::Call { callee, args, .. } => {
-            matches!(callee, Callee::Kernel(k) if *k == kernel) || args.iter().any(recur)
+            matches!(callee, Callee::Kernel(k) if wanted(*k)) || args.iter().any(recur)
         }
         Expr::FuncValue { callee, .. } => {
-            matches!(callee, Callee::Kernel(k) if *k == kernel)
+            matches!(callee, Callee::Kernel(k) if wanted(*k))
         }
         Expr::Apply { func, args } => recur(func) || args.iter().any(recur),
         Expr::Let { value, body, .. } | Expr::Destructure { value, body, .. } => {
@@ -9670,6 +9663,46 @@ fn backend_named_enum_roots(
         .collect()
 }
 
+/// The collected record shapes the backend names without any IR type slot naming them.
+///
+/// The `RetryPolicy` struct: every kernel whose emitted code builds, updates,
+/// or reads it by its field set ([`KernelFn::names_retry_policy_struct`])
+/// needs it emitted, and a program whose policy comes only from such kernels
+/// (`Task.retryOn pred Task.defaultRetryPolicy`) mentions the record in no
+/// signature or body slot. It is rooted iff some surviving function calls
+/// one of those kernels.
+fn backend_named_record_roots(
+    funcs: &[Func],
+    records: &[IrType],
+    interner: &Interner,
+) -> Vec<IrType> {
+    if !funcs
+        .iter()
+        .any(|f| body_uses_kernel_where(&f.body, KernelFn::names_retry_policy_struct))
+    {
+        return Vec::new();
+    }
+    records
+        .iter()
+        .filter(|r| is_retry_policy_ir(interner, r))
+        .cloned()
+        .collect()
+}
+
+/// Whether `ty` is the concrete `RetryPolicy` record [`retry_policy_concrete_ir`] builds.
+fn is_retry_policy_ir(interner: &Interner, ty: &IrType) -> bool {
+    let IrType::Record(fields) = ty else {
+        return false;
+    };
+    fields.len() == ipe_types::RETRY_POLICY_FIELDS.len()
+        && fields.iter().all(|(name, field_ty)| {
+            interner
+                .resolve(*name)
+                .and_then(retry_policy_field_ir)
+                .is_some_and(|want| want == *field_ty)
+        })
+}
+
 /// The functions the backend invokes without any IR call edge naming them.
 ///
 /// Two kinds, in function order: every wasm-hydration island projection
@@ -9770,6 +9803,7 @@ fn collect_ir_type_refs(
 fn prune_dead_type_decls(
     funcs: &[Func],
     extra_enum_roots: &[(ModPath, Symbol)],
+    extra_record_roots: &[IrType],
     types_ir: &mut Vec<TypeDef>,
     records: &mut Vec<IrType>,
 ) {
@@ -9780,6 +9814,9 @@ fn prune_dead_type_decls(
     let mut reachable_enums: BTreeSet<(ModPath, Symbol)> =
         extra_enum_roots.iter().cloned().collect();
     let mut reachable_records: std::collections::HashSet<IrType> = std::collections::HashSet::new();
+    for root in extra_record_roots {
+        collect_ir_type_refs(root, &mut reachable_enums, &mut reachable_records);
+    }
     for f in funcs {
         collect_ir_type_refs(&f.ret, &mut reachable_enums, &mut reachable_records);
         for ipe_ir::Param { ty: t, .. } in &f.params {
@@ -10886,21 +10923,41 @@ fn reject_off_intercept_store_kernel(callee: &Callee, span: Span) -> DResult<()>
     Ok(())
 }
 
-/// The core of `expr` under its leading plain `let`s (every binder a `PVar`).
+/// How many of the IR `let` names `names` are `expr`'s leading plain `let`s, and the core under them.
 ///
-/// A plain `let` lowers to an IR `Let` of the same name, so the core is the
-/// canon source of the IR core [`Lowerer::normalize_handler`] peels; a
-/// destructuring `let` stays part of the core, as it does in the IR.
-fn plain_let_core(expr: &canon::Expr) -> &canon::Expr {
+/// A plain `let` group (every binder a `PVar`) lowers to one IR `Let` per
+/// binder, same name, same order, so a group is matched only when the next
+/// names are exactly its binders. The walk stops at the first group that does
+/// not match (a destructuring binder, a `let` the IR spells otherwise, a `let`
+/// the lowerer synthesised). The IR `let`s from there on stay inside the core
+/// whose source the returned canon core is, so the captures classified from
+/// it are exactly the locals that IR core reads.
+fn hoistable_plain_lets<'c>(expr: &'c canon::Expr, names: &[Symbol]) -> (usize, &'c canon::Expr) {
     let mut core = expr;
+    let mut matched = 0;
     while let canon::Expr_::Let(bindings, body) = &core.value
+        && let Some(rest) = names.get(matched..)
+        && bindings.len() <= rest.len()
         && bindings
             .iter()
-            .all(|b| matches!(b.pat.value, canon::Pattern_::PVar(_)))
+            .zip(rest)
+            .all(|(b, name)| matches!(b.pat.value, canon::Pattern_::PVar(n) if n == *name))
     {
+        matched += bindings.len();
         core = body;
     }
-    core
+    (matched, core)
+}
+
+/// `lets` (outermost first) wrapped around `body`.
+fn fold_lets(lets: Vec<(Symbol, Expr)>, body: Expr) -> Expr {
+    lets.into_iter()
+        .rev()
+        .fold(body, |body, (name, value)| Expr::Let {
+            name,
+            value: Box::new(value),
+            body: Box::new(body),
+        })
 }
 
 /// Fail-closed SEAL gate for an adapted-callback kernel whose handler is not supplied.
@@ -16741,7 +16798,14 @@ impl<'a> Lowerer<'a> {
         // enums (appended below) can never reference a pruned declaration.
         if prune_dead {
             let extra_enum_roots = backend_named_enum_roots(&funcs, &types_ir, self.interner);
-            prune_dead_type_decls(&funcs, &extra_enum_roots, &mut types_ir, &mut records);
+            let extra_record_roots = backend_named_record_roots(&funcs, &records, self.interner);
+            prune_dead_type_decls(
+                &funcs,
+                &extra_enum_roots,
+                &extra_record_roots,
+                &mut types_ir,
+                &mut records,
+            );
         }
 
         // Every synthesized Prelude enum lives in (or aliases into) the Db
@@ -20547,15 +20611,46 @@ impl<'a> Lowerer<'a> {
         Ok(site)
     }
 
+    /// Put the adapted slots of an intercepted kernel call in handler normal form.
+    ///
+    /// An intercept lowers its arguments one to one, so `lowered_args` pairs
+    /// with `args` by position; a kernel with adapted slots whose intercept
+    /// changed the argument count is a compiler bug, never a slot left
+    /// unnormalized for the backend to refuse.
+    fn normalize_intercepted_handler_args(
+        &self,
+        resolved: &Callee,
+        args: &[canon::Expr],
+        lowered_args: &mut [Expr],
+        span: Span,
+    ) -> DResult<()> {
+        let Callee::Kernel(kernel) = resolved else {
+            return Ok(());
+        };
+        if kernel.adapted_slots().is_empty() {
+            return Ok(());
+        }
+        if lowered_args.len() != args.len() {
+            return Err(bug(
+                "ipe_lower::normalize_intercepted_handler_args",
+                "an intercepted adapted-callback call changed its argument count",
+            ));
+        }
+        self.normalize_adapted_handler_args(resolved, args, lowered_args, EtaDemand::EMPTY, span)
+            .map(|_| ())
+    }
+
     /// Rewrite the function-valued handler `slot` (canon source `canon`) into handler normal form.
     ///
-    /// The leading `let`s are kept outside, evaluated once where the handler
-    /// is built. A closure-literal core stays as it is; any other core (a
-    /// variable, a call returning a function, an `if`, a `case`) is
-    /// eta-wrapped into `\x1..xn -> core x1..xn` over the slot's `arity`
-    /// parameters, re-evaluated per call exactly as the kernel would call it.
-    /// The wrap's captures are the locals free in the canon core (the source
-    /// under its leading plain `let`s) and are classified by
+    /// A closure-literal core under the slot's leading `let`s stays as it is,
+    /// the `let`s outside, evaluated once where the handler is built. Any other
+    /// core (a variable, a call returning a function, an `if`, a `case`, a
+    /// destructure) is eta-wrapped into `\x1..xn -> core x1..xn` over the
+    /// slot's `arity` parameters, re-evaluated per call exactly as the kernel
+    /// would call it. Only the IR `let`s that are the source's leading plain
+    /// `let`s ([`hoistable_plain_lets`]) stay outside the wrap; every other
+    /// `let` is part of the wrapped core. The wrap's captures are the locals
+    /// free in the matching canon core and are classified by
     /// [`Self::clone_eta_body_captures`]: a `Clone` capture clones, a moved
     /// non-`Clone` one makes the closure an [`Expr::OnceLambda`] the once check
     /// refuses with IPE-L0126. The wrap's eta block is charged to `site`.
@@ -20578,6 +20673,9 @@ impl<'a> Lowerer<'a> {
             core,
             Expr::Lambda { .. } | Expr::SharedLambda { .. } | Expr::OnceLambda { .. }
         ) {
+            let names: Vec<Symbol> = lets.iter().map(|&(name, _)| name).collect();
+            let (hoisted, canon_core) = hoistable_plain_lets(canon, &names);
+            core = fold_lets(lets.split_off(hoisted), core);
             site = site
                 .charge(arity)
                 .ok_or_else(|| unsupported(span, Feature::EtaSiteLimit))?;
@@ -20603,22 +20701,9 @@ impl<'a> Lowerer<'a> {
                 func: Box::new(core),
                 args: params.iter().map(|&(sym, _)| Expr::Var(sym)).collect(),
             };
-            core = self.clone_eta_body_captures(
-                &[plain_let_core(canon)],
-                canon.span,
-                params,
-                ret,
-                body,
-            )?;
+            core = self.clone_eta_body_captures(&[canon_core], canon.span, params, ret, body)?;
         }
-        *slot = lets
-            .into_iter()
-            .rev()
-            .fold(core, |body, (name, value)| Expr::Let {
-                name,
-                value: Box::new(value),
-                body: Box::new(body),
-            });
+        *slot = fold_lets(lets, core);
         Ok(site)
     }
 
@@ -20686,10 +20771,8 @@ impl<'a> Lowerer<'a> {
             let flags = fn_value_read_flags(sym, &body);
             // The sync-capture flow check mirrors the `lower_let_pvar`
             // trigger: a fn param captured inside a `requires_sync_capture`
-            // kernel argument is moved out of the wrapper `Fn` closure's env
-            // per call (E0507) unless it rides the `Clone` `Arc` carrier —
-            // the flags walk deliberately excludes those slots, so the flow
-            // check is the param-side trigger for them.
+            // kernel argument rides the `Clone` `Arc` carrier even when its
+            // only read there is a borrowing callee one.
             if flags.move_in_recallable
                 || flags.any_past
                 || count_fn_value_uses(sym, &body) > 1
@@ -23941,9 +24024,26 @@ impl<'a> Lowerer<'a> {
             return self.lower_call(inner_callee, &merged, call_span);
         }
 
-        // App-entry / Web.route intercepts — see the helper.
+        // App-entry / Web.route intercepts — see the helper. An intercepted
+        // call to an adapted-callback kernel (`Input.text`'s cfg record) skips
+        // the uniform choke point, so its slots take handler normal form here.
         match self.intercept_web_kernel_call(callee, args, call_span)? {
-            Intercepted::Done(e) => Ok(e),
+            Intercepted::Done(mut e) => {
+                if let Expr::Call {
+                    callee: resolved @ Callee::Kernel(_),
+                    args: lowered_args,
+                    ..
+                } = &mut e
+                {
+                    self.normalize_intercepted_handler_args(
+                        resolved,
+                        args,
+                        lowered_args,
+                        call_span,
+                    )?;
+                }
+                Ok(e)
+            }
             Intercepted::Fallthrough(peeked) => {
                 self.lower_call_uniform(callee, args, call_span, peeked)
             }

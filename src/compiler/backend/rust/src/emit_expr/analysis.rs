@@ -2,7 +2,7 @@ use super::{
     Diagnostic, Expr, Func, IrType, LowerError, MAX_IR_RENDER_DEPTH, Span, Symbol, wants_arc_ctor,
 };
 
-pub use ipe_ir::free_vars::{collect_free_vars, free_vars};
+pub use ipe_ir::free_vars::free_vars;
 pub use ipe_ir::let_inline::inlined_let_body;
 use ipe_ir::let_inline::pat_binds_target;
 pub use ipe_ir::seq_clone::clone_targets_in_expr;

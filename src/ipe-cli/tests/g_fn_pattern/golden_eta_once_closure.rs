@@ -807,3 +807,225 @@ fn clone_capturing_adapted_handlers_build_and_run() {
         outcome.stdout
     );
 }
+
+/// Adapted-callback slot shapes beyond a bare partial.
+///
+/// A slot under leading `let`s that mixes plain bindings with a destructure,
+/// a `let`-bound function returned or passed on, an outer `let`-bound handler,
+/// a record field (`Input.text`'s `onChange`) under a `let`, a pipe, a `case`,
+/// `Ui.onSubmit`, and a `Lazy.lazy2` partial: each must reach the backend in
+/// handler normal form, and every element still reads `model` as a sibling.
+/// An outer `let`-bound or parameter handler passed on as a value inside a
+/// handler (`apply g`) is re-dispatched, never handed over as its `Arc`
+/// carrier to an `impl Fn` parameter (E0277).
+const HANDLER_SHAPES: &str = r#"module Main exposing (main)
+
+import Ipe.Error as Error exposing (Error)
+import Ipe.Html as Html
+import Ipe.Io as Io
+import Ipe.String
+import Ipe.Task as Task
+import Ipe.Ui as Ui exposing (Element)
+import Ipe.Ui.Input as Input
+import Ipe.Ui.Lazy as Lazy
+
+
+type alias Model =
+    { keys : String }
+
+
+type Msg
+    = KeyDown String String
+    | Toggled String Bool
+
+
+offers : Model -> String
+offers m =
+    m.keys
+
+
+pick : Model -> String -> Msg
+pick m key =
+    KeyDown m.keys key
+
+
+apply : (String -> Msg) -> String -> Msg
+apply f key =
+    f key
+
+
+item : String -> String -> Element Msg
+item prefix label =
+    Ui.text (prefix ++ label)
+
+
+item2 : String -> String -> String -> Element Msg
+item2 prefix a b =
+    Ui.text (prefix ++ a ++ b)
+
+
+handleKey : String -> Msg
+handleKey k =
+    KeyDown "top" k
+
+
+mixedDestructure : Model -> Element Msg
+mixedDestructure model =
+    let
+        pair =
+            ( model.keys, "q" )
+    in
+    Ui.column
+        [ Ui.onKeyDown
+            (let
+                a =
+                    offers model
+
+                ( p, q ) =
+                    pair
+             in
+             KeyDown (a ++ p ++ q)
+            )
+        , Ui.onKeyUp
+            (let
+                a =
+                    offers model
+
+                ( p, _ ) =
+                    pair
+             in
+             if p == "" then
+                KeyDown a
+
+             else
+                KeyDown (a ++ p)
+            )
+        ]
+        [ Ui.text model.keys ]
+
+
+letAliases : Model -> Element Msg
+letAliases model =
+    let
+        g =
+            pick model
+    in
+    Ui.column
+        [ Ui.onKeyDown
+            (let
+                h =
+                    pick model
+             in
+             h
+            )
+        , Ui.onKeyUp
+            (let
+                h =
+                    pick model
+             in
+             apply h
+            )
+        , Ui.onInput g
+        , Ui.onChange (apply g)
+        , Ui.onFile
+            (let
+                h =
+                    \k -> KeyDown model.keys k
+             in
+             h
+            )
+        ]
+        [ Input.text []
+            { onChange =
+                let
+                    h =
+                        pick model
+                in
+                h
+            , text = model.keys
+            , placeholder = Nothing
+            , label = Input.labelLeft [] (Ui.text model.keys)
+            }
+        , Ui.text model.keys
+        ]
+
+
+pipesAndCases : Model -> Element Msg
+pipesAndCases model =
+    Ui.column
+        [ model |> pick |> Ui.onKeyDown
+        , Ui.onKeyUp <| pick model
+        , Ui.onInput handleKey
+        , Ui.onChange
+            (case model.keys of
+                "" ->
+                    KeyDown "a"
+
+                _ ->
+                    KeyDown (offers model)
+            )
+        , Ui.onSubmit (KeyDown (offers model))
+        ]
+        [ Lazy.lazy2 (item2 (offers model)) model.keys "b", Ui.text model.keys ]
+
+
+paramHandler : (String -> Msg) -> Model -> Element Msg
+paramHandler handler model =
+    Ui.column
+        [ Ui.onChange (apply handler)
+        , Ui.onKeyDown handler
+        ]
+        [ Ui.text model.keys ]
+
+
+view : Model -> Element Msg
+view model =
+    Ui.column []
+        [ mixedDestructure model
+        , letAliases model
+        , pipesAndCases model
+        , paramHandler (pick model) model
+        ]
+
+
+main : Task Error ()
+main =
+    let
+        model =
+            { keys = "keys" }
+    in
+    Io.println (Html.render (Ui.layout [] (view model)) ++ "|" ++ model.keys)
+"#;
+
+/// Every adapted-callback slot shape of [`HANDLER_SHAPES`] passes ipe.
+#[test]
+fn adapted_handler_shapes_pass_ipe() {
+    let (built, _) = build_source("eta_once_handler_shapes", HANDLER_SHAPES);
+    assert!(
+        built.is_ok(),
+        "every adapted-callback slot shape must pass ipe: {:?}",
+        built.err()
+    );
+}
+
+/// cargo-0 and run-correct for [`HANDLER_SHAPES`]: gated on `IPE_E2E=1` (THE SEAL).
+#[test]
+fn adapted_handler_shapes_build_and_run() {
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
+        return;
+    }
+    let (built, out) = build_source("eta_once_handler_shapes_e2e", HANDLER_SHAPES);
+    assert!(built.is_ok(), "the build must succeed: {:?}", built.err());
+    let outcome = crate::support::build_and_run_emitted("eta_once_handler_shapes", &out);
+    assert_eq!(
+        outcome.exit_code,
+        Some(0),
+        "the adapted-callback slot shapes must build and exit 0 (no E0382/E0507); stdout: {:?}",
+        outcome.stdout
+    );
+    assert!(
+        outcome.stdout.contains("keyskeysb") && outcome.stdout.trim_end().ends_with("|keys"),
+        "must render the lazy view and the model; got: {:?}",
+        outcome.stdout
+    );
+}

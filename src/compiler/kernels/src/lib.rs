@@ -16015,6 +16015,28 @@ impl StdlibKernel {
         )
     }
 
+    /// Whether the backend emits this kernel's call by naming the synthesised `RetryPolicy` struct.
+    ///
+    /// The emitted code of each listed kernel builds, updates, or reads the
+    /// `RetryPolicy` record struct by its field set, so the struct must be
+    /// emitted whenever a surviving function calls one of them, even when no
+    /// IR type slot of the program names the record.
+    #[must_use]
+    pub const fn names_retry_policy_struct(self) -> bool {
+        matches!(
+            self,
+            Self::TaskRetryWith
+                | Self::TaskLinearBackoff
+                | Self::TaskExponentialBackoff
+                | Self::TaskWithJitter
+                | Self::TaskRetryOn
+                | Self::TaskWithRetryOn
+                | Self::TaskDefaultRetryPolicy
+                | Self::TaskWithMaxAttempts
+                | Self::TaskWithBaseMs
+        )
+    }
+
     /// The argument slots the backend adapts into a callback closure of its own.
     ///
     /// Each listed slot holds, after lowering, the handler normal form: leading
