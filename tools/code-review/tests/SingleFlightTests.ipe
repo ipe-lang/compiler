@@ -1,15 +1,19 @@
 module SingleFlightTests exposing (checks)
 
+import Ipe.ByteSize as ByteSize
 import Ipe.Db as Db
 import Ipe.Error as Error exposing (Error)
+import Ipe.File as File
 import Ipe.Html as Html
 import Ipe.Io as Io
 import Ipe.List as List
 import Ipe.Maybe as Maybe
+import Ipe.Path as Path
 import Ipe.Result exposing (Result(..))
 import Ipe.String as String
 import Ipe.System as System
 import Ipe.Task as Task
+import Ipe.Time.Timestamp as Timestamp
 import Ipe.Ui as Ui
 import Lib.App as App exposing (Model, Msg(..), Page(..))
 import Lib.Db as LibDb exposing (Decision(..))
@@ -18,13 +22,14 @@ import Lib.Epoch as Epoch exposing (Epoch)
 import Lib.Failure as Failure exposing (DecideRefusal(..), LoadFailure(..), ReasonRefusal(..), RefuseFailure(..), SaveFailure(..))
 import Lib.Index as Index exposing (Change(..), RefusalReason(..), SourceView(..), StaleReason(..))
 import Lib.Keys as Keys
-import Lib.Queue as Queue exposing (DecisionSlot(..), DecisionTarget(..), HistoryState(..), QueueState(..), RefusalPanel(..), SelectedView(..), StandingRead(..), UnitPageState(..))
+import Lib.Queue as Queue exposing (DecisionSlot(..), DecisionTarget(..), HistoryState(..), HistoryWant(..), QueueState(..), QueueWant(..), RefusalPanel(..), SelectedView(..), Settle(..), StandingRead(..), UnitPageState(..))
 import Lib.ReviewKey as ReviewKey exposing (ReviewKey(..))
 import Lib.SafeText as SafeText
 import Lib.Settings as Settings
 import Lib.Uid as Uid exposing (Uid)
 import Lib.View as View
 import TestSupport exposing (Scratch, check, checkReporting, cleanupIndex, decideNow, envAppSettings, execIndex, fixtureLibRs, freshScratch, loadPageNow, loadUnitNow, migratedReviewAt, refusalOf, removeFileIfAny, seedIndex, testMacKey, uid, labelOf, labelText, viewA, writeFileText)
+import TextSinkScanTests
 
 
 -- Every check drives the app's own `App.update`, the dispatch `src/Main.ipe`
@@ -248,7 +253,7 @@ oneReadSlotAcrossPages settings a b =
             after settings [ Navigated QueuePage ] unitReading
 
         queueLoaded =
-            after settings [ PendingLoaded backOnQueue.queueLoad (Ok (queuePageOf [ a, b ])) ] backOnQueue
+            after settings [ PendingLoaded (Queue.latestTicket backOnQueue.queueLoad) (Ok (queuePageOf [ a, b ])) ] backOnQueue
     in
     inFlight onUnitPage == Just ( ua, Just ub )
         && inFlight keysOnUnitPage == Just ( ua, Just ub )
@@ -281,7 +286,7 @@ unitPageSettlesOnItsOwnRead settings a b =
             after settings [ SelectedViewLoaded ua settings.epoch (Ok (Just a)) ] waiting
 
         queueLoaded =
-            after settings [ PendingLoaded otherReturned.queueLoad (Ok (queuePageOf [ a ])) ] otherReturned
+            after settings [ PendingLoaded (Queue.latestTicket otherReturned.queueLoad) (Ok (queuePageOf [ a ])) ] otherReturned
 
         ownReturned =
             after settings [ SelectedViewLoaded ub settings.epoch (Ok (Just b)) ] queueLoaded
@@ -412,7 +417,7 @@ refusalPanelLivesInIdleSlot settings a b file =
             after settings [ Navigated QueuePage ] opened
 
         reloaded =
-            after settings [ PendingLoaded reloading.queueLoad (Ok (queuePageOf [ a, b ])) ] reloading
+            after settings [ PendingLoaded (Queue.latestTicket reloading.queueLoad) (Ok (queuePageOf [ a, b ])) ] reloading
     in
     offers shown ua
         && offers secondShown ub
@@ -770,7 +775,7 @@ foreignReadIsIdle settings otherEpoch a b =
             after settings [ Navigated QueuePage ] stale
 
         queueLoaded =
-            after settings [ PendingLoaded reloading.queueLoad (Ok (queuePageOf [ a, b ])) ] reloading
+            after settings [ PendingLoaded (Queue.latestTicket reloading.queueLoad) (Ok (queuePageOf [ a, b ])) ] reloading
 
         historyEntered =
             after settings [ Navigated HistoryPage ] stale
@@ -1077,6 +1082,9 @@ standingFailure read =
         StandingShown _ _ _ ->
             Nothing
 
+        StandingReading _ _ _ _ ->
+            Nothing
+
 
 -- A queue load's failure is decided from the error's details and kind, never
 -- its text: a busy database is `LoadContended`, a ceiling passed
@@ -1090,7 +1098,7 @@ queueLoadFailureTyped settings a =
             after settings [ Navigated QueuePage ] initialModel
 
         settle result =
-            after settings [ App.queueLoaded loading.queueLoad result ] loading
+            after settings [ App.queueLoaded (Queue.latestTicket loading.queueLoad) result ] loading
 
         busy =
             settle (Err busyMarker)
@@ -1126,7 +1134,7 @@ historyLoadFailureTyped settings =
             after settings [ Navigated HistoryPage ] initialModel
 
         settle result =
-            after settings [ App.historyLoaded loading.historyLoad result ] loading
+            after settings [ App.historyLoaded (Queue.latestTicket loading.historyLoad) result ] loading
 
         limit =
             settle (Err limitMarker)
@@ -1228,8 +1236,11 @@ standingLoadFailureTyped settings a =
         shown =
             queueModel [ a ] (ViewShown a)
 
+        ( reading, _ ) =
+            Queue.standingRequested settings.epoch ua (Index.storedHash a.unit.attested) StandingUnread
+
         onUnitPage =
-            { shown | page = unitAt ua }
+            { shown | page = unitAt ua, standing = reading }
 
         settle result =
             after settings [ App.standingLoaded ua (Index.storedHash a.unit.attested) settings.epoch result ] onUnitPage
@@ -1727,19 +1738,22 @@ writtenStaysPending settings a b file pair =
             after settings (drawnOn written ua ApproveRow ++ [ press written "a" ] ++ drawnOn (withRefusal file written) file.uid ApproveRow) written
 
         olderLoad =
-            after settings [ PendingLoaded saving.queueLoad (Ok (queuePageOf [ a, b ])) ] pressed
+            after settings [ PendingLoaded (Queue.latestTicket saving.queueLoad) (Ok (queuePageOf [ a, b ])) ] pressed
 
         reloaded =
-            after settings [ PendingLoaded written.queueLoad (Ok (queuePageOf [ b ])) ] pressed
+            after settings [ PendingLoaded (Queue.latestTicket written.queueLoad) (Ok (queuePageOf [ b ])) ] pressed
 
         reloadFailed =
-            after settings [ App.queueLoaded written.queueLoad (Err (Error.conflict "boom")) ] pressed
+            after settings [ App.queueLoaded (Queue.latestTicket written.queueLoad) (Err (Error.conflict "boom")) ] pressed
 
         superseding =
             after settings [ Navigated QueuePage ] pressed
 
+        drainReturned =
+            after settings [ PendingLoaded (Queue.latestTicket written.queueLoad) (Ok (queuePageOf [ a, b ])) ] superseding
+
         superseded =
-            after settings [ PendingLoaded written.queueLoad (Ok (queuePageOf [ a, b ])), PendingLoaded superseding.queueLoad (Ok (queuePageOf [ b ])) ] superseding
+            after settings [ PendingLoaded (Queue.latestTicket drainReturned.queueLoad) (Ok (queuePageOf [ b ])) ] drainReturned
 
         writtenPage =
             page written
@@ -1754,6 +1768,7 @@ writtenStaysPending settings a b file pair =
         && reloaded.decision == DecisionIdle PanelClosed
         && reloadFailed.decision == DecisionIdle PanelClosed
         && superseding.decision == DecisionRefreshing ua settings.epoch
+        && drainReturned.decision == DecisionRefreshing ua settings.epoch
         && superseded.decision == DecisionIdle PanelClosed
 
 
@@ -1777,10 +1792,10 @@ notSavedClearedByReload settings a b =
             after settings [ Navigated QueuePage ] failed
 
         reloaded =
-            after settings [ PendingLoaded reloading.queueLoad (Ok (queuePageOf [ a, b ])) ] reloading
+            after settings [ PendingLoaded (Queue.latestTicket reloading.queueLoad) (Ok (queuePageOf [ a, b ])) ] reloading
 
         reloadFailed =
-            after settings [ App.queueLoaded reloading.queueLoad (Err (Error.conflict "boom")) ] reloading
+            after settings [ App.queueLoaded (Queue.latestTicket reloading.queueLoad) (Err (Error.conflict "boom")) ] reloading
 
         banner =
             Html.escapeHtml ("Decision not saved: " ++ Failure.saveFailureText SaveFailed)
@@ -1816,13 +1831,13 @@ notSavedOutlivesOlderLoad settings a b =
             after settings [ App.decisionSaved ua settings.epoch (Err (Error.conflict "boom")) ] enteredWhileSaving
 
         olderLoaded =
-            after settings [ PendingLoaded enteredWhileSaving.queueLoad (Ok (queuePageOf [ a, b ])) ] failed
+            after settings [ PendingLoaded (Queue.latestTicket enteredWhileSaving.queueLoad) (Ok (queuePageOf [ a, b ])) ] failed
 
         reloading =
             after settings [ Navigated QueuePage ] olderLoaded
 
         reloaded =
-            after settings [ PendingLoaded reloading.queueLoad (Ok (queuePageOf [ a, b ])) ] reloading
+            after settings [ PendingLoaded (Queue.latestTicket reloading.queueLoad) (Ok (queuePageOf [ a, b ])) ] reloading
 
         banner =
             Html.escapeHtml ("Decision not saved: " ++ Failure.saveFailureText SaveFailed)
@@ -1855,7 +1870,11 @@ writtenChecks =
         pair <- decideNow db (uid "u-a") Approved
         cleanupIndex at.indexDb at.repo
         removeFileIfAny at.reviewDb
-        Task.succeed [ ( "a saved decision withholds its row's controls until the queue reload settles", writtenStaysPending settings a b file pair ) ]
+        Task.succeed
+            [ ( "a saved decision withholds its row's controls until the queue reload settles", writtenStaysPending settings a b file pair )
+            , ( "a decision saved during a queue load stays refreshing until its drain settles", refreshingSettlesOnlyAfterWrite settings a b pair )
+            , ( "a wanted drain absorbs a page turn and replaces a wanted reload", drainAbsorbsReload settings pair )
+            ]
 
 
 checks : Task.Task Error (List ( String, Bool ))
@@ -1865,6 +1884,7 @@ checks =
         seededChecks
         (check "a decision off the shown list or source is refused before any read" decisionRefusedBeforeReading)
         |> Task.andThen (\rows -> check "Enter in an unreviewable file's refusal panel submits that file's refusal" enterRefusesOpenFile |> Task.map (\entered -> rows ++ [ entered ]))
+        |> Task.andThen (\rows -> check "every task in src starts at its slot's one start site" everyTaskStartsAtItsSlot |> Task.map (\scanned -> rows ++ [ scanned ]))
 
 
 -- Enter in the refusal panel open on an acknowledgeable file the page lists
@@ -1935,6 +1955,13 @@ seededChecks =
             , ( "a reason of astral characters at the limit fits the draft, and the input maxlength admits no more than the draft holds", astralDraftWithinMaxlength settings a b )
             , ( "the reason input's maxlength derives from the reason limit", refusePanelMaxlengthFromSsot settings a b )
             , ( "Confirm after a cut records exactly the shown text", confirmRecordsShownText settings a b )
+            , ( "a press on an idle queue slot starts exactly one load", idlePressStartsOneLoad settings )
+            , ( "presses during a queue load start no second load and want only the last page", queueLoadsSingleFlight settings a )
+            , ( "a queue page superseded while loading is dropped and the wanted page settles", supersededQueueResultDropped settings a b )
+            , ( "presses during a History load start no second load and want only the last page", historyLoadsSingleFlight settings )
+            , ( "source reads settling during a standing read start no second standing read", standingSingleFlight settings a b )
+            , ( "a load slot or standing read held under another process's epoch is idle", foreignLoadSlotIdle settings otherEpoch a )
+            , ( "a queue load refused with an error frees its slot", ceilingRefusalReleasesSlot settings )
             ]
         )
         |> Task.andThen (\rows -> writtenChecks |> Task.map (\written -> rows ++ written))
@@ -2097,7 +2124,7 @@ staleAckAfterDigestChangeDecidesNothing r =
             queuePageOf [ r.a, r.b ]
 
         reloaded =
-            after r.settings [ PendingLoaded reloading.queueLoad (Ok { changedPage | refusals = [ r.file2 ] }) ] reloading
+            after r.settings [ PendingLoaded (Queue.latestTicket reloading.queueLoad) (Ok { changedPage | refusals = [ r.file2 ] }) ] reloading
 
         stale =
             after r.settings (drawnOn listed fileUid ApproveRow) reloaded
@@ -2258,3 +2285,418 @@ reshownRows r unitDrift fileDrift =
     , ( "a key typed into a refusal panel records nothing after the panel closes or before it is drawn", panelKeysNeverDecideAcrossPanelDrawing r )
     , ( "a decision task binds the drawn source and digest before any read", reshownTaskRefusals unitDrift fileDrift )
     ]
+
+
+-- ── one task in flight per load slot ────────────────────────────────────
+-- The queue, History and standing slots each hold at most one load in
+-- flight: a request made while one runs is recorded as wanted, a result
+-- arriving with a want held is dropped and the want starts, and a slot
+-- owned by another process's epoch is idle.
+cursorAfter : Int -> String -> Index.Cursor
+cursorAfter at unit =
+    Index.After { enqueuedAt = at, uid = uid unit }
+
+
+historyAfter : Int -> LibDb.HistoryCursor
+historyAfter seq =
+    LibDb.HistoryAfter (Timestamp.fromUnixMillis seq) seq
+
+
+-- One press on an idle queue slot starts exactly one load, its ticket the
+-- next one: the positive control the single-flight checks compare against.
+idlePressStartsOneLoad : Settings.AppSettings -> Bool
+idlePressStartsOneLoad settings =
+    let
+        running =
+            after settings [ Navigated QueuePage ] initialModel
+    in
+    Queue.latestTicket running.queueLoad == Queue.nextTicket (Queue.latestTicket initialModel.queueLoad)
+        && Queue.runningWant settings.epoch running.queueLoad == Just Nothing
+        && Queue.runningWant settings.epoch initialModel.queueLoad == Nothing
+
+
+-- Pages turned, the queue shown again and a unit page entered while a queue
+-- load runs start no second load: the ticket stays the one in flight and
+-- only the last page asked for is wanted, and a unit-page entry, which only
+-- needs the queue loaded, records nothing. Red if any press starts a load
+-- beside the one in flight, or the entry records a want.
+queueLoadsSingleFlight : Settings.AppSettings -> Index.UnitView -> Bool
+queueLoadsSingleFlight settings a =
+    let
+        running =
+            after settings [ Navigated QueuePage ] initialModel
+
+        inFlightTicket =
+            Queue.latestTicket running.queueLoad
+
+        pressed =
+            after settings [ ShowQueue, NextPage (cursorAfter 1 "u-a"), NextPage (cursorAfter 2 "u-b") ] running
+
+        entered =
+            after settings [ Navigated (unitAt a.unit.uid) ] running
+    in
+    Queue.latestTicket pressed.queueLoad == inFlightTicket
+        && Queue.runningWant settings.epoch pressed.queueLoad == Just (Just (QueueReload (cursorAfter 2 "u-b")))
+        && Queue.latestTicket entered.queueLoad == inFlightTicket
+        && Queue.runningWant settings.epoch entered.queueLoad == Just Nothing
+
+
+-- The running queue load's page returning while another page is wanted is
+-- dropped: the queue stays loading, the wanted load starts under the next
+-- ticket, and its page settles the queue. A result under a ticket no longer
+-- in flight changes nothing. Red if a superseded page is shown.
+supersededQueueResultDropped : Settings.AppSettings -> Index.UnitView -> Index.UnitView -> Bool
+supersededQueueResultDropped settings a b =
+    let
+        running =
+            after settings [ Navigated QueuePage ] initialModel
+
+        first =
+            Queue.latestTicket running.queueLoad
+
+        wanting =
+            after settings [ NextPage (cursorAfter 2 "u-b") ] running
+
+        dropped =
+            after settings [ PendingLoaded first (Ok (queuePageOf [ a, b ])) ] wanting
+
+        late =
+            after settings [ PendingLoaded first (Ok (queuePageOf [ a, b ])) ] dropped
+
+        settled =
+            after settings [ PendingLoaded (Queue.latestTicket dropped.queueLoad) (Ok (queuePageOf [ b ])) ] late
+    in
+    dropped.queueState == Loading
+        && Queue.latestTicket dropped.queueLoad == Queue.nextTicket first
+        && Queue.runningWant settings.epoch dropped.queueLoad == Just Nothing
+        && late.queueState == Loading
+        && Queue.latestTicket late.queueLoad == Queue.latestTicket dropped.queueLoad
+        && settled.queueState == Loaded (queuePageOf [ b ])
+        && Queue.runningWant settings.epoch settled.queueLoad == Nothing
+
+
+-- A decision saved while a queue load runs waits for the drain: the load
+-- read before the write returns, is dropped, and the decision stays
+-- refreshing with the decided row still offering no control; the drain's
+-- page ends it. Red if the page read before the write idles the decision.
+refreshingSettlesOnlyAfterWrite : Settings.AppSettings -> Index.UnitView -> Index.UnitView -> ( Index.Attested, Index.Written ) -> Bool
+refreshingSettlesOnlyAfterWrite settings a b ( attested, written ) =
+    let
+        ua =
+            a.unit.uid
+
+        shown =
+            queueModel [ a, b ] (ViewShown a)
+
+        loadingWhileSaving =
+            after settings (drawnOn shown ua ApproveRow ++ [ Navigated QueuePage ]) shown
+
+        saved =
+            after settings [ DecisionSaved ua settings.epoch (Ok ( attested, written )) ] loadingWhileSaving
+
+        preWrite =
+            after settings [ PendingLoaded (Queue.latestTicket loadingWhileSaving.queueLoad) (Ok (queuePageOf [ a, b ])) ] saved
+
+        drained =
+            after settings [ PendingLoaded (Queue.latestTicket preWrite.queueLoad) (Ok (queuePageOf [ b ])) ] preWrite
+    in
+    Queue.runningWant settings.epoch saved.queueLoad == Just (Just (QueueDrain attested written Index.Start))
+        && preWrite.decision == DecisionRefreshing ua settings.epoch
+        && not (String.contains ">Approve<" (page preWrite))
+        && Queue.runningWant settings.epoch preWrite.queueLoad == Just Nothing
+        && drained.decision == DecisionIdle PanelClosed
+        && drained.queueState == Loaded (queuePageOf [ b ])
+
+
+-- A wanted drain absorbs a reload asked after it, taking the reload's
+-- cursor, and a drain asked after a wanted reload replaces it: no saved
+-- decision's drain is lost to a page turn. Red if a reload drops the
+-- drain it follows, for each of the four merge pairs.
+drainAbsorbsReload : Settings.AppSettings -> ( Index.Attested, Index.Written ) -> Bool
+drainAbsorbsReload settings ( attested, written ) =
+    let
+        c1 =
+            cursorAfter 1 "u-a"
+
+        c2 =
+            cursorAfter 2 "u-b"
+
+        running =
+            after settings [ Navigated QueuePage ] initialModel
+
+        ua =
+            uid "u-a"
+
+        drainThenPage =
+            after settings [ DecisionSaved ua settings.epoch (Ok ( attested, written )), NextPage c2 ] running
+
+        pageThenDrain =
+            after settings [ NextPage c2, DecisionSaved ua settings.epoch (Ok ( attested, written )) ] running
+    in
+    Queue.mergeQueueWant (QueueDrain attested written c1) (QueueReload c2) == QueueDrain attested written c2
+        && Queue.mergeQueueWant (QueueReload c1) (QueueDrain attested written c2) == QueueDrain attested written c2
+        && Queue.mergeQueueWant (QueueDrain attested written c1) (QueueDrain attested written c2) == QueueDrain attested written c2
+        && Queue.mergeQueueWant (QueueReload c1) (QueueReload c2) == QueueReload c2
+        && Queue.runningWant settings.epoch drainThenPage.queueLoad == Just (Just (QueueDrain attested written c2))
+        && Queue.runningWant settings.epoch pageThenDrain.queueLoad == Just (Just (QueueDrain attested written c2))
+
+
+-- History shown again and paged while a History load runs starts no second
+-- load: only the last page asked for is wanted. A result under an older
+-- ticket changes nothing, the running load's result is dropped for the
+-- want, and the want's page settles the History. Red if a press starts a
+-- second History load or a superseded page is shown.
+historyLoadsSingleFlight : Settings.AppSettings -> Bool
+historyLoadsSingleFlight settings =
+    let
+        running =
+            after settings [ Navigated HistoryPage ] initialModel
+
+        first =
+            Queue.latestTicket running.historyLoad
+
+        pressed =
+            after settings [ ShowHistory, HistoryNext (historyAfter 1), HistoryNext (historyAfter 2) ] running
+
+        historyPage =
+            { rows = [], at = LibDb.HistoryStart, next = Nothing, log = LibDb.ShownProven }
+
+        stale =
+            after settings [ App.historyLoaded (Queue.latestTicket initialModel.historyLoad) (Ok historyPage) ] pressed
+
+        dropped =
+            after settings [ App.historyLoaded first (Ok historyPage) ] stale
+
+        settled =
+            after settings [ App.historyLoaded (Queue.latestTicket dropped.historyLoad) (Ok { historyPage | at = historyAfter 2 }) ] dropped
+    in
+    Queue.latestTicket pressed.historyLoad == first
+        && Queue.runningWant settings.epoch pressed.historyLoad == Just (Just (HistoryFrom (historyAfter 2)))
+        && stale.history == HistoryLoading
+        && Queue.latestTicket stale.historyLoad == first
+        && dropped.history == HistoryLoading
+        && Queue.latestTicket dropped.historyLoad == Queue.nextTicket first
+        && historyFailure settled.history == Nothing
+        && settled.history /= HistoryLoading
+        && Queue.runningWant settings.epoch settled.historyLoad == Nothing
+
+
+-- Two source reads settling on the unit page while a standing read runs
+-- start no second standing read: the second body is wanted, the first
+-- read's result is dropped for it, and its own result is shown. Red if a
+-- settled source read starts a standing read beside the one in flight, or
+-- the first body's standing is shown for the second.
+standingSingleFlight : Settings.AppSettings -> Index.UnitView -> Index.UnitView -> Bool
+standingSingleFlight settings a b =
+    let
+        ua =
+            a.unit.uid
+
+        ub =
+            b.unit.uid
+
+        hashA =
+            Index.storedHash a.unit.attested
+
+        hashB =
+            Index.storedHash b.unit.attested
+
+        reading =
+            after settings [ Navigated (unitAt ua), SelectedViewLoaded ua settings.epoch (Ok (Just a)) ] (queueModel [ a, b ] NoneSelected)
+
+        second =
+            after settings [ Navigated (unitAt ub), SelectedViewLoaded ub settings.epoch (Ok (Just b)) ] reading
+
+        firstReturned =
+            after settings [ App.standingLoaded ua hashA settings.epoch (Ok Queue.Undecided) ] second
+
+        stale =
+            after settings [ App.standingLoaded ua hashA settings.epoch (Ok Queue.Undecided) ] firstReturned
+
+        shown =
+            after settings [ App.standingLoaded ub hashB settings.epoch (Ok Queue.Undecided) ] stale
+    in
+    reading.standing == StandingReading ua hashA settings.epoch Nothing
+        && second.standing == StandingReading ua hashA settings.epoch (Just ( ub, hashB ))
+        && firstReturned.standing == StandingReading ub hashB settings.epoch Nothing
+        && stale.standing == StandingReading ub hashB settings.epoch Nothing
+        && shown.standing == StandingShown ub hashB Queue.Undecided
+
+
+-- A load slot or standing read held under another process's epoch is idle:
+-- a request starts a load, and a result arriving for it is dropped with
+-- the slot unchanged. Red if a dead process's slot blocks a load or its
+-- result settles this process's slot.
+foreignLoadSlotIdle : Settings.AppSettings -> Epoch -> Index.UnitView -> Bool
+foreignLoadSlotIdle settings otherEpoch a =
+    let
+        ( foreignSlot, _ ) =
+            Queue.requestLoad Queue.mergeQueueWant otherEpoch (QueueReload Index.Start) Queue.idleLoad
+
+        foreignTicket =
+            Queue.latestTicket foreignSlot
+
+        ( _, started ) =
+            Queue.requestLoad Queue.mergeQueueWant settings.epoch (QueueReload Index.Start) foreignSlot
+
+        ( settle, kept, startedOnArrival ) =
+            Queue.loadArrived settings.epoch foreignTicket foreignSlot
+
+        held =
+            { initialModel | queueLoad = foreignSlot }
+
+        entered =
+            after settings [ Navigated QueuePage ] held
+
+        arrived =
+            after settings [ PendingLoaded foreignTicket (Ok (queuePageOf [ a ])) ] held
+
+        ua =
+            a.unit.uid
+
+        hashA =
+            Index.storedHash a.unit.attested
+
+        foreignRead =
+            StandingReading ua hashA otherEpoch Nothing
+    in
+    started == Just ( Queue.nextTicket foreignTicket, QueueReload Index.Start )
+        && settle == Dropped
+        && kept == foreignSlot
+        && startedOnArrival == Nothing
+        && Queue.latestTicket entered.queueLoad == Queue.nextTicket foreignTicket
+        && Queue.runningWant settings.epoch entered.queueLoad == Just Nothing
+        && arrived.queueState == Loading
+        && Queue.standingRequested settings.epoch ua hashA foreignRead == ( StandingReading ua hashA settings.epoch Nothing, Just ( ua, hashA ) )
+        && Queue.standingArrived settings.epoch ua hashA (Ok Queue.Undecided) foreignRead == ( foreignRead, Nothing )
+
+
+-- A running load answered with an error, the shape a refused task settles
+-- with when the session's task ceiling is reached, frees its slot: with no
+-- want the queue shows the failure and the next press starts a load; with
+-- a want held the want starts. Red if a failed load keeps its slot taken.
+ceilingRefusalReleasesSlot : Settings.AppSettings -> Bool
+ceilingRefusalReleasesSlot settings =
+    let
+        running =
+            after settings [ Navigated QueuePage ] initialModel
+
+        first =
+            Queue.latestTicket running.queueLoad
+
+        refused =
+            after settings [ App.queueLoaded first (Err limitMarker) ] running
+
+        pressedAfter =
+            after settings [ Navigated QueuePage ] refused
+
+        wanting =
+            after settings [ NextPage (cursorAfter 2 "u-b") ] running
+
+        refusedWithWant =
+            after settings [ App.queueLoaded first (Err limitMarker) ] wanting
+    in
+    queueFailure refused.queueState == Just LoadPastLimit
+        && Queue.runningWant settings.epoch refused.queueLoad == Nothing
+        && Queue.latestTicket pressedAfter.queueLoad == Queue.nextTicket first
+        && refusedWithWant.queueState == Loading
+        && Queue.latestTicket refusedWithWant.queueLoad == Queue.nextTicket first
+        && Queue.runningWant settings.epoch refusedWithWant.queueLoad == Just Nothing
+
+
+-- ── every task starts at its slot ───────────────────────────────────────
+-- `Cmd.perform` appears in `src` only inside the slot-transition
+-- definitions, each the one start site of its slot, and the Cmd module is
+-- imported under its own name exposing nothing, so no other spelling
+-- starts a task. The modules are lexed as Ipê reads them, so a mention in a
+-- comment or a string is no site.
+taskStartSites : List String
+taskStartSites =
+    [ "loadViewCmd", "saveDecision", "queueStep", "historyStep", "standingStep" ]
+
+
+-- The declarations of `text` that start a task outside the start sites,
+-- and whether it imports the Cmd module under another name or exposing
+-- its names.
+strayTaskStarts : String -> List String
+strayTaskStarts text =
+    let
+        lexed =
+            TextSinkScanTests.lex text
+
+        starts =
+            List.filter (\token -> token.kind == TextSinkScanTests.WordToken && (token.text == "perform" || String.endsWith ".perform" token.text)) lexed.code
+
+        stray =
+            List.filter (\token -> token.text /= "Cmd.perform" || not (List.member token.name taskStartSites)) starts
+
+        renamed =
+            List.filter (\i -> String.endsWith ".Cmd" i.moduleName && (i.qualifier /= "Cmd" || i.opensAll || not (List.isEmpty i.exposed))) lexed.imports
+    in
+    List.map .name stray
+        ++ List.map .moduleName renamed
+        ++ (if lexed.broken then
+                [ "a literal left open" ]
+
+            else
+                []
+           )
+
+
+scanFixture : String
+scanFixture =
+    "module Fixture exposing (update)\n\nimport Ipe.Tea.Web.Cmd as Cmd\n\n\n-- Cmd.perform in a comment starts nothing\nqueueStep settings next model =\n    ( model, Cmd.perform task done )\n"
+
+
+everyTaskStartsAtItsSlotFixtures : Bool
+everyTaskStartsAtItsSlotFixtures =
+    strayTaskStarts scanFixture == []
+        && strayTaskStarts (scanFixture ++ "\n\nelsewhere model =\n    ( model, Cmd.perform task done )\n") == [ "elsewhere" ]
+        && strayTaskStarts (scanFixture ++ "\n\nbatched model =\n    ( model, Cmd.batch [ Cmd.none, Cmd.perform task done ] )\n") == [ "batched" ]
+        && strayTaskStarts (String.replace "Cmd.perform task" "Effect.perform task" (String.replace "as Cmd" "as Effect" scanFixture)) == [ "queueStep", "Ipe.Tea.Web.Cmd" ]
+
+
+-- The modules of `src`, each by its path with its text. A file past
+-- `srcFileCeiling` or a module past `srcModuleCeiling` fails the read.
+srcModules : Task.Task Error (List ( String, String ))
+srcModules =
+    do
+        cwd <- System.cwd ()
+        root <- Task.fromResult (Path.fromString (cwd ++ "/src"))
+        files <- File.walk root
+        bounded <- if List.length files > srcFileCeiling then
+                    Task.fail (Error.limitExceeded ("src holds more than " ++ String.fromInt srcFileCeiling ++ " files"))
+
+                   else
+                    Task.succeed files
+        Task.sequence (List.map (\path -> File.readFileLimit path srcModuleCeiling |> Task.map (\text -> ( Path.toString path, text ))) (List.filter (\path -> String.endsWith ".ipe" (Path.toString path)) bounded))
+
+
+srcFileCeiling : Int
+srcFileCeiling =
+    64
+
+
+srcModuleCeiling : ByteSize.ByteSize
+srcModuleCeiling =
+    ByteSize.kib 512
+
+
+-- Every module of `src` starts its tasks only at the start sites, every
+-- start site is a definition that exists, and the fixtures go red: a task
+-- started in another definition, one behind a `Cmd.batch`, and one through
+-- a renamed Cmd import. Red if a `Cmd.perform` is added outside a slot
+-- transition.
+everyTaskStartsAtItsSlot : Task.Task Error Bool
+everyTaskStartsAtItsSlot =
+    srcModules
+        |> Task.map
+            (\modules ->
+                let
+                    names =
+                        List.concatMap (\( _, text ) -> List.map .name (TextSinkScanTests.lex text).code) modules
+                in
+                List.all (\( _, text ) -> List.isEmpty (strayTaskStarts text)) modules
+                    && List.all (\site -> List.member site names) taskStartSites
+                    && everyTaskStartsAtItsSlotFixtures
+            )
