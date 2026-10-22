@@ -353,6 +353,8 @@ code! {
     IPE_P0070 = "IPE-P0070", "source file is too large to compile", "IPE-P0070";
     /// a `\r` not followed by `\n` — a line break the lexer and editors disagree on
     IPE_P0071 = "IPE-P0071", "a carriage return must be followed by a newline", "IPE-P0071";
+    /// a line break or bidi control a viewer draws as structure the compiler does not read
+    IPE_P0072 = "IPE-P0072", "a character that breaks or reorders the displayed source", "IPE-P0072";
 
     // -----------------------------------------------------------------------
     // Name resolution (IPE-N####)
