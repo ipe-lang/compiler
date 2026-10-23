@@ -305,13 +305,13 @@ mod tests {
         }
     }
 
-    /// The refusal an [`UserPin::Open`] holds in these tests, told apart from
-    /// the settle pass's own by its span.
-    fn open_refusal() -> Box<Diagnostic> {
-        Box::new(super::super::unsupported(
+    /// An open pin whose held refusal is told apart from the settle pass's
+    /// own by its span.
+    fn open_pin() -> UserPin {
+        UserPin::Open(Box::new(super::super::unsupported(
             Span::new(7, 9),
             Feature::Polymorphism,
-        ))
+        )))
     }
 
     /// Whether `pin` holds, for `a`, a refusal anchored at `span`.
@@ -333,12 +333,7 @@ mod tests {
                 vec![IrType::Int],
                 Expr::Unit,
             ),
-            func(
-                1,
-                vec![],
-                vec![],
-                call(0, vec![(a, UserPin::Open(open_refusal()))]),
-            ),
+            func(1, vec![], vec![], call(0, vec![(a, open_pin())])),
         ];
         let pin = settled_pin(&mut funcs).cloned();
         assert_eq!(
@@ -358,12 +353,7 @@ mod tests {
                 IrType::List(Box::new(IrType::Generic(a))),
                 Expr::Unit,
             ),
-            func(
-                1,
-                vec![],
-                vec![],
-                call(0, vec![(a, UserPin::Open(open_refusal()))]),
-            ),
+            func(1, vec![], vec![], call(0, vec![(a, open_pin())])),
         ];
         let pin = settled_pin(&mut funcs);
         assert!(refused_at(pin, a, Span::new(7, 9)), "{pin:?}");
@@ -379,12 +369,7 @@ mod tests {
                 vec![IrType::Generic(a)],
                 Expr::Unit,
             ),
-            func(
-                1,
-                vec![],
-                vec![],
-                call(0, vec![(a, UserPin::Open(open_refusal()))]),
-            ),
+            func(1, vec![], vec![], call(0, vec![(a, open_pin())])),
         ];
         let pin = settled_pin(&mut funcs).cloned();
         assert_eq!(pin, Some(CallPin::None));
@@ -396,12 +381,7 @@ mod tests {
         let add = BoundSet::UNBOUNDED.with_add().with_copy();
         let mut funcs = vec![
             func(0, vec![(a, add)], vec![IrType::Int], Expr::Unit),
-            func(
-                1,
-                vec![],
-                vec![],
-                call(0, vec![(a, UserPin::Open(open_refusal()))]),
-            ),
+            func(1, vec![], vec![], call(0, vec![(a, open_pin())])),
         ];
         let pin = settled_pin(&mut funcs);
         assert!(refused_at(pin, a, Span::new(0, 1)), "{pin:?}");
@@ -412,12 +392,7 @@ mod tests {
                 vec![IrType::Int],
                 Expr::Unit,
             ),
-            func(
-                1,
-                vec![],
-                vec![],
-                call(0, vec![(a, UserPin::Open(open_refusal()))]),
-            ),
+            func(1, vec![], vec![], call(0, vec![(a, open_pin())])),
         ];
         let control = settled_pin(&mut unbounded).cloned();
         assert_eq!(
