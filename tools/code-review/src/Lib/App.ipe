@@ -1,4 +1,4 @@
-module Lib.App exposing (KeyOffers, Model, Msg(..), Page(..), decidableRow, decisionSaved, decisionTask, historyLoaded, initialModel, keyOffers, queueList, queueLoaded, selectedUid, selectedUnit, standingLoaded, unitPageState, update, viewLoaded)
+module Lib.App exposing (KeyCard, KeyOffers(..), Model, Msg(..), Page(..), decidableRow, decisionSaved, decisionTask, historyLoaded, initialModel, keyMode, keyOffers, queueList, queueLoaded, selectedUid, selectedUnit, standingLoaded, unitPageState, update, viewLoaded)
 
 import Ipe.Error as Error exposing (Error)
 import Ipe.List as List
@@ -60,25 +60,88 @@ type alias Model =
     }
 
 
--- The offers a render drew for its keys: the selected card's uid with the
--- offer `decidableRow` makes on it (Nothing when the card draws no control),
--- and the open refusal panel's row as the page offers it. The root key
--- handler bakes them, so a key acts only on what that render drew, never on
--- what the model selects when the key arrives. A key is read as typed into
--- a refusal panel when its render drew one or one is open when it arrives,
--- so a reason typed into a panel that has since closed, or the first letter
--- typed before an opening panel was drawn, records and opens nothing.
-type alias KeyOffers =
-    { selected : Maybe ( Uid, Maybe DecidableRow )
-    , panel : Maybe DecidableRow
-    }
+-- A card a render drew for its keys: the selected card's uid with the offer
+-- `decidableRow` makes on it (Nothing when the card draws no control).
+type alias KeyCard =
+    { uid : Uid, offer : Maybe DecidableRow }
+
+
+-- What a render drew for its keys: an open refusal panel, with its row when
+-- the page draws that panel's controls (the row `offeredControls` draws
+-- them for); or the selected card, with the offer `decidableRow` makes on
+-- it; or no queue page, where no key acts. The root key handler bakes it, so
+-- a key acts only on what that render drew, never on what the model selects
+-- when the key arrives.
+type KeyOffers
+    = PanelDrawn (Maybe DecidableRow)
+    | CardsDrawn (Maybe KeyCard)
+    | NothingDrawn
 
 
 keyOffers : Model -> KeyOffers
 keyOffers model =
-    { selected = Maybe.map (\uid -> ( uid, decidableRow model uid )) (selectedUid model)
-    , panel = Maybe.andThen (\( row, _ ) -> decidableRow model (Queue.rowUid row)) (Queue.openRow model.decision)
-    }
+    if model.page /= QueuePage then
+        NothingDrawn
+
+    else
+        case Queue.openRow model.decision of
+            Just ( open, _ ) ->
+                PanelDrawn (drawnPanel model open)
+
+            Nothing ->
+                CardsDrawn (Maybe.map (\uid -> { uid = uid, offer = decidableRow model uid }) (selectedUid model))
+
+
+-- The open panel's row when the page draws its controls: the row the page
+-- offers under its uid, only while it is the row the panel is open on (the
+-- view's own `open == row` in `offeredControls`).
+drawnPanel : Model -> DecidableRow -> Maybe DecidableRow
+drawnPanel model open =
+    case decidableRow model (Queue.rowUid open) of
+        Just row ->
+            if row == open then
+                Just row
+
+            else
+                Nothing
+
+        Nothing ->
+            Nothing
+
+
+-- A key's mode: no key acts off the queue page (either side); a key is
+-- typed into a refusal panel when its render drew one or one is open when it
+-- arrives, and only the panel row its render drew can be confirmed or
+-- cancelled; otherwise shortcuts act on the card the render drew, and the
+-- selection moves from where the model stands, over the cards it holds. A
+-- reason typed into a panel that has since closed, or the first letter
+-- typed before an opening panel was drawn, therefore records and opens
+-- nothing.
+keyMode : KeyOffers -> Model -> Keys.KeyMode KeyCard DecidableRow
+keyMode offers model =
+    if model.page /= QueuePage then
+        Keys.Dormant
+
+    else
+        case offers of
+            NothingDrawn ->
+                Keys.Dormant
+
+            PanelDrawn drawn ->
+                Keys.InPanel drawn
+
+            CardsDrawn card ->
+                case Queue.openPanel model.decision of
+                    Just _ ->
+                        Keys.InPanel Nothing
+
+                    Nothing ->
+                        case Keys.position model.selected (List.length (queueList model)) of
+                            Just at ->
+                                Keys.OnCards card at
+
+                            Nothing ->
+                                Keys.Dormant
 
 
 -- A task's result reaches a `Msg` only through the callbacks below, which
@@ -88,8 +151,8 @@ type Msg
     | NextPage Index.Cursor
     | ApproveRow DecidableRow
     | RefuseStart DecidableRow
-    | RefuseDraft Uid String
-    | RefuseCancel
+    | RefuseDraft DecidableRow String
+    | RefuseCancel DecidableRow
     | RefuseSubmit DecidableRow
     | DecisionSaved Uid Epoch (Result SaveFailure ( Index.Attested, Index.Written ))
     | Navigated Page
@@ -408,11 +471,11 @@ step settings msg model =
         RefuseStart row ->
             startRefusal settings (Queue.rowTarget row) (Queue.rowUid row) (Just row) model
 
-        RefuseDraft uid text ->
-            ( { model | decision = Queue.editDraft uid (Draft.draft text) model.decision }, Cmd.none )
+        RefuseDraft row text ->
+            ( { model | decision = onOpenRow row (Queue.editDraft (Queue.rowUid row) (Draft.draft text)) model.decision }, Cmd.none )
 
-        RefuseCancel ->
-            ( { model | decision = Queue.closeRefusal model.decision }, Cmd.none )
+        RefuseCancel row ->
+            ( { model | decision = onOpenRow row Queue.closeRefusal model.decision }, Cmd.none )
 
         RefuseSubmit row ->
             submitRefuse settings model row
@@ -459,11 +522,7 @@ step settings msg model =
             standingStep settings (Queue.standingArrived epoch uid bodyHash result model.standing) model
 
         KeyDown offers key ->
-            if model.page == QueuePage then
-                keyActionMsg settings offers (Keys.keyAction (offers.panel /= Nothing || Queue.openPanel model.decision /= Nothing) (List.length (queueList model)) model.selected key) model
-
-            else
-                ( model, Cmd.none )
+            keyActionMsg settings (Keys.keyAction (keyMode offers model) key) model
 
         SelectUnit i ->
             if model.page == QueuePage then
@@ -577,42 +636,42 @@ standingStep settings ( read, next ) model =
             ( { model | standing = read }, Cmd.none )
 
 
--- Every KeyAction dispatches the same Msg the matching button sends —
--- the buttons remain the single source of truth; the keys are a mirror. A
--- key acts on the offers its render drew (`offers`), never on the model's
--- selection when it arrives.
-keyActionMsg : Settings.AppSettings -> KeyOffers -> KeyAction -> Model -> ( Model, Cmd Msg )
-keyActionMsg settings offers action model =
+-- `change` applied to the slot only while its refusal panel is open on
+-- exactly `row`, the row the message was drawn for; any other slot is kept.
+onOpenRow : DecidableRow -> (Queue.DecisionSlot -> Queue.DecisionSlot) -> Queue.DecisionSlot -> Queue.DecisionSlot
+onOpenRow row change slot =
+    case Queue.openRow slot of
+        Just ( open, _ ) ->
+            if open == row then
+                change slot
+
+            else
+                slot
+
+        Nothing ->
+            slot
+
+
+-- Every KeyAction does what the matching button's message does; the buttons
+-- remain the single source of truth and the keys are a mirror. Each action
+-- carries the offer its render drew, so none reads the model's selection.
+keyActionMsg : Settings.AppSettings -> KeyAction KeyCard DecidableRow -> Model -> ( Model, Cmd Msg )
+keyActionMsg settings action model =
     case action of
-        ApproveSelected ->
-            case offers.selected of
-                Just ( uid, drawn ) ->
-                    saveDecision settings model OnUnit uid drawn Approved
+        ApproveSelected card ->
+            saveDecision settings model OnUnit card.uid card.offer Approved
 
-                Nothing ->
-                    ( model, Cmd.none )
+        RefuseSelected card ->
+            startRefusal settings OnUnit card.uid card.offer model
 
-        RefuseSelected ->
-            case offers.selected of
-                Just ( uid, drawn ) ->
-                    startRefusal settings OnUnit uid drawn model
+        Select at ->
+            selectAt settings (Keys.index at) model
 
-                Nothing ->
-                    ( model, Cmd.none )
+        ConfirmRefuse drawn ->
+            submitRefuse settings model drawn
 
-        Select i ->
-            selectAt settings i model
-
-        ConfirmRefuse ->
-            case offers.panel of
-                Just drawn ->
-                    submitRefuse settings model drawn
-
-                Nothing ->
-                    ( model, Cmd.none )
-
-        CancelRefuse ->
-            ( { model | decision = Queue.closeRefusal model.decision }, Cmd.none )
+        CancelRefuse drawn ->
+            ( { model | decision = onOpenRow drawn Queue.closeRefusal model.decision }, Cmd.none )
 
         Ignore ->
             ( model, Cmd.none )
