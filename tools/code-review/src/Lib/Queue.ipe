@@ -1,4 +1,4 @@
-module Lib.Queue exposing (DecisionSlot(..), HistoryLabel(..), HistoryPage, HistoryRow, HistoryState(..), LoadTicket, Place(..), Presence(..), Progress, QueuePage, QueueState(..), QueuedUnit, ResyncBound, SelectedView(..), Standing(..), StandingRead(..), UnitLabel, UnitPageState(..), chainBanner, clearView, decidableSource, decide, decideRefusal, decisionNotSaved, decisionRefused, decisionWritten, drainThenLoad, entryUid, firstTicket, historyStateFromResult, historyStatusText, isCurrentLoad, loadHistoryPage, loadPage, loadStanding, makeResyncBound, notSavedOf, ownedSlot, pendingText, nextTicket, loadUnitView, pageHeaderText, queueLabels, queueSettled, queueStatusText, refusalReasonText, reloadView, resyncBound, resyncPageCeiling, resyncReviewed, resyncReviewedWithin, selectView, selectedViewOf, selectedViewStatusText, sourceStatusText, standingArrived, standingFor, standingOf, startDecision, stateFromResult, unitLabel, unitPageEntry, unitPageOf, unitPageStatusText, viewArrived)
+module Lib.Queue exposing (DecidableRow, DecisionSlot(..), DecisionTarget(..), Draft, HistoryLabel(..), HistoryPage, HistoryRow, HistoryState(..), LoadTicket, Place(..), Presence(..), Progress, QueuePage, QueueState(..), QueuedUnit, RefusalPanel(..), ResyncBound, SelectedView(..), Standing(..), StandingRead(..), UnitLabel, UnitPageState(..), chainBanner, clearView, closeRefusal, decidableAs, decidableRow, decidableSource, decide, decideRefusal, decisionNotSaved, decisionRefused, decisionWritten, draftRefused, drainThenLoad, editDraft, entryUid, firstTicket, historyStateFromResult, historyStatusText, isCurrentLoad, loadHistoryPage, loadPage, loadStanding, makeResyncBound, notSavedOf, openPanel, openRefusal, openRow, ownedSlot, pendingText, nextTicket, loadUnitView, pageHeaderText, queueLabels, queueSettled, queueStatusText, refusalReasonText, reloadView, rowTarget, rowUid, resyncBound, resyncPageCeiling, resyncReviewed, resyncReviewedWithin, selectView, selectedViewOf, selectedViewStatusText, sourceStatusText, standingArrived, standingFor, standingOf, startDecision, stateFromResult, unitLabel, unitPageEntry, unitPageOf, unitPageStatusText, viewArrived)
 
 import Ipe.ByteSize as ByteSize
 import Ipe.Db as Db
@@ -11,7 +11,7 @@ import Ipe.String as String
 import Ipe.Task as Task
 import Lib.Db as LibDb exposing (BreakAt(..), HistoryCursor(..), LogShown(..), LogVerdict(..), ReviewEntry(..))
 import Lib.Epoch exposing (Epoch)
-import Lib.Failure as Failure exposing (DecideRefusal, LoadFailure, SaveFailure)
+import Lib.Failure as Failure exposing (DecideRefusal, LoadFailure, RefuseFailure, SaveFailure)
 import Lib.Format as Format
 -- `Index.Unit` names `Highlight.Lang` and `Index.UnitView` names
 -- `Links.LinkSet`, and an imported alias resolves its qualified names in this
@@ -1140,6 +1140,152 @@ unitPageOf uid state =
             UnitLoading
 
 
+-- What a decision is asked on: a queued unit, decided on its shown source,
+-- or an unreviewable file the loaded page lists, decided on its digest.
+type DecisionTarget
+    = OnUnit
+    | OnRefusal
+
+
+-- A row the shown queue page draws decision controls for, with what a
+-- decision on it is asked on. Only `decidableRow` builds one, so the view
+-- draws a row's controls, and the refusal panel opens, by one predicate.
+type DecidableRow
+    = DecidableRow Uid DecisionTarget
+
+
+rowUid : DecidableRow -> Uid
+rowUid row =
+    case row of
+        DecidableRow uid _ ->
+            uid
+
+
+rowTarget : DecidableRow -> DecisionTarget
+rowTarget row =
+    case row of
+        DecidableRow _ target ->
+            target
+
+
+-- The row `uid` as the queue page shows it with card `selected` selected
+-- and `view` in the source slot, when it offers a decision: an
+-- acknowledgeable file the page lists, or the selected card's unit with its
+-- verified source shown, each over a proven log. Nothing for a withheld
+-- source, a file no decision binds, a log that records no decision, a page
+-- not loaded, or a uid the page does not show.
+decidableRow : Int -> QueueState -> SelectedView -> Uid -> Maybe DecidableRow
+decidableRow selected state view uid =
+    case state of
+        Loaded page ->
+            case page.log of
+                ShownProven ->
+                    case List.find (\row -> row.uid == uid) page.refusals of
+                        Just row ->
+                            Maybe.map (\_ -> DecidableRow uid OnRefusal) row.digest
+
+                        Nothing ->
+                            case List.head (List.drop selected page.units) of
+                                Just q ->
+                                    if q.unit.uid == uid then
+                                        Maybe.map (\_ -> DecidableRow uid OnUnit) (decidableSource uid view)
+
+                                    else
+                                        Nothing
+
+                                Nothing ->
+                                    Nothing
+
+                ShownBroken _ ->
+                    Nothing
+
+                ShownKeyMismatch ->
+                    Nothing
+
+                ShownUnkeyed ->
+                    Nothing
+
+        Loading ->
+            Nothing
+
+        Failed _ ->
+            Nothing
+
+
+-- The row `uid` when it offers a decision on `target` by `decidableRow`,
+-- the predicate the view draws the row's controls by, or why a decision on
+-- it is refused before it starts: a click that arrived after its row
+-- stopped offering one.
+decidableAs : Int -> QueueState -> SelectedView -> DecisionTarget -> Uid -> Result SaveFailure DecidableRow
+decidableAs selected state view target uid =
+    case decidableRow selected state view uid of
+        Just row ->
+            if rowTarget row == target then
+                Ok row
+
+            else
+                Err (undecidable state target uid)
+
+        Nothing ->
+            Err (undecidable state target uid)
+
+
+-- Why `uid` offers no decision on `target` on the queue page `state`: the
+-- log records no decision, the unit's source is not shown, or the unit or
+-- file is not one the page offers a decision on.
+undecidable : QueueState -> DecisionTarget -> Uid -> SaveFailure
+undecidable state target uid =
+    case state of
+        Loaded page ->
+            case page.log of
+                ShownProven ->
+                    case target of
+                        OnUnit ->
+                            if List.any (\q -> q.unit.uid == uid) page.units then
+                                Failure.SaveRefused Failure.SourceNotShown
+
+                            else
+                                Failure.SaveRefused Failure.NotQueued
+
+                        OnRefusal ->
+                            case List.find (\row -> row.uid == uid) page.refusals of
+                                Just row ->
+                                    case row.digest of
+                                        Just _ ->
+                                            Failure.SaveRefused Failure.FileNotQueued
+
+                                        Nothing ->
+                                            Failure.SaveRefused Failure.FileNotAcknowledgeable
+
+                                Nothing ->
+                                    Failure.SaveRefused Failure.FileNotQueued
+
+                ShownBroken _ ->
+                    Failure.SaveRefused Failure.LogBroken
+
+                ShownKeyMismatch ->
+                    Failure.SaveRefused Failure.LogKeyMismatch
+
+                ShownUnkeyed ->
+                    Failure.SaveReadOnly
+
+        Loading ->
+            notListed target
+
+        Failed _ ->
+            notListed target
+
+
+notListed : DecisionTarget -> SaveFailure
+notListed target =
+    case target of
+        OnUnit ->
+            Failure.SaveRefused Failure.NotQueued
+
+        OnRefusal ->
+            Failure.SaveRefused Failure.FileNotQueued
+
+
 -- The session's one decision slot, and what the reviewer sees of it. A
 -- decision re-reads its source to re-prove it, so at most one is in flight:
 -- a decision asked while one is busy starts nothing. Busy is two cases: the
@@ -1152,11 +1298,25 @@ unitPageOf uid state =
 -- was raised; the next decision started, or a queue load started after it
 -- that succeeds, replaces it, so a reload clears it as its text advises,
 -- and a load that read the queue before the failure was known does not.
+-- The refusal panel lives only in the two idle cases, so a panel open
+-- beside a busy decision, or a draft with no panel, has no representation.
 type DecisionSlot
-    = DecisionIdle
+    = DecisionIdle RefusalPanel
     | DecisionSaving Uid Epoch
     | DecisionRefreshing Uid Epoch
-    | DecisionNotSaved SaveFailure LoadTicket
+    | DecisionNotSaved SaveFailure LoadTicket RefusalPanel
+
+
+-- The refusal panel of an idle slot: closed, or open on one row the shown
+-- page offers a decision on, with its draft.
+type RefusalPanel
+    = PanelClosed
+    | PanelOpen DecidableRow Draft
+
+
+-- The reviewer's refusal draft, and why it stays open, if it was refused.
+type alias Draft =
+    { refuseDraft : String, refuseError : Maybe RefuseFailure }
 
 
 -- The decision on `uid` and the process `epoch` runs it in, while that
@@ -1178,16 +1338,16 @@ busyOwnedBy epoch slot =
             else
                 Nothing
 
-        DecisionIdle ->
+        DecisionIdle _ ->
             Nothing
 
-        DecisionNotSaved _ _ ->
+        DecisionNotSaved _ _ _ ->
             Nothing
 
 
 -- The slot holding a decision on `uid` run by process `epoch`; Nothing
 -- while another decision of that process is busy. Starting a decision drops
--- the last one's not-saved notice.
+-- the last one's not-saved notice and closes any open refusal panel.
 startDecision : Epoch -> Uid -> DecisionSlot -> Maybe DecisionSlot
 startDecision epoch uid slot =
     case busyOwnedBy epoch slot of
@@ -1196,6 +1356,113 @@ startDecision epoch uid slot =
 
         Nothing ->
             Just (DecisionSaving uid epoch)
+
+
+-- The slot with the refusal panel open on `row`, its draft empty, by the
+-- same busy check `startDecision` makes: while a decision of process
+-- `epoch` is busy the slot is unchanged, and a busy decision another process
+-- left behind is idle. Only a row the shown page offers a decision on can
+-- hold the panel, so a panel no row draws has no representation.
+openRefusal : Epoch -> DecidableRow -> DecisionSlot -> DecisionSlot
+openRefusal epoch row slot =
+    case busyOwnedBy epoch slot of
+        Just _ ->
+            slot
+
+        Nothing ->
+            withPanel (PanelOpen row { refuseDraft = "", refuseError = Nothing }) (ownedSlot epoch slot)
+
+
+-- The slot with its refusal panel closed.
+closeRefusal : DecisionSlot -> DecisionSlot
+closeRefusal slot =
+    withPanel PanelClosed slot
+
+
+-- The draft of the panel open on `uid` replaced by `text`, which clears
+-- why it was refused; a slot with no panel open on `uid` is unchanged, so
+-- an edit sent for another row's panel writes into none.
+editDraft : Uid -> String -> DecisionSlot -> DecisionSlot
+editDraft uid text slot =
+    case openRow slot of
+        Just ( row, _ ) ->
+            if rowUid row == uid then
+                mapOpenDraft (\_ -> { refuseDraft = text, refuseError = Nothing }) slot
+
+            else
+                slot
+
+        Nothing ->
+            slot
+
+
+-- The open panel's draft refused for `failure`; a slot with no open panel
+-- is unchanged.
+draftRefused : RefuseFailure -> DecisionSlot -> DecisionSlot
+draftRefused failure slot =
+    mapOpenDraft (\draft -> { draft | refuseError = Just failure }) slot
+
+
+-- The row the refusal panel is open on, with its draft, if it is open.
+openRow : DecisionSlot -> Maybe ( DecidableRow, Draft )
+openRow slot =
+    case panelOf slot of
+        PanelOpen row draft ->
+            Just ( row, draft )
+
+        PanelClosed ->
+            Nothing
+
+
+-- The uid of the row the refusal panel is open on, with its draft.
+openPanel : DecisionSlot -> Maybe ( Uid, Draft )
+openPanel slot =
+    Maybe.map (\( row, draft ) -> ( rowUid row, draft )) (openRow slot)
+
+
+-- The refusal panel the slot holds; a busy slot holds none.
+panelOf : DecisionSlot -> RefusalPanel
+panelOf slot =
+    case slot of
+        DecisionIdle panel ->
+            panel
+
+        DecisionNotSaved _ _ panel ->
+            panel
+
+        DecisionSaving _ _ ->
+            PanelClosed
+
+        DecisionRefreshing _ _ ->
+            PanelClosed
+
+
+-- An idle slot holding `panel` in place of its own, its notice kept; a
+-- busy slot holds no panel and is unchanged.
+withPanel : RefusalPanel -> DecisionSlot -> DecisionSlot
+withPanel panel slot =
+    case slot of
+        DecisionIdle _ ->
+            DecisionIdle panel
+
+        DecisionNotSaved failure raisedAt _ ->
+            DecisionNotSaved failure raisedAt panel
+
+        DecisionSaving _ _ ->
+            slot
+
+        DecisionRefreshing _ _ ->
+            slot
+
+
+mapOpenDraft : (Draft -> Draft) -> DecisionSlot -> DecisionSlot
+mapOpenDraft change slot =
+    case panelOf slot of
+        PanelOpen row draft ->
+            withPanel (PanelOpen row (change draft)) slot
+
+        PanelClosed ->
+            slot
 
 
 -- The slot as this process `epoch` owns it: a busy decision another process
@@ -1208,17 +1475,17 @@ ownedSlot epoch slot =
 
         Nothing ->
             case slot of
-                DecisionNotSaved _ _ ->
+                DecisionNotSaved _ _ _ ->
                     slot
 
-                DecisionIdle ->
+                DecisionIdle _ ->
                     slot
 
                 DecisionSaving _ _ ->
-                    DecisionIdle
+                    DecisionIdle PanelClosed
 
                 DecisionRefreshing _ _ ->
-                    DecisionIdle
+                    DecisionIdle PanelClosed
 
 
 -- The decision on `uid` run by process `epoch` was written: it stays busy
@@ -1239,7 +1506,7 @@ decisionWritten epoch uid slot =
 decisionNotSaved : Epoch -> Uid -> SaveFailure -> LoadTicket -> DecisionSlot -> DecisionSlot
 decisionNotSaved epoch uid failure latest slot =
     if isSaving epoch uid slot then
-        DecisionNotSaved failure latest
+        DecisionNotSaved failure latest PanelClosed
 
     else
         slot
@@ -1254,16 +1521,17 @@ isSaving epoch uid slot =
         DecisionRefreshing _ _ ->
             False
 
-        DecisionIdle ->
+        DecisionIdle _ ->
             False
 
-        DecisionNotSaved _ _ ->
+        DecisionNotSaved _ _ _ ->
             False
 
 
 -- A decision refused before it started, for `failure`, while `latest` is
 -- the queue's latest load: the notice replaces an idle slot or an older
--- notice, never a busy decision of process `epoch`.
+-- notice, keeping its refusal panel, never a busy decision of process
+-- `epoch`.
 decisionRefused : Epoch -> SaveFailure -> LoadTicket -> DecisionSlot -> DecisionSlot
 decisionRefused epoch failure latest slot =
     case busyOwnedBy epoch slot of
@@ -1271,7 +1539,7 @@ decisionRefused epoch failure latest slot =
             slot
 
         Nothing ->
-            DecisionNotSaved failure latest
+            DecisionNotSaved failure latest (panelOf slot)
 
 
 -- The current queue load `load` settled with `result`. The reloaded queue
@@ -1280,30 +1548,31 @@ decisionRefused epoch failure latest slot =
 -- notice that succeeds also clears it, the reload its text advises, while
 -- a load started before it read the queue before the failure was known
 -- and leaves it. A decision still saving stays: its row is re-proved at
--- the write, and its own result settles it.
+-- the write, and its own result settles it. Every idle slot it settles
+-- closes its refusal panel, since the rows it was opened on are re-read.
 queueSettled : LoadTicket -> Result e a -> DecisionSlot -> DecisionSlot
 queueSettled load result slot =
     case slot of
         DecisionRefreshing _ _ ->
-            DecisionIdle
+            DecisionIdle PanelClosed
 
-        DecisionNotSaved _ raisedAt ->
+        DecisionNotSaved failure raisedAt _ ->
             case result of
                 Ok _ ->
                     if ticketNumber load > ticketNumber raisedAt then
-                        DecisionIdle
+                        DecisionIdle PanelClosed
 
                     else
-                        slot
+                        DecisionNotSaved failure raisedAt PanelClosed
 
                 Err _ ->
-                    slot
+                    DecisionNotSaved failure raisedAt PanelClosed
 
         DecisionSaving _ _ ->
             slot
 
-        DecisionIdle ->
-            slot
+        DecisionIdle _ ->
+            DecisionIdle PanelClosed
 
 
 -- What a row's decision controls show while a decision is busy, in place of
@@ -1327,10 +1596,10 @@ pendingText uid slot =
             else
                 Just (SafeText.literal "Refreshing the queue after a decision…")
 
-        DecisionIdle ->
+        DecisionIdle _ ->
             Nothing
 
-        DecisionNotSaved _ _ ->
+        DecisionNotSaved _ _ _ ->
             Nothing
 
 
@@ -1338,10 +1607,10 @@ pendingText uid slot =
 notSavedOf : DecisionSlot -> Maybe SaveFailure
 notSavedOf slot =
     case slot of
-        DecisionNotSaved failure _ ->
+        DecisionNotSaved failure _ _ ->
             Just failure
 
-        DecisionIdle ->
+        DecisionIdle _ ->
             Nothing
 
         DecisionSaving _ _ ->
@@ -1402,9 +1671,6 @@ sourceStatusText view =
 
         TooLarge (ChildSpans o) ->
             Just [ ToolText (SafeText.literal ("This file holds at least " ++ String.fromInt o.atLeast ++ " other units, past the " ++ String.fromInt Index.childSpanCeiling ++ "-unit review ceiling. It is not shown and cannot be decided here; split the file to review it.")) ]
-
-        TooLarge (ViewNodes o) ->
-            Just [ ToolText (SafeText.literal ("This unit's source draws as " ++ String.fromInt o.nodes ++ " elements even without highlighting, past the " ++ String.fromInt Index.viewNodeCeiling ++ "-element review ceiling." ++ notShownRemedy)) ]
 
 
 -- What a reviewer can do about a view past a ceiling.

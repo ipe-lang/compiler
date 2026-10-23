@@ -110,7 +110,7 @@ jobs:
           ALLOCATOR: ${{ matrix.allocator }}
         run: |
           cd examples/shapes/non-tea/hello-world
-          "$CARGO_TARGET_DIR/release/ipe" dev build package.ipe --out out \
+          "$CARGO_TARGET_DIR/release/ipe" dev build --out out \
             --static --allocator "$ALLOCATOR"
           cd out/rust
           cargo build --release --target "$STATIC_TRIPLE"
@@ -224,7 +224,7 @@ jobs:
       - name: ipe dev build --static --target aarch64-unknown-linux-musl
         run: |
           cd examples/shapes/non-tea/hello-world
-          "$CARGO_TARGET_DIR/release/ipe" dev build package.ipe --out out \
+          "$CARGO_TARGET_DIR/release/ipe" dev build --out out \
             --static --target aarch64-unknown-linux-musl --allocator dlmalloc
           cd out/rust
           cargo build --release --target "$STATIC_TRIPLE"
@@ -314,17 +314,48 @@ jobs:
       - name: C-free refusal gates
         run: cargo test -p ipe --test static_emit -- cfree
 
-      # And the CLI itself refuses --cfree end to end, artifact-free.
+      # And the CLI itself refuses --cfree end to end, artifact-free, with the
+      # exact typed refusal: its machine kind and its message, rendered from
+      # the `cli-static-refusal` and `cfree-not-yet-wired` entries of the
+      # message catalog, so any other failure (a typo, a crash) is red.
       - name: ipe dev build --static --cfree is refused
         run: |
           cd examples/shapes/non-tea/hello-world
-          if "$CARGO_TARGET_DIR/release/ipe" dev build package.ipe --out out/cfree \
-               --static --cfree; then
+          if "$CARGO_TARGET_DIR/release/ipe" dev build --out out/cfree \
+               --static --cfree --json 2> "$RUNNER_TEMP/cfree.json"; then
             echo "::error::--cfree must be refused until the pure-Rust dep swaps land"
             exit 1
           fi
           test ! -e out/cfree || {
             echo "::error::--cfree refusal must be artifact-free (no emitted crate)"; exit 1; }
+          python3 - "$GITHUB_WORKSPACE/src/ipe-cli/text/messages.md" "$RUNNER_TEMP/cfree.json" <<'PY'
+          import json, sys
+
+          def entry(lines, key):
+              start = lines.index(f"## {key}") + 1
+              body = []
+              for line in lines[start:]:
+                  if line.startswith("#"):
+                      break
+                  if line.strip():
+                      body.append(line)
+              if len(body) != 1:
+                  sys.exit(f"::error::message entry {key} is not one line: {body}")
+              return body[0]
+
+          catalog = open(sys.argv[1], encoding="utf-8").read().splitlines()
+          expected = entry(catalog, "cli-static-refusal").replace(
+              "{refusal}", entry(catalog, "cfree-not-yet-wired")
+          )
+          envelope = json.loads(open(sys.argv[2], encoding="utf-8").read())
+          payload = envelope.get("payload", {})
+          if envelope.get("status") != "error" or payload.get("kind") != "static-refusal":
+              sys.exit(f"::error::--cfree must refuse as static-refusal, got: {envelope}")
+          if payload.get("message") != expected:
+              sys.exit(
+                  f"::error::--cfree refusal text drifted: {payload.get('message')!r} != {expected!r}"
+              )
+          PY
 
       # Only `main` saves: a cache saved under any other ref is one no later run
       # reads, and it evicts the ones `main` wrote (verify-manifest check 6).
@@ -394,7 +425,7 @@ jobs:
       - name: ipe dev build (emit Rust for 01-hello-world)
         run: |
           cd "$REPO/examples/shapes/non-tea/hello-world"
-          "$CARGO_TARGET_DIR/release/ipe.exe" dev build package.ipe --out out
+          "$CARGO_TARGET_DIR/release/ipe.exe" dev build --out out
 
       - name: cargo build --release (MSVC +crt-static, dlmalloc)
         run: |
@@ -493,7 +524,7 @@ jobs:
       - name: ipe dev build (emit Rust for 01-hello-world)
         run: |
           cd examples/shapes/non-tea/hello-world
-          "$CARGO_TARGET_DIR/release/ipe" dev build package.ipe --out out
+          "$CARGO_TARGET_DIR/release/ipe" dev build --out out
 
       # Build-only: cross compiles the emitted crate for FreeBSD. Running
       # the resulting ELF on an ubuntu host is not possible (wrong ABI).

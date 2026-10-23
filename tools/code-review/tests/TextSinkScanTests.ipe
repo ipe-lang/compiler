@@ -476,8 +476,9 @@ errorTextNames =
     [ "Error.toString", "Error.message", "Ipe.Error.toString", "Ipe.Error.message" ]
 
 
--- The renderers that draw a `SafeText`'s parts, a label's parts and a
--- source's tokens, each once per `Html.text` it holds.
+-- The renderers that draw a `SafeText`'s parts, a label's parts, a
+-- source's tokens and its spelled-out text, each once per `Html.text` it
+-- holds.
 sanctionedHtmlText : List String
 sanctionedHtmlText =
     [ "Lib/View.ipe:segmentHtml"
@@ -487,6 +488,7 @@ sanctionedHtmlText =
     , "Lib/View.ipe:codeChildren"
     , "Lib/View.ipe:pieceHtml"
     , "Lib/View.ipe:pieceHtml"
+    , "Lib/View.ipe:spelledText"
     , "Lib/View.ipe:labelPartHtml"
     , "Lib/View.ipe:labelPartHtml"
     , "Lib/View.ipe:labelPartHtml"
@@ -650,11 +652,13 @@ admittedMarkup =
     , "Lib/View.ipe:labelPartHtml"
     , "Lib/View.ipe:linkEl"
     , "Lib/View.ipe:linkEl"
+    , "Lib/View.ipe:partHtml"
     , "Lib/View.ipe:pieceHtml"
     , "Lib/View.ipe:refusePanel"
     , "Lib/View.ipe:runHtml"
     , "Lib/View.ipe:safeTextHtml"
     , "Lib/View.ipe:segmentHtml"
+    , "Lib/View.ipe:spelledHtml"
     , "Lib/View.ipe:urlSync"
     , "Lib/View.ipe:view"
     ]
@@ -1176,10 +1180,18 @@ importOneViolations rel imp =
                     []
 
 
--- A module of `src`: its path relative to `src`, its text, and its
--- findings.
+-- Where a source's text comes from: a module read from `src`, or the code
+-- an evasion case adds to the module at that path, lexed apart from it.
+type Origin
+    = ReadFromSrc
+    | AddedByCase
+
+
+-- A source the scan reads: the path relative to `src` its findings are
+-- reported under, where its text comes from, its text, the import header
+-- of that text, its imports, and its findings.
 type alias Source =
-    ( String, String, Findings )
+    { rel : String, origin : Origin, text : String, header : String, imports : List Import, found : Findings }
 
 
 -- What the scan finds in one module, read from its tokens once when it is
@@ -1201,31 +1213,61 @@ findingsOf rel lexed =
     }
 
 
-lexSource : ( String, String ) -> Source
-lexSource ( rel, text ) =
-    ( rel, text, findingsOf rel (lex text) )
+indexSource : ( String, String ) -> Source
+indexSource ( rel, text ) =
+    let
+        lexed =
+            lex text
+    in
+    { rel = rel, origin = ReadFromSrc, text = text, header = importHeader text, imports = lexed.imports, found = findingsOf rel lexed }
+
+
+-- The lines of `text` before its first declaration: the module line, the
+-- imports, and the blank, indented and comment lines among them.
+importHeader : String -> String
+importHeader text =
+    String.join "\n"
+        (List.foldl
+            (\line acc ->
+                if acc.done then
+                    acc
+
+                else if headerLine line then
+                    { acc | kept = acc.kept ++ [ line ] }
+
+                else
+                    { acc | done = True }
+            )
+            { done = False, kept = [] }
+            (String.lines text)
+        ).kept
+
+
+headerLine : String -> Bool
+headerLine line =
+    String.isEmpty line || List.any (\start -> String.startsWith start line) [ "module ", "import", " ", "\t", "--", "{-" ]
 
 
 scanViolations : List Source -> List Violation
 scanViolations sources =
-    List.concatMap (\( _, _, found ) -> found.atTokens) sources
-        ++ multisetViolations StrayHtmlText "Html.text" sanctionedHtmlText (List.concatMap (\( _, _, found ) -> found.htmlTexts) sources)
-        ++ multisetViolations FlattenedText "SafeText.toString" admittedFlattening (List.concatMap (\( _, _, found ) -> found.flattenings) sources)
-        ++ multisetViolations ComputedMarkup "markup sink of computed text" admittedMarkup (List.concatMap (\( _, _, found ) -> found.markupSinks) sources)
-        ++ List.concatMap (\( _, _, found ) -> found.atImports) sources
+    List.concatMap (\source -> source.found.atTokens) sources
+        ++ multisetViolations StrayHtmlText "Html.text" sanctionedHtmlText (List.concatMap (\source -> source.found.htmlTexts) sources)
+        ++ multisetViolations FlattenedText "SafeText.toString" admittedFlattening (List.concatMap (\source -> source.found.flattenings) sources)
+        ++ multisetViolations ComputedMarkup "markup sink of computed text" admittedMarkup (List.concatMap (\source -> source.found.markupSinks) sources)
+        ++ List.concatMap (\source -> source.found.atImports) sources
 
 
 -- ── the real tree ───────────────────────────────────────────────────────
 
-
+-- `src` read and lexed once, for every check of the tree.
 lexedTree : Task.Task Error (List Source)
 lexedTree =
-    srcSources |> Task.map (List.map lexSource)
+    srcSources |> Task.map (List.map indexSource)
 
 
-realTreeClean : Task.Task Error Bool
-realTreeClean =
-    lexedTree |> Task.map (\sources -> List.isEmpty (scanViolations sources) && List.length sources > 1)
+realTreeClean : List Source -> Bool
+realTreeClean sources =
+    List.isEmpty (scanViolations sources) && List.length sources > 1
 
 
 -- True when `sources` breaks `rule` and no other rule.
@@ -1252,95 +1294,97 @@ clean sources =
 -- Each way around the scan is a violation of its own rule, beside a clean
 -- form that differs from it by the evasion alone. Red if the scan stops
 -- seeing a way untrusted text reaches a page flattened or unmarked.
-scanRefusesEvasions : Task.Task Error Bool
-scanRefusesEvasions =
-    lexedTree
-        |> Task.map
-            (\sources ->
-                let
-                    inView extra =
-                        appendTo "Lib/View.ipe" extra sources
+scanRefusesEvasions : List Source -> Bool
+scanRefusesEvasions sources =
+    let
+        inView extra =
+            appendTo "Lib/View.ipe" extra sources
 
-                    inQueue extra =
-                        appendTo "Lib/Queue.ipe" extra sources
-                in
-                clean sources
-                    && breaks ComputedUiText (inView "shown x =\n    Ui.text (SafeText.toString x)")
-                    && breaks FlattenedText (inView "shown x =\n    Ui.text (SafeText.toString x)")
-                    && caughtBy ComputedUiText (inView "shown label =\n    Ui.text label")
-                    && caughtBy ComputedUiText (inView "shown label =\n    Ipe.Ui.text label")
-                    && caughtBy ComputedUiText (inView "shown =\n    List.map Ui.text")
-                    && clean (inView "shown =\n    Ui.text \"a fixed label\"")
-                    && caughtBy ImportSpelling (prependTo "Lib/Queue.ipe" "import Lib.SafeText as T" (inQueue "shown x =\n    T.toString x"))
-                    && caughtBy ImportSpelling (prependTo "Lib/View.ipe" "import Lib.SafeText exposing (toString)" sources)
-                    && caughtBy ImportSpelling (prependTo "Lib/View.ipe" "import Ipe.Ui as Ui exposing (text)" sources)
-                    && caughtBy ImportSpelling (prependTo "Lib/View.ipe" "import Ipe.Html as Html exposing (..)" sources)
-                    && caughtBy ImportSpelling (prependTo "Lib/Queue.ipe" "import Ipe.Error as Error exposing (Error, message)" sources)
-                    && caughtBy ImportSpelling (prependTo "Lib/Queue.ipe" "import Ipe.Error as Error exposing (Error," sources)
-                    && caughtBy ImportSpelling (prependTo "Lib/View.ipe" "import Ipe.Ui as Ui\n    exposing (text)" sources)
-                    && clean (prependTo "Lib/Queue.ipe" "import Lib.SafeText as SafeText exposing (SafeText, Segment(..))" sources)
-                    && caughtBy FlattenedText (inView "shown =\n    Maybe.map SafeText.toString")
-                    && caughtBy FlattenedText (inView "shown x =\n    Lib.SafeText.toString x")
-                    && caughtBy FlattenedText (inQueue "shown x =\n    SafeText.toString x")
-                    && caughtBy FlattenedText (List.filter (\( rel, _, _ ) -> rel /= "Lib/Settings.ipe") sources)
-                    && breaks ComputedUiText (inView "shown e =\n    Ui.text (Error.message e)")
-                    && breaks ErrorTextUnrendered (inView "shown e =\n    Ui.text (Error.message e)")
-                    && caughtBy ErrorTextUnrendered (inQueue "shown e =\n    SafeText.literal (Error.toString e)")
-                    && clean (inQueue "shown e =\n    SafeText.renderForeign (Error.message e)")
-                    && clean (appendTo "Lib/Db.ipe" "shown e =\n    Error.message e" sources)
-                    && caughtBy StrayHtmlText (inView "shown x =\n    Html.text x")
-                    && caughtBy StrayHtmlText (appendTo "Lib/Links.ipe" "shown x =\n    Ipe.Html.text x" sources)
-                    && caughtBy FlattenedText (inView "shown x =\n    ( \"--\", SafeText.toString x )")
-                    && caughtBy FlattenedText (inView "shown x =\n    ( \"{-\", SafeText.toString x )")
-                    && caughtBy FlattenedText (inView "shown x =\n    ( '\"', SafeText.toString x )")
-                    && caughtBy FlattenedText (inView "shown x =\n    ( '\\'', SafeText.toString x )")
-                    && caughtBy ComputedUiText (inView "shown x =\n    ( \"a \\\" -- b\", Ui.text x )")
-                    && caughtBy ComputedUiText (inView "shown x =\n    {- {- -} -} Ui.text x")
-                    && clean (inView "shown x =\n    {- {- -} Ui.text x -} x")
-                    && clean (inView "shown x =\n    -- Ui.text x\n    x")
-                    && clean (inView "shown x =\n    \"\"\"a \" -- Ui.text x \"\"\"")
-                    && caughtBy ComputedMarkup (inView "shown x =\n    Ui.texts x\n\n\nother x =\n    myUi.text x")
-                    && clean (inView "shown x =\n    myUi.text x")
-                    && caughtBy Interpolated (inView "shown x =\n    Ui.text \"\"\"{{x}}\"\"\"")
-                    && caughtBy Interpolated (inQueue "shown x =\n    \"\"\"a {{SafeText.toString x}}\"\"\"")
-                    && caughtBy Interpolated (inView "shown x =\n    Ui.text \"\"\"{{x\"\"\"")
-                    && clean (inView "shown x =\n    Ui.text \"\"\"{ x } {\n{\"\"\"")
-                    && caughtBy ComputedUiText (inView "shown x =\n    ( \"\"\"a\\\"\"\" , Ui.text x )")
-                    && clean (inView "shown x =\n    ( \"\"\"a\\\"\"\" , Ui.text \"b\" )")
-                    && caughtBy ImportSpelling (prependTo "Lib/Queue.ipe" "import\tLib.SafeText as T" (inQueue "shown x =\n    T.toString x"))
-                    && caughtBy ImportSpelling (prependTo "Lib/Queue.ipe" "import Lib.SafeText{--}as T" (inQueue "shown x =\n    T.toString x"))
-                    && caughtBy ImportSpelling (prependTo "Lib/Queue.ipe" "import\n    Lib.SafeText\n    as T" (inQueue "shown x =\n    T.toString x"))
-                    && clean (prependTo "Lib/Queue.ipe" "import\tLib.SafeText{--}as SafeText" sources)
-                    && caughtBy ImportSpelling (prependTo "Lib/View.ipe" "import Ipe.Html.Unsafe as Unsafe" sources)
-                    && caughtBy ImportSpelling (prependTo "Lib/View.ipe" "import Ipe.Html.Attributes as A" sources)
-                    && caughtBy ImportSpelling (prependTo "Lib/View.ipe" "import Ipe.Html.Attributes as Attr exposing (title)" sources)
-                    && caughtBy ImportSpelling (prependTo "Lib/View.ipe" "import Ipe.Ui as Ui exposing (LinkTarget(..))" sources)
-                    && clean (prependTo "Lib/View.ipe" "import Ipe.Ui as Ui exposing (Element)" sources)
-                    && caughtBy ComputedMarkup (inView "shown x =\n    Attr.title x")
-                    && caughtBy ComputedMarkup (inView "shown x =\n    Attr.attribute \"title\" x")
-                    && caughtBy ComputedMarkup (inView "shown x =\n    x |> Attr.attribute \"title\"")
-                    && caughtBy ComputedMarkup (inView "shown x =\n    Ipe.Html.Attributes.style (\"color:\" ++ x)")
-                    && caughtBy ComputedMarkup (inView "shown x =\n    Html.titleNode x")
-                    && caughtBy ComputedMarkup (inView "shown x =\n    Font.family x")
-                    && clean (inView "shown =\n    [ Attr.attribute \"title\" \"fixed\", Ipe.Html.Attributes.style \"color:red\", Font.family Font.monospace ]")
-                    && caughtBy ComputedMarkup (editIn "Lib/View.ipe" "(currentPath model)" "\"/\"" sources)
-                    && caughtBy Unlexed (inView "shown x =\n    \"open")
-                    && caughtBy Unlexed (inView "shown x =\n    {- open")
-                    && caughtBy Unlexed (inView "shown x =\n    \"\"\"open")
-            )
+        inQueue extra =
+            appendTo "Lib/Queue.ipe" extra sources
+    in
+    clean sources
+        && breaks ComputedUiText (inView "shown x =\n    Ui.text (SafeText.toString x)")
+        && breaks FlattenedText (inView "shown x =\n    Ui.text (SafeText.toString x)")
+        && caughtBy ComputedUiText (inView "shown label =\n    Ui.text label")
+        && caughtBy ComputedUiText (inView "shown label =\n    Ipe.Ui.text label")
+        && caughtBy ComputedUiText (inView "shown =\n    List.map Ui.text")
+        && clean (inView "shown =\n    Ui.text \"a fixed label\"")
+        && caughtBy ImportSpelling (prependTo "Lib/Queue.ipe" "import Lib.SafeText as T" (inQueue "shown x =\n    T.toString x"))
+        && caughtBy ImportSpelling (prependTo "Lib/View.ipe" "import Lib.SafeText exposing (toString)" sources)
+        && caughtBy ImportSpelling (prependTo "Lib/View.ipe" "import Ipe.Ui as Ui exposing (text)" sources)
+        && caughtBy ImportSpelling (prependTo "Lib/View.ipe" "import Ipe.Html as Html exposing (..)" sources)
+        && caughtBy ImportSpelling (prependTo "Lib/Queue.ipe" "import Ipe.Error as Error exposing (Error, message)" sources)
+        && caughtBy ImportSpelling (prependTo "Lib/Queue.ipe" "import Ipe.Error as Error exposing (Error," sources)
+        && caughtBy ImportSpelling (prependTo "Lib/View.ipe" "import Ipe.Ui as Ui\n    exposing (text)" sources)
+        && clean (prependTo "Lib/Queue.ipe" "import Lib.SafeText as SafeText exposing (SafeText, Segment(..))" sources)
+        && caughtBy FlattenedText (inView "shown =\n    Maybe.map SafeText.toString")
+        && caughtBy FlattenedText (inView "shown x =\n    Lib.SafeText.toString x")
+        && caughtBy FlattenedText (inQueue "shown x =\n    SafeText.toString x")
+        && caughtBy FlattenedText (List.filter (\source -> source.rel /= "Lib/Settings.ipe") sources)
+        && breaks ComputedUiText (inView "shown e =\n    Ui.text (Error.message e)")
+        && breaks ErrorTextUnrendered (inView "shown e =\n    Ui.text (Error.message e)")
+        && caughtBy ErrorTextUnrendered (inQueue "shown e =\n    SafeText.literal (Error.toString e)")
+        && clean (inQueue "shown e =\n    SafeText.renderForeign (Error.message e)")
+        && clean (appendTo "Lib/Db.ipe" "shown e =\n    Error.message e" sources)
+        && caughtBy StrayHtmlText (inView "shown x =\n    Html.text x")
+        && caughtBy StrayHtmlText (appendTo "Lib/Links.ipe" "shown x =\n    Ipe.Html.text x" sources)
+        && caughtBy FlattenedText (inView "shown x =\n    ( \"--\", SafeText.toString x )")
+        && caughtBy FlattenedText (inView "shown x =\n    ( \"{-\", SafeText.toString x )")
+        && caughtBy FlattenedText (inView "shown x =\n    ( '\"', SafeText.toString x )")
+        && caughtBy FlattenedText (inView "shown x =\n    ( '\\'', SafeText.toString x )")
+        && caughtBy ComputedUiText (inView "shown x =\n    ( \"a \\\" -- b\", Ui.text x )")
+        && caughtBy ComputedUiText (inView "shown x =\n    {- {- -} -} Ui.text x")
+        && clean (inView "shown x =\n    {- {- -} Ui.text x -} x")
+        && clean (inView "shown x =\n    -- Ui.text x\n    x")
+        && clean (inView "shown x =\n    \"\"\"a \" -- Ui.text x \"\"\"")
+        && caughtBy ComputedMarkup (inView "shown x =\n    Ui.texts x\n\n\nother x =\n    myUi.text x")
+        && clean (inView "shown x =\n    myUi.text x")
+        && caughtBy Interpolated (inView "shown x =\n    Ui.text \"\"\"{{x}}\"\"\"")
+        && caughtBy Interpolated (inQueue "shown x =\n    \"\"\"a {{SafeText.toString x}}\"\"\"")
+        && caughtBy Interpolated (inView "shown x =\n    Ui.text \"\"\"{{x\"\"\"")
+        && clean (inView "shown x =\n    Ui.text \"\"\"{ x } {\n{\"\"\"")
+        && caughtBy ComputedUiText (inView "shown x =\n    ( \"\"\"a\\\"\"\" , Ui.text x )")
+        && clean (inView "shown x =\n    ( \"\"\"a\\\"\"\" , Ui.text \"b\" )")
+        && caughtBy ImportSpelling (prependTo "Lib/Queue.ipe" "import\tLib.SafeText as T" (inQueue "shown x =\n    T.toString x"))
+        && caughtBy ImportSpelling (prependTo "Lib/Queue.ipe" "import Lib.SafeText{--}as T" (inQueue "shown x =\n    T.toString x"))
+        && caughtBy ImportSpelling (prependTo "Lib/Queue.ipe" "import\n    Lib.SafeText\n    as T" (inQueue "shown x =\n    T.toString x"))
+        && clean (prependTo "Lib/Queue.ipe" "import\tLib.SafeText{--}as SafeText" sources)
+        && caughtBy ImportSpelling (prependTo "Lib/View.ipe" "import Ipe.Html.Unsafe as Unsafe" sources)
+        && caughtBy ImportSpelling (prependTo "Lib/View.ipe" "import Ipe.Html.Attributes as A" sources)
+        && caughtBy ImportSpelling (prependTo "Lib/View.ipe" "import Ipe.Html.Attributes as Attr exposing (title)" sources)
+        && caughtBy ImportSpelling (prependTo "Lib/View.ipe" "import Ipe.Ui as Ui exposing (LinkTarget(..))" sources)
+        && clean (prependTo "Lib/View.ipe" "import Ipe.Ui as Ui exposing (Element)" sources)
+        && caughtBy ComputedMarkup (inView "shown x =\n    Attr.title x")
+        && caughtBy ComputedMarkup (inView "shown x =\n    Attr.attribute \"title\" x")
+        && caughtBy ComputedMarkup (inView "shown x =\n    x |> Attr.attribute \"title\"")
+        && caughtBy ComputedMarkup (inView "shown x =\n    Ipe.Html.Attributes.style (\"color:\" ++ x)")
+        && caughtBy ComputedMarkup (inView "shown x =\n    Html.titleNode x")
+        && caughtBy ComputedMarkup (inView "shown x =\n    Font.family x")
+        && clean (inView "shown =\n    [ Attr.attribute \"title\" \"fixed\", Ipe.Html.Attributes.style \"color:red\", Font.family Font.monospace ]")
+        && caughtBy ComputedMarkup (editIn "Lib/View.ipe" "(currentPath model)" "\"/\"" sources)
+        && caughtBy Unlexed (inView "shown x =\n    \"open")
+        && caughtBy Unlexed (inView "shown x =\n    {- open")
+        && caughtBy Unlexed (inView "shown x =\n    \"\"\"open")
 
 
--- The tree with module `rel` grown by `extra`, that module lexed again
--- whole.
-appendTo : String -> String -> List Source -> List Source
-appendTo rel extra sources =
+-- Whether `source` is module `rel` as read from `src`.
+isModule : String -> Source -> Bool
+isModule rel source =
+    source.rel == rel && source.origin == ReadFromSrc
+
+
+-- The tree with the text of module `rel` rewritten by `edit`, that module
+-- lexed again whole.
+rewritten : String -> (String -> String) -> List Source -> List Source
+rewritten rel edit sources =
     List.map
-        (\( name, text, found ) ->
-            if name == rel then
-                lexSource ( name, text ++ "\n\n" ++ extra ++ "\n" )
+        (\source ->
+            if isModule rel source then
+                indexSource ( rel, edit source.text )
 
             else
-                ( name, text, found )
+                source
         )
         sources
 
@@ -1349,28 +1393,192 @@ appendTo rel extra sources =
 -- lexed again whole.
 editIn : String -> String -> String -> List Source -> List Source
 editIn rel from to sources =
-    List.map
-        (\( name, text, found ) ->
-            if name == rel then
-                lexSource ( name, String.replace from to text )
+    rewritten rel (String.replace from to) sources
+
+
+-- The tree with module `rel` grown by `extra`, that module lexed again
+-- whole.
+appendToWhole : String -> String -> List Source -> List Source
+appendToWhole rel extra sources =
+    rewritten rel (\text -> text ++ "\n\n" ++ extra ++ "\n") sources
+
+
+-- The tree with module `rel` grown by `extra`. A new declaration is lexed
+-- alone and judged as code of `rel`; any other text grows the module, lexed
+-- again whole.
+appendTo : String -> String -> List Source -> List Source
+appendTo rel extra sources =
+    List.concatMap
+        (\source ->
+            if isModule rel source then
+                case addedApart extra source of
+                    Just added ->
+                        [ source, added ]
+
+                    Nothing ->
+                        appendToWhole rel extra [ source ]
 
             else
-                ( name, text, found )
+                [ source ]
         )
         sources
 
 
+-- `extra` lexed alone as code added after `source`, or nothing when the
+-- seam could change a token's reading. A module that lexes closed ends in
+-- code, and a declaration name at column 0 starts the site key anew and is
+-- a word: no rule reads a word next to it differently from no token, so
+-- every finding of the two parts is a finding of the grown module.
+addedApart : String -> Source -> Maybe Source
+addedApart extra source =
+    if startsDeclaration extra && List.all (\v -> v.rule /= Unlexed) source.found.atTokens then
+        let
+            lexed =
+                lex (extra ++ "\n")
+        in
+        Just { rel = source.rel, origin = AddedByCase, text = extra, header = "", imports = lexed.imports, found = findingsOf source.rel lexed }
+
+    else
+        Nothing
+
+
+startsDeclaration : String -> Bool
+startsDeclaration text =
+    Maybe.map (\c -> Char.isLower c && Char.toCode c < 128) (List.head (String.toList text)) == Just True
+
+
+-- The tree with `extra` before module `rel`. Import lines are read with the
+-- module's import header alone; any other text is prepended and the module
+-- lexed again whole.
 prependTo : String -> String -> List Source -> List Source
 prependTo rel extra sources =
-    List.map
-        (\( name, text, found ) ->
-            if name == rel then
-                lexSource ( name, extra ++ "\n" ++ text )
+    List.concatMap
+        (\source ->
+            if isModule rel source then
+                case importLinesApart extra source of
+                    Just prepended ->
+                        [ prepended ]
+
+                    Nothing ->
+                        rewritten rel (\text -> extra ++ "\n" ++ text) [ source ]
 
             else
-                ( name, text, found )
+                [ source ]
         )
         sources
+
+
+-- `source` with the import lines `extra` before it, read with its import
+-- header alone, or nothing when `extra` holds code, leaves a literal open,
+-- or changes how the header's own imports read. The module's import
+-- findings are those of the header so read; the tokens of `extra` add
+-- their own findings.
+importLinesApart : String -> Source -> Maybe Source
+importLinesApart extra source =
+    let
+        alone =
+            lex extra
+
+        headed =
+            lex (extra ++ "\n" ++ source.header)
+    in
+    if List.isEmpty alone.code && not alone.broken && not alone.interpolated && List.drop (List.length alone.imports) headed.imports == source.imports then
+        let
+            found =
+                source.found
+
+            own =
+                findingsOf source.rel alone
+        in
+        Just
+            { source
+                | text = extra ++ "\n" ++ source.text
+                , header = extra ++ "\n" ++ source.header
+                , imports = headed.imports
+                , found =
+                    { found
+                        | atTokens = own.atTokens ++ found.atTokens
+                        , atImports = importViolations source.rel headed.imports
+                        , htmlTexts = own.htmlTexts ++ found.htmlTexts
+                        , flattenings = own.flattenings ++ found.flattenings
+                        , markupSinks = own.markupSinks ++ found.markupSinks
+                    }
+            }
+
+    else
+        Nothing
+
+
+-- The same violations, each as often, in both lists.
+sameViolations : List Source -> List Source -> Bool
+sameViolations apart whole =
+    let
+        a =
+            scanViolations apart
+
+        b =
+            scanViolations whole
+
+        count v vs =
+            List.length (List.filter (\x -> x == v) vs)
+    in
+    List.length a == List.length b && List.all (\v -> count v a == count v b) (a ++ b)
+
+
+-- A case read apart from its module is judged as the module lexed again
+-- whole with the same text, for a rule of each family: a token rule, a
+-- listed-site rule, and an import rule. Red if reading a case apart lets
+-- the module's own text matter less, or a case meant to be read apart is
+-- lexed whole.
+appendedSiteKeysAsModule : List Source -> Bool
+appendedSiteKeysAsModule sources =
+    let
+        drawn =
+            "shown label =\n    Ui.text label"
+
+        flattened =
+            "shown x =\n    SafeText.toString x"
+
+        aliased =
+            "import Lib.SafeText as T"
+
+        viaAlias =
+            "shown x =\n    T.toString x"
+
+        drawnApart =
+            appendTo "Lib/View.ipe" drawn sources
+
+        drawnWhole =
+            appendToWhole "Lib/View.ipe" drawn sources
+
+        flattenedApart =
+            appendTo "Lib/Queue.ipe" flattened sources
+
+        flattenedWhole =
+            appendToWhole "Lib/Queue.ipe" flattened sources
+
+        aliasedApart =
+            prependTo "Lib/Queue.ipe" aliased (appendTo "Lib/Queue.ipe" viaAlias sources)
+
+        aliasedWhole =
+            rewritten "Lib/Queue.ipe" (\text -> aliased ++ "\n" ++ text ++ "\n\n" ++ viaAlias ++ "\n") sources
+
+        readApart rel tree =
+            List.any (\source -> source.rel == rel && source.origin == AddedByCase) tree
+
+        importsApart rel =
+            List.any (\source -> isModule rel source && importLinesApart aliased source /= Nothing) sources
+    in
+    readApart "Lib/View.ipe" drawnApart
+        && readApart "Lib/Queue.ipe" flattenedApart
+        && readApart "Lib/Queue.ipe" aliasedApart
+        && importsApart "Lib/Queue.ipe"
+        && breaks ComputedUiText drawnWhole
+        && sameViolations drawnApart drawnWhole
+        && breaks FlattenedText flattenedWhole
+        && sameViolations flattenedApart flattenedWhole
+        && breaks ImportSpelling aliasedWhole
+        && sameViolations aliasedApart aliasedWhole
 
 
 -- ── scanner self-tests ──────────────────────────────────────────────────
@@ -1403,10 +1611,25 @@ lexerReadsLiterals =
         && Result.toMaybe (withinFileCeiling (List.repeat fileCeiling "")) /= Nothing
 
 
+-- `scan` of the lexed tree, or the read's failure.
+onTree : (List Source -> Bool) -> Result Error (List Source) -> Task.Task Error Bool
+onTree scan tree =
+    Task.fromResult (Result.map scan tree)
+
+
+-- Each check of the tree reads the one lexed tree; a failed read fails
+-- each of them.
 checks : Task.Task Error (List ( String, Bool ))
 checks =
-    Task.sequence
-        [ check "untrusted text reaches a page only through the one sink: the source scan finds no violation" realTreeClean
-        , check "each way around the text sink scan is a violation of its own rule" scanRefusesEvasions
-        , Task.succeed ( "the text sink scan lexes literals and comments as Ipê reads them", lexerReadsLiterals )
-        ]
+    lexedTree
+        |> Task.map Ok
+        |> Task.onError (\e -> Task.succeed (Err e))
+        |> Task.andThen
+            (\tree ->
+                Task.sequence
+                    [ check "untrusted text reaches a page only through the one sink: the source scan finds no violation" (onTree realTreeClean tree)
+                    , check "each way around the text sink scan is a violation of its own rule" (onTree scanRefusesEvasions tree)
+                    , check "an evasion case read apart from its module is judged as the module lexed again whole" (onTree appendedSiteKeysAsModule tree)
+                    , Task.succeed ( "the text sink scan lexes literals and comments as Ipê reads them", lexerReadsLiterals )
+                    ]
+            )

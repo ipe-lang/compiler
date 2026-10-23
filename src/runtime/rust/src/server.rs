@@ -1777,6 +1777,90 @@ where
     }
 }
 
+/// The layer that counts each admitted request as shutdown work.
+///
+/// It wraps the router inside the Host admission, so a refused request holds
+/// nothing.
+#[derive(Clone)]
+struct WorkLayer {
+    count: shutdown::WorkCount,
+}
+
+impl<S> tower::Layer<S> for WorkLayer {
+    type Service = WorkService<S>;
+
+    fn layer(&self, inner: S) -> Self::Service {
+        WorkService {
+            inner,
+            count: self.count.clone(),
+        }
+    }
+}
+
+/// Each request holds one [`shutdown::WorkGuard`] until its response head
+/// exists; a request past the work ceiling, or one still running when the
+/// shutdown closes, is answered 503 with `Connection: close`.
+///
+/// The cancel arm is polled first, so a request that arrives once the phase
+/// is closing never reaches its handler.
+#[derive(Clone)]
+struct WorkService<S> {
+    inner: S,
+    count: shutdown::WorkCount,
+}
+
+impl<S> tower::Service<axum::extract::Request> for WorkService<S>
+where
+    S: tower::Service<
+            axum::extract::Request,
+            Response = axum::response::Response,
+            Error = std::convert::Infallible,
+        >,
+    S::Future: Send + 'static,
+{
+    type Response = axum::response::Response;
+    type Error = std::convert::Infallible;
+    type Future =
+        futures_util::future::BoxFuture<'static, Result<Self::Response, std::convert::Infallible>>;
+
+    fn poll_ready(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), Self::Error>> {
+        self.inner.poll_ready(cx)
+    }
+
+    fn call(&mut self, request: axum::extract::Request) -> Self::Future {
+        let Ok(mut guard) = self.count.guard() else {
+            return Box::pin(std::future::ready(Ok(work_cancelled())));
+        };
+        let handled = self.inner.call(request);
+        Box::pin(async move {
+            tokio::select! {
+                biased;
+                () = guard.cancelled() => Ok(work_cancelled()),
+                response = handled => response,
+            }
+        })
+    }
+}
+
+/// The 503 a request the shutdown cancels, or the work ceiling refuses, reads.
+fn work_cancelled() -> axum::response::Response {
+    use axum::response::IntoResponse;
+    let mut resp = with_security_headers(
+        RequestRejection::Unavailable
+            .status_and_reason()
+            .into_response(),
+        response_security_headers(),
+    );
+    resp.headers_mut().insert(
+        axum::http::header::CONNECTION,
+        axum::http::HeaderValue::from_static("close"),
+    );
+    resp
+}
+
 /// Parse `request`'s URL once, respell its path canonically and record the
 /// parse as its [`StrictUrl`] extension.
 ///
@@ -2767,11 +2851,18 @@ pub(crate) async fn bind_app_listener(
 /// the fallback are refused alike and a refused request reaches no handler,
 /// session or concurrency permit.
 ///
+/// Every admitted request is counted as shutdown work until its response head
+/// exists.
+///
 /// Its only success is [`shutdown::Stopped`]: after the first signal the
-/// in-flight requests and long-lived tasks get what is left of the grace, every
-/// other serve site sharing the owner drains too, the exporters flush, and
-/// every owned pool closes under its deadline. A signal
+/// in-flight requests, the counted work and the long-lived tasks get what is
+/// left of the grace, and every other serve site sharing the owner drains too.
+/// Then the work still running is cancelled (a request reads 503), the
+/// exporters flush, and every owned pool closes under its deadline. A signal
 /// that arrived before the serve skips accepting altogether.
+///
+/// Only a signalled stop tears down: a serve that ends before any signal
+/// returns at once and leaves the shared owner serving.
 ///
 /// # Errors
 ///
@@ -2784,17 +2875,18 @@ pub(crate) async fn serve_app(
 ) -> std::io::Result<shutdown::Stopped> {
     use axum::ServiceExt as _;
     use tower::Layer as _;
+    let mut served: std::io::Result<()> = Ok(());
     if !armed.is_draining() {
-        // This site counts as live while it serves, so a sibling site sharing
-        // the owner closes the shared pools only after this one has drained.
-        let serving = armed.drain().hold();
         let AppListener {
             listener,
             admission,
             tag,
         } = app;
+        let work = WorkLayer {
+            count: armed.work_count(),
+        };
         let svc = crate::inbound_authority::HostAdmissionLayer::new(admission, tag)
-            .layer(CanonicalUrl::new(router));
+            .layer(work.layer(CanonicalUrl::new(router)));
         let mut stop = armed.drain();
         let serve = std::future::IntoFuture::into_future(
             axum::serve(
@@ -2803,24 +2895,55 @@ pub(crate) async fn serve_app(
             )
             .with_graceful_shutdown(async move { stop.wait().await }),
         );
-        tokio::pin!(serve);
-        let mut drain = armed.drain();
-        tokio::select! {
-            biased;
-            served = serve.as_mut() => served?,
-            () = drain.wait() => {
-                if let Ok(served) = tokio::time::timeout(armed.remaining_grace(), serve.as_mut()).await {
-                    served?;
-                }
+        served = serve_until_drained(serve, &armed).await;
+    }
+    stop_after_serve(&armed, served).await
+}
+
+/// Run `serve` until it ends, or until the drain plus what is left of the
+/// grace; the site counts as live throughout.
+async fn serve_until_drained(
+    serve: impl std::future::Future<Output = std::io::Result<()>> + Send,
+    armed: &shutdown::Armed,
+) -> std::io::Result<()> {
+    // This site counts as live while it serves, so a sibling site sharing
+    // the owner closes the shared pools only after this one has drained.
+    let serving = armed.drain().hold();
+    tokio::pin!(serve);
+    let mut drain = armed.drain();
+    let mut served = Ok(());
+    tokio::select! {
+        biased;
+        ended = serve.as_mut() => served = ended,
+        () = drain.wait() => {
+            if let Ok(ended) = tokio::time::timeout(armed.remaining_grace(), serve.as_mut()).await {
+                served = ended;
             }
         }
-        drop(serving);
+    }
+    drop(serving);
+    served
+}
+
+/// Tear the owner down after a stopping serve; hand back an unsignalled
+/// serve's end untouched.
+async fn stop_after_serve(
+    armed: &shutdown::Armed,
+    served: std::io::Result<()>,
+) -> std::io::Result<shutdown::Stopped> {
+    if !armed.signalled() && !armed.is_draining() {
+        return served.and_then(|()| {
+            Err(std::io::Error::other(
+                "the serve loop ended before any shutdown signal",
+            ))
+        });
     }
     armed.settle_live().await;
+    let settled = armed.cancel_work().await;
     #[cfg(all(feature = "web", feature = "http_client"))]
     crate::web::flush_exporters().await;
-    let closed = shutdown::close_owned_pools(&armed).await;
-    Ok(shutdown::Stopped::after(closed))
+    let closed = shutdown::close_owned_pools(armed, settled).await;
+    served.map(|()| shutdown::Stopped::after(closed))
 }
 
 /// Serve a test upstream `router` on `listener` with no Host admission.
@@ -3706,6 +3829,10 @@ fn ws_max_message_bytes(max_message_bytes: i64) -> usize {
 /// The drain counts the socket until `onClose` returns. Once it drains, the
 /// socket sends close code 1001 and ends the loop. Every close frame goes
 /// through [`ws_send_close`], under [`shutdown::WS_CLOSE_DEADLINE`].
+///
+/// The socket is one unit of shutdown work too: a callback still running when
+/// the shutdown closes is cancelled, and no callback starts after it, so no
+/// user code on the socket outlives the pools it may use.
 async fn ws_loop<E, S>(
     mut socket: S,
     cfg: WsServerCfg<E>,
@@ -3740,6 +3867,10 @@ async fn ws_loop<E, S>(
         ws_send_close(&mut socket, ws_away_close()).await;
         return;
     };
+    let Ok(mut work) = drain.work() else {
+        ws_send_close(&mut socket, ws_away_close()).await;
+        return;
+    };
     let (tx, mut rx) = tokio::sync::mpsc::channel::<WsOut>(ceilings.send_buffer);
     // Live-peer ceiling, application-layer defense in depth: the upgrade gate in
     // `server_web_socket_upgrade` is the primary check, but under high
@@ -3761,9 +3892,13 @@ async fn ws_loop<E, S>(
         ws_send_close(&mut socket, Message::Close(None)).await;
         return;
     }
-    let _ = credentials
-        .scoped(|| (cfg.onConnect)(WsHandle::WebSocketServer(id)))
+    let connected = work
+        .unless_cancelled(credentials.scoped(|| (cfg.onConnect)(WsHandle::WebSocketServer(id))))
         .await;
+    if connected.is_none() {
+        ws_close_cancelled(socket, id, work).await;
+        return;
+    }
     // Heartbeat: send a Ping every `ceilings.heartbeat_secs` seconds to keep the
     // connection alive through proxies and detect silent drops.  Mirrors
     // `wsDefaultPingInterval = 30s` + `wsPingTimeout = 10s` pattern in
@@ -3796,9 +3931,14 @@ async fn ws_loop<E, S>(
                         ws_send_close(&mut socket, ws_denied_close()).await;
                         break;
                     }
-                    let _ = credentials
-                        .scoped(|| (cfg.onMessage)(WsHandle::WebSocketServer(id), t))
+                    let handled = work
+                        .unless_cancelled(
+                            credentials.scoped(|| (cfg.onMessage)(WsHandle::WebSocketServer(id), t)),
+                        )
                         .await;
+                    if handled.is_none() {
+                        break;
+                    }
                 }
                 Some(Ok(Message::Binary(b))) => {
                     if b.len() > max_bytes {
@@ -3818,9 +3958,14 @@ async fn ws_loop<E, S>(
                     // encoding at the Ipê level.
                     #[allow(clippy::disallowed_methods)] // a binary frame reaches `onMessage` as `String` text
                     let s = String::from_utf8_lossy(&b).into_owned();
-                    let _ = credentials
-                        .scoped(|| (cfg.onMessage)(WsHandle::WebSocketServer(id), s))
+                    let handled = work
+                        .unless_cancelled(
+                            credentials.scoped(|| (cfg.onMessage)(WsHandle::WebSocketServer(id), s)),
+                        )
                         .await;
+                    if handled.is_none() {
+                        break;
+                    }
                 }
                 Some(Ok(Message::Close(_))) | None => break,
                 // Incoming Ping/Pong frames are auto-handled by axum; no user
@@ -3828,8 +3973,10 @@ async fn ws_loop<E, S>(
                 Some(Ok(_)) => {}
                 Some(Err(e)) => {
                     let error = format!("ws read error: {}", e).into();
-                    let _ = credentials
-                        .scoped(|| (cfg.onError)(WsHandle::WebSocketServer(id), error))
+                    let _ = work
+                        .unless_cancelled(
+                            credentials.scoped(|| (cfg.onError)(WsHandle::WebSocketServer(id), error)),
+                        )
                         .await;
                     break;
                 }
@@ -3853,13 +4000,27 @@ async fn ws_loop<E, S>(
             },
         }
     }
-    let _ = credentials
-        .scoped(|| (cfg.onClose)(WsHandle::WebSocketServer(id)))
+    let _ = work
+        .unless_cancelled(credentials.scoped(|| (cfg.onClose)(WsHandle::WebSocketServer(id))))
         .await;
     ws_registry()
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .remove(&id);
+}
+
+/// End a socket the shutdown cancelled before its loop began: unregister it,
+/// release its work unit, then send the going-away close under its deadline.
+async fn ws_close_cancelled<S>(mut socket: S, id: i64, work: shutdown::WorkGuard)
+where
+    S: futures_util::Sink<axum::extract::ws::Message> + Unpin,
+{
+    ws_registry()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(&id);
+    drop(work);
+    ws_send_close(&mut socket, ws_away_close()).await;
 }
 
 fn ws_resp(status: i64, body: &str) -> ServerResponse {
@@ -5319,6 +5480,274 @@ mod tests {
             .expect("the idle site stops");
         assert!(matches!(idle, Ok(Ok(shutdown::Stopped { .. }))));
         drop(client);
+    }
+
+    /// Sets its flag when the future holding it is dropped.
+    struct DropFlag(Arc<std::sync::atomic::AtomicBool>);
+
+    impl Drop for DropFlag {
+        fn drop(&mut self) {
+            self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    /// A router stand-in that counts its calls and flags when a call's
+    /// future first runs.
+    fn probed(
+        calls: &Arc<std::sync::atomic::AtomicUsize>,
+        polled: &Arc<std::sync::atomic::AtomicBool>,
+    ) -> impl tower::Service<
+        axum::extract::Request,
+        Response = axum::response::Response,
+        Error = std::convert::Infallible,
+        Future = impl std::future::Future<
+            Output = Result<axum::response::Response, std::convert::Infallible>,
+        > + Send
+                 + 'static,
+    > {
+        use axum::response::IntoResponse as _;
+        let (calls, polled) = (Arc::clone(calls), Arc::clone(polled));
+        tower::service_fn(move |_request: axum::extract::Request| {
+            calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let polled = Arc::clone(&polled);
+            async move {
+                polled.store(true, std::sync::atomic::Ordering::SeqCst);
+                Ok::<_, std::convert::Infallible>(axum::http::StatusCode::OK.into_response())
+            }
+        })
+    }
+
+    /// One empty request through `svc`, answered.
+    async fn answer<S>(svc: &mut S) -> axum::response::Response
+    where
+        S: tower::Service<
+                axum::extract::Request,
+                Response = axum::response::Response,
+                Error = std::convert::Infallible,
+            > + Send,
+        S::Future: Send,
+    {
+        use tower::ServiceExt as _;
+        let request = axum::extract::Request::new(axum::body::Body::empty());
+        let ready = match svc.ready().await {
+            Ok(ready) => ready,
+            Err(never) => match never {},
+        };
+        match ready.call(request).await {
+            Ok(response) => response,
+            Err(never) => match never {},
+        }
+    }
+
+    /// Whether `response` is the shutdown's 503 that closes its connection.
+    fn is_work_refusal(response: &axum::response::Response) -> bool {
+        response.status() == axum::http::StatusCode::SERVICE_UNAVAILABLE
+            && response
+                .headers()
+                .get(axum::http::header::CONNECTION)
+                .is_some_and(|value| value.as_bytes() == b"close")
+    }
+
+    #[tokio::test]
+    async fn a_request_after_the_close_never_runs_its_handler() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use tower::Layer as _;
+        let (armed, _signals) = shutdown::tests::armed_with(
+            shutdown::ShutdownPlan::bare("test"),
+            std::time::Duration::ZERO,
+            Arc::new(std::sync::atomic::AtomicI32::new(0)),
+        );
+        let calls = Arc::new(AtomicUsize::new(0));
+        let polled = Arc::new(AtomicBool::new(false));
+        let mut svc = WorkLayer {
+            count: armed.work_count(),
+        }
+        .layer(probed(&calls, &polled));
+        let served = answer(&mut svc).await;
+        assert_eq!(served.status(), axum::http::StatusCode::OK);
+        assert!(
+            polled.load(Ordering::SeqCst),
+            "a serving owner runs the handler"
+        );
+        let _settled = armed.cancel_work().await;
+        // Each request races a ready handler against its born-cancelled
+        // guard; only the biased cancel arm wins every time.
+        for _ in 0..64 {
+            polled.store(false, Ordering::SeqCst);
+            let refused = answer(&mut svc).await;
+            assert!(
+                is_work_refusal(&refused),
+                "a closed owner answers 503 and closes"
+            );
+            assert!(
+                !polled.load(Ordering::SeqCst),
+                "a request after the close never runs its handler"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_request_past_the_work_ceiling_is_refused_before_its_handler() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use tower::Layer as _;
+        let (armed, _signals) = shutdown::tests::armed_with(
+            shutdown::ShutdownPlan::bare("test"),
+            std::time::Duration::ZERO,
+            Arc::new(std::sync::atomic::AtomicI32::new(0)),
+        );
+        let calls = Arc::new(AtomicUsize::new(0));
+        let polled = Arc::new(AtomicBool::new(false));
+        let mut svc = WorkLayer {
+            count: armed.work_count(),
+        }
+        .layer(probed(&calls, &polled));
+        armed.force_work_state(shutdown::WORK_CEILING);
+        let refused = answer(&mut svc).await;
+        assert!(
+            is_work_refusal(&refused),
+            "a full owner answers 503 and closes"
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "the handler is never called"
+        );
+        assert!(!polled.load(Ordering::SeqCst));
+        assert_eq!(armed.work_in_flight(), shutdown::WORK_CEILING);
+    }
+
+    #[tokio::test]
+    async fn an_unsignalled_serve_error_leaves_the_shared_owner_serving() {
+        let budget = std::time::Duration::from_secs(1);
+        let (armed, _signals) = shutdown::tests::armed_with(
+            shutdown::ShutdownPlan::bare("test"),
+            std::time::Duration::from_secs(30),
+            Arc::new(std::sync::atomic::AtomicI32::new(0)),
+        );
+        let count = armed.work_count();
+        let mut sibling = count.guard().expect("a serving owner counts work");
+        let failing = ready(Err(std::io::Error::other("accept failed")));
+        let served = serve_until_drained(failing, &armed).await;
+        let stopped = tokio::time::timeout(budget, stop_after_serve(&armed, served))
+            .await
+            .expect("an unsignalled serve error returns at once");
+        assert!(stopped.is_err_and(|e| e.to_string() == "accept failed"));
+        assert!(!armed.is_draining(), "the shared owner still serves");
+        assert_eq!(armed.live_count(), 0, "the failed site holds nothing");
+        let cancelled =
+            tokio::time::timeout(std::time::Duration::from_millis(50), sibling.cancelled()).await;
+        assert!(cancelled.is_err(), "a sibling's work is not cancelled");
+        let _next = count.guard().expect("new work is still admitted");
+        assert_eq!(armed.work_in_flight(), 2, "new work is still counted");
+        let ended = tokio::time::timeout(budget, stop_after_serve(&armed, Ok(())))
+            .await
+            .expect("an unsignalled clean end returns at once");
+        assert!(ended.is_err(), "a serve that ends unsignalled is no stop");
+        assert!(!armed.is_draining());
+    }
+
+    #[tokio::test]
+    async fn a_signalled_serve_error_still_tears_down_before_it_returns() {
+        let budget = std::time::Duration::from_secs(5);
+        let (armed, signals) = shutdown::tests::armed_with(
+            shutdown::ShutdownPlan::bare("test"),
+            std::time::Duration::ZERO,
+            Arc::new(std::sync::atomic::AtomicI32::new(0)),
+        );
+        let mut held = armed
+            .work_count()
+            .guard()
+            .expect("a serving owner counts work");
+        let mut drain = armed.drain();
+        assert!(signals.send(shutdown::Signal::Terminate).await.is_ok());
+        tokio::time::timeout(budget, drain.wait())
+            .await
+            .expect("the signal drains the owner");
+        let failing = ready(Err(std::io::Error::other("accept failed")));
+        let served = serve_until_drained(failing, &armed).await;
+        let stopped = tokio::time::timeout(budget, stop_after_serve(&armed, served))
+            .await
+            .expect("the teardown ends under its bound");
+        assert!(stopped.is_err_and(|e| e.to_string() == "accept failed"));
+        tokio::time::timeout(std::time::Duration::from_millis(1), held.cancelled())
+            .await
+            .expect("the teardown cancelled the counted work");
+        assert_eq!(armed.live_count(), 0, "the site released its live hold");
+    }
+
+    #[tokio::test]
+    async fn a_request_running_past_the_grace_is_cancelled_before_the_stop() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let budget = std::time::Duration::from_secs(5);
+        let (armed, signals) = shutdown::tests::armed_with(
+            shutdown::ShutdownPlan::bare("test"),
+            std::time::Duration::ZERO,
+            Arc::new(std::sync::atomic::AtomicI32::new(0)),
+        );
+        let host = RecordedHost::record(crate::app_config::ListenHost::Loopback(
+            crate::app_config::LoopbackIp::DEFAULT,
+        ));
+        let app = bind_app_listener("test", host, 0)
+            .await
+            .expect("a loopback port binds");
+        let port = app.listener.local_addr().expect("a bound port").port();
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let finished = Arc::new(AtomicBool::new(false));
+        let dropped = Arc::new(AtomicBool::new(false));
+        let (entering, finishing, dropping) = (
+            Arc::clone(&entered),
+            Arc::clone(&finished),
+            Arc::clone(&dropped),
+        );
+        let router = axum::Router::new().route(
+            "/slow",
+            axum::routing::get(move || {
+                let (entering, finishing) = (Arc::clone(&entering), Arc::clone(&finishing));
+                let sentinel = DropFlag(Arc::clone(&dropping));
+                async move {
+                    let _sentinel = sentinel;
+                    entering.notify_one();
+                    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                    finishing.store(true, Ordering::SeqCst);
+                    "done"
+                }
+            }),
+        );
+        let served = tokio::spawn(serve_app(app, router, armed));
+        let mut client = tokio::net::TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, port))
+            .await
+            .expect("the app accepts");
+        let request = format!("GET /slow HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n\r\n");
+        client
+            .write_all(request.as_bytes())
+            .await
+            .expect("the request is sent");
+        tokio::time::timeout(budget, entered.notified())
+            .await
+            .expect("the handler runs");
+        assert!(signals.send(shutdown::Signal::Terminate).await.is_ok());
+        let stopped = tokio::time::timeout(budget, served)
+            .await
+            .expect("the app stops");
+        assert!(matches!(stopped, Ok(Ok(shutdown::Stopped { .. }))));
+        assert!(
+            dropped.load(Ordering::SeqCst),
+            "the handler's future is dropped before the pools close"
+        );
+        let mut answer = Vec::new();
+        tokio::time::timeout(budget, client.read_to_end(&mut answer))
+            .await
+            .expect("the cancelled request is answered and closed")
+            .expect("the answer reads");
+        let answer = String::from_utf8(answer).expect("the answer is UTF-8");
+        assert!(answer.starts_with("HTTP/1.1 503"), "got {answer:?}");
+        assert!(answer.to_ascii_lowercase().contains("connection: close"));
+        tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+        assert!(
+            !finished.load(Ordering::SeqCst),
+            "a request past the grace never runs on after the stop"
+        );
     }
 
     /// `Ipe.Http.Server` resolves through the shared resolver under its own
@@ -9568,6 +9997,224 @@ mod tests {
         );
     }
 
+    /// A socket callback still running when the shutdown closes is cancelled,
+    /// and no callback starts after it.
+    #[tokio::test(start_paused = true)]
+    async fn a_socket_callback_running_past_the_grace_is_cancelled_by_the_close() {
+        let (armed, _signals) = shutdown::tests::armed_with(
+            shutdown::ShutdownPlan::bare("test"),
+            std::time::Duration::ZERO,
+            std::sync::Arc::new(std::sync::atomic::AtomicI32::new(0)),
+        );
+        let entered = std::sync::Arc::new(tokio::sync::Notify::new());
+        let closed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (entering, closing) = (
+            std::sync::Arc::clone(&entered),
+            std::sync::Arc::clone(&closed),
+        );
+        let cfg = WsServerCfg {
+            onConnect: std::sync::Arc::new(move |_: WsHandle| {
+                let entering = std::sync::Arc::clone(&entering);
+                Box::pin(async move {
+                    entering.notify_one();
+                    std::future::pending::<()>().await;
+                    ok_res(())
+                }) as IpeTask<String, ()>
+            }),
+            onClose: std::sync::Arc::new(move |_: WsHandle| {
+                let closing = std::sync::Arc::clone(&closing);
+                Box::pin(async move {
+                    closing.store(true, Ordering::SeqCst);
+                    ok_res(())
+                }) as IpeTask<String, ()>
+            }),
+            ..ws_server_default_cfg::<String>()
+        };
+        let ceilings = WsCeilings {
+            send_buffer: 16,
+            max_connections: usize::MAX,
+            heartbeat_secs: 30,
+        };
+        let id = WS_NEXT_ID.fetch_add(1, Ordering::Relaxed);
+        let served = tokio::spawn(ws_loop(
+            StalledSocket,
+            cfg,
+            id,
+            ceilings,
+            ChannelCredentials::of_request(),
+            None,
+            armed.drain(),
+        ));
+        let began = tokio::time::timeout(shutdown::WS_CLOSE_DEADLINE, entered.notified()).await;
+        assert!(began.is_ok(), "the socket's onConnect runs");
+        let started = tokio::time::Instant::now();
+        let _settled = armed.cancel_work().await;
+        assert!(
+            started.elapsed() < shutdown::WORK_CANCEL_DEADLINE,
+            "the cancelled callback releases its unit before the cancel deadline"
+        );
+        let ended = tokio::time::timeout(shutdown::WS_CLOSE_DEADLINE * 2, served).await;
+        assert!(
+            matches!(ended, Ok(Ok(()))),
+            "the close cancels the running callback and ends the socket"
+        );
+        assert!(
+            !closed.load(Ordering::SeqCst),
+            "no callback starts once the shutdown closes"
+        );
+    }
+
+    /// A socket whose peer sends nothing and takes every frame, recording it.
+    struct RecordingSocket(Arc<std::sync::Mutex<Vec<axum::extract::ws::Message>>>);
+
+    impl futures_util::Stream for RecordingSocket {
+        type Item = Result<axum::extract::ws::Message, axum::Error>;
+
+        fn poll_next(
+            self: Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Option<Self::Item>> {
+            std::task::Poll::Pending
+        }
+    }
+
+    impl futures_util::Sink<axum::extract::ws::Message> for RecordingSocket {
+        type Error = std::convert::Infallible;
+
+        fn poll_ready(
+            self: Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), Self::Error>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+
+        fn start_send(
+            self: Pin<&mut Self>,
+            item: axum::extract::ws::Message,
+        ) -> Result<(), Self::Error> {
+            self.0.lock().unwrap_or_else(|e| e.into_inner()).push(item);
+            Ok(())
+        }
+
+        fn poll_flush(
+            self: Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), Self::Error>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+
+        fn poll_close(
+            self: Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), Self::Error>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    /// A socket callback that sets `flag` when it runs and returns at once.
+    fn flagging(
+        flag: &Arc<std::sync::atomic::AtomicBool>,
+    ) -> Arc<dyn Fn(WsHandle) -> IpeTask<String, ()> + Send + Sync> {
+        let flag = Arc::clone(flag);
+        Arc::new(move |_: WsHandle| {
+            let flag = Arc::clone(&flag);
+            Box::pin(async move {
+                flag.store(true, Ordering::SeqCst);
+                ok_res(())
+            }) as IpeTask<String, ()>
+        })
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_socket_past_the_work_ceiling_closes_going_away_before_its_on_connect() {
+        let (armed, _signals) = shutdown::tests::armed_with(
+            shutdown::ShutdownPlan::bare("test"),
+            std::time::Duration::ZERO,
+            Arc::new(std::sync::atomic::AtomicI32::new(0)),
+        );
+        armed.force_work_state(shutdown::WORK_CEILING);
+        let connected = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let cfg = WsServerCfg {
+            onConnect: flagging(&connected),
+            ..ws_server_default_cfg::<String>()
+        };
+        let sent = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let ceilings = WsCeilings {
+            send_buffer: 16,
+            max_connections: usize::MAX,
+            heartbeat_secs: 30,
+        };
+        let id = WS_NEXT_ID.fetch_add(1, Ordering::Relaxed);
+        let served = ws_loop(
+            RecordingSocket(Arc::clone(&sent)),
+            cfg,
+            id,
+            ceilings,
+            ChannelCredentials::of_request(),
+            None,
+            armed.drain(),
+        );
+        let ended = tokio::time::timeout(shutdown::WS_CLOSE_DEADLINE * 2, served).await;
+        assert!(ended.is_ok(), "a refused socket ends at once");
+        assert!(
+            !connected.load(Ordering::SeqCst),
+            "a socket past the ceiling never runs onConnect"
+        );
+        let frames = sent.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let away = matches!(
+            frames.as_slice(),
+            [axum::extract::ws::Message::Close(Some(frame))]
+                if frame.code == axum::extract::ws::close_code::AWAY
+        );
+        assert!(away, "the one frame is a 1001 close; sent {frames:?}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_socket_the_close_ends_skips_its_on_close() {
+        let (armed, _signals) = shutdown::tests::armed_with(
+            shutdown::ShutdownPlan::bare("test"),
+            std::time::Duration::ZERO,
+            Arc::new(std::sync::atomic::AtomicI32::new(0)),
+        );
+        let connected = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let closed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let cfg = WsServerCfg {
+            onConnect: flagging(&connected),
+            onClose: flagging(&closed),
+            ..ws_server_default_cfg::<String>()
+        };
+        let ceilings = WsCeilings {
+            send_buffer: 16,
+            max_connections: usize::MAX,
+            heartbeat_secs: 30,
+        };
+        let id = WS_NEXT_ID.fetch_add(1, Ordering::Relaxed);
+        let served = tokio::spawn(ws_loop(
+            RecordingSocket(Arc::new(std::sync::Mutex::new(Vec::new()))),
+            cfg,
+            id,
+            ceilings,
+            ChannelCredentials::of_request(),
+            None,
+            armed.drain(),
+        ));
+        let opened = tokio::time::Instant::now() + shutdown::WS_CLOSE_DEADLINE;
+        while !connected.load(Ordering::SeqCst) {
+            assert!(
+                tokio::time::Instant::now() < opened,
+                "the socket's onConnect runs"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+        let _settled = armed.cancel_work().await;
+        let ended = tokio::time::timeout(shutdown::WS_CLOSE_DEADLINE * 2, served).await;
+        assert!(matches!(ended, Ok(Ok(()))), "the close ends the socket");
+        assert!(
+            !closed.load(Ordering::SeqCst),
+            "a socket the close ends never runs onClose"
+        );
+    }
+
     #[tokio::test(start_paused = true)]
     async fn a_socket_over_the_peer_ceiling_ends_within_its_close_deadline() {
         assert!(
@@ -10346,9 +10993,17 @@ mod tests {
         }
 
         #[tokio::test(start_paused = true)]
-        async fn stream_ends_after_revoke_and_emit_reports_closed() {
+        async fn stream_ends_after_revoke_and_its_handler_is_aborted() {
             use futures_util::StreamExt;
             type Emits = (IpeResult<String, ()>, IpeResult<String, ()>);
+            struct Dropped(Arc<std::sync::atomic::AtomicBool>);
+            impl Drop for Dropped {
+                fn drop(&mut self) {
+                    self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+                }
+            }
+            let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let dropped_in = Arc::clone(&dropped);
             let cap = crate::jwt::now_unix_seconds() + 7200;
             let claims = session_claims("stream-revoke-subject", "stream-revoke-jti", cap);
             let (emits_tx, mut emits) = tokio::sync::mpsc::unbounded_channel::<Emits>();
@@ -10360,12 +11015,15 @@ mod tests {
                 move |_req, _p| {
                     let emits_tx = emits_tx.clone();
                     let release = Arc::clone(&release_in);
+                    let dropped = Arc::clone(&dropped_in);
                     crate::server_stream::server_stream_stream::<String, _>(
                         "text/plain".to_string(),
                         move |writer| {
                             let emits_tx = emits_tx.clone();
                             let release = Arc::clone(&release);
+                            let guard = Dropped(Arc::clone(&dropped));
                             Box::pin(async move {
+                                let _guard = guard;
                                 let first = crate::server_stream::server_stream_emit::<String>(
                                     "first".to_string(),
                                     writer,
@@ -10405,15 +11063,21 @@ mod tests {
                 matches!(ended, Ok(None)),
                 "the body ends within the coalesce bound"
             );
+            let aborted = tokio::time::timeout(RECHECK_COALESCE, async {
+                while !dropped.load(std::sync::atomic::Ordering::SeqCst) {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await;
+            assert!(
+                aborted.is_ok(),
+                "a body that ended on the revocation aborts its handler"
+            );
             release.notify_one();
             let reported = tokio::time::timeout(RECHECK_COALESCE, emits.recv()).await;
             assert!(
-                matches!(
-                    reported,
-                    Ok(Some((IpeResult::Ok(()), IpeResult::Err(ref late))))
-                        if late == "server.stream emit: client disconnected"
-                ),
-                "the handler's next emit reports the client gone"
+                reported.is_err(),
+                "the aborted handler never reaches its late emit: {reported:?}"
             );
         }
 

@@ -8,7 +8,7 @@
 //! `Main.ipe` to stdout `62\n`, exit 0:
 //!
 //! ```text
-//! $ ipe dev run tests/golden/lambdas/src/Main.ipe
+//! $ ipe dev run
 //! 62
 //! ```
 //!

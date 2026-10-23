@@ -1118,7 +1118,7 @@ mod real_jail {
         let args = vec![
             "release".to_owned(),
             "build".to_owned(),
-            pkg.join("package.ipe").display().to_string(),
+            pkg.display().to_string(),
             "--out".to_owned(),
             out.display().to_string(),
         ];
@@ -1151,7 +1151,7 @@ mod real_jail {
         let args = vec![
             "release".to_owned(),
             "build".to_owned(),
-            pkg.join("package.ipe").display().to_string(),
+            pkg.display().to_string(),
             "--out".to_owned(),
             out.display().to_string(),
         ];
@@ -1184,7 +1184,7 @@ mod real_jail {
         let args = vec![
             "dev".to_owned(),
             "build".to_owned(),
-            pkg.join("package.ipe").display().to_string(),
+            pkg.display().to_string(),
             "--out".to_owned(),
             out.display().to_string(),
         ];
@@ -1347,7 +1347,7 @@ mod real_jail {
         let (_, stdout, stderr) = release_run(
             &pkg,
             &[
-                pkg.join("package.ipe").into_os_string(),
+                pkg.clone().into_os_string(),
                 "--out".into(),
                 base.join("out").into_os_string(),
             ],
@@ -1593,19 +1593,30 @@ mod real_jail {
         );
     }
 
+    /// A project named `ipe-app` under `base`, its `src/` made and empty.
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    fn app_project(base: &std::path::Path) -> PathBuf {
+        let project = base.join("project");
+        std::fs::create_dir_all(project.join("src")).expect("project src/");
+        std::fs::write(
+            project.join("package.ipe"),
+            super::support::package_ipe("ipe-app"),
+        )
+        .expect("package.ipe");
+        project
+    }
+
     /// Build `main_src` with the real `ipe dev build` and lay its binary out as
     /// a bundle's `ipe-app`, beside a maximally isolated `ipe.profile` (a
     /// profile every floor admits) and the stub wrapper.
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     fn dev_built_bundle(base: &std::path::Path, main_src: &str) -> PathBuf {
-        let project = base.join("project");
-        std::fs::create_dir_all(&project).expect("project dir");
-        let entry = project.join("Main.ipe");
-        std::fs::write(&entry, main_src).expect("Main.ipe");
+        let project = app_project(base);
+        std::fs::write(project.join("src/Main.ipe"), main_src).expect("Main.ipe");
         let out = base.join("out");
         let mut cmd = std::process::Command::new(super::support::ipe_bin());
         cmd.args(["dev", "build"])
-            .arg(&entry)
+            .arg(&project)
             .arg("--out")
             .arg(&out)
             .current_dir(&project)
@@ -1762,11 +1773,9 @@ mod real_jail {
             return;
         }
         let base = non_tmp_base("release-run-forged-dev-run");
-        let project = base.join("project");
-        std::fs::create_dir_all(&project).expect("project dir");
-        let entry = project.join("Main.ipe");
+        let project = app_project(&base);
         std::fs::write(
-            &entry,
+            project.join("src/Main.ipe"),
             "module Main exposing (main)\n\nimport Ipe.Io as Io\n\n\nmain =\n    \
              Io.println \"ipe-capfloor 1 net=true fs=rw sub=true env= intent=release\\n\"\n",
         )
@@ -1774,7 +1783,7 @@ mod real_jail {
         let out = base.join("out");
         let mut cmd = std::process::Command::new(super::support::ipe_bin());
         cmd.args(["dev", "run"])
-            .arg(&entry)
+            .arg(&project)
             .arg("--out")
             .arg(&out)
             .current_dir(&project)

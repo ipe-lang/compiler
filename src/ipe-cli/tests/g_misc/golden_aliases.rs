@@ -15,7 +15,7 @@
 //! build artifacts never touch the reference tree):
 //!
 //! ```text
-//! $ cd "$(mktemp -d)" && cp Main.ipe . && ipe dev run Main.ipe
+//! $ ipe dev run
 //! 42
 //! ```
 //!

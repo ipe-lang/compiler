@@ -55,6 +55,29 @@ pub enum SourceOrigin {
     FfiInterface,
 }
 
+/// The part a snapshot module plays in the project build.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BuildRole {
+    /// A `src/` module: an inference entry of the build.
+    Entry,
+    /// Injected stdlib text the build compiles alongside the entries.
+    Stdlib,
+    /// Read for the snapshot but never compiled by the build.
+    Unbuilt,
+}
+
+impl SourceOrigin {
+    /// The part a module from this origin plays in the project build.
+    #[must_use]
+    pub const fn build_role(self) -> BuildRole {
+        match self {
+            Self::Own(SourceDir::Src) => BuildRole::Entry,
+            Self::Stdlib => BuildRole::Stdlib,
+            Self::Own(SourceDir::Tests) | Self::FfiInterface => BuildRole::Unbuilt,
+        }
+    }
+}
+
 /// One module's text and where it came from.
 #[derive(Debug, Clone)]
 pub struct SnapshotModule {
@@ -309,42 +332,27 @@ impl SourceSnapshot {
     }
 
     /// Every `tests/` module, keyed by module path, including one whose path a `src/` module has.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "the test runner reads its programs through this snapshot once it is wired in"
-        )
-    )]
     #[must_use]
     pub const fn tests(&self) -> &BTreeMap<ModulePath, SnapshotModule> {
         &self.tests
     }
 
     /// The module `module`, when the snapshot holds it.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "the build reads its module set through this snapshot once it is wired in"
-        )
-    )]
     #[must_use]
     pub fn module(&self, module: &[String]) -> Option<&SnapshotModule> {
         self.modules.get(module)
     }
 
     /// The FFI preparation made over this snapshot's text.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "the build prepares FFI through this snapshot once it is wired in"
-        )
-    )]
     #[must_use]
     pub const fn ffi(&self) -> &FfiPrep {
         &self.ffi
+    }
+
+    /// The FFI catalog read once through the root's held cache directory.
+    #[must_use]
+    pub const fn catalog(&self) -> &Catalog {
+        &self.catalog
     }
 }
 
@@ -361,13 +369,6 @@ pub struct TestEntry<'s> {
 
 impl TestEntry<'_> {
     /// The entry's module path.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "the test runner names its programs through this snapshot once it is wired in"
-        )
-    )]
     #[must_use]
     pub const fn module(&self) -> &ModulePath {
         self.module

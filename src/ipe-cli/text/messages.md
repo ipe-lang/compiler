@@ -854,6 +854,10 @@ error[IPE-E0010]: {path} is a symbolic link; ipe never follows a link inside a p
 
 error[IPE-E0011]: {arg} names no module of this project: a file argument must lie under `src/` or `tests/` of the current directory, or be its package.ipe; cd into {root} and run ipe there
 
+## project-directory-expected
+
+error[IPE-E0012]: `{arg}` is a file; `ipe {verb}` takes a project directory. Pass the directory instead: `ipe {verb} {parent}`
+
 ## cli-device-named-module
 
 {path}: module segment `{segment}` is a reserved Windows device name, so this file cannot be the same module on every platform — rename it
@@ -1675,6 +1679,10 @@ installed FFI crate `{krate}` claims the module `{module}`, which is reserved fo
 ## ffi-reserved-wrapper-prefix
 
 installed FFI crate `{krate}` declares wrapper `{wrapper}`, which uses the reserved asserted-shim prefix `{prefix}` — refusing to load the cache
+
+## ffi-wrapper-moved
+
+refusing to emit: the wrapper crate `{package}` at `{path}` is no longer the directory the project's FFI catalog was read from, so the emitted `Cargo.toml` would bind another tree. Replace any link there with the wrapper directory itself and build again
 
 ## ffi-reserved-module-exists
 

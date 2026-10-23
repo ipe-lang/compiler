@@ -1,4 +1,4 @@
-module Lib.Drawn exposing (Code(..), DrawnSource, Hue(..), LayoutNote(..), Mode(..), Part(..), Piece(..), RowLine(..), Run(..), SourceRow(..), elements, highlighted, layoutLine, layoutNotes, mode, notes, parts, plain, rowLines)
+module Lib.Drawn exposing (DrawnSource, Drawing(..), Hue(..), LayoutNote(..), Mode(..), Part(..), Piece(..), RowLine(..), Run(..), SourceRow(..), SpelledRow(..), drawing, elements, highlighted, layoutLine, layoutNotes, mode, notes, plain, rowLines, spelled, spelledGapMark, spelledGapText)
 
 import Ipe.Char as Char
 import Ipe.List as List
@@ -15,33 +15,43 @@ type SourceRow
 
 
 -- A view's source as it is drawn, built once when the view is judged: the
--- notes on its file's layout, its parts, whether it is coloured, and the
--- number of elements drawing it takes. Opaque: built only by `highlighted`
--- and `plain`, which count the elements of the parts they build, so the
+-- notes on its file's layout, its drawing, and the number of elements
+-- drawing it takes. Opaque: built only by `highlighted`, `plain` and
+-- `spelled`, which count the elements of the drawing they build, so the
 -- count is the count of what is drawn.
 type DrawnSource
-    = DrawnSource { notes : List LayoutNote, parts : List Part, mode : Mode, elements : Int }
+    = DrawnSource { notes : List LayoutNote, drawing : Drawing, elements : Int }
 
 
--- Whether a view is drawn with its tokens coloured, or as plain text because
--- coloured it takes more elements than a view may.
+-- A view drawn with its tokens coloured; as plain text, each run of escapes
+-- its own marked element; or spelled out as one block of printable ASCII,
+-- every other character but a tab written as an escape and every `\` doubled,
+-- whose elements are a constant whatever the rows hold.
+type Drawing
+    = Colored (List (Part (List (List Run))))
+    | Uncolored (List (Part (List Piece)))
+    | Spelled (List SpelledRow)
+
+
+-- How a view is drawn, read off its `Drawing`.
 type Mode
     = Highlighted
     | Unhighlighted
+    | SpelledOut
 
 
--- Consecutive numbered lines with their numbers, or one run of covered
--- lines.
-type Part
-    = LineRun (List Int) Code
+-- Consecutive numbered lines with their numbers and code, or one run of
+-- covered lines.
+type Part code
+    = LineRun (List Int) code
     | CoveredRun
 
 
--- A run's lines: each line as its runs of one colour, or the whole run's
--- text as one sequence of pieces.
-type Code
-    = ColoredLines (List (List Run))
-    | PlainText (List Piece)
+-- One row of a spelled drawing: a numbered line's text, spelled through
+-- `SafeText.spelled` with each tab kept, or one run of covered lines.
+type SpelledRow
+    = SpelledLine Int (List Piece)
+    | SpelledGap
 
 
 -- Adjacent tokens of one colour.
@@ -59,9 +69,10 @@ type Hue
     | TextHue
 
 
--- Text drawn as itself, or a run of display hazards drawn as their escapes
--- in one marked element. No two `Chars` or two `Escapes` are adjacent, and a
--- `Chars` is never empty.
+-- Text drawn as itself, or a run of escaped characters drawn as their
+-- escapes: display hazards, and in a spelled drawing `\` and every other
+-- character outside printable ASCII. No two `Chars` or two `Escapes` are
+-- adjacent, and a `Chars` is never empty.
 type Piece
     = Chars String
     | Escapes (List Char)
@@ -74,25 +85,32 @@ notes drawn =
             d.notes
 
 
-parts : DrawnSource -> List Part
-parts drawn =
+drawing : DrawnSource -> Drawing
+drawing drawn =
     case drawn of
         DrawnSource d ->
-            d.parts
+            d.drawing
 
 
 mode : DrawnSource -> Mode
 mode drawn =
-    case drawn of
-        DrawnSource d ->
-            d.mode
+    case drawing drawn of
+        Colored _ ->
+            Highlighted
+
+        Uncolored _ ->
+            Unhighlighted
+
+        Spelled _ ->
+            SpelledOut
 
 
--- The elements drawing the view takes: one for the view, three for each
--- line run (the run, its gutter, its code block), one for each covered run,
--- one for each coloured line, one for each run not in the text colour, and
--- one for each run of escapes. Every text node sits inside one of them, at
--- most one per element.
+-- The elements drawing the view takes. Coloured or plain: one for the view,
+-- three for each line run (the run, its gutter, its code block), one for
+-- each covered run, one for each coloured line, one for each run not in the
+-- text colour, and one for each run of escapes. Spelled: four, the view, its
+-- one row, the gutter and the code block, whatever the rows hold. Every text
+-- node sits inside one of them, at most one per element.
 elements : DrawnSource -> Int
 elements drawn =
     case drawn of
@@ -100,10 +118,24 @@ elements drawn =
             d.elements
 
 
+-- The text a spelled drawing's code block holds for one run of covered
+-- lines. It starts with `\` and is no escape `SafeText.spelled` writes, so
+-- no source line spells it.
+spelledGapText : String
+spelledGapText =
+    "\\…"
+
+
+-- The gutter entry beside `spelledGapText`.
+spelledGapMark : String
+spelledGapMark =
+    "⋮"
+
+
 -- The rows drawn with their tokens coloured.
 highlighted : Highlight.Lang -> List SourceRow -> DrawnSource
 highlighted lang rows =
-    drawnOf lang Highlighted rows (List.map coloredPart (groupRuns rowLineEntry (rowLines lang rows)))
+    drawnOf lang rows (Colored (List.map coloredPart (groupRuns rowLineEntry (rowLines lang rows))))
 
 
 -- The rows drawn as plain text: the same escapes and display order, no
@@ -114,21 +146,54 @@ plain lang rows =
         layout =
             Highlight.layoutOf lang
     in
-    drawnOf lang Unhighlighted rows (List.map plainPart (groupRuns (rowEntry layout) rows))
+    drawnOf lang rows (Uncolored (List.map plainPart (groupRuns (rowEntry layout) rows)))
 
 
-drawnOf : Highlight.Lang -> Mode -> List SourceRow -> List Part -> DrawnSource
-drawnOf lang drawnMode rows drawnParts =
+-- The rows spelled out: each line's text through `SafeText.spelled`, each
+-- tab kept, in byte order, each covered run as `spelledGapText`.
+spelled : Highlight.Lang -> List SourceRow -> DrawnSource
+spelled lang rows =
+    let
+        layout =
+            Highlight.layoutOf lang
+    in
+    drawnOf lang rows (Spelled (List.map (spelledRow layout) rows))
+
+
+spelledRow : Layout -> SourceRow -> SpelledRow
+spelledRow layout row =
+    case row of
+        Numbered n line ->
+            SpelledLine n (piecesOf (tabbedRaws (List.map SafeText.spelled (String.split "\t" (layoutLine layout n line)))))
+
+        Covered ->
+            SpelledGap
+
+
+drawnOf : Highlight.Lang -> List SourceRow -> Drawing -> DrawnSource
+drawnOf lang rows drawn =
     DrawnSource
         { notes = layoutNotes lang rows
-        , parts = drawnParts
-        , mode = drawnMode
-        , elements = 1 + List.sum (List.map partElements drawnParts)
+        , drawing = drawn
+        , elements = drawingElements drawn
         }
 
 
-partElements : Part -> Int
-partElements part =
+drawingElements : Drawing -> Int
+drawingElements drawn =
+    case drawn of
+        Colored drawnParts ->
+            1 + List.sum (List.map (partElements coloredElements) drawnParts)
+
+        Uncolored drawnParts ->
+            1 + List.sum (List.map (partElements escapeElements) drawnParts)
+
+        Spelled _ ->
+            4
+
+
+partElements : (code -> Int) -> Part code -> Int
+partElements codeElements part =
     case part of
         LineRun _ code ->
             3 + codeElements code
@@ -137,14 +202,9 @@ partElements part =
             1
 
 
-codeElements : Code -> Int
-codeElements code =
-    case code of
-        ColoredLines lines ->
-            List.sum (List.map (\line -> 1 + List.sum (List.map runElements line)) lines)
-
-        PlainText pieces ->
-            escapeElements pieces
+coloredElements : List (List Run) -> Int
+coloredElements lines =
+    List.sum (List.map (\line -> 1 + List.sum (List.map runElements line)) lines)
 
 
 runElements : Run -> Int
@@ -227,21 +287,21 @@ rowEntry layout row =
             Nothing
 
 
-coloredPart : Group (List Token) -> Part
+coloredPart : Group (List Token) -> Part (List (List Run))
 coloredPart group =
     case group of
         Lines run ->
-            LineRun (List.map (\( n, _ ) -> n) run) (ColoredLines (List.map (\( _, toks ) -> lineRuns toks) run))
+            LineRun (List.map (\( n, _ ) -> n) run) (List.map (\( _, toks ) -> lineRuns toks) run)
 
         Gap ->
             CoveredRun
 
 
-plainPart : Group String -> Part
+plainPart : Group String -> Part (List Piece)
 plainPart group =
     case group of
         Lines run ->
-            LineRun (List.map (\( n, _ ) -> n) run) (PlainText (piecesOf (List.concat (List.intersperse [ RawChars "\n" ] (List.map (\( _, line ) -> textRaws line) run)))))
+            LineRun (List.map (\( n, _ ) -> n) run) (piecesOf (List.concat (List.intersperse [ RawChars "\n" ] (List.map (\( _, line ) -> textRaws line) run))))
 
         Gap ->
             CoveredRun
@@ -311,7 +371,14 @@ type Raw
 -- it is.
 tokenRaws : Token -> List Raw
 tokenRaws tok =
-    List.concat (List.intersperse [ RawChars "\t" ] (List.map safeRaws (Highlight.tokenRuns tok)))
+    tabbedRaws (Highlight.tokenRuns tok)
+
+
+-- A text's tab-free stretches, each already through a sink, joined by the
+-- tabs between them kept raw.
+tabbedRaws : List SafeText.SafeText -> List Raw
+tabbedRaws stretches =
+    List.concat (List.intersperse [ RawChars "\t" ] (List.map safeRaws stretches))
 
 
 -- A line's text as one plain token's.

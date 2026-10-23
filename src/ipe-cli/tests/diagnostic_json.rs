@@ -303,10 +303,11 @@ fn build_json_on_type_error_exits_nonzero_with_schema_conforming_json() {
     let _ = std::fs::remove_dir_all(&tmp);
     std::fs::create_dir_all(&tmp).expect("create tmp dir");
 
-    // A minimal source file with a deliberate type error.
-    let src = tmp.join("Main.ipe");
+    // A minimal project whose entry has a deliberate type error.
+    std::fs::create_dir_all(tmp.join("src")).expect("create src dir");
+    std::fs::write(tmp.join("package.ipe"), support::package_ipe("diag")).expect("package.ipe");
     std::fs::write(
-        &src,
+        tmp.join("src").join("Main.ipe"),
         "module Main exposing (main)\n\
          import Ipe.String as String\n\
          import Ipe.Io as Io\n\
@@ -317,11 +318,10 @@ fn build_json_on_type_error_exits_nonzero_with_schema_conforming_json() {
     .expect("write source file");
 
     let out_dir = tmp.join("out");
-    // Entry path must come first (before flags) — `parse_build` uses `take_leading_entry`.
     let r = run_ipe(&[
         "dev",
         "build",
-        &src.to_string_lossy(),
+        &tmp.to_string_lossy(),
         "--json",
         "--out",
         &out_dir.to_string_lossy(),
@@ -393,8 +393,8 @@ fn machine_error_command_field() {
 /// stderr. The note is human furniture — it belongs only in `--human` mode.
 ///
 /// The test drives `ipe dev build --static --allocator mimalloc <format>` against a
-/// non-existent entry. The process fails (preflight cannot find the musl
-/// toolchain, or the entry file is absent), but the failing path that MATTERS
+/// non-existent project. The process fails (preflight cannot find the musl
+/// toolchain, or no `package.ipe` is there), but the failing path that MATTERS
 /// here is `resolve_static_plan`, which runs at plan-resolution time, before
 /// any filesystem access. Regardless of where the failure fires, the machine
 /// stderr must be free of the mimalloc note.
@@ -405,13 +405,13 @@ fn mimalloc_note_absent_from_machine_stderr() {
             let r = run_ipe(&[
                 "dev",
                 cmd,
-                "NoSuchEntry.ipe",
+                "no-such-project",
                 "--static",
                 "--allocator",
                 "mimalloc",
                 format,
             ]);
-            // The run must fail (no musl toolchain or no file) — but whatever
+            // The run must fail (no musl toolchain or no project) — but whatever
             // error fires, the mimalloc human note must not be on stderr.
             assert!(
                 !r.stderr.contains("note: mimalloc"),
@@ -435,9 +435,10 @@ fn run_json_on_type_error_exits_nonzero_with_schema_conforming_json() {
     let _ = std::fs::remove_dir_all(&tmp);
     std::fs::create_dir_all(&tmp).expect("create tmp dir");
 
-    let src = tmp.join("Main.ipe");
+    std::fs::create_dir_all(tmp.join("src")).expect("create src dir");
+    std::fs::write(tmp.join("package.ipe"), support::package_ipe("diag")).expect("package.ipe");
     std::fs::write(
-        &src,
+        tmp.join("src").join("Main.ipe"),
         "module Main exposing (main)\n\
          import Ipe.String as String\n\
          import Ipe.Io as Io\n\
@@ -448,11 +449,10 @@ fn run_json_on_type_error_exits_nonzero_with_schema_conforming_json() {
     .expect("write source file");
 
     let out_dir = tmp.join("out");
-    // Entry path must come first — `parse_run` uses `take_leading_entry`.
     let r = run_ipe(&[
         "dev",
         "run",
-        &src.to_string_lossy(),
+        &tmp.to_string_lossy(),
         "--json",
         "--out",
         &out_dir.to_string_lossy(),
