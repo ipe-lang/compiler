@@ -953,6 +953,25 @@ impl Func {
         collect_generics(&self.ret, &mut named);
         named.into_iter().collect()
     }
+
+    /// The type parameters a parameter of a closure the return type yields
+    /// names, along its arrow spine: a caller applying the returned closure
+    /// fixes each of them through the argument it passes.
+    #[must_use]
+    pub fn generics_named_by_ret_args(&self) -> BTreeSet<Symbol> {
+        let mut named: Vec<Symbol> = Vec::new();
+        let mut spine = &self.ret;
+        while let IrType::Fun(params, ret)
+        | IrType::SharedFun(params, ret)
+        | IrType::FnOnceChain(params, ret) = spine
+        {
+            for param in params {
+                collect_generics(param, &mut named);
+            }
+            spine = ret;
+        }
+        named.into_iter().collect()
+    }
 }
 
 /// Collect the distinct [`IrType::Generic`] symbols in `ty`, appending each (in
@@ -3535,9 +3554,11 @@ pub enum UserPin {
     /// emitted return still names the parameter.
     ///
     /// Settled once the callee's emitted signature is final: dropped when an
-    /// emitted parameter names it, `()` when no emitted position does, the
-    /// refusal when only the return does (the caller would observe a type
-    /// no argument fixes). Never reaches the backend.
+    /// emitted parameter, or a parameter of a closure the return yields,
+    /// names it (the argument the caller passes fixes it); `()` when no
+    /// emitted position does; the refusal when only the return otherwise
+    /// does (the caller would observe a type no argument fixes). Never
+    /// reaches the backend.
     #[serde(skip)]
     Open(Box<Diagnostic>),
 }

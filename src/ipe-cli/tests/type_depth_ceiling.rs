@@ -651,15 +651,23 @@ fn a_generic_named_past_the_emitted_arity_is_pinned_at_each_call() {
     let _ = std::fs::remove_dir_all(&scratch);
 }
 
-/// Emit `src`, build and run it under `IPE_E2E=1` (the CI `e2e` job), and
-/// assert it prints `stdout`; without e2e, emitting it is the whole check.
-fn assert_runs(src: &str, bin: &str, stdout: &str) {
+/// Emit `src`, assert no call of a callee in `unpinned` carries a turbofish,
+/// then build and run it under `IPE_E2E=1` (the CI `e2e` job) and assert it
+/// prints `stdout`; without e2e, the emitted calls are the whole check.
+fn assert_runs(src: &str, bin: &str, unpinned: &[&str], stdout: &str) {
     let runtime = e2e_support::require_runtime().into_path_buf();
     let scratch = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
         .join(format!("ipe_type_ceiling_{bin}_{}", std::process::id()));
     let emitted = ipe::RootFixture::main(src)
         .and_then(|fixture| ipe::build_fixture(&fixture, &scratch, &runtime).map(|_| ()));
     assert!(emitted.is_ok(), "must emit: {emitted:?}");
+    for callee in unpinned {
+        let pinned = turbofish_calls(&scratch, callee);
+        assert!(
+            pinned.is_empty(),
+            "`{callee}` must be called unpinned: {pinned:?}"
+        );
+    }
     if e2e_support::e2e_tier() == e2e_support::Tier::E2e {
         let ran = e2e_support::build_and_run_rust(bin, &scratch);
         assert!(
@@ -677,11 +685,17 @@ fn assert_runs(src: &str, bin: &str, stdout: &str) {
 const RETURN_ONLY_RESULT_ERROR: &str = "module Main exposing (main)\n\nimport Ipe.Io as Io\nimport Ipe.Result as Result\nimport Ipe.String as String\n\n\nnone : Int -> Maybe e\nnone _ =\n    Nothing\n\n\nmain =\n    Io.println\n        (String.fromInt\n            (Result.withDefault 0\n                (case none 1 of\n                    Just e ->\n                        Err e\n\n                    Nothing ->\n                        Ok 2\n                )\n            )\n        )\n";
 
 /// A generic only the declared return names is left to the call's expected
-/// type, never pinned to a reading its sibling contradicts. Emitted in the CI
-/// `test-run` job; built and run under `IPE_E2E=1` (the CI `e2e` job).
+/// type, never pinned to a reading its sibling contradicts: the emitted call
+/// carries no turbofish. Read in the CI `test-run` job; built and run under
+/// `IPE_E2E=1` (the CI `e2e` job).
 #[test]
 fn a_return_only_generic_bound_to_a_result_error_builds_and_runs() {
-    assert_runs(RETURN_ONLY_RESULT_ERROR, "return_only_result_error", "2\n");
+    assert_runs(
+        RETURN_ONLY_RESULT_ERROR,
+        "return_only_result_error",
+        &["none"],
+        "2\n",
+    );
 }
 
 /// `none`'s `a` is named by its return alone, beside a `List.head []` sibling
@@ -689,15 +703,29 @@ fn a_return_only_generic_bound_to_a_result_error_builds_and_runs() {
 const RETURN_ONLY_BESIDE_A_KERNEL: &str = "module Main exposing (main)\n\nimport Ipe.Io as Io\nimport Ipe.List as List\n\n\nnone : Int -> Maybe a\nnone _ =\n    Nothing\n\n\nmain =\n    case (if List.length [ 1 ] > 0 then none 1 else List.head []) of\n        Just _ ->\n            Io.println \"just\"\n\n        Nothing ->\n            Io.println \"nothing\"\n";
 
 /// A return-only generic beside a kernel call over the same open variable
-/// builds as one Rust type. Emitted in the CI `test-run` job; built and run
-/// under `IPE_E2E=1` (the CI `e2e` job).
+/// builds as one Rust type, its call carrying no turbofish. Read in the CI
+/// `test-run` job; built and run under `IPE_E2E=1` (the CI `e2e` job).
 #[test]
 fn a_return_only_generic_beside_a_kernel_sibling_builds_and_runs() {
     assert_runs(
         RETURN_ONLY_BESIDE_A_KERNEL,
         "return_only_kernel",
+        &["none"],
         "nothing\n",
     );
+}
+
+/// `konst` takes one Rust argument and returns a closure over `a`; the call
+/// applies it to `List.head []`, which leaves `a`'s element open.
+const OVER_APPLIED_OPEN: &str = "module Main exposing (main)\n\nimport Ipe.Io as Io\nimport Ipe.List as List\nimport Ipe.String as String\n\n\nkonst : Int -> a -> Int\nkonst n =\n    \\_ -> n\n\n\nmain =\n    Io.println (String.fromInt (konst 1 (List.head [])))\n";
+
+/// A generic past the emitted arity that the returned closure's parameter
+/// names is fixed by the argument the caller passes to that closure: an open
+/// instance is left unpinned, never refused. Read in the CI `test-run` job;
+/// built and run under `IPE_E2E=1` (the CI `e2e` job).
+#[test]
+fn an_open_generic_a_returned_closure_takes_is_left_to_its_argument() {
+    assert_runs(OVER_APPLIED_OPEN, "over_applied_open", &["konst"], "1\n");
 }
 
 /// `empties` names `a` in its erased `Tag a` argument and in its result;
@@ -735,7 +763,7 @@ fn an_open_generic_only_an_erased_argument_names_is_refused_where_the_result_sho
     let emitted = rust_sources(&scratch);
     assert!(emitted.is_empty(), "no Rust may be emitted: {emitted:?}");
     let _ = std::fs::remove_dir_all(&scratch);
-    assert_runs(FIXED_ERASED_RESULT, "fixed_erased_result", "0\n");
+    assert_runs(FIXED_ERASED_RESULT, "fixed_erased_result", &[], "0\n");
 }
 
 /// `doubledCount` is generic over a `number` its body's `x + x` bounds, and

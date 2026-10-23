@@ -4,8 +4,10 @@
 //! final ([`super::propagate_call_site_bounds`] runs after every body is
 //! lowered). This pass keeps exactly the pin entries the backend renders
 //! ([`UserPin::renders`]), so an unrendered pin feeds no type-mention walker.
-//! A rendered [`UserPin::Open`] becomes `()` when the callee's emitted return
-//! does not name the parameter either, and its held refusal when it does. A
+//! A rendered [`UserPin::Open`] is dropped when a parameter of a closure the
+//! callee's emitted return yields names the parameter (the caller's argument
+//! to that closure fixes it), becomes `()` when the emitted return does not
+//! name it at all, and its held refusal otherwise. A
 //! rendered `()` or `JsonVal` reading becomes the lowering's refusal when the
 //! callee's bounds on that parameter are ones the pinned type does not meet
 //! ([`BoundSet::met_by_unit`], [`BoundSet::met_by_json`]).
@@ -19,11 +21,13 @@ use ipe_ir::{BoundSet, CallPin, Callee, Expr, Func, FuncId, IrType, UserPin};
 use super::ir_type_mentions::ir_type_mentions;
 
 /// One callee's view for pin settling: its type parameters' emitted bounds,
-/// the ones some parameter type names, and the ones its return type names.
+/// the ones some parameter type names, the ones its return type names, and
+/// the ones a parameter of a closure its return yields names.
 struct PinLayout {
     bounds: BTreeMap<Symbol, BoundSet>,
     named: BTreeSet<Symbol>,
     in_ret: BTreeSet<Symbol>,
+    ret_args: BTreeSet<Symbol>,
 }
 
 /// Settle every [`CallPin::User`] in `funcs` (see the module doc). A refused
@@ -37,6 +41,7 @@ pub(super) fn settle_user_pins(funcs: &mut [Func], def_span: impl Fn(FuncId) -> 
                 bounds: f.type_params.iter().copied().collect(),
                 named: f.generics_named_by_params(),
                 in_ret: f.generics_named_by_ret(),
+                ret_args: f.generics_named_by_ret_args(),
             };
             (f.id, layout)
         })
@@ -89,6 +94,7 @@ impl Settle<'_> {
                     return None;
                 }
                 let pin = match pin {
+                    UserPin::Open(_) if layout.ret_args.contains(&sym) => return None,
                     UserPin::Open(refusal) if layout.in_ret.contains(&sym) => {
                         UserPin::Unlowered(refusal)
                     }
@@ -351,6 +357,48 @@ mod tests {
                 vec![(a, BoundSet::UNBOUNDED)],
                 vec![IrType::Int],
                 IrType::List(Box::new(IrType::Generic(a))),
+                Expr::Unit,
+            ),
+            func(1, vec![], vec![], call(0, vec![(a, open_pin())])),
+        ];
+        let pin = settled_pin(&mut funcs);
+        assert!(refused_at(pin, a, Span::new(7, 9)), "{pin:?}");
+    }
+
+    #[test]
+    fn an_open_pin_a_returned_closure_parameter_names_is_dropped() {
+        let a = sym(1);
+        let mut funcs = vec![
+            func_returning(
+                0,
+                vec![(a, BoundSet::UNBOUNDED)],
+                vec![IrType::Int],
+                IrType::Fun(vec![IrType::Generic(a)], Box::new(IrType::Int)),
+                Expr::Unit,
+            ),
+            func(1, vec![], vec![], call(0, vec![(a, open_pin())])),
+        ];
+        let pin = settled_pin(&mut funcs).cloned();
+        assert_eq!(pin, Some(CallPin::None));
+    }
+
+    #[test]
+    fn an_open_pin_a_returned_closure_yields_but_takes_not_is_refused() {
+        let a = sym(1);
+        let tag = IrType::Enum {
+            name: sym(50),
+            home: ipe_ir::ModPath(vec![]),
+            args: vec![],
+        };
+        let mut funcs = vec![
+            func_returning(
+                0,
+                vec![(a, BoundSet::UNBOUNDED)],
+                vec![IrType::Int],
+                IrType::Fun(
+                    vec![tag],
+                    Box::new(IrType::List(Box::new(IrType::Generic(a)))),
+                ),
                 Expr::Unit,
             ),
             func(1, vec![], vec![], call(0, vec![(a, open_pin())])),
