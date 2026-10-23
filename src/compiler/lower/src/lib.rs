@@ -1526,7 +1526,7 @@ mod tests {
         let is_static = |name: &str| {
             lower_func(src, name)
                 .and_then(|(func, i)| generic_bounds(&func, &i, "msg"))
-                .is_some_and(|bounds| bounds.has_static())
+                .is_some_and(ipe_ir::BoundSet::has_static)
         };
         assert!(
             is_static("badge"),
