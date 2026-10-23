@@ -908,12 +908,17 @@ fn lower_prose(msg: &LowerError) -> String {
                  signature."
             )
         }
-        LowerError::MixedMessageParameter { callee, var } => {
+        LowerError::MixedOpenParameter {
+            callee,
+            var,
+            uses: [first, second],
+        } => {
             format!(
                 "This call leaves the type variable `{var}` of `{callee}` open, and \
-                 `{callee}` uses `{var}` both as a UI message parameter and elsewhere, \
-                 so the two uses would get different types. Annotate the call's result \
-                 with a concrete message type."
+                 `{callee}` uses `{var}` both as {} and as {}, so the two uses would \
+                 get different types. Annotate the call's result with a concrete type.",
+                first.phrase(),
+                second.phrase()
             )
         }
         LowerError::StoreSelectProjectionInvalid(defect) => match defect {
@@ -2189,10 +2194,16 @@ fn lower_label(msg: &LowerError) -> String {
                  type variable `{var}` — annotate `{helper}` with its own type"
             )
         }
-        LowerError::MixedMessageParameter { callee, var } => {
+        LowerError::MixedOpenParameter {
+            callee,
+            var,
+            uses: [first, second],
+        } => {
             format!(
-                "`{var}` is open here, but `{callee}` uses it both as a UI message \
-                 parameter and elsewhere — annotate the result with a concrete type"
+                "`{var}` is open here, but `{callee}` uses it both as {} and as {} — \
+                 annotate the result with a concrete type",
+                first.phrase(),
+                second.phrase()
             )
         }
     }

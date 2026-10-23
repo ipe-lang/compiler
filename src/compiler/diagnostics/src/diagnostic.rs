@@ -1860,20 +1860,46 @@ pub enum LowerError {
         /// The owner's type variable (e.g. `msg`).
         var: Box<str>,
     },
-    /// A call leaves free a type variable its callee uses both as a UI
-    /// message parameter and elsewhere.
+    /// A call leaves free a type variable its callee uses in two positions
+    /// that read an open variable differently.
     ///
-    /// A free variable reads as `()` in a message slot (`Html msg`) and as
-    /// the JSON carrier at any other position, so the emitted call would name
-    /// two Rust types for one parameter. Refused fail-closed at `ipe` time;
-    /// the fix is a type annotation that fixes the variable at the call.
-    /// [IPE-L0102]
-    MixedMessageParameter {
+    /// A free variable reads by its position's [`OpenVarUse`]: `()` in a UI
+    /// message slot (`Html msg`), the project error in a `Result` error slot,
+    /// the JSON carrier anywhere else, so the emitted call would name two Rust
+    /// types for one parameter. Refused fail-closed at `ipe` time; the fix is a
+    /// type annotation that fixes the variable at the call. [IPE-L0102]
+    MixedOpenParameter {
         /// The called function (e.g. `wrap`).
         callee: Box<str>,
         /// The callee's type variable (e.g. `msg`).
         var: Box<str>,
+        /// Two of the uses that read the variable differently, in order.
+        uses: [OpenVarUse; 2],
     },
+}
+
+/// How a position of a declared type uses a type variable: the reading an
+/// open variable gets there.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+pub enum OpenVarUse {
+    /// The message argument of a UI type (`Html msg`): reads as `()`.
+    UiMessage,
+    /// The error argument of `Result e a`: reads as the project error.
+    ResultError,
+    /// Any other position: reads as the JSON carrier.
+    Value,
+}
+
+impl OpenVarUse {
+    /// The use, as prose after "as".
+    #[must_use]
+    pub const fn phrase(self) -> &'static str {
+        match self {
+            Self::UiMessage => "a UI message parameter",
+            Self::ResultError => "a `Result` error",
+            Self::Value => "a value type",
+        }
+    }
 }
 
 /// Why a literal route pattern or server route path was refused under
@@ -2902,9 +2928,7 @@ const fn lower_code(msg: &LowerError) -> Code {
         LowerError::PointFreeAccessorKernel { .. }
         | LowerError::AccessorKernelOffIntercept { .. } => IPE_L0146,
         LowerError::UnsaturatedHandlerKernel { .. } => IPE_L0152,
-        LowerError::ForeignTypeVariable { .. } | LowerError::MixedMessageParameter { .. } => {
-            IPE_L0102
-        }
+        LowerError::ForeignTypeVariable { .. } | LowerError::MixedOpenParameter { .. } => IPE_L0102,
         LowerError::StoreSelectProjectionInvalid(_) => IPE_L0149,
     })
 }
@@ -3434,8 +3458,8 @@ fn lower_help(msg: &LowerError) -> Vec<HelpLine> {
         LowerError::ForeignTypeVariable { helper, owner, var } => {
             foreign_type_variable_help(helper, owner, var)
         }
-        LowerError::MixedMessageParameter { callee, var } => {
-            mixed_message_parameter_help(callee, var)
+        LowerError::MixedOpenParameter { callee, var, .. } => {
+            mixed_open_parameter_help(callee, var)
         }
         LowerError::StoreSelectProjectionInvalid(defect) => {
             store_select_projection_invalid_help(defect)
@@ -3556,16 +3580,16 @@ fn foreign_type_variable_help(helper: &str, owner: &str, var: &str) -> Vec<HelpL
     ]
 }
 
-/// The help lines for [`LowerError::MixedMessageParameter`], factored out so
+/// The help lines for [`LowerError::MixedOpenParameter`], factored out so
 /// [`lower_help`] stays a thin per-variant dispatcher.
-fn mixed_message_parameter_help(callee: &str, var: &str) -> Vec<HelpLine> {
+fn mixed_open_parameter_help(callee: &str, var: &str) -> Vec<HelpLine> {
     vec![
         HelpLine::Note(
             format!(
                 "fix `{var}` at this call with a type annotation on the binding that \
-                 holds the result, naming a concrete message type (`Html Msg`, not \
-                 `Html msg`); or annotate `{callee}` so it uses `{var}` only as a \
-                 message parameter"
+                 holds the result, naming a concrete type (`Html Msg`, not `Html msg`; \
+                 `Result Error Int`, not `Result e Int`); or annotate `{callee}` so it \
+                 uses `{var}` in one kind of position only"
             )
             .into_boxed_str(),
         ),

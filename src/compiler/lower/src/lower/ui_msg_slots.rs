@@ -6,13 +6,19 @@
 //! `ir_type_from_ty_ui_msg`, which lowers a free variable there to `()` and
 //! takes a [`MsgArg`], a value only [`lookup`] builds from a table row: a
 //! position no row names cannot be read as a message slot. The use-pin
-//! classifier ([`ui_slot_vars`]) asks the same lookup, so a pin for a callee
+//! classifier ([`open_var_uses`]) asks the same lookup, so a pin for a callee
 //! type parameter reads it the way the use's own node types do.
+//!
+//! [`open_var_ir`] is the one table of what an open variable reads as by its
+//! position's [`OpenVarUse`]; the UI, `Result` and JSON readers default an
+//! open variable through it, and the use pin of a parameter used one way
+//! reads it through it too.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
+use ipe_diagnostics::OpenVarUse;
 use ipe_intern::Symbol;
-use ipe_ir::UiCtor;
+use ipe_ir::{IrType, UiCtor};
 use ipe_types::{RowTail, Ty};
 
 /// How a slot constructor selects its [`UiCtor`].
@@ -117,73 +123,92 @@ pub(super) fn lookup<'t>(name: &str, args: &'t [Ty]) -> Option<(&'static UiMsgSl
     Some((row, MsgArg(args.get(row.slot)?)))
 }
 
-/// The type variables of a declared type, as raws, split by where they occur.
-#[derive(Debug, Default, PartialEq, Eq)]
-pub(super) struct UiSlotVars {
-    /// Occurring only in UI message slots.
-    pub(super) only: BTreeSet<u32>,
-    /// Occurring both in a UI message slot and elsewhere.
-    pub(super) mixed: BTreeSet<u32>,
+/// The argument index of the error in `Result e a`.
+pub(super) const RESULT_ERROR_SLOT: usize = 0;
+
+/// The error slot of a constructor called `name` applied to `args`, when it
+/// is `Result e a`.
+pub(super) fn result_error_slot(name: &str, args: &[Ty]) -> Option<usize> {
+    (name == "Result" && args.len() == 2).then_some(RESULT_ERROR_SLOT)
 }
 
-/// Classify the variables of `ty`; `slot` names the message-slot argument index
-/// of a constructor `(module, name)` applied to `args`, or `None` when it has
-/// none.
+/// What an open variable reads as at a position used as `role`: `()` in a UI
+/// message slot, the project error (the `Ok` wrapper's fixed error) in a
+/// `Result` error slot, the JSON carrier anywhere else.
+pub(super) const fn open_var_ir(role: OpenVarUse) -> IrType {
+    match role {
+        OpenVarUse::UiMessage => IrType::Unit,
+        OpenVarUse::ResultError => IrType::Error,
+        OpenVarUse::Value => IrType::Json,
+    }
+}
+
+/// The type variables of a declared type, as raws, each with the uses of its
+/// positions.
+pub(super) type OpenVarUses = BTreeMap<u32, BTreeSet<OpenVarUse>>;
+
+/// Classify the variables of `ty`; `slot` names the argument index and use of
+/// the one special slot of a constructor `(module, name)` applied to `args`,
+/// or `None` when it has none.
 ///
-/// A position is a slot only directly: the reader reads a compound message
-/// type (a function, a tuple, a record, a non-slot constructor) strictly, so
-/// every variable inside one occurs outside a slot.
-pub(super) fn ui_slot_vars(
+/// A position is a slot only directly: the readers read a compound type in a
+/// slot (a function, a tuple, a record, a non-slot constructor) by its own
+/// arms, so every variable inside one is a [`OpenVarUse::Value`].
+pub(super) fn open_var_uses(
     ty: &Ty,
-    slot: impl Fn(&[Symbol], Symbol, &[Ty]) -> Option<usize>,
-) -> UiSlotVars {
-    let mut ui = BTreeSet::new();
-    let mut other = BTreeSet::new();
-    let mut stack: Vec<(&Ty, bool)> = vec![(ty, false)];
-    while let Some((t, in_slot)) = stack.pop() {
+    slot: impl Fn(&[Symbol], Symbol, &[Ty]) -> Option<(usize, OpenVarUse)>,
+) -> OpenVarUses {
+    let mut uses = OpenVarUses::new();
+    let mut stack: Vec<(&Ty, OpenVarUse)> = vec![(ty, OpenVarUse::Value)];
+    while let Some((t, role)) = stack.pop() {
         match t {
             Ty::Var(raw) => {
-                if in_slot {
-                    ui.insert(*raw);
-                } else {
-                    other.insert(*raw);
-                }
+                uses.entry(*raw).or_default().insert(role);
             }
             Ty::Fun(a, b) => {
-                stack.push((a, false));
-                stack.push((b, false));
+                stack.push((a, OpenVarUse::Value));
+                stack.push((b, OpenVarUse::Value));
             }
             Ty::Con { module, name, args } => {
                 let at = slot(module.as_slice(), *name, args);
-                stack.extend(args.iter().enumerate().map(|(i, a)| (a, at == Some(i))));
+                stack.extend(args.iter().enumerate().map(|(i, a)| {
+                    let role = match at {
+                        Some((s, special)) if s == i => special,
+                        Some(_) | None => OpenVarUse::Value,
+                    };
+                    (a, role)
+                }));
             }
-            Ty::Tuple(elems) => stack.extend(elems.iter().map(|e| (e, false))),
+            Ty::Tuple(elems) => stack.extend(elems.iter().map(|e| (e, OpenVarUse::Value))),
             Ty::Record(fields, tail) => {
                 match tail {
                     RowTail::Open(raw) => {
-                        other.insert(*raw);
+                        uses.entry(*raw).or_default().insert(OpenVarUse::Value);
                     }
                     RowTail::Closed => {}
                 }
-                stack.extend(fields.values().map(|v| (v, false)));
+                stack.extend(fields.values().map(|v| (v, OpenVarUse::Value)));
             }
             Ty::Wildcard | Ty::Unit => {}
         }
     }
-    UiSlotVars {
-        only: ui.difference(&other).copied().collect(),
-        mixed: ui.intersection(&other).copied().collect(),
-    }
+    uses
+}
+
+/// Whether `roles` is the UI message slot alone.
+pub(super) fn only_ui_message(roles: &BTreeSet<OpenVarUse>) -> bool {
+    roles.len() == 1 && roles.contains(&OpenVarUse::UiMessage)
 }
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeSet;
+    use std::collections::{BTreeMap, BTreeSet};
 
+    use ipe_diagnostics::OpenVarUse;
     use ipe_intern::{Interner, Symbol};
     use ipe_types::Ty;
 
-    use super::{UiSlotVars, lookup, ui_slot_vars};
+    use super::{OpenVarUses, lookup, open_var_uses, result_error_slot};
 
     /// The raw of the message variable the classification tests place.
     const MSG: u32 = 3;
@@ -201,11 +226,19 @@ mod tests {
         lookup(name, args).map(|(row, _)| row.slot())
     }
 
-    /// Classify `ty` by the table alone (no program union shadows a name).
-    fn classify(interner: &Interner, ty: &Ty) -> UiSlotVars {
-        ui_slot_vars(ty, |_, name, args| {
-            interner.resolve(name).and_then(|n| slot_at(n, args))
+    /// Classify `ty` by the tables alone (no program union shadows a name).
+    fn classify(interner: &Interner, ty: &Ty) -> OpenVarUses {
+        open_var_uses(ty, |_, name, args| {
+            let name = interner.resolve(name)?;
+            slot_at(name, args)
+                .map(|s| (s, OpenVarUse::UiMessage))
+                .or_else(|| result_error_slot(name, args).map(|s| (s, OpenVarUse::ResultError)))
         })
+    }
+
+    /// The classification of `MSG` alone, by `uses`.
+    fn msg_uses(uses: &[OpenVarUse]) -> OpenVarUses {
+        BTreeMap::from([(MSG, uses.iter().copied().collect())])
     }
 
     /// `String -> View Web msg` (what `render : String -> Element msg`
@@ -223,17 +256,38 @@ mod tests {
             Box::new(con(string, vec![])),
             Box::new(con(view, vec![con(web, vec![]), Ty::Var(MSG)])),
         );
-        assert_eq!(
-            classify(&interner, &ty),
-            UiSlotVars {
-                only: BTreeSet::from([MSG]),
-                mixed: BTreeSet::new(),
-            }
-        );
+        assert_eq!(classify(&interner, &ty), msg_uses(&[OpenVarUse::UiMessage]));
         // A variable in the engine-tag position is no message slot.
         let tag = con(view, vec![Ty::Var(MSG), Ty::Unit]);
-        let vars = classify(&interner, &tag);
-        assert!(vars.only.is_empty() && vars.mixed.is_empty());
+        assert_eq!(classify(&interner, &tag), msg_uses(&[OpenVarUse::Value]));
+    }
+
+    /// `Result e a` holds `e` in its error slot and `a` as a value; a variable
+    /// in both is used both ways.
+    #[test]
+    fn the_result_error_argument_is_a_slot() {
+        const OK: u32 = 4;
+        let mut interner = Interner::new();
+        let result = interner.intern("Result").unwrap();
+        let ty = con(result, vec![Ty::Var(MSG), Ty::Var(OK)]);
+        assert_eq!(
+            classify(&interner, &ty),
+            BTreeMap::from([
+                (MSG, BTreeSet::from([OpenVarUse::ResultError])),
+                (OK, BTreeSet::from([OpenVarUse::Value])),
+            ])
+        );
+        let both = Ty::Tuple(vec![ty, Ty::Var(MSG)]);
+        assert_eq!(
+            classify(&interner, &both).get(&MSG),
+            Some(&BTreeSet::from([
+                OpenVarUse::ResultError,
+                OpenVarUse::Value
+            ]))
+        );
+        // A mis-arity `Result` holds no error slot.
+        assert_eq!(result_error_slot("Result", &[Ty::Unit]), None);
+        assert_eq!(result_error_slot("Result", &[Ty::Unit, Ty::Unit]), Some(0));
     }
 
     /// A variable in a message slot and outside one is mixed, never slot-only.
@@ -250,10 +304,7 @@ mod tests {
         ]);
         assert_eq!(
             classify(&interner, &ty),
-            UiSlotVars {
-                only: BTreeSet::new(),
-                mixed: BTreeSet::from([MSG]),
-            }
+            msg_uses(&[OpenVarUse::UiMessage, OpenVarUse::Value])
         );
     }
 
@@ -280,16 +331,13 @@ mod tests {
             let ty = con(html, vec![compound.clone()]);
             assert_eq!(
                 classify(&interner, &ty),
-                UiSlotVars::default(),
+                msg_uses(&[OpenVarUse::Value]),
                 "`Html ({compound:?})` holds no slot-only variable"
             );
             let mixed = Ty::Tuple(vec![con(html, vec![Ty::Var(MSG)]), ty]);
             assert_eq!(
                 classify(&interner, &mixed),
-                UiSlotVars {
-                    only: BTreeSet::new(),
-                    mixed: BTreeSet::from([MSG]),
-                },
+                msg_uses(&[OpenVarUse::UiMessage, OpenVarUse::Value]),
                 "beside a direct slot, `Html ({compound:?})` makes the variable mixed"
             );
         }

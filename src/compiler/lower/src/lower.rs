@@ -20,7 +20,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use ipe_canon::ast as canon;
 use ipe_diagnostics::{
     DResult, Diagnostic, Feature, GenericAppEntryReach, InterceptContext, Located, LowerError,
-    MainRetName, NameError, Span, StoreEqAccessorDefect, StoreSelectProjectionDefect,
+    MainRetName, NameError, OpenVarUse, Span, StoreEqAccessorDefect, StoreSelectProjectionDefect,
 };
 use ipe_intern::{Interner, Symbol, SynthStem};
 use ipe_ir::free_vars::{
@@ -21913,9 +21913,11 @@ impl<'a> Lowerer<'a> {
             // A variable no binding keeps generic falls through to
             // `IrType::Unit`; one another binding keeps generic is refused,
             // since that binding emits it as its own Rust generic.
-            Ty::Var(v) => self.ir_type_from_owned_var(*v, span, || Ok(IrType::Unit)),
+            Ty::Var(v) => self.ir_type_from_owned_var(*v, span, || {
+                Ok(ui_msg_slots::open_var_ir(OpenVarUse::UiMessage))
+            }),
             // A wildcard names no enclosing generic: a message-free subtree.
-            Ty::Wildcard => Ok(IrType::Unit),
+            Ty::Wildcard => Ok(ui_msg_slots::open_var_ir(OpenVarUse::UiMessage)),
             // All other forms delegate to the strict helper — a concrete `Msg`
             // type becomes `IrType::Enum(Msg)`, `()` becomes `IrType::Unit`, etc.
             _ => self.ir_type_from_ty(t, span),
@@ -21961,8 +21963,10 @@ impl<'a> Lowerer<'a> {
             // own generic (see the SEAL-fix doc comment above), in which case
             // it must render as that binding's Rust generic instead, or
             // another binding's generic, which is refused.
-            Ty::Var(v) => self.ir_type_from_owned_var(*v, span, || Ok(IrType::Json)),
-            Ty::Wildcard => Ok(IrType::Json),
+            Ty::Var(v) => self.ir_type_from_owned_var(*v, span, || {
+                Ok(ui_msg_slots::open_var_ir(OpenVarUse::Value))
+            }),
+            Ty::Wildcard => Ok(ui_msg_slots::open_var_ir(OpenVarUse::Value)),
             // Recursively handle compound types so embedded `Ty::Var`s also
             // map to `IrType::Json`.
             Ty::Tuple(elems) => {
@@ -22002,34 +22006,24 @@ impl<'a> Lowerer<'a> {
                         Ok(IrType::Maybe(Box::new(elem)))
                     }
                     "Result" if args.len() == 2 => {
-                        // A free `Ty::Var` in the ERROR slot must pin to
-                        // `IrType::Error` (`IpeError`), NOT the Json fallback:
-                        // the emitted `ok_res` wrapper (`ResultOkDefault`, see
-                        // the ctor-lowering arm) pins an unresolved error type
-                        // to the project's `IpeError` — "the canonical
-                        // default" — so a type ANNOTATION derived from the
-                        // same free var (e.g. an eta-param binder for a piped
-                        // `Ok f |> Result.andMap …`) must agree, or the
-                        // emitted `let eta_0: IpeResult<JsonVal, _> = ok_res(…)`
-                        // is an E0308 exit-0-then-cargo-fail (found while
-                        // gating the 5th attempt: the
-                        // `result_and_map_fn_payload` positive-path
-                        // fixture). One defaulting policy, both sides.
-                        // Another binding's generic read in the def's signature
-                        // is refused here too, never defaulted.
-                        let err_ty = args.first().ok_or_else(result_arg_bug)?;
+                        // An open variable in the ERROR slot reads as the
+                        // project error (`IpeError`), not the JSON carrier:
+                        // the `ok_res` wrapper (`ResultOkDefault`, see the
+                        // ctor-lowering arm) fixes an open error to it, so a
+                        // binder typed from the same variable (an eta binder
+                        // of a piped `Ok f |> Result.andMap …`) agrees. A
+                        // generic or an erased variable reads by its owner
+                        // like any other position; another binding's generic
+                        // read in the def's signature is refused.
+                        let err_ty = args
+                            .get(ui_msg_slots::RESULT_ERROR_SLOT)
+                            .ok_or_else(result_arg_bug)?;
+                        let open_err = ui_msg_slots::open_var_ir(OpenVarUse::ResultError);
                         let err = match err_ty {
-                            Ty::Var(raw) => match (self.var_owner(*raw), self.read_site.get()) {
-                                (VarOwner::Elsewhere { owner, sym }, ReadSite::Signature) => {
-                                    return Err(self.foreign_type_variable(&owner, sym, span));
-                                }
-                                (VarOwner::Elsewhere { .. }, ReadSite::Body)
-                                | (
-                                    VarOwner::Here(_) | VarOwner::Unowned,
-                                    ReadSite::Signature | ReadSite::Body,
-                                ) => IrType::Error,
-                            },
-                            Ty::Wildcard => IrType::Error,
+                            Ty::Var(raw) => {
+                                self.ir_type_from_owned_var(*raw, span, || Ok(open_err))?
+                            }
+                            Ty::Wildcard => open_err,
                             Ty::Unit
                             | Ty::Fun(..)
                             | Ty::Con { .. }
@@ -24403,6 +24397,71 @@ impl<'a> Lowerer<'a> {
         ui_msg_slots::lookup(self.interner.resolve(name)?, args)
     }
 
+    /// The argument index and [`OpenVarUse`] of the one special slot of the
+    /// constructor `(module, name)` applied to `args`: a UI message slot
+    /// ([`Self::ui_msg_slot`]) or the `Result` error slot, the slots whose
+    /// open variable the readers default other than as a value.
+    fn open_var_slot(
+        &self,
+        module: &[Symbol],
+        name: Symbol,
+        args: &[Ty],
+    ) -> Option<(usize, OpenVarUse)> {
+        if let Some((row, _)) = self.ui_msg_slot(module, name, args) {
+            return Some((row.slot(), OpenVarUse::UiMessage));
+        }
+        ui_msg_slots::result_error_slot(self.interner.resolve(name)?, args)
+            .map(|at| (at, OpenVarUse::ResultError))
+    }
+
+    /// The pin type of a callee parameter its declared positions use as
+    /// `roles`, instantiated by this use to `ty`, or the refusal naming the
+    /// callee `callee` and the parameter `var`.
+    ///
+    /// An instance an open variable or a wildcard reads by its position
+    /// ([`ui_msg_slots::open_var_ir`]): one use gives one reading, two uses
+    /// give two and are refused. A UI message use reads a compound instance by
+    /// its own reader, so a compound naming an open variable is refused beside
+    /// it too. Any other instance reads the same at every position.
+    fn open_param_pin(
+        &self,
+        roles: Option<&BTreeSet<OpenVarUse>>,
+        ty: &Ty,
+        callee: Symbol,
+        var: Symbol,
+        span: Span,
+    ) -> UserPin {
+        let open = match ty {
+            Ty::Wildcard => true,
+            Ty::Var(raw) => matches!(self.owned_var_read(*raw), OwnedVarRead::Lenient),
+            Ty::Unit | Ty::Fun(..) | Ty::Con { .. } | Ty::Tuple(_) | Ty::Record(..) => false,
+        };
+        let mut each = roles.into_iter().flatten().copied();
+        match (each.next(), each.next()) {
+            (Some(first), Some(second))
+                if open
+                    || (roles.is_some_and(|r| r.contains(&OpenVarUse::UiMessage))
+                        && self.ty_mentions_position_read_var(ty)) =>
+            {
+                let text =
+                    |s: Symbol| -> Box<str> { self.interner.resolve(s).unwrap_or("_").into() };
+                UserPin::Unlowered(Box::new(Diagnostic::Lower {
+                    span,
+                    msg: LowerError::MixedOpenParameter {
+                        callee: text(callee),
+                        var: text(var),
+                        uses: [first, second],
+                    },
+                }))
+            }
+            (Some(only), None) if open => UserPin::Instance(ui_msg_slots::open_var_ir(only)),
+            (Some(_) | None, _) => match self.ir_type_from_ty_json(ty, span) {
+                Ok(lowered) => UserPin::Instance(lowered),
+                Err(refusal) => UserPin::Unlowered(Box::new(refusal)),
+            },
+        }
+    }
+
     /// Lower an application of the [`ui_msg_slots::UI_MSG_SLOTS`] row `row`:
     /// the row selects the [`UiCtor`], and the message argument `msg` reads
     /// through [`Self::ir_type_from_ty_ui_msg`] (a free variable there is
@@ -24464,18 +24523,18 @@ impl<'a> Lowerer<'a> {
     /// Two kinds of type parameter are pinned, by the callee's scheme symbol:
     ///
     /// * one that occurs only in UI message slots of the declared scheme
-    ///   ([`ui_msg_slots::ui_slot_vars`], the slots [`Self::ir_type_from_ty`]
+    ///   ([`ui_msg_slots::open_var_uses`], the slots [`Self::ir_type_from_ty`]
     ///   reads), or the `any` return marker, which this use leaves free
     ///   ([`Self::ty_is_unbound_free`]): pinned to `()`, the type the use's own
     ///   node type lowered that slot to;
     /// * every other one the declared type names anywhere on its spine,
     ///   arguments past the emitted arity and the return included: pinned to
-    ///   the use's solved instantiation, a free variable read as the eta and
-    ///   wildcard binders read it ([`Self::ir_type_from_ty_json`]). The
-    ///   backend renders it only when no emitted parameter of the callee names
-    ///   it, so the pin set never depends on the callee's Rust arity. One
-    ///   that occurs both in a message slot and elsewhere, left free by this
-    ///   use, has no single reading and is refused when it renders.
+    ///   the use's solved instantiation ([`Self::open_param_pin`]), an open
+    ///   variable read by its declared position as the readers read it there.
+    ///   The backend renders it only when no emitted parameter of the callee
+    ///   names it, so the pin set never depends on the callee's Rust arity.
+    ///   One whose positions read an open variable two ways, left open by
+    ///   this use, has no single reading and is refused when it renders.
     ///
     /// Any other callee, or an instantiation the template match cannot align,
     /// pins nothing.
@@ -24488,13 +24547,14 @@ impl<'a> Lowerer<'a> {
         else {
             return CallPin::None;
         };
-        let ui_msg_slots::UiSlotVars {
-            only: msg_only,
-            mixed,
-        } = ui_msg_slots::ui_slot_vars(declared, |module, name, args| {
-            self.ui_msg_slot(module, name, args)
-                .map(|(row, _)| row.slot())
+        let uses = ui_msg_slots::open_var_uses(declared, |module, name, args| {
+            self.open_var_slot(module, name, args)
         });
+        let msg_only: BTreeSet<u32> = uses
+            .iter()
+            .filter(|(_, roles)| ui_msg_slots::only_ui_message(roles))
+            .map(|(raw, _)| *raw)
+            .collect();
         let mut subst: BTreeMap<u32, Ty> = BTreeMap::new();
         match_signature_template(declared, inst, &mut subst, self.interner);
         // An untyped callee's scheme carries solver variables, named by its
@@ -24518,24 +24578,7 @@ impl<'a> Lowerer<'a> {
             let (Some(sym), Some(ty)) = (name_of(*raw), subst.get(raw)) else {
                 continue;
             };
-            // A free variable reads as `()` in a message slot and otherwise as
-            // `JsonVal`: a parameter in both positions has no one reading.
-            let pin = if mixed.contains(raw) && self.ty_mentions_position_read_var(ty) {
-                let text =
-                    |s: Symbol| -> Box<str> { self.interner.resolve(s).unwrap_or("_").into() };
-                UserPin::Unlowered(Box::new(Diagnostic::Lower {
-                    span: callee.span,
-                    msg: LowerError::MixedMessageParameter {
-                        callee: text(*name),
-                        var: text(sym),
-                    },
-                }))
-            } else {
-                match self.ir_type_from_ty_json(ty, callee.span) {
-                    Ok(lowered) => UserPin::Instance(lowered),
-                    Err(refusal) => UserPin::Unlowered(Box::new(refusal)),
-                }
-            };
+            let pin = self.open_param_pin(uses.get(raw), ty, *name, sym, callee.span);
             pins.insert(sym, pin);
         }
         let free_msg = msg_only
@@ -29553,19 +29596,25 @@ impl<'a> Lowerer<'a> {
         }
     }
 
-    /// Whether the `Result e a` value produced at `span` still has an
-    /// unconstrained error type `e` after solving. True only when the solved
-    /// region type is a `Result` constructor whose first argument (the error
-    /// type) is an unresolved [`Ty::Var`] — the case the backend cannot emit as a
-    /// bare `IpeResult::Ok` without tripping rustc's E0282 ambiguity. A missing
-    /// region type or a concrete error type yields `false`.
+    /// Whether the `Result e a` value produced at `span` has an open error
+    /// type `e`: a wildcard or a variable no generic or erasure of the
+    /// current def reads ([`OwnedVarRead::Lenient`]) — the case the backend
+    /// cannot emit as a bare `IpeResult::Ok` without rustc's E0282. A generic
+    /// `e` stays the def's own Rust generic, never the wrapper's fixed error.
+    /// A missing region type or a concrete error type yields `false`.
     fn result_error_unresolved(&self, span: Span) -> bool {
-        match self.region_ty(span) {
-            Some(Ty::Con { name, args, .. }) => {
-                self.resolve(*name).is_ok_and(|n| n == "Result")
-                    && matches!(args.first(), Some(Ty::Var(_) | Ty::Wildcard))
-            }
-            _ => false,
+        let Some(Ty::Con { name, args, .. }) = self.region_ty(span) else {
+            return false;
+        };
+        let at = self
+            .interner
+            .resolve(*name)
+            .and_then(|n| ui_msg_slots::result_error_slot(n, args));
+        match at.and_then(|at| args.get(at)) {
+            Some(Ty::Wildcard) => true,
+            Some(Ty::Var(raw)) => matches!(self.owned_var_read(*raw), OwnedVarRead::Lenient),
+            Some(Ty::Unit | Ty::Fun(..) | Ty::Con { .. } | Ty::Tuple(_) | Ty::Record(..))
+            | None => false,
         }
     }
 
@@ -34537,12 +34586,16 @@ mod tests {
         });
     }
 
+    /// A declared type over `msg`, built from a `View Web m` builder, a
+    /// `Result e a` builder and `msg`.
+    type UseShape = fn(&dyn Fn(Ty) -> Ty, &dyn Fn(Ty, Ty) -> Ty, Ty) -> Ty;
+
     /// The use pin of a reference to `render`, declared `Unit -> shape(msg)` and
     /// used at `Unit -> shape(free)`; `shape` builds over `View Web`. With
     /// `erased`, `free` is a solver variable the enclosing def's signature
     /// erased with that reading.
     fn render_use_pin(
-        shape: fn(&dyn Fn(Ty) -> Ty, Ty) -> Ty,
+        shape: UseShape,
         erased: Option<super::ErasedTvar>,
     ) -> (ipe_intern::Symbol, ipe_ir::CallPin) {
         let free = if erased.is_some() {
@@ -34554,8 +34607,14 @@ mod tests {
         let builtins = build_test_builtin_ctors(&mut interner);
         let view = interner.intern("View").unwrap();
         let web = interner.intern("Web").unwrap();
+        let result = interner.intern("Result").unwrap();
         let msg = interner.intern("msg").unwrap();
         let render = interner.intern("render").unwrap();
+        let result_of = move |e: Ty, a: Ty| Ty::Con {
+            module: vec![],
+            name: result,
+            args: vec![e, a],
+        };
         let view_web = move |m: Ty| Ty::Con {
             module: vec![],
             name: view,
@@ -34580,14 +34639,14 @@ mod tests {
             (vec![], render),
             Ty::Fun(
                 Box::new(Ty::Unit),
-                Box::new(shape(&view_web, Ty::Var(msg.as_raw()))),
+                Box::new(shape(&view_web, &result_of, Ty::Var(msg.as_raw()))),
             ),
         );
         types.regions.insert(
             (vec![], RENDER_CALL_SPAN),
             Ty::Fun(
                 Box::new(Ty::Unit),
-                Box::new(shape(&view_web, Ty::Var(free))),
+                Box::new(shape(&view_web, &result_of, Ty::Var(free))),
             ),
         );
         let lowerer = Lowerer::new(
@@ -34628,7 +34687,7 @@ mod tests {
     /// lowers to, never `JsonVal`.
     #[test]
     fn a_view_message_parameter_left_free_pins_unit() {
-        let (msg, pin) = render_use_pin(|view_web, m| view_web(m), None);
+        let (msg, pin) = render_use_pin(|view_web, _, m| view_web(m), None);
         assert_eq!(
             pin,
             ipe_ir::CallPin::User(BTreeMap::from([(msg, ipe_ir::UserPin::Unit)]))
@@ -34639,8 +34698,10 @@ mod tests {
     /// reading: its pin is refused, never `JsonVal` beside an `Element<()>`.
     #[test]
     fn a_free_parameter_in_and_outside_a_message_slot_is_refused() {
-        let (msg, pin) =
-            render_use_pin(|view_web, m| Ty::Tuple(vec![view_web(m.clone()), m]), None);
+        let (msg, pin) = render_use_pin(
+            |view_web, _, m| Ty::Tuple(vec![view_web(m.clone()), m]),
+            None,
+        );
         let refused = matches!(
             &pin,
             ipe_ir::CallPin::User(pins)
@@ -34650,8 +34711,9 @@ mod tests {
                         &**d,
                         super::Diagnostic::Lower {
                             span: RENDER_CALL_SPAN,
-                            msg: super::LowerError::MixedMessageParameter { callee, var },
+                            msg: super::LowerError::MixedOpenParameter { callee, var, uses },
                         } if &**callee == "render" && &**var == "msg"
+                            && *uses == [super::OpenVarUse::UiMessage, super::OpenVarUse::Value]
                     )
                 )
         );
@@ -34667,7 +34729,7 @@ mod tests {
     #[test]
     fn a_mixed_parameter_erased_to_unit_pins_unit() {
         let (msg, pin) = render_use_pin(
-            |view_web, m| Ty::Tuple(vec![view_web(m.clone()), m]),
+            |view_web, _, m| Ty::Tuple(vec![view_web(m.clone()), m]),
             Some(super::ErasedTvar::Unit),
         );
         assert_eq!(
@@ -34677,6 +34739,45 @@ mod tests {
                 ipe_ir::UserPin::Instance(super::IrType::Unit)
             )]))
         );
+    }
+
+    /// A parameter only in a `Result` error slot, left free, pins the project
+    /// error: the type the `Ok` wrapper fixes for a sibling, never `JsonVal`.
+    #[test]
+    fn a_free_result_error_parameter_pins_the_project_error() {
+        let (msg, pin) = render_use_pin(|_, result_of, m| result_of(m, Ty::Unit), None);
+        assert_eq!(
+            pin,
+            ipe_ir::CallPin::User(BTreeMap::from([(
+                msg,
+                ipe_ir::UserPin::Instance(super::IrType::Error)
+            )]))
+        );
+    }
+
+    /// A parameter in a `Result` error slot and as a value, left free, reads
+    /// two ways: its pin is refused naming both uses.
+    #[test]
+    fn a_free_parameter_in_and_outside_a_result_error_slot_is_refused() {
+        let (msg, pin) = render_use_pin(
+            |_, result_of, m| Ty::Tuple(vec![result_of(m.clone(), Ty::Unit), m]),
+            None,
+        );
+        let refused = matches!(
+            &pin,
+            ipe_ir::CallPin::User(pins)
+                if matches!(
+                    pins.get(&msg),
+                    Some(ipe_ir::UserPin::Unlowered(d)) if matches!(
+                        &**d,
+                        super::Diagnostic::Lower {
+                            msg: super::LowerError::MixedOpenParameter { uses, .. },
+                            ..
+                        } if *uses == [super::OpenVarUse::ResultError, super::OpenVarUse::Value]
+                    )
+                )
+        );
+        assert!(refused, "got {pin:?}");
     }
 
     /// An application whose argument count differs from the declaration's
