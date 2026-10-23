@@ -21,6 +21,8 @@ mod golden_cross_module_chained_msg_slot_seal;
 mod golden_declared_any_param_seal;
 #[path = "g_issues/golden_embed_fn_param_capture_seal.rs"]
 mod golden_embed_fn_param_capture_seal;
+#[path = "g_issues/golden_generic_bound_closure_capture.rs"]
+mod golden_generic_bound_closure_capture;
 #[path = "g_issues/golden_generic_bound_cross_module.rs"]
 mod golden_generic_bound_cross_module;
 #[path = "g_issues/golden_generic_bound_fn_param_forwarding.rs"]
