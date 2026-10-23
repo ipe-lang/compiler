@@ -132,10 +132,10 @@ fn edge_words(text: &str, into: &mut BTreeSet<String>) {
     segments.push(rest);
     for segment in segments {
         for (start, end) in words(segment) {
-            if start == 0 || end == segment.len() {
-                if let Some(word) = segment.get(start..end) {
-                    into.insert(word.to_owned());
-                }
+            if (start == 0 || end == segment.len())
+                && let Some(word) = segment.get(start..end)
+            {
+                into.insert(word.to_owned());
             }
         }
     }
