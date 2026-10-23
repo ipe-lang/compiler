@@ -1144,6 +1144,12 @@ pub struct RowParam {
     /// Field names from `fields` that are updated in the function body.
     /// Drives `IpeWithF` setter witness synthesis in the backend.
     pub updated_fields: BTreeSet<Symbol>,
+    /// The auto-trait and `Clone` bounds the lowerer finalized for this row
+    /// variable.
+    ///
+    /// Only `'static`, `Send`, `Sync` and `Clone` bits are meaningful; the
+    /// backend renders exactly this set beside the field witnesses.
+    pub bounds: BoundSet,
 }
 
 /// The type lattice.

@@ -262,14 +262,14 @@ pub(super) fn clone_class(env: CloneEnv<'_>, t: &IrType) -> CloneClass {
 ///
 /// A `CloneOk` param clones per the general multi-use rule. A bare
 /// [`IrType::Generic`] param is ALSO eligible even though [`clone_class`] floors
-/// it to `NonClone`: `render_fn_generics` (`ipe_backend_rust` `emit_expr.rs`,
+/// it to `NonClone`: `apply_signature_shape_bounds` (`signature_bounds.rs`,
 /// `bounds.with_clone()`) stamps `T: Clone` on EVERY emitted generic fn
 /// type-param UNCONDITIONALLY, so an inserted `x.clone()` on a reused generic
 /// param always type-checks. That `T: Clone` bound is the soundness gate — a
 /// non-`Clone` instantiation (e.g. `Box<dyn Fn>`) fails the bound at the CALLER
 /// before the inserted `.clone()` is ever reached, so inserting the clone is
 /// sound (over-cloning is the only downside, never unsoundness). SINGLE SOURCE
-/// OF TRUTH: this predicate and `render_fn_generics`' unconditional
+/// OF TRUTH: this predicate and `apply_signature_shape_bounds`' unconditional
 /// `with_clone()` must agree — if one changes, the other must change with it,
 /// else a reused generic either moves twice (E0382) or clones a non-`Clone`
 /// value (E0599).
@@ -291,7 +291,7 @@ pub(super) fn param_is_multiuse_clonable(env: CloneEnv<'_>, ir_ty: &IrType) -> b
 /// position, else IPE-L0126), `None` is a `CopyLeaf` capture left bare.
 ///
 /// A bare [`IrType::Generic`] capture clones, exactly as a bare `Generic` PARAM
-/// does under [`param_is_multiuse_clonable`]: `render_fn_generics` stamps
+/// does under [`param_is_multiuse_clonable`]: `apply_signature_shape_bounds` stamps
 /// `T: Clone` on every emitted generic type-param unconditionally, so the
 /// inserted `.clone()` type-checks, and a non-`Clone` instantiation is rejected
 /// at the CALLER by that bound before the clone is reached. SINGLE SOURCE OF
@@ -368,7 +368,7 @@ pub(super) fn classify_handler_capture(
 /// The clone class of one COMPOSITE PART.
 ///
 /// A bare [`IrType::Generic`] part is `CloneOk`, not `NonClone`: every emitted
-/// generic fn stamps `T: Clone` unconditionally (`render_fn_generics`), so a
+/// generic fn stamps `T: Clone` unconditionally (`apply_signature_shape_bounds`), so a
 /// composite carrying the tvar (`Vec<(T, String)>` for an `enum`'s pairs,
 /// `Vec<Variant<T>>` for a `taggedUnion`'s variants) is `Clone` whenever the
 /// composite's own shape is, and a `.clone()` inserted on it type-checks — a

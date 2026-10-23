@@ -947,8 +947,6 @@ fn emit_func_item(ctx: &EmitCtx, func: &Func, vis_prefix: &str) -> DResult<Strin
         .collect();
     let generics = GenericScope::with_rows(&scope_syms, &row_syms, &row_binder_syms);
 
-    let ret_is_task = matches!(ret_ty, IrType::Task(_));
-
     // Direct-position function-value monomorphization: a `Fun` param used only
     // as a direct callee renders as a fresh generic `FN{i}` (declared with a
     // `Fn(..) -> R + Send + Sync + 'static` bound in the generic clause) rather
@@ -1073,7 +1071,7 @@ fn emit_func_item(ctx: &EmitCtx, func: &Func, vis_prefix: &str) -> DResult<Strin
     // in the param's `BoundSet` — the generic clause just renders the BoundSet.
     // Any direct-position `Fn` params contribute their fresh `FN{i}: Fn(..)`
     // generics, appended after the ordinary `T{n}` type variables.
-    let generic_clause = render_fn_generics(ctx, func, ret_is_task, &impl_fn_params, generics)?;
+    let generic_clause = render_fn_generics(ctx, func, &impl_fn_params, generics)?;
 
     // The body (the only place a TEA `update`'s arms are emitted) is rendered;
     // disarm the transition rewrite so no sibling / nested function inherits it.
@@ -1408,29 +1406,21 @@ pub fn record_body_spends<T>(f: impl FnOnce() -> T) -> (T, Vec<LayoutSpend>) {
     (value, spends)
 }
 
-/// Render a function's generic clause `<T1, T2: <bounds>, ..>` — one entry per
-/// quantified variable in declaration order, the position fixing its `T{i+1}`
-/// name. Empty string for a monomorphic function.
+/// Render a function's generic clause `<T1, T2: <bounds>, ..>`, one entry per quantified variable.
 ///
-/// `Clone` is always included: Ipê has value semantics so every type must be
-/// cloneable (field reads emit `.clone()` to prevent partial-move errors). For
-/// `Copy` types (`i64`, `bool`, …) the bound is trivially satisfied.
-///
-/// `Send + 'static` is injected only when `ret_is_task`: futures require their
-/// captured values to be `Send + 'static`, but plain record/ADT-returning
-/// functions have no such requirement. Adding the bounds unconditionally would
-/// over-constrain callers of pure record-constructors (e.g. `wrap : a -> {
-/// value : a }` must accept any `Clone` type, not only `Send + 'static` ones).
-///
-/// The `IpeRow` bound (for a wildcard `any` param that flows into a
-/// `Db.get*` accessor) is already recorded in the relevant param's [`BoundSet`]
-/// by the lowerer's structural IR walk (`ipe_lower`'s `apply_db_row_bounds` /
-/// `body_calls_db_get_on_param`), so this function simply renders whatever
-/// bounds each param carries.
+/// Entries follow declaration order, the position fixing each `T{i+1}` name;
+/// the clause is empty for a monomorphic function. Every bound comes verbatim
+/// from the lowerer's finalized [`BoundSet`] (`Func::type_params`,
+/// `RowParam::bounds`): the signature-shape rules (`Clone`, `Send + 'static` for
+/// a `Task` return or a callback parameter, `'static` for a UI-carrier
+/// message), the body-derived kernel obligations, and whatever the cross-call
+/// fixpoint carried from callees. This function derives none of them, so a
+/// caller's clause is always a superset of every callee clause it reaches. The
+/// only entries it adds are the structural `FN{i}` callback generics and the
+/// per-field row witnesses.
 pub fn render_fn_generics(
     ctx: &EmitCtx,
     func: &Func,
-    ret_is_task: bool,
     impl_fn_params: &[usize],
     generics: GenericScope,
 ) -> DResult<String> {
@@ -1442,35 +1432,9 @@ pub fn render_fn_generics(
         .type_params
         .iter()
         .enumerate()
-        .map(|(i, (sym, bounds))| {
+        .map(|(i, (_, bounds))| {
             let n = i.saturating_add(1);
-            // Always inject `Clone` — field reads emit `.clone()` to prevent
-            // partial-move errors. `with_*` are idempotent, so folding the same
-            // flag the solver already recorded is a no-op.
-            let mut bounds = bounds.with_clone();
-            // A task return, or a type var inside a first-class-function-value
-            // PARAMETER, moves the value into a spawned / boxed
-            // `Box<dyn Fn(..) -> R + Send + Sync + 'static>` consumer, so it
-            // needs `Send + 'static` (`with_send` sets both). Example: a
-            // generic-over-`msg` helper taking an `onEdit : String -> msg`
-            // callback and forwarding it into `input_multiline_`.
-            if ret_is_task || type_var_in_fn_param(func, *sym) {
-                bounds = bounds.with_send();
-            }
-            // A type var that is the `msg` of a `Ipe.Ui` / `Ipe.Html` carrier in
-            // the RETURN type needs only `'static`: such a function is a leaf
-            // renderer boxed by its caller's `List.map` into a
-            // `Box<dyn Fn(..) -> Element<msg> + 'static>`, and a boxed `fn` item
-            // is `Send + Sync` regardless of `msg`, so `'static` alone lets the
-            // coercion type-check (`with_static`, not `with_send`). Without it
-            // the leaf renderer is an E0310 (`msg may not live long enough`).
-            if type_var_in_ui_carrier(&func.ret, *sym) {
-                bounds = bounds.with_static();
-            }
-            // ONE render pass: `render_bounds` orders the lifetime bound first
-            // and de-duplicates, so `'static` never doubles even when the
-            // lowerer's `BoundSet::STATIC` already set it.
-            let clause = render_bounds(bounds, n);
+            let clause = render_bounds(*bounds, n);
             if clause.is_empty() {
                 format!("T{n}")
             } else {
@@ -1508,23 +1472,22 @@ pub fn render_fn_generics(
         ));
     }
 
-    // Row generics: each `R{n}` is bounded by one per-field witness trait —
-    // `IpeHasField<Field = FieldTy>` — plus `Clone` (field reads emit `.clone()`
-    // for value semantics, §4.4). The bounds are exactly the field obligations
-    // the solver already proved at every call site, so exit-0 ⇒ cargo-green.
+    // Row generics: each `R{n}` carries its finalized auto-trait bounds, then
+    // one per-field witness trait — `IpeHasField<Field = FieldTy>` — then
+    // `Clone`. The field witnesses are exactly the obligations the solver
+    // proved at every call site, so exit-0 ⇒ cargo-green.
     for (i, row) in func.row_params.iter().enumerate() {
         let n = i.saturating_add(1);
-        let mut bounds: Vec<String> = Vec::with_capacity(row.fields.len() + 3);
-        // A task-returning function moves its row-generic parameter into the
-        // boxed continuation of its `task_and_then` tail — a
-        // `Box<dyn FnOnce(..) -> Pin<Box<.. + Send>> + Send>` — so the row generic
-        // needs `Send + 'static`, exactly as a task-flowing `T{n}` does above.
-        // The lifetime bound must precede every trait bound (`R{n}: 'static + …`),
-        // so it is pushed first. Both auto-traits hold for every concrete Ipê
-        // record (owned, never borrows), so exit-0 ⇒ cargo-green is preserved.
-        if ret_is_task {
+        let mut bounds: Vec<String> = Vec::with_capacity(row.fields.len() + 4);
+        // The lifetime bound must precede every trait bound (`R{n}: 'static + …`).
+        if row.bounds.has_static() {
             bounds.push("'static".to_owned());
+        }
+        if row.bounds.has_send() {
             bounds.push("Send".to_owned());
+        }
+        if row.bounds.has_sync() {
+            bounds.push("Sync".to_owned());
         }
         for (field_sym, field_ty) in &row.fields {
             let field_name = ctx.resolve_ident(*field_sym)?;
@@ -1547,7 +1510,9 @@ pub fn render_fn_generics(
             }
             bounds.push(format!("{trait_name}<{assoc} = {field_ty_s}>"));
         }
-        bounds.push("Clone".to_owned());
+        if row.bounds.has_clone() {
+            bounds.push("Clone".to_owned());
+        }
         entries.push(format!("R{n}: {}", bounds.join(" + ")));
     }
 
@@ -1560,127 +1525,6 @@ pub fn render_fn_generics(
 /// [`Func::type_params`].
 pub fn impl_fn_generic_name(idx: usize) -> String {
     format!("FN{idx}")
-}
-
-/// `true` if the type variable `sym` appears anywhere inside a
-/// first-class-function-value (`IrType::Fun` / `IrType::FnOnceChain`)
-/// parameter of `func`.
-///
-/// Such a parameter is emitted as a boxed `dyn Fn` trait object carrying a
-/// `+ 'static` bound (`emit_types::render_type`), so any type variable it
-/// mentions must itself be `'static`. This predicate drives the `Send +
-/// 'static` bound injection in [`render_fn_generics`] for exactly those
-/// variables — narrower than the blanket `ret_is_task` gate so that a pure,
-/// non-callback-taking generic function keeps a bare `Clone` bound.
-pub fn type_var_in_fn_param(func: &Func, sym: Symbol) -> bool {
-    func.params
-        .iter()
-        .any(|ipe_ir::Param { ty, .. }| ty_mentions_var_under_fn(ty, sym, false))
-}
-
-/// `true` if the type variable `sym` is the message parameter of a `Ipe.Ui` /
-/// `Ipe.Html` carrier (`Element msg`, `Attribute msg`, `Html msg`, …) anywhere
-/// in the return type `ret`.
-///
-/// A carrier over `msg` holds event handlers as `Arc<dyn Fn(..) -> msg + Send +
-/// Sync + 'static>` (`Attribute`'s `AttrEvent` / `HtmlAttribute`), so a
-/// `msg`-generic function returning one is boxable into a `Box<dyn Fn(..) ->
-/// Element<msg> + 'static>` slot — precisely how `List.map renderCell cells`
-/// forwards a leaf renderer. Without a `msg: 'static` bound that box is an
-/// E0310 (`msg may not live long enough`) even though the leaf's own body names
-/// no function-typed parameter. Pinning exactly the carried `msg` var mirrors
-/// the boxed-`dyn Fn` treatment and leaves pure record/ADT-returning generics
-/// unconstrained.
-pub fn type_var_in_ui_carrier(ret: &IrType, sym: Symbol) -> bool {
-    match ret {
-        IrType::Ui { msg, .. } => ty_mentions_var(msg, sym),
-        IrType::Task(inner)
-        | IrType::Maybe(inner)
-        | IrType::List(inner)
-        | IrType::Set(inner)
-        | IrType::Decoder(inner)
-        | IrType::Cmd(inner)
-        | IrType::Sub(inner)
-        | IrType::WebRoute(inner) => type_var_in_ui_carrier(inner, sym),
-        IrType::Result(a, b) | IrType::Dict(a, b) => {
-            type_var_in_ui_carrier(a, sym) || type_var_in_ui_carrier(b, sym)
-        }
-        IrType::Tuple(items) => items.iter().any(|t| type_var_in_ui_carrier(t, sym)),
-        IrType::Enum { args, .. } => args.iter().any(|t| type_var_in_ui_carrier(t, sym)),
-        IrType::Record(fields) => fields.values().any(|t| type_var_in_ui_carrier(t, sym)),
-        _ => false,
-    }
-}
-
-/// `true` if `IrType::Generic(sym)` occurs anywhere in `ty` — the carrier's
-/// message argument may itself be a nested structure (`List msg`, `(msg, a)`),
-/// so the whole sub-tree is scanned.
-pub fn ty_mentions_var(ty: &IrType, sym: Symbol) -> bool {
-    match ty {
-        IrType::Generic(s) => *s == sym,
-        IrType::Ui { msg, .. } => ty_mentions_var(msg, sym),
-        IrType::Task(inner)
-        | IrType::Maybe(inner)
-        | IrType::List(inner)
-        | IrType::Set(inner)
-        | IrType::Decoder(inner)
-        | IrType::Cmd(inner)
-        | IrType::Sub(inner)
-        | IrType::WebRoute(inner) => ty_mentions_var(inner, sym),
-        IrType::Fun(params, ret)
-        | IrType::SharedFun(params, ret)
-        | IrType::FnOnceChain(params, ret) => {
-            params.iter().any(|p| ty_mentions_var(p, sym)) || ty_mentions_var(ret, sym)
-        }
-        IrType::Result(a, b) | IrType::Dict(a, b) => {
-            ty_mentions_var(a, sym) || ty_mentions_var(b, sym)
-        }
-        IrType::Tuple(items) => items.iter().any(|t| ty_mentions_var(t, sym)),
-        IrType::Enum { args, .. } => args.iter().any(|t| ty_mentions_var(t, sym)),
-        IrType::Record(fields) => fields.values().any(|t| ty_mentions_var(t, sym)),
-        _ => false,
-    }
-}
-
-/// Walk `ty`, returning `true` if `IrType::Generic(sym)` occurs while `under_fn`
-/// is set (i.e. inside a `Fun` / `FnOnceChain` sub-tree). Once a function-typed
-/// node is entered, `under_fn` stays set for the whole sub-tree — the entire
-/// boxed trait object is `'static`, so every variable it names needs the bound.
-pub fn ty_mentions_var_under_fn(ty: &IrType, sym: Symbol, under_fn: bool) -> bool {
-    match ty {
-        IrType::Generic(s) => under_fn && *s == sym,
-        // `SharedFun` shares `Fun`'s `+ 'static` boxed/`Arc` carrier, so entering
-        // it pins every type it names to `'static` just as `Fun` does.
-        IrType::Fun(params, ret)
-        | IrType::SharedFun(params, ret)
-        | IrType::FnOnceChain(params, ret) => {
-            params
-                .iter()
-                .any(|p| ty_mentions_var_under_fn(p, sym, true))
-                || ty_mentions_var_under_fn(ret, sym, true)
-        }
-        IrType::Task(inner)
-        | IrType::Maybe(inner)
-        | IrType::List(inner)
-        | IrType::Set(inner)
-        | IrType::Decoder(inner)
-        | IrType::Cmd(inner)
-        | IrType::Sub(inner)
-        | IrType::WebRoute(inner) => ty_mentions_var_under_fn(inner, sym, under_fn),
-        IrType::Result(a, b) | IrType::Dict(a, b) => {
-            ty_mentions_var_under_fn(a, sym, under_fn) || ty_mentions_var_under_fn(b, sym, under_fn)
-        }
-        IrType::Tuple(items) => items
-            .iter()
-            .any(|t| ty_mentions_var_under_fn(t, sym, under_fn)),
-        IrType::Enum { args, .. } => args
-            .iter()
-            .any(|t| ty_mentions_var_under_fn(t, sym, under_fn)),
-        IrType::Record(fields) => fields
-            .values()
-            .any(|t| ty_mentions_var_under_fn(t, sym, under_fn)),
-        _ => false,
-    }
 }
 
 #[cfg(test)]
