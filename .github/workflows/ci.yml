@@ -1397,10 +1397,33 @@ jobs:
       # cargo tries to link the emitted Webview project — pkg-config cannot find
       # gobject-2.0 and the build exits non-zero (THE SEAL breach in CI only,
       # not in the emitter).
+      # The `-dev` packages pull in the WebKitGTK/GStreamer runtime libraries as
+      # hard dependencies, a download that varies from seconds to tens of
+      # minutes with the mirror. The fetched archives are cached (only `main`
+      # saves, as everywhere else) so a restored run installs from disk and only
+      # a cold or stale cache pays the mirror; the step ceiling keeps even that
+      # case inside the job budget.
+      - name: Identify the runner image
+        id: apt-image
+        run: echo "image=${ImageVersion:-unknown}" >> "$GITHUB_OUTPUT"
+      - name: Restore webview link dep archives
+        id: apt-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: ${{ runner.temp }}/apt-archives
+          key: ${{ runner.os }}-${{ runner.arch }}-apt-webview-${{ steps.apt-image.outputs.image }}
       - name: Install webview link deps (wry/tao — GLib/GTK/WebKit)
+        timeout-minutes: 20
         run: |
-          sudo apt-get update
-          sudo apt-get install -y libwebkit2gtk-4.1-dev libsoup-3.0-dev
+          mkdir -p "$RUNNER_TEMP/apt-archives/partial"
+          sudo apt-get -o Acquire::Retries=3 update
+          sudo apt-get -o Acquire::Retries=3 -o Dir::Cache::archives="$RUNNER_TEMP/apt-archives" install -y --no-install-recommends libwebkit2gtk-4.1-dev libsoup-3.0-dev
+      - name: Save webview link dep archives
+        if: github.ref == 'refs/heads/main' && steps.apt-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: ${{ runner.temp }}/apt-archives
+          key: ${{ steps.apt-cache.outputs.cache-primary-key }}
       - name: E2E shard ${{ matrix.shard }}/14 (THE SEAL — build+run emitted Rust)
         env:
           IPE_E2E: "1"
