@@ -267,7 +267,15 @@ web-sys = { version = "0.3", optional = true, features = [
     "HtmlSelectElement",
     "HtmlFormElement",
     "FormData",
+    # A patch's markup is parsed into a detached holder of the target's own
+    # tag (a template's inert content), and its `autofocus` elements are found
+    # in one query before the nodes connect.
+    "HtmlTemplateElement",
+    "DocumentFragment",
+    "NodeList",
+    # A key or edit an input method is still composing is no user act.
     "KeyboardEvent",
+    "InputEvent",
     # Debugger overlay: a keyboard toggle, a draggable floating window (pointer
     # events + element geometry), and per-element inline style writes.
     "PointerEvent",

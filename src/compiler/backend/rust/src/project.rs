@@ -205,8 +205,11 @@ web-sys = { version = "0.3", features = [
   "Window", "Document", "Element", "HtmlElement", "Node", "Text",
   "Event", "EventTarget", "console", "HtmlInputElement",
   "HtmlTextAreaElement", "HtmlSelectElement", "HtmlFormElement",
-  "FormData", "KeyboardEvent", "Location", "HtmlDocument",
+  "FormData", "KeyboardEvent", "InputEvent", "Location", "HtmlDocument",
   "CustomEvent",
+  # A patch's markup is parsed detached in its target's own context and its
+  # autofocus elements found in one query (mirrors the runtime crate).
+  "HtmlTemplateElement", "DocumentFragment", "NodeList",
   "Request", "RequestInit", "RequestMode", "RequestRedirect",
   "Response", "Headers", "AbortController", "AbortSignal",
   # Incremental capped body read (fetch arm): Response.body() ->
@@ -2325,7 +2328,9 @@ fn shell_boot_script(boot_url: &str) -> String {
     out
 }
 
-/// The boot module: import the wasm-bindgen glue at `glue_url` and instantiate
+/// The boot module: import the wasm-bindgen glue at `glue_url`, start hearing
+/// the user's first key, pointer press or focus move (the first paint then
+/// leaves the load's `autofocus` alone, as `client.js` does), and instantiate
 /// the module at `wasm_url`.
 ///
 /// The module URL is explicit rather than derived from `import.meta.url`. Each
@@ -2334,7 +2339,9 @@ fn shell_boot_script(boot_url: &str) -> String {
 fn shell_boot_js(glue_url: &str, wasm_url: &str) -> String {
     let mut out = String::from("import init from \"");
     out.push_str(&ipe_runtime_rust::escape::json_str_body(glue_url));
-    out.push_str("\";\ninit({ module_or_path: \"");
+    out.push_str("\";\n");
+    out.push_str(&ipe_runtime_rust::dom::diff::autofocus_spent_listener_js());
+    out.push_str("init({ module_or_path: \"");
     out.push_str(&ipe_runtime_rust::escape::json_str_body(wasm_url));
     out.push_str("\" });\n");
     out
@@ -6901,7 +6908,10 @@ mod wasm_shell_tests {
         let plain = shell_boot_js("/pkg/ipe_app.js", "/pkg/ipe_app_bg.wasm");
         assert_eq!(
             plain,
-            "import init from \"/pkg/ipe_app.js\";\ninit({ module_or_path: \"/pkg/ipe_app_bg.wasm\" });\n"
+            "import init from \"/pkg/ipe_app.js\";\n\
+             for (const type of [\"focusin\", \"pointerdown\", \"mousedown\", \"touchstart\", \"keydown\"]) {\n  \
+             document.addEventListener(type, () => { globalThis.__ipeAutofocusSpent = true; }, true);\n}\n\
+             init({ module_or_path: \"/pkg/ipe_app_bg.wasm\" });\n"
         );
     }
 }

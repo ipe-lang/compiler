@@ -11,6 +11,8 @@ function __ipeDocProp(doc, name) {
   var d = Object.getOwnPropertyDescriptor(Document.prototype, name);
   return d && d.get ? d.get.call(doc) : null;
 }
+// The HTML namespace.
+var __IPE_HTML_NS = "http://www.w3.org/1999/xhtml";
 // The document members the client reads, bound from the prototypes before any
 // page content is consulted. A document's named properties (an `img`, `form`,
 // `embed`, `object` or `iframe` with that `name`) shadow its built-in members
@@ -71,7 +73,10 @@ var __ipeNode = (function() {
   var removeChild = own(Node.prototype.removeChild);
   var appendChild = own(Node.prototype.appendChild);
   var replaceChild = own(Node.prototype.replaceChild);
+  var query = own(Element.prototype.querySelector);
+  var fragmentQuery = own(DocumentFragment.prototype.querySelector);
   var queryAll = own(Element.prototype.querySelectorAll);
+  var fragmentQueryAll = own(DocumentFragment.prototype.querySelectorAll);
   var on = own(EventTarget.prototype.addEventListener);
   var controls = getter(HTMLFormElement.prototype, "elements");
   var parentElement = getter(Node.prototype, "parentElement");
@@ -83,7 +88,9 @@ var __ipeNode = (function() {
   var previousElementSibling = getter(Element.prototype, "previousElementSibling");
   var tagName = getter(Element.prototype, "tagName");
   var namespaceURI = getter(Element.prototype, "namespaceURI");
-  var queryOne = own(Element.prototype.querySelector);
+  var localName = getter(Element.prototype, "localName");
+  var templateContent = typeof HTMLTemplateElement === "function"
+      ? getter(HTMLTemplateElement.prototype, "content") : missing;
   var closest = own(Element.prototype.closest);
   // `focus()` per element interface: HTML, SVG and MathML elements are every
   // element that has one. An interface the browser lacks is left out.
@@ -118,6 +125,17 @@ var __ipeNode = (function() {
     setText: function(el, text) { textContent.call(el, text); },
     tag: function(el) { return tagName.call(el); },
     ns: function(el) { return namespaceURI.call(el); },
+    local: function(el) { return localName.call(el); },
+    // A template's inert content fragment.
+    content: function(el) { return templateContent.call(el); },
+    // The first, or every, match below the detached holder `tmp` (an element
+    // or a fragment).
+    queryIn: function(tmp, sel) {
+      return (tmp instanceof DocumentFragment ? fragmentQuery : query).call(tmp, sel);
+    },
+    queryAllIn: function(tmp, sel) {
+      return (tmp instanceof DocumentFragment ? fragmentQueryAll : queryAll).call(tmp, sel);
+    },
     // The child-element indices leading from `root` down to `el`; null when
     // `el` is not below `root`.
     pathFrom: function(root, el) {
@@ -148,7 +166,17 @@ var __ipeNode = (function() {
       }
       return {node: node, depth: depth};
     },
-    firstAutofocus: function(root) { return queryOne.call(root, "[autofocus]"); },
+    // Removes `autofocus` from every element below the detached holder `tmp`
+    // (an element or a fragment), returning them in document order.
+    stripAutofocus: function(tmp) {
+      var found = (tmp instanceof DocumentFragment ? fragmentQueryAll : queryAll).call(tmp, "[autofocus]");
+      var stripped = [];
+      for (var i = 0; i < found.length; i++) {
+        removeAttribute.call(found[i], "autofocus");
+        stripped.push(found[i]);
+      }
+      return stripped;
+    },
     // Whether `el` took focus: a node that cannot be focused stays unfocused.
     focus: function(el) {
       var run = null;
@@ -156,8 +184,10 @@ var __ipeNode = (function() {
         if (el instanceof focusers[i].of) run = focusers[i].run;
       }
       if (run === null) return false;
-      try { run.call(el, {preventScroll: true}); } catch (_) { return false; }
-      return __ipeDoc.active() === el;
+      var ran = __ipeAsRuntimeFocus(function() {
+        try { run.call(el, {preventScroll: true}); return true; } catch (_) { return false; }
+      });
+      return ran && __ipeDoc.active() === el;
     }
   };
 })();
@@ -620,13 +650,13 @@ function __ipeCssString(s) {
 function __ipeFindPlaceholder(tmp, live) {
   var sid = live.getAttribute && live.getAttribute("ipe-id");
   if (sid) {
-    var bySid = tmp.querySelector("[ipe-id=" + __ipeCssString(sid) + "]");
+    var bySid = __ipeNode.queryIn(tmp, "[ipe-id=" + __ipeCssString(sid) + "]");
     if (bySid) return bySid;
   }
   var name = live.getAttribute && live.getAttribute("name");
   if (!name) return null;
   var tag = live.tagName.toLowerCase();
-  var matches = tmp.querySelectorAll(tag + "[name=" + __ipeCssString(name) + "]");
+  var matches = __ipeNode.queryAllIn(tmp, tag + "[name=" + __ipeCssString(name) + "]");
   if (matches.length === 1) return matches[0];
   return null;
 }
@@ -644,12 +674,38 @@ function __ipeFindPlaceholder(tmp, live) {
 // call; __ipePatch (full body) takes the two steps apart to pick the page
 // shell's root out of its one parse.
 function __ipeReplaceHTMLPreservingFocus(container, newHTML) {
-  __ipeSwapPreservingFocus(container, __ipeParseFor(container, newHTML));
+  var parsed = __ipeParseFor(container, newHTML);
+  if (__ipeIsTemplate(container)) {
+    // A template's markup lives in its inert content, never in the document:
+    // no field or focus is there to keep.
+    var content = __ipeNode.content(container);
+    var gone;
+    while ((gone = __ipeNode.firstChild(content))) __ipeNode.removeChild(content, gone);
+    var moved;
+    while ((moved = __ipeNode.firstChild(parsed))) __ipeNode.append(content, moved);
+    return;
+  }
+  __ipeSwapPreservingFocus(container, parsed);
 }
 
-// `html` parsed into a detached holder in `container`'s namespace, by the
-// document's own parser: scripting is on, as for the markup it replaces.
-function __ipeParseFor(container, html) {
+function __ipeIsTemplate(el) {
+  return __ipeNode.ns(el) === __IPE_HTML_NS && __ipeNode.local(el) === "template";
+}
+
+// `html` parsed into a detached holder in `container`'s namespace and context,
+// by the document's own parser: scripting is on, as for the markup it
+// replaces. An HTML holder is an element of `container`'s own tag, so the
+// parser reads the markup in the insertion mode `container` sets (a `<tr>`
+// below a `<tbody>`, an `<option>` below a `<select>`, text below a
+// `<textarea>`); a `div` would drop the table tags and keep only their text.
+// A custom element's name would run its constructor on the holder, so it gets
+// a `div`; a template's markup is parsed into a template's inert content.
+// Every `autofocus` attribute is removed before the holder's nodes connect:
+// the browser focuses an autofocus element on insertion while focus is on the
+// body, so a render the user did not cause would move focus. The runtime moves
+// focus itself (`__ipeFocusAutofocus`, `__ipeFocusAddressed`). The stripped
+// elements are pushed onto `stripped` when given.
+function __ipeParseFor(container, html, stripped) {
   // Parse the new HTML into a detached element so we can splice
   // preserved live nodes into it before committing.
   //
@@ -678,14 +734,18 @@ function __ipeParseFor(container, html) {
   // inline-SVG icon <path> children are the common victims.
   var tmp;
   var ns = __ipeNode.ns(container);
-  if (ns && ns !== "http://www.w3.org/1999/xhtml") {
+  if (ns && ns !== __IPE_HTML_NS) {
     var range = __ipeDoc.range();
     range.selectNodeContents(container);
     tmp = range.createContextualFragment(html);
   } else {
-    tmp = __ipeDoc.create("div");
-    tmp.innerHTML = html;
+    var local = __ipeNode.local(container);
+    var holder = __ipeDoc.create(local.indexOf("-") >= 0 ? "div" : local);
+    holder.innerHTML = html;
+    tmp = __ipeIsTemplate(container) ? __ipeNode.content(holder) : holder;
   }
+  var found = __ipeNode.stripAutofocus(tmp);
+  if (stripped) for (var i = 0; i < found.length; i++) stripped.push(found[i]);
   return tmp;
 }
 
@@ -776,9 +836,11 @@ function __ipeSwapPreservingFocus(container, tmp) {
   // composition buffer survive untouched. removeChild + appendChild
   // drop focus, so we re-set it now.
   if (preservedFocus) {
-    try { preservedFocus.focus({preventScroll: true}); } catch (_) {
-      try { preservedFocus.focus(); } catch (_) {}
-    }
+    __ipeAsRuntimeFocus(function() {
+      try { preservedFocus.focus({preventScroll: true}); } catch (_) {
+        try { preservedFocus.focus(); } catch (_) {}
+      }
+    });
     if (typeof preservedFocus.setSelectionRange === "function" &&
         selStart !== null && selEnd !== null) {
       try { preservedFocus.setSelectionRange(selStart, selEnd, selDir); } catch (_) {}
@@ -832,20 +894,110 @@ function __ipeRestoreFocus(container, path, ids) {
 }
 
 // The first mount of the page focuses the element the browser would have
-// focused at load (the first `[autofocus]` below `root`) only while the load's
-// own autofocus is still due: nothing has held focus since the client started,
-// the user has not pressed a key or a pointer, and the URL names no fragment
-// target (the browser skips autofocus for one too). Any later frame only puts
-// lost focus back (`__ipeRestoreFocus`): an element is never autofocused after
-// the user has acted or focus has been somewhere.
+// focused at load (the first element the server's page marks `autofocus`,
+// found again by its `ipe-id`) only while the load's own autofocus is still
+// due: nothing has held focus since the client started, the user has not
+// pressed a key or a pointer, and the URL names no fragment target (the
+// browser skips autofocus for one too). No
+// `autofocus` attribute reaches the live DOM from a swap or a patch, so the
+// browser never focuses an inserted element itself. A later full frame only
+// puts lost focus back (`__ipeRestoreFocus`). A later patches frame moves focus
+// only through `__ipeFocusAddressed`: onto the element the server named as
+// newly autofocused, when the frame answers this tab's own user act, applies
+// as the next step, and focus has not moved since that act.
 var __ipeMounted = false;
+// The `ipe-id` of the first element the server's page marks `autofocus`, read
+// as the client starts; null when it marks none, or one with no `ipe-id`.
+var __ipeLoadAutofocus = (function() {
+  var el = __ipeDoc.query("#ipe-root [autofocus]");
+  return el ? __ipeNode.attr(el, "ipe-id") : null;
+})();
 var __ipeAutofocusSpent = (function() {
   var now = __ipeDoc.active();
   return !!now && now !== __ipeDoc.body();
 })();
-["focusin", "pointerdown", "mousedown", "touchstart", "keydown"].forEach(function(type) {
+// The page events after which the load's own autofocus is spent; the wasm
+// loader hears the same list (`dom::diff::AUTOFOCUS_SPENDING_EVENTS`).
+var __IPE_AUTOFOCUS_SPENDING = ["focusin", "pointerdown", "mousedown", "touchstart", "keydown"];
+__IPE_AUTOFOCUS_SPENDING.forEach(function(type) {
   __ipeDoc.on(type, function() { __ipeAutofocusSpent = true; }, true);
 });
+// Counts the user's focus moves: a focus change or a pointer press the runtime
+// did not cause itself. A key press is not a move: it is what sends the event.
+var __ipeFocusEpoch = 0;
+var __ipeRuntimeFocusing = false;
+// Runs `move` as the runtime's own focus move and returns its result. The flag
+// is restored, never cleared: a move nested in another keeps the outer one's.
+function __ipeAsRuntimeFocus(move) {
+  var was = __ipeRuntimeFocusing;
+  __ipeRuntimeFocusing = true;
+  try { return move(); } finally { __ipeRuntimeFocusing = was; }
+}
+["focusin", "pointerdown", "mousedown", "touchstart"].forEach(function(type) {
+  __ipeDoc.on(type, function() {
+    if (!__ipeRuntimeFocusing) __ipeFocusEpoch += 1;
+  }, true);
+});
+// The event kinds that are a deliberate act of the user: a key, a click, an
+// edit, a submit. A pointer crossing (`mouseover`, `mouseout`) is not one: a
+// render that shifts layout under a pointer at rest raises a trusted one. Nor
+// is a focus change (`focus`, `blur`): the runtime raises one when it puts
+// focus back.
+var __IPE_USER_ACTS = Object.freeze({
+  click: 1, dblclick: 1, input: 1, change: 1, submit: 1,
+  keydown: 1, keyup: 1, keypress: 1, mousedown: 1, mouseup: 1
+});
+// The focus epoch of the user act `ev` is, read as it arrives; undefined when
+// `ev` proves no act of the user's: an event the runtime or a render can
+// raise, an untrusted one, or one raised while the runtime moves focus (the
+// `change` a field commits as the runtime focuses another node), or an edit or
+// key an input method is still composing (moving focus would cut the
+// composition off). An event with no epoch keeps no record, so its render
+// moves no focus.
+function __ipeUserActEpoch(ev) {
+  if (!ev.isTrusted || __ipeRuntimeFocusing) return undefined;
+  if (ev.isComposing === true || ev.keyCode === 229) return undefined;
+  if (!Object.prototype.hasOwnProperty.call(__IPE_USER_ACTS, ev.type)) return undefined;
+  return __ipeFocusEpoch;
+}
+// The focus epoch of the user act behind each of this tab's recent events, by
+// the tab's own seq. The epoch is read at the act itself (the key, the click,
+// the file pick), never at the send: a file read, a resize or a debounce sends
+// later, after the user may have moved focus. A frame names the seq of the
+// event it answers, so the check binds to that event alone, never to acks or to
+// the other events in flight. An event no user act of this document raised (a
+// widget's emit, a page script's `__ipe_send`) keeps no record, so its render
+// moves no focus: the runtime cannot prove a user drove it. At the cap the
+// oldest record is dropped: a frame whose record is gone moves no focus.
+var __IPE_FOCUS_SENDS_MAX = 64;
+var __ipeFocusSends = [];
+function __ipeFocusSent(seq, actEpoch) {
+  if (typeof actEpoch !== "number") return;
+  if (__ipeFocusSends.length >= __IPE_FOCUS_SENDS_MAX) __ipeFocusSends.shift();
+  __ipeFocusSends.push({seq: seq, epoch: actEpoch});
+}
+// The focus epoch of the act behind the event at `seq`, taking its record out
+// (one event commits one render); null when this tab holds no record of it.
+function __ipeFocusTakeSent(seq) {
+  for (var i = 0; i < __ipeFocusSends.length; i++) {
+    if (__ipeFocusSends[i].seq === seq) return __ipeFocusSends.splice(i, 1)[0].epoch;
+  }
+  return null;
+}
+// A patches frame just applied as the next step moves focus onto the element
+// it names only when it answers a user act of this tab and focus has not moved
+// since that act. A target the frame's own patches removed, or one
+// that cannot take focus, leaves focus alone.
+function __ipeFocusAddressed(frame) {
+  if (!__ipeTabId || frame.tab !== __ipeTabId) return;
+  if (typeof frame.tabSeq !== "number") return;
+  var sentIn = __ipeFocusTakeSent(frame.tabSeq);
+  if (sentIn === null || sentIn !== __ipeFocusEpoch) return;
+  if (typeof frame.focus !== "string") return;
+  var el = null;
+  try { el = __ipeDoc.query("[ipe-id=" + __ipeCssString(frame.focus) + "]"); } catch (_) { return; }
+  if (el) __ipeNode.focus(el);
+}
 // The element the URL fragment names, resolved from the URL itself: `:target`
 // matches only once the browser has applied the fragment, which can follow the
 // first frame.
@@ -857,13 +1009,23 @@ function __ipeFragmentTarget() {
   try { return __ipeDoc.byId(decodeURIComponent(raw)); } catch (_) { return null; }
 }
 function __ipeAutofocusDue() {
-  return !__ipeMounted && !__ipeAutofocusSpent && !__ipeFragmentTarget();
+  return !__ipeMounted && __ipeLoadAutofocus !== null && !__ipeAutofocusSpent &&
+      !__ipeFragmentTarget();
 }
-function __ipeFocusAutofocus(root) {
+// Focuses `el`, the mount's copy of the load's autofocus element, once the
+// swap has landed below `root`. A live field the swap spliced in its place is
+// found by its `ipe-id`; an element that did not land takes no focus.
+function __ipeFocusAutofocus(root, el) {
   var now = __ipeDoc.active();
   if (__ipeAutofocusSpent || (now && now !== __ipeDoc.body())) return;
-  var el = __ipeNode.firstAutofocus(root);
-  if (el) __ipeNode.focus(el);
+  if (!__ipeNode.contains(root, el)) {
+    var id = __ipeNode.attr(el, "ipe-id");
+    el = null;
+    if (id !== null) {
+      try { el = __ipeDoc.query("[ipe-id=" + __ipeCssString(id) + "]"); } catch (_) { el = null; }
+    }
+  }
+  if (el && __ipeNode.contains(root, el)) __ipeNode.focus(el);
 }
 
 // __ipeCopyAttrsExceptAuthority — mirror attrs from src onto dst,
@@ -905,13 +1067,21 @@ function __ipePatch(t, mode) {
   // A full page (an ipe-nav or popstate fetch) contributes only its
   // `#ipe-root` contents: its head, boot block and scripts never enter the
   // live root, where script revival would run a second client.
-  var parsed = __ipeShellRoot(__ipeParseFor(root, t), t);
+  var stripped = [];
+  var parsed = __ipeShellRoot(__ipeParseFor(root, t, stripped), t);
+  var loadTarget = null;
+  for (var i = 0; i < stripped.length && loadTarget === null; i++) {
+    if (__ipeNode.contains(parsed, stripped[i]) &&
+        __ipeNode.attr(stripped[i], "ipe-id") === __ipeLoadAutofocus) {
+      loadTarget = stripped[i];
+    }
+  }
   var scrollX = window.scrollX, scrollY = window.scrollY;
   // Read before the swap: a fragment target the swap replaces stops matching.
   var autofocus = __ipeAutofocusDue();
   __ipeMounted = true;
   __ipeSwapPreservingFocus(root, parsed);
-  if (autofocus) __ipeFocusAutofocus(root);
+  if (autofocus && loadTarget !== null) __ipeFocusAutofocus(root, loadTarget);
   // behavior:"instant" keeps this housekeeping scroll a synchronous jump
   // even under a global `scroll-behavior: smooth`, which would otherwise
   // animate every restore and fight the caret on per-keystroke re-renders.
@@ -1077,14 +1247,15 @@ function __ipeLoaderEnd() {
 // ── Debounce ─────────────────────────────────────────────────
 var __ipeInputTimers = {};
 var __ipeInputPending = {};
-// `epoch` is the render epoch read with `hid` at the keystroke.
-function __ipeDebouncedSend(msgName, args, hid, delay, epoch) {
+// `epoch` is the render epoch read with `hid` at the keystroke, and `focus` the
+// focus epoch read at that keystroke.
+function __ipeDebouncedSend(msgName, args, hid, delay, epoch, focus) {
   var key = hid || msgName;
   clearTimeout(__ipeInputTimers[key]);
-  __ipeInputPending[key] = { msgName: msgName, args: args, hid: hid, epoch: epoch };
+  __ipeInputPending[key] = { msgName: msgName, args: args, hid: hid, epoch: epoch, focus: focus };
   __ipeInputTimers[key] = setTimeout(function() {
     delete __ipeInputPending[key];
-    __ipeSend(msgName, args, hid, { noLoader: true, epoch: epoch });
+    __ipeSend(msgName, args, hid, { noLoader: true, epoch: epoch, focus: focus });
   }, delay);
 }
 // Flush pending debounced input on blur (tab away / click elsewhere).
@@ -1100,7 +1271,7 @@ __ipeDoc.on("focusout", function(ev) {
     clearTimeout(__ipeInputTimers[key]);
     var p = __ipeInputPending[key];
     delete __ipeInputPending[key];
-    __ipeSend(p.msgName, p.args, p.hid, { noLoader: true, epoch: p.epoch });
+    __ipeSend(p.msgName, p.args, p.hid, { noLoader: true, epoch: p.epoch, focus: p.focus });
   }
 }, true);
 
@@ -1186,6 +1357,8 @@ function __ipeFlushPendingBeacon() {
 // transitions where sendBeacon is overkill. Calls __ipeSend for
 // each pending entry; the fetch requests are fire-and-forget and
 // the browser keeps them alive across same-origin navigation.
+// A flushed entry keeps no focus record: the link activation that flushes it
+// is a later act than its keystroke.
 function __ipeFlushPendingSync() {
   var batch = __ipeCollectPendingBatch();
   if (!batch) return;
@@ -1231,6 +1404,8 @@ window.addEventListener("pagehide", __ipeFlushPendingBeacon);
 //     the inputState snapshot that produced them; with tab it marks a
 //     re-delivered event as a duplicate.
 //   * epoch names the render handlerId was read from.
+//   * opts.focus (client-only, never posted) is the focus epoch read at the
+//     user act that raised the event; without it the event records no focus.
 //   * inputState carries the user's current DOM values for every
 //     dirty input so the server's diff can align against reality
 //     before emitting patches.
@@ -1263,6 +1438,7 @@ function __ipeSend(msgName, args, handlerId, opts) {
   if (epoch) body.epoch = epoch;
   if (__ipeTabId) body.tab = __ipeTabId;
   if (snapshot) body.inputState = snapshot;
+  __ipeFocusSent(mySeq, opts.focus);
   __ipePostEvent(body);
 }
 
@@ -1542,6 +1718,11 @@ function __ipeApplyPatches(patches) {
       var valueChanged = false;
       for (var j = 0; j < keys.length; j++) {
         var k = keys[j], v = p.attrs[k];
+        // No `autofocus` reaches a live node: a later move would focus it.
+        if (String(k).toLowerCase() === "autofocus") {
+          __ipeNode.removeAttr(el, k);
+          continue;
+        }
         // Authority filter: the user is currently editing this
         // field, so the server's proposed value/checked/selected
         // would stomp in-flight keystrokes. Drop them and let the
@@ -1611,12 +1792,14 @@ function __ipeEscapeHTML(s) {
 // Walks the DOM for ipe-<event> attributes and binds a native listener
 // that extracts args and dispatches through the TEA update cycle.
 // Re-run after every DOM patch because new ipe-* attrs may have appeared.
+// The events a node binds through an `ipe-<event>` attribute; the user acts
+// (`__IPE_USER_ACTS`) are a subset of them.
+var __IPE_BOUND_EVENTS = ["click", "dblclick", "input", "change", "submit", "focus", "blur",
+                          "keydown", "keyup", "keypress", "mouseover", "mouseout",
+                          "mousedown", "mouseup"];
 function __ipeBindEvents() {
-  var events = ["click", "dblclick", "input", "change", "submit", "focus", "blur",
-                "keydown", "keyup", "keypress", "mouseover", "mouseout",
-                "mousedown", "mouseup"];
-  for (var i = 0; i < events.length; i++) {
-    __ipeBindOne(events[i]);
+  for (var i = 0; i < __IPE_BOUND_EVENTS.length; i++) {
+    __ipeBindOne(__IPE_BOUND_EVENTS[i]);
   }
 }
 
@@ -1664,6 +1847,7 @@ function __ipeBindOne(eventName) {
       var msgName = __ipeNode.attr(target, "ipe-" + ev.type);
       var hid     = __ipeNode.attr(target, "data-ipe-hid");
       var epoch   = __ipeEpoch;
+      var focus   = __ipeUserActEpoch(ev);
       if (!msgName && !hid) return;
       var args = __ipeExtractArgs(ev);
       if (ev.type === "input") {
@@ -1675,10 +1859,10 @@ function __ipeBindOne(eventName) {
           var e = __ipeInputEntry(sid);
           e.liveValue = args && args.length > 0 ? String(args[0]) : "";
         }
-        __ipeDebouncedSend(msgName, args, hid, 150, epoch);
+        __ipeDebouncedSend(msgName, args, hid, 150, epoch, focus);
         return;
       }
-      __ipeSend(msgName, args, hid, { epoch: epoch });
+      __ipeSend(msgName, args, hid, { epoch: epoch, focus: focus });
     });
   }
 }
@@ -1768,8 +1952,10 @@ __ipeDoc.on("change", function(ev) {
   var fileEv  = el.getAttribute("data-ipe-ev-ipe-file");
   var imageEv = el.getAttribute("data-ipe-ev-ipe-image");
   var hid     = el.getAttribute("data-ipe-hid");
-  // Read with the id, before the asynchronous read below.
+  // Read with the id and at the pick, before the asynchronous read below: the
+  // user may move focus while the file is read.
   var epoch   = __ipeEpoch;
+  var focus   = __ipeUserActEpoch(ev);
   var f = el.files && el.files[0];
   if (!f) return;
   // Client-side size guard via fileMaxSize. Saves the round-trip when
@@ -1794,7 +1980,9 @@ __ipeDoc.on("change", function(ev) {
     // []json.RawMessage); a bare string would unmarshal-fail. Wrap
     // the data URL in a single-element array — the Ipe-side Msg
     // constructor declared as 'String -> Msg' reads args[0].
-    r.onload = function(e) { __ipeSend(fileEv, [e.target.result], hid, { epoch: epoch }); };
+    r.onload = function(e) {
+      __ipeSend(fileEv, [e.target.result], hid, { epoch: epoch, focus: focus });
+    };
     r.readAsDataURL(f);
   }
   if (imageEv) {
@@ -1802,7 +1990,7 @@ __ipeDoc.on("change", function(ev) {
     var maxH = parseInt(el.getAttribute("data-ipe-ev-ipe-file-max-height") || "1200");
     __ipeResizeImage(f, maxW, maxH, function(dataUrl) {
       // Same wire-format reason as the onFile branch — wrap in array.
-      __ipeSend(imageEv, [dataUrl], hid, { epoch: epoch });
+      __ipeSend(imageEv, [dataUrl], hid, { epoch: epoch, focus: focus });
     });
   }
 });
@@ -1829,7 +2017,8 @@ function __ipeResizeImage(file, maxW, maxH, cb) {
 // registered handler by id, so the id maps to __ipeSend's handlerId slot
 // (not msgName) and value maps to args.
 // The caller reads no id from the DOM, so the event carries the epoch current
-// at the call.
+// at the call. A page script may call it with no user act, so its event keeps
+// no focus record and its render moves no focus.
 window.__ipe_send = function(id, value, opts) {
   __ipeSend("", value, id, { noLoader: !!(opts && opts.noLoader), epoch: __ipeEpoch });
 };
@@ -2574,7 +2763,7 @@ var __ipeLiveFrames = {
       return;
     }
     __ipeHandleResponse(frame.seq, relayed ? null : frame.ackInputs, function() {
-      __ipeAdoptPatches(frame.from, frame.to, frame.patches);
+      if (__ipeAdoptPatches(frame.from, frame.to, frame.patches)) __ipeFocusAddressed(frame);
     }, frame.globalSeq);
   },
   // Dev-watch blue-green cutover cue. The watch server sends this right after
