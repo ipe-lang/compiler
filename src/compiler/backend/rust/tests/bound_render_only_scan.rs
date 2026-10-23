@@ -335,11 +335,9 @@ fn a_use_into_bound_set_is_refused() {
 #[test]
 fn a_builder_inside_a_macro_is_refused() {
     assert!(refused(
-        "fn f(b: BoundSet) -> String { format!(\"{:?}\", b.with_static()) }"
+        "fn f(b: BoundSet) -> Vec<BoundSet> { vec![b.with_static()] }"
     ));
-    assert!(refused(
-        "fn f() -> String { format!(\"{:?}\", BoundSet::SEND) }"
-    ));
+    assert!(refused("fn f() -> Vec<BoundSet> { vec![BoundSet::SEND] }"));
 }
 
 #[test]
