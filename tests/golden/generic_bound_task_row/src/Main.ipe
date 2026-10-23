@@ -1,0 +1,35 @@
+module Main exposing (main)
+
+-- SEAL repro: a pure function forwarding a row-polymorphic record into a
+-- `Task`-returning callee. `greet` moves its record into a boxed `Send`
+-- continuation, so its row variable needs `Send + 'static`; `greetings`
+-- forwards its own row variable into `greet` and must carry the bound, or the
+-- emitted crate is ipe-accepted but fails `cargo build` with E0277.
+--
+-- Output: the greetings for two records of different shapes.
+
+import Ipe.Error exposing (Error)
+import Ipe.Io as Io
+import Ipe.String as String
+import Ipe.Task as Task exposing (Task)
+
+
+greet : { r | name : String } -> Task Error String
+greet rec =
+    Task.succeed "hi"
+        |> Task.andThen (\hi -> Task.succeed (hi ++ " " ++ rec.name))
+
+
+greetings : { r | name : String } -> List (Task Error String)
+greetings rec =
+    [ greet rec, greet rec ]
+
+
+main : Task Error ()
+main =
+    Task.sequence (greetings { name = "Ada" })
+        |> Task.andThen
+            (\ada ->
+                Task.sequence (greetings { name = "Bo", age = 3 })
+                    |> Task.andThen (\bo -> Io.println (String.join "," ada ++ "\n" ++ String.join "," bo))
+            )

@@ -21,6 +21,18 @@ mod golden_cross_module_chained_msg_slot_seal;
 mod golden_declared_any_param_seal;
 #[path = "g_issues/golden_embed_fn_param_capture_seal.rs"]
 mod golden_embed_fn_param_capture_seal;
+#[path = "g_issues/golden_generic_bound_cross_module.rs"]
+mod golden_generic_bound_cross_module;
+#[path = "g_issues/golden_generic_bound_fn_param_forwarding.rs"]
+mod golden_generic_bound_fn_param_forwarding;
+#[path = "g_issues/golden_generic_bound_mutual_recursion.rs"]
+mod golden_generic_bound_mutual_recursion;
+#[path = "g_issues/golden_generic_bound_task_row.rs"]
+mod golden_generic_bound_task_row;
+#[path = "g_issues/golden_generic_bound_transitive_chain.rs"]
+mod golden_generic_bound_transitive_chain;
+#[path = "g_issues/golden_generic_bound_ui_msg.rs"]
+mod golden_generic_bound_ui_msg;
 #[path = "g_issues/golden_generic_carrier_send_seal.rs"]
 mod golden_generic_carrier_send_seal;
 #[path = "g_issues/golden_generic_msg_forward_sync_seal.rs"]
