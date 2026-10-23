@@ -1,0 +1,142 @@
+module Main exposing (main)
+
+-- SEAL repro: a function forwarding its generics into a helper whose
+-- generics sit under a callback parameter. `onCard` takes `card -> KeyAction
+-- card panel`, so its `card` and `panel` need `Send + 'static`; `cardKey`
+-- passes its own `card` (and returns its own `panel`) straight through, and
+-- `keyAction` does the same into `cardKey` and `panelKey`. Every caller's
+-- generic clause must carry the callee's bounds, or the emitted crate is
+-- ipe-accepted but fails `cargo build` with E0277.
+--
+-- Output: one line per key, at two instantiations of `card` and `panel`.
+
+import Ipe.Error exposing (Error)
+import Ipe.Io as Io
+import Ipe.List as List
+import Ipe.String as String
+import Ipe.Task as Task exposing (Task)
+
+
+type KeyMode card panel
+    = InPanel (Maybe panel)
+    | OnCards (Maybe card) Int
+    | Dormant
+
+
+type KeyAction card panel
+    = ApproveSelected card
+    | RefuseSelected card
+    | Select Int
+    | ConfirmRefuse panel
+    | CancelRefuse panel
+    | Ignore
+
+
+keyAction : KeyMode card panel -> String -> KeyAction card panel
+keyAction mode key =
+    case mode of
+        InPanel drawn ->
+            panelKey drawn key
+
+        OnCards card at ->
+            cardKey card at key
+
+        Dormant ->
+            Ignore
+
+
+panelKey : Maybe panel -> String -> KeyAction card panel
+panelKey drawn key =
+    case drawn of
+        Just row ->
+            case key of
+                "Enter" ->
+                    ConfirmRefuse row
+
+                "Escape" ->
+                    CancelRefuse row
+
+                _ ->
+                    Ignore
+
+        Nothing ->
+            Ignore
+
+
+cardKey : Maybe card -> Int -> String -> KeyAction card panel
+cardKey card at key =
+    case key of
+        "a" ->
+            onCard ApproveSelected card
+
+        "r" ->
+            onCard RefuseSelected card
+
+        "j" ->
+            Select (at + 1)
+
+        _ ->
+            Ignore
+
+
+onCard : (card -> KeyAction card panel) -> Maybe card -> KeyAction card panel
+onCard act card =
+    case card of
+        Just drawn ->
+            act drawn
+
+        Nothing ->
+            Ignore
+
+
+describe : (card -> String) -> (panel -> String) -> KeyAction card panel -> String
+describe showCard showPanel action =
+    case action of
+        ApproveSelected c ->
+            "approve " ++ showCard c
+
+        RefuseSelected c ->
+            "refuse " ++ showCard c
+
+        Select i ->
+            "select " ++ String.fromInt i
+
+        ConfirmRefuse p ->
+            "confirm " ++ showPanel p
+
+        CancelRefuse p ->
+            "cancel " ++ showPanel p
+
+        Ignore ->
+            "ignore"
+
+
+showTitle : { title : String } -> String
+showTitle card =
+    card.title
+
+
+showText : String -> String
+showText text =
+    text
+
+
+showInts : List Int -> String
+showInts xs =
+    String.join "," (List.map String.fromInt xs)
+
+
+main : Task Error ()
+main =
+    Io.println
+        (String.join "\n"
+            [ describe showTitle showText (keyAction (OnCards (Just { title = "first" }) 0) "a")
+            , describe showTitle showText (keyAction (OnCards (Just { title = "second" }) 0) "r")
+            , describe showTitle showText (keyAction (InPanel (Just "why")) "Enter")
+            , describe showInts String.fromInt (keyAction (OnCards (Just [ 1, 2 ]) 0) "a")
+            , describe showInts String.fromInt (keyAction (InPanel (Just 3)) "Escape")
+            , describe showInts String.fromInt (keyAction (OnCards (Just [ 1 ]) 4) "j")
+            , describe showInts String.fromInt (keyAction (OnCards Nothing 0) "a")
+            , describe showTitle showText (keyAction Dormant "a")
+            ]
+        )

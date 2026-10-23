@@ -1,0 +1,44 @@
+module Main exposing (main)
+
+-- SEAL repro: a forwarder into a helper bounded only by its UI message.
+-- `badge` returns `Html.Html msg`, whose message needs `'static`; `label`
+-- passes its own `msg` into `badge` and must carry the bound, or the emitted
+-- crate is ipe-accepted but fails `cargo build` with E0310.
+--
+-- Output: one rendering per message.
+
+import Ipe.Error exposing (Error)
+import Ipe.Html as Html
+import Ipe.Io as Io
+import Ipe.String as String
+import Ipe.Task as Task exposing (Task)
+
+
+type Msg
+    = Click
+    | Close
+
+
+badge : Maybe msg -> Html.Html msg
+badge m =
+    case m of
+        Just _ ->
+            Html.text "some"
+
+        Nothing ->
+            Html.text "none"
+
+
+label : Maybe msg -> String
+label m =
+    Html.render (badge m)
+
+
+main : Task Error ()
+main =
+    Io.println
+        (String.join "\n"
+            [ label (Just Click)
+            , label (Just Close)
+            ]
+        )

@@ -1,0 +1,41 @@
+module Main exposing (main)
+
+-- SEAL repro: a forwarder in one module calling a callback-taking helper in
+-- another. `Lib.pick`'s `item` needs `Send + 'static`; `firstOf` forwards its
+-- own `item` into it, so `firstOf`'s clause must carry the bound across the
+-- module boundary, or the emitted crate is ipe-accepted but fails
+-- `cargo build` with E0277.
+--
+-- Output: one line per instantiation of `item`.
+
+import Ipe.Error exposing (Error)
+import Ipe.Io as Io
+import Ipe.String as String
+import Ipe.Task as Task exposing (Task)
+import Lib exposing (Choice(..), pick)
+
+
+firstOf : Maybe item -> Choice item
+firstOf found =
+    pick Picked found
+
+
+show : (item -> String) -> Choice item -> String
+show render choice =
+    case choice of
+        Picked it ->
+            "picked " ++ render it
+
+        Skipped ->
+            "skipped"
+
+
+main : Task Error ()
+main =
+    Io.println
+        (String.join "\n"
+            [ show String.fromInt (firstOf (Just 7))
+            , show (\s -> s) (firstOf (Just "seven"))
+            , show String.fromInt (firstOf Nothing)
+            ]
+        )
