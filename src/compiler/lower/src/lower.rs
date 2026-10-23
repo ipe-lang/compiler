@@ -19367,11 +19367,32 @@ impl<'a> Lowerer<'a> {
         name: Symbol,
         args: &'args [A],
     ) -> DResult<impl Iterator<Item = &'args A>> {
-        Ok(args
-            .iter()
-            .zip(self.type_arg_fates(home, name, args.len())?)
+        Ok(self
+            .fated_type_args(home, name, args)?
             .filter(|(_, fate)| *fate == TypeArgFate::Kept)
             .map(|(a, _)| a))
+    }
+
+    /// Each argument of an application of program union `(home, name)`
+    /// paired with its [`Self::type_arg_fates`] fate, in order.
+    ///
+    /// The one pairing both [`Self::emitted_type_args`] (what lowering
+    /// emits) and [`Self::unused_enum_parameter_vars`] (where an argument
+    /// variable is erased) read, so the two cannot take different paths
+    /// through the same application.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::type_arg_fates`].
+    fn fated_type_args<'args, A>(
+        &self,
+        home: &[Symbol],
+        name: Symbol,
+        args: &'args [A],
+    ) -> DResult<impl Iterator<Item = (&'args A, TypeArgFate)>> {
+        Ok(args
+            .iter()
+            .zip(self.type_arg_fates(home, name, args.len())?))
     }
 
     /// What lowering does with each of the `len` type arguments of an
@@ -19426,9 +19447,20 @@ impl<'a> Lowerer<'a> {
     /// The type variables, as raws, an argument of the declared type
     /// `declared` names inside a program enum argument lowering erases as an
     /// unused parameter ([`TypeArgFate::UnusedEnumParameter`]), on the same
-    /// spine [`argument_vars`] reads. A union of a builtin's name is left out:
-    /// only a distinct program union ([`Self::is_distinct_program_union`])
-    /// lowers through [`Self::type_arg_fates`] ahead of every other arm.
+    /// spine [`argument_vars`] reads.
+    ///
+    /// The walk follows only the positions lowering emits, through the
+    /// same [`Self::fated_type_args`] decision: a distinct program union
+    /// ([`Self::is_distinct_program_union`], lowered ahead of every other
+    /// arm) is entered at its kept arguments and marks its unused-parameter
+    /// arguments erased, while an opaque-carrier argument (`Cond` row,
+    /// `Cache k v`) and every argument of any other head (a builtin, whose
+    /// lowering may drop it, as `Connection` and `Setting` do) is never
+    /// entered. A union nested only under such a dropped position is pruned,
+    /// never emitted, so a variable there is not erased by an unused
+    /// parameter. Below an erased argument every variable is erased with it.
+    /// An unentered position classes its variables
+    /// [`ArgumentErasure::Other`], the conservative answer.
     fn unused_enum_parameter_vars(&self, declared: &Ty) -> BTreeSet<u32> {
         let mut vars = BTreeSet::new();
         let mut stack: Vec<(&Ty, bool)> = Vec::new();
@@ -19448,20 +19480,23 @@ impl<'a> Lowerer<'a> {
                     stack.push((a, unused));
                     stack.push((b, unused));
                 }
+                Ty::Con { args, .. } if unused => {
+                    stack.extend(args.iter().map(|a| (a, true)));
+                }
                 Ty::Con { module, name, args } => {
-                    let fates: Vec<TypeArgFate> = if self.is_distinct_program_union(module, *name) {
-                        // A miscounted application is refused where the
-                        // signature lowers; here it holds no erased argument.
-                        self.type_arg_fates(module, *name, args.len())
-                            .map(Iterator::collect)
-                            .unwrap_or_default()
-                    } else {
-                        Vec::new()
-                    };
-                    for (position, arg) in args.iter().enumerate() {
-                        let erased = fates.get(position) == Some(&TypeArgFate::UnusedEnumParameter);
-                        stack.push((arg, unused || erased));
+                    if !self.is_distinct_program_union(module, *name) {
+                        continue;
                     }
+                    // A miscounted application is refused where the
+                    // signature lowers; here it is not entered.
+                    let Ok(fated) = self.fated_type_args(module, *name, args) else {
+                        continue;
+                    };
+                    stack.extend(fated.filter_map(|(arg, fate)| match fate {
+                        TypeArgFate::Kept => Some((arg, false)),
+                        TypeArgFate::UnusedEnumParameter => Some((arg, true)),
+                        TypeArgFate::OpaqueCarrier => None,
+                    }));
                 }
                 Ty::Tuple(args) => stack.extend(args.iter().map(|a| (a, unused))),
                 Ty::Record(fields, _) => stack.extend(fields.values().map(|f| (f, unused))),
@@ -35334,6 +35369,112 @@ mod tests {
             .emitted_type_args(&home, cache, &[1u8, 2u8][..])
             .map(|args| args.copied().collect::<Vec<u8>>());
         assert_eq!(kept, Ok(vec![]));
+    }
+
+    /// A variable is erased by an unused enum parameter only where lowering
+    /// emits that enum: under a direct `Tag a` it is, but under the dropped
+    /// argument of an opaque carrier (`Cond (Tag a)`) or of a builtin head
+    /// (`Connection (Tag a)`) the union is pruned, so it is not.
+    #[test]
+    fn an_unused_enum_parameter_under_a_dropped_argument_erases_no_variable() {
+        let mut interner = Interner::new();
+        let builtins = build_test_builtin_ctors(&mut interner);
+        let (main, tag, pa, ipe, db, store, cond, compare, connection, list) = (
+            interner.intern("Main").unwrap(),
+            interner.intern("Tag").unwrap(),
+            interner.intern("a").unwrap(),
+            interner.intern("Ipe").unwrap(),
+            interner.intern("Db").unwrap(),
+            interner.intern("Store").unwrap(),
+            interner.intern("Cond").unwrap(),
+            interner.intern("Compare").unwrap(),
+            interner.intern("Connection").unwrap(),
+            interner.intern("List").unwrap(),
+        );
+        let module = canon::Module {
+            imports_unsafe_submodule: false,
+            imported_web_capabilities: BTreeSet::new(),
+            name: vec![],
+            unions: vec![],
+            defs: vec![],
+        };
+        let types = empty_solved_types();
+        let mut lowerer = Lowerer::new(
+            &module,
+            &types,
+            &interner,
+            SymbolPools {
+                eta_params: vec![],
+                cap_params: vec![],
+                param_binders: vec![],
+                any_param_binders: vec![],
+                projection_decode_binders: vec![],
+                destructure_thunk_binders: vec![],
+                nested_cons_binders: vec![],
+                nested_strlit_binders: vec![],
+                tuple_elem_binders: vec![],
+                wildcard_marker: super::WildcardMarker(ipe_intern::Symbol::from_raw(u32::MAX)),
+            },
+            &builtins,
+            "",
+            "",
+        );
+        let store_home = vec![ipe, db, store];
+        let phantom_tag = ipe_ir::EnumDef {
+            name: tag,
+            home: ipe_ir::ModPath(vec![main]),
+            type_params: vec![pa],
+            variants: vec![ipe_ir::Variant {
+                name: tag,
+                fields: vec![],
+            }],
+        };
+        let row_cond = ipe_ir::EnumDef {
+            name: cond,
+            home: ipe_ir::ModPath(store_home.clone()),
+            type_params: vec![],
+            variants: vec![ipe_ir::Variant {
+                name: compare,
+                fields: vec![ipe_ir::IrType::Int],
+            }],
+        };
+        lowerer.enum_param_use = ipe_ir::EnumParamUse::of([&phantom_tag, &row_cond]);
+        lowerer
+            .enum_variants
+            .insert((ipe_ir::ModPath(vec![main]), tag), vec![tag]);
+        lowerer
+            .enum_variants
+            .insert((ipe_ir::ModPath(store_home.clone()), cond), vec![compare]);
+        assert!(lowerer.is_distinct_program_union(&store_home, cond));
+        let var = 7;
+        let tag_a = Ty::Con {
+            module: vec![main],
+            name: tag,
+            args: vec![Ty::Var(var)],
+        };
+        let applied = |module: Vec<ipe_intern::Symbol>, name| Ty::Con {
+            module,
+            name,
+            args: vec![tag_a.clone()],
+        };
+        let rows = Ty::Con {
+            module: vec![],
+            name: list,
+            args: vec![Ty::Var(var)],
+        };
+        let arrow = |param: Ty| Ty::Fun(Box::new(param), Box::new(rows.clone()));
+        assert_eq!(
+            lowerer.unused_enum_parameter_vars(&arrow(tag_a.clone())),
+            BTreeSet::from([var])
+        );
+        assert_eq!(
+            lowerer.unused_enum_parameter_vars(&arrow(applied(store_home, cond))),
+            BTreeSet::new()
+        );
+        assert_eq!(
+            lowerer.unused_enum_parameter_vars(&arrow(applied(vec![], connection))),
+            BTreeSet::new()
+        );
     }
 
     /// A nullary built-in `Ty::Con` named `name`.
