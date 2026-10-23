@@ -908,6 +908,14 @@ fn lower_prose(msg: &LowerError) -> String {
                  signature."
             )
         }
+        LowerError::MixedMessageParameter { callee, var } => {
+            format!(
+                "This call leaves the type variable `{var}` of `{callee}` open, and \
+                 `{callee}` uses `{var}` both as a UI message parameter and elsewhere, \
+                 so the two uses would get different types. Annotate the call's result \
+                 with a concrete message type."
+            )
+        }
         LowerError::StoreSelectProjectionInvalid(defect) => match defect {
             StoreSelectProjectionDefect::NotAProjectionLambda => {
                 "A `Store.select` projection must be `\\( left, right ) -> \
@@ -2179,6 +2187,12 @@ fn lower_label(msg: &LowerError) -> String {
             format!(
                 "`{helper}` has no signature, so it cannot be generic over `{owner}`'s \
                  type variable `{var}` — annotate `{helper}` with its own type"
+            )
+        }
+        LowerError::MixedMessageParameter { callee, var } => {
+            format!(
+                "`{var}` is open here, but `{callee}` uses it both as a UI message \
+                 parameter and elsewhere — annotate the result with a concrete type"
             )
         }
     }

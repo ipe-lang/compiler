@@ -13709,6 +13709,25 @@ enum VarOwner {
     Unowned,
 }
 
+/// How the lowerer reads a type variable at the current def and read site
+/// ([`Lowerer::owned_var_read`]).
+enum OwnedVarRead {
+    /// A generic the current def's signature erased, read by its [`ErasedTvar`].
+    Erased(ErasedTvar),
+    /// The current def's own generic.
+    Generic(Symbol),
+    /// Another binding's generic read in the current def's signature: refused.
+    Foreign {
+        /// The binding that keeps the variable generic.
+        owner: (Vec<Symbol>, Symbol),
+        /// The owner's name for the variable.
+        sym: Symbol,
+    },
+    /// Free here: each position reads it its own way (`()` in a UI message
+    /// slot, `JsonVal` on the JSON path, a refusal on the strict path).
+    Lenient,
+}
+
 /// Whether the annotation `ty`, past `params` parameter arrows, is the wildcard `any`.
 fn canon_returns_wildcard(ty: &canon::Type, params: usize) -> bool {
     let mut cur = ty;
@@ -21097,20 +21116,35 @@ impl<'a> Lowerer<'a> {
         span: Span,
         lenient: impl FnOnce() -> DResult<IrType>,
     ) -> DResult<IrType> {
-        let erased = ipe_types::SolverVar::from_raw(raw)
-            .and_then(|var| self.current_erased_tvars.borrow().get(&var).copied());
-        match erased {
-            Some(ErasedTvar::Unit) => return Ok(IrType::Unit),
-            Some(ErasedTvar::Bounded) => return Err(unsupported(span, Feature::Polymorphism)),
-            None => {}
-        }
-        match (self.var_owner(raw), self.read_site.get()) {
-            (VarOwner::Here(sym), ReadSite::Signature | ReadSite::Body) => Ok(IrType::Generic(sym)),
-            (VarOwner::Elsewhere { owner, sym }, ReadSite::Signature) => {
+        match self.owned_var_read(raw) {
+            OwnedVarRead::Erased(ErasedTvar::Unit) => Ok(IrType::Unit),
+            OwnedVarRead::Erased(ErasedTvar::Bounded) => {
+                Err(unsupported(span, Feature::Polymorphism))
+            }
+            OwnedVarRead::Generic(sym) => Ok(IrType::Generic(sym)),
+            OwnedVarRead::Foreign { owner, sym } => {
                 Err(self.foreign_type_variable(&owner, sym, span))
             }
+            OwnedVarRead::Lenient => lenient(),
+        }
+    }
+
+    /// How [`Self::ir_type_from_owned_var`] reads the type variable `raw` here.
+    fn owned_var_read(&self, raw: u32) -> OwnedVarRead {
+        let erased = ipe_types::SolverVar::from_raw(raw)
+            .and_then(|var| self.current_erased_tvars.borrow().get(&var).copied());
+        if let Some(read) = erased {
+            return OwnedVarRead::Erased(read);
+        }
+        match (self.var_owner(raw), self.read_site.get()) {
+            (VarOwner::Here(sym), ReadSite::Signature | ReadSite::Body) => {
+                OwnedVarRead::Generic(sym)
+            }
+            (VarOwner::Elsewhere { owner, sym }, ReadSite::Signature) => {
+                OwnedVarRead::Foreign { owner, sym }
+            }
             (VarOwner::Elsewhere { .. }, ReadSite::Body)
-            | (VarOwner::Unowned, ReadSite::Signature | ReadSite::Body) => lenient(),
+            | (VarOwner::Unowned, ReadSite::Signature | ReadSite::Body) => OwnedVarRead::Lenient,
         }
     }
 
@@ -21159,6 +21193,11 @@ impl<'a> Lowerer<'a> {
                 // the builtin of its name lowers by its own identity first.
                 _ if self.is_distinct_program_union(module, *name) => {
                     self.program_enum_from_ty(module, *name, args, span)
+                }
+                // The Ipe.Ui / Ipe.Html message-parametric constructors, by the
+                // one slot table the use-pin classifier also reads.
+                _ if let Some((row, msg)) = self.ui_msg_slot(module, *name, args) => {
+                    self.ir_type_from_ui_slot(row, msg, module, args, span)
                 }
                 // The closed config-tag ADTs (`HostMode` / `LogLevel` / `CsrfMode` /
                 // `RevocationMode`) erase to the raw `Int` tag their constructor kernels
@@ -21440,245 +21479,6 @@ impl<'a> Lowerer<'a> {
                 // solved user `type WebSocketServerCfg = …` wins by its own identity.
                 "WebSocketServerCfg" if self.is_stream_ws_opaque_con(module, *name) => {
                     Ok(IrType::WebSocketServerCfg)
-                }
-                // ── Ipe.Ui / Ipe.Html parametric type constructors ────────
-                // Mirror of `ir_type_from_canon` (which handles user-written
-                // type ANNOTATIONS).  This path handles SOLVED types from the
-                // HM region map — `list_elem_ir` calls here when lowering a
-                // `List (Attribute msg)` region, among others.
-                //
-                // Key differences from `ir_type_from_canon`:
-                // 1. The msg arg is recursed through `ir_type_from_ty_ui_msg`
-                //    (free `Ty::Var` → `IrType::Unit`, not `Json`, not error).
-                // 2. `Attribute` is disambiguated by `Ty::Con.module` (T2 trap:
-                //    BOTH `Ipe.Ui.Attribute` and `Ipe.Html.Attribute` exist —
-                //    check the module path, never just the name).
-                // 3. Plain Ui types (`Length`, `Color`, …) are nullary — no msg.
-                // 4. `WebReq` maps to `IrType::WebReq` (opaque init arg).
-                "Html" if args.len() == 1 => {
-                    let msg = self.ir_type_from_ty_ui_msg(
-                        args.first().ok_or_else(|| {
-                            bug(
-                                "ipe_lower::ir_type_from_ty",
-                                "Html applied without its message type",
-                            )
-                        })?,
-                        span,
-                    )?;
-                    Ok(IrType::Ui {
-                        ctor: UiCtor::Html,
-                        msg: Box::new(msg),
-                    })
-                }
-                // `View engine msg` — the engine-tagged view carrier (twin of
-                // the `ir_type_from_canon` arm). The solved engine tag
-                // (`Ty::Con` `Web`/`Tui`/`Cli`) selects the per-engine
-                // `IrType::Ui` ctor and erases; the `msg` arg is threaded.
-                // Byte-identical IR to the per-engine alias.
-                "View" if args.len() == 2 => {
-                    let ctor = match args.first() {
-                        Some(Ty::Con { name: tag, .. }) => match self.resolve(*tag)? {
-                            "Web" => UiCtor::Element,
-                            "Tui" => UiCtor::Cells,
-                            "Cli" => UiCtor::CliLines,
-                            other => {
-                                return Err(bug(
-                                    "ipe_lower::ir_type_from_ty",
-                                    format!("View carrier with unknown engine tag `{other}`"),
-                                ));
-                            }
-                        },
-                        _ => {
-                            return Err(bug(
-                                "ipe_lower::ir_type_from_ty",
-                                "View carrier without a settled engine tag",
-                            ));
-                        }
-                    };
-                    let msg = self.ir_type_from_ty_ui_msg(
-                        args.get(1).ok_or_else(|| {
-                            bug(
-                                "ipe_lower::ir_type_from_ty",
-                                "View applied without its message type",
-                            )
-                        })?,
-                        span,
-                    )?;
-                    Ok(IrType::Ui {
-                        ctor,
-                        msg: Box::new(msg),
-                    })
-                }
-                "Element" if args.len() == 1 => {
-                    let msg = self.ir_type_from_ty_ui_msg(
-                        args.first().ok_or_else(|| {
-                            bug(
-                                "ipe_lower::ir_type_from_ty",
-                                "Element applied without its message type",
-                            )
-                        })?,
-                        span,
-                    )?;
-                    Ok(IrType::Ui {
-                        ctor: UiCtor::Element,
-                        msg: Box::new(msg),
-                    })
-                }
-                "Screen" if args.len() == 1 => {
-                    let msg = self.ir_type_from_ty_ui_msg(
-                        args.first().ok_or_else(|| {
-                            bug(
-                                "ipe_lower::ir_type_from_ty",
-                                "Screen applied without its message type",
-                            )
-                        })?,
-                        span,
-                    )?;
-                    Ok(IrType::Ui {
-                        ctor: UiCtor::Cells,
-                        msg: Box::new(msg),
-                    })
-                }
-                // `Ipe.Ui.Tui.Attribute msg` — the cell-native attribute type.
-                "TuiAttr" if args.len() == 1 => {
-                    let msg = self.ir_type_from_ty_ui_msg(
-                        args.first().ok_or_else(|| {
-                            bug(
-                                "ipe_lower::ir_type_from_ty",
-                                "TuiAttr applied without its message type",
-                            )
-                        })?,
-                        span,
-                    )?;
-                    Ok(IrType::Ui {
-                        ctor: UiCtor::TuiAttribute,
-                        msg: Box::new(msg),
-                    })
-                }
-                // `Lines msg` — the Cli line-oriented view type.
-                "Lines" if args.len() == 1 => {
-                    let msg = self.ir_type_from_ty_ui_msg(
-                        args.first().ok_or_else(|| {
-                            bug(
-                                "ipe_lower::ir_type_from_ty",
-                                "Lines applied without its message type",
-                            )
-                        })?,
-                        span,
-                    )?;
-                    Ok(IrType::Ui {
-                        ctor: UiCtor::CliLines,
-                        msg: Box::new(msg),
-                    })
-                }
-                // `Ipe.Ui.Cli.Attribute msg` — the line-native attribute type.
-                "CliAttr" if args.len() == 1 => {
-                    let msg = self.ir_type_from_ty_ui_msg(
-                        args.first().ok_or_else(|| {
-                            bug(
-                                "ipe_lower::ir_type_from_ty",
-                                "CliAttr applied without its message type",
-                            )
-                        })?,
-                        span,
-                    )?;
-                    Ok(IrType::Ui {
-                        ctor: UiCtor::CliAttribute,
-                        msg: Box::new(msg),
-                    })
-                }
-                // T2 trap: `Attribute` exists in BOTH `Ipe.Ui` and `Ipe.Html`.
-                // Disambiguate by `Ty::Con.module` — a module path containing
-                // "Html" identifies the `Ipe.Html.Attribute` form.
-                "Attribute" if args.len() == 1 => {
-                    let msg = self.ir_type_from_ty_ui_msg(
-                        args.first().ok_or_else(|| {
-                            bug(
-                                "ipe_lower::ir_type_from_ty",
-                                "Attribute applied without its message type",
-                            )
-                        })?,
-                        span,
-                    )?;
-                    // A module path containing "Html" (e.g. ["Std","Html"] or
-                    // ["Html"]) selects `HtmlAttribute`; everything else
-                    // (["Std","Ui"], ["Ui"], or empty for builtin-injected)
-                    // selects `UiAttribute`.  `any` short-circuits on first hit.
-                    let is_html = module.iter().any(|s| self.resolve(*s).ok() == Some("Html"));
-                    let ctor = if is_html {
-                        UiCtor::HtmlAttribute
-                    } else {
-                        UiCtor::UiAttribute
-                    };
-                    Ok(IrType::Ui {
-                        ctor,
-                        msg: Box::new(msg),
-                    })
-                }
-                "Event" if args.len() == 1 => {
-                    let msg = self.ir_type_from_ty_ui_msg(
-                        args.first().ok_or_else(|| {
-                            bug(
-                                "ipe_lower::ir_type_from_ty",
-                                "Event applied without its message type",
-                            )
-                        })?,
-                        span,
-                    )?;
-                    Ok(IrType::Ui {
-                        ctor: UiCtor::HtmlEvent,
-                        msg: Box::new(msg),
-                    })
-                }
-                // ── Ipe.Ui.Input parametric types ───────────────────────
-                // `Label msg` and `Placeholder msg` are kernel-reserved type
-                // names produced by `constrain`'s `label_t` / `placeholder_t`
-                // helper closures.  They are NOT user ADTs, so they precede the
-                // `enum_variants` guard below.
-                "Label" if args.len() == 1 => {
-                    let msg = self.ir_type_from_ty_ui_msg(
-                        args.first().ok_or_else(|| {
-                            bug(
-                                "ipe_lower::ir_type_from_ty",
-                                "Label applied without its message type",
-                            )
-                        })?,
-                        span,
-                    )?;
-                    Ok(IrType::Ui {
-                        ctor: UiCtor::Label,
-                        msg: Box::new(msg),
-                    })
-                }
-                "Placeholder" if args.len() == 1 => {
-                    let msg = self.ir_type_from_ty_ui_msg(
-                        args.first().ok_or_else(|| {
-                            bug(
-                                "ipe_lower::ir_type_from_ty",
-                                "Placeholder applied without its message type",
-                            )
-                        })?,
-                        span,
-                    )?;
-                    Ok(IrType::Ui {
-                        ctor: UiCtor::Placeholder,
-                        msg: Box::new(msg),
-                    })
-                }
-                "RadioOption" if args.len() == 1 => {
-                    let msg = self.ir_type_from_ty_ui_msg(
-                        args.first().ok_or_else(|| {
-                            bug(
-                                "ipe_lower::ir_type_from_ty",
-                                "RadioOption applied without its message type",
-                            )
-                        })?,
-                        span,
-                    )?;
-                    Ok(IrType::Ui {
-                        ctor: UiCtor::RadioOption,
-                        msg: Box::new(msg),
-                    })
                 }
                 // ── Program-defined enum guard (home-aware) ──────────────
                 // Checked BEFORE the bare-name Ipe.Ui / Ipe.Web opaque arms
@@ -22084,7 +21884,11 @@ impl<'a> Lowerer<'a> {
     /// is for `Value = any` kernel positions; this path is strictly for the
     /// `msg` slot of Ui parametric types.  Using Json here would emit
     /// `Html<JsonVal>` which conflicts with the typed callee's `Html<MainMsg>`.
-    fn ir_type_from_ty_ui_msg(&self, t: &Ty, span: Span) -> DResult<IrType> {
+    ///
+    /// The message argument is a [`ui_msg_slots::MsgArg`], which only the slot
+    /// table builds, so no position outside a table row reads this way.
+    fn ir_type_from_ty_ui_msg(&self, msg: ui_msg_slots::MsgArg<'_>, span: Span) -> DResult<IrType> {
+        let t = msg.ty();
         match t {
             // A type variable in msg position is either:
             //
@@ -24548,14 +24352,18 @@ impl<'a> Lowerer<'a> {
         }
     }
 
-    /// Whether `ty` names a variable [`Self::ty_is_unbound_free`] holds free
-    /// anywhere.
-    fn ty_mentions_unbound_free(&self, ty: &Ty) -> bool {
+    /// Whether `ty` names a variable each position reads its own way: one
+    /// [`Self::owned_var_read`] reads [`OwnedVarRead::Lenient`] (`()` in a UI
+    /// message slot, `JsonVal` elsewhere), or a wildcard. A variable erased to
+    /// `()`, a generic, or a refused one reads one way at every position.
+    fn ty_mentions_position_read_var(&self, ty: &Ty) -> bool {
+        let lenient = |raw: u32| matches!(self.owned_var_read(raw), OwnedVarRead::Lenient);
         let mut stack: Vec<&Ty> = vec![ty];
         while let Some(t) = stack.pop() {
             match t {
-                Ty::Var(_) | Ty::Wildcard => {
-                    if self.ty_is_unbound_free(t) {
+                Ty::Wildcard => return true,
+                Ty::Var(raw) => {
+                    if lenient(*raw) {
                         return true;
                     }
                 }
@@ -24566,7 +24374,7 @@ impl<'a> Lowerer<'a> {
                 Ty::Con { args, .. } | Ty::Tuple(args) => stack.extend(args),
                 Ty::Record(fields, tail) => {
                     if let RowTail::Open(raw) = tail
-                        && self.ty_is_unbound_free(&Ty::Var(*raw))
+                        && lenient(*raw)
                     {
                         return true;
                     }
@@ -24578,15 +24386,75 @@ impl<'a> Lowerer<'a> {
         false
     }
 
-    /// The UI message-slot argument index of the constructor `(module, name)`
-    /// applied to `arity` arguments, read as [`Self::ir_type_from_ty`] reads
-    /// it: a program union of the name lowers by its own identity first, so it
-    /// holds no slot.
-    fn ui_msg_slot_of(&self, module: &[Symbol], name: Symbol, arity: usize) -> Option<usize> {
+    /// The [`ui_msg_slots::UI_MSG_SLOTS`] row of the constructor
+    /// `(module, name)` applied to `args`, with its message argument: the one
+    /// lookup [`Self::ir_type_from_ty`] reads UI types by and the use-pin
+    /// classifier names slots by. A program union of the name lowers by its
+    /// own identity first, so it holds no slot.
+    fn ui_msg_slot<'t>(
+        &self,
+        module: &[Symbol],
+        name: Symbol,
+        args: &'t [Ty],
+    ) -> Option<(&'static ui_msg_slots::UiMsgSlot, ui_msg_slots::MsgArg<'t>)> {
         if self.is_distinct_program_union(module, name) {
             return None;
         }
-        ui_msg_slots::slot_of(self.interner.resolve(name)?, arity)
+        ui_msg_slots::lookup(self.interner.resolve(name)?, args)
+    }
+
+    /// Lower an application of the [`ui_msg_slots::UI_MSG_SLOTS`] row `row`:
+    /// the row selects the [`UiCtor`], and the message argument `msg` reads
+    /// through [`Self::ir_type_from_ty_ui_msg`] (a free variable there is
+    /// `()`, not `Json`, not a refusal).
+    fn ir_type_from_ui_slot(
+        &self,
+        row: &ui_msg_slots::UiMsgSlot,
+        msg: ui_msg_slots::MsgArg<'_>,
+        module: &[Symbol],
+        args: &[Ty],
+        span: Span,
+    ) -> DResult<IrType> {
+        let ctor = match row.ctor() {
+            ui_msg_slots::UiSlotCtor::Fixed(ctor) => ctor,
+            // `View engine msg`: the solved engine tag (`Web`/`Tui`/`Cli`)
+            // selects the per-engine ctor and erases (twin of the
+            // `ir_type_from_canon` arm), byte-identical IR to the alias.
+            ui_msg_slots::UiSlotCtor::ByEngineTag => match args.first() {
+                Some(Ty::Con { name: tag, .. }) => match self.resolve(*tag)? {
+                    "Web" => UiCtor::Element,
+                    "Tui" => UiCtor::Cells,
+                    "Cli" => UiCtor::CliLines,
+                    other => {
+                        return Err(bug(
+                            "ipe_lower::ir_type_from_ty",
+                            format!("View carrier with unknown engine tag `{other}`"),
+                        ));
+                    }
+                },
+                _ => {
+                    return Err(bug(
+                        "ipe_lower::ir_type_from_ty",
+                        "View carrier without a settled engine tag",
+                    ));
+                }
+            },
+            // `Attribute` exists in both `Ipe.Ui` and `Ipe.Html`: a module path
+            // containing `Html` selects `HtmlAttribute`, any other (`Ipe.Ui`,
+            // or empty for a builtin-injected type) `UiAttribute`.
+            ui_msg_slots::UiSlotCtor::ByAttributeHome => {
+                if module.iter().any(|s| self.resolve(*s).ok() == Some("Html")) {
+                    UiCtor::HtmlAttribute
+                } else {
+                    UiCtor::UiAttribute
+                }
+            }
+        };
+        let msg = self.ir_type_from_ty_ui_msg(msg, span)?;
+        Ok(IrType::Ui {
+            ctor,
+            msg: Box::new(msg),
+        })
     }
 
     /// The pin for a direct call of a user generic function `callee`, at any
@@ -24623,8 +24491,9 @@ impl<'a> Lowerer<'a> {
         let ui_msg_slots::UiSlotVars {
             only: msg_only,
             mixed,
-        } = ui_msg_slots::ui_slot_vars(declared, |module, name, arity| {
-            self.ui_msg_slot_of(module, name, arity)
+        } = ui_msg_slots::ui_slot_vars(declared, |module, name, args| {
+            self.ui_msg_slot(module, name, args)
+                .map(|(row, _)| row.slot())
         });
         let mut subst: BTreeMap<u32, Ty> = BTreeMap::new();
         match_signature_template(declared, inst, &mut subst, self.interner);
@@ -24651,8 +24520,16 @@ impl<'a> Lowerer<'a> {
             };
             // A free variable reads as `()` in a message slot and otherwise as
             // `JsonVal`: a parameter in both positions has no one reading.
-            let pin = if mixed.contains(raw) && self.ty_mentions_unbound_free(ty) {
-                UserPin::Unlowered(Box::new(unsupported(callee.span, Feature::Polymorphism)))
+            let pin = if mixed.contains(raw) && self.ty_mentions_position_read_var(ty) {
+                let text =
+                    |s: Symbol| -> Box<str> { self.interner.resolve(s).unwrap_or("_").into() };
+                UserPin::Unlowered(Box::new(Diagnostic::Lower {
+                    span: callee.span,
+                    msg: LowerError::MixedMessageParameter {
+                        callee: text(*name),
+                        var: text(sym),
+                    },
+                }))
             } else {
                 match self.ir_type_from_ty_json(ty, callee.span) {
                     Ok(lowered) => UserPin::Instance(lowered),
@@ -34508,7 +34385,9 @@ mod tests {
                     None,
                     "an untagged raw is an annotation symbol, never a variable key"
                 );
-                let msg_slot = lowerer.ir_type_from_ty_ui_msg(&Ty::Var(BARE_VAR), UNIT_SPAN);
+                let args = [Ty::Var(BARE_VAR)];
+                let (_, msg) = super::ui_msg_slots::lookup("Html", &args).unwrap();
+                let msg_slot = lowerer.ir_type_from_ty_ui_msg(msg, UNIT_SPAN);
                 assert!(
                     matches!(msg_slot, Ok(super::IrType::Unit)),
                     "a symbol raw in a msg slot stays message-free, got {msg_slot:?}"
@@ -34563,51 +34442,114 @@ mod tests {
     /// The span of the `render` reference whose use pin the slot tests read.
     const RENDER_CALL_SPAN: Span = Span::new(70, 76);
 
-    /// Every [`super::ui_msg_slots::UI_MSG_SLOTS`] entry names an argument
+    /// `name` applied to `arity` arguments: a free variable at `slot`, the
+    /// nullary `filler` everywhere else.
+    fn slot_probe(
+        name: ipe_intern::Symbol,
+        arity: usize,
+        slot: usize,
+        filler: ipe_intern::Symbol,
+    ) -> Ty {
+        Ty::Con {
+            module: vec![],
+            name,
+            args: (0..arity)
+                .map(|i| {
+                    if i == slot {
+                        Ty::Var(SLOT_FREE_VAR)
+                    } else {
+                        Ty::Con {
+                            module: vec![],
+                            name: filler,
+                            args: vec![],
+                        }
+                    }
+                })
+                .collect(),
+        }
+    }
+
+    /// Every [`super::ui_msg_slots::UI_MSG_SLOTS`] row names an argument
     /// [`Lowerer::ir_type_from_ty`] reads as a message slot: a free variable
-    /// there lowers to `()`, the reading the slot-only use pin renders.
+    /// there lowers to `()`, the reading the slot-only use pin renders, under
+    /// the ctor the row fixes.
     #[test]
     fn every_ui_msg_slot_is_read_as_a_message_slot() {
         let slots = super::ui_msg_slots::UI_MSG_SLOTS;
-        let mut names: Vec<&str> = slots.iter().map(|s| s.name).collect();
+        let mut names: Vec<&str> = slots
+            .iter()
+            .map(super::ui_msg_slots::UiMsgSlot::name)
+            .collect();
         names.push("Web");
         with_named_lowerer(&names, |lowerer, syms| {
             let web = *syms.last().unwrap();
-            for (entry, name) in slots.iter().zip(syms) {
-                let args = (0..entry.arity)
-                    .map(|i| {
-                        if i == entry.slot {
-                            Ty::Var(SLOT_FREE_VAR)
-                        } else {
-                            Ty::Con {
-                                module: vec![],
-                                name: web,
-                                args: vec![],
-                            }
-                        }
-                    })
-                    .collect();
-                let ty = Ty::Con {
-                    module: vec![],
-                    name: *name,
-                    args,
+            for (row, name) in slots.iter().zip(syms) {
+                let ty = slot_probe(*name, row.arity(), row.slot(), web);
+                let lowered = lowerer.ir_type_from_ty(&ty, UNIT_SPAN);
+                let ctor_agrees = |ctor: &super::UiCtor| match row.ctor() {
+                    super::ui_msg_slots::UiSlotCtor::Fixed(fixed) => *ctor == fixed,
+                    super::ui_msg_slots::UiSlotCtor::ByEngineTag => *ctor == super::UiCtor::Element,
+                    super::ui_msg_slots::UiSlotCtor::ByAttributeHome => {
+                        *ctor == super::UiCtor::UiAttribute
+                    }
                 };
+                assert!(
+                    matches!(&lowered, Ok(super::IrType::Ui { ctor, msg })
+                        if **msg == super::IrType::Unit && ctor_agrees(ctor)),
+                    "`{}` slot {} must read a free variable as `()`, got {lowered:?}",
+                    row.name(),
+                    row.slot()
+                );
+            }
+        });
+    }
+
+    /// The reader's UI arms are the table's rows and nothing else: a row's
+    /// name at another arity, or any non-row name, never reads as a UI type,
+    /// so no position the use-pin classifier calls a non-slot reads a free
+    /// variable as `()`.
+    #[test]
+    fn no_position_outside_the_slot_table_reads_as_a_ui_type() {
+        let slots = super::ui_msg_slots::UI_MSG_SLOTS;
+        let mut names: Vec<&str> = slots
+            .iter()
+            .map(super::ui_msg_slots::UiMsgSlot::name)
+            .collect();
+        names.extend(["Web", "Cmd", "List", "Maybe", "Sub"]);
+        with_named_lowerer(&names, |lowerer, syms| {
+            let web = *syms.get(slots.len()).unwrap();
+            let mut probes: Vec<Ty> = Vec::new();
+            for (row, name) in slots.iter().zip(syms) {
+                for arity in [row.arity().saturating_sub(1), row.arity().saturating_add(1)] {
+                    probes.extend((0..arity).map(|slot| slot_probe(*name, arity, slot, web)));
+                }
+            }
+            for name in syms.iter().skip(slots.len() + 1) {
+                probes.push(slot_probe(*name, 1, 0, web));
+            }
+            for ty in probes {
                 let lowered = lowerer.ir_type_from_ty(&ty, UNIT_SPAN);
                 assert!(
-                    matches!(&lowered, Ok(super::IrType::Ui { msg, .. }) if **msg == super::IrType::Unit),
-                    "`{}` slot {} must read a free variable as `()`, got {lowered:?}",
-                    entry.name,
-                    entry.slot
+                    !matches!(&lowered, Ok(super::IrType::Ui { .. })),
+                    "`{ty:?}` is no slot-table row, yet read as a UI type: {lowered:?}"
                 );
             }
         });
     }
 
     /// The use pin of a reference to `render`, declared `Unit -> shape(msg)` and
-    /// used at `Unit -> shape(free)`; `shape` builds over `View Web`.
+    /// used at `Unit -> shape(free)`; `shape` builds over `View Web`. With
+    /// `erased`, `free` is a solver variable the enclosing def's signature
+    /// erased with that reading.
     fn render_use_pin(
         shape: fn(&dyn Fn(Ty) -> Ty, Ty) -> Ty,
+        erased: Option<super::ErasedTvar>,
     ) -> (ipe_intern::Symbol, ipe_ir::CallPin) {
+        let free = if erased.is_some() {
+            ipe_types::tag_solver_var(SLOT_FREE_VAR)
+        } else {
+            SLOT_FREE_VAR
+        };
         let mut interner = Interner::new();
         let builtins = build_test_builtin_ctors(&mut interner);
         let view = interner.intern("View").unwrap();
@@ -34645,7 +34587,7 @@ mod tests {
             (vec![], RENDER_CALL_SPAN),
             Ty::Fun(
                 Box::new(Ty::Unit),
-                Box::new(shape(&view_web, Ty::Var(SLOT_FREE_VAR))),
+                Box::new(shape(&view_web, Ty::Var(free))),
             ),
         );
         let lowerer = Lowerer::new(
@@ -34668,6 +34610,9 @@ mod tests {
             "",
             "",
         );
+        if let (Some(read), Some(var)) = (erased, ipe_types::SolverVar::from_raw(free)) {
+            lowerer.current_erased_tvars.borrow_mut().insert(var, read);
+        }
         let callee = Located::new(
             RENDER_CALL_SPAN,
             canon::Expr_::VarTopLevel {
@@ -34683,7 +34628,7 @@ mod tests {
     /// lowers to, never `JsonVal`.
     #[test]
     fn a_view_message_parameter_left_free_pins_unit() {
-        let (msg, pin) = render_use_pin(|view_web, m| view_web(m));
+        let (msg, pin) = render_use_pin(|view_web, m| view_web(m), None);
         assert_eq!(
             pin,
             ipe_ir::CallPin::User(BTreeMap::from([(msg, ipe_ir::UserPin::Unit)]))
@@ -34694,15 +34639,43 @@ mod tests {
     /// reading: its pin is refused, never `JsonVal` beside an `Element<()>`.
     #[test]
     fn a_free_parameter_in_and_outside_a_message_slot_is_refused() {
-        let (msg, pin) = render_use_pin(|view_web, m| Ty::Tuple(vec![view_web(m.clone()), m]));
+        let (msg, pin) =
+            render_use_pin(|view_web, m| Ty::Tuple(vec![view_web(m.clone()), m]), None);
         let refused = matches!(
             &pin,
             ipe_ir::CallPin::User(pins)
-                if matches!(pins.get(&msg), Some(ipe_ir::UserPin::Unlowered(_)))
+                if matches!(
+                    pins.get(&msg),
+                    Some(ipe_ir::UserPin::Unlowered(d)) if matches!(
+                        &**d,
+                        super::Diagnostic::Lower {
+                            span: RENDER_CALL_SPAN,
+                            msg: super::LowerError::MixedMessageParameter { callee, var },
+                        } if &**callee == "render" && &**var == "msg"
+                    )
+                )
         );
         assert!(
             refused,
-            "a mixed free parameter must be refused, got {pin:?}"
+            "a mixed free parameter must be refused naming the callee and the variable, got {pin:?}"
+        );
+    }
+
+    /// A mixed parameter instantiated to a variable the enclosing signature
+    /// erased to `()` reads `()` at every position, so its pin is `()`, not a
+    /// refusal.
+    #[test]
+    fn a_mixed_parameter_erased_to_unit_pins_unit() {
+        let (msg, pin) = render_use_pin(
+            |view_web, m| Ty::Tuple(vec![view_web(m.clone()), m]),
+            Some(super::ErasedTvar::Unit),
+        );
+        assert_eq!(
+            pin,
+            ipe_ir::CallPin::User(BTreeMap::from([(
+                msg,
+                ipe_ir::UserPin::Instance(super::IrType::Unit)
+            )]))
         );
     }
 

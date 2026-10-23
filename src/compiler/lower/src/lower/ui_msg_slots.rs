@@ -1,64 +1,120 @@
 //! Where a declared type holds a UI message slot, by the lowerer's own reading.
 //!
-//! [`super::Lowerer::ir_type_from_ty`] reads the message argument of each
-//! constructor in [`UI_MSG_SLOTS`] through `ir_type_from_ty_ui_msg`, which
-//! lowers a free variable there to `()`; every other position reads a free
-//! variable some other way (refused, or `JsonVal` on the JSON path). A use pin
-//! for a callee type parameter must read that parameter the way its positions
-//! do, so the pin and the use's own node types name one Rust type.
+//! [`UI_MSG_SLOTS`] is the one table of UI message-slot constructors. The
+//! reader ([`super::Lowerer::ir_type_from_ty`]) selects its UI arm by
+//! [`lookup`] and reads the message argument through
+//! `ir_type_from_ty_ui_msg`, which lowers a free variable there to `()` and
+//! takes a [`MsgArg`], a value only [`lookup`] builds from a table row: a
+//! position no row names cannot be read as a message slot. The use-pin
+//! classifier ([`ui_slot_vars`]) asks the same lookup, so a pin for a callee
+//! type parameter reads it the way the use's own node types do.
 
 use std::collections::BTreeSet;
 
 use ipe_intern::Symbol;
+use ipe_ir::UiCtor;
 use ipe_types::{RowTail, Ty};
 
-/// One UI message-slot constructor: its name, its arity, and the index of the
-/// argument the lowerer reads as the message slot.
-#[derive(Clone, Copy, Debug)]
-pub(super) struct UiMsgSlot {
-    pub(super) name: &'static str,
-    pub(super) arity: usize,
-    pub(super) slot: usize,
+/// How a slot constructor selects its [`UiCtor`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum UiSlotCtor {
+    /// Always this ctor.
+    Fixed(UiCtor),
+    /// By the engine tag in argument 0 (`View engine msg`).
+    ByEngineTag,
+    /// By the constructor's home: `Ipe.Html` or `Ipe.Ui`.
+    ByAttributeHome,
 }
 
-const fn single(name: &'static str) -> UiMsgSlot {
+/// One UI message-slot constructor: its name, its arity, the index of the
+/// argument read as the message slot, and how it selects its [`UiCtor`].
+///
+/// The fields are private, so a row exists only in [`UI_MSG_SLOTS`].
+#[derive(Clone, Copy, Debug)]
+pub(super) struct UiMsgSlot {
+    name: &'static str,
+    arity: usize,
+    slot: usize,
+    ctor: UiSlotCtor,
+}
+
+impl UiMsgSlot {
+    #[cfg(test)]
+    pub(super) const fn name(&self) -> &'static str {
+        self.name
+    }
+
+    #[cfg(test)]
+    pub(super) const fn arity(&self) -> usize {
+        self.arity
+    }
+
+    pub(super) const fn slot(&self) -> usize {
+        self.slot
+    }
+
+    pub(super) const fn ctor(&self) -> UiSlotCtor {
+        self.ctor
+    }
+}
+
+/// The message argument of a [`UI_MSG_SLOTS`] constructor's application.
+///
+/// The field is private, so only [`lookup`] builds one: holding a `MsgArg` is
+/// the proof that its position is a table slot.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct MsgArg<'t>(&'t Ty);
+
+impl<'t> MsgArg<'t> {
+    pub(super) const fn ty(self) -> &'t Ty {
+        self.0
+    }
+}
+
+const fn single(name: &'static str, ctor: UiCtor) -> UiMsgSlot {
     UiMsgSlot {
         name,
         arity: 1,
         slot: 0,
+        ctor: UiSlotCtor::Fixed(ctor),
     }
 }
 
-/// Every constructor whose message argument `ir_type_from_ty` reads through
-/// `ir_type_from_ty_ui_msg`. `View engine msg` is the carrier the per-engine
-/// view aliases (`Element`, `Screen`, `Lines`) canonicalise to: its engine tag
-/// is no slot.
+/// Every UI message-slot constructor. `View engine msg` is the carrier the
+/// per-engine view aliases (`Element`, `Screen`, `Lines`) canonicalise to: its
+/// engine tag is no slot.
 pub(super) const UI_MSG_SLOTS: [UiMsgSlot; 12] = [
-    single("Html"),
+    single("Html", UiCtor::Html),
     UiMsgSlot {
         name: "View",
         arity: 2,
         slot: 1,
+        ctor: UiSlotCtor::ByEngineTag,
     },
-    single("Element"),
-    single("Screen"),
-    single("TuiAttr"),
-    single("Lines"),
-    single("CliAttr"),
-    single("Attribute"),
-    single("Event"),
-    single("Label"),
-    single("Placeholder"),
-    single("RadioOption"),
+    single("Element", UiCtor::Element),
+    single("Screen", UiCtor::Cells),
+    single("TuiAttr", UiCtor::TuiAttribute),
+    single("Lines", UiCtor::CliLines),
+    single("CliAttr", UiCtor::CliAttribute),
+    UiMsgSlot {
+        name: "Attribute",
+        arity: 1,
+        slot: 0,
+        ctor: UiSlotCtor::ByAttributeHome,
+    },
+    single("Event", UiCtor::HtmlEvent),
+    single("Label", UiCtor::Label),
+    single("Placeholder", UiCtor::Placeholder),
+    single("RadioOption", UiCtor::RadioOption),
 ];
 
-/// The message-slot argument index of a constructor called `name` applied to
-/// `arity` arguments, when it is one of [`UI_MSG_SLOTS`].
-pub(super) fn slot_of(name: &str, arity: usize) -> Option<usize> {
-    UI_MSG_SLOTS
+/// The [`UI_MSG_SLOTS`] row of a constructor called `name` applied to `args`,
+/// with its message argument, when the name and the arity match a row.
+pub(super) fn lookup<'t>(name: &str, args: &'t [Ty]) -> Option<(&'static UiMsgSlot, MsgArg<'t>)> {
+    let row = UI_MSG_SLOTS
         .iter()
-        .find(|s| s.name == name && s.arity == arity)
-        .map(|s| s.slot)
+        .find(|s| s.name == name && s.arity == args.len())?;
+    Some((row, MsgArg(args.get(row.slot)?)))
 }
 
 /// The type variables of a declared type, as raws, split by where they occur.
@@ -71,43 +127,45 @@ pub(super) struct UiSlotVars {
 }
 
 /// Classify the variables of `ty`; `slot` names the message-slot argument index
-/// of a constructor `(module, name, arity)`, or `None` when it has none.
+/// of a constructor `(module, name)` applied to `args`, or `None` when it has
+/// none.
 ///
-/// A constructor's argument is a slot position only directly: a non-slot
-/// constructor nested inside a slot resets the position, the way the lowerer
-/// reads a compound message type strictly.
+/// A position is a slot only directly: the reader reads a compound message
+/// type (a function, a tuple, a record, a non-slot constructor) strictly, so
+/// every variable inside one occurs outside a slot.
 pub(super) fn ui_slot_vars(
     ty: &Ty,
-    slot: impl Fn(&[Symbol], Symbol, usize) -> Option<usize>,
+    slot: impl Fn(&[Symbol], Symbol, &[Ty]) -> Option<usize>,
 ) -> UiSlotVars {
     let mut ui = BTreeSet::new();
     let mut other = BTreeSet::new();
     let mut stack: Vec<(&Ty, bool)> = vec![(ty, false)];
     while let Some((t, in_slot)) = stack.pop() {
-        let mut note = |raw: u32| {
-            if in_slot {
-                ui.insert(raw);
-            } else {
-                other.insert(raw);
-            }
-        };
         match t {
-            Ty::Var(raw) => note(*raw),
+            Ty::Var(raw) => {
+                if in_slot {
+                    ui.insert(*raw);
+                } else {
+                    other.insert(*raw);
+                }
+            }
             Ty::Fun(a, b) => {
-                stack.push((a, in_slot));
-                stack.push((b, in_slot));
+                stack.push((a, false));
+                stack.push((b, false));
             }
             Ty::Con { module, name, args } => {
-                let at = slot(module.as_slice(), *name, args.len());
+                let at = slot(module.as_slice(), *name, args);
                 stack.extend(args.iter().enumerate().map(|(i, a)| (a, at == Some(i))));
             }
-            Ty::Tuple(elems) => stack.extend(elems.iter().map(|e| (e, in_slot))),
+            Ty::Tuple(elems) => stack.extend(elems.iter().map(|e| (e, false))),
             Ty::Record(fields, tail) => {
                 match tail {
-                    RowTail::Open(raw) => note(*raw),
+                    RowTail::Open(raw) => {
+                        other.insert(*raw);
+                    }
                     RowTail::Closed => {}
                 }
-                stack.extend(fields.values().map(|v| (v, in_slot)));
+                stack.extend(fields.values().map(|v| (v, false)));
             }
             Ty::Wildcard | Ty::Unit => {}
         }
@@ -125,7 +183,7 @@ mod tests {
     use ipe_intern::{Interner, Symbol};
     use ipe_types::Ty;
 
-    use super::{UiSlotVars, slot_of, ui_slot_vars};
+    use super::{UiSlotVars, lookup, ui_slot_vars};
 
     /// The raw of the message variable the classification tests place.
     const MSG: u32 = 3;
@@ -136,6 +194,18 @@ mod tests {
             name,
             args,
         }
+    }
+
+    /// The slot index of `name` applied to `args`, by the table.
+    fn slot_at(name: &str, args: &[Ty]) -> Option<usize> {
+        lookup(name, args).map(|(row, _)| row.slot())
+    }
+
+    /// Classify `ty` by the table alone (no program union shadows a name).
+    fn classify(interner: &Interner, ty: &Ty) -> UiSlotVars {
+        ui_slot_vars(ty, |_, name, args| {
+            interner.resolve(name).and_then(|n| slot_at(n, args))
+        })
     }
 
     /// `String -> View Web msg` (what `render : String -> Element msg`
@@ -153,11 +223,8 @@ mod tests {
             Box::new(con(string, vec![])),
             Box::new(con(view, vec![con(web, vec![]), Ty::Var(MSG)])),
         );
-        let vars = ui_slot_vars(&ty, |_, name, arity| {
-            interner.resolve(name).and_then(|n| slot_of(n, arity))
-        });
         assert_eq!(
-            vars,
+            classify(&interner, &ty),
             UiSlotVars {
                 only: BTreeSet::from([MSG]),
                 mixed: BTreeSet::new(),
@@ -165,9 +232,7 @@ mod tests {
         );
         // A variable in the engine-tag position is no message slot.
         let tag = con(view, vec![Ty::Var(MSG), Ty::Unit]);
-        let vars = ui_slot_vars(&tag, |_, name, arity| {
-            interner.resolve(name).and_then(|n| slot_of(n, arity))
-        });
+        let vars = classify(&interner, &tag);
         assert!(vars.only.is_empty() && vars.mixed.is_empty());
     }
 
@@ -183,11 +248,8 @@ mod tests {
             con(view, vec![con(web, vec![]), Ty::Var(MSG)]),
             Ty::Var(MSG),
         ]);
-        let vars = ui_slot_vars(&ty, |_, name, arity| {
-            interner.resolve(name).and_then(|n| slot_of(n, arity))
-        });
         assert_eq!(
-            vars,
+            classify(&interner, &ty),
             UiSlotVars {
                 only: BTreeSet::new(),
                 mixed: BTreeSet::from([MSG]),
@@ -195,14 +257,54 @@ mod tests {
         );
     }
 
+    /// A variable inside a tuple, a function or a record that fills a message
+    /// slot is read strictly by the reader, so it occurs outside a slot.
+    #[test]
+    fn a_compound_message_type_holds_no_slot_variable() {
+        let mut interner = Interner::new();
+        let html = interner.intern("Html").unwrap();
+        let field = interner.intern("f").unwrap();
+        let compounds = [
+            Ty::Tuple(vec![Ty::Var(MSG), Ty::Unit]),
+            Ty::Fun(Box::new(Ty::Unit), Box::new(Ty::Var(MSG))),
+            Ty::Record(
+                std::collections::BTreeMap::from([(field, Ty::Var(MSG))]),
+                ipe_types::RowTail::Closed,
+            ),
+            Ty::Record(
+                std::collections::BTreeMap::new(),
+                ipe_types::RowTail::Open(MSG),
+            ),
+        ];
+        for compound in compounds {
+            let ty = con(html, vec![compound.clone()]);
+            assert_eq!(
+                classify(&interner, &ty),
+                UiSlotVars::default(),
+                "`Html ({compound:?})` holds no slot-only variable"
+            );
+            let mixed = Ty::Tuple(vec![con(html, vec![Ty::Var(MSG)]), ty]);
+            assert_eq!(
+                classify(&interner, &mixed),
+                UiSlotVars {
+                    only: BTreeSet::new(),
+                    mixed: BTreeSet::from([MSG]),
+                },
+                "beside a direct slot, `Html ({compound:?})` makes the variable mixed"
+            );
+        }
+    }
+
     /// The slot table answers by name and arity both: a mis-arity application
     /// holds no slot.
     #[test]
     fn a_mis_arity_application_holds_no_slot() {
-        assert_eq!(slot_of("View", 2), Some(1));
-        assert_eq!(slot_of("View", 1), None);
-        assert_eq!(slot_of("Html", 1), Some(0));
-        assert_eq!(slot_of("Html", 2), None);
-        assert_eq!(slot_of("List", 1), None);
+        let one = [Ty::Unit];
+        let two = [Ty::Unit, Ty::Unit];
+        assert_eq!(slot_at("View", &two), Some(1));
+        assert_eq!(slot_at("View", &one), None);
+        assert_eq!(slot_at("Html", &one), Some(0));
+        assert_eq!(slot_at("Html", &two), None);
+        assert_eq!(slot_at("List", &one), None);
     }
 }

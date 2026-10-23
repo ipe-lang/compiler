@@ -1860,6 +1860,20 @@ pub enum LowerError {
         /// The owner's type variable (e.g. `msg`).
         var: Box<str>,
     },
+    /// A call leaves free a type variable its callee uses both as a UI
+    /// message parameter and elsewhere.
+    ///
+    /// A free variable reads as `()` in a message slot (`Html msg`) and as
+    /// the JSON carrier at any other position, so the emitted call would name
+    /// two Rust types for one parameter. Refused fail-closed at `ipe` time;
+    /// the fix is a type annotation that fixes the variable at the call.
+    /// [IPE-L0102]
+    MixedMessageParameter {
+        /// The called function (e.g. `wrap`).
+        callee: Box<str>,
+        /// The callee's type variable (e.g. `msg`).
+        var: Box<str>,
+    },
 }
 
 /// Why a literal route pattern or server route path was refused under
@@ -2888,7 +2902,9 @@ const fn lower_code(msg: &LowerError) -> Code {
         LowerError::PointFreeAccessorKernel { .. }
         | LowerError::AccessorKernelOffIntercept { .. } => IPE_L0146,
         LowerError::UnsaturatedHandlerKernel { .. } => IPE_L0152,
-        LowerError::ForeignTypeVariable { .. } => IPE_L0102,
+        LowerError::ForeignTypeVariable { .. } | LowerError::MixedMessageParameter { .. } => {
+            IPE_L0102
+        }
         LowerError::StoreSelectProjectionInvalid(_) => IPE_L0149,
     })
 }
@@ -3418,6 +3434,9 @@ fn lower_help(msg: &LowerError) -> Vec<HelpLine> {
         LowerError::ForeignTypeVariable { helper, owner, var } => {
             foreign_type_variable_help(helper, owner, var)
         }
+        LowerError::MixedMessageParameter { callee, var } => {
+            mixed_message_parameter_help(callee, var)
+        }
         LowerError::StoreSelectProjectionInvalid(defect) => {
             store_select_projection_invalid_help(defect)
         }
@@ -3530,6 +3549,23 @@ fn foreign_type_variable_help(helper: &str, owner: &str, var: &str) -> Vec<HelpL
                 "give `{helper}` its own type annotation, generic over its own type \
                  variable; it is used inside `{owner}`, whose type variable `{var}` it \
                  would otherwise borrow without being generic over it"
+            )
+            .into_boxed_str(),
+        ),
+        HelpLine::SeeExplain("IPE-L0102"),
+    ]
+}
+
+/// The help lines for [`LowerError::MixedMessageParameter`], factored out so
+/// [`lower_help`] stays a thin per-variant dispatcher.
+fn mixed_message_parameter_help(callee: &str, var: &str) -> Vec<HelpLine> {
+    vec![
+        HelpLine::Note(
+            format!(
+                "fix `{var}` at this call with a type annotation on the binding that \
+                 holds the result, naming a concrete message type (`Html Msg`, not \
+                 `Html msg`); or annotate `{callee}` so it uses `{var}` only as a \
+                 message parameter"
             )
             .into_boxed_str(),
         ),
