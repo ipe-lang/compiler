@@ -45,6 +45,7 @@ mod clone_class;
 mod generic_syms;
 mod ir_type_mentions;
 mod record_shapes;
+mod signature_bounds;
 mod ty_templates;
 
 use capture_rewrite::force_shared_capture_clones;
@@ -77,6 +78,7 @@ use record_shapes::{
     is_server_response_canon_shape, is_server_response_shape, is_websocket_cfg_canon_shape,
     is_websocket_cfg_shape, ty_is_int,
 };
+use signature_bounds::apply_signature_shape_bounds;
 use ty_templates::{
     GroundTy, canon_type_contains_record_key_set, generic_binding_breaks_clone,
     match_signature_template, ty_contains_fun, ty_contains_record_key_set, ty_fields_mention_var,
@@ -4907,13 +4909,18 @@ fn collect_local_derived_tvars(
 /// Cross-call type-parameter-bound propagation, run to a fixpoint over all
 /// lowered funcs of a module.
 ///
-/// [`apply_kernel_type_param_bounds`] infers each function's bounds from its OWN
-/// body alone — a generic tvar gains `Sync`/`Send`/`'static` only where THIS
-/// body captures it into an emitted closure, boxes it as a callback, or flows it
-/// into a bound-obliging kernel. A function that instead FORWARDS its generic to
-/// a peer user function (`Store.toMaybe q = Task.map List.head (Store.toList q)`)
-/// never captures the tvar in its own body, so the intra-procedural pass leaves
-/// it unbounded — yet the callee (`Store.toList<T: Send + Sync>`) requires the
+/// The input bounds are complete per function: [`apply_signature_shape_bounds`]
+/// (a `Task` return, a callback parameter, a UI-carrier message) and
+/// [`apply_kernel_type_param_bounds`] (what THIS body captures into an emitted
+/// closure, boxes as a callback, or flows into a bound-obliging kernel) both run
+/// before this pass, and the backend adds no bound after it, so the emitted
+/// clause of every generic and row variable is exactly the set finalized here.
+/// Row variables (`RowParam::bounds`) take part alongside the generics.
+///
+/// A function that FORWARDS its generic to a peer user function
+/// (`Store.toMaybe q = Task.map List.head (Store.toList q)`) never captures the
+/// tvar in its own body, so the intra-procedural pass leaves it unbounded —
+/// yet the callee (`Store.toList<T: Send + Sync>`) requires the
 /// bound on the very type argument the caller supplies. The emitted caller then
 /// fails `cargo build` with E0277 (`T cannot be shared between threads`) even
 /// though `ipe` reported exit 0 — an exit-0-then-cargo-fail SEAL break.
@@ -4994,10 +5001,10 @@ fn propagate_call_site_bounds(
     let sig_rets: Vec<IrType> = funcs.iter().map(|f| f.ret.clone()).collect();
 
     loop {
-        // Only the mutable half — each callee's `type_params` bounds — is
-        // re-snapshotted per round; the params/ret snapshots above are invariant.
-        let sig_tparams: Vec<Vec<(Symbol, BoundSet)>> =
-            funcs.iter().map(|f| f.type_params.clone()).collect();
+        // Only the mutable half — each callee's generic and row-variable
+        // bounds — is re-snapshotted per round; the params/ret snapshots above
+        // are invariant.
+        let sig_tparams: Vec<Vec<(Symbol, BoundSet)>> = funcs.iter().map(bound_vars).collect();
 
         let mut changed = false;
         for caller in funcs.iter_mut() {
@@ -5013,7 +5020,8 @@ fn propagate_call_site_bounds(
                 .iter()
                 .map(|p| (p.sym, p.ty.clone()))
                 .collect();
-            let caller_tvars: Vec<Symbol> = caller.type_params.iter().map(|(tv, _)| *tv).collect();
+            let caller_tvars: Vec<Symbol> =
+                bound_vars(caller).into_iter().map(|(tv, _)| tv).collect();
 
             let mut binder_tvars: std::collections::HashMap<Symbol, Vec<Symbol>> =
                 std::collections::HashMap::new();
@@ -5182,18 +5190,20 @@ fn propagate_call_site_bounds(
             if add.is_empty() {
                 continue;
             }
-            for (tv, bounds) in &mut caller.type_params {
-                if let Some(extra) = add.get(tv) {
+            let slots = caller
+                .type_params
+                .iter_mut()
+                .map(|(tv, bounds)| (*tv, bounds))
+                .chain(
+                    caller
+                        .row_params
+                        .iter_mut()
+                        .map(|row| (row.var, &mut row.bounds)),
+                );
+            for (tv, bounds) in slots {
+                if let Some(extra) = add.get(&tv) {
                     let before = *bounds;
-                    if extra.has_sync() {
-                        *bounds = bounds.with_sync();
-                    }
-                    if extra.has_send() {
-                        *bounds = bounds.with_send();
-                    }
-                    if extra.has_static() {
-                        *bounds = bounds.with_static();
-                    }
+                    oblige_auto_traits(bounds, *extra);
                     if *bounds != before {
                         changed = true;
                     }
@@ -5205,6 +5215,19 @@ fn propagate_call_site_bounds(
             break;
         }
     }
+}
+
+/// Every bound-carrying variable of `func`: its generics, then its row variables.
+///
+/// The fixpoint treats both alike, so a row variable a callee obliges (a
+/// `Task`-returning row-polymorphic helper's `Send + 'static`) reaches the
+/// caller's forwarded row variable exactly as a generic's bound does.
+fn bound_vars(func: &Func) -> Vec<(Symbol, BoundSet)> {
+    func.type_params
+        .iter()
+        .copied()
+        .chain(func.row_params.iter().map(|row| (row.var, row.bounds)))
+        .collect()
 }
 
 /// Collect every callee reached in TAIL position of `expr` — the calls whose
@@ -5261,7 +5284,10 @@ fn aligned_caller_tvars(sig_ret: &IrType, target_g: Symbol, site_ret: &IrType) -
 /// `align_param_slot`) is the fail-closed net for any tvar missed here.
 fn align_ret_tvars(sig: &IrType, target: Symbol, site: &IrType, out: &mut Vec<Symbol>) {
     match (sig, site) {
-        (IrType::Generic(sig_tv), IrType::Generic(site_tv)) => {
+        (
+            IrType::Generic(sig_tv) | IrType::RowGeneric(sig_tv),
+            IrType::Generic(site_tv) | IrType::RowGeneric(site_tv),
+        ) => {
             if *sig_tv == target {
                 out.push(*site_tv);
             }
@@ -5589,9 +5615,9 @@ fn align_param_slot(
     if !ir_type_mentions_generic(sig, target) {
         return true;
     }
-    // `sig` mentions `target`, so a generic here IS `target`: `site` is its
-    // instantiation.
-    if matches!(sig, IrType::Generic(_)) {
+    // `sig` mentions `target`, so a generic or row variable here IS `target`:
+    // `site` is its instantiation.
+    if matches!(sig, IrType::Generic(_) | IrType::RowGeneric(_)) {
         for tv in caller_tvars {
             if ir_type_generic_reaches_bare(site, *tv) && !out.contains(tv) {
                 out.push(*tv);
@@ -16641,10 +16667,11 @@ impl<'a> Lowerer<'a> {
         let export_roots = backend_invoked_roots(&funcs.iter(), self.interner);
 
         // Cross-call type-parameter-bound propagation. The per-function
-        // `apply_kernel_type_param_bounds` pass infers bounds from each body in
-        // isolation; a function that FORWARDS its generic to a peer user
-        // function (`Store.toMaybe` → `Store.toList<T: Send + Sync>`) gains no
-        // bound there yet the callee requires one on the argument it supplies.
+        // `apply_signature_shape_bounds` and `apply_kernel_type_param_bounds`
+        // passes infer bounds from each signature and body in isolation; a
+        // function that FORWARDS its generic to a peer user function
+        // (`Store.toMaybe` → `Store.toList<T: Send + Sync>`) gains no bound
+        // there yet the callee requires one on the argument it supplies.
         // This whole-module fixpoint copies each callee's `Sync`/`Send`/`'static`
         // obligation onto the caller's forwarded tvar, so the emitted caller
         // proves the bound instead of cargo-failing E0277 (an
@@ -17822,9 +17849,11 @@ impl<'a> Lowerer<'a> {
     /// Every definition shape (annotated, unannotated with parameters,
     /// unannotated zero-parameter value binding) yields a [`DefParts`] from
     /// [`Self::lower_def_parts`]; the `Func` is assembled only here, after
-    /// [`Self::finalize_type_params`] folds every body-derived bound obligation
-    /// into the generics, so no shape can emit a generic missing an obligation
-    /// its body recorded.
+    /// [`apply_signature_shape_bounds`] folds every signature-shape obligation
+    /// and [`Self::finalize_type_params`] every body-derived one into the
+    /// generics, so no shape can emit a generic missing an obligation its
+    /// signature or body carries, and the cross-call fixpoint sees the whole
+    /// set before the backend renders it.
     fn lower_def(&self, def: &canon::Def, id: FuncId) -> DResult<Func> {
         // Track the current def's home so every `region_ty(span)` lookup uses the
         // correct `(home, span)` key, matching what the constraint builder wrote.
@@ -17844,11 +17873,12 @@ impl<'a> Lowerer<'a> {
         let DefParts {
             mut type_params,
             wildcard_any_syms,
-            row_params,
+            mut row_params,
             params,
             ret,
             body,
         } = self.lower_def_parts(def, id)?;
+        apply_signature_shape_bounds(&mut type_params, &mut row_params, &params, &ret);
         self.finalize_type_params(&mut type_params, &wildcard_any_syms, &params, &ret, &body);
         Ok(Func {
             id,
@@ -18307,6 +18337,7 @@ impl<'a> Lowerer<'a> {
                                 var: *sym,
                                 fields: row_fields,
                                 updated_fields: BTreeSet::new(),
+                                bounds: BoundSet::UNBOUNDED,
                             });
                             param_pinned.insert(*sym);
                             *ir_ty = IrType::RowGeneric(*sym);
@@ -18910,6 +18941,7 @@ impl<'a> Lowerer<'a> {
                         .map(|(fname, fty)| Ok((*fname, self.ir_type_from_canon(fty, generics)?)))
                         .collect::<DResult<_>>()?,
                     updated_fields: BTreeSet::new(),
+                    bounds: BoundSet::UNBOUNDED,
                 });
                 IrType::RowGeneric(*row_var)
             } else {
@@ -26934,7 +26966,7 @@ impl<'a> Lowerer<'a> {
                 match self.ir_type_from_ty(slot_ty, call_span) {
                     // A bare `Generic` slot clones, not moves: every emitted
                     // generic carries an unconditional `T: Clone`
-                    // (`render_fn_generics`), so a supplied generic arg captured by
+                    // (`apply_signature_shape_bounds`), so a supplied generic arg captured by
                     // the re-callable `Fn` residual clones per call. SSOT with
                     // `param_is_multiuse_clonable` / `classify_capture_clone`;
                     // without it a threaded generic is moved out of the `Fn` env
@@ -27371,7 +27403,7 @@ impl<'a> Lowerer<'a> {
             .take(supplied)
             .map(|slot_ty| match self.ir_type_from_ty(slot_ty, call_span) {
                 // A bare `Generic` slot is `CloneOk`, not `NonClone`:
-                // `render_fn_generics` stamps `T: Clone` on every emitted generic
+                // `apply_signature_shape_bounds` stamps `T: Clone` on every emitted generic
                 // unconditionally, so a supplied generic arg captured by the
                 // re-callable `Fn` residual clones per call (a non-`Clone`
                 // instantiation is rejected at the CALLER by that bound before the
@@ -33443,7 +33475,7 @@ impl<'a> Lowerer<'a> {
         // (`poly_tvar_symbol` matched `current_poly_tvars` — a free var NOT in
         // that map maps to `IrType::Json`, never `Generic`), and every emitted
         // function type parameter carries a `Clone` bound
-        // (`render_fn_generics`'s `bounds.with_clone()`). So the emitted
+        // (`apply_signature_shape_bounds`'s `bounds.with_clone()`). So the emitted
         // `fn f<T1: Clone>(xs: Vec<T1>) -> …` supports `rest.to_vec()` /
         // `x.clone()` and `cargo`-builds. This holds for a Boundary-Scheme-
         // Promoted untyped def (`listLen xs = case xs of [] -> … ; _ :: rest ->

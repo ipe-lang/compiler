@@ -434,8 +434,8 @@ fn parametric_annotation_lowers_to_generic_func() -> DResult<()> {
     let func = single_func(&res);
     assert_eq!(
         func.map(|f| f.type_params.clone()),
-        Some(vec![(a, BoundSet::UNBOUNDED)]),
-        "identity quantifies exactly [a], unbounded: {res:?}"
+        Some(vec![(a, BoundSet::UNBOUNDED.with_clone())]),
+        "identity quantifies exactly [a], bounded by `Clone` only: {res:?}"
     );
     assert_eq!(
         func.and_then(|f| f.params.first())
@@ -566,7 +566,7 @@ fn named_type_var_in_nested_return_lowers_cleanly() -> DResult<()> {
     );
     assert_eq!(
         func.type_params,
-        vec![(a, BoundSet::UNBOUNDED)],
+        vec![(a, BoundSet::UNBOUNDED.with_clone())],
         "quantifies exactly the named var [a]: {res:?}"
     );
     Ok(())

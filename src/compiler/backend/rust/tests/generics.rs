@@ -71,7 +71,7 @@ fn build_identity_program(interner: &mut Interner) -> DResult<Program> {
         id: identity_id,
         name: identity,
         home: ModPath(vec![]),
-        type_params: vec![(a, BoundSet::UNBOUNDED)],
+        type_params: vec![(a, BoundSet::UNBOUNDED.with_clone())],
         row_params: vec![],
         params: vec![ipe_ir::Param::owned(x, IrType::Generic(a))],
         ret: IrType::Generic(a),
@@ -257,7 +257,7 @@ fn build_bounded_program(interner: &mut Interner) -> DResult<Program> {
 
     // double x = x + x — the body adds `x` to itself, so `a` carries Add and is
     // reused (Copy). A reused (Copy) numeric-add variable.
-    let num_bounds = BoundSet::UNBOUNDED.with_add().with_copy();
+    let num_bounds = BoundSet::UNBOUNDED.with_add().with_copy().with_clone();
     let double_fn = Func {
         id: double_id,
         name: double,
@@ -274,7 +274,7 @@ fn build_bounded_program(interner: &mut Interner) -> DResult<Program> {
     };
 
     // max a b = if a > b then a else b — `a` is ordered and reused.
-    let ord_bounds = BoundSet::UNBOUNDED.with_ord().with_copy();
+    let ord_bounds = BoundSet::UNBOUNDED.with_ord().with_copy().with_clone();
     let max_fn = Func {
         id: max_id,
         name: max,
