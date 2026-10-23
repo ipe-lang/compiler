@@ -29,10 +29,10 @@ use crate::code::{
     IPE_P0003, IPE_P0010, IPE_P0011, IPE_P0012, IPE_P0013, IPE_P0014, IPE_P0015, IPE_P0016,
     IPE_P0017, IPE_P0018, IPE_P0020, IPE_P0021, IPE_P0030, IPE_P0031, IPE_P0040, IPE_P0041,
     IPE_P0050, IPE_P0060, IPE_P0061, IPE_P0062, IPE_P0063, IPE_P0064, IPE_P0065, IPE_P0066,
-    IPE_P0067, IPE_P0068, IPE_P0069, IPE_P0070, IPE_S0001, IPE_S0002, IPE_S0003, IPE_S0004,
-    IPE_T0001, IPE_T0002, IPE_T0003, IPE_T0004, IPE_T0010, IPE_T0011, IPE_T0012, IPE_T0013,
-    IPE_T0014, IPE_T0015, IPE_T0016, IPE_T0017, IPE_T0018, IPE_T0019, IPE_T0020, IPE_T0021,
-    IPE_T0022, IPE_T0023, Severity,
+    IPE_P0067, IPE_P0068, IPE_P0069, IPE_P0070, IPE_P0071, IPE_P0072, IPE_P0073, IPE_S0001,
+    IPE_S0002, IPE_S0003, IPE_S0004, IPE_T0001, IPE_T0002, IPE_T0003, IPE_T0004, IPE_T0010,
+    IPE_T0011, IPE_T0012, IPE_T0013, IPE_T0014, IPE_T0015, IPE_T0016, IPE_T0017, IPE_T0018,
+    IPE_T0019, IPE_T0020, IPE_T0021, IPE_T0022, IPE_T0023, Severity,
 };
 use crate::span::Span;
 use crate::suggest::{Confidence, Hit};
@@ -464,6 +464,37 @@ pub enum ParseError {
     /// accurate spans. Rather than clamp offsets (which would misreport every
     /// position past the limit), the lexer turns the file away. [IPE-P0070]
     SourceTooLarge { bytes: usize },
+    /// A `\r` not followed by `\n`. An editor or viewer ends a line there and the
+    /// compiler does not, so the two would read different line structures
+    /// (code a reader sees on its own line the compiler reads as part of a
+    /// comment). A `\r\n` pair is one line break and stays accepted. [IPE-P0071]
+    LoneCarriageReturn,
+    /// A character a viewer draws as a line break or as reordered text, where
+    /// the compiler reads no such structure: code a reader sees could be
+    /// comment text to the compiler, or a literal could look closed where it is
+    /// not. `ch` is the character, `refusal` why its position refuses it.
+    /// [IPE-P0072]
+    SourceDisplayHazard { ch: char, refusal: HazardRefusal },
+    /// A raw C0 control, `DEL` or C1 control other than TAB, LF, CR and the
+    /// line breaks [`ParseError::SourceDisplayHazard`] covers. A terminal that
+    /// shows the raw file runs it as a command (ESC or CSI moves the cursor or
+    /// erases a line, BS steps back), so it can overwrite or hide the code
+    /// around it. Refused in every position, literals included: a program
+    /// builds such a character with `Char.fromCode`. [IPE-P0073]
+    SourceTerminalControl { ch: char },
+}
+
+/// Why a source display hazard is refused where it stands.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum HazardRefusal {
+    /// VT, FF, NEL, or a bidi embedding, pop or override: refused in every position.
+    Anywhere,
+    /// A line or paragraph separator or a bidi isolate in a comment or among code.
+    OutsideLiteral,
+    /// An isolate opener its literal does not close before the literal or its line ends.
+    UnclosedIsolate,
+    /// An isolate closer with no isolate open before it in its literal and line.
+    UnopenedIsolate,
 }
 
 /// Errors raised during name resolution / canonicalisation.
@@ -2759,6 +2790,9 @@ const fn parse_code(msg: &ParseError) -> Code {
         ParseError::AnnotationWithoutBinding { .. } => IPE_P0068,
         ParseError::DuplicateAnnotation { .. } => IPE_P0069,
         ParseError::SourceTooLarge { .. } => IPE_P0070,
+        ParseError::LoneCarriageReturn => IPE_P0071,
+        ParseError::SourceDisplayHazard { .. } => IPE_P0072,
+        ParseError::SourceTerminalControl { .. } => IPE_P0073,
     })
 }
 
@@ -2968,7 +3002,10 @@ fn parse_help(msg: &ParseError) -> Vec<HelpLine> {
         | ParseError::MissingDocString { .. }
         | ParseError::AnnotationWithoutBinding { .. }
         | ParseError::DuplicateAnnotation { .. }
-        | ParseError::SourceTooLarge { .. } => Vec::new(),
+        | ParseError::SourceTooLarge { .. }
+        | ParseError::LoneCarriageReturn
+        | ParseError::SourceDisplayHazard { .. }
+        | ParseError::SourceTerminalControl { .. } => Vec::new(),
     }
 }
 

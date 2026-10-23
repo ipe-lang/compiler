@@ -4595,11 +4595,33 @@ mod scrub_log_controls_tests {
         assert_eq!(out, "adm\\u{200b}in\\u{e0041}\\u{ad}\\u{2060}\\u{feff}");
     }
 
+    /// The characters a range table names, as sorted ranges with overlapping
+    /// and adjacent entries merged: two tables denote the same set exactly
+    /// when their merged forms are equal, however each one splits its ranges.
+    fn merged(ranges: &[std::ops::RangeInclusive<char>]) -> Vec<std::ops::RangeInclusive<char>> {
+        let mut sorted = ranges.to_vec();
+        sorted.sort_by_key(|range| *range.start());
+        let mut out: Vec<std::ops::RangeInclusive<char>> = Vec::new();
+        for range in sorted {
+            match out.last_mut() {
+                Some(last)
+                    if u32::from(*range.start()) <= u32::from(*last.end()).saturating_add(1) =>
+                {
+                    if range.end() > last.end() {
+                        *last = *last.start()..=*range.end();
+                    }
+                }
+                _ => out.push(range),
+            }
+        }
+        out
+    }
+
     #[test]
     fn log_format_hazards_equal_the_terminal_set() {
         assert_eq!(
-            super::LOG_FORMAT_HAZARDS,
-            ipe_diagnostics::terminal::DENIED_FORMAT_CHARS
+            merged(super::LOG_FORMAT_HAZARDS),
+            merged(ipe_diagnostics::terminal::DENIED_FORMAT_CHARS)
         );
     }
 
