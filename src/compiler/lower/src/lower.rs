@@ -46,6 +46,7 @@ mod generic_syms;
 mod ir_type_mentions;
 mod record_shapes;
 mod ty_templates;
+mod ui_msg_slots;
 mod user_pins;
 
 use capture_rewrite::force_shared_capture_clones;
@@ -24547,6 +24548,47 @@ impl<'a> Lowerer<'a> {
         }
     }
 
+    /// Whether `ty` names a variable [`Self::ty_is_unbound_free`] holds free
+    /// anywhere.
+    fn ty_mentions_unbound_free(&self, ty: &Ty) -> bool {
+        let mut stack: Vec<&Ty> = vec![ty];
+        while let Some(t) = stack.pop() {
+            match t {
+                Ty::Var(_) | Ty::Wildcard => {
+                    if self.ty_is_unbound_free(t) {
+                        return true;
+                    }
+                }
+                Ty::Fun(a, b) => {
+                    stack.push(a);
+                    stack.push(b);
+                }
+                Ty::Con { args, .. } | Ty::Tuple(args) => stack.extend(args),
+                Ty::Record(fields, tail) => {
+                    if let RowTail::Open(raw) = tail
+                        && self.ty_is_unbound_free(&Ty::Var(*raw))
+                    {
+                        return true;
+                    }
+                    stack.extend(fields.values());
+                }
+                Ty::Unit => {}
+            }
+        }
+        false
+    }
+
+    /// The UI message-slot argument index of the constructor `(module, name)`
+    /// applied to `arity` arguments, read as [`Self::ir_type_from_ty`] reads
+    /// it: a program union of the name lowers by its own identity first, so it
+    /// holds no slot.
+    fn ui_msg_slot_of(&self, module: &[Symbol], name: Symbol, arity: usize) -> Option<usize> {
+        if self.is_distinct_program_union(module, name) {
+            return None;
+        }
+        ui_msg_slots::slot_of(self.interner.resolve(name)?, arity)
+    }
+
     /// The pin for a direct call of a user generic function `callee`, at any
     /// arity: saturated, a value reference, or the base call of an
     /// over-application.
@@ -24554,15 +24596,18 @@ impl<'a> Lowerer<'a> {
     /// Two kinds of type parameter are pinned, by the callee's scheme symbol:
     ///
     /// * one that occurs only in UI message slots of the declared scheme
-    ///   ([`ipe_types::ui_msg_only_vars`]), or the `any` return marker, which
-    ///   this use leaves free ([`Self::ty_is_unbound_free`]): pinned to `()`,
-    ///   the type the use's own node type lowered that slot to;
+    ///   ([`ui_msg_slots::ui_slot_vars`], the slots [`Self::ir_type_from_ty`]
+    ///   reads), or the `any` return marker, which this use leaves free
+    ///   ([`Self::ty_is_unbound_free`]): pinned to `()`, the type the use's own
+    ///   node type lowered that slot to;
     /// * every other one the declared type names anywhere on its spine,
     ///   arguments past the emitted arity and the return included: pinned to
     ///   the use's solved instantiation, a free variable read as the eta and
     ///   wildcard binders read it ([`Self::ir_type_from_ty_json`]). The
     ///   backend renders it only when no emitted parameter of the callee names
-    ///   it, so the pin set never depends on the callee's Rust arity.
+    ///   it, so the pin set never depends on the callee's Rust arity. One
+    ///   that occurs both in a message slot and elsewhere, left free by this
+    ///   use, has no single reading and is refused when it renders.
     ///
     /// Any other callee, or an instantiation the template match cannot align,
     /// pins nothing.
@@ -24575,8 +24620,12 @@ impl<'a> Lowerer<'a> {
         else {
             return CallPin::None;
         };
-        let msg_only =
-            ipe_types::ui_msg_only_vars(declared, &ipe_types::ui_msg_carrier_syms(self.interner));
+        let ui_msg_slots::UiSlotVars {
+            only: msg_only,
+            mixed,
+        } = ui_msg_slots::ui_slot_vars(declared, |module, name, arity| {
+            self.ui_msg_slot_of(module, name, arity)
+        });
         let mut subst: BTreeMap<u32, Ty> = BTreeMap::new();
         match_signature_template(declared, inst, &mut subst, self.interner);
         // An untyped callee's scheme carries solver variables, named by its
@@ -24600,9 +24649,15 @@ impl<'a> Lowerer<'a> {
             let (Some(sym), Some(ty)) = (name_of(*raw), subst.get(raw)) else {
                 continue;
             };
-            let pin = match self.ir_type_from_ty_json(ty, callee.span) {
-                Ok(lowered) => UserPin::Instance(lowered),
-                Err(refusal) => UserPin::Unlowered(Box::new(refusal)),
+            // A free variable reads as `()` in a message slot and otherwise as
+            // `JsonVal`: a parameter in both positions has no one reading.
+            let pin = if mixed.contains(raw) && self.ty_mentions_unbound_free(ty) {
+                UserPin::Unlowered(Box::new(unsupported(callee.span, Feature::Polymorphism)))
+            } else {
+                match self.ir_type_from_ty_json(ty, callee.span) {
+                    Ok(lowered) => UserPin::Instance(lowered),
+                    Err(refusal) => UserPin::Unlowered(Box::new(refusal)),
+                }
             };
             pins.insert(sym, pin);
         }
@@ -34500,6 +34555,153 @@ mod tests {
             "",
         );
         check(&lowerer, &syms);
+    }
+
+    /// A free variable the slot tests place, unowned by any def.
+    const SLOT_FREE_VAR: u32 = 7;
+
+    /// The span of the `render` reference whose use pin the slot tests read.
+    const RENDER_CALL_SPAN: Span = Span::new(70, 76);
+
+    /// Every [`super::ui_msg_slots::UI_MSG_SLOTS`] entry names an argument
+    /// [`Lowerer::ir_type_from_ty`] reads as a message slot: a free variable
+    /// there lowers to `()`, the reading the slot-only use pin renders.
+    #[test]
+    fn every_ui_msg_slot_is_read_as_a_message_slot() {
+        let slots = super::ui_msg_slots::UI_MSG_SLOTS;
+        let mut names: Vec<&str> = slots.iter().map(|s| s.name).collect();
+        names.push("Web");
+        with_named_lowerer(&names, |lowerer, syms| {
+            let web = *syms.last().unwrap();
+            for (entry, name) in slots.iter().zip(syms) {
+                let args = (0..entry.arity)
+                    .map(|i| {
+                        if i == entry.slot {
+                            Ty::Var(SLOT_FREE_VAR)
+                        } else {
+                            Ty::Con {
+                                module: vec![],
+                                name: web,
+                                args: vec![],
+                            }
+                        }
+                    })
+                    .collect();
+                let ty = Ty::Con {
+                    module: vec![],
+                    name: *name,
+                    args,
+                };
+                let lowered = lowerer.ir_type_from_ty(&ty, UNIT_SPAN);
+                assert!(
+                    matches!(&lowered, Ok(super::IrType::Ui { msg, .. }) if **msg == super::IrType::Unit),
+                    "`{}` slot {} must read a free variable as `()`, got {lowered:?}",
+                    entry.name,
+                    entry.slot
+                );
+            }
+        });
+    }
+
+    /// The use pin of a reference to `render`, declared `Unit -> shape(msg)` and
+    /// used at `Unit -> shape(free)`; `shape` builds over `View Web`.
+    fn render_use_pin(
+        shape: fn(&dyn Fn(Ty) -> Ty, Ty) -> Ty,
+    ) -> (ipe_intern::Symbol, ipe_ir::CallPin) {
+        let mut interner = Interner::new();
+        let builtins = build_test_builtin_ctors(&mut interner);
+        let view = interner.intern("View").unwrap();
+        let web = interner.intern("Web").unwrap();
+        let msg = interner.intern("msg").unwrap();
+        let render = interner.intern("render").unwrap();
+        let view_web = move |m: Ty| Ty::Con {
+            module: vec![],
+            name: view,
+            args: vec![
+                Ty::Con {
+                    module: vec![],
+                    name: web,
+                    args: vec![],
+                },
+                m,
+            ],
+        };
+        let module = canon::Module {
+            imports_unsafe_submodule: false,
+            imported_web_capabilities: BTreeSet::new(),
+            name: vec![],
+            unions: vec![],
+            defs: vec![],
+        };
+        let mut types = empty_solved_types();
+        types.env.insert(
+            (vec![], render),
+            Ty::Fun(
+                Box::new(Ty::Unit),
+                Box::new(shape(&view_web, Ty::Var(msg.as_raw()))),
+            ),
+        );
+        types.regions.insert(
+            (vec![], RENDER_CALL_SPAN),
+            Ty::Fun(
+                Box::new(Ty::Unit),
+                Box::new(shape(&view_web, Ty::Var(SLOT_FREE_VAR))),
+            ),
+        );
+        let lowerer = Lowerer::new(
+            &module,
+            &types,
+            &interner,
+            SymbolPools {
+                eta_params: vec![],
+                cap_params: vec![],
+                param_binders: vec![],
+                any_param_binders: vec![],
+                projection_decode_binders: vec![],
+                destructure_thunk_binders: vec![],
+                nested_cons_binders: vec![],
+                nested_strlit_binders: vec![],
+                tuple_elem_binders: vec![],
+                wildcard_marker: super::WildcardMarker(ipe_intern::Symbol::from_raw(u32::MAX)),
+            },
+            &builtins,
+            "",
+            "",
+        );
+        let callee = Located::new(
+            RENDER_CALL_SPAN,
+            canon::Expr_::VarTopLevel {
+                module: vec![],
+                name: render,
+            },
+        );
+        (msg, lowerer.user_func_pin(&callee))
+    }
+
+    /// `render : String -> Element msg` canonicalises to `View Web msg`: a use
+    /// leaving `msg` free pins it to `()`, the type its `Element<()>` node
+    /// lowers to, never `JsonVal`.
+    #[test]
+    fn a_view_message_parameter_left_free_pins_unit() {
+        let (msg, pin) = render_use_pin(|view_web, m| view_web(m));
+        assert_eq!(
+            pin,
+            ipe_ir::CallPin::User(BTreeMap::from([(msg, ipe_ir::UserPin::Unit)]))
+        );
+    }
+
+    /// A parameter in a message slot and outside one, left free, has no single
+    /// reading: its pin is refused, never `JsonVal` beside an `Element<()>`.
+    #[test]
+    fn a_free_parameter_in_and_outside_a_message_slot_is_refused() {
+        let (msg, pin) = render_use_pin(|view_web, m| Ty::Tuple(vec![view_web(m.clone()), m]));
+        let ipe_ir::CallPin::User(pins) = pin else {
+            panic!("the mixed parameter must be pinned, got {pin:?}");
+        };
+        assert!(
+            matches!(pins.get(&msg), Some(ipe_ir::UserPin::Unlowered(_))),
+            "a mixed free parameter must be refused, got {pins:?}"
+        );
     }
 
     /// An application whose argument count differs from the declaration's
