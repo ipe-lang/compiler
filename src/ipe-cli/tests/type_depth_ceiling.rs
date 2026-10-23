@@ -746,8 +746,8 @@ fn an_open_generic_an_opaque_carrier_drops_is_left_to_the_call_context() {
     );
 }
 
-/// `rowsOf` names `a` only inside a `Tag a` an opaque carrier (`Cond`) drops
-/// and in its result; the dropped `Tag` is never emitted.
+/// `rowsOf` names `a` only inside a `Tag a` under the stdlib `Cond` head,
+/// whose argument lowering drops, and in its result; `Tag` is never emitted.
 const CARRIED_PHANTOM_OPEN: &str = "module Main exposing (main)\n\nimport Ipe.Db.Store exposing (Cond(..))\nimport Ipe.Io as Io\nimport Ipe.List as List\n\n\ntype Tag a\n    = Tag\n\n\nrowsOf : Cond (Tag a) -> List a\nrowsOf _ =\n    []\n\n\nmain =\n    Io.println\n        (case List.head (rowsOf (IsNull \"x\")) of\n            Just _ ->\n                \"some\"\n\n            Nothing ->\n                \"none\"\n        )\n";
 
 /// An unused enum parameter nested only under an argument lowering drops

@@ -19449,18 +19449,19 @@ impl<'a> Lowerer<'a> {
     /// unused parameter ([`TypeArgFate::UnusedEnumParameter`]), on the same
     /// spine [`argument_vars`] reads.
     ///
-    /// The walk follows only the positions lowering emits, through the
-    /// same [`Self::fated_type_args`] decision: a distinct program union
+    /// The walk enters only a distinct program union
     /// ([`Self::is_distinct_program_union`], lowered ahead of every other
-    /// arm) is entered at its kept arguments and marks its unused-parameter
-    /// arguments erased, while an opaque-carrier argument (`Cond` row,
-    /// `Cache k v`) and every argument of any other head (a builtin, whose
-    /// lowering may drop it, as `Connection` and `Setting` do) is never
-    /// entered. A union nested only under such a dropped position is pruned,
-    /// never emitted, so a variable there is not erased by an unused
-    /// parameter. Below an erased argument every variable is erased with it.
-    /// An unentered position classes its variables
-    /// [`ArgumentErasure::Other`], the conservative answer.
+    /// arm), through the same [`Self::fated_type_args`] decision lowering
+    /// emits it by: it follows the kept arguments, marks the unused-parameter
+    /// arguments erased, and skips an opaque-carrier argument. Every other
+    /// head is a builtin non-distinct head and is never entered: the
+    /// builtins whose lowering drops an argument (`Connection`, `Setting`),
+    /// the non-distinct stdlib unions such as `Ipe.Db.Store`'s `Cond` rows
+    /// and `Ipe.Cache`'s `Cache k v`, and those that keep their arguments
+    /// (`List`, `Maybe`). A union nested under such a head is either pruned
+    /// or reached by a path this walk does not follow, so its variables
+    /// class [`ArgumentErasure::Other`], main's no-pin. Below an erased
+    /// argument every variable is erased with it.
     fn unused_enum_parameter_vars(&self, declared: &Ty) -> BTreeSet<u32> {
         let mut vars = BTreeSet::new();
         let mut stack: Vec<(&Ty, bool)> = Vec::new();
@@ -35371,10 +35372,11 @@ mod tests {
         assert_eq!(kept, Ok(vec![]));
     }
 
-    /// A variable is erased by an unused enum parameter only where lowering
-    /// emits that enum: under a direct `Tag a` it is, but under the dropped
-    /// argument of an opaque carrier (`Cond (Tag a)`) or of a builtin head
-    /// (`Connection (Tag a)`) the union is pruned, so it is not.
+    /// A variable is erased by an unused enum parameter only under a
+    /// distinct program union the walk enters: under a direct `Tag a` it is,
+    /// but under a builtin non-distinct head, a stdlib union (`Cond (Tag a)`)
+    /// or a builtin (`Connection (Tag a)`), it is never entered, so it is
+    /// not.
     #[test]
     fn an_unused_enum_parameter_under_a_dropped_argument_erases_no_variable() {
         let mut interner = Interner::new();
@@ -35445,7 +35447,7 @@ mod tests {
         lowerer
             .enum_variants
             .insert((ipe_ir::ModPath(store_home.clone()), cond), vec![compare]);
-        assert!(lowerer.is_distinct_program_union(&store_home, cond));
+        assert!(!lowerer.is_distinct_program_union(&store_home, cond));
         let var = 7;
         let tag_a = Ty::Con {
             module: vec![main],
