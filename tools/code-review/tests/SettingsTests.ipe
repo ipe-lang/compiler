@@ -23,17 +23,18 @@ import Ipe.Task as Task
 import Ipe.Time.Timestamp as Timestamp
 import Lib.Bind as Bind exposing (BindRefusal(..))
 import Lib.Db as LibDb exposing (Decision(..), HistoryCursor(..))
-import Lib.EnvLookup as EnvLookup
+import Lib.EnvLookup as EnvLookup exposing (StartupVar(..))
 import Lib.Format as Format
 import Lib.Highlight as Highlight exposing (Lang(..), Token(..))
 import Lib.Index as Index exposing (SourceView(..), StaleReason(..))
 import Lib.Keys as Keys exposing (KeyAction(..))
 import Lib.Links as Links exposing (Link(..))
+import Lib.PageSize as PageSize
 import Lib.Queue as Queue exposing (HistoryState(..), QueueState(..), UnitPageState(..))
 import Lib.RepoPath as RepoPath exposing (PathError(..), Root, RootMap)
 import Lib.ReviewKey as ReviewKey exposing (ReviewKey(..))
 import Lib.SafeText as SafeText
-import Lib.Settings as Settings
+import Lib.Settings as Settings exposing (DbRefusal(..), LogBreak(..))
 import TestSupport exposing (openFileAt, tableExists, envReview, countReviewRows, expectErr, refuse, seedIndex, writeFileText, fixtureLibRs, fixtureMainIpe, viewA, viewB, viewTag, shownTextOf, unitViewTag, execIndex, execIndexUnchecked, Scratch, freshScratch, freshDir, check, indexSchemaStatements, execIndexSchema, seedIndexDb, insertUnitRows, setIndexEnv, envSettings, loadFirstPage, checkUnits, listSecond, isUnitA, isUnitB, cleanupIndex, removeFileIfAny, codeText, noHazard, rendered, renderedForeign, describeText, refusedFor, openReadOnlyAt, vectorsPath, ipeIndexTestFile, repoFile, probeMessage, probeNames, maybeContains)
 
 
@@ -538,7 +539,7 @@ admittedSites =
     , ( "Ipe.Ffi", [] )
     , ( "Ipe.Env", [] )
     , ( "Ipe.Process", [] )
-    , ( "System.", [ ( "Main.ipe", 6 ), ( "Lib/RepoPath.ipe", 1 ), ( "Lib/ReviewKey.ipe", 1 ) ] )
+    , ( "System.", [ ( "Main.ipe", 5 ), ( "Lib/RepoPath.ipe", 1 ), ( "Lib/ReviewKey.ipe", 1 ) ] )
     , ( "getenv", [ ( "Main.ipe", 2 ), ( "Lib/ReviewKey.ipe", 1 ) ] )
     , ( "cwd", [ ( "Lib/RepoPath.ipe", 3 ) ] )
     , ( "isDir", [ ( "Lib/RepoPath.ipe", 6 ), ( "Lib/Settings.ipe", 1 ) ] )
@@ -1079,7 +1080,7 @@ macKeyParseRefuses =
             "5c0ffee15dec1dedba5eba11c0de0f0a11c0ffee5ca1ab1e0ddba11fee1900d1"
 
         expected =
-            "IPE_REVIEW_MAC_KEY must be exactly 64 hexadecimal characters (32 random bytes); the value set is not.\n  fix: generate one with `openssl rand -hex 32`."
+            "IPE_REVIEW_MAC_KEY: it must be exactly 64 hexadecimal characters (32 random bytes), and the value set is not; fix: generate one with `openssl rand -hex 32`"
 
         refusedExactly raw =
             case ReviewKey.parseMacKey raw of
@@ -1468,6 +1469,10 @@ checks =
         , check "an unreadable IPE_INDEX_REPOS refuses startup, never reads as unset" reposUnreadableRefused
         , check "an unreadable IPE_REVIEW_DB refuses startup, never reads as unset" reviewDbUnreadableRefused
         , check "the README env table lists exactly the variables the server reads" readmeEnvTableMatchesReads
+        , check "every page size the README states is the constant it names" readmePageSizesMatch
+        , check "every startup refusal is one line naming its variable and one fix" startupRefusalsOneLine
+        , check "a startup refusal quotes the file it names, so the file forges no line nor fix" startupRefusalQuotesFile
+        , Task.succeed ( "each broken-log refusal states its own problem and fix", logBreakTotal )
         , Task.succeed ( "the bind is accepted only unset, exactly 127.0.0.1 or exactly ::1", bindAcceptsLoopback )
         , Task.succeed ( "every other bind spelling is refused as not loopback, naming the value read", bindRefusesOtherValues )
         , Task.succeed ( "an empty bind is refused as empty and an unreadable one as unreadable", bindRefusesEmptyAndUnreadable )
@@ -1475,3 +1480,305 @@ checks =
         , Task.succeed ( "a bind refusal states the accepted-spelling rule for 127.0.0.2 and 0.0.0.0, never that the value is no loopback address", bindRefusalStatesRule )
         , Task.succeed ( "a bind refusal lists exactly the spellings the parser accepts, each accepted as itself", bindRefusalListsAcceptedSpellings )
         ]
+
+
+-- Every page size the README states is the `PageSize` constant it names on
+-- the same line, and that constant is declared and exposed by
+-- `src/Lib/PageSize.ipe`; a line stating a number about pages, open files or
+-- open units without naming its constant is refused, as is a constant name
+-- that cannot be read or is not known. Red if the README restates a page
+-- size by hand, or the constant changes and the README does not.
+readmePageSizesMatch : Task.Task Error Bool
+readmePageSizesMatch =
+    do
+        cwd <- System.cwd ()
+        readme <- readLibSource (cwd ++ "/README.md")
+        pageSource <- readLibSource (cwd ++ "/src/Lib/PageSize.ipe")
+        let
+            agrees =
+                pageSizesAgree pageSource
+
+            movedQueue =
+                List.map
+                    (\( name, rows ) ->
+                        if name == "queue" then
+                            ( name, rows + 1 )
+
+                        else
+                            ( name, rows )
+                    )
+                    pageSizeConstants
+        in
+        Task.succeed
+            (agrees pageSizeConstants readme
+                && List.length (List.filter (String.contains "`PageSize.") (String.lines readme)) == 3
+                && not (agrees movedQueue readme)
+                && not (agrees pageSizeConstants (readme ++ "\nThe queue view loads one page of at most 200 open units (`pageSize` in `src/Lib/Index.ipe`)."))
+                && not (agrees pageSizeConstants (readme ++ "\nThe list shows up to 32 open files."))
+                && not (agrees pageSizeConstants (readme ++ "\nOne page holds 32 rows (`PageSize.unknown` in `src/Lib/PageSize.ipe`)."))
+                && not (agrees pageSizeConstants (readme ++ "\nOne page holds 32 rows (`PageSize.queue in `src/Lib/PageSize.ipe`)."))
+                && not (agrees pageSizeConstants (readme ++ "\nOne page holds 33 rows (`PageSize.queue` in `src/Lib/PageSize.ipe`)."))
+                && not (pageSizesAgree (String.replace "queue : PageSize" "queued : PageSize" pageSource) pageSizeConstants readme)
+            )
+
+
+-- Each page-size constant the README may name, with its size.
+pageSizeConstants : List ( String, Int )
+pageSizeConstants =
+    [ ( "queue", PageSize.toInt PageSize.queue )
+    , ( "history", PageSize.toInt PageSize.history )
+    , ( "pairs", PageSize.toInt PageSize.pairs )
+    ]
+
+
+pageSizesAgree : String -> List ( String, Int ) -> String -> Bool
+pageSizesAgree pageSource constants readme =
+    List.all (pageSizeLineAgrees pageSource constants) (String.lines readme)
+
+
+-- A README line naming no constant states no number about pages; a line
+-- naming constants names only known ones the module declares and exposes,
+-- and every number on it is the size of one of them.
+pageSizeLineAgrees : String -> List ( String, Int ) -> String -> Bool
+pageSizeLineAgrees pageSource constants line =
+    let
+        numbers =
+            digitRuns line
+    in
+    case pageSizeNames line of
+        Nothing ->
+            False
+
+        Just names ->
+            if List.isEmpty names then
+                List.isEmpty numbers || not (List.any (\word -> String.contains word (String.toLower line)) [ "page", "open files", "open units" ])
+
+            else
+                not (List.isEmpty numbers)
+                    && List.all (\name -> sizeOf constants name /= Nothing && pageSizeDeclared pageSource name) names
+                    && List.all (\number -> List.any (\name -> sizeOf constants name == Just number) names) numbers
+
+
+-- The constant names a line holds as "`PageSize.<name>`"; `Nothing` when one
+-- is not a closed, alphabetic name.
+pageSizeNames : String -> Maybe (List String)
+pageSizeNames line =
+    List.foldr
+        (\piece names ->
+            let
+                parts =
+                    String.split "`" piece
+
+                name =
+                    Maybe.withDefault "" (List.head parts)
+            in
+            if List.length parts >= 2 && name /= "" && List.all Char.isAlpha (String.toList name) then
+                Maybe.map (\rest -> name :: rest) names
+
+            else
+                Nothing
+        )
+        (Just [])
+        (List.drop 1 (String.split "`PageSize." line))
+
+
+sizeOf : List ( String, Int ) -> String -> Maybe Int
+sizeOf constants name =
+    List.head
+        (List.filterMap
+            (\( known, rows ) ->
+                if known == name then
+                    Just rows
+
+                else
+                    Nothing
+            )
+            constants
+        )
+
+
+-- `name` is declared a `PageSize` in the module source and exposed by its
+-- header.
+pageSizeDeclared : String -> String -> Bool
+pageSizeDeclared pageSource name =
+    let
+        header =
+            Maybe.withDefault "" (List.head (String.lines pageSource))
+    in
+    List.member (name ++ " : PageSize") (String.lines pageSource)
+        && List.any (\form -> String.contains form header) [ ", " ++ name ++ ",", ", " ++ name ++ ")", "(" ++ name ++ "," ]
+
+
+-- Each maximal run of decimal digits in `line`, as a number.
+digitRuns : String -> List Int
+digitRuns line =
+    let
+        step c ( current, runs ) =
+            if Char.isDigit c then
+                ( current ++ String.fromChar c, runs )
+
+            else if current == "" then
+                ( current, runs )
+
+            else
+                ( "", current :: runs )
+    in
+    case List.foldl step ( "", [] ) (String.toList line) of
+        ( last, runs ) ->
+            List.filterMap String.toInt (last :: runs)
+
+
+-- Every tool-authored startup refusal, printed as `main` prints it, is one
+-- line in the shared layout: it starts with its variable and a colon, states
+-- exactly one fix, and holds no line break nor any escape the printer adds.
+-- Covered: each variable through the renderer, with and without a file, each
+-- `LogBreak`, the key mismatch, both key refusals, and each `DbRefusal` of
+-- `openFailure` for both databases. Red if a producer embeds a line break,
+-- lays its text out by hand, or appends a second fix.
+startupRefusalsOneLine : Task.Task Error Bool
+startupRefusalsOneLine =
+    do
+        base <- freshDir "ipe-settings-startup-one-line"
+        writeFileText (base ++ "/present.db") "not a database"
+        present <- Task.fromResult (Path.fromString (base ++ "/present.db"))
+        missing <- Task.fromResult (Path.fromString (base ++ "/missing.db"))
+        directory <- Task.fromResult (Path.fromString base)
+        opened <- Task.sequence (List.concatMap (\role -> List.map (openRefusal role present missing directory) dbRefusals) [ Settings.IndexDb, Settings.ReviewDb ])
+        let
+            rendered =
+                List.concatMap (\var -> [ ( var, sampleRefusal var Nothing ), ( var, sampleRefusal var (Just present) ) ]) EnvLookup.startupVars
+                    ++ List.map (\break -> ( ReviewDbVar, Settings.brokenLog present break )) Settings.logBreaks
+                    ++ ( ReviewKeyVar, LibDb.keyMismatchRefusal present )
+                    :: keyRefusals
+                    ++ List.map (\( role, e ) -> ( Settings.roleVar role, e )) opened
+        in
+        Task.succeed
+            (List.length keyRefusals == 2
+                && List.length opened == 2 * List.length dbRefusals
+                && List.length EnvLookup.startupVars == 5
+                && List.all oneLineRefusal rendered
+                && not (oneLineRefusal ( ReviewDbVar, Error.invalidInput "IPE_REVIEW_DB: it is refused.\n  fix: set it again" ))
+                && not (oneLineRefusal ( ReviewDbVar, Error.invalidInput "IPE_REVIEW_DB: it is refused; fix: set it again; fix: restore it" ))
+            )
+
+
+sampleRefusal : StartupVar -> Maybe Path.Path -> Error
+sampleRefusal var file =
+    EnvLookup.startupRefusal { var = var, file = file, problem = "it is refused", fix = "set it again" }
+
+
+-- The file a startup refusal names came from the environment: it is quoted
+-- with its hazards and its `"` escaped, so a path holding a quote, a
+-- `; fix:`, a line break or an escape sequence cannot close its quotes,
+-- forge a second line or a second fix outside them, or reach the terminal
+-- as a control sequence. Red if the renderer writes the file unquoted.
+startupRefusalQuotesFile : Task.Task Error Bool
+startupRefusalQuotesFile =
+    let
+        raw =
+            "/tmp/x\"; fix: rm -rf ~\n" ++ codeText 27 ++ "[31my.db"
+    in
+    do
+        file <- Task.fromResult (Path.fromString raw)
+        let
+            shown =
+                renderedForeign (Error.message (sampleRefusal ReviewDbVar (Just file)))
+        in
+        Task.succeed
+            (Path.toString file == raw
+                && shown == "IPE_REVIEW_DB: cannot use \"/tmp/x\\\"; fix: rm -rf ~\\n\\u{1b}[31my.db\": it is refused; fix: set it again"
+                && not (String.contains "\n" shown)
+                && noHazard shown
+            )
+
+
+-- The two refusals of a review key: a value that is not a key, and a read
+-- of the variable that failed.
+keyRefusals : List ( StartupVar, Error )
+keyRefusals =
+    List.filterMap
+        (\result ->
+            case result of
+                Ok _ ->
+                    Nothing
+
+                Err e ->
+                    Just ( ReviewKeyVar, e )
+        )
+        [ Result.map (\_ -> ()) (ReviewKey.parseMacKey "x")
+        , Result.map (\_ -> ()) (ReviewKey.keyFromLookup (Err Error.permissionDenied))
+        ]
+
+
+-- The rendered refusal starts with its variable, holds one fix, and carries
+-- no line break and no escape.
+oneLineRefusal : ( StartupVar, Error ) -> Bool
+oneLineRefusal ( var, e ) =
+    let
+        text =
+            renderedForeign (Error.message e)
+    in
+    String.startsWith (EnvLookup.startupVarName var ++ ":") text
+        && not (String.contains "\\" text)
+        && not (String.contains "\n" text)
+        && List.length (String.split "; fix: " text) == 2
+
+
+-- Every `DbRefusal`.
+dbRefusals : List DbRefusal
+dbRefusals =
+    [ NoDatabaseFile, NotSqliteFile, Locked, NotPermitted, NotAFile, MissingSchema, Unusable ]
+
+
+-- The refusal `openFailure` gives for `refusal`, from a location and a
+-- typed failure that classify as it.
+openRefusal : Settings.DbRole -> Path.Path -> Path.Path -> Path.Path -> DbRefusal -> Task.Task Error ( Settings.DbRole, Error )
+openRefusal role present missing directory refusal =
+    let
+        failed at failure =
+            Settings.openFailure role at (Error.withDetails (Database failure) (Error.unexpected "db failed"))
+                |> Task.onError (\e -> Task.succeed ( role, e ))
+    in
+    case refusal of
+        NoDatabaseFile ->
+            failed missing Db.CannotOpen
+
+        NotSqliteFile ->
+            failed present Db.NotADatabase
+
+        Locked ->
+            failed present Db.Busy
+
+        NotPermitted ->
+            failed present Db.AccessDenied
+
+        NotAFile ->
+            failed directory Db.OtherFailure
+
+        MissingSchema ->
+            failed present Db.InvalidStatement
+
+        Unusable ->
+            failed present Db.OtherFailure
+
+
+-- Each `LogBreak` states a problem and a fix of its own: the problems are
+-- pairwise distinct, and a log recorded before names were kept, which no
+-- copy repairs, is never told to restore one. Red if a break shares another's
+-- problem or offers a remedy that cannot clear it.
+logBreakTotal : Bool
+logBreakTotal =
+    let
+        problems =
+            List.map Settings.logBreakProblem Settings.logBreaks
+
+        fixes =
+            List.map Settings.logBreakFix Settings.logBreaks
+    in
+    List.length Settings.logBreaks == 3
+        && List.all (\text -> String.trim text /= "") (problems ++ fixes)
+        && List.length (List.unique problems) == List.length problems
+        && not (String.contains "restore" (Settings.logBreakFix UnnamedRows))
+        && String.contains "new file" (Settings.logBreakFix UnnamedRows)
+        && Settings.logBreakFix UnnamedRows /= Settings.logBreakFix HeadMissing
+        && String.contains "restore" (Settings.logBreakFix GuardLost)

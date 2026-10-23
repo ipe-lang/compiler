@@ -1,6 +1,7 @@
 module IndexTests exposing (checks)
 
 import Ipe.ByteSize as ByteSize
+import Ipe.Bytes as Bytes
 import Ipe.Char as Char
 import Ipe.Crypto as Crypto
 import Ipe.Db as Db
@@ -87,7 +88,7 @@ fixtureLabel unit =
         "u-b"
 
     else
-        Uid.toString unit
+        TestSupport.uidHex unit
 
 
 -- True for an `Unreadable` view tag whose rendered error contains `needle`.
@@ -283,7 +284,7 @@ actedColumnsPastWindowFailRead =
                 && not (maybeContains (String.repeat 64 "a") message)
     in
     do
-        oldHash <- readMessageAfter "ipe-index-old-hash-past-window" ("UPDATE change_queue SET old_hash = " ++ long ++ " WHERE uid = '" ++ Uid.toString (uid "u-b") ++ "'") (\conn -> pendingRows conn |> Task.map (\_ -> ()))
+        oldHash <- readMessageAfter "ipe-index-old-hash-past-window" ("UPDATE change_queue SET old_hash = " ++ long ++ " WHERE uid = '" ++ TestSupport.uidHex (uid "u-b") ++ "'") (\conn -> pendingRows conn |> Task.map (\_ -> ()))
         pair <- readMessageAfter "ipe-index-pair-past-window" ("INSERT INTO reviewed VALUES ('x', " ++ long ++ ")") (\conn -> snapshotOn conn |> Task.map (\_ -> ()))
         stamp <- readMessageAfter "ipe-index-stamp-past-window" ("INSERT OR REPLACE INTO reviewed_stamp (one, head) VALUES (1, " ++ long ++ ")") (\conn -> Index.readStamp conn |> Task.map (\_ -> ()))
         tag <- reposProbeAfter "ipe-index-repos-tag-past-window" [ "INSERT INTO repos (tag, outer, prefix) VALUES (" ++ long ++ ", NULL, NULL)" ] noRepos
@@ -602,9 +603,6 @@ classifyRefusesPastLineCeiling =
         TooLarge (ChildSpans _) ->
             False
 
-        TooLarge (ViewNodes _) ->
-            False
-
         Shown _ ->
             False
 
@@ -627,39 +625,13 @@ classifyLine line =
     Index.classifyView (uid "u-n") Rust (Index.attest line) (LineRange 1 1) line
 
 
--- The element count a view past the element ceiling was withheld with.
-nodesOver : SourceView -> Maybe Int
-nodesOver view =
-    case view of
-        TooLarge (ViewNodes o) ->
-            Just o.nodes
-
-        TooLarge (SpanLines _) ->
-            Nothing
-
-        TooLarge (ViewBytes _) ->
-            Nothing
-
-        TooLarge (ChildSpans _) ->
-            Nothing
-
-        Shown _ ->
-            Nothing
-
-        Stale _ ->
-            Nothing
-
-        Unreadable _ ->
-            Nothing
-
-
 -- The elements and mode of a shown view's drawing.
 drawnShape : SourceView -> Maybe ( Int, Mode )
 drawnShape view =
     Maybe.map (\shown -> ( Drawn.elements (Index.shownDrawn shown), Drawn.mode (Index.shownDrawn shown) )) (shownOf view)
 
 
--- The control for `viewPastNodeCeilingWithheld`: a line drawn in exactly
+-- The control for `viewPastNodeCeilingSpelled`: a line drawn in exactly
 -- `viewNodeCeiling` elements, too many to highlight, is shown plain with
 -- that count. Red if the ceiling is compared with `<`.
 viewAtNodeCeilingShown : Bool
@@ -668,22 +640,24 @@ viewAtNodeCeilingShown =
         == Just ( Index.viewNodeCeiling, Unhighlighted )
 
 
--- One element past the ceiling, with one line and a few KiB, under the line
--- and byte ceilings, is withheld with its exact element count. Red if the
--- element check is removed.
-viewPastNodeCeilingWithheld : Bool
-viewPastNodeCeilingWithheld =
+-- One element past the ceiling plain, with one line and a few KiB, under
+-- the line and byte ceilings, is shown spelled out in four elements, never
+-- withheld. Red if the spelled drawing is not tried, or a drawing past the
+-- ceiling is kept.
+viewPastNodeCeilingSpelled : Bool
+viewPastNodeCeilingSpelled =
     let
         line =
             escapeLine (Index.viewNodeCeiling - 3)
     in
-    nodesOver (classifyLine line) == Just (Index.viewNodeCeiling + 1)
+    drawnShape (classifyLine line) == Just ( 4, SpelledOut )
         && String.length line < ByteSize.toBytes Index.viewByteCeiling
 
 
 -- A line of 7000 keywords takes more elements coloured than the ceiling and
--- four plain, so it is shown plain; a short line is shown coloured. Red if
--- the plain drawing is not tried, or tried first.
+-- four plain, so it is shown plain, not spelled out; a short line is shown
+-- coloured. Red if the plain drawing is not tried, or tried first, or the
+-- spelled one is tried first.
 plainFallbackWhenColorsTooMany : Bool
 plainFallbackWhenColorsTooMany =
     let
@@ -696,8 +670,8 @@ plainFallbackWhenColorsTooMany =
 
 
 -- A 14 KB line of one token per byte, and a 129 KiB one, are shown plain
--- or withheld, never coloured past the ceiling; a 129 KiB line of escapes
--- is withheld by its element count. Red if the element check is removed.
+-- or spelled out, never coloured past the ceiling; a 129 KiB line of escapes
+-- is shown spelled out. Red if a drawing past the ceiling is kept.
 longTokenLinesNeverHighlighted : Bool
 longTokenLinesNeverHighlighted =
     let
@@ -705,6 +679,9 @@ longTokenLinesNeverHighlighted =
             case drawnShape view of
                 Just ( count, Unhighlighted ) ->
                     count <= Index.viewNodeCeiling
+
+                Just ( count, SpelledOut ) ->
+                    count == 4
 
                 Just ( _, Highlighted ) ->
                     False
@@ -717,32 +694,74 @@ longTokenLinesNeverHighlighted =
     in
     withinCeiling (classifyLine (String.repeat 7000 "1 "))
         && withinCeiling (classifyLine (String.repeat 66048 "1 "))
-        && nodesOver (classifyLine escapes) == Just 33028
+        && drawnShape (classifyLine escapes) == Just ( 4, SpelledOut )
         && 4 * 33024 < ByteSize.toBytes Index.viewByteCeiling
 
 
--- A view past the element ceiling under a wrong hash is too large, not
--- drifted: it is counted before it is hashed.
-nodeOversizeRanksBeforeDrift : Bool
-nodeOversizeRanksBeforeDrift =
+-- An escape-dense view under a wrong hash is drifted: with no element
+-- refusal left, the attestation compare follows the byte check.
+escapeDenseWrongHashDrifted : Bool
+escapeDenseWrongHashDrifted =
     let
         line =
             escapeLine Index.viewNodeCeiling
     in
-    nodesOver (Index.classifyView (uid "u-n") Rust (Index.attest "another view") (LineRange 1 1) line)
-        == Just (Index.viewNodeCeiling + 4)
+    viewTag (Index.classifyView (uid "u-n") Rust (Index.attest "another view") (LineRange 1 1) line) == "drifted"
+
+
+-- A thousand lines of thirty escapes each, past the element ceiling drawn
+-- plain and under the line and byte ceilings, are shown spelled out in four
+-- elements, never withheld for their escapes. Red if the spelled drawing is
+-- dropped or an element refusal returns.
+escapeDenseUnitShownSpelled : Bool
+escapeDenseUnitShownSpelled =
+    let
+        text =
+            String.join "\n" (List.repeat 1000 (escapeLine 30))
+
+        view =
+            Index.classifyView (uid "u-d") Rust (Index.attest text) (LineRange 1 1000) text
+    in
+    drawnShape view == Just ( 4, SpelledOut )
+        && Maybe.map Index.shownText (shownOf view) == Just text
+        && Bytes.length (Bytes.fromString text) < ByteSize.toBytes Index.viewByteCeiling
+
+
+-- A file unit whose every other line another unit covers, 4999 lines with
+-- 2499 covered runs, inside the line and child-span ceilings, draws plain
+-- past the element ceiling and is shown spelled out in four elements. Red
+-- if a residual's gaps are drawn one element each past the ceiling.
+alternatingResidualShownSpelled : Bool
+alternatingResidualShownSpelled =
+    let
+        src =
+            xLines 4999
+
+        spans =
+            List.map (\k -> ( 2 * k, 2 * k )) (List.range 1 2499)
+
+        view =
+            Index.classifyView (uid "u-file") Rust (Index.attestResidual (Index.residualText spans src)) (Residual spans) src
+    in
+    List.length spans <= Index.childSpanCeiling
+        && drawnShape view == Just ( 4, SpelledOut )
 
 
 -- The relation the element ceiling is chosen by: its elements at the cost
 -- of one, plus the reserve, fit three quarters of the runtime's session
 -- ceiling, and the reserve holds the largest view's text sixteen times over
--- with 128 bytes for each of its lines. Red if a ceiling or a cost moves
--- without the other.
+-- with 128 bytes for each of its lines, and a spelled drawing's gap text,
+-- gap mark and two line breaks for each line. Red if a ceiling or a cost
+-- moves without the other.
 nodeCeilingFitsSessionCeiling : Bool
 nodeCeilingFitsSessionCeiling =
+    let
+        spelledLineBytes =
+            Bytes.length (Bytes.fromString Drawn.spelledGapText) + Bytes.length (Bytes.fromString Drawn.spelledGapMark) + 2
+    in
     0 < Index.viewNodeCeiling
         && Index.viewNodeCeiling * ByteSize.toBytes Index.elementResidentBytes + ByteSize.toBytes Index.viewReserve <= ByteSize.toBytes Index.runtimeSessionCeiling // 4 * 3
-        && 16 * ByteSize.toBytes Index.viewByteCeiling + 128 * Index.viewLineCeiling <= ByteSize.toBytes Index.viewReserve
+        && 16 * ByteSize.toBytes Index.viewByteCeiling + 128 * Index.viewLineCeiling + spelledLineBytes * Index.viewLineCeiling <= ByteSize.toBytes Index.viewReserve
 
 
 -- The relation the queue page is sized by: a full page's elements at the
@@ -1437,7 +1456,7 @@ unrecordedUnitListed =
 -- in a missing `old_hash`.
 changeDecodeRefusesModifiedWithoutOld : Task.Task Error Bool
 changeDecodeRefusesModifiedWithoutOld =
-    pageReadFailsAfter "ipe-index-modified-no-old" ("UPDATE change_queue SET old_hash = NULL WHERE uid = '" ++ Uid.toString (uid "u-b") ++ "'")
+    pageReadFailsAfter "ipe-index-modified-no-old" ("UPDATE change_queue SET old_hash = NULL WHERE uid = '" ++ TestSupport.uidHex (uid "u-b") ++ "'")
 
 
 -- An index whose queue row reports a change kind this reviewer does not
@@ -1477,7 +1496,7 @@ redefinedViewHidesNoUnit =
         at <- freshScratch "ipe-index-redefined-view"
         removeFileIfAny at.indexDb
         seedIndex at.indexDb at.repo
-        execIndexScript at.indexDb ("DROP VIEW open_units; CREATE VIEW open_units AS SELECT uid, path, name, qualified, kind, line_start, line_end, facing, purpose, body_hash, updated_sha, NULL AS lang, NULL AS change, NULL AS old_hash, 0 AS enqueued_at FROM units WHERE uid <> '" ++ Uid.toString (uid "u-b") ++ "'")
+        execIndexScript at.indexDb ("DROP VIEW open_units; CREATE VIEW open_units AS SELECT uid, path, name, qualified, kind, line_start, line_end, facing, purpose, body_hash, updated_sha, NULL AS lang, NULL AS change, NULL AS old_hash, 0 AS enqueued_at FROM units WHERE uid <> '" ++ TestSupport.uidHex (uid "u-b") ++ "'")
         r <- loadFirstPage
         cleanupIndex at.indexDb at.repo
         Task.succeed (r.total == 2 && List.map (\e -> e.uid) r.units == [ uid "u-a", uid "u-b" ])
@@ -1615,7 +1634,7 @@ indexExposingScanRefusesEvasions =
 -- Every name `Lib.Index` exposes, a type's constructors written bare.
 indexExposes : List String
 indexExposes =
-    [ "Attested", "AttestedHash", "Body", "ChainHead", "ChainVerdict", "Change", "Cursor", "DecidedPair", "LogStatus", "Oversize", "PendingRow", "ReadFailure", "RefusalDigest", "RefusalReason", "RefusalRow", "ShownSource", "Snapshot", "SourceView", "StaleReason", "Stamp", "Unit", "UnitView", "Written", "ackable", "attest", "attestResidual", "attestedHash", "attestedHashMaxBytes", "attestedName", "attestedUid", "candidateQuery", "chainHeadDecoder", "chainHeadText", "chainKeyCheck", "chainLogId", "chainMac", "chainNext", "chainSeq", "childSpanCeiling", "classifyView", "decidedPairDecoder", "decidedPairKey", "digestPair", "drainDecided", "drainUnit", "drawnDepthCeiling", "elementResidentBytes", "lengthPrefixed", "linkElements", "liveFiles", "liveUnits", "loadView", "placeholders", "probe", "probeRepos", "probeRoot", "queueElementCeiling", "queueLabelByteCeiling", "readConnection", "readFailureText", "readSnapshot", "readStamp", "rebuildReviewed", "refusalDigestText", "refusalReasons", "refusalRowDecoder", "refusalTag", "residualText", "reverify", "reverifyRefusal", "runtimeEntryOverhead", "runtimeSessionCeiling", "shortHash", "shownDrawn", "shownHash", "shownRows", "shownText", "signedStamp", "sourceCeiling", "spanOversize", "stampStatus", "stampText", "storedHash", "unescapeShown", "unitName", "unsignedStamp", "viewByteCeiling", "viewLineCeiling", "viewLines", "viewNodeCeiling", "viewReserve", "viewText" ]
+    [ "Attested", "AttestedHash", "Body", "ChainHead", "ChainVerdict", "Change", "Cursor", "DecidedPair", "LogStatus", "Oversize", "PendingRow", "ReadFailure", "RefusalDigest", "RefusalReason", "RefusalRow", "ShownHash", "ShownSource", "Snapshot", "SourceView", "StaleReason", "Stamp", "Unit", "UnitView", "Written", "ackable", "attest", "attestResidual", "attestedHash", "attestedHashMaxBytes", "attestedName", "attestedUid", "candidateQuery", "chainHeadDecoder", "chainHeadText", "chainKeyCheck", "chainLogId", "chainMac", "chainNext", "chainSeq", "childSpanCeiling", "classifyView", "decidedPairDecoder", "decidedPairKey", "digestPair", "drainDecided", "drainUnit", "drawnDepthCeiling", "elementResidentBytes", "lengthPrefixed", "linkElements", "liveFiles", "liveUnits", "loadView", "placeholders", "probe", "probeRepos", "probeRoot", "queueElementCeiling", "queueLabelByteCeiling", "readConnection", "readFailureText", "readSnapshot", "readStamp", "rebuildReviewed", "refusalDigestText", "refusalReasons", "refusalRowDecoder", "refusalTag", "residualText", "reverify", "reverifyRefusal", "runtimeEntryOverhead", "runtimeSessionCeiling", "shortHash", "shownDigest", "shownDrawn", "shownHash", "shownRows", "shownText", "signedStamp", "sourceCeiling", "spanOversize", "stampStatus", "stampText", "storedHash", "unescapeShown", "unitName", "unsignedStamp", "viewByteCeiling", "viewLineCeiling", "viewLines", "viewNodeCeiling", "viewReserve", "viewText" ]
 
 
 -- The readers `Index.readSnapshot` runs in its transaction.
@@ -1786,7 +1805,7 @@ unboundUnitsExcluded =
                 && after.units == before.units
                 && after.open == before.open
                 && List.length after.rows == List.length before.rows
-                && not (List.any (\row -> Uid.toString row.unit.uid == Uid.toString (uid "u-ext")) after.rows)
+                && not (List.any (\row -> TestSupport.uidHex row.unit.uid == TestSupport.uidHex (uid "u-ext")) after.rows)
                 && (case view of
                         Just _ ->
                             False
@@ -1808,7 +1827,7 @@ unjudgedUnitFailsSnapshot =
         removeFileIfAny at.indexDb
         seedIndex at.indexDb at.repo
         intact <- indexConn |> Task.andThen snapshotOn |> Task.map (\_ -> True) |> Task.onError (\_ -> Task.succeed False)
-        execIndexScript at.indexDb ("CREATE TABLE units_copy AS SELECT * FROM units; DROP TABLE units; CREATE TABLE units AS SELECT * FROM units_copy; DROP TABLE units_copy; UPDATE units SET path = NULL WHERE uid = '" ++ Uid.toString (uid "u-a") ++ "'")
+        execIndexScript at.indexDb ("CREATE TABLE units_copy AS SELECT * FROM units; DROP TABLE units; CREATE TABLE units AS SELECT * FROM units_copy; DROP TABLE units_copy; UPDATE units SET path = NULL WHERE uid = '" ++ TestSupport.uidHex (uid "u-a") ++ "'")
         message <- probeMessage (indexConn |> Task.andThen snapshotOn |> Task.map (\_ -> ()))
         cleanupIndex at.indexDb at.repo
         Task.succeed (intact && maybeContains "the index's unit counts do not add up" message)
@@ -1855,9 +1874,9 @@ liveReadsBoundedByUids =
         execIndexScript at.indexDb
             ("CREATE TABLE units_copy AS SELECT * FROM units; DROP TABLE units; CREATE TABLE units AS SELECT * FROM units_copy; DROP TABLE units_copy; "
                 ++ "INSERT INTO units SELECT * FROM units WHERE uid = '"
-                ++ Uid.toString (uid "u-a")
+                ++ TestSupport.uidHex (uid "u-a")
                 ++ "'; INSERT INTO units SELECT * FROM units WHERE uid = '"
-                ++ Uid.toString (uid "u-a")
+                ++ TestSupport.uidHex (uid "u-a")
                 ++ "' LIMIT 1; "
                 ++ "CREATE TABLE refusals_copy AS SELECT * FROM refusals; DROP TABLE refusals; CREATE TABLE refusals AS SELECT * FROM refusals_copy; DROP TABLE refusals_copy; "
                 ++ "INSERT INTO refusals SELECT * FROM refusals; INSERT INTO refusals SELECT * FROM refusals LIMIT 1"
@@ -1935,10 +1954,12 @@ checks =
         , Task.succeed ( "the view ceilings are positive and within the read ceiling", viewCeilingsWellFormed )
         , Task.succeed ( "the drawn lines are the attested lines", shownLinesAreAttestedLines )
         , Task.succeed ( "a view drawn in exactly the element ceiling is shown", viewAtNodeCeilingShown )
-        , Task.succeed ( "a view one element past the element ceiling is withheld, counted in elements", viewPastNodeCeilingWithheld )
+        , Task.succeed ( "a view one element past the element ceiling plain is shown spelled out", viewPastNodeCeilingSpelled )
         , Task.succeed ( "a view too many elements to highlight is shown plain, a small one highlighted", plainFallbackWhenColorsTooMany )
-        , Task.succeed ( "a long line of one token per byte is never shown highlighted, and one of escapes is withheld", longTokenLinesNeverHighlighted )
-        , Task.succeed ( "a view past the element ceiling is too large, never drifted", nodeOversizeRanksBeforeDrift )
+        , Task.succeed ( "a long line of one token per byte is never shown highlighted, and one of escapes is shown spelled out", longTokenLinesNeverHighlighted )
+        , Task.succeed ( "an escape-dense view under a wrong hash is drifted", escapeDenseWrongHashDrifted )
+        , Task.succeed ( "a unit of a thousand escape-dense lines is shown spelled out, never withheld", escapeDenseUnitShownSpelled )
+        , Task.succeed ( "a file unit with every other line covered is shown spelled out", alternatingResidualShownSpelled )
         , Task.succeed ( "the element ceiling, at the cost per element, fits three quarters of the runtime's session ceiling", nodeCeilingFitsSessionCeiling )
         , Task.succeed ( "a full queue page's elements and label bytes fit the quarter of the session ceiling the unit view leaves", queueCeilingFitsQuarter )
         , check "a mebibyte purpose reaches the queue page and the unit page cut to the purpose cap, its marker counting the dropped bytes" purposeOfOneMibIsBounded

@@ -23,6 +23,9 @@ module TestSupport exposing
     , check
     , checkReporting
     , onFreshReview
+    , withReviewDb
+    , bracketDb
+    , applyEdits
     , indexSchemaStatements
     , execIndexSchema
     , seedIndexDb
@@ -86,6 +89,7 @@ module TestSupport exposing
     , carriesFailure
     , carriesNoFailure
     , uid
+    , uidHex
     , resyncBoundOf
     , testKeyHex
     , testMacKey
@@ -180,6 +184,40 @@ uid label =
 
         Err _ ->
             uid ""
+
+
+-- A unit id's hex, for a test's fixture text and messages. `Lib.Uid` has
+-- no text exit, so this reads the text back from its SQL bind form; the
+-- source scans cover `src/Lib` only, which keeps the helper out of the app.
+uidHex : Uid -> String
+uidHex id =
+    case Uid.toSql id of
+        SqlString hex ->
+            hex
+
+        SqlInt _ ->
+            ""
+
+        SqlFloat _ ->
+            ""
+
+        SqlBool _ ->
+            ""
+
+        SqlBytes _ ->
+            ""
+
+        SqlTime _ ->
+            ""
+
+        SqlDecimal _ ->
+            ""
+
+        SqlMoney _ ->
+            ""
+
+        SqlNull _ ->
+            ""
 
 
 fixtureHex : String -> String
@@ -304,9 +342,6 @@ viewTag view =
         TooLarge (ChildSpans o) ->
             "too large spans " ++ String.fromInt o.atLeast
 
-        TooLarge (ViewNodes o) ->
-            "too large nodes " ++ String.fromInt o.nodes
-
 
 shownTextOf : Index.SourceView -> Maybe String
 shownTextOf view =
@@ -428,12 +463,57 @@ onFreshReview name f =
 onReviewAt : String -> (Db -> Task.Task Error Bool) -> Task.Task Error Bool
 onReviewAt reviewDb f =
     do
-        db <- migratedReviewAt reviewDb
-        ok <- f db
+        loc <- Settings.parseReviewDb reviewDb
+        key <- testReviewKey
+        LibDb.probe key loc
+        ok <- withReviewDb loc f
         removeFileIfAny reviewDb
         removeFileIfAny (reviewDb ++ "-wal")
         removeFileIfAny (reviewDb ++ "-shm")
         Task.succeed ok
+
+
+-- The review database at `loc` handed to `body`, and closed once `body`
+-- settles, on success and on failure alike; `body`'s result or error is then
+-- passed on unchanged.
+withReviewDb : Settings.ReviewFile -> (Db -> Task.Task Error a) -> Task.Task Error a
+withReviewDb loc body =
+    bracketDb (LibDb.openAt loc) body
+
+
+-- The database `open` yields handed to `body`, then closed whichever way
+-- `body` settles: the outcome is held as a `Result` across the one close, so
+-- the success and the failure path share it. A test that opens through here
+-- leaves no pool open on its file, so it never deletes the file under a live
+-- pool, nor reads through a pool opened before another one changed the file.
+bracketDb : Task.Task Error Db -> (Db -> Task.Task Error a) -> Task.Task Error a
+bracketDb open body =
+    open
+        |> Task.andThen
+            (\db ->
+                body db
+                    |> Task.map Ok
+                    |> Task.onError (\e -> Task.succeed (Err e))
+                    |> Task.andThen (\outcome -> Db.close db |> Task.andThen (\_ -> Task.fromResult outcome))
+            )
+
+
+-- `edits`, made outside the tool, run in order on one connection of `db`
+-- in one transaction, after a read of the schema table. A pooled connection
+-- keeps the schema it last read, and SQLite refuses a `CREATE TRIGGER` or a
+-- rename onto a name that stale schema still holds without reading it
+-- again, so an edit run on whichever connection the pool hands out passes or
+-- fails by which one it got. The read loads the file's schema as it stands,
+-- and the transaction holds every edit on that connection.
+applyEdits : Db -> List String -> Task.Task Error ()
+applyEdits db edits =
+    Db.withTransaction db
+        (\tx ->
+            do
+                Db.queryDecode tx "SELECT COUNT(*) AS total FROM sqlite_master" [] totalDecoder
+                Task.sequence (List.map (\sql -> Db.exec tx sql []) edits)
+                Task.succeed ()
+        )
 
 
 -- One named check. A check whose task fails is reported by name with its
@@ -779,7 +859,7 @@ pageEntry conn roots row =
                         Task.succeed { uid = unit, unit = loaded.unit, change = row.change, view = loaded.view }
 
                     Nothing ->
-                        Task.fail (Error.conflict ("queued unit " ++ Uid.toString unit ++ " has no view"))
+                        Task.fail (Error.conflict ("queued unit " ++ uidHex unit ++ " has no view"))
             )
 
 
@@ -803,7 +883,7 @@ loadUnitNow unit =
 -- the run.
 decideNow : Db -> Uid -> LibDb.Decision -> Task.Task Error ( Index.Attested, Index.Written )
 decideNow db unit decision =
-    accepted ("the decision on " ++ Uid.toString unit) (decidedNow db unit decision)
+    accepted ("the decision on " ++ uidHex unit) (decidedNow db unit decision)
 
 
 -- `decideNow`'s result with a refusal kept as a value.
@@ -817,7 +897,7 @@ decidedNow db unit decision =
                         decideShownNow db shown decision
 
                     Nothing ->
-                        Task.fail (Error.conflict ("unit " ++ Uid.toString unit ++ " is not shown"))
+                        Task.fail (Error.conflict ("unit " ++ uidHex unit ++ " is not shown"))
             )
 
 
@@ -1201,7 +1281,7 @@ rawReason reason =
 -- absent, then the row's name.
 rawMacInput : String -> Int -> String -> RawRow -> String
 rawMacInput logId seq prev row =
-    rawMacInputWith logId seq prev (Uid.toString row.uid) row
+    rawMacInputWith logId seq prev (uidHex row.uid) row
 
 
 -- `rawMacInput` with `uidText` as the uid field.
@@ -1455,19 +1535,19 @@ reverifyShown unit found =
         Just loaded ->
             case loaded.view of
                 Shown shown ->
-                    envSettings |> Task.andThen (\settings -> accepted ("fixture unit " ++ Uid.toString unit) (Index.reverify settings shown))
+                    envSettings |> Task.andThen (\settings -> accepted ("fixture unit " ++ uidHex unit) (Index.reverify settings shown))
 
                 Stale _ ->
-                    Task.fail (Error.conflict ("fixture unit " ++ Uid.toString unit ++ " is stale"))
+                    Task.fail (Error.conflict ("fixture unit " ++ uidHex unit ++ " is stale"))
 
                 Unreadable _ ->
-                    Task.fail (Error.conflict ("fixture unit " ++ Uid.toString unit ++ " is unreadable"))
+                    Task.fail (Error.conflict ("fixture unit " ++ uidHex unit ++ " is unreadable"))
 
                 TooLarge _ ->
-                    Task.fail (Error.conflict ("fixture unit " ++ Uid.toString unit ++ " is too large"))
+                    Task.fail (Error.conflict ("fixture unit " ++ uidHex unit ++ " is too large"))
 
         Nothing ->
-            Task.fail (Error.conflict ("fixture unit " ++ Uid.toString unit ++ " is not in the index"))
+            Task.fail (Error.conflict ("fixture unit " ++ uidHex unit ++ " is not in the index"))
 
 
 -- A test file path opened read-only through the location the app builds

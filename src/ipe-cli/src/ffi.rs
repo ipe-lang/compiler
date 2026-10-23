@@ -324,17 +324,6 @@ pub fn find_cache_root(start: &Path) -> Result<Option<TrustedCache>, CliError> {
     Ok(None)
 }
 
-/// Load the installed-crate catalog for a build rooted at (or blamed on)
-/// `blame_path`. Absent cache ⇒ empty catalog.
-///
-/// # Errors
-/// [`CliError::TrustRefused`] relaying the catalog loader's diagnostic (a
-/// tampered or half-written cache is refused, never silently skipped), or
-/// refusing a cache entry that fails the owner rule.
-pub fn load_catalog_for(blame_path: &Path) -> Result<Vec<InstalledCrate>, CliError> {
-    load_located_catalog(blame_path).map(|catalog| catalog.crates)
-}
-
 /// Whether a build can link Rust FFI: an installed crate catalog makes its
 /// `Rust.*` interfaces reachable from the program.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -345,24 +334,14 @@ pub enum FfiPresence {
     Present,
 }
 
-/// The [`FfiPresence`] of the build rooted at (or blamed on) `blame_path`.
-///
-/// # Errors
-/// As [`load_catalog_for`].
-pub fn project_ffi_presence(blame_path: &Path) -> Result<FfiPresence, CliError> {
-    Ok(if load_catalog_for(blame_path)?.is_empty() {
-        FfiPresence::Absent
-    } else {
-        FfiPresence::Present
-    })
-}
-
 /// The catalog of the cache one discovery walk up from `blame_path` finds.
 ///
 /// Empty when no cache exists.
 ///
 /// # Errors
-/// As [`load_catalog_for`].
+/// [`CliError::TrustRefused`] relaying the catalog loader's diagnostic (a
+/// tampered or half-written cache is refused, never silently skipped), or
+/// refusing a cache entry that fails the owner rule.
 fn load_located_catalog(blame_path: &Path) -> Result<Catalog, CliError> {
     load_catalog(find_cache_root(blame_path)?.as_ref())
 }
@@ -522,6 +501,44 @@ pub fn assemble_emit(catalog: &[InstalledCrate]) -> Result<Option<AssembledEmit>
     };
     seal_dependency_references(catalog, &merged, &emit).map_err(FfiPrepError::CatalogSeal)?;
     Ok(Some(AssembledEmit { emit, merged }))
+}
+
+/// Refuse a wrapper crate `catalog` binds by path that is no longer the directory below `root`.
+///
+/// A wrapper's `path` dependency is proven inside the project when the
+/// catalog is read. Between that read and the emit, a wrapper level swapped
+/// for a link, or the project renamed away and replaced, would make the path
+/// the emitted `Cargo.toml` binds name another tree; so at the emit each
+/// wrapper is proven to be the directory reached through the root's own
+/// handle.
+///
+/// This is a check-then-cargo window, not a hold: cargo later resolves the
+/// emitted `path = ...` by name. A co-tenant able to write a level of the
+/// wrapper's path can rename the wrapper directory and plant another tree
+/// after this check and before cargo resolves the path, and that tree is
+/// built. The structural close copies the wrapper through a held handle into
+/// the output directory and binds the copy, a separate design.
+///
+/// # Errors
+/// [`CliError::TrustRefused`] naming the first wrapper that is not;
+/// [`CliError::Io`] when a level cannot be opened or stat'd.
+pub fn hold_wrapper_deps(
+    root: &crate::project_root::ProjectRoot,
+    catalog: &[InstalledCrate],
+) -> Result<(), CliError> {
+    for dep in catalog.iter().flat_map(|c| &c.cargo_deps) {
+        if let CargoDep::Wrapper { dir, .. } = dep
+            && !root.holds_wrapper(Path::new(dir.as_str()))?
+        {
+            return Err(CliError::TrustRefused(
+                owner_trust::TrustRefusal::FfiWrapperMoved {
+                    package: dir.package().as_str().to_owned(),
+                    path: PathBuf::from(dir.as_str()),
+                },
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Every refusal FFI prep returns, one variant per cause.
@@ -1044,7 +1061,7 @@ pub struct FfiPrep {
 /// walks up from it looking for `.ipe/cache/ffi/rust`.
 ///
 /// # Errors
-/// As [`load_catalog_for`] and [`prepare`].
+/// As [`load_located_catalog`] and [`prepare`].
 pub fn prepare_ffi(
     sources: &mut BTreeMap<Vec<String>, (PathBuf, String)>,
     blame_path: &Path,

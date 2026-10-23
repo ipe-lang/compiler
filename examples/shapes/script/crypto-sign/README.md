@@ -6,6 +6,6 @@ verification. The `Key` type makes passing a message where a key is expected a
 compile error. The worked example for the [Cryptography guide](../../../../docs/guide/crypto.md).
 
 ```
-ipe dev build package.ipe
+ipe dev build
 cargo run --manifest-path out/rust/Cargo.toml
 ```

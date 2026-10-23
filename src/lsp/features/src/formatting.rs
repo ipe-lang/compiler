@@ -16,15 +16,23 @@
 //! ([`ipe_fmt::verify_rewrite`]) or no edit is returned at all.
 //!
 //! An edit's range means what it says only where the server and the client
-//! count the same lines. A client ends a line at a lone `\r` as well as at
-//! `\n`; the position mapper and the lexer end one only at `\n`. A buffer
-//! holding a lone `\r` gets no edit, since its positions would name other
-//! text in the client.
+//! count the same lines. A client ends a line at `\n`, at `\r\n` and at a lone
+//! `\r`; the position mapper counts all three, and the lexer refuses a lone
+//! `\r`. A buffer holding one gets no edit here either, checked at this sink
+//! independently of the lexer and the mapper.
+//!
+//! Whole-document formatting writes the canonical `\n` breaks `ipe fmt`
+//! writes. A range edit lands among lines it does not touch, so in a buffer
+//! whose every break is `\r\n` its text breaks with `\r\n` too, and the
+//! buffer keeps one line ending; any other buffer gets `\n`. The rewritten
+//! edits are what [`ipe_fmt::verify_rewrite`] proves.
 
 use ipe_db::{IpeDatabase, SourceFile};
 use lsp_types::{Range, TextEdit};
 
-use crate::offset::{PositionEncoding, offset_to_position, position_to_offset};
+use crate::offset::{
+    LineEnding, PositionEncoding, lines_agree, offset_to_position, position_to_offset,
+};
 
 /// Format the full text of `file`.
 ///
@@ -88,19 +96,6 @@ fn engine_output(text: &str) -> Option<ipe_fmt::Formatted> {
     accepted(ipe_fmt::format_with_segments(text))
 }
 
-/// Whether an LSP client counts `text`'s lines as the position mapper does:
-/// the client also ends a line at a `\r` not followed by `\n`, the mapper
-/// only at `\n`.
-fn lines_agree(text: &str) -> bool {
-    let mut bytes = text.bytes().peekable();
-    while let Some(byte) = bytes.next() {
-        if byte == b'\r' && bytes.peek() != Some(&b'\n') {
-            return false;
-        }
-    }
-    true
-}
-
 /// The engine's verdict as an edit decision: every refusal is no edit.
 fn accepted<T>(verdict: Result<T, ipe_fmt::FmtError>) -> Option<T> {
     verdict.ok()
@@ -109,14 +104,17 @@ fn accepted<T>(verdict: Result<T, ipe_fmt::FmtError>) -> Option<T> {
 /// The edits replacing each declaration of `formatted` whose input bytes lie
 /// inside `request`, or `None` when the edited buffer fails
 /// [`ipe_fmt::verify_rewrite`].
+///
+/// Each edit's text breaks lines in `text`'s [`LineEnding`].
 fn range_edits(
     text: &str,
     formatted: &ipe_fmt::Formatted,
     request: std::ops::Range<usize>,
     encoding: PositionEncoding,
 ) -> Option<Vec<TextEdit>> {
+    let ending = LineEnding::of(text);
     let mut edits: Vec<TextEdit> = Vec::new();
-    let mut splices: Vec<(std::ops::Range<usize>, &str)> = Vec::new();
+    let mut splices: Vec<(std::ops::Range<usize>, String)> = Vec::new();
     for segment in &formatted.decls {
         // Confinement: the range must cover the whole declaration. A partial
         // overlap (a straddled boundary) produces no edit for it.
@@ -124,7 +122,7 @@ fn range_edits(
             continue;
         }
         let old = text.get(segment.input.clone())?;
-        let new = formatted.text.get(segment.output.clone())?;
+        let new = ending.apply(formatted.text.get(segment.output.clone())?);
         if old == new {
             continue; // already canonical — no edit for this declaration
         }
@@ -133,7 +131,7 @@ fn range_edits(
                 start: offset_to_position(text, segment.input.start, encoding),
                 end: offset_to_position(text, segment.input.end, encoding),
             },
-            new_text: new.to_owned(),
+            new_text: new.clone(),
         });
         splices.push((segment.input.clone(), new));
     }
@@ -163,7 +161,7 @@ mod tests {
 
     use lsp_types::{Position, Range};
 
-    use super::{format_document, format_range, range_edits};
+    use super::{LineEnding, format_document, format_range, lines_agree, range_edits};
     use crate::offset::{PositionEncoding, position_to_offset};
 
     fn file(db: &IpeDatabase, path: &[&str], text: &str) -> SourceFile {
@@ -679,18 +677,20 @@ mod tests {
         );
     }
 
-    /// A lone `\r` ends a line for the client but not for the position
-    /// mapper, so every position past it names other text in the client
-    /// buffer: neither whole-document nor range formatting returns an edit.
-    /// The same file with `\r\n` breaks still formats.
+    /// A buffer holding a lone `\r` gets no edit from either request.
+    ///
+    /// The lexer refuses it, and the `lines_agree` sink refuses it on its own
+    /// account. The same file with `\r\n` breaks still formats.
     #[test]
     fn lone_carriage_return_yields_no_edit() {
         let db = IpeDatabase::new();
         let lone = "module Main exposing (a, b)\n\n-- x\rzz\na =\n      1\n\nb =\n      2\n";
         assert!(
-            ipe_fmt::format_source(lone).is_ok(),
-            "precondition: the engine formats it"
+            ipe_fmt::format_source(lone).is_err(),
+            "the engine refuses a lone `\\r` through the lexer"
         );
+        assert!(!lines_agree(lone), "the sink refuses it on its own");
+        assert!(lines_agree("a\r\nb\n"), "control: `\\r\\n` and `\\n` agree");
         let f = file(&db, &["Main"], lone);
         assert_eq!(format_document(&db, f, PositionEncoding::Utf16), None);
         assert_eq!(
@@ -730,6 +730,100 @@ mod tests {
         assert!(
             new_text.contains("-- keep"),
             "comment must survive formatting: {new_text}"
+        );
+    }
+
+    /// Whether every line break in `text` is `\r\n` (and there is at least one).
+    fn uniform_crlf(text: &str) -> bool {
+        text.contains('\n')
+            && text.matches('\n').count() == text.matches("\r\n").count()
+            && !text.contains("\r\r")
+    }
+
+    /// The ending of a buffer is `\r\n` only when every break is `\r\n`.
+    #[test]
+    fn line_ending_is_crlf_only_for_a_uniform_crlf_buffer() {
+        assert_eq!(LineEnding::of("a\r\nb\r\n"), LineEnding::Crlf);
+        assert_eq!(LineEnding::of("a\r\nb\n"), LineEnding::Lf);
+        assert_eq!(LineEnding::of("\na\r\n"), LineEnding::Lf);
+        assert_eq!(LineEnding::of("no break"), LineEnding::Lf);
+        assert_eq!(LineEnding::of(""), LineEnding::Lf);
+        assert_eq!(LineEnding::Crlf.apply("a\nb\r\nc\n"), "a\r\nb\r\nc\r\n");
+        assert_eq!(LineEnding::Lf.apply("a\nb"), "a\nb");
+    }
+
+    /// In a uniform `\r\n` buffer a range edit breaks with `\r\n`.
+    ///
+    /// It never doubles a `\r\n` the engine carried verbatim (a block comment,
+    /// a `"""` body), the buffer keeps one line ending, and a second request is
+    /// a no-op.
+    #[test]
+    fn range_format_keeps_a_uniform_crlf_buffer_crlf() {
+        let db = IpeDatabase::new();
+        let src = "module Main exposing (a, b)\r\n\r\n{- one\r\n   two -}\r\na =\r\n      1\r\n\r\nb  :  String\r\nb =\r\n    \"\"\"\r\n    x\r\n    y\r\n    \"\"\"\r\n";
+        let f = file(&db, &["Main"], src);
+        let edits = format_range(&db, f, line_range(0, 20), PositionEncoding::Utf16)
+            .expect("parseable source returns Some");
+        assert!(!edits.is_empty(), "the over-indented decls reformat");
+        for edit in &edits {
+            assert!(edit.new_text.contains("\r\n"), "{:?}", edit.new_text);
+            assert_eq!(
+                edit.new_text.matches('\n').count(),
+                edit.new_text.matches("\r\n").count(),
+                "every break of an edit is `\\r\\n`: {:?}",
+                edit.new_text
+            );
+            assert!(!edit.new_text.contains("\r\r"), "{:?}", edit.new_text);
+        }
+        let result = apply_edits(src, &edits);
+        assert!(uniform_crlf(&result), "one line ending: {result:?}");
+        assert!(result.contains("{- one\r\n   two -}"), "{result:?}");
+        assert!(result.contains("b : String\r\n"), "{result:?}");
+        assert!(result.contains("    x\r\n    y\r\n"), "{result:?}");
+        let again = file(&db, &["Again"], &result);
+        assert_eq!(
+            format_range(&db, again, line_range(0, 20), PositionEncoding::Utf16),
+            Some(Vec::new()),
+            "a second range format is a no-op"
+        );
+    }
+
+    /// A buffer whose breaks mix `\r\n` and `\n` gets edits in `\n` only.
+    #[test]
+    fn range_format_in_a_mixed_buffer_writes_lf() {
+        let db = IpeDatabase::new();
+        let src = "module Main exposing (a)\r\n\r\na =\n      1\n";
+        let f = file(&db, &["Main"], src);
+        let edits = format_range(&db, f, line_range(0, 20), PositionEncoding::Utf16)
+            .expect("parseable source returns Some");
+        assert!(!edits.is_empty(), "the over-indented decl reformats");
+        assert!(
+            edits.iter().all(|edit| !edit.new_text.contains('\r')),
+            "{edits:?}"
+        );
+    }
+
+    /// A rewrite that changes a `"""` value in a `\r\n` buffer yields no edit.
+    ///
+    /// The faulty print splits the body's one line in two; written in `\r\n`,
+    /// the value gains a line the source never held, and the engine's guards
+    /// refuse the spliced buffer.
+    #[test]
+    fn range_format_refuses_a_crlf_rewrite_that_changes_a_string() {
+        let src = "module Main exposing (a)\r\n\r\na  :  String\r\na =\r\n    \"\"\"\r\n    xy\r\n    \"\"\"\r\n";
+        let whole = 0..src.len();
+        let real = ipe_fmt::format_with_segments(src).expect("formats");
+        assert!(
+            range_edits(src, &real, whole.clone(), PositionEncoding::Utf16)
+                .is_some_and(|edits| !edits.is_empty()),
+            "control: the engine's own output is an edit"
+        );
+        let (faulty, _) =
+            faulty_output(src, "a : String\na =\n    \"\"\"\n    x\n    y\n    \"\"\"");
+        assert_eq!(
+            range_edits(src, &faulty, whole, PositionEncoding::Utf16),
+            None,
+            "a rewrite that changes the string value yields no edit"
         );
     }
 }

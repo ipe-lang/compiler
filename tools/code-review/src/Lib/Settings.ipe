@@ -1,4 +1,4 @@
-module Lib.Settings exposing (AppSettings, DbRefusal(..), DbRole(..), EnvValue(..), IndexFile, IndexSettings, ReviewFile, brokenLog, dbFileName, dbRefusalOf, envFailure, ipeTag, openFailure, parseIndexDb, parseIndexSettings, parseReviewDb, valueOr)
+module Lib.Settings exposing (AppSettings, DbRefusal(..), DbRole(..), EnvValue(..), IndexFile, IndexSettings, LogBreak(..), ReviewFile, brokenLog, dbFileName, dbRefusalOf, envFailure, ipeTag, logBreakFix, logBreakProblem, logBreaks, openFailure, parseIndexDb, parseIndexSettings, parseReviewDb, roleVar, valueOr)
 
 import Ipe.Db as Db exposing (DbFailure(..))
 import Ipe.Db.Location as Location exposing (DbLocation, Mode(..))
@@ -10,7 +10,7 @@ import Ipe.Path as Path exposing (Path)
 import Ipe.Result as Result exposing (Result(..))
 import Ipe.String as String
 import Ipe.Task as Task
-import Lib.EnvLookup as EnvLookup
+import Lib.EnvLookup as EnvLookup exposing (StartupVar(..))
 import Lib.Epoch exposing (Epoch)
 import Lib.Label as Label
 import Lib.RepoPath as RepoPath exposing (PathError, RootMap, Tag)
@@ -168,9 +168,9 @@ rootsRefusal err =
 parseIndexDb : String -> Task.Task Error IndexFile
 parseIndexDb raw =
     do
-        path <- parseDbFile "IPE_INDEX_DB" raw
-        read <- dbLocation "IPE_INDEX_DB" ReadExisting path
-        write <- dbLocation "IPE_INDEX_DB" WriteExisting path
+        path <- parseDbFile IndexDbVar raw
+        read <- dbLocation IndexDbVar ReadExisting path
+        write <- dbLocation IndexDbVar WriteExisting path
         Task.succeed { path = path, read = read, write = write }
 
 
@@ -179,8 +179,8 @@ parseIndexDb raw =
 parseReviewDb : String -> Task.Task Error ReviewFile
 parseReviewDb raw =
     do
-        path <- parseDbFile "IPE_REVIEW_DB" raw
-        open <- dbLocation "IPE_REVIEW_DB" CreateIfMissing path
+        path <- parseDbFile ReviewDbVar raw
+        open <- dbLocation ReviewDbVar CreateIfMissing path
         Task.succeed { path = path, open = open }
 
 
@@ -190,27 +190,27 @@ parseReviewDb raw =
 -- other byte is literal: the database layer never reads the name as URL
 -- syntax. A refusal names the variable, never its value: a mistyped URL can
 -- carry a password. Each refusal states its problem and exactly one fix.
-parseDbFile : String -> String -> Task.Task Error Path
+parseDbFile : StartupVar -> String -> Task.Task Error Path
 parseDbFile var raw =
     if String.trim raw == "" then
-        Task.fail (Error.invalidInput (dbRefusal var "is empty" dbFix))
+        Task.fail (dbRefusal var "it is empty")
 
     else if String.contains "://" raw || String.startsWith "sqlite:" raw || String.startsWith "file:" raw then
-        Task.fail (Error.invalidInput (dbRefusal var "is a URL, not a file path" dbFix))
+        Task.fail (dbRefusal var "it is a URL, not a file path")
 
     else
         RepoPath.absolutize raw
-            |> Task.mapError (\_ -> Error.invalidInput (dbRefusal var "is not a valid file path" dbFix))
+            |> Task.mapError (\_ -> dbRefusal var "it is not a valid file path")
             |> Task.andThen (toDbFile var)
 
 
 -- A cleaned absolute path names a database file unless it is the root
 -- directory itself, which a `..` climbing past `/` cleans to and which can
 -- never be a database file.
-toDbFile : String -> Path -> Task.Task Error Path
+toDbFile : StartupVar -> Path -> Task.Task Error Path
 toDbFile var path =
     if Path.toString path == "/" then
-        Task.fail (Error.invalidInput (dbRefusal var "names the root directory, not a database file" dbFix))
+        Task.fail (dbRefusal var "it names the root directory, not a database file")
 
     else
         Task.succeed path
@@ -219,22 +219,18 @@ toDbFile var path =
 -- `path` opened in `mode`. The database layer refuses a file name it cannot
 -- open as written, such as one holding a `:`; that refusal is reported by
 -- variable name, like every other.
-dbLocation : String -> Mode -> Path -> Task.Task Error DbLocation
+dbLocation : StartupVar -> Mode -> Path -> Task.Task Error DbLocation
 dbLocation var mode path =
     Location.file mode path
         |> Task.fromResult
-        |> Task.mapError (\_ -> Error.invalidInput (dbRefusal var "is a file path the database cannot open as written, such as one holding a `:`" dbFix))
+        |> Task.mapError (\_ -> dbRefusal var "it is a file path the database cannot open as written, such as one holding a `:`")
 
 
-dbRefusal : String -> String -> String -> String
-dbRefusal var problem fix =
-    String.concat [ var, " ", problem, "; ", fix ]
-
-
--- The fix for a refusal whose problem names no more specific one.
-dbFix : String
-dbFix =
-    "set it to the path of a SQLite database file"
+-- A database setting refused before it names a file: the value is never
+-- repeated, and every such problem has the one fix.
+dbRefusal : StartupVar -> String -> Error
+dbRefusal var problem =
+    EnvLookup.startupRefusal { var = var, file = Nothing, problem = problem, fix = "set it to the path of a SQLite database file" }
 
 
 -- The database a startup refusal is about, which names its variable and
@@ -377,39 +373,70 @@ locationRefusal file e =
             )
 
 
--- A migrated review file that opens and reads but whose log is broken: an
--- append-only trigger gone, or its head row missing. No change of access
--- repairs it, so the fix is a sound copy or a fresh log.
-brokenLog : Path -> String -> Error
-brokenLog file problem =
-    useRefusal ReviewDb file ( problem, "restore it from a copy whose log is intact, or point IPE_REVIEW_DB at a new file to start a fresh log" )
+-- How a migrated review file that opens and reads can still have a broken
+-- log: its head row missing, an append-only guard gone, or rows recorded
+-- before unit names were kept. No change of access repairs any of them.
+type LogBreak
+    = HeadMissing
+    | GuardLost
+    | UnnamedRows
+
+
+-- Every `LogBreak`, for the checks that cover each one.
+logBreaks : List LogBreak
+logBreaks =
+    [ HeadMissing, GuardLost, UnnamedRows ]
+
+
+-- The refusal of a review file whose log is broken in the way `break` names,
+-- with that break's own fix.
+brokenLog : Path -> LogBreak -> Error
+brokenLog file break =
+    useRefusal ReviewDb file ( logBreakProblem break, logBreakFix break )
+
+
+logBreakProblem : LogBreak -> String
+logBreakProblem break =
+    case break of
+        HeadMissing ->
+            "its review log has no single head row"
+
+        GuardLost ->
+            "its review log has lost an append-only trigger, so its decisions could be rewritten unseen"
+
+        UnnamedRows ->
+            "its review log holds decisions recorded before unit names were kept, which this reviewer cannot verify"
+
+
+-- The one fix of each break. A log damaged after it was written can be
+-- restored from a sound copy; a log recorded before names were kept is
+-- refused however intact any copy of it is, so only a fresh log clears it.
+logBreakFix : LogBreak -> String
+logBreakFix break =
+    case break of
+        HeadMissing ->
+            "restore it from a copy whose log is intact, or point IPE_REVIEW_DB at a new file to start a fresh log"
+
+        GuardLost ->
+            "restore it from a copy whose log is intact, or point IPE_REVIEW_DB at a new file to start a fresh log"
+
+        UnnamedRows ->
+            "point IPE_REVIEW_DB at a new file to start a fresh log"
 
 
 useRefusal : DbRole -> Path -> ( String, String ) -> Error
 useRefusal role file ( problem, fix ) =
-    Error.invalidInput
-        (SafeText.toString
-            (SafeText.concat
-                [ SafeText.literal (roleVar role)
-                , SafeText.literal ": cannot use "
-                , SafeText.quoted (Path.toString file)
-                , SafeText.literal ": "
-                , SafeText.literal problem
-                , SafeText.literal "; "
-                , SafeText.literal fix
-                ]
-            )
-        )
+    EnvLookup.startupRefusal { var = roleVar role, file = Just file, problem = problem, fix = fix }
 
 
-roleVar : DbRole -> String
+roleVar : DbRole -> StartupVar
 roleVar role =
     case role of
         IndexDb ->
-            "IPE_INDEX_DB"
+            IndexDbVar
 
         ReviewDb ->
-            "IPE_REVIEW_DB"
+            ReviewDbVar
 
 
 -- Each refusal's problem and its one fix, per database.

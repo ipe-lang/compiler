@@ -28,11 +28,11 @@
 use ipe_annotate::TokenClass;
 use ipe_db::{Db as _, IpeDatabase, SourceFile};
 use lsp_types::{
-    Range, SemanticToken, SemanticTokens, SemanticTokensLegend, SemanticTokensRangeResult,
-    SemanticTokensResult,
+    Position, Range, SemanticToken, SemanticTokens, SemanticTokensLegend,
+    SemanticTokensRangeResult, SemanticTokensResult,
 };
 
-use crate::offset::{PositionEncoding, position_to_offset};
+use crate::offset::{LineIndex, PositionEncoding, position_to_offset};
 
 // ---------------------------------------------------------------------------
 // Legend
@@ -193,78 +193,40 @@ const fn class_to_lsp(class: TokenClass) -> Option<u32> {
 // Delta encoding
 // ---------------------------------------------------------------------------
 
-/// The byte offset of the start of every line in a document, built once so a
-/// byte→position lookup is a binary search plus a within-line column scan rather
-/// than a from-zero rescan of the whole prefix per token.
-struct LineIndex {
-    /// `starts[i]` is the byte offset of line `i` (0-based). Always begins with
-    /// `0`; a trailing newline adds a final empty line's start.
-    starts: Vec<usize>,
-}
-
-impl LineIndex {
-    fn new(text: &str) -> Self {
-        let mut starts = vec![0usize];
-        for (i, b) in text.bytes().enumerate() {
-            if b == b'\n' {
-                starts.push(i + 1);
-            }
-        }
-        Self { starts }
-    }
-
-    /// The 0-based line containing `byte`: the last line start `<= byte`.
-    fn line_of(&self, byte: usize) -> usize {
-        match self.starts.binary_search(&byte) {
-            Ok(line) => line,
-            // `Err(i)` is the insertion point; the containing line is the one
-            // before it. `i` is never 0 because `starts[0] == 0 <= byte`.
-            Err(i) => i.saturating_sub(1),
-        }
-    }
-
-    /// The byte offset of line `line`'s start.
-    fn start_of(&self, line: usize) -> usize {
-        self.starts.get(line).copied().unwrap_or(0)
-    }
-}
-
-fn encode(raw: Vec<RawToken>, text: &str, encoding: PositionEncoding) -> Vec<SemanticToken> {
+/// Delta-encode `raw`, reading each token's position from the shared [`LineIndex`].
+///
+/// A delta is the distance from the previous token, so the tokens are put in
+/// source order first; a position is monotone in its byte, so no delta is
+/// negative. A token whose delta would still be negative, or whose end lies
+/// past `u32::MAX`, is dropped rather than encoded wrong.
+fn encode(mut raw: Vec<RawToken>, text: &str, encoding: PositionEncoding) -> Vec<SemanticToken> {
+    raw.sort_by_key(|tok| tok.byte);
     let mut out: Vec<SemanticToken> = Vec::with_capacity(raw.len());
     let index = LineIndex::new(text);
     let mut prev_line: u32 = 0;
     let mut prev_char: u32 = 0;
 
     for tok in raw {
-        let mut byte = (tok.byte as usize).min(text.len());
-        while byte > 0 && !text.is_char_boundary(byte) {
-            byte -= 1;
-        }
-        let line = index.line_of(byte);
-        let line_start = index.start_of(line);
-        // Column: sum the encoding-widths of the characters on this line up to
-        // the token, scanning only the (short) line prefix, not the whole file.
-        let column: usize = text
-            .get(line_start..byte)
-            .unwrap_or("")
-            .chars()
-            .map(|c| match encoding {
-                PositionEncoding::Utf8 => c.len_utf8(),
-                PositionEncoding::Utf16 => c.len_utf16(),
-            })
-            .sum();
-        let pos_line = u32::try_from(line).unwrap_or(u32::MAX);
-        let pos_char = u32::try_from(column).unwrap_or(u32::MAX);
+        let Position {
+            line: pos_line,
+            character: pos_char,
+        } = index.position_of(tok.byte as usize, encoding);
 
-        let delta_line = pos_line - prev_line;
+        let Some(delta_line) = pos_line.checked_sub(prev_line) else {
+            continue;
+        };
         let delta_start = if delta_line == 0 {
-            pos_char - prev_char
+            let Some(delta) = pos_char.checked_sub(prev_char) else {
+                continue;
+            };
+            delta
         } else {
             pos_char
         };
-        let slice = text
-            .get(tok.byte as usize..(tok.byte + tok.len) as usize)
-            .unwrap_or("");
+        let Some(end) = tok.byte.checked_add(tok.len) else {
+            continue;
+        };
+        let slice = text.get(tok.byte as usize..end as usize).unwrap_or("");
         let length = match encoding {
             PositionEncoding::Utf8 => tok.len,
             PositionEncoding::Utf16 => slice
@@ -423,5 +385,105 @@ mod tests {
             "first range token delta_line must be its absolute line (encoding reset to 0), got {}",
             first.delta_line
         );
+    }
+
+    /// Every text of up to four pieces over `a`, `\r\n`, `\n`, a lone `\r` and an astral char.
+    fn every_short_text() -> Vec<String> {
+        let pieces = ["a", "\r\n", "\n", "\r", "😀"];
+        let mut texts = vec![String::new()];
+        let mut frontier = vec![String::new()];
+        for _ in 0..4 {
+            frontier = frontier
+                .iter()
+                .flat_map(|t| pieces.iter().map(move |piece| format!("{t}{piece}")))
+                .collect();
+            texts.extend(frontier.iter().cloned());
+        }
+        texts
+    }
+
+    /// The absolute positions a delta-encoded token list names.
+    fn decoded(tokens: &[lsp_types::SemanticToken]) -> Vec<Position> {
+        let mut at = Position {
+            line: 0,
+            character: 0,
+        };
+        tokens
+            .iter()
+            .map(|tok| {
+                at = if tok.delta_line == 0 {
+                    Position {
+                        line: at.line,
+                        character: at.character + tok.delta_start,
+                    }
+                } else {
+                    Position {
+                        line: at.line + tok.delta_line,
+                        character: tok.delta_start,
+                    }
+                };
+                at
+            })
+            .collect()
+    }
+
+    /// Tokens handed over out of source order are encoded in source order,
+    /// never as a negative delta.
+    #[test]
+    fn tokens_out_of_order_encode_in_source_order() {
+        let text = "ab\ncd\nef";
+        let token = |byte: u32| super::RawToken {
+            byte,
+            len: 1,
+            token_type: 0,
+        };
+        let raw = vec![token(7), token(1), token(4), token(0)];
+        let got = decoded(&super::encode(raw, text, PositionEncoding::Utf16));
+        let at = |line, character| Position { line, character };
+        assert_eq!(got, vec![at(0, 0), at(0, 1), at(1, 1), at(2, 1)]);
+    }
+
+    /// A token whose end would pass `u32::MAX` is dropped, not encoded.
+    #[test]
+    fn a_token_ending_past_u32_max_is_dropped() {
+        let token = |byte: u32| super::RawToken {
+            byte,
+            len: 1,
+            token_type: 0,
+        };
+        let got = super::encode(
+            vec![token(0), token(u32::MAX)],
+            "a",
+            PositionEncoding::Utf16,
+        );
+        assert_eq!(got.len(), 1, "{got:?}");
+    }
+
+    /// A token at every char boundary of every mix of line breaks sits where
+    /// the shared `offset::LineIndex` puts it, a mid-`\r\n` byte included.
+    #[test]
+    fn semantic_tokens_positions_match_offset_line_index() {
+        for text in every_short_text() {
+            let bytes: Vec<usize> = (0..=text.len())
+                .filter(|&b| text.is_char_boundary(b))
+                .collect();
+            let raw: Vec<super::RawToken> = bytes
+                .iter()
+                .map(|&b| super::RawToken {
+                    byte: u32::try_from(b).unwrap(),
+                    len: 0,
+                    token_type: 0,
+                })
+                .collect();
+            for encoding in [PositionEncoding::Utf8, PositionEncoding::Utf16] {
+                let index = crate::offset::LineIndex::new(&text);
+                let expected: Vec<Position> = bytes
+                    .iter()
+                    .map(|&b| index.position_of(b, encoding))
+                    .collect();
+                let got = decoded(&super::encode(raw.clone(), &text, encoding));
+                assert_eq!(got, expected, "{text:?} ({encoding:?})");
+            }
+        }
     }
 }

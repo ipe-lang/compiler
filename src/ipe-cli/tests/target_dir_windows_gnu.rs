@@ -58,7 +58,13 @@ error: could not compile `app` (bin \"app\") due to 1 previous error
             for dir in [&case.project, &case.bin, &case.cache, &case.home] {
                 fs::create_dir_all(dir).expect("make case dir");
             }
-            fs::write(case.project.join("Main.ipe"), SRC).expect("write source");
+            fs::create_dir_all(case.project.join("src")).expect("make src dir");
+            fs::write(
+                case.project.join("package.ipe"),
+                "module Package exposing (package)\n\n\npackage =\n    { name = \"app\" }\n",
+            )
+            .expect("write package.ipe");
+            fs::write(case.project.join("src").join("Main.ipe"), SRC).expect("write source");
             fs::write(case.bin.join("unopenable.txt"), UNOPENABLE).expect("write link stderr");
             case
         }
@@ -101,10 +107,9 @@ error: could not compile `app` (bin \"app\") due to 1 previous error
         /// Run `ipe dev build` on the project with `extra` environment.
         fn build(&self, extra: &[(&str, &Path)]) -> (bool, String) {
             let runtime_dir = e2e_support::require_runtime().into_path_buf();
-            let entry = self.project.join("Main.ipe");
             let mut cmd = std::process::Command::new(e2e_support::cargo_bin!("ipe"));
             cmd.args(["dev", "build"])
-                .arg(&entry)
+                .arg(&self.project)
                 .arg("--out")
                 .arg(self.project.join("out"))
                 .env(

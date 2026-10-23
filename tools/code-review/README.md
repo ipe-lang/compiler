@@ -118,13 +118,21 @@ refusal reason is escaped as it is rendered. A source line carrying bidi
 overrides therefore shows each one as `\u{202e}`-style text instead of
 rendering reordered (Trojan Source). `\` and `"` are shown as written.
 
+A unit too large to draw with each escape marked is shown spelled out
+instead, one block of plain text where every `\` of the source is doubled
+and every character outside printable ASCII but a tab is escaped, so the
+display stays exact and no character can pass for the `\` of an escape:
+`\\` is one `\` of the source, `\r` and `\u{202e}` are characters it
+holds, and a line `\…` stands for lines reviewed as their own units. A
+unit is never withheld for its escapes.
+
 A refusal needs a reason of at most 500 characters; a blank or longer one is
 refused before anything is saved. A stored refusal whose reason breaks that
 bound (saved before it, or edited in the database) still loads, shown by its
 length, never its text.
 
-History shows 100 reviews per page, newest first; each page reads only its own
-rows, through an index in that order.
+History shows 100 reviews per page (`PageSize.history` in `src/Lib/PageSize.ipe`),
+newest first; each page reads only its own rows, through an index in that order.
 
 Each History entry names its unit by kind, qualified name, path and line, or
 an unreviewable file by its path. A decision records that name in its signed
@@ -270,8 +278,9 @@ open again after the next `ipe-index` run. Before the decision is recorded the
 index row is read again and a content reason is re-probed: a file that now
 reads as text is refused, with "re-run the index". The other reasons say
 "Cannot be acknowledged: fix it in the tree." and offer no decision. The list
-shows up to 200 open files, every acknowledgeable one before any that cannot
-be acknowledged; the header counts them all.
+shows up to 32 open files (`PageSize.queue` in `src/Lib/PageSize.ipe`), every
+acknowledgeable one before any that cannot be acknowledged; the header counts
+them all.
 
 ## Checks
 
@@ -328,7 +337,7 @@ the app cannot verify, so every unit reads as unverifiable until the index is
 rebuilt: `tools/scripts/ipe-index update` rebuilds an index of an older schema
 in full, as `tools/scripts/ipe-index index` does.
 
-The queue view loads one page of at most 200 open units (`pageSize` in `src/Lib/Index.ipe`).
+The queue view loads one page of at most 32 open units (`PageSize.queue` in `src/Lib/PageSize.ipe`).
 
 If you run from inside a compiler checkout, `ipe` may auto-discover the
 checkout's vendored runtime snapshot instead of its own version-matched one,

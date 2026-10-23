@@ -8998,7 +8998,7 @@ class TestBrowserE2eRunScriptParity(unittest.TestCase):
             self.assertIsNotNone(served, "run.sh serves nothing on %s" % key)
         built = set()
         for step in job["steps"]:
-            built.update(re.findall(r"examples/shapes/web/([\w-]+)/package\.ipe", str(step.get("run", ""))))
+            built.update(re.findall(r"examples/shapes/web/([\w-]+)(?=[\s\"'])", str(step.get("run", ""))))
         served_apps = set(re.findall(r'^serve ([\w-]+) ', run_sh, re.M))
         self.assertTrue(built, "the job builds no example app")
         self.assertEqual(served_apps, built)

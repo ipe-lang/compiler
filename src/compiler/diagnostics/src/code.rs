@@ -351,6 +351,12 @@ code! {
     IPE_P0069 = "IPE-P0069", "duplicate type annotation for one name", "IPE-P0069";
     /// source exceeds the addressable span range (u32 byte offsets)
     IPE_P0070 = "IPE-P0070", "source file is too large to compile", "IPE-P0070";
+    /// a `\r` not followed by `\n` — a line break the lexer and editors disagree on
+    IPE_P0071 = "IPE-P0071", "a carriage return must be followed by a newline", "IPE-P0071";
+    /// a line break or bidi control a viewer draws as structure the compiler does not read
+    IPE_P0072 = "IPE-P0072", "a character that breaks or reorders the displayed source", "IPE-P0072";
+    /// a raw C0/C1 control a terminal showing the file runs as a cursor or screen command
+    IPE_P0073 = "IPE-P0073", "a control character a terminal runs as a command", "IPE-P0073";
 
     // -----------------------------------------------------------------------
     // Name resolution (IPE-N####)
@@ -771,6 +777,8 @@ code! {
     IPE_E0010 = "IPE-E0010", "a symbolic link inside the project", "IPE-E0010";
     /// a file argument lies outside the project's `src/` and `tests/`
     IPE_E0011 = "IPE-E0011", "a file argument outside the project sources", "IPE-E0011";
+    /// a build command was given a file where it takes a project directory
+    IPE_E0012 = "IPE-E0012", "a build command given a file", "IPE-E0012";
 
     // -----------------------------------------------------------------------
     // Internal (IPE-I####)

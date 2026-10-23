@@ -964,7 +964,7 @@ jobs:
           IPE="$RUNNER_TEMP/ipe-release/ipe"
           WARM="$(mktemp -d)"
           cd "$WARM"
-          "$IPE" dev build "$GITHUB_WORKSPACE/examples/shapes/non-tea/hello-world/package.ipe" --out out
+          "$IPE" dev build "$GITHUB_WORKSPACE/examples/shapes/non-tea/hello-world" --out out
           cd out/rust
           cargo build --release   # compiles the runtime dep tree into the shared target
       - name: Emit + build + run (examples/shapes/non-tea/hello-world)
@@ -974,7 +974,7 @@ jobs:
           set -euo pipefail
           IPE="$RUNNER_TEMP/ipe-release/ipe"
           cd examples/shapes/non-tea/hello-world
-          "$IPE" dev build package.ipe --out out
+          "$IPE" dev build --out out
           cd out/rust
           cargo build --release   # incremental: deps already in the shared target
           OUT="$(cargo run --release --quiet)"
@@ -1043,7 +1043,7 @@ jobs:
           set -euo pipefail
           IPE="$RUNNER_TEMP/ipe-release/ipe"
           WARM="$(mktemp -d)"; cd "$WARM"
-          "$IPE" dev build "$GITHUB_WORKSPACE/examples/shapes/script/release-preflight/package.ipe" --out out
+          "$IPE" dev build "$GITHUB_WORKSPACE/examples/shapes/script/release-preflight" --out out
           cd out/rust && cargo build
       - name: Check + emit + build every first-party shape
         env:
@@ -1058,7 +1058,7 @@ jobs:
             if ! "$IPE" type-check "$dir"; then
               echo "::error::ipe type-check regressed: $dir"; fail=1; echo "::endgroup::"; continue
             fi
-            if ! "$IPE" dev build "$toml" --out "$dir/out"; then
+            if ! "$IPE" dev build "$dir" --out "$dir/out"; then
               echo "::error::ipe dev build regressed: $dir"; fail=1; echo "::endgroup::"; continue
             fi
             # A debug build proves the emitted crate compiles and links — the two
@@ -2411,7 +2411,7 @@ jobs:
           set -euo pipefail
           IPE="$RUNNER_TEMP/ipe-release/ipe"
           OUT="$RUNNER_TEMP/geo-clipboard-emitted"
-          "$IPE" dev build examples/shapes/web/geo-clipboard/package.ipe --out "$OUT"
+          "$IPE" dev build examples/shapes/web/geo-clipboard --out "$OUT"
           bash "$GITHUB_WORKSPACE/.github/ci/github-env.sh" CI_JOB_GEO_CLIPBOARD_EMITTED "$OUT/rust"
       - name: Cargo-build emitted project
         env:
@@ -2461,7 +2461,7 @@ jobs:
         run: |
           set -euo pipefail
           OUT="$RUNNER_TEMP/layout-fill-emitted"
-          "$RUNNER_TEMP/ipe-release/ipe" dev build examples/shapes/web/layout-fill/package.ipe --out "$OUT"
+          "$RUNNER_TEMP/ipe-release/ipe" dev build examples/shapes/web/layout-fill --out "$OUT"
           cd "$OUT/rust"
           cargo build --release
           NAME="$(sed -n 's/^name = "\(.*\)"$/\1/p;T;q' Cargo.toml)"
@@ -2498,7 +2498,7 @@ jobs:
         run: |
           set -euo pipefail
           OUT="$RUNNER_TEMP/focus-across-patch-emitted"
-          "$RUNNER_TEMP/ipe-release/ipe" dev build examples/shapes/web/focus-across-patch/package.ipe --out "$OUT"
+          "$RUNNER_TEMP/ipe-release/ipe" dev build examples/shapes/web/focus-across-patch --out "$OUT"
           cd "$OUT/rust"
           cargo build --release
           NAME="$(sed -n 's/^name = "\(.*\)"$/\1/p;T;q' Cargo.toml)"
@@ -2535,7 +2535,7 @@ jobs:
         run: |
           set -euo pipefail
           OUT="$RUNNER_TEMP/csp-styles-emitted"
-          "$RUNNER_TEMP/ipe-release/ipe" dev build examples/shapes/web/csp-styles/package.ipe --out "$OUT"
+          "$RUNNER_TEMP/ipe-release/ipe" dev build examples/shapes/web/csp-styles --out "$OUT"
           cd "$OUT/rust"
           cargo build --release
           NAME="$(sed -n 's/^name = "\(.*\)"$/\1/p;T;q' Cargo.toml)"

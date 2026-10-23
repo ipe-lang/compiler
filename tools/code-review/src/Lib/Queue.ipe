@@ -1,4 +1,4 @@
-module Lib.Queue exposing (DecisionSlot(..), HistoryLabel(..), HistoryPage, HistoryRow, HistoryState(..), LoadTicket, Place(..), Presence(..), Progress, QueuePage, QueueState(..), QueuedUnit, ResyncBound, SelectedView(..), Standing(..), StandingRead(..), UnitLabel, UnitPageState(..), chainBanner, clearView, decidableSource, decide, decideRefusal, decisionNotSaved, decisionRefused, decisionWritten, drainThenLoad, entryUid, firstTicket, historyStateFromResult, historyStatusText, isCurrentLoad, loadHistoryPage, loadPage, loadStanding, makeResyncBound, notSavedOf, ownedSlot, pendingText, nextTicket, loadUnitView, pageHeaderText, queueLabels, queueSettled, queueStatusText, refusalReasonText, reloadView, resyncBound, resyncPageCeiling, resyncReviewed, resyncReviewedWithin, selectView, selectedViewOf, selectedViewStatusText, sourceStatusText, standingArrived, standingFor, standingOf, startDecision, stateFromResult, unitLabel, unitPageEntry, unitPageOf, unitPageStatusText, viewArrived)
+module Lib.Queue exposing (DecidableRow, DecisionSlot(..), DecisionTarget(..), Draft, HistoryLabel(..), HistoryPage, HistoryRow, HistoryState(..), HistoryWant(..), LoadSlot, LoadTicket, Place(..), Presence(..), Progress, QueuePage, QueueState(..), QueueWant(..), QueuedUnit, RefusalPanel(..), ResyncBound, SelectedView(..), Settle(..), Standing(..), StandingRead(..), UnitLabel, UnitPageState(..), chainBanner, clearView, closeRefusal, decidableAs, decidableRow, decidableSource, decide, decideRefusal, decisionNotSaved, decisionRefused, decisionWritten, draftRefused, drainThenLoad, editDraft, ensureLoad, entryUid, firstTicket, historyStateFromResult, historyStatusText, idleLoad, isCurrentLoad, latestTicket, latestWant, loadArrived, loadHistoryPage, loadPage, loadStanding, makeResyncBound, mergeQueueWant, notSavedOf, openPanel, openRefusal, openRow, ownedSlot, pendingText, nextTicket, loadUnitView, offeredRefusal, offeredSource, pageHeaderText, queueLabels, queueSettled, queueStatusText, refusalReasonText, reloadView, requestLoad, runningWant, rowTarget, rowUid, sameSubject, resyncBound, resyncPageCeiling, resyncReviewed, resyncReviewedWithin, selectView, selectedViewOf, selectedViewStatusText, sourceStatusText, standingArrived, standingFor, standingRequested, standingOf, startDecision, stateFromResult, unitLabel, unitPageEntry, unitPageOf, unitPageStatusText, viewArrived)
 
 import Ipe.ByteSize as ByteSize
 import Ipe.Db as Db
@@ -10,8 +10,9 @@ import Ipe.Result as Result exposing (Result(..))
 import Ipe.String as String
 import Ipe.Task as Task
 import Lib.Db as LibDb exposing (BreakAt(..), HistoryCursor(..), LogShown(..), LogVerdict(..), ReviewEntry(..))
+import Lib.Draft as Draft
 import Lib.Epoch exposing (Epoch)
-import Lib.Failure as Failure exposing (DecideRefusal, LoadFailure, SaveFailure)
+import Lib.Failure as Failure exposing (DecideRefusal, LoadFailure, RefuseFailure, SaveFailure)
 import Lib.Format as Format
 -- `Index.Unit` names `Highlight.Lang` and `Index.UnitView` names
 -- `Links.LinkSet`, and an imported alias resolves its qualified names in this
@@ -68,11 +69,14 @@ standingOf entry =
 
 -- The unit page's read of its shown body's standing, keyed by the uid and
 -- body hash it was read for, so a read for another unit or an older body
--- never stands for the one shown.
+-- never stands for the one shown. `StandingReading` is the one read in
+-- flight, run by process `owner`, with the body asked for meanwhile: a read
+-- asked during it starts nothing, so the slot holds at most one read.
 type StandingRead
     = StandingUnread
     | StandingShown Uid String Standing
     | StandingFailed Uid String LoadFailure
+    | StandingReading Uid String Epoch (Maybe ( Uid, String ))
 
 
 -- The standing of `uid`'s body `bodyHash`, under one walk of the review log.
@@ -85,14 +89,63 @@ loadStanding settings uid bodyHash =
         Task.succeed (standingOf entry)
 
 
-standingArrived : Uid -> String -> Result LoadFailure Standing -> StandingRead
-standingArrived uid bodyHash result =
-    case result of
-        Ok standing ->
-            StandingShown uid bodyHash standing
+-- The standing of `uid`'s body `bodyHash` asked for by process `epoch`,
+-- with the read to start, if any. During a read this process runs, the body
+-- is only recorded as wanted (the latest wins); a read another process left
+-- behind has no completion left to settle it, so the slot is idle to it.
+standingRequested : Epoch -> Uid -> String -> StandingRead -> ( StandingRead, Maybe ( Uid, String ) )
+standingRequested epoch uid bodyHash read =
+    case read of
+        StandingReading reading readHash owner _ ->
+            if owner == epoch then
+                ( StandingReading reading readHash owner (Just ( uid, bodyHash )), Nothing )
 
-        Err e ->
-            StandingFailed uid bodyHash e
+            else
+                ( StandingReading uid bodyHash epoch Nothing, Just ( uid, bodyHash ) )
+
+        StandingUnread ->
+            ( StandingReading uid bodyHash epoch Nothing, Just ( uid, bodyHash ) )
+
+        StandingShown _ _ _ ->
+            ( StandingReading uid bodyHash epoch Nothing, Just ( uid, bodyHash ) )
+
+        StandingFailed _ _ _ ->
+            ( StandingReading uid bodyHash epoch Nothing, Just ( uid, bodyHash ) )
+
+
+-- The read of `uid`'s body `bodyHash` run by process `epoch` returned with
+-- `result`: when another body was asked for meanwhile, the result is
+-- dropped and that body's read starts; otherwise the result settles the
+-- slot. A result for any read but the one in flight, or from any process
+-- but its owner, changes nothing.
+standingArrived : Epoch -> Uid -> String -> Result LoadFailure Standing -> StandingRead -> ( StandingRead, Maybe ( Uid, String ) )
+standingArrived epoch uid bodyHash result read =
+    case read of
+        StandingReading reading readHash owner wanted ->
+            if reading /= uid || readHash /= bodyHash || owner /= epoch then
+                ( read, Nothing )
+
+            else
+                case wanted of
+                    Just ( next, nextHash ) ->
+                        ( StandingReading next nextHash epoch Nothing, Just ( next, nextHash ) )
+
+                    Nothing ->
+                        case result of
+                            Ok standing ->
+                                ( StandingShown uid bodyHash standing, Nothing )
+
+                            Err e ->
+                                ( StandingFailed uid bodyHash e, Nothing )
+
+        StandingUnread ->
+            ( read, Nothing )
+
+        StandingShown _ _ _ ->
+            ( read, Nothing )
+
+        StandingFailed _ _ _ ->
+            ( read, Nothing )
 
 
 -- The read's result for `unit`'s current body, Nothing while none is held.
@@ -115,6 +168,9 @@ standingFor unit read =
 
             else
                 Nothing
+
+        StandingReading _ _ _ _ ->
+            Nothing
 
 
 -- What a unit is called on screen: its kind and qualified name, plus as
@@ -461,11 +517,11 @@ type QueueState
     | Failed LoadFailure
 
 
--- The number of one load of a page slot (the queue, a History page, a unit
--- page). Each load a slot starts takes the ticket after the slot's latest,
--- and a result settles the slot only under the slot's latest ticket, so a
--- slower earlier load never replaces the result of a later one. Opaque:
--- built only by `firstTicket` and `nextTicket`.
+-- The number of one load of a page slot (the queue, a History page). Each
+-- load a slot starts takes the ticket after the slot's latest, and a result
+-- settles the slot only under the slot's latest ticket, so a slower earlier
+-- load never replaces the result of a later one. Opaque: built only by
+-- `firstTicket` and `nextTicket`.
 type LoadTicket
     = LoadTicket Int
 
@@ -493,6 +549,173 @@ ticketNumber ticket =
     case ticket of
         LoadTicket n ->
             n
+
+
+-- A page slot's load: idle at its latest ticket, or the one load in flight,
+-- under its ticket, run by process `owner`, with what was asked meanwhile.
+-- A load asked while one runs is recorded, never started, so the slot holds
+-- at most one load; the running load's result is dropped while anything is
+-- wanted, and the wanted load starts in its place. A load another process
+-- left behind has no completion left to settle it, so the slot is idle to
+-- every transition. Opaque: changed only by the transitions below, so a
+-- ticket and a load in flight cannot disagree.
+type LoadSlot want
+    = LoadIdle LoadTicket
+    | LoadRunning LoadTicket Epoch (Maybe want)
+
+
+-- What a queue load reads: the page at a cursor, or the drain of a saved
+-- decision's pair from the index, then that page.
+type QueueWant
+    = QueueReload Index.Cursor
+    | QueueDrain Index.Attested Index.Written Index.Cursor
+
+
+-- What a History load reads: the page at a cursor.
+type HistoryWant
+    = HistoryFrom LibDb.HistoryCursor
+
+
+-- Whether an arrived result settles its page (`Settles`), or is dropped
+-- (`Dropped`): superseded by a load wanted meanwhile, from another load, or
+-- from another process.
+type Settle
+    = Settles
+    | Dropped
+
+
+-- A slot with no load run yet.
+idleLoad : LoadSlot want
+idleLoad =
+    LoadIdle firstTicket
+
+
+-- The slot's latest ticket: the one in flight, or the last one settled.
+latestTicket : LoadSlot want -> LoadTicket
+latestTicket slot =
+    case slot of
+        LoadIdle ticket ->
+            ticket
+
+        LoadRunning ticket _ _ ->
+            ticket
+
+
+-- What the load in flight has wanted after it: Nothing while the slot is
+-- idle to process `epoch`, Just Nothing while it runs with nothing wanted.
+runningWant : Epoch -> LoadSlot want -> Maybe (Maybe want)
+runningWant epoch slot =
+    case slot of
+        LoadIdle _ ->
+            Nothing
+
+        LoadRunning _ owner wanted ->
+            if owner == epoch then
+                Just wanted
+
+            else
+                Nothing
+
+
+-- `want` asked for by process `epoch`, with the load to start, if any: an
+-- idle slot starts it under its next ticket; during a load this process
+-- runs it is only recorded, folded into what was wanted by `merge`.
+requestLoad : (want -> want -> want) -> Epoch -> want -> LoadSlot want -> ( LoadSlot want, Maybe ( LoadTicket, want ) )
+requestLoad merge epoch want slot =
+    case slot of
+        LoadIdle ticket ->
+            startLoad epoch ticket want
+
+        LoadRunning ticket owner wanted ->
+            if owner == epoch then
+                ( LoadRunning ticket owner (Just (wantedWith merge wanted want)), Nothing )
+
+            else
+                startLoad epoch ticket want
+
+
+-- `want` asked for only to have the slot's data loaded: a load this process
+-- runs will settle it, so nothing is recorded; an idle slot starts it.
+ensureLoad : (want -> want -> want) -> Epoch -> want -> LoadSlot want -> ( LoadSlot want, Maybe ( LoadTicket, want ) )
+ensureLoad merge epoch want slot =
+    case runningWant epoch slot of
+        Just _ ->
+            ( slot, Nothing )
+
+        Nothing ->
+            requestLoad merge epoch want slot
+
+
+-- The load under `load` run by process `epoch` returned: with a load wanted
+-- meanwhile its result is `Dropped` and the wanted load starts; with none
+-- the slot is idle and the result `Settles`. A result under any ticket but
+-- the one in flight, or from any process but its owner, is `Dropped` with
+-- the slot unchanged.
+loadArrived : Epoch -> LoadTicket -> LoadSlot want -> ( Settle, LoadSlot want, Maybe ( LoadTicket, want ) )
+loadArrived epoch load slot =
+    case slot of
+        LoadIdle _ ->
+            ( Dropped, slot, Nothing )
+
+        LoadRunning ticket owner wanted ->
+            if owner /= epoch || not (isCurrentLoad load ticket) then
+                ( Dropped, slot, Nothing )
+
+            else
+                case wanted of
+                    Just next ->
+                        let
+                            ( started, start ) =
+                                startLoad epoch ticket next
+                        in
+                        ( Dropped, started, start )
+
+                    Nothing ->
+                        ( Settles, LoadIdle ticket, Nothing )
+
+
+startLoad : Epoch -> LoadTicket -> want -> ( LoadSlot want, Maybe ( LoadTicket, want ) )
+startLoad epoch latest want =
+    let
+        ticket =
+            nextTicket latest
+    in
+    ( LoadRunning ticket epoch Nothing, Just ( ticket, want ) )
+
+
+wantedWith : (want -> want -> want) -> Maybe want -> want -> want
+wantedWith merge wanted want =
+    case wanted of
+        Just held ->
+            merge held want
+
+        Nothing ->
+            want
+
+
+-- The later of two wants, for a slot whose loads only read.
+latestWant : want -> want -> want
+latestWant _ newer =
+    newer
+
+
+-- Two queue loads asked for while one runs, as one: a drain is never lost
+-- to a reload, and the newer cursor is read. A drain asked over another
+-- drain keeps the newer; the older pair's copy row is rebuilt by the next
+-- load's snapshot (its copy no longer holds the log's head).
+mergeQueueWant : QueueWant -> QueueWant -> QueueWant
+mergeQueueWant held newer =
+    case newer of
+        QueueDrain _ _ _ ->
+            newer
+
+        QueueReload cursor ->
+            case held of
+                QueueDrain attested written _ ->
+                    QueueDrain attested written cursor
+
+                QueueReload _ ->
+                    newer
 
 
 -- A review as the History page shows it: the review entry, counted or not,
@@ -1140,6 +1363,223 @@ unitPageOf uid state =
             UnitLoading
 
 
+-- What a decision is asked on: a queued unit, decided on its shown source,
+-- or an unreviewable file the loaded page lists, decided on its digest.
+type DecisionTarget
+    = OnUnit
+    | OnRefusal
+
+
+-- A row the shown queue page draws decision controls for, with what a
+-- decision on it is asked on and the digest of the content drawn: a unit's
+-- shown-source hash or a file's refusal digest, each the hash the log signs.
+-- The constructor is the target, so a row and a target cannot disagree. Only
+-- `decidableRow` builds one, so the view draws a row's controls, and the
+-- refusal panel opens, by one predicate, and a message carrying the row the
+-- render drew proceeds only while the page still offers that same content.
+type DecidableRow
+    = UnitOffer Uid Index.ShownHash
+    | FileOffer Uid Index.RefusalDigest
+
+
+rowUid : DecidableRow -> Uid
+rowUid row =
+    case row of
+        UnitOffer uid _ ->
+            uid
+
+        FileOffer uid _ ->
+            uid
+
+
+rowTarget : DecidableRow -> DecisionTarget
+rowTarget row =
+    case row of
+        UnitOffer _ _ ->
+            OnUnit
+
+        FileOffer _ _ ->
+            OnRefusal
+
+
+-- Whether two offers name the same row and target, whatever content each
+-- drew. No gate reads it: it picks why an offer that is not the current one
+-- is refused.
+sameSubject : DecidableRow -> DecidableRow -> Bool
+sameSubject a b =
+    rowUid a == rowUid b && rowTarget a == rowTarget b
+
+
+-- The row `uid` as the queue page shows it with card `selected` selected
+-- and `view` in the source slot, when it offers a decision: an
+-- acknowledgeable file the page lists, or the selected card's unit with its
+-- verified source shown, each over a proven log. Nothing for a withheld
+-- source, a file no decision binds, a log that records no decision, a page
+-- not loaded, or a uid the page does not show.
+decidableRow : Int -> QueueState -> SelectedView -> Uid -> Maybe DecidableRow
+decidableRow selected state view uid =
+    case state of
+        Loaded page ->
+            case page.log of
+                ShownProven ->
+                    case List.find (\row -> row.uid == uid) page.refusals of
+                        Just row ->
+                            Maybe.map (FileOffer uid) row.digest
+
+                        Nothing ->
+                            case List.head (List.drop selected page.units) of
+                                Just q ->
+                                    if q.unit.uid == uid then
+                                        Maybe.map (\shown -> UnitOffer uid (Index.shownDigest shown)) (decidableSource uid view)
+
+                                    else
+                                        Nothing
+
+                                Nothing ->
+                                    Nothing
+
+                ShownBroken _ ->
+                    Nothing
+
+                ShownKeyMismatch ->
+                    Nothing
+
+                ShownUnkeyed ->
+                    Nothing
+
+        Loading ->
+            Nothing
+
+        Failed _ ->
+            Nothing
+
+
+-- The row `uid` when it offers a decision on `target` by `decidableRow`,
+-- the predicate the view draws the row's controls by, and that offer is the
+-- one the render drew (`drawn`, Nothing when it drew no control), or why a
+-- decision on it is refused before it starts: a click that arrived after its
+-- row stopped offering one, or an offer on the same row whose content changed
+-- since it was drawn (or that was never drawn), `DrawnChanged`.
+decidableAs : Int -> QueueState -> SelectedView -> DecisionTarget -> Uid -> Maybe DecidableRow -> Result SaveFailure DecidableRow
+decidableAs selected state view target uid drawn =
+    case decidableRow selected state view uid of
+        Just current ->
+            if Just current == drawn && rowTarget current == target && rowUid current == uid then
+                Ok current
+
+            else if drawnChanged current drawn then
+                Err (Failure.SaveRefused Failure.DrawnChanged)
+
+            else
+                Err (undecidable state target uid)
+
+        Nothing ->
+            Err (undecidable state target uid)
+
+
+-- Whether the page offers `current` where the render drew no control, or
+-- drew the same row with other content.
+drawnChanged : DecidableRow -> Maybe DecidableRow -> Bool
+drawnChanged current drawn =
+    case drawn of
+        Nothing ->
+            True
+
+        Just d ->
+            sameSubject current d && current /= d
+
+
+-- The one source a decision on `row` may be made on: the selected unit's
+-- verified view, kept only while its digest is the one `row` drew, so the
+-- bytes re-proved and signed are the bytes drawn. Nothing for a file's
+-- offer, or a view whose content changed since the offer was drawn.
+offeredSource : DecidableRow -> SelectedView -> Maybe Index.ShownSource
+offeredSource row view =
+    case row of
+        UnitOffer uid hash ->
+            case decidableSource uid view of
+                Just shown ->
+                    if Index.shownDigest shown == hash then
+                        Just shown
+
+                    else
+                        Nothing
+
+                Nothing ->
+                    Nothing
+
+        FileOffer _ _ ->
+            Nothing
+
+
+-- The digest a decision on `row` acknowledges: the refusal digest the
+-- file's offer drew, never the page's copy. Nothing for a unit's offer.
+offeredRefusal : DecidableRow -> Maybe Index.RefusalDigest
+offeredRefusal row =
+    case row of
+        FileOffer _ digest ->
+            Just digest
+
+        UnitOffer _ _ ->
+            Nothing
+
+
+-- Why `uid` offers no decision on `target` on the queue page `state`: the
+-- log records no decision, the unit's source is not shown, or the unit or
+-- file is not one the page offers a decision on.
+undecidable : QueueState -> DecisionTarget -> Uid -> SaveFailure
+undecidable state target uid =
+    case state of
+        Loaded page ->
+            case page.log of
+                ShownProven ->
+                    case target of
+                        OnUnit ->
+                            if List.any (\q -> q.unit.uid == uid) page.units then
+                                Failure.SaveRefused Failure.SourceNotShown
+
+                            else
+                                Failure.SaveRefused Failure.NotQueued
+
+                        OnRefusal ->
+                            case List.find (\row -> row.uid == uid) page.refusals of
+                                Just row ->
+                                    case row.digest of
+                                        Just _ ->
+                                            Failure.SaveRefused Failure.FileNotQueued
+
+                                        Nothing ->
+                                            Failure.SaveRefused Failure.FileNotAcknowledgeable
+
+                                Nothing ->
+                                    Failure.SaveRefused Failure.FileNotQueued
+
+                ShownBroken _ ->
+                    Failure.SaveRefused Failure.LogBroken
+
+                ShownKeyMismatch ->
+                    Failure.SaveRefused Failure.LogKeyMismatch
+
+                ShownUnkeyed ->
+                    Failure.SaveReadOnly
+
+        Loading ->
+            notListed target
+
+        Failed _ ->
+            notListed target
+
+
+notListed : DecisionTarget -> SaveFailure
+notListed target =
+    case target of
+        OnUnit ->
+            Failure.SaveRefused Failure.NotQueued
+
+        OnRefusal ->
+            Failure.SaveRefused Failure.FileNotQueued
+
+
 -- The session's one decision slot, and what the reviewer sees of it. A
 -- decision re-reads its source to re-prove it, so at most one is in flight:
 -- a decision asked while one is busy starts nothing. Busy is two cases: the
@@ -1152,11 +1592,26 @@ unitPageOf uid state =
 -- was raised; the next decision started, or a queue load started after it
 -- that succeeds, replaces it, so a reload clears it as its text advises,
 -- and a load that read the queue before the failure was known does not.
+-- The refusal panel lives only in the two idle cases, so a panel open
+-- beside a busy decision, or a draft with no panel, has no representation.
 type DecisionSlot
-    = DecisionIdle
+    = DecisionIdle RefusalPanel
     | DecisionSaving Uid Epoch
     | DecisionRefreshing Uid Epoch
-    | DecisionNotSaved SaveFailure LoadTicket
+    | DecisionNotSaved SaveFailure LoadTicket RefusalPanel
+
+
+-- The refusal panel of an idle slot: closed, or open on one row the shown
+-- page offers a decision on, with its draft.
+type RefusalPanel
+    = PanelClosed
+    | PanelOpen DecidableRow Draft
+
+
+-- The reviewer's refusal draft, bounded where it enters, and what the panel
+-- says of it: why it was refused, or that it was cut.
+type alias Draft =
+    { refuseDraft : Draft.Draft, refuseError : Maybe RefuseFailure }
 
 
 -- The decision on `uid` and the process `epoch` runs it in, while that
@@ -1178,16 +1633,16 @@ busyOwnedBy epoch slot =
             else
                 Nothing
 
-        DecisionIdle ->
+        DecisionIdle _ ->
             Nothing
 
-        DecisionNotSaved _ _ ->
+        DecisionNotSaved _ _ _ ->
             Nothing
 
 
 -- The slot holding a decision on `uid` run by process `epoch`; Nothing
 -- while another decision of that process is busy. Starting a decision drops
--- the last one's not-saved notice.
+-- the last one's not-saved notice and closes any open refusal panel.
 startDecision : Epoch -> Uid -> DecisionSlot -> Maybe DecisionSlot
 startDecision epoch uid slot =
     case busyOwnedBy epoch slot of
@@ -1196,6 +1651,114 @@ startDecision epoch uid slot =
 
         Nothing ->
             Just (DecisionSaving uid epoch)
+
+
+-- The slot with the refusal panel open on `row`, its draft empty, by the
+-- same busy check `startDecision` makes: while a decision of process
+-- `epoch` is busy the slot is unchanged, and a busy decision another process
+-- left behind is idle. Only a row the shown page offers a decision on can
+-- hold the panel, so a panel no row draws has no representation.
+openRefusal : Epoch -> DecidableRow -> DecisionSlot -> DecisionSlot
+openRefusal epoch row slot =
+    case busyOwnedBy epoch slot of
+        Just _ ->
+            slot
+
+        Nothing ->
+            withPanel (PanelOpen row { refuseDraft = Draft.empty, refuseError = Nothing }) (ownedSlot epoch slot)
+
+
+-- The slot with its refusal panel closed.
+closeRefusal : DecisionSlot -> DecisionSlot
+closeRefusal slot =
+    withPanel PanelClosed slot
+
+
+-- The draft of the panel open on `uid` replaced by `text`, which clears
+-- why it was refused and says, on this edit, whether it was cut; a slot with
+-- no panel open on `uid` is unchanged, so an edit sent for another row's
+-- panel writes into none.
+editDraft : Uid -> Draft.Draft -> DecisionSlot -> DecisionSlot
+editDraft uid text slot =
+    case openRow slot of
+        Just ( row, _ ) ->
+            if rowUid row == uid then
+                mapOpenDraft (\_ -> { refuseDraft = text, refuseError = Draft.notice text }) slot
+
+            else
+                slot
+
+        Nothing ->
+            slot
+
+
+-- The open panel's draft refused for `failure`; a slot with no open panel
+-- is unchanged.
+draftRefused : RefuseFailure -> DecisionSlot -> DecisionSlot
+draftRefused failure slot =
+    mapOpenDraft (\draft -> { draft | refuseError = Just failure }) slot
+
+
+-- The row the refusal panel is open on, with its draft, if it is open.
+openRow : DecisionSlot -> Maybe ( DecidableRow, Draft )
+openRow slot =
+    case panelOf slot of
+        PanelOpen row draft ->
+            Just ( row, draft )
+
+        PanelClosed ->
+            Nothing
+
+
+-- The uid of the row the refusal panel is open on, with its draft.
+openPanel : DecisionSlot -> Maybe ( Uid, Draft )
+openPanel slot =
+    Maybe.map (\( row, draft ) -> ( rowUid row, draft )) (openRow slot)
+
+
+-- The refusal panel the slot holds; a busy slot holds none.
+panelOf : DecisionSlot -> RefusalPanel
+panelOf slot =
+    case slot of
+        DecisionIdle panel ->
+            panel
+
+        DecisionNotSaved _ _ panel ->
+            panel
+
+        DecisionSaving _ _ ->
+            PanelClosed
+
+        DecisionRefreshing _ _ ->
+            PanelClosed
+
+
+-- An idle slot holding `panel` in place of its own, its notice kept; a
+-- busy slot holds no panel and is unchanged.
+withPanel : RefusalPanel -> DecisionSlot -> DecisionSlot
+withPanel panel slot =
+    case slot of
+        DecisionIdle _ ->
+            DecisionIdle panel
+
+        DecisionNotSaved failure raisedAt _ ->
+            DecisionNotSaved failure raisedAt panel
+
+        DecisionSaving _ _ ->
+            slot
+
+        DecisionRefreshing _ _ ->
+            slot
+
+
+mapOpenDraft : (Draft -> Draft) -> DecisionSlot -> DecisionSlot
+mapOpenDraft change slot =
+    case panelOf slot of
+        PanelOpen row draft ->
+            withPanel (PanelOpen row (change draft)) slot
+
+        PanelClosed ->
+            slot
 
 
 -- The slot as this process `epoch` owns it: a busy decision another process
@@ -1208,17 +1771,17 @@ ownedSlot epoch slot =
 
         Nothing ->
             case slot of
-                DecisionNotSaved _ _ ->
+                DecisionNotSaved _ _ _ ->
                     slot
 
-                DecisionIdle ->
+                DecisionIdle _ ->
                     slot
 
                 DecisionSaving _ _ ->
-                    DecisionIdle
+                    DecisionIdle PanelClosed
 
                 DecisionRefreshing _ _ ->
-                    DecisionIdle
+                    DecisionIdle PanelClosed
 
 
 -- The decision on `uid` run by process `epoch` was written: it stays busy
@@ -1239,7 +1802,7 @@ decisionWritten epoch uid slot =
 decisionNotSaved : Epoch -> Uid -> SaveFailure -> LoadTicket -> DecisionSlot -> DecisionSlot
 decisionNotSaved epoch uid failure latest slot =
     if isSaving epoch uid slot then
-        DecisionNotSaved failure latest
+        DecisionNotSaved failure latest PanelClosed
 
     else
         slot
@@ -1254,16 +1817,17 @@ isSaving epoch uid slot =
         DecisionRefreshing _ _ ->
             False
 
-        DecisionIdle ->
+        DecisionIdle _ ->
             False
 
-        DecisionNotSaved _ _ ->
+        DecisionNotSaved _ _ _ ->
             False
 
 
 -- A decision refused before it started, for `failure`, while `latest` is
 -- the queue's latest load: the notice replaces an idle slot or an older
--- notice, never a busy decision of process `epoch`.
+-- notice, keeping its refusal panel, never a busy decision of process
+-- `epoch`.
 decisionRefused : Epoch -> SaveFailure -> LoadTicket -> DecisionSlot -> DecisionSlot
 decisionRefused epoch failure latest slot =
     case busyOwnedBy epoch slot of
@@ -1271,7 +1835,7 @@ decisionRefused epoch failure latest slot =
             slot
 
         Nothing ->
-            DecisionNotSaved failure latest
+            DecisionNotSaved failure latest (panelOf slot)
 
 
 -- The current queue load `load` settled with `result`. The reloaded queue
@@ -1280,30 +1844,31 @@ decisionRefused epoch failure latest slot =
 -- notice that succeeds also clears it, the reload its text advises, while
 -- a load started before it read the queue before the failure was known
 -- and leaves it. A decision still saving stays: its row is re-proved at
--- the write, and its own result settles it.
+-- the write, and its own result settles it. Every idle slot it settles
+-- closes its refusal panel, since the rows it was opened on are re-read.
 queueSettled : LoadTicket -> Result e a -> DecisionSlot -> DecisionSlot
 queueSettled load result slot =
     case slot of
         DecisionRefreshing _ _ ->
-            DecisionIdle
+            DecisionIdle PanelClosed
 
-        DecisionNotSaved _ raisedAt ->
+        DecisionNotSaved failure raisedAt _ ->
             case result of
                 Ok _ ->
                     if ticketNumber load > ticketNumber raisedAt then
-                        DecisionIdle
+                        DecisionIdle PanelClosed
 
                     else
-                        slot
+                        DecisionNotSaved failure raisedAt PanelClosed
 
                 Err _ ->
-                    slot
+                    DecisionNotSaved failure raisedAt PanelClosed
 
         DecisionSaving _ _ ->
             slot
 
-        DecisionIdle ->
-            slot
+        DecisionIdle _ ->
+            DecisionIdle PanelClosed
 
 
 -- What a row's decision controls show while a decision is busy, in place of
@@ -1327,10 +1892,10 @@ pendingText uid slot =
             else
                 Just (SafeText.literal "Refreshing the queue after a decision…")
 
-        DecisionIdle ->
+        DecisionIdle _ ->
             Nothing
 
-        DecisionNotSaved _ _ ->
+        DecisionNotSaved _ _ _ ->
             Nothing
 
 
@@ -1338,10 +1903,10 @@ pendingText uid slot =
 notSavedOf : DecisionSlot -> Maybe SaveFailure
 notSavedOf slot =
     case slot of
-        DecisionNotSaved failure _ ->
+        DecisionNotSaved failure _ _ ->
             Just failure
 
-        DecisionIdle ->
+        DecisionIdle _ ->
             Nothing
 
         DecisionSaving _ _ ->
@@ -1402,9 +1967,6 @@ sourceStatusText view =
 
         TooLarge (ChildSpans o) ->
             Just [ ToolText (SafeText.literal ("This file holds at least " ++ String.fromInt o.atLeast ++ " other units, past the " ++ String.fromInt Index.childSpanCeiling ++ "-unit review ceiling. It is not shown and cannot be decided here; split the file to review it.")) ]
-
-        TooLarge (ViewNodes o) ->
-            Just [ ToolText (SafeText.literal ("This unit's source draws as " ++ String.fromInt o.nodes ++ " elements even without highlighting, past the " ++ String.fromInt Index.viewNodeCeiling ++ "-element review ceiling." ++ notShownRemedy)) ]
 
 
 -- What a reviewer can do about a view past a ceiling.

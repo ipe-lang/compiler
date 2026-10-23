@@ -160,6 +160,8 @@ fn static_emit_mimalloc_optin_activates_mimalloc() {
 ///   out dir is never created.
 #[test]
 fn cli_refusals_are_typed_and_artifact_free() {
+    let project = hello_project();
+    let project_arg = project.path().to_string_lossy().into_owned();
     // A fresh, guaranteed-absent out dir per case; the refusal must not create it.
     let scratch = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("cli_refusal_out");
     let _ = std::fs::remove_dir_all(&scratch);
@@ -191,7 +193,7 @@ fn cli_refusals_are_typed_and_artifact_free() {
         &[
             "dev",
             "build",
-            "NoSuch.ipe",
+            project_arg.as_str(),
             "--static",
             "--allocator",
             "jemalloc",
@@ -208,7 +210,7 @@ fn cli_refusals_are_typed_and_artifact_free() {
         &[
             "dev",
             "build",
-            "NoSuch.ipe",
+            project_arg.as_str(),
             "--target",
             "x86_64-unknown-linux-musl",
         ],
@@ -227,7 +229,7 @@ fn cli_refusals_are_typed_and_artifact_free() {
         &[
             "dev",
             "build",
-            "NoSuch.ipe",
+            project_arg.as_str(),
             "--static",
             "--target",
             "x86_64-apple-darwin",
@@ -246,7 +248,7 @@ fn cli_refusals_are_typed_and_artifact_free() {
         &[
             "dev",
             "build",
-            "NoSuch.ipe",
+            project_arg.as_str(),
             "--static",
             "--allocator",
             "talc",
@@ -270,10 +272,12 @@ fn cli_refusals_are_typed_and_artifact_free() {
 /// C and honouring the flag would be a lie.
 #[test]
 fn cfree_contradictions_are_refused_at_the_cli_boundary() {
+    let project = hello_project();
+    let project_arg = project.path().to_string_lossy().into_owned();
     let err = ipe::run_cli(&[
         "dev".into(),
         "build".into(),
-        "NoSuch.ipe".into(),
+        project_arg.clone(),
         "--static".into(),
         "--cfree".into(),
         "--allocator".into(),
@@ -291,7 +295,7 @@ fn cfree_contradictions_are_refused_at_the_cli_boundary() {
     let err = ipe::run_cli(&[
         "dev".into(),
         "build".into(),
-        "NoSuch.ipe".into(),
+        project_arg,
         "--static".into(),
         "--cfree".into(),
     ])
@@ -310,10 +314,12 @@ fn cfree_contradictions_are_refused_at_the_cli_boundary() {
 /// compilation or filesystem write.
 #[test]
 fn run_subcommand_refuses_like_build() {
+    let project = hello_project();
+    let project_arg = project.path().to_string_lossy().into_owned();
     let err = ipe::run_cli(&[
         "dev".into(),
         "run".into(),
-        "NoSuch.ipe".into(),
+        project_arg.clone(),
         "--static".into(),
         "--allocator".into(),
         "talc".into(),
@@ -330,7 +336,7 @@ fn run_subcommand_refuses_like_build() {
     let err = ipe::run_cli(&[
         "dev".into(),
         "run".into(),
-        "NoSuch.ipe".into(),
+        project_arg,
         "--target".into(),
         "x86_64-unknown-linux-musl".into(),
     ])
@@ -1491,13 +1497,11 @@ fn ipe_run_static_builds_and_executes_a_static_binary() {
         return;
     }
     let root = repo_root();
-    let entry = root
+    let project = root
         .join("examples")
         .join("shapes")
         .join("non-tea")
-        .join("hello-world")
-        .join("src")
-        .join("Main.ipe");
+        .join("hello-world");
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("static_run_e2e");
     let _ = std::fs::remove_dir_all(&out);
 
@@ -1509,7 +1513,7 @@ fn ipe_run_static_builds_and_executes_a_static_binary() {
 
     let run = std::process::Command::new(support::ipe_bin())
         .args(["dev", "run"])
-        .arg(&entry)
+        .arg(&project)
         .args(["--static", "--out"])
         .arg(&out)
         .env("CARGO_TARGET_DIR", &target_dir)

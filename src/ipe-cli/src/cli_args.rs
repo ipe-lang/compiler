@@ -376,10 +376,10 @@ fn take_leading_entry(
 
 /// `true` when `token` is a delivery word — a shape (`web`/`tui`/…), the `solo`
 /// runtime, the never-written `served`, or a host (`desktop`/`ios`/`android`).
-/// Used to tell a leading entry-path positional from a leading delivery word so
-/// `ipe dev build web` (a delivery) and `ipe dev build src/Main.ipe` (an entry) both
-/// parse. A target triple is deliberately excluded: a leading bare triple with
-/// no preceding shape word is meaningless, so it stays an entry-path candidate
+/// Used to tell a leading project-directory positional from a leading delivery
+/// word so `ipe dev build web` (a delivery) and `ipe dev build app` (a directory)
+/// both parse. A target triple is deliberately excluded: a leading bare triple with
+/// no preceding shape word is meaningless, so it stays a directory candidate
 /// and the delivery parse rejects it in tail position if it slips through.
 fn is_delivery_word(token: &str) -> bool {
     Shape::from_word(token).is_some()

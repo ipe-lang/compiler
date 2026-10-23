@@ -14,13 +14,14 @@ import Ipe.Ui.Font as Font
 import Ipe.Ui.Input as Input
 import Lib.App as App exposing (Model, Msg(..), Page(..), queueList)
 import Lib.Db as LibDb exposing (LogShown(..), ReviewEntry(..), StoredDecision(..), Unverified(..))
-import Lib.Drawn as Drawn exposing (Code(..), DrawnSource, Hue(..), LayoutNote(..), Mode(..), Part(..), Piece(..), Run(..))
+import Lib.Draft as Draft
+import Lib.Drawn as Drawn exposing (DrawnSource, Drawing(..), Hue(..), LayoutNote(..), Mode(..), Part(..), Piece(..), Run(..), SpelledRow(..))
 import Lib.Failure as Failure exposing (LoadFailure)
 import Lib.Format as Format
 import Lib.Index as Index exposing (Change(..), SourceView(..))
 import Lib.Label as Label exposing (Label, LabelPart(..), LabelPiece(..))
 import Lib.Links as Links exposing (Link(..))
-import Lib.Queue as Queue exposing (HistoryLabel(..), HistoryState(..), Place(..), Presence(..), QueueState(..), Standing(..), UnitLabel, UnitPageState(..))
+import Lib.Queue as Queue exposing (DecisionTarget(..), HistoryLabel(..), HistoryState(..), Place(..), Presence(..), QueueState(..), Standing(..), UnitLabel, UnitPageState(..))
 import Lib.ReviewKey as ReviewKey
 import Lib.SafeText as SafeText exposing (SafeText, Segment(..))
 import Lib.Uid exposing (Uid)
@@ -121,11 +122,15 @@ progressBar k n =
 -- handler before and after any click, since key events bubble to the root.
 view : Model -> Ui.Element Msg
 view model =
+    let
+        offers =
+            App.keyOffers model
+    in
     Ui.column
         [ Ui.width Ui.fill
         , Ui.height Ui.fill
         , Background.color (Ui.rgb 16 16 22)
-        , Ui.onKeyDown KeyDown
+        , Ui.onKeyDown (KeyDown offers)
         , Ui.htmlAttribute "tabindex" "0"
         , Ui.htmlAttribute "autofocus" ""
         , Ui.htmlAttribute "lang" "en"
@@ -200,7 +205,7 @@ notSavedBanner : Model -> Ui.Element Msg
 notSavedBanner model =
     case Queue.notSavedOf model.decision of
         Just failure ->
-            Ui.el [ Font.size 13, Font.color (Ui.rgb 230 120 120) ] (safeText (SafeText.literal ("Decision save failed: " ++ Failure.saveFailureText failure)))
+            Ui.el [ Font.size 13, Font.color (Ui.rgb 230 120 120) ] (safeText (SafeText.literal ("Decision not saved: " ++ Failure.saveFailureText failure)))
 
         Nothing ->
             Ui.none
@@ -220,7 +225,7 @@ queueStateBody model =
                     , nextPageButton page.next
                     ]
                 , chainBannerLine page.log
-                , refusalBlock (refuseControlsOf model) page
+                , refusalBlock model page
                 , queueUnits model
                 ]
 
@@ -236,8 +241,8 @@ queueStateBody model =
 -- size and its digest's first characters, never a byte of the file. An
 -- acknowledgeable file on a page that records decisions offers Acknowledge
 -- and Refuse; a blocking one says only a change to the tree closes it.
-refusalBlock : RefuseControls -> Queue.QueuePage -> Ui.Element Msg
-refusalBlock controls page =
+refusalBlock : Model -> Queue.QueuePage -> Ui.Element Msg
+refusalBlock model page =
     if List.isEmpty page.refusals then
         Ui.none
 
@@ -245,12 +250,12 @@ refusalBlock controls page =
         Ui.column
             [ Ui.width Ui.fill, Ui.spacing 8 ]
             (Ui.el [ Font.size 13, Font.bold, Font.color (Ui.rgb 220 170 90) ] (Ui.text "Unreviewable files")
-                :: List.map (refusalCard controls page.log) page.refusals
+                :: List.map (\row -> refusalCard (refuseControlsOf model) (App.decidableRow model row.uid) page.log row) page.refusals
             )
 
 
-refusalCard : RefuseControls -> LogShown -> Index.RefusalRow -> Ui.Element Msg
-refusalCard controls shown row =
+refusalCard : RefuseControls -> Maybe Queue.DecidableRow -> LogShown -> Index.RefusalRow -> Ui.Element Msg
+refusalCard controls offered shown row =
     Ui.column
         [ Ui.width Ui.fill
         , Ui.padding 12
@@ -268,7 +273,7 @@ refusalCard controls shown row =
                 [ Ui.paddingXY 8 3, Background.color (Ui.rgb 40 40 52), Border.rounded 4, Font.size 11, Font.bold, Font.color (Ui.rgb 220 220 230) ]
                 (safeText (Queue.refusalReasonText row.reason))
             , Ui.el [ Ui.width Ui.fill ] Ui.none
-            , refusalControls controls shown row
+            , refusalControls controls offered shown row
             ]
         , Ui.row
             [ Ui.spacing 10, Font.size 12, Font.color (Ui.rgb 150 150 165) ]
@@ -290,8 +295,8 @@ refusalCard controls shown row =
 
 -- Acknowledge and Refuse for a file a decision can bind on a page that
 -- records decisions; otherwise why there is no control.
-refusalControls : RefuseControls -> LogShown -> Index.RefusalRow -> Ui.Element Msg
-refusalControls controls shown row =
+refusalControls : RefuseControls -> Maybe Queue.DecidableRow -> LogShown -> Index.RefusalRow -> Ui.Element Msg
+refusalControls controls offered shown row =
     case row.digest of
         Nothing ->
             Ui.el [ Font.size 12, Font.color (Ui.rgb 220 170 90) ] (Ui.text "Cannot be acknowledged: fix it in the tree.")
@@ -302,7 +307,7 @@ refusalControls controls shown row =
                     Ui.el [ Font.size 12, Font.color (Ui.rgb 220 170 90) ] (safeText (SafeText.literal why))
 
                 Nothing ->
-                    decisionControls controls row.uid (SafeText.literal "Acknowledge") (AckRefusal row.uid) (RefuseRefusalSubmit row.uid)
+                    decisionControls controls row.uid offered
 
 
 nextPageButton : Maybe Index.Cursor -> Ui.Element Msg
@@ -315,23 +320,18 @@ nextPageButton next =
             Ui.none
 
 
--- What the decision controls read of the model: which row has its refusal
--- panel open, the draft and its failure, and the decision in flight.
+-- What the decision controls read of the model: the decision slot, and the
+-- row its refusal panel is open on with its draft, read from the slot, which
+-- holds a panel only while no decision is busy.
 type alias RefuseControls =
-    { refusingUid : Maybe Uid
-    , refuseDraft : String
-    , refuseError : Maybe Failure.RefuseFailure
+    { panel : Maybe ( Queue.DecidableRow, Queue.Draft )
     , decision : Queue.DecisionSlot
     }
 
 
 refuseControlsOf : Model -> RefuseControls
 refuseControlsOf model =
-    { refusingUid = model.refusingUid
-    , refuseDraft = model.refuseDraft
-    , refuseError = model.refuseError
-    , decision = model.decision
-    }
+    { panel = Queue.openRow model.decision, decision = model.decision }
 
 
 queueUnits : Model -> Ui.Element Msg
@@ -356,7 +356,7 @@ queueUnits model =
                     [ hintLine (recordsDecisions model.queueState)
                     , case current of
                         Just ( q, label ) ->
-                            unitCard (refuseControlsOf model) model.queueState model.selectedView label q
+                            unitCard (refuseControlsOf model) (App.decidableRow model q.unit.uid) model.queueState model.selectedView label q
 
                         Nothing ->
                             Ui.none
@@ -702,7 +702,7 @@ linkEl : Links.Link -> Ui.Element Msg
 linkEl link =
     case link of
         Internal _ uid ->
-            linkOrText (Result.toMaybe (Ui.linkTarget ("/unit/" ++ Uid.toString uid))) (linkPieces link)
+            linkOrText (Uid.linkTarget uid) (linkPieces link)
 
         External url ->
             linkOrText (Maybe.andThen (\raw -> Result.toMaybe (Ui.linkTarget raw)) (Links.href url)) (linkPieces link)
@@ -819,8 +819,8 @@ urlSync model =
         (Html.node "div" [ Attr.attribute "data-ipe-path" (currentPath model) ] [])
 
 
-unitCard : RefuseControls -> Queue.QueueState -> Queue.SelectedView -> UnitLabel -> Queue.QueuedUnit -> Ui.Element Msg
-unitCard controls queueState selectedView label q =
+unitCard : RefuseControls -> Maybe Queue.DecidableRow -> Queue.QueueState -> Queue.SelectedView -> UnitLabel -> Queue.QueuedUnit -> Ui.Element Msg
+unitCard controls offered queueState selectedView label q =
     let
         unit =
             q.unit
@@ -848,7 +848,7 @@ unitCard controls queueState selectedView label q =
             , Ui.el [ Ui.width Ui.fill ] Ui.none
             , case loaded of
                 Just v ->
-                    decisionButtons controls queueState v
+                    decisionButtons controls offered queueState v
 
                 Nothing ->
                     Ui.none
@@ -910,7 +910,7 @@ placeEls size place =
             [ placeEl size (placeText path line) ]
 
         AtUnit path line uid ->
-            [ placeEl size (placeText path line ++ [ ToolText (SafeText.literal " · "), ToolText (SafeText.renderForeign (Uid.toString uid)) ]) ]
+            [ placeEl size (placeText path line ++ [ ToolText (SafeText.literal " · "), ToolText (Uid.placeText uid) ]) ]
 
 
 placeEl : Int -> List LabelPiece -> Ui.Element Msg
@@ -1108,8 +1108,8 @@ chipAround bg content =
 
 -- Approve and Refuse exist only for a verified view on a server that signs
 -- decisions; any other view shows why it cannot be decided instead.
-decisionButtons : RefuseControls -> Queue.QueueState -> Index.UnitView -> Ui.Element Msg
-decisionButtons controls queueState loaded =
+decisionButtons : RefuseControls -> Maybe Queue.DecidableRow -> Queue.QueueState -> Index.UnitView -> Ui.Element Msg
+decisionButtons controls offered queueState loaded =
     case Queue.sourceStatusText loaded.view of
         Just why ->
             Ui.el [ Font.size 12, Font.color (Ui.rgb 220 170 90) ] (shownLabel why)
@@ -1119,7 +1119,7 @@ decisionButtons controls queueState loaded =
                 Loaded page ->
                     case noDecisionReason page.log of
                         Nothing ->
-                            verifiedDecisionButtons controls loaded.unit
+                            verifiedDecisionButtons controls offered loaded.unit
 
                         Just why ->
                             Ui.el [ Font.size 12, Font.color (Ui.rgb 220 170 90) ] (safeText (SafeText.literal why))
@@ -1131,31 +1131,73 @@ decisionButtons controls queueState loaded =
                     Ui.none
 
 
-verifiedDecisionButtons : RefuseControls -> Index.Unit -> Ui.Element Msg
-verifiedDecisionButtons controls unit =
-    decisionControls controls unit.uid (SafeText.literal "Approve") (ApproveUnit unit.uid) (RefuseSubmit unit.uid)
+verifiedDecisionButtons : RefuseControls -> Maybe Queue.DecidableRow -> Index.Unit -> Ui.Element Msg
+verifiedDecisionButtons controls offered unit =
+    decisionControls controls unit.uid offered
 
 
 -- The one place a row's decision controls are drawn, for a queued unit and
--- an unreviewable file alike: the open refusal panel, the pending state
--- while a decision is busy, or the approve control (`approveLabel` sending
--- `approve`) beside Refuse.
-decisionControls : RefuseControls -> Uid -> SafeText -> Msg -> Msg -> Ui.Element Msg
-decisionControls controls uid approveLabel approve submit =
-    if controls.refusingUid == Just uid then
-        refusePanel controls submit
+-- an unreviewable file alike: the pending state of row `uid` while a
+-- decision is busy, else, when the page offers a decision on it (`offered`,
+-- the same row the refusal panel opens on), that row's controls. A row
+-- offered under another uid draws none.
+decisionControls : RefuseControls -> Uid -> Maybe Queue.DecidableRow -> Ui.Element Msg
+decisionControls controls uid offered =
+    case Queue.pendingText uid controls.decision of
+        Just text ->
+            Ui.el [ Font.size 12, Font.color (Ui.rgb 150 150 165) ] (safeText text)
 
-    else
-        case Queue.pendingText uid controls.decision of
-            Just text ->
-                Ui.el [ Font.size 12, Font.color (Ui.rgb 150 150 165) ] (safeText text)
+        Nothing ->
+            case offered of
+                Just row ->
+                    if Queue.rowUid row == uid then
+                        offeredControls controls row
 
-            Nothing ->
-                Ui.row
-                    [ Ui.spacing 8 ]
-                    [ approveButton approveLabel approve
-                    , refuseButton (SafeText.literal "Refuse") (RefuseStart uid)
-                    ]
+                    else
+                        Ui.none
+
+                Nothing ->
+                    Ui.none
+
+
+-- An offered row's controls, each message and label read from the row
+-- itself: its open refusal panel, or its approve control beside Refuse.
+offeredControls : RefuseControls -> Queue.DecidableRow -> Ui.Element Msg
+offeredControls controls row =
+    let
+        uid =
+            Queue.rowUid row
+    in
+    case controls.panel of
+        Just ( open, draft ) ->
+            if open == row then
+                refusePanel uid draft (RefuseSubmit row)
+
+            else
+                offeredButtons row
+
+        Nothing ->
+            offeredButtons row
+
+
+offeredButtons : Queue.DecidableRow -> Ui.Element Msg
+offeredButtons row =
+    Ui.row
+        [ Ui.spacing 8 ]
+        [ approveOf row
+        , refuseButton (SafeText.literal "Refuse") (RefuseStart row)
+        ]
+
+
+-- The approve control of `row`: Approve on a unit, Acknowledge on a file.
+approveOf : Queue.DecidableRow -> Ui.Element Msg
+approveOf row =
+    case Queue.rowTarget row of
+        OnUnit ->
+            approveButton (SafeText.literal "Approve") (ApproveRow row)
+
+        OnRefusal ->
+            approveButton (SafeText.literal "Acknowledge") (ApproveRow row)
 
 
 approveButton : SafeText -> Msg -> Ui.Element Msg
@@ -1184,19 +1226,23 @@ refuseButton label msg =
         { onPress = Just msg, label = safeText label }
 
 
--- The refusal reason input with Confirm, which sends `submit`, and Cancel.
-refusePanel : RefuseControls -> Msg -> Ui.Element Msg
-refusePanel controls submit =
+-- The refusal reason input of the panel open on `uid` with Confirm, which
+-- sends `submit`, and Cancel.
+refusePanel : Uid -> Queue.Draft -> Msg -> Ui.Element Msg
+refusePanel uid draft submit =
     Ui.column
         [ Ui.width (Ui.px 240), Ui.spacing 6 ]
         [ Input.text
-            [ Ui.width Ui.fill, Ui.htmlAttribute "autofocus" "" ]
+            [ Ui.width Ui.fill
+            , Ui.htmlAttribute "maxlength" (String.fromInt Draft.inputMaxUnits)
+            , Ui.htmlAttribute "autofocus" ""
+            ]
             { label = Input.labelAbove [ Font.size 11 ] (Ui.text "Reason")
-            , text = controls.refuseDraft
-            , onChange = RefuseDraft
+            , text = Draft.draftText draft.refuseDraft
+            , onChange = RefuseDraft uid
             , placeholder = Just (Input.placeholder [ Font.size 12 ] (Ui.text "Why refuse?"))
             }
-        , case controls.refuseError of
+        , case draft.refuseError of
             Just failure ->
                 Ui.el [ Font.size 11, Font.color (Ui.rgb 220 110 110) ] (safeText (SafeText.literal (Failure.refuseFailureText failure)))
 
@@ -1257,7 +1303,8 @@ withheldSource view =
 
 
 -- A shown view: the notes on its file's layout, a note when it is drawn
--- without highlighting, then the drawing the view was proved with.
+-- without highlighting or spelled out, then the drawing the view was proved
+-- with.
 shownSource : DrawnSource -> List (Ui.Element Msg)
 shownSource drawn =
     List.map layoutNoteEl (Drawn.notes drawn) ++ modeNote (Drawn.mode drawn) ++ [ Ui.html (drawnHtml drawn) ]
@@ -1271,6 +1318,9 @@ modeNote drawnMode =
 
         Unhighlighted ->
             [ Ui.el [ Font.size 12, Font.color (Ui.rgb 150 150 165) ] (Ui.text "Shown without highlighting: highlighted, this unit would draw past the review ceiling.") ]
+
+        SpelledOut ->
+            [ Ui.el [ Font.size 12, Font.color (Ui.rgb 150 150 165) ] (Ui.text "Shown spelled out: with each escape marked, this unit would draw past the review ceiling. Here \\\\ is one \\ of the source, \\r and \\u{…} are characters the source holds (every character outside printable ASCII but a tab is spelled so), and a line \\… stands for lines reviewed as their own units.") ]
 
 
 layoutNoteEl : LayoutNote -> Ui.Element Msg
@@ -1290,41 +1340,61 @@ layoutNoteText note =
 
 -- A shown view's drawing: each run of numbered lines as one block of text
 -- beside its gutter, and a marker for each run of lines other units cover,
--- which those units' own pages show. It draws exactly the elements
--- `Drawn.elements` counts, each in markup with its style inline.
+-- which those units' own pages show; or, spelled out, the whole view as one
+-- block beside one gutter. It draws exactly the elements `Drawn.elements`
+-- counts, each in markup with its style inline.
 drawnHtml : DrawnSource -> Html.Html msg
 drawnHtml drawn =
-    Html.div [ Attr.style "display:flex;flex-direction:column;gap:2px" ] (List.map partHtml (Drawn.parts drawn))
+    Html.div [ Attr.style "display:flex;flex-direction:column;gap:2px" ] (drawingHtml (Drawn.drawing drawn))
 
 
-partHtml : Part -> Html.Html msg
-partHtml part =
+drawingHtml : Drawing -> List (Html.Html msg)
+drawingHtml drawing =
+    case drawing of
+        Colored drawnParts ->
+            List.map (partHtml codeChildren) drawnParts
+
+        Uncolored drawnParts ->
+            List.map (partHtml (List.map pieceHtml)) drawnParts
+
+        Spelled rows ->
+            [ spelledHtml rows ]
+
+
+partHtml : (code -> List (Html.Html msg)) -> Part code -> Html.Html msg
+partHtml children part =
     case part of
         LineRun numbers code ->
-            Html.div [ Attr.style "display:flex;gap:8px;font-family:monospace;font-size:12px" ] [ gutterHtml numbers, codeHtml code ]
+            Html.div [ Attr.style rowCss ] [ gutterHtml (List.map String.fromInt numbers), codeHtml [] (children code) ]
 
         CoveredRun ->
             Html.div [ Attr.style "font-family:monospace;font-size:12px;color:rgb(120,120,135)" ] [ Html.text "... lines reviewed as their own units" ]
 
 
--- The line numbers of a run, one per line, outside the copied text.
-gutterHtml : List Int -> Html.Html msg
-gutterHtml numbers =
+rowCss : String
+rowCss =
+    "display:flex;gap:8px;font-family:monospace;font-size:12px"
+
+
+-- The gutter's entries, one per line, outside the copied text.
+gutterHtml : List String -> Html.Html msg
+gutterHtml entries =
     Html.div
         [ Attr.style "white-space:pre;text-align:right;user-select:none;flex:none;width:40px;color:rgb(120,120,135)"
         , Attr.attribute "aria-hidden" "true"
         ]
-        [ Html.text (String.join "\n" (List.map String.fromInt numbers)) ]
+        [ Html.text (String.join "\n" entries) ]
 
 
 -- A run's lines as one block whose text is the lines joined by newlines, so
 -- copying it gives the source as written: its spaces and tabs kept, a
 -- coloured run one line element per line. The block draws its text in byte
--- order (`displayOrderCss`); the override holds for every inline element
--- inside it, so no line, run or escape element carries it again.
-codeHtml : Code -> Html.Html msg
-codeHtml code =
-    Html.node "code" [ Attr.style codeCss ] (codeChildren code)
+-- order (`displayOrderCss`) whatever declarations `extraCss` adds; the
+-- override holds for every inline element inside it, so no line, run or
+-- escape element carries it again.
+codeHtml : List String -> List (Html.Html msg) -> Html.Html msg
+codeHtml extraCss children =
+    Html.node "code" [ Attr.style (String.join ";" (codeCss :: extraCss)) ] children
 
 
 codeCss : String
@@ -1332,14 +1402,61 @@ codeCss =
     "display:block;flex:1;white-space:pre;color:#cdcdd7;" ++ displayOrderCss
 
 
-codeChildren : Code -> List (Html.Html msg)
-codeChildren code =
-    case code of
-        ColoredLines lines ->
-            List.intersperse (Html.text "\n") (List.map lineHtml lines)
+codeChildren : List (List Run) -> List (Html.Html msg)
+codeChildren lines =
+    List.intersperse (Html.text "\n") (List.map lineHtml lines)
 
-        PlainText pieces ->
-            List.map pieceHtml pieces
+
+-- A spelled view: one row, its gutter numbering each line and marking each
+-- covered run with `Drawn.spelledGapMark`, and one code block holding one
+-- text node, the rows joined by newlines.
+spelledHtml : List SpelledRow -> Html.Html msg
+spelledHtml rows =
+    Html.div [ Attr.style rowCss ] [ gutterHtml (List.map spelledGutterEntry rows), codeHtml [ spelledCss ] [ spelledText rows ] ]
+
+
+spelledText : List SpelledRow -> Html.Html msg
+spelledText rows =
+    Html.text (String.join "\n" (List.map spelledRowText rows))
+
+
+spelledGutterEntry : SpelledRow -> String
+spelledGutterEntry row =
+    case row of
+        SpelledLine n _ ->
+            String.fromInt n
+
+        SpelledGap ->
+            Drawn.spelledGapMark
+
+
+-- A spelled line's text: its characters as themselves, each escaped
+-- character as its `SafeText.escapeSpelling`; a covered run as
+-- `Drawn.spelledGapText`.
+spelledRowText : SpelledRow -> String
+spelledRowText row =
+    case row of
+        SpelledLine _ pieces ->
+            String.concat (List.map pieceSpelling pieces)
+
+        SpelledGap ->
+            Drawn.spelledGapText
+
+
+pieceSpelling : Piece -> String
+pieceSpelling piece =
+    case piece of
+        Chars s ->
+            s
+
+        Escapes cs ->
+            String.concat (List.map SafeText.escapeSpelling cs)
+
+
+-- The mark of a spelled block: a dashed rule on its left.
+spelledCss : String
+spelledCss =
+    "border-left:1px dashed rgb(120,120,135);padding-left:6px"
 
 
 -- One source line as a single run of inline text, so it copies as the

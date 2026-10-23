@@ -192,6 +192,13 @@ pub enum TrustRefusal {
         /// The offending wrapper identifier.
         ident: String,
     },
+    /// A wrapper crate bound by path is no longer the directory below the project root.
+    FfiWrapperMoved {
+        /// The wrapper's `[package] name`.
+        package: String,
+        /// The path the `path` dependency binds.
+        path: PathBuf,
+    },
 }
 
 impl TrustRefusal {
@@ -210,7 +217,8 @@ impl TrustRefusal {
             | Self::FfiCacheTooManyEntries { .. }
             | Self::FfiCatalog(_)
             | Self::FfiReservedModule { .. }
-            | Self::FfiReservedWrapperPrefix { .. } => TrustSubject::Ffi,
+            | Self::FfiReservedWrapperPrefix { .. }
+            | Self::FfiWrapperMoved { .. } => TrustSubject::Ffi,
         }
     }
 
@@ -239,6 +247,9 @@ impl TrustRefusal {
                     ident,
                     &ipe_canon::asserted::ASSERTED_WRAPPER_PREFIX,
                 )
+            }
+            Self::FfiWrapperMoved { package, path } => {
+                text::msg::ffi_wrapper_moved(package, &path.display())
             }
         }
     }

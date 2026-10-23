@@ -271,7 +271,7 @@ fn emitted_build_failure_reports_missing_feature() {
     assert!(rendered.contains("/tmp/rt"), "{rendered}");
     assert!(rendered.contains("out of date"), "{rendered}");
     assert!(
-        !rendered.contains("ipe dev run [<path>]"),
+        !rendered.contains("ipe dev run [<dir>]"),
         "the build failure must not print the run help page: {rendered}"
     );
 }
@@ -298,7 +298,7 @@ fn emitted_build_failure_reports_unattributed_as_compiler_bug() {
     assert!(rendered.contains("cannot find value"), "{rendered}");
     assert!(rendered.contains("E0425"), "{rendered}");
     // Neither a help page nor the old plain-header user-error framing.
-    assert!(!rendered.contains("ipe dev run [<path>]"), "{rendered}");
+    assert!(!rendered.contains("ipe dev run [<dir>]"), "{rendered}");
     assert!(
         !rendered.contains("building the emitted program failed (cargo exited"),
         "{rendered}"
@@ -3119,7 +3119,7 @@ fn eject_refuses_a_wasm_mode_project_from_the_manifest_tier() {
 
     let out = tmp.join("out");
     let args = [
-        tmp.join("package.ipe").to_string_lossy().into_owned(),
+        tmp.to_string_lossy().into_owned(),
         "--out".to_owned(),
         out.to_string_lossy().into_owned(),
     ];
@@ -3831,7 +3831,233 @@ fn audit_entry_rejects_on_hash_mismatch() {
     let _ = std::fs::remove_dir_all(&idx_root);
 }
 
-// ---- unsafe-scan fail-closed tests -----------------------------------
+// ---- consent scans over the held read ---------------------------------
+
+/// The project at `dir`, read once as the build arms read it.
+fn held_build(dir: &Path, fix: bool) -> Result<HeldBuild, CliError> {
+    use crate::project_root::{ProjectRoot, RootArg};
+    let held = HeldBuild::read(ProjectRoot::resolve(RootArg::at(dir))?)?;
+    if fix { held.fixed() } else { Ok(held) }
+}
+
+/// A project with an unreadable module is refused by the one read, naming that module.
+///
+/// The consent scans have no read of their own: a module the read cannot take
+/// refuses the build, so no scan judges a partial module set.
+#[cfg(unix)]
+#[test]
+fn the_held_read_fails_closed_on_an_unreadable_module() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = unsafe_scan_test_dir("held-unreadable");
+    let src = dir.join("src");
+    fs::create_dir_all(&src).expect("create src");
+    fs::write(src.join("Main.ipe"), CLEAN_MAIN).expect("write Main");
+    let locked = src.join("Locked.ipe");
+    fs::write(
+        &locked,
+        "module Locked exposing ()
+",
+    )
+    .expect("write Locked");
+    fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).expect("chmod 000");
+    fs::write(dir.join("package.ipe"), FIX_MANIFEST).expect("write manifest");
+
+    let held = held_build(&dir, false);
+
+    let _ = fs::set_permissions(&locked, fs::Permissions::from_mode(0o644));
+    let _ = fs::remove_dir_all(&dir);
+    assert!(
+        matches!(
+            &held,
+            Err(CliError::SourceRefused { path, reason: SourceRefusal::AccessDenied })
+                if path.ends_with("Locked.ipe")
+        ),
+        "an unreadable module must refuse the read by name: {:?}",
+        held.err()
+    );
+}
+
+/// The consent scans judge the text the read took: a module swapped on disk after it is not seen.
+///
+/// The held tree imports `Ipe.Unsafe` and the swap removes it, so a scan that
+/// re-read the tree would clear the import; the clean-to-unsafe swap is the
+/// mirror, where a re-read would see an import the build never compiles.
+#[test]
+fn consent_scans_read_the_held_modules_never_the_tree() {
+    const UNSAFE_MAIN: &str =
+        "module Main exposing (main)\n\nimport Ipe.Db.Unsafe\n\n\nmain : Int\nmain =\n    1\n";
+    for (tag, held_text, swapped, scanned_unsafe) in [
+        ("held-unsafe", UNSAFE_MAIN, CLEAN_MAIN, true),
+        ("held-clean", CLEAN_MAIN, UNSAFE_MAIN, false),
+    ] {
+        let dir = fix_project(tag, FIX_MANIFEST, &[("Main.ipe", held_text)]);
+        let held = held_build(&dir, false).expect("the project reads");
+        fs::write(dir.join("src").join("Main.ipe"), swapped).expect("swap Main");
+        let sources = own_sources(&held);
+        let via =
+            crate::unsafe_ack::unsafe_modules_in_sources(sources.iter().map(|(_, text)| *text));
+        let _ = fs::remove_dir_all(&dir);
+        assert_eq!(
+            sources,
+            vec![("Main".to_owned(), held_text)],
+            "{tag}: the scan reads the held text"
+        );
+        assert_eq!(
+            !via.is_empty(),
+            scanned_unsafe,
+            "{tag}: the `.Unsafe` scan judges the held text: {via:?}"
+        );
+    }
+}
+
+/// `--fix` rewrites the tree before the one read, so the build reads the fixed bytes.
+///
+/// The control without `--fix` reads the misspelled module the tree holds.
+#[test]
+fn a_fixed_build_reads_the_rewritten_module() {
+    for (tag, fix, expected) in [
+        (
+            "held-fixed",
+            true,
+            "module Main exposing (main)\n\nlength : Int\nlength = 2\n\nmain = length\n",
+        ),
+        ("held-unfixed", false, MAIN_MISSPELLING_LENGTH),
+    ] {
+        let dir = fix_project(
+            tag,
+            FIX_MANIFEST,
+            &[
+                ("Helpers.ipe", HELPERS_EXPOSING_LENGHT),
+                ("Main.ipe", MAIN_MISSPELLING_LENGTH),
+            ],
+        );
+        let held = held_build(&dir, fix);
+        let _ = fs::remove_dir_all(&dir);
+        let main = held
+            .as_ref()
+            .ok()
+            .and_then(|held| held.snapshot().module(&["Main".to_owned()]))
+            .map(|module| module.text().to_owned());
+        assert_eq!(
+            main.as_deref(),
+            Some(expected),
+            "{tag}: the build reads the tree as `--fix` left it: {:?}",
+            held.err()
+        );
+    }
+}
+
+/// `ipe dev build --fix` of a project its delivery refuses rewrites no file.
+///
+/// The `tui` cross-check word contradicts the `Script` shape the entry pins, so
+/// the build is refused on the unfixed read before any fix is written. The
+/// control fixes the same fixture through the held read, so the refused build
+/// left a fixable file untouched.
+#[test]
+fn a_build_refused_for_delivery_never_applies_its_fixes() {
+    let dir = fix_project(
+        "fix-refused-delivery",
+        FIX_MANIFEST,
+        &[("Main.ipe", MAIN_MISSPELLING_LENGTH)],
+    );
+    let main = dir.join("src").join("Main.ipe");
+    let built = super::run_build_body(&[
+        dir.to_string_lossy().into_owned(),
+        "tui".to_owned(),
+        "--fix".to_owned(),
+    ]);
+    let after_refusal = fs::read_to_string(&main).ok();
+    let fixed = held_build(&dir, true).map(|_| ());
+    let after_fix = fs::read_to_string(&main).ok();
+    let _ = fs::remove_dir_all(&dir);
+    assert!(
+        matches!(built, Err(CliError::Usage(_))),
+        "the stated `tui` shape is refused for a `Script` entry: {:?}",
+        built.err()
+    );
+    assert_eq!(
+        after_refusal.as_deref(),
+        Some(MAIN_MISSPELLING_LENGTH),
+        "a refused build rewrites no file"
+    );
+    assert!(fixed.is_ok(), "{:?}", fixed.err());
+    assert_eq!(
+        after_fix.as_deref(),
+        Some("module Main exposing (main)\n\nlength : Int\nlength = 2\n\nmain = length\n"),
+        "the fixture is fixable"
+    );
+}
+
+/// The shape is read from the held text: an entry swapped after the read keeps the shape it was read as.
+///
+/// The read classified the Tui program and holds its text, the text the emit
+/// compiles; a swap to a `Script` `main` on disk changes neither, while a
+/// fresh read of the swapped tree classifies the new text.
+#[test]
+fn the_shape_and_the_build_share_one_read_of_the_entry() {
+    use crate::delivery::Shape;
+    let dir = fix_project("held-shape-swap", FIX_MANIFEST, &[("Main.ipe", TUI_MAIN)]);
+    let held = held_build(&dir, false).expect("the project reads");
+    fs::write(dir.join("src").join("Main.ipe"), CLEAN_MAIN).expect("swap Main");
+    let fresh = held_build(&dir, false).map(|fresh| fresh.shape());
+    let _ = fs::remove_dir_all(&dir);
+    assert_eq!(
+        held.shape(),
+        Shape::Tui,
+        "the read classified the Tui entry"
+    );
+    assert_eq!(
+        held.snapshot()
+            .module(&["Main".to_owned()])
+            .map(crate::source_snapshot::SnapshotModule::text),
+        Some(TUI_MAIN),
+        "the emit compiles the text the shape was read from"
+    );
+    assert!(
+        matches!(fresh, Ok(Shape::Script)),
+        "a fresh read classifies the swapped text: {fresh:?}"
+    );
+}
+
+/// A multi-program root's shape is its built program's, never another program's.
+#[test]
+fn the_shape_is_the_built_programs() {
+    use crate::delivery::Shape;
+    for (tag, programs, expected) in [
+        (
+            "held-shape-first-script",
+            "[ { name = \"tool\", entry = \"Main.ipe\" }, { name = \"term\", entry = \"Term.ipe\" } ]",
+            Shape::Script,
+        ),
+        (
+            "held-shape-first-tui",
+            "[ { name = \"term\", entry = \"Term.ipe\" }, { name = \"tool\", entry = \"Main.ipe\" } ]",
+            Shape::Tui,
+        ),
+    ] {
+        let manifest = format!(
+            "module Package exposing (package)\n\n\npackage =\n    {{ name = \"app\"\n    , programs = {programs}\n    }}\n"
+        );
+        let dir = fix_project(
+            tag,
+            &manifest,
+            &[("Main.ipe", CLEAN_MAIN), ("Term.ipe", TUI_TERM)],
+        );
+        let shape = held_build(&dir, false).map(|held| held.shape());
+        let _ = fs::remove_dir_all(&dir);
+        assert!(
+            matches!(shape, Ok(got) if got == expected),
+            "{tag}: the built program's shape: {shape:?}"
+        );
+    }
+}
+
+/// A Tui `Main`: the shape read classifies `main = Tui.tea …` without resolving its callee.
+const TUI_MAIN: &str = "module Main exposing (main)\n\nimport Ipe.Tea.Tui\n\nmain = Tui.tea cfg\n";
+
+/// A Tui `Term` program for a multi-program root.
+const TUI_TERM: &str = "module Term exposing (main)\n\nimport Ipe.Tea.Tui\n\nmain = Tui.tea cfg\n";
 
 /// Returns a unique scratch directory under the OS temp root.
 /// The caller is responsible for removing it when done.
@@ -3845,201 +4071,6 @@ fn unsafe_scan_test_dir(tag: &str) -> PathBuf {
     ));
     std::fs::create_dir_all(&dir).expect("create test scratch dir");
     dir
-}
-
-/// A manifest project with an unreadable module must return `Err(CliError::Io)`
-/// naming the unreadable path — not `Ok` with a partial source list.
-#[cfg(unix)]
-#[test]
-fn unsafe_scan_manifest_project_fails_closed_on_unreadable_module() {
-    use std::fs;
-    use std::os::unix::fs::PermissionsExt;
-
-    let dir = unsafe_scan_test_dir("manifest-fail");
-    let src = dir.join("src");
-    fs::create_dir_all(&src).expect("create src");
-
-    // One readable module and one unreadable one.
-    let readable = src.join("Main.ipe");
-    fs::write(&readable, "module Main exposing (main)\n").expect("write Main");
-    let unreadable = src.join("Locked.ipe");
-    fs::write(&unreadable, "module Locked exposing ()\n").expect("write Locked");
-    fs::set_permissions(&unreadable, fs::Permissions::from_mode(0o000)).expect("chmod 000");
-
-    let manifest_path = dir.join("package.ipe");
-    fs::write(
-        &manifest_path,
-        "module Package exposing (package)\n\n\npackage =\n    { name = \"test\" }\n",
-    )
-    .expect("write manifest");
-
-    let result = user_sources_for_unsafe_scan(Some(&manifest_path), &readable);
-
-    // Restore permissions before any assertion so cleanup always runs.
-    let _ = fs::set_permissions(&unreadable, fs::Permissions::from_mode(0o644));
-    let _ = fs::remove_dir_all(&dir);
-
-    // Must be the typed access-denied refusal naming the unreadable path —
-    // never an `Ok` partial scan and never a different error variant.
-    assert!(
-        matches!(
-            &result,
-            Err(CliError::SourceRefused { path, reason: SourceRefusal::AccessDenied })
-                if path == &unreadable
-        ),
-        "expected Err(CliError::SourceRefused(AccessDenied)) naming {unreadable:?}, got: {result:?}"
-    );
-}
-
-/// A manifest project where every module is readable must return `Ok` with
-/// every source text present.
-#[test]
-fn unsafe_scan_manifest_project_ok_when_all_readable() {
-    use std::fs;
-
-    let dir = unsafe_scan_test_dir("manifest-ok");
-    let src = dir.join("src");
-    fs::create_dir_all(&src).expect("create src");
-
-    let entry = src.join("Main.ipe");
-    fs::write(&entry, "module Main exposing (main)\n").expect("write Main");
-    let other = src.join("Helper.ipe");
-    fs::write(&other, "module Helper exposing ()\n").expect("write Helper");
-
-    let manifest_path = dir.join("package.ipe");
-    fs::write(
-        &manifest_path,
-        "module Package exposing (package)\n\n\npackage =\n    { name = \"test\" }\n",
-    )
-    .expect("write manifest");
-
-    let result = user_sources_for_unsafe_scan(Some(&manifest_path), &entry);
-    let _ = fs::remove_dir_all(&dir);
-
-    // Every module readable ⇒ `Ok` carrying a source for each.
-    assert!(
-        matches!(&result, Ok(sources) if sources.len() >= 2),
-        "expected Ok with a source for every readable module, got: {result:?}"
-    );
-}
-
-/// A manifest project whose module discovery fails fails both consent scans
-/// closed, never falling back to the entry's loose-file closure.
-#[test]
-fn unsafe_scan_manifest_project_fails_closed_on_discovery_failure() {
-    use std::fs;
-
-    let dir = unsafe_scan_test_dir("manifest-discovery");
-    let src = dir.join("src");
-    let entry = src.join("Main.ipe");
-    let too_deep = (0..=crate::project::MAX_DISCOVERY_DEPTH).fold(src, |path, _| path.join("d"));
-    fs::create_dir_all(&too_deep).expect("create a tree past the depth ceiling");
-    fs::write(&entry, "module Main exposing (main)\n\nmain = 1\n").expect("write Main");
-    fs::write(
-        too_deep.join("Deep.ipe"),
-        "module Deep exposing (x)\n\nx = 1\n",
-    )
-    .expect("write Deep");
-    let manifest_path = dir.join("package.ipe");
-    fs::write(
-        &manifest_path,
-        "module Package exposing (package)\n\n\npackage =\n    { name = \"test\" }\n",
-    )
-    .expect("write manifest");
-
-    let unsafe_scan = user_sources_for_unsafe_scan(Some(&manifest_path), &entry);
-    let web_scan = named_sources_for_web_scan(Some(&manifest_path), &entry);
-    let _ = fs::remove_dir_all(&dir);
-
-    assert!(
-        matches!(&unsafe_scan, Err(CliError::DiscoveryLimitReached { detail }) if detail.contains("depth ceiling")),
-        "a failed discovery fails the `.Unsafe` scan closed, got: {unsafe_scan:?}"
-    );
-    assert!(
-        matches!(&web_scan, Err(CliError::DiscoveryLimitReached { detail }) if detail.contains("depth ceiling")),
-        "a failed discovery fails the web scan closed, got: {web_scan:?}"
-    );
-}
-
-/// Single-file fallback: when `collect_entry_and_siblings` fails and the
-/// entry itself is unreadable, the result must be `Err(CliError::Io)`
-/// naming the entry path — not `Ok` with an empty list.
-#[cfg(unix)]
-#[test]
-fn unsafe_scan_single_file_fallback_fails_closed_on_unreadable_entry() {
-    use std::fs;
-    use std::os::unix::fs::PermissionsExt;
-
-    let dir = unsafe_scan_test_dir("single-fail");
-    let entry = dir.join("Main.ipe");
-    fs::write(&entry, "module Main exposing (main)\n").expect("write entry");
-    fs::set_permissions(&entry, fs::Permissions::from_mode(0o000)).expect("chmod 000");
-
-    // Pass no manifest so the single-file (entry + siblings) path is taken.
-    let result = user_sources_for_unsafe_scan(None, &entry);
-
-    let _ = fs::set_permissions(&entry, fs::Permissions::from_mode(0o644));
-    let _ = fs::remove_dir_all(&dir);
-
-    // Must be the typed access-denied refusal naming the unreadable entry —
-    // never an `Ok` empty scan and never a different error variant.
-    assert!(
-        matches!(
-            &result,
-            Err(CliError::SourceRefused { path, reason: SourceRefusal::AccessDenied })
-                if path == &entry
-        ),
-        "expected Err(CliError::SourceRefused(AccessDenied)) naming {entry:?}, got: {result:?}"
-    );
-}
-
-/// The consent scans fall back to the entry's own text only when the entry does not parse.
-///
-/// An unparsable entry is scanned as its text alone; a closure refused past
-/// its probe ceiling propagates the refusal, never the fallback.
-#[test]
-#[allow(clippy::expect_used)] // test fixture: an unwritable scratch file IS the failure
-fn scan_sources_fall_back_only_on_entry_parse() {
-    use std::fmt::Write as _;
-
-    let dir = unsafe_scan_test_dir("entry-parse-fallback");
-    let entry = dir.join("Main.ipe");
-    let broken = "module Main exposing (main)\n\nmain =\n";
-    fs::write(&entry, broken).expect("write unparsable entry");
-    let unparsable_unsafe = user_sources_for_unsafe_scan(None, &entry);
-    let unparsable_web = named_sources_for_web_scan(None, &entry);
-
-    // Every import names a module absent on disk: probing alone passes the ceiling.
-    let imports =
-        (0..crate::loose_file::MAX_LOOSE_FILE_PROBES).fold(String::new(), |mut acc, i| {
-            let _ = writeln!(acc, "import M{i}");
-            acc
-        });
-    fs::write(
-        &entry,
-        format!("module Main exposing (main)\n\n{imports}\nmain = 1\n"),
-    )
-    .expect("write over-ceiling entry");
-    let over_unsafe = user_sources_for_unsafe_scan(None, &entry);
-    let over_web = named_sources_for_web_scan(None, &entry);
-    let _ = fs::remove_dir_all(&dir);
-
-    assert!(
-        matches!(&unparsable_unsafe, Ok(sources) if sources.iter().map(String::as_str).eq([broken])),
-        "an unparsable entry is scanned as its own text, got: {unparsable_unsafe:?}"
-    );
-    assert!(
-        matches!(&unparsable_web, Ok(named) if named.iter().map(|(_, src)| src.as_str()).eq([broken])),
-        "an unparsable entry is web-scanned as its own text, got: {unparsable_web:?}"
-    );
-    assert!(
-        matches!(&over_unsafe, Err(CliError::DiscoveryLimitReached { detail }) if detail.contains("distinct modules")),
-        "a closure past its probe ceiling fails the scan closed, got: {over_unsafe:?}"
-    );
-    assert!(
-        matches!(&over_web, Err(CliError::DiscoveryLimitReached { detail }) if detail.contains("distinct modules")),
-        "a closure past its probe ceiling fails the web scan closed, got: {over_web:?}"
-    );
 }
 
 /// The entry's parse failure renders exactly as the compiler diagnostic it always was.
@@ -4109,113 +4140,6 @@ fn entry_parse_renders_as_pipeline() {
         crate::render_json(diag, &file.to_string_lossy(), src),
         crate::render_json(expected_diag, &entry.to_string_lossy(), broken),
         "--json parity"
-    );
-}
-
-/// An unreadable imported module fails both consent scans closed.
-///
-/// Neither scan may judge the entry alone when a module it imports cannot be
-/// read — that module's `.Unsafe`/native imports would go unseen.
-#[cfg(unix)]
-#[test]
-fn consent_scans_fail_closed_on_unreadable_imported_module() {
-    use std::fs;
-    use std::os::unix::fs::PermissionsExt;
-
-    let dir = unsafe_scan_test_dir("sibling-fail");
-    let entry = dir.join("Main.ipe");
-    fs::write(
-        &entry,
-        "module Main exposing (main)\n\nimport Helper\n\nmain = Helper.h\n",
-    )
-    .expect("write entry");
-    let helper = dir.join("Helper.ipe");
-    fs::write(&helper, "module Helper exposing (h)\n\nh = 1\n").expect("write Helper");
-    fs::set_permissions(&helper, fs::Permissions::from_mode(0o000)).expect("chmod 000");
-
-    let unsafe_scan = user_sources_for_unsafe_scan(None, &entry);
-    let web_scan = named_sources_for_web_scan(None, &entry);
-
-    let _ = fs::set_permissions(&helper, fs::Permissions::from_mode(0o644));
-    let _ = fs::remove_dir_all(&dir);
-
-    assert!(
-        matches!(
-            &unsafe_scan,
-            Err(CliError::SourceRefused { path, reason: SourceRefusal::AccessDenied })
-                if path.ends_with("Helper.ipe")
-        ),
-        "unsafe scan must refuse the unreadable module by name, got: {unsafe_scan:?}"
-    );
-    assert!(
-        matches!(
-            &web_scan,
-            Err(CliError::SourceRefused { path, reason: SourceRefusal::AccessDenied })
-                if path.ends_with("Helper.ipe")
-        ),
-        "web scan must refuse the unreadable module by name, got: {web_scan:?}"
-    );
-}
-
-/// A closure one module past the loose-file limit fails both consent scans closed.
-#[test]
-fn consent_scans_fail_closed_on_closure_past_the_module_limit() {
-    use std::fmt::Write as _;
-    use std::fs;
-
-    let dir = unsafe_scan_test_dir("closure-limit");
-    let count = crate::loose_file::MAX_LOOSE_FILE_MODULES + 1;
-    let mut entry_text = String::from("module Main exposing (main)\n\n");
-    for i in 0..count {
-        let _ = writeln!(entry_text, "import M{i}");
-        fs::write(
-            dir.join(format!("M{i}.ipe")),
-            format!("module M{i} exposing ()\n"),
-        )
-        .expect("write module");
-    }
-    entry_text.push_str("\nmain = 1\n");
-    let entry = dir.join("Main.ipe");
-    fs::write(&entry, &entry_text).expect("write entry");
-
-    let unsafe_scan = user_sources_for_unsafe_scan(None, &entry);
-    let web_scan = named_sources_for_web_scan(None, &entry);
-    let _ = fs::remove_dir_all(&dir);
-
-    assert!(
-        matches!(&unsafe_scan, Err(CliError::DiscoveryLimitReached { .. })),
-        "unsafe scan must refuse the over-limit closure, got: {unsafe_scan:?}"
-    );
-    assert!(
-        matches!(&web_scan, Err(CliError::DiscoveryLimitReached { .. })),
-        "web scan must refuse the over-limit closure, got: {web_scan:?}"
-    );
-}
-
-/// An entry that does not parse is scanned alone, keyed by its own path.
-///
-/// It has no import closure to follow; the build reports the parse error.
-#[test]
-fn consent_scans_read_an_unparseable_entry_alone() {
-    use std::fs;
-
-    let dir = unsafe_scan_test_dir("unparseable");
-    let entry = dir.join("Main.ipe");
-    let text = "module Main exposing (\nimport Ipe.Unsafe\n";
-    fs::write(&entry, text).expect("write entry");
-
-    let unsafe_scan = user_sources_for_unsafe_scan(None, &entry);
-    let web_scan = named_sources_for_web_scan(None, &entry);
-    let _ = fs::remove_dir_all(&dir);
-
-    assert!(
-        matches!(&unsafe_scan, Ok(sources) if sources.as_slice() == [text]),
-        "unsafe scan must see the entry text, got: {unsafe_scan:?}"
-    );
-    let expected = vec![(entry.display().to_string(), text.to_owned())];
-    assert!(
-        matches!(&web_scan, Ok(named) if named == &expected),
-        "web scan must see the entry text keyed by its path, got: {web_scan:?}"
     );
 }
 
@@ -4679,17 +4603,24 @@ fn named_replay_log_is_shown_when_it_is_a_trace() {
 #[test]
 fn default_replay_prefers_the_typed_log_then_the_trace() {
     let dir = session_scratch("default");
-    let entry = dir.join("proj").join("Main.ipe");
+    let project = dir.join("proj");
     assert!(
-        fs::create_dir_all(dir.join("proj")).is_ok(),
+        fs::create_dir_all(project.join("src")).is_ok(),
         "make project dir"
     );
     assert!(
-        fs::write(&entry, "module Main exposing (main)\n").is_ok(),
+        fs::write(project.join("src").join("Main.ipe"), CLEAN_MAIN).is_ok(),
         "write entry"
     );
+    assert!(
+        fs::write(project.join("package.ipe"), FIX_MANIFEST).is_ok(),
+        "write package.ipe"
+    );
     let out = dir.join("out");
-    let output_result = resolve_output_root(Some(&out.to_string_lossy()), &entry, None);
+    let manifest = project::parse_manifest(&project.join("package.ipe"));
+    assert!(manifest.is_ok(), "the manifest parses: {manifest:?}");
+    let manifest = manifest.expect("`manifest` must parse");
+    let output_result = resolve_output_root(Some(&out.to_string_lossy()), &manifest);
     assert!(output_result.is_ok(), "out must resolve: {output_result:?}");
     let output = output_result.expect("`output_result` must succeed");
     let replay = cli_args::SessionMode::Replay(None);
@@ -5776,8 +5707,8 @@ fn debug_project(label: &str, package: &str, main: &str) -> (PathBuf, String) {
     fs::create_dir_all(tmp.join("src")).expect("create project dir");
     fs::write(tmp.join("package.ipe"), package).expect("write package.ipe");
     fs::write(tmp.join("src").join("Main.ipe"), main).expect("write Main.ipe");
-    let manifest = tmp.join("package.ipe").to_string_lossy().into_owned();
-    (tmp, manifest)
+    let project = tmp.to_string_lossy().into_owned();
+    (tmp, project)
 }
 
 /// A minimal manifest naming the package `name`.
@@ -5818,8 +5749,8 @@ const DEBUG_DESKTOP_MAIN: &str = "module Main exposing (main)\n\nimport Ipe.Tea.
 /// Bundle the Debug-using desktop app finished in `finish`.
 fn bundle_debug_desktop(finish: NativeFinish<'_>, label: &str) -> Result<(), CliError> {
     let (tmp, _) = debug_project(label, DEBUG_DESKTOP_PACKAGE, DEBUG_DESKTOP_MAIN);
-    let project = tmp.to_string_lossy().into_owned();
-    let result = bundle_delivery(BundleHost::Desktop, finish, Some(&project));
+    let result = held_build(&tmp, false)
+        .and_then(|held| bundle_delivery(BundleHost::Desktop, finish, &held));
     let _ = fs::remove_dir_all(&tmp);
     result
 }
@@ -5944,9 +5875,9 @@ fn release_eject_gates_debug() {
     .expect("write package.ipe");
     fs::write(tmp.join("src").join("Main.ipe"), DEBUG_LOG_MAIN).expect("write Main.ipe");
     let out = tmp.join("ejected");
-    let package = tmp.join("package.ipe").to_string_lossy().into_owned();
+    let project = tmp.to_string_lossy().into_owned();
     let out_arg = out.to_string_lossy().into_owned();
-    let result = run_argv(&["release", "eject", &package, "--out", &out_arg]);
+    let result = run_argv(&["release", "eject", &project, "--out", &out_arg]);
     let written = out.join("Cargo.toml").exists() || out.join("src").join("main.rs").exists();
     let _ = fs::remove_dir_all(&tmp);
     assert!(
@@ -6238,253 +6169,6 @@ fn vendored_debugger_build_is_refused_before_compiling() {
         "the dependency model is not refused by the debugger gate: {err:?}"
     );
     let _ = fs::remove_dir_all(&out);
-}
-
-// A loose entry file the user named through a link is read through it.
-#[cfg(unix)]
-#[test]
-fn a_user_named_entry_symlink_is_followed() {
-    let dir = session_scratch("named_entry_link");
-    let target = dir.join("Real.ipe");
-    let link = dir.join("Main.ipe");
-    assert!(
-        fs::write(&target, "module Main exposing (main)\n\nmain = 1\n").is_ok(),
-        "write entry"
-    );
-    assert!(
-        std::os::unix::fs::symlink(&target, &link).is_ok(),
-        "make link"
-    );
-    let shape = built_entry_shape(&link);
-    let _ = fs::remove_dir_all(&dir);
-    assert!(
-        shape.is_ok(),
-        "a named entry link must be followed: {:?}",
-        shape.err()
-    );
-}
-
-/// A project whose one program's entry is `entry`, with a clean `src/Main.ipe` and `extra` sources.
-fn declared_entry_project(tag: &str, entry: &str, extra: &[(&str, &str)]) -> PathBuf {
-    let dir = session_scratch(tag);
-    let src = dir.join("src");
-    assert!(fs::create_dir_all(&src).is_ok(), "make src/");
-    let manifest = format!(
-        "module Package exposing (package)\n\n\npackage =\n    {{ name = \"app\"\n    , programs = [ {{ name = \"app\", entry = \"{entry}\" }} ]\n    }}\n"
-    );
-    assert!(
-        fs::write(dir.join("package.ipe"), manifest).is_ok(),
-        "write package.ipe"
-    );
-    assert!(
-        fs::write(src.join("Main.ipe"), CLEAN_MAIN).is_ok(),
-        "write src/Main.ipe"
-    );
-    for (rel, body) in extra {
-        assert!(fs::write(src.join(rel), body).is_ok(), "write extra source");
-    }
-    dir
-}
-
-/// A program entry the build refuses (escaping `src/`, absolute, no `.ipe`, no
-/// module name) is refused by the shape read too, never read as the path it spells.
-#[test]
-fn built_entry_shape_refuses_an_entry_the_build_refuses() {
-    for (tag, entry) in [
-        ("shape_entry_absolute", "/etc/passwd"),
-        ("shape_entry_absolute_module", "/etc/Main.ipe"),
-        ("shape_entry_parent", "../../secret.ipe"),
-        ("shape_entry_parent_module", "../../Secret.ipe"),
-        ("shape_entry_no_extension", "Main"),
-        ("shape_entry_other_extension", "Main.txt"),
-        ("shape_entry_lowercase", "main.ipe"),
-    ] {
-        let dir = declared_entry_project(
-            tag,
-            entry,
-            &[
-                ("Main.txt", "module Main exposing (main)\nmain = 1\n"),
-                ("main.ipe", "module Main exposing (main)\nmain = 1\n"),
-            ],
-        );
-        let shape = built_entry_shape(&dir);
-        let _ = fs::remove_dir_all(&dir);
-        assert!(
-            matches!(shape, Err(CliError::Usage(_))),
-            "entry {entry:?} must be refused like the build: {shape:?}"
-        );
-    }
-}
-
-/// A well-formed entry module whose file links out of `src/` is refused, not read.
-#[cfg(unix)]
-#[test]
-fn built_entry_shape_refuses_an_entry_linked_outside_the_source_root() {
-    let dir = declared_entry_project("shape_entry_link", "Main.ipe", &[]);
-    let outside = dir.join("Outside.ipe");
-    assert!(
-        fs::write(&outside, CLEAN_MAIN).is_ok(),
-        "write outside file"
-    );
-    let link = dir.join("src").join("Main.ipe");
-    assert!(fs::remove_file(&link).is_ok(), "drop src/Main.ipe");
-    assert!(
-        std::os::unix::fs::symlink(&outside, &link).is_ok(),
-        "link entry out of src/"
-    );
-    let shape = built_entry_shape(&dir);
-    let _ = fs::remove_dir_all(&dir);
-    assert!(
-        matches!(shape, Err(CliError::EntryEscapes { .. })),
-        "an entry file linked outside src/ must be refused: {shape:?}"
-    );
-}
-
-/// A Tui entry: `Tui.tea`'s callee is never resolved by the parse-only shape read.
-const TUI_PROGRAM: &str =
-    "module Term exposing (main)\n\nimport Ipe.Tea.Tui\n\nmain = Tui.tea cfg\n";
-
-/// A root's second program alone being a Tui program gets the Tui shape, never the first program's.
-#[test]
-fn classify_entry_shape_reads_each_program_of_a_root() {
-    use crate::delivery;
-    use crate::project_root::{EntrySet, ProjectRoot, RootArg};
-    let dir = session_scratch("shape_each_program");
-    let src = dir.join("src");
-    assert!(fs::create_dir_all(&src).is_ok(), "make src/");
-    let manifest = "module Package exposing (package)\n\n\npackage =\n    { name = \"app\"\n    , programs =\n        [ { name = \"tool\", entry = \"Main.ipe\" }\n        , { name = \"term\", entry = \"Term.ipe\" }\n        ]\n    }\n";
-    assert!(
-        fs::write(dir.join("package.ipe"), manifest).is_ok(),
-        "write package.ipe"
-    );
-    assert!(
-        fs::write(src.join("Main.ipe"), CLEAN_MAIN).is_ok(),
-        "write src/Main.ipe"
-    );
-    assert!(
-        fs::write(src.join("Term.ipe"), TUI_PROGRAM).is_ok(),
-        "write src/Term.ipe"
-    );
-    let root = ProjectRoot::resolve(RootArg::at(&dir));
-    let shapes: Result<Vec<(String, delivery::Shape)>, CliError> = root.and_then(|root| {
-        let EntrySet::Programs(programs) = root.entries() else {
-            return Ok(Vec::new());
-        };
-        programs
-            .iter()
-            .map(|entry| {
-                classify_entry_shape(&root, entry)
-                    .map(|shape| (entry.name().as_str().to_owned(), shape))
-            })
-            .collect()
-    });
-    let _ = fs::remove_dir_all(&dir);
-    assert!(
-        matches!(
-            shapes.as_deref(),
-            Ok([(tool, delivery::Shape::Script), (term, delivery::Shape::Tui)])
-                if tool == "tool" && term == "term"
-        ),
-        "each program is classified on its own entry: {shapes:?}"
-    );
-}
-
-/// An entry read through a resolved root refuses a linked entry file, a linked parent
-/// directory and an absent parent directory, whatever the tree held when it resolved.
-#[cfg(unix)]
-#[test]
-fn classify_entry_shape_refuses_a_tree_changed_after_resolve() {
-    use crate::project_root::{EntrySet, ProjectRoot, RootArg};
-    let dir = session_scratch("shape_changed_tree");
-    let src = dir.join("src");
-    assert!(
-        fs::create_dir_all(src.join("Tools")).is_ok(),
-        "make src/Tools/"
-    );
-    let manifest = "module Package exposing (package)\n\n\npackage =\n    { name = \"app\"\n    , programs =\n        [ { name = \"term\", entry = \"Term.ipe\" }\n        , { name = \"sync\", entry = \"Tools/Sync.ipe\" }\n        ]\n    }\n";
-    assert!(
-        fs::write(dir.join("package.ipe"), manifest).is_ok(),
-        "write package.ipe"
-    );
-    assert!(
-        fs::write(src.join("Term.ipe"), TUI_PROGRAM).is_ok(),
-        "write src/Term.ipe"
-    );
-    assert!(
-        fs::write(
-            src.join("Tools").join("Sync.ipe"),
-            "module Tools.Sync exposing (main)\n\nmain = 1\n"
-        )
-        .is_ok(),
-        "write src/Tools/Sync.ipe"
-    );
-    let outside = dir.join("Outside.ipe");
-    assert!(
-        fs::write(&outside, TUI_PROGRAM).is_ok(),
-        "write the outside file"
-    );
-    let root = ProjectRoot::resolve(RootArg::at(&dir)).expect("resolve the root");
-    let programs: Vec<_> = match root.entries() {
-        EntrySet::Programs(programs) => programs.iter().collect(),
-        EntrySet::Library(_) => Vec::new(),
-    };
-    let entry = |name: &str| {
-        programs
-            .iter()
-            .copied()
-            .find(|entry| entry.name().as_str() == name)
-            .expect("the named program")
-    };
-
-    assert!(
-        fs::remove_file(src.join("Term.ipe")).is_ok(),
-        "drop src/Term.ipe"
-    );
-    assert!(
-        std::os::unix::fs::symlink(&outside, src.join("Term.ipe")).is_ok(),
-        "link src/Term.ipe out of src/"
-    );
-    let linked_file = classify_entry_shape(&root, entry("term"));
-
-    let moved = dir.join("MovedTools");
-    assert!(
-        fs::rename(src.join("Tools"), &moved).is_ok(),
-        "move src/Tools away"
-    );
-    assert!(
-        std::os::unix::fs::symlink(&moved, src.join("Tools")).is_ok(),
-        "link src/Tools to the moved directory"
-    );
-    let linked_parent = classify_entry_shape(&root, entry("sync"));
-
-    assert!(
-        fs::remove_file(src.join("Tools")).is_ok(),
-        "drop the src/Tools link"
-    );
-    let absent_parent = classify_entry_shape(&root, entry("sync"));
-    let _ = fs::remove_dir_all(&dir);
-
-    assert!(
-        matches!(
-            linked_file,
-            Err(CliError::SourceRefused {
-                reason: SourceRefusal::Symlink,
-                ..
-            })
-        ),
-        "a linked entry file is refused as a link: {linked_file:?}"
-    );
-    assert!(
-        matches!(
-            linked_parent,
-            Err(CliError::OutputRefused(OutputRefusal::Symlink(_)))
-        ),
-        "a linked parent directory is refused as a link: {linked_parent:?}"
-    );
-    assert!(
-        matches!(absent_parent, Err(CliError::EntryMissing { .. })),
-        "an absent parent directory is a missing entry: {absent_parent:?}"
-    );
 }
 
 // A `src/` module `ipe fix` is pointed at through a link is refused, never read through it.

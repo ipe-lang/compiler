@@ -149,10 +149,10 @@ fn release_target_twice_is_usage_error() {
     );
 }
 
-/// `ipe release` in an empty directory with no package.ipe or src/Main.ipe
-/// returns a usage error (not a panic or a silent wrong result).
+/// `ipe release build` in a directory with no package.ipe is refused as
+/// `NoManifest` (not a panic or a silent wrong result).
 #[test]
-fn release_no_project_returns_usage_error() {
+fn release_no_project_is_refused_as_no_manifest() {
     let dir = {
         let d =
             std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("ipe_release_test_empty");
@@ -169,11 +169,8 @@ fn release_no_project_returns_usage_error() {
     let _ = std::fs::remove_dir_all(&dir);
 
     assert!(
-        matches!(
-            result,
-            Err(ipe::CliError::CommandUsage { command, .. }) if command == "release build"
-        ),
-        "bare `ipe release build` in an empty dir must yield a release build command-usage error, got: {result:?}"
+        matches!(result, Err(ipe::CliError::NoManifest { .. })),
+        "bare `ipe release build` in an empty dir must yield NoManifest, got: {result:?}"
     );
 }
 
