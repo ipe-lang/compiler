@@ -388,6 +388,7 @@ pub(super) fn expr_type_mentions(expr: &Expr, pred: &impl Fn(&IrType) -> bool) -
         Expr::FuncValue { ty, .. } => pred(ty),
         Expr::TailLoop { params, .. } => params.iter().any(|(_, t)| pred(t)),
         Expr::Record { ty, .. } => matches!(ty, Some(t) if pred(t)),
+        Expr::Call { pin, .. } => pin.pinned_types().any(pred),
         Expr::Int(_)
         | Expr::Bool(_)
         | Expr::Float(_)
@@ -403,7 +404,6 @@ pub(super) fn expr_type_mentions(expr: &Expr, pred: &impl Fn(&IrType) -> bool) -
         | Expr::Destructure { .. }
         | Expr::If { .. }
         | Expr::Match(_)
-        | Expr::Call { .. }
         | Expr::Tuple(_)
         | Expr::Cons { .. }
         | Expr::ListIndexClone { .. }
@@ -599,6 +599,11 @@ pub(super) fn collect_body_record_shapes(
                 consider(t);
             }
         }
+        Expr::Call { pin, .. } => {
+            for ty in pin.pinned_types() {
+                consider(ty);
+            }
+        }
         Expr::Int(_)
         | Expr::Bool(_)
         | Expr::Float(_)
@@ -614,7 +619,6 @@ pub(super) fn collect_body_record_shapes(
         | Expr::Destructure { .. }
         | Expr::If { .. }
         | Expr::Match(_)
-        | Expr::Call { .. }
         | Expr::Tuple(_)
         | Expr::Cons { .. }
         | Expr::ListIndexClone { .. }

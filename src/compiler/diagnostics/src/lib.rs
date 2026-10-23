@@ -30,7 +30,7 @@ pub use diagnostic::{
     MountPrefixFault, NameError, ParseError, RoutePatternDefect, RustNameFoldKind, SandboxError,
     SealRejection, SortedNames, SpanRole, StdlibReach, StoreEqAccessorDefect,
     StoreSelectProjectionDefect, Suggestion, TokenKind, TyDoc, TypeDeclDefect, TypeError,
-    WildcardDependence,
+    TypeSizeOrigin, WildcardDependence,
 };
 pub use render::{DOC_HINT_CMD, plain_message, render, render_json, render_ty};
 pub use span::{Located, Span};

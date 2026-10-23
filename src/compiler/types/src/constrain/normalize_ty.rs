@@ -106,8 +106,8 @@ impl Builder<'_> {
                         // A `Task` applied to any other arity (bare `Task`, or
                         // `Task Error Int Bool`) is ill-formed. It reaches here
                         // from source because canonicalisation validates arity
-                        // only for type *aliases* (`NameError::AliasArity`), never
-                        // for a non-alias type-constructor application like `Task`.
+                        // only for aliases, declared unions and the fixed-arity
+                        // builtins, never for `Task`.
                         // Fail closed with a clean IPE-T0016 diagnostic naming the
                         // found argument count instead of raising a `CompilerBug`.
                         n => Err(Diagnostic::Type {

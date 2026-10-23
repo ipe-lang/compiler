@@ -3,7 +3,10 @@ use super::{
     Generated, InferError, Interner, RefCell, RowTail, STAGE, SchemeKey, Span, StdlibKernel,
     Symbol, Ty, TypeError, UnionFind, VarId, ZONK_NODE_LIMIT, tag_solver_var, unify_at,
 };
-use ipe_diagnostics::nesting::{TYPE_DEPTH_LIMIT, TYPE_SIZE_LIMIT};
+use ipe_diagnostics::TypeSizeOrigin;
+use ipe_diagnostics::nesting::{TYPE_DEPTH_LIMIT, TYPE_LEVELS_PER_ARROW, TYPE_SIZE_LIMIT};
+
+use crate::expansive::NominalLevels;
 use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet};
 
@@ -807,6 +810,7 @@ const fn type_too_large(span: Span) -> Diagnostic {
         span,
         msg: TypeError::TypeTooLarge {
             limit: TYPE_SIZE_LIMIT,
+            origin: TypeSizeOrigin::Value,
         },
     }
 }
@@ -1073,9 +1077,11 @@ pub fn zonk_underflow() -> Diagnostic {
 
 /// Depth and unfolded size of one type, as [`measure_type_depth`] counts them.
 ///
-/// A function arrow, a type application with arguments, a tuple and a record
-/// (its whole row chain) are one level each; a variable, `()` and a nullary
-/// type are leaves of depth 0. The size counts every node of the unfolded
+/// A type application with arguments, a tuple and a record (its whole row
+/// chain) are one level each, and a function arrow is
+/// [`TYPE_LEVELS_PER_ARROW`]. A custom type costs at least its declared level
+/// ([`NominalLevels`]), so a nullary one is that many levels deep; a variable,
+/// `()` and a builtin nullary type are leaves of depth 0. The size counts every node of the unfolded
 /// tree, each occurrence of a shared subtree included, so it is the node count
 /// [`zonk`] reads back.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -1114,9 +1120,10 @@ enum MeasureTask {
     /// Measure one variable's representative.
     Visit(VarId),
     /// Combine the measured `children` (and the row chain's next record, if
-    /// any) into the measure of `root`.
+    /// any) into the measure of `root`, `own` levels above its deepest child.
     Finish {
         root: VarId,
+        own: u16,
         children: Vec<VarId>,
         row: Option<VarId>,
     },
@@ -1125,14 +1132,35 @@ enum MeasureTask {
 /// The memoized type measures of one module's solved union-find graph.
 ///
 /// One memo keyed by representative is shared by every measured variable, so
-/// measuring every region costs one walk over the solved graph.
-#[derive(Default)]
-pub struct TypeMeasures {
+/// measuring every region costs one walk over the solved graph. A custom type
+/// is charged its level in `levels`.
+pub struct TypeMeasures<'l> {
+    levels: &'l NominalLevels,
     memo: HashMap<VarId, TypeMeasure>,
     in_progress: HashSet<VarId>,
 }
 
-impl TypeMeasures {
+/// The table [`TypeMeasures::default`] measures with: no custom type levels,
+/// so every type is measured by its structure alone.
+static STRUCTURAL: NominalLevels = NominalLevels::EMPTY;
+
+impl Default for TypeMeasures<'_> {
+    fn default() -> Self {
+        Self::new(&STRUCTURAL)
+    }
+}
+
+impl<'l> TypeMeasures<'l> {
+    /// An empty memo charging each custom type its level in `levels`.
+    #[must_use]
+    pub fn new(levels: &'l NominalLevels) -> Self {
+        Self {
+            levels,
+            memo: HashMap::new(),
+            in_progress: HashSet::new(),
+        }
+    }
+
     /// The measure of `var`'s solved type.
     ///
     /// Iterative (an explicit work stack), memoized by representative, and
@@ -1157,9 +1185,10 @@ impl TypeMeasures {
                 }
                 MeasureTask::Finish {
                     root,
+                    own,
                     children,
                     row,
-                } => self.finish(root, &children, row)?,
+                } => self.finish(root, own, &children, row)?,
             }
         }
         let root = uf.find(var)?;
@@ -1185,22 +1214,34 @@ impl TypeMeasures {
                     .to_owned(),
             });
         }
-        let (children, ext) = match uf.root_content(root)? {
+        let (own, children, ext) = match uf.root_content(root)? {
             Content::Flex
             | Content::Rigid
             | Content::Super { .. }
-            | Content::Structure(FlatType::Unit | FlatType::EmptyRecord) => (Vec::new(), None),
-            Content::Structure(FlatType::Fun(a, b)) => (vec![*a, *b], None),
-            Content::Structure(FlatType::Con { args, .. }) => (args.clone(), None),
-            Content::Structure(FlatType::Tuple(elems)) => (elems.clone(), None),
+            | Content::Structure(FlatType::Unit | FlatType::EmptyRecord) => (0, Vec::new(), None),
+            Content::Structure(FlatType::Fun(a, b)) => (TYPE_LEVELS_PER_ARROW, vec![*a, *b], None),
+            Content::Structure(FlatType::Con { module, name, args }) => (
+                self.levels
+                    .level(module, *name)
+                    .max(u16::from(!args.is_empty())),
+                args.clone(),
+                None,
+            ),
+            Content::Structure(FlatType::Tuple(elems)) => (1, elems.clone(), None),
             Content::Structure(FlatType::Record(fields, ext)) => {
-                (fields.values().copied().collect(), Some(*ext))
+                (1, fields.values().copied().collect(), Some(*ext))
             }
         };
         let is_leaf = children.is_empty() && ext.is_none();
         if is_leaf {
             self.in_progress.remove(&root);
-            self.memo.insert(root, TypeMeasure::LEAF);
+            self.memo.insert(
+                root,
+                TypeMeasure {
+                    depth: own,
+                    ..TypeMeasure::LEAF
+                },
+            );
             return Ok(());
         }
         // A record whose extension is itself a record continues one row:
@@ -1223,6 +1264,7 @@ impl TypeMeasures {
         // The finish runs beneath every child visit, so after all of them.
         work.push(MeasureTask::Finish {
             root,
+            own,
             children: roots.clone(),
             row,
         });
@@ -1236,7 +1278,13 @@ impl TypeMeasures {
     }
 
     /// Combine the measured children of `root` into its measure.
-    fn finish(&mut self, root: VarId, children: &[VarId], row: Option<VarId>) -> DResult<()> {
+    fn finish(
+        &mut self,
+        root: VarId,
+        own: u16,
+        children: &[VarId],
+        row: Option<VarId>,
+    ) -> DResult<()> {
         let mut depth: u16 = 0;
         let mut size: u64 = 1;
         for child in children {
@@ -1244,7 +1292,7 @@ impl TypeMeasures {
             depth = depth.max(m.depth);
             size = size.saturating_add(m.size);
         }
-        depth = depth.saturating_add(1);
+        depth = depth.saturating_add(own);
         if let Some(row) = row {
             // The next record of the row chain shares this level: its depth
             // and size each carry one record node this level already counts.
@@ -1268,7 +1316,7 @@ fn measure_bug() -> Diagnostic {
 
 /// Refuse a module whose solved types pass [`TYPE_DEPTH_LIMIT`] or [`TYPE_SIZE_LIMIT`].
 ///
-/// Every region's, every expected type's and every untyped top-level binding's
+/// Each custom type is charged its level in `levels`. Every region's, every expected type's and every untyped top-level binding's
 /// solved type is measured over one shared memo. A deep type is reported where
 /// it is first built: among the spans whose type passes a ceiling, the one
 /// that ends first (the innermost, for nested spans), so a `let` chain is
@@ -1284,9 +1332,10 @@ fn measure_bug() -> Diagnostic {
 pub fn measure_type_depth(
     uf: &mut UnionFind<Content>,
     budget: &mut Budget,
+    levels: &NominalLevels,
     generated: &Generated,
 ) -> Result<(), InferError> {
-    let mut measures = TypeMeasures::default();
+    let mut measures = TypeMeasures::new(levels);
     let mut refused: Option<(RefusalRank<'_>, Diagnostic)> = None;
     for ((home, span), var) in generated.regions.iter().chain(&generated.expected) {
         let measure = measures

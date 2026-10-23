@@ -2754,6 +2754,7 @@ mod type_measure_tests {
             span: Span::DUMMY,
             msg: TypeError::TypeTooLarge {
                 limit: TYPE_SIZE_LIMIT,
+                origin: ipe_diagnostics::TypeSizeOrigin::Value,
             },
         };
         let mut uf = UnionFind::<Content>::new();

@@ -5,7 +5,7 @@
 //! (`unionToRustTypeDef`) and `Emitter.hs` (`typeDefToString` / the enum
 //! `ipeStringifyEnumImpl`). The byte target is golden `main.rs` lines 31–43.
 
-use ipe_diagnostics::nesting::{IR_EXPANSION_SLACK, TYPE_DEPTH_LIMIT};
+use ipe_diagnostics::nesting::{IR_EXPANSION_SLACK, TYPE_DEPTH_LIMIT, TYPE_LEVELS_PER_ARROW};
 use ipe_diagnostics::{DResult, Diagnostic, LowerError, Span};
 use ipe_intern::{Symbol, rust_fmt_str_lit, rust_str_lit};
 use ipe_ir::{
@@ -282,8 +282,10 @@ impl<'a> GenericScope<'a> {
 /// The nesting depth of the Rust type [`render_type_at`] is rendering.
 ///
 /// A second, independent bound behind the type checker's
-/// [`TYPE_DEPTH_LIMIT`]: every nested render descends one level, and a render
-/// past [`TypeDepth::LIMIT`] is refused at ipe time instead of reaching
+/// [`TYPE_DEPTH_LIMIT`], counted in the checker's unit: a leaf adds no level,
+/// every type former renders its children one level below itself, and a
+/// curried `FnOnce` chain charges [`TYPE_LEVELS_PER_ARROW`] per parameter. A
+/// render past [`TypeDepth::LIMIT`] is refused at ipe time instead of reaching
 /// rustc's recursion limit (and instead of growing the emitter's stack).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TypeDepth(u16);
@@ -349,7 +351,6 @@ pub fn render_type_at(
     generics: GenericScope,
     depth: TypeDepth,
 ) -> DResult<String> {
-    let depth = depth.descend()?;
     Ok(match ty {
         IrType::BackoffStrategy => "ipe_runtime::task::BackoffStrategy".to_owned(),
         IrType::Order => "ipe_runtime::basics::IpeOrder".to_owned(),
@@ -382,7 +383,10 @@ pub fn render_type_at(
         IrType::Str => "String".to_owned(),
         IrType::Char => "char".to_owned(),
         IrType::Unit => "()".to_owned(),
-        IrType::Task(inner) => format!("IpeTask<{}>", render_type_at(ctx, inner, generics, depth)?),
+        IrType::Task(inner) => format!(
+            "IpeTask<{}>",
+            render_type_at(ctx, inner, generics, depth.descend()?)?
+        ),
         IrType::Enum { home, name, args } => {
             // A foreign OPAQUE FFI type renders as its REAL Rust path — its
             // placeholder union is never emitted as an enum ([`ipe_lower`]
@@ -432,7 +436,7 @@ pub fn render_type_at(
             } else {
                 let mut parts = Vec::with_capacity(args.len());
                 for arg in args {
-                    parts.push(render_type_at(ctx, arg, generics, depth)?);
+                    parts.push(render_type_at(ctx, arg, generics, depth.descend()?)?);
                 }
                 format!("{base}<{}>", parts.join(", "))
             }
@@ -440,22 +444,31 @@ pub fn render_type_at(
         // The built-in `Maybe a` / `Result e a` render to the runtime's shared
         // representations, brought into scope by the emitted crate's
         // `pub use ipe_runtime::*`.
-        IrType::Maybe(elem) => format!("IpeMaybe<{}>", render_type_at(ctx, elem, generics, depth)?),
+        IrType::Maybe(elem) => format!(
+            "IpeMaybe<{}>",
+            render_type_at(ctx, elem, generics, depth.descend()?)?
+        ),
         IrType::Result(err, ok) => format!(
             "IpeResult<{}, {}>",
-            render_type_at(ctx, err, generics, depth)?,
-            render_type_at(ctx, ok, generics, depth)?
+            render_type_at(ctx, err, generics, depth.descend()?)?,
+            render_type_at(ctx, ok, generics, depth.descend()?)?
         ),
         // The built-in `List a` is the runtime's `Vec<T>`.
-        IrType::List(elem) => format!("Vec<{}>", render_type_at(ctx, elem, generics, depth)?),
+        IrType::List(elem) => format!(
+            "Vec<{}>",
+            render_type_at(ctx, elem, generics, depth.descend()?)?
+        ),
         // `Dict k v` is the runtime's `HashMap<K, V>`.
         IrType::Dict(k, v) => format!(
             "HashMap<{}, {}>",
-            render_type_at(ctx, k, generics, depth)?,
-            render_type_at(ctx, v, generics, depth)?
+            render_type_at(ctx, k, generics, depth.descend()?)?,
+            render_type_at(ctx, v, generics, depth.descend()?)?
         ),
         // `Set a` is the runtime's `BTreeSet<A>`.
-        IrType::Set(a) => format!("BTreeSet<{}>", render_type_at(ctx, a, generics, depth)?),
+        IrType::Set(a) => format!(
+            "BTreeSet<{}>",
+            render_type_at(ctx, a, generics, depth.descend()?)?
+        ),
         // `Bytes` is an arbitrary byte buffer — `Vec<u8>`. Divergence from
         // Ipê: Ipê aliases Bytes = String; Rust's String is UTF-8 constrained,
         // so Bytes maps to Vec<u8> for lossless arbitrary binary.
@@ -481,9 +494,9 @@ pub fn render_type_at(
         IrType::Decoder(inner) => {
             let inner_s = match inner.as_ref() {
                 IrType::Fun(params, ret) => {
-                    render_fn_once_chain(ctx, params, ret, generics, depth)?
+                    render_fn_once_chain(ctx, params, ret, generics, depth.descend()?)?
                 }
-                other => render_type_at(ctx, other, generics, depth)?,
+                other => render_type_at(ctx, other, generics, depth.descend()?)?,
             };
             format!("Decoder<{inner_s}>")
         }
@@ -494,8 +507,14 @@ pub fn render_type_at(
         // types, aliased in the emitted project's preamble as
         // `pub type IpeCmd<M> = ipe_runtime::tea::IpeCmd<M>` and
         // `pub type IpeSub<M> = ipe_runtime::tea::IpeSub<M>`.
-        IrType::Cmd(inner) => format!("IpeCmd<{}>", render_type_at(ctx, inner, generics, depth)?),
-        IrType::Sub(inner) => format!("IpeSub<{}>", render_type_at(ctx, inner, generics, depth)?),
+        IrType::Cmd(inner) => format!(
+            "IpeCmd<{}>",
+            render_type_at(ctx, inner, generics, depth.descend()?)?
+        ),
+        IrType::Sub(inner) => format!(
+            "IpeSub<{}>",
+            render_type_at(ctx, inner, generics, depth.descend()?)?
+        ),
         // Opaque server types — render to their ipe_runtime names directly.
         IrType::ServerRequest => "ServerRequest".to_owned(),
         IrType::ServerResponse => "ServerResponse".to_owned(),
@@ -572,7 +591,7 @@ pub fn render_type_at(
         // (T2 soundness: `Attribute` exists in BOTH Ipe.Ui and Ipe.Html namespaces;
         // qualified paths keep them unambiguous and prevent glob-import shadowing).
         IrType::Ui { ctor, msg } => {
-            let m = render_type_at(ctx, msg, generics, depth)?;
+            let m = render_type_at(ctx, msg, generics, depth.descend()?)?;
             match ctor {
                 UiCtor::Html => format!("ipe_runtime::html::Html<{m}>"),
                 UiCtor::Element => format!("ipe_runtime::ui::element::Element<{m}>"),
@@ -639,7 +658,7 @@ pub fn render_type_at(
         // let-bound route table's fn signature.
         IrType::WebRoute(page) => format!(
             "ipe_runtime::web::route::Route<{}>",
-            render_type_at(ctx, page, generics, depth)?
+            render_type_at(ctx, page, generics, depth.descend()?)?
         ),
         // The widget handle carries only its generated tag string; the seal
         // types are phantom (they drive the down-encode / up-decode codegen at
@@ -649,11 +668,11 @@ pub fn render_type_at(
         IrType::Tuple(elems) => {
             let mut parts = Vec::with_capacity(elems.len());
             for elem in elems {
-                parts.push(render_type_at(ctx, elem, generics, depth)?);
+                parts.push(render_type_at(ctx, elem, generics, depth.descend()?)?);
             }
             format!("({})", parts.join(", "))
         }
-        IrType::Record(fields) => ctx.render_record_use(fields, generics, depth)?,
+        IrType::Record(fields) => ctx.render_record_use(fields, generics, depth.descend()?)?,
         // Handler-arrow special case: `Request -> Task Error Response` must
         // render as `ServerHandler<IpeError>` (an Arc<dyn Fn> alias defined in
         // the runtime), not as a generic `Box<dyn Fn + Send + 'static>`.  This
@@ -685,9 +704,9 @@ pub fn render_type_at(
         {
             let mut parts = Vec::with_capacity(params.len());
             for param in params {
-                parts.push(render_type_at(ctx, param, generics, depth)?);
+                parts.push(render_type_at(ctx, param, generics, depth.descend()?)?);
             }
-            let ret_ty = render_type_at(ctx, ret, generics, depth)?;
+            let ret_ty = render_type_at(ctx, ret, generics, depth.descend()?)?;
             format!(
                 "Arc<dyn Fn({}) -> {ret_ty} + Send + Sync + 'static>",
                 parts.join(", ")
@@ -702,9 +721,9 @@ pub fn render_type_at(
         IrType::SharedFun(params, ret) => {
             let mut parts = Vec::with_capacity(params.len());
             for param in params {
-                parts.push(render_type_at(ctx, param, generics, depth)?);
+                parts.push(render_type_at(ctx, param, generics, depth.descend()?)?);
             }
-            let ret = render_type_at(ctx, ret, generics, depth)?;
+            let ret = render_type_at(ctx, ret, generics, depth.descend()?)?;
             format!(
                 "::std::sync::Arc<dyn Fn({}) -> {ret} + Send + Sync + 'static>",
                 parts.join(", ")
@@ -734,9 +753,9 @@ pub fn render_type_at(
             // optimisation (a concrete, non-boxed generic closure type) is deferred.
             let mut parts = Vec::with_capacity(params.len());
             for param in params {
-                parts.push(render_type_at(ctx, param, generics, depth)?);
+                parts.push(render_type_at(ctx, param, generics, depth.descend()?)?);
             }
-            let ret = render_type_at(ctx, ret, generics, depth)?;
+            let ret = render_type_at(ctx, ret, generics, depth.descend()?)?;
             format!(
                 "Box<dyn Fn({}) -> {ret} + Send + Sync + 'static>",
                 parts.join(", ")
@@ -797,12 +816,12 @@ fn render_fn_once_chain(
             detail: "function-value curry chain with an empty parameter list".to_owned(),
         });
     };
-    // Each parameter is one `Box<dyn FnOnce(..) -> _>` level: two levels of
-    // nesting (the box and the trait object). Every part is charged at the
-    // innermost level, the depth the return type sits at.
+    // Each parameter is one `Box<dyn FnOnce(..) -> _>` level, charged as the
+    // checker charges one arrow. Every part is charged at the innermost level,
+    // the depth the return type sits at.
     let levels = u16::try_from(params.len())
         .unwrap_or(u16::MAX)
-        .saturating_mul(2);
+        .saturating_mul(TYPE_LEVELS_PER_ARROW);
     let inner = depth.descend_by(levels)?;
     let mut acc = render_type_at(ctx, ret, generics, inner)?;
     acc = format!(

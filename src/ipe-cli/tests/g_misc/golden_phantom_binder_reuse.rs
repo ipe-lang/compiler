@@ -60,3 +60,28 @@ fn map_error_binder_emits_byte_identical_main_rs() {
 fn map_error_binder_end_to_end_prints_err_twice() {
     assert_runs_golden(MAP_ERROR_GOLDEN);
 }
+
+/// The phantom `Ok` payload reads as `JsonVal` in `Result.mapError`'s pin, but
+/// an argument names that parameter, so the pin never renders: the emitted
+/// project must not pull the JSON aliases or the `json` runtime feature in.
+#[test]
+fn map_error_binder_unrendered_pin_pulls_in_no_json() {
+    let root = repo_root();
+    let dir = golden_dir(&root, MAP_ERROR_GOLDEN);
+    let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("phantom_map_error_no_json_emit");
+    let _ = std::fs::remove_dir_all(&out);
+    let runtime = e2e_support::require_runtime().into_path_buf();
+    let built = crate::support::build_golden(&dir, &out, &runtime);
+    assert!(built.is_ok(), "build failed: {:?}", built.err());
+    let main_rs = std::fs::read_to_string(out.join("src").join("main.rs")).unwrap_or_default();
+    assert!(!main_rs.is_empty(), "main.rs was not emitted");
+    for json in ["JsonVal", "Decoder<", "ipe_runtime::json"] {
+        assert!(!main_rs.contains(json), "main.rs names `{json}`");
+    }
+    let manifest = std::fs::read_to_string(out.join("Cargo.toml")).unwrap_or_default();
+    assert!(!manifest.is_empty(), "Cargo.toml was not emitted");
+    assert!(
+        !manifest.contains("\"json\""),
+        "Cargo.toml selects the `json` feature"
+    );
+}

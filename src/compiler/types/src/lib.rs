@@ -28,6 +28,7 @@
 mod constrain;
 mod doc;
 mod exhaust;
+mod expansive;
 mod homed;
 mod pairing;
 mod solve;
@@ -736,6 +737,11 @@ fn infer_core(
     // closed (the payload is invisible in a `Ty::Con's applied type
     // arguments; see [`EnumEmbeds`]).
     let enum_embeds = EnumEmbeds::of(interner, &m.unions, &dep_unions);
+    // Every declaration and top-level annotation is measured before inference:
+    // a custom type on an expanding cycle, or one past the depth ceiling, is
+    // refused where it is declared, used or not, and the level each declared
+    // type renders to is what the solved types are measured with below.
+    let nominal_levels = expansive::check_declarations(interner, budget, m, &dep_unions)?;
     let generated = match scoped {
         None => Builder::run(&mut uf, interner, m)?,
         Some(ctx) => {
@@ -842,7 +848,7 @@ fn infer_core(
     // Every solved type is measured first: a type past the depth or size
     // ceiling is refused at the span that built it, so no read-back below, no
     // downstream walker and no rustc build meets it.
-    measure_type_depth(&mut uf, budget, &generated)?;
+    measure_type_depth(&mut uf, budget, &nominal_levels, &generated)?;
     let mut regions_for_exhaust: BTreeMap<(Vec<Symbol>, Span), Ty> = BTreeMap::new();
     for ((home, span), var) in &generated.regions {
         regions_for_exhaust.insert((home.clone(), *span), lift!(zonk(&mut uf, budget, *var)));

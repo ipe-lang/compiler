@@ -828,6 +828,28 @@ pub struct CtorIdentity {
     pub type_name: Symbol,
 }
 
+/// The declared type-parameter count of each union, by name then home.
+#[derive(Clone, Debug, Default)]
+pub struct UnionParams(BTreeMap<Symbol, BTreeMap<Vec<Symbol>, usize>>);
+
+impl UnionParams {
+    /// Record that the union `name` declared at `home` takes `params` type
+    /// parameters.
+    pub fn declare(&mut self, home: &[Symbol], name: Symbol, params: usize) {
+        self.0
+            .entry(name)
+            .or_default()
+            .insert(home.to_vec(), params);
+    }
+
+    /// The declared type-parameter count of the union `name` at `home`, or
+    /// `None` for a type no union declaration names.
+    #[must_use]
+    pub fn of(&self, home: &[Symbol], name: Symbol) -> Option<usize> {
+        self.0.get(&name)?.get(home).copied()
+    }
+}
+
 /// Dotted module path to the `as` aliases it is imported under.
 pub type ImportAliases = Rc<BTreeMap<Box<str>, BTreeSet<Box<str>>>>;
 
@@ -849,6 +871,11 @@ pub struct Env {
     ///
     /// Written only during module setup, through `Rc::make_mut`.
     pub module_scope: Rc<ModuleScope>,
+    /// The declared type-parameter count of every union this module can name:
+    /// its own and each imported module's.
+    ///
+    /// Written only during module setup, through `Rc::make_mut`.
+    pub union_params: Rc<UnionParams>,
     /// Qualified variable bindings: qualifier spelling → (name → home).
     ///
     /// Empty in a fresh environment; written only by [`Self::install_import`],

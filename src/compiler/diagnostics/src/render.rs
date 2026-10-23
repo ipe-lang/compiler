@@ -36,7 +36,7 @@ use crate::diagnostic::{
     Hint, IfDefect, ImportedAs, LetDefect, LowerError, MountPrefixFault, NameError, ParseError,
     RoutePatternDefect, SandboxError, SealRejection, SpanRole, StoreEqAccessorDefect,
     StoreSelectProjectionDefect, Suggestion, TokenKind, TyDoc, TypeDeclDefect, TypeError,
-    WildcardDependence, intercept_context_phrase,
+    TypeSizeOrigin, WildcardDependence, intercept_context_phrase,
 };
 use crate::span::Span;
 
@@ -483,7 +483,7 @@ fn name_prose(msg: &NameError) -> String {
         | NameError::DuplicateType { name, .. } => {
             format!("`{name}` is already defined, so I found two definitions with the same name.")
         }
-        NameError::AliasArity { name, .. } | NameError::BuiltinTypeArity { name, .. } => {
+        NameError::AliasArity { name, .. } | NameError::TypeArity { name, .. } => {
             format!("`{name}` is applied to the wrong number of type arguments.")
         }
         NameError::ModuleNotFound { name, .. } => {
@@ -728,9 +728,21 @@ fn type_prose(msg: &TypeError) -> String {
         TypeError::TypeTooDeep { depth, limit } => {
             format!("The type of this value nests {depth} levels deep, past the limit of {limit}.")
         }
-        TypeError::TypeTooLarge { limit } => {
-            format!("The type of this value is built from more than {limit} parts.")
-        }
+        TypeError::TypeTooLarge {
+            limit,
+            origin: TypeSizeOrigin::Value,
+        } => format!("The type of this value is built from more than {limit} parts."),
+        TypeError::TypeTooLarge {
+            limit,
+            origin: TypeSizeOrigin::Declaration,
+        } => format!(
+            "The type this constructor holds is built from more than {limit} parts, \
+             because its type refers to itself with larger arguments."
+        ),
+        TypeError::ExpansiveRecursion { union, param } => format!(
+            "The type `{union}` refers to itself with its parameter `{param}` wrapped in a \
+             larger type, so every level of it is a bigger type than the last."
+        ),
     }
 }
 
@@ -1546,7 +1558,7 @@ fn name_label(msg: &NameError) -> Option<String> {
         } => Some(format!(
             "`{name}` takes {expected} type argument(s), but {found} were given"
         )),
-        NameError::BuiltinTypeArity {
+        NameError::TypeArity {
             name,
             expected,
             found,
@@ -1965,8 +1977,21 @@ fn type_label(msg: &TypeError) -> Option<String> {
             "this value's type nests more than {limit} levels deep, which the generated \
              Rust cannot build"
         )),
-        TypeError::TypeTooLarge { limit } => Some(format!(
+        TypeError::TypeTooLarge {
+            limit,
+            origin: TypeSizeOrigin::Value,
+        } => Some(format!(
             "this value's type unfolds to more than {limit} parts"
+        )),
+        TypeError::TypeTooLarge {
+            limit,
+            origin: TypeSizeOrigin::Declaration,
+        } => Some(format!(
+            "this constructor's type unfolds to more than {limit} parts"
+        )),
+        TypeError::ExpansiveRecursion { param, .. } => Some(format!(
+            "`{param}` grows each time this type refers to itself, which the generated \
+             Rust cannot build"
         )),
         TypeError::Mismatch | TypeError::BudgetExceeded | TypeError::StepBudgetExceeded { .. } => {
             None
