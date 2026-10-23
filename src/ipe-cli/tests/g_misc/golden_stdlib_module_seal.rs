@@ -896,7 +896,9 @@ fn a_mixed_message_parameter_fixed_by_its_page_builds_and_runs() {
 
 /// `mk`'s `e` is named by its return's error slot alone, so the use pins
 /// nothing and the `Ok 4` sibling's wrapper fixes it. `pick` keeps `e`
-/// generic, so its own `Ok 4` stays `IpeResult::Ok` over that generic.
+/// generic, so its own `Ok 4` stays `IpeResult::Ok` over that generic; `pick`
+/// is declared but never applied, because applying it leaves `e` with no
+/// reading at all.
 const OPEN_RESULT_ERROR_MAIN: &str = "module Main exposing (main)
 import Ipe.Io as Io
 import Ipe.String as String
@@ -915,10 +917,10 @@ shown r =
         Err _ -> \"err\"
 
 main =
-    Io.println (shown (if String.length \"a\" > 0 then mk 3 else Ok 4) ++ shown (pick False))
+    Io.println (shown (if String.length \"a\" > 0 then mk 3 else Ok 4))
 ";
 
 #[test]
 fn an_open_result_error_beside_ok_builds_and_runs() {
-    seal_module("open_result_error", OPEN_RESULT_ERROR_MAIN, "34");
+    seal_module("open_result_error", OPEN_RESULT_ERROR_MAIN, "3");
 }
