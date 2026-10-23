@@ -131,8 +131,8 @@ refused before anything is saved. A stored refusal whose reason breaks that
 bound (saved before it, or edited in the database) still loads, shown by its
 length, never its text.
 
-History shows 100 reviews per page, newest first; each page reads only its own
-rows, through an index in that order.
+History shows 100 reviews per page (`PageSize.history` in `src/Lib/PageSize.ipe`),
+newest first; each page reads only its own rows, through an index in that order.
 
 Each History entry names its unit by kind, qualified name, path and line, or
 an unreviewable file by its path. A decision records that name in its signed
@@ -278,8 +278,9 @@ open again after the next `ipe-index` run. Before the decision is recorded the
 index row is read again and a content reason is re-probed: a file that now
 reads as text is refused, with "re-run the index". The other reasons say
 "Cannot be acknowledged: fix it in the tree." and offer no decision. The list
-shows up to 200 open files, every acknowledgeable one before any that cannot
-be acknowledged; the header counts them all.
+shows up to 32 open files (`PageSize.queue` in `src/Lib/PageSize.ipe`), every
+acknowledgeable one before any that cannot be acknowledged; the header counts
+them all.
 
 ## Checks
 
@@ -336,7 +337,7 @@ the app cannot verify, so every unit reads as unverifiable until the index is
 rebuilt: `tools/scripts/ipe-index update` rebuilds an index of an older schema
 in full, as `tools/scripts/ipe-index index` does.
 
-The queue view loads one page of at most 200 open units (`pageSize` in `src/Lib/Index.ipe`).
+The queue view loads one page of at most 32 open units (`PageSize.queue` in `src/Lib/PageSize.ipe`).
 
 If you run from inside a compiler checkout, `ipe` may auto-discover the
 checkout's vendored runtime snapshot instead of its own version-matched one,

@@ -1,4 +1,4 @@
-module Lib.Db exposing (BreakAt(..), CellCeiling, Decision(..), HistoryCursor(..), HistoryRows, LogRow, LogShown(..), LogState, LogVerdict(..), ProvenHead, Reason, ReviewEntry(..), RowName(..), StoredDecision(..), StoredReason, Unverified(..), UnverifiedRow, VerifiedRow, Verifier, advanceHead, cellHeld, copyCurrent, copyHolds, copyStamp, countedRows, currentHead, findDecision, findLatestForUid, headMoved, headCellCeilings, historyPage, historyPlan, insertDecision, lastSeq, keyMismatchRefusal, logCellCeilings, logPageCeiling, logRowsAfter, logShown, logVerdict, logVerdictWithin, macInput, openAt, parseReason, probe, reasonMaxChars, reasonText, rowNameOf, stateHead, stateVerdict, storedReasonMaxBytes, storedReasonText, storedUid, verifiedAt, verifiedDecision, verifiedHash, verifiedName, verifiedPair, verifiedUid, verifier, writeTransaction)
+module Lib.Db exposing (BreakAt(..), CellCeiling, Decision(..), HistoryCursor(..), HistoryRows, LogRow, LogShown(..), LogState, LogVerdict(..), ProvenHead, Reason, ReviewEntry(..), RowName(..), StoredDecision(..), StoredReason, Unverified(..), UnverifiedRow, VerifiedRow, Verifier, advanceHead, cellHeld, copyCurrent, copyHolds, copyStamp, countedRows, currentHead, findDecision, findLatestForUid, headMoved, headCellCeilings, historyPage, historyPlan, insertDecision, lastSeq, keyMismatchRefusal, logCellCeilings, logPageCeiling, logRowsAfter, logShown, logVerdict, logVerdictWithin, macInput, openAt, parseReason, probe, reasonMaxChars, reasonText, rowNameOf, stateHead, stateVerdict, storedReasonMaxBytes, storedReasonText, verifiedAt, verifiedDecision, verifiedHash, verifiedName, verifiedPair, verifiedUid, verifier, writeTransaction)
 
 import Ipe.Crypto as Crypto
 import Ipe.Db as Db
@@ -6,18 +6,20 @@ import Ipe.Db.Decode
 import Ipe.Error as Error
 import Ipe.List as List
 import Ipe.Maybe as Maybe
+import Ipe.Path exposing (Path)
 import Ipe.Result as Result exposing (Result(..))
 import Ipe.String as String
 import Ipe.Task as Task
 import Ipe.Time as Time
 import Ipe.Time.Timestamp as Timestamp exposing (Timestamp)
+import Lib.EnvLookup as EnvLookup exposing (StartupVar(..))
 import Lib.Failure exposing (DecideRefusal(..), ReasonRefusal(..))
 import Lib.Index as Index exposing (Attested, ChainVerdict(..), DecidedPair, LogStatus(..))
 import Lib.PageSize as PageSize exposing (PageSize)
 import Lib.ReviewKey as ReviewKey exposing (MacKey, ReviewKey(..))
 import Lib.SafeText as SafeText exposing (SafeText)
 import Lib.SetDigest as SetDigest exposing (SetDigest)
-import Lib.Settings as Settings exposing (DbRole(..), ReviewFile)
+import Lib.Settings as Settings exposing (DbRole(..), LogBreak(..), ReviewFile)
 import Lib.Uid as Uid exposing (Uid)
 import Lib.UnitName as UnitName exposing (RecordedName)
 import Migrations exposing (all)
@@ -495,11 +497,10 @@ makeRecord uid bodyHash decision reason reviewedAt held =
 
 
 -- The one parser of a stored row. Every cell must be held, the uid a unit
--- id and the decision `approve` or `refuse`; any other row fails, naming the
--- row by its uid only once it is a unit id and never echoing the column
--- text. A refusal's reason is classified by `storedReason`, a NULL one as
--- blank, so a row breaking the reason bound still reads; an approval's
--- reason column is never read.
+-- id and the decision `approve` or `refuse`; any other row fails without
+-- echoing any cell, its uid included. A refusal's reason is classified by
+-- `storedReason`, a NULL one as blank, so a row breaking the reason bound
+-- still reads; an approval's reason column is never read.
 fromRecord : ReviewRecord -> Result Error LegacyRow
 fromRecord record =
     if not record.held then
@@ -513,11 +514,11 @@ fromRecord record =
             Ok uid ->
                 Result.map
                     (\decision -> { uid = uid, bodyHash = record.bodyHash, decision = decision, reviewedAt = record.reviewedAt })
-                    (storedDecision uid record)
+                    (storedDecision record)
 
 
-storedDecision : Uid -> ReviewRecord -> Result Error StoredDecision
-storedDecision uid record =
+storedDecision : ReviewRecord -> Result Error StoredDecision
+storedDecision record =
     if record.decision == "approve" then
         Ok StoredApproved
 
@@ -525,7 +526,7 @@ storedDecision uid record =
         Ok (StoredRefused (storedReason (Maybe.withDefault "" record.reason)))
 
     else
-        Err (Error.unexpected ("review row " ++ Uid.toString uid ++ " holds a decision this reviewer does not know"))
+        Err (Error.unexpected "a review row holds a decision this reviewer does not know")
 
 
 -- A one-row read's row, parsed.
@@ -569,15 +570,15 @@ probe key loc =
                 Task.succeed ()
 
             Signing macKey ->
-                writeTransaction db (requireKeyCheck macKey)
+                writeTransaction db (requireKeyCheck loc.path macKey)
 
 
 -- The head bound to `key`: its key check verifies, or, absent, is written
 -- once the walk proves the log under `key`. A log the walk does not prove
 -- is refused and keeps no key check, since a different key and an edited
 -- log read alike.
-requireKeyCheck : MacKey -> Db -> Task.Task Error ()
-requireKeyCheck key tx =
+requireKeyCheck : Path -> MacKey -> Db -> Task.Task Error ()
+requireKeyCheck file key tx =
     do
         head <- currentHead tx
         case Index.chainKeyCheck head of
@@ -586,7 +587,7 @@ requireKeyCheck key tx =
                     Task.succeed ()
 
                 else
-                    Task.fail keyMismatchRefusal
+                    Task.fail (keyMismatchRefusal file)
 
             Nothing ->
                 do
@@ -596,13 +597,13 @@ requireKeyCheck key tx =
                             adoptLog key tx head
 
                         Broken _ ->
-                            Task.fail keyMismatchRefusal
+                            Task.fail (keyMismatchRefusal file)
 
                         KeyMismatch ->
-                            Task.fail keyMismatchRefusal
+                            Task.fail (keyMismatchRefusal file)
 
                         Unkeyed ->
-                            Task.fail keyMismatchRefusal
+                            Task.fail (keyMismatchRefusal file)
 
 
 -- The key check written on a head that still has none and still reads as
@@ -657,11 +658,16 @@ signedBy key message macHex =
             ReviewKey.verifies key message mac
 
 
--- The refusal of a key that did not sign the review log. It names the
--- variable only, never the key nor the head's stored check.
-keyMismatchRefusal : Error
-keyMismatchRefusal =
-    Error.invalidInput ("the review log was signed by a different " ++ ReviewKey.keyVar ++ ", so this key can neither verify nor record its decisions.\n  fix: start with the key that signed it.")
+-- The refusal of a key that did not sign the review log in `file`. It names
+-- the variable and the file, never the key nor the head's stored check.
+keyMismatchRefusal : Path -> Error
+keyMismatchRefusal file =
+    EnvLookup.startupRefusal
+        { var = ReviewKeyVar
+        , file = Just file
+        , problem = "its review log was signed by a different key, so this key can neither verify nor record its decisions"
+        , fix = "start with the key that signed it"
+        }
 
 
 -- The review file opened and migrated, once it is known to hold no decision
@@ -686,7 +692,7 @@ headAt : ReviewFile -> Db -> Task.Task Error Index.ChainHead
 headAt loc db =
     headRows db
         |> Task.onError (Settings.openFailure ReviewDb loc.path)
-        |> Task.andThen (\rows -> Task.mapError (\_ -> Settings.brokenLog loc.path "its review log has no single head row") (oneHead rows))
+        |> Task.andThen (\rows -> Task.mapError (\_ -> Settings.brokenLog loc.path HeadMissing) (oneHead rows))
 
 
 -- The integrity guards of the review log, each named with the table it
@@ -728,7 +734,7 @@ requireGuards loc db =
             Task.succeed ()
 
         else
-            Task.fail (Settings.brokenLog loc.path "its review log has lost an append-only trigger, so its decisions could be rewritten unseen")
+            Task.fail (Settings.brokenLog loc.path GuardLost)
 
 
 -- A log holding a row with no subject name was recorded before names were
@@ -744,7 +750,7 @@ requireNamedRows loc db =
                 Task.succeed ()
 
             _ ->
-                Task.fail (Settings.brokenLog loc.path unnamedRowsReason)
+                Task.fail (Settings.brokenLog loc.path UnnamedRows)
 
 
 -- A log whose table predates the name columns and holds a decision is
@@ -767,13 +773,7 @@ requireNamedBeforeMigration loc db =
                             Task.succeed ()
 
                         _ ->
-                            Task.fail (Settings.brokenLog loc.path unnamedRowsReason)
-
-
--- Why a log holding rows recorded before names were kept is refused.
-unnamedRowsReason : String
-unnamedRowsReason =
-    "its review log holds decisions recorded before unit names were kept, which this reviewer cannot verify; start a fresh review database"
+                            Task.fail (Settings.brokenLog loc.path UnnamedRows)
 
 
 unnamedDecoder : Db.Decode.Decoder Bool
@@ -927,16 +927,11 @@ headMoved =
     Error.conflict "the review log's head moved while a decision was recorded; decide again"
 
 
--- A `uid` column as stored: the signer writes a unit id's text, while the
--- walk reads whatever text the row holds. A type of its own, so the mac
--- input's uid can be neither the link, the body hash nor the decision.
+-- A `uid` column as a read holds it: whatever text the row stores,
+-- unverified, never built from a `Uid`. A type of its own, so it can be
+-- neither the body hash nor the decision.
 type StoredUid
     = StoredUid String
-
-
-storedUid : Uid -> StoredUid
-storedUid uid =
-    StoredUid (Uid.toString uid)
 
 
 storedUidText : StoredUid -> String
@@ -963,14 +958,14 @@ storedIsUnitId stored =
 -- path and line, or a file's path). A NULL reason (`-`) and an empty one
 -- (`+`) differ, and `Index.lengthPrefixed` keeps any two field lists apart,
 -- so no edit of any column keeps the mac.
-macInput : String -> Int -> String -> StoredUid -> String -> String -> Maybe String -> Int -> RecordedName -> String
+macInput : String -> Int -> String -> Uid.MacField -> String -> String -> Maybe String -> Int -> RecordedName -> String
 macInput logId seq prev uid bodyHash decision reason reviewedAt name =
     Index.lengthPrefixed
         ([ "ipe-code-review/review-row/v2"
          , logId
          , String.fromInt seq
          , prev
-         , storedUidText uid
+         , Uid.macFieldText uid
          , bodyHash
          , decision
          , reasonField reason
@@ -987,7 +982,7 @@ rowSignedBy : MacKey -> String -> Int -> String -> StoredUid -> String -> String
 rowSignedBy key logId seq prev uid bodyHash decision reason reviewedAt name macHex =
     case name of
         Named recorded ->
-            signedBy key (macInput logId seq prev uid bodyHash decision reason reviewedAt recorded) macHex
+            signedBy key (macInput logId seq prev (Uid.storedMacField (storedUidText uid)) bodyHash decision reason reviewedAt recorded) macHex
 
         NameMalformed ->
             False
@@ -1750,7 +1745,7 @@ appendDecision key tx head attested decision at =
             Index.chainMac head
 
         mac =
-            ReviewKey.sign key (macInput (Index.chainLogId head) seq prev (storedUid uid) bodyHash decisionText reason at name)
+            ReviewKey.sign key (macInput (Index.chainLogId head) seq prev (Uid.macField uid) bodyHash decisionText reason at name)
 
         next =
             Index.chainNext head mac

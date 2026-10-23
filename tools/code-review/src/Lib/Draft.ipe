@@ -1,0 +1,78 @@
+module Lib.Draft exposing (Draft, draft, draftCut, draftReason, draftText, empty, inputMaxUnits, notice)
+
+-- The reviewer's refusal draft, bounded where it enters: at most
+-- `LibDb.reasonMaxChars` code points are ever held, and a cut records the
+-- length the reviewer gave, so the panel says so the moment it happens.
+-- Opaque: built only by `draft` and `empty`, so a draft past the reason
+-- limit has no representation, and the text the panel shows is the text
+-- Confirm parses.
+
+import Ipe.Maybe as Maybe
+import Ipe.Result as Result exposing (Result)
+import Ipe.String as String
+import Lib.Db as LibDb exposing (Reason)
+import Lib.Failure exposing (ReasonRefusal(..), RefuseFailure(..))
+
+
+type Draft
+    = Draft { text : String, cutFrom : Maybe Int }
+
+
+empty : Draft
+empty =
+    Draft { text = "", cutFrom = Nothing }
+
+
+-- `raw` kept to its first `LibDb.reasonMaxChars` code points, with the
+-- length it had when it was cut.
+draft : String -> Draft
+draft raw =
+    let
+        chars =
+            String.length raw
+    in
+    if chars > LibDb.reasonMaxChars then
+        Draft { text = String.left LibDb.reasonMaxChars raw, cutFrom = Just chars }
+
+    else
+        Draft { text = raw, cutFrom = Nothing }
+
+
+draftText : Draft -> String
+draftText bounded =
+    case bounded of
+        Draft d ->
+            d.text
+
+
+-- The length the reviewer's text had, when it was cut.
+draftCut : Draft -> Maybe Int
+draftCut bounded =
+    case bounded of
+        Draft d ->
+            d.cutFrom
+
+
+-- Why the draft's panel says its text was cut, when it was.
+notice : Draft -> Maybe RefuseFailure
+notice bounded =
+    Maybe.map (\chars -> DraftRefused (ReasonOverlong { chars = chars, limit = LibDb.reasonMaxChars })) (draftCut bounded)
+
+
+-- The kept text as the reason Confirm records, or why it is not one.
+draftReason : Draft -> Result ReasonRefusal Reason
+draftReason bounded =
+    LibDb.parseReason (draftText bounded)
+
+
+-- The page-side bound on the reason input, in the UTF-16 units `maxlength`
+-- counts. A code point is at least one unit, so a value the input admits is
+-- never past `LibDb.reasonMaxChars` code points: the draft never cuts what
+-- an honest page holds, and the focused input, whose value the page keeps
+-- as typed, shows exactly the text Confirm records. A reason of characters
+-- outside the Basic Multilingual Plane, two units each, is held to half the
+-- limit by the page; the draft's own cut stays the bound for any other
+-- sender.
+inputMaxUnits : Int
+inputMaxUnits =
+    LibDb.reasonMaxChars

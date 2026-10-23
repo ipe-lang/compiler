@@ -36,7 +36,7 @@ import Lib.Settings as Settings
 import Lib.Uid as Uid exposing (Uid)
 import Lib.UnitName as UnitName
 import Migrations
-import TestSupport exposing (tableExists, countReviewRows, expectErr, refuse, seedIndex, writeFileText, fixtureLibRs, fixtureMainIpe, viewA, viewB, viewTag, shownTextOf, unitViewTag, execIndex, execIndexUnchecked, Scratch, freshScratch, freshDir, check, onFreshReview, indexSchemaStatements, execIndexSchema, seedIndexDb, insertUnitRows, setIndexEnv, loadFirstPage, checkUnits, listSecond, isUnitA, isUnitB, cleanupIndex, removeFileIfAny, codeText, noHazard, rendered, renderedForeign, describeText, refusedFor, migratedReviewAt, tableNames, attestedFor, openReadOnlyAt, vectorsPath, ipeIndexTestFile, repoFile, probeMessage, probeNames, maybeContains, reviewHeadOf, uid, testMacKey, countingVerifier, RawRow, RawName(..), rawRow, rawMacInput, openFileAt, appendSigned, appendSignedAs, appendSignedClaiming, tamperLog, headTextOf, logRowCount, testReviewKey, carriesFailure, carriesNoFailure, testKeyHex, otherKeyHex, otherMacKey, logVerdictOf, appendSignedPastHead, appendSignedBeforeFirst, appendSignedWithUidText, rawKeyCheck, refusedWith, accepted, refusedAs, refusalOf)
+import TestSupport exposing (tableExists, countReviewRows, expectErr, refuse, seedIndex, writeFileText, fixtureLibRs, fixtureMainIpe, viewA, viewB, viewTag, shownTextOf, unitViewTag, execIndex, execIndexUnchecked, Scratch, freshScratch, freshDir, check, onFreshReview, withReviewDb, bracketDb, applyEdits, indexSchemaStatements, execIndexSchema, seedIndexDb, insertUnitRows, setIndexEnv, loadFirstPage, checkUnits, listSecond, isUnitA, isUnitB, cleanupIndex, removeFileIfAny, codeText, noHazard, rendered, renderedForeign, describeText, refusedFor, migratedReviewAt, tableNames, attestedFor, openReadOnlyAt, vectorsPath, ipeIndexTestFile, repoFile, probeMessage, probeNames, maybeContains, reviewHeadOf, uid, testMacKey, countingVerifier, RawRow, RawName(..), rawRow, rawMacInput, openFileAt, appendSigned, appendSignedAs, appendSignedClaiming, tamperLog, headTextOf, logRowCount, testReviewKey, carriesFailure, carriesNoFailure, testKeyHex, otherKeyHex, otherMacKey, logVerdictOf, appendSignedPastHead, appendSignedBeforeFirst, appendSignedWithUidText, rawKeyCheck, refusedWith, accepted, refusedAs, refusalOf)
 
 
 removeReviewFiles : String -> Task.Task Error ()
@@ -334,10 +334,10 @@ probeRefusesReviewWithoutGuardsIn base =
 probeAfterEdits : String -> List String -> Task.Task Error (Maybe String)
 probeAfterEdits dbPath edits =
     do
-        db <- migratedReviewAt dbPath
-        Task.sequence (List.map (\sql -> Db.exec db sql []) edits)
         loc <- Settings.parseReviewDb dbPath
         key <- testReviewKey
+        LibDb.probe key loc
+        withReviewDb loc (\db -> applyEdits db edits)
         message <- probeMessage (LibDb.probe key loc)
         removeReviewFiles dbPath
         Task.succeed message
@@ -689,10 +689,10 @@ historyWalkMatchesOrder db =
             Db.exec db "INSERT INTO review (uid, body_hash, decision, reason, reviewed_at) VALUES (?,?,?,?,?)" [ Uid.toSql (uid label), SqlString bodyHash, SqlString "refuse", SqlString "r", SqlInt at ]
 
         walkKey ( label, bodyHash ) =
-            ( Uid.toString (uid label), bodyHash )
+            ( TestSupport.uidHex (uid label), bodyHash )
 
         walkUids =
-            List.map (\( label, _, _ ) -> Uid.toString (uid label)) (seeded ++ legacy)
+            List.map (\( label, _, _ ) -> TestSupport.uidHex (uid label)) (seeded ++ legacy)
 
         keyDecoder =
             Db.Decode.succeed (\unit bodyHash -> ( unit, bodyHash ))
@@ -718,10 +718,10 @@ entryKey : ReviewEntry -> ( String, String )
 entryKey entry =
     case entry of
         Verified row ->
-            ( Uid.toString (LibDb.verifiedUid row), LibDb.verifiedHash row )
+            ( TestSupport.uidHex (LibDb.verifiedUid row), LibDb.verifiedHash row )
 
         Unverified row ->
-            ( Maybe.withDefault "" (Maybe.map Uid.toString row.uid), row.bodyHash )
+            ( Maybe.withDefault "" (Maybe.map TestSupport.uidHex row.uid), row.bodyHash )
 
 
 -- The state one History walk step carries: where the next page starts, the
@@ -1512,10 +1512,48 @@ wrongKeyRefusesStartupIn base =
         bound <- rawKeyCheck db
         loc <- Settings.parseReviewDb dbPath
         other <- otherMacKey
-        refused <- refusedWith LibDb.keyMismatchRefusal (LibDb.probe (ReviewKey.Signing other) loc)
+        refused <- refusedWith (LibDb.keyMismatchRefusal loc.path) (LibDb.probe (ReviewKey.Signing other) loc)
         kept <- rawKeyCheck db
         removeReviewFiles dbPath
-        Task.succeed (refused && String.contains "IPE_REVIEW_MAC_KEY" (Error.message LibDb.keyMismatchRefusal) && bound /= Nothing && kept == bound)
+        Task.succeed (refused && String.contains "IPE_REVIEW_MAC_KEY" (Error.message (LibDb.keyMismatchRefusal loc.path)) && bound /= Nothing && kept == bound)
+
+
+-- The key-mismatch refusal is one line in the startup layout: it starts
+-- with the key's variable, names the review file it could not use, states
+-- one fix, and carries neither key nor the head's stored check. Red if the
+-- refusal drops the file, embeds a line break, or leaves the shared layout.
+keyMismatchNamesFile : Task.Task Error Bool
+keyMismatchNamesFile =
+    freshDir "ipe-review-key-mismatch-names-file" |> Task.andThen keyMismatchNamesFileIn
+
+
+keyMismatchNamesFileIn : String -> Task.Task Error Bool
+keyMismatchNamesFileIn base =
+    let
+        dbPath =
+            base ++ "/review.db"
+    in
+    do
+        db <- migratedReviewAt dbPath
+        appendSigned db (rawRow "bound-1" "h" "approve" Nothing)
+        stored <- rawKeyCheck db
+        loc <- Settings.parseReviewDb dbPath
+        other <- otherMacKey
+        message <- probeMessage (LibDb.probe (ReviewKey.Signing other) loc)
+        removeReviewFiles dbPath
+        let
+            secrets =
+                [ testKeyHex, String.toUpper testKeyHex, otherKeyHex, String.toUpper otherKeyHex ] ++ Maybe.withDefault [] (Maybe.map List.singleton stored)
+        in
+        Task.succeed
+            (probeNames "IPE_REVIEW_MAC_KEY" dbPath message
+                && message == Just (Error.message (LibDb.keyMismatchRefusal loc.path))
+                && maybeContains "signed by a different key" message
+                && not (maybeContains "\n" message)
+                && List.length (String.split "; fix: " (Maybe.withDefault "" message)) == 2
+                && stored /= Nothing
+                && not (List.any (\secret -> maybeContains secret message) secrets)
+            )
 
 
 -- A decision recorded straight through `insertDecision` under a second
@@ -1558,17 +1596,55 @@ legacyHeadAdoptsOnlyOnProofIn base =
         tampered <- legacyProbe (base ++ "/tampered.db") [ "UPDATE review_log SET reviewed_at = 99 WHERE seq = 1" ] key
         otherKey <- legacyProbe (base ++ "/other-key.db") [] other
         pastHead <- legacyProbe (base ++ "/past-head.db") [ "INSERT INTO review_log (seq, uid, body_hash, decision, reason, reviewed_at, prev, mac, unit_kind, unit_qualified, unit_path, unit_line) VALUES (3, 'x', 'hX', 'approve', NULL, 0, 'genesis', '" ++ String.repeat 64 "e" ++ "', 'fn', 'Lib.answer', 'ipe:src/Lib.rs', 3)" ] key
+        tamperedRefusal <- mismatchAt (base ++ "/tampered.db")
+        otherKeyRefusal <- mismatchAt (base ++ "/other-key.db")
+        pastHeadRefusal <- mismatchAt (base ++ "/past-head.db")
         Task.succeed
             (intact.unbound == KeyMismatch
                 && intact.refusal == Nothing
                 && intact.check /= Nothing
                 && isProven intact.after
-                && tampered.refusal == Just (Error.message LibDb.keyMismatchRefusal)
+                && tampered.refusal == Just tamperedRefusal
                 && tampered.check == Nothing
-                && otherKey.refusal == Just (Error.message LibDb.keyMismatchRefusal)
+                && otherKey.refusal == Just otherKeyRefusal
                 && otherKey.check == Nothing
-                && pastHead.refusal == Just (Error.message LibDb.keyMismatchRefusal)
+                && pastHead.refusal == Just pastHeadRefusal
                 && pastHead.check == Nothing
+            )
+
+
+-- The key-mismatch refusal text for the review file at `dbPath`.
+mismatchAt : String -> Task.Task Error String
+mismatchAt dbPath =
+    Settings.parseReviewDb dbPath |> Task.map (\loc -> Error.message (LibDb.keyMismatchRefusal loc.path))
+
+
+-- A log already past the names migration that holds a row with no name is
+-- refused with the one fix that clears it, a new file, never a restored
+-- copy, which would hold the same rows; following that fix, the probe of a
+-- new `IPE_REVIEW_DB` path passes. Red if the refusal offers a remedy that
+-- cannot clear it, or states two.
+unnamedRowsRemedyClears : Task.Task Error Bool
+unnamedRowsRemedyClears =
+    do
+        base <- freshDir "ipe-review-unnamed-remedy"
+        refused <- probeAfterEdits
+                    (base ++ "/after.db")
+                    [ "DROP TRIGGER review_log_name_whole"
+                    , "INSERT INTO review_log (seq, uid, body_hash, decision, reason, reviewed_at, prev, mac) VALUES (1, 'x', 'h', 'approve', NULL, 0, 'genesis', '" ++ String.repeat 64 "e" ++ "')"
+                    , "CREATE TRIGGER review_log_name_whole BEFORE INSERT ON review_log BEGIN SELECT 1; END"
+                    ]
+        fresh <- Settings.parseReviewDb (base ++ "/fresh.db")
+        key <- testReviewKey
+        followed <- probeMessage (LibDb.probe key fresh)
+        removeReviewFiles (base ++ "/fresh.db")
+        Task.succeed
+            (probeNames "IPE_REVIEW_DB" (base ++ "/after.db") refused
+                && maybeContains "recorded before unit names were kept" refused
+                && Maybe.map (String.endsWith "; fix: point IPE_REVIEW_DB at a new file to start a fresh log") refused == Just True
+                && List.length (String.split "fix:" (Maybe.withDefault "" refused)) == 2
+                && not (maybeContains "restore" refused)
+                && followed == Nothing
             )
 
 
@@ -1714,6 +1790,8 @@ reviewLogChecks =
         , check "a different key is refused at startup" wrongKeyRefusesStartup
         , check "a different key cannot append" (onFreshReview "ipe-review-wrongKeyCannotAppend" wrongKeyCannotAppend)
         , check "a head with no key check is bound only on proof" legacyHeadAdoptsOnlyOnProof
+        , check "the key-mismatch refusal names the review file on one line" keyMismatchNamesFile
+        , check "a log with unnamed rows is refused with the one fix that clears it" unnamedRowsRemedyClears
         , check "a genesis head with no key check is bound" legacyGenesisAdopts
         , check "the head compare-and-set covers the key check" (onFreshReview "ipe-review-headCasPinsKeyCheck" headCasPinsKeyCheck)
         , check "the key-mismatch messages carry no key material" keyCheckMismatchMessageIsSecretFree
@@ -1734,6 +1812,9 @@ unitNameChecks =
         , check "a name column that is not text or an integer line, is empty, past the ceiling or holds a NUL is refused" (onFreshReview "ipe-review-nameColumnChecksRefuse" nameColumnChecksRefuse)
         , check "a review file without its whole-name guard fails the probe" probeRefusesReviewWithoutNameGuard
         , check "a review file holding decisions recorded before names were kept fails the probe" probeRefusesUnnamedRows
+        , check "the check on decisions recorded before names were kept gives one result however often it runs" unnamedRowsRepeatable
+        , check "a schema edit runs on the file as another pool left it" (freshDir "ipe-review-edits-see-other-pools" |> Task.andThen (\base -> editsSeeOtherPools (base ++ "/review.db")))
+        , check "a test's pool is closed after its body succeeds or fails, and the body's error is passed on" (freshDir "ipe-review-pool-bracket" |> Task.andThen (\base -> bracketClosesItsPool (base ++ "/review.db")))
         , Task.succeed ( "a row's name columns decode whole within the ceiling or malformed", rowNameWholeOrMalformed )
         , Task.succeed ( "the unit and file mac inputs are pinned to fixed vectors", macInputVectorsPinned )
         ]
@@ -1907,19 +1988,79 @@ probeRefusesUnnamedRows =
 
 -- The probe's refusal message on a review file at `dbPath` migrated up to,
 -- not through, the names migration, after `edits` ran on it (Nothing when
--- the probe passes), and whether the file then has the name columns.
+-- the probe passes), and whether the file then has the name columns, read
+-- through a pool opened after the probe changed the file.
 probeBeforeNames : String -> List String -> Task.Task Error { message : Maybe String, migrated : Bool }
 probeBeforeNames dbPath edits =
     do
-        db <- openFileAt CreateIfMissing dbPath
-        Db.migrate db (List.take 8 Migrations.all)
-        Task.sequence (List.map (\sql -> Db.exec db sql []) edits)
         loc <- Settings.parseReviewDb dbPath
+        withReviewDb loc (\db -> Db.migrate db (List.take 8 Migrations.all) |> Task.andThen (\_ -> applyEdits db edits))
         key <- testReviewKey
         message <- probeMessage (LibDb.probe key loc)
-        columns <- Db.queryDecode db "SELECT COUNT(*) AS total FROM pragma_table_info('review_log') WHERE name = 'unit_path'" [] nameColumnDecoder
+        columns <- withReviewDb loc (\db -> Db.queryDecode db "SELECT COUNT(*) AS total FROM pragma_table_info('review_log') WHERE name = 'unit_path'" [] nameColumnDecoder)
         removeReviewFiles dbPath
         Task.succeed { message = message, migrated = columns == [ 1 ] }
+
+
+-- The unnamed-rows check, run ten times in one process, passes every time:
+-- each run's edits and reads land on the file as the run before left it,
+-- whichever pooled connection serves them. Red while an edit can run on a
+-- connection holding a schema read before another connection changed it.
+unnamedRowsRepeatable : Task.Task Error Bool
+unnamedRowsRepeatable =
+    Task.sequence (List.map (\_ -> probeRefusesUnnamedRows) (List.range 1 10))
+        |> Task.map (List.all identity)
+
+
+-- A pool that read the schema before another pool dropped a trigger
+-- recreates that trigger through `applyEdits`, and the file then holds it.
+-- Red if `applyEdits` runs its edits on the schema the pool read before:
+-- SQLite refuses the `CREATE TRIGGER` of a name that schema still holds.
+editsSeeOtherPools : String -> Task.Task Error Bool
+editsSeeOtherPools dbPath =
+    do
+        loc <- Settings.parseReviewDb dbPath
+        key <- testReviewKey
+        LibDb.probe key loc
+        recreated <- bracketDb (openFileAt WriteExisting dbPath) (recreateNameGuard loc)
+        removeReviewFiles dbPath
+        Task.succeed (recreated == [ 1 ])
+
+
+recreateNameGuard : Settings.ReviewFile -> Db -> Task.Task Error (List Int)
+recreateNameGuard loc stale =
+    do
+        Db.queryDecode stale "SELECT COUNT(*) AS total FROM review_log" [] nameColumnDecoder
+        withReviewDb loc (\other -> Db.exec other "DROP TRIGGER review_log_name_whole" [])
+        applyEdits stale [ "CREATE TRIGGER review_log_name_whole BEFORE INSERT ON review_log BEGIN SELECT 1; END" ]
+        Db.queryDecode stale "SELECT COUNT(*) AS total FROM sqlite_master WHERE type = 'trigger' AND name = 'review_log_name_whole'" [] nameColumnDecoder
+
+
+-- A pool `withReviewDb` handed out is closed once the body succeeds, so a
+-- read through it afterwards fails; a failing body's error comes back
+-- unchanged; and the file opens again afterwards. Red if the bracket leaves
+-- its pool open, or swallows or rewrites the body's error.
+bracketClosesItsPool : String -> Task.Task Error Bool
+bracketClosesItsPool dbPath =
+    do
+        loc <- Settings.parseReviewDb dbPath
+        key <- testReviewKey
+        LibDb.probe key loc
+        leaked <- withReviewDb loc (\db -> Task.succeed db)
+        leakedReads <- Db.queryDecode leaked "SELECT COUNT(*) AS total FROM review_log" [] nameColumnDecoder
+                        |> Task.map (\_ -> True)
+                        |> Task.onError (\_ -> Task.succeed False)
+        failed <- withReviewDb loc failingBody
+                    |> Task.map (\_ -> Nothing)
+                    |> Task.onError (\e -> Task.succeed (Just (Error.toString e)))
+        reopened <- withReviewDb loc (\db -> Db.queryDecode db "SELECT COUNT(*) AS total FROM review_log" [] nameColumnDecoder)
+        removeReviewFiles dbPath
+        Task.succeed (not leakedReads && failed == Just "Conflict: the body failed" && reopened == [ 0 ])
+
+
+failingBody : Db -> Task.Task Error Int
+failingBody _ =
+    Task.fail (Error.conflict "the body failed")
 
 
 nameColumnDecoder : Db.Decode.Decoder Int
@@ -1984,10 +2125,10 @@ macInputVectorsPinned =
             "0123456789abcdef0123456789abcdef"
 
         tool recorded =
-            LibDb.macInput logId 2 "prevhead" (LibDb.storedUid unitRow.uid) unitRow.bodyHash unitRow.decision unitRow.reason unitRow.reviewedAt recorded
+            LibDb.macInput logId 2 "prevhead" (Uid.macField unitRow.uid) unitRow.bodyHash unitRow.decision unitRow.reason unitRow.reviewedAt recorded
 
         fields =
-            "29:ipe-code-review/review-row/v2" ++ "32:" ++ logId ++ "1:2" ++ "8:prevhead" ++ "64:" ++ Uid.toString unitRow.uid ++ "2:hV" ++ "6:refuse" ++ "3:+no" ++ "1:7"
+            "29:ipe-code-review/review-row/v2" ++ "32:" ++ logId ++ "1:2" ++ "8:prevhead" ++ "64:" ++ TestSupport.uidHex unitRow.uid ++ "2:hV" ++ "6:refuse" ++ "3:+no" ++ "1:7"
 
         unitVector =
             fields ++ "4:unit" ++ "2:fn" ++ "10:Lib.answer" ++ "14:ipe:src/Lib.rs" ++ "1:3"
@@ -2001,7 +2142,7 @@ macInputVectorsPinned =
                 && rawMacInput logId 2 "prevhead" unitRow == unitVector
                 && tool file == fileVector
                 && rawMacInput logId 2 "prevhead" fileRow == fileVector
-                && String.length (Uid.toString unitRow.uid) == 64
+                && String.length (TestSupport.uidHex unitRow.uid) == 64
 
         _ ->
             False

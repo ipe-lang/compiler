@@ -33,7 +33,9 @@ type LoadFailure
 -- refused when the file is no longer listed unreviewable, its digest changed,
 -- it is one no decision acknowledges, it could not be re-probed, it now reads
 -- as text, its path is past the recorded-name ceiling or not whole text,
--- or it is not on the shown queue page.
+-- or it is not on the shown queue page. Either is refused when what the
+-- decision names differs from what the page now offers on the same row (its
+-- content changed under the same uid, or the page drew no control for it).
 type DecideRefusal
     = SourceGone
     | SourceChanged
@@ -50,6 +52,7 @@ type DecideRefusal
     | FileNotReprobed
     | FileReadsAsText
     | FileNotQueued
+    | DrawnChanged
 
 
 -- Why a decision was not saved, as the model holds it. A decision asked off
@@ -70,15 +73,16 @@ type SaveFailure
     | SaveFailed
 
 
--- Why the reviewer's draft is not a refusal reason: blank, or `chars`
--- characters where at most `limit` are kept.
+-- Why the reviewer's text is not a refusal reason as given: blank, or
+-- `chars` characters where at most `limit` are kept.
 type ReasonRefusal
     = ReasonBlank
     | ReasonOverlong { chars : Int, limit : Int }
 
 
--- Why a refusal draft stays open: its reason is refused. A draft is open only
--- while no decision is busy, so no other case exists.
+-- What the open refusal panel says of its draft: its reason is refused at
+-- Confirm (blank), or it was cut to the limit as it was typed. A draft is
+-- open only while no decision is busy, so no other case exists.
 type RefuseFailure
     = DraftRefused ReasonRefusal
 
@@ -315,6 +319,9 @@ decideRefusalText refusal =
         FileNotQueued ->
             "the file was not on the queue page shown when this click arrived (it was acknowledged, the index no longer lists it, or the page changed or was reloading); nothing was saved"
 
+        DrawnChanged ->
+            "what you decided on changed, or was not yet drawn, when the decision arrived; nothing was saved, and the page now shows the current version: read it and decide again"
+
 
 refuseFailureText : RefuseFailure -> String
 refuseFailureText failure =
@@ -323,4 +330,4 @@ refuseFailureText failure =
             "a refusal needs a reason"
 
         DraftRefused (ReasonOverlong over) ->
-            "a refusal reason is at most " ++ String.fromInt over.limit ++ " characters; this one has " ++ String.fromInt over.chars
+            "this reason had " ++ String.fromInt over.chars ++ " characters; a reason holds at most " ++ String.fromInt over.limit ++ ", so only the first " ++ String.fromInt over.limit ++ " are kept and the rest was cut"

@@ -1,4 +1,4 @@
-module Lib.Index exposing (Attested, AttestedHash(..), Body(..), ChainHead, ChainVerdict(..), Change(..), Cursor(..), DecidedPair, LogStatus(..), Oversize(..), PendingRow, ReadFailure(..), RefusalDigest, RefusalReason(..), RefusalRow, ShownSource, Snapshot, SourceView(..), StaleReason(..), Stamp, Unit, UnitView, Written(..), ackable, attest, attestResidual, attestedHash, attestedHashMaxBytes, attestedName, attestedUid, candidateQuery, chainHeadDecoder, chainHeadText, chainKeyCheck, chainLogId, chainMac, chainNext, chainSeq, childSpanCeiling, classifyView, decidedPairDecoder, decidedPairKey, digestPair, drainDecided, drainUnit, drawnDepthCeiling, elementResidentBytes, lengthPrefixed, linkElements, liveFiles, liveUnits, loadView, placeholders, probe, probeRepos, probeRoot, queueElementCeiling, queueLabelByteCeiling, readConnection, readFailureText, readSnapshot, readStamp, rebuildReviewed, refusalDigestText, refusalReasons, refusalRowDecoder, refusalTag, residualText, reverify, reverifyRefusal, runtimeEntryOverhead, runtimeSessionCeiling, shortHash, shownDrawn, shownHash, shownRows, shownText, signedStamp, sourceCeiling, spanOversize, stampStatus, stampText, storedHash, unescapeShown, unitName, unsignedStamp, viewByteCeiling, viewLineCeiling, viewLines, viewNodeCeiling, viewReserve, viewText)
+module Lib.Index exposing (Attested, AttestedHash(..), Body(..), ChainHead, ChainVerdict(..), Change(..), Cursor(..), DecidedPair, LogStatus(..), Oversize(..), PendingRow, ReadFailure(..), RefusalDigest, RefusalReason(..), RefusalRow, ShownHash, ShownSource, Snapshot, SourceView(..), StaleReason(..), Stamp, Unit, UnitView, Written(..), ackable, attest, attestResidual, attestedHash, attestedHashMaxBytes, attestedName, attestedUid, candidateQuery, chainHeadDecoder, chainHeadText, chainKeyCheck, chainLogId, chainMac, chainNext, chainSeq, childSpanCeiling, classifyView, decidedPairDecoder, decidedPairKey, digestPair, drainDecided, drainUnit, drawnDepthCeiling, elementResidentBytes, lengthPrefixed, linkElements, liveFiles, liveUnits, loadView, placeholders, probe, probeRepos, probeRoot, queueElementCeiling, queueLabelByteCeiling, readConnection, readFailureText, readSnapshot, readStamp, rebuildReviewed, refusalDigestText, refusalReasons, refusalRowDecoder, refusalTag, residualText, reverify, reverifyRefusal, runtimeEntryOverhead, runtimeSessionCeiling, shortHash, shownDigest, shownDrawn, shownHash, shownRows, shownText, signedStamp, sourceCeiling, spanOversize, stampStatus, stampText, storedHash, unescapeShown, unitName, unsignedStamp, viewByteCeiling, viewLineCeiling, viewLines, viewNodeCeiling, viewReserve, viewText)
 
 import Ipe.ByteSize as ByteSize exposing (ByteSize)
 import Ipe.Bytes as Bytes
@@ -2725,6 +2725,18 @@ shownHash shown =
     case shown of
         ShownSource s ->
             s.hash
+
+
+-- The hash of the bytes a shown source holds, as a value only `shownDigest`
+-- builds: what a decision offer binds, so a decision proceeds only on the
+-- content the page drew.
+type ShownHash
+    = ShownHash String
+
+
+shownDigest : ShownSource -> ShownHash
+shownDigest shown =
+    ShownHash (shownHash shown)
 
 
 -- The one hash a decision or drain may record: the hash of the bytes that
