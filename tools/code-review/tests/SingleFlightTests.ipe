@@ -12,13 +12,13 @@ import Ipe.System as System
 import Ipe.Task as Task
 import Ipe.Time.Timestamp as Timestamp
 import Ipe.Ui as Ui
-import Lib.App as App exposing (Model, Msg(..), Page(..))
+import Lib.App as App exposing (KeyOffers(..), Model, Msg(..), Page(..))
 import Lib.Db as LibDb exposing (Decision(..))
 import Lib.Draft as Draft
 import Lib.Epoch as Epoch exposing (Epoch)
 import Lib.Failure as Failure exposing (DecideRefusal(..), LoadFailure(..), ReasonRefusal(..), RefuseFailure(..), SaveFailure(..))
 import Lib.Index as Index exposing (Change(..), RefusalReason(..), SourceView(..), StaleReason(..))
-import Lib.Keys as Keys
+import Lib.Keys as Keys exposing (KeyAction(..))
 import Lib.Queue as Queue exposing (DecisionSlot(..), DecisionTarget(..), HistoryState(..), HistoryWant(..), QueueState(..), QueueWant(..), RefusalPanel(..), SelectedView(..), Settle(..), StandingRead(..), UnitPageState(..))
 import Lib.ReviewKey as ReviewKey exposing (ReviewKey(..))
 import Lib.SafeText as SafeText
@@ -27,6 +27,7 @@ import Lib.Uid as Uid exposing (Uid)
 import Lib.View as View
 import TestSupport exposing (Scratch, check, checkReporting, cleanupIndex, decideNow, envAppSettings, execIndex, fixtureLibRs, freshScratch, loadPageNow, loadUnitNow, migratedReviewAt, refusalOf, removeFileIfAny, seedIndex, testMacKey, uid, labelOf, labelText, viewA, writeFileText)
 import TextSinkScanTests
+import ViewTests exposing (allKeys)
 
 
 -- Every check drives the app's own `App.update`, the dispatch `src/Main.ipe`
@@ -164,6 +165,31 @@ drawnOn drawnFrom unit control =
 press : Model -> String -> Msg
 press drawnFrom key =
     KeyDown (App.keyOffers drawnFrom) key
+
+
+-- `text` typed into the refusal panel the render of `drawnFrom` draws on
+-- `unit`'s row; none when that render offers no row for the unit.
+draftOn : Model -> Uid -> String -> List Msg
+draftOn drawnFrom unit text =
+    drawnOn drawnFrom unit (\row -> RefuseDraft row text)
+
+
+-- Whether the render of `model` draws an open refusal panel's controls for
+-- its keys, so a key pressed on it is read on that panel's row.
+panelKeysDrawn : Model -> Bool
+panelKeysDrawn model =
+    case App.keyOffers model of
+        PanelDrawn (Just _) ->
+            True
+
+        PanelDrawn Nothing ->
+            False
+
+        CardsDrawn _ ->
+            False
+
+        NothingDrawn ->
+            False
 
 
 -- Whether the render of `model` draws a decision control for `unit`, so a
@@ -332,7 +358,7 @@ decisionsSingleFlight settings a b =
             after settings (drawnOn shown ua ApproveRow ++ [ press saving "a" ]) saving
 
         refusing =
-            after settings (drawnOn shown ua RefuseStart ++ [ RefuseDraft ua "needs a test" ] ++ drawnOn shown ua RefuseSubmit) saving
+            after settings (drawnOn shown ua RefuseStart ++ draftOn shown ua "needs a test" ++ drawnOn shown ua RefuseSubmit) saving
 
         settled =
             after settings [ App.decisionSaved ua settings.epoch (Err (Error.conflict "boom")) ] pressedAgain
@@ -384,7 +410,7 @@ refusalPanelLivesInIdleSlot settings a b file =
             after settings [ press saving "r" ] saving
 
         cancelled =
-            after settings [ RefuseCancel, press saving "Escape" ] saving
+            after settings (drawnOn shown ua RefuseCancel ++ [ press saving "Escape" ]) saving
 
         secondShown =
             cardModel [ a, b ] 1 b
@@ -396,7 +422,7 @@ refusalPanelLivesInIdleSlot settings a b file =
             after settings (drawnOn secondShown ub RefuseStart) otherSaving
 
         opened =
-            after settings (drawnOn shown ua RefuseStart ++ [ RefuseDraft ua "needs a test" ]) shown
+            after settings (drawnOn shown ua RefuseStart ++ draftOn shown ua "needs a test") shown
 
         draft =
             { refuseDraft = Draft.draft "needs a test", refuseError = Nothing }
@@ -419,7 +445,13 @@ refusalPanelLivesInIdleSlot settings a b file =
     offers shown ua
         && offers secondShown ub
         && offers (withRefusal file shown) file.uid
-        && Keys.label (Keys.keyAction (Queue.openPanel saving.decision /= Nothing) 2 0 "r") == "refuse"
+        && (case Keys.keyAction (App.keyMode (App.keyOffers saving) saving) "r" of
+                RefuseSelected _ ->
+                    True
+
+                _ ->
+                    False
+           )
         && keyed == saving
         && keyed.decision == DecisionSaving ua settings.epoch
         && String.contains "Saving the decision…" (page keyed)
@@ -484,7 +516,7 @@ refusalPanelOnlyOnOfferedRow settings a b file =
             after settings (drawnOn shown ua RefuseStart) shown
 
         drafted =
-            after settings [ RefuseDraft ua "needs a test" ] opened
+            after settings (draftOn opened ua "needs a test") opened
 
         unlisted =
             renamed "u-unlisted" a
@@ -544,7 +576,7 @@ refusalPanelOnlyOnOfferedRow settings a b file =
         && Queue.openPanel readShown.decision == Just ( ua, { refuseDraft = Draft.draft "needs a test", refuseError = Nothing } )
         && after settings (drawnOn secondShown ub RefuseSubmit) drafted == drafted
         && after settings (drawnOn fileShown file.uid RefuseSubmit) drafted == drafted
-        && after settings [ RefuseDraft ub "elsewhere" ] drafted == drafted
+        && after settings (draftOn secondShown ub "elsewhere") drafted == drafted
 
 
 -- Whether a rendered page draws the refusal panel's reason field or Confirm.
@@ -582,7 +614,7 @@ staleDecisionTakesNoSlot settings a b file =
             { refuseDraft = Draft.draft "needs a test", refuseError = Nothing }
 
         drafted =
-            after settings (drawnOn shown ua RefuseStart ++ [ RefuseDraft ua "needs a test" ]) shown
+            after settings (drawnOn shown ua RefuseStart ++ draftOn shown ua "needs a test") shown
 
         secondShown =
             cardModel [ a, b ] 1 b
@@ -649,7 +681,7 @@ staleDecisionTakesNoSlot settings a b file =
             { settings | key = ReadOnly }
 
         refusedSubmit =
-            after readOnly (drawnOn shown ua RefuseStart ++ [ RefuseDraft ua "needs a test" ] ++ drawnOn shown ua RefuseSubmit) shown
+            after readOnly (drawnOn shown ua RefuseStart ++ draftOn shown ua "needs a test" ++ drawnOn shown ua RefuseSubmit) shown
 
         idleNotice failure model =
             Queue.notSavedOf model.decision == Just failure
@@ -712,7 +744,7 @@ foreignDecisionIsIdle settings otherEpoch a b =
             after settings (drawnOn shown ua RefuseStart) stale
 
         refused =
-            after settings (RefuseDraft ua "needs a test" :: drawnOn shown ua RefuseSubmit) opened
+            after settings (draftOn shown ua "needs a test" ++ drawnOn shown ua RefuseSubmit) opened
 
         foreignResult =
             after settings [ App.decisionSaved ua otherEpoch (Err (Error.conflict "boom")) ] approved
@@ -1277,7 +1309,7 @@ refuseDraftTyped settings a b =
             queueModel [ a, b ] (ViewShown a)
 
         submit draft =
-            after settings (drawnOn shown ua RefuseStart ++ [ RefuseDraft ua draft ] ++ drawnOn shown ua RefuseSubmit) shown
+            after settings (drawnOn shown ua RefuseStart ++ draftOn shown ua draft ++ drawnOn shown ua RefuseSubmit) shown
 
         blank =
             submit "   "
@@ -1305,7 +1337,7 @@ typedDraft settings a b text =
         shown =
             queueModel [ a, b ] (ViewShown a)
     in
-    after settings (drawnOn shown a.unit.uid RefuseStart ++ [ RefuseDraft a.unit.uid text ]) shown
+    after settings (drawnOn shown a.unit.uid RefuseStart ++ draftOn shown a.unit.uid text) shown
 
 
 -- The open panel's draft as the model holds it.
@@ -1381,7 +1413,7 @@ draftPastLimitCutWithNotice settings a b =
             typedDraft settings a b (atLimit ++ "y")
 
         shortened =
-            after settings [ RefuseDraft a.unit.uid "needs a test" ] typed
+            after settings (draftOn typed a.unit.uid "needs a test") typed
     in
     heldText typed == Just atLimit
         && noticeDrawn (cutNotice (LibDb.reasonMaxChars + 1)) typed
@@ -1910,7 +1942,7 @@ enteredOnFile settings listed =
             uid "r-link"
 
         drafted =
-            after settings (drawnOn listed file RefuseStart ++ [ RefuseDraft file "not ours" ]) listed
+            after settings (drawnOn listed file RefuseStart ++ draftOn listed file "not ours") listed
 
         entered =
             after settings [ press drafted "Enter" ] drafted
@@ -2176,10 +2208,7 @@ confirmRefuseBindsDrawnPanelRow r =
             reshownCard r
 
         drafted =
-            after r.settings (drawnOn reloaded ua RefuseStart ++ [ RefuseDraft ua "needs a test" ]) reloaded
-
-        drawn =
-            App.keyOffers drafted
+            after r.settings (drawnOn reloaded ua RefuseStart ++ draftOn reloaded ua "needs a test") reloaded
 
         fileOffer =
             App.decidableRow (withRefusal r.file reloaded) r.file.uid
@@ -2188,12 +2217,12 @@ confirmRefuseBindsDrawnPanelRow r =
             after r.settings [ press drafted "Enter" ] drafted
 
         withPanel panel =
-            after r.settings [ KeyDown { drawn | panel = panel } "Enter" ] drafted
+            after r.settings [ KeyDown (App.PanelDrawn panel) "Enter" ] drafted
 
         clickedFile =
             after r.settings (drawnOn (withRefusal r.file reloaded) r.file.uid RefuseSubmit) drafted
     in
-    drawn.panel /= Nothing
+    panelKeysDrawn drafted
         && fileOffer /= Nothing
         && confirmed.decision == DecisionSaving ua r.settings.epoch
         && withPanel (App.decidableRow shown ua) == drafted
@@ -2203,10 +2232,11 @@ confirmRefuseBindsDrawnPanelRow r =
 
 
 -- A key typed into a refusal panel stays panel input on either side of the
--- panel's drawing: `a` and `r` pressed on a render that drew the panel and
--- received after it closed, and `a` pressed on a render that drew no panel
--- and received after one opened, each leave the model as it was. Red if the
--- key is read by the panel the model holds when it arrives alone.
+-- panel's drawing: every key but Enter and Escape pressed on a render that
+-- drew the panel and received after it closed, and pressed on a render that
+-- drew no panel and received after one opened, leaves the model as it was.
+-- Red if the key is read by the panel the model holds when it arrives alone,
+-- or by the panel its render drew alone.
 panelKeysNeverDecideAcrossPanelDrawing : Reshown -> Bool
 panelKeysNeverDecideAcrossPanelDrawing r =
     let
@@ -2217,20 +2247,240 @@ panelKeysNeverDecideAcrossPanelDrawing r =
             reshownCard r
 
         drafted =
-            after r.settings (drawnOn reloaded ua RefuseStart ++ [ RefuseDraft ua "awkward" ]) reloaded
+            after r.settings (drawnOn reloaded ua RefuseStart ++ draftOn reloaded ua "awkward") reloaded
 
         cancelled =
-            after r.settings [ RefuseCancel ] drafted
+            after r.settings (drawnOn drafted ua RefuseCancel) drafted
 
         opened =
             after r.settings (drawnOn reloaded ua RefuseStart) reloaded
     in
-    (App.keyOffers drafted).panel /= Nothing
+    panelKeysDrawn drafted
         && Queue.openPanel cancelled.decision == Nothing
-        && after r.settings [ press drafted "a" ] cancelled == cancelled
-        && after r.settings [ press drafted "r" ] cancelled == cancelled
         && Queue.openPanel opened.decision /= Nothing
-        && after r.settings [ press reloaded "a" ] opened == opened
+        && List.all (\key -> after r.settings [ press drafted key ] cancelled == cancelled) reasonKeys
+        && List.all (\key -> after r.settings [ press reloaded key ] opened == opened) reasonKeys
+
+
+-- Every key of `allKeys` but the panel's own Enter and Escape.
+reasonKeys : List String
+reasonKeys =
+    List.filter (\key -> key /= "Enter" && key /= "Escape") allKeys
+
+
+-- A render's key offers follow what it draws: no queue page draws nothing,
+-- an open panel draws its row, a card whose source read is in flight draws
+-- the card with no offer, and a queue still loading draws no card. Across
+-- every fixture the offers name a panel row exactly when the page draws the
+-- panel's reason field or Confirm. Red if a page gate is dropped, or if the
+-- keys' panel predicate drifts from the view's.
+keyOffersFollowTheDrawing : Reshown -> Bool
+keyOffersFollowTheDrawing r =
+    let
+        ua =
+            r.a.unit.uid
+
+        ( shown, reloaded ) =
+            reshownCard r
+
+        history =
+            after r.settings [ ShowHistory ] shown
+
+        unitPage =
+            after r.settings [ Navigated (unitAt ua) ] shown
+
+        opened =
+            after r.settings (drawnOn shown ua RefuseStart) shown
+
+        reading =
+            { shown | selectedView = ViewLoading { uid = ua, wanted = Nothing, fresh = True, owner = r.settings.epoch } }
+
+        loading =
+            after r.settings [ NextPage Index.Start ] shown
+
+        listed =
+            withRefusal r.file reloaded
+
+        fileOpened =
+            after r.settings (drawnOn listed r.file.uid RefuseStart) listed
+    in
+    offers shown ua
+        && history.page == HistoryPage
+        && loading.queueState == Loading
+        && App.keyOffers history == App.NothingDrawn
+        && App.keyOffers unitPage == App.NothingDrawn
+        && App.keyOffers opened == App.PanelDrawn (App.decidableRow shown ua)
+        && App.keyOffers reading == App.CardsDrawn (Just { uid = ua, offer = Nothing })
+        && App.keyOffers loading == App.CardsDrawn Nothing
+        && App.keyOffers shown == App.CardsDrawn (Just { uid = ua, offer = App.decidableRow shown ua })
+        && panelKeysDrawn fileOpened
+        && List.all (\m -> panelKeysDrawn m == panelDrawn (page m)) [ shown, reloaded, history, unitPage, opened, reading, loading, listed, fileOpened ]
+
+
+-- A key's mode over every drawn offer and every receipt: off the queue page
+-- at receipt, or with nothing drawn, no key acts; a drawn panel is read as
+-- that panel on every queue-page receipt; a drawn card is read as an undrawn
+-- panel while a panel is open at receipt, as shortcuts on that card over the
+-- cards held, and as nothing while the queue loads. Red if any precedence of
+-- `App.keyMode` moves.
+keyModeTable : Reshown -> Bool
+keyModeTable r =
+    let
+        ua =
+            r.a.unit.uid
+
+        shown =
+            queueModel [ r.a, r.b ] (ViewShown r.a)
+
+        rowA =
+            App.decidableRow shown ua
+
+        cardA =
+            { uid = ua, offer = rowA }
+
+        history =
+            after r.settings [ ShowHistory ] shown
+
+        opened =
+            after r.settings (drawnOn shown ua RefuseStart) shown
+
+        loading =
+            after r.settings [ NextPage Index.Start ] shown
+
+        onQueue =
+            [ opened, shown, loading ]
+
+        cell =
+            \drawn receipt expected -> Just (App.keyMode drawn receipt) == expected
+
+        dormant =
+            Just Keys.Dormant
+
+        onCards =
+            \card -> Maybe.map (Keys.OnCards card) (Keys.position 0 2)
+    in
+    rowA /= Nothing
+        && history.page == HistoryPage
+        && Queue.openPanel opened.decision /= Nothing
+        && loading.queueState == Loading
+        && List.all (\drawn -> cell drawn history dormant) [ App.NothingDrawn, App.PanelDrawn rowA, App.PanelDrawn Nothing, App.CardsDrawn (Just cardA), App.CardsDrawn Nothing ]
+        && List.all (\receipt -> cell App.NothingDrawn receipt dormant) onQueue
+        && List.all (\receipt -> cell (App.PanelDrawn rowA) receipt (Just (Keys.InPanel rowA))) onQueue
+        && List.all (\receipt -> cell (App.PanelDrawn Nothing) receipt (Just (Keys.InPanel Nothing))) onQueue
+        && cell (App.CardsDrawn (Just cardA)) opened (Just (Keys.InPanel Nothing))
+        && cell (App.CardsDrawn (Just cardA)) shown (onCards (Just cardA))
+        && cell (App.CardsDrawn (Just cardA)) loading dormant
+        && cell (App.CardsDrawn Nothing) opened (Just (Keys.InPanel Nothing))
+        && cell (App.CardsDrawn Nothing) shown (onCards Nothing)
+        && cell (App.CardsDrawn Nothing) loading dormant
+
+
+-- Every key pressed on a History render and received on the queue page, or
+-- pressed on the queue page and received on History, leaves the model as it
+-- was. Red without either page gate.
+keysPressedOffTheQueuePageActNowhere : Reshown -> Bool
+keysPressedOffTheQueuePageActNowhere r =
+    let
+        shown =
+            queueModel [ r.a, r.b ] (ViewShown r.a)
+
+        history =
+            after r.settings [ ShowHistory ] shown
+    in
+    history.page == HistoryPage
+        && (after r.settings [ press shown "j" ] shown).selected == 1
+        && List.all (\key -> after r.settings [ press history key ] shown == shown) allKeys
+        && List.all (\key -> after r.settings [ press shown key ] history == history) allKeys
+
+
+-- Escape pressed on a render whose panel was open on `a`, and Cancel drawn
+-- on `a`'s panel, each received after the panel moved to the listed file,
+-- leave the file's panel and its draft; Escape pressed on the file's panel
+-- closes it. Red if a cancel closes whatever panel is open.
+staleCancelKeepsAnotherPanel : Reshown -> Bool
+staleCancelKeepsAnotherPanel r =
+    let
+        ua =
+            r.a.unit.uid
+
+        fu =
+            r.file.uid
+
+        listed =
+            withRefusal r.file (queueModel [ r.a, r.b ] (ViewShown r.a))
+
+        onA =
+            after r.settings (drawnOn listed ua RefuseStart) listed
+
+        onFile =
+            after r.settings (drawnOn onA fu RefuseStart) onA
+
+        fileDrafted =
+            after r.settings (draftOn onFile fu "not ours") onFile
+    in
+    panelKeysDrawn onA
+        && Queue.openPanel fileDrafted.decision == Just ( fu, { refuseDraft = Draft.draft "not ours", refuseError = Nothing } )
+        && after r.settings [ press onA "Escape" ] fileDrafted == fileDrafted
+        && after r.settings (drawnOn onA ua RefuseCancel) fileDrafted == fileDrafted
+        && Queue.openPanel (after r.settings [ press fileDrafted "Escape" ] fileDrafted).decision == Nothing
+
+
+-- A reason typed into the panel drawn on `a`'s first digest, received after
+-- the panel reopened on `a2`, leaves `a2`'s draft empty; the edit typed into
+-- the `a2` panel lands. Red if an edit lands by uid alone.
+staleDraftEditLandsNowhere : Reshown -> Bool
+staleDraftEditLandsNowhere r =
+    let
+        ua =
+            r.a.unit.uid
+
+        ( shown, reloaded ) =
+            reshownCard r
+
+        reopened =
+            after r.settings (drawnOn reloaded ua RefuseStart) reloaded
+    in
+    offers shown ua
+        && App.decidableRow shown ua /= App.decidableRow reloaded ua
+        && Queue.openPanel reopened.decision == Just ( ua, { refuseDraft = Draft.empty, refuseError = Nothing } )
+        && after r.settings (draftOn shown ua "x") reopened == reopened
+        && Queue.openPanel (after r.settings (draftOn reopened ua "x") reopened).decision == Just ( ua, { refuseDraft = Draft.draft "x", refuseError = Nothing } )
+
+
+-- Navigation moves from where the selection stands when the key arrives:
+-- `j` pressed twice on one render of three cards selects the third, and `g`
+-- then selects the first.
+navigationComposesBeforeRedraw : Reshown -> Bool
+navigationComposesBeforeRedraw r =
+    let
+        three =
+            queueModel [ r.a, r.b, renamed "u-c" r.b ] (ViewShown r.a)
+
+        twice =
+            after r.settings [ press three "j", press three "j" ] three
+    in
+    twice.selected == 2
+        && (after r.settings [ press three "g" ] twice).selected == 0
+
+
+-- Escape pressed on the render before a panel opened, received with the
+-- panel open, keeps the panel and its draft; Escape pressed on the panel's
+-- render closes it. Red if the receipt panel yields a payload.
+escapeBeforePanelDrawnKeepsPanel : Reshown -> Bool
+escapeBeforePanelDrawnKeepsPanel r =
+    let
+        ua =
+            r.a.unit.uid
+
+        shown =
+            queueModel [ r.a, r.b ] (ViewShown r.a)
+
+        drafted =
+            after r.settings (drawnOn shown ua RefuseStart ++ draftOn shown ua "needs a test") shown
+    in
+    Queue.openPanel drafted.decision == Just ( ua, { refuseDraft = Draft.draft "needs a test", refuseError = Nothing } )
+        && after r.settings [ press shown "Escape" ] drafted == drafted
+        && Queue.openPanel (after r.settings [ press drafted "Escape" ] drafted).decision == Nothing
 
 
 -- `decisionTask` binds the offer's digest on its own: an offer of `a` run
@@ -2280,6 +2530,13 @@ reshownRows r unitDrift fileDrift =
     , ( "a refusal drawn before the source was read again opens no panel", staleRefuseStartOpensNoPanel r )
     , ( "Confirm submits only the panel row its render drew", confirmRefuseBindsDrawnPanelRow r )
     , ( "a key typed into a refusal panel records nothing after the panel closes or before it is drawn", panelKeysNeverDecideAcrossPanelDrawing r )
+    , ( "a render's key offers follow what it draws", keyOffersFollowTheDrawing r )
+    , ( "a key's mode follows the drawn offer and the receipt by precedence", keyModeTable r )
+    , ( "a key pressed or received off the queue page acts nowhere", keysPressedOffTheQueuePageActNowhere r )
+    , ( "a cancel drawn on one panel keeps another panel open", staleCancelKeepsAnotherPanel r )
+    , ( "a reason typed into a panel since reopened lands nowhere", staleDraftEditLandsNowhere r )
+    , ( "navigation keys compose before the page redraws", navigationComposesBeforeRedraw r )
+    , ( "Escape pressed before a panel was drawn keeps the panel", escapeBeforePanelDrawnKeepsPanel r )
     , ( "a decision task binds the drawn source and digest before any read", reshownTaskRefusals unitDrift fileDrift )
     ]
 

@@ -1164,14 +1164,10 @@ decisionControls controls uid offered =
 -- itself: its open refusal panel, or its approve control beside Refuse.
 offeredControls : RefuseControls -> Queue.DecidableRow -> Ui.Element Msg
 offeredControls controls row =
-    let
-        uid =
-            Queue.rowUid row
-    in
     case controls.panel of
         Just ( open, draft ) ->
             if open == row then
-                refusePanel uid draft (RefuseSubmit row)
+                refusePanel row draft
 
             else
                 offeredButtons row
@@ -1226,10 +1222,10 @@ refuseButton label msg =
         { onPress = Just msg, label = safeText label }
 
 
--- The refusal reason input of the panel open on `uid` with Confirm, which
--- sends `submit`, and Cancel.
-refusePanel : Uid -> Queue.Draft -> Msg -> Ui.Element Msg
-refusePanel uid draft submit =
+-- The refusal reason input of the panel open on `row`, with Confirm and
+-- Cancel; its draft, Confirm and Cancel all name that one row.
+refusePanel : Queue.DecidableRow -> Queue.Draft -> Ui.Element Msg
+refusePanel row draft =
     Ui.column
         [ Ui.width (Ui.px 240), Ui.spacing 6 ]
         [ Input.text
@@ -1239,7 +1235,7 @@ refusePanel uid draft submit =
             ]
             { label = Input.labelAbove [ Font.size 11 ] (Ui.text "Reason")
             , text = Draft.draftText draft.refuseDraft
-            , onChange = RefuseDraft uid
+            , onChange = RefuseDraft row
             , placeholder = Just (Input.placeholder [ Font.size 12 ] (Ui.text "Why refuse?"))
             }
         , case draft.refuseError of
@@ -1250,7 +1246,7 @@ refusePanel uid draft submit =
                 Ui.none
         , Ui.row
             [ Ui.spacing 8 ]
-            [ refuseButton (SafeText.literal "Confirm") submit
+            [ refuseButton (SafeText.literal "Confirm") (RefuseSubmit row)
             , Ui.button
                 [ Ui.paddingXY 10 5
                 , Background.color (Ui.rgb 55 55 70)
@@ -1258,7 +1254,7 @@ refusePanel uid draft submit =
                 , Font.size 12
                 , Font.color (Ui.rgb 200 200 210)
                 ]
-                { onPress = Just RefuseCancel, label = Ui.text "Cancel" }
+                { onPress = Just (RefuseCancel row), label = Ui.text "Cancel" }
             ]
         ]
 
