@@ -951,10 +951,7 @@ pub fn emit_enum(ctx: &EmitCtx, def: &EnumDef) -> DResult<String> {
     let params: Vec<String> = (1..=def.type_params.len())
         .map(|i| format!("T{i}"))
         .collect();
-    // `: 'static` closes a BARE type parameter (`T1: 'static`); `+ 'static`
-    // extends an existing trait-bound list (`T1: IpeStringify + … + 'static`).
-    let decl_static = if params_need_static { ": 'static" } else { "" };
-    let bound_static = if params_need_static { " + 'static" } else { "" };
+    let (decl_static, bound_static) = carrier_static_bounds(params_need_static);
     let (decl_clause, impl_bounds, use_clause) = if params.is_empty() {
         (String::new(), String::new(), String::new())
     } else {
@@ -1307,6 +1304,21 @@ fn emit_enum_clone_impl(
     ))
 }
 
+/// The `'static` bounds a type declaration storing a `dyn Fn` carrier puts on
+/// each of its own parameters, or none when `need` is false.
+///
+/// The first closes a bare parameter (`T1: 'static`), the second extends a
+/// trait-bound list (`T1: IpeStringify + 'static`). A trait object with a type
+/// parameter in its signature requires that parameter to outlive `'static`;
+/// the bound is the carrier's, so no caller obliges it.
+const fn carrier_static_bounds(need: bool) -> (&'static str, &'static str) {
+    if need {
+        (": 'static", " + 'static")
+    } else {
+        ("", "")
+    }
+}
+
 /// Does this enum store a function on the `Arc<dyn Fn(..) -> Tn + … + 'static>`
 /// (`SharedFun`) carrier — the one tier whose type parameters need a `'static`
 /// bound (a trait object with a type parameter in its param/return positions
@@ -1418,8 +1430,7 @@ pub fn emit_record_struct(ctx: &EmitCtx, rec: &RecordStruct) -> DResult<String> 
     // (`enum_stores_shared_fun`): a fully-derivable record has no function
     // payload, so it is unaffected — no `'static` bound, byte-identical to before.
     let params_need_static = rec.is_clone && !rec.is_derivable;
-    let decl_static = if params_need_static { ": 'static" } else { "" };
-    let bound_static = if params_need_static { " + 'static" } else { "" };
+    let (decl_static, bound_static) = carrier_static_bounds(params_need_static);
 
     // Generic clauses: `<T1, T2>` on the struct, `<T1: IpeStringify, …>`
     // on the impl, `<T1, T2>` on the impl's `for` type. All empty when the record
