@@ -1,10 +1,10 @@
-//! SEAL: a row variable forwarded into a `Task`-returning callee inherits `Send + 'static`.
+//! SEAL: a `Task`-returning function's row variable carries `Send + 'static`.
 //!
-//! `greet` returns a `Task` and moves its row-polymorphic record into a boxed
-//! `Send` continuation, so its row variable needs `Send + 'static`; the pure
-//! `greetings` forwards its own row variable into `greet`. Row variables join
-//! the cross-call fixpoint, so `greetings`'s clause carries the bound; without
-//! it the emitted crate is ipe-accepted but fails `cargo build` with E0277.
+//! `greet` returns a `Task` and reads its row-polymorphic record, so the
+//! lowerer's signature rule gives the row variable `Send + 'static` and the
+//! emitted clause renders exactly that set. Forwarding the record into another
+//! function is refused at ipe time (IPE-L0131), pinned by the `ipe_lower` unit
+//! test `task_returning_row_variable_inherits_send`.
 //!
 //! The emit gate asserts the bounds on the emitted signatures; under
 //! `IPE_E2E=1` the program is built, run, and its stdout matched against
@@ -15,10 +15,7 @@ use std::path::{Path, PathBuf};
 const GOLDEN: &str = "generic_bound_task_row";
 
 /// Each `Main` function and the bounds its emitted clause must carry.
-const BOUNDS: &[(&str, &[&str])] = &[
-    ("greet", &["R1: 'static + Send"]),
-    ("greetings", &["R1: 'static + Send"]),
-];
+const BOUNDS: &[(&str, &[&str])] = &[("greet", &["R1: 'static + Send"])];
 
 fn fixture_dir(root: &Path) -> PathBuf {
     root.join("tests").join("golden").join(GOLDEN)
@@ -43,7 +40,7 @@ fn signature_of<'a>(emitted: &'a str, ipe_name: &str) -> Option<&'a str> {
     })
 }
 
-/// Emit gate: both row variables carry `Send + 'static`.
+/// Emit gate: the row variable carries `Send + 'static`.
 #[test]
 fn generic_bound_task_row_bounds_emitted() {
     let root = crate::support::repo_root();

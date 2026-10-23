@@ -460,6 +460,32 @@ pub fn emit_shared_lambda(
     ))
 }
 
+/// Render the auto-trait bounds `bounds` carries, lifetime first:
+/// `'static`, then `Send`, then `Sync`.
+///
+/// The one place a generic clause spells an auto-trait from a [`BoundSet`]:
+/// type and row generics alike render through it, so a clause carries exactly
+/// the auto-traits the lowerer finalized. Rust requires the lifetime bound to
+/// precede every trait bound (`T{n}: 'static + Send`). Every concrete Ipê type
+/// is owned and never borrows, so it satisfies all three — the bounds cost no
+/// call site. `'static` serves a value boxed as `Box<dyn Fn(..) + Send +
+/// 'static>`, `Send` a value moved into a `Send` closure (an `IpeSub::Source`
+/// or a spawned task), and `Sync` a value behind a `Send + Sync` shared carrier
+/// (the optional-decoder runtime slots).
+fn render_auto_traits(bounds: BoundSet) -> Vec<String> {
+    let mut traits = Vec::with_capacity(3);
+    if bounds.has_static() {
+        traits.push("'static".to_owned());
+    }
+    if bounds.has_send() {
+        traits.push("Send".to_owned());
+    }
+    if bounds.has_sync() {
+        traits.push("Sync".to_owned());
+    }
+    traits
+}
+
 /// Render one type parameter's trailing bound clause for the generic list:
 /// `: ::core::ops::Add<Output = T{n}> + Copy` and the like, or the empty string
 /// for an unbounded variable (so a structurally-parametric function emits a
@@ -475,37 +501,7 @@ pub fn render_bounds(bounds: BoundSet, n: usize) -> String {
     if bounds.is_unbounded() {
         return String::new();
     }
-    let mut traits = Vec::new();
-    if bounds.has_static() {
-        // Boxed-callback `'static` lifetime bound: a generic type-param
-        // that flows into a value boxed as `Box<dyn Fn(..) -> .. + Send +
-        // 'static>` (a callback passed to `List.map` etc.) whose own type still
-        // mentions that type-param requires `tv: 'static` for the trait-object
-        // coercion. A LIFETIME bound — Rust requires it to PRECEDE every trait
-        // bound in the list (`T{n}: 'static + Clone`), so it is pushed FIRST.
-        // Satisfied by every concrete Ipê type (emitted values never borrow),
-        // so no caller-side failure — see `BoundSet::STATIC`.
-        traits.push("'static".to_owned());
-    }
-    if bounds.has_send() {
-        // `Send` auto-trait: a bare `msg` value moved into a `IpeSub::Source`
-        // closure (`Box<dyn FnOnce(..) + Send>`) — e.g. `WebSocket.onOpen`'s
-        // `msg` into `sub_subscribe_ws_open<M: Send + 'static>`. Pushed after the
-        // `'static` lifetime bound (a lifetime must precede trait bounds).
-        // Satisfied by every concrete Ipê type (owned, never borrows).
-        traits.push("Send".to_owned());
-    }
-    if bounds.has_sync() {
-        // `Sync` auto-trait: a generic type-param whose value is captured behind
-        // a `Send + Sync` shared carrier that requires the element `Sync` — the
-        // optional-decoder runtime slots (`decode_pipeline_optional`,
-        // `db_decode_optional`), whose element param is bounded `Send + Sync`.
-        // Pushed right after `Send` (auto-traits precede the operator traits);
-        // fully qualified since `Sync` — like `Send` — is in the prelude, so the
-        // bare name is enough. Satisfied by every concrete Ipê type (owned data
-        // is trivially `Sync`).
-        traits.push("Sync".to_owned());
-    }
+    let mut traits = render_auto_traits(bounds);
     if bounds.has_add() {
         // Wrapping addition so `T{n} + T{n}` in a generic body does not panic
         // under `overflow-checks=on` when the call site monomorphises to i64.
@@ -1478,17 +1474,8 @@ pub fn render_fn_generics(
     // proved at every call site, so exit-0 ⇒ cargo-green.
     for (i, row) in func.row_params.iter().enumerate() {
         let n = i.saturating_add(1);
-        let mut bounds: Vec<String> = Vec::with_capacity(row.fields.len() + 4);
-        // The lifetime bound must precede every trait bound (`R{n}: 'static + …`).
-        if row.bounds.has_static() {
-            bounds.push("'static".to_owned());
-        }
-        if row.bounds.has_send() {
-            bounds.push("Send".to_owned());
-        }
-        if row.bounds.has_sync() {
-            bounds.push("Sync".to_owned());
-        }
+        let mut bounds = render_auto_traits(row.bounds);
+        bounds.reserve(row.fields.len().saturating_add(1));
         for (field_sym, field_ty) in &row.fields {
             let field_name = ctx.resolve_ident(*field_sym)?;
             let trait_name = crate::naming::field_witness_trait_name(field_name);

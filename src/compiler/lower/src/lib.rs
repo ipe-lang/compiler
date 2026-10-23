@@ -593,6 +593,30 @@ mod tests {
         Some((func, i))
     }
 
+    /// Lower a free-standing module and return the [`ipe_ir::Func`] of `which`,
+    /// or the stage that refused it.
+    ///
+    /// A test reading bounds off the result must fail on the stage, never read
+    /// a refusal as "no bound".
+    fn lower_func_staged(source: &str, which: &str) -> Result<(ipe_ir::Func, Interner), String> {
+        let mut i = Interner::new();
+        let src = ipe_parse::parse_module(source, &mut i).map_err(|e| format!("parse: {e:?}"))?;
+        let m = ipe_canon::canonicalise(&src, &mut i).map_err(|e| format!("canon: {e:?}"))?;
+        let types = ipe_types::infer(&m, &mut i).map_err(|e| format!("infer: {e:?}"))?;
+        let program = lower(&m, &types, &mut i, "", "").map_err(|e| format!("lower: {e:?}"))?;
+        let module = program
+            .modules
+            .into_iter()
+            .next()
+            .ok_or_else(|| "no module".to_owned())?;
+        let func = module
+            .funcs
+            .into_iter()
+            .find(|f| i.resolve(f.name) == Some(which))
+            .ok_or_else(|| format!("no func `{which}`"))?;
+        Ok((func, i))
+    }
+
     #[test]
     fn tuple_parameter_lowers_to_synthetic_binder_plus_destructure() {
         // `fst (a, b) = a` — the tuple parameter has no single name, so it
@@ -1482,59 +1506,76 @@ mod tests {
         );
     }
 
-    /// A pure caller forwarding a row-generic record into a `Task`-returning
-    /// callee: the row variable's `Send + 'static` joins the fixpoint.
+    /// A `Task`-returning function's row variable carries `Send + 'static`,
+    /// and a caller forwarding that record into it is refused at ipe time.
+    ///
+    /// The refusal is what keeps a forwarder's clause from missing the bound:
+    /// a row value read anywhere but as a field receiver is IPE-L0131. The
+    /// fixture reaches `Task` through a kernel qualifier (`Ipe.Process`),
+    /// since the single-module harness resolves no compiled-source module.
     #[test]
-    fn row_variable_forwarded_into_task_callee_inherits_send() {
-        let src = "module Main exposing (greetings)\n\
-                   import Ipe.Task as Task\n\
-                   greet : { r | name : String } -> Task Error String\n\
-                   greet rec =\n\
-                   \x20   Task.succeed rec.name\n\
-                   greetings : { r | name : String } -> List (Task Error String)\n\
-                   greetings rec =\n\
-                   \x20   [ greet rec, greet rec ]\n";
-        let row_bounds = |name: &str| {
-            lower_func(src, name)
-                .and_then(|(func, _)| func.row_params.first().map(|row| row.bounds))
-                .is_some_and(|bounds| bounds.has_send() && bounds.has_static())
-        };
+    fn task_returning_row_variable_inherits_send() {
+        let greet = "module Main exposing (greet)\n\
+                     import Ipe.Process as Process\n\
+                     greet : { r | name : String } -> Task Error String\n\
+                     greet rec =\n\
+                     \x20   Process.run rec.name []\n";
+        let bounds = lower_func_staged(greet, "greet")
+            .map(|(func, _)| func.row_params.first().map(|row| row.bounds));
         assert!(
-            row_bounds("greet"),
-            "a `Task`-returning function's row variable must carry `Send + 'static` in the IR"
+            matches!(bounds, Ok(Some(b)) if b.has_send() && b.has_static()),
+            "a `Task`-returning function's row variable must carry `Send + 'static` in the IR, got {bounds:?}"
+        );
+        let forwarded = lower_result(
+            "module Main exposing (greetings)\n\
+             import Ipe.Process as Process\n\
+             greet : { r | name : String } -> Task Error String\n\
+             greet rec =\n\
+             \x20   Process.run rec.name []\n\
+             greetings : { r | name : String } -> List (Task Error String)\n\
+             greetings rec =\n\
+             \x20   [ greet rec, greet rec ]\n",
         );
         assert!(
-            row_bounds("greetings"),
-            "`greetings` forwards its row into `greet` and must inherit `Send + 'static`"
+            matches!(
+                forwarded,
+                Err(Diagnostic::Lower {
+                    msg: LowerError::Unsupported(Feature::RowPolyRecordAnnotation),
+                    ..
+                })
+            ),
+            "a row value forwarded into another function must be IPE-L0131, got {forwarded:?}"
         );
     }
 
     /// A forwarder whose callee is bounded only by its return's UI message:
-    /// `label` renders `badge`, whose `msg` needs `'static`.
+    /// `label` inspects `badge`, whose `msg` needs `'static`.
+    ///
+    /// `Html` is the builtin type constructor, so the fixture needs no
+    /// compiled-source module the single-module harness cannot resolve.
     #[test]
     fn forwarder_into_ui_message_helper_inherits_static() {
         let src = "module Main exposing (label)\n\
-                   import Ipe.Html as Html\n\
-                   badge : Maybe msg -> Html.Html msg\n\
+                   badge : Maybe msg -> Html msg\n\
                    badge m =\n\
-                   \x20   case m of\n\
-                   \x20       Just _ -> Html.text \"some\"\n\
-                   \x20       Nothing -> Html.text \"none\"\n\
+                   \x20   badge m\n\
                    label : Maybe msg -> String\n\
                    label m =\n\
-                   \x20   Html.render (badge m)\n";
-        let is_static = |name: &str| {
-            lower_func(src, name)
-                .and_then(|(func, i)| generic_bounds(&func, &i, "msg"))
-                .is_some_and(ipe_ir::BoundSet::has_static)
+                   \x20   case badge m of\n\
+                   \x20       _ ->\n\
+                   \x20           \"badge\"\n";
+        let msg_bounds = |name: &str| {
+            lower_func_staged(src, name).map(|(func, i)| generic_bounds(&func, &i, "msg"))
         };
+        let badge = msg_bounds("badge");
         assert!(
-            is_static("badge"),
-            "a UI-carrier message generic must carry `'static` in the IR"
+            matches!(badge, Ok(Some(b)) if b.has_static()),
+            "a UI-carrier message generic must carry `'static` in the IR, got {badge:?}"
         );
+        let label = msg_bounds("label");
         assert!(
-            is_static("label"),
-            "`label` instantiates `badge`'s `'static` message and must inherit it"
+            matches!(label, Ok(Some(b)) if b.has_static()),
+            "`label` instantiates `badge`'s `'static` message and must inherit it, got {label:?}"
         );
     }
 
