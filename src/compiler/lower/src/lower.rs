@@ -34695,12 +34695,14 @@ mod tests {
     #[test]
     fn a_free_parameter_in_and_outside_a_message_slot_is_refused() {
         let (msg, pin) = render_use_pin(|view_web, m| Ty::Tuple(vec![view_web(m.clone()), m]));
-        let ipe_ir::CallPin::User(pins) = pin else {
-            panic!("the mixed parameter must be pinned, got {pin:?}");
-        };
+        let refused = matches!(
+            &pin,
+            ipe_ir::CallPin::User(pins)
+                if matches!(pins.get(&msg), Some(ipe_ir::UserPin::Unlowered(_)))
+        );
         assert!(
-            matches!(pins.get(&msg), Some(ipe_ir::UserPin::Unlowered(_))),
-            "a mixed free parameter must be refused, got {pins:?}"
+            refused,
+            "a mixed free parameter must be refused, got {pin:?}"
         );
     }
 
