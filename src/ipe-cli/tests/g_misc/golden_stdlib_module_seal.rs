@@ -894,8 +894,8 @@ fn a_mixed_message_parameter_fixed_by_its_page_builds_and_runs() {
 
 // ── A generic only the return names, left open beside a sibling default ──
 
-/// `mk`'s `e` is named by its return's error slot alone: the use pins it to
-/// the project error the `Ok 4` sibling's wrapper fixes. `pick` keeps `e`
+/// `mk`'s `e` is named by its return's error slot alone, so the use pins
+/// nothing and the `Ok 4` sibling's wrapper fixes it. `pick` keeps `e`
 /// generic, so its own `Ok 4` stays `IpeResult::Ok` over that generic.
 const OPEN_RESULT_ERROR_MAIN: &str = "module Main exposing (main)
 import Ipe.Io as Io

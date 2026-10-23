@@ -20,7 +20,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use ipe_canon::ast as canon;
 use ipe_diagnostics::{
     DResult, Diagnostic, Feature, GenericAppEntryReach, InterceptContext, Located, LowerError,
-    MainRetName, NameError, OpenVarUse, Span, StoreEqAccessorDefect, StoreSelectProjectionDefect,
+    MainRetName, NameError, Span, StoreEqAccessorDefect, StoreSelectProjectionDefect,
 };
 use ipe_intern::{Interner, Symbol, SynthStem};
 use ipe_ir::free_vars::{
@@ -80,10 +80,11 @@ use record_shapes::{
     is_websocket_cfg_shape, ty_is_int,
 };
 use ty_templates::{
-    GroundTy, canon_type_contains_record_key_set, declared_vars, generic_binding_breaks_clone,
+    GroundTy, argument_vars, canon_type_contains_record_key_set, generic_binding_breaks_clone,
     match_signature_template, ty_contains_fun, ty_contains_record_key_set, ty_fields_mention_var,
     ty_has_fun_in_derive_carrier,
 };
+use ui_msg_slots::OpenVarUse;
 
 /// One lowered function parameter: its (possibly synthetic) binder name and its
 /// IR type.
@@ -24702,51 +24703,27 @@ impl<'a> Lowerer<'a> {
             .map(|at| (at, OpenVarUse::ResultError))
     }
 
-    /// The pin type of a callee parameter its declared positions use as
-    /// `roles`, instantiated by this use to `ty`, or the refusal naming the
-    /// callee `callee` and the parameter `var`.
+    /// The pin of a callee parameter `var` a declared argument names, which
+    /// this use instantiates to `ty`.
     ///
-    /// An instance an open variable or a wildcard reads by its position
-    /// ([`ui_msg_slots::open_var_ir`]): one use gives one reading, two uses
-    /// give two and are refused. A UI message use reads a compound instance by
-    /// its own reader, so a compound naming an open variable is refused beside
-    /// it too. Any other instance reads the same at every position.
-    fn open_param_pin(
-        &self,
-        roles: Option<&BTreeSet<OpenVarUse>>,
-        ty: &Ty,
-        callee: Symbol,
-        var: Symbol,
-        span: Span,
-    ) -> UserPin {
-        let open = match ty {
-            Ty::Wildcard => true,
-            Ty::Var(raw) => matches!(self.owned_var_read(*raw), OwnedVarRead::Lenient),
-            Ty::Unit | Ty::Fun(..) | Ty::Con { .. } | Ty::Tuple(_) | Ty::Record(..) => false,
-        };
-        let mut each = roles.into_iter().flatten().copied();
-        match (each.next(), each.next()) {
-            (Some(first), Some(second))
-                if open
-                    || (roles.is_some_and(|r| r.contains(&OpenVarUse::UiMessage))
-                        && self.ty_mentions_position_read_var(ty)) =>
-            {
-                let text =
-                    |s: Symbol| -> Box<str> { self.interner.resolve(s).unwrap_or("_").into() };
-                UserPin::Unlowered(Box::new(Diagnostic::Lower {
-                    span,
-                    msg: LowerError::MixedOpenParameter {
-                        callee: text(callee),
-                        var: text(var),
-                        uses: [first, second],
-                    },
-                }))
-            }
-            (Some(only), None) if open => UserPin::Instance(ui_msg_slots::open_var_ir(only)),
-            (Some(_) | None, _) => match self.ir_type_from_ty_json(ty, span) {
-                Ok(lowered) => UserPin::Instance(lowered),
-                Err(refusal) => UserPin::Unlowered(Box::new(refusal)),
-            },
+    /// A concrete instance pins itself. An open one (a variable each position
+    /// reads its own way, or a wildcard, anywhere inside it) has no reading
+    /// the use fixes: it is [`UserPin::Open`], settled against the callee's
+    /// emitted signature, and holds the refusal naming `callee` and `var`.
+    fn argument_param_pin(&self, ty: &Ty, callee: Symbol, var: Symbol, span: Span) -> UserPin {
+        if self.ty_mentions_position_read_var(ty) {
+            let text = |s: Symbol| -> Box<str> { self.interner.resolve(s).unwrap_or("_").into() };
+            return UserPin::Open(Box::new(Diagnostic::Lower {
+                span,
+                msg: LowerError::UninferableErasedParameter {
+                    callee: text(callee),
+                    var: text(var),
+                },
+            }));
+        }
+        match self.ir_type_from_ty_json(ty, span) {
+            Ok(lowered) => UserPin::Instance(lowered),
+            Err(refusal) => UserPin::Unlowered(Box::new(refusal)),
         }
     }
 
@@ -24815,14 +24792,15 @@ impl<'a> Lowerer<'a> {
     ///   reads), or the `any` return marker, which this use leaves free
     ///   ([`Self::ty_is_unbound_free`]): pinned to `()`, the type the use's own
     ///   node type lowered that slot to;
-    /// * every other one the declared type names anywhere on its spine,
-    ///   arguments past the emitted arity and the return included: pinned to
-    ///   the use's solved instantiation ([`Self::open_param_pin`]), an open
-    ///   variable read by its declared position as the readers read it there.
-    ///   The backend renders it only when no emitted parameter of the callee
-    ///   names it, so the pin set never depends on the callee's Rust arity.
-    ///   One whose positions read an open variable two ways, left open by
-    ///   this use, has no single reading and is refused when it renders.
+    /// * every other one a declared argument names, arguments past the
+    ///   emitted arity included: pinned to the use's solved instantiation
+    ///   ([`Self::argument_param_pin`]). The pin renders only when no emitted
+    ///   parameter of the callee names it, so the pin set never depends on the
+    ///   callee's Rust arity; an open instantiation is settled against the
+    ///   callee's emitted return.
+    ///
+    /// A parameter only the declared return names is left to the use's
+    /// expected type, as every other generic call is.
     ///
     /// Any other callee, or an instantiation the template match cannot align,
     /// pins nothing.
@@ -24862,11 +24840,11 @@ impl<'a> Lowerer<'a> {
             )
         };
         let mut pins: BTreeMap<Symbol, UserPin> = BTreeMap::new();
-        for raw in declared_vars(declared).difference(&msg_only) {
+        for raw in argument_vars(declared).difference(&msg_only) {
             let (Some(sym), Some(ty)) = (name_of(*raw), subst.get(raw)) else {
                 continue;
             };
-            let pin = self.open_param_pin(uses.get(raw), ty, *name, sym, callee.span);
+            let pin = self.argument_param_pin(ty, *name, sym, callee.span);
             pins.insert(sym, pin);
         }
         let free_msg = msg_only
@@ -34990,42 +34968,55 @@ mod tests {
         );
     }
 
-    /// A parameter in a message slot and outside one, left free, has no single
-    /// reading: its pin is refused, never `JsonVal` beside an `Element<()>`.
+    /// A parameter only the declared return names, in a message slot and
+    /// outside one, is left to the use's expected type: no pin, never a
+    /// reading the return then contradicts.
     #[test]
-    fn a_free_parameter_in_and_outside_a_message_slot_is_refused() {
-        let (msg, pin) = render_use_pin(
+    fn a_return_only_parameter_in_and_outside_a_message_slot_pins_nothing() {
+        let (_, pin) = render_use_pin(
             |view_web, _, m| Ty::Tuple(vec![view_web(m.clone()), m]),
             None,
         );
-        let refused = matches!(
+        assert_eq!(pin, ipe_ir::CallPin::None);
+    }
+
+    /// A parameter only the declared return names, in a `Result` error slot,
+    /// is left to the use's expected type: no pin.
+    #[test]
+    fn a_return_only_result_error_parameter_pins_nothing() {
+        let (_, pin) = render_use_pin(|_, result_of, m| result_of(m, Ty::Unit), None);
+        assert_eq!(pin, ipe_ir::CallPin::None);
+    }
+
+    /// A parameter a declared argument names, left open by the use, is an
+    /// open pin holding the refusal that names the callee and the variable.
+    #[test]
+    fn an_open_argument_parameter_is_an_open_pin_holding_its_refusal() {
+        let (msg, pin) = render_use_pin(|_, _, m| Ty::Fun(Box::new(m), Box::new(Ty::Unit)), None);
+        let open = matches!(
             &pin,
             ipe_ir::CallPin::User(pins)
                 if matches!(
                     pins.get(&msg),
-                    Some(ipe_ir::UserPin::Unlowered(d)) if matches!(
+                    Some(ipe_ir::UserPin::Open(d)) if matches!(
                         &**d,
                         super::Diagnostic::Lower {
                             span: RENDER_CALL_SPAN,
-                            msg: super::LowerError::MixedOpenParameter { callee, var, uses },
+                            msg: super::LowerError::UninferableErasedParameter { callee, var },
                         } if &**callee == "render" && &**var == "msg"
-                            && *uses == [super::OpenVarUse::UiMessage, super::OpenVarUse::Value]
                     )
                 )
         );
-        assert!(
-            refused,
-            "a mixed free parameter must be refused naming the callee and the variable, got {pin:?}"
-        );
+        assert!(open, "got {pin:?}");
     }
 
-    /// A mixed parameter instantiated to a variable the enclosing signature
-    /// erased to `()` reads `()` at every position, so its pin is `()`, not a
-    /// refusal.
+    /// A parameter a declared argument names, instantiated to a variable the
+    /// enclosing signature erased to `()`, reads `()` at every position: its
+    /// pin is that instance, not an open pin.
     #[test]
-    fn a_mixed_parameter_erased_to_unit_pins_unit() {
+    fn an_argument_parameter_erased_to_unit_pins_unit() {
         let (msg, pin) = render_use_pin(
-            |view_web, _, m| Ty::Tuple(vec![view_web(m.clone()), m]),
+            |_, _, m| Ty::Fun(Box::new(m), Box::new(Ty::Unit)),
             Some(super::ErasedTvar::Unit),
         );
         assert_eq!(
@@ -35035,45 +35026,6 @@ mod tests {
                 ipe_ir::UserPin::Instance(super::IrType::Unit)
             )]))
         );
-    }
-
-    /// A parameter only in a `Result` error slot, left free, pins the project
-    /// error: the type the `Ok` wrapper fixes for a sibling, never `JsonVal`.
-    #[test]
-    fn a_free_result_error_parameter_pins_the_project_error() {
-        let (msg, pin) = render_use_pin(|_, result_of, m| result_of(m, Ty::Unit), None);
-        assert_eq!(
-            pin,
-            ipe_ir::CallPin::User(BTreeMap::from([(
-                msg,
-                ipe_ir::UserPin::Instance(super::IrType::Error)
-            )]))
-        );
-    }
-
-    /// A parameter in a `Result` error slot and as a value, left free, reads
-    /// two ways: its pin is refused naming both uses.
-    #[test]
-    fn a_free_parameter_in_and_outside_a_result_error_slot_is_refused() {
-        let (msg, pin) = render_use_pin(
-            |_, result_of, m| Ty::Tuple(vec![result_of(m.clone(), Ty::Unit), m]),
-            None,
-        );
-        let refused = matches!(
-            &pin,
-            ipe_ir::CallPin::User(pins)
-                if matches!(
-                    pins.get(&msg),
-                    Some(ipe_ir::UserPin::Unlowered(d)) if matches!(
-                        &**d,
-                        super::Diagnostic::Lower {
-                            msg: super::LowerError::MixedOpenParameter { uses, .. },
-                            ..
-                        } if *uses == [super::OpenVarUse::ResultError, super::OpenVarUse::Value]
-                    )
-                )
-        );
-        assert!(refused, "got {pin:?}");
     }
 
     /// An application whose argument count differs from the declaration's

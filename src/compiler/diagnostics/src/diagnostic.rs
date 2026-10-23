@@ -1894,46 +1894,21 @@ pub enum LowerError {
         /// The owner's type variable (e.g. `msg`).
         var: Box<str>,
     },
-    /// A call leaves free a type variable its callee uses in two positions
-    /// that read an open variable differently.
+    /// A call leaves open a type variable only the callee's arguments name,
+    /// and the callee's generated function still returns it.
     ///
-    /// A free variable reads by its position's [`OpenVarUse`]: `()` in a UI
-    /// message slot (`Html msg`), the project error in a `Result` error slot,
-    /// the JSON carrier anywhere else, so the emitted call would name two Rust
-    /// types for one parameter. Refused fail-closed at `ipe` time; the fix is a
-    /// type annotation that fixes the variable at the call. [IPE-L0102]
-    MixedOpenParameter {
-        /// The called function (e.g. `wrap`).
+    /// The callee's generated function drops the arguments that name `var`
+    /// (an erased, payload-free argument), so no argument it takes fixes
+    /// `var`, while its result still mentions it: the caller would observe a
+    /// type nothing at the call decides. Refused fail-closed at `ipe` time;
+    /// the fix is a type annotation that fixes the variable at the call.
+    /// [IPE-L0102]
+    UninferableErasedParameter {
+        /// The called function (e.g. `empties`).
         callee: Box<str>,
-        /// The callee's type variable (e.g. `msg`).
+        /// The callee's type variable (e.g. `a`).
         var: Box<str>,
-        /// Two of the uses that read the variable differently, in order.
-        uses: [OpenVarUse; 2],
     },
-}
-
-/// How a position of a declared type uses a type variable: the reading an
-/// open variable gets there.
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
-pub enum OpenVarUse {
-    /// The message argument of a UI type (`Html msg`): reads as `()`.
-    UiMessage,
-    /// The error argument of `Result e a`: reads as the project error.
-    ResultError,
-    /// Any other position: reads as the JSON carrier.
-    Value,
-}
-
-impl OpenVarUse {
-    /// The use, as prose after "as".
-    #[must_use]
-    pub const fn phrase(self) -> &'static str {
-        match self {
-            Self::UiMessage => "a UI message parameter",
-            Self::ResultError => "a `Result` error",
-            Self::Value => "a value type",
-        }
-    }
 }
 
 /// Why a literal route pattern or server route path was refused under
@@ -2965,7 +2940,9 @@ const fn lower_code(msg: &LowerError) -> Code {
         LowerError::PointFreeAccessorKernel { .. }
         | LowerError::AccessorKernelOffIntercept { .. } => IPE_L0146,
         LowerError::UnsaturatedHandlerKernel { .. } => IPE_L0152,
-        LowerError::ForeignTypeVariable { .. } | LowerError::MixedOpenParameter { .. } => IPE_L0102,
+        LowerError::ForeignTypeVariable { .. } | LowerError::UninferableErasedParameter { .. } => {
+            IPE_L0102
+        }
         LowerError::StoreSelectProjectionInvalid(_) => IPE_L0149,
     })
 }
@@ -3498,8 +3475,8 @@ fn lower_help(msg: &LowerError) -> Vec<HelpLine> {
         LowerError::ForeignTypeVariable { helper, owner, var } => {
             foreign_type_variable_help(helper, owner, var)
         }
-        LowerError::MixedOpenParameter { callee, var, .. } => {
-            mixed_open_parameter_help(callee, var)
+        LowerError::UninferableErasedParameter { callee, var } => {
+            uninferable_erased_parameter_help(callee, var)
         }
         LowerError::StoreSelectProjectionInvalid(defect) => {
             store_select_projection_invalid_help(defect)
@@ -3620,16 +3597,15 @@ fn foreign_type_variable_help(helper: &str, owner: &str, var: &str) -> Vec<HelpL
     ]
 }
 
-/// The help lines for [`LowerError::MixedOpenParameter`], factored out so
-/// [`lower_help`] stays a thin per-variant dispatcher.
-fn mixed_open_parameter_help(callee: &str, var: &str) -> Vec<HelpLine> {
+/// The help lines for [`LowerError::UninferableErasedParameter`], factored
+/// out so [`lower_help`] stays a thin per-variant dispatcher.
+fn uninferable_erased_parameter_help(callee: &str, var: &str) -> Vec<HelpLine> {
     vec![
         HelpLine::Note(
             format!(
-                "fix `{var}` at this call with a type annotation on the binding that \
-                 holds the result, naming a concrete type (`Html Msg`, not `Html msg`; \
-                 `Result Error Int`, not `Result e Int`); or annotate `{callee}` so it \
-                 uses `{var}` in one kind of position only"
+                "fix `{var}` at this call: pass `{callee}` an argument whose type names \
+                 `{var}` concretely (`Tag Int`, not `Tag a`), or annotate the binding \
+                 that holds the result with a concrete type"
             )
             .into_boxed_str(),
         ),

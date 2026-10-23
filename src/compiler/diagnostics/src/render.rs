@@ -1011,17 +1011,11 @@ fn lower_prose(msg: &LowerError) -> String {
                  signature."
             )
         }
-        LowerError::MixedOpenParameter {
-            callee,
-            var,
-            uses: [first, second],
-        } => {
+        LowerError::UninferableErasedParameter { callee, var } => {
             format!(
-                "This call leaves the type variable `{var}` of `{callee}` open, and \
-                 `{callee}` uses `{var}` both as {} and as {}, so the two uses would \
-                 get different types. Annotate the call's result with a concrete type.",
-                first.phrase(),
-                second.phrase()
+                "This call leaves the type variable `{var}` of `{callee}` open. No \
+                 argument `{callee}` is given fixes `{var}`, but its result still \
+                 uses it. Fix `{var}` with a concrete type at the call."
             )
         }
         LowerError::StoreSelectProjectionInvalid(defect) => match defect {
@@ -2307,16 +2301,10 @@ fn lower_label(msg: &LowerError) -> String {
                  type variable `{var}` — annotate `{helper}` with its own type"
             )
         }
-        LowerError::MixedOpenParameter {
-            callee,
-            var,
-            uses: [first, second],
-        } => {
+        LowerError::UninferableErasedParameter { callee, var } => {
             format!(
-                "`{var}` is open here, but `{callee}` uses it both as {} and as {} — \
-                 annotate the result with a concrete type",
-                first.phrase(),
-                second.phrase()
+                "`{var}` is open here: no argument of `{callee}` fixes it, but its \
+                 result uses it — give `{var}` a concrete type at this call"
             )
         }
     }

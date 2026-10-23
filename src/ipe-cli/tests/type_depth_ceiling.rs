@@ -619,15 +619,13 @@ fn a_generic_named_only_by_an_erased_argument_is_pinned_at_each_call() {
 }
 
 /// `mk` takes one Rust argument and returns a closure over the erased `Tag a`,
-/// so a call applying both arguments names `a` through no emitted argument;
-/// `none`'s `a` is named by its return alone and left free at the use.
-const SPINE_ONLY_PIN: &str = "module Main exposing (main)\n\nimport Ipe.Io as Io\nimport Ipe.List as List\n\n\ntype Tag a\n    = Tag\n\n\nmk : Int -> Tag a -> List a\nmk _ =\n    \\_ -> []\n\n\ncount : Tag Int -> Int\ncount t =\n    List.length (mk 1 t)\n\n\nnone : Int -> List a\nnone _ =\n    []\n\n\ncountNone : Int -> Int\ncountNone n =\n    List.length (none n)\n\n\nmain =\n    Io.println (if count Tag + countNone 3 == 0 then \"zero\" else \"other\")\n";
+/// so a call applying both arguments names `a` through no emitted argument.
+const SPINE_ONLY_PIN: &str = "module Main exposing (main)\n\nimport Ipe.Io as Io\nimport Ipe.List as List\n\n\ntype Tag a\n    = Tag\n\n\nmk : Int -> Tag a -> List a\nmk _ =\n    \\_ -> []\n\n\ncount : Tag Int -> Int\ncount t =\n    List.length (mk 1 t)\n\n\nmain =\n    Io.println (if count Tag == 0 then \"zero\" else \"other\")\n";
 
 /// A generic no emitted Rust argument names is pinned at each call whatever
 /// the callee's Rust arity: `i64` where the declared argument past the Rust
-/// arity fixes it, and a pin where only the return names it. The emitted calls
-/// are read in the CI `test-run` job; the crate builds and runs under
-/// `IPE_E2E=1` (the CI `e2e` job).
+/// arity fixes it. The emitted calls are read in the CI `test-run` job; the
+/// crate builds and runs under `IPE_E2E=1` (the CI `e2e` job).
 #[test]
 fn a_generic_named_past_the_emitted_arity_is_pinned_at_each_call() {
     let runtime = e2e_support::require_runtime().into_path_buf();
@@ -641,11 +639,6 @@ fn a_generic_named_past_the_emitted_arity_is_pinned_at_each_call() {
         mk.iter().any(|line| line.contains("mk::<i64>(")),
         "the over-applied `Tag Int` call must pin `i64`: {mk:?}"
     );
-    let none = turbofish_calls(&scratch, "none");
-    assert!(
-        none.iter().any(|line| line.contains("none::<JsonVal>(")),
-        "the unbounded return-only generic must be pinned to `JsonVal`: {none:?}"
-    );
     if e2e_support::e2e_tier() == e2e_support::Tier::E2e {
         let ran = e2e_support::build_and_run_rust("type_ceiling_spine_pin", &scratch);
         assert!(
@@ -656,6 +649,93 @@ fn a_generic_named_past_the_emitted_arity_is_pinned_at_each_call() {
         );
     }
     let _ = std::fs::remove_dir_all(&scratch);
+}
+
+/// Emit `src`, build and run it under `IPE_E2E=1` (the CI `e2e` job), and
+/// assert it prints `stdout`; without e2e, emitting it is the whole check.
+fn assert_runs(src: &str, bin: &str, stdout: &str) {
+    let runtime = e2e_support::require_runtime().into_path_buf();
+    let scratch = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("ipe_type_ceiling_{bin}_{}", std::process::id()));
+    let emitted = ipe::RootFixture::main(src)
+        .and_then(|fixture| ipe::build_fixture(&fixture, &scratch, &runtime).map(|_| ()));
+    assert!(emitted.is_ok(), "must emit: {emitted:?}");
+    if e2e_support::e2e_tier() == e2e_support::Tier::E2e {
+        let ran = e2e_support::build_and_run_rust(bin, &scratch);
+        assert!(
+            ran.as_ref()
+                .is_ok_and(|run| run.exit_code == Some(0) && run.stdout == stdout),
+            "the emitted crate must build with cargo and print {stdout:?}: {:?}",
+            ran.map(|run| (run.exit_code, run.stdout))
+        );
+    }
+    let _ = std::fs::remove_dir_all(&scratch);
+}
+
+/// `none`'s `e` is named by its return alone; the use binds it to the `Err`
+/// of a `Result` whose `Ok 2` sibling fixes the error type.
+const RETURN_ONLY_RESULT_ERROR: &str = "module Main exposing (main)\n\nimport Ipe.Io as Io\nimport Ipe.Result as Result\nimport Ipe.String as String\n\n\nnone : Int -> Maybe e\nnone _ =\n    Nothing\n\n\nmain =\n    Io.println\n        (String.fromInt\n            (Result.withDefault 0\n                (case none 1 of\n                    Just e ->\n                        Err e\n\n                    Nothing ->\n                        Ok 2\n                )\n            )\n        )\n";
+
+/// A generic only the declared return names is left to the call's expected
+/// type, never pinned to a reading its sibling contradicts. Emitted in the CI
+/// `test-run` job; built and run under `IPE_E2E=1` (the CI `e2e` job).
+#[test]
+fn a_return_only_generic_bound_to_a_result_error_builds_and_runs() {
+    assert_runs(RETURN_ONLY_RESULT_ERROR, "return_only_result_error", "2\n");
+}
+
+/// `none`'s `a` is named by its return alone, beside a `List.head []` sibling
+/// in one `if`.
+const RETURN_ONLY_BESIDE_A_KERNEL: &str = "module Main exposing (main)\n\nimport Ipe.Io as Io\nimport Ipe.List as List\n\n\nnone : Int -> Maybe a\nnone _ =\n    Nothing\n\n\nmain =\n    case (if List.length [ 1 ] > 0 then none 1 else List.head []) of\n        Just _ ->\n            Io.println \"just\"\n\n        Nothing ->\n            Io.println \"nothing\"\n";
+
+/// A return-only generic beside a kernel call over the same open variable
+/// builds as one Rust type. Emitted in the CI `test-run` job; built and run
+/// under `IPE_E2E=1` (the CI `e2e` job).
+#[test]
+fn a_return_only_generic_beside_a_kernel_sibling_builds_and_runs() {
+    assert_runs(
+        RETURN_ONLY_BESIDE_A_KERNEL,
+        "return_only_kernel",
+        "nothing\n",
+    );
+}
+
+/// `empties` names `a` in its erased `Tag a` argument and in its result;
+/// `main` calls it over a `Tag` that leaves `a` open.
+const OPEN_ERASED_RESULT: &str = "module Main exposing (main)\n\nimport Ipe.Io as Io\nimport Ipe.List as List\nimport Ipe.String as String\n\n\ntype Tag a\n    = Tag\n\n\nempties : Tag a -> List a\nempties _ =\n    []\n\n\nmain =\n    Io.println (String.fromInt (List.length (empties Tag)))\n";
+
+/// The same call over `intTag : Tag Int`, which fixes `a`.
+const FIXED_ERASED_RESULT: &str = "module Main exposing (main)\n\nimport Ipe.Io as Io\nimport Ipe.List as List\nimport Ipe.String as String\n\n\ntype Tag a\n    = Tag\n\n\nempties : Tag a -> List a\nempties _ =\n    []\n\n\nintTag : Tag Int\nintTag =\n    Tag\n\n\nmain =\n    Io.println (String.fromInt (List.length (empties intTag)))\n";
+
+/// A call leaving open a generic only an erased argument names, while the
+/// callee's emitted result still names it, is refused with IPE-L0102 at the
+/// call and emits no Rust; the same call over a concretely typed argument
+/// emits. Read in the CI `test-run` job; the control builds and runs under
+/// `IPE_E2E=1` (the CI `e2e` job).
+#[test]
+fn an_open_generic_only_an_erased_argument_names_is_refused_where_the_result_shows_it() {
+    let runtime = e2e_support::require_runtime().into_path_buf();
+    let scratch = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!(
+        "ipe_type_ceiling_open_erased_result_{}",
+        std::process::id()
+    ));
+    let built = ipe::RootFixture::main(OPEN_ERASED_RESULT)
+        .and_then(|fixture| ipe::build_fixture(&fixture, &scratch, &runtime).map(|_| ()));
+    let diag = refusal(&built);
+    assert_eq!(diag.map(Diagnostic::code), Some(IPE_L0102), "{built:?}");
+    let main_at = span_of(OPEN_ERASED_RESULT, "main =", 0);
+    let call = span_of(OPEN_ERASED_RESULT, "empties Tag", offset_of(main_at));
+    let span = diag.map(Diagnostic::primary_span);
+    assert!(
+        span.is_some_and(|s| s.lo < s.hi && s.lo >= call.lo && s.hi <= call.hi),
+        "refused at {span:?}, not inside the call {}..{}: {built:?}",
+        call.lo,
+        call.hi
+    );
+    let emitted = rust_sources(&scratch);
+    assert!(emitted.is_empty(), "no Rust may be emitted: {emitted:?}");
+    let _ = std::fs::remove_dir_all(&scratch);
+    assert_runs(FIXED_ERASED_RESULT, "fixed_erased_result", "0\n");
 }
 
 /// `doubledCount` is generic over a `number` its body's `x + x` bounds, and

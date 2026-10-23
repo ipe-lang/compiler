@@ -684,6 +684,25 @@ impl BoundSet {
         self.0 & !json_traits == 0
     }
 
+    /// Whether every bound in this set holds for [`IrType::Unit`] (`()`, which
+    /// is `Clone + Copy + PartialEq + Eq + PartialOrd + Ord + Hash +
+    /// IpeStringify + Send + Sync + 'static`). An arithmetic, interpolation,
+    /// row or bind-parameter bound does not.
+    #[must_use]
+    pub const fn met_by_unit(self) -> bool {
+        let unit_traits = Self::CLONE
+            | Self::COPY
+            | Self::EQ
+            | Self::ORD
+            | Self::ORD_TOTAL
+            | Self::HASH
+            | Self::SHOW
+            | Self::STATIC
+            | Self::SEND
+            | Self::SYNC;
+        self.0 & !unit_traits == 0
+    }
+
     /// This set with the `::core::ops::Add<Output = Self>` (Number `+`) bound.
     #[must_use]
     pub const fn with_add(self) -> Self {
@@ -923,6 +942,15 @@ impl Func {
         for param in &self.params {
             collect_generics(&param.ty, &mut named);
         }
+        named.into_iter().collect()
+    }
+
+    /// The type parameters the return type names: a caller observes each of
+    /// them through the value the call returns.
+    #[must_use]
+    pub fn generics_named_by_ret(&self) -> BTreeSet<Symbol> {
+        let mut named: Vec<Symbol> = Vec::new();
+        collect_generics(&self.ret, &mut named);
         named.into_iter().collect()
     }
 }
@@ -3502,6 +3530,16 @@ pub enum UserPin {
     /// and a cached program never deserializes into one.
     #[serde(skip)]
     Unlowered(Box<Diagnostic>),
+    /// An instantiation this use leaves open, of a parameter the callee's
+    /// declared arguments name, holding the refusal for a callee whose
+    /// emitted return still names the parameter.
+    ///
+    /// Settled once the callee's emitted signature is final: dropped when an
+    /// emitted parameter names it, `()` when no emitted position does, the
+    /// refusal when only the return does (the caller would observe a type
+    /// no argument fixes). Never reaches the backend.
+    #[serde(skip)]
+    Open(Box<Diagnostic>),
 }
 
 impl UserPin {
@@ -3514,7 +3552,7 @@ impl UserPin {
     pub const fn renders(&self, named_by_params: bool) -> bool {
         match self {
             Self::Unit => true,
-            Self::Instance(_) | Self::Unlowered(_) => !named_by_params,
+            Self::Instance(_) | Self::Unlowered(_) | Self::Open(_) => !named_by_params,
         }
     }
 }
@@ -3557,7 +3595,7 @@ impl CallPin {
         };
         pins.into_iter().flatten().filter_map(|pin| match pin {
             UserPin::Instance(ty) => Some(ty),
-            UserPin::Unit | UserPin::Unlowered(_) => None,
+            UserPin::Unit | UserPin::Unlowered(_) | UserPin::Open(_) => None,
         })
     }
 }

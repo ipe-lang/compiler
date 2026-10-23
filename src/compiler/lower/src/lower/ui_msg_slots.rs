@@ -11,12 +11,10 @@
 //!
 //! [`open_var_ir`] is the one table of what an open variable reads as by its
 //! position's [`OpenVarUse`]; the UI, `Result` and JSON readers default an
-//! open variable through it, and the use pin of a parameter used one way
-//! reads it through it too.
+//! open variable through it.
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use ipe_diagnostics::OpenVarUse;
 use ipe_intern::Symbol;
 use ipe_ir::{IrType, UiCtor};
 use ipe_types::{RowTail, Ty};
@@ -132,6 +130,18 @@ pub(super) fn result_error_slot(name: &str, args: &[Ty]) -> Option<usize> {
     (name == "Result" && args.len() == 2).then_some(RESULT_ERROR_SLOT)
 }
 
+/// How a position of a declared type uses a type variable: the reading an
+/// open variable gets there.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+pub(super) enum OpenVarUse {
+    /// The message argument of a UI type (`Html msg`): reads as `()`.
+    UiMessage,
+    /// The error argument of `Result e a`: reads as the project error.
+    ResultError,
+    /// Any other position: reads as the JSON carrier.
+    Value,
+}
+
 /// What an open variable reads as at a position used as `role`: `()` in a UI
 /// message slot, the project error (the `Ok` wrapper's fixed error) in a
 /// `Result` error slot, the JSON carrier anywhere else.
@@ -204,11 +214,10 @@ pub(super) fn only_ui_message(roles: &BTreeSet<OpenVarUse>) -> bool {
 mod tests {
     use std::collections::{BTreeMap, BTreeSet};
 
-    use ipe_diagnostics::OpenVarUse;
     use ipe_intern::{Interner, Symbol};
     use ipe_types::Ty;
 
-    use super::{OpenVarUses, lookup, open_var_uses, result_error_slot};
+    use super::{OpenVarUse, OpenVarUses, lookup, open_var_uses, result_error_slot};
 
     /// The raw of the message variable the classification tests place.
     const MSG: u32 = 3;

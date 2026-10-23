@@ -380,11 +380,17 @@ pub(super) fn match_signature_template(
     }
 }
 
-/// The type variables, as raws, the declared type `ty` names anywhere on its
-/// spine: every argument and the return, whatever arity the callee emits.
-pub(super) fn declared_vars(ty: &Ty) -> BTreeSet<u32> {
+/// The type variables, as raws, an argument of the declared type `ty` names:
+/// every argument on its spine, past whatever arity the callee emits, and not
+/// the return.
+pub(super) fn argument_vars(ty: &Ty) -> BTreeSet<u32> {
     let mut vars = BTreeSet::new();
-    let mut stack: Vec<&Ty> = vec![ty];
+    let mut stack: Vec<&Ty> = Vec::new();
+    let mut spine = ty;
+    while let Ty::Fun(arg, rest) = spine {
+        stack.push(arg);
+        spine = rest;
+    }
     while let Some(t) = stack.pop() {
         match t {
             Ty::Var(raw) => {

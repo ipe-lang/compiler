@@ -27,8 +27,8 @@ pub use diagnostic::{
     GenericAppEntryReach, HOF_KERNEL_RESULT_CLASS, HazardRefusal, HeaderDefect, HelpLine, Hint,
     INTERPOLABLE_CLASS, INTERPOLABLE_TYPES, IfDefect, ImportedAs, InterceptContext, LetDefect,
     LowerError, MainRetName, ModelLeaf, ModulePlacementReason, ModulePlacementRejection,
-    MountPrefixFault, NameError, OpenVarUse, ParseError, RoutePatternDefect, RustNameFoldKind,
-    SandboxError, SealRejection, SortedNames, SpanRole, StdlibReach, StoreEqAccessorDefect,
+    MountPrefixFault, NameError, ParseError, RoutePatternDefect, RustNameFoldKind, SandboxError,
+    SealRejection, SortedNames, SpanRole, StdlibReach, StoreEqAccessorDefect,
     StoreSelectProjectionDefect, Suggestion, TokenKind, TyDoc, TypeDeclDefect, TypeError,
     TypeSizeOrigin, WildcardDependence,
 };

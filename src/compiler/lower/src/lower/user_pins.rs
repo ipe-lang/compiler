@@ -3,10 +3,12 @@
 //! A pin is built at the call site, before the callee's emitted bounds are
 //! final ([`super::propagate_call_site_bounds`] runs after every body is
 //! lowered). This pass keeps exactly the pin entries the backend renders
-//! ([`UserPin::renders`]), so an unrendered pin feeds no type-mention walker,
-//! and turns a rendered `JsonVal` reading of a free variable into the
-//! lowering's refusal when the callee's bounds on that parameter are ones
-//! `JsonVal` does not meet ([`BoundSet::met_by_json`]).
+//! ([`UserPin::renders`]), so an unrendered pin feeds no type-mention walker.
+//! A rendered [`UserPin::Open`] becomes `()` when the callee's emitted return
+//! does not name the parameter either, and its held refusal when it does. A
+//! rendered `()` or `JsonVal` reading becomes the lowering's refusal when the
+//! callee's bounds on that parameter are ones the pinned type does not meet
+//! ([`BoundSet::met_by_unit`], [`BoundSet::met_by_json`]).
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
@@ -16,11 +18,12 @@ use ipe_ir::{BoundSet, CallPin, Callee, Expr, Func, FuncId, IrType, UserPin};
 
 use super::ir_type_mentions::ir_type_mentions;
 
-/// One callee's view for pin settling: its type parameters' emitted bounds and
-/// the ones some parameter type names.
+/// One callee's view for pin settling: its type parameters' emitted bounds,
+/// the ones some parameter type names, and the ones its return type names.
 struct PinLayout {
     bounds: BTreeMap<Symbol, BoundSet>,
     named: BTreeSet<Symbol>,
+    in_ret: BTreeSet<Symbol>,
 }
 
 /// Settle every [`CallPin::User`] in `funcs` (see the module doc). A refused
@@ -33,6 +36,7 @@ pub(super) fn settle_user_pins(funcs: &mut [Func], def_span: impl Fn(FuncId) -> 
             let layout = PinLayout {
                 bounds: f.type_params.iter().copied().collect(),
                 named: f.generics_named_by_params(),
+                in_ret: f.generics_named_by_ret(),
             };
             (f.id, layout)
         })
@@ -85,6 +89,13 @@ impl Settle<'_> {
                     return None;
                 }
                 let pin = match pin {
+                    UserPin::Open(refusal) if layout.in_ret.contains(&sym) => {
+                        UserPin::Unlowered(refusal)
+                    }
+                    UserPin::Open(_) | UserPin::Unit if !bounds.met_by_unit() => {
+                        UserPin::Unlowered(Box::new(self.refusal.clone()))
+                    }
+                    UserPin::Open(_) => UserPin::Unit,
                     UserPin::Instance(ty) if !bounds.met_by_json() && mentions_json_value(&ty) => {
                         UserPin::Unlowered(Box::new(self.refusal.clone()))
                     }
@@ -268,6 +279,16 @@ mod tests {
         params: Vec<IrType>,
         body: Expr,
     ) -> Func {
+        func_returning(id, type_params, params, IrType::Unit, body)
+    }
+
+    fn func_returning(
+        id: u32,
+        type_params: Vec<(Symbol, BoundSet)>,
+        params: Vec<IrType>,
+        ret: IrType,
+        body: Expr,
+    ) -> Func {
         Func {
             id: FuncId::from_raw(id),
             name: sym(900 + id),
@@ -279,8 +300,156 @@ mod tests {
                 .enumerate()
                 .map(|(i, ty)| ipe_ir::Param::owned(sym(800 + u32::try_from(i).unwrap_or(0)), ty))
                 .collect(),
-            ret: IrType::Unit,
+            ret,
             body,
+        }
+    }
+
+    /// The refusal an [`UserPin::Open`] holds in these tests, told apart from
+    /// the settle pass's own by its span.
+    fn open_refusal() -> Box<Diagnostic> {
+        Box::new(super::super::unsupported(
+            Span::new(7, 9),
+            Feature::Polymorphism,
+        ))
+    }
+
+    /// Whether `pin` holds, for `a`, a refusal anchored at `span`.
+    fn refused_at(pin: Option<&CallPin>, a: Symbol, span: Span) -> bool {
+        matches!(
+            pin,
+            Some(CallPin::User(pins))
+                if matches!(pins.get(&a), Some(UserPin::Unlowered(d)) if d.primary_span() == span)
+        )
+    }
+
+    #[test]
+    fn an_open_pin_no_emitted_position_names_becomes_unit() {
+        let a = sym(1);
+        let mut funcs = vec![
+            func(
+                0,
+                vec![(a, BoundSet::UNBOUNDED.with_clone())],
+                vec![IrType::Int],
+                Expr::Unit,
+            ),
+            func(
+                1,
+                vec![],
+                vec![],
+                call(0, vec![(a, UserPin::Open(open_refusal()))]),
+            ),
+        ];
+        let pin = settled_pin(&mut funcs).cloned();
+        assert_eq!(
+            pin,
+            Some(CallPin::User(std::iter::once((a, UserPin::Unit)).collect()))
+        );
+    }
+
+    #[test]
+    fn an_open_pin_the_emitted_return_names_becomes_its_refusal() {
+        let a = sym(1);
+        let mut funcs = vec![
+            func_returning(
+                0,
+                vec![(a, BoundSet::UNBOUNDED)],
+                vec![IrType::Int],
+                IrType::List(Box::new(IrType::Generic(a))),
+                Expr::Unit,
+            ),
+            func(
+                1,
+                vec![],
+                vec![],
+                call(0, vec![(a, UserPin::Open(open_refusal()))]),
+            ),
+        ];
+        let pin = settled_pin(&mut funcs);
+        assert!(refused_at(pin, a, Span::new(7, 9)), "{pin:?}");
+    }
+
+    #[test]
+    fn an_open_pin_a_parameter_names_is_dropped() {
+        let a = sym(1);
+        let mut funcs = vec![
+            func(
+                0,
+                vec![(a, BoundSet::UNBOUNDED)],
+                vec![IrType::Generic(a)],
+                Expr::Unit,
+            ),
+            func(
+                1,
+                vec![],
+                vec![],
+                call(0, vec![(a, UserPin::Open(open_refusal()))]),
+            ),
+        ];
+        let pin = settled_pin(&mut funcs).cloned();
+        assert_eq!(pin, Some(CallPin::None));
+    }
+
+    #[test]
+    fn a_unit_reading_under_a_wrapping_add_bound_becomes_the_refusal() {
+        let a = sym(1);
+        let add = BoundSet::UNBOUNDED.with_add().with_copy();
+        let mut funcs = vec![
+            func(0, vec![(a, add)], vec![IrType::Int], Expr::Unit),
+            func(
+                1,
+                vec![],
+                vec![],
+                call(0, vec![(a, UserPin::Open(open_refusal()))]),
+            ),
+        ];
+        let pin = settled_pin(&mut funcs);
+        assert!(refused_at(pin, a, Span::new(0, 1)), "{pin:?}");
+        let mut unbounded = vec![
+            func(
+                0,
+                vec![(a, BoundSet::UNBOUNDED.with_copy())],
+                vec![IrType::Int],
+                Expr::Unit,
+            ),
+            func(
+                1,
+                vec![],
+                vec![],
+                call(0, vec![(a, UserPin::Open(open_refusal()))]),
+            ),
+        ];
+        let control = settled_pin(&mut unbounded).cloned();
+        assert_eq!(
+            control,
+            Some(CallPin::User(std::iter::once((a, UserPin::Unit)).collect()))
+        );
+    }
+
+    #[test]
+    fn unit_meets_exactly_its_derived_traits() {
+        let met = BoundSet::UNBOUNDED
+            .with_clone()
+            .with_copy()
+            .with_eq()
+            .with_ord()
+            .with_ord_total()
+            .with_hash()
+            .with_show()
+            .with_static()
+            .with_send()
+            .with_sync();
+        assert!(met.met_by_unit());
+        let unmet: [fn(BoundSet) -> BoundSet; 6] = [
+            BoundSet::with_add,
+            BoundSet::with_sub,
+            BoundSet::with_mul,
+            BoundSet::with_interpolable,
+            BoundSet::with_sql_param,
+            BoundSet::with_ipe_row,
+        ];
+        for add in unmet {
+            assert!(!add(met).met_by_unit(), "{:?}", add(BoundSet::UNBOUNDED));
         }
     }
 
