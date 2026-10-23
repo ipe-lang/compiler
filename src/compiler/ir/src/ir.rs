@@ -3551,16 +3551,34 @@ pub enum UserPin {
     Unlowered(Box<Diagnostic>),
     /// An instantiation this use leaves open, of a parameter the callee's
     /// declared arguments name, holding the refusal for a callee whose
-    /// emitted return still names the parameter.
+    /// emitted return still names the parameter, and whether a program enum
+    /// parameter no field uses holds it ([`ArgumentErasure`]).
     ///
     /// Settled once the callee's emitted signature is final: dropped when an
     /// emitted parameter, or a parameter of a closure the return yields,
     /// names it (the argument the caller passes fixes it); `()` when no
-    /// emitted position does; the refusal when only the return otherwise
-    /// does (the caller would observe a type no argument fixes). Never
-    /// reaches the backend.
+    /// emitted position does; when only the return otherwise does, the
+    /// refusal for [`ArgumentErasure::UnusedEnumParameter`] (the caller would
+    /// observe a type no argument fixes) and dropped for
+    /// [`ArgumentErasure::Other`], leaving the type to the call's context.
+    /// Never reaches the backend.
     #[serde(skip)]
-    Open(Box<Diagnostic>),
+    Open(Box<Diagnostic>, ArgumentErasure),
+}
+
+/// Why the emitted parameters of a callee may not name a type parameter one
+/// of its declared arguments names, as the lowering that drops the argument
+/// decides it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ArgumentErasure {
+    /// A parameter of a program enum that no field uses holds the variable:
+    /// lowering erases that parameter from the declaration and every
+    /// application, since the declaration keeping it is refused by rustc
+    /// (E0392) whatever any call site supplies.
+    UnusedEnumParameter,
+    /// Any other position: an opaque carrier's dropped argument (`Cache k v`,
+    /// a store row type), a builtin's erased marker, or an emitted position.
+    Other,
 }
 
 impl UserPin {
@@ -3573,7 +3591,7 @@ impl UserPin {
     pub const fn renders(&self, named_by_params: bool) -> bool {
         match self {
             Self::Unit => true,
-            Self::Instance(_) | Self::Unlowered(_) | Self::Open(_) => !named_by_params,
+            Self::Instance(_) | Self::Unlowered(_) | Self::Open(..) => !named_by_params,
         }
     }
 }
@@ -3616,7 +3634,7 @@ impl CallPin {
         };
         pins.into_iter().flatten().filter_map(|pin| match pin {
             UserPin::Instance(ty) => Some(ty),
-            UserPin::Unit | UserPin::Unlowered(_) | UserPin::Open(_) => None,
+            UserPin::Unit | UserPin::Unlowered(_) | UserPin::Open(..) => None,
         })
     }
 }

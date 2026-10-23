@@ -3880,7 +3880,7 @@ impl<'a> EmitCtx<'a> {
                     UserPin::Unit => Some("()".to_owned()),
                     UserPin::Instance(ty) => Some(emit_types::render_type(self, ty, generics)?),
                     UserPin::Unlowered(refusal) => return Err(Diagnostic::clone(refusal)),
-                    UserPin::Open(_) => {
+                    UserPin::Open(..) => {
                         return Err(Diagnostic::CompilerBug {
                             where_: "ipe_backend_rust::EmitCtx::call_pin_turbofish",
                             detail: "an open user pin reached the emitter unsettled".to_owned(),

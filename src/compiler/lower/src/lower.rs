@@ -29,11 +29,11 @@ use ipe_ir::free_vars::{
 use ipe_ir::let_inline::{inlined_let_body, let_value_is_inlined};
 use ipe_ir::once_closure::{CaptureScope, ClosureKind};
 use ipe_ir::{
-    AppSurface, Arm, BinOp, BoundSet, CallPin, Callee, Capability, EnumDef, EnumPayloadTable, Expr,
-    Func, FuncId, IrType, KernelFn, Match, ModPath, Module, OnFormKind, Pat, Program, RowParam,
-    RuntimeModule, SharedAlts, SliceOwnership, TypeDef, UiCtor, UiPlain, UserPin, Variant,
-    fun_value_arc_promotable, ir_type_has_effect_carrier, ir_type_holds, ir_type_is_serde,
-    is_dispatch_free, is_irrefutable,
+    AppSurface, ArgumentErasure, Arm, BinOp, BoundSet, CallPin, Callee, Capability, EnumDef,
+    EnumPayloadTable, Expr, Func, FuncId, IrType, KernelFn, Match, ModPath, Module, OnFormKind,
+    Pat, Program, RowParam, RuntimeModule, SharedAlts, SliceOwnership, TypeDef, UiCtor, UiPlain,
+    UserPin, Variant, fun_value_arc_promotable, ir_type_has_effect_carrier, ir_type_holds,
+    ir_type_is_serde, is_dispatch_free, is_irrefutable,
 };
 use ipe_kernels::FnSlotCarrier;
 use ipe_types::{
@@ -10806,6 +10806,20 @@ enum ArithKind {
     Mul,
 }
 
+/// What lowering does with one type argument of a program union application
+/// ([`Lowerer::type_arg_fates`]).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum TypeArgFate {
+    /// The emitted enum keeps it.
+    Kept,
+    /// The union is backed by a non-generic carrier that drops every
+    /// argument (`Cache k v`, a store-row-phantom union).
+    OpaqueCarrier,
+    /// No field of the union uses the parameter, so lowering erases it from
+    /// the declaration and every application.
+    UnusedEnumParameter,
+}
+
 /// One operand of a `Store.coalesce` binary expression: either a direct
 /// `side.field` column reference or a `Store.literal(value)` binding. Kept
 /// separate from `ProjectionSource` because operands cannot themselves be
@@ -19342,7 +19356,26 @@ impl<'a> Lowerer<'a> {
     }
 
     /// The arguments of an application of program union `(home, name)` its
-    /// emitted enum keeps, in order.
+    /// emitted enum keeps, in order: those [`Self::type_arg_fates`] keeps.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::type_arg_fates`].
+    fn emitted_type_args<'args, A>(
+        &self,
+        home: &[Symbol],
+        name: Symbol,
+        args: &'args [A],
+    ) -> DResult<impl Iterator<Item = &'args A>> {
+        Ok(args
+            .iter()
+            .zip(self.type_arg_fates(home, name, args.len())?)
+            .filter(|(_, fate)| *fate == TypeArgFate::Kept)
+            .map(|(a, _)| a))
+    }
+
+    /// What lowering does with each of the `len` type arguments of an
+    /// application of program union `(home, name)`, in order.
     ///
     /// The one decision of which type arguments survive lowering: none for
     /// `Ipe.Cache.Cache k v` (backed by the non-generic `IpeCacheHandle`) and
@@ -19355,38 +19388,87 @@ impl<'a> Lowerer<'a> {
     ///
     /// # Errors
     ///
-    /// A [`Diagnostic::CompilerBug`] when `args` does not fill exactly the
+    /// A [`Diagnostic::CompilerBug`] when `len` is not exactly the number of
     /// parameters the declaration holds: the erasure is positional, so a
     /// mismatched count would keep or drop the wrong arguments.
-    fn emitted_type_args<'args, A>(
+    fn type_arg_fates(
         &self,
         home: &[Symbol],
         name: Symbol,
-        args: &'args [A],
-    ) -> DResult<impl Iterator<Item = &'args A>> {
+        len: usize,
+    ) -> DResult<impl Iterator<Item = TypeArgFate>> {
         let erase_all =
             self.is_cache_handle_con(home, name) || self.is_store_row_phantom_con(home, name);
         let path = ModPath(home.to_vec());
         // An erase-all declaration drops every source parameter, so its table arity is not its source arity.
         if !erase_all
             && let Some(declared) = self.enum_param_use.declared_arity(&path, name)
-            && declared != args.len()
+            && declared != len
         {
             return Err(bug(
                 "ipe_lower::emitted_type_args",
                 format!(
-                    "an application of an enum declaring {declared} type parameters holds {} arguments",
-                    args.len()
+                    "an application of an enum declaring {declared} type parameters holds {len} arguments"
                 ),
             ));
         }
-        Ok(args
-            .iter()
-            .enumerate()
-            .filter(move |(position, _)| {
-                !erase_all && self.enum_param_use.is_used(&path, name, *position)
-            })
-            .map(|(_, a)| a))
+        Ok((0..len).map(move |position| {
+            if erase_all {
+                TypeArgFate::OpaqueCarrier
+            } else if self.enum_param_use.is_used(&path, name, position) {
+                TypeArgFate::Kept
+            } else {
+                TypeArgFate::UnusedEnumParameter
+            }
+        }))
+    }
+
+    /// The type variables, as raws, an argument of the declared type
+    /// `declared` names inside a program enum argument lowering erases as an
+    /// unused parameter ([`TypeArgFate::UnusedEnumParameter`]), on the same
+    /// spine [`argument_vars`] reads. A union of a builtin's name is left out:
+    /// only a distinct program union ([`Self::is_distinct_program_union`])
+    /// lowers through [`Self::type_arg_fates`] ahead of every other arm.
+    fn unused_enum_parameter_vars(&self, declared: &Ty) -> BTreeSet<u32> {
+        let mut vars = BTreeSet::new();
+        let mut stack: Vec<(&Ty, bool)> = Vec::new();
+        let mut spine = declared;
+        while let Ty::Fun(arg, rest) = spine {
+            stack.push((arg, false));
+            spine = rest;
+        }
+        while let Some((t, unused)) = stack.pop() {
+            match t {
+                Ty::Var(raw) => {
+                    if unused {
+                        vars.insert(*raw);
+                    }
+                }
+                Ty::Fun(a, b) => {
+                    stack.push((a, unused));
+                    stack.push((b, unused));
+                }
+                Ty::Con { module, name, args } => {
+                    let fates: Vec<TypeArgFate> = if self.is_distinct_program_union(module, *name) {
+                        // A miscounted application is refused where the
+                        // signature lowers; here it holds no erased argument.
+                        self.type_arg_fates(module, *name, args.len())
+                            .map(Iterator::collect)
+                            .unwrap_or_default()
+                    } else {
+                        Vec::new()
+                    };
+                    for (position, arg) in args.iter().enumerate() {
+                        let erased = fates.get(position) == Some(&TypeArgFate::UnusedEnumParameter);
+                        stack.push((arg, unused || erased));
+                    }
+                }
+                Ty::Tuple(args) => stack.extend(args.iter().map(|a| (a, unused))),
+                Ty::Record(fields, _) => stack.extend(fields.values().map(|f| (f, unused))),
+                Ty::Wildcard | Ty::Unit => {}
+            }
+        }
+        vars
     }
 
     /// Lower a solved program-union application to its `IrType::Enum`.
@@ -24709,17 +24791,26 @@ impl<'a> Lowerer<'a> {
     /// A concrete instance pins itself. An open one (a variable each position
     /// reads its own way, or a wildcard, anywhere inside it) has no reading
     /// the use fixes: it is [`UserPin::Open`], settled against the callee's
-    /// emitted signature, and holds the refusal naming `callee` and `var`.
-    fn argument_param_pin(&self, ty: &Ty, callee: Symbol, var: Symbol, span: Span) -> UserPin {
+    /// emitted signature, holding the refusal naming `callee` and `var` and
+    /// `erasure`, whether an unused program enum parameter holds `var`.
+    fn argument_param_pin(
+        &self,
+        ty: &Ty,
+        callee: Symbol,
+        var: Symbol,
+        erasure: ArgumentErasure,
+        span: Span,
+    ) -> UserPin {
         if self.ty_mentions_position_read_var(ty) {
             let text = |s: Symbol| -> Box<str> { self.interner.resolve(s).unwrap_or("_").into() };
-            return UserPin::Open(Box::new(Diagnostic::Lower {
+            let refusal = Diagnostic::Lower {
                 span,
                 msg: LowerError::UninferableErasedParameter {
                     callee: text(callee),
                     var: text(var),
                 },
-            }));
+            };
+            return UserPin::Open(Box::new(refusal), erasure);
         }
         match self.ir_type_from_ty_json(ty, span) {
             Ok(lowered) => UserPin::Instance(lowered),
@@ -24839,12 +24930,18 @@ impl<'a> Lowerer<'a> {
                 },
             )
         };
+        let unused = self.unused_enum_parameter_vars(declared);
         let mut pins: BTreeMap<Symbol, UserPin> = BTreeMap::new();
         for raw in argument_vars(declared).difference(&msg_only) {
             let (Some(sym), Some(ty)) = (name_of(*raw), subst.get(raw)) else {
                 continue;
             };
-            let pin = self.argument_param_pin(ty, *name, sym, callee.span);
+            let erasure = if unused.contains(raw) {
+                ArgumentErasure::UnusedEnumParameter
+            } else {
+                ArgumentErasure::Other
+            };
+            let pin = self.argument_param_pin(ty, *name, sym, erasure, callee.span);
             pins.insert(sym, pin);
         }
         let free_msg = msg_only
@@ -34998,7 +35095,7 @@ mod tests {
             ipe_ir::CallPin::User(pins)
                 if matches!(
                     pins.get(&msg),
-                    Some(ipe_ir::UserPin::Open(d)) if matches!(
+                    Some(ipe_ir::UserPin::Open(d, ipe_ir::ArgumentErasure::Other)) if matches!(
                         &**d,
                         super::Diagnostic::Lower {
                             span: RENDER_CALL_SPAN,

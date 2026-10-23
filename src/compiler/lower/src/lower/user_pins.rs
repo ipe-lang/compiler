@@ -6,8 +6,11 @@
 //! ([`UserPin::renders`]), so an unrendered pin feeds no type-mention walker.
 //! A rendered [`UserPin::Open`] is dropped when a parameter of a closure the
 //! callee's emitted return yields names the parameter (the caller's argument
-//! to that closure fixes it), becomes `()` when the emitted return does not
-//! name it at all, and its held refusal otherwise. A
+//! to that closure fixes it), and becomes `()` when the emitted return does
+//! not name it at all. When the return does name it, the pin becomes its held
+//! refusal only if an unused program enum parameter erased the argument
+//! naming it ([`ArgumentErasure::UnusedEnumParameter`]), and is dropped for
+//! any other erasure, leaving the type to the call's context. A
 //! rendered `()` or `JsonVal` reading becomes the lowering's refusal when the
 //! callee's bounds on that parameter are ones the pinned type does not meet
 //! ([`BoundSet::met_by_unit`], [`BoundSet::met_by_json`]).
@@ -16,7 +19,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use ipe_diagnostics::{Diagnostic, Feature, Span};
 use ipe_intern::Symbol;
-use ipe_ir::{BoundSet, CallPin, Callee, Expr, Func, FuncId, IrType, UserPin};
+use ipe_ir::{ArgumentErasure, BoundSet, CallPin, Callee, Expr, Func, FuncId, IrType, UserPin};
 
 use super::ir_type_mentions::ir_type_mentions;
 
@@ -94,14 +97,19 @@ impl Settle<'_> {
                     return None;
                 }
                 let pin = match pin {
-                    UserPin::Open(_) if layout.ret_args.contains(&sym) => return None,
-                    UserPin::Open(refusal) if layout.in_ret.contains(&sym) => {
+                    UserPin::Open(..) if layout.ret_args.contains(&sym) => return None,
+                    UserPin::Open(refusal, ArgumentErasure::UnusedEnumParameter)
+                        if layout.in_ret.contains(&sym) =>
+                    {
                         UserPin::Unlowered(refusal)
                     }
-                    UserPin::Open(_) | UserPin::Unit if !bounds.met_by_unit() => {
+                    UserPin::Open(_, ArgumentErasure::Other) if layout.in_ret.contains(&sym) => {
+                        return None;
+                    }
+                    UserPin::Open(..) | UserPin::Unit if !bounds.met_by_unit() => {
                         UserPin::Unlowered(Box::new(self.refusal.clone()))
                     }
-                    UserPin::Open(_) => UserPin::Unit,
+                    UserPin::Open(..) => UserPin::Unit,
                     UserPin::Instance(ty) if !bounds.met_by_json() && mentions_json_value(&ty) => {
                         UserPin::Unlowered(Box::new(self.refusal.clone()))
                     }
@@ -311,13 +319,20 @@ mod tests {
         }
     }
 
-    /// An open pin whose held refusal is told apart from the settle pass's
-    /// own by its span.
+    /// An open pin an unused enum parameter erased, whose held refusal is
+    /// told apart from the settle pass's own by its span.
     fn open_pin() -> UserPin {
-        UserPin::Open(Box::new(super::super::unsupported(
-            Span::new(7, 9),
-            Feature::Polymorphism,
-        )))
+        open_pin_erased_by(ArgumentErasure::UnusedEnumParameter)
+    }
+
+    fn open_pin_erased_by(erasure: ArgumentErasure) -> UserPin {
+        UserPin::Open(
+            Box::new(super::super::unsupported(
+                Span::new(7, 9),
+                Feature::Polymorphism,
+            )),
+            erasure,
+        )
     }
 
     /// Whether `pin` holds, for `a`, a refusal anchored at `span`.
@@ -350,6 +365,50 @@ mod tests {
 
     #[test]
     fn an_open_pin_the_emitted_return_names_becomes_its_refusal() {
+        let a = sym(1);
+        let mut funcs = vec![
+            func_returning(
+                0,
+                vec![(a, BoundSet::UNBOUNDED)],
+                vec![IrType::Int],
+                IrType::List(Box::new(IrType::Generic(a))),
+                Expr::Unit,
+            ),
+            func(1, vec![], vec![], call(0, vec![(a, open_pin())])),
+        ];
+        let pin = settled_pin(&mut funcs);
+        assert!(refused_at(pin, a, Span::new(7, 9)), "{pin:?}");
+    }
+
+    /// The return names an open generic that an opaque carrier, not an
+    /// unused enum parameter, erased from the arguments: the call is left to
+    /// its context, unpinned and unrefused.
+    #[test]
+    fn an_open_pin_in_the_return_another_erasure_left_is_dropped() {
+        let a = sym(1);
+        let mut funcs = vec![
+            func_returning(
+                0,
+                vec![(a, BoundSet::UNBOUNDED)],
+                vec![IrType::Int],
+                IrType::List(Box::new(IrType::Generic(a))),
+                Expr::Unit,
+            ),
+            func(
+                1,
+                vec![],
+                vec![],
+                call(0, vec![(a, open_pin_erased_by(ArgumentErasure::Other))]),
+            ),
+        ];
+        let pin = settled_pin(&mut funcs).cloned();
+        assert_eq!(pin, Some(CallPin::None));
+    }
+
+    /// The same return over an open generic an unused enum parameter erased
+    /// is refused.
+    #[test]
+    fn an_open_pin_in_the_return_an_unused_enum_parameter_erased_is_refused() {
         let a = sym(1);
         let mut funcs = vec![
             func_returning(

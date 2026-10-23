@@ -1898,9 +1898,9 @@ pub enum LowerError {
     /// and the callee's generated function still returns it.
     ///
     /// The callee's generated function drops the arguments that name `var`
-    /// (an erased, payload-free argument), so no argument it takes fixes
-    /// `var`, while its result still mentions it: the caller would observe a
-    /// type nothing at the call decides. Refused fail-closed at `ipe` time;
+    /// (a parameter of a program union no constructor holds), so no argument
+    /// it takes fixes `var`, while its result still mentions it: the caller
+    /// would observe a type nothing at the call decides. Refused fail-closed at `ipe` time;
     /// the fix is a type annotation that fixes the variable at the call.
     /// [IPE-L0102]
     UninferableErasedParameter {

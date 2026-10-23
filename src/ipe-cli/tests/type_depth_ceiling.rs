@@ -728,6 +728,24 @@ fn an_open_generic_a_returned_closure_takes_is_left_to_its_argument() {
     assert_runs(OVER_APPLIED_OPEN, "over_applied_open", &["konst"], "1\n");
 }
 
+/// `rowsOf` names `row` in its `Cond row` argument, which the non-generic
+/// store-row carrier drops, and in its result; the call leaves `row` open.
+const OPAQUE_CARRIER_OPEN: &str = "module Main exposing (main)\n\nimport Ipe.Db.Store exposing (Cond(..))\nimport Ipe.Io as Io\nimport Ipe.List as List\n\n\nrowsOf : Cond row -> List row\nrowsOf _ =\n    []\n\n\nmain =\n    Io.println\n        (case List.head (rowsOf (IsNull \"x\")) of\n            Just _ ->\n                \"some\"\n\n            Nothing ->\n                \"none\"\n        )\n";
+
+/// A generic an opaque carrier, not an unused enum parameter, drops from the
+/// arguments is left to the call's context even where the result names it:
+/// unpinned and never refused. Read in the CI `test-run` job; built and run
+/// under `IPE_E2E=1` (the CI `e2e` job).
+#[test]
+fn an_open_generic_an_opaque_carrier_drops_is_left_to_the_call_context() {
+    assert_runs(
+        OPAQUE_CARRIER_OPEN,
+        "opaque_carrier_open",
+        &["rows_of"],
+        "none\n",
+    );
+}
+
 /// `empties` names `a` in its erased `Tag a` argument and in its result;
 /// `main` calls it over a `Tag` that leaves `a` open.
 const OPEN_ERASED_RESULT: &str = "module Main exposing (main)\n\nimport Ipe.Io as Io\nimport Ipe.List as List\nimport Ipe.String as String\n\n\ntype Tag a\n    = Tag\n\n\nempties : Tag a -> List a\nempties _ =\n    []\n\n\nmain =\n    Io.println (String.fromInt (List.length (empties Tag)))\n";
