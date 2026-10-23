@@ -866,3 +866,28 @@ fn markdown_features_builds_and_runs() {
         out.stdout
     );
 }
+
+// ── A message parameter also used outside its slot ────────────────
+
+/// `wrap` uses `a` in `List a` and in `Html a`; `wrap []` inside a page
+/// fixes it by the page, so one Rust type reads both positions.
+const MIXED_MSG_PARAM_MAIN: &str = "module Main exposing (main)
+import Ipe.Io as Io
+import Ipe.Html as Html exposing (Html)
+
+wrap : List a -> Html a
+wrap xs =
+    Html.div [] []
+
+main =
+    Io.println (Html.htmlRender (Html.div [] [ wrap [] ]))
+";
+
+#[test]
+fn a_mixed_message_parameter_fixed_by_its_page_builds_and_runs() {
+    seal_module(
+        "mixed_msg_param",
+        MIXED_MSG_PARAM_MAIN,
+        "<div><div></div></div>",
+    );
+}
