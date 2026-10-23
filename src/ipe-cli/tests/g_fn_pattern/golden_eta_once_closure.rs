@@ -502,7 +502,7 @@ fn destructure_thunk_over_a_function_param_builds_and_runs() {
 ///
 /// The handler normal form wraps the partial in the callback closure itself,
 /// which moves the non-`Clone` task out on its first key press.
-const UI_HANDLER_MOVES_TASK: &str = r#"module Main exposing (main)
+const UI_HANDLER_MOVES_TASK: &str = r"module Main exposing (main)
 
 import Ipe.Error as Error exposing (Error)
 import Ipe.Html as Html
@@ -528,7 +528,7 @@ view t =
 main : Task Error ()
 main =
     Io.println (Html.render (Ui.layout [] (view (Task.succeed 1))))
-"#;
+";
 
 /// A `Lazy.lazy` view built as a partial over a task parameter.
 const LAZY_VIEW_MOVES_TASK: &str = r#"module Main exposing (main)
@@ -561,7 +561,7 @@ main =
 "#;
 
 /// A `Task.retryWith` over a task parameter: each retry re-runs the moved task.
-const RETRY_MOVES_TASK: &str = r#"module Main exposing (main)
+const RETRY_MOVES_TASK: &str = r"module Main exposing (main)
 
 import Ipe.Error as Error exposing (Error)
 import Ipe.Io as Io
@@ -577,7 +577,7 @@ retried t =
 main : Task Error ()
 main =
     Task.andThen (\n -> Io.println (String.fromInt n)) (retried (Task.succeed 1))
-"#;
+";
 
 /// `Ui.onKeyDown`: the eta-wrapped key handler moves `t` out of the callback.
 #[test]
@@ -606,7 +606,7 @@ fn task_retry_with_moving_a_task_is_refused_at_the_capture() {
 }
 
 /// `Ui.onKeyDown` used point-free: its handler is never in the lowerer's hands.
-const UI_ON_KEY_DOWN_POINT_FREE: &str = r#"module Main exposing (main)
+const UI_ON_KEY_DOWN_POINT_FREE: &str = r"module Main exposing (main)
 
 import Ipe.Error as Error exposing (Error)
 import Ipe.Html as Html
@@ -628,7 +628,7 @@ view =
 main : Task Error ()
 main =
     Io.println (Html.render (Ui.layout [] view))
-"#;
+";
 
 /// `Ui.onKeyDown` point-free fails closed with IPE-L0152, naming the kernel.
 #[test]

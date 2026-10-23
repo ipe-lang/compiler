@@ -116,7 +116,7 @@ fn retry_policy_field_access_ice_builds_and_runs() {
 /// `Task.retryWith` mentions `RetryPolicy` in no function signature, record
 /// literal, or lambda type, so the record shape must survive the dead-type
 /// prune through the retry kernels' own use of its struct.
-const KERNEL_ONLY_POLICY: &str = r#"module Main exposing (main)
+const KERNEL_ONLY_POLICY: &str = r"module Main exposing (main)
 
 import Ipe.Error as Error exposing (Error)
 import Ipe.Io as Io
@@ -132,7 +132,7 @@ main =
             (Task.retryOn (\_ -> False) Task.defaultRetryPolicy)
             (Task.succeed 4)
         )
-"#;
+";
 
 fn built_kernel_only_policy(name: &str) -> (Result<(), CliError>, PathBuf) {
     let fixture = crate::root_fixture::main(KERNEL_ONLY_POLICY);
