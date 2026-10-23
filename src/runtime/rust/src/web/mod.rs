@@ -8722,7 +8722,7 @@ mod base_path_tests {
         );
         assert!(
             js.contains("__ipeSwapPreservingFocus(root, parsed)")
-                && js.contains("var parsed = __ipeShellRoot(__ipeParseFor(root, t), t);"),
+                && js.contains("var parsed = __ipeShellRoot(__ipeParseFor(root, t, stripped), t);"),
             "__ipePatch splices the nodes of its one parse, never a re-serialized copy"
         );
     }
