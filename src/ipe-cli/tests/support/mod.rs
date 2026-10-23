@@ -397,6 +397,37 @@ pub fn assert_emitted_project_matches_golden_dir(emitted_out: &Path, golden_dir:
 /// failure, never silently a no-op empty haystack. A missing `ipe_mods/`
 /// directory is NOT a failure: the Spine-collapse invariant (§3.3) legitimately
 /// emits no `ipe_mods/` for a single-home program.
+/// The emitted signature of the function spelled `ipe_name`, from its `fn`
+/// line through the line that opens its body.
+///
+/// Matches the emitted `main_<snake_case>` name with its underscores removed
+/// against the lower-cased Ipê name, so a check does not re-derive the
+/// backend's snake-casing. Generics wrapped over several lines stay whole.
+#[must_use]
+#[allow(dead_code)] // used by the generic-bound goldens only
+pub fn emitted_signature(emitted: &str, ipe_name: &str) -> Option<String> {
+    let wanted = format!("main{}", ipe_name.to_lowercase());
+    let lines = emitted.lines().skip_while(|line| {
+        !line.split_once("fn ").is_some_and(|(_, rest)| {
+            let name: String = rest
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                .filter(|c| *c != '_')
+                .collect();
+            name == wanted
+        })
+    });
+    let mut signature = String::new();
+    for line in lines {
+        signature.push_str(line);
+        signature.push('\n');
+        if line.contains('{') {
+            return Some(signature);
+        }
+    }
+    None
+}
+
 #[must_use]
 #[allow(dead_code)] // adopted file-by-file as substring goldens migrate to the shared helper
 pub fn read_all_emitted_src(emitted_out: &Path) -> String {

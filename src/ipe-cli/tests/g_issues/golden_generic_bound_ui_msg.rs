@@ -19,25 +19,6 @@ fn fixture_dir(root: &Path) -> PathBuf {
     root.join("tests").join("golden").join(GOLDEN)
 }
 
-/// The emitted signature line of the `Main` function spelled `ipe_name`.
-///
-/// Matches the emitted `main_<snake_case>` name with its underscores removed
-/// against the lower-cased Ipê name, so the check does not re-derive the
-/// backend's snake-casing.
-fn signature_of<'a>(emitted: &'a str, ipe_name: &str) -> Option<&'a str> {
-    let wanted = format!("main{}", ipe_name.to_lowercase());
-    emitted.lines().find(|line| {
-        line.split_once("fn ").is_some_and(|(_, rest)| {
-            let name: String = rest
-                .chars()
-                .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
-                .filter(|c| *c != '_')
-                .collect();
-            name == wanted
-        })
-    })
-}
-
 /// Emit gate: both message generics carry `'static`.
 #[test]
 fn generic_bound_ui_msg_bounds_emitted() {
@@ -55,10 +36,10 @@ fn generic_bound_ui_msg_bounds_emitted() {
 
     let emitted = crate::support::read_all_emitted_src(&out);
     for (name, needs) in BOUNDS {
-        let signature = signature_of(&emitted, name);
+        let signature = crate::support::emitted_signature(&emitted, name);
         for need in *needs {
             assert!(
-                signature.is_some_and(|line| line.contains(need)),
+                signature.as_deref().is_some_and(|text| text.contains(need)),
                 "{GOLDEN}: `{name}`'s clause must carry `{need}` (the bound its \
                  callees oblige), got signature: {signature:?}"
             );
