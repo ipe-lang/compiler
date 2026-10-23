@@ -1,2 +1,1 @@
-hi Ada,hi Ada
-hi Bo,hi Bo
+hi Ada,hi Bo

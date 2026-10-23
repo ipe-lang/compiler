@@ -5,8 +5,8 @@
 //! constructor as the callback) and returns its `panel`, and `keyAction`
 //! forwards both into `cardKey` and `panelKey`. The lowerer finalizes those
 //! bounds before the cross-call fixpoint, so every forwarder's clause carries
-//! them; a bound added only while rendering `onCard` left `cardKey` unbounded,
-//! and the emitted crate was ipe-accepted but failed `cargo build` with E0277.
+//! them; a bound added only while rendering `onCard` would leave `cardKey`
+//! unbounded and its crate ipe-accepted yet refused by `cargo build` (E0277).
 //!
 //! The emit gate asserts the bounds on the emitted signatures; under
 //! `IPE_E2E=1` the program is built, run, and its stdout matched against
