@@ -13,6 +13,12 @@
 //! directly or by building an inner closure that captures it, is an
 //! `Expr::OnceLambda` admitted or refused by its position alike.
 //!
+//! An adapted-callback kernel slot (`Ui.onKeyDown`, `Lazy.lazy`,
+//! `Task.retryWith`) takes the same verdict: lowering puts the slot in
+//! handler normal form, so a handler that moves a task is refused at the
+//! capture, and a point-free use is refused with IPE-L0152. A handler whose
+//! captures are `Clone` builds and runs, its sibling reads intact.
+//!
 //! ```text
 //! IPE_E2E=1 cargo nextest run -p ipe --test g_fn_pattern golden_eta_once_closure
 //! ```
@@ -488,6 +494,538 @@ fn destructure_thunk_over_a_function_param_builds_and_runs() {
     assert!(
         outcome.stdout.contains(THUNK_PROMOTED_STDOUT),
         "must decode through the promoted param twice; got: {:?}",
+        outcome.stdout
+    );
+}
+
+/// A `Ui.onKeyDown` handler built as a partial over a task parameter.
+///
+/// The handler normal form wraps the partial in the callback closure itself,
+/// which moves the non-`Clone` task out on its first key press.
+const UI_HANDLER_MOVES_TASK: &str = r"module Main exposing (main)
+
+import Ipe.Error as Error exposing (Error)
+import Ipe.Html as Html
+import Ipe.Io as Io
+import Ipe.Task as Task
+import Ipe.Ui as Ui exposing (Element)
+
+
+type Msg
+    = KeyDown Int String
+
+
+h : Task Error Int -> String -> Msg
+h _ key =
+    KeyDown 0 key
+
+
+view : Task Error Int -> Element Msg
+view t =
+    Ui.column [ Ui.onKeyDown (h t) ] []
+
+
+main : Task Error ()
+main =
+    Io.println (Html.render (Ui.layout [] (view (Task.succeed 1))))
+";
+
+/// A `Lazy.lazy` view built as a partial over a task parameter.
+const LAZY_VIEW_MOVES_TASK: &str = r#"module Main exposing (main)
+
+import Ipe.Error as Error exposing (Error)
+import Ipe.Html as Html
+import Ipe.Io as Io
+import Ipe.Task as Task
+import Ipe.Ui as Ui exposing (Element)
+import Ipe.Ui.Lazy as Lazy
+
+
+type Msg
+    = NoOp
+
+
+h : Task Error Int -> String -> Element Msg
+h _ label =
+    Ui.text label
+
+
+view : Task Error Int -> Element Msg
+view t =
+    Ui.column [] [ Lazy.lazy (h t) "x" ]
+
+
+main : Task Error ()
+main =
+    Io.println (Html.render (Ui.layout [] (view (Task.succeed 1))))
+"#;
+
+/// A `Task.retryWith` over a task parameter: each retry re-runs the moved task.
+const RETRY_MOVES_TASK: &str = r"module Main exposing (main)
+
+import Ipe.Error as Error exposing (Error)
+import Ipe.Io as Io
+import Ipe.String
+import Ipe.Task as Task
+
+
+retried : Task Error Int -> Task Error Int
+retried t =
+    Task.retryWith Task.defaultRetryPolicy t
+
+
+main : Task Error ()
+main =
+    Task.andThen (\n -> Io.println (String.fromInt n)) (retried (Task.succeed 1))
+";
+
+/// `Ui.onKeyDown`: the eta-wrapped key handler moves `t` out of the callback.
+#[test]
+fn ui_on_key_down_handler_moving_a_task_is_refused_at_the_capture() {
+    assert_source_refused_at_capture(
+        "eta_once_ui_on_key_down_task",
+        UI_HANDLER_MOVES_TASK,
+        "t) ]",
+    );
+}
+
+/// `Lazy.lazy`: the view closure moves `t` out on its first render.
+#[test]
+fn lazy_lazy_view_moving_a_task_is_refused_at_the_capture() {
+    assert_source_refused_at_capture("eta_once_lazy_lazy_task", LAZY_VIEW_MOVES_TASK, "t) \"x\"");
+}
+
+/// `Task.retryWith`: the re-run thunk moves `t` out on its first attempt.
+#[test]
+fn task_retry_with_moving_a_task_is_refused_at_the_capture() {
+    assert_source_refused_at_capture(
+        "eta_once_task_retry_with_task",
+        RETRY_MOVES_TASK,
+        "t\n\n\nmain",
+    );
+}
+
+/// `Ui.onKeyDown` used point-free: its handler is never in the lowerer's hands.
+const UI_ON_KEY_DOWN_POINT_FREE: &str = r"module Main exposing (main)
+
+import Ipe.Error as Error exposing (Error)
+import Ipe.Html as Html
+import Ipe.Io as Io
+import Ipe.List as List
+import Ipe.Task as Task
+import Ipe.Ui as Ui exposing (Element)
+
+
+type Msg
+    = KeyDown String
+
+
+view : Element Msg
+view =
+    Ui.column (List.map Ui.onKeyDown [ KeyDown ]) []
+
+
+main : Task Error ()
+main =
+    Io.println (Html.render (Ui.layout [] view))
+";
+
+/// `Ui.onKeyDown` point-free fails closed with IPE-L0152, naming the kernel.
+#[test]
+fn ui_on_key_down_point_free_is_refused_as_unsaturated() {
+    let (built, _) = build_source(
+        "eta_once_ui_on_key_down_point_free",
+        UI_ON_KEY_DOWN_POINT_FREE,
+    );
+    assert!(
+        matches!(
+            &built,
+            Err(CliError::Pipeline { diag, .. })
+                if matches!(
+                    diag.as_ref(),
+                    Diagnostic::Lower {
+                        msg: LowerError::UnsaturatedHandlerKernel { kernel },
+                        ..
+                    } if kernel.as_ref() == "Ui.onKeyDown"
+                )
+        ),
+        "a point-free `Ui.onKeyDown` must fail closed with IPE-L0152, got {built:?}"
+    );
+}
+
+/// Adapted-callback slots whose handlers capture a `Clone` model.
+///
+/// Each handler is a partial over a computed capture (`KeyDown (offers
+/// model)`), a call returning a function, an `if`, or a function-typed
+/// capture, and every element also reads `model` as a sibling: the handler
+/// normal form keeps each slot's `let`s outside its callback, so the model
+/// survives for the sibling and each callback is re-callable.
+const HANDLERS_CAPTURE_CLONE: &str = r#"module Main exposing (main)
+
+import Ipe.Error as Error exposing (Error)
+import Ipe.Html as Html
+import Ipe.Io as Io
+import Ipe.String
+import Ipe.Task as Task
+import Ipe.Ui as Ui exposing (Element)
+import Ipe.Ui.Input as Input
+import Ipe.Ui.Lazy as Lazy
+
+
+type alias Model =
+    { keys : String }
+
+
+type Msg
+    = KeyDown String String
+    | Toggled String Bool
+
+
+offers : Model -> String
+offers m =
+    m.keys
+
+
+pick : Model -> String -> Msg
+pick m key =
+    KeyDown m.keys key
+
+
+apply : (String -> Msg) -> String -> Msg
+apply f key =
+    f key
+
+
+item : String -> String -> Element Msg
+item prefix label =
+    Ui.text (prefix ++ label)
+
+
+giveUp : Model -> Error -> Bool
+giveUp m _ =
+    String.length m.keys == 0
+
+
+view : Bool -> Model -> Element Msg
+view c model =
+    Ui.column
+        [ Ui.onKeyDown (KeyDown (offers model))
+        , Ui.onKeyUp (pick model)
+        , Ui.onInput
+            (if c then
+                KeyDown "x"
+
+             else
+                KeyDown (offers model)
+            )
+        , Ui.onChange (KeyDown (offers model))
+        , Ui.onFile (KeyDown (offers model))
+        , Ui.onBool (Toggled (offers model))
+        ]
+        [ Input.text []
+            { onChange = KeyDown (offers model)
+            , text = model.keys
+            , placeholder = Nothing
+            , label = Input.labelLeft [] (Ui.text model.keys)
+            }
+        , Lazy.lazy (item (offers model)) model.keys
+        , Ui.text model.keys
+        ]
+
+
+single : Model -> Element Msg
+single model =
+    Ui.column [ Ui.onKeyDown (KeyDown (offers model)) ] []
+
+
+sync : Model -> Element Msg
+sync model =
+    let
+        g =
+            pick model
+    in
+    Ui.column
+        [ Ui.onKeyDown (\k -> g k)
+        , Ui.onKeyUp (apply (pick model))
+        ]
+        [ Ui.text model.keys ]
+
+
+main : Task Error ()
+main =
+    let
+        model =
+            { keys = "keys" }
+
+        page =
+            Html.render (Ui.layout [] (Ui.column [] [ view True model, single model, sync model ]))
+    in
+    Task.andThen
+        (\n -> Io.println (page ++ "|" ++ String.fromInt n))
+        (Task.retryWith
+            (Task.retryOn (giveUp model) Task.defaultRetryPolicy)
+            (Task.succeed (String.length (offers model)))
+        )
+"#;
+
+/// Adapted-callback handlers over a `Clone` capture pass ipe.
+#[test]
+fn clone_capturing_adapted_handlers_pass_ipe() {
+    let (built, _) = build_source("eta_once_handlers_capture_clone", HANDLERS_CAPTURE_CLONE);
+    assert!(
+        built.is_ok(),
+        "adapted-callback handlers over a `Clone` capture must pass ipe: {:?}",
+        built.err()
+    );
+}
+
+/// cargo-0 and run-correct for the adapted-callback handlers: gated on `IPE_E2E=1` (THE SEAL).
+///
+/// Without handler normal form the emitted view fails cargo with E0382 (the
+/// sibling read of a model moved into a callback) or E0507 (a single-use
+/// capture moved out of an `Fn` callback).
+#[test]
+fn clone_capturing_adapted_handlers_build_and_run() {
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
+        return;
+    }
+    let (built, out) = build_source(
+        "eta_once_handlers_capture_clone_e2e",
+        HANDLERS_CAPTURE_CLONE,
+    );
+    assert!(built.is_ok(), "the build must succeed: {:?}", built.err());
+    let outcome = crate::support::build_and_run_emitted("eta_once_handlers_capture_clone", &out);
+    assert_eq!(
+        outcome.exit_code,
+        Some(0),
+        "the adapted-callback handlers must build and exit 0 (no E0382/E0507); stdout: {:?}",
+        outcome.stdout
+    );
+    assert!(
+        outcome.stdout.contains("keyskeys") && outcome.stdout.trim_end().ends_with("|4"),
+        "must render the lazy view and the retried task's result; got: {:?}",
+        outcome.stdout
+    );
+}
+
+/// Adapted-callback slot shapes beyond a bare partial.
+///
+/// A slot under leading `let`s that mixes plain bindings with a destructure,
+/// a `let`-bound function returned or passed on, an outer `let`-bound handler,
+/// a record field (`Input.text`'s `onChange`) under a `let`, a pipe, a `case`,
+/// `Ui.onSubmit`, and a `Lazy.lazy2` partial: each must reach the backend in
+/// handler normal form, and every element still reads `model` as a sibling.
+/// An outer `let`-bound or parameter handler passed on as a value inside a
+/// handler (`apply g`) is re-dispatched, never handed over as its `Arc`
+/// carrier to an `impl Fn` parameter (E0277).
+const HANDLER_SHAPES: &str = r#"module Main exposing (main)
+
+import Ipe.Error as Error exposing (Error)
+import Ipe.Html as Html
+import Ipe.Io as Io
+import Ipe.String
+import Ipe.Task as Task
+import Ipe.Ui as Ui exposing (Element)
+import Ipe.Ui.Input as Input
+import Ipe.Ui.Lazy as Lazy
+
+
+type alias Model =
+    { keys : String }
+
+
+type Msg
+    = KeyDown String String
+    | Toggled String Bool
+
+
+offers : Model -> String
+offers m =
+    m.keys
+
+
+pick : Model -> String -> Msg
+pick m key =
+    KeyDown m.keys key
+
+
+apply : (String -> Msg) -> String -> Msg
+apply f key =
+    f key
+
+
+item : String -> String -> Element Msg
+item prefix label =
+    Ui.text (prefix ++ label)
+
+
+item2 : String -> String -> String -> Element Msg
+item2 prefix a b =
+    Ui.text (prefix ++ a ++ b)
+
+
+handleKey : String -> Msg
+handleKey k =
+    KeyDown "top" k
+
+
+mixedDestructure : Model -> Element Msg
+mixedDestructure model =
+    let
+        pair =
+            ( model.keys, "q" )
+    in
+    Ui.column
+        [ Ui.onKeyDown
+            (let
+                a =
+                    offers model
+
+                ( p, q ) =
+                    pair
+             in
+             KeyDown (a ++ p ++ q)
+            )
+        , Ui.onKeyUp
+            (let
+                a =
+                    offers model
+
+                ( p, _ ) =
+                    pair
+             in
+             if p == "" then
+                KeyDown a
+
+             else
+                KeyDown (a ++ p)
+            )
+        ]
+        [ Ui.text model.keys ]
+
+
+letAliases : Model -> Element Msg
+letAliases model =
+    let
+        g =
+            pick model
+    in
+    Ui.column
+        [ Ui.onKeyDown
+            (let
+                h =
+                    pick model
+             in
+             h
+            )
+        , Ui.onKeyUp
+            (let
+                h =
+                    pick model
+             in
+             apply h
+            )
+        , Ui.onInput g
+        , Ui.onChange (apply g)
+        , Ui.onFile
+            (let
+                h =
+                    \k -> KeyDown model.keys k
+             in
+             h
+            )
+        ]
+        [ Input.text []
+            { onChange =
+                let
+                    h =
+                        pick model
+                in
+                h
+            , text = model.keys
+            , placeholder = Nothing
+            , label = Input.labelLeft [] (Ui.text model.keys)
+            }
+        , Ui.text model.keys
+        ]
+
+
+pipesAndCases : Model -> Element Msg
+pipesAndCases model =
+    Ui.column
+        [ model |> pick |> Ui.onKeyDown
+        , Ui.onKeyUp <| pick model
+        , Ui.onInput handleKey
+        , Ui.onChange
+            (case model.keys of
+                "" ->
+                    KeyDown "a"
+
+                _ ->
+                    KeyDown (offers model)
+            )
+        , Ui.onSubmit (KeyDown (offers model))
+        ]
+        [ Lazy.lazy2 (item2 (offers model)) model.keys "b", Ui.text model.keys ]
+
+
+paramHandler : (String -> Msg) -> Model -> Element Msg
+paramHandler handler model =
+    Ui.column
+        [ Ui.onChange (apply handler)
+        , Ui.onKeyDown handler
+        ]
+        [ Ui.text model.keys ]
+
+
+view : Model -> Element Msg
+view model =
+    Ui.column []
+        [ mixedDestructure model
+        , letAliases model
+        , pipesAndCases model
+        , paramHandler (pick model) model
+        ]
+
+
+main : Task Error ()
+main =
+    let
+        model =
+            { keys = "keys" }
+    in
+    Io.println (Html.render (Ui.layout [] (view model)) ++ "|" ++ model.keys)
+"#;
+
+/// Every adapted-callback slot shape of [`HANDLER_SHAPES`] passes ipe.
+#[test]
+fn adapted_handler_shapes_pass_ipe() {
+    let (built, _) = build_source("eta_once_handler_shapes", HANDLER_SHAPES);
+    assert!(
+        built.is_ok(),
+        "every adapted-callback slot shape must pass ipe: {:?}",
+        built.err()
+    );
+}
+
+/// cargo-0 and run-correct for [`HANDLER_SHAPES`]: gated on `IPE_E2E=1` (THE SEAL).
+#[test]
+fn adapted_handler_shapes_build_and_run() {
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
+        return;
+    }
+    let (built, out) = build_source("eta_once_handler_shapes_e2e", HANDLER_SHAPES);
+    assert!(built.is_ok(), "the build must succeed: {:?}", built.err());
+    let outcome = crate::support::build_and_run_emitted("eta_once_handler_shapes", &out);
+    assert_eq!(
+        outcome.exit_code,
+        Some(0),
+        "the adapted-callback slot shapes must build and exit 0 (no E0382/E0507); stdout: {:?}",
+        outcome.stdout
+    );
+    assert!(
+        outcome.stdout.contains("keyskeysb") && outcome.stdout.trim_end().ends_with("|keys"),
+        "must render the lazy view and the model; got: {:?}",
         outcome.stdout
     );
 }

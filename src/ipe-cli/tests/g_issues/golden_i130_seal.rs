@@ -264,15 +264,14 @@ fn c05_streamwriter_capture_forward() {
 /// `header`/`body` are `String`s bound in the handler-constructing function —
 /// the exact shape of examples/36-composite-server's Csv-stream export.
 ///
-/// The `StreamStream` emit arm's `move |_x| (handler)(_x)` re-wrap
-/// (which rebuilds the box per call to recover the runtime's `+Sync` bound)
-/// captures `header`/`body`; if the re-embedded box MOVED them out on the
-/// first call the wrapper would degrade to `FnOnce` → `server_stream_stream`'s
-/// `Fn` bound rejects it (2x `E0507: cannot move out of a captured variable
-/// in an Fn closure`, AFTER `ipe` exit 0 — a SEAL break).
+/// The `StreamStream` handler closure captures `header`/`body`; if it MOVED
+/// them out on the first call the closure would degrade to `FnOnce` →
+/// `server_stream_stream`'s `Fn` bound rejects it (2x `E0507: cannot move out
+/// of a captured variable in an Fn closure`, AFTER `ipe` exit 0 — a SEAL
+/// break).
 ///
-/// So the arm pre-clones every free local the handler captures INSIDE the
-/// wrapper body, so the box moves fresh clones and the wrapper stays `Fn`.
+/// So lowering clones every captured value the handler body consumes inside
+/// the closure, and the closure stays `Fn`.
 ///
 /// Unlike `c05` (ipe exit-0 only), this asserts the EMITTED CRATE cargo-builds
 /// — the layer where this surfaces. A listening-server fixture cannot

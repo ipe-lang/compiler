@@ -1240,29 +1240,111 @@ pub enum FnSlotCarrier {
     AcceptsShared,
 }
 
-/// Whether every capture-cloned handler of `kernels` sits at an [`FnSlotCarrier::AcceptsShared`] slot.
+/// A kernel argument position the backend adapts into a callback closure of its own.
+///
+/// The backend emits the closure the lowered slot holds as the callback, so
+/// lowering puts every adapted slot in handler normal form (leading `let`s
+/// around one closure literal) and the capture analysis sees the closure the
+/// program actually runs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AdaptedSlot {
+    /// The function-typed argument at this index.
+    Arg(u8),
+    /// Every function-typed field of the record-literal argument at `arg`.
+    ///
+    /// The scheme's record shape names the fields, so the slot carries no field name.
+    Field {
+        /// The index of the record argument.
+        arg: u8,
+    },
+    /// The form-submit handler at this index, adapted only when its solved type is an arrow.
+    FormHandler(u8),
+    /// The `Task` argument at this index, which the backend re-runs as a zero-argument thunk.
+    Thunk(u8),
+}
+
+impl AdaptedSlot {
+    /// The index of the kernel argument this slot sits in.
+    #[must_use]
+    pub const fn arg(self) -> u8 {
+        match self {
+            Self::Arg(arg) | Self::Field { arg } | Self::FormHandler(arg) | Self::Thunk(arg) => arg,
+        }
+    }
+
+    /// Whether `self` and `other` name the same slot (a `const` equality).
+    #[must_use]
+    pub const fn same(self, other: Self) -> bool {
+        match (self, other) {
+            (Self::Arg(a), Self::Arg(b))
+            | (Self::Field { arg: a }, Self::Field { arg: b })
+            | (Self::FormHandler(a), Self::FormHandler(b))
+            | (Self::Thunk(a), Self::Thunk(b)) => a == b,
+            _ => false,
+        }
+    }
+}
+
+/// The number of arrows on the curried spine of `shape`.
+const fn arrow_arity(shape: &TyShape) -> usize {
+    let mut cur = shape;
+    let mut arity = 0;
+    while let TyShape::Fun(_, rest) = cur {
+        arity += 1;
+        cur = rest;
+    }
+    arity
+}
+
+/// The common arrow arity of the function fields of the record `shape`, or `None` without one.
+///
+/// `None` when `shape` is not a record, has no function field, or has function
+/// fields of differing arities.
+const fn record_fn_field_arity(shape: &TyShape) -> Option<usize> {
+    let TyShape::Record { fields, .. } = shape else {
+        return None;
+    };
+    let mut rest = *fields;
+    let mut common: Option<usize> = None;
+    while let Some(((_, field), tail)) = rest.split_first() {
+        if matches!(field, TyShape::Fun(..)) {
+            let arity = arrow_arity(field);
+            match common {
+                Some(seen) if seen != arity => return None,
+                _ => common = Some(arity),
+            }
+        }
+        rest = tail;
+    }
+    common
+}
+
+/// Whether every [`StdlibKernel::adapted_slots`] entry of `kernels` fits its kernel's scheme.
+///
+/// Each adapted slot must have an [`StdlibKernel::adapted_slot_arity`], so the
+/// table cannot name a non-function argument, a record with no function field,
+/// a non-`Task` thunk, or a form slot on another kernel.
 #[must_use]
-pub const fn capture_cloned_handlers_accept_shared(kernels: &[StdlibKernel]) -> bool {
+pub const fn adapted_slots_fit_schemes(kernels: &[StdlibKernel]) -> bool {
     let mut rest = kernels;
     while let Some((kernel, tail)) = rest.split_first() {
-        if let Some(index) = kernel.capture_cloned_handler_arg()
-            && !matches!(
-                kernel.fn_slot_carrier(index),
-                Some(FnSlotCarrier::AcceptsShared)
-            )
-        {
-            return false;
+        let mut slots = kernel.adapted_slots();
+        while let Some((slot, more)) = slots.split_first() {
+            if kernel.adapted_slot_arity(*slot).is_none() {
+                return false;
+            }
+            slots = more;
         }
         rest = tail;
     }
     true
 }
 
-// IPE-RUST-AUDIT:ACCEPTED (Arthur Maciel) — compile-time `const` assertion (not a runtime panic); fails the BUILD if a handler the backend re-wraps as an `Arc` callback is not derived as an `AcceptsShared` function slot, which would eta-convert a value the backend expects to re-wrap [ledger #boundary]
+// IPE-RUST-AUDIT:ACCEPTED (Arthur Maciel) — compile-time `const` assertion (not a runtime panic); fails the BUILD if an adapted callback slot does not fit its kernel's scheme, which would let lowering normalize, and the backend adapt, an argument that is not a callback [ledger #boundary]
 #[allow(clippy::assertions_on_constants)] // the constant IS the tripwire
 const _: () = assert!(
-    capture_cloned_handlers_accept_shared(StdlibKernel::ALL),
-    "a kernel's capture_cloned_handler_arg is not an AcceptsShared function slot",
+    adapted_slots_fit_schemes(StdlibKernel::ALL),
+    "a kernel's adapted_slots entry does not fit its scheme",
 );
 
 /// Whether `shape`'s final result, past every arrow, is an app carrier (a `Program` or the opaque `WebApp` leaf).
@@ -15933,19 +16015,1270 @@ impl StdlibKernel {
         )
     }
 
-    /// The argument index of the handler the backend re-wraps with a capture-clone prologue.
+    /// Whether the backend emits this kernel's call by naming the synthesised `RetryPolicy` struct.
     ///
-    /// The backend rebuilds this handler inside a fresh `move` closure per call
-    /// and shadows every free local the handler captures with `.clone()`, so
-    /// each such capture must be `Clone`. The lowerer reads this index to refuse
-    /// a non-`Clone` capture (IPE-L0126) and a point-free or partial use
-    /// (IPE-L0152) at `ipe` time; the backend asserts the index at build time
-    /// against the argument it re-wraps.
+    /// The emitted code of each listed kernel builds, updates, or reads the
+    /// `RetryPolicy` record struct by its field set, so the struct must be
+    /// emitted whenever a surviving function calls one of them, even when no
+    /// IR type slot of the program names the record.
     #[must_use]
-    pub const fn capture_cloned_handler_arg(self) -> Option<usize> {
+    pub const fn names_retry_policy_struct(self) -> bool {
+        matches!(
+            self,
+            Self::TaskRetryWith
+                | Self::TaskLinearBackoff
+                | Self::TaskExponentialBackoff
+                | Self::TaskWithJitter
+                | Self::TaskRetryOn
+                | Self::TaskWithRetryOn
+                | Self::TaskDefaultRetryPolicy
+                | Self::TaskWithMaxAttempts
+                | Self::TaskWithBaseMs
+        )
+    }
+
+    /// The argument slots the backend adapts into a callback closure of its own.
+    ///
+    /// Each listed slot holds, after lowering, the handler normal form: leading
+    /// `let`s around one closure literal, which the backend emits as the
+    /// callback itself. Lowering normalizes every listed slot
+    /// (`normalize_adapted_handler_args`) and the backend refuses any other
+    /// shape, so no emitted callback re-runs an argument's code inside a closure
+    /// the capture analysis never saw. The match is exhaustive, so a new kernel
+    /// states its slots explicitly.
+    #[must_use]
+    #[allow(clippy::too_many_lines)] // one arm per slot set; the exhaustive match IS the table
+    #[allow(clippy::match_same_arms)] // the no-slot set is split so each or-pattern stays under the panic-scan nesting ceiling
+    pub const fn adapted_slots(self) -> &'static [AdaptedSlot] {
         match self {
-            Self::StreamStream => Some(1),
-            _ => None,
+            Self::UiOnInput
+            | Self::UiOnChange
+            | Self::UiOnKeyDown
+            | Self::UiOnKeyUp
+            | Self::UiOnFile
+            | Self::UiOnBool
+            | Self::HtmlOnInput
+            | Self::HtmlOnChange
+            | Self::HtmlOnKeyDown
+            | Self::HtmlOnKeyUp
+            | Self::HtmlOnBool
+            | Self::LazyLazy
+            | Self::LazyLazy2
+            | Self::LazyLazy3
+            | Self::LazyLazy4
+            | Self::LazyLazy5
+            | Self::TaskRetryOn
+            | Self::TaskWithRetryOn => &[AdaptedSlot::Arg(0)],
+            Self::StreamStream => &[AdaptedSlot::Arg(1)],
+            Self::UiWidget => &[AdaptedSlot::Arg(2)],
+            Self::UiOnSubmit | Self::HtmlOnSubmit => &[AdaptedSlot::FormHandler(0)],
+            Self::TaskRetryWith => &[AdaptedSlot::Thunk(1)],
+            Self::InputText
+            | Self::InputEmail
+            | Self::InputUsername
+            | Self::InputSearch
+            | Self::InputCurrentPassword
+            | Self::InputNewPassword
+            | Self::InputMultiline
+            | Self::InputSlider
+            | Self::InputRadio
+            | Self::InputRadioRow
+            | Self::InputCheckbox => &[AdaptedSlot::Field { arg: 1 }],
+            Self::LogInfo
+            | Self::LogDebug
+            | Self::LogWarn
+            | Self::LogError
+            | Self::LogInfoWith
+            | Self::LogDebugWith
+            | Self::LogWarnWith
+            | Self::LogErrorWith
+            | Self::StringFromInt
+            | Self::StringFromFloat
+            | Self::StringLength
+            | Self::StringIsEmpty
+            | Self::StringReverse
+            | Self::StringToUpper
+            | Self::StringToLower
+            | Self::StringCasefold
+            | Self::StringTrim
+            | Self::StringTrimStart
+            | Self::StringTrimEnd
+            | Self::StringToInt
+            | Self::StringToFloat
+            | Self::StringFromChar
+            | Self::StringFromBool
+            | Self::StringFromList
+            | Self::StringConcat
+            | Self::StringWords
+            | Self::StringLines
+            | Self::StringToList
+            | Self::StringIsEmail
+            | Self::StringIsUrl
+            | Self::StringAppend
+            | Self::StringContains
+            | Self::StringStartsWith
+            | Self::StringEndsWith
+            | Self::StringEqualFold
+            | Self::StringJoin
+            | Self::StringSplit
+            | Self::StringRepeat
+            | Self::StringDropLeft
+            | Self::StringDropRight
+            | Self::StringReplace
+            | Self::StringSlice
+            | Self::StringPadLeft
+            | Self::StringPadRight
+            | Self::StringContainsIn
+            | Self::StringStartsWithIn
+            | Self::StringEndsWithIn
+            | Self::StringLeft
+            | Self::StringRight
+            | Self::StringCons
+            | Self::StringUncons
+            | Self::StringPad
+            | Self::StringIndexes
+            | Self::StringMap
+            | Self::StringFilter
+            | Self::StringFoldl
+            | Self::StringFoldr
+            | Self::StringAny
+            | Self::StringAll
+            | Self::CharIsAlpha
+            | Self::CharIsDigit
+            | Self::CharIsLower
+            | Self::CharIsUpper
+            | Self::CharToLower
+            | Self::CharToUpper
+            | Self::CharToCode
+            | Self::CharFromCode
+            | Self::CharIsAlphaNum
+            | Self::CharIsHexDigit
+            | Self::CharIsOctDigit
+            | Self::ListMap
+            | Self::ListFilter
+            | Self::ListFoldl
+            | Self::ListFoldr
+            | Self::ListLength
+            | Self::ListHead
+            | Self::ListTail
+            | Self::ListMember
+            | Self::ListRange
+            | Self::ListReverse
+            | Self::ListAppend
+            | Self::ListConcat
+            | Self::ListTake
+            | Self::ListDrop
+            | Self::ListZip
+            | Self::ListCons
+            | Self::ListIsEmpty
+            | Self::ListConcatMap
+            | Self::ListIndexedMap
+            | Self::ListAny
+            | Self::ListAll
+            | Self::ListFind
+            | Self::ListFilterMap
+            | Self::ListSortBy
+            | Self::ListSort
+            | Self::ListSortWith
+            | Self::ListSingleton
+            | Self::ListRepeat
+            | Self::ListSum
+            | Self::ListProduct
+            | Self::ListMaximum
+            | Self::ListMinimum
+            | Self::ListUnique
+            | Self::ListIntersperse
+            | Self::ListPartition
+            | Self::ListUnzip
+            | Self::ListMap2
+            | Self::ListMap3
+            | Self::ListMap4
+            | Self::ListMap5
+            | Self::BasicsNot
+            | Self::BasicsIdentity
+            | Self::BasicsAlways
+            | Self::BasicsFst
+            | Self::BasicsSnd
+            | Self::BasicsModBy
+            | Self::BasicsClamp
+            | Self::BasicsNegate
+            | Self::BasicsAbs
+            | Self::BasicsSqrt
+            | Self::BasicsMin
+            | Self::BasicsMax
+            | Self::BasicsCompare
+            | Self::ErrorUnexpected
+            | Self::ErrorInvalidInput
+            | Self::ErrorIo
+            | Self::ErrorNetwork
+            | Self::ErrorFfi
+            | Self::ErrorDecode
+            | Self::ErrorConflict
+            | Self::ErrorUnavailable
+            | Self::ErrorLimitExceeded
+            | Self::ErrorTimeout
+            | Self::ErrorNotFound
+            | Self::ErrorPermissionDenied
+            | Self::ErrorToString
+            | Self::ErrorWithMessage
+            | Self::ErrorIsRetryable
+            | Self::ErrorWithDetails
+            | Self::ErrorKind
+            | Self::ErrorMessage
+            | Self::ErrorKindName
+            | Self::CssSafetySafeValue
+            | Self::CssSafetySafePropName
+            | Self::CssSafetySafeSelector
+            | Self::CssSafetyStripStyleClose
+            | Self::CssSafetySanitizeRawBody
+            | Self::MaybeWithDefault
+            | Self::MaybeMap
+            | Self::MaybeAndThen
+            | Self::MaybeMap2
+            | Self::MaybeMap3
+            | Self::MaybeMap4
+            | Self::MaybeMap5
+            | Self::MaybeAndMap
+            | Self::MaybeCombine
+            | Self::MaybeIsJust
+            | Self::MaybeIsNothing
+            | Self::ResultWithDefault
+            | Self::ResultMap
+            | Self::ResultAndThen
+            | Self::ResultMapError
+            | Self::ResultMap2
+            | Self::ResultMap3
+            | Self::ResultMap4
+            | Self::ResultMap5
+            | Self::ResultAndMap
+            | Self::ResultCombine
+            | Self::ResultTraverse
+            | Self::ResultToMaybe
+            | Self::ResultFromMaybe
+            | Self::ResultOkDefault
+            | Self::Interpolate
+            | Self::MathMin
+            | Self::MathMax
+            | Self::MathPi
+            | Self::MathE
+            | Self::MathPhi
+            | Self::MathSqrt2
+            | Self::MathInf
+            | Self::MathNan
+            | Self::MathIsNaN
+            | Self::MathAbs
+            | Self::MathSqrt
+            | Self::MathCbrt
+            | Self::MathExp
+            | Self::MathExp2
+            | Self::MathLog
+            | Self::MathLog2
+            | Self::MathLog10
+            | Self::MathSin
+            | Self::MathCos
+            | Self::MathTan
+            | Self::MathAsin
+            | Self::MathAcos
+            | Self::MathAtan
+            | Self::MathSinh
+            | Self::MathCosh
+            | Self::MathTanh
+            | Self::MathAsinh
+            | Self::MathAcosh
+            | Self::MathAtanh
+            | Self::MathFloor
+            | Self::MathCeil
+            | Self::MathRound
+            | Self::MathTrunc
+            | Self::MathPow
+            | Self::MathHypot
+            | Self::MathAtan2
+            | Self::MathMod
+            | Self::MathRemainder
+            | Self::BitwiseAnd
+            | Self::BitwiseOr
+            | Self::BitwiseXor
+            | Self::BitwiseComplement
+            | Self::BitwiseShiftLeftBy
+            | Self::BitwiseShiftRightBy
+            | Self::BitwiseShiftRightZfBy
+            | Self::RandomSeededInt
+            | Self::RandomSeededFloat
+            | Self::RandomSeededChoice
+            | Self::DictEmpty
+            | Self::DictIsEmpty
+            | Self::DictSize
+            | Self::DictKeys
+            | Self::DictValues
+            | Self::DictToList
+            | Self::DictFromList
+            | Self::DictGet
+            | Self::DictMember
+            | Self::DictRemove
+            | Self::DictUnion
+            | Self::DictMap
+            | Self::DictInsert
+            | Self::DictFoldl
+            | Self::DictSingleton
+            | Self::DictFoldr
+            | Self::DictFilter
+            | Self::DictPartition
+            | Self::DictIntersect
+            | Self::DictDiff
+            | Self::DictUpdate
+            | Self::SetEmpty
+            | Self::SetSize
+            | Self::SetToList
+            | Self::SetFromList
+            | Self::SetMember
+            | Self::SetInsert
+            | Self::SetRemove
+            | Self::SetUnion
+            | Self::SetIntersect
+            | Self::SetDiff
+            | Self::SetIsEmpty
+            | Self::SetSingleton
+            | Self::SetFoldl
+            | Self::SetFoldr
+            | Self::SetMap
+            | Self::SetFilter
+            | Self::SetPartition
+            | Self::BytesEmpty
+            | Self::BytesLength
+            | Self::BytesIsEmpty
+            | Self::BytesFromString
+            | Self::BytesToString
+            | Self::BytesFromHex
+            | Self::BytesToHex
+            | Self::BytesFromBase64
+            | Self::BytesToBase64
+            | Self::BytesAppend
+            | Self::BytesSlice
+            | Self::EncodingBase64Encode
+            | Self::EncodingBase64Decode
+            | Self::EncodingUrlEncode
+            | Self::EncodingUrlDecode
+            | Self::EncodingPercentDecode
+            | Self::EncodingHexEncode
+            | Self::EncodingHexDecode
+            | Self::JsonEncString
+            | Self::JsonEncInt
+            | Self::JsonEncFloat
+            | Self::JsonEncBool
+            | Self::JsonEncNull
+            | Self::JsonEncList
+            | Self::JsonEncObject
+            | Self::JsonEncEncode
+            | Self::JsonDecString
+            | Self::JsonDecInt
+            | Self::JsonDecFloat
+            | Self::JsonDecBool
+            | Self::JsonDecValue
+            | Self::JsonDecDecodeString
+            | Self::JsonDecDecodeValue
+            | Self::JsonDecField
+            | Self::JsonDecAt
+            | Self::JsonDecIndex
+            | Self::JsonDecList
+            | Self::JsonDecNullable
+            | Self::JsonDecMap
+            | Self::JsonDecAndThen
+            | Self::JsonDecSucceed => &[],
+            Self::JsonDecFail
+            | Self::JsonDecOneOf
+            | Self::JsonDecMap2
+            | Self::JsonDecMap3
+            | Self::JsonDecMap4
+            | Self::JsonDecPRequired
+            | Self::JsonDecPOptional
+            | Self::JsonDecPCustom
+            | Self::JsonDecPRequiredAt
+            | Self::CryptoSha256
+            | Self::CryptoSha512
+            | Self::CryptoSha1
+            | Self::CryptoMd5
+            | Self::CryptoRsaSha256Sign
+            | Self::CryptoRsaSha256Verify
+            | Self::CryptoConstantTimeEqual
+            | Self::CryptoAesGcmEncrypt
+            | Self::CryptoAesGcmDecrypt
+            | Self::CryptoChacha20Encrypt
+            | Self::CryptoChacha20Decrypt
+            | Self::CryptoAesKeyFromPassword
+            | Self::CryptoChachaKeyFromPassword
+            | Self::CryptoRandomBytes
+            | Self::CryptoRandomToken
+            | Self::UuidV4
+            | Self::UuidV7
+            | Self::UuidParse
+            | Self::JwtEncodeHs256
+            | Self::JwtDecodeHs256
+            | Self::JwtEncodeRs256
+            | Self::JwtDecodeRs256
+            | Self::JwtClaims
+            | Self::JwtHs256
+            | Self::JwtRs256
+            | Self::JwtSubject
+            | Self::JwtIssuer
+            | Self::JwtAudience
+            | Self::JwtExpiresAt
+            | Self::JwtNotBefore
+            | Self::JwtIssuedAt
+            | Self::JwtJwtId
+            | Self::JwtWithClaim
+            | Self::JwtEncode
+            | Self::JwtDecode
+            | Self::TaskSucceed
+            | Self::TaskFail
+            | Self::TaskMap
+            | Self::TaskMap2
+            | Self::TaskMap3
+            | Self::TaskMap4
+            | Self::TaskMap5
+            | Self::TaskAttempt
+            | Self::TaskAndThen
+            | Self::TaskMapError
+            | Self::TaskOnError
+            | Self::TaskFromResult
+            | Self::TaskAndThenResult
+            | Self::TaskSequence
+            | Self::TaskParallel
+            | Self::TaskRun
+            | Self::TaskPerform
+            | Self::TaskLazy
+            | Self::TaskLoop
+            | Self::TaskLinearBackoff
+            | Self::TaskExponentialBackoff
+            | Self::TaskWithJitter
+            | Self::TaskDefaultRetryPolicy
+            | Self::TaskWithMaxAttempts
+            | Self::TaskWithBaseMs
+            | Self::IoReadLine
+            | Self::IoReadSecret
+            | Self::IoWriteStdout
+            | Self::IoWriteStderr
+            | Self::IoPrintln
+            | Self::IoEprintln
+            | Self::DebugLog
+            | Self::DebugTodo
+            | Self::DebugExplain
+            | Self::TimeNow
+            | Self::TimeSleep
+            | Self::TimeUnixMillis
+            | Self::TimeTimeString
+            | Self::TimeIsLeapYear
+            | Self::TimeDaysInMonth
+            | Self::TimeFormat
+            | Self::TimeFormatHTTP
+            | Self::TimeFormatISO8601
+            | Self::TimeFormatRFC3339
+            | Self::TimeAddMillis
+            | Self::TimeDiffMillis
+            | Self::SystemArgs
+            | Self::SystemGetenv
+            | Self::SystemGetenvOr
+            | Self::SystemGetArg
+            | Self::SystemGetenvInt
+            | Self::SystemGetenvBool
+            | Self::SystemSetenv
+            | Self::SystemUnsetenv
+            | Self::SystemCwd
+            | Self::SystemGetcwd
+            | Self::SystemLoadEnv
+            | Self::SystemExit
+            | Self::RandomInt
+            | Self::RandomFloat
+            | Self::RandomChoice
+            | Self::RandomChoiceMaybe
+            | Self::RandomShuffle
+            | Self::RandomWeighted
+            | Self::FileReadFile
+            | Self::FileWriteFile
+            | Self::FileExists
+            | Self::FileRemove
+            | Self::FileMkdirAll
+            | Self::FileReadFileLimit
+            | Self::FileReadFileBytes
+            | Self::FileAppend
+            | Self::FileReadDir
+            | Self::FileIsDir
+            | Self::FileTempFile
+            | Self::FileTempDir
+            | Self::FileCopy
+            | Self::FileRename
+            | Self::FileDelete
+            | Self::FileWalk
+            | Self::FileWalkMatching
+            | Self::ProcessRun
+            | Self::ProcessRunWith
+            | Self::ProcessRunInPty
+            | Self::HttpGet
+            | Self::HttpPost
+            | Self::HttpRequest
+            | Self::HttpParseQuery
+            | Self::HttpDefaultRequest
+            | Self::HttpDefaultRequestFromString
+            | Self::HttpWithMethod
+            | Self::HttpWithTimeout
+            | Self::HttpWithBody
+            | Self::HttpWithHeader
+            | Self::HttpWithUrl
+            | Self::HttpWithRedirects
+            | Self::HttpMethodFromString
+            | Self::HttpMethodToString
+            | Self::DbConnect
+            | Self::DbOpen
+            | Self::DbClose
+            | Self::DbLocationFile
+            | Self::DbLocationMemory
+            | Self::DbLocationDsn
+            | Self::DsnParse
+            | Self::DsnBuild
+            | Self::DsnDriverTag
+            | Self::DsnHost
+            | Self::DsnPort
+            | Self::DsnDatabase
+            | Self::DsnUser
+            | Self::DsnTlsTag
+            | Self::DsnRedacted
+            | Self::DbConnOpen
+            | Self::DbConnClose
+            | Self::DbConnUnsafeExecRawOn
+            | Self::DbConnFindWhere
+            | Self::DbConnQueryDecode
+            | Self::DbConnGetById
+            | Self::DbExecRaw
+            | Self::DbExec
+            | Self::DbQuery
+            | Self::DbQueryDecode
+            | Self::DbGetString
+            | Self::DbGetInt
+            | Self::DbGetBool
+            | Self::DbGetField
+            | Self::DbInsertRow
+            | Self::DbGetById
+            | Self::DbUpdateById
+            | Self::DbDeleteById
+            | Self::DbFindOneByField
+            | Self::DbFindManyByField
+            | Self::DbFindByConditions
+            | Self::DbInsertFields
+            | Self::DbUpdateFields
+            | Self::DbInsertFieldsReturning
+            | Self::DbWithTransaction
+            | Self::DbMigrate
+            | Self::DbDefaultMigration
+            | Self::StoreEqCol
+            | Self::StoreJoin
+            | Self::StoreSelect
+            | Self::StoreLiteral
+            | Self::StoreUpper
+            | Self::StoreLower
+            | Self::StoreCoalesce
+            | Self::StoreAdd
+            | Self::StoreSub
+            | Self::StoreMul
+            | Self::StoreEqBy
+            | Self::StoreNeqCol
+            | Self::StoreNeqBy
+            | Self::StoreGtCol
+            | Self::StoreGtBy
+            | Self::StoreGteCol
+            | Self::StoreGteBy
+            | Self::StoreLtCol
+            | Self::StoreLtBy
+            | Self::StoreLteCol
+            | Self::StoreLteBy
+            | Self::StoreLike
+            | Self::StoreStartsWith
+            | Self::StoreIsNull
+            | Self::StoreNotNull
+            | Self::StoreInListCol
+            | Self::StoreInListBy
+            | Self::StorePrimaryKey
+            | Self::StoreCompositePrimaryKey2
+            | Self::StoreCompositePrimaryKey3
+            | Self::StoreSerial
+            | Self::StoreUnique
+            | Self::StoreDefaultNow
+            | Self::StoreTouchOnUpdate
+            | Self::StoreDefaultText
+            | Self::StoreDefaultInt
+            | Self::StoreOwnerColumn
+            | Self::StoreImmutable
+            | Self::StoreMask
+            | Self::StoreCorrelate
+            | Self::StoreExistsIn
+            | Self::StoreOrderByLeft
+            | Self::StoreOrderByRight
+            | Self::DbDecString
+            | Self::DbDecInt
+            | Self::DbDecFloat
+            | Self::DbDecBool
+            | Self::DbDecNullable
+            | Self::DbDecMap
+            | Self::DbDecAndThen
+            | Self::DbDecSucceed
+            | Self::DbDecFail
+            | Self::DbDecMap2
+            | Self::DbDecMap3
+            | Self::DbDecMap4
+            | Self::DbDecRequired
+            | Self::DbDecOptional
+            | Self::DbDecMoney
+            | Self::DbDecDecimal
+            | Self::DbDecBytes
+            | Self::CmdNone
+            | Self::CmdBatch
+            | Self::CmdPerform
+            | Self::CmdMap
+            | Self::SubNone
+            | Self::SubBatch
+            | Self::SubEvery
+            | Self::TimeEvery
+            | Self::SubMap
+            | Self::TuiSubOnKey
+            | Self::CliSubOnLine
+            | Self::CmdPublish
+            | Self::CmdPublishNoEcho
+            | Self::SubSubscribeTopic
+            | Self::PubSubPublish
+            | Self::PubSubPublishNoEcho
+            | Self::PubSubTopic
+            | Self::ServerGet
+            | Self::ServerPost
+            | Self::ServerPut
+            | Self::ServerDelete
+            | Self::ServerAny
+            | Self::ServerApi
+            | Self::ServerStatic
+            | Self::ServerMountApp
+            | Self::ServerListen
+            | Self::ServerText
+            | Self::ServerJson
+            | Self::ServerHtml
+            | Self::ServerWithStatus
+            | Self::ServerWithHeader
+            | Self::ServerRedirect
+            | Self::ServerParam
+            | Self::ServerQueryParam
+            | Self::ServerHeader
+            | Self::ServerGetCookie
+            | Self::ServerBody
+            | Self::ServerPath
+            | Self::ServerMethod
+            | Self::ServerCookieNew
+            | Self::ServerWithCookie
+            | Self::ServerAuthConfig
+            | Self::ServerTokenBearer
+            | Self::ServerCookieToken
+            | Self::ServerWithRevocation
+            | Self::ServerGetAuthed
+            | Self::ServerPostAuthed
+            | Self::ServerPutAuthed
+            | Self::ServerDeleteAuthed
+            | Self::MiddlewareWithCors
+            | Self::MiddlewareWithLogging
+            | Self::MiddlewareWithBasicAuth
+            | Self::MiddlewareWithRateLimit
+            | Self::MiddlewareWithCsrf
+            | Self::RateLimitAllow
+            | Self::UiLayout => &[],
+            Self::UiLayoutWith
+            | Self::HtmlRender
+            | Self::HtmlEscapeText
+            | Self::HtmlEscapeAttr
+            | Self::HtmlAttrToString
+            | Self::UiNone
+            | Self::UiText
+            | Self::UiHtml
+            | Self::UiCells
+            | Self::UiCellsNone
+            | Self::UiCellsText
+            | Self::UiCellsEl
+            | Self::UiCellsRow
+            | Self::UiCellsColumn
+            | Self::UiCellsCells
+            | Self::TuiUiSpacing
+            | Self::TuiUiPadding
+            | Self::TuiUiAlignLeft
+            | Self::TuiUiAlignRight
+            | Self::TuiUiCenter
+            | Self::TuiUiBold
+            | Self::TuiUiUnderline
+            | Self::TuiUiDim
+            | Self::TuiUiReverse
+            | Self::TuiUiColor
+            | Self::TuiUiBg
+            | Self::CliUiNone
+            | Self::CliUiText
+            | Self::CliUiLine
+            | Self::CliUiLines
+            | Self::CliUiBold
+            | Self::CliUiUnderline
+            | Self::CliUiDim
+            | Self::CliUiReverse
+            | Self::CliUiColor
+            | Self::CliUiBg
+            | Self::TermColorBlack
+            | Self::TermColorRed
+            | Self::TermColorGreen
+            | Self::TermColorYellow
+            | Self::TermColorBlue
+            | Self::TermColorMagenta
+            | Self::TermColorCyan
+            | Self::TermColorWhite
+            | Self::TermColorBrightBlack
+            | Self::TermColorBrightRed
+            | Self::TermColorBrightGreen
+            | Self::TermColorBrightYellow
+            | Self::TermColorBrightBlue
+            | Self::TermColorBrightMagenta
+            | Self::TermColorBrightCyan
+            | Self::TermColorBrightWhite
+            | Self::TermColorDefault
+            | Self::TermColorRgb
+            | Self::TermColorRgba
+            | Self::UiNode
+            | Self::UiTaggedNode
+            | Self::UiButton
+            | Self::UiLink
+            | Self::UiImage
+            | Self::UiAbove
+            | Self::UiBelow
+            | Self::UiOnLeft
+            | Self::UiOnRight
+            | Self::UiInFront
+            | Self::UiBehind
+            | Self::UiSpacing
+            | Self::UiPadding
+            | Self::UiPaddingXY
+            | Self::UiPaddingEach
+            | Self::UiWidth
+            | Self::UiHeight
+            | Self::UiCenterX
+            | Self::UiCenterY
+            | Self::UiAlignLeft
+            | Self::UiAlignRight
+            | Self::UiAlignTop
+            | Self::UiAlignBottom
+            | Self::UiPointer
+            | Self::UiClip
+            | Self::UiClipX
+            | Self::UiClipY
+            | Self::UiScrollbars
+            | Self::UiScrollbarX
+            | Self::UiScrollbarY
+            | Self::UiGridColumns
+            | Self::UiPx
+            | Self::UiFill
+            | Self::UiContent
+            | Self::UiShrink
+            | Self::UiFillPortion
+            | Self::UiVh
+            | Self::UiVw
+            | Self::UiMinimum
+            | Self::UiMaximum
+            | Self::UiRgb
+            | Self::UiRgba
+            | Self::UiWhite
+            | Self::UiBlack
+            | Self::UiTransparent
+            | Self::UiColorCss
+            | Self::BackgroundColor
+            | Self::BackgroundImage
+            | Self::BackgroundLinearGradient
+            | Self::BorderWidth
+            | Self::BorderRounded
+            | Self::BorderColor
+            | Self::BorderWidthEach
+            | Self::BorderShadow
+            | Self::BorderGlow
+            | Self::BorderInnerShadow
+            | Self::FontSize
+            | Self::FontColor
+            | Self::FontFamily
+            | Self::FontBold
+            | Self::FontItalic
+            | Self::HtmlTextNode
+            | Self::HtmlRawNode
+            | Self::HtmlNode
+            | Self::HtmlVoidNode
+            | Self::HtmlDoctype
+            | Self::HtmlTitleNode
+            | Self::HtmlToString
+            | Self::HtmlStyleNode
+            | Self::HtmlScriptNode
+            | Self::HtmlAttribute
+            | Self::HtmlBoolAttribute
+            | Self::HtmlNoAttr
+            | Self::WebApp
+            | Self::WebAppRouted
+            | Self::WebEmbed
+            | Self::WebRoute
+            | Self::WebRenderStatic
+            | Self::TerminalAppScreen
+            | Self::WebAppWith
+            | Self::AppFromEnv
+            | Self::AppFromEnvRequired
+            | Self::HostBind
+            | Self::LogLevelSetting
+            | Self::DbUrlSetting
+            | Self::ConsoleAdminToken
+            | Self::ConsoleIngestToken
+            | Self::ConsoleMetricsToken
+            | Self::WebCsrf
+            | Self::WebSessionTtl
+            | Self::WebAuthMaxLifetime
+            | Self::WebAuthSlideWindow
+            | Self::WebAuthRevocationMode
+            | Self::HostLoopback
+            | Self::HostAllInterfaces
+            | Self::HostEnvDriven
+            | Self::LevelDebug
+            | Self::LevelInfo
+            | Self::LevelWarn
+            | Self::LevelError
+            | Self::WebCsrfStrict
+            | Self::WebCsrfInherit
+            | Self::WebRevocationOff
+            | Self::WebRevocationStore
+            | Self::UiOnClick
+            | Self::UiOnFocus
+            | Self::UiOnBlur
+            | Self::UiOnMouseOver
+            | Self::UiOnMouseOut
+            | Self::HtmlOnClick
+            | Self::HtmlOnFocus
+            | Self::HtmlOnBlur
+            | Self::HtmlOnMouseOver
+            | Self::HtmlOnMouseOut
+            | Self::UiSquare
+            | Self::UiWidescreen
+            | Self::UiCinemascope
+            | Self::UiAspectRatio
+            | Self::UiAspectRatioWH
+            | Self::UiHtmlAttribute
+            | Self::UiName
+            | Self::UiStyle
+            | Self::UiTransitionRaw
+            | Self::UiGridTracksRaw
+            | Self::UiAnimateRaw
+            | Self::UiBreakpoint
+            | Self::UiMediaQuery
+            | Self::UiMobile
+            | Self::UiTablet
+            | Self::UiDesktop
+            | Self::UiDarkMode
+            | Self::UiLightMode
+            | Self::UiReducedMotion
+            | Self::UiOnPseudo
+            | Self::UiHover
+            | Self::UiFocus
+            | Self::UiFocusVisible
+            | Self::UiActive
+            | Self::UiDisabled
+            | Self::BackgroundHoverColor
+            | Self::BackgroundFocusColor
+            | Self::BackgroundActiveColor
+            | Self::BackgroundDisabledColor
+            | Self::BorderSolid
+            | Self::BorderDashed
+            | Self::BorderDotted
+            | Self::BorderHoverColor
+            | Self::BorderFocusColor
+            | Self::BorderActiveColor
+            | Self::BorderHoverWidth
+            | Self::BorderHoverRounded
+            | Self::FontWeight
+            | Self::FontSemiBold
+            | Self::FontRegular
+            | Self::FontLight
+            | Self::FontExtraBold
+            | Self::FontBlack
+            | Self::FontUnderline
+            | Self::FontNoDecoration
+            | Self::FontLineThrough
+            | Self::FontLetterSpacing
+            | Self::FontWordSpacing
+            | Self::FontAlignLeft
+            | Self::FontAlignRight
+            | Self::FontAlignCenter
+            | Self::FontCenter
+            | Self::FontJustify
+            | Self::FontSansSerif
+            | Self::FontSerif
+            | Self::FontMonospace
+            | Self::FontHoverColor
+            | Self::FontFocusColor
+            | Self::FontActiveColor
+            | Self::FontDisabledColor
+            | Self::FontHoverSize
+            | Self::TerminalAppLines
+            | Self::TeaWorker
+            | Self::AuthHashPassword
+            | Self::AuthHashPasswordCost
+            | Self::AuthVerifyPassword
+            | Self::AuthPasswordStrength
+            | Self::AuthSignToken
+            | Self::AuthVerifyToken
+            | Self::AuthRegister
+            | Self::AuthLogin
+            | Self::AuthSetRole
+            | Self::AuthSubject
+            | Self::AuthClaim
+            | Self::AuthHasRole
+            | Self::AuthMemberOf
+            | Self::AuthRevocationRevokeUser
+            | Self::AuthRevocationRevokeSession
+            | Self::AuthRevocationRestoreUser
+            | Self::AuthRevocationIsRevoked
+            | Self::StreamEmit
+            | Self::StreamFinish
+            | Self::StreamWithContentType
+            | Self::HttpStreamOpen
+            | Self::HttpStreamForEachChunk
+            | Self::HttpStreamClose
+            | Self::HttpStreamChunks
+            | Self::WsDefaultCfg
+            | Self::WsWithOnConnect
+            | Self::WsWithOnMessage
+            | Self::WsWithOnClose
+            | Self::WsWithOnError
+            | Self::WsWithMaxMessageBytes
+            | Self::WsWithOriginPatterns
+            | Self::WsUpgrade
+            | Self::WsSendToClient
+            | Self::WsSendBinaryToClient
+            | Self::WsBroadcast
+            | Self::WsCloseClient
+            | Self::WebSocketConnect
+            | Self::WebSocketConnectWith
+            | Self::WebSocketSend
+            | Self::WebSocketSendBinary
+            | Self::WebSocketClose
+            | Self::WebSocketCloseWithCode
+            | Self::SubSubscribeWebSocket
+            | Self::JsSend
+            | Self::JsSubscribe
+            | Self::JsRequest
+            | Self::JsOpenSession
+            | Self::JsSessionFrames
+            | Self::JsSendToSession
+            | Self::JsCloseSession
+            | Self::EnvPublic
+            | Self::RegionMainContent
+            | Self::RegionNavigation
+            | Self::RegionFooter
+            | Self::RegionAside
+            | Self::RegionHeading
+            | Self::RegionLabel
+            | Self::RegionAnnounce
+            | Self::RegionAnnounceUrgently
+            | Self::UiDescribe
+            | Self::UiDescNone
+            | Self::UiDescParagraph
+            | Self::UiDescMain
+            | Self::UiDescNavigation
+            | Self::UiDescContentInfo
+            | Self::UiDescComplementary
+            | Self::UiDescLivePolite
+            | Self::UiDescLiveAssertive => &[],
+            Self::UiDescHeading
+            | Self::UiDescLabel
+            | Self::InputLabelAbove
+            | Self::InputLabelBelow
+            | Self::InputLabelLeft
+            | Self::InputLabelRight
+            | Self::InputLabelHidden
+            | Self::InputPlaceholder
+            | Self::InputOption
+            | Self::KeyedColumn
+            | Self::KeyedRow
+            | Self::DecZero
+            | Self::DecOne
+            | Self::DecOneHundred
+            | Self::DecFromString
+            | Self::DecFromInt
+            | Self::DecFromFloat
+            | Self::DecFromMinor
+            | Self::DecToString
+            | Self::DecToStringFixed
+            | Self::DecToFloat
+            | Self::DecToInt
+            | Self::DecToMinor
+            | Self::DecAdd
+            | Self::DecSub
+            | Self::DecMul
+            | Self::DecDiv
+            | Self::DecMod
+            | Self::DecNeg
+            | Self::DecAbs
+            | Self::DecFloor
+            | Self::DecCeil
+            | Self::DecRound
+            | Self::DecRoundHalfUp
+            | Self::DecTruncate
+            | Self::DecCompare
+            | Self::DecEq
+            | Self::DecNeq
+            | Self::DecLt
+            | Self::DecLte
+            | Self::DecGt
+            | Self::DecGte
+            | Self::DecMin
+            | Self::DecMax
+            | Self::DecIsZero
+            | Self::DecIsPositive
+            | Self::DecIsNegative
+            | Self::DecPercentOf
+            | Self::DecAddPercent
+            | Self::DecSubPercent
+            | Self::DecFormatWith
+            | Self::MoneyMinorUnits
+            | Self::MoneySymbol
+            | Self::MoneyCurrencyName
+            | Self::MoneyIsKnownCurrency
+            | Self::MoneyFormat
+            | Self::MoneyFormatWithCode
+            | Self::MoneyAllocate
+            | Self::MoneySetRate
+            | Self::MoneyGetRate
+            | Self::MoneyHasRate
+            | Self::MoneyClearRates
+            | Self::SqlColumn
+            | Self::SqlUnsafeFragment
+            | Self::SqlParam
+            | Self::SqlInt
+            | Self::SqlString
+            | Self::SqlFloat
+            | Self::SqlBool
+            | Self::SqlEq
+            | Self::SqlNe
+            | Self::SqlGt
+            | Self::SqlLt
+            | Self::SqlGte
+            | Self::SqlLte
+            | Self::SqlAnd
+            | Self::SqlOr
+            | Self::SqlNot
+            | Self::SqlIsNull
+            | Self::SqlIsNotNull
+            | Self::SqlInList
+            | Self::SqlLike
+            | Self::SqlStartsWith
+            | Self::SqlExists
+            | Self::SqlMaskedColumn
+            | Self::DbFindWhere
+            | Self::DbFindWhereMasked
+            | Self::DbFindJoin
+            | Self::DbFindProjection
+            | Self::DbFindJoinOrdered
+            | Self::DbFindProjectionOrdered
+            | Self::DbDeleteWhere
+            | Self::DbUpdateWhere
+            | Self::DbUpsertFields
+            | Self::DbInsertFieldsChecked
+            | Self::DbUpdateWhereChecked
+            | Self::SecretFromString
+            | Self::SecretReveal
+            | Self::SecretUse
+            | Self::SecretRedacted
+            | Self::RegexCompile
+            | Self::RegexMatch
+            | Self::RegexFind
+            | Self::RegexFindAll
+            | Self::RegexReplace
+            | Self::RegexSplit
+            | Self::PathFromString
+            | Self::PathToString
+            | Self::PathBase
+            | Self::PathDir
+            | Self::PathExt
+            | Self::PathIsAbsolute
+            | Self::PathUnder
+            | Self::PathAbsolute
+            | Self::TraceSpan
+            | Self::TraceEvent
+            | Self::TraceAttr
+            | Self::CompressionGzip
+            | Self::CompressionGunzip
+            | Self::CompressionZstdCompress
+            | Self::CompressionZstdDecompress
+            | Self::CsvParse
+            | Self::CsvParseWithDelimiter
+            | Self::CsvEncode
+            | Self::CsvEncodeWithDelimiter
+            | Self::CsvParseStreamFromFile
+            | Self::CacheNewRaw
+            | Self::CacheGet
+            | Self::CachePut
+            | Self::CacheRemove
+            | Self::CacheClear
+            | Self::CacheSize
+            | Self::CacheStats
+            | Self::CacheDestroyRaw
+            | Self::ConfigString
+            | Self::ConfigInt
+            | Self::ConfigFloat
+            | Self::ConfigBool
+            | Self::ConfigNullable
+            | Self::ConfigField
+            | Self::ConfigAt
+            | Self::ConfigList
+            | Self::ConfigSucceed
+            | Self::ConfigFail
+            | Self::ConfigMap
+            | Self::ConfigAndThen
+            | Self::ConfigMap2
+            | Self::ConfigMap3
+            | Self::ConfigMap4
+            | Self::ConfigMap5
+            | Self::ConfigMap6
+            | Self::ConfigMap7
+            | Self::ConfigMap8
+            | Self::ConfigOneOf
+            | Self::ConfigIndex
+            | Self::ConfigKeyValuePairs
+            | Self::ConfigMaybe
+            | Self::ConfigDict
+            | Self::ConfigDecodeToml
+            | Self::ConfigDecodeYaml
+            | Self::ConfigDecodeJson
+            | Self::ConfigLoadFromFile
+            | Self::EmailSend
+            | Self::CryptoKeyFromString
+            | Self::CryptoKeyFromBytes
+            | Self::CryptoMacToHex
+            | Self::CryptoMacFromHex
+            | Self::CryptoHmacSha256WithKey
+            | Self::CryptoHmacSha512WithKey
+            | Self::CryptoVerifyHmacSha256
+            | Self::EmailAddressParse
+            | Self::EmailAddressToString
+            | Self::UrlFromString
+            | Self::UrlToString
+            | Self::UrlScheme
+            | Self::UrlHost
+            | Self::UrlPort
+            | Self::UrlPath
+            | Self::UrlQuery
+            | Self::UrlFragment
+            | Self::UrlSchemeShown
+            | Self::UrlBuildQuery
+            | Self::UrlRelativeParse
+            | Self::UrlRelativePath
+            | Self::UrlRelativeQuery
+            | Self::UrlRelativeFragment
+            | Self::UrlRelativeToString
+            | Self::LocaleFromTag
+            | Self::LocaleToTag
+            | Self::StringToUpperIn
+            | Self::StringToLowerIn
+            | Self::ColorRgb
+            | Self::ColorRgba
+            | Self::ColorHsl
+            | Self::ColorHsla
+            | Self::ColorWhite
+            | Self::ColorBlack
+            | Self::ColorRed
+            | Self::ColorGreen
+            | Self::ColorBlue
+            | Self::ColorTransparent
+            | Self::ColorToCss
+            | Self::ColorToCssRgba
+            | Self::ColorToHex
+            | Self::ColorLuminance
+            | Self::ColorWithAlpha
+            | Self::ColorMix
+            | Self::ColorBlend
+            | Self::ColorLighten
+            | Self::ColorDarken
+            | Self::ColorSaturate
+            | Self::ColorDesaturate
+            | Self::ColorRotateHue
+            | Self::ColorComplementary
+            | Self::ColorGrayscale
+            | Self::ColorFromHex
+            | Self::ColorFromName
+            | Self::ColorTrueColorProfile
+            | Self::ColorAnsi256Profile
+            | Self::ColorAnsi16Profile
+            | Self::ColorNoColorProfile
+            | Self::ColorToAnsi
+            | Self::ColorWcagAa
+            | Self::ColorWcagAaa
+            | Self::ColorNormalText
+            | Self::ColorLargeText
+            | Self::ColorContrastRatio
+            | Self::ColorReadableTextOn
+            | Self::ColorMeetsWcag
+            | Self::ColorMaximumContrast
+            | Self::ColorProtanopia
+            | Self::ColorDeuteranopia
+            | Self::ColorTritanopia
+            | Self::ColorSimulate => &[],
+        }
+    }
+
+    /// Whether `slot` is one of [`Self::adapted_slots`].
+    #[must_use]
+    pub const fn adapted_callback_slot(self, slot: AdaptedSlot) -> bool {
+        let mut rest = self.adapted_slots();
+        while let Some((listed, tail)) = rest.split_first() {
+            if listed.same(slot) {
+                return true;
+            }
+            rest = tail;
+        }
+        false
+    }
+
+    /// Whether the backend adapts any argument of this kernel into a callback closure.
+    #[must_use]
+    pub const fn has_adapted_slot(self) -> bool {
+        !self.adapted_slots().is_empty()
+    }
+
+    /// Whether this kernel is a form-submit builder whose handler is a decoder or a fixed message.
+    #[must_use]
+    pub const fn is_form_handler(self) -> bool {
+        matches!(self, Self::UiOnSubmit | Self::HtmlOnSubmit)
+    }
+
+    /// The parameter count of the closure an adapted `slot` holds, derived from the scheme.
+    ///
+    /// `None` when `slot` does not fit the scheme: an [`AdaptedSlot::Arg`] that
+    /// is not a function slot, an [`AdaptedSlot::Field`] whose argument is not
+    /// a record with function fields of one common arity, an
+    /// [`AdaptedSlot::Thunk`] that is not a `Task` argument, or an
+    /// [`AdaptedSlot::FormHandler`] on a kernel that is not a form builder.
+    #[must_use]
+    pub const fn adapted_slot_arity(self, slot: AdaptedSlot) -> Option<usize> {
+        let arg = slot.arg() as usize;
+        if arg >= self.decl().arity as usize {
+            return None;
+        }
+        let Some(shape) = self.scheme_shape() else {
+            return None;
+        };
+        let Some(arg_shape) = spine_arg(shape, arg) else {
+            return None;
+        };
+        match slot {
+            AdaptedSlot::Arg(_) => match arg_shape {
+                TyShape::Fun(..) if self.fn_slot_carrier(arg).is_some() => {
+                    Some(arrow_arity(arg_shape))
+                }
+                _ => None,
+            },
+            AdaptedSlot::Field { .. } => record_fn_field_arity(arg_shape),
+            AdaptedSlot::FormHandler(_) if self.is_form_handler() => Some(1),
+            AdaptedSlot::FormHandler(_) => None,
+            AdaptedSlot::Thunk(_) => match arg_shape {
+                TyShape::Con(BuiltinTag::Task, _) => Some(0),
+                _ => None,
+            },
         }
     }
 
@@ -18311,6 +19644,70 @@ mod tests {
                 expected,
             );
         }
+    }
+
+    /// Every adapted callback slot fits its kernel's scheme, and every `+Sync` callback kernel is adapted.
+    ///
+    /// A slot naming a non-function argument has no arity, which the build-time
+    /// assertion also refuses; a sync callback kernel missing from the table
+    /// would leave its handler outside the handler normal form.
+    #[test]
+    fn adapted_slots_are_fn_slots() {
+        use super::AdaptedSlot;
+        for k in StdlibKernel::ALL {
+            for slot in k.adapted_slots() {
+                assert!(
+                    k.adapted_slot_arity(*slot).is_some(),
+                    "{k:?}: adapted slot {slot:?} does not fit the scheme",
+                );
+                assert!(k.adapted_callback_slot(*slot), "{k:?}: {slot:?} not found");
+            }
+            if k.requires_sync_capture() {
+                assert!(
+                    k.has_adapted_slot(),
+                    "{k:?} is a +Sync callback kernel with no adapted slot"
+                );
+            }
+        }
+        assert_eq!(
+            StdlibKernel::UiOnKeyDown.adapted_slot_arity(AdaptedSlot::Arg(0)),
+            Some(1)
+        );
+        assert_eq!(
+            StdlibKernel::TaskRetryWith.adapted_slot_arity(AdaptedSlot::Thunk(1)),
+            Some(0)
+        );
+        assert_eq!(
+            StdlibKernel::InputCheckbox.adapted_slot_arity(AdaptedSlot::Field { arg: 1 }),
+            Some(1),
+        );
+        assert_eq!(
+            StdlibKernel::UiOnSubmit.adapted_slot_arity(AdaptedSlot::FormHandler(0)),
+            Some(1)
+        );
+        // The refusals: a value argument, a non-`Task` thunk, a non-record field
+        // slot and a form slot on another kernel have no arity.
+        assert_eq!(
+            StdlibKernel::UiOnClick.adapted_slot_arity(AdaptedSlot::Arg(0)),
+            None
+        );
+        assert_eq!(
+            StdlibKernel::TaskRetryWith.adapted_slot_arity(AdaptedSlot::Thunk(0)),
+            None
+        );
+        assert_eq!(
+            StdlibKernel::InputText.adapted_slot_arity(AdaptedSlot::Field { arg: 0 }),
+            None
+        );
+        assert_eq!(
+            StdlibKernel::UiOnKeyDown.adapted_slot_arity(AdaptedSlot::FormHandler(0)),
+            None
+        );
+        assert_eq!(
+            StdlibKernel::UiOnKeyDown.adapted_slot_arity(AdaptedSlot::Arg(1)),
+            None
+        );
+        assert!(!StdlibKernel::UiOnClick.has_adapted_slot());
     }
 
     /// The HOF classifier obliges exactly the variable final result of each callback.

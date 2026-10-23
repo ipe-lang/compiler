@@ -754,8 +754,8 @@ pub fn ui_on_mouse_out_<M>(msg: M) -> Attribute<M> {
 /// `Ui.onInput : (String -> msg) -> Attribute msg`
 ///
 /// The callback is Arc-wrapped so the runtime can dispatch it from a
-/// send-safe context.  Callers emit `std::sync::Arc::new(move |_x| (f)(_x))`
-/// where `f` is the emitted Ipê function expression (T6 trap).
+/// send-safe context.  Callers emit `std::sync::Arc::new(<closure>)`, the
+/// handler closure itself.
 pub fn ui_on_input_<M>(f: std::sync::Arc<dyn Fn(String) -> M + Send + Sync>) -> Attribute<M> {
     Attribute::AttrEvent(HtmlAttribute::EventAttr(Event::OnString("input".into(), f)))
 }
@@ -785,7 +785,7 @@ pub fn ui_on_key_up_<M>(f: std::sync::Arc<dyn Fn(String) -> M + Send + Sync>) ->
 ///
 /// Wires a boolean-carrying event (typically `change` on a checkbox) so that
 /// the Ipê callback receives the DOM `checked` value as a Rust `bool`.
-/// The `f` argument is arc-wrapped at the call site by the emitter (T6 trap).
+/// The emitter passes the handler closure itself in the `Arc`.
 pub fn ui_on_bool_<M>(f: std::sync::Arc<dyn Fn(bool) -> M + Send + Sync>) -> Attribute<M> {
     Attribute::AttrEvent(HtmlAttribute::EventAttr(Event::OnBool("change".into(), f)))
 }

@@ -109,3 +109,68 @@ fn retry_policy_field_access_ice_builds_and_runs() {
         );
     }
 }
+
+/// A policy built only from retry kernels: no signature or body type slot names the record.
+///
+/// `Task.retryOn pred Task.defaultRetryPolicy` passed straight to
+/// `Task.retryWith` mentions `RetryPolicy` in no function signature, record
+/// literal, or lambda type, so the record shape must survive the dead-type
+/// prune through the retry kernels' own use of its struct.
+const KERNEL_ONLY_POLICY: &str = r"module Main exposing (main)
+
+import Ipe.Error as Error exposing (Error)
+import Ipe.Io as Io
+import Ipe.String
+import Ipe.Task as Task
+
+
+main : Task Error ()
+main =
+    Task.andThen
+        (\n -> Io.println (String.fromInt n))
+        (Task.retryWith
+            (Task.retryOn (\_ -> False) Task.defaultRetryPolicy)
+            (Task.succeed 4)
+        )
+";
+
+fn built_kernel_only_policy(name: &str) -> (Result<(), CliError>, PathBuf) {
+    let fixture = crate::root_fixture::main(KERNEL_ONLY_POLICY);
+    let out = crate::support::scratch_root().join(name);
+    let _ = std::fs::remove_dir_all(&out);
+    let runtime = e2e_support::require_runtime().into_path_buf();
+    (crate::root_fixture::build(&fixture, &out, &runtime), out)
+}
+
+/// A policy named by retry kernels alone passes ipe (no IPE-I0001 for a pruned struct).
+#[test]
+fn kernel_only_retry_policy_emits() {
+    let (result, _) = built_kernel_only_policy("ipec_i963_kernel_only_policy");
+    assert!(
+        result.is_ok(),
+        "a policy built only from `retryOn` and `defaultRetryPolicy` must keep its \
+         `RetryPolicy` struct; got: {result:?}"
+    );
+}
+
+/// Under `IPE_E2E=1`: the kernel-only policy builds and runs the retried task.
+#[test]
+fn kernel_only_retry_policy_builds_and_runs() {
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
+        return;
+    }
+    let (result, out) = built_kernel_only_policy("ipec_i963_kernel_only_policy_e2e");
+    assert!(result.is_ok(), "the build must succeed: {result:?}");
+    let outcome = crate::support::build_and_run_emitted("retry_policy_kernel_only_policy", &out);
+    assert_eq!(
+        outcome.exit_code,
+        Some(0),
+        "the kernel-only policy must build and exit 0; stdout: {:?}",
+        outcome.stdout
+    );
+    assert_eq!(
+        outcome.stdout.trim(),
+        "4",
+        "the retried task's result prints"
+    );
+}

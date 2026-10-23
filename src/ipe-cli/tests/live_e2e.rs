@@ -1957,7 +1957,7 @@ fn live_onsubmit_list_literal_build_only() -> Result<(), BoxError> {
 // onSubmit payloads, but a `let`-bound bare `Msg` VALUE dispatched by
 // `onSubmit` (`let m = DoSignUp in onSubmit m`) lowers the payload to a plain
 // `Expr::Var`, which is NOT in such a classifier's fixed set, so it would be
-// wrapped as a decoder: `html_on_raw_("submit", move |_x| (m)(_x))`.
+// treated as a decoder and applied as `(m)(_x)`.
 // `m` is `MainMsg::DoSignUp`, a non-callable enum value → `(m)(_x)` is cargo
 // `E0618` ("expected function") AFTER `ipe` exit 0 — a SEAL violation.
 //
@@ -2161,7 +2161,7 @@ fn live_onsubmit_var_bound_msg_dispatches_fixed_msg() -> Result<(), BoxError> {
 ///
 /// `let handler = \c -> DoSignIn c in ... Ui.onSubmit handler ...`. A `handler`
 /// declared `Box<dyn Fn(Creds) -> MainMsg + Send + 'static>` (never `+ Sync`)
-/// captured by move into the `ui_on_submit_(move |_x| (handler)(_x))` wrapper
+/// captured by move into the `ui_on_submit_(..)` handler closure
 /// would make this `ipe` exit 0 then `cargo build` E0277 (`dyn Fn(..) ->
 /// MainMsg + Send` cannot be shared between threads safely). So
 /// `ipe_lower::lower_let_pvar` + `flows_into_sync_kernel_call` promote the

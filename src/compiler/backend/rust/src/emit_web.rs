@@ -1759,7 +1759,11 @@ mod hot_appearance_tests {
         let mut interner = Interner::new();
         let on_input = Expr::Call {
             callee: Callee::Kernel(KernelFn::UiOnInput),
-            args: vec![Expr::Var(interner.intern("f")?)],
+            args: vec![Expr::Lambda {
+                params: vec![(interner.intern("s")?, IrType::Str)],
+                ret: IrType::Int,
+                body: Box::new(Expr::Int(0)),
+            }],
             pin: P::None,
             on_form: OnFormKind::NotForm,
         };

@@ -6,11 +6,11 @@
 //!
 //! ```rust
 //! ipe_runtime::ui::helpers::ui_on_input_(
-//!     ::std::sync::Arc::new(move |_x| ({closure})(_x))
+//!     ::std::sync::Arc::new({closure})
 //! )
 //! ```
 //!
-//! where `{closure}` is the emitted lambda.  Without `Arc::new(move …)` the
+//! where `{closure}` is the emitted lambda.  Without `Arc::new(..)` the
 //! closure does not satisfy `Arc<dyn Fn(String) -> M + Send + Sync + 'static>`
 //! and cargo rejects it with E0308.
 //!
@@ -26,7 +26,7 @@
 //!
 //! ## What is tested
 //!
-//! * `KernelFn::UiOnInput` emits `ui_on_input_(Arc::new(move |_x| f(_x)))`
+//! * `KernelFn::UiOnInput` emits `ui_on_input_(Arc::new(f))`
 //!   where `f` is a closure expression (not a top-level fn name).
 //! * The emitted Rust project builds without `E0308` or missing-trait-bound errors.
 //! * The rendered HTML contains `data-ipe-on="input"` (event wired) and the
