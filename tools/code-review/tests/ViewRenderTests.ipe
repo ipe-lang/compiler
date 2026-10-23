@@ -21,7 +21,7 @@ import Lib.Failure as Failure exposing (DecideRefusal(..), LoadFailure(..), Reas
 import Lib.Format as Format
 import Lib.Index as Index exposing (Change(..), Oversize(..), ReadFailure(..), RefusalReason(..), SourceView(..), StaleReason(..))
 import Lib.Label as Label exposing (Label)
-import Lib.Links exposing (Hidden(..), Link(..))
+import Lib.Links exposing (Hidden(..), Link(..), LinkKey(..))
 import Lib.PageSize as PageSize
 import Lib.Queue as Queue exposing (DecisionSlot(..), HistoryState(..), QueueState(..), RefusalPanel(..), SelectedView(..), UnitPageState(..))
 import Lib.RepoPath exposing (PathError(..))
@@ -124,7 +124,7 @@ refusingModel epoch loaded =
 -- The unit page of `loaded`'s own address, with its read settled.
 unitPageModel : Index.UnitView -> Model
 unitPageModel loaded =
-    { baseModel | page = UnitPage (Uid.toString loaded.unit.uid), selectedView = ViewShown loaded }
+    { baseModel | page = UnitPage (TestSupport.uidHex loaded.unit.uid), selectedView = ViewShown loaded }
 
 
 -- A unit page at `address`, whatever it names.
@@ -700,8 +700,42 @@ hrefCeilingIsExact loaded =
         && not (has "data-review-cut" (shown atCap))
         && not (has "href=" (shown overCap))
         && has "data-review-cut" (shown overCap)
-        && String.startsWith "f:" (Lib.Links.linkKey (Lib.Links.external overCap))
-        && String.startsWith "e:" (Lib.Links.linkKey (Lib.Links.external atCap))
+        && isUntargetedKey (Lib.Links.linkKey (Lib.Links.external overCap))
+        && isTargetedKey (Lib.Links.linkKey (Lib.Links.external atCap))
+
+
+-- True for the key of a URL shown as a label only, never linked.
+isUntargetedKey : LinkKey -> Bool
+isUntargetedKey key =
+    case key of
+        UntargetedKey _ ->
+            True
+
+        InternalKey _ ->
+            False
+
+        TargetedKey _ ->
+            False
+
+        UnlinkedKey _ ->
+            False
+
+
+-- True for the key of a URL linked whole.
+isTargetedKey : LinkKey -> Bool
+isTargetedKey key =
+    case key of
+        TargetedKey _ ->
+            True
+
+        InternalKey _ ->
+            False
+
+        UntargetedKey _ ->
+            False
+
+        UnlinkedKey _ ->
+            False
 
 
 -- A URL well under the href ceiling whose label is cut by its escape runs
@@ -725,7 +759,7 @@ escapeCutUrlIsUnlinked loaded =
     Label.textBytes url < Lib.Links.hrefByteCeiling
         && has "data-review-cut" shown
         && not (has "href=" shown)
-        && String.startsWith "f:" (Lib.Links.linkKey link)
+        && isUntargetedKey (Lib.Links.linkKey link)
 
 
 -- A unit holding the most links, each named by a hostile qualified name of a
@@ -738,7 +772,7 @@ maxLinksFitBudget loaded =
     let
         links =
             List.map
-                (\n -> Lib.Links.internal (labelOf (hostileColumn ++ String.fromInt n)) (Uid.toString (uid ("u-link-" ++ String.fromInt n))))
+                (\n -> Lib.Links.internal (labelOf (hostileColumn ++ String.fromInt n)) (TestSupport.uidHex (uid ("u-link-" ++ String.fromInt n))))
                 (List.range 1 Lib.Links.linkCeiling)
 
         drawnOn view linkSet =
@@ -827,7 +861,7 @@ seededChecks epoch a b =
                 && List.length (String.split "<h1" html) == 2
 
         standingPage bodyHash standing =
-            page { baseModel | page = UnitPage (Uid.toString a.unit.uid), selectedView = ViewShown a, standing = Queue.StandingShown a.unit.uid bodyHash standing }
+            page { baseModel | page = UnitPage (TestSupport.uidHex a.unit.uid), selectedView = ViewShown a, standing = Queue.StandingShown a.unit.uid bodyHash standing }
 
         currentHash =
             Index.storedHash a.unit.attested
@@ -1234,7 +1268,7 @@ storedPure loaded long ok yes =
             && longestHexRun goneHistory < 64
             && has "crate::FILE" indexedHistory
             && not (has "no longer indexed" indexedHistory)
-            && longestHexRun (Uid.toString (LibDb.verifiedUid yes)) >= 64
+            && longestHexRun (TestSupport.uidHex (LibDb.verifiedUid yes)) >= 64
       )
     , ( "a History entry of a file gone from the index shows its path and says it is no longer indexed, with no uid"
       , has "ipe:src/blob.bin" goneFileHistory
@@ -1372,7 +1406,7 @@ untrustedSinkChecks loaded =
             page { baseModel | page = HistoryPage, history = HistoryFailed failure }
 
         unitFailed failure =
-            page { baseModel | page = UnitPage (Uid.toString loaded.unit.uid), selectedView = ViewFailed loaded.unit.uid failure }
+            page { baseModel | page = UnitPage (TestSupport.uidHex loaded.unit.uid), selectedView = ViewFailed loaded.unit.uid failure }
 
         card =
             cardModel loaded
@@ -1535,7 +1569,7 @@ unitLabelBytes q =
 -- The place a unit's card names, as the markup spells it after its path.
 uidPlace : String -> String
 uidPlace id =
-    " · " ++ Uid.toString (uid id) ++ "</span>"
+    " · " ++ TestSupport.uidHex (uid id) ++ "</span>"
 
 
 queueBudgetChecks : Index.UnitView -> List ( String, Bool )

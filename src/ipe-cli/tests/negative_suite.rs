@@ -268,12 +268,27 @@ fn parse_malformed_type_decl() {
     assert_rejected("parse_type_decl", &src, "IPE-P0031");
 }
 
-/// An unknown character in source (a raw control/garbage byte the lexer cannot
+/// An unknown character in source (a printable symbol the lexer cannot
 /// classify) — lexical rejection.
 #[test]
 fn parse_unknown_character() {
-    let src = format!("{HEAD}main =\n    1 \u{0007} 2\n");
+    let src = format!("{HEAD}main =\n    1 \u{00A7} 2\n");
     assert_rejected("parse_unknown_char", &src, "IPE-P0010");
+}
+
+/// A raw control a terminal runs as a command (here ESC opening a cursor-up and
+/// erase-line sequence in a comment) is refused anywhere in source.
+#[test]
+fn parse_terminal_control() {
+    let src = format!("{HEAD}main =\n    -- ok\u{001B}[1A\u{001B}[2K\n    1\n");
+    assert_rejected("parse_terminal_control", &src, "IPE-P0073");
+}
+
+/// A raw control is refused inside a string literal too; `Char.fromCode` builds one.
+#[test]
+fn parse_terminal_control_in_string() {
+    let src = format!("{HEAD}main =\n    \"a\u{0008}b\"\n");
+    assert_rejected("parse_terminal_control_str", &src, "IPE-P0073");
 }
 
 /// A malformed character literal (empty `''`).

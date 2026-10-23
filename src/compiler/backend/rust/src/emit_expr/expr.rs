@@ -1184,9 +1184,9 @@ pub fn emit_init_datum(
 ///
 /// Emits the whole arm body as
 /// `(<compiled model>, ipe_runtime::web::fire_cmd_wiring("<baked wiring JSON>",
-/// vec![Box::new(move || <compiled effect 0>), ...]))`: the model half is the arm's
-/// OWN compiled model (unchanged), and the Cmd half is the wiring dispatch. Each
-/// effect thunk builds ONE of the arm's compiled effects; the runtime selector
+/// vec![Box::new(move || <compiled effect 0>)]))`: the model half is the arm's
+/// OWN compiled model (unchanged), and the Cmd half is the wiring dispatch. The
+/// effect thunk builds the arm's sole compiled effect; the runtime selector
 /// picks WHICH id fires (dev overlay under the dev gate, the baked id otherwise —
 /// dev == prod) and runs only that thunk. The effect BODIES are compiled exactly as
 /// written — only the WIRING (which id fires) is data.
@@ -1229,10 +1229,10 @@ pub fn emit_cmd_wiring_arm(
     // The `Cmd.none` no-effect wiring is already handled by the transition path
     // (which emits `cmd_none()` at the Cmd position, fail-closed to no effect);
     // wiring it here would only churn its emit for zero behaviour gain. Compose only
-    // when the arm names at least one compiled effect (a real `Cmd.perform`).
-    if arm.effects.is_empty() {
+    // when the arm names its compiled effect (a real `Cmd.perform`).
+    let Some(effect) = arm.effect else {
         return Ok(None);
-    }
+    };
     // The arm body is `(Model, Cmd)`; re-extract the model sub-expression to emit as
     // the arm's own compiled model. A shape that does not match here would mean the
     // classifier and this extraction drifted; it fails closed (`None` → ordinary
@@ -1245,16 +1245,12 @@ pub fn emit_cmd_wiring_arm(
     };
     let child = depth + 1;
     let model_s = emit_expr_at(ctx, model_expr, indent + 1, child, generics)?;
-    // The ordered compiled-effect table: each effect wrapped in a `move` thunk so
-    // only the wiring-selected one is built and fired (the rest drop unrun). A
-    // `move` closure lets the effect capture the arm's bindings by value, sound
-    // because only one match arm runs.
-    let mut thunks = Vec::with_capacity(arm.effects.len());
-    for effect in &arm.effects {
-        let effect_s = emit_expr_at(ctx, effect, indent + 1, child, generics)?;
-        thunks.push(format!("Box::new(move || {effect_s})"));
-    }
-    let table = thunks.join(", ");
+    // The one-entry compiled-effect table: the sole effect wrapped in a `move`
+    // thunk, built and fired only when the wiring selects it. A `move` closure
+    // lets the effect capture the arm's bindings by value, sound because only one
+    // match arm runs and the arm has one effect, emitted after its model.
+    let effect_s = emit_expr_at(ctx, effect, indent + 1, child, generics)?;
+    let table = format!("Box::new(move || {effect_s})");
     let json = arm.wiring.to_json();
     let json_lit = rust_str_lit(&json);
     Ok(Some(format!(

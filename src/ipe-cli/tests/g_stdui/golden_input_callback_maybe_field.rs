@@ -10,11 +10,10 @@
 //! the program (exit 0) but the emitted Rust failed `cargo build` with E0308 —
 //! a seal break (the `examples/37-composite-live-shop` blocker).
 //!
-//! The fix (mirroring the reference's uniform-Arc callback policy and this
-//! crate's existing `ui_on_input_` / `ui_on_change_` arms) eta-wraps each Input
-//! callback field in `::std::sync::Arc::new(move |_x| (f)(_x))` at the
-//! call-argument boundary, so it fills the Arc slot regardless of how the field
-//! expression lowered.
+//! Each Input callback field is an adapted slot in handler normal form (`let`s
+//! around one closure literal); the emitter places that closure in
+//! `::std::sync::Arc::new(..)` at the call-argument boundary, so it fills the
+//! Arc slot regardless of how the field expression was written.
 //!
 //! The two non-E2E goldens for these kernels (`golden_i148_input_slider`,
 //! `golden_i155_input_radio_row`) only check ipe lowering — they never run

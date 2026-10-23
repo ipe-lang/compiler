@@ -4,22 +4,14 @@
 //! sibling `onPress` button in the same view.
 //!
 //! **Without the fix, ** `ipe` exits 0, but the emitted Rust fails `cargo build` with
-//! E0382 ("use of moved value").  The lowerer's multi-use-clone rewrite wraps
-//! the `onInput` Lambda in `let item = item.clone(); Lambda { … }`, but the
-//! inline-wrap emitter (`KernelFn::UiOnInput`) then places the whole block
-//! inside `Arc::new(move |_x| …)`.  The outer `move` still move-captures the
+//! E0382 ("use of moved value") whenever the multi-use-clone rewrite's
+//! `let item = item.clone();` lands inside a `move` closure that captures the
 //! free outer `item`, so the sibling `onPress` hits use-after-move.
 //!
-//! This is the same bug shape as the `onChange` FIELD path handled by
-//! `emit_arc_callback_field`.  That path covers only the `on_change` FIELD
-//! path (via `input_checkbox_`/`Input.*` call arguments), NOT the two inline
-//! `Arc::new(move …)` wraps synthesized by the `UiOnInput`/`UiOnChange` kernel
-//! arms in `emit_expr.rs`.
-//!
-//! **Fix (D5):** route `KernelFn::UiOnInput` and `KernelFn::UiOnChange` through
-//! `emit_arc_callback_field`, which peels leading pure-alias `let`s OUTSIDE the
-//! synthesized `Arc`'s `move` closure.  Output is byte-identical when no
-//! capture-clone `let`s are present.
+//! The `onInput` handler is an adapted slot in handler normal form (`let`s
+//! around one closure literal): the emitter emits the leading `let`s OUTSIDE
+//! the closure it places in the `Arc`, the same rule every adapted slot
+//! (`Ui.on*`, `Input.*` callback fields) follows.
 //!
 //! Run:
 //! ```text

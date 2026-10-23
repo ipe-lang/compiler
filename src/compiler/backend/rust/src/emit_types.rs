@@ -740,7 +740,7 @@ pub fn render_type_at(
             // `ipe_runtime::ui::element::Event`). Without `Sync` on this boxed
             // param, an emitted user fn generic over its Msg type
             // (`fn f<T1: Clone>(onEdit: Box<dyn Fn(String) -> T1 + Send>) …`)
-            // that arc-wraps `onEdit` (via `arc_callback_wrap`) and passes it to
+            // that places `onEdit` in an `Arc` callback slot and passes it to
             // `input_multiline_`/`input_text_`/… fails E0277 (`… cannot be
             // shared between threads safely`) — the seal break that
             // `26-ui-showcase`'s `regression_gates_input_multiline_fill`

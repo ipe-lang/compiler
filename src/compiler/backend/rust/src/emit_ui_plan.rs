@@ -92,17 +92,17 @@ pub enum NativeUiEmit {
     InputRadioRow,
     /// `Html.voidNode` — a runtime-tag void element (empty children vec).
     HtmlVoidNode,
-    /// `Ui.onInput` — string-carrying event handler, peel-hoisted Arc callback.
+    /// `Ui.onInput` — string-carrying event handler in an `Arc` slot.
     OnInput,
-    /// `Ui.onChange` — string-carrying event handler, peel-hoisted Arc callback.
+    /// `Ui.onChange` — string-carrying event handler in an `Arc` slot.
     OnChange,
-    /// `Ui.onKeyDown` — string-carrying event handler, inline Arc wrap.
+    /// `Ui.onKeyDown` — string-carrying event handler in an `Arc` slot.
     OnKeyDown,
-    /// `Ui.onKeyUp` — string-carrying event handler, inline Arc wrap.
+    /// `Ui.onKeyUp` — string-carrying event handler in an `Arc` slot.
     OnKeyUp,
-    /// `Ui.onFile` — string-carrying event handler, inline Arc wrap.
+    /// `Ui.onFile` — string-carrying event handler in an `Arc` slot.
     OnFile,
-    /// `Event.onBool` — bool-carrying event handler, inline Arc wrap.
+    /// `Event.onBool` — bool-carrying event handler in an `Arc` slot.
     OnBool,
     /// `Ui.onSubmit` — form handler dispatched by its lowered `OnFormKind`.
     OnSubmit,

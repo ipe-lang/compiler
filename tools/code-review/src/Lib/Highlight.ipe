@@ -686,6 +686,7 @@ type Gap
 type Lexing
     = Start Gap
     | InNum
+    | WordHead Char
     | InWord
     | InRawPrefix
     | InStr
@@ -733,11 +734,18 @@ step g c ( lexing, buf, toks ) =
             else
                 begin g AfterText c (toks ++ [ Num buf ])
 
-        InWord ->
-            if rawPrefixed g buf c then
+        WordHead h ->
+            if rawHead g h c then
                 ( InRawPrefix, extend buf c, toks )
 
             else if isWordChar c then
+                ( InWord, extend buf c, toks )
+
+            else
+                begin g AfterText c (toks ++ [ word g buf ])
+
+        InWord ->
+            if isWordChar c then
                 ( InWord, extend buf c, toks )
 
             else
@@ -970,7 +978,7 @@ begin g gap c toks =
         ( InRawPrefix, "r", toks )
 
     else if isWordStart c then
-        ( InWord, String.fromChar c, toks )
+        ( WordHead c, String.fromChar c, toks )
 
     else
         ( Start (gapAfter c), "", toks ++ [ Plain (String.fromChar c) ] )
@@ -1063,12 +1071,13 @@ rawOpens raw c =
             False
 
 
--- A word `b` or `c` followed by `r` begins a `br`/`cr` raw string prefix.
-rawPrefixed : Grammar -> String -> Char -> Bool
-rawPrefixed g buf c =
+-- A word that began with `b` or `c`, followed by `r`, begins a `br`/`cr` raw
+-- string prefix.
+rawHead : Grammar -> Char -> Char -> Bool
+rawHead g h c =
     case g.rawStrings of
         HashRawStrings ->
-            c == 'r' && (buf == "b" || buf == "c")
+            c == 'r' && (h == 'b' || h == 'c')
 
         NoRawStrings ->
             False
@@ -1147,6 +1156,9 @@ endLine g ( lexing, buf, toks ) =
 
         InNum ->
             ( toks ++ [ Num buf ], Start AfterSpace )
+
+        WordHead _ ->
+            ( toks ++ [ word g buf ], Start AfterSpace )
 
         InWord ->
             ( toks ++ [ word g buf ], Start AfterSpace )
@@ -1264,6 +1276,9 @@ finish g ( lexing, buf, toks ) =
 
         InNum ->
             toks ++ [ Num buf ]
+
+        WordHead _ ->
+            toks ++ [ word g buf ]
 
         InWord ->
             toks ++ [ word g buf ]

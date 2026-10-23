@@ -9,7 +9,7 @@
 //! ## What is tested
 //!
 //! * `Lazy.lazy viewItem "hello"` — arity-1 closure: emits
-//!   `ipe_runtime::ui::lazy::lazy_lazy_(move |_a| (f)(_a), a)`.
+//!   `ipe_runtime::ui::lazy::lazy_lazy_(f, a)` with `f` the view closure.
 //! * `Lazy.lazy2 viewPair "first" "second"` — arity-2 closure with TWO
 //!   DISTINGUISHABLE args: emits `lazy_lazy2_(..., a, b)` (arg ORDER matters;
 //!   a swap is silent past the mechanical gate).

@@ -32,13 +32,14 @@ use core::fmt::Write as _;
 use crate::code::{Severity, issue_tracker_url, title};
 use crate::diagnostic::{
     AppShape, Applicability, CaseDefect, CodecAutoRejection, ConsentError, Diagnostic, Expected,
-    ExpectedSet, ExposingDefect, Feature, FfiError, GenericAppEntryReach, HeaderDefect, HelpLine,
-    Hint, IfDefect, ImportedAs, LetDefect, LowerError, MountPrefixFault, NameError, ParseError,
-    RoutePatternDefect, SandboxError, SealRejection, SpanRole, StoreEqAccessorDefect,
-    StoreSelectProjectionDefect, Suggestion, TokenKind, TyDoc, TypeDeclDefect, TypeError,
-    TypeSizeOrigin, WildcardDependence, intercept_context_phrase,
+    ExpectedSet, ExposingDefect, Feature, FfiError, GenericAppEntryReach, HazardRefusal,
+    HeaderDefect, HelpLine, Hint, IfDefect, ImportedAs, LetDefect, LowerError, MountPrefixFault,
+    NameError, ParseError, RoutePatternDefect, SandboxError, SealRejection, SpanRole,
+    StoreEqAccessorDefect, StoreSelectProjectionDefect, Suggestion, TokenKind, TyDoc,
+    TypeDeclDefect, TypeError, TypeSizeOrigin, WildcardDependence, intercept_context_phrase,
 };
 use crate::span::Span;
+use crate::terminal::BIDI_ISOLATE_CLOSER;
 
 // ANSI escape sequences. Colour only ever *wraps* text, so stripping these
 // yields byte-identical output to the plain (non-tty / `NO_COLOR`) path.
@@ -368,30 +369,6 @@ fn parse_prose(msg: &ParseError) -> String {
         ParseError::NestingTooDeep { .. } | ParseError::TooDeep => {
             "This expression nests deeper than I can follow.".to_string()
         }
-        ParseError::UnknownChar(c) => {
-            format!("I don't recognise the character {} here.", char_repr(*c))
-        }
-        ParseError::StrayDot | ParseError::SpaceBeforeDot => {
-            "This `.` isn't attached to anything I can read as a field access.".to_string()
-        }
-        ParseError::NumberJoinedToName(_) => {
-            "This number runs straight into a name, so I can't tell where one ends and the \
-             other begins."
-                .to_string()
-        }
-        ParseError::IntLiteralOutOfRange => {
-            "This whole number does not fit in Ipê's `Int`.".to_string()
-        }
-        ParseError::FloatLiteralOutOfRange => {
-            "This number is too large for Ipê's `Float` to hold.".to_string()
-        }
-        ParseError::UnterminatedString => {
-            "This string opens with a `\"` but never closes.".to_string()
-        }
-        ParseError::MalformedChar => "I can't read this as a character literal.".to_string(),
-        ParseError::UnterminatedBlockComment => {
-            "This block comment opens with `{-` but never closes.".to_string()
-        }
         ParseError::MalformedModuleHeader(_) => {
             "I couldn't read the module header at the top of this file.".to_string()
         }
@@ -444,13 +421,139 @@ fn parse_prose(msg: &ParseError) -> String {
                  one declared type."
             )
         }
+        ParseError::UnknownChar(_)
+        | ParseError::StrayDot
+        | ParseError::SpaceBeforeDot
+        | ParseError::NumberJoinedToName(_)
+        | ParseError::IntLiteralOutOfRange
+        | ParseError::FloatLiteralOutOfRange
+        | ParseError::UnterminatedString
+        | ParseError::MalformedChar
+        | ParseError::UnterminatedBlockComment
+        | ParseError::SourceTooLarge { .. }
+        | ParseError::LoneCarriageReturn
+        | ParseError::SourceDisplayHazard { .. }
+        | ParseError::SourceTerminalControl { .. } => lexical_prose(msg),
+        ParseError::Unexpected => "I couldn't make sense of this part of the file.".to_string(),
+    }
+}
+
+/// The prose band for a source display hazard: what the character does, and why here.
+fn display_hazard_prose(ch: char, refusal: HazardRefusal) -> String {
+    let ch = char_repr(ch);
+    let closer = char_repr(BIDI_ISOLATE_CLOSER);
+    match refusal {
+        HazardRefusal::Anywhere => format!(
+            "The invisible character {ch} makes a viewer break the line or reorder the text \
+             around it, and I do not, so this file would read differently to you and to me. \
+             It is refused anywhere in a source file."
+        ),
+        HazardRefusal::OutsideLiteral => format!(
+            "The invisible character {ch} makes a viewer break the line or reorder the text \
+             around it, and I do not, so this file would read differently to you and to me. \
+             Only a string or character literal may hold it."
+        ),
+        HazardRefusal::UnclosedIsolate => format!(
+            "The bidirectional isolate {ch} is not closed by {closer} before its literal or \
+             line ends, so a viewer would reorder the text that follows it."
+        ),
+        HazardRefusal::UnopenedIsolate => format!(
+            "This {ch} closes no bidirectional isolate opened before it in its literal and \
+             line, so a viewer would reorder the text around it."
+        ),
+    }
+}
+
+/// The prose band for a raw terminal control: what a terminal does with it, and the fix.
+fn terminal_control_prose(ch: char) -> String {
+    format!(
+        "The control character {} is one a terminal that shows this file may run as a \
+         command (controls such as escape move the cursor, erase a line or step back \
+         over text), so the file could show you other code than I read. It is refused \
+         anywhere in a source file, literals included; build it in a value with \
+         `Char.fromCode` instead.",
+        char_repr(ch)
+    )
+}
+
+/// The primary label for a source display hazard.
+fn display_hazard_label(ch: char, refusal: HazardRefusal) -> String {
+    let ch = char_repr(ch);
+    match refusal {
+        HazardRefusal::Anywhere => format!("{ch} is refused anywhere in source"),
+        HazardRefusal::OutsideLiteral => format!("{ch} may stand only inside a literal"),
+        HazardRefusal::UnclosedIsolate => {
+            format!("{ch} is never closed by {}", char_repr(BIDI_ISOLATE_CLOSER))
+        }
+        HazardRefusal::UnopenedIsolate => format!("this {ch} closes no isolate"),
+    }
+}
+
+/// The prose band for a defect the lexer raises while it reads the source bytes.
+fn lexical_prose(msg: &ParseError) -> String {
+    match msg {
+        ParseError::UnknownChar(c) => {
+            format!("I don't recognise the character {} here.", char_repr(*c))
+        }
+        ParseError::StrayDot | ParseError::SpaceBeforeDot => {
+            "This `.` isn't attached to anything I can read as a field access.".to_string()
+        }
+        ParseError::NumberJoinedToName(_) => {
+            "This number runs straight into a name, so I can't tell where one ends and the \
+             other begins."
+                .to_string()
+        }
+        ParseError::IntLiteralOutOfRange => {
+            "This whole number does not fit in Ipê's `Int`.".to_string()
+        }
+        ParseError::FloatLiteralOutOfRange => {
+            "This number is too large for Ipê's `Float` to hold.".to_string()
+        }
+        ParseError::UnterminatedString => {
+            "This string opens with a `\"` but never closes.".to_string()
+        }
+        ParseError::MalformedChar => "I can't read this as a character literal.".to_string(),
+        ParseError::UnterminatedBlockComment => {
+            "This block comment opens with `{-` but never closes.".to_string()
+        }
         ParseError::SourceTooLarge { bytes } => {
             format!(
                 "this source file is {bytes} bytes, larger than I can compile — a file \
                  must fit in a 32-bit byte offset (under 4 GiB)."
             )
         }
-        ParseError::Unexpected => "I couldn't make sense of this part of the file.".to_string(),
+        ParseError::LoneCarriageReturn => {
+            "This carriage return (`\\r`) is not followed by a newline (`\\n`). An editor \
+             starts a new line here and I do not, so the file would read differently \
+             to you and to me."
+                .to_string()
+        }
+        ParseError::SourceDisplayHazard { ch, refusal } => display_hazard_prose(*ch, *refusal),
+        ParseError::SourceTerminalControl { ch } => terminal_control_prose(*ch),
+        // A grammar defect: `parse_prose` answers each of these in its own arm.
+        ParseError::Unexpected
+        | ParseError::TooDeep
+        | ParseError::UnexpectedToken { .. }
+        | ParseError::UnexpectedEof { .. }
+        | ParseError::NestingTooDeep { .. }
+        | ParseError::MalformedModuleHeader(_)
+        | ParseError::MalformedExposingList(_)
+        | ParseError::MissingEquals { .. }
+        | ParseError::MalformedTypeDeclaration(_)
+        | ParseError::TypeArgsOnNonConstructor
+        | ParseError::ExpectedType
+        | ParseError::UnclosedDelimiter { .. }
+        | ParseError::MalformedCase(_)
+        | ParseError::MalformedLet(_)
+        | ParseError::MalformedIf(_)
+        | ParseError::InvalidPathLiteral { .. }
+        | ParseError::SteplessDo
+        | ParseError::DocOnUnexported { .. }
+        | ParseError::MissingDocString { .. }
+        | ParseError::AnnotationWithoutBinding { .. }
+        | ParseError::DuplicateAnnotation { .. } => {
+            "I couldn't make sense of this part of the file.".to_string()
+        }
     }
 }
 
@@ -897,8 +1000,8 @@ fn lower_prose(msg: &LowerError) -> String {
         }
         LowerError::UnsaturatedHandlerKernel { kernel } => {
             format!(
-                "`{kernel}` has to be called with all its arguments — you can't \
-                 store it under a name or pass it around before its handler is given."
+                "`{kernel}` has to be called with its handler — you can't store it \
+                 under a name or pass it around before its handler is given."
             )
         }
         LowerError::ForeignTypeVariable { helper, owner, var } => {
@@ -1525,6 +1628,16 @@ fn parse_label(msg: &ParseError) -> Option<String> {
             };
             Some(detail)
         }
+        ParseError::LoneCarriageReturn => {
+            Some("a `\\r` here must be followed by `\\n`".to_string())
+        }
+        ParseError::SourceDisplayHazard { ch, refusal } => {
+            Some(display_hazard_label(*ch, *refusal))
+        }
+        ParseError::SourceTerminalControl { ch } => Some(format!(
+            "{} is a terminal control, refused anywhere in source",
+            char_repr(*ch)
+        )),
         ParseError::AnnotationWithoutBinding { .. } => {
             Some("this annotation has no matching definition".to_string())
         }
@@ -2180,9 +2293,9 @@ fn lower_label(msg: &LowerError) -> String {
         }
         LowerError::UnsaturatedHandlerKernel { kernel } => {
             format!(
-                "`{kernel}` must be applied to all its arguments here — it rebuilds its \
-                 handler for every request, so the handler must be given at the call: \
-                 write `{kernel} contentType handler` (piping the handler in with \
+                "`{kernel}` must be given its handler here — the handler is called \
+                 again and again, so the compiler needs the handler expression at the \
+                 call: apply `{kernel}` to its handler (piping the handler in with \
                  `<|` / `|>` is fine) instead of binding `{kernel}` or a partial \
                  application of it to a name or passing it as a value"
             )
@@ -2701,8 +2814,9 @@ const fn feature_label(f: Feature) -> &'static str {
              [feature: task-loop-function-state]"
         }
         Feature::StreamHandlerCapture => {
-            "a `Stream.stream` handler is rebuilt for every request, so each value \
-             it captures is copied into it — this capture cannot be copied (a \
+            "this handler (a `Stream.stream` request handler or a `Ui`/`Html` \
+             event handler) is shared and called again and again, so each value it \
+             captures is copied into it — this capture cannot be copied (a \
              function bound through a tuple/record destructure, a `Task`/`Cmd`/\
              `Sub`, or a value whose type could not be determined); bind a \
              captured function with a plain `let f = …` or take it as a parameter, \
@@ -3935,6 +4049,67 @@ mod tests {
                 out.ends_with(&format!("`{name}`")),
                 "the bare name should be the wrapped tail: {out:?}"
             );
+        }
+    }
+
+    /// Each lexer defect reaches its own prose through `lexical_prose`, never
+    /// the grammar fallback that function answers for a non-lexical defect.
+    #[test]
+    fn every_lexical_defect_has_its_own_prose() {
+        let fallback = parse_prose(&ParseError::Unexpected);
+        let lexical = [
+            ParseError::UnknownChar('\u{7}'),
+            ParseError::StrayDot,
+            ParseError::SpaceBeforeDot,
+            ParseError::IntLiteralOutOfRange,
+            ParseError::FloatLiteralOutOfRange,
+            ParseError::UnterminatedString,
+            ParseError::MalformedChar,
+            ParseError::UnterminatedBlockComment,
+            ParseError::SourceTooLarge { bytes: 1 },
+            ParseError::LoneCarriageReturn,
+            ParseError::SourceDisplayHazard {
+                ch: '\u{2028}',
+                refusal: HazardRefusal::OutsideLiteral,
+            },
+            ParseError::SourceTerminalControl { ch: '\u{1b}' },
+        ];
+        for msg in &lexical {
+            assert_ne!(parse_prose(msg), fallback, "{msg:?}");
+        }
+        assert!(
+            parse_prose(&ParseError::LoneCarriageReturn).contains("carriage return"),
+            "the lone `\\r` prose names the byte"
+        );
+    }
+
+    /// A source display hazard's prose and label name it by code point, never raw.
+    ///
+    /// The raw character would break or reorder the very line that reports it.
+    #[test]
+    fn a_display_hazard_is_named_by_its_code_point() {
+        let refusals = [
+            HazardRefusal::Anywhere,
+            HazardRefusal::OutsideLiteral,
+            HazardRefusal::UnclosedIsolate,
+            HazardRefusal::UnopenedIsolate,
+        ];
+        for (range, _) in crate::terminal::SOURCE_DISPLAY_HAZARDS {
+            for ch in range.clone() {
+                let code = format!("U+{:04X}", u32::from(ch));
+                let messages = refusals
+                    .map(|refusal| ParseError::SourceDisplayHazard { ch, refusal })
+                    .into_iter()
+                    .chain([ParseError::SourceTerminalControl { ch }]);
+                for msg in messages {
+                    let prose = parse_prose(&msg);
+                    let label = parse_label(&msg).unwrap_or_default();
+                    for text in [&prose, &label] {
+                        assert!(text.contains(&code), "{text:?} names {code}");
+                        assert!(!text.contains(ch), "{text:?} carries {code} raw");
+                    }
+                }
+            }
         }
     }
 }

@@ -29,7 +29,7 @@
 //! `Apply`/`Call`) via eta-expansion into `SharedLambda { body: Apply(f, [Var
 //! (fresh0), …]) }` (rendering `Arc::new(move |x| (f)(x))`). The promoted
 //! `handler` value-leaf read is cloned (`Arc::clone`) so it is not moved out of
-//! the backend's synthetic `move |_x| (…)(_x)` re-wrap `Fn` closure (E0507).
+//! an enclosing `Fn` closure (E0507).
 //! Both branches then render the identical `Arc<dyn Fn(..) + Send + Sync>`
 //! carrier and the crate type-checks AND builds.
 //!

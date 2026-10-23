@@ -29,10 +29,10 @@ use crate::code::{
     IPE_P0003, IPE_P0010, IPE_P0011, IPE_P0012, IPE_P0013, IPE_P0014, IPE_P0015, IPE_P0016,
     IPE_P0017, IPE_P0018, IPE_P0020, IPE_P0021, IPE_P0030, IPE_P0031, IPE_P0040, IPE_P0041,
     IPE_P0050, IPE_P0060, IPE_P0061, IPE_P0062, IPE_P0063, IPE_P0064, IPE_P0065, IPE_P0066,
-    IPE_P0067, IPE_P0068, IPE_P0069, IPE_P0070, IPE_S0001, IPE_S0002, IPE_S0003, IPE_S0004,
-    IPE_T0001, IPE_T0002, IPE_T0003, IPE_T0004, IPE_T0010, IPE_T0011, IPE_T0012, IPE_T0013,
-    IPE_T0014, IPE_T0015, IPE_T0016, IPE_T0017, IPE_T0018, IPE_T0019, IPE_T0020, IPE_T0021,
-    IPE_T0022, IPE_T0023, IPE_T0024, Severity,
+    IPE_P0067, IPE_P0068, IPE_P0069, IPE_P0070, IPE_P0071, IPE_P0072, IPE_P0073, IPE_S0001,
+    IPE_S0002, IPE_S0003, IPE_S0004, IPE_T0001, IPE_T0002, IPE_T0003, IPE_T0004, IPE_T0010,
+    IPE_T0011, IPE_T0012, IPE_T0013, IPE_T0014, IPE_T0015, IPE_T0016, IPE_T0017, IPE_T0018,
+    IPE_T0019, IPE_T0020, IPE_T0021, IPE_T0022, IPE_T0023, IPE_T0024, Severity,
 };
 use crate::span::Span;
 use crate::suggest::{Confidence, Hit};
@@ -464,6 +464,37 @@ pub enum ParseError {
     /// accurate spans. Rather than clamp offsets (which would misreport every
     /// position past the limit), the lexer turns the file away. [IPE-P0070]
     SourceTooLarge { bytes: usize },
+    /// A `\r` not followed by `\n`. An editor or viewer ends a line there and the
+    /// compiler does not, so the two would read different line structures
+    /// (code a reader sees on its own line the compiler reads as part of a
+    /// comment). A `\r\n` pair is one line break and stays accepted. [IPE-P0071]
+    LoneCarriageReturn,
+    /// A character a viewer draws as a line break or as reordered text, where
+    /// the compiler reads no such structure: code a reader sees could be
+    /// comment text to the compiler, or a literal could look closed where it is
+    /// not. `ch` is the character, `refusal` why its position refuses it.
+    /// [IPE-P0072]
+    SourceDisplayHazard { ch: char, refusal: HazardRefusal },
+    /// A raw C0 control, `DEL` or C1 control other than TAB, LF, CR and the
+    /// line breaks [`ParseError::SourceDisplayHazard`] covers. A terminal that
+    /// shows the raw file runs it as a command (ESC or CSI moves the cursor or
+    /// erases a line, BS steps back), so it can overwrite or hide the code
+    /// around it. Refused in every position, literals included: a program
+    /// builds such a character with `Char.fromCode`. [IPE-P0073]
+    SourceTerminalControl { ch: char },
+}
+
+/// Why a source display hazard is refused where it stands.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum HazardRefusal {
+    /// VT, FF, NEL, or a bidi embedding, pop or override: refused in every position.
+    Anywhere,
+    /// A line or paragraph separator or a bidi isolate in a comment or among code.
+    OutsideLiteral,
+    /// An isolate opener its literal does not close before the literal or its line ends.
+    UnclosedIsolate,
+    /// An isolate closer with no isolate open before it in its literal and line.
+    UnopenedIsolate,
 }
 
 /// Errors raised during name resolution / canonicalisation.
@@ -1475,14 +1506,15 @@ pub enum Feature {
     /// non-`Clone`-reuse SEAL, for the effect-carrier payload those two do not
     /// cover. Thread the value linearly (use it once) instead. [IPE-L0135]
     NonCloneValueReuse,
-    /// A `Stream.stream` handler captured a value the per-request re-wrap cannot copy.
+    /// A shared handler captured a value it cannot copy per call.
     ///
-    /// The handler is rebuilt for every request and each captured local is
-    /// cloned into it, so a capture must be `Clone`: a destructure-bound
-    /// function, a `Task`/`Cmd`/`Sub`, or a capture whose type could not be
-    /// resolved is refused. Bind a captured function with a plain `let` or take
+    /// A `Stream.stream` request handler or a `Ui`/`Html` event handler (the
+    /// `requires_sync_capture` kernels) is shared and called again and again,
+    /// and each captured local is cloned into it, so a capture must be `Clone`:
+    /// a destructure-bound function, a `Task`/`Cmd`/`Sub`, or a capture whose
+    /// type could not be resolved is refused. Bind a captured function with a plain `let` or take
     /// it as a parameter, and build a captured task inside the handler. A
-    /// partially-applied or point-free `Stream.stream` is a separate fact,
+    /// partially-applied or point-free handler kernel is a separate fact,
     /// [`LowerError::UnsaturatedHandlerKernel`]. [IPE-L0126]
     StreamHandlerCapture,
     /// A closure a partial application rebuilds would move a value it cannot copy.
@@ -1832,13 +1864,15 @@ pub enum LowerError {
     },
     /// A kernel whose handler the backend re-wraps per call was used unsaturated.
     ///
-    /// `Stream.stream` rebuilds its handler for every request and clones each
-    /// capture into it, which needs the handler expression in hand at the call.
-    /// Point-free or partially applied, the handler is the synthesized
-    /// closure's own parameter — a bare function value with no copyable form —
-    /// so the kernel is legal only as a saturated call (`<|` / `|>` spines are
-    /// flattened to one first). `kernel` is the dotted name from the kernel
-    /// registry (e.g. `Stream.stream`). [IPE-L0152]
+    /// A kernel with an adapted handler slot (`Stream.stream`, `Ui.onKeyDown`,
+    /// `Lazy.lazy`, `Task.retryWith`, …) calls its handler again and again and
+    /// needs the handler expression in hand at the call to classify its
+    /// captures. Point-free or partially applied before its handler, the
+    /// handler is the synthesized closure's own parameter — a bare function
+    /// value with no copyable form — so the kernel is legal only with its
+    /// handler supplied (`<|` / `|>` spines are flattened to one call first).
+    /// `kernel` is the dotted name from the kernel registry (e.g.
+    /// `Stream.stream`). [IPE-L0152]
     UnsaturatedHandlerKernel {
         /// The dotted kernel name that was used unsaturated (e.g. `Stream.stream`).
         kernel: Box<str>,
@@ -2819,6 +2853,9 @@ const fn parse_code(msg: &ParseError) -> Code {
         ParseError::AnnotationWithoutBinding { .. } => IPE_P0068,
         ParseError::DuplicateAnnotation { .. } => IPE_P0069,
         ParseError::SourceTooLarge { .. } => IPE_P0070,
+        ParseError::LoneCarriageReturn => IPE_P0071,
+        ParseError::SourceDisplayHazard { .. } => IPE_P0072,
+        ParseError::SourceTerminalControl { .. } => IPE_P0073,
     })
 }
 
@@ -3029,7 +3066,10 @@ fn parse_help(msg: &ParseError) -> Vec<HelpLine> {
         | ParseError::MissingDocString { .. }
         | ParseError::AnnotationWithoutBinding { .. }
         | ParseError::DuplicateAnnotation { .. }
-        | ParseError::SourceTooLarge { .. } => Vec::new(),
+        | ParseError::SourceTooLarge { .. }
+        | ParseError::LoneCarriageReturn
+        | ParseError::SourceDisplayHazard { .. }
+        | ParseError::SourceTerminalControl { .. } => Vec::new(),
     }
 }
 
@@ -3602,12 +3642,11 @@ fn mixed_open_parameter_help(callee: &str, var: &str) -> Vec<HelpLine> {
 fn unsaturated_handler_kernel_help(kernel: &str) -> Vec<HelpLine> {
     vec![HelpLine::Note(
         format!(
-            "`{kernel}` rebuilds its handler for every request, so it needs the \
-             handler in hand where it is called: apply it to all its arguments, \
-             `{kernel} contentType handler`, or pipe the handler in with \
-             `{kernel} contentType <| handler` / `handler |> {kernel} contentType`. \
-             Do not bind `{kernel}` (or `{kernel} contentType`) to a name or pass it \
-             as a value."
+            "`{kernel}` calls its handler again and again, so it needs the handler \
+             in hand where it is called: apply it to its handler at the call, or pipe \
+             the handler in with `<|` / `|>`. Do not bind `{kernel}` (or a partial \
+             application of it that still lacks the handler) to a name or pass it as \
+             a value."
         )
         .into_boxed_str(),
     )]

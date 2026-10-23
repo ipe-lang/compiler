@@ -2086,7 +2086,7 @@ Ipe.Html — HTML element builders.
 | `required` | (no summary) |
 | `multiple` | (no summary) |
 | `selected` | (no summary) |
-| `autofocus` | (no summary) |
+| `autofocus` | `autofocus True` — a control with `autofocus` takes focus at load, and |
 | `tabindex` | (no summary) |
 | `rows` | `rows n` — the `<textarea>` `rows` attribute, rendered as its decimal |
 | `Role` | (no summary) |

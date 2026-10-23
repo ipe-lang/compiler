@@ -24,19 +24,21 @@ use std::ops::RangeInclusive;
 /// CLI message relies on a zero-width joiner, so it is dropped too. A test
 /// checks the table against the Unicode general-category data.
 pub const DENIED_FORMAT_CHARS: &[RangeInclusive<char>] = &[
-    '\u{00AD}'..='\u{00AD}',   // SOFT HYPHEN
-    '\u{0600}'..='\u{0605}',   // ARABIC NUMBER SIGN .. NUMBER MARK ABOVE
-    '\u{061C}'..='\u{061C}',   // ARABIC LETTER MARK
-    '\u{06DD}'..='\u{06DD}',   // ARABIC END OF AYAH
-    '\u{070F}'..='\u{070F}',   // SYRIAC ABBREVIATION MARK
-    '\u{0890}'..='\u{0891}',   // ARABIC POUND / PIASTRE MARK ABOVE
-    '\u{08E2}'..='\u{08E2}',   // ARABIC DISPUTED END OF AYAH
-    '\u{180E}'..='\u{180E}',   // MONGOLIAN VOWEL SEPARATOR
-    '\u{200B}'..='\u{200F}',   // ZERO WIDTH SPACE, NON-JOINER, JOINER, LRM, RLM
-    '\u{2028}'..='\u{2029}',   // LINE / PARAGRAPH SEPARATOR
-    '\u{202A}'..='\u{202E}',   // bidi EMBEDDINGs, POP, OVERRIDEs
-    '\u{2060}'..='\u{2064}',   // WORD JOINER, invisible operators
-    '\u{2066}'..='\u{206F}',   // bidi ISOLATEs, deprecated format controls
+    '\u{00AD}'..='\u{00AD}', // SOFT HYPHEN
+    '\u{0600}'..='\u{0605}', // ARABIC NUMBER SIGN .. NUMBER MARK ABOVE
+    '\u{061C}'..='\u{061C}', // ARABIC LETTER MARK
+    '\u{06DD}'..='\u{06DD}', // ARABIC END OF AYAH
+    '\u{070F}'..='\u{070F}', // SYRIAC ABBREVIATION MARK
+    '\u{0890}'..='\u{0891}', // ARABIC POUND / PIASTRE MARK ABOVE
+    '\u{08E2}'..='\u{08E2}', // ARABIC DISPUTED END OF AYAH
+    '\u{180E}'..='\u{180E}', // MONGOLIAN VOWEL SEPARATOR
+    '\u{200B}'..='\u{200F}', // ZERO WIDTH SPACE, NON-JOINER, JOINER, LRM, RLM
+    LINE_AND_PARAGRAPH_SEPARATORS,
+    BIDI_EMBEDDINGS_AND_OVERRIDES,
+    '\u{2060}'..='\u{2064}', // WORD JOINER, invisible operators
+    BIDI_ISOLATE_OPENERS,
+    BIDI_ISOLATE_CLOSER..=BIDI_ISOLATE_CLOSER,
+    '\u{206A}'..='\u{206F}',   // deprecated format controls
     '\u{FEFF}'..='\u{FEFF}',   // ZERO WIDTH NO-BREAK SPACE (BOM)
     '\u{FFF9}'..='\u{FFFB}',   // INTERLINEAR ANNOTATION controls
     '\u{110BD}'..='\u{110BD}', // KAITHI NUMBER SIGN
@@ -46,6 +48,180 @@ pub const DENIED_FORMAT_CHARS: &[RangeInclusive<char>] = &[
     '\u{1D173}'..='\u{1D17A}', // MUSICAL SYMBOL BEGIN/END controls
     '\u{E0000}'..='\u{E007F}', // TAG block
 ];
+
+/// The LINE SEPARATOR and PARAGRAPH SEPARATOR, which a viewer draws as a line break.
+pub const LINE_AND_PARAGRAPH_SEPARATORS: RangeInclusive<char> = '\u{2028}'..=PARAGRAPH_SEPARATOR;
+
+/// PARAGRAPH SEPARATOR, which also ends a bidi paragraph.
+pub const PARAGRAPH_SEPARATOR: char = '\u{2029}';
+
+/// The bidi embeddings, the pop, and the overrides: LRE, RLE, PDF, LRO, RLO.
+pub const BIDI_EMBEDDINGS_AND_OVERRIDES: RangeInclusive<char> = '\u{202A}'..='\u{202E}';
+
+/// The bidi isolate openers: LRI, RLI, FSI.
+pub const BIDI_ISOLATE_OPENERS: RangeInclusive<char> = '\u{2066}'..='\u{2068}';
+
+/// The bidi isolate closer, POP DIRECTIONAL ISOLATE.
+pub const BIDI_ISOLATE_CLOSER: char = '\u{2069}';
+
+/// The two C0 controls a viewer draws as a line break: VT and FF.
+pub const CONTROL_LINE_BREAKS: RangeInclusive<char> = '\u{000B}'..='\u{000C}';
+
+/// NEXT LINE (NEL), the C1 control a viewer draws as a line break.
+pub const NEXT_LINE: char = '\u{0085}';
+
+/// The C0 controls before TAB: NUL through BS, which moves the cursor back.
+pub const C0_CONTROLS_BEFORE_TAB: RangeInclusive<char> = '\u{0000}'..='\u{0008}';
+
+/// The C0 controls after CR: SO through US, with ESC, which opens a cursor or erase sequence.
+pub const C0_CONTROLS_AFTER_CR: RangeInclusive<char> = '\u{000E}'..='\u{001F}';
+
+/// `DEL` and the C1 controls before [`NEXT_LINE`].
+pub const DEL_AND_C1_BEFORE_NEXT_LINE: RangeInclusive<char> = '\u{007F}'..='\u{0084}';
+
+/// The C1 controls after [`NEXT_LINE`], with CSI, which opens a cursor or erase sequence.
+pub const C1_CONTROLS_AFTER_NEXT_LINE: RangeInclusive<char> = '\u{0086}'..='\u{009F}';
+
+/// The role a source display hazard plays.
+///
+/// A source display hazard is a character a viewer draws as structure (a line
+/// break, or text reordered around it) while the compiler reads none there, or
+/// a control a terminal showing the raw file runs as a command. The lexer
+/// refuses each one by its role, and every one is also an
+/// [`is_display_hazard`] character, so a sink that prints source text escapes
+/// it too.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum SourceHazard {
+    /// VT, FF or NEL: a line break to a viewer, admitted nowhere in source.
+    ControlBreak,
+    /// LINE or PARAGRAPH SEPARATOR: a line break to a viewer, admitted only in a literal.
+    SeparatorBreak,
+    /// An embedding, the pop, or an override, admitted nowhere in source.
+    BidiOverride,
+    /// An isolate opener, admitted only in a literal that closes it.
+    IsolateOpen,
+    /// The isolate closer, admitted only in a literal that opened its isolate.
+    IsolateClose,
+    /// A C0 control, `DEL` or a C1 control a terminal executes, admitted nowhere in source.
+    ///
+    /// Every `Cc` character except the line model's TAB, LF and CR and the
+    /// [`Self::ControlBreak`]s: a terminal showing the raw file runs it as a
+    /// command (ESC and CSI move the cursor or erase a line, BS steps back), so
+    /// it could overwrite or hide the code around it.
+    TerminalControl,
+}
+
+/// Every source display hazard, as the code points it covers and its role.
+pub const SOURCE_DISPLAY_HAZARDS: &[(RangeInclusive<char>, SourceHazard)] = &[
+    (CONTROL_LINE_BREAKS, SourceHazard::ControlBreak),
+    (NEXT_LINE..=NEXT_LINE, SourceHazard::ControlBreak),
+    (LINE_AND_PARAGRAPH_SEPARATORS, SourceHazard::SeparatorBreak),
+    (BIDI_EMBEDDINGS_AND_OVERRIDES, SourceHazard::BidiOverride),
+    (BIDI_ISOLATE_OPENERS, SourceHazard::IsolateOpen),
+    (
+        BIDI_ISOLATE_CLOSER..=BIDI_ISOLATE_CLOSER,
+        SourceHazard::IsolateClose,
+    ),
+    (C0_CONTROLS_BEFORE_TAB, SourceHazard::TerminalControl),
+    (C0_CONTROLS_AFTER_CR, SourceHazard::TerminalControl),
+    (DEL_AND_C1_BEFORE_NEXT_LINE, SourceHazard::TerminalControl),
+    (C1_CONTROLS_AFTER_NEXT_LINE, SourceHazard::TerminalControl),
+];
+
+// IPE-RUST-AUDIT:ACCEPTED (Arthur Maciel) — compile-time `const` assertion (not a runtime panic); fails the BUILD if the source table's control roles stop being exactly the `Cc` controls the sanitiser drops, bar TAB, LF and CR [ledger #boundary]
+const _: () = assert!(controls_are_refused_exactly());
+
+/// Whether `code` is a `Cc` control (C0, `DEL` or C1) other than TAB, LF and CR.
+///
+/// The Unicode stability policy fixes the `Cc` set to these code points, the
+/// ones [`char::is_control`] accepts.
+const fn is_refused_control(code: u32) -> bool {
+    matches!(code, 0x00..=0x08 | 0x0B..=0x0C | 0x0E..=0x1F | 0x7F..=0x9F)
+}
+
+/// Whether `role` is one a control character plays.
+const fn is_control_role(role: SourceHazard) -> bool {
+    matches!(
+        role,
+        SourceHazard::ControlBreak | SourceHazard::TerminalControl
+    )
+}
+
+/// Whether some control role of [`SOURCE_DISPLAY_HAZARDS`] covers `code`.
+const fn has_control_role(code: u32) -> bool {
+    let mut rest = SOURCE_DISPLAY_HAZARDS;
+    while let Some(((range, role), tail)) = rest.split_first() {
+        if is_control_role(*role) && *range.start() as u32 <= code && code <= *range.end() as u32 {
+            return true;
+        }
+        rest = tail;
+    }
+    false
+}
+
+/// Whether the control roles of [`SOURCE_DISPLAY_HAZARDS`] cover every refused
+/// control and nothing else, and no literal admits either role.
+const fn controls_are_refused_exactly() -> bool {
+    if SourceHazard::ControlBreak.admitted_in_literal()
+        || SourceHazard::TerminalControl.admitted_in_literal()
+    {
+        return false;
+    }
+    let mut rest = SOURCE_DISPLAY_HAZARDS;
+    while let Some(((range, role), tail)) = rest.split_first() {
+        if is_control_role(*role) {
+            let mut code = *range.start() as u32;
+            while code <= *range.end() as u32 {
+                if !is_refused_control(code) {
+                    return false;
+                }
+                code += 1;
+            }
+        }
+        rest = tail;
+    }
+    let mut code = 0;
+    while code <= 0x9F {
+        if is_refused_control(code) && !has_control_role(code) {
+            return false;
+        }
+        code += 1;
+    }
+    true
+}
+
+impl SourceHazard {
+    /// The role `c` plays, or `None` for a character no viewer draws as structure or runs.
+    #[must_use]
+    pub fn of(c: char) -> Option<Self> {
+        SOURCE_DISPLAY_HAZARDS
+            .iter()
+            .find(|(range, _)| range.contains(&c))
+            .map(|&(_, role)| role)
+    }
+
+    /// Whether a string or char literal may carry this hazard.
+    ///
+    /// An isolate must still be closed inside the same literal and bidi paragraph.
+    #[must_use]
+    pub const fn admitted_in_literal(self) -> bool {
+        matches!(
+            self,
+            Self::SeparatorBreak | Self::IsolateOpen | Self::IsolateClose
+        )
+    }
+}
+
+/// Whether `c` ends a bidi paragraph, which closes every isolate still open.
+///
+/// These are the UAX #9 paragraph separators (bidi class `B`).
+#[must_use]
+pub const fn ends_bidi_paragraph(c: char) -> bool {
+    matches!(
+        c,
+        '\n' | '\r' | '\u{1C}'..='\u{1E}' | NEXT_LINE | PARAGRAPH_SEPARATOR
+    )
+}
 
 /// Whether `c` is one of the [`DENIED_FORMAT_CHARS`].
 #[must_use]
@@ -441,6 +617,115 @@ mod tests {
         assert!(!is_display_hazard(' '));
         assert!(!is_display_hazard('\u{00AC}'));
         assert!(!is_display_hazard('\u{FFFC}'));
+    }
+
+    /// The source display hazards are exactly the line-like breaks, the bidi
+    /// controls and the terminal controls, each with its role, and no other
+    /// character has a role.
+    #[test]
+    fn source_display_hazards_are_the_breaks_bidi_and_terminal_controls() {
+        let expected: [(char, SourceHazard); 14] = [
+            ('\u{000B}', SourceHazard::ControlBreak),
+            ('\u{000C}', SourceHazard::ControlBreak),
+            ('\u{0085}', SourceHazard::ControlBreak),
+            ('\u{2028}', SourceHazard::SeparatorBreak),
+            ('\u{2029}', SourceHazard::SeparatorBreak),
+            ('\u{202A}', SourceHazard::BidiOverride),
+            ('\u{202B}', SourceHazard::BidiOverride),
+            ('\u{202C}', SourceHazard::BidiOverride),
+            ('\u{202D}', SourceHazard::BidiOverride),
+            ('\u{202E}', SourceHazard::BidiOverride),
+            ('\u{2066}', SourceHazard::IsolateOpen),
+            ('\u{2067}', SourceHazard::IsolateOpen),
+            ('\u{2068}', SourceHazard::IsolateOpen),
+            ('\u{2069}', SourceHazard::IsolateClose),
+        ];
+        for c in char::MIN..=char::MAX {
+            let terminal = c.is_control() && !matches!(c, '\t' | '\n' | '\r');
+            let want = expected
+                .iter()
+                .find(|(hazard, _)| *hazard == c)
+                .map(|&(_, role)| role)
+                .or_else(|| terminal.then_some(SourceHazard::TerminalControl));
+            assert_eq!(SourceHazard::of(c), want, "U+{:04X}", u32::from(c));
+        }
+    }
+
+    /// Every source display hazard is a display hazard, so a sink that prints
+    /// source text drops each one the lexer refuses.
+    #[test]
+    fn every_source_display_hazard_is_a_display_hazard() {
+        for (range, _) in SOURCE_DISPLAY_HAZARDS {
+            for c in range.clone() {
+                let code = u32::from(c);
+                assert!(is_display_hazard(c), "U+{code:04X}");
+                let text = c.to_string();
+                assert!(
+                    TerminalSafe::sanitize(&text).as_str().is_empty(),
+                    "U+{code:04X} reaches a terminal"
+                );
+            }
+        }
+    }
+
+    /// The source refuses every `Cc` control the terminal sanitiser drops, except
+    /// the line model's TAB, LF and CR, so the lexer's control set and the
+    /// sanitiser's are one set.
+    #[test]
+    fn every_control_but_the_line_model_is_a_source_hazard() {
+        use unicode_general_category::{GeneralCategory, get_general_category};
+        for c in char::MIN..=char::MAX {
+            let code = u32::from(c);
+            let control = matches!(get_general_category(c), GeneralCategory::Control);
+            assert_eq!(control, c.is_control(), "U+{code:04X}");
+            let line_model = matches!(c, '\t' | '\n' | '\r');
+            assert_eq!(
+                is_refused_control(code),
+                control && !line_model,
+                "U+{code:04X}"
+            );
+            if control {
+                assert_eq!(SourceHazard::of(c).is_some(), !line_model, "U+{code:04X}");
+            }
+        }
+        let terminal = SOURCE_DISPLAY_HAZARDS
+            .iter()
+            .filter(|(_, role)| *role == SourceHazard::TerminalControl)
+            .flat_map(|(range, _)| range.clone());
+        assert_eq!(
+            terminal.count(),
+            59,
+            "65 `Cc` less TAB, LF, CR, VT, FF and NEL"
+        );
+        assert!(!SourceHazard::TerminalControl.admitted_in_literal());
+    }
+
+    /// Only the separators and isolates may stand in a literal, and the bidi
+    /// paragraph ends are the UAX #9 class `B` characters.
+    #[test]
+    fn literal_admission_and_paragraph_ends() {
+        let admitted: Vec<SourceHazard> = SOURCE_DISPLAY_HAZARDS
+            .iter()
+            .map(|&(_, role)| role)
+            .filter(|role| role.admitted_in_literal())
+            .collect();
+        assert_eq!(
+            admitted,
+            [
+                SourceHazard::SeparatorBreak,
+                SourceHazard::IsolateOpen,
+                SourceHazard::IsolateClose
+            ]
+        );
+        let ends: Vec<char> = (char::MIN..='\u{3000}')
+            .filter(|&c| ends_bidi_paragraph(c))
+            .collect();
+        assert_eq!(
+            ends,
+            [
+                '\n', '\r', '\u{1C}', '\u{1D}', '\u{1E}', '\u{85}', '\u{2029}'
+            ]
+        );
     }
 
     /// `find` reports the first hazard and its 1-based character position.

@@ -88,7 +88,7 @@ fixtureLabel unit =
         "u-b"
 
     else
-        Uid.toString unit
+        TestSupport.uidHex unit
 
 
 -- True for an `Unreadable` view tag whose rendered error contains `needle`.
@@ -284,7 +284,7 @@ actedColumnsPastWindowFailRead =
                 && not (maybeContains (String.repeat 64 "a") message)
     in
     do
-        oldHash <- readMessageAfter "ipe-index-old-hash-past-window" ("UPDATE change_queue SET old_hash = " ++ long ++ " WHERE uid = '" ++ Uid.toString (uid "u-b") ++ "'") (\conn -> pendingRows conn |> Task.map (\_ -> ()))
+        oldHash <- readMessageAfter "ipe-index-old-hash-past-window" ("UPDATE change_queue SET old_hash = " ++ long ++ " WHERE uid = '" ++ TestSupport.uidHex (uid "u-b") ++ "'") (\conn -> pendingRows conn |> Task.map (\_ -> ()))
         pair <- readMessageAfter "ipe-index-pair-past-window" ("INSERT INTO reviewed VALUES ('x', " ++ long ++ ")") (\conn -> snapshotOn conn |> Task.map (\_ -> ()))
         stamp <- readMessageAfter "ipe-index-stamp-past-window" ("INSERT OR REPLACE INTO reviewed_stamp (one, head) VALUES (1, " ++ long ++ ")") (\conn -> Index.readStamp conn |> Task.map (\_ -> ()))
         tag <- reposProbeAfter "ipe-index-repos-tag-past-window" [ "INSERT INTO repos (tag, outer, prefix) VALUES (" ++ long ++ ", NULL, NULL)" ] noRepos
@@ -1456,7 +1456,7 @@ unrecordedUnitListed =
 -- in a missing `old_hash`.
 changeDecodeRefusesModifiedWithoutOld : Task.Task Error Bool
 changeDecodeRefusesModifiedWithoutOld =
-    pageReadFailsAfter "ipe-index-modified-no-old" ("UPDATE change_queue SET old_hash = NULL WHERE uid = '" ++ Uid.toString (uid "u-b") ++ "'")
+    pageReadFailsAfter "ipe-index-modified-no-old" ("UPDATE change_queue SET old_hash = NULL WHERE uid = '" ++ TestSupport.uidHex (uid "u-b") ++ "'")
 
 
 -- An index whose queue row reports a change kind this reviewer does not
@@ -1496,7 +1496,7 @@ redefinedViewHidesNoUnit =
         at <- freshScratch "ipe-index-redefined-view"
         removeFileIfAny at.indexDb
         seedIndex at.indexDb at.repo
-        execIndexScript at.indexDb ("DROP VIEW open_units; CREATE VIEW open_units AS SELECT uid, path, name, qualified, kind, line_start, line_end, facing, purpose, body_hash, updated_sha, NULL AS lang, NULL AS change, NULL AS old_hash, 0 AS enqueued_at FROM units WHERE uid <> '" ++ Uid.toString (uid "u-b") ++ "'")
+        execIndexScript at.indexDb ("DROP VIEW open_units; CREATE VIEW open_units AS SELECT uid, path, name, qualified, kind, line_start, line_end, facing, purpose, body_hash, updated_sha, NULL AS lang, NULL AS change, NULL AS old_hash, 0 AS enqueued_at FROM units WHERE uid <> '" ++ TestSupport.uidHex (uid "u-b") ++ "'")
         r <- loadFirstPage
         cleanupIndex at.indexDb at.repo
         Task.succeed (r.total == 2 && List.map (\e -> e.uid) r.units == [ uid "u-a", uid "u-b" ])
@@ -1634,7 +1634,7 @@ indexExposingScanRefusesEvasions =
 -- Every name `Lib.Index` exposes, a type's constructors written bare.
 indexExposes : List String
 indexExposes =
-    [ "Attested", "AttestedHash", "Body", "ChainHead", "ChainVerdict", "Change", "Cursor", "DecidedPair", "LogStatus", "Oversize", "PendingRow", "ReadFailure", "RefusalDigest", "RefusalReason", "RefusalRow", "ShownSource", "Snapshot", "SourceView", "StaleReason", "Stamp", "Unit", "UnitView", "Written", "ackable", "attest", "attestResidual", "attestedHash", "attestedHashMaxBytes", "attestedName", "attestedUid", "candidateQuery", "chainHeadDecoder", "chainHeadText", "chainKeyCheck", "chainLogId", "chainMac", "chainNext", "chainSeq", "childSpanCeiling", "classifyView", "decidedPairDecoder", "decidedPairKey", "digestPair", "drainDecided", "drainUnit", "drawnDepthCeiling", "elementResidentBytes", "lengthPrefixed", "linkElements", "liveFiles", "liveUnits", "loadView", "placeholders", "probe", "probeRepos", "probeRoot", "queueElementCeiling", "queueLabelByteCeiling", "readConnection", "readFailureText", "readSnapshot", "readStamp", "rebuildReviewed", "refusalDigestText", "refusalReasons", "refusalRowDecoder", "refusalTag", "residualText", "reverify", "reverifyRefusal", "runtimeEntryOverhead", "runtimeSessionCeiling", "shortHash", "shownDrawn", "shownHash", "shownRows", "shownText", "signedStamp", "sourceCeiling", "spanOversize", "stampStatus", "stampText", "storedHash", "unescapeShown", "unitName", "unsignedStamp", "viewByteCeiling", "viewLineCeiling", "viewLines", "viewNodeCeiling", "viewReserve", "viewText" ]
+    [ "Attested", "AttestedHash", "Body", "ChainHead", "ChainVerdict", "Change", "Cursor", "DecidedPair", "LogStatus", "Oversize", "PendingRow", "ReadFailure", "RefusalDigest", "RefusalReason", "RefusalRow", "ShownHash", "ShownSource", "Snapshot", "SourceView", "StaleReason", "Stamp", "Unit", "UnitView", "Written", "ackable", "attest", "attestResidual", "attestedHash", "attestedHashMaxBytes", "attestedName", "attestedUid", "candidateQuery", "chainHeadDecoder", "chainHeadText", "chainKeyCheck", "chainLogId", "chainMac", "chainNext", "chainSeq", "childSpanCeiling", "classifyView", "decidedPairDecoder", "decidedPairKey", "digestPair", "drainDecided", "drainUnit", "drawnDepthCeiling", "elementResidentBytes", "lengthPrefixed", "linkElements", "liveFiles", "liveUnits", "loadView", "placeholders", "probe", "probeRepos", "probeRoot", "queueElementCeiling", "queueLabelByteCeiling", "readConnection", "readFailureText", "readSnapshot", "readStamp", "rebuildReviewed", "refusalDigestText", "refusalReasons", "refusalRowDecoder", "refusalTag", "residualText", "reverify", "reverifyRefusal", "runtimeEntryOverhead", "runtimeSessionCeiling", "shortHash", "shownDigest", "shownDrawn", "shownHash", "shownRows", "shownText", "signedStamp", "sourceCeiling", "spanOversize", "stampStatus", "stampText", "storedHash", "unescapeShown", "unitName", "unsignedStamp", "viewByteCeiling", "viewLineCeiling", "viewLines", "viewNodeCeiling", "viewReserve", "viewText" ]
 
 
 -- The readers `Index.readSnapshot` runs in its transaction.
@@ -1805,7 +1805,7 @@ unboundUnitsExcluded =
                 && after.units == before.units
                 && after.open == before.open
                 && List.length after.rows == List.length before.rows
-                && not (List.any (\row -> Uid.toString row.unit.uid == Uid.toString (uid "u-ext")) after.rows)
+                && not (List.any (\row -> TestSupport.uidHex row.unit.uid == TestSupport.uidHex (uid "u-ext")) after.rows)
                 && (case view of
                         Just _ ->
                             False
@@ -1827,7 +1827,7 @@ unjudgedUnitFailsSnapshot =
         removeFileIfAny at.indexDb
         seedIndex at.indexDb at.repo
         intact <- indexConn |> Task.andThen snapshotOn |> Task.map (\_ -> True) |> Task.onError (\_ -> Task.succeed False)
-        execIndexScript at.indexDb ("CREATE TABLE units_copy AS SELECT * FROM units; DROP TABLE units; CREATE TABLE units AS SELECT * FROM units_copy; DROP TABLE units_copy; UPDATE units SET path = NULL WHERE uid = '" ++ Uid.toString (uid "u-a") ++ "'")
+        execIndexScript at.indexDb ("CREATE TABLE units_copy AS SELECT * FROM units; DROP TABLE units; CREATE TABLE units AS SELECT * FROM units_copy; DROP TABLE units_copy; UPDATE units SET path = NULL WHERE uid = '" ++ TestSupport.uidHex (uid "u-a") ++ "'")
         message <- probeMessage (indexConn |> Task.andThen snapshotOn |> Task.map (\_ -> ()))
         cleanupIndex at.indexDb at.repo
         Task.succeed (intact && maybeContains "the index's unit counts do not add up" message)
@@ -1874,9 +1874,9 @@ liveReadsBoundedByUids =
         execIndexScript at.indexDb
             ("CREATE TABLE units_copy AS SELECT * FROM units; DROP TABLE units; CREATE TABLE units AS SELECT * FROM units_copy; DROP TABLE units_copy; "
                 ++ "INSERT INTO units SELECT * FROM units WHERE uid = '"
-                ++ Uid.toString (uid "u-a")
+                ++ TestSupport.uidHex (uid "u-a")
                 ++ "'; INSERT INTO units SELECT * FROM units WHERE uid = '"
-                ++ Uid.toString (uid "u-a")
+                ++ TestSupport.uidHex (uid "u-a")
                 ++ "' LIMIT 1; "
                 ++ "CREATE TABLE refusals_copy AS SELECT * FROM refusals; DROP TABLE refusals; CREATE TABLE refusals AS SELECT * FROM refusals_copy; DROP TABLE refusals_copy; "
                 ++ "INSERT INTO refusals SELECT * FROM refusals; INSERT INTO refusals SELECT * FROM refusals LIMIT 1"

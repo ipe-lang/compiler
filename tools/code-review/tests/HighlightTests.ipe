@@ -1,10 +1,15 @@
 module HighlightTests exposing (checks)
 
+import HighlightFrozen
+import Ipe.ByteSize as ByteSize
+import Ipe.Char as Char
 import Ipe.Error as Error
 import Ipe.List as List
 import Ipe.String as String
 import Ipe.Task as Task
+import Ipe.Tuple as Tuple
 import Lib.Highlight as Highlight exposing (Lang(..), LeadingMark(..), LineEnds(..), Separator(..), Token(..))
+import Lib.Index as Index
 
 
 -- Each check pins one language's lexical grammar: a delimiter opens a
@@ -216,6 +221,213 @@ longLines =
         && Highlight.tokenize Ipe comment == [ Comment comment ]
 
 
+codeText : Int -> String
+codeText code =
+    String.fromChar (Char.fromCode code)
+
+
+kindOf : Token -> ( String, String )
+kindOf tok =
+    case tok of
+        Keyword t ->
+            ( "keyword", t )
+
+        Str t ->
+            ( "str", t )
+
+        Comment t ->
+            ( "comment", t )
+
+        Num t ->
+            ( "num", t )
+
+        Ident t ->
+            ( "ident", t )
+
+        Plain t ->
+            ( "plain", t )
+
+
+frozenLang : Lang -> HighlightFrozen.Lang
+frozenLang lang =
+    case lang of
+        Rust ->
+            HighlightFrozen.Rust
+
+        Shell ->
+            HighlightFrozen.Shell
+
+        Ipe ->
+            HighlightFrozen.Ipe
+
+        Unknown ->
+            HighlightFrozen.Unknown
+
+
+allLangs : List Lang
+allLangs =
+    [ Rust, Shell, Ipe, Unknown ]
+
+
+-- Every string of length 0..3 over the characters the grammars branch on.
+exhaustiveInputs : List String
+exhaustiveInputs =
+    let
+        alphabet =
+            [ "b", "c", "r", "a", "1", "\"", "'", "#", "\\", "/", "*", "-", "{", "}", "|", "$", "<", " ", codeText 9, codeText 13, "\n", codeText 0 ]
+
+        extendAll prefixes =
+            List.concatMap (\prefix -> List.map (\c -> prefix ++ c) alphabet) prefixes
+
+        two =
+            extendAll alphabet
+    in
+    List.concat [ [ "" ], alphabet, two, extendAll two ]
+
+
+wordHeadInputs : List String
+wordHeadInputs =
+    List.concatMap
+        (\head -> [ head, head ++ "\n", head ++ "\nz" ])
+        [ "b", "c", "br\"x\"", "cr\"x\"", "b\"x\"", "bx", "brr", "bR\"x\"", "Br\"x\"", "Cr\"x\"", "r#\"x\"#", "br##\"a\"#\"##", "c'x'" ]
+
+
+handPickedInputs : List String
+handPickedInputs =
+    let
+        nul =
+            codeText 0
+
+        rlo =
+            codeText 8238
+    in
+    List.concat
+        [ wordHeadInputs
+        , [ "\"abc", "'a", "r#\"x", "/* x", "{- x {- y -}", "{-| x", "\"\"\"x", "$'x" ]
+        , [ "cat <<EOF", "cat <<-EOF\nbody\n" ++ codeText 9 ++ "EOF\nz", "cat <<EOF\nbody\nEOF\nz", "$((1<<2))" ]
+        , [ "a" ++ codeText 13 ++ "\nb", "a" ++ codeText 13 ++ "b", codeText 65279 ++ "fn x" ]
+        , [ "\"a" ++ nul ++ "b\"", "// a" ++ nul ++ "b", "-- a" ++ nul ++ "b", "# a" ++ nul ++ "b" ]
+        , [ codeText 233, codeText 8364, codeText 128512 ]
+        , [ "a" ++ rlo ++ "b", "\"a" ++ rlo ++ "b\"", "-- a" ++ rlo ++ "b", "// a" ++ rlo ++ "b" ]
+        , [ "0x1F", "1_000", "1e-3", "1.2.3" ]
+        ]
+
+
+-- Every ordered pair of hand-picked inputs on two lines, so each one is lexed
+-- with every other's carry.
+pairedInputs : List String
+pairedInputs =
+    List.concatMap (\first -> List.map (\second -> first ++ "\n" ++ second) handPickedInputs) handPickedInputs
+
+
+-- Lines that close whatever a lexeme left open, so a carry that differs
+-- between the two lexers shows up as different tokens.
+flushTail : List String
+flushTail =
+    [ "\"", "'", "*/ a", "-} b", "\"\"\"", "EOF", "z" ]
+
+
+sameTokens : Lang -> String -> Bool
+sameTokens lang src =
+    List.map kindOf (Highlight.tokenize lang src)
+        == List.map HighlightFrozen.kindOf (HighlightFrozen.tokenize (frozenLang lang) src)
+
+
+lexLines : Lang -> List String -> List (List ( String, String ))
+lexLines lang lines =
+    Tuple.second (List.foldl (lexNext lang) ( Highlight.lineStart, [] ) lines)
+
+
+lexNext : Lang -> String -> ( Highlight.Carry, List (List ( String, String )) ) -> ( Highlight.Carry, List (List ( String, String )) )
+lexNext lang line ( carry, done ) =
+    case Highlight.lexLine lang carry line of
+        ( toks, next ) ->
+            ( next, done ++ [ List.map kindOf toks ] )
+
+
+frozenLexLines : HighlightFrozen.Lang -> List String -> List (List ( String, String ))
+frozenLexLines lang lines =
+    Tuple.second (List.foldl (frozenLexNext lang) ( HighlightFrozen.lineStart, [] ) lines)
+
+
+frozenLexNext : HighlightFrozen.Lang -> String -> ( HighlightFrozen.Carry, List (List ( String, String )) ) -> ( HighlightFrozen.Carry, List (List ( String, String )) )
+frozenLexNext lang line ( carry, done ) =
+    case HighlightFrozen.lexLine lang carry line of
+        ( toks, next ) ->
+            ( next, done ++ [ List.map HighlightFrozen.kindOf toks ] )
+
+
+sameLines : Lang -> String -> Bool
+sameLines lang src =
+    let
+        lines =
+            String.split "\n" src ++ flushTail
+    in
+    lexLines lang lines == frozenLexLines (frozenLang lang) lines
+
+
+-- The tokens of every input are the frozen lexer's, whole or line by line
+-- with the carry between lines. Red if a state split changes any token or
+-- any carry, e.g. a raw-string prefix taken for a word that began with `B`.
+tokenizeMatchesFrozen : Bool
+tokenizeMatchesFrozen =
+    List.all (\lang -> List.all (sameTokens lang) (List.concat [ exhaustiveInputs, handPickedInputs, pairedInputs ])) allLangs
+
+
+lexLineMatchesFrozen : Bool
+lexLineMatchesFrozen =
+    List.all (\lang -> List.all (sameLines lang) (List.concat [ exhaustiveInputs, handPickedInputs, pairedInputs ])) allLangs
+
+
+-- One maximal word at the shown-view ceiling: letters only, a `b` then
+-- letters (the word-head state then the word state), and digits only. Each is
+-- one token of the kind the frozen lexer gives the same shape at 64 characters.
+-- Red if a step copies the open word per character (quadratic: never ends).
+longWordShape : Int -> Int -> String
+longWordShape shape size =
+    if shape == 0 then
+        String.repeat size "a"
+
+    else if shape == 1 then
+        "b" ++ String.repeat (size - 1) "a"
+
+    else
+        String.repeat size "1"
+
+
+longWordIsOneToken : Lang -> Int -> Bool
+longWordIsOneToken lang shape =
+    let
+        long =
+            longWordShape shape (ByteSize.toBytes Index.viewByteCeiling)
+
+        expected =
+            List.map HighlightFrozen.kindOf (HighlightFrozen.tokenize (frozenLang lang) (longWordShape shape 64))
+
+        got =
+            Highlight.tokenize lang long
+    in
+    List.length expected == 1
+        && List.length got == 1
+        && List.map (\tok -> Tuple.first (kindOf tok)) got == List.map Tuple.first expected
+        && String.concat (List.map rawText got) == long
+
+
+longWordsLinear : Bool
+longWordsLinear =
+    List.all (\lang -> List.all (longWordIsOneToken lang) [ 0, 1, 2 ]) allLangs
+
+
+-- Each token holds at least one character and only a line break adds its own
+-- token, so a lex never yields more tokens than the source has characters
+-- plus one.
+tokenCountBounded : Bool
+tokenCountBounded =
+    List.all
+        (\lang -> List.all (\src -> List.length (Highlight.tokenize lang src) <= String.length src + 1) (exhaustiveInputs ++ handPickedInputs))
+        allLangs
+
+
 -- Each language's layout and path facts are its grammar row's: a CRLF is
 -- one line break in Rust and Ipê, only Rust skips a leading byte-order mark,
 -- and a path joins with `::` (Rust, `crate` its own root) or `.` (Ipê). A
@@ -301,4 +513,8 @@ checks =
         , ( "lexemes open at end of input close in one pass", unterminatedAtEof )
         , ( "a quarter-mebibyte line lexes whole in each language", longLines )
         , ( "each language's layout and path facts are its grammar row", languageFacts )
+        , ( "tokenize matches the frozen lexer on every corpus input", tokenizeMatchesFrozen )
+        , ( "lexLine tokens and carries match the frozen lexer", lexLineMatchesFrozen )
+        , ( "one maximal word at the view ceiling lexes as one token", longWordsLinear )
+        , ( "a lex yields at most one token per character plus one", tokenCountBounded )
         ]
