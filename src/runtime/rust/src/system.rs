@@ -1750,6 +1750,94 @@ fn spawn_bounded_child(
 /// The result one capture thread hands back.
 type CaptureResult = std::io::Result<Vec<u8>>;
 
+/// One of the two streams a piped child is captured on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PipedStream {
+    Stdout,
+    Stderr,
+}
+
+impl PipedStream {
+    /// The stream's name in a refusal.
+    const fn name(self) -> &'static str {
+        match self {
+            Self::Stdout => "stdout",
+            Self::Stderr => "stderr",
+        }
+    }
+}
+
+/// How a piped call applies its byte ceiling.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OutputCeiling {
+    /// Both streams together, refused as `output` (`Process.run`).
+    Combined,
+    /// Each stream on its own, refused by name (`Process.runWith`).
+    PerStream,
+}
+
+/// The streams of a piped child drained so far.
+struct Drained {
+    stdout: Option<Vec<u8>>,
+    stderr: Option<Vec<u8>>,
+}
+
+impl Drained {
+    /// The byte-ceiling refusal the drained streams already decide.
+    ///
+    /// A refusal is issued only when no stream still draining could change
+    /// it, so the outcome is the one a check over both finished streams
+    /// (stdout first) yields: under `Combined` a partial total past `cap`
+    /// stays past it; under `PerStream` stdout decides first, and stderr
+    /// decides once stdout is in and within the ceiling. `expired` lets an
+    /// over-ceiling stderr decide while stdout is still open: a known overflow
+    /// is the truer refusal than the wall-clock one.
+    fn refusal(
+        &self,
+        cmd: &str,
+        ceiling: OutputCeiling,
+        cap: u64,
+        expired: bool,
+    ) -> Option<ProcessRefusal> {
+        let stdout = self.stdout.as_deref();
+        let stderr = self.stderr.as_deref();
+        let over = |bytes: Option<&[u8]>| bytes.is_some_and(|bytes| byte_len(bytes) > cap);
+        let stream = match ceiling {
+            OutputCeiling::Combined => (stdout
+                .map_or(0, byte_len)
+                .saturating_add(stderr.map_or(0, byte_len))
+                > cap)
+                .then_some("output"),
+            OutputCeiling::PerStream => {
+                if over(stdout) {
+                    Some(PipedStream::Stdout.name())
+                } else if (stdout.is_some() || expired) && over(stderr) {
+                    Some(PipedStream::Stderr.name())
+                } else {
+                    None
+                }
+            }
+        };
+        stream.map(|stream| ProcessRefusal::OutputTooLarge {
+            cmd: cmd.to_owned(),
+            stream,
+            cap,
+        })
+    }
+
+    /// The stream not yet drained, for a capture thread that never reported.
+    const fn pending(&self) -> PipedStream {
+        if self.stdout.is_none() {
+            PipedStream::Stdout
+        } else {
+            PipedStream::Stderr
+        }
+    }
+}
+
+/// What one capture thread hands back: its stream and the bytes it drained.
+type StreamCapture = (PipedStream, CaptureResult);
+
 /// Read up to `limit` bytes from `reader` on a dedicated thread. Draining each
 /// pipe on its OWN thread avoids the sequential-drain deadlock: a child that
 /// fills one pipe's kernel buffer while blocking on the other cannot wedge the
@@ -1758,9 +1846,10 @@ type CaptureResult = std::io::Result<Vec<u8>>;
 /// `limit` is a per-call value (`cap + 1`) passed by ownership, so concurrent
 /// `process_run` calls never share or clobber it.
 ///
-/// The bytes arrive on the returned receiver, so the caller waits under its
-/// [`Deadline`]; a thread that panics drops its sender, which the caller sees
-/// as [`DeadlineLapse::Disconnected`].
+/// The bytes arrive on `report`, tagged with `stream`, so the caller judges
+/// whichever stream ends first under its [`Deadline`]; a thread that panics
+/// drops its sender, which the caller sees as [`DeadlineLapse::Disconnected`]
+/// once no other thread can still report.
 ///
 /// # Errors
 ///
@@ -1768,28 +1857,31 @@ type CaptureResult = std::io::Result<Vec<u8>>;
 fn spawn_capture_thread<R>(
     reader: Option<R>,
     limit: u64,
-) -> std::io::Result<std::sync::mpsc::Receiver<CaptureResult>>
+    stream: PipedStream,
+    report: std::sync::mpsc::SyncSender<StreamCapture>,
+) -> std::io::Result<()>
 where
     R: std::io::Read + Send + 'static,
 {
-    let (tx, rx) = std::sync::mpsc::sync_channel::<CaptureResult>(1);
     crate::threads::spawn_named(CAPTURE_THREAD, move || {
         use std::io::Read as _;
         let mut buf = Vec::new();
         let read = reader
             .map_or(Ok(0), |reader| reader.take(limit).read_to_end(&mut buf))
             .map(|_| buf);
-        // The slot is free until this one send; a caller gone past its
-        // deadline has dropped the receiver, and the bytes are discarded.
-        let _ = tx.send(read);
+        // The channel holds one slot per stream, so this send never blocks; a
+        // caller gone past its deadline has dropped the receiver, and the
+        // bytes are discarded.
+        let _ = report.send((stream, read));
     })?;
-    Ok(rx)
+    Ok(())
 }
 
-/// Waits for one captured stream under `deadline`.
+/// Waits for the pty stream under `deadline`.
 ///
 /// On expiry the child is killed and reaped before the `TimedOut` refusal
 /// returns, so no caller observes a timeout with the child still alive.
+#[cfg(unix)]
 fn capture_within(
     cmd: &str,
     stream: &'static str,
@@ -1845,7 +1937,8 @@ fn byte_len(bytes: &[u8]) -> u64 {
     u64::try_from(bytes.len()).unwrap_or(u64::MAX)
 }
 
-/// Refuses a stream whose capture of `len` bytes passed `cap`.
+/// Refuses a pty stream whose capture of `len` bytes passed `cap`.
+#[cfg(unix)]
 fn within_cap(cmd: &str, stream: &'static str, len: u64, cap: u64) -> Result<(), ProcessRefusal> {
     if len > cap {
         return Err(ProcessRefusal::OutputTooLarge {
@@ -2829,24 +2922,28 @@ struct PipedStreams {
 /// `bounds`.
 ///
 /// Each stream reads at most `output + 1` bytes on its own thread (no
-/// sequential-drain deadlock); `admit` then checks the drained bytes against
-/// the byte ceiling BEFORE the reap, so an over-ceiling child still running is
-/// killed at once rather than waited on. The wall deadline starts at the
-/// spawn and covers both drains and the reap; on expiry the child (its process
-/// group on Linux) is killed and reaped before `TimedOut` returns. Every error
-/// path kills and reaps the child through [`ChildGuard`].
+/// sequential-drain deadlock), and both report on one channel, so the byte
+/// ceiling is judged as each stream ends: a stream that already decides the
+/// refusal ends the call at once and kills a child that keeps its other
+/// stream open (one ignoring `SIGPIPE`, or one that sleeps on) instead of
+/// waiting it out. The check precedes the reap, so an over-ceiling child is
+/// never waited on. The wall deadline starts at the spawn and covers both
+/// drains and the reap; on expiry the child (its process group on Linux) is
+/// killed and reaped before `TimedOut` returns. Every error path kills and
+/// reaps the child through [`ChildGuard`].
 fn run_piped(
     cmd: &str,
     builder: std::process::Command,
     bounds: ProcessBounds,
-    admit: impl FnOnce(&[u8], &[u8]) -> Result<(), ProcessRefusal>,
+    ceiling: OutputCeiling,
 ) -> Result<PipedStreams, ProcessRefusal> {
     let mut guard = spawn_bounded_child(cmd, builder)?;
     let deadline = Deadline::start(bounds.wall);
+    let cap = bounds.output;
 
     // Per-stream read bound; passed by value to each capture thread (no shared
     // global, so concurrent `process_run` calls cannot clobber one another).
-    let limit = bounds.output.saturating_add(1);
+    let limit = cap.saturating_add(1);
 
     // Take the pipe handles so each thread owns its reader; a `?` before the
     // waits still reaps the child via `guard`'s `Drop`.
@@ -2855,22 +2952,61 @@ fn run_piped(
         .map_or((None, None), |c| (c.stdout.take(), c.stderr.take()));
     // A refused capture thread returns through `?`; `guard` kills and reaps the
     // child, which ends any capture already started.
-    let thread_refused = |stream| {
+    let thread_refused = |stream: PipedStream| {
         move |error| ProcessRefusal::Thread {
             cmd: cmd.to_owned(),
-            stream,
+            stream: stream.name(),
             error,
         }
     };
-    let out_rx = spawn_capture_thread(stdout_pipe, limit).map_err(thread_refused("stdout"))?;
-    let err_rx = spawn_capture_thread(stderr_pipe, limit).map_err(thread_refused("stderr"))?;
+    let (report, reports) = std::sync::mpsc::sync_channel::<StreamCapture>(2);
+    spawn_capture_thread(stdout_pipe, limit, PipedStream::Stdout, report.clone())
+        .map_err(thread_refused(PipedStream::Stdout))?;
+    spawn_capture_thread(stderr_pipe, limit, PipedStream::Stderr, report)
+        .map_err(thread_refused(PipedStream::Stderr))?;
 
-    // A thread panic (e.g. OOM in the reader) surfaces as an `Err`, never a
-    // propagated panic; `guard` still reaps the child on the `?` return.
-    let stdout = capture_within(cmd, "stdout", &out_rx, &deadline, &mut guard)?;
-    let stderr = capture_within(cmd, "stderr", &err_rx, &deadline, &mut guard)?;
-    // A refusal here drops `guard`, which kills and reaps the child.
-    admit(&stdout, &stderr)?;
+    // Each thread reports once, so this takes at most two values; a third
+    // wait finds every sender dropped. A thread panic (e.g. OOM in the reader)
+    // surfaces as an `Err`, never a propagated panic; every `return` drops
+    // `guard`, which kills and reaps the child.
+    let mut drained = Drained {
+        stdout: None,
+        stderr: None,
+    };
+    let (stdout, stderr) = loop {
+        if let Some(refusal) = drained.refusal(cmd, ceiling, cap, false) {
+            return Err(refusal);
+        }
+        drained = match drained {
+            Drained {
+                stdout: Some(stdout),
+                stderr: Some(stderr),
+            } => break (stdout, stderr),
+            still_draining => still_draining,
+        };
+        match deadline.recv(&reports) {
+            Ok((PipedStream::Stdout, Ok(bytes))) => drained.stdout = Some(bytes),
+            Ok((PipedStream::Stderr, Ok(bytes))) => drained.stderr = Some(bytes),
+            Ok((stream, Err(error))) => {
+                return Err(ProcessRefusal::Capture {
+                    cmd: cmd.to_owned(),
+                    stream: stream.name(),
+                    error,
+                });
+            }
+            Err(DeadlineLapse::Expired) => {
+                return Err(drained
+                    .refusal(cmd, ceiling, cap, true)
+                    .unwrap_or_else(|| timed_out(cmd, &deadline, &mut guard)));
+            }
+            Err(DeadlineLapse::Disconnected) => {
+                return Err(ProcessRefusal::Panicked {
+                    cmd: cmd.to_owned(),
+                    stream: drained.pending().name(),
+                });
+            }
+        }
+    };
     let status = reap_within(cmd, &deadline, &mut guard)?;
     Ok(PipedStreams {
         stdout,
@@ -2894,15 +3030,7 @@ fn process_run_sync(
         .stderr(Stdio::piped());
     apply_env_overlay(&mut builder);
 
-    let cap = bounds.output;
-    let streams = run_piped(cmd, builder, bounds, |stdout, stderr| {
-        within_cap(
-            cmd,
-            "output",
-            byte_len(stdout).saturating_add(byte_len(stderr)),
-            cap,
-        )
-    })?;
+    let streams = run_piped(cmd, builder, bounds, OutputCeiling::Combined)?;
     // Combined = stdout then stderr (callers usually treat it as `2>&1`).
     let mut combined = streams.stdout;
     combined.extend_from_slice(&streams.stderr);
@@ -3044,11 +3172,7 @@ fn process_run_with_sync(
         builder.env(k, v);
     }
 
-    let cap = bounds.output;
-    let streams = run_piped(cmd, builder, bounds, |stdout, stderr| {
-        within_cap(cmd, "stdout", byte_len(stdout), cap)?;
-        within_cap(cmd, "stderr", byte_len(stderr), cap)
-    })?;
+    let streams = run_piped(cmd, builder, bounds, OutputCeiling::PerStream)?;
 
     #[allow(clippy::disallowed_methods)] // process output reaches Ipê as `String` text
     let stdout = String::from_utf8_lossy(&streams.stdout).into_owned();
@@ -6194,6 +6318,106 @@ mod process_run_tests {
         );
     }
 
+    /// `sh -c` arguments that write `bytes` to `stream` and then spin without
+    /// exiting, holding both pipes open and carrying `marker` in the command
+    /// line.
+    #[cfg(target_os = "linux")]
+    fn overflow_then_spin(marker: &str, stream: &str, bytes: usize) -> [String; 3] {
+        [
+            "-c".to_owned(),
+            format!(
+                "printf %s {} {stream}; while :; do :; done",
+                "x".repeat(bytes)
+            ),
+            marker.to_owned(),
+        ]
+    }
+
+    /// The byte refusal a piped call should end with.
+    #[cfg(target_os = "linux")]
+    fn too_large(stream: &str, cap: u64) -> KernelFailure {
+        KernelFailure::LimitExceeded(LimitRefusal::new(format!(
+            "sh: {stream} exceeds the {cap}-byte capture ceiling (raise IPE_PROCESS_OUTPUT_MAX)"
+        )))
+    }
+
+    /// A stream past the byte ceiling ends `Process.run` as soon as it is
+    /// drained: the child, still holding its other stream open, is killed
+    /// rather than waited on until the wall ceiling.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn an_overflowing_stream_ends_the_call_while_the_other_is_open() {
+        let marker = format!("ipe-early-output-ceiling-probe-{}", std::process::id());
+        let args = overflow_then_spin(&marker, "", 9);
+        let ended = finishes_within(std::time::Duration::from_secs(5), move || {
+            process_run_sync("sh", &args, ProcessBounds::for_test(8)).map_err(KernelFailure::from)
+        });
+        assert!(
+            ended.is_some(),
+            "an over-ceiling stream must end the call, not wait on the open one"
+        );
+        let Some(refused) = ended else { return };
+        assert_eq!(refused.err(), Some(too_large("output", 8)));
+        assert!(
+            gone_within(&marker, std::time::Duration::from_secs(2)),
+            "the over-ceiling child must be killed and reaped"
+        );
+    }
+
+    /// Under the per-stream ceiling an over-ceiling stdout decides at once,
+    /// while stderr is still open.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn an_overflowing_stdout_ends_run_with_while_stderr_is_open() {
+        let marker = format!("ipe-early-stdout-ceiling-probe-{}", std::process::id());
+        let args = overflow_then_spin(&marker, "", 9);
+        let ended = finishes_within(std::time::Duration::from_secs(5), move || {
+            process_run_with_sync("sh", &args, None, &[], ProcessBounds::for_test(8))
+                .map(|_| ())
+                .map_err(KernelFailure::from)
+        });
+        assert!(
+            ended.is_some(),
+            "an over-ceiling stdout must end the call, not wait on stderr"
+        );
+        let Some(refused) = ended else { return };
+        assert_eq!(refused.err(), Some(too_large("stdout", 8)));
+        assert!(
+            gone_within(&marker, std::time::Duration::from_secs(2)),
+            "the over-ceiling child must be killed and reaped"
+        );
+    }
+
+    /// An over-ceiling stderr cannot decide while stdout is open (stdout might
+    /// overflow too and names the refusal first), but when the wall ceiling
+    /// expires the known overflow is the refusal, not the timeout.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn an_overflowing_stderr_outranks_the_wall_ceiling() {
+        let marker = format!("ipe-expired-stderr-ceiling-probe-{}", std::process::id());
+        let args = overflow_then_spin(&marker, ">&2", 65);
+        // Long enough that a loaded host still drains stderr before expiry.
+        let bounds = ProcessBounds {
+            output: 64,
+            wall: ProcessDeadline::for_test(std::time::Duration::from_secs(2)),
+        };
+        let ended = finishes_within(std::time::Duration::from_secs(10), move || {
+            process_run_with_sync("sh", &args, None, &[], bounds)
+                .map(|_| ())
+                .map_err(KernelFailure::from)
+        });
+        assert!(
+            ended.is_some(),
+            "a call past its wall ceiling must return, not wait on the child"
+        );
+        let Some(refused) = ended else { return };
+        assert_eq!(refused.err(), Some(too_large("stderr", 64)));
+        assert!(
+            gone_within(&marker, std::time::Duration::from_secs(2)),
+            "the over-ceiling child must be killed and reaped"
+        );
+    }
+
     /// A malformed wall ceiling refuses the call before any child exists.
     #[test]
     fn a_refused_wall_ceiling_fails_the_task_naming_the_variable() {
@@ -6406,7 +6630,7 @@ mod process_run_with_tests {
                 cwd: IpeMaybe::Nothing,
                 env: Vec::new(),
             },
-            8,
+            ProcessBounds::for_test(8),
         ));
         assert!(
             matches!(&res, IpeResult::Err(e) if *e == IpeError::limit_exceeded(
@@ -6422,7 +6646,7 @@ mod process_run_with_tests {
                     cwd: IpeMaybe::Nothing,
                     env: Vec::new(),
                 },
-                8,
+                ProcessBounds::for_test(8),
             ));
         assert!(
             matches!(&stderr_past, IpeResult::Err(e) if *e == IpeError::limit_exceeded(
