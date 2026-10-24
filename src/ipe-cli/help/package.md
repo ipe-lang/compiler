@@ -6,7 +6,7 @@ ipe package <audit|audit-entry|publish|validate-entry> [<path>]
 
 ## Arguments
 
-The subcommand and its path: `audit`/`publish` take the project directory or `package.ipe` (defaults to the current project); `validate-entry` takes a `packages/<name>.toml` entry file (schema check only); `audit-entry` takes the same entry file and runs the full index CI receiving gate: schema, fetch+integrity-verify, and the complete Tier-1 (+ Tier-2) audit for every new version.
+The subcommand and its path: `audit`/`publish` take the project directory or `package.ipe` (defaults to the current project); `validate-entry` takes a `packages/<name>.toml` entry file (schema check only); `audit-entry` takes the same entry file and runs the full index CI receiving gate: schema, fetch+integrity-verify, and the complete Tier-1 (+ Tier-2) audit for every new version. `audit` regenerates a native package's FFI bindings only inside a jail — a host without bubblewrap, or with `IPE_FFI_ALLOW_UNSANDBOXED=1` set, is refused — and takes its supply-chain policy from the installed compiler's workspace, never from the package or the working directory.
 
 ## Options
 
