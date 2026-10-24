@@ -1411,8 +1411,8 @@ pub fn record_body_spends<T>(f: impl FnOnce() -> T) -> (T, Vec<LayoutSpend>) {
 /// a `Task` return or a callback parameter, `'static` for a UI-carrier
 /// message), the body-derived kernel obligations, and whatever the cross-call
 /// fixpoint carried from callees. This function derives none of them, so a
-/// caller's clause is always a superset of every callee clause it reaches. The
-/// only entries it adds are the structural `FN{i}` callback generics and the
+/// caller's clause always carries every auto-trait (`Send`, `Sync`, `'static`)
+/// of every callee clause it reaches. The only entries it adds are the structural `FN{i}` callback generics and the
 /// per-field row witnesses.
 pub fn render_fn_generics(
     ctx: &EmitCtx,

@@ -19,7 +19,11 @@
 //! it names and passes, but only for words after its `dyn Fn` / `: Fn(` head.
 //! Inside one macro call, the fragments touching a literal's edge or a `{…}`
 //! placeholder must not join into an auto-trait name either, so
-//! `concat!("Se", "nd")` and `format!("{}end", "S")` are refused. Doc
+//! `concat!("Se", "nd")` and `format!("{}end", "S")` are refused, and so are
+//! fragments a `const` or `static` string item offers a macro. A `Send` or
+//! `Sync` identifier inside a macro body and a byte-string literal naming an
+//! auto-trait are refused as well, and a literal holding a comment opener has
+//! no carrier head to pass behind. Doc
 //! attributes are prose. Macro bodies are walked token by token under the same
 //! rules. A file that does not parse is red, never skipped. The `BoundSet`
 //! allow-list is empty and stays empty.
@@ -92,17 +96,24 @@ fn words(text: &str) -> Vec<(usize, usize)> {
     spans
 }
 
-/// Where a carrier literal's head (`dyn Fn`, `: Fn(`) ends, if `text` has one.
+/// Where a carrier literal's head (`dyn Fn(`, `: Fn(`) ends, if `text` has one.
 fn carrier_head(text: &str) -> Option<usize> {
-    ["dyn Fn", ": Fn("]
+    ["dyn Fn(", "dyn FnOnce(", "dyn FnMut(", ": Fn("]
         .iter()
         .filter_map(|head| text.find(head).map(|at| at.saturating_add(head.len())))
         .min()
 }
 
 /// The auto-trait words of `text` outside a carrier's bounds.
+///
+/// A literal holding a comment opener has no carrier head: a head inside a
+/// comment would otherwise excuse a bound spelled before it.
 fn auto_trait_words(text: &str) -> Vec<String> {
-    let head = carrier_head(text);
+    let head = if text.contains("/*") || text.contains("//") {
+        None
+    } else {
+        carrier_head(text)
+    };
     words(text)
         .into_iter()
         .filter(|(start, _)| head.is_none_or(|h| *start < h))
@@ -180,6 +191,39 @@ fn macro_literals(stream: TokenStream, into: &mut Vec<String>) {
     }
 }
 
+/// The pieces a file's `const` and `static` string items offer a macro to
+/// join into an auto-trait name: `const P: &str = "Se"; format!("{P}nd")`.
+struct ItemPieces {
+    /// The edge words found so far.
+    pieces: BTreeSet<String>,
+    /// Whether the walk is inside a `const` or `static` item.
+    inside: bool,
+}
+
+impl<'ast> Visit<'ast> for ItemPieces {
+    fn visit_item_const(&mut self, item: &'ast syn::ItemConst) {
+        if !is_test_only(&item.attrs) {
+            self.inside = true;
+            visit::visit_item_const(self, item);
+            self.inside = false;
+        }
+    }
+
+    fn visit_item_static(&mut self, item: &'ast syn::ItemStatic) {
+        if !is_test_only(&item.attrs) {
+            self.inside = true;
+            visit::visit_item_static(self, item);
+            self.inside = false;
+        }
+    }
+
+    fn visit_lit_str(&mut self, lit: &'ast syn::LitStr) {
+        if self.inside {
+            edge_words(&lit.value(), &mut self.pieces);
+        }
+    }
+}
+
 /// One refused site: the line and what it spells.
 type Site = (usize, String);
 
@@ -233,6 +277,8 @@ struct Sites {
     renderer: Option<&'static str>,
     /// How deep the walk is inside the renderer's function.
     in_renderer: usize,
+    /// The pieces the file's `const` and `static` string items offer a macro.
+    item_pieces: BTreeSet<String>,
 }
 
 impl Sites {
@@ -258,7 +304,7 @@ impl Sites {
         }
         let mut literals = Vec::new();
         macro_literals(mac.tokens.clone(), &mut literals);
-        let mut pieces = BTreeSet::new();
+        let mut pieces = self.item_pieces.clone();
         for literal in literals.iter().filter(|l| carrier_head(l).is_none()) {
             edge_words(literal, &mut pieces);
         }
@@ -327,12 +373,17 @@ impl Sites {
                         self.hit(ident.span(), format!("{name}::…"));
                     } else if method_call && BUILDERS.contains(&name.as_str()) {
                         self.hit(ident.span(), format!(".{name}()"));
+                    } else if self.in_renderer == 0 && matches!(name.as_str(), "Send" | "Sync") {
+                        self.hit(ident.span(), format!("{name} token in a macro"));
                     }
                 }
                 TokenTree::Group(group) => self.tokens(group.stream()),
                 TokenTree::Literal(literal) => {
-                    if let Ok(text) = syn::parse_str::<syn::LitStr>(&literal.to_string()) {
+                    let text = literal.to_string();
+                    if let Ok(text) = syn::parse_str::<syn::LitStr>(&text) {
                         self.literal(literal.span(), &text.value());
+                    } else if let Ok(bytes) = syn::parse_str::<syn::LitByteStr>(&text) {
+                        self.literal(literal.span(), &String::from_utf8_lossy(&bytes.value()));
                     }
                 }
                 TokenTree::Punct(_) => {}
@@ -415,6 +466,10 @@ impl<'ast> Visit<'ast> for Sites {
         self.literal(lit.span(), &lit.value());
     }
 
+    fn visit_lit_byte_str(&mut self, lit: &'ast syn::LitByteStr) {
+        self.literal(lit.span(), &String::from_utf8_lossy(&lit.value()));
+    }
+
     fn visit_attribute(&mut self, attr: &'ast Attribute) {
         if !attr.path().is_ident("doc") {
             visit::visit_attribute(self, attr);
@@ -439,7 +494,13 @@ fn scan_source(rel: &str, src: &str) -> Result<Vec<Site>, String> {
         syn::parse_file(src).map_err(|e| format!("does not parse, so it cannot be judged: {e}"))?;
     let mut names = Names(BTreeSet::from([BOUND_SET.to_owned()]));
     names.visit_file(&file);
+    let mut items = ItemPieces {
+        pieces: BTreeSet::new(),
+        inside: false,
+    };
+    items.visit_file(&file);
     let mut sites = Sites {
+        item_pieces: items.pieces,
         names: names.0,
         found: Vec::new(),
         renderer: RENDERERS
@@ -630,6 +691,47 @@ fn an_auto_trait_joined_from_macro_fragments_is_refused() {
         "fn f() -> &'static str { concat!(\"Se\", \"nd\") }"
     ));
     assert!(refused("fn f() -> String { format!(\"{}end\", \"S\") }"));
+}
+
+#[test]
+fn an_auto_trait_ident_inside_a_macro_is_refused() {
+    assert!(refused(
+        "fn f(bounds: &mut Vec<String>) { bounds.push(stringify!(Send).to_owned()); }"
+    ));
+    assert!(passes(
+        "emit_expr/func.rs",
+        "fn render_auto_traits(b: &mut Vec<String>) { b.push(stringify!(Send).to_owned()); }"
+    ));
+}
+
+#[test]
+fn an_auto_trait_byte_string_is_refused() {
+    assert!(refused(
+        "fn f() -> String { String::from_utf8_lossy(b\"Send\").into_owned() }"
+    ));
+    assert!(refused(
+        "fn f() -> String { String::from_utf8_lossy(vec![b\"Sync\"].concat().as_slice()).into_owned() }"
+    ));
+}
+
+#[test]
+fn an_auto_trait_joined_from_an_item_and_a_macro_is_refused() {
+    assert!(refused(
+        "const P: &str = \"Se\";\nfn f() -> String { format!(\"{P}nd\") }"
+    ));
+    assert!(refused(
+        "static P: &str = \"S\";\nfn f() -> String { format!(\"{P}end\") }"
+    ));
+}
+
+#[test]
+fn a_carrier_head_inside_a_comment_excuses_nothing() {
+    assert!(refused(
+        "fn f() -> String { \"/*dyn Fn(*/Send\".to_owned() }"
+    ));
+    assert!(refused(
+        "fn f() -> String { \"Send // dyn Fn(\".to_owned() }"
+    ));
 }
 
 #[test]
