@@ -404,7 +404,8 @@ fn render_into_ctx<M>(
             // Regular + bool attrs as (key, value) pairs, sorted by key below:
             // alphabetical order matches the byte-exact output expected by
             // golden tests.
-            let mut pairs = attribute_pairs(tag, attrs);
+            let child_ctx = ctx.enter(tag);
+            let mut pairs = attribute_pairs(child_ctx, tag, attrs);
             let ipe_id = attrs.iter().rev().find_map(|a| match a {
                 Attribute::Attr(k, v) if k == STAMPED_ID_ATTR => Some(v.as_str()),
                 _ => None,
@@ -441,10 +442,10 @@ fn render_into_ctx<M>(
             {
                 pairs.retain(|(k, _)| *k != "selected");
                 if pairs.iter().any(|(k, v)| *k == "value" && v == sv) {
-                    pairs.push(("selected", Cow::Borrowed("selected")));
+                    pairs.push((Cow::Borrowed("selected"), Cow::Borrowed("selected")));
                 }
             }
-            pairs.sort_by(|a, b| a.0.cmp(b.0));
+            pairs.sort_by(|a, b| a.0.cmp(&b.0));
             for (k, v) in &pairs {
                 // Attr KEY is emitted unescaped; an unsafe key (`x onload=…`)
                 // injects a new attribute, and a script-bearing key (`onerror`,
@@ -541,15 +542,7 @@ fn render_into_ctx<M>(
             } else {
                 None
             };
-            render_body_into(
-                body,
-                ctx.enter(tag),
-                kids,
-                s,
-                child_select_value,
-                depth,
-                stamp,
-            );
+            render_body_into(body, child_ctx, kids, s, child_select_value, depth, stamp);
             s.push_str("</");
             s.push_str(tag);
             s.push('>');
@@ -967,9 +960,159 @@ const RESERVED_ATTR_PREFIX: &[u8] = b"ipe-";
 /// The attribute carrying the identity the ipe-id stamper assigns.
 pub(crate) const STAMPED_ID_ATTR: &str = "ipe-id";
 
+/// The attribute names the HTML parser stores in mixed case on a foreign
+/// (SVG or MathML) element, keyed by their ASCII-lowercase spelling and sorted
+/// by that key.
+///
+/// The parser lowercases every attribute name it tokenizes and then, on a
+/// foreign element alone, restores these to their stored case ("adjust SVG
+/// attributes" and "adjust MathML attributes"); every other name stays
+/// lowercase. A key absent here is stored lowercase on every element.
+const FOREIGN_ATTR_CASE: [(&str, &str); 59] = [
+    ("attributename", "attributeName"),
+    ("attributetype", "attributeType"),
+    ("basefrequency", "baseFrequency"),
+    ("baseprofile", "baseProfile"),
+    ("calcmode", "calcMode"),
+    ("clippathunits", "clipPathUnits"),
+    ("definitionurl", "definitionURL"),
+    ("diffuseconstant", "diffuseConstant"),
+    ("edgemode", "edgeMode"),
+    ("filterunits", "filterUnits"),
+    ("glyphref", "glyphRef"),
+    ("gradienttransform", "gradientTransform"),
+    ("gradientunits", "gradientUnits"),
+    ("kernelmatrix", "kernelMatrix"),
+    ("kernelunitlength", "kernelUnitLength"),
+    ("keypoints", "keyPoints"),
+    ("keysplines", "keySplines"),
+    ("keytimes", "keyTimes"),
+    ("lengthadjust", "lengthAdjust"),
+    ("limitingconeangle", "limitingConeAngle"),
+    ("markerheight", "markerHeight"),
+    ("markerunits", "markerUnits"),
+    ("markerwidth", "markerWidth"),
+    ("maskcontentunits", "maskContentUnits"),
+    ("maskunits", "maskUnits"),
+    ("numoctaves", "numOctaves"),
+    ("pathlength", "pathLength"),
+    ("patterncontentunits", "patternContentUnits"),
+    ("patterntransform", "patternTransform"),
+    ("patternunits", "patternUnits"),
+    ("pointsatx", "pointsAtX"),
+    ("pointsaty", "pointsAtY"),
+    ("pointsatz", "pointsAtZ"),
+    ("preservealpha", "preserveAlpha"),
+    ("preserveaspectratio", "preserveAspectRatio"),
+    ("primitiveunits", "primitiveUnits"),
+    ("refx", "refX"),
+    ("refy", "refY"),
+    ("repeatcount", "repeatCount"),
+    ("repeatdur", "repeatDur"),
+    ("requiredextensions", "requiredExtensions"),
+    ("requiredfeatures", "requiredFeatures"),
+    ("specularconstant", "specularConstant"),
+    ("specularexponent", "specularExponent"),
+    ("spreadmethod", "spreadMethod"),
+    ("startoffset", "startOffset"),
+    ("stddeviation", "stdDeviation"),
+    ("stitchtiles", "stitchTiles"),
+    ("surfacescale", "surfaceScale"),
+    ("systemlanguage", "systemLanguage"),
+    ("tablevalues", "tableValues"),
+    ("targetx", "targetX"),
+    ("targety", "targetY"),
+    ("textlength", "textLength"),
+    ("viewbox", "viewBox"),
+    ("viewtarget", "viewTarget"),
+    ("xchannelselector", "xChannelSelector"),
+    ("ychannelselector", "yChannelSelector"),
+    ("zoomandpan", "zoomAndPan"),
+];
+
+/// Whether `a` sorts strictly before `b` byte-wise.
+const fn bytes_before(mut a: &[u8], mut b: &[u8]) -> bool {
+    while let ([x, a_rest @ ..], [y, b_rest @ ..]) = (a, b) {
+        if *x != *y {
+            return *x < *y;
+        }
+        a = a_rest;
+        b = b_rest;
+    }
+    a.is_empty() && !b.is_empty()
+}
+
+/// Whether `key` is the ASCII-lowercase fold of `stored`.
+const fn is_ascii_lowercase_of(mut key: &[u8], mut stored: &[u8]) -> bool {
+    while let ([k, key_rest @ ..], [s, stored_rest @ ..]) = (key, stored) {
+        if *k != s.to_ascii_lowercase() {
+            return false;
+        }
+        key = key_rest;
+        stored = stored_rest;
+    }
+    key.is_empty() && stored.is_empty()
+}
+
+/// Whether every key of `table` is the ASCII-lowercase fold of its stored
+/// name and the keys strictly increase, checked in one pass.
+const fn attr_case_table_sound(table: &[(&str, &str)]) -> bool {
+    let mut rest = table;
+    let mut prev: Option<&[u8]> = None;
+    while let Some(((key, stored), tail)) = rest.split_first() {
+        let key = key.as_bytes();
+        if !is_ascii_lowercase_of(key, stored.as_bytes()) {
+            return false;
+        }
+        if let Some(p) = prev
+            && !bytes_before(p, key)
+        {
+            return false;
+        }
+        prev = Some(key);
+        rest = tail;
+    }
+    true
+}
+
+// IPE-RUST-AUDIT:ACCEPTED (Arthur Maciel) — compile-time `const` assertion (not a runtime panic); fails the BUILD if a `FOREIGN_ATTR_CASE` key is not its stored name's lowercase fold or the keys are not strictly sorted, which the binary search in `stored_attr_key` requires [ledger #boundary]
+const _: () = assert!(attr_case_table_sound(&FOREIGN_ATTR_CASE));
+
+/// The name the DOM stores an attribute written as `key` under, on an element
+/// whose children are written in `child_ctx`.
+///
+/// The HTML parser lowercases every attribute name; on a foreign element it
+/// then restores the [`FOREIGN_ATTR_CASE`] spellings. `setAttribute` on an
+/// HTML element lowercases too, and on a foreign element keeps the name it is
+/// given, so a key folded here paints and patches as one DOM attribute. An
+/// element is foreign exactly when its children are: `svg` and `math` open
+/// foreign content and the sink keeps it for their whole subtree. A key
+/// already in its stored form is borrowed, never copied.
+fn stored_attr_key(child_ctx: ParseContext, key: &str) -> Cow<'_, str> {
+    let lower = if key.bytes().any(|b| b.is_ascii_uppercase()) {
+        Cow::Owned(key.to_ascii_lowercase())
+    } else {
+        Cow::Borrowed(key)
+    };
+    match child_ctx {
+        ParseContext::Data | ParseContext::RawOrRcdata => lower,
+        ParseContext::Foreign => FOREIGN_ATTR_CASE
+            .binary_search_by(|(folded, _)| folded.as_bytes().cmp(lower.as_bytes()))
+            .ok()
+            .and_then(|i| FOREIGN_ATTR_CASE.get(i))
+            .map_or(lower, |(_, stored)| Cow::Borrowed(*stored)),
+    }
+}
+
 /// The attribute pairs an element `tag` with attributes `attrs` carries, in
 /// first-appearance order: what the renderer writes at first paint and what
-/// the patch diff compares, so the two never disagree on a value.
+/// the patch diff compares, so the two never disagree on a key or a value.
+///
+/// Every key is the name the DOM stores it under ([`stored_attr_key`] for
+/// `child_ctx`, the context the element puts its children in), so two keys
+/// that differ only in ASCII case are one attribute here as they are in the
+/// painted document: last write wins across case, and a diff never sets one
+/// spelling while removing another.
 ///
 /// An `iframe` carries exactly one `sandbox`, last: the canonical value of
 /// [`frame_verdict`], in place of every ASCII case variant of `sandbox` the
@@ -984,14 +1127,15 @@ pub(crate) const STAMPED_ID_ATTR: &str = "ipe-id";
 /// attributes of which the browser keeps only the first. Every other repeated
 /// key, an empty held value, or a `BoolAttr` takes the later value.
 pub(crate) fn attribute_pairs<'a, M>(
+    child_ctx: ParseContext,
     tag: &str,
     attrs: &'a [Attribute<M>],
-) -> Vec<(&'a str, Cow<'a, str>)> {
+) -> Vec<(Cow<'a, str>, Cow<'a, str>)> {
     /// Pair count past which a key lookup goes through a hash index rather
     /// than a scan, so a long attribute list costs linear time.
     const SCANNED_PAIRS: usize = 16;
-    let mut pairs: Vec<(&str, Cow<'_, str>)> = Vec::with_capacity(attrs.len());
-    let mut index: HashMap<&str, usize> = HashMap::new();
+    let mut pairs: Vec<(Cow<'_, str>, Cow<'_, str>)> = Vec::with_capacity(attrs.len());
+    let mut index: HashMap<Cow<'_, str>, usize> = HashMap::new();
     for a in attrs {
         let (k, v, joins) = match a {
             Attribute::Attr(k, v) => (k.as_str(), v.as_str(), true),
@@ -1000,22 +1144,23 @@ pub(crate) fn attribute_pairs<'a, M>(
                 continue;
             }
         };
+        let k = stored_attr_key(child_ctx, k);
         let held = if pairs.len() <= SCANNED_PAIRS {
             pairs.iter().position(|(pk, _)| *pk == k)
         } else {
             if index.is_empty() {
-                index.extend(pairs.iter().enumerate().map(|(i, (pk, _))| (*pk, i)));
+                index.extend(pairs.iter().enumerate().map(|(i, (pk, _))| (pk.clone(), i)));
             }
-            index.get(k).copied()
+            index.get(&k).copied()
         };
         let Some((_, existing)) = held.and_then(|i| pairs.get_mut(i)) else {
             if !index.is_empty() {
-                index.insert(k, pairs.len());
+                index.insert(k.clone(), pairs.len());
             }
             pairs.push((k, Cow::Borrowed(v)));
             continue;
         };
-        let sep = match k {
+        let sep = match k.as_ref() {
             "class" => Some(" "),
             "style" if existing.ends_with(';') => Some(" "),
             "style" => Some("; "),
@@ -1032,7 +1177,7 @@ pub(crate) fn attribute_pairs<'a, M>(
     }
     if let FrameVerdict::Sandboxed(tokens) = frame_verdict(tag, painted_pairs(attrs)) {
         pairs.retain(|(k, _)| !k.eq_ignore_ascii_case(SANDBOX_ATTR));
-        pairs.push((SANDBOX_ATTR, Cow::Owned(tokens.canonical())));
+        pairs.push((Cow::Borrowed(SANDBOX_ATTR), Cow::Owned(tokens.canonical())));
     }
     pairs
 }
@@ -2078,15 +2223,16 @@ mod tests {
     }
 
     /// A long attribute list merges and overrides exactly as a short one: the
-    /// hash index past the scan threshold agrees with a plain scan.
+    /// hash index past the scan threshold agrees with a plain scan, keys
+    /// written in another case included.
     #[test]
     fn attribute_pairs_agree_past_the_scan_threshold() {
-        fn scanned(attrs: &[Attribute<()>]) -> Vec<(&str, String)> {
-            let mut pairs: Vec<(&str, String)> = vec![];
+        fn scanned(attrs: &[Attribute<()>]) -> Vec<(String, String)> {
+            let mut pairs: Vec<(String, String)> = vec![];
             for a in attrs {
                 let (k, v, joins) = match a {
-                    Attribute::Attr(k, v) => (k.as_str(), v.as_str(), true),
-                    Attribute::BoolAttr(k, true) => (k.as_str(), "true", false),
+                    Attribute::Attr(k, v) => (k.to_ascii_lowercase(), v.as_str(), true),
+                    Attribute::BoolAttr(k, true) => (k.to_ascii_lowercase(), "true", false),
                     _ => continue,
                 };
                 match pairs.iter_mut().find(|(pk, _)| *pk == k) {
@@ -2111,20 +2257,106 @@ mod tests {
         attrs.extend((0..40).map(|i| Attribute::Attr(format!("data-{i}"), i.to_string())));
         attrs.extend([
             Attribute::Attr("class".into(), "b".into()),
-            Attribute::Attr("style".into(), "q: 2".into()),
-            Attribute::Attr("data-3".into(), "over".into()),
+            Attribute::Attr("STYLE".into(), "q: 2".into()),
+            Attribute::Attr("Data-3".into(), "over".into()),
             Attribute::BoolAttr("class".into(), true),
-            Attribute::Attr("class".into(), "c".into()),
+            Attribute::Attr("Class".into(), "c".into()),
             Attribute::Attr("data-late".into(), String::new()),
-            Attribute::Attr("data-late".into(), "set".into()),
+            Attribute::Attr("DATA-LATE".into(), "set".into()),
         ]);
         for len in 0..=attrs.len() {
             let slice = attrs.get(..len).unwrap_or_default();
-            let got: Vec<(&str, String)> = attribute_pairs("div", slice)
+            let got: Vec<(String, String)> = attribute_pairs(ParseContext::Data, "div", slice)
                 .into_iter()
-                .map(|(k, v)| (k, v.into_owned()))
+                .map(|(k, v)| (k.into_owned(), v.into_owned()))
                 .collect();
             assert_eq!(got, scanned(slice), "{len}");
+        }
+    }
+
+    /// Two keys that differ only in ASCII case are one attribute, as they are
+    /// in the painted document: the last write paints, a merged attribute
+    /// joins across case, and no key is written in the case the app spelled.
+    #[test]
+    fn attribute_keys_fold_to_the_name_the_dom_stores() {
+        let out = render_html(&bare(
+            "div",
+            vec![
+                attr("Title", "a"),
+                attr("title", "b"),
+                attr("Class", "x"),
+                attr("class", "y"),
+                attr("DATA-N", "1"),
+            ],
+        ));
+        assert_eq!(
+            out, r#"<div class="x y" data-n="1" title="b"></div>"#,
+            "{out}"
+        );
+        let out = render_html(&bare("input", vec![attr("Title", "a"), attr("title", "b")]));
+        assert!(
+            out.contains(r#" title="b""#) && !out.contains("Title"),
+            "{out}"
+        );
+        assert_eq!(out.matches("title=").count(), 1, "{out}");
+    }
+
+    /// On an HTML element a mixed-case key stores lowercase; on an SVG or
+    /// MathML element, and every element below one, the parser's adjusted
+    /// spellings store as adjusted, so a `VIEWBOX` and a `viewBox` are one
+    /// `viewBox`, and a `viewBox` already in its stored case is kept.
+    #[test]
+    fn foreign_attribute_keys_keep_their_stored_case() {
+        let svg = Html::HElement(
+            "svg".into(),
+            vec![
+                attr("VIEWBOX", "0 0 1 1"),
+                attr("viewBox", "0 0 2 2"),
+                attr("PreserveAspectRatio", "none"),
+                attr("Fill", "red"),
+            ],
+            vec![bare(
+                "linearGradient",
+                vec![attr("GRADIENTUNITS", "userSpaceOnUse")],
+            )],
+        );
+        let out = render_html(&svg);
+        assert_eq!(
+            out,
+            r#"<svg fill="red" preserveAspectRatio="none" viewBox="0 0 2 2"><linearGradient gradientUnits="userSpaceOnUse"></linearGradient></svg>"#,
+            "{out}"
+        );
+        let math = render_html(&bare("math", vec![attr("DefinitionURL", "u")]));
+        assert_eq!(math, r#"<math definitionURL="u"></math>"#, "{math}");
+        let html = render_html(&bare("div", vec![attr("viewBox", "0 0 1 1")]));
+        assert_eq!(html, r#"<div viewbox="0 0 1 1"></div>"#, "{html}");
+        for ctx in [ParseContext::Data, ParseContext::RawOrRcdata] {
+            assert_eq!(stored_attr_key(ctx, "viewBox"), "viewbox");
+            assert_eq!(stored_attr_key(ctx, "title"), "title");
+        }
+        assert_eq!(stored_attr_key(ParseContext::Foreign, "VIEWBOX"), "viewBox");
+        assert_eq!(stored_attr_key(ParseContext::Foreign, "Title"), "title");
+        assert!(matches!(
+            stored_attr_key(ParseContext::Foreign, "viewBox"),
+            Cow::Borrowed("viewBox")
+        ));
+        assert!(matches!(
+            stored_attr_key(ParseContext::Data, "title"),
+            Cow::Borrowed("title")
+        ));
+    }
+
+    /// Every stored spelling of the foreign table is reached from its own
+    /// lowercase fold and from any other ASCII case of it, so the binary
+    /// search over the table agrees with a scan.
+    #[test]
+    fn every_foreign_attr_spelling_is_reached_in_any_case() {
+        for (folded, stored) in &FOREIGN_ATTR_CASE {
+            assert_eq!(stored_attr_key(ParseContext::Foreign, folded), *stored);
+            assert_eq!(stored_attr_key(ParseContext::Foreign, stored), *stored);
+            let upper = stored.to_ascii_uppercase();
+            assert_eq!(stored_attr_key(ParseContext::Foreign, &upper), *stored);
+            assert_eq!(stored_attr_key(ParseContext::Data, &upper), *folded);
         }
     }
 

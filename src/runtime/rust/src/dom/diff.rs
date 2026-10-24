@@ -382,7 +382,7 @@ fn diff_node_depth<M>(
 
     // Attribute + event delta.
     let mut p = Patch::for_id(id.unwrap_or_default());
-    diff_attrs(nt, oa, na, &mut p);
+    diff_attrs(child_ctx, nt, oa, na, &mut p);
     if !p.attrs.is_empty() {
         if id.is_none() {
             return Reach::Unaddressed;
@@ -453,22 +453,35 @@ fn diff_node_depth<M>(
 }
 
 /// Compute the attribute + event delta between `old` and `new`, the
-/// attributes of two elements `tag`.
+/// attributes of two elements `tag` whose children are written in `child_ctx`.
+///
 /// Keys changed or added → `Some(new value)`; keys removed → `None`.
-/// The values compared are [`attribute_pairs`], the pairs first paint writes,
-/// so an `iframe`'s canonical `sandbox` is on both sides and never removed.
-/// `ipe-id` is excluded (never patched as an attribute).
-fn diff_attrs<M>(tag: &str, old: &[Attribute<M>], new: &[Attribute<M>], p: &mut Patch) {
-    // Borrowed values: only `insert_safe_attr` (which copies, post-XSS-gate)
-    // allocates, and only for a changed attribute; a merged `class`/`style`
-    // is the one owned value.
-    fn collect<'a, M>(tag: &str, xs: &'a [Attribute<M>]) -> HashMap<&'a str, Cow<'a, str>> {
-        attribute_pairs(tag, xs)
+/// The pairs compared are [`attribute_pairs`], the pairs first paint writes,
+/// so every key is the name the DOM stores (a key that changes only its ASCII
+/// case patches nothing) and an `iframe`'s canonical `sandbox` is on both
+/// sides and never removed. `ipe-id` is excluded (never patched as an
+/// attribute).
+fn diff_attrs<M>(
+    child_ctx: ParseContext,
+    tag: &str,
+    old: &[Attribute<M>],
+    new: &[Attribute<M>],
+    p: &mut Patch,
+) {
+    // Borrowed keys and values: only `insert_safe_attr` (which copies,
+    // post-XSS-gate) allocates, and only for a changed attribute; a merged
+    // `class`/`style` and a key written in another case are the owned ones.
+    fn collect<'a, M>(
+        child_ctx: ParseContext,
+        tag: &str,
+        xs: &'a [Attribute<M>],
+    ) -> HashMap<Cow<'a, str>, Cow<'a, str>> {
+        attribute_pairs(child_ctx, tag, xs)
             .into_iter()
             .filter(|(k, _)| *k != STAMPED_ID_ATTR)
             .collect()
     }
-    let (om, nm) = (collect(tag, old), collect(tag, new));
+    let (om, nm) = (collect(child_ctx, tag, old), collect(child_ctx, tag, new));
     for (k, v) in &nm {
         if om.get(k) != Some(v) {
             insert_safe_attr(p, k, Some(v.as_ref()));
@@ -1971,6 +1984,58 @@ mod tests {
             Attribute::Attr("SandBox".into(), "allow-forms allow-scripts".into()),
         ]);
         assert!(plain(&old, &new).is_empty());
+    }
+
+    /// A stamped element `tag` with attributes `attrs`.
+    fn stamped_with(tag: &str, attrs: Vec<Attribute<()>>) -> Html<()> {
+        let mut e = Html::HElement(tag.into(), attrs, vec![]);
+        ids(&mut e);
+        e
+    }
+
+    /// A key that changes only its ASCII case names the same DOM attribute:
+    /// the diff patches nothing, and a value change under the other case
+    /// patches the stored name alone, never a removal of the old spelling.
+    #[test]
+    fn a_case_only_attribute_key_change_patches_nothing() {
+        let old = stamped_with("div", vec![Attribute::Attr("Title".into(), "a".into())]);
+        let new = stamped_with("div", vec![Attribute::Attr("title".into(), "a".into())]);
+        assert!(plain(&old, &new).is_empty(), "{:?}", plain(&old, &new));
+        let new = stamped_with("div", vec![Attribute::Attr("TITLE".into(), "b".into())]);
+        let p = plain(&old, &new);
+        assert_eq!(patched(&p, "title"), Some(Some("b")));
+        assert_eq!(p.first().map(|patch| patch.attrs.len()), Some(1), "{p:?}");
+        let both = stamped_with(
+            "div",
+            vec![
+                Attribute::Attr("Title".into(), "a".into()),
+                Attribute::Attr("title".into(), "b".into()),
+            ],
+        );
+        assert!(plain(&new, &both).is_empty(), "{:?}", plain(&new, &both));
+    }
+
+    /// A foreign element's patch carries the key in the case the parser stores
+    /// it, so `setAttribute` on the SVG node names the attribute first paint
+    /// created.
+    #[test]
+    fn a_foreign_attribute_patch_carries_its_stored_case() {
+        let old = stamped_with(
+            "svg",
+            vec![Attribute::Attr("viewBox".into(), "0 0 1 1".into())],
+        );
+        let new = stamped_with(
+            "svg",
+            vec![Attribute::Attr("VIEWBOX".into(), "0 0 2 2".into())],
+        );
+        let p = plain(&old, &new);
+        assert_eq!(patched(&p, "viewBox"), Some(Some("0 0 2 2")));
+        assert_eq!(p.first().map(|patch| patch.attrs.len()), Some(1), "{p:?}");
+        let same = stamped_with(
+            "svg",
+            vec![Attribute::Attr("ViewBox".into(), "0 0 1 1".into())],
+        );
+        assert!(plain(&old, &same).is_empty(), "{:?}", plain(&old, &same));
     }
 
     /// An `embed` gaining its `src` leaves the page: its parent's children are
