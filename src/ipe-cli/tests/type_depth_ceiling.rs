@@ -12,13 +12,31 @@
 //! the growing value has a type one arrow deeper than the value it returns, so
 //! a former written as an application reaches the ceiling one binding earlier,
 //! and a use whose callee takes the value reaches it one binding earlier again.
+//!
+//! Declared types are measured where they are written, used or not: a chain of
+//! custom types each holding the one before is as deep as it is long, so the
+//! one declaration past the ceiling is refused at the constructor that crosses
+//! it, a top-level annotation past the ceiling at its name, and a custom type
+//! that refers to itself with a growing parameter with IPE-T0024 at its name.
+//! A custom type passing its parameters on permuted is as deep as every
+//! arrangement its constructors reach, together, and is refused at the
+//! constructor that permutes them. A parameter no field uses is accepted and
+//! erased from the emitted enum, and a generic its erasure leaves no argument
+//! to infer from is pinned at each call, as is one only an argument past the
+//! emitted arity or the return names; a bounded generic only an erased
+//! parameter names is refused with IPE-L0102 where its body reads it. A custom
+//! type whose instantiations grow past the size ceiling is refused with
+//! IPE-T0023 at the constructor applying the one that crosses it.
 
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
 use ipe::CliError;
 use ipe_diagnostics::nesting::{TYPE_DEPTH_LIMIT, TYPE_SIZE_LIMIT};
-use ipe_diagnostics::{Diagnostic, IPE_T0022, IPE_T0023, Span, TypeError};
+use ipe_diagnostics::{
+    Diagnostic, HelpLine, IPE_L0102, IPE_T0014, IPE_T0022, IPE_T0023, IPE_T0024, Span, TypeError,
+    TypeSizeOrigin,
+};
 
 /// Where the chain one binding past the deepest is refused.
 #[derive(Clone, Copy)]
@@ -54,7 +72,7 @@ fn compare(last: &str, _: usize) -> String {
 }
 
 /// Every former the checker measures, with the chain each builds.
-fn formers() -> [Former; 9] {
+fn formers() -> [Former; 11] {
     let plain = |name, wrap, refused_at| Former {
         name,
         imports: "",
@@ -82,6 +100,23 @@ fn formers() -> [Former; 9] {
                 |x| format!("Wrap {x}"),
                 RefusedAt::Head("Wrap"),
             )
+        },
+        // `ok : a -> Result String a` is one arrow over the value it builds.
+        Former {
+            decls: "ok : a -> Result String a\nok x =\n    Ok x\n\n\n",
+            short_of_ceiling: 1,
+            ..plain("result", |x| format!("ok {x}"), RefusedAt::Head("ok"))
+        },
+        // A decoder has no equality, so `main` runs it; `Decode.decodeJson`
+        // takes the decoder after its input, two arrows over the decoder.
+        Former {
+            name: "decoder",
+            imports: "import Ipe.Config as Decode\n",
+            decls: "report : Result e a -> String\nreport result =\n    case result of\n        Ok _ ->\n            \"ok\"\n\n        Err _ ->\n            \"err\"\n\n\n",
+            wrap: |x| format!("Decode.succeed {x}"),
+            body: |last, _| format!("Io.println (report (Decode.decodeJson \"0\" {last}))"),
+            short_of_ceiling: 2,
+            refused_at: RefusedAt::Use("Decode.decodeJson"),
         },
         // `Dict.singleton : k -> v -> Dict k v` is two arrows over its value.
         Former {
@@ -250,6 +285,632 @@ fn deepest_accepted_chain_of_every_former_builds_with_cargo() {
     }
 }
 
+/// A module whose `main` prints a constant after `decls`.
+fn with_decls(decls: &str) -> String {
+    format!(
+        "module Main exposing (main)\n\nimport Ipe.Io as Io\n\n\n{decls}main =\n    Io.println \"ok\"\n"
+    )
+}
+
+/// The span of the first `needle` in `src` at or after byte `from`.
+fn span_of(src: &str, needle: &str, from: usize) -> Span {
+    let lo = src
+        .get(from..)
+        .and_then(|rest| rest.find(needle))
+        .map_or(src.len(), |at| from + at);
+    Span {
+        lo: offset(lo),
+        hi: offset(lo + needle.len()),
+    }
+}
+
+/// `type U0 = U0` and `type U{k} = U{k} U{k-1}` through `U{n}`, `U{k}` declared
+/// `k` levels deep, and the span of `U{n}`'s constructor.
+fn union_chain(n: usize) -> Chain {
+    let mut decls = String::from("type U0\n    = U0\n\n\n");
+    for k in 1..=n {
+        let _ = write!(decls, "type U{k}\n    = U{k} U{}\n\n\n", k - 1);
+    }
+    let src = with_decls(&decls);
+    let ctor = format!("= U{n} ");
+    let at = span_of(&src, &ctor, 0);
+    Chain {
+        refused_at: Span {
+            lo: at.lo + 2,
+            hi: at.hi - 1,
+        },
+        src,
+    }
+}
+
+/// `deep : List (List … Int)` with `n` lists, unused, and the span of the name
+/// its definition binds.
+fn annotation_chain(n: usize) -> Chain {
+    let src = with_decls(&format!(
+        "deep : {}Int{}\ndeep =\n    []\n\n\n",
+        "List (".repeat(n - 1) + "List ",
+        ")".repeat(n - 1)
+    ));
+    let at = span_of(&src, "\ndeep =", 0);
+    Chain {
+        refused_at: Span {
+            lo: at.lo + 1,
+            hi: at.lo + 1 + offset("deep".len()),
+        },
+        src,
+    }
+}
+
+/// `Nested` refers to itself at `inner`, given over its parameter `a`.
+fn nested(inner: &str) -> String {
+    with_decls(&format!(
+        "type Nested a\n    = Leaf a\n    | Nest {inner}\n\n\n"
+    ))
+}
+
+/// A refusal of `src` with IPE-T0022 at `span`, `depth` levels deep.
+fn assert_too_deep(src: &str, span: Span, depth: u16) {
+    let refused = front_check(src);
+    assert_eq!(
+        refusal(&refused),
+        Some(&Diagnostic::Type {
+            span,
+            msg: TypeError::TypeTooDeep {
+                depth,
+                limit: TYPE_DEPTH_LIMIT,
+            },
+        }),
+        "refused at {span:?} ({:?}): {refused:?}",
+        src.get(span.lo as usize..span.hi as usize)
+    );
+}
+
+/// The custom type chain as deep as the ceiling is accepted, and the one
+/// declaration more is refused at its constructor, used or not.
+#[test]
+fn a_custom_type_chain_one_past_the_ceiling_is_refused_at_its_constructor() {
+    let n = usize::from(TYPE_DEPTH_LIMIT);
+    let accepted = front_check(&union_chain(n).src);
+    assert!(
+        accepted.is_ok(),
+        "the chain of {n} must be accepted: {accepted:?}"
+    );
+    let past = union_chain(n + 1);
+    assert_too_deep(&past.src, past.refused_at, TYPE_DEPTH_LIMIT + 1);
+}
+
+/// An annotation as deep as the ceiling is accepted, and one level more is
+/// refused at the name it annotates, used or not.
+#[test]
+fn an_annotation_one_past_the_ceiling_is_refused_at_its_name() {
+    let n = usize::from(TYPE_DEPTH_LIMIT);
+    let accepted = front_check(&annotation_chain(n).src);
+    assert!(
+        accepted.is_ok(),
+        "the annotation of {n} must be accepted: {accepted:?}"
+    );
+    let past = annotation_chain(n + 1);
+    assert_too_deep(&past.src, past.refused_at, TYPE_DEPTH_LIMIT + 1);
+}
+
+/// A custom type that refers to itself with its parameter inside a larger type
+/// is refused with IPE-T0024 at its name; the same type holding a list of
+/// itself is accepted.
+#[test]
+fn a_custom_type_growing_at_each_self_reference_is_refused_at_its_name() {
+    let accepted = front_check(&nested("(List (Nested a))"));
+    assert!(
+        accepted.is_ok(),
+        "a list of itself must be accepted: {accepted:?}"
+    );
+    let src = nested("(Nested (List a))");
+    let refused = front_check(&src);
+    let diag = refusal(&refused);
+    assert_eq!(diag.map(Diagnostic::code), Some(IPE_T0024), "{refused:?}");
+    assert_eq!(
+        diag,
+        Some(&Diagnostic::Type {
+            span: span_of(&src, "Nested", 0),
+            msg: TypeError::ExpansiveRecursion {
+                union: "Nested".into(),
+                param: "a".into(),
+            },
+        }),
+        "{refused:?}"
+    );
+}
+
+/// The deepest accepted declarations build with cargo. Gated on `IPE_E2E=1`
+/// (the CI `e2e` job).
+#[test]
+fn deepest_accepted_declarations_build_with_cargo() {
+    if e2e_support::e2e_tier() == e2e_support::Tier::E2e {
+        let runtime = e2e_support::require_runtime().into_path_buf();
+        let scratch = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+            .join(format!("ipe_type_ceiling_decls_{}", std::process::id()));
+        let n = usize::from(TYPE_DEPTH_LIMIT);
+        let cases = [
+            ("union_chain", union_chain(n).src),
+            ("annotation", annotation_chain(n).src),
+            ("regular_nested", nested("(List (Nested a))")),
+        ];
+        for (name, src) in cases {
+            let bin = format!("type_ceiling_{name}");
+            assert_builds_with_cargo(&src, &scratch.join(name), &runtime, &bin);
+        }
+        let _ = std::fs::remove_dir_all(&scratch);
+    }
+}
+
+/// `type R a1 … ak = Z | E a1 … ak | Rot (R a2 … ak a1)`, `k` nullary types
+/// `K0 … K{k-1}`, a value `v : R K0 … K{k-1}` compared with itself, and the
+/// span of `Rot`'s name.
+///
+/// `Rot` passes the parameters on rotated, so rustc builds all `k` rotations
+/// of `R`, each one level over its payload: the declaration is `2 * k` deep.
+fn rotation(k: usize) -> Chain {
+    let params: Vec<String> = (1..=k).map(|n| format!("a{n}")).collect();
+    let rotated: Vec<&str> = params
+        .iter()
+        .cycle()
+        .skip(1)
+        .take(k)
+        .map(String::as_str)
+        .collect();
+    let mut decls = format!(
+        "type R {params}\n    = Z\n    | E {params}\n    | Rot (R {rotated})\n\n\n",
+        params = params.join(" "),
+        rotated = rotated.join(" "),
+    );
+    for n in 0..k {
+        let _ = write!(decls, "type K{n}\n    = K{n}\n\n\n");
+    }
+    let args: Vec<String> = (0..k).map(|n| format!("K{n}")).collect();
+    let _ = write!(decls, "v : R {}\nv =\n    Z\n\n\n", args.join(" "));
+    let src = format!(
+        "module Main exposing (main)\n\nimport Ipe.Io as Io\n\n\n{decls}main =\n    {}\n",
+        compare("v", 0)
+    );
+    let at = span_of(&src, "| Rot (", 0);
+    Chain {
+        refused_at: Span {
+            lo: at.lo + 2,
+            hi: at.lo + 2 + offset("Rot".len()),
+        },
+        src,
+    }
+}
+
+/// A custom type passing its parameters on rotated is as deep as its rotations
+/// together: the rotation reaching the ceiling is accepted, and the one
+/// parameter more is refused at the constructor that rotates them.
+#[test]
+fn a_permuting_type_one_past_the_ceiling_is_refused_at_its_rotating_constructor() {
+    let k = usize::from(TYPE_DEPTH_LIMIT) / 2;
+    let accepted = front_check(&rotation(k).src);
+    assert!(
+        accepted.is_ok(),
+        "the rotation of {k} must be accepted: {accepted:?}"
+    );
+    let past = rotation(k + 1);
+    assert_too_deep(&past.src, past.refused_at, TYPE_DEPTH_LIMIT + 2);
+}
+
+/// The deepest accepted rotation builds with cargo: every rotation rustc
+/// instantiates is charged, so none overflows its drop-check walk. Gated on
+/// `IPE_E2E=1` (the CI `e2e` job).
+#[test]
+fn deepest_accepted_rotation_builds_with_cargo() {
+    if e2e_support::e2e_tier() == e2e_support::Tier::E2e {
+        let runtime = e2e_support::require_runtime().into_path_buf();
+        let scratch = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+            .join(format!("ipe_type_ceiling_rotation_{}", std::process::id()));
+        let src = rotation(usize::from(TYPE_DEPTH_LIMIT) / 2).src;
+        assert_builds_with_cargo(&src, &scratch, &runtime, "type_ceiling_rotation");
+        let _ = std::fs::remove_dir_all(&scratch);
+    }
+}
+
+/// `T a` whose parameter no constructor holds except through `T a` itself, and
+/// a polymorphic function over it applied at two arguments.
+const UNUSED_PARAMETER: &str = "module Main exposing (main)\n\nimport Ipe.Io as Io\n\n\ntype T a\n    = L\n    | N (T a)\n\n\nsize : T a -> Int\nsize t =\n    case t of\n        L ->\n            0\n\n        N inner ->\n            1 + size inner\n\n\nints : T Int\nints =\n    N (N L)\n\n\nstrings : T String\nstrings =\n    N L\n\n\nmain =\n    Io.println (if size ints == 2 then \"two\" else if size strings == 1 then \"one\" else \"other\")\n";
+
+/// A custom type parameter no field uses is accepted and builds with cargo:
+/// the emitted enum carries no parameter rustc would refuse as unused. The
+/// acceptance runs in the CI `test-run` job, the build under `IPE_E2E=1` (the
+/// CI `e2e` job).
+#[test]
+fn a_custom_type_parameter_no_field_uses_builds_with_cargo() {
+    let accepted = front_check(UNUSED_PARAMETER);
+    assert!(accepted.is_ok(), "must be accepted: {accepted:?}");
+    if e2e_support::e2e_tier() == e2e_support::Tier::E2e {
+        let runtime = e2e_support::require_runtime().into_path_buf();
+        let scratch = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!(
+            "ipe_type_ceiling_unused_param_{}",
+            std::process::id()
+        ));
+        assert_builds_with_cargo(
+            UNUSED_PARAMETER,
+            &scratch,
+            &runtime,
+            "type_ceiling_unused_param",
+        );
+        let _ = std::fs::remove_dir_all(&scratch);
+    }
+}
+
+/// `Tag a` whose parameter no constructor holds, so its erasure removes the
+/// only argument naming `empties`'s generic: a caller at `Tag Int`, a caller
+/// generic over the erased parameter, and an unannotated caller.
+const ERASED_INFERENCE_PIN: &str = "module Main exposing (main)\n\nimport Ipe.Io as Io\nimport Ipe.List as List\n\n\ntype Tag a\n    = Tag\n\n\nempties : Tag a -> List a\nempties _ =\n    []\n\n\ncount : Tag Int -> Int\ncount t =\n    List.length (empties t)\n\n\ncountAny : Tag b -> Int\ncountAny t =\n    List.length (empties t)\n\n\ncountUnannotated t =\n    List.length (empties t)\n\n\nmain =\n    Io.println (if count Tag + countAny Tag + countUnannotated Tag == 0 then \"zero\" else \"other\")\n";
+
+/// Every emitted Rust source file under `dir`.
+fn rust_sources(dir: &Path) -> Vec<PathBuf> {
+    let mut found = Vec::new();
+    let mut pending = vec![dir.to_path_buf()];
+    while let Some(next) = pending.pop() {
+        let Ok(entries) = std::fs::read_dir(&next) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                pending.push(path);
+            } else if path.extension().is_some_and(|ext| ext == "rs") {
+                found.push(path);
+            }
+        }
+    }
+    found
+}
+
+/// Every emitted Rust line under `dir` that calls `callee` with a turbofish.
+fn turbofish_calls(dir: &Path, callee: &str) -> Vec<String> {
+    let needle = format!("{callee}::<");
+    rust_sources(dir)
+        .iter()
+        .flat_map(|path| {
+            let text = std::fs::read_to_string(path).unwrap_or_default();
+            text.lines()
+                .filter(|line| line.contains(&needle))
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        })
+        .collect()
+}
+
+/// A generic whose only naming argument a parameter erasure removed is pinned
+/// at each call by its instantiation: `i64` at `Tag Int`, `()` where the
+/// caller's own generic was erased too. The emitted calls are read in the CI
+/// `test-run` job; the crate builds with cargo under `IPE_E2E=1` (the CI `e2e`
+/// job).
+#[test]
+fn a_generic_named_only_by_an_erased_argument_is_pinned_at_each_call() {
+    let runtime = e2e_support::require_runtime().into_path_buf();
+    let scratch = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!(
+        "ipe_type_ceiling_erased_pin_{}",
+        std::process::id()
+    ));
+    let emitted = ipe::RootFixture::main(ERASED_INFERENCE_PIN)
+        .and_then(|fixture| ipe::build_fixture(&fixture, &scratch, &runtime).map(|_| ()));
+    assert!(emitted.is_ok(), "must emit: {emitted:?}");
+    let calls = turbofish_calls(&scratch, "empties");
+    assert!(
+        calls.iter().any(|line| line.contains("empties::<i64>(")),
+        "the `Tag Int` call must pin `i64`: {calls:?}"
+    );
+    assert!(
+        calls
+            .iter()
+            .filter(|line| line.contains("empties::<()>("))
+            .count()
+            >= 2,
+        "the calls over an erased caller generic must pin `()`: {calls:?}"
+    );
+    if e2e_support::e2e_tier() == e2e_support::Tier::E2e {
+        let built = e2e_support::build_rust_binary("type_ceiling_erased_pin", &scratch);
+        assert!(
+            built.is_ok(),
+            "the emitted crate must build with cargo: {}",
+            built.err().unwrap_or_default()
+        );
+    }
+    let _ = std::fs::remove_dir_all(&scratch);
+}
+
+/// `mk` takes one Rust argument and returns a closure over the erased `Tag a`,
+/// so a call applying both arguments names `a` through no emitted argument.
+const SPINE_ONLY_PIN: &str = "module Main exposing (main)\n\nimport Ipe.Io as Io\nimport Ipe.List as List\n\n\ntype Tag a\n    = Tag\n\n\nmk : Int -> Tag a -> List a\nmk _ =\n    \\_ -> []\n\n\ncount : Tag Int -> Int\ncount t =\n    List.length (mk 1 t)\n\n\nmain =\n    Io.println (if count Tag == 0 then \"zero\" else \"other\")\n";
+
+/// A generic no emitted Rust argument names is pinned at each call whatever
+/// the callee's Rust arity: `i64` where the declared argument past the Rust
+/// arity fixes it. The emitted calls are read in the CI `test-run` job; the
+/// crate builds and runs under `IPE_E2E=1` (the CI `e2e` job).
+#[test]
+fn a_generic_named_past_the_emitted_arity_is_pinned_at_each_call() {
+    let runtime = e2e_support::require_runtime().into_path_buf();
+    let scratch = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("ipe_type_ceiling_spine_pin_{}", std::process::id()));
+    let emitted = ipe::RootFixture::main(SPINE_ONLY_PIN)
+        .and_then(|fixture| ipe::build_fixture(&fixture, &scratch, &runtime).map(|_| ()));
+    assert!(emitted.is_ok(), "must emit: {emitted:?}");
+    let mk = turbofish_calls(&scratch, "mk");
+    assert!(
+        mk.iter().any(|line| line.contains("mk::<i64>(")),
+        "the over-applied `Tag Int` call must pin `i64`: {mk:?}"
+    );
+    if e2e_support::e2e_tier() == e2e_support::Tier::E2e {
+        let ran = e2e_support::build_and_run_rust("type_ceiling_spine_pin", &scratch);
+        assert!(
+            ran.as_ref()
+                .is_ok_and(|run| run.exit_code == Some(0) && run.stdout == "zero\n"),
+            "the emitted crate must build with cargo and print `zero`: {:?}",
+            ran.map(|run| (run.exit_code, run.stdout))
+        );
+    }
+    let _ = std::fs::remove_dir_all(&scratch);
+}
+
+/// Emit `src`, assert no call of a callee in `unpinned` carries a turbofish,
+/// then build and run it under `IPE_E2E=1` (the CI `e2e` job) and assert it
+/// prints `stdout`; without e2e, the emitted calls are the whole check.
+fn assert_runs(src: &str, bin: &str, unpinned: &[&str], stdout: &str) {
+    let runtime = e2e_support::require_runtime().into_path_buf();
+    let scratch = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("ipe_type_ceiling_{bin}_{}", std::process::id()));
+    let emitted = ipe::RootFixture::main(src)
+        .and_then(|fixture| ipe::build_fixture(&fixture, &scratch, &runtime).map(|_| ()));
+    assert!(emitted.is_ok(), "must emit: {emitted:?}");
+    for callee in unpinned {
+        let pinned = turbofish_calls(&scratch, callee);
+        assert!(
+            pinned.is_empty(),
+            "`{callee}` must be called unpinned: {pinned:?}"
+        );
+    }
+    if e2e_support::e2e_tier() == e2e_support::Tier::E2e {
+        let ran = e2e_support::build_and_run_rust(bin, &scratch);
+        assert!(
+            ran.as_ref()
+                .is_ok_and(|run| run.exit_code == Some(0) && run.stdout == stdout),
+            "the emitted crate must build with cargo and print {stdout:?}: {:?}",
+            ran.map(|run| (run.exit_code, run.stdout))
+        );
+    }
+    let _ = std::fs::remove_dir_all(&scratch);
+}
+
+/// `none`'s `e` is named by its return alone; the use binds it to the `Err`
+/// of a `Result` whose `Ok 2` sibling fixes the error type.
+const RETURN_ONLY_RESULT_ERROR: &str = "module Main exposing (main)\n\nimport Ipe.Io as Io\nimport Ipe.Result as Result\nimport Ipe.String as String\n\n\nnone : Int -> Maybe e\nnone _ =\n    Nothing\n\n\nmain =\n    Io.println\n        (String.fromInt\n            (Result.withDefault 0\n                (case none 1 of\n                    Just e ->\n                        Err e\n\n                    Nothing ->\n                        Ok 2\n                )\n            )\n        )\n";
+
+/// A generic only the declared return names is left to the call's expected
+/// type, never pinned to a reading its sibling contradicts: the emitted call
+/// carries no turbofish. Read in the CI `test-run` job; built and run under
+/// `IPE_E2E=1` (the CI `e2e` job).
+#[test]
+fn a_return_only_generic_bound_to_a_result_error_builds_and_runs() {
+    assert_runs(
+        RETURN_ONLY_RESULT_ERROR,
+        "return_only_result_error",
+        &["none"],
+        "2\n",
+    );
+}
+
+/// `none`'s `a` is named by its return alone, beside a `List.head []` sibling
+/// in one `if`.
+const RETURN_ONLY_BESIDE_A_KERNEL: &str = "module Main exposing (main)\n\nimport Ipe.Io as Io\nimport Ipe.List as List\n\n\nnone : Int -> Maybe a\nnone _ =\n    Nothing\n\n\nmain =\n    case (if List.length [ 1 ] > 0 then none 1 else List.head []) of\n        Just _ ->\n            Io.println \"just\"\n\n        Nothing ->\n            Io.println \"nothing\"\n";
+
+/// A return-only generic beside a kernel call over the same open variable
+/// builds as one Rust type, its call carrying no turbofish. Read in the CI
+/// `test-run` job; built and run under `IPE_E2E=1` (the CI `e2e` job).
+#[test]
+fn a_return_only_generic_beside_a_kernel_sibling_builds_and_runs() {
+    assert_runs(
+        RETURN_ONLY_BESIDE_A_KERNEL,
+        "return_only_kernel",
+        &["none"],
+        "nothing\n",
+    );
+}
+
+/// `konst` takes one Rust argument and returns a closure over `a`; the call
+/// applies it to `List.head []`, which leaves `a`'s element open.
+const OVER_APPLIED_OPEN: &str = "module Main exposing (main)\n\nimport Ipe.Io as Io\nimport Ipe.List as List\nimport Ipe.String as String\n\n\nkonst : Int -> a -> Int\nkonst n =\n    \\_ -> n\n\n\nmain =\n    Io.println (String.fromInt (konst 1 (List.head [])))\n";
+
+/// A generic past the emitted arity that the returned closure's parameter
+/// names is fixed by the argument the caller passes to that closure: an open
+/// instance is left unpinned, never refused. Read in the CI `test-run` job;
+/// built and run under `IPE_E2E=1` (the CI `e2e` job).
+#[test]
+fn an_open_generic_a_returned_closure_takes_is_left_to_its_argument() {
+    assert_runs(OVER_APPLIED_OPEN, "over_applied_open", &["konst"], "1\n");
+}
+
+/// `rowsOf` names `row` in its `Cond row` argument, which the non-generic
+/// store-row carrier drops, and in its result; the call leaves `row` open.
+const OPAQUE_CARRIER_OPEN: &str = "module Main exposing (main)\n\nimport Ipe.Db.Store exposing (Cond(..))\nimport Ipe.Io as Io\nimport Ipe.List as List\n\n\nrowsOf : Cond row -> List row\nrowsOf _ =\n    []\n\n\nmain =\n    Io.println\n        (case List.head (rowsOf (IsNull \"x\")) of\n            Just _ ->\n                \"some\"\n\n            Nothing ->\n                \"none\"\n        )\n";
+
+/// A generic an opaque carrier, not an unused enum parameter, drops from the
+/// arguments is left to the call's context even where the result names it:
+/// unpinned and never refused. Read in the CI `test-run` job; built and run
+/// under `IPE_E2E=1` (the CI `e2e` job).
+#[test]
+fn an_open_generic_an_opaque_carrier_drops_is_left_to_the_call_context() {
+    assert_runs(
+        OPAQUE_CARRIER_OPEN,
+        "opaque_carrier_open",
+        &["rows_of"],
+        "none\n",
+    );
+}
+
+/// `rowsOf` names `a` only inside a `Tag a` under the stdlib `Cond` head,
+/// whose argument lowering drops, and in its result; `Tag` is never emitted.
+const CARRIED_PHANTOM_OPEN: &str = "module Main exposing (main)\n\nimport Ipe.Db.Store exposing (Cond(..))\nimport Ipe.Io as Io\nimport Ipe.List as List\n\n\ntype Tag a\n    = Tag\n\n\nrowsOf : Cond (Tag a) -> List a\nrowsOf _ =\n    []\n\n\nmain =\n    Io.println\n        (case List.head (rowsOf (IsNull \"x\")) of\n            Just _ ->\n                \"some\"\n\n            Nothing ->\n                \"none\"\n        )\n";
+
+/// An unused enum parameter nested only under an argument lowering drops
+/// erases nothing lowering emits, so the generic is left to the call's
+/// context: unpinned and never refused. Read in the CI `test-run` job; built
+/// and run under `IPE_E2E=1` (the CI `e2e` job).
+#[test]
+fn an_unused_enum_parameter_under_a_dropped_argument_is_left_to_the_call_context() {
+    assert_runs(
+        CARRIED_PHANTOM_OPEN,
+        "carried_phantom_open",
+        &["rows_of"],
+        "none\n",
+    );
+}
+
+/// `empties` names `a` in its erased `Tag a` argument and in its result;
+/// `main` calls it over a `Tag` that leaves `a` open.
+const OPEN_ERASED_RESULT: &str = "module Main exposing (main)\n\nimport Ipe.Io as Io\nimport Ipe.List as List\nimport Ipe.String as String\n\n\ntype Tag a\n    = Tag\n\n\nempties : Tag a -> List a\nempties _ =\n    []\n\n\nmain =\n    Io.println (String.fromInt (List.length (empties Tag)))\n";
+
+/// The same call over `intTag : Tag Int`, which fixes `a`.
+const FIXED_ERASED_RESULT: &str = "module Main exposing (main)\n\nimport Ipe.Io as Io\nimport Ipe.List as List\nimport Ipe.String as String\n\n\ntype Tag a\n    = Tag\n\n\nempties : Tag a -> List a\nempties _ =\n    []\n\n\nintTag : Tag Int\nintTag =\n    Tag\n\n\nmain =\n    Io.println (String.fromInt (List.length (empties intTag)))\n";
+
+/// A call leaving open a generic only an erased argument names, while the
+/// callee's emitted result still names it, is refused with IPE-L0102 at the
+/// call and emits no Rust; the same call over a concretely typed argument
+/// emits. Read in the CI `test-run` job; the control builds and runs under
+/// `IPE_E2E=1` (the CI `e2e` job).
+#[test]
+fn an_open_generic_only_an_erased_argument_names_is_refused_where_the_result_shows_it() {
+    let runtime = e2e_support::require_runtime().into_path_buf();
+    let scratch = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!(
+        "ipe_type_ceiling_open_erased_result_{}",
+        std::process::id()
+    ));
+    let built = ipe::RootFixture::main(OPEN_ERASED_RESULT)
+        .and_then(|fixture| ipe::build_fixture(&fixture, &scratch, &runtime).map(|_| ()));
+    let diag = refusal(&built);
+    assert_eq!(diag.map(Diagnostic::code), Some(IPE_L0102), "{built:?}");
+    let main_at = span_of(OPEN_ERASED_RESULT, "main =", 0);
+    let call = span_of(OPEN_ERASED_RESULT, "empties Tag", offset_of(main_at));
+    let span = diag.map(Diagnostic::primary_span);
+    assert!(
+        span.is_some_and(|s| s.lo < s.hi && s.lo >= call.lo && s.hi <= call.hi),
+        "refused at {span:?}, not inside the call {}..{}: {built:?}",
+        call.lo,
+        call.hi
+    );
+    let emitted = rust_sources(&scratch);
+    assert!(emitted.is_empty(), "no Rust may be emitted: {emitted:?}");
+    let _ = std::fs::remove_dir_all(&scratch);
+    assert_runs(FIXED_ERASED_RESULT, "fixed_erased_result", &[], "0\n");
+}
+
+/// `doubledCount` is generic over a `number` its body's `x + x` bounds, and
+/// that only the erased parameter of `Tag` names, so its emitted signature
+/// names no generic the body could read. The checker accepts it: the body adds
+/// no literal to the annotated variable, and the one use pins it to `Int`
+/// through `intTag`, since a use leaving a bounded generic unpinned is refused
+/// with IPE-T0014.
+const BOUNDED_ERASED_GENERIC: &str = "module Main exposing (main)\n\nimport Ipe.Io as Io\nimport Ipe.List as List\n\n\ntype Tag a\n    = Tag\n\n\nempties : Tag a -> List a\nempties _ =\n    []\n\n\nintTag : Tag Int\nintTag =\n    Tag\n\n\ndoubledCount : Tag number -> Int\ndoubledCount t =\n    case List.head (empties t) of\n        Just x ->\n            List.length [ x + x ]\n\n        Nothing ->\n            0\n\n\nmain =\n    Io.println (if doubledCount intTag == 0 then \"zero\" else \"other\")\n";
+
+/// A bounded generic the emitted signature does not name has no reading in
+/// its body: the build is refused with IPE-L0102 inside the body that reads
+/// it, never a compiler bug, and no Rust is emitted. Read in the CI
+/// `test-run` job.
+#[test]
+fn a_bounded_generic_only_an_erased_parameter_names_is_refused_where_it_is_read() {
+    let runtime = e2e_support::require_runtime().into_path_buf();
+    let scratch = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!(
+        "ipe_type_ceiling_bounded_erased_{}",
+        std::process::id()
+    ));
+    let built = ipe::RootFixture::main(BOUNDED_ERASED_GENERIC)
+        .and_then(|fixture| ipe::build_fixture(&fixture, &scratch, &runtime).map(|_| ()));
+    let diag = refusal(&built);
+    assert_eq!(diag.map(Diagnostic::code), Some(IPE_L0102), "{built:?}");
+    let src = BOUNDED_ERASED_GENERIC;
+    let body = span_of(src, "doubledCount t =", 0);
+    let main_at = span_of(src, "main =", offset_of(body));
+    let span = diag.map(Diagnostic::primary_span);
+    assert!(
+        span.is_some_and(|s| s != Span::DUMMY
+            && s.lo < s.hi
+            && (body.lo..=main_at.lo).contains(&s.lo)
+            && (body.lo..=main_at.lo).contains(&s.hi)),
+        "refused at {span:?}, not inside doubledCount's body {}..{}: {built:?}",
+        body.lo,
+        main_at.lo
+    );
+    let emitted = rust_sources(&scratch);
+    assert!(emitted.is_empty(), "no Rust may be emitted: {emitted:?}");
+    let _ = std::fs::remove_dir_all(&scratch);
+}
+
+/// `empties` returns a `Set` of a variable no argument names: its one use
+/// leaves an order-classed variable unresolved.
+const ORDERED_FREE_PIN: &str = "module Main exposing (main)\n\nimport Ipe.Io as Io\nimport Ipe.Set as Set\n\n\nempties : Int -> Set comparable\nempties _ =\n    Set.fromList []\n\n\nmain =\n    Io.println (if Set.size (empties 1) == 0 then \"zero\" else \"other\")\n";
+
+/// A free variable under an order class (`comparable`, `Ord` for a `Set`
+/// element) never reaches lowering: inference refuses it at the use with
+/// IPE-T0014, so no turbofish cargo refuses (E0277) can be emitted. The
+/// lowering's own refusal for a bound `JsonVal` lacks is proved by the
+/// `ipe_lower` unit test `a_json_reading_on_an_ordered_parameter_becomes_the_refusal`.
+/// Read in the CI `test-run` job.
+#[test]
+fn a_free_variable_under_an_order_class_is_refused_by_inference_at_its_use() {
+    let runtime = e2e_support::require_runtime().into_path_buf();
+    let scratch = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!(
+        "ipe_type_ceiling_ordered_free_pin_{}",
+        std::process::id()
+    ));
+    let built = ipe::RootFixture::main(ORDERED_FREE_PIN)
+        .and_then(|fixture| ipe::build_fixture(&fixture, &scratch, &runtime).map(|_| ()));
+    let diag = refusal(&built);
+    assert_eq!(diag.map(Diagnostic::code), Some(IPE_T0014), "{built:?}");
+    let main_at = span_of(ORDERED_FREE_PIN, "main =", 0);
+    let span = diag.map(Diagnostic::primary_span);
+    assert!(
+        span.is_some_and(|s| s.lo >= main_at.lo && s.lo < s.hi),
+        "refused at {span:?}, not inside `main` from {}: {built:?}",
+        main_at.lo
+    );
+    let emitted = rust_sources(&scratch);
+    assert!(emitted.is_empty(), "no Rust may be emitted: {emitted:?}");
+    let _ = std::fs::remove_dir_all(&scratch);
+}
+
+/// An unannotated helper returns a `Set` of a variable no argument names, so
+/// its element class is only inferred: the program is refused at ipe time or
+/// its emitted project builds, never accepted and then refused by cargo.
+const UNANNOTATED_ORDER_CLASS: &str = "module Main exposing (main)\n\nimport Ipe.Io as Io\nimport Ipe.Set as Set\n\n\nempties _ =\n    Set.fromList []\n\n\nmain =\n    Io.println (if Set.size (empties 1) == 0 then \"zero\" else \"other\")\n";
+
+/// Read in the CI `test-run` job.
+#[test]
+fn an_unannotated_helper_with_a_free_order_class_never_fails_at_cargo() {
+    let checked = front_check(UNANNOTATED_ORDER_CLASS);
+    if checked.is_ok() && e2e_support::e2e_tier() == e2e_support::Tier::E2e {
+        let runtime = e2e_support::require_runtime().into_path_buf();
+        let scratch = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!(
+            "ipe_type_ceiling_unannotated_order_{}",
+            std::process::id()
+        ));
+        assert_builds_with_cargo(
+            UNANNOTATED_ORDER_CLASS,
+            &scratch,
+            &runtime,
+            "type_ceiling_unannotated_order",
+        );
+        let _ = std::fs::remove_dir_all(&scratch);
+    } else {
+        assert!(
+            refusal(&checked).is_some(),
+            "neither accepted nor refused: {checked:?}"
+        );
+    }
+}
+
+/// The byte offset `span` starts at.
+fn offset_of(span: Span) -> usize {
+    usize::try_from(span.lo).unwrap_or(usize::MAX)
+}
+
 /// `p0 = 0` and `pK = ( p{K-1}, p{K-1} )` through `p{n}`, compared with
 /// itself, and the span of `p{n}`'s body.
 fn doubling_chain(n: usize) -> Chain {
@@ -277,6 +938,16 @@ fn doubling_chain(n: usize) -> Chain {
     }
 }
 
+/// The help under a value's type past the size ceiling.
+const VALUE_SIZE_HELP: &str = "a value that holds the same value twice doubles its type each time. \
+     Name the repeated part with its own custom type, or build the structure from a list \
+     instead of nested pairs.";
+
+/// The help under a declared type built past the size ceiling.
+const DECLARATION_SIZE_HELP: &str = "a custom type that refers to itself with larger arguments \
+     builds a larger type at each level, however shallow. Pass its parameters on as they are, \
+     or hold the growing part in a field of its own type, such as a `List`.";
+
 /// A type that is shallow but unfolds to more than [`TYPE_SIZE_LIMIT`] nodes is
 /// refused with IPE-T0023 at the binding that doubled past it; one doubling
 /// less fits. `pK`'s type unfolds to `2^(K + 1) - 1` nodes.
@@ -297,9 +968,69 @@ fn a_type_doubling_past_the_size_ceiling_is_refused() {
             span: past.refused_at,
             msg: TypeError::TypeTooLarge {
                 limit: TYPE_SIZE_LIMIT,
+                origin: TypeSizeOrigin::Value,
             },
         })
     );
+    assert_eq!(
+        diag.map(Diagnostic::help),
+        Some(vec![HelpLine::Note(VALUE_SIZE_HELP.into())])
+    );
+}
+
+/// `type B p1 … pk = B p1 … pk` and `type T a b c d = Z | X (T Int (B a … a)
+/// (B b … b) (B c … c))`, and the span of `X`'s name.
+///
+/// Each instantiation of `T` holds `B` over the previous one's arguments, so
+/// the largest, `B (B (B Int …) …) …`, is `1 + k + k^2 + k^3` nodes: shallow,
+/// but `k` times larger at each step.
+fn widening(k: usize) -> Chain {
+    let params: Vec<String> = (1..=k).map(|n| format!("p{n}")).collect();
+    let over = |v: &str| format!("(B{})", format!(" {v}").repeat(k));
+    let src = with_decls(&format!(
+        "type B {params}\n    = B {params}\n\n\ntype T a b c d\n    = Z\n    | X (T Int {} {} {})\n\n\n",
+        over("a"),
+        over("b"),
+        over("c"),
+        params = params.join(" "),
+    ));
+    let at = span_of(&src, "| X (", 0);
+    Chain {
+        refused_at: Span {
+            lo: at.lo + 2,
+            hi: at.lo + 3,
+        },
+        src,
+    }
+}
+
+/// A recursive type whose instantiations widen past [`TYPE_SIZE_LIMIT`] nodes
+/// is refused with IPE-T0023 at the constructor that applies the widening
+/// instantiation, before any of it is built; the widest that fits is accepted.
+#[test]
+fn a_type_whose_instantiations_widen_past_the_size_ceiling_is_refused() {
+    let fits = front_check(&widening(39).src);
+    assert!(fits.is_ok(), "a widening of 39 must be accepted: {fits:?}");
+    for k in [40, 1500] {
+        let past = widening(k);
+        let refused = front_check(&past.src);
+        assert_eq!(
+            refusal(&refused),
+            Some(&Diagnostic::Type {
+                span: past.refused_at,
+                msg: TypeError::TypeTooLarge {
+                    limit: TYPE_SIZE_LIMIT,
+                    origin: TypeSizeOrigin::Declaration,
+                },
+            }),
+            "a widening of {k} must be refused: {refused:?}"
+        );
+        assert_eq!(
+            refusal(&refused).map(Diagnostic::help),
+            Some(vec![HelpLine::Note(DECLARATION_SIZE_HELP.into())]),
+            "a widening of {k} must name its declaration: {refused:?}"
+        );
+    }
 }
 
 /// `main`'s body comparing the last binding with `0`, a type mismatch for

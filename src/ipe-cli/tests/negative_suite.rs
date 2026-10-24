@@ -1528,6 +1528,34 @@ fn canon_connection_arity_too_many() {
     assert_rejected("canon_connection_arity2", &src, "IPE-N0031");
 }
 
+/// A declared union takes exactly its declared parameters: over-applied
+/// (`X Int Int` for `type X a`) it is IPE-N0031, never an emitted enum use
+/// cargo refuses (E0107).
+#[test]
+fn canon_union_arity_too_many() {
+    let src = format!(
+        "{HEAD}type X a = A a
+f : X Int Int -> Int
+f x = 0
+main = 1
+"
+    );
+    assert_rejected("canon_union_arity2", &src, "IPE-N0031");
+}
+
+/// A bare one-parameter union is the same arity rejection (IPE-N0031).
+#[test]
+fn canon_union_arity_too_few() {
+    let src = format!(
+        "{HEAD}type X a = A a
+f : X -> Int
+f x = 0
+main = 1
+"
+    );
+    assert_rejected("canon_union_arity0", &src, "IPE-N0031");
+}
+
 /// The SEAL rejects a function-carrying boundary parameter (IPE-N0039): a
 /// function is behaviour, not a serialisable value, and must never cross the
 /// Ipê↔JS seam. Fail-closed at the type level, before emission.

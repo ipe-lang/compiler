@@ -866,3 +866,61 @@ fn markdown_features_builds_and_runs() {
         out.stdout
     );
 }
+
+// ── A message parameter also used outside its slot ────────────────
+
+/// `wrap` uses `a` in `List a` and in `Html a`; `wrap []` inside a page
+/// fixes it by the page, so one Rust type reads both positions.
+const MIXED_MSG_PARAM_MAIN: &str = "module Main exposing (main)
+import Ipe.Io as Io
+import Ipe.Html as Html exposing (Html)
+
+wrap : List a -> Html a
+wrap xs =
+    Html.div [] []
+
+main =
+    Io.println (Html.htmlRender (Html.div [] [ wrap [] ]))
+";
+
+#[test]
+fn a_mixed_message_parameter_fixed_by_its_page_builds_and_runs() {
+    seal_module(
+        "mixed_msg_param",
+        MIXED_MSG_PARAM_MAIN,
+        "<div><div></div></div>",
+    );
+}
+
+// ── A generic only the return names, left open beside a sibling default ──
+
+/// `mk`'s `e` is named by its return's error slot alone, so the use pins
+/// nothing and the `Ok 4` sibling's wrapper fixes it. `pick` keeps `e`
+/// generic, so its own `Ok 4` stays `IpeResult::Ok` over that generic; `pick`
+/// is declared but never applied, because applying it leaves `e` with no
+/// reading at all.
+const OPEN_RESULT_ERROR_MAIN: &str = "module Main exposing (main)
+import Ipe.Io as Io
+import Ipe.String as String
+
+mk : Int -> Result e Int
+mk n =
+    Ok n
+
+pick : Bool -> Result e Int
+pick c =
+    if c then mk 3 else Ok 4
+
+shown r =
+    case r of
+        Ok n -> String.fromInt n
+        Err _ -> \"err\"
+
+main =
+    Io.println (shown (if String.length \"a\" > 0 then mk 3 else Ok 4))
+";
+
+#[test]
+fn an_open_result_error_beside_ok_builds_and_runs() {
+    seal_module("open_result_error", OPEN_RESULT_ERROR_MAIN, "3");
+}

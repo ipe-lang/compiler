@@ -31,8 +31,8 @@ use ipe_diagnostics::DResult;
 use ipe_intern::{Interner, Symbol};
 
 pub use env::{
-    CtorHome, Env, ModuleCatalog, STDLIB_MODULE_QUALIFIERS, VarHome, bare_import_binds,
-    const_str_eq, kernel_import_binds_last_segment, stdlib_canonical_qualifier,
+    CtorHome, Env, ModuleCatalog, STDLIB_MODULE_QUALIFIERS, UnionParams, VarHome,
+    bare_import_binds, const_str_eq, kernel_import_binds_last_segment, stdlib_canonical_qualifier,
 };
 pub use resolve::{
     DO_BIND_MODULE, ModuleOrigin, QualifierForm, builtin_empty_home_arity, import_qualifier_forms,
@@ -76,9 +76,10 @@ pub struct ModuleExports {
     /// Exported value names (without their resolved `VarHome`; the home is
     /// always `TopLevel(path)`, reconstructed at injection time).
     pub values: BTreeSet<Symbol>,
-    /// Exported type names mapped to their home module path. For a type
-    /// `Widget` declared in `Lib.Utils`, this entry is `Widget → [Lib, Utils]`.
-    pub types: BTreeMap<Symbol, Vec<Symbol>>,
+    /// Exported type names mapped to their home module path and arity fact.
+    /// For a one-parameter type `Widget a` declared in `Lib.Utils`, this entry
+    /// is `Widget → Union { home: [Lib, Utils], params: 1 }`.
+    pub types: BTreeMap<Symbol, ExportedType>,
     /// Exported constructors by name.
     pub ctors: BTreeMap<Symbol, CtorHome>,
     /// Exported type aliases by name.
@@ -94,6 +95,26 @@ pub struct ModuleExports {
     /// disjointness with a normal value is by construction: `detect_kernel_alias`
     /// classifies each binding exactly once.
     pub kernel_aliases: BTreeMap<Symbol, ExportedKernelAlias>,
+}
+
+/// An exported type name: where it resolves, and who owns its arity.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum ExportedType {
+    /// A union the module declares, with its declared type-parameter count.
+    Union { home: Vec<Symbol>, params: usize },
+    /// A reserved builtin carrier the module re-exports; the builtin table
+    /// owns its arity.
+    Builtin { home: Vec<Symbol> },
+}
+
+impl ExportedType {
+    /// The home module path the type resolves to.
+    #[must_use]
+    pub fn home(&self) -> &[Symbol] {
+        match self {
+            Self::Union { home, .. } | Self::Builtin { home } => home,
+        }
+    }
 }
 
 /// The resolved target of an exported Stage-4 kernel alias — the `(StdlibKernel,
@@ -2197,7 +2218,7 @@ mod tests {
             matches!(
                 err,
                 Some(Diagnostic::Name {
-                    msg: NameError::BuiltinTypeArity {
+                    msg: NameError::TypeArity {
                         ref name,
                         expected: 1,
                         found: 0,
@@ -2205,7 +2226,7 @@ mod tests {
                     ..
                 }) if name.as_ref() == "List"
             ),
-            "expected a BuiltinTypeArity(List, 1, 0) diagnostic, got {err:?}"
+            "expected a TypeArity(List, 1, 0) diagnostic, got {err:?}"
         );
     }
 
@@ -2223,7 +2244,7 @@ mod tests {
             matches!(
                 err,
                 Some(Diagnostic::Name {
-                    msg: NameError::BuiltinTypeArity {
+                    msg: NameError::TypeArity {
                         ref name,
                         expected: 1,
                         found: 2,
@@ -2231,7 +2252,7 @@ mod tests {
                     ..
                 }) if name.as_ref() == "Maybe"
             ),
-            "expected a BuiltinTypeArity(Maybe, 1, 2) diagnostic, got {err:?}"
+            "expected a TypeArity(Maybe, 1, 2) diagnostic, got {err:?}"
         );
     }
 
@@ -2247,7 +2268,7 @@ mod tests {
             matches!(
                 err,
                 Some(Diagnostic::Name {
-                    msg: NameError::BuiltinTypeArity {
+                    msg: NameError::TypeArity {
                         ref name,
                         expected: 2,
                         found: 1,
@@ -2255,7 +2276,7 @@ mod tests {
                     ..
                 }) if name.as_ref() == "Dict"
             ),
-            "expected a BuiltinTypeArity(Dict, 2, 1) diagnostic, got {err:?}"
+            "expected a TypeArity(Dict, 2, 1) diagnostic, got {err:?}"
         );
     }
 
@@ -2272,11 +2293,218 @@ mod tests {
             !matches!(
                 err,
                 Some(Diagnostic::Name {
-                    msg: NameError::BuiltinTypeArity { .. },
+                    msg: NameError::TypeArity { .. },
                     ..
                 })
             ),
             "well-formed `Maybe (List Int)` must not trip IPE-N0031, got {err:?}"
+        );
+    }
+
+    /// Whether `err` is IPE-N0031 for `name` (`expected` declared, `found`
+    /// given) at a span of `src_text` covering `excerpt`.
+    fn is_type_arity_at(
+        err: Option<&Diagnostic>,
+        src_text: &str,
+        name: &str,
+        (expected, found): (usize, usize),
+        excerpt: &str,
+    ) -> bool {
+        let Some(Diagnostic::Name {
+            span,
+            msg:
+                NameError::TypeArity {
+                    name: got_name,
+                    expected: got_expected,
+                    found: got_found,
+                },
+            ..
+        }) = err
+        else {
+            return false;
+        };
+        let covered = usize::try_from(span.lo)
+            .ok()
+            .zip(usize::try_from(span.hi).ok())
+            .and_then(|(lo, hi)| src_text.get(lo..hi));
+        got_name.as_ref() == name
+            && *got_expected == expected
+            && *got_found == found
+            && covered.is_some_and(|text| text.contains(excerpt))
+    }
+
+    /// A one-parameter union over-applied in a signature.
+    const UNION_OVER_APPLIED_SIGNATURE: &str = "module Main exposing (f)\n\
+         type X a = A a\n\n\
+         f : X Int Int -> Int\n\
+         f x =\n    0\n";
+
+    #[test]
+    fn union_over_applied_in_a_signature_is_a_type_arity_error() {
+        let err = canon_err(UNION_OVER_APPLIED_SIGNATURE);
+        assert!(
+            is_type_arity_at(
+                err.as_ref(),
+                UNION_OVER_APPLIED_SIGNATURE,
+                "X",
+                (1, 2),
+                "X Int Int"
+            ),
+            "expected TypeArity(X, 1, 2) at the signature, got {err:?}"
+        );
+    }
+
+    /// A one-parameter union applied to nothing in a signature.
+    const UNION_UNDER_APPLIED_SIGNATURE: &str = "module Main exposing (f)\n\
+         type X a = A a\n\n\
+         f : X -> Int\n\
+         f x =\n    0\n";
+
+    #[test]
+    fn union_under_applied_in_a_signature_is_a_type_arity_error() {
+        let err = canon_err(UNION_UNDER_APPLIED_SIGNATURE);
+        assert!(
+            is_type_arity_at(
+                err.as_ref(),
+                UNION_UNDER_APPLIED_SIGNATURE,
+                "X",
+                (1, 0),
+                "X -> Int"
+            ),
+            "expected TypeArity(X, 1, 0) at the signature, got {err:?}"
+        );
+    }
+
+    /// A nullary union given an argument in a value annotation.
+    const UNION_OVER_APPLIED_ANNOTATION: &str = "module Main exposing (v)\n\
+         type Z = Z\n\n\
+         v : Z Int\n\
+         v =\n    Z\n";
+
+    #[test]
+    fn union_over_applied_in_an_annotation_is_a_type_arity_error() {
+        let err = canon_err(UNION_OVER_APPLIED_ANNOTATION);
+        assert!(
+            is_type_arity_at(
+                err.as_ref(),
+                UNION_OVER_APPLIED_ANNOTATION,
+                "Z",
+                (0, 1),
+                "Z Int"
+            ),
+            "expected TypeArity(Z, 0, 1) at the annotation, got {err:?}"
+        );
+    }
+
+    /// A one-parameter union over-applied in another union's field.
+    const UNION_OVER_APPLIED_FIELD: &str = "module Main exposing (Y)\n\
+         type X a = A a\n\n\
+         type Y = Y (X Int Int)\n";
+
+    #[test]
+    fn union_over_applied_in_a_union_field_is_a_type_arity_error() {
+        let err = canon_err(UNION_OVER_APPLIED_FIELD);
+        assert!(
+            is_type_arity_at(err.as_ref(), UNION_OVER_APPLIED_FIELD, "X", (1, 2), "Y"),
+            "expected TypeArity(X, 1, 2) at the field's constructor, got {err:?}"
+        );
+    }
+
+    /// A union under-applied in its own recursive field.
+    const UNION_UNDER_APPLIED_SELF_FIELD: &str = "module Main exposing (T)\n\
+         type T a = Leaf | Node a T\n";
+
+    #[test]
+    fn union_under_applied_in_its_own_field_is_a_type_arity_error() {
+        let err = canon_err(UNION_UNDER_APPLIED_SELF_FIELD);
+        assert!(
+            is_type_arity_at(
+                err.as_ref(),
+                UNION_UNDER_APPLIED_SELF_FIELD,
+                "T",
+                (1, 0),
+                "Node"
+            ),
+            "expected TypeArity(T, 1, 0) at the field, got {err:?}"
+        );
+    }
+
+    /// An imported union over-applied through its qualified name, which the
+    /// import's clause does not expose.
+    const IMPORTED_UNION_OVER_APPLIED: &str = "module Main exposing (f)\n\
+         import Dep\n\n\
+         f : Dep.Box Int Int -> Int\n\
+         f b =\n    0\n";
+
+    #[test]
+    fn imported_union_over_applied_is_a_type_arity_error() {
+        let err = canon_main_with_dep(
+            "module Dep exposing (Box)\n\
+             type Box a = Box a\n",
+            IMPORTED_UNION_OVER_APPLIED,
+        );
+        assert!(
+            is_type_arity_at(
+                err.as_ref(),
+                IMPORTED_UNION_OVER_APPLIED,
+                "Box",
+                (1, 2),
+                "Dep.Box Int Int"
+            ),
+            "expected TypeArity(Box, 1, 2) at the signature, got {err:?}"
+        );
+    }
+
+    /// An imported union over-applied through the bare name its import's
+    /// clause exposes.
+    const EXPOSED_UNION_OVER_APPLIED: &str = "module Main exposing (f)\n\
+         import Dep exposing (Box)\n\n\
+         f : Box Int Int -> Int\n\
+         f b =\n    0\n";
+
+    #[test]
+    fn exposed_union_over_applied_is_a_type_arity_error() {
+        let err = canon_main_with_dep(
+            "module Dep exposing (Box)\n\
+             type Box a = Box a\n",
+            EXPOSED_UNION_OVER_APPLIED,
+        );
+        assert!(
+            is_type_arity_at(
+                err.as_ref(),
+                EXPOSED_UNION_OVER_APPLIED,
+                "Box",
+                (1, 2),
+                "Box Int Int"
+            ),
+            "expected TypeArity(Box, 1, 2) at the signature, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn union_applied_to_its_declared_parameters_is_accepted() {
+        let local = canon_err(
+            "module Main exposing (f)\n\
+             type X a = A a\n\n\
+             type Y = Y (X Int)\n\n\
+             f : X Int -> Y\n\
+             f x =\n    Y x\n",
+        );
+        assert!(
+            local.is_none(),
+            "a saturated union must resolve, got {local:?}"
+        );
+        let imported = canon_main_with_dep(
+            "module Dep exposing (Box)\n\
+             type Box a = Box a\n",
+            "module Main exposing (f)\n\
+             import Dep\n\n\
+             f : Dep.Box Int -> Int\n\
+             f b =\n    0\n",
+        );
+        assert!(
+            imported.is_none(),
+            "a saturated imported union must resolve, got {imported:?}"
         );
     }
 

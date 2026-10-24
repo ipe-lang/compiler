@@ -673,6 +673,36 @@ impl BoundSet {
         self.0 == 0
     }
 
+    /// Whether every bound in this set holds for [`IrType::Json`] (`JsonVal`,
+    /// which is `Clone + PartialEq + Eq + Hash + Send + Sync + 'static` and
+    /// nothing more). An ordering, `Copy`, arithmetic, rendering, row or
+    /// bind-parameter bound does not.
+    #[must_use]
+    pub const fn met_by_json(self) -> bool {
+        let json_traits =
+            Self::CLONE | Self::EQ | Self::HASH | Self::STATIC | Self::SEND | Self::SYNC;
+        self.0 & !json_traits == 0
+    }
+
+    /// Whether every bound in this set holds for [`IrType::Unit`] (`()`, which
+    /// is `Clone + Copy + PartialEq + Eq + PartialOrd + Ord + Hash +
+    /// IpeStringify + Send + Sync + 'static`). An arithmetic, interpolation,
+    /// row or bind-parameter bound does not.
+    #[must_use]
+    pub const fn met_by_unit(self) -> bool {
+        let unit_traits = Self::CLONE
+            | Self::COPY
+            | Self::EQ
+            | Self::ORD
+            | Self::ORD_TOTAL
+            | Self::HASH
+            | Self::SHOW
+            | Self::STATIC
+            | Self::SEND
+            | Self::SYNC;
+        self.0 & !unit_traits == 0
+    }
+
     /// This set with the `::core::ops::Add<Output = Self>` (Number `+`) bound.
     #[must_use]
     pub const fn with_add(self) -> Self {
@@ -900,6 +930,195 @@ pub struct Func {
     pub params: Vec<crate::Param>,
     pub ret: IrType,
     pub body: Expr,
+}
+
+impl Func {
+    /// The type parameters some parameter type names. A call's arguments let
+    /// rustc infer each of them, so a pin on one renders only when it is
+    /// [`UserPin::Unit`] ([`UserPin::renders`]).
+    #[must_use]
+    pub fn generics_named_by_params(&self) -> BTreeSet<Symbol> {
+        let mut named: Vec<Symbol> = Vec::new();
+        for param in &self.params {
+            collect_generics(&param.ty, &mut named);
+        }
+        named.into_iter().collect()
+    }
+
+    /// The type parameters the return type names: a caller observes each of
+    /// them through the value the call returns.
+    #[must_use]
+    pub fn generics_named_by_ret(&self) -> BTreeSet<Symbol> {
+        let mut named: Vec<Symbol> = Vec::new();
+        collect_generics(&self.ret, &mut named);
+        named.into_iter().collect()
+    }
+
+    /// The type parameters a parameter of a closure the return type yields
+    /// names, along its arrow spine: a caller applying the returned closure
+    /// fixes each of them through the argument it passes.
+    #[must_use]
+    pub fn generics_named_by_ret_args(&self) -> BTreeSet<Symbol> {
+        let mut named: Vec<Symbol> = Vec::new();
+        let mut spine = &self.ret;
+        while let IrType::Fun(params, ret)
+        | IrType::SharedFun(params, ret)
+        | IrType::FnOnceChain(params, ret) = spine
+        {
+            for param in params {
+                collect_generics(param, &mut named);
+            }
+            spine = ret;
+        }
+        named.into_iter().collect()
+    }
+}
+
+/// Collect the distinct [`IrType::Generic`] symbols in `ty`, appending each (in
+/// first-occurrence order) to `out` if not already present.
+#[allow(clippy::too_many_lines)] // one exhaustive arm per IrType variant — the completeness is the point
+pub fn collect_generics(ty: &IrType, out: &mut Vec<Symbol>) {
+    match ty {
+        IrType::Generic(s) => {
+            if !out.contains(s) {
+                out.push(*s);
+            }
+        }
+        IrType::Tuple(elems) => {
+            for e in elems {
+                collect_generics(e, out);
+            }
+        }
+        IrType::Record(map) => {
+            for v in map.values() {
+                collect_generics(v, out);
+            }
+        }
+        IrType::Fun(params, ret)
+        | IrType::SharedFun(params, ret)
+        | IrType::FnOnceChain(params, ret) => {
+            for p in params {
+                collect_generics(p, out);
+            }
+            collect_generics(ret, out);
+        }
+        IrType::Enum { args, .. } => {
+            for a in args {
+                collect_generics(a, out);
+            }
+        }
+        IrType::Maybe(elem) | IrType::List(elem) => collect_generics(elem, out),
+        IrType::Result(err, ok) => {
+            collect_generics(err, out);
+            collect_generics(ok, out);
+        }
+        IrType::Dict(k, v) => {
+            collect_generics(k, out);
+            collect_generics(v, out);
+        }
+        IrType::Set(a) => collect_generics(a, out),
+        IrType::Decoder(inner) | IrType::Task(inner) | IrType::Cmd(inner) | IrType::Sub(inner) => {
+            collect_generics(inner, out);
+        }
+        IrType::Int
+        | IrType::Float
+        | IrType::Bool
+        | IrType::Str
+        | IrType::Char
+        | IrType::Unit
+        | IrType::Bytes
+        | IrType::Json
+        // `Db` is monomorphic — no generic parameters to collect.
+        | IrType::Db
+        // Opaque server types are monomorphic.
+        | IrType::ServerRequest
+        | IrType::ServerResponse
+        | IrType::ServerRoute
+        | IrType::ServerCookie
+        // `StreamWriter` is monomorphic — no generics to collect.
+        | IrType::StreamWriter
+        // `HttpRequest` is monomorphic — no generics to collect.
+        | IrType::HttpRequest
+        // `Regex` is a monomorphic opaque handle — no generics to collect.
+        | IrType::Regex
+        // `WsHandle` / `WsServerCfg` are monomorphic — no generics to collect.
+        | IrType::WebSocketServer
+        | IrType::WebSocketServerCfg
+        // nullary plain types and the opaque live request handle
+        // contribute no generics.
+        | IrType::UiPlain(_)
+        | IrType::WebReq
+        | IrType::SessionHandle
+        // `Order` is monomorphic — no generics to collect.
+        // `HttpMethod` is monomorphic — no generics to collect.
+        // `Decimal` is monomorphic — no generics to collect.
+        // `BackoffStrategy` is monomorphic — no generics to collect.
+        | IrType::BackoffStrategy
+        | IrType::Order
+        | IrType::HttpMethod
+        | IrType::Decimal
+        | IrType::ErrorKind
+        | IrType::Error
+        | IrType::ErrorDetails
+        // Nominal error-payload leaves (SEAL fix) — monomorphic
+        // runtime structs, same classification as `Error`/`ErrorDetails`.
+        | IrType::ErrorInfo
+        | IrType::PanicInfo
+        | IrType::TypeInfo
+        // `SqlFragment` is monomorphic — no generics to collect.
+        // `Secret` is monomorphic — no generics to collect.
+        | IrType::SqlFragment
+        | IrType::Secret
+        | IrType::Path
+        // `Url` is a monomorphic opaque wrapper — no generics to collect.
+        | IrType::Url
+        | IrType::UrlRelative
+        // `Dsn` is a monomorphic opaque wrapper — no generics to collect.
+        | IrType::Dsn
+        | IrType::DbLocation
+        | IrType::Connection
+        | IrType::ConnReadOnly
+        | IrType::ConnReadWrite
+        | IrType::Setting | IrType::ShapeWeb | IrType::ShapeWebView | IrType::ShapeTerminal
+        // Process-run-with cfg + Cache config / stats + Csv document are
+        // monomorphic — no generics to collect.
+        | IrType::ProcessRunWithCfg
+        | IrType::ProcessRunInPtyCfg
+        | IrType::CacheCfg
+        | IrType::WebSocketClientCfg
+        | IrType::CacheStats
+        | IrType::CsvDoc
+        // Ipe.Email records + provider ADT are monomorphic — no generics.
+        | IrType::EmailMessage
+        | IrType::EmailAttachment
+        | IrType::EmailSesConfig
+        | IrType::EmailSmtpConfig
+        | IrType::EmailProvider
+        // Typed security newtypes are monomorphic opaque wrappers — no generics.
+        | IrType::CryptoKey
+        | IrType::CryptoMac
+        | IrType::EmailAddress
+        // `Locale` is monomorphic — no generics to collect.
+        | IrType::Locale
+        // `Principal` is monomorphic — no generics to collect.
+        | IrType::Principal
+        // `AuthConfig` / `TokenSource` are monomorphic — no generics to collect.
+        | IrType::AuthConfig
+        | IrType::TokenSource
+        // Shape opaque app leaves — monomorphic, no generics to collect.
+        | IrType::WebApp | IrType::TuiApp | IrType::CliApp | IrType::WorkerApp
+        // A row variable is a separate row generic (`R{n}`), tracked in
+        // `Func::row_params`, never in the ordinary `T{n}` scope collected here.
+        | IrType::RowGeneric(_) => {}
+        // `WebRoute page` may carry generic parameters through `page`.
+        IrType::WebRoute(page) => collect_generics(page, out),
+        IrType::CustomElement { down, up } => {
+            collect_generics(down, out);
+            collect_generics(up, out);
+        }
+        // `Ui { ctor, msg }` may carry generic parameters through `msg`.
+        IrType::Ui { msg, .. } => collect_generics(msg, out),
+    }
 }
 
 /// A row variable's required-field contract — the single source of truth for
@@ -3305,19 +3524,83 @@ pub enum CallPin {
     /// error type — `::<IpeError>`. Used by `decimal_from_string<E: From<String>>`
     /// when the `Err` channel is discarded.
     ErrIpeError,
-    /// A USER generic function's type parameters, named by the callee
-    /// [`Func::type_params`] symbol, that occur only as UI message slots of its
-    /// signature and that this use leaves unconstrained — each pinned to `()`,
-    /// the type the use's own node type lowered that slot to. Every other
-    /// parameter renders `_`. Only a [`Callee::Func`] call carries it.
-    MsgUnit(BTreeSet<Symbol>),
+    /// A USER generic function's type parameters this use pins, keyed by the
+    /// callee [`Func::type_params`] symbol; every other parameter renders `_`.
+    /// Only a [`Callee::Func`] call carries it.
+    User(BTreeMap<Symbol, UserPin>),
+}
+
+/// How a use pins one type parameter of a user generic callee.
+#[derive(Clone, PartialEq, Eq, Debug, serde::Serialize, serde::Deserialize)]
+pub enum UserPin {
+    /// `()`: a message slot or `any` return this use leaves unconstrained,
+    /// the type the use's own node type lowered it to.
+    Unit,
+    /// The use's solved instantiation of a parameter its declared arguments
+    /// name, rendered when no emitted parameter of the callee names it (an
+    /// argument lowering erased it), so its return alone cannot leave rustc
+    /// without the type.
+    Instance(IrType),
+    /// An instantiation the use could not lower, holding the lowering's own
+    /// refusal: the backend returns it when the parameter must render, so the
+    /// reason is never replaced by a compiler bug.
+    ///
+    /// Never serialized: a program holding one does not enter the IR cache,
+    /// and a cached program never deserializes into one.
+    #[serde(skip)]
+    Unlowered(Box<Diagnostic>),
+    /// An instantiation this use leaves open, of a parameter the callee's
+    /// declared arguments name, holding the refusal for a callee whose
+    /// emitted return still names the parameter, and whether a program enum
+    /// parameter no field uses holds it ([`ArgumentErasure`]).
+    ///
+    /// Settled once the callee's emitted signature is final: dropped when an
+    /// emitted parameter, or a parameter of a closure the return yields,
+    /// names it (the argument the caller passes fixes it); `()` when no
+    /// emitted position does; when only the return otherwise does, the
+    /// refusal for [`ArgumentErasure::UnusedEnumParameter`] (the caller would
+    /// observe a type no argument fixes) and dropped for
+    /// [`ArgumentErasure::Other`], leaving the type to the call's context.
+    /// Never reaches the backend.
+    #[serde(skip)]
+    Open(Box<Diagnostic>, ArgumentErasure),
+}
+
+/// Why the emitted parameters of a callee may not name a type parameter one
+/// of its declared arguments names, as the lowering that drops the argument
+/// decides it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ArgumentErasure {
+    /// A parameter of a program enum that no field uses holds the variable:
+    /// lowering erases that parameter from the declaration and every
+    /// application, since the declaration keeping it is refused by rustc
+    /// (E0392) whatever any call site supplies.
+    UnusedEnumParameter,
+    /// Any other position: an opaque carrier's dropped argument (`Cache k v`,
+    /// a store row type), a builtin's erased marker, or an emitted position.
+    Other,
+}
+
+impl UserPin {
+    /// Whether a call renders this pin for a callee type parameter, given
+    /// whether some callee parameter type names it
+    /// ([`Func::generics_named_by_params`]): the one rule the backend renders
+    /// by and the lowerer prunes by, so an unrendered pin never reaches the
+    /// type-mention walkers.
+    #[must_use]
+    pub const fn renders(&self, named_by_params: bool) -> bool {
+        match self {
+            Self::Unit => true,
+            Self::Instance(_) | Self::Unlowered(_) | Self::Open(..) => !named_by_params,
+        }
+    }
 }
 
 impl CallPin {
     /// The turbofish suffix this pin renders immediately after a kernel's name
     /// (before its `(` argument list): `dict_empty::<String, i64>(…)`, etc.
     /// [`Self::None`] renders the empty string, so an unpinned call emits no
-    /// turbofish. [`Self::MsgUnit`] has no fixed suffix — its rendering needs
+    /// turbofish. [`Self::User`] has no fixed suffix — its rendering needs
     /// the callee's generic layout — so it is `None`.
     ///
     /// The concrete default types (`i64` / `String` / `IpeError`) mirror the
@@ -3334,8 +3617,25 @@ impl CallPin {
             Self::DefaultDict => Some("::<String, i64>"),
             Self::DefaultResultMapErr => Some("::<_, _, i64>"),
             Self::ErrIpeError => Some("::<IpeError>"),
-            Self::MsgUnit(_) => None,
+            Self::User(_) => None,
         }
+    }
+
+    /// Every type this pin may render, the one source the type-mention walkers
+    /// read so a pinned type keeps its definitions and features alive.
+    pub fn pinned_types(&self) -> impl Iterator<Item = &IrType> {
+        let pins = match self {
+            Self::User(pins) => Some(pins.values()),
+            Self::None
+            | Self::DefaultI64
+            | Self::DefaultDict
+            | Self::DefaultResultMapErr
+            | Self::ErrIpeError => None,
+        };
+        pins.into_iter().flatten().filter_map(|pin| match pin {
+            UserPin::Instance(ty) => Some(ty),
+            UserPin::Unit | UserPin::Unlowered(_) | UserPin::Open(..) => None,
+        })
     }
 }
 

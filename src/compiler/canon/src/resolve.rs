@@ -141,14 +141,14 @@ pub fn is_user_type_declaration_forbidden(name: &str) -> bool {
 
 /// Fixed type-argument arity for empty-home builtins, or `None`.
 ///
-/// Drives the IPE-N0031 canon gate: a mis-arity application would otherwise
+/// Feeds the IPE-N0031 canon gate: a mis-arity application would otherwise
 /// fall through to the lowerer's empty-home ICE catch-all (IPE-I0001). The
 /// arity is the row's [`BuiltinRow::fixed_arity`] column, which the kernels
 /// table proves reserved, so a fixed-arity head can never be user-shadowed.
 ///
 /// `Task`/`Cmd`/`Sub` carry no arity here (their gate is in
-/// `ipe_types::constrain`); `CustomElement` carries none either (its
-/// name-based gate is fused with its boundary SEAL).
+/// `ipe_types::constrain`); `CustomElement` carries none either (the gate
+/// checks it by name under any home).
 #[must_use]
 pub fn builtin_empty_home_arity(name: Option<&str>) -> Option<usize> {
     bare_builtin(name?)?.fixed_arity().map(usize::from)
@@ -4375,6 +4375,13 @@ fn inject_dep_exports(
     interner: &mut Interner,
 ) -> DResult<()> {
     let dep_path = &dep.path;
+    // A qualified use (`Dep.Widget`) names a union the clause may not expose,
+    // so every exported union's arity is recorded.
+    for (&type_name, exported) in &dep.types {
+        if let crate::ExportedType::Union { home, params } = exported {
+            Rc::make_mut(&mut env.union_params).declare(home, type_name, *params);
+        }
+    }
 
     match &import.exposing.value {
         src::Exposing::All => {
@@ -4382,11 +4389,11 @@ fn inject_dep_exports(
             for &name in &dep.values {
                 bind_dep_value(dep, name, Tier::Open, span, env, interner)?;
             }
-            for (&type_name, home) in &dep.types {
+            for (&type_name, exported) in &dep.types {
                 bind_dep_union(
                     dep,
                     type_name,
-                    home,
+                    exported.home(),
                     &CtorFilter::All,
                     Tier::Open,
                     span,
@@ -4426,7 +4433,7 @@ fn inject_dep_exports(
                         bind_dep_value(dep, *name, Tier::Explicit, item.span, env, interner)?;
                     }
                     src::Exposed::Type(type_name, privacy) => {
-                        let union_home = dep.types.get(type_name);
+                        let union_home = dep.types.get(type_name).map(crate::ExportedType::home);
                         let alias = dep.aliases.get(type_name);
                         if union_home.is_none() && alias.is_none() {
                             let name_s = name_str(interner, *type_name)?;
@@ -4596,13 +4603,21 @@ fn build_module_exports(
 
     // Sets of names defined by THIS module (not imported from deps).
     let own_values: BTreeSet<Symbol> = m.values.iter().map(|v| v.value.name.value).collect();
-    let own_types: BTreeSet<Symbol> = m.unions.iter().map(|u| u.value.name.value).collect();
+    let own_types: BTreeMap<Symbol, usize> = m
+        .unions
+        .iter()
+        .map(|u| (u.value.name.value, u.value.vars.len()))
+        .collect();
+    let own_union = |params: usize| crate::ExportedType::Union {
+        home: home.to_owned(),
+        params,
+    };
 
     match &m.exposing.value {
         src::Exposing::All => {
             exports.values = own_values;
-            for &type_name in &own_types {
-                exports.types.insert(type_name, home.to_owned());
+            for (&type_name, &params) in &own_types {
+                exports.types.insert(type_name, own_union(params));
                 for ctor_home in local_ctors(env) {
                     if ctor_home.type_name == type_name {
                         exports.ctors.insert(ctor_home.name, ctor_home.clone());
@@ -4632,8 +4647,8 @@ fn build_module_exports(
                         }
                     }
                     src::Exposed::Type(type_name, privacy) => {
-                        if own_types.contains(type_name) {
-                            exports.types.insert(*type_name, home.to_owned());
+                        if let Some(&params) = own_types.get(type_name) {
+                            exports.types.insert(*type_name, own_union(params));
                             let filter = exposed_ctor_filter(privacy);
                             if !matches!(filter, CtorFilter::None) {
                                 for ctor_home in local_ctors(env) {
@@ -4657,7 +4672,10 @@ fn build_module_exports(
                             // constructors (a builtin carrier has none at source).
                             let builtin_home =
                                 reexported_builtin_type_home(resolved, home, interner);
-                            exports.types.insert(*type_name, builtin_home);
+                            exports.types.insert(
+                                *type_name,
+                                crate::ExportedType::Builtin { home: builtin_home },
+                            );
                         } else if let Some(resolved) = own_aliases.get(type_name) {
                             exports.aliases.insert(*type_name, resolved.clone());
                             // Exposing a record alias also exposes its
@@ -4787,6 +4805,7 @@ fn register_union(
     interner: &Interner,
 ) -> DResult<()> {
     let type_name = u.name.value;
+    Rc::make_mut(&mut env.union_params).declare(home, type_name, u.vars.len());
     for (index, c) in u.ctors.iter().enumerate() {
         let name = c.value.name;
         let ctor = CtorHome {
@@ -6642,8 +6661,9 @@ fn is_wildcard_spelling(v: Symbol, interner: &Interner) -> bool {
 ///
 /// # Errors
 /// [`Diagnostic::Name`] ([`NameError::AliasArity`]) when an alias is applied to a
-/// number of type arguments that differs from its declared parameter count; the
-/// span is the enclosing annotation (the type AST carries no inner spans).
+/// number of type arguments that differs from its declared parameter count, and
+/// [`NameError::TypeArity`] when a union or fixed-arity builtin is; the span is
+/// the enclosing annotation (the type AST carries no inner spans).
 /// [`NameError::DuplicateValue`] when a record type repeats a label, at the
 /// repeated label; [`NameError::AliasRowArgument`] when an alias's row argument
 /// cannot extend its record.
@@ -7081,23 +7101,14 @@ fn canonicalise_type(
                     args,
                 });
             }
-            // A fixed-arity built-in that resolves to the empty-home sentinel
-            // (a closed container, or `Ipe.Db`'s `Connection mode` handle and
-            // its nullary `ReadOnly`/`ReadWrite` markers) has an exact-`args.len()`
-            // lowerer arm: a mis-application (`Maybe List String` parsed as
-            // `Maybe` over two args, a bare `List`, `Dict String`, `Connection`,
-            // `Connection a b`) would otherwise reach the lowerer's
-            // `ir_type_from_canon` empty-home catch-all and ICE (IPE-I0001).
-            // Fail closed here with a clean IPE-N0031, the sibling of
-            // `AliasArity` for the closed table. Gating on the empty home keeps a
-            // user `type List a b` (which wins by its real home) unaffected.
-            if home.is_empty()
-                && let Some(expected) = builtin_empty_home_arity(ctx.interner.resolve(name))
+            // Every type constructor with a fixed arity is applied to exactly
+            // that many arguments (IPE-N0031); see [`fixed_type_arity`].
+            if let Some(expected) = fixed_type_arity(&home, name, ctx)
                 && can_args.len() != expected
             {
                 return Err(Diagnostic::Name {
                     span: ctx.ann_span,
-                    msg: NameError::BuiltinTypeArity {
+                    msg: NameError::TypeArity {
                         name: name_str(ctx.interner, name)?,
                         expected,
                         found: can_args.len(),
@@ -7113,10 +7124,8 @@ fn canonicalise_type(
             // DEFINITION of the name is already rejected earlier (IPE-N0026).
             //
             //   (a) ARITY: exactly two type arguments — the sealed down-state and
-            //       the up-event. A mis-arity is a clean IPE-N0031, the same code
-            //       the closed builtin containers use; a dedicated NAME-based check
-            //       (not `builtin_container_arity`, which gates on the empty-home
-            //       sentinel) so the qualified spelling is gated too.
+            //       the up-event, refused above by [`fixed_type_arity`] on the
+            //       NAME, so the qualified spelling is gated too.
             //   (b) SEAL: each of the two parameters must be a plain, closed,
             //       concrete value type (§2.1). A function, an effect carrier, a
             //       view value, a `Secret`/reserved-sink type, an open row, or a
@@ -7126,16 +7135,6 @@ fn canonicalise_type(
             // On passing both, the type resolves to a `Con` with the empty-home
             // sentinel and lowers to the opaque widget handle.
             if ctx.interner.resolve(name) == Some("CustomElement") {
-                if can_args.len() != 2 {
-                    return Err(Diagnostic::Name {
-                        span: ctx.ann_span,
-                        msg: NameError::BuiltinTypeArity {
-                            name: name_str(ctx.interner, name)?,
-                            expected: 2,
-                            found: can_args.len(),
-                        },
-                    });
-                }
                 for arg in &can_args {
                     if let Some(reason) = boundary_seal_rejection(arg, ctx.interner) {
                         return Err(Diagnostic::Name {
@@ -7183,6 +7182,30 @@ fn canonicalise_type(
             })
         }
     }
+}
+
+/// The type-argument count the type constructor `name` at `home` takes, when
+/// it is fixed.
+///
+/// One rule for every non-alias head: a declared union takes its declared
+/// parameters (an over- or under-application has no emitted Rust spelling,
+/// E0107); `CustomElement` takes its down-state and up-event under any home;
+/// an empty-home builtin takes its [`builtin_empty_home_arity`] (a mis-arity
+/// would reach the lowerer's empty-home catch-all, IPE-I0001). `None` for a
+/// head the lowerer arity-fills (`Html`, `Attribute`) or whose gate lives in
+/// inference (`Task`, `Cmd`, `Sub`). An alias is checked where it expands.
+fn fixed_type_arity(home: &[Symbol], name: Symbol, ctx: &TypeCtx) -> Option<usize> {
+    if let Some(params) = ctx.env.union_params.of(home, name) {
+        return Some(params);
+    }
+    let spelled = ctx.interner.resolve(name);
+    if spelled == Some("CustomElement") {
+        return Some(2);
+    }
+    if home.is_empty() {
+        return builtin_empty_home_arity(spelled);
+    }
+    None
 }
 
 /// The reserved builtin a terminal engine's `Attribute` resolves to:
@@ -9471,9 +9494,15 @@ mod html_qualifier_type_home_tests {
         let attribute = sym(i, "Attribute");
         let html_home = vec![sym(i, "Html")];
 
-        let mut types: BTreeMap<Symbol, Vec<Symbol>> = BTreeMap::new();
-        types.insert(link_target, dep_path.to_vec());
-        types.insert(attribute, html_home);
+        let mut types: BTreeMap<Symbol, crate::ExportedType> = BTreeMap::new();
+        types.insert(
+            link_target,
+            crate::ExportedType::Union {
+                home: dep_path.to_vec(),
+                params: 0,
+            },
+        );
+        types.insert(attribute, crate::ExportedType::Builtin { home: html_home });
 
         let mut ctors: BTreeMap<Symbol, CtorHome> = BTreeMap::new();
         ctors.insert(

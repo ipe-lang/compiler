@@ -14,6 +14,7 @@
 pub mod borrow;
 mod carrier;
 mod enum_facts;
+mod enum_params;
 pub mod free_vars;
 mod held;
 mod ir;
@@ -31,18 +32,19 @@ pub use enum_facts::{
     EnumTraits, FfiUnion, RuntimeBridgedEnum, STORE_ROW_PHANTOM_UNIONS, home_is_ffi_interface,
     is_store_row_phantom_union, payload_leaf_is_clone,
 };
+pub use enum_params::EnumParamUse;
 pub use held::{
     EnumPayloadTable, MAX_HELD_WALK_DEPTH, Reach, enum_payload_holds, enum_payload_table,
     ir_type_holds, ir_type_reaches,
 };
 pub use ir::{
-    Arm, BinOp, BoundSet, CallPin, Callee, Carried, CarrierLeaf, EnumDef, EvalOrder, Expr, Func,
-    FuncId, HtmlEventShape, IrType, KernelClass, KernelFn, Match, ModPath, Module, OnFormKind, Pat,
-    Program, RowParam, RuntimeFeatureId, RuntimeModule, SharedAlts, SliceOwnership, TypeDef,
-    UiCtor, UiPlain, Variant, carrier_is_clone, carrier_is_clone_bounded, carrier_leaf,
-    fun_value_arc_promotable, head_alternatives, ir_type_feature_requirement,
-    ir_type_has_effect_carrier, ir_type_is_derivable, ir_type_is_serde, is_dispatch_free,
-    is_irrefutable,
+    ArgumentErasure, Arm, BinOp, BoundSet, CallPin, Callee, Carried, CarrierLeaf, EnumDef,
+    EvalOrder, Expr, Func, FuncId, HtmlEventShape, IrType, KernelClass, KernelFn, Match, ModPath,
+    Module, OnFormKind, Pat, Program, RowParam, RuntimeFeatureId, RuntimeModule, SharedAlts,
+    SliceOwnership, TypeDef, UiCtor, UiPlain, UserPin, Variant, carrier_is_clone,
+    carrier_is_clone_bounded, carrier_leaf, collect_generics, fun_value_arc_promotable,
+    head_alternatives, ir_type_feature_requirement, ir_type_has_effect_carrier,
+    ir_type_is_derivable, ir_type_is_serde, is_dispatch_free, is_irrefutable,
 };
 pub use pairing::{PairedChildren, paired_children};
 pub use pretty::{MAX_IR_RENDER_DEPTH, pretty};

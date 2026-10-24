@@ -32,7 +32,7 @@ use crate::code::{
     IPE_P0067, IPE_P0068, IPE_P0069, IPE_P0070, IPE_P0071, IPE_P0072, IPE_P0073, IPE_S0001,
     IPE_S0002, IPE_S0003, IPE_S0004, IPE_T0001, IPE_T0002, IPE_T0003, IPE_T0004, IPE_T0010,
     IPE_T0011, IPE_T0012, IPE_T0013, IPE_T0014, IPE_T0015, IPE_T0016, IPE_T0017, IPE_T0018,
-    IPE_T0019, IPE_T0020, IPE_T0021, IPE_T0022, IPE_T0023, Severity,
+    IPE_T0019, IPE_T0020, IPE_T0021, IPE_T0022, IPE_T0023, IPE_T0024, Severity,
 };
 use crate::span::Span;
 use crate::suggest::{Confidence, Hit};
@@ -647,9 +647,11 @@ pub enum NameError {
     /// 2); an under- or over-application is caught at name resolution, ahead of
     /// the lowerer's `ir_type_from_canon` — where a mis-arity builtin would
     /// otherwise reach the empty-home catch-all and ICE (IPE-I0001). The
-    /// sibling of `AliasArity` for the closed builtin-container table.
-    /// [IPE-N0031]
-    BuiltinTypeArity {
+    /// sibling of `AliasArity` for every non-alias type constructor with a
+    /// fixed arity: the closed builtin table, `CustomElement`, and each declared
+    /// union (`X Int Int` or a bare `X` for `type X a`, which no emitted Rust
+    /// type can spell). [IPE-N0031]
+    TypeArity {
         name: Box<str>,
         expected: usize,
         found: usize,
@@ -1245,9 +1247,26 @@ pub enum TypeError {
     TypeTooDeep { depth: u16, limit: u16 },
     /// A type unfolds to more nodes than the checker's size ceiling. [IPE-T0023]
     ///
-    /// `limit` is the node ceiling. The type itself is never carried: printing
-    /// it would unfold every one of those nodes.
-    TypeTooLarge { limit: u64 },
+    /// `limit` is the node ceiling and `origin` what built the type. The type
+    /// itself is never carried: printing it would unfold every one of those
+    /// nodes.
+    TypeTooLarge { limit: u64, origin: TypeSizeOrigin },
+    /// A custom type reaches itself with one of its parameters wrapped in a
+    /// larger type, so its uses nest without bound. [IPE-T0024]
+    ///
+    /// `union` names the custom type refused and `param` the parameter that
+    /// grows on the way around the cycle.
+    ExpansiveRecursion { union: Box<str>, param: Box<str> },
+}
+
+/// What built a type past the size ceiling, under [`TypeError::TypeTooLarge`].
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum TypeSizeOrigin {
+    /// A value's inferred type.
+    Value,
+    /// A custom type's constructor instantiating a type of its own recursive
+    /// group with larger arguments.
+    Declaration,
 }
 
 /// Why a wildcard `any` parameter has no independent lowering, under
@@ -1873,6 +1892,21 @@ pub enum LowerError {
         /// The generic binding whose type variable it borrows (e.g. `row`).
         owner: Box<str>,
         /// The owner's type variable (e.g. `msg`).
+        var: Box<str>,
+    },
+    /// A call leaves open a type variable only the callee's arguments name,
+    /// and the callee's generated function still returns it.
+    ///
+    /// The callee's generated function drops the arguments that name `var`
+    /// (a parameter of a program union no constructor holds), so no argument
+    /// it takes fixes `var`, while its result still mentions it: the caller
+    /// would observe a type nothing at the call decides. Refused fail-closed at `ipe` time;
+    /// the fix is a type annotation that fixes the variable at the call.
+    /// [IPE-L0102]
+    UninferableErasedParameter {
+        /// The called function (e.g. `empties`).
+        callee: Box<str>,
+        /// The callee's type variable (e.g. `a`).
         var: Box<str>,
     },
 }
@@ -2609,7 +2643,8 @@ impl Diagnostic {
                 | TypeError::WebViewReturnsHtml
                 | TypeError::WildcardNotIndependent { .. }
                 | TypeError::TypeTooDeep { .. }
-                | TypeError::TypeTooLarge { .. } => Severity::Error,
+                | TypeError::TypeTooLarge { .. }
+                | TypeError::ExpansiveRecursion { .. } => Severity::Error,
             },
             Self::CompilerBug { .. } => Severity::Bug,
         }
@@ -2822,7 +2857,7 @@ const fn name_code(msg: &NameError) -> Code {
         NameError::UnknownKernelAlias { .. } => IPE_N0028,
         NameError::ServerOnlyKernelForWasm { .. } => IPE_N0029,
         NameError::ServerModuleReachableFromWasmClient { .. } => IPE_N0030,
-        NameError::BuiltinTypeArity { .. } => IPE_N0031,
+        NameError::TypeArity { .. } => IPE_N0031,
         NameError::TypeExpansionTooDeep { .. } => IPE_N0032,
         NameError::ProgramImportsTeaShape { .. } => IPE_N0033,
         NameError::WrongShapeCmdSub(..) | NameError::TwoShapeImports { .. } => IPE_N0035,
@@ -2866,6 +2901,7 @@ const fn type_code(msg: &TypeError) -> Code {
         TypeError::WildcardNotIndependent { .. } => IPE_T0021,
         TypeError::TypeTooDeep { .. } => IPE_T0022,
         TypeError::TypeTooLarge { .. } => IPE_T0023,
+        TypeError::ExpansiveRecursion { .. } => IPE_T0024,
     })
 }
 
@@ -2904,7 +2940,9 @@ const fn lower_code(msg: &LowerError) -> Code {
         LowerError::PointFreeAccessorKernel { .. }
         | LowerError::AccessorKernelOffIntercept { .. } => IPE_L0146,
         LowerError::UnsaturatedHandlerKernel { .. } => IPE_L0152,
-        LowerError::ForeignTypeVariable { .. } => IPE_L0102,
+        LowerError::ForeignTypeVariable { .. } | LowerError::UninferableErasedParameter { .. } => {
+            IPE_L0102
+        }
         LowerError::StoreSelectProjectionInvalid(_) => IPE_L0149,
     })
 }
@@ -3056,7 +3094,7 @@ fn name_help(msg: &NameError) -> Vec<HelpLine> {
         )],
         NameError::Unknown
         | NameError::AliasArity { .. }
-        | NameError::BuiltinTypeArity { .. }
+        | NameError::TypeArity { .. }
         | NameError::ImportCycle { .. }
         | NameError::ModulePathMismatch { .. }
         | NameError::AmbiguousImport { .. }
@@ -3135,14 +3173,36 @@ fn type_help(msg: &TypeError) -> Vec<HelpLine> {
         )],
         TypeError::TypeTooDeep { .. } => vec![HelpLine::Note(
             "each binding whose value wraps the one before it adds a level to its \
-             type. Give an intermediate level a named type (a `type alias` or a \
-             custom type), or restructure the chain so no value nests this deep."
+             type, and each custom type adds a level over the types its \
+             constructors hold. Keep a long sequence in a `List` or a recursive \
+             custom type, whose depth does not grow with its length, or \
+             restructure the chain so no value nests this deep."
                 .into(),
         )],
-        TypeError::TypeTooLarge { .. } => vec![HelpLine::Note(
+        TypeError::ExpansiveRecursion { .. } => vec![HelpLine::Note(
+            "a custom type may refer to itself only with its parameters as they \
+             are (`List a` inside `type List a`). Hold the growing part in a \
+             field of its own type instead, such as a `List` of the values one \
+             level down."
+                .into(),
+        )],
+        TypeError::TypeTooLarge {
+            origin: TypeSizeOrigin::Value,
+            ..
+        } => vec![HelpLine::Note(
             "a value that holds the same value twice doubles its type each time. \
              Name the repeated part with its own custom type, or build the \
              structure from a list instead of nested pairs."
+                .into(),
+        )],
+        TypeError::TypeTooLarge {
+            origin: TypeSizeOrigin::Declaration,
+            ..
+        } => vec![HelpLine::Note(
+            "a custom type that refers to itself with larger arguments builds a \
+             larger type at each level, however shallow. Pass its parameters on \
+             as they are, or hold the growing part in a field of its own type, \
+             such as a `List`."
                 .into(),
         )],
         TypeError::WildcardNotIndependent { .. } => vec![HelpLine::Note(
@@ -3415,6 +3475,9 @@ fn lower_help(msg: &LowerError) -> Vec<HelpLine> {
         LowerError::ForeignTypeVariable { helper, owner, var } => {
             foreign_type_variable_help(helper, owner, var)
         }
+        LowerError::UninferableErasedParameter { callee, var } => {
+            uninferable_erased_parameter_help(callee, var)
+        }
         LowerError::StoreSelectProjectionInvalid(defect) => {
             store_select_projection_invalid_help(defect)
         }
@@ -3527,6 +3590,22 @@ fn foreign_type_variable_help(helper: &str, owner: &str, var: &str) -> Vec<HelpL
                 "give `{helper}` its own type annotation, generic over its own type \
                  variable; it is used inside `{owner}`, whose type variable `{var}` it \
                  would otherwise borrow without being generic over it"
+            )
+            .into_boxed_str(),
+        ),
+        HelpLine::SeeExplain("IPE-L0102"),
+    ]
+}
+
+/// The help lines for [`LowerError::UninferableErasedParameter`], factored
+/// out so [`lower_help`] stays a thin per-variant dispatcher.
+fn uninferable_erased_parameter_help(callee: &str, var: &str) -> Vec<HelpLine> {
+    vec![
+        HelpLine::Note(
+            format!(
+                "fix `{var}` at this call: pass `{callee}` an argument whose type names \
+                 `{var}` concretely (`Tag Int`, not `Tag a`), or annotate the binding \
+                 that holds the result with a concrete type"
             )
             .into_boxed_str(),
         ),

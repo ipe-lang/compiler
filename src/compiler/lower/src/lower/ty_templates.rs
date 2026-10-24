@@ -2,7 +2,7 @@
 //! contains a variable or function, breaks `Clone`, covers a template, or
 //! carries a given record-key set, plus signature-template matching.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use ipe_canon::ast as canon;
 use ipe_intern::{Interner, Symbol};
@@ -378,4 +378,32 @@ pub(super) fn match_signature_template(
             }
         }
     }
+}
+
+/// The type variables, as raws, an argument of the declared type `ty` names:
+/// every argument on its spine, past whatever arity the callee emits, and not
+/// the return.
+pub(super) fn argument_vars(ty: &Ty) -> BTreeSet<u32> {
+    let mut vars = BTreeSet::new();
+    let mut stack: Vec<&Ty> = Vec::new();
+    let mut spine = ty;
+    while let Ty::Fun(arg, rest) = spine {
+        stack.push(arg);
+        spine = rest;
+    }
+    while let Some(t) = stack.pop() {
+        match t {
+            Ty::Var(raw) => {
+                vars.insert(*raw);
+            }
+            Ty::Fun(a, b) => {
+                stack.push(a);
+                stack.push(b);
+            }
+            Ty::Con { args, .. } | Ty::Tuple(args) => stack.extend(args),
+            Ty::Record(fields, _) => stack.extend(fields.values()),
+            Ty::Wildcard | Ty::Unit => {}
+        }
+    }
+    vars
 }

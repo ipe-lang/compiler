@@ -28,6 +28,7 @@
 mod constrain;
 mod doc;
 mod exhaust;
+mod expansive;
 mod homed;
 mod pairing;
 mod solve;
@@ -736,6 +737,11 @@ fn infer_core(
     // closed (the payload is invisible in a `Ty::Con's applied type
     // arguments; see [`EnumEmbeds`]).
     let enum_embeds = EnumEmbeds::of(interner, &m.unions, &dep_unions);
+    // Every declaration and top-level annotation is measured before inference:
+    // a custom type on an expanding cycle, or one past the depth ceiling, is
+    // refused where it is declared, used or not, and the level each declared
+    // type renders to is what the solved types are measured with below.
+    let nominal_levels = expansive::check_declarations(interner, budget, m, &dep_unions)?;
     let generated = match scoped {
         None => Builder::run(&mut uf, interner, m)?,
         Some(ctx) => {
@@ -842,7 +848,7 @@ fn infer_core(
     // Every solved type is measured first: a type past the depth or size
     // ceiling is refused at the span that built it, so no read-back below, no
     // downstream walker and no rustc build meets it.
-    measure_type_depth(&mut uf, budget, &generated)?;
+    measure_type_depth(&mut uf, budget, &nominal_levels, &generated)?;
     let mut regions_for_exhaust: BTreeMap<(Vec<Symbol>, Span), Ty> = BTreeMap::new();
     for ((home, span), var) in &generated.regions {
         regions_for_exhaust.insert((home.clone(), *span), lift!(zonk(&mut uf, budget, *var)));
@@ -1692,27 +1698,6 @@ type SchemeAppVars<'a> = BTreeMap<(Vec<Symbol>, Symbol), Vec<&'a BTreeMap<u32, V
 /// The UI type constructors whose single argument is a message slot: a type
 /// variable there is phantom in the value it types.
 pub const UI_MSG_CARRIERS: [&str; 4] = ["Html", "Element", "Attribute", "Event"];
-
-/// The interned [`UI_MSG_CARRIERS`]. A carrier name never interned names no
-/// type in this build, so it is absent rather than minted.
-#[must_use]
-pub fn ui_msg_carrier_syms(interner: &Interner) -> BTreeSet<Symbol> {
-    UI_MSG_CARRIERS
-        .into_iter()
-        .filter_map(|n| interner.lookup(n))
-        .collect()
-}
-
-/// The type variables of `ty` that occur ONLY as a UI message slot (inside a
-/// [`UI_MSG_CARRIERS`] constructor's argument) and nowhere else, each as the
-/// raw it carries in `ty`.
-#[must_use]
-pub fn ui_msg_only_vars(ty: &Ty, carriers: &BTreeSet<Symbol>) -> BTreeSet<u32> {
-    let mut ui = BTreeSet::new();
-    let mut other = BTreeSet::new();
-    collect_ui_msg_and_other_vars(ty, carriers, false, &mut ui, &mut other);
-    ui.difference(&other).map(|s| s.as_raw()).collect()
-}
 
 /// Classify each annotation type variable of `ty` as either a **UI message
 /// slot** variable (it appears as the argument of a `Html` / `Element` /

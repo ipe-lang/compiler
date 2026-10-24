@@ -29,11 +29,11 @@ use ipe_ir::free_vars::{
 use ipe_ir::let_inline::{inlined_let_body, let_value_is_inlined};
 use ipe_ir::once_closure::{CaptureScope, ClosureKind};
 use ipe_ir::{
-    AppSurface, Arm, BinOp, BoundSet, CallPin, Callee, Capability, EnumDef, EnumPayloadTable, Expr,
-    Func, FuncId, IrType, KernelFn, Match, ModPath, Module, OnFormKind, Pat, Program, RowParam,
-    RuntimeModule, SharedAlts, SliceOwnership, TypeDef, UiCtor, UiPlain, Variant,
-    fun_value_arc_promotable, ir_type_has_effect_carrier, ir_type_holds, ir_type_is_serde,
-    is_dispatch_free, is_irrefutable,
+    AppSurface, ArgumentErasure, Arm, BinOp, BoundSet, CallPin, Callee, Capability, EnumDef,
+    EnumPayloadTable, Expr, Func, FuncId, IrType, KernelFn, Match, ModPath, Module, OnFormKind,
+    Pat, Program, RowParam, RuntimeModule, SharedAlts, SliceOwnership, TypeDef, UiCtor, UiPlain,
+    UserPin, Variant, fun_value_arc_promotable, ir_type_has_effect_carrier, ir_type_holds,
+    ir_type_is_serde, is_dispatch_free, is_irrefutable,
 };
 use ipe_kernels::FnSlotCarrier;
 use ipe_types::{
@@ -46,6 +46,8 @@ mod generic_syms;
 mod ir_type_mentions;
 mod record_shapes;
 mod ty_templates;
+mod ui_msg_slots;
+mod user_pins;
 
 use capture_rewrite::force_shared_capture_clones;
 use clone_class::CaptureWalk;
@@ -55,7 +57,7 @@ use clone_class::{
     reject_nonclone_value_reuse, rewrite_captured_clones, rewrite_multiuse_clones,
     slice_element_alias_refusal, slice_ownership,
 };
-use generic_syms::{collect_ir_generic_syms, default_generics_to_unit};
+use generic_syms::{default_generics_to_unit, signature_generics};
 #[cfg(test)]
 use ir_type_mentions::expr_type_mentions;
 use ir_type_mentions::{
@@ -78,10 +80,11 @@ use record_shapes::{
     is_websocket_cfg_shape, ty_is_int,
 };
 use ty_templates::{
-    GroundTy, canon_type_contains_record_key_set, generic_binding_breaks_clone,
+    GroundTy, argument_vars, canon_type_contains_record_key_set, generic_binding_breaks_clone,
     match_signature_template, ty_contains_fun, ty_contains_record_key_set, ty_fields_mention_var,
     ty_has_fun_in_derive_carrier,
 };
+use ui_msg_slots::OpenVarUse;
 
 /// One lowered function parameter: its (possibly synthetic) binder name and its
 /// IR type.
@@ -95,8 +98,8 @@ type IrArrow = (Vec<IrType>, IrType);
 /// at the top of the function body (`let <Pat> = <synthetic>`).
 type ParamPrologue = (Symbol, Pat);
 
-/// An unannotated function's lowered parameters, return type, and body.
-type UnannotatedFnParts = (Vec<IrParam>, IrType, Expr);
+/// An unannotated function's lowered parameters, return type, signature generics, and body.
+type UnannotatedFnParts = (Vec<IrParam>, IrType, BTreeSet<Symbol>, Expr);
 
 /// A used binder's type as the ownership disciplines see it.
 ///
@@ -9935,7 +9938,31 @@ fn collect_node_head_type_refs(
                 }
             }
             Expr::Record { ty: Some(t), .. } => slot(t),
-            _ => {}
+            Expr::Call { pin, .. } => pin.pinned_types().for_each(&slot),
+            Expr::Record { ty: None, .. }
+            | Expr::Int(_)
+            | Expr::Bool(_)
+            | Expr::Float(_)
+            | Expr::Str(_)
+            | Expr::CustomElementRef { .. }
+            | Expr::Char(_)
+            | Expr::Unit
+            | Expr::Var(_)
+            | Expr::CloneVar(_)
+            | Expr::Ctor { .. }
+            | Expr::BinOp { .. }
+            | Expr::Let { .. }
+            | Expr::Destructure { .. }
+            | Expr::If { .. }
+            | Expr::Match(_)
+            | Expr::Tuple(_)
+            | Expr::Cons { .. }
+            | Expr::ListIndexClone { .. }
+            | Expr::ListLenCheck { .. }
+            | Expr::Update { .. }
+            | Expr::Apply { .. }
+            | Expr::TaskSeq { .. }
+            | Expr::TailRecur { .. } => {}
         }
     }
     if let Expr::Ctor { home, ty, .. } = expr {
@@ -10777,6 +10804,20 @@ enum ArithKind {
     Add,
     Sub,
     Mul,
+}
+
+/// What lowering does with one type argument of a program union application
+/// ([`Lowerer::type_arg_fates`]).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum TypeArgFate {
+    /// The emitted enum keeps it.
+    Kept,
+    /// The union is backed by a non-generic carrier that drops every
+    /// argument (`Cache k v`, a store-row-phantom union).
+    OpaqueCarrier,
+    /// No field of the union uses the parameter, so lowering erases it from
+    /// the declaration and every application.
+    UnusedEnumParameter,
 }
 
 /// One operand of a `Store.coalesce` binary expression: either a direct
@@ -11629,6 +11670,12 @@ pub struct Lowerer<'a> {
     /// enum holds — the same table shape the backend's enum-`Clone` fixpoint
     /// reads, so both stages agree on which enums are `Clone`.
     enum_payloads: EnumPayloadTable,
+    /// Which type parameters of the program's enums a field uses.
+    ///
+    /// Filled once every union is lowered, before any def body: an unused
+    /// parameter is erased from the declaration and from every application,
+    /// so no emitted enum declares a parameter rustc refuses (E0392).
+    enum_param_use: ipe_ir::EnumParamUse,
     /// The constructors of those transparent unions, keyed `(home, ctor)` —
     /// the one `Rust.*` constructor set a user program may legitimately
     /// construct and match.
@@ -11820,6 +11867,9 @@ pub struct Lowerer<'a> {
     /// Installed and restored together with `current_poly_tvars` by
     /// [`Self::with_poly_tvars`], so the two can never describe different defs.
     current_row_params: std::cell::RefCell<BTreeSet<Symbol>>,
+    /// The current def's generics its emitted signature does not name, each
+    /// with how its body reads it ([`Self::with_erased_tvars`]).
+    current_erased_tvars: std::cell::RefCell<BTreeMap<ipe_types::SolverVar, ErasedTvar>>,
     /// Whether the function (def or lambda) currently being lowered has a Task
     /// return type. Set to `true` when `lower_def` / `lower_lambda` detects that
     /// the inferred return type is `IrType::Task(_)`; reset to `false` on entry to
@@ -13754,6 +13804,25 @@ enum VarOwner {
     Unowned,
 }
 
+/// How the lowerer reads a type variable at the current def and read site
+/// ([`Lowerer::owned_var_read`]).
+enum OwnedVarRead {
+    /// A generic the current def's signature erased, read by its [`ErasedTvar`].
+    Erased(ErasedTvar),
+    /// The current def's own generic.
+    Generic(Symbol),
+    /// Another binding's generic read in the current def's signature: refused.
+    Foreign {
+        /// The binding that keeps the variable generic.
+        owner: (Vec<Symbol>, Symbol),
+        /// The owner's name for the variable.
+        sym: Symbol,
+    },
+    /// Free here: each position reads it its own way (`()` in a UI message
+    /// slot, `JsonVal` on the JSON path, a refusal on the strict path).
+    Lenient,
+}
+
 /// Whether the annotation `ty`, past `params` parameter arrows, is the wildcard `any`.
 fn canon_returns_wildcard(ty: &canon::Type, params: usize) -> bool {
     let mut cur = ty;
@@ -13781,6 +13850,18 @@ enum ReadSite {
     Signature,
     /// A type inside the current def's body.
     Body,
+}
+
+/// How the current def's body reads a generic its emitted signature does not
+/// name ([`Lowerer::with_erased_tvars`]): the emitted function declares no
+/// Rust generic for it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ErasedTvar {
+    /// No obligation: read as `()`, sound by parametricity.
+    Unit,
+    /// An obligation `()` may not meet, and no Rust generic carries the bound:
+    /// a body type naming it is refused (IPE-L0102).
+    Bounded,
 }
 
 /// The one symbol that stands for the wildcard `any` in lowered types.
@@ -14156,6 +14237,7 @@ impl<'a> Lowerer<'a> {
             ctor_arity,
             transparent_ffi_unions,
             enum_payloads: EnumPayloadTable::new(),
+            enum_param_use: ipe_ir::EnumParamUse::default(),
             transparent_ffi_ctors,
             eta_params,
             eta_base: Cell::new(0),
@@ -14185,6 +14267,7 @@ impl<'a> Lowerer<'a> {
             ),
             current_poly_tvars: std::cell::RefCell::new(BTreeMap::new()),
             current_row_params: std::cell::RefCell::new(BTreeSet::new()),
+            current_erased_tvars: std::cell::RefCell::new(BTreeMap::new()),
             fn_is_async: Cell::new(false),
             promotable_fn_binders: std::cell::RefCell::new(BTreeSet::new()),
             deferred_fun_captures: std::cell::RefCell::new(BTreeMap::new()),
@@ -16572,6 +16655,22 @@ impl<'a> Lowerer<'a> {
             types_ir.push(TypeDef::Enum(def));
         }
         let prelude_enums = self.synthetic_prelude_enums();
+        // A parameter no field uses, directly or through a used parameter of
+        // another enum, carries nothing: erase it from every declaration here
+        // and, through `enum_param_use`, from every application lowered after.
+        self.enum_param_use = ipe_ir::EnumParamUse::of(
+            types_ir
+                .iter()
+                .map(|td| {
+                    let TypeDef::Enum(def) = td;
+                    def
+                })
+                .chain(prelude_enums.iter()),
+        );
+        let mut types_ir: Vec<TypeDef> = types_ir
+            .into_iter()
+            .map(|TypeDef::Enum(def)| TypeDef::Enum(self.enum_param_use.erase_in_def(def)))
+            .collect();
         self.enum_payloads = ipe_ir::enum_payload_table(
             types_ir
                 .iter()
@@ -16650,6 +16749,14 @@ impl<'a> Lowerer<'a> {
         // proves the bound instead of cargo-failing E0277 (an
         // exit-0-then-cargo-fail SEAL break).
         propagate_call_site_bounds(&mut funcs, &callee_instances);
+        // Pins settle against the final signatures: only rendered entries stay,
+        // and a `JsonVal` reading on a bound `JsonVal` cannot meet is refused.
+        user_pins::settle_user_pins(&mut funcs, |id| {
+            usize::try_from(id.as_raw())
+                .ok()
+                .and_then(|idx| self.m.defs.get(idx))
+                .map(|def| def.name().span)
+        });
 
         // when any Db kernel call is present, inject the synthetic
         // `SqlValue` and `SqlField` `EnumDef`s into `module.types`.  They are
@@ -18173,20 +18280,23 @@ impl<'a> Lowerer<'a> {
                             param_binder_scope(params.iter().map(|(s, _)| *s), patterns);
                         let mut row_vars = BTreeSet::new();
                         canon_sig_collect_arg_row_vars(ty, &mut row_vars);
-                        let body_result = self
-                            .reject_generic_app_entries_in(body, &row_vars)
-                            .and_then(|()| {
-                                self.with_binders(&param_scope, || {
-                                    self.with_param_binders(&params, patterns, || {
-                                        self.lower_returned_body(body, &ret)
+                        let def_bounds = self.types.bounds.get(&poly_key);
+                        let named = signature_generics(&params, &ret);
+                        let folded = self.with_erased_tvars(&named, def_bounds, || {
+                            let body_result = self
+                                .reject_generic_app_entries_in(body, &row_vars)
+                                .and_then(|()| {
+                                    self.with_binders(&param_scope, || {
+                                        self.with_param_binders(&params, patterns, || {
+                                            self.lower_returned_body(body, &ret)
+                                        })
                                     })
-                                })
-                            });
-                        self.fn_is_async.set(prev_async);
-                        // The prologue binders' types mention the def's own generics, so
-                        // they resolve before those generics go out of scope.
-                        let folded = body_result
-                            .and_then(|b| self.fold_param_prologues(prologue, b, body))?;
+                                });
+                            self.fn_is_async.set(prev_async);
+                            // The prologue binders' types mention the def's own generics, so
+                            // they resolve before those generics go out of scope.
+                            body_result.and_then(|b| self.fold_param_prologues(prologue, b, body))
+                        })?;
                         Ok((ret, folded))
                     },
                 );
@@ -18416,14 +18526,7 @@ impl<'a> Lowerer<'a> {
                 //   - INCLUDES it when `any` is the injected UI msg generic
                 //     (`view : Model -> any`) because `ret = Html<Generic(marker)>`.
                 // A param-position `any` was already freshened to a minted symbol.
-                let used_generics: BTreeSet<Symbol> = {
-                    let mut s = BTreeSet::new();
-                    for (_, ty) in &params {
-                        collect_ir_generic_syms(ty, &mut s);
-                    }
-                    collect_ir_generic_syms(&ret, &mut s);
-                    s
-                };
+                let used_generics = signature_generics(&params, &ret);
                 // (AUD-05) keyed by (home, name) — see the `bounds` field doc
                 // on `SolvedTypes` for why a bare-name lookup is unsound here.
                 let var_bounds = self.types.bounds.get(&(def.home().to_vec(), name));
@@ -18562,26 +18665,18 @@ impl<'a> Lowerer<'a> {
                 // 3-module cross-module field-access getter; this filter is
                 // defense-in-depth alongside the `obligation_roots` fix above.
                 // Computed per-branch below, once `params`/`ret` are known.
-                let compute_type_params = |quantified_syms: Option<&Vec<Symbol>>,
-                                           var_bounds: Option<&BTreeMap<Symbol, TyBounds>>,
-                                           params: &[(Symbol, IrType)],
-                                           ret: &IrType| {
-                    let used_generics: BTreeSet<Symbol> = {
-                        let mut s = BTreeSet::new();
-                        for (_, ty) in params {
-                            collect_ir_generic_syms(ty, &mut s);
-                        }
-                        collect_ir_generic_syms(ret, &mut s);
-                        s
+                let compute_type_params =
+                    |quantified_syms: Option<&Vec<Symbol>>,
+                     var_bounds: Option<&BTreeMap<Symbol, TyBounds>>,
+                     used_generics: &BTreeSet<Symbol>| {
+                        quantified_syms
+                            .into_iter()
+                            .flatten()
+                            .copied()
+                            .filter(|v| used_generics.contains(v))
+                            .map(|v| (v, Self::bounds_for(var_bounds, v)))
+                            .collect::<Vec<(Symbol, BoundSet)>>()
                     };
-                    quantified_syms
-                        .into_iter()
-                        .flatten()
-                        .copied()
-                        .filter(|v| used_generics.contains(v))
-                        .map(|v| (v, Self::bounds_for(var_bounds, v)))
-                        .collect::<Vec<(Symbol, BoundSet)>>()
-                };
 
                 if !patterns.is_empty() {
                     // An unannotated top-level function: synthesise the typed
@@ -18606,24 +18701,27 @@ impl<'a> Lowerer<'a> {
                             // Same binder-scope registration as the Typed path.
                             let param_scope =
                                 param_binder_scope(params.iter().map(|(s, _)| *s), patterns);
-                            let body_result = self
-                                .reject_generic_app_entries_in(body, &BTreeSet::new())
-                                .and_then(|()| {
-                                    self.with_binders(&param_scope, || {
-                                        self.with_param_binders(&params, patterns, || {
-                                            self.lower_returned_body(body, &ret)
+                            let named = signature_generics(&params, &ret);
+                            let folded = self.with_erased_tvars(&named, var_bounds, || {
+                                let body_result = self
+                                    .reject_generic_app_entries_in(body, &BTreeSet::new())
+                                    .and_then(|()| {
+                                        self.with_binders(&param_scope, || {
+                                            self.with_param_binders(&params, patterns, || {
+                                                self.lower_returned_body(body, &ret)
+                                            })
                                         })
-                                    })
-                                });
-                            self.fn_is_async.set(prev_async);
-                            // Prologue binders resolve under the def's generics, as in
-                            // the Typed path.
-                            let folded = body_result
-                                .and_then(|b| self.fold_param_prologues(prologue, b, body))?;
-                            Ok((params, ret, folded))
+                                    });
+                                self.fn_is_async.set(prev_async);
+                                // Prologue binders resolve under the def's generics, as in
+                                // the Typed path.
+                                body_result
+                                    .and_then(|b| self.fold_param_prologues(prologue, b, body))
+                            })?;
+                            Ok((params, ret, named, folded))
                         },
                     );
-                    let (params, ret, mut lowered_body) = scoped?;
+                    let (params, ret, named, mut lowered_body) = scoped?;
                     // Same move-ownership discipline as the Typed path above —
                     // one `apply_param_move_ownership` per param (see that call
                     // site and the fn doc for the collapsed-branch rationale).
@@ -18637,8 +18735,7 @@ impl<'a> Lowerer<'a> {
                     {
                         lowered_body = rewrite_tail_calls(id, arity, params.clone(), lowered_body);
                     }
-                    let type_params =
-                        compute_type_params(quantified_syms, var_bounds, &params, &ret);
+                    let type_params = compute_type_params(quantified_syms, var_bounds, &named);
                     return Ok(DefParts {
                         type_params,
                         // An unannotated def's tvars are all genuine
@@ -18652,19 +18749,21 @@ impl<'a> Lowerer<'a> {
                         body: lowered_body,
                     });
                 }
-                let (ret, lowered_body) = self.with_poly_tvars(
+                let (ret, named, lowered_body) = self.with_poly_tvars(
                     scope_poly,
                     BTreeSet::new(),
-                    || -> DResult<(IrType, Expr)> {
+                    || -> DResult<(IrType, BTreeSet<Symbol>, Expr)> {
                         let ret = self.signature_ir_type(solved_ty, sig_span)?;
                         // Save/set/restore fn_is_async for the 0-param (value-binding) path.
                         let prev_async = self.fn_is_async.get();
                         self.fn_is_async.set(matches!(ret, IrType::Task(_)));
-                        let lowered_body = self
-                            .reject_generic_app_entries_in(body, &BTreeSet::new())
-                            .and_then(|()| self.lower_returned_body(body, &ret));
+                        let named = signature_generics(&[], &ret);
+                        let lowered_body = self.with_erased_tvars(&named, var_bounds, || {
+                            self.reject_generic_app_entries_in(body, &BTreeSet::new())
+                                .and_then(|()| self.lower_returned_body(body, &ret))
+                        });
                         self.fn_is_async.set(prev_async);
-                        Ok((ret, lowered_body?))
+                        Ok((ret, named, lowered_body?))
                     },
                 )?;
                 // Zero-param generalized value bindings (no value restriction,
@@ -18672,7 +18771,7 @@ impl<'a> Lowerer<'a> {
                 // take the identical `params: []` path the backend already
                 // emits for zero-arg fn calls — no shared mutable cell, no
                 // memoization to break.
-                let mut type_params = compute_type_params(quantified_syms, var_bounds, &[], &ret);
+                let mut type_params = compute_type_params(quantified_syms, var_bounds, &named);
                 apply_tea_carrier_bounds(&mut type_params, &[], &ret);
                 Ok(DefParts {
                     type_params,
@@ -19231,39 +19330,181 @@ impl<'a> Lowerer<'a> {
         args: &[canon::Type],
         generics: &[Symbol],
     ) -> DResult<IrType> {
-        // drop the phantom `k`/`v` of `Ipe.Cache.Cache k v`
-        // (backed by the non-generic `IpeCacheHandle`) and the phantom
-        // `row` of `Ipe.Db.Store.Cond row` (untyped runtime data) —
-        // twin of the solved-Ty arm; see its comment for the E0283
-        // rationale.
-        let ir_args =
-            if self.is_cache_handle_con(home, name) || self.is_store_row_phantom_con(home, name) {
-                Vec::new()
-            } else {
-                let mut v = Vec::with_capacity(args.len());
-                for a in args {
-                    // A type argument filling a generic payload slot that
-                    // instantiates to a function takes the same `Arc<dyn Fn>`
-                    // carrier the decl-side flip
-                    // ([`normalize_enum_payload_fun_carrier`]) stamps on a
-                    // direct-function payload and the value-side flip
-                    // ([`promote_stored_fn_carrier`]) constructs with
-                    // `Arc::new`. Without it the type application spells the
-                    // slot `Box<dyn Fn>` while the construction fills it with
-                    // an `Arc`, an `Arc`-vs-`Box` E0308 (and the composite's
-                    // derived `Clone` fails on the non-`Clone` `Box`). The
-                    // flip is a no-op for every non-function argument.
-                    v.push(normalize_enum_payload_fun_carrier(
-                        self.ir_type_from_canon(a, generics)?,
-                    ));
-                }
-                v
-            };
+        let mut ir_args = Vec::with_capacity(args.len());
+        for a in self.emitted_type_args(home, name, args)? {
+            // A type argument filling a generic payload slot that
+            // instantiates to a function takes the same `Arc<dyn Fn>`
+            // carrier the decl-side flip
+            // ([`normalize_enum_payload_fun_carrier`]) stamps on a
+            // direct-function payload and the value-side flip
+            // ([`promote_stored_fn_carrier`]) constructs with
+            // `Arc::new`. Without it the type application spells the
+            // slot `Box<dyn Fn>` while the construction fills it with
+            // an `Arc`, an `Arc`-vs-`Box` E0308 (and the composite's
+            // derived `Clone` fails on the non-`Clone` `Box`). The
+            // flip is a no-op for every non-function argument.
+            ir_args.push(normalize_enum_payload_fun_carrier(
+                self.ir_type_from_canon(a, generics)?,
+            ));
+        }
+        let home = ModPath(home.to_vec());
         Ok(IrType::Enum {
-            home: ModPath(home.to_vec()),
+            home,
             name,
             args: ir_args,
         })
+    }
+
+    /// The arguments of an application of program union `(home, name)` its
+    /// emitted enum keeps, in order: those [`Self::type_arg_fates`] keeps.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::type_arg_fates`].
+    fn emitted_type_args<'args, A>(
+        &self,
+        home: &[Symbol],
+        name: Symbol,
+        args: &'args [A],
+    ) -> DResult<impl Iterator<Item = &'args A>> {
+        Ok(self
+            .fated_type_args(home, name, args)?
+            .filter(|(_, fate)| *fate == TypeArgFate::Kept)
+            .map(|(a, _)| a))
+    }
+
+    /// Each argument of an application of program union `(home, name)`
+    /// paired with its [`Self::type_arg_fates`] fate, in order.
+    ///
+    /// The one pairing both [`Self::emitted_type_args`] (what lowering
+    /// emits) and [`Self::unused_enum_parameter_vars`] (where an argument
+    /// variable is erased) read, so the two cannot take different paths
+    /// through the same application.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::type_arg_fates`].
+    fn fated_type_args<'args, A>(
+        &self,
+        home: &[Symbol],
+        name: Symbol,
+        args: &'args [A],
+    ) -> DResult<impl Iterator<Item = (&'args A, TypeArgFate)>> {
+        Ok(args
+            .iter()
+            .zip(self.type_arg_fates(home, name, args.len())?))
+    }
+
+    /// What lowering does with each of the `len` type arguments of an
+    /// application of program union `(home, name)`, in order.
+    ///
+    /// The one decision of which type arguments survive lowering: none for
+    /// `Ipe.Cache.Cache k v` (backed by the non-generic `IpeCacheHandle`) and
+    /// for a store-row-phantom union ([`Self::is_store_row_phantom_con`]),
+    /// whose declarations [`Self::lower_enum`] and the runtime emit
+    /// non-generic; otherwise each one [`ipe_ir::EnumParamUse`] proves used.
+    /// Kept, a phantom argument would leave the emitted enum's generic
+    /// uninferrable (E0283/E0392). An erased argument is never lowered, so
+    /// nothing it names can refuse a type the emitted Rust never spells.
+    ///
+    /// # Errors
+    ///
+    /// A [`Diagnostic::CompilerBug`] when `len` is not exactly the number of
+    /// parameters the declaration holds: the erasure is positional, so a
+    /// mismatched count would keep or drop the wrong arguments.
+    fn type_arg_fates(
+        &self,
+        home: &[Symbol],
+        name: Symbol,
+        len: usize,
+    ) -> DResult<impl Iterator<Item = TypeArgFate>> {
+        let erase_all =
+            self.is_cache_handle_con(home, name) || self.is_store_row_phantom_con(home, name);
+        let path = ModPath(home.to_vec());
+        // An erase-all declaration drops every source parameter, so its table arity is not its source arity.
+        if !erase_all
+            && let Some(declared) = self.enum_param_use.declared_arity(&path, name)
+            && declared != len
+        {
+            return Err(bug(
+                "ipe_lower::emitted_type_args",
+                format!(
+                    "an application of an enum declaring {declared} type parameters holds {len} arguments"
+                ),
+            ));
+        }
+        Ok((0..len).map(move |position| {
+            if erase_all {
+                TypeArgFate::OpaqueCarrier
+            } else if self.enum_param_use.is_used(&path, name, position) {
+                TypeArgFate::Kept
+            } else {
+                TypeArgFate::UnusedEnumParameter
+            }
+        }))
+    }
+
+    /// The type variables, as raws, an argument of the declared type
+    /// `declared` names inside a program enum argument lowering erases as an
+    /// unused parameter ([`TypeArgFate::UnusedEnumParameter`]), on the same
+    /// spine [`argument_vars`] reads.
+    ///
+    /// The walk enters only a distinct program union
+    /// ([`Self::is_distinct_program_union`], lowered ahead of every other
+    /// arm), through the same [`Self::fated_type_args`] decision lowering
+    /// emits it by: it follows the kept arguments, marks the unused-parameter
+    /// arguments erased, and skips an opaque-carrier argument. Every other
+    /// head is a builtin non-distinct head and is never entered: the
+    /// builtins whose lowering drops an argument (`Connection`, `Setting`),
+    /// the non-distinct stdlib unions such as `Ipe.Db.Store`'s `Cond` rows
+    /// and `Ipe.Cache`'s `Cache k v`, and those that keep their arguments
+    /// (`List`, `Maybe`). A union nested under such a head is either pruned
+    /// or reached by a path this walk does not follow, so its variables
+    /// class [`ArgumentErasure::Other`], main's no-pin. Below an erased
+    /// argument every variable is erased with it.
+    fn unused_enum_parameter_vars(&self, declared: &Ty) -> BTreeSet<u32> {
+        let mut vars = BTreeSet::new();
+        let mut stack: Vec<(&Ty, bool)> = Vec::new();
+        let mut spine = declared;
+        while let Ty::Fun(arg, rest) = spine {
+            stack.push((arg, false));
+            spine = rest;
+        }
+        while let Some((t, unused)) = stack.pop() {
+            match t {
+                Ty::Var(raw) => {
+                    if unused {
+                        vars.insert(*raw);
+                    }
+                }
+                Ty::Fun(a, b) => {
+                    stack.push((a, unused));
+                    stack.push((b, unused));
+                }
+                Ty::Con { args, .. } if unused => {
+                    stack.extend(args.iter().map(|a| (a, true)));
+                }
+                Ty::Con { module, name, args } => {
+                    if !self.is_distinct_program_union(module, *name) {
+                        continue;
+                    }
+                    // A miscounted application is refused where the
+                    // signature lowers; here it is not entered.
+                    let Ok(fated) = self.fated_type_args(module, *name, args) else {
+                        continue;
+                    };
+                    stack.extend(fated.filter_map(|(arg, fate)| match fate {
+                        TypeArgFate::Kept => Some((arg, false)),
+                        TypeArgFate::UnusedEnumParameter => Some((arg, true)),
+                        TypeArgFate::OpaqueCarrier => None,
+                    }));
+                }
+                Ty::Tuple(args) => stack.extend(args.iter().map(|a| (a, unused))),
+                Ty::Record(fields, _) => stack.extend(fields.values().map(|f| (f, unused))),
+                Ty::Wildcard | Ty::Unit => {}
+            }
+        }
+        vars
     }
 
     /// Lower a solved program-union application to its `IrType::Enum`.
@@ -19280,33 +19521,21 @@ impl<'a> Lowerer<'a> {
         // `Ty::Con`), which is the same identity the union was keyed
         // under.
         //
-        // `Ipe.Cache.Cache k v` is backed by the NON-generic
-        // runtime `IpeCacheHandle`, so drop its `k`/`v` args here —
-        // otherwise they surface as unused generic params on the
-        // `Ipe.Cache` wrapper fns (`new : CacheCfg -> Task Error
-        // (Cache k v)` whose result no longer mentions them), an
-        // uninferrable `T` at the call site (E0283).
-        let ir_args = if self.is_cache_handle_con(module, name)
-            || self.is_store_row_phantom_con(module, name)
-        {
-            Vec::new()
-        } else {
-            let mut v = Vec::with_capacity(args.len());
-            for a in args {
-                // A generic payload slot instantiated to a function takes
-                // the `Arc<dyn Fn>` carrier, matching the decl-side flip
-                // ([`normalize_enum_payload_fun_carrier`]) and the
-                // value-side construction ([`promote_stored_fn_carrier`]).
-                // Twin of the annotation-path flip in
-                // [`Self::ir_type_from_canon`]; both spellings of the enum
-                // type argument must agree or the emitted slot is an
-                // `Arc`-vs-`Box` E0308. A no-op for a non-function argument.
-                v.push(normalize_enum_payload_fun_carrier(
-                    self.ir_type_from_ty(a, span)?,
-                ));
-            }
-            v
-        };
+        // The arguments the emitted enum keeps ([`Self::emitted_type_args`]).
+        let mut ir_args = Vec::with_capacity(args.len());
+        for a in self.emitted_type_args(module, name, args)? {
+            // A generic payload slot instantiated to a function takes
+            // the `Arc<dyn Fn>` carrier, matching the decl-side flip
+            // ([`normalize_enum_payload_fun_carrier`]) and the
+            // value-side construction ([`promote_stored_fn_carrier`]).
+            // Twin of the annotation-path flip in
+            // [`Self::ir_type_from_canon`]; both spellings of the enum
+            // type argument must agree or the emitted slot is an
+            // `Arc`-vs-`Box` E0308. A no-op for a non-function argument.
+            ir_args.push(normalize_enum_payload_fun_carrier(
+                self.ir_type_from_ty(a, span)?,
+            ));
+        }
         Ok(IrType::Enum {
             home: ModPath(module.to_vec()),
             name,
@@ -20472,6 +20701,57 @@ impl<'a> Lowerer<'a> {
         out
     }
 
+    /// Run `f` with every generic of the current def outside `named` (its
+    /// signature's `signature_generics`) read by its [`ErasedTvar`]: `()` for
+    /// one carrying no obligation in `bounds`, a refusal for a bounded one.
+    ///
+    /// An argument lowering may erase a generic (`Tag b` lowers to `Tag` when
+    /// `Tag` never uses its parameter); the emitted function then has no Rust
+    /// generic for it, so a body type naming it would be out of scope. No value
+    /// of the def's type is observable through it, so by parametricity `()`
+    /// is a sound instantiation. A bounded one has no type that surely meets
+    /// the bound and no generic to carry it, so a body type naming it is
+    /// refused at the read (IPE-L0102) rather than emitted out of scope.
+    /// Restored once `f` returns.
+    fn with_erased_tvars<T>(
+        &self,
+        named: &BTreeSet<Symbol>,
+        bounds: Option<&BTreeMap<Symbol, TyBounds>>,
+        f: impl FnOnce() -> T,
+    ) -> T {
+        let erased: BTreeMap<ipe_types::SolverVar, ErasedTvar> = {
+            let rows = self.current_row_params.borrow();
+            self.current_poly_tvars
+                .borrow()
+                .iter()
+                .filter(|(_, sym)| {
+                    !named.contains(*sym) && **sym != self.wildcard_marker && !rows.contains(*sym)
+                })
+                .map(|(var, sym)| {
+                    let unbounded = bounds.and_then(|m| m.get(sym)).is_none_or(|b| b.is_empty());
+                    let read = if unbounded {
+                        ErasedTvar::Unit
+                    } else {
+                        ErasedTvar::Bounded
+                    };
+                    (*var, read)
+                })
+                .collect()
+        };
+        if erased.is_empty() {
+            return f();
+        }
+        let saved_poly = self.current_poly_tvars.borrow().clone();
+        self.current_poly_tvars
+            .borrow_mut()
+            .retain(|var, _| erased.get(var) != Some(&ErasedTvar::Unit));
+        let saved_erased = self.current_erased_tvars.replace(erased);
+        let out = f();
+        self.current_poly_tvars.replace(saved_poly);
+        self.current_erased_tvars.replace(saved_erased);
+        out
+    }
+
     /// Refuse a non-`Clone` capture of a source-lambda handler of a `+Sync` callback kernel.
     ///
     /// A [`KernelFn::requires_sync_capture`] kernel drives the `Arc<dyn Fn>`
@@ -21215,22 +21495,46 @@ impl<'a> Lowerer<'a> {
         out
     }
 
-    /// Lower the type variable `raw` by its owner: the current def's generic,
-    /// a refusal for another binding's generic read in the current def's
-    /// signature, or `lenient` for a free one or a body read (see [`ReadSite`]).
+    /// Lower the type variable `raw` by its owner: a generic the current def's
+    /// signature erased by its [`ErasedTvar`] ([`Self::with_erased_tvars`]),
+    /// the current def's generic, a refusal for another binding's generic read
+    /// in the current def's signature, or `lenient` for a free one or a body
+    /// read (see [`ReadSite`]).
     fn ir_type_from_owned_var(
         &self,
         raw: u32,
         span: Span,
         lenient: impl FnOnce() -> DResult<IrType>,
     ) -> DResult<IrType> {
-        match (self.var_owner(raw), self.read_site.get()) {
-            (VarOwner::Here(sym), ReadSite::Signature | ReadSite::Body) => Ok(IrType::Generic(sym)),
-            (VarOwner::Elsewhere { owner, sym }, ReadSite::Signature) => {
+        match self.owned_var_read(raw) {
+            OwnedVarRead::Erased(ErasedTvar::Unit) => Ok(IrType::Unit),
+            OwnedVarRead::Erased(ErasedTvar::Bounded) => {
+                Err(unsupported(span, Feature::Polymorphism))
+            }
+            OwnedVarRead::Generic(sym) => Ok(IrType::Generic(sym)),
+            OwnedVarRead::Foreign { owner, sym } => {
                 Err(self.foreign_type_variable(&owner, sym, span))
             }
+            OwnedVarRead::Lenient => lenient(),
+        }
+    }
+
+    /// How [`Self::ir_type_from_owned_var`] reads the type variable `raw` here.
+    fn owned_var_read(&self, raw: u32) -> OwnedVarRead {
+        let erased = ipe_types::SolverVar::from_raw(raw)
+            .and_then(|var| self.current_erased_tvars.borrow().get(&var).copied());
+        if let Some(read) = erased {
+            return OwnedVarRead::Erased(read);
+        }
+        match (self.var_owner(raw), self.read_site.get()) {
+            (VarOwner::Here(sym), ReadSite::Signature | ReadSite::Body) => {
+                OwnedVarRead::Generic(sym)
+            }
+            (VarOwner::Elsewhere { owner, sym }, ReadSite::Signature) => {
+                OwnedVarRead::Foreign { owner, sym }
+            }
             (VarOwner::Elsewhere { .. }, ReadSite::Body)
-            | (VarOwner::Unowned, ReadSite::Signature | ReadSite::Body) => lenient(),
+            | (VarOwner::Unowned, ReadSite::Signature | ReadSite::Body) => OwnedVarRead::Lenient,
         }
     }
 
@@ -21279,6 +21583,11 @@ impl<'a> Lowerer<'a> {
                 // the builtin of its name lowers by its own identity first.
                 _ if self.is_distinct_program_union(module, *name) => {
                     self.program_enum_from_ty(module, *name, args, span)
+                }
+                // The Ipe.Ui / Ipe.Html message-parametric constructors, by the
+                // one slot table the use-pin classifier also reads.
+                _ if let Some((row, msg)) = self.ui_msg_slot(module, *name, args) => {
+                    self.ir_type_from_ui_slot(row, msg, module, args, span)
                 }
                 // The closed config-tag ADTs (`HostMode` / `LogLevel` / `CsrfMode` /
                 // `RevocationMode`) erase to the raw `Int` tag their constructor kernels
@@ -21560,245 +21869,6 @@ impl<'a> Lowerer<'a> {
                 // solved user `type WebSocketServerCfg = …` wins by its own identity.
                 "WebSocketServerCfg" if self.is_stream_ws_opaque_con(module, *name) => {
                     Ok(IrType::WebSocketServerCfg)
-                }
-                // ── Ipe.Ui / Ipe.Html parametric type constructors ────────
-                // Mirror of `ir_type_from_canon` (which handles user-written
-                // type ANNOTATIONS).  This path handles SOLVED types from the
-                // HM region map — `list_elem_ir` calls here when lowering a
-                // `List (Attribute msg)` region, among others.
-                //
-                // Key differences from `ir_type_from_canon`:
-                // 1. The msg arg is recursed through `ir_type_from_ty_ui_msg`
-                //    (free `Ty::Var` → `IrType::Unit`, not `Json`, not error).
-                // 2. `Attribute` is disambiguated by `Ty::Con.module` (T2 trap:
-                //    BOTH `Ipe.Ui.Attribute` and `Ipe.Html.Attribute` exist —
-                //    check the module path, never just the name).
-                // 3. Plain Ui types (`Length`, `Color`, …) are nullary — no msg.
-                // 4. `WebReq` maps to `IrType::WebReq` (opaque init arg).
-                "Html" if args.len() == 1 => {
-                    let msg = self.ir_type_from_ty_ui_msg(
-                        args.first().ok_or_else(|| {
-                            bug(
-                                "ipe_lower::ir_type_from_ty",
-                                "Html applied without its message type",
-                            )
-                        })?,
-                        span,
-                    )?;
-                    Ok(IrType::Ui {
-                        ctor: UiCtor::Html,
-                        msg: Box::new(msg),
-                    })
-                }
-                // `View engine msg` — the engine-tagged view carrier (twin of
-                // the `ir_type_from_canon` arm). The solved engine tag
-                // (`Ty::Con` `Web`/`Tui`/`Cli`) selects the per-engine
-                // `IrType::Ui` ctor and erases; the `msg` arg is threaded.
-                // Byte-identical IR to the per-engine alias.
-                "View" if args.len() == 2 => {
-                    let ctor = match args.first() {
-                        Some(Ty::Con { name: tag, .. }) => match self.resolve(*tag)? {
-                            "Web" => UiCtor::Element,
-                            "Tui" => UiCtor::Cells,
-                            "Cli" => UiCtor::CliLines,
-                            other => {
-                                return Err(bug(
-                                    "ipe_lower::ir_type_from_ty",
-                                    format!("View carrier with unknown engine tag `{other}`"),
-                                ));
-                            }
-                        },
-                        _ => {
-                            return Err(bug(
-                                "ipe_lower::ir_type_from_ty",
-                                "View carrier without a settled engine tag",
-                            ));
-                        }
-                    };
-                    let msg = self.ir_type_from_ty_ui_msg(
-                        args.get(1).ok_or_else(|| {
-                            bug(
-                                "ipe_lower::ir_type_from_ty",
-                                "View applied without its message type",
-                            )
-                        })?,
-                        span,
-                    )?;
-                    Ok(IrType::Ui {
-                        ctor,
-                        msg: Box::new(msg),
-                    })
-                }
-                "Element" if args.len() == 1 => {
-                    let msg = self.ir_type_from_ty_ui_msg(
-                        args.first().ok_or_else(|| {
-                            bug(
-                                "ipe_lower::ir_type_from_ty",
-                                "Element applied without its message type",
-                            )
-                        })?,
-                        span,
-                    )?;
-                    Ok(IrType::Ui {
-                        ctor: UiCtor::Element,
-                        msg: Box::new(msg),
-                    })
-                }
-                "Screen" if args.len() == 1 => {
-                    let msg = self.ir_type_from_ty_ui_msg(
-                        args.first().ok_or_else(|| {
-                            bug(
-                                "ipe_lower::ir_type_from_ty",
-                                "Screen applied without its message type",
-                            )
-                        })?,
-                        span,
-                    )?;
-                    Ok(IrType::Ui {
-                        ctor: UiCtor::Cells,
-                        msg: Box::new(msg),
-                    })
-                }
-                // `Ipe.Ui.Tui.Attribute msg` — the cell-native attribute type.
-                "TuiAttr" if args.len() == 1 => {
-                    let msg = self.ir_type_from_ty_ui_msg(
-                        args.first().ok_or_else(|| {
-                            bug(
-                                "ipe_lower::ir_type_from_ty",
-                                "TuiAttr applied without its message type",
-                            )
-                        })?,
-                        span,
-                    )?;
-                    Ok(IrType::Ui {
-                        ctor: UiCtor::TuiAttribute,
-                        msg: Box::new(msg),
-                    })
-                }
-                // `Lines msg` — the Cli line-oriented view type.
-                "Lines" if args.len() == 1 => {
-                    let msg = self.ir_type_from_ty_ui_msg(
-                        args.first().ok_or_else(|| {
-                            bug(
-                                "ipe_lower::ir_type_from_ty",
-                                "Lines applied without its message type",
-                            )
-                        })?,
-                        span,
-                    )?;
-                    Ok(IrType::Ui {
-                        ctor: UiCtor::CliLines,
-                        msg: Box::new(msg),
-                    })
-                }
-                // `Ipe.Ui.Cli.Attribute msg` — the line-native attribute type.
-                "CliAttr" if args.len() == 1 => {
-                    let msg = self.ir_type_from_ty_ui_msg(
-                        args.first().ok_or_else(|| {
-                            bug(
-                                "ipe_lower::ir_type_from_ty",
-                                "CliAttr applied without its message type",
-                            )
-                        })?,
-                        span,
-                    )?;
-                    Ok(IrType::Ui {
-                        ctor: UiCtor::CliAttribute,
-                        msg: Box::new(msg),
-                    })
-                }
-                // T2 trap: `Attribute` exists in BOTH `Ipe.Ui` and `Ipe.Html`.
-                // Disambiguate by `Ty::Con.module` — a module path containing
-                // "Html" identifies the `Ipe.Html.Attribute` form.
-                "Attribute" if args.len() == 1 => {
-                    let msg = self.ir_type_from_ty_ui_msg(
-                        args.first().ok_or_else(|| {
-                            bug(
-                                "ipe_lower::ir_type_from_ty",
-                                "Attribute applied without its message type",
-                            )
-                        })?,
-                        span,
-                    )?;
-                    // A module path containing "Html" (e.g. ["Std","Html"] or
-                    // ["Html"]) selects `HtmlAttribute`; everything else
-                    // (["Std","Ui"], ["Ui"], or empty for builtin-injected)
-                    // selects `UiAttribute`.  `any` short-circuits on first hit.
-                    let is_html = module.iter().any(|s| self.resolve(*s).ok() == Some("Html"));
-                    let ctor = if is_html {
-                        UiCtor::HtmlAttribute
-                    } else {
-                        UiCtor::UiAttribute
-                    };
-                    Ok(IrType::Ui {
-                        ctor,
-                        msg: Box::new(msg),
-                    })
-                }
-                "Event" if args.len() == 1 => {
-                    let msg = self.ir_type_from_ty_ui_msg(
-                        args.first().ok_or_else(|| {
-                            bug(
-                                "ipe_lower::ir_type_from_ty",
-                                "Event applied without its message type",
-                            )
-                        })?,
-                        span,
-                    )?;
-                    Ok(IrType::Ui {
-                        ctor: UiCtor::HtmlEvent,
-                        msg: Box::new(msg),
-                    })
-                }
-                // ── Ipe.Ui.Input parametric types ───────────────────────
-                // `Label msg` and `Placeholder msg` are kernel-reserved type
-                // names produced by `constrain`'s `label_t` / `placeholder_t`
-                // helper closures.  They are NOT user ADTs, so they precede the
-                // `enum_variants` guard below.
-                "Label" if args.len() == 1 => {
-                    let msg = self.ir_type_from_ty_ui_msg(
-                        args.first().ok_or_else(|| {
-                            bug(
-                                "ipe_lower::ir_type_from_ty",
-                                "Label applied without its message type",
-                            )
-                        })?,
-                        span,
-                    )?;
-                    Ok(IrType::Ui {
-                        ctor: UiCtor::Label,
-                        msg: Box::new(msg),
-                    })
-                }
-                "Placeholder" if args.len() == 1 => {
-                    let msg = self.ir_type_from_ty_ui_msg(
-                        args.first().ok_or_else(|| {
-                            bug(
-                                "ipe_lower::ir_type_from_ty",
-                                "Placeholder applied without its message type",
-                            )
-                        })?,
-                        span,
-                    )?;
-                    Ok(IrType::Ui {
-                        ctor: UiCtor::Placeholder,
-                        msg: Box::new(msg),
-                    })
-                }
-                "RadioOption" if args.len() == 1 => {
-                    let msg = self.ir_type_from_ty_ui_msg(
-                        args.first().ok_or_else(|| {
-                            bug(
-                                "ipe_lower::ir_type_from_ty",
-                                "RadioOption applied without its message type",
-                            )
-                        })?,
-                        span,
-                    )?;
-                    Ok(IrType::Ui {
-                        ctor: UiCtor::RadioOption,
-                        msg: Box::new(msg),
-                    })
                 }
                 // ── Program-defined enum guard (home-aware) ──────────────
                 // Checked BEFORE the bare-name Ipe.Ui / Ipe.Web opaque arms
@@ -22204,7 +22274,11 @@ impl<'a> Lowerer<'a> {
     /// is for `Value = any` kernel positions; this path is strictly for the
     /// `msg` slot of Ui parametric types.  Using Json here would emit
     /// `Html<JsonVal>` which conflicts with the typed callee's `Html<MainMsg>`.
-    fn ir_type_from_ty_ui_msg(&self, t: &Ty, span: Span) -> DResult<IrType> {
+    ///
+    /// The message argument is a [`ui_msg_slots::MsgArg`], which only the slot
+    /// table builds, so no position outside a table row reads this way.
+    fn ir_type_from_ty_ui_msg(&self, msg: ui_msg_slots::MsgArg<'_>, span: Span) -> DResult<IrType> {
+        let t = msg.ty();
         match t {
             // A type variable in msg position is either:
             //
@@ -22229,9 +22303,11 @@ impl<'a> Lowerer<'a> {
             // A variable no binding keeps generic falls through to
             // `IrType::Unit`; one another binding keeps generic is refused,
             // since that binding emits it as its own Rust generic.
-            Ty::Var(v) => self.ir_type_from_owned_var(*v, span, || Ok(IrType::Unit)),
+            Ty::Var(v) => self.ir_type_from_owned_var(*v, span, || {
+                Ok(ui_msg_slots::open_var_ir(OpenVarUse::UiMessage))
+            }),
             // A wildcard names no enclosing generic: a message-free subtree.
-            Ty::Wildcard => Ok(IrType::Unit),
+            Ty::Wildcard => Ok(ui_msg_slots::open_var_ir(OpenVarUse::UiMessage)),
             // All other forms delegate to the strict helper — a concrete `Msg`
             // type becomes `IrType::Enum(Msg)`, `()` becomes `IrType::Unit`, etc.
             _ => self.ir_type_from_ty(t, span),
@@ -22277,8 +22353,10 @@ impl<'a> Lowerer<'a> {
             // own generic (see the SEAL-fix doc comment above), in which case
             // it must render as that binding's Rust generic instead, or
             // another binding's generic, which is refused.
-            Ty::Var(v) => self.ir_type_from_owned_var(*v, span, || Ok(IrType::Json)),
-            Ty::Wildcard => Ok(IrType::Json),
+            Ty::Var(v) => self.ir_type_from_owned_var(*v, span, || {
+                Ok(ui_msg_slots::open_var_ir(OpenVarUse::Value))
+            }),
+            Ty::Wildcard => Ok(ui_msg_slots::open_var_ir(OpenVarUse::Value)),
             // Recursively handle compound types so embedded `Ty::Var`s also
             // map to `IrType::Json`.
             Ty::Tuple(elems) => {
@@ -22318,34 +22396,24 @@ impl<'a> Lowerer<'a> {
                         Ok(IrType::Maybe(Box::new(elem)))
                     }
                     "Result" if args.len() == 2 => {
-                        // A free `Ty::Var` in the ERROR slot must pin to
-                        // `IrType::Error` (`IpeError`), NOT the Json fallback:
-                        // the emitted `ok_res` wrapper (`ResultOkDefault`, see
-                        // the ctor-lowering arm) pins an unresolved error type
-                        // to the project's `IpeError` — "the canonical
-                        // default" — so a type ANNOTATION derived from the
-                        // same free var (e.g. an eta-param binder for a piped
-                        // `Ok f |> Result.andMap …`) must agree, or the
-                        // emitted `let eta_0: IpeResult<JsonVal, _> = ok_res(…)`
-                        // is an E0308 exit-0-then-cargo-fail (found while
-                        // gating the 5th attempt: the
-                        // `result_and_map_fn_payload` positive-path
-                        // fixture). One defaulting policy, both sides.
-                        // Another binding's generic read in the def's signature
-                        // is refused here too, never defaulted.
-                        let err_ty = args.first().ok_or_else(result_arg_bug)?;
+                        // An open variable in the ERROR slot reads as the
+                        // project error (`IpeError`), not the JSON carrier:
+                        // the `ok_res` wrapper (`ResultOkDefault`, see the
+                        // ctor-lowering arm) fixes an open error to it, so a
+                        // binder typed from the same variable (an eta binder
+                        // of a piped `Ok f |> Result.andMap …`) agrees. A
+                        // generic or an erased variable reads by its owner
+                        // like any other position; another binding's generic
+                        // read in the def's signature is refused.
+                        let err_ty = args
+                            .get(ui_msg_slots::RESULT_ERROR_SLOT)
+                            .ok_or_else(result_arg_bug)?;
+                        let open_err = ui_msg_slots::open_var_ir(OpenVarUse::ResultError);
                         let err = match err_ty {
-                            Ty::Var(raw) => match (self.var_owner(*raw), self.read_site.get()) {
-                                (VarOwner::Elsewhere { owner, sym }, ReadSite::Signature) => {
-                                    return Err(self.foreign_type_variable(&owner, sym, span));
-                                }
-                                (VarOwner::Elsewhere { .. }, ReadSite::Body)
-                                | (
-                                    VarOwner::Here(_) | VarOwner::Unowned,
-                                    ReadSite::Signature | ReadSite::Body,
-                                ) => IrType::Error,
-                            },
-                            Ty::Wildcard => IrType::Error,
+                            Ty::Var(raw) => {
+                                self.ir_type_from_owned_var(*raw, span, || Ok(open_err))?
+                            }
+                            Ty::Wildcard => open_err,
                             Ty::Unit
                             | Ty::Fun(..)
                             | Ty::Con { .. }
@@ -23508,7 +23576,7 @@ impl<'a> Lowerer<'a> {
                     // referenced as a value is its own zero-argument call
                     // (`x` → `x()`), its message slot pinned like any call's.
                     let pin = match &callee {
-                        Callee::Func(_) => self.user_func_msg_pin(e),
+                        Callee::Func(_) => self.user_func_pin(e),
                         Callee::Kernel(_) | Callee::Ffi { .. } => CallPin::None,
                     };
                     Ok(Expr::Call {
@@ -24685,19 +24753,185 @@ impl<'a> Lowerer<'a> {
         }
     }
 
-    /// The pin for a use of a user generic function `callee` whose
-    /// message-slot type parameters THIS use leaves unconstrained.
+    /// Whether `ty` names a variable each position reads its own way: one
+    /// [`Self::owned_var_read`] reads [`OwnedVarRead::Lenient`] (`()` in a UI
+    /// message slot, `JsonVal` elsewhere), or a wildcard. A variable erased to
+    /// `()`, a generic, or a refused one reads one way at every position.
+    fn ty_mentions_position_read_var(&self, ty: &Ty) -> bool {
+        let lenient = |raw: u32| matches!(self.owned_var_read(raw), OwnedVarRead::Lenient);
+        let mut stack: Vec<&Ty> = vec![ty];
+        while let Some(t) = stack.pop() {
+            match t {
+                Ty::Wildcard => return true,
+                Ty::Var(raw) => {
+                    if lenient(*raw) {
+                        return true;
+                    }
+                }
+                Ty::Fun(a, b) => {
+                    stack.push(a);
+                    stack.push(b);
+                }
+                Ty::Con { args, .. } | Ty::Tuple(args) => stack.extend(args),
+                Ty::Record(fields, tail) => {
+                    if let RowTail::Open(raw) = tail
+                        && lenient(*raw)
+                    {
+                        return true;
+                    }
+                    stack.extend(fields.values());
+                }
+                Ty::Unit => {}
+            }
+        }
+        false
+    }
+
+    /// The [`ui_msg_slots::UI_MSG_SLOTS`] row of the constructor
+    /// `(module, name)` applied to `args`, with its message argument: the one
+    /// lookup [`Self::ir_type_from_ty`] reads UI types by and the use-pin
+    /// classifier names slots by. A program union of the name lowers by its
+    /// own identity first, so it holds no slot.
+    fn ui_msg_slot<'t>(
+        &self,
+        module: &[Symbol],
+        name: Symbol,
+        args: &'t [Ty],
+    ) -> Option<(&'static ui_msg_slots::UiMsgSlot, ui_msg_slots::MsgArg<'t>)> {
+        if self.is_distinct_program_union(module, name) {
+            return None;
+        }
+        ui_msg_slots::lookup(self.interner.resolve(name)?, args)
+    }
+
+    /// The argument index and [`OpenVarUse`] of the one special slot of the
+    /// constructor `(module, name)` applied to `args`: a UI message slot
+    /// ([`Self::ui_msg_slot`]) or the `Result` error slot, the slots whose
+    /// open variable the readers default other than as a value.
+    fn open_var_slot(
+        &self,
+        module: &[Symbol],
+        name: Symbol,
+        args: &[Ty],
+    ) -> Option<(usize, OpenVarUse)> {
+        if let Some((row, _)) = self.ui_msg_slot(module, name, args) {
+            return Some((row.slot(), OpenVarUse::UiMessage));
+        }
+        ui_msg_slots::result_error_slot(self.interner.resolve(name)?, args)
+            .map(|at| (at, OpenVarUse::ResultError))
+    }
+
+    /// The pin of a callee parameter `var` a declared argument names, which
+    /// this use instantiates to `ty`.
     ///
-    /// A parameter qualifies when it occurs only in UI message slots of the
-    /// callee's declared scheme ([`ipe_types::ui_msg_only_vars`]) and the use's
-    /// solved instantiation binds it to a free variable no enclosing generic
-    /// owns ([`Self::ty_is_unbound_free`]). The use's own node type lowered
-    /// that slot to `()`, so the pin renders `()` there and the emitted call
-    /// names one concrete type instead of leaving rustc an ambiguous generic.
-    /// Phantom by construction: the parameter types no value. Any other
-    /// callee, or an instantiation the template match cannot align, pins
-    /// nothing.
-    fn user_func_msg_pin(&self, callee: &canon::Expr) -> CallPin {
+    /// A concrete instance pins itself. An open one (a variable each position
+    /// reads its own way, or a wildcard, anywhere inside it) has no reading
+    /// the use fixes: it is [`UserPin::Open`], settled against the callee's
+    /// emitted signature, holding the refusal naming `callee` and `var` and
+    /// `erasure`, whether an unused program enum parameter holds `var`.
+    fn argument_param_pin(
+        &self,
+        ty: &Ty,
+        callee: Symbol,
+        var: Symbol,
+        erasure: ArgumentErasure,
+        span: Span,
+    ) -> UserPin {
+        if self.ty_mentions_position_read_var(ty) {
+            let text = |s: Symbol| -> Box<str> { self.interner.resolve(s).unwrap_or("_").into() };
+            let refusal = Diagnostic::Lower {
+                span,
+                msg: LowerError::UninferableErasedParameter {
+                    callee: text(callee),
+                    var: text(var),
+                },
+            };
+            return UserPin::Open(Box::new(refusal), erasure);
+        }
+        match self.ir_type_from_ty_json(ty, span) {
+            Ok(lowered) => UserPin::Instance(lowered),
+            Err(refusal) => UserPin::Unlowered(Box::new(refusal)),
+        }
+    }
+
+    /// Lower an application of the [`ui_msg_slots::UI_MSG_SLOTS`] row `row`:
+    /// the row selects the [`UiCtor`], and the message argument `msg` reads
+    /// through [`Self::ir_type_from_ty_ui_msg`] (a free variable there is
+    /// `()`, not `Json`, not a refusal).
+    fn ir_type_from_ui_slot(
+        &self,
+        row: &ui_msg_slots::UiMsgSlot,
+        msg: ui_msg_slots::MsgArg<'_>,
+        module: &[Symbol],
+        args: &[Ty],
+        span: Span,
+    ) -> DResult<IrType> {
+        let ctor = match row.ctor() {
+            ui_msg_slots::UiSlotCtor::Fixed(ctor) => ctor,
+            // `View engine msg`: the solved engine tag (`Web`/`Tui`/`Cli`)
+            // selects the per-engine ctor and erases (twin of the
+            // `ir_type_from_canon` arm), byte-identical IR to the alias.
+            ui_msg_slots::UiSlotCtor::ByEngineTag => match args.first() {
+                Some(Ty::Con { name: tag, .. }) => match self.resolve(*tag)? {
+                    "Web" => UiCtor::Element,
+                    "Tui" => UiCtor::Cells,
+                    "Cli" => UiCtor::CliLines,
+                    other => {
+                        return Err(bug(
+                            "ipe_lower::ir_type_from_ty",
+                            format!("View carrier with unknown engine tag `{other}`"),
+                        ));
+                    }
+                },
+                _ => {
+                    return Err(bug(
+                        "ipe_lower::ir_type_from_ty",
+                        "View carrier without a settled engine tag",
+                    ));
+                }
+            },
+            // `Attribute` exists in both `Ipe.Ui` and `Ipe.Html`: a module path
+            // containing `Html` selects `HtmlAttribute`, any other (`Ipe.Ui`,
+            // or empty for a builtin-injected type) `UiAttribute`.
+            ui_msg_slots::UiSlotCtor::ByAttributeHome => {
+                if module.iter().any(|s| self.resolve(*s).ok() == Some("Html")) {
+                    UiCtor::HtmlAttribute
+                } else {
+                    UiCtor::UiAttribute
+                }
+            }
+        };
+        let msg = self.ir_type_from_ty_ui_msg(msg, span)?;
+        Ok(IrType::Ui {
+            ctor,
+            msg: Box::new(msg),
+        })
+    }
+
+    /// The pin for a direct call of a user generic function `callee`, at any
+    /// arity: saturated, a value reference, or the base call of an
+    /// over-application.
+    ///
+    /// Two kinds of type parameter are pinned, by the callee's scheme symbol:
+    ///
+    /// * one that occurs only in UI message slots of the declared scheme
+    ///   ([`ui_msg_slots::open_var_uses`], the slots [`Self::ir_type_from_ty`]
+    ///   reads), or the `any` return marker, which this use leaves free
+    ///   ([`Self::ty_is_unbound_free`]): pinned to `()`, the type the use's own
+    ///   node type lowered that slot to;
+    /// * every other one a declared argument names, arguments past the
+    ///   emitted arity included: pinned to the use's solved instantiation
+    ///   ([`Self::argument_param_pin`]). The pin renders only when no emitted
+    ///   parameter of the callee names it, so the pin set never depends on the
+    ///   callee's Rust arity; an open instantiation is settled against the
+    ///   callee's emitted return.
+    ///
+    /// A parameter only the declared return names is left to the use's
+    /// expected type, as every other generic call is.
+    ///
+    /// Any other callee, or an instantiation the template match cannot align,
+    /// pins nothing.
+    fn user_func_pin(&self, callee: &canon::Expr) -> CallPin {
         let canon::Expr_::VarTopLevel { module, name } = &callee.value else {
             return CallPin::None;
         };
@@ -24706,12 +24940,14 @@ impl<'a> Lowerer<'a> {
         else {
             return CallPin::None;
         };
-        let msg_only =
-            ipe_types::ui_msg_only_vars(declared, &ipe_types::ui_msg_carrier_syms(self.interner));
-        let any_slot = self.any_return_slot_pin(&key, inst);
-        if msg_only.is_empty() {
-            return any_slot.map_or(CallPin::None, |sym| CallPin::MsgUnit(BTreeSet::from([sym])));
-        }
+        let uses = ui_msg_slots::open_var_uses(declared, |module, name, args| {
+            self.open_var_slot(module, name, args)
+        });
+        let msg_only: BTreeSet<u32> = uses
+            .iter()
+            .filter(|(_, roles)| ui_msg_slots::only_ui_message(roles))
+            .map(|(raw, _)| *raw)
+            .collect();
         let mut subst: BTreeMap<u32, Ty> = BTreeMap::new();
         match_signature_template(declared, inst, &mut subst, self.interner);
         // An untyped callee's scheme carries solver variables, named by its
@@ -24721,24 +24957,40 @@ impl<'a> Lowerer<'a> {
             .untyped_type_params
             .contains_key(&key)
             .then(|| self.types.poly_var_map.get(&key));
-        let pinned: BTreeSet<Symbol> = msg_only
-            .into_iter()
+        let name_of = |raw: u32| -> Option<Symbol> {
+            solver_names.map_or_else(
+                || Some(Symbol::from_raw(raw)),
+                |names| {
+                    let var = ipe_types::SolverVar::from_raw(raw)?;
+                    names?.get(&var).copied()
+                },
+            )
+        };
+        let unused = self.unused_enum_parameter_vars(declared);
+        let mut pins: BTreeMap<Symbol, UserPin> = BTreeMap::new();
+        for raw in argument_vars(declared).difference(&msg_only) {
+            let (Some(sym), Some(ty)) = (name_of(*raw), subst.get(raw)) else {
+                continue;
+            };
+            let erasure = if unused.contains(raw) {
+                ArgumentErasure::UnusedEnumParameter
+            } else {
+                ArgumentErasure::Other
+            };
+            let pin = self.argument_param_pin(ty, *name, sym, erasure, callee.span);
+            pins.insert(sym, pin);
+        }
+        let free_msg = msg_only
+            .iter()
             .filter(|raw| subst.get(raw).is_some_and(|ty| self.ty_is_unbound_free(ty)))
-            .filter_map(|raw| {
-                solver_names.map_or_else(
-                    || Some(Symbol::from_raw(raw)),
-                    |names| {
-                        let var = ipe_types::SolverVar::from_raw(raw)?;
-                        names?.get(&var).copied()
-                    },
-                )
-            })
-            .chain(any_slot)
-            .collect();
-        if pinned.is_empty() {
+            .filter_map(|raw| name_of(*raw));
+        for sym in free_msg.chain(self.any_return_slot_pin(&key, inst)) {
+            pins.insert(sym, UserPin::Unit);
+        }
+        if pins.is_empty() {
             CallPin::None
         } else {
-            CallPin::MsgUnit(pinned)
+            CallPin::User(pins)
         }
     }
 
@@ -25625,7 +25877,7 @@ impl<'a> Lowerer<'a> {
                         // free parameter is not an enclosing generic (which would
                         // already pin it — see `kernel_turbofish_pin`).
                         let pin = match &resolved {
-                            Callee::Func(_) => self.user_func_msg_pin(callee),
+                            Callee::Func(_) => self.user_func_pin(callee),
                             Callee::Kernel(_) | Callee::Ffi { .. } => {
                                 self.kernel_turbofish_pin(&resolved, args, call_span)
                             }
@@ -27738,7 +27990,7 @@ impl<'a> Lowerer<'a> {
         // applied; the affected kernels never take this shape, so only a user
         // callee's message slot can need a pin.
         let pin = match &resolved {
-            Callee::Func(_) => self.user_func_msg_pin(callee),
+            Callee::Func(_) => self.user_func_pin(callee),
             Callee::Kernel(_) | Callee::Ffi { .. } => CallPin::None,
         };
         Ok(Expr::Apply {
@@ -27865,12 +28117,16 @@ impl<'a> Lowerer<'a> {
         }
         self.advance_eta(residual);
         let ret = self.ir_type_from_ty_json(ret_ty, call_span)?;
+        let pin = match &resolved {
+            Callee::Func(_) => self.user_func_pin(callee),
+            Callee::Kernel(_) | Callee::Ffi { .. } => CallPin::None,
+        };
         // Body: apply (surplus + residual) args to the direct-call result at once.
         let body = Expr::Apply {
             func: Box::new(Expr::Call {
                 callee: resolved,
                 args: head,
-                pin: CallPin::None,
+                pin,
                 // Over-applied kernel base call — never `onSubmit`.
                 on_form: OnFormKind::NotForm,
             }),
@@ -29747,19 +30003,25 @@ impl<'a> Lowerer<'a> {
         }
     }
 
-    /// Whether the `Result e a` value produced at `span` still has an
-    /// unconstrained error type `e` after solving. True only when the solved
-    /// region type is a `Result` constructor whose first argument (the error
-    /// type) is an unresolved [`Ty::Var`] — the case the backend cannot emit as a
-    /// bare `IpeResult::Ok` without tripping rustc's E0282 ambiguity. A missing
-    /// region type or a concrete error type yields `false`.
+    /// Whether the `Result e a` value produced at `span` has an open error
+    /// type `e`: a wildcard or a variable no generic or erasure of the
+    /// current def reads ([`OwnedVarRead::Lenient`]) — the case the backend
+    /// cannot emit as a bare `IpeResult::Ok` without rustc's E0282. A generic
+    /// `e` stays the def's own Rust generic, never the wrapper's fixed error.
+    /// A missing region type or a concrete error type yields `false`.
     fn result_error_unresolved(&self, span: Span) -> bool {
-        match self.region_ty(span) {
-            Some(Ty::Con { name, args, .. }) => {
-                self.resolve(*name).is_ok_and(|n| n == "Result")
-                    && matches!(args.first(), Some(Ty::Var(_) | Ty::Wildcard))
-            }
-            _ => false,
+        let Some(Ty::Con { name, args, .. }) = self.region_ty(span) else {
+            return false;
+        };
+        let at = self
+            .interner
+            .resolve(*name)
+            .and_then(|n| ui_msg_slots::result_error_slot(n, args));
+        match at.and_then(|at| args.get(at)) {
+            Some(Ty::Wildcard) => true,
+            Some(Ty::Var(raw)) => matches!(self.owned_var_read(*raw), OwnedVarRead::Lenient),
+            Some(Ty::Unit | Ty::Fun(..) | Ty::Con { .. } | Ty::Tuple(_) | Ty::Record(..))
+            | None => false,
         }
     }
 
@@ -34579,7 +34841,9 @@ mod tests {
                     None,
                     "an untagged raw is an annotation symbol, never a variable key"
                 );
-                let msg_slot = lowerer.ir_type_from_ty_ui_msg(&Ty::Var(BARE_VAR), UNIT_SPAN);
+                let args = [Ty::Var(BARE_VAR)];
+                let (_, msg) = super::ui_msg_slots::lookup("Html", &args).unwrap();
+                let msg_slot = lowerer.ir_type_from_ty_ui_msg(msg, UNIT_SPAN);
                 assert!(
                     matches!(msg_slot, Ok(super::IrType::Unit)),
                     "a symbol raw in a msg slot stays message-free, got {msg_slot:?}"
@@ -34626,6 +34890,593 @@ mod tests {
             "",
         );
         check(&lowerer, &syms);
+    }
+
+    /// A free variable the slot tests place, unowned by any def.
+    const SLOT_FREE_VAR: u32 = 7;
+
+    /// The span of the `render` reference whose use pin the slot tests read.
+    const RENDER_CALL_SPAN: Span = Span::new(70, 76);
+
+    /// `name` applied to `arity` arguments: a free variable at `slot`, the
+    /// nullary `filler` everywhere else.
+    fn slot_probe(
+        name: ipe_intern::Symbol,
+        arity: usize,
+        slot: usize,
+        filler: ipe_intern::Symbol,
+    ) -> Ty {
+        Ty::Con {
+            module: vec![],
+            name,
+            args: (0..arity)
+                .map(|i| {
+                    if i == slot {
+                        Ty::Var(SLOT_FREE_VAR)
+                    } else {
+                        Ty::Con {
+                            module: vec![],
+                            name: filler,
+                            args: vec![],
+                        }
+                    }
+                })
+                .collect(),
+        }
+    }
+
+    /// Every [`super::ui_msg_slots::UI_MSG_SLOTS`] row names an argument
+    /// [`Lowerer::ir_type_from_ty`] reads as a message slot: a free variable
+    /// there lowers to `()`, the reading the slot-only use pin renders, under
+    /// the ctor the row fixes.
+    #[test]
+    fn every_ui_msg_slot_is_read_as_a_message_slot() {
+        let slots = super::ui_msg_slots::UI_MSG_SLOTS;
+        let mut names: Vec<&str> = slots
+            .iter()
+            .map(super::ui_msg_slots::UiMsgSlot::name)
+            .collect();
+        names.push("Web");
+        with_named_lowerer(&names, |lowerer, syms| {
+            let web = *syms.last().unwrap();
+            for (row, name) in slots.iter().zip(syms) {
+                let ty = slot_probe(*name, row.arity(), row.slot(), web);
+                let lowered = lowerer.ir_type_from_ty(&ty, UNIT_SPAN);
+                let ctor_agrees = |ctor: &super::UiCtor| match row.ctor() {
+                    super::ui_msg_slots::UiSlotCtor::Fixed(fixed) => *ctor == fixed,
+                    super::ui_msg_slots::UiSlotCtor::ByEngineTag => *ctor == super::UiCtor::Element,
+                    super::ui_msg_slots::UiSlotCtor::ByAttributeHome => {
+                        *ctor == super::UiCtor::UiAttribute
+                    }
+                };
+                assert!(
+                    matches!(&lowered, Ok(super::IrType::Ui { ctor, msg })
+                        if **msg == super::IrType::Unit && ctor_agrees(ctor)),
+                    "`{}` slot {} must read a free variable as `()`, got {lowered:?}",
+                    row.name(),
+                    row.slot()
+                );
+            }
+        });
+    }
+
+    /// The reader's UI arms are the table's rows and nothing else: a row's
+    /// name at another arity, or any non-row name, never reads as a UI type,
+    /// so no position the use-pin classifier calls a non-slot reads a free
+    /// variable as `()`.
+    #[test]
+    fn no_position_outside_the_slot_table_reads_as_a_ui_type() {
+        let slots = super::ui_msg_slots::UI_MSG_SLOTS;
+        let mut names: Vec<&str> = slots
+            .iter()
+            .map(super::ui_msg_slots::UiMsgSlot::name)
+            .collect();
+        names.extend(["Web", "Cmd", "List", "Maybe", "Sub"]);
+        with_named_lowerer(&names, |lowerer, syms| {
+            let web = *syms.get(slots.len()).unwrap();
+            let mut probes: Vec<Ty> = Vec::new();
+            for (row, name) in slots.iter().zip(syms) {
+                for arity in [row.arity().saturating_sub(1), row.arity().saturating_add(1)] {
+                    probes.extend((0..arity).map(|slot| slot_probe(*name, arity, slot, web)));
+                }
+            }
+            for name in syms.iter().skip(slots.len() + 1) {
+                probes.push(slot_probe(*name, 1, 0, web));
+            }
+            for ty in probes {
+                let lowered = lowerer.ir_type_from_ty(&ty, UNIT_SPAN);
+                assert!(
+                    !matches!(&lowered, Ok(super::IrType::Ui { .. })),
+                    "`{ty:?}` is no slot-table row, yet read as a UI type: {lowered:?}"
+                );
+            }
+        });
+    }
+
+    /// A declared type over `msg`, built from a `View Web m` builder, a
+    /// `Result e a` builder and `msg`.
+    type UseShape = fn(&dyn Fn(Ty) -> Ty, &dyn Fn(Ty, Ty) -> Ty, Ty) -> Ty;
+
+    /// The use pin of a reference to `render`, declared `Unit -> shape(msg)` and
+    /// used at `Unit -> shape(free)`; `shape` builds over `View Web`. With
+    /// `erased`, `free` is a solver variable the enclosing def's signature
+    /// erased with that reading.
+    fn render_use_pin(
+        shape: UseShape,
+        erased: Option<super::ErasedTvar>,
+    ) -> (ipe_intern::Symbol, ipe_ir::CallPin) {
+        let free = if erased.is_some() {
+            ipe_types::tag_solver_var(SLOT_FREE_VAR)
+        } else {
+            SLOT_FREE_VAR
+        };
+        let mut interner = Interner::new();
+        let builtins = build_test_builtin_ctors(&mut interner);
+        let view = interner.intern("View").unwrap();
+        let web = interner.intern("Web").unwrap();
+        let result = interner.intern("Result").unwrap();
+        let msg = interner.intern("msg").unwrap();
+        let render = interner.intern("render").unwrap();
+        let result_of = move |e: Ty, a: Ty| Ty::Con {
+            module: vec![],
+            name: result,
+            args: vec![e, a],
+        };
+        let view_web = move |m: Ty| Ty::Con {
+            module: vec![],
+            name: view,
+            args: vec![
+                Ty::Con {
+                    module: vec![],
+                    name: web,
+                    args: vec![],
+                },
+                m,
+            ],
+        };
+        let module = canon::Module {
+            imports_unsafe_submodule: false,
+            imported_web_capabilities: BTreeSet::new(),
+            name: vec![],
+            unions: vec![],
+            defs: vec![],
+        };
+        let mut types = empty_solved_types();
+        types.env.insert(
+            (vec![], render),
+            Ty::Fun(
+                Box::new(Ty::Unit),
+                Box::new(shape(&view_web, &result_of, Ty::Var(msg.as_raw()))),
+            ),
+        );
+        types.regions.insert(
+            (vec![], RENDER_CALL_SPAN),
+            Ty::Fun(
+                Box::new(Ty::Unit),
+                Box::new(shape(&view_web, &result_of, Ty::Var(free))),
+            ),
+        );
+        let lowerer = Lowerer::new(
+            &module,
+            &types,
+            &interner,
+            SymbolPools {
+                eta_params: vec![],
+                cap_params: vec![],
+                param_binders: vec![],
+                any_param_binders: vec![],
+                projection_decode_binders: vec![],
+                destructure_thunk_binders: vec![],
+                nested_cons_binders: vec![],
+                nested_strlit_binders: vec![],
+                tuple_elem_binders: vec![],
+                wildcard_marker: super::WildcardMarker(ipe_intern::Symbol::from_raw(u32::MAX)),
+            },
+            &builtins,
+            "",
+            "",
+        );
+        if let (Some(read), Some(var)) = (erased, ipe_types::SolverVar::from_raw(free)) {
+            lowerer.current_erased_tvars.borrow_mut().insert(var, read);
+        }
+        let callee = Located::new(
+            RENDER_CALL_SPAN,
+            canon::Expr_::VarTopLevel {
+                module: vec![],
+                name: render,
+            },
+        );
+        (msg, lowerer.user_func_pin(&callee))
+    }
+
+    /// `render : String -> Element msg` canonicalises to `View Web msg`: a use
+    /// leaving `msg` free pins it to `()`, the type its `Element<()>` node
+    /// lowers to, never `JsonVal`.
+    #[test]
+    fn a_view_message_parameter_left_free_pins_unit() {
+        let (msg, pin) = render_use_pin(|view_web, _, m| view_web(m), None);
+        assert_eq!(
+            pin,
+            ipe_ir::CallPin::User(BTreeMap::from([(msg, ipe_ir::UserPin::Unit)]))
+        );
+    }
+
+    /// A parameter only the declared return names, in a message slot and
+    /// outside one, is left to the use's expected type: no pin, never a
+    /// reading the return then contradicts.
+    #[test]
+    fn a_return_only_parameter_in_and_outside_a_message_slot_pins_nothing() {
+        let (_, pin) = render_use_pin(
+            |view_web, _, m| Ty::Tuple(vec![view_web(m.clone()), m]),
+            None,
+        );
+        assert_eq!(pin, ipe_ir::CallPin::None);
+    }
+
+    /// A parameter only the declared return names, in a `Result` error slot,
+    /// is left to the use's expected type: no pin.
+    #[test]
+    fn a_return_only_result_error_parameter_pins_nothing() {
+        let (_, pin) = render_use_pin(|_, result_of, m| result_of(m, Ty::Unit), None);
+        assert_eq!(pin, ipe_ir::CallPin::None);
+    }
+
+    /// A parameter a declared argument names, left open by the use, is an
+    /// open pin holding the refusal that names the callee and the variable.
+    #[test]
+    fn an_open_argument_parameter_is_an_open_pin_holding_its_refusal() {
+        let (msg, pin) = render_use_pin(|_, _, m| Ty::Fun(Box::new(m), Box::new(Ty::Unit)), None);
+        let open = matches!(
+            &pin,
+            ipe_ir::CallPin::User(pins)
+                if matches!(
+                    pins.get(&msg),
+                    Some(ipe_ir::UserPin::Open(d, ipe_ir::ArgumentErasure::Other)) if matches!(
+                        &**d,
+                        super::Diagnostic::Lower {
+                            span: RENDER_CALL_SPAN,
+                            msg: super::LowerError::UninferableErasedParameter { callee, var },
+                        } if &**callee == "render" && &**var == "msg"
+                    )
+                )
+        );
+        assert!(open, "got {pin:?}");
+    }
+
+    /// A parameter a declared argument names, instantiated to a variable the
+    /// enclosing signature erased to `()`, reads `()` at every position: its
+    /// pin is that instance, not an open pin.
+    #[test]
+    fn an_argument_parameter_erased_to_unit_pins_unit() {
+        let (msg, pin) = render_use_pin(
+            |_, _, m| Ty::Fun(Box::new(m), Box::new(Ty::Unit)),
+            Some(super::ErasedTvar::Unit),
+        );
+        assert_eq!(
+            pin,
+            ipe_ir::CallPin::User(BTreeMap::from([(
+                msg,
+                ipe_ir::UserPin::Instance(super::IrType::Unit)
+            )]))
+        );
+    }
+
+    /// An application whose argument count differs from the declaration's
+    /// parameter count is a compiler bug, never a positional erasure.
+    #[test]
+    fn an_enum_application_not_filling_its_declared_parameters_is_refused() {
+        let mut interner = Interner::new();
+        let builtins = build_test_builtin_ctors(&mut interner);
+        let (main, pair, pa, pb) = (
+            interner.intern("Main").unwrap(),
+            interner.intern("Pair").unwrap(),
+            interner.intern("a").unwrap(),
+            interner.intern("b").unwrap(),
+        );
+        let module = canon::Module {
+            imports_unsafe_submodule: false,
+            imported_web_capabilities: BTreeSet::new(),
+            name: vec![],
+            unions: vec![],
+            defs: vec![],
+        };
+        let types = empty_solved_types();
+        let mut lowerer = Lowerer::new(
+            &module,
+            &types,
+            &interner,
+            SymbolPools {
+                eta_params: vec![],
+                cap_params: vec![],
+                param_binders: vec![],
+                any_param_binders: vec![],
+                projection_decode_binders: vec![],
+                destructure_thunk_binders: vec![],
+                nested_cons_binders: vec![],
+                nested_strlit_binders: vec![],
+                tuple_elem_binders: vec![],
+                wildcard_marker: super::WildcardMarker(ipe_intern::Symbol::from_raw(u32::MAX)),
+            },
+            &builtins,
+            "",
+            "",
+        );
+        let def = ipe_ir::EnumDef {
+            name: pair,
+            home: ipe_ir::ModPath(vec![main]),
+            type_params: vec![pa, pb],
+            variants: vec![ipe_ir::Variant {
+                name: pair,
+                fields: vec![ipe_ir::IrType::Generic(pa), ipe_ir::IrType::Generic(pb)],
+            }],
+        };
+        lowerer.enum_param_use = ipe_ir::EnumParamUse::of([&def]);
+        let kept = lowerer
+            .emitted_type_args(&[main], pair, &[1u8, 2][..])
+            .map(|args| args.copied().collect::<Vec<u8>>());
+        assert_eq!(kept, Ok(vec![1, 2]));
+        let short: &[u8] = &[1];
+        let long: &[u8] = &[1, 2, 3];
+        for args in [short, long] {
+            let refused = lowerer.emitted_type_args(&[main], pair, args).map(|_| ());
+            assert!(
+                matches!(
+                    refused,
+                    Err(ipe_diagnostics::Diagnostic::CompilerBug {
+                        where_: "ipe_lower::emitted_type_args",
+                        ..
+                    })
+                ),
+                "{} arguments must be refused: {refused:?}",
+                args.len()
+            );
+        }
+    }
+
+    /// A store-row phantom union is declared without its source `row`
+    /// parameter, so its one-argument application is admitted and emits none.
+    #[test]
+    fn a_store_row_phantom_application_holding_its_source_argument_is_admitted() {
+        let mut interner = Interner::new();
+        let builtins = build_test_builtin_ctors(&mut interner);
+        let (ipe, db, store, cond, compare, plain) = (
+            interner.intern("Ipe").unwrap(),
+            interner.intern("Db").unwrap(),
+            interner.intern("Store").unwrap(),
+            interner.intern("Cond").unwrap(),
+            interner.intern("Compare").unwrap(),
+            interner.intern("Plain").unwrap(),
+        );
+        let module = canon::Module {
+            imports_unsafe_submodule: false,
+            imported_web_capabilities: BTreeSet::new(),
+            name: vec![],
+            unions: vec![],
+            defs: vec![],
+        };
+        let types = empty_solved_types();
+        let mut lowerer = Lowerer::new(
+            &module,
+            &types,
+            &interner,
+            SymbolPools {
+                eta_params: vec![],
+                cap_params: vec![],
+                param_binders: vec![],
+                any_param_binders: vec![],
+                projection_decode_binders: vec![],
+                destructure_thunk_binders: vec![],
+                nested_cons_binders: vec![],
+                nested_strlit_binders: vec![],
+                tuple_elem_binders: vec![],
+                wildcard_marker: super::WildcardMarker(ipe_intern::Symbol::from_raw(u32::MAX)),
+            },
+            &builtins,
+            "",
+            "",
+        );
+        let home = [ipe, db, store];
+        let phantom = ipe_ir::EnumDef {
+            name: cond,
+            home: ipe_ir::ModPath(home.to_vec()),
+            type_params: vec![],
+            variants: vec![ipe_ir::Variant {
+                name: compare,
+                fields: vec![ipe_ir::IrType::Int],
+            }],
+        };
+        let nongeneric = ipe_ir::EnumDef {
+            name: plain,
+            home: ipe_ir::ModPath(home.to_vec()),
+            type_params: vec![],
+            variants: vec![ipe_ir::Variant {
+                name: plain,
+                fields: vec![ipe_ir::IrType::Int],
+            }],
+        };
+        lowerer.enum_param_use = ipe_ir::EnumParamUse::of([&phantom, &nongeneric]);
+        let kept = lowerer
+            .emitted_type_args(&home, cond, &[1u8][..])
+            .map(|args| args.copied().collect::<Vec<u8>>());
+        assert_eq!(kept, Ok(vec![]));
+        let refused = lowerer
+            .emitted_type_args(&home, plain, &[1u8][..])
+            .map(|_| ());
+        assert!(
+            matches!(
+                refused,
+                Err(ipe_diagnostics::Diagnostic::CompilerBug {
+                    where_: "ipe_lower::emitted_type_args",
+                    ..
+                })
+            ),
+            "a non-phantom enum declaring no parameters must refuse an argument: {refused:?}"
+        );
+    }
+
+    /// The `Ipe.Cache.Cache` handle drops every source argument, so an
+    /// application holding its `k` and `v` is admitted whatever its table entry
+    /// declares, and emits no argument.
+    #[test]
+    fn a_cache_handle_application_holding_its_source_arguments_is_admitted() {
+        let mut interner = Interner::new();
+        let builtins = build_test_builtin_ctors(&mut interner);
+        let (ipe, cache, handle) = (
+            interner.intern("Ipe").unwrap(),
+            interner.intern("Cache").unwrap(),
+            interner.intern("Handle").unwrap(),
+        );
+        let module = canon::Module {
+            imports_unsafe_submodule: false,
+            imported_web_capabilities: BTreeSet::new(),
+            name: vec![],
+            unions: vec![],
+            defs: vec![],
+        };
+        let types = empty_solved_types();
+        let mut lowerer = Lowerer::new(
+            &module,
+            &types,
+            &interner,
+            SymbolPools {
+                eta_params: vec![],
+                cap_params: vec![],
+                param_binders: vec![],
+                any_param_binders: vec![],
+                projection_decode_binders: vec![],
+                destructure_thunk_binders: vec![],
+                nested_cons_binders: vec![],
+                nested_strlit_binders: vec![],
+                tuple_elem_binders: vec![],
+                wildcard_marker: super::WildcardMarker(ipe_intern::Symbol::from_raw(u32::MAX)),
+            },
+            &builtins,
+            "",
+            "",
+        );
+        let home = [ipe, cache];
+        let opaque = ipe_ir::EnumDef {
+            name: cache,
+            home: ipe_ir::ModPath(home.to_vec()),
+            type_params: vec![],
+            variants: vec![ipe_ir::Variant {
+                name: handle,
+                fields: vec![ipe_ir::IrType::Int],
+            }],
+        };
+        lowerer.enum_param_use = ipe_ir::EnumParamUse::of([&opaque]);
+        assert!(lowerer.is_cache_handle_con(&home, cache));
+        let kept = lowerer
+            .emitted_type_args(&home, cache, &[1u8, 2u8][..])
+            .map(|args| args.copied().collect::<Vec<u8>>());
+        assert_eq!(kept, Ok(vec![]));
+    }
+
+    /// A variable is erased by an unused enum parameter only under a
+    /// distinct program union the walk enters: under a direct `Tag a` it is,
+    /// but under a builtin non-distinct head, a stdlib union (`Cond (Tag a)`)
+    /// or a builtin (`Connection (Tag a)`), it is never entered, so it is
+    /// not.
+    #[test]
+    fn an_unused_enum_parameter_under_a_dropped_argument_erases_no_variable() {
+        let mut interner = Interner::new();
+        let builtins = build_test_builtin_ctors(&mut interner);
+        let (main, tag, pa, ipe, db, store, cond, compare, connection, list) = (
+            interner.intern("Main").unwrap(),
+            interner.intern("Tag").unwrap(),
+            interner.intern("a").unwrap(),
+            interner.intern("Ipe").unwrap(),
+            interner.intern("Db").unwrap(),
+            interner.intern("Store").unwrap(),
+            interner.intern("Cond").unwrap(),
+            interner.intern("Compare").unwrap(),
+            interner.intern("Connection").unwrap(),
+            interner.intern("List").unwrap(),
+        );
+        let module = canon::Module {
+            imports_unsafe_submodule: false,
+            imported_web_capabilities: BTreeSet::new(),
+            name: vec![],
+            unions: vec![],
+            defs: vec![],
+        };
+        let types = empty_solved_types();
+        let mut lowerer = Lowerer::new(
+            &module,
+            &types,
+            &interner,
+            SymbolPools {
+                eta_params: vec![],
+                cap_params: vec![],
+                param_binders: vec![],
+                any_param_binders: vec![],
+                projection_decode_binders: vec![],
+                destructure_thunk_binders: vec![],
+                nested_cons_binders: vec![],
+                nested_strlit_binders: vec![],
+                tuple_elem_binders: vec![],
+                wildcard_marker: super::WildcardMarker(ipe_intern::Symbol::from_raw(u32::MAX)),
+            },
+            &builtins,
+            "",
+            "",
+        );
+        let store_home = vec![ipe, db, store];
+        let phantom_tag = ipe_ir::EnumDef {
+            name: tag,
+            home: ipe_ir::ModPath(vec![main]),
+            type_params: vec![pa],
+            variants: vec![ipe_ir::Variant {
+                name: tag,
+                fields: vec![],
+            }],
+        };
+        let row_cond = ipe_ir::EnumDef {
+            name: cond,
+            home: ipe_ir::ModPath(store_home.clone()),
+            type_params: vec![],
+            variants: vec![ipe_ir::Variant {
+                name: compare,
+                fields: vec![ipe_ir::IrType::Int],
+            }],
+        };
+        lowerer.enum_param_use = ipe_ir::EnumParamUse::of([&phantom_tag, &row_cond]);
+        lowerer
+            .enum_variants
+            .insert((ipe_ir::ModPath(vec![main]), tag), vec![tag]);
+        lowerer
+            .enum_variants
+            .insert((ipe_ir::ModPath(store_home.clone()), cond), vec![compare]);
+        assert!(!lowerer.is_distinct_program_union(&store_home, cond));
+        let var = 7;
+        let tag_a = Ty::Con {
+            module: vec![main],
+            name: tag,
+            args: vec![Ty::Var(var)],
+        };
+        let applied = |module: Vec<ipe_intern::Symbol>, name| Ty::Con {
+            module,
+            name,
+            args: vec![tag_a.clone()],
+        };
+        let rows = Ty::Con {
+            module: vec![],
+            name: list,
+            args: vec![Ty::Var(var)],
+        };
+        let arrow = |param: Ty| Ty::Fun(Box::new(param), Box::new(rows.clone()));
+        assert_eq!(
+            lowerer.unused_enum_parameter_vars(&arrow(tag_a.clone())),
+            BTreeSet::from([var])
+        );
+        assert_eq!(
+            lowerer.unused_enum_parameter_vars(&arrow(applied(store_home, cond))),
+            BTreeSet::new()
+        );
+        assert_eq!(
+            lowerer.unused_enum_parameter_vars(&arrow(applied(vec![], connection))),
+            BTreeSet::new()
+        );
     }
 
     /// A nullary built-in `Ty::Con` named `name`.
