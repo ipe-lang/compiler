@@ -90,8 +90,8 @@ use std::time::{Duration, Instant};
 
 use crate::output_dir::{EmitTarget, OutputRefusal, OwnedDir, ProjectPaths};
 use crate::package_manifest::PACKAGE_IPE;
-use crate::project;
-use crate::project_root::{ProjectRoot, RootArg};
+use crate::project_root::{ProjectRoot, RootArg, SourceDir};
+use crate::source_snapshot::{Limits, SourceOrigin, SourceSnapshot};
 use crate::target_dir::LinkableTargetDir;
 use crate::text;
 use crate::threads::{self, ThreadRole};
@@ -452,8 +452,10 @@ impl RebuildTimings {
 pub(crate) struct ResolvedProject {
     /// The held project root every path below derives from.
     pub(crate) root: ProjectRoot,
-    pub(crate) sources: BTreeMap<Vec<String>, (PathBuf, String)>,
-    pub(crate) discovered: Vec<project::DiscoveredModule>,
+    /// Every module the build sees, read once through `root`'s held handles:
+    /// the `src/` modules, the stdlib closure and the FFI interfaces, each
+    /// tagged with its origin, over the catalog read through `root.cache_dir()`.
+    pub(crate) snapshot: SourceSnapshot,
     pub(crate) entry_path: Vec<String>,
     /// What the confined watcher observes for this snapshot.
     pub(crate) scope: ScopeSpec,
@@ -471,7 +473,7 @@ impl ResolvedProject {
 pub(crate) struct ScopeSpec {
     /// The project directory.
     pub(crate) root: PathBuf,
-    /// Every module file the bounded module discovery found.
+    /// Every `src/` module file of the snapshot.
     pub(crate) source_files: Vec<PathBuf>,
 }
 
@@ -485,43 +487,49 @@ impl ScopeSpec {
     }
 }
 
-/// Resolve the modules of the held project `root` into a fresh
-/// [`ResolvedProject`] by re-reading every module file from disk.
+/// Resolve the modules of the held project `root` into a fresh [`ResolvedProject`].
 ///
-/// The root is the one `ipe dev build` resolves for the same directory, so
-/// the module set, the entry and the manifest a rebuild compiles are the
-/// build's; no directory above or below the root is searched for a manifest.
+/// The modules are the [`SourceSnapshot`] `ipe dev build` reads for the same
+/// root: every component is opened beneath the root's held handles, a link
+/// anywhere in the tree is refused, and the FFI catalog is read through the
+/// root's held cache directory. No directory above or below the root is
+/// searched for a manifest, and no module is read again by path.
 ///
 /// # Errors
-/// [`CliError::Io`] on any filesystem failure; [`CliError::DiscoveryLimitReached`]
-/// when the source tree is too deep or too large; [`CliError::DeviceNamedModule`]
-/// for a module file naming a Windows device; [`CliError::EntryMissing`] when
+/// Every refusal of [`SourceSnapshot::read`]; [`CliError::EntryMissing`] when
 /// the manifest's program entry is not spelled relative to `src/`.
 pub(crate) fn resolve_project_sources(root: ProjectRoot) -> Result<ResolvedProject, CliError> {
-    let manifest = root.manifest();
-    let discovered = project::discover_modules(&manifest.src_root)?;
-    let mut sources: BTreeMap<Vec<String>, (PathBuf, String)> = BTreeMap::new();
-    for m in &discovered {
-        let src = crate::io_bounded::read_walked_source(m.path())?;
-        sources.insert(m.module_path().to_vec(), (m.path().to_path_buf(), src));
-    }
+    let snapshot = SourceSnapshot::read(&root, Limits::DEFAULT)?;
     // The entry defaults to `["Main"]`; a `programs` manifest routes its
     // (default) program's declared entry file through instead. Named
     // multi-program selection is a reported residual — see
     // `misc/docs/package-programs-design.md`.
-    let entry_path = manifest.resolved_entry()?;
-    let source_files = discovered.iter().map(|m| m.path().to_path_buf()).collect();
+    let entry_path = root.manifest().resolved_entry()?;
+    let source_files = snapshot
+        .modules()
+        .values()
+        .filter(|held| held.origin() == SourceOrigin::Own(SourceDir::Src))
+        .map(|held| held.path().to_path_buf())
+        .collect();
     let scope = ScopeSpec {
         root: root.path().to_path_buf(),
         source_files,
     };
     Ok(ResolvedProject {
         root,
-        sources,
-        discovered,
+        snapshot,
         entry_path,
         scope,
     })
+}
+
+/// The database origin of a snapshot module.
+const fn db_origin(origin: SourceOrigin) -> ipe_db::ModuleOrigin {
+    match origin {
+        SourceOrigin::Own(SourceDir::Src | SourceDir::Tests) => ipe_db::ModuleOrigin::User,
+        SourceOrigin::Stdlib => ipe_db::ModuleOrigin::EmbeddedStdlib,
+        SourceOrigin::FfiInterface => ipe_db::ModuleOrigin::FfiInterface,
+    }
 }
 
 /// The directories a scope hands the OS-level watcher.
@@ -1200,49 +1208,16 @@ fn run_inner(
                     }
                 };
                 let settings = watch_emit_settings(&resolved, opts.debugger, opts.hot_appearance);
-                let mut sources = resolved.sources;
-                let mut discovered = resolved.discovered;
-                let injected = project::inject_compiled_std_closure(&mut sources, &mut discovered);
-
-                // Load the FFI catalog from the held root's cache and inject
-                // installed-crate interface modules — the same seam `run_build`
-                // uses. An error logs and skips the cycle (same policy as a
-                // resolution failure above) rather than tearing down the
-                // whole watch session.
-                let ffi_prep = match resolved
-                    .root
-                    .cache_dir()
-                    .and_then(|cache| crate::ffi::load_catalog(cache.as_ref()))
-                    .and_then(|catalog| crate::ffi::prepare(&mut sources, &catalog))
-                {
-                    Ok(p) => p,
-                    Err(e) => {
-                        emit_watch_line(
-                            &crate::style::TerminalSafe::sanitize(&format!(
-                                "[ipe dev watch] FFI catalog error: {e}"
-                            )),
-                            WatchRole::Failure,
-                        );
-                        continue;
-                    }
-                };
-
-                // Borrow each module's text: `sync_source_root` clones only at
-                // the real mutation points (a new input, or an actually-changed
-                // set), so a settled batch that touches one file no longer copies
-                // every module's source (including the ~130-module injected
-                // stdlib closure) into a map that is immediately discarded.
-                let desired: BTreeMap<Vec<String>, (&str, ipe_db::ModuleOrigin)> = sources
+                // Borrow each module's text from the snapshot:
+                // `sync_source_root` clones only at the real mutation points
+                // (a new input, or an actually-changed set), so the database
+                // copies no unchanged module's source.
+                let modules = resolved.snapshot.modules();
+                let desired: BTreeMap<Vec<String>, (&str, ipe_db::ModuleOrigin)> = modules
                     .iter()
-                    .map(|(p, (_, text))| {
-                        let origin = if injected.contains(p) {
-                            ipe_db::ModuleOrigin::EmbeddedStdlib
-                        } else if ffi_prep.injected.contains(p) {
-                            ipe_db::ModuleOrigin::FfiInterface
-                        } else {
-                            ipe_db::ModuleOrigin::User
-                        };
-                        (p.clone(), (text.as_str(), origin))
+                    .map(|(module, held)| {
+                        let input = (held.text(), db_origin(held.origin()));
+                        (module.clone(), input)
                     })
                     .collect();
 
@@ -1257,7 +1232,7 @@ fn run_inner(
                     settings: ipe_backend_rust::EmitSettings {
                         // The backend writes FFI bindings (src/ffi.rs) into the
                         // emitted project — the same slot `run_build` fills.
-                        ffi: ffi_prep.emit,
+                        ffi: resolved.snapshot.ffi().emit.clone(),
                         // Dependency-model emit: the project links the runtime
                         // as a path dependency (what `ipe dev build` uses by
                         // default), so no runtime source is vendored into
@@ -1285,6 +1260,14 @@ fn run_inner(
                 timings.resolve = Some(resolve_started.elapsed());
 
                 let db_worker = db_main.db().clone();
+                // The worker owns its copy of the module texts the compile reads.
+                let sources: BTreeMap<Vec<String>, (PathBuf, String)> = modules
+                    .iter()
+                    .map(|(module, held)| {
+                        let read = (held.path().to_path_buf(), held.text().to_owned());
+                        (module.clone(), read)
+                    })
+                    .collect();
                 let entry_path = resolved.entry_path.clone();
                 let blame_path = resolved.blame_path();
                 let worker_tx = evt_tx.clone();

@@ -16,8 +16,9 @@ use ipe_lsp_server::{LimitSource, LoadError, LoadedFile, LoadedProject, ProjectL
 
 use crate::ffi::FfiPrepError;
 use crate::package_manifest::PACKAGE_IPE;
-use crate::project_root::{ProjectRoot, RootArg};
-use crate::{CliError, project, text, watch};
+use crate::project_root::{ProjectRoot, RootArg, SourceDir};
+use crate::source_snapshot::SourceOrigin;
+use crate::{CliError, text, watch};
 
 /// The directory `open_file` is resolved in.
 ///
@@ -171,38 +172,30 @@ impl ProjectLoader for DriverLoader {
             })
         })?;
         let root = ProjectRoot::resolve(RootArg::at(&dir)).map_err(|e| load_error(&e))?;
-        // The catalog is read through the held root's cache handle before the
-        // root moves into the module resolution, so a tampered cache refuses
-        // the load exactly as `ipe dev build` refuses it.
-        let catalog = root
-            .cache_dir()
-            .and_then(|cache| crate::ffi::load_catalog(cache.as_ref()))
-            .map_err(|e| load_error(&e))?;
         let manifest_path = root.path().join(PACKAGE_IPE);
-        let watch::ResolvedProject {
-            mut sources,
-            mut discovered,
-            entry_path: entry_module,
-            ..
-        } = watch::resolve_project_sources(root).map_err(|e| load_error(&e))?;
-        let injected = project::inject_compiled_std_closure(&mut sources, &mut discovered);
-        // Inject installed-crate interface modules so the LSP sees
-        // `Rust.<Crate>` bindings exactly as `ipe dev build` does. A
-        // missing/empty catalog is fine (no crates installed).
-        let ffi_injected = crate::ffi::prepare(&mut sources, &catalog)
-            .map_err(|e| load_error(&e))?
-            .injected;
-        let files = sources
-            .into_iter()
-            .map(|(module, (path, text))| {
-                let origin = if injected.contains(&module) {
-                    ipe_canon::ModuleOrigin::EmbeddedStdlib
-                } else if ffi_injected.contains(&module) {
-                    ipe_canon::ModuleOrigin::FfiInterface
-                } else {
-                    ipe_canon::ModuleOrigin::User
+        // The module set is the source snapshot `ipe dev build` reads for this
+        // root: held-handle reads, a link anywhere refused, the summed size
+        // capped, and the FFI catalog read through the held cache directory.
+        let resolved = watch::resolve_project_sources(root).map_err(|e| load_error(&e))?;
+        let entry_module = resolved.entry_path;
+        let files = resolved
+            .snapshot
+            .modules()
+            .iter()
+            .map(|(module, held)| {
+                let origin = match held.origin() {
+                    SourceOrigin::Own(SourceDir::Src | SourceDir::Tests) => {
+                        ipe_canon::ModuleOrigin::User
+                    }
+                    SourceOrigin::Stdlib => ipe_canon::ModuleOrigin::EmbeddedStdlib,
+                    SourceOrigin::FfiInterface => ipe_canon::ModuleOrigin::FfiInterface,
                 };
-                (module, LoadedFile { path, text, origin })
+                let file = LoadedFile {
+                    path: held.path().to_path_buf(),
+                    text: held.text().to_owned(),
+                    origin,
+                };
+                (module.clone(), file)
             })
             .collect();
         Ok(LoadedProject {
@@ -653,6 +646,45 @@ mod tests {
         );
     }
 
+    /// A module that is a link refuses the LSP load and the watch resolution
+    /// exactly as it refuses the build: no reader of the project skips it or
+    /// follows it out of `src/`.
+    #[cfg(unix)]
+    #[test]
+    #[allow(clippy::expect_used)] // test fixture: a failed write or symlink IS the failure
+    fn a_symlinked_module_refuses_like_the_build() {
+        let fixture = RootFixture::main(MAIN).expect("fixture");
+        let outside = fixture.path().join("Outside.ipe");
+        fs::write(&outside, "module Helper exposing (h)\n\nh =\n    1\n")
+            .expect("write the link target");
+        std::os::unix::fs::symlink(&outside, fixture.path().join("src/Helper.ipe"))
+            .expect("link a module out of src/");
+        let main = fixture.path().join("src/Main.ipe");
+
+        let build_root =
+            ProjectRoot::resolve(RootArg::at(fixture.path())).expect("build resolves the root");
+        let build = crate::source_snapshot::SourceSnapshot::read(
+            &build_root,
+            crate::source_snapshot::Limits::DEFAULT,
+        );
+        assert!(
+            matches!(build, Err(CliError::SymlinkInSource { .. })),
+            "the build refuses the link"
+        );
+
+        let loaded = DriverLoader.load(&[fixture.path().to_path_buf()], &main, Some(MAIN));
+        let err = loaded.err();
+        assert!(matches!(err, Some(LoadError::Refused(_))), "{err:?}");
+
+        let watch_root =
+            ProjectRoot::resolve(RootArg::at(fixture.path())).expect("watch resolves the root");
+        let watched = watch::resolve_project_sources(watch_root);
+        assert!(
+            matches!(watched, Err(CliError::SymlinkInSource { .. })),
+            "the watch refuses the link"
+        );
+    }
+
     /// Build, LSP load and a watch resolution of one project reach the same
     /// root, the same module set and the same FFI cache; a stray
     /// `package.ipe` under `src/` changes none of them and is never read.
@@ -702,9 +734,11 @@ mod tests {
             ProjectRoot::resolve(RootArg::at(fixture.path())).expect("watch resolves the root");
         let watched = watch::resolve_project_sources(watch_root).expect("watch resolves");
         let watch_modules: Vec<(Vec<String>, PathBuf)> = watched
-            .sources
+            .snapshot
+            .modules()
             .iter()
-            .map(|(module, (path, _))| (module.clone(), path.clone()))
+            .filter(|(_, held)| held.origin() == SourceOrigin::Own(SourceDir::Src))
+            .map(|(module, held)| (module.clone(), held.path().to_path_buf()))
             .collect();
 
         let expected = vec![
