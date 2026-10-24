@@ -1097,10 +1097,10 @@ positionRefusals =
 -- token (the type's constructor, the one plan built and the one arm matched,
 -- so a plan built by passing the constructor as a function is counted too),
 -- and `decidePlan` three times (its signature, its definition and the one
--- call in `saveDecision`); none of them appears in `Main`. The arms are matched with whitespace runs
--- collapsed, so re-indenting them keeps the scan. A site list with exact
--- counts, since `ipe test` builds no `update`. Red if a second path to either
--- decision is added.
+-- call in `saveDecision`); none of them appears in `Main`. The arms are
+-- matched with whitespace runs collapsed, so re-indenting them keeps the
+-- scan. A site list with exact counts, since `ipe test` builds no `update`.
+-- Red if a second path to either decision is added.
 decisionReachedOnlyThroughDecidableSource : Task.Task Error Bool
 decisionReachedOnlyThroughDecidableSource =
     let
