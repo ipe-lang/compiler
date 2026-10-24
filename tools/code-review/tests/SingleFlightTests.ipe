@@ -590,18 +590,14 @@ startsNothing settings msgs model =
     not (List.isEmpty msgs) && List.all List.isEmpty (Tuple.second (record settings msgs model))
 
 
--- Whether two stamps are the one stamp as process `epoch` sees it: the
--- same epoch and key, both of this process.
-sameStamp : Epoch -> Stamp key -> Stamp key -> Bool
-sameStamp epoch a b =
-    Slot.owns epoch a (Just b)
-
-
-sameHeld : Epoch -> Maybe (Stamp key) -> Maybe (Stamp key) -> Bool
-sameHeld epoch a b =
+-- Whether two held stamps are the one stamp as `owns` (a slot's ownership
+-- rule, fixed to a process's epoch where the key type is known) sees it. The
+-- rule is passed in because a still-generic key type supports no equality.
+sameHeld : (Stamp key -> Maybe (Stamp key) -> Bool) -> Maybe (Stamp key) -> Maybe (Stamp key) -> Bool
+sameHeld owns a b =
     case ( a, b ) of
         ( Just x, Just y ) ->
-            sameStamp epoch x y
+            owns x (Just y)
 
         ( Nothing, Nothing ) ->
             True
@@ -611,11 +607,11 @@ sameHeld epoch a b =
 
 
 -- Whether `emitted` is exactly the one stamp `now`.
-emittedOnly : Epoch -> List (Stamp key) -> Stamp key -> Bool
-emittedOnly epoch emitted now =
+emittedOnly : (Stamp key -> Maybe (Stamp key) -> Bool) -> List (Stamp key) -> Stamp key -> Bool
+emittedOnly owns emitted now =
     case emitted of
         [ only ] ->
-            sameStamp epoch only now
+            owns only (Just now)
 
         _ ->
             False
@@ -623,11 +619,11 @@ emittedOnly epoch emitted now =
 
 -- Whether `effects` start exactly the task stamped `held` for the slot
 -- `start` reads, and nothing else for it; no stamp held is no start.
-startsExactly : Epoch -> (Effect -> Maybe (Stamp key)) -> Maybe (Stamp key) -> List Effect -> Bool
-startsExactly epoch start held effects =
+startsExactly : (Stamp key -> Maybe (Stamp key) -> Bool) -> (Effect -> Maybe (Stamp key)) -> Maybe (Stamp key) -> List Effect -> Bool
+startsExactly owns start held effects =
     case held of
         Just stamp ->
-            emittedOnly epoch (List.filterMap start effects) stamp
+            emittedOnly owns (List.filterMap start effects) stamp
 
         Nothing ->
             False
@@ -644,13 +640,13 @@ startsNone start effects =
 -- step took a stamp the slot did not hold or the slot's own completion
 -- started its want, and nothing for the slot otherwise; and a slot running
 -- under this process's epoch stops running only on its own completion.
-slotStepHolds : Epoch -> (Model -> Maybe (Stamp key)) -> (Effect -> Maybe (Stamp key)) -> (Msg -> Maybe (Stamp key)) -> Msg -> Model -> Model -> List Effect -> Bool
-slotStepHolds epoch held start completes msg before next effects =
+slotStepHolds : Epoch -> (Stamp key -> Maybe (Stamp key) -> Bool) -> (Model -> Maybe (Stamp key)) -> (Effect -> Maybe (Stamp key)) -> (Msg -> Maybe (Stamp key)) -> Msg -> Model -> Model -> List Effect -> Bool
+slotStepHolds epoch owns held start completes msg before next effects =
     let
         owned =
             case completes msg of
                 Just arrived ->
-                    Slot.owns epoch arrived (held before)
+                    owns arrived (held before)
 
                 Nothing ->
                     False
@@ -664,8 +660,8 @@ slotStepHolds epoch held start completes msg before next effects =
         startsOnce =
             case held next of
                 Just now ->
-                    if not (sameHeld epoch (held before) (Just now)) || owned then
-                        emittedOnly epoch emitted now
+                    if not (sameHeld owns (held before) (Just now)) || owned then
+                        emittedOnly owns emitted now
 
                     else
                         List.isEmpty emitted
@@ -673,17 +669,17 @@ slotStepHolds epoch held start completes msg before next effects =
                 Nothing ->
                     List.isEmpty emitted
     in
-    startsOnce && (sameHeld epoch wasRunning Nothing || sameHeld epoch (Slot.running epoch (held next)) wasRunning || owned)
+    startsOnce && (sameHeld owns wasRunning Nothing || sameHeld owns (Slot.running epoch (held next)) wasRunning || owned)
 
 
 -- Whether one step holds `slotStepHolds` for all five slots.
 stepHolds : Settings.AppSettings -> Msg -> Model -> Model -> List Effect -> Bool
 stepHolds settings msg before next effects =
-    slotStepHolds settings.epoch (\m -> Slot.runningLoad m.queueLoad) queueStart queueCompletion msg before next effects
-        && slotStepHolds settings.epoch (\m -> Slot.runningLoad m.historyLoad) historyStart historyCompletion msg before next effects
-        && slotStepHolds settings.epoch (\m -> Selected.runningView m.selectedView) viewStart viewCompletion msg before next effects
-        && slotStepHolds settings.epoch (\m -> Standing.runningStanding m.standing) standingStart standingCompletion msg before next effects
-        && slotStepHolds settings.epoch (\m -> DecisionSlot.savingStamp m.decision) decisionStart decisionCompletion msg before next effects
+    slotStepHolds settings.epoch (Slot.owns settings.epoch) (\m -> Slot.runningLoad m.queueLoad) queueStart queueCompletion msg before next effects
+        && slotStepHolds settings.epoch (Slot.owns settings.epoch) (\m -> Slot.runningLoad m.historyLoad) historyStart historyCompletion msg before next effects
+        && slotStepHolds settings.epoch (Slot.owns settings.epoch) (\m -> Selected.runningView m.selectedView) viewStart viewCompletion msg before next effects
+        && slotStepHolds settings.epoch (Slot.owns settings.epoch) (\m -> Standing.runningStanding m.standing) standingStart standingCompletion msg before next effects
+        && slotStepHolds settings.epoch (Slot.owns settings.epoch) (\m -> DecisionSlot.savingStamp m.decision) decisionStart decisionCompletion msg before next effects
 
 
 -- Whether every step of `msgs` sent to `model` in turn holds `stepHolds`.
@@ -935,9 +931,9 @@ unitEntriesDuringReadCoalesce settings a b =
         && pageTag entered == "loading"
         && inFlight returned == Just ( uc, Nothing )
         && pageTag returned == "loading"
-        && startsExactly settings.epoch viewStart (Selected.runningView first.selectedView) (effectsOf settings [ Navigated (unitAt ua) ] initialModel)
+        && startsExactly (Slot.owns settings.epoch) viewStart (Selected.runningView first.selectedView) (effectsOf settings [ Navigated (unitAt ua) ] initialModel)
         && startsNone viewStart (effectsOf settings [ Navigated (unitAt ub), Navigated (unitAt uc) ] first)
-        && startsExactly settings.epoch viewStart (Selected.runningView returned.selectedView) (effectsOf settings (viewDone settings.epoch ua (Ok (Just a))) entered)
+        && startsExactly (Slot.owns settings.epoch) viewStart (Selected.runningView returned.selectedView) (effectsOf settings (viewDone settings.epoch ua (Ok (Just a))) entered)
 
 
 -- The queue card and the unit page read through one slot: a unit page entered
@@ -1077,10 +1073,10 @@ decisionsSingleFlight settings a b =
         && DecisionSlot.notSavedOf settled.decision == Just SaveFailed
         && next.decision == savingSlot settings.epoch ua
         && lateOther.decision == savingSlot settings.epoch ua
-        && startsExactly settings.epoch decisionStart (DecisionSlot.savingStamp saving.decision) (effectsOf settings (drawnOn shown ua ApproveRow) shown)
+        && startsExactly (Slot.owns settings.epoch) decisionStart (DecisionSlot.savingStamp saving.decision) (effectsOf settings (drawnOn shown ua ApproveRow) shown)
         && startsNothing settings (drawnOn shown ua ApproveRow ++ [ press saving "a" ]) saving
         && startsNothing settings (drawnOn shown ua RefuseStart ++ draftOn (refusalOpened settings shown ua) ua "needs a test" ++ drawnOn shown ua RefuseSubmit) saving
-        && startsExactly settings.epoch decisionStart (DecisionSlot.savingStamp next.decision) (effectsOf settings (drawnOn settled ua ApproveRow) settled)
+        && startsExactly (Slot.owns settings.epoch) decisionStart (DecisionSlot.savingStamp next.decision) (effectsOf settings (drawnOn settled ua ApproveRow) settled)
         && startsNothing settings (decisionSavedFor settings.epoch b.unit.uid (Err (Error.conflict "boom"))) next
 
 
@@ -3515,7 +3511,7 @@ refusedDecisionEmitsNoEffect r =
         && startsNothing settings unlisted (queueModel [ r.a ] (ViewShown r.a))
         && startsNothing settings approve saving
         && DecisionSlot.notSavedOf (after settings approve reloaded).decision == Just (SaveRefused DrawnChanged)
-        && startsExactly settings.epoch decisionStart (DecisionSlot.savingStamp saving.decision) (effectsOf settings approve shown)
+        && startsExactly (Slot.owns settings.epoch) decisionStart (DecisionSlot.savingStamp saving.decision) (effectsOf settings approve shown)
 
 
 -- Over every model these checks build and every offer any of them draws,
@@ -3636,7 +3632,7 @@ idlePressStartsOneLoad settings =
     Slot.latestTicket running.queueLoad == Slot.nextTicket (Slot.latestTicket initialModel.queueLoad)
         && Slot.runningWant settings.epoch running.queueLoad == Just Nothing
         && Slot.runningWant settings.epoch initialModel.queueLoad == Nothing
-        && startsExactly settings.epoch queueStart (Slot.runningLoad running.queueLoad) (effectsOf settings [ Navigated QueuePage ] initialModel)
+        && startsExactly (Slot.owns settings.epoch) queueStart (Slot.runningLoad running.queueLoad) (effectsOf settings [ Navigated QueuePage ] initialModel)
 
 
 -- Pages turned, the queue shown again and a unit page entered while a queue
@@ -3704,7 +3700,7 @@ supersededQueueResultDropped settings a b =
         && settled.queueState == Loaded (queuePageOf [ b ])
         && Slot.runningWant settings.epoch settled.queueLoad == Nothing
         && startsNone queueStart (effectsOf settings [ NextPage (cursorAfter 2 "u-b") ] running)
-        && startsExactly settings.epoch queueStart (Slot.runningLoad dropped.queueLoad) (effectsOf settings (completions PendingLoaded firstLoad (Ok (queuePageOf [ a, b ]))) wanting)
+        && startsExactly (Slot.owns settings.epoch) queueStart (Slot.runningLoad dropped.queueLoad) (effectsOf settings (completions PendingLoaded firstLoad (Ok (queuePageOf [ a, b ]))) wanting)
         && startsNone queueStart (effectsOf settings (completions PendingLoaded firstLoad (Ok (queuePageOf [ a, b ]))) dropped)
         && startsNone queueStart (effectsOf settings (queueDone dropped.queueLoad (Ok (queuePageOf [ b ]))) late)
 
@@ -3741,7 +3737,7 @@ refreshingSettlesOnlyAfterWrite settings a b ( attested, written ) =
         && drained.decision == DecisionIdle PanelClosed
         && drained.queueState == Loaded (queuePageOf [ b ])
         && startsNone queueStart (effectsOf settings (decisionDone settings.epoch ua (Ok ( attested, written ))) loadingWhileSaving)
-        && startsExactly settings.epoch queueStart (Slot.runningLoad preWrite.queueLoad) (effectsOf settings (queueDone loadingWhileSaving.queueLoad (Ok (queuePageOf [ a, b ]))) saved)
+        && startsExactly (Slot.owns settings.epoch) queueStart (Slot.runningLoad preWrite.queueLoad) (effectsOf settings (queueDone loadingWhileSaving.queueLoad (Ok (queuePageOf [ a, b ]))) saved)
 
 
 -- A wanted drain absorbs a reload asked after it, taking the reload's
@@ -3828,10 +3824,10 @@ historyLoadsSingleFlight settings =
         && historyFailure settled.history == Nothing
         && settled.history /= HistoryLoading
         && Slot.runningWant settings.epoch settled.historyLoad == Nothing
-        && startsExactly settings.epoch historyStart firstLoad (effectsOf settings [ Navigated HistoryPage ] initialModel)
+        && startsExactly (Slot.owns settings.epoch) historyStart firstLoad (effectsOf settings [ Navigated HistoryPage ] initialModel)
         && startsNone historyStart (effectsOf settings [ ShowHistory, HistoryNext (historyAfter 1), HistoryNext (historyAfter 2) ] running)
         && startsNothing settings (completions App.historyLoaded otherLoad (Ok historyPage)) pressed
-        && startsExactly settings.epoch historyStart (Slot.runningLoad dropped.historyLoad) (effectsOf settings (completions App.historyLoaded firstLoad (Ok historyPage)) stale)
+        && startsExactly (Slot.owns settings.epoch) historyStart (Slot.runningLoad dropped.historyLoad) (effectsOf settings (completions App.historyLoaded firstLoad (Ok historyPage)) stale)
         && startsNone historyStart (effectsOf settings (historyLoadedOn dropped.historyLoad (Ok { historyPage | at = historyAfter 2 })) dropped)
 
 
@@ -3876,7 +3872,7 @@ standingSingleFlight settings a b =
         && stale.standing == standingReading settings.epoch ub hashB
         && shown.standing == StandingShown ub hashB Standing.Undecided
         && startsNone standingStart (effectsOf settings ([ Navigated (unitAt ub) ] ++ viewDone settings.epoch ub (Ok (Just b))) reading)
-        && startsExactly settings.epoch standingStart (Standing.runningStanding firstReturned.standing) (effectsOf settings (standingLoadedFor settings.epoch ua hashA (Ok Standing.Undecided)) second)
+        && startsExactly (Slot.owns settings.epoch) standingStart (Standing.runningStanding firstReturned.standing) (effectsOf settings (standingLoadedFor settings.epoch ua hashA (Ok Standing.Undecided)) second)
         && startsNothing settings (standingLoadedFor settings.epoch ua hashA (Ok Standing.Undecided)) firstReturned
         && startsNone standingStart (effectsOf settings (standingLoadedFor settings.epoch ub hashB (Ok Standing.Undecided)) stale)
 
@@ -3942,7 +3938,7 @@ foreignLoadSlotIdle settings otherEpoch a =
         && Slot.runningWant settings.epoch entered.queueLoad == Just Nothing
         && arrived.queueState == Loading
         && foreignLoad /= Nothing
-        && startsExactly settings.epoch queueStart (Slot.runningLoad entered.queueLoad) (effectsOf settings [ Navigated QueuePage ] held)
+        && startsExactly (Slot.owns settings.epoch) queueStart (Slot.runningLoad entered.queueLoad) (effectsOf settings [ Navigated QueuePage ] held)
         && startsNothing settings (completions PendingLoaded foreignLoad (Ok (queuePageOf [ a ]))) held
         && Standing.standingRequested settings.epoch ua hashA foreignRead == Standing.standingRequested settings.epoch ua hashA StandingUnread
         && foreignArrived == ( foreignRead, Nothing )
@@ -3983,8 +3979,8 @@ ceilingRefusalReleasesSlot settings =
         && Slot.latestTicket refusedWithWant.queueLoad == Slot.nextTicket first
         && Slot.runningWant settings.epoch refusedWithWant.queueLoad == Just Nothing
         && startsNone queueStart (effectsOf settings (completions App.queueLoaded firstLoad (Err limitMarker)) running)
-        && startsExactly settings.epoch queueStart (Slot.runningLoad pressedAfter.queueLoad) (effectsOf settings [ Navigated QueuePage ] refused)
-        && startsExactly settings.epoch queueStart (Slot.runningLoad refusedWithWant.queueLoad) (effectsOf settings (completions App.queueLoaded firstLoad (Err limitMarker)) wanting)
+        && startsExactly (Slot.owns settings.epoch) queueStart (Slot.runningLoad pressedAfter.queueLoad) (effectsOf settings [ Navigated QueuePage ] refused)
+        && startsExactly (Slot.owns settings.epoch) queueStart (Slot.runningLoad refusedWithWant.queueLoad) (effectsOf settings (completions App.queueLoaded firstLoad (Err limitMarker)) wanting)
 
 
 -- ── each task is an effect of exactly one transition ────────────────────
@@ -4065,22 +4061,22 @@ secondRequestHeldNotStarted settings a b =
         saving =
             after settings approve shown
     in
-    startsExactly settings.epoch queueStart (Slot.runningLoad queueRunning.queueLoad) (effectsOf settings [ Navigated QueuePage ] initialModel)
+    startsExactly (Slot.owns settings.epoch) queueStart (Slot.runningLoad queueRunning.queueLoad) (effectsOf settings [ Navigated QueuePage ] initialModel)
         && startsNone queueStart (effectsOf settings [ NextPage c2, ShowQueue ] queueRunning)
         && Slot.runningWant settings.epoch queueWanting.queueLoad == Just (Just (QueueReload c2))
-        && startsExactly settings.epoch queueStart (Slot.runningLoad queueRestarted.queueLoad) (effectsOf settings (queueDone queueRunning.queueLoad (Ok (queuePageOf [ a ]))) queueWanting)
-        && startsExactly settings.epoch historyStart (Slot.runningLoad historyRunning.historyLoad) (effectsOf settings [ Navigated HistoryPage ] initialModel)
+        && startsExactly (Slot.owns settings.epoch) queueStart (Slot.runningLoad queueRestarted.queueLoad) (effectsOf settings (queueDone queueRunning.queueLoad (Ok (queuePageOf [ a ]))) queueWanting)
+        && startsExactly (Slot.owns settings.epoch) historyStart (Slot.runningLoad historyRunning.historyLoad) (effectsOf settings [ Navigated HistoryPage ] initialModel)
         && startsNone historyStart (effectsOf settings [ HistoryNext (historyAfter 2), ShowHistory ] historyRunning)
         && Slot.runningWant settings.epoch historyWanting.historyLoad == Just (Just (HistoryFrom (historyAfter 2)))
-        && startsExactly settings.epoch historyStart (Slot.runningLoad historyRestarted.historyLoad) (effectsOf settings (historyLoadedOn historyRunning.historyLoad (Ok historyPage)) historyWanting)
-        && startsExactly settings.epoch viewStart (Selected.runningView viewRunning.selectedView) (effectsOf settings [ Navigated (unitAt ua) ] listed)
+        && startsExactly (Slot.owns settings.epoch) historyStart (Slot.runningLoad historyRestarted.historyLoad) (effectsOf settings (historyLoadedOn historyRunning.historyLoad (Ok historyPage)) historyWanting)
+        && startsExactly (Slot.owns settings.epoch) viewStart (Selected.runningView viewRunning.selectedView) (effectsOf settings [ Navigated (unitAt ua) ] listed)
         && startsNone viewStart (effectsOf settings [ Navigated (unitAt ub) ] viewRunning)
         && inFlight viewWanting == Just ( ua, Just ub )
-        && startsExactly settings.epoch viewStart (Selected.runningView viewRestarted.selectedView) (effectsOf settings (viewDone settings.epoch ua (Ok (Just a))) viewWanting)
-        && startsExactly settings.epoch standingStart (Standing.runningStanding standingRunning.standing) (effectsOf settings (viewDone settings.epoch ua (Ok (Just a))) viewRunning)
+        && startsExactly (Slot.owns settings.epoch) viewStart (Selected.runningView viewRestarted.selectedView) (effectsOf settings (viewDone settings.epoch ua (Ok (Just a))) viewWanting)
+        && startsExactly (Slot.owns settings.epoch) standingStart (Standing.runningStanding standingRunning.standing) (effectsOf settings (viewDone settings.epoch ua (Ok (Just a))) viewRunning)
         && startsNone standingStart (effectsOf settings secondBody standingRunning)
-        && startsExactly settings.epoch standingStart (Standing.runningStanding standingRestarted.standing) (effectsOf settings (standingLoadedFor settings.epoch ua hashA (Ok Standing.Undecided)) standingWanting)
-        && startsExactly settings.epoch decisionStart (DecisionSlot.savingStamp saving.decision) (effectsOf settings approve shown)
+        && startsExactly (Slot.owns settings.epoch) standingStart (Standing.runningStanding standingRestarted.standing) (effectsOf settings (standingLoadedFor settings.epoch ua hashA (Ok Standing.Undecided)) standingWanting)
+        && startsExactly (Slot.owns settings.epoch) decisionStart (DecisionSlot.savingStamp saving.decision) (effectsOf settings approve shown)
         && startsNothing settings approve saving
         && saving.decision == savingSlot settings.epoch ua
 
@@ -4185,10 +4181,10 @@ effectOncePerTransition settings otherEpoch a b pair =
 -- ── the session starts nothing ──────────────────────────────────────────
 -- `Lib/Session.ipe` returns effects as values and imports neither the Cmd
 -- module nor the Task module under any name, so it cannot start a task. A
--- task starts in `src` only through `Cmd.perform`, and a batch is built
--- only through `Cmd.batch`, each only inside `run` and `update` of
--- `Lib/App.ipe`, the interpreter, which builds no model: it holds no
--- record update. `Task.attempt` lowers to the same start, so any use of it
+-- task starts in `src` only through `Cmd.perform`, only inside `run` of
+-- `Lib/App.ipe`, the interpreter, exactly once in each effect's arm; and a
+-- batch is built only through `Cmd.batch`, once, inside its `update`. The
+-- interpreter builds no model: it holds no record update. `Task.attempt` lowers to the same start, so any use of it
 -- is stray, and the Cmd module is imported under its own name exposing
 -- nothing, so no other spelling starts a task. Only `src/Main.ipe` imports
 -- the interpreter, and only the session and the interpreter name an effect.
@@ -4274,7 +4270,7 @@ sessionBoundaryBreaks effects path text =
             List.filter (\token -> token.kind == TextSinkScanTests.WordToken && startsTask token.text) lexed.code
 
         stray =
-            List.filter (\token -> not (path == interpreterModule && List.member token.name interpreterSites && (token.text == "Cmd.perform" || token.text == "Cmd.batch"))) starts
+            List.filter (\token -> not (path == interpreterModule && interpreterSite token)) starts
 
         renamed =
             List.filter (\i -> String.endsWith ".Cmd" i.moduleName && (i.qualifier /= "Cmd" || i.opensAll || not (List.isEmpty i.exposed))) lexed.imports
@@ -4321,6 +4317,59 @@ sessionBoundaryBreaks effects path text =
            )
 
 
+-- Whether `token` is a start the interpreter may hold: a perform in `run`,
+-- or the batch in `update`.
+interpreterSite : TextSinkScanTests.Token -> Bool
+interpreterSite token =
+    (token.name == "run" && token.text == "Cmd.perform") || (token.name == "update" && token.text == "Cmd.batch")
+
+
+-- Whether the interpreter lexed as `toks` performs each of `effects` once,
+-- in that effect's own arm of `run`: read in order, `run` names each effect
+-- once, each followed by exactly one `Cmd.perform` before the next; and
+-- `update` batches once. Red if an arm performs nothing, performs twice, or
+-- an effect has no arm of its own.
+interpreterShape : List String -> List TextSinkScanTests.Token -> Bool
+interpreterShape effects toks =
+    let
+        arms =
+            List.map .text (List.filter (\token -> token.name == "run" && token.kind == TextSinkScanTests.WordToken && (List.member token.text effects || token.text == "Cmd.perform")) toks)
+
+        matched =
+            List.filter (\text -> List.member text effects) arms
+    in
+    not (List.isEmpty effects)
+        && arms == List.concatMap (\effect -> [ effect, "Cmd.perform" ]) matched
+        && List.length matched == List.length effects
+        && List.all (\effect -> List.member effect matched) effects
+        && List.length (List.filter (\token -> token.name == "update" && token.text == "Cmd.batch") toks) == 1
+
+
+interpreterFixture : String
+interpreterFixture =
+    "module Lib.App exposing (run, update)\n\nimport Ipe.Tea.Web.Cmd as Cmd\n\n\nupdate settings msg model =\n    case step settings msg model of\n        ( next, effects ) ->\n            ( next, Cmd.batch (List.map (run settings) effects) )\n\n\nrun settings effect =\n    case effect of\n        LoadA load ->\n            Cmd.perform (taskA settings) (doneA load)\n\n        LoadB load ->\n            Cmd.perform (taskB settings) (doneB load)\n"
+
+
+-- Red cases for `interpreterShape`: an arm that performs nothing beside
+-- one that performs twice, an effect with no arm of its own, an effect the
+-- interpreter does not know, and an `update` that batches nothing.
+interpreterShapeFixtures : Bool
+interpreterShapeFixtures =
+    let
+        shape =
+            \effects text -> interpreterShape effects (TextSinkScanTests.lex text).code
+
+        swapped =
+            String.replace "Cmd.perform (taskA settings) (doneA load)" "Cmd.none" (String.replace "Cmd.perform (taskB settings) (doneB load)" "Cmd.perform (taskB settings) (doneB load) |> also (Cmd.perform (taskA settings) (doneA load))" interpreterFixture)
+    in
+    shape [ "LoadA", "LoadB" ] interpreterFixture
+        && List.isEmpty (sessionBoundaryBreaks [ "LoadA", "LoadB" ] interpreterModule interpreterFixture)
+        && not (shape [ "LoadA", "LoadB" ] swapped)
+        && not (shape [ "LoadA", "LoadB" ] (String.replace "LoadB load" "_" interpreterFixture))
+        && not (shape [ "LoadA", "LoadB", "LoadC" ] interpreterFixture)
+        && not (shape [ "LoadA", "LoadB" ] (String.replace "Cmd.batch (List.map (run settings) effects)" "Cmd.none" interpreterFixture))
+
+
 scanFixture : String
 scanFixture =
     "module Fixture exposing (run)\n\nimport Ipe.Tea.Web.Cmd as Cmd\n\n\n-- Cmd.perform in a comment starts nothing\nrun settings effect =\n    Cmd.perform task done\n"
@@ -4339,7 +4388,8 @@ fixtureEffects =
 -- Red cases: a task started in another definition, one behind a
 -- `Cmd.batch`, one through a renamed Cmd import, one through an import
 -- exposing `perform`, one through `Task.attempt` (inside a site too), a
--- perform in `Lib/View.ipe`, the session importing the Cmd or the Task
+-- perform in `Lib/View.ipe`, a perform in `update` or a batch in `run`,
+-- the session importing the Cmd or the Task
 -- module under any name, the interpreter building a model, a module other
 -- than `src/Main.ipe` importing the interpreter, and a view naming an
 -- effect, bare or qualified.
@@ -4358,6 +4408,9 @@ sessionStartsNothingFixtures =
         && sessionBoundaryBreaks fixtureEffects sessionModule (String.replace "import Lib.Slot as Slot" "import Ipe.Tea.Web.Cmd as Effects" sessionFixture) == [ "Ipe.Tea.Web.Cmd", "Ipe.Tea.Web.Cmd" ]
         && sessionBoundaryBreaks fixtureEffects sessionModule (String.replace "import Lib.Slot as Slot" "import Ipe.Task exposing (Task)" sessionFixture) == [ "Ipe.Task" ]
         && sessionBoundaryBreaks fixtureEffects interpreterModule (scanFixture ++ "\n\nbuild model =\n    { model | page = next }\n") == [ "build" ]
+        && sessionBoundaryBreaks fixtureEffects interpreterModule (scanFixture ++ "\n\nupdate settings msg model =\n    ( model, Cmd.perform task done )\n") == [ "update" ]
+        && sessionBoundaryBreaks fixtureEffects interpreterModule (String.replace "Cmd.perform task done" "Cmd.batch [ Cmd.perform task done, Cmd.perform task done ]" scanFixture) == [ "run" ]
+        && interpreterShapeFixtures
         && sessionBoundaryBreaks fixtureEffects "Lib/View.ipe" (String.replace "import Lib.Slot as Slot" "import Lib.App as App" (String.replace "module Lib.Session" "module Lib.View" sessionFixture)) == [ "Lib.App", "step" ]
         && sessionBoundaryBreaks fixtureEffects "Lib/View.ipe" (String.replace "LoadView read" "Session.SaveDecision read" sessionFixture) == [ "step" ]
 
@@ -4395,7 +4448,8 @@ effectConstructorStep token state =
 -- keeps the session's boundary, the session and the interpreter are
 -- modules of it, the interpreter defines both its sites, and the fixtures
 -- go red. Red if the session can start a task, a task starts outside the
--- interpreter, or the interpreter builds a model.
+-- interpreter's arm for its effect, an effect's arm starts other than one
+-- task, or the interpreter builds a model.
 sessionStartsNothing : Task.Task Error Bool
 sessionStartsNothing =
     TextSinkScanTests.srcSources
@@ -4422,6 +4476,7 @@ sessionStartsNothing =
                 effects == fixtureEffects
                     && List.all (\( path, text ) -> List.isEmpty (sessionBoundaryBreaks effects path text)) modules
                     && List.all (\site -> List.member site names) interpreterSites
+                    && List.all (\text -> interpreterShape effects (TextSinkScanTests.lex text).code) (textOf interpreterModule)
                     && sessionStartsNothingFixtures
             )
 
