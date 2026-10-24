@@ -22,7 +22,7 @@ import Ipe.System as System
 import Ipe.Task as Task
 import Ipe.Time.Timestamp as Timestamp
 import Ipe.Tuple as Tuple
-import Lib.Db as LibDb exposing (BreakAt(..), Decision(..), HistoryCursor(..), LogShown(..), ReviewEntry(..), StoredDecision(..), Unverified(..))
+import Lib.Db as LibDb exposing (BreakAt(..), CopyFault(..), Decision(..), HistoryCursor(..), LogShown(..), ReviewEntry(..), StoredDecision(..), Unverified(..))
 import Lib.DecisionSlot as DecisionSlot exposing (DecisionTarget(..))
 import Lib.Epoch as Epoch exposing (Epoch)
 import Lib.Failure as Failure exposing (DecideRefusal(..), LoadFailure(..), SaveFailure(..))
@@ -39,11 +39,12 @@ import Lib.RepoPath as RepoPath exposing (PathError(..), Root, RootMap)
 import Lib.ReviewKey as ReviewKey exposing (ReviewKey(..))
 import Lib.SafeText as SafeText
 import Lib.Selected as Selected exposing (SelectedView(..))
+import Lib.Settings as Settings
 import Lib.Slot as Slot
 import Lib.Standing as Standing
 import Lib.Uid as Uid exposing (Uid)
 import Lib.UnitName as UnitName
-import TestSupport exposing (openFileAt, piecesShown, quotedLabelOf, tableExists, countReviewRows, expectErr, refuse, seedIndex, writeFileText, fixtureLibRs, fixtureMainIpe, viewA, viewB, viewTag, shownTextOf, unitViewTag, execIndex, execIndexUnchecked, Scratch, freshScratch, freshDir, check, indexSchemaStatements, execIndexSchema, seedIndexDb, insertUnitRows, setIndexEnv, loadFirstPage, indexConn, loadUnitNow, decideNow, envSettings, envReview, envAppSettings, loadPageNow, drainThenLoadNow, loadUnitViewNow, drainUnitNow, decideShownNow, decidedRefusalNow, accepted, refusalOf, refusedAs, decidedNow, resyncReviewedNow, resyncReviewedWithinNow, shownOf, PageEntry, checkUnits, listSecond, isUnitA, isUnitB, cleanupIndex, removeFileIfAny, codeText, noHazard, rendered, renderedForeign, describeText, refusedFor, migratedReviewAt, tableRowCounts, openReadOnlyAt, vectorsPath, ipeIndexTestFile, repoFile, probeMessage, probeNames, maybeContains, isNew, isUnrecorded, mirroredCount, stampOf, reviewHeadOf, uid, resyncBoundOf, appendSigned, RawName(..), rawRow, tamperLog, logIdOf, headTextOf, logRowCount, loadHistoryPageNow, carriesFailure, logVerdictOf, appendSignedWithUidText, insertUnboundUnit, labelOf, labelText)
+import TestSupport exposing (openFileAt, piecesShown, quotedLabelOf, tableExists, countReviewRows, expectErr, refuse, seedIndex, writeFileText, fixtureLibRs, fixtureMainIpe, viewA, viewB, viewTag, shownTextOf, unitViewTag, execIndex, execIndexUnchecked, Scratch, freshScratch, freshDir, check, indexSchemaStatements, execIndexSchema, seedIndexDb, insertUnitRows, setIndexEnv, loadFirstPage, indexConn, loadUnitNow, decideNow, envSettings, envReview, envAppSettings, loadPageNow, drainThenLoadNow, loadUnitViewNow, drainUnitNow, attestedNow, proveCopyNow, otherMacKey, decideShownNow, decidedRefusalNow, accepted, refusalOf, refusedAs, decidedNow, resyncReviewedNow, resyncReviewedWithinNow, shownOf, PageEntry, checkUnits, listSecond, isUnitA, isUnitB, cleanupIndex, removeFileIfAny, codeText, noHazard, rendered, renderedForeign, describeText, refusedFor, migratedReviewAt, tableRowCounts, openReadOnlyAt, vectorsPath, ipeIndexTestFile, repoFile, probeMessage, probeNames, maybeContains, isNew, isUnrecorded, mirroredCount, stampOf, reviewHeadOf, uid, resyncBoundOf, appendSigned, RawName(..), rawRow, tamperLog, logIdOf, headTextOf, logRowCount, loadHistoryPageNow, carriesFailure, logVerdictOf, appendSignedWithUidText, insertUnboundUnit, labelOf, labelText)
 
 
 -- ── decisions on attested bytes ─────────────────────────────────────────
@@ -2829,6 +2830,229 @@ loadFailureTyped =
         && List.all (\text -> not (String.contains "MARKER" text)) texts
 
 
+-- ── a drain writes only a pair the review log holds ─────────────────────
+--
+-- The `reviewed` copy and the queue row consumed with it are written only by
+-- `Index.drainUnit` over a `DecidedPair`: a pair read back from a log row
+-- whose mac verified under the configured key. `Queue.drainDecision` looks
+-- the attested pair up in the log and drains only a verified row's pair. A
+-- page is built only from a `ProvenCopy`, whose sole constructor
+-- `LibDb.proveCopy` checks the copy's stamp and digest against that same
+-- verdict and names the check it failed. Every case below seeds the bridge
+-- fixture with an empty review database and loads the first page once, so
+-- the copy is rebuilt and stamped before anything acts on it.
+--
+-- R1: an attested pair with no signed log row drains nothing: no index
+-- table changes, no queue row is deleted, and the unit is still queued as
+-- new on the next page. Red while a drain trusts the pair a message
+-- carries.
+drainWithoutSignedRowKeepsUnitQueued : Task.Task Error Bool
+drainWithoutSignedRowKeepsUnitQueued =
+    do
+        at <- freshScratch "ipe-index-drain-unsigned"
+        seedProgressScratch at
+        loadPageNow Index.Start
+        attested <- attestedNow (uid "u-a")
+        index <- openFileAt ReadExisting at.indexDb
+        before <- tableRowCounts index
+        drained <- drainUnitNow attested AlreadyDecided
+        after <- tableRowCounts index
+        page <- loadPageNow Index.Start
+        cleanupProgressScratch at
+        Task.succeed
+            (drained == 0
+                && before == after
+                && List.any (\q -> q.unit.uid == uid "u-b" && isNew q.change) page.units
+                && onPage "u-a" page
+            )
+
+
+-- R2 (control): the same drain over a pair whose signed row the log holds
+-- drains the unit: its queue row is deleted and it leaves the page. Red if
+-- the walk refuses a row it signed itself.
+drainWithSignedRowDrains : Task.Task Error Bool
+drainWithSignedRowDrains =
+    do
+        at <- freshScratch "ipe-index-drain-signed"
+        db <- seedProgressScratch at
+        loadPageNow Index.Start
+        decided <- decideNow db (uid "u-b") Approved
+        drained <- drainFor decided
+        page <- loadPageNow Index.Start
+        cleanupProgressScratch at
+        Task.succeed (drained == 1 && not (onPage "u-b" page))
+
+
+-- R3: a decision recorded on one hash never drains the unit under another.
+-- After `u-a` is decided at its first hash, its file and index row change
+-- and its queue row is re-hashed; the pair attested from the new row has no
+-- signed log row, so the drain writes no `reviewed` row for it and keeps
+-- the re-hashed queue row. Red while a drain writes the attested pair
+-- without finding its row in the log.
+drainOfOtherHashKeepsUnit : Task.Task Error Bool
+drainOfOtherHashKeepsUnit =
+    let
+        rehashed =
+            Index.attest (String.replace "42" "43" viewA)
+    in
+    do
+        at <- freshScratch "ipe-index-drain-other-hash"
+        db <- seedProgressScratch at
+        loadPageNow Index.Start
+        decideNow db (uid "u-a") Approved
+        writeFileText (at.repo ++ "/src/Lib.rs") (String.replace "42" "43" fixtureLibRs)
+        execIndex at.indexDb "UPDATE units SET body_hash = ? WHERE uid = ?" [ SqlString rehashed, Uid.toSql (uid "u-a") ]
+        execIndex at.indexDb "UPDATE change_queue SET new_hash = ? WHERE uid = ?" [ SqlString rehashed, Uid.toSql (uid "u-a") ]
+        attested <- attestedNow (uid "u-a")
+        drained <- drainUnitNow attested AlreadyDecided
+        queued <- queueRows at.indexDb "u-a" rehashed
+        copied <- copyRows at.indexDb "u-a" rehashed
+        cleanupProgressScratch at
+        Task.succeed (Index.attestedHash attested == rehashed && drained == 0 && queued == 1 && copied == 0)
+
+
+-- R4: the same decided pair, drained under another key, drains nothing and
+-- changes no index table: the log's rows fail that key, so none is
+-- verified. The control drain under the configured key then drains it. Red
+-- while a drain skips the walk, or the walk verifies a row under a key other
+-- than the one it was signed with.
+drainUnderOtherKeyDrainsNothing : Task.Task Error Bool
+drainUnderOtherKeyDrainsNothing =
+    do
+        at <- freshScratch "ipe-index-drain-other-key"
+        db <- seedProgressScratch at
+        loadPageNow Index.Start
+        decided <- decideNow db (uid "u-b") Approved
+        settings <- envAppSettings
+        other <- otherMacKey
+        index <- openFileAt ReadExisting at.indexDb
+        before <- tableRowCounts index
+        forged <- drainUnder { settings | key = Signing other } decided
+        after <- tableRowCounts index
+        drained <- drainUnder settings decided
+        cleanupProgressScratch at
+        Task.succeed (forged == 0 && before == after && drained == 1)
+
+
+drainUnder : Settings.AppSettings -> ( Index.Attested, Index.Written ) -> Task.Task Error Int
+drainUnder settings decided =
+    case decided of
+        ( attested, written ) ->
+            Queue.drainDecision settings attested written
+
+
+-- How many `reviewed` rows the copy holds for fixture unit `label` under
+-- `hash`.
+copyRows : String -> String -> String -> Task.Task Error Int
+copyRows indexDb label hash =
+    do
+        conn <- openFileAt ReadExisting indexDb
+        rows <- Db.findWhere conn
+                    "reviewed"
+                    (Sql.and
+                        (Sql.eq (Sql.column "uid") (Sql.param (Uid.toSql (uid label))))
+                        (Sql.eq (Sql.column "body_hash") (Sql.string hash))
+                    )
+        Task.succeed (List.length rows)
+
+
+-- R5: a pair written straight into the `reviewed` copy fails `proveCopy`
+-- with `CopyDiffers`: the stamp is current, the digest is not the verified
+-- entries'. Red if the copy is proven on its stamp alone, or the fault is
+-- named as another's.
+proveCopyRefusesForgedPair : Task.Task Error Bool
+proveCopyRefusesForgedPair =
+    proveFaultAfter "ipe-index-prove-forged" (\at -> mirrorPair at.indexDb "u-b" (Index.attest viewB))
+        |> Task.map (\fault -> fault == Just CopyDiffers)
+
+
+-- R6: a copy whose stamp row is gone fails `proveCopy` with `StampStale`,
+-- whatever pairs it holds. Red if a missing stamp proves, or is named as a
+-- digest fault.
+proveCopyRefusesStaleStamp : Task.Task Error Bool
+proveCopyRefusesStaleStamp =
+    proveFaultAfter "ipe-index-prove-stale" (\at -> execIndex at.indexDb "DELETE FROM reviewed_stamp" [])
+        |> Task.map (\fault -> fault == Just StampStale)
+
+
+-- R7: a copy with no digest to prove, here a keyless table holding a
+-- repeated pair, fails `proveCopy` with `CopyUnproven` though its stamp is
+-- current. Red if a copy without a digest proves, or is named as a differing
+-- one.
+proveCopyRefusesUnprovenTable : Task.Task Error Bool
+proveCopyRefusesUnprovenTable =
+    proveFaultAfter "ipe-index-prove-unproven"
+        (\at ->
+            do
+                execIndex at.indexDb "DROP TABLE reviewed" []
+                execIndex at.indexDb "CREATE TABLE reviewed (uid TEXT NOT NULL, body_hash TEXT NOT NULL)" []
+                mirrorPair at.indexDb "u-b" (Index.attest viewB)
+                mirrorPair at.indexDb "u-b" (Index.attest viewB)
+        )
+        |> Task.map (\fault -> fault == Just CopyUnproven)
+
+
+-- The fault `proveCopy` names for the seeded copy after `mutate` ran on it,
+-- or `Nothing` when the copy still proves. The copy is proven once before
+-- the mutation, so a fault is the mutation's and not the fixture's; a
+-- fixture that does not prove fails the run.
+proveFaultAfter : String -> (Scratch -> Task.Task Error ()) -> Task.Task Error (Maybe LibDb.CopyFault)
+proveFaultAfter name mutate =
+    do
+        at <- freshScratch name
+        db <- seedProgressScratch at
+        loadPageNow Index.Start
+        intact <- proveCopyNow db Index.Start
+        mutate at
+        mutated <- proveCopyNow db Index.Start
+        cleanupProgressScratch at
+        case intact of
+            Ok _ ->
+                Task.succeed (faultOf mutated)
+
+            Err _ ->
+                Task.fail (Error.conflict ("the seeded copy did not prove before " ++ name))
+
+
+faultOf : Result LibDb.CopyFault LibDb.ProvenCopy -> Maybe LibDb.CopyFault
+faultOf result =
+    case result of
+        Ok _ ->
+            Nothing
+
+        Err fault ->
+            Just fault
+
+
+-- R8: `ProvenCopy` is exposed opaque from `Lib.Db`, with no `copyHolds`
+-- left to bypass `proveCopy`, so no caller can build or match one. The
+-- check refuses the header with the constructor exposed and the header with
+-- `copyHolds` back. Red if the check matches nothing or everything.
+provenCopyIsOpaque : Task.Task Error Bool
+provenCopyIsOpaque =
+    do
+        cwd <- System.cwd ()
+        text <- sourceAt cwd "src/Lib/Db.ipe"
+        let
+            header =
+                Maybe.withDefault "" (List.head (String.split "\n" text))
+        in
+        Task.succeed
+            (provenCopyOpaqueIn header
+                && not (provenCopyOpaqueIn (String.replace "ProvenCopy," "ProvenCopy(..)," header))
+                && not (provenCopyOpaqueIn (header ++ " copyHolds"))
+            )
+
+
+provenCopyOpaqueIn : String -> Bool
+provenCopyOpaqueIn header =
+    String.startsWith "module Lib.Db exposing (" header
+        && String.contains " ProvenCopy," header
+        && not (String.contains "ProvenCopy(..)" header)
+        && not (String.contains "copyHolds" header)
+        && not (String.contains "exposing (..)" header)
+
+
 checks : Task.Task Error (List ( String, Bool ))
 checks =
     do
@@ -2913,6 +3137,14 @@ checks =
                     , check "a file at an escaped name is acknowledged at the name it escapes" escapedRefusalAcknowledged
                     , check "a refusal under an escaped bound tag is listed and acknowledged" escapedTagRefusalBound
                     , Task.succeed ( "a progress rebuild bound that wraps past Int.max has no representation", resyncRefusesMaxIntCeiling )
+                    , check "a drain of an attested pair with no signed log row writes nothing and keeps the unit queued" drainWithoutSignedRowKeepsUnitQueued
+                    , check "a drain of a pair whose signed row the log holds drains the unit" drainWithSignedRowDrains
+                    , check "a drain of a unit re-hashed since its decision writes nothing for the new hash and keeps its queue row" drainOfOtherHashKeepsUnit
+                    , check "a drain under another key drains nothing; the configured key then drains" drainUnderOtherKeyDrainsNothing
+                    , check "a pair written straight into the copy fails proveCopy as CopyDiffers" proveCopyRefusesForgedPair
+                    , check "a copy whose stamp row is gone fails proveCopy as StampStale" proveCopyRefusesStaleStamp
+                    , check "a keyless copy holding a repeated pair fails proveCopy as CopyUnproven" proveCopyRefusesUnprovenTable
+                    , check "ProvenCopy is exposed opaque and copyHolds is gone" provenCopyIsOpaque
                     ]
         named <- Task.sequence
                     [ check "a decided unit deleted from the index keeps its signed name on History, marked no longer indexed" historyNamesDeletedUnit
