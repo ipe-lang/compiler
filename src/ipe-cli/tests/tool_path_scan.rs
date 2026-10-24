@@ -15,8 +15,9 @@
 //!
 //! 1. a `split_paths` or `join_paths` identifier outside the resolver
 //!    ([`RESOLVER`]);
-//! 2. a `Command::new(<program>)` (through any `use … as` rename of
-//!    `Command`) or `.command(<program>)` whose program is a
+//! 2. a `Command::new(<program>)` (through any `use … as` rename or `type`
+//!    alias of `Command`, and as `<Command>::new`) or `.command(<program>)`
+//!    whose program is a
 //!    relative string literal, a `PathBuf`/`Path`/`OsStr`/`OsString`/`String`
 //!    built from one, or a name the same fn (or a file-level `const`/`static`)
 //!    binds to one. An absolute literal names no `PATH` search, and a program
@@ -39,7 +40,7 @@ use std::path::{Path, PathBuf};
 use proc_macro2::{Delimiter, Span, TokenStream, TokenTree};
 use syn::ext::IdentExt as _;
 use syn::visit::{self, Visit};
-use syn::{Expr, ExprCall, ExprMethodCall, Lit, Macro, Pat};
+use syn::{Expr, ExprCall, ExprMethodCall, Lit, Macro, Pat, Type};
 
 /// The source roots scanned, relative to the repository root.
 const ROOTS: &[&str] = &["src", "tools"];
@@ -99,14 +100,33 @@ fn is_punct(tree: Option<&TokenTree>, ch: char) -> bool {
     matches!(tree, Some(TokenTree::Punct(p)) if p.as_char() == ch)
 }
 
-/// The last two segments of `expr` when it is a path.
+/// The last segment of the type `ty` names, through groups and parentheses.
+fn type_name(ty: &Type) -> Option<String> {
+    match ty {
+        Type::Path(path) => path
+            .path
+            .segments
+            .last()
+            .map(|segment| segment.ident.unraw().to_string()),
+        Type::Group(group) => type_name(&group.elem),
+        Type::Paren(paren) => type_name(&paren.elem),
+        _ => None,
+    }
+}
+
+/// The last segment of `expr` when it is a path, with the type it is
+/// associated to: the qualified self type of `<T>::f` or `<T as Trait>::f`,
+/// otherwise the segment before the last.
 fn tail_segments(expr: &Expr) -> Option<(Option<String>, String)> {
     let Expr::Path(path) = expr else {
         return None;
     };
     let mut segments = path.path.segments.iter().rev();
     let last = segments.next()?.ident.unraw().to_string();
-    let parent = segments.next().map(|s| s.ident.unraw().to_string());
+    let parent = match &path.qself {
+        Some(qself) => type_name(&qself.ty),
+        None => segments.next().map(|s| s.ident.unraw().to_string()),
+    };
     Some((parent, last))
 }
 
@@ -179,9 +199,9 @@ impl<'ast> Visit<'ast> for Bindings {
     fn visit_item(&mut self, _item: &'ast syn::Item) {}
 }
 
-/// The names `Command` goes by in one file, renames included.
+/// The names `Command` goes by in one file, renames and aliases included.
 struct CommandNames {
-    /// `Command` and every `use … as` alias of it.
+    /// `Command` and every `use … as` rename or `type` alias of it.
     names: BTreeSet<String>,
 }
 
@@ -191,15 +211,29 @@ impl<'ast> Visit<'ast> for CommandNames {
             self.names.insert(rename.rename.unraw().to_string());
         }
     }
+
+    fn visit_item_type(&mut self, item: &'ast syn::ItemType) {
+        if type_name(&item.ty).is_some_and(|name| self.names.contains(&name)) {
+            self.names.insert(item.ident.unraw().to_string());
+        }
+        visit::visit_item_type(self, item);
+    }
 }
 
-/// The names `Command` goes by in `file`.
+/// The names `Command` goes by in `file`, walked to a fixpoint so a rename or
+/// alias declared before the name it renames is still followed. A pass that
+/// does not stop adds a name, and a file declares finitely many.
 fn command_names(file: &syn::File) -> BTreeSet<String> {
     let mut names = CommandNames {
         names: BTreeSet::from([String::from("Command")]),
     };
-    names.visit_file(file);
-    names.names
+    loop {
+        let before = names.names.len();
+        names.visit_file(file);
+        if names.names.len() == before {
+            return names.names;
+        }
+    }
 }
 
 /// The refused sites of one parsed file.
@@ -603,6 +637,28 @@ fn a_literal_program_is_refused() {
         kinds(FIXTURE_PATH, renamed),
         [Kind::LiteralProgram, Kind::LiteralProgram]
     );
+    let grouped = "use std::process::{Command as Spawn, Stdio};\n\
+                   pub fn f() { let _ = Spawn::new(\"git\"); }\n";
+    assert_eq!(kinds(FIXTURE_PATH, grouped), [Kind::LiteralProgram]);
+}
+
+#[test]
+fn a_qualified_or_aliased_command_is_refused() {
+    let qualified = "pub fn f() { let _ = <Command>::new(\"git\"); \
+                     let _ = <std::process::Command as Spawner>::new(\"sh\"); }\n";
+    assert_eq!(
+        kinds(FIXTURE_PATH, qualified),
+        [Kind::LiteralProgram, Kind::LiteralProgram]
+    );
+    let aliased = "type Cmd = Spawn;\nuse std::process::Command as Spawn;\n\
+                   pub fn f() { let _ = Cmd::new(\"git\"); }\n";
+    assert_eq!(
+        kinds(FIXTURE_PATH, aliased),
+        [Kind::LiteralProgram],
+        "an alias declared before its rename is still followed"
+    );
+    let unrelated = "type Cmd = Vec<u8>;\npub fn f() { let _ = Cmd::new(\"git\"); }\n";
+    assert_eq!(kinds(FIXTURE_PATH, unrelated), Vec::<Kind>::new());
 }
 
 #[test]

@@ -538,7 +538,9 @@ fn nproc_scope_is_proven_on_this_host() {
     let Some(tools) = e2e_tools() else { return };
     let proven = prove(&tools);
     assert!(
-        proven.as_ref().is_ok_and(|scope| scope.tools() == &tools),
+        proven.as_ref().is_ok_and(|scope| tools
+            .bwrap_tools()
+            .is_ok_and(|bwrap| scope.tools() == bwrap)),
         "the proof must succeed and carry the tools it measured: {proven:?}"
     );
 }
@@ -546,10 +548,15 @@ fn nproc_scope_is_proven_on_this_host() {
 /// A `/bin/sh -c script` jail with `prlimit` OUTSIDE `bwrap`, so `cap` is set
 /// in the invoker's namespace and counts every task the user owns.
 fn user_wide_canary(tools: &RunJailTools, cap: ProcCap, script: &str) -> CanaryExit {
-    let status = Command::new(&tools.prlimit)
+    let tools = tools
+        .bwrap_tools()
+        .expect("the e2e tools are the bubblewrap arm");
+    let status = tools
+        .prlimit
+        .command()
         .arg(format!("--nproc={}", cap.get()))
         .arg("--")
-        .arg(&tools.bwrap)
+        .arg(tools.bwrap.as_path())
         .args([
             "--unshare-user",
             "--unshare-pid",
