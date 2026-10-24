@@ -1839,7 +1839,7 @@ mod tests {
         LoadedProject, Message, ModuleOrigin, Notification, Overlay, Path, PathBuf,
         PositionEncoding, ProjectLoader, PublishDiagnostics, PublishDiagnosticsParams, Served,
         State, TextDocumentContentChangeEvent, Url, code_action_result, ensure_project_fresh,
-        handle_notification, normalize, publish, recompute, sync_and_recompute,
+        handle_notification, normalize, publish, recompute, sync_and_recompute, workspace_roots_of,
     };
     use crate::loader::{LimitSource, LoadDisposition, LoadError};
     use ipe_lint::{LintConfigLoadError, WorkspaceReadError, load_lint_config};
@@ -1940,7 +1940,7 @@ mod tests {
         main_path: &Path,
         text: &str,
     ) -> (State, BTreeMap<Url, Vec<lsp_types::Diagnostic>>) {
-        let mut state = State::new(None, PositionEncoding::Utf16);
+        let mut state = State::new(Vec::new(), PositionEncoding::Utf16);
         state.overlays.insert(
             main_path.to_path_buf(),
             Overlay {
@@ -2325,7 +2325,7 @@ mod tests {
     fn a_refused_load_serves_no_layout() {
         let main_path = normalize(Path::new("/lsp-refuse-test/Main.ipe"));
         for refusal in every_refusal() {
-            let mut state = State::new(None, PositionEncoding::Utf16);
+            let mut state = State::new(Vec::new(), PositionEncoding::Utf16);
             state.overlays.insert(
                 main_path.clone(),
                 Overlay {
@@ -2420,7 +2420,7 @@ mod tests {
         let main_path = normalize(Path::new("/lsp-refuse-keystroke-test/Main.ipe"));
         let loader = CountingRefusalLoader::refusing();
         let (diag_tx, _diag_rx) = crossbeam_channel::unbounded::<DiagnosticsBatch>();
-        let mut state = State::new(None, PositionEncoding::Utf16);
+        let mut state = State::new(Vec::new(), PositionEncoding::Utf16);
         state.overlays.insert(
             main_path.clone(),
             Overlay {
@@ -2449,7 +2449,7 @@ mod tests {
         let main_path = normalize(Path::new("/lsp-refuse-watched-test/Main.ipe"));
         let loader = CountingRefusalLoader::refusing();
         let (diag_tx, _diag_rx) = crossbeam_channel::unbounded::<DiagnosticsBatch>();
-        let mut state = State::new(None, PositionEncoding::Utf16);
+        let mut state = State::new(Vec::new(), PositionEncoding::Utf16);
         state.overlays.insert(
             main_path.clone(),
             Overlay {
@@ -2481,7 +2481,7 @@ mod tests {
     fn nothing_loaded_gives_a_watched_file_event_no_anchor() {
         let loader = CountingRefusalLoader::refusing();
         let (diag_tx, _diag_rx) = crossbeam_channel::unbounded::<DiagnosticsBatch>();
-        let mut state = State::new(None, PositionEncoding::Utf16);
+        let mut state = State::new(Vec::new(), PositionEncoding::Utf16);
         did_change_watched_files(&mut state, &loader, &diag_tx);
         assert_eq!(loader.loads(), 0, "no anchor, no load");
         assert!(matches!(state.served, Served::Unloaded));
@@ -2522,7 +2522,7 @@ mod tests {
             lib_path,
         };
         for refusal in every_refusal() {
-            let mut state = State::new(None, PositionEncoding::Utf16);
+            let mut state = State::new(Vec::new(), PositionEncoding::Utf16);
             state.overlays.insert(
                 main_path.clone(),
                 Overlay {
@@ -2567,7 +2567,7 @@ mod tests {
         let main_path = normalize(Path::new("/lsp-refuse-first-test/Main.ipe"));
         let main_uri = Url::from_file_path(&main_path).expect("main uri");
         for refusal in every_refusal() {
-            let mut state = State::new(None, PositionEncoding::Utf16);
+            let mut state = State::new(Vec::new(), PositionEncoding::Utf16);
             let (server, client) = Connection::memory();
             let detail = refusal.to_string();
             ensure_project_fresh(&mut state, &FailingLoader(refusal), &main_path);
@@ -2592,7 +2592,7 @@ mod tests {
                 detail: "import closure ceiling".to_owned(),
             },
         ] {
-            let mut state = State::new(None, PositionEncoding::Utf16);
+            let mut state = State::new(Vec::new(), PositionEncoding::Utf16);
             state.overlays.insert(
                 main_path.clone(),
                 Overlay {
@@ -2701,7 +2701,7 @@ mod tests {
         let main_path = normalize(Path::new("/lsp-buffer-limit-test/Main.ipe"));
         let loader = BufferCeilingLoader::new(MAIN_TEXT.len());
         let (diag_tx, _diag_rx) = crossbeam_channel::unbounded::<DiagnosticsBatch>();
-        let mut state = State::new(None, PositionEncoding::Utf16);
+        let mut state = State::new(Vec::new(), PositionEncoding::Utf16);
         state.overlays.insert(
             main_path.clone(),
             Overlay {
@@ -2728,7 +2728,7 @@ mod tests {
         let main_uri = Url::from_file_path(&main_path).expect("main uri");
         let loader = BufferCeilingLoader::new(MAIN_TEXT.len());
         let (diag_tx, diag_rx) = crossbeam_channel::unbounded::<DiagnosticsBatch>();
-        let mut state = State::new(None, PositionEncoding::Utf16);
+        let mut state = State::new(Vec::new(), PositionEncoding::Utf16);
         state.overlays.insert(
             main_path.clone(),
             Overlay {
@@ -2806,7 +2806,7 @@ mod tests {
             lib_path,
         };
 
-        let mut state = State::new(None, PositionEncoding::Utf16);
+        let mut state = State::new(Vec::new(), PositionEncoding::Utf16);
         state.overlays.insert(
             main_path.clone(),
             Overlay {
@@ -2902,7 +2902,7 @@ mod tests {
             lib_path,
         };
 
-        let mut state = State::new(None, PositionEncoding::Utf16);
+        let mut state = State::new(Vec::new(), PositionEncoding::Utf16);
         state.overlays.insert(
             main_path.clone(),
             Overlay {
@@ -3084,7 +3084,7 @@ mod tests {
 
         let helper_path = normalize(Path::new("/test-proj/Helper.ipe"));
         let main_path = normalize(Path::new("/test-proj/Main.ipe"));
-        let mut state = State::new(None, PositionEncoding::Utf8);
+        let mut state = State::new(Vec::new(), PositionEncoding::Utf8);
 
         let mut files = BTreeMap::new();
         files.insert(
@@ -3306,7 +3306,7 @@ mod tests {
             main_path: main_path.clone(),
             lib_path,
         };
-        let mut state = State::new(None, PositionEncoding::Utf16);
+        let mut state = State::new(Vec::new(), PositionEncoding::Utf16);
         // Any warm stdlib generation stands past one symbol, so every buffer
         // that adds an input forces a cold rebuild.
         state.db = ipe_db::LongLivedDb::with_ceiling(ipe_db::GrowthCeiling {
@@ -3377,7 +3377,7 @@ mod tests {
             fail_next: Arc::new(AtomicBool::new(false)),
             lib_path: normalize(&Path::new(dir).join("Lib.ipe")),
         };
-        let mut state = State::new(None, PositionEncoding::Utf16);
+        let mut state = State::new(Vec::new(), PositionEncoding::Utf16);
         state.overlays.insert(
             main_path.clone(),
             Overlay {
