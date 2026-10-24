@@ -745,6 +745,7 @@ drainKeepsRequeuedChange =
         removeFileIfAny at.reviewDb
         seedIndex at.indexDb at.repo
         r <- loadFirstPage
+        System.setenv "IPE_REVIEW_DB" at.reviewDb
         db <- migratedReviewAt at.reviewDb
         decided <- decideUnit db (List.find (\u -> u.uid == uid "u-b") r.units)
         requeueB at
@@ -859,8 +860,9 @@ requeueB at =
     execIndex at.indexDb "UPDATE change_queue SET new_hash = ? WHERE uid = ?" [ SqlString "sha256:other", Uid.toSql (uid "u-b") ]
 
 
--- Seeds the bridge fixture, decides `u-b`, runs `mutate`, then drains under
--- the decision's attested pair. `totalBefore`
+-- Seeds the bridge fixture, decides `u-b` in a review database the
+-- environment names (the drain reads the decision back from it), runs
+-- `mutate`, then drains under the decision's attested pair. `totalBefore`
 -- and `totalAfter` are the queue counts around the drain.
 drainAfter : String -> (Scratch -> Task.Task Error ()) -> Task.Task Error DrainOutcome
 drainAfter name mutate =
@@ -870,6 +872,7 @@ drainAfter name mutate =
         removeFileIfAny at.reviewDb
         seedIndex at.indexDb at.repo
         r <- loadFirstPage
+        System.setenv "IPE_REVIEW_DB" at.reviewDb
         db <- migratedReviewAt at.reviewDb
         decided <- decideUnit db (List.find (\u -> u.uid == uid "u-b") r.units)
         mutate at
