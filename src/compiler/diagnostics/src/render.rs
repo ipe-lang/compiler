@@ -3037,15 +3037,18 @@ fn ty_to_string(t: &TyDoc) -> String {
             let rendered: Vec<String> = elems.iter().map(ty_to_string).collect();
             format!("({})", rendered.join(", "))
         }
-        TyDoc::Record(fields) => {
-            if fields.is_empty() {
-                "{}".to_string()
-            } else {
-                let rendered: Vec<String> = fields
-                    .iter()
-                    .map(|(name, ty)| format!("{name} : {}", ty_to_string(ty)))
-                    .collect();
-                format!("{{ {} }}", rendered.join(", "))
+        TyDoc::Record { fields, tail } => {
+            let rendered: Vec<String> = fields
+                .iter()
+                .map(|(name, ty)| format!("{name} : {}", ty_to_string(ty)))
+                .collect();
+            match (tail, rendered.is_empty()) {
+                (None, true) => "{}".to_string(),
+                (None, false) => format!("{{ {} }}", rendered.join(", ")),
+                // An open row with no known field is the row variable alone,
+                // the only surface spelling the type has.
+                (Some(row), true) => row.to_string(),
+                (Some(row), false) => format!("{{ {row} | {} }}", rendered.join(", ")),
             }
         }
     }
@@ -3142,6 +3145,32 @@ mod tests {
         assert_eq!(render_ty(&con("CliAttr")), "Cli.Ui.Attribute");
         // A plain con with an empty module still renders bare.
         assert_eq!(render_ty(&con("Int")), "Int");
+    }
+
+    /// A record renders in its surface form: closed records list their fields,
+    /// an open record names its row first, and the empty closed record is `{}`.
+    #[test]
+    fn record_renders_its_row_tail_in_surface_form() {
+        let record = |fields: Vec<(&str, TyDoc)>, tail: Option<&str>| TyDoc::Record {
+            fields: fields
+                .into_iter()
+                .map(|(name, ty)| (Box::<str>::from(name), ty))
+                .collect(),
+            tail: tail.map(Box::from),
+        };
+        assert_eq!(render_ty(&record(vec![], None)), "{}");
+        assert_eq!(
+            render_ty(&record(vec![("x", con("Int"))], None)),
+            "{ x : Int }"
+        );
+        assert_eq!(
+            render_ty(&record(
+                vec![("x", con("Int")), ("y", con("Bool"))],
+                Some("a")
+            )),
+            "{ a | x : Int, y : Bool }"
+        );
+        assert_eq!(render_ty(&record(vec![], Some("r"))), "r");
     }
 
     #[test]

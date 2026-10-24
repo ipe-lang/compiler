@@ -521,11 +521,14 @@ pub fn reify_scheme(
                     Content::Flex | Content::Rigid | Content::Super { .. } => {
                         return Ok(None);
                     }
-                    // `EmptyRecord` is only reachable on a direct call over a
-                    // bare tail — records route tails through `BuildRecord`
-                    // below — and falls back to `Ty::Unit` like `zonk` does.
-                    Content::Structure(FlatType::Unit | FlatType::EmptyRecord) => {
+                    Content::Structure(FlatType::Unit) => {
                         results.push(Ty::Unit);
+                    }
+                    // A bare empty row (records route their tails through
+                    // `BuildRecord` below) is the empty closed record, as in
+                    // `zonk`: never `()`.
+                    Content::Structure(FlatType::EmptyRecord) => {
+                        results.push(Ty::Record(BTreeMap::new(), RowTail::Closed));
                     }
                     Content::Structure(FlatType::Fun(a, b)) => {
                         work.push(ReifyTask::BuildFun);
@@ -763,16 +766,15 @@ fn zonk_visit(
             }
         }
         Content::Structure(FlatType::EmptyRecord) => {
-            // EmptyRecord is the closed-tail sentinel — it carries no children
-            // and does not produce a `Ty` of its own. It should only appear as
-            // the extension variable of a `FlatType::Record`, never as the root
-            // type of a standalone expression. Push `Ty::Unit` as a safe fallback
-            // so the work stack stays balanced (this arm is reachable if zonk is
-            // called directly on an extension var, which does not happen in
-            // normal code, but must not panic).
+            // A bare empty row — a row tail read on its own, or a row variable
+            // a signature also uses as a whole type — is the empty closed
+            // record `{}`. It is never `()`: the unit type and the empty row
+            // are distinct types, and a diagnostic naming one for the other
+            // states a false fact.
+            let ty = Ty::Record(BTreeMap::new(), RowTail::Closed);
             charge_unfolded(unfolded, 1)?;
-            memo.insert(root, (Ty::Unit, 1));
-            results.push(Ty::Unit);
+            memo.insert(root, (ty.clone(), 1));
+            results.push(ty);
         }
     }
     Ok(())

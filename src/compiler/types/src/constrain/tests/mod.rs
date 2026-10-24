@@ -3025,6 +3025,82 @@ mod zonk_row_tail_tests {
         );
     }
 
+    /// The rendered `(found, expected)` pair of the type mismatch `src` is refused with.
+    fn mismatch_of(src: &str) -> Option<(String, String)> {
+        let mut i = Interner::new();
+        let parsed = ipe_parse::parse_module(src, &mut i).ok()?;
+        let m = ipe_canon::canonicalise(&parsed, &mut i).ok()?;
+        match crate::infer(&m, &mut i) {
+            Err(Diagnostic::Type {
+                msg:
+                    TypeError::TypeMismatch {
+                        found, expected, ..
+                    },
+                ..
+            }) => Some((
+                ipe_diagnostics::render_ty(&found),
+                ipe_diagnostics::render_ty(&expected),
+            )),
+            Ok(_) | Err(_) => None,
+        }
+    }
+
+    /// A record argument refused against an open signature row names the
+    /// row: the expected type reads `{ a | x : Int }`, never the closed
+    /// `{ x : Int }`, a type the program never wrote.
+    #[test]
+    fn open_row_mismatch_names_the_row() {
+        let src = format!(
+            "{MAIN_HDR}getX : {{ a | x : Int }} -> Int\ngetX r =\n    r.x\n\nmain = getX {{ y = 1 }}\n"
+        );
+        let refused = mismatch_of(&src);
+        assert!(
+            refused.is_some(),
+            "`{src}` must be refused with a type mismatch"
+        );
+        let Some((found, expected)) = refused else {
+            return;
+        };
+        let sides = [found.as_str(), expected.as_str()];
+        assert!(
+            sides.iter().any(|t| t.contains(" | x : Int }")),
+            "one side must be the open row record, got {sides:?}"
+        );
+        assert!(
+            !sides.contains(&"{ x : Int }"),
+            "the open row must not read as a closed record, got {sides:?}"
+        );
+    }
+
+    /// A row-tail clash reports the record pair it came from: closing an
+    /// open row reads `{ a | x : Int }` against `{ x : Int }`, never the bare
+    /// tails `a` against `()`.
+    #[test]
+    fn row_tail_mismatch_reports_the_record_pair() {
+        let src = format!(
+            "{MAIN_HDR}close : {{ a | x : Int }} -> {{ x : Int }}\nclose r =\n    r\n\nmain = 0\n"
+        );
+        let refused = mismatch_of(&src);
+        assert!(
+            refused.is_some(),
+            "`{src}` must be refused with a type mismatch"
+        );
+        let Some((found, expected)) = refused else {
+            return;
+        };
+        let sides = [found.as_str(), expected.as_str()];
+        assert!(
+            sides
+                .iter()
+                .all(|t| t.starts_with('{') && t.contains("x : Int")),
+            "both sides must be records over `x`, got {sides:?}"
+        );
+        assert!(
+            sides.contains(&"{ x : Int }") && sides.iter().any(|t| t.contains(" | x : Int }")),
+            "the pair must be the closed record and the open row record, got {sides:?}"
+        );
+    }
+
     /// A signature row variable used as a whole type (`a` in
     /// `{ a | x : Int } -> a -> Int`) lets a caller bind the row to a record
     /// that repeats a label of the chain, or to a non-row type. Such a program

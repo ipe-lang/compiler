@@ -12,7 +12,7 @@ use ipe_canon::ast as canon;
 use ipe_diagnostics::{DResult, Diagnostic, TyDoc};
 use ipe_intern::{Interner, Symbol};
 
-use crate::ty::Ty;
+use crate::ty::{RowTail, Ty};
 
 /// Deterministic naming for flexible type variables that survived solving.
 ///
@@ -121,12 +121,17 @@ pub fn ty_to_doc(ty: &Ty, interner: &Interner, namer: &mut VarNamer) -> DResult<
             }
             Ok(TyDoc::Tuple(doc_elems.into_boxed_slice()))
         }
-        Ty::Record(fields, _tail) => {
-            // Render in field-name order. The map is keyed by `Symbol`, so resolve
-            // each name and sort the resulting pairs for a deterministic form.
-            // `_tail` is intentionally not rendered here — open records read back
-            // as closed in the resolved `Ty` form (the tail is a solver artefact
-            // consumed by unify.rs, not by diagnostics).
+        Ty::Record(fields, tail) => {
+            // Name the row before the fields so a shared namer reads the
+            // record left to right, `{ a | x : b }`. The tail shares
+            // `Ty::Var`'s id space, so a row variable that also appears as a
+            // whole type reads under the same name. Fields render in
+            // field-name order: the map is keyed by `Symbol`, so resolve each
+            // name and sort the pairs for a deterministic form.
+            let tail = match tail {
+                RowTail::Open(raw) => Some(namer.name(*raw)),
+                RowTail::Closed => None,
+            };
             let mut entries: Vec<(Box<str>, TyDoc)> = Vec::with_capacity(fields.len());
             for (name, field_ty) in fields {
                 entries.push((
@@ -135,7 +140,10 @@ pub fn ty_to_doc(ty: &Ty, interner: &Interner, namer: &mut VarNamer) -> DResult<
                 ));
             }
             entries.sort_by(|a, b| a.0.cmp(&b.0));
-            Ok(TyDoc::Record(entries.into_boxed_slice()))
+            Ok(TyDoc::Record {
+                fields: entries.into_boxed_slice(),
+                tail,
+            })
         }
     }
 }
@@ -179,24 +187,32 @@ pub fn canon_type_to_doc(t: &canon::Type, interner: &Interner) -> DResult<TyDoc>
             }
             Ok(TyDoc::Tuple(doc_elems.into_boxed_slice()))
         }
-        // Both the closed and the row-polymorphic record render as the same
-        // field-name-ordered `TyDoc::Record`; the open tail carries no named
-        // field, so — like the solved-type renderer above, which discards its
-        // tail marker — it is not shown.
-        canon::Type::Record(fields) | canon::Type::RecordOpen(_, fields) => {
-            // Render in field-name order for a deterministic form, mirroring the
-            // solved-type renderer above.
-            let mut entries: Vec<(Box<str>, TyDoc)> = Vec::with_capacity(fields.len());
-            for (name, field_ty) in fields {
-                entries.push((
-                    resolve(interner, *name)?,
-                    canon_type_to_doc(field_ty, interner)?,
-                ));
-            }
-            entries.sort_by(|a, b| a.0.cmp(&b.0));
-            Ok(TyDoc::Record(entries.into_boxed_slice()))
-        }
+        canon::Type::Record(fields) => Ok(TyDoc::Record {
+            fields: canon_fields_to_doc(fields, interner)?,
+            tail: None,
+        }),
+        canon::Type::RecordOpen(row, fields) => Ok(TyDoc::Record {
+            fields: canon_fields_to_doc(fields, interner)?,
+            tail: Some(resolve(interner, *row)?),
+        }),
     }
+}
+
+/// Render a written record's fields in field-name order, the order the
+/// solved-type renderer uses.
+fn canon_fields_to_doc(
+    fields: &[(Symbol, canon::Type)],
+    interner: &Interner,
+) -> DResult<Box<[(Box<str>, TyDoc)]>> {
+    let mut entries: Vec<(Box<str>, TyDoc)> = Vec::with_capacity(fields.len());
+    for (name, field_ty) in fields {
+        entries.push((
+            resolve(interner, *name)?,
+            canon_type_to_doc(field_ty, interner)?,
+        ));
+    }
+    entries.sort_by(|a, b| a.0.cmp(&b.0));
+    Ok(entries.into_boxed_slice())
 }
 
 #[cfg(test)]
@@ -220,6 +236,40 @@ mod tests {
         assert_eq!(&*first, "a");
         assert_eq!(&*second, "b");
         assert_eq!(first, again, "same id must reuse its name");
+    }
+
+    /// The empty closed record documents as `{}`, never as the unit type.
+    #[test]
+    fn empty_closed_record_is_not_unit() {
+        let i = Interner::new();
+        let mut namer = VarNamer::new();
+        let ty = Ty::Record(std::collections::BTreeMap::new(), RowTail::Closed);
+        let doc = ty_to_doc(&ty, &i, &mut namer);
+        assert!(
+            matches!(doc, Ok(TyDoc::Record { ref fields, tail: None }) if fields.is_empty()),
+            "the empty closed record must document as a field-less closed record, got {doc:?}"
+        );
+    }
+
+    /// An open record names its row tail, ahead of its field variables.
+    #[test]
+    fn open_record_names_its_tail_first() {
+        let mut i = Interner::new();
+        let Ok(x) = i.intern("x") else {
+            return;
+        };
+        let fields = std::collections::BTreeMap::from([(x, Ty::Var(7))]);
+        let ty = Ty::Record(fields, RowTail::Open(42));
+        let mut namer = VarNamer::new();
+        let doc = ty_to_doc(&ty, &i, &mut namer);
+        assert_eq!(
+            doc.ok(),
+            Some(TyDoc::Record {
+                fields: Box::new([("x".into(), TyDoc::Var("b".into()))]),
+                tail: Some("a".into()),
+            }),
+            "the row reads as `a` and the field variable as `b`"
+        );
     }
 
     #[test]

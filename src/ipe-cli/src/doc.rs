@@ -2446,12 +2446,20 @@ fn push_ty(ty: &TyDoc, index: &AnchorIndex, prec: Prec, pieces: &mut Vec<SigPiec
             }
             push_text(pieces, ")");
         }
-        TyDoc::Record(fields) => {
-            if fields.is_empty() {
-                push_text(pieces, "{}");
-                return;
+        TyDoc::Record { fields, tail } => {
+            match (tail, fields.is_empty()) {
+                (None, true) => {
+                    push_text(pieces, "{}");
+                    return;
+                }
+                // An open row with no known field is the row variable alone.
+                (Some(row), true) => {
+                    push_text(pieces, row);
+                    return;
+                }
+                (None, false) => push_text(pieces, "{ "),
+                (Some(row), false) => push_text(pieces, &format!("{{ {row} | ")),
             }
-            push_text(pieces, "{ ");
             for (i, (fname, fty)) in fields.iter().enumerate() {
                 if i > 0 {
                     push_text(pieces, ", ");

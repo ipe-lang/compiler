@@ -233,7 +233,10 @@ fn normalize_tydoc(ty: &TyDoc, ctx: &mut TyDocAlphaCtx) -> NormalizedType {
             let norm = elems.iter().map(|e| normalize_tydoc(e, ctx)).collect();
             NormalizedType::Tuple(norm)
         }
-        TyDoc::Record(fields) => {
+        // The row tail is not part of the normalized form: a query's open
+        // record (`TRecordOpen` above) drops it too, so both sides compare
+        // records by their fields alone.
+        TyDoc::Record { fields, tail: _ } => {
             // Fields are already in field-name order (producer sorts them).
             let norm = fields
                 .iter()

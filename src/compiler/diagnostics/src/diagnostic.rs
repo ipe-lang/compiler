@@ -355,10 +355,15 @@ pub enum TyDoc {
     Unit,
     /// An anonymous product (tuple) type `(T1, T2, ...)`. Invariant: arity ≥ 2.
     Tuple(Box<[Self]>),
-    /// A closed record type `{ x : Int, y : Bool }`. Fields are `(name, type)`
-    /// pairs in field-name order (the producer sorts them, so rendering is
-    /// deterministic).
-    Record(Box<[(Box<str>, Self)]>),
+    /// A record type: closed `{ x : Int, y : Bool }` or open `{ r | x : Int }`.
+    ///
+    /// `fields` are `(name, type)` pairs in field-name order (the producer sorts
+    /// them, so rendering is deterministic). `tail` names the row variable of
+    /// an open record and is `None` exactly when the record is closed.
+    Record {
+        fields: Box<[(Box<str>, Self)]>,
+        tail: Option<Box<str>>,
+    },
 }
 
 // ===========================================================================

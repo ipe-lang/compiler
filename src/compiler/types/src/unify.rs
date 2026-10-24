@@ -26,9 +26,10 @@
 //! never touches the interner or the arena.
 
 use std::collections::BTreeMap;
+use std::rc::Rc;
 
 use ipe_diagnostics::{DResult, Diagnostic, Span, TypeError};
-use ipe_intern::Interner;
+use ipe_intern::{Interner, Symbol};
 
 use crate::constrain::zonk_reported;
 use crate::doc::{VarNamer, ty_to_doc};
@@ -36,6 +37,72 @@ use crate::homed::{InferError, ModuleHome};
 use crate::solve::Budget;
 use crate::ty::{Content, FlatType, Ty, TyBounds};
 use crate::unionfind::{UnionFind, VarId};
+
+/// One `(found, expected)` unification obligation on the work stack.
+///
+/// `row` is set exactly when the pair is the row tails of a record pair, or a
+/// row further along that pair's chain. A mismatch there is reported as the
+/// record pair, the types the program wrote, never as the bare tails.
+struct Goal {
+    found: VarId,
+    expected: VarId,
+    row: Option<Rc<RecordPair>>,
+}
+
+impl Goal {
+    /// An obligation that reports its own two types on a mismatch.
+    const fn new(found: VarId, expected: VarId) -> Self {
+        Self {
+            found,
+            expected,
+            row: None,
+        }
+    }
+
+    /// A row-tail obligation that reports `pair` on a mismatch.
+    const fn row(found: VarId, expected: VarId, pair: Rc<RecordPair>) -> Self {
+        Self {
+            found,
+            expected,
+            row: Some(pair),
+        }
+    }
+}
+
+/// One side of a [`RecordPair`]: the record's own fields over its own tail.
+type RecordSide = (BTreeMap<Symbol, VarId>, VarId);
+
+/// A record pair as unification first met it, before either side was merged.
+struct RecordPair {
+    found: RecordSide,
+    expected: RecordSide,
+}
+
+/// The mismatch of a failed row-tail obligation, reported as its record pair.
+///
+/// Each side is rebuilt as a fresh record node over its own fields and tail,
+/// so the report shows both records as written even though unification has
+/// already merged their roots.
+fn record_pair_mismatch(
+    uf: &mut UnionFind<Content>,
+    budget: &mut Budget,
+    interner: &Interner,
+    span: Span,
+    pair: &RecordPair,
+) -> Diagnostic {
+    let mut side = |(fields, tail): &RecordSide| {
+        uf.fresh(Content::Structure(FlatType::Record(fields.clone(), *tail)))
+    };
+    let found = match side(&pair.found) {
+        Ok(v) => v,
+        Err(bug) => return bug,
+    };
+    let expected = match side(&pair.expected) {
+        Ok(v) => v,
+        Err(bug) => return bug,
+    };
+    mismatch(uf, budget, interner, span, found, expected)
+}
 
 /// Whether a concrete structure `flat` satisfies a variable's super-type
 /// obligations `bounds` at the head.
@@ -168,9 +235,38 @@ fn unify(
     // of source order so that LIFO pops them in the original left-to-right
     // sequence — later obligations may depend on the merges an earlier one
     // performs, so the ordering is load-bearing, not cosmetic.
-    let mut stack: Vec<(VarId, VarId)> = vec![(a, b)];
-    while let Some((a, b)) = stack.pop() {
-        unify_step(uf, budget, interner, span, a, b, &mut stack)?;
+    let mut stack: Vec<Goal> = vec![Goal::new(a, b)];
+    while let Some(Goal {
+        found,
+        expected,
+        row,
+    }) = stack.pop()
+    {
+        let step = unify_step(
+            uf,
+            budget,
+            interner,
+            span,
+            found,
+            expected,
+            row.as_ref(),
+            &mut stack,
+        );
+        if let Err(diag) = step {
+            let row_mismatch = matches!(
+                diag,
+                Diagnostic::Type {
+                    msg: TypeError::TypeMismatch { .. },
+                    ..
+                }
+            );
+            return Err(match row {
+                Some(pair) if row_mismatch => {
+                    record_pair_mismatch(uf, budget, interner, span, &pair)
+                }
+                Some(_) | None => diag,
+            });
+        }
     }
     Ok(())
 }
@@ -199,7 +295,8 @@ pub fn unify_at(
 /// Process a single `(found, expected)` obligation: agree the two heads and
 /// push any child obligations onto `stack`. Never recurses on children — that
 /// is what keeps the whole unification bounded by the [`Budget`] rather than the
-/// native stack.
+/// native stack. `row` is the record pair the obligation reports as, when it is
+/// a row tail ([`Goal`]).
 #[allow(clippy::too_many_arguments)]
 fn unify_step(
     uf: &mut UnionFind<Content>,
@@ -208,7 +305,8 @@ fn unify_step(
     span: Span,
     a: VarId,
     b: VarId,
-    stack: &mut Vec<(VarId, VarId)>,
+    row: Option<&Rc<RecordPair>>,
+    stack: &mut Vec<Goal>,
 ) -> DResult<()> {
     budget.tick()?;
     // Two finds, reused for both the same-class short-circuit and the content
@@ -282,7 +380,7 @@ fn unify_step(
             Err(mismatch(uf, budget, interner, span, ra, rb))
         }
         (Content::Structure(fa), Content::Structure(fb)) => {
-            unify_flat(uf, budget, interner, span, ra, rb, fa, fb, stack)
+            unify_flat(uf, budget, interner, span, ra, rb, fa, fb, row, stack)
         }
         // At least one side is a structure here (the no-structure fast path
         // returned above), so every remaining combination pairs a structure with
@@ -570,7 +668,8 @@ fn unify_flat(
     rb: VarId,
     fa: FlatType,
     fb: FlatType,
-    stack: &mut Vec<(VarId, VarId)>,
+    row: Option<&Rc<RecordPair>>,
+    stack: &mut Vec<Goal>,
 ) -> DResult<()> {
     match (fa, fb) {
         (FlatType::Unit, FlatType::Unit) => uf.union(ra, rb, Content::Structure(FlatType::Unit)),
@@ -579,8 +678,8 @@ fn unify_flat(
             // queue argument-with-argument and result-with-result. Push result
             // last so it pops after the argument (source order preserved).
             uf.union(ra, rb, Content::Structure(FlatType::Fun(a1, r1)))?;
-            stack.push((r1, r2));
-            stack.push((a1, a2));
+            stack.push(Goal::new(r1, r2));
+            stack.push(Goal::new(a1, a2));
             Ok(())
         }
         (
@@ -621,7 +720,7 @@ fn unify_flat(
             // ascending index order, matching the original in-place walk. The
             // driver processes this stack only after the union commits.
             for (x, y) in as1.iter().zip(as2.iter()).rev() {
-                stack.push((*x, *y));
+                stack.push(Goal::new(*x, *y));
             }
             uf.union(
                 ra,
@@ -647,7 +746,7 @@ fn unify_flat(
             // moved, never cloned. Push in reverse so LIFO replays them in
             // ascending index order.
             for (x, y) in es1.iter().zip(es2.iter()).rev() {
-                stack.push((*x, *y));
+                stack.push(Goal::new(*x, *y));
             }
             uf.union(ra, rb, Content::Structure(FlatType::Tuple(es1)))?;
             Ok(())
@@ -681,7 +780,7 @@ fn unify_flat(
                 let Some((v1, v2)) = fs1.get(name).copied().zip(fs2.get(name).copied()) else {
                     continue;
                 };
-                stack.push((v1, v2));
+                stack.push(Goal::new(v1, v2));
             }
 
             // Partition into only-on-left and only-on-right.
@@ -707,25 +806,43 @@ fn unify_flat(
                 return Err(mismatch(uf, budget, interner, span, ra, rb));
             }
 
+            // The record pair every tail obligation below reports as: the
+            // pair a row chain started from, or this pair at a chain's head.
+            let pair = row.map_or_else(
+                || {
+                    Rc::new(RecordPair {
+                        found: (fs1.clone(), ext1),
+                        expected: (fs2, ext2),
+                    })
+                },
+                Rc::clone,
+            );
+
             if only1.is_empty() && only2.is_empty() {
                 // Step 3 — identical field sets: merge first, then queue the
-                // tail unification. `fs1` is moved into the union; no clone.
+                // tail unification. `fs1` is moved into the union.
                 uf.union(ra, rb, Content::Structure(FlatType::Record(fs1, ext1)))?;
-                stack.push((ext1, ext2));
+                stack.push(Goal::row(ext1, ext2, pair));
             } else {
                 // Step 4 — differing extras: absorb each side's unique fields
                 // into the other's extension so both original tails carry the
                 // full field union and stay live for later constraints.
-                unify_open_record_rows(uf, ra, rb, fs1, ext1, ext2, only1, only2, stack)?;
+                let rows = RowMerge {
+                    ext1,
+                    ext2,
+                    only1,
+                    only2,
+                    pair,
+                };
+                unify_open_record_rows(uf, ra, rb, fs1, rows, stack)?;
             }
             Ok(())
         }
         // Two closed-tail sentinels: identical structures, merge and succeed.
         // Mirrors the reference compiler `(EmptyRecord1, EmptyRecord1) -> return ()` arm
         // in `../ipe/src/Ipe/Type/Unify.hs`. Without this arm both roots would
-        // fall through to the wildcard mismatch, producing a spurious
-        // "TypeMismatch { expected: Unit, found: Unit }" (zonk renders
-        // EmptyRecord as Unit for display purposes).
+        // fall through to the wildcard mismatch, a spurious mismatch of two
+        // empty rows.
         (FlatType::EmptyRecord, FlatType::EmptyRecord) => {
             uf.union(ra, rb, Content::Structure(FlatType::EmptyRecord))
         }
@@ -753,18 +870,21 @@ fn unify_flat(
 /// The queued tail unifications run the occurs check (the Flex-vs-Structure
 /// arm), so no cycle can form; fresh extension nodes are minted before pushing
 /// so each obligation carries a resolved target.
-#[allow(clippy::too_many_arguments)]
 fn unify_open_record_rows(
     uf: &mut UnionFind<Content>,
     ra: VarId,
     rb: VarId,
-    fs1: BTreeMap<ipe_intern::Symbol, VarId>,
-    ext1: VarId,
-    ext2: VarId,
-    only1: Vec<(ipe_intern::Symbol, VarId)>,
-    only2: Vec<(ipe_intern::Symbol, VarId)>,
-    stack: &mut Vec<(VarId, VarId)>,
+    fs1: BTreeMap<Symbol, VarId>,
+    rows: RowMerge,
+    stack: &mut Vec<Goal>,
 ) -> DResult<()> {
+    let RowMerge {
+        ext1,
+        ext2,
+        only1,
+        only2,
+        pair,
+    } = rows;
     // Merged field map: the union of both sides' fields, used as the merged
     // record's structure. `fs1` is moved in; `only2` supplies the right-unique
     // fields. Its extension is chosen below to match each asymmetric case.
@@ -780,7 +900,7 @@ fn unify_open_record_rows(
             uf.union(ra, rb, Content::Structure(FlatType::Record(merged, ext2)))?;
             let only2_map: BTreeMap<_, _> = only2.into_iter().collect();
             let ext1_target = uf.fresh(Content::Structure(FlatType::Record(only2_map, ext2)))?;
-            stack.push((ext1, ext1_target));
+            stack.push(Goal::row(ext1, ext1_target, pair));
             Ok(())
         }
         // Only side 1 carries extras: symmetric to the case above.
@@ -788,7 +908,7 @@ fn unify_open_record_rows(
             uf.union(ra, rb, Content::Structure(FlatType::Record(merged, ext1)))?;
             let only1_map: BTreeMap<_, _> = only1.into_iter().collect();
             let ext2_target = uf.fresh(Content::Structure(FlatType::Record(only1_map, ext1)))?;
-            stack.push((ext2, ext2_target));
+            stack.push(Goal::row(ext2, ext2_target, pair));
             Ok(())
         }
         // Both sides carry unique fields: a shared fresh tail closes the union,
@@ -811,18 +931,28 @@ fn unify_open_record_rows(
 
             // Push in reverse so LIFO replays them as ext1-then-ext2, matching
             // the original sequential order.
-            stack.push((ext2, ext2_target));
-            stack.push((ext1, ext1_target));
+            stack.push(Goal::row(ext2, ext2_target, Rc::clone(&pair)));
+            stack.push(Goal::row(ext1, ext1_target, pair));
             Ok(())
         }
         // Unreachable: the caller only enters step 4 when at least one side has
         // extras. Handle it as the identical-field-set merge for total safety.
         (true, true) => {
             uf.union(ra, rb, Content::Structure(FlatType::Record(merged, ext1)))?;
-            stack.push((ext1, ext2));
+            stack.push(Goal::row(ext1, ext2, pair));
             Ok(())
         }
     }
+}
+
+/// The row half of a step-4 record merge: both tails, each side's unique
+/// fields, and the record pair the tail obligations report as.
+struct RowMerge {
+    ext1: VarId,
+    ext2: VarId,
+    only1: Vec<(Symbol, VarId)>,
+    only2: Vec<(Symbol, VarId)>,
+    pair: Rc<RecordPair>,
 }
 
 /// Reject binding flexible `var` to `structure` if `var` occurs inside it,
