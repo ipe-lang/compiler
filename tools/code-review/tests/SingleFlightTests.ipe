@@ -494,11 +494,11 @@ unitPageSettlesOnItsOwnRead settings a b =
         otherReturned =
             after settings (viewDone settings.epoch ua (Ok (Just a))) waiting
 
-        queueLoaded =
-            after settings (completions PendingLoaded otherQueueLoad (Ok (queuePageOf [ a ]))) otherReturned
-
         otherQueueLoad =
             anotherLoad settings.epoch (QueueReload Index.Start) otherReturned.queueLoad
+
+        queueLoaded =
+            after settings (completions PendingLoaded otherQueueLoad (Ok (queuePageOf [ a ]))) otherReturned
 
         ownReturned =
             after settings (viewDone settings.epoch ub (Ok (Just b))) queueLoaded
@@ -2003,7 +2003,7 @@ notSavedClearedByReload settings a b =
             queueModel [ a, b ] (ViewShown a)
 
         failed =
-            after settings (drawnOn shown ua ApproveRow ++ (decisionSavedFor settings.epoch ua (Err (Error.conflict "boom")))) shown
+            after settings (drawnOn shown ua ApproveRow ++ decisionSavedFor settings.epoch ua (Err (Error.conflict "boom"))) shown
 
         reloading =
             after settings [ Navigated QueuePage ] failed

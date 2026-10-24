@@ -1,5 +1,6 @@
 module Lib.Slot exposing (LoadSlot, LoadTicket, Settle(..), Stamp, ensureLoad, firstTicket, idleLoad, isCurrentLoad, latestTicket, latestWant, loadArrived, nextTicket, owns, requestLoad, running, runningLoad, runningWant, stamp, stampKey, ticketNumber)
 
+import Ipe.Maybe as Maybe
 import Lib.Epoch exposing (Epoch)
 
 
@@ -83,8 +84,10 @@ running current held =
 owns : Epoch -> Stamp key -> Maybe (Stamp key) -> Bool
 owns current arrived held =
     case running current held of
-        Just own ->
-            own == arrived
+        Just (Stamp owner key) ->
+            case arrived of
+                Stamp from presented ->
+                    owner == from && key == presented
 
         Nothing ->
             False
