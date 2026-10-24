@@ -794,6 +794,7 @@ mod tests {
             remove: false,
         };
         diff_attrs::<()>(
+            ParseContext::Data,
             "button",
             &[],
             &[Attribute::Attr("data-ipe-hid".into(), "r_9_button".into())],
