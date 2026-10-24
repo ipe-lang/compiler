@@ -1199,7 +1199,10 @@ static HAND_TABLE: &[EnvVar] = &[
                   to a fresh `init`. Requesting a backend the build lacks the \
                   feature for is a fail-closed startup error, not a silent \
                   downgrade — build with the feature or set \
-                  `IPE_WEB_STORE=file|memory`.",
+                  `IPE_WEB_STORE=file|memory`. A page request that cannot persist \
+                  its new session is refused with 503; an existing session whose \
+                  checkpoint fails stays live and is not evicted until a checkpoint \
+                  lands.",
         subsystem: Subsystem::Web,
         class: Class::Tunable,
     },
