@@ -564,11 +564,15 @@ pub mod tests {
         let leader = pgid.to_string();
         for entry in std::fs::read_dir("/proc").expect("list /proc") {
             let name = entry.expect("a /proc entry").file_name();
-            let Some(process) = name.to_str() else { continue };
+            let Some(process) = name.to_str() else {
+                continue;
+            };
             if process == leader || !process.bytes().all(|byte| byte.is_ascii_digit()) {
                 continue;
             }
-            let Some(stat) = read_stat(process) else { continue };
+            let Some(stat) = read_stat(process) else {
+                continue;
+            };
             let mut fields = stat_fields(&stat);
             let state = fields.next().expect("a stat state field");
             let member = fields.nth(1).expect("a stat group field") == leader;
