@@ -174,6 +174,29 @@ draftOn drawnFrom unit text =
     drawnOn drawnFrom unit (\row -> RefuseDraft row text)
 
 
+-- Whether `action` is the refuse shortcut, the one that opens a panel.
+startsRefusal : KeyAction card panel -> Bool
+startsRefusal action =
+    case action of
+        RefuseSelected _ ->
+            True
+
+        ApproveSelected _ ->
+            False
+
+        Select _ ->
+            False
+
+        ConfirmRefuse _ ->
+            False
+
+        CancelRefuse _ ->
+            False
+
+        Ignore ->
+            False
+
+
 -- Whether the render of `model` draws an open refusal panel's controls for
 -- its keys, so a key pressed on it is read on that panel's row.
 panelKeysDrawn : Model -> Bool
@@ -445,13 +468,7 @@ refusalPanelLivesInIdleSlot settings a b file =
     offers shown ua
         && offers secondShown ub
         && offers (withRefusal file shown) file.uid
-        && (case Keys.keyAction (App.keyMode (App.keyOffers saving) saving) "r" of
-                RefuseSelected _ ->
-                    True
-
-                _ ->
-                    False
-           )
+        && startsRefusal (Keys.keyAction (App.keyMode (App.keyOffers saving) saving) "r")
         && keyed == saving
         && keyed.decision == DecisionSaving ua settings.epoch
         && String.contains "Saving the decision…" (page keyed)
