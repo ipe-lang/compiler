@@ -968,6 +968,12 @@ pub(crate) const STAMPED_ID_ATTR: &str = "ipe-id";
 /// foreign element alone, restores these to their stored case ("adjust SVG
 /// attributes" and "adjust MathML attributes"); every other name stays
 /// lowercase. A key absent here is stored lowercase on every element.
+///
+/// [`ParseContext::Foreign`] does not tell an SVG subtree from a MathML one,
+/// so both adjustment lists apply to either: an SVG-list key on a MathML
+/// element (or `definitionURL` on an SVG one) is written in its adjusted
+/// case here where the parser stores it lowercase. Neither name means
+/// anything on the other namespace's elements; the divergence is deliberate.
 const FOREIGN_ATTR_CASE: [(&str, &str); 59] = [
     ("attributename", "attributeName"),
     ("attributetype", "attributeType"),
@@ -1487,8 +1493,8 @@ fn assign_ipe_ids_depth<M>(node: &mut Html<M>, path: &str, depth: usize, group: 
             if let Html::HElement(ctag, cattrs, _) = child {
                 if let Some(name) = group
                     && ctag.as_str() == "input"
-                    && attr_value(cattrs, "type") == Some("radio")
-                    && attr_value(cattrs, "name").is_none_or(str::is_empty)
+                    && painted_attr_value(cattrs, "type") == Some("radio")
+                    && painted_attr_value(cattrs, "name").is_none_or(str::is_empty)
                 {
                     set_attr(cattrs, "name", name);
                 }
@@ -1528,7 +1534,7 @@ fn ipe_id_key<'a, M>(tag: &str, attrs: &'a [Attribute<M>]) -> Option<&'a str> {
     if matches!(
         tag,
         "input" | "textarea" | "select" | "form" | "button" | "fieldset"
-    ) && let Some(k) = attr_value(attrs, "name")
+    ) && let Some(k) = painted_attr_value(attrs, "name")
         && !k.is_empty()
     {
         return Some(k);
@@ -1536,9 +1542,24 @@ fn ipe_id_key<'a, M>(tag: &str, attrs: &'a [Attribute<M>]) -> Option<&'a str> {
     None
 }
 
+/// The value of the attribute spelled exactly `key`, first written.
+///
+/// Reads the runtime's own reserved names (`ipe-key`), which the sink refuses
+/// in any other case, so an exact match is the one the painted document holds.
 fn attr_value<'a, M>(attrs: &'a [Attribute<M>], key: &str) -> Option<&'a str> {
     attrs.iter().find_map(|a| match a {
         Attribute::Attr(k, v) if k == key => Some(v.as_str()),
+        _ => None,
+    })
+}
+
+/// The value the painted document holds for the HTML attribute `key` on an
+/// HTML element: the last `Attr` whose key is `key` in any ASCII case, as
+/// [`attribute_pairs`] folds and keeps it. `key` must be lowercase and never
+/// a [`FOREIGN_ATTR_CASE`] key, so the fold is the plain ASCII one.
+fn painted_attr_value<'a, M>(attrs: &'a [Attribute<M>], key: &str) -> Option<&'a str> {
+    attrs.iter().rev().find_map(|a| match a {
+        Attribute::Attr(k, v) if k.eq_ignore_ascii_case(key) => Some(v.as_str()),
         _ => None,
     })
 }
@@ -3161,6 +3182,35 @@ mod tests {
         );
         assign_ipe_ids(&mut t, "r");
         assert!(collect_ids(&t).contains(&"r_0_input:email".to_string()));
+    }
+
+    /// The implicit key is the `name` the painted document holds: a `NAME`
+    /// written in another case names the same attribute, and the last write
+    /// is the one painted, so the key follows it.
+    #[test]
+    fn the_implicit_key_is_the_painted_name() {
+        let form = |attrs: Vec<Attribute<()>>| -> Html<()> {
+            Html::HElement(
+                "form".into(),
+                vec![],
+                vec![Html::HElement("input".into(), attrs, vec![])],
+            )
+        };
+        let mut t = form(vec![Attribute::Attr("NAME".into(), "email".into())]);
+        assign_ipe_ids(&mut t, "r");
+        assert_eq!(
+            collect_ids(&t),
+            vec!["r".to_string(), "r_0_input:email".to_string()]
+        );
+        let mut t = form(vec![
+            Attribute::Attr("name".into(), "first".into()),
+            Attribute::Attr("Name".into(), "last".into()),
+        ]);
+        assign_ipe_ids(&mut t, "r");
+        assert_eq!(
+            collect_ids(&t),
+            vec!["r".to_string(), "r_0_input:last".to_string()]
+        );
     }
 
     /// Inverse of `push_id_segment`: `None` for a byte outside the encoding.
