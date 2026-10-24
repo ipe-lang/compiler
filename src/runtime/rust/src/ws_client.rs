@@ -27,7 +27,10 @@
 use super::*;
 #[cfg(not(target_arch = "wasm32"))]
 use crate::tea::SourceTask;
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(any(
+    not(target_arch = "wasm32"),
+    all(target_arch = "wasm32", feature = "wasm-client")
+))]
 use crate::transport_timeout::{PingCadence, TimeoutRefusal, TransportTimeout};
 #[cfg(not(target_arch = "wasm32"))]
 use futures_util::{SinkExt, StreamExt};
@@ -192,6 +195,51 @@ crate::redact::redacting_debug!(WsClientCfg {
     shown: [timeout, pingInterval],
     masked: [url, headers],
 });
+
+/// Which connect setting is outside its admitted range, and why.
+#[cfg(any(
+    not(target_arch = "wasm32"),
+    all(target_arch = "wasm32", feature = "wasm-client")
+))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SpanRefusal {
+    /// `WebSocketCfg.timeout`.
+    Timeout(TimeoutRefusal),
+    /// `WebSocketCfg.pingInterval`.
+    PingInterval(TimeoutRefusal),
+}
+
+#[cfg(any(
+    not(target_arch = "wasm32"),
+    all(target_arch = "wasm32", feature = "wasm-client")
+))]
+impl std::fmt::Display for SpanRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Timeout(refusal) => write!(f, "timeout: {refusal}"),
+            Self::PingInterval(refusal) => write!(f, "pingInterval: {refusal}"),
+        }
+    }
+}
+
+/// Parses a connect's handshake timeout, then its ping interval: the one
+/// judgement of both spans, shared by the native and the browser connect.
+///
+/// # Errors
+///
+/// The first span outside its admitted range, as a [`SpanRefusal`].
+#[cfg(any(
+    not(target_arch = "wasm32"),
+    all(target_arch = "wasm32", feature = "wasm-client")
+))]
+fn parse_connect_spans(
+    timeout_ms: i64,
+    ping_interval_ms: i64,
+) -> Result<(TransportTimeout, PingCadence), SpanRefusal> {
+    let deadline = TransportTimeout::parse(timeout_ms).map_err(SpanRefusal::Timeout)?;
+    let ping = PingCadence::parse(ping_interval_ms).map_err(SpanRefusal::PingInterval)?;
+    Ok((deadline, ping))
+}
 
 #[cfg(not(target_arch = "wasm32"))]
 enum WsCmd {
@@ -727,19 +775,16 @@ async fn do_connect<E: From<String> + FromLimitExceeded + FromIpeError + Send + 
     // with no admissible deadline never leaves the process. The one deadline
     // bounds the name lookup, the TCP dial, the TLS handshake and the
     // WebSocket handshake.
-    let deadline = match TransportTimeout::parse(timeout_ms) {
-        Ok(deadline) => deadline,
-        Err(refusal) => {
+    let (deadline, ping) = match parse_connect_spans(timeout_ms, ping_interval_ms) {
+        Ok(spans) => spans,
+        Err(SpanRefusal::Timeout(refusal)) => {
             return WsConnectError::BadTimeout {
                 url: safe_url,
                 refusal,
             }
             .into_task();
         }
-    };
-    let ping = match PingCadence::parse(ping_interval_ms) {
-        Ok(ping) => ping,
-        Err(refusal) => {
+        Err(SpanRefusal::PingInterval(refusal)) => {
             return WsConnectError::BadPingInterval {
                 url: safe_url,
                 refusal,
@@ -1569,6 +1614,41 @@ mod tests {
         let dialled =
             tokio::time::timeout(std::time::Duration::from_millis(100), listener.accept()).await;
         assert!(dialled.is_err(), "a refused span must never dial");
+    }
+
+    /// The one span judgement both targets share: the browser connect refuses
+    /// with this exact text, so a span the native connect refuses can never
+    /// open a browser socket.
+    #[test]
+    fn connect_spans_are_judged_once_for_every_target() {
+        use crate::transport_timeout::TimeoutRefusal::{AboveCeiling, NotPositive};
+        let over = i64::from(crate::transport_timeout::MAX_TRANSPORT_TIMEOUT_MS) + 1;
+        for (timeout, ping_interval, expected) in [
+            (0, 0, SpanRefusal::Timeout(NotPositive)),
+            (-1, 0, SpanRefusal::Timeout(NotPositive)),
+            (over, 0, SpanRefusal::Timeout(AboveCeiling)),
+            (0, -1, SpanRefusal::Timeout(NotPositive)),
+            (30_000, -1, SpanRefusal::PingInterval(NotPositive)),
+            (30_000, over, SpanRefusal::PingInterval(AboveCeiling)),
+        ] {
+            assert_eq!(
+                parse_connect_spans(timeout, ping_interval).err(),
+                Some(expected),
+                "{timeout}/{ping_interval}"
+            );
+        }
+        assert!(matches!(
+            parse_connect_spans(30_000, 0),
+            Ok((_, PingCadence::Off))
+        ));
+        assert!(matches!(
+            parse_connect_spans(30_000, 15_000),
+            Ok((_, PingCadence::Every(_)))
+        ));
+        let timeout_text = SpanRefusal::Timeout(NotPositive).to_string();
+        let ping_text = SpanRefusal::PingInterval(AboveCeiling).to_string();
+        assert!(timeout_text.starts_with("timeout: "), "{timeout_text}");
+        assert!(ping_text.starts_with("pingInterval: "), "{ping_text}");
     }
 
     #[test]
@@ -2495,12 +2575,19 @@ mod wasm_client {
     /// cannot be attached: the browser `WebSocket` constructor has no header
     /// parameter (a real platform limitation, not a dropped feature on our
     /// side) — surfaced as a console warning rather than a silent drop.
-    /// `cfg.timeout`/`cfg.pingInterval` have no browser-substitute wiring yet
-    /// (the browser auto-manages ping/pong at the protocol level).
-    pub fn web_socket_connect_with<E: From<String> + 'static>(
+    /// `cfg.timeout` and `cfg.pingInterval` are judged exactly as the native
+    /// connect judges them, so a span it refuses is refused here too, as
+    /// `InvalidInput`; an admitted span is not applied, since the browser owns
+    /// the handshake deadline and the ping/pong exchange.
+    pub fn web_socket_connect_with<E: From<String> + super::FromIpeError + 'static>(
         cfg: super::WsClientCfg,
     ) -> IpeTask<E, i64> {
         Box::pin(async move {
+            if let Err(refusal) = super::parse_connect_spans(cfg.timeout, cfg.pingInterval) {
+                return IpeResult::Err(E::from_ipe_error(crate::error::IpeError::invalid_input(
+                    format!("WebSocket.connect: {refusal}"),
+                )));
+            }
             if !cfg.headers.is_empty() {
                 crate::wasm::console_warn(
                     "Ipe.WebSocket.connectWith: custom headers are not settable via the \
