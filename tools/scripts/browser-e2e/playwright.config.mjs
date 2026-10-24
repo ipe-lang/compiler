@@ -3,8 +3,8 @@
  * layout-fill, the stale-event, boot-data and form-controls refusals and the
  * select-hold and live-property specs on the geo-clipboard app, and the
  * focus-across-patch refusals on their own app, the host-rebind refusal
- * on the layout-fill app, and the live-tabs and closed-session refusals on
- * the geo-clipboard app).
+ * on the layout-fill app, and the live-tabs, closed-session and event-answer
+ * refusals on the geo-clipboard app).
  *
  * A single Chromium project — the only browser target for these tests.
  * The geo/clipboard browser APIs (navigator.geolocation,
@@ -30,6 +30,7 @@ export default {
     "live-tabs.spec.mjs",
     "csp.spec.mjs",
     "session-closed.spec.mjs",
+    "event-refused.spec.mjs",
   ],
   timeout: 30_000,
   retries: 0,
