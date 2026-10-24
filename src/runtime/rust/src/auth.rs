@@ -244,15 +244,17 @@ fn login_path(stored: Option<&str>) -> LoginPath<'_> {
         .map_or(LoginPath::Decoy, LoginPath::Verify)
 }
 
-/// Whether `password` logs in on `path`.
+/// Whether `password` logs in on `path`; `decoy` is [`dummy_bcrypt_hash`].
 ///
 /// The one site that runs bcrypt on the login path; both arms hand it a hash
-/// at [`REGISTER_COST`]. The decoy arm runs the KDF and never admits.
+/// at [`REGISTER_COST`]. The decoy arm runs the KDF and never admits. The
+/// caller produces `decoy` before the path is known, so its one-time hash
+/// runs on whichever path the first login takes, never on the decoy arm only.
 #[cfg(feature = "db")]
-fn run_login_path(path: LoginPath<'_>, password: &str) -> bool {
+fn run_login_path(path: LoginPath<'_>, password: &str, decoy: &str) -> bool {
     let (hash, admits) = match path {
         LoginPath::Verify(hash) => (hash.text(), true),
-        LoginPath::Decoy => (dummy_bcrypt_hash(), false),
+        LoginPath::Decoy => (decoy, false),
     };
     let verified = bcrypt::verify(password, hash).unwrap_or(false);
     admits && verified
@@ -1220,7 +1222,8 @@ pub fn auth_login<
         // `Unavailable` on both alike; a panicked verify fails closed as
         // invalid credentials.
         let verified = crate::threads::join_blocking("auth.login", move || {
-            run_login_path(login_path(stored.as_deref()), &password)
+            let decoy = dummy_bcrypt_hash();
+            run_login_path(login_path(stored.as_deref()), &password, decoy)
         })
         .await;
         match (verified, id) {
@@ -2892,11 +2895,13 @@ mod tests {
         // The decoy path runs and never admits, whatever the password.
         assert!(!run_login_path(
             login_path(Some(floor.as_str())),
-            "hunter2!"
+            "hunter2!",
+            dummy_bcrypt_hash()
         ));
         assert!(!run_login_path(
             LoginPath::Decoy,
-            "ipe-login-timing-defence"
+            "ipe-login-timing-defence",
+            dummy_bcrypt_hash()
         ));
     }
 
@@ -3696,6 +3701,63 @@ fn two(p: &str) -> bool { let v = |h| bcrypt::verify(p, h); v("h").is_ok() }
         assert_eq!(bcrypt_verify_sites(SYNTHETIC_VERIFIES), ["one", "two"]);
     }
 
+    /// What follows each `bcrypt` path root in `source`: `::verify` and
+    /// `::hash` are calls the site scan sees; a rename, glob or group import
+    /// names `verify` under a path the site scan cannot follow.
+    fn bcrypt_roots(source: &str) -> Vec<String> {
+        let tokens = tokens(source);
+        tokens
+            .iter()
+            .enumerate()
+            .filter(|(_, token)| token.text == "bcrypt")
+            .map(|(at, _)| {
+                tokens
+                    .iter()
+                    .skip(at + 1)
+                    .take(3)
+                    .map(|t| t.text.as_str())
+                    .collect::<String>()
+            })
+            .collect()
+    }
+
+    /// The enclosing `fn` of every call of `name` in `source`, its
+    /// declaration aside.
+    fn call_sites(source: &str, name: &str) -> Vec<String> {
+        tokens(source)
+            .windows(3)
+            .filter_map(|window| match window {
+                [before, called, open]
+                    if called.text == name && open.text == "(" && before.text != "fn" =>
+                {
+                    Some(called.func.clone().unwrap_or_default())
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Source with every way to reach `bcrypt::verify` under another path,
+    /// beside the two calls the site scan sees.
+    const SYNTHETIC_ROOTS: &str = r#"
+use bcrypt::{verify as check};
+use bcrypt as b;
+fn f(p: &str) -> bool { bcrypt::verify(p, "h").is_ok() && bcrypt::hash(p, 4).is_ok() }
+fn g() { use bcrypt::*; }
+// bcrypt as c
+fn decoy() -> u8 { 0 }
+fn caller() -> u8 { decoy() }
+"#;
+
+    #[test]
+    fn bcrypt_root_scan_names_every_path_and_call_scan_skips_the_declaration() {
+        assert_eq!(
+            bcrypt_roots(SYNTHETIC_ROOTS),
+            ["::{", "asb;", "::verify", "::hash", "::*"]
+        );
+        assert_eq!(call_sites(SYNTHETIC_ROOTS, "decoy"), ["caller"]);
+    }
+
     /// The login path runs bcrypt at one site, `run_login_path`, whose two arms
     /// both hand it a hash at `REGISTER_COST`; the other production site is
     /// `verifyPassword`'s, which verifies at any admitted cost. The rest are
@@ -3712,6 +3774,27 @@ fn two(p: &str) -> bool { let v = |h| bcrypt::verify(p, h); v("h").is_ok() }
                 "login_refuses_a_stored_hash_above_the_cost_ceiling",
             ],
             "a new `bcrypt::verify` must not open a second login site"
+        );
+        assert!(
+            bcrypt_roots(auth)
+                .iter()
+                .all(|path| path == "::verify" || path == "::hash"),
+            "`bcrypt` is reached only as `bcrypt::verify`/`bcrypt::hash`, the paths the site \
+             scan sees: {:?}",
+            bcrypt_roots(auth)
+        );
+        let decoy_sites = call_sites(auth, "dummy_bcrypt_hash");
+        assert!(
+            !decoy_sites.iter().any(|site| site == "run_login_path"),
+            "the decoy is produced by the caller, before the path is known: {decoy_sites:?}"
+        );
+        assert_eq!(
+            decoy_sites
+                .iter()
+                .filter(|site| *site == "auth_login")
+                .count(),
+            1,
+            "`auth_login` produces the decoy on every path: {decoy_sites:?}"
         );
         let none: Vec<usize> = Vec::new();
         assert_eq!(
