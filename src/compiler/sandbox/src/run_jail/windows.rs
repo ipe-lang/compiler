@@ -13,7 +13,7 @@ use super::{RunJailDefect, RunJailTools};
 
 /// Windows: the run jail's primitives are Win32 kernel objects.
 ///
-/// A Job Object and an AppContainer lowbox token are built directly through the
+/// A Job Object and an `AppContainer` lowbox token are built directly through the
 /// Windows API rather than by exec'ing an external tool. There is no
 /// `bwrap`/`prlimit`/`sandbox-exec` binary to locate, so this returns the
 /// [`RunJailTools::Native`] arm, which carries no tool path at all; the real
