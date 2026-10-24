@@ -15,6 +15,9 @@ use ipe_runtime_rust::{IpeError, IpeErrorKind, IpeResult};
 /// Names the scenario a child run executes instead of spawning.
 const CHILD_SCENARIO: &str = "IPE_STDIN_LINE_READER_CHILD";
 
+/// Starts each report line, so the harness's own output is never read as a report.
+const REPORT: &str = "stdin-line-reader-report:";
+
 /// The `Io.readLine` line cap, mirrored from `io.rs`.
 const LINE_CAP_BYTES: usize = 1024 * 1024;
 
@@ -42,7 +45,8 @@ fn child_scenario() -> Option<String> {
 fn run_child(reads: usize) {
     let mut out = std::io::stdout().lock();
     for _ in 0..reads {
-        writeln!(out, "{}", read_one()).expect("write the report line");
+        // The leading newline ends any harness text left open on the line.
+        writeln!(out, "\n{REPORT}{}", read_one()).expect("write the report line");
     }
     out.flush().expect("flush the report");
 }
@@ -52,7 +56,7 @@ fn spawn_child(test_name: &str, input: &[u8]) -> Vec<String> {
     let exe = std::env::current_exe().expect("the test binary must locate itself");
     let mut child = Command::new(exe)
         .env(CHILD_SCENARIO, test_name)
-        .args(["--exact", test_name, "--test-threads=1", "--nocapture"])
+        .args(["--exact", test_name, "--nocapture"])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -66,7 +70,7 @@ fn spawn_child(test_name: &str, input: &[u8]) -> Vec<String> {
     String::from_utf8(output.stdout)
         .expect("the child's report is UTF-8")
         .lines()
-        .filter(|line| line.starts_with("line:") || line.starts_with("refused:"))
+        .filter_map(|line| line.strip_prefix(REPORT))
         .map(str::to_owned)
         .collect()
 }
