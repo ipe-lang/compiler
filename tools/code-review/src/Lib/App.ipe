@@ -1,4 +1,4 @@
-module Lib.App exposing (KeyCard, KeyOffers(..), Model, Msg(..), Page(..), decidableRow, decisionSaved, decisionTask, historyLoaded, initialModel, keyMode, keyOffers, queueList, queueLoaded, selectedUid, selectedUnit, standingLoaded, unitPageState, update, viewLoaded)
+module Lib.App exposing (DecisionPlan(..), KeyCard, KeyOffers(..), Model, Msg(..), Page(..), decidableRow, decisionPlan, decisionSaved, historyLoaded, initialModel, keyMode, keyOffers, queueList, queueLoaded, selectedUid, selectedUnit, standingLoaded, unitPageState, update, viewLoaded)
 
 import Ipe.Error as Error exposing (Error)
 import Ipe.List as List
@@ -747,10 +747,11 @@ pageRefusal model uid =
 -- drew, each re-proved before writing. A decision asked off the queue page
 -- is refused before it takes the slot, and so is one asked on a server with
 -- no signing key, on a row the page does not offer that decision on (the
--- view's own `decidableRow`), or with an offer (`drawn`) other than the one
--- the page offers now, each with a notice saying why and the refusal panel
--- kept; one asked while another is busy starts nothing, and that decision's
--- pending state stays shown.
+-- view's own `decidableRow`), with an offer (`drawn`) other than the one
+-- the page offers now, or on an offer `decisionPlan` refuses, each with a
+-- notice saying why and the refusal panel kept, and no task started; one
+-- asked while another is busy starts nothing, and that decision's pending
+-- state stays shown.
 saveDecision : Settings.AppSettings -> Model -> DecisionTarget -> Uid -> Maybe DecidableRow -> LibDb.Decision -> ( Model, Cmd Msg )
 saveDecision settings model target uid drawn decision =
     if model.page /= QueuePage then
@@ -764,26 +765,41 @@ saveDecision settings model target uid drawn decision =
             Signing macKey ->
                 case DecisionSlot.decidableAs model.selected model.queueState model.selectedView target uid drawn of
                     Ok row ->
-                        case DecisionSlot.startDecision settings.epoch uid model.decision of
-                            Just ( started, saving ) ->
-                                ( { model | decision = started }
-                                , Cmd.perform (ServerLog.logged "decision save failed" (decisionTask settings macKey model row decision)) (decisionSaved saving)
-                                )
+                        case decisionPlan model row of
+                            Ok plan ->
+                                case DecisionSlot.startDecision settings.epoch uid model.decision of
+                                    Just ( started, saving ) ->
+                                        ( { model | decision = started }
+                                        , Cmd.perform (ServerLog.logged "decision save failed" (decidePlan settings macKey plan decision)) (decisionSaved saving)
+                                        )
 
-                            Nothing ->
-                                ( model, Cmd.none )
+                                    Nothing ->
+                                        ( model, Cmd.none )
+
+                            Err refusal ->
+                                ( { model | decision = DecisionSlot.decisionRefused settings.epoch (SaveRefused refusal) (Slot.latestTicket model.queueLoad) model.decision }, Cmd.none )
 
                     Err failure ->
                         ( { model | decision = DecisionSlot.decisionRefused settings.epoch failure (Slot.latestTicket model.queueLoad) model.decision }, Cmd.none )
 
 
--- The decision on `row`'s drawn source or listed unreviewable file's drawn
--- digest, or its refusal when the unit or file is off the shown queue page,
--- no source is shown, the file carries no digest, or the source or digest
--- shown is no longer the one drawn, decided before anything is read. The
--- source and digest come from the offer, never from the page's current copy.
-decisionTask : Settings.AppSettings -> MacKey -> Model -> DecidableRow -> LibDb.Decision -> Task.Task Error (Result DecideRefusal ( Index.Attested, Index.Written ))
-decisionTask settings macKey model row decision =
+-- What a decision writes: the source a unit's offer drew, or the digest a
+-- listed unreviewable file's offer drew. Built only by `decisionPlan`, so
+-- a decision's write carries what the reviewer was shown and nothing read
+-- from the session after.
+type DecisionPlan
+    = WriteUnit Index.ShownSource
+    | WriteFile Uid Index.RefusalDigest
+
+
+-- The plan of a decision on `row`'s drawn source or listed unreviewable
+-- file's drawn digest, or its refusal when the unit or file is off the
+-- shown queue page, no source is shown, the file carries no digest, or the
+-- source or digest shown is no longer the one drawn, decided before
+-- anything is read. The source and digest come from the offer, never from
+-- the page's current copy.
+decisionPlan : Model -> DecidableRow -> Result DecideRefusal DecisionPlan
+decisionPlan model row =
     let
         uid =
             DecisionSlot.rowUid row
@@ -794,33 +810,45 @@ decisionTask settings macKey model row decision =
                 Just _ ->
                     case DecisionSlot.offeredSource row model.selectedView of
                         Just shown ->
-                            decideOn settings macKey shown decision
+                            Ok (WriteUnit shown)
 
                         Nothing ->
                             case Selected.decidableSource uid model.selectedView of
                                 Just _ ->
-                                    Task.succeed (Err DrawnChanged)
+                                    Err DrawnChanged
 
                                 Nothing ->
-                                    Task.succeed (Err SourceNotShown)
+                                    Err SourceNotShown
 
                 Nothing ->
-                    Task.succeed (Err NotQueued)
+                    Err NotQueued
 
         Just digest ->
             case Maybe.map (\listed -> listed.digest) (pageRefusal model uid) of
                 Just (Just listed) ->
                     if listed == digest then
-                        LibDb.openAt settings.review |> Task.andThen (\db -> Queue.decideRefusal macKey settings.index db uid digest decision)
+                        Ok (WriteFile uid digest)
 
                     else
-                        Task.succeed (Err DrawnChanged)
+                        Err DrawnChanged
 
                 Just Nothing ->
-                    Task.succeed (Err FileNotAcknowledgeable)
+                    Err FileNotAcknowledgeable
 
                 Nothing ->
-                    Task.succeed (Err FileNotQueued)
+                    Err FileNotQueued
+
+
+-- The write `plan` names, as `decision` under `macKey`. It reads no
+-- session state: each sink re-proves what the plan carries before writing.
+decidePlan : Settings.AppSettings -> MacKey -> DecisionPlan -> LibDb.Decision -> Task.Task Error (Result DecideRefusal ( Index.Attested, Index.Written ))
+decidePlan settings macKey plan decision =
+    case plan of
+        WriteUnit shown ->
+            decideOn settings macKey shown decision
+
+        WriteFile uid digest ->
+            LibDb.openAt settings.review |> Task.andThen (\db -> Queue.decideRefusal macKey settings.index db uid digest decision)
 
 
 decideOn : Settings.AppSettings -> MacKey -> Index.ShownSource -> LibDb.Decision -> Task.Task Error (Result DecideRefusal ( Index.Attested, Index.Written ))
