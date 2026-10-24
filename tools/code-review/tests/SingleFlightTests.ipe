@@ -31,7 +31,7 @@ import Lib.Slot as Slot exposing (Settle(..), Stamp)
 import Lib.Standing as Standing exposing (StandingRead(..))
 import Lib.Uid as Uid exposing (Uid)
 import Lib.View as View
-import TestSupport exposing (Scratch, check, checkReporting, cleanupIndex, decideNow, envAppSettings, execIndex, fixtureLibRs, freshScratch, loadPageNow, loadUnitNow, migratedReviewAt, refusalOf, removeFileIfAny, seedIndex, testMacKey, uid, labelOf, labelText, viewA, writeFileText)
+import TestSupport exposing (Scratch, check, checkReporting, cleanupIndex, decideNow, envAppSettings, execIndex, fixtureLibRs, freshScratch, loadPageNow, loadUnitNow, migratedReviewAt, refusalOf, removeFileIfAny, seedIndex, uid, labelOf, labelText, viewA, writeFileText)
 import TextSinkScanTests
 import ViewTests exposing (allKeys)
 
@@ -1704,11 +1704,13 @@ confirmRecordsShownText settings a b =
 -- `FileNotAcknowledgeable`, each a value decided before any database is
 -- opened, and the save's banner the refusal's fixed text, which says
 -- nothing was saved rather than that a save failed. Each offer is one a
--- render drew earlier. Red if `decisionTask` decides a unit or file the
--- reviewer was not shown, a refusal is read as a failure, or a stale
--- click's banner says anything else. A click on a still-queued unit while
--- the queue reloads is refused the same way, so the refusal's text names
--- that cause too.
+-- render drew earlier. Red if `decisionPlan` plans a write of a unit or
+-- file the reviewer was not shown, a refusal is read as a failure, or a
+-- stale click's banner says anything else. A click on a still-queued unit
+-- while the queue reloads is refused the same way, so the refusal's text
+-- names that cause too. Every offer the gate before the slot admits on
+-- these models is one its plan writes, the admitted offers plan exactly
+-- the drawn source and digest, and each refused click starts no task.
 decisionRefusedBeforeReading : Task.Task Error Bool
 decisionRefusedBeforeReading =
     do
@@ -1717,18 +1719,17 @@ decisionRefusedBeforeReading =
         insertLinkRefusal at.indexDb "a"
         reviewStoreAt at
         settings <- envAppSettings
-        macKey <- testMacKey
         a <- loadUnitNow (uid "u-a") |> Task.andThen requireUnit
         b <- loadUnitNow (uid "u-b") |> Task.andThen requireUnit
         file <- linkRow
         offerA <- requireOffer (App.decidableRow (queueModel [ a, b ] (ViewShown a)) a.unit.uid)
         offerB <- requireOffer (App.decidableRow (cardModel [ a, b ] 1 b) b.unit.uid)
         offerFile <- requireOffer (App.decidableRow (withRefusal file (queueModel [ a, b ] (ViewShown a))) file.uid)
-        offList <- App.decisionTask settings macKey (queueModel [ a ] (ViewShown a)) offerB LibDb.Approved
-        notShown <- App.decisionTask settings macKey (queueModel [ a, b ] (ViewShown a)) offerB LibDb.Approved
-        fileOffList <- App.decisionTask settings macKey (queueModel [ a, b ] (ViewShown a)) offerFile LibDb.Approved
-        fileBlocking <- App.decisionTask settings macKey (withRefusal { file | digest = Nothing } (queueModel [ a, b ] (ViewShown a))) offerFile LibDb.Approved
-        whileReloading <- App.decisionTask settings macKey (reloadingModel a) offerA LibDb.Approved
+        offList <- Task.succeed (App.decisionPlan (queueModel [ a ] (ViewShown a)) offerB)
+        notShown <- Task.succeed (App.decisionPlan (queueModel [ a, b ] (ViewShown a)) offerB)
+        fileOffList <- Task.succeed (App.decisionPlan (queueModel [ a, b ] (ViewShown a)) offerFile)
+        fileBlocking <- Task.succeed (App.decisionPlan (withRefusal { file | digest = Nothing } (queueModel [ a, b ] (ViewShown a))) offerFile)
+        whileReloading <- Task.succeed (App.decisionPlan (reloadingModel a) offerA)
         cleanupIndex at.indexDb at.repo
         removeFileIfAny at.reviewDb
         Task.succeed
@@ -1744,7 +1745,56 @@ decisionRefusedBeforeReading =
                 && savedRefusal (Failure.saved (Ok fileBlocking)) == Just FileNotAcknowledgeable
                 && savedRefusal (Failure.saved (Ok offList)) == Just NotQueued
                 && savedRefusal (Failure.saved (Ok notShown)) == Just SourceNotShown
+                && List.all (\( model, offer ) -> planFollowsGate model offer && refusedStartsNoTask settings model offer) [ ( queueModel [ a ] (ViewShown a), offerB ), ( queueModel [ a, b ] (ViewShown a), offerB ), ( queueModel [ a, b ] (ViewShown a), offerFile ), ( withRefusal { file | digest = Nothing } (queueModel [ a, b ] (ViewShown a)), offerFile ), ( reloadingModel a, offerA ) ]
+                && admittedAndPlanned (queueModel [ a, b ] (ViewShown a)) offerA (Maybe.map App.WriteUnit (DecisionSlot.offeredSource offerA (ViewShown a)))
+                && admittedAndPlanned (withRefusal file (queueModel [ a, b ] (ViewShown a))) offerFile (Maybe.map (App.WriteFile file.uid) (DecisionSlot.offeredRefusal offerFile))
             )
+
+
+-- Whether the gate before the slot, `decidableAs`, refuses `offer` on
+-- `model`, or `decisionPlan` plans it: an offer the gate admits is never
+-- one its plan refuses, so the plan's refusal in `saveDecision` is reached
+-- on no model these checks build. Red if a plan refuses an admitted offer.
+planFollowsGate : Model -> DecisionSlot.DecidableRow -> Bool
+planFollowsGate model offer =
+    case gateOn model offer of
+        Ok _ ->
+            refusalOf (App.decisionPlan model offer) == Nothing
+
+        Err _ ->
+            True
+
+
+-- Whether the gate admits `offer` on `model` and its plan is `expected`,
+-- the write of exactly what the offer drew. Red if an admitted offer plans
+-- a source or digest other than the drawn one.
+admittedAndPlanned : Model -> DecisionSlot.DecidableRow -> Maybe App.DecisionPlan -> Bool
+admittedAndPlanned model offer expected =
+    case ( gateOn model offer, expected ) of
+        ( Ok _, Just plan ) ->
+            App.decisionPlan model offer == Ok plan
+
+        _ ->
+            False
+
+
+gateOn : Model -> DecisionSlot.DecidableRow -> Result SaveFailure DecisionSlot.DecidableRow
+gateOn model offer =
+    DecisionSlot.decidableAs model.selected model.queueState model.selectedView (DecisionSlot.rowTarget offer) (DecisionSlot.rowUid offer) (Just offer)
+
+
+-- Whether a click of `offer` on `model`, which the gate or the plan
+-- refuses, starts no task: the decision slot takes no save, so no task was
+-- started, and it holds the notice of why. Red if a refused decision starts
+-- a task.
+refusedStartsNoTask : Settings.AppSettings -> Model -> DecisionSlot.DecidableRow -> Bool
+refusedStartsNoTask settings model offer =
+    let
+        clicked =
+            after settings [ ApproveRow offer ] model
+    in
+    DecisionSlot.savingStamp clicked.decision == Nothing
+        && DecisionSlot.notSavedOf clicked.decision /= Nothing
 
 
 -- The queue page of `a` while it reloads, so no row is listed though `a` is
@@ -1783,16 +1833,25 @@ fileNotQueuedText =
 -- click before it takes the slot, and kept when a save's late refusal
 -- `refused` for it arrives: the not-saved notice of `expected`, whose fixed
 -- text is `shown`, and none of the failed-save lead.
-staleBannerShown : Settings.AppSettings -> Model -> DecisionSlot.DecidableRow -> Result DecideRefusal ( Index.Attested, Index.Written ) -> SaveFailure -> String -> Bool
+staleBannerShown : Settings.AppSettings -> Model -> DecisionSlot.DecidableRow -> Result DecideRefusal plan -> SaveFailure -> String -> Bool
 staleBannerShown settings model clicked refused expected shown =
     let
+        answered =
+            case refused of
+                Err refusal ->
+                    decisionSavedFor settings.epoch (DecisionSlot.rowUid clicked) (Ok (Err refusal))
+
+                Ok _ ->
+                    []
+
         settled =
-            after settings ([ ApproveRow clicked ] ++ decisionSavedFor settings.epoch (DecisionSlot.rowUid clicked) (Ok refused)) model
+            after settings ([ ApproveRow clicked ] ++ answered) model
 
         html =
             page settled
     in
-    DecisionSlot.notSavedOf settled.decision == Just expected
+    not (List.isEmpty answered)
+        && DecisionSlot.notSavedOf settled.decision == Just expected
         && Failure.saveFailureText expected == shown
         && String.contains (Html.escapeHtml ("Decision not saved: " ++ shown)) html
         && not (String.contains "Decision save failed" html)
@@ -2885,15 +2944,17 @@ escapeBeforePanelDrawnKeepsPanel r =
         && DecisionSlot.openPanel (after r.settings [ press drafted "Escape" ] drafted).decision == Nothing
 
 
--- `decisionTask` binds the offer's digest on its own: an offer of `a` run
--- on a model showing `a2`, and an offer of the file's first digest run on a
--- page listing the second, are each refused as `DrawnChanged` before any
--- database is opened. Red if the task reads the model's current source or
--- the page's digest.
-reshownTaskRefusals : Result DecideRefusal ( Index.Attested, Index.Written ) -> Result DecideRefusal ( Index.Attested, Index.Written ) -> Bool
-reshownTaskRefusals unitDrift fileDrift =
+-- `decisionPlan` binds the offer's digest on its own: an offer of `a`
+-- planned on a model showing `a2`, and an offer of the file's first digest
+-- planned on a page listing the second, are each refused as `DrawnChanged`
+-- before any database is opened, the gate before the slot refuses both
+-- offers too, and neither click starts a task. Red if the plan reads the
+-- model's current source or the page's digest.
+reshownPlanRefusals : Result DecideRefusal App.DecisionPlan -> Result DecideRefusal App.DecisionPlan -> Bool -> Bool
+reshownPlanRefusals unitDrift fileDrift gated =
     refusalOf unitDrift == Just DrawnChanged
         && refusalOf fileDrift == Just DrawnChanged
+        && gated
 
 
 reshownChecks : Task.Task Error (List ( String, Bool ))
@@ -2904,7 +2965,6 @@ reshownChecks =
         insertLinkRefusal at.indexDb "a"
         reviewStoreAt at
         settings <- envAppSettings
-        macKey <- testMacKey
         a <- loadUnitNow (uid "u-a") |> Task.andThen requireUnit
         b <- loadUnitNow (uid "u-b") |> Task.andThen requireUnit
         file <- linkRow
@@ -2915,15 +2975,16 @@ reshownChecks =
         a2 <- loadUnitNow (uid "u-a") |> Task.andThen requireUnit
         offerA <- requireOffer (App.decidableRow (queueModel [ a, b ] (ViewShown a)) a.unit.uid)
         offerFile <- requireOffer (App.decidableRow (withRefusal file (queueModel [ a, b ] (ViewShown a))) file.uid)
-        unitDrift <- App.decisionTask settings macKey (queueModel [ a2, b ] (ViewShown a2)) offerA LibDb.Approved
-        fileDrift <- App.decisionTask settings macKey (withRefusal file2 (queueModel [ a, b ] (ViewShown a))) offerFile LibDb.Approved
+        unitDrift <- Task.succeed (App.decisionPlan (queueModel [ a2, b ] (ViewShown a2)) offerA)
+        fileDrift <- Task.succeed (App.decisionPlan (withRefusal file2 (queueModel [ a, b ] (ViewShown a))) offerFile)
+        gated <- Task.succeed (List.all (\( model, offer ) -> planFollowsGate model offer && refusedStartsNoTask settings model offer) [ ( queueModel [ a2, b ] (ViewShown a2), offerA ), ( withRefusal file2 (queueModel [ a, b ] (ViewShown a)), offerFile ) ])
         cleanupIndex at.indexDb at.repo
         removeFileIfAny at.reviewDb
-        Task.succeed (reshownRows { settings = settings, a = a, a2 = a2, b = b, file = file, file2 = file2 } unitDrift fileDrift)
+        Task.succeed (reshownRows { settings = settings, a = a, a2 = a2, b = b, file = file, file2 = file2 } unitDrift fileDrift gated)
 
 
-reshownRows : Reshown -> Result DecideRefusal ( Index.Attested, Index.Written ) -> Result DecideRefusal ( Index.Attested, Index.Written ) -> List ( String, Bool )
-reshownRows r unitDrift fileDrift =
+reshownRows : Reshown -> Result DecideRefusal App.DecisionPlan -> Result DecideRefusal App.DecisionPlan -> Bool -> List ( String, Bool )
+reshownRows r unitDrift fileDrift gated =
     [ ( "an approval drawn before the source was read again decides nothing", staleApproveAfterSourceReloadDecidesNothing r )
     , ( "an approval drawn after the source was read again saves", freshApproveAfterSourceReloadSaves r )
     , ( "the approve key drawn before the source was read again, or with no control drawn, decides nothing", staleKeyApproveDecidesNothing r )
@@ -2939,7 +3000,7 @@ reshownRows r unitDrift fileDrift =
     , ( "a reason typed into a panel since reopened lands nowhere", staleDraftEditLandsNowhere r )
     , ( "navigation keys compose before the page redraws", navigationComposesBeforeRedraw r )
     , ( "Escape pressed before a panel was drawn keeps the panel", escapeBeforePanelDrawnKeepsPanel r )
-    , ( "a decision task binds the drawn source and digest before any read", reshownTaskRefusals unitDrift fileDrift )
+    , ( "a decision plan binds the drawn source and digest before any read", reshownPlanRefusals unitDrift fileDrift gated )
     ]
 
 
