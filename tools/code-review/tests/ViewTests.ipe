@@ -1087,15 +1087,18 @@ positionRefusals =
 
 -- A decision reaches `Queue.decide` only through the shown source
 -- `DecisionSlot.offeredSource` gives (the decidable source, kept only while its
--- digest is the one the offer drew): `Queue.decide ` appears once in the app
--- (inside `decideOn`), `decideOn ` exactly three times (its signature, its
--- definition and the one call in the `Just shown` arm), and neither in
--- `Main`; `Queue.decideRefusal ` appears once in the app, in the arm of a
--- refusal listed on the page under the digest the offer drew, and never in
--- `Main`. The arms
--- are matched with whitespace runs collapsed, so re-indenting them keeps the
--- scan. A site list with exact counts, since `ipe test` builds no `update`.
--- Red if a second path to either decision is added.
+-- digest is the one the offer drew): `decisionPlan` plans `WriteUnit` only in
+-- its `Just shown` arm, and `WriteFile` only in the arm of a refusal listed
+-- on the page under the digest the offer drew; `decidePlan` writes each plan
+-- through its one sink. `Queue.decide ` appears once in the app (inside
+-- `decideOn`), `decideOn ` exactly three times (its signature, its definition
+-- and the one call in the `WriteUnit` arm), `Queue.decideRefusal ` once, in
+-- the `WriteFile` arm, and `WriteUnit ` and `WriteFile ` each three times
+-- (the type's constructor, the one plan built and the one arm matched); none
+-- of them appears in `Main`. The arms are matched with whitespace runs
+-- collapsed, so re-indenting them keeps the scan. A site list with exact
+-- counts, since `ipe test` builds no `update`. Red if a second path to either
+-- decision is added.
 decisionReachedOnlyThroughDecidableSource : Task.Task Error Bool
 decisionReachedOnlyThroughDecidableSource =
     let
@@ -1106,11 +1109,17 @@ decisionReachedOnlyThroughDecidableSource =
         squashed =
             \text -> String.join " " (String.words text)
 
+        onePlan =
+            "case DecisionSlot.offeredSource row model.selectedView of Just shown -> Ok (WriteUnit shown) "
+
         oneCall =
-            "case DecisionSlot.offeredSource row model.selectedView of Just shown -> decideOn settings macKey shown decision "
+            "WriteUnit shown -> decideOn settings macKey shown decision "
+
+        oneRefusalPlan =
+            "case Maybe.map (\\listed -> listed.digest) (pageRefusal model uid) of Just (Just listed) -> if listed == digest then Ok (WriteFile uid digest) "
 
         oneRefusalCall =
-            "case Maybe.map (\\listed -> listed.digest) (pageRefusal model uid) of Just (Just listed) -> if listed == digest then LibDb.openAt settings.review |> Task.andThen (\\db -> Queue.decideRefusal macKey settings.index db uid digest decision) "
+            "WriteFile uid digest -> LibDb.openAt settings.review |> Task.andThen (\\db -> Queue.decideRefusal macKey settings.index db uid digest decision) "
     in
     do
         cwd <- System.cwd ()
@@ -1121,12 +1130,18 @@ decisionReachedOnlyThroughDecidableSource =
         Task.succeed
             (count "Queue.decide " app == 1
                 && count "decideOn " app == 3
+                && count onePlan (squashed app) == 1
                 && count oneCall (squashed app) == 1
                 && count "Queue.decideRefusal " app == 1
+                && count oneRefusalPlan (squashed app) == 1
                 && count oneRefusalCall (squashed app) == 1
+                && count "WriteUnit " app == 3
+                && count "WriteFile " app == 3
                 && count "Queue.decide " mainSrc == 0
                 && count "decideOn" mainSrc == 0
                 && count "decideRefusal" mainSrc == 0
+                && count "WriteUnit" mainSrc == 0
+                && count "WriteFile" mainSrc == 0
             )
 
 
