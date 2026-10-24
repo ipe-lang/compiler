@@ -42,6 +42,7 @@ import Lib.Selected as Selected exposing (SelectedView(..))
 import Lib.Slot as Slot
 import Lib.Standing as Standing
 import Lib.Uid as Uid exposing (Uid)
+import Lib.UnitName as UnitName
 import TestSupport exposing (openFileAt, piecesShown, quotedLabelOf, tableExists, countReviewRows, expectErr, refuse, seedIndex, writeFileText, fixtureLibRs, fixtureMainIpe, viewA, viewB, viewTag, shownTextOf, unitViewTag, execIndex, execIndexUnchecked, Scratch, freshScratch, freshDir, check, indexSchemaStatements, execIndexSchema, seedIndexDb, insertUnitRows, setIndexEnv, loadFirstPage, indexConn, loadUnitNow, decideNow, envSettings, envReview, envAppSettings, loadPageNow, drainThenLoadNow, loadUnitViewNow, drainUnitNow, decideShownNow, decidedRefusalNow, accepted, refusalOf, refusedAs, decidedNow, resyncReviewedNow, resyncReviewedWithinNow, shownOf, PageEntry, checkUnits, listSecond, isUnitA, isUnitB, cleanupIndex, removeFileIfAny, codeText, noHazard, rendered, renderedForeign, describeText, refusedFor, migratedReviewAt, tableRowCounts, openReadOnlyAt, vectorsPath, ipeIndexTestFile, repoFile, probeMessage, probeNames, maybeContains, isNew, isUnrecorded, mirroredCount, stampOf, reviewHeadOf, uid, resyncBoundOf, appendSigned, RawName(..), rawRow, tamperLog, logIdOf, headTextOf, logRowCount, loadHistoryPageNow, carriesFailure, logVerdictOf, appendSignedWithUidText, insertUnboundUnit, labelOf, labelText)
 
 
@@ -1044,6 +1045,7 @@ sampleQueuedUnit =
         , facing = labelOf "internal"
         , purpose = Nothing
         , attested = Index.UnknownScheme "hash-sample"
+        , record = Index.nameDecision (UnitName.recordUnit { kind = "module", qualified = "Main", path = "ipe:src/Main.ipe", line = 1 })
         }
     , change = Index.New
     , changed = Nothing
@@ -1070,6 +1072,7 @@ labelled id kind qualified path line =
                 , qualified = labelOf qualified
                 , path = labelOf path
                 , lineStart = line
+                , record = Index.nameDecision (UnitName.recordUnit { kind = kind, qualified = qualified, path = path, line = line })
             }
     }
 
@@ -2924,6 +2927,11 @@ checks =
                     , check "a decision on a unit whose qualified name holds a NUL is refused and writes nothing" (decideRefusedWhenNameUnreadable "nul" "UPDATE units SET qualified = 'Lib.' || char(0) || 'answer' WHERE uid = ?")
                     , check "a decision on a file unit that starts at a negative line is refused and writes nothing, and lands at line 0" decideRefusedWhenLineNegative
                     , check "an acknowledgement of a file whose path is past the ceiling is refused and writes nothing" refusalDecisionRefusedWhenPathPastCeiling
+                    , check "a unit whose name is past the ceiling is offered no decision though its source is shown" pastCeilingNameOffersNoDecision
+                    , check "a unit whose name is at the ceiling is offered a decision" atCeilingNameOffersDecision
+                    , check "a unit whose name holds a NUL is offered no decision" unreadableNameOffersNoDecision
+                    , check "a decision asked on a unit whose name cannot be recorded is refused with the name's refusal first" undecidableNamesNameFirst
+                    , check "a name changed past the ceiling after its page loaded is still refused at decide time and writes nothing" reverifyStillRefusesChangedName
                     ]
         gated <- drawnGateChecks
         Task.succeed (first ++ rest ++ named ++ gated)
@@ -3390,3 +3398,133 @@ refusalDecisionRefusedWhenPathPastCeiling =
         headAfter <- headTextOf db
         cleanupProgressScratch at
         Task.succeed (refused && rows == 0 && headAfter == headBefore)
+
+
+-- ── whether a row's name can be recorded is decided at load ─────────────
+-- `u-a` loaded (`a`), and the first queue page with `u-a` its only unit
+-- (`page`), after `edit` on its index row.
+type alias NameGate =
+    { a : Index.UnitView
+    , page : Queue.QueuePage
+    }
+
+
+nameGateFixture : String -> String -> List SqlValue -> Task.Task Error NameGate
+nameGateFixture label edit params =
+    do
+        at <- freshScratch ("ipe-queue-name-gate-" ++ label)
+        _ <- seedProgressScratch at
+        execIndex at.indexDb edit (params ++ [ Uid.toSql (uid "u-a") ])
+        a <- loadUnitNow (uid "u-a") |> Task.andThen requireView
+        page <- loadPageNow Index.Start
+        cleanupProgressScratch at
+        Task.succeed { a = a, page = onlyUnitA page }
+
+
+qualifiedOf : Int -> List SqlValue
+qualifiedOf chars =
+    [ SqlString (String.repeat chars "q") ]
+
+
+-- Why the unit's name cannot be recorded, as the row carries it.
+recordRefusal : Index.Unit -> Maybe DecideRefusal
+recordRefusal unit =
+    case unit.record of
+        Err refusal ->
+            Just refusal
+
+        Ok _ ->
+            Nothing
+
+
+-- Whether `page` offers a decision on its only unit `u-a` with `a` shown,
+-- and `a`'s source is one a decision could bind.
+offersOnUnitA : Index.UnitView -> Queue.QueuePage -> ( Bool, Bool )
+offersOnUnitA a page =
+    ( DecisionSlot.decidableRow 0 (Loaded page) (ViewShown a) (uid "u-a") /= Nothing
+    , Selected.decidableSource (uid "u-a") (ViewShown a) /= Nothing
+    )
+
+
+-- A unit whose qualified name is 2049 code points carries `NamePastCeiling`
+-- from its load, and the page offers no decision on it although its source
+-- is verified and shown. Red if `decidableRow` stops reading the row's
+-- `record`, so the control is drawn and the click refused.
+pastCeilingNameOffersNoDecision : Task.Task Error Bool
+pastCeilingNameOffersNoDecision =
+    do
+        g <- nameGateFixture "past" "UPDATE units SET qualified = ? WHERE uid = ?" (qualifiedOf 2049)
+        Task.succeed
+            (recordRefusal g.a.unit == Just NamePastCeiling
+                && List.map (\q -> recordRefusal q.unit) g.page.units == [ Just NamePastCeiling ]
+                && offersOnUnitA g.a g.page == ( False, True )
+            )
+
+
+-- The same unit at 2048 code points records its name and is offered a
+-- decision. Red if the load ceiling is one below the decide ceiling.
+atCeilingNameOffersDecision : Task.Task Error Bool
+atCeilingNameOffersDecision =
+    do
+        g <- nameGateFixture "at" "UPDATE units SET qualified = ? WHERE uid = ?" (qualifiedOf 2048)
+        Task.succeed
+            (recordRefusal g.a.unit == Nothing
+                && List.map (\q -> recordRefusal q.unit) g.page.units == [ Nothing ]
+                && offersOnUnitA g.a g.page == ( True, True )
+            )
+
+
+-- A unit whose qualified name holds a NUL carries `NameUnreadable` and is
+-- offered no decision. Red if a refusal other than past-the-ceiling still
+-- draws the control.
+unreadableNameOffersNoDecision : Task.Task Error Bool
+unreadableNameOffersNoDecision =
+    do
+        g <- nameGateFixture "nul" "UPDATE units SET qualified = 'Lib.' || char(0) || 'answer' WHERE uid = ?" []
+        Task.succeed
+            (recordRefusal g.a.unit == Just NameUnreadable
+                && List.map (\q -> recordRefusal q.unit) g.page.units == [ Just NameUnreadable ]
+                && offersOnUnitA g.a g.page == ( False, True )
+            )
+
+
+-- A decision asked on a unit whose name is past the ceiling is refused as
+-- `NamePastCeiling`, shown or not: the row's own refusal comes before any
+-- cause from the source slot. Red if `undecidable` reads the slot first.
+undecidableNamesNameFirst : Task.Task Error Bool
+undecidableNamesNameFirst =
+    do
+        g <- nameGateFixture "first" "UPDATE units SET qualified = ? WHERE uid = ?" (qualifiedOf 2049)
+        Task.succeed
+            (DecisionSlot.decidableAs 0 (Loaded g.page) NoneSelected OnUnit (uid "u-a") Nothing == Err (SaveRefused NamePastCeiling)
+                && DecisionSlot.decidableAs 0 (Loaded g.page) (ViewShown g.a) OnUnit (uid "u-a") Nothing == Err (SaveRefused NamePastCeiling)
+            )
+
+
+-- A unit loaded at 2048 code points whose name grows to 2049 before the
+-- decision is refused as `NamePastCeiling` by the decide-time re-read, and
+-- no row is written: the load-time value gates the control, never the
+-- write. Red if the decision records the name read at load.
+reverifyStillRefusesChangedName : Task.Task Error Bool
+reverifyStillRefusesChangedName =
+    do
+        at <- freshScratch "ipe-queue-name-gate-reverify"
+        db <- seedProgressScratch at
+        execIndex at.indexDb "UPDATE units SET qualified = ? WHERE uid = ?" (qualifiedOf 2048 ++ [ Uid.toSql (uid "u-a") ])
+        a <- loadUnitNow (uid "u-a") |> Task.andThen requireView
+        execIndex at.indexDb "UPDATE units SET qualified = ? WHERE uid = ?" (qualifiedOf 2049 ++ [ Uid.toSql (uid "u-a") ])
+        refused <- refusedOnShown db a
+        rows <- logRowCount db
+        cleanupProgressScratch at
+        Task.succeed (recordRefusal a.unit == Nothing && refused && rows == 0)
+
+
+-- Whether a decision on `a`'s shown source is refused as `NamePastCeiling`.
+refusedOnShown : Db -> Index.UnitView -> Task.Task Error Bool
+refusedOnShown db a =
+    case shownOf a.view of
+        Just shown ->
+            refusedAs NamePastCeiling (decideShownNow db shown Approved)
+
+        Nothing ->
+            Task.succeed False

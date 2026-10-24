@@ -32,6 +32,7 @@ import Lib.Session exposing (Model, Page(..), decidableRow, initialModel)
 import Lib.Slot as Slot
 import Lib.Standing as Standing
 import Lib.Uid as Uid
+import Lib.UnitName as UnitName
 import Lib.View as View
 import TestSupport exposing (accepted, labelOf, quotedLabelOf, labelText, decidedRefusalNow, checkReporting, cleanupIndex, codeText, execIndex, freshScratch, loadHistoryPageNow, loadPageNow, loadUnitNow, migratedReviewAt, removeFileIfAny, renderedForeign, seedIndex, uid, writeFileText, appendSigned, rawRow, countingVerifier, testKeyHex)
 
@@ -1305,6 +1306,79 @@ longestHexRun text =
         |> .longest
 
 
+-- ── names no decision can record ────────────────────────────────────────
+--
+-- A row whose name is past the recorded-name ceiling draws the refusal a
+-- click on it would meet in place of its decision controls, and a row at
+-- the ceiling draws its controls. Red if `View.refusalControls` or
+-- `View.decisionButtons` draws a control the gate refuses, or draws none
+-- without saying why.
+undecidableNameChecks : Task.Task Error (List ( String, Bool ))
+undecidableNameChecks =
+    do
+        at <- freshScratch "ipe-view-render-undecidable-name"
+        seedIndex at.indexDb at.repo
+        System.setenv "IPE_REVIEW_DB" at.reviewDb
+        _ <- migratedReviewAt at.reviewDb
+        execIndex at.indexDb
+            "INSERT INTO refusals (uid, path, lang, reason, size, digest) VALUES (?, ?, 'other', 'symlink-entry', NULL, ?)"
+            [ Uid.toSql (uid "r-long"), SqlString ("ipe:" ++ String.repeat 2045 "p"), SqlString ("refusal-blake3:" ++ String.repeat 64 "a") ]
+        execIndex at.indexDb
+            "INSERT INTO refusals (uid, path, lang, reason, size, digest) VALUES (?, ?, 'other', 'symlink-entry', NULL, ?)"
+            [ Uid.toSql (uid "r-ok"), SqlString "ipe:src/ok.txt", SqlString ("refusal-blake3:" ++ String.repeat 64 "b") ]
+        loaded <- loadPageNow Index.Start
+        execIndex at.indexDb "UPDATE units SET qualified = ? WHERE uid = ?" [ SqlString (String.repeat 2048 "q"), Uid.toSql (uid "u-a") ]
+        atCeiling <- loadUnitNow (uid "u-a")
+        execIndex at.indexDb "UPDATE units SET qualified = ? WHERE uid = ?" [ SqlString (String.repeat 2049 "q"), Uid.toSql (uid "u-a") ]
+        pastCeiling <- loadUnitNow (uid "u-a")
+        cleanupIndex at.indexDb at.repo
+        removeFileIfAny at.reviewDb
+        Task.succeed (undecidableNameRows loaded atCeiling pastCeiling)
+
+
+undecidableNameRows : Queue.QueuePage -> Maybe Index.UnitView -> Maybe Index.UnitView -> List ( String, Bool )
+undecidableNameRows loaded atCeiling pastCeiling =
+    let
+        notice =
+            Failure.saveFailureText (SaveRefused NamePastCeiling)
+
+        refusalPage id =
+            page { baseModel | queueState = Loaded { loaded | log = ShownProven, units = [], refusals = List.filter (\row -> row.uid == uid id) loaded.refusals } }
+
+        long =
+            refusalPage "r-long"
+
+        short =
+            refusalPage "r-ok"
+
+        cardOf found =
+            Maybe.map (\v -> page (cardModel v)) found
+    in
+    [ ( "a file whose path is past the ceiling draws its refusal in place of Acknowledge and Refuse"
+      , not (button "Acknowledge" long) && not (button "Refuse" long) && has notice long && has "Unreviewable files" long
+      )
+    , ( "a file whose path a decision can record draws Acknowledge"
+      , button "Acknowledge" short && not (has notice short)
+      )
+    , ( "a unit whose name is past the ceiling draws its refusal in place of Approve and Refuse"
+      , case cardOf pastCeiling of
+            Just html ->
+                not (button "Approve" html) && not (button "Refuse" html) && has notice html
+
+            Nothing ->
+                False
+      )
+    , ( "a unit whose name is at the ceiling draws Approve"
+      , case cardOf atCeiling of
+            Just html ->
+                button "Approve" html && not (has notice html)
+
+            Nothing ->
+                False
+      )
+    ]
+
+
 -- ── harness ─────────────────────────────────────────────────────────────
 -- A group whose fixtures fail to build reports one failed check by name, with
 -- the error, instead of ending the run.
@@ -1546,6 +1620,7 @@ budgetRefusal id =
     , reason = UnreadableEntry
     , size = Nothing
     , digest = Nothing
+    , record = Index.nameDecision (UnitName.recordFile hostileColumn)
     }
 
 
@@ -1650,6 +1725,7 @@ checks =
         , group "spelled source fixture" spelledSourceChecks
         , group "stored decision fixture" storedChecks
         , group "unreviewable file fixture" refusalChecks
+        , group "undecidable name fixture" undecidableNameChecks
         , Task.succeed [ ( "the shortcut root takes focus on page load", shortcutRootAutofocused ) ]
         , group "withheld constructors" (everyWithheldConstructorRendered |> Task.map (\ok -> [ ( "every withheld source constructor Lib.Index declares is rendered", ok ) ]))
         ]
