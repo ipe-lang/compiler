@@ -384,7 +384,7 @@ pub fn io_eprintln<E: Send + From<String> + 'static>(msg: String) -> IpeTask<E, 
     })
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(target_arch = "wasm32")))]
 mod line_reader_tests {
     use super::{
         LINE_CAP_BYTES, LineEnd, LineRefusal, ReadCaps, STDIN_CAPS, read_line_into, read_text_line,
