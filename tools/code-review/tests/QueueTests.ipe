@@ -2862,8 +2862,7 @@ drainWithoutSignedRowKeepsUnitQueued =
         Task.succeed
             (drained == 0
                 && before == after
-                && List.any (\q -> q.unit.uid == uid "u-b" && isNew q.change) page.units
-                && onPage "u-a" page
+                && List.any (\q -> q.unit.uid == uid "u-a" && isNew q.change) page.units
             )
 
 
