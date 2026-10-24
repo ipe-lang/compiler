@@ -1123,11 +1123,14 @@ enum Checkpoint {
 /// Write session `sid` through to the store, unless it was closed or
 /// displaced meanwhile.
 ///
-/// The closer is read after the write: a [`close_session`] that flipped it
-/// before this read has its delete repeated here, and one that flips it after
-/// deletes this write itself. A closed session is never stored again. A
-/// displaced handle wrote nothing and deletes nothing: the sid is another
-/// handle's.
+/// The closer is read after the write, whatever the store answered: a
+/// [`close_session`] that flipped it before this read has its delete repeated
+/// here, and one that flips it after deletes this write itself. A closed
+/// session is never stored again. The read covers a displaced or refused
+/// write too: a write that lands after a close's delete emptied the slot
+/// reports [`store::Installed::Displaced`] while its row stands, and a refused
+/// write may have landed before its driver failed. An open displaced handle
+/// deletes nothing: the sid is another handle's.
 #[cfg(feature = "web")]
 async fn checkpoint<Model, Msg>(
     store: &Arc<dyn store::SessionStore<Model, Msg>>,
@@ -1146,9 +1149,9 @@ where
         }
         store::Installed::Refused(_) => {
             StoreWriteFailure::SetRefused.count();
-            return Checkpoint::Refused;
+            Checkpoint::Refused
         }
-        store::Installed::Displaced => return Checkpoint::Displaced,
+        store::Installed::Displaced => Checkpoint::Displaced,
     };
     let closed = entry
         .lock()
@@ -18865,6 +18868,120 @@ mod web_revocation_tests {
                 Checkpoint::Stored
             ));
             assert!(entry_of(&store, &open.sid).await.is_some());
+        });
+    }
+
+    /// A store whose every write lands a row and then answers `Displaced`, as
+    /// a write landing after a close's delete emptied its slot, or `Refused`
+    /// with `refuse`, as a driver that failed after the statement ran.
+    struct LateWrite {
+        inner: Store,
+        refuse: bool,
+        rows: Mutex<std::collections::BTreeSet<String>>,
+    }
+
+    impl LateWrite {
+        fn rows(&self) -> std::collections::BTreeSet<String> {
+            self.rows
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl store::SessionStore<Model, Msg> for LateWrite {
+        async fn get(&self, sid: &str) -> Option<store::SessionHandle<Model, Msg>> {
+            self.inner.get(sid).await
+        }
+        fn admission(&self) -> &store::SidAdmission {
+            self.inner.admission()
+        }
+        async fn set(
+            &self,
+            sid: &str,
+            _handle: store::SessionHandle<Model, Msg>,
+        ) -> crate::web::Installed {
+            self.rows
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(sid.to_owned());
+            if self.refuse {
+                crate::web::Installed::Refused(crate::web::WriteFault::Encode(
+                    crate::web::CheckpointRefusal::Model,
+                ))
+            } else {
+                crate::web::Installed::Displaced
+            }
+        }
+        async fn delete(&self, sid: &str) -> crate::web::Deleted {
+            self.rows
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .remove(sid);
+            self.inner.delete(sid).await
+        }
+        async fn web_sessions(&self) -> Vec<store::SessionHandle<Model, Msg>> {
+            self.inner.web_sessions().await
+        }
+        async fn evict_unconnected(&self, need: crate::retained::Bytes) -> crate::retained::Bytes {
+            self.inner.evict_unconnected(need).await
+        }
+        fn holds(&self, sid: &str, handle: &store::SessionHandle<Model, Msg>) -> bool {
+            self.inner.holds(sid, handle)
+        }
+    }
+
+    /// A checkpoint of a closed session whose write landed but was answered
+    /// displaced or refused still repeats the close's delete, so the row it
+    /// wrote never outlives the close; an open displaced handle deletes nothing.
+    #[test]
+    fn checkpoint_undoes_a_late_write_of_a_closed_session() {
+        run(false, || async {
+            let store = Arc::new(Store::new(Duration::from_secs(60)));
+            let router = make_router(&store);
+            for refuse in [false, true] {
+                let subject = if refuse {
+                    "late-refused"
+                } else {
+                    "late-displaced"
+                };
+                let opened = open_session(&router, subject, 7200, "").await;
+                let handle = entry_of(&store, &opened.sid).await;
+                assert!(handle.is_some(), "the page load stored a live session");
+                let Some(handle) = handle else { return };
+                let probe = Arc::new(LateWrite {
+                    inner: Store::new(Duration::from_secs(60)),
+                    refuse,
+                    rows: Mutex::new(std::collections::BTreeSet::new()),
+                });
+                let dyn_probe = Arc::clone(&probe) as Arc<dyn store::SessionStore<Model, Msg>>;
+                let open = checkpoint(&dyn_probe, &opened.sid, &handle).await;
+                assert!(
+                    matches!(
+                        (refuse, open),
+                        (false, Checkpoint::Displaced) | (true, Checkpoint::Refused)
+                    ),
+                    "{open:?}"
+                );
+                assert_eq!(
+                    probe.rows(),
+                    std::collections::BTreeSet::from([opened.sid.clone()]),
+                    "an open write stays"
+                );
+                handle
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .liveness
+                    .closer
+                    .send_replace(Liveness::Closed(CloseReason::Ended));
+                let closed = checkpoint(&dyn_probe, &opened.sid, &handle).await;
+                assert!(matches!(closed, Checkpoint::Closed), "{closed:?}");
+                assert!(
+                    probe.rows().is_empty(),
+                    "the late write of a closed session is deleted"
+                );
+            }
         });
     }
 
