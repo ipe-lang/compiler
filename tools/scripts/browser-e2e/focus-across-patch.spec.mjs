@@ -17,7 +17,9 @@
  * applies as the next step, and focus has not moved since the key. No
  * `autofocus` attribute reaches the live DOM after load, so the browser's own
  * focus-on-insertion never fires: a page loaded with focus on the body keeps
- * it there through a render it did not cause. A form's
+ * it there through a render it did not cause, and every frame a patch adds
+ * connects sandboxed, so the document it loads never shares the app's
+ * origin. A form's
  * named controls shadow its members, so every member read on a node that may
  * be a form goes through the element prototypes: one test per read proves it.
  *
@@ -42,7 +44,7 @@ const BASE = `http://127.0.0.1:${PORT}`;
 /** The id of the focused element, "" when focus is on `body`. */
 const focusedId = (page) => page.evaluate(() => document.activeElement?.id ?? "");
 
-/** Opens the fixture; `query` (`noauto`, `tick`) picks its load state. */
+/** Opens the fixture; `query` (`noauto`, `tick`, `frame`) picks its load state. */
 async function open(page, query = "") {
   await page.goto(query ? `${BASE}/?${query}` : BASE);
   await page.waitForSelector('html[data-ipe-live="1"]', { timeout: 15000 });
@@ -620,6 +622,29 @@ test("focus-across-patch: a timer's autofocus field never takes focus from the b
   await settle(page);
   expect(await onBody(page)).toBe(true);
   expect(await page.locator("#ipe-root [autofocus]").count()).toBe(0);
+});
+
+test("focus-across-patch: a same-origin frame added by a render the tab did not cause never takes focus", async ({ page }) => {
+  // The tick adds a frame of the fixture's own root, whose `autofocus` would
+  // take focus from the body if the framed document shared the app's origin.
+  await open(page, "noauto&tick&frame");
+  await expect(page.locator("iframe#frame")).toHaveCount(1, { timeout: 5000 });
+  await settle(page);
+  expect(await onBody(page)).toBe(true);
+  expect(await page.locator("iframe#frame").getAttribute("sandbox")).toBe("");
+  // An opaque origin: the app cannot reach the framed document.
+  expect(await page.evaluate(() => document.getElementById("frame").contentDocument)).toBeNull();
+});
+
+test("focus-across-patch: a raw iframe in a patch connects sandboxed", async ({ page }) => {
+  // The raw markup bypasses the render sink: only the client's fence of the
+  // detached holder sandboxes this frame.
+  await open(page, "noauto&tick&frame");
+  await expect(page.locator("iframe#rawframe")).toHaveCount(1, { timeout: 5000 });
+  expect(await page.locator("iframe#rawframe").getAttribute("sandbox")).toBe("");
+  expect(await page.evaluate(() => document.getElementById("rawframe").contentDocument)).toBeNull();
+  await settle(page);
+  expect(await onBody(page)).toBe(true);
 });
 
 test("focus-across-patch: another tab's autofocus field never takes focus from the body", async ({ browser }) => {

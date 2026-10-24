@@ -37,11 +37,15 @@ module Main exposing (main)
 -- arms a timer whose tick puts a row ahead of `hovertarget`, moving it to
 -- where `hoverbelow` was; once that tick has landed, a pointer crossing into
 -- `hovertarget` adds the `autofocus` field `hoverask`.
+-- A query holding `frame` makes the first tick add two frames of the fixture's
+-- own root, which carries `autofocus`: `frame`, built with `Html.iframe`, and
+-- `rawframe`, inside `Ipe.Html.Unsafe.unsafeRaw` markup.
 --
--- Co-located, no capabilities, no JS ports.
+-- Co-located, no JS ports; `rawframe` is why the package accepts `Unsafe`.
 
 import Ipe.Html as Html
 import Ipe.Html.Attributes as Attr
+import Ipe.Html.Unsafe as Unsafe
 import Ipe.String as String
 import Ipe.Tea.Web as Web
 import Ipe.Tea.Web.Cmd as Cmd
@@ -77,6 +81,8 @@ type alias Model =
     , hovering : Bool
     , hoverShift : Bool
     , hoverAsk : Bool
+    , framing : Bool
+    , framed : Bool
     }
 
 
@@ -101,7 +107,7 @@ type Msg
 
 init : WebReq -> ( Model, Cmd.Cmd Msg )
 init req =
-    ( { keys = "", row = False, drop = True, note = "", swapped = False, pressed = False, deep = False, tagSwapped = False, hostRow = False, formDrop = True, mathRow = False, ask = False, answer = "", ticking = String.contains "tick" req.query, subAsk = False, loadAuto = not (String.contains "noauto" req.query), picked = False, flag = False, tableRow = False, shifting = False, shifted = False, focusAsk = False, hovering = False, hoverShift = False, hoverAsk = False }, Cmd.none )
+    ( { keys = "", row = False, drop = True, note = "", swapped = False, pressed = False, deep = False, tagSwapped = False, hostRow = False, formDrop = True, mathRow = False, ask = False, answer = "", ticking = String.contains "tick" req.query, subAsk = False, loadAuto = not (String.contains "noauto" req.query), picked = False, flag = False, tableRow = False, shifting = False, shifted = False, focusAsk = False, hovering = False, hoverShift = False, hoverAsk = False, framing = String.contains "frame" req.query, framed = False }, Cmd.none )
 
 
 update : Msg -> Model -> ( Model, Cmd.Cmd Msg )
@@ -173,6 +179,7 @@ update msg model =
                 , shifted = model.shifted || model.shifting
                 , hovering = False
                 , hoverShift = model.hoverShift || model.hovering
+                , framed = model.framed || (model.framing && model.ticking)
               }
             , Cmd.none
             )
@@ -467,6 +474,19 @@ hoverPad shifted =
         []
 
 
+-- Once `on`, a frame of the fixture's root built with `Html.iframe`, and one
+-- inside raw markup.
+frames : Bool -> List (Ui.Element Msg)
+frames on =
+    if on then
+        [ Ui.html (Html.iframe [ Attr.id "frame", Attr.attribute "src" "/" ] [])
+        , Ui.html (Html.div [ Attr.id "rawhost" ] [ Unsafe.unsafeRaw "<iframe id=\"rawframe\" src=\"/\"></iframe>" ])
+        ]
+
+    else
+        []
+
+
 -- The root's `autofocus` unless the page loaded with `noauto`.
 rootAutofocus : Model -> List (Ui.Attribute Msg)
 rootAutofocus model =
@@ -569,6 +589,7 @@ view model =
                    ]
             )
         , Ui.column [ Ui.id "hoveraskhost" ] (askPanel model.hoverAsk "hoverask" model)
+        , Ui.column [ Ui.id "framehost" ] (frames model.framed)
         ]
 
 
