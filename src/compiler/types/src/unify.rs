@@ -81,8 +81,9 @@ struct RecordPair {
 /// The mismatch of a failed row-tail obligation, reported as its record pair.
 ///
 /// Each side is rebuilt as a fresh record node over its own fields and tail,
-/// so the report shows both records as written even though unification has
-/// already merged their roots.
+/// so the report shows each record's own fields even though unification has
+/// already merged their roots. A tail an earlier obligation of the same pair
+/// already bound reads through that binding.
 fn record_pair_mismatch(
     uf: &mut UnionFind<Content>,
     budget: &mut Budget,

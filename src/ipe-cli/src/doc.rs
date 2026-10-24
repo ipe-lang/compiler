@@ -6590,6 +6590,47 @@ mod tests {
         );
     }
 
+    /// The linked signature reads exactly as the diagnostics' flat rendering
+    /// for every record shape: closed, open, the empty record, and the bare
+    /// row, at the top, as an arrow's argument, and as a constructor argument.
+    #[test]
+    fn linked_record_signature_reads_as_render_ty() {
+        let index = AnchorIndex {
+            types: BTreeSet::new(),
+        };
+        let int_field = |name: &str| (Box::<str>::from(name), con("", "Int", vec![]));
+        let record = |fields: Vec<(Box<str>, TyDoc)>, tail: Option<&str>| TyDoc::Record {
+            fields: fields.into_boxed_slice(),
+            tail: tail.map(Box::from),
+        };
+        let records = [
+            record(vec![], None),
+            record(vec![], Some("r")),
+            record(vec![int_field("x")], None),
+            record(vec![int_field("x"), int_field("y")], Some("r")),
+        ];
+        for rec in records {
+            let shapes = [
+                TyDoc::Fun(Box::new(rec.clone()), Box::new(con("", "Int", vec![]))),
+                con("", "List", vec![rec.clone()]),
+                rec,
+            ];
+            for ty in &shapes {
+                let linked: String = signature_pieces(ty, &index)
+                    .into_iter()
+                    .map(|piece| match piece {
+                        SigPiece::Text(text) | SigPiece::Link { text, .. } => text,
+                    })
+                    .collect();
+                assert_eq!(
+                    linked,
+                    render_ty(ty),
+                    "`ipe doc` and diagnostics must spell `{ty:?}` alike"
+                );
+            }
+        }
+    }
+
     #[test]
     fn json_records_the_cross_reference() {
         let docs = one_module_docs(color_module());
