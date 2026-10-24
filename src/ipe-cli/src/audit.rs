@@ -52,7 +52,6 @@
 
 use std::collections::BTreeSet;
 use std::ffi::{OsStr, OsString};
-use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -71,6 +70,7 @@ use crate::remote_ingest::{
 };
 use crate::scratch::ScratchDir;
 use crate::text;
+use posture::GatePosture;
 
 /// The package-gate checks, in the fixed order [`run_audit`] runs them. Naming
 /// the check that rejected lets the diagnostic say exactly which gate failed.
@@ -980,53 +980,62 @@ fn prepare(snapshot: PackageSnapshot) -> Result<Prepared, CliError> {
     })
 }
 
-/// Proof that this process runs the audit with no host-side escape from the sandbox.
-///
-/// Minted once per audit, before any step that runs the package's foreign code
-/// (the FFI binding regeneration); nothing else constructs it. The step takes
-/// the proof as a parameter, so without a jail the step cannot be called: the
-/// developer's unsandboxed inspector override and a host without bubblewrap
-/// are refusals of the gate, never a host run with a warning.
-struct GatePosture(());
+/// The gate's sandbox posture, in its own module so that its proof's field is
+/// private to it: only [`GatePosture::from_facts`] can mint one.
+mod posture {
+    use super::{Check, reject};
+    use crate::CliError;
+    use crate::text;
 
-impl GatePosture {
-    /// Prove the gate's posture from the host's sandbox facts.
+    /// Proof that this process runs the audit with no host-side escape from the sandbox.
     ///
-    /// The only production read of the unsandboxed override in this module;
-    /// `audit_source_reads_no_environment_or_cwd` pins that.
-    ///
-    /// # Errors
-    /// As [`Self::from_facts`].
-    fn establish() -> Result<Self, CliError> {
-        let caps = ipe_sandbox::probe();
-        Self::from_facts(
-            ipe_sandbox::unsandboxed_override_set(),
-            &ipe_sandbox::select_mechanism(&caps),
-        )
-    }
+    /// Minted once per audit, before any step that runs the package's foreign code
+    /// (the FFI binding regeneration); nothing outside this module can construct
+    /// it. The step takes the proof as a parameter, so without a jail the step
+    /// cannot be called: the developer's unsandboxed inspector override and a
+    /// host without bubblewrap are refusals of the gate, never a host run with a
+    /// warning.
+    pub(super) struct GatePosture(());
 
-    /// The pure core: refuse the override, refuse a host without a jail.
-    ///
-    /// # Errors
-    /// [`CliError::PackageAudit`] with [`Check::NativeBindingRegen`] when the
-    /// unsandboxed inspector override is set, or when the sandbox mechanism is
-    /// [`ipe_sandbox::Mechanism::Refused`].
-    fn from_facts(
-        override_set: bool,
-        mechanism: &ipe_sandbox::Mechanism,
-    ) -> Result<Self, CliError> {
-        if override_set {
-            return Err(reject(
-                Check::NativeBindingRegen,
-                text::msg::audit_refuses_unsandboxed_override().into(),
-            ));
+    impl GatePosture {
+        /// Prove the gate's posture from the host's sandbox facts.
+        ///
+        /// The only production read of the unsandboxed override in this module;
+        /// `audit_source_reads_no_environment_or_cwd` pins that.
+        ///
+        /// # Errors
+        /// As [`Self::from_facts`].
+        pub(super) fn establish() -> Result<Self, CliError> {
+            let caps = ipe_sandbox::probe();
+            Self::from_facts(
+                ipe_sandbox::unsandboxed_override_set(),
+                &ipe_sandbox::select_mechanism(&caps),
+            )
         }
-        match mechanism {
-            ipe_sandbox::Mechanism::Bwrap(_) => Ok(Self(())),
-            ipe_sandbox::Mechanism::Refused => Err(reject(
-                Check::NativeBindingRegen,
-                text::msg::audit_requires_a_jail().into(),
-            )),
+
+        /// The pure core: refuse the override, refuse a host without a jail.
+        ///
+        /// # Errors
+        /// [`CliError::PackageAudit`] with [`Check::NativeBindingRegen`] when the
+        /// unsandboxed inspector override is set, or when the sandbox mechanism is
+        /// [`ipe_sandbox::Mechanism::Refused`].
+        pub(super) fn from_facts(
+            override_set: bool,
+            mechanism: &ipe_sandbox::Mechanism,
+        ) -> Result<Self, CliError> {
+            if override_set {
+                return Err(reject(
+                    Check::NativeBindingRegen,
+                    text::msg::audit_refuses_unsandboxed_override().into(),
+                ));
+            }
+            match mechanism {
+                ipe_sandbox::Mechanism::Bwrap(_) => Ok(Self(())),
+                ipe_sandbox::Mechanism::Refused => Err(reject(
+                    Check::NativeBindingRegen,
+                    text::msg::audit_requires_a_jail().into(),
+                )),
+            }
         }
     }
 }
@@ -1825,15 +1834,13 @@ fn run_cargo_deny(
 ///   - minor < 20:  `[--manifest-path <m>] check advisories bans sources [--config <cfg>]`
 ///
 /// `--manifest-path` is a global option accepted in both series.
-fn deny_args(cargo_deny_minor: u32, manifest: &Path, config: Option<&Path>) -> Vec<OsString> {
+fn deny_args(cargo_deny_minor: u32, manifest: &Path, config: &Path) -> Vec<OsString> {
     let mut args: Vec<OsString> = Vec::new();
     args.push("--manifest-path".into());
     args.push(manifest.into());
-    if cargo_deny_minor >= 20
-        && let Some(cfg) = config
-    {
+    if cargo_deny_minor >= 20 {
         args.push("--config".into());
-        args.push(cfg.into());
+        args.push(config.into());
     }
     args.push("check".into());
     // Advisories + bans + sources are the supply-chain axes; licenses are a
@@ -1841,11 +1848,9 @@ fn deny_args(cargo_deny_minor: u32, manifest: &Path, config: Option<&Path>) -> V
     args.push("advisories".into());
     args.push("bans".into());
     args.push("sources".into());
-    if cargo_deny_minor < 20
-        && let Some(cfg) = config
-    {
+    if cargo_deny_minor < 20 {
         args.push("--config".into());
-        args.push(cfg.into());
+        args.push(config.into());
     }
     args
 }
@@ -1888,14 +1893,14 @@ fn supply_chain(prepared: &Prepared) -> Result<(), CliError> {
     // `deny.toml` ledgers advisories the vendored runtime's dependency tree
     // legitimately carries. Without it the check would default-reject every
     // emitted package for a runtime dependency the workspace has already vetted.
-    // Absent a resolvable config, cargo-deny falls back to its defaults.
+    // The policy is the gate's embedded one, never a file the audit finds.
     //
     // `--config` placement is version-dependent: global (before `check`) for
     // cargo-deny >= 0.20, on the `check` subcommand for < 0.20.
     let derived_config = derive_deny_config(&prepared.emitted_dir)?;
     let cargo_deny = OsStr::new(CARGO_DENY);
     let minor = detect_cargo_deny_minor(cargo_deny, TOOL_QUERY_LIMITS);
-    let args = deny_args(minor, &manifest, derived_config.as_deref());
+    let args = deny_args(minor, &manifest, &derived_config);
 
     match run_cargo_deny(cargo_deny, &args, SUPPLY_CHAIN_SCAN_LIMITS) {
         Ok(out) if out.status.success() => verify_locked_dependency_hashes(prepared),
@@ -2078,107 +2083,46 @@ fn check_one_dep_advisories(
     }
 }
 
-/// The workspace's cargo-deny config file name.
-const DENY_CONFIG: &str = "deny.toml";
-
-/// How many directories, the start included, a policy walk may probe.
+/// The supply-chain policy the gate applies: the compiler workspace's own
+/// `deny.toml`, embedded when this binary was built.
 ///
-/// A typed non-zero count: the walk from the runtime module tree to the
-/// workspace root above it is a fixed few levels, so the ceiling bounds the
-/// probes without a sentinel.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct AncestorCeiling(NonZeroUsize);
-
-impl AncestorCeiling {
-    /// The number of directories probed at most.
-    const fn get(self) -> usize {
-        self.0.get()
-    }
-}
-
-/// The policy walk's ceiling: the runtime tree (`src/runtime/rust/src`) sits
-/// four levels below the workspace root, with margin for a relocated tree.
-const POLICY_ANCESTOR_CEILING: AncestorCeiling =
-    AncestorCeiling(NonZeroUsize::MIN.saturating_add(7));
-
-/// Where the supply-chain policy may come from.
-///
-/// The audited package's tree and the invoker's working directory are never
-/// candidates: only the gate's own installation names a policy.
-#[derive(Debug, PartialEq, Eq)]
-enum PolicyOrigin {
-    /// `deny.toml` in the workspace holding the resolved runtime module tree,
-    /// with the bytes read through the handle that located it.
-    RuntimeWorkspace {
-        /// The file's text, the one read the derived config is built from.
-        text: String,
-    },
-}
-
-/// Locate and read the policy from the roots the gate owns: the ancestry of the
-/// resolved runtime module tree, at most `ceiling` directories deep.
-///
-/// Each probe is one held open of `deny.toml` under the probed directory, so
-/// the bytes returned are the bytes the open proved regular; an absent file
-/// moves the walk one level up, any other refusal (a link, a directory, a
-/// denied or over-cap file) is the gate's refusal. `None` when no probed
-/// directory holds a policy, or there is no runtime tree to walk from.
-///
-/// # Errors
-/// [`CliError::SourceRefused`], [`CliError::FileTooLarge`] or [`CliError::Io`]
-/// from a present `deny.toml` that cannot be read as a regular file.
-fn policy_origin(
-    runtime_root: Option<&Path>,
-    ceiling: AncestorCeiling,
-) -> Result<Option<PolicyOrigin>, CliError> {
-    let Some(runtime_root) = runtime_root else {
-        return Ok(None);
-    };
-    for dir in runtime_root.ancestors().take(ceiling.get()) {
-        match crate::io_bounded::read_named_in(
-            dir,
-            &[DENY_CONFIG],
-            crate::io_bounded::SMALL_FILE_CAP,
-        ) {
-            Ok(text) => {
-                return Ok(Some(PolicyOrigin::RuntimeWorkspace { text }));
-            }
-            Err(CliError::Io { source, .. }) if source.kind() == std::io::ErrorKind::NotFound => {}
-            Err(other) => return Err(other),
-        }
-    }
-    Ok(None)
-}
+/// The policy is part of the gate's installation, so no file at audit time can
+/// stand in for it: neither the audited package's tree, nor the working
+/// directory, nor a runtime tree a cwd walk or `IPE_RUNTIME_DIR` resolves (a
+/// package shipping an empty `src/runtime/rust/src/` beside its own
+/// `deny.toml` would otherwise name the policy it is judged by). An absent
+/// policy has no representation, so cargo-deny never runs on its defaults.
+const GATE_DENY_POLICY: &str = include_str!("../../../deny.toml");
 
 /// Derive a cargo-deny config for the EMITTED project from the gate's
-/// `deny.toml`, dropping its `[graph]` section.
+/// embedded policy ([`GATE_DENY_POLICY`]), dropping its `[graph]` section.
 ///
 /// The workspace config's `[graph] features = ["full"]` names the RUNTIME crate's
 /// own feature set, which the emitted `ipe-app` does not have — passing the
 /// workspace config verbatim makes `cargo metadata` fail on the unknown feature.
 /// The advisory/license/bans/sources POLICY is exactly what the gate must apply,
 /// so this copies every section EXCEPT `[graph]` into a derived config written
-/// beside the emitted project, and returns its path. The policy is read from a
-/// [`PolicyOrigin`] only — never from the audited package or the working
-/// directory. Returns `None` when the gate's installation names no policy
-/// (cargo-deny then uses its defaults).
+/// beside the emitted project, and returns its path.
 ///
 /// # Errors
-/// [`CliError::Io`] on a read/write failure; the [`policy_origin`] refusals.
-fn derive_deny_config(emitted_dir: &Path) -> Result<Option<PathBuf>, CliError> {
-    let runtime_root = crate::resolve_runtime().ok();
-    let Some(PolicyOrigin::RuntimeWorkspace { text }) =
-        policy_origin(runtime_root.as_deref(), POLICY_ANCESTOR_CEILING)?
-    else {
-        return Ok(None);
-    };
+/// [`CliError::Io`] on a write failure.
+fn derive_deny_config(emitted_dir: &Path) -> Result<PathBuf, CliError> {
+    let derived = emitted_dir.join("ipe-audit-deny.toml");
+    std::fs::write(&derived, emitted_deny_policy(GATE_DENY_POLICY)).map_err(|e| CliError::Io {
+        path: derived.clone(),
+        source: e,
+    })?;
+    Ok(derived)
+}
 
-    // Line-filter out the `[graph]` table (up to the next top-level `[section]`).
-    // The remaining tables (`[advisories]`, `[licenses]`, `[bans]`, `[sources]`)
-    // are the emitted-project-independent policy the gate applies.
-    let mut out = String::with_capacity(text.len());
+/// `policy` without its `[graph]` table (up to the next top-level `[section]`).
+///
+/// The remaining tables (`[advisories]`, `[licenses]`, `[bans]`, `[sources]`)
+/// are the emitted-project-independent policy the gate applies.
+fn emitted_deny_policy(policy: &str) -> String {
+    let mut out = String::with_capacity(policy.len());
     let mut in_graph = false;
-    for line in text.lines() {
+    for line in policy.lines() {
         let trimmed = line.trim_start();
         if trimmed.starts_with('[') {
             in_graph = trimmed.starts_with("[graph]");
@@ -2188,13 +2132,7 @@ fn derive_deny_config(emitted_dir: &Path) -> Result<Option<PathBuf>, CliError> {
             out.push('\n');
         }
     }
-
-    let derived = emitted_dir.join("ipe-audit-deny.toml");
-    std::fs::write(&derived, out).map_err(|e| CliError::Io {
-        path: derived.clone(),
-        source: e,
-    })?;
-    Ok(Some(derived))
+    out
 }
 
 /// Refuse a package whose own module set claims a reserved namespace (`Ipe.*`,
@@ -4101,7 +4039,7 @@ mod tests {
     fn deny_args_modern_places_config_before_check() {
         let manifest = Path::new("/tmp/proj/Cargo.toml");
         let config = Path::new("/ws/deny.toml");
-        let args = deny_args(20, manifest, Some(config));
+        let args = deny_args(20, manifest, config);
         let strs: Vec<&str> = args.iter().map(|a| a.to_str().unwrap()).collect();
         let check_pos = strs
             .iter()
@@ -4126,7 +4064,7 @@ mod tests {
     fn deny_args_legacy_places_config_after_check() {
         let manifest = Path::new("/tmp/proj/Cargo.toml");
         let config = Path::new("/ws/deny.toml");
-        let args = deny_args(19, manifest, Some(config));
+        let args = deny_args(19, manifest, config);
         let strs: Vec<&str> = args.iter().map(|a| a.to_str().unwrap()).collect();
         let check_pos = strs
             .iter()
@@ -4143,19 +4081,6 @@ mod tests {
         assert!(strs.contains(&"advisories"), "advisories present");
         assert!(strs.contains(&"bans"), "bans present");
         assert!(strs.contains(&"sources"), "sources present");
-    }
-
-    /// No config: neither version emits `--config` at all.
-    #[test]
-    fn deny_args_no_config_omits_flag() {
-        let manifest = Path::new("/tmp/proj/Cargo.toml");
-        for minor in [19_u32, 20] {
-            let args = deny_args(minor, manifest, None);
-            assert!(
-                !args.iter().any(|a| a.to_str() == Some("--config")),
-                "minor {minor}: --config must not appear when config is None"
-            );
-        }
     }
 
     /// A `cargo-deny` driven through a stub that runs a shell `body`.
@@ -4281,11 +4206,11 @@ mod tests {
     /// ambient state at the verdict.
     mod gate_posture_and_policy_origin {
         use std::collections::BTreeMap;
-        use std::path::{Path, PathBuf};
+        use std::path::PathBuf;
 
         use super::super::{
-            AncestorCeiling, Check, GatePosture, POLICY_ANCESTOR_CEILING, PolicyOrigin, Rejection,
-            policy_origin,
+            Check, GATE_DENY_POLICY, GatePosture, Rejection, derive_deny_config,
+            emitted_deny_policy,
         };
         use super::make_test_dir;
         use crate::CliError;
@@ -4337,115 +4262,42 @@ mod tests {
             );
         }
 
-        const POLICY_TEXT: &str = "[advisories]\nunmaintained = \"all\"\n";
-
-        /// A fake runtime module tree `depth` directories below `workspace`.
-        fn runtime_tree_below(workspace: &Path, depth: usize) -> PathBuf {
-            let mut root = workspace.to_path_buf();
-            for level in 0..depth {
-                root.push(format!("level-{level}"));
-            }
-            std::fs::create_dir_all(&root).expect("create fake runtime tree");
-            root
-        }
-
         #[test]
-        fn policy_origin_never_reads_the_cwd_or_the_package() {
-            // `cargo test` runs with the crate directory as the working directory,
-            // whose ancestry holds the repository's own `deny.toml`: a walk from
-            // the working directory would find it and turn this test red.
-            let package = make_test_dir("policy-package");
-            std::fs::write(package.join("deny.toml"), POLICY_TEXT).expect("write package policy");
-            let runtime = make_test_dir("policy-no-runtime-policy");
-
+        fn the_gate_writes_its_embedded_policy_for_every_audit() {
+            let emitted = make_test_dir("policy-embedded");
+            let written = derive_deny_config(&emitted)
+                .ok()
+                .and_then(|path| std::fs::read_to_string(path).ok());
             assert_eq!(
-                policy_origin(Some(&runtime), POLICY_ANCESTOR_CEILING).ok(),
-                Some(None),
-                "a runtime tree without a policy above it names none"
+                written.as_deref(),
+                Some(emitted_deny_policy(GATE_DENY_POLICY).as_str()),
+                "the derived config is the compiler's own policy, whatever the disk holds"
             );
-            assert_eq!(
-                policy_origin(None, POLICY_ANCESTOR_CEILING).ok(),
-                Some(None),
-                "no runtime tree means no policy, whatever the working directory holds"
-            );
-
-            let _ = std::fs::remove_dir_all(&package);
-            let _ = std::fs::remove_dir_all(&runtime);
-        }
-
-        #[test]
-        fn policy_origin_reads_the_runtime_workspace_policy() {
-            let workspace = make_test_dir("policy-workspace");
-            std::fs::write(workspace.join("deny.toml"), POLICY_TEXT).expect("write policy");
-            let runtime = runtime_tree_below(&workspace, 4);
-
-            assert_eq!(
-                policy_origin(Some(&runtime), POLICY_ANCESTOR_CEILING).ok(),
-                Some(Some(PolicyOrigin::RuntimeWorkspace {
-                    text: String::from(POLICY_TEXT),
-                })),
-                "the workspace above the runtime tree is the policy origin"
-            );
-
-            let _ = std::fs::remove_dir_all(&workspace);
-        }
-
-        #[test]
-        fn policy_origin_stops_at_the_ancestor_ceiling() {
-            let workspace = make_test_dir("policy-ceiling");
-            std::fs::write(workspace.join("deny.toml"), POLICY_TEXT).expect("write policy");
-            let ceiling: AncestorCeiling = POLICY_ANCESTOR_CEILING;
-
-            let past = runtime_tree_below(&workspace, ceiling.get());
-            assert_eq!(
-                policy_origin(Some(&past), ceiling).ok(),
-                Some(None),
-                "a policy one directory past the ceiling is never probed"
-            );
-
-            let within = runtime_tree_below(&workspace, ceiling.get() - 1);
+            let policy = written.unwrap_or_default();
             assert!(
-                matches!(
-                    policy_origin(Some(&within), ceiling),
-                    Ok(Some(PolicyOrigin::RuntimeWorkspace { .. }))
-                ),
-                "the same policy exactly at the ceiling is found (the ceiling is the pin, not the walk)"
+                policy.contains("unknown-registry = \"deny\"") && policy.contains("[advisories]"),
+                "the embedded policy carries the supply-chain tables, never cargo-deny defaults"
             );
-
-            let _ = std::fs::remove_dir_all(&workspace);
+            let _ = std::fs::remove_dir_all(&emitted);
         }
 
-        #[cfg(unix)]
         #[test]
-        fn policy_origin_refuses_a_linked_policy() {
-            use crate::io_bounded::SourceRefusal;
-
-            let workspace = make_test_dir("policy-link");
-            let elsewhere = make_test_dir("policy-link-target");
-            std::fs::write(elsewhere.join("deny.toml"), POLICY_TEXT).expect("write link target");
-            std::os::unix::fs::symlink(elsewhere.join("deny.toml"), workspace.join("deny.toml"))
-                .expect("link the policy");
-            let runtime = runtime_tree_below(&workspace, 2);
-
-            assert!(
-                matches!(
-                    policy_origin(Some(&runtime), POLICY_ANCESTOR_CEILING),
-                    Err(CliError::SourceRefused {
-                        reason: SourceRefusal::Symlink,
-                        ..
-                    })
-                ),
-                "a present policy that is a link is the gate's refusal, never followed nor skipped"
+        fn the_emitted_policy_drops_only_the_graph_table() {
+            let policy = "[graph]\nfeatures = [\"full\"]\n[advisories]\nignore = []\n[sources]\nunknown-git = \"deny\"\n";
+            assert_eq!(
+                emitted_deny_policy(policy),
+                "[advisories]\nignore = []\n[sources]\nunknown-git = \"deny\"\n",
+                "the runtime crate's feature graph is dropped; every policy table is kept"
             );
-
-            let _ = std::fs::remove_dir_all(&workspace);
-            let _ = std::fs::remove_dir_all(&elsewhere);
         }
 
         /// Names whose qualified mention in production code is an ambient read:
-        /// the process environment, the working directory, the sandbox facts.
+        /// the process environment, the working directory, a runtime tree found
+        /// from either, the sandbox facts.
         const AMBIENT_READS: &[&str] = &[
             "current_dir",
+            "resolve_runtime",
+            "resolve_runtime_src",
             "var",
             "var_os",
             "vars",
@@ -4660,6 +4512,22 @@ mod tests {
                 hits.get(&(String::from("smuggled"), String::from("current_dir"))),
                 Some(&1),
                 "a qualified working-directory read in a production function is a hit"
+            );
+        }
+
+        #[test]
+        fn the_ambient_scan_sees_a_runtime_tree_resolution() {
+            let mutated = format!(
+                "{AUDIT_SOURCE}\nfn policy_beside_runtime() -> bool {{ crate::resolve_runtime().is_ok() }}\n"
+            );
+            let hits = ambient_reads(&mutated).unwrap_or_default();
+            assert_eq!(
+                hits.get(&(
+                    String::from("policy_beside_runtime"),
+                    String::from("resolve_runtime")
+                )),
+                Some(&1),
+                "a runtime tree resolved from the cwd or the environment is an ambient read"
             );
         }
 
