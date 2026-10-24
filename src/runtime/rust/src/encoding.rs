@@ -933,29 +933,19 @@ pub struct RoutePattern(Vec<PatternSeg>);
 
 impl RoutePattern {
     /// Split `pattern` by the request-path split rule and classify each raw
-    /// segment: a leading `:` makes a parameter whose name is admitted by
-    /// [`ParamNames::admit`]; anything else is a literal decoded by the strict
-    /// path-segment decoder.
+    /// segment by [`route_segment`], the one segment grammar `Ipe.Web` and
+    /// `Ipe.Server` patterns share.
     ///
     /// # Errors
     ///
-    /// The refusal of the first malformed segment: a literal that does not
-    /// decode, a parameter name that is empty, not an identifier or a repeat,
-    /// or `TooLong` for an oversized pattern.
+    /// The refusal of the first malformed segment, or `TooLong` for an
+    /// oversized pattern.
     pub fn parse(pattern: &str) -> Result<Self, RouteSegmentRefusal> {
         let mut names = ParamNames::default();
         raw_path_segments(pattern)
             .map_err(RouteSegmentRefusal::Decode)?
             .into_iter()
-            .map(|raw| match raw.strip_prefix(':') {
-                Some(name) => names
-                    .admit(name)
-                    .map(PatternSeg::Param)
-                    .map_err(RouteSegmentRefusal::ParamName),
-                None => decode_path_segment(raw)
-                    .map(PatternSeg::Literal)
-                    .map_err(RouteSegmentRefusal::Decode),
-            })
+            .map(|raw| route_segment(raw, &mut names))
             .collect::<Result<Vec<_>, _>>()
             .map(Self)
     }
@@ -975,6 +965,35 @@ impl RoutePattern {
     }
 }
 
+/// Classify one raw segment of a route pattern.
+///
+/// The one segment grammar of every route pattern: a segment led by `*` (a
+/// catch-all) is refused; a segment led by `:` is a parameter whose name is
+/// admitted by [`ParamNames::admit`]; any other segment holds no `:` or `*`
+/// and is a literal decoded by the strict path-segment decoder.
+///
+/// # Errors
+///
+/// `CatchAll`, the parameter-name refusal, `MidSegmentSigil`, or the decode
+/// refusal of the literal.
+fn route_segment(raw: &str, names: &mut ParamNames) -> Result<PatternSeg, RouteSegmentRefusal> {
+    if raw.starts_with('*') {
+        return Err(RouteSegmentRefusal::CatchAll);
+    }
+    if let Some(name) = raw.strip_prefix(':') {
+        return names
+            .admit(name)
+            .map(PatternSeg::Param)
+            .map_err(RouteSegmentRefusal::ParamName);
+    }
+    if let Some(at) = raw.find([':', '*']) {
+        return Err(RouteSegmentRefusal::MidSegmentSigil { at: ByteOffset(at) });
+    }
+    decode_path_segment(raw)
+        .map(PatternSeg::Literal)
+        .map_err(RouteSegmentRefusal::Decode)
+}
+
 /// Why one segment of a route pattern was refused.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RouteSegmentRefusal {
@@ -982,6 +1001,13 @@ pub enum RouteSegmentRefusal {
     Decode(DecodeRefusal),
     /// A `:name` segment's name is empty, not an identifier, or a repeat.
     ParamName(ParamNameRefusal),
+    /// A segment is led by `*`: a catch-all, which no route serves.
+    CatchAll,
+    /// A literal segment holds a `:` or `*` after its first byte.
+    MidSegmentSigil {
+        /// Offset of the sigil within the segment.
+        at: ByteOffset,
+    },
 }
 
 impl std::fmt::Display for RouteSegmentRefusal {
@@ -989,16 +1015,22 @@ impl std::fmt::Display for RouteSegmentRefusal {
         match self {
             Self::Decode(refusal) => write!(f, "{refusal}"),
             Self::ParamName(refusal) => write!(f, "{refusal}"),
+            Self::CatchAll => f.write_str("a `*` catch-all segment is not served"),
+            Self::MidSegmentSigil { at } => write!(
+                f,
+                "a `:` or `*` at byte {} of a segment is neither a parameter nor a literal",
+                at.get()
+            ),
         }
     }
 }
 
-/// A route pattern refused at registration: the raw pattern text and why it
-/// did not parse.
+/// A route pattern refused at registration: the pattern text and why it did
+/// not parse.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RoutePatternRefusal {
-    /// The pattern text as registered.
-    pub pattern: String,
+    /// The pattern text as registered, scrubbed where the refusal is built.
+    pub pattern: crate::system::RefusedText,
     /// Why its first malformed segment was refused.
     pub refusal: RouteSegmentRefusal,
 }
@@ -1008,8 +1040,7 @@ impl std::fmt::Display for RoutePatternRefusal {
         write!(
             f,
             "route pattern `{}` is malformed: {}",
-            crate::system::scrub_log_controls(&self.pattern),
-            self.refusal
+            self.pattern, self.refusal
         )
     }
 }
@@ -1131,14 +1162,7 @@ pub const MAX_SERVER_PARAMS: usize = 25;
 pub enum ServerPatternRefusal {
     /// The pattern does not start with `/`.
     NotAbsolute,
-    /// A segment is led by `*`: a catch-all, which `Ipe.Server` does not serve.
-    CatchAll,
-    /// A literal segment holds a `:` or `*` after its first byte.
-    MidSegmentSigil {
-        /// Offset of the sigil within the segment.
-        at: ByteOffset,
-    },
-    /// A segment is refused as in a `Web.route` pattern.
+    /// A segment is refused by the route segment grammar.
     Segment(RouteSegmentRefusal),
     /// The pattern holds more than [`MAX_SERVER_PARAMS`] parameters.
     TooManyParams {
@@ -1153,12 +1177,6 @@ impl std::fmt::Display for ServerPatternRefusal {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::NotAbsolute => f.write_str("a route path starts with `/`"),
-            Self::CatchAll => f.write_str("a `*` catch-all segment is not served"),
-            Self::MidSegmentSigil { at } => write!(
-                f,
-                "a `:` or `*` at byte {} of a segment is neither a parameter nor a literal",
-                at.get()
-            ),
             Self::Segment(refusal) => write!(f, "{refusal}"),
             Self::TooManyParams { cap } => {
                 write!(f, "a route path holds at most {cap} `:` parameters")
@@ -1169,9 +1187,9 @@ impl std::fmt::Display for ServerPatternRefusal {
 }
 
 impl ServerPattern {
-    /// Parse `raw`: split by the request-path split rule, a segment led by
-    /// `:` is a parameter admitted by [`ParamNames::admit`], and any other
-    /// segment is a literal decoded by the strict path-segment decoder.
+    /// Parse `raw`: split by the request-path split rule, each segment
+    /// classified by [`route_segment`], the grammar `Web.route` patterns
+    /// share.
     ///
     /// # Errors
     ///
@@ -1189,8 +1207,9 @@ impl ServerPattern {
         let mut names = ParamNames::default();
         let segments = raws
             .into_iter()
-            .map(|seg| server_segment(seg, &mut names))
-            .collect::<Result<Vec<_>, _>>()?;
+            .map(|seg| route_segment(seg, &mut names))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(ServerPatternRefusal::Segment)?;
         let pattern = RoutePattern(segments);
         if pattern.param_names().count() > MAX_SERVER_PARAMS {
             return Err(ServerPatternRefusal::TooManyParams {
@@ -1249,24 +1268,6 @@ impl ServerPattern {
     pub fn router_path(&self) -> &str {
         &self.router_path
     }
-}
-
-/// Classify one raw segment of an `Ipe.Server` pattern.
-fn server_segment(raw: &str, names: &mut ParamNames) -> Result<PatternSeg, ServerPatternRefusal> {
-    if raw.starts_with('*') {
-        return Err(ServerPatternRefusal::CatchAll);
-    }
-    if let Some(name) = raw.strip_prefix(':') {
-        return names.admit(name).map(PatternSeg::Param).map_err(|refusal| {
-            ServerPatternRefusal::Segment(RouteSegmentRefusal::ParamName(refusal))
-        });
-    }
-    if let Some(at) = raw.find([':', '*']) {
-        return Err(ServerPatternRefusal::MidSegmentSigil { at: ByteOffset(at) });
-    }
-    decode_path_segment(raw)
-        .map(PatternSeg::Literal)
-        .map_err(|refusal| ServerPatternRefusal::Segment(RouteSegmentRefusal::Decode(refusal)))
 }
 
 /// The router spelling of `pattern` ([`ServerPattern::router_path`]).
@@ -2418,12 +2419,16 @@ mod server_pattern_tests {
             Some(R::Segment(S::ParamName(N::NotIdentifier { .. })))
         ));
         for catch_all in ["/*rest", "/f/*", "/a/:x/*y", "/*"] {
-            assert_eq!(refusal(catch_all), Some(R::CatchAll), "{catch_all}");
+            assert_eq!(
+                refusal(catch_all),
+                Some(R::Segment(S::CatchAll)),
+                "{catch_all}"
+            );
         }
         for (mid, at) in [("/a:b", 1), ("/v-:id", 2), ("/x/ab*", 2), ("/q/a*:b", 1)] {
             assert_eq!(
                 refusal(mid),
-                Some(R::MidSegmentSigil { at: ByteOffset(at) }),
+                Some(R::Segment(S::MidSegmentSigil { at: ByteOffset(at) })),
                 "{mid}"
             );
         }

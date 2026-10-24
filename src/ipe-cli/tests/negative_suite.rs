@@ -3807,9 +3807,9 @@ main =
 
 // ===========================================================================
 // Literal route paths follow the runtime's grammar — IPE-L0156. A `:name` is
-// `[A-Za-z_][A-Za-z0-9_]*` and unique per path; a `Web.route` literal segment
-// is strictly percent-decodable. A literal that breaks it is refused at ipe
-// time rather than at listener startup.
+// `[A-Za-z_][A-Za-z0-9_]*` and unique per path; no segment is a `*` catch-all;
+// a literal segment holds no `:` or `*` and is strictly percent-decodable. A
+// literal that breaks it is refused at ipe time rather than at listener startup.
 // ===========================================================================
 
 /// A `Web.tea` app whose second route pattern is `pattern`, built by the
@@ -3878,6 +3878,18 @@ fn lower_web_route_param_duplicate() {
 fn lower_web_route_malformed_escape() {
     let src = web_route_fixture("/files/100%zz", "HomePage");
     assert_rejected("lower_web_route_malformed_escape", &src, "IPE-L0156");
+}
+
+#[test]
+fn lower_web_route_catch_all() {
+    let src = web_route_fixture("/files/*rest", "HomePage");
+    assert_rejected("lower_web_route_catch_all", &src, "IPE-L0156");
+}
+
+#[test]
+fn lower_web_route_mid_segment_sigil() {
+    let src = web_route_fixture("/file:id", "HomePage");
+    assert_rejected("lower_web_route_mid_segment_sigil", &src, "IPE-L0156");
 }
 
 #[test]
