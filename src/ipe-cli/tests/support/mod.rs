@@ -653,7 +653,7 @@ pub fn build_and_run_emitted_with_stdin(
 }
 
 /// Outcome of one deadline-bounded run of an emitted binary.
-#[allow(dead_code)]
+#[allow(dead_code)] // fields read only by deadline-bounded goldens
 pub struct TimedRunOutcome {
     /// The program's standard output, decoded lossily from UTF-8.
     pub stdout: String,
@@ -727,11 +727,13 @@ pub fn run_with_stdin_deadline(
     let started = std::time::Instant::now();
     let stdout = child.stdout.take().map(drain_on_thread);
     let stderr = child.stderr.take().map(drain_on_thread);
-    // Dropping the handle after the write closes stdin, so the child sees EOF.
-    let wrote = child
-        .stdin
-        .take()
-        .map(|mut stdin| stdin.write_all(stdin_bytes));
+    // The write runs on its own thread so a child that stops reading cannot
+    // hold the caller past `deadline`; the thread drops the handle after the
+    // write, which closes stdin, so the child sees EOF.
+    let feed = child.stdin.take().map(|mut stdin| {
+        let bytes = stdin_bytes.to_vec();
+        std::thread::spawn(move || stdin.write_all(&bytes))
+    });
 
     let mut polled = Ok(None);
     while started.elapsed() < deadline {
@@ -749,6 +751,9 @@ pub fn run_with_stdin_deadline(
     }
     let stdout = stdout.map_or_else(String::new, join_drain);
     let stderr = stderr.map_or_else(String::new, join_drain);
+    // The child has exited or been reaped, so its end of the pipe is closed and
+    // a write still pending returns `BrokenPipe` instead of blocking the join.
+    let wrote = feed.map(std::thread::JoinHandle::join);
     assert!(
         polled.is_ok(),
         "{golden_name}: failed to poll `{exe}`: {:?}",
@@ -759,8 +764,11 @@ pub fn run_with_stdin_deadline(
         "{golden_name}: no exit within {deadline:?}, superlinear or hung; stderr:\n{stderr}"
     );
     assert!(
-        wrote.as_ref().is_none_or(Result::is_ok),
-        "{golden_name}: failed to write stdin: {wrote:?}"
+        wrote
+            .as_ref()
+            .is_none_or(|joined| joined.as_ref().is_ok_and(Result::is_ok)),
+        "{golden_name}: failed to write stdin: {:?}",
+        wrote.map(|joined| joined.map_err(|_| "stdin writer panicked"))
     );
     TimedRunOutcome {
         stdout,
