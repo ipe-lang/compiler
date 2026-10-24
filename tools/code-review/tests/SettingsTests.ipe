@@ -802,7 +802,7 @@ settingsExports source =
 -- every word by its unqualified name, so a
 -- qualified or wrapped spelling (`Settings.AppSettings`,
 -- `Maybe RepoPath.RootMap`) is caught alike. The `Model` is declared in
--- `src/Lib/App.ipe`; its source is scanned for the declaration, and the scan
+-- `src/Lib/Session.ipe`; its source is scanned for the declaration, and the scan
 -- must find `Model` there. Red while the `Model` holds a `settings` field.
 settingsNeverInSessionState : Task.Task Error Bool
 settingsNeverInSessionState =
@@ -828,7 +828,7 @@ settingsNeverInSessionState =
                 && not (stateAdmitted (appendTo "Lib/Queue.ipe" "type\tHeld\n    = Held IndexSettings" sources))
                 && not (stateAdmitted (appendTo "Lib/Queue.ipe" "{- note -} type Held\n    = Held IndexSettings" sources))
                 && not (stateAdmitted (appendTo "Lib/Queue.ipe" "type Held\n{- note\nend -}\n    = Held IndexSettings" sources))
-                && not (stateAdmitted (List.filter (\( rel, _ ) -> rel /= "Lib/App.ipe") sources))
+                && not (stateAdmitted (List.filter (\( rel, _ ) -> rel /= "Lib/Session.ipe") sources))
                 && statePinned sources
                 && not (statePinned (replaceIn "Main.ipe" "init : Web.WebReq -> ( Model, Cmd Msg )" "init : Web.WebReq -> ( ( Model, Settings.AppSettings ), Cmd Msg )" sources))
                 && not (statePinned (replaceIn "Lib/View.ipe" "view : Model -> Ui.Element Msg" "view : ( Model, Settings.AppSettings ) -> Ui.Element Msg" sources))
@@ -886,12 +886,12 @@ replaceIn rel old new sources =
 
 
 -- `sources` with a `settings` field added to the `Model` declaration of
--- `Lib.App`, the shape a session carrying the startup settings takes.
+-- `Lib.Session`, the shape a session carrying the startup settings takes.
 withModelField : List ( String, String ) -> List ( String, String )
 withModelField sources =
     List.map
         (\( rel, text ) ->
-            if rel == "Lib/App.ipe" then
+            if rel == "Lib/Session.ipe" then
                 ( rel, String.replace "    { page : Page\n" "    { page : Page\n    , settings : Settings.AppSettings\n" text )
 
             else
@@ -915,11 +915,11 @@ admittedCarriers =
     ]
 
 
--- `Lib.App` declares a `Model`, and no declaration outside `admittedCarriers`
+-- `Lib.Session` declares a `Model`, and no declaration outside `admittedCarriers`
 -- names a settings carrier.
 stateAdmitted : List ( String, String ) -> Bool
 stateAdmitted sources =
-    List.any (\( rel, text ) -> rel == "Lib/App.ipe" && List.any (\( name, _ ) -> name == "Model") (typeDeclarations text)) sources
+    List.any (\( rel, text ) -> rel == "Lib/Session.ipe" && List.any (\( name, _ ) -> name == "Model") (typeDeclarations text)) sources
         && List.all
             (\( rel, text ) ->
                 List.all

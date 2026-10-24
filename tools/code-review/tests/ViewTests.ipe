@@ -1097,9 +1097,12 @@ positionRefusals =
 -- token (the type's constructor, the one plan built and the one arm matched,
 -- so a plan built by passing the constructor as a function is counted too),
 -- and `decidePlan` three times (its signature, its definition and the one
--- call in `saveDecision`); none of them appears in `Main`. The arms are
+-- call in `run`), counted over `Lib.App` and `Lib.Session` together; the
+-- session names neither `decidePlan` nor `decideOn`, and only the one
+-- matched arm of each constructor is in `Lib.App`; none of them appears in
+-- `Main`. The arms are
 -- matched with whitespace runs collapsed, so re-indenting them keeps the
--- scan. A site list with exact counts, since `ipe test` builds no `update`.
+-- scan. A site list with exact counts, since `ipe test` runs no `run`.
 -- Red if a second path to either decision is added.
 decisionReachedOnlyThroughDecidableSource : Task.Task Error Bool
 decisionReachedOnlyThroughDecidableSource =
@@ -1126,9 +1129,15 @@ decisionReachedOnlyThroughDecidableSource =
     do
         cwd <- System.cwd ()
         appPath <- Task.fromResult (Path.fromString (cwd ++ "/src/Lib/App.ipe"))
+        sessionPath <- Task.fromResult (Path.fromString (cwd ++ "/src/Lib/Session.ipe"))
         mainPath <- Task.fromResult (Path.fromString (cwd ++ "/src/Main.ipe"))
-        app <- File.readFileLimit appPath (ByteSize.kib 64)
+        interpreter <- File.readFileLimit appPath (ByteSize.kib 64)
+        session <- File.readFileLimit sessionPath (ByteSize.kib 64)
         mainSrc <- File.readFileLimit mainPath (ByteSize.kib 64)
+        let
+            app =
+                interpreter ++ "\n" ++ session
+        in
         Task.succeed
             (count "Queue.decide " app == 1
                 && count "decideOn " app == 3
@@ -1140,6 +1149,10 @@ decisionReachedOnlyThroughDecidableSource =
                 && count "WriteUnit" app == 3
                 && count "WriteFile" app == 3
                 && count "decidePlan" app == 3
+                && count "decidePlan" session == 0
+                && count "decideOn" session == 0
+                && count "WriteUnit" interpreter == 1
+                && count "WriteFile" interpreter == 1
                 && count "Queue.decide " mainSrc == 0
                 && count "decideOn" mainSrc == 0
                 && count "decideRefusal" mainSrc == 0

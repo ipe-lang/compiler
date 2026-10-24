@@ -1,11 +1,14 @@
 module SingleFlightTests exposing (checks)
 
+import Ipe.ByteSize as ByteSize
 import Ipe.Db as Db
 import Ipe.Error as Error exposing (Error)
+import Ipe.File as File
 import Ipe.Html as Html
 import Ipe.Io as Io
 import Ipe.List as List
 import Ipe.Maybe as Maybe
+import Ipe.Path as Path
 import Ipe.Result exposing (Result(..))
 import Ipe.String as String
 import Ipe.System as System
@@ -13,7 +16,7 @@ import Ipe.Task as Task
 import Ipe.Time.Timestamp as Timestamp
 import Ipe.Tuple as Tuple
 import Ipe.Ui as Ui
-import Lib.App as App exposing (KeyOffers(..), Model, Msg(..), Page(..))
+import Lib.App as App
 import Lib.Db as LibDb exposing (Decision(..))
 import Lib.DecisionSlot as DecisionSlot exposing (DecisionSlot(..), DecisionTarget(..), RefusalPanel(..))
 import Lib.Draft as Draft
@@ -26,37 +29,31 @@ import Lib.Queue as Queue exposing (QueueState(..), QueueWant(..), UnitPageState
 import Lib.ReviewKey as ReviewKey exposing (ReviewKey(..))
 import Lib.SafeText as SafeText
 import Lib.Selected as Selected exposing (SelectedView(..))
+import Lib.Session as Session exposing (Effect(..), KeyOffers(..), Model, Msg(..), Page(..))
 import Lib.Settings as Settings
 import Lib.Slot as Slot exposing (Settle(..), Stamp)
 import Lib.Standing as Standing exposing (StandingRead(..))
 import Lib.Uid as Uid exposing (Uid)
 import Lib.View as View
-import TestSupport exposing (Scratch, check, checkReporting, cleanupIndex, decideNow, envAppSettings, execIndex, fixtureLibRs, freshScratch, loadPageNow, loadUnitNow, migratedReviewAt, refusalOf, removeFileIfAny, seedIndex, uid, labelOf, labelText, viewA, writeFileText)
+import TestSupport exposing (Scratch, check, checkReporting, cleanupIndex, decideNow, envAppSettings, execIndex, fixtureLibRs, freshScratch, loadPageNow, loadUnitNow, migratedReviewAt, refusalOf, record, removeFileIfAny, repoFile, seedIndex, uid, labelOf, labelText, viewA, writeFileText)
 import TextSinkScanTests
 import ViewTests exposing (allKeys)
 
 
--- Every check drives the app's own `App.update`, the dispatch `src/Main.ipe`
--- serves, and asserts on the session's two in-flight slots: `selectedView`,
--- the one source read shared by the queue card and the unit page, and
--- `decision`, the one decision. A read or a decision starts only from a slot
--- transition that takes an idle slot, so a slot that stays taken across a
--- second request proves the second request started nothing.
+-- Every check drives `Session.step`, the step `App.update` performs for the
+-- dispatch `src/Main.ipe` serves, and asserts on the session's in-flight
+-- slots and on the effects each step returns: `selectedView`, the one
+-- source read shared by the queue card and the unit page, `decision`, the
+-- one decision, and the queue, History and standing loads. A task starts
+-- only as an effect of the transition that takes its slot, so a step whose
+-- effects name no task for a slot started nothing there.
 -- ── driving the app ─────────────────────────────────────────────────────
--- `model` after each of `msgs` in turn; the Cmds are dropped, so a read
--- or a decision is in flight exactly while its slot holds it.
+-- `model` after each of `msgs` in turn through `Session.step`, recorded by
+-- `TestSupport.record`; `effectsOf` reads the effects the same steps
+-- return.
 after : Settings.AppSettings -> List Msg -> Model -> Model
 after settings msgs model =
-    List.foldl
-        (\msg current ->
-            let
-                ( next, _ ) =
-                    App.update settings msg current
-            in
-            next
-        )
-        model
-        msgs
+    Tuple.first (record settings msgs model)
 
 
 -- The read in flight and the unit wanted after it, if a read is in flight.
@@ -205,12 +202,511 @@ standingLoadedFor epoch unit bodyHash result =
     completions App.standingLoaded (standingStamp epoch unit bodyHash) result
 
 
+-- ── the effects a step returns ──────────────────────────────────────────
+-- The stamp an effect carries for each slot, read by `case`, since a save's
+-- effect carries its signing key and is never compared whole. Each match
+-- names every constructor, so a new effect is a slot these checks place.
+queueStart : Effect -> Maybe (Stamp Slot.LoadTicket)
+queueStart effect =
+    case effect of
+        LoadQueue load _ ->
+            Just load
+
+        LoadHistory _ _ ->
+            Nothing
+
+        LoadView _ ->
+            Nothing
+
+        LoadStanding _ ->
+            Nothing
+
+        SaveDecision _ _ _ _ ->
+            Nothing
+
+
+historyStart : Effect -> Maybe (Stamp Slot.LoadTicket)
+historyStart effect =
+    case effect of
+        LoadQueue _ _ ->
+            Nothing
+
+        LoadHistory load _ ->
+            Just load
+
+        LoadView _ ->
+            Nothing
+
+        LoadStanding _ ->
+            Nothing
+
+        SaveDecision _ _ _ _ ->
+            Nothing
+
+
+viewStart : Effect -> Maybe (Stamp Uid)
+viewStart effect =
+    case effect of
+        LoadQueue _ _ ->
+            Nothing
+
+        LoadHistory _ _ ->
+            Nothing
+
+        LoadView read ->
+            Just read
+
+        LoadStanding _ ->
+            Nothing
+
+        SaveDecision _ _ _ _ ->
+            Nothing
+
+
+standingStart : Effect -> Maybe (Stamp Standing.StandingKey)
+standingStart effect =
+    case effect of
+        LoadQueue _ _ ->
+            Nothing
+
+        LoadHistory _ _ ->
+            Nothing
+
+        LoadView _ ->
+            Nothing
+
+        LoadStanding reading ->
+            Just reading
+
+        SaveDecision _ _ _ _ ->
+            Nothing
+
+
+decisionStart : Effect -> Maybe (Stamp Uid)
+decisionStart effect =
+    case effect of
+        LoadQueue _ _ ->
+            Nothing
+
+        LoadHistory _ _ ->
+            Nothing
+
+        LoadView _ ->
+            Nothing
+
+        LoadStanding _ ->
+            Nothing
+
+        SaveDecision saving _ _ _ ->
+            Just saving
+
+
+-- The stamp each slot's completion carries, if `msg` is that completion.
+queueCompletion : Msg -> Maybe (Stamp Slot.LoadTicket)
+queueCompletion msg =
+    case msg of
+        PendingLoaded stamped _ ->
+            Just stamped
+
+        NextPage _ ->
+            Nothing
+
+        ApproveRow _ ->
+            Nothing
+
+        RefuseStart _ ->
+            Nothing
+
+        RefuseDraft _ _ ->
+            Nothing
+
+        RefuseCancel _ ->
+            Nothing
+
+        RefuseSubmit _ ->
+            Nothing
+
+        DecisionSaved _ _ ->
+            Nothing
+
+        Navigated _ ->
+            Nothing
+
+        ShowQueue ->
+            Nothing
+
+        ShowHistory ->
+            Nothing
+
+        HistoryPageLoaded _ _ ->
+            Nothing
+
+        HistoryNext _ ->
+            Nothing
+
+        SelectedViewLoaded _ _ ->
+            Nothing
+
+        StandingLoaded _ _ ->
+            Nothing
+
+        KeyDown _ _ ->
+            Nothing
+
+        SelectUnit _ ->
+            Nothing
+
+
+historyCompletion : Msg -> Maybe (Stamp Slot.LoadTicket)
+historyCompletion msg =
+    case msg of
+        PendingLoaded _ _ ->
+            Nothing
+
+        NextPage _ ->
+            Nothing
+
+        ApproveRow _ ->
+            Nothing
+
+        RefuseStart _ ->
+            Nothing
+
+        RefuseDraft _ _ ->
+            Nothing
+
+        RefuseCancel _ ->
+            Nothing
+
+        RefuseSubmit _ ->
+            Nothing
+
+        DecisionSaved _ _ ->
+            Nothing
+
+        Navigated _ ->
+            Nothing
+
+        ShowQueue ->
+            Nothing
+
+        ShowHistory ->
+            Nothing
+
+        HistoryPageLoaded stamped _ ->
+            Just stamped
+
+        HistoryNext _ ->
+            Nothing
+
+        SelectedViewLoaded _ _ ->
+            Nothing
+
+        StandingLoaded _ _ ->
+            Nothing
+
+        KeyDown _ _ ->
+            Nothing
+
+        SelectUnit _ ->
+            Nothing
+
+
+viewCompletion : Msg -> Maybe (Stamp Uid)
+viewCompletion msg =
+    case msg of
+        PendingLoaded _ _ ->
+            Nothing
+
+        NextPage _ ->
+            Nothing
+
+        ApproveRow _ ->
+            Nothing
+
+        RefuseStart _ ->
+            Nothing
+
+        RefuseDraft _ _ ->
+            Nothing
+
+        RefuseCancel _ ->
+            Nothing
+
+        RefuseSubmit _ ->
+            Nothing
+
+        DecisionSaved _ _ ->
+            Nothing
+
+        Navigated _ ->
+            Nothing
+
+        ShowQueue ->
+            Nothing
+
+        ShowHistory ->
+            Nothing
+
+        HistoryPageLoaded _ _ ->
+            Nothing
+
+        HistoryNext _ ->
+            Nothing
+
+        SelectedViewLoaded stamped _ ->
+            Just stamped
+
+        StandingLoaded _ _ ->
+            Nothing
+
+        KeyDown _ _ ->
+            Nothing
+
+        SelectUnit _ ->
+            Nothing
+
+
+standingCompletion : Msg -> Maybe (Stamp Standing.StandingKey)
+standingCompletion msg =
+    case msg of
+        PendingLoaded _ _ ->
+            Nothing
+
+        NextPage _ ->
+            Nothing
+
+        ApproveRow _ ->
+            Nothing
+
+        RefuseStart _ ->
+            Nothing
+
+        RefuseDraft _ _ ->
+            Nothing
+
+        RefuseCancel _ ->
+            Nothing
+
+        RefuseSubmit _ ->
+            Nothing
+
+        DecisionSaved _ _ ->
+            Nothing
+
+        Navigated _ ->
+            Nothing
+
+        ShowQueue ->
+            Nothing
+
+        ShowHistory ->
+            Nothing
+
+        HistoryPageLoaded _ _ ->
+            Nothing
+
+        HistoryNext _ ->
+            Nothing
+
+        SelectedViewLoaded _ _ ->
+            Nothing
+
+        StandingLoaded stamped _ ->
+            Just stamped
+
+        KeyDown _ _ ->
+            Nothing
+
+        SelectUnit _ ->
+            Nothing
+
+
+decisionCompletion : Msg -> Maybe (Stamp Uid)
+decisionCompletion msg =
+    case msg of
+        PendingLoaded _ _ ->
+            Nothing
+
+        NextPage _ ->
+            Nothing
+
+        ApproveRow _ ->
+            Nothing
+
+        RefuseStart _ ->
+            Nothing
+
+        RefuseDraft _ _ ->
+            Nothing
+
+        RefuseCancel _ ->
+            Nothing
+
+        RefuseSubmit _ ->
+            Nothing
+
+        DecisionSaved stamped _ ->
+            Just stamped
+
+        Navigated _ ->
+            Nothing
+
+        ShowQueue ->
+            Nothing
+
+        ShowHistory ->
+            Nothing
+
+        HistoryPageLoaded _ _ ->
+            Nothing
+
+        HistoryNext _ ->
+            Nothing
+
+        SelectedViewLoaded _ _ ->
+            Nothing
+
+        StandingLoaded _ _ ->
+            Nothing
+
+        KeyDown _ _ ->
+            Nothing
+
+        SelectUnit _ ->
+            Nothing
+
+
+-- Every effect `msgs` sent to `model` in turn return, in order.
+effectsOf : Settings.AppSettings -> List Msg -> Model -> List Effect
+effectsOf settings msgs model =
+    List.concat (Tuple.second (record settings msgs model))
+
+
+-- Whether every step of `msgs` sent to `model` returns no effect; vacuous
+-- `msgs` count as a start.
+startsNothing : Settings.AppSettings -> List Msg -> Model -> Bool
+startsNothing settings msgs model =
+    not (List.isEmpty msgs) && List.all List.isEmpty (Tuple.second (record settings msgs model))
+
+
+-- Whether two held stamps are the one stamp as `owns` (a slot's ownership
+-- rule, fixed to a process's epoch where the key type is known) sees it. The
+-- rule is passed in because a still-generic key type supports no equality.
+sameHeld : (Stamp key -> Maybe (Stamp key) -> Bool) -> Maybe (Stamp key) -> Maybe (Stamp key) -> Bool
+sameHeld owns a b =
+    case ( a, b ) of
+        ( Just x, Just y ) ->
+            owns x (Just y)
+
+        ( Nothing, Nothing ) ->
+            True
+
+        _ ->
+            False
+
+
+-- Whether `emitted` is exactly the one stamp `now`.
+emittedOnly : (Stamp key -> Maybe (Stamp key) -> Bool) -> List (Stamp key) -> Stamp key -> Bool
+emittedOnly owns emitted now =
+    case emitted of
+        [ only ] ->
+            owns only (Just now)
+
+        _ ->
+            False
+
+
+-- Whether `effects` start exactly the task stamped `held` for the slot
+-- `start` reads, and nothing else for it; no stamp held is no start.
+startsExactly : (Stamp key -> Maybe (Stamp key) -> Bool) -> (Effect -> Maybe (Stamp key)) -> Maybe (Stamp key) -> List Effect -> Bool
+startsExactly owns start held effects =
+    case held of
+        Just stamp ->
+            emittedOnly owns (List.filterMap start effects) stamp
+
+        Nothing ->
+            False
+
+
+-- Whether `effects` start no task for the slot `start` reads.
+startsNone : (Effect -> Maybe (Stamp key)) -> List Effect -> Bool
+startsNone start effects =
+    List.isEmpty (List.filterMap start effects)
+
+
+-- One step from `before` to `next` on `msg`, for the slot `held` reads:
+-- its effects carry the slot's new running stamp exactly once when the
+-- step took a stamp the slot did not hold or the slot's own completion
+-- started its want, and nothing for the slot otherwise; and a slot running
+-- under this process's epoch stops running only on its own completion.
+slotStepHolds : Epoch -> (Stamp key -> Maybe (Stamp key) -> Bool) -> (Model -> Maybe (Stamp key)) -> (Effect -> Maybe (Stamp key)) -> (Msg -> Maybe (Stamp key)) -> Msg -> Model -> Model -> List Effect -> Bool
+slotStepHolds epoch owns held start completes msg before next effects =
+    let
+        owned =
+            case completes msg of
+                Just arrived ->
+                    owns arrived (held before)
+
+                Nothing ->
+                    False
+
+        emitted =
+            List.filterMap start effects
+
+        wasRunning =
+            Slot.running epoch (held before)
+
+        startsOnce =
+            case held next of
+                Just now ->
+                    if not (sameHeld owns (held before) (Just now)) || owned then
+                        emittedOnly owns emitted now
+
+                    else
+                        List.isEmpty emitted
+
+                Nothing ->
+                    List.isEmpty emitted
+    in
+    startsOnce && (sameHeld owns wasRunning Nothing || sameHeld owns (Slot.running epoch (held next)) wasRunning || owned)
+
+
+-- Whether one step holds `slotStepHolds` for all five slots.
+stepHolds : Settings.AppSettings -> Msg -> Model -> Model -> List Effect -> Bool
+stepHolds settings msg before next effects =
+    slotStepHolds settings.epoch (Slot.owns settings.epoch) (\m -> Slot.runningLoad m.queueLoad) queueStart queueCompletion msg before next effects
+        && slotStepHolds settings.epoch (Slot.owns settings.epoch) (\m -> Slot.runningLoad m.historyLoad) historyStart historyCompletion msg before next effects
+        && slotStepHolds settings.epoch (Slot.owns settings.epoch) (\m -> Selected.runningView m.selectedView) viewStart viewCompletion msg before next effects
+        && slotStepHolds settings.epoch (Slot.owns settings.epoch) (\m -> Standing.runningStanding m.standing) standingStart standingCompletion msg before next effects
+        && slotStepHolds settings.epoch (Slot.owns settings.epoch) (\m -> DecisionSlot.savingStamp m.decision) decisionStart decisionCompletion msg before next effects
+
+
+-- Whether every step of `msgs` sent to `model` in turn holds `stepHolds`.
+effectsOncePerStep : Settings.AppSettings -> List Msg -> Model -> Bool
+effectsOncePerStep settings msgs model =
+    let
+        walked =
+            List.foldl
+                (\msg ( current, holds ) ->
+                    let
+                        ( next, effects ) =
+                            Session.step settings msg current
+                    in
+                    ( next, holds && stepHolds settings msg current next effects )
+                )
+                ( model, True )
+                msgs
+    in
+    Tuple.second walked
+
+
 -- What the unit page at the model's address shows, by name.
 pageTag : Model -> String
 pageTag model =
     case model.page of
         UnitPage raw ->
-            case App.unitPageState raw model of
+            case Session.unitPageState raw model of
                 UnitLoading ->
                     "loading"
 
@@ -267,7 +763,7 @@ queueModel units view =
 
 initialModel : Model
 initialModel =
-    App.initialModel
+    Session.initialModel
 
 
 -- The queue page showing `units` with card `selected` showing `view`.
@@ -285,7 +781,7 @@ cardModel units selected view =
 -- sends; none when that render draws no decision control for the unit.
 drawnOn : Model -> Uid -> (DecisionSlot.DecidableRow -> Msg) -> List Msg
 drawnOn drawnFrom unit control =
-    case App.decidableRow drawnFrom unit of
+    case Session.decidableRow drawnFrom unit of
         Just row ->
             [ control row ]
 
@@ -296,7 +792,7 @@ drawnOn drawnFrom unit control =
 -- `key` pressed on the render of `drawnFrom`, carrying the offers it drew.
 press : Model -> String -> Msg
 press drawnFrom key =
-    KeyDown (App.keyOffers drawnFrom) key
+    KeyDown (Session.keyOffers drawnFrom) key
 
 
 -- The render after Refuse is clicked on `unit` in the render of `drawnFrom`.
@@ -310,7 +806,7 @@ refusalOpened settings drawnFrom unit =
 -- drawn for; none when that render draws no panel on the unit.
 panelOn : Model -> Uid -> (DecisionSlot.DecidableRow -> Msg) -> List Msg
 panelOn drawnFrom unit control =
-    case App.keyOffers drawnFrom of
+    case Session.keyOffers drawnFrom of
         PanelDrawn (Just row) ->
             if DecisionSlot.rowUid row == unit then
                 [ control row ]
@@ -369,7 +865,7 @@ startsRefusal action =
 -- its keys, so a key pressed on it is read on that panel's row.
 panelKeysDrawn : Model -> Bool
 panelKeysDrawn model =
-    case App.keyOffers model of
+    case Session.keyOffers model of
         PanelDrawn (Just _) ->
             True
 
@@ -387,7 +883,7 @@ panelKeysDrawn model =
 -- message baked from it is not vacuous.
 offers : Model -> Uid -> Bool
 offers model unit =
-    App.decidableRow model unit /= Nothing
+    Session.decidableRow model unit /= Nothing
 
 
 -- `loaded` under another uid, a unit the page shown does not list.
@@ -435,6 +931,9 @@ unitEntriesDuringReadCoalesce settings a b =
         && pageTag entered == "loading"
         && inFlight returned == Just ( uc, Nothing )
         && pageTag returned == "loading"
+        && startsExactly (Slot.owns settings.epoch) viewStart (Selected.runningView first.selectedView) (effectsOf settings [ Navigated (unitAt ua) ] initialModel)
+        && startsNone viewStart (effectsOf settings [ Navigated (unitAt ub), Navigated (unitAt uc) ] first)
+        && startsExactly (Slot.owns settings.epoch) viewStart (Selected.runningView returned.selectedView) (effectsOf settings (viewDone settings.epoch ua (Ok (Just a))) entered)
 
 
 -- The queue card and the unit page read through one slot: a unit page entered
@@ -574,6 +1073,11 @@ decisionsSingleFlight settings a b =
         && DecisionSlot.notSavedOf settled.decision == Just SaveFailed
         && next.decision == savingSlot settings.epoch ua
         && lateOther.decision == savingSlot settings.epoch ua
+        && startsExactly (Slot.owns settings.epoch) decisionStart (DecisionSlot.savingStamp saving.decision) (effectsOf settings (drawnOn shown ua ApproveRow) shown)
+        && startsNothing settings (drawnOn shown ua ApproveRow ++ [ press saving "a" ]) saving
+        && startsNothing settings (drawnOn shown ua RefuseStart ++ draftOn (refusalOpened settings shown ua) ua "needs a test" ++ drawnOn shown ua RefuseSubmit) saving
+        && startsExactly (Slot.owns settings.epoch) decisionStart (DecisionSlot.savingStamp next.decision) (effectsOf settings (drawnOn settled ua ApproveRow) settled)
+        && startsNothing settings (decisionSavedFor settings.epoch b.unit.uid (Err (Error.conflict "boom"))) next
 
 
 -- The refusal panel opens only on an idle slot, through the busy check a
@@ -640,7 +1144,7 @@ refusalPanelLivesInIdleSlot settings a b file =
     offers shown ua
         && offers secondShown ub
         && offers (withRefusal file shown) file.uid
-        && startsRefusal (Keys.keyAction (App.keyMode (App.keyOffers saving) saving) "r")
+        && startsRefusal (Keys.keyAction (Session.keyMode (Session.keyOffers saving) saving) "r")
         && keyed == saving
         && keyed.decision == savingSlot settings.epoch ua
         && String.contains "Saving the decision…" (page keyed)
@@ -878,7 +1382,7 @@ staleDecisionTakesNoSlot settings a b file =
                 && DecisionSlot.pendingText ub model.decision == Nothing
                 && String.contains (Html.escapeHtml ("Decision not saved: " ++ Failure.saveFailureText failure)) (page model)
     in
-    App.decidableRow drafted ub == Nothing
+    Session.decidableRow drafted ub == Nothing
         && offers shown ua
         && offers secondShown ub
         && offers fileShown file.uid
@@ -1265,7 +1769,7 @@ unitFailure : Model -> Maybe LoadFailure
 unitFailure model =
     case model.page of
         UnitPage raw ->
-            case App.unitPageState raw model of
+            case Session.unitPageState raw model of
                 UnitFailed failure ->
                     Just failure
 
@@ -1507,7 +2011,7 @@ refuseDraftTyped settings a b =
             submit "needs a test"
 
         idleOpen draft =
-            Maybe.map (\row -> DecisionIdle (PanelOpen row draft)) (App.decidableRow shown ua)
+            Maybe.map (\row -> DecisionIdle (PanelOpen row draft)) (Session.decidableRow shown ua)
     in
     Just blank.decision == idleOpen { refuseDraft = Draft.draft "   ", refuseError = Just (DraftRefused ReasonBlank) }
         && String.contains (Failure.refuseFailureText (DraftRefused ReasonBlank)) (page blank)
@@ -1722,14 +2226,14 @@ decisionRefusedBeforeReading =
         a <- loadUnitNow (uid "u-a") |> Task.andThen requireUnit
         b <- loadUnitNow (uid "u-b") |> Task.andThen requireUnit
         file <- linkRow
-        offerA <- requireOffer (App.decidableRow (queueModel [ a, b ] (ViewShown a)) a.unit.uid)
-        offerB <- requireOffer (App.decidableRow (cardModel [ a, b ] 1 b) b.unit.uid)
-        offerFile <- requireOffer (App.decidableRow (withRefusal file (queueModel [ a, b ] (ViewShown a))) file.uid)
-        offList <- Task.succeed (App.decisionPlan (queueModel [ a ] (ViewShown a)) offerB)
-        notShown <- Task.succeed (App.decisionPlan (queueModel [ a, b ] (ViewShown a)) offerB)
-        fileOffList <- Task.succeed (App.decisionPlan (queueModel [ a, b ] (ViewShown a)) offerFile)
-        fileBlocking <- Task.succeed (App.decisionPlan (withRefusal { file | digest = Nothing } (queueModel [ a, b ] (ViewShown a))) offerFile)
-        whileReloading <- Task.succeed (App.decisionPlan (reloadingModel a) offerA)
+        offerA <- requireOffer (Session.decidableRow (queueModel [ a, b ] (ViewShown a)) a.unit.uid)
+        offerB <- requireOffer (Session.decidableRow (cardModel [ a, b ] 1 b) b.unit.uid)
+        offerFile <- requireOffer (Session.decidableRow (withRefusal file (queueModel [ a, b ] (ViewShown a))) file.uid)
+        offList <- Task.succeed (Session.decisionPlan (queueModel [ a ] (ViewShown a)) offerB)
+        notShown <- Task.succeed (Session.decisionPlan (queueModel [ a, b ] (ViewShown a)) offerB)
+        fileOffList <- Task.succeed (Session.decisionPlan (queueModel [ a, b ] (ViewShown a)) offerFile)
+        fileBlocking <- Task.succeed (Session.decisionPlan (withRefusal { file | digest = Nothing } (queueModel [ a, b ] (ViewShown a))) offerFile)
+        whileReloading <- Task.succeed (Session.decisionPlan (reloadingModel a) offerA)
         cleanupIndex at.indexDb at.repo
         removeFileIfAny at.reviewDb
         Task.succeed
@@ -1746,8 +2250,8 @@ decisionRefusedBeforeReading =
                 && savedRefusal (Failure.saved (Ok offList)) == Just NotQueued
                 && savedRefusal (Failure.saved (Ok notShown)) == Just SourceNotShown
                 && List.all (\( model, offer ) -> planFollowsGate model offer && refusedStartsNoTask settings model offer) [ ( queueModel [ a ] (ViewShown a), offerB ), ( queueModel [ a, b ] (ViewShown a), offerB ), ( queueModel [ a, b ] (ViewShown a), offerFile ), ( withRefusal { file | digest = Nothing } (queueModel [ a, b ] (ViewShown a)), offerFile ), ( reloadingModel a, offerA ) ]
-                && admittedAndPlanned (queueModel [ a, b ] (ViewShown a)) offerA (Maybe.map App.WriteUnit (DecisionSlot.offeredSource offerA (ViewShown a)))
-                && admittedAndPlanned (withRefusal file (queueModel [ a, b ] (ViewShown a))) offerFile (Maybe.map (App.WriteFile file.uid) (DecisionSlot.offeredRefusal offerFile))
+                && admittedAndPlanned (queueModel [ a, b ] (ViewShown a)) offerA (Maybe.map Session.WriteUnit (DecisionSlot.offeredSource offerA (ViewShown a)))
+                && admittedAndPlanned (withRefusal file (queueModel [ a, b ] (ViewShown a))) offerFile (Maybe.map (Session.WriteFile file.uid) (DecisionSlot.offeredRefusal offerFile))
             )
 
 
@@ -1759,7 +2263,7 @@ planFollowsGate : Model -> DecisionSlot.DecidableRow -> Bool
 planFollowsGate model offer =
     case gateOn model offer of
         Ok _ ->
-            refusalOf (App.decisionPlan model offer) == Nothing
+            refusalOf (Session.decisionPlan model offer) == Nothing
 
         Err _ ->
             True
@@ -1768,11 +2272,11 @@ planFollowsGate model offer =
 -- Whether the gate admits `offer` on `model` and its plan is `expected`,
 -- the write of exactly what the offer drew. Red if an admitted offer plans
 -- a source or digest other than the drawn one.
-admittedAndPlanned : Model -> DecisionSlot.DecidableRow -> Maybe App.DecisionPlan -> Bool
+admittedAndPlanned : Model -> DecisionSlot.DecidableRow -> Maybe Session.DecisionPlan -> Bool
 admittedAndPlanned model offer expected =
     case ( gateOn model offer, expected ) of
         ( Ok _, Just plan ) ->
-            App.decisionPlan model offer == Ok plan
+            Session.decisionPlan model offer == Ok plan
 
         _ ->
             False
@@ -1785,8 +2289,8 @@ gateOn model offer =
 
 -- Whether a click of `offer` on `model`, which the gate or the plan
 -- refuses, starts no task: the decision slot takes no save, so no task was
--- started, and it holds the notice of why. Red if a refused decision starts
--- a task.
+-- started, the step returns no effect, and it holds the notice of why. Red
+-- if a refused decision starts a task.
 refusedStartsNoTask : Settings.AppSettings -> Model -> DecisionSlot.DecidableRow -> Bool
 refusedStartsNoTask settings model offer =
     let
@@ -1794,6 +2298,7 @@ refusedStartsNoTask settings model offer =
             after settings [ ApproveRow offer ] model
     in
     DecisionSlot.savingStamp clicked.decision == Nothing
+        && startsNothing settings [ ApproveRow offer ] model
         && DecisionSlot.notSavedOf clicked.decision /= Nothing
 
 
@@ -2136,7 +2641,8 @@ notSavedOutlivesOlderLoad settings a b =
 -- start of the same task, one stamped by another start of this process,
 -- and one arriving at an idle slot. Each stamp comes from a real start.
 -- Red if any completion settles, restarts or clears a slot on a stamp
--- that is not the slot's running one, epoch and key alike.
+-- that is not the slot's running one, epoch and key alike, or returns
+-- any effect for it.
 staleCompletionDropped : Settings.AppSettings -> Epoch -> Index.UnitView -> Index.UnitView -> ( Index.Attested, Index.Written ) -> Bool
 staleCompletionDropped settings otherEpoch a b pair =
     let
@@ -2150,7 +2656,7 @@ staleCompletionDropped settings otherEpoch a b pair =
             Index.storedHash a.unit.attested
 
         unchangedBy msgs model =
-            not (List.isEmpty msgs) && after settings msgs model == model
+            startsNothing settings msgs model && after settings msgs model == model
 
         queuePage =
             Ok (queuePageOf [ a ])
@@ -2225,14 +2731,15 @@ staleCompletionDropped settings otherEpoch a b pair =
 
 
 -- `msgs` sent to `model` leave its queue load slot as it was, nothing
--- started and nothing wanted; vacuous `msgs` count as a change.
+-- started, no effect returned and nothing wanted; vacuous `msgs` count as
+-- a change.
 drainsNothing : Settings.AppSettings -> List Msg -> Model -> Bool
 drainsNothing settings msgs model =
     let
         saved =
             after settings msgs model
     in
-    not (List.isEmpty msgs)
+    startsNothing settings msgs model
         && saved.queueLoad == model.queueLoad
         && Slot.runningWant settings.epoch saved.queueLoad == Slot.runningWant settings.epoch model.queueLoad
 
@@ -2241,8 +2748,9 @@ drainsNothing settings msgs model =
 -- runs: a save result whose stamp the slot does not hold, from another
 -- process, another unit's save, or a slot already idle or refreshing,
 -- leaves the queue's load slot as it was and wants no drain, while the
--- slot's own save wants exactly one. Red if an unowned `DecisionSaved Ok`
--- starts or records a drain.
+-- slot's own save wants exactly one, held behind the running load rather
+-- than started beside it. Red if an unowned `DecisionSaved Ok` starts or
+-- records a drain, or returns a `LoadQueue`.
 unownedDecisionSavedDrainsNothing : Settings.AppSettings -> Epoch -> Index.UnitView -> Index.UnitView -> ( Index.Attested, Index.Written ) -> Bool
 unownedDecisionSavedDrainsNothing settings otherEpoch a b ( attested, written ) =
     let
@@ -2278,10 +2786,11 @@ unownedDecisionSavedDrainsNothing settings otherEpoch a b ( attested, written ) 
         && drainsNothing settings (decisionDone settings.epoch ua (Ok ( attested, written ))) refreshing
         && Slot.runningWant settings.epoch loading.queueLoad == Just Nothing
         && Slot.runningWant settings.epoch owned.queueLoad == Just drain
+        && startsNone queueStart (effectsOf settings (decisionDone settings.epoch ua (Ok ( attested, written ))) loading)
 
 
 -- A decision slot settles a save result only under its own stamp, apart
--- from the gate `App.update` holds before it: a result another process
+-- from the gate `Session.step` holds before it: a result another process
 -- stamped, one for another unit, or one reaching a slot that is not saving
 -- leaves the slot unchanged and wants no reload. Red if `decisionWritten`
 -- or `decisionNotSaved` settles a result its slot does not own.
@@ -2353,6 +2862,7 @@ writtenChecks =
             , ( "a completion its slot does not own leaves the model unchanged, for each of the five completions", staleCompletionDropped settings otherEpoch a b pair )
             , ( "a saved decision whose stamp its slot does not hold drains nothing", unownedDecisionSavedDrainsNothing settings otherEpoch a b pair )
             , ( "a decision slot settles only the save result its own stamp names", decisionSlotOwnsItsResult settings otherEpoch )
+            , ( "every step returns each slot's new task once and no other", effectOncePerTransition settings otherEpoch a b pair )
             ]
 
 
@@ -2363,8 +2873,9 @@ checks =
         seededChecks
         (check "a decision off the shown list or source is refused before any read" decisionRefusedBeforeReading)
         |> Task.andThen (\rows -> check "Enter in an unreviewable file's refusal panel submits that file's refusal" enterRefusesOpenFile |> Task.map (\entered -> rows ++ [ entered ]))
-        |> Task.andThen (\rows -> check "every task in src starts at its slot's one start site" everyTaskStartsAtItsSlot |> Task.map (\scanned -> rows ++ [ scanned ]))
+        |> Task.andThen (\rows -> check "the session starts no task, and only the interpreter's run and update do" sessionStartsNothing |> Task.map (\scanned -> rows ++ [ scanned ]))
         |> Task.andThen (\rows -> check "every completion stamp in src is minted at its slot's one start" everyStampMintedAtItsStart |> Task.map (\scanned -> rows ++ [ scanned ]))
+        |> Task.andThen (\rows -> check "the session's effects are its five slots, within the runtime's session task ceiling" effectSlotsUnderCeiling |> Task.map (\scanned -> rows ++ [ scanned ]))
 
 
 -- Enter in the refusal panel open on an acknowledgeable file the page lists
@@ -2398,7 +2909,7 @@ enteredOnFile settings listed =
         entered =
             after settings [ press drafted "Enter" ] drafted
     in
-    Maybe.map DecisionSlot.rowTarget (App.decidableRow listed file) == Just OnRefusal
+    Maybe.map DecisionSlot.rowTarget (Session.decidableRow listed file) == Just OnRefusal
         && DecisionSlot.openPanel drafted.decision == Just ( file, { refuseDraft = Draft.draft "not ours", refuseError = Nothing } )
         && entered.decision == savingSlot settings.epoch file
         && DecisionSlot.openPanel entered.decision == Nothing
@@ -2442,6 +2953,7 @@ seededChecks =
             , ( "source reads settling during a standing read start no second standing read", standingSingleFlight settings a b )
             , ( "a load slot or standing read held under another process's epoch is idle", foreignLoadSlotIdle settings otherEpoch a )
             , ( "a queue load refused with an error frees its slot", ceilingRefusalReleasesSlot settings )
+            , ( "a request made while a slot runs returns no task, and the held want starts once", secondRequestHeldNotStarted settings a b )
             ]
         )
         |> Task.andThen (\rows -> writtenChecks |> Task.map (\written -> rows ++ written))
@@ -2497,7 +3009,7 @@ staleApproveAfterSourceReloadDecidesNothing r =
     in
     offers shown ua
         && offers reloaded ua
-        && App.decidableRow shown ua /= App.decidableRow reloaded ua
+        && Session.decidableRow shown ua /= Session.decidableRow reloaded ua
         && DecisionSlot.notSavedOf stale.decision == Just (SaveRefused DrawnChanged)
         && stale.decision /= savingSlot r.settings.epoch ua
         && String.contains (Html.escapeHtml ("Decision not saved: " ++ Failure.saveFailureText (SaveRefused DrawnChanged))) (page stale)
@@ -2662,13 +3174,13 @@ confirmRefuseBindsDrawnPanelRow r =
             after r.settings (drawnOn reloaded ua RefuseStart ++ draftOn (refusalOpened r.settings reloaded ua) ua "needs a test") reloaded
 
         fileOffer =
-            App.decidableRow (withRefusal r.file reloaded) r.file.uid
+            Session.decidableRow (withRefusal r.file reloaded) r.file.uid
 
         confirmed =
             after r.settings [ press drafted "Enter" ] drafted
 
         withPanel panel =
-            after r.settings [ KeyDown (App.PanelDrawn panel) "Enter" ] drafted
+            after r.settings [ KeyDown (Session.PanelDrawn panel) "Enter" ] drafted
 
         clickedFile =
             after r.settings (drawnOn (withRefusal r.file reloaded) r.file.uid RefuseSubmit) drafted
@@ -2676,7 +3188,7 @@ confirmRefuseBindsDrawnPanelRow r =
     panelKeysDrawn drafted
         && fileOffer /= Nothing
         && confirmed.decision == savingSlot r.settings.epoch ua
-        && withPanel (App.decidableRow shown ua) == drafted
+        && withPanel (Session.decidableRow shown ua) == drafted
         && withPanel fileOffer == drafted
         && clickedFile == drafted
         && DecisionSlot.openPanel drafted.decision == Just ( ua, { refuseDraft = Draft.draft "needs a test", refuseError = Nothing } )
@@ -2763,14 +3275,14 @@ keyOffersFollowTheDrawing r =
     offers shown ua
         && history.page == HistoryPage
         && loading.queueState == Loading
-        && App.keyOffers history == App.NothingDrawn
-        && App.keyOffers unitPage == App.NothingDrawn
-        && App.keyOffers opened == App.PanelDrawn (App.decidableRow shown ua)
-        && App.keyOffers reading == App.CardsDrawn (Just { uid = ua, offer = Nothing })
-        && App.keyOffers loading == App.CardsDrawn Nothing
-        && App.keyOffers shown == App.CardsDrawn (Just { uid = ua, offer = App.decidableRow shown ua })
+        && Session.keyOffers history == Session.NothingDrawn
+        && Session.keyOffers unitPage == Session.NothingDrawn
+        && Session.keyOffers opened == Session.PanelDrawn (Session.decidableRow shown ua)
+        && Session.keyOffers reading == Session.CardsDrawn (Just { uid = ua, offer = Nothing })
+        && Session.keyOffers loading == Session.CardsDrawn Nothing
+        && Session.keyOffers shown == Session.CardsDrawn (Just { uid = ua, offer = Session.decidableRow shown ua })
         && panelKeysDrawn fileOpened
-        && App.keyOffers stale == App.PanelDrawn Nothing
+        && Session.keyOffers stale == Session.PanelDrawn Nothing
         && List.all (\m -> panelKeysDrawn m == panelDrawn (page m)) [ shown, reloaded, history, unitPage, opened, stale, reading, loading, listed, fileOpened ]
 
 
@@ -2779,7 +3291,7 @@ keyOffersFollowTheDrawing r =
 -- that panel on every queue-page receipt; a drawn card is read as an undrawn
 -- panel while a panel is open at receipt, as shortcuts on that card over the
 -- cards held, and as nothing while the queue loads. Red if any precedence of
--- `App.keyMode` moves.
+-- `Session.keyMode` moves.
 keyModeTable : Reshown -> Bool
 keyModeTable r =
     let
@@ -2790,7 +3302,7 @@ keyModeTable r =
             queueModel [ r.a, r.b ] (ViewShown r.a)
 
         rowA =
-            App.decidableRow shown ua
+            Session.decidableRow shown ua
 
         cardA =
             { uid = ua, offer = rowA }
@@ -2808,7 +3320,7 @@ keyModeTable r =
             [ opened, shown, loading ]
 
         cell =
-            \drawn receipt expected -> Just (App.keyMode drawn receipt) == expected
+            \drawn receipt expected -> Just (Session.keyMode drawn receipt) == expected
 
         dormant =
             Just Keys.Dormant
@@ -2820,16 +3332,16 @@ keyModeTable r =
         && history.page == HistoryPage
         && DecisionSlot.openPanel opened.decision /= Nothing
         && loading.queueState == Loading
-        && List.all (\drawn -> cell drawn history dormant) [ App.NothingDrawn, App.PanelDrawn rowA, App.PanelDrawn Nothing, App.CardsDrawn (Just cardA), App.CardsDrawn Nothing ]
-        && List.all (\receipt -> cell App.NothingDrawn receipt dormant) onQueue
-        && List.all (\receipt -> cell (App.PanelDrawn rowA) receipt (Just (Keys.InPanel rowA))) onQueue
-        && List.all (\receipt -> cell (App.PanelDrawn Nothing) receipt (Just (Keys.InPanel Nothing))) onQueue
-        && cell (App.CardsDrawn (Just cardA)) opened (Just (Keys.InPanel Nothing))
-        && cell (App.CardsDrawn (Just cardA)) shown (onCards (Just cardA))
-        && cell (App.CardsDrawn (Just cardA)) loading dormant
-        && cell (App.CardsDrawn Nothing) opened (Just (Keys.InPanel Nothing))
-        && cell (App.CardsDrawn Nothing) shown (onCards Nothing)
-        && cell (App.CardsDrawn Nothing) loading dormant
+        && List.all (\drawn -> cell drawn history dormant) [ Session.NothingDrawn, Session.PanelDrawn rowA, Session.PanelDrawn Nothing, Session.CardsDrawn (Just cardA), Session.CardsDrawn Nothing ]
+        && List.all (\receipt -> cell Session.NothingDrawn receipt dormant) onQueue
+        && List.all (\receipt -> cell (Session.PanelDrawn rowA) receipt (Just (Keys.InPanel rowA))) onQueue
+        && List.all (\receipt -> cell (Session.PanelDrawn Nothing) receipt (Just (Keys.InPanel Nothing))) onQueue
+        && cell (Session.CardsDrawn (Just cardA)) opened (Just (Keys.InPanel Nothing))
+        && cell (Session.CardsDrawn (Just cardA)) shown (onCards (Just cardA))
+        && cell (Session.CardsDrawn (Just cardA)) loading dormant
+        && cell (Session.CardsDrawn Nothing) opened (Just (Keys.InPanel Nothing))
+        && cell (Session.CardsDrawn Nothing) shown (onCards Nothing)
+        && cell (Session.CardsDrawn Nothing) loading dormant
 
 
 -- Every key pressed on a History render and received on the queue page, or
@@ -2902,7 +3414,7 @@ staleDraftEditLandsNowhere r =
     in
     offers shown ua
         && draftOn firstOpened ua "x" /= []
-        && App.decidableRow shown ua /= App.decidableRow reloaded ua
+        && Session.decidableRow shown ua /= Session.decidableRow reloaded ua
         && DecisionSlot.openPanel reopened.decision == Just ( ua, { refuseDraft = Draft.empty, refuseError = Nothing } )
         && after r.settings (draftOn firstOpened ua "x") reopened == reopened
         && DecisionSlot.openPanel (after r.settings (draftOn reopened ua "x") reopened).decision == Just ( ua, { refuseDraft = Draft.draft "x", refuseError = Nothing } )
@@ -2950,11 +3462,99 @@ escapeBeforePanelDrawnKeepsPanel r =
 -- before any database is opened, the gate before the slot refuses both
 -- offers too, and neither click starts a task. Red if the plan reads the
 -- model's current source or the page's digest.
-reshownPlanRefusals : Result DecideRefusal App.DecisionPlan -> Result DecideRefusal App.DecisionPlan -> Bool -> Bool
+reshownPlanRefusals : Result DecideRefusal Session.DecisionPlan -> Result DecideRefusal Session.DecisionPlan -> Bool -> Bool
 reshownPlanRefusals unitDrift fileDrift gated =
     refusalOf unitDrift == Just DrawnChanged
         && refusalOf fileDrift == Just DrawnChanged
         && gated
+
+
+-- Every refusal of a decision before its slot returns no effect: one asked
+-- on the unit page or History, one on a read-only server, one whose drawn
+-- source was read again since, one on a row the page does not list, and
+-- one asked while another decision is saving. The same approval on the
+-- page it was drawn on returns exactly one save, the positive control.
+-- The plan's own refusal is reached on no model these checks build, which
+-- `decidableImpliesPlan` pins. Red if a refused decision returns a task.
+refusedDecisionEmitsNoEffect : Reshown -> Bool
+refusedDecisionEmitsNoEffect r =
+    let
+        settings =
+            r.settings
+
+        ua =
+            r.a.unit.uid
+
+        ub =
+            r.b.unit.uid
+
+        shown =
+            queueModel [ r.a, r.b ] (ViewShown r.a)
+
+        approve =
+            drawnOn shown ua ApproveRow
+
+        ( _, reloaded ) =
+            reshownCard r
+
+        saving =
+            after settings approve shown
+
+        unlisted =
+            drawnOn (cardModel [ r.a, r.b ] 1 r.b) ub ApproveRow
+    in
+    offers shown ua
+        && startsNothing settings approve { shown | page = unitAt ua }
+        && startsNothing settings approve { shown | page = HistoryPage }
+        && startsNothing { settings | key = ReadOnly } approve shown
+        && startsNothing settings approve reloaded
+        && startsNothing settings unlisted (queueModel [ r.a ] (ViewShown r.a))
+        && startsNothing settings approve saving
+        && DecisionSlot.notSavedOf (after settings approve reloaded).decision == Just (SaveRefused DrawnChanged)
+        && startsExactly (Slot.owns settings.epoch) decisionStart (DecisionSlot.savingStamp saving.decision) (effectsOf settings approve shown)
+
+
+-- Over every model these checks build and every offer any of them draws,
+-- an offer the gate before the slot admits is one `decisionPlan` plans, so
+-- the plan's refusal in `saveDecision` is a second edge no session reaches
+-- first. Red if the gate admits an offer its plan refuses.
+decidableImpliesPlan : Reshown -> Bool
+decidableImpliesPlan r =
+    let
+        ( _, reloaded ) =
+            reshownCard r
+
+        file =
+            r.file
+
+        models =
+            [ queueModel [ r.a, r.b ] (ViewShown r.a)
+            , cardModel [ r.a, r.b ] 1 r.b
+            , queueModel [ r.a ] (ViewShown r.a)
+            , queueModel [ r.a2, r.b ] (ViewShown r.a2)
+            , reloaded
+            , reloadingModel r.a
+            , withRefusal r.file (queueModel [ r.a, r.b ] (ViewShown r.a))
+            , withRefusal r.file2 (queueModel [ r.a, r.b ] (ViewShown r.a))
+            , withRefusal { file | digest = Nothing } (queueModel [ r.a, r.b ] (ViewShown r.a))
+            ]
+
+        offersDrawn =
+            List.concatMap (\model -> List.filterMap (Session.decidableRow model) [ r.a.unit.uid, r.b.unit.uid, r.file.uid ]) models
+    in
+    List.length offersDrawn >= 4
+        && List.all (\model -> List.all (planFollowsGate model) offersDrawn) models
+        && List.any (\model -> List.any (gateAdmits model) offersDrawn) models
+
+
+gateAdmits : Model -> DecisionSlot.DecidableRow -> Bool
+gateAdmits model offer =
+    case gateOn model offer of
+        Ok _ ->
+            True
+
+        Err _ ->
+            False
 
 
 reshownChecks : Task.Task Error (List ( String, Bool ))
@@ -2973,17 +3573,17 @@ reshownChecks =
         writeFileText (at.repo ++ "/src/Lib.rs") (String.replace "42" "43" fixtureLibRs)
         execIndex at.indexDb "UPDATE units SET body_hash = ? WHERE uid = ?" [ SqlString (Index.attest (String.replace "42" "43" viewA)), Uid.toSql (uid "u-a") ]
         a2 <- loadUnitNow (uid "u-a") |> Task.andThen requireUnit
-        offerA <- requireOffer (App.decidableRow (queueModel [ a, b ] (ViewShown a)) a.unit.uid)
-        offerFile <- requireOffer (App.decidableRow (withRefusal file (queueModel [ a, b ] (ViewShown a))) file.uid)
-        unitDrift <- Task.succeed (App.decisionPlan (queueModel [ a2, b ] (ViewShown a2)) offerA)
-        fileDrift <- Task.succeed (App.decisionPlan (withRefusal file2 (queueModel [ a, b ] (ViewShown a))) offerFile)
+        offerA <- requireOffer (Session.decidableRow (queueModel [ a, b ] (ViewShown a)) a.unit.uid)
+        offerFile <- requireOffer (Session.decidableRow (withRefusal file (queueModel [ a, b ] (ViewShown a))) file.uid)
+        unitDrift <- Task.succeed (Session.decisionPlan (queueModel [ a2, b ] (ViewShown a2)) offerA)
+        fileDrift <- Task.succeed (Session.decisionPlan (withRefusal file2 (queueModel [ a, b ] (ViewShown a))) offerFile)
         gated <- Task.succeed (List.all (\( model, offer ) -> planFollowsGate model offer && refusedStartsNoTask settings model offer) [ ( queueModel [ a2, b ] (ViewShown a2), offerA ), ( withRefusal file2 (queueModel [ a, b ] (ViewShown a)), offerFile ) ])
         cleanupIndex at.indexDb at.repo
         removeFileIfAny at.reviewDb
         Task.succeed (reshownRows { settings = settings, a = a, a2 = a2, b = b, file = file, file2 = file2 } unitDrift fileDrift gated)
 
 
-reshownRows : Reshown -> Result DecideRefusal App.DecisionPlan -> Result DecideRefusal App.DecisionPlan -> Bool -> List ( String, Bool )
+reshownRows : Reshown -> Result DecideRefusal Session.DecisionPlan -> Result DecideRefusal Session.DecisionPlan -> Bool -> List ( String, Bool )
 reshownRows r unitDrift fileDrift gated =
     [ ( "an approval drawn before the source was read again decides nothing", staleApproveAfterSourceReloadDecidesNothing r )
     , ( "an approval drawn after the source was read again saves", freshApproveAfterSourceReloadSaves r )
@@ -3001,6 +3601,8 @@ reshownRows r unitDrift fileDrift gated =
     , ( "navigation keys compose before the page redraws", navigationComposesBeforeRedraw r )
     , ( "Escape pressed before a panel was drawn keeps the panel", escapeBeforePanelDrawnKeepsPanel r )
     , ( "a decision plan binds the drawn source and digest before any read", reshownPlanRefusals unitDrift fileDrift gated )
+    , ( "every decision refused before its slot returns no effect", refusedDecisionEmitsNoEffect r )
+    , ( "every offer the gate before the slot admits is one its plan writes", decidableImpliesPlan r )
     ]
 
 
@@ -3030,6 +3632,7 @@ idlePressStartsOneLoad settings =
     Slot.latestTicket running.queueLoad == Slot.nextTicket (Slot.latestTicket initialModel.queueLoad)
         && Slot.runningWant settings.epoch running.queueLoad == Just Nothing
         && Slot.runningWant settings.epoch initialModel.queueLoad == Nothing
+        && startsExactly (Slot.owns settings.epoch) queueStart (Slot.runningLoad running.queueLoad) (effectsOf settings [ Navigated QueuePage ] initialModel)
 
 
 -- Pages turned, the queue shown again and a unit page entered while a queue
@@ -3056,6 +3659,8 @@ queueLoadsSingleFlight settings a =
         && Slot.runningWant settings.epoch pressed.queueLoad == Just (Just (QueueReload (cursorAfter 2 "u-b")))
         && Slot.latestTicket entered.queueLoad == inFlightTicket
         && Slot.runningWant settings.epoch entered.queueLoad == Just Nothing
+        && startsNone queueStart (effectsOf settings [ ShowQueue, NextPage (cursorAfter 1 "u-a"), NextPage (cursorAfter 2 "u-b") ] running)
+        && startsNone queueStart (effectsOf settings [ Navigated (unitAt a.unit.uid) ] running)
 
 
 -- The running queue load's page returning while another page is wanted is
@@ -3094,6 +3699,10 @@ supersededQueueResultDropped settings a b =
         && Slot.latestTicket late.queueLoad == Slot.latestTicket dropped.queueLoad
         && settled.queueState == Loaded (queuePageOf [ b ])
         && Slot.runningWant settings.epoch settled.queueLoad == Nothing
+        && startsNone queueStart (effectsOf settings [ NextPage (cursorAfter 2 "u-b") ] running)
+        && startsExactly (Slot.owns settings.epoch) queueStart (Slot.runningLoad dropped.queueLoad) (effectsOf settings (completions PendingLoaded firstLoad (Ok (queuePageOf [ a, b ]))) wanting)
+        && startsNone queueStart (effectsOf settings (completions PendingLoaded firstLoad (Ok (queuePageOf [ a, b ]))) dropped)
+        && startsNone queueStart (effectsOf settings (queueDone dropped.queueLoad (Ok (queuePageOf [ b ]))) late)
 
 
 -- A decision saved while a queue load runs waits for the drain: the load
@@ -3127,6 +3736,8 @@ refreshingSettlesOnlyAfterWrite settings a b ( attested, written ) =
         && Slot.runningWant settings.epoch preWrite.queueLoad == Just Nothing
         && drained.decision == DecisionIdle PanelClosed
         && drained.queueState == Loaded (queuePageOf [ b ])
+        && startsNone queueStart (effectsOf settings (decisionDone settings.epoch ua (Ok ( attested, written ))) loadingWhileSaving)
+        && startsExactly (Slot.owns settings.epoch) queueStart (Slot.runningLoad preWrite.queueLoad) (effectsOf settings (queueDone loadingWhileSaving.queueLoad (Ok (queuePageOf [ a, b ]))) saved)
 
 
 -- A wanted drain absorbs a reload asked after it, taking the reload's
@@ -3213,6 +3824,11 @@ historyLoadsSingleFlight settings =
         && historyFailure settled.history == Nothing
         && settled.history /= HistoryLoading
         && Slot.runningWant settings.epoch settled.historyLoad == Nothing
+        && startsExactly (Slot.owns settings.epoch) historyStart firstLoad (effectsOf settings [ Navigated HistoryPage ] initialModel)
+        && startsNone historyStart (effectsOf settings [ ShowHistory, HistoryNext (historyAfter 1), HistoryNext (historyAfter 2) ] running)
+        && startsNothing settings (completions App.historyLoaded otherLoad (Ok historyPage)) pressed
+        && startsExactly (Slot.owns settings.epoch) historyStart (Slot.runningLoad dropped.historyLoad) (effectsOf settings (completions App.historyLoaded firstLoad (Ok historyPage)) stale)
+        && startsNone historyStart (effectsOf settings (historyLoadedOn dropped.historyLoad (Ok { historyPage | at = historyAfter 2 })) dropped)
 
 
 -- Two source reads settling on the unit page while a standing read runs
@@ -3255,6 +3871,10 @@ standingSingleFlight settings a b =
         && firstReturned.standing == standingReading settings.epoch ub hashB
         && stale.standing == standingReading settings.epoch ub hashB
         && shown.standing == StandingShown ub hashB Standing.Undecided
+        && startsNone standingStart (effectsOf settings ([ Navigated (unitAt ub) ] ++ viewDone settings.epoch ub (Ok (Just b))) reading)
+        && startsExactly (Slot.owns settings.epoch) standingStart (Standing.runningStanding firstReturned.standing) (effectsOf settings (standingLoadedFor settings.epoch ua hashA (Ok Standing.Undecided)) second)
+        && startsNothing settings (standingLoadedFor settings.epoch ua hashA (Ok Standing.Undecided)) firstReturned
+        && startsNone standingStart (effectsOf settings (standingLoadedFor settings.epoch ub hashB (Ok Standing.Undecided)) stale)
 
 
 -- A load slot or standing read held under another process's epoch is idle:
@@ -3318,6 +3938,8 @@ foreignLoadSlotIdle settings otherEpoch a =
         && Slot.runningWant settings.epoch entered.queueLoad == Just Nothing
         && arrived.queueState == Loading
         && foreignLoad /= Nothing
+        && startsExactly (Slot.owns settings.epoch) queueStart (Slot.runningLoad entered.queueLoad) (effectsOf settings [ Navigated QueuePage ] held)
+        && startsNothing settings (completions PendingLoaded foreignLoad (Ok (queuePageOf [ a ]))) held
         && Standing.standingRequested settings.epoch ua hashA foreignRead == Standing.standingRequested settings.epoch ua hashA StandingUnread
         && foreignArrived == ( foreignRead, Nothing )
 
@@ -3356,47 +3978,291 @@ ceilingRefusalReleasesSlot settings =
         && refusedWithWant.queueState == Loading
         && Slot.latestTicket refusedWithWant.queueLoad == Slot.nextTicket first
         && Slot.runningWant settings.epoch refusedWithWant.queueLoad == Just Nothing
+        && startsNone queueStart (effectsOf settings (completions App.queueLoaded firstLoad (Err limitMarker)) running)
+        && startsExactly (Slot.owns settings.epoch) queueStart (Slot.runningLoad pressedAfter.queueLoad) (effectsOf settings [ Navigated QueuePage ] refused)
+        && startsExactly (Slot.owns settings.epoch) queueStart (Slot.runningLoad refusedWithWant.queueLoad) (effectsOf settings (completions App.queueLoaded firstLoad (Err limitMarker)) wanting)
 
 
--- ── every task starts at its slot ───────────────────────────────────────
--- A task starts in `src` only through `Cmd.perform`, and only inside the
--- slot-transition definitions of `Lib/App.ipe`, each the one start site of
--- its slot. `Task.attempt` lowers to the same start, so any use of it is
--- stray, and the Cmd module is imported under its own name exposing
--- nothing, so no other spelling starts a task. The modules are lexed as Ipê
--- reads them, so a mention in a comment or a string is no site.
-taskStartSites : List String
-taskStartSites =
-    [ "loadViewCmd", "saveDecision", "queueStep", "historyStep", "standingStep" ]
+-- ── each task is an effect of exactly one transition ────────────────────
+-- A second request on each of the five slots while the first runs returns
+-- no effect for that slot: the queue and History requests are held as the
+-- slot's want, a second unit page is recorded as the unit wanted after the
+-- read, a second body's standing is held, and a second decision is refused
+-- busy. The running task's own completion then starts the held want as
+-- exactly one effect, stamped with the slot's new running stamp. Red if a
+-- request made while a slot runs returns a task for it, or a held want is
+-- started twice or never.
+secondRequestHeldNotStarted : Settings.AppSettings -> Index.UnitView -> Index.UnitView -> Bool
+secondRequestHeldNotStarted settings a b =
+    let
+        ua =
+            a.unit.uid
+
+        ub =
+            b.unit.uid
+
+        hashA =
+            Index.storedHash a.unit.attested
+
+        c2 =
+            cursorAfter 2 "u-b"
+
+        historyPage =
+            { rows = [], at = LibDb.HistoryStart, next = Nothing, log = LibDb.ShownProven }
+
+        queueRunning =
+            after settings [ Navigated QueuePage ] initialModel
+
+        queueWanting =
+            after settings [ NextPage c2 ] queueRunning
+
+        queueRestarted =
+            after settings (queueDone queueRunning.queueLoad (Ok (queuePageOf [ a ]))) queueWanting
+
+        historyRunning =
+            after settings [ Navigated HistoryPage ] initialModel
+
+        historyWanting =
+            after settings [ HistoryNext (historyAfter 2) ] historyRunning
+
+        historyRestarted =
+            after settings (historyLoadedOn historyRunning.historyLoad (Ok historyPage)) historyWanting
+
+        listed =
+            queueModel [ a, b ] NoneSelected
+
+        viewRunning =
+            after settings [ Navigated (unitAt ua) ] listed
+
+        viewWanting =
+            after settings [ Navigated (unitAt ub) ] viewRunning
+
+        viewRestarted =
+            after settings (viewDone settings.epoch ua (Ok (Just a))) viewWanting
+
+        standingRunning =
+            after settings (viewDone settings.epoch ua (Ok (Just a))) viewRunning
+
+        secondBody =
+            [ Navigated (unitAt ub) ] ++ viewDone settings.epoch ub (Ok (Just b))
+
+        standingWanting =
+            after settings secondBody standingRunning
+
+        standingRestarted =
+            after settings (standingLoadedFor settings.epoch ua hashA (Ok Standing.Undecided)) standingWanting
+
+        shown =
+            queueModel [ a, b ] (ViewShown a)
+
+        approve =
+            drawnOn shown ua ApproveRow
+
+        saving =
+            after settings approve shown
+    in
+    startsExactly (Slot.owns settings.epoch) queueStart (Slot.runningLoad queueRunning.queueLoad) (effectsOf settings [ Navigated QueuePage ] initialModel)
+        && startsNone queueStart (effectsOf settings [ NextPage c2, ShowQueue ] queueRunning)
+        && Slot.runningWant settings.epoch queueWanting.queueLoad == Just (Just (QueueReload c2))
+        && startsExactly (Slot.owns settings.epoch) queueStart (Slot.runningLoad queueRestarted.queueLoad) (effectsOf settings (queueDone queueRunning.queueLoad (Ok (queuePageOf [ a ]))) queueWanting)
+        && startsExactly (Slot.owns settings.epoch) historyStart (Slot.runningLoad historyRunning.historyLoad) (effectsOf settings [ Navigated HistoryPage ] initialModel)
+        && startsNone historyStart (effectsOf settings [ HistoryNext (historyAfter 2), ShowHistory ] historyRunning)
+        && Slot.runningWant settings.epoch historyWanting.historyLoad == Just (Just (HistoryFrom (historyAfter 2)))
+        && startsExactly (Slot.owns settings.epoch) historyStart (Slot.runningLoad historyRestarted.historyLoad) (effectsOf settings (historyLoadedOn historyRunning.historyLoad (Ok historyPage)) historyWanting)
+        && startsExactly (Slot.owns settings.epoch) viewStart (Selected.runningView viewRunning.selectedView) (effectsOf settings [ Navigated (unitAt ua) ] listed)
+        && startsNone viewStart (effectsOf settings [ Navigated (unitAt ub) ] viewRunning)
+        && inFlight viewWanting == Just ( ua, Just ub )
+        && startsExactly (Slot.owns settings.epoch) viewStart (Selected.runningView viewRestarted.selectedView) (effectsOf settings (viewDone settings.epoch ua (Ok (Just a))) viewWanting)
+        && startsExactly (Slot.owns settings.epoch) standingStart (Standing.runningStanding standingRunning.standing) (effectsOf settings (viewDone settings.epoch ua (Ok (Just a))) viewRunning)
+        && startsNone standingStart (effectsOf settings secondBody standingRunning)
+        && startsExactly (Slot.owns settings.epoch) standingStart (Standing.runningStanding standingRestarted.standing) (effectsOf settings (standingLoadedFor settings.epoch ua hashA (Ok Standing.Undecided)) standingWanting)
+        && startsExactly (Slot.owns settings.epoch) decisionStart (DecisionSlot.savingStamp saving.decision) (effectsOf settings approve shown)
+        && startsNothing settings approve saving
+        && saving.decision == savingSlot settings.epoch ua
 
 
--- The module, relative to `src`, that holds every start site.
-taskStartModule : String
-taskStartModule =
+-- Over the scripted sequences of the single-flight checks, every step
+-- returns, for each of the five slots, the slot's new running stamp exactly
+-- once when it took a stamp it did not hold or its own completion started
+-- its want, and no effect for the slot otherwise; and a slot running under
+-- this process's epoch stops running only on its own completion. The
+-- scripts cover a press and a page turn on every load slot, a completion
+-- owned, superseded, foreign and late, a refused load, a unit page entered
+-- twice, a second body's standing, a second decision, a saved decision's
+-- drain started and held, and a failed save followed by a new one. Red if
+-- a start is returned twice, a step returns a start no transition made, or
+-- a slot is cleared without its completion.
+effectOncePerTransition : Settings.AppSettings -> Epoch -> Index.UnitView -> Index.UnitView -> ( Index.Attested, Index.Written ) -> Bool
+effectOncePerTransition settings otherEpoch a b pair =
+    let
+        ua =
+            a.unit.uid
+
+        ub =
+            b.unit.uid
+
+        hashA =
+            Index.storedHash a.unit.attested
+
+        hashB =
+            Index.storedHash b.unit.attested
+
+        listedPage =
+            Ok (queuePageOf [ a, b ])
+
+        historyPage =
+            Ok { rows = [], at = LibDb.HistoryStart, next = Nothing, log = LibDb.ShownProven }
+
+        queueRunning =
+            after settings [ Navigated QueuePage ] initialModel
+
+        queueWanting =
+            after settings [ NextPage (cursorAfter 2 "u-b") ] queueRunning
+
+        queueDropped =
+            after settings (queueDone queueRunning.queueLoad listedPage) queueWanting
+
+        foreignQueueLoad =
+            Slot.runningLoad (Tuple.first (Slot.requestLoad Queue.mergeQueueWant otherEpoch (QueueReload Index.Start) Slot.idleLoad))
+
+        historyRunning =
+            after settings [ Navigated HistoryPage ] initialModel
+
+        historyWanting =
+            after settings [ HistoryNext (historyAfter 2) ] historyRunning
+
+        listed =
+            queueModel [ a, b ] NoneSelected
+
+        unitRead =
+            after settings [ Navigated (unitAt ua) ] listed
+
+        unitShown =
+            after settings (viewDone settings.epoch ua (Ok (Just a))) unitRead
+
+        standingWanting =
+            after settings ([ Navigated (unitAt ub) ] ++ viewDone settings.epoch ub (Ok (Just b))) unitShown
+
+        shown =
+            queueModel [ a, b ] (ViewShown a)
+
+        approve =
+            drawnOn shown ua ApproveRow
+
+        saving =
+            after settings approve shown
+
+        savingLoading =
+            after settings [ Navigated QueuePage ] saving
+
+        scripts =
+            [ ( initialModel, [ Navigated QueuePage, ShowQueue, NextPage (cursorAfter 1 "u-a"), NextPage (cursorAfter 2 "u-b"), Navigated (unitAt ua) ] )
+            , ( queueRunning, queueDone queueRunning.queueLoad listedPage ++ [ Navigated QueuePage ] )
+            , ( queueWanting, queueDone queueRunning.queueLoad listedPage )
+            , ( queueDropped, queueDone queueRunning.queueLoad listedPage ++ queueDone queueDropped.queueLoad listedPage )
+            , ( queueRunning, queueLoadedOn queueRunning.queueLoad (Err limitMarker) ++ [ Navigated QueuePage ] )
+            , ( queueRunning, completions PendingLoaded foreignQueueLoad listedPage )
+            , ( initialModel, [ Navigated HistoryPage, ShowHistory, HistoryNext (historyAfter 1), HistoryNext (historyAfter 2) ] )
+            , ( historyRunning, completions HistoryPageLoaded (Slot.runningLoad historyRunning.historyLoad) historyPage ++ [ ShowHistory ] )
+            , ( historyWanting, completions HistoryPageLoaded (Slot.runningLoad historyRunning.historyLoad) historyPage ++ completions HistoryPageLoaded (Slot.runningLoad historyRunning.historyLoad) historyPage )
+            , ( listed, [ Navigated (unitAt ua), Navigated (unitAt ub) ] ++ viewDone settings.epoch ua (Ok (Just a)) ++ viewDone settings.epoch ub (Ok (Just b)) )
+            , ( unitRead, viewDone otherEpoch ua (Ok (Just a)) ++ viewDone settings.epoch ub (Ok (Just b)) ++ viewDone settings.epoch ua (Ok (Just a)) )
+            , ( unitShown, standingLoadedFor settings.epoch ua hashA (Ok Standing.Undecided) ++ [ Navigated QueuePage ] )
+            , ( standingWanting, standingLoadedFor settings.epoch ua hashA (Ok Standing.Undecided) ++ standingLoadedFor settings.epoch ua hashA (Ok Standing.Undecided) ++ standingLoadedFor settings.epoch ub hashB (Ok Standing.Undecided) )
+            , ( shown, approve ++ approve ++ [ press shown "a" ] )
+            , ( saving, decisionDone settings.epoch ua (Ok pair) ++ [ Navigated QueuePage ] )
+            , ( savingLoading, decisionDone settings.epoch ua (Ok pair) ++ queueDone savingLoading.queueLoad listedPage )
+            , ( saving, decisionDone otherEpoch ua (Ok pair) ++ decisionDone settings.epoch ub (Ok pair) ++ decisionDone settings.epoch ua (Err SaveFailed) ++ approve )
+            ]
+    in
+    List.all (\( model, msgs ) -> not (List.isEmpty msgs) && effectsOncePerStep settings msgs model) scripts
+
+
+-- ── the session starts nothing ──────────────────────────────────────────
+-- `Lib/Session.ipe` returns effects as values and imports neither the Cmd
+-- module nor the Task module under any name, so it cannot start a task. A
+-- task starts in `src` only through `Cmd.perform`, only inside `run` of
+-- `Lib/App.ipe`, the interpreter, exactly once in each effect's arm; and a
+-- batch is built only through `Cmd.batch`, once, inside its `update`. The
+-- interpreter builds no model: it holds no record update. `Task.attempt`
+-- lowers to the same start, so any use of it is stray, and the Cmd module
+-- is imported under its own name exposing nothing, so no other spelling
+-- starts a task. Only `src/Main.ipe` imports
+-- the interpreter, and only the session and the interpreter name an effect.
+-- The modules are lexed as Ipê reads them, so a mention in a comment or a
+-- string is no site.
+interpreterSites : List String
+interpreterSites =
+    [ "run", "update" ]
+
+
+-- The modules, relative to `src`, of the interpreter, the session, and the
+-- one module that wires the interpreter into the server.
+interpreterModule : String
+interpreterModule =
     "Lib/App.ipe"
 
 
--- The start sites a module at `path` may hold: all of them in the start
--- module, none anywhere else.
-sitesOf : String -> List String
-sitesOf path =
-    if path == taskStartModule then
-        taskStartSites
+sessionModule : String
+sessionModule =
+    "Lib/Session.ipe"
 
-    else
-        []
+
+mainModule : String
+mainModule =
+    "Main.ipe"
+
+
+-- The modules the session must not import: the ones that start a task.
+taskModules : List String
+taskModules =
+    [ "Ipe.Tea.Web.Cmd", "Ipe.Task" ]
 
 
 startsTask : String -> Bool
 startsTask text =
-    text == "perform" || String.endsWith ".perform" text || text == "attempt" || String.endsWith ".attempt" text
+    List.any (\verb -> text == verb || String.endsWith ("." ++ verb) text) [ "perform", "attempt", "batch" ]
 
 
--- The declarations of `text` that start a task outside `sites`, and
--- whether it imports the Cmd module under another name or exposing its
--- names.
-strayTaskStarts : List String -> String -> List String
-strayTaskStarts sites text =
+-- Whether `text` names one of `effects`, bare or qualified.
+namesEffect : List String -> String -> Bool
+namesEffect effects text =
+    List.any (\effect -> text == effect || String.endsWith ("." ++ effect) text) effects
+
+
+-- The declarations of `toks` holding a record update, `{ name |`.
+recordUpdates : List TextSinkScanTests.Token -> List String
+recordUpdates toks =
+    .hits (List.foldl recordUpdateStep { before = noToken, last = noToken, hits = [] } toks)
+
+
+noToken : TextSinkScanTests.Token
+noToken =
+    { kind = TextSinkScanTests.Punctuation, text = "", name = "" }
+
+
+recordUpdateStep : TextSinkScanTests.Token -> { before : TextSinkScanTests.Token, last : TextSinkScanTests.Token, hits : List String } -> { before : TextSinkScanTests.Token, last : TextSinkScanTests.Token, hits : List String }
+recordUpdateStep token state =
+    let
+        hits =
+            if state.before.text == "{" && state.last.kind == TextSinkScanTests.WordToken && token.text == "|" then
+                state.hits ++ [ token.name ]
+
+            else
+                state.hits
+    in
+    { before = state.last, last = token, hits = hits }
+
+
+-- What the module at `path` does past the session's boundary, given the
+-- session's `effects`: each declaration starting or batching a task
+-- outside the interpreter's sites or under another spelling, each Cmd
+-- import under another name or exposing its names, each task module the
+-- session imports, each interpreter declaration building a model, each
+-- import of the interpreter outside `src/Main.ipe`, and each declaration
+-- naming an effect outside the session and the interpreter.
+sessionBoundaryBreaks : List String -> String -> String -> List String
+sessionBoundaryBreaks effects path text =
     let
         lexed =
             TextSinkScanTests.lex text
@@ -3405,13 +4271,45 @@ strayTaskStarts sites text =
             List.filter (\token -> token.kind == TextSinkScanTests.WordToken && startsTask token.text) lexed.code
 
         stray =
-            List.filter (\token -> token.text /= "Cmd.perform" || not (List.member token.name sites)) starts
+            List.filter (\token -> not (path == interpreterModule && interpreterSite token)) starts
 
         renamed =
             List.filter (\i -> String.endsWith ".Cmd" i.moduleName && (i.qualifier /= "Cmd" || i.opensAll || not (List.isEmpty i.exposed))) lexed.imports
+
+        sessionTasks =
+            if path == sessionModule then
+                List.filter (\i -> List.member i.moduleName taskModules) lexed.imports
+
+            else
+                []
+
+        built =
+            if path == interpreterModule then
+                recordUpdates lexed.code
+
+            else
+                []
+
+        wired =
+            if path == mainModule then
+                []
+
+            else
+                List.filter (\i -> i.moduleName == "Lib.App") lexed.imports
+
+        named =
+            if path == sessionModule || path == interpreterModule then
+                []
+
+            else
+                List.filter (\token -> token.kind == TextSinkScanTests.WordToken && namesEffect effects token.text) lexed.code
     in
     List.map .name stray
         ++ List.map .moduleName renamed
+        ++ List.map .moduleName sessionTasks
+        ++ built
+        ++ List.map .moduleName wired
+        ++ List.map .name named
         ++ (if lexed.broken then
                 [ "a literal left open" ]
 
@@ -3420,43 +4318,245 @@ strayTaskStarts sites text =
            )
 
 
+-- Whether `token` is a start the interpreter may hold: a perform in `run`,
+-- or the batch in `update`.
+interpreterSite : TextSinkScanTests.Token -> Bool
+interpreterSite token =
+    (token.name == "run" && token.text == "Cmd.perform") || (token.name == "update" && token.text == "Cmd.batch")
+
+
+-- Whether the interpreter lexed as `toks` performs each of `effects` once,
+-- in that effect's own arm of `run`: read in order, `run` names each effect
+-- once, each followed by exactly one `Cmd.perform` before the next; and
+-- `update` batches once. Red if an arm performs nothing, performs twice, or
+-- an effect has no arm of its own.
+interpreterShape : List String -> List TextSinkScanTests.Token -> Bool
+interpreterShape effects toks =
+    let
+        arms =
+            List.map .text (List.filter (\token -> token.name == "run" && token.kind == TextSinkScanTests.WordToken && (List.member token.text effects || token.text == "Cmd.perform")) toks)
+
+        matched =
+            List.filter (\text -> List.member text effects) arms
+    in
+    not (List.isEmpty effects)
+        && arms == List.concatMap (\effect -> [ effect, "Cmd.perform" ]) matched
+        && List.length matched == List.length effects
+        && List.all (\effect -> List.member effect matched) effects
+        && List.length (List.filter (\token -> token.name == "update" && token.text == "Cmd.batch") toks) == 1
+
+
+interpreterFixture : String
+interpreterFixture =
+    "module Lib.App exposing (run, update)\n\nimport Ipe.Tea.Web.Cmd as Cmd\n\n\nupdate settings msg model =\n    case step settings msg model of\n        ( next, effects ) ->\n            ( next, Cmd.batch (List.map (run settings) effects) )\n\n\nrun settings effect =\n    case effect of\n        LoadA load ->\n            Cmd.perform (taskA settings) (doneA load)\n\n        LoadB load ->\n            Cmd.perform (taskB settings) (doneB load)\n"
+
+
+-- Red cases for `interpreterShape`: an arm that performs nothing beside
+-- one that performs twice, an effect with no arm of its own, an effect the
+-- interpreter does not know, and an `update` that batches nothing.
+interpreterShapeFixtures : Bool
+interpreterShapeFixtures =
+    let
+        shape effects text =
+            interpreterShape effects (TextSinkScanTests.lex text).code
+
+        swapped =
+            String.replace "Cmd.perform (taskA settings) (doneA load)" "Cmd.none" (String.replace "Cmd.perform (taskB settings) (doneB load)" "Cmd.perform (taskB settings) (doneB load) |> also (Cmd.perform (taskA settings) (doneA load))" interpreterFixture)
+    in
+    shape [ "LoadA", "LoadB" ] interpreterFixture
+        && List.isEmpty (sessionBoundaryBreaks [ "LoadA", "LoadB" ] interpreterModule interpreterFixture)
+        && not (shape [ "LoadA", "LoadB" ] swapped)
+        && not (shape [ "LoadA", "LoadB" ] (String.replace "LoadB load" "_" interpreterFixture))
+        && not (shape [ "LoadA", "LoadB", "LoadC" ] interpreterFixture)
+        && not (shape [ "LoadA", "LoadB" ] (String.replace "Cmd.batch (List.map (run settings) effects)" "Cmd.none" interpreterFixture))
+
+
 scanFixture : String
 scanFixture =
-    "module Fixture exposing (update)\n\nimport Ipe.Tea.Web.Cmd as Cmd\n\n\n-- Cmd.perform in a comment starts nothing\nqueueStep settings next model =\n    ( model, Cmd.perform task done )\n"
+    "module Fixture exposing (run)\n\nimport Ipe.Tea.Web.Cmd as Cmd\n\n\n-- Cmd.perform in a comment starts nothing\nrun settings effect =\n    Cmd.perform task done\n"
+
+
+sessionFixture : String
+sessionFixture =
+    "module Lib.Session exposing (step)\n\nimport Lib.Slot as Slot\n\n\n-- Cmd.perform in a comment starts nothing\nstep settings msg model =\n    ( model, [ LoadView read ] )\n"
+
+
+fixtureEffects : List String
+fixtureEffects =
+    [ "LoadQueue", "LoadHistory", "LoadView", "LoadStanding", "SaveDecision" ]
 
 
 -- Red cases: a task started in another definition, one behind a
--- `Cmd.batch`, one through a renamed Cmd import, one through
--- `Task.attempt` (inside a start site too), and a start site's name
--- defined in another module.
-everyTaskStartsAtItsSlotFixtures : Bool
-everyTaskStartsAtItsSlotFixtures =
-    strayTaskStarts taskStartSites scanFixture == []
-        && strayTaskStarts taskStartSites (scanFixture ++ "\n\nelsewhere model =\n    ( model, Cmd.perform task done )\n") == [ "elsewhere" ]
-        && strayTaskStarts taskStartSites (scanFixture ++ "\n\nbatched model =\n    ( model, Cmd.batch [ Cmd.none, Cmd.perform task done ] )\n") == [ "batched" ]
-        && strayTaskStarts taskStartSites (String.replace "Cmd.perform task" "Effect.perform task" (String.replace "as Cmd" "as Effect" scanFixture)) == [ "queueStep", "Ipe.Tea.Web.Cmd" ]
-        && strayTaskStarts taskStartSites (scanFixture ++ "\n\nattempted model =\n    ( model, Task.attempt done task )\n") == [ "attempted" ]
-        && strayTaskStarts taskStartSites (String.replace "Cmd.perform task" "Task.attempt done task" scanFixture) == [ "queueStep" ]
-        && strayTaskStarts (sitesOf "Lib/View.ipe") scanFixture == [ "queueStep" ]
+-- `Cmd.batch`, one through a renamed Cmd import, one through an import
+-- exposing `perform`, one through `Task.attempt` (inside a site too), a
+-- perform in `Lib/View.ipe`, a perform in `update` or a batch in `run`,
+-- the session importing the Cmd or the Task
+-- module under any name, the interpreter building a model, a module other
+-- than `src/Main.ipe` importing the interpreter, and a view naming an
+-- effect, bare or qualified.
+sessionStartsNothingFixtures : Bool
+sessionStartsNothingFixtures =
+    sessionBoundaryBreaks fixtureEffects interpreterModule scanFixture == []
+        && sessionBoundaryBreaks fixtureEffects sessionModule sessionFixture == []
+        && sessionBoundaryBreaks fixtureEffects interpreterModule (scanFixture ++ "\n\nelsewhere model =\n    Cmd.perform task done\n") == [ "elsewhere" ]
+        && sessionBoundaryBreaks fixtureEffects interpreterModule (scanFixture ++ "\n\nbatched model =\n    ( model, Cmd.batch [ Cmd.none, Cmd.perform task done ] )\n") == [ "batched", "batched" ]
+        && sessionBoundaryBreaks fixtureEffects interpreterModule (String.replace "Cmd.perform task" "Effect.perform task" (String.replace "as Cmd" "as Effect" scanFixture)) == [ "run", "Ipe.Tea.Web.Cmd" ]
+        && sessionBoundaryBreaks fixtureEffects interpreterModule (String.replace "as Cmd" "as Cmd exposing (perform)" scanFixture) == [ "Ipe.Tea.Web.Cmd" ]
+        && sessionBoundaryBreaks fixtureEffects interpreterModule (scanFixture ++ "\n\nattempted model =\n    ( model, Task.attempt done task )\n") == [ "attempted" ]
+        && sessionBoundaryBreaks fixtureEffects interpreterModule (String.replace "Cmd.perform task" "Task.attempt done task" scanFixture) == [ "run" ]
+        && sessionBoundaryBreaks fixtureEffects "Lib/View.ipe" scanFixture == [ "run" ]
+        && sessionBoundaryBreaks fixtureEffects sessionModule (String.replace "import Lib.Slot as Slot" "import Ipe.Tea.Web.Cmd as Cmd" sessionFixture) == [ "Ipe.Tea.Web.Cmd" ]
+        && sessionBoundaryBreaks fixtureEffects sessionModule (String.replace "import Lib.Slot as Slot" "import Ipe.Tea.Web.Cmd as Effects" sessionFixture) == [ "Ipe.Tea.Web.Cmd", "Ipe.Tea.Web.Cmd" ]
+        && sessionBoundaryBreaks fixtureEffects sessionModule (String.replace "import Lib.Slot as Slot" "import Ipe.Task exposing (Task)" sessionFixture) == [ "Ipe.Task" ]
+        && sessionBoundaryBreaks fixtureEffects interpreterModule (scanFixture ++ "\n\nbuild model =\n    { model | page = next }\n") == [ "build" ]
+        && sessionBoundaryBreaks fixtureEffects interpreterModule (scanFixture ++ "\n\nupdate settings msg model =\n    ( model, Cmd.perform task done )\n") == [ "update" ]
+        && sessionBoundaryBreaks fixtureEffects interpreterModule (String.replace "Cmd.perform task done" "Cmd.batch [ Cmd.perform task done, Cmd.perform task done ]" scanFixture) == [ "run" ]
+        && interpreterShapeFixtures
+        && sessionBoundaryBreaks fixtureEffects "Lib/View.ipe" (String.replace "import Lib.Slot as Slot" "import Lib.App as App" (String.replace "module Lib.Session" "module Lib.View" sessionFixture)) == [ "Lib.App", "step" ]
+        && sessionBoundaryBreaks fixtureEffects "Lib/View.ipe" (String.replace "LoadView read" "Session.SaveDecision read" sessionFixture) == [ "step" ]
+
+
+-- The constructors of the `type Effect` declaration in `toks`, in order.
+effectConstructors : List TextSinkScanTests.Token -> List String
+effectConstructors toks =
+    .found (List.foldl effectConstructorStep { previous = "", inEffect = False, found = [] } toks)
+
+
+effectConstructorStep : TextSinkScanTests.Token -> { previous : String, inEffect : Bool, found : List String } -> { previous : String, inEffect : Bool, found : List String }
+effectConstructorStep token state =
+    let
+        inEffect =
+            if token.name /= "type" then
+                False
+
+            else if state.previous == "type" then
+                token.text == "Effect"
+
+            else
+                state.inEffect
+
+        found =
+            if inEffect && token.kind == TextSinkScanTests.WordToken && (state.previous == "=" || state.previous == "|") then
+                state.found ++ [ token.text ]
+
+            else
+                state.found
+    in
+    { previous = token.text, inEffect = inEffect, found = found }
 
 
 -- Every module of `src`, read through the text-sink scan's bounded reader,
--- starts its tasks only at the start sites, every start site is a
--- definition of the start module, and the fixtures go red. Red if a task is
--- started outside a slot transition.
-everyTaskStartsAtItsSlot : Task.Task Error Bool
-everyTaskStartsAtItsSlot =
+-- keeps the session's boundary, the session and the interpreter are
+-- modules of it, the interpreter defines both its sites, and the fixtures
+-- go red. Red if the session can start a task, a task starts outside the
+-- interpreter's arm for its effect, an effect's arm starts other than one
+-- task, or the interpreter builds a model.
+sessionStartsNothing : Task.Task Error Bool
+sessionStartsNothing =
     TextSinkScanTests.srcSources
         |> Task.map
             (\modules ->
                 let
+                    textOf path =
+                        List.filterMap
+                            (\( at, text ) ->
+                                if at == path then
+                                    Just text
+
+                                else
+                                    Nothing
+                            )
+                            modules
+
+                    effects =
+                        List.concatMap (\text -> effectConstructors (TextSinkScanTests.lex text).code) (textOf sessionModule)
+
                     names =
-                        List.concatMap (\( _, text ) -> List.map .name (TextSinkScanTests.lex text).code) (List.filter (\( path, _ ) -> path == taskStartModule) modules)
+                        List.concatMap (\text -> List.map .name (TextSinkScanTests.lex text).code) (textOf interpreterModule)
                 in
-                List.any (\( path, _ ) -> path == taskStartModule) modules
-                    && List.all (\( path, text ) -> List.isEmpty (strayTaskStarts (sitesOf path) text)) modules
-                    && List.all (\site -> List.member site names) taskStartSites
-                    && everyTaskStartsAtItsSlotFixtures
+                effects == fixtureEffects
+                    && List.all (\( path, text ) -> List.isEmpty (sessionBoundaryBreaks effects path text)) modules
+                    && List.all (\site -> List.member site names) interpreterSites
+                    && List.all (\text -> interpreterShape effects (TextSinkScanTests.lex text).code) (textOf interpreterModule)
+                    && sessionStartsNothingFixtures
+            )
+
+
+-- ── the session's effects fit the runtime's ceiling ─────────────────────
+-- One step returns at most one effect per slot, so a session holds at most
+-- as many tasks in flight as `Effect` has constructors, each a slot. The
+-- runtime refuses a session's task past `SESSION_CMD_CEILING`, so the slot
+-- count must not exceed it, or a refused start would be the single-flight
+-- path the app takes on a slot it holds.
+ceilingPrefix : String
+ceilingPrefix =
+    "pub const SESSION_CMD_CEILING: Cmds = Cmds::new("
+
+
+-- The value of `SESSION_CMD_CEILING` declared in the Rust source `text`.
+sessionCmdCeiling : String -> Maybe Int
+sessionCmdCeiling text =
+    List.head
+        (List.filterMap
+            (\line ->
+                if String.startsWith ceilingPrefix (String.trim line) then
+                    String.toInt (String.replace ");" "" (String.dropLeft (String.length ceilingPrefix) (String.trim line)))
+
+                else
+                    Nothing
+            )
+            (String.lines text)
+        )
+
+
+-- Whether the `Effect` of `session` is exactly the five slots and their
+-- count fits the ceiling `budget` declares.
+effectsFitCeiling : String -> String -> Bool
+effectsFitCeiling session budget =
+    let
+        effects =
+            effectConstructors (TextSinkScanTests.lex session).code
+    in
+    effects == fixtureEffects
+        && (case sessionCmdCeiling budget of
+                Just ceiling ->
+                    List.length effects <= ceiling
+
+                Nothing ->
+                    False
+           )
+
+
+effectFixture : String
+effectFixture =
+    "module Lib.Session exposing (Effect(..))\n\n\n-- a comment naming LoadElse is no constructor\ntype Effect\n    = LoadQueue (Stamp Slot.LoadTicket) Queue.QueueWant\n    | LoadHistory (Stamp Slot.LoadTicket) History.HistoryWant\n    | LoadView (Stamp Uid)\n    | LoadStanding (Stamp Standing.StandingKey)\n    | SaveDecision (Stamp Uid) MacKey DecisionPlan LibDb.Decision\n\n\ntype alias Other =\n    { field : Int }\n"
+
+
+budgetFixture : String
+budgetFixture =
+    "/// The Cmds one session may have in flight.\npub const SESSION_CMD_CEILING: Cmds = Cmds::new(64);\n"
+
+
+-- The `Effect` of `src/Lib/Session.ipe` is the five slots, under the
+-- ceiling `src/runtime/rust/src/web/budget.rs` declares, and the fixtures
+-- go red on a sixth constructor, a ceiling below five, and a ceiling that
+-- does not parse. Red if the session can hold more tasks than the runtime
+-- admits.
+effectSlotsUnderCeiling : Task.Task Error Bool
+effectSlotsUnderCeiling =
+    do
+        cwd <- System.cwd ()
+        sessionPath <- Task.fromResult (Path.fromString (cwd ++ "/src/Lib/Session.ipe"))
+        budgetPath <- Task.fromResult (Path.fromString (repoFile cwd "src/runtime/rust/src/web/budget.rs"))
+        session <- File.readFileLimit sessionPath (ByteSize.kib 256)
+        budget <- File.readFileLimit budgetPath (ByteSize.kib 256)
+        Task.succeed
+            (effectsFitCeiling session budget
+                && sessionCmdCeiling budget /= Nothing
+                && effectsFitCeiling effectFixture budgetFixture
+                && not (effectsFitCeiling (String.replace "    | SaveDecision" "    | LoadElse (Stamp Uid)\n    | SaveDecision" effectFixture) budgetFixture)
+                && not (effectsFitCeiling effectFixture (String.replace "new(64)" "new(4)" budgetFixture))
+                && not (effectsFitCeiling effectFixture (String.replace "new(64)" "new(sixty)" budgetFixture))
             )
 
 
@@ -3594,7 +4694,8 @@ slotFixture =
 
 
 -- Red cases: a mint in another definition, qualified, fully qualified or
--- under a renamed import; a start site's name in another module; an import
+-- under a renamed import; a start site's name in another module; a mint
+-- in the session's `step`; an import
 -- exposing `stamp`, by name or by `(..)`; a bare mint in the stamp module
 -- outside `startLoad`; the stamp module exposing `Stamp(..)`; and the
 -- `Stamp` constructor built in a declaration of the stamp module other
@@ -3604,8 +4705,9 @@ everyStampMintedAtItsStartFixtures =
     strayStampMints "Lib/Selected.ipe" stampFixture == []
         && strayStampMints "Lib/Selected.ipe" (stampFixture ++ "\n\nelsewhere epoch uid =\n    Slot.stamp epoch uid\n") == [ "elsewhere" ]
         && strayStampMints "Lib/Selected.ipe" (stampFixture ++ "\n\nelsewhere epoch uid =\n    Lib.Slot.stamp epoch uid\n") == [ "elsewhere" ]
-        && strayStampMints "Lib/App.ipe" (String.replace "Slot.stamp epoch" "S.stamp epoch" (String.replace "as Slot" "as S" stampFixture)) == [ "startView" ]
-        && strayStampMints "Lib/App.ipe" stampFixture == [ "startView" ]
+        && strayStampMints "Lib/Session.ipe" (String.replace "Slot.stamp epoch" "S.stamp epoch" (String.replace "as Slot" "as S" stampFixture)) == [ "startView" ]
+        && strayStampMints "Lib/Session.ipe" stampFixture == [ "startView" ]
+        && strayStampMints "Lib/Session.ipe" (stampFixture ++ "\n\nstep settings msg model =\n    ( model, [ LoadView (Slot.stamp settings.epoch uid) ] )\n") == [ "startView", "step" ]
         && strayStampMints "Lib/Selected.ipe" (String.replace "as Slot" "as Slot exposing (stamp)" stampFixture) == [ "Lib.Slot" ]
         && strayStampMints "Lib/Selected.ipe" (String.replace "as Slot" "as Slot exposing (..)" stampFixture) == [ "Lib.Slot" ]
         && strayStampMints stampModule slotFixture == []

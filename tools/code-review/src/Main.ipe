@@ -9,7 +9,7 @@ import Ipe.Task as Task
 import Ipe.Tea.Web as Web
 import Ipe.Tea.Web.Cmd as Cmd
 import Ipe.Tea.Web.Sub as Sub
-import Lib.App as App exposing (Model, Msg(..), Page(..))
+import Lib.App as App
 import Lib.Bind as Bind
 import Lib.Db as LibDb
 import Lib.EnvLookup as EnvLookup
@@ -18,6 +18,7 @@ import Lib.Index as Index
 import Lib.Queue as Queue
 import Lib.ReviewKey as ReviewKey exposing (ReviewKey(..))
 import Lib.SafeText as SafeText
+import Lib.Session as Session exposing (Model, Msg(..), Page(..))
 import Lib.Settings as Settings
 import Lib.View as View
 
@@ -25,7 +26,7 @@ import Lib.View as View
 -- The session's first model; the route entry that follows loads the page.
 init : Web.WebReq -> ( Model, Cmd Msg )
 init _req =
-    ( App.initialModel, Cmd.none )
+    ( Session.initialModel, Cmd.none )
 
 
 subscriptions : Model -> Sub Msg

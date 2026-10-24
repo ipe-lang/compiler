@@ -14,7 +14,6 @@ import Ipe.System as System
 import Ipe.Task as Task
 import Ipe.Time.Timestamp as Timestamp
 import Ipe.Ui as Ui
-import Lib.App exposing (Model, Page(..), decidableRow, initialModel)
 import Lib.Db as LibDb exposing (BreakAt(..), HistoryCursor(..), LogShown(..), ReviewEntry(..), StoredDecision(..), Unverified(..))
 import Lib.DecisionSlot as DecisionSlot exposing (DecisionSlot(..), RefusalPanel(..))
 import Lib.Epoch as Epoch exposing (Epoch)
@@ -29,6 +28,7 @@ import Lib.Queue as Queue exposing (QueueState(..), UnitPageState(..))
 import Lib.RepoPath exposing (PathError(..))
 import Lib.SafeText as SafeText
 import Lib.Selected exposing (SelectedView(..))
+import Lib.Session exposing (Model, Page(..), decidableRow, initialModel)
 import Lib.Slot as Slot
 import Lib.Standing as Standing
 import Lib.Uid as Uid

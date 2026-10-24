@@ -12,7 +12,6 @@ import Ipe.Ui.Background as Background
 import Ipe.Ui.Border as Border
 import Ipe.Ui.Font as Font
 import Ipe.Ui.Input as Input
-import Lib.App as App exposing (Model, Msg(..), Page(..), queueList)
 import Lib.Db as LibDb exposing (LogShown(..), ReviewEntry(..), StoredDecision(..), Unverified(..))
 import Lib.DecisionSlot as DecisionSlot exposing (DecisionTarget(..))
 import Lib.Draft as Draft
@@ -27,6 +26,7 @@ import Lib.Queue as Queue exposing (Place(..), QueueState(..), UnitLabel, UnitPa
 import Lib.ReviewKey as ReviewKey
 import Lib.SafeText as SafeText exposing (SafeText, Segment(..))
 import Lib.Selected as Selected
+import Lib.Session as Session exposing (Model, Msg(..), Page(..), queueList)
 import Lib.Standing as Standing exposing (Standing(..))
 import Lib.Uid exposing (Uid)
 
@@ -128,7 +128,7 @@ view : Model -> Ui.Element Msg
 view model =
     let
         offers =
-            App.keyOffers model
+            Session.keyOffers model
     in
     Ui.column
         [ Ui.width Ui.fill
@@ -166,7 +166,7 @@ pageTopic model =
             "History"
 
         UnitPage raw ->
-            case App.unitPageState raw model of
+            case Session.unitPageState raw model of
                 UnitLoaded _ ->
                     "Unit"
 
@@ -193,7 +193,7 @@ pageBody model =
             historyBody model
 
         UnitPage raw ->
-            unitPageBody model.standing (App.unitPageState raw model)
+            unitPageBody model.standing (Session.unitPageState raw model)
 
 
 queueBody : Model -> Ui.Element Msg
@@ -254,7 +254,7 @@ refusalBlock model page =
         Ui.column
             [ Ui.width Ui.fill, Ui.spacing 8 ]
             (Ui.el [ Font.size 13, Font.bold, Font.color (Ui.rgb 220 170 90) ] (Ui.text "Unreviewable files")
-                :: List.map (\row -> refusalCard (refuseControlsOf model) (App.decidableRow model row.uid) page.log row) page.refusals
+                :: List.map (\row -> refusalCard (refuseControlsOf model) (Session.decidableRow model row.uid) page.log row) page.refusals
             )
 
 
@@ -360,7 +360,7 @@ queueUnits model =
                     [ hintLine (recordsDecisions model.queueState)
                     , case current of
                         Just ( q, label ) ->
-                            unitCard (refuseControlsOf model) (App.decidableRow model q.unit.uid) model.queueState model.selectedView label q
+                            unitCard (refuseControlsOf model) (Session.decidableRow model q.unit.uid) model.queueState model.selectedView label q
 
                         Nothing ->
                             Ui.none
