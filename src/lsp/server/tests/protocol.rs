@@ -5,7 +5,7 @@
 //! project).
 
 use std::collections::BTreeMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use lsp_server::{Connection, Message, Notification, Request, RequestId};
@@ -18,14 +18,14 @@ use ipe_lsp_server::{LoadError, LoadedFile, LoadedProject, ModuleOrigin, Project
 // ---------------------------------------------------------------------------
 
 /// A loader for the lint-config protocol test. The `lint.ipe` file is written
-/// to the workspace directory before the server starts; the server discovers it
-/// via the `workspaceFolders` URI passed in `InitializeParams`.
+/// to the workspace directory before the server starts; the server passes the
+/// `workspaceFolders` of `InitializeParams` to every load.
 struct WorkspaceLoader;
 
 impl ProjectLoader for WorkspaceLoader {
     fn load(
         &self,
-        workspace_root: Option<&Path>,
+        workspace_roots: &[PathBuf],
         open_file: &Path,
         open_text: Option<&str>,
     ) -> Result<LoadedProject, LoadError> {
@@ -55,11 +55,12 @@ impl ProjectLoader for WorkspaceLoader {
         Ok(LoadedProject {
             files,
             entry_module: vec!["Main".to_owned()],
-            // `lint.ipe` is discovered at the workspace root, not next to the
-            // (possibly virtual) open file — matching the real driver, which
-            // anchors on the project root it resolves, never the open file's
-            // own directory.
-            lint_config_dir: workspace_root
+            // `lint.ipe` is discovered at the workspace folder, not next to
+            // the (possibly virtual) open file — matching the real driver,
+            // which anchors on the project root it resolves, never the open
+            // file's own directory.
+            lint_config_dir: workspace_roots
+                .first()
                 .map_or_else(|| ipe_lint::lint_config_dir(open_file), Path::to_path_buf),
         })
     }
@@ -94,7 +95,7 @@ fn lint_ipe_workspace_config_is_respected() {
         .spawn(move || ipe_lsp_server::run_with_connection(&server_side, &loader))
         .expect("spawn test thread");
 
-    // Handshake — pass the workspace folder so the server sets workspace_root.
+    // Handshake — pass the workspace folder so the server hands it to the loader.
     let ws_uri = lsp_types::Url::from_file_path(&ws_root).expect("ws uri");
     client
         .sender
@@ -184,7 +185,7 @@ struct FixtureLoader;
 impl ProjectLoader for FixtureLoader {
     fn load(
         &self,
-        _workspace_root: Option<&Path>,
+        _workspace_roots: &[PathBuf],
         open_file: &Path,
         open_text: Option<&str>,
     ) -> Result<LoadedProject, LoadError> {
@@ -465,7 +466,7 @@ struct CyclicLoader;
 impl ProjectLoader for CyclicLoader {
     fn load(
         &self,
-        _workspace_root: Option<&Path>,
+        _workspace_roots: &[PathBuf],
         open_file: &Path,
         _open_text: Option<&str>,
     ) -> Result<LoadedProject, LoadError> {
