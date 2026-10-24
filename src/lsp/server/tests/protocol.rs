@@ -61,7 +61,7 @@ impl ProjectLoader for WorkspaceLoader {
             // file's own directory.
             lint_config_dir: workspace_roots
                 .first()
-                .map_or_else(|| ipe_lint::lint_config_dir(open_file), Path::to_path_buf),
+                .map_or_else(|| ipe_lint::lint_config_dir(open_file), PathBuf::clone),
         })
     }
 }
