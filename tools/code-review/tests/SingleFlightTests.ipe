@@ -590,13 +590,44 @@ startsNothing settings msgs model =
     not (List.isEmpty msgs) && List.all List.isEmpty (Tuple.second (record settings msgs model))
 
 
+-- Whether two stamps are the one stamp as process `epoch` sees it: the
+-- same epoch and key, both of this process.
+sameStamp : Epoch -> Stamp key -> Stamp key -> Bool
+sameStamp epoch a b =
+    Slot.owns epoch a (Just b)
+
+
+sameHeld : Epoch -> Maybe (Stamp key) -> Maybe (Stamp key) -> Bool
+sameHeld epoch a b =
+    case ( a, b ) of
+        ( Just x, Just y ) ->
+            sameStamp epoch x y
+
+        ( Nothing, Nothing ) ->
+            True
+
+        _ ->
+            False
+
+
+-- Whether `emitted` is exactly the one stamp `now`.
+emittedOnly : Epoch -> List (Stamp key) -> Stamp key -> Bool
+emittedOnly epoch emitted now =
+    case emitted of
+        [ only ] ->
+            sameStamp epoch only now
+
+        _ ->
+            False
+
+
 -- Whether `effects` start exactly the task stamped `held` for the slot
 -- `start` reads, and nothing else for it; no stamp held is no start.
-startsExactly : (Effect -> Maybe (Stamp key)) -> Maybe (Stamp key) -> List Effect -> Bool
-startsExactly start held effects =
+startsExactly : Epoch -> (Effect -> Maybe (Stamp key)) -> Maybe (Stamp key) -> List Effect -> Bool
+startsExactly epoch start held effects =
     case held of
         Just stamp ->
-            List.filterMap start effects == [ stamp ]
+            emittedOnly epoch (List.filterMap start effects) stamp
 
         Nothing ->
             False
@@ -633,8 +664,8 @@ slotStepHolds epoch held start completes msg before next effects =
         startsOnce =
             case held next of
                 Just now ->
-                    if held before /= Just now || owned then
-                        emitted == [ now ]
+                    if not (sameHeld epoch (held before) (Just now)) || owned then
+                        emittedOnly epoch emitted now
 
                     else
                         List.isEmpty emitted
@@ -642,7 +673,7 @@ slotStepHolds epoch held start completes msg before next effects =
                 Nothing ->
                     List.isEmpty emitted
     in
-    startsOnce && (wasRunning == Nothing || Slot.running epoch (held next) == wasRunning || owned)
+    startsOnce && (sameHeld epoch wasRunning Nothing || sameHeld epoch (Slot.running epoch (held next)) wasRunning || owned)
 
 
 -- Whether one step holds `slotStepHolds` for all five slots.
@@ -904,9 +935,9 @@ unitEntriesDuringReadCoalesce settings a b =
         && pageTag entered == "loading"
         && inFlight returned == Just ( uc, Nothing )
         && pageTag returned == "loading"
-        && startsExactly viewStart (Selected.runningView first.selectedView) (effectsOf settings [ Navigated (unitAt ua) ] initialModel)
+        && startsExactly settings.epoch viewStart (Selected.runningView first.selectedView) (effectsOf settings [ Navigated (unitAt ua) ] initialModel)
         && startsNone viewStart (effectsOf settings [ Navigated (unitAt ub), Navigated (unitAt uc) ] first)
-        && startsExactly viewStart (Selected.runningView returned.selectedView) (effectsOf settings (viewDone settings.epoch ua (Ok (Just a))) entered)
+        && startsExactly settings.epoch viewStart (Selected.runningView returned.selectedView) (effectsOf settings (viewDone settings.epoch ua (Ok (Just a))) entered)
 
 
 -- The queue card and the unit page read through one slot: a unit page entered
@@ -1046,10 +1077,10 @@ decisionsSingleFlight settings a b =
         && DecisionSlot.notSavedOf settled.decision == Just SaveFailed
         && next.decision == savingSlot settings.epoch ua
         && lateOther.decision == savingSlot settings.epoch ua
-        && startsExactly decisionStart (DecisionSlot.savingStamp saving.decision) (effectsOf settings (drawnOn shown ua ApproveRow) shown)
+        && startsExactly settings.epoch decisionStart (DecisionSlot.savingStamp saving.decision) (effectsOf settings (drawnOn shown ua ApproveRow) shown)
         && startsNothing settings (drawnOn shown ua ApproveRow ++ [ press saving "a" ]) saving
         && startsNothing settings (drawnOn shown ua RefuseStart ++ draftOn (refusalOpened settings shown ua) ua "needs a test" ++ drawnOn shown ua RefuseSubmit) saving
-        && startsExactly decisionStart (DecisionSlot.savingStamp next.decision) (effectsOf settings (drawnOn settled ua ApproveRow) settled)
+        && startsExactly settings.epoch decisionStart (DecisionSlot.savingStamp next.decision) (effectsOf settings (drawnOn settled ua ApproveRow) settled)
         && startsNothing settings (decisionSavedFor settings.epoch b.unit.uid (Err (Error.conflict "boom"))) next
 
 
@@ -3484,7 +3515,7 @@ refusedDecisionEmitsNoEffect r =
         && startsNothing settings unlisted (queueModel [ r.a ] (ViewShown r.a))
         && startsNothing settings approve saving
         && DecisionSlot.notSavedOf (after settings approve reloaded).decision == Just (SaveRefused DrawnChanged)
-        && startsExactly decisionStart (DecisionSlot.savingStamp saving.decision) (effectsOf settings approve shown)
+        && startsExactly settings.epoch decisionStart (DecisionSlot.savingStamp saving.decision) (effectsOf settings approve shown)
 
 
 -- Over every model these checks build and every offer any of them draws,
@@ -3605,7 +3636,7 @@ idlePressStartsOneLoad settings =
     Slot.latestTicket running.queueLoad == Slot.nextTicket (Slot.latestTicket initialModel.queueLoad)
         && Slot.runningWant settings.epoch running.queueLoad == Just Nothing
         && Slot.runningWant settings.epoch initialModel.queueLoad == Nothing
-        && startsExactly queueStart (Slot.runningLoad running.queueLoad) (effectsOf settings [ Navigated QueuePage ] initialModel)
+        && startsExactly settings.epoch queueStart (Slot.runningLoad running.queueLoad) (effectsOf settings [ Navigated QueuePage ] initialModel)
 
 
 -- Pages turned, the queue shown again and a unit page entered while a queue
@@ -3673,7 +3704,7 @@ supersededQueueResultDropped settings a b =
         && settled.queueState == Loaded (queuePageOf [ b ])
         && Slot.runningWant settings.epoch settled.queueLoad == Nothing
         && startsNone queueStart (effectsOf settings [ NextPage (cursorAfter 2 "u-b") ] running)
-        && startsExactly queueStart (Slot.runningLoad dropped.queueLoad) (effectsOf settings (completions PendingLoaded firstLoad (Ok (queuePageOf [ a, b ]))) wanting)
+        && startsExactly settings.epoch queueStart (Slot.runningLoad dropped.queueLoad) (effectsOf settings (completions PendingLoaded firstLoad (Ok (queuePageOf [ a, b ]))) wanting)
         && startsNone queueStart (effectsOf settings (completions PendingLoaded firstLoad (Ok (queuePageOf [ a, b ]))) dropped)
         && startsNone queueStart (effectsOf settings (queueDone dropped.queueLoad (Ok (queuePageOf [ b ]))) late)
 
@@ -3710,7 +3741,7 @@ refreshingSettlesOnlyAfterWrite settings a b ( attested, written ) =
         && drained.decision == DecisionIdle PanelClosed
         && drained.queueState == Loaded (queuePageOf [ b ])
         && startsNone queueStart (effectsOf settings (decisionDone settings.epoch ua (Ok ( attested, written ))) loadingWhileSaving)
-        && startsExactly queueStart (Slot.runningLoad preWrite.queueLoad) (effectsOf settings (queueDone loadingWhileSaving.queueLoad (Ok (queuePageOf [ a, b ]))) saved)
+        && startsExactly settings.epoch queueStart (Slot.runningLoad preWrite.queueLoad) (effectsOf settings (queueDone loadingWhileSaving.queueLoad (Ok (queuePageOf [ a, b ]))) saved)
 
 
 -- A wanted drain absorbs a reload asked after it, taking the reload's
@@ -3797,10 +3828,10 @@ historyLoadsSingleFlight settings =
         && historyFailure settled.history == Nothing
         && settled.history /= HistoryLoading
         && Slot.runningWant settings.epoch settled.historyLoad == Nothing
-        && startsExactly historyStart firstLoad (effectsOf settings [ Navigated HistoryPage ] initialModel)
+        && startsExactly settings.epoch historyStart firstLoad (effectsOf settings [ Navigated HistoryPage ] initialModel)
         && startsNone historyStart (effectsOf settings [ ShowHistory, HistoryNext (historyAfter 1), HistoryNext (historyAfter 2) ] running)
         && startsNothing settings (completions App.historyLoaded otherLoad (Ok historyPage)) pressed
-        && startsExactly historyStart (Slot.runningLoad dropped.historyLoad) (effectsOf settings (completions App.historyLoaded firstLoad (Ok historyPage)) stale)
+        && startsExactly settings.epoch historyStart (Slot.runningLoad dropped.historyLoad) (effectsOf settings (completions App.historyLoaded firstLoad (Ok historyPage)) stale)
         && startsNone historyStart (effectsOf settings (historyLoadedOn dropped.historyLoad (Ok { historyPage | at = historyAfter 2 })) dropped)
 
 
@@ -3845,7 +3876,7 @@ standingSingleFlight settings a b =
         && stale.standing == standingReading settings.epoch ub hashB
         && shown.standing == StandingShown ub hashB Standing.Undecided
         && startsNone standingStart (effectsOf settings ([ Navigated (unitAt ub) ] ++ viewDone settings.epoch ub (Ok (Just b))) reading)
-        && startsExactly standingStart (Standing.runningStanding firstReturned.standing) (effectsOf settings (standingLoadedFor settings.epoch ua hashA (Ok Standing.Undecided)) second)
+        && startsExactly settings.epoch standingStart (Standing.runningStanding firstReturned.standing) (effectsOf settings (standingLoadedFor settings.epoch ua hashA (Ok Standing.Undecided)) second)
         && startsNothing settings (standingLoadedFor settings.epoch ua hashA (Ok Standing.Undecided)) firstReturned
         && startsNone standingStart (effectsOf settings (standingLoadedFor settings.epoch ub hashB (Ok Standing.Undecided)) stale)
 
@@ -3911,7 +3942,7 @@ foreignLoadSlotIdle settings otherEpoch a =
         && Slot.runningWant settings.epoch entered.queueLoad == Just Nothing
         && arrived.queueState == Loading
         && foreignLoad /= Nothing
-        && startsExactly queueStart (Slot.runningLoad entered.queueLoad) (effectsOf settings [ Navigated QueuePage ] held)
+        && startsExactly settings.epoch queueStart (Slot.runningLoad entered.queueLoad) (effectsOf settings [ Navigated QueuePage ] held)
         && startsNothing settings (completions PendingLoaded foreignLoad (Ok (queuePageOf [ a ]))) held
         && Standing.standingRequested settings.epoch ua hashA foreignRead == Standing.standingRequested settings.epoch ua hashA StandingUnread
         && foreignArrived == ( foreignRead, Nothing )
@@ -3952,8 +3983,8 @@ ceilingRefusalReleasesSlot settings =
         && Slot.latestTicket refusedWithWant.queueLoad == Slot.nextTicket first
         && Slot.runningWant settings.epoch refusedWithWant.queueLoad == Just Nothing
         && startsNone queueStart (effectsOf settings (completions App.queueLoaded firstLoad (Err limitMarker)) running)
-        && startsExactly queueStart (Slot.runningLoad pressedAfter.queueLoad) (effectsOf settings [ Navigated QueuePage ] refused)
-        && startsExactly queueStart (Slot.runningLoad refusedWithWant.queueLoad) (effectsOf settings (completions App.queueLoaded firstLoad (Err limitMarker)) wanting)
+        && startsExactly settings.epoch queueStart (Slot.runningLoad pressedAfter.queueLoad) (effectsOf settings [ Navigated QueuePage ] refused)
+        && startsExactly settings.epoch queueStart (Slot.runningLoad refusedWithWant.queueLoad) (effectsOf settings (completions App.queueLoaded firstLoad (Err limitMarker)) wanting)
 
 
 -- ── each task is an effect of exactly one transition ────────────────────
@@ -4034,22 +4065,22 @@ secondRequestHeldNotStarted settings a b =
         saving =
             after settings approve shown
     in
-    startsExactly queueStart (Slot.runningLoad queueRunning.queueLoad) (effectsOf settings [ Navigated QueuePage ] initialModel)
+    startsExactly settings.epoch queueStart (Slot.runningLoad queueRunning.queueLoad) (effectsOf settings [ Navigated QueuePage ] initialModel)
         && startsNone queueStart (effectsOf settings [ NextPage c2, ShowQueue ] queueRunning)
         && Slot.runningWant settings.epoch queueWanting.queueLoad == Just (Just (QueueReload c2))
-        && startsExactly queueStart (Slot.runningLoad queueRestarted.queueLoad) (effectsOf settings (queueDone queueRunning.queueLoad (Ok (queuePageOf [ a ]))) queueWanting)
-        && startsExactly historyStart (Slot.runningLoad historyRunning.historyLoad) (effectsOf settings [ Navigated HistoryPage ] initialModel)
+        && startsExactly settings.epoch queueStart (Slot.runningLoad queueRestarted.queueLoad) (effectsOf settings (queueDone queueRunning.queueLoad (Ok (queuePageOf [ a ]))) queueWanting)
+        && startsExactly settings.epoch historyStart (Slot.runningLoad historyRunning.historyLoad) (effectsOf settings [ Navigated HistoryPage ] initialModel)
         && startsNone historyStart (effectsOf settings [ HistoryNext (historyAfter 2), ShowHistory ] historyRunning)
         && Slot.runningWant settings.epoch historyWanting.historyLoad == Just (Just (HistoryFrom (historyAfter 2)))
-        && startsExactly historyStart (Slot.runningLoad historyRestarted.historyLoad) (effectsOf settings (historyLoadedOn historyRunning.historyLoad (Ok historyPage)) historyWanting)
-        && startsExactly viewStart (Selected.runningView viewRunning.selectedView) (effectsOf settings [ Navigated (unitAt ua) ] listed)
+        && startsExactly settings.epoch historyStart (Slot.runningLoad historyRestarted.historyLoad) (effectsOf settings (historyLoadedOn historyRunning.historyLoad (Ok historyPage)) historyWanting)
+        && startsExactly settings.epoch viewStart (Selected.runningView viewRunning.selectedView) (effectsOf settings [ Navigated (unitAt ua) ] listed)
         && startsNone viewStart (effectsOf settings [ Navigated (unitAt ub) ] viewRunning)
         && inFlight viewWanting == Just ( ua, Just ub )
-        && startsExactly viewStart (Selected.runningView viewRestarted.selectedView) (effectsOf settings (viewDone settings.epoch ua (Ok (Just a))) viewWanting)
-        && startsExactly standingStart (Standing.runningStanding standingRunning.standing) (effectsOf settings (viewDone settings.epoch ua (Ok (Just a))) viewRunning)
+        && startsExactly settings.epoch viewStart (Selected.runningView viewRestarted.selectedView) (effectsOf settings (viewDone settings.epoch ua (Ok (Just a))) viewWanting)
+        && startsExactly settings.epoch standingStart (Standing.runningStanding standingRunning.standing) (effectsOf settings (viewDone settings.epoch ua (Ok (Just a))) viewRunning)
         && startsNone standingStart (effectsOf settings secondBody standingRunning)
-        && startsExactly standingStart (Standing.runningStanding standingRestarted.standing) (effectsOf settings (standingLoadedFor settings.epoch ua hashA (Ok Standing.Undecided)) standingWanting)
-        && startsExactly decisionStart (DecisionSlot.savingStamp saving.decision) (effectsOf settings approve shown)
+        && startsExactly settings.epoch standingStart (Standing.runningStanding standingRestarted.standing) (effectsOf settings (standingLoadedFor settings.epoch ua hashA (Ok Standing.Undecided)) standingWanting)
+        && startsExactly settings.epoch decisionStart (DecisionSlot.savingStamp saving.decision) (effectsOf settings approve shown)
         && startsNothing settings approve saving
         && saving.decision == savingSlot settings.epoch ua
 
