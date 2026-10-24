@@ -1093,9 +1093,11 @@ positionRefusals =
 -- through its one sink. `Queue.decide ` appears once in the app (inside
 -- `decideOn`), `decideOn ` exactly three times (its signature, its definition
 -- and the one call in the `WriteUnit` arm), `Queue.decideRefusal ` once, in
--- the `WriteFile` arm, and `WriteUnit ` and `WriteFile ` each three times
--- (the type's constructor, the one plan built and the one arm matched); none
--- of them appears in `Main`. The arms are matched with whitespace runs
+-- the `WriteFile` arm, `WriteUnit` and `WriteFile` each three times as any
+-- token (the type's constructor, the one plan built and the one arm matched,
+-- so a plan built by passing the constructor as a function is counted too),
+-- and `decidePlan` three times (its signature, its definition and the one
+-- call in `saveDecision`); none of them appears in `Main`. The arms are matched with whitespace runs
 -- collapsed, so re-indenting them keeps the scan. A site list with exact
 -- counts, since `ipe test` builds no `update`. Red if a second path to either
 -- decision is added.
@@ -1135,13 +1137,15 @@ decisionReachedOnlyThroughDecidableSource =
                 && count "Queue.decideRefusal " app == 1
                 && count oneRefusalPlan (squashed app) == 1
                 && count oneRefusalCall (squashed app) == 1
-                && count "WriteUnit " app == 3
-                && count "WriteFile " app == 3
+                && count "WriteUnit" app == 3
+                && count "WriteFile" app == 3
+                && count "decidePlan" app == 3
                 && count "Queue.decide " mainSrc == 0
                 && count "decideOn" mainSrc == 0
                 && count "decideRefusal" mainSrc == 0
                 && count "WriteUnit" mainSrc == 0
                 && count "WriteFile" mainSrc == 0
+                && count "decidePlan" mainSrc == 0
             )
 
 
