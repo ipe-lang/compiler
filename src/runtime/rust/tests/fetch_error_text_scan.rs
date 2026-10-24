@@ -1,11 +1,13 @@
 //! Fetch error-text scan: the browser `fetch` path never renders a value it did not write.
 //!
 //! The body of `do_fetch` in `src/http_client.rs` is parsed with `syn`. It must
-//! contain no format-family macro, so no browser error, URL, or header can be
-//! interpolated into an error string there. Every `IpeResult::Err(..)` it
-//! builds must carry either a `FetchFailure` turned into an error by
-//! `into_error()`, or the `body_refusal` the capped body reader returned,
-//! whose texts are fixed. A shape the scan does not recognise turns it red.
+//! invoke no macro at all, so no formatting macro can interpolate a browser
+//! error, URL, or header into an error string there, whatever name it is
+//! reached by, and no macro body can hide code the scan cannot read. Every
+//! `IpeResult::Err(..)` it builds must carry either a `FetchFailure` turned
+//! into an error by `into_error()`, or the `body_refusal` the capped body
+//! reader returned, whose texts are fixed. A shape the scan does not recognise
+//! turns it red.
 #![cfg(not(target_arch = "wasm32"))]
 
 use syn::visit::{self, Visit};
@@ -13,24 +15,6 @@ use syn::{Expr, ExprCall, File, Item, ItemFn, Macro, Path};
 
 /// The `http_client.rs` source the scan reads.
 const HTTP_CLIENT: &str = include_str!("../src/http_client.rs");
-
-/// Macros that format their arguments into text.
-const FORMAT_FAMILY: &[&str] = &[
-    "format",
-    "format_args",
-    "write",
-    "writeln",
-    "print",
-    "println",
-    "eprint",
-    "eprintln",
-    "panic",
-    "dbg",
-    "concat",
-    "stringify",
-    "anyhow",
-    "bail",
-];
 
 /// The one binding that may pass straight into an `IpeResult::Err`.
 const BODY_REFUSAL: &str = "body_refusal";
@@ -41,8 +25,8 @@ const FAILURE_BINDING: &str = "failure";
 /// One finding the scan reports.
 #[derive(Debug, PartialEq, Eq)]
 enum Finding {
-    /// A format-family macro inside `do_fetch`.
-    FormatMacro(String),
+    /// A macro invocation inside `do_fetch`, by its last path segment.
+    Macro(String),
     /// An `IpeResult::Err` argument that is not a fixed-text failure.
     UntypedErr,
 }
@@ -99,12 +83,13 @@ struct BodyScan {
 
 impl<'ast> Visit<'ast> for BodyScan {
     fn visit_macro(&mut self, mac: &'ast Macro) {
-        if let Some(last) = mac.path.segments.last() {
-            let name = last.ident.to_string();
-            if FORMAT_FAMILY.contains(&name.as_str()) {
-                self.findings.push(Finding::FormatMacro(name));
-            }
-        }
+        let name = mac
+            .path
+            .segments
+            .last()
+            .map(|segment| segment.ident.to_string())
+            .unwrap_or_default();
+        self.findings.push(Finding::Macro(name));
         visit::visit_macro(self, mac);
     }
 
@@ -181,8 +166,23 @@ fn a_debug_rendered_browser_error_trips_the_scan() {
         assert!(matches!(scan(source), ScanOutcome::Scanned(_)));
         return;
     };
-    assert!(findings.contains(&Finding::FormatMacro("format".to_owned())));
+    assert!(findings.contains(&Finding::Macro("format".to_owned())));
     assert!(findings.contains(&Finding::UntypedErr));
+}
+
+#[test]
+fn a_formatting_macro_under_another_name_trips_the_scan() {
+    let source = r#"
+        async fn do_fetch() -> IpeResult<E, R> {
+            use std::format as render;
+            let shown = render!("{e:?}");
+            ok_res(shown)
+        }
+    "#;
+    assert_eq!(
+        scan(source),
+        ScanOutcome::Scanned(vec![Finding::Macro("render".to_owned())])
+    );
 }
 
 #[test]
