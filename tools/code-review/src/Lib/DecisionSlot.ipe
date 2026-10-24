@@ -1,4 +1,4 @@
-module Lib.DecisionSlot exposing (DecidableRow, DecisionSlot(..), DecisionTarget(..), Draft, RefusalPanel(..), closeRefusal, decidableAs, decidableRow, decisionNotSaved, decisionRefused, decisionWritten, draftRefused, editDraft, notSavedOf, offeredRefusal, offeredSource, openPanel, openRefusal, openRow, ownedSlot, pendingText, queueSettled, rowTarget, rowUid, sameSubject, startDecision)
+module Lib.DecisionSlot exposing (DecidableRow, DecisionSlot(..), DecisionTarget(..), Draft, RefusalPanel(..), closeRefusal, decidableAs, decidableRow, decisionNotSaved, decisionRefused, decisionWritten, draftRefused, editDraft, notSavedOf, offeredRefusal, offeredSource, openPanel, openRefusal, openRow, ownSlot, pendingText, queueSettled, rowTarget, rowUid, sameSubject, savingStamp, startDecision)
 
 import Ipe.List as List
 import Ipe.Maybe as Maybe
@@ -11,7 +11,7 @@ import Lib.Index as Index
 import Lib.Queue exposing (QueueState(..))
 import Lib.SafeText as SafeText exposing (SafeText)
 import Lib.Selected exposing (SelectedView, decidableSource)
-import Lib.Slot exposing (LoadTicket, ticketNumber)
+import Lib.Slot as Slot exposing (LoadTicket, Stamp, ticketNumber)
 import Lib.Uid exposing (Uid)
 
 
@@ -237,9 +237,9 @@ notListed target =
 -- a decision asked while one is busy starts nothing. Busy is two cases: the
 -- decision is saving, or it is saved and the queue reload that drops its row
 -- is still running, so the row's controls stay withheld until the reloaded
--- queue no longer lists it. A busy decision records the epoch whose process
--- runs it: slot ownership is tied to process lifetime, so one owned by
--- another epoch is idle. `DecisionNotSaved` is the notice of the last
+-- queue no longer lists it. A busy decision holds the stamp of its save:
+-- slot ownership is tied to process lifetime, so one another process
+-- started is idle. `DecisionNotSaved` is the notice of the last
 -- decision that was not saved, with the queue's latest load ticket when it
 -- was raised; the next decision started, or a queue load started after it
 -- that succeeds, replaces it, so a reload clears it as its text advises,
@@ -248,8 +248,8 @@ notListed target =
 -- beside a busy decision, or a draft with no panel, has no representation.
 type DecisionSlot
     = DecisionIdle RefusalPanel
-    | DecisionSaving Uid Epoch
-    | DecisionRefreshing Uid Epoch
+    | DecisionSaving (Stamp Uid)
+    | DecisionRefreshing (Stamp Uid)
     | DecisionNotSaved SaveFailure LoadTicket RefusalPanel
 
 
@@ -266,24 +266,16 @@ type alias Draft =
     { refuseDraft : Draft.Draft, refuseError : Maybe RefuseFailure }
 
 
--- The decision on `uid` and the process `epoch` runs it in, while that
--- process has it busy.
-busyOwnedBy : Epoch -> DecisionSlot -> Maybe Uid
-busyOwnedBy epoch slot =
+-- The stamp of the busy decision, saving or refreshing, whichever process
+-- started it.
+busyStamp : DecisionSlot -> Maybe (Stamp Uid)
+busyStamp slot =
     case slot of
-        DecisionSaving uid owner ->
-            if owner == epoch then
-                Just uid
+        DecisionSaving saving ->
+            Just saving
 
-            else
-                Nothing
-
-        DecisionRefreshing uid owner ->
-            if owner == epoch then
-                Just uid
-
-            else
-                Nothing
+        DecisionRefreshing saved ->
+            Just saved
 
         DecisionIdle _ ->
             Nothing
@@ -292,17 +284,51 @@ busyOwnedBy epoch slot =
             Nothing
 
 
--- The slot holding a decision on `uid` run by process `epoch`; Nothing
--- while another decision of that process is busy. Starting a decision drops
--- the last one's not-saved notice and closes any open refusal panel.
-startDecision : Epoch -> Uid -> DecisionSlot -> Maybe DecisionSlot
-startDecision epoch uid slot =
-    case busyOwnedBy epoch slot of
-        Just _ ->
+-- The stamp of the decision still saving, the one task whose result the
+-- slot awaits, whichever process started it; a refreshing decision's save
+-- already returned.
+savingStamp : DecisionSlot -> Maybe (Stamp Uid)
+savingStamp slot =
+    case slot of
+        DecisionSaving saving ->
+            Just saving
+
+        DecisionRefreshing _ ->
             Nothing
 
+        DecisionIdle _ ->
+            Nothing
+
+        DecisionNotSaved _ _ _ ->
+            Nothing
+
+
+-- Whether a decision of process `epoch` is busy.
+busyFor : Epoch -> DecisionSlot -> Bool
+busyFor epoch slot =
+    case Slot.running epoch (busyStamp slot) of
+        Just _ ->
+            True
+
         Nothing ->
-            Just (DecisionSaving uid epoch)
+            False
+
+
+-- The one start of a decision: the slot saving the decision on `uid` run
+-- by process `epoch`, with its stamp; Nothing while another decision of
+-- that process is busy. Starting a decision drops the last one's not-saved
+-- notice and closes any open refusal panel.
+startDecision : Epoch -> Uid -> DecisionSlot -> Maybe ( DecisionSlot, Stamp Uid )
+startDecision epoch uid slot =
+    if busyFor epoch slot then
+        Nothing
+
+    else
+        let
+            saving =
+                Slot.stamp epoch uid
+        in
+        Just ( DecisionSaving saving, saving )
 
 
 -- The slot with the refusal panel open on `row`, its draft empty, by the
@@ -312,12 +338,11 @@ startDecision epoch uid slot =
 -- hold the panel, so a panel no row draws has no representation.
 openRefusal : Epoch -> DecidableRow -> DecisionSlot -> DecisionSlot
 openRefusal epoch row slot =
-    case busyOwnedBy epoch slot of
-        Just _ ->
-            slot
+    if busyFor epoch slot then
+        slot
 
-        Nothing ->
-            withPanel (PanelOpen row { refuseDraft = Draft.empty, refuseError = Nothing }) (ownedSlot epoch slot)
+    else
+        withPanel (PanelOpen row { refuseDraft = Draft.empty, refuseError = Nothing }) (ownSlot epoch slot)
 
 
 -- The slot with its refusal panel closed.
@@ -378,10 +403,10 @@ panelOf slot =
         DecisionNotSaved _ _ panel ->
             panel
 
-        DecisionSaving _ _ ->
+        DecisionSaving _ ->
             PanelClosed
 
-        DecisionRefreshing _ _ ->
+        DecisionRefreshing _ ->
             PanelClosed
 
 
@@ -396,10 +421,10 @@ withPanel panel slot =
         DecisionNotSaved failure raisedAt _ ->
             DecisionNotSaved failure raisedAt panel
 
-        DecisionSaving _ _ ->
+        DecisionSaving _ ->
             slot
 
-        DecisionRefreshing _ _ ->
+        DecisionRefreshing _ ->
             slot
 
 
@@ -415,65 +440,62 @@ mapOpenDraft change slot =
 
 -- The slot as this process `epoch` owns it: a busy decision another process
 -- left behind, whose completion died with it, is idle.
-ownedSlot : Epoch -> DecisionSlot -> DecisionSlot
-ownedSlot epoch slot =
-    case busyOwnedBy epoch slot of
-        Just _ ->
+ownSlot : Epoch -> DecisionSlot -> DecisionSlot
+ownSlot epoch slot =
+    if busyFor epoch slot then
+        slot
+
+    else
+        case slot of
+            DecisionNotSaved _ _ _ ->
+                slot
+
+            DecisionIdle _ ->
+                slot
+
+            DecisionSaving _ ->
+                DecisionIdle PanelClosed
+
+            DecisionRefreshing _ ->
+                DecisionIdle PanelClosed
+
+
+-- The saving decision was written: it stays busy, under its stamp, until
+-- the queue reload that follows settles. Reached only for a result
+-- `Slot.owns` matched to `savingStamp`; any other slot is unchanged.
+decisionWritten : DecisionSlot -> DecisionSlot
+decisionWritten slot =
+    case slot of
+        DecisionSaving saving ->
+            DecisionRefreshing saving
+
+        DecisionRefreshing _ ->
             slot
 
-        Nothing ->
-            case slot of
-                DecisionNotSaved _ _ _ ->
-                    slot
-
-                DecisionIdle _ ->
-                    slot
-
-                DecisionSaving _ _ ->
-                    DecisionIdle PanelClosed
-
-                DecisionRefreshing _ _ ->
-                    DecisionIdle PanelClosed
-
-
--- The decision on `uid` run by process `epoch` was written: it stays busy
--- until the queue reload that follows settles. A result for any other uid
--- or from any other process leaves the slot.
-decisionWritten : Epoch -> Uid -> DecisionSlot -> DecisionSlot
-decisionWritten epoch uid slot =
-    if isSaving epoch uid slot then
-        DecisionRefreshing uid epoch
-
-    else
-        slot
-
-
--- The decision on `uid` run by process `epoch` was not saved, for
--- `failure`, while `latest` is the queue's latest load. A result for any
--- other uid or from any other process leaves the slot.
-decisionNotSaved : Epoch -> Uid -> SaveFailure -> LoadTicket -> DecisionSlot -> DecisionSlot
-decisionNotSaved epoch uid failure latest slot =
-    if isSaving epoch uid slot then
-        DecisionNotSaved failure latest PanelClosed
-
-    else
-        slot
-
-
-isSaving : Epoch -> Uid -> DecisionSlot -> Bool
-isSaving epoch uid slot =
-    case slot of
-        DecisionSaving saving owner ->
-            saving == uid && owner == epoch
-
-        DecisionRefreshing _ _ ->
-            False
-
         DecisionIdle _ ->
-            False
+            slot
 
         DecisionNotSaved _ _ _ ->
-            False
+            slot
+
+
+-- The saving decision was not saved, for `failure`, while `latest` is the
+-- queue's latest load. Reached only for a result `Slot.owns` matched to
+-- `savingStamp`; any other slot is unchanged.
+decisionNotSaved : SaveFailure -> LoadTicket -> DecisionSlot -> DecisionSlot
+decisionNotSaved failure latest slot =
+    case slot of
+        DecisionSaving _ ->
+            DecisionNotSaved failure latest PanelClosed
+
+        DecisionRefreshing _ ->
+            slot
+
+        DecisionIdle _ ->
+            slot
+
+        DecisionNotSaved _ _ _ ->
+            slot
 
 
 -- A decision refused before it started, for `failure`, while `latest` is
@@ -482,12 +504,11 @@ isSaving epoch uid slot =
 -- `epoch`.
 decisionRefused : Epoch -> SaveFailure -> LoadTicket -> DecisionSlot -> DecisionSlot
 decisionRefused epoch failure latest slot =
-    case busyOwnedBy epoch slot of
-        Just _ ->
-            slot
+    if busyFor epoch slot then
+        slot
 
-        Nothing ->
-            DecisionNotSaved failure latest (panelOf slot)
+    else
+        DecisionNotSaved failure latest (panelOf slot)
 
 
 -- The current queue load `load` settled with `result`. The reloaded queue
@@ -501,7 +522,7 @@ decisionRefused epoch failure latest slot =
 queueSettled : LoadTicket -> Result e a -> DecisionSlot -> DecisionSlot
 queueSettled load result slot =
     case slot of
-        DecisionRefreshing _ _ ->
+        DecisionRefreshing _ ->
             DecisionIdle PanelClosed
 
         DecisionNotSaved failure raisedAt _ ->
@@ -516,7 +537,7 @@ queueSettled load result slot =
                 Err _ ->
                     DecisionNotSaved failure raisedAt PanelClosed
 
-        DecisionSaving _ _ ->
+        DecisionSaving _ ->
             slot
 
         DecisionIdle _ ->
@@ -530,15 +551,15 @@ queueSettled load result slot =
 pendingText : Uid -> DecisionSlot -> Maybe SafeText
 pendingText uid slot =
     case slot of
-        DecisionSaving busy _ ->
-            if busy == uid then
+        DecisionSaving saving ->
+            if Slot.stampKey saving == uid then
                 Just (SafeText.literal "Saving the decision…")
 
             else
                 Just (SafeText.literal "Another decision is saving…")
 
-        DecisionRefreshing busy _ ->
-            if busy == uid then
+        DecisionRefreshing saved ->
+            if Slot.stampKey saved == uid then
                 Just (SafeText.literal "Decision saved; refreshing the queue…")
 
             else
@@ -561,8 +582,8 @@ notSavedOf slot =
         DecisionIdle _ ->
             Nothing
 
-        DecisionSaving _ _ ->
+        DecisionSaving _ ->
             Nothing
 
-        DecisionRefreshing _ _ ->
+        DecisionRefreshing _ ->
             Nothing

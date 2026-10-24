@@ -1,4 +1,4 @@
-module Lib.Standing exposing (Standing(..), StandingRead(..), loadStanding, standingArrived, standingFor, standingOf, standingRequested)
+module Lib.Standing exposing (Standing(..), StandingKey, StandingRead(..), loadStanding, runningStanding, standingArrived, standingFor, standingOf, standingRequested)
 
 import Ipe.Error as Error
 import Ipe.Result as Result exposing (Result(..))
@@ -11,6 +11,7 @@ import Lib.Failure exposing (LoadFailure)
 import Lib.Highlight as Highlight
 import Lib.Index as Index
 import Lib.Settings exposing (AppSettings)
+import Lib.Slot as Slot exposing (Stamp)
 import Lib.Uid exposing (Uid)
 
 
@@ -41,13 +42,35 @@ standingOf entry =
 -- The unit page's read of its shown body's standing, keyed by the uid and
 -- body hash it was read for, so a read for another unit or an older body
 -- never stands for the one shown. `StandingReading` is the one read in
--- flight, run by process `owner`, with the body asked for meanwhile: a read
--- asked during it starts nothing, so the slot holds at most one read.
+-- flight, under its stamp, with the body asked for meanwhile: a read asked
+-- during it starts nothing, so the slot holds at most one read.
 type StandingRead
     = StandingUnread
     | StandingShown Uid String Standing
     | StandingFailed Uid String LoadFailure
-    | StandingReading Uid String Epoch (Maybe ( Uid, String ))
+    | StandingReading (Stamp StandingKey) (Maybe StandingKey)
+
+
+-- The unit and body hash one standing read is for.
+type alias StandingKey =
+    ( Uid, String )
+
+
+-- The stamp of the read in flight, whichever process started it.
+runningStanding : StandingRead -> Maybe (Stamp StandingKey)
+runningStanding read =
+    case read of
+        StandingReading reading _ ->
+            Just reading
+
+        StandingUnread ->
+            Nothing
+
+        StandingShown _ _ _ ->
+            Nothing
+
+        StandingFailed _ _ _ ->
+            Nothing
 
 
 -- The standing of `uid`'s body `bodyHash`, under one walk of the review log.
@@ -64,44 +87,37 @@ loadStanding settings uid bodyHash =
 -- with the read to start, if any. During a read this process runs, the body
 -- is only recorded as wanted (the latest wins); a read another process left
 -- behind has no completion left to settle it, so the slot is idle to it.
-standingRequested : Epoch -> Uid -> String -> StandingRead -> ( StandingRead, Maybe ( Uid, String ) )
+standingRequested : Epoch -> Uid -> String -> StandingRead -> ( StandingRead, Maybe (Stamp StandingKey) )
 standingRequested epoch uid bodyHash read =
-    case read of
-        StandingReading reading readHash owner _ ->
-            if owner == epoch then
-                ( StandingReading reading readHash owner (Just ( uid, bodyHash )), Nothing )
+    case Slot.running epoch (runningStanding read) of
+        Just own ->
+            ( StandingReading own (Just ( uid, bodyHash )), Nothing )
 
-            else
-                ( StandingReading uid bodyHash epoch Nothing, Just ( uid, bodyHash ) )
-
-        StandingUnread ->
-            ( StandingReading uid bodyHash epoch Nothing, Just ( uid, bodyHash ) )
-
-        StandingShown _ _ _ ->
-            ( StandingReading uid bodyHash epoch Nothing, Just ( uid, bodyHash ) )
-
-        StandingFailed _ _ _ ->
-            ( StandingReading uid bodyHash epoch Nothing, Just ( uid, bodyHash ) )
+        Nothing ->
+            startStanding epoch ( uid, bodyHash )
 
 
--- The read of `uid`'s body `bodyHash` run by process `epoch` returned with
--- `result`: when another body was asked for meanwhile, the result is
--- dropped and that body's read starts; otherwise the result settles the
--- slot. A result for any read but the one in flight, or from any process
--- but its owner, changes nothing.
-standingArrived : Epoch -> Uid -> String -> Result LoadFailure Standing -> StandingRead -> ( StandingRead, Maybe ( Uid, String ) )
-standingArrived epoch uid bodyHash result read =
-    case read of
-        StandingReading reading readHash owner wanted ->
-            if reading /= uid || readHash /= bodyHash || owner /= epoch then
-                ( read, Nothing )
+-- The read stamped `arrived` returned to process `epoch` with `result`:
+-- when another body was asked for meanwhile, the result is dropped and that
+-- body's read starts; otherwise the result settles the slot. A read the
+-- slot does not own changes nothing.
+standingArrived : Epoch -> Stamp StandingKey -> Result LoadFailure Standing -> StandingRead -> ( StandingRead, Maybe (Stamp StandingKey) )
+standingArrived epoch arrived result read =
+    if not (Slot.owns epoch arrived (runningStanding read)) then
+        ( read, Nothing )
 
-            else
+    else
+        case read of
+            StandingReading _ wanted ->
                 case wanted of
-                    Just ( next, nextHash ) ->
-                        ( StandingReading next nextHash epoch Nothing, Just ( next, nextHash ) )
+                    Just next ->
+                        startStanding epoch next
 
                     Nothing ->
+                        let
+                            ( uid, bodyHash ) =
+                                Slot.stampKey arrived
+                        in
                         case result of
                             Ok standing ->
                                 ( StandingShown uid bodyHash standing, Nothing )
@@ -109,14 +125,24 @@ standingArrived epoch uid bodyHash result read =
                             Err e ->
                                 ( StandingFailed uid bodyHash e, Nothing )
 
-        StandingUnread ->
-            ( read, Nothing )
+            StandingUnread ->
+                ( read, Nothing )
 
-        StandingShown _ _ _ ->
-            ( read, Nothing )
+            StandingShown _ _ _ ->
+                ( read, Nothing )
 
-        StandingFailed _ _ _ ->
-            ( read, Nothing )
+            StandingFailed _ _ _ ->
+                ( read, Nothing )
+
+
+-- The one start of a standing read: `key` read by process `epoch`.
+startStanding : Epoch -> StandingKey -> ( StandingRead, Maybe (Stamp StandingKey) )
+startStanding epoch key =
+    let
+        reading =
+            Slot.stamp epoch key
+    in
+    ( StandingReading reading Nothing, Just reading )
 
 
 -- The read's result for `unit`'s current body, Nothing while none is held.
@@ -140,5 +166,5 @@ standingFor unit read =
             else
                 Nothing
 
-        StandingReading _ _ _ _ ->
+        StandingReading _ _ ->
             Nothing

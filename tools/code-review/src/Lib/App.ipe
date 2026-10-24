@@ -9,7 +9,6 @@ import Ipe.Tea.Web.Cmd as Cmd
 import Lib.Db as LibDb exposing (Decision(..), HistoryCursor(..))
 import Lib.DecisionSlot as DecisionSlot exposing (DecidableRow, DecisionSlot(..), DecisionTarget(..), RefusalPanel(..))
 import Lib.Draft as Draft
-import Lib.Epoch exposing (Epoch)
 import Lib.Failure as Failure exposing (DecideRefusal(..), LoadFailure, RefuseFailure(..), SaveFailure(..))
 import Lib.History as History exposing (HistoryState(..), HistoryWant(..))
 import Lib.Index as Index
@@ -19,7 +18,7 @@ import Lib.ReviewKey exposing (MacKey, ReviewKey(..))
 import Lib.Selected as Selected exposing (SelectedView(..))
 import Lib.ServerLog as ServerLog
 import Lib.Settings as Settings
-import Lib.Slot as Slot exposing (Settle(..))
+import Lib.Slot as Slot exposing (Settle(..), Stamp)
 import Lib.Standing as Standing
 import Lib.Uid exposing (Uid)
 
@@ -152,51 +151,52 @@ keyMode offers model =
 -- A task's result reaches a `Msg` only through the callbacks below, which
 -- turn its failure into a typed case, so no `Msg` holds an error.
 type Msg
-    = PendingLoaded Slot.LoadTicket (Result LoadFailure Queue.QueuePage)
+    = PendingLoaded (Stamp Slot.LoadTicket) (Result LoadFailure Queue.QueuePage)
     | NextPage Index.Cursor
     | ApproveRow DecidableRow
     | RefuseStart DecidableRow
     | RefuseDraft DecidableRow String
     | RefuseCancel DecidableRow
     | RefuseSubmit DecidableRow
-    | DecisionSaved Uid Epoch (Result SaveFailure ( Index.Attested, Index.Written ))
+    | DecisionSaved (Stamp Uid) (Result SaveFailure ( Index.Attested, Index.Written ))
     | Navigated Page
     | ShowQueue
     | ShowHistory
-    | HistoryPageLoaded Slot.LoadTicket (Result LoadFailure History.HistoryPage)
+    | HistoryPageLoaded (Stamp Slot.LoadTicket) (Result LoadFailure History.HistoryPage)
     | HistoryNext LibDb.HistoryCursor
-    | SelectedViewLoaded Uid Epoch (Result LoadFailure (Maybe Index.UnitView))
-    | StandingLoaded Uid String Epoch (Result LoadFailure Standing.Standing)
+    | SelectedViewLoaded (Stamp Uid) (Result LoadFailure (Maybe Index.UnitView))
+    | StandingLoaded (Stamp Standing.StandingKey) (Result LoadFailure Standing.Standing)
     | KeyDown KeyOffers String
     | SelectUnit Int
 
 
 -- The callbacks every page task settles through: the one place its error
 -- becomes a typed case. The error's own text goes to the server log only,
--- through `ServerLog.logged` on the task.
-queueLoaded : Slot.LoadTicket -> Result Error Queue.QueuePage -> Msg
+-- through `ServerLog.logged` on the task. Each carries the stamp of the
+-- task it settles, copied from the slot's start, never minted here.
+queueLoaded : Stamp Slot.LoadTicket -> Result Error Queue.QueuePage -> Msg
 queueLoaded load result =
     PendingLoaded load (Failure.loaded result)
 
 
-historyLoaded : Slot.LoadTicket -> Result Error History.HistoryPage -> Msg
+historyLoaded : Stamp Slot.LoadTicket -> Result Error History.HistoryPage -> Msg
 historyLoaded load result =
     HistoryPageLoaded load (Failure.loaded result)
 
 
-viewLoaded : Uid -> Epoch -> Result Error (Maybe Index.UnitView) -> Msg
-viewLoaded uid epoch result =
-    SelectedViewLoaded uid epoch (Failure.loaded result)
+viewLoaded : Stamp Uid -> Result Error (Maybe Index.UnitView) -> Msg
+viewLoaded read result =
+    SelectedViewLoaded read (Failure.loaded result)
 
 
-standingLoaded : Uid -> String -> Epoch -> Result Error Standing.Standing -> Msg
-standingLoaded uid bodyHash epoch result =
-    StandingLoaded uid bodyHash epoch (Failure.loaded result)
+standingLoaded : Stamp Standing.StandingKey -> Result Error Standing.Standing -> Msg
+standingLoaded read result =
+    StandingLoaded read (Failure.loaded result)
 
 
-decisionSaved : Uid -> Epoch -> Result Error (Result DecideRefusal ( Index.Attested, Index.Written )) -> Msg
-decisionSaved uid epoch result =
-    DecisionSaved uid epoch (Failure.saved result)
+decisionSaved : Stamp Uid -> Result Error (Result DecideRefusal ( Index.Attested, Index.Written )) -> Msg
+decisionSaved saving result =
+    DecisionSaved saving (Failure.saved result)
 
 
 -- The session's first model. It loads nothing: the route entry that follows
@@ -273,7 +273,7 @@ enterPage : Settings.AppSettings -> Page -> Model -> ( Model, Cmd Msg )
 enterPage settings page model =
     let
         entered =
-            { model | page = page, decision = DecisionSlot.ownedSlot settings.epoch model.decision }
+            { model | page = page, decision = DecisionSlot.ownSlot settings.epoch model.decision }
     in
     case page of
         QueuePage ->
@@ -325,7 +325,7 @@ alsoQueue settings cmd model =
 
 -- A queue-slot transition, with the one load it starts, if any: the only
 -- place a queue load is started.
-queueStep : Settings.AppSettings -> ( Slot.LoadSlot Queue.QueueWant, Maybe ( Slot.LoadTicket, Queue.QueueWant ) ) -> Model -> ( Model, Cmd Msg )
+queueStep : Settings.AppSettings -> ( Slot.LoadSlot Queue.QueueWant, Maybe ( Stamp Slot.LoadTicket, Queue.QueueWant ) ) -> Model -> ( Model, Cmd Msg )
 queueStep settings ( slot, next ) model =
     case next of
         Just ( load, want ) ->
@@ -362,7 +362,7 @@ loadHistory settings cursor model =
 
 -- A History-slot transition, with the one load it starts, if any: the only
 -- place a History load is started.
-historyStep : Settings.AppSettings -> ( Slot.LoadSlot History.HistoryWant, Maybe ( Slot.LoadTicket, History.HistoryWant ) ) -> Model -> ( Model, Cmd Msg )
+historyStep : Settings.AppSettings -> ( Slot.LoadSlot History.HistoryWant, Maybe ( Stamp Slot.LoadTicket, History.HistoryWant ) ) -> Model -> ( Model, Cmd Msg )
 historyStep settings ( slot, next ) model =
     case next of
         Just ( load, HistoryFrom cursor ) ->
@@ -457,7 +457,7 @@ step settings msg model =
                 Settles ->
                     let
                         loaded =
-                            { stepped | queueState = Queue.stateFromResult result, decision = DecisionSlot.queueSettled load result stepped.decision }
+                            { stepped | queueState = Queue.stateFromResult result, decision = DecisionSlot.queueSettled (Slot.stampKey load) result stepped.decision }
 
                         ( viewed, viewCmd ) =
                             viewAfterLoad settings { loaded | selected = clampIndex stepped.selected (List.length (queueList loaded)) }
@@ -485,13 +485,17 @@ step settings msg model =
         RefuseSubmit row ->
             submitRefuse settings model row
 
-        DecisionSaved uid epoch result ->
-            case result of
-                Ok ( attested, written ) ->
-                    queueStep settings (Slot.requestLoad Queue.mergeQueueWant settings.epoch (QueueDrain attested written model.queueCursor) model.queueLoad) { model | decision = DecisionSlot.decisionWritten epoch uid model.decision }
+        DecisionSaved saving result ->
+            if Slot.owns settings.epoch saving (DecisionSlot.savingStamp model.decision) then
+                case result of
+                    Ok ( attested, written ) ->
+                        queueStep settings (Slot.requestLoad Queue.mergeQueueWant settings.epoch (QueueDrain attested written model.queueCursor) model.queueLoad) { model | decision = DecisionSlot.decisionWritten model.decision }
 
-                Err failure ->
-                    ( { model | decision = DecisionSlot.decisionNotSaved epoch uid failure (Slot.latestTicket model.queueLoad) model.decision }, Cmd.none )
+                    Err failure ->
+                        ( { model | decision = DecisionSlot.decisionNotSaved failure (Slot.latestTicket model.queueLoad) model.decision }, Cmd.none )
+
+            else
+                ( model, Cmd.none )
 
         Navigated page ->
             enterPage settings page model
@@ -520,11 +524,15 @@ step settings msg model =
         HistoryNext cursor ->
             loadHistory settings cursor model
 
-        SelectedViewLoaded uid epoch result ->
-            withStanding settings (viewStep settings (Selected.viewArrived epoch uid result model.selectedView) model)
+        SelectedViewLoaded read result ->
+            if Slot.owns settings.epoch read (Selected.runningView model.selectedView) then
+                withStanding settings (viewStep settings (Selected.viewArrived settings.epoch read result model.selectedView) model)
 
-        StandingLoaded uid bodyHash epoch result ->
-            standingStep settings (Standing.standingArrived epoch uid bodyHash result model.standing) model
+            else
+                ( model, Cmd.none )
+
+        StandingLoaded read result ->
+            standingStep settings (Standing.standingArrived settings.epoch read result model.standing) model
 
         KeyDown offers key ->
             keyActionMsg settings (Keys.keyAction (keyMode offers model) key) model
@@ -609,32 +617,34 @@ selectAt settings i model =
 
 
 -- A source-slot transition, with the one read it starts, if any: the only
--- place a source read is started, its result stamped with this process's
--- epoch.
-viewStep : Settings.AppSettings -> ( Selected.SelectedView, Maybe Uid ) -> Model -> ( Model, Cmd Msg )
+-- place a source read is started, its result carrying the read's stamp.
+viewStep : Settings.AppSettings -> ( Selected.SelectedView, Maybe (Stamp Uid) ) -> Model -> ( Model, Cmd Msg )
 viewStep settings ( state, next ) model =
     ( { model | selectedView = state }, loadViewCmd settings next )
 
 
-loadViewCmd : Settings.AppSettings -> Maybe Uid -> Cmd Msg
+loadViewCmd : Settings.AppSettings -> Maybe (Stamp Uid) -> Cmd Msg
 loadViewCmd settings next =
     case next of
-        Just uid ->
-            Cmd.perform (ServerLog.logged "source load failed" (Queue.loadUnitView settings.index uid)) (viewLoaded uid settings.epoch)
+        Just read ->
+            Cmd.perform (ServerLog.logged "source load failed" (Queue.loadUnitView settings.index (Slot.stampKey read))) (viewLoaded read)
 
         Nothing ->
             Cmd.none
 
 
 -- A standing-slot transition, with the one read it starts, if any: the only
--- place a standing read is started, its result stamped with this process's
--- epoch.
-standingStep : Settings.AppSettings -> ( Standing.StandingRead, Maybe ( Uid, String ) ) -> Model -> ( Model, Cmd Msg )
+-- place a standing read is started, its result carrying the read's stamp.
+standingStep : Settings.AppSettings -> ( Standing.StandingRead, Maybe (Stamp Standing.StandingKey) ) -> Model -> ( Model, Cmd Msg )
 standingStep settings ( read, next ) model =
     case next of
-        Just ( uid, bodyHash ) ->
+        Just reading ->
+            let
+                ( uid, bodyHash ) =
+                    Slot.stampKey reading
+            in
             ( { model | standing = read }
-            , Cmd.perform (ServerLog.logged "standing load failed" (Standing.loadStanding settings uid bodyHash)) (standingLoaded uid bodyHash settings.epoch)
+            , Cmd.perform (ServerLog.logged "standing load failed" (Standing.loadStanding settings uid bodyHash)) (standingLoaded reading)
             )
 
         Nothing ->
@@ -750,9 +760,9 @@ saveDecision settings model target uid drawn decision =
                 case DecisionSlot.decidableAs model.selected model.queueState model.selectedView target uid drawn of
                     Ok row ->
                         case DecisionSlot.startDecision settings.epoch uid model.decision of
-                            Just saving ->
-                                ( { model | decision = saving }
-                                , Cmd.perform (ServerLog.logged "decision save failed" (decisionTask settings macKey model row decision)) (decisionSaved uid settings.epoch)
+                            Just ( started, saving ) ->
+                                ( { model | decision = started }
+                                , Cmd.perform (ServerLog.logged "decision save failed" (decisionTask settings macKey model row decision)) (decisionSaved saving)
                                 )
 
                             Nothing ->

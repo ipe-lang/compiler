@@ -476,6 +476,16 @@ errorTextNames =
     [ "Error.toString", "Error.message", "Ipe.Error.toString", "Ipe.Error.message" ]
 
 
+-- The `src/Lib` modules whose code may hold an error's text unrendered,
+-- each with why no page can show that text. Every other `src/Lib` module,
+-- one added later included, shows an error's text only rendered as foreign.
+errorTextExempt : List ( String, String )
+errorTextExempt =
+    [ ( "Lib/ServerLog.ipe", "writes a failed task's error to the server log, the operator's sink, and passes the failure on unchanged" )
+    , ( "Lib/RepoPath.ipe", "builds the startup refusal's error, printed only to stderr by `src/Main.ipe` through `SafeText.renderForeign`" )
+    ]
+
+
 -- The renderers that draw a `SafeText`'s parts, a label's parts, a
 -- source's tokens and its spelled-out text, each once per `Html.text` it
 -- holds.
@@ -838,7 +848,7 @@ tokenViolations rel lexed =
             neighbours lexed.tokens
 
         guardedErrors =
-            List.member rel [ "Lib/View.ipe", "Lib/Queue.ipe", "Lib/Slot.ipe", "Lib/Selected.ipe", "Lib/Standing.ipe", "Lib/DecisionSlot.ipe", "Lib/History.ipe" ]
+            String.startsWith "Lib/" rel && not (List.any (\( exempt, _ ) -> exempt == rel) errorTextExempt)
 
         computed =
             List.filter (\n -> isWord uiTextNames n.token && not (kindIs StringToken n.after)) around
@@ -1328,7 +1338,10 @@ scanRefusesEvasions sources =
         && breaks ErrorTextUnrendered (inView "shown e =\n    Ui.text (Error.message e)")
         && caughtBy ErrorTextUnrendered (inQueue "shown e =\n    SafeText.literal (Error.toString e)")
         && clean (inQueue "shown e =\n    SafeText.renderForeign (Error.message e)")
-        && clean (appendTo "Lib/Db.ipe" "shown e =\n    Error.message e" sources)
+        && clean (appendTo "Lib/ServerLog.ipe" "shown e =\n    Error.message e" sources)
+        && caughtBy ErrorTextUnrendered (appendTo "Lib/Db.ipe" "shown e =\n    Error.message e" sources)
+        && caughtBy ErrorTextUnrendered (sources ++ [ indexSource ( "Lib/Fresh.ipe", freshModule "Error.message e" ) ])
+        && clean (sources ++ [ indexSource ( "Lib/Fresh.ipe", freshModule "SafeText.renderForeign (Error.message e)" ) ])
         && caughtBy StrayHtmlText (inView "shown x =\n    Html.text x")
         && caughtBy StrayHtmlText (appendTo "Lib/Links.ipe" "shown x =\n    Ipe.Html.text x" sources)
         && caughtBy FlattenedText (inView "shown x =\n    ( \"--\", SafeText.toString x )")
@@ -1403,6 +1416,21 @@ editIn rel from to sources =
 appendToWhole : String -> String -> List Source -> List Source
 appendToWhole rel extra sources =
     rewritten rel (\text -> text ++ "\n\n" ++ extra ++ "\n") sources
+
+
+-- A module added to `src/Lib`, unlisted anywhere, whose one declaration
+-- shows `shown`.
+freshModule : String -> String
+freshModule shown =
+    "module Lib.Fresh exposing (shown)\n\nimport Ipe.Error as Error\nimport Lib.SafeText as SafeText\n\n\nshown e =\n    " ++ shown ++ "\n"
+
+
+-- Every exemption from the error-text guard names a module of `src/Lib`
+-- the tree holds, and says why. Red if an exemption outlives its module,
+-- so a module added under its name would be unguarded.
+errorTextExemptionsExist : List Source -> Bool
+errorTextExemptionsExist sources =
+    List.all (\( rel, why ) -> String.startsWith "Lib/" rel && not (String.isEmpty why) && List.any (\source -> source.rel == rel) sources) errorTextExempt
 
 
 -- The tree with module `rel` grown by `extra`. A new declaration is lexed
@@ -1632,6 +1660,7 @@ checks =
                     [ check "untrusted text reaches a page only through the one sink: the source scan finds no violation" (onTree realTreeClean tree)
                     , check "each way around the text sink scan is a violation of its own rule" (onTree scanRefusesEvasions tree)
                     , check "an evasion case read apart from its module is judged as the module lexed again whole" (onTree appendedSiteKeysAsModule tree)
+                    , check "every exemption from the error-text guard names a module of src/Lib" (onTree errorTextExemptionsExist tree)
                     , Task.succeed ( "the text sink scan lexes literals and comments as Ipê reads them", lexerReadsLiterals )
                     ]
             )
