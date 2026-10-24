@@ -675,7 +675,7 @@ mod line_reader_tests {
             "an over-long secret is refused, never truncated"
         );
         let next = read_secret_line(&mut input, SMALL, &latch);
-        assert!(matches!(next, Ok(_)), "the next line is read whole");
+        assert!(next.is_ok(), "the next line is read whole");
         let Ok(secret) = next else { return };
         assert_eq!(crate::secret::secret_reveal(secret), "n");
     }
