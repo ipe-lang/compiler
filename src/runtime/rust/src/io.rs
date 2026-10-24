@@ -17,7 +17,7 @@ const DRAIN_CAP_BYTES: u64 = 64 * 1024 * 1024;
 struct ReadCaps {
     /// The longest line admitted, newline excluded.
     line: u64,
-    /// The bytes past `line + 1` discarded while looking for the refused line's newline.
+    /// The bytes past `line + 2` discarded while looking for the refused line's newline.
     drain: u64,
 }
 
@@ -92,9 +92,10 @@ fn read_line_into<R: BufRead>(
     if desynced.load(Ordering::Acquire) {
         return Err(LineRefusal::Desynced);
     }
+    // Room for the line and its `\r\n`, so a CRLF line at the cap is admitted.
     let read = reader
         .by_ref()
-        .take(caps.line.saturating_add(1))
+        .take(caps.line.saturating_add(2))
         .read_until(b'\n', buf);
     let count = match read {
         Ok(count) => count,
@@ -113,7 +114,10 @@ fn read_line_into<R: BufRead>(
         if buf.last() == Some(&b'\r') {
             buf.pop();
         }
-        return Ok(LineEnd::Line);
+        if (buf.len() as u64) <= caps.line {
+            return Ok(LineEnd::Line);
+        }
+        return Err(LineRefusal::TooLong { cap: caps.line });
     }
     if (buf.len() as u64) <= caps.line {
         return Ok(LineEnd::Line);
@@ -203,7 +207,7 @@ fn read_secret_line<R: BufRead>(
     desynced: &AtomicBool,
 ) -> Result<crate::secret::Secret, LineRefusal> {
     use zeroize::Zeroize;
-    let capacity = usize::try_from(caps.line.saturating_add(1)).unwrap_or(0);
+    let capacity = usize::try_from(caps.line.saturating_add(2)).unwrap_or(0);
     let mut buf = zeroize::Zeroizing::new(Vec::with_capacity(capacity));
     match read_line_into(reader, &mut buf, caps, desynced)? {
         LineEnd::Eof => Ok(crate::secret::secret_from_string(String::new())),
@@ -484,9 +488,9 @@ mod line_reader_tests {
 
     #[test]
     fn drain_at_budget_reaches_the_next_line() {
-        // 5 bytes fill the read window; the rest, newline included, is exactly the 8-byte budget.
+        // 6 bytes fill the read window; the rest, newline included, is exactly the 8-byte budget.
         let latch = AtomicBool::new(false);
-        let mut input = cursor(b"yyyyyzzzzzzz\nn\n");
+        let mut input = cursor(b"yyyyyyzzzzzzz\nn\n");
         assert_eq!(
             read_text_line(&mut input, SMALL, &latch),
             Err(LineRefusal::TooLong { cap: 4 })
@@ -501,7 +505,7 @@ mod line_reader_tests {
     fn drain_budget_exhausted_latches() {
         // One byte more than `drain_at_budget_reaches_the_next_line`: the newline is past the budget.
         let latch = AtomicBool::new(false);
-        let mut input = cursor(b"yyyyyzzzzzzzz\nn\n");
+        let mut input = cursor(b"yyyyyyzzzzzzzz\nn\n");
         assert_eq!(
             read_text_line(&mut input, SMALL, &latch),
             Err(LineRefusal::TooLong { cap: 4 })
@@ -529,6 +533,38 @@ mod line_reader_tests {
         assert_eq!(
             read_text_line(&mut input, SMALL, &latch),
             Ok("b\r".to_owned())
+        );
+    }
+
+    #[test]
+    fn crlf_line_at_cap_admitted() {
+        let latch = AtomicBool::new(false);
+        let mut input = cursor(b"yyyy\r\nn\n");
+        assert_eq!(
+            read_text_line(&mut input, SMALL, &latch),
+            Ok("yyyy".to_owned())
+        );
+        assert_eq!(
+            read_text_line(&mut input, SMALL, &latch),
+            Ok("n".to_owned())
+        );
+    }
+
+    #[test]
+    fn crlf_line_past_cap_refused() {
+        let latch = AtomicBool::new(false);
+        let mut input = cursor(b"yyyyy\r\nn\n");
+        assert_eq!(
+            read_text_line(&mut input, SMALL, &latch),
+            Err(LineRefusal::TooLong { cap: 4 })
+        );
+        assert_eq!(
+            read_text_line(&mut input, SMALL, &latch),
+            Ok("n".to_owned())
+        );
+        assert!(
+            !latch.load(Ordering::Acquire),
+            "a drained line keeps stdin in sync"
         );
     }
 
