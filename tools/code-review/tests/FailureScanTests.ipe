@@ -642,7 +642,7 @@ reachViolationsOf : List ScanModule -> List String
 reachViolationsOf modules =
     let
         start =
-            { seen = [], frontier = [ ( "Lib/App.ipe", "Model" ), ( "Lib/App.ipe", "Msg" ) ], violations = [] }
+            { seen = [], frontier = [ ( "Lib/Session.ipe", "Model" ), ( "Lib/Session.ipe", "Msg" ) ], violations = [] }
 
         walked =
             walkFrom modules (reachCeiling + 1) start
@@ -1614,9 +1614,9 @@ editIn rel old new sources =
 -- ── scanner self-tests ──────────────────────────────────────────────────
 
 
-appOnly : String -> List ( String, String )
-appOnly text =
-    [ ( "Lib/App.ipe", text ) ]
+sessionOnly : String -> List ( String, String )
+sessionOnly text =
+    [ ( "Lib/Session.ipe", text ) ]
 
 
 reachFlags : List ( String, String ) -> Bool
@@ -1633,21 +1633,21 @@ reachFlags sources =
 -- Red if the walk misses a path an error could reach a page by.
 typeWalkRefuses : Bool
 typeWalkRefuses =
-    reachFlags (appOnly "type alias Model =\n    { queueState : QueueState }\n\n\ntype Msg\n    = Reload\n\n\ntype QueueState\n    = Loading\n    | Failed Error\n")
-        && reachFlags (appOnly "type alias Model =\n    { n : Int }\n\n\ntype Msg\n    = QueueLoaded (Result Error QueuePage)\n\n\ntype alias QueuePage =\n    { n : Int }\n")
+    reachFlags (sessionOnly "type alias Model =\n    { queueState : QueueState }\n\n\ntype Msg\n    = Reload\n\n\ntype QueueState\n    = Loading\n    | Failed Error\n")
+        && reachFlags (sessionOnly "type alias Model =\n    { n : Int }\n\n\ntype Msg\n    = QueueLoaded (Result Error QueuePage)\n\n\ntype alias QueuePage =\n    { n : Int }\n")
         && reachFlags
-            [ ( "Lib/App.ipe", "import Lib.Failure as Failure exposing (LoadFailure)\n\n\ntype alias Model =\n    { load : Maybe LoadFailure, save : Maybe Failure.SaveFailure }\n\n\ntype Msg\n    = Reload\n" )
+            [ ( "Lib/Session.ipe", "import Lib.Failure as Failure exposing (LoadFailure)\n\n\ntype alias Model =\n    { load : Maybe LoadFailure, save : Maybe Failure.SaveFailure }\n\n\ntype Msg\n    = Reload\n" )
             , ( "Lib/Failure.ipe", "type LoadFailure\n    = LoadFailed\n\n\ntype SaveFailure\n    = SaveFailed Error\n" )
             ]
-        && reachFlags (appOnly "type alias Model =\n    { x : Foo.Bar }\n\n\ntype Msg\n    = Reload\n")
-        && reachFlags (appOnly "import Lib.Gone exposing (Gone)\n\n\ntype alias Model =\n    { gone : Gone }\n\n\ntype Msg\n    = Reload\n")
-        && reachFlags (appOnly "type Msg\n    = Reload\n")
-        && reachFlags (appOnly "type alias Model =\n    { n : Int }\n\n\ntype Msg\n    = Reload\n\n    | Failed Error\n")
-        && reachFlags (appOnly (chainedModel (reachCeiling + 2)))
-        && reachFlags (appOnly (chainedModel (reachCeiling - 2)))
-        && List.isEmpty (reachViolations (appOnly (chainedModel (reachCeiling - 3))))
-        && List.isEmpty (reachViolations (appOnly "type alias Model =\n    { refuseError : Maybe RefuseFailure }\n\n\ntype Msg\n    = Reload\n\n\ntype RefuseFailure\n    = DraftWhileSaving\n"))
-        && List.isEmpty (reachViolations (appOnly (chainedModel 8)))
+        && reachFlags (sessionOnly "type alias Model =\n    { x : Foo.Bar }\n\n\ntype Msg\n    = Reload\n")
+        && reachFlags (sessionOnly "import Lib.Gone exposing (Gone)\n\n\ntype alias Model =\n    { gone : Gone }\n\n\ntype Msg\n    = Reload\n")
+        && reachFlags (sessionOnly "type Msg\n    = Reload\n")
+        && reachFlags (sessionOnly "type alias Model =\n    { n : Int }\n\n\ntype Msg\n    = Reload\n\n    | Failed Error\n")
+        && reachFlags (sessionOnly (chainedModel (reachCeiling + 2)))
+        && reachFlags (sessionOnly (chainedModel (reachCeiling - 2)))
+        && List.isEmpty (reachViolations (sessionOnly (chainedModel (reachCeiling - 3))))
+        && List.isEmpty (reachViolations (sessionOnly "type alias Model =\n    { refuseError : Maybe RefuseFailure }\n\n\ntype Msg\n    = Reload\n\n\ntype RefuseFailure\n    = DraftWhileSaving\n"))
+        && List.isEmpty (reachViolations (sessionOnly (chainedModel 8)))
 
 
 -- A `Model` and `Msg` reaching `depth + 1` more declarations, each naming
