@@ -7216,7 +7216,10 @@ mod tests {
         let mut carried = BTreeSet::new();
         let mut pages = 0;
         for (name, page) in &site {
-            if !name.ends_with(".html") {
+            if !Path::new(name)
+                .extension()
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("html"))
+            {
                 continue;
             }
             pages += 1;

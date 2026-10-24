@@ -558,7 +558,7 @@ mod tests {
         let fixture = RootFixture::main(MAIN).expect("fixture");
         let folder = fixture.path().join("src");
         let main = folder.join("Main.ipe");
-        let loaded = DriverLoader.load(&[folder.clone()], &main, Some(MAIN));
+        let loaded = DriverLoader.load(std::slice::from_ref(&folder), &main, Some(MAIN));
         let expected = CliError::NoManifest { dir: folder }.to_string();
         let err = loaded.err();
         assert_eq!(err, Some(LoadError::RootRefused(expected)));
