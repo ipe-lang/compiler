@@ -1,0 +1,173 @@
+module Lib.Slot exposing (LoadSlot, LoadTicket, Settle(..), ensureLoad, firstTicket, idleLoad, isCurrentLoad, latestTicket, latestWant, loadArrived, nextTicket, requestLoad, runningWant, ticketNumber)
+
+import Lib.Epoch exposing (Epoch)
+
+
+-- The number of one load of a page slot (the queue, a History page). Each
+-- load a slot starts takes the ticket after the slot's latest, and a result
+-- settles the slot only under the slot's latest ticket, so a slower earlier
+-- load never replaces the result of a later one. Opaque: built only by
+-- `firstTicket` and `nextTicket`.
+type LoadTicket
+    = LoadTicket Int
+
+
+firstTicket : LoadTicket
+firstTicket =
+    LoadTicket 0
+
+
+nextTicket : LoadTicket -> LoadTicket
+nextTicket ticket =
+    case ticket of
+        LoadTicket n ->
+            LoadTicket (n + 1)
+
+
+-- True when a result carrying `load` is the slot's latest load.
+isCurrentLoad : LoadTicket -> LoadTicket -> Bool
+isCurrentLoad load latest =
+    ticketNumber load == ticketNumber latest
+
+
+ticketNumber : LoadTicket -> Int
+ticketNumber ticket =
+    case ticket of
+        LoadTicket n ->
+            n
+
+
+-- A page slot's load: idle at its latest ticket, or the one load in flight,
+-- under its ticket, run by process `owner`, with what was asked meanwhile.
+-- A load asked while one runs is recorded, never started, so the slot holds
+-- at most one load; the running load's result is dropped while anything is
+-- wanted, and the wanted load starts in its place. A load another process
+-- left behind has no completion left to settle it, so the slot is idle to
+-- every transition. Opaque: changed only by the transitions below, so a
+-- ticket and a load in flight cannot disagree.
+type LoadSlot want
+    = LoadIdle LoadTicket
+    | LoadRunning LoadTicket Epoch (Maybe want)
+
+
+-- Whether an arrived result settles its page (`Settles`), or is dropped
+-- (`Dropped`): superseded by a load wanted meanwhile, from another load, or
+-- from another process.
+type Settle
+    = Settles
+    | Dropped
+
+
+-- A slot with no load run yet.
+idleLoad : LoadSlot want
+idleLoad =
+    LoadIdle firstTicket
+
+
+-- The slot's latest ticket: the one in flight, or the last one settled.
+latestTicket : LoadSlot want -> LoadTicket
+latestTicket slot =
+    case slot of
+        LoadIdle ticket ->
+            ticket
+
+        LoadRunning ticket _ _ ->
+            ticket
+
+
+-- What the load in flight has wanted after it: Nothing while the slot is
+-- idle to process `epoch`, Just Nothing while it runs with nothing wanted.
+runningWant : Epoch -> LoadSlot want -> Maybe (Maybe want)
+runningWant epoch slot =
+    case slot of
+        LoadIdle _ ->
+            Nothing
+
+        LoadRunning _ owner wanted ->
+            if owner == epoch then
+                Just wanted
+
+            else
+                Nothing
+
+
+-- `want` asked for by process `epoch`, with the load to start, if any: an
+-- idle slot starts it under its next ticket; during a load this process
+-- runs it is only recorded, folded into what was wanted by `merge`.
+requestLoad : (want -> want -> want) -> Epoch -> want -> LoadSlot want -> ( LoadSlot want, Maybe ( LoadTicket, want ) )
+requestLoad merge epoch want slot =
+    case slot of
+        LoadIdle ticket ->
+            startLoad epoch ticket want
+
+        LoadRunning ticket owner wanted ->
+            if owner == epoch then
+                ( LoadRunning ticket owner (Just (wantedWith merge wanted want)), Nothing )
+
+            else
+                startLoad epoch ticket want
+
+
+-- `want` asked for only to have the slot's data loaded: a load this process
+-- runs will settle it, so nothing is recorded; an idle slot starts it.
+ensureLoad : (want -> want -> want) -> Epoch -> want -> LoadSlot want -> ( LoadSlot want, Maybe ( LoadTicket, want ) )
+ensureLoad merge epoch want slot =
+    case runningWant epoch slot of
+        Just _ ->
+            ( slot, Nothing )
+
+        Nothing ->
+            requestLoad merge epoch want slot
+
+
+-- The load under `load` run by process `epoch` returned: with a load wanted
+-- meanwhile its result is `Dropped` and the wanted load starts; with none
+-- the slot is idle and the result `Settles`. A result under any ticket but
+-- the one in flight, or from any process but its owner, is `Dropped` with
+-- the slot unchanged.
+loadArrived : Epoch -> LoadTicket -> LoadSlot want -> ( Settle, LoadSlot want, Maybe ( LoadTicket, want ) )
+loadArrived epoch load slot =
+    case slot of
+        LoadIdle _ ->
+            ( Dropped, slot, Nothing )
+
+        LoadRunning ticket owner wanted ->
+            if owner /= epoch || not (isCurrentLoad load ticket) then
+                ( Dropped, slot, Nothing )
+
+            else
+                case wanted of
+                    Just next ->
+                        let
+                            ( started, start ) =
+                                startLoad epoch ticket next
+                        in
+                        ( Dropped, started, start )
+
+                    Nothing ->
+                        ( Settles, LoadIdle ticket, Nothing )
+
+
+startLoad : Epoch -> LoadTicket -> want -> ( LoadSlot want, Maybe ( LoadTicket, want ) )
+startLoad epoch latest want =
+    let
+        ticket =
+            nextTicket latest
+    in
+    ( LoadRunning ticket epoch Nothing, Just ( ticket, want ) )
+
+
+wantedWith : (want -> want -> want) -> Maybe want -> want -> want
+wantedWith merge wanted want =
+    case wanted of
+        Just held ->
+            merge held want
+
+        Nothing ->
+            want
+
+
+-- The later of two wants, for a slot whose loads only read.
+latestWant : want -> want -> want
+latestWant _ newer =
+    newer

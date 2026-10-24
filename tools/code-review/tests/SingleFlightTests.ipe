@@ -14,15 +14,20 @@ import Ipe.Time.Timestamp as Timestamp
 import Ipe.Ui as Ui
 import Lib.App as App exposing (KeyOffers(..), Model, Msg(..), Page(..))
 import Lib.Db as LibDb exposing (Decision(..))
+import Lib.DecisionSlot as DecisionSlot exposing (DecisionSlot(..), DecisionTarget(..), RefusalPanel(..))
 import Lib.Draft as Draft
 import Lib.Epoch as Epoch exposing (Epoch)
 import Lib.Failure as Failure exposing (DecideRefusal(..), LoadFailure(..), ReasonRefusal(..), RefuseFailure(..), SaveFailure(..))
+import Lib.History as History exposing (HistoryState(..), HistoryWant(..))
 import Lib.Index as Index exposing (Change(..), RefusalReason(..), SourceView(..), StaleReason(..))
 import Lib.Keys as Keys exposing (KeyAction(..))
-import Lib.Queue as Queue exposing (DecisionSlot(..), DecisionTarget(..), HistoryState(..), HistoryWant(..), QueueState(..), QueueWant(..), RefusalPanel(..), SelectedView(..), Settle(..), StandingRead(..), UnitPageState(..))
+import Lib.Queue as Queue exposing (QueueState(..), QueueWant(..), UnitPageState(..))
 import Lib.ReviewKey as ReviewKey exposing (ReviewKey(..))
 import Lib.SafeText as SafeText
+import Lib.Selected as Selected exposing (SelectedView(..))
 import Lib.Settings as Settings
+import Lib.Slot as Slot exposing (Settle(..))
+import Lib.Standing as Standing exposing (StandingRead(..))
 import Lib.Uid as Uid exposing (Uid)
 import Lib.View as View
 import TestSupport exposing (Scratch, check, checkReporting, cleanupIndex, decideNow, envAppSettings, execIndex, fixtureLibRs, freshScratch, loadPageNow, loadUnitNow, migratedReviewAt, refusalOf, removeFileIfAny, seedIndex, testMacKey, uid, labelOf, labelText, viewA, writeFileText)
@@ -108,7 +113,7 @@ unitAt unit =
 
 queued : Index.UnitView -> Queue.QueuedUnit
 queued loaded =
-    { unit = loaded.unit, change = New, changed = Nothing, standing = Queue.Undecided }
+    { unit = loaded.unit, change = New, changed = Nothing, standing = Standing.Undecided }
 
 
 queuePageOf : List Index.UnitView -> Queue.QueuePage
@@ -128,7 +133,7 @@ queuePageOf units =
 
 
 -- The queue page showing `units`, the first one selected with `view`.
-queueModel : List Index.UnitView -> Queue.SelectedView -> Model
+queueModel : List Index.UnitView -> Selected.SelectedView -> Model
 queueModel units view =
     { initialModel | queueState = Loaded (queuePageOf units), selectedView = view }
 
@@ -151,7 +156,7 @@ cardModel units selected view =
 -- A message is baked from the render it was sent from, as a browser sends
 -- it. The message a control the render of `drawnFrom` draws for `unit`
 -- sends; none when that render draws no decision control for the unit.
-drawnOn : Model -> Uid -> (Queue.DecidableRow -> Msg) -> List Msg
+drawnOn : Model -> Uid -> (DecisionSlot.DecidableRow -> Msg) -> List Msg
 drawnOn drawnFrom unit control =
     case App.decidableRow drawnFrom unit of
         Just row ->
@@ -176,11 +181,11 @@ refusalOpened settings drawnFrom unit =
 -- The message a control of the refusal panel the render of `drawnFrom`
 -- draws on `unit`'s row sends, carrying the row that render's panel is
 -- drawn for; none when that render draws no panel on the unit.
-panelOn : Model -> Uid -> (Queue.DecidableRow -> Msg) -> List Msg
+panelOn : Model -> Uid -> (DecisionSlot.DecidableRow -> Msg) -> List Msg
 panelOn drawnFrom unit control =
     case App.keyOffers drawnFrom of
         PanelDrawn (Just row) ->
-            if Queue.rowUid row == unit then
+            if DecisionSlot.rowUid row == unit then
                 [ control row ]
 
             else
@@ -292,7 +297,7 @@ unitEntriesDuringReadCoalesce settings a b =
             after settings [ Navigated (unitAt ub), Navigated (unitAt uc) ] first
 
         ( _, startedDuring ) =
-            Queue.reloadView settings.epoch ub first.selectedView
+            Selected.reloadView settings.epoch ub first.selectedView
 
         returned =
             after settings [ SelectedViewLoaded ua settings.epoch (Ok (Just a)) ] entered
@@ -335,7 +340,7 @@ oneReadSlotAcrossPages settings a b =
             after settings [ Navigated QueuePage ] unitReading
 
         queueLoaded =
-            after settings [ PendingLoaded (Queue.latestTicket backOnQueue.queueLoad) (Ok (queuePageOf [ a, b ])) ] backOnQueue
+            after settings [ PendingLoaded (Slot.latestTicket backOnQueue.queueLoad) (Ok (queuePageOf [ a, b ])) ] backOnQueue
     in
     inFlight onUnitPage == Just ( ua, Just ub )
         && inFlight keysOnUnitPage == Just ( ua, Just ub )
@@ -368,7 +373,7 @@ unitPageSettlesOnItsOwnRead settings a b =
             after settings [ SelectedViewLoaded ua settings.epoch (Ok (Just a)) ] waiting
 
         queueLoaded =
-            after settings [ PendingLoaded (Queue.latestTicket otherReturned.queueLoad) (Ok (queuePageOf [ a ])) ] otherReturned
+            after settings [ PendingLoaded (Slot.latestTicket otherReturned.queueLoad) (Ok (queuePageOf [ a ])) ] otherReturned
 
         ownReturned =
             after settings [ SelectedViewLoaded ub settings.epoch (Ok (Just b)) ] queueLoaded
@@ -430,12 +435,12 @@ decisionsSingleFlight settings a b =
     in
     offers shown ua
         && offers settled ua
-        && Queue.startDecision settings.epoch ua (DecisionSaving ua settings.epoch) == Nothing
+        && DecisionSlot.startDecision settings.epoch ua (DecisionSaving ua settings.epoch) == Nothing
         && saving.decision == DecisionSaving ua settings.epoch
         && pressedAgain.decision == DecisionSaving ua settings.epoch
         && refusing.decision == DecisionSaving ua settings.epoch
-        && Queue.openPanel refusing.decision == Nothing
-        && Queue.notSavedOf settled.decision == Just SaveFailed
+        && DecisionSlot.openPanel refusing.decision == Nothing
+        && DecisionSlot.notSavedOf settled.decision == Just SaveFailed
         && next.decision == DecisionSaving ua settings.epoch
         && lateOther.decision == DecisionSaving ua settings.epoch
 
@@ -499,7 +504,7 @@ refusalPanelLivesInIdleSlot settings a b file =
             after settings [ Navigated QueuePage ] opened
 
         reloaded =
-            after settings [ PendingLoaded (Queue.latestTicket reloading.queueLoad) (Ok (queuePageOf [ a, b ])) ] reloading
+            after settings [ PendingLoaded (Slot.latestTicket reloading.queueLoad) (Ok (queuePageOf [ a, b ])) ] reloading
     in
     offers shown ua
         && offers secondShown ub
@@ -513,14 +518,14 @@ refusalPanelLivesInIdleSlot settings a b file =
         && otherRefused == otherSaving
         && String.contains "Another decision is saving…" (page otherRefused)
         && not (panelDrawn (page otherRefused))
-        && Queue.openPanel opened.decision == Just ( ua, draft )
+        && DecisionSlot.openPanel opened.decision == Just ( ua, draft )
         && panelDrawn (page opened)
-        && Queue.notSavedOf elsewhere.decision == Just (SaveRefused SourceNotShown)
-        && Queue.openPanel elsewhere.decision == Just ( ua, draft )
+        && DecisionSlot.notSavedOf elsewhere.decision == Just (SaveRefused SourceNotShown)
+        && DecisionSlot.openPanel elsewhere.decision == Just ( ua, draft )
         && strayUnit == opened
         && strayFile == opened
-        && Queue.openPanel reloading.decision == Just ( ua, draft )
-        && Queue.openPanel reloaded.decision == Nothing
+        && DecisionSlot.openPanel reloading.decision == Just ( ua, draft )
+        && DecisionSlot.openPanel reloaded.decision == Nothing
 
 
 -- The refusal panel opens only on a row the shown page draws decision
@@ -615,18 +620,18 @@ refusalPanelOnlyOnOfferedRow settings a b file =
         && after settings (drawnOn secondShown ub RefuseStart) shown == shown
         && not (offers blocking (uid "r-blocking"))
         && after settings (drawnOn fileShown file.uid RefuseStart) (withRefusal { file | digest = Nothing } shown) == withRefusal { file | digest = Nothing } shown
-        && Queue.openPanel opened.decision == Just ( ua, { refuseDraft = Draft.empty, refuseError = Nothing } )
-        && Queue.openPanel drafted.decision == Just ( ua, { refuseDraft = Draft.draft "needs a test", refuseError = Nothing } )
+        && DecisionSlot.openPanel opened.decision == Just ( ua, { refuseDraft = Draft.empty, refuseError = Nothing } )
+        && DecisionSlot.openPanel drafted.decision == Just ( ua, { refuseDraft = Draft.draft "needs a test", refuseError = Nothing } )
         && movedAway.selected == 1
-        && Queue.openPanel movedAway.decision == Nothing
+        && DecisionSlot.openPanel movedAway.decision == Nothing
         && nextPage.queueState == Loading
-        && Queue.openPanel nextPage.decision == Nothing
+        && DecisionSlot.openPanel nextPage.decision == Nothing
         && toHistory.page == HistoryPage
-        && Queue.openPanel toHistory.decision == Nothing
-        && Queue.openPanel reading.decision /= Nothing
-        && Queue.decidableSource ua readWithheld.selectedView == Nothing
-        && Queue.openPanel readWithheld.decision == Nothing
-        && Queue.openPanel readShown.decision == Just ( ua, { refuseDraft = Draft.draft "needs a test", refuseError = Nothing } )
+        && DecisionSlot.openPanel toHistory.decision == Nothing
+        && DecisionSlot.openPanel reading.decision /= Nothing
+        && Selected.decidableSource ua readWithheld.selectedView == Nothing
+        && DecisionSlot.openPanel readWithheld.decision == Nothing
+        && DecisionSlot.openPanel readShown.decision == Just ( ua, { refuseDraft = Draft.draft "needs a test", refuseError = Nothing } )
         && after settings (drawnOn secondShown ub RefuseSubmit) drafted == drafted
         && after settings (drawnOn fileShown file.uid RefuseSubmit) drafted == drafted
         && after settings (draftOn (refusalOpened settings secondShown ub) ub "elsewhere") drafted == drafted
@@ -737,9 +742,9 @@ staleDecisionTakesNoSlot settings a b file =
             after readOnly (drawnOn shown ua RefuseStart ++ draftOn (refusalOpened settings shown ua) ua "needs a test" ++ drawnOn shown ua RefuseSubmit) shown
 
         idleNotice failure model =
-            Queue.notSavedOf model.decision == Just failure
-                && Queue.pendingText ua model.decision == Nothing
-                && Queue.pendingText ub model.decision == Nothing
+            DecisionSlot.notSavedOf model.decision == Just failure
+                && DecisionSlot.pendingText ua model.decision == Nothing
+                && DecisionSlot.pendingText ub model.decision == Nothing
                 && String.contains (Html.escapeHtml ("Decision not saved: " ++ Failure.saveFailureText failure)) (page model)
     in
     App.decidableRow drafted ub == Nothing
@@ -748,10 +753,10 @@ staleDecisionTakesNoSlot settings a b file =
         && offers fileShown file.uid
         && offers absentShown absentUnit.unit.uid
         && idleNotice (SaveRefused SourceNotShown) approvedElsewhere
-        && Queue.openPanel approvedElsewhere.decision == Just ( ua, draft )
+        && DecisionSlot.openPanel approvedElsewhere.decision == Just ( ua, draft )
         && panelDrawn (page approvedElsewhere)
         && idleNotice (SaveRefused FileNotQueued) ackedUnlisted
-        && Queue.openPanel ackedUnlisted.decision == Just ( ua, draft )
+        && DecisionSlot.openPanel ackedUnlisted.decision == Just ( ua, draft )
         && idleNotice (SaveRefused FileNotAcknowledgeable) ackedBlocking
         && idleNotice (SaveRefused SourceNotShown) withheld
         && idleNotice (SaveRefused LogBroken) broken
@@ -762,7 +767,7 @@ staleDecisionTakesNoSlot settings a b file =
         && idleNotice (SaveRefused FileNotQueued) reloadingFile
         && idleNotice (SaveRefused NotQueued) loadFailed
         && idleNotice SaveReadOnly refusedSubmit
-        && Queue.openPanel refusedSubmit.decision == Just ( ua, draft )
+        && DecisionSlot.openPanel refusedSubmit.decision == Just ( ua, draft )
         && String.contains (Html.escapeHtml ("Decision not saved: " ++ Failure.saveFailureText (SaveRefused LogBroken))) (page broken)
 
 
@@ -812,18 +817,18 @@ foreignDecisionIsIdle settings otherEpoch a b =
             after settings [ Navigated QueuePage ] { shown | decision = DecisionRefreshing ub settings.epoch }
     in
     offers shown ua
-        && Queue.startDecision settings.epoch ua (DecisionSaving ub otherEpoch) == Just (DecisionSaving ua settings.epoch)
-        && Queue.startDecision settings.epoch ua (DecisionRefreshing ub otherEpoch) == Just (DecisionSaving ua settings.epoch)
-        && Queue.startDecision settings.epoch ua (DecisionSaving ub settings.epoch) == Nothing
-        && Queue.startDecision settings.epoch ua (DecisionRefreshing ub settings.epoch) == Nothing
+        && DecisionSlot.startDecision settings.epoch ua (DecisionSaving ub otherEpoch) == Just (DecisionSaving ua settings.epoch)
+        && DecisionSlot.startDecision settings.epoch ua (DecisionRefreshing ub otherEpoch) == Just (DecisionSaving ua settings.epoch)
+        && DecisionSlot.startDecision settings.epoch ua (DecisionSaving ub settings.epoch) == Nothing
+        && DecisionSlot.startDecision settings.epoch ua (DecisionRefreshing ub settings.epoch) == Nothing
         && entered.decision == DecisionIdle PanelClosed
         && ownEntered.decision == DecisionRefreshing ub settings.epoch
         && approved.decision == DecisionSaving ua settings.epoch
-        && Queue.openPanel opened.decision == Just ( ua, { refuseDraft = Draft.empty, refuseError = Nothing } )
+        && DecisionSlot.openPanel opened.decision == Just ( ua, { refuseDraft = Draft.empty, refuseError = Nothing } )
         && refused.decision == DecisionSaving ua settings.epoch
-        && Queue.openPanel refused.decision == Nothing
+        && DecisionSlot.openPanel refused.decision == Nothing
         && foreignResult.decision == DecisionSaving ua settings.epoch
-        && Queue.notSavedOf ownResult.decision == Just SaveFailed
+        && DecisionSlot.notSavedOf ownResult.decision == Just SaveFailed
 
 
 -- A source read left in flight by another process is `NoneSelected`: a
@@ -857,7 +862,7 @@ foreignReadIsIdle settings otherEpoch a b =
             after settings [ Navigated QueuePage ] stale
 
         queueLoaded =
-            after settings [ PendingLoaded (Queue.latestTicket reloading.queueLoad) (Ok (queuePageOf [ a, b ])) ] reloading
+            after settings [ PendingLoaded (Slot.latestTicket reloading.queueLoad) (Ok (queuePageOf [ a, b ])) ] reloading
 
         historyEntered =
             after settings [ Navigated HistoryPage ] stale
@@ -875,7 +880,7 @@ foreignReadIsIdle settings otherEpoch a b =
         && inFlight ownSelected == Just ( ua, Just ub )
         && inFlight foreignResult == Just ( ub, Nothing )
         && inFlight ownResult == Nothing
-        && Maybe.map SafeText.toString (Queue.selectedViewStatusText ub ownResult.selectedView) == Nothing
+        && Maybe.map SafeText.toString (Selected.selectedViewStatusText ub ownResult.selectedView) == Nothing
 
 
 -- A decision asked off the queue page is refused before it takes the slot:
@@ -910,8 +915,8 @@ decisionOffQueueHoldsNoSlot settings a b =
             after settings approve { onQueue | page = HistoryPage }
     in
     offers shown ua
-        && Queue.notSavedOf onUnitPage.decision == Just SaveOffQueue
-        && Queue.notSavedOf onHistory.decision == Just SaveOffQueue
+        && DecisionSlot.notSavedOf onUnitPage.decision == Just SaveOffQueue
+        && DecisionSlot.notSavedOf onHistory.decision == Just SaveOffQueue
         && onQueue.decision == DecisionSaving ua settings.epoch
         && backOnQueue.decision == DecisionSaving ua settings.epoch
         && savingThenOff.decision == DecisionSaving ua settings.epoch
@@ -1012,19 +1017,19 @@ saveFailureRendered settings a b =
             after settings [ App.decisionSaved ua settings.epoch (Ok (Err SourceChanged)) ] saving
     in
     saving.decision == DecisionSaving ua settings.epoch
-        && Queue.notSavedOf busy.decision == Just SaveContended
+        && DecisionSlot.notSavedOf busy.decision == Just SaveContended
         && String.contains "the index or review database is busy; try again" busyPage
         && not (String.contains "Unexpected" busyPage)
         && not (String.contains "[5]" busyPage)
         && not (String.contains (Html.escapeHtml busyText) busyPage)
-        && Queue.notSavedOf other.decision == Just SaveFailed
+        && DecisionSlot.notSavedOf other.decision == Just SaveFailed
         && String.contains (Html.escapeHtml (Failure.saveFailureText SaveFailed)) otherPage
         && not (String.contains "Unexpected" otherPage)
         && not (String.contains (Html.escapeHtml otherText) otherPage)
-        && Queue.notSavedOf moved.decision == Just SaveFailed
+        && DecisionSlot.notSavedOf moved.decision == Just SaveFailed
         && String.contains (Html.escapeHtml (Failure.saveFailureText SaveFailed)) movedPage
         && not (String.contains (Html.escapeHtml (Error.message LibDb.headMoved)) movedPage)
-        && Queue.notSavedOf changed.decision == Just (SaveRefused SourceChanged)
+        && DecisionSlot.notSavedOf changed.decision == Just (SaveRefused SourceChanged)
         && String.contains (Html.escapeHtml (Failure.saveFailureText (SaveRefused SourceChanged))) (page changed)
 
 
@@ -1041,7 +1046,7 @@ readOnlySaveRefused settings a b =
             after { settings | key = ReadOnly } (drawnOn shown a.unit.uid ApproveRow) shown
     in
     offers shown a.unit.uid
-        && Queue.notSavedOf refused.decision == Just SaveReadOnly
+        && DecisionSlot.notSavedOf refused.decision == Just SaveReadOnly
         && String.contains ReviewKey.readOnlyText (page refused)
 
 
@@ -1180,7 +1185,7 @@ queueLoadFailureTyped settings a =
             after settings [ Navigated QueuePage ] initialModel
 
         settle result =
-            after settings [ App.queueLoaded (Queue.latestTicket loading.queueLoad) result ] loading
+            after settings [ App.queueLoaded (Slot.latestTicket loading.queueLoad) result ] loading
 
         busy =
             settle (Err busyMarker)
@@ -1216,7 +1221,7 @@ historyLoadFailureTyped settings =
             after settings [ Navigated HistoryPage ] initialModel
 
         settle result =
-            after settings [ App.historyLoaded (Queue.latestTicket loading.historyLoad) result ] loading
+            after settings [ App.historyLoaded (Slot.latestTicket loading.historyLoad) result ] loading
 
         limit =
             settle (Err limitMarker)
@@ -1235,7 +1240,7 @@ historyLoadFailureTyped settings =
         && historyFailure plain.history == Just LoadFailed
         && showsOnly (lead ++ Failure.loadFailureText LoadFailed) plain
         && historyFailure succeeded.history == Nothing
-        && Maybe.map SafeText.toString (Queue.historyStatusText succeeded.history) == Just "No reviews yet."
+        && Maybe.map SafeText.toString (History.historyStatusText succeeded.history) == Just "No reviews yet."
 
 
 -- The queue card's source read that fails settles the slot as a typed case,
@@ -1270,7 +1275,7 @@ viewLoadFailureTyped settings a b =
         && viewFailure busy.selectedView == Just LoadContended
         && showsOnly (lead ++ Failure.loadFailureText LoadContended) busy
         && viewFailure succeeded.selectedView == Nothing
-        && Maybe.map SafeText.toString (Queue.selectedViewStatusText ua succeeded.selectedView) == Nothing
+        && Maybe.map SafeText.toString (Selected.selectedViewStatusText ua succeeded.selectedView) == Nothing
 
 
 -- The unit page's read that fails shows the case's fixed text. Red if the
@@ -1319,7 +1324,7 @@ standingLoadFailureTyped settings a =
             queueModel [ a ] (ViewShown a)
 
         ( reading, _ ) =
-            Queue.standingRequested settings.epoch ua (Index.storedHash a.unit.attested) StandingUnread
+            Standing.standingRequested settings.epoch ua (Index.storedHash a.unit.attested) StandingUnread
 
         onUnitPage =
             { shown | page = unitAt ua, standing = reading }
@@ -1334,7 +1339,7 @@ standingLoadFailureTyped settings a =
             settle (Err plainMarker)
 
         succeeded =
-            settle (Ok Queue.Undecided)
+            settle (Ok Standing.Undecided)
 
         lead =
             "Review status read failed: "
@@ -1376,7 +1381,7 @@ refuseDraftTyped settings a b =
     Just blank.decision == idleOpen { refuseDraft = Draft.draft "   ", refuseError = Just (DraftRefused ReasonBlank) }
         && String.contains (Failure.refuseFailureText (DraftRefused ReasonBlank)) (page blank)
         && kept.decision == DecisionSaving ua settings.epoch
-        && Queue.openPanel kept.decision == Nothing
+        && DecisionSlot.openPanel kept.decision == Nothing
         && String.contains "Saving the decision…" (page kept)
         && not (panelDrawn (page kept))
 
@@ -1394,9 +1399,9 @@ typedDraft settings a b text =
 
 
 -- The open panel's draft as the model holds it.
-heldDraft : Model -> Maybe Queue.Draft
+heldDraft : Model -> Maybe DecisionSlot.Draft
 heldDraft model =
-    Maybe.map (\( _, draft ) -> draft) (Queue.openPanel model.decision)
+    Maybe.map (\( _, draft ) -> draft) (DecisionSlot.openPanel model.decision)
 
 
 -- The cut notice for a text of `chars` code points.
@@ -1647,16 +1652,16 @@ fileNotQueuedText =
 -- click before it takes the slot, and kept when a save's late refusal
 -- `refused` for it arrives: the not-saved notice of `expected`, whose fixed
 -- text is `shown`, and none of the failed-save lead.
-staleBannerShown : Settings.AppSettings -> Model -> Queue.DecidableRow -> Result DecideRefusal ( Index.Attested, Index.Written ) -> SaveFailure -> String -> Bool
+staleBannerShown : Settings.AppSettings -> Model -> DecisionSlot.DecidableRow -> Result DecideRefusal ( Index.Attested, Index.Written ) -> SaveFailure -> String -> Bool
 staleBannerShown settings model clicked refused expected shown =
     let
         settled =
-            after settings [ ApproveRow clicked, App.decisionSaved (Queue.rowUid clicked) settings.epoch (Ok refused) ] model
+            after settings [ ApproveRow clicked, App.decisionSaved (DecisionSlot.rowUid clicked) settings.epoch (Ok refused) ] model
 
         html =
             page settled
     in
-    Queue.notSavedOf settled.decision == Just expected
+    DecisionSlot.notSavedOf settled.decision == Just expected
         && Failure.saveFailureText expected == shown
         && String.contains (Html.escapeHtml ("Decision not saved: " ++ shown)) html
         && not (String.contains "Decision save failed" html)
@@ -1675,7 +1680,7 @@ blockingRow =
 
 
 -- The offer a render drew, which a check needs to exist.
-requireOffer : Maybe Queue.DecidableRow -> Task.Task Error Queue.DecidableRow
+requireOffer : Maybe DecisionSlot.DecidableRow -> Task.Task Error DecisionSlot.DecidableRow
 requireOffer drawn =
     case drawn of
         Just row ->
@@ -1820,22 +1825,22 @@ writtenStaysPending settings a b file pair =
             after settings (drawnOn written ua ApproveRow ++ [ press written "a" ] ++ drawnOn (withRefusal file written) file.uid ApproveRow) written
 
         olderLoad =
-            after settings [ PendingLoaded (Queue.latestTicket saving.queueLoad) (Ok (queuePageOf [ a, b ])) ] pressed
+            after settings [ PendingLoaded (Slot.latestTicket saving.queueLoad) (Ok (queuePageOf [ a, b ])) ] pressed
 
         reloaded =
-            after settings [ PendingLoaded (Queue.latestTicket written.queueLoad) (Ok (queuePageOf [ b ])) ] pressed
+            after settings [ PendingLoaded (Slot.latestTicket written.queueLoad) (Ok (queuePageOf [ b ])) ] pressed
 
         reloadFailed =
-            after settings [ App.queueLoaded (Queue.latestTicket written.queueLoad) (Err (Error.conflict "boom")) ] pressed
+            after settings [ App.queueLoaded (Slot.latestTicket written.queueLoad) (Err (Error.conflict "boom")) ] pressed
 
         superseding =
             after settings [ Navigated QueuePage ] pressed
 
         drainReturned =
-            after settings [ PendingLoaded (Queue.latestTicket written.queueLoad) (Ok (queuePageOf [ a, b ])) ] superseding
+            after settings [ PendingLoaded (Slot.latestTicket written.queueLoad) (Ok (queuePageOf [ a, b ])) ] superseding
 
         superseded =
-            after settings [ PendingLoaded (Queue.latestTicket drainReturned.queueLoad) (Ok (queuePageOf [ b ])) ] drainReturned
+            after settings [ PendingLoaded (Slot.latestTicket drainReturned.queueLoad) (Ok (queuePageOf [ b ])) ] drainReturned
 
         writtenPage =
             page written
@@ -1874,21 +1879,21 @@ notSavedClearedByReload settings a b =
             after settings [ Navigated QueuePage ] failed
 
         reloaded =
-            after settings [ PendingLoaded (Queue.latestTicket reloading.queueLoad) (Ok (queuePageOf [ a, b ])) ] reloading
+            after settings [ PendingLoaded (Slot.latestTicket reloading.queueLoad) (Ok (queuePageOf [ a, b ])) ] reloading
 
         reloadFailed =
-            after settings [ App.queueLoaded (Queue.latestTicket reloading.queueLoad) (Err (Error.conflict "boom")) ] reloading
+            after settings [ App.queueLoaded (Slot.latestTicket reloading.queueLoad) (Err (Error.conflict "boom")) ] reloading
 
         banner =
             Html.escapeHtml ("Decision not saved: " ++ Failure.saveFailureText SaveFailed)
     in
     offers shown ua
-        && Queue.notSavedOf failed.decision == Just SaveFailed
+        && DecisionSlot.notSavedOf failed.decision == Just SaveFailed
         && String.contains banner (page failed)
-        && Queue.notSavedOf reloading.decision == Just SaveFailed
+        && DecisionSlot.notSavedOf reloading.decision == Just SaveFailed
         && reloaded.decision == DecisionIdle PanelClosed
         && not (String.contains banner (page reloaded))
-        && Queue.notSavedOf reloadFailed.decision == Just SaveFailed
+        && DecisionSlot.notSavedOf reloadFailed.decision == Just SaveFailed
 
 
 -- Only a reload started after the failure clears its notice: a queue load
@@ -1913,20 +1918,20 @@ notSavedOutlivesOlderLoad settings a b =
             after settings [ App.decisionSaved ua settings.epoch (Err (Error.conflict "boom")) ] enteredWhileSaving
 
         olderLoaded =
-            after settings [ PendingLoaded (Queue.latestTicket enteredWhileSaving.queueLoad) (Ok (queuePageOf [ a, b ])) ] failed
+            after settings [ PendingLoaded (Slot.latestTicket enteredWhileSaving.queueLoad) (Ok (queuePageOf [ a, b ])) ] failed
 
         reloading =
             after settings [ Navigated QueuePage ] olderLoaded
 
         reloaded =
-            after settings [ PendingLoaded (Queue.latestTicket reloading.queueLoad) (Ok (queuePageOf [ a, b ])) ] reloading
+            after settings [ PendingLoaded (Slot.latestTicket reloading.queueLoad) (Ok (queuePageOf [ a, b ])) ] reloading
 
         banner =
             Html.escapeHtml ("Decision not saved: " ++ Failure.saveFailureText SaveFailed)
     in
     offers shown ua
-        && Queue.notSavedOf failed.decision == Just SaveFailed
-        && Queue.notSavedOf olderLoaded.decision == Just SaveFailed
+        && DecisionSlot.notSavedOf failed.decision == Just SaveFailed
+        && DecisionSlot.notSavedOf olderLoaded.decision == Just SaveFailed
         && String.contains banner (page olderLoaded)
         && reloaded.decision == DecisionIdle PanelClosed
         && not (String.contains banner (page reloaded))
@@ -2000,10 +2005,10 @@ enteredOnFile settings listed =
         entered =
             after settings [ press drafted "Enter" ] drafted
     in
-    Maybe.map Queue.rowTarget (App.decidableRow listed file) == Just OnRefusal
-        && Queue.openPanel drafted.decision == Just ( file, { refuseDraft = Draft.draft "not ours", refuseError = Nothing } )
+    Maybe.map DecisionSlot.rowTarget (App.decidableRow listed file) == Just OnRefusal
+        && DecisionSlot.openPanel drafted.decision == Just ( file, { refuseDraft = Draft.draft "not ours", refuseError = Nothing } )
         && entered.decision == DecisionSaving file settings.epoch
-        && Queue.openPanel entered.decision == Nothing
+        && DecisionSlot.openPanel entered.decision == Nothing
 
 
 seededChecks : Task.Task Error (List ( String, Bool ))
@@ -2100,7 +2105,7 @@ staleApproveAfterSourceReloadDecidesNothing r =
     offers shown ua
         && offers reloaded ua
         && App.decidableRow shown ua /= App.decidableRow reloaded ua
-        && Queue.notSavedOf stale.decision == Just (SaveRefused DrawnChanged)
+        && DecisionSlot.notSavedOf stale.decision == Just (SaveRefused DrawnChanged)
         && stale.decision /= DecisionSaving ua r.settings.epoch
         && String.contains (Html.escapeHtml ("Decision not saved: " ++ Failure.saveFailureText (SaveRefused DrawnChanged))) (page stale)
 
@@ -2149,8 +2154,8 @@ staleKeyApproveDecidesNothing r =
     in
     offers shown ua
         && not (offers reading ua)
-        && Queue.notSavedOf staleKey.decision == Just (SaveRefused DrawnChanged)
-        && Queue.notSavedOf undrawnKey.decision == Just (SaveRefused DrawnChanged)
+        && DecisionSlot.notSavedOf staleKey.decision == Just (SaveRefused DrawnChanged)
+        && DecisionSlot.notSavedOf undrawnKey.decision == Just (SaveRefused DrawnChanged)
         && staleKey.decision /= DecisionSaving ua r.settings.epoch
         && undrawnKey.decision /= DecisionSaving ua r.settings.epoch
 
@@ -2183,7 +2188,7 @@ keyApproveNeverDecidesUndrawnSelection r =
         && offers settled ub
         && keyed.decision /= DecisionSaving ub r.settings.epoch
         && keyed.decision /= DecisionSaving ua r.settings.epoch
-        && Queue.notSavedOf keyed.decision == Just (SaveRefused SourceNotShown)
+        && DecisionSlot.notSavedOf keyed.decision == Just (SaveRefused SourceNotShown)
 
 
 -- An acknowledgement drawn on the file's first digest and received after a
@@ -2206,7 +2211,7 @@ staleAckAfterDigestChangeDecidesNothing r =
             queuePageOf [ r.a, r.b ]
 
         reloaded =
-            after r.settings [ PendingLoaded (Queue.latestTicket reloading.queueLoad) (Ok { changedPage | refusals = [ r.file2 ] }) ] reloading
+            after r.settings [ PendingLoaded (Slot.latestTicket reloading.queueLoad) (Ok { changedPage | refusals = [ r.file2 ] }) ] reloading
 
         stale =
             after r.settings (drawnOn listed fileUid ApproveRow) reloaded
@@ -2217,7 +2222,7 @@ staleAckAfterDigestChangeDecidesNothing r =
     r.file.digest /= r.file2.digest
         && offers listed fileUid
         && offers reloaded fileUid
-        && Queue.notSavedOf stale.decision == Just (SaveRefused DrawnChanged)
+        && DecisionSlot.notSavedOf stale.decision == Just (SaveRefused DrawnChanged)
         && stale.decision /= DecisionSaving fileUid r.settings.epoch
         && fresh.decision == DecisionSaving fileUid r.settings.epoch
 
@@ -2241,9 +2246,9 @@ staleRefuseStartOpensNoPanel r =
             after r.settings (drawnOn reloaded ua RefuseStart) reloaded
     in
     offers shown ua
-        && Queue.openPanel stale.decision == Nothing
-        && Queue.notSavedOf stale.decision == Just (SaveRefused DrawnChanged)
-        && Queue.openPanel fresh.decision == Just ( ua, { refuseDraft = Draft.empty, refuseError = Nothing } )
+        && DecisionSlot.openPanel stale.decision == Nothing
+        && DecisionSlot.notSavedOf stale.decision == Just (SaveRefused DrawnChanged)
+        && DecisionSlot.openPanel fresh.decision == Just ( ua, { refuseDraft = Draft.empty, refuseError = Nothing } )
 
 
 -- Enter in the open panel submits only the panel row its render drew: the
@@ -2281,7 +2286,7 @@ confirmRefuseBindsDrawnPanelRow r =
         && withPanel (App.decidableRow shown ua) == drafted
         && withPanel fileOffer == drafted
         && clickedFile == drafted
-        && Queue.openPanel drafted.decision == Just ( ua, { refuseDraft = Draft.draft "needs a test", refuseError = Nothing } )
+        && DecisionSlot.openPanel drafted.decision == Just ( ua, { refuseDraft = Draft.draft "needs a test", refuseError = Nothing } )
 
 
 -- A key typed into a refusal panel stays panel input on either side of the
@@ -2309,8 +2314,8 @@ panelKeysNeverDecideAcrossPanelDrawing r =
             after r.settings (drawnOn reloaded ua RefuseStart) reloaded
     in
     panelKeysDrawn drafted
-        && Queue.openPanel cancelled.decision == Nothing
-        && Queue.openPanel opened.decision /= Nothing
+        && DecisionSlot.openPanel cancelled.decision == Nothing
+        && DecisionSlot.openPanel opened.decision /= Nothing
         && List.all (\key -> after r.settings [ press drafted key ] cancelled == cancelled) reasonKeys
         && List.all (\key -> after r.settings [ press reloaded key ] opened == opened) reasonKeys
 
@@ -2420,7 +2425,7 @@ keyModeTable r =
     in
     rowA /= Nothing
         && history.page == HistoryPage
-        && Queue.openPanel opened.decision /= Nothing
+        && DecisionSlot.openPanel opened.decision /= Nothing
         && loading.queueState == Loading
         && List.all (\drawn -> cell drawn history dormant) [ App.NothingDrawn, App.PanelDrawn rowA, App.PanelDrawn Nothing, App.CardsDrawn (Just cardA), App.CardsDrawn Nothing ]
         && List.all (\receipt -> cell App.NothingDrawn receipt dormant) onQueue
@@ -2478,10 +2483,10 @@ staleCancelKeepsAnotherPanel r =
             after r.settings (draftOn onFile fu "not ours") onFile
     in
     panelKeysDrawn onA
-        && Queue.openPanel fileDrafted.decision == Just ( fu, { refuseDraft = Draft.draft "not ours", refuseError = Nothing } )
+        && DecisionSlot.openPanel fileDrafted.decision == Just ( fu, { refuseDraft = Draft.draft "not ours", refuseError = Nothing } )
         && after r.settings [ press onA "Escape" ] fileDrafted == fileDrafted
         && after r.settings (cancelOn onA ua) fileDrafted == fileDrafted
-        && Queue.openPanel (after r.settings [ press fileDrafted "Escape" ] fileDrafted).decision == Nothing
+        && DecisionSlot.openPanel (after r.settings [ press fileDrafted "Escape" ] fileDrafted).decision == Nothing
 
 
 -- A reason typed into the panel drawn on `a`'s first digest, received after
@@ -2505,9 +2510,9 @@ staleDraftEditLandsNowhere r =
     offers shown ua
         && draftOn firstOpened ua "x" /= []
         && App.decidableRow shown ua /= App.decidableRow reloaded ua
-        && Queue.openPanel reopened.decision == Just ( ua, { refuseDraft = Draft.empty, refuseError = Nothing } )
+        && DecisionSlot.openPanel reopened.decision == Just ( ua, { refuseDraft = Draft.empty, refuseError = Nothing } )
         && after r.settings (draftOn firstOpened ua "x") reopened == reopened
-        && Queue.openPanel (after r.settings (draftOn reopened ua "x") reopened).decision == Just ( ua, { refuseDraft = Draft.draft "x", refuseError = Nothing } )
+        && DecisionSlot.openPanel (after r.settings (draftOn reopened ua "x") reopened).decision == Just ( ua, { refuseDraft = Draft.draft "x", refuseError = Nothing } )
 
 
 -- Navigation moves from where the selection stands when the key arrives:
@@ -2541,9 +2546,9 @@ escapeBeforePanelDrawnKeepsPanel r =
         drafted =
             after r.settings (drawnOn shown ua RefuseStart ++ draftOn (refusalOpened r.settings shown ua) ua "needs a test") shown
     in
-    Queue.openPanel drafted.decision == Just ( ua, { refuseDraft = Draft.draft "needs a test", refuseError = Nothing } )
+    DecisionSlot.openPanel drafted.decision == Just ( ua, { refuseDraft = Draft.draft "needs a test", refuseError = Nothing } )
         && after r.settings [ press shown "Escape" ] drafted == drafted
-        && Queue.openPanel (after r.settings [ press drafted "Escape" ] drafted).decision == Nothing
+        && DecisionSlot.openPanel (after r.settings [ press drafted "Escape" ] drafted).decision == Nothing
 
 
 -- `decisionTask` binds the offer's digest on its own: an offer of `a` run
@@ -2627,9 +2632,9 @@ idlePressStartsOneLoad settings =
         running =
             after settings [ Navigated QueuePage ] initialModel
     in
-    Queue.latestTicket running.queueLoad == Queue.nextTicket (Queue.latestTicket initialModel.queueLoad)
-        && Queue.runningWant settings.epoch running.queueLoad == Just Nothing
-        && Queue.runningWant settings.epoch initialModel.queueLoad == Nothing
+    Slot.latestTicket running.queueLoad == Slot.nextTicket (Slot.latestTicket initialModel.queueLoad)
+        && Slot.runningWant settings.epoch running.queueLoad == Just Nothing
+        && Slot.runningWant settings.epoch initialModel.queueLoad == Nothing
 
 
 -- Pages turned, the queue shown again and a unit page entered while a queue
@@ -2644,7 +2649,7 @@ queueLoadsSingleFlight settings a =
             after settings [ Navigated QueuePage ] initialModel
 
         inFlightTicket =
-            Queue.latestTicket running.queueLoad
+            Slot.latestTicket running.queueLoad
 
         pressed =
             after settings [ ShowQueue, NextPage (cursorAfter 1 "u-a"), NextPage (cursorAfter 2 "u-b") ] running
@@ -2652,10 +2657,10 @@ queueLoadsSingleFlight settings a =
         entered =
             after settings [ Navigated (unitAt a.unit.uid) ] running
     in
-    Queue.latestTicket pressed.queueLoad == inFlightTicket
-        && Queue.runningWant settings.epoch pressed.queueLoad == Just (Just (QueueReload (cursorAfter 2 "u-b")))
-        && Queue.latestTicket entered.queueLoad == inFlightTicket
-        && Queue.runningWant settings.epoch entered.queueLoad == Just Nothing
+    Slot.latestTicket pressed.queueLoad == inFlightTicket
+        && Slot.runningWant settings.epoch pressed.queueLoad == Just (Just (QueueReload (cursorAfter 2 "u-b")))
+        && Slot.latestTicket entered.queueLoad == inFlightTicket
+        && Slot.runningWant settings.epoch entered.queueLoad == Just Nothing
 
 
 -- The running queue load's page returning while another page is wanted is
@@ -2669,7 +2674,7 @@ supersededQueueResultDropped settings a b =
             after settings [ Navigated QueuePage ] initialModel
 
         first =
-            Queue.latestTicket running.queueLoad
+            Slot.latestTicket running.queueLoad
 
         wanting =
             after settings [ NextPage (cursorAfter 2 "u-b") ] running
@@ -2681,15 +2686,15 @@ supersededQueueResultDropped settings a b =
             after settings [ PendingLoaded first (Ok (queuePageOf [ a, b ])) ] dropped
 
         settled =
-            after settings [ PendingLoaded (Queue.latestTicket dropped.queueLoad) (Ok (queuePageOf [ b ])) ] late
+            after settings [ PendingLoaded (Slot.latestTicket dropped.queueLoad) (Ok (queuePageOf [ b ])) ] late
     in
     dropped.queueState == Loading
-        && Queue.latestTicket dropped.queueLoad == Queue.nextTicket first
-        && Queue.runningWant settings.epoch dropped.queueLoad == Just Nothing
+        && Slot.latestTicket dropped.queueLoad == Slot.nextTicket first
+        && Slot.runningWant settings.epoch dropped.queueLoad == Just Nothing
         && late.queueState == Loading
-        && Queue.latestTicket late.queueLoad == Queue.latestTicket dropped.queueLoad
+        && Slot.latestTicket late.queueLoad == Slot.latestTicket dropped.queueLoad
         && settled.queueState == Loaded (queuePageOf [ b ])
-        && Queue.runningWant settings.epoch settled.queueLoad == Nothing
+        && Slot.runningWant settings.epoch settled.queueLoad == Nothing
 
 
 -- A decision saved while a queue load runs waits for the drain: the load
@@ -2712,15 +2717,15 @@ refreshingSettlesOnlyAfterWrite settings a b ( attested, written ) =
             after settings [ DecisionSaved ua settings.epoch (Ok ( attested, written )) ] loadingWhileSaving
 
         preWrite =
-            after settings [ PendingLoaded (Queue.latestTicket loadingWhileSaving.queueLoad) (Ok (queuePageOf [ a, b ])) ] saved
+            after settings [ PendingLoaded (Slot.latestTicket loadingWhileSaving.queueLoad) (Ok (queuePageOf [ a, b ])) ] saved
 
         drained =
-            after settings [ PendingLoaded (Queue.latestTicket preWrite.queueLoad) (Ok (queuePageOf [ b ])) ] preWrite
+            after settings [ PendingLoaded (Slot.latestTicket preWrite.queueLoad) (Ok (queuePageOf [ b ])) ] preWrite
     in
-    Queue.runningWant settings.epoch saved.queueLoad == Just (Just (QueueDrain attested written Index.Start))
+    Slot.runningWant settings.epoch saved.queueLoad == Just (Just (QueueDrain attested written Index.Start))
         && preWrite.decision == DecisionRefreshing ua settings.epoch
         && not (String.contains ">Approve<" (page preWrite))
-        && Queue.runningWant settings.epoch preWrite.queueLoad == Just Nothing
+        && Slot.runningWant settings.epoch preWrite.queueLoad == Just Nothing
         && drained.decision == DecisionIdle PanelClosed
         && drained.queueState == Loaded (queuePageOf [ b ])
 
@@ -2754,8 +2759,8 @@ drainAbsorbsReload settings ( attested, written ) =
         && Queue.mergeQueueWant (QueueReload c1) (QueueDrain attested written c2) == QueueDrain attested written c2
         && Queue.mergeQueueWant (QueueDrain attested written c1) (QueueDrain attested written c2) == QueueDrain attested written c2
         && Queue.mergeQueueWant (QueueReload c1) (QueueReload c2) == QueueReload c2
-        && Queue.runningWant settings.epoch drainThenPage.queueLoad == Just (Just (QueueDrain attested written c2))
-        && Queue.runningWant settings.epoch pageThenDrain.queueLoad == Just (Just (QueueDrain attested written c2))
+        && Slot.runningWant settings.epoch drainThenPage.queueLoad == Just (Just (QueueDrain attested written c2))
+        && Slot.runningWant settings.epoch pageThenDrain.queueLoad == Just (Just (QueueDrain attested written c2))
 
 
 -- History shown again and paged while a History load runs starts no second
@@ -2770,7 +2775,7 @@ historyLoadsSingleFlight settings =
             after settings [ Navigated HistoryPage ] initialModel
 
         first =
-            Queue.latestTicket running.historyLoad
+            Slot.latestTicket running.historyLoad
 
         pressed =
             after settings [ ShowHistory, HistoryNext (historyAfter 1), HistoryNext (historyAfter 2) ] running
@@ -2779,23 +2784,23 @@ historyLoadsSingleFlight settings =
             { rows = [], at = LibDb.HistoryStart, next = Nothing, log = LibDb.ShownProven }
 
         stale =
-            after settings [ App.historyLoaded (Queue.latestTicket initialModel.historyLoad) (Ok historyPage) ] pressed
+            after settings [ App.historyLoaded (Slot.latestTicket initialModel.historyLoad) (Ok historyPage) ] pressed
 
         dropped =
             after settings [ App.historyLoaded first (Ok historyPage) ] stale
 
         settled =
-            after settings [ App.historyLoaded (Queue.latestTicket dropped.historyLoad) (Ok { historyPage | at = historyAfter 2 }) ] dropped
+            after settings [ App.historyLoaded (Slot.latestTicket dropped.historyLoad) (Ok { historyPage | at = historyAfter 2 }) ] dropped
     in
-    Queue.latestTicket pressed.historyLoad == first
-        && Queue.runningWant settings.epoch pressed.historyLoad == Just (Just (HistoryFrom (historyAfter 2)))
+    Slot.latestTicket pressed.historyLoad == first
+        && Slot.runningWant settings.epoch pressed.historyLoad == Just (Just (HistoryFrom (historyAfter 2)))
         && stale.history == HistoryLoading
-        && Queue.latestTicket stale.historyLoad == first
+        && Slot.latestTicket stale.historyLoad == first
         && dropped.history == HistoryLoading
-        && Queue.latestTicket dropped.historyLoad == Queue.nextTicket first
+        && Slot.latestTicket dropped.historyLoad == Slot.nextTicket first
         && historyFailure settled.history == Nothing
         && settled.history /= HistoryLoading
-        && Queue.runningWant settings.epoch settled.historyLoad == Nothing
+        && Slot.runningWant settings.epoch settled.historyLoad == Nothing
 
 
 -- Two source reads settling on the unit page while a standing read runs
@@ -2825,19 +2830,19 @@ standingSingleFlight settings a b =
             after settings [ Navigated (unitAt ub), SelectedViewLoaded ub settings.epoch (Ok (Just b)) ] reading
 
         firstReturned =
-            after settings [ App.standingLoaded ua hashA settings.epoch (Ok Queue.Undecided) ] second
+            after settings [ App.standingLoaded ua hashA settings.epoch (Ok Standing.Undecided) ] second
 
         stale =
-            after settings [ App.standingLoaded ua hashA settings.epoch (Ok Queue.Undecided) ] firstReturned
+            after settings [ App.standingLoaded ua hashA settings.epoch (Ok Standing.Undecided) ] firstReturned
 
         shown =
-            after settings [ App.standingLoaded ub hashB settings.epoch (Ok Queue.Undecided) ] stale
+            after settings [ App.standingLoaded ub hashB settings.epoch (Ok Standing.Undecided) ] stale
     in
     reading.standing == StandingReading ua hashA settings.epoch Nothing
         && second.standing == StandingReading ua hashA settings.epoch (Just ( ub, hashB ))
         && firstReturned.standing == StandingReading ub hashB settings.epoch Nothing
         && stale.standing == StandingReading ub hashB settings.epoch Nothing
-        && shown.standing == StandingShown ub hashB Queue.Undecided
+        && shown.standing == StandingShown ub hashB Standing.Undecided
 
 
 -- A load slot or standing read held under another process's epoch is idle:
@@ -2848,16 +2853,16 @@ foreignLoadSlotIdle : Settings.AppSettings -> Epoch -> Index.UnitView -> Bool
 foreignLoadSlotIdle settings otherEpoch a =
     let
         ( foreignSlot, _ ) =
-            Queue.requestLoad Queue.mergeQueueWant otherEpoch (QueueReload Index.Start) Queue.idleLoad
+            Slot.requestLoad Queue.mergeQueueWant otherEpoch (QueueReload Index.Start) Slot.idleLoad
 
         foreignTicket =
-            Queue.latestTicket foreignSlot
+            Slot.latestTicket foreignSlot
 
         ( _, started ) =
-            Queue.requestLoad Queue.mergeQueueWant settings.epoch (QueueReload Index.Start) foreignSlot
+            Slot.requestLoad Queue.mergeQueueWant settings.epoch (QueueReload Index.Start) foreignSlot
 
         ( settle, kept, startedOnArrival ) =
-            Queue.loadArrived settings.epoch foreignTicket foreignSlot
+            Slot.loadArrived settings.epoch foreignTicket foreignSlot
 
         held =
             { initialModel | queueLoad = foreignSlot }
@@ -2877,15 +2882,15 @@ foreignLoadSlotIdle settings otherEpoch a =
         foreignRead =
             StandingReading ua hashA otherEpoch Nothing
     in
-    started == Just ( Queue.nextTicket foreignTicket, QueueReload Index.Start )
+    started == Just ( Slot.nextTicket foreignTicket, QueueReload Index.Start )
         && settle == Dropped
         && kept == foreignSlot
         && startedOnArrival == Nothing
-        && Queue.latestTicket entered.queueLoad == Queue.nextTicket foreignTicket
-        && Queue.runningWant settings.epoch entered.queueLoad == Just Nothing
+        && Slot.latestTicket entered.queueLoad == Slot.nextTicket foreignTicket
+        && Slot.runningWant settings.epoch entered.queueLoad == Just Nothing
         && arrived.queueState == Loading
-        && Queue.standingRequested settings.epoch ua hashA foreignRead == ( StandingReading ua hashA settings.epoch Nothing, Just ( ua, hashA ) )
-        && Queue.standingArrived settings.epoch ua hashA (Ok Queue.Undecided) foreignRead == ( foreignRead, Nothing )
+        && Standing.standingRequested settings.epoch ua hashA foreignRead == ( StandingReading ua hashA settings.epoch Nothing, Just ( ua, hashA ) )
+        && Standing.standingArrived settings.epoch ua hashA (Ok Standing.Undecided) foreignRead == ( foreignRead, Nothing )
 
 
 -- A running load answered with an error, the shape a refused task settles
@@ -2899,7 +2904,7 @@ ceilingRefusalReleasesSlot settings =
             after settings [ Navigated QueuePage ] initialModel
 
         first =
-            Queue.latestTicket running.queueLoad
+            Slot.latestTicket running.queueLoad
 
         refused =
             after settings [ App.queueLoaded first (Err limitMarker) ] running
@@ -2914,11 +2919,11 @@ ceilingRefusalReleasesSlot settings =
             after settings [ App.queueLoaded first (Err limitMarker) ] wanting
     in
     queueFailure refused.queueState == Just LoadPastLimit
-        && Queue.runningWant settings.epoch refused.queueLoad == Nothing
-        && Queue.latestTicket pressedAfter.queueLoad == Queue.nextTicket first
+        && Slot.runningWant settings.epoch refused.queueLoad == Nothing
+        && Slot.latestTicket pressedAfter.queueLoad == Slot.nextTicket first
         && refusedWithWant.queueState == Loading
-        && Queue.latestTicket refusedWithWant.queueLoad == Queue.nextTicket first
-        && Queue.runningWant settings.epoch refusedWithWant.queueLoad == Just Nothing
+        && Slot.latestTicket refusedWithWant.queueLoad == Slot.nextTicket first
+        && Slot.runningWant settings.epoch refusedWithWant.queueLoad == Just Nothing
 
 
 -- ── every task starts at its slot ───────────────────────────────────────

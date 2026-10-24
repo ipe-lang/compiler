@@ -22,19 +22,23 @@ import Ipe.System as System
 import Ipe.Task as Task
 import Ipe.Time.Timestamp as Timestamp
 import Lib.Db as LibDb exposing (BreakAt(..), Decision(..), HistoryCursor(..), LogShown(..), ReviewEntry(..), StoredDecision(..), Unverified(..))
+import Lib.DecisionSlot as DecisionSlot exposing (DecisionTarget(..))
 import Lib.Epoch as Epoch exposing (Epoch)
 import Lib.Failure as Failure exposing (DecideRefusal(..), LoadFailure(..), SaveFailure(..))
 import Lib.Format as Format
 import Lib.Highlight as Highlight exposing (Lang(..), Token(..))
+import Lib.History as History exposing (HistoryLabel(..), HistoryState(..), Presence(..))
 import Lib.Index as Index exposing (Change(..), Oversize(..), ReadFailure(..), SourceView(..), StaleReason(..), Written(..))
 import Lib.Keys as Keys exposing (KeyAction(..))
 import Lib.Label as Label
 import Lib.Links as Links exposing (Link(..))
 import Lib.PageSize as PageSize
-import Lib.Queue as Queue exposing (DecisionTarget(..), HistoryLabel(..), HistoryState(..), Place(..), Presence(..), QueueState(..), SelectedView(..), UnitPageState(..))
+import Lib.Queue as Queue exposing (Place(..), QueueState(..), UnitPageState(..))
 import Lib.RepoPath as RepoPath exposing (PathError(..), Root, RootMap)
 import Lib.ReviewKey as ReviewKey exposing (ReviewKey(..))
 import Lib.SafeText as SafeText
+import Lib.Selected as Selected exposing (SelectedView(..))
+import Lib.Standing as Standing
 import Lib.Uid as Uid exposing (Uid)
 import TestSupport exposing (openFileAt, piecesShown, quotedLabelOf, tableExists, countReviewRows, expectErr, refuse, seedIndex, writeFileText, fixtureLibRs, fixtureMainIpe, viewA, viewB, viewTag, shownTextOf, unitViewTag, execIndex, execIndexUnchecked, Scratch, freshScratch, freshDir, check, indexSchemaStatements, execIndexSchema, seedIndexDb, insertUnitRows, setIndexEnv, loadFirstPage, indexConn, loadUnitNow, decideNow, envSettings, envReview, envAppSettings, loadPageNow, drainThenLoadNow, loadUnitViewNow, drainUnitNow, decideShownNow, decidedRefusalNow, accepted, refusalOf, refusedAs, decidedNow, resyncReviewedNow, resyncReviewedWithinNow, shownOf, PageEntry, checkUnits, listSecond, isUnitA, isUnitB, cleanupIndex, removeFileIfAny, codeText, noHazard, rendered, renderedForeign, describeText, refusedFor, migratedReviewAt, tableRowCounts, openReadOnlyAt, vectorsPath, ipeIndexTestFile, repoFile, probeMessage, probeNames, maybeContains, isNew, isUnrecorded, mirroredCount, stampOf, reviewHeadOf, uid, resyncBoundOf, appendSigned, RawName(..), rawRow, tamperLog, logIdOf, headTextOf, logRowCount, loadHistoryPageNow, carriesFailure, logVerdictOf, appendSignedWithUidText, insertUnboundUnit, labelOf, labelText)
 
@@ -171,7 +175,7 @@ staleRefuseAlsoRefused =
             (case found of
                 Just loaded ->
                     viewTag loaded.view == "drifted"
-                        && isNothing (Queue.decidableSource (uid "u-a") (ViewShown loaded))
+                        && isNothing (Selected.decidableSource (uid "u-a") (ViewShown loaded))
 
                 Nothing ->
                     False
@@ -193,10 +197,10 @@ onlySelectedShownDecidable =
         Task.succeed
             (case found of
                 Just loaded ->
-                    not (isNothing (Queue.decidableSource (uid "u-a") (ViewShown loaded)))
-                        && isNothing (Queue.decidableSource (uid "u-b") (ViewShown loaded))
-                        && isNothing (Queue.decidableSource (uid "u-a") (ViewLoading { uid = uid "u-a", wanted = Nothing, fresh = True, owner = epoch }))
-                        && isNothing (Queue.decidableSource (uid "u-a") NoneSelected)
+                    not (isNothing (Selected.decidableSource (uid "u-a") (ViewShown loaded)))
+                        && isNothing (Selected.decidableSource (uid "u-b") (ViewShown loaded))
+                        && isNothing (Selected.decidableSource (uid "u-a") (ViewLoading { uid = uid "u-a", wanted = Nothing, fresh = True, owner = epoch }))
+                        && isNothing (Selected.decidableSource (uid "u-a") NoneSelected)
 
                 Nothing ->
                     False
@@ -216,9 +220,9 @@ tooLargeNotDecidable =
         Task.succeed
             (case found of
                 Just loaded ->
-                    not (isNothing (Queue.decidableSource (uid "u-a") (ViewShown loaded)))
-                        && isNothing (Queue.decidableSource (uid "u-a") (ViewShown { loaded | view = TooLarge (SpanLines { lines = Index.viewLineCeiling + 1 }) }))
-                        && isNothing (Queue.decidableSource (uid "u-a") (ViewShown { loaded | view = TooLarge (ViewBytes { size = ByteSize.bytes (ByteSize.toBytes Index.viewByteCeiling + 1) }) }))
+                    not (isNothing (Selected.decidableSource (uid "u-a") (ViewShown loaded)))
+                        && isNothing (Selected.decidableSource (uid "u-a") (ViewShown { loaded | view = TooLarge (SpanLines { lines = Index.viewLineCeiling + 1 }) }))
+                        && isNothing (Selected.decidableSource (uid "u-a") (ViewShown { loaded | view = TooLarge (ViewBytes { size = ByteSize.bytes (ByteSize.toBytes Index.viewByteCeiling + 1) }) }))
 
                 Nothing ->
                     False
@@ -306,13 +310,13 @@ selectionsDuringReadCoalesce : Epoch -> Bool
 selectionsDuringReadCoalesce epoch =
     let
         ( afterB, readB ) =
-            Queue.selectView epoch (uid "b") (ViewLoading { uid = uid "a", wanted = Nothing, fresh = True, owner = epoch })
+            Selected.selectView epoch (uid "b") (ViewLoading { uid = uid "a", wanted = Nothing, fresh = True, owner = epoch })
 
         ( afterC, readC ) =
-            Queue.selectView epoch (uid "c") afterB
+            Selected.selectView epoch (uid "c") afterB
 
         ( arrived, next ) =
-            Queue.viewArrived epoch (uid "a") (Ok Nothing) afterC
+            Selected.viewArrived epoch (uid "a") (Ok Nothing) afterC
     in
     readB == Nothing
         && readC == Nothing
@@ -331,19 +335,19 @@ outdatedResponseDropped epoch =
             ViewLoading { uid = uid "b", wanted = Nothing, fresh = True, owner = epoch }
 
         ( afterLate, lateNext ) =
-            Queue.viewArrived epoch (uid "a") (Ok Nothing) loading
+            Selected.viewArrived epoch (uid "a") (Ok Nothing) loading
 
         ( reselected, reselectNext ) =
-            Queue.selectView epoch (uid "b") (ViewLoading { uid = uid "b", wanted = Just (uid "c"), fresh = True, owner = epoch })
+            Selected.selectView epoch (uid "b") (ViewLoading { uid = uid "b", wanted = Just (uid "c"), fresh = True, owner = epoch })
 
         ( settled, settledNext ) =
-            Queue.viewArrived epoch (uid "b") (Ok Nothing) loading
+            Selected.viewArrived epoch (uid "b") (Ok Nothing) loading
 
         ( fresh, freshNext ) =
-            Queue.selectView epoch (uid "a") NoneSelected
+            Selected.selectView epoch (uid "a") NoneSelected
 
         ( cleared, clearedNext ) =
-            Queue.reloadView epoch (uid "a") (Queue.clearView epoch loading)
+            Selected.reloadView epoch (uid "a") (Selected.clearView epoch loading)
     in
     selectedTag afterLate == "loading b"
         && lateNext == Nothing
@@ -367,19 +371,19 @@ outdatedReadNeverSettles : Epoch -> Bool
 outdatedReadNeverSettles epoch =
     let
         ( reloaded, reloadNext ) =
-            Queue.reloadView epoch (uid "a") (ViewLoading { uid = uid "a", wanted = Nothing, fresh = True, owner = epoch })
+            Selected.reloadView epoch (uid "a") (ViewLoading { uid = uid "a", wanted = Nothing, fresh = True, owner = epoch })
 
         ( viaB, _ ) =
-            Queue.selectView epoch (uid "b") reloaded
+            Selected.selectView epoch (uid "b") reloaded
 
         ( backToA, backNext ) =
-            Queue.selectView epoch (uid "a") viaB
+            Selected.selectView epoch (uid "a") viaB
 
         ( arrived, arrivedNext ) =
-            Queue.viewArrived epoch (uid "a") (Ok Nothing) backToA
+            Selected.viewArrived epoch (uid "a") (Ok Nothing) backToA
 
         ( dropped, droppedNext ) =
-            Queue.viewArrived epoch (uid "a") (Ok Nothing) (Queue.clearView epoch (ViewLoading { uid = uid "a", wanted = Nothing, fresh = True, owner = epoch }))
+            Selected.viewArrived epoch (uid "a") (Ok Nothing) (Selected.clearView epoch (ViewLoading { uid = uid "a", wanted = Nothing, fresh = True, owner = epoch }))
     in
     reloadNext == Nothing
         && backNext == Nothing
@@ -390,7 +394,7 @@ outdatedReadNeverSettles epoch =
         && droppedNext == Nothing
 
 
-selectedTag : Queue.SelectedView -> String
+selectedTag : Selected.SelectedView -> String
 selectedTag state =
     case state of
         NoneSelected ->
@@ -778,7 +782,7 @@ unitPageStatesDistinct =
         epoch <- Epoch.mint
         let
             ( settled, _ ) =
-                Queue.viewArrived epoch (uid "no-such") (Ok loaded) (ViewLoading { uid = uid "no-such", wanted = Nothing, fresh = True, owner = epoch })
+                Selected.viewArrived epoch (uid "no-such") (Ok loaded) (ViewLoading { uid = uid "no-such", wanted = Nothing, fresh = True, owner = epoch })
         in
         Task.succeed
             (isNotFound (Queue.unitPageOf (uid "no-such") settled)
@@ -1021,7 +1025,7 @@ sampleQueuedUnit =
         }
     , change = Index.New
     , changed = Nothing
-    , standing = Queue.Undecided
+    , standing = Standing.Undecided
     }
 
 
@@ -1078,12 +1082,12 @@ standingNotCounted =
         row why =
             Just (Unverified { uid = Just (uid "u-a"), bodyHash = "h", reviewedAt = Timestamp.fromUnixMillis 0, why = why })
     in
-    Queue.standingOf (row Tampered) == Queue.NotCounted Tampered
-        && Queue.standingOf (row ChainBroken) == Queue.NotCounted ChainBroken
-        && Queue.standingOf (row NoKey) == Queue.NotCounted NoKey
-        && Queue.standingOf (row Legacy) == Queue.NotCounted Legacy
-        && Queue.standingOf Nothing == Queue.Undecided
-        && Queue.standingOf (row Tampered) /= Queue.Undecided
+    Standing.standingOf (row Tampered) == Standing.NotCounted Tampered
+        && Standing.standingOf (row ChainBroken) == Standing.NotCounted ChainBroken
+        && Standing.standingOf (row NoKey) == Standing.NotCounted NoKey
+        && Standing.standingOf (row Legacy) == Standing.NotCounted Legacy
+        && Standing.standingOf Nothing == Standing.Undecided
+        && Standing.standingOf (row Tampered) /= Standing.Undecided
 
 
 queueLabelsDistinct : Bool
@@ -1246,7 +1250,7 @@ pageReadsStartupSettings =
         reparsedRefused <- envSettings |> Task.map (\_ -> False) |> Task.onError (\_ -> Task.succeed True)
         reviewRefused <- envReview |> Task.map (\_ -> False) |> Task.onError (\_ -> Task.succeed True)
         after <- Queue.loadPage startup Index.Start
-        history <- Queue.loadHistoryPage startup LibDb.HistoryStart
+        history <- History.loadHistoryPage startup LibDb.HistoryStart
         setIndexEnv at.indexDb at.repo
         System.setenv "IPE_REVIEW_DB" at.reviewDb
         cleanupIndex at.indexDb at.repo
@@ -1545,7 +1549,7 @@ reviewWritesGoThroughWriteTransaction : Task.Task Error Bool
 reviewWritesGoThroughWriteTransaction =
     let
         others =
-            [ "src/Main.ipe", "src/Migrations.ipe", "src/Lib/App.ipe", "src/Lib/Bind.ipe", "src/Lib/Draft.ipe", "src/Lib/Drawn.ipe", "src/Lib/EnvLookup.ipe", "src/Lib/Epoch.ipe", "src/Lib/Failure.ipe", "src/Lib/Format.ipe", "src/Lib/Highlight.ipe", "src/Lib/Keys.ipe", "src/Lib/Label.ipe", "src/Lib/Links.ipe", "src/Lib/PageSize.ipe", "src/Lib/Queue.ipe", "src/Lib/RepoPath.ipe", "src/Lib/ReviewKey.ipe", "src/Lib/SafeText.ipe", "src/Lib/ServerLog.ipe", "src/Lib/SetDigest.ipe", "src/Lib/Settings.ipe", "src/Lib/Uid.ipe", "src/Lib/UnitName.ipe", "src/Lib/View.ipe" ]
+            [ "src/Main.ipe", "src/Migrations.ipe", "src/Lib/App.ipe", "src/Lib/Bind.ipe", "src/Lib/DecisionSlot.ipe", "src/Lib/Draft.ipe", "src/Lib/Drawn.ipe", "src/Lib/EnvLookup.ipe", "src/Lib/Epoch.ipe", "src/Lib/Failure.ipe", "src/Lib/Format.ipe", "src/Lib/Highlight.ipe", "src/Lib/History.ipe", "src/Lib/Keys.ipe", "src/Lib/Label.ipe", "src/Lib/Links.ipe", "src/Lib/PageSize.ipe", "src/Lib/Queue.ipe", "src/Lib/RepoPath.ipe", "src/Lib/ReviewKey.ipe", "src/Lib/SafeText.ipe", "src/Lib/Selected.ipe", "src/Lib/ServerLog.ipe", "src/Lib/SetDigest.ipe", "src/Lib/Settings.ipe", "src/Lib/Slot.ipe", "src/Lib/Standing.ipe", "src/Lib/Uid.ipe", "src/Lib/UnitName.ipe", "src/Lib/View.ipe" ]
     in
     do
         cwd <- System.cwd ()
@@ -2266,7 +2270,7 @@ malformedUidRowUnnamed =
         cleanupProgressScratch at
         Task.succeed
             (List.length history.rows == 2
-                && List.map (\row -> ( whyOf row.entry, Queue.entryUid row.entry, describeLabel row.label )) (List.filter (\row -> Queue.entryUid row.entry == Nothing) history.rows) == [ ( Just Tampered, Nothing, describeLabel Unnamed ) ]
+                && List.map (\row -> ( whyOf row.entry, History.entryUid row.entry, describeLabel row.label )) (List.filter (\row -> History.entryUid row.entry == Nothing) history.rows) == [ ( Just Tampered, Nothing, describeLabel Unnamed ) ]
             )
 
 
@@ -2955,7 +2959,7 @@ drawnGateChecks =
         |> Task.onError (\e -> check "the drawn-offer gate fixture" (Task.fail e) |> Task.map (\failed -> [ failed ]))
 
 
--- `Queue.decidableAs` admits a decision only on the offer the page makes
+-- `DecisionSlot.decidableAs` admits a decision only on the offer the page makes
 -- now: an offer drawn over other content under the same row, or a decision
 -- asked where no control was drawn, is `DrawnChanged`; a row no longer
 -- listed keeps its own refusal, never `DrawnChanged`. Red if the gate
@@ -2988,16 +2992,16 @@ drawnGateRows g =
             ViewShown g.a2
 
         offerV1 =
-            Queue.decidableRow 0 st1 v1 ua
+            DecisionSlot.decidableRow 0 st1 v1 ua
 
         offerV2 =
-            Queue.decidableRow 0 st1 v2 ua
+            DecisionSlot.decidableRow 0 st1 v2 ua
 
         fileD1 =
-            Queue.decidableRow 0 st1 v1 file
+            DecisionSlot.decidableRow 0 st1 v1 file
 
         fileD2 =
-            Queue.decidableRow 0 st2 v1 file
+            DecisionSlot.decidableRow 0 st2 v1 file
 
         drawnChanged =
             Err (SaveRefused DrawnChanged)
@@ -3005,30 +3009,30 @@ drawnGateRows g =
         offeredSourceBinds =
             case ( offerV1, fileD1 ) of
                 ( Just unitOffer, Just fileOffer ) ->
-                    isNothing (Queue.offeredSource unitOffer v2)
-                        && not (isNothing (Queue.offeredSource unitOffer v1))
-                        && isNothing (Queue.offeredSource fileOffer v1)
+                    isNothing (DecisionSlot.offeredSource unitOffer v2)
+                        && not (isNothing (DecisionSlot.offeredSource unitOffer v1))
+                        && isNothing (DecisionSlot.offeredSource fileOffer v1)
 
                 _ ->
                     False
     in
     [ ( "a decision drawn on one source and received on another is refused as changed"
-      , offerV1 /= Nothing && offerV2 /= Nothing && offerV1 /= offerV2 && Queue.decidableAs 0 st1 v2 OnUnit ua offerV1 == drawnChanged
+      , offerV1 /= Nothing && offerV2 /= Nothing && offerV1 /= offerV2 && DecisionSlot.decidableAs 0 st1 v2 OnUnit ua offerV1 == drawnChanged
       )
     , ( "a decision drawn on the page's current offer passes the gate"
       , offerV2 /= Nothing
-            && Maybe.map Ok offerV2 == Just (Queue.decidableAs 0 st1 v2 OnUnit ua offerV2)
+            && Maybe.map Ok offerV2 == Just (DecisionSlot.decidableAs 0 st1 v2 OnUnit ua offerV2)
             && fileD2 /= Nothing
-            && Maybe.map Ok fileD2 == Just (Queue.decidableAs 0 st2 v1 OnRefusal file fileD2)
+            && Maybe.map Ok fileD2 == Just (DecisionSlot.decidableAs 0 st2 v1 OnRefusal file fileD2)
       )
     , ( "a decision asked where no control was drawn is refused as changed once the page offers one"
-      , Queue.decidableAs 0 st1 v2 OnUnit ua Nothing == drawnChanged && Queue.decidableAs 0 st2 v1 OnRefusal file Nothing == drawnChanged
+      , DecisionSlot.decidableAs 0 st1 v2 OnUnit ua Nothing == drawnChanged && DecisionSlot.decidableAs 0 st2 v1 OnRefusal file Nothing == drawnChanged
       )
     , ( "an acknowledgement drawn on one digest and received on another is refused as changed"
-      , fileD1 /= Nothing && fileD2 /= Nothing && fileD1 /= fileD2 && Queue.decidableAs 0 st2 v1 OnRefusal file fileD1 == drawnChanged
+      , fileD1 /= Nothing && fileD2 /= Nothing && fileD1 /= fileD2 && DecisionSlot.decidableAs 0 st2 v1 OnRefusal file fileD1 == drawnChanged
       )
     , ( "a decision drawn on a row no longer listed keeps that row's own refusal"
-      , Queue.decidableAs 0 unlisted v2 OnUnit ua offerV1 == Err (SaveRefused NotQueued) && Queue.decidableAs 0 unlisted v1 OnRefusal file fileD1 == Err (SaveRefused FileNotQueued)
+      , DecisionSlot.decidableAs 0 unlisted v2 OnUnit ua offerV1 == Err (SaveRefused NotQueued) && DecisionSlot.decidableAs 0 unlisted v1 OnRefusal file fileD1 == Err (SaveRefused FileNotQueued)
       )
     , ( "the source a decision binds is the one its offer drew", offeredSourceBinds )
     ]
@@ -3075,11 +3079,11 @@ describePresence presence =
 
 
 -- The described labels of the rows of `page` for `label`, in page order.
-labelsFor : String -> Queue.HistoryPage -> List String
+labelsFor : String -> History.HistoryPage -> List String
 labelsFor label page =
     List.filterMap
         (\row ->
-            if Queue.entryUid row.entry == Just (uid label) then
+            if History.entryUid row.entry == Just (uid label) then
                 Just (describeLabel row.label)
 
             else

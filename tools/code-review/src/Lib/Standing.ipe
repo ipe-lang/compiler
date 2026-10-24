@@ -1,0 +1,144 @@
+module Lib.Standing exposing (Standing(..), StandingRead(..), loadStanding, standingArrived, standingFor, standingOf, standingRequested)
+
+import Ipe.Error as Error
+import Ipe.Result as Result exposing (Result(..))
+import Ipe.Task as Task
+import Lib.Db as LibDb exposing (ReviewEntry(..))
+import Lib.Epoch exposing (Epoch)
+import Lib.Failure exposing (LoadFailure)
+-- `Index.Unit` names `Highlight.Lang`, and an imported alias resolves its
+-- qualified names in this module.
+import Lib.Highlight as Highlight
+import Lib.Index as Index
+import Lib.Settings exposing (AppSettings)
+import Lib.Uid exposing (Uid)
+
+
+-- Where a unit's current body stands in the review log, classified as the
+-- History classifies its entries: no entry, a decision that counts, or an
+-- entry that does not count and why.
+type Standing
+    = Undecided
+    | Decided LibDb.StoredDecision
+    | NotCounted LibDb.Unverified
+
+
+standingOf : Maybe LibDb.ReviewEntry -> Standing
+standingOf entry =
+    case entry of
+        Just found ->
+            case found of
+                Verified row ->
+                    Decided (LibDb.verifiedDecision row)
+
+                Unverified row ->
+                    NotCounted row.why
+
+        Nothing ->
+            Undecided
+
+
+-- The unit page's read of its shown body's standing, keyed by the uid and
+-- body hash it was read for, so a read for another unit or an older body
+-- never stands for the one shown. `StandingReading` is the one read in
+-- flight, run by process `owner`, with the body asked for meanwhile: a read
+-- asked during it starts nothing, so the slot holds at most one read.
+type StandingRead
+    = StandingUnread
+    | StandingShown Uid String Standing
+    | StandingFailed Uid String LoadFailure
+    | StandingReading Uid String Epoch (Maybe ( Uid, String ))
+
+
+-- The standing of `uid`'s body `bodyHash`, under one walk of the review log.
+loadStanding : AppSettings -> Uid -> String -> Task.Task Error Standing
+loadStanding settings uid bodyHash =
+    do
+        db <- LibDb.openAt settings.review
+        state <- LibDb.logVerdict settings.key db
+        entry <- LibDb.findDecision (LibDb.verifier state) db uid bodyHash
+        Task.succeed (standingOf entry)
+
+
+-- The standing of `uid`'s body `bodyHash` asked for by process `epoch`,
+-- with the read to start, if any. During a read this process runs, the body
+-- is only recorded as wanted (the latest wins); a read another process left
+-- behind has no completion left to settle it, so the slot is idle to it.
+standingRequested : Epoch -> Uid -> String -> StandingRead -> ( StandingRead, Maybe ( Uid, String ) )
+standingRequested epoch uid bodyHash read =
+    case read of
+        StandingReading reading readHash owner _ ->
+            if owner == epoch then
+                ( StandingReading reading readHash owner (Just ( uid, bodyHash )), Nothing )
+
+            else
+                ( StandingReading uid bodyHash epoch Nothing, Just ( uid, bodyHash ) )
+
+        StandingUnread ->
+            ( StandingReading uid bodyHash epoch Nothing, Just ( uid, bodyHash ) )
+
+        StandingShown _ _ _ ->
+            ( StandingReading uid bodyHash epoch Nothing, Just ( uid, bodyHash ) )
+
+        StandingFailed _ _ _ ->
+            ( StandingReading uid bodyHash epoch Nothing, Just ( uid, bodyHash ) )
+
+
+-- The read of `uid`'s body `bodyHash` run by process `epoch` returned with
+-- `result`: when another body was asked for meanwhile, the result is
+-- dropped and that body's read starts; otherwise the result settles the
+-- slot. A result for any read but the one in flight, or from any process
+-- but its owner, changes nothing.
+standingArrived : Epoch -> Uid -> String -> Result LoadFailure Standing -> StandingRead -> ( StandingRead, Maybe ( Uid, String ) )
+standingArrived epoch uid bodyHash result read =
+    case read of
+        StandingReading reading readHash owner wanted ->
+            if reading /= uid || readHash /= bodyHash || owner /= epoch then
+                ( read, Nothing )
+
+            else
+                case wanted of
+                    Just ( next, nextHash ) ->
+                        ( StandingReading next nextHash epoch Nothing, Just ( next, nextHash ) )
+
+                    Nothing ->
+                        case result of
+                            Ok standing ->
+                                ( StandingShown uid bodyHash standing, Nothing )
+
+                            Err e ->
+                                ( StandingFailed uid bodyHash e, Nothing )
+
+        StandingUnread ->
+            ( read, Nothing )
+
+        StandingShown _ _ _ ->
+            ( read, Nothing )
+
+        StandingFailed _ _ _ ->
+            ( read, Nothing )
+
+
+-- The read's result for `unit`'s current body, Nothing while none is held.
+standingFor : Index.Unit -> StandingRead -> Maybe (Result LoadFailure Standing)
+standingFor unit read =
+    case read of
+        StandingUnread ->
+            Nothing
+
+        StandingShown uid bodyHash standing ->
+            if uid == unit.uid && bodyHash == Index.storedHash unit.attested then
+                Just (Ok standing)
+
+            else
+                Nothing
+
+        StandingFailed uid bodyHash e ->
+            if uid == unit.uid && bodyHash == Index.storedHash unit.attested then
+                Just (Err e)
+
+            else
+                Nothing
+
+        StandingReading _ _ _ _ ->
+            Nothing
