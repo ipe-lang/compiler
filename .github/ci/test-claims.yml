@@ -16,7 +16,7 @@ cells:
     platform: wasm32-unknown-unknown
     features: [wasm-client, debugger]
     owner: wasm-floor
-    expect_tests: 17
+    expect_tests: 20
   - package: ipe-runtime-rust
     target: {test: wasm_js_port_bridge}
     platform: wasm32-unknown-unknown
@@ -28,7 +28,7 @@ cells:
     platform: wasm32-unknown-unknown
     features: [wasm-client]
     owner: wasm-floor
-    expect_tests: 6
+    expect_tests: 8
   - package: ipe-runtime-rust
     target: {test: wasm_websocket_bridge}
     platform: wasm32-unknown-unknown

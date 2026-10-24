@@ -181,3 +181,46 @@ fn a_template_takes_its_markup_into_its_inert_content() {
     }
     host.remove();
 }
+
+#[wasm_bindgen_test]
+fn a_patched_iframe_connects_sandboxed() {
+    let doc = document();
+    assert!(doc.is_some(), "run_in_browser must provide a document");
+    let Some(doc) = doc else { return };
+    let root = fresh(&doc, "div");
+    assert!(root.is_some(), "the patch target must attach");
+    let Some(root) = root else { return };
+    replace_children_html(
+        &doc,
+        &root,
+        r#"<iframe id="bare" src="/"></iframe><iframe id="wide" sandbox="allow-scripts ALLOW-SAME-ORIGIN allow-popups-to-escape-sandbox"></iframe>"#,
+    );
+    let sandbox = |id: &str| {
+        root.query_selector(id)
+            .ok()
+            .flatten()
+            .and_then(|el| el.get_attribute("sandbox"))
+    };
+    assert_eq!(sandbox("#bare").as_deref(), Some(""));
+    assert_eq!(sandbox("#wide").as_deref(), Some("allow-scripts"));
+    root.remove();
+}
+
+#[wasm_bindgen_test]
+fn a_patched_embed_with_a_url_never_connects() {
+    let doc = document();
+    assert!(doc.is_some(), "run_in_browser must provide a document");
+    let Some(doc) = doc else { return };
+    let root = fresh(&doc, "div");
+    assert!(root.is_some(), "the patch target must attach");
+    let Some(root) = root else { return };
+    replace_children_html(
+        &doc,
+        &root,
+        r#"<embed src="/"><object data="/"></object><p><embed SRC=" "></p><embed id="inert" type="x">"#,
+    );
+    assert!(root.query_selector("p").ok().flatten().is_some());
+    assert!(root.query_selector("#inert").ok().flatten().is_some());
+    assert!(matches!(root.query_selector("[src], object"), Ok(None)));
+    root.remove();
+}

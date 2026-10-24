@@ -211,7 +211,7 @@ fn for_each_autofocus<'a, M>(root: &'a Html<M>, mut visit: impl FnMut(&'a str) -
         let Html::HElement(tag, attrs, kids) = node else {
             continue;
         };
-        let Ok(rendered) = admit_rendered_in(ctx, tag, kids) else {
+        let Ok(rendered) = admit_rendered_in(ctx, tag, attrs, kids) else {
             continue;
         };
         let child_ctx = match rendered {
@@ -324,7 +324,7 @@ fn push_children_replace<M>(
 /// admission rule refuses, so the renderer leaves it out of the page.
 fn is_refused_element<M>(ctx: ParseContext, node: &Html<M>) -> bool {
     match node {
-        Html::HElement(tag, _, kids) => admit_rendered_in(ctx, tag, kids).is_err(),
+        Html::HElement(tag, attrs, kids) => admit_rendered_in(ctx, tag, attrs, kids).is_err(),
         Html::HText(_) | Html::HRaw(_) => false,
     }
 }
@@ -368,8 +368,8 @@ fn diff_node_depth<M>(
     // same rule. The `Html.doctype` wrapper is admitted as markup, so a view
     // rooted at it is diffed through to its children.
     let (Ok(new_rendered), Ok(_)) = (
-        admit_rendered_in(ctx, nt, nk),
-        admit_rendered_in(ctx, ot, ok),
+        admit_rendered_in(ctx, nt, na, nk),
+        admit_rendered_in(ctx, ot, oa, ok),
     ) else {
         return Reach::Patched;
     };
@@ -382,7 +382,7 @@ fn diff_node_depth<M>(
 
     // Attribute + event delta.
     let mut p = Patch::for_id(id.unwrap_or_default());
-    diff_attrs(oa, na, &mut p);
+    diff_attrs(nt, oa, na, &mut p);
     if !p.attrs.is_empty() {
         if id.is_none() {
             return Reach::Unaddressed;
@@ -452,21 +452,23 @@ fn diff_node_depth<M>(
     Reach::Patched
 }
 
-/// Compute the attribute + event delta between `old` and `new`.
+/// Compute the attribute + event delta between `old` and `new`, the
+/// attributes of two elements `tag`.
 /// Keys changed or added → `Some(new value)`; keys removed → `None`.
-/// The values compared are [`attribute_pairs`], the pairs first paint writes.
+/// The values compared are [`attribute_pairs`], the pairs first paint writes,
+/// so an `iframe`'s canonical `sandbox` is on both sides and never removed.
 /// `ipe-id` is excluded (never patched as an attribute).
-fn diff_attrs<M>(old: &[Attribute<M>], new: &[Attribute<M>], p: &mut Patch) {
+fn diff_attrs<M>(tag: &str, old: &[Attribute<M>], new: &[Attribute<M>], p: &mut Patch) {
     // Borrowed values: only `insert_safe_attr` (which copies, post-XSS-gate)
     // allocates, and only for a changed attribute; a merged `class`/`style`
     // is the one owned value.
-    fn collect<M>(xs: &[Attribute<M>]) -> HashMap<&str, Cow<'_, str>> {
-        attribute_pairs(xs)
+    fn collect<'a, M>(tag: &str, xs: &'a [Attribute<M>]) -> HashMap<&'a str, Cow<'a, str>> {
+        attribute_pairs(tag, xs)
             .into_iter()
             .filter(|(k, _)| *k != STAMPED_ID_ATTR)
             .collect()
     }
-    let (om, nm) = (collect(old), collect(new));
+    let (om, nm) = (collect(tag, old), collect(tag, new));
     for (k, v) in &nm {
         if om.get(k) != Some(v) {
             insert_safe_attr(p, k, Some(v.as_ref()));
@@ -1923,5 +1925,78 @@ mod tests {
         assert!(painted.contains(" class=\"x y\""), "{painted}");
         assert!(painted.contains(" style=\"a: 1; b: 2\""), "{painted}");
         assert!(plain(&new, &new.clone()).is_empty());
+    }
+
+    /// A stamped `iframe` with attributes `attrs`.
+    fn iframe(attrs: Vec<Attribute<()>>) -> Html<()> {
+        let mut f = Html::HElement("iframe".into(), attrs, vec![]);
+        ids(&mut f);
+        f
+    }
+
+    /// Dropping the app's `sandbox` patches the empty sandbox, never a removal.
+    #[test]
+    fn dropping_an_iframe_sandbox_patches_an_empty_sandbox() {
+        let opted = iframe(vec![Attribute::Attr(
+            "sandbox".into(),
+            "allow-scripts".into(),
+        )]);
+        let p = plain(&opted, &iframe(vec![]));
+        assert_eq!(patched(&p, "sandbox"), Some(Some("")));
+        let p = plain(&iframe(vec![]), &opted);
+        assert_eq!(patched(&p, "sandbox"), Some(Some("allow-scripts")));
+        let widened = iframe(vec![Attribute::Attr(
+            "sandbox".into(),
+            "allow-scripts allow-same-origin".into(),
+        )]);
+        assert!(plain(&opted, &widened).is_empty());
+    }
+
+    /// A `sandbox` that changes only its key's case, or its tokens' case and
+    /// order, paints the same value, so nothing is patched.
+    #[test]
+    fn a_case_variant_sandbox_change_patches_nothing() {
+        let old = iframe(vec![Attribute::Attr(
+            "sandbox".into(),
+            "allow-forms allow-scripts".into(),
+        )]);
+        let new = iframe(vec![Attribute::Attr(
+            "SANDBOX".into(),
+            "ALLOW-SCRIPTS allow-forms".into(),
+        )]);
+        assert!(plain(&old, &new).is_empty(), "{:?}", plain(&old, &new));
+        let new = iframe(vec![
+            Attribute::Attr("sandbox".into(), "allow-forms".into()),
+            Attribute::Attr("SandBox".into(), "allow-forms allow-scripts".into()),
+        ]);
+        assert!(plain(&old, &new).is_empty());
+    }
+
+    /// An `embed` gaining its `src` leaves the page: its parent's children are
+    /// replaced without it, and no attribute patch names `src`.
+    #[test]
+    fn an_embed_gaining_its_url_replaces_the_parent_without_it() {
+        let page = |embed_attrs: Vec<Attribute<()>>| {
+            let mut d: Html<()> = Html::HElement(
+                "div".into(),
+                vec![],
+                vec![Html::HElement("embed".into(), embed_attrs, vec![])],
+            );
+            ids(&mut d);
+            d
+        };
+        let old = page(vec![Attribute::Attr("type".into(), "x".into())]);
+        let new = page(vec![
+            Attribute::Attr("type".into(), "x".into()),
+            Attribute::Attr("src".into(), "/".into()),
+        ]);
+        let p = plain(&old, &new);
+        assert_eq!(p.len(), 1, "{p:?}");
+        let html = p.first().and_then(|x| x.html.as_deref());
+        assert!(html.is_some_and(|h| !h.contains("<embed")), "{p:?}");
+        assert!(
+            p.iter()
+                .all(|x| !x.attrs.keys().any(|k| k.eq_ignore_ascii_case("src")))
+        );
     }
 }

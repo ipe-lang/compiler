@@ -1784,7 +1784,7 @@ fn render_node_as<M: Clone>(
     // strips directly after `<pre>`.
     if code_block {
         let code = NodeTag::Code.as_str();
-        if admit_element(code, &html_kids).is_err() {
+        if admit_element::<_, M>(code, &[], &html_kids).is_err() {
             return Html::HText(String::new());
         }
         html_kids = vec![Html::HElement(code.to_owned(), Vec::new(), html_kids)];
@@ -1797,7 +1797,7 @@ fn render_node_as<M: Clone>(
     // SECURITY: the shared tag gate on the lowered children, so an element
     // that reached the tree without `ui_tagged_node_` still cannot render a
     // raw-text or executable body.
-    if admit_element(tag, &html_kids).is_err() {
+    if admit_element(tag, &html_attrs, &html_kids).is_err() {
         return Html::HText(String::new());
     }
     Html::HElement(tag.to_owned(), html_attrs, html_kids)
@@ -3767,11 +3767,11 @@ mod text_role_tests {
 
     /// True when every element of a rendered tree is admitted as markup.
     fn all_admitted(h: &Html<()>) -> bool {
-        let Html::HElement(tag, _, kids) = h else {
+        let Html::HElement(tag, attrs, kids) = h else {
             return true;
         };
         matches!(
-            admit_rendered_in(ParseContext::Data, tag, kids),
+            admit_rendered_in(ParseContext::Data, tag, attrs, kids),
             Ok(RenderedElement::Element(ElementBody::Markup))
         ) && kids.iter().all(all_admitted)
     }
