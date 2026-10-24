@@ -759,17 +759,73 @@ impl From<LimitRefusal> for IpeError {
     }
 }
 
+/// A declared wall-clock ceiling ended the operation.
+///
+/// The message names the operation, the ceiling and, when one exists, the
+/// setting that raises it. The value reaches an error sink only as `Timeout`:
+/// it has no conversion into `String`, so it cannot fall into the
+/// `From<String>` bridge that yields `Unexpected`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TimeoutRefusal(String);
+
+impl TimeoutRefusal {
+    #[must_use]
+    pub fn new(message: impl Into<String>) -> Self {
+        Self(message.into())
+    }
+
+    #[must_use]
+    pub fn message(&self) -> &str {
+        &self.0
+    }
+
+    /// Prefixes the message with the refusing operation, keeping the kind.
+    #[must_use]
+    pub fn context(self, operation: &str) -> Self {
+        Self(format!("{operation}: {}", self.0))
+    }
+
+    /// The refusal in a generic error sink, kinded `Timeout`.
+    #[must_use]
+    pub fn into_error<E: FromIpeError>(self) -> E {
+        E::from_ipe_error(IpeError::from(self))
+    }
+}
+
+impl From<TimeoutRefusal> for IpeError {
+    fn from(refusal: TimeoutRefusal) -> Self {
+        Self::with(IpeErrorKind::Timeout, refusal.0)
+    }
+}
+
+/// An error sink that can carry every [`KernelFailure`] kind.
+///
+/// The one bound every generic kernel that lands a `KernelFailure` names, so a
+/// new kind widens this trait, never each kernel's own bound list.
+pub trait KernelErrorSink:
+    From<String> + FromLimitExceeded + FromUnavailable + FromIpeError
+{
+}
+
+impl<E> KernelErrorSink for E where
+    E: From<String> + FromLimitExceeded + FromUnavailable + FromIpeError
+{
+}
+
 /// A kernel failure whose kind is decided where it is built.
 ///
 /// A bare `String` converts into `Unexpected`, so a `?` on an OS or library
 /// error keeps that classification; a ceiling refusal is built as
-/// `LimitExceeded` and keeps that kind through `into_error`.
+/// `LimitExceeded`, a wall-clock expiry as `Timeout`, and each keeps its kind
+/// through `into_error`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum KernelFailure {
     /// An unclassified failure (an OS or library error).
     Unexpected(String),
     /// A declared ceiling turned the input back.
     LimitExceeded(LimitRefusal),
+    /// A declared wall-clock ceiling ended the operation.
+    TimedOut(TimeoutRefusal),
     /// The blocking pool could not start a thread for the operation.
     Unavailable(String),
 }
@@ -780,6 +836,7 @@ impl KernelFailure {
         match self {
             Self::Unexpected(message) | Self::Unavailable(message) => message,
             Self::LimitExceeded(refusal) => refusal.message(),
+            Self::TimedOut(refusal) => refusal.message(),
         }
     }
 
@@ -789,18 +846,26 @@ impl KernelFailure {
         match self {
             Self::Unexpected(message) => Self::Unexpected(format!("{operation}: {message}")),
             Self::LimitExceeded(refusal) => Self::LimitExceeded(refusal.context(operation)),
+            Self::TimedOut(refusal) => Self::TimedOut(refusal.context(operation)),
             Self::Unavailable(message) => Self::Unavailable(format!("{operation}: {message}")),
         }
     }
 
     /// The failure in a generic error sink, each variant under its own kind.
     #[must_use]
-    pub fn into_error<E: From<String> + FromLimitExceeded + FromUnavailable>(self) -> E {
+    pub fn into_error<E: KernelErrorSink>(self) -> E {
         match self {
             Self::Unexpected(message) => E::from(message),
             Self::LimitExceeded(refusal) => refusal.into_error(),
+            Self::TimedOut(refusal) => refusal.into_error(),
             Self::Unavailable(message) => E::from_unavailable(message),
         }
+    }
+}
+
+impl From<TimeoutRefusal> for KernelFailure {
+    fn from(refusal: TimeoutRefusal) -> Self {
+        Self::TimedOut(refusal)
     }
 }
 
@@ -931,6 +996,18 @@ mod tests {
         assert_eq!(
             IpeError::from(LimitRefusal::new("x")),
             IpeError::limit_exceeded("x")
+        );
+        let expired =
+            KernelFailure::from(TimeoutRefusal::new("still running after 1s")).context("Op");
+        assert_eq!(expired.message(), "Op: still running after 1s");
+        assert_eq!(
+            expired.clone().into_error::<IpeError>().to_ipe_string(),
+            "Timeout: Op: still running after 1s"
+        );
+        assert_eq!(
+            expired.into_error::<String>(),
+            "Timeout: Op: still running after 1s",
+            "a bare String sink keeps the kinded text"
         );
     }
 

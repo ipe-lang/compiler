@@ -105,7 +105,7 @@ async fn offloaded<E, Ce, F>(
     f: F,
 ) -> IpeResult<E, Vec<u8>>
 where
-    E: From<String> + FromLimitExceeded + crate::FromUnavailable,
+    E: crate::KernelErrorSink,
     Ce: Into<KernelFailure> + Send + 'static,
     F: FnOnce() -> Result<Vec<u8>, Ce> + Send + 'static,
 {
@@ -117,9 +117,7 @@ where
 }
 
 /// Compression.gzip : Bytes -> Task Error Bytes
-pub fn compression_gzip<
-    E: From<String> + FromLimitExceeded + crate::FromUnavailable + Send + 'static,
->(
+pub fn compression_gzip<E: crate::KernelErrorSink + Send + 'static>(
     data: Vec<u8>,
 ) -> IpeTask<E, Vec<u8>> {
     Box::pin(async move {
@@ -136,9 +134,7 @@ pub fn compression_gzip<
 }
 
 /// Compression.gunzip : Bytes -> Task Error Bytes
-pub fn compression_gunzip<
-    E: From<String> + FromLimitExceeded + crate::FromUnavailable + Send + 'static,
->(
+pub fn compression_gunzip<E: crate::KernelErrorSink + Send + 'static>(
     data: Vec<u8>,
 ) -> IpeTask<E, Vec<u8>> {
     Box::pin(async move {
@@ -152,9 +148,7 @@ pub fn compression_gunzip<
 }
 
 /// Compression.zstdCompress : Bytes -> Task Error Bytes
-pub fn compression_zstd_compress<
-    E: From<String> + FromLimitExceeded + crate::FromUnavailable + Send + 'static,
->(
+pub fn compression_zstd_compress<E: crate::KernelErrorSink + Send + 'static>(
     data: Vec<u8>,
 ) -> IpeTask<E, Vec<u8>> {
     Box::pin(async move {
@@ -168,9 +162,7 @@ pub fn compression_zstd_compress<
 }
 
 /// Compression.zstdDecompress : Bytes -> Task Error Bytes
-pub fn compression_zstd_decompress<
-    E: From<String> + FromLimitExceeded + crate::FromUnavailable + Send + 'static,
->(
+pub fn compression_zstd_decompress<E: crate::KernelErrorSink + Send + 'static>(
     data: Vec<u8>,
 ) -> IpeTask<E, Vec<u8>> {
     Box::pin(async move {

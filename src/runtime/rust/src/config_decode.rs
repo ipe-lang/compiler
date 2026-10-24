@@ -478,10 +478,7 @@ fn config_read_capped(path: &str, cap: u64) -> Result<String, KernelFailure> {
 // worker thread. The decode dispatch itself runs back on the calling task
 // after the read completes — decoding an already-in-memory, size-capped
 // (≤16 MiB default) string is fast enough not to warrant its own offload.
-pub fn config_load_from_file<
-    E: From<String> + FromLimitExceeded + crate::FromUnavailable + Send + 'static,
-    T: Send + 'static,
->(
+pub fn config_load_from_file<E: crate::KernelErrorSink + Send + 'static, T: Send + 'static>(
     path: crate::path::Path,
     decoder: Decoder<E, T>,
 ) -> IpeTask<E, T> {
