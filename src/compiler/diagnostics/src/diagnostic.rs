@@ -1964,13 +1964,13 @@ pub enum RoutePatternDefect {
         /// The most parameters one path holds.
         cap: usize,
     },
-    /// A `Server.*` route path has a segment led by `*`: a catch-all, which
-    /// the server does not serve.
+    /// A route pattern or path has a segment led by `*`: a catch-all, which
+    /// no route serves.
     CatchAll {
         /// The offending segment.
         segment: Box<str>,
     },
-    /// A literal segment of a `Server.*` route path holds a `:` or `*` after
+    /// A literal segment of a route pattern or path holds a `:` or `*` after
     /// its first byte.
     MidSegmentSigil {
         /// The offending segment.
@@ -3665,7 +3665,7 @@ fn route_pattern_malformed_help(defect: &RoutePatternDefect) -> Vec<HelpLine> {
             "a server route path starts with `/` — write `/health`, not `health`".to_string()
         }
         RoutePatternDefect::CatchAll { .. } => {
-            "a server route matches a fixed number of segments — name each one \
+            "a route matches a fixed number of segments — name each one \
              (`/files/:dir/:name`) instead of a `*` catch-all"
                 .to_string()
         }

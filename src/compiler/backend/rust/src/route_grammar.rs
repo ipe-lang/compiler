@@ -8,13 +8,13 @@
 //! case table through both sides and asserts identical verdicts.
 //!
 //! - A parameter name is `[A-Za-z_][A-Za-z0-9_]*`, distinct within one path.
-//! - A `Web.route` pattern is split on raw `/` after trimming surrounding `/`;
-//!   a segment led by `:` is a parameter, any other segment must strictly
-//!   percent-decode (`%` + two hex digits, UTF-8 result, `+` literal).
-//! - A `Server.*` path starts with `/` and is split like a `Web.route`
-//!   pattern; a segment led by `*` (a catch-all) is refused, a segment led by
-//!   `:` is a parameter, and any other segment holds no `:` or `*` and must
-//!   strictly percent-decode. It holds at most `MAX_SERVER_PARAMS` parameters,
+//! - A `Web.route` pattern is split on raw `/` after trimming surrounding `/`,
+//!   and each segment follows one grammar: a segment led by `*` (a catch-all)
+//!   is refused, a segment led by `:` is a parameter, and any other segment
+//!   holds no `:` or `*` and must strictly percent-decode (`%` + two hex
+//!   digits, UTF-8 result, `+` literal).
+//! - A `Server.*` path starts with `/` and is split and its segments read like
+//!   a `Web.route` pattern's. It holds at most `MAX_SERVER_PARAMS` parameters,
 //!   and its router spelling (each literal re-escaped by the runtime's one
 //!   segment alphabet, each parameter `:p` and its ordinal) is within the
 //!   length ceiling.
@@ -186,13 +186,37 @@ pub fn web_route_segments(pattern: &str) -> Result<Vec<SegmentShape>, RoutePatte
     let mut names = Names::default();
     trimmed
         .split('/')
-        .map(|raw| {
-            raw.strip_prefix(':').map_or_else(
-                || literal_segment(raw).map(SegmentShape::Literal),
-                |name| names.admit(name).map(|()| SegmentShape::Param),
-            )
-        })
+        .map(|raw| route_segment(raw, &mut names))
         .collect()
+}
+
+/// Read one raw segment of a route pattern or path, the grammar the
+/// runtime's route segment parser applies to both.
+///
+/// # Errors
+///
+/// `CatchAll` for a segment led by `*`, the name defect of a segment led by
+/// `:`, `MidSegmentSigil` for a `:` or `*` later in a literal, then the
+/// literal's decode defect.
+fn route_segment<'a>(
+    raw: &'a str,
+    names: &mut Names<'a>,
+) -> Result<SegmentShape, RoutePatternDefect> {
+    if raw.starts_with('*') {
+        return Err(RoutePatternDefect::CatchAll {
+            segment: excerpt(raw),
+        });
+    }
+    if let Some(name) = raw.strip_prefix(':') {
+        return names.admit(name).map(|()| SegmentShape::Param);
+    }
+    if let Some(at) = raw.find([':', '*']) {
+        return Err(RoutePatternDefect::MidSegmentSigil {
+            segment: excerpt(raw),
+            at,
+        });
+    }
+    literal_segment(raw).map(SegmentShape::Literal)
 }
 
 /// Check a literal `Server.*` route path against the runtime's
@@ -220,24 +244,15 @@ pub fn server_route_path(path: &str) -> Result<(), RoutePatternDefect> {
     let mut spelled: usize = 0;
     let mut params: usize = 0;
     for raw in trimmed.split('/') {
-        let seg_len = if raw.starts_with('*') {
-            return Err(RoutePatternDefect::CatchAll {
-                segment: excerpt(raw),
-            });
-        } else if let Some(name) = raw.strip_prefix(':') {
-            names.admit(name)?;
-            // `:p` and the ordinal; a path past `MAX_SERVER_PARAMS` (two
-            // digits at most) is refused before its spelling is measured.
-            let spelled_param = if params < 10 { 3 } else { 4 };
-            params = params.saturating_add(1);
-            spelled_param
-        } else if let Some(at) = raw.find([':', '*']) {
-            return Err(RoutePatternDefect::MidSegmentSigil {
-                segment: excerpt(raw),
-                at,
-            });
-        } else {
-            canonical_len(&literal_segment(raw)?)
+        let seg_len = match route_segment(raw, &mut names)? {
+            SegmentShape::Param => {
+                // `:p` and the ordinal; a path past `MAX_SERVER_PARAMS` (two
+                // digits at most) is refused before its spelling is measured.
+                let spelled_param = if params < 10 { 3 } else { 4 };
+                params = params.saturating_add(1);
+                spelled_param
+            }
+            SegmentShape::Literal(decoded) => canonical_len(&decoded),
         };
         spelled = spelled.saturating_add(1).saturating_add(seg_len);
     }
@@ -1047,6 +1062,8 @@ mod agreement_tests {
             RouteSegmentRefusal::Decode(DecodeRefusal::TooLong { cap }) => {
                 Verdict::TooLong(cap.get())
             }
+            RouteSegmentRefusal::CatchAll => Verdict::CatchAll,
+            RouteSegmentRefusal::MidSegmentSigil { at } => Verdict::MidSegmentSigil(at.get()),
         }
     }
 
@@ -1054,8 +1071,6 @@ mod agreement_tests {
         match ServerPattern::parse(path) {
             Ok(_) => Verdict::Ok,
             Err(ServerPatternRefusal::NotAbsolute) => Verdict::NotAbsolute,
-            Err(ServerPatternRefusal::CatchAll) => Verdict::CatchAll,
-            Err(ServerPatternRefusal::MidSegmentSigil { at }) => Verdict::MidSegmentSigil(at.get()),
             Err(ServerPatternRefusal::Segment(r)) => segment_verdict(r),
             Err(ServerPatternRefusal::TooManyParams { cap }) => Verdict::TooManyParams(cap),
             Err(ServerPatternRefusal::Render(EncodeRefusal::TooLong { cap })) => {
@@ -1106,6 +1121,11 @@ mod agreement_tests {
         "/a//b",
         "/%2E/..",
         "/a+b~c.d_e-f",
+        "/a%3Ab",
+        "/%2Arest",
+        "/%3Aid",
+        "/a%3A:b",
+        "/f/%2A*",
     ];
 
     #[test]

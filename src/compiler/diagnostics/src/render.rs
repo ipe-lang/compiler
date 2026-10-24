@@ -2382,7 +2382,7 @@ fn route_pattern_label(defect: &RoutePatternDefect) -> String {
             format!("this path holds more than {cap} `:` parameters")
         }
         RoutePatternDefect::CatchAll { segment } => {
-            format!("segment `{segment}` is a `*` catch-all, which a server route cannot hold")
+            format!("segment `{segment}` is a `*` catch-all, which a route cannot hold")
         }
         RoutePatternDefect::MidSegmentSigil { segment, at } => format!(
             "segment `{segment}` has a `:` or `*` at byte {at}, which is neither a parameter \
