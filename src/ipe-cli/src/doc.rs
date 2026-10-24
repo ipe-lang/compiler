@@ -108,6 +108,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 use ipe_diagnostics::{TyDoc, render_ty};
 use ipe_docs::{CommandInfo, Index, html};
@@ -4081,8 +4082,7 @@ p.entry-code { margin: 0.2rem 0 1rem; color: var(--muted); }
 /// Hides any module list item whose lowercased `data-name` does not contain
 /// the (lowercased) query, and collapses a section that ends up with no
 /// visible module. No external dependency.
-const FILTER_SCRIPT: &str = "\
-<script>
+const FILTER_SCRIPT_BODY: &str = "\n\
 (function () {
   var box = document.getElementById('filter');
   if (!box) return;
@@ -4100,19 +4100,29 @@ const FILTER_SCRIPT: &str = "\
     });
   });
 })();
-</script>
 ";
 
 /// The inline search script embedded in every HTML page.
 ///
-/// Reads the `ENTRY_INDEX` JSON variable (embedded per-page) and does
-/// client-side substring filtering against key and title. Selecting a result
-/// navigates to that entry's page. Degrades gracefully when JS is off: the
-/// header links still work, the search box is simply non-functional.
-const SEARCH_SCRIPT_TEMPLATE: &str = "\
-<script>
+/// Reads the page's index from the inert JSON block placed right before it,
+/// found through the prototype getters so no named element in the page can
+/// stand in for either node, and does client-side substring filtering against
+/// key and title. Selecting a result navigates to that entry's page. Without
+/// JS, or without a well-formed index block, the header links still work and
+/// the search box is simply non-functional.
+const SEARCH_SCRIPT_BODY: &str = "\n\
 (function () {
-  var INDEX = ENTRY_INDEX_PLACEHOLDER;
+  function getter(proto, name) {
+    var d = Object.getOwnPropertyDescriptor(proto, name);
+    return d && d.get ? d.get : function () { return null; };
+  }
+  var cur = getter(Document.prototype, 'currentScript').call(document);
+  var block = cur && getter(Element.prototype, 'previousElementSibling').call(cur);
+  if (!block || getter(Element.prototype, 'tagName').call(block) !== 'SCRIPT'
+      || block.getAttribute('type') !== 'application/json') return;
+  var INDEX;
+  try { INDEX = JSON.parse(getter(Node.prototype, 'textContent').call(block)); } catch (e) { return; }
+  if (!Array.isArray(INDEX)) return;
   var box = document.getElementById('nav-search');
   var list = document.getElementById('search-results');
   if (!box || !list) return;
@@ -4182,7 +4192,6 @@ const SEARCH_SCRIPT_TEMPLATE: &str = "\
     }
   });
 })();
-</script>
 ";
 
 /// Which section of the navigation is currently active.
@@ -4303,15 +4312,13 @@ fn render_header(active: NavSection, base: &str, search_script: &str) -> String 
     h.push_str("</div>\n");
     h.push_str("</nav>\n");
     h.push_str(search_script);
-    h.push_str(NAV_UX_SCRIPT);
+    h.push_str(&inline_script(NAV_UX_SCRIPT_BODY));
     h
 }
 
-/// The inline script powering the theme toggle (item 19), the mobile hamburger
-/// (item 20), and the floating scroll-to-top button (item 17). Static — no user
-/// content reaches it.
-const NAV_UX_SCRIPT: &str = "\
-<script>
+/// The inline script powering the theme toggle, the mobile hamburger and the
+/// floating scroll-to-top button. Static — no user content reaches it.
+const NAV_UX_SCRIPT_BODY: &str = "\n\
 (function () {
   var root = document.documentElement;
   // Theme: stored choice wins, else the system preference (the default).
@@ -4363,8 +4370,67 @@ const NAV_UX_SCRIPT: &str = "\
     });
   }
 })();
-</script>
 ";
+
+/// Every script a preview page can carry, as the exact text the policy hashes.
+const PREVIEW_SCRIPTS: [&str; 3] = [FILTER_SCRIPT_BODY, SEARCH_SCRIPT_BODY, NAV_UX_SCRIPT_BODY];
+
+/// The `id` of the inert JSON block holding a page's search index.
+const DOC_INDEX_ID: &str = "ipe-doc-index";
+
+/// The `frame-ancestors` directive: header-only, so the `<meta>` copy drops it.
+const FRAME_ANCESTORS_DIRECTIVE: &str = "; frame-ancestors 'none'";
+
+/// One script element around `body`, the text the policy hashes.
+fn inline_script(body: &str) -> String {
+    format!("<script>{body}</script>\n")
+}
+
+/// The `'sha256-…'` source admitting one inline script by its exact text.
+fn script_hash(text: &str) -> String {
+    use base64::Engine as _;
+    use sha2::{Digest, Sha256};
+    format!(
+        "'sha256-{}'",
+        base64::engine::general_purpose::STANDARD.encode(Sha256::digest(text.as_bytes()))
+    )
+}
+
+/// The hash sources of [`PREVIEW_SCRIPTS`], computed once.
+fn script_hashes() -> &'static [String; 3] {
+    static HASHES: OnceLock<[String; 3]> = OnceLock::new();
+    HASHES.get_or_init(|| PREVIEW_SCRIPTS.map(script_hash))
+}
+
+/// The security headers every preview response leaves under.
+///
+/// The one policy covers the whole site: a page's scripts are the hashed
+/// constants and its data is inert JSON, so no page needs a policy of its own.
+struct PreviewHeaders {
+    csp: String,
+}
+
+impl PreviewHeaders {
+    /// The policy as a written page's `<meta http-equiv>` carries it.
+    fn meta_csp(&self) -> String {
+        self.csp
+            .strip_suffix(FRAME_ANCESTORS_DIRECTIVE)
+            .unwrap_or(&self.csp)
+            .to_owned()
+    }
+}
+
+/// The preview's headers, built once from the script hashes.
+fn preview_headers() -> &'static PreviewHeaders {
+    static HEADERS: OnceLock<PreviewHeaders> = OnceLock::new();
+    HEADERS.get_or_init(|| PreviewHeaders {
+        csp: format!(
+            "default-src 'none'; script-src {}; style-src 'self'; img-src 'self' data:; \
+             font-src 'self'; base-uri 'none'; form-action 'none'{FRAME_ANCESTORS_DIRECTIVE}",
+            script_hashes().join(" ")
+        ),
+    })
+}
 
 /// Parse a leading `[label](url)` link. Returns the label text, the URL, and
 /// the byte length consumed, or `None` when the slice does not open a
@@ -4547,20 +4613,24 @@ fn html_page(title: &str, css_href: &str, header: &str, body: &str) -> String {
     format!(
         "<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n\
          <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n\
+         <meta http-equiv=\"Content-Security-Policy\" content=\"{}\">\n\
          <title>{}</title>\n<link rel=\"stylesheet\" href=\"{css_href}\">\n</head>\n\
          <body>\n{header}<main id=\"content\" class=\"page-body\">\n{body}</main>\n\
          <button id=\"scroll-top\" class=\"scroll-top\" type=\"button\" \
          aria-label=\"{}\">\u{2191}</button>\n</body>\n</html>\n",
+        preview_headers().meta_csp(),
         html::escape(title),
         html::escape(crate::text::site_scroll_top_label()),
     )
 }
 
-/// Build the search script with the embedded entry index.
+/// Build the page's search index block and the constant script that reads it.
 ///
-/// Each entry carries its already-resolved `href` (relative to the page the
-/// script is embedded in), so the JS navigates straight to a generated file and
-/// never rebuilds a path from parts.
+/// The index is inert data (`type="application/json"`), never script text, so
+/// the policy's script hashes stay the same for every page. Each entry carries
+/// its already-resolved `href` (relative to the page the script is embedded
+/// in), so the JS navigates straight to a generated file and never rebuilds a
+/// path from parts.
 fn build_search_script(entries: &[SearchEntry]) -> String {
     use crate::cli_args::json;
     let mut json_buf = String::from("[");
@@ -4586,7 +4656,10 @@ fn build_search_script(entries: &[SearchEntry]) -> String {
     // titles are repo-controlled.
     let json_buf = ipe_diagnostics::json::script_embed(&json_buf);
 
-    SEARCH_SCRIPT_TEMPLATE.replace("ENTRY_INDEX_PLACEHOLDER", &json_buf)
+    format!(
+        "<script type=\"application/json\" id=\"{DOC_INDEX_ID}\">{json_buf}</script>\n{}",
+        inline_script(SEARCH_SCRIPT_BODY)
+    )
 }
 
 /// Sort curated entries: entries with an explicit `order:` first (ascending),
@@ -4720,7 +4793,7 @@ fn render_reference_index(docs: &DocsJson, search_script: &str) -> String {
         crate::text::site_standard_library(),
     );
 
-    body.push_str(FILTER_SCRIPT);
+    body.push_str(&inline_script(FILTER_SCRIPT_BODY));
     html_page(title, "../style.css", &header, &body)
 }
 
@@ -5500,16 +5573,19 @@ fn serve_one(
     let Some(deadline) = Instant::now().checked_add(budget) else {
         return;
     };
+    let headers = preview_headers();
     let mut reader =
         BufReader::new(DeadlineConn { conn, deadline }.take(DOC_SERVE_REQUEST_HEAD_CAP as u64));
     let response = match read_head(&mut reader) {
         Err(HeadRefusal::Abandoned) => return,
         Err(HeadRefusal::TooLarge) => http_response(
+            headers,
             "431 Request Header Fields Too Large",
             "text/plain; charset=utf-8",
             "request head too large\n",
         ),
         Err(HeadRefusal::Malformed) => http_response(
+            headers,
             "400 Bad Request",
             "text/plain; charset=utf-8",
             "malformed request head\n",
@@ -5518,11 +5594,19 @@ fn serve_one(
             Ok(Some(path)) => {
                 let name = serve_file_name(path);
                 site.get(&name).map_or_else(
-                    || http_response("404 Not Found", "text/plain; charset=utf-8", "not found\n"),
-                    |body| http_response("200 OK", content_type(&name), body),
+                    || {
+                        http_response(
+                            headers,
+                            "404 Not Found",
+                            "text/plain; charset=utf-8",
+                            "not found\n",
+                        )
+                    },
+                    |body| http_response(headers, "200 OK", content_type(&name), body),
                 )
             }
             Ok(None) | Err(_) => http_response(
+                headers,
                 "421 Misdirected Request",
                 "application/json",
                 DOC_SERVE_REFUSED_HOST_BODY,
@@ -5562,14 +5646,22 @@ fn content_type(name: &str) -> &'static str {
     }
 }
 
-/// A complete HTTP/1.1 response with an explicit `Content-Length`, a
+/// A complete HTTP/1.1 response: the one production sink every served byte
+/// leaves through.
+///
+/// Every status and content type carries the security headers (the policy,
+/// `nosniff`, no referrer, no framing), an explicit `Content-Length`, a
 /// `Connection: close` (the loop serves one request per connection), and
 /// `Cache-Control: no-store` (the site is a live preview built in memory).
-fn http_response(status: &str, content_type: &str, body: &str) -> String {
+fn http_response(headers: &PreviewHeaders, status: &str, content_type: &str, body: &str) -> String {
     format!(
         "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\n\
-         Content-Length: {}\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n{body}",
-        body.len()
+         Content-Length: {}\r\nCache-Control: no-store\r\n\
+         Content-Security-Policy: {}\r\nX-Content-Type-Options: nosniff\r\n\
+         Referrer-Policy: no-referrer\r\nX-Frame-Options: DENY\r\n\
+         Connection: close\r\n\r\n{body}",
+        body.len(),
+        headers.csp,
     )
 }
 
@@ -5943,11 +6035,7 @@ mod tests {
             title: title.to_owned(),
             href: "Main.html#x".to_owned(),
         }]);
-        let index = script
-            .split_once("var INDEX = ")
-            .and_then(|(_, rest)| rest.split_once(";\n"))
-            .map(|(index, _)| index)
-            .expect("the index assignment");
+        let index = doc_index_json(&script).expect("the index block");
         for raw in ['<', '>', '&', '\u{2028}', '\u{2029}'] {
             assert!(
                 !index.contains(raw),
@@ -7015,11 +7103,203 @@ mod tests {
 
     #[test]
     fn http_response_has_length_and_close() {
-        let r = http_response("200 OK", "text/html; charset=utf-8", "hi");
+        let r = http_response(
+            preview_headers(),
+            "200 OK",
+            "text/html; charset=utf-8",
+            "hi",
+        );
         assert!(r.starts_with("HTTP/1.1 200 OK\r\n"));
         assert!(r.contains("Content-Length: 2\r\n"));
         assert!(r.contains("Connection: close\r\n"));
         assert!(r.ends_with("\r\n\r\nhi"));
+    }
+
+    /// The JSON text of a page's index block, when the page carries one.
+    fn doc_index_json(page: &str) -> Option<&str> {
+        let open = format!("<script type=\"application/json\" id=\"{DOC_INDEX_ID}\">");
+        let (_, rest) = page.split_once(open.as_str())?;
+        rest.split_once("</script>").map(|(json, _)| json)
+    }
+
+    /// The text of every script element on `page` that is not inert JSON.
+    fn inline_script_texts(page: &str) -> Vec<&str> {
+        let mut out = Vec::new();
+        let mut rest = page;
+        while let Some((_, after_open)) = rest.split_once("<script") {
+            let Some((attrs, after_tag)) = after_open.split_once('>') else {
+                break;
+            };
+            let Some((text, after_close)) = after_tag.split_once("</script>") else {
+                break;
+            };
+            if !attrs.contains("type=\"application/json\"") {
+                out.push(text);
+            }
+            rest = after_close;
+        }
+        out
+    }
+
+    /// The `script-src` sources of a policy.
+    fn csp_script_sources(csp: &str) -> BTreeSet<String> {
+        csp.split("; ")
+            .find_map(|directive| directive.strip_prefix("script-src "))
+            .map(|sources| sources.split(' ').map(str::to_owned).collect())
+            .unwrap_or_default()
+    }
+
+    /// Whether every script `page` carries is one the policy names.
+    fn policy_covers(page: &str) -> bool {
+        let named = csp_script_sources(&preview_headers().csp);
+        inline_script_texts(page)
+            .iter()
+            .all(|text| named.contains(&script_hash(text)))
+    }
+
+    #[test]
+    fn every_preview_response_carries_the_security_headers() {
+        let headers = preview_headers();
+        let responses = [
+            http_response(headers, "200 OK", content_type("index.html"), "<p>hi</p>"),
+            http_response(headers, "200 OK", content_type("style.css"), "body{}"),
+            http_response(headers, "200 OK", content_type("x.js"), "1"),
+            http_response(headers, "200 OK", content_type("M.md"), "# M"),
+            http_response(headers, "200 OK", content_type("notes.txt"), "plain"),
+            http_response(
+                headers,
+                "404 Not Found",
+                "text/plain; charset=utf-8",
+                "not found\n",
+            ),
+        ];
+        let expected = [
+            format!("Content-Security-Policy: {}\r\n", headers.csp),
+            "X-Content-Type-Options: nosniff\r\n".to_owned(),
+            "Referrer-Policy: no-referrer\r\n".to_owned(),
+            "X-Frame-Options: DENY\r\n".to_owned(),
+        ];
+        for response in &responses {
+            let (head, _) = response.split_once("\r\n\r\n").expect("head and body");
+            for header in &expected {
+                assert_eq!(
+                    head.matches(header.as_str()).count(),
+                    1,
+                    "{header:?} exactly once in {head:?}"
+                );
+            }
+        }
+        assert!(
+            headers
+                .csp
+                .starts_with("default-src 'none'; script-src 'sha256-"),
+            "the policy admits scripts by hash only: {}",
+            headers.csp
+        );
+        assert!(
+            csp_script_sources(&headers.csp)
+                .iter()
+                .all(|source| source.starts_with("'sha256-")),
+            "every script source is a hash: {}",
+            headers.csp
+        );
+    }
+
+    #[test]
+    fn the_policy_names_exactly_the_scripts_a_page_carries() {
+        let docs = build_stdlib_only_docs();
+        let bundle = build_doc_bundle(&locate_docs_root()).expect("bundle builds");
+        let site = render_site_for_serve(&docs, &bundle);
+        let named = csp_script_sources(&preview_headers().csp);
+        assert_eq!(named.len(), PREVIEW_SCRIPTS.len(), "one hash per script");
+
+        let mut carried = BTreeSet::new();
+        let mut pages = 0;
+        for (name, page) in &site {
+            if !name.ends_with(".html") {
+                continue;
+            }
+            pages += 1;
+            let texts = inline_script_texts(page);
+            assert!(
+                texts.len() >= 2,
+                "{name} carries the search and nav scripts"
+            );
+            assert!(
+                policy_covers(page),
+                "{name} carries only policy-named scripts"
+            );
+            carried.extend(texts.iter().map(|text| script_hash(text)));
+        }
+        assert!(pages > 1, "the site has pages");
+        assert_eq!(
+            carried, named,
+            "the policy names exactly the carried scripts"
+        );
+
+        let index = site.get("index.html").expect("the index page");
+        assert!(policy_covers(index), "the index page passes the check");
+        let tampered = format!("{index}<script>1</script>");
+        assert!(
+            !policy_covers(&tampered),
+            "a script the policy does not name fails the check"
+        );
+    }
+
+    #[test]
+    fn the_page_index_is_inert_json() {
+        let entries = [
+            SearchEntry {
+                kind: "symbol",
+                key: "Main.x".to_owned(),
+                title: "a</script><!--&\u{2028}b".to_owned(),
+                href: "Main.html#x".to_owned(),
+            },
+            SearchEntry {
+                kind: "module",
+                key: "Ipe.List".to_owned(),
+                title: "<List> & friends".to_owned(),
+                href: "Ipe.List.html".to_owned(),
+            },
+        ];
+        let script = build_search_script(&entries);
+        assert!(
+            script.starts_with("<script type=\"application/json\" id=\"ipe-doc-index\">"),
+            "the index is an inert block: {script}"
+        );
+        let json = doc_index_json(&script).expect("the index block");
+        for raw in ['<', '>', '&'] {
+            assert!(!json.contains(raw), "{raw:?} reached the block raw: {json}");
+        }
+        let parsed: serde_json::Value = serde_json::from_str(json).expect("valid JSON");
+        let titles: Vec<&str> = parsed
+            .as_array()
+            .expect("an array")
+            .iter()
+            .filter_map(|entry| entry.get("title").and_then(serde_json::Value::as_str))
+            .collect();
+        assert_eq!(titles, ["a</script><!--&\u{2028}b", "<List> & friends"]);
+        assert_eq!(
+            inline_script_texts(&script),
+            [SEARCH_SCRIPT_BODY],
+            "the one executable script is the constant"
+        );
+        assert!(policy_covers(&script), "the policy names the search script");
+    }
+
+    #[test]
+    fn meta_csp_equals_the_header_csp_without_frame_ancestors() {
+        let headers = preview_headers();
+        let meta = headers.meta_csp();
+        assert!(!meta.contains("frame-ancestors"), "header-only: {meta}");
+        assert_eq!(format!("{meta}{FRAME_ANCESTORS_DIRECTIVE}"), headers.csp);
+        let page = html_page("t", "style.css", "", "<p>b</p>");
+        assert!(
+            page.contains(&format!(
+                "<meta http-equiv=\"Content-Security-Policy\" content=\"{meta}\">\n"
+            )),
+            "the written page carries the policy: {page}"
+        );
     }
 
     // ── Per-format subfolder layout ────────────────────────────────────────
@@ -7750,7 +8030,11 @@ mod tests {
             "search index contains multiple kinds: {json_str}"
         );
 
-        // The inline script element is present.
+        // The inert index block and the constant script element are present.
+        assert!(
+            script.contains("<script type=\"application/json\""),
+            "search index is an inert block"
+        );
         assert!(
             script.contains("<script>"),
             "search script contains <script> tag"
