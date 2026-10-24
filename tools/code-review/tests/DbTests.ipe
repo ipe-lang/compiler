@@ -24,15 +24,17 @@ import Lib.Db as LibDb exposing (BreakAt(..), Decision(..), HistoryCursor(..), L
 import Lib.Failure as Failure exposing (DecideRefusal(..), LoadFailure(..), ReasonRefusal(..), SaveFailure(..))
 import Lib.Format as Format
 import Lib.Highlight as Highlight exposing (Lang(..), Token(..))
+import Lib.History as History exposing (HistoryState(..))
 import Lib.Index as Index exposing (Change(..), SourceView(..), StaleReason(..), Written(..))
 import Lib.Keys as Keys exposing (KeyAction(..))
 import Lib.Links as Links exposing (Link(..))
 import Lib.PageSize as PageSize exposing (PageSize)
-import Lib.Queue as Queue exposing (HistoryState(..), QueueState(..), UnitPageState(..))
+import Lib.Queue as Queue exposing (QueueState(..), UnitPageState(..))
 import Lib.RepoPath as RepoPath exposing (PathError(..), Root, RootMap)
 import Lib.ReviewKey as ReviewKey
 import Lib.SafeText as SafeText
 import Lib.Settings as Settings
+import Lib.Slot as Slot
 import Lib.Uid as Uid exposing (Uid)
 import Lib.UnitName as UnitName
 import Migrations
@@ -598,7 +600,7 @@ storedUidNotAUnitIdTampered db =
         page <- LibDb.historyPage verify db PageSize.history HistoryStart
         Task.succeed
             (List.map (\entry -> whyOf (Just entry)) page.rows == [ Just Tampered, Just ChainBroken ]
-                && List.map Queue.entryUid page.rows == [ Nothing, Just (uid "first-1") ]
+                && List.map History.entryUid page.rows == [ Nothing, Just (uid "first-1") ]
             )
 
 
@@ -812,7 +814,7 @@ historyStateTextsDistinct : Bool
 historyStateTextsDistinct =
     let
         row =
-            { entry = Unverified { uid = Just (uid "u-h"), bodyHash = "h", reviewedAt = Timestamp.fromUnixMillis 0, why = Legacy }, label = Queue.Unnamed }
+            { entry = Unverified { uid = Just (uid "u-h"), bodyHash = "h", reviewedAt = Timestamp.fromUnixMillis 0, why = Legacy }, label = History.Unnamed }
 
         later =
             HistoryAfter (Timestamp.fromUnixMillis 0) 1
@@ -821,12 +823,12 @@ historyStateTextsDistinct =
             ShownProven
     in
     List.all identity
-        [ Maybe.map SafeText.toString (Queue.historyStatusText HistoryLoading) == Just "Loading history…"
-        , Maybe.map SafeText.toString (Queue.historyStatusText (HistoryFailed LoadFailed)) == Just ("History load failed: " ++ Failure.loadFailureText LoadFailed)
-        , Maybe.map SafeText.toString (Queue.historyStatusText (HistoryLoaded { rows = [], at = HistoryStart, next = Nothing, log = log })) == Just "No reviews yet."
-        , Maybe.map SafeText.toString (Queue.historyStatusText (HistoryLoaded { rows = [], at = later, next = Nothing, log = log })) == Just "No more reviews."
-        , Maybe.map SafeText.toString (Queue.historyStatusText (HistoryLoaded { rows = [ row ], at = HistoryStart, next = Nothing, log = log })) == Nothing
-        , Maybe.map SafeText.toString (Queue.historyStatusText (HistoryLoaded { rows = [ row ], at = later, next = Just later, log = log })) == Nothing
+        [ Maybe.map SafeText.toString (History.historyStatusText HistoryLoading) == Just "Loading history…"
+        , Maybe.map SafeText.toString (History.historyStatusText (HistoryFailed LoadFailed)) == Just ("History load failed: " ++ Failure.loadFailureText LoadFailed)
+        , Maybe.map SafeText.toString (History.historyStatusText (HistoryLoaded { rows = [], at = HistoryStart, next = Nothing, log = log })) == Just "No reviews yet."
+        , Maybe.map SafeText.toString (History.historyStatusText (HistoryLoaded { rows = [], at = later, next = Nothing, log = log })) == Just "No more reviews."
+        , Maybe.map SafeText.toString (History.historyStatusText (HistoryLoaded { rows = [ row ], at = HistoryStart, next = Nothing, log = log })) == Nothing
+        , Maybe.map SafeText.toString (History.historyStatusText (HistoryLoaded { rows = [ row ], at = later, next = Just later, log = log })) == Nothing
         ]
 
 
@@ -862,15 +864,15 @@ loadTicketsSettleLatest : Bool
 loadTicketsSettleLatest =
     let
         first =
-            Queue.nextTicket Queue.firstTicket
+            Slot.nextTicket Slot.firstTicket
 
         second =
-            Queue.nextTicket first
+            Slot.nextTicket first
     in
-    Queue.isCurrentLoad second second
-        && not (Queue.isCurrentLoad first second)
-        && not (Queue.isCurrentLoad Queue.firstTicket first)
-        && not (Queue.isCurrentLoad second first)
+    Slot.isCurrentLoad second second
+        && not (Slot.isCurrentLoad first second)
+        && not (Slot.isCurrentLoad Slot.firstTicket first)
+        && not (Slot.isCurrentLoad second first)
 
 
 -- A write that fails keeps its own error: a read-only connection makes a

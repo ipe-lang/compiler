@@ -838,7 +838,7 @@ tokenViolations rel lexed =
             neighbours lexed.tokens
 
         guardedErrors =
-            rel == "Lib/View.ipe" || rel == "Lib/Queue.ipe"
+            List.member rel [ "Lib/View.ipe", "Lib/Queue.ipe", "Lib/Slot.ipe", "Lib/Selected.ipe", "Lib/Standing.ipe", "Lib/DecisionSlot.ipe", "Lib/History.ipe" ]
 
         computed =
             List.filter (\n -> isWord uiTextNames n.token && not (kindIs StringToken n.after)) around

@@ -7,15 +7,20 @@ import Ipe.Result exposing (Result(..))
 import Ipe.Task as Task
 import Ipe.Tea.Web.Cmd as Cmd
 import Lib.Db as LibDb exposing (Decision(..), HistoryCursor(..))
+import Lib.DecisionSlot as DecisionSlot exposing (DecidableRow, DecisionSlot(..), DecisionTarget(..), RefusalPanel(..))
 import Lib.Draft as Draft
 import Lib.Epoch exposing (Epoch)
 import Lib.Failure as Failure exposing (DecideRefusal(..), LoadFailure, RefuseFailure(..), SaveFailure(..))
+import Lib.History as History exposing (HistoryState(..), HistoryWant(..))
 import Lib.Index as Index
 import Lib.Keys as Keys exposing (KeyAction(..))
-import Lib.Queue as Queue exposing (DecidableRow, DecisionSlot(..), DecisionTarget(..), HistoryState(..), HistoryWant(..), QueueState(..), QueueWant(..), RefusalPanel(..), SelectedView(..), Settle(..), UnitPageState(..))
+import Lib.Queue as Queue exposing (QueueState(..), QueueWant(..), UnitPageState(..))
 import Lib.ReviewKey exposing (MacKey, ReviewKey(..))
+import Lib.Selected as Selected exposing (SelectedView(..))
 import Lib.ServerLog as ServerLog
 import Lib.Settings as Settings
+import Lib.Slot as Slot exposing (Settle(..))
+import Lib.Standing as Standing
 import Lib.Uid exposing (Uid)
 
 
@@ -50,13 +55,13 @@ type alias Model =
     { page : Page
     , queueState : Queue.QueueState
     , queueCursor : Index.Cursor
-    , queueLoad : Queue.LoadSlot Queue.QueueWant
-    , history : Queue.HistoryState
-    , historyLoad : Queue.LoadSlot Queue.HistoryWant
+    , queueLoad : Slot.LoadSlot Queue.QueueWant
+    , history : History.HistoryState
+    , historyLoad : Slot.LoadSlot History.HistoryWant
     , selected : Int
-    , selectedView : Queue.SelectedView
-    , decision : Queue.DecisionSlot
-    , standing : Queue.StandingRead
+    , selectedView : Selected.SelectedView
+    , decision : DecisionSlot.DecisionSlot
+    , standing : Standing.StandingRead
     }
 
 
@@ -84,7 +89,7 @@ keyOffers model =
         NothingDrawn
 
     else
-        case Queue.openRow model.decision of
+        case DecisionSlot.openRow model.decision of
             Just ( open, _ ) ->
                 PanelDrawn (drawnPanel model open)
 
@@ -97,7 +102,7 @@ keyOffers model =
 -- view's own `open == row` in `offeredControls`).
 drawnPanel : Model -> DecidableRow -> Maybe DecidableRow
 drawnPanel model open =
-    case decidableRow model (Queue.rowUid open) of
+    case decidableRow model (DecisionSlot.rowUid open) of
         Just row ->
             if row == open then
                 Just row
@@ -131,7 +136,7 @@ keyMode offers model =
                 Keys.InPanel drawn
 
             CardsDrawn card ->
-                case Queue.openPanel model.decision of
+                case DecisionSlot.openPanel model.decision of
                     Just _ ->
                         Keys.InPanel Nothing
 
@@ -147,7 +152,7 @@ keyMode offers model =
 -- A task's result reaches a `Msg` only through the callbacks below, which
 -- turn its failure into a typed case, so no `Msg` holds an error.
 type Msg
-    = PendingLoaded Queue.LoadTicket (Result LoadFailure Queue.QueuePage)
+    = PendingLoaded Slot.LoadTicket (Result LoadFailure Queue.QueuePage)
     | NextPage Index.Cursor
     | ApproveRow DecidableRow
     | RefuseStart DecidableRow
@@ -158,10 +163,10 @@ type Msg
     | Navigated Page
     | ShowQueue
     | ShowHistory
-    | HistoryPageLoaded Queue.LoadTicket (Result LoadFailure Queue.HistoryPage)
+    | HistoryPageLoaded Slot.LoadTicket (Result LoadFailure History.HistoryPage)
     | HistoryNext LibDb.HistoryCursor
     | SelectedViewLoaded Uid Epoch (Result LoadFailure (Maybe Index.UnitView))
-    | StandingLoaded Uid String Epoch (Result LoadFailure Queue.Standing)
+    | StandingLoaded Uid String Epoch (Result LoadFailure Standing.Standing)
     | KeyDown KeyOffers String
     | SelectUnit Int
 
@@ -169,12 +174,12 @@ type Msg
 -- The callbacks every page task settles through: the one place its error
 -- becomes a typed case. The error's own text goes to the server log only,
 -- through `ServerLog.logged` on the task.
-queueLoaded : Queue.LoadTicket -> Result Error Queue.QueuePage -> Msg
+queueLoaded : Slot.LoadTicket -> Result Error Queue.QueuePage -> Msg
 queueLoaded load result =
     PendingLoaded load (Failure.loaded result)
 
 
-historyLoaded : Queue.LoadTicket -> Result Error Queue.HistoryPage -> Msg
+historyLoaded : Slot.LoadTicket -> Result Error History.HistoryPage -> Msg
 historyLoaded load result =
     HistoryPageLoaded load (Failure.loaded result)
 
@@ -184,7 +189,7 @@ viewLoaded uid epoch result =
     SelectedViewLoaded uid epoch (Failure.loaded result)
 
 
-standingLoaded : Uid -> String -> Epoch -> Result Error Queue.Standing -> Msg
+standingLoaded : Uid -> String -> Epoch -> Result Error Standing.Standing -> Msg
 standingLoaded uid bodyHash epoch result =
     StandingLoaded uid bodyHash epoch (Failure.loaded result)
 
@@ -202,13 +207,13 @@ initialModel =
     { page = QueuePage
     , queueState = Loading
     , queueCursor = Index.Start
-    , queueLoad = Queue.idleLoad
+    , queueLoad = Slot.idleLoad
     , history = HistoryLoading
-    , historyLoad = Queue.idleLoad
+    , historyLoad = Slot.idleLoad
     , selected = 0
     , selectedView = NoneSelected
     , decision = DecisionIdle PanelClosed
-    , standing = Queue.StandingUnread
+    , standing = Standing.StandingUnread
     }
 
 
@@ -268,14 +273,14 @@ enterPage : Settings.AppSettings -> Page -> Model -> ( Model, Cmd Msg )
 enterPage settings page model =
     let
         entered =
-            { model | page = page, decision = Queue.ownedSlot settings.epoch model.decision }
+            { model | page = page, decision = DecisionSlot.ownedSlot settings.epoch model.decision }
     in
     case page of
         QueuePage ->
             loadQueue settings entered.queueCursor entered
 
         HistoryPage ->
-            withQueue settings (loadHistory settings HistoryStart { entered | selectedView = Queue.clearView settings.epoch entered.selectedView })
+            withQueue settings (loadHistory settings HistoryStart { entered | selectedView = Selected.clearView settings.epoch entered.selectedView })
 
         UnitPage raw ->
             case Queue.unitPageEntry raw of
@@ -283,7 +288,7 @@ enterPage settings page model =
                     withQueue settings (loadUnit settings uid entered)
 
                 Err _ ->
-                    ( { entered | selectedView = Queue.clearView settings.epoch entered.selectedView }, Cmd.none )
+                    ( { entered | selectedView = Selected.clearView settings.epoch entered.selectedView }, Cmd.none )
 
 
 -- The queue page from `cursor`, asked of the queue's one load slot: it
@@ -291,7 +296,7 @@ enterPage settings page model =
 -- shown page stays until a result settles it.
 loadQueue : Settings.AppSettings -> Index.Cursor -> Model -> ( Model, Cmd Msg )
 loadQueue settings cursor model =
-    queueStep settings (Queue.requestLoad Queue.mergeQueueWant settings.epoch (QueueReload cursor) model.queueLoad) { model | queueCursor = cursor }
+    queueStep settings (Slot.requestLoad Queue.mergeQueueWant settings.epoch (QueueReload cursor) model.queueLoad) { model | queueCursor = cursor }
 
 
 -- An entry, plus a queue load while the queue is not loaded; a load in
@@ -313,14 +318,14 @@ alsoQueue : Settings.AppSettings -> Cmd Msg -> Model -> ( Model, Cmd Msg )
 alsoQueue settings cmd model =
     let
         ( queued, queueCmd ) =
-            queueStep settings (Queue.ensureLoad Queue.mergeQueueWant settings.epoch (QueueReload model.queueCursor) model.queueLoad) model
+            queueStep settings (Slot.ensureLoad Queue.mergeQueueWant settings.epoch (QueueReload model.queueCursor) model.queueLoad) model
     in
     ( queued, Cmd.batch [ cmd, queueCmd ] )
 
 
 -- A queue-slot transition, with the one load it starts, if any: the only
 -- place a queue load is started.
-queueStep : Settings.AppSettings -> ( Queue.LoadSlot Queue.QueueWant, Maybe ( Queue.LoadTicket, Queue.QueueWant ) ) -> Model -> ( Model, Cmd Msg )
+queueStep : Settings.AppSettings -> ( Slot.LoadSlot Queue.QueueWant, Maybe ( Slot.LoadTicket, Queue.QueueWant ) ) -> Model -> ( Model, Cmd Msg )
 queueStep settings ( slot, next ) model =
     case next of
         Just ( load, want ) ->
@@ -352,17 +357,17 @@ queueTask settings want =
 -- load slot.
 loadHistory : Settings.AppSettings -> LibDb.HistoryCursor -> Model -> ( Model, Cmd Msg )
 loadHistory settings cursor model =
-    historyStep settings (Queue.requestLoad Queue.latestWant settings.epoch (HistoryFrom cursor) model.historyLoad) { model | history = HistoryLoading }
+    historyStep settings (Slot.requestLoad Slot.latestWant settings.epoch (HistoryFrom cursor) model.historyLoad) { model | history = HistoryLoading }
 
 
 -- A History-slot transition, with the one load it starts, if any: the only
 -- place a History load is started.
-historyStep : Settings.AppSettings -> ( Queue.LoadSlot Queue.HistoryWant, Maybe ( Queue.LoadTicket, Queue.HistoryWant ) ) -> Model -> ( Model, Cmd Msg )
+historyStep : Settings.AppSettings -> ( Slot.LoadSlot History.HistoryWant, Maybe ( Slot.LoadTicket, History.HistoryWant ) ) -> Model -> ( Model, Cmd Msg )
 historyStep settings ( slot, next ) model =
     case next of
         Just ( load, HistoryFrom cursor ) ->
             ( { model | historyLoad = slot }
-            , Cmd.perform (ServerLog.logged "history load failed" (Queue.loadHistoryPage settings cursor)) (historyLoaded load)
+            , Cmd.perform (ServerLog.logged "history load failed" (History.loadHistoryPage settings cursor)) (historyLoaded load)
             )
 
         Nothing ->
@@ -374,7 +379,7 @@ historyStep settings ( slot, next ) model =
 -- while a read runs start no second read.
 loadUnit : Settings.AppSettings -> Uid -> Model -> ( Model, Cmd Msg )
 loadUnit settings uid model =
-    viewStep settings (Queue.reloadView settings.epoch uid model.selectedView) model
+    viewStep settings (Selected.reloadView settings.epoch uid model.selectedView) model
 
 
 -- Every step ends with the refusal panel closed unless the row it is open
@@ -392,13 +397,13 @@ update settings msg model =
 
 shownPanel : Model -> Model
 shownPanel model =
-    case Queue.openRow model.decision of
+    case DecisionSlot.openRow model.decision of
         Just ( row, _ ) ->
-            if decidableRow model (Queue.rowUid row) == Just row then
+            if decidableRow model (DecisionSlot.rowUid row) == Just row then
                 model
 
             else
-                { model | decision = Queue.closeRefusal model.decision }
+                { model | decision = DecisionSlot.closeRefusal model.decision }
 
         Nothing ->
             model
@@ -409,7 +414,7 @@ shownPanel model =
 decidableRow : Model -> Uid -> Maybe DecidableRow
 decidableRow model uid =
     if model.page == QueuePage then
-        Queue.decidableRow model.selected model.queueState model.selectedView uid
+        DecisionSlot.decidableRow model.selected model.queueState model.selectedView uid
 
     else
         Nothing
@@ -426,12 +431,12 @@ startRefusal settings target uid drawn model =
         ( model, Cmd.none )
 
     else
-        case Queue.decidableAs model.selected model.queueState model.selectedView target uid drawn of
+        case DecisionSlot.decidableAs model.selected model.queueState model.selectedView target uid drawn of
             Ok row ->
-                ( { model | decision = Queue.openRefusal settings.epoch row model.decision }, Cmd.none )
+                ( { model | decision = DecisionSlot.openRefusal settings.epoch row model.decision }, Cmd.none )
 
             Err (SaveRefused DrawnChanged) ->
-                ( { model | decision = Queue.decisionRefused settings.epoch (SaveRefused DrawnChanged) (Queue.latestTicket model.queueLoad) model.decision }, Cmd.none )
+                ( { model | decision = DecisionSlot.decisionRefused settings.epoch (SaveRefused DrawnChanged) (Slot.latestTicket model.queueLoad) model.decision }, Cmd.none )
 
             Err _ ->
                 ( model, Cmd.none )
@@ -443,7 +448,7 @@ step settings msg model =
         PendingLoaded load result ->
             let
                 ( settle, slot, next ) =
-                    Queue.loadArrived settings.epoch load model.queueLoad
+                    Slot.loadArrived settings.epoch load model.queueLoad
 
                 ( stepped, loadCmd ) =
                     queueStep settings ( slot, next ) model
@@ -452,7 +457,7 @@ step settings msg model =
                 Settles ->
                     let
                         loaded =
-                            { stepped | queueState = Queue.stateFromResult result, decision = Queue.queueSettled load result stepped.decision }
+                            { stepped | queueState = Queue.stateFromResult result, decision = DecisionSlot.queueSettled load result stepped.decision }
 
                         ( viewed, viewCmd ) =
                             viewAfterLoad settings { loaded | selected = clampIndex stepped.selected (List.length (queueList loaded)) }
@@ -466,16 +471,16 @@ step settings msg model =
             loadQueue settings cursor { model | queueState = Loading, selected = 0 }
 
         ApproveRow row ->
-            saveDecision settings model (Queue.rowTarget row) (Queue.rowUid row) (Just row) Approved
+            saveDecision settings model (DecisionSlot.rowTarget row) (DecisionSlot.rowUid row) (Just row) Approved
 
         RefuseStart row ->
-            startRefusal settings (Queue.rowTarget row) (Queue.rowUid row) (Just row) model
+            startRefusal settings (DecisionSlot.rowTarget row) (DecisionSlot.rowUid row) (Just row) model
 
         RefuseDraft row text ->
-            ( { model | decision = onOpenRow row (Queue.editDraft (Queue.rowUid row) (Draft.draft text)) model.decision }, Cmd.none )
+            ( { model | decision = onOpenRow row (DecisionSlot.editDraft (DecisionSlot.rowUid row) (Draft.draft text)) model.decision }, Cmd.none )
 
         RefuseCancel row ->
-            ( { model | decision = onOpenRow row Queue.closeRefusal model.decision }, Cmd.none )
+            ( { model | decision = onOpenRow row DecisionSlot.closeRefusal model.decision }, Cmd.none )
 
         RefuseSubmit row ->
             submitRefuse settings model row
@@ -483,10 +488,10 @@ step settings msg model =
         DecisionSaved uid epoch result ->
             case result of
                 Ok ( attested, written ) ->
-                    queueStep settings (Queue.requestLoad Queue.mergeQueueWant settings.epoch (QueueDrain attested written model.queueCursor) model.queueLoad) { model | decision = Queue.decisionWritten epoch uid model.decision }
+                    queueStep settings (Slot.requestLoad Queue.mergeQueueWant settings.epoch (QueueDrain attested written model.queueCursor) model.queueLoad) { model | decision = DecisionSlot.decisionWritten epoch uid model.decision }
 
                 Err failure ->
-                    ( { model | decision = Queue.decisionNotSaved epoch uid failure (Queue.latestTicket model.queueLoad) model.decision }, Cmd.none )
+                    ( { model | decision = DecisionSlot.decisionNotSaved epoch uid failure (Slot.latestTicket model.queueLoad) model.decision }, Cmd.none )
 
         Navigated page ->
             enterPage settings page model
@@ -500,14 +505,14 @@ step settings msg model =
         HistoryPageLoaded load result ->
             let
                 ( settle, slot, next ) =
-                    Queue.loadArrived settings.epoch load model.historyLoad
+                    Slot.loadArrived settings.epoch load model.historyLoad
 
                 ( stepped, loadCmd ) =
                     historyStep settings ( slot, next ) model
             in
             case settle of
                 Settles ->
-                    ( { stepped | history = Queue.historyStateFromResult result }, loadCmd )
+                    ( { stepped | history = History.historyStateFromResult result }, loadCmd )
 
                 Dropped ->
                     ( stepped, loadCmd )
@@ -516,10 +521,10 @@ step settings msg model =
             loadHistory settings cursor model
 
         SelectedViewLoaded uid epoch result ->
-            withStanding settings (viewStep settings (Queue.viewArrived epoch uid result model.selectedView) model)
+            withStanding settings (viewStep settings (Selected.viewArrived epoch uid result model.selectedView) model)
 
         StandingLoaded uid bodyHash epoch result ->
-            standingStep settings (Queue.standingArrived epoch uid bodyHash result model.standing) model
+            standingStep settings (Standing.standingArrived epoch uid bodyHash result model.standing) model
 
         KeyDown offers key ->
             keyActionMsg settings (Keys.keyAction (keyMode offers model) key) model
@@ -545,7 +550,7 @@ withStanding settings ( model, cmd ) =
                             Index.storedHash loaded.unit.attested
 
                         ( read, readCmd ) =
-                            standingStep settings (Queue.standingRequested settings.epoch loaded.unit.uid bodyHash model.standing) model
+                            standingStep settings (Standing.standingRequested settings.epoch loaded.unit.uid bodyHash model.standing) model
                     in
                     ( read, Cmd.batch [ cmd, readCmd ] )
 
@@ -576,13 +581,13 @@ viewAfterLoad : Settings.AppSettings -> Model -> ( Model, Cmd Msg )
 viewAfterLoad settings model =
     case ( model.page, selectedUid model ) of
         ( QueuePage, Just uid ) ->
-            viewStep settings (Queue.reloadView settings.epoch uid model.selectedView) model
+            viewStep settings (Selected.reloadView settings.epoch uid model.selectedView) model
 
         ( QueuePage, Nothing ) ->
-            ( { model | selectedView = Queue.clearView settings.epoch model.selectedView }, Cmd.none )
+            ( { model | selectedView = Selected.clearView settings.epoch model.selectedView }, Cmd.none )
 
         ( HistoryPage, _ ) ->
-            ( { model | selectedView = Queue.clearView settings.epoch model.selectedView }, Cmd.none )
+            ( { model | selectedView = Selected.clearView settings.epoch model.selectedView }, Cmd.none )
 
         ( UnitPage _, _ ) ->
             ( model, Cmd.none )
@@ -597,7 +602,7 @@ selectAt settings i model =
     in
     case selectedUid moved of
         Just uid ->
-            viewStep settings (Queue.selectView settings.epoch uid moved.selectedView) moved
+            viewStep settings (Selected.selectView settings.epoch uid moved.selectedView) moved
 
         Nothing ->
             ( moved, Cmd.none )
@@ -606,7 +611,7 @@ selectAt settings i model =
 -- A source-slot transition, with the one read it starts, if any: the only
 -- place a source read is started, its result stamped with this process's
 -- epoch.
-viewStep : Settings.AppSettings -> ( Queue.SelectedView, Maybe Uid ) -> Model -> ( Model, Cmd Msg )
+viewStep : Settings.AppSettings -> ( Selected.SelectedView, Maybe Uid ) -> Model -> ( Model, Cmd Msg )
 viewStep settings ( state, next ) model =
     ( { model | selectedView = state }, loadViewCmd settings next )
 
@@ -624,12 +629,12 @@ loadViewCmd settings next =
 -- A standing-slot transition, with the one read it starts, if any: the only
 -- place a standing read is started, its result stamped with this process's
 -- epoch.
-standingStep : Settings.AppSettings -> ( Queue.StandingRead, Maybe ( Uid, String ) ) -> Model -> ( Model, Cmd Msg )
+standingStep : Settings.AppSettings -> ( Standing.StandingRead, Maybe ( Uid, String ) ) -> Model -> ( Model, Cmd Msg )
 standingStep settings ( read, next ) model =
     case next of
         Just ( uid, bodyHash ) ->
             ( { model | standing = read }
-            , Cmd.perform (ServerLog.logged "standing load failed" (Queue.loadStanding settings uid bodyHash)) (standingLoaded uid bodyHash settings.epoch)
+            , Cmd.perform (ServerLog.logged "standing load failed" (Standing.loadStanding settings uid bodyHash)) (standingLoaded uid bodyHash settings.epoch)
             )
 
         Nothing ->
@@ -638,9 +643,9 @@ standingStep settings ( read, next ) model =
 
 -- `change` applied to the slot only while its refusal panel is open on
 -- exactly `row`, the row the message was drawn for; any other slot is kept.
-onOpenRow : DecidableRow -> (Queue.DecisionSlot -> Queue.DecisionSlot) -> Queue.DecisionSlot -> Queue.DecisionSlot
+onOpenRow : DecidableRow -> (DecisionSlot.DecisionSlot -> DecisionSlot.DecisionSlot) -> DecisionSlot.DecisionSlot -> DecisionSlot.DecisionSlot
 onOpenRow row change slot =
-    case Queue.openRow slot of
+    case DecisionSlot.openRow slot of
         Just ( open, _ ) ->
             if open == row then
                 change slot
@@ -671,7 +676,7 @@ keyActionMsg settings action model =
             submitRefuse settings model drawn
 
         CancelRefuse drawn ->
-            ( { model | decision = onOpenRow drawn Queue.closeRefusal model.decision }, Cmd.none )
+            ( { model | decision = onOpenRow drawn DecisionSlot.closeRefusal model.decision }, Cmd.none )
 
         Ignore ->
             ( model, Cmd.none )
@@ -686,15 +691,15 @@ keyActionMsg settings action model =
 -- the panel and the draft.
 submitRefuse : Settings.AppSettings -> Model -> DecidableRow -> ( Model, Cmd Msg )
 submitRefuse settings model drawn =
-    case Queue.openRow model.decision of
+    case DecisionSlot.openRow model.decision of
         Just ( row, draft ) ->
             if row == drawn then
                 case Draft.draftReason draft.refuseDraft of
                     Err refused ->
-                        ( { model | decision = Queue.draftRefused (DraftRefused refused) model.decision }, Cmd.none )
+                        ( { model | decision = DecisionSlot.draftRefused (DraftRefused refused) model.decision }, Cmd.none )
 
                     Ok reason ->
-                        saveDecision settings model (Queue.rowTarget drawn) (Queue.rowUid drawn) (Just drawn) (Refused reason)
+                        saveDecision settings model (DecisionSlot.rowTarget drawn) (DecisionSlot.rowUid drawn) (Just drawn) (Refused reason)
 
             else
                 ( model, Cmd.none )
@@ -734,17 +739,17 @@ pageRefusal model uid =
 saveDecision : Settings.AppSettings -> Model -> DecisionTarget -> Uid -> Maybe DecidableRow -> LibDb.Decision -> ( Model, Cmd Msg )
 saveDecision settings model target uid drawn decision =
     if model.page /= QueuePage then
-        ( { model | decision = Queue.decisionRefused settings.epoch SaveOffQueue (Queue.latestTicket model.queueLoad) model.decision }, Cmd.none )
+        ( { model | decision = DecisionSlot.decisionRefused settings.epoch SaveOffQueue (Slot.latestTicket model.queueLoad) model.decision }, Cmd.none )
 
     else
         case settings.key of
             ReadOnly ->
-                ( { model | decision = Queue.decisionRefused settings.epoch SaveReadOnly (Queue.latestTicket model.queueLoad) model.decision }, Cmd.none )
+                ( { model | decision = DecisionSlot.decisionRefused settings.epoch SaveReadOnly (Slot.latestTicket model.queueLoad) model.decision }, Cmd.none )
 
             Signing macKey ->
-                case Queue.decidableAs model.selected model.queueState model.selectedView target uid drawn of
+                case DecisionSlot.decidableAs model.selected model.queueState model.selectedView target uid drawn of
                     Ok row ->
-                        case Queue.startDecision settings.epoch uid model.decision of
+                        case DecisionSlot.startDecision settings.epoch uid model.decision of
                             Just saving ->
                                 ( { model | decision = saving }
                                 , Cmd.perform (ServerLog.logged "decision save failed" (decisionTask settings macKey model row decision)) (decisionSaved uid settings.epoch)
@@ -754,7 +759,7 @@ saveDecision settings model target uid drawn decision =
                                 ( model, Cmd.none )
 
                     Err failure ->
-                        ( { model | decision = Queue.decisionRefused settings.epoch failure (Queue.latestTicket model.queueLoad) model.decision }, Cmd.none )
+                        ( { model | decision = DecisionSlot.decisionRefused settings.epoch failure (Slot.latestTicket model.queueLoad) model.decision }, Cmd.none )
 
 
 -- The decision on `row`'s drawn source or listed unreviewable file's drawn
@@ -766,18 +771,18 @@ decisionTask : Settings.AppSettings -> MacKey -> Model -> DecidableRow -> LibDb.
 decisionTask settings macKey model row decision =
     let
         uid =
-            Queue.rowUid row
+            DecisionSlot.rowUid row
     in
-    case Queue.offeredRefusal row of
+    case DecisionSlot.offeredRefusal row of
         Nothing ->
             case List.find (\q -> q.unit.uid == uid) (queueList model) of
                 Just _ ->
-                    case Queue.offeredSource row model.selectedView of
+                    case DecisionSlot.offeredSource row model.selectedView of
                         Just shown ->
                             decideOn settings macKey shown decision
 
                         Nothing ->
-                            case Queue.decidableSource uid model.selectedView of
+                            case Selected.decidableSource uid model.selectedView of
                                 Just _ ->
                                     Task.succeed (Err DrawnChanged)
 

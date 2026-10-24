@@ -14,16 +14,20 @@ import Ipe.Ui.Font as Font
 import Ipe.Ui.Input as Input
 import Lib.App as App exposing (Model, Msg(..), Page(..), queueList)
 import Lib.Db as LibDb exposing (LogShown(..), ReviewEntry(..), StoredDecision(..), Unverified(..))
+import Lib.DecisionSlot as DecisionSlot exposing (DecisionTarget(..))
 import Lib.Draft as Draft
 import Lib.Drawn as Drawn exposing (DrawnSource, Drawing(..), Hue(..), LayoutNote(..), Mode(..), Part(..), Piece(..), Run(..), SpelledRow(..))
 import Lib.Failure as Failure exposing (LoadFailure)
 import Lib.Format as Format
+import Lib.History as History exposing (HistoryLabel(..), HistoryState(..), Presence(..))
 import Lib.Index as Index exposing (Change(..), SourceView(..))
 import Lib.Label as Label exposing (Label, LabelPart(..), LabelPiece(..))
 import Lib.Links as Links exposing (Link(..))
-import Lib.Queue as Queue exposing (DecisionTarget(..), HistoryLabel(..), HistoryState(..), Place(..), Presence(..), QueueState(..), Standing(..), UnitLabel, UnitPageState(..))
+import Lib.Queue as Queue exposing (Place(..), QueueState(..), UnitLabel, UnitPageState(..))
 import Lib.ReviewKey as ReviewKey
 import Lib.SafeText as SafeText exposing (SafeText, Segment(..))
+import Lib.Selected as Selected
+import Lib.Standing as Standing exposing (Standing(..))
 import Lib.Uid exposing (Uid)
 
 
@@ -203,7 +207,7 @@ queueBody model =
 
 notSavedBanner : Model -> Ui.Element Msg
 notSavedBanner model =
-    case Queue.notSavedOf model.decision of
+    case DecisionSlot.notSavedOf model.decision of
         Just failure ->
             Ui.el [ Font.size 13, Font.color (Ui.rgb 230 120 120) ] (safeText (SafeText.literal ("Decision not saved: " ++ Failure.saveFailureText failure)))
 
@@ -254,7 +258,7 @@ refusalBlock model page =
             )
 
 
-refusalCard : RefuseControls -> Maybe Queue.DecidableRow -> LogShown -> Index.RefusalRow -> Ui.Element Msg
+refusalCard : RefuseControls -> Maybe DecisionSlot.DecidableRow -> LogShown -> Index.RefusalRow -> Ui.Element Msg
 refusalCard controls offered shown row =
     Ui.column
         [ Ui.width Ui.fill
@@ -295,7 +299,7 @@ refusalCard controls offered shown row =
 
 -- Acknowledge and Refuse for a file a decision can bind on a page that
 -- records decisions; otherwise why there is no control.
-refusalControls : RefuseControls -> Maybe Queue.DecidableRow -> LogShown -> Index.RefusalRow -> Ui.Element Msg
+refusalControls : RefuseControls -> Maybe DecisionSlot.DecidableRow -> LogShown -> Index.RefusalRow -> Ui.Element Msg
 refusalControls controls offered shown row =
     case row.digest of
         Nothing ->
@@ -324,14 +328,14 @@ nextPageButton next =
 -- row its refusal panel is open on with its draft, read from the slot, which
 -- holds a panel only while no decision is busy.
 type alias RefuseControls =
-    { panel : Maybe ( Queue.DecidableRow, Queue.Draft )
-    , decision : Queue.DecisionSlot
+    { panel : Maybe ( DecisionSlot.DecidableRow, DecisionSlot.Draft )
+    , decision : DecisionSlot.DecisionSlot
     }
 
 
 refuseControlsOf : Model -> RefuseControls
 refuseControlsOf model =
-    { panel = Queue.openRow model.decision, decision = model.decision }
+    { panel = DecisionSlot.openRow model.decision, decision = model.decision }
 
 
 queueUnits : Model -> Ui.Element Msg
@@ -470,11 +474,11 @@ chainBannerLine shown =
             Ui.none
 
 
--- Every state's text comes from `Queue.historyStatusText`, the function the
+-- Every state's text comes from `History.historyStatusText`, the function the
 -- tests pin; a loaded page with rows adds its cards and the next-page control.
 historyBody : Model -> Ui.Element Msg
 historyBody model =
-    case Queue.historyStatusText model.history of
+    case History.historyStatusText model.history of
         Just text ->
             safeText text
 
@@ -502,7 +506,7 @@ historyNextButton next =
             Ui.none
 
 
-historyCard : Queue.HistoryRow -> Ui.Element Msg
+historyCard : History.HistoryRow -> Ui.Element Msg
 historyCard row =
     Ui.column
         [ Ui.width Ui.fill
@@ -530,7 +534,7 @@ historyCard row =
         )
 
 
-historyHeading : Queue.HistoryRow -> Ui.Element Msg -> String -> Timestamp -> Ui.Element Msg
+historyHeading : History.HistoryRow -> Ui.Element Msg -> String -> Timestamp -> Ui.Element Msg
 historyHeading row badge bodyHash reviewedAt =
     Ui.row
         [ Ui.width Ui.fill, Ui.spacing 10, Ui.centerY ]
@@ -571,7 +575,7 @@ unverifiedText why =
 -- What a History row is called: a unit's label or a file's path, each
 -- marked when the index no longer holds it. A row with no name says so in
 -- fixed text, never in any text the row carries.
-historyName : Queue.HistoryLabel -> Ui.Element Msg
+historyName : History.HistoryLabel -> Ui.Element Msg
 historyName label =
     case label of
         Labelled unit presence ->
@@ -584,7 +588,7 @@ historyName label =
             Ui.el [ Font.size 14, Font.bold, Font.color (Ui.rgb 235 235 240) ] (safeText (SafeText.literal "unit no longer indexed (no verified record of its name)"))
 
 
-presenceEls : Queue.Presence -> List (Ui.Element Msg)
+presenceEls : History.Presence -> List (Ui.Element Msg)
 presenceEls presence =
     case presence of
         Indexed ->
@@ -596,7 +600,7 @@ presenceEls presence =
 
 -- The unit page shows the source of one unit with its resolved links —
 -- no decision buttons, no change state; the unit is read-only here.
-unitPageBody : Queue.StandingRead -> Queue.UnitPageState -> Ui.Element Msg
+unitPageBody : Standing.StandingRead -> Queue.UnitPageState -> Ui.Element Msg
 unitPageBody standing state =
     case state of
         UnitLoaded loaded ->
@@ -627,7 +631,7 @@ unitPageStatus state =
             Ui.none
 
 
-unitPageCard : Queue.StandingRead -> Index.UnitView -> Ui.Element Msg
+unitPageCard : Standing.StandingRead -> Index.UnitView -> Ui.Element Msg
 unitPageCard standing loaded =
     let
         unit =
@@ -648,7 +652,7 @@ unitPageCard standing loaded =
             [ sectionHeading (labelEl 14 (Queue.unitLabel Named (Index.unitName unit)))
             , labelChip unit.facing
             ]
-        , unitStanding (Queue.standingFor unit standing)
+        , unitStanding (Standing.standingFor unit standing)
         , Ui.el
             [ Font.size 12, Font.family Font.monospace, Font.color (Ui.rgb 150 150 165) ]
             (shownLabel (unitLocation unit))
@@ -725,7 +729,7 @@ linkPieces link =
 -- Where a unit's current body stands in the review log: not reviewed,
 -- decided, or a row recorded for it that is not counted. Every standing
 -- draws its own badge, so a reopened unit never reads as a fresh one.
-standingBadge : Queue.Standing -> Ui.Element Msg
+standingBadge : Standing.Standing -> Ui.Element Msg
 standingBadge standing =
     case standing of
         Undecided ->
@@ -740,7 +744,7 @@ standingBadge standing =
 
 -- The rail names a standing only when a row exists for the current body;
 -- the change badge already marks a body no row names.
-railStanding : Queue.Standing -> Ui.Element Msg
+railStanding : Standing.Standing -> Ui.Element Msg
 railStanding standing =
     case standing of
         Undecided ->
@@ -755,7 +759,7 @@ railStanding standing =
 
 -- The unit page's standing line: the badge with a refusal's reason, the
 -- failed read, or the read still running for the body shown.
-unitStanding : Maybe (Result LoadFailure Queue.Standing) -> Ui.Element Msg
+unitStanding : Maybe (Result LoadFailure Standing.Standing) -> Ui.Element Msg
 unitStanding read =
     case read of
         Just (Ok standing) ->
@@ -774,7 +778,7 @@ unitStanding read =
             Ui.el [ Font.size 12, Font.color (Ui.rgb 150 150 165) ] (Ui.text "Reading review status…")
 
 
-standingReason : Queue.Standing -> Ui.Element Msg
+standingReason : Standing.Standing -> Ui.Element Msg
 standingReason standing =
     case standing of
         Decided (StoredRefused r) ->
@@ -819,14 +823,14 @@ urlSync model =
         (Html.node "div" [ Attr.attribute "data-ipe-path" (currentPath model) ] [])
 
 
-unitCard : RefuseControls -> Maybe Queue.DecidableRow -> Queue.QueueState -> Queue.SelectedView -> UnitLabel -> Queue.QueuedUnit -> Ui.Element Msg
+unitCard : RefuseControls -> Maybe DecisionSlot.DecidableRow -> Queue.QueueState -> Selected.SelectedView -> UnitLabel -> Queue.QueuedUnit -> Ui.Element Msg
 unitCard controls offered queueState selectedView label q =
     let
         unit =
             q.unit
 
         loaded =
-            Queue.selectedViewOf unit.uid selectedView
+            Selected.selectedViewOf unit.uid selectedView
     in
     Ui.column
         [ Ui.width Ui.fill
@@ -870,9 +874,9 @@ unitCard controls offered queueState selectedView label q =
 
 -- The line in place of the selected card's source while its view is not
 -- loaded.
-selectedViewStatus : Uid -> Queue.SelectedView -> Ui.Element Msg
+selectedViewStatus : Uid -> Selected.SelectedView -> Ui.Element Msg
 selectedViewStatus uid state =
-    case Queue.selectedViewStatusText uid state of
+    case Selected.selectedViewStatusText uid state of
         Just text ->
             Ui.el [ Font.size 12, Font.color (Ui.rgb 150 150 165) ] (safeText text)
 
@@ -1108,7 +1112,7 @@ chipAround bg content =
 
 -- Approve and Refuse exist only for a verified view on a server that signs
 -- decisions; any other view shows why it cannot be decided instead.
-decisionButtons : RefuseControls -> Maybe Queue.DecidableRow -> Queue.QueueState -> Index.UnitView -> Ui.Element Msg
+decisionButtons : RefuseControls -> Maybe DecisionSlot.DecidableRow -> Queue.QueueState -> Index.UnitView -> Ui.Element Msg
 decisionButtons controls offered queueState loaded =
     case Queue.sourceStatusText loaded.view of
         Just why ->
@@ -1131,7 +1135,7 @@ decisionButtons controls offered queueState loaded =
                     Ui.none
 
 
-verifiedDecisionButtons : RefuseControls -> Maybe Queue.DecidableRow -> Index.Unit -> Ui.Element Msg
+verifiedDecisionButtons : RefuseControls -> Maybe DecisionSlot.DecidableRow -> Index.Unit -> Ui.Element Msg
 verifiedDecisionButtons controls offered unit =
     decisionControls controls unit.uid offered
 
@@ -1141,16 +1145,16 @@ verifiedDecisionButtons controls offered unit =
 -- decision is busy, else, when the page offers a decision on it (`offered`,
 -- the same row the refusal panel opens on), that row's controls. A row
 -- offered under another uid draws none.
-decisionControls : RefuseControls -> Uid -> Maybe Queue.DecidableRow -> Ui.Element Msg
+decisionControls : RefuseControls -> Uid -> Maybe DecisionSlot.DecidableRow -> Ui.Element Msg
 decisionControls controls uid offered =
-    case Queue.pendingText uid controls.decision of
+    case DecisionSlot.pendingText uid controls.decision of
         Just text ->
             Ui.el [ Font.size 12, Font.color (Ui.rgb 150 150 165) ] (safeText text)
 
         Nothing ->
             case offered of
                 Just row ->
-                    if Queue.rowUid row == uid then
+                    if DecisionSlot.rowUid row == uid then
                         offeredControls controls row
 
                     else
@@ -1162,7 +1166,7 @@ decisionControls controls uid offered =
 
 -- An offered row's controls, each message and label read from the row
 -- itself: its open refusal panel, or its approve control beside Refuse.
-offeredControls : RefuseControls -> Queue.DecidableRow -> Ui.Element Msg
+offeredControls : RefuseControls -> DecisionSlot.DecidableRow -> Ui.Element Msg
 offeredControls controls row =
     case controls.panel of
         Just ( open, draft ) ->
@@ -1176,7 +1180,7 @@ offeredControls controls row =
             offeredButtons row
 
 
-offeredButtons : Queue.DecidableRow -> Ui.Element Msg
+offeredButtons : DecisionSlot.DecidableRow -> Ui.Element Msg
 offeredButtons row =
     Ui.row
         [ Ui.spacing 8 ]
@@ -1186,9 +1190,9 @@ offeredButtons row =
 
 
 -- The approve control of `row`: Approve on a unit, Acknowledge on a file.
-approveOf : Queue.DecidableRow -> Ui.Element Msg
+approveOf : DecisionSlot.DecidableRow -> Ui.Element Msg
 approveOf row =
-    case Queue.rowTarget row of
+    case DecisionSlot.rowTarget row of
         OnUnit ->
             approveButton (SafeText.literal "Approve") (ApproveRow row)
 
@@ -1224,7 +1228,7 @@ refuseButton label msg =
 
 -- The refusal reason input of the panel open on `row`, with Confirm and
 -- Cancel; its draft, Confirm and Cancel all name that one row.
-refusePanel : Queue.DecidableRow -> Queue.Draft -> Ui.Element Msg
+refusePanel : DecisionSlot.DecidableRow -> DecisionSlot.Draft -> Ui.Element Msg
 refusePanel row draft =
     Ui.column
         [ Ui.width (Ui.px 240), Ui.spacing 6 ]

@@ -1,0 +1,252 @@
+module Lib.History exposing (HistoryLabel(..), HistoryPage, HistoryRow, HistoryState(..), HistoryWant(..), Presence(..), entryUid, historyStateFromResult, historyStatusText, loadHistoryPage)
+
+import Ipe.Error as Error
+import Ipe.List as List
+import Ipe.Result as Result exposing (Result(..))
+import Ipe.Task as Task
+import Lib.Db as LibDb exposing (HistoryCursor(..), LogShown, ReviewEntry(..))
+import Lib.Failure as Failure exposing (LoadFailure)
+-- `Index.Unit` names `Highlight.Lang`, and an imported alias resolves its
+-- qualified names in this module.
+import Lib.Highlight as Highlight
+import Lib.Index as Index
+import Lib.Label exposing (Label)
+import Lib.PageSize as PageSize
+import Lib.Queue exposing (Tallies, UnitLabel, freshStatus, placeIn, talliesOf, unitLabel)
+import Lib.SafeText as SafeText exposing (SafeText)
+import Lib.Settings exposing (AppSettings)
+import Lib.Uid exposing (Uid)
+import Lib.UnitName as UnitName exposing (SignedName(..), UnitName)
+
+
+-- What a History load reads: the page at a cursor.
+type HistoryWant
+    = HistoryFrom LibDb.HistoryCursor
+
+
+-- A review as the History page shows it: the review entry, counted or not,
+-- and what it is called.
+type alias HistoryRow =
+    { entry : LibDb.ReviewEntry
+    , label : HistoryLabel
+    }
+
+
+-- What a History row is called. A verified row is called by the name its
+-- mac covers, the subject as it was decided, whether or not the index still
+-- holds it; any other row only by the live unit or unreviewable file the
+-- index holds under its uid, never by text the row itself carries. A row
+-- with neither is `Unnamed`. Units are labelled as a queue page labels
+-- them, against every other unit the History page names.
+type HistoryLabel
+    = Labelled UnitLabel Presence
+    | FileLabelled Label Presence
+    | Unnamed
+
+
+-- Whether the index still holds a History row's subject under its uid.
+type Presence
+    = Indexed
+    | NoLongerIndexed
+
+
+-- One loaded History page: its rows, the cursor it was read from, the
+-- cursor of the page after it (Nothing on the last page), and the review
+-- log's verdict every row was classified under.
+type alias HistoryPage =
+    { rows : List HistoryRow
+    , at : LibDb.HistoryCursor
+    , next : Maybe LibDb.HistoryCursor
+    , log : LogShown
+    }
+
+
+-- The History view's state. An empty history is only `HistoryLoaded` with
+-- no rows from `HistoryStart`, so a load in flight or a failed load can
+-- never render as "no reviews".
+type HistoryState
+    = HistoryLoading
+    | HistoryLoaded HistoryPage
+    | HistoryFailed LoadFailure
+
+
+historyStateFromResult : Result LoadFailure HistoryPage -> HistoryState
+historyStateFromResult result =
+    case result of
+        Ok page ->
+            HistoryLoaded page
+
+        Err e ->
+            HistoryFailed e
+
+
+-- The one-line text for a History state that has no rows to show; Nothing
+-- for a loaded page that holds rows.
+historyStatusText : HistoryState -> Maybe SafeText
+historyStatusText state =
+    case state of
+        HistoryLoading ->
+            Just (SafeText.literal "Loading history…")
+
+        HistoryFailed failure ->
+            Just (SafeText.literal ("History load failed: " ++ Failure.loadFailureText failure))
+
+        HistoryLoaded page ->
+            if List.isEmpty page.rows then
+                case page.at of
+                    HistoryStart ->
+                        Just (SafeText.literal "No reviews yet.")
+
+                    HistoryAfter _ _ ->
+                        Just (SafeText.literal "No more reviews.")
+
+                    HistoryLegacyAfter _ _ _ ->
+                        Just (SafeText.literal "No more reviews.")
+
+            else
+                Nothing
+
+
+-- One History page from `cursor`, newest first, each row classified under
+-- the review log's verdict, taken once for the load with the `reviewed`
+-- copy proved current for it (rebuilt once when its stamp is not), and
+-- named through `historyRows` against the units and unreviewable files the
+-- index db named by `settings` holds under the page's uids. At most
+-- `PageSize.history` rows are read, and two index reads name them all.
+loadHistoryPage : AppSettings -> LibDb.HistoryCursor -> Task.Task Error HistoryPage
+loadHistoryPage settings cursor =
+    do
+        db <- LibDb.openAt settings.review
+        conn <- Index.readConnection settings.index
+        state <- freshStatus settings conn db
+        page <- LibDb.historyPage (LibDb.verifier state) db PageSize.history cursor
+        units <- Index.liveUnits conn settings.index.roots (distinctUids page.rows)
+        files <- Index.liveFiles conn settings.index.roots (distinctUids page.rows)
+        Task.succeed { rows = historyRows units files page.rows, at = cursor, next = page.next, log = LibDb.logShown state }
+
+
+distinctUids : List LibDb.ReviewEntry -> List Uid
+distinctUids entries =
+    List.foldr
+        (\subject uids ->
+            if List.member subject uids then
+                uids
+
+            else
+                subject :: uids
+        )
+        []
+        (List.filterMap entryUid entries)
+
+
+-- A History row's subject before its label: a unit's name or a file's path,
+-- with whether the index still holds it.
+type Subject
+    = UnitSubject UnitName Presence
+    | FileSubject Label Presence
+    | NoSubject
+
+
+-- Each entry with its label, every unit subject placed against the others
+-- of the page.
+historyRows : List Index.Unit -> List ( Uid, Label ) -> List LibDb.ReviewEntry -> List HistoryRow
+historyRows units files entries =
+    let
+        subjects =
+            List.map (\entry -> ( entry, subjectOf units files entry )) entries
+
+        tallies =
+            talliesOf (List.filterMap (\( _, subject ) -> subjectUnit subject) subjects)
+    in
+    List.map (\( entry, subject ) -> { entry = entry, label = labelOf tallies subject }) subjects
+
+
+subjectOf : List Index.Unit -> List ( Uid, Label ) -> LibDb.ReviewEntry -> Subject
+subjectOf units files entry =
+    case entry of
+        Verified row ->
+            let
+                subject =
+                    LibDb.verifiedUid row
+
+                presence =
+                    presenceOf units files subject
+            in
+            case UnitName.fromRecorded subject (LibDb.verifiedName row) of
+                UnitNamed name ->
+                    UnitSubject name presence
+
+                FileNamed path ->
+                    FileSubject path presence
+
+        Unverified row ->
+            case row.uid of
+                Just subject ->
+                    liveSubject units files subject
+
+                Nothing ->
+                    NoSubject
+
+
+-- The subject the index holds under `subject`: its unit, else its
+-- unreviewable file, else none.
+liveSubject : List Index.Unit -> List ( Uid, Label ) -> Uid -> Subject
+liveSubject units files subject =
+    case List.head (List.filter (\unit -> unit.uid == subject) units) of
+        Just unit ->
+            UnitSubject (Index.unitName unit) Indexed
+
+        Nothing ->
+            case List.head (List.filter (\( fileUid, _ ) -> fileUid == subject) files) of
+                Just ( _, path ) ->
+                    FileSubject path Indexed
+
+                Nothing ->
+                    NoSubject
+
+
+presenceOf : List Index.Unit -> List ( Uid, Label ) -> Uid -> Presence
+presenceOf units files subject =
+    if List.any (\unit -> unit.uid == subject) units || List.any (\( fileUid, _ ) -> fileUid == subject) files then
+        Indexed
+
+    else
+        NoLongerIndexed
+
+
+subjectUnit : Subject -> Maybe UnitName
+subjectUnit subject =
+    case subject of
+        UnitSubject name _ ->
+            Just name
+
+        FileSubject _ _ ->
+            Nothing
+
+        NoSubject ->
+            Nothing
+
+
+labelOf : Tallies -> Subject -> HistoryLabel
+labelOf tallies subject =
+    case subject of
+        UnitSubject name presence ->
+            Labelled (unitLabel (placeIn tallies name) name) presence
+
+        FileSubject path presence ->
+            FileLabelled path presence
+
+        NoSubject ->
+            Unnamed
+
+
+-- The unit id an entry names: Nothing for a row whose uid column holds no
+-- unit id, which names no subject.
+entryUid : LibDb.ReviewEntry -> Maybe Uid
+entryUid entry =
+    case entry of
+        Verified row ->
+            Just (LibDb.verifiedUid row)
+
+        Unverified row ->
+            row.uid

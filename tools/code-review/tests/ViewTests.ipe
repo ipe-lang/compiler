@@ -25,10 +25,11 @@ import Lib.Db as LibDb exposing (Decision(..), HistoryCursor(..))
 import Lib.Drawn as Drawn exposing (Drawing(..), Hue(..), LayoutNote(..), Mode(..), Part(..), Piece(..), RowLine(..), Run(..), SourceRow(..), SpelledRow(..))
 import Lib.Format as Format
 import Lib.Highlight as Highlight exposing (Lang(..), LeadingMark(..), LineEnds(..), Token(..))
+import Lib.History exposing (HistoryState(..))
 import Lib.Index as Index exposing (SourceView(..), StaleReason(..))
 import Lib.Keys as Keys exposing (KeyAction(..), KeyMode(..))
 import Lib.Links as Links exposing (Link(..))
-import Lib.Queue as Queue exposing (HistoryState(..), QueueState(..), UnitPageState(..))
+import Lib.Queue as Queue exposing (QueueState(..), UnitPageState(..))
 import Lib.RepoPath as RepoPath exposing (PathError(..), Root, RootMap)
 import Lib.SafeText as SafeText exposing (Segment(..))
 import Lib.Settings as Settings
@@ -1085,7 +1086,7 @@ positionRefusals =
 
 
 -- A decision reaches `Queue.decide` only through the shown source
--- `Queue.offeredSource` gives (the decidable source, kept only while its
+-- `DecisionSlot.offeredSource` gives (the decidable source, kept only while its
 -- digest is the one the offer drew): `Queue.decide ` appears once in the app
 -- (inside `decideOn`), `decideOn ` exactly three times (its signature, its
 -- definition and the one call in the `Just shown` arm), and neither in
@@ -1106,7 +1107,7 @@ decisionReachedOnlyThroughDecidableSource =
             \text -> String.join " " (String.words text)
 
         oneCall =
-            "case Queue.offeredSource row model.selectedView of Just shown -> decideOn settings macKey shown decision "
+            "case DecisionSlot.offeredSource row model.selectedView of Just shown -> decideOn settings macKey shown decision "
 
         oneRefusalCall =
             "case Maybe.map (\\listed -> listed.digest) (pageRefusal model uid) of Just (Just listed) -> if listed == digest then LibDb.openAt settings.review |> Task.andThen (\\db -> Queue.decideRefusal macKey settings.index db uid digest decision) "

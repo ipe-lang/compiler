@@ -16,16 +16,21 @@ import Ipe.Time.Timestamp as Timestamp
 import Ipe.Ui as Ui
 import Lib.App exposing (Model, Page(..), decidableRow, initialModel)
 import Lib.Db as LibDb exposing (BreakAt(..), HistoryCursor(..), LogShown(..), ReviewEntry(..), StoredDecision(..), Unverified(..))
+import Lib.DecisionSlot as DecisionSlot exposing (DecisionSlot(..), RefusalPanel(..))
 import Lib.Epoch as Epoch exposing (Epoch)
 import Lib.Failure as Failure exposing (DecideRefusal(..), LoadFailure(..), ReasonRefusal(..), RefuseFailure(..), SaveFailure(..))
 import Lib.Format as Format
+import Lib.History as History exposing (HistoryState(..))
 import Lib.Index as Index exposing (Change(..), Oversize(..), ReadFailure(..), RefusalReason(..), SourceView(..), StaleReason(..))
 import Lib.Label as Label exposing (Label)
 import Lib.Links exposing (Hidden(..), Link(..), LinkKey(..))
 import Lib.PageSize as PageSize
-import Lib.Queue as Queue exposing (DecisionSlot(..), HistoryState(..), QueueState(..), RefusalPanel(..), SelectedView(..), UnitPageState(..))
+import Lib.Queue as Queue exposing (QueueState(..), UnitPageState(..))
 import Lib.RepoPath exposing (PathError(..))
 import Lib.SafeText as SafeText
+import Lib.Selected exposing (SelectedView(..))
+import Lib.Slot as Slot
+import Lib.Standing as Standing
 import Lib.Uid as Uid
 import Lib.View as View
 import TestSupport exposing (accepted, labelOf, quotedLabelOf, labelText, decidedRefusalNow, checkReporting, cleanupIndex, codeText, execIndex, freshScratch, loadHistoryPageNow, loadPageNow, loadUnitNow, migratedReviewAt, removeFileIfAny, renderedForeign, seedIndex, uid, writeFileText, appendSigned, rawRow, countingVerifier, testKeyHex)
@@ -66,7 +71,7 @@ baseModel =
 
 queued : Index.UnitView -> Queue.QueuedUnit
 queued loaded =
-    { unit = loaded.unit, change = New, changed = Nothing, standing = Queue.Undecided }
+    { unit = loaded.unit, change = New, changed = Nothing, standing = Standing.Undecided }
 
 
 queuePage : List Queue.QueuedUnit -> Int -> Queue.Progress -> Queue.QueuePage
@@ -99,7 +104,7 @@ cardModel loaded =
 changedModel : Index.UnitView -> LibDb.VerifiedRow -> Model
 changedModel loaded old =
     { baseModel
-        | queueState = Loaded (queuePage [ { unit = loaded.unit, change = Modified { old = LibDb.verifiedHash old }, changed = Just old, standing = Queue.Undecided } ] 1 { reviewed = 0, total = 1 })
+        | queueState = Loaded (queuePage [ { unit = loaded.unit, change = Modified { old = LibDb.verifiedHash old }, changed = Just old, standing = Standing.Undecided } ] 1 { reviewed = 0, total = 1 })
         , selectedView = ViewShown loaded
     }
 
@@ -115,7 +120,7 @@ refusingModel epoch loaded =
     in
     case decidableRow card loaded.unit.uid of
         Just row ->
-            { card | decision = Queue.openRefusal epoch row card.decision }
+            { card | decision = DecisionSlot.openRefusal epoch row card.decision }
 
         Nothing ->
             card
@@ -133,7 +138,7 @@ addressModel address =
     { baseModel | page = UnitPage address }
 
 
-historyModel : List Queue.HistoryRow -> Model
+historyModel : List History.HistoryRow -> Model
 historyModel rows =
     { baseModel
         | page = HistoryPage
@@ -141,9 +146,9 @@ historyModel rows =
     }
 
 
-historyRowOf : LibDb.VerifiedRow -> Queue.HistoryRow
+historyRowOf : LibDb.VerifiedRow -> History.HistoryRow
 historyRowOf row =
-    { entry = Verified row, label = Queue.Unnamed }
+    { entry = Verified row, label = History.Unnamed }
 
 
 -- The queue card of `loaded` on a server whose review log reads `log`.
@@ -165,7 +170,7 @@ unverifiedHistory : LogShown -> Unverified -> Model
 unverifiedHistory log why =
     { baseModel
         | page = HistoryPage
-        , history = HistoryLoaded { rows = [ { entry = Unverified { uid = Just (uid "u-a"), bodyHash = "h", reviewedAt = Timestamp.fromUnixMillis 0, why = why }, label = Queue.Unnamed } ], at = HistoryStart, next = Nothing, log = log }
+        , history = HistoryLoaded { rows = [ { entry = Unverified { uid = Just (uid "u-a"), bodyHash = "h", reviewedAt = Timestamp.fromUnixMillis 0, why = why }, label = History.Unnamed } ], at = HistoryStart, next = Nothing, log = log }
     }
 
 
@@ -468,7 +473,7 @@ withheldRefusePanelRefuses epoch loaded entry =
         html =
             page refused
     in
-    Queue.openPanel refused.decision == Nothing && has entry.reason html && noDecisionButtons html
+    DecisionSlot.openPanel refused.decision == Nothing && has entry.reason html && noDecisionButtons html
 
 
 -- ── queue states and counts ─────────────────────────────────────
@@ -560,7 +565,7 @@ refuseErrorFixedText epoch loaded =
             ]
 
         rendered failure =
-            page { opened | decision = Queue.draftRefused failure opened.decision }
+            page { opened | decision = DecisionSlot.draftRefused failure opened.decision }
 
         showsItsOwn failure =
             let
@@ -585,7 +590,7 @@ decisionErrorFixedText loaded =
             cardModel loaded
     in
     List.all
-        (\failure -> has (Html.escapeHtml ("Decision not saved: " ++ Failure.saveFailureText failure)) (page { card | decision = DecisionNotSaved failure Queue.firstTicket PanelClosed }))
+        (\failure -> has (Html.escapeHtml ("Decision not saved: " ++ Failure.saveFailureText failure)) (page { card | decision = DecisionNotSaved failure Slot.firstTicket PanelClosed }))
         [ SaveOffQueue
         , SaveReadOnly
         , SaveContended
@@ -823,7 +828,7 @@ seededChecks epoch a b =
             page (refusingModel epoch a)
 
         hostileHistory =
-            historyModel [ { entry = Unverified { uid = Just a.unit.uid, bodyHash = "h", reviewedAt = Timestamp.fromUnixMillis 0, why = Legacy }, label = Queue.FileLabelled (labelOf hostileText) Queue.Indexed } ]
+            historyModel [ { entry = Unverified { uid = Just a.unit.uid, bodyHash = "h", reviewedAt = Timestamp.fromUnixMillis 0, why = Legacy }, label = History.FileLabelled (labelOf hostileText) History.Indexed } ]
 
         readOnlyCard =
             page (cardModelUnder ShownUnkeyed a)
@@ -847,7 +852,7 @@ seededChecks epoch a b =
             { unit | uid = uid "u-twin", path = labelOf "ipe:src/twin.rs" }
 
         twinCard =
-            page { baseModel | queueState = Loaded (queuePage [ queued a, { unit = twin, change = New, changed = Nothing, standing = Queue.Undecided } ] 2 { reviewed = 0, total = 2 }), selectedView = ViewShown a }
+            page { baseModel | queueState = Loaded (queuePage [ queued a, { unit = twin, change = New, changed = Nothing, standing = Standing.Undecided } ] 2 { reviewed = 0, total = 2 }), selectedView = ViewShown a }
 
         placeOf path =
             path ++ ":" ++ String.fromInt unit.lineStart
@@ -861,25 +866,25 @@ seededChecks epoch a b =
                 && List.length (String.split "<h1" html) == 2
 
         standingPage bodyHash standing =
-            page { baseModel | page = UnitPage (TestSupport.uidHex a.unit.uid), selectedView = ViewShown a, standing = Queue.StandingShown a.unit.uid bodyHash standing }
+            page { baseModel | page = UnitPage (TestSupport.uidHex a.unit.uid), selectedView = ViewShown a, standing = Standing.StandingShown a.unit.uid bodyHash standing }
 
         currentHash =
             Index.storedHash a.unit.attested
 
         approvedPage =
-            standingPage currentHash (Queue.Decided StoredApproved)
+            standingPage currentHash (Standing.Decided StoredApproved)
 
         tamperedPage =
-            standingPage currentHash (Queue.NotCounted Tampered)
+            standingPage currentHash (Standing.NotCounted Tampered)
 
         undecidedPage =
-            standingPage currentHash Queue.Undecided
+            standingPage currentHash Standing.Undecided
 
         olderBodyPage =
-            standingPage (currentHash ++ "-older") (Queue.Decided StoredApproved)
+            standingPage (currentHash ++ "-older") (Standing.Decided StoredApproved)
 
         tamperedCard =
-            page { baseModel | queueState = Loaded (queuePage [ { unit = a.unit, change = Unrecorded, changed = Nothing, standing = Queue.NotCounted Tampered } ] 1 { reviewed = 0, total = 1 }), selectedView = ViewShown a }
+            page { baseModel | queueState = Loaded (queuePage [ { unit = a.unit, change = Unrecorded, changed = Nothing, standing = Standing.NotCounted Tampered } ] 1 { reviewed = 0, total = 1 }), selectedView = ViewShown a }
 
         noControl html =
             not (button "Approve" html) && not (button "Refuse" html) && not (has "a approve" html)
@@ -1242,16 +1247,16 @@ storedPure loaded long ok yes =
             { kind = labelOf "const", name = labelOf "crate::FILE", place = Queue.At (labelOf "ipe:src/b.rs") 9 }
 
         goneHistory =
-            page (historyModel [ { entry = Verified yes, label = Queue.Labelled goneLabel Queue.NoLongerIndexed } ])
+            page (historyModel [ { entry = Verified yes, label = History.Labelled goneLabel History.NoLongerIndexed } ])
 
         indexedHistory =
-            page (historyModel [ { entry = Verified yes, label = Queue.Labelled goneLabel Queue.Indexed } ])
+            page (historyModel [ { entry = Verified yes, label = History.Labelled goneLabel History.Indexed } ])
 
         goneFileHistory =
-            page (historyModel [ { entry = Verified yes, label = Queue.FileLabelled (labelOf "ipe:src/blob.bin") Queue.NoLongerIndexed } ])
+            page (historyModel [ { entry = Verified yes, label = History.FileLabelled (labelOf "ipe:src/blob.bin") History.NoLongerIndexed } ])
 
         unnamedHistory =
-            page (historyModel [ { entry = Verified yes, label = Queue.Unnamed } ])
+            page (historyModel [ { entry = Verified yes, label = History.Unnamed } ])
     in
     [ ( "an over-long stored reason shows its length and none of its text, in the History and on a changed card", has lengthNote hiddenInHistory && has lengthNote hiddenOnCard && not (has (String.repeat 20 "Q") hiddenInHistory) && not (has (String.repeat 20 "Q") hiddenOnCard) )
     , ( "a valid stored reason is shown in the History and on a changed card", has "needs a test" okInHistory && has "needs a test" okOnCard && not (has "reason not shown" okInHistory) )
@@ -1529,7 +1534,7 @@ budgetUnit unit column id =
         }
     , change = New
     , changed = Nothing
-    , standing = Queue.Undecided
+    , standing = Standing.Undecided
     }
 
 
