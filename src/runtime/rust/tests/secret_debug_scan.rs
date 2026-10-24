@@ -56,11 +56,13 @@
 use std::collections::BTreeMap;
 
 use proc_macro2::{Literal, TokenStream, TokenTree};
+use syn::parse::Parser;
+use syn::punctuated::Punctuated;
 use syn::visit::{self, Visit};
 use syn::{
-    Attribute, Fields, GenericArgument, ImplItem, Item, ItemEnum, ItemFn, ItemImpl, ItemMod,
-    ItemStruct, Lit, LitByteStr, LitCStr, LitStr, Macro, Path, PathArguments, TraitItem, Type,
-    UsePath, UseTree,
+    Attribute, Expr, ExprArray, ExprLit, Fields, GenericArgument, ImplItem, Item, ItemEnum, ItemFn,
+    ItemImpl, ItemMod, ItemStruct, Lit, LitByteStr, LitCStr, LitStr, Macro, Pat, Path,
+    PathArguments, Token, TraitItem, Type, UsePath, UseTree,
 };
 
 // The `cfg` classification shared with the dial and print-macro scans.
@@ -1493,4 +1495,266 @@ fn a_dev_view_name_outside_its_files_is_refused() {
         }
     }
     assert_eq!(stray_dev_view_names(&sources), expected);
+}
+
+// ─── The credential header-name rule has one home ────────────────────────────
+
+/// Header names every credential rule lists. A production list naming one
+/// outside [`CREDENTIAL_RULE_FILE`] is a second rule, which drifts from the
+/// first.
+const CREDENTIAL_HEADER_PROBES: &[&str] = &[
+    "authorization",
+    "proxy-authorization",
+    "cookie",
+    "set-cookie",
+    "x-api-key",
+];
+
+/// The one runtime file that holds the credential header-name rule.
+const CREDENTIAL_RULE_FILE: &str = "redact.rs";
+
+/// A production header-name list outside the rule file that classifies
+/// something other than credentials.
+struct HeaderList {
+    file: &'static str,
+    func: &'static str,
+    /// Why the list is not a credential rule.
+    #[allow(dead_code)] // documentation carried with the entry
+    why: &'static str,
+}
+
+/// Every admitted header-name list, matched exactly by file and function.
+const HEADER_LISTS: [HeaderList; 1] = [HeaderList {
+    file: "web/console_proxy.rs",
+    func: "is_hop_by_hop",
+    why: "the RFC 7230 §6.1 hop-by-hop set a proxy strips; `proxy-authorization` is \
+          listed there as hop-by-hop, not as a credential",
+}];
+
+/// One header-name list site: `(file, function)`.
+type ListSite = (String, String);
+
+/// Collects every production site of one file where a string literal naming a
+/// probed header stands as a list element or a pattern alternative.
+struct HeaderListScan<'a> {
+    file: &'a str,
+    funcs: Vec<String>,
+    hits: Vec<ListSite>,
+}
+
+impl HeaderListScan<'_> {
+    fn func(&self) -> String {
+        self.funcs.last().map_or(NO_FUNC, String::as_str).to_owned()
+    }
+
+    fn within(&mut self, name: String, walk: impl FnOnce(&mut Self)) {
+        self.funcs.push(name);
+        walk(self);
+        self.funcs.pop();
+    }
+
+    /// Record `text` when it names a probed header, whatever its ASCII case.
+    fn probe(&mut self, text: &str) {
+        if CREDENTIAL_HEADER_PROBES
+            .iter()
+            .any(|probe| probe.eq_ignore_ascii_case(text))
+        {
+            self.hits.push((self.file.to_owned(), self.func()));
+        }
+    }
+
+    /// Probe every element of a list that is a bare string literal.
+    fn elements(&mut self, elems: &Punctuated<Expr, Token![,]>) {
+        for elem in elems {
+            if let Expr::Lit(ExprLit {
+                lit: Lit::Str(lit), ..
+            }) = elem
+            {
+                self.probe(&lit.value());
+            }
+        }
+    }
+
+    /// Probe every string literal token of a `matches!` body, nested groups
+    /// included.
+    fn tokens(&mut self, stream: TokenStream) {
+        for tree in stream {
+            match tree {
+                TokenTree::Group(group) => self.tokens(group.stream()),
+                TokenTree::Literal(token) => {
+                    if let Lit::Str(lit) = Lit::new(token) {
+                        self.probe(&lit.value());
+                    }
+                }
+                TokenTree::Ident(_) | TokenTree::Punct(_) => {}
+            }
+        }
+    }
+}
+
+impl<'ast> Visit<'ast> for HeaderListScan<'_> {
+    fn visit_attribute(&mut self, _: &'ast Attribute) {}
+
+    fn visit_item(&mut self, node: &'ast Item) {
+        if cfg_test_only(item_attrs(node)) {
+            return;
+        }
+        if let Item::Fn(f) = node {
+            if !is_test_fn(&f.attrs) {
+                self.within(f.sig.ident.to_string(), |scan| {
+                    visit::visit_item(scan, node)
+                });
+            }
+            return;
+        }
+        visit::visit_item(self, node);
+    }
+
+    fn visit_impl_item(&mut self, node: &'ast ImplItem) {
+        if cfg_test_only(impl_item_attrs(node)) {
+            return;
+        }
+        if let ImplItem::Fn(f) = node {
+            if !is_test_fn(&f.attrs) {
+                self.within(f.sig.ident.to_string(), |scan| {
+                    visit::visit_impl_item(scan, node);
+                });
+            }
+            return;
+        }
+        visit::visit_impl_item(self, node);
+    }
+
+    fn visit_trait_item(&mut self, node: &'ast TraitItem) {
+        if cfg_test_only(trait_item_attrs(node)) {
+            return;
+        }
+        if let TraitItem::Fn(f) = node {
+            self.within(f.sig.ident.to_string(), |scan| {
+                visit::visit_trait_item(scan, node);
+            });
+            return;
+        }
+        visit::visit_trait_item(self, node);
+    }
+
+    fn visit_expr_array(&mut self, node: &'ast ExprArray) {
+        self.elements(&node.elems);
+        visit::visit_expr_array(self, node);
+    }
+
+    fn visit_pat(&mut self, node: &'ast Pat) {
+        if let Pat::Lit(ExprLit {
+            lit: Lit::Str(lit), ..
+        }) = node
+        {
+            self.probe(&lit.value());
+        }
+        visit::visit_pat(self, node);
+    }
+
+    fn visit_macro(&mut self, node: &'ast Macro) {
+        let name = node
+            .path
+            .segments
+            .last()
+            .map_or_else(String::new, |seg| seg.ident.to_string());
+        match name.as_str() {
+            "matches" => self.tokens(node.tokens.clone()),
+            "vec" => {
+                if let Ok(elems) =
+                    Punctuated::<Expr, Token![,]>::parse_terminated.parse2(node.tokens.clone())
+                {
+                    self.elements(&elems);
+                }
+            }
+            _ => {}
+        }
+        visit::visit_macro(self, node);
+    }
+}
+
+/// Every production header-name list site of `src`, read as the file `file`.
+#[allow(clippy::expect_used)] // an unparsable source must fail the scan, never be skipped
+fn header_list_sites(file: &str, src: &str) -> Vec<ListSite> {
+    let tree = syn::parse_file(src).expect("a runtime source parses");
+    let mut scan = HeaderListScan {
+        file,
+        funcs: Vec::new(),
+        hits: Vec::new(),
+    };
+    scan.visit_file(&tree);
+    scan.hits
+}
+
+/// Whether `site` is a [`HEADER_LISTS`] entry.
+fn admitted_header_list(site: &ListSite) -> bool {
+    HEADER_LISTS
+        .iter()
+        .any(|entry| entry.file == site.0 && entry.func == site.1)
+}
+
+/// Outside test code, a string literal naming a credential header stands in a
+/// list or a pattern only in [`CREDENTIAL_RULE_FILE`], which holds the rule,
+/// or at a [`HEADER_LISTS`] entry; and each entry still matches a site.
+#[test]
+fn the_credential_header_rule_has_one_home() {
+    let root = e2e_support::manifest_dir!().join("src");
+    let sources = rust_sources(&root);
+    let rule = sources
+        .iter()
+        .find(|(name, _)| name == CREDENTIAL_RULE_FILE)
+        .map(|(name, src)| header_list_sites(name, src));
+    assert!(
+        rule.is_some_and(|sites| !sites.is_empty()),
+        "{CREDENTIAL_RULE_FILE} holds no credential header-name list"
+    );
+    let elsewhere: Vec<ListSite> = sources
+        .iter()
+        .filter(|(name, _)| name != CREDENTIAL_RULE_FILE)
+        .flat_map(|(name, src)| header_list_sites(name, src))
+        .collect();
+    let violations: Vec<&ListSite> = elsewhere
+        .iter()
+        .filter(|site| !admitted_header_list(site))
+        .collect();
+    assert_eq!(violations, Vec::<&ListSite>::new());
+    for entry in &HEADER_LISTS {
+        assert!(
+            elsewhere
+                .iter()
+                .any(|site| site.0 == entry.file && site.1 == entry.func),
+            "stale header-list entry {}:{}",
+            entry.file,
+            entry.func
+        );
+    }
+}
+
+/// The header-list scan sees a list in an array, a `vec!`, a `matches!` and a
+/// match arm, in any ASCII case, and skips test code, a single-header call
+/// argument and a list of pairs.
+#[test]
+fn a_second_credential_header_list_is_refused() {
+    let src = r#"
+        fn array() -> bool { ["Authorization", "cookie"].contains(&"x") }
+        fn vector() -> Vec<&'static str> { vec!["Set-Cookie"] }
+        fn matched(name: &str) -> bool { matches!(name, ("x-api-key" | "accept")) }
+        fn armed(name: &str) -> bool { match name { "proxy-authorization" | "te" => true, _ => false } }
+        fn single(h: &mut Headers) { h.set("authorization", "v"); }
+        fn pairs() -> Vec<(&'static str, &'static str)> { vec![("Authorization", "v")] }
+        fn plain() -> bool { ["content-type", "accept"].contains(&"x") }
+        #[cfg(test)] mod tests { fn probe() -> bool { ["authorization"].is_empty() } }
+    "#;
+    let site = |func: &str| ("probe.rs".to_owned(), func.to_owned());
+    assert_eq!(
+        header_list_sites("probe.rs", src),
+        vec![
+            site("array"),
+            site("array"),
+            site("vector"),
+            site("matched"),
+            site("armed"),
+        ]
+    );
 }
