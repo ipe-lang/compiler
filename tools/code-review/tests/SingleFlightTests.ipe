@@ -305,50 +305,275 @@ decisionStart effect =
 queueCompletion : Msg -> Maybe (Stamp Slot.LoadTicket)
 queueCompletion msg =
     case msg of
-        PendingLoaded load _ ->
-            Just load
+        PendingLoaded stamped _ ->
+            Just stamped
 
-        _ ->
+        NextPage _ ->
+            Nothing
+
+        ApproveRow _ ->
+            Nothing
+
+        RefuseStart _ ->
+            Nothing
+
+        RefuseDraft _ _ ->
+            Nothing
+
+        RefuseCancel _ ->
+            Nothing
+
+        RefuseSubmit _ ->
+            Nothing
+
+        DecisionSaved _ _ ->
+            Nothing
+
+        Navigated _ ->
+            Nothing
+
+        ShowQueue ->
+            Nothing
+
+        ShowHistory ->
+            Nothing
+
+        HistoryPageLoaded _ _ ->
+            Nothing
+
+        HistoryNext _ ->
+            Nothing
+
+        SelectedViewLoaded _ _ ->
+            Nothing
+
+        StandingLoaded _ _ ->
+            Nothing
+
+        KeyDown _ _ ->
+            Nothing
+
+        SelectUnit _ ->
             Nothing
 
 
 historyCompletion : Msg -> Maybe (Stamp Slot.LoadTicket)
 historyCompletion msg =
     case msg of
-        HistoryPageLoaded load _ ->
-            Just load
+        PendingLoaded _ _ ->
+            Nothing
 
-        _ ->
+        NextPage _ ->
+            Nothing
+
+        ApproveRow _ ->
+            Nothing
+
+        RefuseStart _ ->
+            Nothing
+
+        RefuseDraft _ _ ->
+            Nothing
+
+        RefuseCancel _ ->
+            Nothing
+
+        RefuseSubmit _ ->
+            Nothing
+
+        DecisionSaved _ _ ->
+            Nothing
+
+        Navigated _ ->
+            Nothing
+
+        ShowQueue ->
+            Nothing
+
+        ShowHistory ->
+            Nothing
+
+        HistoryPageLoaded stamped _ ->
+            Just stamped
+
+        HistoryNext _ ->
+            Nothing
+
+        SelectedViewLoaded _ _ ->
+            Nothing
+
+        StandingLoaded _ _ ->
+            Nothing
+
+        KeyDown _ _ ->
+            Nothing
+
+        SelectUnit _ ->
             Nothing
 
 
 viewCompletion : Msg -> Maybe (Stamp Uid)
 viewCompletion msg =
     case msg of
-        SelectedViewLoaded read _ ->
-            Just read
+        PendingLoaded _ _ ->
+            Nothing
 
-        _ ->
+        NextPage _ ->
+            Nothing
+
+        ApproveRow _ ->
+            Nothing
+
+        RefuseStart _ ->
+            Nothing
+
+        RefuseDraft _ _ ->
+            Nothing
+
+        RefuseCancel _ ->
+            Nothing
+
+        RefuseSubmit _ ->
+            Nothing
+
+        DecisionSaved _ _ ->
+            Nothing
+
+        Navigated _ ->
+            Nothing
+
+        ShowQueue ->
+            Nothing
+
+        ShowHistory ->
+            Nothing
+
+        HistoryPageLoaded _ _ ->
+            Nothing
+
+        HistoryNext _ ->
+            Nothing
+
+        SelectedViewLoaded stamped _ ->
+            Just stamped
+
+        StandingLoaded _ _ ->
+            Nothing
+
+        KeyDown _ _ ->
+            Nothing
+
+        SelectUnit _ ->
             Nothing
 
 
 standingCompletion : Msg -> Maybe (Stamp Standing.StandingKey)
 standingCompletion msg =
     case msg of
-        StandingLoaded reading _ ->
-            Just reading
+        PendingLoaded _ _ ->
+            Nothing
 
-        _ ->
+        NextPage _ ->
+            Nothing
+
+        ApproveRow _ ->
+            Nothing
+
+        RefuseStart _ ->
+            Nothing
+
+        RefuseDraft _ _ ->
+            Nothing
+
+        RefuseCancel _ ->
+            Nothing
+
+        RefuseSubmit _ ->
+            Nothing
+
+        DecisionSaved _ _ ->
+            Nothing
+
+        Navigated _ ->
+            Nothing
+
+        ShowQueue ->
+            Nothing
+
+        ShowHistory ->
+            Nothing
+
+        HistoryPageLoaded _ _ ->
+            Nothing
+
+        HistoryNext _ ->
+            Nothing
+
+        SelectedViewLoaded _ _ ->
+            Nothing
+
+        StandingLoaded stamped _ ->
+            Just stamped
+
+        KeyDown _ _ ->
+            Nothing
+
+        SelectUnit _ ->
             Nothing
 
 
 decisionCompletion : Msg -> Maybe (Stamp Uid)
 decisionCompletion msg =
     case msg of
-        DecisionSaved saving _ ->
-            Just saving
+        PendingLoaded _ _ ->
+            Nothing
 
-        _ ->
+        NextPage _ ->
+            Nothing
+
+        ApproveRow _ ->
+            Nothing
+
+        RefuseStart _ ->
+            Nothing
+
+        RefuseDraft _ _ ->
+            Nothing
+
+        RefuseCancel _ ->
+            Nothing
+
+        RefuseSubmit _ ->
+            Nothing
+
+        DecisionSaved stamped _ ->
+            Just stamped
+
+        Navigated _ ->
+            Nothing
+
+        ShowQueue ->
+            Nothing
+
+        ShowHistory ->
+            Nothing
+
+        HistoryPageLoaded _ _ ->
+            Nothing
+
+        HistoryNext _ ->
+            Nothing
+
+        SelectedViewLoaded _ _ ->
+            Nothing
+
+        StandingLoaded _ _ ->
+            Nothing
+
+        KeyDown _ _ ->
+            Nothing
+
+        SelectUnit _ ->
             Nothing
 
 
