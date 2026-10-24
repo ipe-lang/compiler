@@ -135,3 +135,62 @@ test("option: a removed selected attribute deselects an option a script selected
   expect(await opt.evaluate((el) => el.hasAttribute("selected"))).toBe(false);
   expect(errors.map(String)).toEqual([]);
 });
+
+// The frame rule on the patch path. `addToRoot` bypasses the parse-time fence,
+// so these frames stand for nodes the fence never saw; each patch must still
+// leave a sandboxed iframe and a loader without its URL.
+
+test("frame patch: a url set on an unsandboxed iframe writes an empty sandbox first", async ({
+  page,
+}) => {
+  const errors = [];
+  page.on("pageerror", (e) => errors.push(e));
+  await load(page);
+  await addToRoot(page, '<iframe id="ipe-e2e-frame" ipe-id="e2e-frame"></iframe>');
+  const frame = page.locator("#ipe-e2e-frame");
+  expect(await frame.evaluate((el) => el.hasAttribute("sandbox"))).toBe(false);
+  await pushPatches(page, [{ id: "e2e-frame", attrs: { SRC: "/" } }]);
+  expect(await frame.evaluate((el) => [el.getAttribute("sandbox"), el.getAttribute("src")])).toEqual([
+    "",
+    "/",
+  ]);
+  await expect.poll(() => frame.evaluate((el) => el.contentDocument === null)).toBe(true);
+  expect(errors.map(String)).toEqual([]);
+});
+
+test("frame patch: an iframe sandbox is never removed and keeps only known tokens", async ({ page }) => {
+  const errors = [];
+  page.on("pageerror", (e) => errors.push(e));
+  await load(page);
+  await addToRoot(page, '<iframe id="ipe-e2e-boxed" ipe-id="e2e-boxed" sandbox="allow-forms"></iframe>');
+  const frame = page.locator("#ipe-e2e-boxed");
+  await pushPatches(page, [{ id: "e2e-boxed", attrs: { sandbox: null } }]);
+  expect(await frame.evaluate((el) => el.getAttribute("sandbox"))).toBe("allow-forms");
+  await pushPatches(page, [
+    { id: "e2e-boxed", attrs: { Sandbox: "ALLOW-SAME-ORIGIN\tallow-scripts allow-popups-to-escape-sandbox x" } },
+  ]);
+  expect(await frame.evaluate((el) => el.getAttribute("sandbox"))).toBe("allow-scripts");
+  expect(errors.map(String)).toEqual([]);
+});
+
+test("frame patch: a loader never gains its url, in any key case", async ({ page }) => {
+  const errors = [];
+  page.on("pageerror", (e) => errors.push(e));
+  await load(page);
+  await addToRoot(
+    page,
+    '<embed id="ipe-e2e-embed" ipe-id="e2e-embed"><object id="ipe-e2e-object" ipe-id="e2e-object"></object>',
+  );
+  await pushPatches(page, [
+    { id: "e2e-embed", attrs: { SRC: "/", title: "kept" } },
+    { id: "e2e-object", attrs: { data: "/" } },
+  ]);
+  expect(
+    await page.evaluate(() => {
+      const embed = document.getElementById("ipe-e2e-embed");
+      const object = document.getElementById("ipe-e2e-object");
+      return [embed.hasAttribute("src"), embed.getAttribute("title"), object.hasAttribute("data")];
+    }),
+  ).toEqual([false, "kept", false]);
+  expect(errors.map(String)).toEqual([]);
+});

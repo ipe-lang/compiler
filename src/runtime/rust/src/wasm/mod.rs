@@ -1762,24 +1762,31 @@ fn apply_patches(patches: &[Patch]) {
                 widget::set_widget_down_property(&el, v.as_deref().unwrap_or_default());
                 continue;
             }
-            let sandboxed = el.has_attribute(SANDBOX_ATTR);
-            match attr_write(&el.local_name(), k, v.as_deref(), sandboxed) {
-                AttrWrite::Set(v) => {
-                    let _ = el.set_attribute(k, &v);
-                    sync_dom_property(&el, k, &v);
-                }
-                AttrWrite::SandboxThenSet(v) => {
-                    if el.set_attribute(SANDBOX_ATTR, "").is_ok() {
-                        let _ = el.set_attribute(k, v);
-                    }
-                }
-                AttrWrite::Remove => {
-                    let _ = el.remove_attribute(k);
-                    clear_dom_property(&el, k);
-                }
-                AttrWrite::Keep => {}
+            write_patched_attr(&el, k, v.as_deref());
+        }
+    }
+}
+
+/// Write one patched attribute onto the live `el`: `Some` sets, `None`
+/// removes, both through the frame rule of `attr_write` — an iframe holds a
+/// sandbox before it holds a URL, and a frame loader never gains its URL.
+pub fn write_patched_attr(el: &web_sys::Element, key: &str, value: Option<&str>) {
+    let sandboxed = el.has_attribute(SANDBOX_ATTR);
+    match attr_write(&el.local_name(), key, value, sandboxed) {
+        AttrWrite::Set(v) => {
+            let _ = el.set_attribute(key, &v);
+            sync_dom_property(el, key, &v);
+        }
+        AttrWrite::SandboxThenSet(v) => {
+            if el.set_attribute(SANDBOX_ATTR, "").is_ok() {
+                let _ = el.set_attribute(key, v);
             }
         }
+        AttrWrite::Remove => {
+            let _ = el.remove_attribute(key);
+            clear_dom_property(el, key);
+        }
+        AttrWrite::Keep => {}
     }
 }
 

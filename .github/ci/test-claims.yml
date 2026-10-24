@@ -28,7 +28,7 @@ cells:
     platform: wasm32-unknown-unknown
     features: [wasm-client]
     owner: wasm-floor
-    expect_tests: 8
+    expect_tests: 9
   - package: ipe-runtime-rust
     target: {test: wasm_websocket_bridge}
     platform: wasm32-unknown-unknown

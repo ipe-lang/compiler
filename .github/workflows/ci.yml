@@ -728,7 +728,7 @@ jobs:
         env:
           CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER: wasm-bindgen-test-runner
           CHROMEDRIVER: chromedriver
-        run: cargo test -p ipe-runtime-rust --target wasm32-unknown-unknown --features wasm-client --test wasm_dom_paint | python3 tools/scripts/wasm-test/wasm_test_count.py 8
+        run: cargo test -p ipe-runtime-rust --target wasm32-unknown-unknown --features wasm-client --test wasm_dom_paint | python3 tools/scripts/wasm-test/wasm_test_count.py 9
 
   # Every editors/*/configure.sh happy path, plus the one step none of them
   # proved before: Zed's "install dev extension" compiles editors/zed-ipe as a

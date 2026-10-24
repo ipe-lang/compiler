@@ -17,7 +17,7 @@
 #![cfg(all(target_arch = "wasm32", feature = "wasm-client"))]
 
 use ipe_runtime_rust::dom::diff::AUTOFOCUS_SPENT_GLOBAL;
-use ipe_runtime_rust::wasm::{paint_first, replace_children_html};
+use ipe_runtime_rust::wasm::{paint_first, replace_children_html, write_patched_attr};
 use wasm_bindgen::JsCast;
 use wasm_bindgen_test::*;
 
@@ -222,5 +222,41 @@ fn a_patched_embed_with_a_url_never_connects() {
     assert!(root.query_selector("p").ok().flatten().is_some());
     assert!(root.query_selector("#inert").ok().flatten().is_some());
     assert!(matches!(root.query_selector("[src], object"), Ok(None)));
+    root.remove();
+}
+
+#[wasm_bindgen_test]
+fn a_patched_attribute_keeps_the_frame_rule_on_a_live_node() {
+    let doc = document();
+    assert!(doc.is_some(), "run_in_browser must provide a document");
+    let Some(doc) = doc else { return };
+    let root = fresh(&doc, "div");
+    assert!(root.is_some(), "the patch target must attach");
+    let Some(root) = root else { return };
+    // Built node by node: no parse fence ever sees these elements.
+    let frame = doc.create_element("iframe").ok();
+    let embed = doc.create_element("embed").ok();
+    assert!(
+        frame.is_some() && embed.is_some(),
+        "the elements must build"
+    );
+    let (Some(frame), Some(embed)) = (frame, embed) else {
+        return;
+    };
+    assert!(root.append_child(&frame).is_ok() && root.append_child(&embed).is_ok());
+    write_patched_attr(&frame, "SRC", Some("/"));
+    assert_eq!(frame.get_attribute("sandbox").as_deref(), Some(""));
+    assert_eq!(frame.get_attribute("src").as_deref(), Some("/"));
+    write_patched_attr(&frame, "sandbox", None);
+    assert_eq!(frame.get_attribute("sandbox").as_deref(), Some(""));
+    write_patched_attr(&frame, "Sandbox", Some("ALLOW-SAME-ORIGIN allow-forms"));
+    assert_eq!(
+        frame.get_attribute("sandbox").as_deref(),
+        Some("allow-forms")
+    );
+    write_patched_attr(&embed, "src", Some("/"));
+    write_patched_attr(&embed, "title", Some("kept"));
+    assert!(!embed.has_attribute("src"));
+    assert_eq!(embed.get_attribute("title").as_deref(), Some("kept"));
     root.remove();
 }
