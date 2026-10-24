@@ -226,10 +226,6 @@ explain/IPE-L0154.md:35
 explain/IPE-L0155.md:12
 explain/IPE-L0155.md:26
 explain/IPE-L0155.md:38
-explain/IPE-L0156.md:21
-explain/IPE-L0156.md:31
-explain/IPE-L0156.md:45
-explain/IPE-L0156.md:57
 explain/IPE-L0157.md:12
 explain/IPE-L0157.md:19
 explain/IPE-L0157.md:27
