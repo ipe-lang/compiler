@@ -107,7 +107,12 @@ savingSlot epoch unit =
 
 refreshingSlot : Epoch -> Uid -> DecisionSlot
 refreshingSlot epoch unit =
-    DecisionSlot.decisionWritten (savingSlot epoch unit)
+    case savingStamp epoch unit of
+        Just saving ->
+            Maybe.withDefault (DecisionIdle PanelClosed) (DecisionSlot.decisionWritten epoch saving (savingSlot epoch unit))
+
+        Nothing ->
+            DecisionIdle PanelClosed
 
 
 savingStamp : Epoch -> Uid -> Maybe (Stamp Uid)
@@ -2216,6 +2221,51 @@ unownedDecisionSavedDrainsNothing settings otherEpoch a b ( attested, written ) 
         && Slot.runningWant settings.epoch owned.queueLoad == Just drain
 
 
+-- A decision slot settles a save result only under its own stamp, apart
+-- from the gate `App.update` holds before it: a result another process
+-- stamped, one for another unit, or one reaching a slot that is not saving
+-- leaves the slot unchanged and wants no reload. Red if `decisionWritten`
+-- or `decisionNotSaved` settles a result its slot does not own.
+decisionSlotOwnsItsResult : Settings.AppSettings -> Epoch -> Bool
+decisionSlotOwnsItsResult settings otherEpoch =
+    let
+        ua =
+            uid "u-a"
+
+        ub =
+            uid "u-b"
+
+        latest =
+            Slot.latestTicket Slot.idleLoad
+
+        saving =
+            savingSlot settings.epoch ua
+
+        refusedOn slot held =
+            case held of
+                Just arrived ->
+                    DecisionSlot.decisionWritten settings.epoch arrived slot == Nothing && DecisionSlot.decisionNotSaved settings.epoch arrived SaveFailed latest slot == slot
+
+                Nothing ->
+                    False
+
+        settledOn slot held =
+            case held of
+                Just arrived ->
+                    DecisionSlot.decisionWritten settings.epoch arrived slot == Just (refreshingSlot settings.epoch ua) && DecisionSlot.decisionNotSaved settings.epoch arrived SaveFailed latest slot == DecisionNotSaved SaveFailed latest PanelClosed
+
+                Nothing ->
+                    False
+    in
+    refusedOn saving (savingStamp otherEpoch ua)
+        && refusedOn saving (savingStamp settings.epoch ub)
+        && refusedOn (savingSlot otherEpoch ua) (savingStamp otherEpoch ua)
+        && refusedOn (DecisionIdle PanelClosed) (savingStamp settings.epoch ua)
+        && refusedOn (refreshingSlot settings.epoch ua) (savingStamp settings.epoch ua)
+        && refreshingSlot settings.epoch ua /= saving
+        && settledOn saving (savingStamp settings.epoch ua)
+
+
 -- The written-decision checks, on a decision really written through
 -- `Queue.decide` to a fresh review database, so the app receives the saved
 -- result a server's decision returns.
@@ -2243,6 +2293,7 @@ writtenChecks =
             , ( "a wanted drain absorbs a page turn and replaces a wanted reload", drainAbsorbsReload settings pair )
             , ( "a completion its slot does not own leaves the model unchanged, for each of the five completions", staleCompletionDropped settings otherEpoch a b pair )
             , ( "a saved decision whose stamp its slot does not hold drains nothing", unownedDecisionSavedDrainsNothing settings otherEpoch a b pair )
+            , ( "a decision slot settles only the save result its own stamp names", decisionSlotOwnsItsResult settings otherEpoch )
             ]
 
 
@@ -3020,7 +3071,8 @@ refreshingSettlesOnlyAfterWrite settings a b ( attested, written ) =
 -- A wanted drain absorbs a reload asked after it, taking the reload's
 -- cursor, and a drain asked after a wanted reload replaces it: no saved
 -- decision's drain is lost to a page turn. Red if a reload drops the
--- drain it follows, for each of the four merge pairs.
+-- drain it follows, for each of the four merge pairs. The save is started
+-- on the slot, so its own completion is the one that drains.
 drainAbsorbsReload : Settings.AppSettings -> ( Index.Attested, Index.Written ) -> Bool
 drainAbsorbsReload settings ( attested, written ) =
     let
@@ -3030,11 +3082,14 @@ drainAbsorbsReload settings ( attested, written ) =
         c2 =
             cursorAfter 2 "u-b"
 
-        running =
-            after settings [ Navigated QueuePage ] initialModel
-
         ua =
             uid "u-a"
+
+        queued =
+            after settings [ Navigated QueuePage ] initialModel
+
+        running =
+            { queued | decision = savingSlot settings.epoch ua }
 
         drainThenPage =
             after settings (decisionDone settings.epoch ua (Ok ( attested, written )) ++ [ NextPage c2 ]) running
@@ -3398,8 +3453,16 @@ strayStampMints path text =
 
         header =
             List.filter (\token -> token.name == "module") lexed.tokens
+
+        constructed =
+            if bare then
+                .hits (List.foldl constructorStep { name = "", past = False, hits = [] } lexed.code)
+
+            else
+                []
     in
     List.map .name stray
+        ++ constructed
         ++ List.map .moduleName exposingMint
         ++ (if path == stampModule && opensStamp header then
                 [ "Stamp(..)" ]
@@ -3413,6 +3476,34 @@ strayStampMints path text =
             else
                 []
            )
+
+
+-- The declarations of the stamp module that may name the `Stamp`
+-- constructor past their `=`: the type declarations, `stamp`, the one
+-- construction, and `stampKey`, `running` and `owns`, which only match it.
+stampConstructorSites : List String
+stampConstructorSites =
+    [ "type", "stamp", "stampKey", "running", "owns" ]
+
+
+-- One code token of the stamp module, read in order: a `Stamp` word past
+-- the `=` of a declaration not in `stampConstructorSites` builds a stamp
+-- outside `stamp`, and its declaration is a hit. A signature names the
+-- type before the `=`, so it is no hit.
+constructorStep : TextSinkScanTests.Token -> { name : String, past : Bool, hits : List String } -> { name : String, past : Bool, hits : List String }
+constructorStep token state =
+    let
+        past =
+            (token.kind == TextSinkScanTests.Punctuation && token.text == "=") || (token.name == state.name && state.past)
+
+        hits =
+            if past && token.kind == TextSinkScanTests.WordToken && token.text == "Stamp" && not (List.member token.name stampConstructorSites) then
+                state.hits ++ [ token.name ]
+
+            else
+                state.hits
+    in
+    { name = token.name, past = past, hits = hits }
 
 
 -- Whether a `Stamp` token is followed by `(`, its constructors opened.
@@ -3444,7 +3535,9 @@ slotFixture =
 -- Red cases: a mint in another definition, qualified, fully qualified or
 -- under a renamed import; a start site's name in another module; an import
 -- exposing `stamp`, by name or by `(..)`; a bare mint in the stamp module
--- outside `startLoad`; and the stamp module exposing `Stamp(..)`.
+-- outside `startLoad`; the stamp module exposing `Stamp(..)`; and the
+-- `Stamp` constructor built in a declaration of the stamp module other
+-- than `stamp`, while a signature naming the type is clean.
 everyStampMintedAtItsStartFixtures : Bool
 everyStampMintedAtItsStartFixtures =
     strayStampMints "Lib/Selected.ipe" stampFixture == []
@@ -3457,6 +3550,8 @@ everyStampMintedAtItsStartFixtures =
         && strayStampMints stampModule slotFixture == []
         && strayStampMints stampModule (slotFixture ++ "\n\nother epoch key =\n    stamp epoch key\n") == [ "other" ]
         && strayStampMints stampModule (String.replace "exposing (Stamp," "exposing (Stamp(..)," slotFixture) == [ "Stamp(..)" ]
+        && strayStampMints stampModule (slotFixture ++ "\n\nforge : Epoch -> key -> Stamp key\nforge e k =\n    Stamp e k\n") == [ "forge" ]
+        && strayStampMints stampModule (slotFixture ++ "\n\nheld : Stamp key -> Maybe (Stamp key)\nheld s =\n    Just s\n") == []
 
 
 -- Every module of `src`, read through the text-sink scan's bounded reader,

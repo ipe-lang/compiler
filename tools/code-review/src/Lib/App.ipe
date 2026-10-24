@@ -489,10 +489,15 @@ step settings msg model =
             if Slot.owns settings.epoch saving (DecisionSlot.savingStamp model.decision) then
                 case result of
                     Ok ( attested, written ) ->
-                        queueStep settings (Slot.requestLoad Queue.mergeQueueWant settings.epoch (QueueDrain attested written model.queueCursor) model.queueLoad) { model | decision = DecisionSlot.decisionWritten model.decision }
+                        case DecisionSlot.decisionWritten settings.epoch saving model.decision of
+                            Just refreshing ->
+                                queueStep settings (Slot.requestLoad Queue.mergeQueueWant settings.epoch (QueueDrain attested written model.queueCursor) model.queueLoad) { model | decision = refreshing }
+
+                            Nothing ->
+                                ( model, Cmd.none )
 
                     Err failure ->
-                        ( { model | decision = DecisionSlot.decisionNotSaved failure (Slot.latestTicket model.queueLoad) model.decision }, Cmd.none )
+                        ( { model | decision = DecisionSlot.decisionNotSaved settings.epoch saving failure (Slot.latestTicket model.queueLoad) model.decision }, Cmd.none )
 
             else
                 ( model, Cmd.none )

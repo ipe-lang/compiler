@@ -460,42 +460,29 @@ ownSlot epoch slot =
                 DecisionIdle PanelClosed
 
 
--- The saving decision was written: it stays busy, under its stamp, until
--- the queue reload that follows settles. Reached only for a result
--- `Slot.owns` matched to `savingStamp`; any other slot is unchanged.
-decisionWritten : DecisionSlot -> DecisionSlot
-decisionWritten slot =
-    case slot of
-        DecisionSaving saving ->
-            DecisionRefreshing saving
+-- The saving decision stamped `arrived` was written, as process `epoch`
+-- sees it: the slot stays busy, under its stamp, until the queue reload
+-- that follows settles. Nothing when the slot does not own `arrived`: no
+-- write of its decision is known, so no reload may follow.
+decisionWritten : Epoch -> Stamp Uid -> DecisionSlot -> Maybe DecisionSlot
+decisionWritten epoch arrived slot =
+    if Slot.owns epoch arrived (savingStamp slot) then
+        Maybe.map DecisionRefreshing (savingStamp slot)
 
-        DecisionRefreshing _ ->
-            slot
-
-        DecisionIdle _ ->
-            slot
-
-        DecisionNotSaved _ _ _ ->
-            slot
+    else
+        Nothing
 
 
--- The saving decision was not saved, for `failure`, while `latest` is the
--- queue's latest load. Reached only for a result `Slot.owns` matched to
--- `savingStamp`; any other slot is unchanged.
-decisionNotSaved : SaveFailure -> LoadTicket -> DecisionSlot -> DecisionSlot
-decisionNotSaved failure latest slot =
-    case slot of
-        DecisionSaving _ ->
-            DecisionNotSaved failure latest PanelClosed
+-- The saving decision stamped `arrived` was not saved, for `failure`,
+-- while `latest` is the queue's latest load. A slot that does not own
+-- `arrived`, as process `epoch` sees it, is unchanged.
+decisionNotSaved : Epoch -> Stamp Uid -> SaveFailure -> LoadTicket -> DecisionSlot -> DecisionSlot
+decisionNotSaved epoch arrived failure latest slot =
+    if Slot.owns epoch arrived (savingStamp slot) then
+        DecisionNotSaved failure latest PanelClosed
 
-        DecisionRefreshing _ ->
-            slot
-
-        DecisionIdle _ ->
-            slot
-
-        DecisionNotSaved _ _ _ ->
-            slot
+    else
+        slot
 
 
 -- A decision refused before it started, for `failure`, while `latest` is

@@ -405,7 +405,7 @@ readingOf epoch unit =
 
 -- The read of `unit` process `epoch` started returned to `state` with
 -- `result`. With no stamp from the start the slot reads `NoneSelected`
--- and wants `unit`, an outcome every check here refuses.
+-- and wants nothing.
 readArrived : Epoch -> Uid -> Result LoadFailure (Maybe Index.UnitView) -> Selected.SelectedView -> ( Selected.SelectedView, Maybe (Slot.Stamp Uid) )
 readArrived epoch unit result state =
     case Tuple.second (Selected.selectView epoch unit NoneSelected) of
@@ -413,7 +413,7 @@ readArrived epoch unit result state =
             Selected.viewArrived epoch read result state
 
         Nothing ->
-            ( NoneSelected, Tuple.second (Selected.selectView epoch unit NoneSelected) )
+            ( NoneSelected, Nothing )
 
 
 selectedTag : Selected.SelectedView -> String

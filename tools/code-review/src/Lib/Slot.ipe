@@ -66,9 +66,9 @@ stampKey held =
 running : Epoch -> Maybe (Stamp key) -> Maybe (Stamp key)
 running current held =
     case held of
-        Just (Stamp owner key) ->
+        Just (Stamp owner _) ->
             if owner == current then
-                Just (Stamp owner key)
+                held
 
             else
                 Nothing
