@@ -454,8 +454,9 @@ dbRefusalsStateOneFix =
 -- code lines — `requireEnv`'s read and `optionalEnv`'s read — and each of
 -- `requireEnv` and `optionalEnv` is named only by its declaration and its
 -- calls (two of `requireEnv`, each naming a `StartupVar` constructor, three
--- of `optionalEnv`, each a literal key), so no wrapper can pass either a key. `Settings` exports both
--- parsers and neither the bare `indexSettings` nor `reviewDb`.
+-- of `optionalEnv`, each a literal key), so no wrapper can pass either
+-- reader its variable. `Settings` exports both parsers and neither the bare
+-- `indexSettings` nor `reviewDb`.
 startupReadsAdmittedOnly : Task.Task Error Bool
 startupReadsAdmittedOnly =
     do
@@ -723,8 +724,8 @@ mainAdmits text =
 
 
 -- `main` opens with the bind's read and its loopback proof, then the two
--- `requireEnv` reads, each naming its `StartupVar`, the two other literal-key `optionalEnv`
--- reads, the review key's read, the settings parse and, as the block's tail,
+-- `requireEnv` reads, each naming its `StartupVar`, the two other
+-- literal-key `optionalEnv` reads, the review key's read, the settings parse and, as the block's tail,
 -- the listen over the proof-consuming `mounts`, in that order, so a refused
 -- bind stops startup before any other read, and a partially applied reader
 -- that a request could run cannot take the place of any read.
@@ -1432,7 +1433,7 @@ bindRefusalShown refusal =
 -- Each bind refusal, printed as `main` prints it, is one exact line: the
 -- variable, the refused value when there is one, quoted, escaped and cut at
 -- `EnvLookup.echoMaxChars` with a `…` mark, the problem, why only loopback
--- is accepted, and the one remedy. A value holding a `"`, a `; fix:`, a line
+-- is accepted, and the one remedy. A value holding a `"`, a `; fix: `, a line
 -- break and an ESC stays inside its quotes and reaches the terminal as
 -- escapes; an empty or unreadable value is never shown. Red if the value is
 -- shown unquoted or uncut, or a producer lays the line out by hand.
@@ -1440,10 +1441,10 @@ bindRefusalExactLines : Bool
 bindRefusalExactLines =
     let
         hostile =
-            "\"; fix:\n" ++ codeText 27 ++ String.repeat (EnvLookup.echoMaxChars - 3) "a"
+            "\"; fix: \n" ++ codeText 27 ++ String.repeat (EnvLookup.echoMaxChars - 4) "a"
 
         shownHostile =
-            "IPE_HTTP_BIND is \"\\\"; fix:\\n\\u{1b}" ++ String.repeat (EnvLookup.echoMaxChars - 9) "a" ++ "\"…: "
+            "IPE_HTTP_BIND is \"\\\"; fix: \\n\\u{1b}" ++ String.repeat (EnvLookup.echoMaxChars - 10) "a" ++ "\"…: "
 
         loopbackOnly =
             ", and the review page is unauthenticated, so the server listens on loopback only; fix: unset it (the server then binds 127.0.0.1), or set it to 127.0.0.1 or ::1, and reach the server from another machine through an SSH tunnel, e.g. ssh -L 8000:127.0.0.1:8000 <host> (use the listening port if IPE_SERVER_PORT sets another)"
