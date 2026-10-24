@@ -323,15 +323,16 @@ shadow member =
         { onPress = Nothing, label = Ui.text member }
 
 
--- `mark` while `on`, else empty: the empty value removes the attribute when
--- the form is patched.
-dropMark : Bool -> String -> String
-dropMark on mark =
-    if on then
-        mark
+-- The form carries `data-drop` while its `fdrop` button stands and
+-- `data-dropped` once it is gone, so the patch that removes the button both
+-- removes and sets an attribute on the form.
+dropMarks : Model -> List (Ui.Attribute Msg)
+dropMarks model =
+    if model.formDrop then
+        [ Ui.htmlAttribute "data-drop" "kept" ]
 
     else
-        ""
+        [ Ui.htmlAttribute "data-dropped" "yes" ]
 
 
 -- The form's first child holds the `appendChild` control, so the commit's
@@ -341,11 +342,11 @@ dropMark on mark =
 shadowingForm : Model -> Ui.Element Msg
 shadowingForm model =
     Ui.form
-        [ Ui.id "form"
-        , Ui.htmlAttribute "tabindex" "0"
-        , Ui.htmlAttribute "data-drop" (dropMark model.formDrop "kept")
-        , Ui.htmlAttribute "data-dropped" (dropMark (not model.formDrop) "yes")
-        ]
+        ([ Ui.id "form"
+         , Ui.htmlAttribute "tabindex" "0"
+         ]
+            ++ dropMarks model
+        )
         ([ shadow "appendChild"
          , Ui.button
             [ Ui.id "rc", Ui.htmlAttribute "name" "removeChild" ]

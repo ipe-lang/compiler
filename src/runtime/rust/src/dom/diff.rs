@@ -1,6 +1,8 @@
 use crate::html::{
-    Attribute, ElementBody, Html, ParseContext, RenderCtx, RenderedElement, admit_rendered_in,
+    Attribute, ElementBody, Html, ParseContext, RenderCtx, RenderedElement, STAMPED_ID_ATTR,
+    admit_rendered_in, attribute_pairs,
 };
+use std::borrow::Cow;
 use std::collections::HashMap;
 
 /// A single DOM patch emitted by `diff` (JSON: `id`, `text`, `html`, `attrs`,
@@ -20,10 +22,11 @@ pub struct Patch {
     pub text: Option<String>,
     #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
     pub html: Option<String>,
-    /// Attribute delta: present key with non-empty value → set; empty value → remove.
-    /// Convention: `""` means remove; `BoolAttr(k,true)` encodes as `{k:k}`.
+    /// Attribute delta: `Some(v)` sets the attribute to `v` (an empty `v`
+    /// included, as first paint writes `name=""`), `None` removes it. On the
+    /// wire a removal is JSON `null`, a set is a string.
     #[cfg_attr(feature = "serde", serde(skip_serializing_if = "HashMap::is_empty"))]
-    pub attrs: HashMap<String, String>,
+    pub attrs: HashMap<String, Option<String>>,
     #[cfg_attr(feature = "serde", serde(skip_serializing_if = "std::ops::Not::not"))]
     pub remove: bool,
 }
@@ -253,7 +256,7 @@ fn ipe_id<M>(n: &Html<M>) -> Option<&str> {
     if let Html::HElement(_, attrs, _) = n {
         for a in attrs {
             if let Attribute::Attr(k, v) = a
-                && k == "ipe-id"
+                && k == STAMPED_ID_ATTR
             {
                 return Some(v);
             }
@@ -450,43 +453,28 @@ fn diff_node_depth<M>(
 }
 
 /// Compute the attribute + event delta between `old` and `new`.
-/// Keys changed or added → new value. Keys removed → `""` (signals removal).
+/// Keys changed or added → `Some(new value)`; keys removed → `None`.
+/// The values compared are [`attribute_pairs`], the pairs first paint writes.
 /// `ipe-id` is excluded (never patched as an attribute).
 fn diff_attrs<M>(old: &[Attribute<M>], new: &[Attribute<M>], p: &mut Patch) {
-    // Borrowed maps: cloning every key AND value of every element into two
-    // owned HashMaps per diff was the hottest allocation in the SSE path
-    // (efficiency-audit §6 high). The changed/added/removed key set is
-    // identical owned-or-borrowed; only `insert_safe_attr` (which already
-    // copies, post-XSS-gate) allocates, and only for changed attrs.
-    // (A named fn, not a closure — fn lifetime elision ties the borrowed map
-    // to the argument slice; closure elision can't express that tie.)
-    fn collect<M>(xs: &[Attribute<M>]) -> HashMap<&str, &str> {
-        let mut m = HashMap::new();
-        for a in xs {
-            match a {
-                Attribute::Attr(k, v) if k != "ipe-id" => {
-                    m.insert(k.as_str(), v.as_str());
-                }
-                Attribute::BoolAttr(k, true) => {
-                    // Key-as-value (`attr = k`) encodes a present boolean attr;
-                    // "" is the remove sentinel only.
-                    m.insert(k.as_str(), k.as_str());
-                }
-                _ => {}
-            }
-        }
-        m
+    // Borrowed values: only `insert_safe_attr` (which copies, post-XSS-gate)
+    // allocates, and only for a changed attribute; a merged `class`/`style`
+    // is the one owned value.
+    fn collect<M>(xs: &[Attribute<M>]) -> HashMap<&str, Cow<'_, str>> {
+        attribute_pairs(xs)
+            .into_iter()
+            .filter(|(k, _)| *k != STAMPED_ID_ATTR)
+            .collect()
     }
     let (om, nm) = (collect(old), collect(new));
     for (k, v) in &nm {
         if om.get(k) != Some(v) {
-            insert_safe_attr(p, k, v);
+            insert_safe_attr(p, k, Some(v.as_ref()));
         }
     }
     for k in om.keys() {
         if !nm.contains_key(k) {
-            // Signal removal with empty string.
-            insert_safe_attr(p, k, "");
+            insert_safe_attr(p, k, None);
         }
     }
     diff_events(old, new, p);
@@ -497,17 +485,18 @@ fn diff_attrs<M>(old: &[Attribute<M>], new: &[Attribute<M>], p: &mut Patch) {
 /// attribute-name gate (no `on*` handlers / `srcdoc` / structural-breakout
 /// charset) + URL-scheme sanitisation of the value. SSE patches are applied by
 /// the browser via `setAttribute`, which bypasses `render_into_ctx`'s gates, so
-/// this is THE gate for the patch path. A name that fails policy is dropped.
-fn insert_safe_attr(p: &mut Patch, key: &str, val: &str) {
-    if let Some((k, v)) = crate::html::safe_patch_attr(key, val) {
-        p.attrs.insert(k.to_string(), v.to_string());
+/// this is THE gate for the patch path. A name that fails policy is dropped,
+/// removal included.
+fn insert_safe_attr(p: &mut Patch, key: &str, val: Option<&str>) {
+    if let Some((k, v)) = crate::html::safe_patch_attr(key, val.unwrap_or_default()) {
+        p.attrs.insert(k.to_string(), val.map(|_| v.to_string()));
     }
 }
 
 /// Event-handler delta: an element gaining a handler emits `ipe-<event>` =
 /// `<event>` (the value the client posts back as `msg`, matching `render_html`)
 /// plus a fresh `data-ipe-hid`; an element losing a handler emits
-/// `ipe-<event>` = `""` (remove), and clears `data-ipe-hid` once the last
+/// a removal of `ipe-<event>`, and clears `data-ipe-hid` once the last
 /// handler is gone. Without this, toggling a handler leaves a stale listener
 /// marker and the user's gesture is silently dropped.
 fn diff_events<M>(old: &[Attribute<M>], new: &[Attribute<M>], p: &mut Patch) {
@@ -536,15 +525,15 @@ fn diff_events<M>(old: &[Attribute<M>], new: &[Attribute<M>], p: &mut Patch) {
     let hid = crate::html::HANDLER_ID_ATTR;
     for ev in &nn {
         if !on.contains(ev) {
-            insert_marker_attr(p, &ev_key(ev), ev);
-            insert_marker_attr(p, hid, &id);
+            insert_marker_attr(p, &ev_key(ev), Some(ev));
+            insert_marker_attr(p, hid, Some(&id));
         }
     }
     for ev in &on {
         if !nn.contains(ev) {
-            insert_marker_attr(p, &ev_key(ev), "");
+            insert_marker_attr(p, &ev_key(ev), None);
             if nn.is_empty() {
-                insert_marker_attr(p, hid, "");
+                insert_marker_attr(p, hid, None);
             }
         }
     }
@@ -553,9 +542,9 @@ fn diff_events<M>(old: &[Attribute<M>], new: &[Attribute<M>], p: &mut Patch) {
 /// Insert a listener marker of the event delta through
 /// [`crate::html::patch_marker_attr`]; a program-built attribute takes
 /// [`insert_safe_attr`] instead, which refuses every runtime wire-marker name.
-fn insert_marker_attr(p: &mut Patch, key: &str, val: &str) {
-    if let Some((k, v)) = crate::html::patch_marker_attr(key, val) {
-        p.attrs.insert(k.to_string(), v.to_string());
+fn insert_marker_attr(p: &mut Patch, key: &str, val: Option<&str>) {
+    if let Some((k, v)) = crate::html::patch_marker_attr(key, val.unwrap_or_default()) {
+        p.attrs.insert(k.to_string(), val.map(|_| v.to_string()));
     }
 }
 
@@ -624,8 +613,8 @@ mod tests {
         let p = plain(&a, &b);
         assert_eq!(p.len(), 1);
         let attrs = &p[0].attrs;
-        assert_eq!(attrs.get("class").map(String::as_str), Some("y"));
-        assert_eq!(attrs.get("title").map(String::as_str), Some("t"));
+        assert_eq!(attrs.get("class").map(Option::as_deref), Some(Some("y")));
+        assert_eq!(attrs.get("title").map(Option::as_deref), Some(Some("t")));
     }
 
     #[test]
@@ -680,7 +669,7 @@ mod tests {
         assert_eq!(p.len(), 1);
         // href is still patched (the key passes the name gate) but the
         // dangerous value is neutralised to empty.
-        assert_eq!(p[0].attrs.get("href").map(String::as_str), Some(""));
+        assert_eq!(p[0].attrs.get("href").map(Option::as_deref), Some(Some("")));
     }
 
     #[test]
@@ -693,7 +682,7 @@ mod tests {
     }
 
     #[test]
-    fn diff_bool_attr_add_uses_key_as_value() {
+    fn diff_bool_attr_add_patches_the_painted_value() {
         let mut a: Html<()> = Html::HElement("button".into(), vec![], vec![]);
         let mut b: Html<()> = Html::HElement(
             "button".into(),
@@ -704,10 +693,10 @@ mod tests {
         ids(&mut b);
         let p = plain(&a, &b);
         assert_eq!(p.len(), 1);
-        // present BoolAttr encodes as {k: k}, NOT {k: ""}.
+        // A present BoolAttr patches the value first paint writes, `"true"`.
         assert_eq!(
-            p[0].attrs.get("disabled").map(String::as_str),
-            Some("disabled")
+            p[0].attrs.get("disabled").map(Option::as_deref),
+            Some(Some("true"))
         );
     }
 
@@ -728,12 +717,12 @@ mod tests {
         let p = plain(&a, &b);
         assert_eq!(p.len(), 1);
         assert_eq!(
-            p[0].attrs.get("ipe-click").map(String::as_str),
-            Some("click")
+            p[0].attrs.get("ipe-click").map(Option::as_deref),
+            Some(Some("click"))
         );
         assert_eq!(
-            p[0].attrs.get("data-ipe-hid").map(String::as_str),
-            Some("r")
+            p[0].attrs.get("data-ipe-hid").map(Option::as_deref),
+            Some(Some("r"))
         );
     }
 
@@ -752,9 +741,15 @@ mod tests {
         ids(&mut b);
         let p = plain(&a, &b);
         assert_eq!(p.len(), 1);
-        // Removal sentinel: empty string for both the marker and the (now-stale) hid.
-        assert_eq!(p[0].attrs.get("ipe-click").map(String::as_str), Some(""));
-        assert_eq!(p[0].attrs.get("data-ipe-hid").map(String::as_str), Some(""));
+        // Both the marker and the now-stale hid are removed.
+        assert_eq!(
+            p[0].attrs.get("ipe-click").map(Option::as_deref),
+            Some(None)
+        );
+        assert_eq!(
+            p[0].attrs.get("data-ipe-hid").map(Option::as_deref),
+            Some(None)
+        );
     }
 
     /// A program-built handler id is never patched onto an element: the
@@ -839,7 +834,7 @@ mod tests {
     }
 
     #[test]
-    fn diff_bool_attr_remove_uses_empty_string() {
+    fn diff_bool_attr_remove_patches_a_removal() {
         let mut a: Html<()> = Html::HElement(
             "button".into(),
             vec![Attribute::BoolAttr("disabled".into(), true)],
@@ -850,8 +845,7 @@ mod tests {
         ids(&mut b);
         let p = plain(&a, &b);
         assert_eq!(p.len(), 1);
-        // Removal sentinel: empty string.
-        assert_eq!(p[0].attrs.get("disabled").map(String::as_str), Some(""));
+        assert_eq!(p[0].attrs.get("disabled").map(Option::as_deref), Some(None));
     }
 
     // RT-UI-001: depth cap — diff must return (not abort/stack-overflow) when
@@ -1432,9 +1426,11 @@ mod tests {
         let texts: Vec<&str> = patches.iter().filter_map(|p| p.text.as_deref()).collect();
         assert_eq!(texts, vec!["a{}"], "{patches:?}");
         assert!(
-            patches
-                .iter()
-                .all(|p| p.html.is_none() && !p.attrs.values().any(|v| v.contains(&token))),
+            patches.iter().all(|p| p.html.is_none()
+                && !p
+                    .attrs
+                    .values()
+                    .any(|v| v.as_deref().is_some_and(|v| v.contains(&token)))),
             "{patches:?}"
         );
     }
@@ -1859,5 +1855,73 @@ mod tests {
         let on = with(true);
         assert!(stamp_of(&on, "x").is_some(), "the fixture stamps the input");
         assert_eq!(target(&old, &on), stamp_of(&on, "x"));
+    }
+
+    /// The one attribute value `p`'s single patch carries for `name`.
+    fn patched<'p>(p: &'p [Patch], name: &str) -> Option<Option<&'p str>> {
+        assert_eq!(p.len(), 1, "{p:?}");
+        p.first()?.attrs.get(name).map(Option::as_deref)
+    }
+
+    /// An attribute that appears with an empty value is set to it, as first
+    /// paint writes `name=""`; only a vanished attribute is removed.
+    #[test]
+    fn an_attribute_added_with_an_empty_value_is_set_not_removed() {
+        let button = |attrs: Vec<Attribute<()>>| -> Html<()> {
+            let mut b = Html::HElement("button".into(), attrs, vec![]);
+            ids(&mut b);
+            b
+        };
+        let bare = button(vec![]);
+        let empty = button(vec![
+            Attribute::Attr("autofocus".into(), String::new()),
+            Attribute::Attr("data-mark".into(), String::new()),
+        ]);
+        let p = plain(&bare, &empty);
+        assert_eq!(patched(&p, "autofocus"), Some(Some("")));
+        assert_eq!(patched(&p, "data-mark"), Some(Some("")));
+        assert!(crate::html::render_html(&empty).contains(" data-mark=\"\""));
+        let p = plain(&empty, &bare);
+        assert_eq!(patched(&p, "autofocus"), Some(None));
+        assert_eq!(patched(&p, "data-mark"), Some(None));
+    }
+
+    /// On the wire a set is a string, the empty one included, and a removal is
+    /// `null`, so no value an attribute can hold reads as a removal.
+    #[cfg(all(feature = "serde", feature = "json"))]
+    #[test]
+    fn a_removal_is_null_on_the_wire_and_an_empty_set_is_a_string() {
+        let mut p = Patch::for_id("r");
+        p.attrs.insert("gone".into(), None);
+        p.attrs.insert("empty".into(), Some(String::new()));
+        let wire = serde_json::to_value(&p).unwrap_or_default();
+        assert_eq!(wire["attrs"]["gone"], serde_json::Value::Null, "{wire}");
+        assert_eq!(wire["attrs"]["empty"], serde_json::json!(""), "{wire}");
+        assert_eq!(wire["attrs"].as_object().map(serde_json::Map::len), Some(2));
+    }
+
+    /// A repeated `style` or `class` patches the merged value first paint
+    /// writes, never only the last one.
+    #[test]
+    fn a_merged_multi_valued_attribute_patches_the_painted_value() {
+        let div = |attrs: Vec<Attribute<()>>| -> Html<()> {
+            let mut d = Html::HElement("div".into(), attrs, vec![]);
+            ids(&mut d);
+            d
+        };
+        let old = div(vec![Attribute::Attr("style".into(), "a: 1".into())]);
+        let new = div(vec![
+            Attribute::Attr("style".into(), "a: 1".into()),
+            Attribute::Attr("style".into(), "b: 2".into()),
+            Attribute::Attr("class".into(), "x".into()),
+            Attribute::Attr("class".into(), "y".into()),
+        ]);
+        let p = plain(&old, &new);
+        assert_eq!(patched(&p, "style"), Some(Some("a: 1; b: 2")));
+        assert_eq!(patched(&p, "class"), Some(Some("x y")));
+        let painted = crate::html::render_html(&new);
+        assert!(painted.contains(" class=\"x y\""), "{painted}");
+        assert!(painted.contains(" style=\"a: 1; b: 2\""), "{painted}");
+        assert!(plain(&new, &new.clone()).is_empty());
     }
 }

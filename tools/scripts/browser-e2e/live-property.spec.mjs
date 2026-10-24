@@ -78,9 +78,38 @@ test("checkbox: a removed checked attribute unchecks a box the user checked", as
   await box.click();
   await expect(box).toBeChecked();
   await box.blur();
-  await pushPatches(page, [{ id: "e2e-box", attrs: { checked: "" } }]);
+  await pushPatches(page, [{ id: "e2e-box", attrs: { checked: null } }]);
   await expect(box).not.toBeChecked();
   expect(await box.evaluate((el) => el.hasAttribute("checked"))).toBe(false);
+  expect(errors.map(String)).toEqual([]);
+});
+
+test("checkbox: an attribute set to the empty value is present, never removed", async ({ page }) => {
+  const errors = [];
+  page.on("pageerror", (e) => errors.push(e));
+  await load(page);
+  await addToRoot(page, '<input type="checkbox" id="ipe-e2e-empty" ipe-id="e2e-empty">');
+  const box = page.locator("#ipe-e2e-empty");
+  await expect(box).not.toBeChecked();
+  await pushPatches(page, [{ id: "e2e-empty", attrs: { checked: "", "data-mark": "" } }]);
+  await expect(box).toBeChecked();
+  expect(await box.evaluate((el) => [el.getAttribute("checked"), el.getAttribute("data-mark")])).toEqual([
+    "",
+    "",
+  ]);
+  expect(errors.map(String)).toEqual([]);
+});
+
+test("patch: an attribute value that is neither a string nor null is refused", async ({ page }) => {
+  const errors = [];
+  page.on("pageerror", (e) => errors.push(e));
+  await load(page);
+  await addToRoot(page, '<span id="ipe-e2e-shape" ipe-id="e2e-shape" title="kept">x</span>');
+  const el = page.locator("#ipe-e2e-shape");
+  await pushPatches(page, [{ id: "e2e-shape", attrs: { title: 5, lang: { a: 1 }, dir: true } }]);
+  expect(
+    await el.evaluate((n) => [n.getAttribute("title"), n.hasAttribute("lang"), n.hasAttribute("dir")]),
+  ).toEqual(["kept", false, false]);
   expect(errors.map(String)).toEqual([]);
 });
 
@@ -101,7 +130,7 @@ test("option: a removed selected attribute deselects an option a script selected
     el.selected = false;
     el.selected = true;
   });
-  await pushPatches(page, [{ id: "e2e-opt", attrs: { selected: "" } }]);
+  await pushPatches(page, [{ id: "e2e-opt", attrs: { selected: null } }]);
   expect(await opt.evaluate((el) => el.selected)).toBe(false);
   expect(await opt.evaluate((el) => el.hasAttribute("selected"))).toBe(false);
   expect(errors.map(String)).toEqual([]);

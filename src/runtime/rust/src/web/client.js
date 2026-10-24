@@ -1732,9 +1732,13 @@ function __ipeApplyPatches(patches) {
         }
         var prop = Object.prototype.hasOwnProperty.call(__IPE_LIVE_PROPS, k)
             ? __IPE_LIVE_PROPS[k] : null;
-        if (v === "") {
+        // A removal crosses as null; a set as a string, the empty string
+        // included. Any other shape is refused.
+        if (v === null) {
           __ipeNode.removeAttr(el, k);
           if (prop !== null) el[prop] = false;
+        } else if (typeof v !== "string") {
+          continue;
         } else {
           __ipeNode.setAttr(el, k, v);
           // Sync DOM properties that don't reflect from attrs.

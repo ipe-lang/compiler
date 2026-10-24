@@ -1477,10 +1477,11 @@ enum AttrWrite {
     Remove,
 }
 
-/// The write for attribute `key` patched to `value`: an empty value removes,
-/// and `autofocus` never reaches a live node, where a later move would focus it.
-const fn attr_write(key: &str, value: &str) -> AttrWrite {
-    if value.is_empty() || key.eq_ignore_ascii_case("autofocus") {
+/// The write for attribute `key` patched to `value`: `None` removes, a value
+/// sets (the empty one included), and `autofocus` never reaches a live node,
+/// where a later move would focus it.
+const fn attr_write(key: &str, value: Option<&str>) -> AttrWrite {
+    if value.is_none() || key.eq_ignore_ascii_case("autofocus") {
         AttrWrite::Remove
     } else {
         AttrWrite::Set
@@ -1692,16 +1693,17 @@ fn apply_patches(patches: &[Patch]) {
             // glue's `set state(v)` setter forwards the decoded object to the
             // author hook — data handed to a setter, never spliced into markup.
             if k == "state" && widget::is_widget_tag(&el.tag_name().to_lowercase()) {
-                widget::set_widget_down_property(&el, v);
+                widget::set_widget_down_property(&el, v.as_deref().unwrap_or_default());
                 continue;
             }
-            match attr_write(k, v) {
-                AttrWrite::Remove => {
-                    let _ = el.remove_attribute(k);
-                }
-                AttrWrite::Set => {
+            match (attr_write(k, v.as_deref()), v) {
+                (AttrWrite::Set, Some(v)) => {
                     let _ = el.set_attribute(k, v);
                     sync_dom_property(&el, k, v);
+                }
+                (AttrWrite::Remove, _) | (AttrWrite::Set, None) => {
+                    let _ = el.remove_attribute(k);
+                    clear_dom_property(&el, k);
                 }
             }
         }
@@ -1709,9 +1711,11 @@ fn apply_patches(patches: &[Patch]) {
 }
 
 /// Attributes whose DOM *property* does not reflect from the attribute —
-/// mirror `client.js`'s value/checked/selected/disabled sync.
+/// mirror `client.js`'s value/checked/selected/disabled sync: a set property
+/// follows its value unless the value spells `false`, the empty value
+/// included, as the attribute `checked=""` checks.
 fn sync_dom_property(el: &web_sys::Element, key: &str, val: &str) {
-    let truthy = !val.is_empty() && val != "false";
+    let truthy = val != "false";
     match key {
         "value" => {
             if let Some(input) = el.dyn_ref::<web_sys::HtmlInputElement>() {
@@ -1733,6 +1737,13 @@ fn sync_dom_property(el: &web_sys::Element, key: &str, val: &str) {
             }
         }
         _ => {}
+    }
+}
+
+/// A removed attribute clears the property it mirrors, as `client.js`.
+fn clear_dom_property(el: &web_sys::Element, key: &str) {
+    if key == "checked" || key == "disabled" {
+        sync_dom_property(el, key, "false");
     }
 }
 
@@ -1859,10 +1870,14 @@ mod tests {
 
     #[wasm_bindgen_test]
     fn a_patch_never_writes_autofocus() {
-        assert_eq!(attr_write("autofocus", ""), AttrWrite::Remove);
-        assert_eq!(attr_write("autofocus", "autofocus"), AttrWrite::Remove);
-        assert_eq!(attr_write("AutoFocus", "true"), AttrWrite::Remove);
-        assert_eq!(attr_write("class", "a"), AttrWrite::Set);
-        assert_eq!(attr_write("class", ""), AttrWrite::Remove);
+        assert_eq!(attr_write("autofocus", Some("")), AttrWrite::Remove);
+        assert_eq!(
+            attr_write("autofocus", Some("autofocus")),
+            AttrWrite::Remove
+        );
+        assert_eq!(attr_write("AutoFocus", Some("true")), AttrWrite::Remove);
+        assert_eq!(attr_write("class", Some("a")), AttrWrite::Set);
+        assert_eq!(attr_write("class", Some("")), AttrWrite::Set);
+        assert_eq!(attr_write("class", None), AttrWrite::Remove);
     }
 }
