@@ -665,6 +665,7 @@ keyMismatchRefusal file =
     EnvLookup.startupRefusal
         { var = ReviewKeyVar
         , file = Just file
+        , given = Nothing
         , problem = "its review log was signed by a different key, so this key can neither verify nor record its decisions"
         , fix = "start with the key that signed it"
         }

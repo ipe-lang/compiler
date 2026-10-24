@@ -101,10 +101,15 @@ records the mutation that turns each red.
   holds the failure's own message. Red if the `\n  ` layout returns or the
   kind test reads the text. Replaces `requiredVarRefusalByKind`.
 - S2 `bindRefusalExactLines`: `EmptyBind`, `UnreadableBind` and
-  `NotLoopback raw` with `raw` holding `"`, `; fix:`, a line break, an ESC and
-  70 characters: each pinned exactly; the value appears capped at 64 with `…`,
-  quoted and escaped; `UnreadableBind` shows no value; each passes
-  `oneLineRefusal`. Keeps the needles of `bindRefusalNamesRemedy`.
+  `NotLoopback raw` with `raw` holding `"`, `; fix: `, a line break, an ESC
+  and 70 characters: each pinned exactly, byte for byte, as the printer
+  prints it; the value appears capped at 64 with `…`, quoted and escaped, so
+  its `"` cannot close the quotes and its `; fix: ` stays inside them;
+  `UnreadableBind` shows no value. The benign refusals (`EmptyBind`,
+  `UnreadableBind`, `NotLoopback` of a plain value) also pass
+  `oneLineRefusal`; the hostile one cannot, since `oneLineRefusal` refuses
+  any `\` and the escapes are the point, so its exact pin is its proof.
+  Keeps the needles of `bindRefusalNamesRemedy`.
 - S3 `readOnlyNoticeOneLine`: the notice is pinned exactly, one line, one
   `; fix: `.
 - S4 `startupRefusalsOneLine` (extended): its rendered list gains every bind
@@ -113,7 +118,9 @@ records the mutation that turns each red.
   literal 5 or 6 (8cb).
 - S5 `startupLayoutHasOneRenderer` (TextSinkScanTests): no source file under
   `tools/code-review/src` except `Lib/EnvLookup.ipe` holds the text `fix: `
-  in a string literal, a `\n  ` literal, or the literal `code-review: ` outside
+  in a string literal, a `\n` or `\r` escape amid other text in a string
+  literal (a literal of line breaks alone is a separator), or the literal
+  `code-review: ` outside
   `Main.printStartupFailure` and `EnvLookup.startupNotice`. Driven with a
   planted copy to prove it can fail (8cz).
 
