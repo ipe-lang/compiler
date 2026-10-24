@@ -1,0 +1,31 @@
+module Main exposing (main)
+
+-- SEAL probe: a lambda capturing a caller-generic value, passed to a user
+-- function's direct callback slot. `runWith`'s callback renders as
+-- `FN1: Fn(..) -> i64 + Send + Sync + 'static`, so the closure `countOf`
+-- builds over its `xs : List a` is `Send + Sync` only when `a` is; `countOf`'s
+-- clause must carry that capture obligation, or the emitted crate is
+-- ipe-accepted but fails `cargo build` with E0277.
+--
+-- Output: the counts at two instantiations of `a`.
+
+import Ipe.Error exposing (Error)
+import Ipe.Io as Io
+import Ipe.List as List
+import Ipe.String as String
+import Ipe.Task as Task exposing (Task)
+
+
+runWith : ({} -> Int) -> Int
+runWith f =
+    f {}
+
+
+countOf : List a -> Int
+countOf xs =
+    runWith (\_ -> List.length xs)
+
+
+main : Task Error ()
+main =
+    Io.println (String.fromInt (countOf [ 1, 2, 3 ]) ++ " " ++ String.fromInt (countOf [ "a" ]))

@@ -593,6 +593,30 @@ mod tests {
         Some((func, i))
     }
 
+    /// Lower a free-standing module and return the [`ipe_ir::Func`] of `which`,
+    /// or the stage that refused it.
+    ///
+    /// A test reading bounds off the result must fail on the stage, never read
+    /// a refusal as "no bound".
+    fn lower_func_staged(source: &str, which: &str) -> Result<(ipe_ir::Func, Interner), String> {
+        let mut i = Interner::new();
+        let src = ipe_parse::parse_module(source, &mut i).map_err(|e| format!("parse: {e:?}"))?;
+        let m = ipe_canon::canonicalise(&src, &mut i).map_err(|e| format!("canon: {e:?}"))?;
+        let types = ipe_types::infer(&m, &mut i).map_err(|e| format!("infer: {e:?}"))?;
+        let program = lower(&m, &types, &mut i, "", "").map_err(|e| format!("lower: {e:?}"))?;
+        let module = program
+            .modules
+            .into_iter()
+            .next()
+            .ok_or_else(|| "no module".to_owned())?;
+        let func = module
+            .funcs
+            .into_iter()
+            .find(|f| i.resolve(f.name) == Some(which))
+            .ok_or_else(|| format!("no func `{which}`"))?;
+        Ok((func, i))
+    }
+
     #[test]
     fn tuple_parameter_lowers_to_synthetic_binder_plus_destructure() {
         // `fst (a, b) = a` — the tuple parameter has no single name, so it
@@ -724,8 +748,12 @@ mod tests {
         let Some(&(param_sym, bounds)) = func.type_params.first() else {
             return;
         };
-        // A structurally-parametric variable carries no bounds.
-        assert!(bounds.is_unbounded(), "wrap's `a` is an unbounded generic");
+        // A structurally-parametric variable carries only the value-semantics `Clone`.
+        assert_eq!(
+            bounds,
+            ipe_ir::BoundSet::UNBOUNDED.with_clone(),
+            "wrap's `a` is bounded by `Clone` alone"
+        );
         // The single parameter is `IrType::Generic(a)`.
         assert!(
             matches!(func.params.first(), Some(ipe_ir::Param { ty: IrType::Generic(s), .. }) if *s == param_sym),
@@ -1379,6 +1407,191 @@ mod tests {
                 })
             ),
             "an `any` row param in call-arg position must be IPE-L0131, got {err:?}"
+        );
+    }
+
+    /// The finalized bounds of the generic named `name` in `func`.
+    fn generic_bounds(func: &ipe_ir::Func, i: &Interner, name: &str) -> Option<ipe_ir::BoundSet> {
+        func.type_params
+            .iter()
+            .find(|(sym, _)| i.resolve(*sym) == Some(name))
+            .map(|(_, bounds)| *bounds)
+    }
+
+    /// Whether `name`'s generic `var` in `source` carries `Send + 'static` after lowering.
+    fn generic_is_send(source: &str, name: &str, var: &str) -> bool {
+        lower_func(source, name)
+            .and_then(|(func, i)| generic_bounds(&func, &i, var))
+            .is_some_and(|bounds| bounds.has_send() && bounds.has_static())
+    }
+
+    /// The generic-key shape: `cardKey` forwards its `card` and `panel`, with a
+    /// constructor as the callback, into `onCard`, whose variables sit under a
+    /// function parameter. The callee's `Send + 'static` must reach the caller.
+    #[test]
+    fn forwarder_into_callback_helper_inherits_send() {
+        let src = "module Main exposing (cardKey)\n\
+                   type KeyAction card panel = ApproveSelected card | RefuseSelected card | Select Int | ConfirmRefuse panel | Ignore\n\
+                   cardKey : Maybe card -> Int -> String -> KeyAction card panel\n\
+                   cardKey card at key =\n\
+                   \x20   case key of\n\
+                   \x20       \"a\" -> onCard ApproveSelected card\n\
+                   \x20       \"r\" -> onCard RefuseSelected card\n\
+                   \x20       \"s\" -> Select at\n\
+                   \x20       _ -> Ignore\n\
+                   onCard : (card -> KeyAction card panel) -> Maybe card -> KeyAction card panel\n\
+                   onCard act card =\n\
+                   \x20   case card of\n\
+                   \x20       Just drawn -> act drawn\n\
+                   \x20       Nothing -> Ignore\n";
+        assert!(
+            generic_is_send(src, "onCard", "card") && generic_is_send(src, "onCard", "panel"),
+            "a generic under a callback parameter must carry `Send + 'static` in the IR"
+        );
+        assert!(
+            generic_is_send(src, "cardKey", "card") && generic_is_send(src, "cardKey", "panel"),
+            "`cardKey` instantiates `onCard`'s bounded generics and must inherit `Send + 'static`"
+        );
+    }
+
+    /// A chain `twice -> tagged -> label` where only `label` takes a callback:
+    /// the bound must travel two calls back.
+    #[test]
+    fn transitive_forwarders_inherit_send() {
+        let src = "module Main exposing (twice)\n\
+                   label : (x -> Int) -> x -> Int\n\
+                   label weigh v =\n\
+                   \x20   weigh v + 1\n\
+                   tagged : x -> Int\n\
+                   tagged v =\n\
+                   \x20   label (\\_ -> 1) v\n\
+                   twice : x -> Int\n\
+                   twice v =\n\
+                   \x20   tagged v + tagged v\n";
+        assert!(
+            generic_is_send(src, "tagged", "x"),
+            "`tagged` forwards into `label`'s callback-bound generic"
+        );
+        assert!(
+            generic_is_send(src, "twice", "x"),
+            "`twice` reaches `label` only through `tagged` and must still inherit `Send`"
+        );
+    }
+
+    /// Mutual recursion: `odds` forwards only into `evens`, and `evens` into a
+    /// callback-taking helper; both must end the fixpoint bounded.
+    #[test]
+    fn mutually_recursive_forwarders_inherit_send() {
+        let src = "module Main exposing (evens)\n\
+                   count : (x -> Int) -> x -> Int\n\
+                   count weigh v =\n\
+                   \x20   weigh v\n\
+                   evens : List x -> Int\n\
+                   evens xs =\n\
+                   \x20   case xs of\n\
+                   \x20       [] -> 0\n\
+                   \x20       y :: rest -> count (\\_ -> 1) y + odds rest\n\
+                   odds : List x -> Int\n\
+                   odds xs =\n\
+                   \x20   case xs of\n\
+                   \x20       [] -> 0\n\
+                   \x20       _ :: rest -> evens rest\n";
+        assert!(
+            generic_is_send(src, "evens", "x"),
+            "`evens` forwards into `count`"
+        );
+        assert!(
+            generic_is_send(src, "odds", "x"),
+            "`odds` forwards only into `evens` and must inherit its bound"
+        );
+    }
+
+    /// A `Task`-returning function's row variable carries `Send + 'static`,
+    /// and a caller forwarding that record into it is refused at ipe time.
+    ///
+    /// The refusal is what keeps a forwarder's clause from missing the bound:
+    /// a row value read anywhere but as a field receiver is IPE-L0131. The
+    /// fixture reaches `Task` through a kernel qualifier (`Ipe.Process`),
+    /// since the single-module harness resolves no compiled-source module.
+    #[test]
+    fn task_returning_row_variable_inherits_send() {
+        let greet = "module Main exposing (greet)\n\
+                     import Ipe.Process as Process\n\
+                     greet : { r | name : String } -> Task Error String\n\
+                     greet rec =\n\
+                     \x20   Process.run rec.name []\n";
+        let bounds = lower_func_staged(greet, "greet")
+            .map(|(func, _)| func.row_params.first().map(|row| row.bounds));
+        assert!(
+            matches!(bounds, Ok(Some(b)) if b.has_send() && b.has_static()),
+            "a `Task`-returning function's row variable must carry `Send + 'static` in the IR, got {bounds:?}"
+        );
+        let forwarded = lower_result(
+            "module Main exposing (greetings)\n\
+             import Ipe.Process as Process\n\
+             greet : { r | name : String } -> Task Error String\n\
+             greet rec =\n\
+             \x20   Process.run rec.name []\n\
+             greetings : { r | name : String } -> List (Task Error String)\n\
+             greetings rec =\n\
+             \x20   [ greet rec, greet rec ]\n",
+        );
+        assert!(
+            matches!(
+                forwarded,
+                Err(Diagnostic::Lower {
+                    msg: LowerError::Unsupported(Feature::RowPolyRecordAnnotation),
+                    ..
+                })
+            ),
+            "a row value forwarded into another function must be IPE-L0131, got {forwarded:?}"
+        );
+    }
+
+    /// A forwarder whose callee is bounded only by its return's UI message:
+    /// `label` inspects `badge`, whose `msg` needs `'static`.
+    ///
+    /// `Html` is the builtin type constructor, so the fixture needs no
+    /// compiled-source module the single-module harness cannot resolve.
+    #[test]
+    fn forwarder_into_ui_message_helper_inherits_static() {
+        let src = "module Main exposing (label)\n\
+                   badge : Maybe msg -> Html msg\n\
+                   badge m =\n\
+                   \x20   badge m\n\
+                   label : Maybe msg -> String\n\
+                   label m =\n\
+                   \x20   case badge m of\n\
+                   \x20       _ ->\n\
+                   \x20           \"badge\"\n";
+        let msg_bounds = |name: &str| {
+            lower_func_staged(src, name).map(|(func, i)| generic_bounds(&func, &i, "msg"))
+        };
+        let badge = msg_bounds("badge");
+        assert!(
+            matches!(badge, Ok(Some(b)) if b.has_static()),
+            "a UI-carrier message generic must carry `'static` in the IR, got {badge:?}"
+        );
+        let label = msg_bounds("label");
+        assert!(
+            matches!(label, Ok(Some(b)) if b.has_static()),
+            "`label` instantiates `badge`'s `'static` message and must inherit it, got {label:?}"
+        );
+    }
+
+    /// A pure generic with no callback, `Task` return, or UI carrier keeps
+    /// `Clone` alone: the shape rules never over-bound.
+    #[test]
+    fn plain_generic_gains_no_auto_trait() {
+        let opt = lower_func(
+            "module Main exposing (pick)\npick : x -> x -> x\npick a b =\n    a\n",
+            "pick",
+        );
+        let bounds = opt.and_then(|(func, i)| generic_bounds(&func, &i, "x"));
+        assert_eq!(
+            bounds,
+            Some(ipe_ir::BoundSet::UNBOUNDED.with_clone()),
+            "a plain generic must stay `Clone`-only"
         );
     }
 }

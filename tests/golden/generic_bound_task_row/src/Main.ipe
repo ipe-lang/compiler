@@ -1,0 +1,25 @@
+module Main exposing (main)
+
+-- SEAL repro: a row-polymorphic record read inside a `Task`-returning
+-- function. `greet` returns a `Task`, so the lowerer's signature rule gives its
+-- row variable `Send + 'static`, and the emitted clause carries exactly that
+-- set. A record forwarded on into another function is refused at ipe time
+-- (IPE-L0131), so no caller clause can miss the bound.
+--
+-- Output: the greetings for two records of different shapes.
+
+import Ipe.Error exposing (Error)
+import Ipe.Io as Io
+import Ipe.String as String
+import Ipe.Task as Task exposing (Task)
+
+
+greet : { r | name : String } -> Task Error String
+greet rec =
+    Task.succeed ("hi " ++ rec.name)
+
+
+main : Task Error ()
+main =
+    Task.sequence [ greet { name = "Ada" }, greet { name = "Bo", age = 3 } ]
+        |> Task.andThen (\greetings -> Io.println (String.join "," greetings))

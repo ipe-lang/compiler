@@ -102,7 +102,7 @@ pub(super) fn ty_has_fun_in_derive_carrier(interner: &Interner, ty: &Ty) -> bool
 /// Does instantiating a generic type parameter to `ty` make the emitted Rust
 /// generic parameter's unconditional `Clone` bound unsatisfiable?
 ///
-/// A generic user function emits `fn f<T1: Clone>(..)` (`render_fn_generics`
+/// A generic user function emits `fn f<T1: Clone>(..)` (`apply_signature_shape_bounds`
 /// injects `Clone` on every type parameter, and generic composite structs
 /// derive `Clone` with a `T1: Clone` bound). A function value instantiating
 /// that parameter lowers to a `Box<dyn Fn>` — which is not `Clone` — so the

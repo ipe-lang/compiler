@@ -1,0 +1,40 @@
+module Main exposing (main)
+
+-- SEAL repro: a chain of forwarders `twice -> tagged -> label` where only
+-- `label` takes a callback. `label`'s `x` sits under a function parameter and
+-- needs `Send + 'static`; `tagged` forwards its `x` into `label`, and `twice`
+-- reaches `label` only through `tagged`. The bound must travel two calls back,
+-- or the emitted crate is ipe-accepted but fails `cargo build` with E0277.
+--
+-- Output: one line per instantiation of `x`.
+
+import Ipe.Error exposing (Error)
+import Ipe.Io as Io
+import Ipe.String as String
+import Ipe.Task as Task exposing (Task)
+
+
+label : (x -> String) -> x -> String
+label show v =
+    "<" ++ show v ++ ">"
+
+
+tagged : x -> String
+tagged v =
+    label (\_ -> "item") v
+
+
+twice : x -> String
+twice v =
+    tagged v ++ tagged v
+
+
+main : Task Error ()
+main =
+    Io.println
+        (String.join "\n"
+            [ twice "a"
+            , twice 1
+            , twice { n = 2 }
+            ]
+        )
