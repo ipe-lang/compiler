@@ -935,6 +935,17 @@ static HAND_TABLE: &[EnvVar] = &[
         subsystem: Subsystem::File,
         class: Class::Tunable,
     },
+    EnvVar {
+        name: "IPE_PROCESS_TIMEOUT",
+        default: Cow::Borrowed("3600 (1 h)"),
+        purpose: "Wall-clock ceiling on one `Process.run`, `runWith` or `runInPty` \
+                  call, in whole seconds or `h`/`m`/`s` segments (`30m`, `1h30m`); \
+                  at most 24 hours. A child still running when it expires is killed \
+                  and the call fails with a `Timeout` error, so a hung child cannot \
+                  pin a worker forever.",
+        subsystem: Subsystem::File,
+        class: Class::Tunable,
+    },
     // ── Runtime ───────────────────────────────────────────────────────────────
     EnvVar {
         name: "IPE_HOME",
@@ -1406,6 +1417,20 @@ mod tests {
         assert!(
             entry.is_some_and(|v| v.default.starts_with(&expected)),
             "IPE_FILE_READ_MAX default must start with {expected:?}: {entry:?}"
+        );
+    }
+
+    /// The documented `IPE_PROCESS_TIMEOUT` default is the enforced runtime const.
+    #[test]
+    fn process_timeout_default_matches_runtime() {
+        let entry = ENV_VARS.iter().find(|v| v.name == "IPE_PROCESS_TIMEOUT");
+        let expected = format!(
+            "{} ",
+            ipe_runtime_rust::system::PROCESS_WALL_CEILING.default_value()
+        );
+        assert!(
+            entry.is_some_and(|v| v.default.starts_with(&expected)),
+            "IPE_PROCESS_TIMEOUT default must start with {expected:?}: {entry:?}"
         );
     }
 

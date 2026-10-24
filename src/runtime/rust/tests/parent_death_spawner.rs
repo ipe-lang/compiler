@@ -6,7 +6,9 @@
 //! 1. a child requested from a thread that has since exited (a plain
 //!    `std::thread`, or a reaped tokio blocking-pool thread) stays alive;
 //! 2. a child whose parent PROCESS is `SIGKILL`ed dies with it;
-//! 3. the tokio entry point refuses outside a runtime rather than spawning.
+//! 3. the tokio entry point refuses outside a runtime rather than spawning;
+//! 4. the `Process.*` kernels spawn through the floor, so their children die
+//!    with the Ipê process too.
 #![cfg(target_os = "linux")]
 
 use ipe_runtime_rust::system::spawn_hardened;
@@ -137,28 +139,122 @@ fn a_hardened_child_dies_with_its_killed_parent() {
         let grandchild = grandchild.expect("the probe must report its hardened child's pid");
         let identity = identity.expect("the hardened child must be running before its parent dies");
 
-        let killed = Instant::now();
-        let died = loop {
-            match ProcStat::read(grandchild) {
-                None => break true,
-                Some(current) if !identity.same_process(&current) || current.state == 'Z' => {
-                    break true;
-                }
-                Some(_) if killed.elapsed() >= POLL_CEILING => break false,
-                Some(_) => std::thread::sleep(Duration::from_millis(20)),
-            }
-        };
-        // Kill only the process first observed: a reused pid belongs to someone else.
-        let still_ours =
-            ProcStat::read(grandchild).is_some_and(|current| identity.same_process(&current));
-        if !died && still_ours {
-            let _ = Command::new("/bin/kill")
-                .args(["-KILL", &grandchild.to_string()])
-                .status();
-        }
         assert!(
-            died,
+            died_after_parent(grandchild, &identity),
             "a hardened child must die when its parent process is killed"
+        );
+    }
+}
+
+/// Whether `pid`, first seen as `identity`, dies within `POLL_CEILING` of its
+/// parent's death; a survivor is killed so no test leaves a 30 s sleeper behind.
+fn died_after_parent(pid: u32, identity: &ProcStat) -> bool {
+    let killed = Instant::now();
+    let died = loop {
+        match ProcStat::read(pid) {
+            None => break true,
+            Some(current) if !identity.same_process(&current) || current.state == 'Z' => {
+                break true;
+            }
+            Some(_) if killed.elapsed() >= POLL_CEILING => break false,
+            Some(_) => std::thread::sleep(Duration::from_millis(20)),
+        }
+    };
+    // Kill only the process first observed: a reused pid belongs to someone else.
+    let still_ours = ProcStat::read(pid).is_some_and(|current| identity.same_process(&current));
+    if !died && still_ours {
+        let _ = Command::new("/bin/kill")
+            .args(["-KILL", &pid.to_string()])
+            .status();
+    }
+    died
+}
+
+/// The `Process.*` kernels spawn through the floor: a `runWith` child dies
+/// with the Ipê process that ran it.
+mod process_kernel {
+    use super::{POLL_CEILING, ProcStat, died_after_parent};
+    use ipe_runtime_rust::IpeMaybe;
+    use ipe_runtime_rust::system::{ProcessRunWithCfg, process_run_with};
+    use std::process::{Command, Stdio};
+    use std::time::{Duration, Instant};
+
+    /// Set on the re-executed probe; its value is the mark the probe hands its
+    /// kernel child under `CHILD_MARK_ENV`, so only that child carries it.
+    const PROBE_MARK_ENV: &str = "IPE_PDEATH_KERNEL_PROBE";
+    const CHILD_MARK_ENV: &str = "IPE_PDEATH_KERNEL_CHILD";
+
+    /// The pid of a live process whose initial environment carries `entry`.
+    fn pid_with_env_entry(entry: &str) -> Option<u32> {
+        std::fs::read_dir("/proc")
+            .ok()?
+            .filter_map(Result::ok)
+            .find_map(|dir| {
+                let pid: u32 = dir.file_name().to_str()?.parse().ok()?;
+                let environ = std::fs::read(dir.path().join("environ")).ok()?;
+                environ
+                    .split(|byte| *byte == 0)
+                    .any(|var| var == entry.as_bytes())
+                    .then_some(pid)
+            })
+    }
+
+    #[test]
+    fn a_process_run_with_child_dies_with_its_killed_parent() {
+        #[allow(clippy::disallowed_methods)]
+        // an integration test has no crate-private env accessor
+        let probe_mark = std::env::var(PROBE_MARK_ENV).ok();
+        if let Some(mark) = probe_mark {
+            // Probe mode: run the kernel on a sleeper that outlives this probe,
+            // which the outer test SIGKILLs.
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("runtime");
+            let cfg = ProcessRunWithCfg {
+                command: "/bin/sleep".to_owned(),
+                args: vec!["30".to_owned()],
+                cwd: IpeMaybe::Nothing,
+                env: vec![(CHILD_MARK_ENV.to_owned(), mark)],
+            };
+            let _ = rt.block_on(process_run_with::<String>(cfg));
+            return;
+        }
+
+        let mark = format!("pdeath-kernel-{}", std::process::id());
+        let entry = format!("{CHILD_MARK_ENV}={mark}");
+        let mut probe = Command::new(std::env::current_exe().expect("test binary"))
+            .args([
+                "process_kernel::a_process_run_with_child_dies_with_its_killed_parent",
+                "--exact",
+            ])
+            .env(PROBE_MARK_ENV, &mark)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("re-exec probe");
+
+        let waited = Instant::now();
+        let child = loop {
+            if let Some(pid) = pid_with_env_entry(&entry) {
+                break Some(pid);
+            }
+            if waited.elapsed() >= POLL_CEILING {
+                break None;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        // Captured before the probe dies, while the pid names the kernel's child.
+        let identity = child.and_then(ProcStat::read);
+        let _ = probe.kill();
+        let _ = probe.wait();
+        let child = child.expect("the kernel's child must appear while the probe runs");
+        let identity = identity.expect("the kernel's child must be running before its parent dies");
+
+        assert!(
+            died_after_parent(child, &identity),
+            "a Process.runWith child must die when its Ipê process is killed"
         );
     }
 }
