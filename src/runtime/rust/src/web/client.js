@@ -521,7 +521,10 @@ function __ipeInputEntry(sid) {
   if (!e) {
     e = __ipeInputs[sid] = {
       liveValue: "", lastSentSeq: 0, lastAckedSeq: 0,
-      pendingDebounceId: null, pendingSend: null
+      pendingDebounceId: null, pendingSend: null,
+      // The value a refused event carried for this input, or null. While the
+      // input still shows it, no later event carries it.
+      refusedValue: null
     };
   }
   return e;
@@ -530,13 +533,16 @@ function __ipeInputEntry(sid) {
 // __ipeInputsSnapshot — dirty-input projection bundled into every
 // outgoing event. Only entries whose user-typed value is newer than
 // the server's latest ack are included, so the wire stays compact
-// when the client and server agree.
+// when the client and server agree. A value the server refused is left out
+// until the user edits it: the refusal would otherwise ride on every event.
 function __ipeInputsSnapshot() {
   var out = null;
   var ids = Object.keys(__ipeInputs);
   for (var i = 0; i < ids.length; i++) {
     var e = __ipeInputs[ids[i]];
+    if (e.refusedValue !== null && e.refusedValue !== e.liveValue) e.refusedValue = null;
     if (e.lastSentSeq <= e.lastAckedSeq) continue;
+    if (e.refusedValue !== null) continue;
     if (!out) out = {};
     out[ids[i]] = {value: e.liveValue, seq: e.lastSentSeq};
   }
@@ -1524,8 +1530,39 @@ var __ipeReconnectSince = 0;
 // __ipeRetryBaseMs / __ipeRetryMaxMs / __ipeRetryMaxAttempts /
 // __ipeEventQueueMax are templated at the top of this script from
 // the IPE_WEB_RETRY_* / IPE_WEB_QUEUE_MAX env vars.
-function __ipePostEvent(body) {
+// The outcomes an answer to an event POST can have. Each has one handler in
+// __ipePostEvent; a network failure is TRANSIENT through its `.catch`.
+var __IPE_EVENT_ANSWER = Object.freeze({
+  ACCEPTED: "accepted", STALE: "stale", SESSION_LOST: "session-lost",
+  TRANSIENT: "transient", TOO_LARGE: "too-large", REFUSED: "refused"
+});
+// The one reading of an event answer's status. A status no row names is
+// REFUSED: the client says so and never sends the event again, since a retry
+// of a refusal is refused again.
+function __ipeEventAnswer(r) {
+  var status = r.status;
+  var marked = r.headers.get("X-Ipe-Web") === "1";
+  if (marked && status === 409) return __IPE_EVENT_ANSWER.STALE;
+  if (marked && status === 404) return __IPE_EVENT_ANSWER.SESSION_LOST;
+  if (status >= 200 && status < 300) return __IPE_EVENT_ANSWER.ACCEPTED;
+  if (status === 408 || status === 425 || status === 429) return __IPE_EVENT_ANSWER.TRANSIENT;
+  if (status >= 500 && status < 600) return __IPE_EVENT_ANSWER.TRANSIENT;
+  if (status === 413 || status === 414 || status === 431) return __IPE_EVENT_ANSWER.TOO_LARGE;
+  return __IPE_EVENT_ANSWER.REFUSED;
+}
+// True while a queued event is posted and unanswered. Queued events go one at
+// a time, so a later one never reaches the server before an earlier one.
+var __ipeQueueInFlight = false;
+// `fromQueue` marks the head of the retry queue. A live event posted while
+// the queue holds or posts events joins its tail, so it never overtakes them.
+function __ipePostEvent(body, fromQueue) {
   if (__ipeEnded) return;
+  if (!fromQueue && (__ipeEventQueue.length > 0 || __ipeQueueInFlight)) {
+    __ipeEnqueue(body, false);
+    if (__ipeRetryTimer === null && !__ipeQueueInFlight) __ipeDrainQueue();
+    return;
+  }
+  if (fromQueue) __ipeQueueInFlight = true;
   // Phase 1.2 — attach the per-session CSRF token. The server-side
   // middleware () rejects POSTs
   // without a matching X-Ipe-Csrf / __ipe_csrf cookie pair. Empty
@@ -1539,24 +1576,42 @@ function __ipePostEvent(body) {
     body: JSON.stringify(body),
     credentials: "same-origin"
   }).then(function(r){
-    if (r.status === 409 && r.headers.get("X-Ipe-Web") === "1") {
-      // The server refused the event's render epoch and sent the current
-      // render. Apply it and end here: the refused event is never re-sent,
-      // since its handler id may now name another handler.
-      return r.json().then(function(data) {
+    if (fromQueue) __ipeQueueInFlight = false;
+    var kind = __ipeEventAnswer(r);
+    switch (kind) {
+      case __IPE_EVENT_ANSWER.STALE:
+        // The server refused the event's render epoch and sent the current
+        // render. Apply it and end here: the refused event is never re-sent,
+        // since its handler id may now name another handler.
+        return r.json().then(function(data) {
+          __ipeLoaderEnd();
+          __ipeOnPostSuccess();
+          if (!data || typeof data.body !== "string") return;
+          // The epoch gate orders this render against the DOM on screen; the
+          // seq it carries is the session's, which an earlier ack may equal.
+          __ipeAdoptFullBody(data.epoch, function() { __ipePatch(data.body); });
+        }).catch(function() { __ipeLoaderEnd(); });
+      case __IPE_EVENT_ANSWER.SESSION_LOST:
+        // The marked 404 no DOM may show. The probe confirms it and reloads,
+        // and the event waits in the retry queue meanwhile.
+        __ipeProbeSessionLost();
+        throw new Error("session lost");
+      case __IPE_EVENT_ANSWER.TRANSIENT:
+        // A timeout, a full queue, or a server or deploying edge that is up
+        // but not answering: the same retry path as a network failure.
         __ipeLoaderEnd();
-        __ipeOnPostSuccess();
-        if (!data || typeof data.body !== "string") return;
-        // The epoch gate orders this render against the DOM on screen; the
-        // seq it carries is the session's, which an earlier ack may equal.
-        __ipeAdoptFullBody(data.epoch, function() { __ipePatch(data.body); });
-      }).catch(function() { __ipeLoaderEnd(); });
-    }
-    if (!r.ok && r.status >= 500) {
-      // Server is up but rejecting (502/503/504 from a deploying LB,
-      // or 500 from a panic that survived the recover guard). Treat
-      // as transient — same retry path as a network failure.
-      throw new Error("server " + r.status);
+        __ipeOnPostFailure(body, fromQueue);
+        return;
+      case __IPE_EVENT_ANSWER.TOO_LARGE:
+        __ipeOnPostRefused(body, __IPE_EVENT_ANSWER.TOO_LARGE);
+        return;
+      case __IPE_EVENT_ANSWER.REFUSED:
+        __ipeOnPostRefused(body, __IPE_EVENT_ANSWER.REFUSED);
+        return;
+      case __IPE_EVENT_ANSWER.ACCEPTED:
+        break;
+      default:
+        throw new Error("unclassified event answer");
     }
     // Reverse-proxy wedge detection: a real Ipe.Web response always
     // carries X-Ipe-Web: 1. Without it, we're looking at a proxy-
@@ -1574,35 +1629,72 @@ function __ipePostEvent(body) {
     var ct = r.headers.get("Content-Type") || "";
     var isJson = ct.indexOf("application/json") >= 0;
     if (ipeMark !== "1" && !isJson) {
-      throw new Error("non-ipe response " + r.status);
+      throw new Error("non-ipe response");
     }
-    if (isJson) {
-      return r.json().then(function(data) {
-        // Even JSON is rejected if it lacks the protocol shape (no
-        // seq field): some proxies (Cloudflare access denied, fly.io
-        // edge errors) return JSON error envelopes with 200 OK.
-        if (ipeMark !== "1" && (!data || typeof data.seq === "undefined")) {
-          throw new Error("non-ipe json response");
-        }
-        __ipeLoaderEnd();
-        __ipeOnPostSuccess();
-        if (!data) return;
-        // An accepted event is acked with its seq; its render arrives over
-        // the stream, whose frames name the epochs they move between. Any
-        // patches an answer carries have no epoch to gate on: they never
-        // apply.
-        __ipeHandleResponse(data.seq, data.ackInputs, function() {}, data.globalSeq);
-      });
+    if (!isJson) {
+      // An accepted event is answered in JSON.
+      throw new Error("non-json event response");
     }
-    // An event is answered in JSON; the one marked text answer is the
-    // session-lost 404, which no DOM may show. The probe confirms it and
-    // reloads, and the event waits in the retry queue meanwhile.
-    if (r.status === 404) __ipeProbeSessionLost();
-    throw new Error("non-json event response " + r.status);
+    return r.json().then(function(data) {
+      // Even JSON is rejected if it lacks the protocol shape (no
+      // seq field): some proxies (Cloudflare access denied, fly.io
+      // edge errors) return JSON error envelopes with 200 OK.
+      if (ipeMark !== "1" && (!data || typeof data.seq === "undefined")) {
+        throw new Error("non-ipe json response");
+      }
+      __ipeLoaderEnd();
+      __ipeOnPostSuccess();
+      if (!data) return;
+      // An accepted event is acked with its seq; its render arrives over
+      // the stream, whose frames name the epochs they move between. Any
+      // patches an answer carries have no epoch to gate on: they never
+      // apply.
+      __ipeHandleResponse(data.seq, data.ackInputs, function() {}, data.globalSeq);
+    });
   }).catch(function() {
+    if (fromQueue) __ipeQueueInFlight = false;
     __ipeLoaderEnd();
-    __ipeOnPostFailure(body);
+    __ipeOnPostFailure(body, fromQueue);
   });
+}
+// A refused event is never sent again. The values it carried are left out of
+// every later event until the user edits them, the refusal is said, and the
+// events queued behind it still go.
+function __ipeOnPostRefused(body, kind) {
+  __ipeLoaderEnd();
+  var sent = body.inputState;
+  if (sent) {
+    var ids = Object.keys(sent);
+    for (var i = 0; i < ids.length; i++) {
+      var e = __ipeInputs[ids[i]];
+      if (e && sent[ids[i]]) e.refusedValue = sent[ids[i]].value;
+    }
+  } else {
+    __ipeRefusedBare = true;
+  }
+  __ipeShowRefused(kind);
+  __ipeDrainQueue();
+}
+// True once an event that carried no input was refused, until an event is
+// accepted.
+var __ipeRefusedBare = false;
+// The answer kind of the latest refusal, which its notice names.
+var __ipeRefusedKind = null;
+// True while a refusal still stands: a refused event carried no input and
+// none has been accepted since, or an input on the page still shows the value
+// a refused event carried.
+function __ipeRefusalStands() {
+  if (__ipeRefusedKind === null) return false;
+  if (__ipeRefusedBare) return true;
+  var ids = Object.keys(__ipeInputs);
+  for (var i = 0; i < ids.length; i++) {
+    var e = __ipeInputs[ids[i]];
+    if (e.refusedValue === null || e.refusedValue !== e.liveValue) continue;
+    var el = null;
+    try { el = __ipeDoc.query("[ipe-id=" + __ipeCssString(ids[i]) + "]"); } catch (_) { el = null; }
+    if (el) return true;
+  }
+  return false;
 }
 function __ipeOnPostSuccess() {
   // A successful POST proves the server reachable — clear any
@@ -1610,10 +1702,12 @@ function __ipeOnPostSuccess() {
   // SSE was the trigger that drained the queue, this is a no-op.
   __ipeRetryAttempts = 0;
   __ipeReconnectSince = 0;  // reopen the fast-reconnect window for the next drop
+  __ipeRefusedBare = false;
   if (__ipeRetryTimer !== null) {
     clearTimeout(__ipeRetryTimer);
     __ipeRetryTimer = null;
   }
+  // A refusal that still stands keeps its notice (__ipeSetStatus).
   if (__ipeStatus !== "connected") {
     __ipeSetStatus("connected", "");
   }
@@ -1631,17 +1725,21 @@ function __ipeOnPostSuccess() {
   }
   __ipeDrainQueue();
 }
-function __ipeOnPostFailure(body) {
-  // FIFO drop when the queue is at the cap — bail on the oldest
-  // pending event rather than the new one, so the user's most
-  // recent intent is preserved.
+// Queue `body` for a retry: at the head for the queue's own head, which keeps
+// its place, else at the tail. At the cap the oldest event behind the head is
+// dropped, so the user's most recent intent is preserved.
+function __ipeEnqueue(body, atHead) {
   if (__ipeEventQueue.length >= __ipeEventQueueMax) {
     var dropped = __ipeEventQueue.shift();
     if (window.console && console.warn) {
       console.warn("[ipe.live] event queue at cap; dropped oldest", dropped);
     }
   }
-  __ipeEventQueue.push(body);
+  if (atHead) __ipeEventQueue.unshift(body);
+  else __ipeEventQueue.push(body);
+}
+function __ipeOnPostFailure(body, fromQueue) {
+  __ipeEnqueue(body, fromQueue);
   __ipeShowReconnecting();
   __ipeScheduleRetry();
 }
@@ -1652,7 +1750,7 @@ function __ipeShowReconnecting() {
   // fire when the new binary answers. If the reconnect does NOT land inside the
   // window (a genuine connection loss), we fall through to the amber banner.
   if (__ipeSwapToast && __ipeInFastReconnect()) return;
-  if (__ipeStatus === "connected") {
+  if (__ipeStatus === "connected" || __ipeStatus === "refused") {
     __ipeSetStatus("reconnecting", __ipeMsgReconnecting);
   }
 }
@@ -1695,14 +1793,15 @@ function __ipeScheduleRetry() {
 }
 function __ipeDrainQueue() {
   if (__ipeEnded) return;
+  if (__ipeQueueInFlight) return;
   if (__ipeEventQueue.length === 0) return;
   // Send the head of the queue. If it succeeds, __ipeOnPostSuccess
-  // recurses into __ipeDrainQueue to send the next one. If it
-  // fails, the body re-enters the queue and the retry loop kicks
-  // back in. Order is preserved (FIFO) — the server's seq matching
-  // tolerates late deliveries via __ipeHandleResponse.
+  // recurses into __ipeDrainQueue to send the next one. If it fails,
+  // the body re-enters the queue at its head and the retry loop kicks
+  // back in. Order is preserved (FIFO): one queued event is in flight
+  // at a time, and a live send waits behind the queue.
   var head = __ipeEventQueue.shift();
-  __ipePostEvent(head);
+  __ipePostEvent(head, true);
 }
 
 // Apply a list of ipe-id addressed patches with input authority (I1):
@@ -2343,6 +2442,11 @@ var __ipeBuildOkTimer = null;           // auto-hide timer for build-ok toast
 function __ipeSetStatus(state, msg) {
   // A stale document keeps its banner: no later state replaces it.
   if (__ipeStale) return;
+  // A refusal that still stands keeps its notice over a recovered connection.
+  if (state === "connected" && __ipeRefusalStands()) {
+    __ipeShowRefused(__ipeRefusedKind);
+    return;
+  }
   // Cancel any pending build-ok auto-hide when switching to a different state.
   if (__ipeBuildOkTimer !== null && state !== "build-ok") {
     clearTimeout(__ipeBuildOkTimer);
@@ -2356,6 +2460,7 @@ function __ipeSetStatus(state, msg) {
   });
   classes.push("ipe-status--" + state);
   __ipeStatusEl.className = classes.join(" ");
+  __ipeStatusEl.removeAttribute("data-ipe-refused");
   if (__ipeStatusMsgEl && msg !== undefined) {
     __ipeStatusMsgEl.textContent = msg;
   }
@@ -2437,6 +2542,45 @@ function __ipeClosedNotice(tag) {
     default:
       return "This session was closed \u2014 reload to start a new one";
   }
+}
+// The notice for an event the server refused, by its answer kind. The text is
+// the client's own, and a kind outside this set gets the generic notice.
+function __ipeRefusedNotice(kind) {
+  switch (kind) {
+    case __IPE_EVENT_ANSWER.TOO_LARGE:
+      return "This change is too large to send and was not saved \u2014 shorten it and try again";
+    case __IPE_EVENT_ANSWER.REFUSED:
+      return "The server refused this action and did not apply it \u2014 reload the page";
+    default:
+      return "The server did not apply this action \u2014 reload the page";
+  }
+}
+// Show the notice for a refused event. It ignores the banner setting: a write
+// the server refused is always said. A stale or ended document keeps its own
+// banner.
+function __ipeShowRefused(kind) {
+  if (__ipeEnded || __ipeStale) return;
+  if (__ipeBuildOkTimer !== null) {
+    clearTimeout(__ipeBuildOkTimer);
+    __ipeBuildOkTimer = null;
+  }
+  __ipeStatus = "refused";
+  __ipeRefusedKind = kind;
+  var notice = __ipeRefusedNotice(kind);
+  function show() {
+    if (__ipeStatus !== "refused") return;
+    if (!__ipeStatusEl) {
+      var built = __ipeBuildStatusEl("offline");
+      __ipeDoc.body().appendChild(built.el);
+      __ipeStatusEl = built.el;
+      __ipeStatusMsgEl = built.msgEl;
+    }
+    __ipeStatusEl.className = "ipe-status ipe-status--offline";
+    __ipeStatusEl.setAttribute("data-ipe-refused", kind);
+    __ipeStatusMsgEl.textContent = notice;
+  }
+  if (__ipeDoc.body()) show();
+  else __ipeDoc.on("DOMContentLoaded", show);
 }
 // End this document's session for good: the server closed it, so no reopen,
 // retry, probe or reload can bring it back. The banner tells the reader why
@@ -2975,8 +3119,7 @@ function __ipeProbeSessionLost() {
     body: JSON.stringify({sessionId: __ipeSid, msg: "__ipeSessionPing", args: []}),
     credentials: "same-origin"
   }).then(function(r) {
-    if (r.status !== 404) return;
-    if (r.headers.get("X-Ipe-Web") !== "1") return;
+    if (__ipeEventAnswer(r) !== __IPE_EVENT_ANSWER.SESSION_LOST) return;
     return r.text().then(function(body) {
       // Specifically "session not found" — distinguishes from
       // "handler not found" (which means the session is fine, just
