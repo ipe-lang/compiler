@@ -374,6 +374,15 @@ impl Tombstones {
         }
     }
 
+    /// Hold `sid` back before its delete leaves the live map.
+    ///
+    /// A cold read that misses the live entry then never reads the row the
+    /// delete is still removing; [`Self::deleted`] settles the hold once the
+    /// persisted step returns, and a delete dropped mid-flight keeps it.
+    fn begin(&self, sid: &str) {
+        self.record(sid);
+    }
+
     /// The outcome of a delete whose persisted step returned `removed`.
     fn deleted(&self, sid: &str, removed: Result<(), WriteFault>) -> Deleted {
         self.retry(sid, &removed);
@@ -1439,9 +1448,11 @@ where
         settle_in(&self.mem_cache, sid, &handle, slot, written)
     }
     async fn delete(&self, sid: &str) -> Deleted {
-        remove_in(&self.mem_cache, sid);
+        // The disk map is locked before the live entry goes, so a cold read
+        // that misses the live entry waits for the row's removal.
         let removed = {
             let mut disk = self.disk.lock().unwrap_or_else(PoisonError::into_inner);
+            remove_in(&self.mem_cache, sid);
             disk.remove(sid).is_some().then(|| self.persist(&disk))
         };
         removed.map_or(Deleted::Removed, |removed| {
@@ -1797,6 +1808,7 @@ where
         settle_in(&self.mem_cache, sid, &handle, slot, written)
     }
     async fn delete(&self, sid: &str) -> Deleted {
+        self.tombstones.begin(sid);
         remove_in(&self.mem_cache, sid);
         self.tombstones.deleted(sid, self.delete_row(sid).await)
     }
@@ -2020,6 +2032,7 @@ where
         settle_in(&self.mem_cache, sid, &handle, slot, written)
     }
     async fn delete(&self, sid: &str) -> Deleted {
+        self.tombstones.begin(sid);
         remove_in(&self.mem_cache, sid);
         self.tombstones.deleted(sid, self.delete_row(sid).await)
     }
@@ -2231,6 +2244,7 @@ where
         settle_in(&self.mem_cache, sid, &handle, slot, written)
     }
     async fn delete(&self, sid: &str) -> Deleted {
+        self.tombstones.begin(sid);
         remove_in(&self.mem_cache, sid);
         self.tombstones.deleted(sid, self.delete_key(sid).await)
     }
@@ -5143,6 +5157,64 @@ mod tests {
                 matches!(reconstruct(&s, SID, &init).await, Rejoin::Miss),
                 "a tombstoned sid is never restored"
             );
+        })
+        .await;
+        remove_sqlite(p);
+        assert!(bounded.is_ok(), "the store answers within the bound");
+    }
+
+    /// A cold read racing a delete still in flight never restores the row.
+    ///
+    /// A second connection holds the write lock, so the delete waits with the
+    /// live entry already gone while the row stays readable.
+    #[cfg(feature = "db")]
+    #[tokio::test]
+    async fn sqlite_cold_read_during_an_in_flight_delete_misses() {
+        let path = crate::scratch_core::test_temp_root()
+            .join(format!("ipetest_inflight_{}.db", std::process::id()));
+        let p = path.to_str().unwrap();
+        remove_sqlite(p);
+        let bounded = tokio::time::timeout(Duration::from_secs(30), async {
+            let s: SqliteStore<i32, ()> = SqliteStore::new(p, Duration::from_secs(60), TEST_TAG)
+                .await
+                .unwrap();
+            assert!(matches!(s.set(SID, handle_i32(7)).await, Installed::Held));
+            let side = sqlx::SqlitePool::connect(&format!("sqlite:{p}"))
+                .await
+                .unwrap();
+            let mut locker = side.acquire().await.unwrap();
+            sqlx::query("BEGIN IMMEDIATE")
+                .execute(&mut *locker)
+                .await
+                .unwrap();
+            let gone = async {
+                while s.get(SID).await.is_some() {
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+            };
+            let (deleted, restored, ()) = tokio::join!(
+                s.delete(SID),
+                async {
+                    gone.await;
+                    restored_i32(&s, SID).await
+                },
+                async {
+                    while s.get(SID).await.is_some() {
+                        tokio::time::sleep(Duration::from_millis(1)).await;
+                    }
+                    tokio::time::sleep(Duration::from_millis(300)).await;
+                    sqlx::query("ROLLBACK").execute(&mut *locker).await.unwrap();
+                },
+            );
+            assert_eq!(restored, None, "the row being deleted is never restored");
+            assert!(matches!(deleted, Deleted::Removed), "{deleted:?}");
+            assert_eq!(sqlite_rows(&s, SID).await, 0);
+            assert!(
+                s.tombstones.snapshot().is_empty(),
+                "the landed delete settles"
+            );
+            drop(locker);
+            side.close().await;
         })
         .await;
         remove_sqlite(p);
