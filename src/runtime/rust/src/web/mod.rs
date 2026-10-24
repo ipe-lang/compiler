@@ -2648,11 +2648,8 @@ fn dispatch_cmd<Msg: Send + 'static>(
                 tokio::spawn(scope.clone().scoped(async move {
                     // Bounded send: the Msg waits for queue room, and is
                     // dropped with a warn once the session queue is closed.
-                    if cmd.finish(&tx).await.is_err() {
-                        crate::system::emit_runtime_log(
-                            "live",
-                            "run_cmd: session msg channel closed; dropping Perform result",
-                        );
+                    if let Some(line) = finished_line(&cmd.finish(&tx).await) {
+                        crate::system::emit_runtime_log("live", line);
                     }
                 }));
             }
@@ -2662,6 +2659,93 @@ fn dispatch_cmd<Msg: Send + 'static>(
             // Inject this session's sid as the broadcast origin (
             // liveApp.Publish sets Origin = session.sid). Fire-and-forget.
             let _ = thunk(scope.sid());
+        }
+    }
+}
+
+/// The operator line for how one `Perform` ended, if it is one an operator reads.
+///
+/// A Cmd the shutdown cancelled has no result to drop: it writes no line, and
+/// the shutdown's one cancel line counts it.
+#[cfg(feature = "web")]
+const fn finished_line<M>(
+    finished: &Result<cmd_admission::Delivery, tokio::sync::mpsc::error::SendError<M>>,
+) -> Option<&'static str> {
+    match finished {
+        Ok(cmd_admission::Delivery::Delivered | cmd_admission::Delivery::Cancelled) => None,
+        Err(_) => Some("run_cmd: session msg channel closed; dropping Perform result"),
+    }
+}
+
+/// The unit of shutdown work one driver turn holds, or `None` once the
+/// shutdown closes.
+///
+/// A turn the work ceiling refuses waits for room, as a Msg waits for queue
+/// room; the wait ends at the close, where every unit is born cancelled.
+#[cfg(feature = "web")]
+async fn turn_work(
+    drain: &crate::server::shutdown::Drain,
+) -> Option<crate::server::shutdown::WorkGuard> {
+    loop {
+        if let Ok(work) = drain.work() {
+            return open_work(work).await;
+        }
+        tokio::time::sleep(TURN_WORK_RETRY).await;
+    }
+}
+
+/// How long a driver turn the work ceiling refused waits before it asks again.
+#[cfg(feature = "web")]
+const TURN_WORK_RETRY: std::time::Duration = std::time::Duration::from_millis(10);
+
+/// `work`, unless the shutdown already closed.
+#[cfg(feature = "web")]
+async fn open_work(
+    mut work: crate::server::shutdown::WorkGuard,
+) -> Option<crate::server::shutdown::WorkGuard> {
+    work.unless_cancelled(std::future::ready(())).await?;
+    Some(work)
+}
+
+/// Run `publish` to its end under `work`; `None`, with `publish` never
+/// polled, once the shutdown closed first.
+///
+/// `publish` is not raced against the cancel: it runs whole or not at all,
+/// and the close waits for it.
+#[cfg(feature = "web")]
+async fn under_work<T>(
+    work: crate::server::shutdown::WorkGuard,
+    publish: impl std::future::Future<Output = T>,
+) -> Option<T> {
+    let work = open_work(work).await?;
+    let out = publish.await;
+    drop(work);
+    Some(out)
+}
+
+/// The periodic TTL sweep of `store`, one sweep per `period`.
+///
+/// Each sweep is one unit of shutdown work run to its end; the loop ends
+/// once the server drains, so no sweep starts after the close. A tick the
+/// work ceiling refuses is skipped.
+#[cfg(feature = "web")]
+async fn sweep_sessions<Model, Msg>(
+    store: Arc<dyn store::SessionStore<Model, Msg>>,
+    mut drain: crate::server::shutdown::Drain,
+    period: std::time::Duration,
+) {
+    let mut tick = tokio::time::interval(period);
+    loop {
+        tokio::select! {
+            biased;
+            () = drain.wait() => return,
+            _ = tick.tick() => {}
+        }
+        let Ok(work) = drain.work() else {
+            continue;
+        };
+        if under_work(work, store.sweep()).await.is_none() {
+            return;
         }
     }
 }
@@ -2841,9 +2925,9 @@ async fn take_input<Model, Msg, T>(
 ///
 /// URL entries arrive on `enter_rx` and are committed by the same loop, so an
 /// entry and an in-flight `update` never overwrite each other's model.
-// Eleven distinct per-session runtime handles (entry, both Msg channel ends, the
+// Distinct per-session runtime handles (entry, both Msg channel ends, the
 // entry queue, the three Arc'd TEA callbacks, the route entry, the store, the
-// session scope, the revocation watch) — bundling them into a struct purely to satisfy the 7-arg heuristic
+// session scope, the revocation watch, the shutdown drain) — bundling them into a struct purely to satisfy the 7-arg heuristic
 // would add indirection without clarifying anything.
 #[allow(clippy::too_many_arguments)]
 #[cfg(feature = "web")]
@@ -2869,6 +2953,8 @@ async fn drive_session<Model, Msg, FUpdate, FView, FSubs>(
     // Subscribed by the page handler before the session's first credential was
     // admitted, so no revocation between that admission and this start is missed.
     mut revocation: RevocationWatch,
+    // The shutdown each turn holds a unit of work on; the parked driver holds none.
+    drain: crate::server::shutdown::Drain,
     // Admission-control slot: decrements WebState::session_count on driver exit.
     _slot: SessionSlot,
 ) where
@@ -2950,15 +3036,25 @@ async fn drive_session<Model, Msg, FUpdate, FView, FSubs>(
     loop {
         // Each input is taken with its turn, held until the Cmds it produced
         // hold their own units: dropped at the end of the iteration, after
-        // `run_cmd`, or on the way out.
-        let (msg, queued, origin, _turn) = tokio::select! {
+        // `run_cmd`, or on the way out. The turn's unit of shutdown work is
+        // held as long, so the close waits for its checkpoint; an input taken
+        // once the shutdown closed ends the driver before `update` runs.
+        let (msg, queued, origin, _turn, work) = tokio::select! {
             taken = take_input(&entry, &cmds, &mut msg_rx) => match taken {
-                Taken::Input(m, turn) => (m, None, Origin::None, turn),
+                Taken::Input(m, turn) => {
+                    let Some(work) = turn_work(&drain).await else {
+                        break;
+                    };
+                    (m, None, Origin::None, turn, work)
+                }
                 Taken::Closed | Taken::Gone => break,
             },
             taken = take_input(&entry, &cmds, &mut event_rx), if events_open => match taken {
                 Taken::Input(QueuedEvent { msg, charge, sent }, turn) => {
-                    (msg, Some(charge), Origin::of(sent), turn)
+                    let Some(work) = turn_work(&drain).await else {
+                        break;
+                    };
+                    (msg, Some(charge), Origin::of(sent), turn, work)
                 }
                 Taken::Closed => {
                     events_open = false;
@@ -2968,6 +3064,9 @@ async fn drive_session<Model, Msg, FUpdate, FView, FSubs>(
             },
             taken = take_input(&entry, &cmds, &mut enter_rx) => {
                 let Taken::Input(request, turn) = taken else {
+                    break;
+                };
+                let Some(work) = turn_work(&drain).await else {
                     break;
                 };
                 // Re-prove the credentials before the entry runs; a refused
@@ -2989,6 +3088,9 @@ async fn drive_session<Model, Msg, FUpdate, FView, FSubs>(
                 });
                 drop(turn);
                 revocation.rearm(&scope);
+                if open_work(work).await.is_none() {
+                    break;
+                }
                 continue;
             }
             wake = revocation.wait() => {
@@ -3006,6 +3108,11 @@ async fn drive_session<Model, Msg, FUpdate, FView, FSubs>(
                     rechecks.fetch_add(1, Ordering::Relaxed);
                 }
                 if standing_after(&scope, wake) == Standing::Revoked {
+                    // The close's delete is a unit of shutdown work; once the
+                    // shutdown closed, the store is left to the close.
+                    let Some(_work) = turn_work(&drain).await else {
+                        break;
+                    };
                     close_session(&store, &sid, entry.upgrade().as_ref(), CloseReason::Revoked)
                         .await;
                     break;
@@ -3151,6 +3258,11 @@ async fn drive_session<Model, Msg, FUpdate, FView, FSubs>(
             sub_runtime.reconcile(subs(next.clone()));
         });
         revocation.rearm(&scope);
+        // A shutdown that closed during this turn ends the driver here: the
+        // turn's checkpoint is written, and no later input runs.
+        if open_work(work).await.is_none() {
+            break;
+        }
     }
     drop(sub_runtime);
 }
@@ -5254,7 +5366,14 @@ mod handlers {
         // The session's first turn: from before the store holds it until its
         // seed Cmd holds its own unit.
         let birth = cmds.begin_turn();
-        let commit = tokio::spawn(async move {
+        // The publication is one unit of shutdown work, taken here and held
+        // across the store write, the driver spawn and the seed Cmd: the close
+        // waits for it, and one admitted after the close publishes nothing.
+        let drain = crate::server::shutdown::drain();
+        let Ok(work) = drain.work() else {
+            return entry_unavailable();
+        };
+        let commit = tokio::spawn(under_work(work, async move {
             let sid = owner.sid();
             if store.set(sid, entry.clone()).await == store::Installed::Displaced {
                 drop(owner);
@@ -5274,6 +5393,7 @@ mod handlers {
                 scope.clone(),
                 Arc::clone(&cmds),
                 revocation,
+                drain,
                 slot,
             ));
             // Fire the entry Cmd into the loop (batched after init's on a miss).
@@ -5281,10 +5401,12 @@ mod handlers {
             drop(birth);
             drop(owner);
             store::Installed::Held
-        });
+        }));
         match commit.await {
-            Ok(store::Installed::Held) => {}
-            Ok(store::Installed::Displaced) => return entry_unavailable(),
+            Ok(Some(store::Installed::Held)) => {}
+            // A displaced sid, or a shutdown that closed first: nothing was
+            // published, and the claim is released.
+            Ok(Some(store::Installed::Displaced) | None) => return entry_unavailable(),
             Err(failed) => {
                 return match failed.try_into_panic() {
                     Ok(payload) => (
@@ -7068,20 +7190,6 @@ where
     FView: Fn(Model) -> Html<Msg> + Send + Sync + 'static,
     FSubs: Fn(Model) -> IpeSub<Msg> + Send + Sync + 'static,
 {
-    // Background TTL eviction : sweep
-    // idle-expired sessions every 60 s. Persistent backends also prune their
-    // checkpoint table in `sweep`.
-    {
-        let store = state.store.clone();
-        tokio::spawn(async move {
-            let mut tick = tokio::time::interval(std::time::Duration::from_secs(60));
-            loop {
-                tick.tick().await;
-                store.sweep().await;
-            }
-        });
-    }
-
     // Enable the telemetry SQLite spill when
     // IPE_CONSOLE_DB_PATH is set — the console child reads it via the
     // hub kernels. db-gated; a no-op for live-without-db apps. Enabled
@@ -7121,6 +7229,7 @@ where
     // Cloned for the shutdown path's dev-only reload push — the router's
     // `.with_state(state)` takes ownership of `state` below.
     let shutdown_store = state.store.clone();
+    let sweep_store = state.store.clone();
 
     #[cfg(all(feature = "web", feature = "http_client"))]
     let console_proxy_flag = use_console_proxy;
@@ -7177,6 +7286,14 @@ where
             ))));
         }
     };
+    // Background TTL eviction: sweep idle-expired sessions every 60 s under
+    // the armed owner. Persistent backends also prune their checkpoint table
+    // in `sweep`.
+    tokio::spawn(sweep_sessions(
+        sweep_store,
+        armed.drain(),
+        std::time::Duration::from_secs(60),
+    ));
     // Logs the bind-address line (stderr), and the exposure warning if any.
     let listener = match crate::server::bind_app_listener("web", host, port).await {
         Ok(l) => l,
@@ -19316,6 +19433,46 @@ mod web_revocation_tests {
         );
     }
 
+    /// Every task that can touch the session store runs under a unit of shutdown work.
+    #[test]
+    fn store_tasks_hold_shutdown_work() {
+        let code = production_only(&code_only(include_str!("mod.rs")));
+        let bodies = fn_bodies(&code);
+        let page = sole_body(&code, &bodies, "serve_page");
+        let taken =
+            page.find("letdrain=crate::server::shutdown::drain();letOk(work)=drain.work()else{");
+        let commit = page.find("tokio::spawn(under_work(work,asyncmove{");
+        let write = page.find("store.set(");
+        assert!(
+            taken.is_some_and(|t| commit.is_some_and(|c| t < c))
+                && commit.is_some_and(|c| write.is_some_and(|w| c < w)),
+            "the page mint takes its unit from the shutdown and writes the store only inside it: {page}"
+        );
+        let sweeps = call_owners(&code, &bodies, "store", "sweep");
+        assert!(
+            !sweeps.is_empty()
+                && sweeps
+                    .iter()
+                    .all(|o| o.as_deref() == Some("sweep_sessions")),
+            "only the sweep loop sweeps the store: {sweeps:?}"
+        );
+        let sweeper = sole_body(&code, &bodies, "sweep_sessions");
+        assert!(
+            sweeper.contains("under_work(work,store.sweep())"),
+            "each sweep runs under a unit of work: {sweeper}"
+        );
+        let driver = sole_body(&code, &bodies, "drive_session");
+        assert!(
+            driver.matches("turn_work(&drain)").count() == 4,
+            "each driver turn (Msg, event, entry, revoked close) takes a unit of work: {driver}"
+        );
+        let dispatch = sole_body(&code, &bodies, "dispatch_cmd");
+        assert!(
+            dispatch.contains("finished_line(") && !dispatch.contains(".is_err()"),
+            "`dispatch_cmd` matches a finished Cmd's delivery explicitly: {dispatch}"
+        );
+    }
+
     /// A `Perform` task's `verifyToken` binds to the session that ran the Cmd.
     #[test]
     fn perform_task_verify_binds_to_its_session() {
@@ -19618,5 +19775,343 @@ mod session_history_charge_tests {
         let mut entry = entry_after(ChargeMsg::Measurable);
         assert!(entry.resident_bytes().is_some());
         assert_eq!(entry.recharge_resident(), Ok(()));
+    }
+}
+
+#[cfg(all(test, feature = "web"))]
+mod shutdown_work_tests {
+    use super::*;
+    use crate::server::shutdown::{self, Armed, Drain};
+    use crate::web::store::{MemoryStore, SessionHandle, SessionStore};
+    use std::time::Duration;
+
+    /// How long a test waits for any one event before it fails.
+    const BUDGET: Duration = Duration::from_secs(5);
+
+    /// A memory store whose `set` and `sweep` each wait for the test's release.
+    struct GatedStore {
+        inner: MemoryStore<i64, i64>,
+        sets: AtomicUsize,
+        sweeps: AtomicUsize,
+        entered: tokio::sync::Notify,
+        release: tokio::sync::Semaphore,
+    }
+
+    impl GatedStore {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                inner: MemoryStore::new(Duration::from_secs(60)),
+                sets: AtomicUsize::new(0),
+                sweeps: AtomicUsize::new(0),
+                entered: tokio::sync::Notify::new(),
+                release: tokio::sync::Semaphore::new(0),
+            })
+        }
+
+        async fn released(&self) {
+            self.entered.notify_one();
+            if let Ok(permit) = self.release.acquire().await {
+                permit.forget();
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl SessionStore<i64, i64> for GatedStore {
+        async fn get(&self, sid: &str) -> Option<SessionHandle<i64, i64>> {
+            self.inner.get(sid).await
+        }
+        fn admission(&self) -> &store::SidAdmission {
+            self.inner.admission()
+        }
+        async fn set(&self, sid: &str, handle: SessionHandle<i64, i64>) -> crate::web::Installed {
+            self.sets.fetch_add(1, Ordering::SeqCst);
+            self.released().await;
+            self.inner.set(sid, handle).await
+        }
+        async fn delete(&self, sid: &str) {
+            self.inner.delete(sid).await;
+        }
+        async fn sweep(&self) {
+            self.sweeps.fetch_add(1, Ordering::SeqCst);
+            self.released().await;
+            self.inner.sweep().await;
+        }
+        async fn web_sessions(&self) -> Vec<SessionHandle<i64, i64>> {
+            self.inner.web_sessions().await
+        }
+        async fn evict_unconnected(&self, need: crate::retained::Bytes) -> crate::retained::Bytes {
+            self.inner.evict_unconnected(need).await
+        }
+        fn holds(&self, sid: &str, handle: &SessionHandle<i64, i64>) -> bool {
+            self.inner.holds(sid, handle)
+        }
+    }
+
+    /// A fresh armed shutdown owner with a long grace.
+    fn owner() -> (Armed, Sender<shutdown::Signal>) {
+        shutdown::tests::armed_with(
+            shutdown::ShutdownPlan::bare("test"),
+            Duration::from_secs(30),
+            Arc::new(std::sync::atomic::AtomicI32::new(0)),
+        )
+    }
+
+    /// Resolve once `drain`'s owner has closed.
+    async fn closed(drain: &Drain) {
+        loop {
+            if let Ok(work) = drain.work()
+                && open_work(work).await.is_none()
+            {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    }
+
+    /// A session driven by `drive_session` under `drain`, its Msg sender and the driver task.
+    ///
+    /// `update` adds the Msg to the model and counts itself in `applied`.
+    fn spawn_driver(
+        store: Arc<GatedStore>,
+        drain: Drain,
+        applied: Arc<AtomicUsize>,
+    ) -> (
+        SessionHandle<i64, i64>,
+        Sender<i64>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let scope = pubsub::SessionScope::new(new_sid());
+        let (msg_tx, msg_rx) = mpsc::channel::<i64>(8);
+        let (event_tx, event_rx) = mpsc::channel::<QueuedEvent<i64>>(1);
+        let (enter_tx, enter_rx) = mpsc::channel::<EnterRequest>(1);
+        let cmds = Arc::new(budget::SessionCmds::new());
+        let entry = Arc::new(Mutex::new(SessionEntry {
+            model: 0_i64,
+            rendered: Rendered::first(SessionKeys::distinct(), Html::HText(String::new())),
+            tabs: TabSeqs::default(),
+            seq: 0,
+            sse_tx: None,
+            msg_tx: msg_tx.clone(),
+            event_tx,
+            entered_path: None,
+            enter_tx,
+            #[cfg(feature = "debugger")]
+            history: crate::debugger::RecordBuffer::measured(
+                0_i64,
+                crate::debugger::DEFAULT_HISTORY_CAP,
+            ),
+            #[cfg(feature = "debugger")]
+            debug_cursor: None,
+            liveness: SessionLiveness::new(scope.clone()),
+            charge: budget::Charge::detached(),
+            cmds: Arc::clone(&cmds),
+        }));
+        let update = Arc::new(move |msg: i64, model: i64| {
+            applied.fetch_add(1, Ordering::SeqCst);
+            (model.saturating_add(msg), IpeCmd::None)
+        });
+        let view = Arc::new(|model: i64| Html::HText(model.to_string()));
+        let subs = Arc::new(|_model: i64| IpeSub::None);
+        let route_entry: RouteEntry<i64, i64> =
+            Arc::new(|model: i64, _path: &route::DecodedPath| route::Entered {
+                model,
+                cmd: IpeCmd::None,
+            });
+        let store: Arc<dyn SessionStore<i64, i64>> = store;
+        let driver = tokio::spawn(drive_session(
+            Arc::downgrade(&entry),
+            msg_rx,
+            msg_tx.clone(),
+            event_rx,
+            enter_rx,
+            update,
+            view,
+            subs,
+            route_entry,
+            store,
+            scope,
+            cmds,
+            RevocationWatch::subscribe(),
+            drain,
+            SessionSlot {
+                count: Arc::new(AtomicUsize::new(1)),
+            },
+        ));
+        (entry, msg_tx, driver)
+    }
+
+    fn model_of(entry: &SessionHandle<i64, i64>) -> i64 {
+        entry
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .model
+    }
+
+    /// A turn running at the close holds it until its checkpoint is written, and a later Msg never runs.
+    #[tokio::test]
+    async fn a_driver_turn_at_closing_writes_its_checkpoint_then_ends() {
+        let (armed, _signals) = owner();
+        let probe = armed.drain();
+        let store = GatedStore::new();
+        let applied = Arc::new(AtomicUsize::new(0));
+        let (entry, msg_tx, driver) =
+            spawn_driver(Arc::clone(&store), armed.drain(), Arc::clone(&applied));
+        assert!(msg_tx.try_send(1).is_ok());
+        let reached = tokio::time::timeout(BUDGET, store.entered.notified()).await;
+        assert!(reached.is_ok(), "the turn reaches its checkpoint write");
+        assert_eq!(armed.work_in_flight(), 1, "the turn holds one unit of work");
+        let cancel = tokio::spawn(async move {
+            let _settled = armed.cancel_work().await;
+            armed
+        });
+        assert!(tokio::time::timeout(BUDGET, closed(&probe)).await.is_ok());
+        assert!(msg_tx.try_send(2).is_ok());
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(
+            !cancel.is_finished(),
+            "the close waits for the turn's checkpoint write"
+        );
+        store.release.add_permits(1);
+        let settled = tokio::time::timeout(BUDGET, cancel).await;
+        assert!(
+            matches!(settled, Ok(Ok(ref owner)) if owner.work_in_flight() == 0),
+            "the close ends once the turn is done"
+        );
+        let ended = tokio::time::timeout(BUDGET, driver).await;
+        assert!(
+            matches!(ended, Ok(Ok(()))),
+            "the driver ends after the closing turn"
+        );
+        assert_eq!(
+            applied.load(Ordering::SeqCst),
+            1,
+            "the later Msg never runs"
+        );
+        assert_eq!(store.sets.load(Ordering::SeqCst), 1, "one checkpoint write");
+        assert_eq!(model_of(&entry), 1, "the closing turn's model is committed");
+    }
+
+    /// A Msg a parked driver takes after the close ends it before `update` or a checkpoint runs.
+    #[tokio::test]
+    async fn a_msg_after_closing_ends_the_driver_unapplied() {
+        let (armed, _signals) = owner();
+        let store = GatedStore::new();
+        let applied = Arc::new(AtomicUsize::new(0));
+        let (entry, msg_tx, driver) =
+            spawn_driver(Arc::clone(&store), armed.drain(), Arc::clone(&applied));
+        let _settled = armed.cancel_work().await;
+        assert!(msg_tx.try_send(1).is_ok());
+        let ended = tokio::time::timeout(BUDGET, driver).await;
+        assert!(
+            matches!(ended, Ok(Ok(()))),
+            "the driver ends at the closed turn"
+        );
+        assert_eq!(applied.load(Ordering::SeqCst), 0);
+        assert_eq!(store.sets.load(Ordering::SeqCst), 0);
+        assert_eq!(model_of(&entry), 0);
+    }
+
+    /// The sweep loop of a closed server ends without starting a sweep.
+    #[tokio::test]
+    async fn the_sweep_loop_ends_at_the_close_without_a_sweep() {
+        let (armed, _signals) = owner();
+        let _settled = armed.cancel_work().await;
+        let store = GatedStore::new();
+        let swept = tokio::time::timeout(
+            BUDGET,
+            sweep_sessions(
+                Arc::clone(&store) as Arc<dyn SessionStore<i64, i64>>,
+                armed.drain(),
+                Duration::from_millis(1),
+            ),
+        )
+        .await;
+        assert!(swept.is_ok(), "the loop ends");
+        assert_eq!(store.sweeps.load(Ordering::SeqCst), 0, "no sweep starts");
+    }
+
+    /// A sweep running at the close holds it until the sweep returns, and the loop ends after it.
+    #[tokio::test]
+    async fn a_running_sweep_holds_the_close_until_it_returns() {
+        let (armed, _signals) = owner();
+        let store = GatedStore::new();
+        let sweeper = tokio::spawn(sweep_sessions(
+            Arc::clone(&store) as Arc<dyn SessionStore<i64, i64>>,
+            armed.drain(),
+            Duration::from_secs(3600),
+        ));
+        let reached = tokio::time::timeout(BUDGET, store.entered.notified()).await;
+        assert!(reached.is_ok(), "the first tick starts a sweep");
+        assert_eq!(
+            armed.work_in_flight(),
+            1,
+            "the sweep holds one unit of work"
+        );
+        let cancel = tokio::spawn(async move {
+            let _settled = armed.cancel_work().await;
+            armed
+        });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(!cancel.is_finished(), "the close waits for the sweep");
+        store.release.add_permits(1);
+        let settled = tokio::time::timeout(BUDGET, cancel).await;
+        assert!(matches!(settled, Ok(Ok(ref owner)) if owner.work_in_flight() == 0));
+        let ended = tokio::time::timeout(BUDGET, sweeper).await;
+        assert!(matches!(ended, Ok(Ok(()))), "the loop ends after the close");
+        assert_eq!(store.sweeps.load(Ordering::SeqCst), 1);
+    }
+
+    /// A publication admitted before the close runs whole; one admitted after it never runs.
+    #[tokio::test]
+    async fn a_page_mint_after_closing_publishes_nothing() {
+        let (armed, _signals) = owner();
+        let ran = Arc::new(AtomicUsize::new(0));
+        let early = armed.drain().work();
+        assert!(early.is_ok(), "an idle owner admits a unit of work");
+        let Ok(early) = early else { return };
+        let probe = Arc::clone(&ran);
+        let published = under_work(early, async move {
+            probe.fetch_add(1, Ordering::SeqCst);
+        })
+        .await;
+        assert!(published.is_some(), "a publication before the close runs");
+        assert_eq!(armed.work_in_flight(), 0, "its unit ends with it");
+        let _settled = armed.cancel_work().await;
+        let late = armed.drain().work();
+        assert!(
+            late.is_ok(),
+            "a unit after the close is born cancelled, never refused"
+        );
+        let Ok(late) = late else { return };
+        let probe = Arc::clone(&ran);
+        let published = under_work(late, async move {
+            probe.fetch_add(1, Ordering::SeqCst);
+        })
+        .await;
+        assert!(
+            published.is_none(),
+            "a publication after the close is refused"
+        );
+        assert_eq!(ran.load(Ordering::SeqCst), 1, "its body is never polled");
+    }
+
+    /// Only a closed session queue logs a dropped result; a delivered or cancelled Cmd writes nothing.
+    #[test]
+    fn only_a_closed_queue_logs_a_dropped_result() {
+        let lost: Result<cmd_admission::Delivery, _> =
+            Err(tokio::sync::mpsc::error::SendError(1_i64));
+        assert_eq!(
+            finished_line(&lost),
+            Some("run_cmd: session msg channel closed; dropping Perform result")
+        );
+        assert_eq!(
+            finished_line::<i64>(&Ok(cmd_admission::Delivery::Cancelled)),
+            None
+        );
+        assert_eq!(
+            finished_line::<i64>(&Ok(cmd_admission::Delivery::Delivered)),
+            None
+        );
     }
 }

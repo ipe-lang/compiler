@@ -161,8 +161,11 @@ leave detached children.
 - `drive_session` takes a `WorkGuard` for each turn, next to the existing
   `budget::Turn`, from the input take to the end of the iteration. The
   checkpoint write therefore finishes before the close.
-- A biased first `select!` arm ends the driver on `Closing`, so no `update` and
-  no checkpoint runs after it.
+- Every input the driver takes (Msg, event, entry, revocation close) first
+  takes its unit; one taken after `Closing` is born cancelled and ends the
+  driver, so no `update` and no store call runs after it. The gate sits on the
+  path to every effect, so a parked driver that wakes late is safe without a
+  racing arm.
 - The driver is not counted while it is parked. Counting it would make every
   shutdown wait out the whole grace for idle sessions.
 - The TTL sweep task selects on `Closing` and holds a guard while it runs
@@ -267,7 +270,7 @@ Each one goes red without its fix.
 | T12 | `web/mod.rs` native | the sweep loop at `Closing` ends without starting a sweep; a sweep running at `Closing` holds the settle until it returns | `runtime-full-features` |
 | T13 | `web/mod.rs` native | a page-mint `commit` admitted after `Closing` never calls `store.set` nor runs the seed Cmd | `runtime-full-features` |
 | T14 | `web/mod.rs` native | `dispatch_cmd` logs the dropped-result line only for a closed queue, never for `Ok(Cancelled)` (the explicit `Delivery` match) | `runtime-full-features` |
-| T10 | same e2e file | a `Web.tea` app with a 50 ms `Sub.every` on the SQLite session store: SIGTERM → 0 stderr lines naming a checkpoint or store failure, exit 0, no sidecars | `IPE_E2E=1` e2e shards |
+| T10 | same e2e file | a `Web.tea` app with a 50 ms `Sub.every` on the SQLite session store, grace 0: SIGTERM → exit 0, no `did not stop` line (red if the parked driver were counted), no sidecars. The persistent stores swallow write errors, so a cut checkpoint is invisible here; T11 is the turn guard's proof | `IPE_E2E=1` e2e shards |
 
 - T7 also pins that the `cancel_work` call cannot be removed: drop the call and
   the flag sets.
@@ -289,6 +292,18 @@ Each one goes red without its fix.
 - **Durability gap.** A Cmd cancelled at shutdown is not persisted for replay
   after a restart. This is unchanged: today it is killed the same way. Making
   Cmds durable is a separate design.
+- **Silent store writes.** `SqliteStore`/`PostgresStore` `set`, `delete` and
+  `sweep` discard their query result (`let _ =`), so a checkpoint that fails
+  (a closed pool, a full disk) is lost with no line and no typed outcome. The
+  driver cannot tell a stored checkpoint from a dropped one, and no e2e test
+  can observe a cut turn. Root cause: `SessionStore::set` returns `Installed`
+  only; it needs a typed write outcome (`Stored | Displaced | Failed(kind)`)
+  that `checkpoint` maps, logged once per failure run. Owned by `web/store.rs`,
+  outside this change.
+- **A revoked session left in a persistent store at `Closing`.** A revocation
+  the driver sees after the close ends it without `store.delete` (the pool is
+  closing). Not a hole: a cold row is re-proved at rejoin (`prove_persisted`),
+  so a revoked credential's row is refused there.
 
 ## 9. BUG-CLASSES touched
 
