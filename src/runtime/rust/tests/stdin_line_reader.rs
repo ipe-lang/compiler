@@ -42,6 +42,10 @@ fn child_scenario() -> Option<String> {
 }
 
 /// In a child, reads `reads` lines and prints one report line per read.
+#[allow(
+    clippy::expect_used,
+    reason = "a child that cannot report must fail the test"
+)]
 fn run_child(reads: usize) {
     let mut out = std::io::stdout().lock();
     for _ in 0..reads {
@@ -52,6 +56,10 @@ fn run_child(reads: usize) {
 }
 
 /// Runs `test_name` as a child fed `input` on stdin and returns its report lines.
+#[allow(
+    clippy::expect_used,
+    reason = "a child that cannot be driven must fail the test"
+)]
 fn spawn_child(test_name: &str, input: &[u8]) -> Vec<String> {
     let exe = std::env::current_exe().expect("the test binary must locate itself");
     let mut child = Command::new(exe)
