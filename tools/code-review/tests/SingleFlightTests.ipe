@@ -4184,9 +4184,10 @@ effectOncePerTransition settings otherEpoch a b pair =
 -- task starts in `src` only through `Cmd.perform`, only inside `run` of
 -- `Lib/App.ipe`, the interpreter, exactly once in each effect's arm; and a
 -- batch is built only through `Cmd.batch`, once, inside its `update`. The
--- interpreter builds no model: it holds no record update. `Task.attempt` lowers to the same start, so any use of it
--- is stray, and the Cmd module is imported under its own name exposing
--- nothing, so no other spelling starts a task. Only `src/Main.ipe` imports
+-- interpreter builds no model: it holds no record update. `Task.attempt`
+-- lowers to the same start, so any use of it is stray, and the Cmd module
+-- is imported under its own name exposing nothing, so no other spelling
+-- starts a task. Only `src/Main.ipe` imports
 -- the interpreter, and only the session and the interpreter name an effect.
 -- The modules are lexed as Ipê reads them, so a mention in a comment or a
 -- string is no site.
@@ -4356,8 +4357,8 @@ interpreterFixture =
 interpreterShapeFixtures : Bool
 interpreterShapeFixtures =
     let
-        shape =
-            \effects text -> interpreterShape effects (TextSinkScanTests.lex text).code
+        shape effects text =
+            interpreterShape effects (TextSinkScanTests.lex text).code
 
         swapped =
             String.replace "Cmd.perform (taskA settings) (doneA load)" "Cmd.none" (String.replace "Cmd.perform (taskB settings) (doneB load)" "Cmd.perform (taskB settings) (doneB load) |> also (Cmd.perform (taskA settings) (doneA load))" interpreterFixture)
