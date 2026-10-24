@@ -342,22 +342,39 @@ main =
 "#;
 
 /// A `Web.tea` app whose session ticks every 50 ms, so a driver turn and its
-/// checkpoint write are running whenever the shutdown closes.
-const WEB_SESSION_TICKS: &str = r"module Main exposing (main)
+/// checkpoint write are running whenever the shutdown closes. Its `init` opens
+/// the session-store file through `Ipe.Db`: the `Db` use builds the store's `db`
+/// feature in, and the open switches the file to WAL.
+const WEB_SESSION_TICKS: &str = r#"module Main exposing (main)
 
+import Ipe.Db as Db
+import Ipe.Db.Location as Location exposing (Mode(..))
+import Ipe.Error exposing (Error)
+import Ipe.Path as Path
+import Ipe.Result as Result
 import Ipe.String
+import Ipe.System as System
+import Ipe.Task as Task exposing (Task)
 import Ipe.Tea.Web as Web
 import Ipe.Tea.Web.Cmd
 import Ipe.Tea.Web.Sub
 import Ipe.Ui as Ui
 
-type Msg = Tick | Reset
+type Msg = Tick | Reset | Opened (Result Error ())
 
 type alias Model = { count : Int }
 
+openStoreFile : Task Error ()
+openStoreFile =
+    Path.fromString (System.getenvOr "IPE_WEB_STORE_PATH" "sessions.db")
+        |> Result.andThen (Location.file CreateIfMissing)
+        |> Task.fromResult
+        |> Task.andThen (\location -> Db.open location)
+        |> Task.map (\_ -> ())
+
 init : WebReq -> ( Model, Cmd Msg )
 init _req =
-    ( { count = 0 }, Cmd.none )
+    ( { count = 0 }, Cmd.perform openStoreFile Opened )
 
 update : Msg -> Model -> ( Model, Cmd Msg )
 update msg model =
@@ -367,6 +384,9 @@ update msg model =
 
         Reset ->
             ( { model | count = 0 }, Cmd.none )
+
+        Opened _result ->
+            ( model, Cmd.none )
 
 subscriptions : Model -> Sub Msg
 subscriptions _model =
@@ -385,7 +405,7 @@ main =
         , routes = []
         , notFound = Reset
         }
-";
+"#;
 
 /// A `Web.tea` app whose `init` Cmd opens the `STORE_DB` file through `Ipe.Db`,
 /// writes a row (so the file has a `-wal`), logs that it opened, then queries

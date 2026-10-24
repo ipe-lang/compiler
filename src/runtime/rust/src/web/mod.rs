@@ -19860,10 +19860,10 @@ mod shutdown_work_tests {
     /// Resolve once `drain`'s owner has closed.
     async fn closed(drain: &Drain) {
         loop {
-            if let Ok(work) = drain.work() {
-                if open_work(work).await.is_none() {
-                    return;
-                }
+            if let Ok(work) = drain.work()
+                && open_work(work).await.is_none()
+            {
+                return;
             }
             tokio::time::sleep(Duration::from_millis(1)).await;
         }
