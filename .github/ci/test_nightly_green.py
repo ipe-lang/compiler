@@ -9,12 +9,16 @@ own test, per PRINCIPLES.md "Prove the refusals". Pure stdlib `unittest`.
 
 from __future__ import annotations
 
+import contextlib
 import copy
 import importlib.util
+import io
 import itertools
 import os
+import subprocess
 import sys
 import unittest
+from collections.abc import Callable, Iterator
 from datetime import datetime, timedelta, timezone
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -80,8 +84,11 @@ def _prun(producer: ng.Producer, **over: object) -> dict:
 _JOB_IDS = itertools.count(1)
 
 
-def _jobs_page(rid: int, *jobs: tuple[str, str], total: int | None = None) -> dict:
-    listed = [{"id": next(_JOB_IDS), "name": n, "status": "completed", "conclusion": c, "run_id": rid} for n, c in jobs]
+def _jobs_page(rid: int, *jobs: tuple[str, str], total: int | None = None, attempt: int = 1) -> dict:
+    listed = [
+        {"id": next(_JOB_IDS), "name": n, "status": "completed", "conclusion": c, "run_id": rid, "run_attempt": attempt}
+        for n, c in jobs
+    ]
     return {"total_count": len(listed) if total is None else total, "jobs": listed}
 
 
@@ -103,7 +110,8 @@ class FakeApi:
     `others_own[workflow]` is its commit listing, empty by default.
     `by_id` answers a run's own document, by default its most recently served listed copy.
     `jobs[rid]` answers run rid's job listing pages; by default one page holding every
-    nightly-gate job of its producer, concluded as the run's freshest copy concluded.
+    nightly-gate job of its producer, concluded as the run's freshest copy concluded,
+    stamped with that copy's attempt. `job_attempts` records the attempt every jobs read names.
     """
 
     def __init__(
@@ -138,6 +146,7 @@ class FakeApi:
         self.others.update(others or {})
         self.others_own = others_own or {}
         self.calls: list[str] = []
+        self.job_attempts: list[int] = []
 
     def __call__(self, path: str) -> object:
         self.calls.append(path)
@@ -183,7 +192,8 @@ class FakeApi:
             return pages[page - 1] if page <= len(pages) else {"total_count": pages[0].get("total_count"), "jobs": []}
         run = self.judged[rid]
         (producer,) = [p for p in ng.PRODUCERS if p.path == run.get("path")]
-        return _jobs_page(rid, *((g, str(run.get("conclusion"))) for g in sorted(producer.gates)))
+        gates = ((g, str(run.get("conclusion"))) for g in sorted(producer.gates))
+        return _jobs_page(rid, *gates, attempt=ng._attempt(run))
 
     def _route(self, path: str) -> object:
         if "/pulls/" in path:
@@ -193,8 +203,11 @@ class FakeApi:
         if "/compare/" in path:
             return self.compare
         if path.startswith(f"repos/{REPO}/actions/runs/") and "/jobs?" in path:
-            rid = int(path.split("/actions/runs/", 1)[1].split("/", 1)[0])
-            return self._job_pages(rid, int(path.rsplit("page=", 1)[-1]))
+            rid, rest = path.split("/actions/runs/", 1)[1].split("/", 1)
+            if not rest.startswith("attempts/"):
+                raise AssertionError(f"jobs read not bound to an attempt: {path}")
+            self.job_attempts.append(int(rest.split("/", 2)[1]))
+            return self._job_pages(int(rid), int(path.rsplit("page=", 1)[-1]))
         if path.startswith(f"repos/{REPO}/actions/runs/"):
             return self._reread(int(path.rsplit("/", 1)[-1]))
         if f"repos/{REPO}/actions/runs?" in path:
@@ -221,6 +234,19 @@ class FakeApi:
 
 def _pick(*listings: object, branch: str | None = "main", sha: str | None = None) -> dict | None:
     return ng.newest_run(list(listings), CI, CI.events, branch=branch, sha=sha)
+
+
+@contextlib.contextmanager
+def _patched(**seams: object) -> Iterator[None]:
+    """Replace module attributes of `nightly_green` for the block, restoring them after."""
+    saved = {name: getattr(ng, name) for name in seams}
+    for name, value in seams.items():
+        setattr(ng, name, value)
+    try:
+        yield
+    finally:
+        for name, value in saved.items():
+            setattr(ng, name, value)
 
 
 def _verdict(api: FakeApi, **env: str) -> list[str]:
@@ -731,7 +757,7 @@ class ProducerVerdictTest(unittest.TestCase):
         self.assertTrue(ng.job_errors(jobs, both))
 
     def test_unfinished_job_fails(self) -> None:
-        jobs = {STATIC_ID: [{"total_count": 1, "jobs": [{"id": 1, "name": "linux-cfree-gate (refusal is fail-closed)", "status": "in_progress", "conclusion": None, "run_id": STATIC_ID}]}]}
+        jobs = {STATIC_ID: [{"total_count": 1, "jobs": [{"id": 1, "name": "linux-cfree-gate (refusal is fail-closed)", "status": "in_progress", "conclusion": None, "run_id": STATIC_ID, "run_attempt": 1}]}]}
         self.assertTrue(_verdict(FakeApi(_listing(_run()), jobs=jobs)))
 
     def test_own_dispatch_recovers_only_its_producer(self) -> None:
@@ -764,7 +790,7 @@ class ProducerVerdictTest(unittest.TestCase):
 class JobListingTest(unittest.TestCase):
     def test_pages_cover_the_total(self) -> None:
         jobs = [_jobs_page(5, ("a", "success"), total=2), _jobs_page(5, ("b", "success"), total=2)]
-        self.assertEqual([j["name"] for j in ng.jobs_of(jobs, 5)], ["a", "b"])
+        self.assertEqual([j["name"] for j in ng.jobs_of(jobs, 5, 1)], ["a", "b"])
 
     def test_short_or_malformed_listing_refused(self) -> None:
         for pages in (
@@ -780,7 +806,7 @@ class JobListingTest(unittest.TestCase):
             [_jobs_page(6, ("a", "success"))],
         ):
             with self.subTest(pages), self.assertRaises(ng.NightlyError):
-                ng.jobs_of(pages, 5)
+                ng.jobs_of(pages, 5, 1)
 
     def test_repeated_job_refused(self) -> None:
         # A page that shifted under the read repeats one job where another stood:
@@ -788,7 +814,7 @@ class JobListingTest(unittest.TestCase):
         first = _jobs_page(5, ("a", "success"), total=2)
         again = {"total_count": 2, "jobs": [dict(first["jobs"][0])]}
         with self.assertRaises(ng.NightlyError):
-            ng.jobs_of([first, again], 5)
+            ng.jobs_of([first, again], 5, 1)
 
     def test_job_without_an_id_refused(self) -> None:
         for jid in (None, 0, -1, True, "7"):
@@ -796,7 +822,7 @@ class JobListingTest(unittest.TestCase):
                 page = _jobs_page(5, ("a", "success"))
                 page["jobs"][0]["id"] = jid
                 with self.assertRaises(ng.NightlyError):
-                    ng.jobs_of([page], 5)
+                    ng.jobs_of([page], 5, 1)
 
     def test_listing_past_the_page_bound_refused(self) -> None:
         total = ng.JOBS_PAGE * ng.MAX_JOB_PAGES + 1
@@ -807,19 +833,141 @@ class JobListingTest(unittest.TestCase):
         api = FakeApi(_listing(_run()), jobs={SANDBOX_ID: pages})
         with self.assertRaises(ng.NightlyError):
             _verdict(api)
-        self.assertEqual(sum(f"actions/runs/{SANDBOX_ID}/jobs?" in c for c in api.calls), ng.MAX_JOB_PAGES)
+        self.assertEqual(sum(f"actions/runs/{SANDBOX_ID}/attempts/1/jobs?" in c for c in api.calls), ng.MAX_JOB_PAGES)
 
     def test_every_page_read(self) -> None:
         names = sorted(SANDBOX.gates)
         pages = [_jobs_page(SANDBOX_ID, (names[0], "success"), total=2), _jobs_page(SANDBOX_ID, (names[1], "success"), total=2)]
         api = FakeApi(_listing(_run()), jobs={SANDBOX_ID: pages})
         self.assertEqual(_verdict(api), [])
-        self.assertIn(ng._jobs_path(REPO, SANDBOX_ID, 2), api.calls)
+        self.assertIn(ng._jobs_path(REPO, SANDBOX_ID, 1, 2), api.calls)
 
-    def test_jobs_read_latest_attempt_unfiltered_by_status(self) -> None:
-        path = ng._jobs_path(REPO, 5, 1)
-        self.assertIn("filter=latest", path)
+    def test_jobs_read_the_judged_attempt_listing(self) -> None:
+        path = ng._jobs_path(REPO, 5, 2, 1)
+        self.assertIn(f"repos/{REPO}/actions/runs/5/attempts/2/jobs?", path)
+        self.assertIn("per_page=30", path)
+        self.assertNotIn("filter=", path)
         self.assertNotIn("status=", path)
+
+    def test_rerun_attempt_is_the_one_read(self) -> None:
+        listed = _run(id=5, run_attempt=1, conclusion="failure", updated_at=_stamp(timedelta(hours=7)))
+        document = _run(id=5, run_attempt=2, updated_at=_stamp(timedelta(hours=1)))
+        api = FakeApi(_listing(listed), by_id={5: document})
+        self.assertEqual(_verdict(api), [])
+        ci_reads = [c for c in api.calls if "/actions/runs/5/" in c and "/jobs?" in c]
+        self.assertTrue(ci_reads)
+        self.assertTrue(all("/actions/runs/5/attempts/2/jobs?" in c for c in ci_reads), ci_reads)
+
+    def test_job_of_another_attempt_refused(self) -> None:
+        for bad in (1, None, "2", True, 0, 3):
+            with self.subTest(bad):
+                page = _jobs_page(5, ("a", "success"), ("b", "success"), attempt=2)
+                if bad is None:
+                    del page["jobs"][1]["run_attempt"]
+                else:
+                    page["jobs"][1]["run_attempt"] = bad
+                with self.assertRaises(ng.NightlyError) as caught:
+                    ng.jobs_of([page], 5, 2)
+                self.assertIn("is of attempt", str(caught.exception))
+        self.assertEqual(len(ng.jobs_of([_jobs_page(5, ("a", "success"), attempt=2)], 5, 2)), 1)
+
+    def test_failing_judged_attempt_listing_stays_red(self) -> None:
+        api = FakeApi(_listing(_run()))
+
+        def gateway(path: str) -> object:
+            if "/attempts/" in path and "/jobs?" in path:
+                raise ng.NightlyError(f"`gh api {path}` exited 1: gh: Server Error (HTTP 502)")
+            return api(path)
+
+        class Frozen(datetime):
+            @classmethod
+            def now(cls, tz: object = None) -> datetime:
+                return NOW
+
+        env = {"EVENT_NAME": "pull_request", "HEAD_SHA": SHA, "GITHUB_REF": "", "REPO": REPO}
+        saved_env = dict(os.environ)
+        err = io.StringIO()
+        try:
+            os.environ.update(env)
+            with _patched(_gh_json=gateway, datetime=Frozen), contextlib.redirect_stderr(err):
+                self.assertEqual(ng.main(["--verdict"]), 1)
+        finally:
+            os.environ.clear()
+            os.environ.update(saved_env)
+        self.assertIn("/actions/runs/", err.getvalue())
+        self.assertIn("/attempts/1/jobs?", err.getvalue())
+        self.assertIn("RED", err.getvalue())
+
+
+def _done(returncode: int, stdout: str = "", stderr: str = "") -> subprocess.CompletedProcess[str]:
+    return subprocess.CompletedProcess(["gh", "api"], returncode, stdout, stderr)
+
+
+GATEWAY = "gh: Server Error (HTTP 502)\n"
+
+
+class GhReadTest(unittest.TestCase):
+    """A transient `gh api` failure is retried a bounded number of times; anything else refuses at once."""
+
+    def read(self, answers: list[Callable[[], subprocess.CompletedProcess[str]]]) -> tuple[object, int, list[int]]:
+        """Run `_gh_json` over scripted `gh` answers; return its result, the `gh` runs made, and the pauses."""
+        runs: list[str] = []
+        pauses: list[int] = []
+
+        def gh(path: str) -> subprocess.CompletedProcess[str]:
+            runs.append(path)
+            return answers[min(len(runs), len(answers)) - 1]()
+
+        with _patched(_gh_run=gh, _pause=pauses.append):
+            try:
+                result: object = ng._gh_json("repos/x/y")
+            except ng.NightlyError as exc:
+                result = exc
+        return result, len(runs), pauses
+
+    def test_transient_gh_failure_is_retried_then_green(self) -> None:
+        result, runs, pauses = self.read([lambda: _done(1, stderr=GATEWAY), lambda: _done(0, stdout='{"ok": 1}')])
+        self.assertEqual(result, {"ok": 1})
+        self.assertEqual(runs, 2)
+        self.assertEqual(pauses, [2])
+
+    def test_persistent_transient_failure_stays_red(self) -> None:
+        result, runs, pauses = self.read([lambda: _done(1, stderr=GATEWAY)])
+        self.assertIsInstance(result, ng.NightlyError)
+        self.assertIn("HTTP 502", str(result))
+        self.assertEqual(runs, ng.GH_TRIES)
+        self.assertEqual(pauses, list(ng.GH_BACKOFF_S))
+
+    def test_refused_gh_failure_not_retried(self) -> None:
+        for answer in (lambda: _done(1, stderr="gh: Not Found (HTTP 404)\n"), lambda: _done(0, stdout="<html>")):
+            result, runs, pauses = self.read([answer, lambda: _done(0, stdout="{}")])
+            self.assertIsInstance(result, ng.NightlyError)
+            self.assertEqual(runs, 1)
+            self.assertEqual(pauses, [])
+
+    def test_stream_reset_and_timeout_are_transient(self) -> None:
+        for stderr, want in (
+            ("stream error: stream ID 1; CANCEL; received from peer", ng.GhFailure.TRANSIENT),
+            ("gh: Service Unavailable (HTTP 503)", ng.GhFailure.TRANSIENT),
+            ("gh: Bad Gateway (HTTP 502) after 30s", ng.GhFailure.TRANSIENT),
+            ("gh: Not Found (HTTP 404)", ng.GhFailure.REFUSED),
+            ("gh: Forbidden (HTTP 403)", ng.GhFailure.REFUSED),
+            ("HTTP 502", ng.GhFailure.REFUSED),
+            ("", ng.GhFailure.REFUSED),
+        ):
+            with self.subTest(stderr):
+                self.assertEqual(ng.classify(1, stderr), want)
+        self.assertEqual(ng.classify(0, GATEWAY), ng.GhFailure.REFUSED)
+
+        def timeout() -> subprocess.CompletedProcess[str]:
+            raise subprocess.TimeoutExpired(["gh", "api"], ng.GH_TIMEOUT_S)
+
+        result, runs, pauses = self.read([timeout, lambda: _done(0, stdout="[]")])
+        self.assertEqual(result, [])
+        self.assertEqual((runs, pauses), (2, [2]))
+        result, runs, _ = self.read([timeout])
+        self.assertIsInstance(result, ng.NightlyError)
+        self.assertEqual(runs, ng.GH_TRIES)
 
 
 def _manifest(*entries: tuple[str, str, str]) -> dict:

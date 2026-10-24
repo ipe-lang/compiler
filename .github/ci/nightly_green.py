@@ -16,10 +16,12 @@ producer is proven green, each in one of two ways:
      in this repository (a tag or branch merely named `main` proves nothing),
      and its jobs are green.
 
-A run's jobs are green when every `nightly-gate` context of the producer is a
-job that concluded `success`, and every other job concluded `success` or
-`skipped` — except a job whose context the manifest declares non-blocking
-(`NON_BLOCKING_DISPOSITIONS`). A job the manifest does not name blocks: an
+A run's jobs are read from the listing of the very attempt its own document
+names (`attempts/<n>/jobs`, immutable once that attempt concluded), and every
+job must belong to that attempt. They are green when every `nightly-gate`
+context of the producer is a job that concluded `success`, and every other job
+concluded `success` or `skipped` — except a job whose context the manifest
+declares non-blocking (`NON_BLOCKING_DISPOSITIONS`). A job the manifest does not name blocks: an
 unknown job is never assumed harmless.
 
 Absence is not a pass: no run, a missing gate job, an unreadable listing, an
@@ -42,8 +44,10 @@ import os
 import re
 import subprocess
 import sys
+import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from enum import Enum
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO_ROOT = os.path.dirname(os.path.dirname(HERE))
@@ -54,13 +58,21 @@ MAIN = "main"
 MAX_AGE_H = 48
 # Runs fetched per listing; the newest matching run across all listings is judged.
 LISTING_PAGE = 20
-# Jobs fetched per page of a run's job listing, and the most pages read; a run
-# with more jobs than the bound covers is refused, never judged on a prefix.
-JOBS_PAGE = 100
-MAX_JOB_PAGES = 10
+# Jobs fetched per page of an attempt's job listing, and the most pages read; a
+# run with more jobs than the bound covers is refused, never judged on a prefix.
+# The page is GitHub's default size: a rerun attempt's listing is rendered with
+# its carried-forward jobs, and large pages of it fail at the gateway.
+JOBS_PAGE = 30
+MAX_JOB_PAGES = 34
 # Fields a run is judged on; two equally fresh copies of one run must agree on them.
 _JUDGED_FIELDS = ("event", "path", "status", "conclusion", "head_branch", "head_sha", "created_at")
 GH_TIMEOUT_S = 60
+# Tries per `gh api` read, and the pause before each retry; only a transient
+# failure (`GhFailure.TRANSIENT`) is retried, and the last one stays a refusal.
+GH_TRIES = 3
+GH_BACKOFF_S: tuple[int, ...] = (2, 5)
+if len(GH_BACKOFF_S) != GH_TRIES - 1:
+    raise SystemExit("nightly_green.py: GH_BACKOFF_S must hold one pause per retry (GH_TRIES - 1)")
 VERDICT_INVOCATION = "python3 .github/ci/nightly_green.py --verdict"
 EXPECTED_ENV = {
     "EVENT_NAME": "${{ github.event_name }}",
@@ -84,6 +96,17 @@ _QUEUE_REF = re.compile(r"refs/heads/gh-readonly-queue/main/pr-([1-9][0-9]{0,9})
 
 class NightlyError(Exception):
     """A listing, run, or event shape that proves nothing."""
+
+
+class GhFailure(Enum):
+    """How a failed `gh api` read failed: worth a bounded retry, or final."""
+
+    TRANSIENT = "transient"  # gateway 5xx, HTTP/2 stream reset, timeout
+    REFUSED = "refused"  # everything else (4xx, auth, bad path)
+
+
+# gh's stderr for a 5xx (`gh: Server Error (HTTP 502)`) or an HTTP/2 stream reset.
+_TRANSIENT = re.compile(r"\(HTTP 5\d\d\)|^stream error: ", re.M)
 
 
 @dataclass(frozen=True)
@@ -304,13 +327,13 @@ def run_errors(
     return errors
 
 
-def jobs_of(pages: list[object], rid: int) -> list[dict]:
-    """Return the jobs `pages` (a run's job listing, page by page) hold for run `rid`.
+def jobs_of(pages: list[object], rid: int, attempt: int) -> list[dict]:
+    """Return the jobs `pages` (attempt `attempt` of run `rid`'s job listing, page by page) hold.
 
     The pages must cover the listing's `total_count` exactly with distinct
     jobs (a page that shifts under the read repeats one job in place of
-    another), and every job must name `rid` and carry a positive id and a
-    string name; anything else refuses.
+    another), and every job must name `rid` and `attempt` and carry a positive
+    id and a string name; anything else refuses.
     """
     jobs: list[dict] = []
     ids: set[int] = set()
@@ -329,6 +352,8 @@ def jobs_of(pages: list[object], rid: int) -> list[dict]:
                 raise NightlyError(f"run {rid} job listing entry is not a named job")
             if job.get("run_id") != rid:
                 raise NightlyError(f"run {rid} job listing holds a job of run {job.get('run_id')!r}")
+            if _positive_int(job.get("run_attempt")) != attempt:
+                raise NightlyError(f"run {rid} job {job['name']!r} is of attempt {job.get('run_attempt')!r}, not {attempt}")
             jid = _positive_int(job.get("id"))
             if jid is None:
                 raise NightlyError(f"run {rid} job {job['name']!r} id {job.get('id')!r} is not a positive integer")
@@ -399,16 +424,45 @@ def change_sha_source(event: str, head_sha: str, head_ref: str) -> tuple[str, st
     raise NightlyError(f"event {event!r} is not one nightly-green judges")
 
 
+def classify(returncode: int, stderr: str) -> GhFailure:
+    """Return whether a `gh api` exit is a transient gateway failure; anything unrecognised is final."""
+    if returncode != 0 and _TRANSIENT.search(stderr):
+        return GhFailure.TRANSIENT
+    return GhFailure.REFUSED
+
+
+def _gh_run(path: str) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(["gh", "api", path], check=False, capture_output=True, text=True, timeout=GH_TIMEOUT_S)
+
+
+_pause = time.sleep
+
+
 def _gh_json(path: str) -> object:
-    proc = subprocess.run(
-        ["gh", "api", path], check=False, capture_output=True, text=True, timeout=GH_TIMEOUT_S
-    )
-    if proc.returncode != 0:
-        raise NightlyError(f"`gh api {path}` exited {proc.returncode}: {proc.stderr.strip()}")
-    try:
-        return json.loads(proc.stdout)
-    except json.JSONDecodeError as exc:
-        raise NightlyError(f"`gh api {path}` returned non-JSON: {exc}") from exc
+    """Return the JSON `gh api path` answers, retrying a transient failure at most `GH_TRIES` times in all.
+
+    A refused read, a non-JSON body, or a transient failure on the last try
+    raises: a read that never succeeds stays a refusal.
+    """
+    last = ""
+    for tried in range(GH_TRIES):
+        try:
+            proc = _gh_run(path)
+        except subprocess.TimeoutExpired:
+            failure, last = GhFailure.TRANSIENT, f"timed out after {GH_TIMEOUT_S}s"
+        else:
+            if proc.returncode == 0:
+                try:
+                    return json.loads(proc.stdout)
+                except json.JSONDecodeError as exc:
+                    raise NightlyError(f"`gh api {path}` returned non-JSON: {exc}") from exc
+            failure = classify(proc.returncode, proc.stderr)
+            last = f"exited {proc.returncode}: {proc.stderr.strip()}"
+        if failure is GhFailure.REFUSED:
+            raise NightlyError(f"`gh api {path}` {last}")
+        if tried < len(GH_BACKOFF_S):
+            _pause(GH_BACKOFF_S[tried])
+    raise NightlyError(f"`gh api {path}` failed transiently {GH_TRIES} times; last {last}")
 
 
 def _listing_paths(repo: str, producer: Producer, event: str, scope: str) -> tuple[str, ...]:
@@ -426,8 +480,8 @@ def _listing_paths(repo: str, producer: Producer, event: str, scope: str) -> tup
     )
 
 
-def _jobs_path(repo: str, rid: int, page: int) -> str:
-    return f"repos/{repo}/actions/runs/{rid}/jobs?filter=latest&per_page={JOBS_PAGE}&page={page}"
+def _jobs_path(repo: str, rid: int, attempt: int, page: int) -> str:
+    return f"repos/{repo}/actions/runs/{rid}/attempts/{attempt}/jobs?per_page={JOBS_PAGE}&page={page}"
 
 
 def _reread(repo: str, run: dict) -> dict:
@@ -444,12 +498,17 @@ def _reread(repo: str, run: dict) -> dict:
     return _fresher(run, fresh)
 
 
-def _jobs(repo: str, rid: int) -> list[dict]:
-    """Read run `rid`'s latest job results, page by page, at most `MAX_JOB_PAGES` pages."""
+def _jobs(repo: str, run: dict) -> list[dict]:
+    """Read the jobs of the judged copy `run`'s own attempt, page by page, at most `MAX_JOB_PAGES` pages.
+
+    The attempt is the one the judged run document names, never "the latest at
+    read time": a rerun started mid-read cannot substitute its jobs.
+    """
+    rid, attempt = _run_id(run), _attempt(run)
     pages: list[object] = []
     collected = 0
     for number in range(1, MAX_JOB_PAGES + 1):
-        page = _gh_json(_jobs_path(repo, rid, number))
+        page = _gh_json(_jobs_path(repo, rid, attempt, number))
         pages.append(page)
         jobs = page.get("jobs") if isinstance(page, dict) else None
         count = page.get("total_count") if isinstance(page, dict) else None
@@ -458,7 +517,7 @@ def _jobs(repo: str, rid: int) -> list[dict]:
         collected += len(jobs)
         if collected >= count:
             break
-    return jobs_of(pages, rid)
+    return jobs_of(pages, rid, attempt)
 
 
 def _newest(
@@ -489,7 +548,7 @@ def _proof_errors(
         errors = on_main_errors(repo, run)
         if errors:
             return errors
-    return job_errors(_jobs(repo, _run_id(run)), producer)
+    return job_errors(_jobs(repo, run), producer)
 
 
 def producer_errors(repo: str, producer: Producer, change_sha: str | None, now: datetime) -> list[str]:
