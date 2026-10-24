@@ -933,6 +933,9 @@ enum FetchFailure {
     NoWindow,
     /// The browser cannot build a `Headers` object.
     HeadersUnavailable,
+    /// The browser cannot build the `AbortController` that carries the
+    /// request deadline, so the request is refused rather than sent unbounded.
+    DeadlineUnavailable,
 }
 
 #[cfg(any(test, all(target_arch = "wasm32", feature = "wasm-client")))]
@@ -954,6 +957,9 @@ impl std::fmt::Display for FetchFailure {
             Self::NotAResponse => f.write_str("http: fetch did not return a Response"),
             Self::NoWindow => f.write_str("http: no window (not a browser context?)"),
             Self::HeadersUnavailable => f.write_str("http: failed to build request headers"),
+            Self::DeadlineUnavailable => {
+                f.write_str("http: the browser cannot arm the request deadline")
+            }
         }
     }
 }
@@ -978,7 +984,8 @@ impl FetchFailure {
             | Self::NetworkOrCors
             | Self::NotAResponse
             | Self::NoWindow
-            | Self::HeadersUnavailable => text.into(),
+            | Self::HeadersUnavailable
+            | Self::DeadlineUnavailable => text.into(),
         }
     }
 }
@@ -1034,14 +1041,15 @@ async fn do_fetch<E: From<String> + FromLimitExceeded + FromIpeError + 'static>(
 
     // Timeout via `AbortController` — the browser analogue of the native
     // request deadline. A fired abort rejects the fetch Promise; the signal's
-    // aborted flag then tells a deadline from a network or CORS failure.
-    let controller = web_sys::AbortController::new().ok();
-    let _timeout_handle = controller.as_ref().map(|ctl| {
-        init.set_signal(Some(&ctl.signal()));
-        let ctl = ctl.clone();
-        gloo_timers::callback::Timeout::new(timeout.millis(), move || {
-            ctl.abort();
-        })
+    // aborted flag then tells a deadline from a network or CORS failure. With
+    // no controller there is no deadline, so the request is never sent.
+    let Ok(controller) = web_sys::AbortController::new() else {
+        return IpeResult::Err(FetchFailure::DeadlineUnavailable.into_error());
+    };
+    init.set_signal(Some(&controller.signal()));
+    let abort = controller.clone();
+    let _timeout_handle = gloo_timers::callback::Timeout::new(timeout.millis(), move || {
+        abort.abort();
     });
 
     // The browser's thrown value is dropped unread: its text echoes the URL.
@@ -1052,10 +1060,7 @@ async fn do_fetch<E: From<String> + FromLimitExceeded + FromIpeError + 'static>(
     let resp_value = match JsFuture::from(window.fetch_with_request(&request)).await {
         Ok(v) => v,
         Err(_) => {
-            let timed_out = controller
-                .as_ref()
-                .is_some_and(|ctl| ctl.signal().aborted());
-            let failure = if timed_out {
+            let failure = if controller.signal().aborted() {
                 FetchFailure::TimedOut
             } else {
                 FetchFailure::NetworkOrCors
@@ -1240,6 +1245,7 @@ mod tests {
             FetchFailure::NotAResponse,
             FetchFailure::NoWindow,
             FetchFailure::HeadersUnavailable,
+            FetchFailure::DeadlineUnavailable,
         ]
     }
 
@@ -1261,6 +1267,7 @@ mod tests {
             FetchFailure::NotAResponse => 9,
             FetchFailure::NoWindow => 10,
             FetchFailure::HeadersUnavailable => 11,
+            FetchFailure::DeadlineUnavailable => 12,
         }
     }
 
@@ -1326,7 +1333,7 @@ mod tests {
         let failures = every_fetch_failure();
         let positions: Vec<usize> = failures.iter().map(fetch_failure_position).collect();
         let expected: Vec<usize> =
-            (0..=fetch_failure_position(&FetchFailure::HeadersUnavailable)).collect();
+            (0..=fetch_failure_position(&FetchFailure::DeadlineUnavailable)).collect();
         assert_eq!(positions, expected, "every variant appears once, in order");
         for failure in &failures {
             let shown = failure.to_string();

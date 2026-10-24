@@ -4,14 +4,16 @@
 //! invoke no macro at all, so no formatting macro can interpolate a browser
 //! error, URL, or header into an error string there, whatever name it is
 //! reached by, and no macro body can hide code the scan cannot read. Every
-//! `IpeResult::Err(..)` it builds must carry either a `FetchFailure` turned
-//! into an error by `into_error()`, or the `body_refusal` the capped body
-//! reader returned, whose texts are fixed. A shape the scan does not recognise
-//! turns it red.
+//! `Err(..)` it builds, by any path ending in `Err`, must carry either a
+//! `FetchFailure` turned into an error by `into_error()`, or the
+//! `body_refusal` the capped body reader returned, whose texts are fixed. An
+//! `Err` constructor named but not called, and any `use .. as ..` rename, turn
+//! it red too, so the constructor cannot be reached under another name. A
+//! shape the scan does not recognise turns it red.
 #![cfg(not(target_arch = "wasm32"))]
 
 use syn::visit::{self, Visit};
-use syn::{Expr, ExprCall, File, Item, ItemFn, Macro, Path};
+use syn::{Expr, ExprCall, ExprPath, File, Item, ItemFn, Macro, Path, UseRename};
 
 /// The `http_client.rs` source the scan reads.
 const HTTP_CLIENT: &str = include_str!("../src/http_client.rs");
@@ -27,8 +29,20 @@ const FAILURE_BINDING: &str = "failure";
 enum Finding {
     /// A macro invocation inside `do_fetch`, by its last path segment.
     Macro(String),
-    /// An `IpeResult::Err` argument that is not a fixed-text failure.
+    /// An `Err` constructor argument that is not a fixed-text failure.
     UntypedErr,
+    /// An `Err` constructor named as a value rather than called.
+    ErrAsValue,
+    /// A `use .. as ..` rename inside `do_fetch`.
+    Rename(String),
+}
+
+/// Whether `path` ends in the `Err` constructor, whatever its prefix:
+/// `Err`, `IpeResult::Err`, `crate::IpeResult::Err`, `IpeResult::<E, T>::Err`.
+fn ends_in_err(path: &Path) -> bool {
+    path.segments
+        .last()
+        .is_some_and(|segment| segment.ident == "Err")
 }
 
 /// Whether `path` names `segments` exactly, ignoring generic arguments.
@@ -95,14 +109,31 @@ impl<'ast> Visit<'ast> for BodyScan {
 
     fn visit_expr_call(&mut self, call: &'ast ExprCall) {
         if let Expr::Path(func) = call.func.as_ref()
-            && path_is(&func.path, &["IpeResult", "Err"])
+            && ends_in_err(&func.path)
         {
             let admitted = call.args.len() == 1 && call.args.first().is_some_and(admitted_err_arg);
             if !admitted {
                 self.findings.push(Finding::UntypedErr);
             }
+            for arg in &call.args {
+                self.visit_expr(arg);
+            }
+            return;
         }
         visit::visit_expr_call(self, call);
+    }
+
+    fn visit_expr_path(&mut self, path: &'ast ExprPath) {
+        if ends_in_err(&path.path) {
+            self.findings.push(Finding::ErrAsValue);
+        }
+        visit::visit_expr_path(self, path);
+    }
+
+    fn visit_use_rename(&mut self, rename: &'ast UseRename) {
+        self.findings
+            .push(Finding::Rename(rename.rename.to_string()));
+        visit::visit_use_rename(self, rename);
     }
 }
 
@@ -212,6 +243,51 @@ fn a_fixed_text_failure_passes_the_scan() {
         }
     ";
     assert_eq!(scan(source), ScanOutcome::Scanned(Vec::new()));
+}
+
+#[test]
+fn a_foreign_error_under_a_longer_path_trips_the_scan() {
+    for call in [
+        "crate::IpeResult::Err(e.into())",
+        "Err(e.into())",
+        "IpeResult::<E, R>::Err(e.into())",
+    ] {
+        let source = format!(
+            "async fn do_fetch() -> IpeResult<E, R> {{ let Err(e) = go() else {{ return ok() }}; \
+             {call} }}"
+        );
+        assert_eq!(
+            scan(&source),
+            ScanOutcome::Scanned(vec![Finding::UntypedErr]),
+            "{call}"
+        );
+    }
+}
+
+#[test]
+fn a_renamed_or_unapplied_err_constructor_trips_the_scan() {
+    let renamed = r"
+        async fn do_fetch() -> IpeResult<E, R> {
+            use IpeResult::Err as Fail;
+            let Err(e) = go() else { return ok() };
+            Fail(e.into())
+        }
+    ";
+    assert_eq!(
+        scan(renamed),
+        ScanOutcome::Scanned(vec![Finding::Rename("Fail".to_owned())])
+    );
+    let unapplied = r"
+        async fn do_fetch() -> IpeResult<E, R> {
+            let fail = IpeResult::Err;
+            let Err(e) = go() else { return ok() };
+            fail(e.into())
+        }
+    ";
+    assert_eq!(
+        scan(unapplied),
+        ScanOutcome::Scanned(vec![Finding::ErrAsValue])
+    );
 }
 
 #[test]
