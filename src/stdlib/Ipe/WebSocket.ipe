@@ -193,6 +193,11 @@ withHeaders headers cfg =
 -- | Override the handshake timeout (default 30 s).  Takes a typed
 -- `Ipe.Duration` (e.g. `Duration.seconds 30`); the raw milliseconds are
 -- unwrapped into the transport DTO for the runtime.
+--
+-- The runtime admits a deadline from 1 millisecond to 10 minutes and refuses
+-- the connect with an `InvalidInput` error otherwise: `Duration.zero` is no
+-- deadline (never "the default"), and a span past 10 minutes is refused rather
+-- than cut down.
 withTimeout : Duration -> WebSocketCfg -> WebSocketCfg
 withTimeout timeout cfg =
     { cfg | timeout = Duration.toMillis timeout }
@@ -200,7 +205,9 @@ withTimeout timeout cfg =
 
 -- | Override the ping interval (default 30 s).  Takes a typed `Ipe.Duration`;
 -- `Duration.zero` disables application-level pings entirely.  The raw
--- milliseconds are unwrapped into the transport DTO for the runtime.
+-- milliseconds are unwrapped into the transport DTO for the runtime, which
+-- admits `Duration.zero` or a span from 1 millisecond to 10 minutes and
+-- refuses the connect with an `InvalidInput` error otherwise.
 withPingInterval : Duration -> WebSocketCfg -> WebSocketCfg
 withPingInterval interval cfg =
     { cfg | pingInterval = Duration.toMillis interval }

@@ -56,6 +56,7 @@ pub mod csp;
 pub mod entropy;
 pub mod time;
 pub mod trace;
+pub mod transport_timeout;
 pub use basics::*;
 pub use cache::*;
 pub use color::*;
