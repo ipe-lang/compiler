@@ -1372,9 +1372,13 @@ fn a_web_cmd_past_the_grace_is_cancelled_before_the_pools_close() -> Result<(), 
 }
 
 /// E12: a ticking session on the SQLite session store, signalled with no
-/// grace, stops its driver turns before the store's pool closes: no line names
-/// a failed checkpoint or store write, the exit is 0 and the session file keeps
-/// no `-wal` or `-shm`.
+/// grace, ends cleanly: the exit is 0, no unit of work outlives its cancel
+/// deadline (a parked driver counted as work would), nothing panics, and the
+/// session file keeps no `-wal` or `-shm`.
+///
+/// The store writes no line when a checkpoint fails, so a turn cut by the
+/// pool close is not visible here; the turn's hold on the close is proved by
+/// `a_driver_turn_at_closing_writes_its_checkpoint_then_ends` in the runtime.
 #[test]
 fn a_ticking_session_stops_its_turns_before_the_store_closes() -> Result<(), BoxError> {
     if e2e_support::e2e_tier() == e2e_support::Tier::Unit {

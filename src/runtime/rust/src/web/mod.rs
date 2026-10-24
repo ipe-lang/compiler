@@ -19439,11 +19439,14 @@ mod web_revocation_tests {
         let code = production_only(&code_only(include_str!("mod.rs")));
         let bodies = fn_bodies(&code);
         let page = sole_body(&code, &bodies, "serve_page");
+        let taken =
+            page.find("letdrain=crate::server::shutdown::drain();letOk(work)=drain.work()else{");
         let commit = page.find("tokio::spawn(under_work(work,asyncmove{");
         let write = page.find("store.set(");
         assert!(
-            commit.is_some_and(|c| write.is_some_and(|w| c < w)),
-            "the page mint writes the store only inside its unit of work: {page}"
+            taken.is_some_and(|t| commit.is_some_and(|c| t < c))
+                && commit.is_some_and(|c| write.is_some_and(|w| c < w)),
+            "the page mint takes its unit from the shutdown and writes the store only inside it: {page}"
         );
         let sweeps = call_owners(&code, &bodies, "store", "sweep");
         assert!(
@@ -19460,8 +19463,8 @@ mod web_revocation_tests {
         );
         let driver = sole_body(&code, &bodies, "drive_session");
         assert!(
-            driver.matches("turn_work(&drain)").count() >= 3,
-            "each driver turn takes a unit of work: {driver}"
+            driver.matches("turn_work(&drain)").count() == 4,
+            "each driver turn (Msg, event, entry, revoked close) takes a unit of work: {driver}"
         );
         let dispatch = sole_body(&code, &bodies, "dispatch_cmd");
         assert!(
