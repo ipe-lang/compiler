@@ -226,3 +226,24 @@ test("events queued while the server is unreachable reach it in order", async ({
   await expect.poll(() => delivered, { timeout: 20000 }).toEqual(["e2e-A", "e2e-B", "e2e-C"]);
   await expect.poll(queued).toEqual([]);
 });
+
+test("a dropped connection replaces a standing refusal, which returns once it recovers", async ({ page }) => {
+  await open(page);
+  await page.route("**/_ipe/event", (route) =>
+    route.fulfill({ status: 400, contentType: "text/plain", body: "e2e" }),
+  );
+  await page.getByRole("button", { name: "Locate" }).click();
+  await expect(refusedBanner(page, "refused")).toBeVisible({ timeout: 10000 });
+  await page.unroute("**/_ipe/event");
+
+  // The stream drops: the banner says so, over the refusal notice.
+  await page.route("**/_ipe/sse**", (route) => route.abort());
+  await page.evaluate(() => window.__ipeForceReopenSSE());
+  const banner = page.locator("#__ipe-status");
+  await expect(banner).toHaveClass(/ipe-status--reconnecting/, { timeout: 10000 });
+  await expect(page.locator("#__ipe-status[data-ipe-refused]")).toHaveCount(0);
+
+  // The stream recovers: the refusal still stands, so its notice returns.
+  await page.unroute("**/_ipe/sse**");
+  await expect(refusedBanner(page, "refused")).toBeVisible({ timeout: 15000 });
+});

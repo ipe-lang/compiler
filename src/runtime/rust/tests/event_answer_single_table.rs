@@ -376,3 +376,93 @@ fn a_refused_event_is_never_sent_again() {
         "`__ipeInputsSnapshot` must release a refused value once the input no longer shows it"
     );
 }
+
+#[test]
+fn no_answer_field_is_read_by_name() {
+    let source = code();
+    for field in ["status", "ok", "statusText"] {
+        for quote in ['"', '\'', '`'] {
+            let read = format!("[{quote}{field}{quote}]");
+            assert!(
+                !source.contains(&read),
+                "client.js reads `{read}`; an event answer's status is read only as `r.status` in `{THE_TABLE}`"
+            );
+        }
+    }
+    let ok_reads = field_reads(&source, "ok");
+    let stray: Vec<&(usize, String)> = ok_reads
+        .iter()
+        .filter(|(_, receiver)| receiver != "data")
+        .collect();
+    assert!(
+        stray.is_empty(),
+        "`.ok` is read off {stray:?}; only the stream's `data.ok` frame field is read"
+    );
+    assert!(
+        ok_reads.len() == 2,
+        "client.js reads `data.ok` {} times, expected the stream frame's 2",
+        ok_reads.len()
+    );
+}
+
+#[test]
+fn the_queue_slot_is_released_only_by_the_post_holding_it() {
+    let source = code();
+    let poster = body_of(&source, THE_POSTER);
+    assert!(
+        source.contains("var __ipeQueueInFlight = null;"),
+        "`__ipeQueueInFlight` must hold the posted body or null"
+    );
+    assert!(
+        poster.contains("if (fromQueue) __ipeQueueInFlight = body;"),
+        "`{THE_POSTER}` must hold the queue slot with the body it posts"
+    );
+    let release = "if (__ipeQueueInFlight === body) __ipeQueueInFlight = null;";
+    let releases = poster.matches(release).count();
+    assert!(
+        releases == 2,
+        "`{THE_POSTER}` releases the queue slot from {releases} sites; the answer and the network failure are the two"
+    );
+    let writes = source.matches("__ipeQueueInFlight = ").count();
+    assert!(
+        writes == releases + 2,
+        "client.js writes `__ipeQueueInFlight` {writes} times; only its declaration, the post holding it and that post's two releases do"
+    );
+}
+
+#[test]
+fn a_refusal_notice_stands_for_a_connection_that_is_up() {
+    let source = code();
+    let mapping = body_of(&source, "__ipeConnectionStatus");
+    assert!(
+        mapping.contains("return __ipeStatus === \"refused\" ? \"connected\" : __ipeStatus;"),
+        "`__ipeConnectionStatus` must read a refusal notice as a connection that is up"
+    );
+    assert!(
+        !source.contains("__ipeStatus === \"connected\""),
+        "a test of `__ipeStatus === \"connected\"` misses the refusal notice; test `__ipeConnectionStatus()`"
+    );
+    let not_connected = "__ipeStatus !== \"connected\"";
+    let setter = format!("{not_connected}) {{ __ipeSetStatus(\"connected\", \"\");");
+    let setters = source.matches(&setter).count();
+    let tests = source.matches(not_connected).count();
+    assert!(
+        tests == setters,
+        "{tests} tests of `{not_connected}`, {setters} of them only to set \"connected\"; any other must test `__ipeConnectionStatus()`"
+    );
+    let beat = body_of(&source, "__ipeLiveBeat");
+    assert!(
+        beat.contains("status: __ipeConnectionStatus()"),
+        "the leader must tell the other tabs its connection state, never its own refusal notice"
+    );
+    let mirror = body_of(&source, "__ipeLiveMirror");
+    assert!(
+        mirror.contains("var mine = __ipeConnectionStatus(); if (status === mine) return;")
+            && !mirror.contains("__ipeLiveStatuses.indexOf(__ipeStatus)"),
+        "a tab mirrors the leader's connection against its own connection state, its refusal notice included"
+    );
+    assert!(
+        source.contains("var __ipeLiveStatuses = [\"connected\", \"reconnecting\", \"offline\"];"),
+        "the statuses tabs share are the connection's three; a refusal notice is one tab's own"
+    );
+}

@@ -1550,9 +1550,11 @@ function __ipeEventAnswer(r) {
   if (status === 413 || status === 414 || status === 431) return __IPE_EVENT_ANSWER.TOO_LARGE;
   return __IPE_EVENT_ANSWER.REFUSED;
 }
-// True while a queued event is posted and unanswered. Queued events go one at
-// a time, so a later one never reaches the server before an earlier one.
-var __ipeQueueInFlight = false;
+// The queued event posted and still unanswered, or null. Queued events go one
+// at a time, so a later one never reaches the server before an earlier one.
+// Only the post holding it releases it: a late answer to an earlier post never
+// frees the slot a later one holds.
+var __ipeQueueInFlight = null;
 // `fromQueue` marks the head of the retry queue. A live event posted while
 // the queue holds or posts events joins its tail, so it never overtakes them.
 function __ipePostEvent(body, fromQueue) {
@@ -1562,7 +1564,7 @@ function __ipePostEvent(body, fromQueue) {
     if (__ipeRetryTimer === null && !__ipeQueueInFlight) __ipeDrainQueue();
     return;
   }
-  if (fromQueue) __ipeQueueInFlight = true;
+  if (fromQueue) __ipeQueueInFlight = body;
   // Phase 1.2 — attach the per-session CSRF token. The server-side
   // middleware () rejects POSTs
   // without a matching X-Ipe-Csrf / __ipe_csrf cookie pair. Empty
@@ -1576,7 +1578,7 @@ function __ipePostEvent(body, fromQueue) {
     body: JSON.stringify(body),
     credentials: "same-origin"
   }).then(function(r){
-    if (fromQueue) __ipeQueueInFlight = false;
+    if (__ipeQueueInFlight === body) __ipeQueueInFlight = null;
     var kind = __ipeEventAnswer(r);
     switch (kind) {
       case __IPE_EVENT_ANSWER.STALE:
@@ -1652,7 +1654,7 @@ function __ipePostEvent(body, fromQueue) {
       __ipeHandleResponse(data.seq, data.ackInputs, function() {}, data.globalSeq);
     });
   }).catch(function() {
-    if (fromQueue) __ipeQueueInFlight = false;
+    if (__ipeQueueInFlight === body) __ipeQueueInFlight = null;
     __ipeLoaderEnd();
     __ipeOnPostFailure(body, fromQueue);
   });
@@ -1750,7 +1752,7 @@ function __ipeShowReconnecting() {
   // fire when the new binary answers. If the reconnect does NOT land inside the
   // window (a genuine connection loss), we fall through to the amber banner.
   if (__ipeSwapToast && __ipeInFastReconnect()) return;
-  if (__ipeStatus === "connected" || __ipeStatus === "refused") {
+  if (__ipeConnectionStatus() === "connected") {
     __ipeSetStatus("reconnecting", __ipeMsgReconnecting);
   }
 }
@@ -2439,6 +2441,12 @@ var __ipeStatusEl = null;               // banner root, set on DOMContentLoaded
 var __ipeStatusMsgEl = null;            // text node child
 var __ipeStatusGraceTimer = null;       // 500ms anti-flicker timer
 var __ipeBuildOkTimer = null;           // auto-hide timer for build-ok toast
+// The connection state the banner stands for. A refusal notice is drawn over a
+// connection that is up, so it reads as "connected": a dropped connection
+// replaces it, and another tab mirrors the connection, never this tab's notice.
+function __ipeConnectionStatus() {
+  return __ipeStatus === "refused" ? "connected" : __ipeStatus;
+}
 function __ipeSetStatus(state, msg) {
   // A stale document keeps its banner: no later state replaces it.
   if (__ipeStale) return;
@@ -2804,7 +2812,7 @@ function __ipeOpenSSE() {
     // response received yet). Show the banner only if the situation
     // persists past the grace window — a quick error+reopen burst
     // shouldn't paint chrome.
-    if (__ipeStatus !== "connected") return;
+    if (__ipeConnectionStatus() !== "connected") return;
     if (__ipeStatusGraceTimer !== null) return;
     __ipeStatusGraceTimer = setTimeout(function() {
       __ipeStatusGraceTimer = null;
@@ -3057,7 +3065,7 @@ function __ipeForceReopenSSE() {
   __ipeSetLive(false);
   try { if (__ipeSSE) __ipeSSE.close(); } catch (_) {}
   __ipeSSE = null;
-  if (__ipeStatus === "connected") {
+  if (__ipeConnectionStatus() === "connected") {
     __ipeSetStatus("reconnecting", __ipeMsgReconnecting);
   }
   // Session-loss probe: when the SSE is wedged (typically a server
@@ -3283,7 +3291,7 @@ function __ipeLiveBeat() {
     live: __ipeHelloOk,
     visible: __ipeDoc.visibility() !== "hidden",
     focused: __ipeHasFocus(),
-    status: __ipeStatus
+    status: __ipeConnectionStatus()
   });
 }
 function __ipeLiveAskResync() {
@@ -3303,8 +3311,9 @@ function __ipeLiveMirror(live, status) {
     __ipeHelloOk = false;
     __ipeSetLive(false);
   }
-  if (status === __ipeStatus) return;
-  if (__ipeLiveStatuses.indexOf(status) < 0 || __ipeLiveStatuses.indexOf(__ipeStatus) < 0) return;
+  var mine = __ipeConnectionStatus();
+  if (status === mine) return;
+  if (__ipeLiveStatuses.indexOf(status) < 0 || __ipeLiveStatuses.indexOf(mine) < 0) return;
   if (status === "connected") __ipeSetStatus("connected", "");
   else if (status === "reconnecting") __ipeSetStatus("reconnecting", __ipeMsgReconnecting);
   else __ipeSetStatus("offline", __ipeMsgOffline);
