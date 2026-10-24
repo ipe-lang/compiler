@@ -110,6 +110,16 @@ attribute never reaches the live page from a later render, so the browser's
 own focus-on-insertion never fires, and a CSS `[autofocus]` selector matches
 at most the page as loaded.
 
+**Frames.** A framed document never shares the app's origin, so it cannot
+reach the page, its storage, or its session. Every `Html.iframe` is sandboxed:
+the runtime paints `sandbox` on it at every render and patch, keeping only the
+browser's known tokens, and always removes `allow-same-origin` and
+`allow-popups-to-escape-sandbox`. Opt a frame into other tokens with
+`Attr.attribute "sandbox" "allow-scripts allow-forms"`. An `embed` with a
+`src`, an `object` with a `data`, or a `frame` with a `src` renders nothing,
+since the browser gives them no sandbox; use `iframe`. Framed content in
+`Ipe.Html.Unsafe.unsafeRaw` markup is the author's to sandbox.
+
 **Focus ring.** The runtime injects a visible focus ring — a 3 px solid accent
 outline with a white halo — into every page via the global CSS reset. The ring
 appears only on `:focus-visible` (keyboard focus), not on mouse clicks. It meets

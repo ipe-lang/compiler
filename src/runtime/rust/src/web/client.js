@@ -51,6 +51,33 @@ var __ipeDoc = (function(doc) {
 // `form.addEventListener` that input, so a listener bound or an attribute read
 // through the form's own lookup throws before the submit is intercepted and
 // the browser submits the form natively, its fields in the URL.
+// The frame tables of the runtime (`html.rs` `SANDBOX_TOKENS` and
+// `FRAME_LOADERS`); a native test asserts this copy equals them. A framed
+// document never shares the app's origin: an `iframe` holds only these
+// sandbox tokens, `allow-same-origin` never among them, and an `embed`,
+// `object` or `frame` never holds the attribute it loads a document from.
+var __IPE_SANDBOX_TOKENS = ["allow-downloads", "allow-forms", "allow-modals", "allow-orientation-lock", "allow-pointer-lock", "allow-popups", "allow-presentation", "allow-scripts", "allow-storage-access-by-user-activation", "allow-top-navigation", "allow-top-navigation-by-user-activation", "allow-top-navigation-to-custom-protocols"];
+var __IPE_FRAME_LOADERS = [["embed", "src"], ["object", "data"], ["frame", "src"]];
+// `s` with its ASCII letters lowercased and every other character kept, as
+// the runtime compares tags, keys and tokens.
+function __ipeAsciiLower(s) {
+  return String(s).replace(/[A-Z]+/g, function(m) { return m.toLowerCase(); });
+}
+// The canonical sandbox of the `sandbox` value `v` (null when absent): the
+// known tokens it holds, split on ASCII whitespace, once each in table order.
+function __ipeSandbox(v) {
+  var held = typeof v === "string" ? v.split(/[\t\n\f\r ]+/).map(__ipeAsciiLower) : [];
+  return __IPE_SANDBOX_TOKENS.filter(function(t) { return held.indexOf(t) !== -1; }).join(" ");
+}
+// The attribute the frame loader `tag` loads its document from; null for
+// every other tag.
+function __ipeFrameLoaderKey(tag) {
+  var name = __ipeAsciiLower(tag);
+  for (var i = 0; i < __IPE_FRAME_LOADERS.length; i++) {
+    if (__IPE_FRAME_LOADERS[i][0] === name) return __IPE_FRAME_LOADERS[i][1];
+  }
+  return null;
+}
 var __ipeNode = (function() {
   // A member the browser lacks is a function that refuses every call: boot
   // never stops on it, and a read that needs it throws rather than answer
@@ -176,6 +203,22 @@ var __ipeNode = (function() {
         stripped.push(found[i]);
       }
       return stripped;
+    },
+    // Fences every frame below the detached holder `tmp` (an element or a
+    // fragment) before its nodes connect: an `iframe` gets the canonical
+    // sandbox, and an `embed`, `object` or `frame` holding the attribute it
+    // loads from is removed.
+    fenceFrames: function(tmp) {
+      var found = (tmp instanceof DocumentFragment ? fragmentQueryAll : queryAll).call(tmp, "iframe, embed, object, frame");
+      for (var i = 0; i < found.length; i++) {
+        var tag = __ipeAsciiLower(localName.call(found[i]));
+        var loads = __ipeFrameLoaderKey(tag);
+        if (tag === "iframe") {
+          setAttribute.call(found[i], "sandbox", __ipeSandbox(getAttribute.call(found[i], "sandbox")));
+        } else if (loads !== null && getAttribute.call(found[i], loads) !== null) {
+          remove.call(found[i]);
+        }
+      }
     },
     // Whether `el` took focus: a node that cannot be focused stays unfocused.
     focus: function(el) {
@@ -744,9 +787,30 @@ function __ipeParseFor(container, html, stripped) {
     holder.innerHTML = html;
     tmp = __ipeIsTemplate(container) ? __ipeNode.content(holder) : holder;
   }
+  __ipeNode.fenceFrames(tmp);
   var found = __ipeNode.stripAutofocus(tmp);
   if (stripped) for (var i = 0; i < found.length; i++) stripped.push(found[i]);
   return tmp;
+}
+
+// What the attribute patch `k` = `v` writes on `el` under the frame rule: the
+// value to write (a string, or null to remove), or false to drop the write.
+// An iframe's sandbox is never removed and is always written canonical, and a
+// `src` or `srcdoc` set on an iframe without a sandbox writes the empty one
+// first, as the sandbox binds when the frame navigates; a frame loader never
+// gains the attribute it loads from.
+function __ipeFramePatch(el, k, v) {
+  var tag = __ipeAsciiLower(__ipeNode.local(el));
+  var key = __ipeAsciiLower(k);
+  if (tag === "iframe") {
+    if (key === "sandbox") return typeof v === "string" ? __ipeSandbox(v) : false;
+    if ((key === "src" || key === "srcdoc") && typeof v === "string" &&
+        __ipeNode.attr(el, "sandbox") === null) {
+      __ipeNode.setAttr(el, "sandbox", "");
+    }
+    return v;
+  }
+  return key === __ipeFrameLoaderKey(tag) && v !== null ? false : v;
 }
 
 // Replace `container`'s children with the parsed holder `tmp`'s, splicing the
@@ -1723,6 +1787,8 @@ function __ipeApplyPatches(patches) {
           __ipeNode.removeAttr(el, k);
           continue;
         }
+        v = __ipeFramePatch(el, k, v);
+        if (v === false) continue;
         // Authority filter: the user is currently editing this
         // field, so the server's proposed value/checked/selected
         // would stomp in-flight keystrokes. Drop them and let the
@@ -1732,9 +1798,13 @@ function __ipeApplyPatches(patches) {
         }
         var prop = Object.prototype.hasOwnProperty.call(__IPE_LIVE_PROPS, k)
             ? __IPE_LIVE_PROPS[k] : null;
-        if (v === "") {
+        // A removal crosses as null; a set as a string, the empty string
+        // included. Any other shape is refused.
+        if (v === null) {
           __ipeNode.removeAttr(el, k);
           if (prop !== null) el[prop] = false;
+        } else if (typeof v !== "string") {
+          continue;
         } else {
           __ipeNode.setAttr(el, k, v);
           // Sync DOM properties that don't reflect from attrs.
