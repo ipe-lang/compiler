@@ -1499,19 +1499,52 @@ fn a_dev_view_name_outside_its_files_is_refused() {
 
 // ─── The credential header-name rule has one home ────────────────────────────
 
-/// Header names every credential rule lists. A production list naming one
-/// outside [`CREDENTIAL_RULE_FILE`] is a second rule, which drifts from the
-/// first.
-const CREDENTIAL_HEADER_PROBES: &[&str] = &[
-    "authorization",
-    "proxy-authorization",
-    "cookie",
-    "set-cookie",
-    "x-api-key",
-];
-
 /// The one runtime file that holds the credential header-name rule.
 const CREDENTIAL_RULE_FILE: &str = "redact.rs";
+
+/// The rule's whole-name list in [`CREDENTIAL_RULE_FILE`]. Its string elements
+/// are the names the scan probes, so a name added to the rule is probed too.
+const CREDENTIAL_RULE_LIST: &str = "CREDENTIAL_HEADERS";
+
+/// The source of [`CREDENTIAL_RULE_FILE`], the one place the probed names are
+/// read from.
+const CREDENTIAL_RULE_SOURCE: &str = include_str!("../src/redact.rs");
+
+/// The string elements of the top-level [`CREDENTIAL_RULE_LIST`] array of
+/// `src`: the header names the credential rule lists. A production list naming
+/// one outside [`CREDENTIAL_RULE_FILE`] is a second rule, which drifts from the
+/// first.
+#[allow(clippy::expect_used)] // an unparsable rule file must fail the scan, never be skipped
+fn credential_rule_names(src: &str) -> Vec<String> {
+    let tree = syn::parse_file(src).expect("the credential rule file parses");
+    let names: Vec<String> = tree
+        .items
+        .iter()
+        .find_map(|item| match item {
+            Item::Const(list) if list.ident == CREDENTIAL_RULE_LIST => match &*list.expr {
+                Expr::Array(array) => Some(
+                    array
+                        .elems
+                        .iter()
+                        .filter_map(|elem| match elem {
+                            Expr::Lit(ExprLit {
+                                lit: Lit::Str(lit), ..
+                            }) => Some(lit.value()),
+                            _ => None,
+                        })
+                        .collect(),
+                ),
+                _ => None,
+            },
+            _ => None,
+        })
+        .unwrap_or_default();
+    assert!(
+        !names.is_empty(),
+        "{CREDENTIAL_RULE_FILE} holds no `{CREDENTIAL_RULE_LIST}` array of names"
+    );
+    names
+}
 
 /// A production header-name list outside the rule file that classifies
 /// something other than credentials.
@@ -1538,6 +1571,7 @@ type ListSite = (String, String);
 /// probed header stands as a list element or a pattern alternative.
 struct HeaderListScan<'a> {
     file: &'a str,
+    probes: &'a [String],
     funcs: Vec<String>,
     hits: Vec<ListSite>,
 }
@@ -1555,7 +1589,8 @@ impl HeaderListScan<'_> {
 
     /// Record `text` when it names a probed header, whatever its ASCII case.
     fn probe(&mut self, text: &str) {
-        if CREDENTIAL_HEADER_PROBES
+        if self
+            .probes
             .iter()
             .any(|probe| probe.eq_ignore_ascii_case(text))
         {
@@ -1676,10 +1711,11 @@ impl<'ast> Visit<'ast> for HeaderListScan<'_> {
 
 /// Every production header-name list site of `src`, read as the file `file`.
 #[allow(clippy::expect_used)] // an unparsable source must fail the scan, never be skipped
-fn header_list_sites(file: &str, src: &str) -> Vec<ListSite> {
+fn header_list_sites(probes: &[String], file: &str, src: &str) -> Vec<ListSite> {
     let tree = syn::parse_file(src).expect("a runtime source parses");
     let mut scan = HeaderListScan {
         file,
+        probes,
         funcs: Vec::new(),
         hits: Vec::new(),
     };
@@ -1701,10 +1737,11 @@ fn admitted_header_list(site: &ListSite) -> bool {
 fn the_credential_header_rule_has_one_home() {
     let root = e2e_support::manifest_dir!().join("src");
     let sources = rust_sources(&root);
+    let probes = credential_rule_names(CREDENTIAL_RULE_SOURCE);
     let rule = sources
         .iter()
         .find(|(name, _)| name == CREDENTIAL_RULE_FILE)
-        .map(|(name, src)| header_list_sites(name, src));
+        .map(|(name, src)| header_list_sites(&probes, name, src));
     assert!(
         rule.is_some_and(|sites| !sites.is_empty()),
         "{CREDENTIAL_RULE_FILE} holds no credential header-name list"
@@ -1712,7 +1749,7 @@ fn the_credential_header_rule_has_one_home() {
     let elsewhere: Vec<ListSite> = sources
         .iter()
         .filter(|(name, _)| name != CREDENTIAL_RULE_FILE)
-        .flat_map(|(name, src)| header_list_sites(name, src))
+        .flat_map(|(name, src)| header_list_sites(&probes, name, src))
         .collect();
     let violations: Vec<&ListSite> = elsewhere
         .iter()
@@ -1732,8 +1769,8 @@ fn the_credential_header_rule_has_one_home() {
 }
 
 /// The header-list scan sees a list in an array, a `vec!`, a `matches!` and a
-/// match arm, in any ASCII case, and skips test code, a single-header call
-/// argument and a list of pairs.
+/// match arm, in any ASCII case, of any name the rule's list holds, and skips
+/// test code, a single-header call argument and a list of pairs.
 #[test]
 fn a_second_credential_header_list_is_refused() {
     let src = r#"
@@ -1741,20 +1778,32 @@ fn a_second_credential_header_list_is_refused() {
         fn vector() -> Vec<&'static str> { vec!["Set-Cookie"] }
         fn matched(name: &str) -> bool { matches!(name, ("x-api-key" | "accept")) }
         fn armed(name: &str) -> bool { match name { "proxy-authorization" | "te" => true, _ => false } }
+        const TOKENS: [&str; 2] = ["X-Auth-Token", "x-csrf-token"];
         fn single(h: &mut Headers) { h.set("authorization", "v"); }
         fn pairs() -> Vec<(&'static str, &'static str)> { vec![("Authorization", "v")] }
         fn plain() -> bool { ["content-type", "accept"].contains(&"x") }
         #[cfg(test)] mod tests { fn probe() -> bool { ["authorization"].is_empty() } }
     "#;
     let site = |func: &str| ("probe.rs".to_owned(), func.to_owned());
+    let probes = credential_rule_names(CREDENTIAL_RULE_SOURCE);
     assert_eq!(
-        header_list_sites("probe.rs", src),
+        header_list_sites(&probes, "probe.rs", src),
         vec![
             site("array"),
             site("array"),
             site("vector"),
             site("matched"),
             site("armed"),
+            site(NO_FUNC),
+            site(NO_FUNC),
         ]
     );
+}
+
+/// The probed names are read from the rule's own list, so a source without it
+/// fails the scan rather than probing nothing.
+#[test]
+#[should_panic(expected = "holds no `CREDENTIAL_HEADERS` array of names")]
+fn a_rule_file_without_its_list_fails_the_scan() {
+    credential_rule_names("const OTHER: [&str; 1] = [\"authorization\"];");
 }
