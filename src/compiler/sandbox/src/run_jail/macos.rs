@@ -9,16 +9,14 @@ use std::ffi::OsString;
 use std::path::Path;
 
 use super::{RunJailDefect, RunJailTools, SandboxProfile};
+use crate::host_tool::{self, HostTool, ToolPath};
 use crate::{CanonicalPath, JailMounts};
 
 /// macOS: probe for `sandbox-exec`, the run jail's only primitive.
 ///
-/// The `bwrap`/`prlimit` tools the Linux jail needs do not apply. The macOS
-/// [`exec_in_run_jail`] arm re-resolves `sandbox-exec` itself and does NOT read
-/// the returned tools, so the returned [`RunJailTools`] is an inert "primitive
-/// present" token whose fields all hold the resolved `sandbox-exec` path (never
-/// used for a Linux tool invocation on macOS). Fail-closed: an absent
-/// `sandbox-exec` refuses.
+/// The `bwrap`/`prlimit` tools the Linux jail needs do not apply; the
+/// [`RunJailTools::Seatbelt`] arm carries the resolved `sandbox-exec`, which
+/// [`exec_in_run_jail`] spawns. Fail-closed: an absent `sandbox-exec` refuses.
 ///
 /// `_wants_wall_clock` is unused on macOS: the SBPL run jail carries no external
 /// wall-clock helper.
@@ -27,16 +25,22 @@ use crate::{CanonicalPath, JailMounts};
 ///
 /// [`RunJailDefect::PrimitiveUnavailable`] when `sandbox-exec` is absent.
 pub fn probe_run_jail_tools(_wants_wall_clock: bool) -> Result<RunJailTools, RunJailDefect> {
-    let Some(sandbox_exec) = crate::build_jail::find_in_path("sandbox-exec") else {
+    let Ok(sandbox_exec) = host_tool::resolve(HostTool::SandboxExec) else {
         return Err(RunJailDefect::PrimitiveUnavailable {
-            missing: vec!["sandbox-exec"],
+            missing: vec![HostTool::SandboxExec.name()],
         });
     };
-    Ok(RunJailTools {
-        bwrap: sandbox_exec.clone(),
-        prlimit: sandbox_exec.clone(),
-        timeout: Some(sandbox_exec),
-    })
+    Ok(RunJailTools::Seatbelt { sandbox_exec })
+}
+
+/// The `sandbox-exec` the tools carry; every other arm refuses.
+fn seatbelt_of(tools: &RunJailTools) -> Result<&ToolPath, RunJailDefect> {
+    match tools {
+        RunJailTools::Seatbelt { sandbox_exec } => Ok(sandbox_exec),
+        RunJailTools::Bwrap(_) | RunJailTools::Native => Err(RunJailDefect::PrimitiveUnavailable {
+            missing: vec![HostTool::SandboxExec.name()],
+        }),
+    }
 }
 
 /// Run the emitted `app` binary inside the macOS `sandbox-exec` Seatbelt jail
@@ -74,7 +78,7 @@ pub fn probe_run_jail_tools(_wants_wall_clock: bool) -> Result<RunJailTools, Run
 ///
 /// Any [`RunJailDefect`]; on success it does not return.
 pub fn exec_in_run_jail(
-    _tools: &RunJailTools,
+    tools: &RunJailTools,
     profile: &SandboxProfile,
     scoped_tmp: &Path,
     working_tree: &Path,
@@ -85,11 +89,7 @@ pub fn exec_in_run_jail(
 
     // `sandbox-exec` is the mandatory macOS jail primitive. Absent ⇒ refuse; the
     // capability-bearing app is never run unconfined.
-    let Some(sandbox_exec) = crate::build_jail::find_in_path("sandbox-exec") else {
-        return Err(RunJailDefect::PrimitiveUnavailable {
-            missing: vec!["sandbox-exec"],
-        });
-    };
+    let sandbox_exec = seatbelt_of(tools)?;
 
     let mounts = JailMounts::of_invoker(
         CanonicalPath::resolve(scoped_tmp).map_err(RunJailDefect::Path)?,
@@ -103,7 +103,7 @@ pub fn exec_in_run_jail(
     let sbpl = crate::build_jail::checked_sbpl(profile, &mounts).map_err(RunJailDefect::Path)?;
 
     // argv: sandbox-exec -p <profile> <app> <app_args…>. Direct argv, no shell.
-    let mut cmd = std::process::Command::new(&sandbox_exec);
+    let mut cmd = sandbox_exec.command();
     cmd.arg("-p").arg(&sbpl).arg(app).args(app_args);
     // Enforce the `env` axis in the launcher (Seatbelt cannot scrub env): clear
     // the inherited environment and re-export ONLY the scrubbed base plus the

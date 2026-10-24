@@ -5,6 +5,11 @@ version.workspace = true
 license.workspace = true
 description = "Isolation jail for compiling/inspecting untrusted foreign crates: bubblewrap-primary, proven-unshare fallback, fail-closed refusal"
 
+[features]
+# `ToolPath::assumed`: a tool at a stated absolute directory with no file check,
+# for tests that render an argv without spawning. Never enabled by a shipping crate.
+test-support = []
+
 [dependencies]
 ipe_diagnostics = { path = "../diagnostics" }
 ipe_kernels = { path = "../kernels" }

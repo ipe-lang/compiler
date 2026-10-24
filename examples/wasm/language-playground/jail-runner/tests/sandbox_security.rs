@@ -46,7 +46,7 @@ fn jail_or_skip(test: &str) -> Option<std::path::PathBuf> {
     // having verified nothing. A missing jail primitive here is a hard failure,
     // not a skip. Locally, without the flag, skipping stays a dev convenience.
     let require = ipe_env::var("IPE_PLAYGROUND_E2E").is_ok();
-    let Some(bwrap) = ipe_sandbox::probe().bwrap else {
+    let Some(bwrap) = ipe_sandbox::probe().bwrap.map(PathBuf::from) else {
         assert!(
             !require,
             "{test}: IPE_PLAYGROUND_E2E=1 but bwrap is absent — refusing to \

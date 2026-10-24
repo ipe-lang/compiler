@@ -12,11 +12,11 @@ use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::path::Path;
 
 use super::{
-    JailArgv, RunJailDefect, RunJailTools, SandboxProfile, SealedFdNumber, prove, run_jail_argv,
-    run_jail_argv_with_delivery,
+    BwrapTools, JailArgv, RunJailDefect, RunJailTools, SandboxProfile, SealedFdNumber, prove,
+    run_jail_argv, run_jail_argv_with_delivery,
 };
 use crate::seccomp;
-use crate::{CanonicalPath, JailMounts};
+use crate::{CanonicalPath, HostTool, JailMounts};
 
 /// Probe the host for the run-jail primitives and decide whether a jail can be
 /// built, returning the tools or the fail-closed refusal.
@@ -35,13 +35,13 @@ pub fn probe_run_jail_tools(wants_wall_clock: bool) -> Result<RunJailTools, RunJ
     let caps = crate::probe();
     let mut missing: Vec<&'static str> = Vec::new();
     if caps.bwrap.is_none() {
-        missing.push("bwrap");
+        missing.push(HostTool::Bwrap.name());
     }
     if caps.prlimit.is_none() {
-        missing.push("prlimit");
+        missing.push(HostTool::Prlimit.name());
     }
     if wants_wall_clock && caps.timeout.is_none() {
-        missing.push("timeout");
+        missing.push(HostTool::Timeout.name());
     }
     if !missing.is_empty() {
         return Err(RunJailDefect::PrimitiveUnavailable { missing });
@@ -49,14 +49,14 @@ pub fn probe_run_jail_tools(wants_wall_clock: bool) -> Result<RunJailTools, RunJ
     // The probes above guarantee these are `Some`.
     let (Some(bwrap), Some(prlimit)) = (caps.bwrap, caps.prlimit) else {
         return Err(RunJailDefect::PrimitiveUnavailable {
-            missing: vec!["bwrap", "prlimit"],
+            missing: vec![HostTool::Bwrap.name(), HostTool::Prlimit.name()],
         });
     };
-    Ok(RunJailTools {
+    Ok(RunJailTools::Bwrap(BwrapTools {
         bwrap,
         prlimit,
         timeout: caps.timeout,
-    })
+    }))
 }
 
 /// Return `true` when bwrap can successfully establish a `--unshare-net`
@@ -367,11 +367,15 @@ fn write_frozen_memfd(
 /// # use std::ffi::OsString;
 /// # use std::path::Path;
 /// # use ipe_sandbox::run_jail::{
-/// #     RunJailTools, SandboxProfile, prove, run_jail_argv, write_seccomp_memfd,
+/// #     BwrapTools, RunJailTools, SandboxProfile, prove, run_jail_argv, write_seccomp_memfd,
 /// # };
-/// # use ipe_sandbox::{CanonicalPath, JailMounts};
+/// # use ipe_sandbox::{CanonicalPath, HostTool, JailMounts, host_tool};
 /// # fn stale() -> Option<usize> {
-/// # let tools = RunJailTools { bwrap: "bwrap".into(), prlimit: "prlimit".into(), timeout: None };
+/// # let tools = RunJailTools::Bwrap(BwrapTools {
+/// #     bwrap: host_tool::resolve(HostTool::Bwrap).ok()?,
+/// #     prlimit: host_tool::resolve(HostTool::Prlimit).ok()?,
+/// #     timeout: None,
+/// # });
 /// # let scope = prove(&tools).ok()?;
 /// # let root = CanonicalPath::resolve(Path::new("/")).ok()?;
 /// # let mounts = JailMounts::of_invoker(root.clone(), root, Vec::new()).ok()?;

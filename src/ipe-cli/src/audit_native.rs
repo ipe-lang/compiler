@@ -756,12 +756,13 @@ pub fn native_tier2(audit: &NativeAudit) -> Result<Tier2Outcome, CliError> {
 /// jail is built from, or a sandbox-unavailable reject.
 ///
 /// On `Linux/x86_64` the primitives are `bwrap` + `prlimit` (the runtime jail's
-/// tools). On macOS the primitive is `sandbox-exec`, on FreeBSD it is `jail(8)`,
-/// on Windows it is `powershell.exe` (the `CreateProcessW`-invokable probe
-/// interpreter) — the matching [`ipe_sandbox::build_jail::build_in_jail`] arm
-/// finds and drives its confinement itself, so the `RunJailTools` fields are
-/// unused there; this only confirms the primitive exists so an absent one is a
-/// sandbox-unavailable reject, never a silent skip.
+/// tools, [`RunJailTools::Bwrap`]). On macOS the primitive is `sandbox-exec`
+/// ([`RunJailTools::Seatbelt`]); on FreeBSD it is `jail(8)` and on Windows the
+/// kernel's Job Object, which the matching
+/// [`ipe_sandbox::build_jail::build_in_jail`] arm drives itself
+/// ([`RunJailTools::Native`]). Every tool is resolved from an absolute `PATH`
+/// entry alone; an absent primitive is a sandbox-unavailable reject, never a
+/// silent skip.
 #[cfg(all(
     target_os = "linux",
     any(target_arch = "x86_64", target_arch = "aarch64")
@@ -775,40 +776,34 @@ fn establish_jail_tools() -> Result<RunJailTools, CliError> {
             },
         )));
     };
-    Ok(RunJailTools {
+    Ok(RunJailTools::Bwrap(ipe_sandbox::run_jail::BwrapTools {
         bwrap,
         prlimit,
         timeout: caps.timeout,
-    })
+    }))
 }
 
-/// macOS: confirm `sandbox-exec` exists (the Seatbelt jail primitive). The
-/// `RunJailTools` fields are unused on macOS — the jail finds `sandbox-exec`
-/// itself — so a present-primitive placeholder is returned; an absent primitive
-/// is a sandbox-unavailable reject.
+/// macOS: resolve `sandbox-exec` (the Seatbelt jail primitive), which the
+/// macOS jail spawns from the returned tools; an absent primitive is a
+/// sandbox-unavailable reject.
 #[cfg(target_os = "macos")]
 fn establish_jail_tools() -> Result<RunJailTools, CliError> {
-    let Some(sandbox_exec) = which_on_path("sandbox-exec") else {
+    let Ok(sandbox_exec) = ipe_sandbox::host_tool::resolve(ipe_sandbox::HostTool::SandboxExec)
+    else {
         return Err(CliError::PackageAudit(sandbox_unavailable(
             &RunJailDefect::PrimitiveUnavailable {
-                missing: vec!["sandbox-exec"],
+                missing: vec![ipe_sandbox::HostTool::SandboxExec.name()],
             },
         )));
     };
-    // The macOS jail ignores these fields (it drives `sandbox-exec` directly);
-    // the placeholder only carries the confirmed primitive so the value is honest.
-    Ok(RunJailTools {
-        bwrap: sandbox_exec.clone(),
-        prlimit: sandbox_exec,
-        timeout: None,
-    })
+    Ok(RunJailTools::Seatbelt { sandbox_exec })
 }
 
 /// FreeBSD: confirm `jail(8)` exists (the mandatory `jail(2)` primitive the
 /// FreeBSD [`ipe_sandbox::build_jail::build_in_jail`] drives). The FreeBSD jail
-/// finds and invokes `jail` itself, so — as on macOS — the `RunJailTools` fields
-/// are unused and a present-primitive placeholder is returned; an absent `jail`
-/// is a sandbox-unavailable reject, never a silent skip.
+/// resolves and invokes `jail` itself, so the tools are
+/// [`RunJailTools::Native`]; an absent `jail` is a sandbox-unavailable reject,
+/// never a silent skip.
 ///
 /// `rctl(8)` is deliberately NOT required here: Tier-2's `scoped_profile`
 /// force-grants the `subprocess` axis (the probe forks a helper), and the FreeBSD
@@ -819,59 +814,41 @@ fn establish_jail_tools() -> Result<RunJailTools, CliError> {
 /// unconfined build proceed.
 #[cfg(target_os = "freebsd")]
 fn establish_jail_tools() -> Result<RunJailTools, CliError> {
-    let Some(jail) = which_on_path("jail") else {
+    if ipe_sandbox::host_tool::resolve(ipe_sandbox::HostTool::Jail).is_err() {
         return Err(CliError::PackageAudit(sandbox_unavailable(
             &RunJailDefect::PrimitiveUnavailable {
-                missing: vec!["jail"],
+                missing: vec![ipe_sandbox::HostTool::Jail.name()],
             },
         )));
-    };
-    // The FreeBSD jail ignores these fields (it drives `jail(8)` directly); the
-    // placeholder only carries the confirmed primitive so the value is honest.
-    Ok(RunJailTools {
-        bwrap: jail.clone(),
-        prlimit: jail,
-        timeout: None,
-    })
+    }
+    Ok(RunJailTools::Native)
 }
 
-/// Windows: confirm `powershell.exe` exists (the `CreateProcessW`-invokable
-/// interpreter the Windows `build_in_jail` runs as `payload[0]`, driving the
-/// native `.ps1` probe wrapper). The Windows jail builds its Job Object +
-/// `AppContainer` confinement itself and reads no `RunJailTools` fields, so — as
-/// on macOS/FreeBSD — a present-primitive placeholder is returned; an absent
-/// PowerShell is a sandbox-unavailable reject, never a silent skip.
+/// Windows: the jail builds its Job Object + `AppContainer` confinement itself,
+/// so the tools are [`RunJailTools::Native`].
 ///
-/// The Job Object / `AppContainer` constructibility is confirmed by
-/// `build_in_jail` itself (a failure there is folded into
-/// `JailOutcome::Unavailable` → a sandbox-unavailable reject), so confirming the
-/// probe interpreter here cannot let an unconfined build proceed.
+/// The probe interpreter (`powershell.exe`, `payload[0]`) is resolved by
+/// [`JailProbeRunner::new`], which refuses when it is absent; the Job Object /
+/// `AppContainer` constructibility is confirmed by `build_in_jail` itself (a
+/// failure there is folded into `JailOutcome::Unavailable` → a
+/// sandbox-unavailable reject), so no unconfined build can proceed.
 #[cfg(target_os = "windows")]
-fn establish_jail_tools() -> Result<RunJailTools, CliError> {
-    let Some(powershell) = which_on_path("powershell.exe") else {
-        return Err(CliError::PackageAudit(sandbox_unavailable(
-            &RunJailDefect::PrimitiveUnavailable {
-                missing: vec!["powershell.exe"],
-            },
-        )));
-    };
-    // The Windows jail ignores these fields (it builds the Job Object +
-    // AppContainer itself); the placeholder only carries the confirmed primitive
-    // so the value is honest.
-    Ok(RunJailTools {
-        bwrap: powershell.clone(),
-        prlimit: powershell,
-        timeout: None,
-    })
+#[allow(clippy::unnecessary_wraps)] // one signature across the wired platforms
+const fn establish_jail_tools() -> Result<RunJailTools, CliError> {
+    Ok(RunJailTools::Native)
 }
 
-/// Resolve a program name to an absolute path on `PATH`, or `None` if absent.
-#[cfg(any(target_os = "macos", target_os = "freebsd", target_os = "windows"))]
-fn which_on_path(bin: &str) -> Option<PathBuf> {
-    let path = ipe_env::var_os("PATH")?;
-    std::env::split_paths(&path)
-        .map(|dir| dir.join(bin))
-        .find(|candidate| candidate.is_file())
+/// Windows: resolve `powershell.exe`, the `CreateProcessW`-invokable
+/// interpreter the Windows `build_in_jail` runs as `payload[0]`, driving the
+/// native `.ps1` probe wrapper; an absent PowerShell is a sandbox-unavailable
+/// reject, never a silent skip.
+#[cfg(target_os = "windows")]
+fn probe_interpreter() -> Result<ipe_sandbox::ToolPath, CliError> {
+    ipe_sandbox::host_tool::resolve(ipe_sandbox::HostTool::PowerShell).map_err(|_| {
+        CliError::PackageAudit(sandbox_unavailable(&RunJailDefect::PrimitiveUnavailable {
+            missing: vec![ipe_sandbox::HostTool::PowerShell.name()],
+        }))
+    })
 }
 
 /// A wired platform where Tier-2 can certify (Linux `x86_64`/`aarch64`, macOS,
@@ -1460,7 +1437,7 @@ fn emit_probe_and_build_argv(
     }
 
     let target_dir = scratch.join("target");
-    let cargo = absolute_cargo().unwrap_or_else(|| PathBuf::from("cargo"));
+    let cargo = absolute_cargo()?;
 
     // Resolve the dependency graph to a `Cargo.lock` in the emitted crate BEFORE
     // the jailed build runs. The jail binds the emitted crate read-only, so a
@@ -1860,12 +1837,61 @@ fn cargo_home_env(
     target_os = "freebsd",
     target_os = "windows"
 ))]
-fn absolute_cargo() -> Option<PathBuf> {
-    let path = ipe_env::var_os("PATH")?;
-    std::env::split_paths(&path)
-        .find(|dir| dir.join("cargo").is_file())
-        .and_then(|dir| CanonicalPath::resolve(&dir).ok())
-        .map(|dir| dir.as_path().join("cargo"))
+fn absolute_cargo() -> Result<PathBuf, CliError> {
+    absolute_cargo_from(ipe_env::var_os("PATH").as_deref())
+}
+
+/// [`absolute_cargo`] over the `PATH` value `path_var`.
+///
+/// # Errors
+/// [`CliError::PackageAudit`] carrying a [`Check::NativeTier2`] [`Rejection`]
+/// when no absolute `PATH` entry holds an executable `cargo` or its directory
+/// does not canonicalise: the audit never falls back to a bare name a relative
+/// entry (the untrusted project's directory) could supply.
+#[cfg(any(
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ),
+    target_os = "macos",
+    target_os = "freebsd",
+    target_os = "windows"
+))]
+fn absolute_cargo_from(path_var: Option<&std::ffi::OsStr>) -> Result<PathBuf, CliError> {
+    let cargo = ipe_sandbox::host_tool::resolve_from(
+        path_var,
+        ipe_sandbox::HostTool::Cargo,
+        ipe_path_core::HOST,
+    )
+    .map_err(|refusal| CliError::PackageAudit(cargo_unavailable(&refusal.to_string())))?;
+    let dir = CanonicalPath::resolve(cargo.dir()).map_err(|e| {
+        CliError::PackageAudit(cargo_unavailable(&format!(
+            "the directory of `{}` does not resolve: {e}",
+            cargo.as_path().display()
+        )))
+    })?;
+    Ok(dir.as_path().join(cargo.file_name()))
+}
+
+/// The reject when the audit's `cargo` cannot be resolved to an absolute path.
+#[cfg(any(
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ),
+    target_os = "macos",
+    target_os = "freebsd",
+    target_os = "windows"
+))]
+fn cargo_unavailable(reason: &str) -> Rejection {
+    Rejection {
+        check: Check::NativeTier2,
+        message: format!(
+            "the native build cannot run: {reason} — refusing to certify a native package \
+             whose build never ran, and never running a `cargo` the package's own directory \
+             could supply."
+        ),
+    }
 }
 
 /// The production probe runner: establishes the real Linux jail and runs the
@@ -1888,6 +1914,9 @@ fn absolute_cargo() -> Option<PathBuf> {
 ))]
 pub struct JailProbeRunner<'a> {
     tools: &'a RunJailTools,
+    /// The interpreter the Windows probe payload runs as `payload[0]`.
+    #[cfg(target_os = "windows")]
+    powershell: ipe_sandbox::ToolPath,
     wrapper: TrustedWrapper,
     /// The scratch, the working tree, and the caller's binds plus the exercise's
     /// toolchain binds, checked against the cargo home.
@@ -1926,8 +1955,9 @@ impl<'a> JailProbeRunner<'a> {
     ///
     /// # Errors
     /// [`CliError::PackageAudit`] carrying a [`Check::NativeTier2`]
-    /// [`Rejection`] when a path equals or contains the cargo home, or the cargo
-    /// home cannot be resolved.
+    /// [`Rejection`] when a path equals or contains the cargo home, the cargo
+    /// home cannot be resolved, or (Windows) no absolute `PATH` entry holds
+    /// `powershell.exe`.
     pub fn new(
         tools: &'a RunJailTools,
         wrapper: TrustedWrapper,
@@ -1944,6 +1974,8 @@ impl<'a> JailProbeRunner<'a> {
             .map_err(|e| jail_path_rejected(&e))?;
         Ok(Self {
             tools,
+            #[cfg(target_os = "windows")]
+            powershell: probe_interpreter()?,
             wrapper,
             mounts,
             exercised,
@@ -2125,7 +2157,7 @@ impl JailProbeRunner<'_> {
         escape: &Path,
     ) -> ProbePayload {
         let invocation_prefix = vec![
-            self.tools.bwrap.clone().into_os_string(),
+            self.powershell.clone().into_os_string(),
             OsString::from("-NoProfile"),
             OsString::from("-NonInteractive"),
             OsString::from("-ExecutionPolicy"),
@@ -2747,6 +2779,71 @@ mod tests {
         target_os = "windows"
     ))]
     #[test]
+    fn absolute_cargo_never_falls_back_to_a_bare_name() {
+        // No `PATH`, an empty one, and one naming only a relative directory
+        // (the untrusted project's own `bin/`) each refuse; none yields `cargo`.
+        let relative = std::env::join_paths(["bin", ""]).expect("join relative entries");
+        for path_var in [
+            None,
+            Some(std::ffi::OsStr::new("")),
+            Some(relative.as_os_str()),
+        ] {
+            let refused = absolute_cargo_from(path_var);
+            assert!(
+                matches!(
+                    &refused,
+                    Err(CliError::PackageAudit(r)) if r.check == Check::NativeTier2
+                ),
+                "{path_var:?} must refuse, never fall back: {refused:?}"
+            );
+        }
+    }
+
+    #[cfg(all(
+        unix,
+        any(
+            all(
+                target_os = "linux",
+                any(target_arch = "x86_64", target_arch = "aarch64")
+            ),
+            target_os = "macos",
+            target_os = "freebsd"
+        )
+    ))]
+    #[test]
+    fn absolute_cargo_resolves_an_absolute_entry_canonically() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = ipe_test_temp::temp_root().join(format!("ipe-abs-cargo-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("cargo dir");
+        let stub = dir.join("cargo");
+        std::fs::write(&stub, "#!/bin/sh\n").expect("write cargo stub");
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755))
+            .expect("mark cargo stub executable");
+        let path_var = std::env::join_paths(["bin", dir.to_str().expect("utf-8 temp dir")])
+            .expect("join entries");
+        let cargo = absolute_cargo_from(Some(path_var.as_os_str())).expect("absolute cargo");
+        assert!(cargo.is_absolute(), "{cargo:?}");
+        assert_eq!(
+            cargo,
+            CanonicalPath::resolve(&dir)
+                .expect("canonical cargo dir")
+                .as_path()
+                .join("cargo")
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(any(
+        all(
+            target_os = "linux",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        ),
+        target_os = "macos",
+        target_os = "freebsd",
+        target_os = "windows"
+    ))]
+    #[test]
     fn missing_sidecar_when_ffi_rs_present_rejects_fail_closed() {
         // A present `src/ffi.rs` with no sidecar → typed reject (fail-closed).
         // This guards against an emitted crate that predates the sidecar or a
@@ -3159,11 +3256,7 @@ mod tests {
                 Some(user(link)),
             )
             .expect("disjoint homes resolve");
-            let tools = RunJailTools {
-                bwrap: PathBuf::from("/nonexistent/bwrap"),
-                prlimit: PathBuf::from("/nonexistent/prlimit"),
-                timeout: None,
-            };
+            let tools = inert_tools();
             let exercise = ProbeExercise::real_build(vec![OsString::from("cargo")], toolchain)
                 .expect("non-empty argv");
             let wrapper = TrustedWrapper { source: "exit 0" };
@@ -3217,12 +3310,18 @@ mod tests {
             );
         }
 
+        /// Bubblewrap tools assumed under `/nonexistent`: the argv-rendering
+        /// tests never spawn them.
         fn inert_tools() -> RunJailTools {
-            RunJailTools {
-                bwrap: PathBuf::from("/nonexistent/bwrap"),
-                prlimit: PathBuf::from("/nonexistent/prlimit"),
+            let assumed = |tool| {
+                ipe_sandbox::ToolPath::assumed(Path::new("/nonexistent"), tool)
+                    .expect("an absolute test directory")
+            };
+            RunJailTools::Bwrap(ipe_sandbox::run_jail::BwrapTools {
+                bwrap: assumed(ipe_sandbox::HostTool::Bwrap),
+                prlimit: assumed(ipe_sandbox::HostTool::Prlimit),
                 timeout: None,
-            }
+            })
         }
 
         fn probe_runner<'a>(

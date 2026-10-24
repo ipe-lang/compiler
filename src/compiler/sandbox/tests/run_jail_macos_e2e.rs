@@ -38,12 +38,13 @@ use std::process::Command;
 
 use ipe_sandbox::build_jail::{checked_sbpl, macos_scrubbed_env};
 use ipe_sandbox::run_jail::SandboxProfile;
+use ipe_sandbox::{HostTool, host_tool};
 
+/// `sandbox-exec`, resolved from an absolute `PATH` entry as the jail resolves it.
 fn which_sandbox_exec() -> Option<std::path::PathBuf> {
-    let path = ipe_env::var_os("PATH")?;
-    std::env::split_paths(&path)
-        .map(|dir| dir.join("sandbox-exec"))
-        .find(|candidate| candidate.is_file())
+    host_tool::resolve(HostTool::SandboxExec)
+        .ok()
+        .map(Into::into)
 }
 
 /// Run `sandbox-exec -p <sbpl> sh -c <script>` under the profile's SBPL,

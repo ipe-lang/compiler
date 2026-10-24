@@ -20,13 +20,14 @@
 //! argv (`std::process::Command`), so the quoting/injection class does not
 //! exist here.
 
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::path::{Path, PathBuf};
 
 use ipe_diagnostics::{Code, Diagnostic as SharedDiag, IPE_F4410, SandboxError};
 
 pub use covers::{JailMounts, bind_exposing, path_covers};
+pub use host_tool::{HostTool, ToolPath, ToolRefusal};
 pub use mounts::{CanonicalPath, HomeMasks, JailPathError, MaskedDir};
 pub use vcs_config::{
     ConfigFault, ConfigLimits, ConfigRefusal, ConfigRoots, ConfigSetting, Grants, Home, MAX_LINKS,
@@ -47,6 +48,7 @@ mod clippy_paths_resolve;
 mod covers;
 pub mod home;
 pub mod host_env;
+pub mod host_tool;
 mod mounts;
 pub mod run_jail;
 pub mod scratch;
@@ -167,20 +169,29 @@ impl std::error::Error for SandboxDefect {}
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Capabilities {
     /// `bwrap` (bubblewrap) — the jail.
-    pub bwrap: Option<PathBuf>,
+    pub bwrap: Option<ToolPath>,
     /// `prlimit` — resource caps (mandatory).
-    pub prlimit: Option<PathBuf>,
+    pub prlimit: Option<ToolPath>,
     /// `timeout` — the wall clock (mandatory).
-    pub timeout: Option<PathBuf>,
+    pub timeout: Option<ToolPath>,
 }
 
 /// Probe `PATH` for the jail tools.
+///
+/// Only an absolute `PATH` entry can supply a tool ([`host_tool::resolve`]):
+/// a jail primitive planted in the working directory never runs.
 #[must_use]
 pub fn probe() -> Capabilities {
+    ipe_env::var_os("PATH").map_or_else(Capabilities::default, |path| probe_in(&path))
+}
+
+/// Probe the `PATH` value `path_var` for the jail tools.
+fn probe_in(path_var: &OsStr) -> Capabilities {
+    let find = |tool| host_tool::resolve_in(path_var, tool, ipe_path_core::HOST).ok();
     Capabilities {
-        bwrap: find_in_path("bwrap"),
-        prlimit: find_in_path("prlimit"),
-        timeout: find_in_path("timeout"),
+        bwrap: find(HostTool::Bwrap),
+        prlimit: find(HostTool::Prlimit),
+        timeout: find(HostTool::Timeout),
     }
 }
 
@@ -189,26 +200,19 @@ pub fn probe() -> Capabilities {
 pub fn missing_caps(caps: &Capabilities) -> Vec<&'static str> {
     let mut missing = Vec::new();
     if caps.timeout.is_none() {
-        missing.push("timeout");
+        missing.push(HostTool::Timeout.name());
     }
     if caps.prlimit.is_none() {
-        missing.push("prlimit");
+        missing.push(HostTool::Prlimit.name());
     }
     missing
-}
-
-fn find_in_path(bin: &str) -> Option<PathBuf> {
-    let path = ipe_env::var_os("PATH")?;
-    std::env::split_paths(&path)
-        .map(|dir| dir.join(bin))
-        .find(|candidate| candidate.is_file())
 }
 
 /// The isolation mechanism selected for a run.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Mechanism {
     /// Bubblewrap — fails closed by itself.
-    Bwrap(PathBuf),
+    Bwrap(ToolPath),
     /// Bubblewrap is not available: refuse (`IPE-F4410`).
     Refused,
 }
@@ -333,14 +337,14 @@ pub struct JailSpec {
 /// Any error of [`mounts::push_mounts`].
 pub fn bwrap_argv(
     scope: &run_jail::NprocScope,
-    timeout: &Path,
+    timeout: &ToolPath,
     spec: &JailSpec,
     payload: &[OsString],
 ) -> Result<Vec<OsString>, JailPathError> {
     let tools = scope.tools();
     // The wall clock wraps everything: `timeout --kill-after=5s <wall> bwrap …`.
     let mut argv: Vec<OsString> = vec![
-        timeout.into(),
+        timeout.clone().into(),
         "--kill-after=5s".into(),
         spec.limits.wall_secs.to_string().into(),
         tools.bwrap.clone().into(),
@@ -475,7 +479,7 @@ pub fn run_in_bwrap_jail(
 /// [`SandboxDefect::NoIsolationMechanism`] without `bwrap`;
 /// [`SandboxDefect::CapsUnavailable`] without `prlimit` or `timeout`;
 /// [`SandboxDefect::ProcCapUnproven`] when the proof is refused.
-fn proven_scope(caps: &Capabilities) -> Result<(run_jail::NprocScope, &Path), SandboxDefect> {
+fn proven_scope(caps: &Capabilities) -> Result<(run_jail::NprocScope, &ToolPath), SandboxDefect> {
     let Some(bwrap) = &caps.bwrap else {
         return Err(SandboxDefect::NoIsolationMechanism);
     };
@@ -487,13 +491,13 @@ fn proven_scope(caps: &Capabilities) -> Result<(run_jail::NprocScope, &Path), Sa
             missing: missing_caps(caps),
         });
     };
-    let tools = run_jail::RunJailTools {
+    let tools = run_jail::RunJailTools::Bwrap(run_jail::BwrapTools {
         bwrap: bwrap.clone(),
         prlimit: prlimit.clone(),
         timeout: Some(timeout.clone()),
-    };
+    });
     let scope = run_jail::prove(&tools).map_err(SandboxDefect::ProcCapUnproven)?;
-    Ok((scope, timeout.as_path()))
+    Ok((scope, timeout))
 }
 
 /// Run `payload` in the bubblewrap jail under a subprocess-deny seccomp filter.
@@ -573,7 +577,7 @@ pub fn run_in_bwrap_jail_deny_subprocess(
 /// reads the filter from it across the exec.
 fn run_bwrap(
     scope: &run_jail::NprocScope,
-    timeout: &Path,
+    timeout: &ToolPath,
     spec: &JailSpec,
     payload: &[OsString],
     seccomp_fd: Option<run_jail::SealedFdNumber<'_>>,
@@ -734,7 +738,7 @@ fn drain_and_reap(
 /// here keeps the seccomp guarantee: no filter, no run.
 fn bwrap_argv_with_seccomp<'fd>(
     scope: &run_jail::NprocScope,
-    timeout: &Path,
+    timeout: &ToolPath,
     spec: &JailSpec,
     payload: &[OsString],
     seccomp_fd: Option<run_jail::SealedFdNumber<'fd>>,
@@ -747,7 +751,8 @@ fn bwrap_argv_with_seccomp<'fd>(
     };
     // The argv is `timeout … <wall> bwrap …`; insert `--seccomp <fd>` right after
     // the `bwrap` token so it is a bwrap option, not a timeout one.
-    if !argv.attach_fd_after(scope.tools().bwrap.as_os_str(), "--seccomp", &fd) {
+    let bwrap = scope.tools().bwrap.as_path().into_os_string();
+    if !argv.attach_fd_after(&bwrap, "--seccomp", &fd) {
         return Err(SandboxDefect::SeccompNotAttached);
     }
     Ok(argv)
@@ -789,27 +794,33 @@ mod tests {
         }
     }
 
-    /// A proof over `bwrap` and the system `prlimit`, for argv-rendering tests.
-    fn scope_of(bwrap: &str) -> run_jail::NprocScope {
-        run_jail::NprocScope::for_test(run_jail::RunJailTools {
-            bwrap: bwrap.into(),
-            prlimit: "/usr/bin/prlimit".into(),
+    /// The tool assumed under the absolute directory `dir`.
+    fn tool(dir: &str, tool: HostTool) -> ToolPath {
+        ToolPath::assumed(Path::new(dir), tool).expect("an absolute test directory")
+    }
+
+    /// A proof over the `bwrap` in `bwrap_dir` and the system `prlimit`, for
+    /// argv-rendering tests.
+    fn scope_of(bwrap_dir: &str) -> run_jail::NprocScope {
+        run_jail::NprocScope::for_test(run_jail::BwrapTools {
+            bwrap: tool(bwrap_dir, HostTool::Bwrap),
+            prlimit: tool("/usr/bin", HostTool::Prlimit),
             timeout: None,
         })
     }
 
+    /// The system `timeout`, assumed.
+    fn timeout() -> ToolPath {
+        tool("/usr/bin", HostTool::Timeout)
+    }
+
     fn rendered_argv(spec: &JailSpec) -> Vec<String> {
         let payload: Vec<OsString> = vec!["ipe-ffi-inspector".into(), "semver".into()];
-        bwrap_argv(
-            &scope_of("/usr/bin/bwrap"),
-            Path::new("/usr/bin/timeout"),
-            spec,
-            &payload,
-        )
-        .expect("the argv builds")
-        .into_iter()
-        .map(|a| a.to_string_lossy().into_owned())
-        .collect()
+        bwrap_argv(&scope_of("/usr/bin"), &timeout(), spec, &payload)
+            .expect("the argv builds")
+            .into_iter()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect()
     }
 
     #[test]
@@ -1032,12 +1043,12 @@ mod tests {
     #[test]
     fn mechanism_selection_is_bwrap_or_refuse() {
         let with_bwrap = Capabilities {
-            bwrap: Some("/usr/bin/bwrap".into()),
+            bwrap: Some(tool("/usr/bin", HostTool::Bwrap)),
             ..Capabilities::default()
         };
         assert_eq!(
             select_mechanism(&with_bwrap),
-            Mechanism::Bwrap("/usr/bin/bwrap".into())
+            Mechanism::Bwrap(tool("/usr/bin", HostTool::Bwrap))
         );
         assert_eq!(
             select_mechanism(&Capabilities::default()),
@@ -1050,7 +1061,7 @@ mod tests {
         // A host with bwrap but no timeout/prlimit runs untrusted code with
         // no wall clock and no rlimits — refuse, naming the missing helpers.
         let caps = Capabilities {
-            bwrap: Some("/usr/bin/bwrap".into()),
+            bwrap: Some(tool("/usr/bin", HostTool::Bwrap)),
             prlimit: None,
             timeout: None,
         };
@@ -1062,11 +1073,48 @@ mod tests {
         );
         // A partial absence names only the missing one.
         let only_timeout = Capabilities {
-            bwrap: Some("/usr/bin/bwrap".into()),
-            prlimit: Some("/usr/bin/prlimit".into()),
+            bwrap: Some(tool("/usr/bin", HostTool::Bwrap)),
+            prlimit: Some(tool("/usr/bin", HostTool::Prlimit)),
             timeout: None,
         };
         assert_eq!(missing_caps(&only_timeout), vec!["timeout"]);
+    }
+
+    /// A jail tool planted in a relative `PATH` entry — the working directory,
+    /// an untrusted project checkout — is never probed, so the jail refuses
+    /// instead of running the planted program.
+    #[test]
+    fn probe_level_planted_stub() {
+        let root = crate::test_dir::TestDir::new("probe-planted").expect("test dir");
+        let planted = root.path().join("planted");
+        std::fs::create_dir_all(&planted).expect("planted dir");
+        for tool in [HostTool::Bwrap, HostTool::Prlimit, HostTool::Timeout] {
+            let stub = planted.join(tool.file_name(ipe_path_core::HOST));
+            std::fs::write(&stub, b"#!/bin/sh\nexit 0\n").expect("stub");
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755))
+                    .expect("mode");
+            }
+        }
+        let relative =
+            std::env::join_paths([OsStr::new("planted"), OsStr::new("."), OsStr::new("")])
+                .expect("no separator inside an entry");
+        let caps = probe_in(&relative);
+        assert_eq!(caps, Capabilities::default());
+        assert_eq!(select_mechanism(&caps), Mechanism::Refused);
+        assert!(matches!(
+            run_in_bwrap_jail(&caps, &spec(), &["x".into()]),
+            Err(SandboxDefect::NoIsolationMechanism)
+        ));
+        // The same stubs under an absolute entry are what the probe admits.
+        let caps = probe_in(planted.as_os_str());
+        assert_eq!(
+            caps.bwrap.as_ref().map(ToolPath::dir),
+            Some(planted.as_path())
+        );
+        assert!(caps.prlimit.is_some() && caps.timeout.is_some());
     }
 
     #[test]
@@ -1278,8 +1326,8 @@ mod tests {
         use std::os::fd::{AsFd as _, AsRawFd as _};
         let filter = stand_in_fd();
         let argv = bwrap_argv_with_seccomp(
-            &scope_of("/usr/bin/bwrap"),
-            Path::new("/usr/bin/timeout"),
+            &scope_of("/usr/bin"),
+            &timeout(),
             &spec(),
             &[OsString::from("ipe-ffi-inspector")],
             Some(run_jail::SealedFdNumber::for_test(filter.as_fd())),
@@ -1316,8 +1364,8 @@ mod tests {
         // for the impossible case where the token the builder itself inserted
         // cannot be found again; it turns a silent drop into a hard refusal.
         let argv = bwrap_argv_with_seccomp(
-            &scope_of("/nonexistent/bwrap-alias"),
-            Path::new("/usr/bin/timeout"),
+            &scope_of("/nonexistent"),
+            &timeout(),
             &spec(),
             &[OsString::from("ipe-ffi-inspector")],
             Some(run_jail::SealedFdNumber::for_test(filter.as_fd())),
@@ -1330,7 +1378,7 @@ mod tests {
             .collect();
         let bwrap = rendered
             .iter()
-            .position(|a| a == "/nonexistent/bwrap-alias")
+            .position(|a| a == "/nonexistent/bwrap")
             .expect("the bwrap token is present in the argv");
         assert_eq!(
             rendered.get(bwrap + 1).map(String::as_str),
@@ -1347,8 +1395,8 @@ mod tests {
     #[test]
     fn no_seccomp_request_is_unchanged() {
         let argv = bwrap_argv_with_seccomp(
-            &scope_of("/nonexistent/bwrap-alias"),
-            Path::new("/usr/bin/timeout"),
+            &scope_of("/nonexistent"),
+            &timeout(),
             &spec(),
             &[OsString::from("ipe-ffi-inspector")],
             None,

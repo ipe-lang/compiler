@@ -38,6 +38,7 @@ use ipe_sandbox::run_jail::{
     FilesystemScope, ProcCap, RunResourceLimits, SandboxProfile, WindowsBaseEnv,
     run_windows_jailed_for_test, windows_scrubbed_env,
 };
+use ipe_sandbox::{HostTool, host_tool};
 
 /// A per-test scratch under the process temp dir (NTFS on the hosted image, so
 /// the container-SID ACL is meaningful).
@@ -48,28 +49,14 @@ fn scratch_dir(tag: &str) -> PathBuf {
     dir
 }
 
-/// Resolve a system executable (powershell / cmd) via `PATH`, or a conventional
-/// absolute path, so the jailed launch has a real `.exe` to run.
-fn system_exe(name: &str) -> PathBuf {
-    if let Some(path) = ipe_env::var_os("PATH") {
-        for dir in std::env::split_paths(&path) {
-            let candidate = dir.join(name);
-            if candidate.is_file() {
-                return candidate;
-            }
-        }
-    }
-    // Fallbacks under the system root.
-    let root = ipe_env::var_os("SystemRoot").unwrap_or_else(|| OsString::from("C:\\Windows"));
-    let root = PathBuf::from(root);
-    match name {
-        "powershell.exe" => root.join("System32\\WindowsPowerShell\\v1.0\\powershell.exe"),
-        other => root.join("System32").join(other),
-    }
-}
-
+/// PowerShell, resolved from an absolute `PATH` entry, or its conventional
+/// location under the system root, so the jailed launch has a real `.exe` to run.
 fn powershell() -> PathBuf {
-    system_exe("powershell.exe")
+    if let Ok(found) = host_tool::resolve(HostTool::PowerShell) {
+        return found.into();
+    }
+    let root = ipe_env::var_os("SystemRoot").unwrap_or_else(|| OsString::from("C:\\Windows"));
+    PathBuf::from(root).join("System32\\WindowsPowerShell\\v1.0\\powershell.exe")
 }
 
 /// Run `command` (a PowerShell one-liner) under the run jail described by

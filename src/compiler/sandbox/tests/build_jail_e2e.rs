@@ -37,7 +37,7 @@ use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
 use ipe_sandbox::build_jail::{CapabilityAxis, JailOutcome, build_in_jail};
-use ipe_sandbox::run_jail::{FilesystemScope, RunJailTools, SandboxProfile};
+use ipe_sandbox::run_jail::{BwrapTools, FilesystemScope, RunJailTools, SandboxProfile};
 use ipe_sandbox::{CanonicalPath, JailMounts};
 
 /// The `build_in_jail` seccomp path creates a `memfd` and clears its
@@ -62,11 +62,11 @@ fn e2e_tools() -> Option<RunJailTools> {
         return None;
     }
     let caps = ipe_sandbox::probe();
-    let tools = RunJailTools {
+    let tools = RunJailTools::Bwrap(BwrapTools {
         bwrap: caps.bwrap?,
         prlimit: caps.prlimit?,
         timeout: caps.timeout,
-    };
+    });
     if !jail_can_establish(&tools) {
         return None;
     }
