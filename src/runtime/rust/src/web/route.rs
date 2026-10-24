@@ -1111,7 +1111,16 @@ mod tests {
                 "{catch_all}"
             );
         }
-        for (mid, at) in [("/a:b", 1), ("/file:id", 4), ("/x/ab*", 2), ("/q/a*:b", 1)] {
+        for escaped in ["/a%3Ab", "/%2Arest", "/%3Aid", "/file%3Aid"] {
+            assert!(RoutePattern::parse(escaped).is_ok(), "{escaped}");
+        }
+        for (mid, at) in [
+            ("/a:b", 1),
+            ("/file:id", 4),
+            ("/x/ab*", 2),
+            ("/q/a*:b", 1),
+            ("/a%3A:b", 4),
+        ] {
             let refused = RoutePattern::parse(mid);
             assert!(
                 matches!(

@@ -1121,6 +1121,11 @@ mod agreement_tests {
         "/a//b",
         "/%2E/..",
         "/a+b~c.d_e-f",
+        "/a%3Ab",
+        "/%2Arest",
+        "/%3Aid",
+        "/a%3A:b",
+        "/f/%2A*",
     ];
 
     #[test]
