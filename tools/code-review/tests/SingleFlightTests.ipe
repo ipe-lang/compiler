@@ -2236,7 +2236,7 @@ decisionSlotOwnsItsResult settings otherEpoch =
             uid "u-b"
 
         latest =
-            Slot.latestTicket Slot.idleLoad
+            Slot.firstTicket
 
         saving =
             savingSlot settings.epoch ua
