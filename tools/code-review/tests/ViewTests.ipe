@@ -1,4 +1,4 @@
-module ViewTests exposing (checks)
+module ViewTests exposing (allKeys, checks)
 
 import Ipe.ByteSize as ByteSize
 import Ipe.Char as Char
@@ -26,7 +26,7 @@ import Lib.Drawn as Drawn exposing (Drawing(..), Hue(..), LayoutNote(..), Mode(.
 import Lib.Format as Format
 import Lib.Highlight as Highlight exposing (Lang(..), LeadingMark(..), LineEnds(..), Token(..))
 import Lib.Index as Index exposing (SourceView(..), StaleReason(..))
-import Lib.Keys as Keys exposing (KeyAction(..))
+import Lib.Keys as Keys exposing (KeyAction(..), KeyMode(..))
 import Lib.Links as Links exposing (Link(..))
 import Lib.Queue as Queue exposing (HistoryState(..), QueueState(..), UnitPageState(..))
 import Lib.RepoPath as RepoPath exposing (PathError(..), Root, RootMap)
@@ -958,28 +958,130 @@ hereStringCarries =
             False
 
 
--- The keyboard shortcuts drive exactly the messages the buttons send: a/r
--- act on the selected unit, j/k/g/1-5 move the selection, Enter/Escape
--- confirm/cancel an open refuse panel, and every key is ignored while the
--- refuse reason input is open (so typing a reason is not hijacked).
-testKeys : Bool
-testKeys =
-    List.all identity
-        [ Keys.label (Keys.keyAction False 3 0 "a") == "approve"
-        , Keys.label (Keys.keyAction False 3 0 "r") == "refuse"
-        , Keys.label (Keys.keyAction False 3 0 "j") == "select1"
-        , Keys.label (Keys.keyAction False 3 0 "k") == "select0"
-        , Keys.label (Keys.keyAction False 3 2 "g") == "select0"
-        , Keys.label (Keys.keyAction False 3 0 "2") == "select1"
-        , Keys.label (Keys.keyAction False 3 0 "5") == "select2"
-        , Keys.label (Keys.keyAction False 3 2 "j") == "select2"
-        , Keys.label (Keys.keyAction False 3 1 "Enter") == "ignore"
-        , Keys.label (Keys.keyAction False 0 0 "a") == "ignore"
-        , Keys.label (Keys.keyAction True 3 0 "a") == "ignore"
-        , Keys.label (Keys.keyAction True 3 0 "j") == "ignore"
-        , Keys.label (Keys.keyAction True 3 0 "Enter") == "confirm"
-        , Keys.label (Keys.keyAction True 3 0 "Escape") == "cancel"
-        ]
+-- Every bound key, its shifted form, the neighbours of the digit range, and
+-- empties: the whole domain the key tests below walk.
+allKeys : List String
+allKeys =
+    [ "a", "r", "j", "k", "g", "1", "2", "3", "4", "5", "Enter", "Escape", "x", "A", "R", "J", "0", "6", "Tab", " ", "" ]
+
+
+-- An action spelled with the payload it carries and the position it moves
+-- to, so two actions compare by what they act on.
+spell : KeyAction String Int -> String
+spell action =
+    case action of
+        ApproveSelected card ->
+            "approve " ++ card
+
+        RefuseSelected card ->
+            "refuse " ++ card
+
+        Select at ->
+            "select " ++ String.fromInt (Keys.index at)
+
+        ConfirmRefuse row ->
+            "confirm " ++ String.fromInt row
+
+        CancelRefuse row ->
+            "cancel " ++ String.fromInt row
+
+        Ignore ->
+            "ignore"
+
+
+-- The spelling `bound` names for `key`, else "ignore".
+boundOr : String -> List ( String, String ) -> String
+boundOr key bound =
+    case bound of
+        [] ->
+            "ignore"
+
+        ( named, spelled ) :: rest ->
+            if named == key then
+                spelled
+
+            else
+                boundOr key rest
+
+
+-- Every key of `allKeys` in `mode` takes the action `bound` names for it,
+-- and every key `bound` does not name is ignored.
+keysSpell : KeyMode String Int -> List ( String, String ) -> Bool
+keysSpell mode bound =
+    List.all (\key -> spell (Keys.keyAction mode key) == boundOr key bound) allKeys
+
+
+-- The key `key` in `OnCards card` with the selection at `selected` of
+-- `count` cards, spelled.
+cardSpell : Maybe String -> Int -> Int -> String -> String
+cardSpell card selected count key =
+    case Keys.position selected count of
+        Just at ->
+            spell (Keys.keyAction (OnCards card at) key)
+
+        Nothing ->
+            "no position"
+
+
+-- The navigation a card shortcut takes from the second of three cards.
+navigationFromSecondOfThree : List ( String, String )
+navigationFromSecondOfThree =
+    [ ( "j", "select 2" ), ( "k", "select 0" ), ( "g", "select 0" ), ( "1", "select 0" ), ( "2", "select 1" ), ( "3", "select 2" ), ( "4", "select 2" ), ( "5", "select 2" ) ]
+
+
+-- A drawn panel's Enter and Escape act on its row; every other key is a
+-- reason's letter and acts on nothing.
+panelKeysActOnlyOnTheDrawnRow : Bool
+panelKeysActOnlyOnTheDrawnRow =
+    keysSpell (InPanel (Just 7)) [ ( "Enter", "confirm 7" ), ( "Escape", "cancel 7" ) ]
+
+
+-- A panel the render did not draw confirms and cancels nothing.
+undrawnPanelKeysActOnNothing : Bool
+undrawnPanelKeysActOnNothing =
+    keysSpell (InPanel Nothing) []
+
+
+dormantKeysActOnNothing : Bool
+dormantKeysActOnNothing =
+    keysSpell Dormant []
+
+
+-- On cards, a and r act on the drawn card and the navigation keys move the
+-- selection clamped into the cards; every other key is ignored.
+cardKeysMap : Bool
+cardKeysMap =
+    (case Keys.position 1 3 of
+        Just at ->
+            keysSpell (OnCards (Just "c") at) ([ ( "a", "approve c" ), ( "r", "refuse c" ) ] ++ navigationFromSecondOfThree)
+
+        Nothing ->
+            False
+    )
+        && cardSpell (Just "c") 2 3 "j" == "select 2"
+        && cardSpell (Just "c") 0 3 "k" == "select 0"
+
+
+-- With no card drawn, a and r decide nothing; navigation is unchanged.
+cardlessKeysNeverDecide : Bool
+cardlessKeysNeverDecide =
+    case Keys.position 1 3 of
+        Just at ->
+            keysSpell (OnCards Nothing at) navigationFromSecondOfThree
+
+        Nothing ->
+            False
+
+
+-- A position over no cards has no representation, and one built past the
+-- cards is clamped into them.
+positionRefusals : Bool
+positionRefusals =
+    Maybe.map Keys.index (Keys.position 0 0) == Nothing
+        && Maybe.map Keys.index (Keys.position 0 (-1)) == Nothing
+        && Maybe.map Keys.index (Keys.position 7 3) == Just 2
+        && Maybe.map Keys.index (Keys.position (-4) 3) == Just 0
+        && List.all (\key -> cardSpell (Just "c") 0 1 key == "select 0") [ "j", "k", "g", "5" ]
 
 
 -- A decision reaches `Queue.decide` only through the shown source
@@ -1064,7 +1166,12 @@ checks =
                 && Format.percent 5 4 == "125%"
                 && Format.percent 0 0 == "0%"
             )
-        , Task.succeed ( "keyboard shortcuts map to the button msgs", testKeys )
+        , Task.succeed ( "panel keys act only on the drawn row", panelKeysActOnlyOnTheDrawnRow )
+        , Task.succeed ( "undrawn panel keys act on nothing", undrawnPanelKeysActOnNothing )
+        , Task.succeed ( "dormant keys act on nothing", dormantKeysActOnNothing )
+        , Task.succeed ( "card keys map to the button msgs", cardKeysMap )
+        , Task.succeed ( "cardless keys never decide", cardlessKeysNeverDecide )
+        , Task.succeed ( "positions refuse no cards and clamp", positionRefusals )
         , check "a decision reaches Queue.decide only through the decidable source" decisionReachedOnlyThroughDecidableSource
         , check "highlight languages match the shared ipe-index language vectors" langVectorsHold
         , Task.succeed
