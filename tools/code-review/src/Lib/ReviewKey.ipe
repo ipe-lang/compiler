@@ -55,6 +55,7 @@ malformedKey =
     EnvLookup.startupRefusal
         { var = ReviewKeyVar
         , file = Nothing
+        , given = Nothing
         , problem = "it must be exactly 64 hexadecimal characters (32 random bytes), and the value set is not"
         , fix = "generate one with `openssl rand -hex 32`"
         }
@@ -92,6 +93,7 @@ unreadableKey =
     EnvLookup.startupRefusal
         { var = ReviewKeyVar
         , file = Nothing
+        , given = Nothing
         , problem = "it could not be read from the environment"
         , fix = "set it to 64 hex characters (32 random bytes), e.g. `openssl rand -hex 32`, or unset it to run read-only"
         }
@@ -100,7 +102,11 @@ unreadableKey =
 -- The startup notice of a server running with no key.
 readOnlyNotice : String
 readOnlyNotice =
-    "code-review: " ++ keyVar ++ " is not set, so this server is read-only: it records no decision and counts none.\n  fix: set " ++ keyVar ++ " to 64 hex characters (32 random bytes), e.g. `openssl rand -hex 32`, stored outside the review database."
+    EnvLookup.startupNotice
+        { var = ReviewKeyVar
+        , problem = "it is not set, so this server is read-only: it records no decision and counts none"
+        , fix = "set it to 64 hex characters (32 random bytes), e.g. `openssl rand -hex 32`, stored outside the review database"
+        }
 
 
 -- The refusal of a decision on a server running with no key.

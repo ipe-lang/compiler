@@ -50,20 +50,20 @@ reviewApp settings =
 
 
 -- Require an environment variable, failing closed with an actionable message
--- when it cannot be read. The recovery branch names the variable, says by
--- the failure's kind whether it is not set or could not be read, never
--- repeats the failure's text, adds that variable's own fix, then exits
--- non-zero. The app never falls back to a silent default that would surface
--- later as an opaque SQLITE_CANTOPEN when the index db is not where a bare
--- default points. `key` and `fix` are this tool's own text.
-requireEnv : String -> String -> Task Error String
-requireEnv key fix =
+-- when it cannot be read. The recovery branch prints that variable's startup
+-- refusal, which says by the failure's kind whether it is not set or could
+-- not be read, never repeats the failure's text and names the one fix, then
+-- exits non-zero. The app never falls back to a silent default that would
+-- surface later as an opaque SQLITE_CANTOPEN when the index db is not where a
+-- bare default points.
+requireEnv : EnvLookup.StartupVar -> Task Error String
+requireEnv var =
+    let
+        key =
+            EnvLookup.startupVarName var
+    in
     Task.onError
-        (\e ->
-            do
-                Io.eprintln (EnvLookup.requiredVarRefusal key fix e)
-                System.exit 1
-        )
+        (\e -> printStartupFailure (EnvLookup.requiredVarRefusal var e))
         (System.getenv key)
 
 
@@ -87,7 +87,9 @@ requireReviewKey =
 
 
 -- A startup refusal printed on one line under the tool's name, its text
--- rendered so no control character reaches the terminal, then exit 1.
+-- rendered so no control character reaches the terminal, then exit 1. The
+-- one printer of every startup refusal, and the one place that writes the
+-- tool's name before one.
 printStartupFailure : Error -> Task Error a
 printStartupFailure e =
     do
@@ -146,9 +148,7 @@ requireLoopbackBind raw =
             Task.succeed bind
 
         Err refusal ->
-            do
-                Io.eprintln ("code-review: " ++ SafeText.toString (Bind.refusalText refusal))
-                System.exit 1
+            printStartupFailure (Bind.refusal refusal)
 
 
 -- The one mount list. It takes the `Loopback` proof, so the server cannot
@@ -166,8 +166,8 @@ main =
     do
         rawBind <- optionalEnv "IPE_HTTP_BIND"
         bind <- requireLoopbackBind rawBind
-        rawDb <- requireEnv "IPE_INDEX_DB" "Set it to the file path of the ipe-index index.db (absolute, or relative to the working directory).\n  Build the index first from the repo root:  tools/scripts/ipe-index index"
-        rawRoot <- requireEnv "IPE_INDEX_ROOT" "Set it to the repo root the index's tag:relative paths join to (absolute, or relative to the working directory)."
+        rawDb <- requireEnv EnvLookup.IndexDbVar
+        rawRoot <- requireEnv EnvLookup.IndexRootVar
         rawRepos <- optionalEnv "IPE_INDEX_REPOS"
         rawReview <- optionalEnv "IPE_REVIEW_DB"
         key <- requireReviewKey
