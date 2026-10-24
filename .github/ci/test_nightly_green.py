@@ -46,12 +46,20 @@ def _run(**over: object) -> dict:
         "path": ".github/workflows/ci.yml",
         "status": "completed",
         "conclusion": "success",
+        "run_attempt": 1,
         "head_branch": "main",
         "head_sha": OTHER,
         "created_at": _stamp(timedelta(hours=8)),
         "head_repository": {"full_name": REPO},
     }
     run.update(over)
+    return run
+
+
+def _unattempted(**over: object) -> dict:
+    """A run copy that names no attempt at all."""
+    run = _run(**over)
+    del run["run_attempt"]
     return run
 
 
@@ -471,9 +479,30 @@ class UnionTest(unittest.TestCase):
 
     def test_malformed_copy_rank_refused(self) -> None:
         a = _run(id=5)
-        for bad in (_run(id=5, run_attempt=0), _run(id=5, run_attempt="2"), _run(id=5, updated_at="soon")):
+        for bad in (_run(id=5, run_attempt=0), _run(id=5, run_attempt="2"), _unattempted(id=5), _run(id=5, updated_at="soon")):
             with self.subTest(bad), self.assertRaises(ng.NightlyError):
                 _pick(_listing(a), _listing(bad))
+
+    def test_run_naming_no_attempt_refused(self) -> None:
+        # The attempt a run names selects the job listing judged; a copy that
+        # names none is never read as attempt 1.
+        with self.assertRaises(ng.NightlyError):
+            _pick(_listing(_unattempted()))
+        fresher = _unattempted(id=5, updated_at=_stamp(timedelta(hours=1)))
+        with self.assertRaises(ng.NightlyError):
+            _pick(_listing(_run(id=5)), _listing(fresher))
+        reads: list[str] = []
+
+        def answer(path: str) -> object:
+            reads.append(path)
+            return fresher if path.endswith("/runs/5") else _jobs_page(5, ("a", "success"))
+
+        with _patched(_gh_json=answer):
+            with self.assertRaises(ng.NightlyError):
+                ng._reread(REPO, _run(id=5))
+            with self.assertRaises(ng.NightlyError):
+                ng._jobs(REPO, _unattempted(id=5))
+        self.assertEqual(reads, [f"repos/{REPO}/actions/runs/5"])
 
 
 class EventTest(unittest.TestCase):

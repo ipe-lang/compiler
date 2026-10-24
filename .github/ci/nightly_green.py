@@ -211,7 +211,8 @@ def _run_id(run: dict) -> int:
 
 
 def _attempt(run: dict) -> int:
-    attempt = _positive_int(run.get("run_attempt", 1))
+    """Return the attempt `run` names; it selects the job listing judged, so an absent one is never guessed."""
+    attempt = _positive_int(run.get("run_attempt"))
     if attempt is None:
         raise NightlyError(f"run {run.get('id')} attempt {run.get('run_attempt')!r} is not a positive integer")
     return attempt
