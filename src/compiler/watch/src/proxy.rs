@@ -52,8 +52,11 @@
 //! the upstream half closes; that terminates the client keep-alive too (the
 //! response has no self-delimiting length), which is the correct HTTP/1.1
 //! behaviour and matches how a streaming response ends. A response to a
-//! `HEAD` request, or with a 1xx/204/304 status, carries no body whatever its
-//! headers say.
+//! `HEAD` request, or with a 204/304 status, carries no body whatever its
+//! headers say. An interim 1xx response (`100 Continue`) is relayed head-only
+//! and the final response read after it, at most [`MAX_INTERIM_RESPONSES`]
+//! times. A `101 Switching Protocols` is refused with a `502`: the bytes after
+//! it are another protocol, which this per-message framer does not carry.
 //!
 //! ## Soundness
 //!
@@ -88,6 +91,10 @@ const UPSTREAM_CONNECT_TIMEOUT: Duration = Duration::from_millis(500);
 /// a memory-DoS guard on the one part of the message the proxy must buffer to
 /// re-emit verbatim (the bodies are streamed, never fully buffered).
 const MAX_REQUEST_HEADER_BYTES: usize = 64 * 1024;
+
+/// Most interim (1xx) responses relayed ahead of one final response; an
+/// upstream sending more is answered with the proxy's `502`.
+const MAX_INTERIM_RESPONSES: usize = 8;
 
 /// Copy-loop buffer size for streaming bodies/responses.
 const COPY_BUF_BYTES: usize = 16 * 1024;
@@ -382,9 +389,12 @@ enum Role {
 /// could frame it differently, or it is malformed in a way the server rejects.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum FramingRefusal {
+    MissingStartLine,
+    MalformedStatusLine,
     LineWithoutColon,
     SpaceBeforeColon,
     HeaderNameNotToken,
+    HeaderValueInvalidByte,
     ObsFold,
     ContentLengthNotDigits,
     ContentLengthTooLong,
@@ -396,15 +406,20 @@ enum FramingRefusal {
     ChunkDataNotCrlfTerminated,
     TrailerLineMalformed,
     TruncatedTrailer,
+    TooManyInterimResponses,
+    ProtocolUpgrade,
 }
 
 impl FramingRefusal {
     /// The proxy's own phrase for the refusal; never echoes peer bytes.
     const fn text(self) -> &'static str {
         match self {
+            Self::MissingStartLine => "no request line",
+            Self::MalformedStatusLine => "status code is not three digits",
             Self::LineWithoutColon => "header line without a colon",
             Self::SpaceBeforeColon => "whitespace before the header colon",
             Self::HeaderNameNotToken => "header name is not a token",
+            Self::HeaderValueInvalidByte => "control byte in a header value",
             Self::ObsFold => "obsolete header line folding",
             Self::ContentLengthNotDigits => "content-length is not a plain decimal",
             Self::ContentLengthTooLong => "content-length has too many digits",
@@ -418,6 +433,8 @@ impl FramingRefusal {
             Self::ChunkDataNotCrlfTerminated => "chunk data not followed by CRLF",
             Self::TrailerLineMalformed => "malformed chunked trailer line",
             Self::TruncatedTrailer => "connection closed inside the chunked trailer",
+            Self::TooManyInterimResponses => "too many interim responses",
+            Self::ProtocolUpgrade => "the dev proxy does not carry protocol upgrades",
         }
     }
 }
@@ -437,7 +454,7 @@ impl From<FramingRefusal> for io::Error {
 /// The start line of one role, parsed from the first line of its head.
 trait StartLine: Sized {
     const ROLE: Role;
-    fn parse(line: &[u8]) -> Self;
+    fn parse(line: &[u8]) -> Result<Self, FramingRefusal>;
 }
 
 /// A request line: only the method bears on framing.
@@ -448,33 +465,62 @@ struct RequestStart {
 impl StartLine for RequestStart {
     const ROLE: Role = Role::Request;
 
-    fn parse(line: &[u8]) -> Self {
+    fn parse(line: &[u8]) -> Result<Self, FramingRefusal> {
         let method = line.split(|&b| b == b' ').next().unwrap_or(&[]);
-        Self {
+        if method.is_empty() {
+            return Err(FramingRefusal::MissingStartLine);
+        }
+        Ok(Self {
             method: if method == b"HEAD" {
                 Method::Head
             } else {
                 Method::Other
             },
-        }
+        })
     }
 }
 
-/// A status line: a 1xx/204/304 status carries no body regardless of headers.
+/// What a response's status code says about the exchange.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ResponseStatus {
+    /// A 1xx other than 101: an interim answer; a final one still follows.
+    Interim,
+    Final(FinalStatus),
+}
+
+/// A final response's status, as far as body framing cares.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FinalStatus {
+    /// 101: the bytes after the head are another protocol, not HTTP.
+    SwitchingProtocols,
+    /// 204 or 304: no body whatever the headers say.
+    NoBody,
+    Body,
+}
+
+/// A status line: its three-digit code tells interim, upgrade and no-body
+/// answers apart.
 struct ResponseStart {
-    no_body: bool,
+    status: ResponseStatus,
 }
 
 impl StartLine for ResponseStart {
     const ROLE: Role = Role::Response;
 
-    fn parse(line: &[u8]) -> Self {
-        let no_body = line
+    fn parse(line: &[u8]) -> Result<Self, FramingRefusal> {
+        let code = line
             .split(u8::is_ascii_whitespace)
             .filter(|token| !token.is_empty())
             .nth(1)
-            .is_some_and(|code| code.starts_with(b"1") || code == b"204" || code == b"304");
-        Self { no_body }
+            .unwrap_or(&[]);
+        let status = match *code {
+            [b'1', b'0', b'1'] => ResponseStatus::Final(FinalStatus::SwitchingProtocols),
+            [b'1', b'0'..=b'9', b'0'..=b'9'] => ResponseStatus::Interim,
+            [b'2' | b'3', b'0', b'4'] => ResponseStatus::Final(FinalStatus::NoBody),
+            [b'0'..=b'9', b'0'..=b'9', b'0'..=b'9'] => ResponseStatus::Final(FinalStatus::Body),
+            _ => return Err(FramingRefusal::MalformedStatusLine),
+        };
+        Ok(Self { status })
     }
 }
 
@@ -496,7 +542,7 @@ impl<S: StartLine> Head<S> {
     /// differently is a [`FramingRefusal`].
     fn parse(raw: Vec<u8>) -> Result<Self, FramingRefusal> {
         let mut lines = raw.split_inclusive(|&b| b == b'\n').map(strip_line_end);
-        let start = S::parse(lines.next().unwrap_or(&[]));
+        let start = S::parse(lines.next().unwrap_or(&[]))?;
         let mut framing = FramingHeaders::default();
         let mut connection_close = false;
         for line in lines {
@@ -588,9 +634,13 @@ fn parse_content_length(value: &[u8]) -> Result<u64, FramingRefusal> {
         .ok_or(FramingRefusal::ContentLengthTooLong)
 }
 
-/// A `Transfer-Encoding` value is chunked only when its last token is
-/// `chunked` and no other token is.
+/// A `Transfer-Encoding` value is chunked only when it is all ASCII (the
+/// server reads a value with obs-text as not chunked), its last token is
+/// `chunked`, and no other token is.
 fn parse_transfer_encoding(value: &[u8]) -> TransferEncoding {
+    if !value.is_ascii() {
+        return TransferEncoding::NotFinalChunked;
+    }
     let mut chunked_tokens = 0usize;
     let mut last_is_chunked = false;
     for token in value.split(|&b| b == b',').map(trim_ows) {
@@ -633,7 +683,18 @@ fn split_header(line: &[u8]) -> Result<(&[u8], &[u8]), FramingRefusal> {
     if name.is_empty() || !name.iter().all(|&b| is_tchar(b)) {
         return Err(FramingRefusal::HeaderNameNotToken);
     }
-    Ok((name, trim_ows(rest.get(1..).unwrap_or(&[]))))
+    let value = rest.get(1..).unwrap_or(&[]);
+    if !value.iter().all(|&b| is_field_value_byte(b)) {
+        return Err(FramingRefusal::HeaderValueInvalidByte);
+    }
+    Ok((name, trim_ows(value)))
+}
+
+/// A header-value byte the server's parser admits: HTAB, visible ASCII, SP,
+/// or obs-text. A CR, LF, NUL, DEL or other control byte is refused, so no
+/// line the proxy reads is one the server would skip or split differently.
+const fn is_field_value_byte(byte: u8) -> bool {
+    matches!(byte, b'\t' | b' '..=0x7e | 0x80..=0xff)
 }
 
 /// Drop the line terminator (CRLF or bare LF) from one head line.
@@ -693,14 +754,19 @@ const fn trim_ows(mut bytes: &[u8]) -> &[u8] {
 /// Read one header block (start line through the blank line) within the head
 /// byte cap.
 ///
-/// `None` is a clean EOF before any byte — a keep-alive peer closing between
-/// messages. An EOF after a partial head is an error.
+/// Empty lines before the start line are skipped, as the server behind the
+/// proxy skips them (RFC 9112 section 2.2), and never forwarded; they count
+/// against the cap. `None` is a clean EOF before any start line — a
+/// keep-alive peer closing between messages. An EOF after a partial head is
+/// an error.
 fn read_head_block(reader: &mut BufReader<TcpStream>) -> io::Result<Option<Vec<u8>>> {
     let mut raw = Vec::new();
-    let mut first_line = true;
+    let mut skipped = 0usize;
     loop {
         let mut line = Vec::new();
-        let budget = MAX_REQUEST_HEADER_BYTES.saturating_sub(raw.len());
+        let budget = MAX_REQUEST_HEADER_BYTES
+            .saturating_sub(raw.len())
+            .saturating_sub(skipped);
         let n = read_line_capped(reader, &mut line, budget)?;
         if n == 0 {
             if raw.is_empty() {
@@ -712,11 +778,14 @@ fn read_head_block(reader: &mut BufReader<TcpStream>) -> io::Result<Option<Vec<u
             ));
         }
         let is_blank = strip_line_end(&line).is_empty();
+        if is_blank && raw.is_empty() {
+            skipped = skipped.saturating_add(n);
+            continue;
+        }
         raw.extend_from_slice(&line);
-        if is_blank && !first_line {
+        if is_blank {
             return Ok(Some(raw));
         }
-        first_line = false;
     }
 }
 
@@ -748,38 +817,64 @@ fn relay_response(
     request_method: Method,
 ) -> io::Result<bool> {
     let mut upstream_reader = BufReader::new(upstream.try_clone()?);
-    let Some(raw) = read_head_block(&mut upstream_reader)? else {
-        return Err(io::Error::new(
-            io::ErrorKind::UnexpectedEof,
-            "upstream closed before responding",
-        ));
-    };
-    let head = match Head::<ResponseStart>::parse(raw) {
-        Ok(head) => head,
-        Err(refusal) => {
-            write_refusal(client, RefusalStatus::BadGateway, refusal.text())?;
-            return Ok(false);
-        }
+    let mut interim_left = MAX_INTERIM_RESPONSES;
+    let (head, status) = loop {
+        let Some(raw) = read_head_block(&mut upstream_reader)? else {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "upstream closed before responding",
+            ));
+        };
+        let refusal = match Head::<ResponseStart>::parse(raw) {
+            Ok(head) => match head.start.status {
+                ResponseStatus::Final(status) => break (head, status),
+                // An interim answer (`100 Continue`, `103 Early Hints`) is
+                // relayed head-only; the final answer follows on the same
+                // upstream connection.
+                ResponseStatus::Interim => match interim_left.checked_sub(1) {
+                    Some(left) => {
+                        interim_left = left;
+                        client.write_all(&head.raw)?;
+                        client.flush()?;
+                        continue;
+                    }
+                    None => FramingRefusal::TooManyInterimResponses,
+                },
+            },
+            Err(refusal) => refusal,
+        };
+        write_refusal(client, RefusalStatus::BadGateway, refusal.text())?;
+        return Ok(false);
     };
 
+    let body = match (status, request_method) {
+        // The bytes after a `101` head are another protocol: the proxy frames
+        // only HTTP/1.1 messages, so it refuses before relaying one byte.
+        (FinalStatus::SwitchingProtocols, _) => {
+            write_refusal(
+                client,
+                RefusalStatus::BadGateway,
+                FramingRefusal::ProtocolUpgrade.text(),
+            )?;
+            return Ok(false);
+        }
+        (FinalStatus::NoBody, _) | (FinalStatus::Body, Method::Head) => None,
+        (FinalStatus::Body, Method::Other) => Some(head.framing),
+    };
     client.write_all(&head.raw)?;
-    let no_body = matches!(request_method, Method::Head) || head.start.no_body;
-    let keep_alive = if no_body {
-        !head.connection_close
-    } else {
-        match head.framing {
-            BodyFraming::Length(len) => {
-                copy_exact(&mut upstream_reader, client, len)?;
-                !head.connection_close
-            }
-            BodyFraming::Chunked => {
-                copy_chunked_strict(&mut upstream_reader, client)?;
-                !head.connection_close
-            }
-            BodyFraming::None => {
-                copy_until_eof(&mut upstream_reader, client)?;
-                false
-            }
+    let keep_alive = match body {
+        None => !head.connection_close,
+        Some(BodyFraming::Length(len)) => {
+            copy_exact(&mut upstream_reader, client, len)?;
+            !head.connection_close
+        }
+        Some(BodyFraming::Chunked) => {
+            copy_chunked_strict(&mut upstream_reader, client)?;
+            !head.connection_close
+        }
+        Some(BodyFraming::None) => {
+            copy_until_eof(&mut upstream_reader, client)?;
+            false
         }
     };
     client.flush()?;
@@ -1535,6 +1630,28 @@ mod tests {
                 b"GET / HTTP/1.1\r\nHo\"st: h\r\n\r\n",
                 FramingRefusal::HeaderNameNotToken,
             ),
+            (b"\r\nGET / HTTP/1.1\r\n\r\n", FramingRefusal::MissingStartLine),
+            (b" GET / HTTP/1.1\r\n\r\n", FramingRefusal::MissingStartLine),
+            (
+                b"GET / HTTP/1.1\r\nX: a\x01b\r\n\r\n",
+                FramingRefusal::HeaderValueInvalidByte,
+            ),
+            (
+                b"GET / HTTP/1.1\r\nX: a\rb\r\n\r\n",
+                FramingRefusal::HeaderValueInvalidByte,
+            ),
+            (
+                b"GET / HTTP/1.1\r\nX: a\x7fb\r\n\r\n",
+                FramingRefusal::HeaderValueInvalidByte,
+            ),
+            (
+                b"GET / HTTP/1.1\r\nX: a\x00\r\n\r\n",
+                FramingRefusal::HeaderValueInvalidByte,
+            ),
+            (
+                b"POST / HTTP/1.1\r\nTransfer-Encoding: g\xc3zip, chunked\r\n\r\n",
+                FramingRefusal::TransferEncodingNotFinalChunked,
+            ),
         ];
         for (raw, expected) in cases {
             let parsed = Head::<RequestStart>::parse(raw.to_vec()).map(|head| head.framing);
@@ -1576,6 +1693,11 @@ mod tests {
                 BodyFraming::None,
                 false,
             ),
+            (
+                b"GET / HTTP/1.1\r\nX-Name: caf\xc3\xa9\t!\r\n\r\n",
+                BodyFraming::None,
+                false,
+            ),
         ];
         for (raw, framing, close) in cases {
             let head = Head::<RequestStart>::parse(raw.to_vec());
@@ -1592,22 +1714,63 @@ mod tests {
         }
     }
 
-    /// A response head reads the start line for its no-body statuses and
-    /// treats a transfer-encoding without a final `chunked` as close-delimited.
+    /// A response head reads its status class from the start line and treats a
+    /// transfer-encoding without a final `chunked` as close-delimited.
     #[test]
     fn response_head_shapes() {
-        let no_body = Head::<ResponseStart>::parse(b"HTTP/1.1 204 No Content\r\n\r\n".to_vec());
-        assert!(no_body.as_ref().is_ok_and(|head| head.start.no_body));
-        let informational =
-            Head::<ResponseStart>::parse(b"HTTP/1.1 101 Switching\r\n\r\n".to_vec());
-        assert!(informational.as_ref().is_ok_and(|head| head.start.no_body));
+        let cases: &[(&[u8], Result<ResponseStatus, FramingRefusal>)] = &[
+            (
+                b"HTTP/1.1 100 Continue\r\n\r\n",
+                Ok(ResponseStatus::Interim),
+            ),
+            (
+                b"HTTP/1.1 103 Early Hints\r\n\r\n",
+                Ok(ResponseStatus::Interim),
+            ),
+            (
+                b"HTTP/1.1 101 Switching Protocols\r\n\r\n",
+                Ok(ResponseStatus::Final(FinalStatus::SwitchingProtocols)),
+            ),
+            (
+                b"HTTP/1.1 204 No Content\r\n\r\n",
+                Ok(ResponseStatus::Final(FinalStatus::NoBody)),
+            ),
+            (
+                b"HTTP/1.1 304 Not Modified\r\n\r\n",
+                Ok(ResponseStatus::Final(FinalStatus::NoBody)),
+            ),
+            (
+                b"HTTP/1.1 200 OK\r\n\r\n",
+                Ok(ResponseStatus::Final(FinalStatus::Body)),
+            ),
+            (
+                b"HTTP/1.1 20 OK\r\n\r\n",
+                Err(FramingRefusal::MalformedStatusLine),
+            ),
+            (
+                b"HTTP/1.1 2000 OK\r\n\r\n",
+                Err(FramingRefusal::MalformedStatusLine),
+            ),
+            (
+                b"HTTP/1.1 2x0 OK\r\n\r\n",
+                Err(FramingRefusal::MalformedStatusLine),
+            ),
+            (
+                b"HTTP/1.1\r\n\r\n",
+                Err(FramingRefusal::MalformedStatusLine),
+            ),
+        ];
+        for (raw, expected) in cases {
+            let parsed = Head::<ResponseStart>::parse(raw.to_vec()).map(|head| head.start.status);
+            assert_eq!(parsed, *expected, "{}", String::from_utf8_lossy(raw));
+        }
         let gzip = Head::<ResponseStart>::parse(
             b"HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip\r\n\r\n".to_vec(),
         );
-        assert!(
-            gzip.as_ref()
-                .is_ok_and(|head| { head.framing == BodyFraming::None && !head.start.no_body })
-        );
+        assert!(gzip.as_ref().is_ok_and(|head| {
+            head.framing == BodyFraming::None
+                && head.start.status == ResponseStatus::Final(FinalStatus::Body)
+        }));
         let both = Head::<ResponseStart>::parse(
             b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nTransfer-Encoding: chunked\r\n\r\n".to_vec(),
         )
@@ -1854,11 +2017,123 @@ mod tests {
             text.contains(phrase),
             "{phrase}: refusal text missing in {text:?}"
         );
-        assert!(
-            !text.contains("200 OK"),
+        assert_eq!(
+            text.matches("HTTP/1.1 ").count(),
+            1,
             "{phrase}: upstream bytes leaked: {text:?}"
         );
         assert!(closed, "{phrase}: the connection must close after the 502");
+    }
+
+    #[test]
+    fn switching_protocols_is_refused() {
+        assert_response_refused(
+            Script::raw(
+                b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n",
+                b"\x81\x02hi",
+                false,
+            ),
+            FramingRefusal::ProtocolUpgrade.text(),
+        );
+    }
+
+    #[test]
+    fn malformed_status_line_is_refused() {
+        assert_response_refused(
+            Script::raw(b"HTTP/1.1 20 OK\r\nContent-Length: 2\r\n\r\n", b"ok", false),
+            FramingRefusal::MalformedStatusLine.text(),
+        );
+    }
+
+    /// A `100 Continue` is relayed head-only, the final response after it,
+    /// and the socket stays in step for the next exchange.
+    #[test]
+    fn interim_response_is_relayed_before_the_final_one() {
+        let (proxy, _captured) = proxy_over(Script::raw(
+            b"HTTP/1.1 100 Continue\r\n\r\n",
+            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok",
+            false,
+        ));
+        let mut client = connect(proxy.port());
+        let mut reader = BufReader::new(client.try_clone().unwrap());
+        for exchange in ["first", "second"] {
+            client.write_all(PROBE).unwrap();
+            let interim = read_head_block(&mut reader).unwrap().expect("interim head");
+            assert_eq!(
+                interim,
+                b"HTTP/1.1 100 Continue\r\n\r\n".to_vec(),
+                "{exchange}"
+            );
+            let (head, body) = read_response(&mut reader).expect("final response");
+            assert!(head.starts_with(b"HTTP/1.1 200 OK\r\n"), "{exchange}");
+            assert_eq!(body, b"ok", "{exchange}");
+        }
+    }
+
+    /// More interim responses than [`MAX_INTERIM_RESPONSES`] end in the
+    /// proxy's `502`, never the upstream's final response.
+    #[test]
+    fn interim_flood_is_refused() {
+        let interim: &[u8] = b"HTTP/1.1 100 Continue\r\n\r\n";
+        let flood = interim.repeat(MAX_INTERIM_RESPONSES + 1);
+        let (proxy, _captured) = proxy_over(Script::raw(
+            &flood,
+            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok",
+            false,
+        ));
+        let (reply, closed) = send_raw(proxy.port(), PROBE);
+        let text = String::from_utf8_lossy(&reply);
+        assert_eq!(
+            text.matches("HTTP/1.1 100 Continue\r\n").count(),
+            MAX_INTERIM_RESPONSES,
+            "{text:?}"
+        );
+        assert!(
+            text.contains(FramingRefusal::TooManyInterimResponses.text())
+                && text.contains("HTTP/1.1 502 Bad Gateway\r\n"),
+            "{text:?}"
+        );
+        assert!(!text.contains("200 OK"), "{text:?}");
+        assert!(closed);
+    }
+
+    // ---- start-line and header-value bytes on the wire -------------------
+
+    /// Empty lines before a request line are skipped as the server skips
+    /// them, and never forwarded.
+    #[test]
+    fn leading_empty_lines_are_skipped_not_forwarded() {
+        let (proxy, captured) = proxy_over(Script::ok("ok"));
+        let mut client = connect(proxy.port());
+        client.write_all(b"\r\n\n").unwrap();
+        assert_eq!(get_body_on(&mut client).as_deref(), Some("ok"));
+        assert_eq!(captured.bytes(), PROBE.to_vec());
+    }
+
+    /// A connection that sends only empty lines and closes never reaches the
+    /// upstream, and its worker returns.
+    #[test]
+    fn blank_lines_only_never_reach_upstream() {
+        let (proxy, captured) = proxy_over(Script::ok("ok"));
+        let (reply, closed) = send_raw(proxy.port(), b"\r\n\r\n\n");
+        assert!(reply.is_empty(), "{:?}", String::from_utf8_lossy(&reply));
+        assert!(closed, "the proxy must close, not wait on the upstream");
+        let mut probe = connect(proxy.port());
+        assert_eq!(get_body_on(&mut probe).as_deref(), Some("ok"));
+        assert_eq!(captured.connections.load(Ordering::SeqCst), 1);
+        assert_eq!(captured.bytes(), PROBE.to_vec());
+    }
+
+    #[test]
+    fn header_value_control_byte_is_refused() {
+        assert_request_refused(
+            b"GET / HTTP/1.1\r\nHost: h\r\nX: a\x01b\r\n\r\n",
+            FramingRefusal::HeaderValueInvalidByte.text(),
+        );
+        assert_request_refused(
+            b"GET / HTTP/1.1\r\nHost: h\r\nX: a\rb\r\n\r\n",
+            FramingRefusal::HeaderValueInvalidByte.text(),
+        );
     }
 
     #[test]
@@ -1952,29 +2227,38 @@ mod tests {
     #[test]
     fn proxy_has_one_framing_reader() {
         let source = include_str!("proxy.rs");
-        let (production, _tests) = source
+        let (production, tests) = source
             .split_once("#[cfg(test)]\nmod tests")
             .expect("test module marker");
+        assert!(
+            production.contains("fn parse(raw: Vec<u8>)") && tests.contains("fn read_body_into"),
+            "the split must land between production and tests"
+        );
         for banned in [
             "windows(",
             "parse::<",
-            "from_utf8_lossy",
+            ".parse(",
+            "from_utf8",
             "to_ascii_lowercase",
+            "to_lowercase",
         ] {
             assert!(
                 !production.contains(banned),
                 "a second framing reader: `{banned}` in the production half"
             );
         }
-        for (needle, count) in [
-            ("b\"content-length\"", 1),
-            ("b\"transfer-encoding\"", 1),
-            ("b\"chunked\"", 1),
-            ("b\"close\"", 1),
+        // Case-folded, so a second spelling (`b"Content-Length"`, a `&str`
+        // literal) counts against the one site too.
+        let folded = production.to_ascii_lowercase();
+        for needle in [
+            "\"content-length\"",
+            "\"transfer-encoding\"",
+            "\"chunked\"",
+            "\"close\"",
         ] {
             assert_eq!(
-                production.matches(needle).count(),
-                count,
+                folded.matches(needle).count(),
+                1,
                 "`{needle}` must be judged at exactly one site"
             );
         }
