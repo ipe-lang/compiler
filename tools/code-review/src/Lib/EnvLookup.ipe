@@ -1,7 +1,8 @@
-module Lib.EnvLookup exposing (StartupRefusal, StartupVar(..), isUnset, requiredVarRefusal, startupRefusal, startupVarName, startupVars)
+module Lib.EnvLookup exposing (StartupNotice, StartupRefusal, StartupVar(..), echoMaxChars, isUnset, requiredVarRefusal, startupNotice, startupRefusal, startupVarName, startupVars)
 
 import Ipe.Error as Error exposing (Error)
 import Ipe.Path as Path exposing (Path)
+import Ipe.String as String
 import Lib.SafeText as SafeText exposing (SafeText)
 
 
@@ -14,26 +15,54 @@ isUnset e =
     Error.kind e == Error.kind Error.notFound
 
 
--- The startup refusal of the required variable `key` whose read failed with
--- `failure`, ending with `fix`: it says whether the variable is not set or
--- could not be read, names the variable, and never repeats the failure's
--- own text.
-requiredVarRefusal : String -> String -> Error -> String
-requiredVarRefusal key fix failure =
-    if isUnset failure then
-        "code-review: required environment variable " ++ key ++ " is not set.\n  " ++ fix
+-- The startup refusal of the required variable `var` whose read failed with
+-- `failure`: it says by the failure's kind whether the variable is not set
+-- or could not be read, never repeats the failure's own text, and ends with
+-- that variable's one fix.
+requiredVarRefusal : StartupVar -> Error -> Error
+requiredVarRefusal var failure =
+    let
+        problem =
+            if isUnset failure then
+                "it is not set"
 
-    else
-        "code-review: required environment variable " ++ key ++ " could not be read from the environment.\n  " ++ fix
+            else
+                "it could not be read from the environment"
+    in
+    startupRefusal { var = var, file = Nothing, given = Nothing, problem = problem, fix = requiredFix var }
 
 
--- Each environment variable a startup refusal can name.
+-- What to set each variable to when a required read of it fails.
+requiredFix : StartupVar -> String
+requiredFix var =
+    case var of
+        IndexDbVar ->
+            "set it to the path of the ipe-index index.db (absolute, or relative to the working directory); build it first from the repo root with `tools/scripts/ipe-index index`"
+
+        IndexRootVar ->
+            "set it to the repo root the index's tag:relative paths join to (absolute, or relative to the working directory)"
+
+        IndexReposVar ->
+            "set it to the other repositories' roots as name=/absolute/path entries joined by a comma"
+
+        ReviewDbVar ->
+            "set it to the path of a SQLite database file"
+
+        ReviewKeyVar ->
+            "set it to 64 hex characters (32 random bytes), e.g. `openssl rand -hex 32`"
+
+        HttpBindVar ->
+            "unset it, or set it to an accepted loopback spelling"
+
+
+-- Each environment variable a startup line can name.
 type StartupVar
     = IndexDbVar
     | IndexRootVar
     | IndexReposVar
     | ReviewDbVar
     | ReviewKeyVar
+    | HttpBindVar
 
 
 -- The one spelling of each variable.
@@ -55,42 +84,102 @@ startupVarName var =
         ReviewKeyVar ->
             "IPE_REVIEW_MAC_KEY"
 
+        HttpBindVar ->
+            "IPE_HTTP_BIND"
+
 
 -- Every `StartupVar`, for the checks that cover each one.
 startupVars : List StartupVar
 startupVars =
-    [ IndexDbVar, IndexRootVar, IndexReposVar, ReviewDbVar, ReviewKeyVar ]
+    [ IndexDbVar, IndexRootVar, IndexReposVar, ReviewDbVar, ReviewKeyVar, HttpBindVar ]
 
 
 -- A startup refusal as its parts: the variable it is about, the file that
--- variable resolved to when there is one, what is wrong, and the one fix.
--- `problem` and `fix` are this tool's own one-line text.
+-- variable resolved to when there is one, the variable's own value when the
+-- refusal shows it, what is wrong, and the one fix. `problem` and `fix` are
+-- this tool's own one-line text; `file` and `given` came from the
+-- environment.
 type alias StartupRefusal =
     { var : StartupVar
     , file : Maybe Path
+    , given : Maybe String
+    , problem : String
+    , fix : String
+    }
+
+
+-- A startup notice as its parts: the variable it is about, the state it
+-- puts the server in, and the one fix. Both texts are this tool's own.
+type alias StartupNotice =
+    { var : StartupVar
     , problem : String
     , fix : String
     }
 
 
 -- The one rendering of a startup refusal, on one line:
--- `VAR: cannot use "<file>": <problem>; fix: <fix>`, the file part left out
--- when there is none. The file came from the environment, so it is quoted
--- with its hazards escaped; no producer lays this text out by hand.
+-- `VAR is "<value>": cannot use "<file>": <problem>; fix: <fix>`, the value
+-- and the file parts left out when there is none. The value and the file
+-- came from the environment, so each is quoted with its hazards escaped,
+-- and the value is cut at `echoMaxChars`; no producer lays this text out by
+-- hand.
 startupRefusal : StartupRefusal -> Error
 startupRefusal refusal =
     Error.invalidInput
         (SafeText.toString
-            (SafeText.concat
-                [ SafeText.literal (startupVarName refusal.var)
-                , filePart refusal.file
-                , SafeText.literal ": "
-                , SafeText.literal refusal.problem
-                , SafeText.literal "; fix: "
-                , SafeText.literal refusal.fix
-                ]
+            (startupLine refusal.var
+                (SafeText.concat [ givenPart refusal.given, filePart refusal.file ])
+                refusal.problem
+                refusal.fix
             )
         )
+
+
+-- The one rendering of a startup notice, on one line in the refusal's
+-- layout under the tool's name: `code-review: VAR: <problem>; fix: <fix>`.
+startupNotice : StartupNotice -> String
+startupNotice notice =
+    "code-review: " ++ SafeText.toString (startupLine notice.var (SafeText.literal "") notice.problem notice.fix)
+
+
+-- The layout both renderings share: the variable, what is shown of it, the
+-- problem and the one fix.
+startupLine : StartupVar -> SafeText -> String -> String -> SafeText
+startupLine var shown problem fix =
+    SafeText.concat
+        [ SafeText.literal (startupVarName var)
+        , shown
+        , SafeText.literal ": "
+        , SafeText.literal problem
+        , SafeText.literal "; fix: "
+        , SafeText.literal fix
+        ]
+
+
+-- The longest prefix of a variable's value a refusal shows, in code points.
+echoMaxChars : Int
+echoMaxChars =
+    64
+
+
+givenPart : Maybe String -> SafeText
+givenPart given =
+    case given of
+        Just value ->
+            SafeText.concat [ SafeText.literal " is ", SafeText.quoted (String.left echoMaxChars value), cutMark value ]
+
+        Nothing ->
+            SafeText.literal ""
+
+
+-- `…` after the shown prefix when `value` is longer than it.
+cutMark : String -> SafeText
+cutMark value =
+    if String.length value > echoMaxChars then
+        SafeText.literal "…"
+
+    else
+        SafeText.literal ""
 
 
 filePart : Maybe Path -> SafeText

@@ -78,9 +78,38 @@ test("checkbox: a removed checked attribute unchecks a box the user checked", as
   await box.click();
   await expect(box).toBeChecked();
   await box.blur();
-  await pushPatches(page, [{ id: "e2e-box", attrs: { checked: "" } }]);
+  await pushPatches(page, [{ id: "e2e-box", attrs: { checked: null } }]);
   await expect(box).not.toBeChecked();
   expect(await box.evaluate((el) => el.hasAttribute("checked"))).toBe(false);
+  expect(errors.map(String)).toEqual([]);
+});
+
+test("checkbox: an attribute set to the empty value is present, never removed", async ({ page }) => {
+  const errors = [];
+  page.on("pageerror", (e) => errors.push(e));
+  await load(page);
+  await addToRoot(page, '<input type="checkbox" id="ipe-e2e-empty" ipe-id="e2e-empty">');
+  const box = page.locator("#ipe-e2e-empty");
+  await expect(box).not.toBeChecked();
+  await pushPatches(page, [{ id: "e2e-empty", attrs: { checked: "", "data-mark": "" } }]);
+  await expect(box).toBeChecked();
+  expect(await box.evaluate((el) => [el.getAttribute("checked"), el.getAttribute("data-mark")])).toEqual([
+    "",
+    "",
+  ]);
+  expect(errors.map(String)).toEqual([]);
+});
+
+test("patch: an attribute value that is neither a string nor null is refused", async ({ page }) => {
+  const errors = [];
+  page.on("pageerror", (e) => errors.push(e));
+  await load(page);
+  await addToRoot(page, '<span id="ipe-e2e-shape" ipe-id="e2e-shape" title="kept">x</span>');
+  const el = page.locator("#ipe-e2e-shape");
+  await pushPatches(page, [{ id: "e2e-shape", attrs: { title: 5, lang: { a: 1 }, dir: true } }]);
+  expect(
+    await el.evaluate((n) => [n.getAttribute("title"), n.hasAttribute("lang"), n.hasAttribute("dir")]),
+  ).toEqual(["kept", false, false]);
   expect(errors.map(String)).toEqual([]);
 });
 
@@ -101,8 +130,67 @@ test("option: a removed selected attribute deselects an option a script selected
     el.selected = false;
     el.selected = true;
   });
-  await pushPatches(page, [{ id: "e2e-opt", attrs: { selected: "" } }]);
+  await pushPatches(page, [{ id: "e2e-opt", attrs: { selected: null } }]);
   expect(await opt.evaluate((el) => el.selected)).toBe(false);
   expect(await opt.evaluate((el) => el.hasAttribute("selected"))).toBe(false);
+  expect(errors.map(String)).toEqual([]);
+});
+
+// The frame rule on the patch path. `addToRoot` bypasses the parse-time fence,
+// so these frames stand for nodes the fence never saw; each patch must still
+// leave a sandboxed iframe and a loader without its URL.
+
+test("frame patch: a url set on an unsandboxed iframe writes an empty sandbox first", async ({
+  page,
+}) => {
+  const errors = [];
+  page.on("pageerror", (e) => errors.push(e));
+  await load(page);
+  await addToRoot(page, '<iframe id="ipe-e2e-frame" ipe-id="e2e-frame"></iframe>');
+  const frame = page.locator("#ipe-e2e-frame");
+  expect(await frame.evaluate((el) => el.hasAttribute("sandbox"))).toBe(false);
+  await pushPatches(page, [{ id: "e2e-frame", attrs: { SRC: "/" } }]);
+  expect(await frame.evaluate((el) => [el.getAttribute("sandbox"), el.getAttribute("src")])).toEqual([
+    "",
+    "/",
+  ]);
+  await expect.poll(() => frame.evaluate((el) => el.contentDocument === null)).toBe(true);
+  expect(errors.map(String)).toEqual([]);
+});
+
+test("frame patch: an iframe sandbox is never removed and keeps only known tokens", async ({ page }) => {
+  const errors = [];
+  page.on("pageerror", (e) => errors.push(e));
+  await load(page);
+  await addToRoot(page, '<iframe id="ipe-e2e-boxed" ipe-id="e2e-boxed" sandbox="allow-forms"></iframe>');
+  const frame = page.locator("#ipe-e2e-boxed");
+  await pushPatches(page, [{ id: "e2e-boxed", attrs: { sandbox: null } }]);
+  expect(await frame.evaluate((el) => el.getAttribute("sandbox"))).toBe("allow-forms");
+  await pushPatches(page, [
+    { id: "e2e-boxed", attrs: { Sandbox: "ALLOW-SAME-ORIGIN\tallow-scripts allow-popups-to-escape-sandbox x" } },
+  ]);
+  expect(await frame.evaluate((el) => el.getAttribute("sandbox"))).toBe("allow-scripts");
+  expect(errors.map(String)).toEqual([]);
+});
+
+test("frame patch: a loader never gains its url, in any key case", async ({ page }) => {
+  const errors = [];
+  page.on("pageerror", (e) => errors.push(e));
+  await load(page);
+  await addToRoot(
+    page,
+    '<embed id="ipe-e2e-embed" ipe-id="e2e-embed"><object id="ipe-e2e-object" ipe-id="e2e-object"></object>',
+  );
+  await pushPatches(page, [
+    { id: "e2e-embed", attrs: { SRC: "/", title: "kept" } },
+    { id: "e2e-object", attrs: { data: "/" } },
+  ]);
+  expect(
+    await page.evaluate(() => {
+      const embed = document.getElementById("ipe-e2e-embed");
+      const object = document.getElementById("ipe-e2e-object");
+      return [embed.hasAttribute("src"), embed.getAttribute("title"), object.hasAttribute("data")];
+    }),
+  ).toEqual([false, "kept", false]);
   expect(errors.map(String)).toEqual([]);
 });

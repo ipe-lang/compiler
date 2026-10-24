@@ -28,6 +28,7 @@
 
 #![allow(clippy::type_complexity)] // TEA fn-quadruples are inherent here
 
+use std::borrow::Cow;
 use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
 use std::rc::Rc;
@@ -40,7 +41,10 @@ use crate::dom::{
     HandlerIndex, WebReq, build_index,
     diff::{AUTOFOCUS_SPENT_GLOBAL, Patch, diff, focus_target},
 };
-use crate::html::{FormData, Html, RenderCtx, assign_ipe_ids, render_html};
+use crate::html::{
+    FormData, Html, IFRAME_TAG, RenderCtx, SANDBOX_ATTR, SandboxTokens, assign_ipe_ids,
+    frame_loader_key, render_html,
+};
 use crate::tea::{IpeCmd, IpeSub};
 use crate::web::route::MountRefusal;
 
@@ -1472,25 +1476,83 @@ fn ipe_id_selector(id: &str) -> String {
 
 /// How a patch writes one attribute.
 #[derive(Debug, PartialEq, Eq)]
-enum AttrWrite {
-    Set,
+enum AttrWrite<'v> {
+    /// Set the attribute to this value.
+    Set(Cow<'v, str>),
+    /// Remove the attribute.
     Remove,
+    /// Write nothing.
+    Keep,
+    /// Set the empty `sandbox` first, then the attribute to this value: the
+    /// sandbox binds when the frame navigates.
+    SandboxThenSet(&'v str),
 }
 
-/// The write for attribute `key` patched to `value`: an empty value removes,
-/// and `autofocus` never reaches a live node, where a later move would focus it.
-const fn attr_write(key: &str, value: &str) -> AttrWrite {
-    if value.is_empty() || key.eq_ignore_ascii_case("autofocus") {
-        AttrWrite::Remove
-    } else {
-        AttrWrite::Set
+/// The write for attribute `key` of an element `tag` patched to `value`, where
+/// `sandboxed` says whether the element holds a `sandbox` now.
+///
+/// `None` removes and a value sets, the empty one included. `autofocus` never
+/// reaches a live node, where a later move would focus it. The frame rule of
+/// `html.rs` holds on the live node: an `iframe`'s `sandbox` is never removed
+/// and is set canonical, a `src` or `srcdoc` on an unsandboxed `iframe` is
+/// preceded by the empty sandbox, and a frame loader never gains the
+/// attribute it loads from.
+fn attr_write<'v>(tag: &str, key: &str, value: Option<&'v str>, sandboxed: bool) -> AttrWrite<'v> {
+    if key.eq_ignore_ascii_case("autofocus") {
+        return AttrWrite::Remove;
     }
+    if tag.eq_ignore_ascii_case(IFRAME_TAG) {
+        if key.eq_ignore_ascii_case(SANDBOX_ATTR) {
+            return value.map_or(AttrWrite::Keep, |v| {
+                AttrWrite::Set(Cow::Owned(SandboxTokens::parse(v).canonical()))
+            });
+        }
+        if let Some(v) = value
+            && !sandboxed
+            && (key.eq_ignore_ascii_case("src") || key.eq_ignore_ascii_case("srcdoc"))
+        {
+            return AttrWrite::SandboxThenSet(v);
+        }
+    } else if value.is_some()
+        && frame_loader_key(tag).is_some_and(|loads| key.eq_ignore_ascii_case(loads))
+    {
+        return AttrWrite::Keep;
+    }
+    value.map_or(AttrWrite::Remove, |v| AttrWrite::Set(Cow::Borrowed(v)))
+}
+
+/// The frame-loading elements a detached holder is fenced on.
+const FRAME_SELECTOR: &str = "iframe, embed, object, frame";
+
+/// Fence every frame `frames` of a detached holder before its nodes connect:
+/// an `iframe` gets the canonical sandbox, and an `embed`, `object` or `frame`
+/// holding the attribute it loads from is removed.
+fn fence_frames(frames: &web_sys::NodeList) -> Result<(), &'static str> {
+    for i in 0..frames.length() {
+        let Some(element) = frames
+            .item(i)
+            .and_then(|node| node.dyn_into::<web_sys::Element>().ok())
+        else {
+            continue;
+        };
+        let tag = element.local_name();
+        if tag.eq_ignore_ascii_case(IFRAME_TAG) {
+            let held = element.get_attribute(SANDBOX_ATTR).unwrap_or_default();
+            element
+                .set_attribute(SANDBOX_ATTR, &SandboxTokens::parse(&held).canonical())
+                .map_err(|_| "frame sandbox could not be set")?;
+        } else if frame_loader_key(&tag).is_some_and(|loads| element.has_attribute(loads)) {
+            element.remove();
+        }
+    }
+    Ok(())
 }
 
 /// The HTML namespace.
 const HTML_NS: &str = "http://www.w3.org/1999/xhtml";
 
-/// Markup parsed detached, every `autofocus` already removed.
+/// Markup parsed detached, every `autofocus` already removed and every frame
+/// fenced.
 struct Detached {
     /// The holder whose children are the parsed nodes.
     nodes: web_sys::Node,
@@ -1500,7 +1562,9 @@ struct Detached {
 
 /// `html` parsed detached in `el`'s own namespace and context, with every
 /// `autofocus` removed before the nodes connect: the browser focuses an
-/// autofocus element on insertion while focus is on the body. The holder is an
+/// autofocus element on insertion while focus is on the body. Every frame is
+/// fenced there too (`fence_frames`), as a detached holder loads no document,
+/// so no document a patch frames shares the app's origin. The holder is an
 /// element of `el`'s own tag, so the parser reads the markup in the insertion
 /// mode `el` sets (a `<tr>` below a `<tbody>`); a custom element's name would
 /// run its constructor on the holder, so it gets a `div`, and a template's
@@ -1527,14 +1591,17 @@ fn parse_detached(
     } else {
         None
     };
-    let (nodes, found): (web_sys::Node, _) = if let Some(template) = template {
+    let (nodes, found, frames): (web_sys::Node, _, _) = if let Some(template) = template {
         let content = template.content();
         let found = content.query_selector_all("[autofocus]");
-        (content.into(), found)
+        let frames = content.query_selector_all(FRAME_SELECTOR);
+        (content.into(), found, frames)
     } else {
         let found = holder.query_selector_all("[autofocus]");
-        (holder.into(), found)
+        let frames = holder.query_selector_all(FRAME_SELECTOR);
+        (holder.into(), found, frames)
     };
+    fence_frames(&frames.map_err(|_| "frame query refused")?)?;
     let found = found.map_err(|_| "autofocus query refused")?;
     let mut autofocus = None;
     for i in 0..found.length() {
@@ -1692,26 +1759,43 @@ fn apply_patches(patches: &[Patch]) {
             // glue's `set state(v)` setter forwards the decoded object to the
             // author hook — data handed to a setter, never spliced into markup.
             if k == "state" && widget::is_widget_tag(&el.tag_name().to_lowercase()) {
-                widget::set_widget_down_property(&el, v);
+                widget::set_widget_down_property(&el, v.as_deref().unwrap_or_default());
                 continue;
             }
-            match attr_write(k, v) {
-                AttrWrite::Remove => {
-                    let _ = el.remove_attribute(k);
-                }
-                AttrWrite::Set => {
-                    let _ = el.set_attribute(k, v);
-                    sync_dom_property(&el, k, v);
-                }
-            }
+            write_patched_attr(&el, k, v.as_deref());
         }
     }
 }
 
+/// Write one patched attribute onto the live `el`: `Some` sets, `None`
+/// removes, both through the frame rule of `attr_write` — an iframe holds a
+/// sandbox before it holds a URL, and a frame loader never gains its URL.
+pub fn write_patched_attr(el: &web_sys::Element, key: &str, value: Option<&str>) {
+    let sandboxed = el.has_attribute(SANDBOX_ATTR);
+    match attr_write(&el.local_name(), key, value, sandboxed) {
+        AttrWrite::Set(v) => {
+            let _ = el.set_attribute(key, &v);
+            sync_dom_property(el, key, &v);
+        }
+        AttrWrite::SandboxThenSet(v) => {
+            if el.set_attribute(SANDBOX_ATTR, "").is_ok() {
+                let _ = el.set_attribute(key, v);
+            }
+        }
+        AttrWrite::Remove => {
+            let _ = el.remove_attribute(key);
+            clear_dom_property(el, key);
+        }
+        AttrWrite::Keep => {}
+    }
+}
+
 /// Attributes whose DOM *property* does not reflect from the attribute —
-/// mirror `client.js`'s value/checked/selected/disabled sync.
+/// mirror `client.js`'s value/checked/selected/disabled sync: a set property
+/// follows its value unless the value spells `false`, the empty value
+/// included, as the attribute `checked=""` checks.
 fn sync_dom_property(el: &web_sys::Element, key: &str, val: &str) {
-    let truthy = !val.is_empty() && val != "false";
+    let truthy = val != "false";
     match key {
         "value" => {
             if let Some(input) = el.dyn_ref::<web_sys::HtmlInputElement>() {
@@ -1733,6 +1817,13 @@ fn sync_dom_property(el: &web_sys::Element, key: &str, val: &str) {
             }
         }
         _ => {}
+    }
+}
+
+/// A removed attribute clears the property it mirrors, as `client.js`.
+fn clear_dom_property(el: &web_sys::Element, key: &str) {
+    if key == "checked" || key == "disabled" {
+        sync_dom_property(el, key, "false");
     }
 }
 
@@ -1857,12 +1948,80 @@ mod tests {
         assert_eq!(ipe_id_selector("a\nb\0"), "[ipe-id=\"a\\a b\u{FFFD}\"]");
     }
 
+    /// The write of a set to `v`, borrowed.
+    const fn set(v: &str) -> AttrWrite<'_> {
+        AttrWrite::Set(Cow::Borrowed(v))
+    }
+
     #[wasm_bindgen_test]
     fn a_patch_never_writes_autofocus() {
-        assert_eq!(attr_write("autofocus", ""), AttrWrite::Remove);
-        assert_eq!(attr_write("autofocus", "autofocus"), AttrWrite::Remove);
-        assert_eq!(attr_write("AutoFocus", "true"), AttrWrite::Remove);
-        assert_eq!(attr_write("class", "a"), AttrWrite::Set);
-        assert_eq!(attr_write("class", ""), AttrWrite::Remove);
+        let write = |key, value| attr_write("div", key, value, false);
+        assert_eq!(write("autofocus", Some("")), AttrWrite::Remove);
+        assert_eq!(write("autofocus", Some("autofocus")), AttrWrite::Remove);
+        assert_eq!(write("AutoFocus", Some("true")), AttrWrite::Remove);
+        assert_eq!(write("class", Some("a")), set("a"));
+        assert_eq!(write("class", Some("")), set(""));
+        assert_eq!(write("class", None), AttrWrite::Remove);
+    }
+
+    /// An `iframe`'s `sandbox` is never removed, and a set is canonical.
+    #[wasm_bindgen_test]
+    fn a_patch_never_removes_an_iframe_sandbox() {
+        for (tag, key) in [("iframe", "sandbox"), ("IFRAME", "SandBox")] {
+            assert_eq!(attr_write(tag, key, None, true), AttrWrite::Keep);
+            assert_eq!(
+                attr_write(
+                    tag,
+                    key,
+                    Some("ALLOW-SCRIPTS allow-same-origin allow-forms"),
+                    true
+                ),
+                set("allow-forms allow-scripts")
+            );
+            assert_eq!(
+                attr_write(tag, key, Some("allow-popups-to-escape-sandbox"), true),
+                set("")
+            );
+        }
+        assert_eq!(attr_write("div", "sandbox", None, false), AttrWrite::Remove);
+    }
+
+    /// A frame loader never gains the attribute it loads from, in any case.
+    #[wasm_bindgen_test]
+    fn a_patch_never_gives_a_frame_loader_its_url() {
+        for (tag, key) in [
+            ("embed", "src"),
+            ("EMBED", "SRC"),
+            ("object", "data"),
+            ("frame", "Src"),
+        ] {
+            for value in ["", " ", "/"] {
+                assert_eq!(
+                    attr_write(tag, key, Some(value), false),
+                    AttrWrite::Keep,
+                    "{tag} {key}"
+                );
+            }
+            assert_eq!(attr_write(tag, key, None, false), AttrWrite::Remove);
+        }
+        assert_eq!(attr_write("embed", "type", Some("x"), false), set("x"));
+        assert_eq!(attr_write("object", "src", Some("/"), false), set("/"));
+    }
+
+    /// A `src` patched onto an `iframe` with no sandbox writes the empty
+    /// sandbox first; one already sandboxed only sets the `src`.
+    #[wasm_bindgen_test]
+    fn an_iframe_src_patch_sandboxes_first() {
+        assert_eq!(
+            attr_write("iframe", "src", Some("/"), false),
+            AttrWrite::SandboxThenSet("/")
+        );
+        assert_eq!(
+            attr_write("iframe", "SRC", Some(""), false),
+            AttrWrite::SandboxThenSet("")
+        );
+        assert_eq!(attr_write("iframe", "src", Some("/"), true), set("/"));
+        assert_eq!(attr_write("iframe", "src", None, false), AttrWrite::Remove);
+        assert_eq!(attr_write("div", "src", Some("/"), false), set("/"));
     }
 }

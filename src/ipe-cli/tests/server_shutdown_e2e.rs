@@ -341,6 +341,72 @@ main =
         }
 "#;
 
+/// A `Web.tea` app whose session ticks every 50 ms, so a driver turn and its
+/// checkpoint write are running whenever the shutdown closes. Its `init` opens
+/// the session-store file through `Ipe.Db`: the `Db` use builds the store's `db`
+/// feature in, and the open switches the file to WAL.
+const WEB_SESSION_TICKS: &str = r#"module Main exposing (main)
+
+import Ipe.Db as Db
+import Ipe.Db.Location as Location exposing (Mode(..))
+import Ipe.Error exposing (Error)
+import Ipe.Path as Path
+import Ipe.Result as Result
+import Ipe.String
+import Ipe.System as System
+import Ipe.Task as Task exposing (Task)
+import Ipe.Tea.Web as Web
+import Ipe.Tea.Web.Cmd
+import Ipe.Tea.Web.Sub
+import Ipe.Ui as Ui
+
+type Msg = Tick | Reset | Opened (Result Error ())
+
+type alias Model = { count : Int }
+
+openStoreFile : Task Error ()
+openStoreFile =
+    Path.fromString (System.getenvOr "IPE_WEB_STORE_PATH" "sessions.db")
+        |> Result.andThen (Location.file CreateIfMissing)
+        |> Task.fromResult
+        |> Task.andThen (\location -> Db.open location)
+        |> Task.map (\_ -> ())
+
+init : WebReq -> ( Model, Cmd Msg )
+init _req =
+    ( { count = 0 }, Cmd.perform openStoreFile Opened )
+
+update : Msg -> Model -> ( Model, Cmd Msg )
+update msg model =
+    case msg of
+        Tick ->
+            ( { model | count = model.count + 1 }, Cmd.none )
+
+        Reset ->
+            ( { model | count = 0 }, Cmd.none )
+
+        Opened _result ->
+            ( model, Cmd.none )
+
+subscriptions : Model -> Sub Msg
+subscriptions _model =
+    Sub.every 50 Tick
+
+view : Model -> Element Msg
+view model =
+    Ui.el [ Ui.onClick Reset ] (Ui.text (String.fromInt model.count))
+
+main =
+    Web.tea
+        { init = init
+        , update = update
+        , view = view
+        , subscriptions = subscriptions
+        , routes = []
+        , notFound = Reset
+        }
+"#;
+
 /// A `Web.tea` app whose `init` Cmd opens the `STORE_DB` file through `Ipe.Db`,
 /// writes a row (so the file has a `-wal`), logs that it opened, then queries
 /// the table back to back, writing a failed query to stderr: a Cmd always on
@@ -1318,6 +1384,84 @@ fn a_web_cmd_past_the_grace_is_cancelled_before_the_pools_close() -> Result<(), 
         served.containing(Pipe::Err, "cancelled 1 task still running"),
         1,
         "{test_name}: the grace's end cancels the running Cmd; seen {:?}",
+        served.seen
+    );
+    assert_eq!(served.containing(Pipe::Err, FORCING_LINE), 0);
+    assert_no_sidecars(test_name, &db);
+    Ok(())
+}
+
+/// E12: a ticking session on the SQLite session store, signalled with no
+/// grace, ends cleanly: the exit is 0, no unit of work outlives its cancel
+/// deadline (a parked driver counted as work would), nothing panics, and the
+/// session file keeps no `-wal` or `-shm`.
+///
+/// The store writes no line when a checkpoint fails, so a turn cut by the
+/// pool close is not visible here; the turn's hold on the close is proved by
+/// `a_driver_turn_at_closing_writes_its_checkpoint_then_ends` in the runtime.
+#[test]
+fn a_ticking_session_stops_its_turns_before_the_store_closes() -> Result<(), BoxError> {
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
+        return Ok(());
+    }
+    let test_name = "web_session_ticks";
+    let exe = compile(test_name, WEB_SESSION_TICKS)?;
+    let db = fresh_db(test_name);
+    let db_env = db.to_string_lossy().into_owned();
+    let port = pick_ephemeral_port()?;
+    let port_env = port.to_string();
+    let env = [
+        ("IPE_WEB_PORT", port_env.as_str()),
+        ("IPE_CSRF", "off"),
+        ("IPE_CONSOLE_EMBED", "off"),
+        ("IPE_WEB_SHUTDOWN_GRACE_MS", "0"),
+        ("IPE_WEB_STORE", "sqlite"),
+        ("IPE_WEB_STORE_PATH", db_env.as_str()),
+    ];
+    let mut served = Served::ready(&exe, port, &env)?;
+    let page = get(port, "/")?;
+    assert!(
+        page.starts_with("HTTP/1.1 200"),
+        "{test_name}: the page renders: {page}"
+    );
+    let switched = Instant::now() + LINE_BUDGET;
+    while !sidecar(&db, "-wal").exists() {
+        assert!(
+            Instant::now() < switched,
+            "{test_name}: the session file never ran in WAL; seen {:?}",
+            served.seen
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    // Several ticks, each a turn and a checkpoint write, run before the signal.
+    std::thread::sleep(Duration::from_millis(400));
+    served.signal("-TERM")?;
+    let status = served.wait_exit(EXIT_BUDGET)?;
+    assert_eq!(
+        status.code(),
+        Some(0),
+        "{test_name}: {status}; seen {:?}",
+        served.seen
+    );
+    assert_eq!(
+        served.ending_with(Pipe::Out, SHUTDOWN_LINE),
+        1,
+        "{test_name}: one shutdown line; seen {:?}",
+        served.seen
+    );
+    assert_eq!(
+        served.containing(Pipe::Err, "session store: sqlite @ "),
+        1,
+        "{test_name}: the SQLite session store opened, and no other store line; seen {:?}",
+        served.seen
+    );
+    let failures: usize = ["checkpoint", "pool closed", "did not stop", "panicked"]
+        .iter()
+        .map(|text| served.containing(Pipe::Err, text) + served.containing(Pipe::Out, text))
+        .sum();
+    assert_eq!(
+        failures, 0,
+        "{test_name}: no turn outlives the store it writes; seen {:?}",
         served.seen
     );
     assert_eq!(served.containing(Pipe::Err, FORCING_LINE), 0);

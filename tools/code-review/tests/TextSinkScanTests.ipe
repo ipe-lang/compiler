@@ -132,31 +132,39 @@ type Mode
 
 -- What the lexer knows besides its mode: whether it is at column 0,
 -- whether the word it is reading names a declaration, the declaration it
--- is in, whether a literal broke, and whether a triple-quoted string held
--- a `{{`.
+-- is in, whether a literal broke, whether a triple-quoted string held
+-- a `{{`, the source text of the string literal it is reading, and the
+-- string literals it has read.
 type alias Meta =
-    { atColumnZero : Bool, nameWord : Bool, name : String, broken : Bool, interpolated : Bool }
+    { atColumnZero : Bool, nameWord : Bool, name : String, broken : Bool, interpolated : Bool, buffer : String, literals : List StringLiteral }
+
+
+-- A string literal as its source spells it between its quotes, escapes
+-- unread, with the declaration it sits in.
+type alias StringLiteral =
+    { text : String, name : String }
 
 
 type alias Lexer =
     ( Mode, Meta, List Token )
 
 
--- A module's tokens, its imports, the tokens outside them, and whether a
--- literal broke or a triple-quoted string held a `{{`.
+-- A module's tokens, its imports, the tokens outside them, whether a
+-- literal broke or a triple-quoted string held a `{{`, and its string
+-- literals as the source spells them.
 type alias Lexed =
-    { tokens : List Token, imports : List Import, code : List Token, broken : Bool, interpolated : Bool }
+    { tokens : List Token, imports : List Import, code : List Token, broken : Bool, interpolated : Bool, literals : List StringLiteral }
 
 
 lex : String -> Lexed
 lex text =
-    case finish (String.foldl lexStep ( Code, { atColumnZero = True, nameWord = False, name = "", broken = False, interpolated = False }, [] ) text) of
+    case finish (String.foldl lexStep ( Code, { atColumnZero = True, nameWord = False, name = "", broken = False, interpolated = False, buffer = "", literals = [] }, [] ) text) of
         ( _, meta, toks ) ->
             let
                 split =
                     splitImports toks
             in
-            { tokens = toks, imports = split.imports, code = split.code, broken = meta.broken, interpolated = meta.interpolated }
+            { tokens = toks, imports = split.imports, code = split.code, broken = meta.broken, interpolated = meta.interpolated, literals = meta.literals }
 
 
 lexStep : Char -> Lexer -> Lexer
@@ -217,27 +225,27 @@ advance c ( mode, meta, toks ) =
                 ( Triple 0 False, meta, toks )
 
             else
-                codeChar c meta (toks ++ [ stringToken meta ])
+                codeChar c (recorded "" meta) (toks ++ [ stringToken meta ])
 
         InString ->
             stringChar c meta toks
 
         StringEscape ->
-            ( InString, meta, toks )
+            ( InString, appended c meta, toks )
 
         Triple closing brace ->
             if c == '"' then
                 if closing == 2 then
-                    ( Code, meta, toks ++ [ stringToken meta ] )
+                    ( Code, recorded (String.dropRight 2 meta.buffer) meta, toks ++ [ stringToken meta ] )
 
                 else
-                    ( Triple (closing + 1) False, meta, toks )
+                    ( Triple (closing + 1) False, appended c meta, toks )
 
             else if c == '{' then
-                ( Triple 0 True, { meta | interpolated = meta.interpolated || brace }, toks )
+                ( Triple 0 True, appended c { meta | interpolated = meta.interpolated || brace }, toks )
 
             else
-                ( Triple 0 False, meta, toks )
+                ( Triple 0 False, appended c meta, toks )
 
         CharOpen ->
             if c == '\\' then
@@ -310,7 +318,7 @@ codeChar c meta toks =
         ( CodeBrace, meta, toks )
 
     else if c == '"' then
-        ( OneQuote, meta, toks )
+        ( OneQuote, { meta | buffer = "" }, toks )
 
     else if c == '\'' then
         ( CharOpen, meta, toks )
@@ -325,16 +333,28 @@ codeChar c meta toks =
 stringChar : Char -> Meta -> List Token -> Lexer
 stringChar c meta toks =
     if c == '\\' then
-        ( StringEscape, meta, toks )
+        ( StringEscape, appended c meta, toks )
 
     else if c == '"' then
-        ( Code, meta, toks ++ [ stringToken meta ] )
+        ( Code, recorded meta.buffer meta, toks ++ [ stringToken meta ] )
 
     else if c == '\n' then
         broke meta toks
 
     else
-        ( InString, meta, toks )
+        ( InString, appended c meta, toks )
+
+
+-- `meta` with `c` added to the literal it is reading.
+appended : Char -> Meta -> Meta
+appended c meta =
+    { meta | buffer = meta.buffer ++ String.fromChar c }
+
+
+-- `meta` with a string literal spelled `text` read in its declaration.
+recorded : String -> Meta -> Meta
+recorded text meta =
+    { meta | literals = meta.literals ++ [ { text = text, name = meta.name } ], buffer = "" }
 
 
 blockChar : Int -> Char -> Meta -> List Token -> Lexer
@@ -397,7 +417,7 @@ finish ( mode, meta, toks ) =
             ( Code, meta, toks ++ [ punctuationToken '{' meta ] )
 
         TwoQuotes ->
-            ( Code, meta, toks ++ [ stringToken meta ] )
+            ( Code, recorded "" meta, toks ++ [ stringToken meta ] )
 
         OneQuote ->
             broke meta toks
@@ -440,7 +460,8 @@ finish ( mode, meta, toks ) =
 -- site not listed, an error's text not rendered as foreign, a markup name
 -- not classified or a markup sink of computed text at a site not listed,
 -- an import that opens another spelling, a triple-quoted string that
--- interpolates code, and a module that does not lex.
+-- interpolates code, a startup line laid out outside its one renderer, and
+-- a module that does not lex.
 type Rule
     = ComputedUiText
     | StrayHtmlText
@@ -449,6 +470,7 @@ type Rule
     | ComputedMarkup
     | ImportSpelling
     | Interpolated
+    | StartupLayout
     | Unlexed
 
 
@@ -518,9 +540,74 @@ admittedFlattening =
     , "Lib/RepoPath.ipe:rootRefusal"
     , "Lib/RepoPath.ipe:toError"
     , "Lib/Settings.ipe:rootsRefusal"
+    , "Lib/EnvLookup.ipe:startupNotice"
     , "Main.ipe:printStartupFailure"
-    , "Main.ipe:requireLoopbackBind"
     ]
+
+
+-- The one module that lays out a startup line, and the two sites that
+-- write the tool's prefix: the printer of every refusal and the renderer of
+-- the one notice.
+startupLayoutModule : String
+startupLayoutModule =
+    "Lib/EnvLookup.ipe"
+
+
+startupPrefixSites : List String
+startupPrefixSites =
+    [ "Main.ipe:printStartupFailure", "Lib/EnvLookup.ipe:startupNotice" ]
+
+
+-- The string literals of one module that lay out a startup line outside
+-- `EnvLookup`: a `fix: ` or a line-break escape, or the tool's
+-- `code-review: ` prefix outside its two sites.
+layoutViolations : String -> Lexed -> List Violation
+layoutViolations rel lexed =
+    List.map (\literal -> { rule = StartupLayout, why = rel ++ ":" ++ literal.name ++ " lays out a startup line outside " ++ startupLayoutModule }) (List.filter (laysOutStartupLine rel) lexed.literals)
+        ++ List.map (\literal -> { rule = StartupLayout, why = rel ++ ":" ++ literal.name ++ " writes the code-review: prefix outside its two sites" }) (List.filter (writesStrayPrefix rel) lexed.literals)
+
+
+-- A literal of module `rel` that holds a fix or a line-break escape,
+-- outside the one module that lays out a startup line.
+laysOutStartupLine : String -> StringLiteral -> Bool
+laysOutStartupLine rel literal =
+    rel /= startupLayoutModule && (String.contains "fix: " literal.text || holdsLineBreakEscape literal.text)
+
+
+-- Whether a literal, spelled as its source spells it, breaks a line amid
+-- other text: it holds a `\n` or `\r` escape (an `n` or `r` after a `\`
+-- that is not itself escaped) and some other character. A literal of line
+-- breaks alone is a separator, and lays out no line.
+holdsLineBreakEscape : String -> Bool
+holdsLineBreakEscape text =
+    let
+        read =
+            String.foldl
+                (\c acc ->
+                    if acc.escaping then
+                        if c == 'n' || c == 'r' then
+                            { acc | escaping = False, found = True }
+
+                        else
+                            { acc | escaping = False, other = True }
+
+                    else if c == '\\' then
+                        { acc | escaping = True }
+
+                    else
+                        { acc | other = True }
+                )
+                { escaping = False, found = False, other = False }
+                text
+    in
+    read.found && read.other
+
+
+-- A literal of module `rel` that holds the tool's prefix outside its two
+-- sites.
+writesStrayPrefix : String -> StringLiteral -> Bool
+writesStrayPrefix rel literal =
+    String.contains "code-review: " literal.text && not (List.member (rel ++ ":" ++ literal.name) startupPrefixSites)
 
 
 -- What an import of a guarded module may expose bare: any name but the
@@ -873,6 +960,7 @@ tokenViolations rel lexed =
     List.map (\n -> { rule = ComputedUiText, why = site rel n.token ++ " draws computed text with " ++ n.token.text }) computed
         ++ List.map (\n -> { rule = ErrorTextUnrendered, why = site rel n.token ++ " shows " ++ n.token.text ++ " not rendered as foreign" }) unrendered
         ++ markupViolations rel lexed
+        ++ layoutViolations rel lexed
         ++ interpolated
         ++ unlexed
 
@@ -1611,6 +1699,34 @@ appendedSiteKeysAsModule sources =
         && sameViolations aliasedApart aliasedWhole
 
 
+-- Every startup line is laid out by `EnvLookup` alone and prefixed by its
+-- two sites alone: the tree holds no other layout, and a planted copy of
+-- each kind is refused, a `; fix:` in a string or a triple-quoted string,
+-- a line-break escape with or without an indent, and the prefix elsewhere
+-- in `Main` or `EnvLookup`, while a `; fix:` in a comment or inside
+-- `EnvLookup`, an escaped `\` before an `n`, and a separator of line
+-- breaks alone, are not.
+-- Red if a producer lays out its own line or writes its own prefix.
+startupLayoutHasOneRenderer : List Source -> Bool
+startupLayoutHasOneRenderer sources =
+    let
+        inQueue extra =
+            appendTo "Lib/Queue.ipe" extra sources
+    in
+    clean sources
+        && caughtBy StartupLayout (inQueue "shown =\n    \"IPE_X: it is refused; fix: set it\"")
+        && caughtBy StartupLayout (inQueue "shown =\n    \"IPE_X: it is refused\\n  set it\"")
+        && caughtBy StartupLayout (inQueue "shown =\n    \"IPE_X: it is refused\\nset it\"")
+        && caughtBy StartupLayout (inQueue "shown =\n    \"IPE_X: it is refused\\r\\n\\tset it\"")
+        && caughtBy StartupLayout (inQueue "shown =\n    \"\"\"IPE_X: it is refused; fix: set it\"\"\"")
+        && caughtBy StartupLayout (appendTo "Main.ipe" "shown =\n    \"code-review: \"" sources)
+        && caughtBy StartupLayout (appendTo "Lib/EnvLookup.ipe" "shown =\n    \"code-review: \"" sources)
+        && clean (inQueue "-- IPE_X: it is refused; fix: set it\nshown =\n    \"IPE_X\"")
+        && clean (inQueue "shown =\n    \"IPE_X: a \\\\n is a backslash and n\"")
+        && clean (inQueue "shown =\n    \"\\r\\n\"")
+        && clean (appendTo "Lib/EnvLookup.ipe" "shown =\n    \"; fix: \"" sources)
+
+
 -- ── scanner self-tests ──────────────────────────────────────────────────
 
 -- A site is keyed by the last column-0 lowercase word above it, a literal
@@ -1635,6 +1751,7 @@ lexerReadsLiterals =
         && kinds "'\"' x '\\'' y" == [ Punctuation, WordToken, Punctuation, WordToken ]
         && kinds "a {- b {- c -} d -} e -- f\ng" == [ WordToken, WordToken, WordToken ]
         && kinds "a - b" == [ WordToken, Punctuation, WordToken ]
+        && List.map (\l -> ( l.text, l.name )) (lex "x =\n    \"a\\nb\" ++ \"\" ++ \"\"\"c\"d\"\"\"").literals == [ ( "a\\nb", "x" ), ( "", "x" ), ( "c\"d", "x" ) ]
         && not (lex "a b").broken
         && (lex "a 'bc' d").broken
         && Result.toMaybe (withinFileCeiling (List.repeat (fileCeiling + 1) "")) == Nothing
@@ -1661,6 +1778,7 @@ checks =
                     , check "each way around the text sink scan is a violation of its own rule" (onTree scanRefusesEvasions tree)
                     , check "an evasion case read apart from its module is judged as the module lexed again whole" (onTree appendedSiteKeysAsModule tree)
                     , check "every exemption from the error-text guard names a module of src/Lib" (onTree errorTextExemptionsExist tree)
+                    , check "every startup line is laid out by one renderer and prefixed at its two sites" (onTree startupLayoutHasOneRenderer tree)
                     , Task.succeed ( "the text sink scan lexes literals and comments as Ipê reads them", lexerReadsLiterals )
                     ]
             )

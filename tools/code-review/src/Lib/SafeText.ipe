@@ -5,8 +5,10 @@ module Lib.SafeText exposing (SafeText, Segment(..), concat, escapeSpelling, isH
 -- text (index rows, environment values, an error message built from either)
 -- enters only through `render`, `quoted` or `renderForeign`; `literal` is for
 -- text this tool writes itself, so its callers pass string literals only.
--- `toString` is the one exit, used at a sink. The tool constants `key` and
--- `hint` that `Main.requireEnv` prints are such literals.
+-- `toString` is the one exit, used at a sink. The variable name, problem and
+-- fix of a startup line are such literals, laid out by `EnvLookup`; a value
+-- or file a startup line shows came from the environment, so it enters
+-- through `quoted`.
 --
 -- The hazard set is the review-display set: a strict superset of the
 -- runtime's log-hazard set (`is_log_hazard`, `src/runtime/rust/src/system.rs`)

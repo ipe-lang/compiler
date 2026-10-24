@@ -65,9 +65,11 @@ sameSubject a b =
 -- The row `uid` as the queue page shows it with card `selected` selected
 -- and `view` in the source slot, when it offers a decision: an
 -- acknowledgeable file the page lists, or the selected card's unit with its
--- verified source shown, each over a proven log. Nothing for a withheld
--- source, a file no decision binds, a log that records no decision, a page
--- not loaded, or a uid the page does not show.
+-- verified source shown, each over a proven log and each with a name its
+-- decision can record (the row's `record`). Nothing for a withheld source,
+-- a file no decision binds, a row whose name no decision can record, a log
+-- that records no decision, a page not loaded, or a uid the page does not
+-- show.
 decidableRow : Int -> QueueState -> SelectedView -> Uid -> Maybe DecidableRow
 decidableRow selected state view uid =
     case state of
@@ -76,13 +78,23 @@ decidableRow selected state view uid =
                 ShownProven ->
                     case List.find (\row -> row.uid == uid) page.refusals of
                         Just row ->
-                            Maybe.map (FileOffer uid) row.digest
+                            case row.record of
+                                Ok _ ->
+                                    Maybe.map (FileOffer uid) row.digest
+
+                                Err _ ->
+                                    Nothing
 
                         Nothing ->
                             case List.head (List.drop selected page.units) of
                                 Just q ->
                                     if q.unit.uid == uid then
-                                        Maybe.map (\shown -> UnitOffer uid (Index.shownDigest shown)) (decidableSource uid view)
+                                        case q.unit.record of
+                                            Ok _ ->
+                                                Maybe.map (\shown -> UnitOffer uid (Index.shownDigest shown)) (decidableSource uid view)
+
+                                            Err _ ->
+                                                Nothing
 
                                     else
                                         Nothing
@@ -177,8 +189,9 @@ offeredRefusal row =
 
 
 -- Why `uid` offers no decision on `target` on the queue page `state`: the
--- log records no decision, the unit's source is not shown, or the unit or
--- file is not one the page offers a decision on.
+-- log records no decision, the row's name cannot be recorded (named before
+-- any queue-state cause, as the row's own), the unit's source is not shown,
+-- or the unit or file is not one the page offers a decision on.
 undecidable : QueueState -> DecisionTarget -> Uid -> SaveFailure
 undecidable state target uid =
     case state of
@@ -187,21 +200,32 @@ undecidable state target uid =
                 ShownProven ->
                     case target of
                         OnUnit ->
-                            if List.any (\q -> q.unit.uid == uid) page.units then
-                                Failure.SaveRefused Failure.SourceNotShown
+                            case List.find (\q -> q.unit.uid == uid) page.units of
+                                Just q ->
+                                    case q.unit.record of
+                                        Err refusal ->
+                                            Failure.SaveRefused refusal
 
-                            else
-                                Failure.SaveRefused Failure.NotQueued
+                                        Ok _ ->
+                                            Failure.SaveRefused Failure.SourceNotShown
+
+                                Nothing ->
+                                    Failure.SaveRefused Failure.NotQueued
 
                         OnRefusal ->
                             case List.find (\row -> row.uid == uid) page.refusals of
                                 Just row ->
-                                    case row.digest of
-                                        Just _ ->
-                                            Failure.SaveRefused Failure.FileNotQueued
+                                    case row.record of
+                                        Err refusal ->
+                                            Failure.SaveRefused refusal
 
-                                        Nothing ->
-                                            Failure.SaveRefused Failure.FileNotAcknowledgeable
+                                        Ok _ ->
+                                            case row.digest of
+                                                Just _ ->
+                                                    Failure.SaveRefused Failure.FileNotQueued
+
+                                                Nothing ->
+                                                    Failure.SaveRefused Failure.FileNotAcknowledgeable
 
                                 Nothing ->
                                     Failure.SaveRefused Failure.FileNotQueued

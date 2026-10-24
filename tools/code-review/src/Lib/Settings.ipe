@@ -230,7 +230,7 @@ dbLocation var mode path =
 -- repeated, and every such problem has the one fix.
 dbRefusal : StartupVar -> String -> Error
 dbRefusal var problem =
-    EnvLookup.startupRefusal { var = var, file = Nothing, problem = problem, fix = "set it to the path of a SQLite database file" }
+    EnvLookup.startupRefusal { var = var, file = Nothing, given = Nothing, problem = problem, fix = "set it to the path of a SQLite database file" }
 
 
 -- The database a startup refusal is about, which names its variable and
@@ -426,7 +426,7 @@ logBreakFix break =
 
 useRefusal : DbRole -> Path -> ( String, String ) -> Error
 useRefusal role file ( problem, fix ) =
-    EnvLookup.startupRefusal { var = roleVar role, file = Just file, problem = problem, fix = fix }
+    EnvLookup.startupRefusal { var = roleVar role, file = Just file, given = Nothing, problem = problem, fix = fix }
 
 
 roleVar : DbRole -> StartupVar

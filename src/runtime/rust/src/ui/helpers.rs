@@ -51,7 +51,9 @@ pub fn ui_tagged_node_<M>(
     attrs: Vec<Attribute<M>>,
     children: Vec<Element<M>>,
 ) -> Element<M> {
-    if admit_element(&tag, &children).is_err() {
+    // Ui attributes are not yet `Html` ones: the frame rule runs on them in
+    // the `ui/render.rs` lowering every Ui tree passes before it is `Html`.
+    if admit_element::<_, M>(&tag, &[], &children).is_err() {
         return Element::Empty;
     }
     Element::TaggedNode(tag, desc, attrs, children)
@@ -671,7 +673,7 @@ pub fn html_node_<M>(
     attrs: Vec<crate::html::Attribute<M>>,
     children: Vec<Html<M>>,
 ) -> Html<M> {
-    if admit_element(&tag, &children).is_err() {
+    if admit_element(&tag, &attrs, &children).is_err() {
         return Html::HText(String::new());
     }
     Html::HElement(tag, attrs, children)

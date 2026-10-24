@@ -34,6 +34,7 @@ import Lib.Settings as Settings
 import Lib.Slot as Slot exposing (Settle(..), Stamp)
 import Lib.Standing as Standing exposing (StandingRead(..))
 import Lib.Uid as Uid exposing (Uid)
+import Lib.UnitName as UnitName
 import Lib.View as View
 import TestSupport exposing (Scratch, check, checkReporting, cleanupIndex, decideNow, envAppSettings, execIndex, fixtureLibRs, freshScratch, loadPageNow, loadUnitNow, migratedReviewAt, refusalOf, record, removeFileIfAny, repoFile, seedIndex, uid, labelOf, labelText, viewA, writeFileText)
 import TextSinkScanTests
@@ -2255,6 +2256,32 @@ decisionRefusedBeforeReading =
             )
 
 
+-- A click drawn on `u-a` before its qualified name grew past the ceiling,
+-- received on the page loaded after, is refused as `NamePastCeiling` by the
+-- gate before the slot: the page offers no decision on it, the click starts
+-- no task, and the slot holds that refusal. Red if `decidableRow` stops
+-- reading the row's `record`, so the click reaches the decide-time re-read.
+clickOnPastCeilingRefusedWithoutDb : Task.Task Error Bool
+clickOnPastCeilingRefusedWithoutDb =
+    do
+        at <- freshScratch "ipe-single-flight-name-ceiling"
+        seedIndex at.indexDb at.repo
+        reviewStoreAt at
+        settings <- envAppSettings
+        a <- loadUnitNow (uid "u-a") |> Task.andThen requireUnit
+        offer <- requireOffer (Session.decidableRow (queueModel [ a ] (ViewShown a)) a.unit.uid)
+        execIndex at.indexDb "UPDATE units SET qualified = ? WHERE uid = ?" [ SqlString (String.repeat 2049 "q"), Uid.toSql (uid "u-a") ]
+        long <- loadUnitNow (uid "u-a") |> Task.andThen requireUnit
+        cleanupIndex at.indexDb at.repo
+        removeFileIfAny at.reviewDb
+        Task.succeed
+            (Session.decidableRow (queueModel [ long ] (ViewShown long)) long.unit.uid == Nothing
+                && startsNothing settings [ ApproveRow offer ] (queueModel [ long ] (ViewShown long))
+                && DecisionSlot.notSavedOf (after settings [ ApproveRow offer ] (queueModel [ long ] (ViewShown long))).decision == Just (SaveRefused NamePastCeiling)
+                && refusedStartsNoTask settings (queueModel [ long ] (ViewShown long)) offer
+            )
+
+
 -- Whether the gate before the slot, `decidableAs`, refuses `offer` on
 -- `model`, or `decisionPlan` plans it: an offer the gate admits is never
 -- one its plan refuses, so the plan's refusal in `saveDecision` is reached
@@ -2371,6 +2398,7 @@ blockingRow =
     , reason = UnreadableEntry
     , size = Nothing
     , digest = Nothing
+    , record = Index.nameDecision (UnitName.recordFile "ipe:src/unreadable.txt")
     }
 
 
@@ -2872,6 +2900,7 @@ checks =
         (\seeded refused -> seeded ++ [ refused ])
         seededChecks
         (check "a decision off the shown list or source is refused before any read" decisionRefusedBeforeReading)
+        |> Task.andThen (\rows -> check "a click on a unit whose name is past the ceiling is refused with that refusal and starts no task" clickOnPastCeilingRefusedWithoutDb |> Task.map (\refusedName -> rows ++ [ refusedName ]))
         |> Task.andThen (\rows -> check "Enter in an unreviewable file's refusal panel submits that file's refusal" enterRefusesOpenFile |> Task.map (\entered -> rows ++ [ entered ]))
         |> Task.andThen (\rows -> check "the session starts no task, and only the interpreter's run and update do" sessionStartsNothing |> Task.map (\scanned -> rows ++ [ scanned ]))
         |> Task.andThen (\rows -> check "every completion stamp in src is minted at its slot's one start" everyStampMintedAtItsStart |> Task.map (\scanned -> rows ++ [ scanned ]))

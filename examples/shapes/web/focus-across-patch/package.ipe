@@ -7,4 +7,8 @@ package : Package
 package =
     { name = "focus-across-patch"
     , version = "0.1.0"
+    , capabilities =
+        { declares = []
+        , accepts = [ Unsafe ]
+        }
     }

@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::collections::HashMap;
 
 use super::css_safety;
@@ -379,10 +380,12 @@ fn render_into_ctx<M>(
             // SECURITY: the shared tag gate, re-checked at the sink. A refused
             // element (an unsafe tag name, an unclosable `<plaintext>`, or a
             // `<script>`/`<style>` whose body is not trusted raw markup, or a
-            // `<script>` outside an HTML data-state context) is dropped with
+            // `<script>` outside an HTML data-state context, or an `embed`,
+            // `object` or `frame` naming a document to load) is dropped with
             // its whole subtree, so no value built on the safe surface reaches
-            // a raw-text or executable element body.
-            let Ok(rendered) = admit_rendered_in(ctx, tag, kids) else {
+            // a raw-text or executable element body or loads a document that
+            // could share the app's origin.
+            let Ok(rendered) = admit_rendered_in(ctx, tag, attrs, kids) else {
                 return;
             };
             let body = match rendered {
@@ -398,71 +401,21 @@ fn render_into_ctx<M>(
             };
             s.push('<');
             s.push_str(tag);
-            // Collect regular + bool attrs into (key, value) pairs, then sort
-            // by key — alphabetical order matches the byte-exact output expected
-            // by golden tests. A BoolAttr renders as `k="true"` (the string
-            // "true"), NOT a bare `k`.
-            let mut pairs: Vec<(&str, String)> = vec![];
-            let mut events: Vec<&str> = vec![];
-            let mut ipe_id: Option<&str> = None;
-            // Multi-valued attribute merge: `class` is HTML's space-separated
-            // and `style` HTML's semicolon-separated multi-valued attribute: an
-            // element carrying BOTH a Ipe.Ui-computed inline `style` (from
-            // padding/background/border attrs) AND a user
-            // `Ui.htmlAttribute "style" "z-index: 5"` must emit ONE merged
-            // `style="…computed…; z-index: 5"`, not two `style="…"`
-            // attributes (the browser keeps only the first → the user's
-            // declarations are silently dropped). The Rust attribute list
-            // never went through  map accumulation, so we fold the merge
-            // here at collection time. First-seen value keeps its position
-            // (Ipe.Ui composes the computed style first); later values append
-            // so a user style declared last can override. Every other key is
-            // last-wins (two `href`/`value` ⇒ override, matching  map set).
-            for a in attrs {
-                match a {
-                    Attribute::Attr(k, v) => {
-                        let k = k.as_str();
-                        if k == STAMPED_ID_ATTR {
-                            ipe_id = Some(v);
-                        }
-                        match pairs.iter_mut().find(|(pk, _)| *pk == k) {
-                            Some((_, existing)) if !existing.is_empty() && k == "class" => {
-                                existing.push(' ');
-                                existing.push_str(v);
-                            }
-                            Some((_, existing)) if !existing.is_empty() && k == "style" => {
-                                // `; ` separator unless `existing` already ends
-                                // with `;` (then a single space) — avoids `;;`.
-                                if existing.ends_with(';') {
-                                    existing.push(' ');
-                                } else {
-                                    existing.push_str("; ");
-                                }
-                                existing.push_str(v);
-                            }
-                            Some((_, existing)) => {
-                                // Last-wins for every other key (and for an
-                                // empty existing style/class — nothing to join).
-                                existing.clear();
-                                existing.push_str(v);
-                            }
-                            None => pairs.push((k, v.clone())),
-                        }
-                    }
-                    Attribute::BoolAttr(k, true) => {
-                        let k = k.as_str();
-                        match pairs.iter_mut().find(|(pk, _)| *pk == k) {
-                            Some((_, existing)) => {
-                                existing.clear();
-                                existing.push_str("true");
-                            }
-                            None => pairs.push((k, "true".to_string())),
-                        }
-                    }
-                    Attribute::BoolAttr(_, false) | Attribute::NoAttr => {}
-                    Attribute::EventAttr(e) => events.push(e.name()),
-                }
-            }
+            // Regular + bool attrs as (key, value) pairs, sorted by key below:
+            // alphabetical order matches the byte-exact output expected by
+            // golden tests.
+            let mut pairs = attribute_pairs(tag, attrs);
+            let ipe_id = attrs.iter().rev().find_map(|a| match a {
+                Attribute::Attr(k, v) if k == STAMPED_ID_ATTR => Some(v.as_str()),
+                _ => None,
+            });
+            let mut events: Vec<&str> = attrs
+                .iter()
+                .filter_map(|a| match a {
+                    Attribute::EventAttr(e) => Some(e.name()),
+                    _ => None,
+                })
+                .collect();
             // <textarea> and <select> have NO `value` attribute in the HTML spec
             // — a textarea's displayed value is its TEXT CONTENT; a select's is the
             // `selected` <option>. Emitting `<textarea value="…">` renders EMPTY in
@@ -475,7 +428,7 @@ fn render_into_ctx<M>(
                 && let Some(pos) = pairs.iter().position(|(k, _)| *k == "value")
             {
                 let (_, v) = pairs.remove(pos);
-                textarea_value = Some(v);
+                textarea_value = Some(v.into_owned());
             }
             // <option selected> flip: when rendered as a direct child of a
             // <select> with a value, set `selected` on the value-matching option
@@ -488,7 +441,7 @@ fn render_into_ctx<M>(
             {
                 pairs.retain(|(k, _)| *k != "selected");
                 if pairs.iter().any(|(k, v)| *k == "value" && v == sv) {
-                    pairs.push(("selected", "selected".to_string()));
+                    pairs.push(("selected", Cow::Borrowed("selected")));
                 }
             }
             pairs.sort_by(|a, b| a.0.cmp(b.0));
@@ -670,6 +623,139 @@ pub(crate) enum ElementRefusal {
     /// ancestor: its body would be read as text that can end that ancestor,
     /// or as live markup, instead of as script data.
     ScriptOutsideData,
+    /// An `embed`, `object` or `frame` that names a document to load. The
+    /// browser gives these elements no sandbox and the runtime holds no proof
+    /// that the document's origin differs from the app's, so the loaded
+    /// document could act as the app. Use `Html.iframe`, which the runtime
+    /// always sandboxes.
+    UnsandboxableFrame,
+}
+
+/// The `sandbox` tokens an `iframe` may hold, in the order the runtime paints
+/// them.
+///
+/// `allow-same-origin` and `allow-popups-to-escape-sandbox` are not in the
+/// table, so no [`SandboxTokens`] can hold them: either gives the framed
+/// document, or a popup it opens, the real origin of its URL, which may be the
+/// app's own. The browser client mirrors this table in `__IPE_SANDBOX_TOKENS`.
+pub(crate) const SANDBOX_TOKENS: [&str; 12] = [
+    "allow-downloads",
+    "allow-forms",
+    "allow-modals",
+    "allow-orientation-lock",
+    "allow-pointer-lock",
+    "allow-popups",
+    "allow-presentation",
+    "allow-scripts",
+    "allow-storage-access-by-user-activation",
+    "allow-top-navigation",
+    "allow-top-navigation-by-user-activation",
+    "allow-top-navigation-to-custom-protocols",
+];
+
+/// The frame-loading elements the browser gives no sandbox, each with the
+/// attribute it loads a document from. The browser client mirrors this table
+/// in `__IPE_FRAME_LOADERS`.
+pub(crate) const FRAME_LOADERS: [(&str, &str); 3] =
+    [("embed", "src"), ("object", "data"), ("frame", "src")];
+
+/// The attribute that sandboxes an `iframe`.
+pub(crate) const SANDBOX_ATTR: &str = "sandbox";
+
+/// The sandboxed frame element.
+pub(crate) const IFRAME_TAG: &str = "iframe";
+
+/// A `sandbox` value that can never grant the app's origin back: a set over
+/// [`SANDBOX_TOKENS`], painted lowercase, once each, in table order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct SandboxTokens([bool; SANDBOX_TOKENS.len()]);
+
+impl SandboxTokens {
+    /// The known tokens of `value`, split on ASCII whitespace as the browser
+    /// splits them and matched without regard to ASCII case; every other
+    /// token, a forbidden one included, is dropped.
+    pub(crate) fn parse(value: &str) -> Self {
+        let mut held = [false; SANDBOX_TOKENS.len()];
+        for token in value.split_ascii_whitespace() {
+            for (slot, known) in held.iter_mut().zip(SANDBOX_TOKENS) {
+                if known.eq_ignore_ascii_case(token) {
+                    *slot = true;
+                }
+            }
+        }
+        Self(held)
+    }
+
+    /// The canonical `sandbox` value: the held tokens, space-separated.
+    pub(crate) fn canonical(self) -> String {
+        let mut out = String::new();
+        for (_, token) in self.0.iter().zip(SANDBOX_TOKENS).filter(|(held, _)| **held) {
+            if !out.is_empty() {
+                out.push(' ');
+            }
+            out.push_str(token);
+        }
+        out
+    }
+}
+
+/// What the frame rule makes of an element before it renders.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum FrameVerdict {
+    /// Not a frame-loading element: render as is.
+    NotAFrame,
+    /// An `iframe`: render with this one canonical `sandbox` value, and drop
+    /// every `sandbox` pair the app wrote.
+    Sandboxed(SandboxTokens),
+    /// A frame-loading element carrying its loading attribute.
+    Refused(ElementRefusal),
+}
+
+/// The attribute a [`FRAME_LOADERS`] element `tag` loads its document from;
+/// `None` for every other tag. Tags match without regard to ASCII case.
+pub(crate) fn frame_loader_key(tag: &str) -> Option<&'static str> {
+    FRAME_LOADERS
+        .iter()
+        .find(|(loader, _)| tag.eq_ignore_ascii_case(loader))
+        .map(|(_, key)| *key)
+}
+
+/// The frame rule for an element `tag` whose attributes, in order, are the
+/// pairs `attrs`.
+///
+/// No document such an element loads can share the app's origin: an `iframe`
+/// always renders one sandbox, the last `sandbox` of any ASCII case read (an
+/// absent, empty or unknown value gives the empty sandbox), and a
+/// [`FRAME_LOADERS`] element that carries its loading attribute at all, in any
+/// key case and with any value, is refused, as `" "` resolves to the page
+/// itself. Tags and keys match without regard to ASCII case only.
+pub(crate) fn frame_verdict<'a>(
+    tag: &str,
+    mut attrs: impl Iterator<Item = (&'a str, &'a str)>,
+) -> FrameVerdict {
+    if tag.eq_ignore_ascii_case(IFRAME_TAG) {
+        let value = attrs
+            .filter(|(k, _)| k.eq_ignore_ascii_case(SANDBOX_ATTR))
+            .last()
+            .map_or("", |(_, v)| v);
+        return FrameVerdict::Sandboxed(SandboxTokens::parse(value));
+    }
+    match frame_loader_key(tag) {
+        Some(key) if attrs.any(|(k, _)| k.eq_ignore_ascii_case(key)) => {
+            FrameVerdict::Refused(ElementRefusal::UnsandboxableFrame)
+        }
+        Some(_) | None => FrameVerdict::NotAFrame,
+    }
+}
+
+/// The `(key, value)` pairs `attrs` paints, in order: a `BoolAttr` that holds
+/// is the value `"true"`; a false one, an event and `NoAttr` carry none.
+fn painted_pairs<M>(attrs: &[Attribute<M>]) -> impl Iterator<Item = (&str, &str)> {
+    attrs.iter().filter_map(|a| match a {
+        Attribute::Attr(k, v) => Some((k.as_str(), v.as_str())),
+        Attribute::BoolAttr(k, true) => Some((k.as_str(), "true")),
+        Attribute::BoolAttr(_, false) | Attribute::EventAttr(_) | Attribute::NoAttr => None,
+    })
 }
 
 /// Elements whose children the HTML tokenizer reads as RCDATA or RAWTEXT.
@@ -744,7 +830,8 @@ impl ParseContext {
     }
 }
 
-/// Decide whether an element `tag` with children `kids` may be rendered.
+/// Decide whether an element `tag` with attributes `attrs` and children `kids`
+/// may be rendered.
 ///
 /// This is the one tag gate of the safe surface: every element constructor
 /// (`Html.node`, `Ui.taggedNode`, both template materialisers, `Ipe.Ui`'s
@@ -756,13 +843,18 @@ impl ParseContext {
 /// elements (`title`, `textarea`, `noscript`, `iframe`, `xmp`, `noembed`,
 /// `noframes`) are admitted as markup: their text children are entity-escaped
 /// and any trusted `<style>` inside them is markup-neutralised, so no child can
-/// end them early.
-pub(crate) fn admit_element<K: TrustedRawChild>(
+/// end them early. A frame-loading element runs [`frame_verdict`]: an
+/// `embed`, `object` or `frame` carrying its loading attribute is refused.
+pub(crate) fn admit_element<K: TrustedRawChild, M>(
     tag: &str,
+    attrs: &[Attribute<M>],
     kids: &[K],
 ) -> Result<ElementBody, ElementRefusal> {
     if !is_safe_html_name(tag) {
         return Err(ElementRefusal::UnsafeName);
+    }
+    if let FrameVerdict::Refused(refusal) = frame_verdict(tag, painted_pairs(attrs)) {
+        return Err(refusal);
     }
     if tag.eq_ignore_ascii_case("plaintext") {
         return Err(ElementRefusal::Unclosable);
@@ -785,19 +877,20 @@ pub(crate) fn admit_element<K: TrustedRawChild>(
     Ok(ElementBody::Markup)
 }
 
-/// Decide whether an element `tag` with children `kids`, written in `ctx`, may
-/// be rendered.
+/// Decide whether an element `tag` with attributes `attrs` and children
+/// `kids`, written in `ctx`, may be rendered.
 ///
 /// It runs `admit_element`, then refuses a `<script>` whose start tag would not
 /// put the tokenizer in script-data state. `<style>` is admitted in every
 /// context, as `neutralise_style_body` removes every markup opener from its
 /// body.
-pub(crate) fn admit_in_context<K: TrustedRawChild>(
+pub(crate) fn admit_in_context<K: TrustedRawChild, M>(
     ctx: ParseContext,
     tag: &str,
+    attrs: &[Attribute<M>],
     kids: &[K],
 ) -> Result<ElementBody, ElementRefusal> {
-    let body = admit_element(tag, kids)?;
+    let body = admit_element(tag, attrs, kids)?;
     match body {
         ElementBody::Script if !ctx.admits_script() => Err(ElementRefusal::ScriptOutsideData),
         ElementBody::Script | ElementBody::Markup | ElementBody::Style => Ok(body),
@@ -830,24 +923,26 @@ impl RenderedElement {
     }
 }
 
-/// Decide how an `Html` element node `tag` with children `kids`, written in
-/// `ctx`, is rendered.
+/// Decide how an `Html` element node `tag` with attributes `attrs` and
+/// children `kids`, written in `ctx`, is rendered.
 ///
 /// This is the one admission rule of every rendered-tree walker (the render
 /// sink and the SSE diff), so the two cannot disagree on which nodes are on
 /// the page: the `Html.doctype` wrapper is recognised by its exact pseudo-tag,
 /// before the name gate its `!` fails, and every other tag runs
-/// `admit_in_context`. The context is a required argument, so no walker can
-/// judge a raw body without its ancestors.
+/// `admit_in_context`. The context and the attributes are required
+/// arguments, so no walker can judge a raw body without its ancestors, nor a
+/// frame without its loading attribute.
 pub(crate) fn admit_rendered_in<M>(
     ctx: ParseContext,
     tag: &str,
+    attrs: &[Attribute<M>],
     kids: &[Html<M>],
 ) -> Result<RenderedElement, ElementRefusal> {
     if tag == DOCTYPE_WRAPPER_TAG {
         return Ok(RenderedElement::Doctype);
     }
-    admit_in_context(ctx, tag, kids).map(RenderedElement::Element)
+    admit_in_context(ctx, tag, attrs, kids).map(RenderedElement::Element)
 }
 
 /// Attribute NAMES that execute script (or embed a scripting context) regardless
@@ -870,7 +965,77 @@ fn is_dangerous_attr_name(name: &str) -> bool {
 const RESERVED_ATTR_PREFIX: &[u8] = b"ipe-";
 
 /// The attribute carrying the identity the ipe-id stamper assigns.
-const STAMPED_ID_ATTR: &str = "ipe-id";
+pub(crate) const STAMPED_ID_ATTR: &str = "ipe-id";
+
+/// The attribute pairs an element `tag` with attributes `attrs` carries, in
+/// first-appearance order: what the renderer writes at first paint and what
+/// the patch diff compares, so the two never disagree on a value.
+///
+/// An `iframe` carries exactly one `sandbox`, last: the canonical value of
+/// [`frame_verdict`], in place of every ASCII case variant of `sandbox` the
+/// app wrote. Its old and new sides therefore always both hold `sandbox`, so
+/// no diff removes it.
+///
+/// A `BoolAttr` that holds is the value `"true"`; a false one, an event and
+/// `NoAttr` carry no pair. `class` (space-separated) and `style`
+/// (semicolon-separated) are HTML's multi-valued attributes: a later regular
+/// value of either joins the one already held, so a computed `style` and a
+/// user `Ui.htmlAttribute "style" "z-index: 5"` become one `style`, not two
+/// attributes of which the browser keeps only the first. Every other repeated
+/// key, an empty held value, or a `BoolAttr` takes the later value.
+pub(crate) fn attribute_pairs<'a, M>(
+    tag: &str,
+    attrs: &'a [Attribute<M>],
+) -> Vec<(&'a str, Cow<'a, str>)> {
+    /// Pair count past which a key lookup goes through a hash index rather
+    /// than a scan, so a long attribute list costs linear time.
+    const SCANNED_PAIRS: usize = 16;
+    let mut pairs: Vec<(&str, Cow<'_, str>)> = Vec::with_capacity(attrs.len());
+    let mut index: HashMap<&str, usize> = HashMap::new();
+    for a in attrs {
+        let (k, v, joins) = match a {
+            Attribute::Attr(k, v) => (k.as_str(), v.as_str(), true),
+            Attribute::BoolAttr(k, true) => (k.as_str(), "true", false),
+            Attribute::BoolAttr(_, false) | Attribute::EventAttr(_) | Attribute::NoAttr => {
+                continue;
+            }
+        };
+        let held = if pairs.len() <= SCANNED_PAIRS {
+            pairs.iter().position(|(pk, _)| *pk == k)
+        } else {
+            if index.is_empty() {
+                index.extend(pairs.iter().enumerate().map(|(i, (pk, _))| (*pk, i)));
+            }
+            index.get(k).copied()
+        };
+        let Some((_, existing)) = held.and_then(|i| pairs.get_mut(i)) else {
+            if !index.is_empty() {
+                index.insert(k, pairs.len());
+            }
+            pairs.push((k, Cow::Borrowed(v)));
+            continue;
+        };
+        let sep = match k {
+            "class" => Some(" "),
+            "style" if existing.ends_with(';') => Some(" "),
+            "style" => Some("; "),
+            _ => None,
+        };
+        match sep.filter(|_| joins && !existing.is_empty()) {
+            Some(sep) => {
+                let joined = existing.to_mut();
+                joined.push_str(sep);
+                joined.push_str(v);
+            }
+            None => *existing = Cow::Borrowed(v),
+        }
+    }
+    if let FrameVerdict::Sandboxed(tokens) = frame_verdict(tag, painted_pairs(attrs)) {
+        pairs.retain(|(k, _)| !k.eq_ignore_ascii_case(SANDBOX_ATTR));
+        pairs.push((SANDBOX_ATTR, Cow::Owned(tokens.canonical())));
+    }
+    pairs
+}
 
 /// The attribute `Html.keyed` sets; the stamper reads it as the key segment.
 const KEY_ATTR: &str = "ipe-key";
@@ -1730,6 +1895,237 @@ mod tests {
     #[derive(Clone, Debug, PartialEq)]
     enum Msg {
         Inc,
+    }
+
+    /// An element with no attributes.
+    const NO_ATTRS: &[Attribute<()>] = &[];
+
+    /// An element `tag` with attributes `attrs` and no children.
+    fn bare(tag: &str, attrs: Vec<Attribute<()>>) -> Html<()> {
+        Html::HElement(tag.into(), attrs, vec![])
+    }
+
+    fn attr(k: &str, v: &str) -> Attribute<()> {
+        Attribute::Attr(k.into(), v.into())
+    }
+
+    /// The `sandbox` attributes `out` paints, in any ASCII case.
+    fn sandboxes(out: &str) -> usize {
+        out.to_ascii_lowercase().matches(" sandbox=").count()
+    }
+
+    /// An `iframe` the app gave no `sandbox` paints the empty one, whatever
+    /// the tag's case.
+    #[test]
+    fn an_iframe_without_sandbox_renders_an_empty_sandbox() {
+        let built =
+            crate::ui::helpers::html_node_::<()>("iframe".into(), vec![attr("src", "/")], vec![]);
+        let out = render_html(&built);
+        assert_eq!(out, "<iframe sandbox=\"\" src=\"/\"></iframe>");
+        let out = render_html(&bare("IFRAME", vec![attr("src", "/")]));
+        assert_eq!(sandboxes(&out), 1, "{out}");
+        assert!(out.contains(" sandbox=\"\""), "{out}");
+    }
+
+    /// Every case variant of `sandbox` folds into one, the last one read.
+    #[test]
+    fn every_case_of_sandbox_folds_into_one_canonical_value() {
+        let out = render_html(&bare(
+            "iframe",
+            vec![
+                attr("sandbox", "allow-forms"),
+                attr("SANDBOX", "allow-modals"),
+                attr("SandBox", "ALLOW-SCRIPTS allow-popups allow-scripts"),
+            ],
+        ));
+        assert_eq!(sandboxes(&out), 1, "{out}");
+        assert!(
+            out.contains(" sandbox=\"allow-popups allow-scripts\""),
+            "{out}"
+        );
+    }
+
+    /// Neither token that gives the framed document or its popups the app's
+    /// origin back reaches the page, in any case; a token that is only ASCII
+    /// case-equal through a non-ASCII byte, or carries a NUL, is unknown.
+    #[test]
+    fn allow_same_origin_never_reaches_the_page() {
+        let out = render_html(&bare(
+            "iframe",
+            vec![attr(
+                "sandbox",
+                "allow-scripts ALLOW-SAME-ORIGIN allow-same-origin allow-popups-to-escape-sandbox",
+            )],
+        ));
+        assert_eq!(out, "<iframe sandbox=\"allow-scripts\"></iframe>");
+        let out = render_html(&bare(
+            "iframe",
+            vec![attr(
+                "sandbox",
+                "allow-pointer-loc\u{212A} allow-forms\u{0} allow-modals",
+            )],
+        ));
+        assert_eq!(out, "<iframe sandbox=\"allow-modals\"></iframe>");
+    }
+
+    /// An unknown token is dropped, and a held boolean `sandbox` (painted
+    /// `"true"`, no token) is the empty sandbox.
+    #[test]
+    fn unknown_sandbox_tokens_are_dropped() {
+        let out = render_html(&bare(
+            "iframe",
+            vec![attr("sandbox", "allow-everything allow-forms bogus")],
+        ));
+        assert_eq!(out, "<iframe sandbox=\"allow-forms\"></iframe>");
+        let out = render_html(&bare(
+            "iframe",
+            vec![Attribute::BoolAttr("sandbox".into(), true)],
+        ));
+        assert_eq!(out, "<iframe sandbox=\"\"></iframe>");
+    }
+
+    /// An `embed`, `object` or `frame` carrying its loading attribute, in any
+    /// key case and with any value, renders nothing, in HTML and in foreign
+    /// content alike; without that attribute it still renders.
+    #[test]
+    fn a_frame_loader_with_its_url_renders_nothing() {
+        let loaders = [
+            ("embed", "src"),
+            ("EMBED", "SRC"),
+            ("object", "data"),
+            ("Object", "Data"),
+            ("frame", "src"),
+            ("frame", "SRC"),
+        ];
+        for (tag, key) in loaders {
+            for value in ["", " ", "/", "https://x"] {
+                let loader = || bare(tag, vec![attr("title", "t"), attr(key, value)]);
+                let shown = |outer: Html<()>| {
+                    let out = render_html(&outer);
+                    assert!(
+                        !out.to_ascii_lowercase()
+                            .contains(&format!("<{}", tag.to_ascii_lowercase())),
+                        "<{tag} {key}={value:?}> rendered: {out}"
+                    );
+                };
+                shown(Html::HElement("div".into(), vec![], vec![loader()]));
+                shown(Html::HElement("svg".into(), vec![], vec![loader()]));
+                shown(Html::HElement(
+                    "svg".into(),
+                    vec![],
+                    vec![Html::HElement(
+                        "foreignObject".into(),
+                        vec![],
+                        vec![loader()],
+                    )],
+                ));
+            }
+            assert_eq!(
+                admit_element(tag, &[attr(key, "/")], &[] as &[Html<()>]),
+                Err(ElementRefusal::UnsandboxableFrame)
+            );
+        }
+        let held = bare("embed", vec![Attribute::BoolAttr("src".into(), true)]);
+        assert!(!render_html(&held).contains("<embed"));
+        let out = render_html(&bare("embed", vec![attr("type", "x")]));
+        assert!(out.starts_with("<embed"), "{out}");
+        let out = render_html(&bare("object", vec![attr("src", "/")]));
+        assert!(out.starts_with("<object"), "{out}");
+    }
+
+    /// `Html.node` builds a frame loader with its URL as empty text.
+    #[test]
+    fn html_node_refuses_a_frame_loader() {
+        for (tag, key) in FRAME_LOADERS {
+            let node =
+                crate::ui::helpers::html_node_::<()>(tag.into(), vec![attr(key, "/")], vec![]);
+            assert!(
+                matches!(&node, Html::HText(t) if t.is_empty()),
+                "<{tag} {key}>: {node:?}"
+            );
+        }
+        let kept = crate::ui::helpers::html_node_::<()>("embed".into(), vec![], vec![]);
+        assert!(matches!(kept, Html::HElement(..)));
+    }
+
+    /// The browser client's literal copy of the frame tables equals the
+    /// runtime's, and the rule covers exactly the four document-loading tags.
+    #[test]
+    fn client_js_frame_table_matches_the_runtime() {
+        const CLIENT_JS: &str = include_str!("web/client.js");
+        let tokens: Vec<String> = SANDBOX_TOKENS.iter().map(|t| format!("\"{t}\"")).collect();
+        let tokens = format!("var __IPE_SANDBOX_TOKENS = [{}];", tokens.join(", "));
+        let loaders: Vec<String> = FRAME_LOADERS
+            .iter()
+            .map(|(t, k)| format!("[\"{t}\", \"{k}\"]"))
+            .collect();
+        let loaders = format!("var __IPE_FRAME_LOADERS = [{}];", loaders.join(", "));
+        for (decl, name) in [
+            (tokens, "__IPE_SANDBOX_TOKENS ="),
+            (loaders, "__IPE_FRAME_LOADERS ="),
+        ] {
+            assert_eq!(CLIENT_JS.matches(name).count(), 1, "one {name}");
+            assert_eq!(CLIENT_JS.matches(decl.as_str()).count(), 1, "{decl}");
+        }
+        let mut tags: Vec<&str> = FRAME_LOADERS.iter().map(|(t, _)| *t).collect();
+        tags.push(IFRAME_TAG);
+        tags.sort_unstable();
+        assert_eq!(tags, ["embed", "frame", "iframe", "object"]);
+        for forbidden in ["allow-same-origin", "allow-popups-to-escape-sandbox"] {
+            assert!(!SANDBOX_TOKENS.contains(&forbidden), "{forbidden}");
+            assert_eq!(SandboxTokens::parse(forbidden).canonical(), "");
+        }
+    }
+
+    /// A long attribute list merges and overrides exactly as a short one: the
+    /// hash index past the scan threshold agrees with a plain scan.
+    #[test]
+    fn attribute_pairs_agree_past_the_scan_threshold() {
+        fn scanned(attrs: &[Attribute<()>]) -> Vec<(&str, String)> {
+            let mut pairs: Vec<(&str, String)> = vec![];
+            for a in attrs {
+                let (k, v, joins) = match a {
+                    Attribute::Attr(k, v) => (k.as_str(), v.as_str(), true),
+                    Attribute::BoolAttr(k, true) => (k.as_str(), "true", false),
+                    _ => continue,
+                };
+                match pairs.iter_mut().find(|(pk, _)| *pk == k) {
+                    Some((_, e)) if joins && !e.is_empty() && k == "class" => {
+                        e.push(' ');
+                        e.push_str(v);
+                    }
+                    Some((_, e)) if joins && !e.is_empty() && k == "style" => {
+                        e.push_str(if e.ends_with(';') { " " } else { "; " });
+                        e.push_str(v);
+                    }
+                    Some((_, e)) => *e = v.to_owned(),
+                    None => pairs.push((k, v.to_owned())),
+                }
+            }
+            pairs
+        }
+        let mut attrs: Vec<Attribute<()>> = vec![
+            Attribute::Attr("class".into(), "a".into()),
+            Attribute::Attr("style".into(), "p: 1;".into()),
+        ];
+        attrs.extend((0..40).map(|i| Attribute::Attr(format!("data-{i}"), i.to_string())));
+        attrs.extend([
+            Attribute::Attr("class".into(), "b".into()),
+            Attribute::Attr("style".into(), "q: 2".into()),
+            Attribute::Attr("data-3".into(), "over".into()),
+            Attribute::BoolAttr("class".into(), true),
+            Attribute::Attr("class".into(), "c".into()),
+            Attribute::Attr("data-late".into(), String::new()),
+            Attribute::Attr("data-late".into(), "set".into()),
+        ]);
+        for len in 0..=attrs.len() {
+            let slice = attrs.get(..len).unwrap_or_default();
+            let got: Vec<(&str, String)> = attribute_pairs("div", slice)
+                .into_iter()
+                .map(|(k, v)| (k, v.into_owned()))
+                .collect();
+            assert_eq!(got, scanned(slice), "{len}");
+        }
     }
 
     // A tree far deeper than any recursion could walk is measured on the heap,
@@ -2967,39 +3363,54 @@ mod tests {
         let raw = || vec![Html::<()>::HRaw("r".into())];
         let none: Vec<Html<()>> = Vec::new();
         assert_eq!(
-            admit_element("script", &text()),
+            admit_element("script", NO_ATTRS, &text()),
             Err(ElementRefusal::UntrustedScript)
         );
         assert_eq!(
-            admit_element("ScRiPt", &text()),
+            admit_element("ScRiPt", NO_ATTRS, &text()),
             Err(ElementRefusal::UntrustedScript)
         );
         assert_eq!(
-            admit_element("script", &none),
+            admit_element("script", NO_ATTRS, &none),
             Err(ElementRefusal::UntrustedScript)
         );
         assert_eq!(
-            admit_element("style", &text()),
+            admit_element("style", NO_ATTRS, &text()),
             Err(ElementRefusal::UntrustedStyle)
         );
         assert_eq!(
-            admit_element("STYLE", &text()),
+            admit_element("STYLE", NO_ATTRS, &text()),
             Err(ElementRefusal::UntrustedStyle)
         );
         assert_eq!(
-            admit_element("plaintext", &none),
+            admit_element("plaintext", NO_ATTRS, &none),
             Err(ElementRefusal::Unclosable)
         );
-        assert_eq!(admit_element("x y", &none), Err(ElementRefusal::UnsafeName));
-        assert_eq!(admit_element("script", &raw()), Ok(ElementBody::Script));
-        assert_eq!(admit_element("SCRIPT", &raw()), Ok(ElementBody::Script));
-        assert_eq!(admit_element("style", &raw()), Ok(ElementBody::Style));
-        assert_eq!(admit_element("style", &none), Ok(ElementBody::Style));
+        assert_eq!(
+            admit_element("x y", NO_ATTRS, &none),
+            Err(ElementRefusal::UnsafeName)
+        );
+        assert_eq!(
+            admit_element("script", NO_ATTRS, &raw()),
+            Ok(ElementBody::Script)
+        );
+        assert_eq!(
+            admit_element("SCRIPT", NO_ATTRS, &raw()),
+            Ok(ElementBody::Script)
+        );
+        assert_eq!(
+            admit_element("style", NO_ATTRS, &raw()),
+            Ok(ElementBody::Style)
+        );
+        assert_eq!(
+            admit_element("style", NO_ATTRS, &none),
+            Ok(ElementBody::Style)
+        );
         for tag in [
             "div", "p", "title", "textarea", "noscript", "iframe", "template", "svg",
         ] {
             assert_eq!(
-                admit_element(tag, &text()),
+                admit_element(tag, NO_ATTRS, &text()),
                 Ok(ElementBody::Markup),
                 "<{tag}>"
             );
@@ -3385,20 +3796,26 @@ mod tests {
     fn admit_in_context_refuses_a_script_outside_data_state() {
         let raw = vec![Html::<()>::HRaw("r".into())];
         assert_eq!(
-            admit_in_context(ParseContext::Data, "script", &raw),
+            admit_in_context(ParseContext::Data, "script", NO_ATTRS, &raw),
             Ok(ElementBody::Script)
         );
         for ctx in [ParseContext::RawOrRcdata, ParseContext::Foreign] {
             assert_eq!(
-                admit_in_context(ctx, "script", &raw),
+                admit_in_context(ctx, "script", NO_ATTRS, &raw),
                 Err(ElementRefusal::ScriptOutsideData)
             );
             assert_eq!(
-                admit_in_context(ctx, "SCRIPT", &raw),
+                admit_in_context(ctx, "SCRIPT", NO_ATTRS, &raw),
                 Err(ElementRefusal::ScriptOutsideData)
             );
-            assert_eq!(admit_in_context(ctx, "style", &raw), Ok(ElementBody::Style));
-            assert_eq!(admit_in_context(ctx, "div", &raw), Ok(ElementBody::Markup));
+            assert_eq!(
+                admit_in_context(ctx, "style", NO_ATTRS, &raw),
+                Ok(ElementBody::Style)
+            );
+            assert_eq!(
+                admit_in_context(ctx, "div", NO_ATTRS, &raw),
+                Ok(ElementBody::Markup)
+            );
         }
     }
 

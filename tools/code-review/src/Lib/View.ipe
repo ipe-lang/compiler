@@ -4,7 +4,7 @@ import Ipe.Html as Html
 import Ipe.Html.Attributes as Attr
 import Ipe.List as List
 import Ipe.Maybe as Maybe
-import Ipe.Result as Result exposing (Result)
+import Ipe.Result as Result exposing (Result(..))
 import Ipe.String as String
 import Ipe.Time.Timestamp as Timestamp exposing (Timestamp)
 import Ipe.Ui as Ui
@@ -29,6 +29,7 @@ import Lib.Selected as Selected
 import Lib.Session as Session exposing (Model, Msg(..), Page(..), queueList)
 import Lib.Standing as Standing exposing (Standing(..))
 import Lib.Uid exposing (Uid)
+import Lib.UnitName exposing (RecordedName)
 
 
 header : Model -> Ui.Element Msg
@@ -298,20 +299,33 @@ refusalCard controls offered shown row =
 
 
 -- Acknowledge and Refuse for a file a decision can bind on a page that
--- records decisions; otherwise why there is no control.
+-- records decisions; otherwise why there is no control: first the file's
+-- own name refusal, read from the row's `record` as the offer is.
 refusalControls : RefuseControls -> Maybe DecisionSlot.DecidableRow -> LogShown -> Index.RefusalRow -> Ui.Element Msg
 refusalControls controls offered shown row =
-    case row.digest of
-        Nothing ->
-            Ui.el [ Font.size 12, Font.color (Ui.rgb 220 170 90) ] (Ui.text "Cannot be acknowledged: fix it in the tree.")
+    case row.record of
+        Err refusal ->
+            nameRefusalNotice refusal
 
-        Just _ ->
-            case noDecisionReason shown of
-                Just why ->
-                    Ui.el [ Font.size 12, Font.color (Ui.rgb 220 170 90) ] (safeText (SafeText.literal why))
-
+        Ok _ ->
+            case row.digest of
                 Nothing ->
-                    decisionControls controls row.uid offered
+                    Ui.el [ Font.size 12, Font.color (Ui.rgb 220 170 90) ] (Ui.text "Cannot be acknowledged: fix it in the tree.")
+
+                Just _ ->
+                    case noDecisionReason shown of
+                        Just why ->
+                            Ui.el [ Font.size 12, Font.color (Ui.rgb 220 170 90) ] (safeText (SafeText.literal why))
+
+                        Nothing ->
+                            decisionControls controls row.uid offered
+
+
+-- Why a row whose name no decision can record has no decision control, in
+-- the refusal's own text, the one a click on it would be refused with.
+nameRefusalNotice : Failure.DecideRefusal -> Ui.Element Msg
+nameRefusalNotice refusal =
+    Ui.el [ Font.size 12, Font.color (Ui.rgb 220 170 90) ] (safeText (SafeText.literal (Failure.saveFailureText (Failure.SaveRefused refusal))))
 
 
 nextPageButton : Maybe Index.Cursor -> Ui.Element Msg
@@ -852,7 +866,7 @@ unitCard controls offered queueState selectedView label q =
             , Ui.el [ Ui.width Ui.fill ] Ui.none
             , case loaded of
                 Just v ->
-                    decisionButtons controls offered queueState v
+                    decisionButtons controls offered queueState unit.record v
 
                 Nothing ->
                     Ui.none
@@ -1110,10 +1124,22 @@ chipAround bg content =
         content
 
 
--- Approve and Refuse exist only for a verified view on a server that signs
--- decisions; any other view shows why it cannot be decided instead.
-decisionButtons : RefuseControls -> Maybe DecisionSlot.DecidableRow -> Queue.QueueState -> Index.UnitView -> Ui.Element Msg
-decisionButtons controls offered queueState loaded =
+-- Approve and Refuse exist only for a verified view of a unit whose name a
+-- decision can record (`record`, the queued unit's, which the offer reads
+-- too), on a server that signs decisions; any other view shows why it
+-- cannot be decided instead.
+decisionButtons : RefuseControls -> Maybe DecisionSlot.DecidableRow -> Queue.QueueState -> Result Failure.DecideRefusal RecordedName -> Index.UnitView -> Ui.Element Msg
+decisionButtons controls offered queueState record loaded =
+    case record of
+        Err refusal ->
+            nameRefusalNotice refusal
+
+        Ok _ ->
+            verifiedViewButtons controls offered queueState loaded
+
+
+verifiedViewButtons : RefuseControls -> Maybe DecisionSlot.DecidableRow -> Queue.QueueState -> Index.UnitView -> Ui.Element Msg
+verifiedViewButtons controls offered queueState loaded =
     case Queue.sourceStatusText loaded.view of
         Just why ->
             Ui.el [ Font.size 12, Font.color (Ui.rgb 220 170 90) ] (shownLabel why)

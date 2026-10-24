@@ -23,6 +23,7 @@ import Ipe.Task as Task
 import Ipe.Time.Timestamp as Timestamp
 import Lib.Db as LibDb exposing (Decision(..), HistoryCursor(..))
 import Lib.Drawn as Drawn exposing (Mode(..), SourceRow(..))
+import Lib.Failure exposing (DecideRefusal(..))
 import Lib.Format as Format
 import Lib.Highlight as Highlight exposing (Lang(..), Token(..))
 import Lib.History exposing (HistoryState(..))
@@ -35,6 +36,7 @@ import Lib.RepoPath as RepoPath exposing (PathError(..), Root, RootMap)
 import Lib.ReviewKey as ReviewKey
 import Lib.Settings as Settings
 import Lib.Uid as Uid exposing (Uid)
+import Lib.UnitName as UnitName exposing (NameRefusal(..))
 import TestSupport exposing (tableExists, countReviewRows, expectErr, refuse, seedIndex, writeFileText, fixtureLibRs, fixtureMainIpe, viewA, viewB, viewTag, shownTextOf, unitViewTag, execIndex, execIndexUnchecked, Scratch, freshScratch, freshDir, check, indexSchemaStatements, execIndexSchema, seedIndexDb, insertUnitRows, setIndexEnv, envSettings, loadFirstPage, indexConn, loadUnitNow, checkUnits, listSecond, isUnitA, isUnitB, cleanupIndex, removeFileIfAny, codeText, noHazard, rendered, renderedForeign, describeText, refusedFor, openReadOnlyAt, vectorsPath, ipeIndexTestFile, langName, repoFile, probeMessage, probeNames, maybeContains, isUnrecorded, modifiedFrom, shownOf, uid, insertUnboundUnit, labelText, piecesShown)
 
 
@@ -1635,7 +1637,7 @@ indexExposingScanRefusesEvasions =
 -- Every name `Lib.Index` exposes, a type's constructors written bare.
 indexExposes : List String
 indexExposes =
-    [ "Attested", "AttestedHash", "Body", "ChainHead", "ChainVerdict", "Change", "Cursor", "DecidedPair", "LogStatus", "Oversize", "PendingRow", "ReadFailure", "RefusalDigest", "RefusalReason", "RefusalRow", "ShownHash", "ShownSource", "Snapshot", "SourceView", "StaleReason", "Stamp", "Unit", "UnitView", "Written", "ackable", "attest", "attestResidual", "attestedHash", "attestedHashMaxBytes", "attestedName", "attestedUid", "candidateQuery", "chainHeadDecoder", "chainHeadText", "chainKeyCheck", "chainLogId", "chainMac", "chainNext", "chainSeq", "childSpanCeiling", "classifyView", "decidedPairDecoder", "decidedPairKey", "digestPair", "drainDecided", "drainUnit", "drawnDepthCeiling", "elementResidentBytes", "lengthPrefixed", "linkElements", "liveFiles", "liveUnits", "loadView", "placeholders", "probe", "probeRepos", "probeRoot", "queueElementCeiling", "queueLabelByteCeiling", "readConnection", "readFailureText", "readSnapshot", "readStamp", "rebuildReviewed", "refusalDigestText", "refusalReasons", "refusalRowDecoder", "refusalTag", "residualText", "reverify", "reverifyRefusal", "runtimeEntryOverhead", "runtimeSessionCeiling", "shortHash", "shownDigest", "shownDrawn", "shownHash", "shownRows", "shownText", "signedStamp", "sourceCeiling", "spanOversize", "stampStatus", "stampText", "storedHash", "unescapeShown", "unitName", "unsignedStamp", "viewByteCeiling", "viewLineCeiling", "viewLines", "viewNodeCeiling", "viewReserve", "viewText" ]
+    [ "Attested", "AttestedHash", "Body", "ChainHead", "ChainVerdict", "Change", "Cursor", "DecidedPair", "LogStatus", "Oversize", "PendingRow", "ReadFailure", "RefusalDigest", "RefusalReason", "RefusalRow", "ShownHash", "ShownSource", "Snapshot", "SourceView", "StaleReason", "Stamp", "Unit", "UnitView", "Written", "ackable", "attest", "attestResidual", "attestedHash", "attestedHashMaxBytes", "attestedName", "attestedUid", "candidateQuery", "chainHeadDecoder", "chainHeadText", "chainKeyCheck", "chainLogId", "chainMac", "chainNext", "chainSeq", "childSpanCeiling", "classifyView", "decidedPairDecoder", "decidedPairKey", "digestPair", "drainDecided", "drainUnit", "drawnDepthCeiling", "elementResidentBytes", "lengthPrefixed", "linkElements", "liveFiles", "liveUnits", "loadView", "nameDecision", "placeholders", "probe", "probeRepos", "probeRoot", "queueElementCeiling", "queueLabelByteCeiling", "readConnection", "readFailureText", "readSnapshot", "readStamp", "rebuildReviewed", "refusalDigestText", "refusalReasons", "refusalRowDecoder", "refusalTag", "residualText", "reverify", "reverifyRefusal", "runtimeEntryOverhead", "runtimeSessionCeiling", "shortHash", "shownDigest", "shownDrawn", "shownHash", "shownRows", "shownText", "signedStamp", "sourceCeiling", "spanOversize", "stampStatus", "stampText", "storedHash", "unescapeShown", "unitName", "unsignedStamp", "viewByteCeiling", "viewLineCeiling", "viewLines", "viewNodeCeiling", "viewReserve", "viewText" ]
 
 
 -- The readers `Index.readSnapshot` runs in its transaction.
@@ -1975,4 +1977,30 @@ checks =
         , check "a unit neither bound nor unbound fails the snapshot" unjudgedUnitFailsSnapshot
         , check "a refusal neither bound nor unbound fails the snapshot" unjudgedRefusalFailsSnapshot
         , check "History's live name reads return at most one row per uid asked, however many the index holds" liveReadsBoundedByUids
+        , check "every name refusal maps to the decision refusal a click on its row is refused with" nameDecisionTotal
         ]
+
+
+-- The one map from a name refusal to the decision refusal the row carries:
+-- past the ceiling is `NamePastCeiling`, any other refusal `NameUnreadable`,
+-- and a recorded name stays recorded.
+nameDecisionTotal : Task.Task Error Bool
+nameDecisionTotal =
+    Task.succeed
+        (decisionRefusal (Index.nameDecision (Err PartPastCeiling)) == Just NamePastCeiling
+            && decisionRefusal (Index.nameDecision (Err PartEmpty)) == Just NameUnreadable
+            && decisionRefusal (Index.nameDecision (Err PartNotText)) == Just NameUnreadable
+            && decisionRefusal (Index.nameDecision (Err LineNegative)) == Just NameUnreadable
+            && decisionRefusal (Index.nameDecision (UnitName.recordFile "ipe:src/a.rs")) == Nothing
+            && decisionRefusal (Index.nameDecision (UnitName.recordFile ("ipe:" ++ String.repeat 2045 "p"))) == Just NamePastCeiling
+        )
+
+
+decisionRefusal : Result DecideRefusal a -> Maybe DecideRefusal
+decisionRefusal decided =
+    case decided of
+        Err refusal ->
+            Just refusal
+
+        Ok _ ->
+            Nothing

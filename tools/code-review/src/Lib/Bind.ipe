@@ -1,4 +1,4 @@
-module Lib.Bind exposing (BindRefusal(..), Loopback, acceptedSpellings, loopbackAddress, parseBind, refusalText)
+module Lib.Bind exposing (BindRefusal(..), Loopback, acceptedSpellings, loopbackAddress, parseBind, refusal)
 
 -- The listen address of the review server, proved loopback before anything
 -- else starts. The server is unauthenticated: any host that could reach a
@@ -14,10 +14,11 @@ module Lib.Bind exposing (BindRefusal(..), Loopback, acceptedSpellings, loopback
 -- 127/8 address, another spelling of `::1`), never by admitting an exposed
 -- one.
 
+import Ipe.Error as Error exposing (Error)
 import Ipe.List as List
 import Ipe.Result as Result exposing (Result(..))
 import Ipe.String as String
-import Lib.SafeText as SafeText exposing (SafeText)
+import Lib.EnvLookup as EnvLookup exposing (StartupVar(..))
 import Lib.Settings exposing (EnvValue(..))
 
 
@@ -30,7 +31,7 @@ type Loopback
 
 
 -- Why a bind value is refused. `NotLoopback` holds the raw value, which is
--- shown only through `refusalText`: capped and escaped.
+-- shown only through `refusal`, by the startup renderer: capped and escaped.
 type BindRefusal
     = EmptyBind
     | NotLoopback String
@@ -105,50 +106,36 @@ loopbackAddress bind =
             ipv6Text
 
 
--- The longest prefix of a refused value the refusal shows, in code points.
-echoMaxChars : Int
-echoMaxChars =
-    64
-
-
--- The startup refusal: the variable, what is wrong with its value (it is not
--- one of the accepted spellings, which are listed), and the one remedy. A
--- refused value is shown capped at `echoMaxChars` and escaped, so it can
--- neither flood nor forge the operator's terminal; an unreadable value is
--- never shown.
-refusalText : BindRefusal -> SafeText
-refusalText refusal =
-    SafeText.concat [ problemText refusal, SafeText.literal remedyText ]
-
-
-problemText : BindRefusal -> SafeText
-problemText refusal =
-    case refusal of
+-- The startup refusal of a bind value, one per reason: what is wrong with
+-- the value (for a set value, that it is not one of the accepted spellings,
+-- which are listed), why only loopback is accepted, and the one remedy. A
+-- refused value is handed to the renderer, which shows it capped and
+-- escaped, so it can neither flood nor forge the operator's terminal; an
+-- empty or unreadable value is never shown.
+refusal : BindRefusal -> Error
+refusal reason =
+    case reason of
         EmptyBind ->
-            SafeText.literal "IPE_HTTP_BIND is set but empty"
+            bindRefusal Nothing "it is set but empty"
 
         NotLoopback raw ->
-            SafeText.concat
-                [ SafeText.literal "IPE_HTTP_BIND is "
-                , SafeText.quoted (String.left echoMaxChars raw)
-                , cutMark raw
-                , SafeText.literal (", which is not one of the accepted loopback spellings (" ++ String.join ", " acceptedSpellings ++ ")")
-                ]
+            bindRefusal (Just raw) ("it is not one of the accepted loopback spellings (" ++ String.join ", " acceptedSpellings ++ ")")
 
         UnreadableBind ->
-            SafeText.literal "IPE_HTTP_BIND is set but could not be read from the environment (it is not valid Unicode)"
+            bindRefusal Nothing "it is set but could not be read from the environment (it is not valid Unicode)"
 
 
--- `…` after the shown prefix when `raw` is longer than it.
-cutMark : String -> SafeText
-cutMark raw =
-    if String.length raw > echoMaxChars then
-        SafeText.literal "…"
-
-    else
-        SafeText.literal ""
+bindRefusal : Maybe String -> String -> Error
+bindRefusal given cause =
+    EnvLookup.startupRefusal
+        { var = HttpBindVar
+        , file = Nothing
+        , given = given
+        , problem = cause ++ ", and the review page is unauthenticated, so the server listens on loopback only"
+        , fix = remedyText
+        }
 
 
 remedyText : String
 remedyText =
-    "; code-review serves an unauthenticated review page, so it listens on loopback only. Unset IPE_HTTP_BIND (the server then binds " ++ ipv4Text ++ "), or set it to " ++ String.join " or " acceptedSpellings ++ ", and reach it from another machine through an SSH tunnel, e.g. ssh -L 8000:127.0.0.1:8000 <host> (use the listening port if IPE_SERVER_PORT sets another)"
+    "unset it (the server then binds " ++ ipv4Text ++ "), or set it to " ++ String.join " or " acceptedSpellings ++ ", and reach the server from another machine through an SSH tunnel, e.g. ssh -L 8000:127.0.0.1:8000 <host> (use the listening port if IPE_SERVER_PORT sets another)"

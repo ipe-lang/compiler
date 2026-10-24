@@ -1,4 +1,4 @@
-module Lib.Index exposing (Attested, AttestedHash(..), Body(..), ChainHead, ChainVerdict(..), Change(..), Cursor(..), DecidedPair, LogStatus(..), Oversize(..), PendingRow, ReadFailure(..), RefusalDigest, RefusalReason(..), RefusalRow, ShownHash, ShownSource, Snapshot, SourceView(..), StaleReason(..), Stamp, Unit, UnitView, Written(..), ackable, attest, attestResidual, attestedHash, attestedHashMaxBytes, attestedName, attestedUid, candidateQuery, chainHeadDecoder, chainHeadText, chainKeyCheck, chainLogId, chainMac, chainNext, chainSeq, childSpanCeiling, classifyView, decidedPairDecoder, decidedPairKey, digestPair, drainDecided, drainUnit, drawnDepthCeiling, elementResidentBytes, lengthPrefixed, linkElements, liveFiles, liveUnits, loadView, placeholders, probe, probeRepos, probeRoot, queueElementCeiling, queueLabelByteCeiling, readConnection, readFailureText, readSnapshot, readStamp, rebuildReviewed, refusalDigestText, refusalReasons, refusalRowDecoder, refusalTag, residualText, reverify, reverifyRefusal, runtimeEntryOverhead, runtimeSessionCeiling, shortHash, shownDigest, shownDrawn, shownHash, shownRows, shownText, signedStamp, sourceCeiling, spanOversize, stampStatus, stampText, storedHash, unescapeShown, unitName, unsignedStamp, viewByteCeiling, viewLineCeiling, viewLines, viewNodeCeiling, viewReserve, viewText)
+module Lib.Index exposing (Attested, AttestedHash(..), Body(..), ChainHead, ChainVerdict(..), Change(..), Cursor(..), DecidedPair, LogStatus(..), Oversize(..), PendingRow, ReadFailure(..), RefusalDigest, RefusalReason(..), RefusalRow, ShownHash, ShownSource, Snapshot, SourceView(..), StaleReason(..), Stamp, Unit, UnitView, Written(..), ackable, attest, attestResidual, attestedHash, attestedHashMaxBytes, attestedName, attestedUid, candidateQuery, chainHeadDecoder, chainHeadText, chainKeyCheck, chainLogId, chainMac, chainNext, chainSeq, childSpanCeiling, classifyView, decidedPairDecoder, decidedPairKey, digestPair, drainDecided, drainUnit, drawnDepthCeiling, elementResidentBytes, lengthPrefixed, linkElements, liveFiles, liveUnits, loadView, nameDecision, placeholders, probe, probeRepos, probeRoot, queueElementCeiling, queueLabelByteCeiling, readConnection, readFailureText, readSnapshot, readStamp, rebuildReviewed, refusalDigestText, refusalReasons, refusalRowDecoder, refusalTag, residualText, reverify, reverifyRefusal, runtimeEntryOverhead, runtimeSessionCeiling, shortHash, shownDigest, shownDrawn, shownHash, shownRows, shownText, signedStamp, sourceCeiling, spanOversize, stampStatus, stampText, storedHash, unescapeShown, unitName, unsignedStamp, viewByteCeiling, viewLineCeiling, viewLines, viewNodeCeiling, viewReserve, viewText)
 
 import Ipe.ByteSize as ByteSize exposing (ByteSize)
 import Ipe.Bytes as Bytes
@@ -38,7 +38,11 @@ import Lib.UnitName as UnitName exposing (NameRefusal(..), RecordedName, UnitNam
 -- parsed once in `withRow`, so no index text reaches a page raw or
 -- unbounded; `lang` is the language ipe-index stores for the unit's file,
 -- read through the same window and parsed for highlighting. `attested` is
--- the stored body hash, read whole or not at all, parsed once.
+-- the stored body hash, read whole or not at all, parsed once. `record` is
+-- the name a decision on the unit would record, parsed once from the same
+-- kind, qualified name, path and start line columns the decision re-reads,
+-- or why no decision can record it: the one value the page offers a
+-- decision by.
 type alias Unit =
     { uid : Uid
     , path : Label
@@ -51,6 +55,7 @@ type alias Unit =
     , facing : Label
     , purpose : Maybe Label
     , attested : AttestedHash
+    , record : Result DecideRefusal RecordedName
     }
 
 
@@ -1276,7 +1281,9 @@ refusalDigestText digest =
 -- the index's escaped `tag:relative` form, read through a bounded window and
 -- parsed once into a `Label`; `digest` is
 -- Nothing exactly for a blocking reason, so a row no decision can bind has
--- no hash to bind it to. No file byte is ever part of it.
+-- no hash to bind it to; `record` is the path a decision on the file would
+-- record, parsed once from the stored path column, or why none can. No file
+-- byte is ever part of it.
 type alias RefusalRow =
     { uid : Uid
     , path : Label
@@ -1284,6 +1291,7 @@ type alias RefusalRow =
     , reason : RefusalReason
     , size : Maybe Int
     , digest : Maybe RefusalDigest
+    , record : Result DecideRefusal RecordedName
     }
 
 
@@ -1354,6 +1362,7 @@ refusalRowOf raw =
                             , reason = reason
                             , size = raw.size
                             , digest = digest
+                            , record = nameDecision (UnitName.fileFromColumn raw.path)
                             }
 
 
@@ -2584,6 +2593,7 @@ withRow row shown =
     , facing = Label.parse Label.labelCap shown.facing
     , purpose = Maybe.map (Label.parse Label.purposeCap) shown.purpose
     , attested = parseAttested row.bodyHash
+    , record = nameDecision (UnitName.unitFromColumns { kind = shown.kind, qualified = shown.qualified, path = shown.path, line = row.lineStart })
     }
 
 
@@ -2849,9 +2859,18 @@ reverifyRefusal settings uid digest =
 -- of its subject, or refused when that name cannot be recorded whole.
 attestedWith : Uid -> String -> Result NameRefusal RecordedName -> Result DecideRefusal Attested
 attestedWith uid hash name =
+    Result.map (\recorded -> Attested { uid = uid, hash = hash, name = recorded }) (nameDecision name)
+
+
+-- A parsed name as a decision sees it: the name it records, or the
+-- decision refusal its name refusal is. The one mapping, read at the row's
+-- decode and again at the decision's re-read, so the page offers a decision
+-- exactly where the save can record its name.
+nameDecision : Result NameRefusal RecordedName -> Result DecideRefusal RecordedName
+nameDecision name =
     case name of
         Ok recorded ->
-            Ok (Attested { uid = uid, hash = hash, name = recorded })
+            Ok recorded
 
         Err PartPastCeiling ->
             Err NamePastCeiling
