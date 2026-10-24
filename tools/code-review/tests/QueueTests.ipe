@@ -2886,8 +2886,10 @@ drainWithSignedRowDrains =
 -- After `u-a` is decided at its first hash, its file and index row change
 -- and its queue row is re-hashed; the pair attested from the new row has no
 -- signed log row, so the drain writes no `reviewed` row for it and keeps
--- the re-hashed queue row. Red while a drain writes the attested pair
--- without finding its row in the log.
+-- the re-hashed queue row. The control drains the pair the decision signed,
+-- in the same fixture: its `reviewed` row is written, so the refusal is the
+-- hash's and not a log the fixture left unproven. Red while a drain writes
+-- the attested pair without finding its row in the log.
 drainOfOtherHashKeepsUnit : Task.Task Error Bool
 drainOfOtherHashKeepsUnit =
     let
@@ -2898,7 +2900,7 @@ drainOfOtherHashKeepsUnit =
         at <- freshScratch "ipe-index-drain-other-hash"
         db <- seedProgressScratch at
         loadPageNow Index.Start
-        decideNow db (uid "u-a") Approved
+        decided <- decideNow db (uid "u-a") Approved
         writeFileText (at.repo ++ "/src/Lib.rs") (String.replace "42" "43" fixtureLibRs)
         execIndex at.indexDb "UPDATE units SET body_hash = ? WHERE uid = ?" [ SqlString rehashed, Uid.toSql (uid "u-a") ]
         execIndex at.indexDb "UPDATE change_queue SET new_hash = ? WHERE uid = ?" [ SqlString rehashed, Uid.toSql (uid "u-a") ]
@@ -2906,15 +2908,18 @@ drainOfOtherHashKeepsUnit =
         drained <- drainUnitNow attested AlreadyDecided
         queued <- queueRows at.indexDb "u-a" rehashed
         copied <- copyRows at.indexDb "u-a" rehashed
+        drainFor decided
+        signedCopied <- copyRows at.indexDb "u-a" (Index.attestedHash (Tuple.first decided))
         cleanupProgressScratch at
-        Task.succeed (Index.attestedHash attested == rehashed && drained == 0 && queued == 1 && copied == 0)
+        Task.succeed (Index.attestedHash attested == rehashed && drained == 0 && queued == 1 && copied == 0 && signedCopied == 1)
 
 
--- R4: the same decided pair, drained under another key, drains nothing and
--- changes no index table: the log's rows fail that key, so none is
--- verified. The control drain under the configured key then drains it. Red
--- while a drain skips the walk, or the walk verifies a row under a key other
--- than the one it was signed with.
+-- R4: the same decided pair, drained with no key or under another key,
+-- drains nothing and changes no index table: with no key no row counts, and
+-- the log's rows fail another key, so none is verified. The control drain
+-- under the configured key then drains it. Red while a drain skips the walk,
+-- counts a row with no key, or verifies a row under a key other than the one
+-- it was signed with.
 drainUnderOtherKeyDrainsNothing : Task.Task Error Bool
 drainUnderOtherKeyDrainsNothing =
     do
@@ -2926,11 +2931,12 @@ drainUnderOtherKeyDrainsNothing =
         other <- otherMacKey
         index <- openFileAt ReadExisting at.indexDb
         before <- tableRowCounts index
+        keyless <- drainUnder { settings | key = ReadOnly } decided
         forged <- drainUnder { settings | key = Signing other } decided
         after <- tableRowCounts index
         drained <- drainUnder settings decided
         cleanupProgressScratch at
-        Task.succeed (forged == 0 && before == after && drained == 1)
+        Task.succeed (keyless == 0 && forged == 0 && before == after && drained == 1)
 
 
 drainUnder : Settings.AppSettings -> ( Index.Attested, Index.Written ) -> Task.Task Error Int
@@ -3139,7 +3145,7 @@ checks =
                     , check "a drain of an attested pair with no signed log row writes nothing and keeps the unit queued" drainWithoutSignedRowKeepsUnitQueued
                     , check "a drain of a pair whose signed row the log holds drains the unit" drainWithSignedRowDrains
                     , check "a drain of a unit re-hashed since its decision writes nothing for the new hash and keeps its queue row" drainOfOtherHashKeepsUnit
-                    , check "a drain under another key drains nothing; the configured key then drains" drainUnderOtherKeyDrainsNothing
+                    , check "a drain with no key or under another key drains nothing; the configured key then drains" drainUnderOtherKeyDrainsNothing
                     , check "a pair written straight into the copy fails proveCopy as CopyDiffers" proveCopyRefusesForgedPair
                     , check "a copy whose stamp row is gone fails proveCopy as StampStale" proveCopyRefusesStaleStamp
                     , check "a keyless copy holding a repeated pair fails proveCopy as CopyUnproven" proveCopyRefusesUnprovenTable
