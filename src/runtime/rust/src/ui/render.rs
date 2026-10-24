@@ -3783,7 +3783,7 @@ mod text_role_tests {
         for tag in NodeTag::ALL {
             assert!(
                 matches!(
-                    admit_rendered_in::<()>(ParseContext::Data, tag.as_str(), &[]),
+                    admit_rendered_in::<()>(ParseContext::Data, tag.as_str(), &[], &[]),
                     Ok(RenderedElement::Element(ElementBody::Markup))
                 ),
                 "{tag:?}"
@@ -3822,6 +3822,7 @@ mod text_role_tests {
             admit_rendered_in::<()>(
                 ParseContext::Data,
                 "script",
+                &[],
                 &[Html::HText("alert(1)".to_owned())]
             ),
             Ok(RenderedElement::Element(ElementBody::Markup))

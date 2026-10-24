@@ -781,6 +781,7 @@ mod tests {
             remove: false,
         };
         diff_attrs::<()>(
+            "button",
             &[],
             &[Attribute::Attr("data-ipe-hid".into(), "r_9_button".into())],
             &mut patch,
