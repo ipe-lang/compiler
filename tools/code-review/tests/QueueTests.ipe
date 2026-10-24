@@ -21,6 +21,7 @@ import Ipe.String as String
 import Ipe.System as System
 import Ipe.Task as Task
 import Ipe.Time.Timestamp as Timestamp
+import Ipe.Tuple as Tuple
 import Lib.Db as LibDb exposing (BreakAt(..), Decision(..), HistoryCursor(..), LogShown(..), ReviewEntry(..), StoredDecision(..), Unverified(..))
 import Lib.DecisionSlot as DecisionSlot exposing (DecisionTarget(..))
 import Lib.Epoch as Epoch exposing (Epoch)
@@ -38,6 +39,7 @@ import Lib.RepoPath as RepoPath exposing (PathError(..), Root, RootMap)
 import Lib.ReviewKey as ReviewKey exposing (ReviewKey(..))
 import Lib.SafeText as SafeText
 import Lib.Selected as Selected exposing (SelectedView(..))
+import Lib.Slot as Slot
 import Lib.Standing as Standing
 import Lib.Uid as Uid exposing (Uid)
 import TestSupport exposing (openFileAt, piecesShown, quotedLabelOf, tableExists, countReviewRows, expectErr, refuse, seedIndex, writeFileText, fixtureLibRs, fixtureMainIpe, viewA, viewB, viewTag, shownTextOf, unitViewTag, execIndex, execIndexUnchecked, Scratch, freshScratch, freshDir, check, indexSchemaStatements, execIndexSchema, seedIndexDb, insertUnitRows, setIndexEnv, loadFirstPage, indexConn, loadUnitNow, decideNow, envSettings, envReview, envAppSettings, loadPageNow, drainThenLoadNow, loadUnitViewNow, drainUnitNow, decideShownNow, decidedRefusalNow, accepted, refusalOf, refusedAs, decidedNow, resyncReviewedNow, resyncReviewedWithinNow, shownOf, PageEntry, checkUnits, listSecond, isUnitA, isUnitB, cleanupIndex, removeFileIfAny, codeText, noHazard, rendered, renderedForeign, describeText, refusedFor, migratedReviewAt, tableRowCounts, openReadOnlyAt, vectorsPath, ipeIndexTestFile, repoFile, probeMessage, probeNames, maybeContains, isNew, isUnrecorded, mirroredCount, stampOf, reviewHeadOf, uid, resyncBoundOf, appendSigned, RawName(..), rawRow, tamperLog, logIdOf, headTextOf, logRowCount, loadHistoryPageNow, carriesFailure, logVerdictOf, appendSignedWithUidText, insertUnboundUnit, labelOf, labelText)
@@ -199,7 +201,7 @@ onlySelectedShownDecidable =
                 Just loaded ->
                     not (isNothing (Selected.decidableSource (uid "u-a") (ViewShown loaded)))
                         && isNothing (Selected.decidableSource (uid "u-b") (ViewShown loaded))
-                        && isNothing (Selected.decidableSource (uid "u-a") (ViewLoading { uid = uid "u-a", wanted = Nothing, fresh = True, owner = epoch }))
+                        && isNothing (Selected.decidableSource (uid "u-a") (readingOf epoch (uid "u-a")))
                         && isNothing (Selected.decidableSource (uid "u-a") NoneSelected)
 
                 Nothing ->
@@ -310,18 +312,18 @@ selectionsDuringReadCoalesce : Epoch -> Bool
 selectionsDuringReadCoalesce epoch =
     let
         ( afterB, readB ) =
-            Selected.selectView epoch (uid "b") (ViewLoading { uid = uid "a", wanted = Nothing, fresh = True, owner = epoch })
+            Selected.selectView epoch (uid "b") (readingOf epoch (uid "a"))
 
         ( afterC, readC ) =
             Selected.selectView epoch (uid "c") afterB
 
         ( arrived, next ) =
-            Selected.viewArrived epoch (uid "a") (Ok Nothing) afterC
+            readArrived epoch (uid "a") (Ok Nothing) afterC
     in
     readB == Nothing
         && readC == Nothing
         && selectedTag afterC == "loading a wanting c"
-        && next == Just (uid "c")
+        && Maybe.map Slot.stampKey next == Just (uid "c")
         && selectedTag arrived == "loading c"
 
 
@@ -332,16 +334,16 @@ outdatedResponseDropped : Epoch -> Bool
 outdatedResponseDropped epoch =
     let
         loading =
-            ViewLoading { uid = uid "b", wanted = Nothing, fresh = True, owner = epoch }
+            readingOf epoch (uid "b")
 
         ( afterLate, lateNext ) =
-            Selected.viewArrived epoch (uid "a") (Ok Nothing) loading
+            readArrived epoch (uid "a") (Ok Nothing) loading
 
         ( reselected, reselectNext ) =
-            Selected.selectView epoch (uid "b") (ViewLoading { uid = uid "b", wanted = Just (uid "c"), fresh = True, owner = epoch })
+            Selected.selectView epoch (uid "b") (Tuple.first (Selected.selectView epoch (uid "c") (readingOf epoch (uid "b"))))
 
         ( settled, settledNext ) =
-            Selected.viewArrived epoch (uid "b") (Ok Nothing) loading
+            readArrived epoch (uid "b") (Ok Nothing) loading
 
         ( fresh, freshNext ) =
             Selected.selectView epoch (uid "a") NoneSelected
@@ -356,7 +358,7 @@ outdatedResponseDropped epoch =
         && selectedTag settled == "missing b"
         && settledNext == Nothing
         && selectedTag fresh == "loading a"
-        && freshNext == Just (uid "a")
+        && Maybe.map Slot.stampKey freshNext == Just (uid "a")
         && selectedTag cleared == "loading b wanting a"
         && clearedNext == Nothing
 
@@ -371,7 +373,7 @@ outdatedReadNeverSettles : Epoch -> Bool
 outdatedReadNeverSettles epoch =
     let
         ( reloaded, reloadNext ) =
-            Selected.reloadView epoch (uid "a") (ViewLoading { uid = uid "a", wanted = Nothing, fresh = True, owner = epoch })
+            Selected.reloadView epoch (uid "a") (readingOf epoch (uid "a"))
 
         ( viaB, _ ) =
             Selected.selectView epoch (uid "b") reloaded
@@ -380,18 +382,38 @@ outdatedReadNeverSettles epoch =
             Selected.selectView epoch (uid "a") viaB
 
         ( arrived, arrivedNext ) =
-            Selected.viewArrived epoch (uid "a") (Ok Nothing) backToA
+            readArrived epoch (uid "a") (Ok Nothing) backToA
 
         ( dropped, droppedNext ) =
-            Selected.viewArrived epoch (uid "a") (Ok Nothing) (Selected.clearView epoch (ViewLoading { uid = uid "a", wanted = Nothing, fresh = True, owner = epoch }))
+            readArrived epoch (uid "a") (Ok Nothing) (Selected.clearView epoch (readingOf epoch (uid "a")))
     in
     reloadNext == Nothing
         && backNext == Nothing
         && selectedTag backToA == "loading a wanting a"
-        && arrivedNext == Just (uid "a")
+        && Maybe.map Slot.stampKey arrivedNext == Just (uid "a")
         && selectedTag arrived == "loading a"
         && selectedTag dropped == "none"
         && droppedNext == Nothing
+
+
+-- The read of `unit` process `epoch` starts on an idle slot: a slot and a
+-- stamp are made only by the production start.
+readingOf : Epoch -> Uid -> Selected.SelectedView
+readingOf epoch unit =
+    Tuple.first (Selected.selectView epoch unit NoneSelected)
+
+
+-- The read of `unit` process `epoch` started returned to `state` with
+-- `result`. With no stamp from the start the slot reads `NoneSelected`
+-- and wants nothing.
+readArrived : Epoch -> Uid -> Result LoadFailure (Maybe Index.UnitView) -> Selected.SelectedView -> ( Selected.SelectedView, Maybe (Slot.Stamp Uid) )
+readArrived epoch unit result state =
+    case Tuple.second (Selected.selectView epoch unit NoneSelected) of
+        Just read ->
+            Selected.viewArrived epoch read result state
+
+        Nothing ->
+            ( NoneSelected, Nothing )
 
 
 selectedTag : Selected.SelectedView -> String
@@ -403,10 +425,10 @@ selectedTag state =
         ViewLoading loading ->
             case loading.wanted of
                 Just w ->
-                    "loading " ++ fixtureNameOf loading.uid ++ " wanting " ++ fixtureNameOf w
+                    "loading " ++ fixtureNameOf (Slot.stampKey loading.running) ++ " wanting " ++ fixtureNameOf w
 
                 Nothing ->
-                    "loading " ++ fixtureNameOf loading.uid
+                    "loading " ++ fixtureNameOf (Slot.stampKey loading.running)
 
         ViewShown loaded ->
             "shown " ++ fixtureNameOf loaded.unit.uid
@@ -782,7 +804,7 @@ unitPageStatesDistinct =
         epoch <- Epoch.mint
         let
             ( settled, _ ) =
-                Selected.viewArrived epoch (uid "no-such") (Ok loaded) (ViewLoading { uid = uid "no-such", wanted = Nothing, fresh = True, owner = epoch })
+                readArrived epoch (uid "no-such") (Ok loaded) (readingOf epoch (uid "no-such"))
         in
         Task.succeed
             (isNotFound (Queue.unitPageOf (uid "no-such") settled)

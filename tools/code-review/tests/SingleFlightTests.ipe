@@ -11,6 +11,7 @@ import Ipe.String as String
 import Ipe.System as System
 import Ipe.Task as Task
 import Ipe.Time.Timestamp as Timestamp
+import Ipe.Tuple as Tuple
 import Ipe.Ui as Ui
 import Lib.App as App exposing (KeyOffers(..), Model, Msg(..), Page(..))
 import Lib.Db as LibDb exposing (Decision(..))
@@ -26,7 +27,7 @@ import Lib.ReviewKey as ReviewKey exposing (ReviewKey(..))
 import Lib.SafeText as SafeText
 import Lib.Selected as Selected exposing (SelectedView(..))
 import Lib.Settings as Settings
-import Lib.Slot as Slot exposing (Settle(..))
+import Lib.Slot as Slot exposing (Settle(..), Stamp)
 import Lib.Standing as Standing exposing (StandingRead(..))
 import Lib.Uid as Uid exposing (Uid)
 import Lib.View as View
@@ -63,7 +64,7 @@ inFlight : Model -> Maybe ( Uid, Maybe Uid )
 inFlight model =
     case model.selectedView of
         ViewLoading loading ->
-            Just ( loading.uid, loading.wanted )
+            Just ( Slot.stampKey loading.running, loading.wanted )
 
         ViewShown _ ->
             Nothing
@@ -76,6 +77,132 @@ inFlight model =
 
         ViewFailed _ _ ->
             Nothing
+
+
+-- ── slots and stamps, built only by the production starts ──────────────
+-- A stamp is minted only by its slot's start function, so every running
+-- slot and every completion stamp below comes from a real start on an idle
+-- slot. A stamp is its process's epoch and its key, so the stamp a start
+-- under `epoch` of `unit` returns here is the one the model's slot holds
+-- after the same start.
+readingSlot : Epoch -> Uid -> SelectedView
+readingSlot epoch unit =
+    Tuple.first (Selected.selectView epoch unit NoneSelected)
+
+
+readStamp : Epoch -> Uid -> Maybe (Stamp Uid)
+readStamp epoch unit =
+    Tuple.second (Selected.selectView epoch unit NoneSelected)
+
+
+savingSlot : Epoch -> Uid -> DecisionSlot
+savingSlot epoch unit =
+    case DecisionSlot.startDecision epoch unit (DecisionIdle PanelClosed) of
+        Just ( started, _ ) ->
+            started
+
+        Nothing ->
+            DecisionIdle PanelClosed
+
+
+refreshingSlot : Epoch -> Uid -> DecisionSlot
+refreshingSlot epoch unit =
+    case savingStamp epoch unit of
+        Just saving ->
+            Maybe.withDefault (DecisionIdle PanelClosed) (DecisionSlot.decisionWritten epoch saving (savingSlot epoch unit))
+
+        Nothing ->
+            DecisionIdle PanelClosed
+
+
+savingStamp : Epoch -> Uid -> Maybe (Stamp Uid)
+savingStamp epoch unit =
+    Maybe.map Tuple.second (DecisionSlot.startDecision epoch unit (DecisionIdle PanelClosed))
+
+
+standingReading : Epoch -> Uid -> String -> StandingRead
+standingReading epoch unit bodyHash =
+    Tuple.first (Standing.standingRequested epoch unit bodyHash StandingUnread)
+
+
+standingStamp : Epoch -> Uid -> String -> Maybe (Stamp Standing.StandingKey)
+standingStamp epoch unit bodyHash =
+    Tuple.second (Standing.standingRequested epoch unit bodyHash StandingUnread)
+
+
+-- The completion `done` of the task stamped `held`, as the messages to
+-- send: none when no start made the stamp.
+completions : (Stamp key -> result -> Msg) -> Maybe (Stamp key) -> result -> List Msg
+completions done held result =
+    case held of
+        Just arrived ->
+            [ done arrived result ]
+
+        Nothing ->
+            []
+
+
+-- The stamp of a load process `epoch` starts on `slot` once its running
+-- load, if any, has settled: a load of this process the slot does not
+-- hold.
+anotherLoad : Epoch -> want -> Slot.LoadSlot want -> Maybe (Stamp Slot.LoadTicket)
+anotherLoad epoch want slot =
+    let
+        ( _, settled, _ ) =
+            case Slot.runningLoad slot of
+                Just load ->
+                    Slot.loadArrived epoch load slot
+
+                Nothing ->
+                    ( Settles, slot, Nothing )
+    in
+    Slot.runningLoad (Tuple.first (Slot.requestLoad Slot.latestWant epoch want settled))
+
+
+-- The queue's running load returned with `result`.
+queueDone : Slot.LoadSlot QueueWant -> Result LoadFailure Queue.QueuePage -> List Msg
+queueDone slot result =
+    completions PendingLoaded (Slot.runningLoad slot) result
+
+
+queueLoadedOn : Slot.LoadSlot QueueWant -> Result Error Queue.QueuePage -> List Msg
+queueLoadedOn slot result =
+    completions App.queueLoaded (Slot.runningLoad slot) result
+
+
+historyLoadedOn : Slot.LoadSlot HistoryWant -> Result Error History.HistoryPage -> List Msg
+historyLoadedOn slot result =
+    completions App.historyLoaded (Slot.runningLoad slot) result
+
+
+-- The read of `unit` run by process `epoch` returned with `result`.
+viewDone : Epoch -> Uid -> Result LoadFailure (Maybe Index.UnitView) -> List Msg
+viewDone epoch unit result =
+    completions SelectedViewLoaded (readStamp epoch unit) result
+
+
+viewLoadedFor : Epoch -> Uid -> Result Error (Maybe Index.UnitView) -> List Msg
+viewLoadedFor epoch unit result =
+    completions App.viewLoaded (readStamp epoch unit) result
+
+
+-- The save of a decision on `unit` run by process `epoch` returned with
+-- `result`.
+decisionDone : Epoch -> Uid -> Result SaveFailure ( Index.Attested, Index.Written ) -> List Msg
+decisionDone epoch unit result =
+    completions DecisionSaved (savingStamp epoch unit) result
+
+
+decisionSavedFor : Epoch -> Uid -> Result Error (Result DecideRefusal ( Index.Attested, Index.Written )) -> List Msg
+decisionSavedFor epoch unit result =
+    completions App.decisionSaved (savingStamp epoch unit) result
+
+
+-- The standing read of `unit`'s body `bodyHash` run by process `epoch`
+-- returned with `result`.
+standingLoadedFor : Epoch -> Uid -> String -> Result Error Standing.Standing -> List Msg
+standingLoadedFor epoch unit bodyHash result =
+    completions App.standingLoaded (standingStamp epoch unit bodyHash) result
 
 
 -- What the unit page at the model's address shows, by name.
@@ -300,7 +427,7 @@ unitEntriesDuringReadCoalesce settings a b =
             Selected.reloadView settings.epoch ub first.selectedView
 
         returned =
-            after settings [ SelectedViewLoaded ua settings.epoch (Ok (Just a)) ] entered
+            after settings (viewDone settings.epoch ua (Ok (Just a))) entered
     in
     inFlight first == Just ( ua, Nothing )
         && startedDuring == Nothing
@@ -325,7 +452,7 @@ oneReadSlotAcrossPages settings a b =
             b.unit.uid
 
         cardReading =
-            queueModel [ a, b ] (ViewLoading { uid = ua, wanted = Nothing, fresh = True, owner = settings.epoch })
+            queueModel [ a, b ] (readingSlot settings.epoch ua)
 
         onUnitPage =
             after settings [ Navigated (unitAt ub) ] cardReading
@@ -340,7 +467,7 @@ oneReadSlotAcrossPages settings a b =
             after settings [ Navigated QueuePage ] unitReading
 
         queueLoaded =
-            after settings [ PendingLoaded (Slot.latestTicket backOnQueue.queueLoad) (Ok (queuePageOf [ a, b ])) ] backOnQueue
+            after settings (queueDone backOnQueue.queueLoad (Ok (queuePageOf [ a, b ]))) backOnQueue
     in
     inFlight onUnitPage == Just ( ua, Just ub )
         && inFlight keysOnUnitPage == Just ( ua, Just ub )
@@ -367,31 +494,35 @@ unitPageSettlesOnItsOwnRead settings a b =
             uid "u-c"
 
         waiting =
-            after settings [ Navigated (unitAt ub) ] (queueModel [ a ] (ViewLoading { uid = ua, wanted = Nothing, fresh = True, owner = settings.epoch }))
+            after settings [ Navigated (unitAt ub) ] (queueModel [ a ] (readingSlot settings.epoch ua))
 
         otherReturned =
-            after settings [ SelectedViewLoaded ua settings.epoch (Ok (Just a)) ] waiting
+            after settings (viewDone settings.epoch ua (Ok (Just a))) waiting
+
+        otherQueueLoad =
+            anotherLoad settings.epoch (QueueReload Index.Start) otherReturned.queueLoad
 
         queueLoaded =
-            after settings [ PendingLoaded (Slot.latestTicket otherReturned.queueLoad) (Ok (queuePageOf [ a ])) ] otherReturned
+            after settings (completions PendingLoaded otherQueueLoad (Ok (queuePageOf [ a ]))) otherReturned
 
         ownReturned =
-            after settings [ SelectedViewLoaded ub settings.epoch (Ok (Just b)) ] queueLoaded
+            after settings (viewDone settings.epoch ub (Ok (Just b))) queueLoaded
 
         lateOther =
-            after settings [ SelectedViewLoaded ua settings.epoch (Ok (Just a)) ] ownReturned
+            after settings (viewDone settings.epoch ua (Ok (Just a))) ownReturned
 
         shownElsewhere =
             { ownReturned | page = unitAt ua }
 
         missing =
-            after settings [ Navigated (unitAt uc), SelectedViewLoaded uc settings.epoch (Ok Nothing) ] ownReturned
+            after settings ([ Navigated (unitAt uc) ] ++ viewDone settings.epoch uc (Ok Nothing)) ownReturned
 
         refused =
             after settings [ Navigated (UnitPage "not-a-unit-id") ] ownReturned
     in
     pageTag waiting == "loading"
         && pageTag otherReturned == "loading"
+        && otherQueueLoad /= Nothing
         && inFlight queueLoaded == Just ( ub, Nothing )
         && pageTag ownReturned == ("loaded " ++ TestSupport.uidHex ub)
         && pageTag lateOther == ("loaded " ++ TestSupport.uidHex ub)
@@ -425,24 +556,24 @@ decisionsSingleFlight settings a b =
             after settings (drawnOn shown ua RefuseStart ++ draftOn (refusalOpened settings shown ua) ua "needs a test" ++ drawnOn shown ua RefuseSubmit) saving
 
         settled =
-            after settings [ App.decisionSaved ua settings.epoch (Err (Error.conflict "boom")) ] pressedAgain
+            after settings (decisionSavedFor settings.epoch ua (Err (Error.conflict "boom"))) pressedAgain
 
         next =
             after settings (drawnOn settled ua ApproveRow) settled
 
         lateOther =
-            after settings [ App.decisionSaved b.unit.uid settings.epoch (Err (Error.conflict "boom")) ] next
+            after settings (decisionSavedFor settings.epoch b.unit.uid (Err (Error.conflict "boom"))) next
     in
     offers shown ua
         && offers settled ua
-        && DecisionSlot.startDecision settings.epoch ua (DecisionSaving ua settings.epoch) == Nothing
-        && saving.decision == DecisionSaving ua settings.epoch
-        && pressedAgain.decision == DecisionSaving ua settings.epoch
-        && refusing.decision == DecisionSaving ua settings.epoch
+        && DecisionSlot.startDecision settings.epoch ua (savingSlot settings.epoch ua) == Nothing
+        && saving.decision == savingSlot settings.epoch ua
+        && pressedAgain.decision == savingSlot settings.epoch ua
+        && refusing.decision == savingSlot settings.epoch ua
         && DecisionSlot.openPanel refusing.decision == Nothing
         && DecisionSlot.notSavedOf settled.decision == Just SaveFailed
-        && next.decision == DecisionSaving ua settings.epoch
-        && lateOther.decision == DecisionSaving ua settings.epoch
+        && next.decision == savingSlot settings.epoch ua
+        && lateOther.decision == savingSlot settings.epoch ua
 
 
 -- The refusal panel opens only on an idle slot, through the busy check a
@@ -480,7 +611,7 @@ refusalPanelLivesInIdleSlot settings a b file =
             cardModel [ a, b ] 1 b
 
         otherSaving =
-            { secondShown | decision = DecisionSaving ua settings.epoch }
+            { secondShown | decision = savingSlot settings.epoch ua }
 
         otherRefused =
             after settings (drawnOn secondShown ub RefuseStart) otherSaving
@@ -504,17 +635,17 @@ refusalPanelLivesInIdleSlot settings a b file =
             after settings [ Navigated QueuePage ] opened
 
         reloaded =
-            after settings [ PendingLoaded (Slot.latestTicket reloading.queueLoad) (Ok (queuePageOf [ a, b ])) ] reloading
+            after settings (queueDone reloading.queueLoad (Ok (queuePageOf [ a, b ]))) reloading
     in
     offers shown ua
         && offers secondShown ub
         && offers (withRefusal file shown) file.uid
         && startsRefusal (Keys.keyAction (App.keyMode (App.keyOffers saving) saving) "r")
         && keyed == saving
-        && keyed.decision == DecisionSaving ua settings.epoch
+        && keyed.decision == savingSlot settings.epoch ua
         && String.contains "Saving the decision…" (page keyed)
         && not (panelDrawn (page keyed))
-        && cancelled.decision == DecisionSaving ua settings.epoch
+        && cancelled.decision == savingSlot settings.epoch ua
         && otherRefused == otherSaving
         && String.contains "Another decision is saving…" (page otherRefused)
         && not (panelDrawn (page otherRefused))
@@ -598,13 +729,13 @@ refusalPanelOnlyOnOfferedRow settings a b file =
             after settings [ ShowHistory ] drafted
 
         reading =
-            { drafted | selectedView = ViewLoading { uid = ua, wanted = Nothing, fresh = True, owner = settings.epoch } }
+            { drafted | selectedView = readingSlot settings.epoch ua }
 
         readWithheld =
-            after settings [ SelectedViewLoaded ua settings.epoch (Ok (Just { a | view = Stale Drifted })) ] reading
+            after settings (viewDone settings.epoch ua (Ok (Just { a | view = Stale Drifted }))) reading
 
         readShown =
-            after settings [ SelectedViewLoaded ua settings.epoch (Ok (Just a)) ] reading
+            after settings (viewDone settings.epoch ua (Ok (Just a))) reading
     in
     offers shown ua
         && offers unlistedShown unlisted.unit.uid
@@ -793,7 +924,7 @@ foreignDecisionIsIdle settings otherEpoch a b =
             queueModel [ a, b ] (ViewShown a)
 
         stale =
-            { shown | decision = DecisionSaving ub otherEpoch }
+            { shown | decision = savingSlot otherEpoch ub }
 
         approved =
             after settings (drawnOn shown ua ApproveRow) stale
@@ -805,29 +936,29 @@ foreignDecisionIsIdle settings otherEpoch a b =
             after settings (draftOn (refusalOpened settings shown ua) ua "needs a test" ++ drawnOn shown ua RefuseSubmit) opened
 
         foreignResult =
-            after settings [ App.decisionSaved ua otherEpoch (Err (Error.conflict "boom")) ] approved
+            after settings (decisionSavedFor otherEpoch ua (Err (Error.conflict "boom"))) approved
 
         ownResult =
-            after settings [ App.decisionSaved ua settings.epoch (Err (Error.conflict "boom")) ] foreignResult
+            after settings (decisionSavedFor settings.epoch ua (Err (Error.conflict "boom"))) foreignResult
 
         entered =
-            after settings [ Navigated QueuePage ] { shown | decision = DecisionRefreshing ub otherEpoch }
+            after settings [ Navigated QueuePage ] { shown | decision = refreshingSlot otherEpoch ub }
 
         ownEntered =
-            after settings [ Navigated QueuePage ] { shown | decision = DecisionRefreshing ub settings.epoch }
+            after settings [ Navigated QueuePage ] { shown | decision = refreshingSlot settings.epoch ub }
     in
     offers shown ua
-        && DecisionSlot.startDecision settings.epoch ua (DecisionSaving ub otherEpoch) == Just (DecisionSaving ua settings.epoch)
-        && DecisionSlot.startDecision settings.epoch ua (DecisionRefreshing ub otherEpoch) == Just (DecisionSaving ua settings.epoch)
-        && DecisionSlot.startDecision settings.epoch ua (DecisionSaving ub settings.epoch) == Nothing
-        && DecisionSlot.startDecision settings.epoch ua (DecisionRefreshing ub settings.epoch) == Nothing
+        && Maybe.map Tuple.first (DecisionSlot.startDecision settings.epoch ua (savingSlot otherEpoch ub)) == Just (savingSlot settings.epoch ua)
+        && Maybe.map Tuple.first (DecisionSlot.startDecision settings.epoch ua (refreshingSlot otherEpoch ub)) == Just (savingSlot settings.epoch ua)
+        && DecisionSlot.startDecision settings.epoch ua (savingSlot settings.epoch ub) == Nothing
+        && DecisionSlot.startDecision settings.epoch ua (refreshingSlot settings.epoch ub) == Nothing
         && entered.decision == DecisionIdle PanelClosed
-        && ownEntered.decision == DecisionRefreshing ub settings.epoch
-        && approved.decision == DecisionSaving ua settings.epoch
+        && ownEntered.decision == refreshingSlot settings.epoch ub
+        && approved.decision == savingSlot settings.epoch ua
         && DecisionSlot.openPanel opened.decision == Just ( ua, { refuseDraft = Draft.empty, refuseError = Nothing } )
-        && refused.decision == DecisionSaving ua settings.epoch
+        && refused.decision == savingSlot settings.epoch ua
         && DecisionSlot.openPanel refused.decision == Nothing
-        && foreignResult.decision == DecisionSaving ua settings.epoch
+        && foreignResult.decision == savingSlot settings.epoch ua
         && DecisionSlot.notSavedOf ownResult.decision == Just SaveFailed
 
 
@@ -847,10 +978,10 @@ foreignReadIsIdle settings otherEpoch a b =
             b.unit.uid
 
         stale =
-            queueModel [ a, b ] (ViewLoading { uid = ua, wanted = Nothing, fresh = True, owner = otherEpoch })
+            queueModel [ a, b ] (readingSlot otherEpoch ua)
 
         ownSelected =
-            after settings [ SelectUnit 1 ] (queueModel [ a, b ] (ViewLoading { uid = ua, wanted = Nothing, fresh = True, owner = settings.epoch }))
+            after settings [ SelectUnit 1 ] (queueModel [ a, b ] (readingSlot settings.epoch ua))
 
         unitEntered =
             after settings [ Navigated (unitAt ub) ] stale
@@ -862,16 +993,16 @@ foreignReadIsIdle settings otherEpoch a b =
             after settings [ Navigated QueuePage ] stale
 
         queueLoaded =
-            after settings [ PendingLoaded (Slot.latestTicket reloading.queueLoad) (Ok (queuePageOf [ a, b ])) ] reloading
+            after settings (queueDone reloading.queueLoad (Ok (queuePageOf [ a, b ]))) reloading
 
         historyEntered =
             after settings [ Navigated HistoryPage ] stale
 
         foreignResult =
-            after settings [ SelectedViewLoaded ub otherEpoch (Ok (Just b)) ] selected
+            after settings (viewDone otherEpoch ub (Ok (Just b))) selected
 
         ownResult =
-            after settings [ SelectedViewLoaded ub settings.epoch (Ok (Just b)) ] foreignResult
+            after settings (viewDone settings.epoch ub (Ok (Just b))) foreignResult
     in
     inFlight unitEntered == Just ( ub, Nothing )
         && inFlight selected == Just ( ub, Nothing )
@@ -917,9 +1048,9 @@ decisionOffQueueHoldsNoSlot settings a b =
     offers shown ua
         && DecisionSlot.notSavedOf onUnitPage.decision == Just SaveOffQueue
         && DecisionSlot.notSavedOf onHistory.decision == Just SaveOffQueue
-        && onQueue.decision == DecisionSaving ua settings.epoch
-        && backOnQueue.decision == DecisionSaving ua settings.epoch
-        && savingThenOff.decision == DecisionSaving ua settings.epoch
+        && onQueue.decision == savingSlot settings.epoch ua
+        && backOnQueue.decision == savingSlot settings.epoch ua
+        && savingThenOff.decision == savingSlot settings.epoch ua
 
 
 -- ── rendered ────────────────────────────────────────────────────────────
@@ -993,16 +1124,16 @@ saveFailureRendered settings a b =
             "database is locked [5]"
 
         busy =
-            after settings [ App.decisionSaved ua settings.epoch (Err (Error.withDetails (Database Db.Busy) (Error.unexpected busyText))) ] saving
+            after settings (decisionSavedFor settings.epoch ua (Err (Error.withDetails (Database Db.Busy) (Error.unexpected busyText)))) saving
 
         otherText =
             "UNIQUE constraint failed: review_log.seq [2067]"
 
         other =
-            after settings [ App.decisionSaved ua settings.epoch (Err (Error.withDetails (Database Db.UniqueViolation) (Error.unexpected otherText))) ] saving
+            after settings (decisionSavedFor settings.epoch ua (Err (Error.withDetails (Database Db.UniqueViolation) (Error.unexpected otherText)))) saving
 
         moved =
-            after settings [ App.decisionSaved ua settings.epoch (Err LibDb.headMoved) ] saving
+            after settings (decisionSavedFor settings.epoch ua (Err LibDb.headMoved)) saving
 
         busyPage =
             page busy
@@ -1014,9 +1145,9 @@ saveFailureRendered settings a b =
             page moved
 
         changed =
-            after settings [ App.decisionSaved ua settings.epoch (Ok (Err SourceChanged)) ] saving
+            after settings (decisionSavedFor settings.epoch ua (Ok (Err SourceChanged))) saving
     in
-    saving.decision == DecisionSaving ua settings.epoch
+    saving.decision == savingSlot settings.epoch ua
         && DecisionSlot.notSavedOf busy.decision == Just SaveContended
         && String.contains "the index or review database is busy; try again" busyPage
         && not (String.contains "Unexpected" busyPage)
@@ -1169,7 +1300,7 @@ standingFailure read =
         StandingShown _ _ _ ->
             Nothing
 
-        StandingReading _ _ _ _ ->
+        StandingReading _ _ ->
             Nothing
 
 
@@ -1185,7 +1316,7 @@ queueLoadFailureTyped settings a =
             after settings [ Navigated QueuePage ] initialModel
 
         settle result =
-            after settings [ App.queueLoaded (Slot.latestTicket loading.queueLoad) result ] loading
+            after settings (queueLoadedOn loading.queueLoad result) loading
 
         busy =
             settle (Err busyMarker)
@@ -1221,7 +1352,7 @@ historyLoadFailureTyped settings =
             after settings [ Navigated HistoryPage ] initialModel
 
         settle result =
-            after settings [ App.historyLoaded (Slot.latestTicket loading.historyLoad) result ] loading
+            after settings (historyLoadedOn loading.historyLoad result) loading
 
         limit =
             settle (Err limitMarker)
@@ -1253,10 +1384,10 @@ viewLoadFailureTyped settings a b =
             a.unit.uid
 
         reading =
-            queueModel [ a, b ] (ViewLoading { uid = ua, wanted = Nothing, fresh = True, owner = settings.epoch })
+            queueModel [ a, b ] (readingSlot settings.epoch ua)
 
         settle result =
-            after settings [ App.viewLoaded ua settings.epoch result ] reading
+            after settings (viewLoadedFor settings.epoch ua result) reading
 
         plain =
             settle (Err plainMarker)
@@ -1290,7 +1421,7 @@ unitLoadFailureTyped settings a =
             after settings [ Navigated (unitAt ua) ] initialModel
 
         settle result =
-            after settings [ App.viewLoaded ua settings.epoch result ] entered
+            after settings (viewLoadedFor settings.epoch ua result) entered
 
         busy =
             settle (Err busyMarker)
@@ -1330,7 +1461,7 @@ standingLoadFailureTyped settings a =
             { shown | page = unitAt ua, standing = reading }
 
         settle result =
-            after settings [ App.standingLoaded ua (Index.storedHash a.unit.attested) settings.epoch result ] onUnitPage
+            after settings (standingLoadedFor settings.epoch ua (Index.storedHash a.unit.attested) result) onUnitPage
 
         busy =
             settle (Err busyMarker)
@@ -1380,7 +1511,7 @@ refuseDraftTyped settings a b =
     in
     Just blank.decision == idleOpen { refuseDraft = Draft.draft "   ", refuseError = Just (DraftRefused ReasonBlank) }
         && String.contains (Failure.refuseFailureText (DraftRefused ReasonBlank)) (page blank)
-        && kept.decision == DecisionSaving ua settings.epoch
+        && kept.decision == savingSlot settings.epoch ua
         && DecisionSlot.openPanel kept.decision == Nothing
         && String.contains "Saving the decision…" (page kept)
         && not (panelDrawn (page kept))
@@ -1563,7 +1694,7 @@ confirmRecordsShownText settings a b =
                 Nothing ->
                     False
            )
-        && confirmed.decision == DecisionSaving a.unit.uid settings.epoch
+        && confirmed.decision == savingSlot settings.epoch a.unit.uid
 
 
 -- A decision on a unit off the shown queue page is refused as `NotQueued`,
@@ -1656,7 +1787,7 @@ staleBannerShown : Settings.AppSettings -> Model -> DecisionSlot.DecidableRow ->
 staleBannerShown settings model clicked refused expected shown =
     let
         settled =
-            after settings [ ApproveRow clicked, App.decisionSaved (DecisionSlot.rowUid clicked) settings.epoch (Ok refused) ] model
+            after settings ([ ApproveRow clicked ] ++ decisionSavedFor settings.epoch (DecisionSlot.rowUid clicked) (Ok refused)) model
 
         html =
             page settled
@@ -1803,7 +1934,7 @@ requireUnit found =
 -- settles, so the row it was made on, still listed until then, offers no
 -- control a second decision could land on: a press by button, key or
 -- acknowledgement starts nothing, and the card says the queue is
--- refreshing. An older load's result leaves it busy; the reload settling,
+-- refreshing. Another load's result leaves it busy; the reload settling,
 -- failed or superseded by a later load, ends it. Red if a decision is idle
 -- once written while its row is still listed, or if no later load frees it.
 writtenStaysPending : Settings.AppSettings -> Index.UnitView -> Index.UnitView -> Index.RefusalRow -> ( Index.Attested, Index.Written ) -> Bool
@@ -1819,43 +1950,47 @@ writtenStaysPending settings a b file pair =
             after settings (drawnOn shown ua ApproveRow) shown
 
         written =
-            after settings [ DecisionSaved ua settings.epoch (Ok pair) ] saving
+            after settings (decisionDone settings.epoch ua (Ok pair)) saving
 
         pressed =
             after settings (drawnOn written ua ApproveRow ++ [ press written "a" ] ++ drawnOn (withRefusal file written) file.uid ApproveRow) written
 
+        otherLoad =
+            anotherLoad settings.epoch (QueueReload Index.Start) pressed.queueLoad
+
         olderLoad =
-            after settings [ PendingLoaded (Slot.latestTicket saving.queueLoad) (Ok (queuePageOf [ a, b ])) ] pressed
+            after settings (completions PendingLoaded otherLoad (Ok (queuePageOf [ a, b ]))) pressed
 
         reloaded =
-            after settings [ PendingLoaded (Slot.latestTicket written.queueLoad) (Ok (queuePageOf [ b ])) ] pressed
+            after settings (queueDone written.queueLoad (Ok (queuePageOf [ b ]))) pressed
 
         reloadFailed =
-            after settings [ App.queueLoaded (Slot.latestTicket written.queueLoad) (Err (Error.conflict "boom")) ] pressed
+            after settings (queueLoadedOn written.queueLoad (Err (Error.conflict "boom"))) pressed
 
         superseding =
             after settings [ Navigated QueuePage ] pressed
 
         drainReturned =
-            after settings [ PendingLoaded (Slot.latestTicket written.queueLoad) (Ok (queuePageOf [ a, b ])) ] superseding
+            after settings (queueDone written.queueLoad (Ok (queuePageOf [ a, b ]))) superseding
 
         superseded =
-            after settings [ PendingLoaded (Slot.latestTicket drainReturned.queueLoad) (Ok (queuePageOf [ b ])) ] drainReturned
+            after settings (queueDone drainReturned.queueLoad (Ok (queuePageOf [ b ]))) drainReturned
 
         writtenPage =
             page written
     in
     offers written ua
         && offers (withRefusal file written) file.uid
-        && written.decision == DecisionRefreshing ua settings.epoch
-        && pressed.decision == DecisionRefreshing ua settings.epoch
+        && written.decision == refreshingSlot settings.epoch ua
+        && pressed.decision == refreshingSlot settings.epoch ua
         && String.contains "Decision saved; refreshing the queue…" writtenPage
         && not (String.contains ">Approve<" writtenPage)
-        && olderLoad.decision == DecisionRefreshing ua settings.epoch
+        && otherLoad /= Nothing
+        && olderLoad.decision == refreshingSlot settings.epoch ua
         && reloaded.decision == DecisionIdle PanelClosed
         && reloadFailed.decision == DecisionIdle PanelClosed
-        && superseding.decision == DecisionRefreshing ua settings.epoch
-        && drainReturned.decision == DecisionRefreshing ua settings.epoch
+        && superseding.decision == refreshingSlot settings.epoch ua
+        && drainReturned.decision == refreshingSlot settings.epoch ua
         && superseded.decision == DecisionIdle PanelClosed
 
 
@@ -1873,16 +2008,16 @@ notSavedClearedByReload settings a b =
             queueModel [ a, b ] (ViewShown a)
 
         failed =
-            after settings (drawnOn shown ua ApproveRow ++ [ App.decisionSaved ua settings.epoch (Err (Error.conflict "boom")) ]) shown
+            after settings (drawnOn shown ua ApproveRow ++ decisionSavedFor settings.epoch ua (Err (Error.conflict "boom"))) shown
 
         reloading =
             after settings [ Navigated QueuePage ] failed
 
         reloaded =
-            after settings [ PendingLoaded (Slot.latestTicket reloading.queueLoad) (Ok (queuePageOf [ a, b ])) ] reloading
+            after settings (queueDone reloading.queueLoad (Ok (queuePageOf [ a, b ]))) reloading
 
         reloadFailed =
-            after settings [ App.queueLoaded (Slot.latestTicket reloading.queueLoad) (Err (Error.conflict "boom")) ] reloading
+            after settings (queueLoadedOn reloading.queueLoad (Err (Error.conflict "boom"))) reloading
 
         banner =
             Html.escapeHtml ("Decision not saved: " ++ Failure.saveFailureText SaveFailed)
@@ -1915,16 +2050,16 @@ notSavedOutlivesOlderLoad settings a b =
             after settings (drawnOn shown ua ApproveRow ++ [ Navigated QueuePage ]) shown
 
         failed =
-            after settings [ App.decisionSaved ua settings.epoch (Err (Error.conflict "boom")) ] enteredWhileSaving
+            after settings (decisionSavedFor settings.epoch ua (Err (Error.conflict "boom"))) enteredWhileSaving
 
         olderLoaded =
-            after settings [ PendingLoaded (Slot.latestTicket enteredWhileSaving.queueLoad) (Ok (queuePageOf [ a, b ])) ] failed
+            after settings (queueDone enteredWhileSaving.queueLoad (Ok (queuePageOf [ a, b ]))) failed
 
         reloading =
             after settings [ Navigated QueuePage ] olderLoaded
 
         reloaded =
-            after settings [ PendingLoaded (Slot.latestTicket reloading.queueLoad) (Ok (queuePageOf [ a, b ])) ] reloading
+            after settings (queueDone reloading.queueLoad (Ok (queuePageOf [ a, b ]))) reloading
 
         banner =
             Html.escapeHtml ("Decision not saved: " ++ Failure.saveFailureText SaveFailed)
@@ -1935,6 +2070,200 @@ notSavedOutlivesOlderLoad settings a b =
         && String.contains banner (page olderLoaded)
         && reloaded.decision == DecisionIdle PanelClosed
         && not (String.contains banner (page reloaded))
+
+
+-- A completion the slot does not own leaves the model unchanged, for
+-- every one of the five completions: one stamped by another process's
+-- start of the same task, one stamped by another start of this process,
+-- and one arriving at an idle slot. Each stamp comes from a real start.
+-- Red if any completion settles, restarts or clears a slot on a stamp
+-- that is not the slot's running one, epoch and key alike.
+staleCompletionDropped : Settings.AppSettings -> Epoch -> Index.UnitView -> Index.UnitView -> ( Index.Attested, Index.Written ) -> Bool
+staleCompletionDropped settings otherEpoch a b pair =
+    let
+        ua =
+            a.unit.uid
+
+        ub =
+            b.unit.uid
+
+        hashA =
+            Index.storedHash a.unit.attested
+
+        unchangedBy msgs model =
+            not (List.isEmpty msgs) && after settings msgs model == model
+
+        queuePage =
+            Ok (queuePageOf [ a ])
+
+        queueWant =
+            QueueReload Index.Start
+
+        queueRunning =
+            after settings [ Navigated QueuePage ] initialModel
+
+        queueLoad =
+            Slot.runningLoad queueRunning.queueLoad
+
+        foreignQueueLoad =
+            Slot.runningLoad (Tuple.first (Slot.requestLoad Queue.mergeQueueWant otherEpoch queueWant Slot.idleLoad))
+
+        historyPage =
+            Ok { rows = [], at = LibDb.HistoryStart, next = Nothing, log = LibDb.ShownProven }
+
+        historyWant =
+            HistoryFrom (historyAfter 1)
+
+        historyRunning =
+            after settings [ Navigated HistoryPage ] initialModel
+
+        historyLoad =
+            Slot.runningLoad historyRunning.historyLoad
+
+        foreignHistoryLoad =
+            Slot.runningLoad (Tuple.first (Slot.requestLoad Slot.latestWant otherEpoch historyWant Slot.idleLoad))
+
+        reading =
+            queueModel [ a, b ] (readingSlot settings.epoch ua)
+
+        shownOnUnitPage =
+            { reading | selectedView = ViewShown a, page = unitAt ua }
+
+        shown =
+            queueModel [ a, b ] (ViewShown a)
+
+        saving =
+            { shown | decision = savingSlot settings.epoch ua }
+
+        refreshing =
+            { shown | decision = refreshingSlot settings.epoch ua }
+
+        standing =
+            { shown | standing = standingReading settings.epoch ua hashA }
+    in
+    Maybe.map Slot.stampKey foreignQueueLoad == Maybe.map Slot.stampKey queueLoad
+        && Maybe.map Slot.stampKey foreignHistoryLoad == Maybe.map Slot.stampKey historyLoad
+        && saving.decision /= shown.decision
+        && standing.standing /= shown.standing
+        && unchangedBy (completions PendingLoaded foreignQueueLoad queuePage) queueRunning
+        && unchangedBy (completions PendingLoaded (anotherLoad settings.epoch queueWant queueRunning.queueLoad) queuePage) queueRunning
+        && unchangedBy (completions PendingLoaded queueLoad queuePage) initialModel
+        && unchangedBy (completions HistoryPageLoaded foreignHistoryLoad historyPage) historyRunning
+        && unchangedBy (completions HistoryPageLoaded (anotherLoad settings.epoch historyWant historyRunning.historyLoad) historyPage) historyRunning
+        && unchangedBy (completions HistoryPageLoaded historyLoad historyPage) initialModel
+        && unchangedBy (viewDone otherEpoch ua (Ok (Just a))) reading
+        && unchangedBy (viewDone settings.epoch ub (Ok (Just b))) reading
+        && unchangedBy (viewDone settings.epoch ua (Ok (Just a))) shown
+        && unchangedBy (viewDone settings.epoch ua (Ok (Just a))) shownOnUnitPage
+        && unchangedBy (decisionDone otherEpoch ua (Ok pair)) saving
+        && unchangedBy (decisionDone settings.epoch ub (Ok pair)) saving
+        && unchangedBy (decisionDone settings.epoch ua (Ok pair)) shown
+        && unchangedBy (decisionDone settings.epoch ua (Ok pair)) refreshing
+        && unchangedBy (decisionDone settings.epoch ua (Err SaveFailed)) refreshing
+        && unchangedBy (completions StandingLoaded (standingStamp otherEpoch ua hashA) (Ok Standing.Undecided)) standing
+        && unchangedBy (completions StandingLoaded (standingStamp settings.epoch ua "another body") (Ok Standing.Undecided)) standing
+        && unchangedBy (completions StandingLoaded (standingStamp settings.epoch ua hashA) (Ok Standing.Undecided)) shown
+
+
+-- `msgs` sent to `model` leave its queue load slot as it was, nothing
+-- started and nothing wanted; vacuous `msgs` count as a change.
+drainsNothing : Settings.AppSettings -> List Msg -> Model -> Bool
+drainsNothing settings msgs model =
+    let
+        saved =
+            after settings msgs model
+    in
+    not (List.isEmpty msgs)
+        && saved.queueLoad == model.queueLoad
+        && Slot.runningWant settings.epoch saved.queueLoad == Slot.runningWant settings.epoch model.queueLoad
+
+
+-- A saved decision's drain is asked only by the save the decision slot
+-- runs: a save result whose stamp the slot does not hold, from another
+-- process, another unit's save, or a slot already idle or refreshing,
+-- leaves the queue's load slot as it was and wants no drain, while the
+-- slot's own save wants exactly one. Red if an unowned `DecisionSaved Ok`
+-- starts or records a drain.
+unownedDecisionSavedDrainsNothing : Settings.AppSettings -> Epoch -> Index.UnitView -> Index.UnitView -> ( Index.Attested, Index.Written ) -> Bool
+unownedDecisionSavedDrainsNothing settings otherEpoch a b ( attested, written ) =
+    let
+        ua =
+            a.unit.uid
+
+        ub =
+            b.unit.uid
+
+        shown =
+            queueModel [ a, b ] (ViewShown a)
+
+        saving =
+            { shown | decision = savingSlot settings.epoch ua }
+
+        loading =
+            after settings [ Navigated QueuePage ] saving
+
+        refreshing =
+            { shown | decision = refreshingSlot settings.epoch ua }
+
+        drain =
+            Just (QueueDrain attested written Index.Start)
+
+        owned =
+            after settings (decisionDone settings.epoch ua (Ok ( attested, written ))) loading
+    in
+    drainsNothing settings (decisionDone otherEpoch ua (Ok ( attested, written ))) saving
+        && drainsNothing settings (decisionDone settings.epoch ub (Ok ( attested, written ))) saving
+        && drainsNothing settings (decisionDone otherEpoch ua (Ok ( attested, written ))) loading
+        && drainsNothing settings (decisionDone settings.epoch ub (Ok ( attested, written ))) loading
+        && drainsNothing settings (decisionDone settings.epoch ua (Ok ( attested, written ))) shown
+        && drainsNothing settings (decisionDone settings.epoch ua (Ok ( attested, written ))) refreshing
+        && Slot.runningWant settings.epoch loading.queueLoad == Just Nothing
+        && Slot.runningWant settings.epoch owned.queueLoad == Just drain
+
+
+-- A decision slot settles a save result only under its own stamp, apart
+-- from the gate `App.update` holds before it: a result another process
+-- stamped, one for another unit, or one reaching a slot that is not saving
+-- leaves the slot unchanged and wants no reload. Red if `decisionWritten`
+-- or `decisionNotSaved` settles a result its slot does not own.
+decisionSlotOwnsItsResult : Settings.AppSettings -> Epoch -> Bool
+decisionSlotOwnsItsResult settings otherEpoch =
+    let
+        ua =
+            uid "u-a"
+
+        ub =
+            uid "u-b"
+
+        latest =
+            Slot.firstTicket
+
+        saving =
+            savingSlot settings.epoch ua
+
+        refusedOn slot held =
+            case held of
+                Just arrived ->
+                    DecisionSlot.decisionWritten settings.epoch arrived slot == Nothing && DecisionSlot.decisionNotSaved settings.epoch arrived SaveFailed latest slot == slot
+
+                Nothing ->
+                    False
+
+        settledOn slot held =
+            case held of
+                Just arrived ->
+                    DecisionSlot.decisionWritten settings.epoch arrived slot == Just (refreshingSlot settings.epoch ua) && DecisionSlot.decisionNotSaved settings.epoch arrived SaveFailed latest slot == DecisionNotSaved SaveFailed latest PanelClosed
+
+                Nothing ->
+                    False
+    in
+    refusedOn saving (savingStamp otherEpoch ua)
+        && refusedOn saving (savingStamp settings.epoch ub)
+        && refusedOn (savingSlot otherEpoch ua) (savingStamp otherEpoch ua)
+        && refusedOn (DecisionIdle PanelClosed) (savingStamp settings.epoch ua)
+        && refusedOn (refreshingSlot settings.epoch ua) (savingStamp settings.epoch ua)
+        && refreshingSlot settings.epoch ua /= saving
+        && settledOn saving (savingStamp settings.epoch ua)
 
 
 -- The written-decision checks, on a decision really written through
@@ -1951,6 +2280,7 @@ writtenChecks =
         System.setenv "IPE_REVIEW_DB" at.reviewDb
         db <- migratedReviewAt at.reviewDb
         settings <- envAppSettings
+        otherEpoch <- Epoch.mint
         a <- loadUnitNow (uid "u-a") |> Task.andThen requireUnit
         b <- loadUnitNow (uid "u-b") |> Task.andThen requireUnit
         file <- linkRow
@@ -1961,6 +2291,9 @@ writtenChecks =
             [ ( "a saved decision withholds its row's controls until the queue reload settles", writtenStaysPending settings a b file pair )
             , ( "a decision saved during a queue load stays refreshing until its drain settles", refreshingSettlesOnlyAfterWrite settings a b pair )
             , ( "a wanted drain absorbs a page turn and replaces a wanted reload", drainAbsorbsReload settings pair )
+            , ( "a completion its slot does not own leaves the model unchanged, for each of the five completions", staleCompletionDropped settings otherEpoch a b pair )
+            , ( "a saved decision whose stamp its slot does not hold drains nothing", unownedDecisionSavedDrainsNothing settings otherEpoch a b pair )
+            , ( "a decision slot settles only the save result its own stamp names", decisionSlotOwnsItsResult settings otherEpoch )
             ]
 
 
@@ -1972,6 +2305,7 @@ checks =
         (check "a decision off the shown list or source is refused before any read" decisionRefusedBeforeReading)
         |> Task.andThen (\rows -> check "Enter in an unreviewable file's refusal panel submits that file's refusal" enterRefusesOpenFile |> Task.map (\entered -> rows ++ [ entered ]))
         |> Task.andThen (\rows -> check "every task in src starts at its slot's one start site" everyTaskStartsAtItsSlot |> Task.map (\scanned -> rows ++ [ scanned ]))
+        |> Task.andThen (\rows -> check "every completion stamp in src is minted at its slot's one start" everyStampMintedAtItsStart |> Task.map (\scanned -> rows ++ [ scanned ]))
 
 
 -- Enter in the refusal panel open on an acknowledgeable file the page lists
@@ -2007,7 +2341,7 @@ enteredOnFile settings listed =
     in
     Maybe.map DecisionSlot.rowTarget (App.decidableRow listed file) == Just OnRefusal
         && DecisionSlot.openPanel drafted.decision == Just ( file, { refuseDraft = Draft.draft "not ours", refuseError = Nothing } )
-        && entered.decision == DecisionSaving file settings.epoch
+        && entered.decision == savingSlot settings.epoch file
         && DecisionSlot.openPanel entered.decision == Nothing
 
 
@@ -2080,9 +2414,9 @@ reshownCard r =
             queueModel [ r.a, r.b ] (ViewShown r.a)
 
         reading =
-            { shown | selectedView = ViewLoading { uid = r.a.unit.uid, wanted = Nothing, fresh = True, owner = r.settings.epoch } }
+            { shown | selectedView = readingSlot r.settings.epoch r.a.unit.uid }
     in
-    ( shown, after r.settings [ SelectedViewLoaded r.a.unit.uid r.settings.epoch (Ok (Just r.a2)) ] reading )
+    ( shown, after r.settings (viewDone r.settings.epoch r.a.unit.uid (Ok (Just r.a2))) reading )
 
 
 -- An approval drawn on `a` and received after the card's source was read
@@ -2106,7 +2440,7 @@ staleApproveAfterSourceReloadDecidesNothing r =
         && offers reloaded ua
         && App.decidableRow shown ua /= App.decidableRow reloaded ua
         && DecisionSlot.notSavedOf stale.decision == Just (SaveRefused DrawnChanged)
-        && stale.decision /= DecisionSaving ua r.settings.epoch
+        && stale.decision /= savingSlot r.settings.epoch ua
         && String.contains (Html.escapeHtml ("Decision not saved: " ++ Failure.saveFailureText (SaveRefused DrawnChanged))) (page stale)
 
 
@@ -2126,7 +2460,7 @@ freshApproveAfterSourceReloadSaves r =
             after r.settings (drawnOn stale ua ApproveRow) stale
     in
     offers stale ua
-        && fresh.decision == DecisionSaving ua r.settings.epoch
+        && fresh.decision == savingSlot r.settings.epoch ua
 
 
 -- The approve key carries the offers of the render it was pressed on: a
@@ -2144,7 +2478,7 @@ staleKeyApproveDecidesNothing r =
             reshownCard r
 
         reading =
-            { shown | selectedView = ViewLoading { uid = ua, wanted = Nothing, fresh = True, owner = r.settings.epoch } }
+            { shown | selectedView = readingSlot r.settings.epoch ua }
 
         staleKey =
             after r.settings [ press shown "a" ] reloaded
@@ -2156,8 +2490,8 @@ staleKeyApproveDecidesNothing r =
         && not (offers reading ua)
         && DecisionSlot.notSavedOf staleKey.decision == Just (SaveRefused DrawnChanged)
         && DecisionSlot.notSavedOf undrawnKey.decision == Just (SaveRefused DrawnChanged)
-        && staleKey.decision /= DecisionSaving ua r.settings.epoch
-        && undrawnKey.decision /= DecisionSaving ua r.settings.epoch
+        && staleKey.decision /= savingSlot r.settings.epoch ua
+        && undrawnKey.decision /= savingSlot r.settings.epoch ua
 
 
 -- The approve key pressed while `a` was selected never decides `b`, the
@@ -2179,15 +2513,15 @@ keyApproveNeverDecidesUndrawnSelection r =
             after r.settings [ SelectUnit 1 ] shown
 
         settled =
-            after r.settings [ SelectedViewLoaded ub r.settings.epoch (Ok (Just r.b)) ] moved
+            after r.settings (viewDone r.settings.epoch ub (Ok (Just r.b))) moved
 
         keyed =
             after r.settings [ press shown "a" ] settled
     in
     offers shown ua
         && offers settled ub
-        && keyed.decision /= DecisionSaving ub r.settings.epoch
-        && keyed.decision /= DecisionSaving ua r.settings.epoch
+        && keyed.decision /= savingSlot r.settings.epoch ub
+        && keyed.decision /= savingSlot r.settings.epoch ua
         && DecisionSlot.notSavedOf keyed.decision == Just (SaveRefused SourceNotShown)
 
 
@@ -2211,7 +2545,7 @@ staleAckAfterDigestChangeDecidesNothing r =
             queuePageOf [ r.a, r.b ]
 
         reloaded =
-            after r.settings [ PendingLoaded (Slot.latestTicket reloading.queueLoad) (Ok { changedPage | refusals = [ r.file2 ] }) ] reloading
+            after r.settings (queueDone reloading.queueLoad (Ok { changedPage | refusals = [ r.file2 ] })) reloading
 
         stale =
             after r.settings (drawnOn listed fileUid ApproveRow) reloaded
@@ -2223,8 +2557,8 @@ staleAckAfterDigestChangeDecidesNothing r =
         && offers listed fileUid
         && offers reloaded fileUid
         && DecisionSlot.notSavedOf stale.decision == Just (SaveRefused DrawnChanged)
-        && stale.decision /= DecisionSaving fileUid r.settings.epoch
-        && fresh.decision == DecisionSaving fileUid r.settings.epoch
+        && stale.decision /= savingSlot r.settings.epoch fileUid
+        && fresh.decision == savingSlot r.settings.epoch fileUid
 
 
 -- A refusal drawn on `a` and received after the read settled `a2` opens no
@@ -2282,7 +2616,7 @@ confirmRefuseBindsDrawnPanelRow r =
     in
     panelKeysDrawn drafted
         && fileOffer /= Nothing
-        && confirmed.decision == DecisionSaving ua r.settings.epoch
+        && confirmed.decision == savingSlot r.settings.epoch ua
         && withPanel (App.decidableRow shown ua) == drafted
         && withPanel fileOffer == drafted
         && clickedFile == drafted
@@ -2353,7 +2687,7 @@ keyOffersFollowTheDrawing r =
             after r.settings (drawnOn shown ua RefuseStart) shown
 
         reading =
-            { shown | selectedView = ViewLoading { uid = ua, wanted = Nothing, fresh = True, owner = r.settings.epoch } }
+            { shown | selectedView = readingSlot r.settings.epoch ua }
 
         loading =
             after r.settings [ NextPage Index.Start ] shown
@@ -2676,19 +3010,23 @@ supersededQueueResultDropped settings a b =
         first =
             Slot.latestTicket running.queueLoad
 
+        firstLoad =
+            Slot.runningLoad running.queueLoad
+
         wanting =
             after settings [ NextPage (cursorAfter 2 "u-b") ] running
 
         dropped =
-            after settings [ PendingLoaded first (Ok (queuePageOf [ a, b ])) ] wanting
+            after settings (completions PendingLoaded firstLoad (Ok (queuePageOf [ a, b ]))) wanting
 
         late =
-            after settings [ PendingLoaded first (Ok (queuePageOf [ a, b ])) ] dropped
+            after settings (completions PendingLoaded firstLoad (Ok (queuePageOf [ a, b ]))) dropped
 
         settled =
-            after settings [ PendingLoaded (Slot.latestTicket dropped.queueLoad) (Ok (queuePageOf [ b ])) ] late
+            after settings (queueDone dropped.queueLoad (Ok (queuePageOf [ b ]))) late
     in
-    dropped.queueState == Loading
+    firstLoad /= Nothing
+        && dropped.queueState == Loading
         && Slot.latestTicket dropped.queueLoad == Slot.nextTicket first
         && Slot.runningWant settings.epoch dropped.queueLoad == Just Nothing
         && late.queueState == Loading
@@ -2714,16 +3052,16 @@ refreshingSettlesOnlyAfterWrite settings a b ( attested, written ) =
             after settings (drawnOn shown ua ApproveRow ++ [ Navigated QueuePage ]) shown
 
         saved =
-            after settings [ DecisionSaved ua settings.epoch (Ok ( attested, written )) ] loadingWhileSaving
+            after settings (decisionDone settings.epoch ua (Ok ( attested, written ))) loadingWhileSaving
 
         preWrite =
-            after settings [ PendingLoaded (Slot.latestTicket loadingWhileSaving.queueLoad) (Ok (queuePageOf [ a, b ])) ] saved
+            after settings (queueDone loadingWhileSaving.queueLoad (Ok (queuePageOf [ a, b ]))) saved
 
         drained =
-            after settings [ PendingLoaded (Slot.latestTicket preWrite.queueLoad) (Ok (queuePageOf [ b ])) ] preWrite
+            after settings (queueDone preWrite.queueLoad (Ok (queuePageOf [ b ]))) preWrite
     in
     Slot.runningWant settings.epoch saved.queueLoad == Just (Just (QueueDrain attested written Index.Start))
-        && preWrite.decision == DecisionRefreshing ua settings.epoch
+        && preWrite.decision == refreshingSlot settings.epoch ua
         && not (String.contains ">Approve<" (page preWrite))
         && Slot.runningWant settings.epoch preWrite.queueLoad == Just Nothing
         && drained.decision == DecisionIdle PanelClosed
@@ -2733,7 +3071,8 @@ refreshingSettlesOnlyAfterWrite settings a b ( attested, written ) =
 -- A wanted drain absorbs a reload asked after it, taking the reload's
 -- cursor, and a drain asked after a wanted reload replaces it: no saved
 -- decision's drain is lost to a page turn. Red if a reload drops the
--- drain it follows, for each of the four merge pairs.
+-- drain it follows, for each of the four merge pairs. The save is started
+-- on the slot, so its own completion is the one that drains.
 drainAbsorbsReload : Settings.AppSettings -> ( Index.Attested, Index.Written ) -> Bool
 drainAbsorbsReload settings ( attested, written ) =
     let
@@ -2743,17 +3082,20 @@ drainAbsorbsReload settings ( attested, written ) =
         c2 =
             cursorAfter 2 "u-b"
 
-        running =
-            after settings [ Navigated QueuePage ] initialModel
-
         ua =
             uid "u-a"
 
+        queued =
+            after settings [ Navigated QueuePage ] initialModel
+
+        running =
+            { queued | decision = savingSlot settings.epoch ua }
+
         drainThenPage =
-            after settings [ DecisionSaved ua settings.epoch (Ok ( attested, written )), NextPage c2 ] running
+            after settings (decisionDone settings.epoch ua (Ok ( attested, written )) ++ [ NextPage c2 ]) running
 
         pageThenDrain =
-            after settings [ NextPage c2, DecisionSaved ua settings.epoch (Ok ( attested, written )) ] running
+            after settings ([ NextPage c2 ] ++ decisionDone settings.epoch ua (Ok ( attested, written ))) running
     in
     Queue.mergeQueueWant (QueueDrain attested written c1) (QueueReload c2) == QueueDrain attested written c2
         && Queue.mergeQueueWant (QueueReload c1) (QueueDrain attested written c2) == QueueDrain attested written c2
@@ -2764,7 +3106,7 @@ drainAbsorbsReload settings ( attested, written ) =
 
 
 -- History shown again and paged while a History load runs starts no second
--- load: only the last page asked for is wanted. A result under an older
+-- load: only the last page asked for is wanted. A result under another
 -- ticket changes nothing, the running load's result is dropped for the
 -- want, and the want's page settles the History. Red if a press starts a
 -- second History load or a superseded page is shown.
@@ -2777,6 +3119,12 @@ historyLoadsSingleFlight settings =
         first =
             Slot.latestTicket running.historyLoad
 
+        firstLoad =
+            Slot.runningLoad running.historyLoad
+
+        otherLoad =
+            anotherLoad settings.epoch (HistoryFrom (historyAfter 1)) running.historyLoad
+
         pressed =
             after settings [ ShowHistory, HistoryNext (historyAfter 1), HistoryNext (historyAfter 2) ] running
 
@@ -2784,15 +3132,18 @@ historyLoadsSingleFlight settings =
             { rows = [], at = LibDb.HistoryStart, next = Nothing, log = LibDb.ShownProven }
 
         stale =
-            after settings [ App.historyLoaded (Slot.latestTicket initialModel.historyLoad) (Ok historyPage) ] pressed
+            after settings (completions App.historyLoaded otherLoad (Ok historyPage)) pressed
 
         dropped =
-            after settings [ App.historyLoaded first (Ok historyPage) ] stale
+            after settings (completions App.historyLoaded firstLoad (Ok historyPage)) stale
 
         settled =
-            after settings [ App.historyLoaded (Slot.latestTicket dropped.historyLoad) (Ok { historyPage | at = historyAfter 2 }) ] dropped
+            after settings (historyLoadedOn dropped.historyLoad (Ok { historyPage | at = historyAfter 2 })) dropped
     in
-    Slot.latestTicket pressed.historyLoad == first
+    otherLoad /= Nothing
+        && Maybe.map Slot.stampKey otherLoad == Just (Slot.nextTicket first)
+        && firstLoad /= Nothing
+        && Slot.latestTicket pressed.historyLoad == first
         && Slot.runningWant settings.epoch pressed.historyLoad == Just (Just (HistoryFrom (historyAfter 2)))
         && stale.history == HistoryLoading
         && Slot.latestTicket stale.historyLoad == first
@@ -2824,24 +3175,24 @@ standingSingleFlight settings a b =
             Index.storedHash b.unit.attested
 
         reading =
-            after settings [ Navigated (unitAt ua), SelectedViewLoaded ua settings.epoch (Ok (Just a)) ] (queueModel [ a, b ] NoneSelected)
+            after settings ([ Navigated (unitAt ua) ] ++ viewDone settings.epoch ua (Ok (Just a))) (queueModel [ a, b ] NoneSelected)
 
         second =
-            after settings [ Navigated (unitAt ub), SelectedViewLoaded ub settings.epoch (Ok (Just b)) ] reading
+            after settings ([ Navigated (unitAt ub) ] ++ viewDone settings.epoch ub (Ok (Just b))) reading
 
         firstReturned =
-            after settings [ App.standingLoaded ua hashA settings.epoch (Ok Standing.Undecided) ] second
+            after settings (standingLoadedFor settings.epoch ua hashA (Ok Standing.Undecided)) second
 
         stale =
-            after settings [ App.standingLoaded ua hashA settings.epoch (Ok Standing.Undecided) ] firstReturned
+            after settings (standingLoadedFor settings.epoch ua hashA (Ok Standing.Undecided)) firstReturned
 
         shown =
-            after settings [ App.standingLoaded ub hashB settings.epoch (Ok Standing.Undecided) ] stale
+            after settings (standingLoadedFor settings.epoch ub hashB (Ok Standing.Undecided)) stale
     in
-    reading.standing == StandingReading ua hashA settings.epoch Nothing
-        && second.standing == StandingReading ua hashA settings.epoch (Just ( ub, hashB ))
-        && firstReturned.standing == StandingReading ub hashB settings.epoch Nothing
-        && stale.standing == StandingReading ub hashB settings.epoch Nothing
+    reading.standing == standingReading settings.epoch ua hashA
+        && second.standing == Tuple.first (Standing.standingRequested settings.epoch ub hashB (standingReading settings.epoch ua hashA))
+        && firstReturned.standing == standingReading settings.epoch ub hashB
+        && stale.standing == standingReading settings.epoch ub hashB
         && shown.standing == StandingShown ub hashB Standing.Undecided
 
 
@@ -2858,11 +3209,19 @@ foreignLoadSlotIdle settings otherEpoch a =
         foreignTicket =
             Slot.latestTicket foreignSlot
 
+        foreignLoad =
+            Slot.runningLoad foreignSlot
+
         ( _, started ) =
             Slot.requestLoad Queue.mergeQueueWant settings.epoch (QueueReload Index.Start) foreignSlot
 
         ( settle, kept, startedOnArrival ) =
-            Slot.loadArrived settings.epoch foreignTicket foreignSlot
+            case foreignLoad of
+                Just arrivedLoad ->
+                    Slot.loadArrived settings.epoch arrivedLoad foreignSlot
+
+                Nothing ->
+                    ( Settles, Slot.idleLoad, Nothing )
 
         held =
             { initialModel | queueLoad = foreignSlot }
@@ -2871,7 +3230,7 @@ foreignLoadSlotIdle settings otherEpoch a =
             after settings [ Navigated QueuePage ] held
 
         arrived =
-            after settings [ PendingLoaded foreignTicket (Ok (queuePageOf [ a ])) ] held
+            after settings (completions PendingLoaded foreignLoad (Ok (queuePageOf [ a ]))) held
 
         ua =
             a.unit.uid
@@ -2880,17 +3239,26 @@ foreignLoadSlotIdle settings otherEpoch a =
             Index.storedHash a.unit.attested
 
         foreignRead =
-            StandingReading ua hashA otherEpoch Nothing
+            standingReading otherEpoch ua hashA
+
+        foreignArrived =
+            case Standing.runningStanding foreignRead of
+                Just reading ->
+                    Standing.standingArrived settings.epoch reading (Ok Standing.Undecided) foreignRead
+
+                Nothing ->
+                    ( StandingUnread, Nothing )
     in
-    started == Just ( Slot.nextTicket foreignTicket, QueueReload Index.Start )
+    Maybe.map (\( load, want ) -> ( Slot.stampKey load, want )) started == Just ( Slot.nextTicket foreignTicket, QueueReload Index.Start )
         && settle == Dropped
         && kept == foreignSlot
         && startedOnArrival == Nothing
         && Slot.latestTicket entered.queueLoad == Slot.nextTicket foreignTicket
         && Slot.runningWant settings.epoch entered.queueLoad == Just Nothing
         && arrived.queueState == Loading
-        && Standing.standingRequested settings.epoch ua hashA foreignRead == ( StandingReading ua hashA settings.epoch Nothing, Just ( ua, hashA ) )
-        && Standing.standingArrived settings.epoch ua hashA (Ok Standing.Undecided) foreignRead == ( foreignRead, Nothing )
+        && foreignLoad /= Nothing
+        && Standing.standingRequested settings.epoch ua hashA foreignRead == Standing.standingRequested settings.epoch ua hashA StandingUnread
+        && foreignArrived == ( foreignRead, Nothing )
 
 
 -- A running load answered with an error, the shape a refused task settles
@@ -2906,8 +3274,11 @@ ceilingRefusalReleasesSlot settings =
         first =
             Slot.latestTicket running.queueLoad
 
+        firstLoad =
+            Slot.runningLoad running.queueLoad
+
         refused =
-            after settings [ App.queueLoaded first (Err limitMarker) ] running
+            after settings (completions App.queueLoaded firstLoad (Err limitMarker)) running
 
         pressedAfter =
             after settings [ Navigated QueuePage ] refused
@@ -2916,7 +3287,7 @@ ceilingRefusalReleasesSlot settings =
             after settings [ NextPage (cursorAfter 2 "u-b") ] running
 
         refusedWithWant =
-            after settings [ App.queueLoaded first (Err limitMarker) ] wanting
+            after settings (completions App.queueLoaded firstLoad (Err limitMarker)) wanting
     in
     queueFailure refused.queueState == Just LoadPastLimit
         && Slot.runningWant settings.epoch refused.queueLoad == Nothing
@@ -3025,4 +3396,175 @@ everyTaskStartsAtItsSlot =
                     && List.all (\( path, text ) -> List.isEmpty (strayTaskStarts (sitesOf path) text)) modules
                     && List.all (\site -> List.member site names) taskStartSites
                     && everyTaskStartsAtItsSlotFixtures
+            )
+
+
+-- ── every stamp is minted at its slot's start ───────────────────────────
+-- A completion stamp is made only by `Slot.stamp`, and `Slot.stamp` is
+-- called only inside each slot's one start definition; `Lib/Slot.ipe`
+-- exposes `Stamp` without its constructor, so no other module builds one.
+-- The modules are lexed as Ipê reads them, so a mention in a comment or a
+-- string is no site.
+stampMintSites : List ( String, String )
+stampMintSites =
+    [ ( "Lib/Slot.ipe", "startLoad" ), ( "Lib/Selected.ipe", "startView" ), ( "Lib/Standing.ipe", "startStanding" ), ( "Lib/DecisionSlot.ipe", "startDecision" ) ]
+
+
+-- The module, relative to `src`, that defines `Stamp` and `stamp`.
+stampModule : String
+stampModule =
+    "Lib/Slot.ipe"
+
+
+-- The declarations of the module at `path` that mint a stamp outside its
+-- start site, the imports of `Lib.Slot` that expose `stamp`, and the
+-- `Stamp` constructor if the stamp module exposes it.
+strayStampMints : String -> String -> List String
+strayStampMints path text =
+    let
+        lexed =
+            TextSinkScanTests.lex text
+
+        slotImports =
+            List.filter (\i -> i.moduleName == "Lib.Slot") lexed.imports
+
+        qualified =
+            [ "Lib.Slot.stamp" ] ++ List.map (\i -> i.qualifier ++ ".stamp") slotImports
+
+        sites =
+            List.filterMap
+                (\( site, name ) ->
+                    if site == path then
+                        Just name
+
+                    else
+                        Nothing
+                )
+                stampMintSites
+
+        bare =
+            path == stampModule
+
+        stray =
+            List.filter (\token -> token.kind == TextSinkScanTests.WordToken && (List.member token.text qualified || (bare && token.text == "stamp" && token.name /= "stamp" && token.name /= "module")) && not (List.member token.name sites)) lexed.code
+
+        exposingMint =
+            List.filter (\i -> i.opensAll || List.member "stamp" i.exposed) slotImports
+
+        header =
+            List.filter (\token -> token.name == "module") lexed.tokens
+
+        constructed =
+            if bare then
+                .hits (List.foldl constructorStep { name = "", past = False, hits = [] } lexed.code)
+
+            else
+                []
+    in
+    List.map .name stray
+        ++ constructed
+        ++ List.map .moduleName exposingMint
+        ++ (if path == stampModule && opensStamp header then
+                [ "Stamp(..)" ]
+
+            else
+                []
+           )
+        ++ (if lexed.broken then
+                [ "a literal left open" ]
+
+            else
+                []
+           )
+
+
+-- The declarations of the stamp module that may name the `Stamp`
+-- constructor past their `=`: the type declarations, `stamp`, the one
+-- construction, and `stampKey`, `running` and `owns`, which only match it.
+stampConstructorSites : List String
+stampConstructorSites =
+    [ "type", "stamp", "stampKey", "running", "owns" ]
+
+
+-- One code token of the stamp module, read in order: a `Stamp` word past
+-- the `=` of a declaration not in `stampConstructorSites` builds a stamp
+-- outside `stamp`, and its declaration is a hit. A signature names the
+-- type before the `=`, so it is no hit.
+constructorStep : TextSinkScanTests.Token -> { name : String, past : Bool, hits : List String } -> { name : String, past : Bool, hits : List String }
+constructorStep token state =
+    let
+        past =
+            (token.kind == TextSinkScanTests.Punctuation && token.text == "=") || (token.name == state.name && state.past)
+
+        hits =
+            if past && token.kind == TextSinkScanTests.WordToken && token.text == "Stamp" && not (List.member token.name stampConstructorSites) then
+                state.hits ++ [ token.name ]
+
+            else
+                state.hits
+    in
+    { name = token.name, past = past, hits = hits }
+
+
+-- Whether a `Stamp` token is followed by `(`, its constructors opened.
+opensStamp : List TextSinkScanTests.Token -> Bool
+opensStamp toks =
+    case toks of
+        first :: rest ->
+            case rest of
+                second :: _ ->
+                    (first.text == "Stamp" && second.text == "(") || opensStamp rest
+
+                [] ->
+                    False
+
+        [] ->
+            False
+
+
+stampFixture : String
+stampFixture =
+    "module Fixture exposing (startView)\n\nimport Lib.Slot as Slot\n\n\n-- Slot.stamp in a comment mints nothing\nstartView epoch uid =\n    ( Slot.stamp epoch uid, \"Slot.stamp\" )\n"
+
+
+slotFixture : String
+slotFixture =
+    "module Lib.Slot exposing (Stamp, stamp)\n\n\ntype Stamp key\n    = Stamp Epoch key\n\n\nstamp : Epoch -> key -> Stamp key\nstamp epoch key =\n    Stamp epoch key\n\n\nstartLoad epoch latest =\n    stamp epoch latest\n"
+
+
+-- Red cases: a mint in another definition, qualified, fully qualified or
+-- under a renamed import; a start site's name in another module; an import
+-- exposing `stamp`, by name or by `(..)`; a bare mint in the stamp module
+-- outside `startLoad`; the stamp module exposing `Stamp(..)`; and the
+-- `Stamp` constructor built in a declaration of the stamp module other
+-- than `stamp`, while a signature naming the type is clean.
+everyStampMintedAtItsStartFixtures : Bool
+everyStampMintedAtItsStartFixtures =
+    strayStampMints "Lib/Selected.ipe" stampFixture == []
+        && strayStampMints "Lib/Selected.ipe" (stampFixture ++ "\n\nelsewhere epoch uid =\n    Slot.stamp epoch uid\n") == [ "elsewhere" ]
+        && strayStampMints "Lib/Selected.ipe" (stampFixture ++ "\n\nelsewhere epoch uid =\n    Lib.Slot.stamp epoch uid\n") == [ "elsewhere" ]
+        && strayStampMints "Lib/App.ipe" (String.replace "Slot.stamp epoch" "S.stamp epoch" (String.replace "as Slot" "as S" stampFixture)) == [ "startView" ]
+        && strayStampMints "Lib/App.ipe" stampFixture == [ "startView" ]
+        && strayStampMints "Lib/Selected.ipe" (String.replace "as Slot" "as Slot exposing (stamp)" stampFixture) == [ "Lib.Slot" ]
+        && strayStampMints "Lib/Selected.ipe" (String.replace "as Slot" "as Slot exposing (..)" stampFixture) == [ "Lib.Slot" ]
+        && strayStampMints stampModule slotFixture == []
+        && strayStampMints stampModule (slotFixture ++ "\n\nother epoch key =\n    stamp epoch key\n") == [ "other" ]
+        && strayStampMints stampModule (String.replace "exposing (Stamp," "exposing (Stamp(..)," slotFixture) == [ "Stamp(..)" ]
+        && strayStampMints stampModule (slotFixture ++ "\n\nforge : Epoch -> key -> Stamp key\nforge e k =\n    Stamp e k\n") == [ "forge" ]
+        && strayStampMints stampModule (slotFixture ++ "\n\nheld : Stamp key -> Maybe (Stamp key)\nheld s =\n    Just s\n") == []
+
+
+-- Every module of `src`, read through the text-sink scan's bounded reader,
+-- mints stamps only at the start sites, every start site is a definition
+-- of its module, and the fixtures go red. Red if a completion stamp can be
+-- built anywhere but a slot's start.
+everyStampMintedAtItsStart : Task.Task Error Bool
+everyStampMintedAtItsStart =
+    TextSinkScanTests.srcSources
+        |> Task.map
+            (\modules ->
+                List.any (\( path, _ ) -> path == stampModule) modules
+                    && List.all (\( path, text ) -> List.isEmpty (strayStampMints path text)) modules
+                    && List.all (\( site, name ) -> List.any (\( path, text ) -> path == site && List.any (\token -> token.name == name) (TextSinkScanTests.lex text).code) modules) stampMintSites
+                    && everyStampMintedAtItsStartFixtures
             )
