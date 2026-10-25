@@ -193,12 +193,16 @@ fn a_debug_rendered_browser_error_trips_the_scan() {
             }
         }
     "#;
-    let ScanOutcome::Scanned(findings) = scan(source) else {
-        assert!(matches!(scan(source), ScanOutcome::Scanned(_)));
-        return;
-    };
-    assert!(findings.contains(&Finding::Macro("format".to_owned())));
-    assert!(findings.contains(&Finding::UntypedErr));
+    let outcome = scan(source);
+    assert!(
+        matches!(
+            &outcome,
+            ScanOutcome::Scanned(findings)
+                if findings.contains(&Finding::Macro("format".to_owned()))
+                    && findings.contains(&Finding::UntypedErr)
+        ),
+        "{outcome:?}"
+    );
 }
 
 #[test]
@@ -227,11 +231,10 @@ fn a_converted_foreign_error_trips_the_scan() {
             IpeResult::Err(e.into())
         }
     ";
-    let ScanOutcome::Scanned(findings) = scan(source) else {
-        assert!(matches!(scan(source), ScanOutcome::Scanned(_)));
-        return;
-    };
-    assert_eq!(findings, vec![Finding::UntypedErr]);
+    assert_eq!(
+        scan(source),
+        ScanOutcome::Scanned(vec![Finding::UntypedErr])
+    );
 }
 
 #[test]
