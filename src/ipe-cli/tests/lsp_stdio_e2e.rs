@@ -114,7 +114,10 @@ fn stdio_server_serves_live_diagnostics_for_a_real_project() {
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).expect("create project dir");
     let dir = std::fs::canonicalize(&dir).expect("canonical project dir");
-    let main_path: PathBuf = dir.join("Main.ipe");
+    std::fs::write(dir.join("package.ipe"), support::package_ipe("lsp-e2e"))
+        .expect("write package.ipe");
+    std::fs::create_dir_all(dir.join("src")).expect("create src dir");
+    let main_path: PathBuf = dir.join("src").join("Main.ipe");
     std::fs::write(&main_path, CLEAN).expect("write Main.ipe");
     let uri = format!("file://{}", main_path.display());
 
