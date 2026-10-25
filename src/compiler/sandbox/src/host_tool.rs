@@ -459,11 +459,16 @@ mod tests {
         std::fs::create_dir_all(&real).expect("real dir");
         plant(&planted, OsStr::new("timeout"), 0o755);
         plant(&real, OsStr::new("timeout"), 0o755);
-        let path = path_var(&[OsStr::new("planted"), real.as_os_str()]);
+        let rel = crate::test_dir::relative_spelling(&planted);
+        assert!(
+            rel.join("timeout").is_file(),
+            "the plant is reachable through {rel:?}"
+        );
+        let path = path_var(&[rel.as_os_str(), real.as_os_str()]);
         let found = resolve_in(&path, HostTool::Timeout, Regime::Unix).expect("real timeout");
         assert_eq!(found.dir(), real.as_path());
-        let refusal = resolve_in(OsStr::new("planted"), HostTool::Timeout, Regime::Unix)
-            .expect_err("relative");
+        let refusal =
+            resolve_in(rel.as_os_str(), HostTool::Timeout, Regime::Unix).expect_err("relative");
         assert_eq!(skipped(&refusal), Some(1));
     }
 

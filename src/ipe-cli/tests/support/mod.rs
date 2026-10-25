@@ -727,11 +727,13 @@ pub fn run_with_stdin_deadline(
     let started = std::time::Instant::now();
     let stdout = child.stdout.take().map(drain_on_thread);
     let stderr = child.stderr.take().map(drain_on_thread);
-    // Dropping the handle after the write closes stdin, so the child sees EOF.
-    let wrote = child
-        .stdin
-        .take()
-        .map(|mut stdin| stdin.write_all(stdin_bytes));
+    // The write runs on its own thread so a child that stops reading cannot
+    // hold the caller past `deadline`; the thread drops the handle after the
+    // write, which closes stdin, so the child sees EOF.
+    let feed = child.stdin.take().map(|mut stdin| {
+        let bytes = stdin_bytes.to_vec();
+        std::thread::Builder::new().spawn(move || stdin.write_all(&bytes))
+    });
 
     let mut polled = Ok(None);
     while started.elapsed() < deadline {
@@ -749,6 +751,14 @@ pub fn run_with_stdin_deadline(
     }
     let stdout = stdout.map_or_else(String::new, join_drain);
     let stderr = stderr.map_or_else(String::new, join_drain);
+    // The child has exited or been reaped, so a pending write returns
+    // `BrokenPipe` instead of blocking the join.
+    let wrote = feed.map(|spawned| {
+        spawned
+            .map_err(|e| format!("stdin writer not spawned: {e}"))
+            .and_then(|h| h.join().map_err(|_| String::from("stdin writer panicked")))
+            .and_then(|w| w.map_err(|e| e.to_string()))
+    });
     assert!(
         polled.is_ok(),
         "{golden_name}: failed to poll `{exe}`: {:?}",

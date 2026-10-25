@@ -1099,8 +1099,19 @@ mod tests {
                     .expect("mode");
             }
         }
+        #[cfg(unix)]
+        let planted_entry = {
+            let rel = crate::test_dir::relative_spelling(&planted);
+            assert!(
+                rel.join("timeout").is_file(),
+                "the plant is reachable through {rel:?}"
+            );
+            rel
+        };
+        #[cfg(not(unix))]
+        let planted_entry = std::path::PathBuf::from("planted");
         let relative =
-            std::env::join_paths([OsStr::new("planted"), OsStr::new("."), OsStr::new("")])
+            std::env::join_paths([planted_entry.as_os_str(), OsStr::new("."), OsStr::new("")])
                 .expect("no separator inside an entry");
         let caps = probe_in(&relative);
         assert_eq!(caps, Capabilities::default());

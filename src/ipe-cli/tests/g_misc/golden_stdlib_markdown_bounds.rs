@@ -1,7 +1,8 @@
 //! `Ipe.Markdown` parses adversarial input in linear time on a bounded stack.
 //!
-//! Quotes nest at most `MAX_BLOCKQUOTE_DEPTH` deep. One Ipê program, built once per test, reads a single `case n` line from
-//! stdin, builds the input with `String.repeat`, parses it, and prints a digest
+//! Quotes nest at most `MAX_BLOCKQUOTE_DEPTH` deep. One Ipê program, built
+//! once per test, reads a single `case n` line from stdin, builds the input
+//! with `String.repeat`, parses it, and prints a digest
 //! `case:count:firstTag:lastTag:lastSize[:depth]`. The expected digest comes
 //! from the `ipe_docs` port on the identical input (the port is pinned equal to
 //! the Ipê source by the parity snapshot), and the count, tags and depth are
@@ -649,11 +650,56 @@ fn doubling_is_linear() {
             base = parse_time(&exe, case, n, startup);
         }
         let quadrupled = parse_time(&exe, case, 4 * n, startup);
-        let ratio = quadrupled.as_secs_f64() / base.as_secs_f64().max(1e-3);
+        // A case still under `floor` at `cap` is noise-dominated; dividing by
+        // `floor` keeps that noise from reading as growth.
+        let ratio = quadrupled.as_secs_f64() / base.max(floor).as_secs_f64();
         assert!(
             ratio <= 6.0,
             "`{}`: t(4n)/t(n) = {ratio:.2} at n = {n} ({base:?} -> {quadrupled:?}); linear is about 4",
             case.name()
         );
     }
+}
+
+/// A child that never reads its stdin and never exits is killed at the
+/// deadline: the stdin write cannot hold the runner past it. The input is
+/// larger than any pipe buffer and the child sleeps 30 s, so a runner that
+/// writes stdin before it polls blocks until the sleep ends.
+#[cfg(unix)]
+#[test]
+fn a_child_that_never_reads_stdin_is_killed_at_the_deadline() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = ipe_test_temp::temp_root().join(format!("ipe-stdin-deadline-{}", std::process::id()));
+    assert!(fs::create_dir_all(&dir).is_ok(), "scratch dir");
+    let script = dir.join("never-reads");
+    assert!(
+        fs::write(&script, "#!/bin/sh\nexec sleep 30\n").is_ok(),
+        "write script"
+    );
+    assert!(
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o700)).is_ok(),
+        "chmod script"
+    );
+    let exe = script.to_string_lossy().into_owned();
+    let input = vec![b'x'; 4 << 20];
+    let started = std::time::Instant::now();
+    let run = std::panic::catch_unwind(|| {
+        run_with_stdin_deadline("never_reads", &exe, &input, Duration::from_millis(300))
+    });
+    let took = started.elapsed();
+    let _ = fs::remove_dir_all(&dir);
+    let message = run
+        .err()
+        .and_then(|payload| payload.downcast::<String>().ok())
+        .map(|text| *text)
+        .unwrap_or_default();
+    assert!(
+        message.contains("no exit within"),
+        "the runner must refuse the hung child, got: {message:?}"
+    );
+    assert!(
+        took < Duration::from_secs(15),
+        "the runner returned after {took:?}; the stdin write held it past the deadline"
+    );
 }
