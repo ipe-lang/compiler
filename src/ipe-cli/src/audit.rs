@@ -70,6 +70,7 @@ use crate::remote_ingest::{
 };
 use crate::scratch::ScratchDir;
 use crate::text;
+use posture::GatePosture;
 
 /// The package-gate checks, in the fixed order [`run_audit`] runs them. Naming
 /// the check that rejected lets the diagnostic say exactly which gate failed.
@@ -940,9 +941,12 @@ fn prepare(snapshot: PackageSnapshot) -> Result<Prepared, CliError> {
     // gate-regenerated catalog (or none).
     purge_committed_ffi_cache(&manifest.root)?;
     // Regenerate FFI bindings for native-bearing packages before the build so
-    // the compiler finds `Rust.<Crate>` interface modules.
+    // the compiler finds `Rust.<Crate>` interface modules. The regeneration runs
+    // the package's foreign crates' build scripts, so it is reachable only
+    // behind the proof that this process holds a jail and no host-side escape.
     if !manifest.rust_dependencies.is_empty() {
-        regenerate_ffi_bindings(&manifest_path)?;
+        let posture = GatePosture::establish()?;
+        regenerate_ffi_bindings(&posture, &manifest_path)?;
     }
 
     // `audit_scratch_dir` creates the directory exclusively with 128-bit OS
@@ -976,6 +980,66 @@ fn prepare(snapshot: PackageSnapshot) -> Result<Prepared, CliError> {
     })
 }
 
+/// The gate's sandbox posture, in its own module so that its proof's field is
+/// private to it: only [`GatePosture::from_facts`] can mint one.
+mod posture {
+    use super::{Check, reject};
+    use crate::CliError;
+    use crate::text;
+
+    /// Proof that this process runs the audit with no host-side escape from the sandbox.
+    ///
+    /// Minted once per audit, before any step that runs the package's foreign code
+    /// (the FFI binding regeneration); nothing outside this module can construct
+    /// it. The step takes the proof as a parameter, so without a jail the step
+    /// cannot be called: the developer's unsandboxed inspector override and a
+    /// host without bubblewrap are refusals of the gate, never a host run with a
+    /// warning.
+    pub(super) struct GatePosture(());
+
+    impl GatePosture {
+        /// Prove the gate's posture from the host's sandbox facts.
+        ///
+        /// The only production read of the unsandboxed override in this module;
+        /// `audit_source_reads_no_environment_or_cwd` pins that.
+        ///
+        /// # Errors
+        /// As [`Self::from_facts`].
+        pub(super) fn establish() -> Result<Self, CliError> {
+            let caps = ipe_sandbox::probe();
+            Self::from_facts(
+                ipe_sandbox::unsandboxed_override_set(),
+                &ipe_sandbox::select_mechanism(&caps),
+            )
+        }
+
+        /// The pure core: refuse the override, refuse a host without a jail.
+        ///
+        /// # Errors
+        /// [`CliError::PackageAudit`] with [`Check::NativeBindingRegen`] when the
+        /// unsandboxed inspector override is set, or when the sandbox mechanism is
+        /// [`ipe_sandbox::Mechanism::Refused`].
+        pub(super) fn from_facts(
+            override_set: bool,
+            mechanism: &ipe_sandbox::Mechanism,
+        ) -> Result<Self, CliError> {
+            if override_set {
+                return Err(reject(
+                    Check::NativeBindingRegen,
+                    text::msg::audit_refuses_unsandboxed_override().into(),
+                ));
+            }
+            match mechanism {
+                ipe_sandbox::Mechanism::Bwrap(_) => Ok(Self(())),
+                ipe_sandbox::Mechanism::Refused => Err(reject(
+                    Check::NativeBindingRegen,
+                    text::msg::audit_requires_a_jail().into(),
+                )),
+            }
+        }
+    }
+}
+
 /// Regenerate FFI bindings for a native-bearing package into the project's own
 /// `.ipe/cache/ffi/rust`, so the gate audits bindings it derived from the pinned
 /// crate rather than any the publisher may have committed.
@@ -988,7 +1052,8 @@ fn prepare(snapshot: PackageSnapshot) -> Result<Prepared, CliError> {
 /// Build scripts are always enabled here (equivalent to `--allow-build-scripts`)
 /// because the bwrap jail (network-denied) is the sole confinement boundary;
 /// skipping build scripts would silently omit crates that require them to
-/// generate their API surface.
+/// generate their API surface. The [`GatePosture`] is the proof that the jail
+/// is what runs them: the regeneration is unreachable without it.
 ///
 /// Failure is fail-closed: a regeneration error maps to a typed
 /// [`Check::NativeBindingRegen`] rejection rather than letting the audit
@@ -999,7 +1064,7 @@ fn prepare(snapshot: PackageSnapshot) -> Result<Prepared, CliError> {
 /// jailed regeneration fails or the cache path escapes the project root via a
 /// symlinked component; [`CliError::Io`] when the existing committed cache
 /// cannot be removed.
-fn regenerate_ffi_bindings(manifest_path: &Path) -> Result<(), CliError> {
+fn regenerate_ffi_bindings(_posture: &GatePosture, manifest_path: &Path) -> Result<(), CliError> {
     let project_root = manifest_path.parent().unwrap_or_else(|| Path::new("."));
     purge_committed_ffi_cache(project_root)?;
     crate::ffi::install_registry_deps_for_project(manifest_path, true).map_err(|e| {
@@ -1769,15 +1834,13 @@ fn run_cargo_deny(
 ///   - minor < 20:  `[--manifest-path <m>] check advisories bans sources [--config <cfg>]`
 ///
 /// `--manifest-path` is a global option accepted in both series.
-fn deny_args(cargo_deny_minor: u32, manifest: &Path, config: Option<&Path>) -> Vec<OsString> {
+fn deny_args(cargo_deny_minor: u32, manifest: &Path, config: &Path) -> Vec<OsString> {
     let mut args: Vec<OsString> = Vec::new();
     args.push("--manifest-path".into());
     args.push(manifest.into());
-    if cargo_deny_minor >= 20
-        && let Some(cfg) = config
-    {
+    if cargo_deny_minor >= 20 {
         args.push("--config".into());
-        args.push(cfg.into());
+        args.push(config.into());
     }
     args.push("check".into());
     // Advisories + bans + sources are the supply-chain axes; licenses are a
@@ -1785,11 +1848,9 @@ fn deny_args(cargo_deny_minor: u32, manifest: &Path, config: Option<&Path>) -> V
     args.push("advisories".into());
     args.push("bans".into());
     args.push("sources".into());
-    if cargo_deny_minor < 20
-        && let Some(cfg) = config
-    {
+    if cargo_deny_minor < 20 {
         args.push("--config".into());
-        args.push(cfg.into());
+        args.push(config.into());
     }
     args
 }
@@ -1832,14 +1893,14 @@ fn supply_chain(prepared: &Prepared) -> Result<(), CliError> {
     // `deny.toml` ledgers advisories the vendored runtime's dependency tree
     // legitimately carries. Without it the check would default-reject every
     // emitted package for a runtime dependency the workspace has already vetted.
-    // Absent a resolvable config, cargo-deny falls back to its defaults.
+    // The policy is the gate's embedded one, never a file the audit finds.
     //
     // `--config` placement is version-dependent: global (before `check`) for
     // cargo-deny >= 0.20, on the `check` subcommand for < 0.20.
     let derived_config = derive_deny_config(&prepared.emitted_dir)?;
     let cargo_deny = OsStr::new(CARGO_DENY);
     let minor = detect_cargo_deny_minor(cargo_deny, TOOL_QUERY_LIMITS);
-    let args = deny_args(minor, &manifest, derived_config.as_deref());
+    let args = deny_args(minor, &manifest, &derived_config);
 
     match run_cargo_deny(cargo_deny, &args, SUPPLY_CHAIN_SCAN_LIMITS) {
         Ok(out) if out.status.success() => verify_locked_dependency_hashes(prepared),
@@ -2022,63 +2083,46 @@ fn check_one_dep_advisories(
     }
 }
 
-/// The workspace's cargo-deny config file name.
-const DENY_CONFIG: &str = "deny.toml";
+/// The supply-chain policy the gate applies: the compiler workspace's own
+/// `deny.toml`, embedded when this binary was built.
+///
+/// The policy is part of the gate's installation, so no file at audit time can
+/// stand in for it: neither the audited package's tree, nor the working
+/// directory, nor a runtime tree a cwd walk or `IPE_RUNTIME_DIR` resolves (a
+/// package shipping an empty `src/runtime/rust/src/` beside its own
+/// `deny.toml` would otherwise name the policy it is judged by). An absent
+/// policy has no representation, so cargo-deny never runs on its defaults.
+const GATE_DENY_POLICY: &str = include_str!("../../../deny.toml");
 
-/// Locate the workspace's `deny.toml` so the supply-chain check applies the same
-/// posture the workspace CI does. Walks up from the current directory, then from
-/// the resolved runtime tree's ancestry (the runtime lives inside the workspace,
-/// so `deny.toml` sits at the workspace root above it). Returns the directory
-/// holding it, or `None` when no `deny.toml` is found.
-fn locate_workspace_deny_config() -> Option<PathBuf> {
-    let mut roots: Vec<PathBuf> = Vec::new();
-    if let Ok(cwd) = std::env::current_dir() {
-        roots.push(cwd);
-    }
-    if let Ok(runtime) = crate::resolve_runtime() {
-        roots.push(runtime);
-    }
-    for root in roots {
-        let mut here: Option<&Path> = Some(root.as_path());
-        while let Some(dir) = here {
-            if dir.join(DENY_CONFIG).is_file() {
-                return Some(dir.to_path_buf());
-            }
-            here = dir.parent();
-        }
-    }
-    None
-}
-
-/// Derive a cargo-deny config for the EMITTED project from the workspace's
-/// `deny.toml`, dropping its `[graph]` section.
+/// Derive a cargo-deny config for the EMITTED project from the gate's
+/// embedded policy ([`GATE_DENY_POLICY`]), dropping its `[graph]` section.
 ///
 /// The workspace config's `[graph] features = ["full"]` names the RUNTIME crate's
 /// own feature set, which the emitted `ipe-app` does not have — passing the
 /// workspace config verbatim makes `cargo metadata` fail on the unknown feature.
 /// The advisory/license/bans/sources POLICY is exactly what the gate must apply,
 /// so this copies every section EXCEPT `[graph]` into a derived config written
-/// beside the emitted project, and returns its path. Returns `None` when no
-/// workspace `deny.toml` is found (cargo-deny then uses its defaults).
+/// beside the emitted project, and returns its path.
 ///
 /// # Errors
-/// [`CliError::Io`] on a read/write failure.
-fn derive_deny_config(emitted_dir: &Path) -> Result<Option<PathBuf>, CliError> {
-    let Some(workspace) = locate_workspace_deny_config() else {
-        return Ok(None);
-    };
-    let text = crate::io_bounded::read_named_in(
-        &workspace,
-        &[DENY_CONFIG],
-        crate::io_bounded::SMALL_FILE_CAP,
-    )?;
+/// [`CliError::Io`] on a write failure.
+fn derive_deny_config(emitted_dir: &Path) -> Result<PathBuf, CliError> {
+    let derived = emitted_dir.join("ipe-audit-deny.toml");
+    std::fs::write(&derived, emitted_deny_policy(GATE_DENY_POLICY)).map_err(|e| CliError::Io {
+        path: derived.clone(),
+        source: e,
+    })?;
+    Ok(derived)
+}
 
-    // Line-filter out the `[graph]` table (up to the next top-level `[section]`).
-    // The remaining tables (`[advisories]`, `[licenses]`, `[bans]`, `[sources]`)
-    // are the emitted-project-independent policy the gate applies.
-    let mut out = String::with_capacity(text.len());
+/// `policy` without its `[graph]` table (up to the next top-level `[section]`).
+///
+/// The remaining tables (`[advisories]`, `[licenses]`, `[bans]`, `[sources]`)
+/// are the emitted-project-independent policy the gate applies.
+fn emitted_deny_policy(policy: &str) -> String {
+    let mut out = String::with_capacity(policy.len());
     let mut in_graph = false;
-    for line in text.lines() {
+    for line in policy.lines() {
         let trimmed = line.trim_start();
         if trimmed.starts_with('[') {
             in_graph = trimmed.starts_with("[graph]");
@@ -2088,13 +2132,7 @@ fn derive_deny_config(emitted_dir: &Path) -> Result<Option<PathBuf>, CliError> {
             out.push('\n');
         }
     }
-
-    let derived = emitted_dir.join("ipe-audit-deny.toml");
-    std::fs::write(&derived, out).map_err(|e| CliError::Io {
-        path: derived.clone(),
-        source: e,
-    })?;
-    Ok(Some(derived))
+    out
 }
 
 /// Refuse a package whose own module set claims a reserved namespace (`Ipe.*`,
@@ -4001,7 +4039,7 @@ mod tests {
     fn deny_args_modern_places_config_before_check() {
         let manifest = Path::new("/tmp/proj/Cargo.toml");
         let config = Path::new("/ws/deny.toml");
-        let args = deny_args(20, manifest, Some(config));
+        let args = deny_args(20, manifest, config);
         let strs: Vec<&str> = args.iter().map(|a| a.to_str().unwrap()).collect();
         let check_pos = strs
             .iter()
@@ -4026,7 +4064,7 @@ mod tests {
     fn deny_args_legacy_places_config_after_check() {
         let manifest = Path::new("/tmp/proj/Cargo.toml");
         let config = Path::new("/ws/deny.toml");
-        let args = deny_args(19, manifest, Some(config));
+        let args = deny_args(19, manifest, config);
         let strs: Vec<&str> = args.iter().map(|a| a.to_str().unwrap()).collect();
         let check_pos = strs
             .iter()
@@ -4043,19 +4081,6 @@ mod tests {
         assert!(strs.contains(&"advisories"), "advisories present");
         assert!(strs.contains(&"bans"), "bans present");
         assert!(strs.contains(&"sources"), "sources present");
-    }
-
-    /// No config: neither version emits `--config` at all.
-    #[test]
-    fn deny_args_no_config_omits_flag() {
-        let manifest = Path::new("/tmp/proj/Cargo.toml");
-        for minor in [19_u32, 20] {
-            let args = deny_args(minor, manifest, None);
-            assert!(
-                !args.iter().any(|a| a.to_str() == Some("--config")),
-                "minor {minor}: --config must not appear when config is None"
-            );
-        }
     }
 
     /// A `cargo-deny` driven through a stub that runs a shell `body`.
@@ -4173,6 +4198,394 @@ mod tests {
                 "a probe past its stdout ceiling reads no version"
             );
             clean(&deny);
+        }
+    }
+
+    /// The gate's posture and policy origin: every verdict input is typed by
+    /// the gate's own installation, never read from the package or the host's
+    /// ambient state at the verdict.
+    mod gate_posture_and_policy_origin {
+        use std::collections::BTreeMap;
+        use std::path::PathBuf;
+
+        use super::super::{
+            Check, GATE_DENY_POLICY, GatePosture, Rejection, derive_deny_config,
+            emitted_deny_policy,
+        };
+        use super::make_test_dir;
+        use crate::CliError;
+        use crate::text;
+
+        fn bwrap() -> ipe_sandbox::Mechanism {
+            ipe_sandbox::Mechanism::Bwrap(PathBuf::from("/usr/bin/bwrap"))
+        }
+
+        /// The regeneration rejection's message, or `None` for any other outcome.
+        fn regen_rejection(result: Result<GatePosture, CliError>) -> Option<String> {
+            match result {
+                Err(CliError::PackageAudit(Rejection {
+                    check: Check::NativeBindingRegen,
+                    message,
+                })) => Some(message),
+                Ok(_) | Err(_) => None,
+            }
+        }
+
+        #[test]
+        fn gate_posture_refuses_the_unsandboxed_override() {
+            let message = regen_rejection(GatePosture::from_facts(true, &bwrap()));
+            assert_eq!(
+                message,
+                Some(String::from(text::msg::audit_refuses_unsandboxed_override())),
+                "the developer override is a refusal of the gate even with a jail present"
+            );
+        }
+
+        #[test]
+        fn gate_posture_refuses_a_host_without_a_jail() {
+            let message = regen_rejection(GatePosture::from_facts(
+                false,
+                &ipe_sandbox::Mechanism::Refused,
+            ));
+            assert_eq!(
+                message,
+                Some(String::from(text::msg::audit_requires_a_jail())),
+                "no bubblewrap means no regeneration, never a host run"
+            );
+        }
+
+        #[test]
+        fn gate_posture_holds_under_a_jail_without_the_override() {
+            assert!(
+                GatePosture::from_facts(false, &bwrap()).is_ok(),
+                "a jailed host without the override is the one accepted posture"
+            );
+        }
+
+        #[test]
+        fn the_gate_writes_its_embedded_policy_for_every_audit() {
+            let emitted = make_test_dir("policy-embedded");
+            let written = derive_deny_config(&emitted)
+                .ok()
+                .and_then(|path| std::fs::read_to_string(path).ok());
+            assert_eq!(
+                written.as_deref(),
+                Some(emitted_deny_policy(GATE_DENY_POLICY).as_str()),
+                "the derived config is the compiler's own policy, whatever the disk holds"
+            );
+            let policy = written.unwrap_or_default();
+            assert!(
+                policy.contains("unknown-registry = \"deny\"") && policy.contains("[advisories]"),
+                "the embedded policy carries the supply-chain tables, never cargo-deny defaults"
+            );
+            let _ = std::fs::remove_dir_all(&emitted);
+        }
+
+        #[test]
+        fn the_emitted_policy_drops_only_the_graph_table() {
+            let policy = "[graph]\nfeatures = [\"full\"]\n[advisories]\nignore = []\n[sources]\nunknown-git = \"deny\"\n";
+            assert_eq!(
+                emitted_deny_policy(policy),
+                "[advisories]\nignore = []\n[sources]\nunknown-git = \"deny\"\n",
+                "the runtime crate's feature graph is dropped; every policy table is kept"
+            );
+        }
+
+        /// Names whose qualified mention in production code is an ambient read:
+        /// the process environment, the working directory, a runtime tree found
+        /// from either, the sandbox facts.
+        const AMBIENT_READS: &[&str] = &[
+            "current_dir",
+            "resolve_runtime",
+            "resolve_runtime_src",
+            "var",
+            "var_os",
+            "vars",
+            "vars_os",
+            "unsandboxed_override_set",
+            "probe",
+            "select_mechanism",
+        ];
+
+        /// Macros that read the build or process environment.
+        const AMBIENT_MACROS: &[&str] = &["env", "option_env"];
+
+        /// The one production function allowed to read the sandbox facts.
+        const POSTURE_SITE: &str = "establish";
+
+        /// Whether `attrs` carry `#[cfg(test)]`.
+        fn is_cfg_test(attrs: &[syn::Attribute]) -> bool {
+            attrs.iter().any(|attr| {
+                matches!(&attr.meta, syn::Meta::List(list)
+                    if list.path.is_ident("cfg") && list.tokens.to_string() == "test")
+            })
+        }
+
+        /// Ambient reads per production scope: `(enclosing function, name) -> count`.
+        ///
+        /// A qualified path (`std::env::current_dir`, `ipe_sandbox::probe`), a
+        /// `use` of the name (which would let a bare call stand for it), a
+        /// macro path (`env!`), and a `::name` token inside any macro's
+        /// arguments all count; a bare local named like one does not. Items
+        /// under `#[cfg(test)]` are skipped.
+        #[derive(Default)]
+        struct AmbientReads {
+            scope: Vec<String>,
+            hits: BTreeMap<(String, String), usize>,
+        }
+
+        impl AmbientReads {
+            fn hit(&mut self, name: &str) {
+                let scope = self
+                    .scope
+                    .last()
+                    .cloned()
+                    .unwrap_or_else(|| String::from("<item>"));
+                *self.hits.entry((scope, String::from(name))).or_insert(0) += 1;
+            }
+
+            fn qualified_path(&mut self, path: &syn::Path) {
+                if path.segments.len() < 2 {
+                    return;
+                }
+                if let Some(last) = path.segments.last()
+                    && let Some(name) = AMBIENT_READS.iter().find(|n| last.ident == **n)
+                {
+                    self.hit(name);
+                }
+            }
+
+            /// Every `::name` ident of a macro's unparsed tokens.
+            fn tokens(&mut self, stream: proc_macro2::TokenStream) {
+                let mut after_colon = false;
+                for tree in stream {
+                    match tree {
+                        proc_macro2::TokenTree::Ident(ident) => {
+                            if after_colon
+                                && let Some(name) = AMBIENT_READS.iter().find(|n| ident == **n)
+                            {
+                                self.hit(name);
+                            }
+                            after_colon = false;
+                        }
+                        proc_macro2::TokenTree::Group(group) => {
+                            self.tokens(group.stream());
+                            after_colon = false;
+                        }
+                        proc_macro2::TokenTree::Punct(punct) => {
+                            after_colon = punct.as_char() == ':';
+                        }
+                        proc_macro2::TokenTree::Literal(_) => after_colon = false,
+                    }
+                }
+            }
+        }
+
+        impl<'ast> syn::visit::Visit<'ast> for AmbientReads {
+            fn visit_item_mod(&mut self, m: &'ast syn::ItemMod) {
+                if !is_cfg_test(&m.attrs) {
+                    syn::visit::visit_item_mod(self, m);
+                }
+            }
+
+            fn visit_item_impl(&mut self, imp: &'ast syn::ItemImpl) {
+                if !is_cfg_test(&imp.attrs) {
+                    syn::visit::visit_item_impl(self, imp);
+                }
+            }
+
+            fn visit_item_trait(&mut self, tr: &'ast syn::ItemTrait) {
+                if !is_cfg_test(&tr.attrs) {
+                    syn::visit::visit_item_trait(self, tr);
+                }
+            }
+
+            fn visit_item_use(&mut self, u: &'ast syn::ItemUse) {
+                if !is_cfg_test(&u.attrs) {
+                    syn::visit::visit_item_use(self, u);
+                }
+            }
+
+            fn visit_item_const(&mut self, c: &'ast syn::ItemConst) {
+                if !is_cfg_test(&c.attrs) {
+                    syn::visit::visit_item_const(self, c);
+                }
+            }
+
+            fn visit_item_static(&mut self, s: &'ast syn::ItemStatic) {
+                if !is_cfg_test(&s.attrs) {
+                    syn::visit::visit_item_static(self, s);
+                }
+            }
+
+            fn visit_item_fn(&mut self, f: &'ast syn::ItemFn) {
+                if is_cfg_test(&f.attrs) {
+                    return;
+                }
+                self.scope.push(f.sig.ident.to_string());
+                syn::visit::visit_item_fn(self, f);
+                self.scope.pop();
+            }
+
+            fn visit_impl_item_fn(&mut self, f: &'ast syn::ImplItemFn) {
+                if is_cfg_test(&f.attrs) {
+                    return;
+                }
+                self.scope.push(f.sig.ident.to_string());
+                syn::visit::visit_impl_item_fn(self, f);
+                self.scope.pop();
+            }
+
+            fn visit_trait_item_fn(&mut self, f: &'ast syn::TraitItemFn) {
+                if is_cfg_test(&f.attrs) {
+                    return;
+                }
+                self.scope.push(f.sig.ident.to_string());
+                syn::visit::visit_trait_item_fn(self, f);
+                self.scope.pop();
+            }
+
+            fn visit_path(&mut self, path: &'ast syn::Path) {
+                self.qualified_path(path);
+                syn::visit::visit_path(self, path);
+            }
+
+            fn visit_use_name(&mut self, name: &'ast syn::UseName) {
+                if let Some(found) = AMBIENT_READS.iter().find(|n| name.ident == **n) {
+                    self.hit(found);
+                }
+            }
+
+            fn visit_use_rename(&mut self, rename: &'ast syn::UseRename) {
+                if let Some(found) = AMBIENT_READS.iter().find(|n| rename.ident == **n) {
+                    self.hit(found);
+                }
+            }
+
+            fn visit_macro(&mut self, mac: &'ast syn::Macro) {
+                if let Some(last) = mac.path.segments.last()
+                    && let Some(name) = AMBIENT_MACROS.iter().find(|n| last.ident == **n)
+                {
+                    self.hit(name);
+                }
+                self.tokens(mac.tokens.clone());
+                syn::visit::visit_macro(self, mac);
+            }
+        }
+
+        /// The ambient reads of `src`'s production code; `None` when it does not parse.
+        fn ambient_reads(src: &str) -> Option<BTreeMap<(String, String), usize>> {
+            use syn::visit::Visit as _;
+            let file = syn::parse_file(src).ok()?;
+            let mut scan = AmbientReads::default();
+            scan.visit_file(&file);
+            Some(scan.hits)
+        }
+
+        const AUDIT_SOURCE: &str = include_str!("audit.rs");
+
+        #[test]
+        fn audit_source_reads_no_environment_or_cwd() {
+            let hits = ambient_reads(AUDIT_SOURCE);
+            assert!(hits.is_some(), "audit.rs parses");
+            let Some(hits) = hits else { return };
+
+            let mut expected = BTreeMap::new();
+            for name in ["unsandboxed_override_set", "probe", "select_mechanism"] {
+                expected.insert((String::from(POSTURE_SITE), String::from(name)), 1);
+            }
+            assert_eq!(
+                hits, expected,
+                "the sandbox facts are read once, in `GatePosture::establish`; the \
+                 environment and the working directory are read nowhere (a stale \
+                 allowlist is red too)"
+            );
+        }
+
+        #[test]
+        fn the_ambient_scan_sees_a_working_directory_read() {
+            let mutated = format!(
+                "{AUDIT_SOURCE}\nfn smuggled() -> std::io::Result<PathBuf> {{ std::env::current_dir() }}\n"
+            );
+            let hits = ambient_reads(&mutated).unwrap_or_default();
+            assert_eq!(
+                hits.get(&(String::from("smuggled"), String::from("current_dir"))),
+                Some(&1),
+                "a qualified working-directory read in a production function is a hit"
+            );
+        }
+
+        #[test]
+        fn the_ambient_scan_sees_a_runtime_tree_resolution() {
+            let mutated = format!(
+                "{AUDIT_SOURCE}\nfn policy_beside_runtime() -> bool {{ crate::resolve_runtime().is_ok() }}\n"
+            );
+            let hits = ambient_reads(&mutated).unwrap_or_default();
+            assert_eq!(
+                hits.get(&(
+                    String::from("policy_beside_runtime"),
+                    String::from("resolve_runtime")
+                )),
+                Some(&1),
+                "a runtime tree resolved from the cwd or the environment is an ambient read"
+            );
+        }
+
+        #[test]
+        fn the_ambient_scan_sees_an_imported_environment_reader() {
+            let mutated = format!("use std::env::var_os as read_setting;\n{AUDIT_SOURCE}");
+            let hits = ambient_reads(&mutated).unwrap_or_default();
+            assert_eq!(
+                hits.get(&(String::from("<item>"), String::from("var_os"))),
+                Some(&1),
+                "importing an environment reader under another name is a hit"
+            );
+        }
+
+        #[test]
+        fn the_ambient_scan_sees_a_second_posture_read() {
+            let mutated = format!(
+                "{AUDIT_SOURCE}\nfn second_look() -> bool {{ ipe_sandbox::unsandboxed_override_set() }}\n"
+            );
+            let hits = ambient_reads(&mutated).unwrap_or_default();
+            assert_eq!(
+                hits.get(&(
+                    String::from("second_look"),
+                    String::from("unsandboxed_override_set")
+                )),
+                Some(&1),
+                "a second read of the override outside the posture site is a hit"
+            );
+        }
+
+        #[test]
+        fn the_ambient_scan_sees_a_read_hidden_in_macro_arguments() {
+            let mutated = format!(
+                "{AUDIT_SOURCE}\nfn in_macro() -> String {{ format!(\"{{:?}}\", std::env::current_dir()) }}\n"
+            );
+            let hits = ambient_reads(&mutated).unwrap_or_default();
+            assert_eq!(
+                hits.get(&(String::from("in_macro"), String::from("current_dir"))),
+                Some(&1),
+                "a read inside a macro's arguments is a hit"
+            );
+        }
+
+        #[test]
+        fn the_ambient_scan_ignores_a_bare_local_and_test_code() {
+            let mutated = format!(
+                "{AUDIT_SOURCE}\nfn local_named_probe() -> u8 {{ let probe = 1; probe }}\n\
+                 #[cfg(test)]\nfn only_in_tests() -> std::io::Result<PathBuf> {{ std::env::current_dir() }}\n"
+            );
+            let hits = ambient_reads(&mutated).unwrap_or_default();
+            assert!(
+                !hits.contains_key(&(String::from("local_named_probe"), String::from("probe"))),
+                "a bare local is not a sandbox read"
+            );
+            assert!(
+                !hits.contains_key(&(String::from("only_in_tests"), String::from("current_dir"))),
+                "test-only code is outside the scan"
+            );
         }
     }
 }

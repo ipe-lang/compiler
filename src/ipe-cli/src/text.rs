@@ -1202,6 +1202,10 @@ messages! {
     audit_no_manifest(path) = "audit-no-manifest";
     /// `ipe package audit` was given a path that is neither a project nor a manifest.
     audit_not_a_package(path) = "audit-not-a-package";
+    /// `ipe package audit` refuses to regenerate FFI bindings under the unsandboxed override.
+    audit_refuses_unsandboxed_override = "audit-refuses-unsandboxed-override";
+    /// `ipe package audit` refuses to regenerate FFI bindings on a host without a jail.
+    audit_requires_a_jail = "audit-requires-a-jail";
     /// An index entry file is not named `packages/<name>.toml`.
     index_entry_path_invalid(path) = "index-entry-path-invalid";
     /// An index entry exceeds the per-entry version ceiling.
