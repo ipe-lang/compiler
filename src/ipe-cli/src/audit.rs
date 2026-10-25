@@ -4538,7 +4538,7 @@ mod tests {
 
         #[test]
         fn the_ambient_scan_sees_an_imported_environment_reader() {
-            let mutated = format!("use std::env::var_os as read_setting;\n{AUDIT_SOURCE}");
+            let mutated = format!("{AUDIT_SOURCE}\nuse std::env::var_os as read_setting;\n");
             let hits = ambient_reads(&mutated).unwrap_or_default();
             assert_eq!(
                 hits.get(&(String::from("<item>"), String::from("var_os"))),
