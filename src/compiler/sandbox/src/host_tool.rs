@@ -582,8 +582,12 @@ mod tests {
         ];
         let found = resolve_in_dirs(&dirs, HostTool::Cargo, Regime::Unix).expect("cargo in t");
         assert_eq!(found.dir(), t.path());
-        let refusal = resolve_in_dirs(&dirs[..2], HostTool::Cargo, Regime::Unix)
-            .expect_err("only relative dirs");
+        let refusal = resolve_in_dirs(
+            dirs.get(..2).expect("two relative directories"),
+            HostTool::Cargo,
+            Regime::Unix,
+        )
+        .expect_err("only relative dirs");
         assert_eq!(skipped(&refusal), Some(2));
         let refusal = resolve_in_dirs(&[], HostTool::Cargo, Regime::Unix).expect_err("no dirs");
         assert_eq!(skipped(&refusal), Some(0));

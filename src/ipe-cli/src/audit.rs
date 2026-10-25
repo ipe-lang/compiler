@@ -4217,7 +4217,13 @@ mod tests {
         use crate::text;
 
         fn bwrap() -> ipe_sandbox::Mechanism {
-            ipe_sandbox::Mechanism::Bwrap(PathBuf::from("/usr/bin/bwrap"))
+            ipe_sandbox::Mechanism::Bwrap(
+                ipe_sandbox::ToolPath::assumed(
+                    std::path::Path::new("/usr/bin"),
+                    ipe_sandbox::HostTool::Bwrap,
+                )
+                .expect("an absolute directory"),
+            )
         }
 
         /// The regeneration rejection's message, or `None` for any other outcome.

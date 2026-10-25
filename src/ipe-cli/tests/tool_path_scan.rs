@@ -123,10 +123,10 @@ fn tail_segments(expr: &Expr) -> Option<(Option<String>, String)> {
     };
     let mut segments = path.path.segments.iter().rev();
     let last = segments.next()?.ident.unraw().to_string();
-    let parent = match &path.qself {
-        Some(qself) => type_name(&qself.ty),
-        None => segments.next().map(|s| s.ident.unraw().to_string()),
-    };
+    let parent = path.qself.as_ref().map_or_else(
+        || segments.next().map(|s| s.ident.unraw().to_string()),
+        |qself| type_name(&qself.ty),
+    );
     Some((parent, last))
 }
 

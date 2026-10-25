@@ -793,11 +793,13 @@ type Drain = std::thread::JoinHandle<Vec<u8>>;
 
 #[allow(dead_code)] // reached only from the deadline-bounded runner
 fn drain_on_thread(mut pipe: impl std::io::Read + Send + 'static) -> Drain {
-    std::thread::spawn(move || {
-        let mut bytes = Vec::new();
-        let _ = pipe.read_to_end(&mut bytes);
-        bytes
-    })
+    std::thread::Builder::new()
+        .spawn(move || {
+            let mut bytes = Vec::new();
+            let _ = pipe.read_to_end(&mut bytes);
+            bytes
+        })
+        .expect("the OS spawns a drain thread")
 }
 
 #[allow(dead_code)] // reached only from the deadline-bounded runner
