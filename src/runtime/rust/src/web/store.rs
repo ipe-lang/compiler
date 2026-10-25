@@ -379,6 +379,7 @@ impl Tombstones {
     /// A cold read that misses the live entry then never reads the row the
     /// delete is still removing; [`Self::deleted`] settles the hold once the
     /// persisted step returns, and a delete dropped mid-flight keeps it.
+    #[cfg(any(feature = "db", feature = "redis_store"))]
     fn begin(&self, sid: &str) {
         self.record(sid);
     }
@@ -1071,6 +1072,7 @@ fn settle_in<Model, Msg>(
 }
 
 /// Mark the entry under `sid` `durability`, iff `sessions` still holds `handle` there.
+#[cfg(any(feature = "db", feature = "redis_store"))]
 fn mark_in<Model, Msg>(
     sessions: &RwLock<SessionMap<Model, Msg>>,
     sid: &str,
@@ -1154,7 +1156,6 @@ type SessionMap<Model, Msg> = HashMap<String, Live<Model, Msg>>;
 
 /// In-process store with idle-TTL eviction. `get` touches the entry's last-seen
 /// so active sessions don't expire.
-
 pub struct MemoryStore<Model, Msg> {
     sessions: RwLock<SessionMap<Model, Msg>>,
     ttl: Duration,

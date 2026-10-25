@@ -217,7 +217,7 @@ mod process_kernel {
                 cwd: IpeMaybe::Nothing,
                 env: vec![(CHILD_MARK_ENV.to_owned(), mark)],
             };
-            let _ = rt.block_on(process_run_with::<String>(cfg));
+            let _ = rt.block_on(process_run_with::<ipe_runtime_rust::IpeError>(cfg));
             return;
         }
 

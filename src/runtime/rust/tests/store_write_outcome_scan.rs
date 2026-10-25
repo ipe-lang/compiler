@@ -114,7 +114,7 @@ impl<'ast> Visit<'ast> for Scan {
     }
 
     fn visit_item_impl(&mut self, item: &'ast ItemImpl) {
-        let partial_eq = item.trait_.as_ref().is_some_and(|(_, path, _)| {
+        let partial_eq = item.trait_.as_ref().is_some_and(|(path, _)| {
             path.segments
                 .last()
                 .is_some_and(|seg| seg.ident == "PartialEq")

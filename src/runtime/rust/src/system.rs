@@ -6516,7 +6516,7 @@ mod process_run_with_tests {
         let Some(res) = ended else { return };
         assert!(
             matches!(res, IpeResult::Err(_)),
-            "a child past the wall ceiling must fail the Task: {res:?}"
+            "a child past the wall ceiling must fail the Task"
         );
         let IpeResult::Err(error) = res else { return };
         assert_eq!(
@@ -6787,7 +6787,7 @@ mod process_run_in_pty_tests {
                 &res,
                 IpeResult::Err(e) if crate::ipe_error_kind(e.clone()) == crate::IpeErrorKind::Timeout
             ),
-            "{res:?}"
+            "a pty call past its wall ceiling must fail with a Timeout error"
         );
     }
 
