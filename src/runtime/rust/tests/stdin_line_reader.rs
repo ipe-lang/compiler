@@ -4,16 +4,14 @@
 //! goes through the process-wide `StdinLock` the kernel shares between calls:
 //! a reader private to one call would drop the bytes it buffered past the
 //! first newline, and a second line written in the same pipe write would be
-//! lost.
+//! lost. The child is an `#[ignore]`d test of the same binary that only its
+//! parent test selects, so no environment variable names the scenario.
 #![cfg(not(target_arch = "wasm32"))]
 
 use std::io::Write;
 use std::process::{Command, Stdio};
 
 use ipe_runtime_rust::{IpeError, IpeErrorKind, IpeResult};
-
-/// Names the scenario a child run executes instead of spawning.
-const CHILD_SCENARIO: &str = "IPE_STDIN_LINE_READER_CHILD";
 
 /// Starts each report line, so the harness's own output is never read as a report.
 const REPORT: &str = "stdin-line-reader-report:";
@@ -31,16 +29,6 @@ fn read_one() -> String {
     }
 }
 
-/// The scenario this process runs as a child, if it is one.
-fn child_scenario() -> Option<String> {
-    #[expect(
-        clippy::disallowed_methods,
-        reason = "an integration test has no crate-private env accessor"
-    )]
-    let scenario = std::env::var(CHILD_SCENARIO).ok();
-    scenario
-}
-
 /// In a child, reads `reads` lines and prints one report line per read.
 #[allow(
     clippy::expect_used,
@@ -55,16 +43,15 @@ fn run_child(reads: usize) {
     out.flush().expect("flush the report");
 }
 
-/// Runs `test_name` as a child fed `input` on stdin and returns its report lines.
+/// Runs the ignored test `child_name` as a child fed `input` on stdin and returns its report lines.
 #[allow(
     clippy::expect_used,
     reason = "a child that cannot be driven must fail the test"
 )]
-fn spawn_child(test_name: &str, input: &[u8]) -> Vec<String> {
+fn spawn_child(child_name: &str, input: &[u8]) -> Vec<String> {
     let exe = std::env::current_exe().expect("the test binary must locate itself");
     let mut child = Command::new(exe)
-        .env(CHILD_SCENARIO, test_name)
-        .args(["--exact", test_name, "--nocapture"])
+        .args(["--ignored", "--exact", child_name, "--nocapture"])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -83,16 +70,25 @@ fn spawn_child(test_name: &str, input: &[u8]) -> Vec<String> {
         .collect()
 }
 
+/// The child of `two_piped_lines_are_both_read`: three reads of the piped stdin.
+#[test]
+#[ignore = "driven as a child with a piped stdin by its parent test"]
+fn child_three_reads() {
+    run_child(3);
+}
+
+/// The child of `piped_overlong_line_is_refused_and_the_next_answer_is_intact`: two reads.
+#[test]
+#[ignore = "driven as a child with a piped stdin by its parent test"]
+fn child_two_reads() {
+    run_child(2);
+}
+
 /// Two lines delivered in one pipe write are both read, then end of input.
 #[test]
 fn two_piped_lines_are_both_read() {
-    const NAME: &str = "two_piped_lines_are_both_read";
-    if child_scenario().as_deref() == Some(NAME) {
-        run_child(3);
-        return;
-    }
     assert_eq!(
-        spawn_child(NAME, b"a\nb\n"),
+        spawn_child("child_three_reads", b"a\nb\n"),
         ["line:a", "line:b", "line:"],
         "a second line written with the first must not be dropped"
     );
@@ -101,16 +97,11 @@ fn two_piped_lines_are_both_read() {
 /// A piped line one byte past the cap is refused whole, and the next line is the next answer.
 #[test]
 fn piped_overlong_line_is_refused_and_the_next_answer_is_intact() {
-    const NAME: &str = "piped_overlong_line_is_refused_and_the_next_answer_is_intact";
-    if child_scenario().as_deref() == Some(NAME) {
-        run_child(2);
-        return;
-    }
     let mut input = vec![b'y'; LINE_CAP_BYTES + 1];
     input.extend_from_slice(b"\nn\n");
     let refused = format!("refused:{:?}", IpeErrorKind::LimitExceeded);
     assert_eq!(
-        spawn_child(NAME, &input),
+        spawn_child("child_two_reads", &input),
         [refused.as_str(), "line:n"],
         "the over-long line's tail must never be read as the next answer"
     );
