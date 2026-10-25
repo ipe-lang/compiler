@@ -182,12 +182,96 @@ impl<'a> StoredHash<'a> {
     }
 }
 
-/// Ipê `hashPasswordCost : String -> Int -> Result Error String`. Clamps cost to
-/// `[BCRYPT_COST_MIN, BCRYPT_COST_MAX]` = [4, 15] (4 = fast for tests, 12 =
-/// production default, 14–15 = high security). The bcrypt VALID range is
-/// [4, 31], but cost is caller-controlled: each +1 DOUBLES the work, so cost 31
-/// is a single-call CPU-exhaustion DoS (~years per hash). Higher than the
-/// ceiling is always a self-DoS, so it is clamped down rather than honoured.
+/// A stored hash the login path verifies: a [`StoredHash`] at [`REGISTER_COST`].
+///
+/// Login runs bcrypt at [`REGISTER_COST`] whichever branch it takes: a known
+/// email verifies its `LoginHash`, and an unknown email or a stored hash at
+/// any other cost verifies the decoy, which is at the same cost. A failed
+/// login then costs the same whether the email exists and whatever its row
+/// holds. A hash at another cost has no `LoginHash` and never logs in.
+#[cfg(feature = "db")]
+#[derive(Clone, Copy)]
+struct LoginHash<'a>(StoredHash<'a>);
+
+/// Why a stored hash is not a [`LoginHash`]; login answers every cause alike.
+#[cfg(feature = "db")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LoginHashRefusal {
+    /// The hash is not a [`StoredHash`].
+    Stored(StoredHashRefusal),
+    /// The hash is a [`StoredHash`] at a cost other than [`REGISTER_COST`].
+    CostNotRegister {
+        /// The cost the hash names.
+        found: BcryptCost,
+    },
+}
+
+#[cfg(feature = "db")]
+impl<'a> LoginHash<'a> {
+    /// The `stored` hash, admitted only at [`REGISTER_COST`].
+    fn parse(stored: &'a str) -> Result<Self, LoginHashRefusal> {
+        let hash = StoredHash::parse(stored).map_err(LoginHashRefusal::Stored)?;
+        let found = BcryptCost::of_hash(hash.text).map_err(LoginHashRefusal::Stored)?;
+        if found == REGISTER_COST {
+            Ok(Self(hash))
+        } else {
+            Err(LoginHashRefusal::CostNotRegister { found })
+        }
+    }
+
+    /// The hash text bcrypt verifies.
+    const fn text(self) -> &'a str {
+        self.0.text
+    }
+}
+
+/// The one bcrypt run a login makes after reading the user's row.
+#[cfg(feature = "db")]
+enum LoginPath<'a> {
+    /// A known email with a [`LoginHash`]: verify it.
+    Verify(LoginHash<'a>),
+    /// An unknown email, or a stored hash that is no [`LoginHash`]: verify the
+    /// decoy and fail.
+    Decoy,
+}
+
+/// The login path for the `stored` hash a row read, `None` for an unknown
+/// email.
+#[cfg(feature = "db")]
+fn login_path(stored: Option<&str>) -> LoginPath<'_> {
+    stored
+        .and_then(|hash| LoginHash::parse(hash).ok())
+        .map_or(LoginPath::Decoy, LoginPath::Verify)
+}
+
+/// Whether `password` logs in on `path`; `decoy` is [`dummy_bcrypt_hash`].
+///
+/// The one site that runs bcrypt on the login path; both arms hand it a hash
+/// at [`REGISTER_COST`]. The decoy arm runs the KDF and never admits. The
+/// caller produces `decoy` before the path is known, so its one-time hash
+/// runs on whichever path the first login takes, never on the decoy arm only.
+#[cfg(feature = "db")]
+fn run_login_path(path: LoginPath<'_>, password: &str, decoy: &str) -> bool {
+    let (hash, admits) = match path {
+        LoginPath::Verify(hash) => (hash.text(), true),
+        LoginPath::Decoy => (decoy, false),
+    };
+    let verified = bcrypt::verify(password, hash).unwrap_or(false);
+    admits && verified
+}
+
+/// Ipê `hashPasswordCost : String -> Int -> Result Error String`.
+///
+/// Clamps cost to `[BCRYPT_COST_MIN, BCRYPT_COST_MAX]` = [4, 15] (4 = fast for
+/// tests, 12 = production default, 14–15 = high security). The bcrypt VALID
+/// range is [4, 31], but cost is caller-controlled: each +1 DOUBLES the work,
+/// so cost 31 is a single-call CPU-exhaustion DoS (~years per hash). Higher
+/// than the ceiling is always a self-DoS, so it is clamped down rather than
+/// honoured.
+///
+/// `Auth.login` verifies only hashes written at the registration cost
+/// (`hashPassword`, `register`); a hash at another cost never logs in. This
+/// kernel is for `verifyPassword`, which verifies at any admitted cost.
 pub fn auth_hash_password_cost<E: From<String>>(pw: String, cost: i64) -> IpeResult<E, String> {
     if pw.chars().count() < 8 {
         return IpeResult::Err("password must be at least 8 characters".to_string().into());
@@ -1095,25 +1179,13 @@ pub fn auth_register<
 }
 
 #[cfg(feature = "db")]
-/// Whether `password` verifies against the `stored` hash a login read.
-///
-/// A stored hash that is not a [`StoredHash`] never verifies, and bcrypt runs
-/// on `decoy` instead: a cost above the ceiling never reaches the KDF, and a
-/// hash bcrypt would refuse before hashing costs what a wrong password costs.
-fn login_hash_verifies(password: &str, stored: &str, decoy: &str) -> bool {
-    let parsed = StoredHash::parse(stored);
-    let verified = parsed.map_or_else(
-        |_| bcrypt::verify(password, decoy).unwrap_or(false),
-        |hash| hash.verifies(password).unwrap_or(false),
-    );
-    parsed.is_ok() && verified
-}
-
-#[cfg(feature = "db")]
 /// Ipê `login : Db -> String -> String -> Task Error Int`.
-/// Authenticates the user. Returns user id on success. Does NOT leak whether
-/// the email exists vs. password was wrong — both paths return the same
-/// generic "invalid credentials" error.
+///
+/// Authenticates the user and returns the user id. Whether the email exists,
+/// what its row holds and whether the password was wrong all answer the same
+/// "invalid credentials" error after the same bcrypt run at [`REGISTER_COST`]
+/// (see [`LoginPath`]); only a hash written at that cost (`register`,
+/// `hashPassword`) logs in.
 pub fn auth_login<
     E: Send + From<String> + crate::FromUnavailable + crate::FromIpeError + 'static,
 >(
@@ -1129,61 +1201,39 @@ pub fn auth_login<
             return IpeResult::Err(e);
         }
         let sql = db_format_sql("SELECT id, password_hash FROM users WHERE email = ?".to_string());
-        match sqlx::query(super::sql_text::assembled(sql))
+        let row = match sqlx::query(super::sql_text::assembled(sql))
             .bind(&email)
             .fetch_optional(&conn)
             .await
         {
-            Ok(Some(row)) => {
-                use sqlx::Row;
-                // A failed id-column read MUST NOT silently default to user 0
-                // (authenticating as the wrong/zero user). Fail closed instead.
-                let id: i64 = match row.try_get(0) {
-                    Ok(id) => id,
-                    Err(_) => {
-                        return IpeResult::Err(
-                            "auth.login: invalid credentials".to_string().into(),
-                        );
-                    }
-                };
-                let hash: String = row.try_get(1).unwrap_or_default();
-                // bcrypt::verify is CPU-bound + blocking → blocking pool (see register).
-                // A refused thread is `Unavailable` on both email paths alike; a
-                // panicked verify fails closed as invalid credentials.
-                let verified = crate::threads::join_blocking("auth.login", move || {
-                    login_hash_verifies(&password, &hash, dummy_bcrypt_hash())
-                })
-                .await;
-                match verified {
-                    Ok(true) => IpeResult::Ok(id),
-                    Err(crate::threads::BlockingFailure::Refused(refused)) => {
-                        IpeResult::Err(refused.into_error())
-                    }
-                    Ok(false) | Err(crate::threads::BlockingFailure::Panicked) => {
-                        IpeResult::Err("auth.login: invalid credentials".to_string().into())
-                    }
-                }
+            Ok(row) => row,
+            Err(e) => return IpeResult::Err(auth_db_error("auth.login: db: ", &e)),
+        };
+        // A known and an unknown email share one path from here: the row's
+        // id and stored hash, each absent when unreadable or when no row
+        // exists. A failed id read MUST NOT default to user 0 (authenticating
+        // as the wrong/zero user); it fails closed below, after the bcrypt run.
+        let (id, stored): (Option<i64>, Option<String>) = row.map_or((None, None), |row| {
+            use sqlx::Row;
+            (row.try_get(0).ok(), row.try_get(1).ok())
+        });
+        // bcrypt is CPU-bound + blocking → blocking pool (see register). The
+        // run is at `REGISTER_COST` on both paths; a refused thread is
+        // `Unavailable` on both alike; a panicked verify fails closed as
+        // invalid credentials.
+        let verified = crate::threads::join_blocking("auth.login", move || {
+            let decoy = dummy_bcrypt_hash();
+            run_login_path(login_path(stored.as_deref()), &password, decoy)
+        })
+        .await;
+        match (verified, id) {
+            (Ok(true), Some(id)) => IpeResult::Ok(id),
+            (Err(crate::threads::BlockingFailure::Refused(refused)), _) => {
+                IpeResult::Err(refused.into_error())
             }
-            Ok(None) => {
-                // TIMING: perform an equal-cost bcrypt verify against a fixed
-                // `REGISTER_COST` hash so the unknown-email path does the same hashing
-                // work as the known-email path — removing the email-enumeration
-                // timing oracle. The verify result is discarded; a refused
-                // thread is `Unavailable`, as on the known-email path.
-                let verified = crate::threads::join_blocking("auth.login", move || {
-                    bcrypt::verify(&password, dummy_bcrypt_hash())
-                })
-                .await;
-                match verified {
-                    Err(crate::threads::BlockingFailure::Refused(refused)) => {
-                        IpeResult::Err(refused.into_error())
-                    }
-                    Ok(_) | Err(crate::threads::BlockingFailure::Panicked) => {
-                        IpeResult::Err("auth.login: invalid credentials".to_string().into())
-                    }
-                }
+            (Ok(true), None) | (Ok(false) | Err(crate::threads::BlockingFailure::Panicked), _) => {
+                IpeResult::Err("auth.login: invalid credentials".to_string().into())
             }
-            Err(e) => IpeResult::Err(auth_db_error("auth.login: db: ", &e)),
         }
     })
 }
@@ -1709,7 +1759,9 @@ mod tests {
             .split_at_checked(at_default.len() - 1)
             .expect("a full hash");
         assert!(bcrypt::verify("hunter2!", malformed).is_err());
+        let at_register = bcrypt::hash("hunter2!", REGISTER_COST.get()).expect("hash");
         for (email, stored) in [
+            ("control@example.com", at_register.as_str()),
             ("floor@example.com", at_floor.as_str()),
             ("over@example.com", over_ceiling.as_str()),
             ("malformed@example.com", malformed),
@@ -1729,8 +1781,12 @@ mod tests {
             auth_login::<IpeError>(pool.clone(), email.to_owned(), "hunter2!".to_owned())
         };
         assert!(
-            matches!(login("floor@example.com").await, IpeResult::Ok(_)),
-            "the control: a hash inside the ceiling still logs in"
+            matches!(login("control@example.com").await, IpeResult::Ok(_)),
+            "the control: a hash at the registration cost logs in"
+        );
+        assert!(
+            matches!(login("floor@example.com").await, IpeResult::Err(_)),
+            "a hash inside the ceiling but below the registration cost never logs in"
         );
         let started = std::time::Instant::now();
         let over = login("over@example.com").await;
@@ -2755,6 +2811,149 @@ mod tests {
         ));
     }
 
+    // ── Login verifies at one cost ────────────────────────────────────────────
+
+    /// A `StoredHash` at the floor, below the registration cost.
+    #[cfg(feature = "db")]
+    fn floor_hash() -> String {
+        let hash = bcrypt::hash("hunter2!", BCRYPT_COST_MIN).expect("hash");
+        assert_eq!(BcryptCost::of_hash(&hash), Ok(BcryptCost(BCRYPT_COST_MIN)));
+        assert!(
+            StoredHash::parse(&hash).is_ok(),
+            "the fixture is a StoredHash"
+        );
+        hash
+    }
+
+    /// A stored hash at any admitted cost other than the registration cost is
+    /// a `StoredHash` but no `LoginHash`; the refusal names the cost found.
+    #[cfg(feature = "db")]
+    #[test]
+    fn a_stored_hash_at_another_cost_has_no_login_representation() {
+        let floor = floor_hash();
+        assert_eq!(
+            LoginHash::parse(&floor).err(),
+            Some(LoginHashRefusal::CostNotRegister {
+                found: BcryptCost(BCRYPT_COST_MIN)
+            })
+        );
+        assert!(StoredHash::parse(COST_15_HASH).is_ok());
+        assert_eq!(
+            LoginHash::parse(COST_15_HASH).err(),
+            Some(LoginHashRefusal::CostNotRegister {
+                found: BcryptCost(BCRYPT_COST_MAX)
+            })
+        );
+        assert_eq!(
+            LoginHash::parse(&COST_15_HASH.replacen("$15$", "$31$", 1)).err(),
+            Some(LoginHashRefusal::Stored(StoredHashRefusal::CostOverCeiling))
+        );
+        assert_eq!(
+            LoginHash::parse("hunter2!").err(),
+            Some(LoginHashRefusal::Stored(StoredHashRefusal::NotBcrypt))
+        );
+        let at_register = bcrypt::hash("hunter2!", REGISTER_COST.get()).expect("hash");
+        assert!(LoginHash::parse(&at_register).is_ok());
+    }
+
+    /// Both hashes the login path can run bcrypt on are `LoginHash`es: the
+    /// decoy, its fallback, and the hash `register` writes.
+    #[cfg(feature = "db")]
+    #[tokio::test]
+    async fn a_registered_hash_is_a_login_hash() {
+        assert!(LoginHash::parse(dummy_bcrypt_hash()).is_ok());
+        assert!(LoginHash::parse(DECOY_FALLBACK_HASH).is_ok());
+        let pool = DbPool::connect("sqlite::memory:")
+            .await
+            .expect("in-memory connect");
+        let registered: IpeResult<IpeError, i64> =
+            auth_register(pool.clone(), "login@example.com".into(), "hunter2!".into()).await;
+        assert!(matches!(registered, IpeResult::Ok(_)), "{registered:?}");
+        let stored: String = sqlx::query_scalar("SELECT password_hash FROM users")
+            .fetch_one(&pool)
+            .await
+            .expect("the registered row");
+        assert!(
+            LoginHash::parse(&stored).is_ok(),
+            "the writer's hash is the reader's type: {stored}"
+        );
+    }
+
+    /// An unknown email and a known email whose stored hash is at a foreign
+    /// cost take the same path, the decoy; only a `LoginHash` is verified.
+    #[cfg(feature = "db")]
+    #[test]
+    fn an_unknown_email_and_a_foreign_cost_row_take_the_same_path() {
+        let floor = floor_hash();
+        assert!(matches!(login_path(None), LoginPath::Decoy));
+        assert!(matches!(login_path(Some(floor.as_str())), LoginPath::Decoy));
+        assert!(matches!(login_path(Some("hunter2!")), LoginPath::Decoy));
+        assert!(matches!(
+            login_path(Some(dummy_bcrypt_hash())),
+            LoginPath::Verify(_)
+        ));
+        // The decoy path runs and never admits, whatever the password.
+        assert!(!run_login_path(
+            login_path(Some(floor.as_str())),
+            "hunter2!",
+            dummy_bcrypt_hash()
+        ));
+        assert!(!run_login_path(
+            LoginPath::Decoy,
+            "ipe-login-timing-defence",
+            dummy_bcrypt_hash()
+        ));
+    }
+
+    /// A row whose stored hash is at a cost other than the registration cost
+    /// never logs in, right password or not; rehashing at the registration
+    /// cost is what readmits it.
+    #[cfg(feature = "db")]
+    #[tokio::test]
+    async fn a_stored_hash_at_another_cost_never_logs_in() {
+        let floor = floor_hash();
+        let pool = DbPool::connect("sqlite::memory:")
+            .await
+            .expect("in-memory connect");
+        let schema = ensure_users_schema::<IpeError>(&pool).await;
+        assert!(matches!(schema, IpeResult::Ok(())), "users schema");
+        sqlx::query(
+            "INSERT INTO users (email, password_hash, role, created_at) \
+             VALUES ('floor@example.com', ?, 'user', 0)",
+        )
+        .bind(&floor)
+        .execute(&pool)
+        .await
+        .expect("insert");
+        let login = |password: &str| {
+            auth_login::<IpeError>(
+                pool.clone(),
+                "floor@example.com".to_owned(),
+                password.to_owned(),
+            )
+        };
+        let right = login("hunter2!").await;
+        assert!(
+            matches!(
+                &right,
+                IpeResult::Err(IpeError::Error(_, info))
+                    if info.message == "auth.login: invalid credentials"
+            ),
+            "the right password at a foreign cost: {right:?}"
+        );
+        let at_register = bcrypt::hash("hunter2!", REGISTER_COST.get()).expect("hash");
+        sqlx::query("UPDATE users SET password_hash = ? WHERE email = 'floor@example.com'")
+            .bind(&at_register)
+            .execute(&pool)
+            .await
+            .expect("rehash");
+        assert!(
+            matches!(login("hunter2!").await, IpeResult::Ok(_)),
+            "the same account logs in once rehashed at the registration cost"
+        );
+        assert!(matches!(login("wrong-pass").await, IpeResult::Err(_)));
+    }
+
     // ── Armed revocation gate ─────────────────────────────────────────────────
 
     /// The armed gate.
@@ -3465,6 +3664,153 @@ fn header(raw: &str) -> bool { HeaderValue::from_str(raw).is_ok() }
                 "point_free",
                 "width",
             ]
+        );
+    }
+
+    /// The enclosing `fn` of every `bcrypt::verify` call in `source`.
+    fn bcrypt_verify_sites(source: &str) -> Vec<String> {
+        let tokens = tokens(source);
+        tokens
+            .windows(4)
+            .filter(|window| {
+                window
+                    .iter()
+                    .map(|t| t.text.as_str())
+                    .eq(["bcrypt", ":", ":", "verify"])
+            })
+            .map(|window| {
+                window
+                    .last()
+                    .and_then(|t| t.func.clone())
+                    .unwrap_or_default()
+            })
+            .collect()
+    }
+
+    /// Source with a `bcrypt::verify` outside any `fn`, one per `fn`, and
+    /// masked mentions.
+    const SYNTHETIC_VERIFIES: &str = r#"
+// bcrypt::verify(in a comment)
+const DOC: &str = "bcrypt::verify(in a literal)";
+fn one(p: &str) -> bool { bcrypt::verify(p, "h").unwrap_or(false) }
+fn two(p: &str) -> bool { let v = |h| bcrypt::verify(p, h); v("h").is_ok() }
+"#;
+
+    #[test]
+    fn bcrypt_verify_scan_masks_literals_and_names_the_fn() {
+        assert_eq!(bcrypt_verify_sites(SYNTHETIC_VERIFIES), ["one", "two"]);
+    }
+
+    /// What follows each `bcrypt` path root in `source`: `::verify` and
+    /// `::hash` are calls the site scan sees; a rename, glob or group import
+    /// names `verify` under a path the site scan cannot follow.
+    fn bcrypt_roots(source: &str) -> Vec<String> {
+        let tokens = tokens(source);
+        tokens
+            .iter()
+            .enumerate()
+            .filter(|(_, token)| token.text == "bcrypt")
+            .map(|(at, _)| {
+                tokens
+                    .iter()
+                    .skip(at + 1)
+                    .take(3)
+                    .map(|t| t.text.as_str())
+                    .collect::<String>()
+            })
+            .collect()
+    }
+
+    /// The enclosing `fn` of every call of `name` in `source`, its
+    /// declaration aside.
+    fn call_sites(source: &str, name: &str) -> Vec<String> {
+        tokens(source)
+            .windows(3)
+            .filter_map(|window| match window {
+                [before, called, open]
+                    if called.text == name && open.text == "(" && before.text != "fn" =>
+                {
+                    Some(called.func.clone().unwrap_or_default())
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Source with every way to reach `bcrypt::verify` under another path,
+    /// beside the two calls the site scan sees.
+    const SYNTHETIC_ROOTS: &str = r#"
+use bcrypt::{verify as check};
+use bcrypt as b;
+fn f(p: &str) -> bool { bcrypt::verify(p, "h").is_ok() && bcrypt::hash(p, 4).is_ok() }
+fn g() { use bcrypt::*; }
+// bcrypt as c
+fn decoy() -> u8 { 0 }
+fn caller() -> u8 { decoy() }
+"#;
+
+    #[test]
+    fn bcrypt_root_scan_names_every_path_and_call_scan_skips_the_declaration() {
+        assert_eq!(
+            bcrypt_roots(SYNTHETIC_ROOTS),
+            ["::{", "asb;", "::verify", "::hash", "::*"]
+        );
+        assert_eq!(call_sites(SYNTHETIC_ROOTS, "decoy"), ["caller"]);
+    }
+
+    /// The login path runs bcrypt at one site, `run_login_path`, whose two arms
+    /// both hand it a hash at `REGISTER_COST`; the other production site is
+    /// `verifyPassword`'s, which verifies at any admitted cost. The rest are
+    /// the test that measures the decoy's cost.
+    #[test]
+    fn bcrypt_verify_has_one_login_site() {
+        let auth = include_str!("auth.rs");
+        assert_eq!(
+            bcrypt_verify_sites(auth),
+            [
+                "verifies",
+                "run_login_path",
+                "login_refuses_a_stored_hash_above_the_cost_ceiling",
+                "login_refuses_a_stored_hash_above_the_cost_ceiling",
+            ],
+            "a new `bcrypt::verify` must not open a second login site"
+        );
+        assert!(
+            bcrypt_roots(auth)
+                .iter()
+                .all(|path| path == "::verify" || path == "::hash"),
+            "`bcrypt` is reached only as `bcrypt::verify`/`bcrypt::hash`, the paths the site \
+             scan sees: {:?}",
+            bcrypt_roots(auth)
+        );
+        let decoy_sites = call_sites(auth, "dummy_bcrypt_hash");
+        assert!(
+            !decoy_sites.iter().any(|site| site == "run_login_path"),
+            "the decoy is produced by the caller, before the path is known: {decoy_sites:?}"
+        );
+        assert_eq!(
+            decoy_sites
+                .iter()
+                .filter(|site| *site == "auth_login")
+                .count(),
+            1,
+            "`auth_login` produces the decoy on every path: {decoy_sites:?}"
+        );
+        let none: Vec<usize> = Vec::new();
+        assert_eq!(
+            constructions(auth, "LoginHash", &["parse"]),
+            none,
+            "`LoginHash` is built only inside `LoginHash::parse`"
+        );
+        assert_eq!(
+            constructions(auth, "LoginHash", &[]).len(),
+            1,
+            "the scan sees the sanctioned construction"
+        );
+        assert_eq!(
+            aliases(auth, "LoginHash"),
+            Vec::<String>::new(),
+            "`LoginHash` has no alias the construction scan cannot see"
         );
     }
 

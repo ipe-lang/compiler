@@ -197,7 +197,7 @@ impl Served {
 }
 
 struct State {
-    workspace_root: Option<PathBuf>,
+    workspace_roots: Vec<PathBuf>,
     encoding: PositionEncoding,
     /// The one owner of the session's database and root: past its growth
     /// ceiling it drops the generation and rebuilds cold.
@@ -270,9 +270,9 @@ impl State {
             .map(|o| o.version)
     }
 
-    fn new(workspace_root: Option<PathBuf>, encoding: PositionEncoding) -> Self {
+    fn new(workspace_roots: Vec<PathBuf>, encoding: PositionEncoding) -> Self {
         Self {
-            workspace_root,
+            workspace_roots,
             encoding,
             db: ipe_db::LongLivedDb::new(),
             overlays: BTreeMap::new(),
@@ -302,7 +302,7 @@ pub fn run(
 ) -> Result<(), ServerError> {
     let (diag_tx, diag_rx): (Sender<DiagnosticsBatch>, Receiver<DiagnosticsBatch>) =
         crossbeam_channel::unbounded();
-    let mut state = State::new(workspace_root_of(init), encoding);
+    let mut state = State::new(workspace_roots_of(init), encoding);
     state.document_changes = init
         .capabilities
         .workspace
@@ -339,19 +339,30 @@ pub fn run(
     Ok(())
 }
 
-fn workspace_root_of(init: &InitializeParams) -> Option<PathBuf> {
-    if let Some(folder) = init
+/// The editor's workspace folders as local paths, in the order sent.
+///
+/// Each folder is normalized the way every document path is, so a document
+/// is matched to its folder by prefix. A folder whose URI is not a local
+/// path is dropped; a client that sends no folders falls back to its
+/// deprecated `rootUri`.
+fn workspace_roots_of(init: &InitializeParams) -> Vec<PathBuf> {
+    let folders: Vec<PathBuf> = init
         .workspace_folders
-        .as_ref()
-        .and_then(|folders| folders.first())
-        && let Ok(path) = folder.uri.to_file_path()
-    {
-        return Some(path);
+        .iter()
+        .flatten()
+        .filter_map(|folder| folder.uri.to_file_path().ok())
+        .map(|folder| normalize(&folder))
+        .collect();
+    if !folders.is_empty() {
+        return folders;
     }
     #[allow(deprecated)] // `root_uri` is the fallback older clients still send.
     init.root_uri
         .as_ref()
         .and_then(|uri| uri.to_file_path().ok())
+        .map(|folder| normalize(&folder))
+        .into_iter()
+        .collect()
 }
 
 fn handle_request(state: &State, connection: &Connection, request: &Request) {
@@ -968,7 +979,7 @@ fn ensure_project(state: &mut State, loader: &dyn ProjectLoader, path: &Path) {
 /// Unconditionally re-resolve the project layout anchored at `path`.
 fn ensure_project_fresh(state: &mut State, loader: &dyn ProjectLoader, path: &Path) {
     let open_text = state.overlays.get(path).map(|o| o.text.as_str());
-    let verdict = loader.load(state.workspace_root.as_deref(), path, open_text);
+    let verdict = loader.load(&state.workspace_roots, path, open_text);
     let previous = std::mem::replace(&mut state.served, Served::Unloaded);
     state.served = match verdict {
         Ok(project) => Served::Trusted(Layout::of(project)),
@@ -1828,7 +1839,7 @@ mod tests {
         LoadedProject, Message, ModuleOrigin, Notification, Overlay, Path, PathBuf,
         PositionEncoding, ProjectLoader, PublishDiagnostics, PublishDiagnosticsParams, Served,
         State, TextDocumentContentChangeEvent, Url, code_action_result, ensure_project_fresh,
-        handle_notification, normalize, publish, recompute, sync_and_recompute,
+        handle_notification, normalize, publish, recompute, sync_and_recompute, workspace_roots_of,
     };
     use crate::loader::{LimitSource, LoadDisposition, LoadError};
     use ipe_lint::{LintConfigLoadError, WorkspaceReadError, load_lint_config};
@@ -1929,7 +1940,7 @@ mod tests {
         main_path: &Path,
         text: &str,
     ) -> (State, BTreeMap<Url, Vec<lsp_types::Diagnostic>>) {
-        let mut state = State::new(None, PositionEncoding::Utf16);
+        let mut state = State::new(Vec::new(), PositionEncoding::Utf16);
         state.overlays.insert(
             main_path.to_path_buf(),
             Overlay {
@@ -1960,7 +1971,7 @@ mod tests {
     impl ProjectLoader for PackageLoader {
         fn load(
             &self,
-            _workspace_root: Option<&Path>,
+            _workspace_roots: &[PathBuf],
             open_file: &Path,
             open_text: Option<&str>,
         ) -> Result<LoadedProject, LoadError> {
@@ -2170,7 +2181,7 @@ mod tests {
     impl ProjectLoader for TwoModuleLoader {
         fn load(
             &self,
-            _workspace_root: Option<&Path>,
+            _workspace_roots: &[PathBuf],
             open_file: &Path,
             open_text: Option<&str>,
         ) -> Result<LoadedProject, LoadError> {
@@ -2241,7 +2252,7 @@ mod tests {
             },
             LoadError::FfiUntrusted(detail()),
             LoadError::FfiCatalogRefused(detail()),
-            LoadError::ManifestUntrusted(detail()),
+            LoadError::RootRefused(detail()),
         ] {
             assert_eq!(
                 refused.disposition(),
@@ -2252,13 +2263,44 @@ mod tests {
         }
     }
 
+    /// Every workspace folder is kept, in the editor's order; `rootUri` is
+    /// the fallback only when no folder was sent.
+    #[test]
+    fn every_workspace_folder_is_a_candidate_root() {
+        let folder = |path: &str| lsp_types::WorkspaceFolder {
+            uri: Url::from_directory_path(path).expect("an absolute directory is a file URL"),
+            name: path.to_owned(),
+        };
+        let init = lsp_types::InitializeParams {
+            workspace_folders: Some(vec![folder("/lsp-roots/b"), folder("/lsp-roots/a")]),
+            ..lsp_types::InitializeParams::default()
+        };
+        assert_eq!(
+            workspace_roots_of(&init),
+            vec![
+                normalize(Path::new("/lsp-roots/b")),
+                normalize(Path::new("/lsp-roots/a")),
+            ]
+        );
+        #[allow(deprecated)] // `root_uri` is the fallback under test.
+        let legacy = lsp_types::InitializeParams {
+            root_uri: Url::from_directory_path("/lsp-roots/legacy").ok(),
+            ..lsp_types::InitializeParams::default()
+        };
+        assert_eq!(
+            workspace_roots_of(&legacy),
+            vec![normalize(Path::new("/lsp-roots/legacy"))]
+        );
+        assert!(workspace_roots_of(&lsp_types::InitializeParams::default()).is_empty());
+    }
+
     /// A loader whose every `load` fails with one fixed error.
     struct FailingLoader(LoadError);
 
     impl ProjectLoader for FailingLoader {
         fn load(
             &self,
-            _workspace_root: Option<&Path>,
+            _workspace_roots: &[PathBuf],
             _open_file: &Path,
             _open_text: Option<&str>,
         ) -> Result<LoadedProject, LoadError> {
@@ -2275,7 +2317,7 @@ mod tests {
             },
             LoadError::FfiUntrusted("untrusted".to_owned()),
             LoadError::FfiCatalogRefused("inconsistent".to_owned()),
-            LoadError::ManifestUntrusted("untrusted".to_owned()),
+            LoadError::RootRefused("no manifest".to_owned()),
         ]
     }
 
@@ -2283,7 +2325,7 @@ mod tests {
     fn a_refused_load_serves_no_layout() {
         let main_path = normalize(Path::new("/lsp-refuse-test/Main.ipe"));
         for refusal in every_refusal() {
-            let mut state = State::new(None, PositionEncoding::Utf16);
+            let mut state = State::new(Vec::new(), PositionEncoding::Utf16);
             state.overlays.insert(
                 main_path.clone(),
                 Overlay {
@@ -2334,7 +2376,7 @@ mod tests {
     impl ProjectLoader for CountingRefusalLoader {
         fn load(
             &self,
-            _workspace_root: Option<&Path>,
+            _workspace_roots: &[PathBuf],
             open_file: &Path,
             open_text: Option<&str>,
         ) -> Result<LoadedProject, LoadError> {
@@ -2342,7 +2384,7 @@ mod tests {
             if self.refusing.load(Ordering::SeqCst) {
                 return Err(LoadError::Limit {
                     lifted_by: LimitSource::Filesystem,
-                    detail: "manifest walk ceiling".to_owned(),
+                    detail: "source tree ceiling".to_owned(),
                 });
             }
             let mut files = BTreeMap::new();
@@ -2378,7 +2420,7 @@ mod tests {
         let main_path = normalize(Path::new("/lsp-refuse-keystroke-test/Main.ipe"));
         let loader = CountingRefusalLoader::refusing();
         let (diag_tx, _diag_rx) = crossbeam_channel::unbounded::<DiagnosticsBatch>();
-        let mut state = State::new(None, PositionEncoding::Utf16);
+        let mut state = State::new(Vec::new(), PositionEncoding::Utf16);
         state.overlays.insert(
             main_path.clone(),
             Overlay {
@@ -2407,7 +2449,7 @@ mod tests {
         let main_path = normalize(Path::new("/lsp-refuse-watched-test/Main.ipe"));
         let loader = CountingRefusalLoader::refusing();
         let (diag_tx, _diag_rx) = crossbeam_channel::unbounded::<DiagnosticsBatch>();
-        let mut state = State::new(None, PositionEncoding::Utf16);
+        let mut state = State::new(Vec::new(), PositionEncoding::Utf16);
         state.overlays.insert(
             main_path.clone(),
             Overlay {
@@ -2439,7 +2481,7 @@ mod tests {
     fn nothing_loaded_gives_a_watched_file_event_no_anchor() {
         let loader = CountingRefusalLoader::refusing();
         let (diag_tx, _diag_rx) = crossbeam_channel::unbounded::<DiagnosticsBatch>();
-        let mut state = State::new(None, PositionEncoding::Utf16);
+        let mut state = State::new(Vec::new(), PositionEncoding::Utf16);
         did_change_watched_files(&mut state, &loader, &diag_tx);
         assert_eq!(loader.loads(), 0, "no anchor, no load");
         assert!(matches!(state.served, Served::Unloaded));
@@ -2480,7 +2522,7 @@ mod tests {
             lib_path,
         };
         for refusal in every_refusal() {
-            let mut state = State::new(None, PositionEncoding::Utf16);
+            let mut state = State::new(Vec::new(), PositionEncoding::Utf16);
             state.overlays.insert(
                 main_path.clone(),
                 Overlay {
@@ -2525,7 +2567,7 @@ mod tests {
         let main_path = normalize(Path::new("/lsp-refuse-first-test/Main.ipe"));
         let main_uri = Url::from_file_path(&main_path).expect("main uri");
         for refusal in every_refusal() {
-            let mut state = State::new(None, PositionEncoding::Utf16);
+            let mut state = State::new(Vec::new(), PositionEncoding::Utf16);
             let (server, client) = Connection::memory();
             let detail = refusal.to_string();
             ensure_project_fresh(&mut state, &FailingLoader(refusal), &main_path);
@@ -2550,7 +2592,7 @@ mod tests {
                 detail: "import closure ceiling".to_owned(),
             },
         ] {
-            let mut state = State::new(None, PositionEncoding::Utf16);
+            let mut state = State::new(Vec::new(), PositionEncoding::Utf16);
             state.overlays.insert(
                 main_path.clone(),
                 Overlay {
@@ -2570,7 +2612,7 @@ mod tests {
         }
     }
 
-    /// A loader answering by the open buffer's size, the shape of a loose file's closure ceiling.
+    /// A loader answering by the open buffer's size, the shape of a buffer-counted ceiling.
     ///
     /// A buffer longer than `ceiling` bytes hits a buffer-counted limit;
     /// arming `refuse_next` makes the next load a filesystem-counted one.
@@ -2591,14 +2633,14 @@ mod tests {
     impl ProjectLoader for BufferCeilingLoader {
         fn load(
             &self,
-            _workspace_root: Option<&Path>,
+            _workspace_roots: &[PathBuf],
             open_file: &Path,
             open_text: Option<&str>,
         ) -> Result<LoadedProject, LoadError> {
             if self.refuse_next.swap(false, Ordering::SeqCst) {
                 return Err(LoadError::Limit {
                     lifted_by: LimitSource::Filesystem,
-                    detail: "manifest walk ceiling".to_owned(),
+                    detail: "source tree ceiling".to_owned(),
                 });
             }
             let text = open_text.unwrap_or_default();
@@ -2659,7 +2701,7 @@ mod tests {
         let main_path = normalize(Path::new("/lsp-buffer-limit-test/Main.ipe"));
         let loader = BufferCeilingLoader::new(MAIN_TEXT.len());
         let (diag_tx, _diag_rx) = crossbeam_channel::unbounded::<DiagnosticsBatch>();
-        let mut state = State::new(None, PositionEncoding::Utf16);
+        let mut state = State::new(Vec::new(), PositionEncoding::Utf16);
         state.overlays.insert(
             main_path.clone(),
             Overlay {
@@ -2686,7 +2728,7 @@ mod tests {
         let main_uri = Url::from_file_path(&main_path).expect("main uri");
         let loader = BufferCeilingLoader::new(MAIN_TEXT.len());
         let (diag_tx, diag_rx) = crossbeam_channel::unbounded::<DiagnosticsBatch>();
-        let mut state = State::new(None, PositionEncoding::Utf16);
+        let mut state = State::new(Vec::new(), PositionEncoding::Utf16);
         state.overlays.insert(
             main_path.clone(),
             Overlay {
@@ -2724,7 +2766,7 @@ mod tests {
         assert_eq!(cleared.generation, state.generation);
         assert!(
             matches!(cleared.per_uri.as_slice(), [(uri, diags)]
-                if *uri == main_uri && matches!(diags.as_slice(), [d] if d.message.contains("manifest walk ceiling"))),
+                if *uri == main_uri && matches!(diags.as_slice(), [d] if d.message.contains("source tree ceiling"))),
             "the fallback's diagnostics are cleared, replaced only by the refusal itself: {:?}",
             cleared.per_uri
         );
@@ -2764,7 +2806,7 @@ mod tests {
             lib_path,
         };
 
-        let mut state = State::new(None, PositionEncoding::Utf16);
+        let mut state = State::new(Vec::new(), PositionEncoding::Utf16);
         state.overlays.insert(
             main_path.clone(),
             Overlay {
@@ -2860,7 +2902,7 @@ mod tests {
             lib_path,
         };
 
-        let mut state = State::new(None, PositionEncoding::Utf16);
+        let mut state = State::new(Vec::new(), PositionEncoding::Utf16);
         state.overlays.insert(
             main_path.clone(),
             Overlay {
@@ -3042,7 +3084,7 @@ mod tests {
 
         let helper_path = normalize(Path::new("/test-proj/Helper.ipe"));
         let main_path = normalize(Path::new("/test-proj/Main.ipe"));
-        let mut state = State::new(None, PositionEncoding::Utf8);
+        let mut state = State::new(Vec::new(), PositionEncoding::Utf8);
 
         let mut files = BTreeMap::new();
         files.insert(
@@ -3196,7 +3238,7 @@ mod tests {
     impl ProjectLoader for ChurnLoader {
         fn load(
             &self,
-            workspace_root: Option<&Path>,
+            workspace_roots: &[PathBuf],
             open_file: &Path,
             open_text: Option<&str>,
         ) -> Result<LoadedProject, LoadError> {
@@ -3204,7 +3246,7 @@ mod tests {
                 fail_next: Arc::new(AtomicBool::new(false)),
                 lib_path: self.lib_path.clone(),
             };
-            let mut project = two.load(workspace_root, &self.main_path, None)?;
+            let mut project = two.load(workspace_roots, &self.main_path, None)?;
             if let (Some(text), Some(stem)) = (
                 open_text.filter(|_| open_file != self.main_path),
                 open_file.file_stem().and_then(|stem| stem.to_str()),
@@ -3264,7 +3306,7 @@ mod tests {
             main_path: main_path.clone(),
             lib_path,
         };
-        let mut state = State::new(None, PositionEncoding::Utf16);
+        let mut state = State::new(Vec::new(), PositionEncoding::Utf16);
         // Any warm stdlib generation stands past one symbol, so every buffer
         // that adds an input forces a cold rebuild.
         state.db = ipe_db::LongLivedDb::with_ceiling(ipe_db::GrowthCeiling {
@@ -3335,7 +3377,7 @@ mod tests {
             fail_next: Arc::new(AtomicBool::new(false)),
             lib_path: normalize(&Path::new(dir).join("Lib.ipe")),
         };
-        let mut state = State::new(None, PositionEncoding::Utf16);
+        let mut state = State::new(Vec::new(), PositionEncoding::Utf16);
         state.overlays.insert(
             main_path.clone(),
             Overlay {

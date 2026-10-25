@@ -1,9 +1,9 @@
 //! The project-resolution seam between the server loop and the CLI driver.
 //!
-//! Discovering a project (manifest walk-up, sibling discovery, stdlib
-//! injection) is driver logic that reads the filesystem — it lives in the
-//! `ipe` crate, which depends on this one. The server therefore receives it
-//! as a [`ProjectLoader`] implementation; the query layer below stays free
+//! Resolving a project (the workspace folder's manifest, module discovery,
+//! stdlib injection) is driver logic that reads the filesystem — it lives in
+//! the `ipe` crate, which depends on this one. The server therefore receives
+//! it as a [`ProjectLoader`] implementation; the query layer below stays free
 //! of hidden inputs, and tests substitute a fixture loader with no
 //! filesystem at all.
 
@@ -67,19 +67,23 @@ pub enum LoadError {
     FfiUntrusted(String),
     /// The installed FFI catalog is inconsistent; no buffer edit fixes it.
     FfiCatalogRefused(String),
-    /// The discovered package manifest failed its trust check.
-    ManifestUntrusted(String),
+    /// The workspace folder is not a project the compiler accepts.
+    ///
+    /// No `package.ipe` in the folder, no `src/`, a missing entry: the
+    /// compiler refuses the same root, so no analysis of it is shown until
+    /// the folder is fixed.
+    RootRefused(String),
 }
 
 /// What a load ceiling counted, which decides whether an edit can lift it.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum LimitSource {
-    /// The ceiling counted the open buffer (a loose file's import closure).
+    /// The ceiling counted the open buffer.
     ///
     /// Editing the buffer (dropping imports, shrinking it) can bring the
     /// load back under the ceiling.
     Buffer,
-    /// The ceiling counted the filesystem alone (the manifest walk, a package's tree).
+    /// The ceiling counted the filesystem alone (the project's source tree).
     ///
     /// No edit to the buffer changes what the ceiling counted.
     Filesystem,
@@ -116,7 +120,7 @@ impl LoadError {
             }
             | Self::FfiUntrusted(_)
             | Self::FfiCatalogRefused(_)
-            | Self::ManifestUntrusted(_) => LoadDisposition::Refuse,
+            | Self::RootRefused(_) => LoadDisposition::Refuse,
         }
     }
 }
@@ -130,7 +134,7 @@ impl fmt::Display for LoadError {
             | Self::Limit { detail, .. }
             | Self::FfiUntrusted(detail)
             | Self::FfiCatalogRefused(detail)
-            | Self::ManifestUntrusted(detail) => f.write_str(detail),
+            | Self::RootRefused(detail) => f.write_str(detail),
         }
     }
 }
@@ -139,18 +143,18 @@ impl fmt::Display for LoadError {
 pub trait ProjectLoader {
     /// Resolve the project containing `open_file`.
     ///
-    /// `workspace_root` is the editor's workspace folder (used when it holds
-    /// a manifest); `open_text`, when present, is the editor's current
-    /// buffer for `open_file` and shadows its disk bytes during resolution
-    /// (the VFS overlay applied at the discovery step).
+    /// `workspace_roots` are the editor's workspace folders, in the order the
+    /// editor sent them; the project is the folder holding `open_file`, and
+    /// nothing above a folder is ever searched. `open_text`, when present, is
+    /// the editor's current buffer for `open_file`.
     ///
     /// # Errors
-    /// [`LoadError`] when no project shape can be resolved around
-    /// `open_file`; its [`LoadError::disposition`] says whether the server
-    /// degrades to single-file service or refuses the load.
+    /// [`LoadError`] when no project can be resolved for `open_file`; its
+    /// [`LoadError::disposition`] says whether the server degrades to
+    /// single-file service or refuses the load.
     fn load(
         &self,
-        workspace_root: Option<&Path>,
+        workspace_roots: &[PathBuf],
         open_file: &Path,
         open_text: Option<&str>,
     ) -> Result<LoadedProject, LoadError>;
