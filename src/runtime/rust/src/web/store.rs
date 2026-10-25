@@ -5019,7 +5019,7 @@ mod tests {
 
     // Run `sql` against `s`'s own pool.
     #[cfg(feature = "db")]
-    async fn sqlite_exec<Model, Msg>(s: &SqliteStore<Model, Msg>, sql: &str) {
+    async fn sqlite_exec<Model, Msg>(s: &SqliteStore<Model, Msg>, sql: &'static str) {
         sqlx::query(sql).execute(&s.pool).await.unwrap();
     }
 
