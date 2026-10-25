@@ -22,7 +22,6 @@
 
 use std::ffi::{OsStr, OsString};
 use std::fmt;
-use std::path::{Path, PathBuf};
 
 use ipe_diagnostics::{Code, Diagnostic as SharedDiag, IPE_F4410, SandboxError};
 
@@ -778,6 +777,8 @@ fn read_bounded<R: std::io::Read>(
 
 #[cfg(test)]
 mod tests {
+    use std::path::{Path, PathBuf};
+
     use super::*;
 
     fn spec() -> JailSpec {

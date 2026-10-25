@@ -8,7 +8,7 @@ description = "Isolation jail for compiling/inspecting untrusted foreign crates:
 [features]
 # `ToolPath::assumed`: a tool at a stated absolute directory with no file check,
 # for tests that render an argv without spawning. Never enabled by a shipping crate.
-test-support = []
+assumed-tool-path = []
 
 [dependencies]
 ipe_diagnostics = { path = "../diagnostics" }

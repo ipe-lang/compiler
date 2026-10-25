@@ -175,7 +175,7 @@ impl ToolPath {
     ///
     /// [`ToolRefusal::NotFound`] when `dir` is not absolute: a relative
     /// location has no representation even here.
-    #[cfg(any(test, feature = "test-support"))]
+    #[cfg(any(test, feature = "assumed-tool-path"))]
     pub fn assumed(dir: &Path, tool: HostTool) -> Result<Self, ToolRefusal> {
         if !dir.is_absolute() {
             return Err(ToolRefusal::NotFound {
