@@ -104,6 +104,8 @@ mod golden_session_replay_seal;
 mod golden_show_policy;
 #[path = "g_misc/golden_static_bound.rs"]
 mod golden_static_bound;
+#[path = "g_misc/golden_stdlib_markdown_bounds.rs"]
+mod golden_stdlib_markdown_bounds;
 #[path = "g_misc/golden_stdlib_module_seal.rs"]
 mod golden_stdlib_module_seal;
 #[path = "g_misc/golden_test_summary_line_219.rs"]

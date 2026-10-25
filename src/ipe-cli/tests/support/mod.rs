@@ -652,6 +652,162 @@ pub fn build_and_run_emitted_with_stdin(
     }
 }
 
+/// Outcome of one deadline-bounded run of an emitted binary.
+#[allow(dead_code)]
+pub struct TimedRunOutcome {
+    /// The program's standard output, decoded lossily from UTF-8.
+    pub stdout: String,
+    /// The program's standard error, decoded lossily from UTF-8.
+    pub stderr: String,
+    /// The process exit code (`None` if it was killed by a signal or at the
+    /// deadline).
+    pub exit_code: Option<i32>,
+    /// Wall time from spawn to the observed exit.
+    pub elapsed: std::time::Duration,
+}
+
+impl TimedRunOutcome {
+    #[allow(dead_code)] // reached only from the deadline-bounded runner
+    const fn failed() -> Self {
+        Self {
+            stdout: String::new(),
+            stderr: String::new(),
+            exit_code: None,
+            elapsed: std::time::Duration::ZERO,
+        }
+    }
+}
+
+/// Build the emitted project at `emitted_dir` and return its binary path.
+///
+/// # Panics
+/// Fails the calling test if `cargo build` fails, surfacing cargo's stderr.
+#[must_use]
+#[allow(dead_code)] // only deadline-bounded goldens build once and run many times
+pub fn build_emitted_binary_checked(golden_name: &str, emitted_dir: &Path) -> Option<String> {
+    let exe = e2e_support::build_rust_binary(golden_name, emitted_dir);
+    assert!(
+        exe.is_ok(),
+        "{}",
+        exe.as_ref().err().map_or("", String::as_str)
+    );
+    exe.ok()
+}
+
+/// Run `exe` with `stdin_bytes` on stdin, killing and reaping it at `deadline`.
+///
+/// The child is polled with `try_wait`; its stdout and stderr drain on reader
+/// threads so a full pipe never stalls it. Past `deadline` the child is killed
+/// and reaped, so no process outlives the call.
+///
+/// # Panics
+/// Fails the calling test if the binary cannot be spawned, its stdin cannot be
+/// written, or it has not exited by `deadline` ("superlinear or hung").
+#[must_use]
+#[allow(dead_code)] // only deadline-bounded goldens exercise this helper
+pub fn run_with_stdin_deadline(
+    golden_name: &str,
+    exe: &str,
+    stdin_bytes: &[u8],
+    deadline: std::time::Duration,
+) -> TimedRunOutcome {
+    let child = Command::new(exe)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn();
+    assert!(
+        child.is_ok(),
+        "{golden_name}: failed to spawn `{exe}`: {:?}",
+        child.as_ref().err()
+    );
+    let Ok(mut child) = child else {
+        return TimedRunOutcome::failed();
+    };
+    let started = std::time::Instant::now();
+    let stdout = child.stdout.take().map(drain_on_thread);
+    let stderr = child.stderr.take().map(drain_on_thread);
+    // Dropping the handle after the write closes stdin, so the child sees EOF.
+    let wrote = child
+        .stdin
+        .take()
+        .map(|mut stdin| stdin.write_all(stdin_bytes));
+
+    let mut polled = Ok(None);
+    while started.elapsed() < deadline {
+        polled = child.try_wait();
+        if !matches!(polled, Ok(None)) {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+    let elapsed = started.elapsed();
+    let status = polled.as_ref().ok().copied().flatten();
+    if status.is_none() {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+    let stdout = stdout.map_or_else(String::new, join_drain);
+    let stderr = stderr.map_or_else(String::new, join_drain);
+    assert!(
+        polled.is_ok(),
+        "{golden_name}: failed to poll `{exe}`: {:?}",
+        polled.err()
+    );
+    assert!(
+        status.is_some(),
+        "{golden_name}: no exit within {deadline:?}, superlinear or hung; stderr:\n{stderr}"
+    );
+    assert!(
+        wrote.as_ref().is_none_or(Result::is_ok),
+        "{golden_name}: failed to write stdin: {wrote:?}"
+    );
+    TimedRunOutcome {
+        stdout,
+        stderr,
+        exit_code: status.and_then(|s| s.code()),
+        elapsed,
+    }
+}
+
+/// Build the emitted project and run it once under [`run_with_stdin_deadline`].
+///
+/// # Panics
+/// Fails the calling test on a failed build, or as [`run_with_stdin_deadline`]
+/// does.
+#[must_use]
+#[allow(dead_code)] // only deadline-bounded goldens exercise this helper
+pub fn build_and_run_emitted_with_stdin_deadline(
+    golden_name: &str,
+    emitted_dir: &Path,
+    stdin_bytes: &[u8],
+    deadline: std::time::Duration,
+) -> TimedRunOutcome {
+    build_emitted_binary_checked(golden_name, emitted_dir)
+        .map_or_else(TimedRunOutcome::failed, |exe| {
+            run_with_stdin_deadline(golden_name, &exe, stdin_bytes, deadline)
+        })
+}
+
+type Drain = std::thread::JoinHandle<Vec<u8>>;
+
+#[allow(dead_code)] // reached only from the deadline-bounded runner
+fn drain_on_thread(mut pipe: impl std::io::Read + Send + 'static) -> Drain {
+    std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let _ = pipe.read_to_end(&mut bytes);
+        bytes
+    })
+}
+
+#[allow(dead_code)] // reached only from the deadline-bounded runner
+fn join_drain(handle: Drain) -> String {
+    handle.join().map_or_else(
+        |_| String::new(),
+        |bytes| String::from_utf8_lossy(&bytes).into_owned(),
+    )
+}
+
 /// Build the emitted project and run its binary with the MAIN-THREAD stack
 /// capped to `stack_kib` KiB, via `bash -c 'ulimit -s <kib>; exec "$0"' <bin>`.
 ///

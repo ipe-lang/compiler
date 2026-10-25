@@ -35,9 +35,10 @@ pub fn parse_blocks(src: &str) -> Vec<Block> {
 /// construction (principle 3): a `>>>>…` document deeper than the ceiling can
 /// neither overflow the parse recursion nor build a `Block::Blockquote` tree
 /// whose recursive `Drop` overflows the stack, because the tree is never built
-/// past the ceiling. At the ceiling the innermost blockquote's content is kept
-/// as its parsed inner blocks WITHOUT a further blockquote wrapper — the
-/// nesting is truncated, never silently discarded and never recursed.
+/// past the ceiling. A blockquote opened at the ceiling folds its inner lines
+/// into one paragraph (joined by spaces, trimmed; none when blank), the
+/// `Ipe.Markdown` `maxQuoteDepth` rule — the nesting is truncated, never
+/// silently discarded and never recursed.
 fn blocks_from_lines<'a>(mut lines: &'a [&'a str], depth: usize) -> Vec<Block> {
     let mut out: Vec<Block> = Vec::new();
     while let Some((&l, rest)) = lines.split_first() {
@@ -365,8 +366,15 @@ pub fn parse_spans(s: &str) -> Vec<Span> {
 /// `spanLoop` (rewritten as a loop; the Ipê source prepends onto a reversed
 /// accumulator then `List.reverse`s once — this port appends in source order,
 /// so the result is already forward and no final reverse is needed).
+///
+/// A failed link scan records in `links_off_until` how far its proof reaches
+/// (see [`take_link`]), so no `[` it covers is scanned again and a run of `[`
+/// costs one scan in total: the loop is linear in the line's length.
 fn span_loop(mut remaining: &[char], mut acc: Vec<Span>, mut pending: String) -> Vec<Span> {
+    let total = remaining.len();
+    let mut links_off_until = 0_usize;
     loop {
+        let pos = total.saturating_sub(remaining.len());
         if remaining.is_empty() {
             if pending.ends_with("  ") {
                 let trimmed = strip_trailing_spaces(&pending);
@@ -383,7 +391,10 @@ fn span_loop(mut remaining: &[char], mut acc: Vec<Span>, mut pending: String) ->
             remaining = remaining.get(1..).unwrap_or(&[]);
             pending = String::new();
         } else if starts_with("![", remaining) {
-            if let Some((alt, url, after)) = take_image(remaining) {
+            let bracket = remaining.get(1..).unwrap_or(&[]);
+            if let Some((alt, url, after)) =
+                try_link(bracket, pos.saturating_add(1), &mut links_off_until)
+            {
                 acc = flush_pending(&pending, acc);
                 acc.push(Span::Image(alt, url));
                 remaining = after;
@@ -407,7 +418,7 @@ fn span_loop(mut remaining: &[char], mut acc: Vec<Span>, mut pending: String) ->
             remaining = after;
             pending = String::new();
         } else if starts_with("[", remaining) {
-            if let Some((text, url, after)) = take_link(remaining) {
+            if let Some((text, url, after)) = try_link(remaining, pos, &mut links_off_until) {
                 acc = flush_pending(&pending, acc);
                 acc.push(Span::Link(text, url));
                 remaining = after;
@@ -464,19 +475,57 @@ fn take_between<'a>(delim: &str, s: &'a [char]) -> (String, &'a [char]) {
     )
 }
 
-/// Parse `[text](url)` at the current position. `None` if the syntax does not
-/// match or the URL fails [`SafeHref::parse`]. The parsed span carries a
-/// proven-safe href by type, so the unsafe scheme is turned away at the parse
-/// boundary and cannot reach the emitter (defend-in-depth beside the emit
-/// gate). Mirrors `takeLink`, with the scheme gate at the parse boundary.
-fn take_link(s: &[char]) -> Option<(String, SafeHref, &[char])> {
-    let close = index_of_first(&[']'], s)?;
-    let after_close = s.get(close + 1..).unwrap_or(&[]);
-    if !starts_with("(", after_close) {
+/// A parsed link: its text, its proven-safe target, and the input after it.
+type LinkParts<'a> = (String, SafeHref, &'a [char]);
+
+/// Parse the link whose `[` opens `s`, unless an earlier miss already covers it.
+///
+/// `bracket` is that `[`'s codepoint offset in the line. A miss widens
+/// `links_off_until` to the first offset where a `[` may still open a link.
+fn try_link<'a>(
+    s: &'a [char],
+    bracket: usize,
+    links_off_until: &mut usize,
+) -> Option<LinkParts<'a>> {
+    if bracket < *links_off_until {
         return None;
     }
+    match take_link(s) {
+        Ok(parts) => Some(parts),
+        Err(clear) => {
+            *links_off_until = bracket.saturating_add(clear);
+            None
+        }
+    }
+}
+
+/// Parse `[text](url)` at the current position (`s` starts with `[`).
+///
+/// The parsed span carries a proven-safe href by type, so an unsafe scheme is
+/// turned away at the parse boundary and cannot reach the emitter
+/// (defend-in-depth beside the emit gate). Mirrors `takeLink`, with the scheme
+/// gate at the parse boundary.
+///
+/// # Errors
+///
+/// On a miss, the codepoint count from the start of `s` before which no `[`
+/// can open a link either. Link text ends at the FIRST `]`, so every `[` ahead
+/// of that `]` shares this one's `]`, `(` and URL and fails the same way: the
+/// count is the `]`'s offset when the `(` is missing or the URL is unsafe.
+/// With no `]`, or no `)` after the `(`, no later `[` can close either, so the
+/// count is the length of `s`.
+fn take_link(s: &[char]) -> Result<LinkParts<'_>, usize> {
+    let Some(close) = index_of_first(&[']'], s) else {
+        return Err(s.len());
+    };
+    let after_close = s.get(close + 1..).unwrap_or(&[]);
+    if !starts_with("(", after_close) {
+        return Err(close);
+    }
     let url_and_after = after_close.get(1..).unwrap_or(&[]);
-    let close_paren = index_of_first(&[')'], url_and_after)?;
+    let Some(close_paren) = index_of_first(&[')'], url_and_after) else {
+        return Err(s.len());
+    };
     let link_text: String = s
         .get(1..close)
         .map(|r| r.iter().collect())
@@ -487,16 +536,11 @@ fn take_link(s: &[char]) -> Option<(String, SafeHref, &[char])> {
         .unwrap_or_default();
     // Parse boundary of the two-boundary href gate: an unsafe scheme degrades
     // to literal text (the caller pushes `[` and continues), never a link.
-    let href = SafeHref::parse(&link_url)?;
+    let Some(href) = SafeHref::parse(&link_url) else {
+        return Err(close);
+    };
     let after_link = url_and_after.get(close_paren + 1..).unwrap_or(&[]);
-    Some((link_text, href, after_link))
-}
-
-/// Parse `![alt](url)`; `s` must start with `![`. Mirrors `takeImage` (slice
-/// past `!`, then reuse `takeLink`).
-fn take_image(s: &[char]) -> Option<(String, SafeHref, &[char])> {
-    let without_bang = s.get(1..).unwrap_or(&[]);
-    take_link(without_bang)
+    Ok((link_text, href, after_link))
 }
 
 /// Right-trim ASCII spaces only. Mirrors `stripTrailingSpaces`.
@@ -767,6 +811,50 @@ mod tests {
     fn spans_hard_break_on_trailing_double_space() {
         let spans = parse_spans("text  ");
         assert!(spans.contains(&Span::HardBreak), "{spans:?}");
+    }
+
+    #[test]
+    fn bracket_run_is_linear() {
+        // A run of unclosable `[` (or `![`) costs one link scan in total: a
+        // rescan per bracket is quadratic and blows this deadline by orders of
+        // magnitude.
+        for line in ["[".repeat(100_000), "![".repeat(50_000)] {
+            let started = std::time::Instant::now();
+            let spans = parse_spans(&line);
+            let elapsed = started.elapsed();
+            assert!(
+                elapsed < std::time::Duration::from_secs(2),
+                "bracket run took {elapsed:?}"
+            );
+            assert_eq!(spans, vec![Span::Plain(line)]);
+        }
+    }
+
+    #[test]
+    fn link_miss_memo_keeps_later_links() {
+        // A miss proves only the brackets it covers: a link after them parses.
+        assert_eq!(
+            parse_spans("[a]x [b](c)"),
+            vec![
+                Span::Plain("[a]x ".to_owned()),
+                Span::Link("b".to_owned(), href("c"))
+            ]
+        );
+        assert_eq!(
+            parse_spans("[x](javascript:1) [y](z)"),
+            vec![
+                Span::Plain("[x](javascript:1) ".to_owned()),
+                Span::Link("y".to_owned(), href("z"))
+            ]
+        );
+        assert_eq!(
+            parse_spans("[a [b](c)"),
+            vec![Span::Link("a [b".to_owned(), href("c"))]
+        );
+        assert_eq!(
+            parse_spans("[a](b [c] ![d]"),
+            vec![Span::Plain("[a](b [c] ![d]".to_owned())]
+        );
     }
 
     #[test]

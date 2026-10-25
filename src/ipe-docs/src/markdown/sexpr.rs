@@ -5,9 +5,10 @@
 //! The semantic-parity gate compares this port's tree, serialized here, to a
 //! snapshot produced by an `ipe` run of that program — so `Ipe.Markdown` stays
 //! authoritative and any divergence reddens CI. The two serializers MUST agree
-//! character-for-character; every arm here mirrors a `blockLines` arm there.
+//! character-for-character; every arm here mirrors a `blockLines` or `spanLine`
+//! arm there.
 
-use super::{Block, HeadingLevel};
+use super::{Block, HeadingLevel, Span};
 use std::fmt::Write as _;
 
 /// Serialize a block list to canonical S-expression lines (joined by `\n`),
@@ -50,6 +51,28 @@ fn block_lines(indent: &str, block: &Block) -> String {
             lines.push(format!("{indent})"));
             lines.join("\n")
         }
+    }
+}
+
+/// Serialize a span list to canonical S-expression lines (joined by `\n`).
+///
+/// Mirrors the Ipê serializer's `List.map spanLine spans |> join "\n"`; a link
+/// or image target prints as its [`SafeHref`](super::SafeHref) string.
+#[must_use]
+pub fn spans_to_sexpr(spans: &[Span]) -> String {
+    spans.iter().map(span_line).collect::<Vec<_>>().join("\n")
+}
+
+/// Mirrors `spanLine span`.
+fn span_line(span: &Span) -> String {
+    match span {
+        Span::Plain(text) => format!("(plain {})", quote(text)),
+        Span::Bold(text) => format!("(bold {})", quote(text)),
+        Span::Italic(text) => format!("(italic {})", quote(text)),
+        Span::Code(text) => format!("(code {})", quote(text)),
+        Span::Link(text, url) => format!("(link {} {})", quote(text), quote(url.as_str())),
+        Span::Image(alt, url) => format!("(image {} {})", quote(alt), quote(url.as_str())),
+        Span::HardBreak => "(hardbreak)".to_owned(),
     }
 }
 
