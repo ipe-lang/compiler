@@ -4206,7 +4206,6 @@ mod tests {
     /// ambient state at the verdict.
     mod gate_posture_and_policy_origin {
         use std::collections::BTreeMap;
-        use std::path::PathBuf;
 
         use super::super::{
             Check, GATE_DENY_POLICY, GatePosture, Rejection, derive_deny_config,

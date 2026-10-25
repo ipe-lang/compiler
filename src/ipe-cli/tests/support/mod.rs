@@ -792,6 +792,7 @@ pub fn build_and_run_emitted_with_stdin_deadline(
 type Drain = std::thread::JoinHandle<Vec<u8>>;
 
 #[allow(dead_code)] // reached only from the deadline-bounded runner
+#[allow(clippy::expect_used)] // a failed precondition is the test failure
 fn drain_on_thread(mut pipe: impl std::io::Read + Send + 'static) -> Drain {
     std::thread::Builder::new()
         .spawn(move || {
