@@ -1,4 +1,4 @@
-module Lib.Queue exposing (Place(..), Progress, QueuePage, QueueState(..), QueueWant(..), QueuedUnit, ResyncBound, Tallies, UnitLabel, UnitPageState(..), chainBanner, decide, decideRefusal, drainThenLoad, freshStatus, loadPage, makeResyncBound, mergeQueueWant, loadUnitView, pageHeaderText, placeIn, queueLabels, queueStatusText, refusalReasonText, resyncBound, resyncPageCeiling, resyncReviewed, resyncReviewedWithin, sourceStatusText, stateFromResult, talliesOf, unitLabel, unitPageEntry, unitPageOf, unitPageStatusText)
+module Lib.Queue exposing (Place(..), Progress, QueuePage, QueueState(..), QueueWant(..), QueuedUnit, ResyncBound, Tallies, UnitLabel, UnitPageState(..), chainBanner, decide, decideRefusal, drainDecision, drainThenLoad, freshStatus, loadPage, makeResyncBound, mergeQueueWant, loadUnitView, pageHeaderText, placeIn, queueLabels, queueStatusText, refusalReasonText, resyncBound, resyncPageCeiling, resyncReviewed, resyncReviewedWithin, sourceStatusText, stateFromResult, talliesOf, unitLabel, unitPageEntry, unitPageOf, unitPageStatusText)
 
 import Ipe.ByteSize as ByteSize
 import Ipe.Db as Db
@@ -9,7 +9,7 @@ import Ipe.Maybe as Maybe
 import Ipe.Result as Result exposing (Result(..))
 import Ipe.String as String
 import Ipe.Task as Task
-import Lib.Db as LibDb exposing (BreakAt(..), LogShown(..), LogVerdict(..))
+import Lib.Db as LibDb exposing (BreakAt(..), CopyFault(..), LogShown(..), LogVerdict(..), ReviewEntry(..))
 import Lib.Failure as Failure exposing (DecideRefusal, LoadFailure)
 import Lib.Format as Format
 -- `Index.Unit` names `Highlight.Lang` and `Index.UnitView` names
@@ -436,12 +436,22 @@ freshStatus settings conn db =
                     Task.succeed state
 
                 else
-                    Task.fail stillBehind
+                    Task.fail (stillBehind StampStale)
 
 
-stillBehind : Error
-stillBehind =
-    Error.conflict "the review progress copy is still behind the review database after a rebuild; reload"
+-- The failed load for a `reviewed` copy that one rebuild under the log's
+-- verdict did not prove, named by the check it failed.
+stillBehind : LibDb.CopyFault -> Error
+stillBehind fault =
+    case fault of
+        StampStale ->
+            Error.conflict "the review progress copy's stamp is not current for the log's verdict after a rebuild; reload"
+
+        CopyUnproven ->
+            Error.conflict "the review progress copy has no proven digest (table shape or row count) after a rebuild; reload"
+
+        CopyDiffers ->
+            Error.conflict "the review progress copy is still behind the review database after a rebuild; reload"
 
 
 -- The banner a page shows when the review log is not proven under the
@@ -831,68 +841,102 @@ loadPage settings cursor =
         pageOf settings db fresh
 
 
-pageOf : AppSettings -> Db.Db -> ( LibDb.LogState, Index.Snapshot ) -> Task.Task Error QueuePage
-pageOf settings db fresh =
-    case fresh of
-        ( state, snap ) ->
-            do
-                units <- classify (LibDb.verifier state) db snap.rows
-                Task.succeed
-                    { units = units
-                    , total = snap.open
-                    , unbound = snap.unbound
-                    , dbName = SafeText.renderForeign (Settings.dbFileName settings.index.db.path)
-                    , dbBytes = snap.bytes
-                    , next = nextCursor snap.rows
-                    , progress =
-                        { reviewed = snap.units - snap.open + (snap.refusalsAll - snap.refusalsOpen)
-                        , total = snap.units + snap.refusalsAll
-                        }
-                    , log = LibDb.logShown state
-                    , refusals = snap.refusals
-                    , refusalsOpen = snap.refusalsOpen
-                    , refusalsUnbound = snap.refusalsUnbound
-                    }
+-- The page built from a copy `proveCopy` signed off: the type admits no
+-- snapshot a prover did not pair with the verdict it holds for.
+pageOf : AppSettings -> Db.Db -> LibDb.ProvenCopy -> Task.Task Error QueuePage
+pageOf settings db proven =
+    let
+        state =
+            LibDb.provenState proven
+
+        snap =
+            LibDb.provenSnapshot proven
+    in
+    do
+        units <- classify (LibDb.verifier state) db snap.rows
+        Task.succeed
+            { units = units
+            , total = snap.open
+            , unbound = snap.unbound
+            , dbName = SafeText.renderForeign (Settings.dbFileName settings.index.db.path)
+            , dbBytes = snap.bytes
+            , next = nextCursor snap.rows
+            , progress =
+                { reviewed = snap.units - snap.open + (snap.refusalsAll - snap.refusalsOpen)
+                , total = snap.units + snap.refusalsAll
+                }
+            , log = LibDb.logShown state
+            , refusals = snap.refusals
+            , refusalsOpen = snap.refusalsOpen
+            , refusalsUnbound = snap.refusalsUnbound
+            }
 
 
 -- The index read at `cursor` with the review log's verdict, taken once for
--- the load, trusted only when the `reviewed` copy holds for it: a stamp
--- current for the verdict and exactly the pairs of the entries its walk
--- verified. It is read as is, or once more after one rebuild of the copy
--- under that same verdict; a copy that still does not hold is a failed
--- load. A pair written into the copy outside a drain is never counted: the
--- load rebuilds the copy from the log first. The verdict is taken
--- before the index is read: a decision recorded after it moves the head on,
--- so a match proves the copy holds every counted decision up to a head the
--- log really had, and an entry edited, removed or added outside this tool
--- changes the verdict, so the copy is rebuilt on this load. One walk of the
--- log per load.
-freshSnapshot : AppSettings -> Db.Db -> Db.Db -> Index.Cursor -> Task.Task Error ( LibDb.LogState, Index.Snapshot )
+-- the load, proven by `proveCopy`: a stamp current for the verdict and
+-- exactly the pairs of the entries its walk verified. It is read as is, or
+-- once more after one rebuild of the copy under that same verdict; a copy
+-- that still does not prove is a failed load naming the fault. A pair
+-- written into the copy outside a drain is never counted: the load rebuilds
+-- the copy from the log first. The verdict is taken before the index is
+-- read: a decision recorded after it moves the head on, so a match proves
+-- the copy holds every counted decision up to a head the log really had,
+-- and an entry edited, removed or added outside this tool changes the
+-- verdict, so the copy is rebuilt on this load. One walk of the log per
+-- load.
+freshSnapshot : AppSettings -> Db.Db -> Db.Db -> Index.Cursor -> Task.Task Error LibDb.ProvenCopy
 freshSnapshot settings conn db cursor =
     do
         state <- LibDb.logVerdict settings.key db
         first <- Index.readSnapshot settings.key settings.index.roots conn cursor
-        if LibDb.copyHolds state first then
-            Task.succeed ( state, first )
+        case LibDb.proveCopy state first of
+            Ok proven ->
+                Task.succeed proven
 
-        else
-            do
-                rebuildUnder settings.index resyncBound state db
-                second <- Index.readSnapshot settings.key settings.index.roots conn cursor
-                if LibDb.copyHolds state second then
-                    Task.succeed ( state, second )
+            Err _ ->
+                do
+                    rebuildUnder settings.index resyncBound state db
+                    second <- Index.readSnapshot settings.key settings.index.roots conn cursor
+                    case LibDb.proveCopy state second of
+                        Ok proven ->
+                            Task.succeed proven
 
-                else
-                    Task.fail stillBehind
+                        Err fault ->
+                            Task.fail (stillBehind fault)
 
 
--- A decided unit drained from the index, then the queue page at `cursor`
--- reloaded. The drain writes the index alone: the review database already
--- holds the decision, and `written` says how it moved the log's head, so
--- the drain moves the copy's stamp the same way.
+-- A decided unit drained from the index after its decision is found in the
+-- review log: the log is walked under the configured key, the attested
+-- pair is looked up in it, and only a verified row's pair drains. The pair
+-- written to `reviewed` is the log's, never the message's. An attested pair
+-- with no verified row — none recorded, another hash recorded, a row that
+-- fails the key, or a broken log — drains nothing and returns 0. `written`
+-- says how the decision moved the log's head, so the drain moves the copy's
+-- stamp the same way; it never decides what drains.
+drainDecision : AppSettings -> Index.Attested -> Index.Written -> Task.Task Error Int
+drainDecision settings attested written =
+    do
+        db <- LibDb.openAt settings.review
+        state <- LibDb.logVerdict settings.key db
+        entry <- LibDb.findDecision (LibDb.verifier state) db (Index.attestedUid attested) (Index.attestedHash attested)
+        case entry of
+            Just (Verified row) ->
+                Index.drainUnit settings.index (LibDb.verifiedPair row) written
+
+            Just (Unverified _) ->
+                Task.succeed 0
+
+            Nothing ->
+                Task.succeed 0
+
+
+-- A decided unit drained from the index through `drainDecision`, then the
+-- queue page at `cursor` reloaded. The drain writes the index alone: the
+-- review database already holds the decision, and the drain re-reads it
+-- there before writing.
 drainThenLoad : AppSettings -> Index.Attested -> Index.Written -> Index.Cursor -> Task.Task Error QueuePage
 drainThenLoad settings attested written cursor =
-    Index.drainUnit settings.index attested written |> Task.andThen (\_ -> loadPage settings cursor)
+    drainDecision settings attested written |> Task.andThen (\_ -> loadPage settings cursor)
 
 
 -- A full page may have rows after it; a short page is the last one.

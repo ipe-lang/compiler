@@ -45,6 +45,8 @@ module TestSupport exposing
     , drainThenLoadNow
     , loadUnitViewNow
     , drainUnitNow
+    , attestedNow
+    , proveCopyNow
     , decideShownNow
     , decidedRefusalNow
     , decidedNow
@@ -801,9 +803,33 @@ refusedAs expected task =
         |> Task.onError (\_ -> Task.succeed False)
 
 
+-- A drain made the one way the app makes it: through `Queue.drainDecision`,
+-- which looks the attested pair up in the review log under the environment's
+-- key and writes only a verified row's pair.
 drainUnitNow : Index.Attested -> Index.Written -> Task.Task Error Int
 drainUnitNow attested written =
-    envSettings |> Task.andThen (\settings -> Index.drainUnit settings attested written)
+    envAppSettings |> Task.andThen (\settings -> Queue.drainDecision settings attested written)
+
+
+-- The `Attested` proof for fixture unit `unit` in the current scratch index,
+-- built the one way the app builds it: the unit is loaded and its shown
+-- source re-verified by `Index.reverify`. A unit that is not shown fails the
+-- run.
+attestedNow : Uid -> Task.Task Error Index.Attested
+attestedNow unit =
+    loadUnitNow unit |> Task.andThen (reverifyShown unit)
+
+
+-- `LibDb.proveCopy` run over the current scratch: the review log's verdict
+-- under the environment's key, against the index snapshot read at `cursor`.
+proveCopyNow : Db.Db -> Index.Cursor -> Task.Task Error (Result LibDb.CopyFault LibDb.ProvenCopy)
+proveCopyNow db cursor =
+    do
+        settings <- envAppSettings
+        state <- LibDb.logVerdict settings.key db
+        conn <- Index.readConnection settings.index
+        snap <- Index.readSnapshot settings.key settings.index.roots conn cursor
+        Task.succeed (LibDb.proveCopy state snap)
 
 
 resyncReviewedNow : Db -> Task.Task Error Int
