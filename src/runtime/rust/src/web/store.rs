@@ -380,7 +380,7 @@ impl Tombstones {
     /// delete is still removing; [`Self::deleted`] settles the hold once the
     /// persisted step returns, and a delete dropped mid-flight keeps it.
     #[cfg(any(feature = "db", feature = "redis_store"))]
-    fn begin(&self, sid: &str) {
+    fn hold(&self, sid: &str) {
         self.record(sid);
     }
 
@@ -1630,6 +1630,12 @@ pub struct SqliteStore<Model, Msg> {
 
 #[cfg(feature = "db")]
 impl<Model, Msg> SqliteStore<Model, Msg> {
+    /// The store's own vetted pool, for a test that edits the schema under it.
+    #[cfg(test)]
+    pub(super) const fn pool(&self) -> &sqlx::SqlitePool {
+        &self.pool
+    }
+
     /// Open (creating if missing) the SQLite session store at `path`.
     ///
     /// # Errors
@@ -1809,7 +1815,7 @@ where
         settle_in(&self.mem_cache, sid, &handle, slot, written)
     }
     async fn delete(&self, sid: &str) -> Deleted {
-        self.tombstones.begin(sid);
+        self.tombstones.hold(sid);
         remove_in(&self.mem_cache, sid);
         self.tombstones.deleted(sid, self.delete_row(sid).await)
     }
@@ -2033,7 +2039,7 @@ where
         settle_in(&self.mem_cache, sid, &handle, slot, written)
     }
     async fn delete(&self, sid: &str) -> Deleted {
-        self.tombstones.begin(sid);
+        self.tombstones.hold(sid);
         remove_in(&self.mem_cache, sid);
         self.tombstones.deleted(sid, self.delete_row(sid).await)
     }
@@ -2245,7 +2251,7 @@ where
         settle_in(&self.mem_cache, sid, &handle, slot, written)
     }
     async fn delete(&self, sid: &str) -> Deleted {
-        self.tombstones.begin(sid);
+        self.tombstones.hold(sid);
         remove_in(&self.mem_cache, sid);
         self.tombstones.deleted(sid, self.delete_key(sid).await)
     }

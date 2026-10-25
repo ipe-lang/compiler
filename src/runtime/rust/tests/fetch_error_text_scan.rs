@@ -212,7 +212,10 @@ fn a_formatting_macro_under_another_name_trips_the_scan() {
     "#;
     assert_eq!(
         scan(source),
-        ScanOutcome::Scanned(vec![Finding::Macro("render".to_owned())])
+        ScanOutcome::Scanned(vec![
+            Finding::Rename("render".to_owned()),
+            Finding::Macro("render".to_owned()),
+        ])
     );
 }
 

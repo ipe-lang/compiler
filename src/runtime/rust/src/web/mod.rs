@@ -15721,7 +15721,7 @@ mod route_entry_cmd_tests {
                 let _ = std::fs::remove_file(format!("{p}{suffix}"));
             }
             let bounded = tokio::time::timeout(Duration::from_secs(60), async {
-                let store: Store = Arc::new(
+                let sqlite = Arc::new(
                     store::SqliteStore::<Model, Msg>::new(
                         p.as_str(),
                         Duration::from_secs(60),
@@ -15730,9 +15730,8 @@ mod route_entry_cmd_tests {
                     .await
                     .expect("the temp SQLite store opens"),
                 );
-                let side = sqlx::SqlitePool::connect(&format!("sqlite:{p}"))
-                    .await
-                    .expect("a second connection to the temp store opens");
+                let store: Store = sqlite.clone();
+                let side = sqlite.pool();
                 let gate = Arc::new(tokio::sync::Semaphore::new(0));
                 HELD_GATE.with(|g| *g.borrow_mut() = Some(Arc::clone(&gate)));
                 let mut state = fixture_state(store.clone(), Arc::new(AtomicUsize::new(0)));
@@ -15748,7 +15747,7 @@ mod route_entry_cmd_tests {
                 );
 
                 sqlx::query("DROP TABLE ipe_sessions")
-                    .execute(&side)
+                    .execute(side)
                     .await
                     .expect("drop the session table");
                 let before = store_write_failures("set", "diverged");
@@ -15775,7 +15774,7 @@ mod route_entry_cmd_tests {
                     "CREATE TABLE ipe_sessions (sid TEXT PRIMARY KEY, blob TEXT NOT NULL, \
                      last_seen INTEGER NOT NULL, schema_tag TEXT NOT NULL)",
                 )
-                .execute(&side)
+                .execute(side)
                 .await
                 .expect("recreate the session table");
                 let (status, _, _, _) = get_via(app, "/", Some(&sid)).await;
@@ -15792,7 +15791,6 @@ mod route_entry_cmd_tests {
                     !store.holds(&sid, &live),
                     "a landed checkpoint makes the session evictable again"
                 );
-                side.close().await;
             })
             .await;
             HELD_GATE.with(|g| *g.borrow_mut() = None);
