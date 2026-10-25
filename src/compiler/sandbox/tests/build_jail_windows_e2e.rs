@@ -24,7 +24,7 @@ use std::path::{Path, PathBuf};
 
 use ipe_sandbox::build_jail::{CapabilityAxis, JailOutcome, build_in_jail};
 use ipe_sandbox::run_jail::{FilesystemScope, RunJailTools, SandboxProfile};
-use ipe_sandbox::{CanonicalPath, JailMounts};
+use ipe_sandbox::{CanonicalPath, HostTool, JailMounts, host_tool};
 
 /// A per-test scratch under the process temp dir (NTFS on the hosted image, so
 /// the container-SID ACL — and thus the filesystem boundary — is meaningful).
@@ -39,21 +39,15 @@ fn scratch_dir(tag: &str) -> PathBuf {
 }
 
 fn powershell() -> PathBuf {
-    if let Some(path) = ipe_env::var_os("PATH") {
-        for dir in std::env::split_paths(&path) {
-            let candidate = dir.join("powershell.exe");
-            if candidate.is_file() {
-                return candidate;
-            }
-        }
+    if let Ok(found) = host_tool::resolve(HostTool::PowerShell) {
+        return found.into();
     }
     let root = ipe_env::var_os("SystemRoot").unwrap_or_else(|| OsString::from("C:\\Windows"));
     PathBuf::from(root).join("System32\\WindowsPowerShell\\v1.0\\powershell.exe")
 }
 
 /// The declared-scoped probe profile: `subprocess` granted (PowerShell needs to
-/// run), the axis under test WITHHELD. The Windows arm reads no `RunJailTools`, so
-/// an inert token satisfies the shared signature.
+/// run), the axis under test WITHHELD.
 fn probe_profile(network: bool, filesystem: FilesystemScope) -> SandboxProfile {
     SandboxProfile {
         network,
@@ -63,12 +57,9 @@ fn probe_profile(network: bool, filesystem: FilesystemScope) -> SandboxProfile {
     }
 }
 
-fn inert_tools() -> RunJailTools {
-    RunJailTools {
-        bwrap: PathBuf::from("windows-native"),
-        prlimit: PathBuf::from("windows-native"),
-        timeout: Some(PathBuf::from("windows-native")),
-    }
+/// The Windows jail builds its kernel objects itself.
+const fn inert_tools() -> RunJailTools {
+    RunJailTools::Native
 }
 
 /// Build a payload: `powershell -Command <script>`. The script emits the

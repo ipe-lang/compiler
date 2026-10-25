@@ -37,12 +37,9 @@ fn scratch_dir(tag: &str) -> PathBuf {
     dir
 }
 
-fn inert_tools() -> RunJailTools {
-    RunJailTools {
-        bwrap: PathBuf::from("freebsd-native"),
-        prlimit: PathBuf::from("freebsd-native"),
-        timeout: Some(PathBuf::from("freebsd-native")),
-    }
+/// The FreeBSD jail resolves `jail(8)` and its helpers itself.
+const fn inert_tools() -> RunJailTools {
+    RunJailTools::Native
 }
 
 /// The declared-scoped probe profile: `subprocess` granted (the probe forks
