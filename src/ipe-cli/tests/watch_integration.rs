@@ -247,7 +247,15 @@ fn port_is_free(port: u16) -> bool {
 }
 
 fn write_main(ipe_dir: &Path, source: &str) -> Result<(), BoxError> {
-    std::fs::write(ipe_dir.join("Main.ipe"), source)
+    let src_dir = ipe_dir.join("src");
+    std::fs::create_dir_all(&src_dir)
+        .map_err(|e| -> BoxError { format!("mkdir {}: {e}", src_dir.display()).into() })?;
+    std::fs::write(
+        ipe_dir.join("package.ipe"),
+        "module Package exposing (package)\n\n\npackage =\n    { name = \"watch-fixture\" }\n",
+    )
+    .map_err(|e| -> BoxError { format!("write package.ipe: {e}").into() })?;
+    std::fs::write(src_dir.join("Main.ipe"), source)
         .map_err(|e| -> BoxError { format!("write Main.ipe: {e}").into() })
 }
 
@@ -327,7 +335,7 @@ fn watch_rebuild_on_save_swaps_the_running_binary() -> Result<(), BoxError> {
 
     let sink = EventSink::default();
     let port = 19151;
-    let (join, handle) = start_watch(&ipe_dir.join("Main.ipe"), &out_dir, port, &sink);
+    let (join, handle) = start_watch(&ipe_dir, &out_dir, port, &sink);
 
     assert!(
         wait_for_body(port, "v1", Duration::from_mins(4)),
@@ -354,7 +362,7 @@ fn watch_keeps_last_good_binary_alive_on_a_syntax_error() -> Result<(), BoxError
 
     let sink = EventSink::default();
     let port = 19152;
-    let (join, handle) = start_watch(&ipe_dir.join("Main.ipe"), &out_dir, port, &sink);
+    let (join, handle) = start_watch(&ipe_dir, &out_dir, port, &sink);
 
     assert!(
         wait_for_body(port, "v1", Duration::from_mins(4)),
@@ -397,7 +405,7 @@ fn watch_coalesces_a_rapid_double_save_into_one_rebuild() -> Result<(), BoxError
 
     let sink = EventSink::default();
     let port = 19153;
-    let (join, handle) = start_watch(&ipe_dir.join("Main.ipe"), &out_dir, port, &sink);
+    let (join, handle) = start_watch(&ipe_dir, &out_dir, port, &sink);
 
     assert!(
         wait_for_body(port, "v1", Duration::from_mins(4)),
@@ -456,7 +464,7 @@ fn dropping_a_watch_handle_without_stop_still_reaps_the_supervised_child() -> Re
 
     let sink = EventSink::default();
     let port = 19155;
-    let (join, handle) = start_watch(&ipe_dir.join("Main.ipe"), &out_dir, port, &sink);
+    let (join, handle) = start_watch(&ipe_dir, &out_dir, port, &sink);
 
     assert!(
         wait_for_body(port, "v1", Duration::from_mins(4)),
@@ -518,7 +526,7 @@ fn watch_does_not_bind_a_proxy_for_a_non_http_shape() -> Result<(), BoxError> {
 
     let sink = EventSink::default();
     let port = 19156;
-    let (join, handle) = start_watch_bluegreen(&ipe_dir.join("Main.ipe"), &out_dir, port, &sink);
+    let (join, handle) = start_watch_bluegreen(&ipe_dir, &out_dir, port, &sink);
 
     // Wait for the cold build to spawn the worker (its child carries the
     // injected relocation var — discoverable via /proc).
@@ -575,7 +583,7 @@ fn watch_proxies_a_hardcoded_port_server_on_an_internal_port() -> Result<(), Box
     // opts.port must be a different port — proving the app relocated (T1) and the
     // proxy fronts it (T2).
     let port = 19157;
-    let (join, handle) = start_watch_bluegreen(&ipe_dir.join("Main.ipe"), &out_dir, port, &sink);
+    let (join, handle) = start_watch_bluegreen(&ipe_dir, &out_dir, port, &sink);
 
     // The proxy answers on opts.port with the app's body — the app came up on an
     // internal port BEHIND the proxy despite hardcoding 8000. (Were the 502
@@ -610,12 +618,7 @@ fn operator_port_vars_never_relocate_a_watched_child() -> Result<(), BoxError> {
         return Ok(());
     }
     let (ipe_dir, out_dir) = fresh_dirs("operator_port_vars")?;
-    std::fs::create_dir_all(ipe_dir.join("src"))?;
-    std::fs::write(
-        ipe_dir.join("package.ipe"),
-        "module Package exposing (package)\n\n\npackage =\n    { name = \"operator-port\" }\n",
-    )?;
-    write_main(&ipe_dir.join("src"), &server_fixture("OPERATOR-V1"))?;
+    write_main(&ipe_dir, &server_fixture("OPERATOR-V1"))?;
     let port: u16 = 19165;
     let operator: u16 = 19166;
     let runtime_dir = e2e_support::require_runtime().into_path_buf();

@@ -165,7 +165,15 @@ fn fresh_dirs(tag: &str) -> Result<(PathBuf, PathBuf), BoxError> {
 }
 
 fn write_main(ipe_dir: &Path, source: &str) -> Result<(), BoxError> {
-    std::fs::write(ipe_dir.join("Main.ipe"), source)
+    let src_dir = ipe_dir.join("src");
+    std::fs::create_dir_all(&src_dir)
+        .map_err(|e| -> BoxError { format!("mkdir {}: {e}", src_dir.display()).into() })?;
+    std::fs::write(
+        ipe_dir.join("package.ipe"),
+        "module Package exposing (package)\n\n\npackage =\n    { name = \"watch-fixture\" }\n",
+    )
+    .map_err(|e| -> BoxError { format!("write package.ipe: {e}").into() })?;
+    std::fs::write(src_dir.join("Main.ipe"), source)
         .map_err(|e| -> BoxError { format!("write Main.ipe: {e}").into() })
 }
 
@@ -447,7 +455,7 @@ fn measure_rebuild_tail(
 fn run_measurement(bluegreen: bool, port: u16, tag: &str) -> Result<(), BoxError> {
     let (ipe_dir, out_dir) = fresh_dirs(tag)?;
     write_main(&ipe_dir, &web_fixture("M-0"))?;
-    let (join, handle) = start_watch(&ipe_dir.join("Main.ipe"), &out_dir, port, bluegreen);
+    let (join, handle) = start_watch(&ipe_dir, &out_dir, port, bluegreen);
     assert!(
         wait_for_marker(port, "M-0", Duration::from_mins(5)),
         "cold build must serve M-0"
@@ -521,7 +529,7 @@ fn bluegreen_rebuild_keeps_the_client_connection_alive() -> Result<(), BoxError>
     write_main(&ipe_dir, &web_fixture("MARKER-V1"))?;
 
     let port = 19191;
-    let (join, handle) = start_watch(&ipe_dir.join("Main.ipe"), &out_dir, port, true);
+    let (join, handle) = start_watch(&ipe_dir, &out_dir, port, true);
 
     assert!(
         wait_for_marker(port, "MARKER-V1", Duration::from_mins(5)),
@@ -614,7 +622,7 @@ fn bluegreen_rebuild_preserves_the_model_across_the_swap() -> Result<(), BoxErro
     write_main(&ipe_dir, &ticker_fixture("HANDOFF-V1"))?;
 
     let port = 19193;
-    let (join, handle) = start_watch(&ipe_dir.join("Main.ipe"), &out_dir, port, true);
+    let (join, handle) = start_watch(&ipe_dir, &out_dir, port, true);
     assert!(
         wait_for_marker(port, "HANDOFF-V1", Duration::from_mins(5)),
         "cold build must serve v1 through the blue-green proxy"
@@ -691,7 +699,7 @@ fn bluegreen_rebuild_resets_cleanly_on_model_type_change() -> Result<(), BoxErro
     write_main(&ipe_dir, &ticker_fixture("RESET-V1"))?;
 
     let port = 19194;
-    let (join, handle) = start_watch(&ipe_dir.join("Main.ipe"), &out_dir, port, true);
+    let (join, handle) = start_watch(&ipe_dir, &out_dir, port, true);
     assert!(
         wait_for_marker(port, "RESET-V1", Duration::from_mins(5)),
         "cold build must serve v1 through the blue-green proxy"
@@ -798,7 +806,7 @@ fn bluegreen_rebuild_preserves_state_on_additive_model_change() -> Result<(), Bo
     write_main(&ipe_dir, &ticker_fixture("ADDITIVE-V1"))?;
 
     let port = 19195;
-    let (join, handle) = start_watch(&ipe_dir.join("Main.ipe"), &out_dir, port, true);
+    let (join, handle) = start_watch(&ipe_dir, &out_dir, port, true);
     assert!(
         wait_for_marker(port, "ADDITIVE-V1", Duration::from_mins(5)),
         "cold build must serve v1 through the blue-green proxy"
@@ -859,7 +867,7 @@ fn flag_off_direct_path_still_swaps_the_binary() -> Result<(), BoxError> {
     write_main(&ipe_dir, &web_fixture("OFF-V1"))?;
 
     let port = 19192;
-    let (join, handle) = start_watch(&ipe_dir.join("Main.ipe"), &out_dir, port, false);
+    let (join, handle) = start_watch(&ipe_dir, &out_dir, port, false);
 
     assert!(
         wait_for_marker(port, "OFF-V1", Duration::from_mins(5)),
