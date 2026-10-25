@@ -548,7 +548,10 @@ nodes regardless of position.
 declaration order, captures `:param` segments, and fills the page
 constructor's payload fields with them in order (`String`, `Int`, `Float`,
 `Bool`; a segment that does not parse falls through to the next route).
-Paths are case-sensitive.
+Paths are case-sensitive. A pattern follows the `Server` path grammar: a
+`:param` is a whole segment, there is no `*name` catch-all, and a literal
+segment holds no `:` or `*` (write `%3A`/`%2A`); a literal breaking this is
+refused at compile time (IPE-L0156).
 - Builder = the page constructor itself (`AppDetailPage`), never a lambda or
   function (IPE-L0123): the compiler derives the inverse, page → path.
 - Every Page constructor, `notFound` included, needs a route (IPE-L0159).

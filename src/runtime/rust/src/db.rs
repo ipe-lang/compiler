@@ -333,15 +333,79 @@ impl WriteBegin {
 /// The begin mode of this build's engine.
 const KERNEL_WRITE_BEGIN: WriteBegin = WriteBegin::for_engine(KERNEL_ENGINE);
 
+/// Where an engine keeps the parsed schema a statement compiles against.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SchemaCache {
+    /// SQLite: each connection caches the schema; a pooled connection must
+    /// re-read it before it compiles a statement another connection's DDL
+    /// may have outdated.
+    PerConnection,
+    /// Postgres: the server reads its catalog per statement.
+    Server,
+}
+
+impl SchemaCache {
+    /// Where `engine` keeps the schema its statements compile against.
+    const fn for_engine(engine: DbEngine) -> Self {
+        match engine {
+            DbEngine::Sqlite => Self::PerConnection,
+            DbEngine::Postgres => Self::Server,
+        }
+    }
+
+    /// The statement that makes a connection re-read a changed schema.
+    const fn probe(self) -> Option<&'static str> {
+        match self {
+            Self::PerConnection => Some(SCHEMA_PROBE),
+            Self::Server => None,
+        }
+    }
+}
+
+/// Reads `sqlite_master`, so its schema-cookie check resets a stale cache.
+///
+/// `BEGIN`, `BEGIN IMMEDIATE` and `PRAGMA schema_version` leave a stale cache
+/// in place; a statement that reads the schema table resets it.
+const SCHEMA_PROBE: &str = "SELECT 1 FROM sqlite_master LIMIT 1";
+
+/// Where this build's engine keeps its schema.
+const KERNEL_SCHEMA_CACHE: SchemaCache = SchemaCache::for_engine(KERNEL_ENGINE);
+
+/// Makes `conn` re-read the schema when `cache` keeps one per connection.
+///
+/// The one site the schema probe runs: the pool's checkout hook
+/// ([`vetted_pool_options`]) and [`begin_write_txn`] both call it. A failed
+/// probe is an error, never a pass, so the caller drops the connection or the
+/// transaction instead of compiling against a stale schema.
+async fn refresh_schema_cache<DB>(
+    conn: &mut DB::Connection,
+    cache: SchemaCache,
+) -> Result<(), sqlx::Error>
+where
+    DB: sqlx::Database,
+    for<'c> &'c mut DB::Connection: sqlx::Executor<'c, Database = DB>,
+    <DB as sqlx::Database>::Arguments: sqlx::IntoArguments<DB>,
+{
+    let Some(probe) = cache.probe() else {
+        return Ok(());
+    };
+    sqlx::query::<DB>(probe).execute(conn).await.map(|_| ())
+}
+
 /// Opens a top-level transaction that may write on a connection from `pool`.
 ///
 /// The one site a transaction begins on a pool connection; a nested scope on a
-/// held transaction takes a `SAVEPOINT`, which keeps the outer lock mode.
+/// held transaction takes a `SAVEPOINT`, which keeps the outer lock mode and
+/// schema. Once the write lock is held the connection re-reads the schema, so
+/// the transaction compiles against every schema change committed before its
+/// lock, and no other connection can commit one until it ends.
 async fn begin_write_txn(pool: &Db) -> Result<sqlx::Transaction<'static, DbDatabase>, sqlx::Error> {
-    match KERNEL_WRITE_BEGIN.statement() {
+    let mut tx = match KERNEL_WRITE_BEGIN.statement() {
         Some(statement) => pool.begin_with(statement).await,
         None => pool.begin().await,
-    }
+    }?;
+    refresh_schema_cache::<DbDatabase>(&mut *tx, KERNEL_SCHEMA_CACHE).await?;
+    Ok(tx)
 }
 
 /// A dedicated sqlx `Transaction`, shared across the body via `Arc<Mutex<..>>`
@@ -2128,8 +2192,10 @@ impl GatedDial for sqlx::Postgres {
 /// address), a bounded connection cap, and the engine-version floor before any
 /// other statement. A relay the gate opened is held until the pool closes.
 /// Every failure is a [`DbConnectError`], which holds no driver payload, so no
-/// caller can log or return a connection URL a driver echoed. The runtime's
-/// own telemetry spill (`telemetry_spill.rs`, and the hub reading it) is not a
+/// caller can log or return a connection URL a driver echoed. Its options come
+/// from [`vetted_pool_options`]: a connection handed out again first re-reads
+/// a schema another connection changed, and one returned inside a transaction
+/// is closed. The runtime's own telemetry spill (`telemetry_spill.rs`, and the hub reading it) is not a
 /// caller-supplied URL: it opens a local SQLite file named by operator config,
 /// carrying no credential, directly.
 pub struct VettedPool<DB: sqlx::Database>(sqlx::Pool<DB>);
@@ -2150,9 +2216,7 @@ where
         let engine = DbEngine::for_driver::<DB>().map_err(DbConnectError::EngineRefused)?;
         let mut relay = None;
         let options = DB::gated_connect_options(url, max_connections, &mut relay).await?;
-        let pool = sqlx::pool::PoolOptions::<DB>::new()
-            .max_connections(max_connections)
-            .after_release(keep_outside_transaction::<DB::Connection>)
+        let pool = vetted_pool_options::<DB>(max_connections, SchemaCache::for_engine(engine))
             .connect_with(options)
             .await
             .map_err(|e| DbConnectError::Unreachable(DriverFailure::of(engine, &e)))?;
@@ -2171,6 +2235,32 @@ where
     pub fn into_pool(self) -> sqlx::Pool<DB> {
         self.0
     }
+}
+
+/// The options of every pool [`VettedPool::connect`] opens.
+///
+/// At most `max_connections`; a connection returned inside a transaction is
+/// closed ([`keep_outside_transaction`]); and, when `cache` keeps the schema
+/// per connection, an idle connection re-reads it before it is handed out
+/// ([`refresh_schema_cache`]), so a statement never compiles against a schema
+/// older than the last change committed before its checkout. A failed refresh
+/// fails the hook, and the pool closes that connection instead of handing it
+/// out.
+fn vetted_pool_options<DB>(max_connections: u32, cache: SchemaCache) -> sqlx::pool::PoolOptions<DB>
+where
+    DB: sqlx::Database,
+    for<'c> &'c mut DB::Connection: sqlx::Executor<'c, Database = DB>,
+    <DB as sqlx::Database>::Arguments: sqlx::IntoArguments<DB>,
+{
+    let options = sqlx::pool::PoolOptions::<DB>::new()
+        .max_connections(max_connections)
+        .after_release(keep_outside_transaction::<DB::Connection>);
+    if cache.probe().is_none() {
+        return options;
+    }
+    options.before_acquire(move |conn, _meta| {
+        Box::pin(async move { refresh_schema_cache::<DB>(conn, cache).await.map(|()| true) })
+    })
 }
 
 /// Whether a connection coming back to its pool may be pooled again: only
@@ -9194,6 +9284,371 @@ mod tests {
         assert!(
             offenders.is_empty(),
             "a transaction begin outside db.rs can start deferred: {offenders:?}"
+        );
+    }
+
+    /// Statements that fail at prepare time on a connection whose cached schema
+    /// predates another connection's DDL, before any schema-cookie check runs.
+    const STALE_SENSITIVE: [&str; 2] = [
+        "CREATE TRIGGER tr AFTER INSERT ON t BEGIN SELECT 1; END",
+        "ALTER TABLE t RENAME TO u",
+    ];
+
+    /// The checked-write shape of [`STALE_SENSITIVE`]: an insert into `v`, a
+    /// view in the stale schema and a table in the current one.
+    const STALE_CHECKED_INSERT: &str = "INSERT INTO v (x) VALUES (1) RETURNING (1)";
+
+    /// Connect options for a fresh rollback-journal temp SQLite file.
+    fn schema_test_file() -> (sqlx::sqlite::SqliteConnectOptions, std::path::PathBuf) {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let mut path = crate::scratch_core::test_temp_root();
+        path.push(format!(
+            "ipe_schema_test_{}_{n}_{}.db",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos())
+        ));
+        let _ = std::fs::remove_file(&path);
+        let options = sqlx::sqlite::SqliteConnectOptions::new()
+            .filename(&path)
+            .create_if_missing(true)
+            .busy_timeout(SQLITE_BUSY_TIMEOUT);
+        (options, path)
+    }
+
+    /// A two-connection pool with no checkout hook.
+    async fn hookless_pool(options: sqlx::sqlite::SqliteConnectOptions) -> Db {
+        sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(2)
+            .connect_with(options)
+            .await
+            .expect("connect a hookless pool")
+    }
+
+    /// A two-connection pool built by the production [`vetted_pool_options`].
+    async fn vetted_test_pool(options: sqlx::sqlite::SqliteConnectOptions) -> Db {
+        vetted_pool_options::<sqlx::Sqlite>(2, SchemaCache::PerConnection)
+            .connect_with(options)
+            .await
+            .expect("connect a vetted pool")
+    }
+
+    /// Leaves `pool`'s idle connection B with a schema older than the file's.
+    ///
+    /// Connection A creates `t`, `u`, trigger `tr` and view `v`, B caches
+    /// that schema, then A drops `tr` and `u` and replaces view `v` with a
+    /// table. A is returned still held, so the pool, at its two-connection
+    /// cap, hands out B next.
+    async fn stale_schema_pair(pool: &Db) -> sqlx::pool::PoolConnection<sqlx::Sqlite> {
+        let mut a = pool.acquire().await.expect("acquire A");
+        let mut b = pool.acquire().await.expect("acquire B");
+        for ddl in [
+            "CREATE TABLE t (x)",
+            "CREATE TABLE u (x)",
+            "CREATE TRIGGER tr AFTER INSERT ON t BEGIN SELECT 1; END",
+            "CREATE TABLE base (x)",
+            "CREATE VIEW v AS SELECT x FROM base",
+        ] {
+            sqlx::query(ddl).execute(&mut *a).await.expect(ddl);
+        }
+        let cached = sqlx::query("SELECT name FROM sqlite_master")
+            .fetch_all(&mut *b)
+            .await
+            .expect("B reads the schema");
+        assert_eq!(cached.len(), 5, "B cached every object");
+        for ddl in [
+            "DROP TRIGGER tr",
+            "DROP TABLE u",
+            "DROP VIEW v",
+            "CREATE TABLE v (x)",
+        ] {
+            sqlx::query(ddl).execute(&mut *a).await.expect(ddl);
+        }
+        drop(b);
+        a
+    }
+
+    /// The premise the schema refresh rests on: with no refresh, each
+    /// stale-sensitive statement fails on the connection that cached the
+    /// older schema, so the refresh tests below are not vacuous.
+    #[tokio::test]
+    async fn sqlite_caches_the_schema_per_connection() {
+        for statement in STALE_SENSITIVE.into_iter().chain([STALE_CHECKED_INSERT]) {
+            let (options, path) = schema_test_file();
+            let pool = hookless_pool(options).await;
+            let held = stale_schema_pair(&pool).await;
+            let ran = sqlx::query(statement).execute(&pool).await;
+            drop(held);
+            pool.close().await;
+            let _ = std::fs::remove_file(&path);
+            let failure = ran
+                .as_ref()
+                .err()
+                .map(|e| (classify_failure(DbEngine::Sqlite, e), e.to_string()));
+            assert!(
+                matches!(failure, Some((IpeDbFailure::InvalidStatement, _))),
+                "{statement} ran on the stale connection: {failure:?}"
+            );
+        }
+    }
+
+    /// An autocommit statement on a vetted pool compiles against the schema
+    /// another connection changed before the checkout.
+    #[tokio::test]
+    async fn a_pooled_connection_compiles_against_schema_another_connection_changed() {
+        for statement in STALE_SENSITIVE {
+            let (options, path) = schema_test_file();
+            let pool = vetted_test_pool(options).await;
+            let held = stale_schema_pair(&pool).await;
+            let ran: IpeResult<String, i64> = db_exec_raw(pool.clone(), statement.to_owned()).await;
+            drop(held);
+            pool.close().await;
+            let _ = std::fs::remove_file(&path);
+            assert!(matches!(ran, IpeResult::Ok(_)), "{statement}: {ran:?}");
+        }
+    }
+
+    /// A write transaction re-reads the schema once it holds the write lock,
+    /// even on a pool with no checkout hook.
+    #[tokio::test]
+    async fn a_write_transaction_compiles_against_schema_committed_before_its_lock() {
+        for statement in STALE_SENSITIVE {
+            let (options, path) = schema_test_file();
+            let pool = hookless_pool(options).await;
+            let held = stale_schema_pair(&pool).await;
+            let sql = statement.to_owned();
+            let ran: IpeResult<String, i64> =
+                db_with_transaction(pool.clone(), move |c| db_exec_raw(c, sql)).await;
+            drop(held);
+            pool.close().await;
+            let _ = std::fs::remove_file(&path);
+            assert!(matches!(ran, IpeResult::Ok(_)), "{statement}: {ran:?}");
+        }
+    }
+
+    /// A checked write on the pool begins through [`begin_write_txn`], so it
+    /// writes into the table that replaced a view the connection cached.
+    #[tokio::test]
+    async fn a_checked_write_on_the_pool_compiles_against_the_current_schema() {
+        let (options, path) = schema_test_file();
+        let pool = hookless_pool(options).await;
+        let held = stale_schema_pair(&pool).await;
+        let ran: IpeResult<String, i64> = db_insert_fields_checked(
+            pool.clone(),
+            "v".into(),
+            vec![("x".to_string(), Some(SqlParam::Int(1)))],
+            checked_frag("1", vec![]),
+        )
+        .await;
+        drop(held);
+        pool.close().await;
+        let _ = std::fs::remove_file(&path);
+        assert!(matches!(ran, IpeResult::Ok(1)), "{ran:?}");
+    }
+
+    #[test]
+    fn schema_cache_is_per_connection_on_sqlite_only() {
+        assert_eq!(
+            SchemaCache::for_engine(DbEngine::Sqlite),
+            SchemaCache::PerConnection
+        );
+        assert_eq!(SchemaCache::PerConnection.probe(), Some(SCHEMA_PROBE));
+        assert_eq!(
+            SchemaCache::for_engine(DbEngine::Postgres),
+            SchemaCache::Server
+        );
+        assert_eq!(SchemaCache::Server.probe(), None);
+        assert_eq!(KERNEL_SCHEMA_CACHE, SchemaCache::for_engine(KERNEL_ENGINE));
+    }
+
+    /// A schema refresh the engine refuses is an error, never a pass: a probe
+    /// that cannot take its read lock reports `Busy`, and the same probe runs
+    /// once the lock is released.
+    #[tokio::test]
+    async fn a_failed_schema_refresh_is_an_error_not_a_pass() {
+        use sqlx::Connection as _;
+        let (options, path) = schema_test_file();
+        let mut holder = sqlx::sqlite::SqliteConnection::connect_with(&options)
+            .await
+            .expect("connect the lock holder");
+        sqlx::query("CREATE TABLE w (x)")
+            .execute(&mut holder)
+            .await
+            .expect("create w");
+        let mut waiter = sqlx::sqlite::SqliteConnection::connect_with(
+            &options.clone().busy_timeout(std::time::Duration::ZERO),
+        )
+        .await
+        .expect("connect the waiter");
+        sqlx::query("BEGIN EXCLUSIVE")
+            .execute(&mut holder)
+            .await
+            .expect("take the exclusive lock");
+        sqlx::query("INSERT INTO w (x) VALUES (1)")
+            .execute(&mut holder)
+            .await
+            .expect("write under the lock");
+        let refused =
+            refresh_schema_cache::<sqlx::Sqlite>(&mut waiter, SchemaCache::PerConnection).await;
+        let _ = sqlx::query("ROLLBACK").execute(&mut holder).await;
+        let control =
+            refresh_schema_cache::<sqlx::Sqlite>(&mut waiter, SchemaCache::PerConnection).await;
+        let _ = holder.close().await;
+        let _ = waiter.close().await;
+        let _ = std::fs::remove_file(&path);
+        let failure = refused
+            .as_ref()
+            .err()
+            .map(|e| classify_failure(DbEngine::Sqlite, e));
+        assert_eq!(failure, Some(IpeDbFailure::Busy), "{refused:?}");
+        assert!(control.is_ok(), "the probe runs once unlocked: {control:?}");
+    }
+
+    /// A pooled connection whose checkout refresh fails is closed, never
+    /// handed out: the checkout is refused or yields a new connection.
+    #[tokio::test]
+    async fn a_pooled_connection_whose_refresh_fails_is_never_handed_out() {
+        use sqlx::Connection as _;
+        let (options, path) = schema_test_file();
+        let mut holder = sqlx::sqlite::SqliteConnection::connect_with(&options)
+            .await
+            .expect("connect the lock holder");
+        sqlx::query("CREATE TABLE w (x)")
+            .execute(&mut holder)
+            .await
+            .expect("create w");
+        let pool: Db = vetted_pool_options::<sqlx::Sqlite>(1, SchemaCache::PerConnection)
+            .acquire_timeout(std::time::Duration::from_millis(500))
+            .connect_with(options.clone().busy_timeout(std::time::Duration::ZERO))
+            .await
+            .expect("connect a one-connection vetted pool");
+        {
+            let mut marked = pool.acquire().await.expect("acquire the connection");
+            sqlx::query("CREATE TEMP TABLE marker (x)")
+                .execute(&mut *marked)
+                .await
+                .expect("mark the connection");
+        }
+        // Control: with no lock held, the refresh passes and the marked
+        // connection is handed out again.
+        let reused = {
+            let mut again = pool.acquire().await.expect("acquire it again");
+            sqlx::query("SELECT x FROM temp.marker")
+                .fetch_all(&mut *again)
+                .await
+                .map(|rows| rows.len())
+        };
+        sqlx::query("BEGIN EXCLUSIVE")
+            .execute(&mut holder)
+            .await
+            .expect("take the exclusive lock");
+        sqlx::query("INSERT INTO w (x) VALUES (1)")
+            .execute(&mut holder)
+            .await
+            .expect("write under the lock");
+        let handed = pool.acquire().await;
+        let _ = sqlx::query("ROLLBACK").execute(&mut holder).await;
+        let outcome = match handed {
+            Err(e) => format!("refused: {e}"),
+            Ok(mut conn) => match sqlx::query("SELECT x FROM temp.marker")
+                .fetch_all(&mut *conn)
+                .await
+            {
+                Ok(_) => "handed out the connection whose refresh failed".to_owned(),
+                Err(e) => format!("a new connection: {e}"),
+            },
+        };
+        pool.close().await;
+        let _ = holder.close().await;
+        let _ = std::fs::remove_file(&path);
+        assert!(
+            matches!(reused, Ok(0)),
+            "control: the idle connection is reused: {reused:?}"
+        );
+        assert!(
+            outcome.starts_with("refused")
+                || (outcome.starts_with("a new connection") && outcome.contains("no such table")),
+            "{outcome}"
+        );
+    }
+
+    /// Every pool production runtime code builds takes [`vetted_pool_options`],
+    /// or is an admitted pool no program DDL reaches.
+    ///
+    /// Sites are keyed by file and enclosing function, so a new pool site goes
+    /// red even where it replaces an admitted one in the same file.
+    #[test]
+    fn every_runtime_pool_is_built_by_the_vetted_options_or_admitted() {
+        const POOL_BUILDS: [&str; 5] = [
+            "PoolOptions",
+            "Pool::connect",
+            "Pool::<",
+            ".connect_with(",
+            ".connect_lazy",
+        ];
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut pending = vec![root.clone()];
+        let mut sites = std::collections::BTreeSet::new();
+        while let Some(dir) = pending.pop() {
+            for entry in std::fs::read_dir(dir).expect("read a source dir") {
+                let path = entry.expect("read a dir entry").path();
+                if path.is_dir() {
+                    pending.push(path);
+                    continue;
+                }
+                if path.extension().is_none_or(|ext| ext != "rs") {
+                    continue;
+                }
+                let source = std::fs::read_to_string(path.as_path()).expect("read a source file");
+                let production = source
+                    .split_once("\n#[cfg(test)]\nmod ")
+                    .map_or(source.as_str(), |(head, _)| head);
+                let code = production
+                    .lines()
+                    .filter(|line| !line.trim_start().starts_with("//"))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                let file = path
+                    .strip_prefix(&root)
+                    .expect("a path under src")
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                for needle in POOL_BUILDS {
+                    for (at, _) in code.match_indices(needle) {
+                        // `VettedPool::connect` is the vetted route itself.
+                        if code[..at].ends_with("Vetted") {
+                            continue;
+                        }
+                        let enclosing = code[..at]
+                            .rfind("fn ")
+                            .map(|fn_at| {
+                                code[fn_at + 3..]
+                                    .chars()
+                                    .take_while(|c| c.is_alphanumeric() || *c == '_')
+                                    .collect::<String>()
+                            })
+                            .unwrap_or_default();
+                        sites.insert((file.clone(), enclosing));
+                    }
+                }
+            }
+        }
+        // The spill pools hold a runtime-owned fixed schema, created once with
+        // `CREATE TABLE`; no program DDL reaches them.
+        let admitted = [
+            ("db.rs", "vetted_pool_options"),
+            ("db.rs", "connect"),
+            ("telemetry_spill.rs", "open_spill_pool"),
+            ("web/hub.rs", "open_spill"),
+        ]
+        .map(|(file, function)| (file.to_owned(), function.to_owned()))
+        .into_iter()
+        .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(
+            sites, admitted,
+            "a pool built outside `vetted_pool_options` hands out connections without the schema refresh"
         );
     }
 
