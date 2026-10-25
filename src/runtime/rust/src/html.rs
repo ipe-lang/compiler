@@ -1150,6 +1150,9 @@ pub(crate) fn attribute_pairs<'a, M>(
                 continue;
             }
         };
+        if k != STAMPED_ID_ATTR && is_reserved_attr_name(k) {
+            continue;
+        }
         let k = stored_attr_key(child_ctx, k);
         let held = if pairs.len() <= SCANNED_PAIRS {
             pairs.iter().position(|(pk, _)| *pk == k)
@@ -3379,6 +3382,35 @@ mod tests {
         );
         let low = render_html(&t).to_ascii_lowercase();
         assert!(!low.contains("ipe-"), "{low}");
+    }
+
+    /// The case fold must never turn a program-built reserved key into the
+    /// exact stamped-id spelling the sinks admit.
+    #[test]
+    fn attribute_pairs_drop_reserved_keys_before_the_case_fold() {
+        let attrs: Vec<Attribute<()>> = vec![
+            Attribute::Attr("IPE-ID".into(), "forged".into()),
+            Attribute::Attr("Ipe-Id".into(), "forged".into()),
+            Attribute::BoolAttr("IPE-Flag".into(), true),
+            Attribute::Attr("NONCE".into(), "n".into()),
+            Attribute::Attr("Data-IPE-HID".into(), "h".into()),
+            Attribute::Attr(STAMPED_ID_ATTR.into(), "r".into()),
+            Attribute::Attr("Title".into(), "t".into()),
+        ];
+        for ctx in [ParseContext::Data, ParseContext::Foreign] {
+            let got: Vec<(String, String)> = attribute_pairs(ctx, "div", &attrs)
+                .into_iter()
+                .map(|(k, v)| (k.into_owned(), v.into_owned()))
+                .collect();
+            assert_eq!(
+                got,
+                vec![
+                    (STAMPED_ID_ATTR.to_owned(), "r".to_owned()),
+                    ("title".to_owned(), "t".to_owned()),
+                ],
+                "{ctx:?}"
+            );
+        }
     }
 
     #[test]
