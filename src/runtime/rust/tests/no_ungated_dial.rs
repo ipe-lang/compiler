@@ -68,6 +68,12 @@ const GATED_OWNER_PATHS: [[&str; 2]; 2] =
 /// The gate function `VettedPool::connect` takes its options from.
 const GATE_OPTIONS_FN: &str = "gated_connect_options";
 
+/// The free function that builds the options of every pool `VettedPool::connect` opens.
+///
+/// It names a `*PoolOptions` builder and no dial: a builder opens nothing until
+/// a dial function runs on it, and every such call is held to the gate rule.
+const POOL_OPTIONS_FN: &str = "vetted_pool_options";
+
 /// The driver type parameter `VettedPool::connect` calls the gate through.
 const GATE_DRIVER_PARAM: &str = "DB";
 
@@ -249,6 +255,15 @@ impl Scope {
             impl_of: Some(GATED_OWNER.to_owned()),
             of_trait: None,
             func: Some("connect".to_owned()),
+        }
+    }
+
+    /// The body of the free `vetted_pool_options`, the one place a pool-options builder may be named.
+    fn pool_options() -> Self {
+        Self {
+            impl_of: None,
+            of_trait: None,
+            func: Some(POOL_OPTIONS_FN.to_owned()),
         }
     }
 }
@@ -1011,7 +1026,19 @@ fn db_gate_violations(name: &str, scan: &Scan) -> Vec<String> {
         )),
         _ => {}
     }
-    for dial in scan.dials.iter().filter(|d| !d.gated && d.within != gate) {
+    let builder = Scope::pool_options();
+    let builders = scan.fns.iter().filter(|f| **f == builder).count();
+    if builders > 1 {
+        violations.push(format!(
+            "{name}: {builders} `fn {POOL_OPTIONS_FN}` bodies found; at most one builds pool options"
+        ));
+    }
+    let builds_options = |d: &Dial| d.kind == DialKind::PoolOptions && d.within == builder;
+    for dial in scan
+        .dials
+        .iter()
+        .filter(|d| !d.gated && d.within != gate && !builds_options(d))
+    {
         violations.push(format!(
             "{name}: {}: raw dial `{}` outside VettedPool::connect",
             dial.within, dial.name
@@ -1445,6 +1472,56 @@ async fn sneaky(url: &str) {{
         &db_dials_bypassing_the_gate("fixture.rs", &fixture),
         2,
         "outside VettedPool::connect",
+    );
+}
+
+/// A `*PoolOptions` builder is admitted only in the free `vetted_pool_options`,
+/// and a dial inside that function is as refused as one anywhere else.
+#[test]
+fn pool_options_builder_is_admitted_only_in_its_one_function() {
+    let builder = "
+fn vetted_pool_options<DB>(max: u32) -> PoolOptions<DB> {
+    PoolOptions::<DB>::new().max_connections(max)
+}
+";
+    let admitted = format!("{GATED_POOL_FIXTURE}{builder}");
+    assert_eq!(
+        db_dials_bypassing_the_gate("fixture.rs", &admitted),
+        Vec::<String>::new()
+    );
+
+    let elsewhere = format!(
+        "{GATED_POOL_FIXTURE}\nfn other<DB>(max: u32) -> PoolOptions<DB> {{ PoolOptions::<DB>::new() }}\n"
+    );
+    assert_violations(
+        &db_dials_bypassing_the_gate("fixture.rs", &elsewhere),
+        1,
+        "outside VettedPool::connect",
+    );
+
+    let in_method = format!(
+        "{GATED_POOL_FIXTURE}\nimpl Other {{ fn vetted_pool_options<DB>() -> PoolOptions<DB> {{ PoolOptions::<DB>::new() }} }}\n"
+    );
+    assert_violations(
+        &db_dials_bypassing_the_gate("fixture.rs", &in_method),
+        1,
+        "outside VettedPool::connect",
+    );
+
+    let dialing = format!(
+        "{GATED_POOL_FIXTURE}\nfn vetted_pool_options<DB>(url: String) {{ PoolOptions::<DB>::new().connect(url); }}\n"
+    );
+    assert_violations(
+        &db_dials_bypassing_the_gate("fixture.rs", &dialing),
+        1,
+        "outside VettedPool::connect",
+    );
+
+    let twice = format!("{admitted}{builder}");
+    assert_violations(
+        &db_dials_bypassing_the_gate("fixture.rs", &twice),
+        1,
+        "bodies found",
     );
 }
 
@@ -2002,6 +2079,7 @@ fn db_pool_connect_is_guarded() {
     for (impl_of, func) in [
         (None, "build_pool"),
         (None, "vet_dial_target"),
+        (None, POOL_OPTIONS_FN),
         (Some(GATED_OWNER), "connect"),
         (Some("Postgres"), GATE_OPTIONS_FN),
         (Some("Sqlite"), GATE_OPTIONS_FN),

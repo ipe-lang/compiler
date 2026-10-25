@@ -479,19 +479,261 @@ pub mod tests {
         writeln!(std::io::stdout(), "{line}").expect("report a marker to the parent");
     }
 
-    /// Whether group `pid` holds no live process: gone, or only its unreaped leader.
+    /// One process's state as its `/proc/<pid>/stat` names it.
+    #[cfg(target_os = "linux")]
+    #[derive(Debug, Clone, Copy)]
+    enum Proc {
+        Running,
+        Zombie,
+        Absent,
+    }
+
+    /// A process group's liveness verdict.
+    #[cfg(target_os = "linux")]
+    #[derive(Debug, PartialEq, Eq, Clone, Copy)]
+    enum Group {
+        Alive,
+        Dead,
+    }
+
+    /// The verdict from probes taken in lifecycle order.
+    ///
+    /// The leader is probed first, then the rest of the group. A process only advances running, zombie, reaped, so probing the earlier
+    /// state first means a transition between probes can never make a dead
+    /// group read alive: every `Alive` is witnessed by a live process at the
+    /// instant of the probe that returned it.
+    #[cfg(target_os = "linux")]
+    fn group_verdict(
+        leader: impl FnOnce() -> Proc,
+        live_member_besides_leader: impl FnOnce() -> bool,
+        signalable: impl FnOnce() -> bool,
+    ) -> Group {
+        let alive = match leader() {
+            Proc::Running => true,
+            Proc::Zombie => live_member_besides_leader(),
+            Proc::Absent => signalable() && live_member_besides_leader(),
+        };
+        if alive { Group::Alive } else { Group::Dead }
+    }
+
+    /// The text of `/proc/<pid>/stat`, or `None` once the process is gone.
+    #[cfg(target_os = "linux")]
+    fn read_stat(pid: &str) -> Option<String> {
+        match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+            Err(error)
+                if error.kind() == std::io::ErrorKind::NotFound
+                    || error.raw_os_error() == Some(rustix::io::Errno::SRCH.raw_os_error()) =>
+            {
+                None
+            }
+            read => Some(read.expect("read a /proc stat")),
+        }
+    }
+
+    /// The fields after the command name of a `/proc/<pid>/stat` line: state, parent, group, and on.
+    #[cfg(target_os = "linux")]
+    fn stat_fields(stat: &str) -> std::str::SplitWhitespace<'_> {
+        stat.rsplit_once(") ")
+            .map(|(_, rest)| rest)
+            .expect("a stat line names its command")
+            .split_whitespace()
+    }
+
+    /// Whether a stat state names an exited process: a zombie, or one being reaped.
+    #[cfg(target_os = "linux")]
+    fn exited_state(state: &str) -> bool {
+        matches!(state, "Z" | "X")
+    }
+
+    /// The state of process `pid`.
+    #[cfg(target_os = "linux")]
+    fn proc_state(pid: i32) -> Proc {
+        read_stat(&pid.to_string()).map_or(Proc::Absent, |stat| {
+            let state = stat_fields(&stat).next().expect("a stat state field");
+            if exited_state(state) {
+                Proc::Zombie
+            } else {
+                Proc::Running
+            }
+        })
+    }
+
+    /// Whether a process other than the leader `pgid` runs in group `pgid`.
+    #[cfg(target_os = "linux")]
+    fn live_member_besides(pgid: i32) -> bool {
+        let leader = pgid.to_string();
+        for entry in std::fs::read_dir("/proc").expect("list /proc") {
+            let name = entry.expect("a /proc entry").file_name();
+            let Some(process) = name.to_str() else {
+                continue;
+            };
+            if process == leader || !process.bytes().all(|byte| byte.is_ascii_digit()) {
+                continue;
+            }
+            let Some(stat) = read_stat(process) else {
+                continue;
+            };
+            let mut fields = stat_fields(&stat);
+            let state = fields.next().expect("a stat state field");
+            let member = fields.nth(1).expect("a stat group field") == leader;
+            if member && !exited_state(state) {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Whether a signal can reach any process of group `pgid`, a zombie included.
+    #[cfg(target_os = "linux")]
+    fn signalable(pgid: i32) -> bool {
+        rustix::process::Pid::from_raw(pgid)
+            .is_some_and(|id| rustix::process::test_kill_process_group(id).is_ok())
+    }
+
+    /// Whether group `pid` holds no live process: gone, or only exited processes left unreaped.
     #[cfg(target_os = "linux")]
     fn group_is_dead(pid: i32) -> bool {
-        let gone = rustix::process::Pid::from_raw(pid)
-            .is_none_or(|id| rustix::process::test_kill_process_group(id).is_err());
-        let zombie = std::fs::read_to_string(format!("/proc/{pid}/stat"))
-            .ok()
-            .and_then(|stat| {
-                stat.rsplit_once(") ")
-                    .and_then(|(_, rest)| rest.chars().next())
-            })
-            .is_some_and(|state| state == 'Z');
-        gone || zombie
+        group_verdict(
+            || proc_state(pid),
+            || live_member_besides(pid),
+            || signalable(pid),
+        ) == Group::Dead
+    }
+
+    /// What every probe of a group answers while it holds one lifecycle stage.
+    #[cfg(target_os = "linux")]
+    #[derive(Debug, Clone, Copy)]
+    struct Stage {
+        leader: Proc,
+        live_member_besides_leader: bool,
+        signalable: bool,
+    }
+
+    /// The verdict when the group moves from `before` to `after` after `probes` probe calls.
+    #[cfg(target_os = "linux")]
+    fn verdict_across(before: Stage, after: Stage, probes: usize) -> Group {
+        let calls = std::cell::Cell::new(0_usize);
+        let stage = || {
+            let call = calls.get();
+            calls.set(call.saturating_add(1));
+            if call < probes { before } else { after }
+        };
+        group_verdict(
+            || stage().leader,
+            || stage().live_member_besides_leader,
+            || stage().signalable,
+        )
+    }
+
+    /// A group whose only process is its unreaped leader.
+    #[cfg(target_os = "linux")]
+    const ZOMBIE_LEADER_ALONE: Stage = Stage {
+        leader: Proc::Zombie,
+        live_member_besides_leader: false,
+        signalable: true,
+    };
+
+    /// A group with no process left, its leader reaped.
+    #[cfg(target_os = "linux")]
+    const GONE: Stage = Stage {
+        leader: Proc::Absent,
+        live_member_besides_leader: false,
+        signalable: false,
+    };
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_reap_between_the_probes_never_reads_a_dead_group_alive() {
+        let zombie_member_after_reap = Stage {
+            signalable: true,
+            ..GONE
+        };
+        for (before, after) in [
+            (ZOMBIE_LEADER_ALONE, GONE),
+            (ZOMBIE_LEADER_ALONE, zombie_member_after_reap),
+            (zombie_member_after_reap, GONE),
+        ] {
+            for probes in 0..=3 {
+                assert_eq!(
+                    verdict_across(before, after, probes),
+                    Group::Dead,
+                    "{before:?} -> {after:?} after {probes} probes"
+                );
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_live_group_never_reads_dead() {
+        let running = Stage {
+            leader: Proc::Running,
+            live_member_besides_leader: false,
+            signalable: true,
+        };
+        let running_with_member = Stage {
+            live_member_besides_leader: true,
+            ..running
+        };
+        let zombie_leader_with_member = Stage {
+            leader: Proc::Zombie,
+            ..running_with_member
+        };
+        let member_after_reap = Stage {
+            leader: Proc::Absent,
+            ..running_with_member
+        };
+        for (before, after) in [
+            (running, running),
+            (running_with_member, zombie_leader_with_member),
+            (zombie_leader_with_member, zombie_leader_with_member),
+            (zombie_leader_with_member, member_after_reap),
+            (member_after_reap, member_after_reap),
+        ] {
+            for probes in 0..=3 {
+                assert_eq!(
+                    verdict_across(before, after, probes),
+                    Group::Alive,
+                    "{before:?} -> {after:?} after {probes} probes"
+                );
+            }
+        }
+    }
+
+    /// Poll `done` every 20 ms for at most 5 s, returning the reading that ended the wait.
+    #[cfg(target_os = "linux")]
+    fn poll_until(mut done: impl FnMut() -> bool) -> bool {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut reading = done();
+        while !reading && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            reading = done();
+        }
+        reading
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_zombie_leader_with_a_live_member_is_not_a_dead_group() {
+        let mut shell = std::process::Command::new("/bin/sh");
+        shell.args(["-c", "sleep 30 & exit 0"]);
+        let (mut child, id) = test_group::spawn_detached(shell).expect("spawn sh");
+        let id = id.expect("a detached group");
+        let pgid = id.as_raw_nonzero().get();
+        let leader_exited = poll_until(|| test_group::exited(id).is_ok_and(|exited| exited));
+        let dead_with_member = group_is_dead(pgid);
+        test_group::kill(id);
+        let dead_after_kill = poll_until(|| group_is_dead(pgid));
+        test_group::forget(id);
+        let _ = child.wait();
+        let dead_after_reap = group_is_dead(pgid);
+        assert!(leader_exited, "the group leader never exited");
+        assert!(
+            !dead_with_member,
+            "a zombie leader with a live member read as a dead group"
+        );
+        assert!(dead_after_kill, "the killed group never read dead");
+        assert!(dead_after_reap, "the reaped group read alive");
     }
 
     /// Spawn a detached `sleep 30` transfer group.
@@ -521,11 +763,8 @@ pub mod tests {
             .find_map(|line| line.split_once(ARMED).map(|(_, pid)| pid))
             .and_then(|pid| pid.trim().parse::<i32>().ok())
             .expect("the child reports its transfer group");
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        while !group_is_dead(group) && std::time::Instant::now() < deadline {
-            std::thread::sleep(std::time::Duration::from_millis(50));
-        }
-        assert!(group_is_dead(group), "the transfer group outlived the CLI");
+        let dead = poll_until(|| group_is_dead(group));
+        assert!(dead, "the transfer group outlived the CLI");
     }
 
     #[cfg(target_os = "linux")]

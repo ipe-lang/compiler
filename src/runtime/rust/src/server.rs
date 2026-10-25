@@ -2467,10 +2467,11 @@ impl RouteCause {
             | Self::Prefix(M::TooLong { .. }) => true,
             Self::Pattern(
                 P::NotAbsolute
-                | P::CatchAll
-                | P::MidSegmentSigil { .. }
                 | P::Segment(
-                    S::Decode(D::MalformedEscape { .. } | D::InvalidUtf8 { .. }) | S::ParamName(_),
+                    S::Decode(D::MalformedEscape { .. } | D::InvalidUtf8 { .. })
+                    | S::ParamName(_)
+                    | S::CatchAll
+                    | S::MidSegmentSigil { .. },
                 )
                 | P::Render(E::Empty | E::Dot),
             )

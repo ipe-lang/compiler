@@ -66,7 +66,7 @@ impl<Page> Route<Page> {
     ) -> Self {
         Route {
             pattern: RoutePattern::parse(pattern).map_err(|refusal| RoutePatternRefusal {
-                pattern: pattern.to_owned(),
+                pattern: RefusedText::new(pattern),
                 refusal,
             }),
             build: Arc::new(build),
@@ -1093,9 +1093,53 @@ mod tests {
         let refusal = check_route_table(&rs).err();
         assert!(refusal.is_some_and(|r| {
             let msg = r.to_string();
-            r.pattern == "/u/:id/:id"
+            r.pattern.as_str() == "/u/:id/:id"
                 && msg.contains("route pattern `/u/:id/:id` is malformed")
                 && msg.contains("parameter `id` appears twice")
+        }));
+    }
+
+    /// Prove the refusals: a `Web.route` pattern follows the segment grammar
+    /// `Server.*` paths follow, so a `*` catch-all and a `:` or `*` inside a
+    /// literal segment are refused, not served as literal text.
+    #[test]
+    fn catch_all_and_mid_segment_sigil_are_refused() {
+        for catch_all in ["/*rest", "/f/*", "/a/:x/*y", "/*"] {
+            assert_eq!(
+                RoutePattern::parse(catch_all).err(),
+                Some(RouteSegmentRefusal::CatchAll),
+                "{catch_all}"
+            );
+        }
+        for escaped in ["/a%3Ab", "/%2Arest", "/%3Aid", "/file%3Aid"] {
+            assert!(RoutePattern::parse(escaped).is_ok(), "{escaped}");
+        }
+        for (mid, at) in [
+            ("/a:b", 1),
+            ("/file:id", 4),
+            ("/x/ab*", 2),
+            ("/q/a*:b", 1),
+            ("/a%3A:b", 4),
+        ] {
+            let refused = RoutePattern::parse(mid);
+            assert!(
+                matches!(
+                    &refused,
+                    Err(RouteSegmentRefusal::MidSegmentSigil { at: off }) if off.get() == at
+                ),
+                "{mid} must break at byte {at}, got {refused:?}"
+            );
+        }
+        let rs: Vec<Route<Page>> = vec![
+            Route::new("/ok", |_| Some(Page::Home)),
+            Route::new("/file:id", |_| Some(Page::App("dead".into()))),
+        ];
+        assert!(rs.get(1).is_some_and(|r| r.pattern().is_err()));
+        let refusal = check_route_table(&rs).err();
+        assert!(refusal.is_some_and(|r| {
+            r.pattern.as_str() == "/file:id"
+                && r.to_string()
+                    .contains("route pattern `/file:id` is malformed: a `:` or `*` at byte 4")
         }));
     }
 
@@ -1148,7 +1192,7 @@ mod tests {
         ];
         let refused = check_route_table(&bad).map_err(MountRefusal::RouteTable);
         assert!(
-            matches!(&refused, Err(MountRefusal::RouteTable(r)) if r.pattern == "/%zz"),
+            matches!(&refused, Err(MountRefusal::RouteTable(r)) if r.pattern.as_str() == "/%zz"),
             "a malformed route table must be refused: {refused:?}"
         );
         let message = refused.err().map(|r| r.to_string()).unwrap_or_default();
@@ -1158,7 +1202,7 @@ mod tests {
         );
         let crate::error::IpeError::Error(kind, _) =
             crate::error::IpeError::from(MountRefusal::RouteTable(RoutePatternRefusal {
-                pattern: "/%zz".to_owned(),
+                pattern: RefusedText::new("/%zz"),
                 refusal: RouteSegmentRefusal::Decode(bad_escape()),
             }));
         assert_eq!(kind, crate::error::IpeErrorKind::InvalidInput);
@@ -1184,7 +1228,7 @@ mod tests {
     #[test]
     fn route_pattern_refusal_scrubs_bidi_and_controls() {
         let refusal = RoutePatternRefusal {
-            pattern: HOSTILE.to_owned(),
+            pattern: RefusedText::new(HOSTILE),
             refusal: RouteSegmentRefusal::Decode(bad_escape()),
         };
         assert_scrubbed(&refusal.to_string());
@@ -1231,7 +1275,7 @@ mod tests {
             ),
             (
                 MountRefusal::RouteTable(RoutePatternRefusal {
-                    pattern: "/a\\b".to_owned(),
+                    pattern: RefusedText::new("/a\\b"),
                     refusal: RouteSegmentRefusal::Decode(bad_escape()),
                 }),
                 "[ipe-wasm:MountFailed] route pattern `/a\\\\b` is malformed: ",
@@ -1258,7 +1302,7 @@ mod tests {
     fn mount_refusal_scrubs_bidi_and_controls() {
         let every = [
             MountRefusal::RouteTable(RoutePatternRefusal {
-                pattern: HOSTILE.to_owned(),
+                pattern: RefusedText::new(HOSTILE),
                 refusal: RouteSegmentRefusal::Decode(bad_escape()),
             }),
             MountRefusal::BasePath(bad_escape()),
