@@ -1,7 +1,7 @@
 // System helpers — some generic over E (when returning IpeTask).
 use super::path::{OsOrigin, from_os};
 use super::{
-    FromLimitExceeded, IpeError, IpeMaybe, IpeResult, IpeTask, KernelFailure, LimitRefusal, ok_res,
+    IpeError, IpeMaybe, IpeResult, IpeTask, KernelFailure, LimitRefusal, TimeoutRefusal, ok_res,
     str_err,
 };
 
@@ -1393,7 +1393,7 @@ async fn run_blocking<T, E, F>(f: F) -> Result<T, E>
 where
     F: FnOnce() -> Result<T, KernelFailure> + Send + 'static,
     T: Send + 'static,
-    E: From<String> + FromLimitExceeded + crate::FromUnavailable,
+    E: crate::KernelErrorSink,
 {
     match crate::threads::join_blocking("Process", f).await {
         Ok(done) => done.map_err(KernelFailure::into_error),
@@ -1414,17 +1414,220 @@ const PROCESS_OUTPUT_CEILING: EnvCeiling = EnvCeiling::new(
     "decimal byte count",
 );
 
+/// The wall-clock ceiling on one `Process.run`/`runWith`/`runInPty` call.
+///
+/// `IPE_PROCESS_TIMEOUT`, whole seconds or `h`/`m`/`s` segments, default one
+/// hour, at most 24 hours. A child still running when it expires is killed
+/// (its whole process group on Linux), reaped, and reported as a `Timeout`
+/// error, so no subprocess kernel can hold a blocking-pool thread without end.
+pub const PROCESS_WALL_CEILING: EnvDuration = EnvDuration::new(
+    "IPE_PROCESS_TIMEOUT",
+    3600,
+    "duration (whole seconds, or h/m/s segments such as 30m or 1h30m)",
+)
+.at_most(24 * 60 * 60);
+
 /// Resolves [`PROCESS_OUTPUT_CEILING`]; a malformed setting fails the spawn closed.
 fn process_output_ceiling() -> Result<u64, EnvCeilingRefusal> {
     PROCESS_OUTPUT_CEILING.read()
 }
 
-/// The task a spawn kernel returns when its output ceiling is malformed.
+/// The wall-clock ceiling one subprocess kernel call runs under.
+///
+/// Only [`process_bounds`] builds one in production, from
+/// [`PROCESS_WALL_CEILING`], so every ceiling a `_sync` fn waits under is a
+/// positive, bounded duration the operator declared.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ProcessDeadline(std::time::Duration);
+
+impl ProcessDeadline {
+    /// The ceiling in whole seconds, for the refusal text.
+    const fn secs(self) -> u64 {
+        self.0.as_secs()
+    }
+
+    /// A ceiling a unit test picks directly.
+    #[cfg(test)]
+    pub(crate) const fn for_test(ceiling: std::time::Duration) -> Self {
+        Self(ceiling)
+    }
+}
+
+/// Both ceilings a subprocess kernel runs under, read once at the kernel entry.
+///
+/// A `_sync` fn takes this by value, so there is no call path that captures
+/// without a byte ceiling or waits without a wall-clock one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ProcessBounds {
+    /// Per-stream capture ceiling in bytes.
+    pub output: u64,
+    /// Wall-clock ceiling on the whole call.
+    pub wall: ProcessDeadline,
+}
+
+impl ProcessBounds {
+    /// Bounds a unit test picks directly, with a generous wall ceiling.
+    #[cfg(test)]
+    pub(crate) const fn for_test(output: u64) -> Self {
+        Self {
+            output,
+            wall: ProcessDeadline::for_test(std::time::Duration::from_secs(60)),
+        }
+    }
+}
+
+/// Resolves both subprocess ceilings; a malformed setting fails the spawn closed.
+///
+/// # Errors
+///
+/// The first malformed ceiling variable, as the `EnvCeilingRefusal`
+/// [`process_output_ceiling`] returns.
+fn process_bounds() -> Result<ProcessBounds, EnvCeilingRefusal> {
+    let output = process_output_ceiling()?;
+    let wall = PROCESS_WALL_CEILING.read()?;
+    Ok(ProcessBounds {
+        output,
+        wall: ProcessDeadline(std::time::Duration::from_secs(wall)),
+    })
+}
+
+/// The task a spawn kernel returns when one of its ceilings is malformed.
 fn refused_spawn<E: Send + From<String> + 'static, T: Send + 'static>(
     refusal: EnvCeilingRefusal,
 ) -> IpeTask<E, T> {
     crate::task::task_fail(String::from(refusal).into())
 }
+
+/// Why one subprocess kernel call failed, built where the cause is known.
+///
+/// Every failure of a `_sync` fn is one of these, so the kind an Ipê program
+/// sees (`Timeout`, `LimitExceeded`, `Unexpected`) is decided here and never
+/// by a free-form string.
+#[derive(Debug)]
+enum ProcessRefusal {
+    /// The hardened spawner refused or failed the spawn.
+    Spawn { cmd: String, refusal: SpawnRefusal },
+    /// The child was still running when the wall-clock ceiling expired; it was
+    /// killed and reaped.
+    TimedOut {
+        cmd: String,
+        ceiling: ProcessDeadline,
+    },
+    /// One captured stream passed the byte ceiling.
+    OutputTooLarge {
+        cmd: String,
+        stream: &'static str,
+        cap: u64,
+    },
+    /// Reading one captured stream failed.
+    Capture {
+        cmd: String,
+        stream: &'static str,
+        error: std::io::Error,
+    },
+    /// The OS refused the thread that drains one stream.
+    Thread {
+        cmd: String,
+        stream: &'static str,
+        error: std::io::Error,
+    },
+    /// The thread draining one stream panicked.
+    Panicked { cmd: String, stream: &'static str },
+    /// Reaping the exited child failed.
+    Wait { cmd: String, error: std::io::Error },
+    /// One step of the pseudo-terminal setup failed.
+    #[cfg(unix)]
+    Pty {
+        cmd: String,
+        step: &'static str,
+        error: std::io::Error,
+    },
+    /// The target has no pseudo-terminal surface.
+    #[cfg(not(unix))]
+    Unsupported { what: &'static str },
+}
+
+impl From<ProcessRefusal> for KernelFailure {
+    fn from(refusal: ProcessRefusal) -> Self {
+        match refusal {
+            ProcessRefusal::Spawn { cmd, refusal } => Self::Unexpected(format!("{cmd}: {refusal}")),
+            ProcessRefusal::TimedOut { cmd, ceiling } => {
+                Self::TimedOut(TimeoutRefusal::new(format!(
+                    "{cmd}: still running after the {}s wall-clock ceiling; killed \
+                 (raise {})",
+                    ceiling.secs(),
+                    PROCESS_WALL_CEILING.name(),
+                )))
+            }
+            ProcessRefusal::OutputTooLarge { cmd, stream, cap } => {
+                Self::LimitExceeded(LimitRefusal::new(format!(
+                    "{cmd}: {stream} exceeds the {cap}-byte capture ceiling (raise {})",
+                    PROCESS_OUTPUT_CEILING.name(),
+                )))
+            }
+            ProcessRefusal::Capture { cmd, stream, error } => {
+                Self::Unexpected(format!("{cmd}: {stream} capture failed: {error}"))
+            }
+            ProcessRefusal::Thread { cmd, stream, error } => {
+                Self::Unexpected(format!("{cmd}: {stream} capture thread refused: {error}"))
+            }
+            ProcessRefusal::Panicked { cmd, stream } => {
+                Self::Unexpected(format!("{cmd}: {stream} capture thread panicked"))
+            }
+            ProcessRefusal::Wait { cmd, error } => Self::Unexpected(format!("{cmd}: {error}")),
+            #[cfg(unix)]
+            ProcessRefusal::Pty { cmd, step, error } => {
+                Self::Unexpected(format!("{cmd}: pty {step} failed: {error}"))
+            }
+            #[cfg(not(unix))]
+            ProcessRefusal::Unsupported { what } => Self::Unexpected(what.to_owned()),
+        }
+    }
+}
+
+/// The instant one subprocess call must have finished by.
+struct Deadline {
+    started: std::time::Instant,
+    ceiling: ProcessDeadline,
+}
+
+/// Why a wait under a [`Deadline`] ended without its value.
+enum DeadlineLapse {
+    /// The ceiling expired first.
+    Expired,
+    /// The producer dropped its sender without a value: its thread panicked.
+    Disconnected,
+}
+
+impl Deadline {
+    fn start(ceiling: ProcessDeadline) -> Self {
+        Self {
+            started: std::time::Instant::now(),
+            ceiling,
+        }
+    }
+
+    /// The time left, or `None` once the ceiling has expired.
+    fn remaining(&self) -> Option<std::time::Duration> {
+        self.ceiling.0.checked_sub(self.started.elapsed())
+    }
+
+    /// Receives one value within the time left.
+    fn recv<T>(&self, rx: &std::sync::mpsc::Receiver<T>) -> Result<T, DeadlineLapse> {
+        use std::sync::mpsc::RecvTimeoutError;
+        let Some(left) = self.remaining() else {
+            return Err(DeadlineLapse::Expired);
+        };
+        rx.recv_timeout(left).map_err(|lapse| match lapse {
+            RecvTimeoutError::Timeout => DeadlineLapse::Expired,
+            RecvTimeoutError::Disconnected => DeadlineLapse::Disconnected,
+        })
+    }
+}
+
+/// Longest pause between two polls of a child that closed its pipes but has
+/// not exited.
+const REAP_POLL_CEILING: std::time::Duration = std::time::Duration::from_millis(50);
 
 /// The captured result of a subprocess: its combined stdout+stderr (bounded)
 /// and whether it exited successfully. `status` is the display form of the exit
@@ -1438,9 +1641,9 @@ struct ProcessCapture {
 /// RAII owner of a spawned child: guarantees the child is reaped on EVERY exit
 /// path (early `?` return, panic, or normal completion). `std::process::Child`'s
 /// `Drop` does NOT kill or reap, so without this a read error or a bail would
-/// leak a running, unreaped child (a zombie in a long-lived server). `wait()`
-/// takes ownership so the destructor becomes a no-op once the caller has reaped
-/// the child itself on the success path.
+/// leak a running, unreaped child (a zombie in a long-lived server). A
+/// successful reap takes the child out, so the destructor becomes a no-op once
+/// the caller has reaped it on the success path.
 struct ChildGuard(Option<std::process::Child>);
 
 impl ChildGuard {
@@ -1448,27 +1651,192 @@ impl ChildGuard {
         self.0.as_mut()
     }
 
-    /// Reap the child ourselves, taking it out of the guard so `Drop` does
-    /// nothing. Returns the exit status.
-    fn wait(&mut self) -> std::io::Result<std::process::ExitStatus> {
-        match self.0.take() {
-            Some(mut c) => c.wait(),
-            None => Err(std::io::Error::other("child already reaped")),
+    /// Reap the child if it has exited, taking it out of the guard when it has.
+    fn try_reap(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
+        let Some(child) = self.0.as_mut() else {
+            return Err(std::io::Error::other("child already reaped"));
+        };
+        let status = child.try_wait()?;
+        if status.is_some() {
+            self.0 = None;
+        }
+        Ok(status)
+    }
+
+    /// Kill the child (its whole process group where it leads one) and reap it.
+    fn kill_and_reap(&mut self) {
+        if let Some(mut c) = self.0.take() {
+            kill_child_tree(&mut c);
+            let _ = c.wait();
+        }
+    }
+
+    /// Reap the child within `deadline`, polling a child that closed its pipes
+    /// but has not exited at `1ms, 2ms, … ≤ REAP_POLL_CEILING`.
+    ///
+    /// `Ok(None)` is the deadline expiring with the child still running.
+    fn reap_within(
+        &mut self,
+        deadline: &Deadline,
+    ) -> std::io::Result<Option<std::process::ExitStatus>> {
+        let mut pause = std::time::Duration::from_millis(1);
+        loop {
+            if let Some(status) = self.try_reap()? {
+                return Ok(Some(status));
+            }
+            let Some(left) = deadline.remaining() else {
+                return Ok(None);
+            };
+            std::thread::sleep(pause.min(left));
+            pause = pause.saturating_mul(2).min(REAP_POLL_CEILING);
         }
     }
 }
 
 impl Drop for ChildGuard {
     fn drop(&mut self) {
-        if let Some(mut c) = self.0.take() {
-            // The child is still owned here => it was NOT reaped on a normal
-            // path (an error/bail/panic left it running). Kill then reap so no
-            // subprocess is left running and no zombie accumulates.
-            let _ = c.kill();
-            let _ = c.wait();
+        // The child is still owned here => it was NOT reaped on a normal
+        // path (an error/bail/panic left it running). Kill then reap so no
+        // subprocess is left running and no zombie accumulates.
+        self.kill_and_reap();
+    }
+}
+
+/// `SIGKILL` the process group `child` leads (see [`spawn_bounded_child`]),
+/// then the child itself.
+#[cfg(target_os = "linux")]
+fn kill_child_tree(child: &mut std::process::Child) {
+    let _ = rustix::process::kill_process_group(
+        rustix::process::Pid::from_child(child),
+        rustix::process::Signal::KILL,
+    );
+    let _ = child.kill();
+}
+
+#[cfg(not(target_os = "linux"))]
+fn kill_child_tree(child: &mut std::process::Child) {
+    let _ = child.kill();
+}
+
+/// Spawn a `Process.*` child through the hardened floor, leading its own
+/// process group where a group kill is available.
+///
+/// On Linux the child leads its own group, so a kill reaches the shell
+/// grandchildren it backgrounds; there the parent-death floor bounds the
+/// child, so leaving the parent group's terminal signals costs nothing.
+/// Elsewhere the child keeps its parent's group and a kill reaches the direct
+/// child only. The `Command` is consumed: the spawner drops it once the child
+/// exists, so the parent's copies of the child's stdio handles close with the
+/// spawn.
+fn spawn_bounded_child(
+    cmd: &str,
+    builder: std::process::Command,
+) -> Result<ChildGuard, ProcessRefusal> {
+    #[cfg(target_os = "linux")]
+    let builder = {
+        use std::os::unix::process::CommandExt as _;
+        let mut builder = builder;
+        builder.process_group(0);
+        builder
+    };
+    spawn_hardened(builder)
+        .map(|child| ChildGuard(Some(child)))
+        .map_err(|refusal| ProcessRefusal::Spawn {
+            cmd: cmd.to_owned(),
+            refusal,
+        })
+}
+
+/// The result one capture thread hands back.
+type CaptureResult = std::io::Result<Vec<u8>>;
+
+/// One of the two streams a piped child is captured on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PipedStream {
+    Stdout,
+    Stderr,
+}
+
+impl PipedStream {
+    /// The stream's name in a refusal.
+    const fn name(self) -> &'static str {
+        match self {
+            Self::Stdout => "stdout",
+            Self::Stderr => "stderr",
         }
     }
 }
+
+/// How a piped call applies its byte ceiling.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OutputCeiling {
+    /// Both streams together, refused as `output` (`Process.run`).
+    Combined,
+    /// Each stream on its own, refused by name (`Process.runWith`).
+    PerStream,
+}
+
+/// The streams of a piped child drained so far.
+struct Drained {
+    stdout: Option<Vec<u8>>,
+    stderr: Option<Vec<u8>>,
+}
+
+impl Drained {
+    /// The byte-ceiling refusal the drained streams already decide.
+    ///
+    /// A refusal is issued only when no stream still draining could change
+    /// it, so the outcome is the one a check over both finished streams
+    /// (stdout first) yields: under `Combined` a partial total past `cap`
+    /// stays past it; under `PerStream` stdout decides first, and stderr
+    /// decides once stdout is in and within the ceiling. `expired` lets an
+    /// over-ceiling stderr decide while stdout is still open: a known overflow
+    /// is the truer refusal than the wall-clock one.
+    fn refusal(
+        &self,
+        cmd: &str,
+        ceiling: OutputCeiling,
+        cap: u64,
+        expired: bool,
+    ) -> Option<ProcessRefusal> {
+        let stdout = self.stdout.as_deref();
+        let stderr = self.stderr.as_deref();
+        let over = |bytes: Option<&[u8]>| bytes.is_some_and(|bytes| byte_len(bytes) > cap);
+        let stream = match ceiling {
+            OutputCeiling::Combined => (stdout
+                .map_or(0, byte_len)
+                .saturating_add(stderr.map_or(0, byte_len))
+                > cap)
+                .then_some("output"),
+            OutputCeiling::PerStream => {
+                if over(stdout) {
+                    Some(PipedStream::Stdout.name())
+                } else if (stdout.is_some() || expired) && over(stderr) {
+                    Some(PipedStream::Stderr.name())
+                } else {
+                    None
+                }
+            }
+        };
+        stream.map(|stream| ProcessRefusal::OutputTooLarge {
+            cmd: cmd.to_owned(),
+            stream,
+            cap,
+        })
+    }
+
+    /// The stream not yet drained, for a capture thread that never reported.
+    const fn pending(&self) -> PipedStream {
+        if self.stdout.is_none() {
+            PipedStream::Stdout
+        } else {
+            PipedStream::Stderr
+        }
+    }
+}
+
+/// What one capture thread hands back: its stream and the bytes it drained.
+type StreamCapture = (PipedStream, CaptureResult);
 
 /// Read up to `limit` bytes from `reader` on a dedicated thread. Draining each
 /// pipe on its OWN thread avoids the sequential-drain deadlock: a child that
@@ -1478,24 +1846,108 @@ impl Drop for ChildGuard {
 /// `limit` is a per-call value (`cap + 1`) passed by ownership, so concurrent
 /// `process_run` calls never share or clobber it.
 ///
+/// The bytes arrive on `report`, tagged with `stream`, so the caller judges
+/// whichever stream ends first under its [`Deadline`]; a thread that panics
+/// drops its sender, which the caller sees as [`DeadlineLapse::Disconnected`]
+/// once no other thread can still report.
+///
 /// # Errors
 ///
 /// The OS refused the thread.
 fn spawn_capture_thread<R>(
     reader: Option<R>,
     limit: u64,
-) -> std::io::Result<std::thread::JoinHandle<std::io::Result<Vec<u8>>>>
+    stream: PipedStream,
+    report: std::sync::mpsc::SyncSender<StreamCapture>,
+) -> std::io::Result<()>
 where
     R: std::io::Read + Send + 'static,
 {
     crate::threads::spawn_named(CAPTURE_THREAD, move || {
         use std::io::Read as _;
         let mut buf = Vec::new();
-        if let Some(reader) = reader {
-            reader.take(limit).read_to_end(&mut buf)?;
-        }
-        Ok::<_, std::io::Error>(buf)
-    })
+        let read = reader
+            .map_or(Ok(0), |reader| reader.take(limit).read_to_end(&mut buf))
+            .map(|_| buf);
+        // The channel holds one slot per stream, so this send never blocks; a
+        // caller gone past its deadline has dropped the receiver, and the
+        // bytes are discarded.
+        let _ = report.send((stream, read));
+    })?;
+    Ok(())
+}
+
+/// Waits for the pty stream under `deadline`.
+///
+/// On expiry the child is killed and reaped before the `TimedOut` refusal
+/// returns, so no caller observes a timeout with the child still alive.
+#[cfg(unix)]
+fn capture_within(
+    cmd: &str,
+    stream: &'static str,
+    rx: &std::sync::mpsc::Receiver<CaptureResult>,
+    deadline: &Deadline,
+    guard: &mut ChildGuard,
+) -> Result<Vec<u8>, ProcessRefusal> {
+    match deadline.recv(rx) {
+        Ok(Ok(bytes)) => Ok(bytes),
+        Ok(Err(error)) => Err(ProcessRefusal::Capture {
+            cmd: cmd.to_owned(),
+            stream,
+            error,
+        }),
+        Err(DeadlineLapse::Expired) => Err(timed_out(cmd, deadline, guard)),
+        Err(DeadlineLapse::Disconnected) => Err(ProcessRefusal::Panicked {
+            cmd: cmd.to_owned(),
+            stream,
+        }),
+    }
+}
+
+/// Reaps the child under `deadline` once its streams are drained.
+///
+/// A child that closed its pipes and has not exited by the deadline is killed
+/// and reaped, and the call is `TimedOut`.
+fn reap_within(
+    cmd: &str,
+    deadline: &Deadline,
+    guard: &mut ChildGuard,
+) -> Result<std::process::ExitStatus, ProcessRefusal> {
+    match guard.reap_within(deadline) {
+        Ok(Some(status)) => Ok(status),
+        Ok(None) => Err(timed_out(cmd, deadline, guard)),
+        Err(error) => Err(ProcessRefusal::Wait {
+            cmd: cmd.to_owned(),
+            error,
+        }),
+    }
+}
+
+/// Kills and reaps the child, then names the ceiling it outlived.
+fn timed_out(cmd: &str, deadline: &Deadline, guard: &mut ChildGuard) -> ProcessRefusal {
+    guard.kill_and_reap();
+    ProcessRefusal::TimedOut {
+        cmd: cmd.to_owned(),
+        ceiling: deadline.ceiling,
+    }
+}
+
+/// The length of a captured stream as a byte count.
+fn byte_len(bytes: &[u8]) -> u64 {
+    u64::try_from(bytes.len()).unwrap_or(u64::MAX)
+}
+
+/// Refuses a pty stream whose capture of `len` bytes passed `cap`.
+#[cfg(unix)]
+fn within_cap(cmd: &str, stream: &'static str, len: u64, cap: u64) -> Result<(), ProcessRefusal> {
+    if len > cap {
+        return Err(ProcessRefusal::OutputTooLarge {
+            cmd: cmd.to_owned(),
+            stream,
+            cap,
+        });
+    }
+    Ok(())
 }
 
 /// The name of each subprocess output capture thread.
@@ -2459,7 +2911,115 @@ fn still_parented_by(
     }
 }
 
-fn process_run_sync(cmd: &str, args: &[String], cap: u64) -> Result<ProcessCapture, KernelFailure> {
+/// The two piped streams of a child, drained concurrently under one deadline.
+struct PipedStreams {
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+    status: std::process::ExitStatus,
+}
+
+/// Spawns `builder` through the hardened floor and drains both pipes within
+/// `bounds`.
+///
+/// Each stream reads at most `output + 1` bytes on its own thread (no
+/// sequential-drain deadlock), and both report on one channel, so the byte
+/// ceiling is judged as each stream ends: a stream that already decides the
+/// refusal ends the call at once and kills a child that keeps its other
+/// stream open (one ignoring `SIGPIPE`, or one that sleeps on) instead of
+/// waiting it out. The check precedes the reap, so an over-ceiling child is
+/// never waited on. The wall deadline starts at the spawn and covers both
+/// drains and the reap; on expiry the child (its process group on Linux) is
+/// killed and reaped before `TimedOut` returns. Every error path kills and
+/// reaps the child through [`ChildGuard`].
+fn run_piped(
+    cmd: &str,
+    builder: std::process::Command,
+    bounds: ProcessBounds,
+    ceiling: OutputCeiling,
+) -> Result<PipedStreams, ProcessRefusal> {
+    let mut guard = spawn_bounded_child(cmd, builder)?;
+    let deadline = Deadline::start(bounds.wall);
+    let cap = bounds.output;
+
+    // Per-stream read bound; passed by value to each capture thread (no shared
+    // global, so concurrent `process_run` calls cannot clobber one another).
+    let limit = cap.saturating_add(1);
+
+    // Take the pipe handles so each thread owns its reader; a `?` before the
+    // waits still reaps the child via `guard`'s `Drop`.
+    let (stdout_pipe, stderr_pipe) = guard
+        .get_mut()
+        .map_or((None, None), |c| (c.stdout.take(), c.stderr.take()));
+    // A refused capture thread returns through `?`; `guard` kills and reaps the
+    // child, which ends any capture already started.
+    let thread_refused = |stream: PipedStream| {
+        move |error| ProcessRefusal::Thread {
+            cmd: cmd.to_owned(),
+            stream: stream.name(),
+            error,
+        }
+    };
+    let (report, reports) = std::sync::mpsc::sync_channel::<StreamCapture>(2);
+    spawn_capture_thread(stdout_pipe, limit, PipedStream::Stdout, report.clone())
+        .map_err(thread_refused(PipedStream::Stdout))?;
+    spawn_capture_thread(stderr_pipe, limit, PipedStream::Stderr, report)
+        .map_err(thread_refused(PipedStream::Stderr))?;
+
+    // Each thread reports once, so this takes at most two values; a third
+    // wait finds every sender dropped. A thread panic (e.g. OOM in the reader)
+    // surfaces as an `Err`, never a propagated panic; every `return` drops
+    // `guard`, which kills and reaps the child.
+    let mut drained = Drained {
+        stdout: None,
+        stderr: None,
+    };
+    let (stdout, stderr) = loop {
+        if let Some(refusal) = drained.refusal(cmd, ceiling, cap, false) {
+            return Err(refusal);
+        }
+        drained = match drained {
+            Drained {
+                stdout: Some(stdout),
+                stderr: Some(stderr),
+            } => break (stdout, stderr),
+            still_draining => still_draining,
+        };
+        match deadline.recv(&reports) {
+            Ok((PipedStream::Stdout, Ok(bytes))) => drained.stdout = Some(bytes),
+            Ok((PipedStream::Stderr, Ok(bytes))) => drained.stderr = Some(bytes),
+            Ok((stream, Err(error))) => {
+                return Err(ProcessRefusal::Capture {
+                    cmd: cmd.to_owned(),
+                    stream: stream.name(),
+                    error,
+                });
+            }
+            Err(DeadlineLapse::Expired) => {
+                return Err(drained
+                    .refusal(cmd, ceiling, cap, true)
+                    .unwrap_or_else(|| timed_out(cmd, &deadline, &mut guard)));
+            }
+            Err(DeadlineLapse::Disconnected) => {
+                return Err(ProcessRefusal::Panicked {
+                    cmd: cmd.to_owned(),
+                    stream: drained.pending().name(),
+                });
+            }
+        }
+    };
+    let status = reap_within(cmd, &deadline, &mut guard)?;
+    Ok(PipedStreams {
+        stdout,
+        stderr,
+        status,
+    })
+}
+
+fn process_run_sync(
+    cmd: &str,
+    args: &[String],
+    bounds: ProcessBounds,
+) -> Result<ProcessCapture, ProcessRefusal> {
     use std::process::{Command, Stdio};
 
     let mut builder = Command::new(cmd);
@@ -2469,55 +3029,16 @@ fn process_run_sync(cmd: &str, args: &[String], cap: u64) -> Result<ProcessCaptu
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     apply_env_overlay(&mut builder);
-    let child = builder.spawn().map_err(|e| format!("{cmd}: {e}"))?;
-    let mut guard = ChildGuard(Some(child));
 
-    // Per-stream read bound; passed by value to each capture thread (no shared
-    // global, so concurrent `process_run` calls cannot clobber one another).
-    let limit = cap.saturating_add(1);
-
-    // Take the pipe handles so each thread owns its reader; a `?` before the
-    // joins still reaps the child via `guard`'s `Drop`.
-    let (stdout, stderr) = {
-        let c = guard
-            .get_mut()
-            .ok_or_else(|| format!("{cmd}: child unexpectedly reaped"))?;
-        (c.stdout.take(), c.stderr.take())
-    };
-    // A refused capture thread returns through `?`; `guard` kills and reaps the
-    // child, which ends any capture already started.
-    let out_handle = spawn_capture_thread(stdout, limit)
-        .map_err(|e| format!("{cmd}: stdout capture thread refused: {e}"))?;
-    let err_handle = spawn_capture_thread(stderr, limit)
-        .map_err(|e| format!("{cmd}: stderr capture thread refused: {e}"))?;
-
-    // A thread panic (e.g. OOM in the reader) surfaces as an `Err`, never a
-    // propagated panic; `guard` still reaps the child on the `?` return.
-    let mut combined = out_handle
-        .join()
-        .map_err(|_| format!("{cmd}: stdout capture thread panicked"))?
-        .map_err(|e| format!("{cmd}: {e}"))?;
-    let stderr_bytes = err_handle
-        .join()
-        .map_err(|_| format!("{cmd}: stderr capture thread panicked"))?
-        .map_err(|e| format!("{cmd}: {e}"))?;
+    let streams = run_piped(cmd, builder, bounds, OutputCeiling::Combined)?;
     // Combined = stdout then stderr (callers usually treat it as `2>&1`).
-    combined.extend_from_slice(&stderr_bytes);
+    let mut combined = streams.stdout;
+    combined.extend_from_slice(&streams.stderr);
 
-    if combined.len() as u64 > cap {
-        // `guard`'s `Drop` kills + reaps the still-running child on this bail.
-        return Err(LimitRefusal::new(format!(
-            "{cmd}: output exceeds the {cap}-byte capture ceiling \
-             (raise IPE_PROCESS_OUTPUT_MAX)"
-        ))
-        .into());
-    }
-
-    let status = guard.wait().map_err(|e| format!("{cmd}: {e}"))?;
     Ok(ProcessCapture {
         combined,
-        success: status.success(),
-        status: format!("{status}"),
+        success: streams.status.success(),
+        status: format!("{}", streams.status),
     })
 }
 
@@ -2540,36 +3061,38 @@ fn process_run_sync(cmd: &str, args: &[String], cap: u64) -> Result<ProcessCaptu
 /// doc comment above) so a long-running subprocess can't stall the tokio worker
 /// thread polling this future.
 #[must_use]
-pub fn process_run<
-    E: Send + From<String> + FromLimitExceeded + crate::FromUnavailable + 'static,
->(
+pub fn process_run<E: crate::KernelErrorSink + Send + 'static>(
     cmd: String,
     args: Vec<String>,
 ) -> IpeTask<E, String> {
-    match process_output_ceiling() {
-        Ok(cap) => process_run_with_cap(cmd, args, cap),
+    match process_bounds() {
+        Ok(bounds) => process_run_with_bounds(cmd, args, bounds),
         Err(refusal) => refused_spawn(refusal),
     }
 }
 
-/// `process_run` with the capture ceiling supplied explicitly rather than read
-/// from the environment. `process_run` reads `process_output_ceiling()` once and
-/// forwards it here; tests exercise a specific ceiling by passing it directly,
-/// so no test mutates the process-global environment (which would race a
-/// concurrent subprocess call reading the same var).
+/// `process_run` with the bounds supplied explicitly rather than read from the
+/// environment.
+///
+/// `process_run` reads `process_bounds()` once and forwards it here; tests
+/// exercise a specific ceiling by passing it directly, so no test mutates the
+/// process-global environment (which would race a concurrent subprocess call
+/// reading the same var).
 #[must_use]
-fn process_run_with_cap<
-    E: Send + From<String> + FromLimitExceeded + crate::FromUnavailable + 'static,
->(
+fn process_run_with_bounds<E: crate::KernelErrorSink + Send + 'static>(
     cmd: String,
     args: Vec<String>,
-    cap: u64,
+    bounds: ProcessBounds,
 ) -> IpeTask<E, String> {
     Box::pin(async move {
         // `process_run_sync` folds `cmd` into every `Err` string, so the outer
         // `Err` arm (a refused or panicked blocking task) doesn't need `cmd` —
         // it's moved into the closure.
-        match run_blocking::<_, E, _>(move || process_run_sync(&cmd, &args, cap)).await {
+        match run_blocking::<_, E, _>(move || {
+            process_run_sync(&cmd, &args, bounds).map_err(KernelFailure::from)
+        })
+        .await
+        {
             Ok(out) => {
                 #[allow(clippy::disallowed_methods)] // process output reaches Ipê as `String` text
                 let text = String::from_utf8_lossy(&out.combined).into_owned();
@@ -2624,8 +3147,8 @@ fn process_run_with_sync(
     args: &[String],
     cwd: Option<&std::path::Path>,
     env_overrides: &[(String, String)],
-    cap: u64,
-) -> Result<ProcessRunOutput, KernelFailure> {
+    bounds: ProcessBounds,
+) -> Result<ProcessRunOutput, ProcessRefusal> {
     use std::process::{Command, Stdio};
 
     let mut builder = Command::new(cmd);
@@ -2649,57 +3172,16 @@ fn process_run_with_sync(
         builder.env(k, v);
     }
 
-    let child = builder.spawn().map_err(|e| format!("{cmd}: {e}"))?;
-    let mut guard = ChildGuard(Some(child));
+    let streams = run_piped(cmd, builder, bounds, OutputCeiling::PerStream)?;
 
-    let limit = cap.saturating_add(1);
-
-    let (stdout_pipe, stderr_pipe) = {
-        let c = guard
-            .get_mut()
-            .ok_or_else(|| format!("{cmd}: child unexpectedly reaped"))?;
-        (c.stdout.take(), c.stderr.take())
-    };
-    // A refused capture thread returns through `?`; `guard` kills and reaps the
-    // child, which ends any capture already started.
-    let out_handle = spawn_capture_thread(stdout_pipe, limit)
-        .map_err(|e| format!("{cmd}: stdout capture thread refused: {e}"))?;
-    let err_handle = spawn_capture_thread(stderr_pipe, limit)
-        .map_err(|e| format!("{cmd}: stderr capture thread refused: {e}"))?;
-
-    let stdout_bytes = out_handle
-        .join()
-        .map_err(|_| format!("{cmd}: stdout capture thread panicked"))?
-        .map_err(|e| format!("{cmd}: {e}"))?;
-    let stderr_bytes = err_handle
-        .join()
-        .map_err(|_| format!("{cmd}: stderr capture thread panicked"))?
-        .map_err(|e| format!("{cmd}: {e}"))?;
-
-    if stdout_bytes.len() as u64 > cap {
-        return Err(LimitRefusal::new(format!(
-            "{cmd}: stdout exceeds the {cap}-byte capture ceiling \
-             (raise IPE_PROCESS_OUTPUT_MAX)"
-        ))
-        .into());
-    }
-    if stderr_bytes.len() as u64 > cap {
-        return Err(LimitRefusal::new(format!(
-            "{cmd}: stderr exceeds the {cap}-byte capture ceiling \
-             (raise IPE_PROCESS_OUTPUT_MAX)"
-        ))
-        .into());
-    }
-
-    let status = guard.wait().map_err(|e| format!("{cmd}: {e}"))?;
     #[allow(clippy::disallowed_methods)] // process output reaches Ipê as `String` text
-    let stdout = String::from_utf8_lossy(&stdout_bytes).into_owned();
+    let stdout = String::from_utf8_lossy(&streams.stdout).into_owned();
     #[allow(clippy::disallowed_methods)] // process output reaches Ipê as `String` text
-    let stderr = String::from_utf8_lossy(&stderr_bytes).into_owned();
+    let stderr = String::from_utf8_lossy(&streams.stderr).into_owned();
 
     #[allow(non_snake_case)]
     Ok(ProcessRunOutput {
-        exitCode: i64::from(status.code().unwrap_or(-1)),
+        exitCode: i64::from(streams.status.code().unwrap_or(-1)),
         stdout,
         stderr,
     })
@@ -2719,13 +3201,11 @@ fn process_run_with_sync(
 /// inherits its confined environment from the parent, and the overrides are
 /// applied ON TOP of that already-confined environment.
 #[must_use]
-pub fn process_run_with<
-    E: Send + From<String> + FromLimitExceeded + crate::FromUnavailable + 'static,
->(
+pub fn process_run_with<E: crate::KernelErrorSink + Send + 'static>(
     cfg: ProcessRunWithCfg,
 ) -> IpeTask<E, ProcessRunOutput> {
-    match process_output_ceiling() {
-        Ok(cap) => process_run_with_impl(cfg, cap),
+    match process_bounds() {
+        Ok(bounds) => process_run_with_impl(cfg, bounds),
         Err(refusal) => refused_spawn(refusal),
     }
 }
@@ -2765,11 +3245,9 @@ crate::stringify::show_row!(
 );
 
 #[must_use]
-fn process_run_with_impl<
-    E: Send + From<String> + FromLimitExceeded + crate::FromUnavailable + 'static,
->(
+fn process_run_with_impl<E: crate::KernelErrorSink + Send + 'static>(
     cfg: ProcessRunWithCfg,
-    cap: u64,
+    bounds: ProcessBounds,
 ) -> IpeTask<E, ProcessRunOutput> {
     Box::pin(async move {
         let result = run_blocking::<_, E, _>(move || {
@@ -2777,7 +3255,14 @@ fn process_run_with_impl<
                 IpeMaybe::Just(p) => Some(std::path::PathBuf::from(p)),
                 IpeMaybe::Nothing => None,
             };
-            process_run_with_sync(&cfg.command, &cfg.args, cwd_path.as_deref(), &cfg.env, cap)
+            process_run_with_sync(
+                &cfg.command,
+                &cfg.args,
+                cwd_path.as_deref(),
+                &cfg.env,
+                bounds,
+            )
+            .map_err(KernelFailure::from)
         })
         .await;
         match result {
@@ -2853,26 +3338,26 @@ pub struct ProcessPtyOutput {
 /// rather than a silent no-op. The blocking spawn+read+wait is offloaded via
 /// `run_blocking` so a long-running child cannot stall the tokio worker thread.
 #[must_use]
-pub fn process_run_in_pty<
-    E: Send + From<String> + FromLimitExceeded + crate::FromUnavailable + 'static,
->(
+pub fn process_run_in_pty<E: crate::KernelErrorSink + Send + 'static>(
     cfg: ProcessRunInPtyCfg,
 ) -> IpeTask<E, ProcessPtyOutput> {
-    match process_output_ceiling() {
-        Ok(cap) => process_run_in_pty_impl(cfg, cap),
+    match process_bounds() {
+        Ok(bounds) => process_run_in_pty_impl(cfg, bounds),
         Err(refusal) => refused_spawn(refusal),
     }
 }
 
 #[must_use]
-fn process_run_in_pty_impl<
-    E: Send + From<String> + FromLimitExceeded + crate::FromUnavailable + 'static,
->(
+fn process_run_in_pty_impl<E: crate::KernelErrorSink + Send + 'static>(
     cfg: ProcessRunInPtyCfg,
-    cap: u64,
+    bounds: ProcessBounds,
 ) -> IpeTask<E, ProcessPtyOutput> {
     Box::pin(async move {
-        match run_blocking::<_, E, _>(move || process_run_in_pty_sync(cfg, cap)).await {
+        match run_blocking::<_, E, _>(move || {
+            process_run_in_pty_sync(cfg, bounds).map_err(KernelFailure::from)
+        })
+        .await
+        {
             Ok(out) => ok_res(out),
             Err(e) => IpeResult::Err(e),
         }
@@ -2886,11 +3371,11 @@ fn process_run_in_pty_impl<
 #[cfg(not(unix))]
 fn process_run_in_pty_sync(
     _cfg: ProcessRunInPtyCfg,
-    _cap: u64,
-) -> Result<ProcessPtyOutput, KernelFailure> {
-    Err(KernelFailure::from(
-        "Process.runInPty is only supported on Unix targets".to_owned(),
-    ))
+    _bounds: ProcessBounds,
+) -> Result<ProcessPtyOutput, ProcessRefusal> {
+    Err(ProcessRefusal::Unsupported {
+        what: "Process.runInPty is only supported on Unix targets",
+    })
 }
 
 /// Spawn `cfg.command cfg.args` under a freshly allocated pseudo-terminal, sized
@@ -2916,12 +3401,26 @@ fn process_run_in_pty_sync(
 #[cfg(unix)]
 fn process_run_in_pty_sync(
     cfg: ProcessRunInPtyCfg,
-    cap: u64,
-) -> Result<ProcessPtyOutput, KernelFailure> {
-    use std::io::Read as _;
+    bounds: ProcessBounds,
+) -> Result<ProcessPtyOutput, ProcessRefusal> {
     use std::process::{Command, Stdio};
 
     let cmd = &cfg.command;
+    let cap = bounds.output;
+    let pty_step = |step| {
+        move |error: rustix::io::Errno| ProcessRefusal::Pty {
+            cmd: cmd.clone(),
+            step,
+            error: error.into(),
+        }
+    };
+    let pty_io_step = |step| {
+        move |error: std::io::Error| ProcessRefusal::Pty {
+            cmd: cmd.clone(),
+            step,
+            error,
+        }
+    };
 
     // Allocate the pty master with O_RDWR | O_NOCTTY (the parent must not acquire
     // the pty as its controlling terminal). `OpenptFlags::CLOEXEC` — keeping the
@@ -2940,14 +3439,12 @@ fn process_run_in_pty_sync(
             base
         }
     };
-    let master =
-        rustix::pty::openpt(openpt_flags).map_err(|e| format!("{cmd}: pty openpt failed: {e}"))?;
+    let master = rustix::pty::openpt(openpt_flags).map_err(pty_step("openpt"))?;
 
     // Grant + unlock the replica side, then resolve its filesystem path.
-    rustix::pty::grantpt(&master).map_err(|e| format!("{cmd}: pty grantpt failed: {e}"))?;
-    rustix::pty::unlockpt(&master).map_err(|e| format!("{cmd}: pty unlockpt failed: {e}"))?;
-    let replica_name = rustix::pty::ptsname(&master, Vec::new())
-        .map_err(|e| format!("{cmd}: pty ptsname failed: {e}"))?;
+    rustix::pty::grantpt(&master).map_err(pty_step("grantpt"))?;
+    rustix::pty::unlockpt(&master).map_err(pty_step("unlockpt"))?;
+    let replica_name = rustix::pty::ptsname(&master, Vec::new()).map_err(pty_step("ptsname"))?;
 
     // Open the replica the child will inherit as its stdio. O_NOCTTY: the child
     // acquires the controlling terminal via `setsid` semantics of process
@@ -2957,7 +3454,7 @@ fn process_run_in_pty_sync(
         rustix::fs::OFlags::RDWR | rustix::fs::OFlags::NOCTTY,
         rustix::fs::Mode::empty(),
     )
-    .map_err(|e| format!("{cmd}: pty replica open failed: {e}"))?;
+    .map_err(pty_step("replica open"))?;
 
     // Size the pty. Clamp the caller's cols/rows into the kernel's `u16` window
     // fields (a negative or over-large value is clamped to the representable
@@ -2968,18 +3465,13 @@ fn process_run_in_pty_sync(
         ws_xpixel: 0,
         ws_ypixel: 0,
     };
-    rustix::termios::tcsetwinsize(&replica, winsize)
-        .map_err(|e| format!("{cmd}: pty tcsetwinsize failed: {e}"))?;
+    rustix::termios::tcsetwinsize(&replica, winsize).map_err(pty_step("tcsetwinsize"))?;
 
     // Each of the child's three stdio slots needs its own owned handle to the
     // replica (each `Stdio::from` consumes one). Clone the replica fd twice; the
     // original covers the third.
-    let replica_out = replica
-        .try_clone()
-        .map_err(|e| format!("{cmd}: pty replica dup failed: {e}"))?;
-    let replica_err = replica
-        .try_clone()
-        .map_err(|e| format!("{cmd}: pty replica dup failed: {e}"))?;
+    let replica_out = replica.try_clone().map_err(pty_io_step("replica dup"))?;
+    let replica_err = replica.try_clone().map_err(pty_io_step("replica dup"))?;
 
     let mut builder = Command::new(cmd);
     builder
@@ -3001,73 +3493,32 @@ fn process_run_in_pty_sync(
         builder.env(k, v);
     }
 
-    let child = builder.spawn().map_err(|e| format!("{cmd}: {e}"))?;
-    let mut guard = ChildGuard(Some(child));
-
-    // Close the parent's replica handles by dropping the `Command`: it retains
-    // ownership of the three `Stdio`-wrapped replica fds after `spawn` (spawn
-    // dup'd them into the child, but the parent's originals stay open until the
-    // `Command` is dropped). Once ONLY the child holds replica ends open, reading
-    // the master returns EOF when the child exits — otherwise the parent's own
-    // open replica keeps the master readable forever, and the read below hangs.
-    drop(builder);
+    // The spawner consumes the `Command`, closing the parent's three
+    // `Stdio`-wrapped replica fds with the spawn (spawn dup'd them into the
+    // child). Once ONLY the child holds replica ends open, reading the master
+    // returns EOF when the child exits — otherwise the parent's own open replica
+    // keeps the master readable forever, and the read below hangs.
+    let mut guard = spawn_bounded_child(cmd, builder)?;
+    let deadline = Deadline::start(bounds.wall);
 
     // Read the master to end-of-stream on a dedicated thread, bounded by `cap + 1`
     // so a flooding child cannot allocate without bound. `File::from` takes
     // ownership of the master fd; the reader thread owns it for its lifetime.
-    //
-    // On Linux, once the child (the last replica holder) closes the replica, a
-    // read of the master returns `EIO` rather than a clean `Ok(0)` EOF — this is
-    // the documented pty-master end-of-stream signal, not a real IO fault. Treat
-    // `EIO` (and an interrupted `EINTR`) as end-of-stream; any OTHER error is a
-    // genuine failure and propagates. The manual loop enforces the `cap + 1`
-    // ceiling on peak allocation regardless.
-    let mut master_file = std::fs::File::from(master);
-    let limit = cap.saturating_add(1);
     // A refused reader drops the master with its closure and returns through
     // `?`; `guard` kills and reaps the child.
-    let read_handle: std::thread::JoinHandle<std::io::Result<Vec<u8>>> =
-        crate::threads::spawn_named(PTY_READ_THREAD, move || {
-            let mut buf = Vec::new();
-            let mut chunk = [0u8; 8192];
-            loop {
-                let filled = u64::try_from(buf.len()).unwrap_or(u64::MAX);
-                if filled >= limit {
-                    break;
-                }
-                match master_file.read(&mut chunk) {
-                    Ok(0) => break,
-                    Ok(n) => {
-                        // Never grow past `limit`: take only up to the ceiling.
-                        let room = usize::try_from(limit - filled).unwrap_or(usize::MAX);
-                        let take = n.min(room);
-                        buf.extend_from_slice(chunk.get(..take).unwrap_or(&[]));
-                    }
-                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
-                    // `EIO` on a pty master = the replica side closed = EOF.
-                    Err(e) if e.raw_os_error() == Some(5) => break,
-                    Err(e) => return Err(e),
-                }
-            }
-            Ok(buf)
-        })
-        .map_err(|e| format!("{cmd}: pty read thread refused: {e}"))?;
+    let master_file = std::fs::File::from(master);
+    let rx = spawn_pty_reader(master_file, cap.saturating_add(1)).map_err(|error| {
+        ProcessRefusal::Thread {
+            cmd: cmd.clone(),
+            stream: "pty read",
+            error,
+        }
+    })?;
 
-    let combined = read_handle
-        .join()
-        .map_err(|_| format!("{cmd}: pty read thread panicked"))?
-        .map_err(|e| format!("{cmd}: pty read failed: {e}"))?;
+    let combined = capture_within(cmd, "pty read", &rx, &deadline, &mut guard)?;
+    within_cap(cmd, "pty output", byte_len(&combined), cap)?;
 
-    if combined.len() as u64 > cap {
-        // `guard`'s `Drop` kills + reaps the still-running child on this bail.
-        return Err(LimitRefusal::new(format!(
-            "{cmd}: pty output exceeds the {cap}-byte capture ceiling \
-             (raise IPE_PROCESS_OUTPUT_MAX)"
-        ))
-        .into());
-    }
-
-    let status = guard.wait().map_err(|e| format!("{cmd}: {e}"))?;
+    let status = reap_within(cmd, &deadline, &mut guard)?;
     #[allow(clippy::disallowed_methods)] // process output reaches Ipê as `String` text
     let output = String::from_utf8_lossy(&combined).into_owned();
 
@@ -3076,6 +3527,56 @@ fn process_run_in_pty_sync(
         exitCode: i64::from(status.code().unwrap_or(-1)),
         output,
     })
+}
+
+/// Drains a pty master to end-of-stream on a dedicated thread, keeping at most
+/// `limit` bytes.
+///
+/// On Linux, once the child (the last replica holder) closes the replica, a
+/// read of the master returns `EIO` rather than a clean `Ok(0)` EOF — this is
+/// the documented pty-master end-of-stream signal, not a real IO fault. `EIO`
+/// (and an interrupted `EINTR`) is end-of-stream; any OTHER error is a genuine
+/// failure and is sent back. The manual loop enforces the `limit` ceiling on
+/// peak allocation regardless. The bytes arrive on the returned receiver, so
+/// the caller waits under its [`Deadline`].
+///
+/// # Errors
+///
+/// The OS refused the thread.
+#[cfg(unix)]
+fn spawn_pty_reader(
+    mut master: std::fs::File,
+    limit: u64,
+) -> std::io::Result<std::sync::mpsc::Receiver<CaptureResult>> {
+    use std::io::Read as _;
+    let (tx, rx) = std::sync::mpsc::sync_channel::<CaptureResult>(1);
+    crate::threads::spawn_named(PTY_READ_THREAD, move || {
+        let mut buf = Vec::new();
+        let mut chunk = [0u8; 8192];
+        let read = loop {
+            let filled = u64::try_from(buf.len()).unwrap_or(u64::MAX);
+            if filled >= limit {
+                break Ok(buf);
+            }
+            match master.read(&mut chunk) {
+                Ok(0) => break Ok(buf),
+                Ok(n) => {
+                    // Never grow past `limit`: take only up to the ceiling.
+                    let room = usize::try_from(limit - filled).unwrap_or(usize::MAX);
+                    let take = n.min(room);
+                    buf.extend_from_slice(chunk.get(..take).unwrap_or(&[]));
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                // `EIO` on a pty master = the replica side closed = EOF.
+                Err(e) if e.raw_os_error() == Some(5) => break Ok(buf),
+                Err(e) => break Err(e),
+            }
+        };
+        // The slot is free until this one send; a caller gone past its
+        // deadline has dropped the receiver, and the bytes are discarded.
+        let _ = tx.send(read);
+    })?;
+    Ok(rx)
 }
 
 /// Clamp an `i64` terminal dimension into the kernel `winsize`'s `u16` field: a
@@ -3357,6 +3858,34 @@ pub fn system_load_env<E: Send + 'static>(_: ()) -> IpeTask<E, ()> {
 #[cfg(all(test, not(target_arch = "wasm32")))]
 pub(crate) fn assert_env_ceiling_contract(ceiling: EnvCeiling) {
     assert_decimal_contract(ceiling, |raw| ceiling.parse(raw));
+}
+
+/// Bounds for a child a test must cut off: a generous byte ceiling under a
+/// 100 ms wall ceiling.
+#[cfg(all(test, not(target_arch = "wasm32")))]
+pub(crate) const fn short_wall() -> ProcessBounds {
+    ProcessBounds {
+        output: 64,
+        wall: ProcessDeadline::for_test(std::time::Duration::from_millis(100)),
+    }
+}
+
+/// Runs `job` on its own thread and returns its value, or `None` once `ceiling`
+/// passes with the job still running.
+///
+/// A test that drives a deadline must itself end when the deadline is broken,
+/// so a kernel that waits without bound is a failed test, never a hung one.
+#[cfg(all(test, not(target_arch = "wasm32")))]
+pub(crate) fn finishes_within<T: Send + 'static>(
+    ceiling: std::time::Duration,
+    job: impl FnOnce() -> T + Send + 'static,
+) -> Option<T> {
+    let (tx, rx) = std::sync::mpsc::sync_channel(1);
+    crate::threads::spawn_named("test-deadline", move || {
+        let _ = tx.send(job());
+    })
+    .ok()?;
+    rx.recv_timeout(ceiling).ok()
 }
 
 /// Asserts the [`EnvCeiling`] contract on an [`EnvDuration`].
@@ -3646,8 +4175,9 @@ mod signal_mask_tests {
 mod env_ceiling_tests {
     use super::{
         CeilingDefect, ENV_VALUE_SHOWN_CHARS, EnvCeiling, EnvDuration, EnvValueRefusal,
-        PROCESS_OUTPUT_CEILING, ZeroCeiling, assert_env_ceiling_contract,
-        assert_env_duration_contract, locked_remove_var, locked_set_var, process_output_ceiling,
+        PROCESS_OUTPUT_CEILING, PROCESS_WALL_CEILING, ZeroCeiling, assert_env_ceiling_contract,
+        assert_env_duration_contract, locked_remove_var, locked_set_var, process_bounds,
+        process_output_ceiling,
     };
 
     #[test]
@@ -3843,6 +4373,20 @@ mod env_ceiling_tests {
         assert!(
             refused.is_err_and(|r| r.name() == "IPE_PROCESS_OUTPUT_MAX"),
             "a suffixed output ceiling must refuse the spawn"
+        );
+    }
+
+    /// The wall ceiling honours the duration contract, and a zero setting
+    /// refuses the spawn: no call may run without a positive deadline.
+    #[test]
+    fn process_wall_ceiling_honours_the_contract_and_refuses_zero() {
+        assert_env_duration_contract(PROCESS_WALL_CEILING);
+        locked_set_var("IPE_PROCESS_TIMEOUT", "0");
+        let refused = process_bounds();
+        locked_remove_var("IPE_PROCESS_TIMEOUT");
+        assert!(
+            refused.is_err_and(|r| r.name() == "IPE_PROCESS_TIMEOUT"),
+            "a zero wall ceiling must refuse the spawn"
         );
     }
 
@@ -5626,10 +6170,10 @@ mod process_run_tests {
     fn output_over_ceiling_errs() {
         // The ceiling is passed explicitly (not via a process-global env var),
         // so this runs safely in parallel with any other subprocess test.
-        let res: IpeResult<IpeError, String> = block(process_run_with_cap::<IpeError>(
+        let res: IpeResult<IpeError, String> = block(process_run_with_bounds::<IpeError>(
             "printf".to_string(),
             vec!["%s".to_string(), "x".repeat(9)],
-            8,
+            ProcessBounds::for_test(8),
         ));
         assert_eq!(
             res,
@@ -5638,10 +6182,10 @@ mod process_run_tests {
             )),
             "9 bytes of output under an 8-byte ceiling is a LimitExceeded refusal"
         );
-        let at_cap: IpeResult<IpeError, String> = block(process_run_with_cap::<IpeError>(
+        let at_cap: IpeResult<IpeError, String> = block(process_run_with_bounds::<IpeError>(
             "printf".to_string(),
             vec!["%s".to_string(), "x".repeat(8)],
-            8,
+            ProcessBounds::for_test(8),
         ));
         assert_eq!(
             at_cap,
@@ -5678,7 +6222,8 @@ mod process_run_tests {
             "while :; do :; done".to_owned(),
             marker.clone(),
         ];
-        let refused = process_run_sync("sh", &args, 64);
+        let refused =
+            process_run_sync("sh", &args, ProcessBounds::for_test(64)).map_err(KernelFailure::from);
         assert!(
             matches!(&refused, Err(e) if e.message().contains("capture thread refused")),
             "{:?}",
@@ -5687,6 +6232,201 @@ mod process_run_tests {
         assert!(
             !a_process_carries(&marker),
             "the child of a refused capture must be killed and reaped"
+        );
+    }
+
+    /// Polls until no live process carries `marker`, or `ceiling` passes.
+    #[cfg(target_os = "linux")]
+    fn gone_within(marker: &str, ceiling: std::time::Duration) -> bool {
+        let started = std::time::Instant::now();
+        loop {
+            if !a_process_carries(marker) {
+                return true;
+            }
+            if started.elapsed() >= ceiling {
+                return false;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+
+    /// A busy shell loop that never exits on its own, carrying `marker` in its
+    /// command line.
+    #[cfg(target_os = "linux")]
+    fn endless_loop_args(marker: &str) -> [String; 3] {
+        [
+            "-c".to_owned(),
+            "while :; do :; done".to_owned(),
+            marker.to_owned(),
+        ]
+    }
+
+    /// The wall ceiling ends a child that never exits: the call returns
+    /// `TimedOut` within seconds, and the child is killed and reaped.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_child_past_the_wall_ceiling_is_killed_and_the_call_times_out() {
+        let marker = format!("ipe-wall-ceiling-probe-{}", std::process::id());
+        let args = endless_loop_args(&marker);
+        let ended = finishes_within(std::time::Duration::from_secs(5), move || {
+            process_run_sync("sh", &args, short_wall()).map_err(KernelFailure::from)
+        });
+        assert!(
+            ended.is_some(),
+            "a call past its wall ceiling must return, not wait on the child"
+        );
+        let Some(refused) = ended else { return };
+        assert!(
+            matches!(&refused, Err(KernelFailure::TimedOut(_))),
+            "{:?}",
+            refused.as_ref().err()
+        );
+        assert!(
+            gone_within(&marker, std::time::Duration::from_secs(2)),
+            "the timed-out child must be killed and reaped"
+        );
+    }
+
+    /// The kill reaches the child's whole process group: a grandchild the
+    /// shell backgrounded dies with it instead of surviving as an orphan.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_timed_out_child_takes_its_process_group_with_it() {
+        let marker = format!("ipe-wall-group-probe-{}", std::process::id());
+        let args = [
+            "-c".to_owned(),
+            r#"sh -c 'while :; do :; done' _ "$1" & wait"#.to_owned(),
+            "_".to_owned(),
+            marker.clone(),
+        ];
+        let ended = finishes_within(std::time::Duration::from_secs(5), move || {
+            process_run_sync("sh", &args, short_wall()).map_err(KernelFailure::from)
+        });
+        assert!(
+            ended.is_some(),
+            "a call past its wall ceiling must return, not wait on the child"
+        );
+        let Some(refused) = ended else { return };
+        assert!(
+            matches!(&refused, Err(KernelFailure::TimedOut(_))),
+            "{:?}",
+            refused.as_ref().err()
+        );
+        assert!(
+            gone_within(&marker, std::time::Duration::from_secs(2)),
+            "a backgrounded grandchild must die with the timed-out child"
+        );
+    }
+
+    /// `sh -c` arguments that write `bytes` to `stream` and then spin without
+    /// exiting, holding both pipes open and carrying `marker` in the command
+    /// line.
+    #[cfg(target_os = "linux")]
+    fn overflow_then_spin(marker: &str, stream: &str, bytes: usize) -> [String; 3] {
+        [
+            "-c".to_owned(),
+            format!(
+                "printf %s {} {stream}; while :; do :; done",
+                "x".repeat(bytes)
+            ),
+            marker.to_owned(),
+        ]
+    }
+
+    /// The byte refusal a piped call should end with.
+    #[cfg(target_os = "linux")]
+    fn too_large(stream: &str, cap: u64) -> KernelFailure {
+        KernelFailure::LimitExceeded(LimitRefusal::new(format!(
+            "sh: {stream} exceeds the {cap}-byte capture ceiling (raise IPE_PROCESS_OUTPUT_MAX)"
+        )))
+    }
+
+    /// A stream past the byte ceiling ends `Process.run` as soon as it is
+    /// drained: the child, still holding its other stream open, is killed
+    /// rather than waited on until the wall ceiling.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn an_overflowing_stream_ends_the_call_while_the_other_is_open() {
+        let marker = format!("ipe-early-output-ceiling-probe-{}", std::process::id());
+        let args = overflow_then_spin(&marker, "", 9);
+        let ended = finishes_within(std::time::Duration::from_secs(5), move || {
+            process_run_sync("sh", &args, ProcessBounds::for_test(8)).map_err(KernelFailure::from)
+        });
+        assert!(
+            ended.is_some(),
+            "an over-ceiling stream must end the call, not wait on the open one"
+        );
+        let Some(refused) = ended else { return };
+        assert_eq!(refused.err(), Some(too_large("output", 8)));
+        assert!(
+            gone_within(&marker, std::time::Duration::from_secs(2)),
+            "the over-ceiling child must be killed and reaped"
+        );
+    }
+
+    /// Under the per-stream ceiling an over-ceiling stdout decides at once,
+    /// while stderr is still open.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn an_overflowing_stdout_ends_run_with_while_stderr_is_open() {
+        let marker = format!("ipe-early-stdout-ceiling-probe-{}", std::process::id());
+        let args = overflow_then_spin(&marker, "", 9);
+        let ended = finishes_within(std::time::Duration::from_secs(5), move || {
+            process_run_with_sync("sh", &args, None, &[], ProcessBounds::for_test(8))
+                .map(|_| ())
+                .map_err(KernelFailure::from)
+        });
+        assert!(
+            ended.is_some(),
+            "an over-ceiling stdout must end the call, not wait on stderr"
+        );
+        let Some(refused) = ended else { return };
+        assert_eq!(refused.err(), Some(too_large("stdout", 8)));
+        assert!(
+            gone_within(&marker, std::time::Duration::from_secs(2)),
+            "the over-ceiling child must be killed and reaped"
+        );
+    }
+
+    /// An over-ceiling stderr cannot decide while stdout is open (stdout might
+    /// overflow too and names the refusal first), but when the wall ceiling
+    /// expires the known overflow is the refusal, not the timeout.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn an_overflowing_stderr_outranks_the_wall_ceiling() {
+        let marker = format!("ipe-expired-stderr-ceiling-probe-{}", std::process::id());
+        let args = overflow_then_spin(&marker, ">&2", 65);
+        // Long enough that a loaded host still drains stderr before expiry.
+        let bounds = ProcessBounds {
+            output: 64,
+            wall: ProcessDeadline::for_test(std::time::Duration::from_secs(2)),
+        };
+        let ended = finishes_within(std::time::Duration::from_secs(10), move || {
+            process_run_with_sync("sh", &args, None, &[], bounds)
+                .map(|_| ())
+                .map_err(KernelFailure::from)
+        });
+        assert!(
+            ended.is_some(),
+            "a call past its wall ceiling must return, not wait on the child"
+        );
+        let Some(refused) = ended else { return };
+        assert_eq!(refused.err(), Some(too_large("stderr", 64)));
+        assert!(
+            gone_within(&marker, std::time::Duration::from_secs(2)),
+            "the over-ceiling child must be killed and reaped"
+        );
+    }
+
+    /// A malformed wall ceiling refuses the call before any child exists.
+    #[test]
+    fn a_refused_wall_ceiling_fails_the_task_naming_the_variable() {
+        locked_set_var("IPE_PROCESS_TIMEOUT", "0");
+        let res = block(process_run::<IpeError>("true".to_owned(), vec![]));
+        locked_remove_var("IPE_PROCESS_TIMEOUT");
+        assert!(
+            matches!(&res, IpeResult::Err(e) if e.to_ipe_string().contains("IPE_PROCESS_TIMEOUT")),
+            "{res:?}"
         );
     }
 
@@ -5759,6 +6499,36 @@ mod process_run_with_tests {
             }
             IpeResult::Err(e) => panic!("unexpected error: {e}"),
         }
+    }
+
+    /// A child past the wall ceiling fails the Task as `Timeout`, and the
+    /// message names the variable that raises the ceiling.
+    #[test]
+    fn a_child_past_the_wall_ceiling_is_a_timeout_error() {
+        let endless = cfg("sh", &["-c", "while :; do :; done"]);
+        let ended = finishes_within(std::time::Duration::from_secs(5), move || {
+            block(process_run_with_impl::<IpeError>(endless, short_wall()))
+        });
+        assert!(
+            ended.is_some(),
+            "a call past its wall ceiling must return, not wait on the child"
+        );
+        let Some(res) = ended else { return };
+        assert!(
+            matches!(res, IpeResult::Err(_)),
+            "a child past the wall ceiling must fail the Task"
+        );
+        let IpeResult::Err(error) = res else { return };
+        assert_eq!(
+            crate::ipe_error_kind(error.clone()),
+            crate::IpeErrorKind::Timeout
+        );
+        let shown = error.to_ipe_string();
+        assert!(
+            shown.starts_with("Timeout: sh: still running after the ")
+                && shown.contains(PROCESS_WALL_CEILING.name()),
+            "{shown}"
+        );
     }
 
     /// stderr is captured separately from stdout.
@@ -5860,7 +6630,7 @@ mod process_run_with_tests {
                 cwd: IpeMaybe::Nothing,
                 env: Vec::new(),
             },
-            8,
+            ProcessBounds::for_test(8),
         ));
         assert!(
             matches!(&res, IpeResult::Err(e) if *e == IpeError::limit_exceeded(
@@ -5876,7 +6646,7 @@ mod process_run_with_tests {
                     cwd: IpeMaybe::Nothing,
                     env: Vec::new(),
                 },
-                8,
+                ProcessBounds::for_test(8),
             ));
         assert!(
             matches!(&stderr_past, IpeResult::Err(e) if *e == IpeError::limit_exceeded(
@@ -5989,13 +6759,35 @@ mod process_run_in_pty_tests {
                     cols: 80,
                     rows: 24,
                 },
-                8,
+                ProcessBounds::for_test(8),
             ));
         assert!(
             matches!(&res, IpeResult::Err(e) if *e == IpeError::limit_exceeded(
                 "sh: pty output exceeds the 8-byte capture ceiling (raise IPE_PROCESS_OUTPUT_MAX)"
             )),
             "output far exceeding an 8-byte ceiling is a LimitExceeded refusal"
+        );
+    }
+
+    /// A pty child past the wall ceiling is killed, and the Task fails as
+    /// `Timeout` rather than waiting on the master forever.
+    #[test]
+    fn a_pty_child_past_the_wall_ceiling_times_out() {
+        let cfg = pty_cfg("sh", &["-c", "while :; do :; done"]);
+        let ended = finishes_within(std::time::Duration::from_secs(5), move || {
+            block(process_run_in_pty_impl::<IpeError>(cfg, short_wall()))
+        });
+        assert!(
+            ended.is_some(),
+            "a pty call past its wall ceiling must return, not wait on the child"
+        );
+        let Some(res) = ended else { return };
+        assert!(
+            matches!(
+                &res,
+                IpeResult::Err(e) if crate::ipe_error_kind(e.clone()) == crate::IpeErrorKind::Timeout
+            ),
+            "a pty call past its wall ceiling must fail with a Timeout error"
         );
     }
 

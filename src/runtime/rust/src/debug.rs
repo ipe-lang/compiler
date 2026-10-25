@@ -404,6 +404,12 @@ mod tests {
                 header("Authorization"),
                 header("cookie"),
                 header("Set-Cookie"),
+                header("X-Api-Key"),
+                header("Proxy-Authorization"),
+                header("X-Amz-Security-Token"),
+                header("X-Custom-Token"),
+                header("X-Client-Secret"),
+                header("Authorizatıon"),
             ]
             .into_iter()
             .collect(),
@@ -435,7 +441,7 @@ mod tests {
             dev(&request),
             dev(&crate::http_client::HttpRequest {
                 body: String::new(),
-                headers: vec![header("AUTHORIZATION")],
+                headers: vec![header("AUTHORIZATION"), header("X-Api-Key")],
                 method: crate::http_client::HttpMethod::Get,
                 redirects: crate::http_client::RedirectPolicy::NoRedirects,
                 timeout: 30,

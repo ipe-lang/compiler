@@ -9,8 +9,7 @@
 // the proof.
 use super::path::{OsOrigin, Path, from_os, join_entry, name_from_os};
 use super::{
-    FromLimitExceeded, IpeError, IpeResult, IpeTask, KernelFailure, LimitRefusal, from_u8_slice,
-    ok_res, str_err,
+    IpeError, IpeResult, IpeTask, KernelFailure, LimitRefusal, from_u8_slice, ok_res, str_err,
 };
 
 // ── shared blocking-pool helper ───────────────────────────────────────
@@ -94,9 +93,7 @@ fn file_read_file_sync(path: &str, cap: u64) -> Result<String, KernelFailure> {
 }
 
 #[must_use]
-pub fn file_read_file<
-    E: Send + From<String> + FromLimitExceeded + crate::FromUnavailable + 'static,
->(
+pub fn file_read_file<E: Send + crate::KernelErrorSink + 'static>(
     path: Path,
 ) -> IpeTask<E, String> {
     let path = path.into_string();
@@ -249,9 +246,7 @@ fn read_limit(kernel: &str, limit: i64) -> Result<u64, String> {
 /// `file_read_file`, and `compression.rs`'s decompression-bomb check) leaves
 /// nothing to race against.
 #[must_use]
-pub fn file_read_file_limit<
-    E: Send + From<String> + FromLimitExceeded + crate::FromUnavailable + 'static,
->(
+pub fn file_read_file_limit<E: Send + crate::KernelErrorSink + 'static>(
     path: Path,
     limit: i64,
 ) -> IpeTask<E, String> {
@@ -683,9 +678,7 @@ fn file_read_file_bytes_sync(path: &str) -> Result<Vec<i64>, KernelFailure> {
 /// over the cap is an `Err`, never a silent truncation. For text content with
 /// guaranteed UTF-8, prefer `readFile` / `readFileLimit`.
 #[must_use]
-pub fn file_read_file_bytes<
-    E: Send + From<String> + FromLimitExceeded + crate::FromUnavailable + 'static,
->(
+pub fn file_read_file_bytes<E: Send + crate::KernelErrorSink + 'static>(
     path: Path,
 ) -> IpeTask<E, Vec<i64>> {
     let path = path.into_string();

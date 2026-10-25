@@ -285,9 +285,7 @@ fn csv_parse_stream_from_file_sync(path: &str) -> Result<Vec<Vec<String>>, Kerne
 /// file I/O + incremental CSV parsing (bounded by `IPE_CSV_MAX_ROWS` AND
 /// `IPE_CSV_MAX_BYTES`) is offloaded to tokio's blocking pool via
 /// `threads::join_blocking`.
-pub fn csv_parse_stream_from_file<
-    E: From<String> + FromLimitExceeded + crate::FromUnavailable + Send + 'static,
->(
+pub fn csv_parse_stream_from_file<E: crate::KernelErrorSink + Send + 'static>(
     path: crate::path::Path,
 ) -> IpeTask<E, Vec<Vec<String>>> {
     let path = path.into_string();

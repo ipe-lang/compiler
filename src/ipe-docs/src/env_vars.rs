@@ -935,6 +935,17 @@ static HAND_TABLE: &[EnvVar] = &[
         subsystem: Subsystem::File,
         class: Class::Tunable,
     },
+    EnvVar {
+        name: ipe_runtime_rust::system::PROCESS_WALL_CEILING.name(),
+        default: Cow::Borrowed("3600 (1 h)"),
+        purpose: "Wall-clock ceiling on one `Process.run`, `runWith` or `runInPty` \
+                  call, in whole seconds or `h`/`m`/`s` segments (`30m`, `1h30m`); \
+                  at most 24 hours. A child still running when it expires is killed \
+                  and the call fails with a `Timeout` error, so a hung child cannot \
+                  pin a worker forever.",
+        subsystem: Subsystem::File,
+        class: Class::Tunable,
+    },
     // ── Runtime ───────────────────────────────────────────────────────────────
     EnvVar {
         name: "IPE_HOME",
@@ -1199,7 +1210,10 @@ static HAND_TABLE: &[EnvVar] = &[
                   to a fresh `init`. Requesting a backend the build lacks the \
                   feature for is a fail-closed startup error, not a silent \
                   downgrade — build with the feature or set \
-                  `IPE_WEB_STORE=file|memory`.",
+                  `IPE_WEB_STORE=file|memory`. A page request that cannot persist \
+                  its new session is refused with 503; an existing session whose \
+                  checkpoint fails stays live and is not evicted until a checkpoint \
+                  lands.",
         subsystem: Subsystem::Web,
         class: Class::Tunable,
     },
@@ -1314,7 +1328,8 @@ pub static EXCLUDED_NAMES: &[&str] = &[
     "IPE_JUNCTION_OUT",    // Windows junction test helper: compiled helper output path
     "IPE_LOAD_ENV_PROBE_VAR",
     "IPE_ORACLE_SHARED_TARGET",
-    "IPE_PDEATH_PROBE", // parent-death spawner test: selects the re-executed probe mode
+    "IPE_PDEATH_KERNEL_CHILD", // parent-death spawner test: marks the kernel child for the /proc lookup
+    "IPE_PDEATH_PROBE",        // parent-death spawner test: selects the re-executed probe mode
     "IPE_REGISTRY_TEST_CHOICE_B", // env registry test: a fixed fixture key, never read in production
     "IPE_REGISTRY_TEST_NEW", // env registry test: a replacement name only quoted in a retired-key message
     "IPE_REGISTRY_TEST_PORT_A", // env registry test: a fixed fixture key, never read in production
@@ -1406,6 +1421,19 @@ mod tests {
         assert!(
             entry.is_some_and(|v| v.default.starts_with(&expected)),
             "IPE_FILE_READ_MAX default must start with {expected:?}: {entry:?}"
+        );
+    }
+
+    /// The documented `IPE_PROCESS_TIMEOUT` default is the enforced runtime const.
+    #[test]
+    fn process_timeout_default_matches_runtime() {
+        let ceiling = ipe_runtime_rust::system::PROCESS_WALL_CEILING;
+        let entry = ENV_VARS.iter().find(|v| v.name == ceiling.name());
+        let expected = format!("{} ", ceiling.default_value());
+        assert!(
+            entry.is_some_and(|v| v.default.starts_with(&expected)),
+            "{} default must start with {expected:?}: {entry:?}",
+            ceiling.name()
         );
     }
 

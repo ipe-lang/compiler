@@ -46,8 +46,11 @@ ends it; evicting a session does not close it, so close a socket
 in `update` once the program no longer needs it.
 
 Heartbeat: `connect` sends no pings.  `connectWith` pings every
-`pingInterval` milliseconds when it is positive; `defaultCfg`
-sets 30 s.  Pings from the peer are answered automatically.
+`pingInterval` milliseconds unless it is zero; a span below zero or
+past 10 minutes refuses the connect with an `InvalidInput` error.
+`defaultCfg` sets 30 s.  Pings from the peer are answered
+automatically.  In the browser both spans are judged the same way
+but not applied: the browser owns the ping/pong exchange.
 Pongs are not tracked: a peer that stops answering pings is not
 detected by the heartbeat.
 
@@ -145,6 +148,13 @@ Override the handshake timeout (default 30 s).  Takes a typed
 `Ipe.Duration` (e.g. `Duration.seconds 30`); the raw milliseconds are
 unwrapped into the transport DTO for the runtime.
 
+The runtime admits a deadline from 1 millisecond to 10 minutes and refuses
+the connect with an `InvalidInput` error otherwise: `Duration.zero` is
+refused (it never means "no deadline" or "the default"), and a span past
+10 minutes is refused rather than cut down.  In the browser the span is
+judged the same way but not applied: the browser owns the handshake
+deadline.
+
 ## `withPingInterval`
 
 ```ipe
@@ -153,7 +163,9 @@ withPingInterval : Duration -> WebSocketCfg -> WebSocketCfg
 
 Override the ping interval (default 30 s).  Takes a typed `Ipe.Duration`;
 `Duration.zero` disables application-level pings entirely.  The raw
-milliseconds are unwrapped into the transport DTO for the runtime.
+milliseconds are unwrapped into the transport DTO for the runtime, which
+admits `Duration.zero` or a span from 1 millisecond to 10 minutes and
+refuses the connect with an `InvalidInput` error otherwise.
 
 ## `connect`
 
