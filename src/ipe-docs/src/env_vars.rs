@@ -1328,6 +1328,8 @@ pub static EXCLUDED_NAMES: &[&str] = &[
     "IPE_JUNCTION_OUT",    // Windows junction test helper: compiled helper output path
     "IPE_LOAD_ENV_PROBE_VAR",
     "IPE_ORACLE_SHARED_TARGET",
+    "IPE_PDEATH_KERNEL_CHILD", // parent-death spawner test: marks the kernel child for the /proc lookup
+    "IPE_PDEATH_KERNEL_PROBE", // parent-death spawner test: selects the re-executed kernel probe
     "IPE_PDEATH_PROBE", // parent-death spawner test: selects the re-executed probe mode
     "IPE_REGISTRY_TEST_CHOICE_B", // env registry test: a fixed fixture key, never read in production
     "IPE_REGISTRY_TEST_NEW", // env registry test: a replacement name only quoted in a retired-key message
