@@ -233,7 +233,7 @@ pub enum RunJailTools {
         sandbox_exec: ToolPath,
     },
     /// A jail the platform's own primitives build (FreeBSD `jail(8)`, the
-    /// Windows Job Object and AppContainer); the helpers such a jail spawns are
+    /// Windows Job Object and `AppContainer`); the helpers such a jail spawns are
     /// resolved where they are spawned.
     Native,
 }
@@ -1471,7 +1471,7 @@ mod tests {
         };
         let build: Vec<String> = crate::bwrap_argv(
             &scope(),
-            Path::new("/usr/bin/timeout"),
+            &usr_bin(HostTool::Timeout),
             &spec,
             &[OsString::from("cargo")],
         )

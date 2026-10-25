@@ -777,7 +777,7 @@ fn read_bounded<R: std::io::Read>(
 
 #[cfg(test)]
 mod tests {
-    use std::path::{Path, PathBuf};
+    use std::path::Path;
 
     use super::*;
 
