@@ -51,7 +51,7 @@ src/runtime/rust/src/regex_kernel.rs 1
 src/runtime/rust/src/server.rs 13
 src/runtime/rust/src/server/shutdown.rs 1
 src/runtime/rust/src/ssrf.rs 8
-src/runtime/rust/src/system.rs 5
+src/runtime/rust/src/system.rs 2
 src/runtime/rust/src/telemetry.rs 14
 src/runtime/rust/src/telemetry_spill.rs 4
 src/runtime/rust/src/trace.rs 2

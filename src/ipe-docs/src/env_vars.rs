@@ -936,7 +936,7 @@ static HAND_TABLE: &[EnvVar] = &[
         class: Class::Tunable,
     },
     EnvVar {
-        name: "IPE_PROCESS_TIMEOUT",
+        name: ipe_runtime_rust::system::PROCESS_WALL_CEILING.name(),
         default: Cow::Borrowed("3600 (1 h)"),
         purpose: "Wall-clock ceiling on one `Process.run`, `runWith` or `runInPty` \
                   call, in whole seconds or `h`/`m`/`s` segments (`30m`, `1h30m`); \
@@ -1428,14 +1428,13 @@ mod tests {
     /// The documented `IPE_PROCESS_TIMEOUT` default is the enforced runtime const.
     #[test]
     fn process_timeout_default_matches_runtime() {
-        let entry = ENV_VARS.iter().find(|v| v.name == "IPE_PROCESS_TIMEOUT");
-        let expected = format!(
-            "{} ",
-            ipe_runtime_rust::system::PROCESS_WALL_CEILING.default_value()
-        );
+        let ceiling = ipe_runtime_rust::system::PROCESS_WALL_CEILING;
+        let entry = ENV_VARS.iter().find(|v| v.name == ceiling.name());
+        let expected = format!("{} ", ceiling.default_value());
         assert!(
             entry.is_some_and(|v| v.default.starts_with(&expected)),
-            "IPE_PROCESS_TIMEOUT default must start with {expected:?}: {entry:?}"
+            "{} default must start with {expected:?}: {entry:?}",
+            ceiling.name()
         );
     }
 
