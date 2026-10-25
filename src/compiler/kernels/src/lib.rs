@@ -6741,6 +6741,9 @@ impl StdlibKernel {
                 "auth_hash_password",
                 IpeOrder,
             ),
+            // `Auth.login` verifies only hashes written at the registration
+            // cost (`hashPassword`, `register`); a hash at another cost never
+            // logs in and is for `verifyPassword`.
             Self::AuthHashPasswordCost => d(
                 "Auth",
                 "hashPasswordCost",

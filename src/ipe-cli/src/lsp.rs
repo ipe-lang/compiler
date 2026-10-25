@@ -2,80 +2,49 @@
 //!
 //! The server loop and every feature handler live in `ipe_lsp_server` /
 //! `ipe_lsp_features`; this module supplies the one driver-side ingredient
-//! the server cannot own — project resolution. [`DriverLoader`] first
-//! classifies the opened document as a [`ProjectRoot`]. A package routes
-//! through the SAME manifest-discovery/stdlib-injection code path `ipe dev build`
-//! and `ipe dev watch` use, so the module set the editor analyzes can never
-//! diverge from the one the batch build compiles. A loose file (no
-//! `package.ipe` above it) resolves through [`crate::loose_file`], the same
-//! resolver `ipe dev build` and `ipe dev watch` use for it.
+//! the server cannot own — project resolution. [`DriverLoader`] resolves the
+//! workspace folder holding the opened document as a [`ProjectRoot`], the
+//! same held root `ipe dev build` and `ipe dev watch` resolve for that
+//! directory, and reads the module set, the manifest and the FFI catalog
+//! through it. No directory above a workspace folder is ever searched, so
+//! the module set the editor analyzes can never diverge from the one the
+//! batch build compiles, and no parent directory can supply the scope.
 
-use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use ipe_lsp_server::{LimitSource, LoadError, LoadedFile, LoadedProject, ProjectLoader};
 
 use crate::ffi::FfiPrepError;
-use crate::loose_file::{LooseFileLimits, ProjectRoot, resolve_loose_file};
-use crate::{CliError, project, text, watch};
+use crate::package_manifest::PACKAGE_IPE;
+use crate::project_root::{ProjectRoot, RootArg, SourceDir};
+use crate::source_snapshot::SourceOrigin;
+use crate::{CliError, text, watch};
 
-/// The user modules one project root resolves to, before stdlib and FFI injection.
-struct UserSources {
-    sources: BTreeMap<Vec<String>, (PathBuf, String)>,
-    discovered: Vec<project::DiscoveredModule>,
-    entry_module: Vec<String>,
-    blame_path: PathBuf,
-}
-
-/// Resolve the user modules of `root`.
+/// The directory `open_file` is resolved in.
 ///
-/// `open_text` shadows the loose file's disk bytes; a package reads disk
-/// only (its layout comes from the manifest, not the open buffer).
-fn resolve_user_sources(
-    root: &ProjectRoot,
-    open_text: Option<&str>,
-) -> Result<UserSources, CliError> {
-    match root {
-        ProjectRoot::Package(dir) => {
-            let resolved = watch::resolve_project_sources(dir, None)?;
-            Ok(UserSources {
-                sources: resolved.sources,
-                discovered: resolved.discovered,
-                entry_module: resolved.entry_path,
-                blame_path: resolved.blame_path,
-            })
-        }
-        ProjectRoot::LooseFile(file) => {
-            let loaded = resolve_loose_file(file, open_text, LooseFileLimits::DEFAULT)?;
-            Ok(UserSources {
-                sources: loaded.sources,
-                discovered: loaded.discovered,
-                entry_module: loaded.entry_module,
-                blame_path: file.clone(),
-            })
-        }
-    }
-}
-
-/// What can lift a limit hit while resolving the user modules of `root`.
-///
-/// A loose file's closure is walked from the open buffer, so an edit that
-/// drops an import can bring it back under its limits; a package's layout
-/// comes from disk alone, so no edit to the buffer changes it.
-const fn user_sources_limit(root: &ProjectRoot) -> LimitSource {
-    match root {
-        ProjectRoot::Package(_) => LimitSource::Filesystem,
-        ProjectRoot::LooseFile(_) => LimitSource::Buffer,
-    }
+/// The innermost workspace folder holding the file wins; a file outside every
+/// folder is resolved in the first folder, which is the project the editor
+/// opened. An editor that sent no folders at all leaves the file's own
+/// directory as the only candidate. The candidate is where `package.ipe` must
+/// be: nothing above it is searched.
+fn root_dir(workspace_roots: &[PathBuf], open_file: &Path) -> Option<PathBuf> {
+    workspace_roots
+        .iter()
+        .filter(|folder| open_file.starts_with(folder))
+        .max_by_key(|folder| folder.components().count())
+        .or_else(|| workspace_roots.first())
+        .cloned()
+        .or_else(|| open_file.parent().map(Path::to_path_buf))
 }
 
 /// Type a driver failure as the server's load error, keeping its rendered text.
 ///
 /// The match names every [`CliError`] variant with no fallback arm, so a new
 /// variant cannot reach the editor until someone decides whether it degrades
-/// the load (single-file fallback, retried per edit) or refuses it. A limit
-/// carries `lifted_by`, what the failing step counted.
-fn load_error(err: &CliError, lifted_by: LimitSource) -> LoadError {
+/// the load (single-file fallback, retried per edit) or refuses it. Every
+/// limit the driver hits counts the filesystem: the layout comes from disk
+/// alone, so no edit to the open buffer lifts it.
+fn load_error(err: &CliError) -> LoadError {
     use crate::owner_trust::TrustSubject;
     let detail = err.to_string();
     match err {
@@ -87,24 +56,27 @@ fn load_error(err: &CliError, lifted_by: LimitSource) -> LoadError {
         | CliError::Interrupted => LoadError::Io(detail),
         CliError::SourceRefused { .. }
         | CliError::DeviceNamedModule { .. }
-        | CliError::NoManifest { .. }
+        | CliError::SourceTree(_)
+        | CliError::SymlinkInSource { .. } => LoadError::Refused(detail),
+        CliError::NoManifest { .. }
         | CliError::NoSrcDir { .. }
         | CliError::EntryMissing { .. }
         | CliError::NoDefaultEntry { .. }
         | CliError::EntryEscapes { .. }
         | CliError::ExposedModuleMissing { .. }
-        | CliError::SourceTree(_)
-        | CliError::SymlinkInSource { .. }
         | CliError::FileOutsideRoot { .. }
-        | CliError::DirectoryExpected { .. } => LoadError::Refused(detail),
+        | CliError::DirectoryExpected { .. } => LoadError::RootRefused(detail),
         CliError::FileTooLarge { .. }
         | CliError::FmtOutputTooLarge { .. }
         | CliError::DiscoveryLimitReached { .. }
         | CliError::RemoteIngestExceeded(_)
-        | CliError::LocalLimitExceeded(_) => LoadError::Limit { lifted_by, detail },
+        | CliError::LocalLimitExceeded(_) => LoadError::Limit {
+            lifted_by: LimitSource::Filesystem,
+            detail,
+        },
         CliError::TrustRefused(refusal) => match refusal.subject() {
             TrustSubject::Ffi => LoadError::FfiUntrusted(detail),
-            TrustSubject::Manifest => LoadError::ManifestUntrusted(detail),
+            TrustSubject::Manifest => LoadError::RootRefused(detail),
         },
         CliError::FfiPrep(refusal) => ffi_prep_load_error(refusal, detail),
         CliError::Usage(_)
@@ -190,44 +162,46 @@ struct DriverLoader;
 impl ProjectLoader for DriverLoader {
     fn load(
         &self,
-        workspace_root: Option<&Path>,
+        workspace_roots: &[PathBuf],
         open_file: &Path,
-        open_text: Option<&str>,
+        _open_text: Option<&str>,
     ) -> Result<LoadedProject, LoadError> {
-        let root = ProjectRoot::of(workspace_root, open_file)
-            .map_err(|e| load_error(&e, LimitSource::Filesystem))?;
-        let UserSources {
-            mut sources,
-            mut discovered,
-            entry_module,
-            blame_path,
-        } = resolve_user_sources(&root, open_text)
-            .map_err(|e| load_error(&e, user_sources_limit(&root)))?;
-        let injected = project::inject_compiled_std_closure(&mut sources, &mut discovered);
-        // Load the FFI catalog and inject installed-crate interface modules so
-        // the LSP sees `Rust.<Crate>` bindings exactly as `ipe dev build` does. A
-        // missing/empty catalog is fine (no crates installed); a tampered
-        // cache is surfaced as a `LoadError`.
-        let ffi_injected = crate::ffi::prepare_ffi(&mut sources, &blame_path)
-            .map_err(|e| load_error(&e, LimitSource::Filesystem))?
-            .injected;
-        let files = sources
-            .into_iter()
-            .map(|(module, (path, text))| {
-                let origin = if injected.contains(&module) {
-                    ipe_canon::ModuleOrigin::EmbeddedStdlib
-                } else if ffi_injected.contains(&module) {
-                    ipe_canon::ModuleOrigin::FfiInterface
-                } else {
-                    ipe_canon::ModuleOrigin::User
+        let dir = root_dir(workspace_roots, open_file).ok_or_else(|| {
+            load_error(&CliError::NoManifest {
+                dir: open_file.to_path_buf(),
+            })
+        })?;
+        let root = ProjectRoot::resolve(RootArg::at(&dir)).map_err(|e| load_error(&e))?;
+        let manifest_path = root.path().join(PACKAGE_IPE);
+        // The module set is the source snapshot `ipe dev build` reads for this
+        // root: held-handle reads, a link anywhere refused, the summed size
+        // capped, and the FFI catalog read through the held cache directory.
+        let resolved = watch::resolve_project_sources(root).map_err(|e| load_error(&e))?;
+        let entry_module = resolved.entry_path;
+        let files = resolved
+            .snapshot
+            .modules()
+            .iter()
+            .map(|(module, held)| {
+                let origin = match held.origin() {
+                    SourceOrigin::Own(SourceDir::Src | SourceDir::Tests) => {
+                        ipe_canon::ModuleOrigin::User
+                    }
+                    SourceOrigin::Stdlib => ipe_canon::ModuleOrigin::EmbeddedStdlib,
+                    SourceOrigin::FfiInterface => ipe_canon::ModuleOrigin::FfiInterface,
                 };
-                (module, LoadedFile { path, text, origin })
+                let file = LoadedFile {
+                    path: held.path().to_path_buf(),
+                    text: held.text().to_owned(),
+                    origin,
+                };
+                (module.clone(), file)
             })
             .collect();
         Ok(LoadedProject {
             files,
             entry_module,
-            lint_config_dir: ipe_lint::lint_config_dir(&blame_path),
+            lint_config_dir: ipe_lint::lint_config_dir(&manifest_path),
         })
     }
 }
@@ -252,18 +226,12 @@ mod tests {
     use std::os::unix::fs::PermissionsExt as _;
 
     use super::*;
+    use crate::RootFixture;
     use crate::io_bounded::SourceRefusal;
     use crate::owner_trust::TrustRefusal;
+    use crate::project_root::SourceTree;
 
-    /// A fresh scratch directory for one test.
-    #[allow(clippy::expect_used)] // test fixture: a failed mkdir IS the failure
-    fn scratch_dir(tag: &str) -> PathBuf {
-        let dir =
-            ipe_test_temp::temp_root().join(format!("ipe-lsp-load-{tag}-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).expect("create scratch dir");
-        dir
-    }
+    const MAIN: &str = "module Main exposing (main)\n\nmain =\n    0\n";
 
     /// Every trust refusal, one per variant.
     fn every_trust_refusal() -> Vec<TrustRefusal> {
@@ -313,13 +281,27 @@ mod tests {
         let too_deep = CliError::DiscoveryLimitReached {
             detail: "64".to_owned(),
         };
-        let filesystem = LimitSource::Filesystem;
-        assert_eq!(load_error(&io, filesystem), LoadError::Io(io.to_string()));
+        assert_eq!(load_error(&io), LoadError::Io(io.to_string()));
         assert_eq!(
-            load_error(&refused, filesystem),
+            load_error(&refused),
             LoadError::Refused(refused.to_string())
         );
         let root = PathBuf::from("/p");
+        for source in [
+            CliError::SourceTree(crate::project_root::TreeRefusal::NotModuleSegment {
+                module: "main".to_owned(),
+                segment: "main".to_owned(),
+            }),
+            CliError::SymlinkInSource {
+                path: root.join("src/Main.ipe"),
+            },
+        ] {
+            assert_eq!(
+                load_error(&source),
+                LoadError::Refused(source.to_string()),
+                "{source:?}"
+            );
+        }
         for project in [
             CliError::NoManifest { dir: root.clone() },
             CliError::NoSrcDir { root: root.clone() },
@@ -334,33 +316,31 @@ mod tests {
             CliError::ExposedModuleMissing {
                 module: "Shapes".to_owned(),
             },
-            CliError::SourceTree(crate::project_root::TreeRefusal::NotModuleSegment {
-                module: "main".to_owned(),
-                segment: "main".to_owned(),
-            }),
-            CliError::SymlinkInSource {
-                path: root.join("src/Main.ipe"),
-            },
             CliError::FileOutsideRoot {
                 arg: root.join("other/Main.ipe"),
                 root: root.clone(),
             },
         ] {
+            let got = load_error(&project);
             assert_eq!(
-                load_error(&project, filesystem),
-                LoadError::Refused(project.to_string())
+                got,
+                LoadError::RootRefused(project.to_string()),
+                "{project:?}"
+            );
+            assert_eq!(
+                got.disposition(),
+                ipe_lsp_server::LoadDisposition::Refuse,
+                "{project:?}"
             );
         }
-        for lifted_by in [LimitSource::Buffer, LimitSource::Filesystem] {
-            for limit in [&too_large, &too_deep] {
-                assert_eq!(
-                    load_error(limit, lifted_by),
-                    LoadError::Limit {
-                        lifted_by,
-                        detail: limit.to_string()
-                    }
-                );
-            }
+        for limit in [&too_large, &too_deep] {
+            assert_eq!(
+                load_error(limit),
+                LoadError::Limit {
+                    lifted_by: LimitSource::Filesystem,
+                    detail: limit.to_string()
+                }
+            );
         }
         for pipeline in [
             CliError::Usage(text::msg::lsp_takes_no_arguments()),
@@ -369,7 +349,7 @@ mod tests {
             CliError::LintGateFailed,
         ] {
             assert_eq!(
-                load_error(&pipeline, filesystem),
+                load_error(&pipeline),
                 LoadError::Pipeline(pipeline.to_string()),
                 "{pipeline:?}"
             );
@@ -450,11 +430,7 @@ mod tests {
             } else {
                 LoadError::FfiCatalogRefused(detail)
             };
-            assert_eq!(
-                load_error(&err, LimitSource::Filesystem),
-                expected,
-                "{err:?}"
-            );
+            assert_eq!(load_error(&err), expected, "{err:?}");
         }
     }
 
@@ -466,7 +442,7 @@ mod tests {
         {
             let err = CliError::FfiPrep(Box::new(refusal));
             assert_eq!(
-                load_error(&err, LimitSource::Buffer).disposition(),
+                load_error(&err).disposition(),
                 ipe_lsp_server::LoadDisposition::Refuse,
                 "{err:?}"
             );
@@ -484,7 +460,7 @@ mod tests {
         )));
         for named in [opaque_collision, pin_conflict] {
             assert_eq!(
-                load_error(&named, LimitSource::Buffer).disposition(),
+                load_error(&named).disposition(),
                 ipe_lsp_server::LoadDisposition::Refuse,
                 "{named:?}"
             );
@@ -501,7 +477,7 @@ mod tests {
         for refusal in source_side {
             let err = CliError::FfiPrep(Box::new(refusal));
             assert_eq!(
-                load_error(&err, LimitSource::Filesystem).disposition(),
+                load_error(&err).disposition(),
                 ipe_lsp_server::LoadDisposition::Degrade,
                 "{err:?}"
             );
@@ -520,11 +496,11 @@ mod tests {
             let err = CliError::TrustRefused(refusal);
             let detail = err.to_string();
             let expected = if manifest {
-                LoadError::ManifestUntrusted(detail)
+                LoadError::RootRefused(detail)
             } else {
                 LoadError::FfiUntrusted(detail)
             };
-            let got = load_error(&err, LimitSource::Filesystem);
+            let got = load_error(&err);
             assert_eq!(got, expected, "{err:?}");
             assert_eq!(
                 got.disposition(),
@@ -541,65 +517,68 @@ mod tests {
                 path: PathBuf::from("/p/Pipe.ipe"),
                 reason,
             };
-            let got = load_error(&err, LimitSource::Filesystem);
+            let got = load_error(&err);
             assert!(matches!(got, LoadError::Refused(_)), "{got:?}");
             assert_eq!(got.disposition(), ipe_lsp_server::LoadDisposition::Degrade);
         }
     }
 
-    /// A loose file's limits count its open buffer, so the load degrades and an edit lifts it.
+    /// The innermost workspace folder holding the file is its root; a file
+    /// outside every folder resolves in the first folder; no folder at all
+    /// leaves the file's own directory.
     #[test]
-    #[allow(clippy::expect_used)] // test fixture: a failed write IS the failure
-    fn a_loose_file_closure_limit_degrades_and_an_edit_lifts_it() {
-        let dir = scratch_dir("closure-limit");
-        let main = dir.join("Main.ipe");
-        let small = "module Main exposing (main)\n\nmain = 0\n";
-        fs::write(&main, small).expect("write Main.ipe");
-        let imports = (0..=crate::loose_file::MAX_LOOSE_FILE_PROBES)
-            .map(|index| format!("import M{index}"))
-            .collect::<Vec<_>>()
-            .join("\n");
-        let oversized = format!("module Main exposing (main)\n\n{imports}\nmain = 0\n");
-        let over = DriverLoader.load(None, &main, Some(&oversized));
-        let under = DriverLoader.load(None, &main, Some(small));
-        let _ = fs::remove_dir_all(&dir);
-        let err = over.err();
-        assert!(
-            matches!(
-                err,
-                Some(LoadError::Limit {
-                    lifted_by: LimitSource::Buffer,
-                    ..
-                })
-            ),
-            "{err:?}"
+    fn the_root_is_the_workspace_folder_holding_the_file() {
+        let outer = PathBuf::from("/w/outer");
+        let inner = PathBuf::from("/w/outer/inner");
+        let other = PathBuf::from("/w/other");
+        let folders = [other.clone(), outer.clone(), inner.clone()];
+        assert_eq!(
+            root_dir(&folders, Path::new("/w/outer/inner/src/Main.ipe")),
+            Some(inner)
         );
         assert_eq!(
-            err.as_ref().map(LoadError::disposition),
-            Some(ipe_lsp_server::LoadDisposition::Degrade)
+            root_dir(&folders, Path::new("/w/outer/src/Main.ipe")),
+            Some(outer)
         );
-        assert!(under.is_ok(), "{:?}", under.err());
+        assert_eq!(
+            root_dir(&folders, Path::new("/elsewhere/Main.ipe")),
+            Some(other)
+        );
+        assert_eq!(
+            root_dir(&[], Path::new("/elsewhere/Main.ipe")),
+            Some(PathBuf::from("/elsewhere"))
+        );
+    }
+
+    /// A workspace folder with no `package.ipe` refuses the load with the
+    /// compiler's own no-manifest refusal, and nothing above it is searched.
+    #[test]
+    #[allow(clippy::expect_used)] // test fixture: a failed fixture IS the failure
+    fn a_workspace_folder_without_a_manifest_refuses_the_load() {
+        let fixture = RootFixture::main(MAIN).expect("fixture");
+        let folder = fixture.path().join("src");
+        let main = folder.join("Main.ipe");
+        let loaded = DriverLoader.load(std::slice::from_ref(&folder), &main, Some(MAIN));
+        let expected = CliError::NoManifest { dir: folder }.to_string();
+        let err = loaded.err();
+        assert_eq!(err, Some(LoadError::RootRefused(expected)));
+        assert_eq!(
+            err.as_ref().map(LoadError::disposition),
+            Some(ipe_lsp_server::LoadDisposition::Refuse)
+        );
     }
 
     /// A package's discovery limit counts the filesystem, so the load refuses and the buffer cannot lift it.
     #[test]
     #[allow(clippy::expect_used)] // test fixture: a failed write or mkdir IS the failure
     fn a_package_discovery_limit_refuses_the_load() {
-        let dir = scratch_dir("package-limit");
-        fs::write(
-            dir.join("package.ipe"),
-            "module Package exposing (package)\n\npackage =\n    { name = \"deep\" }\n",
-        )
-        .expect("write package.ipe");
-        let src = dir.join("src");
+        let fixture = RootFixture::main(MAIN).expect("fixture");
+        let src = fixture.path().join("src");
         let main = src.join("Main.ipe");
-        let text = "module Main exposing (main)\n\nmain = 0\n";
         let nested = (0..=crate::project::MAX_DISCOVERY_DEPTH)
             .fold(src, |parent, index| parent.join(format!("D{index}")));
         fs::create_dir_all(&nested).expect("create nested source tree");
-        fs::write(&main, text).expect("write Main.ipe");
-        let loaded = DriverLoader.load(Some(&dir), &main, Some(text));
-        let _ = fs::remove_dir_all(&dir);
+        let loaded = DriverLoader.load(&[fixture.path().to_path_buf()], &main, Some(MAIN));
         let err = loaded.err();
         assert!(
             matches!(
@@ -630,18 +609,15 @@ mod tests {
         dir
     }
 
-    /// A tampered FFI catalog refuses the load rather than degrading it.
+    /// A tampered FFI catalog under the project root refuses the load rather than degrading it.
     #[test]
     #[allow(clippy::expect_used)] // test fixture: a failed write IS the failure
     fn a_tampered_catalog_refuses_the_load() {
-        let dir = scratch_dir("tampered-catalog");
-        let main = dir.join("Main.ipe");
-        let text = "module Main exposing (main)\n\nmain = 0\n";
-        fs::write(&main, text).expect("write Main.ipe");
-        let cache = private_chain(&dir, &ipe_ffi::driver::FFI_CACHE_COMPONENTS);
+        let fixture = RootFixture::main(MAIN).expect("fixture");
+        let main = fixture.path().join("src/Main.ipe");
+        let cache = private_chain(fixture.path(), &ipe_ffi::driver::FFI_CACHE_COMPONENTS);
         fs::write(cache.join("x.consumer.json"), "{ not json").expect("write artifact");
-        let loaded = DriverLoader.load(None, &main, Some(text));
-        let _ = fs::remove_dir_all(&dir);
+        let loaded = DriverLoader.load(&[fixture.path().to_path_buf()], &main, Some(MAIN));
         assert!(
             matches!(&loaded, Err(LoadError::FfiUntrusted(_))),
             "{:?}",
@@ -649,27 +625,148 @@ mod tests {
         );
     }
 
-    /// An imported FIFO degrades the load: the user can fix it, so edits retry.
+    /// A module file that is a FIFO degrades the load: the user can fix it, so edits retry.
     #[cfg(unix)]
     #[test]
     #[allow(clippy::expect_used)] // test fixture: a failed write or `mkfifo` IS the failure
-    fn an_imported_fifo_degrades_the_load() {
-        let dir = scratch_dir("fifo");
-        let main = dir.join("Main.ipe");
-        let text = "module Main exposing (main)\n\nimport Pipe\n\nmain = Pipe.x\n";
-        fs::write(&main, text).expect("write Main.ipe");
+    fn a_fifo_module_degrades_the_load() {
+        let fixture = RootFixture::main(MAIN).expect("fixture");
+        let main = fixture.path().join("src/Main.ipe");
         let made = std::process::Command::new("mkfifo")
-            .arg(dir.join("Pipe.ipe"))
+            .arg(fixture.path().join("src/Pipe.ipe"))
             .status()
             .expect("run mkfifo");
         assert!(made.success(), "mkfifo creates the fixture");
-        let loaded = DriverLoader.load(None, &main, Some(text));
-        let _ = fs::remove_dir_all(&dir);
+        let loaded = DriverLoader.load(&[fixture.path().to_path_buf()], &main, Some(MAIN));
         let err = loaded.err();
         assert!(matches!(err, Some(LoadError::Refused(_))), "{err:?}");
         assert_eq!(
             err.as_ref().map(LoadError::disposition),
             Some(ipe_lsp_server::LoadDisposition::Degrade)
         );
+    }
+
+    /// A module that is a link refuses the LSP load and the watch resolution
+    /// exactly as it refuses the build: no reader of the project skips it or
+    /// follows it out of `src/`.
+    #[cfg(unix)]
+    #[test]
+    #[allow(clippy::expect_used)] // test fixture: a failed write or symlink IS the failure
+    fn a_symlinked_module_refuses_like_the_build() {
+        let fixture = RootFixture::main(MAIN).expect("fixture");
+        let outside = fixture.path().join("Outside.ipe");
+        fs::write(&outside, "module Helper exposing (h)\n\nh =\n    1\n")
+            .expect("write the link target");
+        std::os::unix::fs::symlink(&outside, fixture.path().join("src/Helper.ipe"))
+            .expect("link a module out of src/");
+        let main = fixture.path().join("src/Main.ipe");
+
+        let build_root =
+            ProjectRoot::resolve(RootArg::at(fixture.path())).expect("build resolves the root");
+        let build = crate::source_snapshot::SourceSnapshot::read(
+            &build_root,
+            crate::source_snapshot::Limits::DEFAULT,
+        );
+        assert!(
+            matches!(build, Err(CliError::SymlinkInSource { .. })),
+            "the build refuses the link"
+        );
+
+        let loaded = DriverLoader.load(&[fixture.path().to_path_buf()], &main, Some(MAIN));
+        let err = loaded.err();
+        assert!(matches!(err, Some(LoadError::Refused(_))), "{err:?}");
+
+        let watch_root =
+            ProjectRoot::resolve(RootArg::at(fixture.path())).expect("watch resolves the root");
+        let watched = watch::resolve_project_sources(watch_root);
+        assert!(
+            matches!(watched, Err(CliError::SymlinkInSource { .. })),
+            "the watch refuses the link"
+        );
+    }
+
+    /// Build, LSP load and a watch resolution of one project reach the same
+    /// root, the same module set and the same FFI cache; a stray
+    /// `package.ipe` under `src/` changes none of them and is never read.
+    #[test]
+    #[allow(clippy::expect_used)] // test fixture: a failed write IS the failure
+    fn build_lsp_and_watch_resolve_one_root() {
+        let fixture = RootFixture::from_tree(
+            &SourceTree::main(MAIN).module("Helper", "module Helper exposing (h)\n\nh =\n    1\n"),
+        )
+        .expect("fixture");
+        let stray = fixture.path().join("src").join(PACKAGE_IPE);
+        fs::write(
+            &stray,
+            "module Package exposing (package)\n\npackage =\n    { name = \"stray\" }\n",
+        )
+        .expect("write stray manifest");
+        #[cfg(unix)]
+        fs::set_permissions(&stray, fs::Permissions::from_mode(0o000)).expect("chmod 000");
+        let cache = private_chain(fixture.path(), &ipe_ffi::driver::FFI_CACHE_COMPONENTS);
+
+        let build_root =
+            ProjectRoot::resolve(RootArg::at(fixture.path())).expect("build resolves the root");
+        let snapshot = crate::source_snapshot::SourceSnapshot::read(
+            &build_root,
+            crate::source_snapshot::Limits::DEFAULT,
+        )
+        .expect("build reads the snapshot");
+        let build_modules: Vec<(Vec<String>, PathBuf)> = snapshot
+            .modules()
+            .iter()
+            .filter(|(_, module)| module.path().starts_with(fixture.path()))
+            .map(|(module, source)| (module.clone(), source.path().to_path_buf()))
+            .collect();
+
+        let main = fixture.path().join("src/Main.ipe");
+        let loaded = DriverLoader
+            .load(&[fixture.path().to_path_buf()], &main, None)
+            .expect("the LSP loads the project");
+        let lsp_modules: Vec<(Vec<String>, PathBuf)> = loaded
+            .files
+            .iter()
+            .filter(|(_, file)| file.origin == ipe_canon::ModuleOrigin::User)
+            .map(|(module, file)| (module.clone(), file.path.clone()))
+            .collect();
+
+        let watch_root =
+            ProjectRoot::resolve(RootArg::at(fixture.path())).expect("watch resolves the root");
+        let watched = watch::resolve_project_sources(watch_root).expect("watch resolves");
+        let watch_modules: Vec<(Vec<String>, PathBuf)> = watched
+            .snapshot
+            .modules()
+            .iter()
+            .filter(|(_, held)| held.origin() == SourceOrigin::Own(SourceDir::Src))
+            .map(|(module, held)| (module.clone(), held.path().to_path_buf()))
+            .collect();
+
+        let expected = vec![
+            (
+                vec!["Helper".to_owned()],
+                fixture.path().join("src/Helper.ipe"),
+            ),
+            (vec!["Main".to_owned()], main),
+        ];
+        assert_eq!(build_modules, expected);
+        assert_eq!(lsp_modules, expected);
+        assert_eq!(watch_modules, expected);
+        assert_eq!(loaded.entry_module, watched.entry_path);
+        assert_eq!(loaded.lint_config_dir, fixture.path());
+        assert_eq!(watched.root.path(), fixture.path());
+        assert_eq!(watched.scope.root, fixture.path());
+        assert_eq!(watched.root.manifest().name, build_root.manifest().name);
+        assert_eq!(
+            watched.root.manifest().name,
+            crate::project_root::DEFAULT_NAME,
+            "the stray manifest under src/ names no project"
+        );
+        let cache_of = |root: &ProjectRoot| {
+            root.cache_dir()
+                .expect("the cache opens")
+                .map(|cache| cache.path().to_path_buf())
+        };
+        assert_eq!(cache_of(&build_root), Some(cache.clone()));
+        assert_eq!(cache_of(&watched.root), Some(cache));
     }
 }
