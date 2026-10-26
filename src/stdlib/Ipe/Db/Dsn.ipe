@@ -55,13 +55,25 @@ type Driver
     | Sqlite
 
 
--- | The transport-security posture. `Require` is the secure default when a DSN
--- omits an explicit mode; `Disable` is rejected by every constructor (a `Dsn` is
--- never a proof of a cleartext transport).
+-- | The transport-security posture: TLS with the server certificate verified.
+-- `VerifyFull` (`sslmode=verify-full`) checks that the certificate chains to a
+-- trusted root and names the dialled host; it is the default when a DSN names
+-- no `sslmode`. `VerifyCa` (`sslmode=verify-ca`) checks the chain but not the
+-- host name, so it is weaker: any certificate from a trusted root is accepted
+-- for any host. Every mode that accepts an unverified server or a cleartext
+-- transport (`sslmode=require`, `prefer`, `allow`, `disable`) is rejected by
+-- every constructor, so a `Dsn` is a proof that its connection authenticates
+-- the server.
+--
+-- The server certificate must chain to a root in the Mozilla root set the
+-- runtime is built with; the operating system's certificate store is not
+-- consulted, and a certificate issued by a private certificate authority is
+-- refused. Where the runtime cannot route a connection through its pinned
+-- relay (on platforms other than Unix), a `VerifyFull` connection to a named
+-- host is refused; name the server by its IP address or use `VerifyCa`.
 type TlsMode
-    = Require
-    | Prefer
-    | Disable
+    = VerifyFull
+    | VerifyCa
 
 
 -- ── Construction ──────────────────────────────────────────────────────────────
@@ -69,8 +81,8 @@ type TlsMode
 
 -- | `parse raw` — THE seal from a full DSN URL string. Returns `Err` on any
 -- invalid shape: an unparseable string, an unknown driver, a missing host for a
--- network driver, an out-of-range port, an explicit `sslmode=disable`, an unknown
--- `sslmode`, a smuggled/duplicated credential parameter, a control-character
+-- network driver, an out-of-range port, an `sslmode` that does not verify the
+-- server (`require`, `prefer`, `allow`, `disable`), an unknown `sslmode`, a smuggled/duplicated credential parameter, a control-character
 -- component, or a PostgreSQL user name or password that may run past the URL's
 -- authority. An `@` anywhere after the host (in the path or a query value) is
 -- refused the same way; write it as `%40`. The user name, password, and database
@@ -87,8 +99,7 @@ parse =
 -- | `build parts` — THE seal from typed parts, enforcing the invariants `parse`
 -- does on literal parts. Preferred over `parse` when the parts are already
 -- structured (there is no string to mis-escape). The `password` is a `Secret` on
--- the way in; `Disable`
--- TLS and an out-of-range port are rejected. The `database`, `user`, and
+-- the way in; an out-of-range port is rejected. The `database`, `user`, and
 -- `password` are taken literally and percent-encoded into the connection URL, so a
 -- `?`, `&`, `#`, `@`, `/`, or `%` in them cannot add a parameter such as `sslmode`.
 -- Each is capped at 512 bytes, and a `password` needs a `user`.
@@ -238,14 +249,11 @@ driverTag d =
 tlsTag : TlsMode -> Int
 tlsTag t =
     case t of
-        Require ->
+        VerifyFull ->
             0
 
-        Prefer ->
+        VerifyCa ->
             1
-
-        Disable ->
-            2
 
 
 -- The runtime only ever hands back a valid driver discriminant (0 or 1); the
@@ -261,14 +269,13 @@ driverFromTag tag =
             Postgres
 
 
--- The runtime only ever hands back an accepted TLS discriminant (0 or 1 — a
--- `Dsn` never carries `Disable`); the `_` arm keeps the case total and defaults
--- to the strongest posture.
+-- The runtime only ever hands back a TLS discriminant `tlsTag` produces (0 or
+-- 1); the `_` arm keeps the case total and defaults to the strongest posture.
 tlsFromTag : Int -> TlsMode
 tlsFromTag tag =
     case tag of
         1 ->
-            Prefer
+            VerifyCa
 
         _ ->
-            Require
+            VerifyFull

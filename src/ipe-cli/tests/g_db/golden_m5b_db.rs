@@ -546,9 +546,9 @@ fn db_store_starts_with() {
 /// no I/O beyond stdout). Parses a valid Postgres DSN carrying a password and
 /// prints its `Driver`, host, default TLS mode, and REDACTED render — the
 /// password sentinel `hunter2SENTINEL` NEVER appears (it is a `Secret`, rendered
-/// as `[redacted]`). Also proves: `sslmode=disable` is a hard typed `Err`
-/// (fail-closed TLS); an omitted sslmode defaults to `require` (secure default);
-/// and `Dsn.build` from typed parts runs the same validators. This is the SEAL
+/// as `[redacted]`). Also proves: `sslmode=disable` and `sslmode=require` are
+/// hard typed `Err`s (fail-closed TLS); an omitted sslmode defaults to
+/// `verify-full` (secure default); and `Dsn.build` from typed parts runs the same validators. This is the SEAL
 /// for the reserved `Dsn` type + the `Db.Dsn.*` parse kernels: the emitted crate
 /// must build and run, and the sentinel must be absent from stdout.
 ///
