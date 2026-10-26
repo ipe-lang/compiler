@@ -255,6 +255,10 @@ impl Settle<'_> {
                 effect: self.boxed(effect),
                 rest: self.boxed(rest),
             },
+            Expr::CaptureClones { syms, body } => Expr::CaptureClones {
+                syms,
+                body: self.boxed(body),
+            },
             Expr::ListIndexClone { list, index, elem } => Expr::ListIndexClone {
                 list: self.boxed(list),
                 index,
