@@ -1155,6 +1155,38 @@ fn emit_web_fn(
         Expr::Lambda { params, ret, body } | Expr::SharedLambda { params, ret, body } => {
             crate::emit_expr::emit_lambda_unboxed(ctx, params, ret, body, indent, child, generics)
         }
+        // A pre-cloned inline lambda: its clones, then the same unboxed closure.
+        Expr::CaptureClones { syms, body } => match body.as_ref() {
+            Expr::Lambda {
+                params,
+                ret,
+                body: lambda_body,
+            }
+            | Expr::SharedLambda {
+                params,
+                ret,
+                body: lambda_body,
+            } => {
+                let lets = syms
+                    .iter()
+                    .map(|sym| {
+                        ctx.emit_local_ident(*sym)
+                            .map(|name_s| format!("let {name_s} = {name_s}.clone();"))
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                let closure = crate::emit_expr::emit_lambda_unboxed(
+                    ctx,
+                    params,
+                    ret,
+                    lambda_body,
+                    indent,
+                    child,
+                    generics,
+                )?;
+                Ok(format!("({{ {} {closure} }})", lets.join(" ")))
+            }
+            _ => emit_expr_at(ctx, e, indent, child, generics),
+        },
         // Fallback: general emitter (local var holding a function value, etc.).
         _ => emit_expr_at(ctx, e, indent, child, generics),
     }
@@ -1483,6 +1515,83 @@ mod schema_tag_tests {
         assert!(
             out.contains("ipe_runtime::web::web_app("),
             "single-page cfg must still route to web_app, got:\n{out}"
+        );
+        Ok(())
+    }
+
+    /// A cfg slot holding a pre-cloned inline lambda emits its clones and then
+    /// the unboxed closure, never the `Send`-only boxed function value that
+    /// fails the slot's `Sync` bound.
+    #[test]
+    fn pre_cloned_slot_lambda_stays_unboxed() -> DResult<()> {
+        let mut interner = Interner::new();
+        let title = interner.intern("title")?;
+        let m = interner.intern("m")?;
+        let main_mod = interner.intern("Main")?;
+        let program = Program {
+            imports_unsafe_submodule: false,
+            imported_web_capabilities: std::collections::BTreeSet::new(),
+            modules: vec![Module {
+                name: ModPath(vec![main_mod]),
+                types: vec![],
+                funcs: vec![],
+                entry: None,
+                records: vec![],
+                uses_tea: false,
+                uses_server: false,
+                uses_http: false,
+                uses_config: false,
+                uses_compression: false,
+                uses_csv: false,
+                uses_cache: false,
+                uses_encoding: false,
+                uses_regex: false,
+                uses_uuid: false,
+                uses_random: false,
+                uses_log: false,
+                uses_decimal: false,
+                uses_char_category: false,
+                uses_crypto_core: false,
+                uses_secret: false,
+                uses_json: false,
+                uses_crypto: false,
+                uses_jwt: false,
+                uses_url: false,
+                uses_ui: false,
+                uses_web: true,
+                uses_tui: false,
+                uses_console: false,
+                uses_webview: false,
+                uses_css: false,
+                uses_auth: false,
+                uses_principal: false,
+                uses_websocket: false,
+                uses_email: false,
+                uses_locale: false,
+                uses_time: false,
+                uses_env_public: false,
+                uses_debug: false,
+                uses_ffi: false,
+                uses_async_runtime: false,
+            }],
+        };
+        let ctx = EmitCtx::build(&interner, &program, crate::EmitSettings::unconfigured())?;
+        let slot = Expr::pre_clone(
+            title,
+            Expr::Lambda {
+                params: vec![(m, IrType::Int)],
+                ret: IrType::Int,
+                body: Box::new(Expr::Int(0)),
+            },
+        );
+        let out = super::emit_web_fn(&ctx, &slot, 0, 0, GenericScope::new(&[]))?;
+        assert!(
+            out.contains("let title = title.clone();") && out.contains("move |m: i64|"),
+            "the slot must emit the clone and then the closure, got:\n{out}"
+        );
+        assert!(
+            !out.contains("__ipe_fn"),
+            "the slot must not box the closure, got:\n{out}"
         );
         Ok(())
     }
