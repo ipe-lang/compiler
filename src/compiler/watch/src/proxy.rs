@@ -1614,6 +1614,17 @@ mod tests {
                 b"POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\nTransfer-Encoding: chunked\r\n\r\n",
                 FramingRefusal::DuplicateTransferEncoding,
             ),
+        ];
+        for (raw, expected) in cases {
+            let parsed = Head::<RequestStart>::parse(raw.to_vec()).map(|head| head.framing);
+            assert_eq!(parsed, Err(*expected), "{}", String::from_utf8_lossy(raw));
+        }
+    }
+
+    /// `Head::parse` names the exact refusal for every malformed line shape.
+    #[test]
+    fn request_head_line_refusals_by_variant() {
+        let cases: &[(&[u8], FramingRefusal)] = &[
             (
                 b"GET / HTTP/1.1\r\nHost: h\r\n continued\r\n\r\n",
                 FramingRefusal::ObsFold,
@@ -1630,7 +1641,10 @@ mod tests {
                 b"GET / HTTP/1.1\r\nHo\"st: h\r\n\r\n",
                 FramingRefusal::HeaderNameNotToken,
             ),
-            (b"\r\nGET / HTTP/1.1\r\n\r\n", FramingRefusal::MissingStartLine),
+            (
+                b"\r\nGET / HTTP/1.1\r\n\r\n",
+                FramingRefusal::MissingStartLine,
+            ),
             (b" GET / HTTP/1.1\r\n\r\n", FramingRefusal::MissingStartLine),
             (
                 b"GET / HTTP/1.1\r\nX: a\x01b\r\n\r\n",
