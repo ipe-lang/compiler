@@ -27,6 +27,11 @@
 use super::*;
 #[cfg(not(target_arch = "wasm32"))]
 use crate::tea::SourceTask;
+#[cfg(any(
+    not(target_arch = "wasm32"),
+    all(target_arch = "wasm32", feature = "wasm-client")
+))]
+use crate::transport_timeout::{PingCadence, TimeoutRefusal, TransportTimeout};
 #[cfg(not(target_arch = "wasm32"))]
 use futures_util::{SinkExt, StreamExt};
 use std::collections::HashMap;
@@ -190,6 +195,51 @@ crate::redact::redacting_debug!(WsClientCfg {
     shown: [timeout, pingInterval],
     masked: [url, headers],
 });
+
+/// Which connect setting is outside its admitted range, and why.
+#[cfg(any(
+    not(target_arch = "wasm32"),
+    all(target_arch = "wasm32", feature = "wasm-client")
+))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SpanRefusal {
+    /// `WebSocketCfg.timeout`.
+    Timeout(TimeoutRefusal),
+    /// `WebSocketCfg.pingInterval`.
+    PingInterval(TimeoutRefusal),
+}
+
+#[cfg(any(
+    not(target_arch = "wasm32"),
+    all(target_arch = "wasm32", feature = "wasm-client")
+))]
+impl std::fmt::Display for SpanRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Timeout(refusal) => write!(f, "timeout: {refusal}"),
+            Self::PingInterval(refusal) => write!(f, "pingInterval: {refusal}"),
+        }
+    }
+}
+
+/// Parses a connect's handshake timeout, then its ping interval: the one
+/// judgement of both spans, shared by the native and the browser connect.
+///
+/// # Errors
+///
+/// The first span outside its admitted range, as a [`SpanRefusal`].
+#[cfg(any(
+    not(target_arch = "wasm32"),
+    all(target_arch = "wasm32", feature = "wasm-client")
+))]
+fn parse_connect_spans(
+    timeout_ms: i64,
+    ping_interval_ms: i64,
+) -> Result<(TransportTimeout, PingCadence), SpanRefusal> {
+    let deadline = TransportTimeout::parse(timeout_ms).map_err(SpanRefusal::Timeout)?;
+    let ping = PingCadence::parse(ping_interval_ms).map_err(SpanRefusal::PingInterval)?;
+    Ok((deadline, ping))
+}
 
 #[cfg(not(target_arch = "wasm32"))]
 enum WsCmd {
@@ -422,8 +472,22 @@ enum WsConnectError {
     TimedOut {
         /// The URL as it may be shown.
         url: super::ssrf::DisplayableUrl,
-        /// The deadline, in milliseconds.
-        after_ms: u64,
+        /// The deadline.
+        after: TransportTimeout,
+    },
+    /// The handshake deadline is outside the admitted range.
+    BadTimeout {
+        /// The URL as it may be shown.
+        url: super::ssrf::DisplayableUrl,
+        /// Why the deadline is refused.
+        refusal: TimeoutRefusal,
+    },
+    /// The ping interval is neither off nor in the admitted range.
+    BadPingInterval {
+        /// The URL as it may be shown.
+        url: super::ssrf::DisplayableUrl,
+        /// Why the interval is refused.
+        refusal: TimeoutRefusal,
     },
 }
 
@@ -457,10 +521,17 @@ impl std::fmt::Display for WsConnectError {
                 "WebSocket.connect {url}: the host is not a valid TLS server name"
             ),
             Self::Failed { url, failure } => write!(f, "WebSocket.connect {url}: {failure}"),
-            Self::TimedOut { url, after_ms } => write!(
+            Self::TimedOut { url, after } => write!(
                 f,
-                "WebSocket.connect {url}: handshake timed out after {after_ms}ms"
+                "WebSocket.connect {url}: handshake timed out after {}ms",
+                after.millis()
             ),
+            Self::BadTimeout { url, refusal } => {
+                write!(f, "WebSocket.connect {url}: timeout: {refusal}")
+            }
+            Self::BadPingInterval { url, refusal } => {
+                write!(f, "WebSocket.connect {url}: pingInterval: {refusal}")
+            }
         }
     }
 }
@@ -479,15 +550,36 @@ impl WsConnectError {
             | Self::TlsUnderPin(_)
             | Self::TlsSetup(_)
             | Self::TlsServerName(_)
+            | Self::TimedOut { .. }
+            | Self::BadTimeout { .. }
+            | Self::BadPingInterval { .. } => false,
+        }
+    }
+
+    /// Whether this failure is a caller-supplied setting the connect refuses.
+    const fn is_invalid_input(&self) -> bool {
+        match self {
+            Self::BadTimeout { .. } | Self::BadPingInterval { .. } => true,
+            Self::Refused(_)
+            | Self::Ceiling(_)
+            | Self::BadUrl(_)
+            | Self::InvalidHeaderName { .. }
+            | Self::InvalidHeaderValue { .. }
+            | Self::TlsUnderPin(_)
+            | Self::TlsSetup(_)
+            | Self::TlsServerName(_)
+            | Self::Failed { .. }
             | Self::TimedOut { .. } => false,
         }
     }
 
     /// This failure as the task's error.
-    fn into_task<E: From<String> + FromLimitExceeded>(self) -> IpeResult<E, i64> {
+    fn into_task<E: From<String> + FromLimitExceeded + FromIpeError>(self) -> IpeResult<E, i64> {
         let message = self.to_string();
         IpeResult::Err(if self.is_ceiling() {
             E::from_limit_exceeded(message)
+        } else if self.is_invalid_input() {
+            E::from_ipe_error(crate::error::IpeError::invalid_input(message))
         } else {
             message.into()
         })
@@ -638,13 +730,13 @@ async fn open_over(
     transport: Transport,
     req: tokio_tungstenite::tungstenite::handshake::client::Request,
     ceiling: usize,
-    ping_interval_ms: i64,
+    ping: PingCadence,
 ) -> Result<i64, WsFailure> {
     match transport {
-        Transport::Plain => open_socket(req, tcp, ceiling, ping_interval_ms).await,
+        Transport::Plain => open_socket(req, tcp, ceiling, ping).await,
         Transport::Tls { name, config } => {
             let stream = tls_handshake(tcp, name, config).await?;
-            open_socket(req, stream, ceiling, ping_interval_ms).await
+            open_socket(req, stream, ceiling, ping).await
         }
     }
 }
@@ -656,7 +748,7 @@ async fn open_socket<S>(
     req: tokio_tungstenite::tungstenite::handshake::client::Request,
     stream: S,
     ceiling: usize,
-    ping_interval_ms: i64,
+    ping: PingCadence,
 ) -> Result<i64, WsFailure>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
@@ -665,11 +757,11 @@ where
         tokio_tungstenite::client_async_with_config(req, stream, Some(ws_config(ceiling)))
             .await
             .map_err(|e| WsFailure::of(&e))?;
-    Ok(start_socket(socket, ceiling, ping_interval_ms))
+    Ok(start_socket(socket, ceiling, ping))
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-async fn do_connect<E: From<String> + FromLimitExceeded + Send + 'static>(
+async fn do_connect<E: From<String> + FromLimitExceeded + FromIpeError + Send + 'static>(
     url: String,
     headers: Vec<(String, String)>,
     timeout_ms: i64,
@@ -679,6 +771,27 @@ async fn do_connect<E: From<String> + FromLimitExceeded + Send + 'static>(
     use tokio_tungstenite::tungstenite::http::{HeaderName, HeaderValue};
     // Every error below shows this form of the URL, never the raw `url`.
     let safe_url = super::ssrf::DisplayableUrl::of(&url);
+    // Both spans are parsed before anything resolves or dials, so a connect
+    // with no admissible deadline never leaves the process. The one deadline
+    // bounds the name lookup, the TCP dial, the TLS handshake and the
+    // WebSocket handshake.
+    let (deadline, ping) = match parse_connect_spans(timeout_ms, ping_interval_ms) {
+        Ok(spans) => spans,
+        Err(SpanRefusal::Timeout(refusal)) => {
+            return WsConnectError::BadTimeout {
+                url: safe_url,
+                refusal,
+            }
+            .into_task();
+        }
+        Err(SpanRefusal::PingInterval(refusal)) => {
+            return WsConnectError::BadPingInterval {
+                url: safe_url,
+                refusal,
+            }
+            .into_task();
+        }
+    };
     // SSRF gate, before the handshake: under deny-private the host is resolved
     // ONCE through the shared gate (bounded deadline, a host with any blocked
     // answer refused whole) and the dial below is pinned to the vetted address,
@@ -768,23 +881,14 @@ async fn do_connect<E: From<String> + FromLimitExceeded + Send + 'static>(
             (DialTarget::Named { host, port }, transport)
         }
     };
-    // Floor the handshake timeout: a non-positive cfg.timeout must NOT disable it
-    // (an unreachable / silently-stalling host would otherwise hang the connect
-    // forever, leaking the task + FD). Default 30 s. The one deadline bounds the
-    // name lookup, the TCP dial, the TLS handshake and the WebSocket handshake.
-    let to_ms: u64 = if timeout_ms > 0 {
-        timeout_ms as u64
-    } else {
-        30_000
-    };
     let opening = async move {
         let (addrs, dial_failure) = dial_addrs(target).await?;
         let tcp = tokio::net::TcpStream::connect(addrs.as_slice())
             .await
             .map_err(|e| dial_failure(e.kind()))?;
-        open_over(tcp, transport, req, max_msg, ping_interval_ms).await
+        open_over(tcp, transport, req, max_msg, ping).await
     };
-    match tokio::time::timeout(std::time::Duration::from_millis(to_ms), opening).await {
+    match tokio::time::timeout(deadline.as_duration(), opening).await {
         Ok(Ok(id)) => ok_res(id),
         Ok(Err(failure)) => WsConnectError::Failed {
             url: safe_url,
@@ -793,7 +897,7 @@ async fn do_connect<E: From<String> + FromLimitExceeded + Send + 'static>(
         .into_task(),
         Err(_) => WsConnectError::TimedOut {
             url: safe_url,
-            after_ms: to_ms,
+            after: deadline,
         }
         .into_task(),
     }
@@ -912,27 +1016,27 @@ where
 
 /// Drain the outbound commands into `write` until a close or a failed write.
 ///
-/// When `ping_interval_ms` is positive it also sends a Ping that often, so an
-/// idle connection survives proxy and server idle timeouts. A closed command
-/// queue means no handle can send any more, so it closes the socket too.
+/// Under `PingCadence::Every` it also sends a Ping that often, so an idle
+/// connection survives proxy and server idle timeouts. A closed command queue
+/// means no handle can send any more, so it closes the socket too.
 #[cfg(not(target_arch = "wasm32"))]
 async fn run_writer<S>(
     write: &mut WsWrite<S>,
     mut cmd_rx: tokio::sync::mpsc::Receiver<WsCmd>,
-    ping_interval_ms: i64,
+    ping: PingCadence,
 ) -> WriterEnd
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
     // `interval` ticks immediately on the first poll; skip that first tick so
     // we ping after the interval, not at t=0.
-    let mut ping_iv = if ping_interval_ms > 0 {
-        let mut iv =
-            tokio::time::interval(std::time::Duration::from_millis(ping_interval_ms as u64));
-        iv.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        Some(iv)
-    } else {
-        None
+    let mut ping_iv = match ping {
+        PingCadence::Every(every) => {
+            let mut iv = tokio::time::interval(every.as_duration());
+            iv.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            Some(iv)
+        }
+        PingCadence::Off => None,
     };
     let mut first_tick = true;
     loop {
@@ -1048,7 +1152,7 @@ async fn run_socket<S>(
     cmd_rx: tokio::sync::mpsc::Receiver<WsCmd>,
     frames: tokio::sync::broadcast::Sender<WsEvent>,
     closing: std::sync::Arc<tokio::sync::Notify>,
-    ping_interval_ms: i64,
+    ping: PingCadence,
     registered: tokio::sync::oneshot::Receiver<()>,
 ) where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
@@ -1058,7 +1162,7 @@ async fn run_socket<S>(
     let _ = registered.await;
     let (mut write, mut read) = socket.split();
     let end = {
-        let writer = run_writer(&mut write, cmd_rx, ping_interval_ms);
+        let writer = run_writer(&mut write, cmd_rx, ping);
         let reader = run_reader(&mut read, &frames);
         tokio::pin!(writer, reader);
         let first = tokio::select! {
@@ -1095,7 +1199,7 @@ async fn run_socket<S>(
 fn start_socket<S>(
     socket: tokio_tungstenite::WebSocketStream<S>,
     ceiling: usize,
-    ping_interval_ms: i64,
+    ping: PingCadence,
 ) -> i64
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
@@ -1111,7 +1215,7 @@ where
         cmd_rx,
         frames_tx.clone(),
         std::sync::Arc::clone(&closing),
-        ping_interval_ms,
+        ping,
         registered,
     ));
     registry().lock().unwrap_or_else(|e| e.into_inner()).insert(
@@ -1129,18 +1233,21 @@ where
 
 /// WebSocket.connect : String -> Task Error Int (raw id; Ipê wraps in WebSocket)
 #[cfg(not(target_arch = "wasm32"))]
-pub fn web_socket_connect<E: From<String> + FromLimitExceeded + Send + 'static>(
+pub fn web_socket_connect<E: From<String> + FromLimitExceeded + FromIpeError + Send + 'static>(
     url: String,
 ) -> IpeTask<E, i64> {
     Box::pin(do_connect(url, Vec::new(), 30000, 0))
 }
 
 /// WebSocket.connectWith : WebSocketCfg -> Task Error Int. Applies the cfg's
-/// custom headers, handshake timeout, and pingInterval (when > 0, the client
-/// sends a periodic Ping frame to keep the connection alive through idle proxies;
-/// tungstenite auto-pongs inbound pings on the read side).
+/// custom headers, handshake timeout (1 ms to 10 minutes, else refused as
+/// `InvalidInput` before any dial) and pingInterval (0 sends no pings; a span
+/// in the same range sends a periodic Ping frame to keep the connection alive
+/// through idle proxies; tungstenite auto-pongs inbound pings on the read side).
 #[cfg(not(target_arch = "wasm32"))]
-pub fn web_socket_connect_with<E: From<String> + FromLimitExceeded + Send + 'static>(
+pub fn web_socket_connect_with<
+    E: From<String> + FromLimitExceeded + FromIpeError + Send + 'static,
+>(
     cfg: WsClientCfg,
 ) -> IpeTask<E, i64> {
     Box::pin(do_connect(
@@ -1458,6 +1565,92 @@ mod tests {
         crate::system::assert_env_ceiling_contract(WS_MESSAGE_CEILING);
     }
 
+    /// A deadline the type admits, for building connect errors.
+    #[allow(clippy::expect_used)] // each caller passes a literal inside the admitted range
+    fn deadline(ms: i64) -> TransportTimeout {
+        TransportTimeout::parse(ms).expect("within the admitted range")
+    }
+
+    /// The connect's refusal of `url` with the given spans, or `None` when it opened.
+    async fn connect_refusal(url: String, timeout: i64, ping_interval: i64) -> Option<IpeError> {
+        match do_connect::<IpeError>(url, Vec::new(), timeout, ping_interval).await {
+            IpeResult::Err(error) => Some(error),
+            IpeResult::Ok(_) => None,
+        }
+    }
+
+    /// An inadmissible handshake timeout or ping interval is refused first.
+    ///
+    /// The refusal is `InvalidInput`, names the setting, and comes before any
+    /// dial: the listener the URL names sees no connection.
+    #[tokio::test]
+    async fn an_inadmissible_span_is_refused_before_any_dial() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await;
+        assert!(listener.is_ok(), "bind loopback");
+        let Ok(listener) = listener else { return };
+        let addr = listener.local_addr();
+        assert!(addr.is_ok(), "listener address");
+        let Ok(addr) = addr else { return };
+        let over = i64::from(crate::transport_timeout::MAX_TRANSPORT_TIMEOUT_MS) + 1;
+        for (timeout, ping_interval, setting) in [
+            (0, 0, "timeout"),
+            (-1, 0, "timeout"),
+            (over, 0, "timeout"),
+            (30_000, -1, "pingInterval"),
+            (30_000, over, "pingInterval"),
+        ] {
+            let refusal = connect_refusal(format!("ws://{addr}/"), timeout, ping_interval).await;
+            let expected = format!("{setting}: a span");
+            assert!(
+                matches!(
+                    &refusal,
+                    Some(IpeError::Error(crate::error::IpeErrorKind::InvalidInput, info))
+                        if info.message.contains(&expected)
+                ),
+                "{setting} {timeout}/{ping_interval} must be refused as InvalidInput, got \
+                 {refusal:?}"
+            );
+        }
+        let dialled =
+            tokio::time::timeout(std::time::Duration::from_millis(100), listener.accept()).await;
+        assert!(dialled.is_err(), "a refused span must never dial");
+    }
+
+    /// The one span judgement both targets share: the browser connect refuses
+    /// with this exact text, so a span the native connect refuses can never
+    /// open a browser socket.
+    #[test]
+    fn connect_spans_are_judged_once_for_every_target() {
+        use crate::transport_timeout::TimeoutRefusal::{AboveCeiling, NotPositive};
+        let over = i64::from(crate::transport_timeout::MAX_TRANSPORT_TIMEOUT_MS) + 1;
+        for (timeout, ping_interval, expected) in [
+            (0, 0, SpanRefusal::Timeout(NotPositive)),
+            (-1, 0, SpanRefusal::Timeout(NotPositive)),
+            (over, 0, SpanRefusal::Timeout(AboveCeiling)),
+            (0, -1, SpanRefusal::Timeout(NotPositive)),
+            (30_000, -1, SpanRefusal::PingInterval(NotPositive)),
+            (30_000, over, SpanRefusal::PingInterval(AboveCeiling)),
+        ] {
+            assert_eq!(
+                parse_connect_spans(timeout, ping_interval).err(),
+                Some(expected),
+                "{timeout}/{ping_interval}"
+            );
+        }
+        assert!(matches!(
+            parse_connect_spans(30_000, 0),
+            Ok((_, PingCadence::Off))
+        ));
+        assert!(matches!(
+            parse_connect_spans(30_000, 15_000),
+            Ok((_, PingCadence::Every(_)))
+        ));
+        let timeout_text = SpanRefusal::Timeout(NotPositive).to_string();
+        let ping_text = SpanRefusal::PingInterval(AboveCeiling).to_string();
+        assert!(timeout_text.starts_with("timeout: "), "{timeout_text}");
+        assert!(ping_text.starts_with("pingInterval: "), "{ping_text}");
+    }
+
     #[test]
     fn cfg_debug_prints_neither_url_nor_headers() {
         let cfg = WsClientCfg {
@@ -1516,7 +1709,15 @@ mod tests {
                 },
                 WsConnectError::TimedOut {
                     url: url(),
-                    after_ms: 30_000,
+                    after: deadline(30_000),
+                },
+                WsConnectError::BadTimeout {
+                    url: url(),
+                    refusal: TimeoutRefusal::NotPositive,
+                },
+                WsConnectError::BadPingInterval {
+                    url: url(),
+                    refusal: TimeoutRefusal::AboveCeiling,
                 },
             ] {
                 for shown in [error.to_string(), format!("{error:?}")] {
@@ -1593,7 +1794,10 @@ mod tests {
             WsFailure::WriteBufferFull.into_error::<IpeError>(WsSide::Write),
             IpeError::unexpected("ws write error: write buffer full".to_owned())
         );
-        let timed_out = WsConnectError::TimedOut { url, after_ms: 5 };
+        let timed_out = WsConnectError::TimedOut {
+            url,
+            after: deadline(5),
+        };
         let shown = timed_out.to_string();
         assert_eq!(
             timed_out.into_task::<IpeError>(),
@@ -1950,7 +2154,7 @@ mod tests {
                 .await
                 .ok()?;
         let peer = peer.await.ok()?.ok()?;
-        Some((start_socket(socket, ceiling, 0), peer))
+        Some((start_socket(socket, ceiling, PingCadence::Off), peer))
     }
 
     /// A stream whose writes fail once `broken` is set; reads pass through.
@@ -2371,12 +2575,19 @@ mod wasm_client {
     /// cannot be attached: the browser `WebSocket` constructor has no header
     /// parameter (a real platform limitation, not a dropped feature on our
     /// side) — surfaced as a console warning rather than a silent drop.
-    /// `cfg.timeout`/`cfg.pingInterval` have no browser-substitute wiring yet
-    /// (the browser auto-manages ping/pong at the protocol level).
-    pub fn web_socket_connect_with<E: From<String> + 'static>(
+    /// `cfg.timeout` and `cfg.pingInterval` are judged exactly as the native
+    /// connect judges them, so a span it refuses is refused here too, as
+    /// `InvalidInput`; an admitted span is not applied, since the browser owns
+    /// the handshake deadline and the ping/pong exchange.
+    pub fn web_socket_connect_with<E: From<String> + super::FromIpeError + 'static>(
         cfg: super::WsClientCfg,
     ) -> IpeTask<E, i64> {
         Box::pin(async move {
+            if let Err(refusal) = super::parse_connect_spans(cfg.timeout, cfg.pingInterval) {
+                return IpeResult::Err(E::from_ipe_error(crate::error::IpeError::invalid_input(
+                    format!("WebSocket.connect: {refusal}"),
+                )));
+            }
             if !cfg.headers.is_empty() {
                 crate::wasm::console_warn(
                     "Ipe.WebSocket.connectWith: custom headers are not settable via the \

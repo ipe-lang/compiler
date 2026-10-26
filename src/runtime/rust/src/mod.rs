@@ -237,6 +237,10 @@ pub mod task;
 // set resolves; its arms read `js_sys::Date`/`gloo-timers`, not `chrono`.
 #[cfg(feature = "time-core")]
 pub mod time;
+// Always declared, matching the emitted floor and the browser module set: the
+// one parse of a transport deadline, shared by `http_client` and `ws_client`
+// on every target, with no dependency of its own.
+pub mod transport_timeout;
 // Always declared, matching the emitted floor (`templates/ipe_runtime/mod.rs`
 // declares `pub mod trace;` for every program). `trace.rs` builds a std
 // `IpeTask` future (`async move`/`.await` on the boxed future, no `tokio::`

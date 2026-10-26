@@ -205,6 +205,12 @@ call site and a negative span is not representable; the raw milliseconds are
 unwrapped into the transport DTO for the runtime, exactly as
 `WebSocket.withTimeout` / `Cache.withTTL` do.
 
+The runtime admits a deadline from 1 millisecond to 10 minutes and refuses
+the request with an `InvalidInput` error otherwise: `Duration.zero` is
+refused (it never means "no deadline" or "the default"), and a span past
+10 minutes is refused rather than cut down.  `Http.Stream.open` does not
+read this field: a stream is bounded by its idle ceiling instead.
+
 ## `withUrl`
 
 ```ipe

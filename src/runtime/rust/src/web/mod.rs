@@ -1007,9 +1007,57 @@ where
     if standing == Standing::Live {
         return rejoin;
     }
-    store.delete(sid).await;
+    delete_session(store, sid).await;
     drop(rejoin);
     store::Rejoin::Miss
+}
+
+/// A session-store write that did not land, as the metric counts it.
+#[cfg(feature = "web")]
+#[derive(Clone, Copy, Debug)]
+enum StoreWriteFailure {
+    /// A fresh session's checkpoint was refused; the session was not published.
+    SetRefused,
+    /// A held session's checkpoint failed; it stays live and unevictable.
+    SetDiverged,
+    /// A delete left the persisted row; the sid is tombstoned.
+    DeletePending,
+    /// A TTL sweep did not finish its deletes.
+    SweepFailed,
+}
+
+#[cfg(feature = "web")]
+impl StoreWriteFailure {
+    /// The bounded `op` and `outcome` labels of this failure.
+    const fn labels(self) -> [(&'static str, &'static str); 2] {
+        let (op, outcome) = match self {
+            Self::SetRefused => ("set", "refused"),
+            Self::SetDiverged => ("set", "diverged"),
+            Self::DeletePending => ("delete", "pending"),
+            Self::SweepFailed => ("sweep", "failed"),
+        };
+        [("op", op), ("outcome", outcome)]
+    }
+
+    /// Count this failure in `ipe_web_store_write_failures_total`.
+    fn count(self) {
+        crate::telemetry::metric_inc("ipe_web_store_write_failures_total", &self.labels(), 1);
+    }
+}
+
+/// Delete session `sid` from `store`, counting a delete that left its row.
+///
+/// The store has already tombstoned the sid and logged the fault.
+#[cfg(feature = "web")]
+async fn delete_session<Model, Msg>(store: &Arc<dyn store::SessionStore<Model, Msg>>, sid: &str)
+where
+    Model: Send + 'static,
+    Msg: Send + 'static,
+{
+    match store.delete(sid).await {
+        store::Deleted::Removed => {}
+        store::Deleted::Pending(_) => StoreWriteFailure::DeletePending.count(),
+    }
 }
 
 /// End session `sid`: flip its closer, detach its SSE sender, drop it from the store.
@@ -1046,29 +1094,43 @@ async fn close_session<Model, Msg>(
             });
         e.sse_tx = None;
     }
-    store.delete(sid).await;
+    delete_session(store, sid).await;
 }
 
 /// Whether a [`checkpoint`] left the session in the store.
+///
+/// No `PartialEq`: every caller matches each outcome.
 #[cfg(feature = "web")]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug)]
+#[must_use]
 enum Checkpoint {
     /// The session is stored and open.
     Stored,
+    /// The session is held and open; its write did not land.
+    ///
+    /// It stays live and unevictable until a checkpoint lands.
+    Diverged,
     /// The session was closed; the write is undone.
     Closed,
     /// Another handle holds the sid; nothing was written.
     Displaced,
+    /// The store refused to persist a sid it held no entry for.
+    ///
+    /// The session is no longer in the store.
+    Refused,
 }
 
 /// Write session `sid` through to the store, unless it was closed or
 /// displaced meanwhile.
 ///
-/// The closer is read after the write: a [`close_session`] that flipped it
-/// before this read has its delete repeated here, and one that flips it after
-/// deletes this write itself. A closed session is never stored again. A
-/// displaced handle wrote nothing and deletes nothing: the sid is another
-/// handle's.
+/// The closer is read after the write, whatever the store answered: a
+/// [`close_session`] that flipped it before this read has its delete repeated
+/// here, and one that flips it after deletes this write itself. A closed
+/// session is never stored again. The read covers a displaced or refused
+/// write too: a write that lands after a close's delete emptied the slot
+/// reports [`store::Installed::Displaced`] while its row stands, and a refused
+/// write may have landed before its driver failed. An open displaced handle
+/// deletes nothing: the sid is another handle's.
 #[cfg(feature = "web")]
 async fn checkpoint<Model, Msg>(
     store: &Arc<dyn store::SessionStore<Model, Msg>>,
@@ -1079,9 +1141,18 @@ where
     Model: Send + 'static,
     Msg: Send + 'static,
 {
-    if store.set(sid, Arc::clone(entry)).await == store::Installed::Displaced {
-        return Checkpoint::Displaced;
-    }
+    let open = match store.set(sid, Arc::clone(entry)).await {
+        store::Installed::Held => Checkpoint::Stored,
+        store::Installed::Diverged(_) => {
+            StoreWriteFailure::SetDiverged.count();
+            Checkpoint::Diverged
+        }
+        store::Installed::Refused(_) => {
+            StoreWriteFailure::SetRefused.count();
+            Checkpoint::Refused
+        }
+        store::Installed::Displaced => Checkpoint::Displaced,
+    };
     let closed = entry
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -1090,10 +1161,10 @@ where
         .borrow()
         .closed();
     if closed.is_some() {
-        store.delete(sid).await;
+        delete_session(store, sid).await;
         Checkpoint::Closed
     } else {
-        Checkpoint::Stored
+        open
     }
 }
 
@@ -2124,6 +2195,20 @@ fn entry_unavailable() -> axum::response::Response {
         .into_response()
 }
 
+/// The 503 a request gets when the store cannot persist its new session.
+///
+/// Sent with no cookie: no session this process cannot persist is published.
+#[cfg(feature = "web")]
+fn store_unavailable() -> axum::response::Response {
+    use axum::response::IntoResponse;
+    (
+        axum::http::StatusCode::SERVICE_UNAVAILABLE,
+        [(axum::http::header::RETRY_AFTER, "1")],
+        "session store unavailable",
+    )
+        .into_response()
+}
+
 /// The page's CSRF double-submit token, reused from a well-formed cookie or minted.
 ///
 /// Reusing the browser's per-app cookie keeps a reload on the same token. A
@@ -2744,8 +2829,10 @@ async fn sweep_sessions<Model, Msg>(
         let Ok(work) = drain.work() else {
             continue;
         };
-        if under_work(work, store.sweep()).await.is_none() {
-            return;
+        match under_work(work, store.sweep()).await {
+            None => return,
+            Some(Ok(())) => {}
+            Some(Err(_)) => StoreWriteFailure::SweepFailed.count(),
         }
     }
 }
@@ -2872,8 +2959,12 @@ where
         }
     }
     match checkpoint(store, sid, &strong).await {
-        Checkpoint::Stored => EntryCommit::Entered(entered.model, entered.cmd),
-        Checkpoint::Closed | Checkpoint::Displaced => EntryCommit::SessionGone,
+        Checkpoint::Stored | Checkpoint::Diverged => {
+            EntryCommit::Entered(entered.model, entered.cmd)
+        }
+        Checkpoint::Closed | Checkpoint::Displaced | Checkpoint::Refused => {
+            EntryCommit::SessionGone
+        }
     }
 }
 
@@ -3248,9 +3339,12 @@ async fn drive_session<Model, Msg, FUpdate, FView, FSubs>(
         // alive. `strong` is dropped at the end of this iteration (block scope),
         // before the next select! park — never held across the await loop.
         // A session a request closed meanwhile is not stored again, and its
-        // Cmd never runs; nor is one another handle displaced.
-        if checkpoint(&store, &sid, &strong).await != Checkpoint::Stored {
-            break;
+        // Cmd never runs; nor is one another handle displaced, nor one the
+        // store refused. A diverged write keeps the turn: the live model is
+        // the truth, and the entry stays unevictable until a write lands.
+        match checkpoint(&store, &sid, &strong).await {
+            Checkpoint::Stored | Checkpoint::Diverged => {}
+            Checkpoint::Closed | Checkpoint::Displaced | Checkpoint::Refused => break,
         }
 
         pubsub::with_session(&scope, || {
@@ -5375,9 +5469,21 @@ mod handlers {
         };
         let commit = tokio::spawn(under_work(work, async move {
             let sid = owner.sid();
-            if store.set(sid, entry.clone()).await == store::Installed::Displaced {
-                drop(owner);
-                return store::Installed::Displaced;
+            let installed = store.set(sid, entry.clone()).await;
+            match installed {
+                store::Installed::Held => {}
+                // A fresh handle never diverges; were it to, the session is
+                // held live and published like a held one.
+                store::Installed::Diverged(_) => StoreWriteFailure::SetDiverged.count(),
+                store::Installed::Refused(_) => {
+                    StoreWriteFailure::SetRefused.count();
+                    drop(owner);
+                    return installed;
+                }
+                store::Installed::Displaced => {
+                    drop(owner);
+                    return installed;
+                }
             }
             tokio::spawn(drive_session(
                 Arc::downgrade(&entry),
@@ -5400,10 +5506,13 @@ mod handlers {
             pubsub::with_session(&scope, || run_cmd(cmd0, &msg_tx, &scope, &cmds));
             drop(birth);
             drop(owner);
-            store::Installed::Held
+            installed
         }));
         match commit.await {
-            Ok(Some(store::Installed::Held)) => {}
+            Ok(Some(store::Installed::Held | store::Installed::Diverged(_))) => {}
+            // The store cannot persist the session: nothing was published,
+            // no cookie is set, and the claim is released.
+            Ok(Some(store::Installed::Refused(_))) => return store_unavailable(),
             // A displaced sid, or a shutdown that closed first: nothing was
             // published, and the claim is released.
             Ok(Some(store::Installed::Displaced) | None) => return entry_unavailable(),
@@ -7849,14 +7958,14 @@ mod reload_push_tests {
     async fn push_reload_to_web_sessions_sends_one_frame_per_web_session() {
         let store_impl: MemoryStore<(), ()> = MemoryStore::new(Duration::from_secs(60));
         let (sse_tx, mut sse_rx) = sse::channel().expect("the default SSE buffer resolves");
-        assert_eq!(
+        assert!(matches!(
             store_impl.set("with_sse", handle_with(Some(sse_tx))).await,
             crate::web::Installed::Held
-        );
-        assert_eq!(
+        ));
+        assert!(matches!(
             store_impl.set("without_sse", handle_with(None)).await,
             crate::web::Installed::Held
-        );
+        ));
         let store: Arc<dyn SessionStore<(), ()>> = Arc::new(store_impl);
 
         push_reload_to_web_sessions(&store).await;
@@ -7880,10 +7989,10 @@ mod reload_push_tests {
     async fn reload_push_skipped_on_release_under_env_dev() {
         let store_impl: MemoryStore<(), ()> = MemoryStore::new(Duration::from_secs(60));
         let (sse_tx, mut sse_rx) = sse::channel().expect("the default SSE buffer resolves");
-        assert_eq!(
+        assert!(matches!(
             store_impl.set("s", handle_with(Some(sse_tx))).await,
             crate::web::Installed::Held
-        );
+        ));
         let store: Arc<dyn SessionStore<(), ()>> = Arc::new(store_impl);
 
         maybe_push_reload_with(&store, None).await;
@@ -8001,12 +8110,12 @@ mod hot_appearance_push_tests {
             let store_impl: MemoryStore<i64, ()> = MemoryStore::new(Duration::from_secs(60));
             let (sse_tx, mut sse_rx) = sse::channel().expect("the default SSE buffer resolves");
             // A non-initial Model, to prove the re-render uses the CURRENT Model.
-            assert_eq!(
+            assert!(matches!(
                 store_impl
                     .set("live", session_with_current_view(7, Some(sse_tx)))
                     .await,
                 crate::web::Installed::Held
-            );
+            ));
             let store: Arc<dyn SessionStore<i64, ()>> = Arc::new(store_impl);
             let view: Arc<fn(i64) -> Html<()>> = Arc::new(app_view);
 
@@ -8069,10 +8178,10 @@ mod hot_appearance_push_tests {
                 .unwrap_or_else(|e| e.into_inner())
                 .rendered
                 .epoch();
-            assert_eq!(
+            assert!(matches!(
                 store_impl.set("live", handle.clone()).await,
                 crate::web::Installed::Held
-            );
+            ));
             let store: Arc<dyn SessionStore<i64, ()>> = Arc::new(store_impl);
             let view: Arc<fn(i64) -> Html<()>> = Arc::new(app_view);
 
@@ -8120,12 +8229,12 @@ mod hot_appearance_push_tests {
 
             let store_impl: MemoryStore<i64, ()> = MemoryStore::new(Duration::from_secs(60));
             let (sse_tx, mut sse_rx) = sse::channel().expect("the default SSE buffer resolves");
-            assert_eq!(
+            assert!(matches!(
                 store_impl
                     .set("live", session_with_current_view(3, Some(sse_tx)))
                     .await,
                 crate::web::Installed::Held
-            );
+            ));
             let store: Arc<dyn SessionStore<i64, ()>> = Arc::new(store_impl);
             let view: Arc<fn(i64) -> Html<()>> = Arc::new(app_view);
 
@@ -10821,12 +10930,12 @@ mod watch_status_handler_tests {
 
         let store = Arc::new(TestStore::new(Duration::from_secs(60)));
         let (sse_tx, mut sse_rx) = sse::channel().expect("the default SSE buffer resolves");
-        assert_eq!(
+        assert!(matches!(
             store
                 .set("live-session", make_session_handle(Some(sse_tx)))
                 .await,
             crate::web::Installed::Held
-        );
+        ));
         let state = make_state(store);
         let router = make_router(state);
 
@@ -10944,12 +11053,12 @@ mod watch_status_handler_tests {
     async fn no_sse_event_emitted_when_route_absent() {
         let store = Arc::new(TestStore::new(Duration::from_secs(60)));
         let (sse_tx, mut sse_rx) = sse::channel().expect("the default SSE buffer resolves");
-        assert_eq!(
+        assert!(matches!(
             store
                 .set("session", make_session_handle(Some(sse_tx)))
                 .await,
             crate::web::Installed::Held
-        );
+        ));
         // Route not mounted — production scenario.
         let prod_router: Router = Router::new();
         let req = Request::builder()
@@ -10978,10 +11087,10 @@ mod watch_status_handler_tests {
 
         let store = Arc::new(TestStore::new(Duration::from_secs(60)));
         let (sse_tx, mut sse_rx) = sse::channel().expect("the default SSE buffer resolves");
-        assert_eq!(
+        assert!(matches!(
             store.set("sess", make_session_handle(Some(sse_tx))).await,
             crate::web::Installed::Held
-        );
+        ));
         let state = make_state(store);
         let watch_build_status = state.watch_build_status.clone();
         let router = make_router(state);
@@ -11144,10 +11253,10 @@ mod watch_status_handler_tests {
 
         let store = Arc::new(TestStore::new(Duration::from_secs(60)));
         let (sse_tx, mut sse_rx) = sse::channel().expect("the default SSE buffer resolves");
-        assert_eq!(
+        assert!(matches!(
             store.set("s", make_session_handle(Some(sse_tx))).await,
             crate::web::Installed::Held
-        );
+        ));
         let state = make_state(store);
         let watch_build_status = state.watch_build_status.clone();
         let router = make_router(state);
@@ -15520,6 +15629,234 @@ mod route_entry_cmd_tests {
         });
     }
 
+    /// The count of `ipe_web_store_write_failures_total` for `op` and `outcome`.
+    fn store_write_failures(op: &str, outcome: &str) -> u64 {
+        let series =
+            format!("ipe_web_store_write_failures_total{{op=\"{op}\",outcome=\"{outcome}\"}} ");
+        crate::telemetry::write_prom()
+            .lines()
+            .find_map(|line| line.strip_prefix(series.as_str()))
+            .and_then(|n| n.trim().parse().ok())
+            .unwrap_or(0)
+    }
+
+    /// A memory store that refuses to persist any session it is handed.
+    struct RefusingStore(MemoryStore<Model, Msg>);
+
+    #[async_trait::async_trait]
+    impl SessionStore<Model, Msg> for RefusingStore {
+        async fn get(&self, sid: &str) -> Option<SessionHandle<Model, Msg>> {
+            self.0.get(sid).await
+        }
+        fn admission(&self) -> &store::SidAdmission {
+            self.0.admission()
+        }
+        async fn set(
+            &self,
+            _sid: &str,
+            _handle: SessionHandle<Model, Msg>,
+        ) -> crate::web::Installed {
+            crate::web::Installed::Refused(crate::web::WriteFault::Encode(
+                crate::web::CheckpointRefusal::Model,
+            ))
+        }
+        async fn delete(&self, sid: &str) -> crate::web::Deleted {
+            self.0.delete(sid).await
+        }
+        async fn web_sessions(&self) -> Vec<SessionHandle<Model, Msg>> {
+            self.0.web_sessions().await
+        }
+        async fn evict_unconnected(&self, need: crate::retained::Bytes) -> crate::retained::Bytes {
+            self.0.evict_unconnected(need).await
+        }
+        fn holds(&self, sid: &str, handle: &store::SessionHandle<Model, Msg>) -> bool {
+            self.0.holds(sid, handle)
+        }
+    }
+
+    /// A page mint the store cannot persist answers 503 with no cookie.
+    ///
+    /// No session is published: no driver runs and the store holds nothing.
+    #[test]
+    fn mint_refuses_when_the_store_cannot_persist() {
+        run(false, || async {
+            let sessions = Arc::new(AtomicUsize::new(0));
+            let store: Store = Arc::new(RefusingStore(MemoryStore::new(Duration::from_secs(60))));
+            let before = store_write_failures("set", "refused");
+            let app = router_counted(store.clone(), sessions.clone());
+            let (status, retry_after, sid, body) = get_via(app, "/", None).await;
+            assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+            assert_eq!(retry_after.as_deref(), Some("1"));
+            assert_eq!(body, "session store unavailable");
+            assert!(sid.is_empty(), "a refused mint sets no cookie");
+            assert!(
+                store.web_sessions().await.is_empty(),
+                "nothing is published"
+            );
+            assert_eq!(
+                sessions.load(std::sync::atomic::Ordering::SeqCst),
+                0,
+                "no driver holds a session slot"
+            );
+            assert!(
+                store_write_failures("set", "refused") > before,
+                "the refusal is counted"
+            );
+        });
+    }
+
+    /// A driver turn whose checkpoint diverges keeps the session live.
+    ///
+    /// The diverged session is never evicted; once a checkpoint lands it is
+    /// evictable again.
+    #[cfg(feature = "db")]
+    #[test]
+    #[allow(clippy::expect_used)] // test: the temp store opens and the page stores its session
+    fn driver_continues_on_a_diverged_checkpoint_and_the_session_is_not_evicted() {
+        run(false, || async {
+            let path = crate::scratch_core::test_temp_root()
+                .join(format!("ipetest_diverged_turn_{}.db", std::process::id()));
+            let p = path.to_str().expect("a UTF-8 temp path").to_owned();
+            for suffix in ["", "-wal", "-shm"] {
+                let _ = std::fs::remove_file(format!("{p}{suffix}"));
+            }
+            let bounded = tokio::time::timeout(Duration::from_secs(60), async {
+                let sqlite = Arc::new(
+                    store::SqliteStore::<Model, Msg>::new(
+                        p.as_str(),
+                        Duration::from_secs(60),
+                        [7u8; 32],
+                    )
+                    .await
+                    .expect("the temp SQLite store opens"),
+                );
+                let store: Store = sqlite.clone();
+                let side = sqlite.pool();
+                let gate = Arc::new(tokio::sync::Semaphore::new(0));
+                HELD_GATE.with(|g| *g.borrow_mut() = Some(Arc::clone(&gate)));
+                let mut state = fixture_state(store.clone(), Arc::new(AtomicUsize::new(0)));
+                state.init = Arc::new(held_init);
+                let app = build_web_router(state, false)
+                    .map(crate::server::behind_listener)
+                    .expect("the fixture route table and base are well-formed");
+                let (status, _, sid, _) = get_via(app.clone(), "/", None).await;
+                assert_eq!(status, StatusCode::OK);
+                assert!(
+                    settled(&store, &sid, 1).await.is_some(),
+                    "the entry Cmd landed"
+                );
+
+                sqlx::query("DROP TABLE ipe_sessions")
+                    .execute(side)
+                    .await
+                    .expect("drop the session table");
+                let before = store_write_failures("set", "diverged");
+                gate.add_permits(1);
+                let done = settled(&store, &sid, 2)
+                    .await
+                    .expect("the session is still live");
+                assert_eq!(count(&done, "held"), 1, "the turn ran: {done:?}");
+                assert!(quiescent(&store, &sid).await, "the session settles");
+                assert!(
+                    store_write_failures("set", "diverged") > before,
+                    "the diverged write is counted"
+                );
+                let live = handle_of(&store, &sid).await.expect("the session is live");
+                let _ = store
+                    .evict_unconnected(crate::retained::Bytes::new(u64::MAX))
+                    .await;
+                assert!(
+                    store.holds(&sid, &live),
+                    "a diverged session is never evicted to its stale row"
+                );
+
+                sqlx::query(
+                    "CREATE TABLE ipe_sessions (sid TEXT PRIMARY KEY, blob TEXT NOT NULL, \
+                     last_seen INTEGER NOT NULL, schema_tag TEXT NOT NULL)",
+                )
+                .execute(side)
+                .await
+                .expect("recreate the session table");
+                let (status, _, _, _) = get_via(app, "/", Some(&sid)).await;
+                assert_eq!(status, StatusCode::OK);
+                assert!(
+                    settled(&store, &sid, 3).await.is_some(),
+                    "the reload's turn landed"
+                );
+                assert!(quiescent(&store, &sid).await, "the session settles");
+                let _ = store
+                    .evict_unconnected(crate::retained::Bytes::new(u64::MAX))
+                    .await;
+                assert!(
+                    !store.holds(&sid, &live),
+                    "a landed checkpoint makes the session evictable again"
+                );
+            })
+            .await;
+            HELD_GATE.with(|g| *g.borrow_mut() = None);
+            for suffix in ["", "-wal", "-shm"] {
+                let _ = std::fs::remove_file(format!("{p}{suffix}"));
+            }
+            assert!(bounded.is_ok(), "the test finishes within the bound");
+        });
+    }
+
+    /// A memory store whose deletes remove the live entry but report the row kept.
+    struct PendingDelete(MemoryStore<Model, Msg>);
+
+    #[async_trait::async_trait]
+    impl SessionStore<Model, Msg> for PendingDelete {
+        async fn get(&self, sid: &str) -> Option<SessionHandle<Model, Msg>> {
+            self.0.get(sid).await
+        }
+        fn admission(&self) -> &store::SidAdmission {
+            self.0.admission()
+        }
+        async fn set(&self, sid: &str, handle: SessionHandle<Model, Msg>) -> crate::web::Installed {
+            self.0.set(sid, handle).await
+        }
+        async fn delete(&self, sid: &str) -> crate::web::Deleted {
+            assert!(matches!(
+                self.0.delete(sid).await,
+                crate::web::Deleted::Removed
+            ));
+            crate::web::Deleted::Pending(crate::web::WriteFault::Encode(
+                crate::web::CheckpointRefusal::Model,
+            ))
+        }
+        async fn web_sessions(&self) -> Vec<SessionHandle<Model, Msg>> {
+            self.0.web_sessions().await
+        }
+        async fn evict_unconnected(&self, need: crate::retained::Bytes) -> crate::retained::Bytes {
+            self.0.evict_unconnected(need).await
+        }
+        fn holds(&self, sid: &str, handle: &store::SessionHandle<Model, Msg>) -> bool {
+            self.0.holds(sid, handle)
+        }
+    }
+
+    /// Closing a session whose delete stays pending counts it, and the live entry is gone.
+    #[test]
+    fn close_session_counts_a_pending_delete() {
+        run(false, || async {
+            let store: Store = Arc::new(PendingDelete(MemoryStore::new(Duration::from_secs(60))));
+            let (status, _, sid, _) = get(&store, "/", None).await;
+            assert_eq!(status, StatusCode::OK);
+            let live = handle_of(&store, &sid).await;
+            assert!(live.is_some(), "the page stored its session");
+            let before = store_write_failures("delete", "pending");
+            close_session(&store, &sid, live.as_ref(), CloseReason::Ended).await;
+            assert!(
+                store_write_failures("delete", "pending") > before,
+                "the pending delete is counted"
+            );
+            assert!(
+                handle_of(&store, &sid).await.is_none(),
+                "the live entry is gone"
+            );
+        });
+    }
+
     /// A memory store whose `set` of a model `pause` matches waits, once the
     /// handle is installed, for the test's release, so a test evicts between
     /// a write and the Cmds the writer starts after it.
@@ -15560,8 +15897,8 @@ mod route_entry_cmd_tests {
             }
             installed
         }
-        async fn delete(&self, sid: &str) {
-            self.inner.delete(sid).await;
+        async fn delete(&self, sid: &str) -> crate::web::Deleted {
+            self.inner.delete(sid).await
         }
         async fn web_sessions(&self) -> Vec<SessionHandle<Model, Msg>> {
             self.inner.web_sessions().await
@@ -15679,7 +16016,10 @@ mod route_entry_cmd_tests {
         async fn get(&self, sid: &str) -> Option<SessionHandle<Model, Msg>> {
             let handle = self.0.get(sid).await;
             if self.1.swap(false, std::sync::atomic::Ordering::SeqCst) {
-                self.0.delete(sid).await;
+                assert!(matches!(
+                    self.0.delete(sid).await,
+                    crate::web::Deleted::Removed
+                ));
             }
             handle
         }
@@ -15689,8 +16029,8 @@ mod route_entry_cmd_tests {
         async fn set(&self, sid: &str, handle: SessionHandle<Model, Msg>) -> crate::web::Installed {
             self.0.set(sid, handle).await
         }
-        async fn delete(&self, sid: &str) {
-            self.0.delete(sid).await;
+        async fn delete(&self, sid: &str) -> crate::web::Deleted {
+            self.0.delete(sid).await
         }
         async fn web_sessions(&self) -> Vec<SessionHandle<Model, Msg>> {
             self.0.web_sessions().await
@@ -16130,8 +16470,8 @@ mod route_entry_cmd_tests {
         async fn set(&self, sid: &str, handle: SessionHandle<Model, Msg>) -> crate::web::Installed {
             self.live.set(sid, handle).await
         }
-        async fn delete(&self, sid: &str) {
-            self.live.delete(sid).await;
+        async fn delete(&self, sid: &str) -> crate::web::Deleted {
+            self.live.delete(sid).await
         }
         async fn web_sessions(&self) -> Vec<SessionHandle<Model, Msg>> {
             self.live.web_sessions().await
@@ -16615,8 +16955,8 @@ mod route_entry_cmd_tests {
         async fn set(&self, sid: &str, handle: SessionHandle<Model, Msg>) -> crate::web::Installed {
             self.inner.set(sid, handle).await
         }
-        async fn delete(&self, sid: &str) {
-            self.inner.delete(sid).await;
+        async fn delete(&self, sid: &str) -> crate::web::Deleted {
+            self.inner.delete(sid).await
         }
         async fn web_sessions(&self) -> Vec<SessionHandle<Model, Msg>> {
             self.inner.web_sessions().await
@@ -16719,8 +17059,8 @@ mod route_entry_cmd_tests {
             }
             self.inner.set(sid, handle).await
         }
-        async fn delete(&self, sid: &str) {
-            self.inner.delete(sid).await;
+        async fn delete(&self, sid: &str) -> crate::web::Deleted {
+            self.inner.delete(sid).await
         }
         async fn web_sessions(&self) -> Vec<SessionHandle<Model, Msg>> {
             self.inner.web_sessions().await
@@ -16797,8 +17137,8 @@ mod route_entry_cmd_tests {
             }
             self.inner.set(sid, handle).await
         }
-        async fn delete(&self, sid: &str) {
-            self.inner.delete(sid).await;
+        async fn delete(&self, sid: &str) -> crate::web::Deleted {
+            self.inner.delete(sid).await
         }
         async fn web_sessions(&self) -> Vec<SessionHandle<Model, Msg>> {
             self.inner.web_sessions().await
@@ -16986,7 +17326,10 @@ mod route_entry_cmd_tests {
             charge: crate::web::budget::Charge::detached(),
             cmds: Arc::new(crate::web::budget::SessionCmds::new()),
         }));
-        assert_eq!(store.set(&sid, entry).await, crate::web::Installed::Held);
+        assert!(matches!(
+            store.set(&sid, entry).await,
+            crate::web::Installed::Held
+        ));
         (sid, enter_rx)
     }
 
@@ -18497,11 +18840,14 @@ mod web_revocation_tests {
                 .liveness
                 .closer
                 .send_replace(Liveness::Closed(CloseReason::Ended));
-            store.delete(&closed.sid).await;
-            assert_eq!(
+            assert!(matches!(
+                store.delete(&closed.sid).await,
+                crate::web::Deleted::Removed
+            ));
+            assert!(matches!(
                 checkpoint(&dyn_store, &closed.sid, &handle).await,
                 Checkpoint::Closed
-            );
+            ));
             assert!(
                 entry_of(&store, &closed.sid).await.is_none(),
                 "a closed session is never stored again"
@@ -18511,12 +18857,129 @@ mod web_revocation_tests {
             let handle = entry_of(&store, &open.sid).await;
             assert!(handle.is_some(), "the page load stored a live session");
             let Some(handle) = handle else { return };
-            store.delete(&open.sid).await;
-            assert_eq!(
+            assert!(matches!(
+                store.delete(&open.sid).await,
+                crate::web::Deleted::Removed
+            ));
+            assert!(matches!(
                 checkpoint(&dyn_store, &open.sid, &handle).await,
                 Checkpoint::Stored
-            );
+            ));
             assert!(entry_of(&store, &open.sid).await.is_some());
+        });
+    }
+
+    /// A store whose every write lands a row and then answers `Displaced`, as
+    /// a write landing after a close's delete emptied its slot, or `Refused`
+    /// with `refuse`, as a driver that failed after the statement ran.
+    struct LateWrite {
+        inner: Store,
+        refuse: bool,
+        rows: Mutex<std::collections::BTreeSet<String>>,
+    }
+
+    impl LateWrite {
+        fn rows(&self) -> std::collections::BTreeSet<String> {
+            self.rows
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl store::SessionStore<Model, Msg> for LateWrite {
+        async fn get(&self, sid: &str) -> Option<store::SessionHandle<Model, Msg>> {
+            self.inner.get(sid).await
+        }
+        fn admission(&self) -> &store::SidAdmission {
+            self.inner.admission()
+        }
+        async fn set(
+            &self,
+            sid: &str,
+            _handle: store::SessionHandle<Model, Msg>,
+        ) -> crate::web::Installed {
+            self.rows
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(sid.to_owned());
+            if self.refuse {
+                crate::web::Installed::Refused(crate::web::WriteFault::Encode(
+                    crate::web::CheckpointRefusal::Model,
+                ))
+            } else {
+                crate::web::Installed::Displaced
+            }
+        }
+        async fn delete(&self, sid: &str) -> crate::web::Deleted {
+            self.rows
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .remove(sid);
+            self.inner.delete(sid).await
+        }
+        async fn web_sessions(&self) -> Vec<store::SessionHandle<Model, Msg>> {
+            self.inner.web_sessions().await
+        }
+        async fn evict_unconnected(&self, need: crate::retained::Bytes) -> crate::retained::Bytes {
+            self.inner.evict_unconnected(need).await
+        }
+        fn holds(&self, sid: &str, handle: &store::SessionHandle<Model, Msg>) -> bool {
+            self.inner.holds(sid, handle)
+        }
+    }
+
+    /// A checkpoint of a closed session whose write landed but was answered
+    /// displaced or refused still repeats the close's delete, so the row it
+    /// wrote never outlives the close; an open displaced handle deletes nothing.
+    #[test]
+    fn checkpoint_undoes_a_late_write_of_a_closed_session() {
+        run(false, || async {
+            let store = Arc::new(Store::new(Duration::from_secs(60)));
+            let router = make_router(&store);
+            for refuse in [false, true] {
+                let subject = if refuse {
+                    "late-refused"
+                } else {
+                    "late-displaced"
+                };
+                let opened = open_session(&router, subject, 7200, "").await;
+                let handle = entry_of(&store, &opened.sid).await;
+                assert!(handle.is_some(), "the page load stored a live session");
+                let Some(handle) = handle else { return };
+                let probe = Arc::new(LateWrite {
+                    inner: Store::new(Duration::from_secs(60)),
+                    refuse,
+                    rows: Mutex::new(std::collections::BTreeSet::new()),
+                });
+                let dyn_probe = Arc::clone(&probe) as Arc<dyn store::SessionStore<Model, Msg>>;
+                let open = checkpoint(&dyn_probe, &opened.sid, &handle).await;
+                assert!(
+                    matches!(
+                        (refuse, open),
+                        (false, Checkpoint::Displaced) | (true, Checkpoint::Refused)
+                    ),
+                    "{open:?}"
+                );
+                assert_eq!(
+                    probe.rows(),
+                    std::collections::BTreeSet::from([opened.sid.clone()]),
+                    "an open write stays"
+                );
+                handle
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .liveness
+                    .closer
+                    .send_replace(Liveness::Closed(CloseReason::Ended));
+                let closed = checkpoint(&dyn_probe, &opened.sid, &handle).await;
+                assert!(matches!(closed, Checkpoint::Closed), "{closed:?}");
+                assert!(
+                    probe.rows().is_empty(),
+                    "the late write of a closed session is deleted"
+                );
+            }
         });
     }
 
@@ -18542,7 +19005,7 @@ mod web_revocation_tests {
         ) -> crate::web::Installed {
             self.inner.set(sid, handle).await
         }
-        async fn delete(&self, sid: &str) {
+        async fn delete(&self, sid: &str) -> crate::web::Deleted {
             let closed = self
                 .watched
                 .lock()
@@ -18556,7 +19019,7 @@ mod web_revocation_tests {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .push(closed);
-            self.inner.delete(sid).await;
+            self.inner.delete(sid).await
         }
         async fn web_sessions(&self) -> Vec<store::SessionHandle<Model, Msg>> {
             self.inner.web_sessions().await
@@ -18679,8 +19142,8 @@ mod web_revocation_tests {
             }
             installed
         }
-        async fn delete(&self, sid: &str) {
-            self.inner.delete(sid).await;
+        async fn delete(&self, sid: &str) -> crate::web::Deleted {
+            self.inner.delete(sid).await
         }
         async fn web_sessions(&self) -> Vec<store::SessionHandle<Model, Msg>> {
             self.inner.web_sessions().await
@@ -19829,13 +20292,13 @@ mod shutdown_work_tests {
             self.released().await;
             self.inner.set(sid, handle).await
         }
-        async fn delete(&self, sid: &str) {
-            self.inner.delete(sid).await;
+        async fn delete(&self, sid: &str) -> crate::web::Deleted {
+            self.inner.delete(sid).await
         }
-        async fn sweep(&self) {
+        async fn sweep(&self) -> Result<(), crate::web::WriteFault> {
             self.sweeps.fetch_add(1, Ordering::SeqCst);
             self.released().await;
-            self.inner.sweep().await;
+            self.inner.sweep().await
         }
         async fn web_sessions(&self) -> Vec<SessionHandle<i64, i64>> {
             self.inner.web_sessions().await

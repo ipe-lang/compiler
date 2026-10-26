@@ -617,28 +617,24 @@ pub fn dev_record(name: &str, fields: &[(&str, String)]) -> String {
     format!("{name} {{ {} }}", parts.join(", "))
 }
 
-/// The header names whose values carry a credential: their dev view is the
-/// marker, matched without regard to ASCII case.
-#[cfg(feature = "dev-posture")]
-pub const DEV_WITHHELD_HEADERS: [&str; 3] = ["authorization", "cookie", "set-cookie"];
-
-/// A header value in the dev view: the marker for a [`DEV_WITHHELD_HEADERS`]
-/// name, the value otherwise.
+/// A header value in the dev view: the marker for a credential position, the
+/// value otherwise.
+///
+/// The position is decided by `crate::redact::classify_header_text`, the one
+/// credential rule for header names; a name outside the header grammar is a
+/// credential position, so its value is withheld.
 #[cfg(feature = "dev-posture")]
 #[must_use]
 pub fn dev_header_value<'a>(name: &str, value: &'a str) -> &'a str {
-    if DEV_WITHHELD_HEADERS
-        .iter()
-        .any(|withheld| name.eq_ignore_ascii_case(withheld))
-    {
-        REDACTED_SHOW
-    } else {
-        value
+    use crate::redact::{HeaderClass, classify_header_text};
+    match classify_header_text(name) {
+        HeaderClass::Credential => REDACTED_SHOW,
+        HeaderClass::Plain => value,
     }
 }
 
 /// A header map in the dev view: `map[k:v ..]` sorted by name, with every
-/// [`DEV_WITHHELD_HEADERS`] value withheld.
+/// credential position's value withheld.
 #[cfg(feature = "dev-posture")]
 #[must_use]
 pub fn dev_header_map(headers: &HashMap<String, String>) -> String {
@@ -652,7 +648,7 @@ pub fn dev_header_map(headers: &HashMap<String, String>) -> String {
 }
 
 /// A header list in the dev view: `[{k v} ..]` in its own order, with every
-/// [`DEV_WITHHELD_HEADERS`] value withheld.
+/// credential position's value withheld.
 #[cfg(feature = "dev-posture")]
 #[must_use]
 pub fn dev_header_list(headers: &[(String, String)]) -> String {
@@ -832,6 +828,42 @@ impl<E: IpeStringify, A: IpeStringify> IpeStringify for IpeResult<E, A> {
 #[cfg(not(target_arch = "wasm32"))]
 mod tests {
     use super::*;
+
+    // Every credential position's value is the marker in the dev view, a
+    // plain header's value is shown, and a name outside the header grammar is
+    // withheld rather than folded.
+    #[cfg(feature = "dev-posture")]
+    #[test]
+    fn dev_posture_pin_dev_header_value_withholds_every_credential_position() {
+        for name in [
+            "Authorization",
+            "cookie",
+            "Set-Cookie",
+            "X-Api-Key",
+            "Proxy-Authorization",
+            "X-Amz-Security-Token",
+            "X-Custom-Token",
+            "X-Client-Secret",
+            "X-Amz-Date",
+            "Authorizatıon",
+            "",
+        ] {
+            assert_eq!(dev_header_value(name, "S3CR3T"), REDACTED_SHOW, "{name:?}");
+        }
+        for name in ["Content-Type", "Host", "X-Request-Id"] {
+            assert_eq!(dev_header_value(name, "shown"), "shown", "{name}");
+        }
+        let headers = [
+            ("X-Api-Key".to_owned(), "S3CR3T".to_owned()),
+            ("Content-Type".to_owned(), "text/plain".to_owned()),
+        ];
+        let listed = dev_header_list(&headers);
+        assert!(!listed.contains("S3CR3T"), "{listed}");
+        assert_eq!(listed, "[{X-Api-Key <redacted>} {Content-Type text/plain}]");
+        let mapped = dev_header_map(&HashMap::from(headers));
+        assert!(!mapped.contains("S3CR3T"), "{mapped}");
+        assert_eq!(mapped, "map[Content-Type:text/plain X-Api-Key:<redacted>]");
+    }
 
     #[test]
     fn string_unquoted() {
