@@ -356,8 +356,10 @@ fn shapes() -> [(&'static str, Shape, usize, AtCeiling); 15] {
             limit - 8,
             TypeRefused,
         ),
-        // The chain's expression at depth 0, each operator one level more.
-        ("pipeline", pipeline, limit, Builds),
+        // Each operator one level more, charged over the chain's deepest
+        // operand: a continuation's body atom sits at depth 13, ten past the
+        // depth 3 a chain of bare atoms is measured from.
+        ("pipeline", pipeline, limit - 10, Builds),
         // Ten levels per continuation; the innermost atom at depth `10n + 3`.
         ("nested_lambda", nested_lambda, (limit - 3) / 10, Builds),
         // The innermost atom at depth `13 + 5n` inside `String.fromInt (…)`.

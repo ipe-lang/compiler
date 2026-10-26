@@ -55,6 +55,9 @@ pub struct Parser<'a> {
     toks: Vec<Token>,
     pos: usize,
     interner: &'a mut Interner,
+    /// The deepest level the expression being parsed has reached, counting
+    /// the levels an operator chain it sits under adds once re-associated.
+    deepest: u32,
 }
 
 /// The result of splitting parsed declarations into their four kinds: value
@@ -241,6 +244,14 @@ fn int_value(magnitude: IntMagnitude, sign: Sign, span: Span) -> DResult<i64> {
     }
 }
 
+/// The frames from a chain's expression to a bare operand's atom.
+///
+/// An operand is parsed below the expression, application and postfix
+/// frames, none of which builds a node of its own, so a chain of bare atoms
+/// at depth `d` with `c` levels charged nests `d + c` deep. A deeper operand
+/// adds the levels it reaches past that atom.
+const OPERAND_ATOM_FRAMES: u32 = 3;
+
 /// The source nesting levels one operator of a chain is charged.
 ///
 /// A composition desugars to a lambda over two calls, so it is charged
@@ -282,6 +293,7 @@ impl<'a> Parser<'a> {
             toks,
             pos: 0,
             interner,
+            deepest: 0,
         }
     }
 
@@ -1443,6 +1455,7 @@ impl<'a> Parser<'a> {
         if depth > MAX_DEPTH {
             return Err(self.too_deep(Construct::Expression));
         }
+        let outer = std::mem::replace(&mut self.deepest, depth);
         let first = self.parse_app(threshold, depth + 1)?;
         let mut ops: Vec<(Expr, Located<Symbol>)> = Vec::new();
         let mut operand = first;
@@ -1450,18 +1463,27 @@ impl<'a> Parser<'a> {
         // downstream, so each operator is charged the levels its desugar nests
         // ([`op_nesting`]), cumulatively, or the chain escapes `MAX_DEPTH` and
         // overflows the recursive walkers (and Drop) that traverse the tree.
+        // Re-association can put any operand under the whole chain, so every
+        // operand is charged it: the chain's deepest operand level plus the
+        // levels charged must stay within the ceiling.
         let mut charged: u32 = 0;
         while let Some((op, op_span)) = self.peek_binop(threshold) {
             charged = charged.saturating_add(op_nesting(op));
-            let op_depth = depth.saturating_add(charged);
-            if op_depth > MAX_DEPTH {
+            if self.chain_too_deep(charged) {
                 return Err(self.too_deep(Construct::Expression));
             }
             let op_sym = self.intern(op.text())?;
             self.bump(Construct::Expression)?;
             ops.push((operand, Located::new(op_span, op_sym)));
             operand = self.parse_app(threshold, depth + 1)?;
+            if self.chain_too_deep(charged) {
+                return Err(Self::too_deep_at(op_span, Construct::Expression));
+            }
         }
+        // An enclosing chain charges this one's operands as nested under every
+        // level but the first, which sits where this expression's frame was.
+        let reached = self.deepest.saturating_add(charged.saturating_sub(1));
+        self.deepest = outer.max(reached);
         if ops.is_empty() {
             Ok(operand)
         } else {
@@ -1471,10 +1493,22 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// Whether a chain with `charged` levels over its deepest operand so far
+    /// nests past [`MAX_DEPTH`].
+    const fn chain_too_deep(&self, charged: u32) -> bool {
+        self.deepest.saturating_add(charged) > MAX_DEPTH + OPERAND_ATOM_FRAMES
+    }
+
+    /// Raise the deepest level reached to `depth`.
+    fn reach(&mut self, depth: u32) {
+        self.deepest = self.deepest.max(depth);
+    }
+
     fn parse_app(&mut self, threshold: u32, depth: u32) -> DResult<Expr> {
         if depth > MAX_DEPTH {
             return Err(self.too_deep(Construct::Expression));
         }
+        self.reach(depth);
         let head = self.parse_atom_postfix(threshold, depth + 1)?;
         let mut args = Vec::new();
         let mut end = head.span;
@@ -1574,6 +1608,7 @@ impl<'a> Parser<'a> {
     /// teaching diagnostic rather than silently parsed as field access.
     fn parse_atom_postfix(&mut self, threshold: u32, depth: u32) -> DResult<Expr> {
         let atom_depth = depth + 1;
+        self.reach(atom_depth);
         let mut expr = self.parse_atom(threshold, atom_depth)?;
         // Every `Access` this postfix run wraps around the atom nests one level
         // over the last, across every dotted token the run consumes.
@@ -1748,6 +1783,7 @@ impl<'a> Parser<'a> {
             let span = Span::new(base.span.lo, cursor);
             base = Located::new(span, Expr_::Access(Box::new(base), field));
             cursor = cursor.saturating_add(1); // step past the '.' before the next segment
+            self.reach(depth.saturating_add(seg_count));
         }
         Ok(base)
     }

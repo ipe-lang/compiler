@@ -457,6 +457,78 @@ fn operator_chain_is_refused_one_past_the_ceiling() {
     assert_eq!(boundary, ceiling() + 1, "each operator charges one level");
 }
 
+/// The parentheses around the deep operand of a chain-depth test.
+const OPERAND_PARENS: usize = 8;
+
+/// The levels each parenthesis adds over its contents: the `(` atom and the
+/// expression, application and postfix frames of the expression inside.
+const LEVELS_PER_PAREN: usize = 4;
+
+/// `1` wrapped in [`OPERAND_PARENS`] parentheses.
+fn deep_operand() -> String {
+    format!(
+        "{}1{}",
+        "(".repeat(OPERAND_PARENS),
+        ")".repeat(OPERAND_PARENS)
+    )
+}
+
+/// A chain whose first operand nests deep is charged the whole chain over
+/// that operand's depth, since re-association puts it under every operator.
+#[test]
+fn deep_first_operand_charges_the_chain() {
+    let build = |n: usize| {
+        let mut src = format!(
+            "module Main exposing (main)\n\nmain =\n    {}",
+            deep_operand()
+        );
+        let mut last = src.len();
+        for _ in 0..n {
+            last = src.len();
+            src.push_str(" + 1");
+        }
+        src.push('\n');
+        let offset = |at: usize| u32::try_from(at).unwrap_or(u32::MAX);
+        let tail = (offset(last), offset(src.len()));
+        (src, tail)
+    };
+    let boundary = assert_block_boundary(build, "deep first operand");
+    assert_eq!(
+        boundary,
+        ceiling() + 1 - LEVELS_PER_PAREN * OPERAND_PARENS,
+        "the chain is charged over its deepest operand"
+    );
+}
+
+/// A chain whose last operand nests deep is refused at the operator before
+/// it, once that operand is parsed, by the same count as a deep first one.
+#[test]
+fn deep_last_operand_charges_the_chain() {
+    let build = |n: usize| {
+        let mut src = String::from("module Main exposing (main)\n\nmain =\n    1");
+        let mut last = src.len();
+        for i in 0..n {
+            last = src.len();
+            if i + 1 == n {
+                src.push_str(" + ");
+                src.push_str(&deep_operand());
+            } else {
+                src.push_str(" + 1");
+            }
+        }
+        src.push('\n');
+        let offset = |at: usize| u32::try_from(at).unwrap_or(u32::MAX);
+        let tail = (offset(last), offset(src.len()));
+        (src, tail)
+    };
+    let boundary = assert_block_boundary(build, "deep last operand");
+    assert_eq!(
+        boundary,
+        ceiling() + 1 - LEVELS_PER_PAREN * OPERAND_PARENS,
+        "the chain is charged over its deepest operand"
+    );
+}
+
 /// An `else if` chain lowers to right-nested `If`s, so each `else if` charges
 /// one level: the `if` opens at depth 4 and its arms at 5, so the `k`-th
 /// `else if`'s condition atom sits at depth `8 + k`.
