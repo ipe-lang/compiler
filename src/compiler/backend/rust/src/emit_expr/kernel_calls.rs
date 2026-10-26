@@ -2357,10 +2357,19 @@ pub fn lookup_field<'f>(
 /// (E0382). Any other slot shape is a compiler bug, refused at ipe time.
 #[derive(Debug)]
 pub struct AdaptedHandler<'e> {
-    lets: Vec<(Symbol, &'e Expr)>,
+    lets: Vec<HandlerLet<'e>>,
     params: &'e [(Symbol, IrType)],
     ret: &'e IrType,
     body: &'e Expr,
+}
+
+/// One leading binding of an [`AdaptedHandler`].
+#[derive(Debug, Clone, Copy)]
+enum HandlerLet<'e> {
+    /// `let name = <value>;` from an [`Expr::Let`].
+    Value(Symbol, &'e Expr),
+    /// `let name = name.clone();`, one symbol of an [`Expr::CaptureClones`].
+    SelfClone(Symbol),
 }
 
 impl<'e> AdaptedHandler<'e> {
@@ -2374,9 +2383,18 @@ impl<'e> AdaptedHandler<'e> {
     pub fn from_ir(slot: &'e Expr, where_: &'static str) -> DResult<Self> {
         let mut lets = Vec::new();
         let mut core = slot;
-        while let Expr::Let { name, value, body } = core {
-            lets.push((*name, value.as_ref()));
-            core = body.as_ref();
+        loop {
+            core = match core {
+                Expr::Let { name, value, body } => {
+                    lets.push(HandlerLet::Value(*name, value.as_ref()));
+                    body.as_ref()
+                }
+                Expr::CaptureClones { syms, body } => {
+                    lets.extend(syms.iter().copied().map(HandlerLet::SelfClone));
+                    body.as_ref()
+                }
+                _ => break,
+            };
         }
         match core {
             Expr::Lambda { params, ret, body } | Expr::SharedLambda { params, ret, body } => {
@@ -2413,9 +2431,18 @@ impl<'e> AdaptedHandler<'e> {
         wrap: impl FnOnce(String) -> String,
     ) -> DResult<String> {
         let mut prefix = String::new();
-        for &(name, value) in &self.lets {
-            let name_s = ctx.emit_local_ident(name)?;
-            let value_s = emit_expr_at(ctx, value, indent, child, generics)?;
+        for binding in &self.lets {
+            let (name_s, value_s) = match *binding {
+                HandlerLet::Value(name, value) => (
+                    ctx.emit_local_ident(name)?,
+                    emit_expr_at(ctx, value, indent, child, generics)?,
+                ),
+                HandlerLet::SelfClone(name) => {
+                    let name_s = ctx.emit_local_ident(name)?;
+                    let value_s = format!("{name_s}.clone()");
+                    (name_s, value_s)
+                }
+            };
             write!(prefix, "let {name_s} = {value_s}; ").map_err(|e| Diagnostic::CompilerBug {
                 where_: "ipe_backend_rust::AdaptedHandler::emit",
                 detail: format!("fmt::Write into String failed: {e}"),

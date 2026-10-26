@@ -18,8 +18,8 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use ipe_diagnostics::Diagnostic;
-use ipe_intern::Symbol;
+use ipe_diagnostics::{Diagnostic, LowerError, Span};
+use ipe_intern::{Interner, Symbol};
 
 use crate::free_vars::pat_bound_symbols;
 use crate::once_closure::boundary_kind;
@@ -214,9 +214,30 @@ pub enum BorrowViolation {
 }
 
 impl BorrowViolation {
-    /// The compiler-bug diagnostic reporting this violation from `where_`.
+    /// The diagnostic reporting this violation in `owner` from `where_`.
+    ///
+    /// A body past the walk's ceiling is the emitter's own nesting refusal,
+    /// naming the function and its home; every other violation, and a depth
+    /// refusal whose function does not resolve through `interner`, is a
+    /// compiler bug.
     #[must_use]
-    pub fn into_diagnostic(self, where_: &'static str) -> Diagnostic {
+    pub fn into_diagnostic(
+        self,
+        owner: &Func,
+        interner: &Interner,
+        where_: &'static str,
+    ) -> Diagnostic {
+        if matches!(self, Self::TooDeep { .. })
+            && let Some(site) = owner.emit_site(interner)
+        {
+            return Diagnostic::Lower {
+                span: Span::DUMMY,
+                msg: LowerError::BackendNestingTooDeep {
+                    limit: MAX_IR_RENDER_DEPTH,
+                    func: Some(site),
+                },
+            };
+        }
         let detail = match self {
             Self::NonReadUse { func, param } => format!(
                 "function {} takes parameter {param:?} by reference but a use consumes it",
@@ -231,9 +252,11 @@ impl BorrowViolation {
                 func.as_raw(),
                 callee.as_raw()
             ),
-            Self::TooDeep { func } => format!(
-                "function {} nests deeper than {MAX_IR_RENDER_DEPTH} levels",
-                func.as_raw()
+            Self::TooDeep { func: id } => format!(
+                "function {} nests deeper than {MAX_IR_RENDER_DEPTH} levels and its name {:?} or home {:?} does not resolve",
+                id.as_raw(),
+                owner.name,
+                owner.home.0
             ),
         };
         Diagnostic::CompilerBug { where_, detail }
@@ -249,10 +272,14 @@ impl BorrowViolation {
 /// [`Diagnostic::CompilerBug`] when the program repeats a [`FuncId`], the
 /// fixpoint exceeds its declared bound, or the applied program fails
 /// [`verify`].
-pub fn run(program: &mut Program, eligible: impl Fn(&IrType) -> bool) -> Result<(), Diagnostic> {
+pub fn run(
+    program: &mut Program,
+    interner: &Interner,
+    eligible: impl Fn(&IrType) -> bool,
+) -> Result<(), Diagnostic> {
     let plan = analyze(program, eligible)?;
     apply(&plan, program);
-    verify_program(program, "ipe_ir::borrow::run")
+    verify_program(program, interner, "ipe_ir::borrow::run")
 }
 
 /// The whole-program borrow plan: the greatest fixpoint of "no consuming use".
@@ -388,13 +415,17 @@ pub fn apply(plan: &BorrowPlan, program: &mut Program) {
 /// Re-prove every function of `program` against the passes it carries.
 ///
 /// # Errors
-/// The first [`BorrowViolation`], as a [`Diagnostic::CompilerBug`] from
-/// `where_`.
-pub fn verify_program(program: &Program, where_: &'static str) -> Result<(), Diagnostic> {
+/// The first [`BorrowViolation`], as [`BorrowViolation::into_diagnostic`]
+/// renders it from `where_`.
+pub fn verify_program(
+    program: &Program,
+    interner: &Interner,
+    where_: &'static str,
+) -> Result<(), Diagnostic> {
     let table = PassTable::of_program(program);
     let payloads = program_payloads(program);
     for func in program.modules.iter().flat_map(|m| m.funcs.iter()) {
-        verify(func, &table, &payloads).map_err(|v| v.into_diagnostic(where_))?;
+        verify(func, &table, &payloads).map_err(|v| v.into_diagnostic(func, interner, where_))?;
     }
     Ok(())
 }
@@ -676,6 +707,12 @@ impl<'a> Walk<'a> {
                 self.expr(value, Pos::Other, deferred, next);
                 self.expr(body, Pos::Other, deferred, next);
             }
+            Expr::CaptureClones { syms, body } => {
+                for s in syms {
+                    self.occur(*s, Pos::Other, deferred);
+                }
+                self.expr(body, Pos::Other, deferred, next);
+            }
             Expr::If { cond, then_, else_ } => {
                 self.expr(cond, Pos::Other, deferred, next);
                 self.expr(then_, Pos::Other, deferred, next);
@@ -734,6 +771,10 @@ fn collect_binders(func: &Func, expr: &Expr, out: &mut BTreeSet<Symbol>, depth: 
         Expr::Let { name, value, body } => {
             out.insert(*name);
             go(value, out);
+            go(body, out);
+        }
+        Expr::CaptureClones { syms, body } => {
+            out.extend(syms.iter().copied());
             go(body, out);
         }
         Expr::Destructure {
@@ -1246,7 +1287,7 @@ mod tests {
             1,
             "the plan borrows the read-only slot"
         );
-        run(&mut prog, |_| true)?;
+        run(&mut prog, &interner, |_| true)?;
         assert_eq!(
             prog, before,
             "while the emitter renders no `&T` the program is unchanged"
@@ -1305,6 +1346,40 @@ mod tests {
             body: Box::new(read(p, x)),
         })?;
         assert!(matches!(out, Err(BorrowViolation::Rebound { .. })));
+        Ok(())
+    }
+
+    /// A body past the walk's ceiling is the emitter's nesting refusal,
+    /// IPE-L0200 naming the function and its home, not a compiler bug that
+    /// names a raw function id.
+    #[test]
+    fn borrow_depth_refusal_names_the_function() -> DResult<()> {
+        let refused = deep_walk(|| {
+            let mut interner = Interner::new();
+            let (home, name, p, x) = (
+                interner.intern("Main")?,
+                interner.intern("deep")?,
+                interner.intern("p")?,
+                interner.intern("x")?,
+            );
+            let depth = usize::from(MAX_IR_RENDER_DEPTH) + 4;
+            let mut f = func(F, name, vec![borrowed(p, IrType::Str)], deep(p, x, depth));
+            f.home = ModPath(vec![home]);
+            Ok(verify_program(&program(vec![f]), &interner, "borrow.tests"))
+        })?;
+        assert_eq!(
+            refused,
+            Err(Diagnostic::Lower {
+                span: Span::DUMMY,
+                msg: LowerError::BackendNestingTooDeep {
+                    limit: MAX_IR_RENDER_DEPTH,
+                    func: Some(ipe_diagnostics::EmitSite {
+                        home: Box::new(["Main".into()]),
+                        name: "deep".into(),
+                    }),
+                },
+            })
+        );
         Ok(())
     }
 
@@ -1396,7 +1471,7 @@ mod tests {
         let depth = usize::from(MAX_IR_RENDER_DEPTH) + 4;
         let params = vec![Param::owned(p, IrType::Str)];
         let prog = program(vec![func(F, name, params, deep(p, x, depth))]);
-        assert_eq!(verify_program(&prog, "test"), Ok(()));
+        assert_eq!(verify_program(&prog, &interner, "test"), Ok(()));
         Ok(())
     }
 
@@ -1406,7 +1481,7 @@ mod tests {
         let (name, p) = (interner.intern("f")?, interner.intern("p")?);
         let params = vec![borrowed(p, IrType::Str)];
         let prog = program(vec![func(F, name, params, Expr::Var(p))]);
-        let out = verify_program(&prog, "test");
+        let out = verify_program(&prog, &interner, "test");
         assert!(matches!(
             out,
             Err(Diagnostic::CompilerBug { where_: "test", .. })

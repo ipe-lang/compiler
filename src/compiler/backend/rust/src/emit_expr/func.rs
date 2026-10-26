@@ -8,7 +8,6 @@ use crate::EmitCtx;
 use crate::render::{LayoutSpend, render_code};
 use core::cell::RefCell;
 use core::fmt::Write as _;
-use ipe_diagnostics::EmitSite;
 use ipe_intern::rust_str_lit;
 use ipe_ir::once_closure::{ClosureSite, admitted_once_parts};
 
@@ -49,45 +48,28 @@ pub fn emit_expr_tail(
                 "{pad}if {c} {{\n{t}\n{pad}}} else {{\n{e}\n{pad}}}"
             ))
         }
-        Expr::Match(m) => {
-            let (scrut, mode) = emit_match_scrutinee(ctx, m, indent, depth, generics)?;
-            let arm_indent = indent_of(indent + 1);
-            let close_indent = indent_of(indent);
-            let mut arms = Vec::with_capacity(m.arms().len());
-            for arm in m.arms() {
-                let (patstr, prelude, synth_guard) = emit_arm_head(ctx, &arm.pat, &mode)?;
-                // The arm body is a STATEMENT sequence ending in return/continue;
-                // any binder-rebind prelude precedes it inside the arm's block.
-                let body =
-                    emit_expr_tail(ctx, &arm.body, indent + 2, child, generics, loop_params)?;
-                let inner = if prelude.is_empty() {
-                    body
-                } else {
-                    format!("{}{body}", tail_arm_prelude_lines(&prelude, indent + 2)?)
-                };
-                // Same `if <guard>` fall-through as the value-context emitter: the
-                // list-length arm guard and the synthesized `as_str()` string-
-                // column guard are ANDed; `None` leaves the arm guardless.
-                let ir_guard = match &arm.guard {
-                    Some(g) => Some(emit_expr_at(ctx, g, indent + 1, child, generics)?),
-                    None => None,
-                };
-                let guard_clause = combine_guards(synth_guard, ir_guard)
-                    .map_or_else(String::new, |guard| format!(" if {guard}"));
-                arms.push(format!(
-                    "{arm_indent}{patstr}{guard_clause} => {{\n{inner}\n{arm_indent}}}"
-                ));
-            }
-            Ok(format!(
-                "{pad}match {scrut} {{\n{}\n{close_indent}}}",
-                arms.join("\n")
-            ))
-        }
+        Expr::Match(m) => emit_match_tail(ctx, m, indent, depth, generics, loop_params),
         Expr::Let { name, value, body } => {
             let n = ctx.emit_local_ident(*name)?;
             let v = emit_expr_at(ctx, value, indent, child, generics)?;
             let b = emit_expr_tail(ctx, body, indent, child, generics, loop_params)?;
             Ok(format!("{pad}let {n} = {v};\n{b}"))
+        }
+        // Each pre-clone is its own statement, as the self-clone `let`s it
+        // stands for; only the body is in tail position.
+        Expr::CaptureClones { syms, body } => {
+            let mut out = String::new();
+            for sym in syms {
+                let n = ctx.emit_local_ident(*sym)?;
+                writeln!(out, "{pad}let {n} = {n}.clone();").map_err(|e| {
+                    Diagnostic::CompilerBug {
+                        where_: "ipe_backend_rust::emit_expr_tail",
+                        detail: format!("writing a pre-clone statement failed: {e}"),
+                    }
+                })?;
+            }
+            let b = emit_expr_tail(ctx, body, indent, child, generics, loop_params)?;
+            Ok(format!("{out}{b}"))
         }
         Expr::Destructure {
             binder,
@@ -148,6 +130,52 @@ pub fn emit_expr_tail(
             Ok(format!("{pad}return {v};"))
         }
     }
+}
+
+/// The `Match` arm of [`emit_expr_tail`]: every arm body stays a tail statement
+/// sequence ending in `return` / `continue`.
+#[inline(never)]
+fn emit_match_tail(
+    ctx: &EmitCtx,
+    m: &ipe_ir::Match,
+    indent: usize,
+    depth: u16,
+    generics: GenericScope,
+    loop_params: &[(Symbol, IrType)],
+) -> DResult<String> {
+    let pad = indent_of(indent);
+    let child = depth + 1;
+    let (scrut, mode) = emit_match_scrutinee(ctx, m, indent, depth, generics)?;
+    let arm_indent = indent_of(indent + 1);
+    let close_indent = indent_of(indent);
+    let mut arms = Vec::with_capacity(m.arms().len());
+    for arm in m.arms() {
+        let (patstr, prelude, synth_guard) = emit_arm_head(ctx, &arm.pat, &mode)?;
+        // The arm body is a STATEMENT sequence ending in return/continue;
+        // any binder-rebind prelude precedes it inside the arm's block.
+        let body = emit_expr_tail(ctx, &arm.body, indent + 2, child, generics, loop_params)?;
+        let inner = if prelude.is_empty() {
+            body
+        } else {
+            format!("{}{body}", tail_arm_prelude_lines(&prelude, indent + 2)?)
+        };
+        // Same `if <guard>` fall-through as the value-context emitter: the
+        // list-length arm guard and the synthesized `as_str()` string-
+        // column guard are ANDed; `None` leaves the arm guardless.
+        let ir_guard = match &arm.guard {
+            Some(g) => Some(emit_expr_at(ctx, g, indent + 1, child, generics)?),
+            None => None,
+        };
+        let guard_clause = combine_guards(synth_guard, ir_guard)
+            .map_or_else(String::new, |guard| format!(" if {guard}"));
+        arms.push(format!(
+            "{arm_indent}{patstr}{guard_clause} => {{\n{inner}\n{arm_indent}}}"
+        ));
+    }
+    Ok(format!(
+        "{pad}match {scrut} {{\n{}\n{close_indent}}}",
+        arms.join("\n")
+    ))
 }
 
 /// Emit an application of a first-class function value, `(<func>)(<args>)`. The
@@ -620,6 +648,10 @@ pub fn elide_task_run_tail(expr: &Expr) -> Option<Expr> {
                 body: Box::new(body_e),
             })
         }
+        Expr::CaptureClones { syms, body } => {
+            let body_e = elide_task_run_tail(body)?;
+            Some(Expr::pre_clone_all(syms.clone(), body_e))
+        }
         Expr::Destructure {
             binder,
             value,
@@ -826,38 +858,45 @@ fn name_nesting_site(ctx: &EmitCtx, func: &Func, diag: Diagnostic) -> Diagnostic
         Diagnostic::Lower {
             span,
             msg: LowerError::BackendNestingTooDeep { limit, func: None },
-        } => Diagnostic::Lower {
-            span,
-            msg: LowerError::BackendNestingTooDeep {
-                limit,
-                func: emit_site(ctx, func),
+        } => func.emit_site(ctx.interner).map_or_else(
+            || unresolved_site(func),
+            |site| Diagnostic::Lower {
+                span,
+                msg: LowerError::BackendNestingTooDeep {
+                    limit,
+                    func: Some(site),
+                },
             },
-        },
+        ),
         Diagnostic::Lower {
             span,
             msg: LowerError::BackendTypeTooDeep { limit, func: None },
-        } => Diagnostic::Lower {
-            span,
-            msg: LowerError::BackendTypeTooDeep {
-                limit,
-                func: emit_site(ctx, func),
+        } => func.emit_site(ctx.interner).map_or_else(
+            || unresolved_site(func),
+            |site| Diagnostic::Lower {
+                span,
+                msg: LowerError::BackendTypeTooDeep {
+                    limit,
+                    func: Some(site),
+                },
             },
-        },
+        ),
         other => other,
     }
 }
 
-/// The source-level name and home of `func`, or `None` when a symbol does not
-/// resolve through the build's interner.
-fn emit_site(ctx: &EmitCtx, func: &Func) -> Option<EmitSite> {
-    let home = func
-        .home
-        .0
-        .iter()
-        .map(|segment| ctx.interner.resolve(*segment).map(Box::<str>::from))
-        .collect::<Option<Box<[Box<str>]>>>()?;
-    let name = ctx.interner.resolve(func.name)?.into();
-    Some(EmitSite { home, name })
+/// The compiler bug for a nesting refusal in a function whose name or home
+/// does not resolve through the build's interner.
+fn unresolved_site(func: &Func) -> Diagnostic {
+    Diagnostic::CompilerBug {
+        where_: "ipe_backend_rust::emit_func",
+        detail: format!(
+            "function {} nests past the emit ceiling and its name {:?} or home {:?} does not resolve",
+            func.id.as_raw(),
+            func.name,
+            func.home.0
+        ),
+    }
 }
 
 /// [`emit_func_vis`] before the function is named on a nesting refusal.

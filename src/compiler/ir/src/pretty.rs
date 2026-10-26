@@ -828,6 +828,11 @@ fn write_expr_at(out: &mut String, expr: &Expr, interner: &Interner, level: usiz
                 write_expr_at(out, arg, interner, level + 1, depth);
             }
         }
+        Expr::CaptureClones { syms, body } => {
+            let names: Vec<String> = syms.iter().map(|s| sym_name(interner, *s)).collect();
+            line(out, level, &format!("CaptureClones {}", names.join(", ")));
+            write_expr_at(out, body, interner, level + 1, depth);
+        }
     }
 }
 

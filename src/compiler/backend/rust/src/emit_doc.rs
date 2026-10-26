@@ -325,6 +325,13 @@ pub fn build_doc(
             build_let(ctx, *name, value, body, indent, child, generics)
         }
 
+        // A pre-clone run `({ let a = a.clone(); let b = b.clone(); body })`:
+        // one block whatever the number of symbols, each clone `let` on its own
+        // line, laid out as the one-statement `let` block above.
+        Expr::CaptureClones { syms, body } => {
+            build_capture_clones(ctx, syms, body, indent, child, generics)
+        }
+
         // A `Destructure` block `({ <binding stmts> <body> })`. Like the `let`
         // block, but its binder may expand to MULTIPLE `let` statements
         // (`emit_binding_stmts`: one flat `let <pat> = <value>;` for an alias-free
@@ -1318,6 +1325,36 @@ fn build_let(
     ]))
 }
 
+/// Build the `Doc` for a pre-clone block, mirroring [`crate::emit_expr::emit_expr_at`]'s `Expr::CaptureClones` arm token-for-token.
+///
+/// Each `let <sym> = <sym>.clone();` statement is a leaf on its own
+/// `HardLine`, and the body follows on a further `HardLine`, all inside the
+/// block's sole `Nest(4)`. A single symbol renders exactly as the self-clone
+/// `let` block [`build_let`] builds.
+fn build_capture_clones(
+    ctx: &EmitCtx,
+    syms: &[Symbol],
+    body: &Expr,
+    indent: usize,
+    child: u16,
+    generics: GenericScope,
+) -> DResult<Doc> {
+    let mut inner = Vec::with_capacity(syms.len() * 2 + 2);
+    for sym in syms {
+        let name_s = ctx.emit_local_ident(*sym)?;
+        inner.push(Doc::HardLine);
+        inner.push(Doc::owned(format!("let {name_s} = {name_s}.clone();"))?);
+    }
+    inner.push(Doc::HardLine);
+    inner.push(build_doc(ctx, body, indent, child, generics)?);
+    Ok(Doc::concat(vec![
+        Doc::text(leaf!("({")),
+        Doc::nest(4, Doc::concat(inner)),
+        Doc::HardLine,
+        Doc::text(leaf!("})")),
+    ]))
+}
+
 /// Build the `Doc` for a `Destructure` block, mirroring
 /// [`crate::emit_expr::emit_expr_at`]'s `Expr::Destructure` arm token-for-token.
 ///
@@ -1898,7 +1935,7 @@ fn build_applied_lambda(
 /// brackets (keeping the comma). This mirrors `rustfmt`'s arm-body rule: a call /
 /// constructor / application / tuple / list / cons / record / `task_and_then`
 /// tail overflows into its own argument list, so no braces are synthesized; an
-/// `if` / binary-operator chain / `let` / destructure / update / sync task block
+/// `if` / binary-operator chain / `let` / pre-clone / destructure / update / sync task block
 /// is parenthesized or block-shaped and gets wrapped.
 ///
 /// A body that is not one of the structured shapes (a plain leaf) is treated as
@@ -1908,7 +1945,11 @@ fn build_applied_lambda(
 const fn arm_body_is_control(body: &Expr) -> bool {
     match body {
         // Parenthesized or block-shaped: wrapped in synthesized braces when broken.
-        Expr::If { .. } | Expr::Let { .. } | Expr::Destructure { .. } | Expr::Update { .. } => true,
+        Expr::If { .. }
+        | Expr::Let { .. }
+        | Expr::CaptureClones { .. }
+        | Expr::Destructure { .. }
+        | Expr::Update { .. } => true,
         // A chain-eligible binary operator renders `(a + b)` and wraps when broken;
         // the call-shaped `Append` / `IntDiv` are leaves (delimited-tail).
         Expr::BinOp { op, .. } => infix(*op).is_some(),

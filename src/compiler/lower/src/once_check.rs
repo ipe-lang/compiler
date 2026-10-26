@@ -58,7 +58,8 @@ const fn closure_arity(func: &Expr) -> usize {
         | Expr::FuncValue { .. }
         | Expr::TaskSeq { .. }
         | Expr::TailLoop { .. }
-        | Expr::TailRecur { .. } => 0,
+        | Expr::TailRecur { .. }
+        | Expr::CaptureClones { .. } => 0,
     }
 }
 
@@ -147,7 +148,8 @@ fn check(expr: &Expr, site: &ClosureSite<'_>) -> DResult<()> {
         }
         Expr::Lambda { body, .. }
         | Expr::SharedLambda { body, .. }
-        | Expr::TailLoop { body, .. } => check(body, &ClosureSite::Other),
+        | Expr::TailLoop { body, .. }
+        | Expr::CaptureClones { body, .. } => check(body, &ClosureSite::Other),
         Expr::TaskSeq { effect, rest } => check_all([effect.as_ref(), rest.as_ref()]),
     }
 }
@@ -268,11 +270,7 @@ mod tests {
     fn a_pre_cloned_once_closure_in_an_admitted_slot_refuses() -> DResult<()> {
         let mut i = Interner::new();
         let m = i.intern("m")?;
-        let wrapped = Expr::Let {
-            name: m,
-            value: Box::new(Expr::CloneVar(m)),
-            body: Box::new(once(&mut i)?),
-        };
+        let wrapped = Expr::pre_clone(m, once(&mut i)?);
         let and_then = kernel_call(KernelFn::TaskAndThen, vec![wrapped, Expr::Unit]);
         assert!(refused_at(&check_once_closures(&and_then), 7, 8));
         Ok(())
