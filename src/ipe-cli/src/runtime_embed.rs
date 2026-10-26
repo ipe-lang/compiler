@@ -581,8 +581,24 @@ pub fn materialize() -> Result<ResolvedRuntime, CliError> {
     })
 }
 
-/// Resolve the runtime crate root for the dependency-model emit. The resolution
-/// chain, in order:
+/// Who chooses the runtime crate an emitted project links.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum RuntimeOrigin {
+    /// A developer build: `$IPE_RUNTIME_DIR`, else an in-repo crate above the
+    /// current directory, else the embedded copy (see [`resolve`]).
+    #[default]
+    Developer,
+    /// A gate judging a package: always the compiler's embedded copy.
+    ///
+    /// No override and no directory walk is consulted, so neither the
+    /// environment nor a runtime tree the judged package ships can stand in for
+    /// it.
+    Gate,
+}
+
+/// Resolve the runtime crate root for the dependency-model emit.
+///
+/// The resolution chain, in order:
 ///
 /// 1. `$IPE_RUNTIME_DIR` — an explicit override (dev / advanced). It may name the
 ///    runtime crate root (`Cargo.toml` declaring [`RUNTIME_PACKAGE`]) or any path
@@ -607,14 +623,46 @@ pub fn materialize() -> Result<ResolvedRuntime, CliError> {
 ///   version is not the compiler's.
 /// - Any error from [`materialize`] when the embedded fallback is taken.
 pub fn resolve() -> Result<ResolvedRuntime, CliError> {
-    let resolved = if let Some(dir) = ipe_env::var_os("IPE_RUNTIME_DIR") {
-        resolve_override(&PathBuf::from(dir))?
-    } else if let Some(in_repo) = resolve_in_repo()? {
-        in_repo
-    } else {
-        materialize()?
+    resolve_for(RuntimeOrigin::Developer)
+}
+
+/// Resolve the runtime crate root `origin` allows.
+///
+/// [`RuntimeOrigin::Developer`] is the [`resolve`] chain;
+/// [`RuntimeOrigin::Gate`] is [`materialize`] alone.
+///
+/// # Errors
+/// As [`resolve`] for a developer build; as [`materialize`] for a gate.
+pub fn resolve_for(origin: RuntimeOrigin) -> Result<ResolvedRuntime, CliError> {
+    resolve_through(origin, developer_runtime, materialize)
+}
+
+/// The resolution of `origin`, given the developer's ambient lookup and the embedded copy.
+fn resolve_through(
+    origin: RuntimeOrigin,
+    developer: impl FnOnce() -> Result<Option<ResolvedRuntime>, CliError>,
+    embedded: impl FnOnce() -> Result<ResolvedRuntime, CliError>,
+) -> Result<ResolvedRuntime, CliError> {
+    let resolved = match origin {
+        RuntimeOrigin::Gate => embedded()?,
+        RuntimeOrigin::Developer => developer()?.map_or_else(embedded, Ok)?,
     };
     check_version(resolved)
+}
+
+/// The developer's ambient runtime: the override, else an in-repo crate.
+///
+/// `$IPE_RUNTIME_DIR` when set, else an in-repo crate above the current
+/// directory; `Ok(None)` means neither names one.
+fn developer_runtime() -> Result<Option<ResolvedRuntime>, CliError> {
+    if let Some(dir) = ipe_env::var_os("IPE_RUNTIME_DIR") {
+        return resolve_override(&PathBuf::from(dir)).map(Some);
+    }
+    let cwd = std::env::current_dir().map_err(|e| CliError::Io {
+        path: PathBuf::from("."),
+        source: e,
+    })?;
+    resolve_in_repo(&cwd)
 }
 
 /// Refuse a resolved runtime whose declared version is not the compiler's own.
@@ -636,6 +684,20 @@ fn check_version(resolved: ResolvedRuntime) -> Result<ResolvedRuntime, CliError>
     }
 }
 
+/// The most directories a runtime lookup visits, its start included.
+#[derive(Clone, Copy, Debug)]
+struct AncestorCeiling(usize);
+
+impl AncestorCeiling {
+    /// `start` and its ancestors, nearest first, cut at the ceiling.
+    fn ancestors(self, start: &Path) -> std::iter::Take<std::path::Ancestors<'_>> {
+        start.ancestors().take(self.0)
+    }
+}
+
+/// The ceiling of the override and in-repo runtime lookups.
+const RUNTIME_LOOKUP_CEILING: AncestorCeiling = AncestorCeiling(64);
+
 /// Resolve the `$IPE_RUNTIME_DIR` override: verify it names a runtime crate root,
 /// else a loud, typed refusal (with a targeted hint when it points at the inner
 /// module directory).
@@ -645,14 +707,13 @@ fn resolve_override(path: &Path) -> Result<ResolvedRuntime, CliError> {
     // walking up to the crate root that holds `Cargo.toml`. This keeps every
     // existing `IPE_RUNTIME_DIR` setting working across the meaning change from
     // "source tree" to "crate root".
-    let mut here: Option<&Path> = Some(path);
-    while let Some(dir) = here {
+    for dir in RUNTIME_LOOKUP_CEILING.ancestors(path) {
         if let Some(resolved) = verify(dir)? {
             return Ok(resolved);
         }
-        here = dir.parent();
     }
-    // Nothing at or above the given path names a runtime crate root.
+    // Nothing within the ceiling at or above the given path names a runtime
+    // crate root.
     let points_at_inner = path.file_name() == Some(std::ffi::OsStr::new("ipe_runtime"))
         || path.ends_with("rust/src")
         || path.ends_with("runtime/rust/src");
@@ -662,21 +723,16 @@ fn resolve_override(path: &Path) -> Result<ResolvedRuntime, CliError> {
     })
 }
 
-/// Upward walk from the current directory for the in-repo `src/runtime/rust`
-/// crate root. `Ok(None)` means no in-repo runtime is above the current
-/// directory (the normal case for an installed binary run outside a checkout).
-fn resolve_in_repo() -> Result<Option<ResolvedRuntime>, CliError> {
-    let cwd = std::env::current_dir().map_err(|e| CliError::Io {
-        path: PathBuf::from("."),
-        source: e,
-    })?;
-    let mut here: Option<&Path> = Some(cwd.as_path());
-    while let Some(dir) = here {
+/// Upward walk from `start` for the in-repo `src/runtime/rust` crate root.
+///
+/// `Ok(None)` means no in-repo runtime is within the ceiling above `start` (the
+/// normal case for an installed binary run outside a checkout).
+fn resolve_in_repo(start: &Path) -> Result<Option<ResolvedRuntime>, CliError> {
+    for dir in RUNTIME_LOOKUP_CEILING.ancestors(start) {
         let candidate = dir.join("src").join("runtime").join("rust");
         if let Some(resolved) = verify(&candidate)? {
             return Ok(Some(resolved));
         }
-        here = dir.parent();
     }
     Ok(None)
 }
@@ -973,5 +1029,126 @@ mod tests {
             prepare_bundled_manifest("[dependencies]\n", "1.0.0"),
             Err(BundleFault::Manifest(ManifestFault::NoPackageTable))
         ));
+    }
+
+    /// A runtime root declaring the compiler's version, at a path no lookup reads.
+    fn planted_runtime(tag: &str) -> ResolvedRuntime {
+        ResolvedRuntime {
+            root: PathBuf::from(format!("/nonexistent/{tag}/rust")),
+            version: COMPILER_VERSION.to_owned(),
+        }
+    }
+
+    /// A gate takes the embedded copy and never consults the developer's lookup,
+    /// even when that lookup would name another runtime.
+    #[test]
+    fn a_gate_resolves_only_the_embedded_runtime() {
+        let consulted = std::cell::Cell::new(false);
+        let resolved = resolve_through(
+            RuntimeOrigin::Gate,
+            || {
+                consulted.set(true);
+                Ok(Some(planted_runtime("override")))
+            },
+            || Ok(planted_runtime("embedded")),
+        )
+        .expect("the embedded copy resolves");
+        assert_eq!(resolved, planted_runtime("embedded"));
+        assert!(
+            !consulted.get(),
+            "a gate never reads the override or the walk"
+        );
+    }
+
+    /// The control: a developer build takes the override when one names a runtime,
+    /// and the embedded copy only when none does.
+    #[test]
+    fn a_developer_build_prefers_its_ambient_runtime() {
+        let ambient = resolve_through(
+            RuntimeOrigin::Developer,
+            || Ok(Some(planted_runtime("override"))),
+            || Ok(planted_runtime("embedded")),
+        )
+        .expect("the override resolves");
+        assert_eq!(ambient, planted_runtime("override"));
+        let fallback = resolve_through(
+            RuntimeOrigin::Developer,
+            || Ok(None),
+            || Ok(planted_runtime("embedded")),
+        )
+        .expect("the embedded copy resolves");
+        assert_eq!(fallback, planted_runtime("embedded"));
+    }
+
+    /// A gate's embedded copy is held to the compiler's version like any other.
+    #[test]
+    fn a_gate_refuses_an_embedded_copy_of_another_version() {
+        let err = resolve_through(
+            RuntimeOrigin::Gate,
+            || Ok(None),
+            || {
+                Ok(ResolvedRuntime {
+                    root: PathBuf::from("/nonexistent/stale/rust"),
+                    version: String::from("0.0.0-stale"),
+                })
+            },
+        )
+        .expect_err("a mismatched version is refused");
+        assert!(matches!(err, CliError::RuntimeVersionMismatch { .. }));
+    }
+
+    /// `root` with `levels` nested `d` directories below it.
+    fn nested(root: &Path, levels: usize) -> PathBuf {
+        (0..levels).fold(root.to_path_buf(), |path, _| path.join("d"))
+    }
+
+    /// The override lookup stops at its ceiling: a crate root one directory past
+    /// the last one it visits is not found.
+    #[test]
+    fn the_override_lookup_stops_at_its_ceiling() {
+        let root = crate::scratch::ScratchDir::new("ipe-runtime-ceiling-override")
+            .expect("scratch dir")
+            .into_path();
+        std::fs::write(
+            root.join(MANIFEST),
+            format!("[package]\nname = \"{RUNTIME_PACKAGE}\"\nversion = \"{COMPILER_VERSION}\"\n"),
+        )
+        .expect("write manifest");
+        let AncestorCeiling(ceiling) = RUNTIME_LOOKUP_CEILING;
+        let within = resolve_override(&nested(&root, ceiling - 1));
+        let past = resolve_override(&nested(&root, ceiling));
+        let _ = std::fs::remove_dir_all(&root);
+        assert!(within.is_ok(), "the last visited ancestor is found");
+        assert!(
+            matches!(past, Err(CliError::RuntimeDirInvalid { .. })),
+            "a crate root past the ceiling is refused"
+        );
+    }
+
+    /// The in-repo lookup stops at its ceiling the same way.
+    #[test]
+    fn the_in_repo_lookup_stops_at_its_ceiling() {
+        let root = crate::scratch::ScratchDir::new("ipe-runtime-ceiling-in-repo")
+            .expect("scratch dir")
+            .into_path();
+        let crate_root = root.join("src").join("runtime").join("rust");
+        std::fs::create_dir_all(&crate_root).expect("create runtime root");
+        std::fs::write(
+            crate_root.join(MANIFEST),
+            format!("[package]\nname = \"{RUNTIME_PACKAGE}\"\nversion = \"{COMPILER_VERSION}\"\n"),
+        )
+        .expect("write manifest");
+        let AncestorCeiling(ceiling) = RUNTIME_LOOKUP_CEILING;
+        let within = resolve_in_repo(&nested(&root, ceiling - 1));
+        let past = resolve_in_repo(&nested(&root, ceiling));
+        let _ = std::fs::remove_dir_all(&root);
+        assert!(
+            matches!(within, Ok(Some(_))),
+            "the last visited ancestor is found"
+        );
+        assert!(
+            matches!(past, Ok(None)),
+            "a crate root past the ceiling is not found"
+        );
     }
 }

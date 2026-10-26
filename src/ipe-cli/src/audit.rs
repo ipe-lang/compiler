@@ -952,25 +952,19 @@ fn prepare(snapshot: PackageSnapshot) -> Result<Prepared, CliError> {
     // `audit_scratch_dir` creates the directory exclusively with 128-bit OS
     // entropy — no stale-dir removal needed; a fresh exclusive dir is always empty.
     let emitted_dir = audit_scratch_dir(&manifest.name)?;
-    // Resolve the runtime exactly as `ipe dev build` does — one resolver for every
-    // command. Under the default dependency model the emitted project names the
-    // runtime as a path dependency, which the build materializes from the
-    // embedded source under `IPE_HOME`; no vendored module tree is needed, so an
-    // empty sentinel is passed and `build_project` never reads it. Only the
-    // vendored/wasm shape needs a concrete module tree. Resolving here through a
-    // separate walk-up (that never materialized) is what made `audit` fail on a
-    // clean machine while `build` succeeded.
-    let runtime_dir = crate::resolve_vendored_runtime_dir(None, !crate::runtime_dep_from_env())?;
     // The FFI interface modules and `src/ffi.rs` text are assembled AFTER the
     // regeneration above, so the set holds the gate-owned bindings.
     let sources = crate::driver::PackageSourceSet::from_snapshot(&snapshot)?;
+    // The gate's emit takes no runtime and no options: the emitted project links
+    // the runtime embedded in this binary, materialized under `IPE_HOME`, never
+    // an `IPE_RUNTIME_DIR` override, an `IPE_RUNTIME_VENDORED` tree, or a runtime
+    // crate found above the working directory — the judged package could ship
+    // that one.
     crate::driver::build_from_sources(
         manifest,
         &manifest_path,
         sources.clone(),
         crate::driver::OutTarget::Path(&emitted_dir),
-        &runtime_dir,
-        &crate::driver::BuildOptions::from_env(),
     )?;
 
     Ok(Prepared {
@@ -4002,36 +3996,6 @@ mod tests {
         );
     }
 
-    // ── Runtime resolution ───────────────────────────────────────────────────
-
-    /// `prepare` resolves the runtime through the SAME path `ipe dev build` uses — the
-    /// materialize-capable resolver — never a separate walk-up that cannot
-    /// materialize. Under the default dependency model no vendored module tree is
-    /// needed, so with `IPE_RUNTIME_DIR` unset the resolution succeeds with an
-    /// empty sentinel (the emitted project names the runtime as a path dependency
-    /// the build materializes). This is the property whose absence made `audit`
-    /// fail on a clean machine where `build` succeeded; a regression that re-splits
-    /// the path (calling `resolve_runtime`, which walks up for an in-repo tree and
-    /// errors when none is found) fails here.
-    #[test]
-    fn audit_runtime_resolution_needs_no_in_repo_tree_under_the_dep_model() {
-        // The dependency model is the default. Only the vendored/wasm shape needs a
-        // concrete module tree; the default does not, so resolution yields the
-        // empty sentinel with no `IPE_RUNTIME_DIR` and no in-repo walk-up.
-        let needs_vendored = !crate::runtime_dep_from_env();
-        assert!(
-            !needs_vendored,
-            "the default dependency model must not require a vendored runtime tree"
-        );
-        let resolved = crate::resolve_vendored_runtime_dir(None, needs_vendored)
-            .expect("the dep-model runtime resolution must not require an in-repo tree");
-        assert_eq!(
-            resolved,
-            PathBuf::new(),
-            "the dep-model path returns the empty sentinel; the build materializes the runtime"
-        );
-    }
-
     // --- deny_args placement tests ---
 
     /// cargo-deny >= 0.20: `--config` must appear BEFORE `check`, as a global option.
@@ -4297,12 +4261,15 @@ mod tests {
         }
 
         /// Names whose qualified mention in production code is an ambient read:
-        /// the process environment, the working directory, a runtime tree found
-        /// from either, the sandbox facts.
+        /// the process environment, the working directory, a runtime tree or
+        /// emit model found from either, the sandbox facts.
         const AMBIENT_READS: &[&str] = &[
             "current_dir",
+            "from_env",
             "resolve_runtime",
             "resolve_runtime_src",
+            "resolve_vendored_runtime_dir",
+            "runtime_dep_from_env",
             "var",
             "var_os",
             "vars",
@@ -4314,6 +4281,14 @@ mod tests {
 
         /// Macros that read the build or process environment.
         const AMBIENT_MACROS: &[&str] = &["env", "option_env"];
+
+        /// Modules and types the gate never names.
+        ///
+        /// Each offers a runtime crate, or a set of build options, that a
+        /// developer resolver fills from the environment or the working
+        /// directory; any segment of a path, a `use`, or a macro argument naming
+        /// one is a hit, alias and re-export forms included.
+        const AMBIENT_OWNERS: &[&str] = &["runtime_embed", "BuildOptions"];
 
         /// The one production function allowed to read the sandbox facts.
         const POSTURE_SITE: &str = "establish";
@@ -4331,8 +4306,10 @@ mod tests {
         /// A qualified path (`std::env::current_dir`, `ipe_sandbox::probe`), a
         /// `use` of the name (which would let a bare call stand for it), a
         /// macro path (`env!`), and a `::name` token inside any macro's
-        /// arguments all count; a bare local named like one does not. Items
-        /// under `#[cfg(test)]` are skipped.
+        /// arguments all count; a bare local named like one does not. An
+        /// [`AMBIENT_OWNERS`] name counts wherever it appears in a path, a
+        /// `use` tree, or a macro's arguments. Items under `#[cfg(test)]` are
+        /// skipped.
         #[derive(Default)]
         struct AmbientReads {
             scope: Vec<String>,
@@ -4350,6 +4327,11 @@ mod tests {
             }
 
             fn qualified_path(&mut self, path: &syn::Path) {
+                for segment in &path.segments {
+                    if let Some(owner) = AMBIENT_OWNERS.iter().find(|n| segment.ident == **n) {
+                        self.hit(owner);
+                    }
+                }
                 if path.segments.len() < 2 {
                     return;
                 }
@@ -4360,12 +4342,15 @@ mod tests {
                 }
             }
 
-            /// Every `::name` ident of a macro's unparsed tokens.
+            /// Every `::name` ident, and every owner ident, of a macro's unparsed tokens.
             fn tokens(&mut self, stream: proc_macro2::TokenStream) {
                 let mut after_colon = false;
                 for tree in stream {
                     match tree {
                         proc_macro2::TokenTree::Ident(ident) => {
+                            if let Some(owner) = AMBIENT_OWNERS.iter().find(|n| ident == **n) {
+                                self.hit(owner);
+                            }
                             if after_colon
                                 && let Some(name) = AMBIENT_READS.iter().find(|n| ident == **n)
                             {
@@ -4455,14 +4440,29 @@ mod tests {
                 syn::visit::visit_path(self, path);
             }
 
+            fn visit_use_path(&mut self, path: &'ast syn::UsePath) {
+                if let Some(owner) = AMBIENT_OWNERS.iter().find(|n| path.ident == **n) {
+                    self.hit(owner);
+                }
+                syn::visit::visit_use_path(self, path);
+            }
+
             fn visit_use_name(&mut self, name: &'ast syn::UseName) {
-                if let Some(found) = AMBIENT_READS.iter().find(|n| name.ident == **n) {
+                if let Some(found) = AMBIENT_READS
+                    .iter()
+                    .chain(AMBIENT_OWNERS)
+                    .find(|n| name.ident == **n)
+                {
                     self.hit(found);
                 }
             }
 
             fn visit_use_rename(&mut self, rename: &'ast syn::UseRename) {
-                if let Some(found) = AMBIENT_READS.iter().find(|n| rename.ident == **n) {
+                if let Some(found) = AMBIENT_READS
+                    .iter()
+                    .chain(AMBIENT_OWNERS)
+                    .find(|n| rename.ident == **n)
+                {
                     self.hit(found);
                 }
             }
@@ -4534,6 +4534,84 @@ mod tests {
                 Some(&1),
                 "a runtime tree resolved from the cwd or the environment is an ambient read"
             );
+        }
+
+        #[test]
+        fn the_ambient_scan_sees_a_vendored_runtime_resolution() {
+            let mutated = format!(
+                "{AUDIT_SOURCE}\nfn vendored_tree() -> bool {{ crate::resolve_vendored_runtime_dir(None, true).is_ok() }}\n"
+            );
+            let hits = ambient_reads(&mutated).unwrap_or_default();
+            assert_eq!(
+                hits.get(&(
+                    String::from("vendored_tree"),
+                    String::from("resolve_vendored_runtime_dir")
+                )),
+                Some(&1),
+                "a vendored runtime tree resolved from the cwd or the environment is a hit"
+            );
+        }
+
+        #[test]
+        fn the_ambient_scan_sees_an_environment_emit_model() {
+            let mutated = format!(
+                "{AUDIT_SOURCE}\nfn emit_model() -> bool {{ crate::runtime_dep_from_env() }}\n"
+            );
+            let hits = ambient_reads(&mutated).unwrap_or_default();
+            assert_eq!(
+                hits.get(&(
+                    String::from("emit_model"),
+                    String::from("runtime_dep_from_env")
+                )),
+                Some(&1),
+                "an emit model read from the environment is a hit"
+            );
+        }
+
+        #[test]
+        fn the_ambient_scan_sees_caller_build_options() {
+            let mutated = format!(
+                "{AUDIT_SOURCE}\nfn options() -> bool {{ crate::driver::BuildOptions::from_env().runtime_dep }}\n"
+            );
+            let hits = ambient_reads(&mutated).unwrap_or_default();
+            for name in ["BuildOptions", "from_env"] {
+                assert_eq!(
+                    hits.get(&(String::from("options"), String::from(name))),
+                    Some(&1),
+                    "build options filled from the environment are a hit ({name})"
+                );
+            }
+        }
+
+        #[test]
+        fn the_ambient_scan_sees_the_runtime_resolver_through_an_alias() {
+            let mutated = format!(
+                "{AUDIT_SOURCE}\nuse crate::runtime_embed as embedded;\n\
+                 fn linked() -> bool {{ embedded::resolve().is_ok() }}\n"
+            );
+            let hits = ambient_reads(&mutated).unwrap_or_default();
+            assert_eq!(
+                hits.get(&(String::from("<item>"), String::from("runtime_embed"))),
+                Some(&1),
+                "importing the runtime resolver's module under another name is a hit"
+            );
+        }
+
+        #[test]
+        fn the_ambient_scan_sees_the_runtime_resolver_by_path_use_and_macro() {
+            let mutated = format!(
+                "{AUDIT_SOURCE}\nfn by_path() -> bool {{ crate::runtime_embed::resolve().is_ok() }}\n\
+                 fn in_args() -> String {{ format!(\"{{:?}}\", crate::runtime_embed::resolve().is_ok()) }}\n\
+                 use crate::runtime_embed::{{resolve as linked}};\n"
+            );
+            let hits = ambient_reads(&mutated).unwrap_or_default();
+            for scope in ["by_path", "in_args", "<item>"] {
+                assert_eq!(
+                    hits.get(&(String::from(scope), String::from("runtime_embed"))),
+                    Some(&1),
+                    "the runtime resolver's module named in `{scope}` is a hit"
+                );
+            }
         }
 
         #[test]
