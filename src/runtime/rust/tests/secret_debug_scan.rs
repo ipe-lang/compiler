@@ -1557,12 +1557,21 @@ struct HeaderList {
 }
 
 /// Every admitted header-name list, matched exactly by file and function.
-const HEADER_LISTS: [HeaderList; 1] = [HeaderList {
-    file: "web/console_proxy.rs",
-    func: "is_hop_by_hop",
-    why: "the RFC 7230 §6.1 hop-by-hop set a proxy strips; `proxy-authorization` is \
-          listed there as hop-by-hop, not as a credential",
-}];
+const HEADER_LISTS: [HeaderList; 2] = [
+    HeaderList {
+        file: "web/console_proxy.rs",
+        func: "is_hop_by_hop",
+        why: "the RFC 7230 §6.1 hop-by-hop set a proxy strips; `proxy-authorization` is \
+              listed there as hop-by-hop, not as a credential",
+    },
+    HeaderList {
+        file: "http_header.rs",
+        func: "header_arity",
+        why: "the closed header-arity table: `Cookie` and `Set-Cookie` are named only to \
+              pick the cookie-jar reading of a repeated header, never to redact or select a \
+              credential",
+    },
+];
 
 /// One header-name list site: `(file, function)`.
 type ListSite = (String, String);

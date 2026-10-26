@@ -6807,7 +6807,7 @@ mod tests {
                 crate::doc_bundle::DocKind::Guide,
                 "g\"k".to_owned(),
                 "Guide".to_owned(),
-                String::new(),
+                "",
             )
             .expect("insert");
         let search = build_site_search_script(&docs, &bundle, "../");
@@ -7901,14 +7901,14 @@ mod tests {
                 crate::doc_bundle::DocKind::Guide,
                 "getting-started".to_owned(),
                 "Getting Started".to_owned(),
-                "Begin here.".to_owned(),
+                "Begin here.",
             )
             .unwrap();
             b.insert(
                 crate::doc_bundle::DocKind::Topic,
                 "types".to_owned(),
                 "Types".to_owned(),
-                "Type system overview.".to_owned(),
+                "Type system overview.",
             )
             .unwrap();
             b

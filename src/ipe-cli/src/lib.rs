@@ -345,7 +345,7 @@ pub use project_root::golden::build_golden_dir;
 // to public API; the block above re-exports the genuine public surface as `pub`.
 pub(crate) use driver::{
     DevMarkedCrate, RewriteKind, find_manifest_for_ipe_file, force_cargo_terminal_ui, io_err,
-    read_progress_chunk, read_yes_no, read_yes_no_default, resolve_vendored_runtime_dir,
-    rewrite_user_file, rewrite_walked_file, run_capabilities, run_fix, run_installer, run_package,
-    run_test, run_type_check, run_verify, run_version, write_emitted_project,
+    read_progress_chunk, read_yes_no, read_yes_no_default, rewrite_user_file, rewrite_walked_file,
+    run_capabilities, run_fix, run_installer, run_package, run_test, run_type_check, run_verify,
+    run_version, write_emitted_project,
 };

@@ -233,6 +233,7 @@ pub struct DocEntry {
 /// Eight per-kind maps, each keyed by the canonical key string. Built once
 /// via [`DocBundle::build`]; queried via [`DocBundle::resolve_qualified`] and
 /// ranked by [`crate::doc_search::rank`].
+#[derive(Debug)]
 pub struct DocBundle {
     maps: BTreeMap<DocKind, BTreeMap<String, DocEntry>>,
     /// Extra spellings that open an entry, per kind: alias -> canonical key.
@@ -416,14 +417,14 @@ impl DocBundle {
         kind: DocKind,
         key: String,
         title: String,
-        body: String,
+        body: &str,
     ) -> Result<(), BundleError> {
         insert_entry(
             &mut self.maps,
             kind,
             key,
             title,
-            TerminalSafe::sanitize(&body),
+            TerminalSafe::sanitize(body),
             None,
         )
     }
@@ -1507,12 +1508,7 @@ mod tests {
     fn resolve_qualified_hit() {
         let mut bundle = DocBundle::empty();
         bundle
-            .insert(
-                DocKind::Topic,
-                "foo".to_owned(),
-                "Foo".to_owned(),
-                String::new(),
-            )
+            .insert(DocKind::Topic, "foo".to_owned(), "Foo".to_owned(), "")
             .unwrap();
         let entry = bundle.resolve_qualified("topic:foo").expect("hit");
         assert_eq!(entry.key, "foo");
@@ -1560,7 +1556,7 @@ mod tests {
             DocKind::Module,
             "Ipe.Db.Store".to_owned(),
             "the store".to_owned(),
-            String::new(),
+            "",
         )
         .unwrap();
         b
