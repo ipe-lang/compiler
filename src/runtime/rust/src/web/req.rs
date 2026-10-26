@@ -8,26 +8,20 @@ use crate::dict::IpeDict;
 pub use crate::dom::req::WebReq;
 
 /// Build a `WebReq` from the incoming request parts + the matched route params.
-pub fn web_req(
+///
+/// `headers` is the listener's one header fold, the dict `Ipe.Server` reads
+/// too; `raw` is read only by the cookie parser.
+pub(crate) fn web_req(
     method: &axum::http::Method,
     uri: &axum::http::Uri,
-    headers: &axum::http::HeaderMap,
+    raw: &axum::http::HeaderMap,
+    headers: &crate::http_header::RequestHeaders,
     params: IpeDict<String>,
 ) -> WebReq {
-    let mut hdrs: IpeDict<String> = IpeDict::new();
-    for (k, v) in headers.iter() {
-        if let Ok(val) = v.to_str() {
-            // First-value-wins on duplicate header keys, matching
-            // `headersToDict` (`vs[0]`). axum yields multi-valued headers in
-            // arrival order, so the first `iter()` entry is the first value.
-            hdrs.entry(crate::http_header::canonical_header(k.as_str()))
-                .or_insert_with(|| val.to_string());
-        }
-    }
     // Decoded through the one request-cookie parser, first value wins, so
     // `req.cookies` agrees with `Server.getCookie` and the session reader.
     let mut cookies: IpeDict<String> = IpeDict::new();
-    for (name, value) in crate::server::request_cookie_jar(headers) {
+    for (name, value) in crate::server::request_cookie_jar(raw) {
         cookies.entry(name).or_insert(value);
     }
     WebReq {
@@ -35,7 +29,7 @@ pub fn web_req(
         query: uri.query().unwrap_or("").to_string(),
         method: method.as_str().to_string(),
         params,
-        headers: hdrs,
+        headers: headers.as_dict().clone(),
         cookies,
     }
 }
@@ -53,10 +47,12 @@ mod tests {
         );
         h.insert("x-custom", "v".parse().unwrap());
         let uri: axum::http::Uri = "/apps/ipe?q=1".parse().unwrap();
+        let folded = crate::http_header::RequestHeaders::parse(&h).unwrap();
         let req = web_req(
             &axum::http::Method::GET,
             &uri,
             &h,
+            &folded,
             crate::dict::dict_empty(),
         );
         assert_eq!(req.path, "/apps/ipe");
@@ -65,6 +61,10 @@ mod tests {
         assert_eq!(req.cookies.get("ipe_sid").map(String::as_str), Some("abc"));
         assert_eq!(req.cookies.get("theme").map(String::as_str), Some("dark"));
         assert_eq!(req.headers.get("X-Custom").map(String::as_str), Some("v"));
+        assert!(
+            !req.headers.contains_key("Cookie"),
+            "the cookie parser alone reads `Cookie`"
+        );
     }
 
     /// `req.cookies` keeps the session cookie beside a pair with a non-ASCII byte.
@@ -76,10 +76,12 @@ mod tests {
             axum::http::HeaderValue::from_bytes(b"x=\xC3\xA9; ipe_sid=abc").unwrap(),
         );
         let uri: axum::http::Uri = "/".parse().unwrap();
+        let folded = crate::http_header::RequestHeaders::parse(&h).unwrap();
         let req = web_req(
             &axum::http::Method::GET,
             &uri,
             &h,
+            &folded,
             crate::dict::dict_empty(),
         );
         assert_eq!(req.cookies.get("ipe_sid").map(String::as_str), Some("abc"));
