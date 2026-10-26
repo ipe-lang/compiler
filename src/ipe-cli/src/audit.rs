@@ -956,7 +956,7 @@ fn prepare(snapshot: PackageSnapshot) -> Result<Prepared, CliError> {
     // regeneration above, so the set holds the gate-owned bindings.
     let sources = crate::driver::PackageSourceSet::from_snapshot(&snapshot)?;
     // The gate's emit takes no runtime and no options: the emitted project links
-    // the runtime embedded in this binary, materialized under `IPE_HOME`, never
+    // the runtime embedded in this binary, bundled into the emitted project, never
     // an `IPE_RUNTIME_DIR` override, an `IPE_RUNTIME_VENDORED` tree, or a runtime
     // crate found above the working directory — the judged package could ship
     // that one.
@@ -1805,7 +1805,13 @@ fn detect_cargo_deny_minor(cargo_deny: &OsStr, ceiling: LocalCeiling) -> u32 {
         .unwrap_or(20)
 }
 
-/// Run `cargo-deny` with `args`, detached in its own process group and held to `ceiling`.
+/// Run `cargo-deny` with `args` in `cwd`, detached in its own process group and held to `ceiling`.
+///
+/// `cwd` is a directory the gate owns. Cargo reads its configuration
+/// (`.cargo/config.toml`: the `rustc` it runs, a wrapper, a source
+/// replacement) from the working directory upward, so a scan started in the
+/// caller's directory, which may be the judged package, would run on the
+/// package's choices.
 ///
 /// # Errors
 /// See [`RunError`]: a crossed ceiling kills the child's group and is a
@@ -1814,9 +1820,10 @@ fn run_cargo_deny(
     cargo_deny: &OsStr,
     args: &[OsString],
     ceiling: LocalCeiling,
+    cwd: &Path,
 ) -> Result<Captured, RunError<LocalRefusal>> {
     let mut command = Command::new(cargo_deny);
-    command.args(args);
+    command.args(args).current_dir(cwd);
     run_local(command, ceiling, LocalSource::SupplyChainScan)
 }
 
@@ -1896,7 +1903,12 @@ fn supply_chain(prepared: &Prepared) -> Result<(), CliError> {
     let minor = detect_cargo_deny_minor(cargo_deny, TOOL_QUERY_LIMITS);
     let args = deny_args(minor, &manifest, &derived_config);
 
-    match run_cargo_deny(cargo_deny, &args, SUPPLY_CHAIN_SCAN_LIMITS) {
+    match run_cargo_deny(
+        cargo_deny,
+        &args,
+        SUPPLY_CHAIN_SCAN_LIMITS,
+        &prepared.emitted_dir,
+    ) {
         Ok(out) if out.status.success() => verify_locked_dependency_hashes(prepared),
         Ok(out) => {
             let stderr = out.stderr.to_terminal();
@@ -4079,6 +4091,40 @@ mod tests {
             }
         }
 
+        /// The scratch base holding the stub at `path`.
+        fn stub_base(path: &std::path::Path) -> &std::path::Path {
+            path.parent().unwrap_or(path)
+        }
+
+        /// The scan starts in the directory the gate names, never the
+        /// caller's: cargo reads its configuration from the working directory
+        /// upward, and the caller's may be the judged package.
+        #[test]
+        fn a_scan_runs_in_the_directory_the_gate_names() {
+            let deny = stub("scan-cwd", "pwd -P");
+            let gate_dir = stub_base(&deny)
+                .canonicalize()
+                .expect("canonical scratch base");
+            let caller_dir = std::env::current_dir()
+                .and_then(|dir| dir.canonicalize())
+                .expect("canonical caller directory");
+            assert_ne!(
+                gate_dir, caller_dir,
+                "the premise: the gate's directory is not the caller's"
+            );
+            let ran = run_cargo_deny(deny.as_os_str(), &[], SUPPLY_CHAIN_SCAN_LIMITS, &gate_dir);
+            let printed = ran
+                .as_ref()
+                .ok()
+                .map(|out| PathBuf::from(String::from_utf8_lossy(&out.stdout).trim()));
+            clean(&deny);
+            assert_eq!(
+                printed,
+                Some(gate_dir),
+                "cargo-deny starts in the gate's directory, got {ran:?}"
+            );
+        }
+
         #[test]
         fn a_scan_past_its_wall_is_refused() {
             let deny = stub("scan-wall", "exec sleep 30");
@@ -4087,6 +4133,7 @@ mod tests {
                 deny.as_os_str(),
                 &[],
                 SUPPLY_CHAIN_SCAN_LIMITS.with_wall(LocalWall::of_secs::<1>()),
+                stub_base(&deny),
             );
             assert!(
                 matches!(
@@ -4109,7 +4156,12 @@ mod tests {
         #[test]
         fn a_scan_flooding_stdout_is_refused() {
             let deny = stub("scan-flood", "head -c 2097152 /dev/zero");
-            let ran = run_cargo_deny(deny.as_os_str(), &[], SUPPLY_CHAIN_SCAN_LIMITS);
+            let ran = run_cargo_deny(
+                deny.as_os_str(),
+                &[],
+                SUPPLY_CHAIN_SCAN_LIMITS,
+                stub_base(&deny),
+            );
             assert!(
                 matches!(
                     &ran,
