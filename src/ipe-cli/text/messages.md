@@ -1564,6 +1564,14 @@ ipe doc: stdlib index failed: {detail}
 
 ipe doc: bundle build error: {detail}
 
+## doc-overlay-name
+
+ipe doc: `{path}` in the docs directory is not a page name; name a page with lowercase letters, digits and hyphens (`my-page.md`), or move it out of the docs directory
+
+## doc-overlay-too-large
+
+ipe doc: the pages in the docs directory together pass {limit} bytes; remove pages from the docs directory
+
 ## doc-unknown-kind
 
 ipe doc: `{prefix}` is not a known documentation kind

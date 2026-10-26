@@ -535,6 +535,7 @@ fn summary(entry: &DocEntry) -> TerminalLine {
     let source = if title.is_empty() || title == entry.key {
         entry
             .body
+            .as_str()
             .lines()
             .map(|line| line.trim().trim_start_matches('#').trim())
             .find(|line| !line.is_empty())
@@ -566,7 +567,7 @@ mod tests {
             kind,
             key: key.to_owned(),
             title: title.to_owned(),
-            body: String::new(),
+            body: crate::style::TerminalSafe::sanitize(""),
             order: None,
         }
     }
@@ -990,7 +991,7 @@ mod tests {
             kind: DocKind::Topic,
             key: "x".to_owned(),
             title: "Ti\u{1b}]0;pwned\u{7}tle\u{202e}\r\n\tend".to_owned(),
-            body: String::new(),
+            body: crate::style::TerminalSafe::sanitize(""),
             order: None,
         };
         let s = summary(&hostile);
@@ -1009,7 +1010,7 @@ mod tests {
             kind: DocKind::Symbol,
             key: "Ipe.List.map".to_owned(),
             title: "Ipe.List.map".to_owned(),
-            body: "\n\n# Apply a function\nmore".to_owned(),
+            body: crate::style::TerminalSafe::sanitize("\n\n# Apply a function\nmore"),
             order: None,
         };
         assert_eq!(summary(&e).as_str(), "Apply a function");

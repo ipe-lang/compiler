@@ -119,7 +119,9 @@ use ipe_types::{VarNamer, kernel_type_table, ty_to_doc};
 use crate::CliError;
 use crate::api_surface::{ModuleApi, ModulePath, PublicApi, UnionApi, extract_walked, read_tree};
 use crate::cli_args::OutputFormat;
-use crate::doc_bundle::{BundleSource, DocBundle, DocEntry, DocKind, is_qualified};
+use crate::doc_bundle::{
+    BundleError, BundleSource, DocBundle, DocEntry, DocKind, DocsOverlay, is_qualified,
+};
 use crate::doc_pick::Pick;
 use crate::doc_search::{DocMiss, DocQuery, MAX_QUERY_CHARS, QueryRefusal, Ranked};
 use crate::text;
@@ -737,7 +739,7 @@ fn build_index() -> Result<Index, CliError> {
                     kind: ipe_docs::EntryKind::Construct,
                     source_key: entry.key.clone(),
                     // `body` already has front-matter stripped by `parse_markdown_file`.
-                    text: entry.body.clone(),
+                    text: entry.body.as_str().to_owned(),
                 },
             );
         }
@@ -767,11 +769,11 @@ fn build_index() -> Result<Index, CliError> {
 /// The four directory-convention kinds are always populated from the compile-time
 /// embedded corpus (`docs/{constructs,idioms,topics,guide}/` baked into the
 /// binary), so `ipe doc serve` and `ipe doc --write-format html` render those
-/// sections correctly regardless of the working directory. When `docs_root` also
-/// exists on disk, any page whose key is not already in the embedded corpus is
-/// merged in as an additive overlay (useful for previewing a new page before it
-/// is committed).
-fn build_doc_bundle(docs_root: &std::path::Path) -> Result<DocBundle, CliError> {
+/// sections correctly regardless of the working directory. A
+/// [`DocsOverlay::Project`] adds each page of the project's own `docs/` whose
+/// key the embedded corpus does not hold (a new page previewed before it is
+/// committed); [`DocsOverlay::Embedded`] adds nothing.
+fn build_doc_bundle(overlay: &DocsOverlay) -> Result<DocBundle, CliError> {
     // Modules: one entry per stdlib module name.
     let module_sources: Vec<BundleSource> = stdlib_module_names()
         .into_iter()
@@ -842,13 +844,30 @@ fn build_doc_bundle(docs_root: &std::path::Path) -> Result<DocBundle, CliError> 
         .collect();
 
     DocBundle::build(
-        docs_root,
+        overlay,
         &module_sources,
         &symbol_sources,
         &diagnostic_sources,
         &cli_sources,
     )
-    .map_err(|e| CliError::Usage(text::msg::doc_bundle_build_error(&e)))
+    .map_err(bundle_build_error)
+}
+
+/// The CLI error for a bundle that did not build.
+///
+/// A refused overlay read keeps its own typed error; an overlay refusal is its
+/// catalog message, never wrapped a second time.
+fn bundle_build_error(error: BundleError) -> CliError {
+    match error {
+        BundleError::OverlayRead(source) => *source,
+        BundleError::OverlayName { path } => CliError::Usage(text::msg::doc_overlay_name(
+            &crate::style::TerminalSafe::sanitize(&path.display().to_string()),
+        )),
+        BundleError::OverlayTooLarge { limit } => {
+            CliError::Usage(text::msg::doc_overlay_too_large(&limit))
+        }
+        other => CliError::Usage(text::msg::doc_bundle_build_error(&other)),
+    }
 }
 
 /// `ipe doc kind:key` -- exact scoped bundle lookup.
@@ -861,10 +880,7 @@ fn run_bundle_lookup(
     key: &DocQuery,
     format: OutputFormat,
 ) -> Result<(), CliError> {
-    // Locate the docs root relative to the repo, falling back gracefully when
-    // running outside the repo tree (e.g. a user's home directory).
-    let docs_root = locate_docs_root();
-    let bundle = build_doc_bundle(&docs_root)?;
+    let bundle = build_doc_bundle(&DocsOverlay::Embedded)?;
 
     match bundle.resolve_qualified(term.text()) {
         Ok(entry) => {
@@ -925,8 +941,7 @@ fn run_doc_lookup_with_fuzzy(query: &DocQuery, format: OutputFormat) -> Result<(
     // No exact match: a unique exact key of a kind the index does not carry (a
     // topic, guide, or idiom) opens directly; anything else is a miss that
     // lists the closest entries of every kind.
-    let docs_root = locate_docs_root();
-    let bundle = build_doc_bundle(&docs_root)?;
+    let bundle = build_doc_bundle(&DocsOverlay::Embedded)?;
     if let Some(only) = crate::doc_search::unique_exact(bundle.all_entries(), query) {
         render_bundle_entry(only, format);
         return Ok(());
@@ -1182,7 +1197,7 @@ fn render_bundle_entry(entry: &crate::doc_bundle::DocEntry, format: OutputFormat
     use crate::screen::{Screen, Stream, emit_machine};
     match format {
         OutputFormat::Plain => {
-            let mut out = entry.body.clone();
+            let mut out = entry.body.as_str().to_owned();
             if !out.ends_with('\n') {
                 out.push('\n');
             }
@@ -1194,7 +1209,7 @@ fn render_bundle_entry(entry: &crate::doc_bundle::DocEntry, format: OutputFormat
                 json_string(entry.kind.prefix()),
                 json_string(&entry.key),
                 json_string(&entry.title),
-                json_string(&entry.body),
+                json_string(entry.body.as_str()),
             );
             emit_machine(Stream::Stdout, &out);
         }
@@ -1205,37 +1220,24 @@ fn render_bundle_entry(entry: &crate::doc_bundle::DocEntry, format: OutputFormat
             let _ = writeln!(
                 out,
                 "{}{}{}  {}[{}]{}",
-                p.bold, entry.key, p.reset, p.dim, entry.kind, p.reset
+                p.bold,
+                crate::style::TerminalSafe::sanitize(&entry.key),
+                p.reset,
+                p.dim,
+                entry.kind,
+                p.reset
             );
-            if !entry.body.is_empty() {
+            let body = entry.body.as_str();
+            if !body.is_empty() {
                 out.push('\n');
-                out.push_str(&entry.body);
-                if !entry.body.ends_with('\n') {
+                out.push_str(body);
+                if !body.ends_with('\n') {
                     out.push('\n');
                 }
             }
             screen.styled(&out).emit();
         }
     }
-}
-
-/// Locate the `docs/` directory relative to the binary's own location, falling
-/// back to the current directory's `docs/` when a repo layout is not found.
-/// Returns a path that may not exist; callers must tolerate an absent root.
-fn locate_docs_root() -> std::path::PathBuf {
-    // Walk up from cwd looking for a `docs/` that exists.
-    let mut dir = std::env::current_dir().unwrap_or_default();
-    loop {
-        let candidate = dir.join("docs");
-        if candidate.is_dir() {
-            return candidate;
-        }
-        match dir.parent() {
-            Some(parent) => dir = parent.to_owned(),
-            None => break,
-        }
-    }
-    std::path::PathBuf::from("docs")
 }
 
 /// Plain (terse) rendering of a documentation entry: signature + example.
@@ -2124,7 +2126,7 @@ fn query_module(term: &DocQuery, format: OutputFormat) -> Result<(), CliError> {
                 Err(ambiguous_module_error(module_name, &candidates, format))
             }
             MemberResolution::Miss => {
-                let bundle = build_doc_bundle(&locate_docs_root())?;
+                let bundle = build_doc_bundle(&DocsOverlay::Embedded)?;
                 Err(doc_miss(term, &bundle, format))
             }
         },
@@ -2768,8 +2770,7 @@ struct SearchEntry {
 fn generate(path: &Path, out: &Path, write_format: WriteFormat) -> Result<(), CliError> {
     crate::style::print_command_header();
     let (docs, inputs) = build_docs_or_stdlib(path)?;
-    let docs_root = locate_docs_root();
-    let bundle = build_doc_bundle(&docs_root)?;
+    let bundle = build_doc_bundle(&DocsOverlay::for_project(path)?)?;
 
     let (json_files, markdown_files, html_files) = render_site_split(&docs, &bundle, write_format);
 
@@ -4934,7 +4935,7 @@ fn render_cli_index(bundle: &crate::doc_bundle::DocBundle, search_script: &str) 
     for entry in entries {
         let href = entry_href(entry.kind, &entry.key, "../");
         let summary = if entry.title.is_empty() {
-            first_sentence(&entry.body)
+            first_sentence(entry.body.as_str())
         } else {
             entry.title.clone()
         };
@@ -4997,7 +4998,7 @@ fn render_curated_kind_indexes(
         body.push_str("<ul class=\"curated-entries\">\n");
         for entry in entries {
             let href = entry_href(kind, &entry.key, "../");
-            let summary = first_sentence(&entry.body);
+            let summary = first_sentence(entry.body.as_str());
             let _ = write!(
                 body,
                 "<li><a href=\"{}\" class=\"entry-title\">{}</a>",
@@ -5056,7 +5057,7 @@ fn render_entry_page(
             html::escape(&entry.key)
         );
     }
-    if entry.body.is_empty() {
+    if entry.body.as_str().is_empty() {
         let _ = writeln!(
             body,
             "<p class=\"comment\">{}</p>",
@@ -5068,7 +5069,7 @@ fn render_entry_page(
         // (`ipe_docs::markdown` port + escape-by-default walker) so headings, code
         // fences, tables, and links all work consistently. Fenced code is routed
         // through the shared token-classifier highlighter (no second lexer).
-        body.push_str(&ipe_docs::render::markdown_to_html(&entry.body));
+        body.push_str(&ipe_docs::render::markdown_to_html(entry.body.as_str()));
     }
     html_page(&entry.title, "../style.css", &header, &body)
 }
@@ -5148,7 +5149,7 @@ fn render_html_index(
         body.push_str("<ul class=\"curated-entries\">\n");
         for entry in entries {
             let href = entry_href(kind, &entry.key, "");
-            let summary = first_sentence(&entry.body);
+            let summary = first_sentence(entry.body.as_str());
             let _ = write!(
                 body,
                 "<li><a href=\"{}\" class=\"entry-title\">{}</a>",
@@ -5262,8 +5263,7 @@ fn serve(path: &Path, port: Option<u16>) -> Result<(), CliError> {
 
     crate::style::print_command_header();
     let (docs, _) = build_docs_or_stdlib(path)?;
-    let docs_root = locate_docs_root();
-    let bundle = build_doc_bundle(&docs_root)?;
+    let bundle = build_doc_bundle(&DocsOverlay::for_project(path)?)?;
     let site = render_site_for_serve(&docs, &bundle);
 
     let addr = format!("127.0.0.1:{}", port.unwrap_or(0));
@@ -5669,6 +5669,11 @@ fn http_response(headers: &PreviewHeaders, status: &str, content_type: &str, bod
 mod tests {
     use super::*;
 
+    /// The overlay a site build at the repository root reads.
+    fn repo_overlay() -> DocsOverlay {
+        DocsOverlay::for_project(Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../.."))).unwrap()
+    }
+
     fn refusal_text(rest: &[&str]) -> String {
         let parsed = parse_doc(&s(rest));
         assert!(
@@ -5804,7 +5809,7 @@ mod tests {
             kind,
             key: key.to_owned(),
             title: key.to_owned(),
-            body: String::new(),
+            body: crate::style::TerminalSafe::sanitize(""),
             order: None,
         };
         let modules = [
@@ -5848,7 +5853,7 @@ mod tests {
     /// to a lookup that opens that same entry — the machine re-run contract.
     #[test]
     fn every_listed_term_opens_its_entry_when_passed_back() {
-        let bundle = build_doc_bundle(&locate_docs_root()).expect("the doc bundle builds");
+        let bundle = build_doc_bundle(&repo_overlay()).expect("the doc bundle builds");
         let index = build_index().expect("the doc index builds");
         let modules = stdlib_module_names();
         let mut checked = 0_usize;
@@ -5929,7 +5934,7 @@ mod tests {
     /// `source_key`, never a second entry for the same symbol.
     #[test]
     fn every_symbol_spelling_opens_its_one_canonical_entry() {
-        let bundle = build_doc_bundle(&locate_docs_root()).expect("the doc bundle builds");
+        let bundle = build_doc_bundle(&repo_overlay()).expect("the doc bundle builds");
         let index = build_index().expect("the doc index builds");
         let mut spellings = 0_usize;
         for key in index.keys() {
@@ -5963,7 +5968,7 @@ mod tests {
 
     #[test]
     fn a_miss_lists_only_rerun_terms_under_every_format() {
-        let bundle = build_doc_bundle(&locate_docs_root()).expect("the doc bundle builds");
+        let bundle = build_doc_bundle(&repo_overlay()).expect("the doc bundle builds");
         let query = DocQuery::parse("pipelin").expect("a valid query");
         let ranked = crate::doc_search::rank(bundle.all_entries(), bundle.all_aliases(), &query);
         let err = miss_error("pipelin", &ranked, OutputFormat::Human);
@@ -5990,7 +5995,7 @@ mod tests {
     /// holds the query's characters scattered in order.
     #[test]
     fn a_member_or_qualifier_typo_ranks_the_intended_symbol() {
-        let bundle = build_doc_bundle(&locate_docs_root()).expect("the doc bundle builds");
+        let bundle = build_doc_bundle(&repo_overlay()).expect("the doc bundle builds");
         let ranked = |raw: &str| {
             let query = DocQuery::parse(raw).expect("a valid query");
             crate::doc_search::rank(bundle.all_entries(), bundle.all_aliases(), &query)
@@ -7047,7 +7052,7 @@ mod tests {
             kind: crate::doc_bundle::DocKind::Cli,
             key: command.to_owned(),
             title: crate::help::command_summary(command).unwrap().to_owned(),
-            body: markdown,
+            body: crate::style::TerminalSafe::sanitize(&markdown),
             order: None,
         };
         let html = render_entry_page(crate::doc_bundle::DocKind::Cli, &entry, "");
@@ -7082,7 +7087,7 @@ mod tests {
     #[test]
     fn serve_html_matches_write_format_html_byte_for_byte() {
         let docs = build_stdlib_only_docs();
-        let bundle = build_doc_bundle(&locate_docs_root()).expect("bundle builds");
+        let bundle = build_doc_bundle(&repo_overlay()).expect("bundle builds");
         let (_json, _md, split_html) = render_site_split(&docs, &bundle, WriteFormat::Html);
         let serve_html = render_site_for_serve(&docs, &bundle);
         assert_eq!(
@@ -7208,7 +7213,7 @@ mod tests {
     #[test]
     fn the_policy_names_exactly_the_scripts_a_page_carries() {
         let docs = build_stdlib_only_docs();
-        let bundle = build_doc_bundle(&locate_docs_root()).expect("bundle builds");
+        let bundle = build_doc_bundle(&repo_overlay()).expect("bundle builds");
         let site = render_site_for_serve(&docs, &bundle);
         let named = csp_script_sources(&preview_headers().csp);
         assert_eq!(named.len(), PREVIEW_SCRIPTS.len(), "one hash per script");
@@ -7811,11 +7816,16 @@ mod tests {
             "build",
             "Compile the project.",
         )];
-        // docs_root does not exist on disk; the embedded corpus still populates
-        // the four curated kinds (construct, idiom, topic, guide).
-        let docs_root = std::path::Path::new("/nonexistent");
-        DocBundle::build(docs_root, &modules, &symbols, &diagnostics, &cli)
-            .expect("nav_test_bundle")
+        // No overlay; the embedded corpus still populates the four curated
+        // kinds (construct, idiom, topic, guide).
+        DocBundle::build(
+            &DocsOverlay::Embedded,
+            &modules,
+            &symbols,
+            &diagnostics,
+            &cli,
+        )
+        .expect("nav_test_bundle")
     }
 
     #[test]
@@ -7906,21 +7916,21 @@ mod tests {
             kind: crate::doc_bundle::DocKind::Guide,
             key: "first".to_owned(),
             title: "First Guide".to_owned(),
-            body: String::new(),
+            body: crate::style::TerminalSafe::sanitize(""),
             order: Some(0),
         };
         let second = crate::doc_bundle::DocEntry {
             kind: crate::doc_bundle::DocKind::Guide,
             key: "second".to_owned(),
             title: "Second Guide".to_owned(),
-            body: String::new(),
+            body: crate::style::TerminalSafe::sanitize(""),
             order: Some(1),
         };
         let unordered = crate::doc_bundle::DocEntry {
             kind: crate::doc_bundle::DocKind::Guide,
             key: "zz-alpha".to_owned(),
             title: "Alpha".to_owned(),
-            body: String::new(),
+            body: crate::style::TerminalSafe::sanitize(""),
             order: None,
         };
         let mut to_sort = vec![&second, &unordered, &first];
@@ -8111,8 +8121,7 @@ mod tests {
     #[test]
     fn every_generated_href_resolves_to_a_generated_file() {
         let docs = build_stdlib_only_docs();
-        let docs_root = locate_docs_root();
-        let bundle = build_doc_bundle(&docs_root).expect("bundle");
+        let bundle = build_doc_bundle(&repo_overlay()).expect("bundle");
         let site = render_site_for_serve(&docs, &bundle);
 
         let mut missing: Vec<String> = Vec::new();
@@ -8146,8 +8155,7 @@ mod tests {
     fn per_entry_pages_exist_for_every_linked_kind() {
         use crate::doc_bundle::DocKind;
         let docs = build_stdlib_only_docs();
-        let docs_root = locate_docs_root();
-        let bundle = build_doc_bundle(&docs_root).expect("bundle");
+        let bundle = build_doc_bundle(&repo_overlay()).expect("bundle");
         let site = render_site_for_serve(&docs, &bundle);
 
         for kind in [DocKind::Diagnostic, DocKind::Cli] {
@@ -8653,8 +8661,7 @@ withBaseMs = something
     #[test]
     fn command_page_html_mirrors_help_ssot() {
         let docs = build_stdlib_only_docs();
-        let docs_root = locate_docs_root();
-        let bundle = build_doc_bundle(&docs_root).expect("bundle");
+        let bundle = build_doc_bundle(&repo_overlay()).expect("bundle");
         let site = render_site_for_serve(&docs, &bundle);
 
         for name in crate::help::documented_command_keys() {
@@ -8687,8 +8694,7 @@ withBaseMs = something
     #[test]
     fn tea_terminal_namespace_absent_from_site() {
         let docs = build_stdlib_only_docs();
-        let docs_root = locate_docs_root();
-        let bundle = build_doc_bundle(&docs_root).expect("bundle");
+        let bundle = build_doc_bundle(&repo_overlay()).expect("bundle");
         let site = render_site_for_serve(&docs, &bundle);
 
         for path in site.keys() {
@@ -8709,8 +8715,7 @@ withBaseMs = something
     #[test]
     fn serve_html_equals_write_format_html() {
         let docs = build_stdlib_only_docs();
-        let docs_root = locate_docs_root();
-        let bundle = build_doc_bundle(&docs_root).expect("bundle");
+        let bundle = build_doc_bundle(&repo_overlay()).expect("bundle");
 
         let serve = render_site_for_serve(&docs, &bundle);
         let (_, _, write_html) = render_site_split(&docs, &bundle, WriteFormat::Html);
