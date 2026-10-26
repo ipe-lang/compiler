@@ -1,10 +1,12 @@
-//! Canonical HTTP header-name casing, shared by Ipe.Web and Ipe.Http.Server.
+//! Canonical HTTP header-name casing and the one header fold, shared by
+//! Ipe.Web, Ipe.Http.Server and the HTTP client.
 //!
 //! Canonical MIME case: `content-type` → `Content-Type`, `x-ipe-web` →
 //! `X-Ipe-Web`. hyper/axum expose request header names lower-cased, so the
 //! runtime re-derives the canonical form at the request boundary for both
-//! storage and lookup. This module is the single source of truth for that
-//! transformation so the Web and Server request builders never drift apart.
+//! storage and lookup. The fold turns a message's header entries into the
+//! program-visible dict under one arity table, so the Web and Server request
+//! builders and the client's response reader never pick different copies.
 
 /// Canonicalise a `-`-separated header name (`content-type` -> `Content-Type`).
 ///
@@ -32,6 +34,185 @@ pub(crate) fn canonical_header(k: &str) -> String {
         }
     }
     out
+}
+
+/// How often one header name may appear in a message.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum HeaderArity {
+    /// At most once: a second copy makes the message ambiguous.
+    Singleton,
+    /// A comma-separated list: copies combine, in arrival order, with `", "`.
+    List,
+    /// A cookie header, whose items the cookie parser reads from its bytes.
+    CookieJar,
+}
+
+/// The arity of the header named `canonical` (its [`canonical_header`] form).
+///
+/// The list names are closed; every other name, known or not, is a
+/// singleton, so a repeated header no rule combines is refused, never guessed.
+pub(crate) fn header_arity(canonical: &str) -> HeaderArity {
+    match canonical {
+        "Accept"
+        | "Accept-Charset"
+        | "Accept-Encoding"
+        | "Accept-Language"
+        | "Cache-Control"
+        | "Connection"
+        | "Forwarded"
+        | "If-Match"
+        | "If-None-Match"
+        | "Pragma"
+        | "Te"
+        | "Trailer"
+        | "Transfer-Encoding"
+        | "Upgrade"
+        | "Via"
+        | "Warning"
+        | "X-Forwarded-For"
+        | "Sec-Websocket-Extensions"
+        | "Sec-Websocket-Protocol" => HeaderArity::List,
+        "Cookie" | "Set-Cookie" => HeaderArity::CookieJar,
+        _ => HeaderArity::Singleton,
+    }
+}
+
+/// Why a message's headers have no one program-visible reading.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum HeaderRefusal {
+    /// A singleton header appears more than once.
+    DuplicateSingleton,
+    /// A header value holds a byte outside visible ASCII, space and tab.
+    NotVisibleAscii,
+}
+
+impl HeaderRefusal {
+    /// The fixed text a refused response reads; it never names the header.
+    #[cfg(any(
+        feature = "http_client",
+        all(target_arch = "wasm32", feature = "wasm-client")
+    ))]
+    pub(crate) const fn response_text(self) -> &'static str {
+        match self {
+            Self::DuplicateSingleton => "http: the response repeats a header that must appear once",
+            Self::NotVisibleAscii => {
+                "http: the response carries a header value that is not visible ASCII"
+            }
+        }
+    }
+}
+
+/// The header text of `bytes`, when every byte is visible ASCII, space or tab.
+fn header_text(bytes: &[u8]) -> Option<&str> {
+    if bytes
+        .iter()
+        .all(|&b| b == b'\t' || (b' '..=b'~').contains(&b))
+    {
+        std::str::from_utf8(bytes).ok()
+    } else {
+        None
+    }
+}
+
+/// The one fold of a message's header entries into a dict keyed by canonical name.
+///
+/// Every entry is judged from its raw bytes, so an undecodable copy cannot hide
+/// a duplicate. A singleton seen twice, or a value outside visible ASCII,
+/// refuses the whole message; list copies combine in arrival order. A cookie
+/// header is left to its own reader.
+fn fold_headers<'a>(
+    entries: impl IntoIterator<Item = (&'a str, &'a [u8])>,
+) -> Result<crate::dict::IpeDict<String>, HeaderRefusal> {
+    use std::collections::hash_map::Entry;
+    let mut dict = crate::dict::IpeDict::new();
+    for (name, bytes) in entries {
+        let canonical = canonical_header(name);
+        let arity = header_arity(&canonical);
+        if arity == HeaderArity::CookieJar {
+            continue;
+        }
+        let text = header_text(bytes).ok_or(HeaderRefusal::NotVisibleAscii)?;
+        match dict.entry(canonical) {
+            Entry::Vacant(slot) => {
+                slot.insert(text.to_owned());
+            }
+            Entry::Occupied(mut slot) => match arity {
+                HeaderArity::List => {
+                    let combined = slot.get_mut();
+                    combined.push_str(", ");
+                    combined.push_str(text);
+                }
+                HeaderArity::Singleton | HeaderArity::CookieJar => {
+                    return Err(HeaderRefusal::DuplicateSingleton);
+                }
+            },
+        }
+    }
+    Ok(dict)
+}
+
+/// A request's headers as the program reads them, keyed by canonical name.
+///
+/// Only [`RequestHeaders::parse`] builds one, at the listener, so every
+/// program-visible request header dict comes from the one fold. `Cookie` is
+/// absent: the cookie parser reads it item by item from its bytes.
+#[cfg(feature = "server")]
+#[derive(Clone)]
+pub(crate) struct RequestHeaders(crate::dict::IpeDict<String>);
+
+#[cfg(feature = "server")]
+impl RequestHeaders {
+    /// Fold the request's header entries.
+    ///
+    /// # Errors
+    ///
+    /// A [`HeaderRefusal`] when a singleton repeats or a value is not visible
+    /// ASCII; the listener answers it with the fixed 400.
+    pub(crate) fn parse(map: &axum::http::HeaderMap) -> Result<Self, HeaderRefusal> {
+        fold_headers(
+            map.iter()
+                .map(|(name, value)| (name.as_str(), value.as_bytes())),
+        )
+        .map(Self)
+    }
+
+    /// The program-visible dict.
+    pub(crate) const fn as_dict(&self) -> &crate::dict::IpeDict<String> {
+        &self.0
+    }
+
+    /// The value of the header named `canonical`, list copies combined.
+    pub(crate) fn get(&self, canonical: &str) -> Option<&str> {
+        self.0.get(canonical).map(String::as_str)
+    }
+}
+
+/// Fold a response's header entries into the program-visible dict.
+///
+/// The browser hands `fetch` its headers already combined per name, so there a
+/// repeat never reaches the fold.
+///
+/// # Errors
+///
+/// A [`HeaderRefusal`] when a singleton repeats or a value is not visible
+/// ASCII. `Set-Cookie` is never refused: the dict keeps its last decodable copy.
+#[cfg(any(
+    feature = "http_client",
+    all(target_arch = "wasm32", feature = "wasm-client")
+))]
+pub(crate) fn response_headers<'a>(
+    entries: impl IntoIterator<Item = (&'a str, &'a [u8])> + Clone,
+) -> Result<crate::dict::IpeDict<String>, HeaderRefusal> {
+    let mut dict = fold_headers(entries.clone())?;
+    let set_cookie = entries
+        .into_iter()
+        .filter(|(name, _)| name.eq_ignore_ascii_case("set-cookie"))
+        .filter_map(|(_, bytes)| header_text(bytes))
+        .last();
+    if let Some(text) = set_cookie {
+        dict.insert("Set-Cookie".to_owned(), text.to_owned());
+    }
+    Ok(dict)
 }
 
 /// Strip a scheme's IMPLICIT default port (`:443` for `https`, `:80` for

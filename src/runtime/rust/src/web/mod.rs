@@ -5221,7 +5221,7 @@ mod handlers {
                 let make_init = || {
                     pubsub::with_session(&scope, || {
                         let params = (st.param_resolver)(path);
-                        let req = req::web_req(&method, &uri, &headers, params);
+                        let req = req::web_req(&method, &uri, &headers, strict.headers(), params);
                         (st.init)(req)
                     })
                 };
@@ -5372,7 +5372,7 @@ mod handlers {
                 // unrouted) and init a fresh model. The param_resolver is
                 // model-independent, breaking the init↔routing cycle.
                 let params = (st.param_resolver)(path);
-                let req = req::web_req(&method, &uri, &headers, params);
+                let req = req::web_req(&method, &uri, &headers, strict.headers(), params);
                 // Session fixation guard: a store MISS means this sid is NOT a
                 // known session, so NEVER adopt the client-supplied cookie value
                 // — always mint a fresh sid. (A HIT path keeps cookie_sid.)
@@ -6760,12 +6760,12 @@ mod handlers {
         // Build a fresh init model from the current request context — the same
         // path the clean-reinit miss takes — so the reset session holds exactly
         // what a cold-start visit would have produced.
-        let path = match crate::server::strict_url(strict.as_deref()) {
-            Ok(strict) => strict.path(),
+        let strict = match crate::server::strict_url(strict.as_deref()) {
+            Ok(strict) => strict,
             Err(rejection) => return rejection.status_and_reason().into_response(),
         };
-        let params = (st.param_resolver)(path);
-        let req = req::web_req(&method, &uri, &headers, params);
+        let params = (st.param_resolver)(strict.path());
+        let req = req::web_req(&method, &uri, &headers, strict.headers(), params);
         let (init_model, _cmd) = pubsub::with_session(&scope, || (st.init)(req));
         {
             let mut e = handle.lock().unwrap_or_else(|e| e.into_inner());
@@ -6894,12 +6894,12 @@ mod handlers {
         // Derive the init model the same way reset_handler does: build a
         // WebReq from the current request context so route-aware apps get the
         // correct initial state.
-        let path = match crate::server::strict_url(strict.as_deref()) {
-            Ok(strict) => strict.path(),
+        let strict = match crate::server::strict_url(strict.as_deref()) {
+            Ok(strict) => strict,
             Err(rejection) => return rejection.status_and_reason().into_response(),
         };
-        let params = (st.param_resolver)(path);
-        let req = req::web_req(&method, &uri, &headers, params);
+        let params = (st.param_resolver)(strict.path());
+        let req = req::web_req(&method, &uri, &headers, strict.headers(), params);
         let (init_model, _cmd) = pubsub::with_session(&scope, || (st.init)(req));
 
         // Replay the imported log from the init model. Fail-closed: any
