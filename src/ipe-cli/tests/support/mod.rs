@@ -664,6 +664,8 @@ pub struct TimedRunOutcome {
     pub exit_code: Option<i32>,
     /// Wall time from spawn to the observed exit.
     pub elapsed: std::time::Duration,
+    /// CPU time the child used; `None` off Linux or when `/proc` is unreadable.
+    pub cpu: Option<CpuTime>,
 }
 
 impl TimedRunOutcome {
@@ -674,8 +676,105 @@ impl TimedRunOutcome {
             stderr: String::new(),
             exit_code: None,
             elapsed: std::time::Duration::ZERO,
+            cpu: None,
         }
     }
+}
+
+/// User plus system CPU time of one exited child, summed over its threads.
+///
+/// Only the runner reads one, from the kernel's own accounting of the child
+/// (elsewhere only the zero `Default` can be built), so a wall-clock reading
+/// cannot stand in for it: it measures work, which the host's load (scheduler
+/// delay, sibling processes) does not inflate.
+#[allow(dead_code)] // only work-measuring goldens read it
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
+pub struct CpuTime(std::time::Duration);
+
+#[allow(dead_code)] // only work-measuring goldens read it
+impl CpuTime {
+    /// The CPU time as a duration.
+    #[must_use]
+    pub const fn as_duration(self) -> std::time::Duration {
+        self.0
+    }
+
+    /// The CPU time left after `other`, zero when `other` is larger.
+    #[must_use]
+    pub const fn saturating_sub(self, other: Self) -> Self {
+        Self(self.0.saturating_sub(other.0))
+    }
+}
+
+/// The kernel's clock-tick rate, `AT_CLKTCK` from this process's auxiliary vector.
+#[cfg(target_os = "linux")]
+#[allow(dead_code)] // reached only from the deadline-bounded runner
+fn clock_ticks_per_second() -> Option<u64> {
+    const AT_CLKTCK: usize = 17;
+    let auxv = std::fs::read("/proc/self/auxv").ok()?;
+    let word = std::mem::size_of::<usize>();
+    let word_of = |bytes: &[u8]| bytes.try_into().ok().map(usize::from_ne_bytes);
+    auxv.chunks_exact(word * 2)
+        .find_map(|pair| {
+            let (key, value) = pair.split_at_checked(word)?;
+            if word_of(key)? == AT_CLKTCK {
+                word_of(value)
+            } else {
+                None
+            }
+        })
+        .and_then(|hz| u64::try_from(hz).ok())
+        .filter(|&hz| hz > 0)
+}
+
+/// The CPU time of the exited, not yet reaped child `pid`, from `/proc/<pid>/stat`.
+///
+/// The zombie keeps the kernel's whole-process `utime` and `stime` (fields 14
+/// and 15, in clock ticks) until it is reaped.
+#[cfg(target_os = "linux")]
+#[allow(dead_code)] // reached only from the deadline-bounded runner
+fn zombie_cpu_time(pid: u32) -> Option<CpuTime> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    // `comm` (field 2) may hold spaces and parentheses; the fields after its
+    // last `)` start at `state` (field 3).
+    let (_, after_comm) = stat.rsplit_once(')')?;
+    let mut fields = after_comm.split_whitespace().skip(11);
+    let utime: u64 = fields.next()?.parse().ok()?;
+    let stime: u64 = fields.next()?.parse().ok()?;
+    let nanos = utime
+        .checked_add(stime)?
+        .checked_mul(1_000_000_000)?
+        .checked_div(clock_ticks_per_second()?)?;
+    Some(CpuTime(std::time::Duration::from_nanos(nanos)))
+}
+
+/// One non-blocking poll of `child`: its exit status and CPU time once exited.
+///
+/// The exit is observed with `waitid(WNOWAIT)`, which leaves the child a zombie
+/// whose CPU time is still readable, and only then reaped.
+#[cfg(target_os = "linux")]
+#[allow(dead_code)] // reached only from the deadline-bounded runner
+fn poll_exit(
+    child: &mut std::process::Child,
+) -> std::io::Result<Option<(std::process::ExitStatus, Option<CpuTime>)>> {
+    use rustix::process::{Pid, WaitId, WaitidOptions, waitid};
+    let options = WaitidOptions::EXITED | WaitidOptions::NOHANG | WaitidOptions::NOWAIT;
+    if waitid(WaitId::Pid(Pid::from_child(child)), options)?.is_none() {
+        return Ok(None);
+    }
+    let cpu = zombie_cpu_time(child.id());
+    child.wait().map(|status| Some((status, cpu)))
+}
+
+/// One non-blocking poll of `child`: its exit status; no CPU time off Linux.
+#[cfg(not(target_os = "linux"))]
+#[allow(dead_code)] // reached only from the deadline-bounded runner
+fn poll_exit(
+    child: &mut std::process::Child,
+) -> std::io::Result<Option<(std::process::ExitStatus, Option<CpuTime>)>> {
+    child
+        .try_wait()
+        .map(|status| status.map(|status| (status, None)))
 }
 
 /// Build the emitted project at `emitted_dir` and return its binary path.
@@ -696,7 +795,7 @@ pub fn build_emitted_binary_checked(golden_name: &str, emitted_dir: &Path) -> Op
 
 /// Run `exe` with `stdin_bytes` on stdin, killing and reaping it at `deadline`.
 ///
-/// The child is polled with `try_wait`; its stdout and stderr drain on reader
+/// The child is polled without blocking; its stdout and stderr drain on reader
 /// threads so a full pipe never stalls it. Past `deadline` the child is killed
 /// and reaped, so no process outlives the call.
 ///
@@ -737,14 +836,16 @@ pub fn run_with_stdin_deadline(
 
     let mut polled = Ok(None);
     while started.elapsed() < deadline {
-        polled = child.try_wait();
+        polled = poll_exit(&mut child);
         if !matches!(polled, Ok(None)) {
             break;
         }
         std::thread::sleep(std::time::Duration::from_millis(2));
     }
     let elapsed = started.elapsed();
-    let status = polled.as_ref().ok().copied().flatten();
+    let exited = polled.as_ref().ok().copied().flatten();
+    let status = exited.map(|(status, _)| status);
+    let cpu = exited.and_then(|(_, cpu)| cpu);
     if status.is_none() {
         let _ = child.kill();
         let _ = child.wait();
@@ -777,6 +878,7 @@ pub fn run_with_stdin_deadline(
         stderr,
         exit_code: status.and_then(|s| s.code()),
         elapsed,
+        cpu,
     }
 }
 
