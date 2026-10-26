@@ -14932,6 +14932,44 @@ mod emitted_router_behavior_tests {
         });
     }
 
+    /// Prove the refusal: the Web router answers a repeated singleton header
+    /// with the listener's fixed 400 before any handler logic runs, exactly as
+    /// the Server router does; one copy reaches the page.
+    #[test]
+    #[allow(clippy::expect_used)] // test: request build / body read failure is a test environment issue
+    fn a_repeated_singleton_header_never_reaches_a_web_handler() {
+        with_csrf_off(|| async {
+            let store = Arc::new(Store::new(Duration::from_secs(60)));
+            for (copies, refused) in [(2, true), (1, false)] {
+                let runs = Arc::new(AtomicUsize::new(0));
+                let router = make_counting_router(store.clone(), runs.clone());
+                let mut b = Request::builder().method("GET").uri("/");
+                for n in 0..copies {
+                    b = b.header(header::AUTHORIZATION, format!("Bearer t{n}"));
+                }
+                let resp = router
+                    .oneshot(b.body(Body::empty()).expect("build GET"))
+                    .await
+                    .expect("router responds");
+                let ran = runs.load(std::sync::atomic::Ordering::SeqCst);
+                if refused {
+                    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+                    let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+                        .await
+                        .expect("read body");
+                    assert_eq!(bytes.as_ref(), b"Bad Request", "the refusal never echoes");
+                    assert_eq!(
+                        ran, 0,
+                        "a repeated singleton must never reach handler logic"
+                    );
+                } else {
+                    assert_ne!(resp.status(), StatusCode::BAD_REQUEST);
+                    assert!(ran > 0, "one copy reaches the page");
+                }
+            }
+        });
+    }
+
     /// A route table naming a malformed literal pattern.
     fn malformed_routes() -> Vec<crate::web::route::Route<()>> {
         vec![

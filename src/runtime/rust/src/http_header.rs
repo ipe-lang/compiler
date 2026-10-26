@@ -201,14 +201,16 @@ impl RequestHeaders {
     all(target_arch = "wasm32", feature = "wasm-client")
 ))]
 pub(crate) fn response_headers<'a>(
-    entries: impl IntoIterator<Item = (&'a str, &'a [u8])> + Clone,
+    entries: impl IntoIterator<Item = (&'a str, &'a [u8])>,
 ) -> Result<crate::dict::IpeDict<String>, HeaderRefusal> {
-    let mut dict = fold_headers(entries.clone())?;
+    let entries: Vec<(&str, &[u8])> = entries.into_iter().collect();
+    let mut dict = fold_headers(entries.iter().copied())?;
     let set_cookie = entries
-        .into_iter()
+        .iter()
+        .copied()
+        .rev()
         .filter(|(name, _)| name.eq_ignore_ascii_case("set-cookie"))
-        .filter_map(|(_, bytes)| header_text(bytes))
-        .last();
+        .find_map(|(_, bytes)| header_text(bytes));
     if let Some(text) = set_cookie {
         dict.insert("Set-Cookie".to_owned(), text.to_owned());
     }
@@ -741,5 +743,126 @@ mod tests {
     #[test]
     fn origin_host_mismatch_empty_host_is_never_flagged() {
         assert!(!origin_host_mismatch("https://evil.example", ""));
+    }
+
+    /// The request fold of `entries`, appended in order.
+    #[cfg(feature = "server")]
+    fn fold(
+        entries: &[(&'static str, &[u8])],
+    ) -> Result<super::RequestHeaders, super::HeaderRefusal> {
+        let mut map = axum::http::HeaderMap::new();
+        for (name, bytes) in entries {
+            map.append(
+                *name,
+                axum::http::HeaderValue::from_bytes(bytes).expect("test header value"),
+            );
+        }
+        super::RequestHeaders::parse(&map)
+    }
+
+    #[cfg(feature = "server")]
+    #[test]
+    fn two_authorization_headers_refused() {
+        assert!(matches!(
+            fold(&[
+                ("authorization", b"Bearer a"),
+                ("authorization", b"Bearer b")
+            ]),
+            Err(super::HeaderRefusal::DuplicateSingleton)
+        ));
+        let one = fold(&[("authorization", b"Bearer a")]).expect("one copy is admitted");
+        assert_eq!(one.get("Authorization"), Some("Bearer a"));
+    }
+
+    #[cfg(feature = "server")]
+    #[test]
+    fn two_host_headers_refused() {
+        assert!(matches!(
+            fold(&[("host", b"a.example"), ("host", b"b.example")]),
+            Err(super::HeaderRefusal::DuplicateSingleton)
+        ));
+    }
+
+    /// A name outside the arity table is a singleton: a repeat is refused.
+    #[cfg(feature = "server")]
+    #[test]
+    fn two_unknown_headers_refused() {
+        assert!(matches!(
+            fold(&[("x-tenant", b"a"), ("x-tenant", b"b")]),
+            Err(super::HeaderRefusal::DuplicateSingleton)
+        ));
+    }
+
+    /// An undecodable copy is judged from its bytes, so it neither vanishes
+    /// nor hides the decodable copy beside it; alone it refuses too.
+    #[cfg(feature = "server")]
+    #[test]
+    fn undecodable_copy_does_not_hide_duplicate() {
+        assert!(
+            fold(&[
+                ("authorization", b"\xC3\xA9"),
+                ("authorization", b"Bearer x")
+            ])
+            .is_err()
+        );
+        assert!(matches!(
+            fold(&[("authorization", b"\xC3\xA9")]),
+            Err(super::HeaderRefusal::NotVisibleAscii)
+        ));
+        assert!(matches!(
+            fold(&[("accept", b"a"), ("accept", b"\xC3\xA9")]),
+            Err(super::HeaderRefusal::NotVisibleAscii)
+        ));
+    }
+
+    #[cfg(feature = "server")]
+    #[test]
+    fn list_header_combined_in_order() {
+        let folded = fold(&[("accept", b"a"), ("accept", b"b")]).expect("list copies combine");
+        assert_eq!(folded.get("Accept"), Some("a, b"));
+    }
+
+    /// A split cookie header, even one carrying a non-ASCII pair, is left to
+    /// the cookie parser and never enters the dict.
+    #[cfg(feature = "server")]
+    #[test]
+    fn split_cookie_header_admitted() {
+        let folded = fold(&[("cookie", b"a=1"), ("cookie", b"b=\xC3\xA9")])
+            .expect("a split cookie header is admitted");
+        assert!(!folded.as_dict().contains_key("Cookie"));
+    }
+
+    #[cfg(feature = "http_client")]
+    #[test]
+    fn refusal_text_names_no_header() {
+        for refusal in [
+            super::HeaderRefusal::DuplicateSingleton,
+            super::HeaderRefusal::NotVisibleAscii,
+        ] {
+            let text = refusal.response_text();
+            assert!(!text.contains("Authorization"), "{text}");
+            assert!(!text.contains("Content-Type"), "{text}");
+        }
+    }
+
+    /// Repeated `Set-Cookie` in a response keeps its last decodable copy and
+    /// never refuses; a repeated singleton does.
+    #[cfg(feature = "http_client")]
+    #[test]
+    fn response_set_cookie_keeps_last_decodable_copy() {
+        let dict = super::response_headers([
+            ("set-cookie", b"a=1".as_slice()),
+            ("set-cookie", b"b=2".as_slice()),
+            ("set-cookie", b"c=\xC3\xA9".as_slice()),
+        ])
+        .expect("repeated Set-Cookie is admitted");
+        assert_eq!(dict.get("Set-Cookie").map(String::as_str), Some("b=2"));
+        assert_eq!(
+            super::response_headers([
+                ("content-type", b"a".as_slice()),
+                ("content-type", b"b".as_slice()),
+            ]),
+            Err(super::HeaderRefusal::DuplicateSingleton)
+        );
     }
 }
