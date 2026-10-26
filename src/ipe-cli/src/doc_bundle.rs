@@ -651,15 +651,16 @@ fn ingest_held_dir_additive(
         if !is_markdown_name(name.as_os_str()) {
             continue;
         }
-        let refused = || BundleError::OverlayName {
-            path: dir.path().join(name.as_os_str()),
+        let slug = match name.as_os_str().to_str().map(page_name) {
+            Some(PageName::Page(slug)) => slug.to_owned(),
+            Some(PageName::Housekeeping) => continue,
+            Some(PageName::Refused) | None => {
+                return Err(BundleError::OverlayName {
+                    path: dir.path().join(name.as_os_str()),
+                });
+            }
         };
-        let file_name = name.as_os_str().to_str().ok_or_else(refused)?;
-        match page_name(file_name) {
-            PageName::Page(slug) => pages.push((slug.to_owned(), name.clone())),
-            PageName::Housekeeping => {}
-            PageName::Refused => return Err(refused()),
-        }
+        pages.push((slug, name));
     }
     pages.sort_by(|a, b| a.0.cmp(&b.0));
 
@@ -761,7 +762,13 @@ fn parse_markdown_file(
                 "key" => fm_key = Some(value),
                 "title" => fm_title = Some(value),
                 "order" => {
-                    fm_order = value.parse::<i64>().ok();
+                    let Ok(order) = value.parse::<i64>() else {
+                        return Err(BundleError::MalformedFrontMatter {
+                            source: source_label.to_owned(),
+                            detail: format!("`order: {value}` is not a whole number"),
+                        });
+                    };
+                    fm_order = Some(order);
                 }
                 _ => {}
             }
@@ -1121,6 +1128,18 @@ mod tests {
     }
 
     #[test]
+    fn an_order_that_is_not_a_number_is_refused() {
+        let parsed = parse_markdown_file("p", "---\norder: 2\n---\n# P\n", "p.md");
+        assert!(matches!(parsed, Ok(ParsedMarkdown { order: Some(2), .. })));
+        let refused = parse_markdown_file("p", "---\norder: second\n---\n# P\n", "p.md");
+        assert!(
+            matches!(&refused, Err(BundleError::MalformedFrontMatter { detail, .. }) if detail.contains("second")),
+            "{:?}",
+            refused.err()
+        );
+    }
+
+    #[test]
     fn ingest_absent_kind_dirs_yield_zero_entries() {
         let project = tempdir("ingest_absent");
         fs::create_dir_all(project.join("docs")).unwrap();
@@ -1462,7 +1481,11 @@ mod tests {
             via_alias.is_ok(),
             "an alias reference resolves: {via_alias:?}"
         );
-        assert_eq!(via_alias, via_key, "both spellings link the one page");
+        assert_eq!(
+            via_alias.ok(),
+            via_key.ok(),
+            "both spellings link the one page"
+        );
     }
 
     #[test]

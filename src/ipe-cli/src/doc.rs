@@ -712,37 +712,16 @@ fn build_index() -> Result<Index, CliError> {
     }
 
     // Constructs: sourced from the same embedded corpus as DocBundle::build so
-    // `ipe doc <key>` and the HTML site never drift.  Front-matter is stripped
-    // for terminal display; the slug/key extraction reuses the bundle's own
-    // parsing helpers so there is one code path for both surfaces.
-    {
-        use crate::doc_bundle::DocKind;
-        // Ingest into a temporary map, then harvest parsed entries into the
-        // ipe_docs index.  Errors are silently ignored here — the same policy as
-        // the previous hand-maintained table: a malformed file is skipped rather
-        // than making `ipe doc <key>` fail entirely.
-        let mut maps: BTreeMap<DocKind, BTreeMap<String, crate::doc_bundle::DocEntry>> =
-            BTreeMap::new();
-        let _ = crate::doc_bundle::ingest_embedded_dir(
-            &crate::doc_bundle::EMBEDDED_CONSTRUCTS,
-            DocKind::Construct,
-            &mut maps,
+    // `ipe doc <key>` and the HTML site never drift.
+    for entry in construct_index_entries(&crate::doc_bundle::EMBEDDED_CONSTRUCTS)? {
+        builder.insert(
+            entry.key.clone(),
+            ipe_docs::Entry {
+                kind: ipe_docs::EntryKind::Construct,
+                source_key: entry.key,
+                text: entry.body.as_str().to_owned(),
+            },
         );
-        for entry in maps
-            .get(&DocKind::Construct)
-            .into_iter()
-            .flat_map(|m| m.values())
-        {
-            builder.insert(
-                entry.key.clone(),
-                ipe_docs::Entry {
-                    kind: ipe_docs::EntryKind::Construct,
-                    source_key: entry.key.clone(),
-                    // `body` already has front-matter stripped by `parse_markdown_file`.
-                    text: entry.body.as_str().to_owned(),
-                },
-            );
-        }
     }
 
     // Commands: sourced from the COMMANDS registry so the index never drifts.
@@ -758,6 +737,22 @@ fn build_index() -> Result<Index, CliError> {
     builder.add_env_vars();
 
     Ok(builder.finish())
+}
+
+/// The construct pages of the embedded corpus `dir`, front-matter stripped, in key order.
+///
+/// # Errors
+///
+/// The bundle error of a page `dir` cannot hold: a page is refused, never skipped.
+fn construct_index_entries(dir: &include_dir::Dir<'_>) -> Result<Vec<DocEntry>, CliError> {
+    let mut maps = BTreeMap::new();
+    crate::doc_bundle::ingest_embedded_dir(dir, DocKind::Construct, &mut maps)
+        .map_err(bundle_build_error)?;
+    Ok(maps
+        .remove(&DocKind::Construct)
+        .into_iter()
+        .flat_map(BTreeMap::into_values)
+        .collect())
 }
 
 /// Build the unified [`DocBundle`] from all documentation sources.
@@ -5668,6 +5663,27 @@ fn http_response(headers: &PreviewHeaders, status: &str, content_type: &str, bod
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_construct_page_the_corpus_cannot_hold_refuses_the_index() {
+        use include_dir::{Dir, DirEntry, File};
+
+        let good = [DirEntry::File(File::new(
+            "constructs/case-of.md",
+            b"# Case\n",
+        ))];
+        let entries = construct_index_entries(&Dir::new("constructs", &good)).unwrap();
+        assert_eq!(entries.len(), 1, "a valid page is indexed");
+
+        let bad = [
+            DirEntry::File(File::new("constructs/case-of.md", b"# Case\n")),
+            DirEntry::File(File::new("constructs/Bad Name.md", b"# Bad\n")),
+        ];
+        assert!(
+            construct_index_entries(&Dir::new("constructs", &bad)).is_err(),
+            "a refused page fails the index, never shrinks it"
+        );
+    }
 
     /// The overlay a site build at the repository root reads.
     fn repo_overlay() -> DocsOverlay {
