@@ -55,8 +55,9 @@
 //! `HEAD` request, or with a 204/304 status, carries no body whatever its
 //! headers say. An interim 1xx response (`100 Continue`) is relayed head-only
 //! and the final response read after it, at most [`MAX_INTERIM_RESPONSES`]
-//! times. A `101 Switching Protocols` is refused with a `502`: the bytes after
-//! it are another protocol, which this per-message framer does not carry.
+//! times. A `101 Switching Protocols`, and a 2xx answer to `CONNECT`, is
+//! refused with a `502`: the bytes after it are another protocol, which this
+//! per-message framer does not carry.
 //!
 //! ## Soundness
 //!
@@ -368,10 +369,12 @@ enum BodyFraming {
 }
 
 /// The request method as far as response framing cares: a `HEAD` answer
-/// carries no body whatever its headers declare.
+/// carries no body whatever its headers declare, and a 2xx answer to
+/// `CONNECT` turns the connection into a tunnel.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Method {
     Head,
+    Connect,
     Other,
 }
 
@@ -415,7 +418,7 @@ impl FramingRefusal {
     const fn text(self) -> &'static str {
         match self {
             Self::MissingStartLine => "no request line",
-            Self::MalformedStatusLine => "status code is not three digits",
+            Self::MalformedStatusLine => "malformed status line",
             Self::LineWithoutColon => "header line without a colon",
             Self::SpaceBeforeColon => "whitespace before the header colon",
             Self::HeaderNameNotToken => "header name is not a token",
@@ -470,13 +473,12 @@ impl StartLine for RequestStart {
         if method.is_empty() {
             return Err(FramingRefusal::MissingStartLine);
         }
-        Ok(Self {
-            method: if method == b"HEAD" {
-                Method::Head
-            } else {
-                Method::Other
-            },
-        })
+        let method = match method {
+            b"HEAD" => Method::Head,
+            b"CONNECT" => Method::Connect,
+            _ => Method::Other,
+        };
+        Ok(Self { method })
     }
 }
 
@@ -493,13 +495,19 @@ enum ResponseStatus {
 enum FinalStatus {
     /// 101: the bytes after the head are another protocol, not HTTP.
     SwitchingProtocols,
-    /// 204 or 304: no body whatever the headers say.
-    NoBody,
-    Body,
+    /// 204: no body whatever the headers say; a tunnel when it answers
+    /// `CONNECT`.
+    NoContent,
+    /// 304: no body whatever the headers say.
+    NotModified,
+    /// Any other 2xx: a tunnel when it answers `CONNECT`.
+    Success,
+    Other,
 }
 
-/// A status line: its three-digit code tells interim, upgrade and no-body
-/// answers apart.
+/// A status line, `HTTP/1.0` or `HTTP/1.1`, one SP, a three-digit code, and an
+/// optional SP-led reason phrase: its code tells interim, upgrade, tunnel and
+/// no-body answers apart.
 struct ResponseStart {
     status: ResponseStatus,
 }
@@ -508,16 +516,26 @@ impl StartLine for ResponseStart {
     const ROLE: Role = Role::Response;
 
     fn parse(line: &[u8]) -> Result<Self, FramingRefusal> {
-        let code = line
-            .split(u8::is_ascii_whitespace)
-            .filter(|token| !token.is_empty())
-            .nth(1)
-            .unwrap_or(&[]);
-        let status = match *code {
+        let Some([b'0' | b'1', b' ', hundreds, tens, units, reason @ ..]) =
+            line.strip_prefix(b"HTTP/1.")
+        else {
+            return Err(FramingRefusal::MalformedStatusLine);
+        };
+        let reason_ok = match reason {
+            [] => true,
+            [b' ', phrase @ ..] => phrase.iter().all(|&b| is_field_value_byte(b)),
+            [_, ..] => false,
+        };
+        if !reason_ok {
+            return Err(FramingRefusal::MalformedStatusLine);
+        }
+        let status = match [*hundreds, *tens, *units] {
             [b'1', b'0', b'1'] => ResponseStatus::Final(FinalStatus::SwitchingProtocols),
             [b'1', b'0'..=b'9', b'0'..=b'9'] => ResponseStatus::Interim,
-            [b'2' | b'3', b'0', b'4'] => ResponseStatus::Final(FinalStatus::NoBody),
-            [b'0'..=b'9', b'0'..=b'9', b'0'..=b'9'] => ResponseStatus::Final(FinalStatus::Body),
+            [b'2', b'0', b'4'] => ResponseStatus::Final(FinalStatus::NoContent),
+            [b'3', b'0', b'4'] => ResponseStatus::Final(FinalStatus::NotModified),
+            [b'2', b'0'..=b'9', b'0'..=b'9'] => ResponseStatus::Final(FinalStatus::Success),
+            [b'0'..=b'9', b'0'..=b'9', b'0'..=b'9'] => ResponseStatus::Final(FinalStatus::Other),
             _ => return Err(FramingRefusal::MalformedStatusLine),
         };
         Ok(Self { status })
@@ -848,9 +866,11 @@ fn relay_response(
     };
 
     let body = match (status, request_method) {
-        // The bytes after a `101` head are another protocol: the proxy frames
-        // only HTTP/1.1 messages, so it refuses before relaying one byte.
-        (FinalStatus::SwitchingProtocols, _) => {
+        // The bytes after a `101` head, or after a 2xx answer to `CONNECT`,
+        // are another protocol: the proxy frames only HTTP/1.1 messages, so it
+        // refuses before relaying one byte.
+        (FinalStatus::SwitchingProtocols, _)
+        | (FinalStatus::NoContent | FinalStatus::Success, Method::Connect) => {
             write_refusal(
                 client,
                 RefusalStatus::BadGateway,
@@ -858,8 +878,10 @@ fn relay_response(
             )?;
             return Ok(false);
         }
-        (FinalStatus::NoBody, _) | (FinalStatus::Body, Method::Head) => None,
-        (FinalStatus::Body, Method::Other) => Some(head.framing),
+        (FinalStatus::NoContent | FinalStatus::NotModified, _)
+        | (FinalStatus::Success | FinalStatus::Other, Method::Head) => None,
+        (FinalStatus::Success | FinalStatus::Other, Method::Other)
+        | (FinalStatus::Other, Method::Connect) => Some(head.framing),
     };
     client.write_all(&head.raw)?;
     let keep_alive = match body {
@@ -881,30 +903,15 @@ fn relay_response(
     Ok(keep_alive)
 }
 
-/// Copy exactly `len` bytes from `src` to `dst`.
+/// Copy exactly `len` bytes from `src` to `dst`; the read is limited to `len`,
+/// so the copy never over-reads past this body's end.
 fn copy_exact(src: &mut BufReader<TcpStream>, dst: &mut impl Write, len: u64) -> io::Result<()> {
-    let mut remaining = len;
-    let mut buf = [0u8; COPY_BUF_BYTES];
-    while remaining > 0 {
-        // `want` is capped at the buffer length so the read slot is in-bounds,
-        // and the read is limited to what the caller declared remains so the
-        // copy never over-reads past this body's length.
-        let want = usize::try_from(remaining)
-            .unwrap_or(COPY_BUF_BYTES)
-            .min(COPY_BUF_BYTES);
-        let Some(slot) = buf.get_mut(..want) else {
-            break;
-        };
-        let read = src.read(slot)?;
-        if read == 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                "closed before the declared length was read",
-            ));
-        }
-        let chunk = buf.get(..read).unwrap_or(&buf);
-        dst.write_all(chunk)?;
-        remaining -= read as u64;
+    let copied = io::copy(&mut Read::take(&mut *src, len), dst)?;
+    if copied < len {
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "closed before the declared length was read",
+        ));
     }
     Ok(())
 }
@@ -1747,15 +1754,15 @@ mod tests {
             ),
             (
                 b"HTTP/1.1 204 No Content\r\n\r\n",
-                Ok(ResponseStatus::Final(FinalStatus::NoBody)),
+                Ok(ResponseStatus::Final(FinalStatus::NoContent)),
             ),
             (
                 b"HTTP/1.1 304 Not Modified\r\n\r\n",
-                Ok(ResponseStatus::Final(FinalStatus::NoBody)),
+                Ok(ResponseStatus::Final(FinalStatus::NotModified)),
             ),
             (
                 b"HTTP/1.1 200 OK\r\n\r\n",
-                Ok(ResponseStatus::Final(FinalStatus::Body)),
+                Ok(ResponseStatus::Final(FinalStatus::Success)),
             ),
             (
                 b"HTTP/1.1 20 OK\r\n\r\n",
@@ -1773,6 +1780,18 @@ mod tests {
                 b"HTTP/1.1\r\n\r\n",
                 Err(FramingRefusal::MalformedStatusLine),
             ),
+            (
+                b"HTTP/1.0 200 OK\r\n\r\n",
+                Ok(ResponseStatus::Final(FinalStatus::Success)),
+            ),
+            (
+                b"HTTP/1.1 200\r\n\r\n",
+                Ok(ResponseStatus::Final(FinalStatus::Success)),
+            ),
+            (
+                b"HTTP/1.1 404 Not Found\r\n\r\n",
+                Ok(ResponseStatus::Final(FinalStatus::Other)),
+            ),
         ];
         for (raw, expected) in cases {
             let parsed = Head::<ResponseStart>::parse(raw.to_vec()).map(|head| head.start.status);
@@ -1783,13 +1802,40 @@ mod tests {
         );
         assert!(gzip.as_ref().is_ok_and(|head| {
             head.framing == BodyFraming::None
-                && head.start.status == ResponseStatus::Final(FinalStatus::Body)
+                && head.start.status == ResponseStatus::Final(FinalStatus::Success)
         }));
         let both = Head::<ResponseStart>::parse(
             b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nTransfer-Encoding: chunked\r\n\r\n".to_vec(),
         )
         .map(|head| head.framing);
         assert_eq!(both, Err(FramingRefusal::LengthWithTransferEncoding));
+    }
+
+    /// A status line is `HTTP/1.0` or `HTTP/1.1`, one SP, three digits, and an
+    /// optional SP-led reason: a tab or doubled separator, another version, or
+    /// a control byte in the reason is refused, never read for its code.
+    #[test]
+    fn status_line_shape_refusals() {
+        let cases: &[&[u8]] = &[
+            b"HTTP/1.1\t204\tNo Content\r\n\r\n",
+            b"HTTP/1.1  204 No Content\r\n\r\n",
+            b"HTTP/1.1 204\tNo Content\r\n\r\n",
+            b"HTTP/2 204 No Content\r\n\r\n",
+            b"HTTP/1.2 204 No Content\r\n\r\n",
+            b"http/1.1 204 No Content\r\n\r\n",
+            b"XYZ 204 No Content\r\n\r\n",
+            b" HTTP/1.1 204 No Content\r\n\r\n",
+            b"HTTP/1.1 204 No\x01Content\r\n\r\n",
+        ];
+        for raw in cases {
+            let parsed = Head::<ResponseStart>::parse(raw.to_vec()).map(|head| head.start.status);
+            assert_eq!(
+                parsed,
+                Err(FramingRefusal::MalformedStatusLine),
+                "{}",
+                String::from_utf8_lossy(raw)
+            );
+        }
     }
 
     /// Chunk-size lines: hex digits, an optional extension, CRLF — nothing else.
@@ -2020,8 +2066,13 @@ mod tests {
     /// Drive a probe `GET` at a proxy over `script`; assert the proxy's own
     /// `502`, a closed connection, and not one upstream byte relayed.
     fn assert_response_refused(script: Script, phrase: &str) {
+        assert_response_refused_to(PROBE, script, phrase);
+    }
+
+    /// [`assert_response_refused`] for the response to `request`.
+    fn assert_response_refused_to(request: &[u8], script: Script, phrase: &str) {
         let (proxy, _captured) = proxy_over(script);
-        let (reply, closed) = send_raw(proxy.port(), PROBE);
+        let (reply, closed) = send_raw(proxy.port(), request);
         let text = String::from_utf8_lossy(&reply);
         assert!(
             text.starts_with("HTTP/1.1 502 Bad Gateway\r\n"),
@@ -2049,6 +2100,42 @@ mod tests {
             ),
             FramingRefusal::ProtocolUpgrade.text(),
         );
+    }
+
+    const CONNECT_PROBE: &[u8] = b"CONNECT 127.0.0.1:9 HTTP/1.1\r\nHost: 127.0.0.1:9\r\n\r\n";
+
+    /// A 2xx answer to `CONNECT` makes the connection a tunnel whatever its
+    /// framing headers say, so it is refused like a `101`, not read for a body.
+    #[test]
+    fn success_answer_to_connect_is_refused() {
+        let heads: [&[u8]; 3] = [
+            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n",
+            b"HTTP/1.1 200 OK\r\n\r\n",
+            b"HTTP/1.1 204 No Content\r\n\r\n",
+        ];
+        for head in heads {
+            assert_response_refused_to(
+                CONNECT_PROBE,
+                Script::raw(head, b"ok", false),
+                FramingRefusal::ProtocolUpgrade.text(),
+            );
+        }
+    }
+
+    /// A non-2xx answer to `CONNECT` is an ordinary framed response.
+    #[test]
+    fn refusal_answer_to_connect_is_relayed() {
+        let (proxy, _captured) = proxy_over(Script::raw(
+            b"HTTP/1.1 405 Method Not Allowed\r\nContent-Length: 2\r\n\r\n",
+            b"no",
+            false,
+        ));
+        let mut client = connect(proxy.port());
+        client.write_all(CONNECT_PROBE).unwrap();
+        let mut reader = BufReader::new(client.try_clone().unwrap());
+        let (head, body) = read_response(&mut reader).expect("405 relayed");
+        assert!(head.starts_with(b"HTTP/1.1 405 "));
+        assert_eq!(body, b"no");
     }
 
     #[test]
