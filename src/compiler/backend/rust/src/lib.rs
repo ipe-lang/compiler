@@ -3803,7 +3803,7 @@ impl<'a> EmitCtx<'a> {
     /// deserialized cache entry, a hand-built program) is refused here.
     pub(crate) fn verify_borrows(&self, func: &ipe_ir::Func) -> DResult<()> {
         ipe_ir::borrow::verify(func, &self.passes, &self.enum_variants)
-            .map_err(|v| v.into_diagnostic("ipe_backend_rust::emit_func"))
+            .map_err(|v| v.into_diagnostic(func, self.interner, "ipe_backend_rust::emit_func"))
     }
 
     /// Was the 0-based parameter `idx` of function `id` monomorphized to an

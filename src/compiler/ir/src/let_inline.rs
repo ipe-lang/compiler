@@ -79,6 +79,7 @@ pub fn expr_value_is_non_clone(expr: &Expr, payloads: &EnumPayloadTable) -> bool
         | Expr::Ctor { .. }
         | Expr::BinOp { .. }
         | Expr::Let { .. }
+        | Expr::CaptureClones { .. }
         | Expr::Destructure { .. }
         | Expr::If { .. }
         | Expr::Match(_)
@@ -260,6 +261,13 @@ pub fn scan_free_target_into(
         Expr::TaskSeq { effect, rest } => {
             scan_free_target_into(effect, target, count, has_clonevar);
             scan_free_target_into(rest, target, count, has_clonevar);
+        }
+        Expr::CaptureClones { syms, body } => {
+            if syms.contains(&target) {
+                *has_clonevar = true;
+            } else {
+                scan_free_target_into(body, target, count, has_clonevar);
+            }
         }
     }
 }
@@ -461,6 +469,17 @@ pub fn substitute_var(expr: Expr, target: Symbol, replacement: &Expr) -> Expr {
             effect: Box::new(substitute_var(*effect, target, replacement)),
             rest: Box::new(substitute_var(*rest, target, replacement)),
         },
+        Expr::CaptureClones { syms, body } => {
+            let new_body = if syms.contains(&target) {
+                body
+            } else {
+                Box::new(substitute_var(*body, target, replacement))
+            };
+            Expr::CaptureClones {
+                syms,
+                body: new_body,
+            }
+        }
         Expr::Ctor {
             home,
             ty,

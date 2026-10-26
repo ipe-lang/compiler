@@ -8,7 +8,6 @@ use crate::EmitCtx;
 use crate::render::{LayoutSpend, render_code};
 use core::cell::RefCell;
 use core::fmt::Write as _;
-use ipe_diagnostics::EmitSite;
 use ipe_intern::rust_str_lit;
 use ipe_ir::once_closure::{ClosureSite, admitted_once_parts};
 
@@ -826,38 +825,45 @@ fn name_nesting_site(ctx: &EmitCtx, func: &Func, diag: Diagnostic) -> Diagnostic
         Diagnostic::Lower {
             span,
             msg: LowerError::BackendNestingTooDeep { limit, func: None },
-        } => Diagnostic::Lower {
-            span,
-            msg: LowerError::BackendNestingTooDeep {
-                limit,
-                func: emit_site(ctx, func),
+        } => func.emit_site(ctx.interner).map_or_else(
+            || unresolved_site(func),
+            |site| Diagnostic::Lower {
+                span,
+                msg: LowerError::BackendNestingTooDeep {
+                    limit,
+                    func: Some(site),
+                },
             },
-        },
+        ),
         Diagnostic::Lower {
             span,
             msg: LowerError::BackendTypeTooDeep { limit, func: None },
-        } => Diagnostic::Lower {
-            span,
-            msg: LowerError::BackendTypeTooDeep {
-                limit,
-                func: emit_site(ctx, func),
+        } => func.emit_site(ctx.interner).map_or_else(
+            || unresolved_site(func),
+            |site| Diagnostic::Lower {
+                span,
+                msg: LowerError::BackendTypeTooDeep {
+                    limit,
+                    func: Some(site),
+                },
             },
-        },
+        ),
         other => other,
     }
 }
 
-/// The source-level name and home of `func`, or `None` when a symbol does not
-/// resolve through the build's interner.
-fn emit_site(ctx: &EmitCtx, func: &Func) -> Option<EmitSite> {
-    let home = func
-        .home
-        .0
-        .iter()
-        .map(|segment| ctx.interner.resolve(*segment).map(Box::<str>::from))
-        .collect::<Option<Box<[Box<str>]>>>()?;
-    let name = ctx.interner.resolve(func.name)?.into();
-    Some(EmitSite { home, name })
+/// The compiler bug for a nesting refusal in a function whose name or home
+/// does not resolve through the build's interner.
+fn unresolved_site(func: &Func) -> Diagnostic {
+    Diagnostic::CompilerBug {
+        where_: "ipe_backend_rust::emit_func",
+        detail: format!(
+            "function {} nests past the emit ceiling and its name {:?} or home {:?} does not resolve",
+            func.id.as_raw(),
+            func.name,
+            func.home.0
+        ),
+    }
 }
 
 /// [`emit_func_vis`] before the function is named on a nesting refusal.

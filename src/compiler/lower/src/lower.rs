@@ -17323,10 +17323,11 @@ impl<'a> Lowerer<'a> {
         // The pass fact of every parameter is decided once over the whole
         // program and re-proven at lowering exit; `borrow::run` verifies.
         let env = self.clone_env();
-        ipe_ir::borrow::run(&mut program, |ty| {
+        ipe_ir::borrow::run(&mut program, self.interner, |ty| {
             clone_class::param_is_multiuse_clonable(env, ty)
         })
         .map_err(|d| (d, Vec::new()))?;
+        ipe_ir::refuse_self_clone_lets(&program, self.interner).map_err(|d| (d, Vec::new()))?;
         Ok(program)
     }
 
