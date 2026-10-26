@@ -279,7 +279,8 @@ fn walk_expr(
             body,
             ..
         }
-        | Expr::TailLoop { params: _, body } => {
+        | Expr::TailLoop { params: _, body }
+        | Expr::CaptureClones { syms: _, body } => {
             walk_expr(body, direct_calls, types);
         }
         Expr::Apply { func, args } => {

@@ -88,6 +88,22 @@ pub fn emit_expr_tail(
             let b = emit_expr_tail(ctx, body, indent, child, generics, loop_params)?;
             Ok(format!("{pad}let {n} = {v};\n{b}"))
         }
+        // Each pre-clone is its own statement, as the self-clone `let`s it
+        // stands for; only the body is in tail position.
+        Expr::CaptureClones { syms, body } => {
+            let mut out = String::new();
+            for sym in syms {
+                let n = ctx.emit_local_ident(*sym)?;
+                writeln!(out, "{pad}let {n} = {n}.clone();").map_err(|e| {
+                    Diagnostic::CompilerBug {
+                        where_: "ipe_backend_rust::emit_expr_tail",
+                        detail: format!("writing a pre-clone statement failed: {e}"),
+                    }
+                })?;
+            }
+            let b = emit_expr_tail(ctx, body, indent, child, generics, loop_params)?;
+            Ok(format!("{out}{b}"))
+        }
         Expr::Destructure {
             binder,
             value,
@@ -618,6 +634,10 @@ pub fn elide_task_run_tail(expr: &Expr) -> Option<Expr> {
                 value: value.clone(),
                 body: Box::new(body_e),
             })
+        }
+        Expr::CaptureClones { syms, body } => {
+            let body_e = elide_task_run_tail(body)?;
+            Some(Expr::pre_clone_all(syms.clone(), body_e))
         }
         Expr::Destructure {
             binder,
