@@ -47,32 +47,68 @@ pub(crate) enum HeaderArity {
     CookieJar,
 }
 
+/// The comma-separated list headers, in [`canonical_header`] form: the fields
+/// RFC 9110, 9111 and 9112 define with list syntax, plus the list fields of
+/// `Link`, `Forwarded`, `Prefer`, `Alt-Svc`, `Accept-Patch`, client hints,
+/// Fetch's CORS lists, CSP, Server Timing, trace context, WebSocket and
+/// `X-Forwarded-For`.
+const LIST_HEADERS: [&str; 46] = [
+    "Accept",
+    "Accept-Ch",
+    "Accept-Charset",
+    "Accept-Encoding",
+    "Accept-Language",
+    "Accept-Patch",
+    "Accept-Ranges",
+    "Access-Control-Allow-Headers",
+    "Access-Control-Allow-Methods",
+    "Access-Control-Expose-Headers",
+    "Access-Control-Request-Headers",
+    "Allow",
+    "Alt-Svc",
+    "Authentication-Info",
+    "Baggage",
+    "Cache-Control",
+    "Clear-Site-Data",
+    "Connection",
+    "Content-Encoding",
+    "Content-Language",
+    "Content-Security-Policy",
+    "Content-Security-Policy-Report-Only",
+    "Expect",
+    "Forwarded",
+    "If-Match",
+    "If-None-Match",
+    "Link",
+    "Pragma",
+    "Prefer",
+    "Preference-Applied",
+    "Proxy-Authenticate",
+    "Proxy-Authentication-Info",
+    "Sec-Websocket-Extensions",
+    "Sec-Websocket-Protocol",
+    "Server-Timing",
+    "Te",
+    "Timing-Allow-Origin",
+    "Tracestate",
+    "Trailer",
+    "Transfer-Encoding",
+    "Upgrade",
+    "Vary",
+    "Via",
+    "Warning",
+    "Www-Authenticate",
+    "X-Forwarded-For",
+];
+
 /// The arity of the header named `canonical` (its [`canonical_header`] form).
 ///
 /// The list names are closed; every other name, known or not, is a
 /// singleton, so a repeated header no rule combines is refused, never guessed.
 pub(crate) fn header_arity(canonical: &str) -> HeaderArity {
     match canonical {
-        "Accept"
-        | "Accept-Charset"
-        | "Accept-Encoding"
-        | "Accept-Language"
-        | "Cache-Control"
-        | "Connection"
-        | "Forwarded"
-        | "If-Match"
-        | "If-None-Match"
-        | "Pragma"
-        | "Te"
-        | "Trailer"
-        | "Transfer-Encoding"
-        | "Upgrade"
-        | "Via"
-        | "Warning"
-        | "X-Forwarded-For"
-        | "Sec-Websocket-Extensions"
-        | "Sec-Websocket-Protocol" => HeaderArity::List,
         "Cookie" | "Set-Cookie" => HeaderArity::CookieJar,
+        _ if LIST_HEADERS.contains(&canonical) => HeaderArity::List,
         _ => HeaderArity::Singleton,
     }
 }
@@ -843,6 +879,66 @@ mod tests {
             assert!(!text.contains("Authorization"), "{text}");
             assert!(!text.contains("Content-Type"), "{text}");
         }
+    }
+
+    /// Every list name is spelled as the fold looks it up and listed once, so
+    /// no entry is dead; a cookie header is never a comma-joined list.
+    #[test]
+    fn list_headers_are_canonical_and_distinct() {
+        for (at, name) in super::LIST_HEADERS.iter().enumerate() {
+            assert_eq!(super::canonical_header(name), *name, "{name} is canonical");
+            assert!(
+                !super::LIST_HEADERS
+                    .iter()
+                    .skip(at + 1)
+                    .any(|other| other == name),
+                "{name} is listed once"
+            );
+            assert_eq!(super::header_arity(name), super::HeaderArity::List);
+        }
+        assert_eq!(super::header_arity("Cookie"), super::HeaderArity::CookieJar);
+        assert_eq!(
+            super::header_arity("Set-Cookie"),
+            super::HeaderArity::CookieJar
+        );
+        assert_eq!(
+            super::header_arity("Authorization"),
+            super::HeaderArity::Singleton
+        );
+    }
+
+    /// Prove the admission: standard list fields real messages split over
+    /// lines (`Vary` from a proxy and an app, `Link`, challenges, CORS lists,
+    /// CSP, trace context) combine in order rather than refuse the message,
+    /// while a repeated singleton still refuses.
+    #[test]
+    fn standard_list_fields_combine_rather_than_refuse() {
+        for name in [
+            "vary",
+            "link",
+            "www-authenticate",
+            "access-control-allow-headers",
+            "content-security-policy",
+            "content-encoding",
+            "allow",
+            "server-timing",
+            "tracestate",
+            "prefer",
+        ] {
+            let folded = super::fold_headers([(name, b"a".as_slice()), (name, b"b".as_slice())]);
+            assert_eq!(
+                folded.map(|dict| dict.get(&super::canonical_header(name)).cloned()),
+                Ok(Some("a, b".to_owned())),
+                "{name}"
+            );
+        }
+        assert_eq!(
+            super::fold_headers([
+                ("strict-transport-security", b"max-age=1".as_slice()),
+                ("strict-transport-security", b"max-age=2".as_slice()),
+            ]),
+            Err(super::HeaderRefusal::DuplicateSingleton)
+        );
     }
 
     /// Repeated `Set-Cookie` in a response keeps its last decodable copy and
