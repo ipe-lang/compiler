@@ -245,6 +245,9 @@ fn an_unmeasured_render_keeps_the_charge_unmeasured_until_it_is_evicted() {
 
 /// Every allocation of this test binary goes through the counting wrapper, so
 /// a [`Region`] reads the allocations made between two points of one test.
+///
+/// The counters are process-wide: the reading is exact only while the test is
+/// the process's one running thread, as under nextest's process-per-test run.
 #[global_allocator]
 static GLOBAL: &StatsAlloc<System> = &INSTRUMENTED_SYSTEM;
 
@@ -253,8 +256,8 @@ const BASE_ROWS: usize = 20;
 
 /// Rows the larger stamping fixture adds.
 ///
-/// Both row counts have two-digit indexes, so every row id has the same length
-/// in either fixture.
+/// Both fixtures' last rows have two-digit indexes, so the longest row id, and
+/// with it the shared path buffer's growth, is the same in either fixture.
 const ADDED_ROWS: usize = 50;
 
 /// Heap operations an element costs the stamper.
