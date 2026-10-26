@@ -47,7 +47,8 @@ pub enum DsnDriver {
 /// No inhabitant accepts an unverified peer or a cleartext transport, so a
 /// `Dsn` is a proof that its connection authenticates the server. The
 /// certificate must chain to a root in the `webpki-roots` set the runtime is
-/// built with; the operating system's store is not consulted.
+/// built with, or to one the process environment names in `PGSSLROOTCERT`
+/// (read by the driver); the operating system's store is not consulted.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TlsMode {
     /// The certificate chains to a trusted root and names the dialled host

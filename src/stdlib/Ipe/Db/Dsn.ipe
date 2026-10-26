@@ -66,11 +66,14 @@ type Driver
 -- the server.
 --
 -- The server certificate must chain to a root in the Mozilla root set the
--- runtime is built with; the operating system's certificate store is not
--- consulted, and a certificate issued by a private certificate authority is
--- refused. Where the runtime cannot route a connection through its pinned
--- relay (on platforms other than Unix), a `VerifyFull` connection to a named
--- host is refused; name the server by its IP address or use `VerifyCa`.
+-- runtime is built with, or to a root the process environment names in
+-- `PGSSLROOTCERT`, which the PostgreSQL driver reads; the operating system's
+-- certificate store is not consulted, so a certificate from any other private
+-- certificate authority is refused. Under the default deny-private dial policy,
+-- where the runtime cannot route a connection through its pinned relay (on
+-- platforms other than Unix), a `VerifyFull` connection to a named host is
+-- refused; name the server by an IP address its certificate names, or use
+-- `VerifyCa`.
 type TlsMode
     = VerifyFull
     | VerifyCa
