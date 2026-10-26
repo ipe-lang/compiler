@@ -4,10 +4,17 @@
 //! taken once, at commit, and a recharge reads them back. These tests count the
 //! measure visits of a test message type, deterministically and without a
 //! clock, and pin the cached charge to a fresh walk of the same state.
+//!
+//! Stamping a view's ids is per-event work too: its allocations are counted
+//! through an instrumented global allocator, and its id bytes are pinned to
+//! the id grammar.
 
 #![cfg(all(feature = "web", not(target_arch = "wasm32")))]
 
+use std::alloc::System;
 use std::cell::Cell;
+
+use stats_alloc::{INSTRUMENTED_SYSTEM, Region, StatsAlloc};
 
 use ipe_runtime_rust::dom::{RENDER_HISTORY_DEPTH, Rendered, SessionKeys};
 use ipe_runtime_rust::html::{Attribute, Event, Html, assign_ipe_ids};
@@ -234,4 +241,214 @@ fn an_unmeasured_render_keeps_the_charge_unmeasured_until_it_is_evicted() {
     rendered.commit(view(0)).expect("commit");
     assert!(rendered.resident_bytes().is_some());
     assert_eq!(rendered.resident_bytes(), rendered.measured_fresh());
+}
+
+/// Every allocation of this test binary goes through the counting wrapper, so
+/// a [`Region`] reads the allocations made between two points of one test.
+#[global_allocator]
+static GLOBAL: &StatsAlloc<System> = &INSTRUMENTED_SYSTEM;
+
+/// Rows in the smaller stamping fixture.
+const BASE_ROWS: usize = 20;
+
+/// Rows the larger stamping fixture adds.
+///
+/// Both row counts have two-digit indexes, so every row id has the same length
+/// in either fixture.
+const ADDED_ROWS: usize = 50;
+
+/// Heap operations an element costs the stamper.
+///
+/// They are its `ipe-id` key, its id value, and the one growth of an
+/// exact-capacity attribute vector.
+const STAMP_ALLOCS_PER_ELEMENT: usize = 3;
+
+/// A rail of `rows` leaf `li`s with exact-capacity attributes, beside a header.
+fn stamp_rail(rows: usize) -> Html<()> {
+    let header = Html::HElement(
+        "header".into(),
+        Vec::new(),
+        vec![Html::HElement("span".into(), Vec::new(), Vec::new())],
+    );
+    let rail = Html::HElement(
+        "ul".into(),
+        Vec::new(),
+        (0..rows)
+            .map(|_| {
+                Html::HElement(
+                    "li".into(),
+                    vec![Attribute::Attr("class".into(), "row".into())],
+                    Vec::new(),
+                )
+            })
+            .collect(),
+    );
+    Html::HElement("main".into(), Vec::new(), vec![header, rail])
+}
+
+/// Allocations plus reallocations made while stamping `tree`.
+fn stamp_heap_ops(mut tree: Html<()>) -> usize {
+    let region = Region::new(GLOBAL);
+    assign_ipe_ids(&mut tree, "r");
+    let change = region.change();
+    change.allocations.saturating_add(change.reallocations)
+}
+
+// Each added element costs the stamper exactly its stored id and its id key,
+// plus one attribute-vector growth: no per-child path is built, so the shared
+// path buffer's own growth is a per-tree constant that cancels in the
+// difference.
+#[test]
+fn stamping_allocates_only_each_elements_stored_id() {
+    let base = stamp_heap_ops(stamp_rail(BASE_ROWS));
+    let grown = stamp_heap_ops(stamp_rail(BASE_ROWS.saturating_add(ADDED_ROWS)));
+    assert!(base > 0, "the allocation counter is live");
+    assert_eq!(
+        grown.checked_sub(base),
+        ADDED_ROWS.checked_mul(STAMP_ALLOCS_PER_ELEMENT),
+        "base {base}, grown {grown}"
+    );
+}
+
+/// The `ipe-id` of every element under `node`, in document order.
+fn stamped_ids<M>(node: &Html<M>) -> Vec<String> {
+    let mut ids = Vec::new();
+    let mut pending = vec![node];
+    while let Some(next) = pending.pop() {
+        if let Html::HElement(_, attrs, kids) = next {
+            ids.extend(attrs.iter().find_map(|a| match a {
+                Attribute::Attr(k, v) if k == "ipe-id" => Some(v.clone()),
+                _ => None,
+            }));
+            pending.extend(kids.iter().rev());
+        }
+    }
+    ids
+}
+
+/// The ids the grammar `{root}(_{idx}_{tag})*` names under `node`, in document order.
+///
+/// Each id is built whole by `format!`. It holds for a tree with no key and only
+/// alphanumeric tags, whose segments need no escape.
+fn grammar_ids<M>(node: &Html<M>, root: &str) -> Vec<String> {
+    let mut ids = Vec::new();
+    let mut pending = vec![(node, root.to_owned())];
+    while let Some((next, id)) = pending.pop() {
+        if let Html::HElement(_, _, kids) = next {
+            let mut idx = kids
+                .iter()
+                .filter(|kid| matches!(kid, Html::HElement(..)))
+                .count();
+            for kid in kids.iter().rev() {
+                if let Html::HElement(tag, _, _) = kid {
+                    idx = idx.saturating_sub(1);
+                    pending.push((kid, format!("{id}_{idx}_{tag}")));
+                }
+            }
+            ids.push(id);
+        }
+    }
+    ids
+}
+
+/// Elements in the deep chain of the identity fixture.
+const CHAIN_DEPTH: usize = 600;
+
+/// Rows in the wide list of the identity fixture.
+const WIDE_ROWS: usize = 1500;
+
+// The shared path buffer yields, for a chain hundreds deep and a list
+// thousands wide, the same id bytes as each id built whole from the grammar:
+// every truncate restores the parent's id exactly, and a text node between
+// siblings takes no index.
+#[test]
+fn stamped_ids_of_deep_and_wide_trees_follow_the_grammar() {
+    let mut chain: Html<()> = Html::HElement("b".into(), Vec::new(), Vec::new());
+    for depth in 0..CHAIN_DEPTH {
+        let tag = if depth % 2 == 0 { "div" } else { "section" };
+        chain = Html::HElement(tag.into(), Vec::new(), vec![chain]);
+    }
+    let wide = Html::HElement(
+        "ul".into(),
+        Vec::new(),
+        (0..WIDE_ROWS)
+            .map(|i| {
+                if i % 7 == 0 {
+                    Html::HText(format!("gap {i}"))
+                } else {
+                    Html::HElement(
+                        "li".into(),
+                        Vec::new(),
+                        vec![Html::HElement("span".into(), Vec::new(), Vec::new())],
+                    )
+                }
+            })
+            .collect(),
+    );
+    let mut tree = Html::HElement("main".into(), Vec::new(), vec![chain, wide]);
+    let expected = grammar_ids(&tree, "r");
+    assign_ipe_ids(&mut tree, "r");
+    let ids = stamped_ids(&tree);
+    assert!(
+        ids.len() > CHAIN_DEPTH.saturating_add(WIDE_ROWS),
+        "every element is stamped: {}",
+        ids.len()
+    );
+    assert_eq!(ids, expected);
+}
+
+// The id bytes of keyed, named and radio-grouped elements are pinned to the
+// literal ids the grammar gives them: the key segment escapes `.` and `_`, and
+// a grouped radio's key is the group name its fieldset's id derives.
+#[test]
+fn stamped_ids_of_keyed_named_and_grouped_elements_are_pinned() {
+    let keyed = |key: &str| {
+        Html::HElement(
+            "li".into(),
+            vec![Attribute::Attr("ipe-key".into(), key.into())],
+            Vec::new(),
+        )
+    };
+    let radio = || {
+        Html::HElement(
+            "input".into(),
+            vec![Attribute::Attr("type".into(), "radio".into())],
+            Vec::new(),
+        )
+    };
+    let mut tree: Html<()> = Html::HElement(
+        "main".into(),
+        Vec::new(),
+        vec![
+            Html::HElement("ul".into(), Vec::new(), vec![keyed("a.b"), keyed("c")]),
+            Html::HElement(
+                "input".into(),
+                vec![Attribute::Attr("name".into(), "q".into())],
+                Vec::new(),
+            ),
+            Html::HText("gap".into()),
+            Html::HElement(
+                "fieldset".into(),
+                vec![Attribute::Attr(
+                    "data-ipe-radio-group".into(),
+                    String::new(),
+                )],
+                vec![radio(), radio()],
+            ),
+        ],
+    );
+    assign_ipe_ids(&mut tree, "r");
+    assert_eq!(
+        stamped_ids(&tree),
+        [
+            "r",
+            "r_0_ul",
+            "r_0_ul_0_li:a.2eb",
+            "r_0_ul_1_li:c",
+            "r_1_input:q",
+            "r_2_fieldset",
+            "r_2_fieldset_0_input:ipe-rg-r.5f2.5ffieldset",
+            "r_2_fieldset_1_input:ipe-rg-r.5f2.5ffieldset",
+        ]
+    );
 }
