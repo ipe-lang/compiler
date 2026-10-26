@@ -6,18 +6,17 @@
 
 use std::ffi::{OsStr, OsString};
 use std::path::Path;
-#[cfg(target_os = "windows")]
-use std::path::PathBuf;
 
 use super::SandboxProfile;
 #[cfg(target_os = "windows")]
 use super::{RunJailDefect, RunJailTools};
 
-/// Windows: the run jail's primitives are Win32 kernel objects (a Job Object, an
-/// AppContainer lowbox token), built directly through the Windows API rather than
-/// by exec'ing an external tool. There is no `bwrap`/`prlimit`/`sandbox-exec`
-/// binary to locate, so this returns an inert "primitives are the kernel API"
-/// token whose paths are never used for a tool invocation; the real
+/// Windows: the run jail's primitives are Win32 kernel objects.
+///
+/// A Job Object and an `AppContainer` lowbox token are built directly through the
+/// Windows API rather than by exec'ing an external tool. There is no
+/// `bwrap`/`prlimit`/`sandbox-exec` binary to locate, so this returns the
+/// [`RunJailTools::Native`] arm, which carries no tool path at all; the real
 /// constructibility check — and the fail-closed refusal when a primitive cannot
 /// be created — happens inside [`exec_in_run_jail`] at launch, where the objects
 /// are actually built.
@@ -32,22 +31,9 @@ use super::{RunJailDefect, RunJailTools};
 /// the primitive construction that CAN fail is in [`exec_in_run_jail`], which
 /// refuses (never runs unconfined) on any failure.
 #[cfg(target_os = "windows")]
-#[allow(
-    clippy::missing_const_for_fn,
-    clippy::unnecessary_wraps,
-    clippy::doc_markdown,
-    clippy::too_long_first_doc_paragraph
-)]
+#[allow(clippy::missing_const_for_fn, clippy::unnecessary_wraps)]
 pub fn probe_run_jail_tools(_wants_wall_clock: bool) -> Result<RunJailTools, RunJailDefect> {
-    // An inert token: the fields are the same placeholder path, never invoked as a
-    // Unix tool. The Windows arm builds its kernel objects directly and does not
-    // read these.
-    let placeholder = PathBuf::from("windows-run-jail-native");
-    Ok(RunJailTools {
-        bwrap: placeholder.clone(),
-        prlimit: placeholder.clone(),
-        timeout: Some(placeholder),
-    })
+    Ok(RunJailTools::Native)
 }
 
 /// Run the emitted `app` binary inside the Windows run jail described by

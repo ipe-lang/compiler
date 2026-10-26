@@ -17,7 +17,7 @@ messages, PR bodies, and prompt history.
 Block types: headers (# / ## / ### / #### / ##### / ######), paragraphs,
 fenced code blocks (```), bullet lists (- / *), ordered lists (1.),
 horizontal rules (---), tables (| ... | separator | ... |),
-blockquotes (> …, nestable).
+blockquotes (> …, nestable to 32 levels).
 
 Inline: **bold**, *italic*, `code`, [text](url), ![alt](url) images,
 trailing-double-space → line break.
@@ -31,9 +31,14 @@ image `src` become HTML attributes, which the runtime attribute sink
 (`sanitise_url_attr`) validates as the single SSOT guard: it normalises the
 scheme (stripping leading and intra-scheme control/whitespace, case) and
 neutralises `javascript:`/`vbscript:`/dangerous `data:` schemes, allowing
-only safe schemes and raster `data:image` URLs. Feed untrusted markdown
-without an extra sanitisation step. (Compare: HTML-string renderers need a
+only safe schemes and raster `data:image` URLs, so the output is HTML-safe
+with no extra sanitisation step. (Compare: HTML-string renderers need a
 sanitiser equivalent to bluemonday; this one does not.)
+
+Bounds: parsing runs in time linear in the input's size, with a stack
+bounded by the quote ceiling. Quotes nest at most 32 deep; text
+quoted deeper renders as one flat paragraph. The caller bounds the input's
+size.
 
 Chrome colours (code surfaces, dividers, list markers, blockquote
 left-rules) derive from the inherited theme foreground via `currentColor`,

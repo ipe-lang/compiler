@@ -1319,6 +1319,14 @@ ipe package audit: no `package.ipe` in `{path}` — the gate audits a publishabl
 
 ipe package audit: `{path}` is neither an Ipê project directory nor a package.ipe
 
+## audit-refuses-unsandboxed-override
+
+`IPE_FFI_ALLOW_UNSANDBOXED=1` is set — the gate regenerates a native package's FFI bindings only inside the sandbox and never honours the unsandboxed override; unset it and run the audit again
+
+## audit-requires-a-jail
+
+no sandbox mechanism is available on this host — the gate regenerates a native package's FFI bindings only inside a bubblewrap jail; install bubblewrap (`bwrap`) and run the audit again
+
 ## index-entry-path-invalid
 
 {path} is not a `packages/<name>.toml` entry file — the file stem names the package

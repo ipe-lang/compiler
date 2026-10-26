@@ -260,10 +260,22 @@ page load: the copy is rebuilt from it, the banner shows, and a unit whose
 decision no longer counts is back in the queue. A replaced review DB has a new log id, so it re-opens
 every unit the old one decided. Startup always rebuilds the copy once.
 
+A page is built only from a copy that proof admitted: the stamp check and the
+digest comparison are one function, `proveCopy`, whose result is the only
+value the page builder accepts, so no page can be assembled from a copy the
+check did not pass. A copy that still fails after one rebuild fails the load
+with the check it failed: a stamp not current for the log's verdict, a copy
+with no proven digest (its table shape or row count), or pairs that differ
+from the verified entries'.
+
 The index DB is opened read-only for listing and read-write (never created) only
-to drain a decided unit: in one transaction its pair enters `reviewed`, its
-consumed `change_queue` row is deleted, and the stamp moves. The app creates
-and owns the review DB.
+to drain a decided unit: the drain first looks the decided pair up in the
+review log under the configured key and writes only the pair of a row whose
+mac verified there; a pair that no verified row holds (none recorded, another
+hash recorded, a row signed under another key, a broken log) writes nothing
+and leaves the unit queued. In one transaction the log's pair enters
+`reviewed`, the `change_queue` row consumed for that hash is deleted, and the
+stamp moves. The app creates and owns the review DB.
 
 ### Unreviewable files
 

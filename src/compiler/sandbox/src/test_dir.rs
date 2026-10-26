@@ -29,3 +29,18 @@ impl TestDir {
         &self.path
     }
 }
+
+/// `abs` spelled relative to the working directory, so a resolver that joined a
+/// relative `PATH` entry onto that directory would reach it.
+#[cfg(unix)]
+#[must_use]
+pub fn relative_spelling(abs: &Path) -> PathBuf {
+    let depth = std::env::current_dir().map_or(0, |cwd| {
+        cwd.components()
+            .filter(|c| matches!(c, std::path::Component::Normal(_)))
+            .count()
+    });
+    let mut rel: PathBuf = std::iter::repeat_n("..", depth).collect();
+    rel.push(abs.strip_prefix("/").unwrap_or(abs));
+    rel
+}

@@ -7023,7 +7023,10 @@ iced = "=0.12.1"
     }
 
     fn bwrap() -> ipe_sandbox::Mechanism {
-        ipe_sandbox::Mechanism::Bwrap(PathBuf::from("/usr/bin/bwrap"))
+        ipe_sandbox::Mechanism::Bwrap(
+            ipe_sandbox::ToolPath::assumed(Path::new("/usr/bin"), ipe_sandbox::HostTool::Bwrap)
+                .expect("an absolute test directory"),
+        )
     }
 
     #[test]

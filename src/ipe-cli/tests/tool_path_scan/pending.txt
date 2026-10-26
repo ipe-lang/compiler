@@ -1,0 +1,15 @@
+# Sites not yet moved onto `ipe_sandbox::host_tool`: `<path> <count>`, shrink-only.
+# A count is the file's `split_paths`/`join_paths` identifiers plus its spawns of
+# a relative literal program; see `tool_path_scan.rs`.
+src/compiler/backend/rust/src/emit_doc.rs 1
+src/ipe-cli/src/build_plan.rs 1
+src/ipe-cli/src/driver/commands_pkg.rs 1
+src/ipe-cli/src/ffi.rs 1
+src/ipe-cli/src/health.rs 2
+src/ipe-cli/src/remote_ingest.rs 2
+src/ipe-cli/src/toolchain.rs 3
+src/ipe-cli/src/watch.rs 1
+tools/e2e-support/src/lib.rs 2
+tools/ipe-ffi-inspector/src/main.rs 6
+tools/ipe-index/src/walk.rs 1
+tools/regen-cli-transcripts/src/main.rs 1

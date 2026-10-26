@@ -39,7 +39,7 @@ use std::path::PathBuf;
 use ipe_diagnostics::{Code, Diagnostic as SharedDiag, IPE_F4413, SandboxError};
 use ipe_kernels::Capability;
 
-use crate::{JailMounts, JailPathError};
+use crate::{HostTool, JailMounts, JailPathError, ToolPath};
 
 /// Stamp `$item` with the `#[cfg(...)]` for the targets that HAVE a real run
 /// jail compiled into [`exec_in_run_jail`], and the negation on a matching `no:`
@@ -216,16 +216,55 @@ impl<'fd> SealedFdNumber<'fd> {
 
 // ── the Linux jail argv builder ─────────────────────────────────────────────
 
-/// The paths of the host tools the run jail needs. `bwrap` and `prlimit` are
-/// mandatory; `timeout` is only needed when the profile sets a wall-clock cap.
+/// The host tools a run jail is built from, one arm per jail mechanism.
+///
+/// Every tool is a [`ToolPath`], resolved from an absolute `PATH` entry alone,
+/// so no arm can name a program the working directory supplies, and an arm
+/// never carries a placeholder: a mechanism without host tools is [`Native`].
+///
+/// [`Native`]: RunJailTools::Native
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RunJailTools {
+pub enum RunJailTools {
+    /// The Linux jail: bubblewrap, `prlimit`, and the optional wall clock.
+    Bwrap(BwrapTools),
+    /// The macOS Seatbelt jail.
+    Seatbelt {
+        /// `sandbox-exec`.
+        sandbox_exec: ToolPath,
+    },
+    /// A jail the platform's own primitives build (FreeBSD `jail(8)`, the
+    /// Windows Job Object and `AppContainer`); the helpers such a jail spawns are
+    /// resolved where they are spawned.
+    Native,
+}
+
+/// The Linux jail's tools. `bwrap` and `prlimit` are mandatory; `timeout` is
+/// only needed when the profile sets a wall-clock cap.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BwrapTools {
     /// `bwrap` — the namespaces + `--seccomp` loader.
-    pub bwrap: PathBuf,
+    pub bwrap: ToolPath,
     /// `prlimit` — the resource caps (mandatory).
-    pub prlimit: PathBuf,
+    pub prlimit: ToolPath,
     /// `timeout` — the wall clock, needed only when `limits.wall_secs` is set.
-    pub timeout: Option<PathBuf>,
+    pub timeout: Option<ToolPath>,
+}
+
+impl RunJailTools {
+    /// The Linux jail's tools, when this is the bubblewrap arm.
+    ///
+    /// # Errors
+    ///
+    /// [`RunJailDefect::PrimitiveUnavailable`] naming `bwrap` and `prlimit` for
+    /// every other arm: no bubblewrap argv can be built from them.
+    pub fn bwrap_tools(&self) -> Result<&BwrapTools, RunJailDefect> {
+        match self {
+            Self::Bwrap(tools) => Ok(tools),
+            Self::Seatbelt { .. } | Self::Native => Err(RunJailDefect::PrimitiveUnavailable {
+                missing: vec![HostTool::Bwrap.name(), HostTool::Prlimit.name()],
+            }),
+        }
+    }
 }
 
 /// Build the `bwrap` argv that runs `payload` under the jail `profile`
@@ -344,7 +383,7 @@ pub fn run_jail_argv_with_delivery<'fd>(
 /// mints the proof runs through it; every other caller goes through the two
 /// builders above.
 fn jail_argv_unproven<'fd>(
-    tools: &RunJailTools,
+    tools: &BwrapTools,
     profile: &SandboxProfile,
     mounts: &JailMounts,
     seccomp_fd: Option<SealedFdNumber<'fd>>,
@@ -1188,12 +1227,52 @@ mod tests {
         assert!(subset.is_at_least_as_isolated_as(&floor));
     }
 
+    /// The tool assumed under `/usr/bin`.
+    fn usr_bin(tool: HostTool) -> ToolPath {
+        ToolPath::assumed(std::path::Path::new("/usr/bin"), tool).expect("an absolute directory")
+    }
+
     fn scope() -> NprocScope {
-        NprocScope::for_test(RunJailTools {
-            bwrap: PathBuf::from("/usr/bin/bwrap"),
-            prlimit: PathBuf::from("/usr/bin/prlimit"),
-            timeout: Some(PathBuf::from("/usr/bin/timeout")),
+        NprocScope::for_test(BwrapTools {
+            bwrap: usr_bin(HostTool::Bwrap),
+            prlimit: usr_bin(HostTool::Prlimit),
+            timeout: Some(usr_bin(HostTool::Timeout)),
         })
+    }
+
+    /// Only the bubblewrap arm carries the tools a bubblewrap argv names; the
+    /// other arms refuse the proof instead of lending it a placeholder.
+    #[test]
+    fn run_jail_tools_arms_are_exhaustive() {
+        let bwrap = RunJailTools::Bwrap(BwrapTools {
+            bwrap: usr_bin(HostTool::Bwrap),
+            prlimit: usr_bin(HostTool::Prlimit),
+            timeout: None,
+        });
+        assert!(bwrap.bwrap_tools().is_ok());
+        let refused = [
+            RunJailTools::Native,
+            RunJailTools::Seatbelt {
+                sandbox_exec: usr_bin(HostTool::SandboxExec),
+            },
+        ];
+        for tools in &refused {
+            assert_eq!(
+                tools.bwrap_tools().err(),
+                Some(RunJailDefect::PrimitiveUnavailable {
+                    missing: vec!["bwrap", "prlimit"],
+                }),
+                "{tools:?}"
+            );
+            assert!(
+                matches!(
+                    prove(tools),
+                    Err(RunJailDefect::PrimitiveUnavailable { missing })
+                        if missing == vec!["bwrap", "prlimit"]
+                ),
+                "{tools:?}"
+            );
+        }
     }
 
     /// Mounts over paths that need not exist, checked against a cargo home
@@ -1392,7 +1471,7 @@ mod tests {
         };
         let build: Vec<String> = crate::bwrap_argv(
             &scope(),
-            Path::new("/usr/bin/timeout"),
+            &usr_bin(HostTool::Timeout),
             &spec,
             &[OsString::from("cargo")],
         )

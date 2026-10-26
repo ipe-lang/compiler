@@ -2008,20 +2008,24 @@ type Written
 -- The review app consumes and clears explicitly: after a unit is decided,
 -- one index transaction adds the pair to the `reviewed` copy, deletes the
 -- unit's change_queue row for that hash, and moves the copy's stamp along
--- the review log. A new decision moves the stamp from `prev` to `next` only
--- if it still reads `prev`; any other stamp means the copy missed a
--- decision, so the stamp row is deleted and the next load rebuilds the copy
--- rather than vouch for it. An already-decided pair leaves the stamp alone.
--- Returns the count of queue rows deleted. The index is the one `settings`
--- names, resolved once at startup.
-drainUnit : IndexSettings -> Attested -> Written -> Task.Task Error Int
-drainUnit settings attested written =
+-- the review log. The pair is a `DecidedPair`: one read back from a log row
+-- whose mac verified, so the copy takes the log's pair, never a message's
+-- or a request's. `written` is a hint for the stamp alone: a new decision
+-- moves the stamp from `prev` to `next` only if it still reads `prev`; any
+-- other stamp means the copy missed a decision, so the stamp row is deleted
+-- and the next load rebuilds the copy rather than vouch for it. An
+-- already-decided pair leaves the stamp alone. A wrong `written` can only
+-- cost a rebuild; it can never make a pair counted or uncounted. Returns
+-- the count of queue rows deleted. The index is the one `settings` names,
+-- resolved once at startup.
+drainUnit : IndexSettings -> DecidedPair -> Written -> Task.Task Error Int
+drainUnit settings pair written =
     do
         conn <- Db.open settings.db.write
         Db.withTransaction conn
             (\tx ->
                 do
-                    drained <- drainPair tx (attestedUid attested) (attestedHash attested)
+                    drained <- drainDecided tx pair
                     moveStamp tx written
                     Task.succeed drained
             )
@@ -2079,7 +2083,8 @@ decidedPairKey pair =
             ( p.uid, p.hash )
 
 
--- One decided pair drained on `conn`, the refill step of `rebuildReviewed`.
+-- One decided pair drained on `conn`: the refill step of `rebuildReviewed`
+-- and the write a `drainUnit` makes.
 -- Atomic only inside the transaction `rebuildReviewed` opens.
 drainDecided : Db.Db -> DecidedPair -> Task.Task Error Int
 drainDecided conn pair =

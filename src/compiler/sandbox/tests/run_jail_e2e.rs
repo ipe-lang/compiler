@@ -38,8 +38,9 @@ use std::path::Path;
 use std::process::Command;
 
 use ipe_sandbox::run_jail::{
-    CanaryExit, FilesystemScope, ProcCap, RunJailDefect, RunJailTools, RunResourceLimits,
-    SCOPE_SCRIPT, SandboxProfile, Scope, TEETH_SCRIPT, classify, prove, run_jail_argv,
+    BwrapTools, CanaryExit, FilesystemScope, ProcCap, RunJailDefect, RunJailTools,
+    RunResourceLimits, SCOPE_SCRIPT, SandboxProfile, Scope, TEETH_SCRIPT, classify, prove,
+    run_jail_argv,
 };
 use ipe_sandbox::{CanonicalPath, JailMounts};
 
@@ -64,11 +65,11 @@ fn e2e_tools() -> Option<RunJailTools> {
     let caps = ipe_sandbox::probe();
     let bwrap = caps.bwrap?;
     let prlimit = caps.prlimit?;
-    let tools = RunJailTools {
+    let tools = RunJailTools::Bwrap(BwrapTools {
         bwrap,
         prlimit,
         timeout: caps.timeout,
-    };
+    });
     // The proof's canaries spawn children, so they run under the lock that
     // keeps every inheritable memfd to its one jail.
     let proven = {
@@ -537,7 +538,9 @@ fn nproc_scope_is_proven_on_this_host() {
     let Some(tools) = e2e_tools() else { return };
     let proven = prove(&tools);
     assert!(
-        proven.as_ref().is_ok_and(|scope| scope.tools() == &tools),
+        proven.as_ref().is_ok_and(|scope| tools
+            .bwrap_tools()
+            .is_ok_and(|bwrap| scope.tools() == bwrap)),
         "the proof must succeed and carry the tools it measured: {proven:?}"
     );
 }
@@ -545,10 +548,15 @@ fn nproc_scope_is_proven_on_this_host() {
 /// A `/bin/sh -c script` jail with `prlimit` OUTSIDE `bwrap`, so `cap` is set
 /// in the invoker's namespace and counts every task the user owns.
 fn user_wide_canary(tools: &RunJailTools, cap: ProcCap, script: &str) -> CanaryExit {
-    let status = Command::new(&tools.prlimit)
+    let tools = tools
+        .bwrap_tools()
+        .expect("the e2e tools are the bubblewrap arm");
+    let status = tools
+        .prlimit
+        .command()
         .arg(format!("--nproc={}", cap.get()))
         .arg("--")
-        .arg(&tools.bwrap)
+        .arg(tools.bwrap.as_path())
         .args([
             "--unshare-user",
             "--unshare-pid",
@@ -669,5 +677,27 @@ fn a_fork_bomb_is_bounded_in_a_granted_jail() {
         bounded.stderr.to_lowercase().contains("fork"),
         "the jail must fail on a refused fork, not on another error: {}",
         bounded.stderr
+    );
+}
+
+/// A tools value without bubblewrap never reaches a launch: the jail refuses
+/// before any path is resolved or any child is spawned, on any host.
+#[test]
+fn jail_refuses_a_native_tools_value() {
+    let refusal = ipe_sandbox::run_jail::exec_in_run_jail(
+        &RunJailTools::Native,
+        &SandboxProfile::maximally_isolated(),
+        Path::new("/nonexistent/scratch"),
+        Path::new("/nonexistent/tree"),
+        Path::new("/nonexistent/app"),
+        &[],
+    );
+    assert!(
+        matches!(
+            &refusal,
+            Err(RunJailDefect::PrimitiveUnavailable { missing })
+                if missing == &vec!["bwrap", "prlimit"]
+        ),
+        "{refusal:?}"
     );
 }

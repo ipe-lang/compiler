@@ -162,9 +162,10 @@ fn a_native_bearing_package_with_no_probeable_entrypoint_fails_closed() {
         "a native-bearing package must fail closed — never certify un-observed; \
          stdout:\n{stdout}\nstderr:\n{stderr}"
     );
-    // Any of these checks firing is a valid fail-closed reject.
+    // Any of these checks firing is a valid fail-closed reject. A host without a
+    // jail is refused at binding regeneration before any generator runs.
     assert!(
-        stderr.contains("regenerate FFI bindings")
+        stderr.contains("native FFI binding regeneration")
             || stderr.contains("provenance panic-scan")
             || stderr.contains("native Tier-2 capability enforcement"),
         "the reject names a fail-closed check (binding regeneration, provenance, or Tier-2); \
@@ -204,74 +205,50 @@ mod real_jail {
     };
     use ipe_ir::Capability;
     use ipe_sandbox::build_jail::build_in_jail;
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    use ipe_sandbox::run_jail::BwrapTools;
     use ipe_sandbox::run_jail::{RunJailTools, SandboxProfile};
-    use ipe_sandbox::{CanonicalPath, JailMounts};
+    use ipe_sandbox::{CanonicalPath, HostTool, JailMounts, host_tool};
 
     /// `build_in_jail` mutates the process-global fd table (a `memfd`) on Linux;
     /// serialize the jailed runs so parallel `--test-threads` cannot race.
     static JAIL_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     /// Probe the host for the jail primitive, returning the [`RunJailTools`] the
-    /// jail is built from (bwrap+prlimit on Linux; sandbox-exec on macOS, whose
-    /// fields the jail ignores). `None` when the primitive is absent.
+    /// jail is built from (bwrap+prlimit on Linux). `None` when the primitive is
+    /// absent.
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     fn probe_tools() -> Option<RunJailTools> {
         let caps = ipe_sandbox::probe();
-        Some(RunJailTools {
+        Some(RunJailTools::Bwrap(BwrapTools {
             bwrap: caps.bwrap?,
             prlimit: caps.prlimit?,
             timeout: caps.timeout,
-        })
+        }))
     }
 
-    /// macOS: the jail primitive is `sandbox-exec`; the `RunJailTools` fields are
-    /// unused by the macOS `build_in_jail` (a present-primitive placeholder).
+    /// macOS: the jail primitive is `sandbox-exec`, resolved from an absolute
+    /// `PATH` entry.
     #[cfg(target_os = "macos")]
     fn probe_tools() -> Option<RunJailTools> {
-        let path = ipe_env::var_os("PATH")?;
-        let sandbox_exec = std::env::split_paths(&path)
-            .map(|d| d.join("sandbox-exec"))
-            .find(|p| p.is_file())?;
-        Some(RunJailTools {
-            bwrap: sandbox_exec.clone(),
-            prlimit: sandbox_exec,
-            timeout: None,
-        })
+        let sandbox_exec = host_tool::resolve(HostTool::SandboxExec).ok()?;
+        Some(RunJailTools::Seatbelt { sandbox_exec })
     }
 
-    /// FreeBSD: the jail primitive is `jail(8)`; the `RunJailTools` fields are
-    /// unused by the FreeBSD `build_in_jail` (a present-primitive placeholder).
+    /// FreeBSD: the jail primitive is `jail(8)`, which the FreeBSD
+    /// `build_in_jail` resolves itself.
     #[cfg(target_os = "freebsd")]
     fn probe_tools() -> Option<RunJailTools> {
-        let path = ipe_env::var_os("PATH")?;
-        let jail = std::env::split_paths(&path)
-            .map(|d| d.join("jail"))
-            .find(|p| p.is_file())?;
-        Some(RunJailTools {
-            bwrap: jail.clone(),
-            prlimit: jail,
-            timeout: None,
-        })
+        host_tool::resolve(HostTool::Jail).ok()?;
+        Some(RunJailTools::Native)
     }
 
-    /// Windows: the probe interpreter is `powershell.exe` (the
-    /// `CreateProcessW`-invokable payload[0] the Windows `build_in_jail` runs
-    /// directly, driving the `.ps1` wrapper). The `RunJailTools` fields are read
-    /// by the POSIX arms but ignored by the Windows `build_in_jail` (which builds
-    /// its Job Object + AppContainer itself) — the confirmed interpreter is a
-    /// present-primitive placeholder, so `bwrap` carries the resolved
-    /// `powershell.exe` the payload runs.
+    /// Windows: the jail builds its Job Object + `AppContainer` itself; the probe
+    /// interpreter `powershell.exe` must resolve for any probe to run.
     #[cfg(target_os = "windows")]
     fn probe_tools() -> Option<RunJailTools> {
-        let path = ipe_env::var_os("PATH")?;
-        let powershell = std::env::split_paths(&path)
-            .map(|d| d.join("powershell.exe"))
-            .find(|p| p.is_file())?;
-        Some(RunJailTools {
-            bwrap: powershell.clone(),
-            prlimit: powershell,
-            timeout: None,
-        })
+        host_tool::resolve(HostTool::PowerShell).ok()?;
+        Some(RunJailTools::Native)
     }
 
     /// Skip unless `IPE_E2E=1`, the jail primitive is present, AND a jail can
@@ -298,9 +275,11 @@ mod real_jail {
     }
 
     #[cfg(target_os = "windows")]
-    fn canary_payload(tools: &RunJailTools) -> Vec<OsString> {
+    fn canary_payload(_tools: &RunJailTools) -> Vec<OsString> {
         vec![
-            tools.bwrap.clone().into_os_string(),
+            host_tool::resolve(HostTool::PowerShell)
+                .expect("probe_tools resolved powershell.exe")
+                .into_os_string(),
             OsString::from("-NoProfile"),
             OsString::from("-NonInteractive"),
             OsString::from("-Command"),
@@ -680,17 +659,9 @@ mod real_jail {
         );
     }
 
+    /// `cargo`, resolved from an absolute `PATH` entry as the audit resolves it.
     fn which_cargo() -> Option<PathBuf> {
-        let path = ipe_env::var_os("PATH")?;
-        // `cargo` on POSIX, `cargo.exe` on Windows.
-        let names: &[&str] = if cfg!(target_os = "windows") {
-            &["cargo.exe", "cargo"]
-        } else {
-            &["cargo"]
-        };
-        std::env::split_paths(&path)
-            .flat_map(|dir| names.iter().map(move |n| dir.join(n)))
-            .find(|p| p.is_file())
+        host_tool::resolve(HostTool::Cargo).ok().map(Into::into)
     }
 
     // Keep the imports honest under all cfgs.

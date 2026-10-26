@@ -1,4 +1,4 @@
-module Lib.Db exposing (BreakAt(..), CellCeiling, Decision(..), HistoryCursor(..), HistoryRows, LogRow, LogShown(..), LogState, LogVerdict(..), ProvenHead, Reason, ReviewEntry(..), RowName(..), StoredDecision(..), StoredReason, Unverified(..), UnverifiedRow, VerifiedRow, Verifier, advanceHead, cellHeld, copyCurrent, copyHolds, copyStamp, countedRows, currentHead, findDecision, findLatestForUid, headMoved, headCellCeilings, historyPage, historyPlan, insertDecision, lastSeq, keyMismatchRefusal, logCellCeilings, logPageCeiling, logRowsAfter, logShown, logVerdict, logVerdictWithin, macInput, openAt, parseReason, probe, reasonMaxChars, reasonText, rowNameOf, stateHead, stateVerdict, storedReasonMaxBytes, storedReasonText, verifiedAt, verifiedDecision, verifiedHash, verifiedName, verifiedPair, verifiedUid, verifier, writeTransaction)
+module Lib.Db exposing (BreakAt(..), CellCeiling, CopyFault(..), Decision(..), HistoryCursor(..), HistoryRows, LogRow, LogShown(..), LogState, LogVerdict(..), ProvenCopy, ProvenHead, Reason, ReviewEntry(..), RowName(..), StoredDecision(..), StoredReason, Unverified(..), UnverifiedRow, VerifiedRow, Verifier, advanceHead, cellHeld, copyCurrent, copyStamp, countedRows, currentHead, findDecision, findLatestForUid, headMoved, headCellCeilings, historyPage, historyPlan, insertDecision, lastSeq, keyMismatchRefusal, logCellCeilings, logPageCeiling, logRowsAfter, logShown, logVerdict, logVerdictWithin, macInput, openAt, parseReason, probe, proveCopy, provenSnapshot, provenState, reasonMaxChars, reasonText, rowNameOf, stateHead, stateVerdict, storedReasonMaxBytes, storedReasonText, verifiedAt, verifiedDecision, verifiedHash, verifiedName, verifiedPair, verifiedUid, verifier, writeTransaction)
 
 import Ipe.Crypto as Crypto
 import Ipe.Db as Db
@@ -363,21 +363,63 @@ copyCurrent state stamp =
             Index.stampStatus s.key s.head stamp == Just (copyStatus state)
 
 
--- True exactly when a snapshot's `reviewed` copy may be counted under this
--- verdict: its stamp is current, and the pairs it holds are exactly the
--- pairs of the entries this walk verified, none under any verdict but
--- `Proven`, under which nothing drains. A pair written into the copy by
--- anything but a drain of a verified entry fails it, whatever the stamp.
-copyHolds : LogState -> Index.Snapshot -> Bool
-copyHolds state snap =
-    copyCurrent state snap.stamp
-        && (case snap.copy of
-                Just digest ->
-                    SetDigest.same (verifiedPairs state) digest
+-- A `reviewed` copy proven against the log's verdict, with that verdict. Its
+-- only constructor is `proveCopy`; the type is exposed opaque, so a page can
+-- be built from nothing a prover did not sign off. Accessors return the two
+-- parts; nothing builds one from parts.
+type ProvenCopy
+    = ProvenCopy LogState Index.Snapshot
 
-                Nothing ->
-                    False
-           )
+
+-- Why a snapshot's copy is not proven under a verdict.
+--
+--   * `StampStale` — the stamp is not the one `copyStamp` writes for this
+--     verdict; the copy was rebuilt from another head or another status.
+--   * `CopyUnproven` — the copy has no digest: the table is not the plain
+--     shape, holds a repeated pair, or its row count drifted under the read.
+--   * `CopyDiffers` — the copy's pairs are not exactly the pairs of the
+--     entries this walk verified (a pair written by anything but a drain of
+--     a verified entry, or a drained pair missing).
+type CopyFault
+    = StampStale
+    | CopyUnproven
+    | CopyDiffers
+
+
+-- Proves a snapshot's `reviewed` copy may be counted under this verdict: its
+-- stamp is current, and the pairs it holds are exactly the pairs of the
+-- entries this walk verified, none under any verdict but `Proven`, under
+-- which nothing drains. The first failing check names the fault.
+proveCopy : LogState -> Index.Snapshot -> Result CopyFault ProvenCopy
+proveCopy state snap =
+    if not (copyCurrent state snap.stamp) then
+        Err StampStale
+
+    else
+        case snap.copy of
+            Nothing ->
+                Err CopyUnproven
+
+            Just digest ->
+                if SetDigest.same (verifiedPairs state) digest then
+                    Ok (ProvenCopy state snap)
+
+                else
+                    Err CopyDiffers
+
+
+provenState : ProvenCopy -> LogState
+provenState proven =
+    case proven of
+        ProvenCopy state _ ->
+            state
+
+
+provenSnapshot : ProvenCopy -> Index.Snapshot
+provenSnapshot proven =
+    case proven of
+        ProvenCopy _ snap ->
+            snap
 
 
 verifiedPairs : LogState -> SetDigest
