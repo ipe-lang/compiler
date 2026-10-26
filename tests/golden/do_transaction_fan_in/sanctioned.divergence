@@ -1,0 +1,1 @@
+sanctioned: this program uses Std.Db kernels (Db.open / Db.withTransaction) — the Go backend emits Go+SQLite (cgo) binaries while Ipê emits Rust+sqlx; the SQLite in-memory connection behaviour differs enough that a shared Main.ipe cannot run on both backends. Ipê's output is the correct reference.

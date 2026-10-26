@@ -1349,6 +1349,40 @@ mod tests {
         Ok(())
     }
 
+    /// A body past the walk's ceiling is the emitter's nesting refusal,
+    /// IPE-L0200 naming the function and its home, not a compiler bug that
+    /// names a raw function id.
+    #[test]
+    fn borrow_depth_refusal_names_the_function() -> DResult<()> {
+        let refused = deep_walk(|| {
+            let mut interner = Interner::new();
+            let (home, name, p, x) = (
+                interner.intern("Main")?,
+                interner.intern("deep")?,
+                interner.intern("p")?,
+                interner.intern("x")?,
+            );
+            let depth = usize::from(MAX_IR_RENDER_DEPTH) + 4;
+            let mut f = func(F, name, vec![borrowed(p, IrType::Str)], deep(p, x, depth));
+            f.home = ModPath(vec![home]);
+            Ok(verify_program(&program(vec![f]), &interner, "borrow.tests"))
+        })?;
+        assert_eq!(
+            refused,
+            Err(Diagnostic::Lower {
+                span: Span::DUMMY,
+                msg: LowerError::BackendNestingTooDeep {
+                    limit: MAX_IR_RENDER_DEPTH,
+                    func: Some(ipe_diagnostics::EmitSite {
+                        home: Box::new(["Main".into()]),
+                        name: "deep".into(),
+                    }),
+                },
+            })
+        );
+        Ok(())
+    }
+
     #[test]
     fn verify_rejects_a_body_past_the_depth_ceiling() -> DResult<()> {
         let out = deep_walk(|| {

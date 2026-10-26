@@ -460,9 +460,9 @@ fn operator_chain_is_refused_one_past_the_ceiling() {
 /// The parentheses around the deep operand of a chain-depth test.
 const OPERAND_PARENS: usize = 8;
 
-/// The levels each parenthesis adds over its contents: the `(` atom and the
-/// expression, application and postfix frames of the expression inside.
-const LEVELS_PER_PAREN: usize = 4;
+/// The levels each parenthesis adds over the atom it sits in: its own frame
+/// and the expression, application, postfix and atom frames of its contents.
+const LEVELS_PER_PAREN: usize = 5;
 
 /// `1` wrapped in [`OPERAND_PARENS`] parentheses.
 fn deep_operand() -> String {

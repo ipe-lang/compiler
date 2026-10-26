@@ -3541,8 +3541,7 @@ fn holds_self_clone_let(expr: &Expr, depth: u16) -> bool {
         Expr::If { cond, then_, else_ } => go(cond) || go(then_) || go(else_),
         Expr::Match(m) => {
             go(m.scrutinee())
-                || m
-                    .arms()
+                || m.arms()
                     .iter()
                     .any(|arm| go(&arm.body) || arm.guard.as_ref().is_some_and(go))
         }
@@ -6236,7 +6235,7 @@ mod serde_persistence_tests {
     // A single exhaustive `Module` struct literal (every `uses_*` gate spelled
     // out) dominates the length; splitting it would only scatter the fixture.
     #[allow(clippy::too_many_lines)]
-    fn sample_program(i: &mut Interner) -> DResult<Program> {
+    pub fn sample_program(i: &mut Interner) -> DResult<Program> {
         let msg_ty = i.intern("Msg")?;
         let inc = i.intern("Increment")?;
         let dec = i.intern("Decrement")?;
@@ -6640,6 +6639,100 @@ mod serde_persistence_tests {
         // accidental empty-string comparison).
         assert!(dump_b.contains("Increment") && dump_b.contains("Decrement"));
         assert!(dump_b.contains("main"));
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod capture_clone_tests {
+    use ipe_diagnostics::{DResult, Diagnostic};
+    use ipe_intern::Interner;
+
+    use super::serde_persistence_tests::sample_program;
+    use super::{Expr, IrType, Program, refuse_self_clone_lets};
+    use crate::pretty::pretty;
+
+    /// A closure over `captured`, returning it.
+    fn closure(captured: ipe_intern::Symbol) -> Expr {
+        Expr::Lambda {
+            params: vec![],
+            ret: IrType::Int,
+            body: Box::new(Expr::Var(captured)),
+        }
+    }
+
+    /// The sample program with its entry function's body replaced by `body`.
+    fn program_with_body(i: &mut Interner, body: Expr) -> DResult<Program> {
+        let mut program = sample_program(i)?;
+        if let Some(func) = program
+            .modules
+            .first_mut()
+            .and_then(|m| m.funcs.first_mut())
+        {
+            func.body = body;
+        }
+        Ok(program)
+    }
+
+    /// A capture clone hand-built as a nested self-clone `let` is refused at
+    /// lowering exit, naming the function; the same clone as one
+    /// `CaptureClones` node passes.
+    #[test]
+    fn self_clone_let_is_refused() -> DResult<()> {
+        let mut i = Interner::new();
+        let a = i.intern("a")?;
+        let nested = Expr::Let {
+            name: a,
+            value: Box::new(Expr::CloneVar(a)),
+            body: Box::new(closure(a)),
+        };
+        assert!(nested.is_self_clone_let());
+        let refused = refuse_self_clone_lets(&program_with_body(&mut i, nested)?, &i);
+        let Err(Diagnostic::CompilerBug { where_, detail }) = refused else {
+            assert!(
+                matches!(refused, Err(Diagnostic::CompilerBug { .. })),
+                "a self-clone `let` must be a compiler bug, got {refused:?}"
+            );
+            return Ok(());
+        };
+        assert_eq!(where_, "ipe_ir::refuse_self_clone_lets");
+        assert!(
+            detail.contains("function `main`"),
+            "the refusal names the function: {detail}"
+        );
+
+        let flat = Expr::pre_clone(a, closure(a));
+        let passed = refuse_self_clone_lets(&program_with_body(&mut i, flat)?, &i);
+        assert!(
+            passed.is_ok(),
+            "one `CaptureClones` node passes: {passed:?}"
+        );
+        Ok(())
+    }
+
+    /// Pre-cloning around a pre-clone merges into the one node, the outer
+    /// symbol first, and the node prints as one level.
+    #[test]
+    fn pre_clone_merges_into_one_node() -> DResult<()> {
+        let mut i = Interner::new();
+        let a = i.intern("a")?;
+        let b = i.intern("b")?;
+        let merged = Expr::pre_clone(b, Expr::pre_clone(a, closure(a)));
+        assert_eq!(
+            merged,
+            Expr::CaptureClones {
+                syms: vec![b, a],
+                body: Box::new(closure(a)),
+            }
+        );
+        assert_eq!(Expr::pre_clone_all(vec![], closure(a)), closure(a));
+        let text = pretty(&program_with_body(&mut i, merged)?, &i);
+        assert_eq!(
+            text.matches("CaptureClones").count(),
+            1,
+            "one node for both clones: {text}"
+        );
+        assert!(text.contains("CaptureClones b, a"), "{text}");
         Ok(())
     }
 }

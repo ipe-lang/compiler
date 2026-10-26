@@ -206,6 +206,40 @@ fn access_over(depth: usize, n: usize) -> Shaped {
     )
 }
 
+/// A `do` of `n` named binds inside a `Task` lambda over a handle, every
+/// bind read by the final statement.
+fn do_fan_in(n: usize) -> Shaped {
+    let names: Vec<String> = (1..=n).map(|i| format!("x{i}")).collect();
+    let after = format!(
+        "                report [ {} ]\n        )\n\n\n\
+         withHandle : (Int -> Task Error ()) -> Task Error ()\n\
+         withHandle f =\n    f 0\n\n\n\
+         report : List Int -> Task Error ()\n\
+         report xs =\n    Io.println (String.fromInt (List.length xs))\n",
+        names.join(", ")
+    );
+    sequence(
+        n,
+        "main =\n    withHandle\n        (\\h ->\n            do\n",
+        |i| format!("                x{} <- Task.succeed h\n", i + 1),
+        &after,
+    )
+}
+
+/// The parentheses around the first operand of [`deep_operand_chain`].
+const OPERAND_PARENS: usize = 8;
+
+/// A chain of `n` `+` operators whose first operand is `1` inside
+/// [`OPERAND_PARENS`] parentheses.
+fn deep_operand_chain(n: usize) -> Shaped {
+    let before = format!(
+        "main =\n    Io.println (String.fromInt ({}1{}",
+        "(".repeat(OPERAND_PARENS),
+        ")".repeat(OPERAND_PARENS)
+    );
+    sequence(n, &before, |_| " + 1".to_owned(), "))\n")
+}
+
 /// A pipeline of `n` `Task.andThen` continuations.
 fn pipeline(n: usize) -> Shaped {
     sequence(
@@ -330,7 +364,7 @@ fn lambda_chain(n: usize) -> Shaped {
 ///
 /// `L` is the ceiling. A shape's deepest count is the largest `n` whose
 /// deepest atom (named per entry) still sits at depth `L` or less.
-fn shapes() -> [(&'static str, Shape, usize, AtCeiling); 15] {
+fn shapes() -> [(&'static str, Shape, usize, AtCeiling); 17] {
     use AtCeiling::{Builds, TypeRefused};
     let limit = ceiling();
     let compose = usize::try_from(COMPOSE_NESTING).unwrap_or(usize::MAX);
@@ -338,10 +372,21 @@ fn shapes() -> [(&'static str, Shape, usize, AtCeiling); 15] {
     [
         // Bind `k`'s operand atom at depth `9 + 2k`, the final run's at `10 + 2n`.
         ("do_bind", do_binds, (limit - 10) / 2, Builds),
+        // The `do` atom at depth 13 in the lambda body, the final statement's
+        // list element atom at `25 + 2n`.
+        ("do_fan_in", do_fan_in, (limit - 25) / 2, Builds),
         // The body's `String.fromInt` atom at depth `14 + n`.
         ("let_block", let_block, limit - 14, Builds),
         // The chain's expression at depth 10, each operator one level more.
         ("binop_chain", binop_chain, limit - 10, Builds),
+        // The same chain charged over its first operand, whose atom sits five
+        // levels deeper per parenthesis.
+        (
+            "deep_operand_chain",
+            deep_operand_chain,
+            limit - 10 - 5 * OPERAND_PARENS,
+            Builds,
+        ),
         // The chain's expression at depth 15, each `>>` charged its desugar's levels.
         (
             "compose_chain",
@@ -594,14 +639,18 @@ fn access_chain_at_the_type_ceiling_builds_with_cargo() {
     }
 }
 
-/// An interpolation of as many chunks as the ceiling counts compiles through
-/// emit on the declared stack.
+/// The interpolations of [`interpolation_past_the_source_ceiling_compiles`],
+/// sixteen times the source ceiling.
+const INTERPOLATION_CHUNKS: usize = 4096;
+
+/// An interpolation of far more chunks than the source ceiling counts compiles
+/// through emit on the declared stack: its chunks join in a balanced tree, as
+/// deep as the logarithm of their count.
 #[test]
-fn ceiling_count_interpolation_fits_declared_stack() {
-    let admitted = compile_on_compile_door(interpolation(ceiling()));
+fn interpolation_past_the_source_ceiling_compiles() {
+    let admitted = compile_on_compile_door(interpolation(INTERPOLATION_CHUNKS));
     assert!(
         admitted.is_ok(),
-        "{} interpolations must compile through emit: {admitted:?}",
-        ceiling()
+        "{INTERPOLATION_CHUNKS} interpolations must compile through emit: {admitted:?}"
     );
 }
