@@ -999,6 +999,8 @@ pub fn run_build_body(rest: &[String]) -> Result<BuildSuccess, CliError> {
         // `ipe dev build` never emits appearance hot-swap scaffolding — that is a
         // `ipe dev watch`-only dev affordance. A release artifact stays clean.
         hot_appearance: false,
+        // A developer build links the runtime its environment names.
+        runtime_origin: runtime_embed::RuntimeOrigin::Developer,
     };
 
     // A webview-native `web desktop` delivery links the system webview and
@@ -1758,6 +1760,8 @@ pub fn release_pipeline(
                 debugger: false,
                 // A release build never carries appearance hot-swap scaffolding.
                 hot_appearance: false,
+                // A developer build links the runtime its environment names.
+                runtime_origin: runtime_embed::RuntimeOrigin::Developer,
             };
             let crate_dir = held.emit(
                 &EmitTarget::Area(rust_area),
@@ -3080,6 +3084,8 @@ pub fn run_run_with_args(args: cli_args::RunArgs) -> Result<(), CliError> {
         // `ipe dev run` never emits appearance hot-swap scaffolding — that is a
         // `ipe dev watch`-only dev affordance.
         hot_appearance: false,
+        // A developer build links the runtime its environment names.
+        runtime_origin: runtime_embed::RuntimeOrigin::Developer,
     };
 
     // Nothing is created in the Rust area until the emit writes its crate.
