@@ -162,9 +162,10 @@ fn a_native_bearing_package_with_no_probeable_entrypoint_fails_closed() {
         "a native-bearing package must fail closed — never certify un-observed; \
          stdout:\n{stdout}\nstderr:\n{stderr}"
     );
-    // Any of these checks firing is a valid fail-closed reject.
+    // Any of these checks firing is a valid fail-closed reject. A host without a
+    // jail is refused at binding regeneration before any generator runs.
     assert!(
-        stderr.contains("regenerate FFI bindings")
+        stderr.contains("native FFI binding regeneration")
             || stderr.contains("provenance panic-scan")
             || stderr.contains("native Tier-2 capability enforcement"),
         "the reject names a fail-closed check (binding regeneration, provenance, or Tier-2); \
