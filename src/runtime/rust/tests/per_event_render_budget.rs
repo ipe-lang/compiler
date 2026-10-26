@@ -365,7 +365,11 @@ const WIDE_ROWS: usize = 1500;
 fn stamped_ids_of_deep_and_wide_trees_follow_the_grammar() {
     let mut chain: Html<()> = Html::HElement("b".into(), Vec::new(), Vec::new());
     for depth in 0..CHAIN_DEPTH {
-        let tag = if depth % 2 == 0 { "div" } else { "section" };
+        let tag = if depth.is_multiple_of(2) {
+            "div"
+        } else {
+            "section"
+        };
         chain = Html::HElement(tag.into(), Vec::new(), vec![chain]);
     }
     let wide = Html::HElement(
@@ -373,7 +377,7 @@ fn stamped_ids_of_deep_and_wide_trees_follow_the_grammar() {
         Vec::new(),
         (0..WIDE_ROWS)
             .map(|i| {
-                if i % 7 == 0 {
+                if i.is_multiple_of(7) {
                     Html::HText(format!("gap {i}"))
                 } else {
                     Html::HElement(
