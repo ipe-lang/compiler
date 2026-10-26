@@ -490,13 +490,14 @@ fn emit_bounds_program(slug: &str) -> Option<PathBuf> {
     Some(out)
 }
 
-/// The built bounds binary, or `None` on the unit tier.
-fn bounds_binary(slug: &str) -> Option<String> {
-    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
-        return None;
-    }
-    let dir = emit_bounds_program(slug)?;
-    build_emitted_binary_checked(&format!("markdown_bounds_{slug}"), &dir)
+/// The built bounds binary; the caller has already gated the unit tier.
+fn bounds_binary(slug: &str) -> String {
+    let dir = emit_bounds_program(slug);
+    assert!(dir.is_some(), "the bounds program must emit for `{slug}`");
+    let exe =
+        dir.and_then(|dir| build_emitted_binary_checked(&format!("markdown_bounds_{slug}"), &dir));
+    assert!(exe.is_some(), "the bounds program must build for `{slug}`");
+    exe.unwrap_or_default()
 }
 
 fn run_case(exe: &str, case: Case, n: usize) -> TimedRunOutcome {
@@ -534,9 +535,10 @@ fn bounds_program_resolves_and_emits() {
 
 #[test]
 fn every_block_run_does_not_trip_guard() {
-    let Some(exe) = bounds_binary("blocks") else {
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
         return;
-    };
+    }
+    let exe = bounds_binary("blocks");
     let lines = PAST_GUARD.to_string();
     let lines = lines.as_str();
     // (case, block count, first tag, last tag, last block's size where the rule fixes it)
@@ -573,17 +575,16 @@ fn every_block_run_does_not_trip_guard() {
 
 #[test]
 fn quote_depth_ceiling() {
-    let Some(exe) = bounds_binary("quote") else {
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
         return;
-    };
+    }
+    let exe = bounds_binary("quote");
     let ceiling = MAX_BLOCKQUOTE_DEPTH.to_string();
     for n in [MAX_BLOCKQUOTE_DEPTH + 1, PAST_GUARD] {
         let got = digest_of(&exe, Case::Quote, n);
         let split = got.rsplit_once(':');
         assert!(split.is_some(), "`quote {n}`: malformed digest {got}");
-        let Some((digest, render_len)) = split else {
-            return;
-        };
+        let (digest, render_len) = split.unwrap_or_default();
         assert_eq!(digest, Case::Quote.port_digest(n), "port digest");
         let fields = block_fields(digest);
         assert_eq!(fields.first().copied(), Some("1"), "`quote {n}`: one block");
@@ -601,9 +602,10 @@ fn quote_depth_ceiling() {
 
 #[test]
 fn span_runs_finish_in_deadline() {
-    let Some(exe) = bounds_binary("spans") else {
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
         return;
-    };
+    }
+    let exe = bounds_binary("spans");
     let rows = [
         (Case::Stars, 100_000),
         (Case::Brackets, 100_000),
@@ -633,9 +635,10 @@ fn parse_time(exe: &str, case: Case, n: usize, startup: Duration) -> Duration {
 
 #[test]
 fn doubling_is_linear() {
-    let Some(exe) = bounds_binary("doubling") else {
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
         return;
-    };
+    }
+    let exe = bounds_binary("doubling");
     let startup = (0..3)
         .map(|_| run_case(&exe, Case::Brackets, 0).elapsed)
         .min()
