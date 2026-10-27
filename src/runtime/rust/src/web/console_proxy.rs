@@ -356,7 +356,7 @@ async fn proxy_entry(req: axum::extract::Request) -> axum::response::Response {
     // admin credential required; dev open) BEFORE it reaches this handler — so
     // the proxied path is already gated. This second call to the SAME gate keeps
     // the sensitive console surface protected even if a future router change ever
-    // mounts the proxy outside that middleware. `gate_allows()` (mount-time) is
+    // mounts the proxy outside that middleware. `gate_allows` (mount-time) is
     // orthogonal: it decides whether to mount at all, not who may reach it.
     if let Some(blocked) =
         super::console::gate_blocked(super::console::Surface::Console, req.headers())
@@ -448,8 +448,10 @@ fn parent_spill_active() -> bool {
     }
 }
 
-pub async fn ensure_console_proxy() -> bool {
-    if !super::console::gate_allows() {
+/// Spawn the console child and mount its proxy when the app `mount` names may
+/// mount a console; `false` means the in-process console (or none) serves.
+pub(crate) async fn ensure_console_proxy(mount: &super::MountContext) -> bool {
+    if !super::console::gate_allows(mount) {
         return false;
     }
     // Fast path for the common case (binary not pre-built yet): skip the

@@ -2577,9 +2577,6 @@ enum ServerStartRefusal {
         earlier: RefusedText,
         later: RefusedText,
     },
-    /// A second `Server.mountApp` Web app on one server.
-    #[cfg(feature = "web")]
-    SecondMount,
     /// The router refused an insert every listen check admitted.
     RouterRejected { endpoint: RefusedText },
 }
@@ -2600,12 +2597,6 @@ impl std::fmt::Display for ServerStartRefusal {
                  mounts may not share a prefix; give each mount its own prefix (a prefix nested \
                  under another is served by the longer one)"
             ),
-            #[cfg(feature = "web")]
-            Self::SecondMount => f.write_str(
-                "Server.mountApp: at most one Web app may be mounted per server (the embedded \
-                 app's cookie/CSRF/asset paths are scoped through one process-wide base path); \
-                 mount a single Web app, or serve additional apps as separate servers",
-            ),
             Self::RouterRejected { endpoint } => write!(
                 f,
                 "Server.listen: the router refused to register endpoint `{endpoint}` beside the \
@@ -2625,8 +2616,6 @@ impl ServerStartRefusal {
             Self::Overlap { .. } | Self::SharedPrefix { .. } | Self::RouterRejected { .. } => {
                 IpeError::conflict(message)
             }
-            #[cfg(feature = "web")]
-            Self::SecondMount => IpeError::conflict(message),
         }
     }
 }
@@ -3144,13 +3133,6 @@ pub fn server_listen<E: crate::FromIpeError + Send + 'static>(
             ))));
         }
         let mut app: axum::Router = axum::Router::new();
-        // At most ONE mounted web app per server: the embedded app's cookie /
-        // CSRF / asset paths are scoped through the process-wide base path
-        // (`IPE_WEB_BASE_PATH`), so a SECOND mount at a different prefix would
-        // silently mis-scope the first. Reject the second fail-closed (before
-        // bind) rather than serve a subtly broken session/CSRF surface.
-        #[cfg(feature = "web")]
-        let mut web_mounted = false;
         let mut mounts = Vec::new();
         for r in routes {
             match r.target {
@@ -3169,22 +3151,20 @@ pub fn server_listen<E: crate::FromIpeError + Send + 'static>(
                     };
                 }
                 // `Server.mountApp`: build the embedded web app's router for its
-                // prefix and serve it below that prefix on this same listener
-                // (one port). The builder is taken once; a duplicate (a cloned
-                // route) finds `None` and is skipped — inert.
+                // parsed base and serve it below that prefix on this same
+                // listener (one port). Each app carries its own base in its
+                // state, so any number of apps mount at distinct prefixes. The
+                // builder is taken once; a duplicate (a cloned route) finds
+                // `None` and is skipped — inert.
                 #[cfg(feature = "web")]
                 ParsedTarget::MountWeb(base, cell) => {
-                    if web_mounted {
-                        return refuse(ServerStartRefusal::SecondMount);
-                    }
                     let builder = cell
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner)
                         .take();
                     if let Some(build) = builder {
-                        let sub = build(base.prefix().to_owned()).await;
+                        let sub = build(base.clone()).await;
                         mounts.push((base, sub));
-                        web_mounted = true;
                     }
                 }
             }
@@ -6391,8 +6371,6 @@ mod tests {
                 ServerStartRefusal::RouterRejected { endpoint: text() },
                 K::Conflict,
             ),
-            #[cfg(feature = "web")]
-            (ServerStartRefusal::SecondMount, K::Conflict),
         ];
         for (refusal, kind) in cases {
             let shown = refusal.to_string();

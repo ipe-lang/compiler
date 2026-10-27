@@ -746,6 +746,42 @@ impl MountBase {
     pub fn segments(&self) -> impl Iterator<Item = &str> {
         self.path.segments().iter().map(String::as_str)
     }
+
+    /// The cookie-name suffix that tells this base's cookies from every other base's.
+    #[must_use]
+    pub fn cookie_suffix(&self) -> CookieSuffix {
+        CookieSuffix::of(&self.prefix)
+    }
+}
+
+/// The suffix a mount's runtime cookie names carry: `""` for the root.
+///
+/// Each byte of the base is kept when it is one of `[A-Za-z0-9-.~]`; `_`
+/// becomes `_5F` and `/` becomes `_2F`. A `_` in the output always opens a
+/// three-byte escape, so two distinct bases never share a suffix, and every
+/// output byte is an RFC 6265 `token` byte.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct CookieSuffix(String);
+
+impl CookieSuffix {
+    /// The suffix of the base text `prefix`, which [`MountBase::parse`] admitted.
+    fn of(prefix: &str) -> Self {
+        let mut out = String::with_capacity(prefix.len().saturating_mul(3));
+        for ch in prefix.chars() {
+            match ch {
+                '_' => out.push_str("_5F"),
+                '/' => out.push_str("_2F"),
+                _ => out.push(ch),
+            }
+        }
+        Self(out)
+    }
+
+    /// The suffix text, appended to a cookie base name.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
 }
 
 /// A bundle-relative asset path: `/`-separated segments of `[A-Za-z0-9._-]`.
@@ -2249,9 +2285,48 @@ mod tests {
             ("/a b", MountBaseRefusal::Reserved { byte: b' ' }),
             ("/a\"b", MountBaseRefusal::Reserved { byte: b'"' }),
             ("/\u{e9}", MountBaseRefusal::Reserved { byte: 0xC3 }),
+            ("/a;b", MountBaseRefusal::Reserved { byte: b';' }),
+            ("/a<b", MountBaseRefusal::Reserved { byte: b'<' }),
+            ("/a>b", MountBaseRefusal::Reserved { byte: b'>' }),
+            ("/a%zz", MountBaseRefusal::Reserved { byte: b'%' }),
         ] {
             assert_eq!(MountBase::parse(bad), Err(want), "{bad:?}");
         }
+    }
+
+    /// Distinct bases have distinct cookie suffixes, `/a-b`, `/a_b` and
+    /// `/a/b` included, and every suffix byte is a cookie-name `token` byte.
+    #[test]
+    fn cookie_suffix_is_injective_over_mount_bases() {
+        let segments = [
+            "a", "b", "a-b", "a_b", "_", "__", "_2F", "_5F", "a.b", "a~b", "2F",
+        ];
+        let mut bases = vec![MountBase::root()];
+        for first in segments {
+            bases.push(MountBase::parse(&format!("/{first}")).unwrap());
+            for second in segments {
+                bases.push(MountBase::parse(&format!("/{first}/{second}")).unwrap());
+            }
+        }
+        let mut seen = std::collections::HashMap::new();
+        for base in &bases {
+            let suffix = base.cookie_suffix();
+            assert!(
+                suffix
+                    .as_str()
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'~' | b'_')),
+                "{suffix:?}"
+            );
+            if let Some(other) = seen.insert(suffix.clone(), base.clone()) {
+                assert_eq!(&other, base, "{other:?} and {base:?} share {suffix:?}");
+            }
+        }
+        let suffix = |text: &str| MountBase::parse(text).unwrap().cookie_suffix();
+        assert_eq!(suffix("").as_str(), "");
+        assert_eq!(suffix("/a-b").as_str(), "_2Fa-b");
+        assert_eq!(suffix("/a_b").as_str(), "_2Fa_5Fb");
+        assert_eq!(suffix("/a/b").as_str(), "_2Fa_2Fb");
     }
 
     /// `""` and `/` are the root; `//` is not.
