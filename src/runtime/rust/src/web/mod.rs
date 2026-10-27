@@ -10537,7 +10537,8 @@ mod sse_reconnect_reconcile_tests {
     #[test]
     fn startup_refusal_scrubs_bidi_and_controls() {
         let hostile = "/%zz\u{202e}\n\u{1b}[31m";
-        for refusal in [parse_mount_base(hostile).err()] {
+        {
+            let refusal = parse_mount_base(hostile).err();
             assert!(
                 matches!(
                     &refusal,
@@ -15500,7 +15501,7 @@ mod page_mount_base_tests {
         (
             status,
             cookies,
-            String::from_utf8_lossy(&bytes).into_owned(),
+            String::from_utf8(bytes.to_vec()).expect("utf-8 body"),
         )
     }
 
