@@ -3466,6 +3466,40 @@ fn migrate_checksum(sql: &str) -> String {
     format!("{:x}", h.finalize())
 }
 
+/// The characters a migration name occupies on a `status` line.
+///
+/// Counted on the scrubbed text [`migration_status_line`] prints, so the
+/// column the names align to matches what reaches the terminal.
+fn migration_status_name_width(name: &str) -> usize {
+    crate::system::scrub_log_controls(name).chars().count()
+}
+
+/// One `status` report line: the mark, the name padded to `width` characters, the detail.
+///
+/// The name and the detail (which quotes the ledger's `applied_at` text) are
+/// scrubbed of terminal controls. The padding is a `repeat`, never a runtime
+/// format width: a width past `u16::MAX` panics the formatter.
+fn migration_status_line(mark: &str, name: &str, detail: &str, width: usize) -> String {
+    let name = crate::system::scrub_log_controls(name);
+    let detail = crate::system::scrub_log_controls(detail);
+    let pad = width.saturating_sub(name.chars().count());
+    let mut line = String::with_capacity(
+        mark.len()
+            .saturating_add(name.len())
+            .saturating_add(pad)
+            .saturating_add(detail.len())
+            .saturating_add(6),
+    );
+    line.push_str("  ");
+    line.push_str(mark);
+    line.push_str("  ");
+    line.push_str(&name);
+    line.push_str(&" ".repeat(pad));
+    line.push_str("  ");
+    line.push_str(&detail);
+    line
+}
+
 /// The refusal [`db_migrate_apply`] gives a ledger row with a `NULL` `name` or `checksum`.
 const MIGRATION_LEDGER_NULL_IDENTITY: &str =
     "db.migrate: corrupt _ipe_migrations ledger: a row has a NULL name or checksum";
@@ -3609,9 +3643,13 @@ pub fn db_migrate_apply<E: Send + From<String> + crate::FromIpeError + 'static>(
             }
             crate::system::write_stdout_line(&header);
             crate::system::write_stdout_line("");
-            let width = lines.iter().map(|(_, n, _)| n.len()).max().unwrap_or(0);
+            let width = lines
+                .iter()
+                .map(|(_, n, _)| migration_status_name_width(n))
+                .max()
+                .unwrap_or(0);
             for (mark, name, detail) in &lines {
-                crate::system::write_stdout_line(&format!("  {mark}  {name:<width$}  {detail}"));
+                crate::system::write_stdout_line(&migration_status_line(mark, name, detail, width));
             }
             if lines.is_empty() {
                 crate::system::write_stdout_line("  (no migrations declared)");
@@ -8130,6 +8168,34 @@ mod tests {
             super::migrate_checksum("SELECT 1;"),
             "17db4fd369edb9244b9f91d9aeed145c3d04ad8ba6e95d06247f07a63527d11a"
         );
+    }
+
+    #[test]
+    fn migration_status_line_pads_a_name_past_the_formatter_width_limit() {
+        let name = "m".repeat(70_000);
+        let width = super::migration_status_name_width(&name).saturating_add(5);
+        let line = super::migration_status_line("•", &name, "pending", width);
+        assert_eq!(
+            line.chars().count(),
+            2 + 1 + 2 + 70_005 + 2 + "pending".len()
+        );
+        assert!(line.ends_with(&format!("{}  pending", " ".repeat(5))));
+    }
+
+    #[test]
+    fn migration_status_line_escapes_terminal_controls_in_name_and_detail() {
+        let name = "init\u{1b}[2J";
+        let line = super::migration_status_line(
+            "✓",
+            name,
+            "applied 2026\u{1b}]0;x\u{7}",
+            super::migration_status_name_width(name),
+        );
+        assert!(
+            !line.contains('\u{1b}') && !line.contains('\u{7}'),
+            "{line}"
+        );
+        assert_eq!(line, "  ✓  init\\u{1b}[2J  applied 2026\\u{1b}]0;x\\u{7}");
     }
 
     #[tokio::test]
