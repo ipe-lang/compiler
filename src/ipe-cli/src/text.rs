@@ -1321,6 +1321,10 @@ messages! {
     doc_stdlib_index_failed(detail) = "doc-stdlib-index-failed";
     /// The documentation bundle could not be built.
     doc_bundle_build_error(detail) = "doc-bundle-build-error";
+    /// A docs-directory file is not named as a page.
+    doc_overlay_name(path: &crate::style::TerminalSafe) = "doc-overlay-name";
+    /// The docs-directory pages together pass the overlay read budget.
+    doc_overlay_too_large(limit) = "doc-overlay-too-large";
     /// An `ipe doc <kind>:<key>` query named an unknown kind.
     doc_unknown_kind(prefix) = "doc-unknown-kind";
     /// An `ipe doc` term was empty or only whitespace.

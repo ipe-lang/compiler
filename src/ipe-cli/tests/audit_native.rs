@@ -173,6 +173,93 @@ fn a_native_bearing_package_with_no_probeable_entrypoint_fails_closed() {
     );
 }
 
+/// A runtime crate manifest declaring a version no compiler carries.
+const PLANTED_RUNTIME_MANIFEST: &str =
+    "[package]\nname = \"ipe-runtime-rust\"\nversion = \"0.0.0-planted\"\n";
+
+/// Plant a runtime crate root declaring [`PLANTED_RUNTIME_MANIFEST`] at `root`.
+fn plant_runtime(root: &Path) -> PathBuf {
+    std::fs::create_dir_all(root.join("src")).expect("create planted runtime src");
+    let manifest = root.join("Cargo.toml");
+    std::fs::write(&manifest, PLANTED_RUNTIME_MANIFEST).expect("write planted runtime manifest");
+    manifest
+}
+
+#[test]
+fn the_audit_links_the_embedded_runtime_whatever_the_environment_and_cwd_name() {
+    // The judged program links the compiler's embedded runtime, never one the
+    // environment or the working directory names. Every planted runtime here
+    // declares a foreign version, so a developer resolution would refuse it as a
+    // version mismatch: the audit passing proves none of them was consulted.
+    // A pure package skips the jail, so this holds with and without one.
+    let parent = temp_pkg("runtime-origin");
+    let pkg = parent.join("pkg");
+    std::fs::create_dir_all(pkg.join("src")).expect("create package src");
+    std::fs::write(
+        pkg.join("package.ipe"),
+        "module Package exposing (package)\n\n\npackage =\n    { name = \"pure-pkg\", version = \"0.1.0\" }\n",
+    )
+    .expect("write package.ipe");
+    std::fs::write(pkg.join("src").join("Main.ipe"), PURE_MAIN).expect("write Main");
+    // An in-repo runtime one directory above the working directory, where the
+    // developer's upward walk finds it.
+    let walked = plant_runtime(&parent.join("src").join("runtime").join("rust"));
+    let override_root = parent.join("override").join("rust");
+    let overridden = plant_runtime(&override_root);
+    let ipe_home = parent.join("ipe-home");
+    let index = empty_index("runtime-origin");
+
+    // The plants sit at the exact paths the developer resolution reads.
+    assert_eq!(
+        std::fs::read_to_string(&walked).ok().as_deref(),
+        Some(PLANTED_RUNTIME_MANIFEST),
+        "the walked plant is at `<parent of cwd>/src/runtime/rust/Cargo.toml`"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&overridden).ok().as_deref(),
+        Some(PLANTED_RUNTIME_MANIFEST),
+        "the override plant is at `<IPE_RUNTIME_DIR>/Cargo.toml`"
+    );
+
+    let mut cmd = Command::new(support::ipe_bin());
+    cmd.arg("package")
+        .arg("audit")
+        .arg(&pkg)
+        .arg("--index")
+        .arg(&index)
+        .current_dir(&pkg)
+        .env("IPE_RUNTIME_DIR", &override_root)
+        .env("IPE_RUNTIME_VENDORED", "1")
+        .env("IPE_HOME", &ipe_home);
+    let out = run_child(cmd).expect("run ipe package audit");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "the audit ignores every planted runtime; stdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        stdout.contains("all Tier-1 checks passed"),
+        "Tier-1 runs to completion against the embedded runtime; got:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("0.0.0-planted") && !stderr.contains("0.0.0-planted"),
+        "no planted runtime is named; stdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    let embedded = ipe_home
+        .join("runtime")
+        .join(env!("CARGO_PKG_VERSION"))
+        .join("rust")
+        .join("Cargo.toml");
+    assert!(
+        embedded.is_file(),
+        "the embedded runtime is materialized under the gate's IPE_HOME at {}",
+        embedded.display()
+    );
+    let _ = std::fs::remove_dir_all(&parent);
+    let _ = std::fs::remove_dir_all(&index);
+}
+
 // ===========================================================================
 // Real-jail differential confinement (wired platforms + IPE_E2E=1)
 //

@@ -87,6 +87,14 @@ pub struct BuildOptions {
     /// `ipe dev build` / `ipe dev run` / `ipe release` entries leave it `false` so a
     /// release artifact never carries hot-swap scaffolding. Default `false`.
     pub hot_appearance: bool,
+    /// Who chooses the runtime crate the emitted project links.
+    ///
+    /// [`runtime_embed::RuntimeOrigin::Gate`] links only the compiler's embedded
+    /// copy and always selects the dependency model, whatever `runtime_dep`
+    /// says: a vendored tree would be read from a caller's `runtime_dir`, so a
+    /// gate build has no vendored shape. Default
+    /// [`runtime_embed::RuntimeOrigin::Developer`].
+    pub runtime_origin: runtime_embed::RuntimeOrigin,
 }
 
 /// Where a build writes its emitted crate.
@@ -238,6 +246,7 @@ fn loose_emit_settings(
         static_plan: _,
         runtime_dep: _,
         tree_shake_vendored: _,
+        runtime_origin: _,
     } = options;
     let crate_name = match role {
         runtime_embed::BundleRole::Out => single_file_crate_name(),
@@ -284,6 +293,7 @@ fn manifest_emit_settings(
         static_plan: _,
         runtime_dep: _,
         tree_shake_vendored: _,
+        runtime_origin: _,
     } = options;
     // The emitted crate identity is uniquified per project so two projects
     // that share a friendly name but live at different paths own SEPARATE
@@ -443,11 +453,31 @@ impl Default for BuildOptions {
             tree_shake_vendored: false,
             debugger: false,
             hot_appearance: false,
+            runtime_origin: runtime_embed::RuntimeOrigin::Developer,
         }
     }
 }
 
 impl BuildOptions {
+    /// The options of a gate's build: the release, native, served emit linking
+    /// only the compiler's embedded runtime.
+    ///
+    /// Nothing here is read from the environment or the working directory.
+    #[must_use]
+    pub fn gate() -> Self {
+        Self {
+            runtime_dep: true,
+            runtime_origin: runtime_embed::RuntimeOrigin::Gate,
+            ..Self::default()
+        }
+    }
+
+    /// Whether the emitted project names the runtime as a path dependency.
+    #[must_use]
+    pub const fn links_runtime_dependency(&self) -> bool {
+        self.runtime_dep || matches!(self.runtime_origin, runtime_embed::RuntimeOrigin::Gate)
+    }
+
     /// The default build options with the emit model resolved from the
     /// environment (dependency-model by default; vendored under
     /// `IPE_RUNTIME_VENDORED=1`). The zero-configuration entrypoints
@@ -1074,8 +1104,8 @@ fn compile_source_set_here(
     // worse, a wrong — runtime. Native and wasm share the ONE dependency model
     // (the wasm emit selects the crate's `wasm-client` floor + reached surface,
     // built for `wasm32-unknown-unknown`).
-    let runtime_dep = if options.runtime_dep {
-        match runtime_embed::resolve() {
+    let runtime_dep = if options.links_runtime_dependency() {
+        match runtime_embed::resolve_for(options.runtime_origin) {
             Ok(resolved) => Some(ipe_backend_rust::RuntimeDep {
                 root: resolved.root().to_path_buf(),
             }),
@@ -2978,6 +3008,11 @@ fn refuse_webview_off_web(
 /// blame location of a diagnostic no single module owns and the seed of the
 /// crate identity.
 ///
+/// This is the gate's emit: its options are [`BuildOptions::gate`], so the
+/// crate links the compiler's embedded runtime and no caller can hand it a
+/// runtime directory or options another resolver would fill from the
+/// environment or the working directory.
+///
 /// # Errors
 /// As [`build_project_into`].
 pub fn build_from_sources(
@@ -2985,17 +3020,16 @@ pub fn build_from_sources(
     manifest_path: &Path,
     source_set: super::PackageSourceSet,
     out: OutTarget<'_>,
-    runtime_dir: &Path,
-    options: &BuildOptions,
 ) -> Result<EmittedCrate, CliError> {
-    // An audit emits the served program it judges.
+    // An audit emits the served program it judges. A gate build is always the
+    // dependency model, so the vendored-tree directory is never read.
     build_from_sources_for(
         manifest,
         manifest_path,
         source_set,
         out,
-        runtime_dir,
-        options,
+        Path::new(""),
+        &BuildOptions::gate(),
         crate::delivery::HostIntent::Served,
     )
 }
@@ -3775,5 +3809,35 @@ main =
         );
         assert_eq!(settings.db_driver, project::UNDECLARED_DB_DRIVER);
         assert_eq!(settings.crate_name, ipe_backend_rust::CrateName::Test);
+    }
+
+    /// A gate build links the embedded runtime as a dependency, whatever its
+    /// `runtime_dep` says; a developer build follows `runtime_dep`.
+    #[test]
+    fn a_gate_build_always_links_the_embedded_runtime_dependency() {
+        let gate = BuildOptions::gate();
+        assert_eq!(gate.runtime_origin, runtime_embed::RuntimeOrigin::Gate);
+        assert!(gate.links_runtime_dependency());
+        let vendored_gate = BuildOptions {
+            runtime_dep: false,
+            ..BuildOptions::gate()
+        };
+        assert!(
+            vendored_gate.links_runtime_dependency(),
+            "a gate build has no vendored shape"
+        );
+        let developer = BuildOptions::default();
+        assert_eq!(
+            developer.runtime_origin,
+            runtime_embed::RuntimeOrigin::Developer
+        );
+        assert!(!developer.links_runtime_dependency());
+        assert!(
+            BuildOptions {
+                runtime_dep: true,
+                ..BuildOptions::default()
+            }
+            .links_runtime_dependency()
+        );
     }
 }

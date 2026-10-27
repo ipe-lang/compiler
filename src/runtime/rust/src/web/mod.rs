@@ -5221,7 +5221,7 @@ mod handlers {
                 let make_init = || {
                     pubsub::with_session(&scope, || {
                         let params = (st.param_resolver)(path);
-                        let req = req::web_req(&method, &uri, &headers, params);
+                        let req = req::web_req(&method, &uri, &headers, strict.headers(), params);
                         (st.init)(req)
                     })
                 };
@@ -5372,7 +5372,7 @@ mod handlers {
                 // unrouted) and init a fresh model. The param_resolver is
                 // model-independent, breaking the init↔routing cycle.
                 let params = (st.param_resolver)(path);
-                let req = req::web_req(&method, &uri, &headers, params);
+                let req = req::web_req(&method, &uri, &headers, strict.headers(), params);
                 // Session fixation guard: a store MISS means this sid is NOT a
                 // known session, so NEVER adopt the client-supplied cookie value
                 // — always mint a fresh sid. (A HIT path keeps cookie_sid.)
@@ -6760,12 +6760,12 @@ mod handlers {
         // Build a fresh init model from the current request context — the same
         // path the clean-reinit miss takes — so the reset session holds exactly
         // what a cold-start visit would have produced.
-        let path = match crate::server::strict_url(strict.as_deref()) {
-            Ok(strict) => strict.path(),
+        let strict = match crate::server::strict_url(strict.as_deref()) {
+            Ok(strict) => strict,
             Err(rejection) => return rejection.status_and_reason().into_response(),
         };
-        let params = (st.param_resolver)(path);
-        let req = req::web_req(&method, &uri, &headers, params);
+        let params = (st.param_resolver)(strict.path());
+        let req = req::web_req(&method, &uri, &headers, strict.headers(), params);
         let (init_model, _cmd) = pubsub::with_session(&scope, || (st.init)(req));
         {
             let mut e = handle.lock().unwrap_or_else(|e| e.into_inner());
@@ -6894,12 +6894,12 @@ mod handlers {
         // Derive the init model the same way reset_handler does: build a
         // WebReq from the current request context so route-aware apps get the
         // correct initial state.
-        let path = match crate::server::strict_url(strict.as_deref()) {
-            Ok(strict) => strict.path(),
+        let strict = match crate::server::strict_url(strict.as_deref()) {
+            Ok(strict) => strict,
             Err(rejection) => return rejection.status_and_reason().into_response(),
         };
-        let params = (st.param_resolver)(path);
-        let req = req::web_req(&method, &uri, &headers, params);
+        let params = (st.param_resolver)(strict.path());
+        let req = req::web_req(&method, &uri, &headers, strict.headers(), params);
         let (init_model, _cmd) = pubsub::with_session(&scope, || (st.init)(req));
 
         // Replay the imported log from the init model. Fail-closed: any
@@ -14928,6 +14928,44 @@ mod emitted_router_behavior_tests {
                     0,
                     "{uri:?} must never reach handler logic"
                 );
+            }
+        });
+    }
+
+    /// Prove the refusal: the Web router answers a repeated singleton header
+    /// with the listener's fixed 400 before any handler logic runs, exactly as
+    /// the Server router does; one copy reaches the page.
+    #[test]
+    #[allow(clippy::expect_used)] // test: request build / body read failure is a test environment issue
+    fn a_repeated_singleton_header_never_reaches_a_web_handler() {
+        with_csrf_off(|| async {
+            let store = Arc::new(Store::new(Duration::from_secs(60)));
+            for (copies, refused) in [(2, true), (1, false)] {
+                let runs = Arc::new(AtomicUsize::new(0));
+                let router = make_counting_router(store.clone(), runs.clone());
+                let mut b = Request::builder().method("GET").uri("/");
+                for n in 0..copies {
+                    b = b.header(header::AUTHORIZATION, format!("Bearer t{n}"));
+                }
+                let resp = router
+                    .oneshot(b.body(Body::empty()).expect("build GET"))
+                    .await
+                    .expect("router responds");
+                let ran = runs.load(std::sync::atomic::Ordering::SeqCst);
+                if refused {
+                    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+                    let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+                        .await
+                        .expect("read body");
+                    assert_eq!(bytes.as_ref(), b"Bad Request", "the refusal never echoes");
+                    assert_eq!(
+                        ran, 0,
+                        "a repeated singleton must never reach handler logic"
+                    );
+                } else {
+                    assert_ne!(resp.status(), StatusCode::BAD_REQUEST);
+                    assert!(ran > 0, "one copy reaches the page");
+                }
             }
         });
     }

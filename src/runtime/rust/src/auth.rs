@@ -3851,12 +3851,15 @@ fn caller() -> u8 { decoy() }
             ],
             "a new text read in `revocation.rs` must not re-read a verified date"
         );
-        // Production: the `Content-Length` header. Tests: a response status
-        // line, a port variable parsed through the registry, an address and a
-        // JSON payload fixture.
+        // Production: a trusted proxy's `X-Forwarded-For`/`X-Real-Ip` header
+        // read into an `IpAddr`, and the `Content-Length` header. Tests: a
+        // response status line, a port variable parsed through the registry,
+        // an address and a JSON payload fixture.
         assert_eq!(
             text_reads(include_str!("server.rs")),
             [
+                "remote_address",
+                "remote_address",
                 "build_request",
                 "raw_status",
                 "ipe_server_port_resolves_operator_over_source_under_relocation",

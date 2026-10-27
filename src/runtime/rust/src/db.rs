@@ -13537,10 +13537,22 @@ mod tests {
         })
     }
 
-    /// Dial a fake TLS PostgreSQL server as `host` under `verify-full`, only
+    /// Options naming `host` under `verify-full`.
+    #[cfg(unix)]
+    fn pg_verify_full_options(host: &str) -> sqlx::postgres::PgConnectOptions {
+        sqlx::postgres::PgConnectOptions::new()
+            .host(host)
+            .username("ipe")
+            .database("ipe")
+            .ssl_mode(sqlx::postgres::PgSslMode::VerifyFull)
+    }
+
+    /// Dial a fake TLS PostgreSQL server with `base`'s host and TLS mode, only
     /// through a relay pinned to the server's address.
     #[cfg(unix)]
-    async fn dial_pg_tls_through_relay(host: &str) -> (Result<(), DriverFailure>, Option<TlsSeen>) {
+    async fn dial_pg_tls_through_relay(
+        base: sqlx::postgres::PgConnectOptions,
+    ) -> (Result<(), DriverFailure>, Option<TlsSeen>) {
         let io_failure = || {
             DriverFailure::of(
                 DbEngine::Postgres,
@@ -13571,13 +13583,9 @@ mod tests {
         let Ok(relay) = relay else {
             return (Err(io_failure()), None);
         };
-        let options = sqlx::postgres::PgConnectOptions::new()
-            .host(host)
+        let options = base
             .port(5432)
             .socket(relay.socket_dir())
-            .username("ipe")
-            .database("ipe")
-            .ssl_mode(sqlx::postgres::PgSslMode::VerifyFull)
             .ssl_root_cert_from_pem(PG_TLS_CA_PEM.to_vec());
         let limit = std::time::Duration::from_secs(20);
         let connected = tokio::time::timeout(limit, options.connect()).await;
@@ -13603,7 +13611,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn relayed_tls_dial_sends_the_host_name_and_verifies_it() {
-        let (_outcome, seen) = dial_pg_tls_through_relay(PG_TLS_HOST).await;
+        let (_outcome, seen) = dial_pg_tls_through_relay(pg_verify_full_options(PG_TLS_HOST)).await;
         assert_eq!(
             seen,
             Some(TlsSeen {
@@ -13618,7 +13626,8 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn relayed_tls_dial_refuses_a_certificate_for_another_name() {
-        let (outcome, seen) = dial_pg_tls_through_relay("other.example.test").await;
+        let (outcome, seen) =
+            dial_pg_tls_through_relay(pg_verify_full_options("other.example.test")).await;
         assert!(
             matches!(
                 &outcome,
@@ -13630,6 +13639,52 @@ mod tests {
             seen.as_ref()
                 .is_some_and(|s| s.sni.as_deref() == Some("other.example.test") && !s.handshaken),
             "{seen:?}"
+        );
+    }
+
+    /// The driver options a `Dsn` with no `sslmode` dials as `host`.
+    #[cfg(unix)]
+    fn pg_options_of_default_dsn(host: &str) -> Option<sqlx::postgres::PgConnectOptions> {
+        match crate::dsn::dsn_parse::<String>(format!("postgres://ipe@{host}/ipe")) {
+            IpeResult::Ok(d) => d.connection_url().parse().ok(),
+            IpeResult::Err(_) => None,
+        }
+    }
+
+    /// A `Dsn` that names no `sslmode` dials verifying the server.
+    ///
+    /// A certificate for another name is refused before the handshake
+    /// completes, and one for the dialled name is accepted.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn default_dsn_refuses_a_certificate_for_another_name() {
+        let refused = pg_options_of_default_dsn("other.example.test");
+        assert!(refused.is_some(), "the default DSN does not parse");
+        let Some(refused) = refused else {
+            return;
+        };
+        let (outcome, seen) = dial_pg_tls_through_relay(refused).await;
+        assert!(
+            matches!(
+                &outcome,
+                Err(f) if f.failure() == IpeDbFailure::Unreachable
+            ),
+            "{outcome:?}"
+        );
+        assert!(
+            seen.as_ref()
+                .is_some_and(|s| s.sni.as_deref() == Some("other.example.test") && !s.handshaken),
+            "{seen:?}"
+        );
+        let accepted = pg_options_of_default_dsn(PG_TLS_HOST);
+        assert!(accepted.is_some(), "the default DSN does not parse");
+        let Some(accepted) = accepted else {
+            return;
+        };
+        let (_outcome, seen) = dial_pg_tls_through_relay(accepted).await;
+        assert!(
+            seen.is_some_and(|s| s.handshaken),
+            "the matching name was refused"
         );
     }
 
