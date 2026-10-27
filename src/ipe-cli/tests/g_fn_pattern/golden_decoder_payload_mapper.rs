@@ -36,11 +36,10 @@ fn repo_root() -> PathBuf {
     std::fs::canonicalize(&joined).unwrap_or(joined)
 }
 
-fn entry_path(root: &Path) -> PathBuf {
+fn golden_dir(root: &Path) -> PathBuf {
     root.join("tests")
         .join("golden")
         .join("decoder_payload_mapper")
-        .join("Main.ipe")
 }
 
 /// ipe-0: the compiler must accept the program AND render the mapper lambda's
@@ -52,14 +51,14 @@ fn entry_path(root: &Path) -> PathBuf {
 #[test]
 fn i198_ipec_accepts_and_renders_send_only_fnonce_param() {
     let root = repo_root();
-    let entry = entry_path(&root);
+    let golden = golden_dir(&root);
     let out =
         PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("i198_decoder_payload_mapper_ipec_out");
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
 
-    let built = ipe::build_loose_file(&entry, &out, &runtime);
+    let built = crate::support::build_golden(&golden, &out, &runtime);
     assert!(
         built.is_ok(),
         "ipe dev build must succeed for decoder_payload_mapper: {:?}",
@@ -99,13 +98,13 @@ fn i198_cargo_builds_and_runs() {
     }
 
     let root = repo_root();
-    let entry = entry_path(&root);
+    let golden = golden_dir(&root);
     let out = crate::support::scratch_root().join("ipec_i198_decoder_payload_mapper_e2e");
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
 
-    let built = ipe::build_loose_file(&entry, &out, &runtime);
+    let built = crate::support::build_golden(&golden, &out, &runtime);
     assert!(
         built.is_ok(),
         "ipe dev build must succeed for decoder_payload_mapper: {:?}",

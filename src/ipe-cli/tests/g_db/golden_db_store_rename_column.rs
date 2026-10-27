@@ -31,12 +31,12 @@ fn fixture_dir(root: &Path) -> PathBuf {
 #[test]
 fn db_store_rename_column_emits() {
     let root = crate::support::repo_root();
-    let entry = fixture_dir(&root).join("Main.ipe");
+    let golden_project = fixture_dir(&root);
     let out = crate::support::scratch_root().join(format!("ipec_{GOLDEN}_emit"));
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
-    let built = ipe::build(&entry, &out, &runtime);
+    let built = crate::support::build_golden(&golden_project, &out, &runtime);
     assert!(
         built.is_ok(),
         "{GOLDEN}: ipe dev build must accept the rename program, got: {built:?}"
@@ -53,13 +53,12 @@ fn db_store_rename_column_runs_and_matches() {
 
     let root = crate::support::repo_root();
     let dir = fixture_dir(&root);
-    let entry = dir.join("Main.ipe");
     let out = crate::support::scratch_root().join(format!("ipec_{GOLDEN}_e2e"));
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
 
-    let built = ipe::build(&entry, &out, &runtime);
+    let built = crate::support::build_golden(&dir, &out, &runtime);
     assert!(
         built.is_ok(),
         "{GOLDEN}: ipe dev build must accept the rename program, got: {built:?}"

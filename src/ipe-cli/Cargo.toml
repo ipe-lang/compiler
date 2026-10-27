@@ -43,6 +43,12 @@ signing = ["dep:sigstore", "dep:sigstore_protobuf_specs", "dep:pki_types"]
 # fallback.
 wasi_run = ["dep:wasmtime", "dep:wasmtime-wasi"]
 
+# `RootFixture` and `build_fixture`: the one way a test reaches a project, by
+# writing a real project tree and resolving it through `ProjectRoot::resolve`.
+# Only test targets enable it (the `ipe` dev-dependency below); no dependency
+# and no shipped binary does.
+test-fixtures = []
+
 [dependencies]
 ipe_stdlib = { path = "../stdlib" }
 ipe_docs = { path = "../ipe-docs" }
@@ -50,6 +56,7 @@ ipe_fmt = { path = "../ipe-fmt" }
 ipe_kernels = { path = "../compiler/kernels" }
 ipe_intern = { path = "../compiler/intern" }
 ipe_diagnostics = { path = "../compiler/diagnostics" }
+ipe_path_core = { path = "../compiler/path-core" }
 ipe_parse = { path = "../compiler/parse" }
 ipe_syntax = { path = "../compiler/syntax" }
 ipe_db = { path = "../compiler/db" }
@@ -109,7 +116,7 @@ semver = "1"
 # (`src/net.rs`). A small blocking, pure-Rust client with the same rustls TLS
 # backend the runtime already uses — no `curl` subprocess, and no async runtime
 # pulled into the CLI for a single one-shot GET.
-ureq = { version = "2", default-features = false, features = ["tls"] }
+ureq = { version = "3", default-features = false, features = ["rustls"] }
 # The Tier-2 wrapper capability gate reads a wrapper crate's `Cargo.toml`
 # dependency tables STRUCTURALLY (parse, don't validate): a hand-rolled line
 # scan under-refuses on valid-but-unusual TOML (a trailing comment on a header,
@@ -171,8 +178,8 @@ pki_types = { package = "rustls-pki-types", version = "1", optional = true }
 # JIT default backend is kept (the module is executed once per `ipe dev run`, not a
 # cold-start-sensitive path). Optional so the default build never links the
 # engine's graph.
-wasmtime = { version = "35", default-features = false, features = ["cranelift", "runtime", "std"], optional = true }
-wasmtime-wasi = { version = "35", default-features = false, features = ["preview1"], optional = true }
+wasmtime = { version = "45", default-features = false, features = ["cranelift", "runtime", "std"], optional = true }
+wasmtime-wasi = { version = "45", default-features = false, features = ["p1"], optional = true }
 
 # `ipe health`'s free-disk check reads the filesystem's available blocks via
 # `statvfs(2)`. rustix exposes the syscall directly — no libc binding in our own
@@ -198,6 +205,8 @@ cap-primitives = "3.4.6"
 win32job = "2"
 
 [dev-dependencies]
+# Turns on `test-fixtures` for this package's own test targets.
+ipe = { path = ".", features = ["test-fixtures"] }
 ipe-test-temp = { path = "../../tools/test-temp" }
 # Build + run plumbing shared by the golden E2E tests (tests/support/mod.rs).
 # `cargo build --message-format=json` parsing that locates the produced binary
@@ -205,6 +214,8 @@ ipe-test-temp = { path = "../../tools/test-temp" }
 e2e-support = { path = "../../tools/e2e-support" }
 # The by-path catalog reader the FFI negative tests load their own caches with.
 ipe_ffi = { path = "../compiler/ffi", features = ["testing"] }
+# `ToolPath::assumed` for the jail-argv tests that render without spawning.
+ipe_sandbox = { path = "../compiler/sandbox", features = ["assumed-tool-path"] }
 # Source scans that read this crate's own syntax tree (comments and literals
 # never match). The same versions and features `panic-scan` already builds into
 # this crate's graph, so no new package compiles.

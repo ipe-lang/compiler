@@ -4,7 +4,7 @@
 use ipe_db::{IpeDatabase, SourceFile};
 use lsp_types::{FoldingRange, FoldingRangeKind};
 
-use crate::offset::{PositionEncoding, offset_to_position};
+use crate::offset::{PositionEncoding, first_line, offset_to_position};
 
 /// The foldable regions of one module, in source order.
 #[must_use]
@@ -74,21 +74,24 @@ fn push_range(
     }
 }
 
-/// A short preview string for the folded region — the first non-empty line
-/// starting at `offset`, truncated to 40 characters. Editors display this
-/// inline when the region is collapsed so the user can see what is hidden.
+/// A short preview string for the folded region — the line starting at
+/// `offset`, cut to its longest whole-character prefix of at most 40 bytes.
+/// Editors display this inline when the region is collapsed so the user can
+/// see what is hidden.
 fn first_line_preview(text: &str, offset: usize) -> String {
+    const PREVIEW_BYTES: usize = 40;
     let slice = text.get(offset..).unwrap_or("");
-    let first_line = slice.lines().next().unwrap_or("").trim_end();
-    if first_line.len() <= 40 {
+    let first_line = first_line(slice).trim_end();
+    if first_line.len() <= PREVIEW_BYTES {
         first_line.to_owned()
     } else {
-        // Truncate at a character boundary ≤ 40 bytes, append ellipsis.
-        let mut end = 40;
-        while !first_line.is_char_boundary(end) {
-            end -= 1;
-        }
-        format!("{}…", &first_line[..end])
+        let end = first_line
+            .char_indices()
+            .map(|(at, ch)| at + ch.len_utf8())
+            .take_while(|&end| end <= PREVIEW_BYTES)
+            .last()
+            .unwrap_or(0);
+        format!("{}…", first_line.get(..end).unwrap_or(""))
     }
 }
 
@@ -170,5 +173,27 @@ mod tests {
             "truncated prefix must be ≤ 40 bytes: {}",
             without_ellipsis.len()
         );
+    }
+
+    /// A character straddling the 40-byte cut is left out whole, never split.
+    #[test]
+    fn collapsed_text_cuts_before_a_straddling_character() {
+        use super::first_line_preview;
+        let line = format!("{}😀{}", "a".repeat(38), "b".repeat(10));
+        assert_eq!(first_line_preview(&line, 0), format!("{}…", "a".repeat(38)));
+        let wide = "😀".repeat(12);
+        assert_eq!(
+            first_line_preview(&wide, 0),
+            format!("{}…", "😀".repeat(10))
+        );
+    }
+
+    /// The preview stops at the first line break a client counts, a lone `\r` included.
+    #[test]
+    fn collapsed_text_stops_at_every_line_break() {
+        use super::first_line_preview;
+        for text in ["main =\n    1", "main =\r\n    1", "main =\r    1"] {
+            assert_eq!(first_line_preview(text, 0), "main =", "{text:?}");
+        }
     }
 }

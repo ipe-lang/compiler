@@ -20,7 +20,7 @@
 //! false positives to be actionable. The column is omitted; the three remaining
 //! columns are concretely checkable without build or VCS history.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::coverage::contract::Surface;
@@ -108,32 +108,4 @@ fn compiler_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../..")
         .join("src/compiler")
-}
-
-/// Collect every `.rs` file under `root`, skipping hidden directories and
-/// `target/`.
-#[must_use]
-pub fn rust_files(root: &Path) -> Vec<PathBuf> {
-    let mut out = Vec::new();
-    if !root.exists() {
-        return out;
-    }
-    let mut stack = vec![root.to_owned()];
-    while let Some(dir) = stack.pop() {
-        let Ok(entries) = std::fs::read_dir(&dir) else {
-            continue;
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-                if !name.starts_with('.') && name != "target" {
-                    stack.push(path);
-                }
-            } else if path.extension().and_then(|e| e.to_str()) == Some("rs") {
-                out.push(path);
-            }
-        }
-    }
-    out
 }

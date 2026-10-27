@@ -5,7 +5,8 @@
 //! (`unionToRustTypeDef`) and `Emitter.hs` (`typeDefToString` / the enum
 //! `ipeStringifyEnumImpl`). The byte target is golden `main.rs` lines 31–43.
 
-use ipe_diagnostics::{DResult, Diagnostic};
+use ipe_diagnostics::nesting::{IR_EXPANSION_SLACK, TYPE_DEPTH_LIMIT, TYPE_LEVELS_PER_ARROW};
+use ipe_diagnostics::{DResult, Diagnostic, LowerError, Span};
 use ipe_intern::{Symbol, rust_fmt_str_lit, rust_str_lit};
 use ipe_ir::{
     EnumDef, IrType, UiCtor, UiPlain, ir_type_is_serde, refused_marker, runtime_aliased_enum,
@@ -15,13 +16,13 @@ use std::collections::BTreeSet;
 
 use ipe_ir::Program;
 
-use crate::doc::Doc;
+use crate::doc::{Doc, Leaf};
 use crate::items::{Items, braced};
 use crate::naming::{
     field_witness_assoc_type_name, field_witness_getter_name, field_witness_trait_name,
     mangle_reserved,
 };
-use crate::render::{RenderConfig, render_seeded};
+use crate::render::{RenderConfig, render_code};
 use crate::{EmitCtx, RecordStruct};
 
 /// SSOT tripwire pinning every unified-colour carrier string this module emits
@@ -59,6 +60,11 @@ const _COLOR_CARRIER_SSOT: fn() = || {
 /// head while `block_indent` is the arm's own indent (12). The returned string
 /// carries no leading spaces for `open_col` — the caller has already written the
 /// prefix on that line — and every broken line carries its own absolute indent.
+///
+/// # Errors
+///
+/// [`Diagnostic::CompilerBug`] `backend.leaf_not_code` when an operand, or the
+/// laid-out call, is not code only.
 fn render_stringify_format(
     fmt_literal: &str,
     args: &[String],
@@ -75,12 +81,8 @@ fn render_stringify_format(
         // A macro argument list breaks without a trailing comma.
         false,
     );
-    Ok(render_seeded(
-        &call,
-        RenderConfig::default(),
-        block_indent,
-        open_col,
-    ))
+    let (text, _) = render_code(&call, RenderConfig::default(), block_indent, open_col)?;
+    Ok(text.into_string())
 }
 
 /// `rustfmt`'s `max_width` (default 100): the widest line the formatter leaves
@@ -109,7 +111,13 @@ const FN_CALL_WIDTH: usize = 60;
 ///     dedented to the arm indent, and the arm keeps its trailing `,`.
 ///
 /// `arm_head` is the `            {Enum}::{Variant}(binders) => ` prefix at block
-/// indent 12; `fmt_literal` and `args` are the `format!` operands.
+/// indent 12; `fmt_literal` and `args` are the `format!` operands. Every tier's
+/// arm is lexed whole before it is returned.
+///
+/// # Errors
+///
+/// [`Diagnostic::CompilerBug`] `backend.leaf_not_code` when the arm is not code
+/// only.
 fn render_stringify_enum_arm(
     arm_head: &str,
     fmt_literal: &str,
@@ -130,23 +138,22 @@ fn render_stringify_enum_arm(
     let inline_call = format!("format!({args_text})");
     let inline_arm_width = open_col + inline_call.chars().count() + 1; // +1 for the `,`
 
-    if args_width <= FN_CALL_WIDTH && inline_arm_width <= MAX_WIDTH {
+    let arm = if args_width <= FN_CALL_WIDTH && inline_arm_width <= MAX_WIDTH {
         // INLINE.
-        Ok(format!("{arm_head}{inline_call},"))
+        format!("{arm_head}{inline_call},")
     } else if args_width <= FN_CALL_WIDTH {
         // BLOCK-WRAP: the call fits `fn_call_width` but the inline arm overflows,
         // so `rustfmt` brace-wraps the body. The `format!` lands at arm indent + 4.
         let body_indent = " ".repeat(ARM_INDENT + 4);
         let close_indent = " ".repeat(ARM_INDENT);
-        Ok(format!(
-            "{arm_head}{{\n{body_indent}{inline_call}\n{close_indent}}}"
-        ))
+        format!("{arm_head}{{\n{body_indent}{inline_call}\n{close_indent}}}")
     } else {
         // DELIMITER-BREAK: the argument text exceeds `fn_call_width`, so the
         // `format!` breaks one argument per line after `=> `; the arm keeps `,`.
         let call = render_stringify_format(fmt_literal, args, open_col, ARM_INDENT)?;
-        Ok(format!("{arm_head}{call},"))
-    }
+        format!("{arm_head}{call},")
+    };
+    Ok(Leaf::parse(arm)?.into_string())
 }
 
 /// The generic-type-parameter scope in effect while emitting one function's
@@ -272,11 +279,78 @@ impl<'a> GenericScope<'a> {
     }
 }
 
+/// The nesting depth of the Rust type [`render_type_at`] is rendering.
+///
+/// A second, independent bound behind the type checker's
+/// [`TYPE_DEPTH_LIMIT`], counted in the checker's unit: a leaf adds no level,
+/// every type former renders its children one level below itself, and a
+/// curried `FnOnce` chain charges [`TYPE_LEVELS_PER_ARROW`] per parameter. A
+/// render past [`TypeDepth::LIMIT`] is refused at ipe time instead of reaching
+/// rustc's recursion limit (and instead of growing the emitter's stack).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TypeDepth(u16);
+
+impl TypeDepth {
+    /// The depth of a type rendered at the top of a signature or definition.
+    pub const ROOT: Self = Self(0);
+
+    /// The deepest level a rendered type may reach.
+    pub const LIMIT: u16 = TYPE_DEPTH_LIMIT.saturating_add(IR_EXPANSION_SLACK);
+
+    /// The depth one level below this one.
+    ///
+    /// # Errors
+    ///
+    /// [`LowerError::BackendTypeTooDeep`] past [`TypeDepth::LIMIT`].
+    pub const fn descend(self) -> DResult<Self> {
+        self.descend_by(1)
+    }
+
+    /// The depth `levels` levels below this one.
+    ///
+    /// # Errors
+    ///
+    /// [`LowerError::BackendTypeTooDeep`] past [`TypeDepth::LIMIT`].
+    pub const fn descend_by(self, levels: u16) -> DResult<Self> {
+        let next = self.0.saturating_add(levels);
+        if next > Self::LIMIT {
+            return Err(Diagnostic::Lower {
+                span: Span::DUMMY,
+                msg: LowerError::BackendTypeTooDeep {
+                    limit: Self::LIMIT,
+                    func: None,
+                },
+            });
+        }
+        Ok(Self(next))
+    }
+}
+
 /// Render an IR type to its Rust spelling. `generics` is the enclosing
 /// function's generic scope (empty at program level), used to render
 /// [`IrType::Generic`] as its deterministic Rust generic name.
-#[allow(clippy::too_many_lines)]
+///
+/// # Errors
+///
+/// [`LowerError::BackendTypeTooDeep`] for a type nested past
+/// [`TypeDepth::LIMIT`]; [`Diagnostic::CompilerBug`] on an IR invariant
+/// violation.
 pub fn render_type(ctx: &EmitCtx, ty: &IrType, generics: GenericScope) -> DResult<String> {
+    render_type_at(ctx, ty, generics, TypeDepth::ROOT)
+}
+
+/// [`render_type`] for a type nested `depth` levels inside the one being emitted.
+///
+/// # Errors
+///
+/// As [`render_type`].
+#[allow(clippy::too_many_lines)]
+pub fn render_type_at(
+    ctx: &EmitCtx,
+    ty: &IrType,
+    generics: GenericScope,
+    depth: TypeDepth,
+) -> DResult<String> {
     Ok(match ty {
         IrType::BackoffStrategy => "ipe_runtime::task::BackoffStrategy".to_owned(),
         IrType::Order => "ipe_runtime::basics::IpeOrder".to_owned(),
@@ -309,7 +383,10 @@ pub fn render_type(ctx: &EmitCtx, ty: &IrType, generics: GenericScope) -> DResul
         IrType::Str => "String".to_owned(),
         IrType::Char => "char".to_owned(),
         IrType::Unit => "()".to_owned(),
-        IrType::Task(inner) => format!("IpeTask<{}>", render_type(ctx, inner, generics)?),
+        IrType::Task(inner) => format!(
+            "IpeTask<{}>",
+            render_type_at(ctx, inner, generics, depth.descend()?)?
+        ),
         IrType::Enum { home, name, args } => {
             // A foreign OPAQUE FFI type renders as its REAL Rust path — its
             // placeholder union is never emitted as an enum ([`ipe_lower`]
@@ -359,7 +436,7 @@ pub fn render_type(ctx: &EmitCtx, ty: &IrType, generics: GenericScope) -> DResul
             } else {
                 let mut parts = Vec::with_capacity(args.len());
                 for arg in args {
-                    parts.push(render_type(ctx, arg, generics)?);
+                    parts.push(render_type_at(ctx, arg, generics, depth.descend()?)?);
                 }
                 format!("{base}<{}>", parts.join(", "))
             }
@@ -367,22 +444,31 @@ pub fn render_type(ctx: &EmitCtx, ty: &IrType, generics: GenericScope) -> DResul
         // The built-in `Maybe a` / `Result e a` render to the runtime's shared
         // representations, brought into scope by the emitted crate's
         // `pub use ipe_runtime::*`.
-        IrType::Maybe(elem) => format!("IpeMaybe<{}>", render_type(ctx, elem, generics)?),
+        IrType::Maybe(elem) => format!(
+            "IpeMaybe<{}>",
+            render_type_at(ctx, elem, generics, depth.descend()?)?
+        ),
         IrType::Result(err, ok) => format!(
             "IpeResult<{}, {}>",
-            render_type(ctx, err, generics)?,
-            render_type(ctx, ok, generics)?
+            render_type_at(ctx, err, generics, depth.descend()?)?,
+            render_type_at(ctx, ok, generics, depth.descend()?)?
         ),
         // The built-in `List a` is the runtime's `Vec<T>`.
-        IrType::List(elem) => format!("Vec<{}>", render_type(ctx, elem, generics)?),
+        IrType::List(elem) => format!(
+            "Vec<{}>",
+            render_type_at(ctx, elem, generics, depth.descend()?)?
+        ),
         // `Dict k v` is the runtime's `HashMap<K, V>`.
         IrType::Dict(k, v) => format!(
             "HashMap<{}, {}>",
-            render_type(ctx, k, generics)?,
-            render_type(ctx, v, generics)?
+            render_type_at(ctx, k, generics, depth.descend()?)?,
+            render_type_at(ctx, v, generics, depth.descend()?)?
         ),
         // `Set a` is the runtime's `BTreeSet<A>`.
-        IrType::Set(a) => format!("BTreeSet<{}>", render_type(ctx, a, generics)?),
+        IrType::Set(a) => format!(
+            "BTreeSet<{}>",
+            render_type_at(ctx, a, generics, depth.descend()?)?
+        ),
         // `Bytes` is an arbitrary byte buffer — `Vec<u8>`. Divergence from
         // Ipê: Ipê aliases Bytes = String; Rust's String is UTF-8 constrained,
         // so Bytes maps to Vec<u8> for lossless arbitrary binary.
@@ -407,8 +493,10 @@ pub fn render_type(ctx: &EmitCtx, ty: &IrType, generics: GenericScope) -> DResul
         // Send-only owned shape. Render it as the `FnOnceChain` the runtime uses.
         IrType::Decoder(inner) => {
             let inner_s = match inner.as_ref() {
-                IrType::Fun(params, ret) => render_fn_once_chain(ctx, params, ret, generics)?,
-                other => render_type(ctx, other, generics)?,
+                IrType::Fun(params, ret) => {
+                    render_fn_once_chain(ctx, params, ret, generics, depth.descend()?)?
+                }
+                other => render_type_at(ctx, other, generics, depth.descend()?)?,
             };
             format!("Decoder<{inner_s}>")
         }
@@ -419,8 +507,14 @@ pub fn render_type(ctx: &EmitCtx, ty: &IrType, generics: GenericScope) -> DResul
         // types, aliased in the emitted project's preamble as
         // `pub type IpeCmd<M> = ipe_runtime::tea::IpeCmd<M>` and
         // `pub type IpeSub<M> = ipe_runtime::tea::IpeSub<M>`.
-        IrType::Cmd(inner) => format!("IpeCmd<{}>", render_type(ctx, inner, generics)?),
-        IrType::Sub(inner) => format!("IpeSub<{}>", render_type(ctx, inner, generics)?),
+        IrType::Cmd(inner) => format!(
+            "IpeCmd<{}>",
+            render_type_at(ctx, inner, generics, depth.descend()?)?
+        ),
+        IrType::Sub(inner) => format!(
+            "IpeSub<{}>",
+            render_type_at(ctx, inner, generics, depth.descend()?)?
+        ),
         // Opaque server types — render to their ipe_runtime names directly.
         IrType::ServerRequest => "ServerRequest".to_owned(),
         IrType::ServerResponse => "ServerResponse".to_owned(),
@@ -470,6 +564,8 @@ pub fn render_type(ctx: &EmitCtx, ty: &IrType, generics: GenericScope) -> DResul
         // `Ipe.Db.Dsn`'s opaque validated connection descriptor — fully-qualified
         // to avoid ambiguity with any user-defined `Dsn` type.
         IrType::Dsn => "ipe_runtime::dsn::Dsn".to_owned(),
+        // `Ipe.Db.Location`'s opaque typed database location — fully-qualified.
+        IrType::DbLocation => "ipe_runtime::db::DbLocation".to_owned(),
         // `Ipe.Db`'s external-connection handle — the phantom access mode is
         // already erased at lowering, so every `Connection ReadOnly` /
         // `Connection ReadWrite` position renders to the one concrete pool type.
@@ -495,7 +591,7 @@ pub fn render_type(ctx: &EmitCtx, ty: &IrType, generics: GenericScope) -> DResul
         // (T2 soundness: `Attribute` exists in BOTH Ipe.Ui and Ipe.Html namespaces;
         // qualified paths keep them unambiguous and prevent glob-import shadowing).
         IrType::Ui { ctor, msg } => {
-            let m = render_type(ctx, msg, generics)?;
+            let m = render_type_at(ctx, msg, generics, depth.descend()?)?;
             match ctor {
                 UiCtor::Html => format!("ipe_runtime::html::Html<{m}>"),
                 UiCtor::Element => format!("ipe_runtime::ui::element::Element<{m}>"),
@@ -562,7 +658,7 @@ pub fn render_type(ctx: &EmitCtx, ty: &IrType, generics: GenericScope) -> DResul
         // let-bound route table's fn signature.
         IrType::WebRoute(page) => format!(
             "ipe_runtime::web::route::Route<{}>",
-            render_type(ctx, page, generics)?
+            render_type_at(ctx, page, generics, depth.descend()?)?
         ),
         // The widget handle carries only its generated tag string; the seal
         // types are phantom (they drive the down-encode / up-decode codegen at
@@ -572,11 +668,11 @@ pub fn render_type(ctx: &EmitCtx, ty: &IrType, generics: GenericScope) -> DResul
         IrType::Tuple(elems) => {
             let mut parts = Vec::with_capacity(elems.len());
             for elem in elems {
-                parts.push(render_type(ctx, elem, generics)?);
+                parts.push(render_type_at(ctx, elem, generics, depth.descend()?)?);
             }
             format!("({})", parts.join(", "))
         }
-        IrType::Record(fields) => ctx.render_record_use(fields, generics)?,
+        IrType::Record(fields) => ctx.render_record_use(fields, generics, depth.descend()?)?,
         // Handler-arrow special case: `Request -> Task Error Response` must
         // render as `ServerHandler<IpeError>` (an Arc<dyn Fn> alias defined in
         // the runtime), not as a generic `Box<dyn Fn + Send + 'static>`.  This
@@ -608,9 +704,9 @@ pub fn render_type(ctx: &EmitCtx, ty: &IrType, generics: GenericScope) -> DResul
         {
             let mut parts = Vec::with_capacity(params.len());
             for param in params {
-                parts.push(render_type(ctx, param, generics)?);
+                parts.push(render_type_at(ctx, param, generics, depth.descend()?)?);
             }
-            let ret_ty = render_type(ctx, ret, generics)?;
+            let ret_ty = render_type_at(ctx, ret, generics, depth.descend()?)?;
             format!(
                 "Arc<dyn Fn({}) -> {ret_ty} + Send + Sync + 'static>",
                 parts.join(", ")
@@ -625,9 +721,9 @@ pub fn render_type(ctx: &EmitCtx, ty: &IrType, generics: GenericScope) -> DResul
         IrType::SharedFun(params, ret) => {
             let mut parts = Vec::with_capacity(params.len());
             for param in params {
-                parts.push(render_type(ctx, param, generics)?);
+                parts.push(render_type_at(ctx, param, generics, depth.descend()?)?);
             }
-            let ret = render_type(ctx, ret, generics)?;
+            let ret = render_type_at(ctx, ret, generics, depth.descend()?)?;
             format!(
                 "::std::sync::Arc<dyn Fn({}) -> {ret} + Send + Sync + 'static>",
                 parts.join(", ")
@@ -644,7 +740,7 @@ pub fn render_type(ctx: &EmitCtx, ty: &IrType, generics: GenericScope) -> DResul
             // `ipe_runtime::ui::element::Event`). Without `Sync` on this boxed
             // param, an emitted user fn generic over its Msg type
             // (`fn f<T1: Clone>(onEdit: Box<dyn Fn(String) -> T1 + Send>) …`)
-            // that arc-wraps `onEdit` (via `arc_callback_wrap`) and passes it to
+            // that places `onEdit` in an `Arc` callback slot and passes it to
             // `input_multiline_`/`input_text_`/… fails E0277 (`… cannot be
             // shared between threads safely`) — the seal break that
             // `26-ui-showcase`'s `regression_gates_input_multiline_fill`
@@ -657,9 +753,9 @@ pub fn render_type(ctx: &EmitCtx, ty: &IrType, generics: GenericScope) -> DResul
             // optimisation (a concrete, non-boxed generic closure type) is deferred.
             let mut parts = Vec::with_capacity(params.len());
             for param in params {
-                parts.push(render_type(ctx, param, generics)?);
+                parts.push(render_type_at(ctx, param, generics, depth.descend()?)?);
             }
-            let ret = render_type(ctx, ret, generics)?;
+            let ret = render_type_at(ctx, ret, generics, depth.descend()?)?;
             format!(
                 "Box<dyn Fn({}) -> {ret} + Send + Sync + 'static>",
                 parts.join(", ")
@@ -676,7 +772,9 @@ pub fn render_type(ctx: &EmitCtx, ty: &IrType, generics: GenericScope) -> DResul
         // what the `next_decoder` parameter of `decode_pipeline_required` /
         // `decode_pipeline_optional` / `decode_pipeline_required_at` /
         // `db_decode_required` / `db_decode_optional` actually requires.
-        IrType::FnOnceChain(params, ret) => render_fn_once_chain(ctx, params, ret, generics)?,
+        IrType::FnOnceChain(params, ret) => {
+            render_fn_once_chain(ctx, params, ret, generics, depth)?
+        }
         // A generic type variable renders as the function's corresponding Rust
         // generic (`T1`, `T2`, …), resolved by position in the quantification
         // scope. No trait bound is emitted — only parametric pass-through is
@@ -710,6 +808,7 @@ fn render_fn_once_chain(
     params: &[IrType],
     ret: &IrType,
     generics: GenericScope,
+    depth: TypeDepth,
 ) -> DResult<String> {
     let Some((last, init)) = params.split_last() else {
         return Err(Diagnostic::CompilerBug {
@@ -717,15 +816,22 @@ fn render_fn_once_chain(
             detail: "function-value curry chain with an empty parameter list".to_owned(),
         });
     };
-    let mut acc = render_type(ctx, ret, generics)?;
+    // Each parameter is one `Box<dyn FnOnce(..) -> _>` level, charged as the
+    // checker charges one arrow. Every part is charged at the innermost level,
+    // the depth the return type sits at.
+    let levels = u16::try_from(params.len())
+        .unwrap_or(u16::MAX)
+        .saturating_mul(TYPE_LEVELS_PER_ARROW);
+    let inner = depth.descend_by(levels)?;
+    let mut acc = render_type_at(ctx, ret, generics, inner)?;
     acc = format!(
         "Box<dyn FnOnce({}) -> {acc} + Send + 'static>",
-        render_type(ctx, last, generics)?
+        render_type_at(ctx, last, generics, inner)?
     );
     for param in init.iter().rev() {
         acc = format!(
             "Box<dyn FnOnce({}) -> {acc} + Send + 'static>",
-            render_type(ctx, param, generics)?
+            render_type_at(ctx, param, generics, inner)?
         );
     }
     Ok(acc)
@@ -845,10 +951,7 @@ pub fn emit_enum(ctx: &EmitCtx, def: &EnumDef) -> DResult<String> {
     let params: Vec<String> = (1..=def.type_params.len())
         .map(|i| format!("T{i}"))
         .collect();
-    // `: 'static` closes a BARE type parameter (`T1: 'static`); `+ 'static`
-    // extends an existing trait-bound list (`T1: IpeStringify + … + 'static`).
-    let decl_static = if params_need_static { ": 'static" } else { "" };
-    let bound_static = if params_need_static { " + 'static" } else { "" };
+    let (decl_static, bound_static) = carrier_static_bounds(params_need_static);
     let (decl_clause, impl_bounds, use_clause) = if params.is_empty() {
         (String::new(), String::new(), String::new())
     } else {
@@ -975,7 +1078,7 @@ fn emit_enum_variant_lines_and_arms(
         // the original Ipê name so a variant like `Type` still displays as
         // "Type", not "Type_". For non-keyword variants the two coincide, so the
         // golden stays byte-identical.
-        let vn = ctx.emit_ident(variant.name)?;
+        let vn = ctx.emit_member_ident(variant.name)?;
         let display = ctx.resolve_ident(variant.name)?.to_owned();
         if variant.fields.is_empty() {
             variant_lines.push(format!("    {vn},"));
@@ -1174,7 +1277,7 @@ fn emit_enum_clone_impl(
     };
     let mut clone_arms = Vec::with_capacity(def.variants.len());
     for variant in &def.variants {
-        let vn = ctx.emit_ident(variant.name)?;
+        let vn = ctx.emit_member_ident(variant.name)?;
         if variant.fields.is_empty() {
             clone_arms.push(format!("            {name}::{vn} => {name}::{vn},"));
         } else {
@@ -1199,6 +1302,21 @@ fn emit_enum_clone_impl(
 ",
         clone_arms.join("\n")
     ))
+}
+
+/// The `'static` bounds a type declaration storing a `dyn Fn` carrier puts on
+/// each of its own parameters, or none when `need` is false.
+///
+/// The first closes a bare parameter (`T1: 'static`), the second extends a
+/// trait-bound list (`T1: IpeStringify + 'static`). A trait object with a type
+/// parameter in its signature requires that parameter to outlive `'static`;
+/// the bound is the carrier's, so no caller obliges it.
+const fn carrier_static_bounds(need: bool) -> (&'static str, &'static str) {
+    if need {
+        (": 'static", " + 'static")
+    } else {
+        ("", "")
+    }
 }
 
 /// Does this enum store a function on the `Arc<dyn Fn(..) -> Tn + … + 'static>`
@@ -1312,8 +1430,7 @@ pub fn emit_record_struct(ctx: &EmitCtx, rec: &RecordStruct) -> DResult<String> 
     // (`enum_stores_shared_fun`): a fully-derivable record has no function
     // payload, so it is unaffected — no `'static` bound, byte-identical to before.
     let params_need_static = rec.is_clone && !rec.is_derivable;
-    let decl_static = if params_need_static { ": 'static" } else { "" };
-    let bound_static = if params_need_static { " + 'static" } else { "" };
+    let (decl_static, bound_static) = carrier_static_bounds(params_need_static);
 
     // Generic clauses: `<T1, T2>` on the struct, `<T1: IpeStringify, …>`
     // on the impl, `<T1, T2>` on the impl's `for` type. All empty when the record
@@ -1783,6 +1900,7 @@ mod show_pin_agreement {
             IrType::Url,
             IrType::UrlRelative,
             IrType::Dsn,
+            IrType::DbLocation,
             IrType::Connection,
             IrType::ConnReadOnly,
             IrType::ConnReadWrite,
@@ -2045,5 +2163,71 @@ mod show_pin_agreement {
             resolved_path("ipe_runtime::Attribute"),
             resolved_path("ipe_runtime_rust::html::Attribute")
         );
+    }
+}
+
+#[cfg(test)]
+mod stringify_lexed {
+    use ipe_diagnostics::{DResult, Diagnostic};
+
+    use super::render_stringify_enum_arm;
+
+    /// The arm head of a variant named `name` at block indent 12.
+    fn head(name: &str) -> String {
+        format!("            E::{name}(a) => ")
+    }
+
+    /// Assert that `got` is the `leaf_not_code` compiler bug for a line comment
+    /// at byte `at`.
+    fn assert_line_comment(got: &DResult<String>, at: usize) {
+        assert!(
+            matches!(
+                got,
+                Err(Diagnostic::CompilerBug {
+                    where_: "backend.leaf_not_code",
+                    detail,
+                }) if *detail == format!("line comment at byte {at}")
+            ),
+            "{got:?}"
+        );
+    }
+
+    /// The INLINE and BLOCK-WRAP tiers build their arm with `format!`, outside
+    /// the renderer; the arm is still lexed whole, so an operand that is not
+    /// code only is refused in every tier, not just the rendered one.
+    #[test]
+    fn stringify_enum_arm_output_is_lexed() {
+        let fmt = "\"{}\"";
+        let bad = ["a // b".to_owned()];
+        let inline_head = head("V");
+        let inline = render_stringify_enum_arm(&inline_head, fmt, &bad);
+        let inline_at = inline_head.len() + "format!(\"{}\", a ".len();
+        assert_line_comment(&inline, inline_at);
+
+        let wrap_head = head(&"V".repeat(70));
+        let wrapped = render_stringify_enum_arm(&wrap_head, fmt, &bad);
+        let wrap_at = wrap_head.len() + "{\n".len() + 16 + "format!(\"{}\", a ".len();
+        assert_line_comment(&wrapped, wrap_at);
+
+        // DELIMITER-BREAK lays the operands out as leaves, so the operand's own
+        // lex refuses it, at its offset within the operand.
+        let long = ["a // b".to_owned(), "c".repeat(64)];
+        assert_line_comment(&render_stringify_enum_arm(&inline_head, fmt, &long), 2);
+    }
+
+    /// Code-only operands pass in every tier: the refusal above is not vacuous.
+    #[test]
+    fn stringify_enum_arm_accepts_code_only_operands() {
+        let fmt = "\"//{}\"";
+        let ok = ["a".to_owned()];
+        let inline = render_stringify_enum_arm(&head("V"), fmt, &ok);
+        assert_eq!(
+            inline.ok().as_deref(),
+            Some("            E::V(a) => format!(\"//{}\", a),")
+        );
+        let wrapped = render_stringify_enum_arm(&head(&"V".repeat(70)), fmt, &ok);
+        assert!(wrapped.is_ok_and(|arm| arm.ends_with("{}\", a)\n            }")));
+        let long = ["a".to_owned(), "c".repeat(64)];
+        assert!(render_stringify_enum_arm(&head("V"), fmt, &long).is_ok());
     }
 }

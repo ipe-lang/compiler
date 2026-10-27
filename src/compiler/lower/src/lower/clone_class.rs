@@ -16,7 +16,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use ipe_diagnostics::{DResult, Diagnostic, Feature, Span};
 use ipe_intern::{Interner, Symbol};
-use ipe_ir::once_closure::CaptureScope;
+use ipe_ir::once_closure::{CaptureScope, MovedCapture};
 use ipe_ir::{EnumPayloadTable, Expr, IrType, ModPath, Pat, SliceOwnership, enum_payload_holds};
 
 use super::capture_rewrite::force_shared_capture_clones;
@@ -160,6 +160,7 @@ pub(super) fn clone_class(env: CloneEnv<'_>, t: &IrType) -> CloneClass {
         // `Relative` is `#[derive(Clone)]` (validated `String` projection fields).
         | IrType::UrlRelative
         | IrType::Dsn
+        | IrType::DbLocation
         | IrType::Connection
         | IrType::ConnReadOnly
         | IrType::ConnReadWrite
@@ -261,14 +262,14 @@ pub(super) fn clone_class(env: CloneEnv<'_>, t: &IrType) -> CloneClass {
 ///
 /// A `CloneOk` param clones per the general multi-use rule. A bare
 /// [`IrType::Generic`] param is ALSO eligible even though [`clone_class`] floors
-/// it to `NonClone`: `render_fn_generics` (`ipe_backend_rust` `emit_expr.rs`,
+/// it to `NonClone`: `apply_signature_shape_bounds` (`signature_bounds.rs`,
 /// `bounds.with_clone()`) stamps `T: Clone` on EVERY emitted generic fn
 /// type-param UNCONDITIONALLY, so an inserted `x.clone()` on a reused generic
 /// param always type-checks. That `T: Clone` bound is the soundness gate — a
 /// non-`Clone` instantiation (e.g. `Box<dyn Fn>`) fails the bound at the CALLER
 /// before the inserted `.clone()` is ever reached, so inserting the clone is
 /// sound (over-cloning is the only downside, never unsoundness). SINGLE SOURCE
-/// OF TRUTH: this predicate and `render_fn_generics`' unconditional
+/// OF TRUTH: this predicate and `apply_signature_shape_bounds`' unconditional
 /// `with_clone()` must agree — if one changes, the other must change with it,
 /// else a reused generic either moves twice (E0382) or clones a non-`Clone`
 /// value (E0599).
@@ -290,7 +291,7 @@ pub(super) fn param_is_multiuse_clonable(env: CloneEnv<'_>, ir_ty: &IrType) -> b
 /// position, else IPE-L0126), `None` is a `CopyLeaf` capture left bare.
 ///
 /// A bare [`IrType::Generic`] capture clones, exactly as a bare `Generic` PARAM
-/// does under [`param_is_multiuse_clonable`]: `render_fn_generics` stamps
+/// does under [`param_is_multiuse_clonable`]: `apply_signature_shape_bounds` stamps
 /// `T: Clone` on every emitted generic type-param unconditionally, so the
 /// inserted `.clone()` type-checks, and a non-`Clone` instantiation is rejected
 /// at the CALLER by that bound before the clone is reached. SINGLE SOURCE OF
@@ -307,13 +308,13 @@ pub(super) fn classify_capture_clone(env: CloneEnv<'_>, ir_ty: &IrType) -> Optio
     }
 }
 
-/// How a free local of a capture-cloned kernel handler survives the emitted `.clone()`.
+/// How a free local of a source-lambda handler of a `+Sync` callback kernel is admitted.
 ///
-/// The backend shadows every such capture with `let v = v.clone();` inside a
-/// fresh wrapper closure (`KernelFn::capture_cloned_handler_arg`), so only a
-/// capture proven `Clone` (or `Copy`) is sound there. `NonClone` and
-/// `Unresolved` are the refused classes: absent a resolved type there is no
-/// proof the emitted clone type-checks, so the gate fails closed.
+/// A `KernelFn::requires_sync_capture` kernel's adapted handler
+/// (`KernelFn::adapted_slots`) admits only a capture proven `Copy`, `Clone`,
+/// or promotable to the `Clone` `Arc` fn carrier. `NonClone` and `Unresolved`
+/// are the refused classes: absent a resolved type there is no proof the
+/// capture is sound in the callback, so the gate fails closed.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(super) enum HandlerCapture {
     /// A `Copy` leaf.
@@ -329,7 +330,7 @@ pub(super) enum HandlerCapture {
 }
 
 impl HandlerCapture {
-    /// Whether the emitted per-call `.clone()` of this capture is proven to type-check.
+    /// Whether this capture is proven sound in a `+Sync` callback handler.
     pub(super) const fn admitted(self) -> bool {
         match self {
             Self::CopyLeaf | Self::CloneOk | Self::ArcCarrier => true,
@@ -338,7 +339,7 @@ impl HandlerCapture {
     }
 }
 
-/// Classify one handler capture of type `ir_ty` for the capture-clone prologue.
+/// Classify one handler capture of type `ir_ty` for the `+Sync` handler-capture gate.
 ///
 /// `promotable_binder` is whether the capture's binder runs the `Arc<dyn Fn>`
 /// carrier promotion (a `let` name, a def/lambda param, a match-arm binder):
@@ -367,7 +368,7 @@ pub(super) fn classify_handler_capture(
 /// The clone class of one COMPOSITE PART.
 ///
 /// A bare [`IrType::Generic`] part is `CloneOk`, not `NonClone`: every emitted
-/// generic fn stamps `T: Clone` unconditionally (`render_fn_generics`), so a
+/// generic fn stamps `T: Clone` unconditionally (`apply_signature_shape_bounds`), so a
 /// composite carrying the tvar (`Vec<(T, String)>` for an `enum`'s pairs,
 /// `Vec<Variant<T>>` for a `taggedUnion`'s variants) is `Clone` whenever the
 /// composite's own shape is, and a `.clone()` inserted on it type-checks — a
@@ -489,14 +490,16 @@ pub(super) fn slice_ownership(env: CloneEnv<'_>, elem: &IrType) -> SliceOwnershi
 pub(super) fn pat_binds_any_name(pat: &Pat) -> bool {
     match pat {
         Pat::Var(_) | Pat::Alias(_, _) => true,
-        Pat::Wildcard | Pat::Int(_) | Pat::Bool(_) | Pat::Char(_) | Pat::Str(_) => false,
+        // A `SharedAlts` alternative is binder-free.
+        Pat::Wildcard | Pat::Int(_) | Pat::Bool(_) | Pat::Char(_) | Pat::Str(_) | Pat::Or(_) => {
+            false
+        }
         Pat::Ctor { args, .. } => args.iter().any(pat_binds_any_name),
         Pat::Tuple(elems) => elems.iter().any(pat_binds_any_name),
         Pat::Record(fields) => fields.iter().any(|(_, p)| pat_binds_any_name(p)),
         Pat::Slice { prefix, rest, .. } => {
             prefix.iter().any(pat_binds_any_name) || rest.as_deref().is_some_and(pat_binds_any_name)
         }
-        Pat::Or(alts) => alts.iter().any(pat_binds_any_name),
     }
 }
 
@@ -533,9 +536,14 @@ pub(super) fn slice_element_alias_refusal(prefix: &[Pat], span: Span) -> DResult
 fn holds_binding_alias(pat: &Pat) -> bool {
     match pat {
         Pat::Alias(inner, _) => pat_binds_any_name(inner),
-        Pat::Var(_) | Pat::Wildcard | Pat::Int(_) | Pat::Bool(_) | Pat::Char(_) | Pat::Str(_) => {
-            false
-        }
+        // A `SharedAlts` alternative holds no alias.
+        Pat::Var(_)
+        | Pat::Wildcard
+        | Pat::Int(_)
+        | Pat::Bool(_)
+        | Pat::Char(_)
+        | Pat::Str(_)
+        | Pat::Or(_) => false,
         Pat::Ctor { args, .. } => args.iter().any(holds_binding_alias),
         Pat::Tuple(elems) => elems.iter().any(holds_binding_alias),
         Pat::Record(fields) => fields.iter().any(|(_, p)| holds_binding_alias(p)),
@@ -543,7 +551,6 @@ fn holds_binding_alias(pat: &Pat) -> bool {
             prefix.iter().any(holds_binding_alias)
                 || rest.as_deref().is_some_and(holds_binding_alias)
         }
-        Pat::Or(alts) => alts.iter().any(holds_binding_alias),
     }
 }
 
@@ -578,7 +585,10 @@ fn pat_binds_any_in_either(pat: &Pat, a: &BTreeSet<Symbol>, b: &BTreeSet<Symbol>
     let in_either = |s: &Symbol| a.contains(s) || b.contains(s);
     match pat {
         Pat::Var(s) => in_either(s),
-        Pat::Wildcard | Pat::Int(_) | Pat::Bool(_) | Pat::Char(_) | Pat::Str(_) => false,
+        // A `SharedAlts` alternative is binder-free.
+        Pat::Wildcard | Pat::Int(_) | Pat::Bool(_) | Pat::Char(_) | Pat::Str(_) | Pat::Or(_) => {
+            false
+        }
         Pat::Alias(inner, s) => in_either(s) || pat_binds_any_in_either(inner, a, b),
         Pat::Ctor { args, .. } => args.iter().any(|p| pat_binds_any_in_either(p, a, b)),
         Pat::Tuple(elems) => elems.iter().any(|p| pat_binds_any_in_either(p, a, b)),
@@ -589,36 +599,36 @@ fn pat_binds_any_in_either(pat: &Pat, a: &BTreeSet<Symbol>, b: &BTreeSet<Symbol>
                     .as_deref()
                     .is_some_and(|p| pat_binds_any_in_either(p, a, b))
         }
-        Pat::Or(alts) => alts.iter().any(|p| pat_binds_any_in_either(p, a, b)),
     }
 }
 
 /// What [`rewrite_captured_clones`] does with a moved non-`Clone` capture.
 pub(super) enum NonCloneCapture {
-    /// A source lambda: refuse the capture with IPE-L0126.
+    /// A closure that must stay `Fn` (a destructure thunk): refuse the capture
+    /// with IPE-L0126.
     Refuse,
-    /// An eta-built closure: record the first moved capture and keep walking,
-    /// so the builder can make the closure an [`Expr::OnceLambda`].
+    /// A source lambda or an eta-built closure: record the first moved capture
+    /// and keep walking, so the builder can make the closure an
+    /// [`Expr::OnceLambda`] that the once check admits by its position.
     Record(Cell<Option<Symbol>>),
 }
 
 /// The context one [`rewrite_captured_clones`] walk shares across its recursion.
 pub(super) struct CaptureWalk {
-    /// The closure's span, for a `Refuse` diagnostic.
+    /// The closure's span: the `Refuse` diagnostic site and the fallback for a capture with no recorded use.
     pub(super) span: Span,
-    /// Each non-`Clone` capture's first use, for a refusal reported at the capture.
+    /// Each non-`Clone` capture's first use: where a refusal or a once
+    /// closure's moved capture is reported.
     pub(super) capture_spans: BTreeMap<Symbol, Span>,
     /// What a moved non-`Clone` capture does.
     pub(super) policy: NonCloneCapture,
 }
 
 impl CaptureWalk {
-    /// A walk that refuses a moved non-`Clone` capture at `span`.
-    pub(super) const fn refusing(span: Span) -> Self {
-        Self::refusing_at(span, BTreeMap::new())
-    }
-
-    /// A refusing walk that reports a capture moved through a call at its use in `capture_spans`.
+    /// A walk that refuses a moved non-`Clone` capture.
+    ///
+    /// A capture moved through a call is reported at its use in
+    /// `capture_spans`; any other move at the closure's `span`.
     pub(super) const fn refusing_at(span: Span, capture_spans: BTreeMap<Symbol, Span>) -> Self {
         Self {
             span,
@@ -628,11 +638,37 @@ impl CaptureWalk {
     }
 
     /// A walk that records the first moved non-`Clone` capture.
-    pub(super) const fn recording(span: Span) -> Self {
+    pub(super) const fn recording(span: Span, capture_spans: BTreeMap<Symbol, Span>) -> Self {
         Self {
             span,
-            capture_spans: BTreeMap::new(),
+            capture_spans,
             policy: NonCloneCapture::Record(Cell::new(None)),
+        }
+    }
+
+    /// Wrap a walked closure body as the closure its recorded moves call for.
+    ///
+    /// No moved capture leaves it an `Fn` [`Expr::Lambda`]. A moved capture
+    /// makes it an [`Expr::OnceLambda`] whose capture span is that capture's
+    /// use (the closure's span when absent); the once check then admits or
+    /// refuses it by its position.
+    pub(super) fn closure(&self, params: Vec<(Symbol, IrType)>, ret: IrType, body: Expr) -> Expr {
+        let body = Box::new(body);
+        match self.first_moved() {
+            None => Expr::Lambda { params, ret, body },
+            Some(name) => {
+                let at = self.capture_spans.get(&name).copied().unwrap_or(self.span);
+                Expr::OnceLambda {
+                    params,
+                    ret,
+                    body,
+                    capture: MovedCapture {
+                        name,
+                        lo: at.lo,
+                        hi: at.hi,
+                    },
+                }
+            }
         }
     }
 
@@ -675,21 +711,6 @@ impl CaptureWalk {
             }
         }
     }
-
-    /// Does the walk drop the non-`Clone` set at the closure-literal argument `arg`?
-    ///
-    /// A source lambda's own pass already judged a closure literal passed as
-    /// an argument, so a refusing walk does not re-examine it. A recording walk
-    /// keeps the set: building that inner `move` closure still moves the
-    /// capture out of the outer one, so the outer closure is `FnOnce` either way.
-    const fn clears_at(&self, arg: &Expr) -> bool {
-        match self.policy {
-            NonCloneCapture::Refuse => {
-                matches!(arg, Expr::Lambda { .. } | Expr::OnceLambda { .. })
-            }
-            NonCloneCapture::Record(_) => false,
-        }
-    }
 }
 
 /// Rewrite a lowered IR expression — the body of a `move` closure — to make
@@ -700,7 +721,8 @@ impl CaptureWalk {
 /// * `Var(s)` where `s ∈ noncl_set` AND `s` is the DIRECT callee of an
 ///   `Apply` → kept bare while the call borrows (`Fn::call` takes `&self`):
 ///   at any scope short of [`CaptureScope::PastRecallable`]
-/// * `Var(s)` where `s ∈ noncl_set` elsewhere → `Err(IPE-L0126)`
+/// * `Var(s)` where `s ∈ noncl_set` elsewhere → a move of `s` out of the
+///   closure: recorded or refused with IPE-L0126 by `walk`'s policy
 /// * all others → unchanged (not captured, or `CopyLeaf`)
 ///
 /// `scope` is the read's place among the emitted closures, the closure being
@@ -753,20 +775,10 @@ pub(super) fn rewrite_captured_clones(
         // inside an inner `move` closure built on each outer call, which moves
         // it out of the outer env (E0507), so the read is a hazard.
         //
-        // Args discipline: a lambda that appears as a CALLBACK ARGUMENT
-        // (e.g. `task_and_then(task, \ts -> insertRow db ts)`) has already been
-        // fully processed by its own `lower_lambda` pass, including the
-        // callee-position exemption for NonClone symbols.  Propagating
-        // `noncl_set` into arg-position lambdas here would re-examine already-
-        // handled callee sites one closure deeper, where the exemption does
-        // NOT fire, spuriously emitting L0126.
-        //
-        // Lambdas in FUNC position (immediately-invoked pattern
-        // `(\x -> f x) p`) are NOT cleared: the inner lambda creation moves a
-        // NonClone value out of the outer env on every call → outer closure
-        // becomes FnOnce against a `Box<dyn Fn>` return annotation → Rust E0277.
-        // Those still propagate `noncl_set` via the normal
-        // `other` path into the `Lambda` arm.
+        // Every argument keeps the full `noncl_set`, a closure literal
+        // included: building that inner `move` closure moves each capture it
+        // reads out of this closure's environment, so the read past it is
+        // this closure's move, recorded or refused by `walk`.
         Expr::Apply { func, args } => {
             let new_func = Box::new(match *func {
                 Expr::Var(s) if noncl_set.contains(&s) => {
@@ -779,20 +791,7 @@ pub(super) fn rewrite_captured_clones(
             });
             let new_args = args
                 .into_iter()
-                .map(|a| {
-                    // Clear `noncl_set` for lambda arguments — they are
-                    // already self-consistent from their own `lower_lambda`
-                    // pass.  Non-lambda expressions keep the full `noncl_set`
-                    // so forwarding a NonClone value in arg position (e.g.
-                    // `applyTwice f x` where `f` is non-callee) still fires
-                    // L0126 as expected.
-                    if walk.clears_at(&a) {
-                        let empty = BTreeSet::new();
-                        rewrite_captured_clones(clone_set, &empty, walk, a, scope)
-                    } else {
-                        rewrite_captured_clones(clone_set, noncl_set, walk, a, scope)
-                    }
-                })
+                .map(|a| rewrite_captured_clones(clone_set, noncl_set, walk, a, scope))
                 .collect::<DResult<Vec<_>>>()?;
             Ok(Expr::Apply {
                 func: new_func,
@@ -837,6 +836,25 @@ pub(super) fn rewrite_captured_clones(
                     )?),
                 })
             }
+        }
+        // Each listed symbol is cloned from the enclosing scope (a `CloneVar`
+        // read, never a move) and rebinds itself over `body`, like a `Let`.
+        Expr::CaptureClones { syms, body } => {
+            let inner_clone: BTreeSet<Symbol> = clone_set
+                .iter()
+                .copied()
+                .filter(|s| !syms.contains(s))
+                .collect();
+            let inner_noncl: BTreeSet<Symbol> = noncl_set
+                .iter()
+                .copied()
+                .filter(|s| !syms.contains(s))
+                .collect();
+            let body = rewrite_captured_clones(&inner_clone, &inner_noncl, walk, *body, scope)?;
+            Ok(Expr::CaptureClones {
+                syms,
+                body: Box::new(body),
+            })
         }
         Expr::Destructure {
             binder,
@@ -888,11 +906,11 @@ pub(super) fn rewrite_captured_clones(
         // fire, so `Var(f)` inside the inner body triggers L0126 — correctly
         // preventing a `FnOnce` closure from being boxed as `Box<dyn Fn>`.
         //
-        // The companion case — lambdas in ARGUMENT position such as
-        // `task_and_then(task, \ts -> insertRow db ts)` — is handled one level
-        // up in the `Apply` arm: arg-position lambdas receive an empty
-        // `noncl_set` before entering this arm, so `inner_noncl` below is
-        // already empty and no spurious L0126 is emitted.
+        // A lambda in ARGUMENT position (`Task.andThen (\ts -> insertRow db
+        // ts) task`) keeps the full `noncl_set` too: building it inside a
+        // `Recallable` closure moves each such capture out of that closure,
+        // so a recording walk makes the outer closure once-only and a
+        // refusing walk fails closed at the capture.
         Expr::Lambda { params, ret, body } => {
             let param_names: BTreeSet<Symbol> = params.iter().map(|(s, _)| *s).collect();
             let inner_clone: BTreeSet<Symbol> = clone_set
@@ -1009,17 +1027,8 @@ pub(super) fn rewrite_captured_clones(
                 clone_set, noncl_set, walk, *else_, scope,
             )?),
         }),
-        // Call: kernel / top-level function application.
-        //
-        // Same Lambda-in-args discipline as `Expr::Apply`: a lambda
-        // passed as a callback to a kernel (e.g. `List.map (\m -> f m) xs` or
-        // `task_and_then(task, \ts -> insertRow db ts)`) is already fully
-        // processed by its own `lower_lambda` pass at scope 0.  Propagating
-        // `noncl_set` into it here would fire spurious L0126 at scope+1.
-        //
-        // Non-lambda args keep the full `noncl_set` so forwarding a NonClone
-        // value in arg position (e.g. `applyTwice f x` where `f` is non-callee)
-        // is still rejected.
+        // Call: kernel / top-level function application. Every argument keeps
+        // the full `noncl_set`, exactly as in `Expr::Apply`.
         Expr::Call {
             callee,
             args,
@@ -1029,14 +1038,7 @@ pub(super) fn rewrite_captured_clones(
             callee,
             args: args
                 .into_iter()
-                .map(|a| {
-                    if walk.clears_at(&a) {
-                        let empty = BTreeSet::new();
-                        rewrite_captured_clones(clone_set, &empty, walk, a, scope)
-                    } else {
-                        rewrite_captured_clones(clone_set, noncl_set, walk, a, scope)
-                    }
-                })
+                .map(|a| rewrite_captured_clones(clone_set, noncl_set, walk, a, scope))
                 .collect::<DResult<Vec<_>>>()?,
             pin,
             on_form,
@@ -1259,7 +1261,8 @@ fn match_arm_peak_uses(sym: Symbol, m: &ipe_ir::Match) -> usize {
 /// occurrence decrements it; when `remaining > 1` the occurrence is non-last
 /// and is rewritten:
 /// * bare `Var(sym)` → `CloneVar(sym)`;
-/// * Lambda whose body refs sym → `Let { name: sym, value: CloneVar(sym), body: Lambda }`.
+/// * Lambda that captures sym (no parameter re-binds it) →
+///   `CaptureClones { syms: [sym], body: Lambda }` ([`Expr::pre_clone`]).
 ///   The pre-clone rebinding captures the CLONE into the closure while the
 ///   OUTER `sym` remains alive for subsequent uses.
 ///
@@ -1291,7 +1294,7 @@ pub(super) fn rewrite_multiuse_clones(sym: Symbol, remaining: &mut usize, expr: 
         // When NOT the last use, wrap in a pre-clone Let so the closure
         // captures the clone and the outer `sym` stays alive.
         Expr::Lambda { params, ret, body } => {
-            if super::lambda_body_refs_sym(sym, &body) {
+            if !params.iter().any(|(s, _)| *s == sym) && super::lambda_body_refs_sym(sym, &body) {
                 // a FURTHER-nested `move` closure inside this lambda's
                 // body that ALSO captures `sym` would move `sym` out of THIS
                 // closure's captured environment on the first call, turning a
@@ -1302,7 +1305,7 @@ pub(super) fn rewrite_multiuse_clones(sym: Symbol, remaining: &mut usize, expr: 
                 // `task_map`/`task_and_then` closure nested inside the pipeline
                 // eta-lambda AND consumed by-value in the outer `db_exec` arg).
                 // `force_shared_capture_clones` walks the body and gives every
-                // directly-capturing nested lambda its OWN `let sym = sym.clone()`
+                // directly-capturing nested lambda its OWN pre-clone
                 // wrap, sourced from the fresh owned `sym` this lambda captures.
                 // It is a no-op when there is no nested capturing lambda, so the
                 // steady-state single-closure case stays byte-identical. Applied
@@ -1311,14 +1314,9 @@ pub(super) fn rewrite_multiuse_clones(sym: Symbol, remaining: &mut usize, expr: 
                 let body = Box::new(force_shared_capture_clones(sym, *body));
                 if *remaining > 1 {
                     *remaining -= 1;
-                    // Pre-clone: `let sym = sym.clone() in Lambda { … }`.
-                    // The inner rebinding `sym` shadows the outer; the `move`
-                    // closure inside captures the inner sym (the clone).
-                    Expr::Let {
-                        name: sym,
-                        value: Box::new(Expr::CloneVar(sym)),
-                        body: Box::new(Expr::Lambda { params, ret, body }),
-                    }
+                    // Pre-clone: the inner rebinding `sym` shadows the outer;
+                    // the `move` closure inside captures the clone.
+                    Expr::pre_clone(sym, Expr::Lambda { params, ret, body })
                 } else {
                     *remaining -= 1;
                     Expr::Lambda { params, ret, body }
@@ -1331,16 +1329,12 @@ pub(super) fn rewrite_multiuse_clones(sym: Symbol, remaining: &mut usize, expr: 
         // ALSO a `move` closure literal that may capture `sym`, so it needs
         // the same pre-clone treatment when it is not the last use.
         Expr::SharedLambda { params, ret, body } => {
-            if super::lambda_body_refs_sym(sym, &body) {
+            if !params.iter().any(|(s, _)| *s == sym) && super::lambda_body_refs_sym(sym, &body) {
                 // same nested-capture descent as the `Lambda` arm above.
                 let body = Box::new(force_shared_capture_clones(sym, *body));
                 if *remaining > 1 {
                     *remaining -= 1;
-                    Expr::Let {
-                        name: sym,
-                        value: Box::new(Expr::CloneVar(sym)),
-                        body: Box::new(Expr::SharedLambda { params, ret, body }),
-                    }
+                    Expr::pre_clone(sym, Expr::SharedLambda { params, ret, body })
                 } else {
                     *remaining -= 1;
                     Expr::SharedLambda { params, ret, body }
@@ -1355,21 +1349,20 @@ pub(super) fn rewrite_multiuse_clones(sym: Symbol, remaining: &mut usize, expr: 
             body,
             capture,
         } => {
-            if super::lambda_body_refs_sym(sym, &body) {
+            if !params.iter().any(|(s, _)| *s == sym) && super::lambda_body_refs_sym(sym, &body) {
                 // same nested-capture descent as the `Lambda` arm above.
                 let body = Box::new(force_shared_capture_clones(sym, *body));
                 if *remaining > 1 {
                     *remaining -= 1;
-                    Expr::Let {
-                        name: sym,
-                        value: Box::new(Expr::CloneVar(sym)),
-                        body: Box::new(Expr::OnceLambda {
+                    Expr::pre_clone(
+                        sym,
+                        Expr::OnceLambda {
                             params,
                             ret,
                             body,
                             capture,
-                        }),
-                    }
+                        },
+                    )
                 } else {
                     *remaining -= 1;
                     Expr::OnceLambda {
@@ -1440,6 +1433,19 @@ pub(super) fn rewrite_multiuse_clones(sym: Symbol, remaining: &mut usize, expr: 
                 name,
                 value: new_value,
                 body: new_body,
+            }
+        }
+        // Each listed symbol is a `CloneVar` read in the outer scope; a node
+        // listing `sym` shadows it over `body`. A pre-clone the body grows at
+        // its head merges into this node, so pre-clones never nest.
+        Expr::CaptureClones { syms, body } => {
+            for _ in syms.iter().filter(|s| **s == sym) {
+                *remaining = remaining.saturating_sub(1);
+            }
+            if syms.contains(&sym) {
+                Expr::CaptureClones { syms, body }
+            } else {
+                Expr::pre_clone_all(syms, rewrite_multiuse_clones(sym, remaining, *body))
             }
         }
         Expr::Destructure {
@@ -1703,7 +1709,7 @@ mod handler_capture_tests {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeSet;
+    use std::collections::{BTreeMap, BTreeSet};
 
     use ipe_diagnostics::{DResult, Diagnostic, Feature, LowerError, Span};
     use ipe_intern::Symbol;
@@ -1760,8 +1766,8 @@ mod tests {
         assert!(
             matches!(
                 args.as_slice(),
-                [Expr::Let { name, value, .. }, Expr::Var(s)]
-                    if *name == SYM && matches!(**value, Expr::CloneVar(v) if v == SYM) && *s == SYM
+                [Expr::CaptureClones { syms, .. }, Expr::Var(s)]
+                    if syms.as_slice() == [SYM] && *s == SYM
             ),
             "the capture is the non-last use in Ipê order: {args:?}"
         );
@@ -1842,9 +1848,88 @@ mod tests {
 
     #[test]
     fn a_recording_walk_records_the_capture_moved_through_the_continuation() {
-        let walk = CaptureWalk::recording(CLOSURE);
+        let walk = CaptureWalk::recording(CLOSURE, BTreeMap::new());
         let out = walk_body(&walk, call_prepare_after_a_run_statement(), IN_LAMBDA);
         assert!(out.is_ok(), "a recording walk never refuses: {out:?}");
         assert_eq!(walk.first_moved(), Some(PREPARE));
+    }
+
+    /// `kernel (\at -> prepare at) at`: a closure literal argument calling the capture.
+    fn closure_arg_calling_prepare(kernel: KernelFn) -> Expr {
+        Expr::Call {
+            callee: Callee::Kernel(kernel),
+            args: vec![
+                Expr::Lambda {
+                    params: vec![(PARAM, IrType::Int)],
+                    ret: IrType::Unit,
+                    body: Box::new(Expr::Apply {
+                        func: Box::new(Expr::Var(PREPARE)),
+                        args: vec![Expr::Var(PARAM)],
+                    }),
+                },
+                Expr::Var(AT),
+            ],
+            pin: CallPin::None,
+            on_form: OnFormKind::NotForm,
+        }
+    }
+
+    #[test]
+    fn a_refusing_walk_keeps_the_capture_set_at_a_closure_argument() {
+        for kernel in [KernelFn::ListMap, KernelFn::TaskAndThen] {
+            let out = walk_body(
+                &refusing_walk(),
+                closure_arg_calling_prepare(kernel),
+                IN_LAMBDA,
+            );
+            assert!(
+                matches!(
+                    &out,
+                    Err(Diagnostic::Lower {
+                        span,
+                        msg: LowerError::Unsupported(Feature::RebuiltClosureMovesCapture),
+                    }) if *span == CAPTURE
+                ),
+                "building the argument closure moves the capture out of the `Fn` one: {out:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_recording_walk_records_the_capture_an_argument_closure_moves() {
+        let walk = CaptureWalk::recording(CLOSURE, std::iter::once((PREPARE, CAPTURE)).collect());
+        let out = walk_body(
+            &walk,
+            closure_arg_calling_prepare(KernelFn::TaskAndThen),
+            IN_LAMBDA,
+        );
+        let Ok(body) = out else {
+            assert!(out.is_ok(), "a recording walk never refuses: {out:?}");
+            return;
+        };
+        let built = walk.closure(vec![(AT, IrType::Int)], IrType::Unit, body);
+        assert!(
+            matches!(
+                &built,
+                Expr::OnceLambda { capture, .. }
+                    if capture.name == PREPARE && capture.lo == CAPTURE.lo && capture.hi == CAPTURE.hi
+            ),
+            "the closure moves `prepare`, so it is built once-only at the capture: {built:?}"
+        );
+    }
+
+    #[test]
+    fn a_walk_that_moves_nothing_builds_a_recallable_closure() {
+        let walk = CaptureWalk::recording(CLOSURE, BTreeMap::new());
+        let out = walk_body(&walk, call_prepare(), IN_LAMBDA);
+        let Ok(body) = out else {
+            assert!(out.is_ok(), "a borrowing call never refuses: {out:?}");
+            return;
+        };
+        let built = walk.closure(vec![(AT, IrType::Int)], IrType::Unit, body);
+        assert!(
+            matches!(&built, Expr::Lambda { .. }),
+            "`Fn::call` borrows, so the closure stays `Fn`: {built:?}"
+        );
     }
 }

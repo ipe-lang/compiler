@@ -10,6 +10,7 @@
 //! name. Output is deterministic — the same `(program, interner)` always
 //! renders the same string.
 
+use ipe_diagnostics::nesting::IR_NESTING_LIMIT;
 use ipe_intern::{Interner, Symbol};
 
 #[cfg(test)]
@@ -22,14 +23,17 @@ use crate::ir::{
 /// Upper bound on the nesting depth `ir_type_name`/`pat_name`/`write_expr`
 /// will recurse before rendering a `<depth limit>` placeholder.
 ///
-/// Past this depth these functions stop recursing rather than overflowing
-/// the native stack. The real Rust backend emitter refuses a program past
-/// this same depth (`ipe_backend_rust::emit_expr`'s `MAX_EMIT_DEPTH`,
-/// IPE-L0200) — this is the single source of truth both share, so
-/// `--emit-ir` (a dev-flag path with no other gate) can never stack-overflow
-/// on a program the emitter would already have refused, nor drift out of
-/// step with the real bound.
-pub const MAX_IR_RENDER_DEPTH: u16 = 96;
+/// It is the compiler-wide [`IR_NESTING_LIMIT`], so the IR walkers, the
+/// `--emit-ir` dump and the Rust emitter (`MAX_EMIT_DEPTH`, IPE-L0200) all
+/// stop at the one depth the parser's source ceiling derives. Past it these
+/// functions stop recursing rather than overflowing the native stack.
+#[allow(
+    clippy::cast_possible_truncation,
+    reason = "`ipe_diagnostics::nesting` asserts `IR_NESTING_LIMIT` fits a `u16`"
+)]
+pub const MAX_IR_RENDER_DEPTH: u16 = IR_NESTING_LIMIT as u16;
+// IPE-RUST-AUDIT:ACCEPTED (Arthur Maciel) — compile-time `const` assertion (not a runtime panic); fails the BUILD if the render ceiling drifts from the SSOT IR ceiling [ledger #boundary]
+const _: () = assert!(MAX_IR_RENDER_DEPTH as u32 == IR_NESTING_LIMIT);
 
 /// A `<depth limit>` placeholder, rendered instead of recursing further once
 /// [`MAX_IR_RENDER_DEPTH`] is exceeded.
@@ -299,6 +303,7 @@ fn ir_type_name_at(interner: &Interner, ty: &IrType, depth: u16) -> String {
         IrType::Url => "Url".to_owned(),
         IrType::UrlRelative => "Url.Relative".to_owned(),
         IrType::Dsn => "Dsn".to_owned(),
+        IrType::DbLocation => "DbLocation".to_owned(),
         // The phantom access mode is shown for a readable IR dump; it never
         // renders to a standalone Rust type (erased at emit).
         IrType::Connection => "Connection".to_owned(),
@@ -444,6 +449,7 @@ fn pat_name_at(interner: &Interner, pat: &Pat, depth: u16) -> String {
             }
         }
         Pat::Or(alts) => alts
+            .as_slice()
             .iter()
             .map(|p| pat_name_at(interner, p, depth))
             .collect::<Vec<_>>()
@@ -576,11 +582,11 @@ fn write_func(out: &mut String, func: &Func, interner: &Interner) {
     let params = func
         .params
         .iter()
-        .map(|(sym, ty)| {
+        .map(|p| {
             format!(
                 "{} : {}",
-                sym_name(interner, *sym),
-                ir_type_name(interner, ty)
+                sym_name(interner, p.sym),
+                ir_type_name(interner, &p.ty)
             )
         })
         .collect::<Vec<_>>()
@@ -821,6 +827,11 @@ fn write_expr_at(out: &mut String, expr: &Expr, interner: &Interner, level: usiz
             for arg in args {
                 write_expr_at(out, arg, interner, level + 1, depth);
             }
+        }
+        Expr::CaptureClones { syms, body } => {
+            let names: Vec<String> = syms.iter().map(|s| sym_name(interner, *s)).collect();
+            line(out, level, &format!("CaptureClones {}", names.join(", ")));
+            write_expr_at(out, body, interner, level + 1, depth);
         }
     }
 }
@@ -1093,7 +1104,7 @@ mod tests {
             type_params: vec![],
             row_params: vec![],
             params: vec![
-                (
+                crate::Param::owned(
                     m,
                     IrType::Enum {
                         home: ModPath(vec![]),
@@ -1101,7 +1112,7 @@ mod tests {
                         args: vec![],
                     },
                 ),
-                (count, IrType::Int),
+                crate::Param::owned(count, IrType::Int),
             ],
             ret: IrType::Int,
             body: Expr::Match(Match::new(Expr::Var(m), tick_arms, &[inc, dec])?),
@@ -1257,7 +1268,7 @@ program
                     home: ModPath(vec![]),
                     type_params: vec![],
                     row_params: vec![],
-                    params: vec![(n, IrType::Int)],
+                    params: vec![crate::Param::owned(n, IrType::Int)],
                     ret: IrType::Int,
                     body,
                 }],
@@ -1351,7 +1362,7 @@ program
                     home: ModPath(vec![]),
                     type_params: vec![],
                     row_params: vec![],
-                    params: vec![(n, IrType::Int)],
+                    params: vec![crate::Param::owned(n, IrType::Int)],
                     ret: IrType::Tuple(vec![IrType::Int, IrType::Bool]),
                     body,
                 }],
@@ -1448,7 +1459,7 @@ program
                     home: ModPath(vec![]),
                     type_params: vec![],
                     row_params: vec![],
-                    params: vec![(param, rec_ty.clone())],
+                    params: vec![crate::Param::owned(param, rec_ty.clone())],
                     ret: rec_ty,
                     body,
                 }],
@@ -1624,7 +1635,10 @@ program
                     home: ModPath(vec![]),
                     type_params: vec![],
                     row_params: vec![],
-                    params: vec![(g, IrType::Fun(vec![IrType::Int], Box::new(IrType::Int)))],
+                    params: vec![crate::Param::owned(
+                        g,
+                        IrType::Fun(vec![IrType::Int], Box::new(IrType::Int)),
+                    )],
                     ret: IrType::Int,
                     body,
                 }],
@@ -1707,7 +1721,10 @@ program
                     home: ModPath(vec![]),
                     type_params: vec![],
                     row_params: vec![],
-                    params: vec![(i.intern("k")?, IrType::Fun(vec![], Box::new(IrType::Bool)))],
+                    params: vec![crate::Param::owned(
+                        i.intern("k")?,
+                        IrType::Fun(vec![], Box::new(IrType::Bool)),
+                    )],
                     ret: IrType::Bool,
                     body: Expr::Int(0),
                 }],
@@ -1826,7 +1843,7 @@ program
                     home: ModPath(vec![]),
                     type_params: vec![],
                     row_params: vec![],
-                    params: vec![(
+                    params: vec![crate::Param::owned(
                         m,
                         IrType::Enum {
                             home: ModPath(vec![]),
@@ -1942,7 +1959,7 @@ program
                         home: ModPath(vec![]),
                         type_params: vec![],
                         row_params: vec![],
-                        params: vec![(
+                        params: vec![crate::Param::owned(
                             w,
                             IrType::Enum {
                                 home: ModPath(vec![]),
@@ -2155,11 +2172,18 @@ program
     /// other gate rejecting the program first.
     #[test]
     fn deeply_nested_expr_renders_depth_limit_placeholder_not_stack_overflow() -> DResult<()> {
-        let mut i = Interner::new();
-        // Far past MAX_IR_RENDER_DEPTH (96) — the same order of magnitude
-        // the emitter-side hardening test uses to prove its own guard.
-        let program = deeply_nested_binop_program(&mut i, 4096)?;
-        let rendered = pretty(&program, &i);
+        // Far past MAX_IR_RENDER_DEPTH — the same order of magnitude the
+        // emitter-side hardening test uses to prove its own guard. The render
+        // recurses up to the ceiling, so it runs on the declared compile stack.
+        let rendered = crate::on_compile_stack(|| {
+            let mut i = Interner::new();
+            let program = deeply_nested_binop_program(&mut i, 4096)?;
+            Ok::<_, ipe_diagnostics::Diagnostic>(pretty(&program, &i))
+        });
+        let Some(rendered) = rendered else {
+            return Err(stack_refused());
+        };
+        let rendered = rendered?;
         assert!(
             rendered.contains(DEPTH_LIMIT_PLACEHOLDER),
             "deep nesting must render the depth-limit placeholder:\n{rendered}"
@@ -2167,13 +2191,27 @@ program
         Ok(())
     }
 
+    /// The compile-stack thread could not be started or did not finish.
+    fn stack_refused() -> ipe_diagnostics::Diagnostic {
+        ipe_diagnostics::Diagnostic::CompilerBug {
+            where_: "pretty.tests.on_compile_stack",
+            detail: "the compile-stack thread did not finish".to_owned(),
+        }
+    }
+
     /// An expression at the depth bound still renders in full — the guard is
     /// a ceiling, not an off-by-one rejection of legitimate programs.
     #[test]
     fn nesting_at_the_bound_still_renders_in_full() -> DResult<()> {
-        let mut i = Interner::new();
-        let program = deeply_nested_binop_program(&mut i, u32::from(MAX_IR_RENDER_DEPTH) / 2)?;
-        let rendered = pretty(&program, &i);
+        let rendered = crate::on_compile_stack(|| {
+            let mut i = Interner::new();
+            let program = deeply_nested_binop_program(&mut i, u32::from(MAX_IR_RENDER_DEPTH) / 2)?;
+            Ok::<_, ipe_diagnostics::Diagnostic>(pretty(&program, &i))
+        });
+        let Some(rendered) = rendered else {
+            return Err(stack_refused());
+        };
+        let rendered = rendered?;
         assert!(
             !rendered.contains(DEPTH_LIMIT_PLACEHOLDER),
             "in-bound nesting must render fully, not hit the placeholder:\n{rendered}"

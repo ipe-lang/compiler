@@ -265,8 +265,8 @@ static HAND_TABLE: &[EnvVar] = &[
         name: "IPE_EMIT_PACKAGE_NAME",
         default: Cow::Borrowed("unset (`ipe-app`)"),
         purpose: "Overrides the emitted crate's package name for a single-file build \
-                  (validated through the package-name sanitizer). Set by the coverage \
-                  probe to give each emitted build a unique crate identity; not intended \
+                  (validated through the package-name sanitizer), so single-file builds \
+                  sharing one cargo target keep distinct crate identities; not intended \
                   for operator use.",
         subsystem: Subsystem::Build,
         class: Class::Tunable,
@@ -305,8 +305,13 @@ static HAND_TABLE: &[EnvVar] = &[
         purpose: "Base URL of the registry's static Pages read API (per-package JSON \
                   mirror + advisory index). `ipe add` and `ipe package audit` read it as \
                   a fast-path, falling back to the `IPE_INDEX_DIR` git checkout on any \
-                  network failure or malformed response. Set to empty to disable the HTTP \
-                  fast-path (air-gapped): resolution then reads the checkout directly. \
+                  network failure or malformed response. The URL must be `https://`, \
+                  redirects included, with a host, no userinfo, a port from 1 to 65535 if \
+                  one is written, and no query, fragment, whitespace, control or non-ASCII \
+                  character. A value that breaks any of these, or is not a well-formed URL, \
+                  is refused with an error naming this variable, never fetched or silently \
+                  replaced. Set to empty to disable \
+                  the HTTP fast-path (air-gapped): resolution then reads the checkout directly. \
                   The pinned rev + sha256 stay the trust root either way.",
         subsystem: Subsystem::Build,
         class: Class::Tunable,
@@ -562,10 +567,12 @@ static HAND_TABLE: &[EnvVar] = &[
     EnvVar {
         name: "IPE_SOLVER_BUDGET",
         default: Cow::Borrowed("5000000"),
-        purpose: "Maximum unification steps the type solver takes before giving up and \
-                  emitting a budget-exceeded error. Set to `0` for no limit (escape hatch \
-                  for programs with very large type graphs). Raise when the compiler \
-                  reports a budget-exceeded diagnostic.",
+        purpose: "Maximum unification steps the type solver takes over the whole program \
+                  before giving up and emitting a budget-exceeded error. `0` is refused with \
+                  that error: the limit is always a positive step count. Each module's own \
+                  solve runs under the same limit, and a program whose modules together \
+                  spend more than half of it is decided by the whole-program solve. Raise \
+                  when the compiler reports a budget-exceeded diagnostic.",
         subsystem: Subsystem::Compiler,
         class: Class::Tunable,
     },
@@ -589,8 +596,9 @@ static HAND_TABLE: &[EnvVar] = &[
     },
     EnvVar {
         name: "IPE_YAML_MAX_BYTES",
-        default: Cow::Borrowed("16777216 (16 MiB)"),
-        purpose: "Maximum YAML source size (bytes) that `Config.loadYaml` will parse. \
+        default: Cow::Borrowed("4194304 (4 MiB)"),
+        purpose: "Maximum YAML source size (bytes) that `Config.decodeYaml` will parse, \
+                  including a `.yaml`/`.yml` file read by `Config.loadFromFile`. \
                   A separate ceiling from `IPE_CONFIG_MAX_BYTES`.",
         subsystem: Subsystem::Config,
         class: Class::Tunable,
@@ -927,6 +935,17 @@ static HAND_TABLE: &[EnvVar] = &[
         subsystem: Subsystem::File,
         class: Class::Tunable,
     },
+    EnvVar {
+        name: ipe_runtime_rust::system::PROCESS_WALL_CEILING.name(),
+        default: Cow::Borrowed("3600 (1 h)"),
+        purpose: "Wall-clock ceiling on one `Process.run`, `runWith` or `runInPty` \
+                  call, in whole seconds or `h`/`m`/`s` segments (`30m`, `1h30m`); \
+                  at most 24 hours. A child still running when it expires is killed \
+                  and the call fails with a `Timeout` error, so a hung child cannot \
+                  pin a worker forever.",
+        subsystem: Subsystem::File,
+        class: Class::Tunable,
+    },
     // ── Runtime ───────────────────────────────────────────────────────────────
     EnvVar {
         name: "IPE_HOME",
@@ -1057,11 +1076,13 @@ static HAND_TABLE: &[EnvVar] = &[
     },
     EnvVar {
         name: "IPE_WEB_FRAME_ANCESTORS",
-        default: Cow::Borrowed("unset (no embedding allowed)"),
+        default: Cow::Borrowed("unset (same-origin embedding only)"),
         purpose: "Space-separated `frame-ancestors` sources of the default \
                   `Content-Security-Policy` sent on HTML responses, e.g. \
-                  `https://app.example.com`. Enables embedding this app in a \
-                  third-party iframe; also sets `SameSite=None; Secure` on session \
+                  `https://app.example.com`. Unset, only the app's own origin \
+                  may frame it (`frame-ancestors 'self'` and \
+                  `X-Frame-Options: SAMEORIGIN`). Set, it enables embedding \
+                  this app in a third-party iframe; also sets `SameSite=None; Secure` on session \
                   cookies. A value holding a control or non-ASCII byte, a `;` or `,`, \
                   or only whitespace refuses to start the server.",
         subsystem: Subsystem::Web,
@@ -1088,14 +1109,6 @@ static HAND_TABLE: &[EnvVar] = &[
         default: Cow::Borrowed("33554432 (32 MiB)"),
         purpose: "Maximum inbound request-body size (bytes) for `/_ipe/event`. Raise \
                   for large file uploads; lower to tighten the DoS floor.",
-        subsystem: Subsystem::Web,
-        class: Class::Tunable,
-    },
-    EnvVar {
-        name: "IPE_WEB_MAX_SESSIONS",
-        default: Cow::Borrowed("50000"),
-        purpose: "Maximum concurrent web sessions before new connections are rejected. \
-                  Prevents unbounded memory growth under a session-creation flood.",
         subsystem: Subsystem::Web,
         class: Class::Tunable,
     },
@@ -1159,9 +1172,10 @@ static HAND_TABLE: &[EnvVar] = &[
     EnvVar {
         name: "IPE_WEB_SHUTDOWN_GRACE_MS",
         default: Cow::Borrowed("1500"),
-        purpose: "Grace period (ms) between receiving SIGTERM and closing active \
-                  connections. Allows in-flight requests to complete. Set to `0` for \
-                  immediate shutdown.",
+        purpose: "Grace period (ms) a served app (`Http.Server` or `Ipe.Web`) gives \
+                  in-flight requests and live streams after the first SIGTERM or \
+                  SIGINT, before it closes its connections and database pools. Set \
+                  to `0` for immediate shutdown.",
         subsystem: Subsystem::Web,
         class: Class::Tunable,
     },
@@ -1196,7 +1210,10 @@ static HAND_TABLE: &[EnvVar] = &[
                   to a fresh `init`. Requesting a backend the build lacks the \
                   feature for is a fail-closed startup error, not a silent \
                   downgrade — build with the feature or set \
-                  `IPE_WEB_STORE=file|memory`.",
+                  `IPE_WEB_STORE=file|memory`. A page request that cannot persist \
+                  its new session is refused with 503; an existing session whose \
+                  checkpoint fails stays live and is not evicted until a checkpoint \
+                  lands.",
         subsystem: Subsystem::Web,
         class: Class::Tunable,
     },
@@ -1311,7 +1328,8 @@ pub static EXCLUDED_NAMES: &[&str] = &[
     "IPE_JUNCTION_OUT",    // Windows junction test helper: compiled helper output path
     "IPE_LOAD_ENV_PROBE_VAR",
     "IPE_ORACLE_SHARED_TARGET",
-    "IPE_PDEATH_PROBE", // parent-death spawner test: selects the re-executed probe mode
+    "IPE_PDEATH_KERNEL_CHILD", // parent-death spawner test: marks the kernel child for the /proc lookup
+    "IPE_PDEATH_PROBE",        // parent-death spawner test: selects the re-executed probe mode
     "IPE_REGISTRY_TEST_CHOICE_B", // env registry test: a fixed fixture key, never read in production
     "IPE_REGISTRY_TEST_NEW", // env registry test: a replacement name only quoted in a retired-key message
     "IPE_REGISTRY_TEST_PORT_A", // env registry test: a fixed fixture key, never read in production
@@ -1403,6 +1421,40 @@ mod tests {
         assert!(
             entry.is_some_and(|v| v.default.starts_with(&expected)),
             "IPE_FILE_READ_MAX default must start with {expected:?}: {entry:?}"
+        );
+    }
+
+    /// The documented `IPE_PROCESS_TIMEOUT` default is the enforced runtime const.
+    #[test]
+    fn process_timeout_default_matches_runtime() {
+        let ceiling = ipe_runtime_rust::system::PROCESS_WALL_CEILING;
+        let entry = ENV_VARS.iter().find(|v| v.name == ceiling.name());
+        let expected = format!("{} ", ceiling.default_value());
+        assert!(
+            entry.is_some_and(|v| v.default.starts_with(&expected)),
+            "{} default must start with {expected:?}: {entry:?}",
+            ceiling.name()
+        );
+    }
+
+    /// The documented `IPE_WEB_FRAME_ANCESTORS` default is the policy the
+    /// runtime serves when the variable is unset: same-origin framing only.
+    #[test]
+    fn frame_ancestors_default_matches_runtime() {
+        use ipe_runtime_rust::csp::{ContentSecurityPolicy, Guarded};
+        let served = ContentSecurityPolicy::for_guard(&Guarded::Response, None).header_value();
+        assert!(
+            served.ends_with("frame-ancestors 'self'"),
+            "an unset framing policy must serve same-origin framing: {served}"
+        );
+        let entry = ENV_VARS
+            .iter()
+            .find(|v| v.name == ipe_runtime_rust::telemetry::FRAME_ANCESTORS_ENV);
+        assert!(
+            entry.is_some_and(|v| v.default.contains("same-origin")
+                && v.purpose.contains("frame-ancestors 'self'")
+                && v.purpose.contains("X-Frame-Options: SAMEORIGIN")),
+            "IPE_WEB_FRAME_ANCESTORS must document the same-origin default: {entry:?}"
         );
     }
 

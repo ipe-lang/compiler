@@ -15,38 +15,28 @@ use std::path::{Path, PathBuf};
 
 use crate::support::repo_root;
 
-fn example_entry(root: &Path) -> PathBuf {
-    root.join("tests")
-        .join("golden")
-        .join("alias_tuple")
-        .join("Main.ipe")
+fn example_dir(root: &Path) -> PathBuf {
+    root.join("tests").join("golden").join("alias_tuple")
 }
 
 #[test]
 fn emits_byte_identical_main_rs() {
     let root = repo_root();
-    let entry = example_entry(&root);
-    let golden = root
-        .join("tests")
-        .join("golden")
-        .join("alias_tuple")
-        .join("main.rs");
+    let dir = example_dir(&root);
+    let golden_project = root.join("tests").join("golden").join("alias_tuple");
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("m3b3_alias_tuple_emit");
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
 
-    let built = ipe::build(&entry, &out, &runtime);
+    let built = crate::support::build_golden(&dir, &out, &runtime);
     assert!(built.is_ok(), "build failed: {:?}", built.err());
 
     // Directory-diff the emitted project against the golden dir (byte-compares
     // the emitted `src/main.rs` against the golden `main.rs`). Replaces the
     // former hand-rolled `read_to_string` + `assert_eq!` pair with the shared
     // harness helper.
-    crate::support::assert_emitted_project_matches_golden_dir(
-        &out,
-        crate::support::golden_dir_of(&golden),
-    );
+    crate::support::assert_emitted_project_matches_golden_dir(&out, &golden_project);
 }
 
 /// Full spine: compile, build, run, assert stdout `20` — the verified output.
@@ -58,12 +48,12 @@ fn end_to_end_builds_and_prints_twenty() {
     }
 
     let root = repo_root();
-    let entry = example_entry(&root);
+    let dir = example_dir(&root);
     let out = crate::support::scratch_root().join("ipec_m3b3_alias_tuple_e2e");
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
-    let built = ipe::build(&entry, &out, &runtime);
+    let built = crate::support::build_golden(&dir, &out, &runtime);
     assert!(built.is_ok(), "build failed: {:?}", built.err());
 
     let outcome = crate::support::build_and_run_emitted("alias_tuple", &out);

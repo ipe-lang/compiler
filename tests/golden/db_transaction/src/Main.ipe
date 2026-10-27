@@ -1,0 +1,86 @@
+module Main exposing (main)
+
+import Ipe.Error as Error
+import Ipe.Io as Io
+import Ipe.Db
+import Ipe.Db.Location as Location exposing (Mode(..))
+import Ipe.Db.Unsafe
+import Ipe.Dict
+import Ipe.List
+import Ipe.Path as Path
+import Ipe.Result as Result
+import Ipe.String
+import Ipe.Task
+
+-- M5b-db golden: withTransaction COMMIT path and ROLLBACK-on-error path.
+-- Uses a file-backed SQLite DB (/tmp/ipe_txn_golden.db) so all pool connections
+-- share the same persisted database — independent sequential transactions can
+-- therefore observe each other's commits and non-committed rollbacks.
+-- CREATE TABLE IF NOT EXISTS + DELETE FROM ensures idempotent test runs.
+
+main =
+    Task.andThen
+        (\conn ->
+            do
+                Unsafe.unsafeExecRaw conn
+                    "CREATE TABLE IF NOT EXISTS log (msg TEXT)"
+                Unsafe.unsafeExecRaw conn "DELETE FROM log"
+                -- Transaction 1: INSERT "hello" + succeed → COMMIT → durable.
+                Task.andThen
+                    (\r1 ->
+                        -- Transaction 2: INSERT "world" + fail → ROLLBACK → discarded.
+                        Task.andThen
+                            (\r2 ->
+                                -- SELECT on pool: file-backed shared DB shows only "hello".
+                                Task.andThen
+                                    (\rows ->
+                                        Io.println
+                                            (String.join ","
+                                                (List.map (\r -> cellText "msg" r) rows)
+                                            )
+                                    )
+                                    (Unsafe.unsafeQuery conn
+                                        "SELECT msg FROM log ORDER BY msg"
+                                        []
+                                    )
+                            )
+                            (Task.onError
+                                (\err -> Task.succeed ())
+                                (Db.withTransaction conn
+                                    (\tx ->
+                                        Db.exec tx
+                                            "INSERT INTO log VALUES (?)"
+                                            [ SqlString "world" ]
+                                            |> Task.andThen (\_ -> Task.fail (Error.unexpected "rollback-test"))
+                                    )
+                                )
+                            )
+                    )
+                    (Db.withTransaction conn
+                        (\tx ->
+                            Db.exec tx
+                                "INSERT INTO log VALUES (?)"
+                                [ SqlString "hello" ]
+                        )
+                    )
+        )
+        (Path.fromString "/tmp/ipe_txn_golden.db"
+            |> Result.andThen (Location.file CreateIfMissing)
+            |> Task.fromResult
+            |> Task.andThen (\loc -> Db.open loc)
+        )
+
+
+-- The text of column `key` in a raw Db row: a SQL `NULL` cell reads as `NULL`,
+-- a missing column as the empty string.
+cellText : String -> Dict String (Maybe String) -> String
+cellText key row =
+    case Dict.get key row of
+        Just (Just s) ->
+            s
+
+        Just Nothing ->
+            "NULL"
+
+        Nothing ->
+            ""

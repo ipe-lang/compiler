@@ -31,6 +31,7 @@ use std::path::Path;
 use crate::CliError;
 use crate::advisory::Advisory;
 use crate::index::{self, IndexEntry};
+use crate::net::{HttpsUrl, UrlError};
 
 /// The environment variable naming the registry's static Pages read API base URL.
 const REGISTRY_URL_ENV: &str = "IPE_REGISTRY_URL";
@@ -42,31 +43,171 @@ const DEFAULT_REGISTRY_URL: &str = "https://arthurmaciel.github.io/ipe-registry"
 /// The `Accept` media type for the static JSON read API.
 const JSON_ACCEPT: &str = "application/json";
 
-/// The registry Pages base URL: `IPE_REGISTRY_URL` when set (trailing slashes
-/// trimmed), else [`DEFAULT_REGISTRY_URL`].
-///
-/// An explicitly-empty `IPE_REGISTRY_URL` disables the HTTP fast-path (the base
-/// is empty, so the fast-path declines every request and the caller falls back
-/// to the git checkout) — the air-gapped opt-out that keeps `ipe add` working
-/// with no network attempt.
-#[must_use]
-pub fn registry_base_url() -> String {
-    ipe_env::var(REGISTRY_URL_ENV).map_or_else(
-        |_| DEFAULT_REGISTRY_URL.to_owned(),
-        |value| value.trim_end_matches('/').to_owned(),
-    )
+/// Where the registry Pages read API is read from, parsed once from
+/// [`REGISTRY_URL_ENV`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RegistrySource {
+    /// [`REGISTRY_URL_ENV`] is set to empty: the HTTP fast-path is off and the
+    /// git checkout is read directly — the air-gapped opt-out that keeps
+    /// `ipe add` working with no network attempt.
+    Disabled,
+    /// The `https://` base every request URL is built from.
+    Pages(RegistryBase),
 }
 
-/// A fetcher: given an absolute URL, return the response body, or `None`.
+impl RegistrySource {
+    /// Parse a [`REGISTRY_URL_ENV`] value: empty is [`Self::Disabled`], anything
+    /// else must be an `https://` base.
+    ///
+    /// # Errors
+    /// The [`RegistryUrlError`] of a non-empty value that is not an `https://`
+    /// base URL.
+    pub fn parse(value: &str) -> Result<Self, RegistryUrlError> {
+        if value.is_empty() {
+            return Ok(Self::Disabled);
+        }
+        RegistryBase::parse(value).map(Self::Pages)
+    }
+}
+
+/// An `https://` registry base URL: an [`HttpsUrl`] with no trailing slash
+/// and no query, so a request path appended to it stays a path on that host.
+///
+/// Built only by [`RegistryBase::parse`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RegistryBase(HttpsUrl);
+
+impl RegistryBase {
+    /// Parse `value` as an `https://` base URL: the scheme is matched without
+    /// regard to ASCII case and written back lower-case, and trailing slashes
+    /// are trimmed.
+    ///
+    /// # Errors
+    /// [`RegistryUrlError::NoScheme`] for a value without `://`,
+    /// [`RegistryUrlError::NotHttps`] for any scheme but `https`,
+    /// [`RegistryUrlError::ForbiddenChar`] for a query, fragment, space or
+    /// control character, [`RegistryUrlError::NoHost`] for an empty host, and
+    /// the [`UrlError`] of any other value that is not an [`HttpsUrl`].
+    pub fn parse(value: &str) -> Result<Self, RegistryUrlError> {
+        let Some((scheme, rest)) = value.split_once("://") else {
+            return Err(RegistryUrlError::NoScheme);
+        };
+        if !scheme.eq_ignore_ascii_case("https") {
+            return Err(RegistryUrlError::NotHttps);
+        }
+        if rest
+            .chars()
+            .any(|c| c == '?' || c == '#' || c.is_whitespace() || c.is_control())
+        {
+            return Err(RegistryUrlError::ForbiddenChar);
+        }
+        let rest = rest.trim_end_matches('/');
+        let host = rest.split_once('/').map_or(rest, |(host, _)| host);
+        if host.is_empty() {
+            return Err(RegistryUrlError::NoHost);
+        }
+        HttpsUrl::parse(&format!("https://{rest}"))
+            .map(Self)
+            .map_err(RegistryUrlError::from)
+    }
+
+    /// The absolute URL of `path` (no leading slash) under this base, or
+    /// `None` when `path` does not keep it an [`HttpsUrl`].
+    fn url(&self, path: &str) -> Option<HttpsUrl> {
+        HttpsUrl::parse(&format!("{}/{path}", self.0.as_str())).ok()
+    }
+}
+
+/// Why a [`REGISTRY_URL_ENV`] value is not an `https://` base URL.
+///
+/// Its text never repeats the value, which may carry a credential.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RegistryUrlError {
+    /// The value is not valid UTF-8.
+    NotText,
+    /// The value names no scheme (no `://`).
+    NoScheme,
+    /// The value names a scheme other than `https`.
+    NotHttps,
+    /// The value carries a query, fragment, space, or control character.
+    ForbiddenChar,
+    /// The value names no host after `https://`.
+    NoHost,
+    /// The value carries userinfo before its host.
+    Userinfo,
+    /// The value writes a port that is not a number from 1 to 65535.
+    BadPort,
+    /// The value is not a well-formed URL.
+    Malformed,
+}
+
+impl From<UrlError> for RegistryUrlError {
+    fn from(fault: UrlError) -> Self {
+        match fault {
+            UrlError::Malformed => Self::Malformed,
+            UrlError::NotHttps => Self::NotHttps,
+            UrlError::NoHost => Self::NoHost,
+            UrlError::Userinfo => Self::Userinfo,
+            UrlError::BadPort => Self::BadPort,
+            UrlError::ForbiddenChar => Self::ForbiddenChar,
+        }
+    }
+}
+
+impl std::fmt::Display for RegistryUrlError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::NotText => "the value is not valid UTF-8",
+            Self::NoScheme => "the value names no scheme",
+            Self::NotHttps => "the value names a scheme other than https",
+            Self::ForbiddenChar => {
+                "the value carries a query, fragment, space or control character"
+            }
+            Self::NoHost => "the value names no host",
+            Self::Userinfo => "the value carries userinfo before its host",
+            Self::BadPort => "the value names a port that is not a number from 1 to 65535",
+            Self::Malformed => "the value is not a well-formed URL",
+        })
+    }
+}
+
+impl From<RegistryUrlError> for CliError {
+    fn from(fault: RegistryUrlError) -> Self {
+        Self::Usage(crate::text::msg::cli_registry_url_not_https(
+            &REGISTRY_URL_ENV,
+            &fault,
+        ))
+    }
+}
+
+/// The registry source [`REGISTRY_URL_ENV`] names, else the
+/// [`DEFAULT_REGISTRY_URL`] base when it is unset.
+///
+/// # Errors
+/// The [`CliError::Usage`] of a value that is neither empty nor an `https://`
+/// base URL: an explicit override is refused, never silently replaced by the
+/// default or by the git checkout.
+pub fn registry_source() -> Result<RegistrySource, CliError> {
+    match ipe_env::var(REGISTRY_URL_ENV) {
+        Ok(value) => RegistrySource::parse(&value).map_err(CliError::from),
+        Err(std::env::VarError::NotPresent) => RegistryBase::parse(DEFAULT_REGISTRY_URL)
+            .map(RegistrySource::Pages)
+            .map_err(CliError::from),
+        Err(std::env::VarError::NotUnicode(_)) => Err(RegistryUrlError::NotText.into()),
+    }
+}
+
+/// A fetcher: given an absolute `https://` URL, return the response body, or
+/// `None`.
 ///
 /// `None` signals any failure (offline, DNS, TLS, non-2xx, timeout). The
 /// production fetcher is [`net_fetch`]; tests inject a stub so the read-path and
 /// fallback logic are exercised without real HTTP.
-pub type Fetch<'a> = &'a dyn Fn(&str) -> Option<String>;
+pub type Fetch<'a> = &'a dyn Fn(&HttpsUrl) -> Option<String>;
 
 /// The production fetcher: a blocking JSON GET through [`crate::net`].
 #[must_use]
-pub fn net_fetch(url: &str) -> Option<String> {
+pub fn net_fetch(url: &HttpsUrl) -> Option<String> {
     crate::net::get_with_accept(url, JSON_ACCEPT)
 }
 
@@ -82,14 +223,15 @@ pub fn net_fetch(url: &str) -> Option<String> {
 /// [`CliError::Resolve`] when BOTH the fast-path declines (or is malformed) AND
 /// the git-checkout reader cannot produce the entry — the same error the
 /// git-only reader would have returned, so an absent package is still an honest
-/// "not in the index".
+/// "not in the index". [`CliError::Usage`] when [`REGISTRY_URL_ENV`] is neither
+/// empty nor an `https://` base URL.
 pub fn read_entry_via_pages(name: &str, index_root: &Path) -> Result<IndexEntry, CliError> {
-    read_entry_via_pages_with(name, index_root, &registry_base_url(), &net_fetch)
+    read_entry_via_pages_with(name, index_root, &registry_source()?, &net_fetch)
 }
 
 /// The testable core of [`read_entry_via_pages`].
 ///
-/// The base URL and fetcher are injected so a stub can exercise the fast-path,
+/// The registry source and fetcher are injected so a stub can exercise the fast-path,
 /// the malformed-response fallback, and the network-failure fallback without
 /// real HTTP.
 ///
@@ -99,10 +241,12 @@ pub fn read_entry_via_pages(name: &str, index_root: &Path) -> Result<IndexEntry,
 pub fn read_entry_via_pages_with(
     name: &str,
     index_root: &Path,
-    base_url: &str,
+    source: &RegistrySource,
     fetch: Fetch<'_>,
 ) -> Result<IndexEntry, CliError> {
-    if let Some(entry) = try_pages_entry(name, base_url, fetch) {
+    if let RegistrySource::Pages(base) = source
+        && let Some(entry) = try_pages_entry(name, base, fetch)
+    {
         return Ok(entry);
     }
     // Fall back to the reproducible git-checkout source of truth. A partial or
@@ -114,15 +258,10 @@ pub fn read_entry_via_pages_with(
 /// Attempt the Pages fast-path for `name`, returning the parsed entry only when
 /// the fetch succeeds AND the JSON parses through the typed constructors.
 ///
-/// `None` on an empty base URL (fast-path disabled), a fetch failure, or a
-/// malformed/partial response — every case a fallback trigger, never a partial
-/// trusted as complete.
-fn try_pages_entry(name: &str, base_url: &str, fetch: Fetch<'_>) -> Option<IndexEntry> {
-    if base_url.is_empty() {
-        return None;
-    }
-    let url = format!("{base_url}/packages/{name}.json");
-    let body = fetch(&url)?;
+/// `None` on a fetch failure or a malformed/partial response — every case a
+/// fallback trigger, never a partial trusted as complete.
+fn try_pages_entry(name: &str, base: &RegistryBase, fetch: Fetch<'_>) -> Option<IndexEntry> {
+    let body = fetch(&base.url(&format!("packages/{name}.json"))?)?;
     // A malformed/partial JSON is discarded (→ fallback), never trusted.
     index::parse_entry_json(name, &body).ok()
 }
@@ -158,14 +297,15 @@ pub enum PagesAdvisoryOutcome {
 ///
 /// # Errors
 /// [`CliError::AdvisoryDbMalformed`] when the index or an advisory record is
-/// present but malformed.
+/// present but malformed; [`CliError::Usage`] when [`REGISTRY_URL_ENV`] is
+/// neither empty nor an `https://` base URL.
 pub fn fetch_advisories_via_pages(pkg_name: &str) -> Result<PagesAdvisoryOutcome, CliError> {
-    fetch_advisories_via_pages_with(pkg_name, &registry_base_url(), &net_fetch)
+    fetch_advisories_via_pages_with(pkg_name, &registry_source()?, &net_fetch)
 }
 
 /// The testable core of [`fetch_advisories_via_pages`].
 ///
-/// The base URL and fetcher are injected so the reachable, unreachable, and
+/// The registry source and fetcher are injected so the reachable, unreachable, and
 /// malformed paths are exercised without real HTTP.
 ///
 /// # Errors
@@ -173,14 +313,16 @@ pub fn fetch_advisories_via_pages(pkg_name: &str) -> Result<PagesAdvisoryOutcome
 /// record is present but malformed.
 pub fn fetch_advisories_via_pages_with(
     pkg_name: &str,
-    base_url: &str,
+    source: &RegistrySource,
     fetch: Fetch<'_>,
 ) -> Result<PagesAdvisoryOutcome, CliError> {
-    if base_url.is_empty() {
+    let RegistrySource::Pages(base) = source else {
         return Ok(PagesAdvisoryOutcome::Unreachable);
-    }
-    let index_url = format!("{base_url}/advisories/index.json");
-    let Some(index_body) = fetch(&index_url) else {
+    };
+    let Some(index_body) = base
+        .url("advisories/index.json")
+        .and_then(|url| fetch(&url))
+    else {
         // Network failure / air-gap: unreachable, NOT clean.
         return Ok(PagesAdvisoryOutcome::Unreachable);
     };
@@ -190,8 +332,10 @@ pub fn fetch_advisories_via_pages_with(
 
     let mut advisories = Vec::with_capacity(ids.len());
     for id in ids {
-        let record_url = format!("{base_url}/advisories/{id}.json");
-        let Some(record_body) = fetch(&record_url) else {
+        let Some(record_body) = base
+            .url(&format!("advisories/{id}.json"))
+            .and_then(|url| fetch(&url))
+        else {
             // The index named this advisory but the record is unreachable. The
             // index proved an advisory exists, so we cannot claim the dep clean:
             // fail closed (unreachable), not silent-pass.
@@ -242,6 +386,106 @@ mod tests {
         )
     }
 
+    /// The registry source the fast-path tests read from.
+    fn reg() -> RegistrySource {
+        RegistrySource::parse("https://reg.example").expect("an https base")
+    }
+
+    // ── Registry URL parse ────────────────────────────────────────────────────
+
+    #[test]
+    fn a_non_https_registry_url_is_refused() {
+        for (value, fault) in [
+            ("http://host", RegistryUrlError::NotHttps),
+            ("host/path", RegistryUrlError::NoScheme),
+            ("ftp://host", RegistryUrlError::NotHttps),
+            ("https:host", RegistryUrlError::NoScheme),
+            ("https://", RegistryUrlError::NoHost),
+            ("https:///path", RegistryUrlError::NoHost),
+            ("/", RegistryUrlError::NoScheme),
+            ("https://host/?q", RegistryUrlError::ForbiddenChar),
+            ("https://host#f", RegistryUrlError::ForbiddenChar),
+            ("https://host /p", RegistryUrlError::ForbiddenChar),
+            ("https://host\r\n", RegistryUrlError::ForbiddenChar),
+            ("https://host\u{1b}/reg", RegistryUrlError::ForbiddenChar),
+            ("https://host:99999", RegistryUrlError::BadPort),
+            ("https://host:0/reg", RegistryUrlError::BadPort),
+            ("https://host:/reg", RegistryUrlError::BadPort),
+            ("https://:443/reg", RegistryUrlError::NoHost),
+            ("https://user@host", RegistryUrlError::Userinfo),
+            ("https://user:pw@host/reg", RegistryUrlError::Userinfo),
+            ("https://user@", RegistryUrlError::Malformed),
+            ("https://h\u{e9}/reg", RegistryUrlError::Malformed),
+        ] {
+            assert_eq!(RegistrySource::parse(value), Err(fault), "{value:?}");
+        }
+    }
+
+    #[test]
+    fn the_scheme_is_matched_without_regard_to_case() {
+        // Schemes are case-insensitive: upper-case HTTP is still refused as
+        // plain http, and upper-case HTTPS parses to the lower-case base.
+        assert_eq!(
+            RegistrySource::parse("HTTP://host"),
+            Err(RegistryUrlError::NotHttps)
+        );
+        assert_eq!(
+            RegistrySource::parse("HTTPS://Host/reg//"),
+            Ok(RegistrySource::Pages(RegistryBase(
+                HttpsUrl::parse("https://Host/reg").expect("an https URL")
+            )))
+        );
+    }
+
+    #[test]
+    fn an_empty_registry_url_disables_and_the_default_parses() {
+        assert_eq!(RegistrySource::parse(""), Ok(RegistrySource::Disabled));
+        assert_eq!(
+            RegistryBase::parse(DEFAULT_REGISTRY_URL).map(|base| base.0.as_str().to_owned()),
+            Ok(DEFAULT_REGISTRY_URL.to_owned())
+        );
+    }
+
+    #[test]
+    fn a_refused_registry_url_names_the_variable_and_https_not_the_value() {
+        let err = CliError::from(RegistryUrlError::NotHttps);
+        let text = err.to_string();
+        assert!(text.contains(REGISTRY_URL_ENV), "{text}");
+        assert!(text.contains("https://"), "{text}");
+        let err = CliError::from(
+            RegistrySource::parse("http://user:secret@host").expect_err("plain http"),
+        );
+        assert!(!err.to_string().contains("secret"), "{err}");
+        for value in [
+            "https://user:secret@host:99999",
+            "https://host:99999/secret",
+        ] {
+            let err = CliError::from(RegistrySource::parse(value).expect_err("bad authority"));
+            let text = err.to_string();
+            assert!(text.contains(REGISTRY_URL_ENV), "{text}");
+            assert!(
+                !text.contains("secret") && !text.contains("99999"),
+                "{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn request_urls_stay_under_the_base() {
+        let seen = std::cell::RefCell::new(Vec::new());
+        let fetch = |url: &HttpsUrl| {
+            seen.borrow_mut().push(url.as_str().to_owned());
+            None
+        };
+        let source = RegistrySource::parse("https://reg.example/mirror/").expect("https base");
+        let outcome = fetch_advisories_via_pages_with("p", &source, &fetch).expect("unreachable");
+        assert!(matches!(outcome, PagesAdvisoryOutcome::Unreachable));
+        assert_eq!(
+            *seen.borrow(),
+            ["https://reg.example/mirror/advisories/index.json".to_owned()]
+        );
+    }
+
     // ── Pages read-path ───────────────────────────────────────────────────────
 
     #[test]
@@ -250,11 +494,14 @@ mod tests {
         let root = temp_index("pages-ok");
         // No git entry on disk — proving the fast-path did the work.
         let body = pages_entry_json("http-extras", "pages-source", "1.2.0");
-        let fetch = move |url: &str| {
-            assert!(url.ends_with("/packages/http-extras.json"), "url: {url}");
+        let fetch = move |url: &HttpsUrl| {
+            assert!(
+                url.as_str().ends_with("/packages/http-extras.json"),
+                "url: {url:?}"
+            );
             Some(body.clone())
         };
-        let entry = read_entry_via_pages_with("http-extras", &root, "https://reg.example", &fetch)
+        let entry = read_entry_via_pages_with("http-extras", &root, &reg(), &fetch)
             .expect("fast-path resolves");
         assert_eq!(entry.publisher, "pages-source");
         assert_eq!(entry.versions.len(), 1);
@@ -268,8 +515,8 @@ mod tests {
         // The fetcher returns None (offline). The git-checkout entry is used.
         let root = temp_index("net-fail");
         write_git_entry(&root, "http-extras", "0.9.0");
-        let fetch = |_url: &str| None;
-        let entry = read_entry_via_pages_with("http-extras", &root, "https://reg.example", &fetch)
+        let fetch = |_url: &HttpsUrl| None;
+        let entry = read_entry_via_pages_with("http-extras", &root, &reg(), &fetch)
             .expect("git fallback resolves");
         assert_eq!(entry.publisher, "git-source");
         let first = entry.versions.first().expect("one version");
@@ -284,9 +531,10 @@ mod tests {
         let root = temp_index("malformed");
         write_git_entry(&root, "http-extras", "0.9.0");
         // Missing `versions` — a partial mirror the fast-path must discard.
-        let fetch =
-            |_url: &str| Some(r#"{ "name": "http-extras", "publisher": "attacker" }"#.to_owned());
-        let entry = read_entry_via_pages_with("http-extras", &root, "https://reg.example", &fetch)
+        let fetch = |_url: &HttpsUrl| {
+            Some(r#"{ "name": "http-extras", "publisher": "attacker" }"#.to_owned())
+        };
+        let entry = read_entry_via_pages_with("http-extras", &root, &reg(), &fetch)
             .expect("git fallback resolves");
         assert_eq!(
             entry.publisher, "git-source",
@@ -307,8 +555,8 @@ mod tests {
                   "versions": [ { "version": "1.0.0",
                                    "source": "https://example.invalid/x",
                                    "rev": "main", "sha256": "00" } ] }"#;
-        let fetch = move |_url: &str| Some(body.to_owned());
-        let entry = read_entry_via_pages_with("http-extras", &root, "https://reg.example", &fetch)
+        let fetch = move |_url: &HttpsUrl| Some(body.to_owned());
+        let entry = read_entry_via_pages_with("http-extras", &root, &reg(), &fetch)
             .expect("git fallback resolves");
         assert_eq!(entry.publisher, "git-source");
         let _ = std::fs::remove_dir_all(&root);
@@ -323,12 +571,13 @@ mod tests {
         // Record whether the fetcher was ever consulted: with an empty base URL
         // the fast-path must be skipped entirely, so this stays false.
         let called = std::cell::Cell::new(false);
-        let fetch = |_url: &str| {
+        let fetch = |_url: &HttpsUrl| {
             called.set(true);
             None
         };
-        let entry = read_entry_via_pages_with("http-extras", &root, "", &fetch)
-            .expect("git fallback resolves");
+        let entry =
+            read_entry_via_pages_with("http-extras", &root, &RegistrySource::Disabled, &fetch)
+                .expect("git fallback resolves");
         assert!(
             !called.get(),
             "fetch must not run when the base URL is empty"
@@ -342,8 +591,8 @@ mod tests {
         // No Pages, no git entry — the same "not in the index" error the git-only
         // reader returns, not a spurious success.
         let root = temp_index("absent");
-        let fetch = |_url: &str| None;
-        let err = read_entry_via_pages_with("ghost", &root, "https://reg.example", &fetch)
+        let fetch = |_url: &HttpsUrl| None;
+        let err = read_entry_via_pages_with("ghost", &root, &reg(), &fetch)
             .expect_err("absent everywhere is an error");
         assert!(format!("{err}").contains("ghost"));
         let _ = std::fs::remove_dir_all(&root);
@@ -366,16 +615,16 @@ mod tests {
             r#"{ "advisories": [ { "id": "IPE-2024-0001", "package": "http-client" } ] }"#;
         let record =
             advisory_record_json("IPE-2024-0001", "http-client", "high", ">=1.0.0, <1.2.0");
-        let fetch = move |url: &str| {
-            if url.ends_with("/advisories/index.json") {
+        let fetch = move |url: &HttpsUrl| {
+            if url.as_str().ends_with("/advisories/index.json") {
                 Some(index_json.to_owned())
-            } else if url.ends_with("/advisories/IPE-2024-0001.json") {
+            } else if url.as_str().ends_with("/advisories/IPE-2024-0001.json") {
                 Some(record.clone())
             } else {
                 None
             }
         };
-        let outcome = fetch_advisories_via_pages_with("http-client", "https://reg.example", &fetch)
+        let outcome = fetch_advisories_via_pages_with("http-client", &reg(), &fetch)
             .expect("advisory fetch succeeds");
         let advisories = fetched(outcome);
         assert_eq!(advisories.len(), 1);
@@ -389,8 +638,8 @@ mod tests {
     fn advisory_index_unreachable_is_warn_not_clean() {
         // The index fetch fails (offline). The outcome is Unreachable so the
         // caller WARNs and falls back — never a silent all-clear.
-        let fetch = |_url: &str| None;
-        let outcome = fetch_advisories_via_pages_with("http-client", "https://reg.example", &fetch)
+        let fetch = |_url: &HttpsUrl| None;
+        let outcome = fetch_advisories_via_pages_with("http-client", &reg(), &fetch)
             .expect("unreachable is not an error");
         assert!(
             matches!(outcome, PagesAdvisoryOutcome::Unreachable),
@@ -401,14 +650,14 @@ mod tests {
     #[test]
     fn malformed_advisory_index_is_fail_closed() {
         // A present-but-malformed index is a hard error, never treated as empty.
-        let fetch = |url: &str| {
-            if url.ends_with("/advisories/index.json") {
+        let fetch = |url: &HttpsUrl| {
+            if url.as_str().ends_with("/advisories/index.json") {
                 Some("this is not json ===".to_owned())
             } else {
                 None
             }
         };
-        let err = fetch_advisories_via_pages_with("http-client", "https://reg.example", &fetch)
+        let err = fetch_advisories_via_pages_with("http-client", &reg(), &fetch)
             .expect_err("malformed index must be an error");
         assert!(
             matches!(err, CliError::AdvisoryDbMalformed { .. }),
@@ -422,14 +671,14 @@ mod tests {
         // We cannot claim the dep clean → Unreachable (fail closed), not empty.
         let index_json =
             r#"{ "advisories": [ { "id": "IPE-2024-0001", "package": "http-client" } ] }"#;
-        let fetch = move |url: &str| {
-            if url.ends_with("/advisories/index.json") {
+        let fetch = move |url: &HttpsUrl| {
+            if url.as_str().ends_with("/advisories/index.json") {
                 Some(index_json.to_owned())
             } else {
                 None
             }
         };
-        let outcome = fetch_advisories_via_pages_with("http-client", "https://reg.example", &fetch)
+        let outcome = fetch_advisories_via_pages_with("http-client", &reg(), &fetch)
             .expect("record-unreachable is not an error");
         assert!(
             matches!(outcome, PagesAdvisoryOutcome::Unreachable),
@@ -442,14 +691,14 @@ mod tests {
         // The index lists advisories for another package only; ours is clean.
         let index_json =
             r#"{ "advisories": [ { "id": "IPE-2024-0009", "package": "other-pkg" } ] }"#;
-        let fetch = move |url: &str| {
-            if url.ends_with("/advisories/index.json") {
+        let fetch = move |url: &HttpsUrl| {
+            if url.as_str().ends_with("/advisories/index.json") {
                 Some(index_json.to_owned())
             } else {
                 None
             }
         };
-        let outcome = fetch_advisories_via_pages_with("http-client", "https://reg.example", &fetch)
+        let outcome = fetch_advisories_via_pages_with("http-client", &reg(), &fetch)
             .expect("advisory fetch succeeds");
         let advisories = fetched(outcome);
         assert!(

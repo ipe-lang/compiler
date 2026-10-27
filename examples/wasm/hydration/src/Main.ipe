@@ -22,15 +22,15 @@ module Main exposing (main)
 -- with `Ipe.Html`, reached through the `Ui.html` node inside the single
 -- `Element` view that `Web.tea` takes.
 
+import Ipe.Html as Html
+import Ipe.Html.Attributes as Attr
+import Ipe.Html.Events exposing (onClick)
 import Ipe.String as String
 import Ipe.Tea.Web exposing (tea)
 import Ipe.Tea.Web.Cmd as Cmd
 import Ipe.Tea.Web.Sub as Sub
 import Ipe.Ui as Ui
 import Ipe.Ui exposing (Element)
-import Ipe.Html as Html
-import Ipe.Html.Attributes as Attr
-import Ipe.Html.Events exposing (onClick)
 
 
 -- The island type: only serialisable fields.

@@ -46,6 +46,7 @@ use std::rc::Rc;
 use ipe_fs_open::{
     ByteCap, EntryCap, EntryName, FileId, FileKind, HeldDir, OpenRefusal, RegularFile,
 };
+use ipe_path_core::{Namespace, Regime, Volume, is_sep};
 
 use crate::covers::path_covers;
 use crate::mounts::CanonicalPath;
@@ -314,6 +315,10 @@ pub enum Unprovable {
     Glob,
     /// The value or its subsection names Git's `ext::` transport, which runs a program.
     ExtTransport,
+    /// Under Windows, a path is anchored on the drive or the drive's working directory the tool holds when it runs (`\x`, `/x`, `C:x`).
+    Unanchored,
+    /// Under Windows, a path names a network share or a verbatim or device namespace (`\\server\share`, `\\?\x`, `\\.\x`), which the scan never opens.
+    NetworkOrDevice,
     /// The file has more than one name.
     HardLinked,
     /// The value splits into more than [`MAX_WORDS`] words.
@@ -378,6 +383,14 @@ impl fmt::Display for Unprovable {
                  words the scan does not see",
             ),
             Self::ExtTransport => f.write_str("it runs a program through Git's `ext::` transport"),
+            Self::Unanchored => f.write_str(
+                "it names a path on the current drive or relative to a drive, which the tool \
+                 resolves against the drive and directory it runs in",
+            ),
+            Self::NetworkOrDevice => f.write_str(
+                "it names a network share or a device or verbatim namespace path, which the scan \
+                 never opens",
+            ),
             Self::HardLinked => f.write_str(
                 "it is a hard link, so another name of the same file may lie inside a writable \
                  grant",
@@ -736,12 +749,25 @@ pub fn scan(
     home: &Home,
     limits: ConfigLimits,
 ) -> Result<(), ConfigRefusal> {
+    scan_under(roots, grants, home, limits, ipe_path_core::HOST)
+}
+
+/// [`scan`], reading every value under `regime`.
+fn scan_under(
+    roots: &ConfigRoots<'_>,
+    grants: &Grants<'_>,
+    home: &Home,
+    limits: ConfigLimits,
+    regime: Regime,
+) -> Result<(), ConfigRefusal> {
     let kind = roots.kind();
     let mut run = Scan {
         kind,
         grants,
         home,
         limits,
+        regime,
+        volumes: held_volumes(roots, grants, home, regime),
         marks: marks(grants, kind)?,
         files: 0,
         bytes: 0,
@@ -874,6 +900,8 @@ struct FileCtx {
     scope: Scope,
     /// Whether the tool always reads it.
     reading: Reading,
+    /// The path regime its values are read under.
+    regime: Regime,
 }
 
 /// How a value is judged.
@@ -984,8 +1012,8 @@ impl<'v> Line<'v> {
 }
 
 impl Runner {
-    /// The command line the tool runs for `value`.
-    fn consume(self, value: &str) -> Line<'_> {
+    /// The command line the tool runs for `value`, read under `regime`.
+    fn consume(self, value: &str, regime: Regime) -> Line<'_> {
         let strip = |prefix: &str| {
             value
                 .strip_prefix(prefix)
@@ -995,7 +1023,7 @@ impl Runner {
             Self::None => Line::of(Cow::Borrowed(value)),
             Self::Bang => strip("!").unwrap_or_else(|| Line::of(Cow::Borrowed(value))),
             Self::Python => strip("python:").unwrap_or_else(|| Line::of(Cow::Borrowed(value))),
-            Self::GitHelper if is_git_absolute(value) => Line::of(Cow::Borrowed(value)),
+            Self::GitHelper if is_git_absolute(value, regime) => Line::of(Cow::Borrowed(value)),
             Self::GitHelper => strip("!")
                 .unwrap_or_else(|| Line::of(Cow::Owned(format!("git-credential-{value}")))),
             // Git splits an alias into words and reads its own options
@@ -1011,15 +1039,10 @@ impl Runner {
     }
 }
 
-/// Git's `is_absolute_path`: a leading `/`, and on Windows a leading `\` or a drive prefix.
-fn is_git_absolute(value: &str) -> bool {
-    let mut chars = value.chars();
-    match (chars.next(), chars.next()) {
-        (Some('/'), _) => true,
-        (Some('\\'), _) => cfg!(windows),
-        (Some(letter), Some(':')) => cfg!(windows) && letter.is_ascii_alphabetic(),
-        (Some(_) | None, _) => false,
-    }
+/// Git's `is_absolute_path` under `regime`: a leading separator, or under Windows an ASCII-letter drive prefix.
+fn is_git_absolute(value: &str, regime: Regime) -> bool {
+    value.bytes().next().is_some_and(|c| is_sep(c, regime))
+        || matches!(Volume::parse(value, regime), Volume::Drive(letter) if letter.is_ascii_alphabetic())
 }
 
 /// What becomes of a value.
@@ -1233,17 +1256,64 @@ enum Zone {
     Carved,
 }
 
-/// A grant or carve directory, by path and identity.
+/// A grant or carve, by path and by the identity of the handle it is held open through.
 struct Mark {
     /// Its canonical path.
     path: PathBuf,
-    /// Its identity.
+    /// The identity of the held handle, read once from it.
     id: FileId,
     /// [`Zone::Writable`] for a grant, [`Zone::Carved`] for a carve.
     zone: Zone,
+    /// The handle `id` was read from, held for the whole scan so the object
+    /// cannot be freed and its identity reused by another directory before a
+    /// walked directory is compared against it.
+    _pinned: Pinned,
 }
 
-/// Every grant and carve of `grants`, identified now.
+/// The open handle a [`Mark`] holds.
+///
+/// A grant is a directory; a carve is a directory or a pointer file (a
+/// gitfile, a Jujutsu or Darcs file entry).
+enum Pinned {
+    /// A directory, held as a walk holds one.
+    Dir(HeldDir),
+    /// A regular file.
+    File(RegularFile),
+}
+
+impl Pinned {
+    /// Hold `path` open: as a directory, else as the regular file it is.
+    ///
+    /// The parent is opened following links (`path` is canonical, so that
+    /// is the lookup that made it); the final entry is opened through the
+    /// held parent and never followed, both tries naming that one entry of
+    /// that one handle. A link, a FIFO, a device, or a socket there is
+    /// refused.
+    fn open(path: &Path) -> Result<Self, OpenRefusal> {
+        let (Some(parent), Some(name)) = (path.parent(), path.file_name()) else {
+            return HeldDir::open_root(path).map(Self::Dir);
+        };
+        let name = EntryName::parse(name)?;
+        let parent = HeldDir::open_root(parent)?;
+        match parent.child_dir(&name) {
+            Ok(dir) => Ok(Self::Dir(dir)),
+            Err(OpenRefusal::NotRegular(FileKind::Regular)) => {
+                parent.open_regular(&name).map(Self::File)
+            }
+            Err(refusal) => Err(refusal),
+        }
+    }
+
+    /// The identity of the object this handle holds.
+    fn id(&self) -> Result<FileId, OpenRefusal> {
+        match self {
+            Self::Dir(dir) => dir.id(),
+            Self::File(file) => file.id(),
+        }
+    }
+}
+
+/// Every grant and carve of `grants`, held open and identified from its handle.
 fn marks(grants: &Grants<'_>, kind: VcsKind) -> Result<Vec<Mark>, ConfigRefusal> {
     let writable = grants.writable.iter().map(|path| (path, Zone::Writable));
     let carved = grants.carves.iter().map(|path| (path, Zone::Carved));
@@ -1251,11 +1321,14 @@ fn marks(grants: &Grants<'_>, kind: VcsKind) -> Result<Vec<Mark>, ConfigRefusal>
         .chain(carved)
         .map(|(path, zone)| {
             let path = path.as_path();
-            FileId::of_path(path)
-                .map(|id| Mark {
-                    path: path.to_path_buf(),
-                    id,
-                    zone,
+            Pinned::open(path)
+                .and_then(|pinned| {
+                    pinned.id().map(|id| Mark {
+                        path: path.to_path_buf(),
+                        id,
+                        zone,
+                        _pinned: pinned,
+                    })
                 })
                 .map_err(|refusal| ConfigRefusal::Unreadable {
                     kind,
@@ -1428,6 +1501,10 @@ struct Scan<'s> {
     home: &'s Home,
     /// The ceilings.
     limits: ConfigLimits,
+    /// The path regime every value is read under.
+    regime: Regime,
+    /// The network shares and namespaces the caller's own paths lie on, the only ones a walk may open.
+    volumes: Vec<String>,
     /// The grants and carves, identified.
     marks: Vec<Mark>,
     /// Files read so far.
@@ -1754,6 +1831,7 @@ impl Scan<'_> {
         {
             return Err(Unprovable::TooLong);
         }
+        self.held_volume(path)?;
         if !path.is_absolute() {
             return Err(Unprovable::Unresolvable);
         }
@@ -1916,6 +1994,7 @@ impl Scan<'_> {
             return Err(walk.stop(Unprovable::TooLong));
         }
         if target.is_absolute() {
+            self.held_volume(&target).map_err(|why| walk.stop(why))?;
             let root = root_of(&target);
             let cur = HeldDir::open_root(&root).map_err(|_| walk.stop(Unprovable::Unresolvable))?;
             let zone = self
@@ -2106,6 +2185,7 @@ impl Scan<'_> {
             syntax: item.syntax,
             scope: item.scope,
             reading: item.reading,
+            regime: self.regime,
         });
         let malformed = |line| ConfigFault::Malformed { line };
         match ctx.syntax {
@@ -2567,7 +2647,10 @@ impl Scan<'_> {
                     && value.bytes().all(|b| {
                         b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'+' | b'-')
                     });
-                if !bare || (cfg!(windows) && self.worktree_runs(value).map_err(Stop::Refused)?) {
+                if !bare
+                    || (ctx.regime.is_windows()
+                        && self.worktree_runs(value).map_err(Stop::Refused)?)
+                {
                     return Err(unproven(Unprovable::ToolPath));
                 }
                 value_checks(value).map_err(unproven)?;
@@ -2627,9 +2710,9 @@ impl Scan<'_> {
             Syntax::Toml => Tilde::Verbatim,
         };
         let mut words = Words::default();
-        match runner.consume(value) {
+        match runner.consume(value, ctx.regime) {
             Line::Shell(text) => words
-                .push_split(&text, Position::Program, tilde)
+                .push_split(&text, Position::Program, tilde, ctx.regime)
                 .map_err(unproven)?,
             // No word's leading `~` is expanded: each is judged both ways.
             Line::Split {
@@ -2637,7 +2720,7 @@ impl Scan<'_> {
                 command_prefix,
             } => {
                 words
-                    .push_split(&text, Position::Program, Tilde::Verbatim)
+                    .push_split(&text, Position::Program, Tilde::Verbatim, ctx.regime)
                     .map_err(unproven)?;
                 words.prefix_command(command_prefix);
             }
@@ -2645,7 +2728,7 @@ impl Scan<'_> {
             // splitting it without a shell; a leading `~` is judged both ways.
             Line::Exec(text) => {
                 words
-                    .push_split(&text, Position::Program, Tilde::Verbatim)
+                    .push_split(&text, Position::Program, Tilde::Verbatim, ctx.regime)
                     .map_err(unproven)?;
                 words
                     .push_forms(text.into_owned(), Position::Program)
@@ -2713,10 +2796,10 @@ impl Scan<'_> {
             }
             if text.contains(is_c_space) {
                 words
-                    .push_split(text, Position::Program, Tilde::Shell)
+                    .push_split(text, Position::Program, Tilde::Shell, ctx.regime)
                     .map_err(unproven)?;
             }
-            let shaped = is_path_shaped(text);
+            let shaped = is_path_shaped(text, ctx.regime);
             if shaped {
                 self.judge_path(ctx, text, Reach::Command)?;
             }
@@ -2800,20 +2883,30 @@ impl Scan<'_> {
             let tail = if rest.is_empty() {
                 ""
             } else {
-                let Some(tail) = rest.strip_prefix(is_separator) else {
+                let Some(tail) = rest.strip_prefix(|c| is_separator(c, self.regime)) else {
                     return Err(Unprovable::TildeUser);
                 };
-                tail
+                // The tool appends the text after `~` to the home, so every
+                // further leading separator collapses into the home's own.
+                tail.trim_start_matches(|c| is_separator(c, self.regime))
             };
+            match Anchor::of(tail, self.regime) {
+                Anchor::Relative => {}
+                Anchor::Absolute | Anchor::Unanchored => return Err(Unprovable::Unanchored),
+                Anchor::NetworkOrDevice => return Err(Unprovable::NetworkOrDevice),
+            }
             let Some(home) = &self.home.0 else {
                 return Err(Unprovable::NoHome);
             };
             return Ok(vec![home.as_path().join(tail)]);
         }
-        let path = Path::new(word);
-        if path.is_absolute() {
-            return Ok(vec![path.to_path_buf()]);
+        match Anchor::of(word, self.regime) {
+            Anchor::Absolute => return Ok(vec![PathBuf::from(word)]),
+            Anchor::Unanchored => return Err(Unprovable::Unanchored),
+            Anchor::NetworkOrDevice => return Err(Unprovable::NetworkOrDevice),
+            Anchor::Relative => {}
         }
+        let path = Path::new(word);
         let command = reach == Reach::Command;
         if command
             && path
@@ -2828,6 +2921,114 @@ impl Scan<'_> {
             .map(|base| base.join(path))
             .chain(worktree)
             .collect())
+    }
+}
+
+impl Scan<'_> {
+    /// Refuse a walk of `path` onto a network share or namespace none of the caller's own paths lies on.
+    ///
+    /// Opening such a path dials the server it names before any handle is
+    /// held, so the refusal comes before the open.
+    fn held_volume(&self, path: &Path) -> Result<(), Unprovable> {
+        match remote_volume(path, self.regime)? {
+            None => Ok(()),
+            Some(volume) if self.volumes.contains(&volume) => Ok(()),
+            Some(_) => Err(Unprovable::NetworkOrDevice),
+        }
+    }
+}
+
+/// The network shares and namespaces the roots, grants, carves, and home lie on under `regime`.
+fn held_volumes(
+    roots: &ConfigRoots<'_>,
+    grants: &Grants<'_>,
+    home: &Home,
+    regime: Regime,
+) -> Vec<String> {
+    let rooted: Vec<&Path> = match *roots {
+        ConfigRoots::Git { gitdir, commondir } => {
+            [Some(gitdir), commondir].into_iter().flatten().collect()
+        }
+        ConfigRoots::Mercurial { dot_hg, shared } => {
+            [Some(dot_hg), shared].into_iter().flatten().collect()
+        }
+        ConfigRoots::Jujutsu { dot_jj, repo } => vec![dot_jj, repo],
+        ConfigRoots::Darcs { dot_darcs } => vec![dot_darcs],
+    };
+    let granted = grants
+        .writable
+        .iter()
+        .chain(&grants.carves)
+        .copied()
+        .chain(&home.0)
+        .map(CanonicalPath::as_path);
+    let mut volumes: Vec<String> = rooted
+        .into_iter()
+        .chain(granted)
+        .filter_map(|path| remote_volume(path, regime).ok().flatten())
+        .collect();
+    volumes.sort_unstable();
+    volumes.dedup();
+    volumes
+}
+
+/// Under Windows, the network share (`server\share`) or namespace prefix `path` lies on, ASCII-lowercased; `None` for a local drive or no volume.
+///
+/// # Errors
+/// [`Unprovable::Unresolvable`] under Windows for a path that is not valid Unicode, whose volume cannot be read.
+fn remote_volume(path: &Path, regime: Regime) -> Result<Option<String>, Unprovable> {
+    if !regime.is_windows() {
+        return Ok(None);
+    }
+    let text = path.to_str().ok_or(Unprovable::Unresolvable)?;
+    let volume = Volume::parse(text, regime);
+    let is_drive = |name: &str| matches!(Volume::parse(name, regime), Volume::Drive(c) if name.len() == c.len_utf8() + 1);
+    Ok(match volume {
+        Volume::None | Volume::Drive(_) => None,
+        Volume::Namespaced {
+            tag: Namespace::Verbatim,
+            name: Some(name),
+        } if is_drive(name) => None,
+        Volume::Unc { server, share } | Volume::VerbatimUnc { server, share } => Some(format!(
+            "{}\\{}",
+            server.to_ascii_lowercase(),
+            share.unwrap_or_default().to_ascii_lowercase()
+        )),
+        Volume::Namespaced { .. } => Some(
+            text.get(..volume.byte_len())
+                .unwrap_or(text)
+                .to_ascii_lowercase(),
+        ),
+    })
+}
+
+/// What a path-shaped word is resolved against under a regime.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Anchor {
+    /// Nothing: it names a local root (`/x`; under Windows `C:\x`).
+    Absolute,
+    /// A base the scan knows: the home, a configuration file's directory, or the working tree.
+    Relative,
+    /// Under Windows, the drive (`\x`, `/x`) or the drive's working directory (`C:x`) the tool holds when it runs.
+    Unanchored,
+    /// Under Windows, a network share or a verbatim or device namespace, whose opening may dial a remote host.
+    NetworkOrDevice,
+}
+
+impl Anchor {
+    /// The anchor of `word` under `regime`.
+    fn of(word: &str, regime: Regime) -> Self {
+        let leads = |at: usize| word.as_bytes().get(at).is_some_and(|&c| is_sep(c, regime));
+        match Volume::parse(word, regime) {
+            Volume::None if leads(0) && regime.is_windows() => Self::Unanchored,
+            Volume::None if leads(0) => Self::Absolute,
+            Volume::None => Self::Relative,
+            Volume::Drive(letter) if leads(letter.len_utf8() + 1) => Self::Absolute,
+            Volume::Drive(_) => Self::Unanchored,
+            Volume::Unc { .. } | Volume::VerbatimUnc { .. } | Volume::Namespaced { .. } => {
+                Self::NetworkOrDevice
+            }
+        }
     }
 }
 
@@ -2909,13 +3110,19 @@ impl Words {
         Ok(())
     }
 
-    /// Push the shell words of `text`, the first at `first` and the rest as arguments.
+    /// Push the shell words of `text` under `regime`, the first at `first` and the rest as arguments.
     ///
     /// A word whose leading `~` was quoted or escaped arrives as `./~...`
     /// ([`shell_words`]); one whose leading `~` was not is read as the shell
     /// reads it under [`Tilde::Shell`], and both ways under [`Tilde::Verbatim`].
-    fn push_split(&mut self, text: &str, first: Position, tilde: Tilde) -> Result<(), Unprovable> {
-        for (index, word) in shell_words(text).into_iter().enumerate().rev() {
+    fn push_split(
+        &mut self,
+        text: &str,
+        first: Position,
+        tilde: Tilde,
+        regime: Regime,
+    ) -> Result<(), Unprovable> {
+        for (index, word) in shell_words(text, regime).into_iter().enumerate().rev() {
             let position = if index == 0 {
                 first
             } else {
@@ -3080,9 +3287,9 @@ fn is_network_url(value: &str, scp: bool) -> bool {
         && host_ok(head)
 }
 
-/// A path separator of the host.
-const fn is_separator(c: char) -> bool {
-    c == '/' || (cfg!(windows) && c == '\\')
+/// A path separator under `regime`.
+fn is_separator(c: char, regime: Regime) -> bool {
+    u8::try_from(c).is_ok_and(|b| is_sep(b, regime))
 }
 
 /// A character the shell expands a word at: a glob character or a brace.
@@ -3137,9 +3344,13 @@ fn option_argument(word: &str) -> Option<&str> {
     Some(rest.strip_prefix('=').unwrap_or(rest))
 }
 
-/// Whether `word` is shaped like a path: it holds a separator, starts with `~`, or is `.` or `..`.
-fn is_path_shaped(word: &str) -> bool {
-    word.contains(is_separator) || word.starts_with('~') || word == "." || word == ".."
+/// Whether `word` is shaped like a path: it holds a separator, starts with `~` or (under Windows) a drive, or is `.` or `..`.
+fn is_path_shaped(word: &str, regime: Regime) -> bool {
+    word.contains(|c| is_separator(c, regime))
+        || Volume::parse(word, regime).is_drive()
+        || word.starts_with('~')
+        || word == "."
+        || word == ".."
 }
 
 /// `value` split into shell words: quotes group, a backslash escapes, whitespace separates.
@@ -3151,7 +3362,7 @@ fn is_path_shaped(word: &str) -> bool {
 /// (`'~/x'`, `"~/x"`, `\~/x`, `''~/x`), or whose prefix holds a quote or an
 /// escape (`~"/x"`, `~\/x`, `~''/x`), names the relative path `~/x`, so it
 /// comes back as `./~/x`.
-fn shell_words(value: &str) -> Vec<String> {
+fn shell_words(value: &str, regime: Regime) -> Vec<String> {
     let mut words = Vec::new();
     let mut word = String::new();
     let mut in_word = false;
@@ -3203,7 +3414,7 @@ fn shell_words(value: &str) -> Vec<String> {
                 if !in_word {
                     home = other == '~';
                     in_prefix = home;
-                } else if in_prefix && is_separator(other) {
+                } else if in_prefix && is_separator(other, regime) {
                     in_prefix = false;
                 }
                 in_word = true;
@@ -3908,6 +4119,16 @@ mod tests {
         roots: &ConfigRoots<'_>,
         limits: ConfigLimits,
     ) -> Result<(), ConfigRefusal> {
+        scan_with_under(fixture, roots, limits, ipe_path_core::HOST)
+    }
+
+    /// [`scan_with`] with every value read under `regime`.
+    fn scan_with_under(
+        fixture: &Fixture,
+        roots: &ConfigRoots<'_>,
+        limits: ConfigLimits,
+        regime: Regime,
+    ) -> Result<(), ConfigRefusal> {
         let tree = canonical(&fixture.tree);
         let other = canonical(&fixture.other);
         let carves =
@@ -3915,7 +4136,7 @@ mod tests {
         let [git, hg, jj, darcs] = &carves;
         let grants = Grants::new(&tree, &[&other]).with_carves(&[git, hg, jj, darcs]);
         let home = Home::known(canonical(&fixture.home));
-        scan(roots, &grants, &home, limits)
+        scan_under(roots, &grants, &home, limits, regime)
     }
 
     fn scan_git_at(fixture: &Fixture, gitdir: &Path) -> Result<(), ConfigRefusal> {
@@ -4362,6 +4583,119 @@ mod tests {
         assert_eq!(unprovable(&result), Some(Unprovable::NoHome));
     }
 
+    /// A grant removed before the scan holds no handle, so the scan refuses it rather than running with it unmarked.
+    #[test]
+    fn a_vanished_grant_is_unreadable() {
+        let f = fixture("vanished");
+        let tree = canonical(&f.tree);
+        let other = canonical(&f.other);
+        let git = canonical(&f.tree.join(".git"));
+        let grants = Grants::new(&tree, &[&other]).with_carves(&[&git]);
+        std::fs::remove_dir(&f.other).expect("remove the grant");
+        let roots = ConfigRoots::Git {
+            gitdir: &f.tree.join(".git"),
+            commondir: None,
+        };
+        let home = Home::known(canonical(&f.home));
+        let result = scan(&roots, &grants, &home, ConfigLimits::DEFAULT);
+        assert!(
+            matches!(
+                &result,
+                Err(ConfigRefusal::Unreadable {
+                    path,
+                    fault: ConfigFault::Open(OpenRefusal::Absent),
+                    ..
+                }) if path == other.as_path()
+            ),
+            "the vanished grant is unreadable, got {result:?}"
+        );
+    }
+
+    /// A carve that is a pointer file is held open as a file, so the scan runs.
+    #[test]
+    fn a_file_carve_is_held_and_scanned() {
+        let f = fixture("filecarve");
+        write(&f.tree.join("sub/.git"), "gitdir: ../.git\n");
+        let tree = canonical(&f.tree);
+        let git = canonical(&f.tree.join(".git"));
+        let pointer = canonical(&f.tree.join("sub/.git"));
+        let grants = Grants::new(&tree, &[]).with_carves(&[&git, &pointer]);
+        let roots = ConfigRoots::Git {
+            gitdir: &f.tree.join(".git"),
+            commondir: None,
+        };
+        let home = Home::known(canonical(&f.home));
+        let result = scan(&roots, &grants, &home, ConfigLimits::DEFAULT);
+        assert_eq!(result, Ok(()), "a file carve is marked, not refused");
+    }
+
+    /// Scan Git's configuration with `pointer` carved beside `.git`.
+    #[cfg(unix)]
+    fn scan_with_carve(f: &Fixture, pointer: &CanonicalPath) -> Result<(), ConfigRefusal> {
+        let tree = canonical(&f.tree);
+        let git = canonical(&f.tree.join(".git"));
+        let grants = Grants::new(&tree, &[]).with_carves(&[&git, pointer]);
+        let roots = ConfigRoots::Git {
+            gitdir: &f.tree.join(".git"),
+            commondir: None,
+        };
+        let home = Home::known(canonical(&f.home));
+        scan(&roots, &grants, &home, ConfigLimits::DEFAULT)
+    }
+
+    /// A carve whose final entry became a link after it was resolved is refused, never followed.
+    #[cfg(unix)]
+    #[test]
+    fn a_carve_turned_link_is_unreadable() {
+        let f = fixture("carvelink");
+        let at = f.tree.join("sub/.git");
+        write(&at, "gitdir: ../.git\n");
+        let pointer = canonical(&at);
+        std::fs::remove_file(&at).expect("remove the pointer");
+        std::os::unix::fs::symlink(&f.other, &at).expect("plant link");
+        let result = scan_with_carve(&f, &pointer);
+        assert!(
+            matches!(
+                &result,
+                Err(ConfigRefusal::Unreadable {
+                    path,
+                    fault: ConfigFault::Open(OpenRefusal::Link),
+                    ..
+                }) if path == pointer.as_path()
+            ),
+            "the linked carve is unreadable, got {result:?}"
+        );
+    }
+
+    /// A carve that is a FIFO is refused without blocking on it.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_fifo_carve_is_unreadable() {
+        let f = fixture("carvefifo");
+        let at = f.tree.join("pipe");
+        rustix::fs::mknodat(
+            rustix::fs::CWD,
+            &at,
+            rustix::fs::FileType::Fifo,
+            rustix::fs::Mode::RUSR | rustix::fs::Mode::WUSR,
+            0,
+        )
+        .expect("mkfifo");
+        let pointer = canonical(&at);
+        let result = scan_with_carve(&f, &pointer);
+        assert!(
+            matches!(
+                &result,
+                Err(ConfigRefusal::Unreadable {
+                    path,
+                    fault: ConfigFault::Open(OpenRefusal::NotRegular(FileKind::Fifo)),
+                    ..
+                }) if path == pointer.as_path()
+            ),
+            "the FIFO carve is unreadable, got {result:?}"
+        );
+    }
+
     #[test]
     fn dotdot_remainder_refused() {
         let f = fixture("dotdot");
@@ -4689,17 +5023,386 @@ mod tests {
         assert!(!runs_as(".hg", "evil"));
     }
 
-    #[cfg(windows)]
+    /// [`scan_hg`] with every value read under `regime`.
+    fn scan_hg_under(f: &Fixture, text: &str, regime: Regime) -> Result<(), ConfigRefusal> {
+        let dot_hg = f.tree.join(".hg");
+        write(&dot_hg.join("hgrc"), text);
+        let roots = ConfigRoots::Mercurial {
+            dot_hg: &dot_hg,
+            shared: None,
+        };
+        scan_with_under(f, &roots, ConfigLimits::DEFAULT, regime)
+    }
+
     #[test]
-    fn hg_key_tool_in_worktree_refused_on_windows() {
+    fn hg_key_tool_in_worktree_refused_under_windows() {
         let f = fixture("hgkeywin");
         write(&f.tree.join("evil.exe"), "");
-        let result = scan_hg(&f, "[merge-tools]\nevil.priority = 1\n");
+        let result = scan_hg_under(&f, "[merge-tools]\nevil.priority = 1\n", Regime::Windows);
         assert_eq!(
             unprovable(&result),
             Some(Unprovable::ToolPath),
             "{result:?}"
         );
+    }
+
+    #[test]
+    fn hg_key_tool_in_worktree_admitted_under_unix() {
+        let f = fixture("hgkeyunix");
+        write(&f.tree.join("evil.exe"), "");
+        let result = scan_hg_under(&f, "[merge-tools]\nevil.priority = 1\n", Regime::Unix);
+        assert_eq!(result, Ok(()), "{result:?}");
+    }
+
+    /// [`scan_git`] with every value read under `regime`.
+    fn scan_git_under(f: &Fixture, regime: Regime) -> Result<(), ConfigRefusal> {
+        let gitdir = f.tree.join(".git");
+        let roots = ConfigRoots::Git {
+            gitdir: &gitdir,
+            commondir: None,
+        };
+        scan_with_under(f, &roots, ConfigLimits::DEFAULT, regime)
+    }
+
+    #[test]
+    fn root_and_drive_relative_paths_refused_under_windows() {
+        let f = fixture("unanchoredwin");
+        // A config file reads `\\` as one backslash.
+        for value in [
+            "/no-such-ipe-hooks",
+            "\\\\no-such-ipe-hooks",
+            "C:no-such-ipe-hooks",
+        ] {
+            git_config(&f, &format!("[core]\n\thooksPath = {value}\n"));
+            let result = scan_git_under(&f, Regime::Windows);
+            assert_eq!(
+                unprovable(&result),
+                Some(Unprovable::Unanchored),
+                "{value:?}: {result:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn root_path_admitted_under_unix() {
+        let f = fixture("unanchoredunix");
+        for value in ["/no-such-ipe-hooks", "//no-such-ipe-srv/share/h"] {
+            git_config(&f, &format!("[core]\n\thooksPath = {value}\n"));
+            let result = scan_git_under(&f, Regime::Unix);
+            assert_eq!(result, Ok(()), "{value:?}: {result:?}");
+        }
+    }
+
+    #[test]
+    fn share_paths_refused_under_windows_before_any_open() {
+        let f = fixture("sharewin");
+        git_config(&f, "[core]\n\thooksPath = //no-such-ipe-srv/share/h\n");
+        let result = scan_git_under(&f, Regime::Windows);
+        assert_eq!(
+            unprovable(&result),
+            Some(Unprovable::NetworkOrDevice),
+            "{result:?}"
+        );
+        // A config file reads `\\` as one backslash, and the value's shell-word
+        // reading drops another, so each spelling is refused under one reading
+        // or the other, never walked.
+        for value in [
+            "\\\\\\\\no-such-ipe-srv\\\\share\\\\h",
+            "/\\\\no-such-ipe-srv/share/h",
+        ] {
+            git_config(&f, &format!("[core]\n\thooksPath = {value}\n"));
+            let result = scan_git_under(&f, Regime::Windows);
+            assert!(
+                matches!(
+                    unprovable(&result),
+                    Some(Unprovable::NetworkOrDevice | Unprovable::Unanchored)
+                ),
+                "{value:?}: {result:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn anchor_under_windows() {
+        for value in ["C:\\x", "c:/x", "Z:\\"] {
+            assert_eq!(
+                Anchor::of(value, Regime::Windows),
+                Anchor::Absolute,
+                "{value:?}"
+            );
+        }
+        for value in [
+            "\\\\srv\\share\\x",
+            "//srv/share",
+            "/\\srv\\share",
+            "\\\\srv",
+            "\\\\?\\C:\\x",
+            "\\\\?\\UNC\\srv\\share",
+            "\\\\.\\pipe\\x",
+        ] {
+            assert_eq!(
+                Anchor::of(value, Regime::Windows),
+                Anchor::NetworkOrDevice,
+                "{value:?}"
+            );
+        }
+        for value in ["\\x", "/x", "C:x", "C:", "\\??\\UNC\\srv\\share"] {
+            assert_eq!(
+                Anchor::of(value, Regime::Windows),
+                Anchor::Unanchored,
+                "{value:?}"
+            );
+        }
+        for value in ["x", "x\\y", "./x", "..\\x"] {
+            assert_eq!(
+                Anchor::of(value, Regime::Windows),
+                Anchor::Relative,
+                "{value:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn anchor_under_unix() {
+        for value in ["/x", "//x"] {
+            assert_eq!(
+                Anchor::of(value, Regime::Unix),
+                Anchor::Absolute,
+                "{value:?}"
+            );
+        }
+        for value in ["x", "\\x", "C:x", "C:\\x", "./x"] {
+            assert_eq!(
+                Anchor::of(value, Regime::Unix),
+                Anchor::Relative,
+                "{value:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn tilde_extra_leading_separators_collapse_into_the_home() {
+        let f = fixture("tildecollapse");
+        let root = f.tree.parent().expect("fixture root");
+        let tree = canonical(&f.tree);
+        let git = canonical(&f.tree.join(".git"));
+        let grants = Grants::new(&tree, &[]).with_carves(&[&git]);
+        let gitdir = f.tree.join(".git");
+        let roots = ConfigRoots::Git {
+            gitdir: &gitdir,
+            commondir: None,
+        };
+        let home = Home::known(canonical(root));
+        for value in ["~/tree/bin/less", "~//tree/bin/less", "~///tree/bin/less"] {
+            git_config(&f, &format!("[core]\n\tpager = {value}\n"));
+            let result = scan(&roots, &grants, &home, ConfigLimits::DEFAULT);
+            assert_eq!(
+                in_grant(&result),
+                Some(tree.as_path().join("bin").join("less").as_path()),
+                "{value:?}: {result:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn tilde_drive_tail_refused_under_windows() {
+        let f = fixture("tildedrivewin");
+        for value in ["~/C:x", "~//C:x"] {
+            git_config(&f, &format!("[core]\n\tpager = {value}\n"));
+            let result = scan_git_under(&f, Regime::Windows);
+            assert_eq!(
+                unprovable(&result),
+                Some(Unprovable::Unanchored),
+                "{value:?}: {result:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn drive_relative_program_refused_under_windows() {
+        let f = fixture("driveprogwin");
+        git_config(&f, "[core]\n\tpager = C:evil\n");
+        let result = scan_git_under(&f, Regime::Windows);
+        assert_eq!(
+            unprovable(&result),
+            Some(Unprovable::Unanchored),
+            "{result:?}"
+        );
+    }
+
+    #[test]
+    fn drive_shaped_program_admitted_under_unix() {
+        let f = fixture("driveprogunix");
+        git_config(&f, "[core]\n\tpager = C:evil\n");
+        let result = scan_git_under(&f, Regime::Unix);
+        assert_eq!(result, Ok(()), "{result:?}");
+    }
+
+    #[test]
+    fn tilde_plain_tail_admitted_under_windows() {
+        let f = fixture("tildeplainwin");
+        git_config(&f, "[core]\n\tpager = ~/Cx\n");
+        let result = scan_git_under(&f, Regime::Windows);
+        assert_eq!(result, Ok(()), "{result:?}");
+    }
+
+    /// The refusal of a link whose target the scan judged unprovable for `why`.
+    #[cfg(unix)]
+    fn link_unprovable(result: &Result<(), ConfigRefusal>) -> Option<Unprovable> {
+        match result {
+            Err(ConfigRefusal::LinkNamesWritable {
+                named: Named::Unprovable(why),
+                ..
+            }) => Some(*why),
+            Ok(()) | Err(_) => None,
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn hook_link_onto_a_share_refused_under_windows_before_any_open() {
+        let f = fixture("hooksharewin");
+        let hooks = f.tree.join(".git/hooks");
+        make_dir(&hooks);
+        std::os::unix::fs::symlink("//no-such-ipe-srv/share/h", hooks.join("pre-commit"))
+            .expect("plant link");
+        let result = scan_git_under(&f, Regime::Windows);
+        assert_eq!(
+            link_unprovable(&result),
+            Some(Unprovable::NetworkOrDevice),
+            "{result:?}"
+        );
+        let result = scan_git_under(&f, Regime::Unix);
+        assert_eq!(result, Ok(()), "{result:?}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn hooks_dir_link_onto_a_share_refused_under_windows_before_any_open() {
+        let f = fixture("hooksdirsharewin");
+        std::os::unix::fs::symlink("//no-such-ipe-srv/share", f.tree.join(".git/hooks"))
+            .expect("plant link");
+        let result = scan_git_under(&f, Regime::Windows);
+        assert_eq!(
+            link_unprovable(&result),
+            Some(Unprovable::NetworkOrDevice),
+            "{result:?}"
+        );
+        let result = scan_git_under(&f, Regime::Unix);
+        assert_eq!(result, Ok(()), "{result:?}");
+    }
+
+    /// A share a root lies on admits the walk, never a value's word: each boundary refuses on its own.
+    #[test]
+    fn share_word_refused_under_windows_even_on_a_held_share() {
+        let f = fixture("heldsharewin");
+        let gitdir = f.tree.join(".git");
+        // A doubled leading `/` is the same directory on the host and a share under Windows.
+        let outside = canonical(&f.out);
+        let commondir = PathBuf::from(format!("/{}", outside.as_path().display()));
+        let roots = ConfigRoots::Git {
+            gitdir: &gitdir,
+            commondir: Some(&commondir),
+        };
+        let shared = format!("{}/h", commondir.display());
+        git_config(&f, &format!("[core]\n\thooksPath = {shared}\n"));
+        let result = scan_with_under(&f, &roots, ConfigLimits::DEFAULT, Regime::Windows);
+        assert_eq!(
+            unprovable(&result),
+            Some(Unprovable::NetworkOrDevice),
+            "{result:?}"
+        );
+        git_config(&f, "[core]\n\thooksPath = ~/h\n");
+        let result = scan_with_under(&f, &roots, ConfigLimits::DEFAULT, Regime::Windows);
+        assert_eq!(result, Ok(()), "{result:?}");
+    }
+
+    #[test]
+    fn remote_volume_under_windows() {
+        let share = Some("srv\\share".to_owned());
+        for value in [
+            "\\\\srv\\share\\x",
+            "//SRV/Share/x",
+            "\\\\?\\UNC\\srv\\SHARE\\y",
+        ] {
+            assert_eq!(
+                remote_volume(Path::new(value), Regime::Windows),
+                Ok(share.clone()),
+                "{value:?}"
+            );
+        }
+        assert_eq!(
+            remote_volume(Path::new("\\\\.\\pipe\\x"), Regime::Windows),
+            Ok(Some("\\\\.\\pipe".to_owned()))
+        );
+        for value in ["C:\\x", "\\\\?\\C:\\x", "/x", "x"] {
+            assert_eq!(
+                remote_volume(Path::new(value), Regime::Windows),
+                Ok(None),
+                "{value:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn remote_volume_none_under_unix() {
+        for value in ["\\\\srv\\share\\x", "//srv/share/x", "\\\\.\\pipe\\x", "/x"] {
+            assert_eq!(
+                remote_volume(Path::new(value), Regime::Unix),
+                Ok(None),
+                "{value:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn held_volumes_name_the_share_the_roots_lie_on() {
+        let f = fixture("heldshare");
+        let tree = canonical(&f.tree);
+        let grants = Grants::new(&tree, &[]);
+        let gitdir = Path::new("\\\\Srv\\Share\\repo\\.git");
+        let roots = ConfigRoots::Git {
+            gitdir,
+            commondir: None,
+        };
+        let home = Home::known(canonical(&f.home));
+        assert_eq!(
+            held_volumes(&roots, &grants, &home, Regime::Windows),
+            vec!["srv\\share".to_owned()]
+        );
+        assert!(held_volumes(&roots, &grants, &home, Regime::Unix).is_empty());
+    }
+
+    #[test]
+    fn git_absolute_under_windows_admits_drive_and_backslash() {
+        for value in ["/x", "\\x", "\\\\server\\share\\x", "C:\\x", "c:/x", "Z:x"] {
+            assert!(is_git_absolute(value, Regime::Windows), "{value:?}");
+        }
+        for value in ["", "x", "x/y", "1:x", "\u{e9}:x", ":x", "~/x"] {
+            assert!(!is_git_absolute(value, Regime::Windows), "{value:?}");
+        }
+    }
+
+    #[test]
+    fn git_absolute_under_unix_refuses_drive_and_backslash() {
+        assert!(is_git_absolute("/x", Regime::Unix));
+        for value in ["\\x", "\\\\server\\share\\x", "C:\\x", "c:/x", "Z:x", "x"] {
+            assert!(!is_git_absolute(value, Regime::Unix), "{value:?}");
+        }
+    }
+
+    #[test]
+    fn separator_backslash_only_under_windows() {
+        assert!(is_separator('/', Regime::Windows));
+        assert!(is_separator('\\', Regime::Windows));
+        assert!(!is_separator(':', Regime::Windows));
+        assert!(!is_separator('\u{5c5c}', Regime::Windows));
+    }
+
+    #[test]
+    fn separator_slash_only_under_unix() {
+        assert!(is_separator('/', Regime::Unix));
+        assert!(!is_separator('\\', Regime::Unix));
     }
 
     #[test]

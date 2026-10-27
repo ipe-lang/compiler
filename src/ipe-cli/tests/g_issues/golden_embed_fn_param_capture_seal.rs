@@ -233,9 +233,7 @@ fn embed_routed_fn_param_update_builds() {
 
 /// `source` must be accepted by `ipe`, and under `IPE_E2E` its crate must `cargo build`.
 fn assert_accepted_and_builds(name: &str, source: &str) {
-    let Some((built, out)) = build_fixture(name, source) else {
-        return;
-    };
+    let (built, out) = build_fixture(name, source);
     match built {
         Ok(()) => crate::support::assert_seal_builds(name, &out),
         Err(err) => assert!(
@@ -245,25 +243,13 @@ fn assert_accepted_and_builds(name: &str, source: &str) {
     }
 }
 
-/// Build `source` as `name`, returning the build result and its output dir
-/// (`None`, after a failed assertion, when scratch or runtime setup fails).
-fn build_fixture(name: &str, source: &str) -> Option<(Result<(), CliError>, PathBuf)> {
-    let root = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("embed-fn-param-capture");
-    let src = root.join(name).join("src");
-    let _ = std::fs::remove_dir_all(root.join(name));
-    let entry = src.join("Main.ipe");
-    if std::fs::create_dir_all(&src)
-        .and_then(|()| std::fs::write(&entry, source))
-        .is_err()
-    {
-        assert!(
-            false_marker(),
-            "{name}: could not write the fixture into the scratch dir"
-        );
-        return None;
-    }
-    let out = root.join(format!("{name}-out"));
+/// Build `source` as `name`, returning the build result and its output dir.
+fn build_fixture(name: &str, source: &str) -> (Result<(), CliError>, PathBuf) {
+    let fixture = crate::root_fixture::main(source);
+    let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+        .join("embed-fn-param-capture")
+        .join(format!("{name}-out"));
     let _ = std::fs::remove_dir_all(&out);
     let runtime = e2e_support::require_runtime().into_path_buf();
-    Some((ipe::build(&entry, &out, &runtime), out))
+    (crate::root_fixture::build(&fixture, &out, &runtime), out)
 }

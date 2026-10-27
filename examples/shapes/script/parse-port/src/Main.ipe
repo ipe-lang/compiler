@@ -1,8 +1,8 @@
 module Main exposing (main)
 
-import Ipe.String as String
-import Ipe.Maybe as Maybe exposing (Maybe(..))
 import Ipe.Io as Io
+import Ipe.Maybe as Maybe exposing (Maybe(..))
+import Ipe.String as String
 
 
 -- Parse, don't validate: turn untyped input into a typed value ONCE, at the
@@ -18,7 +18,6 @@ type alias Port =
 parsePort : String -> Maybe Port
 parsePort raw =
     case String.toInt raw of
-
         Nothing ->
             Nothing
 
@@ -40,7 +39,6 @@ describe port_ =
 report : String -> String
 report raw =
     case parsePort raw of
-
         Just port_ ->
             describe port_
 

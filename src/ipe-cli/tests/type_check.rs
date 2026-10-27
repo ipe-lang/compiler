@@ -10,6 +10,8 @@ use std::error::Error;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use ipe::project_root::{ScratchRoot, SourceTree};
+
 mod support;
 
 type TestResult = Result<(), Box<dyn Error>>;
@@ -19,6 +21,65 @@ fn fixture(name: &str) -> PathBuf {
     support::manifest_dir()
         .join("tests/fixtures/type_check")
         .join(name)
+}
+
+/// A project holding the fixture `name`.
+///
+/// A lone `.ipe` fixture is the project's `src/Main.ipe`; a fixture directory
+/// contributes every module of its `src/` tree.
+fn fixture_project(name: &str) -> Result<ScratchRoot, Box<dyn Error>> {
+    let at = fixture(name);
+    let tree = if at.is_dir() {
+        add_modules(SourceTree::new(), &at.join("src"), "")?
+    } else {
+        SourceTree::main(&std::fs::read_to_string(&at)?)
+    };
+    Ok(tree.resolve()?)
+}
+
+/// `tree` with every `.ipe` file under `dir` added as a `src/` module, its path prefixed by `prefix`.
+fn add_modules(tree: SourceTree, dir: &Path, prefix: &str) -> Result<SourceTree, Box<dyn Error>> {
+    let mut entries = std::fs::read_dir(dir)?.collect::<Result<Vec<_>, _>>()?;
+    entries.sort_by_key(std::fs::DirEntry::file_name);
+    let mut tree = tree;
+    for entry in entries {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let module = if prefix.is_empty() {
+            name
+        } else {
+            format!("{prefix}.{name}")
+        };
+        if entry.file_type()?.is_dir() {
+            tree = add_modules(tree, &entry.path(), &module)?;
+        } else if let Some(stem) = module.strip_suffix(".ipe") {
+            tree = tree.module(stem, &std::fs::read_to_string(entry.path())?);
+        }
+    }
+    Ok(tree)
+}
+
+/// The directory of `project`, spelled as a process whose current directory it is reports it.
+fn project_dir(project: &ScratchRoot) -> std::io::Result<PathBuf> {
+    std::fs::canonicalize(project.root().path())
+}
+
+/// Run `ipe type-check` with no argument in the project at `dir`, capturing `(success, stdout, stderr)`.
+fn type_check_in(dir: &Path) -> Result<(bool, String, String), Box<dyn Error>> {
+    let out = Command::new(support::ipe_bin())
+        .arg("type-check")
+        .current_dir(dir)
+        .output()?;
+    Ok((
+        out.status.success(),
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+    ))
+}
+
+/// Run `ipe type-check` over a project holding the fixture `name`, capturing `(success, stdout, stderr)`.
+fn check_fixture(name: &str) -> Result<(bool, String, String), Box<dyn Error>> {
+    let project = fixture_project(name)?;
+    type_check_in(&project_dir(&project)?)
 }
 
 /// Run the built `ipe` binary and capture `(success, stdout, stderr)`.
@@ -33,7 +94,7 @@ fn run_ipe(args: &[&str]) -> Result<(bool, String, String), Box<dyn Error>> {
 
 #[test]
 fn well_typed_program_exits_zero_with_ok() -> TestResult {
-    let (ok, stdout, _) = run_ipe(&["type-check", &fixture("well_typed.ipe").to_string_lossy()])?;
+    let (ok, stdout, _) = check_fixture("well_typed.ipe")?;
     assert!(ok, "a well-typed program must exit 0");
     assert!(
         stdout.contains("type-checks"),
@@ -49,7 +110,7 @@ fn well_typed_program_exits_zero_with_ok() -> TestResult {
 
 #[test]
 fn type_error_program_exits_nonzero_with_the_diagnostic() -> TestResult {
-    let (ok, _, stderr) = run_ipe(&["type-check", &fixture("type_error.ipe").to_string_lossy()])?;
+    let (ok, _, stderr) = check_fixture("type_error.ipe")?;
     assert!(!ok, "a type-error program must exit non-zero");
     assert!(
         stderr.contains("IPE-T0001") && stderr.contains("TYPE MISMATCH"),
@@ -67,10 +128,7 @@ fn type_error_program_exits_nonzero_with_the_diagnostic() -> TestResult {
 /// builtin does not silently unify with its empty-home kernel spelling.
 #[test]
 fn shadowable_builtin_shadow_is_a_type_error() -> TestResult {
-    let (ok, _, stderr) = run_ipe(&[
-        "type-check",
-        &fixture("shadowable_builtin_shadow_is_type_error.ipe").to_string_lossy(),
-    ])?;
+    let (ok, _, stderr) = check_fixture("shadowable_builtin_shadow_is_type_error.ipe")?;
     assert!(
         !ok,
         "a user `type Order` fed the built-in comparison `Order` must NOT type-check"
@@ -90,10 +148,7 @@ fn shadowable_builtin_shadow_is_a_type_error() -> TestResult {
 /// program supplying a raw `String` in the key role does not compile.
 #[test]
 fn crypto_raw_string_key_is_a_type_error() -> TestResult {
-    let (ok, _, stderr) = run_ipe(&[
-        "type-check",
-        &fixture("crypto_raw_key_is_type_error.ipe").to_string_lossy(),
-    ])?;
+    let (ok, _, stderr) = check_fixture("crypto_raw_key_is_type_error.ipe")?;
     assert!(
         !ok,
         "passing a bare String where a Crypto.Key is expected must NOT type-check"
@@ -112,10 +167,7 @@ fn crypto_raw_string_key_is_a_type_error() -> TestResult {
 /// this rejection is the type error and not an unknown name.
 #[test]
 fn crypto_raw_hex_tag_is_a_type_error() -> TestResult {
-    let (ok, _, stderr) = run_ipe(&[
-        "type-check",
-        &fixture("crypto_raw_hex_tag_is_type_error.ipe").to_string_lossy(),
-    ])?;
+    let (ok, _, stderr) = check_fixture("crypto_raw_hex_tag_is_type_error.ipe")?;
     assert!(
         !ok,
         "passing a bare String where a Crypto.Mac is expected must NOT type-check"
@@ -136,7 +188,7 @@ fn crypto_verify_slot_roles_are_not_interchangeable() -> TestResult {
         "crypto_key_in_tag_slot_is_type_error.ipe",
         "crypto_mac_in_message_slot_is_type_error.ipe",
     ] {
-        let (ok, _, stderr) = run_ipe(&["type-check", &fixture(fixture_name).to_string_lossy()])?;
+        let (ok, _, stderr) = check_fixture(fixture_name)?;
         assert!(!ok, "{fixture_name} must NOT type-check");
         assert!(
             stderr.contains("IPE-T0001") && stderr.contains("TYPE MISMATCH"),
@@ -150,10 +202,7 @@ fn crypto_verify_slot_roles_are_not_interchangeable() -> TestResult {
 /// stored hex once into a `Mac`, and `verifyHmacSha256` consumes that `Mac`.
 #[test]
 fn crypto_parsed_tag_verify_path_type_checks() -> TestResult {
-    let (ok, stdout, stderr) = run_ipe(&[
-        "type-check",
-        &fixture("crypto_verify_tag_ok.ipe").to_string_lossy(),
-    ])?;
+    let (ok, stdout, stderr) = check_fixture("crypto_verify_tag_ok.ipe")?;
     assert!(
         ok,
         "the parsed-tag verify path must type-check, got stderr:\n{stderr}"
@@ -171,10 +220,7 @@ fn crypto_parsed_tag_verify_path_type_checks() -> TestResult {
 /// positive counterpart to `crypto_raw_string_key_is_a_type_error`.
 #[test]
 fn crypto_typed_key_path_type_checks() -> TestResult {
-    let (ok, stdout, stderr) = run_ipe(&[
-        "type-check",
-        &fixture("crypto_typed_key_ok.ipe").to_string_lossy(),
-    ])?;
+    let (ok, stdout, stderr) = check_fixture("crypto_typed_key_ok.ipe")?;
     assert!(
         ok,
         "the typed-Key crypto path must type-check, got stderr:\n{stderr}"
@@ -192,10 +238,7 @@ fn crypto_typed_key_path_type_checks() -> TestResult {
 /// resolution here (IPE-N0004) because the module's source is never injected.
 #[test]
 fn program_using_ipe_test_resolves_and_type_checks() -> TestResult {
-    let (ok, stdout, stderr) = run_ipe(&[
-        "type-check",
-        &fixture("uses_ipe_test.ipe").to_string_lossy(),
-    ])?;
+    let (ok, stdout, stderr) = check_fixture("uses_ipe_test.ipe")?;
     assert!(
         ok,
         "an Ipe.Test-using program must type-check, got stderr:\n{stderr}"
@@ -212,10 +255,7 @@ fn program_using_ipe_test_resolves_and_type_checks() -> TestResult {
 /// type-checks. The negative leg (bare `toString` unbound) lives in canon.
 #[test]
 fn string_from_bool_type_checks() -> TestResult {
-    let (ok, stdout, stderr) = run_ipe(&[
-        "type-check",
-        &fixture("string_from_bool.ipe").to_string_lossy(),
-    ])?;
+    let (ok, stdout, stderr) = check_fixture("string_from_bool.ipe")?;
     assert!(
         ok,
         "`String.fromBool` must type-check, got stderr:\n{stderr}"
@@ -240,7 +280,7 @@ fn wildcard_with_a_partial_solved_structure_is_refused() -> TestResult {
         "wildcard_tuple_open_record.ipe",
         "wildcard_record_list_field.ipe",
     ] {
-        let (ok, _, stderr) = run_ipe(&["type-check", &fixture(name).to_string_lossy()])?;
+        let (ok, _, stderr) = check_fixture(name)?;
         assert!(!ok, "{name} must be refused");
         assert!(
             stderr.contains("IPE-T0021"),
@@ -254,10 +294,7 @@ fn wildcard_with_a_partial_solved_structure_is_refused() -> TestResult {
 /// the stdlib, and a bare record wildcard it field-reads, both type-check.
 #[test]
 fn wildcard_pinned_through_the_stdlib_type_checks() -> TestResult {
-    let (ok, stdout, stderr) = run_ipe(&[
-        "type-check",
-        &fixture("wildcard_pinned_ok.ipe").to_string_lossy(),
-    ])?;
+    let (ok, stdout, stderr) = check_fixture("wildcard_pinned_ok.ipe")?;
     assert!(
         ok,
         "pinned and row-record wildcards must type-check, got stderr:\n{stderr}"
@@ -274,19 +311,15 @@ fn wildcard_pinned_through_the_stdlib_type_checks() -> TestResult {
 /// otherwise-empty directory so any emission would be unmistakable.
 #[test]
 fn check_writes_no_emitted_project() -> TestResult {
-    let dir =
-        crate::support::scratch_root().join(format!("ipe_check_no_emit_{}", std::process::id()));
-    std::fs::create_dir_all(&dir)?;
-    let src = dir.join("Main.ipe");
-    std::fs::copy(fixture("well_typed.ipe"), &src)?;
+    let project = fixture_project("well_typed.ipe")?;
+    let dir = project_dir(&project)?;
 
-    let (ok, _, _) = run_ipe(&["type-check", &src.to_string_lossy()])?;
+    let (ok, _, _) = type_check_in(&dir)?;
     let out_present = dir.join("out").exists();
     let siblings: Vec<_> = std::fs::read_dir(&dir)?
         .flatten()
         .map(|e| e.path())
         .collect();
-    std::fs::remove_dir_all(&dir)?;
 
     assert!(ok, "the well-typed program must check");
     assert!(
@@ -307,15 +340,15 @@ fn location_and_caret(report: &str) -> Option<(String, String)> {
     Some((loc.trim().to_owned(), caret.to_owned()))
 }
 
-/// Run `ipe dev build` on a fixture entry, returning its combined stderr. Skips the
+/// Run `ipe dev build` on a fixture project directory, returning its combined stderr. Skips the
 /// caller's assertions (returns `None`) when no runtime tree is resolvable in
 /// this environment — the diagnostic under test fires at compile time, before
 /// any runtime is read, so a resolvable runtime is only needed to get `build`
 /// as far as the compiler.
-fn build_stderr(entry: &Path) -> Option<String> {
+fn build_stderr(project: &Path) -> Option<String> {
     let runtime = e2e_support::require_runtime().into_path_buf();
     let out = Command::new(support::ipe_bin())
-        .args(["dev", "build", &entry.to_string_lossy()])
+        .args(["dev", "build", &project.to_string_lossy()])
         .arg("--out")
         .arg(crate::support::scratch_root().join(format!("ipe_caret_build_{}", std::process::id())))
         .env("IPE_RUNTIME_DIR", &runtime)
@@ -331,8 +364,9 @@ fn build_stderr(entry: &Path) -> Option<String> {
 /// point at an unrelated `src/Main.ipe` line instead.
 #[test]
 fn check_caret_matches_build_for_unresolved_import_in_dependency() -> TestResult {
-    let entry = fixture("multi_unresolved_import/src/Main.ipe");
-    let (ok, _, check_err) = run_ipe(&["type-check", &entry.to_string_lossy()])?;
+    let project = fixture_project("multi_unresolved_import")?;
+    let dir = project_dir(&project)?;
+    let (ok, _, check_err) = type_check_in(&dir)?;
     assert!(!ok, "an unresolved import must exit non-zero");
     assert!(
         check_err.contains("IPE-N0020") && check_err.contains("Lib/Helper.ipe"),
@@ -349,7 +383,7 @@ fn check_caret_matches_build_for_unresolved_import_in_dependency() -> TestResult
         "the caret must underline `Rust.Firestore`, got:\n{caret}"
     );
 
-    if let Some(build_err) = build_stderr(&entry) {
+    if let Some(build_err) = build_stderr(&dir) {
         let build_lc = location_and_caret(&build_err)
             .ok_or_else(|| format!("build report has no snippet band:\n{build_err}"))?;
         assert_eq!(
@@ -367,8 +401,9 @@ fn check_caret_matches_build_for_unresolved_import_in_dependency() -> TestResult
 /// importing `Ipe.Crypto`.
 #[test]
 fn check_caret_matches_build_for_missing_qualifier_in_dependency() -> TestResult {
-    let entry = fixture("multi_missing_qualifier/src/Main.ipe");
-    let (ok, _, check_err) = run_ipe(&["type-check", &entry.to_string_lossy()])?;
+    let project = fixture_project("multi_missing_qualifier")?;
+    let dir = project_dir(&project)?;
+    let (ok, _, check_err) = type_check_in(&dir)?;
     assert!(!ok, "an unimported stdlib qualifier must exit non-zero");
     assert!(
         check_err.contains("IPE-N0034") && check_err.contains("Lib/Calc.ipe"),
@@ -385,7 +420,7 @@ fn check_caret_matches_build_for_missing_qualifier_in_dependency() -> TestResult
         "the caret must underline `Crypto`, got:\n{caret}"
     );
 
-    if let Some(build_err) = build_stderr(&entry) {
+    if let Some(build_err) = build_stderr(&dir) {
         let build_lc = location_and_caret(&build_err)
             .ok_or_else(|| format!("build report has no snippet band:\n{build_err}"))?;
         assert_eq!(
@@ -404,10 +439,7 @@ fn check_caret_matches_build_for_missing_qualifier_in_dependency() -> TestResult
 /// diagnostic exists to prevent.
 #[test]
 fn closed_union_catch_all_fails_check_nonzero() -> TestResult {
-    let (ok, _, stderr) = run_ipe(&[
-        "type-check",
-        &fixture("closed_union_catch_all.ipe").to_string_lossy(),
-    ])?;
+    let (ok, _, stderr) = check_fixture("closed_union_catch_all.ipe")?;
     assert!(
         !ok,
         "a closed-union catch-all must exit non-zero (fail-closed), got success"
@@ -421,7 +453,7 @@ fn closed_union_catch_all_fails_check_nonzero() -> TestResult {
 
 /// FAIL-CLOSED, no artifact: the same closed-union catch-all through `ipe dev build`
 /// must exit non-zero and write NO emitted crate. The entry is copied into a
-/// fresh directory so any `out/` emission would be unmistakable. This proves the
+/// fresh project so any `out/` emission would be unmistakable. This proves the
 /// error stops the pipeline before code generation, not merely at print time.
 #[test]
 fn closed_union_catch_all_build_emits_no_crate() -> TestResult {
@@ -431,13 +463,19 @@ fn closed_union_catch_all_build_emits_no_crate() -> TestResult {
         std::process::id(),
         "closed_union"
     ));
-    std::fs::create_dir_all(&dir)?;
-    let src = dir.join("Main.ipe");
-    std::fs::copy(fixture("closed_union_catch_all.ipe"), &src)?;
+    std::fs::create_dir_all(dir.join("src"))?;
+    std::fs::write(
+        dir.join("package.ipe"),
+        support::package_ipe("closed-union"),
+    )?;
+    std::fs::copy(
+        fixture("closed_union_catch_all.ipe"),
+        dir.join("src").join("Main.ipe"),
+    )?;
     let out_dir = dir.join("out");
 
     let output = Command::new(support::ipe_bin())
-        .args(["dev", "build", &src.to_string_lossy()])
+        .args(["dev", "build", &dir.to_string_lossy()])
         .arg("--out")
         .arg(&out_dir)
         .env("IPE_RUNTIME_DIR", &runtime)
@@ -469,10 +507,7 @@ fn closed_union_catch_all_build_emits_no_crate() -> TestResult {
 /// with IPE-N0040, not print "No type errors".
 #[test]
 fn decoder_nested_direct_fails_check_with_n0040() -> TestResult {
-    let (ok, stdout, stderr) = run_ipe(&[
-        "type-check",
-        &fixture("decoder_nested_direct.ipe").to_string_lossy(),
-    ])?;
+    let (ok, stdout, stderr) = check_fixture("decoder_nested_direct.ipe")?;
     assert!(
         !ok,
         "a hand-nested decoder pipeline must fail type-check (fail-closed), got:\n{stdout}"
@@ -489,10 +524,7 @@ fn decoder_nested_direct_fails_check_with_n0040() -> TestResult {
 /// by `type-check` with IPE-N0040 (the binder-resolution gap).
 #[test]
 fn decoder_nested_through_binder_fails_check_with_n0040() -> TestResult {
-    let (ok, stdout, stderr) = run_ipe(&[
-        "type-check",
-        &fixture("decoder_nested_binder.ipe").to_string_lossy(),
-    ])?;
+    let (ok, stdout, stderr) = check_fixture("decoder_nested_binder.ipe")?;
     assert!(
         !ok,
         "a binder-indirected hand-nested decoder must fail type-check, got:\n{stdout}"
@@ -509,10 +541,7 @@ fn decoder_nested_through_binder_fails_check_with_n0040() -> TestResult {
 /// spelling, never the pipe.
 #[test]
 fn decoder_idiomatic_pipe_form_checks_clean() -> TestResult {
-    let (ok, stdout, stderr) = run_ipe(&[
-        "type-check",
-        &fixture("decoder_pipe_clean.ipe").to_string_lossy(),
-    ])?;
+    let (ok, stdout, stderr) = check_fixture("decoder_pipe_clean.ipe")?;
     assert!(
         ok,
         "the idiomatic |> decoder pipe must type-check, got stderr:\n{stderr}"
@@ -582,10 +611,11 @@ fn type_check_from(cwd: &Path, arg: &str) -> Result<(bool, String), Box<dyn Erro
     ))
 }
 
-/// A cwd-relative file argument is project-rooted exactly as its absolute
-/// spelling is: the nested import resolves against the whole `src/` tree,
-/// which only a source-rooted analysis sees (the loose closure rooted at
-/// `src/Api/` cannot find `Api.Types`).
+/// A cwd-relative file argument is project-rooted: the nested import resolves
+/// against the whole `src/` tree, which only a source-rooted analysis sees
+/// (the loose closure rooted at `src/Api/` cannot find `Api.Types`). The root
+/// is the current directory alone, so the same file named from `src/` — a
+/// directory with no `package.ipe` — is refused, never walked up from.
 #[test]
 fn relative_nested_src_file_argument_is_analysed_against_the_src_tree() -> TestResult {
     let root = nested_import_project("type_check_relative_nested_src_arg")?;
@@ -599,8 +629,8 @@ fn relative_nested_src_file_argument_is_analysed_against_the_src_tree() -> TestR
     );
     let (ok, stderr) = dotted?;
     assert!(
-        ok,
-        "a `..`-bearing relative src file must type-check, got:\n{stderr}"
+        !ok && stderr.contains("IPE-E0004") && stderr.contains("no package.ipe at"),
+        "a subdirectory of a project is no root, got:\n{stderr}"
     );
     Ok(())
 }

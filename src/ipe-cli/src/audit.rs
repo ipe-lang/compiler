@@ -61,6 +61,7 @@ use crate::CliError;
 use crate::cli_args::OutputFormat;
 use crate::index::Sha256Hex;
 use crate::project::{ModuleSources, PackageSnapshot, ProjectManifest};
+use crate::project_root::{EntrySet, Located, NonEmpty, entry_set};
 use crate::published_version::PublishedVersion;
 use crate::publisher::{BlessedPublisher, BlessingRefusal, SelfDeclaredPublisher};
 use crate::remote_ingest::{
@@ -69,6 +70,7 @@ use crate::remote_ingest::{
 };
 use crate::scratch::ScratchDir;
 use crate::text;
+use posture::GatePosture;
 
 /// The package-gate checks, in the fixed order [`run_audit`] runs them. Naming
 /// the check that rejected lets the diagnostic say exactly which gate failed.
@@ -151,22 +153,22 @@ impl std::fmt::Display for Rejection {
     }
 }
 
-/// The compiler-derived facts a consumer needs to consent to a package: how its
-/// entry program drives itself (the control model) and the effect axes it can
+/// The compiler-derived facts a consumer needs to consent to a package: how each
+/// of its programs drives itself (the control model) and the effect axes it can
 /// exercise (the capability set). Both are read from the compiler's own
 /// derivation, never a second source — the control model projects the shape the
 /// compiler pinned for `main`, and the capability set is the whole-tree inferred
 /// union the capability-consistency check already computes.
 ///
-/// A closed value: a package either exposes a runnable entry (whose control model
-/// is one of the closed [`crate::delivery::ControlModel`] variants) or is a
-/// library with no self-driving entry ([`ControlModelDisclosure::NotApplicable`]).
+/// A closed value: a package either builds programs (each disclosing one of the
+/// closed [`crate::delivery::ControlModel`] variants) or is a library with no
+/// self-driving entry ([`ControlModelDisclosure::NotApplicable`]).
 /// An entry that exists but cannot be classified is never represented here — it is
 /// a fail-closed rejection before a [`Disclosure`] is ever built, so no permissive
 /// default can be disclosed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Disclosure {
-    /// The entry program's control model, or the library marker.
+    /// Every program's control model, or the library marker.
     control_model: ControlModelDisclosure,
     /// The capability axes the whole package can exercise — the same inferred
     /// union the capability-consistency check reconciles against the manifest.
@@ -174,10 +176,11 @@ pub(crate) struct Disclosure {
 }
 
 impl Disclosure {
-    /// The disclosed control-model word — a closed-set model's own word, or
-    /// `"library"` for a package with no runnable entry. The exact vocabulary the
-    /// `ipe audit` JSON verdict discloses, so `ipe doc` speaks the same words.
-    pub(crate) const fn control_model_word(&self) -> &'static str {
+    /// The disclosed control-model word — the most elevated model any program
+    /// runs, or `"library"` for a package with no runnable entry. The exact
+    /// vocabulary the `ipe audit` JSON verdict discloses, so `ipe doc` speaks the
+    /// same words.
+    pub(crate) fn control_model_word(&self) -> &'static str {
         self.control_model.word()
     }
 
@@ -188,30 +191,69 @@ impl Disclosure {
     }
 }
 
-/// The control model disclosed for a package: the entry program's model, or the
+/// The control model disclosed for a package: every program's model, or the
 /// marker for a library that exposes modules but runs no entry of its own.
 ///
 /// There is deliberately no "unknown" variant. A runnable entry that cannot be
 /// classified fails the audit closed (a program whose self-driving model we
 /// cannot state must not be certified as safe), so the only representable states
-/// are a known model or a genuine absence of one.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// are a known model for every program or a genuine absence of one.
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum ControlModelDisclosure {
-    /// The entry program's compiler-pinned control model.
-    Entry(crate::delivery::ControlModel),
-    /// A library: it exposes modules but defines no runnable `main`, so it has no
+    /// Each program the package builds, in manifest order, with its compiler-pinned control model.
+    Programs(NonEmpty<ProgramModel>),
+    /// A library: it exposes modules but builds no program, so it has no
     /// control model of its own. Honest absence, not a permissive default.
     NotApplicable,
 }
 
+/// One program of a package and the control model its `main` runs under.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ProgramModel {
+    /// The program's name.
+    program: String,
+    /// The program's entry module.
+    module: Vec<String>,
+    /// The control model the program's `main` pins.
+    model: crate::delivery::ControlModel,
+}
+
 impl ControlModelDisclosure {
-    /// The word disclosed for this control model — a closed-set model's own word,
-    /// or `"library"` for a package with no runnable entry.
-    const fn word(self) -> &'static str {
+    /// The word disclosed for the package — the most elevated model any of its
+    /// programs runs, or `"library"` for a package with no runnable entry.
+    ///
+    /// A package with one `direct` program among `tea` ones reads `direct`, so
+    /// a one-word surface never understates what the package can run.
+    fn word(&self) -> &'static str {
         match self {
-            Self::Entry(model) => model.word(),
+            Self::Programs(programs) => programs
+                .iter()
+                .map(|program| program.model)
+                .fold(programs.first().model, most_elevated)
+                .word(),
             Self::NotApplicable => "library",
         }
+    }
+
+    /// The programs disclosed, in manifest order; none for a library.
+    fn programs(&self) -> impl Iterator<Item = &ProgramModel> {
+        let programs = match self {
+            Self::Programs(programs) => Some(programs.iter()),
+            Self::NotApplicable => None,
+        };
+        programs.into_iter().flatten()
+    }
+}
+
+/// The more elevated of two control models: `Direct` drives itself, `Tea` runs a managed loop.
+const fn most_elevated(
+    a: crate::delivery::ControlModel,
+    b: crate::delivery::ControlModel,
+) -> crate::delivery::ControlModel {
+    use crate::delivery::ControlModel;
+    match (a, b) {
+        (ControlModel::Direct, _) | (_, ControlModel::Direct) => ControlModel::Direct,
+        (ControlModel::Tea, ControlModel::Tea) => ControlModel::Tea,
     }
 }
 
@@ -538,16 +580,13 @@ fn audit_gate(
     })?;
 
     // Control-model consent (defence-in-depth boundary, sibling of the build-time
-    // gate): a package whose runnable entry runs an elevated (`Direct`) control
-    // model its own manifest does not accept is a fail-closed audit rejection. A
-    // managed model or a library (`NotApplicable`) needs no accept and passes
-    // silently. It runs LAST — after the native-bearing fail-closed checks
+    // gate): a package any of whose programs runs a control model its own
+    // manifest does not accept is a fail-closed audit rejection. A library
+    // (`NotApplicable`) has no program to gate and passes silently. It runs LAST — after the native-bearing fail-closed checks
     // (binding regeneration, provenance, Tier-2) — so the consent decision is the
     // final gate on an otherwise-certifiable package and never preempts a
     // native-surface refusal.
-    if let ControlModelDisclosure::Entry(model) = disclosure.control_model {
-        crate::control_model_consent::gate(model, &manifest.control_models_accept, &manifest.name)?;
-    }
+    consent_every_program(&disclosure, manifest)?;
 
     Ok(AuditedPackage {
         digest: reprove_tree(&prepared.snapshot)?,
@@ -629,6 +668,7 @@ fn audit_verdict_json(
                 "controlModel",
                 json::string(disclosure.control_model.word()),
             ),
+            ("programs", disclosure_programs_json(disclosure)),
             ("capabilities", disclosure_capabilities_json(disclosure)),
             ("certified", "true".to_owned()),
         ]),
@@ -642,6 +682,7 @@ fn audit_verdict_json(
                 "controlModel",
                 json::string(disclosure.control_model.word()),
             ),
+            ("programs", disclosure_programs_json(disclosure)),
             ("capabilities", disclosure_capabilities_json(disclosure)),
             ("certified", "true".to_owned()),
         ]),
@@ -652,6 +693,23 @@ fn audit_verdict_json(
             ("reason", json::string(&err.to_string())),
         ]),
     }
+}
+
+/// Every disclosed program as a compact JSON array of `{name, controlModel}`
+/// objects, in manifest order; empty for a library.
+fn disclosure_programs_json(disclosure: &Disclosure) -> String {
+    use crate::cli_args::json;
+    let programs: Vec<String> = disclosure
+        .control_model
+        .programs()
+        .map(|program| {
+            json::object(&[
+                ("name", json::string(&program.program)),
+                ("controlModel", json::string(program.model.word())),
+            ])
+        })
+        .collect();
+    json::array(&programs)
 }
 
 /// The capability set as a compact JSON array of the axes' canonical words, in
@@ -674,13 +732,14 @@ fn passing_summary(
     disclosure: &Disclosure,
 ) -> String {
     use crate::audit_native::Tier2Outcome;
+    let shown = shown_name(name);
     let tier_line = match tier2 {
         Tier2Outcome::SkippedPureIpe => format!(
-            "package audit: {name} {version} — all Tier-1 checks passed. (Pure Ipê package: \
+            "package audit: {shown} {version} — all Tier-1 checks passed. (Pure Ipê package: \
              native Tier-2 does not apply.)"
         ),
         Tier2Outcome::Certified { platform } => format!(
-            "package audit: {name} {version} — all Tier-1 checks passed; native Tier-2 capability \
+            "package audit: {shown} {version} — all Tier-1 checks passed; native Tier-2 capability \
              enforcement (build+link reachability of the package's FFI bindings under a \
              declared-scoped jail) passed on: {platform}. A Tier-2 certification is per-host — it \
              vouches only for the platform whose jail actually ran; running the audit on another \
@@ -882,33 +941,30 @@ fn prepare(snapshot: PackageSnapshot) -> Result<Prepared, CliError> {
     // gate-regenerated catalog (or none).
     purge_committed_ffi_cache(&manifest.root)?;
     // Regenerate FFI bindings for native-bearing packages before the build so
-    // the compiler finds `Rust.<Crate>` interface modules.
+    // the compiler finds `Rust.<Crate>` interface modules. The regeneration runs
+    // the package's foreign crates' build scripts, so it is reachable only
+    // behind the proof that this process holds a jail and no host-side escape.
     if !manifest.rust_dependencies.is_empty() {
-        regenerate_ffi_bindings(&manifest_path)?;
+        let posture = GatePosture::establish()?;
+        regenerate_ffi_bindings(&posture, &manifest_path)?;
     }
 
     // `audit_scratch_dir` creates the directory exclusively with 128-bit OS
     // entropy — no stale-dir removal needed; a fresh exclusive dir is always empty.
     let emitted_dir = audit_scratch_dir(&manifest.name)?;
-    // Resolve the runtime exactly as `ipe dev build` does — one resolver for every
-    // command. Under the default dependency model the emitted project names the
-    // runtime as a path dependency, which the build materializes from the
-    // embedded source under `IPE_HOME`; no vendored module tree is needed, so an
-    // empty sentinel is passed and `build_project` never reads it. Only the
-    // vendored/wasm shape needs a concrete module tree. Resolving here through a
-    // separate walk-up (that never materialized) is what made `audit` fail on a
-    // clean machine while `build` succeeded.
-    let runtime_dir = crate::resolve_vendored_runtime_dir(None, !crate::runtime_dep_from_env())?;
     // The FFI interface modules and `src/ffi.rs` text are assembled AFTER the
     // regeneration above, so the set holds the gate-owned bindings.
     let sources = crate::driver::PackageSourceSet::from_snapshot(&snapshot)?;
+    // The gate's emit takes no runtime and no options: the emitted project links
+    // the runtime embedded in this binary, bundled into the emitted project, never
+    // an `IPE_RUNTIME_DIR` override, an `IPE_RUNTIME_VENDORED` tree, or a runtime
+    // crate found above the working directory — the judged package could ship
+    // that one.
     crate::driver::build_from_sources(
         manifest,
         &manifest_path,
         sources.clone(),
         crate::driver::OutTarget::Path(&emitted_dir),
-        &runtime_dir,
-        &crate::driver::BuildOptions::from_env(),
     )?;
 
     Ok(Prepared {
@@ -916,6 +972,66 @@ fn prepare(snapshot: PackageSnapshot) -> Result<Prepared, CliError> {
         sources,
         emitted_dir,
     })
+}
+
+/// The gate's sandbox posture, in its own module so that its proof's field is
+/// private to it: only [`GatePosture::from_facts`] can mint one.
+mod posture {
+    use super::{Check, reject};
+    use crate::CliError;
+    use crate::text;
+
+    /// Proof that this process runs the audit with no host-side escape from the sandbox.
+    ///
+    /// Minted once per audit, before any step that runs the package's foreign code
+    /// (the FFI binding regeneration); nothing outside this module can construct
+    /// it. The step takes the proof as a parameter, so without a jail the step
+    /// cannot be called: the developer's unsandboxed inspector override and a
+    /// host without bubblewrap are refusals of the gate, never a host run with a
+    /// warning.
+    pub(super) struct GatePosture(());
+
+    impl GatePosture {
+        /// Prove the gate's posture from the host's sandbox facts.
+        ///
+        /// The only production read of the unsandboxed override in this module;
+        /// `audit_source_reads_no_environment_or_cwd` pins that.
+        ///
+        /// # Errors
+        /// As [`Self::from_facts`].
+        pub(super) fn establish() -> Result<Self, CliError> {
+            let caps = ipe_sandbox::probe();
+            Self::from_facts(
+                ipe_sandbox::unsandboxed_override_set(),
+                &ipe_sandbox::select_mechanism(&caps),
+            )
+        }
+
+        /// The pure core: refuse the override, refuse a host without a jail.
+        ///
+        /// # Errors
+        /// [`CliError::PackageAudit`] with [`Check::NativeBindingRegen`] when the
+        /// unsandboxed inspector override is set, or when the sandbox mechanism is
+        /// [`ipe_sandbox::Mechanism::Refused`].
+        pub(super) fn from_facts(
+            override_set: bool,
+            mechanism: &ipe_sandbox::Mechanism,
+        ) -> Result<Self, CliError> {
+            if override_set {
+                return Err(reject(
+                    Check::NativeBindingRegen,
+                    text::msg::audit_refuses_unsandboxed_override().into(),
+                ));
+            }
+            match mechanism {
+                ipe_sandbox::Mechanism::Bwrap(_) => Ok(Self(())),
+                ipe_sandbox::Mechanism::Refused => Err(reject(
+                    Check::NativeBindingRegen,
+                    text::msg::audit_requires_a_jail().into(),
+                )),
+            }
+        }
+    }
 }
 
 /// Regenerate FFI bindings for a native-bearing package into the project's own
@@ -930,7 +1046,8 @@ fn prepare(snapshot: PackageSnapshot) -> Result<Prepared, CliError> {
 /// Build scripts are always enabled here (equivalent to `--allow-build-scripts`)
 /// because the bwrap jail (network-denied) is the sole confinement boundary;
 /// skipping build scripts would silently omit crates that require them to
-/// generate their API surface.
+/// generate their API surface. The [`GatePosture`] is the proof that the jail
+/// is what runs them: the regeneration is unreachable without it.
 ///
 /// Failure is fail-closed: a regeneration error maps to a typed
 /// [`Check::NativeBindingRegen`] rejection rather than letting the audit
@@ -941,7 +1058,7 @@ fn prepare(snapshot: PackageSnapshot) -> Result<Prepared, CliError> {
 /// jailed regeneration fails or the cache path escapes the project root via a
 /// symlinked component; [`CliError::Io`] when the existing committed cache
 /// cannot be removed.
-fn regenerate_ffi_bindings(manifest_path: &Path) -> Result<(), CliError> {
+fn regenerate_ffi_bindings(_posture: &GatePosture, manifest_path: &Path) -> Result<(), CliError> {
     let project_root = manifest_path.parent().unwrap_or_else(|| Path::new("."));
     purge_committed_ffi_cache(project_root)?;
     crate::ffi::install_registry_deps_for_project(manifest_path, true).map_err(|e| {
@@ -989,11 +1106,8 @@ fn purge_committed_ffi_cache(project_root: &Path) -> Result<(), CliError> {
 /// canonical project root. The check uses [`std::fs::symlink_metadata`] so it
 /// never follows symlinks.
 fn ffi_cache_path_or_reject(project_root: &Path) -> Result<PathBuf, CliError> {
-    // The relative components we walk: `.ipe`, `cache`, `ffi`, `rust`.
-    const CACHE_COMPONENTS: &[&str] = &[".ipe", "cache", "ffi", "rust"];
-
     let mut current = project_root.to_path_buf();
-    for component in CACHE_COMPONENTS {
+    for component in ipe_ffi::driver::FFI_CACHE_COMPONENTS {
         current.push(component);
         // Check this component without following the symlink.
         match std::fs::symlink_metadata(&current) {
@@ -1004,7 +1118,8 @@ fn ffi_cache_path_or_reject(project_root: &Path) -> Result<PathBuf, CliError> {
                         "the package's cache path `{}` contains a symlink at `{}`; \
                          the audit rejects this to prevent out-of-tree writes through \
                          a symlinked intermediate path component",
-                        project_root.join(".ipe/cache/ffi/rust").display(),
+                        crate::ffi::joined(project_root, &ipe_ffi::driver::FFI_CACHE_COMPONENTS)
+                            .display(),
                         current.display(),
                     ),
                 ));
@@ -1231,7 +1346,7 @@ fn capability_consistency(
                     &format!(
                         "package audit: note — `{}` exercises the `native-ffi` capability; its \
                      native effects cannot be inferred from Ipê alone.",
-                        manifest.name
+                        shown_name(&manifest.name)
                     ),
                 )
                 .emit();
@@ -1274,8 +1389,7 @@ fn capability_verdict(
     manifest: &ProjectManifest,
     sources: &crate::driver::PackageSourceSet,
 ) -> Result<BTreeSet<Capability>, CliError> {
-    let inferred =
-        crate::driver::infer_package_capabilities_in(&ipe_db::IpeDatabase::new(), sources)?;
+    let inferred = crate::driver::infer_package_capabilities_of(sources)?;
     capability_consistency(manifest, &inferred)?;
     Ok(inferred)
 }
@@ -1284,102 +1398,154 @@ fn capability_verdict(
 // Compiler-derived disclosure (control model + capability set)
 // ===========================================================================
 
-/// Derive the consumer-facing disclosure — the entry program's control model and
+/// Derive the consumer-facing disclosure — every program's control model and
 /// the package's capability set — reusing the compiler's own derivations.
 ///
 /// The capability set is the whole-tree inferred union the caller already
 /// computed (the SSOT the capability-consistency check reconciles), so the
 /// disclosed effects and the reconciled effects are the same value.
 ///
-/// The control model is a projection of the shape the compiler pins for `main`
-/// ([`ipe_canon::shape_source::classify_main_shape`] → [`crate::delivery::Shape`]
-/// → [`crate::delivery::ControlModel`]), never a second inspection of `main`.
-/// It is derived **fail-closed**:
+/// Each program's control model is a projection of the shape the compiler pins
+/// for its `main` ([`crate::driver::EntryMain`], the reading the build's shape
+/// check also projects), never a second inspection of `main`. Every program the
+/// package builds ([`captured_programs`]) is disclosed, never one chosen among
+/// them. It is derived **fail-closed**:
 ///
-/// - A library that exposes modules but has no runnable entry file discloses
+/// - A library that builds no program discloses
 ///   [`ControlModelDisclosure::NotApplicable`] — an honest absence, not a
 ///   permissive default.
-/// - A runnable entry that cannot be read or parsed at disclosure time is a hard
-///   rejection: a program whose self-driving model we cannot state must never be
-///   certified as safe with a permissive-looking default. (The package already
-///   built in [`prepare`], so this is a defence-in-depth second boundary, not the
-///   only one.)
+/// - A program whose entry defines no `main` pins the `script` shape the build
+///   checks it as, and so discloses `direct`, the elevated model.
+/// - A program whose entry does not parse is a hard rejection: a program whose
+///   self-driving model we cannot state must never be certified as safe with a
+///   permissive-looking default. (The package already built in [`prepare`], so
+///   this is a defence-in-depth second boundary, not the only one.)
 ///
 /// # Errors
-/// [`CliError::PackageAudit`] with [`Check::Capability`] when a runnable entry
-/// exists but its control model cannot be derived.
+/// [`CliError::PackageAudit`] with [`Check::Capability`] when a program's
+/// entry does not parse; the [`captured_programs`] refusals.
 fn derive_disclosure(
     manifest: &ProjectManifest,
     sources: &ModuleSources,
     inferred: BTreeSet<Capability>,
 ) -> Result<Disclosure, CliError> {
-    // A library ships no runnable `Main`; the entry is then the first exposed
-    // module (or the absent default). Only an ABSENT entry is an honest
-    // absence. A source the capture could not hold (a link, a FIFO, an
-    // oversized file) already refused the package, so every present entry is
-    // classified from the captured text.
-    let Some((entry, source)) = sources.get(&entry_module_of(manifest, sources)?) else {
+    let Some(programs) = captured_programs(manifest, sources)? else {
         return Ok(Disclosure {
             control_model: ControlModelDisclosure::NotApplicable,
             capabilities: inferred,
         });
     };
-    let mut interner = ipe_intern::Interner::new();
-    let module = ipe_parse::parse_module(source, &mut interner).map_err(|_| {
-        reject(
-            Check::Capability,
-            format!(
-                "the package's entry source (`{}`) does not parse, so its control model cannot be \
-                 derived. A program whose self-driving model the audit cannot state is refused \
-                 rather than certified with an assumed model.",
-                entry.display()
-            ),
-        )
-    })?;
-
-    // A module that defines no `main` is not a runnable program — it is a library
-    // module the package exposes. It drives nothing of its own, so the control
-    // model is a genuine absence, distinct from a plain-`Task` Direct `main`.
-    let defines_main = interner
-        .lookup("main")
-        .is_some_and(|main_sym| module.values.iter().any(|v| v.value.name.value == main_sym));
-    if !defines_main {
-        return Ok(Disclosure {
-            control_model: ControlModelDisclosure::NotApplicable,
-            capabilities: inferred,
+    let mut models = Vec::new();
+    for program in programs.iter() {
+        let model = match crate::driver::EntryMain::of(program.source) {
+            crate::driver::EntryMain::Unparsed => return Err(unparsed(program)),
+            entry => entry.delivery_shape().control_model(),
+        };
+        models.push(ProgramModel {
+            program: program.name.clone(),
+            module: program.module.clone(),
+            model,
         });
     }
-
-    let shape = crate::delivery::Shape::from_main(ipe_canon::shape_source::classify_main_shape(
-        &module, &interner,
-    ));
+    let Some(models) = NonEmpty::from_vec(models) else {
+        return Err(reject(
+            Check::Capability,
+            "the package's program list disclosed no program".to_owned(),
+        ));
+    };
     Ok(Disclosure {
-        control_model: ControlModelDisclosure::Entry(shape.control_model()),
+        control_model: ControlModelDisclosure::Programs(models),
         capabilities: inferred,
     })
 }
 
-/// The module path of a package's entry: the declared program's entry, else `Main`, else the first exposed module.
+/// The fail-closed refusal of a program whose entry does not parse.
+fn unparsed(program: &CapturedProgram<'_>) -> CliError {
+    reject(
+        Check::Capability,
+        format!(
+            "program `{}`'s entry source (`{}`) does not parse, so its control model cannot be \
+             derived. A program whose self-driving model the audit cannot state is refused \
+             rather than certified with an assumed model.",
+            shown_name(&program.name),
+            program.path.display()
+        ),
+    )
+}
+
+/// One program of the captured package: its name, entry module and entry text.
+#[derive(Debug)]
+struct CapturedProgram<'s> {
+    /// The program's name.
+    name: String,
+    /// The program's entry module.
+    module: Vec<String>,
+    /// The entry file's path, for a refusal to name.
+    path: &'s Path,
+    /// The entry file's captured text.
+    source: &'s str,
+}
+
+/// Every program the captured package builds, or `None` for a library.
 ///
-/// The same choice [`crate::driver::analysis_root_of`] makes over files,
-/// made over the module `sources` a caller holds.
+/// [`crate::project_root::entry_set`] over the capture: the one derivation
+/// [`crate::project_root::ProjectRoot`] reads over the disk, so the audit and
+/// the build can never resolve one manifest to different programs.
 ///
 /// # Errors
-/// [`CliError::Manifest`]-family errors when a declared program's entry is refused.
-fn entry_module_of(
+/// Every refusal of [`crate::project_root::entry_set`];
+/// [`CliError::EntryMissing`] when a resolved entry is not in the capture.
+fn captured_programs<'s>(
     manifest: &ProjectManifest,
-    sources: &ModuleSources,
-) -> Result<Vec<String>, CliError> {
-    if manifest.default_program().is_some() {
-        return manifest.resolved_entry();
+    sources: &'s ModuleSources,
+) -> Result<Option<NonEmpty<CapturedProgram<'s>>>, CliError> {
+    let held = |module: &Vec<String>| {
+        Ok(if sources.contains_key(module) {
+            Located::Found
+        } else {
+            Located::Missing
+        })
+    };
+    let EntrySet::Programs(entries) = entry_set(manifest, &manifest.root, held)? else {
+        return Ok(None);
+    };
+    let mut programs = Vec::with_capacity(entries.iter().count());
+    for entry in entries.iter() {
+        let Some((path, source)) = sources.get(entry.module()) else {
+            return Err(CliError::EntryMissing {
+                entry: format!("{}.ipe", entry.module().join("/")),
+            });
+        };
+        programs.push(CapturedProgram {
+            name: entry.name().as_str().to_owned(),
+            module: entry.module().to_vec(),
+            path,
+            source,
+        });
     }
-    let main = vec!["Main".to_owned()];
-    if sources.contains_key(&main) {
-        return Ok(main);
+    Ok(NonEmpty::from_vec(programs))
+}
+
+/// Run the control-model consent gate for every disclosed program.
+///
+/// Each program is gated on its own model, so a package whose second program
+/// alone runs an uncovered model is refused like one whose first program does.
+///
+/// # Errors
+/// The [`crate::control_model_consent::gate`] refusal of the first program whose
+/// model the manifest's `acceptsControl` does not cover.
+fn consent_every_program(
+    disclosure: &Disclosure,
+    manifest: &ProjectManifest,
+) -> Result<(), CliError> {
+    for program in disclosure.control_model.programs() {
+        crate::control_model_consent::gate(
+            program.model,
+            &manifest.control_models_accept,
+            &program.module.join("."),
+        )?;
     }
-    Ok(manifest.exposed_modules.first().map_or(main, |module| {
-        module.split('.').map(str::to_owned).collect()
-    }))
+    Ok(())
 }
 
 /// The package disclosure a non-audit surface (`ipe doc`) reads — the SAME
@@ -1388,18 +1554,19 @@ fn entry_module_of(
 /// [`crate::infer_package_capabilities`] rather than a second derivation that
 /// could disagree with the audit's answer.
 ///
-/// Fail-closed identically to the audit: a runnable entry whose source cannot be
-/// read or parsed is a hard rejection ([`Check::Capability`]), never a permissive
-/// default; a package with no runnable `main` discloses an honest
+/// Fail-closed identically to the audit: a program whose entry cannot be read
+/// or parsed is a hard rejection ([`Check::Capability`]), never a permissive
+/// default; a library that builds no program discloses an honest
 /// [`ControlModelDisclosure::NotApplicable`] ("library").
 ///
 /// This does NOT build the package (no emit): the disclosure needs only the
-/// manifest (for the capability union) and the entry source (for the control
-/// model), so `ipe doc` stays a read-only documentation surface.
+/// manifest (for the capability union) and each program's entry source (for
+/// the control models), so `ipe doc` stays a read-only documentation surface.
 ///
 /// # Errors
 /// [`CliError`] when the manifest cannot be located or parsed, the capability
-/// inference fails, or the entry source cannot be read or parsed (fail-closed).
+/// inference fails, the entry source cannot be read or parsed (fail-closed), or
+/// the package builds nothing ([`CliError::NoDefaultEntry`]).
 pub(crate) fn disclose_package(path: &Path) -> Result<Disclosure, CliError> {
     // A working-tree reader, not a capture: `ipe doc` certifies nothing, and a
     // capture would walk the build output under the project root. The modules
@@ -1409,13 +1576,15 @@ pub(crate) fn disclose_package(path: &Path) -> Result<Disclosure, CliError> {
     let (sources, entries) = crate::driver::read_package_modules(&manifest)?;
     let source_set =
         crate::driver::PackageSourceSet::assemble(sources.clone(), entries, &manifest_path)?;
-    let inferred =
-        crate::driver::infer_package_capabilities_in(&ipe_db::IpeDatabase::new(), &source_set)?;
+    let inferred = crate::driver::infer_package_capabilities_of(&source_set)?;
     derive_disclosure(&manifest, &sources, inferred)
 }
 
 /// Render the disclosure as a human-readable frame — the control model and the
 /// (possibly empty) capability set the package can exercise.
+///
+/// A package of more than one program also names each program's own model.
+/// Every name is shown through [`shown_name`].
 fn disclosure_summary(name: &str, disclosure: &Disclosure) -> String {
     let caps: Vec<&'static str> = disclosure.capabilities.iter().map(|c| c.as_str()).collect();
     let caps_line = if caps.is_empty() {
@@ -1423,10 +1592,38 @@ fn disclosure_summary(name: &str, disclosure: &Disclosure) -> String {
     } else {
         caps.join(", ")
     };
+    let programs: Vec<String> = disclosure
+        .control_model
+        .programs()
+        .map(|program| {
+            format!(
+                "`{}`: {}",
+                shown_name(&program.program),
+                program.model.word()
+            )
+        })
+        .collect();
+    let per_program = if programs.len() > 1 {
+        format!(" ({})", programs.join(", "))
+    } else {
+        String::new()
+    };
     format!(
-        "package audit: `{name}` control model: {}; capabilities: {caps_line}.",
+        "package audit: `{}` control model: {}{per_program}; capabilities: {caps_line}.",
+        shown_name(name),
         disclosure.control_model.word()
     )
+}
+
+/// A manifest-supplied name (the package's or a program's) as one inert token
+/// of a single report line: control characters and line breaks escaped as in
+/// [`str::escape_debug`], a backtick escaped so the name cannot close the code
+/// span it is shown in, and the result proven a [`crate::style::TerminalLine`].
+fn shown_name(raw: &str) -> String {
+    let escaped = raw.escape_debug().to_string().replace('`', "\\`");
+    crate::style::TerminalLine::sanitize(&escaped)
+        .as_str()
+        .to_owned()
 }
 
 // ===========================================================================
@@ -1491,7 +1688,7 @@ fn enforced_semver(
                     "package audit: `{}` {new_version} is a prerelease — exempt from the \
                  enforced-semver API-compatibility bump (semver §9: a prerelease is unstable \
                  and is not resolved by a stable version requirement).",
-                    manifest.name
+                    shown_name(&manifest.name)
                 ),
             )
             .emit();
@@ -1512,7 +1709,7 @@ fn enforced_semver(
                 &format!(
                     "package audit: `{}` has no previously published version in the index — \
                  skipping the enforced-semver check (first version).",
-                    manifest.name
+                    shown_name(&manifest.name)
                 ),
             )
             .emit();
@@ -1527,7 +1724,7 @@ fn enforced_semver(
                     "package audit: `{}` has no published stable version below {new_version} — \
                  skipping the enforced-semver check (first stable version; a prerelease \
                  carries no compatibility promise to diff against).",
-                    manifest.name
+                    shown_name(&manifest.name)
                 ),
             )
             .emit();
@@ -1608,7 +1805,13 @@ fn detect_cargo_deny_minor(cargo_deny: &OsStr, ceiling: LocalCeiling) -> u32 {
         .unwrap_or(20)
 }
 
-/// Run `cargo-deny` with `args`, detached in its own process group and held to `ceiling`.
+/// Run `cargo-deny` with `args` in `cwd`, detached in its own process group and held to `ceiling`.
+///
+/// `cwd` is a directory the gate owns. Cargo reads its configuration
+/// (`.cargo/config.toml`: the `rustc` it runs, a wrapper, a source
+/// replacement) from the working directory upward, so a scan started in the
+/// caller's directory, which may be the judged package, would run on the
+/// package's choices.
 ///
 /// # Errors
 /// See [`RunError`]: a crossed ceiling kills the child's group and is a
@@ -1617,9 +1820,10 @@ fn run_cargo_deny(
     cargo_deny: &OsStr,
     args: &[OsString],
     ceiling: LocalCeiling,
+    cwd: &Path,
 ) -> Result<Captured, RunError<LocalRefusal>> {
     let mut command = Command::new(cargo_deny);
-    command.args(args);
+    command.args(args).current_dir(cwd);
     run_local(command, ceiling, LocalSource::SupplyChainScan)
 }
 
@@ -1631,15 +1835,13 @@ fn run_cargo_deny(
 ///   - minor < 20:  `[--manifest-path <m>] check advisories bans sources [--config <cfg>]`
 ///
 /// `--manifest-path` is a global option accepted in both series.
-fn deny_args(cargo_deny_minor: u32, manifest: &Path, config: Option<&Path>) -> Vec<OsString> {
+fn deny_args(cargo_deny_minor: u32, manifest: &Path, config: &Path) -> Vec<OsString> {
     let mut args: Vec<OsString> = Vec::new();
     args.push("--manifest-path".into());
     args.push(manifest.into());
-    if cargo_deny_minor >= 20
-        && let Some(cfg) = config
-    {
+    if cargo_deny_minor >= 20 {
         args.push("--config".into());
-        args.push(cfg.into());
+        args.push(config.into());
     }
     args.push("check".into());
     // Advisories + bans + sources are the supply-chain axes; licenses are a
@@ -1647,11 +1849,9 @@ fn deny_args(cargo_deny_minor: u32, manifest: &Path, config: Option<&Path>) -> V
     args.push("advisories".into());
     args.push("bans".into());
     args.push("sources".into());
-    if cargo_deny_minor < 20
-        && let Some(cfg) = config
-    {
+    if cargo_deny_minor < 20 {
         args.push("--config".into());
-        args.push(cfg.into());
+        args.push(config.into());
     }
     args
 }
@@ -1694,16 +1894,21 @@ fn supply_chain(prepared: &Prepared) -> Result<(), CliError> {
     // `deny.toml` ledgers advisories the vendored runtime's dependency tree
     // legitimately carries. Without it the check would default-reject every
     // emitted package for a runtime dependency the workspace has already vetted.
-    // Absent a resolvable config, cargo-deny falls back to its defaults.
+    // The policy is the gate's embedded one, never a file the audit finds.
     //
     // `--config` placement is version-dependent: global (before `check`) for
     // cargo-deny >= 0.20, on the `check` subcommand for < 0.20.
     let derived_config = derive_deny_config(&prepared.emitted_dir)?;
     let cargo_deny = OsStr::new(CARGO_DENY);
     let minor = detect_cargo_deny_minor(cargo_deny, TOOL_QUERY_LIMITS);
-    let args = deny_args(minor, &manifest, derived_config.as_deref());
+    let args = deny_args(minor, &manifest, &derived_config);
 
-    match run_cargo_deny(cargo_deny, &args, SUPPLY_CHAIN_SCAN_LIMITS) {
+    match run_cargo_deny(
+        cargo_deny,
+        &args,
+        SUPPLY_CHAIN_SCAN_LIMITS,
+        &prepared.emitted_dir,
+    ) {
         Ok(out) if out.status.success() => verify_locked_dependency_hashes(prepared),
         Ok(out) => {
             let stderr = out.stderr.to_terminal();
@@ -1792,6 +1997,8 @@ fn verify_locked_dependency_hashes(prepared: &Prepared) -> Result<(), CliError> 
 /// [`CliError::AdvisoryVulnerable`] on a `high`/`critical` match.
 /// [`CliError::AdvisoryDbMalformed`] on a malformed advisory file.
 /// [`CliError::AdvisoryDbUnreachable`] on an unreadable advisory directory.
+/// [`CliError::Usage`] when `IPE_REGISTRY_URL` is neither empty nor an
+/// `https://` base URL.
 fn advisory_check(
     lockfile: &crate::lockfile::Lockfile,
     advisory_db: Option<&Path>,
@@ -1809,12 +2016,13 @@ fn advisory_check(
         return Ok(());
     };
 
-    advisory_check_with_base(lockfile, db_root, &crate::registry::registry_base_url())
+    advisory_check_with_base(lockfile, db_root, &crate::registry::registry_source()?)
 }
 
-/// The base-URL-injected core of [`advisory_check`]: cross-checks every dep of
-/// the captured `lockfile`, using `base_url` as the registry Pages read
-/// API. Tests pass an empty `base_url` to disable the HTTP attempt (immediate
+/// The registry-source-injected core of [`advisory_check`]: cross-checks every
+/// dep of the captured `lockfile`, reading the registry Pages read API from
+/// `source`. Tests pass [`crate::registry::RegistrySource::Disabled`] to skip
+/// the HTTP attempt (immediate
 /// unreachable → the git-checkout DB is authoritative), keeping them hermetic and
 /// off the network.
 ///
@@ -1824,14 +2032,14 @@ fn advisory_check(
 fn advisory_check_with_base(
     lockfile: &crate::lockfile::Lockfile,
     db_root: &Path,
-    base_url: &str,
+    source: &crate::registry::RegistrySource,
 ) -> Result<(), CliError> {
     for dep in lockfile.packages() {
         // The lockfile parse turns each `name` into a `PackageName` — a single
         // non-traversing path component by construction — so a hand-edited
         // `ipe.lock` name never reaches the registry URL segment or the
         // advisory-DB path join raw.
-        check_one_dep_advisories(db_root, &dep.name, dep.version.as_semver(), base_url)?;
+        check_one_dep_advisories(db_root, &dep.name, dep.version.as_semver(), source)?;
     }
     Ok(())
 }
@@ -1842,7 +2050,7 @@ fn advisory_check_with_base(
 /// The Pages fast-path fetches `/advisories/index.json` + the per-advisory
 /// records. A reachable index is authoritative for this run — even an empty
 /// result proves the dep clean. When the index (or a named record) is unreachable
-/// (offline / air-gapped / an empty `base_url` opt-out), this is a WARN, never a
+/// (offline / air-gapped / the [`crate::registry::RegistrySource::Disabled`] opt-out), this is a WARN, never a
 /// silent all-clear: the check falls back to the git-checkout advisory DB, which
 /// is itself fail-closed on a malformed or unreadable file.
 ///
@@ -1854,12 +2062,12 @@ fn check_one_dep_advisories(
     db_root: &Path,
     name: &crate::package_name::PackageName,
     version: &semver::Version,
-    base_url: &str,
+    source: &crate::registry::RegistrySource,
 ) -> Result<(), CliError> {
     let name = name.as_str();
     let outcome = crate::registry::fetch_advisories_via_pages_with(
         name,
-        base_url,
+        source,
         &crate::registry::net_fetch,
     )?;
     match outcome {
@@ -1881,63 +2089,46 @@ fn check_one_dep_advisories(
     }
 }
 
-/// The workspace's cargo-deny config file name.
-const DENY_CONFIG: &str = "deny.toml";
+/// The supply-chain policy the gate applies: the compiler workspace's own
+/// `deny.toml`, embedded when this binary was built.
+///
+/// The policy is part of the gate's installation, so no file at audit time can
+/// stand in for it: neither the audited package's tree, nor the working
+/// directory, nor a runtime tree a cwd walk or `IPE_RUNTIME_DIR` resolves (a
+/// package shipping an empty `src/runtime/rust/src/` beside its own
+/// `deny.toml` would otherwise name the policy it is judged by). An absent
+/// policy has no representation, so cargo-deny never runs on its defaults.
+const GATE_DENY_POLICY: &str = include_str!("../../../deny.toml");
 
-/// Locate the workspace's `deny.toml` so the supply-chain check applies the same
-/// posture the workspace CI does. Walks up from the current directory, then from
-/// the resolved runtime tree's ancestry (the runtime lives inside the workspace,
-/// so `deny.toml` sits at the workspace root above it). Returns the directory
-/// holding it, or `None` when no `deny.toml` is found.
-fn locate_workspace_deny_config() -> Option<PathBuf> {
-    let mut roots: Vec<PathBuf> = Vec::new();
-    if let Ok(cwd) = std::env::current_dir() {
-        roots.push(cwd);
-    }
-    if let Ok(runtime) = crate::resolve_runtime() {
-        roots.push(runtime);
-    }
-    for root in roots {
-        let mut here: Option<&Path> = Some(root.as_path());
-        while let Some(dir) = here {
-            if dir.join(DENY_CONFIG).is_file() {
-                return Some(dir.to_path_buf());
-            }
-            here = dir.parent();
-        }
-    }
-    None
-}
-
-/// Derive a cargo-deny config for the EMITTED project from the workspace's
-/// `deny.toml`, dropping its `[graph]` section.
+/// Derive a cargo-deny config for the EMITTED project from the gate's
+/// embedded policy ([`GATE_DENY_POLICY`]), dropping its `[graph]` section.
 ///
 /// The workspace config's `[graph] features = ["full"]` names the RUNTIME crate's
 /// own feature set, which the emitted `ipe-app` does not have — passing the
 /// workspace config verbatim makes `cargo metadata` fail on the unknown feature.
 /// The advisory/license/bans/sources POLICY is exactly what the gate must apply,
 /// so this copies every section EXCEPT `[graph]` into a derived config written
-/// beside the emitted project, and returns its path. Returns `None` when no
-/// workspace `deny.toml` is found (cargo-deny then uses its defaults).
+/// beside the emitted project, and returns its path.
 ///
 /// # Errors
-/// [`CliError::Io`] on a read/write failure.
-fn derive_deny_config(emitted_dir: &Path) -> Result<Option<PathBuf>, CliError> {
-    let Some(workspace) = locate_workspace_deny_config() else {
-        return Ok(None);
-    };
-    let text = crate::io_bounded::read_named_in(
-        &workspace,
-        &[DENY_CONFIG],
-        crate::io_bounded::SMALL_FILE_CAP,
-    )?;
+/// [`CliError::Io`] on a write failure.
+fn derive_deny_config(emitted_dir: &Path) -> Result<PathBuf, CliError> {
+    let derived = emitted_dir.join("ipe-audit-deny.toml");
+    std::fs::write(&derived, emitted_deny_policy(GATE_DENY_POLICY)).map_err(|e| CliError::Io {
+        path: derived.clone(),
+        source: e,
+    })?;
+    Ok(derived)
+}
 
-    // Line-filter out the `[graph]` table (up to the next top-level `[section]`).
-    // The remaining tables (`[advisories]`, `[licenses]`, `[bans]`, `[sources]`)
-    // are the emitted-project-independent policy the gate applies.
-    let mut out = String::with_capacity(text.len());
+/// `policy` without its `[graph]` table (up to the next top-level `[section]`).
+///
+/// The remaining tables (`[advisories]`, `[licenses]`, `[bans]`, `[sources]`)
+/// are the emitted-project-independent policy the gate applies.
+fn emitted_deny_policy(policy: &str) -> String {
+    let mut out = String::with_capacity(policy.len());
     let mut in_graph = false;
-    for line in text.lines() {
+    for line in policy.lines() {
         let trimmed = line.trim_start();
         if trimmed.starts_with('[') {
             in_graph = trimmed.starts_with("[graph]");
@@ -1947,13 +2138,7 @@ fn derive_deny_config(emitted_dir: &Path) -> Result<Option<PathBuf>, CliError> {
             out.push('\n');
         }
     }
-
-    let derived = emitted_dir.join("ipe-audit-deny.toml");
-    std::fs::write(&derived, out).map_err(|e| CliError::Io {
-        path: derived.clone(),
-        source: e,
-    })?;
-    Ok(Some(derived))
+    out
 }
 
 /// Refuse a package whose own module set claims a reserved namespace (`Ipe.*`,
@@ -2382,7 +2567,7 @@ mod tests {
         use crate::audit_native::Tier2Outcome;
 
         let disclosure = Disclosure {
-            control_model: ControlModelDisclosure::Entry(crate::delivery::ControlModel::Tea),
+            control_model: single(crate::delivery::ControlModel::Tea),
             capabilities: BTreeSet::from([Capability::Clock, Capability::Network]),
         };
         let pass = audit_verdict_json(
@@ -2431,12 +2616,9 @@ mod tests {
 
     #[test]
     fn control_model_disclosure_word_is_the_models_word_or_library() {
+        assert_eq!(single(crate::delivery::ControlModel::Tea).word(), "tea");
         assert_eq!(
-            ControlModelDisclosure::Entry(crate::delivery::ControlModel::Tea).word(),
-            "tea"
-        );
-        assert_eq!(
-            ControlModelDisclosure::Entry(crate::delivery::ControlModel::Direct).word(),
+            single(crate::delivery::ControlModel::Direct).word(),
             "direct"
         );
         assert_eq!(ControlModelDisclosure::NotApplicable.word(), "library");
@@ -2445,7 +2627,7 @@ mod tests {
     #[test]
     fn disclosure_summary_lists_capabilities_or_none() {
         let with_caps = Disclosure {
-            control_model: ControlModelDisclosure::Entry(crate::delivery::ControlModel::Direct),
+            control_model: single(crate::delivery::ControlModel::Direct),
             capabilities: BTreeSet::from([Capability::Clock]),
         };
         let s = disclosure_summary("pkg", &with_caps);
@@ -2581,7 +2763,7 @@ mod tests {
              \x20   { name = \"cache-pkg\", version = \"0.1.0\" }\n",
         )
         .expect("write package.ipe");
-        let cache = dir.join(".ipe/cache/ffi/rust");
+        let cache = dir.join(ipe_ffi::driver::FFI_CACHE_REL);
         std::fs::create_dir_all(&cache).expect("create committed cache");
         std::fs::write(cache.join("evil_bindings.rs"), "pub fn evil() {}\n")
             .expect("plant committed bindings");
@@ -2641,7 +2823,7 @@ mod tests {
         let target = make_test_dir("symlink-target");
 
         // Plant `.ipe` as a symlink pointing outside the project root.
-        let ipe_link = dir.join(".ipe");
+        let ipe_link = dir.join(ipe_ffi::driver::CACHE_NAMESPACE_DIR);
         symlink(&target, &ipe_link).expect("create .ipe symlink");
 
         let err =
@@ -2756,6 +2938,403 @@ mod tests {
 
     // ── Disclosure derivation (control model + capabilities) ────────────────
 
+    /// The disclosure of a package whose one program `test-pkg` (entry `Main`) runs `model`.
+    fn single(model: crate::delivery::ControlModel) -> ControlModelDisclosure {
+        ControlModelDisclosure::Programs(
+            NonEmpty::from_vec(vec![ProgramModel {
+                program: "test-pkg".to_owned(),
+                module: vec!["Main".to_owned()],
+                model,
+            }])
+            .expect("one program"),
+        )
+    }
+
+    /// A TEA web entry module `module`.
+    fn tea_entry(module: &str) -> String {
+        format!(
+            "module {module} exposing (main)\nimport Ipe.Tea.Web as Web\n\nmain = Web.tea config\n"
+        )
+    }
+
+    /// A plain-`Task` entry module `module` that writes to standard output.
+    fn direct_entry(module: &str) -> String {
+        format!(
+            "module {module} exposing (main)\n\nimport Ipe.Io as Io\n\n\nmain : Task ()\nmain =\n    Io.println \"hi\"\n"
+        )
+    }
+
+    /// A manifest of two programs, `board` (a TEA `Main`) then `sync` (a Direct `Sync`), and their sources.
+    fn two_program_package() -> (ProjectManifest, ModuleSources) {
+        let mut manifest = test_manifest(Path::new("/nonexistent/disclosure-two-programs"));
+        manifest.programs = vec![
+            crate::project::Program {
+                name: "board".to_owned(),
+                entry: "Main.ipe".to_owned(),
+                shape: None,
+            },
+            crate::project::Program {
+                name: "sync".to_owned(),
+                entry: "Sync.ipe".to_owned(),
+                shape: None,
+            },
+        ];
+        let sources = ModuleSources::from([
+            (
+                vec!["Main".to_owned()],
+                (manifest.src_root.join("Main.ipe"), tea_entry("Main")),
+            ),
+            (
+                vec!["Sync".to_owned()],
+                (manifest.src_root.join("Sync.ipe"), direct_entry("Sync")),
+            ),
+        ]);
+        (manifest, sources)
+    }
+
+    /// Every program of a two-program package is disclosed, the second's Direct model included.
+    #[test]
+    fn disclosure_names_every_program_of_a_two_program_package() {
+        let (manifest, sources) = two_program_package();
+        let disclosure =
+            derive_disclosure(&manifest, &sources, BTreeSet::new()).expect("derives both");
+        let models: Vec<(&str, crate::delivery::ControlModel)> = disclosure
+            .control_model
+            .programs()
+            .map(|program| (program.program.as_str(), program.model))
+            .collect();
+        assert_eq!(
+            models,
+            vec![
+                ("board", crate::delivery::ControlModel::Tea),
+                ("sync", crate::delivery::ControlModel::Direct),
+            ],
+            "each program discloses its own model, in manifest order"
+        );
+        assert_eq!(
+            disclosure.control_model_word(),
+            "direct",
+            "the one-word model is the most elevated any program runs"
+        );
+        let summary = disclosure_summary("two", &disclosure);
+        assert!(
+            summary.contains("control model: direct (`board`: tea, `sync`: direct)"),
+            "the summary names both programs' models: {summary}"
+        );
+        let json = audit_verdict_json(
+            "two",
+            "0.1.0",
+            &Ok(AuditedPackage {
+                digest: test_digest(),
+                disclosure,
+                tier2: crate::audit_native::Tier2Outcome::SkippedPureIpe,
+            }),
+        );
+        assert!(
+            json.contains(
+                "\"programs\":[{\"name\":\"board\",\"controlModel\":\"tea\"},\
+                 {\"name\":\"sync\",\"controlModel\":\"direct\"}]"
+            ),
+            "the verdict lists both programs: {json}"
+        );
+    }
+
+    /// A program or package name holding a line break and a backtick is shown escaped on one
+    /// line, so it cannot forge a second disclosure line or close its code span.
+    #[test]
+    fn disclosure_summary_shows_hostile_names_escaped_on_one_line() {
+        let (mut manifest, sources) = two_program_package();
+        let hostile = "sync\n`forged`: tea";
+        if let Some(program) = manifest.programs.get_mut(1) {
+            hostile.clone_into(&mut program.name);
+        }
+        let disclosure =
+            derive_disclosure(&manifest, &sources, BTreeSet::new()).expect("derives both");
+        let summary = disclosure_summary("two\r\n`pkg`", &disclosure);
+        assert!(
+            !summary.contains('\n') && !summary.contains('\r'),
+            "no name breaks the line: {summary:?}"
+        );
+        assert!(
+            summary.contains(r"`sync\n\`forged\`: tea`: direct"),
+            "the program name is shown escaped: {summary}"
+        );
+        assert!(
+            summary.contains(r"package audit: `two\r\n\`pkg\`` control model"),
+            "the package name is shown escaped: {summary}"
+        );
+        let passing = passing_summary(
+            "two\n`pkg`",
+            "0.1.0",
+            &crate::audit_native::Tier2Outcome::SkippedPureIpe,
+            &disclosure,
+        );
+        assert_eq!(
+            passing.lines().count(),
+            2,
+            "the tier line and the disclosure line only: {passing:?}"
+        );
+    }
+
+    /// A package whose second program alone runs a model `acceptsControl` omits is refused.
+    #[test]
+    fn consent_refuses_a_second_program_the_accept_set_does_not_cover() {
+        let (mut manifest, sources) = two_program_package();
+        manifest.control_models_accept =
+            std::iter::once(crate::delivery::ControlModel::Tea).collect();
+        let disclosure =
+            derive_disclosure(&manifest, &sources, BTreeSet::new()).expect("derives both");
+        let err = consent_every_program(&disclosure, &manifest)
+            .expect_err("the second program's Direct model is not accepted");
+        let text = err.to_string();
+        assert!(text.contains("IPE-S0004"), "carries the code: {text}");
+        assert!(
+            text.contains("`Sync`"),
+            "names the second program's entry: {text}"
+        );
+
+        manifest.control_models_accept = [
+            crate::delivery::ControlModel::Tea,
+            crate::delivery::ControlModel::Direct,
+        ]
+        .into_iter()
+        .collect();
+        assert!(
+            consent_every_program(&disclosure, &manifest).is_ok(),
+            "an accept set covering both programs passes"
+        );
+    }
+
+    /// A second program whose entry does not parse fails the disclosure closed.
+    #[test]
+    fn disclosure_fails_closed_when_a_second_program_does_not_parse() {
+        let (manifest, mut sources) = two_program_package();
+        sources.insert(
+            vec!["Sync".to_owned()],
+            (
+                manifest.src_root.join("Sync.ipe"),
+                "module Sync exposing (main)\n\nmain = = = broken (((\n".to_owned(),
+            ),
+        );
+        let err = derive_disclosure(&manifest, &sources, BTreeSet::new())
+            .expect_err("an unparseable second program must fail closed");
+        assert!(
+            matches!(err, CliError::PackageAudit(ref r) if r.check == Check::Capability),
+            "a Capability rejection: {err:?}"
+        );
+        assert!(
+            err.to_string().contains("`sync`"),
+            "names the program: {err}"
+        );
+    }
+
+    /// A declared program whose entry the capture does not hold fails the disclosure closed.
+    #[test]
+    fn disclosure_fails_closed_when_a_declared_program_is_not_captured() {
+        let (manifest, mut sources) = two_program_package();
+        sources.remove(["Sync".to_owned()].as_slice());
+        let err = derive_disclosure(&manifest, &sources, BTreeSet::new())
+            .expect_err("a missing second program must fail closed");
+        assert!(
+            matches!(&err, CliError::EntryMissing { entry } if entry == "Sync.ipe"),
+            "the project root's missing-entry refusal: {err:?}"
+        );
+    }
+
+    /// An entry that defines no `main` discloses the `direct` model the build's script shape runs.
+    #[test]
+    fn disclosure_of_an_entry_without_main_is_the_script_model() {
+        let (manifest, sources) =
+            manifest_with_main("module Main exposing (helper)\n\nhelper = 1\n");
+        let disclosure = derive_disclosure(&manifest, &sources, BTreeSet::new()).expect("derives");
+        assert_eq!(
+            disclosure.control_model,
+            single(crate::delivery::ControlModel::Direct),
+            "no `main` is the script shape, never a library"
+        );
+    }
+
+    /// A capture case: its tag, its manifest, and its `src/` files.
+    type CaptureCase<'a> = (&'a str, &'a str, &'a [(&'a str, String)]);
+    /// Each program's name and entry module, `None` for a library, or the refusal's kind.
+    type CaptureOutcome = Result<Option<Vec<(String, Vec<String>)>>, String>;
+
+    fn capture_refusal(err: &CliError) -> String {
+        match err {
+            CliError::NoDefaultEntry { .. } => "no-default-entry".to_owned(),
+            other => format!("{other:?}"),
+        }
+    }
+
+    /// The outcome of the audit's capture reading and of the project root's resolution over the
+    /// package `manifest` with `files` under `src/`.
+    fn audited_and_resolved(
+        tag: &str,
+        manifest: &str,
+        files: &[(&str, String)],
+    ) -> (CaptureOutcome, CaptureOutcome) {
+        use crate::project_root::{EntrySet, ProjectRoot, RootArg};
+        let dir = make_test_dir(tag);
+        assert!(
+            std::fs::create_dir_all(dir.join("src/Tools")).is_ok(),
+            "create src/"
+        );
+        assert!(
+            std::fs::write(dir.join("package.ipe"), manifest).is_ok(),
+            "write package.ipe"
+        );
+        for (rel, text) in files {
+            assert!(
+                std::fs::write(dir.join("src").join(rel), text).is_ok(),
+                "write {rel}"
+            );
+        }
+        let snapshot = capture_package(&dir).expect("capture");
+        let audited: CaptureOutcome = captured_programs(snapshot.manifest(), snapshot.sources())
+            .map(|programs| {
+                programs.map(|programs| {
+                    programs
+                        .iter()
+                        .map(|program| (program.name.clone(), program.module.clone()))
+                        .collect()
+                })
+            })
+            .map_err(|err| capture_refusal(&err));
+        let root = ProjectRoot::resolve(RootArg::at(&dir));
+        let _ = std::fs::remove_dir_all(&dir);
+        let resolved: CaptureOutcome = root
+            .map(|root| match root.entries() {
+                EntrySet::Programs(programs) => Some(
+                    programs
+                        .iter()
+                        .map(|entry| (entry.name().as_str().to_owned(), entry.module().to_vec()))
+                        .collect(),
+                ),
+                EntrySet::Library(_) => None,
+            })
+            .map_err(|err| capture_refusal(&err));
+        (audited, resolved)
+    }
+
+    /// The programs the audit reads from a capture are the programs the project root resolves,
+    /// and a package the root refuses is refused by the audit with the same refusal.
+    #[test]
+    fn captured_programs_are_the_project_roots_programs() {
+        let cases: [CaptureCase<'_>; 6] = [
+            (
+                "agree-two-programs",
+                "module Package exposing (package)\n\n\npackage =\n    { name = \"two\"\n    , programs =\n        [ { name = \"board\", entry = \"Main.ipe\" }\n        , { name = \"sync\", entry = \"Tools/Sync.ipe\" }\n        ]\n    }\n",
+                &[
+                    ("Main.ipe", tea_entry("Main")),
+                    ("Tools/Sync.ipe", direct_entry("Tools.Sync")),
+                ],
+            ),
+            (
+                "agree-default-main",
+                SNAPSHOT_MANIFEST,
+                &[("Main.ipe", direct_entry("Main"))],
+            ),
+            (
+                "agree-library",
+                "module Package exposing (package)\n\n\npackage =\n    { name = \"lib\", exposedModules = [ \"Lib\" ] }\n",
+                &[(
+                    "Lib.ipe",
+                    "module Lib exposing (one)\n\none = 1\n".to_owned(),
+                )],
+            ),
+            (
+                "agree-declared-over-stray-main",
+                "module Package exposing (package)\n\n\npackage =\n    { name = \"tools\"\n    , programs = [ { name = \"sync\", entry = \"Tools/Sync.ipe\" } ]\n    }\n",
+                &[
+                    ("Main.ipe", tea_entry("Main")),
+                    ("Tools/Sync.ipe", direct_entry("Tools.Sync")),
+                ],
+            ),
+            (
+                "agree-main-over-exposed",
+                "module Package exposing (package)\n\n\npackage =\n    { name = \"both\", exposedModules = [ \"Lib\" ] }\n",
+                &[
+                    ("Main.ipe", direct_entry("Main")),
+                    (
+                        "Lib.ipe",
+                        "module Lib exposing (one)\n\none = 1\n".to_owned(),
+                    ),
+                ],
+            ),
+            (
+                "agree-no-default-entry",
+                "module Package exposing (package)\n\n\npackage =\n    { name = \"none\" }\n",
+                &[(
+                    "Lib.ipe",
+                    "module Lib exposing (one)\n\none = 1\n".to_owned(),
+                )],
+            ),
+        ];
+        for (tag, manifest, files) in cases {
+            let (audited, resolved) = audited_and_resolved(tag, manifest, files);
+            assert_eq!(audited, resolved, "{tag}: the audit and the root agree");
+            let expected: CaptureOutcome = match tag {
+                "agree-declared-over-stray-main" => Ok(Some(vec![(
+                    "sync".to_owned(),
+                    vec!["Tools".to_owned(), "Sync".to_owned()],
+                )])),
+                "agree-main-over-exposed" => {
+                    Ok(Some(vec![("both".to_owned(), vec!["Main".to_owned()])]))
+                }
+                "agree-no-default-entry" => Err("no-default-entry".to_owned()),
+                _ => continue,
+            };
+            assert_eq!(audited, expected, "{tag}: the expected entry set");
+        }
+    }
+
+    /// A package the project root refuses for an absent exposed module or an absent declared
+    /// entry is refused by the audit with that same refusal, never read as a library or as the
+    /// programs that are present.
+    #[test]
+    fn captured_programs_refuse_what_the_project_root_refuses() {
+        let lib = || "module Lib exposing (one)\n\none = 1\n".to_owned();
+        let cases: [CaptureCase<'_>; 3] = [
+            (
+                "refuse-exposed-missing-library",
+                "module Package exposing (package)\n\n\npackage =\n    { name = \"lib\", exposedModules = [ \"Absent\" ] }\n",
+                &[("Lib.ipe", lib())],
+            ),
+            (
+                "refuse-exposed-missing-beside-main",
+                "module Package exposing (package)\n\n\npackage =\n    { name = \"both\", exposedModules = [ \"Absent\" ] }\n",
+                &[("Main.ipe", direct_entry("Main")), ("Lib.ipe", lib())],
+            ),
+            (
+                "refuse-declared-entry-missing",
+                "module Package exposing (package)\n\n\npackage =\n    { name = \"tools\"\n    , programs = [ { name = \"sync\", entry = \"Tools/Sync.ipe\" } ]\n    }\n",
+                &[("Main.ipe", tea_entry("Main"))],
+            ),
+        ];
+        for (tag, manifest, files) in cases {
+            let (audited, resolved) = audited_and_resolved(tag, manifest, files);
+            assert_eq!(audited, resolved, "{tag}: the audit and the root agree");
+            assert_eq!(
+                audited,
+                Err(capture_refusal(&expected_refusal(tag))),
+                "{tag}: refused, never a library or a partial program set"
+            );
+        }
+    }
+
+    /// The refusal [`captured_programs_refuse_what_the_project_root_refuses`] expects for `tag`.
+    fn expected_refusal(tag: &str) -> CliError {
+        if tag == "refuse-declared-entry-missing" {
+            CliError::EntryMissing {
+                entry: "Tools/Sync.ipe".to_owned(),
+            }
+        } else {
+            CliError::ExposedModuleMissing {
+                module: "Absent".to_owned(),
+            }
+        }
+    }
+
     /// A manifest and captured sources holding a single `Main` module of `main_src`.
     ///
     /// Only the manifest's `programs` and `exposed_modules` matter to [`derive_disclosure`].
@@ -2778,7 +3357,7 @@ mod tests {
         let d = derive_disclosure(&manifest, &sources, BTreeSet::new()).expect("derives");
         assert_eq!(
             d.control_model,
-            ControlModelDisclosure::Entry(crate::delivery::ControlModel::Tea),
+            single(crate::delivery::ControlModel::Tea),
             "a `Web.tea` entry discloses the TEA control model"
         );
     }
@@ -2792,7 +3371,7 @@ mod tests {
         let d = derive_disclosure(&manifest, &sources, BTreeSet::new()).expect("derives");
         assert_eq!(
             d.control_model,
-            ControlModelDisclosure::Entry(crate::delivery::ControlModel::Direct),
+            single(crate::delivery::ControlModel::Direct),
             "a plain-`Task` `main` discloses the Direct control model"
         );
     }
@@ -2889,7 +3468,7 @@ mod tests {
             derive_disclosure(&manifest, &sources, BTreeSet::new()).expect("derives Direct");
         assert_eq!(
             disclosure.control_model,
-            ControlModelDisclosure::Entry(crate::delivery::ControlModel::Direct),
+            single(crate::delivery::ControlModel::Direct),
             "a plain-Task entry discloses the Direct model"
         );
         let err = crate::control_model_consent::gate(
@@ -2911,7 +3490,7 @@ mod tests {
             derive_disclosure(&manifest, &sources, BTreeSet::new()).expect("derives Direct");
         assert_eq!(
             disclosure.control_model,
-            ControlModelDisclosure::Entry(crate::delivery::ControlModel::Direct),
+            single(crate::delivery::ControlModel::Direct),
         );
         crate::control_model_consent::gate(
             crate::delivery::ControlModel::Direct,
@@ -2932,7 +3511,7 @@ mod tests {
             derive_disclosure(&manifest, &sources, BTreeSet::new()).expect("derives Direct");
         assert_eq!(
             disclosure.control_model,
-            ControlModelDisclosure::Entry(crate::delivery::ControlModel::Direct),
+            single(crate::delivery::ControlModel::Direct),
         );
         assert!(
             manifest.control_models_accept.is_empty(),
@@ -3128,8 +3707,9 @@ mod tests {
 
     /// The advisory check over the `ipe.lock` written under `dir`, against the DB at `db`.
     fn advisory_over(dir: &Path, db: &Path) -> Result<(), CliError> {
-        crate::lockfile::Lockfile::read(dir)
-            .and_then(|lock| advisory_check_with_base(&lock, db, ""))
+        crate::lockfile::Lockfile::read(dir).and_then(|lock| {
+            advisory_check_with_base(&lock, db, &crate::registry::RegistrySource::Disabled)
+        })
     }
 
     /// A digest literal for a verdict that judged no tree.
@@ -3428,36 +4008,6 @@ mod tests {
         );
     }
 
-    // ── Runtime resolution ───────────────────────────────────────────────────
-
-    /// `prepare` resolves the runtime through the SAME path `ipe dev build` uses — the
-    /// materialize-capable resolver — never a separate walk-up that cannot
-    /// materialize. Under the default dependency model no vendored module tree is
-    /// needed, so with `IPE_RUNTIME_DIR` unset the resolution succeeds with an
-    /// empty sentinel (the emitted project names the runtime as a path dependency
-    /// the build materializes). This is the property whose absence made `audit`
-    /// fail on a clean machine where `build` succeeded; a regression that re-splits
-    /// the path (calling `resolve_runtime`, which walks up for an in-repo tree and
-    /// errors when none is found) fails here.
-    #[test]
-    fn audit_runtime_resolution_needs_no_in_repo_tree_under_the_dep_model() {
-        // The dependency model is the default. Only the vendored/wasm shape needs a
-        // concrete module tree; the default does not, so resolution yields the
-        // empty sentinel with no `IPE_RUNTIME_DIR` and no in-repo walk-up.
-        let needs_vendored = !crate::runtime_dep_from_env();
-        assert!(
-            !needs_vendored,
-            "the default dependency model must not require a vendored runtime tree"
-        );
-        let resolved = crate::resolve_vendored_runtime_dir(None, needs_vendored)
-            .expect("the dep-model runtime resolution must not require an in-repo tree");
-        assert_eq!(
-            resolved,
-            PathBuf::new(),
-            "the dep-model path returns the empty sentinel; the build materializes the runtime"
-        );
-    }
-
     // --- deny_args placement tests ---
 
     /// cargo-deny >= 0.20: `--config` must appear BEFORE `check`, as a global option.
@@ -3465,7 +4015,7 @@ mod tests {
     fn deny_args_modern_places_config_before_check() {
         let manifest = Path::new("/tmp/proj/Cargo.toml");
         let config = Path::new("/ws/deny.toml");
-        let args = deny_args(20, manifest, Some(config));
+        let args = deny_args(20, manifest, config);
         let strs: Vec<&str> = args.iter().map(|a| a.to_str().unwrap()).collect();
         let check_pos = strs
             .iter()
@@ -3490,7 +4040,7 @@ mod tests {
     fn deny_args_legacy_places_config_after_check() {
         let manifest = Path::new("/tmp/proj/Cargo.toml");
         let config = Path::new("/ws/deny.toml");
-        let args = deny_args(19, manifest, Some(config));
+        let args = deny_args(19, manifest, config);
         let strs: Vec<&str> = args.iter().map(|a| a.to_str().unwrap()).collect();
         let check_pos = strs
             .iter()
@@ -3507,19 +4057,6 @@ mod tests {
         assert!(strs.contains(&"advisories"), "advisories present");
         assert!(strs.contains(&"bans"), "bans present");
         assert!(strs.contains(&"sources"), "sources present");
-    }
-
-    /// No config: neither version emits `--config` at all.
-    #[test]
-    fn deny_args_no_config_omits_flag() {
-        let manifest = Path::new("/tmp/proj/Cargo.toml");
-        for minor in [19_u32, 20] {
-            let args = deny_args(minor, manifest, None);
-            assert!(
-                !args.iter().any(|a| a.to_str() == Some("--config")),
-                "minor {minor}: --config must not appear when config is None"
-            );
-        }
     }
 
     /// A `cargo-deny` driven through a stub that runs a shell `body`.
@@ -3554,6 +4091,40 @@ mod tests {
             }
         }
 
+        /// The scratch base holding the stub at `path`.
+        fn stub_base(path: &std::path::Path) -> &std::path::Path {
+            path.parent().unwrap_or(path)
+        }
+
+        /// The scan starts in the directory the gate names, never the
+        /// caller's: cargo reads its configuration from the working directory
+        /// upward, and the caller's may be the judged package.
+        #[test]
+        fn a_scan_runs_in_the_directory_the_gate_names() {
+            let deny = stub("scan-cwd", "pwd -P");
+            let gate_dir = stub_base(&deny)
+                .canonicalize()
+                .expect("canonical scratch base");
+            let caller_dir = std::env::current_dir()
+                .and_then(|dir| dir.canonicalize())
+                .expect("canonical caller directory");
+            assert_ne!(
+                gate_dir, caller_dir,
+                "the premise: the gate's directory is not the caller's"
+            );
+            let ran = run_cargo_deny(deny.as_os_str(), &[], SUPPLY_CHAIN_SCAN_LIMITS, &gate_dir);
+            let printed = ran
+                .as_ref()
+                .ok()
+                .map(|out| PathBuf::from(String::from_utf8_lossy(&out.stdout).trim()));
+            clean(&deny);
+            assert_eq!(
+                printed,
+                Some(gate_dir),
+                "cargo-deny starts in the gate's directory, got {ran:?}"
+            );
+        }
+
         #[test]
         fn a_scan_past_its_wall_is_refused() {
             let deny = stub("scan-wall", "exec sleep 30");
@@ -3562,6 +4133,7 @@ mod tests {
                 deny.as_os_str(),
                 &[],
                 SUPPLY_CHAIN_SCAN_LIMITS.with_wall(LocalWall::of_secs::<1>()),
+                stub_base(&deny),
             );
             assert!(
                 matches!(
@@ -3584,7 +4156,12 @@ mod tests {
         #[test]
         fn a_scan_flooding_stdout_is_refused() {
             let deny = stub("scan-flood", "head -c 2097152 /dev/zero");
-            let ran = run_cargo_deny(deny.as_os_str(), &[], SUPPLY_CHAIN_SCAN_LIMITS);
+            let ran = run_cargo_deny(
+                deny.as_os_str(),
+                &[],
+                SUPPLY_CHAIN_SCAN_LIMITS,
+                stub_base(&deny),
+            );
             assert!(
                 matches!(
                     &ran,
@@ -3637,6 +4214,513 @@ mod tests {
                 "a probe past its stdout ceiling reads no version"
             );
             clean(&deny);
+        }
+    }
+
+    /// The gate's posture and policy origin: every verdict input is typed by
+    /// the gate's own installation, never read from the package or the host's
+    /// ambient state at the verdict.
+    mod gate_posture_and_policy_origin {
+        use std::collections::BTreeMap;
+
+        use super::super::{
+            Check, GATE_DENY_POLICY, GatePosture, Rejection, derive_deny_config,
+            emitted_deny_policy,
+        };
+        use super::make_test_dir;
+        use crate::CliError;
+        use crate::text;
+
+        fn bwrap() -> ipe_sandbox::Mechanism {
+            ipe_sandbox::Mechanism::Bwrap(
+                ipe_sandbox::ToolPath::assumed(
+                    std::path::Path::new("/usr/bin"),
+                    ipe_sandbox::HostTool::Bwrap,
+                )
+                .expect("an absolute directory"),
+            )
+        }
+
+        /// The regeneration rejection's message, or `None` for any other outcome.
+        fn regen_rejection(result: Result<GatePosture, CliError>) -> Option<String> {
+            match result {
+                Err(CliError::PackageAudit(Rejection {
+                    check: Check::NativeBindingRegen,
+                    message,
+                })) => Some(message),
+                Ok(_) | Err(_) => None,
+            }
+        }
+
+        #[test]
+        fn gate_posture_refuses_the_unsandboxed_override() {
+            let message = regen_rejection(GatePosture::from_facts(true, &bwrap()));
+            assert_eq!(
+                message,
+                Some(String::from(text::msg::audit_refuses_unsandboxed_override())),
+                "the developer override is a refusal of the gate even with a jail present"
+            );
+        }
+
+        #[test]
+        fn gate_posture_refuses_a_host_without_a_jail() {
+            let message = regen_rejection(GatePosture::from_facts(
+                false,
+                &ipe_sandbox::Mechanism::Refused,
+            ));
+            assert_eq!(
+                message,
+                Some(String::from(text::msg::audit_requires_a_jail())),
+                "no bubblewrap means no regeneration, never a host run"
+            );
+        }
+
+        #[test]
+        fn gate_posture_holds_under_a_jail_without_the_override() {
+            assert!(
+                GatePosture::from_facts(false, &bwrap()).is_ok(),
+                "a jailed host without the override is the one accepted posture"
+            );
+        }
+
+        #[test]
+        fn the_gate_writes_its_embedded_policy_for_every_audit() {
+            let emitted = make_test_dir("policy-embedded");
+            let written = derive_deny_config(&emitted)
+                .ok()
+                .and_then(|path| std::fs::read_to_string(path).ok());
+            assert_eq!(
+                written.as_deref(),
+                Some(emitted_deny_policy(GATE_DENY_POLICY).as_str()),
+                "the derived config is the compiler's own policy, whatever the disk holds"
+            );
+            let policy = written.unwrap_or_default();
+            assert!(
+                policy.contains("unknown-registry = \"deny\"") && policy.contains("[advisories]"),
+                "the embedded policy carries the supply-chain tables, never cargo-deny defaults"
+            );
+            let _ = std::fs::remove_dir_all(&emitted);
+        }
+
+        #[test]
+        fn the_emitted_policy_drops_only_the_graph_table() {
+            let policy = "[graph]\nfeatures = [\"full\"]\n[advisories]\nignore = []\n[sources]\nunknown-git = \"deny\"\n";
+            assert_eq!(
+                emitted_deny_policy(policy),
+                "[advisories]\nignore = []\n[sources]\nunknown-git = \"deny\"\n",
+                "the runtime crate's feature graph is dropped; every policy table is kept"
+            );
+        }
+
+        /// Names whose qualified mention in production code is an ambient read:
+        /// the process environment, the working directory, a runtime tree or
+        /// emit model found from either, the sandbox facts.
+        const AMBIENT_READS: &[&str] = &[
+            "current_dir",
+            "from_env",
+            "resolve_runtime",
+            "resolve_runtime_src",
+            "resolve_vendored_runtime_dir",
+            "runtime_dep_from_env",
+            "var",
+            "var_os",
+            "vars",
+            "vars_os",
+            "unsandboxed_override_set",
+            "probe",
+            "select_mechanism",
+        ];
+
+        /// Macros that read the build or process environment.
+        const AMBIENT_MACROS: &[&str] = &["env", "option_env"];
+
+        /// Modules and types the gate never names.
+        ///
+        /// Each offers a runtime crate, or a set of build options, that a
+        /// developer resolver fills from the environment or the working
+        /// directory; any segment of a path, a `use`, or a macro argument naming
+        /// one is a hit, alias and re-export forms included.
+        const AMBIENT_OWNERS: &[&str] = &["runtime_embed", "BuildOptions"];
+
+        /// The one production function allowed to read the sandbox facts.
+        const POSTURE_SITE: &str = "establish";
+
+        /// Whether `attrs` carry `#[cfg(test)]`.
+        fn is_cfg_test(attrs: &[syn::Attribute]) -> bool {
+            attrs.iter().any(|attr| {
+                matches!(&attr.meta, syn::Meta::List(list)
+                    if list.path.is_ident("cfg") && list.tokens.to_string() == "test")
+            })
+        }
+
+        /// Ambient reads per production scope: `(enclosing function, name) -> count`.
+        ///
+        /// A qualified path (`std::env::current_dir`, `ipe_sandbox::probe`), a
+        /// `use` of the name (which would let a bare call stand for it), a
+        /// macro path (`env!`), and a `::name` token inside any macro's
+        /// arguments all count; a bare local named like one does not. An
+        /// [`AMBIENT_OWNERS`] name counts wherever it appears in a path, a
+        /// `use` tree, or a macro's arguments. Items under `#[cfg(test)]` are
+        /// skipped.
+        #[derive(Default)]
+        struct AmbientReads {
+            scope: Vec<String>,
+            hits: BTreeMap<(String, String), usize>,
+        }
+
+        impl AmbientReads {
+            fn hit(&mut self, name: &str) {
+                let scope = self
+                    .scope
+                    .last()
+                    .cloned()
+                    .unwrap_or_else(|| String::from("<item>"));
+                *self.hits.entry((scope, String::from(name))).or_insert(0) += 1;
+            }
+
+            fn qualified_path(&mut self, path: &syn::Path) {
+                for segment in &path.segments {
+                    if let Some(owner) = AMBIENT_OWNERS.iter().find(|n| segment.ident == **n) {
+                        self.hit(owner);
+                    }
+                }
+                if path.segments.len() < 2 {
+                    return;
+                }
+                if let Some(last) = path.segments.last()
+                    && let Some(name) = AMBIENT_READS.iter().find(|n| last.ident == **n)
+                {
+                    self.hit(name);
+                }
+            }
+
+            /// Every `::name` ident, and every owner ident, of a macro's unparsed tokens.
+            fn tokens(&mut self, stream: proc_macro2::TokenStream) {
+                let mut after_colon = false;
+                for tree in stream {
+                    match tree {
+                        proc_macro2::TokenTree::Ident(ident) => {
+                            if let Some(owner) = AMBIENT_OWNERS.iter().find(|n| ident == **n) {
+                                self.hit(owner);
+                            }
+                            if after_colon
+                                && let Some(name) = AMBIENT_READS.iter().find(|n| ident == **n)
+                            {
+                                self.hit(name);
+                            }
+                            after_colon = false;
+                        }
+                        proc_macro2::TokenTree::Group(group) => {
+                            self.tokens(group.stream());
+                            after_colon = false;
+                        }
+                        proc_macro2::TokenTree::Punct(punct) => {
+                            after_colon = punct.as_char() == ':';
+                        }
+                        proc_macro2::TokenTree::Literal(_) => after_colon = false,
+                    }
+                }
+            }
+        }
+
+        impl<'ast> syn::visit::Visit<'ast> for AmbientReads {
+            fn visit_item_mod(&mut self, m: &'ast syn::ItemMod) {
+                if !is_cfg_test(&m.attrs) {
+                    syn::visit::visit_item_mod(self, m);
+                }
+            }
+
+            fn visit_item_impl(&mut self, imp: &'ast syn::ItemImpl) {
+                if !is_cfg_test(&imp.attrs) {
+                    syn::visit::visit_item_impl(self, imp);
+                }
+            }
+
+            fn visit_item_trait(&mut self, tr: &'ast syn::ItemTrait) {
+                if !is_cfg_test(&tr.attrs) {
+                    syn::visit::visit_item_trait(self, tr);
+                }
+            }
+
+            fn visit_item_use(&mut self, u: &'ast syn::ItemUse) {
+                if !is_cfg_test(&u.attrs) {
+                    syn::visit::visit_item_use(self, u);
+                }
+            }
+
+            fn visit_item_const(&mut self, c: &'ast syn::ItemConst) {
+                if !is_cfg_test(&c.attrs) {
+                    syn::visit::visit_item_const(self, c);
+                }
+            }
+
+            fn visit_item_static(&mut self, s: &'ast syn::ItemStatic) {
+                if !is_cfg_test(&s.attrs) {
+                    syn::visit::visit_item_static(self, s);
+                }
+            }
+
+            fn visit_item_fn(&mut self, f: &'ast syn::ItemFn) {
+                if is_cfg_test(&f.attrs) {
+                    return;
+                }
+                self.scope.push(f.sig.ident.to_string());
+                syn::visit::visit_item_fn(self, f);
+                self.scope.pop();
+            }
+
+            fn visit_impl_item_fn(&mut self, f: &'ast syn::ImplItemFn) {
+                if is_cfg_test(&f.attrs) {
+                    return;
+                }
+                self.scope.push(f.sig.ident.to_string());
+                syn::visit::visit_impl_item_fn(self, f);
+                self.scope.pop();
+            }
+
+            fn visit_trait_item_fn(&mut self, f: &'ast syn::TraitItemFn) {
+                if is_cfg_test(&f.attrs) {
+                    return;
+                }
+                self.scope.push(f.sig.ident.to_string());
+                syn::visit::visit_trait_item_fn(self, f);
+                self.scope.pop();
+            }
+
+            fn visit_path(&mut self, path: &'ast syn::Path) {
+                self.qualified_path(path);
+                syn::visit::visit_path(self, path);
+            }
+
+            fn visit_use_path(&mut self, path: &'ast syn::UsePath) {
+                if let Some(owner) = AMBIENT_OWNERS.iter().find(|n| path.ident == **n) {
+                    self.hit(owner);
+                }
+                syn::visit::visit_use_path(self, path);
+            }
+
+            fn visit_use_name(&mut self, name: &'ast syn::UseName) {
+                if let Some(found) = AMBIENT_READS
+                    .iter()
+                    .chain(AMBIENT_OWNERS)
+                    .find(|n| name.ident == **n)
+                {
+                    self.hit(found);
+                }
+            }
+
+            fn visit_use_rename(&mut self, rename: &'ast syn::UseRename) {
+                if let Some(found) = AMBIENT_READS
+                    .iter()
+                    .chain(AMBIENT_OWNERS)
+                    .find(|n| rename.ident == **n)
+                {
+                    self.hit(found);
+                }
+            }
+
+            fn visit_macro(&mut self, mac: &'ast syn::Macro) {
+                if let Some(last) = mac.path.segments.last()
+                    && let Some(name) = AMBIENT_MACROS.iter().find(|n| last.ident == **n)
+                {
+                    self.hit(name);
+                }
+                self.tokens(mac.tokens.clone());
+                syn::visit::visit_macro(self, mac);
+            }
+        }
+
+        /// The ambient reads of `src`'s production code; `None` when it does not parse.
+        fn ambient_reads(src: &str) -> Option<BTreeMap<(String, String), usize>> {
+            use syn::visit::Visit as _;
+            let file = syn::parse_file(src).ok()?;
+            let mut scan = AmbientReads::default();
+            scan.visit_file(&file);
+            Some(scan.hits)
+        }
+
+        const AUDIT_SOURCE: &str = include_str!("audit.rs");
+
+        #[test]
+        fn audit_source_reads_no_environment_or_cwd() {
+            let hits = ambient_reads(AUDIT_SOURCE);
+            assert!(hits.is_some(), "audit.rs parses");
+            let Some(hits) = hits else { return };
+
+            let mut expected = BTreeMap::new();
+            for name in ["unsandboxed_override_set", "probe", "select_mechanism"] {
+                expected.insert((String::from(POSTURE_SITE), String::from(name)), 1);
+            }
+            assert_eq!(
+                hits, expected,
+                "the sandbox facts are read once, in `GatePosture::establish`; the \
+                 environment and the working directory are read nowhere (a stale \
+                 allowlist is red too)"
+            );
+        }
+
+        #[test]
+        fn the_ambient_scan_sees_a_working_directory_read() {
+            let mutated = format!(
+                "{AUDIT_SOURCE}\nfn smuggled() -> std::io::Result<PathBuf> {{ std::env::current_dir() }}\n"
+            );
+            let hits = ambient_reads(&mutated).unwrap_or_default();
+            assert_eq!(
+                hits.get(&(String::from("smuggled"), String::from("current_dir"))),
+                Some(&1),
+                "a qualified working-directory read in a production function is a hit"
+            );
+        }
+
+        #[test]
+        fn the_ambient_scan_sees_a_runtime_tree_resolution() {
+            let mutated = format!(
+                "{AUDIT_SOURCE}\nfn policy_beside_runtime() -> bool {{ crate::resolve_runtime().is_ok() }}\n"
+            );
+            let hits = ambient_reads(&mutated).unwrap_or_default();
+            assert_eq!(
+                hits.get(&(
+                    String::from("policy_beside_runtime"),
+                    String::from("resolve_runtime")
+                )),
+                Some(&1),
+                "a runtime tree resolved from the cwd or the environment is an ambient read"
+            );
+        }
+
+        #[test]
+        fn the_ambient_scan_sees_a_vendored_runtime_resolution() {
+            let mutated = format!(
+                "{AUDIT_SOURCE}\nfn vendored_tree() -> bool {{ crate::resolve_vendored_runtime_dir(None, true).is_ok() }}\n"
+            );
+            let hits = ambient_reads(&mutated).unwrap_or_default();
+            assert_eq!(
+                hits.get(&(
+                    String::from("vendored_tree"),
+                    String::from("resolve_vendored_runtime_dir")
+                )),
+                Some(&1),
+                "a vendored runtime tree resolved from the cwd or the environment is a hit"
+            );
+        }
+
+        #[test]
+        fn the_ambient_scan_sees_an_environment_emit_model() {
+            let mutated = format!(
+                "{AUDIT_SOURCE}\nfn emit_model() -> bool {{ crate::runtime_dep_from_env() }}\n"
+            );
+            let hits = ambient_reads(&mutated).unwrap_or_default();
+            assert_eq!(
+                hits.get(&(
+                    String::from("emit_model"),
+                    String::from("runtime_dep_from_env")
+                )),
+                Some(&1),
+                "an emit model read from the environment is a hit"
+            );
+        }
+
+        #[test]
+        fn the_ambient_scan_sees_caller_build_options() {
+            let mutated = format!(
+                "{AUDIT_SOURCE}\nfn options() -> bool {{ crate::driver::BuildOptions::from_env().runtime_dep }}\n"
+            );
+            let hits = ambient_reads(&mutated).unwrap_or_default();
+            for name in ["BuildOptions", "from_env"] {
+                assert_eq!(
+                    hits.get(&(String::from("options"), String::from(name))),
+                    Some(&1),
+                    "build options filled from the environment are a hit ({name})"
+                );
+            }
+        }
+
+        #[test]
+        fn the_ambient_scan_sees_the_runtime_resolver_through_an_alias() {
+            let mutated = format!(
+                "{AUDIT_SOURCE}\nuse crate::runtime_embed as embedded;\n\
+                 fn linked() -> bool {{ embedded::resolve().is_ok() }}\n"
+            );
+            let hits = ambient_reads(&mutated).unwrap_or_default();
+            assert_eq!(
+                hits.get(&(String::from("<item>"), String::from("runtime_embed"))),
+                Some(&1),
+                "importing the runtime resolver's module under another name is a hit"
+            );
+        }
+
+        #[test]
+        fn the_ambient_scan_sees_the_runtime_resolver_by_path_use_and_macro() {
+            let mutated = format!(
+                "{AUDIT_SOURCE}\nfn by_path() -> bool {{ crate::runtime_embed::resolve().is_ok() }}\n\
+                 fn in_args() -> String {{ format!(\"{{:?}}\", crate::runtime_embed::resolve().is_ok()) }}\n\
+                 use crate::runtime_embed::{{resolve as linked}};\n"
+            );
+            let hits = ambient_reads(&mutated).unwrap_or_default();
+            for scope in ["by_path", "in_args", "<item>"] {
+                assert_eq!(
+                    hits.get(&(String::from(scope), String::from("runtime_embed"))),
+                    Some(&1),
+                    "the runtime resolver's module named in `{scope}` is a hit"
+                );
+            }
+        }
+
+        #[test]
+        fn the_ambient_scan_sees_an_imported_environment_reader() {
+            let mutated = format!("{AUDIT_SOURCE}\nuse std::env::var_os as read_setting;\n");
+            let hits = ambient_reads(&mutated).unwrap_or_default();
+            assert_eq!(
+                hits.get(&(String::from("<item>"), String::from("var_os"))),
+                Some(&1),
+                "importing an environment reader under another name is a hit"
+            );
+        }
+
+        #[test]
+        fn the_ambient_scan_sees_a_second_posture_read() {
+            let mutated = format!(
+                "{AUDIT_SOURCE}\nfn second_look() -> bool {{ ipe_sandbox::unsandboxed_override_set() }}\n"
+            );
+            let hits = ambient_reads(&mutated).unwrap_or_default();
+            assert_eq!(
+                hits.get(&(
+                    String::from("second_look"),
+                    String::from("unsandboxed_override_set")
+                )),
+                Some(&1),
+                "a second read of the override outside the posture site is a hit"
+            );
+        }
+
+        #[test]
+        fn the_ambient_scan_sees_a_read_hidden_in_macro_arguments() {
+            let mutated = format!(
+                "{AUDIT_SOURCE}\nfn in_macro() -> String {{ format!(\"{{:?}}\", std::env::current_dir()) }}\n"
+            );
+            let hits = ambient_reads(&mutated).unwrap_or_default();
+            assert_eq!(
+                hits.get(&(String::from("in_macro"), String::from("current_dir"))),
+                Some(&1),
+                "a read inside a macro's arguments is a hit"
+            );
+        }
+
+        #[test]
+        fn the_ambient_scan_ignores_a_bare_local_and_test_code() {
+            let mutated = format!(
+                "{AUDIT_SOURCE}\nfn local_named_probe() -> u8 {{ let probe = 1; probe }}\n\
+                 #[cfg(test)]\nfn only_in_tests() -> std::io::Result<PathBuf> {{ std::env::current_dir() }}\n"
+            );
+            let hits = ambient_reads(&mutated).unwrap_or_default();
+            assert!(
+                !hits.contains_key(&(String::from("local_named_probe"), String::from("probe"))),
+                "a bare local is not a sandbox read"
+            );
+            assert!(
+                !hits.contains_key(&(String::from("only_in_tests"), String::from("current_dir"))),
+                "test-only code is outside the scan"
+            );
         }
     }
 }

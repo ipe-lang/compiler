@@ -10,11 +10,10 @@
 //! the program (exit 0) but the emitted Rust failed `cargo build` with E0308 —
 //! a seal break (the `examples/37-composite-live-shop` blocker).
 //!
-//! The fix (mirroring the reference's uniform-Arc callback policy and this
-//! crate's existing `ui_on_input_` / `ui_on_change_` arms) eta-wraps each Input
-//! callback field in `::std::sync::Arc::new(move |_x| (f)(_x))` at the
-//! call-argument boundary, so it fills the Arc slot regardless of how the field
-//! expression lowered.
+//! Each Input callback field is an adapted slot in handler normal form (`let`s
+//! around one closure literal); the emitter places that closure in
+//! `::std::sync::Arc::new(..)` at the call-argument boundary, so it fills the
+//! Arc slot regardless of how the field expression was written.
 //!
 //! The two non-E2E goldens for these kernels (`golden_i148_input_slider`,
 //! `golden_i155_input_radio_row`) only check ipe lowering — they never run
@@ -43,7 +42,7 @@ fn repo_root() -> PathBuf {
     std::fs::canonicalize(&joined).unwrap_or(joined)
 }
 
-/// Compile / build / run `tests/golden/input_callback_maybe_field/Main.ipe`.
+/// Compile / build / run `tests/golden/input_callback_maybe_field/src/Main.ipe`.
 /// Gated on `IPE_E2E=1`. The `cargo build` step is where the seal is enforced:
 /// a `Box`-vs-`Arc` callback mismatch fails the build (E0308), failing this
 /// test hard.
@@ -53,12 +52,11 @@ fn build_run_input_callback() -> crate::support::RunOutcome {
         .join("tests")
         .join("golden")
         .join("input_callback_maybe_field");
-    let entry = dir.join("Main.ipe");
     let out = crate::support::scratch_root().join("ipec_m7_input_callback_maybe_field_e2e");
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
-    let built = ipe::build(&entry, &out, &runtime);
+    let built = crate::support::build_golden(&dir, &out, &runtime);
     assert!(
         built.is_ok(),
         "ipe dev build must succeed for input_callback_maybe_field: {:?}",

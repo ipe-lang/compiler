@@ -27,21 +27,19 @@ fn compile_files(
     test_name: &str,
     files: &[(&str, &str)],
 ) -> Result<Result<(), ipe::CliError>, BoxError> {
-    let ipe_dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
-        .join(format!("tea_surface_{test_name}_ipe"));
-    let _ = std::fs::remove_dir_all(&ipe_dir);
-    std::fs::create_dir_all(&ipe_dir)?;
-    for (name, source) in files {
-        std::fs::write(ipe_dir.join(name), source)?;
-    }
-    let entry = ipe_dir.join("Main.ipe");
+    let tree = files.iter().fold(
+        ipe::project_root::SourceTree::new(),
+        |tree, (name, source)| tree.module(name.trim_end_matches(".ipe"), source),
+    );
+    let fixture = ipe::RootFixture::from_tree(&tree)
+        .map_err(|e| -> BoxError { format!("{test_name}: fixture: {e}").into() })?;
 
     let out_dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
         .join(format!("tea_surface_{test_name}_out"));
     let _ = std::fs::remove_dir_all(&out_dir);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
-    Ok(ipe::build_loose_file(&entry, &out_dir, &runtime))
+    Ok(ipe::build_fixture(&fixture, &out_dir, &runtime).map(drop))
 }
 
 fn assert_accepted(test_name: &str, source: &str) -> Result<(), BoxError> {

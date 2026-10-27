@@ -27,6 +27,7 @@ pub mod clean;
 pub mod cli_args;
 pub mod cli_docs;
 pub mod cli_transcript;
+mod compile_stack;
 pub mod contained_path;
 pub mod control_model_consent;
 pub mod coverage;
@@ -64,6 +65,7 @@ pub mod package_name;
 pub mod pkg;
 pub mod progress;
 pub mod project;
+pub mod project_root;
 pub mod proven_dir;
 pub mod publish;
 pub mod published_version;
@@ -77,8 +79,10 @@ pub mod scratch;
 pub mod screen;
 pub mod secret_file;
 pub mod signing;
+mod source_snapshot;
 pub mod ssh_signing_key;
 pub mod style;
+mod target_dir;
 #[cfg(unix)]
 mod terminate;
 pub mod text;
@@ -323,19 +327,25 @@ pub use driver::{
     RuntimeContext, UPGRADE_TAG_FILE_ENV, UPGRADE_WRAPPED_ENV, apply_fixes, bluegreen_enabled,
     build, build_loose_file, build_loose_file_with_options, build_project,
     build_project_with_options, build_with_options, code_index, compile_prepared,
-    create_source_root, emit_ir_text, explain_lookup, front_check_entry, hot_appearance_enabled,
+    create_source_root, emit_ir_text, explain_lookup, front_check, hot_appearance_enabled,
     infer_package_capabilities, infer_package_capabilities_in, resolve_runtime, run_cli,
     run_upgrade, runtime_dep_from_env, select_non_overlapping, verify_capabilities,
     watch_banner_enabled,
 };
+#[cfg(any(test, feature = "test-fixtures"))]
+pub use driver::{emitted_bin_filename, emitted_bin_name};
+#[cfg(any(test, feature = "test-fixtures"))]
+pub use project_root::fixture::{
+    BuiltFixture, RootFixture, build_fixture, build_fixture_for, build_fixture_with_options,
+};
+#[cfg(any(test, feature = "test-fixtures"))]
+pub use project_root::golden::build_golden_dir;
 // Crate-internal driver items reached as `crate::…` by sibling modules
 // (`watch`, `pkg`, …). Kept `pub(crate)` so no originally-private helper widens
 // to public API; the block above re-exports the genuine public surface as `pub`.
 pub(crate) use driver::{
-    DevMarkedCrate, RewriteKind, build_source_graph, capabilities_including_served_widgets,
-    default_entry, find_manifest_for_ipe_file, force_cargo_terminal_ui, io_err,
-    lower_entry_via_graph, read_progress_chunk, read_yes_no, read_yes_no_default,
-    resolve_vendored_runtime_dir, rewrite_user_file, rewrite_walked_file, run_capabilities,
-    run_fix, run_installer, run_package, run_test, run_type_check, run_verify, run_version,
-    typecheck_entry_via_graph, write_emitted_project,
+    DevMarkedCrate, RewriteKind, find_manifest_for_ipe_file, force_cargo_terminal_ui, io_err,
+    read_progress_chunk, read_yes_no, read_yes_no_default, rewrite_user_file, rewrite_walked_file,
+    run_capabilities, run_fix, run_installer, run_package, run_test, run_type_check, run_verify,
+    run_version, write_emitted_project,
 };

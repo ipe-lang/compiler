@@ -140,12 +140,10 @@ impl std::fmt::Display for ToolchainMissing {
     }
 }
 
-/// The executable name of `cargo` for the host platform.
-#[cfg(windows)]
-const CARGO_EXE: &str = "cargo.exe";
-/// The executable name of `cargo` for the host platform.
-#[cfg(not(windows))]
-const CARGO_EXE: &str = "cargo";
+/// The executable file name of `cargo` on this host.
+fn cargo_exe() -> String {
+    crate::health::exe_name("cargo", ipe_path_core::HOST)
+}
 
 /// Resolve `cargo`, or produce a typed [`ToolchainMissing`].
 ///
@@ -211,15 +209,16 @@ enum Resolution {
 /// `PATH`". Pure over its inputs — it reads only the filesystem, never the
 /// environment — so callers and tests supply the search space explicitly.
 fn resolve(path_var: &OsString, install_dirs: &[PathBuf]) -> Resolution {
+    let exe = cargo_exe();
     if let Some(found) = std::env::split_paths(path_var)
-        .map(|dir| dir.join(CARGO_EXE))
+        .map(|dir| dir.join(&exe))
         .find(|candidate| is_executable_file(candidate))
     {
         return Resolution::Found(found);
     }
     let disposition = install_dirs
         .iter()
-        .find(|dir| is_executable_file(&dir.join(CARGO_EXE)))
+        .find(|dir| is_executable_file(&dir.join(&exe)))
         .map_or(Disposition::NotInstalled, |dir| Disposition::NotOnPath {
             found_in: TerminalSafe::sanitize(&dir.display().to_string()),
         });
@@ -429,6 +428,77 @@ impl RustcVersion {
     }
 }
 
+/// The active toolchain's sysroot, read from `rustc --print sysroot`.
+///
+/// Holding one is proof the report was read within [`RUSTC_QUERY_LIMITS`] and
+/// was one UTF-8 line naming an absolute path, with no control character.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RustcSysroot(PathBuf);
+
+/// Why the active toolchain's sysroot could not be read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RustcSysrootRefusal {
+    /// The child failed to run or crossed its ceiling.
+    Run(RustcRunFailure),
+    /// The child exited unsuccessfully.
+    Exit(ExitStatus),
+    /// The report is not one UTF-8 line naming an absolute path.
+    Malformed,
+}
+
+impl RustcSysroot {
+    /// Parse a `rustc --print sysroot` report: one line, its trailing line ending dropped.
+    ///
+    /// # Errors
+    /// [`RustcSysrootRefusal::Malformed`] when `stdout` is not UTF-8, holds a
+    /// control character or a second line, or names a relative path.
+    pub fn parse(stdout: &[u8]) -> Result<Self, RustcSysrootRefusal> {
+        let text = std::str::from_utf8(stdout).map_err(|_| RustcSysrootRefusal::Malformed)?;
+        let line = text
+            .strip_suffix('\n')
+            .map_or(text, |rest| rest.strip_suffix('\r').unwrap_or(rest));
+        let path = Path::new(line);
+        if line.is_empty() || line.chars().any(char::is_control) || !path.is_absolute() {
+            return Err(RustcSysrootRefusal::Malformed);
+        }
+        Ok(Self(path.to_path_buf()))
+    }
+
+    /// The sysroot of the `rustc` on the `PATH`, queried once per process.
+    ///
+    /// # Errors
+    /// The [`RustcSysrootRefusal`] of the one query, returned again on every call.
+    pub fn active() -> Result<&'static Self, RustcSysrootRefusal> {
+        static ACTIVE: OnceLock<Result<RustcSysroot, RustcSysrootRefusal>> = OnceLock::new();
+        ACTIVE
+            .get_or_init(|| Self::query(Command::new("rustc"), RUSTC_QUERY_LIMITS))
+            .as_ref()
+            .map_err(Clone::clone)
+    }
+
+    /// Run `rustc` with `--print sysroot` under `ceiling` and parse its report.
+    ///
+    /// # Errors
+    /// [`RustcSysrootRefusal::Run`] when the child fails or crosses `ceiling`,
+    /// [`RustcSysrootRefusal::Exit`] when it exits unsuccessfully, and
+    /// [`RustcSysrootRefusal::Malformed`] when its report breaks the grammar.
+    pub fn query(mut rustc: Command, ceiling: LocalCeiling) -> Result<Self, RustcSysrootRefusal> {
+        rustc.args(["--print", "sysroot"]);
+        let captured = run_local(rustc, ceiling, LocalSource::RustcSysroot)
+            .map_err(|e| RustcSysrootRefusal::Run(e.into()))?;
+        if !captured.status.success() {
+            return Err(RustcSysrootRefusal::Exit(captured.status));
+        }
+        Self::parse(&captured.stdout)
+    }
+
+    /// The sysroot directory.
+    #[must_use]
+    pub fn path(&self) -> &Path {
+        &self.0
+    }
+}
+
 /// Whether `key` is a report key: an ASCII letter, then letters, digits, `-` or inner spaces.
 fn is_report_key(key: &str) -> bool {
     key.chars().next().is_some_and(|c| c.is_ascii_alphabetic())
@@ -504,7 +574,7 @@ mod tests {
                 ipe_test_temp::temp_root().join(format!("ipe_tc_{tag}_{}", std::process::id()));
             let created = std::fs::create_dir_all(&dir);
             assert!(created.is_ok(), "create probe dir: {created:?}");
-            let cargo = dir.join(CARGO_EXE);
+            let cargo = dir.join(cargo_exe());
             let wrote = std::fs::write(&cargo, b"#!/bin/sh\n");
             assert!(wrote.is_ok(), "write dummy cargo: {wrote:?}");
             #[cfg(unix)]
@@ -560,7 +630,7 @@ mod tests {
         let probe = ProbeDir::with_cargo("onpath");
         let path_var = OsString::from(probe.dir());
         match resolve(&path_var, &[]) {
-            Resolution::Found(found) => assert_eq!(found, probe.dir().join(CARGO_EXE)),
+            Resolution::Found(found) => assert_eq!(found, probe.dir().join(cargo_exe())),
             Resolution::Missing(d) => panic!("expected a resolved cargo, got {d:?}"),
         }
     }

@@ -18,7 +18,7 @@
 //! refused at registration (the route table fails to start, see
 //! [`check_route_table`]) instead of silently never matching. A parameter
 //! name is admitted through the runtime's one parameter-name grammar
-//! ([`ParamNames`]): an empty, non-identifier or repeated name is refused the
+//! ([`ParamNames`](crate::encoding::ParamNames)): an empty, non-identifier or repeated name is refused the
 //! same way, so no route captures a value under an ambiguous name.
 //!
 //! The builder returns `Option<Page>` so that a `:param` segment that fails to
@@ -28,110 +28,14 @@
 
 use std::sync::Arc;
 
-pub use crate::encoding::DecodedPath;
-use crate::encoding::{
-    DecodeRefusal, EncodeRefusal, MAX_URL_COMPONENT_LEN, ParamName, ParamNameRefusal, ParamNames,
-    decode_path_segment, encode_path_segment, raw_path_segments,
+use crate::encoding::{DecodeRefusal, EncodeRefusal, MAX_URL_COMPONENT_LEN, encode_path_segment};
+pub use crate::encoding::{
+    DecodedPath, PatternSeg, RouteParams, RoutePattern, RoutePatternRefusal, RouteSegmentRefusal,
+    match_route,
 };
-#[cfg(feature = "server")]
+#[cfg(feature = "web")]
 use crate::encoding::{EncodedBase, QueryText};
-
-/// One segment of a parsed route pattern.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum PatternSeg {
-    /// A literal segment, already decoded: it must equal the decoded request
-    /// segment.
-    Literal(String),
-    /// A `:name` segment: captures the decoded request segment as `name`.
-    Param(ParamName),
-}
-
-/// A route pattern parsed once, at registration.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct RoutePattern(Vec<PatternSeg>);
-
-impl RoutePattern {
-    /// Split `pattern` by the request-path split rule and classify each raw
-    /// segment: a leading `:` makes a parameter whose name is admitted by
-    /// [`ParamNames::admit`]; anything else is a literal decoded by the strict
-    /// path-segment decoder.
-    ///
-    /// # Errors
-    ///
-    /// The refusal of the first malformed segment: a literal that does not
-    /// decode, a parameter name that is empty, not an identifier or a repeat,
-    /// or `TooLong` for an oversized pattern.
-    pub fn parse(pattern: &str) -> Result<Self, RouteSegmentRefusal> {
-        let mut names = ParamNames::default();
-        raw_path_segments(pattern)
-            .map_err(RouteSegmentRefusal::Decode)?
-            .into_iter()
-            .map(|raw| match raw.strip_prefix(':') {
-                Some(name) => names
-                    .admit(name)
-                    .map(PatternSeg::Param)
-                    .map_err(RouteSegmentRefusal::ParamName),
-                None => decode_path_segment(raw)
-                    .map(PatternSeg::Literal)
-                    .map_err(RouteSegmentRefusal::Decode),
-            })
-            .collect::<Result<Vec<_>, _>>()
-            .map(Self)
-    }
-
-    /// The parsed segments, in pattern order.
-    #[must_use]
-    pub fn segments(&self) -> &[PatternSeg] {
-        &self.0
-    }
-
-    /// The `:name`s of the parameter segments, in pattern order.
-    fn param_names(&self) -> impl Iterator<Item = &str> {
-        self.0.iter().filter_map(|seg| match seg {
-            PatternSeg::Param(name) => Some(name.as_str()),
-            PatternSeg::Literal(_) => None,
-        })
-    }
-}
-
-/// Why one segment of a route pattern was refused.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum RouteSegmentRefusal {
-    /// A literal segment (or the whole pattern) does not decode.
-    Decode(DecodeRefusal),
-    /// A `:name` segment's name is empty, not an identifier, or a repeat.
-    ParamName(ParamNameRefusal),
-}
-
-impl std::fmt::Display for RouteSegmentRefusal {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Decode(refusal) => write!(f, "{refusal}"),
-            Self::ParamName(refusal) => write!(f, "{refusal}"),
-        }
-    }
-}
-
-/// A route pattern refused at registration: the raw pattern text and why it
-/// did not parse.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct RoutePatternRefusal {
-    /// The pattern text as registered.
-    pub pattern: String,
-    /// Why its first malformed segment was refused.
-    pub refusal: RouteSegmentRefusal,
-}
-
-impl std::fmt::Display for RoutePatternRefusal {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "route pattern `{}` is malformed: {}",
-            crate::system::scrub_log_controls(&self.pattern),
-            self.refusal
-        )
-    }
-}
+use crate::system::RefusedText;
 
 /// A declared route: a parsed URL pattern + a builder that applies the
 /// captured `:param` strings (in pattern order) to the page constructor.
@@ -162,7 +66,7 @@ impl<Page> Route<Page> {
     ) -> Self {
         Route {
             pattern: RoutePattern::parse(pattern).map_err(|refusal| RoutePatternRefusal {
-                pattern: pattern.to_owned(),
+                pattern: RefusedText::new(pattern),
                 refusal,
             }),
             build: Arc::new(build),
@@ -291,6 +195,25 @@ pub fn console_line(class: Option<&str>, detail: &str) -> String {
     }
 }
 
+/// The browser-console line for a mount refusal: `[ipe-wasm:<class>] <refusal>`.
+///
+/// A [`MountRefusal`]'s `Display` is already safe for a log line (every text
+/// it quotes is scrubbed exactly once, where the refusal is built or by its
+/// own `Display`), so routing it through [`console_line`] would scrub it twice
+/// and double every `\` it shows. This sink checks the rendered refusal
+/// instead: hazard-free text is written as is, and only text holding a log
+/// hazard (which no refusal renders) is scrubbed again, failing closed.
+pub fn console_refusal_line(class: &str, refusal: &MountRefusal) -> String {
+    use crate::system::{is_log_hazard, scrub_log_controls as scrub};
+    let shown = refusal.to_string();
+    let shown = if shown.chars().any(is_log_hazard) {
+        scrub(&shown).into_owned()
+    } else {
+        shown
+    };
+    format!("[ipe-wasm:{}] {shown}", scrub(class))
+}
+
 /// Why the browser client refused to mount an app.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum MountRefusal {
@@ -309,14 +232,14 @@ pub enum MountRefusal {
         /// The DOM event name.
         event: &'static str,
         /// The platform's report.
-        detail: String,
+        detail: RefusedText,
     },
     /// A DOM construction step failed.
     Dom {
         /// The step that failed.
         step: &'static str,
         /// The platform's report, when it gave one.
-        detail: Option<String>,
+        detail: Option<RefusedText>,
     },
 }
 
@@ -329,17 +252,14 @@ impl std::fmt::Display for MountRefusal {
             Self::NoWindow => f.write_str("no window (not a browser context)"),
             Self::NoDocument => f.write_str("the window has no document"),
             Self::NoBody => f.write_str("the document has no <body>"),
-            Self::Listener { event, detail } => write!(
-                f,
-                "addEventListener({}) failed: {}",
-                scrub(event),
-                scrub(detail)
-            ),
+            Self::Listener { event, detail } => {
+                write!(f, "addEventListener({}) failed: {detail}", scrub(event))
+            }
             Self::Dom { step, detail: None } => write!(f, "{} failed", scrub(step)),
             Self::Dom {
                 step,
                 detail: Some(detail),
-            } => write!(f, "{} failed: {}", scrub(step), scrub(detail)),
+            } => write!(f, "{} failed: {detail}", scrub(step)),
         }
     }
 }
@@ -356,47 +276,6 @@ impl From<MountRefusal> for crate::error::IpeError {
             | MountRefusal::Dom { .. } => Self::unavailable(message),
         }
     }
-}
-
-/// The decoded values a route pattern's `:param` segments captured, in
-/// pattern order.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct RouteParams(Vec<String>);
-
-impl RouteParams {
-    /// The `i`-th captured value, if the pattern has that many params.
-    #[must_use]
-    pub fn get(&self, i: usize) -> Option<&str> {
-        self.0.get(i).map(String::as_str)
-    }
-
-    /// The captured values, for a route builder.
-    #[must_use]
-    pub fn into_segments(self) -> Vec<String> {
-        self.0
-    }
-}
-
-/// Match a decoded `path` against a parsed `pattern`: equal segment counts; a
-/// `:name` segment captures the corresponding decoded segment; a literal
-/// segment (decoded at registration) must equal it. Returns the captured
-/// params in pattern order, or `None`.
-#[must_use]
-pub fn match_route(pattern: &RoutePattern, path: &DecodedPath) -> Option<RouteParams> {
-    let pat = pattern.segments();
-    let segs = path.segments();
-    if pat.len() != segs.len() {
-        return None;
-    }
-    let mut params = Vec::new();
-    for (ps, us) in pat.iter().zip(segs) {
-        match ps {
-            PatternSeg::Param(_) => params.push(us.clone()),
-            PatternSeg::Literal(lit) if lit == us => {}
-            PatternSeg::Literal(_) => return None,
-        }
-    }
-    Some(RouteParams(params))
 }
 
 /// The first route (declaration order) whose pattern matches `path` AND whose
@@ -559,13 +438,13 @@ pub fn resolve<Page>(
 }
 
 /// A same-origin `Location` for a non-canonical page path.
-#[cfg(feature = "server")]
+#[cfg(feature = "web")]
 #[derive(Clone, Debug)]
 pub struct CanonicalRedirect {
     location: axum::http::HeaderValue,
 }
 
-#[cfg(feature = "server")]
+#[cfg(feature = "web")]
 impl CanonicalRedirect {
     /// The `Location` header value: the base, the canonical path, then the
     /// request's query unchanged.
@@ -576,7 +455,7 @@ impl CanonicalRedirect {
 }
 
 /// What the page handler does with a GET before it enters the page.
-#[cfg(feature = "server")]
+#[cfg(feature = "web")]
 #[derive(Clone, Debug)]
 pub enum Redirect {
     /// The request path is canonical: serve it.
@@ -589,18 +468,21 @@ pub enum Redirect {
 
 /// Decide whether a matched GET redirects to its canonical path.
 ///
-/// `raw_path` is the base-relative request path as sent, compared byte for
-/// byte with the canonical one. The redirect target is always `base` plus a
-/// [`RoutePath`] (every segment encoded, never `//`), so it stays on this
-/// origin whatever the request held.
-#[cfg(feature = "server")]
+/// `path` is the base-relative request path the router saw, compared byte for
+/// byte with the canonical one, and `spelling` is how the client spelled the
+/// whole path, so a request the listener respelled is redirected even when
+/// its respelled text already matches. The redirect target is always `base`
+/// plus a [`RoutePath`] (every segment encoded, never `//`), so it stays on
+/// this origin whatever the request held.
+#[cfg(feature = "web")]
 pub fn canonical_redirect(
     base: &EncodedBase,
-    raw_path: &str,
+    spelling: crate::server::Spelling,
+    path: &str,
     raw_query: Option<&str>,
     canonical: &RoutePath,
 ) -> Redirect {
-    if raw_path == canonical.as_str() {
+    if spelling == crate::server::Spelling::Canonical && path == canonical.as_str() {
         return Redirect::Serve;
     }
     let mut location = String::from(base.as_str());
@@ -886,7 +768,7 @@ mod tests {
         assert!(!match_params(&rs, &dp("/nope")).contains_key("key"));
     }
 
-    #[cfg(feature = "server")]
+    #[cfg(feature = "web")]
     fn base(path: &str) -> EncodedBase {
         match EncodedBase::encode(&dp(path)) {
             Ok(b) => b,
@@ -894,7 +776,10 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "server")]
+    #[cfg(feature = "web")]
+    use crate::server::Spelling::{Canonical, Respelled};
+
+    #[cfg(feature = "web")]
     fn location_of(redirect: &Redirect) -> String {
         match redirect {
             Redirect::To(target) => match target.location().to_str() {
@@ -907,28 +792,43 @@ mod tests {
 
     /// A canonical request is served; any other spelling redirects to base
     /// plus the canonical path, the query carried unchanged.
-    #[cfg(feature = "server")]
+    #[cfg(feature = "web")]
     #[test]
     fn canonical_redirect_targets_base_plus_canonical() {
         let canon = canonical_of("/apps/foo/");
         assert!(matches!(
-            canonical_redirect(&base("/"), "/apps/foo", None, &canon),
+            canonical_redirect(&base("/"), Canonical, "/apps/foo", None, &canon),
             Redirect::Serve
         ));
-        let to = canonical_redirect(&base("/"), "/apps/foo/", None, &canon);
+        let to = canonical_redirect(&base("/"), Canonical, "/apps/foo/", None, &canon);
         assert_eq!(location_of(&to), "/apps/foo");
-        let to = canonical_redirect(&base("/m"), "/apps/foo/", Some("x=1&y=%20"), &canon);
+        let to = canonical_redirect(
+            &base("/m"),
+            Canonical,
+            "/apps/foo/",
+            Some("x=1&y=%20"),
+            &canon,
+        );
         assert_eq!(location_of(&to), "/m/apps/foo?x=1&y=%20");
         let home = canonical_of("/");
         assert_eq!(
-            location_of(&canonical_redirect(&base("/m"), "//", None, &home)),
+            location_of(&canonical_redirect(
+                &base("/m"),
+                Canonical,
+                "//",
+                None,
+                &home
+            )),
             "/m/"
         );
+        // A respelled request is redirected though its respelled text matches.
+        let to = canonical_redirect(&base("/m"), Respelled, "/apps/foo", Some("q=1"), &canon);
+        assert_eq!(location_of(&to), "/m/apps/foo?q=1");
     }
 
     /// A redirect target redirects no further: render(parse(canonical)) is
     /// the canonical path itself.
-    #[cfg(feature = "server")]
+    #[cfg(feature = "web")]
     #[test]
     fn canonical_redirect_never_loops() {
         for raw in ["/apps/foo/", "/apps/%41", "/apps/%c3%a9", "/x/1/2/"] {
@@ -936,14 +836,14 @@ mod tests {
             let next = canonical_of(canon.as_str());
             assert_eq!(next, canon, "{raw}: the canonical path is a fixed point");
             assert!(matches!(
-                canonical_redirect(&base("/"), canon.as_str(), None, &next),
+                canonical_redirect(&base("/"), Canonical, canon.as_str(), None, &next),
                 Redirect::Serve
             ));
         }
     }
 
     /// No request path or param can steer the `Location` off this origin.
-    #[cfg(feature = "server")]
+    #[cfg(feature = "web")]
     #[test]
     fn canonical_redirect_stays_on_origin() {
         for slug in [
@@ -954,7 +854,13 @@ mod tests {
             "http://evil.com",
         ] {
             let canon = render(&Page::App(slug.into())).unwrap_or_else(|e| panic!("{slug}: {e}"));
-            let location = location_of(&canonical_redirect(&base("/"), "/other", None, &canon));
+            let location = location_of(&canonical_redirect(
+                &base("/"),
+                Canonical,
+                "/other",
+                None,
+                &canon,
+            ));
             assert!(location.starts_with("/apps/"), "{slug}: {location}");
             assert!(
                 !location.contains('\\') && !location.contains("//"),
@@ -971,7 +877,13 @@ mod tests {
                 continue;
             };
             if let Matched::Hit { canonical, .. } = resolve(&routes(), &path, render) {
-                let location = location_of(&canonical_redirect(&base("/"), raw, None, &canonical));
+                let location = location_of(&canonical_redirect(
+                    &base("/"),
+                    Canonical,
+                    raw,
+                    None,
+                    &canonical,
+                ));
                 assert!(!location.starts_with("//"), "{raw}: {location}");
                 assert!(!location.contains('\\'), "{raw}: {location}");
             }
@@ -980,14 +892,14 @@ mod tests {
 
     /// A query that cannot be copied into a header byte for byte refuses the
     /// request instead of redirecting with a mangled or injected query.
-    #[cfg(feature = "server")]
+    #[cfg(feature = "web")]
     #[test]
     fn canonical_redirect_refuses_a_bad_query() {
         let canon = canonical_of("/apps/foo");
         for query in ["a#b", "a\u{1}b", "a\rb", "a b", "%zz", "%4", "é"] {
             assert!(
                 matches!(
-                    canonical_redirect(&base("/"), "/apps/foo/", Some(query), &canon),
+                    canonical_redirect(&base("/"), Canonical, "/apps/foo/", Some(query), &canon),
                     Redirect::BadQuery
                 ),
                 "{query:?} must be refused"
@@ -1181,9 +1093,53 @@ mod tests {
         let refusal = check_route_table(&rs).err();
         assert!(refusal.is_some_and(|r| {
             let msg = r.to_string();
-            r.pattern == "/u/:id/:id"
+            r.pattern.as_str() == "/u/:id/:id"
                 && msg.contains("route pattern `/u/:id/:id` is malformed")
                 && msg.contains("parameter `id` appears twice")
+        }));
+    }
+
+    /// Prove the refusals: a `Web.route` pattern follows the segment grammar
+    /// `Server.*` paths follow, so a `*` catch-all and a `:` or `*` inside a
+    /// literal segment are refused, not served as literal text.
+    #[test]
+    fn catch_all_and_mid_segment_sigil_are_refused() {
+        for catch_all in ["/*rest", "/f/*", "/a/:x/*y", "/*"] {
+            assert_eq!(
+                RoutePattern::parse(catch_all).err(),
+                Some(RouteSegmentRefusal::CatchAll),
+                "{catch_all}"
+            );
+        }
+        for escaped in ["/a%3Ab", "/%2Arest", "/%3Aid", "/file%3Aid"] {
+            assert!(RoutePattern::parse(escaped).is_ok(), "{escaped}");
+        }
+        for (mid, at) in [
+            ("/a:b", 1),
+            ("/file:id", 4),
+            ("/x/ab*", 2),
+            ("/q/a*:b", 1),
+            ("/a%3A:b", 4),
+        ] {
+            let refused = RoutePattern::parse(mid);
+            assert!(
+                matches!(
+                    &refused,
+                    Err(RouteSegmentRefusal::MidSegmentSigil { at: off }) if off.get() == at
+                ),
+                "{mid} must break at byte {at}, got {refused:?}"
+            );
+        }
+        let rs: Vec<Route<Page>> = vec![
+            Route::new("/ok", |_| Some(Page::Home)),
+            Route::new("/file:id", |_| Some(Page::App("dead".into()))),
+        ];
+        assert!(rs.get(1).is_some_and(|r| r.pattern().is_err()));
+        let refusal = check_route_table(&rs).err();
+        assert!(refusal.is_some_and(|r| {
+            r.pattern.as_str() == "/file:id"
+                && r.to_string()
+                    .contains("route pattern `/file:id` is malformed: a `:` or `*` at byte 4")
         }));
     }
 
@@ -1236,7 +1192,7 @@ mod tests {
         ];
         let refused = check_route_table(&bad).map_err(MountRefusal::RouteTable);
         assert!(
-            matches!(&refused, Err(MountRefusal::RouteTable(r)) if r.pattern == "/%zz"),
+            matches!(&refused, Err(MountRefusal::RouteTable(r)) if r.pattern.as_str() == "/%zz"),
             "a malformed route table must be refused: {refused:?}"
         );
         let message = refused.err().map(|r| r.to_string()).unwrap_or_default();
@@ -1246,7 +1202,7 @@ mod tests {
         );
         let crate::error::IpeError::Error(kind, _) =
             crate::error::IpeError::from(MountRefusal::RouteTable(RoutePatternRefusal {
-                pattern: "/%zz".to_owned(),
+                pattern: RefusedText::new("/%zz"),
                 refusal: RouteSegmentRefusal::Decode(bad_escape()),
             }));
         assert_eq!(kind, crate::error::IpeErrorKind::InvalidInput);
@@ -1272,17 +1228,81 @@ mod tests {
     #[test]
     fn route_pattern_refusal_scrubs_bidi_and_controls() {
         let refusal = RoutePatternRefusal {
-            pattern: HOSTILE.to_owned(),
+            pattern: RefusedText::new(HOSTILE),
             refusal: RouteSegmentRefusal::Decode(bad_escape()),
         };
         assert_scrubbed(&refusal.to_string());
+    }
+
+    /// A platform report is scrubbed once, where the refusal is built: a `\`
+    /// renders as `\\`, never re-escaped to `\\\\` by the `Display`.
+    #[test]
+    fn mount_refusal_scrubs_platform_detail_once() {
+        let listener = MountRefusal::Listener {
+            event: "click",
+            detail: RefusedText::new("a\\b\n"),
+        };
+        let dom = MountRefusal::Dom {
+            step: "createElement(div)",
+            detail: Some(RefusedText::new("a\\b\n")),
+        };
+        assert_eq!(
+            listener.to_string(),
+            "addEventListener(click) failed: a\\\\b\\n"
+        );
+        assert_eq!(dom.to_string(), "createElement(div) failed: a\\\\b\\n");
+    }
+
+    /// A mount refusal reaches the browser console scrubbed exactly once: a
+    /// `\` it quotes shows as `\\` there too, and the line stays one line with
+    /// no raw control or bidi character.
+    #[test]
+    fn console_refusal_line_scrubs_once() {
+        let cases = [
+            (
+                MountRefusal::Listener {
+                    event: "click",
+                    detail: RefusedText::new("a\\b\n"),
+                },
+                "[ipe-wasm:MountFailed] addEventListener(click) failed: a\\\\b\\n",
+            ),
+            (
+                MountRefusal::Dom {
+                    step: "createElement(div)",
+                    detail: Some(RefusedText::new("a\\b")),
+                },
+                "[ipe-wasm:MountFailed] createElement(div) failed: a\\\\b",
+            ),
+            (
+                MountRefusal::RouteTable(RoutePatternRefusal {
+                    pattern: RefusedText::new("/a\\b"),
+                    refusal: RouteSegmentRefusal::Decode(bad_escape()),
+                }),
+                "[ipe-wasm:MountFailed] route pattern `/a\\\\b` is malformed: ",
+            ),
+        ];
+        for (refusal, expected) in cases {
+            let line = console_refusal_line("MountFailed", &refusal);
+            assert!(line.starts_with(expected), "{line:?} vs {expected:?}");
+            assert!(!line.contains("\\\\\\\\"), "scrubbed twice: {line:?}");
+        }
+        let hostile = MountRefusal::Listener {
+            event: "click",
+            detail: RefusedText::new(HOSTILE),
+        };
+        let line = console_refusal_line(HOSTILE, &hostile);
+        assert!(
+            !line.chars().any(crate::system::is_log_hazard),
+            "a raw control survived: {line:?}"
+        );
+        assert_eq!(line.lines().count(), 1, "{line:?}");
     }
 
     #[test]
     fn mount_refusal_scrubs_bidi_and_controls() {
         let every = [
             MountRefusal::RouteTable(RoutePatternRefusal {
-                pattern: HOSTILE.to_owned(),
+                pattern: RefusedText::new(HOSTILE),
                 refusal: RouteSegmentRefusal::Decode(bad_escape()),
             }),
             MountRefusal::BasePath(bad_escape()),
@@ -1291,11 +1311,11 @@ mod tests {
             MountRefusal::NoBody,
             MountRefusal::Listener {
                 event: "click",
-                detail: HOSTILE.to_owned(),
+                detail: RefusedText::new(HOSTILE),
             },
             MountRefusal::Dom {
                 step: "createElement(div)",
-                detail: Some(HOSTILE.to_owned()),
+                detail: Some(RefusedText::new(HOSTILE)),
             },
             MountRefusal::Dom {
                 step: "root cast to HtmlElement",

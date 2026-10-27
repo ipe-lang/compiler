@@ -139,9 +139,10 @@ tools over it.
 
 ## Configuration
 
-`IPE_FILE_READ_MAX` sets the per-call byte ceiling of `File.readFile`, and
-`IPE_PROCESS_OUTPUT_MAX` the ceiling on a subprocess's buffered output. Their
-defaults and exact rules live in the [**File** subsystem](../reference/env.md#file)
+`IPE_FILE_READ_MAX` sets the per-call byte ceiling of `File.readFile`,
+`IPE_PROCESS_OUTPUT_MAX` the ceiling on a subprocess's buffered output, and
+`IPE_PROCESS_TIMEOUT` the wall-clock ceiling after which a subprocess is killed.
+Their defaults and exact rules live in the [**File** subsystem](../reference/env.md#file)
 of the environment variable reference; `ipe doc <VAR>` prints the same entry.
 For a per-call cap of your own, `File.readFileLimit` takes a `ByteSize`:
 `ByteSize.zero` admits only an empty file.

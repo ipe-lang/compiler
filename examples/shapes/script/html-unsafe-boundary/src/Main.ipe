@@ -18,7 +18,6 @@ import Ipe.Io as Io
 --     the raw sink before the program runs. Use it only for trusted,
 --     author-controlled content — never for request input.
 
-
 -- A snippet of trusted, author-written markup — a formatting fragment you wrote,
 -- not something a user typed. This is the ONLY kind of input `unsafeRaw` is for.
 trustedMarkup : String

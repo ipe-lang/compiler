@@ -707,6 +707,8 @@ messages! {
     publish_single_path = "publish-single-path";
     /// `ipe dev watch`/`ipe dev build` given a directory with no manifest inside it.
     watch_dir_no_manifest = "watch-dir-no-manifest";
+    /// A `web desktop` build of an entry file with no `package.ipe`.
+    webview_needs_manifest = "webview-needs-manifest";
     /// `ipe diff` misuse.
     diff_usage = "diff-usage";
     /// `ipe init --shape` without its value.
@@ -727,6 +729,8 @@ messages! {
     internal_module_not_in_source_map = "internal-module-not-in-source-map";
     /// A library package (only `exposedModules`) has no runnable entry.
     library_package_no_entry = "library-package-no-entry";
+    /// `ipe capabilities` named a file that is not one of the project's entries.
+    capabilities_not_an_entry(arg, entries) = "capabilities-not-an-entry";
     /// A `--debugger` build under the vendored emit model.
     debugger_needs_runtime_dep = "debugger-needs-runtime-dep";
     /// A packager could not find a `package.ipe` from the given root.
@@ -745,6 +749,8 @@ messages! {
     package_manifest_name_required = "package-manifest-name-required";
     /// `package.ipe`'s source root does not exist.
     package_manifest_src_root_missing = "package-manifest-src-root-missing";
+    /// `package.ipe` spells `sourceRoot`, which a project root no longer honours.
+    package_manifest_source_root_removed = "package-manifest-source-root-removed";
     /// `package.ipe` with no top-level `package` binding.
     package_manifest_no_package_binding = "package-manifest-no-package-binding";
     /// `ipe add`/`ipe remove` found no top-level `package` binding to edit.
@@ -845,6 +851,8 @@ messages! {
     cli_cache_home_unknown = "cli-cache-home-unknown";
     /// A directory environment variable is set to a relative path.
     cli_env_dir_not_absolute(var) = "cli-env-dir-not-absolute";
+    /// The registry URL environment variable is set to a value that is not an `https://` base URL.
+    cli_registry_url_not_https(var, reason) = "cli-registry-url-not-https";
     /// `$IPE_RUNTIME_DIR` does not name a runtime crate root.
     cli_runtime_dir_invalid(path) = "cli-runtime-dir-invalid";
     /// The invalid runtime dir looks like the inner module directory.
@@ -937,6 +945,40 @@ messages! {
     cli_local_timed_out(source, limit) = "cli-local-timed-out";
     /// A `cargo build` ran past its wall and was stopped.
     cli_cargo_build_timed_out(wall) = "cli-cargo-build-timed-out";
+    /// A build directory or the toolchain sysroot the host linker cannot open.
+    cli_target_dir_unlinkable(what, path: &crate::style::TerminalSafe, linker) = "cli-target-dir-unlinkable";
+    /// An unlinkable build directory the embedding caller chose.
+    cli_target_dir_from_embedder = "cli-target-dir-from-embedder";
+    /// An unlinkable build directory `CARGO_TARGET_DIR` names.
+    cli_target_dir_from_env = "cli-target-dir-from-env";
+    /// An unlinkable build directory the `$IPE_HOME` config pins.
+    cli_target_dir_from_ipe_home = "cli-target-dir-from-ipe-home";
+    /// An unlinkable build directory a Cargo config pins.
+    cli_target_dir_from_cargo_config = "cli-target-dir-from-cargo-config";
+    /// An unlinkable crate-local build directory.
+    cli_target_dir_crate_local = "cli-target-dir-crate-local";
+    /// An unlinkable per-user build cache directory.
+    cli_target_dir_user_cache = "cli-target-dir-user-cache";
+    /// An unlinkable shared test build directory in the per-user cache.
+    cli_target_dir_scratch_cache = "cli-target-dir-scratch-cache";
+    /// Another `ipe test` held the shared test build directory past the wall.
+    cli_test_target_busy(path: &crate::style::TerminalSafe, wall) = "cli-test-target-busy";
+    /// The embedded runtime manifest could not be prepared for bundling.
+    cli_bundled_manifest(detail) = "cli-bundled-manifest";
+    /// An unlinkable toolchain sysroot.
+    cli_target_dir_sysroot = "cli-target-dir-sysroot";
+    /// A host linker that opens only ASCII paths.
+    cli_host_linker_ascii_only = "cli-host-linker-ascii-only";
+    /// A host linker that opens any absolute path.
+    cli_host_linker_unicode = "cli-host-linker-unicode";
+    /// How to fix an unlinkable build directory.
+    cli_target_dir_guidance = "cli-target-dir-guidance";
+    /// How to fix an unlinkable toolchain sysroot.
+    cli_sysroot_guidance = "cli-sysroot-guidance";
+    /// The host linker could not open one of its input files.
+    cli_link_input_unopenable(linker: &crate::style::TerminalSafe, missing: &crate::style::TerminalSafe) = "cli-link-input-unopenable";
+    /// The unopenable linker input's path holds non-ASCII characters.
+    cli_link_input_non_ascii = "cli-link-input-non-ascii";
     /// A local walk met an entry it refuses by its shape.
     cli_local_tree_refused(source, shape) = "cli-local-tree-refused";
     /// A finished child's output pipe stayed open past the grace.
@@ -965,6 +1007,24 @@ messages! {
     cli_discovery_limit_reached(detail) = "cli-discovery-limit-reached";
     /// A discovered source file names a Windows reserved device as a module segment.
     cli_device_named_module(path, segment) = "cli-device-named-module";
+    /// The project directory holds no `package.ipe`.
+    project_no_manifest(dir) = "project-no-manifest";
+    /// The project directory has no `src/` directory.
+    project_no_src_dir(root) = "project-no-src-dir";
+    /// A `programs` entry names a file `src/` does not hold.
+    project_entry_missing(entry) = "project-entry-missing";
+    /// The project declares no program, has no `src/Main.ipe`, and exposes no module.
+    project_no_default_entry(root) = "project-no-default-entry";
+    /// A `programs` entry passes through a symbolic link under `src/`.
+    project_entry_escapes(entry, path) = "project-entry-escapes";
+    /// An `exposedModules` name has no file under `src/`.
+    project_exposed_module_missing(module) = "project-exposed-module-missing";
+    /// A project file or directory ipe would read is a symbolic link.
+    project_symlink_in_source(path) = "project-symlink-in-source";
+    /// A file argument lies outside the project's `src/` and `tests/`.
+    project_file_outside_root(arg, root) = "project-file-outside-root";
+    /// A build command was given a file where it takes a project directory.
+    project_directory_expected(arg, verb, parent) = "project-directory-expected";
     /// A locked dependency falls within an advisory's affected range.
     cli_advisory_vulnerable(package, version, severity, id, description, fixed_in) =
         "cli-advisory-vulnerable";
@@ -1004,6 +1064,8 @@ messages! {
     thread_role_watch_resolve_retry = "thread-role-watch-resolve-retry";
     /// The thread that runs an `ipe dev watch` compile.
     thread_role_watch_compile = "thread-role-watch-compile";
+    /// The thread that runs a one-shot command's compile.
+    thread_role_compile = "thread-role-compile";
     /// The thread that waits on an `ipe dev watch` cargo build.
     thread_role_watch_cargo_waiter = "thread-role-watch-cargo-waiter";
     /// The thread that enforces a WASI run's wall-clock ceiling.
@@ -1032,6 +1094,10 @@ messages! {
     lock_index_dep_local_rev(package) = "lock-index-dep-local-rev";
     /// A path dependency's `source` cannot be recorded in `ipe.lock`.
     lock_unrecordable_local_source(package, max, raw) = "lock-unrecordable-local-source";
+    /// A path dependency names a network share or device.
+    lock_local_source_remote(package, raw, kind) = "lock-local-source-remote";
+    /// A path dependency names a Windows device element.
+    lock_local_source_device(package, raw) = "lock-local-source-device";
     /// A path dependency's path is not valid UTF-8.
     lock_non_utf8_local_path(package, path) = "lock-non-utf8-local-path";
     /// A version string that is not valid semver.
@@ -1136,6 +1202,10 @@ messages! {
     audit_no_manifest(path) = "audit-no-manifest";
     /// `ipe package audit` was given a path that is neither a project nor a manifest.
     audit_not_a_package(path) = "audit-not-a-package";
+    /// `ipe package audit` refuses to regenerate FFI bindings under the unsandboxed override.
+    audit_refuses_unsandboxed_override = "audit-refuses-unsandboxed-override";
+    /// `ipe package audit` refuses to regenerate FFI bindings on a host without a jail.
+    audit_requires_a_jail = "audit-requires-a-jail";
     /// An index entry file is not named `packages/<name>.toml`.
     index_entry_path_invalid(path) = "index-entry-path-invalid";
     /// An index entry exceeds the per-entry version ceiling.
@@ -1251,6 +1321,10 @@ messages! {
     doc_stdlib_index_failed(detail) = "doc-stdlib-index-failed";
     /// The documentation bundle could not be built.
     doc_bundle_build_error(detail) = "doc-bundle-build-error";
+    /// A docs-directory file is not named as a page.
+    doc_overlay_name(path: &crate::style::TerminalSafe) = "doc-overlay-name";
+    /// The docs-directory pages together pass the overlay read budget.
+    doc_overlay_too_large(limit) = "doc-overlay-too-large";
     /// An `ipe doc <kind>:<key>` query named an unknown kind.
     doc_unknown_kind(prefix) = "doc-unknown-kind";
     /// An `ipe doc` term was empty or only whitespace.
@@ -1279,8 +1353,10 @@ messages! {
     ffi_cache_untrusted(path) = "ffi-cache-untrusted";
     /// The FFI cache's ownership cannot be verified on this platform.
     ffi_cache_unverifiable(path) = "ffi-cache-unverifiable";
-    /// An FFI cache component or artifact is a symbolic link.
+    /// An FFI cache artifact is a symbolic link.
     ffi_cache_symlink(path) = "ffi-cache-symlink";
+    /// An FFI cache directory component is a symbolic link or not a directory.
+    ffi_cache_escapes(path) = "ffi-cache-escapes";
     /// An FFI cache artifact is not a regular file.
     ffi_cache_not_regular(path) = "ffi-cache-not-regular";
     /// An FFI cache directory lists more entries than the loader admits.
@@ -1303,6 +1379,8 @@ messages! {
     ffi_reserved_module_claimed(krate, module) = "ffi-reserved-module-claimed";
     /// An FFI wrapper uses the reserved asserted-shim prefix.
     ffi_reserved_wrapper_prefix(krate, wrapper, prefix) = "ffi-reserved-wrapper-prefix";
+    /// A wrapper crate the catalog bound by path is no longer the directory below the project root.
+    ffi_wrapper_moved(package, path) = "ffi-wrapper-moved";
     /// A project module takes the reserved asserted-call module name.
     ffi_reserved_module_exists(module) = "ffi-reserved-module-exists";
     /// Asserted calls were validated against an empty FFI catalog (an internal invariant).
@@ -1630,14 +1708,18 @@ messages! {
     output_inside_ipe_owned(out, owner) = "output-inside-ipe-owned";
     /// A user-bound output inside a directory an ipe claim is turning into ipe's.
     output_inside_claim(out, owner, claim) = "output-inside-claim";
-    /// An output inside a `.git` directory.
-    output_inside_vcs(out) = "output-inside-vcs";
+    /// An output inside a version-control metadata directory.
+    output_inside_vcs(out, dir) = "output-inside-vcs";
     /// An output inside an ipe cache namespace.
     output_inside_cache_namespace(out, namespace) = "output-inside-cache-namespace";
     /// An output with a `..` that does not climb out of a plain existing directory.
     output_parent_traversal(path) = "output-parent-traversal";
     /// An output that names no single absolute place on every platform.
     output_unplaceable(path) = "output-unplaceable";
+    /// A relative output walked on from a working directory that names no single absolute place.
+    output_unplaceable_cwd(cwd, request) = "output-unplaceable-cwd";
+    /// A listed entry whose name no held handle can open.
+    output_unnameable_entry(path) = "output-unnameable-entry";
     /// An eject output that is not absent or empty.
     output_not_fresh(path) = "output-not-fresh";
     /// A product path with a component other than a plain name.
@@ -1690,6 +1772,8 @@ messages! {
     publish_fresh_claim_not_covered(claimed) = "publish-fresh-claim-not-covered";
     /// An index `source` that is not an accepted URL.
     index_source_url_invalid(pkg: &crate::package_name::PackageName, raw: &crate::style::TerminalSafe) = "index-source-url-invalid";
+    /// An index `source` that names a network share or device.
+    index_source_url_remote(pkg: &crate::package_name::PackageName, kind, raw: &crate::style::TerminalSafe) = "index-source-url-remote";
     /// An index `source` on the plaintext `git://` transport.
     index_source_url_plaintext(pkg: &crate::package_name::PackageName, raw: &crate::style::TerminalSafe) = "index-source-url-plaintext";
     /// An index `rev` shaped like an injection.
@@ -2358,30 +2442,6 @@ mod tests {
         found
     }
 
-    /// Every `.rs` file under this crate's `src/`, skipping hidden directories
-    /// and `target/`.
-    fn rs_files_under(root: &std::path::Path) -> Vec<std::path::PathBuf> {
-        let mut out = Vec::new();
-        let mut stack = vec![root.to_owned()];
-        while let Some(dir) = stack.pop() {
-            let Ok(entries) = std::fs::read_dir(&dir) else {
-                continue;
-            };
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path.is_dir() {
-                    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-                    if !name.starts_with('.') && name != "target" {
-                        stack.push(path);
-                    }
-                } else if path.extension().and_then(|e| e.to_str()) == Some("rs") {
-                    out.push(path);
-                }
-            }
-        }
-        out
-    }
-
     /// No production code spells a user-facing message as a Rust literal.
     ///
     /// Every message sink (`CliError::Usage`, `CliError::Resolve`, and the
@@ -2392,7 +2452,8 @@ mod tests {
     #[test]
     fn no_literal_cli_error_usage_outside_the_catalog() {
         let src_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-        let files = rs_files_under(&src_root);
+        let files = panic_scan::rust_sources(&src_root, panic_scan::Want::RustFiles)
+            .expect("the crate's source tree is listed whole");
         assert!(!files.is_empty(), "no sources under {}", src_root.display());
         let mut offenders = Vec::new();
         for path in files {

@@ -1,0 +1,241 @@
+module Lib.Slot exposing (LoadSlot, LoadTicket, Settle(..), Stamp, ensureLoad, firstTicket, idleLoad, isCurrentLoad, latestTicket, latestWant, loadArrived, nextTicket, owns, requestLoad, running, runningLoad, runningWant, stamp, stampKey, ticketNumber)
+
+import Ipe.Maybe as Maybe
+import Lib.Epoch exposing (Epoch)
+
+
+-- The number of one load of a page slot (the queue, a History page). Each
+-- load a slot starts takes the ticket after the slot's latest, and a result
+-- settles the slot only under the slot's latest ticket, so a slower earlier
+-- load never replaces the result of a later one. Opaque: built only by
+-- `firstTicket` and `nextTicket`.
+type LoadTicket
+    = LoadTicket Int
+
+
+firstTicket : LoadTicket
+firstTicket =
+    LoadTicket 0
+
+
+nextTicket : LoadTicket -> LoadTicket
+nextTicket ticket =
+    case ticket of
+        LoadTicket n ->
+            LoadTicket (n + 1)
+
+
+-- True when a result carrying `load` is the slot's latest load.
+isCurrentLoad : LoadTicket -> LoadTicket -> Bool
+isCurrentLoad load latest =
+    ticketNumber load == ticketNumber latest
+
+
+ticketNumber : LoadTicket -> Int
+ticketNumber ticket =
+    case ticket of
+        LoadTicket n ->
+            n
+
+
+-- The identity of one task a slot runs: the process that started it and
+-- the key it runs under. A completion carries the stamp of the task that
+-- produced it, and settles the slot only when `owns` matches it to the
+-- slot's running stamp. Opaque: built only by `stamp`, which only a slot's
+-- start function calls, so no completion can carry a stamp no start made.
+type Stamp key
+    = Stamp Epoch key
+
+
+-- The stamp of a task process `epoch` starts under `key`.
+stamp : Epoch -> key -> Stamp key
+stamp epoch key =
+    Stamp epoch key
+
+
+stampKey : Stamp key -> key
+stampKey held =
+    case held of
+        Stamp _ key ->
+            key
+
+
+-- The running stamp `held` as process `current` sees it: a stamp another
+-- process left behind has no completion left to settle it, so it reads as
+-- idle.
+running : Epoch -> Maybe (Stamp key) -> Maybe (Stamp key)
+running current held =
+    case held of
+        Just (Stamp owner _) ->
+            if owner == current then
+                held
+
+            else
+                Nothing
+
+        Nothing ->
+            Nothing
+
+
+-- The one ownership rule every slot's completion is accepted through: the
+-- completion stamped `arrived` belongs to process `current`'s slot whose
+-- running stamp is `held` only when that stamp is this process's and
+-- equals `arrived`, epoch and key alike.
+owns : Epoch -> Stamp key -> Maybe (Stamp key) -> Bool
+owns current arrived held =
+    case running current held of
+        Just (Stamp owner key) ->
+            case arrived of
+                Stamp from presented ->
+                    owner == from && key == presented
+
+        Nothing ->
+            False
+
+
+-- A page slot's load: idle at its latest ticket, or the one load in flight,
+-- under its stamp, with what was asked meanwhile. A load asked while one
+-- runs is recorded, never started, so the slot holds at most one load; the
+-- running load's result is dropped while anything is wanted, and the wanted
+-- load starts in its place. A load another process left behind has no
+-- completion left to settle it, so the slot is idle to every transition.
+-- Opaque: changed only by the transitions below, so a ticket and a load in
+-- flight cannot disagree.
+type LoadSlot want
+    = LoadIdle LoadTicket
+    | LoadRunning (Stamp LoadTicket) (Maybe want)
+
+
+-- Whether an arrived result settles its page (`Settles`), or is dropped
+-- (`Dropped`): superseded by a load wanted meanwhile, from another load, or
+-- from another process.
+type Settle
+    = Settles
+    | Dropped
+
+
+-- A slot with no load run yet.
+idleLoad : LoadSlot want
+idleLoad =
+    LoadIdle firstTicket
+
+
+-- The slot's latest ticket: the one in flight, or the last one settled.
+latestTicket : LoadSlot want -> LoadTicket
+latestTicket slot =
+    case slot of
+        LoadIdle ticket ->
+            ticket
+
+        LoadRunning load _ ->
+            stampKey load
+
+
+-- The stamp of the load in flight, whichever process started it.
+runningLoad : LoadSlot want -> Maybe (Stamp LoadTicket)
+runningLoad slot =
+    case slot of
+        LoadIdle _ ->
+            Nothing
+
+        LoadRunning load _ ->
+            Just load
+
+
+-- What the load in flight has wanted after it: Nothing while the slot is
+-- idle to process `epoch`, Just Nothing while it runs with nothing wanted.
+runningWant : Epoch -> LoadSlot want -> Maybe (Maybe want)
+runningWant epoch slot =
+    case slot of
+        LoadIdle _ ->
+            Nothing
+
+        LoadRunning load wanted ->
+            Maybe.map (\_ -> wanted) (running epoch (Just load))
+
+
+-- `want` asked for by process `epoch`, with the load to start, if any: an
+-- idle slot starts it under its next ticket; during a load this process
+-- runs it is only recorded, folded into what was wanted by `merge`.
+requestLoad : (want -> want -> want) -> Epoch -> want -> LoadSlot want -> ( LoadSlot want, Maybe ( Stamp LoadTicket, want ) )
+requestLoad merge epoch want slot =
+    case slot of
+        LoadIdle ticket ->
+            startLoad epoch ticket want
+
+        LoadRunning load wanted ->
+            case running epoch (Just load) of
+                Just own ->
+                    ( LoadRunning own (Just (wantedWith merge wanted want)), Nothing )
+
+                Nothing ->
+                    startLoad epoch (stampKey load) want
+
+
+-- `want` asked for only to have the slot's data loaded: a load this process
+-- runs will settle it, so nothing is recorded; an idle slot starts it.
+ensureLoad : (want -> want -> want) -> Epoch -> want -> LoadSlot want -> ( LoadSlot want, Maybe ( Stamp LoadTicket, want ) )
+ensureLoad merge epoch want slot =
+    case runningWant epoch slot of
+        Just _ ->
+            ( slot, Nothing )
+
+        Nothing ->
+            requestLoad merge epoch want slot
+
+
+-- The load stamped `arrived` returned to process `epoch`: with a load
+-- wanted meanwhile its result is `Dropped` and the wanted load starts; with
+-- none the slot is idle and the result `Settles`. A result the slot does
+-- not own is `Dropped` with the slot unchanged.
+loadArrived : Epoch -> Stamp LoadTicket -> LoadSlot want -> ( Settle, LoadSlot want, Maybe ( Stamp LoadTicket, want ) )
+loadArrived epoch arrived slot =
+    if not (owns epoch arrived (runningLoad slot)) then
+        ( Dropped, slot, Nothing )
+
+    else
+        let
+            ticket =
+                stampKey arrived
+        in
+        case slot of
+            LoadRunning _ (Just next) ->
+                settledAs Dropped (startLoad epoch ticket next)
+
+            LoadRunning _ Nothing ->
+                ( Settles, LoadIdle ticket, Nothing )
+
+            LoadIdle _ ->
+                ( Dropped, slot, Nothing )
+
+
+settledAs : Settle -> ( LoadSlot want, Maybe ( Stamp LoadTicket, want ) ) -> ( Settle, LoadSlot want, Maybe ( Stamp LoadTicket, want ) )
+settledAs settle ( slot, start ) =
+    ( settle, slot, start )
+
+
+-- The one start of a queue or History load: the stamp of the next ticket
+-- after `latest`, run by process `epoch`.
+startLoad : Epoch -> LoadTicket -> want -> ( LoadSlot want, Maybe ( Stamp LoadTicket, want ) )
+startLoad epoch latest want =
+    let
+        load =
+            stamp epoch (nextTicket latest)
+    in
+    ( LoadRunning load Nothing, Just ( load, want ) )
+
+
+wantedWith : (want -> want -> want) -> Maybe want -> want -> want
+wantedWith merge wanted want =
+    case wanted of
+        Just held ->
+            merge held want
+
+        Nothing ->
+            want
+
+
+-- The later of two wants, for a slot whose loads only read.
+latestWant : want -> want -> want
+latestWant _ newer =
+    newer

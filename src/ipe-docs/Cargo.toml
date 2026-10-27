@@ -35,5 +35,8 @@ ipe_stdlib    = { path = "../stdlib" }
 # The runtime's operator env registry, projected into the env reference.
 ipe-runtime-rust = { path = "../runtime/rust", default-features = false }
 
+[dev-dependencies]
+ipe_fmt = { path = "../ipe-fmt" }
+
 [lints]
 workspace = true

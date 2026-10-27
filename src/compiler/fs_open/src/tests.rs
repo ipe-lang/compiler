@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 
 use super::{
     ByteCap, EntryCap, EntryName, FileId, FileKind, HeldDir, HintedKind, OpenRefusal, RegularFile,
-    is_one_spelled_name,
+    is_one_spelled_name, may_open_as,
 };
 
 /// A fresh, empty scratch directory unique to this test and process.
@@ -432,6 +432,16 @@ fn a_file_is_not_a_child_directory() {
     );
 }
 
+/// A device namespace is never held as a root, whatever canonicalising makes of it.
+#[cfg(windows)]
+#[test]
+fn open_root_refuses_a_device_prefix_after_canonicalising() {
+    for device in [r"\\.\pipe\", r"\\.\NUL", r"\\?\GLOBALROOT\Device\Null"] {
+        let root = HeldDir::open_root(Path::new(device));
+        assert!(root.is_err(), "{device} must not be held, got {root:?}");
+    }
+}
+
 /// Zero is not a cap: no constructor turns it into an unbounded read.
 #[test]
 fn zero_is_not_a_cap() {
@@ -459,7 +469,7 @@ fn a_file_held_open_elsewhere_is_in_use() {
     drop(other);
 }
 
-/// Every identity read of one file agrees: the proven handle, a raw handle, the path, and the no-follow entry.
+/// Every identity read of one file agrees: the proven handle, a raw handle, and the no-follow entry.
 #[test]
 fn every_identity_read_of_one_file_agrees() {
     let dir = scratch("identity");
@@ -470,7 +480,6 @@ fn every_identity_read_of_one_file_agrees() {
     assert_eq!(proven.id().unwrap(), entry);
     let raw = std::fs::File::open(dir.join("f.txt")).unwrap();
     assert_eq!(FileId::of_file(&raw).unwrap(), entry);
-    assert_eq!(FileId::of_path(&dir.join("f.txt")).unwrap(), entry);
     assert_eq!(proven.link_count().unwrap(), 1);
     std::fs::hard_link(dir.join("f.txt"), dir.join("g.txt")).unwrap();
     assert_eq!(proven.link_count().unwrap(), 2);
@@ -490,6 +499,90 @@ fn each_platform_builds_a_file_id_in_one_place() {
             "{platform} builds a FileId in more than one place"
         );
     }
+}
+
+/// No identity is read from a path: every `FileId` comes from an open handle.
+#[test]
+fn no_file_id_from_a_path() {
+    for (file, source) in [
+        ("lib.rs", include_str!("lib.rs")),
+        ("unix.rs", include_str!("unix.rs")),
+        ("windows.rs", include_str!("windows.rs")),
+        (
+            "sandbox/src/vcs_config.rs",
+            include_str!("../../sandbox/src/vcs_config.rs"),
+        ),
+    ] {
+        for banned in ["fn of_path", "fn id_of_path", "::of_path(", "id_of_path("] {
+            assert!(
+                !source.contains(banned),
+                "{file} reads an identity from a path through `{banned}`"
+            );
+        }
+    }
+    let unix = include_str!("unix.rs");
+    for banned in ["rustix::fs::stat(", "rustix::fs::lstat("] {
+        assert!(
+            !unix.contains(banned),
+            "unix.rs stats a path through `{banned}`, a stat no handle holds"
+        );
+    }
+}
+
+/// Two distinct directories never share an identity.
+#[test]
+fn two_distinct_dirs_have_distinct_ids() {
+    let dir = scratch("distinct_ids");
+    std::fs::create_dir(dir.join("a")).unwrap();
+    std::fs::create_dir(dir.join("b")).unwrap();
+    let a = held(&dir.join("a")).id().unwrap();
+    let b = held(&dir.join("b")).id().unwrap();
+    assert_ne!(a, b, "two directories compare distinct");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A directory opened twice has one identity.
+#[test]
+fn a_reopened_dir_has_the_same_id() {
+    let dir = scratch("reopened_id");
+    std::fs::create_dir(dir.join("a")).unwrap();
+    let first = held(&dir.join("a"));
+    let again = held(&dir.join("a"));
+    assert_eq!(first.id().unwrap(), again.id().unwrap());
+    let parent = held(&dir);
+    assert_eq!(
+        parent.child_dir(&name("a")).unwrap().id().unwrap(),
+        first.id().unwrap()
+    );
+    assert_eq!(
+        parent.entry_id(&name("a")).unwrap(),
+        Some(first.id().unwrap())
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A directory renamed away and replaced by a new one at its name is a new identity.
+#[cfg(unix)]
+#[test]
+fn a_dir_replaced_at_the_same_name_has_a_new_id() {
+    let dir = scratch("replaced_id");
+    std::fs::create_dir(dir.join("a")).unwrap();
+    // Kept open so the replacement cannot reuse the held object number.
+    let original = held(&dir.join("a"));
+    std::fs::rename(dir.join("a"), dir.join("a.aside")).unwrap();
+    std::fs::create_dir(dir.join("a")).unwrap();
+    let replacement = held(&dir.join("a"));
+    assert_ne!(
+        original.id().unwrap(),
+        replacement.id().unwrap(),
+        "the directory now at the name is another object"
+    );
+    assert_eq!(
+        original.id().unwrap(),
+        held(&dir.join("a.aside")).id().unwrap(),
+        "the held directory keeps its identity under its new name"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// The kind listed for `entry`, `None` when the listing lacks it.
@@ -689,24 +782,10 @@ fn kind_of_classifies_without_following() {
     }
 }
 
-/// A reparse point is a link whatever else its attributes say, never a directory.
+/// A junction, a name-surrogate reparse point, is listed as a link, never a directory.
 #[cfg(windows)]
 #[test]
-fn entries_hinted_reports_reparse_as_link() {
-    use super::sys::hint_of_attributes;
-    const DIRECTORY: u32 = 0x10;
-    const REPARSE_POINT: u32 = 0x400;
-    const ARCHIVE: u32 = 0x20;
-    const DEVICE: u32 = 0x40;
-    assert_eq!(
-        hint_of_attributes(DIRECTORY | REPARSE_POINT),
-        HintedKind::Link
-    );
-    assert_eq!(hint_of_attributes(REPARSE_POINT), HintedKind::Link);
-    assert_eq!(hint_of_attributes(DIRECTORY), HintedKind::Dir);
-    assert_eq!(hint_of_attributes(ARCHIVE), HintedKind::Regular);
-    assert_eq!(hint_of_attributes(DEVICE), HintedKind::Other);
-
+fn entries_hinted_reports_a_junction_as_link() {
     let dir = scratch("hinted_junction");
     std::fs::create_dir(dir.join("real")).unwrap();
     let made = std::process::Command::new("cmd")
@@ -767,4 +846,111 @@ fn link_count_counts_a_hard_link() {
     std::fs::hard_link(dir.join("one.txt"), dir.join("two.txt")).unwrap();
     let linked = held.open_regular(&name("one.txt")).unwrap().link_count();
     assert_eq!(linked.ok(), Some(2), "a hard link counts as a second name");
+}
+
+/// A name a case-folding volume opens as a reserved ASCII name matches it.
+#[test]
+fn a_folded_spelling_may_open_as_the_reserved_name() {
+    for (text, spelled) in [
+        (".git", ".git"),
+        (".GiT", ".git"),
+        ("_darc\u{17F}", "_darcs"),
+        ("_DARC\u{17F}", "_darcs"),
+        (".g\u{131}t", ".git"),
+        (".g\u{200C}it", ".git"),
+        ("\u{FEFF}.jj", ".jj"),
+        (".h\u{202E}g\u{206F}", ".hg"),
+        (".\u{212A}", ".k"),
+    ] {
+        assert!(
+            may_open_as(OsStr::new(text), spelled),
+            "{text:?} opens as {spelled:?}"
+        );
+    }
+}
+
+/// A name differing from the reserved one in more than case or ignorables does not match.
+#[test]
+fn an_other_name_may_not_open_as_the_reserved_name() {
+    for (text, spelled) in [
+        (".gitx", ".git"),
+        (".gi", ".git"),
+        ("", ".git"),
+        ("\u{200C}", ".git"),
+        ("git", ".git"),
+        (".g\u{130}t", ".git"),
+        ("\u{FF0E}git", ".git"),
+        (".g it", ".git"),
+        ("_darcs\u{17F}", "_darcs"),
+    ] {
+        assert!(
+            !may_open_as(OsStr::new(text), spelled),
+            "{text:?} is not {spelled:?}"
+        );
+    }
+}
+
+/// A char a volume folds or decomposes to several ASCII chars stands for that whole run.
+#[test]
+fn an_expanding_spelling_may_open_as_the_reserved_run() {
+    for (text, spelled) in [
+        ("_FO\u{DF}IL_", "_FOSSIL_"),
+        ("\u{1E9E}", "ss"),
+        (".\u{FB01}x", ".fix"),
+        ("\u{FB03}", "FFI"),
+        ("\u{FB06}", "st"),
+        ("\u{FB05}", "st"),
+        (".g\u{37E}", ".g;"),
+        ("\u{1FEF}", "`"),
+    ] {
+        assert!(
+            may_open_as(OsStr::new(text), spelled),
+            "{text:?} opens as {spelled:?}"
+        );
+    }
+    for (text, spelled) in [
+        ("\u{DF}", "s"),
+        ("\u{DF}", "sss"),
+        ("\u{FB03}", "ff"),
+        ("s\u{DF}", "ss"),
+        ("\u{37E}", ":"),
+    ] {
+        assert!(
+            !may_open_as(OsStr::new(text), spelled),
+            "{text:?} is not {spelled:?}"
+        );
+    }
+}
+
+/// Every all-ASCII spelling of every char, by case mapping or canonical
+/// decomposition, is the one spelling the reserved-name match accepts for it.
+#[test]
+fn every_ascii_spelling_of_a_char_may_open_as_it() {
+    let ascii = |run: String| run.is_ascii().then(|| run.to_ascii_lowercase());
+    for c in (0..=u32::from(char::MAX)).filter_map(char::from_u32) {
+        let lower = || c.to_lowercase();
+        let upper = || c.to_uppercase();
+        let mut decomposed = String::new();
+        unicode_normalization::char::decompose_canonical(c, |d| decomposed.push(d));
+        let mut spellings: Vec<String> = [
+            lower().collect::<String>(),
+            upper().collect(),
+            lower().flat_map(char::to_uppercase).collect(),
+            upper().flat_map(char::to_lowercase).collect(),
+            decomposed,
+        ]
+        .into_iter()
+        .filter_map(ascii)
+        .collect();
+        spellings.sort();
+        spellings.dedup();
+        assert!(spellings.len() <= 1, "{c:?} has spellings {spellings:?}");
+        let text = c.to_string();
+        for spelled in &spellings {
+            assert!(
+                may_open_as(OsStr::new(&text), spelled),
+                "{c:?} opens as {spelled:?}"
+            );
+        }
+    }
 }

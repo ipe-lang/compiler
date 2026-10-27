@@ -51,7 +51,9 @@ pub fn ui_tagged_node_<M>(
     attrs: Vec<Attribute<M>>,
     children: Vec<Element<M>>,
 ) -> Element<M> {
-    if admit_element(&tag, &children).is_err() {
+    // Ui attributes are not yet `Html` ones: the frame rule runs on them in
+    // the `ui/render.rs` lowering every Ui tree passes before it is `Html`.
+    if admit_element::<_, M>(&tag, &[], &children).is_err() {
         return Element::Empty;
     }
     Element::TaggedNode(tag, desc, attrs, children)
@@ -145,7 +147,7 @@ pub fn ui_button_<M: Clone>(
     match on_press {
         IpeMaybe::Just(msg) => {
             full.push(Attribute::AttrEvent(HtmlAttribute::EventAttr(
-                Event::OnMsg("click".into(), msg),
+                Event::OnMsg("click".into(), Box::new(msg)),
             )));
             full.push(Attribute::AttrPointer);
         }
@@ -671,7 +673,7 @@ pub fn html_node_<M>(
     attrs: Vec<crate::html::Attribute<M>>,
     children: Vec<Html<M>>,
 ) -> Html<M> {
-    if admit_element(&tag, &children).is_err() {
+    if admit_element(&tag, &attrs, &children).is_err() {
         return Html::HText(String::new());
     }
     Html::HElement(tag, attrs, children)
@@ -713,24 +715,33 @@ use crate::html::{Attribute as HtmlAttribute, Event};
 
 /// `Ui.onClick : msg -> Attribute msg`
 pub fn ui_on_click_<M>(msg: M) -> Attribute<M> {
-    Attribute::AttrEvent(HtmlAttribute::EventAttr(Event::OnMsg("click".into(), msg)))
+    Attribute::AttrEvent(HtmlAttribute::EventAttr(Event::OnMsg(
+        "click".into(),
+        Box::new(msg),
+    )))
 }
 
 /// `Ui.onFocus : msg -> Attribute msg`
 pub fn ui_on_focus_<M>(msg: M) -> Attribute<M> {
-    Attribute::AttrEvent(HtmlAttribute::EventAttr(Event::OnMsg("focus".into(), msg)))
+    Attribute::AttrEvent(HtmlAttribute::EventAttr(Event::OnMsg(
+        "focus".into(),
+        Box::new(msg),
+    )))
 }
 
 /// `Ui.onBlur : msg -> Attribute msg`
 pub fn ui_on_blur_<M>(msg: M) -> Attribute<M> {
-    Attribute::AttrEvent(HtmlAttribute::EventAttr(Event::OnMsg("blur".into(), msg)))
+    Attribute::AttrEvent(HtmlAttribute::EventAttr(Event::OnMsg(
+        "blur".into(),
+        Box::new(msg),
+    )))
 }
 
 /// `Ui.onMouseOver : msg -> Attribute msg`
 pub fn ui_on_mouse_over_<M>(msg: M) -> Attribute<M> {
     Attribute::AttrEvent(HtmlAttribute::EventAttr(Event::OnMsg(
         "mouseover".into(),
-        msg,
+        Box::new(msg),
     )))
 }
 
@@ -738,15 +749,15 @@ pub fn ui_on_mouse_over_<M>(msg: M) -> Attribute<M> {
 pub fn ui_on_mouse_out_<M>(msg: M) -> Attribute<M> {
     Attribute::AttrEvent(HtmlAttribute::EventAttr(Event::OnMsg(
         "mouseout".into(),
-        msg,
+        Box::new(msg),
     )))
 }
 
 /// `Ui.onInput : (String -> msg) -> Attribute msg`
 ///
 /// The callback is Arc-wrapped so the runtime can dispatch it from a
-/// send-safe context.  Callers emit `std::sync::Arc::new(move |_x| (f)(_x))`
-/// where `f` is the emitted Ipê function expression (T6 trap).
+/// send-safe context.  Callers emit `std::sync::Arc::new(<closure>)`, the
+/// handler closure itself.
 pub fn ui_on_input_<M>(f: std::sync::Arc<dyn Fn(String) -> M + Send + Sync>) -> Attribute<M> {
     Attribute::AttrEvent(HtmlAttribute::EventAttr(Event::OnString("input".into(), f)))
 }
@@ -776,7 +787,7 @@ pub fn ui_on_key_up_<M>(f: std::sync::Arc<dyn Fn(String) -> M + Send + Sync>) ->
 ///
 /// Wires a boolean-carrying event (typically `change` on a checkbox) so that
 /// the Ipê callback receives the DOM `checked` value as a Rust `bool`.
-/// The `f` argument is arc-wrapped at the call site by the emitter (T6 trap).
+/// The emitter passes the handler closure itself in the `Arc`.
 pub fn ui_on_bool_<M>(f: std::sync::Arc<dyn Fn(bool) -> M + Send + Sync>) -> Attribute<M> {
     Attribute::AttrEvent(HtmlAttribute::EventAttr(Event::OnBool("change".into(), f)))
 }

@@ -31,7 +31,10 @@ pub const SOURCE_EXTENSION: &str = "ipe";
 /// The generated / vendor directories a confined watch must never observe —
 /// watching them would self-trigger a rebuild loop (the watcher's own output
 /// changing the input it watches).
-const EXCLUDED_DIR_NAMES: &[&str] = &[
+///
+/// The `ipe` CLI owns the project layout; its build fails unless this list
+/// holds the cache namespace, the build cache and the default output directory.
+pub const EXCLUDED_DIR_NAMES: &[&str] = &[
     "target",
     ".git",
     "node_modules",
@@ -542,7 +545,7 @@ fn is_temp_sibling(path: &Path) -> bool {
 /// The project manifest filename. It shares the `.ipe` extension but is a
 /// config file, not a source module, so it is watched yet excluded from the
 /// source-module count that bounds the `DoS` guard.
-const MANIFEST_FILE: &str = "package.ipe";
+pub const MANIFEST_FILE: &str = "package.ipe";
 
 /// Whether `path`'s extension is the `.ipe` source extension.
 fn is_source_file(path: &Path) -> bool {

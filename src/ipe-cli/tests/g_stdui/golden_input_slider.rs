@@ -8,7 +8,7 @@
 //! at resolution time (the name was unregistered in `STDLIB_MODULE_QUALIFIERS`
 //! in older builds) or a `CompilerBug` panic at lowering.
 //!
-//! This test asserts that `ipe::build` succeeds on the fixture — no pipeline
+//! This test asserts that `support::build_golden` succeeds on the fixture — no pipeline
 //! diagnostic, no panic.  It does NOT run cargo or the emitted binary (no
 //! `IPE_E2E` required).
 
@@ -19,21 +19,17 @@ fn repo_root() -> PathBuf {
     std::fs::canonicalize(&joined).unwrap_or(joined)
 }
 
-/// Compile `tests/golden/input_slider/Main.ipe` and assert it succeeds.
+/// Compile `tests/golden/input_slider/src/Main.ipe` and assert it succeeds.
 /// Skips silently when the runtime cannot be resolved (CI without runtime dir).
 #[test]
 fn input_slider_typechecks_and_lowers() {
     let root = repo_root();
-    let entry = root
-        .join("tests")
-        .join("golden")
-        .join("input_slider")
-        .join("Main.ipe");
+    let golden_project = root.join("tests").join("golden").join("input_slider");
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("i148_input_slider_emit");
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
-    let result = ipe::build(&entry, &out, &runtime);
+    let result = crate::support::build_golden(&golden_project, &out, &runtime);
     assert!(
         result.is_ok(),
         "Input.slider must compile without diagnostic; got: {:?}",

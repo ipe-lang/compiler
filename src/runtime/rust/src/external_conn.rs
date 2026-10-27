@@ -29,10 +29,9 @@
 //! and idempotent; a dropped `Connection` drops its pool via sqlx's own `Drop`.
 
 use super::IpeResult;
-use crate::core::{IpeTask, ok_res, str_err};
-use crate::db::{DbConnectError, DbEngine, DbUrl, VettedPool, connect_refusal, driver_error};
+use crate::core::{IpeTask, ok_res};
+use crate::db::{DbConnectError, DbEngine, VettedPool, connect_refusal, driver_error, dsn_db_url};
 use crate::dsn::{Dsn, DsnDriver};
-use crate::ssrf::VettedDial;
 
 /// A live external database connection: an independent pool of the dialect the
 /// [`Dsn`] named, distinct from the app's monomorphised `Db`.
@@ -103,21 +102,12 @@ async fn open_external<E: Send + From<String> + crate::FromIpeError + 'static>(
     dsn: Dsn,
 ) -> IpeResult<E, ExternalConnection> {
     let engine = dsn_engine(dsn.driver());
-    let url = match DbUrl::parse(&dsn.connection_url()) {
+    let url = match dsn_db_url(&dsn).await {
         Ok(url) => url,
         Err(refused) => return IpeResult::Err(connect_err(engine, &refused)),
     };
     match dsn.driver() {
         DsnDriver::Postgres => {
-            // Defence in depth: the host the `Dsn` parse boundary extracted is
-            // gated here, and `VettedPool::connect` independently gates every
-            // host its own parse of the URL finds. A `DsnHost` is proven not to
-            // be part of the DSN's credentials, so the refusal may name it.
-            if let Err(refusal) =
-                VettedDial::for_configured_host(dsn.host().configured(), dsn.port()).await
-            {
-                return IpeResult::Err(str_err(&format!("external connect: {refusal}")));
-            }
             match VettedPool::<sqlx::Postgres>::connect(&url, EXTERNAL_POOL_MAX_CONNECTIONS).await {
                 Ok(vetted) => ok_res(ExternalConnection::Postgres(vetted.into_pool())),
                 Err(refused) => IpeResult::Err(connect_err(engine, &refused)),
@@ -132,7 +122,7 @@ async fn open_external<E: Send + From<String> + crate::FromIpeError + 'static>(
     }
 }
 
-/// `Ipe.Db.open : Dsn -> Task Error (Connection ReadOnly)` — the SAFE connector.
+/// `Ipe.Db.Dsn.open : Dsn -> Task Error (Connection ReadOnly)` — the SAFE connector.
 /// The `Dsn` arrived through a validating parse, so no unchecked string reaches
 /// the connector. Discloses `network` (the enforceable egress axis).
 #[must_use]
@@ -171,12 +161,14 @@ pub fn db_conn_unsafe_exec_raw_on<E: Send + From<String> + crate::FromIpeError +
         // Each dialect's `execute` yields a distinct `QueryResult`; reduce each to
         // the shared `u64` rows-affected in-arm so the match unifies on one type.
         let affected: Result<u64, (DbEngine, sqlx::Error)> = match &conn {
-            ExternalConnection::Postgres(pool) => sqlx::query(&sql)
-                .execute(pool)
-                .await
-                .map(|d| d.rows_affected())
-                .map_err(|e| (DbEngine::Postgres, e)),
-            ExternalConnection::Sqlite(pool) => sqlx::query(&sql)
+            ExternalConnection::Postgres(pool) => {
+                sqlx::query(super::sql_text::program_authored(sql))
+                    .execute(pool)
+                    .await
+                    .map(|d| d.rows_affected())
+                    .map_err(|e| (DbEngine::Postgres, e))
+            }
+            ExternalConnection::Sqlite(pool) => sqlx::query(super::sql_text::program_authored(sql))
                 .execute(pool)
                 .await
                 .map(|d| d.rows_affected())
@@ -195,6 +187,7 @@ pub fn db_conn_unsafe_exec_raw_on<E: Send + From<String> + crate::FromIpeError +
 mod tests {
     use super::*;
     use crate::dsn::dsn_parse;
+    use crate::ssrf::VettedDial;
     use crate::{IpeDbFailure, IpeError, IpeErrorDetails, IpeErrorKind, IpeMaybe};
 
     /// A failed raw statement on an external connection is classified like any

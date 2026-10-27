@@ -1,92 +1,141 @@
-module Lib.Keys exposing (KeyAction(..), keyAction, label)
-
-import Ipe.String as String
+module Lib.Keys exposing (KeyAction(..), KeyMode(..), Position, index, keyAction, position)
 
 
 -- Page-level keyboard shortcuts. The mapping lives here, pure and
--- testable; Main only translates each KeyAction into the same Msg the
+-- testable; App only translates each KeyAction into the same Msg the
 -- matching button dispatches, so the buttons stay the single source of truth.
-type KeyAction
-    = ApproveSelected
-    | RefuseSelected
-    | Select Int
-    | ConfirmRefuse
-    | CancelRefuse
+-- `card` is what a decision shortcut acts on and `panel` what a refusal
+-- panel's Enter and Escape act on; the two are distinct type variables, so a
+-- panel row can never stand in for a card, nor a card for a panel row.
+
+-- Where the selection stands among the cards a page holds: `at` within
+-- `0 .. count - 1`, `count` at least 1. Opaque: built only by `position`, so
+-- an index past the cards or a selection over no cards has no representation.
+type Position
+    = Position { at : Int, count : Int }
+
+
+-- The selection `selected` over `count` cards, clamped into them; none when
+-- there are no cards.
+position : Int -> Int -> Maybe Position
+position selected count =
+    if count < 1 then
+        Nothing
+
+    else
+        Just (Position { at = max 0 (min selected (count - 1)), count = count })
+
+
+index : Position -> Int
+index pos =
+    case pos of
+        Position p ->
+            p.at
+
+
+-- `pos` moved to `i`, clamped into its cards.
+moveTo : Int -> Position -> Position
+moveTo i pos =
+    case pos of
+        Position p ->
+            Position { at = max 0 (min i (p.count - 1)), count = p.count }
+
+
+-- How a key is read. `InPanel`: typed into a refusal panel, with the panel
+-- row its render drew when it drew one. `OnCards`: a shortcut, with the card
+-- its render drew and where the selection stands. `Dormant`: no key acts.
+type KeyMode card panel
+    = InPanel (Maybe panel)
+    | OnCards (Maybe card) Position
+    | Dormant
+
+
+-- Each action carries the payload its mode drew; the buttons send the same
+-- messages, so the keys stay a mirror.
+type KeyAction card panel
+    = ApproveSelected card
+    | RefuseSelected card
+    | Select Position
+    | ConfirmRefuse panel
+    | CancelRefuse panel
     | Ignore
 
 
-label : KeyAction -> String
-label action =
-    case action of
-        ApproveSelected ->
-            "approve"
+keyAction : KeyMode card panel -> String -> KeyAction card panel
+keyAction mode key =
+    case mode of
+        InPanel drawn ->
+            panelKey drawn key
 
-        RefuseSelected ->
-            "refuse"
+        OnCards card at ->
+            cardKey card at key
 
-        Select i ->
-            "select" ++ String.fromInt i
-
-        ConfirmRefuse ->
-            "confirm"
-
-        CancelRefuse ->
-            "cancel"
-
-        Ignore ->
-            "ignore"
+        Dormant ->
+            Ignore
 
 
--- panelOpen: a refuse-reason panel is showing; its text input must not be
--- hijacked by shortcuts, so only Enter (confirm) and Escape (cancel) act.
--- len: queue length; 0 disables every shortcut. selected: current index.
-keyAction : Bool -> Int -> Int -> String -> KeyAction
-keyAction panelOpen len selected key =
-    if panelOpen then
-        case key of
-            "Enter" ->
-                ConfirmRefuse
+-- In a panel only Enter and Escape act, and only on the panel row drawn; a
+-- reason's letters are never shortcuts.
+panelKey : Maybe panel -> String -> KeyAction card panel
+panelKey drawn key =
+    case drawn of
+        Just row ->
+            case key of
+                "Enter" ->
+                    ConfirmRefuse row
 
-            "Escape" ->
-                CancelRefuse
+                "Escape" ->
+                    CancelRefuse row
 
-            _ ->
-                Ignore
+                _ ->
+                    Ignore
 
-    else if len == 0 then
-        Ignore
+        Nothing ->
+            Ignore
 
-    else
-        case key of
-            "a" ->
-                ApproveSelected
 
-            "r" ->
-                RefuseSelected
+cardKey : Maybe card -> Position -> String -> KeyAction card panel
+cardKey card at key =
+    case key of
+        "a" ->
+            onCard ApproveSelected card
 
-            "j" ->
-                Select (min (selected + 1) (len - 1))
+        "r" ->
+            onCard RefuseSelected card
 
-            "k" ->
-                Select (max (selected - 1) 0)
+        "j" ->
+            Select (moveTo (index at + 1) at)
 
-            "g" ->
-                Select 0
+        "k" ->
+            Select (moveTo (index at - 1) at)
 
-            "1" ->
-                Select (min 0 (len - 1))
+        "g" ->
+            Select (moveTo 0 at)
 
-            "2" ->
-                Select (min 1 (len - 1))
+        "1" ->
+            Select (moveTo 0 at)
 
-            "3" ->
-                Select (min 2 (len - 1))
+        "2" ->
+            Select (moveTo 1 at)
 
-            "4" ->
-                Select (min 3 (len - 1))
+        "3" ->
+            Select (moveTo 2 at)
 
-            "5" ->
-                Select (min 4 (len - 1))
+        "4" ->
+            Select (moveTo 3 at)
 
-            _ ->
-                Ignore
+        "5" ->
+            Select (moveTo 4 at)
+
+        _ ->
+            Ignore
+
+
+onCard : (card -> KeyAction card panel) -> Maybe card -> KeyAction card panel
+onCard act card =
+    case card of
+        Just drawn ->
+            act drawn
+
+        Nothing ->
+            Ignore

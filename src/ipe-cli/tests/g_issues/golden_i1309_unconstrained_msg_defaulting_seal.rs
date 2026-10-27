@@ -23,11 +23,8 @@ use crate::support::repo_root;
 
 const GOLDEN: &str = "unconstrained_msg_defaulting_seal";
 
-fn fixture_entry(root: &Path) -> PathBuf {
-    root.join("tests")
-        .join("golden")
-        .join(GOLDEN)
-        .join("Main.ipe")
+fn fixture_dir(root: &Path) -> PathBuf {
+    root.join("tests").join("golden").join(GOLDEN)
 }
 
 /// Emit gate: the frontend must accept the free-`msg` helper and emit it (its
@@ -35,12 +32,12 @@ fn fixture_entry(root: &Path) -> PathBuf {
 #[test]
 fn unconstrained_msg_defaulting_emits() {
     let root = repo_root();
-    let entry = fixture_entry(&root);
+    let golden_dir = fixture_dir(&root);
     let out = crate::support::scratch_root().join("ipec_unconstrained_msg_defaulting_seal_emit");
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
-    let built = ipe::build(&entry, &out, &runtime);
+    let built = crate::support::build_golden(&golden_dir, &out, &runtime);
     assert!(
         built.is_ok(),
         "a message-free `page : Html msg` must be accepted and emitted with its \
@@ -55,12 +52,12 @@ fn unconstrained_msg_defaulting_emits() {
 #[test]
 fn unconstrained_msg_defaulting_seal_builds() {
     let root = repo_root();
-    let entry = fixture_entry(&root);
+    let golden_dir = fixture_dir(&root);
     let out = crate::support::scratch_root().join("ipec_unconstrained_msg_defaulting_seal_e2e");
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
-    let built = ipe::build(&entry, &out, &runtime);
+    let built = crate::support::build_golden(&golden_dir, &out, &runtime);
     assert!(built.is_ok(), "{GOLDEN} must be accepted, got: {built:?}");
 
     crate::support::assert_seal_builds(GOLDEN, &out);

@@ -68,6 +68,12 @@ const GATED_OWNER_PATHS: [[&str; 2]; 2] =
 /// The gate function `VettedPool::connect` takes its options from.
 const GATE_OPTIONS_FN: &str = "gated_connect_options";
 
+/// The free function that builds the options of every pool `VettedPool::connect` opens.
+///
+/// It names a `*PoolOptions` builder and no dial: a builder opens nothing until
+/// a dial function runs on it, and every such call is held to the gate rule.
+const POOL_OPTIONS_FN: &str = "vetted_pool_options";
+
 /// The driver type parameter `VettedPool::connect` calls the gate through.
 const GATE_DRIVER_PARAM: &str = "DB";
 
@@ -97,49 +103,90 @@ struct AllowedDial {
     func: &'static str,
     /// The dial's path, as written.
     dial: &'static str,
+    /// For a method dial, the one call shape admitted; `None` for a path dial.
+    method: Option<AllowedMethod>,
     /// Why the dial needs no gate.
     why: &'static str,
+}
+
+/// The one shape of an admitted method dial: `receiver_fn(..).method(..)`.
+struct AllowedMethod {
+    /// The function whose call result the method is called on, as written.
+    receiver_fn: &'static str,
+    /// How many arguments that call takes.
+    receiver_args: usize,
+    /// How many arguments the method takes.
+    args: usize,
 }
 
 impl AllowedDial {
     /// Whether `dial` is this entry's.
     fn admits(&self, dial: &Dial) -> bool {
-        dial.path == self.dial
+        let shaped = match (&self.method, &dial.method) {
+            (None, None) => true,
+            (Some(want), Some(got)) => {
+                got.args == want.args
+                    && got.receiver.as_ref().is_some_and(|receiver| {
+                        receiver.path == want.receiver_fn && receiver.args == want.receiver_args
+                    })
+            }
+            (None, Some(_)) | (Some(_), None) => false,
+        };
+        shaped
+            && dial.path == self.dial
             && dial.within.impl_of.is_none()
             && dial.within.func.as_deref() == Some(self.func)
     }
 }
 
 /// Every raw dial admitted outside `db.rs`; each must match exactly one dial.
-const ALLOWED_DIALS: [AllowedDial; 5] = [
+const ALLOWED_DIALS: [AllowedDial; 6] = [
     AllowedDial {
         file: "web/hub.rs",
         func: "open_spill",
         dial: "SqlitePool::connect_with",
+        method: None,
         why: "opens the console's local SQLite spill file from a filesystem path, not a URL",
     },
     AllowedDial {
         file: "telemetry_spill.rs",
         func: "open_spill_pool",
         dial: "SqlitePool::connect_with",
+        method: None,
         why: "opens the local SQLite spill file the runtime's own environment names",
     },
     AllowedDial {
         file: "ws_client.rs",
         func: "do_connect",
         dial: "tokio::net::TcpStream::connect",
-        why: "a TCP dial of the address `VettedDial::Pinned` proved, not a sqlx dial",
+        method: None,
+        why: "the WebSocket TCP dial: of the address `VettedDial::Pinned` proved, or, only under \
+              `VettedDial::Unrestricted`, of the URL's own host; not a sqlx dial",
+    },
+    AllowedDial {
+        file: "ws_client.rs",
+        func: "tls_handshake",
+        dial: ".connect",
+        method: Some(AllowedMethod {
+            receiver_fn: "tokio_rustls::TlsConnector::from",
+            receiver_args: 1,
+            args: 2,
+        }),
+        why: "`tokio_rustls::TlsConnector::connect`, the TLS handshake over the TCP stream \
+              `do_connect` already dialled; it opens no network target",
     },
     AllowedDial {
         file: "ssrf.rs",
         func: "dial_relay_target",
         dial: "tokio::net::TcpStream::connect",
+        method: None,
         why: "the pinned relay's TCP dial of a `VettedAddr`, which only `VettedDial::Pinned` can mint, not a sqlx dial",
     },
     AllowedDial {
         file: "web/console_proxy.rs",
         func: "wait_ready",
         dial: "tokio::net::TcpStream::connect",
+        method: None,
         why: "a loopback readiness probe of the child this process spawned, not a sqlx dial",
     },
 ];
@@ -210,6 +257,15 @@ impl Scope {
             func: Some("connect".to_owned()),
         }
     }
+
+    /// The body of the free `vetted_pool_options`, the one place a pool-options builder may be named.
+    fn pool_options() -> Self {
+        Self {
+            impl_of: None,
+            of_trait: None,
+            func: Some(POOL_OPTIONS_FN.to_owned()),
+        }
+    }
 }
 
 impl std::fmt::Display for Scope {
@@ -246,7 +302,50 @@ struct Dial {
     gated: bool,
     /// The first argument, when it is a bare local name.
     arg: Option<String>,
+    /// For a method dial, its call shape.
+    method: Option<MethodShape>,
     within: Scope,
+}
+
+/// The call shape of a method dial.
+#[derive(Clone, Debug)]
+struct MethodShape {
+    /// The receiver, when it is a call of a plain path.
+    receiver: Option<PathCall>,
+    /// How many arguments the method takes.
+    args: usize,
+}
+
+/// A call of a path with no qualified self, leading `::` or generic arguments.
+#[derive(Clone, Debug)]
+struct PathCall {
+    /// The called path, as written.
+    path: String,
+    /// How many arguments the call takes.
+    args: usize,
+}
+
+/// `expr` as a call of a plain path, if it is one.
+fn path_call(expr: &Expr) -> Option<PathCall> {
+    let Expr::Call(call) = expr else {
+        return None;
+    };
+    let Expr::Path(func) = &*call.func else {
+        return None;
+    };
+    let plain = func.qself.is_none()
+        && func.path.leading_colon.is_none()
+        && func.path.segments.iter().all(|s| s.arguments.is_none());
+    plain.then(|| PathCall {
+        path: func
+            .path
+            .segments
+            .iter()
+            .map(|s| name_of(&s.ident))
+            .collect::<Vec<_>>()
+            .join("::"),
+        args: call.args.len(),
+    })
 }
 
 /// One SMTP transport constructor in production code.
@@ -370,12 +469,25 @@ impl Scan {
         gated: bool,
         arg: Option<String>,
     ) {
+        self.record_dial_shaped(name, path, kind, gated, arg, None);
+    }
+
+    fn record_dial_shaped(
+        &mut self,
+        name: String,
+        path: String,
+        kind: DialKind,
+        gated: bool,
+        arg: Option<String>,
+        method: Option<MethodShape>,
+    ) {
         self.dials.push(Dial {
             name,
             path,
             kind,
             gated,
             arg,
+            method,
             within: self.scope.clone(),
         });
     }
@@ -721,12 +833,17 @@ impl<'ast> Visit<'ast> for Scan {
         let method = name_of(&call.method);
         if DIAL_FNS.contains(&method.as_str()) {
             let arg = call.args.first().and_then(local_name);
-            self.record_dial(
+            let shape = MethodShape {
+                receiver: path_call(&call.receiver),
+                args: call.args.len(),
+            };
+            self.record_dial_shaped(
                 method.clone(),
                 format!(".{method}"),
                 DialKind::Sqlx,
                 false,
                 arg,
+                Some(shape),
             );
         } else if SMTP_TRANSPORT_FNS.contains(&method.as_str()) {
             let vetted = call.args.first().is_some_and(is_vetted_host);
@@ -909,7 +1026,19 @@ fn db_gate_violations(name: &str, scan: &Scan) -> Vec<String> {
         )),
         _ => {}
     }
-    for dial in scan.dials.iter().filter(|d| !d.gated && d.within != gate) {
+    let builder = Scope::pool_options();
+    let builders = scan.fns.iter().filter(|f| **f == builder).count();
+    if builders > 1 {
+        violations.push(format!(
+            "{name}: {builders} `fn {POOL_OPTIONS_FN}` bodies found; at most one builds pool options"
+        ));
+    }
+    let builds_options = |d: &Dial| d.kind == DialKind::PoolOptions && d.within == builder;
+    for dial in scan
+        .dials
+        .iter()
+        .filter(|d| !d.gated && d.within != gate && !builds_options(d))
+    {
         violations.push(format!(
             "{name}: {}: raw dial `{}` outside VettedPool::connect",
             dial.within, dial.name
@@ -1346,6 +1475,56 @@ async fn sneaky(url: &str) {{
     );
 }
 
+/// A `*PoolOptions` builder is admitted only in the free `vetted_pool_options`,
+/// and a dial inside that function is as refused as one anywhere else.
+#[test]
+fn pool_options_builder_is_admitted_only_in_its_one_function() {
+    let builder = "
+fn vetted_pool_options<DB>(max: u32) -> PoolOptions<DB> {
+    PoolOptions::<DB>::new().max_connections(max)
+}
+";
+    let admitted = format!("{GATED_POOL_FIXTURE}{builder}");
+    assert_eq!(
+        db_dials_bypassing_the_gate("fixture.rs", &admitted),
+        Vec::<String>::new()
+    );
+
+    let elsewhere = format!(
+        "{GATED_POOL_FIXTURE}\nfn other<DB>(max: u32) -> PoolOptions<DB> {{ PoolOptions::<DB>::new() }}\n"
+    );
+    assert_violations(
+        &db_dials_bypassing_the_gate("fixture.rs", &elsewhere),
+        1,
+        "outside VettedPool::connect",
+    );
+
+    let in_method = format!(
+        "{GATED_POOL_FIXTURE}\nimpl Other {{ fn vetted_pool_options<DB>() -> PoolOptions<DB> {{ PoolOptions::<DB>::new() }} }}\n"
+    );
+    assert_violations(
+        &db_dials_bypassing_the_gate("fixture.rs", &in_method),
+        1,
+        "outside VettedPool::connect",
+    );
+
+    let dialing = format!(
+        "{GATED_POOL_FIXTURE}\nfn vetted_pool_options<DB>(url: String) {{ PoolOptions::<DB>::new().connect(url); }}\n"
+    );
+    assert_violations(
+        &db_dials_bypassing_the_gate("fixture.rs", &dialing),
+        1,
+        "outside VettedPool::connect",
+    );
+
+    let twice = format!("{admitted}{builder}");
+    assert_violations(
+        &db_dials_bypassing_the_gate("fixture.rs", &twice),
+        1,
+        "bodies found",
+    );
+}
+
 /// A string literal that spells a dial is not a dial, and a comment or string
 /// inside the gate body that spells the gate call does not stand in for it.
 #[test]
@@ -1741,6 +1920,116 @@ fn allowed_dials_admit_only_their_own_dial_once() {
     );
 }
 
+/// The `wss://` handshake's `.connect` is admitted once, in `tls_handshake`
+/// only: a second `.connect` there, a path dial there, or a `.connect` in any
+/// other function of `ws_client.rs` is refused.
+#[test]
+fn the_tls_handshake_admits_only_its_own_connect() {
+    const DIAL: &str = "async fn do_connect() {
+    let _ = tokio::net::TcpStream::connect(addrs).await;
+}
+";
+    const HANDSHAKE: &str = "async fn tls_handshake(tcp: TcpStream) {
+    let _ = tokio_rustls::TlsConnector::from(config).connect(name, tcp).await;
+}
+";
+    assert_eq!(
+        tree_violations("ws_client.rs", &format!("{DIAL}{HANDSHAKE}")),
+        Vec::<String>::new()
+    );
+    let second = "async fn tls_handshake(tcp: TcpStream) {
+    let _ = tokio_rustls::TlsConnector::from(config).connect(name, tcp).await;
+    let _ = options.connect(url).await;
+}
+";
+    assert_violations(
+        &tree_violations("ws_client.rs", &format!("{DIAL}{second}")),
+        1,
+        "fn tls_handshake: raw dial `connect`",
+    );
+    let twice = "async fn tls_handshake(tcp: TcpStream) {
+    let _ = tokio_rustls::TlsConnector::from(config).connect(name, tcp).await;
+    let _ = tokio_rustls::TlsConnector::from(config).connect(name, tcp).await;
+}
+";
+    assert_violations(
+        &tree_violations("ws_client.rs", &format!("{DIAL}{twice}")),
+        1,
+        "allowed dial `.connect` in fn tls_handshake",
+    );
+    let elsewhere = "async fn reconnect() {
+    let _ = options.connect(url).await;
+}
+";
+    assert_violations(
+        &tree_violations("ws_client.rs", &format!("{DIAL}{HANDSHAKE}{elsewhere}")),
+        1,
+        "fn reconnect: raw dial `connect`",
+    );
+    let pathed = "async fn tls_handshake(tcp: TcpStream) {
+    let _ = PgPool::connect(url).await;
+}
+";
+    let violations = tree_violations("ws_client.rs", &format!("{DIAL}{pathed}"));
+    assert_eq!(violations.len(), 2, "{violations:#?}");
+    assert!(
+        violations
+            .iter()
+            .any(|v| v.contains("fn tls_handshake: raw dial `connect`")),
+        "{violations:#?}"
+    );
+    assert!(
+        violations.iter().any(|v| v.contains("matches 0 dials")),
+        "{violations:#?}"
+    );
+}
+
+/// The handshake's `.connect` is admitted only on a one-argument
+/// `tokio_rustls::TlsConnector::from` call and with two arguments: any other
+/// `.connect` in `tls_handshake`, a sqlx one included, is a raw dial.
+#[test]
+fn the_tls_handshake_connect_is_admitted_only_in_its_own_shape() {
+    const DIAL: &str = "async fn do_connect() {
+    let _ = tokio::net::TcpStream::connect(addrs).await;
+}
+";
+    for body in [
+        "PgConnectOptions::from_str(url)?.connect()",
+        "PgConnectOptions::from(url).connect(name, tcp)",
+        "TlsConnector::from(config).connect(name, tcp)",
+        "::tokio_rustls::TlsConnector::from(config).connect(name, tcp)",
+        "tokio_rustls::TlsConnector::<C>::from(config).connect(name, tcp)",
+        "<tokio_rustls::TlsConnector>::from(config).connect(name, tcp)",
+        "tokio_rustls::TlsConnector::from(config, more).connect(name, tcp)",
+        "tokio_rustls::TlsConnector::from(config).connect(url)",
+        "tokio_rustls::TlsConnector::from(config).connect(name, tcp, more)",
+        "connector.connect(name, tcp)",
+        "(tokio_rustls::TlsConnector::from(config)).connect(name, tcp)",
+    ] {
+        let handshake = format!(
+            "async fn tls_handshake(tcp: TcpStream) {{
+    let _ = {body}.await;
+}}
+"
+        );
+        let violations = tree_violations("ws_client.rs", &format!("{DIAL}{handshake}"));
+        assert_eq!(violations.len(), 2, "{body}: {violations:#?}");
+        assert!(
+            violations
+                .iter()
+                .any(|v| v.contains("fn tls_handshake: raw dial `connect`")),
+            "{body}: {violations:#?}"
+        );
+        assert!(
+            violations.iter().any(
+                |v| v.contains("allowed dial `.connect` in fn tls_handshake")
+                    && v.contains("matches 0 dials")
+            ),
+            "{body}: {violations:#?}"
+        );
+    }
+}
+
 // ---------------------------------------------------------------------------
 // The dial scans over the runtime's dial sites.
 // ---------------------------------------------------------------------------
@@ -1790,6 +2079,7 @@ fn db_pool_connect_is_guarded() {
     for (impl_of, func) in [
         (None, "build_pool"),
         (None, "vet_dial_target"),
+        (None, POOL_OPTIONS_FN),
         (Some(GATED_OWNER), "connect"),
         (Some("Postgres"), GATE_OPTIONS_FN),
         (Some("Sqlite"), GATE_OPTIONS_FN),

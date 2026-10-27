@@ -1,12 +1,12 @@
 Rebuild and re-run a development build on every source change.
 
 ```
-ipe dev watch [<path>]
+ipe dev watch [<dir>]
 ```
 
 ## Arguments
 
-A source file, a project directory, or a package.ipe. Defaults to the current project.
+A project directory (default: the current directory).
 
 ## Options
 

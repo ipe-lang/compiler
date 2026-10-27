@@ -290,7 +290,7 @@ pub(crate) fn user_ipe_db_store_text_column(name: String) -> IpeDbStoreColumn {
 pub(crate) fn user_ipe_db_store_from_columns(
     table: String,
     columns: Vec<IpeDbStoreColumn>,
-) -> IpeResult<ipe_runtime::error::IpeError, IpeDbStoreDraft<HashMap<String, String>>> {
+) -> IpeResult<ipe_runtime::error::IpeError, IpeDbStoreDraft<HashMap<String, IpeMaybe<String>>>> {
     let _ipe_recursion_guard = crate::recursion_guard();
     crate::user_ipe_db_store_build_store(
         table,
@@ -368,7 +368,7 @@ pub(crate) fn user_ipe_db_store_column_name(col: IpeDbStoreColumn) -> String {
 
 pub(crate) fn user_ipe_db_store_row_codec(
     columns: Vec<IpeDbStoreColumn>,
-) -> IpeCodecCodec<HashMap<String, String>> {
+) -> IpeCodecCodec<HashMap<String, IpeMaybe<String>>> {
     let _ipe_recursion_guard = crate::recursion_guard();
     ({
         let names = list_map_consume(
@@ -384,19 +384,29 @@ pub(crate) fn user_ipe_db_store_row_codec(
                 let names = names.clone();
                 {
                     let __ipe_fn: ::std::sync::Arc<
-                        dyn Fn(HashMap<String, String>) -> JsonVal + Send + Sync + 'static,
-                    > = ::std::sync::Arc::new(move |row: HashMap<String, String>| -> JsonVal {
-                        json_enc_object(crate::user_ipe_db_store_row_fields(names.clone(), row))
-                    });
+                        dyn Fn(HashMap<String, IpeMaybe<String>>) -> JsonVal
+                            + Send
+                            + Sync
+                            + 'static,
+                    > = ::std::sync::Arc::new(
+                        move |row: HashMap<String, IpeMaybe<String>>| -> JsonVal {
+                            json_enc_object(crate::user_ipe_db_store_row_fields(names.clone(), row))
+                        },
+                    );
                     __ipe_fn
                 }
             }),
             mkDec: {
                 let __ipe_fn: ::std::sync::Arc<
-                    dyn Fn(Rec_) -> Decoder<HashMap<String, String>> + Send + Sync + 'static,
-                > = ::std::sync::Arc::new(move |arg_13: Rec_| -> Decoder<HashMap<String, String>> {
-                    config_dict(decode_map(({ let cap_0 = "".to_string(); { let __ipe_fn: Box<dyn Fn(IpeMaybe<String>) -> String + Send + Sync + 'static> = Box::new(move |eta_0: IpeMaybe<String>| -> String { maybe_with_default(cap_0.clone(), eta_0) }); __ipe_fn } }), config_nullable(json_decode_string::<IpeError>())))
-                });
+                    dyn Fn(Rec_) -> Decoder<HashMap<String, IpeMaybe<String>>>
+                        + Send
+                        + Sync
+                        + 'static,
+                > = ::std::sync::Arc::new(
+                    move |arg_13: Rec_| -> Decoder<HashMap<String, IpeMaybe<String>>> {
+                        config_dict(config_nullable(json_decode_string::<IpeError>()))
+                    },
+                );
                 __ipe_fn
             },
             shp: IpeCodecShape::SRecord(list_map_consume(
@@ -419,7 +429,7 @@ pub(crate) fn user_ipe_db_store_row_codec(
 
 pub(crate) fn user_ipe_db_store_row_fields(
     names: Vec<String>,
-    row: HashMap<String, String>,
+    row: HashMap<String, IpeMaybe<String>>,
 ) -> Vec<(String, JsonVal)> {
     let _ipe_recursion_guard = crate::recursion_guard();
     list_map_consume(
@@ -428,7 +438,7 @@ pub(crate) fn user_ipe_db_store_row_fields(
                 Box::new(move |name: String| -> (String, JsonVal) {
                     (
                         name.clone(),
-                        json_enc_string(crate::user_ipe_db_store_row_cell(name, row.clone())),
+                        crate::user_ipe_db_store_row_cell(name, row.clone()),
                     )
                 });
             __ipe_fn
@@ -437,11 +447,15 @@ pub(crate) fn user_ipe_db_store_row_fields(
     )
 }
 
-pub(crate) fn user_ipe_db_store_row_cell(name: String, row: HashMap<String, String>) -> String {
+pub(crate) fn user_ipe_db_store_row_cell(
+    name: String,
+    row: HashMap<String, IpeMaybe<String>>,
+) -> JsonVal {
     let _ipe_recursion_guard = crate::recursion_guard();
     match dict_get(name, row.clone()) {
-        IpeMaybe::Just(s) => s,
-        IpeMaybe::Nothing => "".to_string(),
+        IpeMaybe::Just(IpeMaybe::Just(s)) => json_enc_string(s),
+        IpeMaybe::Just(IpeMaybe::Nothing) => json_enc_null(),
+        IpeMaybe::Nothing => json_enc_null(),
     }
 }
 
@@ -552,11 +566,14 @@ pub(crate) fn user_ipe_db_store_decode_rows<T1: 'static + Send + Sync + Clone>(
 
 pub(crate) fn user_ipe_db_store_read_text(
     name: String,
-    row: HashMap<String, String>,
+    row: HashMap<String, IpeMaybe<String>>,
 ) -> IpeResult<ipe_runtime::error::IpeError, String> {
     let _ipe_recursion_guard = crate::recursion_guard();
     match dict_get(name.clone(), row.clone()) {
-        IpeMaybe::Just(s) => IpeResult::Ok(s),
+        IpeMaybe::Just(IpeMaybe::Just(s)) => IpeResult::Ok(s),
+        IpeMaybe::Just(IpeMaybe::Nothing) => {
+            IpeResult::Err(crate::user_ipe_db_store_null_column_error(name))
+        }
         IpeMaybe::Nothing => IpeResult::Err(crate::user_ipe_db_store_missing_column_error(name)),
     }
 }
@@ -581,5 +598,14 @@ pub(crate) fn user_ipe_db_store_missing_column_error(name: String) -> ipe_runtim
         "Ipe.Db.Store: row is missing column \"".to_string(),
         name,
         "\"".to_string(),
+    ]))
+}
+
+pub(crate) fn user_ipe_db_store_null_column_error(name: String) -> ipe_runtime::error::IpeError {
+    let _ipe_recursion_guard = crate::recursion_guard();
+    ipe_error_invalid_input(string_concat(vec![
+        "Ipe.Db.Store: column \"".to_string(),
+        name,
+        "\" is NULL".to_string(),
     ]))
 }

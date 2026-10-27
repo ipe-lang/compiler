@@ -19,6 +19,7 @@ use std::sync::Arc;
 use ipe_docs::env_vars::{ENV_VARS, EXCLUDED_NAMES, EnvVar};
 
 use crate::coverage::contract::Surface;
+use crate::coverage::source_tree::{TreeRefusal, for_each_source};
 
 /// One item of the env-var surface: a registry entry, or an orphan read.
 ///
@@ -65,11 +66,15 @@ impl Surface for EnvVarSurface {
         // Orphan reads: a variable a Rust `read_env_var`/`env::var` call reads
         // that neither the registry nor the exclusion list homes. Scoped to Rust
         // read *calls* (not every `IPE_*` mention) so a doc string, a template
-        // placeholder, or a build-script variable is not a false orphan.
+        // placeholder, or a build-script variable is not a false orphan. A
+        // tree that cannot be read whole names no orphan; the read-in-code
+        // column then holes every registered variable with the cause.
         let scan = SourceReads::scan();
-        for name in scan.env_reads() {
-            if !registered.contains(name.as_str()) && !excluded.contains(name.as_str()) {
-                items.push(EnvItem::OrphanRead(name.clone()));
+        if let Ok(reads) = scan.env_reads() {
+            for name in reads {
+                if !registered.contains(name.as_str()) && !excluded.contains(name.as_str()) {
+                    items.push(EnvItem::OrphanRead(name.clone()));
+                }
             }
         }
 
@@ -112,10 +117,11 @@ const fn kind_rank(item: &EnvItem) -> u8 {
 ///   orphan scope: a script-local build variable is not an operator env var.
 ///
 /// Plus whether any Rust file hand-rolls a truthy `matches!` table. Scanned once
-/// and cloned into each column so the tree is walked a single time per run.
-#[derive(Clone, Debug, Default)]
+/// and cloned into each column so the tree is walked a single time per run. A
+/// tree that cannot be read whole answers every question with its refusal.
+#[derive(Clone, Debug)]
 pub struct SourceReads {
-    inner: Arc<SourceReadsInner>,
+    inner: Arc<Result<SourceReadsInner, TreeRefusal>>,
 }
 
 #[derive(Debug, Default)]
@@ -129,37 +135,59 @@ impl SourceReads {
     /// Scan the `src/` and `tools/` trees for `IPE_*` variable use.
     #[must_use]
     pub fn scan() -> Self {
+        Self::scan_roots(&[workspace_path("src"), workspace_path("tools")])
+    }
+
+    /// Scan every `.rs`, `.sh`, and `.bash` file under `roots`, or refuse the scan.
+    fn scan_roots(roots: &[PathBuf]) -> Self {
         let mut acc = ScanAcc::default();
-        for root in [workspace_path("src"), workspace_path("tools")] {
-            scan_tree(&root, &mut acc);
-        }
-        acc.all_reads.extend(acc.rust_literals.iter().cloned());
+        let scanned = roots
+            .iter()
+            .try_for_each(|root| scan_tree(root, &mut acc))
+            .map(|()| {
+                acc.all_reads.extend(acc.rust_literals.iter().cloned());
+                SourceReadsInner {
+                    rust_literals: acc.rust_literals,
+                    all_reads: acc.all_reads,
+                    hand_rolled_truthy: acc.hand_rolled_truthy,
+                }
+            });
         Self {
-            inner: Arc::new(SourceReadsInner {
-                rust_literals: acc.rust_literals,
-                all_reads: acc.all_reads,
-                hand_rolled_truthy: acc.hand_rolled_truthy,
-            }),
+            inner: Arc::new(scanned),
         }
+    }
+
+    /// The scan, or the refusal that kept it from reading every source file.
+    fn scanned(&self) -> Result<&SourceReadsInner, &TreeRefusal> {
+        self.inner.as_ref().as_ref()
     }
 
     /// Names read via a Rust `"IPE_…"` literal — the orphan-read scope.
-    #[must_use]
-    pub fn env_reads(&self) -> &BTreeSet<String> {
-        &self.inner.rust_literals
+    ///
+    /// # Errors
+    ///
+    /// The [`TreeRefusal`] that kept the scan from reading every source file.
+    pub fn env_reads(&self) -> Result<&BTreeSet<String>, &TreeRefusal> {
+        self.scanned().map(|inner| &inner.rust_literals)
     }
 
     /// Names read anywhere in the tree, Rust or shell — the read-in-code scope.
-    #[must_use]
-    pub fn all_reads(&self) -> &BTreeSet<String> {
-        &self.inner.all_reads
+    ///
+    /// # Errors
+    ///
+    /// The [`TreeRefusal`] that kept the scan from reading every source file.
+    pub fn all_reads(&self) -> Result<&BTreeSet<String>, &TreeRefusal> {
+        self.scanned().map(|inner| &inner.all_reads)
     }
 
     /// Whether any read site hand-rolls a `matches!(v, "1" | "true" | …)` truthy
     /// table rather than routing through a single canonical parser.
-    #[must_use]
-    pub fn has_hand_rolled_truthy(&self) -> bool {
-        self.inner.hand_rolled_truthy
+    ///
+    /// # Errors
+    ///
+    /// The [`TreeRefusal`] that kept the scan from reading every source file.
+    pub fn has_hand_rolled_truthy(&self) -> Result<bool, &TreeRefusal> {
+        self.scanned().map(|inner| inner.hand_rolled_truthy)
     }
 }
 
@@ -192,18 +220,19 @@ fn is_registry_authoring_file(path: &Path) -> bool {
 }
 
 /// Walk one tree, folding each file's `IPE_*` use into the accumulator.
-fn scan_tree(root: &Path, acc: &mut ScanAcc) {
-    for path in source_files(root) {
+///
+/// # Errors
+///
+/// A [`TreeRefusal`] when any file under `root` cannot be listed or read.
+fn scan_tree(root: &Path, acc: &mut ScanAcc) -> Result<(), TreeRefusal> {
+    for_each_source(root, panic_scan::Want::RustAndShellScripts, |path, src| {
         let ext = path.extension().and_then(|e| e.to_str());
-        let Ok(src) = std::fs::read_to_string(&path) else {
-            continue;
-        };
         match ext {
             Some("rs") => {
-                if is_registry_authoring_file(&path) {
-                    continue;
+                if is_registry_authoring_file(path) {
+                    return;
                 }
-                for name in extract_ipe_literals(&src) {
+                for name in extract_ipe_literals(src) {
                     acc.rust_literals.insert(name);
                 }
                 if src.contains("matches!(v, \"1\" | \"true\"") {
@@ -211,43 +240,13 @@ fn scan_tree(root: &Path, acc: &mut ScanAcc) {
                 }
             }
             Some("sh" | "bash") => {
-                for name in extract_ipe_shell_refs(&src) {
+                for name in extract_ipe_shell_refs(src) {
                     acc.all_reads.insert(name);
                 }
             }
             _ => {}
         }
-    }
-}
-
-/// Collect every `.rs`, `.sh`, and `.bash` file under `root`, skipping hidden and
-/// `target` dirs.
-fn source_files(root: &Path) -> Vec<PathBuf> {
-    let mut out = Vec::new();
-    if !root.exists() {
-        return out;
-    }
-    let mut stack = vec![root.to_owned()];
-    while let Some(dir) = stack.pop() {
-        let Ok(entries) = std::fs::read_dir(&dir) else {
-            continue;
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-                if !name.starts_with('.') && name != "target" {
-                    stack.push(path);
-                }
-            } else if matches!(
-                path.extension().and_then(|e| e.to_str()),
-                Some("rs" | "sh" | "bash")
-            ) {
-                out.push(path);
-            }
-        }
-    }
-    out
+    })
 }
 
 /// Extract every `"IPE_[A-Z0-9_]+"` string literal from a Rust source string.
@@ -318,4 +317,42 @@ fn is_valid_ipe_name(s: &str) -> bool {
         && suffix
             .chars()
             .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::coverage::columns_env::{ReadInCodeColumn, TruthyParseColumn};
+    use crate::coverage::contract::{AspectCheck, Cell};
+
+    /// A tree the scan cannot read whole holes every registered variable with the
+    /// cause, never "read nowhere" and never a clean truthy check.
+    #[test]
+    fn an_unlisted_tree_holes_every_registered_variable_with_its_cause() {
+        let missing = ipe_test_temp::temp_root()
+            .join(format!("ipe-env-surface-missing-{}", std::process::id()));
+        let reads = SourceReads::scan_roots(&[missing]);
+        assert!(reads.env_reads().is_err());
+        assert!(reads.all_reads().is_err());
+        assert!(reads.has_hand_rolled_truthy().is_err());
+        let refused = |cell: &Cell| {
+            matches!(cell, Cell::Hole(msg) if msg.contains("cannot be checked")
+                && msg.contains("cannot be listed whole"))
+        };
+        let read_in_code = ReadInCodeColumn::new(reads.clone());
+        let truthy = TruthyParseColumn::new(&reads);
+        let mut truthy_holes = 0_usize;
+        for var in ENV_VARS.iter() {
+            let item = EnvItem::Registered(var);
+            let cell = read_in_code.check(&item);
+            assert!(refused(&cell), "{cell:?}");
+            let cell = truthy.check(&item);
+            if refused(&cell) {
+                truthy_holes += 1;
+            } else {
+                assert!(matches!(cell, Cell::NotApplicable { .. }), "{cell:?}");
+            }
+        }
+        assert!(truthy_holes > 0, "no boolean-style variable was judged");
+    }
 }

@@ -34,12 +34,11 @@ fn assert_golden_e2e(golden: &str) {
     }
     let root = repo_root();
     let dir = golden_dir(&root, golden);
-    let entry = dir.join("Main.ipe");
     let out = crate::support::scratch_root().join(format!("ipec_{golden}_e2e"));
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
-    let built = ipe::build(&entry, &out, &runtime);
+    let built = crate::support::build_golden(&dir, &out, &runtime);
     assert!(
         built.is_ok(),
         "build failed for {golden}: {:?}",
@@ -81,12 +80,12 @@ fn composite_pk_db_refusals_match_oracle() {
 fn composite_pk_unknown_field_accessor_is_rejected() {
     const GOLDEN: &str = "db_store_composite_pk_unknown_field_rejected";
     let root = repo_root();
-    let entry = golden_dir(&root, GOLDEN).join("Main.ipe");
+    let golden_project = golden_dir(&root, GOLDEN);
     let out = crate::support::scratch_root().join("ipec_db_store_composite_pk_unknown_field");
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
-    let built = ipe::build(&entry, &out, &runtime);
+    let built = crate::support::build_golden(&golden_project, &out, &runtime);
     let got = match &built {
         Err(CliError::Pipeline { diag, .. }) => Some(diag.code()),
         _ => None,

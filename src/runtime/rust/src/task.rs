@@ -155,12 +155,7 @@ fn on_behalf_of_caller<F: std::future::Future>(
 
 /// `task`, kept inside the Web session its caller runs on behalf of, so a
 /// credential it verifies binds to that session.
-#[cfg(all(
-    feature = "tokio",
-    feature = "web-core",
-    feature = "server",
-    not(target_arch = "wasm32")
-))]
+#[cfg(all(feature = "tokio", feature = "web", not(target_arch = "wasm32")))]
 fn carry_web_session<F: std::future::Future>(
     task: F,
 ) -> impl std::future::Future<Output = F::Output> {
@@ -168,11 +163,7 @@ fn carry_web_session<F: std::future::Future>(
 }
 
 /// `task` as it is: without the served Web runtime no session scope exists.
-#[cfg(all(
-    feature = "tokio",
-    not(all(feature = "web-core", feature = "server")),
-    not(target_arch = "wasm32")
-))]
+#[cfg(all(feature = "tokio", not(feature = "web"), not(target_arch = "wasm32")))]
 const fn carry_web_session<F: std::future::Future>(task: F) -> F {
     task
 }
@@ -850,6 +841,10 @@ pub fn task_run<E: From<String> + crate::FromUnavailable + Send + 'static, A: Se
 // routes through the redacting foreign-panic funnel — detail server-side under
 // a correlation id, a generic typed `Err` to Ipê. The cancelled arm stays
 // total via the foreign-error funnel rather than an unreachable assumption.
+/// One spawned `Task.parallel` child and the guard that aborts it on drop.
+#[cfg(all(feature = "tokio", not(target_arch = "wasm32")))]
+type ParallelChild<E, A> = (tokio::task::JoinHandle<IpeResult<E, A>>, AbortOnDrop);
+
 #[cfg(all(feature = "tokio", not(target_arch = "wasm32")))]
 pub fn task_parallel<E: From<String> + Send + 'static, A: Send + 'static>(
     tasks: Vec<IpeTask<E, A>>,
@@ -859,11 +854,21 @@ pub fn task_parallel<E: From<String> + Send + 'static, A: Send + 'static>(
         // pop the front (input order) to await while the un-awaited tail stays
         // addressable for `abort()` on failure.
         // Each spawned task stays inside the request scope this one runs in.
-        let mut handles: std::collections::VecDeque<tokio::task::JoinHandle<IpeResult<E, A>>> =
-            tasks.into_iter().map(spawn_in_current_scope).collect();
+        // Each handle is paired with an abort guard, so dropping this future
+        // (a cancelled parent) aborts every child not yet joined.
+        let mut handles: std::collections::VecDeque<ParallelChild<E, A>> = tasks
+            .into_iter()
+            .map(|task| {
+                let handle = spawn_in_current_scope(task);
+                let guard = AbortOnDrop::new(handle.abort_handle());
+                (handle, guard)
+            })
+            .collect();
         let mut out = Vec::with_capacity(handles.len());
-        while let Some(h) = handles.pop_front() {
-            let result = match h.await {
+        while let Some((h, guard)) = handles.pop_front() {
+            let joined = h.await;
+            guard.defuse();
+            let result = match joined {
                 Ok(r) => r,
                 Err(join_err) => match join_err.try_into_panic() {
                     Ok(payload) => {
@@ -880,7 +885,7 @@ pub fn task_parallel<E: From<String> + Send + 'static, A: Send + 'static>(
                     // side effects can fire once we have reported failure.
                     // Already-awaited tasks (`Ok`, popped) are complete — nothing
                     // to abort. `abort()` on a finished handle is a harmless no-op.
-                    for survivor in &handles {
+                    for (survivor, _) in &handles {
                         survivor.abort();
                     }
                     return IpeResult::Err(e);
@@ -1446,6 +1451,27 @@ mod parallel_abort_tests {
             counter.load(Ordering::SeqCst),
             0,
             "aborted siblings must not fire their side effect after the batch failed"
+        );
+    }
+
+    /// A dropped parent (a cancelled Cmd) aborts every child it spawned, so
+    /// no child fires its side effect after the cancel.
+    #[tokio::test(start_paused = true)]
+    async fn dropping_the_parallel_future_aborts_its_children() {
+        let counter = Arc::new(AtomicU64::new(0));
+        let tasks: Vec<IpeTask<String, i64>> = vec![
+            side_effect_task(counter.clone(), 200, 1),
+            side_effect_task(counter.clone(), 200, 2),
+        ];
+        let mut parallel = task_parallel(tasks);
+        let early = tokio::time::timeout(Duration::from_millis(10), &mut parallel).await;
+        assert!(early.is_err(), "the children are still sleeping");
+        drop(parallel);
+        sleep(Duration::from_millis(500)).await;
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            0,
+            "a dropped parent leaves no detached child to fire its side effect"
         );
     }
 
@@ -2017,8 +2043,7 @@ mod spawn_scope_scan_tests {
 #[cfg(all(
     test,
     feature = "tokio",
-    feature = "web-core",
-    feature = "server",
+    feature = "web",
     feature = "jwt",
     not(target_arch = "wasm32")
 ))]

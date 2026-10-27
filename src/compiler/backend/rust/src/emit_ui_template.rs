@@ -821,6 +821,13 @@ fn ui_template_of_expr_at(
         let reduced = subst_expr(body, &[*name], &[*value.clone()]);
         return ui_template_of_expr_at(&reduced, wrappers, depth, holes);
     }
+    // A pre-clone run β-reduces the same way: each symbol's value is its own
+    // clone.
+    if let Expr::CaptureClones { syms, body } = expr {
+        let clones: Vec<Expr> = syms.iter().copied().map(Expr::CloneVar).collect();
+        let reduced = subst_expr(body, syms, &clones);
+        return ui_template_of_expr_at(&reduced, wrappers, depth, holes);
+    }
     // In hole mode, an element-position control-flow (`if` / `case`) over the
     // Model is classified by how far its arms templatize:
     //
@@ -1457,7 +1464,7 @@ fn subst_expr(expr: &Expr, params: &[Symbol], args: &[Expr]) -> Expr {
                 .iter()
                 .map(|a| subst_expr(a, params, args))
                 .collect(),
-            pin: *pin,
+            pin: pin.clone(),
             on_form: *on_form,
         },
 
@@ -1483,6 +1490,20 @@ fn subst_expr(expr: &Expr, params: &[Symbol], args: &[Expr]) -> Expr {
             value: Box::new(subst_expr(value, params, args)),
             body: Box::new(subst_expr(body, params, args)),
         },
+
+        // A pre-clone of a parameter binds its call-site argument instead, as
+        // the self-clone `Let` it stands for would after substitution.
+        Expr::CaptureClones { syms, body } => syms.iter().rev().fold(
+            subst_expr(body, params, args),
+            |body, sym| match subst_expr(&Expr::CloneVar(*sym), params, args) {
+                Expr::CloneVar(s) if s == *sym => Expr::pre_clone(s, body),
+                value => Expr::Let {
+                    name: *sym,
+                    value: Box::new(value),
+                    body: Box::new(body),
+                },
+            },
+        ),
 
         // Leaves and shapes not present in a structural wrapper body pass through.
         _ => expr.clone(),

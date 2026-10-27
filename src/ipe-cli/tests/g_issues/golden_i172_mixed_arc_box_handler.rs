@@ -29,7 +29,7 @@
 //! `Apply`/`Call`) via eta-expansion into `SharedLambda { body: Apply(f, [Var
 //! (fresh0), …]) }` (rendering `Arc::new(move |x| (f)(x))`). The promoted
 //! `handler` value-leaf read is cloned (`Arc::clone`) so it is not moved out of
-//! the backend's synthetic `move |_x| (…)(_x)` re-wrap `Fn` closure (E0507).
+//! an enclosing `Fn` closure (E0507).
 //! Both branches then render the identical `Arc<dyn Fn(..) + Send + Sync>`
 //! carrier and the crate type-checks AND builds.
 //!
@@ -45,11 +45,8 @@ fn repo_root() -> PathBuf {
     std::fs::canonicalize(&joined).unwrap_or(joined)
 }
 
-fn entry_path(root: &Path, fixture: &str) -> PathBuf {
-    root.join("tests")
-        .join("golden")
-        .join(fixture)
-        .join("Main.ipe")
+fn fixture_dir(root: &Path, fixture: &str) -> PathBuf {
+    root.join("tests").join("golden").join(fixture)
 }
 
 /// ipe-0 ∧ carrier-unification: the compiler must accept the program AND emit
@@ -67,13 +64,13 @@ fn entry_path(root: &Path, fixture: &str) -> PathBuf {
 #[allow(clippy::expect_used)]
 fn assert_ipec_unifies_to_arc(fixture: &str) {
     let root = repo_root();
-    let entry = entry_path(&root, fixture);
+    let golden_dir = fixture_dir(&root, fixture);
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("{fixture}_ipec_out"));
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
 
-    let built = ipe::build_loose_file(&entry, &out, &runtime);
+    let built = crate::support::build_golden(&golden_dir, &out, &runtime);
     assert!(
         built.is_ok(),
         "ipe dev build must succeed for {fixture}: {:?}",
@@ -117,13 +114,13 @@ fn assert_cargo_builds_and_runs(fixture: &str) {
     }
 
     let root = repo_root();
-    let entry = entry_path(&root, fixture);
+    let golden_dir = fixture_dir(&root, fixture);
     let out = crate::support::scratch_root().join(format!("ipec_{fixture}_e2e"));
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
 
-    let built = ipe::build_loose_file(&entry, &out, &runtime);
+    let built = crate::support::build_golden(&golden_dir, &out, &runtime);
     assert!(
         built.is_ok(),
         "ipe dev build must succeed for {fixture}: {:?}",

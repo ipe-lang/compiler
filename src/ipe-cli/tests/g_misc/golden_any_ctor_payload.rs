@@ -44,19 +44,12 @@ fn repo_root() -> PathBuf {
     std::fs::canonicalize(&joined).unwrap_or(joined)
 }
 
-fn fixture_entry(root: &Path, name: &str) -> PathBuf {
-    root.join("tests")
-        .join("golden")
-        .join(name)
-        .join("Main.ipe")
+fn fixture_project(root: &Path, name: &str) -> PathBuf {
+    root.join("tests").join("golden").join(name)
 }
 
-fn fixture_src_entry(root: &Path, name: &str) -> PathBuf {
-    root.join("tests")
-        .join("golden")
-        .join(name)
-        .join("src")
-        .join("Main.ipe")
+fn fixture_dir(root: &Path, name: &str) -> PathBuf {
+    root.join("tests").join("golden").join(name)
 }
 
 /// Build-only seal: `BroadcastMsg any` — ipe exit 0 AND cargo build green.
@@ -64,13 +57,13 @@ fn fixture_src_entry(root: &Path, name: &str) -> PathBuf {
 #[test]
 fn any_ctor_payload_ipec_and_cargo_zero() {
     let root = repo_root();
-    let entry = fixture_entry(&root, "any_ctor_payload");
+    let entry = fixture_project(&root, "any_ctor_payload");
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("l0102_any_ctor_payload_emit");
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
 
-    let built = ipe::build(&entry, &out, &runtime);
+    let built = crate::support::build_golden(&entry, &out, &runtime);
     assert!(
         built.is_ok(),
         "ipec must accept `BroadcastMsg any` (was IPE-L0102 pre-fix): {:?}",
@@ -100,13 +93,13 @@ fn any_ctor_payload_ipec_and_cargo_zero() {
 #[test]
 fn any_ctor_payload_fail_closed() {
     let root = repo_root();
-    let entry = fixture_entry(&root, "any_ctor_fail_closed");
+    let entry = fixture_project(&root, "any_ctor_fail_closed");
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("l0102_any_ctor_fail_closed_emit");
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
 
-    let built = ipe::build(&entry, &out, &runtime);
+    let built = crate::support::build_golden(&entry, &out, &runtime);
     let got = match &built {
         Err(CliError::Pipeline { diag, .. }) => Some(diag.code()),
         _ => None,
@@ -124,13 +117,13 @@ fn any_ctor_payload_fail_closed() {
 #[test]
 fn ctor_span_attr_dep_module() {
     let root = repo_root();
-    let entry = fixture_src_entry(&root, "ctor_span_attr");
+    let golden_project = fixture_dir(&root, "ctor_span_attr");
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("l0102_ctor_span_attr_emit");
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
 
-    let result = ipe::build_loose_file(&entry, &out, &runtime);
+    let result = crate::support::build_golden(&golden_project, &out, &runtime);
     assert!(
         result.is_ok(),
         "a dep-module enum wrapping a `List (Int -> Int)` must lower and build: {:?}",

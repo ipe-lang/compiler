@@ -611,6 +611,14 @@ mod tests {
         assert!(GLUE_PRELUDE_SERVER.contains("__ipeSend(\"ipe-widget\""));
     }
 
+    /// A widget's up emit is raised by its script, never proven the user's act,
+    /// so its send carries no focus record and its render moves no focus.
+    #[test]
+    fn a_widget_emit_sends_no_focus_record() {
+        assert!(GLUE_PRELUDE_SERVER.contains("__ipeSend(\"ipe-widget\""));
+        assert!(!GLUE_PRELUDE_SERVER.contains("focus"));
+    }
+
     /// The served URL segment and the page SRI a widget file pins are one
     /// `sha256(content)` — so the URL a page requests and the integrity it checks
     /// that response against can never disagree with the served bytes. Proven by

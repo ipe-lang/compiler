@@ -71,6 +71,15 @@ CREATE TABLE IF NOT EXISTS reviewed_stamp (
   one  INTEGER PRIMARY KEY CHECK (one = 1),
   head TEXT NOT NULL CHECK (typeof(head) = 'text' AND head <> '')
 );
+CREATE TABLE IF NOT EXISTS refusals (
+  uid    TEXT PRIMARY KEY CHECK (length(uid) = 64 AND uid NOT GLOB '*[^0-9a-f]*'),
+  path   TEXT NOT NULL,
+  lang   TEXT NOT NULL CHECK (lang IN ('rs','sh','ts','ipe','other')),
+  reason TEXT NOT NULL CHECK (reason IN ('not-utf8','too-large','symlink-entry','gitlink-entry','unknown-mode','past-hash-ceiling','non-utf8-name','not-repo-relative','nested-repository','not-regular','unreadable','replaced')),
+  size   INTEGER CHECK (size IS NULL OR size >= 0),
+  digest TEXT CHECK (digest IS NULL OR (length(digest) = 79 AND substr(digest, 1, 15) = 'refusal-blake3:' AND NOT substr(digest, 16) GLOB '*[^0-9a-f]*')),
+  CHECK ((digest IS NULL) = (reason IN ('past-hash-ceiling','non-utf8-name','not-repo-relative','nested-repository','not-regular','unreadable','replaced')))
+) WITHOUT ROWID;
 DROP VIEW IF EXISTS open_units;
 CREATE VIEW open_units AS
   SELECT u.uid, u.path, u.kind, u.name, u.qualified, u.line_start, u.line_end,

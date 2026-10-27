@@ -25,6 +25,8 @@ features = ["full"]
 
 # https://embarkstudios.github.io/cargo-deny/checks/advisories/cfg.html
 [advisories]
+# Every entry is "ignore now, replace later": an accepted exposure, revisited
+# when its upstream fix or a replacement lands, never a permanent waiver.
 ignore = [
     "RUSTSEC-2025-0141", # bincode unmaintained (transitive; no runtime exposure)
     # RUSTSEC-2023-0071 — rsa 0.9.x "Marvin Attack" (PKCS#1 v1.5 timing
@@ -47,13 +49,6 @@ ignore = [
     # unreachable. Fix would require rust_decimal >= 0.8 (a semver-breaking
     # jump); accepted until that line is available and rust_decimal updates.
     "RUSTSEC-2026-0235",
-    # RUSTSEC-2024-0449 — unsafe-libyaml is unmaintained (an advisory about
-    # maintenance status, not a vulnerability). Reached only through
-    # `serde_yaml` 0.9 (also deprecated upstream), which backs the optional
-    # `config` feature's YAML decode (runtime/src/config_decode.rs) and the
-    # matching emitted-project dependency. Accepted until the YAML backend is
-    # replaced by a maintained, memory-safe parser.
-    "RUSTSEC-2024-0449",
 ]
 
 # https://embarkstudios.github.io/cargo-deny/checks/licenses/cfg.html
@@ -90,10 +85,26 @@ ignore = false
 # pulls in duplicate transitive versions (e.g. two `syn` majors via different
 # proc-macro crates); a hard `deny` here would be noise, not signal.
 [bans]
+# Ignore now, replace later: `arraydeque` 0.5 (a fixed-capacity ring buffer
+# with internal `unsafe`, no advisory) is reached only through the YAML parser
+# behind the optional `config` feature (serde-saphyr -> granit-parser), and
+# every maintained pure-Rust YAML parser depends on it. It is accepted with NO
+# advisory ignore, so a future RustSec entry against it turns this gate red;
+# replace it once a YAML parser without it exists.
 multiple-versions = "warn"
 wildcards = "allow"
 workspace-default-features = "allow"
 external-default-features = "allow"
+# Roots come from `webpki-roots` 1.x only. A spec is `name:<semver req>`
+# (`name@<version>` is an exact version, so `@<1` bans 1.x and `@<1.0.0`
+# bans nothing). The OS root stores reach the tree only through the CLI's
+# `reqwest` 0.13 chain, named by `wrappers`; the runtime's own closure is
+# walked exactly in the `ipe` test `legacy_roots_are_refused_in_every_lock`.
+deny = [
+    { crate = "webpki-roots:<1", reason = "RUSTSEC-2026-0381: roots come from webpki-roots 1.x only" },
+    { crate = "rustls-native-certs", wrappers = ["rustls-platform-verifier"], reason = "runtime roots are webpki-roots, never the OS store" },
+    { crate = "rustls-platform-verifier", wrappers = ["reqwest"], reason = "runtime roots are webpki-roots, never the OS store" },
+]
 
 # https://embarkstudios.github.io/cargo-deny/checks/sources/cfg.html
 # Every dependency MUST come from the official crates.io index — no ad-hoc git

@@ -1,7 +1,7 @@
 #[cfg(test)]
 mod registry_phase_c_tests {
     use super::super::{
-        Builder, Builtins, Content, Diagnostic, Feature, LowerError, Ty, UnionFind,
+        Builder, Builtins, Content, Diagnostic, Feature, LowerError, Ty, UnionFind, UntypedDef,
     };
     use ipe_diagnostics::Span;
     use ipe_intern::Interner;
@@ -1439,6 +1439,10 @@ mod registry_phase_c_tests {
             K::ColorDeuteranopia,
             K::ColorTritanopia,
             K::ColorSimulate,
+            // Ipe.Db.Location — the typed location `Db.open` takes (Ipê-new).
+            K::DbLocationFile,
+            K::DbLocationMemory,
+            K::DbLocationDsn,
         ]
     };
 
@@ -1968,7 +1972,13 @@ mod registry_phase_c_tests {
             },
         };
         let shared = builder.flex().expect("mint the binding's shared var");
-        builder.untyped.insert((vec![dep], name), shared);
+        builder.untyped.insert(
+            (vec![dep], name),
+            UntypedDef {
+                var: shared,
+                name_span: Span::DUMMY,
+            },
+        );
         builder
             .constrain_def(&def)
             .expect("an Int literal def constrains");
@@ -2632,6 +2642,475 @@ mod zonk_sharing_tests {
         };
         if left != right {
             return Err("the two shared slots must read back as equal sub-types".to_owned());
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod type_measure_tests {
+    use super::super::{
+        Budget, Content, Diagnostic, FlatType, Span, TypeError, TypeMeasures, UnionFind, VarId,
+        zonk,
+    };
+    use ipe_diagnostics::nesting::{TYPE_DEPTH_LIMIT, TYPE_SIZE_LIMIT};
+
+    /// A chain of `levels` arrows `() -> () -> … -> ()`, nested in the result.
+    fn arrow_chain(uf: &mut UnionFind<Content>, levels: usize) -> VarId {
+        let leaf = uf
+            .fresh(Content::Structure(FlatType::Unit))
+            .expect("fresh leaf must not fail");
+        let mut cur = leaf;
+        for _ in 0..levels {
+            cur = uf
+                .fresh(Content::Structure(FlatType::Fun(leaf, cur)))
+                .expect("fresh arrow must not fail");
+        }
+        cur
+    }
+
+    /// `pN = (p{N-1}, p{N-1})` over a `()` leaf: `depth + 1` distinct nodes
+    /// that unfold to `2^(depth + 1) - 1`.
+    fn doubling_chain(uf: &mut UnionFind<Content>, depth: usize) -> VarId {
+        let mut cur = uf
+            .fresh(Content::Structure(FlatType::Unit))
+            .expect("fresh leaf must not fail");
+        for _ in 0..depth {
+            cur = uf
+                .fresh(Content::Structure(FlatType::Tuple(vec![cur, cur])))
+                .expect("fresh tuple must not fail");
+        }
+        cur
+    }
+
+    /// The refusal the measure of `var` earns.
+    fn refusal_of(uf: &mut UnionFind<Content>, var: VarId) -> Option<Diagnostic> {
+        TypeMeasures::default()
+            .measure(uf, &mut Budget::unbounded(), var)
+            .expect("a solved acyclic type must measure")
+            .refusal(Span::DUMMY)
+    }
+
+    /// The ceiling's own depth is accepted; one level more is refused with the
+    /// depth it reached.
+    #[test]
+    fn measure_accepts_the_ceiling_and_refuses_one_level_more() {
+        let limit = usize::from(TYPE_DEPTH_LIMIT);
+        let mut uf = UnionFind::<Content>::new();
+        let at = arrow_chain(&mut uf, limit);
+        assert_eq!(refusal_of(&mut uf, at), None);
+        let past = arrow_chain(&mut uf, limit + 1);
+        assert_eq!(
+            refusal_of(&mut uf, past),
+            Some(Diagnostic::Type {
+                span: Span::DUMMY,
+                msg: TypeError::TypeTooDeep {
+                    depth: TYPE_DEPTH_LIMIT + 1,
+                    limit: TYPE_DEPTH_LIMIT,
+                },
+            })
+        );
+    }
+
+    /// A shared sub-type is measured once: the walk visits each tuple's two
+    /// slots, and the second visit is a memo hit, never a re-walk.
+    #[test]
+    fn measure_walks_a_shared_dag_once() {
+        let mut uf = UnionFind::<Content>::new();
+        let root = doubling_chain(&mut uf, 14);
+        let mut budget = Budget::unbounded();
+        let measure = TypeMeasures::default()
+            .measure(&mut uf, &mut budget, root)
+            .expect("a shared DAG must measure");
+        assert_eq!(measure.depth, 14);
+        assert_eq!(measure.size, (1 << 15) - 1);
+        assert_eq!(budget.spent(), 2 * 14 + 1, "one visit per slot");
+    }
+
+    /// A chain far past the ceiling is measured on the default test thread's
+    /// stack (the walk is iterative), its depth saturating, never overflowing.
+    #[test]
+    fn measure_of_a_hundred_thousand_levels_needs_no_stack() {
+        let mut uf = UnionFind::<Content>::new();
+        let root = arrow_chain(&mut uf, 100_000);
+        assert_eq!(
+            refusal_of(&mut uf, root),
+            Some(Diagnostic::Type {
+                span: Span::DUMMY,
+                msg: TypeError::TypeTooDeep {
+                    depth: u16::MAX,
+                    limit: TYPE_DEPTH_LIMIT,
+                },
+            })
+        );
+    }
+
+    /// A shallow type that unfolds past the size ceiling is refused by the
+    /// measure, and its read-back, which clones each reused subtree, refuses it
+    /// too; one doubling less fits both.
+    #[test]
+    fn a_doubling_type_past_the_size_ceiling_is_refused() {
+        let too_large = Diagnostic::Type {
+            span: Span::DUMMY,
+            msg: TypeError::TypeTooLarge {
+                limit: TYPE_SIZE_LIMIT,
+                origin: ipe_diagnostics::TypeSizeOrigin::Value,
+            },
+        };
+        let mut uf = UnionFind::<Content>::new();
+        let fits = doubling_chain(&mut uf, 15);
+        assert_eq!(refusal_of(&mut uf, fits), None);
+        assert!(zonk(&mut uf, &mut Budget::unbounded(), fits).is_ok());
+        let past = doubling_chain(&mut uf, 16);
+        assert_eq!(refusal_of(&mut uf, past), Some(too_large.clone()));
+        assert_eq!(
+            zonk(&mut uf, &mut Budget::unbounded(), past),
+            Err(too_large)
+        );
+    }
+}
+
+#[cfg(test)]
+mod zonk_row_tail_tests {
+    use super::super::{
+        BTreeMap, Budget, Builder, Content, Diagnostic, FlatType, RowTail, Ty, TyBounds, TypeError,
+        UnionFind, VarId, ZONK_NODE_LIMIT, promote_untyped_boundaries, tag_solver_var, zonk,
+        zonk_emitted,
+    };
+    use crate::SolverSteps;
+    use ipe_intern::{Interner, Symbol};
+
+    const MAIN_HDR: &str = "module Main exposing (main)\n\n";
+
+    const fn label(n: u32) -> Symbol {
+        Symbol::from_raw(n)
+    }
+
+    fn unit(uf: &mut UnionFind<Content>) -> VarId {
+        uf.fresh(Content::Structure(FlatType::Unit))
+            .expect("fresh unit must not fail")
+    }
+
+    fn empty_row(uf: &mut UnionFind<Content>) -> VarId {
+        uf.fresh(Content::Structure(FlatType::EmptyRecord))
+            .expect("fresh empty record must not fail")
+    }
+
+    /// The content of a record over `ext` with one fresh `()`-typed field per label.
+    fn record_content(uf: &mut UnionFind<Content>, labels: &[u32], ext: VarId) -> Content {
+        let mut fields = BTreeMap::new();
+        for n in labels {
+            let field = unit(uf);
+            fields.insert(label(*n), field);
+        }
+        Content::Structure(FlatType::Record(fields, ext))
+    }
+
+    /// A record over `ext` with one `()`-typed field per label.
+    fn record_over(uf: &mut UnionFind<Content>, labels: &[u32], ext: VarId) -> VarId {
+        let content = record_content(uf, labels, ext);
+        uf.fresh(content).expect("fresh record must not fail")
+    }
+
+    fn zonk_unbounded(uf: &mut UnionFind<Content>, v: VarId) -> Result<Ty, Diagnostic> {
+        zonk(uf, &mut Budget::unbounded(), v)
+    }
+
+    fn is_compiler_bug_with(result: &Result<Ty, Diagnostic>, detail_part: &str) -> bool {
+        matches!(result, Err(Diagnostic::CompilerBug { detail, .. }) if detail.contains(detail_part))
+    }
+
+    /// The labels of a zonked record and its tail, or `None` for any other type.
+    fn record_shape(ty: &Ty) -> Option<(Vec<Symbol>, RowTail)> {
+        match ty {
+            Ty::Record(fields, tail) => Some((fields.keys().copied().collect(), tail.clone())),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn zonk_reads_field_read_row_open() {
+        let mut uf = UnionFind::<Content>::new();
+        let ext = uf.fresh(Content::Flex).expect("fresh flex must not fail");
+        let rec = record_over(&mut uf, &[1], ext);
+        let tail = tag_solver_var(uf.find(ext).expect("find must not fail"));
+        let ty = zonk_unbounded(&mut uf, rec).expect("an open record must read back");
+        assert_eq!(
+            record_shape(&ty),
+            Some((vec![label(1)], RowTail::Open(tail))),
+            "a record over a flexible row must read back open over that row"
+        );
+    }
+
+    #[test]
+    fn zonk_reads_rigid_row_open() {
+        let mut uf = UnionFind::<Content>::new();
+        let ext = uf.fresh(Content::Rigid).expect("fresh rigid must not fail");
+        let rec = record_over(&mut uf, &[1], ext);
+        let tail = tag_solver_var(uf.find(ext).expect("find must not fail"));
+        let ty = zonk_unbounded(&mut uf, rec).expect("a rigid-row record must read back");
+        assert_eq!(
+            record_shape(&ty),
+            Some((vec![label(1)], RowTail::Open(tail))),
+            "a record over a signature row must read back open over that row"
+        );
+    }
+
+    #[test]
+    fn zonk_reads_empty_record_tail_closed() {
+        let mut uf = UnionFind::<Content>::new();
+        let ext = empty_row(&mut uf);
+        let rec = record_over(&mut uf, &[1], ext);
+        let ty = zonk_unbounded(&mut uf, rec).expect("a closed record must read back");
+        assert_eq!(
+            record_shape(&ty),
+            Some((vec![label(1)], RowTail::Closed)),
+            "a record ending in the empty row must read back closed"
+        );
+    }
+
+    /// The emitted read-back closes a residual non-rigid row and keeps every
+    /// other terminal as the faithful read-back reads it.
+    #[test]
+    fn zonk_emitted_closes_only_non_rigid_rows() {
+        let terminals = [
+            (Content::Flex, true),
+            (
+                Content::Super {
+                    rigid: false,
+                    bounds: TyBounds::eq(),
+                },
+                true,
+            ),
+            (Content::Rigid, false),
+            (
+                Content::Super {
+                    rigid: true,
+                    bounds: TyBounds::eq(),
+                },
+                false,
+            ),
+        ];
+        for (content, closes) in terminals {
+            let mut uf = UnionFind::<Content>::new();
+            let ext = uf.fresh(content.clone()).expect("fresh row must not fail");
+            let rec = record_over(&mut uf, &[1], ext);
+            let tail = tag_solver_var(uf.find(ext).expect("find must not fail"));
+            let emitted = zonk_emitted(&mut uf, &mut Budget::unbounded(), rec)
+                .expect("an open record must read back");
+            let expected = if closes {
+                RowTail::Closed
+            } else {
+                RowTail::Open(tail)
+            };
+            assert_eq!(
+                record_shape(&emitted),
+                Some((vec![label(1)], expected)),
+                "the emitted read-back of a row ending in {content:?}"
+            );
+            let faithful = zonk_unbounded(&mut uf, rec).expect("an open record must read back");
+            assert_eq!(
+                record_shape(&faithful),
+                Some((vec![label(1)], RowTail::Open(tail))),
+                "the faithful read-back of a row ending in {content:?} stays open"
+            );
+        }
+        let mut uf = UnionFind::<Content>::new();
+        let ext = empty_row(&mut uf);
+        let rec = record_over(&mut uf, &[1], ext);
+        let emitted = zonk_emitted(&mut uf, &mut Budget::unbounded(), rec)
+            .expect("a closed record must read back");
+        assert_eq!(
+            record_shape(&emitted),
+            Some((vec![label(1)], RowTail::Closed))
+        );
+    }
+
+    #[test]
+    fn zonk_flattens_row_chain() {
+        let mut uf = UnionFind::<Content>::new();
+        let empty = empty_row(&mut uf);
+        let ext = uf.fresh(Content::Flex).expect("fresh flex must not fail");
+        let rec = record_over(&mut uf, &[1], ext);
+        // The row variable is later solved to a further record: a chain.
+        let inner = record_content(&mut uf, &[2], empty);
+        let inner_var = uf.fresh(inner.clone()).expect("fresh record must not fail");
+        uf.union(ext, inner_var, inner)
+            .expect("union must not fail");
+        let ty = zonk_unbounded(&mut uf, rec).expect("a row chain must read back");
+        assert_eq!(
+            record_shape(&ty),
+            Some((vec![label(1), label(2)], RowTail::Closed)),
+            "every field along the row chain must be read back, closed by its terminal"
+        );
+    }
+
+    #[test]
+    fn zonk_refuses_non_row_tail() {
+        let mut uf = UnionFind::<Content>::new();
+        let ext = unit(&mut uf);
+        let rec = record_over(&mut uf, &[1], ext);
+        let result = zonk_unbounded(&mut uf, rec);
+        assert!(
+            is_compiler_bug_with(&result, "non-row type"),
+            "a row ending in `()` must be a compiler bug, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn zonk_refuses_duplicate_label_in_chain() {
+        let mut uf = UnionFind::<Content>::new();
+        let empty = empty_row(&mut uf);
+        let inner = record_over(&mut uf, &[1], empty);
+        let rec = record_over(&mut uf, &[1], inner);
+        let result = zonk_unbounded(&mut uf, rec);
+        assert!(
+            is_compiler_bug_with(&result, "duplicate record label"),
+            "a label repeated along the row chain must be a compiler bug, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn zonk_row_chain_charges_budget() {
+        // One single-field hop per node past the limit: the chain alone
+        // exhausts the read-back node budget.
+        let mut uf = UnionFind::<Content>::new();
+        let mut long = empty_row(&mut uf);
+        for n in 0..ZONK_NODE_LIMIT + 8 {
+            long = record_over(&mut uf, &[n], long);
+        }
+        let result = zonk_unbounded(&mut uf, long);
+        assert!(
+            is_compiler_bug_with(&result, "node limit"),
+            "a row chain longer than the node limit must be refused, got {result:?}"
+        );
+
+        // A short chain under a small step budget stops at the budget.
+        let mut short = empty_row(&mut uf);
+        for n in 0..16 {
+            short = record_over(&mut uf, &[n], short);
+        }
+        let four = SolverSteps::new(4);
+        assert!(four.is_some(), "four steps is a ceiling");
+        let Some(four) = four else { return };
+        let result = zonk(&mut uf, &mut Budget::new(four), short);
+        assert!(
+            matches!(
+                result,
+                Err(Diagnostic::Type {
+                    msg: TypeError::StepBudgetExceeded { .. },
+                    ..
+                })
+            ),
+            "each row hop must tick the shared step budget, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn infer_region_of_row_param_is_open() {
+        let src = format!(
+            "{MAIN_HDR}getX : {{ a | x : Int }} -> Int\ngetX r =\n    r.x\n\nmain = getX {{ x = 1, y = 2 }}\n"
+        );
+        let mut i = Interner::new();
+        let parsed = ipe_parse::parse_module(&src, &mut i).expect("source must parse");
+        let m = ipe_canon::canonicalise(&parsed, &mut i).expect("source must resolve");
+        let solved = crate::infer(&m, &mut i).expect("source must type-check");
+        let x = i.lookup("x").expect("`x` is interned");
+        let open_x_row = solved.regions.values().any(
+            |ty| matches!(ty, Ty::Record(fields, RowTail::Open(_)) if fields.contains_key(&x)),
+        );
+        assert!(
+            open_x_row,
+            "the row parameter's region must read back as an open `{{ a | x : Int }}` record"
+        );
+    }
+
+    /// A signature row variable used as a whole type (`a` in
+    /// `{ a | x : Int } -> a -> Int`) lets a caller bind the row to a record
+    /// that repeats a label of the chain, or to a non-row type. Such a program
+    /// is refused, never read back as a record that silently drops the clash.
+    #[test]
+    fn a_row_variable_bound_outside_a_row_is_refused() {
+        for arg in ["{ x = 2 }", "True"] {
+            let src = format!(
+                "{MAIN_HDR}f : {{ a | x : Int }} -> a -> Int\nf r s =\n    r.x\n\ng r =\n    f r {arg}\n\nmain = 0\n"
+            );
+            let mut i = Interner::new();
+            let parsed = ipe_parse::parse_module(&src, &mut i).expect("source must parse");
+            let m = ipe_canon::canonicalise(&parsed, &mut i).expect("source must resolve");
+            let solved = crate::infer(&m, &mut i);
+            assert!(
+                solved.is_err(),
+                "binding the row variable to `{arg}` must be refused, got {solved:?}"
+            );
+        }
+    }
+
+    /// Whether the solver-side and the read-back groundness judgments agree on `v`.
+    fn ground_parity(uf: &mut UnionFind<Content>, v: VarId) -> Result<bool, String> {
+        let mut budget = Budget::unbounded();
+        let solved = crate::solved_is_ground(uf, &mut budget, [v]).map_err(|e| format!("{e:?}"))?;
+        let zonked = zonk(uf, &mut budget, v).map_err(|e| format!("{e:?}"))?;
+        Ok(solved == crate::ty_is_ground(&zonked))
+    }
+
+    #[test]
+    fn solved_ground_matches_zonked_ground() -> Result<(), String> {
+        let mut uf = UnionFind::<Content>::new();
+        let flex = uf.fresh(Content::Flex).expect("fresh flex must not fail");
+        let rigid = uf.fresh(Content::Rigid).expect("fresh rigid must not fail");
+        let empty = empty_row(&mut uf);
+        let open_flex = record_over(&mut uf, &[1], flex);
+        let open_rigid = record_over(&mut uf, &[1], rigid);
+        let closed = record_over(&mut uf, &[1], empty);
+        let chain_tail = uf.fresh(Content::Flex).expect("fresh flex must not fail");
+        let chain_mid = record_over(&mut uf, &[2], chain_tail);
+        let chain = record_over(&mut uf, &[1], chain_mid);
+        for v in [open_flex, open_rigid, closed, chain, empty] {
+            if !ground_parity(&mut uf, v)? {
+                return Err(format!("groundness disagrees on constructed shape {v:?}"));
+            }
+        }
+
+        // Every region of a program mixing a signature row, a field-read
+        // getter, an update and closed records, read before defaulting.
+        let src = format!(
+            "{MAIN_HDR}getX : {{ a | x : Int }} -> Int\ngetX r =\n    r.x\n\nname rec =\n    rec.name\n\nbump r =\n    {{ r | x = r.x + 1 }}\n\npair =\n    ( name {{ name = \"a\" }}, 1 )\n\nmain = getX {{ x = 1, y = 2 }} + getX (bump {{ x = 3 }})\n"
+        );
+        let mut i = Interner::new();
+        let parsed = ipe_parse::parse_module(&src, &mut i).map_err(|e| format!("{e:?}"))?;
+        let m = ipe_canon::canonicalise(&parsed, &mut i).map_err(|e| format!("{e:?}"))?;
+        let mut uf = UnionFind::<Content>::new();
+        let mut budget = Budget::unbounded();
+        let generated = Builder::run(&mut uf, &mut i, &m).map_err(|e| format!("{e:?}"))?;
+        crate::solve::solve_attributed(&mut uf, &mut budget, &i, &generated.constraints)
+            .map_err(|e| format!("{e:?}"))?;
+        promote_untyped_boundaries(&mut uf, &mut budget, &mut i, &generated)
+            .map_err(|e| format!("{e:?}"))?;
+        let req = crate::RequestFields::build(&mut i).map_err(|e| format!("{e:?}"))?;
+        let web_req = crate::WebReqFields::build(&mut i).map_err(|e| format!("{e:?}"))?;
+        let err = crate::ErrorRecordFields::build(&mut i).map_err(|e| format!("{e:?}"))?;
+        let tables = crate::BuiltinFieldTables {
+            req: &req,
+            web_req: &web_req,
+            err: &err,
+        };
+        crate::resolve_deferred(
+            &mut uf,
+            &mut budget,
+            &i,
+            &tables,
+            &generated.field_accesses,
+            &generated.record_updates,
+        )
+        .map_err(|e| format!("{e:?}"))?;
+        if generated.regions.is_empty() {
+            return Err("the program must record regions".to_owned());
+        }
+        for (key, v) in &generated.regions {
+            if !ground_parity(&mut uf, *v)? {
+                return Err(format!("groundness disagrees on the region at {key:?}"));
+            }
         }
         Ok(())
     }

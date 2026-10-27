@@ -1,0 +1,82 @@
+module Main exposing (main)
+import Ipe.Io as Io
+import Ipe.Db
+import Ipe.Db.Location as Location
+import Ipe.Db.Unsafe
+import Ipe.Dict
+import Ipe.List
+import Ipe.Maybe
+import Ipe.Db.Sql
+import Ipe.String
+import Ipe.Task
+
+-- M5b-db golden: the Ipe.Db.Unsafe.unsafeFragment escape hatch mints a
+-- SqlFragment from a verbatim identifier string WITHOUT the Sql.column
+-- valid_sql_ident validation. Here the identifier ("qty") is a safe one the
+-- caller asserts, so the query behaves identically to the Sql.column path — the
+-- hatch's whole point is that the parse is skipped by caller assertion, not that
+-- the identifier is malformed. Importing Ipe.Db.Unsafe discloses the `unsafe`
+-- capability.
+--
+-- Inserts two rows then queries WHERE qty > 9 so only the high-qty row matches.
+
+main =
+    Task.andThen
+        (\conn ->
+            Db.withTransaction conn
+                (\txconn ->
+                    do
+                        Unsafe.unsafeExecRaw txconn
+                            "CREATE TABLE products (name TEXT NOT NULL, qty INTEGER NOT NULL)"
+                        Db.exec txconn
+                            "INSERT INTO products (name, qty) VALUES (?, ?)"
+                            [ SqlString "widget", SqlInt 10 ]
+                        Db.exec txconn
+                            "INSERT INTO products (name, qty) VALUES (?, ?)"
+                            [ SqlString "gadget", SqlInt 7 ]
+                        Task.andThen
+                            (\rows ->
+                                let
+                                    row =
+                                        Maybe.withDefault Dict.empty (List.head rows)
+
+                                    name =
+                                        cellText "name" row
+
+                                    qty =
+                                        cellInt "qty" row
+                                in
+                                Io.println (name ++ ":" ++ String.fromInt qty)
+                            )
+                            -- The WHERE column is minted by unsafeFragment: no
+                            -- valid_sql_ident runs, the caller asserts "qty" is safe.
+                            (Db.findWhere txconn "products" (Sql.gt (Unsafe.unsafeFragment "qty") (Sql.int 9)))
+                )
+        )
+        (Db.open Location.memory)
+
+
+-- The text of column `key` in a raw Db row: a SQL `NULL` cell reads as `NULL`,
+-- a missing column as the empty string.
+cellText : String -> Dict String (Maybe String) -> String
+cellText key row =
+    case Dict.get key row of
+        Just (Just s) ->
+            s
+
+        Just Nothing ->
+            "NULL"
+
+        Nothing ->
+            ""
+
+
+-- The integer in column `key` of a raw Db row, `0` when the cell is not one.
+cellInt : String -> Dict String (Maybe String) -> Int
+cellInt key row =
+    case String.toInt (cellText key row) of
+        Just n ->
+            n
+
+        Nothing ->
+            0

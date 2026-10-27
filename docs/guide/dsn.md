@@ -2,7 +2,8 @@
 
 `Ipe.Db.Dsn` is a typed, opaque **database connection descriptor**. A `Dsn` is a
 parsed, validated proof that a connection string passed every check — its driver
-is known, its port is in range, its transport is not cleartext — and its password
+is known, its port is in range, its transport is TLS that verifies the server
+certificate — and its password
 is a `Secret` with no accessor, so a descriptor cannot leak a credential.
 
 ## The mental model
@@ -13,7 +14,8 @@ Three knots.
   You obtain a `Dsn` from a full URL string (`Dsn.parse`) or from typed parts
   (`Dsn.build`); both apply the same fail-closed rules in the runtime, `parse` to
   URL text and `build` to literal parts. An
-  unknown driver, an out-of-range port, an explicit `sslmode=disable`, a smuggled
+  unknown driver, an out-of-range port, an `sslmode` that does not verify the
+  server (`require`, `prefer`, `allow`, `disable`), a smuggled
   duplicate credential, or a control character is a typed `Err`, never a
   silently-accepted descriptor. A `Dsn` in hand is a proof, not a hope.
 - **The password is a `Secret` with no way out.** The descriptor captures its
@@ -58,15 +60,16 @@ describe raw =
 Running it (`ipe dev run`) over three descriptors prints:
 
 ```
-accepted: postgres://app@db.internal:5432/store (tls=require, password=[redacted]) | driver=postgres host=db.internal port=5432
+accepted: postgres://app@db.internal:5432/store (tls=verify-full, password=[redacted]) | driver=postgres host=db.internal port=5432
 rejected (fail-closed): postgres://app:s3cr3t@db.internal:5432/store?sslmode=disable
 rejected (fail-closed): mysql://app@db.internal/store
 ```
 
 The accepted line carries no password at all — `redacted` renders
 `password=[redacted]`, so the raw `s3cr3t` never appears even though it was in the
-input. The `sslmode=disable` string is rejected because a `Dsn` is never a proof
-of a cleartext transport, and `mysql` is rejected because it is not one of the two
+input. The `sslmode=disable` string is rejected because a `Dsn` is always a proof
+of a transport that verifies the server — `sslmode=verify-full`, the default, or
+`sslmode=verify-ca`, which skips the host-name check — and `mysql` is rejected because it is not one of the two
 drivers the runtime links.
 
 ## The why

@@ -18,12 +18,8 @@ const GOLDEN: &str = "unannotated_value_sync_seal";
 /// The `Lib` values generic over a `Sync`-obliged type variable.
 const VALUES: [&str; 2] = ["emptyList", "checkboxOf"];
 
-fn fixture_entry(root: &Path) -> PathBuf {
-    root.join("tests")
-        .join("golden")
-        .join(GOLDEN)
-        .join("src")
-        .join("Main.ipe")
+fn golden_dir(root: &Path) -> PathBuf {
+    root.join("tests").join("golden").join(GOLDEN)
 }
 
 /// The generic parameter list of the emitted `Lib` function spelled `ipe_name`.
@@ -53,12 +49,12 @@ fn generics_of<'a>(emitted: &'a str, ipe_name: &str) -> Option<&'a str> {
 #[test]
 fn unannotated_value_sync_bounds_emitted() {
     let root = crate::support::repo_root();
-    let entry = fixture_entry(&root);
+    let golden = golden_dir(&root);
     let out = crate::support::scratch_root().join(format!("ipec_{GOLDEN}_emit"));
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
-    let built = ipe::build_loose_file(&entry, &out, &runtime);
+    let built = crate::support::build_golden(&golden, &out, &runtime);
     assert!(
         built.is_ok(),
         "{GOLDEN}: ipe dev build must accept the program, got: {built:?}"
@@ -79,12 +75,12 @@ fn unannotated_value_sync_bounds_emitted() {
 #[test]
 fn unannotated_value_sync_seal_builds() {
     let root = crate::support::repo_root();
-    let entry = fixture_entry(&root);
+    let golden = golden_dir(&root);
     let out = crate::support::scratch_root().join(format!("ipec_{GOLDEN}_e2e"));
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
-    let built = ipe::build_loose_file(&entry, &out, &runtime);
+    let built = crate::support::build_golden(&golden, &out, &runtime);
     assert!(
         built.is_ok(),
         "{GOLDEN}: ipe dev build must accept the program, got: {built:?}"

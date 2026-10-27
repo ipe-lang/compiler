@@ -9,11 +9,11 @@ module Main exposing (main)
 -- never a live read of the raw process/host environment.
 
 import Ipe.Env as Env
+import Ipe.Maybe as Maybe
 import Ipe.Tea.Web exposing (tea)
 import Ipe.Tea.Web.Cmd as Cmd
 import Ipe.Tea.Web.Sub as Sub
 import Ipe.Ui as Ui
-import Ipe.Maybe as Maybe
 
 
 type Page
@@ -54,11 +54,13 @@ view model =
     Ui.column
         [ Ui.spacing 14, Ui.padding 32 ]
         [ Ui.el [ Ui.htmlAttribute "id" "public-env-heading" ] (Ui.text "Ipe.Env.public build-time config")
-        , Ui.row [ Ui.spacing 12 ]
+        , Ui.row
+            [ Ui.spacing 12 ]
             [ Ui.el [] (Ui.text "API_BASE_URL:")
             , Ui.el [ Ui.htmlAttribute "id" "api-base-url" ] (Ui.text model.apiBaseUrl)
             ]
-        , Ui.row [ Ui.spacing 12 ]
+        , Ui.row
+            [ Ui.spacing 12 ]
             [ Ui.el [] (Ui.text "IPE_AUTH_TOKEN_SECRET (must read as none):")
             , Ui.el [ Ui.htmlAttribute "id" "secret-probe" ] (Ui.text model.secretProbe)
             ]

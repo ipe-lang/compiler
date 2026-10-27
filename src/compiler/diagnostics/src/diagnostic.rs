@@ -10,28 +10,29 @@
 //! so existing call sites keep compiling while producers migrate.
 
 use crate::code::{
-    Code, Family, IPE_E0001, IPE_F4400, IPE_F4401, IPE_F4402, IPE_F4410, IPE_F4411, IPE_F4412,
-    IPE_F4413, IPE_F4414, IPE_F4415, IPE_I0001, IPE_I0010, IPE_I0011, IPE_I0100, IPE_I0101,
-    IPE_I0102, IPE_I0103, IPE_I0200, IPE_I0201, IPE_I0202, IPE_I0203, IPE_L0100, IPE_L0101,
-    IPE_L0102, IPE_L0103, IPE_L0104, IPE_L0105, IPE_L0106, IPE_L0107, IPE_L0108, IPE_L0110,
-    IPE_L0111, IPE_L0112, IPE_L0113, IPE_L0114, IPE_L0115, IPE_L0116, IPE_L0117, IPE_L0118,
-    IPE_L0119, IPE_L0120, IPE_L0121, IPE_L0122, IPE_L0123, IPE_L0124, IPE_L0125, IPE_L0126,
-    IPE_L0127, IPE_L0128, IPE_L0129, IPE_L0130, IPE_L0131, IPE_L0132, IPE_L0134, IPE_L0135,
-    IPE_L0136, IPE_L0140, IPE_L0141, IPE_L0142, IPE_L0143, IPE_L0144, IPE_L0145, IPE_L0146,
-    IPE_L0147, IPE_L0148, IPE_L0149, IPE_L0150, IPE_L0151, IPE_L0152, IPE_L0153, IPE_L0154,
-    IPE_L0155, IPE_L0156, IPE_L0157, IPE_L0158, IPE_L0159, IPE_L0160, IPE_L0161, IPE_L0162,
-    IPE_L0200, IPE_N0001, IPE_N0002, IPE_N0003, IPE_N0004, IPE_N0005, IPE_N0010, IPE_N0011,
-    IPE_N0012, IPE_N0013, IPE_N0020, IPE_N0021, IPE_N0022, IPE_N0023, IPE_N0024, IPE_N0025,
-    IPE_N0026, IPE_N0027, IPE_N0028, IPE_N0029, IPE_N0030, IPE_N0031, IPE_N0032, IPE_N0033,
-    IPE_N0034, IPE_N0035, IPE_N0036, IPE_N0038, IPE_N0039, IPE_N0040, IPE_N0041, IPE_N0042,
-    IPE_N0043, IPE_N0044, IPE_N0045, IPE_N0046, IPE_N0047, IPE_N0048, IPE_N0049, IPE_N0050,
-    IPE_N0051, IPE_N0052, IPE_N0053, IPE_P0001, IPE_P0002, IPE_P0003, IPE_P0010, IPE_P0011,
-    IPE_P0012, IPE_P0013, IPE_P0014, IPE_P0015, IPE_P0016, IPE_P0017, IPE_P0018, IPE_P0020,
-    IPE_P0021, IPE_P0030, IPE_P0031, IPE_P0040, IPE_P0041, IPE_P0050, IPE_P0060, IPE_P0061,
-    IPE_P0062, IPE_P0063, IPE_P0064, IPE_P0065, IPE_P0066, IPE_P0067, IPE_P0068, IPE_P0069,
-    IPE_P0070, IPE_S0001, IPE_S0002, IPE_S0003, IPE_S0004, IPE_T0001, IPE_T0002, IPE_T0003,
-    IPE_T0004, IPE_T0010, IPE_T0011, IPE_T0012, IPE_T0013, IPE_T0014, IPE_T0015, IPE_T0016,
-    IPE_T0017, IPE_T0018, IPE_T0019, IPE_T0020, IPE_T0021, Severity,
+    Code, Family, IPE_E0001, IPE_E0002, IPE_E0003, IPE_F4400, IPE_F4401, IPE_F4402, IPE_F4410,
+    IPE_F4411, IPE_F4412, IPE_F4413, IPE_F4414, IPE_F4415, IPE_I0001, IPE_I0010, IPE_I0011,
+    IPE_I0100, IPE_I0101, IPE_I0102, IPE_I0103, IPE_I0200, IPE_I0201, IPE_I0202, IPE_I0203,
+    IPE_L0100, IPE_L0101, IPE_L0102, IPE_L0103, IPE_L0104, IPE_L0105, IPE_L0106, IPE_L0107,
+    IPE_L0108, IPE_L0110, IPE_L0111, IPE_L0112, IPE_L0113, IPE_L0114, IPE_L0115, IPE_L0116,
+    IPE_L0117, IPE_L0118, IPE_L0119, IPE_L0120, IPE_L0121, IPE_L0122, IPE_L0123, IPE_L0124,
+    IPE_L0125, IPE_L0126, IPE_L0127, IPE_L0128, IPE_L0129, IPE_L0130, IPE_L0131, IPE_L0132,
+    IPE_L0134, IPE_L0135, IPE_L0136, IPE_L0140, IPE_L0141, IPE_L0142, IPE_L0143, IPE_L0144,
+    IPE_L0145, IPE_L0146, IPE_L0147, IPE_L0148, IPE_L0149, IPE_L0150, IPE_L0151, IPE_L0152,
+    IPE_L0153, IPE_L0154, IPE_L0155, IPE_L0156, IPE_L0157, IPE_L0158, IPE_L0159, IPE_L0160,
+    IPE_L0161, IPE_L0162, IPE_L0200, IPE_L0201, IPE_N0001, IPE_N0002, IPE_N0003, IPE_N0004,
+    IPE_N0005, IPE_N0010, IPE_N0011, IPE_N0012, IPE_N0013, IPE_N0020, IPE_N0021, IPE_N0022,
+    IPE_N0023, IPE_N0024, IPE_N0025, IPE_N0026, IPE_N0027, IPE_N0028, IPE_N0029, IPE_N0030,
+    IPE_N0031, IPE_N0032, IPE_N0033, IPE_N0034, IPE_N0035, IPE_N0036, IPE_N0038, IPE_N0039,
+    IPE_N0040, IPE_N0041, IPE_N0042, IPE_N0043, IPE_N0044, IPE_N0045, IPE_N0046, IPE_N0047,
+    IPE_N0048, IPE_N0049, IPE_N0050, IPE_N0051, IPE_N0052, IPE_N0053, IPE_P0001, IPE_P0002,
+    IPE_P0003, IPE_P0010, IPE_P0011, IPE_P0012, IPE_P0013, IPE_P0014, IPE_P0015, IPE_P0016,
+    IPE_P0017, IPE_P0018, IPE_P0020, IPE_P0021, IPE_P0030, IPE_P0031, IPE_P0040, IPE_P0041,
+    IPE_P0050, IPE_P0060, IPE_P0061, IPE_P0062, IPE_P0063, IPE_P0064, IPE_P0065, IPE_P0066,
+    IPE_P0067, IPE_P0068, IPE_P0069, IPE_P0070, IPE_P0071, IPE_P0072, IPE_P0073, IPE_S0001,
+    IPE_S0002, IPE_S0003, IPE_S0004, IPE_T0001, IPE_T0002, IPE_T0003, IPE_T0004, IPE_T0010,
+    IPE_T0011, IPE_T0012, IPE_T0013, IPE_T0014, IPE_T0015, IPE_T0016, IPE_T0017, IPE_T0018,
+    IPE_T0019, IPE_T0020, IPE_T0021, IPE_T0022, IPE_T0023, IPE_T0024, Severity,
 };
 use crate::span::Span;
 use crate::suggest::{Confidence, Hit};
@@ -218,6 +219,32 @@ pub enum Construct {
     Tuple,
     Record,
     Lambda,
+}
+
+/// The function a post-lowering refusal fired in.
+///
+/// The IR carries no source spans, so a refusal raised while emitting a body
+/// names its function instead: `home` routes it to the defining module's file
+/// and the rendered message names the function.
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
+pub struct EmitSite {
+    /// The defining module's path, one segment per dotted name part.
+    pub home: Box<[Box<str>]>,
+    /// The function's source name.
+    pub name: Box<str>,
+}
+
+impl EmitSite {
+    /// The function's module-qualified name, as source code spells it.
+    #[must_use]
+    pub fn qualified(&self) -> String {
+        let mut out = self.home.join(".");
+        if !out.is_empty() {
+            out.push('.');
+        }
+        out.push_str(&self.name);
+        out
+    }
 }
 
 /// Which part of a module header is malformed.
@@ -437,6 +464,37 @@ pub enum ParseError {
     /// accurate spans. Rather than clamp offsets (which would misreport every
     /// position past the limit), the lexer turns the file away. [IPE-P0070]
     SourceTooLarge { bytes: usize },
+    /// A `\r` not followed by `\n`. An editor or viewer ends a line there and the
+    /// compiler does not, so the two would read different line structures
+    /// (code a reader sees on its own line the compiler reads as part of a
+    /// comment). A `\r\n` pair is one line break and stays accepted. [IPE-P0071]
+    LoneCarriageReturn,
+    /// A character a viewer draws as a line break or as reordered text, where
+    /// the compiler reads no such structure: code a reader sees could be
+    /// comment text to the compiler, or a literal could look closed where it is
+    /// not. `ch` is the character, `refusal` why its position refuses it.
+    /// [IPE-P0072]
+    SourceDisplayHazard { ch: char, refusal: HazardRefusal },
+    /// A raw C0 control, `DEL` or C1 control other than TAB, LF, CR and the
+    /// line breaks [`ParseError::SourceDisplayHazard`] covers. A terminal that
+    /// shows the raw file runs it as a command (ESC or CSI moves the cursor or
+    /// erases a line, BS steps back), so it can overwrite or hide the code
+    /// around it. Refused in every position, literals included: a program
+    /// builds such a character with `Char.fromCode`. [IPE-P0073]
+    SourceTerminalControl { ch: char },
+}
+
+/// Why a source display hazard is refused where it stands.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum HazardRefusal {
+    /// VT, FF, NEL, or a bidi embedding, pop or override: refused in every position.
+    Anywhere,
+    /// A line or paragraph separator or a bidi isolate in a comment or among code.
+    OutsideLiteral,
+    /// An isolate opener its literal does not close before the literal or its line ends.
+    UnclosedIsolate,
+    /// An isolate closer with no isolate open before it in its literal and line.
+    UnopenedIsolate,
 }
 
 /// Errors raised during name resolution / canonicalisation.
@@ -589,9 +647,11 @@ pub enum NameError {
     /// 2); an under- or over-application is caught at name resolution, ahead of
     /// the lowerer's `ir_type_from_canon` — where a mis-arity builtin would
     /// otherwise reach the empty-home catch-all and ICE (IPE-I0001). The
-    /// sibling of `AliasArity` for the closed builtin-container table.
-    /// [IPE-N0031]
-    BuiltinTypeArity {
+    /// sibling of `AliasArity` for every non-alias type constructor with a
+    /// fixed arity: the closed builtin table, `CustomElement`, and each declared
+    /// union (`X Int Int` or a bare `X` for `type X a`, which no emitted Rust
+    /// type can spell). [IPE-N0031]
+    TypeArity {
         name: Box<str>,
         expected: usize,
         found: usize,
@@ -604,14 +664,15 @@ pub enum NameError {
     ///
     /// * [`AliasExpansionKind::Depth`] — a long straight chain of distinct
     ///   aliases (`type alias A1 = A0`, `type alias A2 = A1`, …) grows the
-    ///   native call stack by one frame per expansion. The depth cap (256)
-    ///   mirrors the parser's `MAX_DEPTH` to stay safely below the thread
-    ///   stack limit in every build profile.
+    ///   native call stack by one frame per expansion. The resolver's
+    ///   `TYPE_EXPANSION_DEPTH_LIMIT` caps it below the thread stack limit in
+    ///   every build profile.
     ///
     /// * [`AliasExpansionKind::Nodes`] — a diamond of aliases (`type alias
     ///   A1 = (A0, A0)`, …) is acyclic so the path-based cycle guard never
-    ///   fires, but the total nodes produced double at every level. The node
-    ///   budget (100 000) bounds this regardless of tree shape.
+    ///   fires, but the total nodes produced double at every level. The
+    ///   resolver's `TYPE_EXPANSION_NODE_LIMIT` bounds this regardless of tree
+    ///   shape.
     ///
     /// [IPE-N0032]
     TypeExpansionTooDeep {
@@ -622,8 +683,9 @@ pub enum NameError {
     /// (TEA) app entry — imports a shape module under `Ipe.Tea.*`. The
     /// `Ipe.Tea.*` namespace holds only live-loop machinery; importing any part
     /// of it marks a module a TEA app, so a Program that does so is a
-    /// contradiction rejected here. `module` is the offending `Ipe.Tea.*` import
-    /// path. [IPE-N0033]
+    /// contradiction rejected here. The one admitted Program is a server whose
+    /// `main` ends in a direct `Server.listen` call, mounting a `Web.embed` app.
+    /// `module` is the offending `Ipe.Tea.*` import path. [IPE-N0033]
     ProgramImportsTeaShape { module: Box<str> },
     /// A TEA app imports another shape's `Cmd` / `Sub` re-export module. `Cmd`
     /// and `Sub` are shape-specific and reached through the app's own shape
@@ -1177,6 +1239,34 @@ pub enum TypeError {
         parameter: usize,
         dependence: WildcardDependence,
     },
+    /// A type nests deeper than the checker's type ceiling. [IPE-T0022]
+    ///
+    /// `depth` is the measured depth, saturated at `u16::MAX`, and `limit` the
+    /// ceiling it passed. The type itself is never carried: printing a type
+    /// past the ceiling would walk that same depth.
+    TypeTooDeep { depth: u16, limit: u16 },
+    /// A type unfolds to more nodes than the checker's size ceiling. [IPE-T0023]
+    ///
+    /// `limit` is the node ceiling and `origin` what built the type. The type
+    /// itself is never carried: printing it would unfold every one of those
+    /// nodes.
+    TypeTooLarge { limit: u64, origin: TypeSizeOrigin },
+    /// A custom type reaches itself with one of its parameters wrapped in a
+    /// larger type, so its uses nest without bound. [IPE-T0024]
+    ///
+    /// `union` names the custom type refused and `param` the parameter that
+    /// grows on the way around the cycle.
+    ExpansiveRecursion { union: Box<str>, param: Box<str> },
+}
+
+/// What built a type past the size ceiling, under [`TypeError::TypeTooLarge`].
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum TypeSizeOrigin {
+    /// A value's inferred type.
+    Value,
+    /// A custom type's constructor instantiating a type of its own recursive
+    /// group with larger arguments.
+    Declaration,
 }
 
 /// Why a wildcard `any` parameter has no independent lowering, under
@@ -1416,14 +1506,15 @@ pub enum Feature {
     /// non-`Clone`-reuse SEAL, for the effect-carrier payload those two do not
     /// cover. Thread the value linearly (use it once) instead. [IPE-L0135]
     NonCloneValueReuse,
-    /// A `Stream.stream` handler captured a value the per-request re-wrap cannot copy.
+    /// A shared handler captured a value it cannot copy per call.
     ///
-    /// The handler is rebuilt for every request and each captured local is
-    /// cloned into it, so a capture must be `Clone`: a destructure-bound
-    /// function, a `Task`/`Cmd`/`Sub`, or a capture whose type could not be
-    /// resolved is refused. Bind a captured function with a plain `let` or take
+    /// A `Stream.stream` request handler or a `Ui`/`Html` event handler (the
+    /// `requires_sync_capture` kernels) is shared and called again and again,
+    /// and each captured local is cloned into it, so a capture must be `Clone`:
+    /// a destructure-bound function, a `Task`/`Cmd`/`Sub`, or a capture whose
+    /// type could not be resolved is refused. Bind a captured function with a plain `let` or take
     /// it as a parameter, and build a captured task inside the handler. A
-    /// partially-applied or point-free `Stream.stream` is a separate fact,
+    /// partially-applied or point-free handler kernel is a separate fact,
     /// [`LowerError::UnsaturatedHandlerKernel`]. [IPE-L0126]
     StreamHandlerCapture,
     /// A closure a partial application rebuilds would move a value it cannot copy.
@@ -1524,7 +1615,20 @@ pub enum LowerError {
         leaf: ModelLeaf,
     },
     /// Expression nesting exceeded the backend's bounded emit depth. [IPE-L0200]
-    BackendNestingTooDeep { limit: u16 },
+    ///
+    /// `func` names the function whose body crossed the bound. It is `None`
+    /// only while the refusal is still inside the expression walk: the function
+    /// emitter fills it before the diagnostic leaves the backend, so the driver
+    /// frames it against the function's own module.
+    BackendNestingTooDeep { limit: u16, func: Option<EmitSite> },
+    /// A rendered Rust type nests past the backend's type-depth backstop. [IPE-L0201]
+    ///
+    /// The type checker's ceiling refuses every such type first; this is the
+    /// emitter's independent second boundary. `func` names the function whose
+    /// emission crossed the bound, filled in by the function emitter exactly as
+    /// for [`LowerError::BackendNestingTooDeep`]; it stays `None` for a type
+    /// rendered outside any function body.
+    BackendTypeTooDeep { limit: u16, func: Option<EmitSite> },
     /// `JsonDec.succeed` / `Db.Decode.succeed` constructor has more than 10
     /// parameters, which exceeds the `curry1`..`curry10` helpers in the runtime.
     /// [IPE-L0121]
@@ -1760,16 +1864,50 @@ pub enum LowerError {
     },
     /// A kernel whose handler the backend re-wraps per call was used unsaturated.
     ///
-    /// `Stream.stream` rebuilds its handler for every request and clones each
-    /// capture into it, which needs the handler expression in hand at the call.
-    /// Point-free or partially applied, the handler is the synthesized
-    /// closure's own parameter — a bare function value with no copyable form —
-    /// so the kernel is legal only as a saturated call (`<|` / `|>` spines are
-    /// flattened to one first). `kernel` is the dotted name from the kernel
-    /// registry (e.g. `Stream.stream`). [IPE-L0152]
+    /// A kernel with an adapted handler slot (`Stream.stream`, `Ui.onKeyDown`,
+    /// `Lazy.lazy`, `Task.retryWith`, …) calls its handler again and again and
+    /// needs the handler expression in hand at the call to classify its
+    /// captures. Point-free or partially applied before its handler, the
+    /// handler is the synthesized closure's own parameter — a bare function
+    /// value with no copyable form — so the kernel is legal only with its
+    /// handler supplied (`<|` / `|>` spines are flattened to one call first).
+    /// `kernel` is the dotted name from the kernel registry (e.g.
+    /// `Stream.stream`). [IPE-L0152]
     UnsaturatedHandlerKernel {
         /// The dotted kernel name that was used unsaturated (e.g. `Stream.stream`).
         kernel: Box<str>,
+    },
+    /// An unannotated binding's type mentions a type variable another binding keeps generic.
+    ///
+    /// A same-module use of an unannotated `helper` inside the annotated,
+    /// generic `owner` shares the helper's one type with the owner's type
+    /// variable `var`. The owner emits `var` as its own Rust generic, but the
+    /// helper has no type parameter for it and would read it as free (`()` in
+    /// a message slot), so the call between the two emitted functions would
+    /// not type-check under cargo. Refused fail-closed at `ipe` time; the fix
+    /// is a signature on the helper. [IPE-L0102]
+    ForeignTypeVariable {
+        /// The unannotated binding (e.g. `chip`).
+        helper: Box<str>,
+        /// The generic binding whose type variable it borrows (e.g. `row`).
+        owner: Box<str>,
+        /// The owner's type variable (e.g. `msg`).
+        var: Box<str>,
+    },
+    /// A call leaves open a type variable only the callee's arguments name,
+    /// and the callee's generated function still returns it.
+    ///
+    /// The callee's generated function drops the arguments that name `var`
+    /// (a parameter of a program union no constructor holds), so no argument
+    /// it takes fixes `var`, while its result still mentions it: the caller
+    /// would observe a type nothing at the call decides. Refused fail-closed at `ipe` time;
+    /// the fix is a type annotation that fixes the variable at the call.
+    /// [IPE-L0102]
+    UninferableErasedParameter {
+        /// The called function (e.g. `empties`).
+        callee: Box<str>,
+        /// The callee's type variable (e.g. `a`).
+        var: Box<str>,
     },
 }
 
@@ -1778,7 +1916,7 @@ pub enum LowerError {
 /// literal, never the whole literal.
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub enum RoutePatternDefect {
-    /// A `:` or `*` segment marker is followed by no name.
+    /// A `:` segment marker is followed by no name.
     ParamEmpty,
     /// A parameter name is not an identifier.
     ParamNotIdentifier {
@@ -1817,6 +1955,71 @@ pub enum RoutePatternDefect {
     UnrenderableLiteral {
         /// The offending literal segment, as written.
         segment: Box<str>,
+    },
+    /// A `Server.*` route path does not start with `/`.
+    NotAbsolute,
+    /// A `Server.*` route path holds more `:` parameters than the server
+    /// routes.
+    TooManyParams {
+        /// The most parameters one path holds.
+        cap: usize,
+    },
+    /// A route pattern or path has a segment led by `*`: a catch-all, which
+    /// no route serves.
+    CatchAll {
+        /// The offending segment.
+        segment: Box<str>,
+    },
+    /// A literal segment of a route pattern or path holds a `:` or `*` after
+    /// its first byte.
+    MidSegmentSigil {
+        /// The offending segment.
+        segment: Box<str>,
+        /// Byte offset of the sigil within the segment.
+        at: usize,
+    },
+    /// A `Server.api` spec names a method the server does not serve.
+    UnknownMethod {
+        /// The method, as written.
+        method: Box<str>,
+    },
+    /// A `Server.static` or `Server.mountApp` prefix is not a string literal.
+    MountPrefixNotLiteral,
+    /// A `Server.static` or `Server.mountApp` prefix is not a mount base.
+    MountPrefix {
+        /// The offending prefix.
+        prefix: Box<str>,
+        /// The mount-base rule it breaks.
+        fault: MountPrefixFault,
+    },
+    /// Two mounts in one `Server.listen` list serve the same prefix.
+    MountPrefixDuplicate {
+        /// The shared prefix.
+        prefix: Box<str>,
+    },
+}
+
+/// The mount-base rule a literal `Server.static` or `Server.mountApp` prefix
+/// breaks.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum MountPrefixFault {
+    /// A non-root prefix that does not start with `/`.
+    NotAbsolute,
+    /// A non-root prefix that ends with `/`.
+    TrailingSlash,
+    /// Two adjacent separators.
+    EmptySegment,
+    /// A `.` or `..` segment.
+    DotSegment,
+    /// A byte outside `A-Z a-z 0-9 - . _ ~` and the `/` separator.
+    Reserved {
+        /// The offending byte.
+        byte: u8,
+    },
+    /// Longer than the mount-base ceiling.
+    TooLong {
+        /// The ceiling in bytes.
+        cap: usize,
     },
 }
 
@@ -1915,6 +2118,19 @@ pub enum StoreSelectProjectionDefect {
         /// Short human-readable Ipê type label for the unsupported type.
         ty: Box<str>,
     },
+    /// The `Select` argument of `Store.selectToList` / `Store.selectToMaybe` is
+    /// not a `Store.select` expression visible at the call.
+    ///
+    /// A `Select` bound to a name, taken as a parameter, or returned by a
+    /// function hides the projected column types the per-row decode is built
+    /// from.
+    SelectArgNotProjection,
+    /// `Store.selectToList` / `Store.selectToMaybe` is referenced other than as
+    /// one call holding its `Db` and its `Store.select` expression.
+    ///
+    /// A partial application or a function value has no projection visible at
+    /// the call, so no per-row decode can be built for it.
+    SelectToNotSaturated,
 }
 
 // ===========================================================================
@@ -2120,6 +2336,22 @@ pub enum Diagnostic {
     /// or DNS), not in the user's source.
     RegistryUnreachable {
         /// The cargo stderr detail, trimmed, for display.
+        detail: String,
+    },
+    /// The build directory or toolchain holds a path the host linker cannot open (`IPE-E0002`).
+    ///
+    /// Span-free: the defect is in the host environment (the project or
+    /// toolchain location), not in the user's source.
+    TargetDirUnlinkable {
+        /// Which directory is refused, and how to fix it, ready for display.
+        detail: String,
+    },
+    /// The host linker could not open one of its input files (`IPE-E0003`).
+    ///
+    /// Span-free: the defect is in the host environment (a path the linker
+    /// family cannot open), not in the user's source.
+    HostLinkerCannotOpenInput {
+        /// The file the linker could not open, and how to fix it, ready for display.
         detail: String,
     },
 }
@@ -2356,6 +2588,8 @@ impl Diagnostic {
             Self::Sandbox { msg } => sandbox_code(msg),
             Self::Consent { msg } => consent_code(msg),
             Self::RegistryUnreachable { .. } => IPE_E0001,
+            Self::TargetDirUnlinkable { .. } => IPE_E0002,
+            Self::HostLinkerCannotOpenInput { .. } => IPE_E0003,
         }
     }
 
@@ -2378,7 +2612,9 @@ impl Diagnostic {
             | Self::Ffi { .. }
             | Self::Sandbox { .. }
             | Self::Consent { .. }
-            | Self::RegistryUnreachable { .. } => Severity::Error,
+            | Self::RegistryUnreachable { .. }
+            | Self::TargetDirUnlinkable { .. }
+            | Self::HostLinkerCannotOpenInput { .. } => Severity::Error,
             Self::Lower { msg, .. } => match msg {
                 LowerError::RoutedAppMissingPageField { .. } => Severity::Warning,
                 _ => Severity::Error,
@@ -2405,7 +2641,10 @@ impl Diagnostic {
                 | TypeError::OrPatternBindingMismatch { .. }
                 | TypeError::TaskArity { .. }
                 | TypeError::WebViewReturnsHtml
-                | TypeError::WildcardNotIndependent { .. } => Severity::Error,
+                | TypeError::WildcardNotIndependent { .. }
+                | TypeError::TypeTooDeep { .. }
+                | TypeError::TypeTooLarge { .. }
+                | TypeError::ExpansiveRecursion { .. } => Severity::Error,
             },
             Self::CompilerBug { .. } => Severity::Bug,
         }
@@ -2424,7 +2663,9 @@ impl Diagnostic {
             | Self::Ffi { .. }
             | Self::Sandbox { .. }
             | Self::Consent { .. }
-            | Self::RegistryUnreachable { .. } => Span::DUMMY,
+            | Self::RegistryUnreachable { .. }
+            | Self::TargetDirUnlinkable { .. }
+            | Self::HostLinkerCannotOpenInput { .. } => Span::DUMMY,
         }
     }
 
@@ -2440,7 +2681,10 @@ impl Diagnostic {
             Self::Ffi { msg } => ffi_help(msg),
             Self::Sandbox { msg } => sandbox_help(msg),
             Self::Consent { msg } => consent_help(msg),
-            Self::CompilerBug { .. } | Self::RegistryUnreachable { .. } => Vec::new(),
+            Self::CompilerBug { .. }
+            | Self::RegistryUnreachable { .. }
+            | Self::TargetDirUnlinkable { .. }
+            | Self::HostLinkerCannotOpenInput { .. } => Vec::new(),
         }
     }
 }
@@ -2527,7 +2771,9 @@ const _: () = assert!(
         && matches!(IPE_S0002.family(), Family::Security)
         && matches!(IPE_S0003.family(), Family::Security)
         && matches!(IPE_S0004.family(), Family::Security)
-        && matches!(IPE_E0001.family(), Family::Environment),
+        && matches!(IPE_E0001.family(), Family::Environment)
+        && matches!(IPE_E0002.family(), Family::Environment)
+        && matches!(IPE_E0003.family(), Family::Environment),
     "diagnostic code family drift: a producer returns a code outside its family",
 );
 
@@ -2582,6 +2828,9 @@ const fn parse_code(msg: &ParseError) -> Code {
         ParseError::AnnotationWithoutBinding { .. } => IPE_P0068,
         ParseError::DuplicateAnnotation { .. } => IPE_P0069,
         ParseError::SourceTooLarge { .. } => IPE_P0070,
+        ParseError::LoneCarriageReturn => IPE_P0071,
+        ParseError::SourceDisplayHazard { .. } => IPE_P0072,
+        ParseError::SourceTerminalControl { .. } => IPE_P0073,
     })
 }
 
@@ -2608,7 +2857,7 @@ const fn name_code(msg: &NameError) -> Code {
         NameError::UnknownKernelAlias { .. } => IPE_N0028,
         NameError::ServerOnlyKernelForWasm { .. } => IPE_N0029,
         NameError::ServerModuleReachableFromWasmClient { .. } => IPE_N0030,
-        NameError::BuiltinTypeArity { .. } => IPE_N0031,
+        NameError::TypeArity { .. } => IPE_N0031,
         NameError::TypeExpansionTooDeep { .. } => IPE_N0032,
         NameError::ProgramImportsTeaShape { .. } => IPE_N0033,
         NameError::WrongShapeCmdSub(..) | NameError::TwoShapeImports { .. } => IPE_N0035,
@@ -2650,6 +2899,9 @@ const fn type_code(msg: &TypeError) -> Code {
         TypeError::TaskArity { .. } => IPE_T0016,
         TypeError::WebViewReturnsHtml => IPE_T0020,
         TypeError::WildcardNotIndependent { .. } => IPE_T0021,
+        TypeError::TypeTooDeep { .. } => IPE_T0022,
+        TypeError::TypeTooLarge { .. } => IPE_T0023,
+        TypeError::ExpansiveRecursion { .. } => IPE_T0024,
     })
 }
 
@@ -2661,6 +2913,7 @@ const fn lower_code(msg: &LowerError) -> Code {
         LowerError::SecretFromStringLiteral => IPE_L0150,
         LowerError::SecretFromStringUnapplied => IPE_L0151,
         LowerError::BackendNestingTooDeep { .. } => IPE_L0200,
+        LowerError::BackendTypeTooDeep { .. } => IPE_L0201,
         LowerError::DecodeSucceedArityTooHigh { .. } => IPE_L0121,
         LowerError::RouteParamCountMismatch { .. } => IPE_L0122,
         LowerError::RoutePatternMalformed { .. } => IPE_L0156,
@@ -2687,6 +2940,9 @@ const fn lower_code(msg: &LowerError) -> Code {
         LowerError::PointFreeAccessorKernel { .. }
         | LowerError::AccessorKernelOffIntercept { .. } => IPE_L0146,
         LowerError::UnsaturatedHandlerKernel { .. } => IPE_L0152,
+        LowerError::ForeignTypeVariable { .. } | LowerError::UninferableErasedParameter { .. } => {
+            IPE_L0102
+        }
         LowerError::StoreSelectProjectionInvalid(_) => IPE_L0149,
     })
 }
@@ -2787,7 +3043,10 @@ fn parse_help(msg: &ParseError) -> Vec<HelpLine> {
         | ParseError::MissingDocString { .. }
         | ParseError::AnnotationWithoutBinding { .. }
         | ParseError::DuplicateAnnotation { .. }
-        | ParseError::SourceTooLarge { .. } => Vec::new(),
+        | ParseError::SourceTooLarge { .. }
+        | ParseError::LoneCarriageReturn
+        | ParseError::SourceDisplayHazard { .. }
+        | ParseError::SourceTerminalControl { .. } => Vec::new(),
     }
 }
 
@@ -2835,7 +3094,7 @@ fn name_help(msg: &NameError) -> Vec<HelpLine> {
         )],
         NameError::Unknown
         | NameError::AliasArity { .. }
-        | NameError::BuiltinTypeArity { .. }
+        | NameError::TypeArity { .. }
         | NameError::ImportCycle { .. }
         | NameError::ModulePathMismatch { .. }
         | NameError::AmbiguousImport { .. }
@@ -2910,6 +3169,40 @@ fn type_help(msg: &TypeError) -> Vec<HelpLine> {
              `Web.tea` `view`, prefer returning the inner \
              `Element` directly (annotate `view : Model -> Element Msg`) and let \
              the shape apply `Ui.layout` for you."
+                .into(),
+        )],
+        TypeError::TypeTooDeep { .. } => vec![HelpLine::Note(
+            "each binding whose value wraps the one before it adds a level to its \
+             type, and each custom type adds a level over the types its \
+             constructors hold. Keep a long sequence in a `List` or a recursive \
+             custom type, whose depth does not grow with its length, or \
+             restructure the chain so no value nests this deep."
+                .into(),
+        )],
+        TypeError::ExpansiveRecursion { .. } => vec![HelpLine::Note(
+            "a custom type may refer to itself only with its parameters as they \
+             are (`List a` inside `type List a`). Hold the growing part in a \
+             field of its own type instead, such as a `List` of the values one \
+             level down."
+                .into(),
+        )],
+        TypeError::TypeTooLarge {
+            origin: TypeSizeOrigin::Value,
+            ..
+        } => vec![HelpLine::Note(
+            "a value that holds the same value twice doubles its type each time. \
+             Name the repeated part with its own custom type, or build the \
+             structure from a list instead of nested pairs."
+                .into(),
+        )],
+        TypeError::TypeTooLarge {
+            origin: TypeSizeOrigin::Declaration,
+            ..
+        } => vec![HelpLine::Note(
+            "a custom type that refers to itself with larger arguments builds a \
+             larger type at each level, however shallow. Pass its parameters on \
+             as they are, or hold the growing part in a field of its own type, \
+             such as a `List`."
                 .into(),
         )],
         TypeError::WildcardNotIndependent { .. } => vec![HelpLine::Note(
@@ -3023,8 +3316,23 @@ fn lower_help(msg: &LowerError) -> Vec<HelpLine> {
         LowerError::InadmissibleAppMsg { app, field, leaf } => vec![HelpLine::Note(
             inadmissible_msg_message(*app, field, *leaf).into_boxed_str(),
         )],
-        LowerError::BackendNestingTooDeep { .. } => {
-            vec![HelpLine::Hint(Hint::NestingBoundDeliberate)]
+        LowerError::BackendNestingTooDeep { func, .. } => {
+            // The IR is span-free, so the function is named on a `note:` line.
+            let mut lines = Vec::with_capacity(2);
+            if let Some(site) = func {
+                lines.push(HelpLine::Note(
+                    format!("in the body of `{}`", site.qualified()).into_boxed_str(),
+                ));
+            }
+            lines.push(HelpLine::Hint(Hint::NestingBoundDeliberate));
+            lines
+        }
+        LowerError::BackendTypeTooDeep { func, .. } => {
+            func.as_ref().map_or_else(Vec::new, |site| {
+                vec![HelpLine::Note(
+                    format!("in the emitted code of `{}`", site.qualified()).into_boxed_str(),
+                )]
+            })
         }
         LowerError::DecodeSucceedArityTooHigh { n } => vec![HelpLine::Note(
             format!(
@@ -3164,6 +3472,12 @@ fn lower_help(msg: &LowerError) -> Vec<HelpLine> {
             accessor_kernel_off_intercept_help(kernel, *context)
         }
         LowerError::UnsaturatedHandlerKernel { kernel } => unsaturated_handler_kernel_help(kernel),
+        LowerError::ForeignTypeVariable { helper, owner, var } => {
+            foreign_type_variable_help(helper, owner, var)
+        }
+        LowerError::UninferableErasedParameter { callee, var } => {
+            uninferable_erased_parameter_help(callee, var)
+        }
         LowerError::StoreSelectProjectionInvalid(defect) => {
             store_select_projection_invalid_help(defect)
         }
@@ -3210,6 +3524,21 @@ fn store_select_projection_invalid_help(defect: &StoreSelectProjectionDefect) ->
              `Store.selectToList`."
         )
         .into_boxed_str(),
+        StoreSelectProjectionDefect::SelectArgNotProjection => {
+            "pass the `Store.select` expression itself, directly or through `|>`: \
+             `Store.join a .x b .y |> Store.select (\\( l, r ) -> r.name) |> \
+             Store.selectToList db`. A `Select` bound to a name, taken as a \
+             parameter, or returned by a function hides the projected column types \
+             the decode is built from."
+                .into()
+        }
+        StoreSelectProjectionDefect::SelectToNotSaturated => {
+            "call `Store.selectToList` / `Store.selectToMaybe` with its `Db` and its \
+             `Store.select` expression at one call site, directly or through `|>`. \
+             It cannot be partially applied or passed as a function value, because \
+             the per-row decode is built from the projection visible at the call."
+                .into()
+        }
     };
     vec![HelpLine::Note(note)]
 }
@@ -3252,17 +3581,48 @@ fn accessor_kernel_off_intercept_help(kernel: &str, context: InterceptContext) -
     )]
 }
 
+/// The help lines for [`LowerError::ForeignTypeVariable`], factored out so
+/// [`lower_help`] stays a thin per-variant dispatcher.
+fn foreign_type_variable_help(helper: &str, owner: &str, var: &str) -> Vec<HelpLine> {
+    vec![
+        HelpLine::Note(
+            format!(
+                "give `{helper}` its own type annotation, generic over its own type \
+                 variable; it is used inside `{owner}`, whose type variable `{var}` it \
+                 would otherwise borrow without being generic over it"
+            )
+            .into_boxed_str(),
+        ),
+        HelpLine::SeeExplain("IPE-L0102"),
+    ]
+}
+
+/// The help lines for [`LowerError::UninferableErasedParameter`], factored
+/// out so [`lower_help`] stays a thin per-variant dispatcher.
+fn uninferable_erased_parameter_help(callee: &str, var: &str) -> Vec<HelpLine> {
+    vec![
+        HelpLine::Note(
+            format!(
+                "fix `{var}` at this call: pass `{callee}` an argument whose type names \
+                 `{var}` concretely (`Tag Int`, not `Tag a`), or annotate the binding \
+                 that holds the result with a concrete type"
+            )
+            .into_boxed_str(),
+        ),
+        HelpLine::SeeExplain("IPE-L0102"),
+    ]
+}
+
 /// The help lines for [`LowerError::UnsaturatedHandlerKernel`], factored out so
 /// [`lower_help`] stays a thin per-variant dispatcher.
 fn unsaturated_handler_kernel_help(kernel: &str) -> Vec<HelpLine> {
     vec![HelpLine::Note(
         format!(
-            "`{kernel}` rebuilds its handler for every request, so it needs the \
-             handler in hand where it is called: apply it to all its arguments, \
-             `{kernel} contentType handler`, or pipe the handler in with \
-             `{kernel} contentType <| handler` / `handler |> {kernel} contentType`. \
-             Do not bind `{kernel}` (or `{kernel} contentType`) to a name or pass it \
-             as a value."
+            "`{kernel}` calls its handler again and again, so it needs the handler \
+             in hand where it is called: apply it to its handler at the call, or pipe \
+             the handler in with `<|` / `|>`. Do not bind `{kernel}` (or a partial \
+             application of it that still lacks the handler) to a name or pass it as \
+             a value."
         )
         .into_boxed_str(),
     )]
@@ -3274,7 +3634,7 @@ fn unsaturated_handler_kernel_help(kernel: &str) -> Vec<HelpLine> {
 /// broke and the rewrite that satisfies it.
 fn route_pattern_malformed_help(defect: &RoutePatternDefect) -> Vec<HelpLine> {
     let note = match defect {
-        RoutePatternDefect::ParamEmpty => "every `:` or `*` segment needs a name after it — \
+        RoutePatternDefect::ParamEmpty => "every `:` segment needs a name after it — \
              write `/posts/:id`, not `/posts/:`"
             .to_string(),
         RoutePatternDefect::ParamNotIdentifier { name, .. } => format!(
@@ -3298,8 +3658,46 @@ fn route_pattern_malformed_help(defect: &RoutePatternDefect) -> Vec<HelpLine> {
         RoutePatternDefect::TooLong { cap } => {
             format!("a route path is at most {cap} bytes — shorten it")
         }
+        RoutePatternDefect::TooManyParams { .. } => {
+            "split the route, or carry the extra values in the query string or the body".to_string()
+        }
+        RoutePatternDefect::NotAbsolute => {
+            "a server route path starts with `/` — write `/health`, not `health`".to_string()
+        }
+        RoutePatternDefect::CatchAll { .. } => {
+            "a route matches a fixed number of segments — name each one \
+             (`/files/:dir/:name`) instead of a `*` catch-all"
+                .to_string()
+        }
+        RoutePatternDefect::MidSegmentSigil { .. } => {
+            "a parameter is a whole segment led by `:` — split `/v-:id` into `/v/:id`, or \
+             write the literal `:` or `*` as `%3A` or `%2A`"
+                .to_string()
+        }
         RoutePatternDefect::UnrenderableLiteral { .. } => {
-            "a page's path is rendered back into a URL, and a browser drops an empty,              `.` or `..` segment — remove the empty segment or rename the literal"
+            "a page's path is rendered back into a URL, and a browser drops an empty, \
+             `.` or `..` segment — remove the empty segment or rename the literal"
+                .to_string()
+        }
+        RoutePatternDefect::UnknownMethod { .. } => {
+            "name one of `GET`, `HEAD`, `POST`, `PUT`, `PATCH`, `DELETE`, `OPTIONS`, \
+             `CONNECT`, `TRACE` or `ANY` before the path — or omit the method to serve every \
+             method"
+                .to_string()
+        }
+        RoutePatternDefect::MountPrefixNotLiteral => {
+            "write the mount prefix as a string literal (`Server.static \"/assets\" dir`), so \
+             it is checked when the program compiles"
+                .to_string()
+        }
+        RoutePatternDefect::MountPrefix { .. } => {
+            "a mount prefix is `/` or `/`-separated segments of the letters, digits, `-`, `.`, \
+             `_` and `~`, with no trailing `/` — write `/assets` or `/app/v2`"
+                .to_string()
+        }
+        RoutePatternDefect::MountPrefixDuplicate { .. } => {
+            "give each mount its own prefix; a longer prefix nested under another is served \
+             by the longer one"
                 .to_string()
         }
     };
@@ -3576,7 +3974,7 @@ mod code_family_tests {
     /// cross (the sandbox is the FFI jail) — so this table pins the exception
     /// too, not only the rule.
     fn family_representatives() -> Vec<(Diagnostic, Family)> {
-        vec![
+        [
             (
                 Diagnostic::Parse {
                     span: Span::DUMMY,
@@ -3655,12 +4053,6 @@ mod code_family_tests {
                 Family::Security,
             ),
             (
-                Diagnostic::RegistryUnreachable {
-                    detail: "test".to_owned(),
-                },
-                Family::Environment,
-            ),
-            (
                 Diagnostic::CompilerBug {
                     where_: "ir.match.non_exhaustive",
                     detail: "test".to_owned(),
@@ -3668,6 +4060,28 @@ mod code_family_tests {
                 Family::Internal,
             ),
         ]
+        .into_iter()
+        .chain(environment_representatives())
+        .collect()
+    }
+
+    /// One representative [`Diagnostic`] for every environment fault, each
+    /// paired with [`Family::Environment`].
+    fn environment_representatives() -> Vec<(Diagnostic, Family)> {
+        [
+            Diagnostic::RegistryUnreachable {
+                detail: "test".to_owned(),
+            },
+            Diagnostic::TargetDirUnlinkable {
+                detail: "test".to_owned(),
+            },
+            Diagnostic::HostLinkerCannotOpenInput {
+                detail: "test".to_owned(),
+            },
+        ]
+        .into_iter()
+        .map(|diagnostic| (diagnostic, Family::Environment))
+        .collect()
     }
 
     /// Every representative diagnostic's rendered code belongs to the family it
@@ -3722,6 +4136,51 @@ mod code_family_tests {
                 c.as_str()
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod foreign_type_variable_help_tests {
+    use super::{HelpLine, foreign_type_variable_help};
+
+    /// The fix the note names fits every shape: a non-message borrow
+    /// (`ident` under `f : a -> a`) is never told to return a UI carrier.
+    #[test]
+    fn note_names_the_binding_and_no_type_constructor() {
+        let lines = foreign_type_variable_help("ident", "f", "a");
+        let notes: Vec<&str> = lines
+            .iter()
+            .filter_map(|line| match line {
+                HelpLine::Note(text) => Some(&**text),
+                HelpLine::DidYouMean(_)
+                | HelpLine::Hint(_)
+                | HelpLine::SecondarySpan { .. }
+                | HelpLine::MissingConstructor(_)
+                | HelpLine::Suggest(_)
+                | HelpLine::SeeExplain(_) => None,
+            })
+            .collect();
+        assert_eq!(notes.len(), 1, "exactly one note: {lines:?}");
+        assert!(
+            notes
+                .iter()
+                .all(|n| n.contains("`ident`") && n.contains("`f`") && n.contains("`a`")),
+            "the note names helper, owner, and variable: {notes:?}"
+        );
+        assert!(
+            notes.iter().all(|n| {
+                !["Html", "Element", "Attribute", "Event"]
+                    .iter()
+                    .any(|carrier| n.contains(carrier))
+            }),
+            "the note must not prescribe a UI carrier for a non-message borrow: {notes:?}"
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|line| matches!(line, HelpLine::SeeExplain("IPE-L0102"))),
+            "the help points at the explain page: {lines:?}"
+        );
     }
 }
 

@@ -448,7 +448,7 @@ pub fn build_in_jail(
 #[cfg(target_os = "macos")]
 #[must_use]
 pub fn build_in_jail(
-    _tools: &RunJailTools,
+    tools: &RunJailTools,
     profile: &SandboxProfile,
     mounts: &JailMounts,
     payload: &[OsString],
@@ -457,12 +457,13 @@ pub fn build_in_jail(
         return outcome;
     }
     let scoped_tmp = mounts.scoped_tmp().as_path();
-    // `sandbox-exec` is the mandatory macOS jail primitive. Absent ⇒ refuse; the
-    // untrusted payload is never run unconfined.
-    let Some(sandbox_exec) = find_in_path("sandbox-exec") else {
+    // `sandbox-exec` is the mandatory macOS jail primitive, carried only by the
+    // Seatbelt arm. Any other arm ⇒ refuse; the untrusted payload is never run
+    // unconfined.
+    let RunJailTools::Seatbelt { sandbox_exec } = tools else {
         return JailOutcome::Unavailable {
             defect: RunJailDefect::PrimitiveUnavailable {
-                missing: vec!["sandbox-exec"],
+                missing: vec![crate::HostTool::SandboxExec.name()],
             },
         };
     };
@@ -480,7 +481,7 @@ pub fn build_in_jail(
         }
     };
     let mut argv: Vec<OsString> = Vec::with_capacity(payload.len() + 3);
-    argv.push(sandbox_exec.into_os_string());
+    argv.push(sandbox_exec.clone().into_os_string());
     argv.push("-p".into());
     argv.push(sbpl.into());
     argv.extend(payload.iter().cloned());
@@ -877,7 +878,8 @@ pub const MACOS_READ_ROOTS: [&str; 11] = [
 ///
 /// # Errors
 /// [`crate::JailPathError::ExposesCargoHome`] when a [`MACOS_READ_ROOTS`] entry
-/// equals or contains the cargo home; any error of [`TreeBind::granted_by`].
+/// equals or contains the cargo home; any error of [`TreeBind::granted_by`] or
+/// [`TreeBind::recheck`].
 #[cfg(any(target_os = "macos", test))]
 pub fn checked_sbpl(
     profile: &SandboxProfile,
@@ -885,6 +887,7 @@ pub fn checked_sbpl(
 ) -> Result<String, crate::JailPathError> {
     mounts.refuse_fixed_exposing(&MACOS_READ_ROOTS)?;
     let tree = TreeBind::granted_by(&profile.filesystem, mounts)?;
+    tree.recheck()?;
     Ok(sbpl_for(
         profile,
         mounts.scoped_tmp().as_path(),
@@ -1233,18 +1236,6 @@ pub fn macos_scrubbed_env(
         }
     }
     env
-}
-
-/// Resolve a program name to an absolute path via `PATH`, or `None` when absent.
-/// The macOS build/run jails (`sandbox-exec`) and the FreeBSD build jail (`jail`)
-/// both refuse (fail-closed) when their mandatory primitive is missing, so the
-/// resolver is shared.
-#[cfg(any(target_os = "macos", target_os = "freebsd"))]
-pub(crate) fn find_in_path(bin: &str) -> Option<PathBuf> {
-    let path = ipe_env::var_os("PATH")?;
-    std::env::split_paths(&path)
-        .map(|dir| dir.join(bin))
-        .find(|candidate| candidate.is_file())
 }
 
 /// The user-private root for per-run FreeBSD jail scratch dirs, under `home`.
@@ -1601,10 +1592,11 @@ pub(crate) fn require_root_only_ancestors(
 mod freebsd_jail {
     use super::{
         FreebsdMountOp, JAIL_TMPFS_OPTIONS, JailOutcome, SafeMountPath, ViewDirTrust,
-        apply_mount_ops, find_in_path, freebsd_mount_ops, macos_scrubbed_env,
-        require_root_only_ancestors, root_only_dir, under_root,
+        apply_mount_ops, freebsd_mount_ops, macos_scrubbed_env, require_root_only_ancestors,
+        root_only_dir, under_root,
     };
     use crate::JailMounts;
+    use crate::host_tool::{self, HostTool};
     use crate::mounts::{TreeBind, jail_binds, mount_plan};
     use crate::run_jail::{RunJailDefect, SandboxProfile};
     use std::ffi::OsString;
@@ -1625,13 +1617,14 @@ mod freebsd_jail {
     ) -> JailOutcome {
         // `jail` is the mandatory primitive. Absent ⇒ refuse; the untrusted build
         // is never run unconfined.
-        let Some(jail_bin) = find_in_path("jail") else {
+        let Ok(jail_bin) = host_tool::resolve(HostTool::Jail) else {
             return JailOutcome::Unavailable {
                 defect: RunJailDefect::PrimitiveUnavailable {
-                    missing: vec!["jail"],
+                    missing: vec![HostTool::Jail.name()],
                 },
             };
         };
+        let jail_bin = jail_bin.as_path();
 
         // The filesystem axis is confined STRUCTURALLY, not by DAC ownership: the
         // jail is chrooted (`path=`) to a fresh root that is a READ-ONLY nullfs view
@@ -1646,7 +1639,9 @@ mod freebsd_jail {
         // file permissions. Absent the mount root the untrusted build is never run —
         // fail-closed. Every planned path is a `SafeMountPath` (absolute, no
         // `..`/`.`), so it re-roots inside the jail root and nowhere else.
-        let tree = match TreeBind::granted_by(&profile.filesystem, mounts) {
+        let tree = match TreeBind::granted_by(&profile.filesystem, mounts)
+            .and_then(|tree| tree.recheck().map(|()| tree))
+        {
             Ok(tree) => tree,
             Err(e) => {
                 return JailOutcome::Unavailable {
@@ -1676,14 +1671,14 @@ mod freebsd_jail {
         let rctl = if profile.subprocess {
             None
         } else {
-            match find_in_path("rctl") {
-                Some(path) => Some(path),
-                None => {
+            match host_tool::resolve(HostTool::Rctl) {
+                Ok(rctl) => Some(rctl.as_path()),
+                Err(_) => {
                     return JailOutcome::Unavailable {
                         defect: RunJailDefect::PrimitiveUnavailable {
                             // Without rctl a withheld-subprocess jail cannot deny
                             // process creation — a refuse-gap, never an unconfined run.
-                            missing: vec!["rctl"],
+                            missing: vec![HostTool::Rctl.name()],
                         },
                     };
                 }
@@ -1819,15 +1814,12 @@ mod freebsd_jail {
     /// `spec` is a `chown(8)` owner spec: a bare user (`nobody`) or a numeric
     /// `uid:gid` pair used to restore the original ownership.
     fn run_chown(spec: &str, path: &Path) -> Result<(), RunJailDefect> {
-        let Some(chown) = find_in_path("chown") else {
+        let Ok(chown) = host_tool::resolve(HostTool::Chown) else {
             return Err(RunJailDefect::PrimitiveUnavailable {
-                missing: vec!["chown"],
+                missing: vec![HostTool::Chown.name()],
             });
         };
-        let status = std::process::Command::new(chown)
-            .arg(spec)
-            .arg(path)
-            .status();
+        let status = chown.command().arg(spec).arg(path).status();
         match status {
             Ok(s) if s.success() => Ok(()),
             Ok(s) => Err(RunJailDefect::Spawn {
@@ -2063,23 +2055,18 @@ mod freebsd_jail {
         /// (`Err`), so the payload never runs against an incompletely-confined or
         /// unmasked root.
         fn establish(mounts: &JailMounts, tree: &TreeBind) -> Result<Self, RunJailDefect> {
-            let Some(mount_nullfs_bin) = find_in_path("mount_nullfs") else {
-                return Err(RunJailDefect::PrimitiveUnavailable {
-                    missing: vec!["mount_nullfs"],
-                });
+            let resolve = |tool: HostTool| {
+                host_tool::resolve(tool)
+                    .map(|found| found.as_path())
+                    .map_err(|_| RunJailDefect::PrimitiveUnavailable {
+                        missing: vec![tool.name()],
+                    })
             };
+            let mount_nullfs_bin = resolve(HostTool::MountNullfs)?;
             // `mount` is the stable primitive; FreeBSD does not ship a standalone
             // `mount_devfs` binary — devfs is mounted via `mount -t devfs devfs`.
-            let Some(mount_devfs_bin) = find_in_path("mount") else {
-                return Err(RunJailDefect::PrimitiveUnavailable {
-                    missing: vec!["mount"],
-                });
-            };
-            let Some(umount_bin) = find_in_path("umount") else {
-                return Err(RunJailDefect::PrimitiveUnavailable {
-                    missing: vec!["umount"],
-                });
-            };
+            let mount_devfs_bin = resolve(HostTool::Mount)?;
+            let umount_bin = resolve(HostTool::Umount)?;
 
             // The jail root is created exclusively under the private cache root
             // (`~/.cache/ipe/jail/`), not world-writable `/tmp`, so a local attacker

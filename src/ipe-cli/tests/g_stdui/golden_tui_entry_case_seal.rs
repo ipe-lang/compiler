@@ -33,20 +33,19 @@ fn repo_root() -> PathBuf {
     std::fs::canonicalize(&joined).unwrap_or(joined)
 }
 
-fn fixture_entry(root: &Path) -> PathBuf {
+fn fixture_project(root: &Path) -> PathBuf {
     root.join("tests")
         .join("golden")
         .join("tui_entry_case_taskrun")
-        .join("Main.ipe")
 }
 
 /// Build the fixture and return the emitted `src/main.rs` text. `None` when the
 /// build fails (the caller's `assert!` reports the diag).
 fn built_main_rs(root: &Path, out: &Path) -> (Result<(), ipe::CliError>, Option<String>) {
-    let entry = fixture_entry(root);
+    let entry = fixture_project(root);
     let _ = std::fs::remove_dir_all(out);
     let runtime = e2e_support::require_runtime().into_path_buf();
-    let built = ipe::build(&entry, out, &runtime);
+    let built = crate::support::build_golden(&entry, out, &runtime);
     let main_rs = if built.is_ok() {
         std::fs::read_to_string(out.join("src").join("main.rs")).ok()
     } else {
@@ -144,9 +143,9 @@ fn tui_entry_case_taskrun_builds_and_runs() {
     let root = repo_root();
     let out = crate::support::scratch_root().join("ipec_tui_entry_case_taskrun_e2e");
     let runtime = e2e_support::require_runtime().into_path_buf();
-    let entry = fixture_entry(&root);
+    let entry = fixture_project(&root);
     let _ = std::fs::remove_dir_all(&out);
-    let built = ipe::build(&entry, &out, &runtime);
+    let built = crate::support::build_golden(&entry, &out, &runtime);
     assert!(
         built.is_ok(),
         "tui_entry_case_taskrun: must be accepted, got: {built:?}"

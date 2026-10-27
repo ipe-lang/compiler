@@ -27,23 +27,22 @@ fn repo_root() -> PathBuf {
     std::fs::canonicalize(&joined).unwrap_or(joined)
 }
 
-fn example_entry(root: &Path) -> PathBuf {
+fn golden_dir(root: &Path) -> PathBuf {
     root.join("tests")
         .join("golden")
         .join("fn_value_return_reify_typevar")
-        .join("Main.ipe")
 }
 
 #[test]
 fn rejects_cleanly_or_builds_and_runs_never_silent_cargo_fail() {
     let root = repo_root();
-    let entry = example_entry(&root);
+    let golden = golden_dir(&root);
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("fn_value_return_reify_typevar_emit");
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
 
-    let built = ipe::build(&entry, &out, &runtime);
+    let built = crate::support::build_golden(&golden, &out, &runtime);
 
     // The minimal sound outcome: a clean first-class-function diagnostic.
     if let Err(CliError::Pipeline { diag, .. }) = &built {

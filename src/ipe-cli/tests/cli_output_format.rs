@@ -11,8 +11,10 @@
 // reports it as the test failure, which is the intended behaviour here.
 #![allow(clippy::expect_used)]
 
-use std::path::PathBuf;
+use std::fs;
+use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 mod support;
 
@@ -44,11 +46,59 @@ fn run(args: &[&str]) -> Run {
     }
 }
 
-/// A source file whose inferred capability set is a known, non-empty pair
+/// A project directory whose inferred capability set is a known, non-empty pair
 /// (`network`, `clock`), for the capabilities-form assertions.
 fn sample_entry() -> String {
-    let path = support::manifest_dir().join("tests/fixtures/capabilities/uses_http_and_clock.ipe");
-    path.to_string_lossy().into_owned()
+    let dir = capabilities_project().expect("the capabilities fixture project is written");
+    dir.to_string_lossy().into_owned()
+}
+
+/// The unformatted fixture module, as a loose file for the formatter tests.
+fn sample_source() -> PathBuf {
+    support::manifest_dir().join("tests/fixtures/capabilities/uses_http_and_clock.ipe")
+}
+
+/// Run `ipe <args>` in `dir` with `NO_COLOR=1`, as [`run`] does.
+fn run_in(dir: &Path, args: &[&str]) -> Run {
+    match Command::new(support::ipe_bin())
+        .args(args)
+        .current_dir(dir)
+        .env("NO_COLOR", "1")
+        .output()
+    {
+        Ok(output) => Run {
+            ok: output.status.success(),
+            stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+        },
+        Err(e) => Run {
+            ok: false,
+            stdout: String::new(),
+            stderr: format!("failed to spawn ipe {args:?} in {}: {e}", dir.display()),
+        },
+    }
+}
+
+/// The well-typed `hello-world` example project.
+fn hello_world() -> PathBuf {
+    support::manifest_dir().join("../../examples/shapes/non-tea/hello-world")
+}
+
+/// A fresh project whose `src/Main.ipe` is the capabilities fixture using the network and the clock.
+fn capabilities_project() -> std::io::Result<PathBuf> {
+    static NEXT: AtomicUsize = AtomicUsize::new(0);
+    let dir = support::scratch_root().join(format!(
+        "capabilities_project_{}_{}",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ));
+    fs::create_dir_all(dir.join("src"))?;
+    fs::write(dir.join("package.ipe"), support::package_ipe("caps"))?;
+    fs::copy(
+        support::manifest_dir().join("tests/fixtures/capabilities/uses_http_and_clock.ipe"),
+        dir.join("src").join("Main.ipe"),
+    )?;
+    Ok(dir)
 }
 
 // ---- version ---------------------------------------------------------------
@@ -592,10 +642,12 @@ fn upgrade_bad_flag_shows_help() {
 #[test]
 fn check_success_output_is_guttered_and_framed() {
     // Use the examples tree as a known well-typed source so no fixture is needed.
-    let entry =
-        support::manifest_dir().join("../../examples/shapes/non-tea/hello-world/src/Main.ipe");
-    assert!(entry.is_file(), "the hello-world example must exist");
-    let r = run(&["type-check", &entry.to_string_lossy()]);
+    let project = hello_world();
+    assert!(
+        project.join("src/Main.ipe").is_file(),
+        "the hello-world example must exist"
+    );
+    let r = run_in(&project, &["type-check"]);
     assert!(
         r.ok,
         "type-check on a well-typed program must exit 0; stderr: {}",
@@ -814,10 +866,11 @@ fn unknown_command_screen_is_fully_guttered() {
 /// errno tail, no `io error` jargon.
 #[test]
 fn missing_file_error_is_styled_without_errno() {
-    let r = run(&["type-check", "/no/such/file.ipe"]);
+    let project = hello_world();
+    let r = run_in(&project, &["type-check", "src/NoSuchFile.ipe"]);
     assert!(!r.ok, "a missing entry must exit non-zero");
     assert!(
-        r.stderr.contains("no such file `/no/such/file.ipe`"),
+        r.stderr.contains("no such file `") && r.stderr.contains("src/NoSuchFile.ipe`"),
         "styled NotFound message, got:\n{}",
         r.stderr
     );
@@ -857,7 +910,7 @@ fn fmt_check_json_emits_compact_verdict() {
     let file = dir.join("Main.ipe");
 
     // Format a copy in place first, so the subsequent --check is a clean scan.
-    std::fs::copy(sample_entry(), &file).expect("seed the fixture");
+    std::fs::copy(sample_source(), &file).expect("seed the fixture");
     let fmt = run(&["fmt", file.to_str().expect("utf8")]);
     assert!(fmt.ok, "seeding format must succeed, got:\n{}", fmt.stderr);
 
@@ -871,7 +924,7 @@ fn fmt_check_json_emits_compact_verdict() {
 
     // Now restore the raw (unformatted) fixture and confirm the verdict lists
     // the file, compact, exit non-zero.
-    std::fs::copy(sample_entry(), &file).expect("restore the unformatted fixture");
+    std::fs::copy(sample_source(), &file).expect("restore the unformatted fixture");
     let dirty = run(&["fmt", "--check", "--json", file.to_str().expect("utf8")]);
     assert!(!dirty.ok, "an unformatted file fails --check");
     let line = dirty.stdout.trim();

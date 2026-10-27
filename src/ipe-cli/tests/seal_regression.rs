@@ -33,18 +33,12 @@ const fn false_marker() -> bool {
     std::hint::black_box(false)
 }
 
-/// Write `source` as a single-file `Main.ipe` under a fresh scratch dir keyed by
-/// `name`, returning the entry path (or `None` if scratch setup fails).
-fn write_single(name: &str, source: &str) -> Option<PathBuf> {
-    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
-        .join("seal")
-        .join(name);
-    let _ = std::fs::remove_dir_all(&dir);
-    let src = dir.join("src");
-    std::fs::create_dir_all(&src).ok()?;
-    let entry = src.join("Main.ipe");
-    std::fs::write(&entry, source).ok()?;
-    Some(entry)
+/// Write `source` as the `Main` module of a fresh project fixture, failing the
+/// test loudly when the fixture cannot be written.
+#[track_caller]
+#[allow(clippy::expect_used)] // test setup: an unwritable fixture IS the failure
+fn write_single(source: &str) -> ipe::RootFixture {
+    ipe::RootFixture::main(source).expect("scratch fixture setup must succeed")
 }
 
 /// The scratch output dir for `name`, cleared.
@@ -61,10 +55,10 @@ fn out_dir(name: &str) -> PathBuf {
 /// the positive-SEAL companion to `negative_suite::assert_rejected`.
 #[track_caller]
 fn assert_accepted(name: &str, source: &str, expected_stdout: &str) {
-    let entry = crate::support::expect_scratch_entry(name, write_single(name, source));
+    let fixture = write_single(source);
     let out = out_dir(name);
     let runtime = e2e_support::require_runtime().into_path_buf();
-    match ipe::build(&entry, &out, &runtime) {
+    match ipe::build_fixture(&fixture, &out, &runtime).map(drop) {
         Ok(()) => {}
         Err(CliError::Pipeline { diag, .. }) => {
             assert!(
@@ -112,10 +106,10 @@ fn assert_accepted(name: &str, source: &str, expected_stdout: &str) {
 /// binding is an Efficiency regression the SEAL's cargo-green gate would
 /// silently accept.
 fn emit_main_rs(name: &str, source: &str) -> String {
-    let entry = crate::support::expect_scratch_entry(name, write_single(name, source));
+    let fixture = write_single(source);
     let out = out_dir(name);
     let runtime = e2e_support::require_runtime().into_path_buf();
-    let built = ipe::build(&entry, &out, &runtime);
+    let built = ipe::build_fixture(&fixture, &out, &runtime).map(drop);
     assert!(built.is_ok(), "{name}: build failed: {built:?}");
     let text = std::fs::read_to_string(out.join("src").join("main.rs"));
     assert!(
@@ -130,24 +124,25 @@ fn emit_main_rs(name: &str, source: &str) -> String {
 /// folding) can only be exercised through the sibling-discovery path.
 #[track_caller]
 fn assert_accepted_project(name: &str, files: &[(&str, &str)], expected_stdout: &str) {
-    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
-        .join("seal-proj")
-        .join(name);
-    let _ = std::fs::remove_dir_all(&dir);
-    let src = dir.join("src");
-    crate::support::expect_scratch_step(name, std::fs::create_dir_all(&src));
-    for (fname, contents) in files {
-        let path = src.join(fname);
-        if let Some(parent) = path.parent() {
-            crate::support::expect_scratch_step(name, std::fs::create_dir_all(parent));
-        }
-        crate::support::expect_scratch_step(name, std::fs::write(&path, contents));
-    }
+    let tree = files.iter().fold(
+        ipe::project_root::SourceTree::new(),
+        |tree, (fname, contents)| {
+            tree.module(&fname.trim_end_matches(".ipe").replace('/', "."), contents)
+        },
+    );
+    let fixture = ipe::RootFixture::from_tree(&tree);
+    assert!(
+        fixture.is_ok(),
+        "{name}: scratch fixture setup failed: {:?}",
+        fixture.as_ref().err()
+    );
+    let Ok(fixture) = fixture else {
+        return;
+    };
     let out = out_dir(name);
     let runtime = e2e_support::require_runtime().into_path_buf();
-    let entry = src.join("Main.ipe");
-    match ipe::build_loose_file(&entry, &out, &runtime) {
-        Ok(()) => {}
+    match ipe::build_fixture(&fixture, &out, &runtime) {
+        Ok(_) => {}
         Err(CliError::Pipeline { diag, .. }) => {
             assert!(
                 false_marker(),
@@ -542,6 +537,7 @@ fn sql_param_wildcard_builds_at_two_types() {
     let src = format!(
         "{HEAD}import Ipe.Io as Io\n\
          import Ipe.Db\n\
+         import Ipe.Db.Location as Location\n\
          import Ipe.Db.Unsafe\n\
          import Ipe.Task\n\
          insertOne : Db -> any -> Task Error Int\n\
@@ -559,7 +555,7 @@ fn sql_param_wildcard_builds_at_two_types() {
          \x20                       Io.println \"ok\"\n\
          \x20               )\n\
          \x20       )\n\
-         \x20       (Db.open \"sqlite\" \"sqlite::memory:\")\n"
+         \x20       (Db.open Location.memory)\n"
     );
     assert_accepted("wildcard_sql_param_two_types", &src, "ok\n");
 }
@@ -573,6 +569,7 @@ fn find_projection_bind_wildcard_builds_at_two_types() {
     let src = format!(
         "{HEAD}import Ipe.Io as Io\n\
          import Ipe.Db\n\
+         import Ipe.Db.Location as Location\n\
          import Ipe.Db.Sql as Sql\n\
          import Ipe.Task\n\
          projectOne : Db -> any -> Task Error ()\n\
@@ -591,7 +588,7 @@ fn find_projection_bind_wildcard_builds_at_two_types() {
          \x20               projectOne conn \"s\"\n\
          \x20               Io.println \"ok\"\n\
          \x20       )\n\
-         \x20       (Db.open \"sqlite\" \"sqlite::memory:\")\n"
+         \x20       (Db.open Location.memory)\n"
     );
     assert_accepted("find_projection_wildcard_two_types", &src, "ok\n");
 }
@@ -663,4 +660,79 @@ fn int_min_literal_builds() {
          9223372036854775807\n\
          4\n",
     );
+}
+
+/// Render `render(lo, hi)` until the parenthesised expression it returns sits
+/// at byte offsets `lo..hi` of the source, and return that source.
+///
+/// The program spells a name from the operator's own offsets, so the offsets
+/// are computed from the rendered text rather than written by hand.
+fn converge_compose_source(render: impl Fn(usize, usize) -> (String, String)) -> String {
+    let (mut lo, mut hi) = (0_usize, 0_usize);
+    let mut last = String::new();
+    for _ in 0..8 {
+        let (source, expr) = render(lo, hi);
+        let found = source.find(&format!("({expr})"));
+        assert!(
+            found.is_some(),
+            "expression `{expr}` not found in:\n{source}"
+        );
+        let Some(at) = found else {
+            return source;
+        };
+        let next = (at + 1, at + 1 + expr.len());
+        if next == (lo, hi) {
+            return source;
+        }
+        (lo, hi) = next;
+        last = source;
+    }
+    assert!(
+        false_marker(),
+        "compose site offsets did not converge within 8 rounds:\n{last}"
+    );
+    last
+}
+
+/// The compose program whose operand is a parameter spelled like the
+/// operator's desugared binder, with `expr` built from that spelling.
+fn compose_capture_source(expr: impl Fn(&str) -> String) -> String {
+    converge_compose_source(|lo, hi| {
+        let name = format!("compose_{lo}_{hi}");
+        let expr = expr(&name);
+        let source = format!(
+            "{HEAD}import Ipe.Io as Io\n\
+             import Ipe.String\n\
+             show : Int -> String\n\
+             show n = String.fromInt n\n\n\
+             apply : (Int -> Int) -> String\n\
+             apply {name} = ({expr}) 41\n\n\
+             main = Io.println (apply (\\n -> n + 1))\n"
+        );
+        (source, expr)
+    })
+}
+
+#[test]
+fn compose_right_operand_named_like_its_param_compiles_and_runs() {
+    let src = compose_capture_source(|name| format!("{name} >> show"));
+    assert_accepted("compose_right_operand_capture", &src, "42\n");
+}
+
+#[test]
+fn compose_left_operand_named_like_its_param_compiles_and_runs() {
+    let src = compose_capture_source(|name| format!("show << {name}"));
+    assert_accepted("compose_left_operand_capture", &src, "42\n");
+}
+
+#[test]
+fn accessor_applied_to_a_local_named_like_its_param_compiles() {
+    let src = format!(
+        "{HEAD}import Ipe.Io as Io\n\
+         import Ipe.String\n\
+         main =\n    \
+         let\n        ipe_accessor_arg = {{ x = 7 }}\n    in\n    \
+         Io.println (String.fromInt (.x ipe_accessor_arg))\n"
+    );
+    assert_accepted("accessor_param_named_local", &src, "7\n");
 }

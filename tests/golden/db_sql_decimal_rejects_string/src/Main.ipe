@@ -1,0 +1,27 @@
+module Main exposing (main)
+import Ipe.Io as Io
+import Ipe.Db
+import Ipe.Db.Location as Location
+import Ipe.Db.Unsafe
+import Ipe.Task
+
+-- Rejection fixture: `SqlDecimal` carries a native `Decimal`, so a raw
+-- `String` argument must be a type mismatch, not a silently accepted stringly
+-- value. Kept alongside the accepting `db_sql_decimal_money` golden so the
+-- retype's fail-closed edge stays pinned.
+
+main =
+    Task.andThen
+        (\conn ->
+            Db.withTransaction conn
+                (\txconn ->
+                    do
+                        Unsafe.unsafeExecRaw txconn
+                            "CREATE TABLE prices (amount TEXT)"
+                        Db.exec txconn
+                            "INSERT INTO prices (amount) VALUES (?)"
+                            [ SqlDecimal "1.5" ]
+                        Io.println "unreachable"
+                )
+        )
+        (Db.open Location.memory)

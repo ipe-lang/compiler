@@ -21,16 +21,12 @@ fn repo_root() -> PathBuf {
 /// cannot be resolved.
 fn assert_gate(fixture: &str, out_suffix: &str, expected: ipe_diagnostics::Code) {
     let root = repo_root();
-    let entry = root
-        .join("tests")
-        .join("golden")
-        .join(fixture)
-        .join("Main.ipe");
+    let golden_project = root.join("tests").join("golden").join(fixture);
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(out_suffix);
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
-    let built = ipe::build(&entry, &out, &runtime);
+    let built = crate::support::build_golden(&golden_project, &out, &runtime);
     let got = match &built {
         Err(CliError::Pipeline { diag, .. }) => Some(diag.code()),
         _ => None,

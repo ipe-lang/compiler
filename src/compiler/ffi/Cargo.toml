@@ -33,6 +33,12 @@ toml = "0.8"
 # a link, never blocking, and read under a typed byte cap.
 ipe_fs_open = { path = "../fs_open" }
 
+[target.'cfg(unix)'.dependencies]
+# Cache writes and removals go through held directory handles (`openat`,
+# `mkdirat`, `renameat`, `unlinkat`), never through a planted link. The
+# version and features `ipe_fs_open` already builds, so no new package compiles.
+rustix = { version = "0.38", features = ["fs"] }
+
 [dev-dependencies]
 ipe-test-temp = { path = "../../../tools/test-temp" }
 ipe_env = { path = "../env" }

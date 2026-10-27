@@ -1,7 +1,9 @@
 module Main exposing (main)
 
 import DbTests
+import FailureScanTests
 import HarnessTests
+import HighlightTests
 import IndexTests
 import Ipe.ByteSize as ByteSize
 import Ipe.Char as Char
@@ -26,10 +28,11 @@ import Ipe.Time.Timestamp as Timestamp
 import Lib.Db as LibDb exposing (Decision(..), HistoryCursor(..))
 import Lib.Format as Format
 import Lib.Highlight as Highlight exposing (Lang(..), Token(..))
+import Lib.History exposing (HistoryState(..))
 import Lib.Index as Index exposing (SourceView(..), StaleReason(..))
 import Lib.Keys as Keys exposing (KeyAction(..))
 import Lib.Links as Links exposing (Link(..))
-import Lib.Queue as Queue exposing (HistoryState(..), QueueState(..), UnitPageState(..))
+import Lib.Queue as Queue exposing (QueueState(..), UnitPageState(..))
 import Lib.RepoPath as RepoPath exposing (PathError(..), Root, RootMap)
 import Lib.SafeText as SafeText
 import Lib.Settings as Settings
@@ -39,6 +42,7 @@ import RepoPathTests
 import SafeTextTests
 import SettingsTests
 import SingleFlightTests
+import TextSinkScanTests
 import TypedRowsTests
 import ViewRenderTests
 import ViewTests
@@ -62,6 +66,7 @@ gatherChecks =
         [ HarnessTests.checks |> Task.andThen (contributesChecks "HarnessTests")
         , DbTests.checks |> Task.andThen (contributesChecks "DbTests")
         , ViewTests.checks |> Task.andThen (contributesChecks "ViewTests")
+        , HighlightTests.checks |> Task.andThen (contributesChecks "HighlightTests")
         , IndexTests.checks |> Task.andThen (contributesChecks "IndexTests")
         , QueueTests.checks |> Task.andThen (contributesChecks "QueueTests")
         , LinksTests.checks |> Task.andThen (contributesChecks "LinksTests")
@@ -71,6 +76,8 @@ gatherChecks =
         , TypedRowsTests.checks |> Task.andThen (contributesChecks "TypedRowsTests")
         , ViewRenderTests.checks |> Task.andThen (contributesChecks "ViewRenderTests")
         , SingleFlightTests.checks |> Task.andThen (contributesChecks "SingleFlightTests")
+        , FailureScanTests.checks |> Task.andThen (contributesChecks "FailureScanTests")
+        , TextSinkScanTests.checks |> Task.andThen (contributesChecks "TextSinkScanTests")
         ]
         |> Task.map List.concat
 
@@ -82,7 +89,7 @@ report results =
             (if ok then
                 "PASS"
 
-            else
+             else
                 "FAIL"
             )
                 ++ " "

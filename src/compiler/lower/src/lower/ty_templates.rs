@@ -2,7 +2,7 @@
 //! contains a variable or function, breaks `Clone`, covers a template, or
 //! carries a given record-key set, plus signature-template matching.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use ipe_canon::ast as canon;
 use ipe_intern::{Interner, Symbol};
@@ -10,18 +10,43 @@ use ipe_types::{ConHead, EmittedHeads, HeadIdentity, Ty, paired_ty_children};
 
 use super::is_opaque_boxed_wrapper;
 
-/// Does this solved [`Ty`] contain a free type variable anywhere? Used to keep
-/// the lowerer's record-shape collection to fully-concrete shapes — a
-/// variable-bearing (generic) record reaches the backend through a signature,
-/// where the type variable still has a source [`Symbol`] to name the generic.
-pub(super) fn ty_contains_var(ty: &Ty) -> bool {
+/// A solved [`Ty`] proven ground: no type variable, wildcard, or open row tail at any depth.
+///
+/// The field is private, so the only way to hold one is [`Self::new`], which
+/// admits exactly what [`ipe_types::ty_is_ground`] admits. A ground type reads
+/// no def scope when lowered (no generic map, row parameter, or read site), so
+/// it has one lowering in every scope; a pass that runs outside any def takes
+/// this view and cannot lower a scope-dependent type.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct GroundTy<'a>(&'a Ty);
+
+impl<'a> GroundTy<'a> {
+    /// The ground view of `ty`, or `None` when it carries a variable or an open row.
+    pub(super) fn new(ty: &'a Ty) -> Option<Self> {
+        ipe_types::ty_is_ground(ty).then_some(Self(ty))
+    }
+
+    /// The proven-ground type.
+    pub(super) const fn ty(self) -> &'a Ty {
+        self.0
+    }
+}
+
+/// Whether a type variable appears in this solved [`Ty`], reading record fields only.
+///
+/// A record's row tail is deliberately not consulted, so this is NOT a
+/// groundness judgment (that is [`ipe_types::ty_is_ground`]). It serves the
+/// one read whose consumer itself works on fields only: a row-polymorphic
+/// record update is emitted through its field trait whatever the tail, so its
+/// gate asks only whether a field carries a variable.
+pub(super) fn ty_fields_mention_var(ty: &Ty) -> bool {
     match ty {
         Ty::Var(_) | Ty::Wildcard => true,
         Ty::Unit => false,
-        Ty::Fun(a, b) => ty_contains_var(a) || ty_contains_var(b),
-        Ty::Tuple(elems) => elems.iter().any(ty_contains_var),
-        Ty::Record(fields, _) => fields.values().any(ty_contains_var),
-        Ty::Con { args, .. } => args.iter().any(ty_contains_var),
+        Ty::Fun(a, b) => ty_fields_mention_var(a) || ty_fields_mention_var(b),
+        Ty::Tuple(elems) => elems.iter().any(ty_fields_mention_var),
+        Ty::Record(fields, _) => fields.values().any(ty_fields_mention_var),
+        Ty::Con { args, .. } => args.iter().any(ty_fields_mention_var),
     }
 }
 
@@ -66,7 +91,7 @@ pub(super) fn ty_has_fun_in_derive_carrier(interner: &Interner, ty: &Ty) -> bool
         Ty::Tuple(elems) => elems.iter().any(ty_contains_fun),
         // An opaque boxed wrapper stores its payload behind a trait object and
         // derives nothing over it — a function there is legitimate.
-        Ty::Con { name, .. } if is_opaque_boxed_wrapper(interner, *name) => false,
+        Ty::Con { module, name, .. } if is_opaque_boxed_wrapper(interner, module, *name) => false,
         // Every other constructor head (a user enum, a builtin collection) is a
         // derive carrier over its type arguments.
         Ty::Con { args, .. } => args.iter().any(ty_contains_fun),
@@ -77,7 +102,7 @@ pub(super) fn ty_has_fun_in_derive_carrier(interner: &Interner, ty: &Ty) -> bool
 /// Does instantiating a generic type parameter to `ty` make the emitted Rust
 /// generic parameter's unconditional `Clone` bound unsatisfiable?
 ///
-/// A generic user function emits `fn f<T1: Clone>(..)` (`render_fn_generics`
+/// A generic user function emits `fn f<T1: Clone>(..)` (`apply_signature_shape_bounds`
 /// injects `Clone` on every type parameter, and generic composite structs
 /// derive `Clone` with a `T1: Clone` bound). A function value instantiating
 /// that parameter lowers to a `Box<dyn Fn>` — which is not `Clone` — so the
@@ -98,7 +123,7 @@ pub(super) fn generic_binding_breaks_clone(interner: &Interner, ty: &Ty) -> bool
         // An opaque boxed wrapper renders to a `Clone` handle over its payload
         // (the payload lives behind a trait object), so a function under it does
         // not break the parameter's `Clone` bound.
-        Ty::Con { name, .. } if is_opaque_boxed_wrapper(interner, *name) => false,
+        Ty::Con { module, name, .. } if is_opaque_boxed_wrapper(interner, module, *name) => false,
         Ty::Con { args, .. } => args
             .iter()
             .any(|a| generic_binding_breaks_clone(interner, a)),
@@ -353,4 +378,32 @@ pub(super) fn match_signature_template(
             }
         }
     }
+}
+
+/// The type variables, as raws, an argument of the declared type `ty` names:
+/// every argument on its spine, past whatever arity the callee emits, and not
+/// the return.
+pub(super) fn argument_vars(ty: &Ty) -> BTreeSet<u32> {
+    let mut vars = BTreeSet::new();
+    let mut stack: Vec<&Ty> = Vec::new();
+    let mut spine = ty;
+    while let Ty::Fun(arg, rest) = spine {
+        stack.push(arg);
+        spine = rest;
+    }
+    while let Some(t) = stack.pop() {
+        match t {
+            Ty::Var(raw) => {
+                vars.insert(*raw);
+            }
+            Ty::Fun(a, b) => {
+                stack.push(a);
+                stack.push(b);
+            }
+            Ty::Con { args, .. } | Ty::Tuple(args) => stack.extend(args),
+            Ty::Record(fields, _) => stack.extend(fields.values()),
+            Ty::Wildcard | Ty::Unit => {}
+        }
+    }
+    vars
 }

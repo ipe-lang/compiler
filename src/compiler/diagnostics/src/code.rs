@@ -351,6 +351,12 @@ code! {
     IPE_P0069 = "IPE-P0069", "duplicate type annotation for one name", "IPE-P0069";
     /// source exceeds the addressable span range (u32 byte offsets)
     IPE_P0070 = "IPE-P0070", "source file is too large to compile", "IPE-P0070";
+    /// a `\r` not followed by `\n` — a line break the lexer and editors disagree on
+    IPE_P0071 = "IPE-P0071", "a carriage return must be followed by a newline", "IPE-P0071";
+    /// a line break or bidi control a viewer draws as structure the compiler does not read
+    IPE_P0072 = "IPE-P0072", "a character that breaks or reorders the displayed source", "IPE-P0072";
+    /// a raw C0/C1 control a terminal showing the file runs as a cursor or screen command
+    IPE_P0073 = "IPE-P0073", "a control character a terminal runs as a command", "IPE-P0073";
 
     // -----------------------------------------------------------------------
     // Name resolution (IPE-N####)
@@ -397,9 +403,10 @@ code! {
     /// A wasm client-entry's reachability closure transitively reaches a
     /// server-classified module.
     IPE_N0030 = "IPE-N0030", "server module reachable from the wasm client entry", "IPE-N0030";
-    /// a built-in container type constructor (`List`/`Maybe`/`Set`/`Dict`/`Result`)
-    /// is applied to the wrong number of type arguments
-    IPE_N0031 = "IPE-N0031", "built-in container type applied to the wrong number of arguments", "IPE-N0031";
+    /// a type constructor with a fixed arity (a declared union, `List`/`Maybe`/
+    /// `Dict`/`Result`, `CustomElement`) is applied to the wrong number of type
+    /// arguments
+    IPE_N0031 = "IPE-N0031", "type applied to the wrong number of arguments", "IPE-N0031";
     /// type alias expansion exceeded the depth or node-count budget (cyclic or
     /// exponentially-fanning alias chain)
     IPE_N0032 = "IPE-N0032", "type alias expansion too deep or too large", "IPE-N0032";
@@ -504,6 +511,12 @@ code! {
     IPE_T0020 = "IPE-T0020", "this is `Html` where an `Element` is required", "IPE-T0020";
     /// a wildcard `any` parameter the body ties to another type (name it with a type variable)
     IPE_T0021 = "IPE-T0021", "this `any` is tied to another type, so it cannot stay a wildcard", "IPE-T0021";
+    /// a type nests deeper than the type depth ceiling
+    IPE_T0022 = "IPE-T0022", "this type nests too deeply", "IPE-T0022";
+    /// a type unfolds to more nodes than the type size ceiling
+    IPE_T0023 = "IPE-T0023", "this type is too large", "IPE-T0023";
+    /// a custom type refers to itself with a parameter wrapped in a larger type
+    IPE_T0024 = "IPE-T0024", "this type grows every time it refers to itself", "IPE-T0024";
 
     // -----------------------------------------------------------------------
     // Lower / not-yet-supported (IPE-L####)
@@ -700,6 +713,8 @@ code! {
     IPE_L0162 = "IPE-L0162", "`onNavigate` is set but the Model has no `page` field", "IPE-L0162";
     /// expression nests too deeply for the backend
     IPE_L0200 = "IPE-L0200", "expression nests too deeply for the backend", "IPE-L0200";
+    /// a type nests too deeply for the backend
+    IPE_L0201 = "IPE-L0201", "a type nests too deeply for the backend", "IPE-L0201";
 
     // -----------------------------------------------------------------------
     // FFI (IPE-F####)
@@ -745,6 +760,28 @@ code! {
 
     /// the crate registry could not be reached (network or DNS failure)
     IPE_E0001 = "IPE-E0001", "could not reach the crate registry", "IPE-E0001";
+    /// the build directory holds a path the host linker cannot open
+    IPE_E0002 = "IPE-E0002", "the host linker cannot open the build directory", "IPE-E0002";
+    /// the host linker could not open one of its input files
+    IPE_E0003 = "IPE-E0003", "the host linker could not open an input file", "IPE-E0003";
+    /// the project directory holds no `package.ipe`
+    IPE_E0004 = "IPE-E0004", "no package.ipe in the project directory", "IPE-E0004";
+    /// the project directory has no `src/` directory (or it is a link)
+    IPE_E0005 = "IPE-E0005", "the project has no src directory", "IPE-E0005";
+    /// a `programs` entry in `package.ipe` names a file `src/` does not hold
+    IPE_E0006 = "IPE-E0006", "a declared program entry is missing", "IPE-E0006";
+    /// the project declares no program, has no `src/Main.ipe`, and exposes no module
+    IPE_E0007 = "IPE-E0007", "the project names no entry module", "IPE-E0007";
+    /// a `programs` entry is reached through a symbolic link under `src/`
+    IPE_E0008 = "IPE-E0008", "a program entry passes through a symbolic link", "IPE-E0008";
+    /// an `exposedModules` name has no file under `src/`
+    IPE_E0009 = "IPE-E0009", "an exposed module is missing", "IPE-E0009";
+    /// a project file or directory ipe would read is a symbolic link
+    IPE_E0010 = "IPE-E0010", "a symbolic link inside the project", "IPE-E0010";
+    /// a file argument lies outside the project's `src/` and `tests/`
+    IPE_E0011 = "IPE-E0011", "a file argument outside the project sources", "IPE-E0011";
+    /// a build command was given a file where it takes a project directory
+    IPE_E0012 = "IPE-E0012", "a build command given a file", "IPE-E0012";
 
     // -----------------------------------------------------------------------
     // Internal (IPE-I####)

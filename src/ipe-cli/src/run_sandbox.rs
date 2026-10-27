@@ -606,52 +606,26 @@ pub fn exec_verified_jailed(
     }
 }
 
-/// Resolve the inferred and declared capability sets for a run, given the
-/// project manifest (if any) and the resolved entry file used for single-file
-/// inference.
+/// Resolve the inferred and declared capability sets for a run of the project `manifest` governs.
 ///
-/// For a manifest project the inferred set is the package-wide union (every
-/// shipped module), matching the package-capability posture; the declared set
-/// is the manifest's `[capabilities]`. For a single file there is no manifest,
-/// so inference is over the entry alone and the declared set is empty.
+/// The inferred set is the package-wide union over `package` (every shipped
+/// module), the capability posture the package audit takes; the declared set
+/// is the manifest's `[capabilities]`. `package` is the source set the build
+/// compiles, so the capabilities consented to are those of the program that
+/// ships.
 ///
 /// # Errors
 ///
-/// Propagates lowering / IO failures from capability inference.
+/// Propagates lowering failures from capability inference.
 pub fn resolve_for_run(
-    manifest: Option<&ProjectManifest>,
-    manifest_path: Option<&Path>,
-    entry: &Path,
+    manifest: &ProjectManifest,
+    package: &crate::PackageSourceSet,
 ) -> Result<ResolvedCapabilities, CliError> {
-    if let (Some(m), Some(mpath)) = (manifest, manifest_path) {
-        // A manifest project: the package-wide inferred union + the manifest's
-        // declared set.
-        let inferred = crate::infer_package_capabilities(mpath)?;
-        Ok(ResolvedCapabilities {
-            inferred,
-            declared: m.capabilities.clone(),
-        })
-    } else {
-        // A single file: inference over the entry alone, no declared set. The
-        // inference routes through the same served-widget-aware SSOT every other
-        // capability-audit surface uses, so a constructed `customElement` handle
-        // (whose JS the emitter serves) discloses `custom-element` here too,
-        // whether or not a `CustomElement.node` mounts it.
-        let graph = crate::build_source_graph(entry)?;
-        let program = graph.run_attributed(entry, |db, root, file| {
-            ipe_db::lower_program(db, root, file).clone()
-        })?;
-        let inferred = crate::capabilities_including_served_widgets(
-            &graph.db,
-            graph.source_root,
-            graph.entry_file,
-            &program,
-        );
-        Ok(ResolvedCapabilities {
-            inferred,
-            declared: BTreeSet::new(),
-        })
-    }
+    let inferred = crate::infer_package_capabilities_in(&ipe_db::IpeDatabase::new(), package)?;
+    Ok(ResolvedCapabilities {
+        inferred,
+        declared: manifest.capabilities.clone(),
+    })
 }
 
 #[cfg(test)]

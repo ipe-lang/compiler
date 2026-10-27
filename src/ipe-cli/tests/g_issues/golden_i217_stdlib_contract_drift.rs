@@ -34,24 +34,21 @@ fn repo_root() -> PathBuf {
     std::fs::canonicalize(&joined).unwrap_or(joined)
 }
 
-fn entry_path(root: &Path, name: &str) -> PathBuf {
-    root.join("tests")
-        .join("golden")
-        .join(name)
-        .join("Main.ipe")
+fn fixture_dir(root: &Path, name: &str) -> PathBuf {
+    root.join("tests").join("golden").join(name)
 }
 
 /// Compile a fixture and assert `ipe` accepts it (the contract now matches the
 /// reference). Returns the emitted output dir for an optional E2E follow-up.
 fn assert_ipec_accepts(name: &str) -> PathBuf {
     let root = repo_root();
-    let entry = entry_path(&root, name);
+    let golden_dir = fixture_dir(&root, name);
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("{name}_ipec_out"));
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
 
-    let built = ipe::build_loose_file(&entry, &out, &runtime);
+    let built = crate::support::build_golden(&golden_dir, &out, &runtime);
     assert!(
         built.is_ok(),
         "ipe dev build must succeed for {name} (contract converged to reference): {:?}",
@@ -65,12 +62,12 @@ fn e2e_build_and_run(name: &str, expect_stdout_contains: &str) {
         return;
     }
     let root = repo_root();
-    let entry = entry_path(&root, name);
+    let golden_dir = fixture_dir(&root, name);
     let out = crate::support::scratch_root().join(format!("ipec_{name}_e2e"));
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
-    let built = ipe::build_loose_file(&entry, &out, &runtime);
+    let built = crate::support::build_golden(&golden_dir, &out, &runtime);
     assert!(
         built.is_ok(),
         "ipe dev build must succeed for {name}: {:?}",

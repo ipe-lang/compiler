@@ -22,4 +22,5 @@ pub mod foreign_surface;
 pub mod matrix;
 pub mod package_surface;
 pub mod probe;
+pub mod source_tree;
 pub mod surface;

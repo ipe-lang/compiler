@@ -56,7 +56,9 @@ use lsp_types::{
 
 use ipe_db::{Db as _, IpeDatabase, SourceRoot};
 
-use crate::offset::{PositionEncoding, offset_to_position};
+use crate::offset::{
+    LineEnding, PositionEncoding, first_line, is_position_boundary, line_span, offset_to_position,
+};
 use crate::workspace_edit::{Document, single_edit};
 
 /// The salsa database view a quick-fix reads from.
@@ -263,7 +265,7 @@ fn add_type_annotation_action(
     // Synthesise `name : Type\n` inserted at the start of `insert_line`.
     let insert_byte = line_byte_range(text, insert_line as usize).0;
     let insert_pos = offset_to_position(text, insert_byte, encoding);
-    let annotation = format!("{name} : {ty_str}\n");
+    let annotation = LineEnding::of(text).apply(&format!("{name} : {ty_str}\n"));
     let edit = TextEdit {
         range: Range {
             start: insert_pos,
@@ -400,7 +402,7 @@ impl ImportBlock {
                 start: insert_pos,
                 end: insert_pos,
             },
-            new_text,
+            new_text: LineEnding::of(text).apply(&new_text),
         })
     }
 }
@@ -497,7 +499,7 @@ fn rename_module_decl_action(
 
     // Line 0 must start with `module ` followed by the declared name. Locate the
     // name token by scanning past the keyword and any whitespace.
-    let line0 = text.lines().next()?;
+    let line0 = first_line(text);
     let rest = line0.strip_prefix("module ")?;
     let declared_start_in_line = "module ".len() + rest.len() - rest.trim_start().len();
     let name_text = rest.trim_start();
@@ -604,7 +606,7 @@ fn rewrite_nested_decoder_action(
     let end = offset_to_position(text, end_byte, encoding);
     let edit = TextEdit {
         range: Range { start, end },
-        new_text: rewritten,
+        new_text: LineEnding::of(text).apply(&rewritten),
     };
     Some(CodeAction {
         title: "Rewrite as `|>` pipeline".to_owned(),
@@ -665,8 +667,9 @@ fn wrap_in_ui_html_action(
 /// per-rule code in this file.
 ///
 /// Fail-closed: a diagnostic with no `data`, a malformed `fix` payload, or a
-/// span that is out of range or lands off a UTF-8 char boundary yields no
-/// action rather than guessing or slicing unsafely.
+/// span that is out of range, inverted, or off a position boundary (inside a
+/// UTF-8 character or between a `\r` and its `\n`) yields no action rather
+/// than an edit the client would apply at a clamped position.
 fn lint_fix_action(
     diag: &Diagnostic,
     uri: &Url,
@@ -680,7 +683,7 @@ fn lint_fix_action(
     let lo = usize::try_from(fix.get("lo")?.as_u64()?).ok()?;
     let hi = usize::try_from(fix.get("hi")?.as_u64()?).ok()?;
     let replacement = fix.get("replacement")?.as_str()?;
-    if lo > hi || hi > text.len() || !text.is_char_boundary(lo) || !text.is_char_boundary(hi) {
+    if lo > hi || !is_position_boundary(text, lo) || !is_position_boundary(text, hi) {
         return None;
     }
 
@@ -688,7 +691,7 @@ fn lint_fix_action(
     let end = offset_to_position(text, hi, encoding);
     let edit = TextEdit {
         range: Range { start, end },
-        new_text: replacement.to_owned(),
+        new_text: LineEnding::of(text).apply(replacement),
     };
     Some(CodeAction {
         title: capitalize_first(describe),
@@ -719,10 +722,10 @@ fn capitalize_first(s: &str) -> String {
 /// Returns the content of the last backtick pair on the first line.
 fn expected_module_name_from_message(message: &str) -> Option<String> {
     // Work only on the first line (the title + label portion).
-    let first_line = message.lines().next()?;
+    let title_line = first_line(message);
     // Walk backtick pairs; the LAST one on the first line is the expected name.
     let mut last: Option<&str> = None;
-    for chunk in first_line.split('`').skip(1).step_by(2) {
+    for chunk in title_line.split('`').skip(1).step_by(2) {
         if !chunk.is_empty() {
             last = Some(chunk);
         }
@@ -738,13 +741,13 @@ fn expected_module_name_from_message(message: &str) -> Option<String> {
 fn replacement_from_removed_surface_message(message: &str) -> Option<String> {
     // Walk backtick pairs on the first line; accept the one immediately before
     // ` instead`.
-    let first_line = message.lines().next()?;
-    for candidate in first_line.split('`').skip(1).step_by(2) {
+    let title_line = first_line(message);
+    for candidate in title_line.split('`').skip(1).step_by(2) {
         // Reconstruct enough suffix to detect " instead": after the closing backtick
         // of `candidate`, the raw text would be the next even-indexed split segment.
         // We check by looking at the original string for the pattern.
         let marker = format!("`{candidate}` instead");
-        if first_line.contains(&marker) && !candidate.is_empty() {
+        if title_line.contains(&marker) && !candidate.is_empty() {
             return Some(candidate.to_owned());
         }
     }
@@ -857,18 +860,11 @@ fn shape_paths_from_message(message: &str) -> Option<(String, String)> {
     Some((wrong, correct))
 }
 
-/// Returns `(start_byte, end_byte)` for `line` (0-based), where `end_byte`
-/// points just past the trailing `\n` (or to `text.len()` on the last line).
+/// The `(start, end)` bytes of the 0-based `line`, its line break included.
+///
+/// A line past the last one is empty at `text.len()`.
 fn line_byte_range(text: &str, line: usize) -> (usize, usize) {
-    let mut byte = 0;
-    for (i, l) in text.split('\n').enumerate() {
-        let next = byte + l.len() + 1; // +1 for the '\n'
-        if i == line {
-            return (byte, next.min(text.len()));
-        }
-        byte = next;
-    }
-    (text.len(), text.len())
+    line_span(text, line).map_or((text.len(), text.len()), |span| (span.start, span.end))
 }
 
 #[cfg(test)]
@@ -1230,6 +1226,121 @@ mod tests {
         assert_eq!(
             decoded(&serde_json::json!(names(cap + 1))),
             Vec::<String>::new()
+        );
+    }
+
+    /// The one action's inserted text and the buffer it leaves, for `diag` over `src`.
+    fn applied_edit(src: &str, diag: Diagnostic) -> (String, String) {
+        let db = IpeDatabase::new();
+        let entry = file(&db, &["Main"], src);
+        let root = root_of(&db, &[(&["Main"], entry)]);
+        let uri = Url::from_file_path("/fake/Main.ipe").unwrap();
+        let whole = Range {
+            start: Position {
+                line: 0,
+                character: 0,
+            },
+            end: crate::offset::offset_to_position(src, src.len(), PositionEncoding::Utf16),
+        };
+        let actions = code_actions(
+            DbView {
+                db: &db,
+                root,
+                entry,
+            },
+            &["Main".to_owned()],
+            Document {
+                uri: &uri,
+                text: src,
+                version: None,
+            },
+            whole,
+            &[diag],
+            PositionEncoding::Utf16,
+        );
+        let edit = only_edit(&actions)
+            .and_then(|edit| edit.changes.as_ref()?.get(&uri)?.first().cloned())
+            .expect("exactly one code action with one edit");
+        let lo = crate::offset::position_to_offset(src, edit.range.start, PositionEncoding::Utf16);
+        let hi = crate::offset::position_to_offset(src, edit.range.end, PositionEncoding::Utf16);
+        let mut applied = src.to_owned();
+        applied.replace_range(lo..hi, &edit.new_text);
+        (edit.new_text, applied)
+    }
+
+    /// Whether every line break of `text` is `\r\n`.
+    fn uniform_crlf(text: &str) -> bool {
+        crate::offset::lines_agree(text)
+            && crate::offset::LineEnding::of(text) == crate::offset::LineEnding::Crlf
+    }
+
+    /// The inserted type signature in a CRLF buffer ends in `\r\n`, so the
+    /// buffer stays uniform. Compiled by ci.yml nextest `-p ipe_lsp_features`.
+    #[test]
+    fn add_signature_in_crlf_buffer_writes_crlf() {
+        let src = "module Main exposing (main)\r\n\r\nmain : String\r\nmain =\r\n    answer\r\n\r\nanswer =\r\n    \"hi\"\r\n";
+        let (new_text, applied) = applied_edit(src, diag_at(6, "IPE-L0106"));
+        assert_eq!(new_text, "answer : String\r\n");
+        assert!(uniform_crlf(&applied), "{applied:?}");
+    }
+
+    /// An inserted import in a CRLF buffer ends in `\r\n` in every placement.
+    ///
+    /// The placements are the first import, one sorted before an existing
+    /// import, and one sorted after. Compiled by ci.yml nextest
+    /// `-p ipe_lsp_features`.
+    #[test]
+    fn add_import_in_crlf_buffer_writes_crlf() {
+        let body = "main =\r\n    Utils.f 1\r\n";
+        for imports in ["", "import Zeta\r\n\r\n", "import Ipe.List\r\n\r\n"] {
+            let src = format!("module Main exposing (main)\r\n\r\n{imports}{body}");
+            let body_line = crate::offset::offset_to_position(
+                &src,
+                src.len() - body.len(),
+                PositionEncoding::Utf16,
+            )
+            .line;
+            let mut diag = diag_at(body_line + 1, "IPE-N0034");
+            diag.data = Some(serde_json::json!({ "importCandidates": ["Lib.Utils"] }));
+            let (new_text, applied) = applied_edit(&src, diag);
+            assert!(new_text.ends_with("import Lib.Utils\r\n"), "{new_text:?}");
+            assert!(uniform_crlf(&applied), "{applied:?}");
+        }
+    }
+
+    /// A lint fix whose span ends between a `\r` and its `\n` is refused: the
+    /// client would clamp the end before the `\r` and splice other text.
+    #[test]
+    fn lint_fix_inside_a_crlf_pair_is_refused() {
+        let text = "module Main exposing (main)\r\n\r\nmain = 1\r\n";
+        let mid = text.find("1\r\n").expect("literal") + 2;
+        let uri = Url::parse("file:///Main.ipe").expect("uri");
+        let with_fix = |lo: usize, hi: usize| {
+            let mut diag = diag_at(2, "lint/test");
+            diag.data = Some(serde_json::json!({
+                "fix": { "describe": "drop it", "lo": lo, "hi": hi, "replacement": "" }
+            }));
+            super::lint_fix_action(&diag, &uri, text, PositionEncoding::Utf8, None)
+        };
+        assert!(
+            with_fix(mid - 1, mid - 1).is_some(),
+            "a boundary span offers the fix"
+        );
+        assert!(
+            with_fix(mid - 1, mid).is_none(),
+            "an end mid-pair is refused"
+        );
+        assert!(
+            with_fix(mid, mid + 1).is_none(),
+            "a start mid-pair is refused"
+        );
+        assert!(
+            with_fix(mid - 1, mid - 2).is_none(),
+            "an inverted span is refused"
+        );
+        assert!(
+            with_fix(0, text.len() + 1).is_none(),
+            "a span past the end is refused"
         );
     }
 }

@@ -1,8 +1,8 @@
 module Main exposing (main)
 
+import Ipe.Io as Io
 import Ipe.Log as Log
 import Ipe.Task as Task
-import Ipe.Io as Io
 
 
 -- `Ipe.Log` writes structured, single-line log records at four severities.

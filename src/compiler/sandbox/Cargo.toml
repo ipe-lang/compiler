@@ -5,12 +5,19 @@ version.workspace = true
 license.workspace = true
 description = "Isolation jail for compiling/inspecting untrusted foreign crates: bubblewrap-primary, proven-unshare fallback, fail-closed refusal"
 
+[features]
+# `ToolPath::assumed`: a tool at a stated absolute directory with no file check,
+# for tests that render an argv without spawning. Never enabled by a shipping crate.
+assumed-tool-path = []
+
 [dependencies]
 ipe_diagnostics = { path = "../diagnostics" }
 ipe_kernels = { path = "../kernels" }
 ipe_env = { path = "../env" }
 # Held-handle, size-capped, no-follow reads of the VCS configuration a jail scans.
 ipe_fs_open = { path = "../fs_open" }
+# The path regime a configuration value is read under: separators and volume prefixes.
+ipe_path_core = { path = "../path-core" }
 serde = { version = "1", features = ["derive"] }
 # Scratch names draw 128 bits from each target's real CSPRNG (`getrandom(2)`,
 # `BCryptGenRandom`) with no weaker fallback. `std` supplies the

@@ -15,7 +15,7 @@
 //! `inject_dep_type`'s existing dep-vs-dep clash check EXACTLY, closing the
 //! asymmetry for the local-vs-dep case (both unions and aliases).
 //!
-//! This test only checks that `ipe::build` fails with IPE-N0012 (does NOT build
+//! This test only checks that the golden build fails with IPE-N0012 (does NOT build
 //! or run the emitted Rust project; does NOT require `IPE_E2E`).
 //!
 //! Run:
@@ -36,7 +36,8 @@ fn golden_dir(root: &Path, name: &str) -> PathBuf {
 
 fn try_build(name: &str) -> Result<(), String> {
     let root = repo_root();
-    let entry = golden_dir(&root, name).join("src").join("Main.ipe");
+    let dir = golden_dir(&root, name);
+    let entry = dir.join("src").join("Main.ipe");
     if !entry.exists() {
         return Err(format!("fixture not found: {}", entry.display()));
     }
@@ -44,7 +45,7 @@ fn try_build(name: &str) -> Result<(), String> {
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
-    ipe::build_loose_file(&entry, &out, &runtime).map_err(|e| e.to_string())
+    crate::support::build_golden(&dir, &out, &runtime).map_err(|e| e.to_string())
 }
 
 /// The exact two-module repro from item D — `Main` declares `type Color`

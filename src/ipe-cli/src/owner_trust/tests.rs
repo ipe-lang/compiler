@@ -2,8 +2,10 @@ use std::path::{Path, PathBuf};
 
 use super::*;
 
-/// The cache path below a project root, as the FFI loader discovers it.
-const REL: &str = ".ipe/cache/ffi/rust";
+/// The FFI cache below `root`, spelled out component by component, as the loader discovers it.
+fn cache_at(root: &Path) -> PathBuf {
+    root.join(".ipe").join("cache").join("ffi").join("rust")
+}
 
 /// A fresh, empty scratch directory unique to `name` and this process.
 fn scratch(name: &str) -> PathBuf {
@@ -90,7 +92,7 @@ fn container_breach_refuses_shared_write_without_the_sticky_bit() {
 
 #[cfg(unix)]
 mod unix {
-    use std::os::unix::fs::{PermissionsExt as _, symlink};
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _, symlink};
 
     use ipe_ffi::driver::CacheSource as _;
 
@@ -100,10 +102,10 @@ mod unix {
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).expect("chmod");
     }
 
-    /// Create every component of `root/REL` as a private directory; return the cache path.
+    /// Create every component of the cache below `root` as a private directory; return the cache path.
     fn private_chain(root: &Path) -> PathBuf {
         let mut dir = root.to_path_buf();
-        for segment in REL.split('/') {
+        for segment in ipe_ffi::driver::FFI_CACHE_COMPONENTS {
             dir.push(segment);
             std::fs::create_dir_all(&dir).expect("create cache component");
             chmod(&dir, 0o700);
@@ -129,7 +131,7 @@ mod unix {
     fn a_private_owned_cache_is_held() {
         let root = scratch("control");
         let cache = private_chain(&root);
-        let held = open_cache(&root, REL).expect("owned cache is trusted");
+        let held = open_cache(&root).expect("owned cache is trusted");
         assert_eq!(held.as_ref().map(TrustedCache::path), Some(cache.as_path()));
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -138,7 +140,7 @@ mod unix {
     fn an_absent_component_finds_no_cache() {
         let root = scratch("absent");
         std::fs::create_dir_all(root.join(".ipe/cache")).expect("create partial chain");
-        let held = open_cache(&root, REL).expect("absent cache is not an error");
+        let held = open_cache(&root).expect("absent cache is not an error");
         assert!(held.is_none());
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -152,10 +154,10 @@ mod unix {
         chmod(&elsewhere, 0o700);
         std::fs::remove_dir(&cache).expect("remove real cache dir");
         symlink(&elsewhere, &cache).expect("plant symlink");
-        let refused = usage(open_cache(&root, REL));
+        let refused = usage(open_cache(&root));
         assert_eq!(
             refused,
-            Some(text::msg::ffi_cache_symlink(&cache.display()))
+            Some(text::msg::ffi_cache_escapes(&cache.display()))
         );
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -167,10 +169,148 @@ mod unix {
         private_chain(&real);
         let link = root.join(".ipe");
         symlink(real.join(".ipe"), &link).expect("plant symlink");
-        let refused = usage(open_cache(&root, REL));
-        assert_eq!(refused, Some(text::msg::ffi_cache_symlink(&link.display())));
+        let refused = usage(open_cache(&root));
+        assert_eq!(refused, Some(text::msg::ffi_cache_escapes(&link.display())));
         let _ = std::fs::remove_dir_all(&root);
         let _ = std::fs::remove_dir_all(&real);
+    }
+
+    #[test]
+    fn a_component_that_is_not_a_directory_is_refused() {
+        for (index, segment) in ipe_ffi::driver::FFI_CACHE_COMPONENTS.iter().enumerate() {
+            let root = scratch(&format!("file-component-{index}"));
+            let mut component = root.clone();
+            for parent in ipe_ffi::driver::FFI_CACHE_COMPONENTS.iter().take(index) {
+                component.push(parent);
+                std::fs::create_dir_all(&component).expect("create cache component");
+                chmod(&component, 0o700);
+            }
+            component.push(segment);
+            std::fs::write(&component, "").expect("plant a file where a directory belongs");
+            let refused = usage(open_cache(&root));
+            assert_eq!(
+                refused,
+                Some(text::msg::ffi_cache_escapes(&component.display())),
+                "{}",
+                component.display()
+            );
+            let _ = std::fs::remove_dir_all(&root);
+        }
+    }
+
+    #[test]
+    fn the_cache_is_opened_beneath_the_held_anchor_not_its_path() {
+        let root = scratch("held-anchor");
+        let moved = scratch("held-anchor-moved");
+        std::fs::remove_dir(&moved).expect("free the moved name");
+        let cache = private_chain(&root);
+        let anchor = std::fs::File::open(&root).expect("hold the anchor");
+        std::fs::rename(&root, &moved).expect("move the anchor away");
+        std::fs::create_dir_all(&root).expect("recreate the anchor path");
+        symlink(moved.join(".ipe"), root.join(".ipe")).expect("plant a link at the old path");
+        assert_eq!(
+            usage(open_cache(&root)),
+            Some(text::msg::ffi_cache_escapes(&root.join(".ipe").display())),
+            "control: the path now leads through a link"
+        );
+        let held = open_cache_beneath(&anchor, &root).expect("the held anchor is unchanged");
+        assert_eq!(held.as_ref().map(TrustedCache::path), Some(cache.as_path()));
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&moved);
+    }
+
+    /// The invoker running the test, judged as a member of `gid` only.
+    fn in_group(gid: u32) -> Invoker {
+        Invoker {
+            uid: Invoker::current().uid,
+            gid,
+        }
+    }
+
+    /// Another user than the one running the test.
+    fn another_user() -> Invoker {
+        let me = Invoker::current();
+        Invoker {
+            uid: me.uid.wrapping_add(1),
+            gid: me.gid,
+        }
+    }
+
+    #[test]
+    fn a_component_a_foreign_group_can_write_is_refused() {
+        let root = scratch("foreign-group");
+        let cache = private_chain(&root);
+        let anchor = std::fs::File::open(&root).expect("hold the anchor");
+        let shared = root.join(".ipe/cache/ffi");
+        let group = std::fs::metadata(&shared).expect("stat").gid();
+        let foreign = in_group(group.wrapping_add(1));
+        chmod(&shared, 0o750);
+        let read_only = crate::owner_trust::held::open_cache_beneath_as(&anchor, &root, foreign)
+            .expect("a foreign group that can only read is admitted");
+        assert_eq!(
+            read_only.as_ref().map(TrustedCache::path),
+            Some(cache.as_path())
+        );
+        chmod(&shared, 0o770);
+        let refused = usage(crate::owner_trust::held::open_cache_beneath_as(
+            &anchor, &root, foreign,
+        ));
+        assert_eq!(
+            refused,
+            Some(text::msg::ffi_cache_untrusted(&shared.display()))
+        );
+        let own_group =
+            crate::owner_trust::held::open_cache_beneath_as(&anchor, &root, in_group(group))
+                .expect("the invoker's own group may write");
+        assert!(own_group.is_some());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_component_another_user_owns_is_refused() {
+        let root = scratch("foreign-owner");
+        let cache = private_chain(&root);
+        let anchor = std::fs::File::open(&root).expect("hold the anchor");
+        let owned =
+            open_cache_beneath(&anchor, &root).expect("a 0700 invoker-owned cache is admitted");
+        assert_eq!(
+            owned.as_ref().map(TrustedCache::path),
+            Some(cache.as_path())
+        );
+        let refused = usage(crate::owner_trust::held::open_cache_beneath_as(
+            &anchor,
+            &root,
+            another_user(),
+        ));
+        assert_eq!(
+            refused,
+            Some(text::msg::ffi_cache_untrusted(&root.join(".ipe").display()))
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn an_artifact_another_user_owns_is_refused() {
+        let root = scratch("artifact-foreign-owner");
+        let cache = private_chain(&root);
+        let artifact = cache.join("demo.pkg.json");
+        std::fs::write(&artifact, "{}").expect("write artifact");
+        chmod(&artifact, 0o600);
+        let held = open_cache(&root)
+            .expect("owned cache is trusted")
+            .expect("cache exists");
+        let body = held
+            .read_artifact("demo.pkg.json")
+            .map_err(CliError::from)
+            .expect("the invoker's own artifact reads");
+        assert_eq!(body.as_deref(), Some("{}"));
+        let foreign = held.judged_as(another_user());
+        let refused = artifact_usage(foreign.read_artifact("demo.pkg.json"));
+        assert_eq!(
+            refused,
+            Some(text::msg::ffi_cache_untrusted(&artifact.display()))
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -179,7 +319,7 @@ mod unix {
         let cache = private_chain(&root);
         let shared = root.join(".ipe/cache");
         chmod(&shared, 0o777);
-        let refused = usage(open_cache(&root, REL));
+        let refused = usage(open_cache(&root));
         assert_eq!(
             refused,
             Some(text::msg::ffi_cache_untrusted(&shared.display()))
@@ -195,7 +335,7 @@ mod unix {
         let shared = root.join(".ipe");
         std::fs::create_dir_all(&shared).expect("create .ipe");
         chmod(&shared, 0o777);
-        let held = open_cache(&root, REL).expect("no cache below, nothing to refuse");
+        let held = open_cache(&root).expect("no cache below, nothing to refuse");
         assert!(held.is_none());
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -206,7 +346,7 @@ mod unix {
         let cache = private_chain(&root);
         std::fs::write(cache.join("demo.pkg.json"), "{}").expect("write artifact");
         chmod(&cache.join("demo.pkg.json"), 0o600);
-        let held = open_cache(&root, REL)
+        let held = open_cache(&root)
             .expect("owned cache is trusted")
             .expect("cache exists");
         let names = held.entry_names().map_err(CliError::from).expect("list");
@@ -232,7 +372,7 @@ mod unix {
         std::fs::write(&target, "{}").expect("write link target");
         let link = cache.join("demo.pkg.json");
         symlink(&target, &link).expect("plant symlink");
-        let held = open_cache(&root, REL)
+        let held = open_cache(&root)
             .expect("owned cache is trusted")
             .expect("cache exists");
         let refused = artifact_usage(held.read_artifact("demo.pkg.json"));
@@ -247,7 +387,7 @@ mod unix {
         let odd = cache.join("demo.pkg.json");
         std::fs::create_dir_all(&odd).expect("create directory artifact");
         chmod(&odd, 0o700);
-        let held = open_cache(&root, REL)
+        let held = open_cache(&root)
             .expect("owned cache is trusted")
             .expect("cache exists");
         let refused = artifact_usage(held.read_artifact("demo.pkg.json"));
@@ -265,7 +405,7 @@ mod unix {
         let artifact = cache.join("demo.pkg.json");
         std::fs::write(&artifact, "{}").expect("write artifact");
         chmod(&artifact, 0o666);
-        let held = open_cache(&root, REL)
+        let held = open_cache(&root)
             .expect("owned cache is trusted")
             .expect("cache exists");
         let refused = artifact_usage(held.read_artifact("demo.pkg.json"));
@@ -280,7 +420,7 @@ mod unix {
     fn an_artifact_name_escaping_the_cache_is_refused() {
         let root = scratch("artifact-escape");
         private_chain(&root);
-        let held = open_cache(&root, REL)
+        let held = open_cache(&root)
             .expect("owned cache is trusted")
             .expect("cache exists");
         for name in ["", ".", "..", "../x", "a/b"] {
@@ -438,9 +578,9 @@ mod unverifiable_policy {
     #[test]
     fn an_existing_cache_directory_is_refused() {
         let root = scratch("unverifiable-policy-dir");
-        let cache = root.join(REL);
+        let cache = cache_at(&root);
         std::fs::create_dir_all(&cache).expect("create cache");
-        let refused = refuse_unverifiable_cache(&root, REL);
+        let refused = refuse_unverifiable_cache(&root);
         assert!(
             matches!(&refused, Err(CliError::TrustRefused(t)) if t.message() == text::msg::ffi_cache_unverifiable(&cache.display())),
             "{refused:?}"
@@ -451,11 +591,11 @@ mod unverifiable_policy {
     #[test]
     fn an_existing_cache_file_is_refused() {
         let root = scratch("unverifiable-policy-file");
-        let cache = root.join(REL);
+        let cache = cache_at(&root);
         let parent = cache.parent().expect("cache has a parent");
         std::fs::create_dir_all(parent).expect("create cache parent");
         std::fs::write(&cache, "").expect("plant a file at the cache path");
-        let refused = refuse_unverifiable_cache(&root, REL);
+        let refused = refuse_unverifiable_cache(&root);
         assert!(
             matches!(&refused, Err(CliError::TrustRefused(t)) if t.message() == text::msg::ffi_cache_unverifiable(&cache.display())),
             "{refused:?}"
@@ -466,7 +606,7 @@ mod unverifiable_policy {
     #[test]
     fn an_absent_cache_is_no_cache() {
         let root = scratch("unverifiable-policy-absent");
-        assert!(refuse_unverifiable_cache(&root, REL).is_ok());
+        assert!(refuse_unverifiable_cache(&root).is_ok());
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -474,7 +614,7 @@ mod unverifiable_policy {
     fn a_path_through_a_file_is_no_cache() {
         let root = scratch("unverifiable-policy-through-file");
         std::fs::write(root.join(".ipe"), "").expect("plant a file where a directory belongs");
-        let admitted = refuse_unverifiable_cache(&root, REL);
+        let admitted = refuse_unverifiable_cache(&root);
         assert!(admitted.is_ok(), "{admitted:?}");
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -498,9 +638,9 @@ mod unverifiable_host {
     #[test]
     fn every_existing_cache_is_refused_as_unverifiable() {
         let root = scratch("unverifiable-cache");
-        let cache = root.join(REL);
+        let cache = cache_at(&root);
         std::fs::create_dir_all(&cache).expect("create cache");
-        let refused = open_cache(&root, REL);
+        let refused = open_cache(&root);
         assert!(
             matches!(&refused, Err(CliError::TrustRefused(t)) if t.message() == text::msg::ffi_cache_unverifiable(&cache.display())),
             "{refused:?}"

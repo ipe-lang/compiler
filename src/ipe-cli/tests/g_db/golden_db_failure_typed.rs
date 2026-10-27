@@ -28,12 +28,11 @@ fn db_failure_matches_oracle() {
     }
     let root = repo_root();
     let dir = root.join("tests").join("golden").join(GOLDEN);
-    let entry = dir.join("Main.ipe");
     let out = crate::support::scratch_root().join(format!("ipec_{GOLDEN}_e2e"));
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
-    let built = ipe::build(&entry, &out, &runtime);
+    let built = crate::support::build_golden(&dir, &out, &runtime);
     assert!(
         built.is_ok(),
         "build failed for {GOLDEN}: {:?}",

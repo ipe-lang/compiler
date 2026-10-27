@@ -83,8 +83,9 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y musl-tools bubblewrap util-linux
 
-      - name: Cache cargo target
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+      - name: Restore cargo target
+        id: cargo-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
         with:
           path: |
             ~/.cargo/registry
@@ -109,7 +110,7 @@ jobs:
           ALLOCATOR: ${{ matrix.allocator }}
         run: |
           cd examples/shapes/non-tea/hello-world
-          "$CARGO_TARGET_DIR/release/ipe" dev build package.ipe --out out \
+          "$CARGO_TARGET_DIR/release/ipe" dev build --out out \
             --static --allocator "$ALLOCATOR"
           cd out/rust
           cargo build --release --target "$STATIC_TRIPLE"
@@ -153,11 +154,22 @@ jobs:
 
       - name: Upload frozen-deps manifest
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: static-frozen-deps-${{ matrix.allocator }}
           path: examples/shapes/non-tea/hello-world/out/rust/Cargo.lock
           if-no-files-found: warn
+
+      # Only `main` saves: a cache saved under any other ref is one no later run
+      # reads, and it evicts the ones `main` wrote (verify-manifest check 6).
+      - name: Save cargo target
+        if: github.ref == 'refs/heads/main' && steps.cargo-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ${{ github.workspace }}/.cache/ipe-lang-target
+          key: ${{ steps.cargo-cache.outputs.cache-primary-key }}
 
   # ─── aarch64 static gate ───────────────────────────────────────────────────
   # Cross-compiles the emitted example crate for aarch64-unknown-linux-musl from
@@ -195,8 +207,9 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y gcc-aarch64-linux-gnu musl-tools qemu-user-static
 
-      - name: Cache cargo target
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+      - name: Restore cargo target
+        id: cargo-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
         with:
           path: |
             ~/.cargo/registry
@@ -211,7 +224,7 @@ jobs:
       - name: ipe dev build --static --target aarch64-unknown-linux-musl
         run: |
           cd examples/shapes/non-tea/hello-world
-          "$CARGO_TARGET_DIR/release/ipe" dev build package.ipe --out out \
+          "$CARGO_TARGET_DIR/release/ipe" dev build --out out \
             --static --target aarch64-unknown-linux-musl --allocator dlmalloc
           cd out/rust
           cargo build --release --target "$STATIC_TRIPLE"
@@ -240,11 +253,22 @@ jobs:
 
       - name: Upload frozen-deps manifest (arm64)
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: static-frozen-deps-arm64-dlmalloc
           path: examples/shapes/non-tea/hello-world/out/rust/Cargo.lock
           if-no-files-found: warn
+
+      # Only `main` saves: a cache saved under any other ref is one no later run
+      # reads, and it evicts the ones `main` wrote (verify-manifest check 6).
+      - name: Save cargo target
+        if: github.ref == 'refs/heads/main' && steps.cargo-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ${{ github.workspace }}/.cache/ipe-lang-target
+          key: ${{ steps.cargo-cache.outputs.cache-primary-key }}
 
   # ─── C-free build axis gate ────────────────────────────────────────────────
   # The `--cfree` axis models "link no C". Its ADT (`CProfile`) makes the
@@ -270,8 +294,9 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: ./.github/actions/rust-toolchain-pinned
 
-      - name: Cache cargo target
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+      - name: Restore cargo target
+        id: cargo-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
         with:
           path: |
             ~/.cargo/registry
@@ -289,17 +314,59 @@ jobs:
       - name: C-free refusal gates
         run: cargo test -p ipe --test static_emit -- cfree
 
-      # And the CLI itself refuses --cfree end to end, artifact-free.
+      # And the CLI itself refuses --cfree end to end, artifact-free, with the
+      # exact typed refusal: its machine kind and its message, rendered from
+      # the `cli-static-refusal` and `cfree-not-yet-wired` entries of the
+      # message catalog, so any other failure (a typo, a crash) is red.
       - name: ipe dev build --static --cfree is refused
         run: |
           cd examples/shapes/non-tea/hello-world
-          if "$CARGO_TARGET_DIR/release/ipe" dev build package.ipe --out out/cfree \
-               --static --cfree; then
+          if "$CARGO_TARGET_DIR/release/ipe" dev build --out out/cfree \
+               --static --cfree --json 2> "$RUNNER_TEMP/cfree.json"; then
             echo "::error::--cfree must be refused until the pure-Rust dep swaps land"
             exit 1
           fi
           test ! -e out/cfree || {
             echo "::error::--cfree refusal must be artifact-free (no emitted crate)"; exit 1; }
+          python3 - "$GITHUB_WORKSPACE/src/ipe-cli/text/messages.md" "$RUNNER_TEMP/cfree.json" <<'PY'
+          import json, sys
+
+          def entry(lines, key):
+              start = lines.index(f"## {key}") + 1
+              body = []
+              for line in lines[start:]:
+                  if line.startswith("#"):
+                      break
+                  if line.strip():
+                      body.append(line)
+              if len(body) != 1:
+                  sys.exit(f"::error::message entry {key} is not one line: {body}")
+              return body[0]
+
+          catalog = open(sys.argv[1], encoding="utf-8").read().splitlines()
+          expected = entry(catalog, "cli-static-refusal").replace(
+              "{refusal}", entry(catalog, "cfree-not-yet-wired")
+          )
+          envelope = json.loads(open(sys.argv[2], encoding="utf-8").read())
+          payload = envelope.get("payload", {})
+          if envelope.get("status") != "error" or payload.get("kind") != "static-refusal":
+              sys.exit(f"::error::--cfree must refuse as static-refusal, got: {envelope}")
+          if payload.get("message") != expected:
+              sys.exit(
+                  f"::error::--cfree refusal text drifted: {payload.get('message')!r} != {expected!r}"
+              )
+          PY
+
+      # Only `main` saves: a cache saved under any other ref is one no later run
+      # reads, and it evicts the ones `main` wrote (verify-manifest check 6).
+      - name: Save cargo target
+        if: github.ref == 'refs/heads/main' && steps.cargo-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ${{ github.workspace }}/.cache/ipe-lang-target
+          key: ${{ steps.cargo-cache.outputs.cache-primary-key }}
 
   # ─── Windows static gate ───────────────────────────────────────────────────
   # `ipe dev build` on Windows emits a standard Cargo project; then `cargo build
@@ -341,8 +408,9 @@ jobs:
         with:
           targets: x86_64-pc-windows-msvc
 
-      - name: Cache cargo target
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+      - name: Restore cargo target
+        id: cargo-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
         with:
           path: |
             ~/.cargo/registry
@@ -357,7 +425,7 @@ jobs:
       - name: ipe dev build (emit Rust for 01-hello-world)
         run: |
           cd "$REPO/examples/shapes/non-tea/hello-world"
-          "$CARGO_TARGET_DIR/release/ipe.exe" dev build package.ipe --out out
+          "$CARGO_TARGET_DIR/release/ipe.exe" dev build --out out
 
       - name: cargo build --release (MSVC +crt-static, dlmalloc)
         run: |
@@ -382,11 +450,22 @@ jobs:
 
       - name: Upload frozen-deps manifest (windows)
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: static-frozen-deps-windows-dlmalloc
           path: examples/shapes/non-tea/hello-world/out/rust/Cargo.lock
           if-no-files-found: warn
+
+      # Only `main` saves: a cache saved under any other ref is one no later run
+      # reads, and it evicts the ones `main` wrote (verify-manifest check 6).
+      - name: Save cargo target
+        if: github.ref == 'refs/heads/main' && steps.cargo-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ${{ github.workspace }}/.cache/ipe-lang-target
+          key: ${{ steps.cargo-cache.outputs.cache-primary-key }}
 
   # ─── FreeBSD cross-compile gate ────────────────────────────────────────────
   # Cross-compiles the emitted example crate for `x86_64-unknown-freebsd` from
@@ -423,8 +502,9 @@ jobs:
         with:
           targets: x86_64-unknown-freebsd
 
-      - name: Cache cargo target
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+      - name: Restore cargo target
+        id: cargo-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
         with:
           path: |
             ~/.cargo/registry
@@ -444,7 +524,7 @@ jobs:
       - name: ipe dev build (emit Rust for 01-hello-world)
         run: |
           cd examples/shapes/non-tea/hello-world
-          "$CARGO_TARGET_DIR/release/ipe" dev build package.ipe --out out
+          "$CARGO_TARGET_DIR/release/ipe" dev build --out out
 
       # Build-only: cross compiles the emitted crate for FreeBSD. Running
       # the resulting ELF on an ubuntu host is not possible (wrong ABI).
@@ -455,8 +535,19 @@ jobs:
 
       - name: Upload frozen-deps manifest (freebsd-cross)
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: static-frozen-deps-freebsd-cross
           path: examples/shapes/non-tea/hello-world/out/rust/Cargo.lock
           if-no-files-found: warn
+
+      # Only `main` saves: a cache saved under any other ref is one no later run
+      # reads, and it evicts the ones `main` wrote (verify-manifest check 6).
+      - name: Save cargo target
+        if: github.ref == 'refs/heads/main' && steps.cargo-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ${{ github.workspace }}/.cache/ipe-lang-target
+          key: ${{ steps.cargo-cache.outputs.cache-primary-key }}

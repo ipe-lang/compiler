@@ -44,15 +44,15 @@ const ARC_INTO_DIRECT_SLOT: [&str; 5] = [
     "count(maybe_with_default(",
 ];
 
-fn fixture_entry() -> PathBuf {
-    golden_entry(FIXTURE)
+fn fixture_dir() -> PathBuf {
+    golden_dir(FIXTURE)
 }
 
 /// Lower the fixture into `out`, asserting `ipe` accepts it.
 fn build_fixture(out: &Path) {
     let _ = std::fs::remove_dir_all(out);
     let runtime = e2e_support::require_runtime().into_path_buf();
-    let built = ipe::build(&fixture_entry(), out, &runtime);
+    let built = crate::support::build_golden(&fixture_dir(), out, &runtime);
     assert!(
         built.is_ok(),
         "{FIXTURE}: ipe must accept the fixture; got {built:?}"
@@ -111,19 +111,19 @@ const ARC_INTO_TASK_RESULT: [&str; 2] = [
     "task_succeed(c.keep.clone())",
 ];
 
+fn golden_dir(dir: &str) -> PathBuf {
+    repo_root().join("tests").join("golden").join(dir)
+}
+
 fn golden_entry(dir: &str) -> PathBuf {
-    repo_root()
-        .join("tests")
-        .join("golden")
-        .join(dir)
-        .join("Main.ipe")
+    golden_dir(dir).join("src").join("Main.ipe")
 }
 
 /// Lower the frontier fixture into `out`, asserting `ipe` accepts it.
 fn build_frontier(out: &Path) {
     let _ = std::fs::remove_dir_all(out);
     let runtime = e2e_support::require_runtime().into_path_buf();
-    let built = ipe::build(&golden_entry(FRONTIER), out, &runtime);
+    let built = crate::support::build_golden(&golden_dir(FRONTIER), out, &runtime);
     assert!(
         built.is_ok(),
         "{FRONTIER}: ipe must accept the fixture; got {built:?}"
@@ -179,7 +179,7 @@ fn payload_carrier_conflict_is_refused() {
     let out = crate::support::scratch_root().join("ipec_i3344_conflict");
     let _ = std::fs::remove_dir_all(&out);
     let runtime = e2e_support::require_runtime().into_path_buf();
-    let built = ipe::build(&golden_entry(dir), &out, &runtime);
+    let built = crate::support::build_golden(&golden_dir(dir), &out, &runtime);
     let got = match &built {
         Err(CliError::Pipeline { diag, .. }) => Some(diag.code()),
         _ => None,
@@ -211,11 +211,11 @@ fn payload_carrier_conflict_is_refused() {
 #[test]
 fn stored_read_through_a_user_generic_def_is_refused() {
     let dir = "fn_carrier_unification_generic";
-    let entry = golden_entry(dir);
+    let golden = golden_dir(dir);
     let out = crate::support::scratch_root().join("ipec_i3344_generic");
     let _ = std::fs::remove_dir_all(&out);
     let runtime = e2e_support::require_runtime().into_path_buf();
-    let built = ipe::build(&entry, &out, &runtime);
+    let built = crate::support::build_golden(&golden, &out, &runtime);
     let got = match &built {
         Err(CliError::Pipeline { diag, .. }) => Some(diag.code()),
         _ => None,
@@ -236,7 +236,7 @@ const PARTIAL_FN_RESULT_STDOUT: &str = "3 3 3 2";
 fn build_partial_fn_result(out: &Path) {
     let _ = std::fs::remove_dir_all(out);
     let runtime = e2e_support::require_runtime().into_path_buf();
-    let built = ipe::build(&golden_entry(PARTIAL_FN_RESULT), out, &runtime);
+    let built = crate::support::build_golden(&golden_dir(PARTIAL_FN_RESULT), out, &runtime);
     assert!(
         built.is_ok(),
         "{PARTIAL_FN_RESULT}: ipe must accept the fixture; got {built:?}"
@@ -322,7 +322,7 @@ fn partial_over_a_non_clone_payload_is_refused() {
     let out = crate::support::scratch_root().join("ipec_i3344_partial_moves_payload");
     let _ = std::fs::remove_dir_all(&out);
     let runtime = e2e_support::require_runtime().into_path_buf();
-    let built = ipe::build(&golden_entry(PARTIAL_MOVES_PAYLOAD), &out, &runtime);
+    let built = crate::support::build_golden(&golden_dir(PARTIAL_MOVES_PAYLOAD), &out, &runtime);
     let got = match &built {
         Err(CliError::Pipeline { diag, .. }) => Some(diag.code()),
         _ => None,

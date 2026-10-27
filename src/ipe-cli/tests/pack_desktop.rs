@@ -182,13 +182,11 @@ fn linux_bundle_is_materialised_end_to_end() {
     let dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("pack_desktop_linux_e2e");
     let _ = std::fs::remove_dir_all(&dir);
     let src = dir.join("src");
-    std::fs::create_dir_all(&src).expect("create project src dir");
-    let entry = src.join("Main.ipe");
-    std::fs::write(&entry, TRIVIAL_MAIN).expect("write Main.ipe");
+    let fixture = ipe::RootFixture::main(TRIVIAL_MAIN).expect("write the project fixture");
 
     let out_dir = dir.join("out").join("rust");
     let runtime = e2e_support::require_runtime().into_path_buf();
-    ipe::build(&entry, &out_dir, &runtime).expect("ipe dev build of the program");
+    ipe::build_fixture(&fixture, &out_dir, &runtime).expect("ipe dev build of the program");
 
     let exe = PathBuf::from(
         e2e_support::build_rust_binary("pack_desktop_linux", &out_dir)

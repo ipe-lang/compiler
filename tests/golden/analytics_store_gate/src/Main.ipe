@@ -1,0 +1,162 @@
+module Main exposing (main)
+
+-- Store-backed persistence proof for `Ipe.Analytics`:
+--
+--   1. `eventsStore` builds (all identifiers are valid SQL identifiers).
+--   2. `persist` with consent `Granted` inserts a row.
+--   3. `persist` with consent `Pending` inserts ZERO rows (fail-closed).
+--   4. A `PPii` prop is stored as `"[redacted]"` — plaintext never reaches the DB.
+--   5. `totals` counts correctly.
+--   6. `uniqueUsers` counts distinct identified users.
+--   7. `erase` removes all rows for a user; other users' rows remain.
+--   8. `eventCounts` maps each event name to its frequency.
+--
+-- Expected stdout:
+--   store:ok
+--   totals-after-granted:1
+--   totals-after-pending:1
+--   pii-in-db:[redacted]
+--   unique-users:1
+--   erase-count:2
+--   totals-after-erase:1
+--   event-count-purchase:1
+--   event-count-login:0
+
+import Ipe.Analytics as Analytics exposing (ConsentState(..), PropValue(..))
+import Ipe.Db as Db
+import Ipe.Db.Location as Location
+import Ipe.Db.Store as Store
+import Ipe.Dict as Dict
+import Ipe.Error as Error exposing (Error)
+import Ipe.Io as Io
+import Ipe.List as List
+import Ipe.Maybe as Maybe exposing (Maybe(..))
+import Ipe.Result as Result exposing (Result(..))
+import Ipe.String as String
+import Ipe.Task as Task
+
+
+pendingCfg : Analytics.Config
+pendingCfg =
+    Analytics.defaultConfig Analytics.Stderr
+
+
+grantedCfg : Analytics.Config
+grantedCfg =
+    Analytics.defaultConfig Analytics.Stderr
+        |> Analytics.setConsent Granted
+        |> Analytics.identify "user-42" Analytics.noTraits
+
+
+anotherCfg : Analytics.Config
+anotherCfg =
+    Analytics.defaultConfig Analytics.Stderr
+        |> Analytics.setConsent Granted
+        |> Analytics.identify "user-99" Analytics.noTraits
+
+
+main : Task Error ()
+main =
+    case Analytics.eventsStore of
+        Err e ->
+            Io.println (String.concat [ "store:FAIL:", Error.toString e ])
+
+        Ok store ->
+            Task.andThen
+                (\conn -> run conn store)
+                (Db.open Location.memory)
+
+
+run : Db -> Store.Store Analytics.AnalyticsEvent -> Task Error ()
+run conn store =
+    Store.create conn store
+        |> Task.andThen (\_ -> Io.println "store:ok")
+        -- (2) Granted persist
+        |> Task.andThen
+            (\_ ->
+                Analytics.persist conn store grantedCfg "signed_up"
+                    (Analytics.props
+                        [ ( "plan", PText "pro" )
+                        , ( "email", PPii (Analytics.pii "alice@example.com") )
+                        ]
+                    )
+            )
+        |> Task.andThen (\_ -> Analytics.totals conn store)
+        |> Task.andThen
+            (\n -> Io.println (String.concat [ "totals-after-granted:", String.fromInt n ]))
+        -- (3) Pending persist — row must NOT be inserted (fail-closed)
+        |> Task.andThen
+            (\_ ->
+                Analytics.persist conn store pendingCfg "dropped" Analytics.noProps
+            )
+        |> Task.andThen (\_ -> Analytics.totals conn store)
+        |> Task.andThen
+            (\n -> Io.println (String.concat [ "totals-after-pending:", String.fromInt n ]))
+        -- (4) PII check: the most-recent row has "[redacted]" in propsJson, not plaintext
+        |> Task.andThen
+            (\_ ->
+                Analytics.recent conn store 1
+                    |> Task.andThen
+                        (\events ->
+                            let
+                                piiLine =
+                                    case events of
+                                        [] ->
+                                            "pii-in-db:FAIL-missing"
+
+                                        ev :: _ ->
+                                            if String.contains "alice@example.com" ev.propsJson then
+                                                "pii-in-db:FAIL-plaintext-leaked"
+
+                                            else if String.contains "[redacted]" ev.propsJson then
+                                                "pii-in-db:[redacted]"
+
+                                            else
+                                                "pii-in-db:FAIL-unexpected"
+                            in
+                            Io.println piiLine
+                        )
+            )
+        -- (6) uniqueUsers: one identified user (user-42)
+        |> Task.andThen (\_ -> Analytics.uniqueUsers conn store)
+        |> Task.andThen
+            (\n -> Io.println (String.concat [ "unique-users:", String.fromInt n ]))
+        -- insert a second user so erase only removes one user's rows
+        |> Task.andThen
+            (\_ ->
+                Analytics.persist conn store anotherCfg "purchase" Analytics.noProps
+            )
+        -- add a second event for user-42 (total: signed_up + login = 2 rows for user-42)
+        |> Task.andThen
+            (\_ ->
+                Analytics.persist conn store grantedCfg "login" Analytics.noProps
+            )
+        |> Task.andThen
+            (\_ -> Analytics.erase conn store grantedCfg)
+        |> Task.andThen
+            (\n -> Io.println (String.concat [ "erase-count:", String.fromInt n ]))
+        -- one row remains (user-99's "purchase")
+        |> Task.andThen (\_ -> Analytics.totals conn store)
+        |> Task.andThen
+            (\n -> Io.println (String.concat [ "totals-after-erase:", String.fromInt n ]))
+        -- (8) eventCounts: "purchase" = 1, "login" = 0 (erased)
+        |> Task.andThen (\_ -> Analytics.eventCounts conn store)
+        |> Task.andThen
+            (\counts ->
+                let
+                    lookupCount name =
+                        case Dict.get name counts of
+                            Just c ->
+                                c
+
+                            Nothing ->
+                                0
+                in
+                Io.println
+                    (String.join "\n"
+                        [ String.concat [ "event-count-purchase:", String.fromInt (lookupCount "purchase") ]
+                        , String.concat [ "event-count-login:", String.fromInt (lookupCount "login") ]
+                        ]
+                    )
+            )
+        |> Task.onError (\e -> Io.println (String.concat [ "FAIL:", Error.toString e ]))

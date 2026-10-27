@@ -12,23 +12,20 @@ fn repo_root() -> PathBuf {
     std::fs::canonicalize(&joined).unwrap_or(joined)
 }
 
-fn fixture_entry(root: &Path) -> PathBuf {
-    root.join("tests")
-        .join("golden")
-        .join("timestamp_seal")
-        .join("Main.ipe")
+fn fixture_project(root: &Path) -> PathBuf {
+    root.join("tests").join("golden").join("timestamp_seal")
 }
 
 /// Emit-only gate: the seal program must be accepted by the compiler.
 #[test]
 fn timestamp_seal_emits() {
     let root = repo_root();
-    let entry = fixture_entry(&root);
+    let entry = fixture_project(&root);
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("timestamp_seal_emit");
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
-    let built = ipe::build(&entry, &out, &runtime);
+    let built = crate::support::build_golden(&entry, &out, &runtime);
     assert!(
         built.is_ok(),
         "timestamp_seal: must compile cleanly; got: {built:?}"
@@ -44,12 +41,12 @@ fn timestamp_seal_builds_and_runs() {
     }
 
     let root = repo_root();
-    let entry = fixture_entry(&root);
+    let entry = fixture_project(&root);
     let out = crate::support::scratch_root().join("ipec_timestamp_seal_e2e");
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
-    let built = ipe::build(&entry, &out, &runtime);
+    let built = crate::support::build_golden(&entry, &out, &runtime);
     assert!(
         built.is_ok(),
         "timestamp_seal: build must succeed: {:?}",

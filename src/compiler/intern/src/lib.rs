@@ -35,6 +35,117 @@ impl Symbol {
     }
 }
 
+/// Declares [`SynthStem`], its `ALL` table and its `text` from one list.
+///
+/// One list feeds the enum, `ALL` and the `text` match, so no variant can be
+/// missing from `ALL`.
+macro_rules! synth_stems {
+    ($($(#[$meta:meta])* $variant:ident => $text:literal,)+) => {
+        /// The closed set of stems every compiler-synthesized binder is spelled from.
+        #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+        pub enum SynthStem {
+            $($(#[$meta])* $variant,)+
+        }
+
+        impl SynthStem {
+            /// Every variant, once, in declaration order.
+            pub const ALL: [Self; [$(Self::$variant),+].len()] = [$(Self::$variant),+];
+
+            /// The stem's spelling, a prefix of every name minted from it.
+            #[must_use]
+            pub const fn text(self) -> &'static str {
+                match self {
+                    $(Self::$variant => $text,)+
+                }
+            }
+        }
+    };
+}
+
+synth_stems! {
+    /// The parameter of a `>>` or `<<` desugaring.
+    Compose => "compose_",
+    /// The record parameter of a derived record codec.
+    CodecRecord => "codec_rec_",
+    /// The binder of a codec encoder or decoder projection.
+    CodecProjection => "codec_r_",
+    /// An eta-expansion parameter.
+    Eta => "eta_",
+    /// A closure capture.
+    Cap => "cap_",
+    /// A lowered call argument.
+    Arg => "arg_",
+    /// A wildcard-typed parameter.
+    AnyParam => "anyp_",
+    /// A wildcard-typed pattern binder.
+    AnyWild => "anyw_",
+    /// A projection decoder binder.
+    ProjDecode => "projdec_",
+    /// A destructuring thunk.
+    DestrThunk => "destr_thunk_",
+    /// A nested constructor pattern binder.
+    NestedCons => "ncons_",
+    /// A nested string-literal pattern binder.
+    NestedStrLit => "nstrlit_",
+    /// A tuple element binder.
+    TupleElem => "telem_",
+}
+
+/// Every [`SynthStem`] spelling, in `SynthStem::ALL` order.
+const SYNTH_STEM_TEXTS: [&str; SynthStem::ALL.len()] = {
+    let mut out = [""; SynthStem::ALL.len()];
+    let mut slots: &mut [&str] = &mut out;
+    let mut stems: &[SynthStem] = &SynthStem::ALL;
+    while let ([slot, rest_slots @ ..], [stem, rest_stems @ ..]) = (slots, stems) {
+        *slot = stem.text();
+        slots = rest_slots;
+        stems = rest_stems;
+    }
+    out
+};
+
+// IPE-RUST-AUDIT:ACCEPTED (Arthur Maciel) — compile-time `const` assertion (not a runtime panic); fails the BUILD if one synthesized-binder stem is a prefix of another [ledger #boundary]
+const _: () = assert!(stems_prefix_free(&SYNTH_STEM_TEXTS));
+
+/// Whether `prefix` is a byte prefix of `of`.
+const fn is_byte_prefix(prefix: &[u8], of: &[u8]) -> bool {
+    let (mut p, mut o) = (prefix, of);
+    loop {
+        match (p, o) {
+            ([], _) => return true,
+            ([_, ..], []) => return false,
+            ([a, p_rest @ ..], [b, o_rest @ ..]) => {
+                if *a != *b {
+                    return false;
+                }
+                p = p_rest;
+                o = o_rest;
+            }
+        }
+    }
+}
+
+/// Whether no stem in `stems` is a byte prefix of another.
+///
+/// A stem listed twice is a prefix of its copy, so a duplicate is refused.
+#[must_use]
+pub const fn stems_prefix_free(stems: &[&str]) -> bool {
+    let mut rest = stems;
+    while let [head, tail @ ..] = rest {
+        let mut others = tail;
+        while let [other, more @ ..] = others {
+            if is_byte_prefix(head.as_bytes(), other.as_bytes())
+                || is_byte_prefix(other.as_bytes(), head.as_bytes())
+            {
+                return false;
+            }
+            others = more;
+        }
+        rest = tail;
+    }
+    true
+}
+
 #[derive(Default)]
 pub struct Interner {
     /// One shared `Arc<str>` per unique string, stored in BOTH `map` (as the
@@ -113,7 +224,8 @@ impl Interner {
     /// Mint `count` fresh symbols whose resolved strings are guaranteed to be
     /// distinct from one another *and* from every user identifier.
     ///
-    /// Each name is `<prefix><n>` for the smallest run of `n` (from `0`) whose
+    /// Each name is `<stem><n>`, with `<stem>` the [`SynthStem::text`] of
+    /// `stem`, for the smallest run of `n` (from `0`) whose
     /// candidate does not collide, so the result can never alias a user
     /// identifier nor a previously minted fresh symbol of the same pool. The
     /// lowerer uses this for eta-expansion parameter names, which must not
@@ -139,7 +251,8 @@ impl Interner {
     /// exhausted before `count` fresh names are found, or when [`Self::intern`]
     /// itself reports the symbol table full — both unreachable for any real
     /// program.
-    pub fn fresh_symbols(&mut self, prefix: &str, count: usize) -> DResult<Vec<Symbol>> {
+    pub fn fresh_symbols(&mut self, stem: SynthStem, count: usize) -> DResult<Vec<Symbol>> {
+        let prefix = stem.text();
         let mut out = Vec::with_capacity(count);
         let mut n: u32 = 0;
         while out.len() < count {
@@ -256,9 +369,10 @@ impl Interner {
 // `Interner::intern` accepts ANY string by design (it is a pure append-only
 // table with no opinion about identifier shapes — see its own doc). The
 // backend, however, trusts an interned string VERBATIM when emitting Rust
-// identifiers (`ipe_backend_rust`'s `resolve_ident`/`emit_ident` do not
-// sanitise; `naming::mangle_reserved` only appends `_` on an EXACT keyword
-// match). A cache file is written by a previous, possibly-compromised or
+// identifiers (`ipe_backend_rust`'s `resolve_ident`, `emit_local_ident` and
+// `emit_member_ident` do not sanitise; `naming::local_ident` only prefixes a
+// `__`-leading local and `naming::mangle_reserved` only appends `_` on an
+// EXACT keyword match). A cache file is written by a previous, possibly-compromised or
 // tampered, process — so a poisoned entry containing e.g. `"x; std::process
 // ::exit(1); //"` as a `Symbol`'s text could splice arbitrary Rust source
 // into the next build's emitted `main.rs`, reached the moment `cargo build`
@@ -286,7 +400,7 @@ thread_local! {
 /// — never leading, trailing, or doubled.
 ///
 /// This single grammar also covers every non-lexer-scanned shape a
-/// `Symbol` is ever built from: [`Interner::fresh_symbols`]' `<prefix><n>`
+/// `Symbol` is ever built from: [`Interner::fresh_symbols`]' `<stem><n>`
 /// pools (`eta_0`, `cap_3`, …), `ipe_types`' single-letter-plus-digit
 /// type-variable mint (`a`, `a1`, `z12`, …), and the handful of hardcoded
 /// compiler-internal qualifier aliases that embed a literal dot (`"Db.
@@ -467,6 +581,22 @@ mod tests {
     use std::collections::BTreeSet;
 
     use super::*;
+
+    #[test]
+    fn stems_prefix_free_refuses_an_overlap() {
+        assert!(!stems_prefix_free(&["eta_", "eta_x"]));
+        assert!(!stems_prefix_free(&["eta_x", "eta_"]));
+        assert!(!stems_prefix_free(&["a_", "a_"]));
+        assert!(stems_prefix_free(&["codec_r_", "codec_rec_"]));
+        assert!(stems_prefix_free(&SYNTH_STEM_TEXTS));
+        let listed: BTreeSet<&str> = SynthStem::ALL.iter().map(|s| s.text()).collect();
+        assert_eq!(listed.len(), SynthStem::ALL.len());
+        assert_eq!(SYNTH_STEM_TEXTS.len(), SynthStem::ALL.len());
+        for (stem, text) in SynthStem::ALL.iter().zip(SYNTH_STEM_TEXTS) {
+            assert_eq!(stem.text(), text);
+        }
+    }
+
     #[test]
     fn intern_dedups_and_resolves() -> ipe_diagnostics::DResult<()> {
         let mut i = Interner::new();
@@ -502,7 +632,7 @@ mod tests {
     #[test]
     fn fresh_symbols_are_distinct_and_named_in_order() -> ipe_diagnostics::DResult<()> {
         let mut i = Interner::new();
-        let pool = i.fresh_symbols("eta_", 3)?;
+        let pool = i.fresh_symbols(SynthStem::Eta, 3)?;
         let names: Vec<Option<&str>> = pool.iter().map(|&s| i.resolve(s)).collect();
         assert_eq!(
             names,
@@ -516,11 +646,47 @@ mod tests {
     }
 
     #[test]
+    fn every_stem_mints_its_pinned_spelling() -> ipe_diagnostics::DResult<()> {
+        let pinned = [
+            (SynthStem::Compose, "compose_0"),
+            (SynthStem::CodecRecord, "codec_rec_0"),
+            (SynthStem::CodecProjection, "codec_r_0"),
+            (SynthStem::Eta, "eta_0"),
+            (SynthStem::Cap, "cap_0"),
+            (SynthStem::Arg, "arg_0"),
+            (SynthStem::AnyParam, "anyp_0"),
+            (SynthStem::AnyWild, "anyw_0"),
+            (SynthStem::ProjDecode, "projdec_0"),
+            (SynthStem::DestrThunk, "destr_thunk_0"),
+            (SynthStem::NestedCons, "ncons_0"),
+            (SynthStem::NestedStrLit, "nstrlit_0"),
+            (SynthStem::TupleElem, "telem_0"),
+        ];
+        let covered: Vec<SynthStem> = pinned.iter().map(|&(stem, _)| stem).collect();
+        assert_eq!(
+            covered,
+            SynthStem::ALL,
+            "every stem has one pinned spelling"
+        );
+        for (stem, spelling) in pinned {
+            let mut i = Interner::new();
+            let pool = i.fresh_symbols(stem, 1)?;
+            let names: Vec<Option<&str>> = pool.iter().map(|&s| i.resolve(s)).collect();
+            assert_eq!(
+                names,
+                vec![Some(spelling)],
+                "{stem:?} mints from its own text"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
     fn fresh_symbols_skip_already_interned_collisions() -> ipe_diagnostics::DResult<()> {
         let mut i = Interner::new();
         // A user identifier that would collide with the first candidate.
         let user = i.intern("eta_0")?;
-        let pool = i.fresh_symbols("eta_", 2)?;
+        let pool = i.fresh_symbols(SynthStem::Eta, 2)?;
         // The minted names step over the pre-existing `eta_0`.
         let names: Vec<Option<&str>> = pool.iter().map(|&s| i.resolve(s)).collect();
         assert_eq!(names, vec![Some("eta_1"), Some("eta_2")]);
@@ -534,7 +700,7 @@ mod tests {
     #[test]
     fn fresh_symbols_zero_count_is_empty() -> ipe_diagnostics::DResult<()> {
         let mut i = Interner::new();
-        assert!(i.fresh_symbols("eta_", 0)?.is_empty());
+        assert!(i.fresh_symbols(SynthStem::Eta, 0)?.is_empty());
         Ok(())
     }
 
@@ -547,8 +713,8 @@ mod tests {
     fn fresh_symbols_avoid_set_is_stable_across_rebuilds() -> ipe_diagnostics::DResult<()> {
         let mut i = Interner::new();
         i.set_fresh_avoid(BTreeSet::new());
-        let run1 = i.fresh_symbols("eta_", 2)?;
-        let run2 = i.fresh_symbols("eta_", 2)?;
+        let run1 = i.fresh_symbols(SynthStem::Eta, 2)?;
+        let run2 = i.fresh_symbols(SynthStem::Eta, 2)?;
         assert_eq!(run1, run2, "warm re-mint returns the same symbols");
         let names: Vec<Option<&str>> = run2.iter().map(|&s| i.resolve(s)).collect();
         assert_eq!(names, vec![Some("eta_0"), Some("eta_1")]);
@@ -561,7 +727,7 @@ mod tests {
         let mut i = Interner::new();
         let user = i.intern("eta_0")?;
         i.set_fresh_avoid(BTreeSet::from(["eta_0".to_owned()]));
-        let pool = i.fresh_symbols("eta_", 2)?;
+        let pool = i.fresh_symbols(SynthStem::Eta, 2)?;
         let names: Vec<Option<&str>> = pool.iter().map(|&s| i.resolve(s)).collect();
         assert_eq!(names, vec![Some("eta_1"), Some("eta_2")]);
         assert!(
@@ -578,7 +744,7 @@ mod tests {
     fn fresh_symbols_avoid_set_is_per_build_not_sticky() -> ipe_diagnostics::DResult<()> {
         let mut i = Interner::new();
         i.set_fresh_avoid(BTreeSet::from(["eta_0".to_owned()]));
-        let run1 = i.fresh_symbols("eta_", 1)?;
+        let run1 = i.fresh_symbols(SynthStem::Eta, 1)?;
         assert_eq!(
             run1.first().and_then(|&s| i.resolve(s)),
             Some("eta_1"),
@@ -586,7 +752,7 @@ mod tests {
         );
         // Next build: the program no longer names `eta_0`.
         i.set_fresh_avoid(BTreeSet::new());
-        let run2 = i.fresh_symbols("eta_", 1)?;
+        let run2 = i.fresh_symbols(SynthStem::Eta, 1)?;
         assert_eq!(
             run2.first().and_then(|&s| i.resolve(s)),
             Some("eta_0"),

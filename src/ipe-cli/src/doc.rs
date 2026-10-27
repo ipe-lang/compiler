@@ -108,6 +108,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 use ipe_diagnostics::{TyDoc, render_ty};
 use ipe_docs::{CommandInfo, Index, html};
@@ -118,7 +119,9 @@ use ipe_types::{VarNamer, kernel_type_table, ty_to_doc};
 use crate::CliError;
 use crate::api_surface::{ModuleApi, ModulePath, PublicApi, UnionApi, extract_walked, read_tree};
 use crate::cli_args::OutputFormat;
-use crate::doc_bundle::{BundleSource, DocBundle, DocEntry, DocKind, is_qualified};
+use crate::doc_bundle::{
+    BundleError, BundleSource, DocBundle, DocEntry, DocKind, DocsOverlay, is_qualified,
+};
 use crate::doc_pick::Pick;
 use crate::doc_search::{DocMiss, DocQuery, MAX_QUERY_CHARS, QueryRefusal, Ranked};
 use crate::text;
@@ -709,37 +712,16 @@ fn build_index() -> Result<Index, CliError> {
     }
 
     // Constructs: sourced from the same embedded corpus as DocBundle::build so
-    // `ipe doc <key>` and the HTML site never drift.  Front-matter is stripped
-    // for terminal display; the slug/key extraction reuses the bundle's own
-    // parsing helpers so there is one code path for both surfaces.
-    {
-        use crate::doc_bundle::DocKind;
-        // Ingest into a temporary map, then harvest parsed entries into the
-        // ipe_docs index.  Errors are silently ignored here — the same policy as
-        // the previous hand-maintained table: a malformed file is skipped rather
-        // than making `ipe doc <key>` fail entirely.
-        let mut maps: BTreeMap<DocKind, BTreeMap<String, crate::doc_bundle::DocEntry>> =
-            BTreeMap::new();
-        let _ = crate::doc_bundle::ingest_embedded_dir(
-            &crate::doc_bundle::EMBEDDED_CONSTRUCTS,
-            DocKind::Construct,
-            &mut maps,
+    // `ipe doc <key>` and the HTML site never drift.
+    for entry in construct_index_entries(&crate::doc_bundle::EMBEDDED_CONSTRUCTS)? {
+        builder.insert(
+            entry.key.clone(),
+            ipe_docs::Entry {
+                kind: ipe_docs::EntryKind::Construct,
+                source_key: entry.key,
+                text: entry.body.as_str().to_owned(),
+            },
         );
-        for entry in maps
-            .get(&DocKind::Construct)
-            .into_iter()
-            .flat_map(|m| m.values())
-        {
-            builder.insert(
-                entry.key.clone(),
-                ipe_docs::Entry {
-                    kind: ipe_docs::EntryKind::Construct,
-                    source_key: entry.key.clone(),
-                    // `body` already has front-matter stripped by `parse_markdown_file`.
-                    text: entry.body.clone(),
-                },
-            );
-        }
     }
 
     // Commands: sourced from the COMMANDS registry so the index never drifts.
@@ -757,6 +739,22 @@ fn build_index() -> Result<Index, CliError> {
     Ok(builder.finish())
 }
 
+/// The construct pages of the embedded corpus `dir`, front-matter stripped, in key order.
+///
+/// # Errors
+///
+/// The bundle error of a page `dir` cannot hold: a page is refused, never skipped.
+fn construct_index_entries(dir: &include_dir::Dir<'_>) -> Result<Vec<DocEntry>, CliError> {
+    let mut maps = BTreeMap::new();
+    crate::doc_bundle::ingest_embedded_dir(dir, DocKind::Construct, &mut maps)
+        .map_err(bundle_build_error)?;
+    Ok(maps
+        .remove(&DocKind::Construct)
+        .into_iter()
+        .flat_map(BTreeMap::into_values)
+        .collect())
+}
+
 /// Build the unified [`DocBundle`] from all documentation sources.
 ///
 /// Modules and symbols from the stdlib, diagnostic codes from the embedded
@@ -766,11 +764,11 @@ fn build_index() -> Result<Index, CliError> {
 /// The four directory-convention kinds are always populated from the compile-time
 /// embedded corpus (`docs/{constructs,idioms,topics,guide}/` baked into the
 /// binary), so `ipe doc serve` and `ipe doc --write-format html` render those
-/// sections correctly regardless of the working directory. When `docs_root` also
-/// exists on disk, any page whose key is not already in the embedded corpus is
-/// merged in as an additive overlay (useful for previewing a new page before it
-/// is committed).
-fn build_doc_bundle(docs_root: &std::path::Path) -> Result<DocBundle, CliError> {
+/// sections correctly regardless of the working directory. A
+/// [`DocsOverlay::Project`] adds each page of the project's own `docs/` whose
+/// key the embedded corpus does not hold (a new page previewed before it is
+/// committed); [`DocsOverlay::Embedded`] adds nothing.
+fn build_doc_bundle(overlay: &DocsOverlay) -> Result<DocBundle, CliError> {
     // Modules: one entry per stdlib module name.
     let module_sources: Vec<BundleSource> = stdlib_module_names()
         .into_iter()
@@ -841,13 +839,30 @@ fn build_doc_bundle(docs_root: &std::path::Path) -> Result<DocBundle, CliError> 
         .collect();
 
     DocBundle::build(
-        docs_root,
+        overlay,
         &module_sources,
         &symbol_sources,
         &diagnostic_sources,
         &cli_sources,
     )
-    .map_err(|e| CliError::Usage(text::msg::doc_bundle_build_error(&e)))
+    .map_err(bundle_build_error)
+}
+
+/// The CLI error for a bundle that did not build.
+///
+/// A refused overlay read keeps its own typed error; an overlay refusal is its
+/// catalog message, never wrapped a second time.
+fn bundle_build_error(error: BundleError) -> CliError {
+    match error {
+        BundleError::OverlayRead(source) => *source,
+        BundleError::OverlayName { path } => CliError::Usage(text::msg::doc_overlay_name(
+            &crate::style::TerminalSafe::sanitize(&path.display().to_string()),
+        )),
+        BundleError::OverlayTooLarge { limit } => {
+            CliError::Usage(text::msg::doc_overlay_too_large(&limit))
+        }
+        other => CliError::Usage(text::msg::doc_bundle_build_error(&other)),
+    }
 }
 
 /// `ipe doc kind:key` -- exact scoped bundle lookup.
@@ -860,10 +875,7 @@ fn run_bundle_lookup(
     key: &DocQuery,
     format: OutputFormat,
 ) -> Result<(), CliError> {
-    // Locate the docs root relative to the repo, falling back gracefully when
-    // running outside the repo tree (e.g. a user's home directory).
-    let docs_root = locate_docs_root();
-    let bundle = build_doc_bundle(&docs_root)?;
+    let bundle = build_doc_bundle(&DocsOverlay::Embedded)?;
 
     match bundle.resolve_qualified(term.text()) {
         Ok(entry) => {
@@ -924,8 +936,7 @@ fn run_doc_lookup_with_fuzzy(query: &DocQuery, format: OutputFormat) -> Result<(
     // No exact match: a unique exact key of a kind the index does not carry (a
     // topic, guide, or idiom) opens directly; anything else is a miss that
     // lists the closest entries of every kind.
-    let docs_root = locate_docs_root();
-    let bundle = build_doc_bundle(&docs_root)?;
+    let bundle = build_doc_bundle(&DocsOverlay::Embedded)?;
     if let Some(only) = crate::doc_search::unique_exact(bundle.all_entries(), query) {
         render_bundle_entry(only, format);
         return Ok(());
@@ -1181,7 +1192,7 @@ fn render_bundle_entry(entry: &crate::doc_bundle::DocEntry, format: OutputFormat
     use crate::screen::{Screen, Stream, emit_machine};
     match format {
         OutputFormat::Plain => {
-            let mut out = entry.body.clone();
+            let mut out = entry.body.as_str().to_owned();
             if !out.ends_with('\n') {
                 out.push('\n');
             }
@@ -1193,7 +1204,7 @@ fn render_bundle_entry(entry: &crate::doc_bundle::DocEntry, format: OutputFormat
                 json_string(entry.kind.prefix()),
                 json_string(&entry.key),
                 json_string(&entry.title),
-                json_string(&entry.body),
+                json_string(entry.body.as_str()),
             );
             emit_machine(Stream::Stdout, &out);
         }
@@ -1204,37 +1215,24 @@ fn render_bundle_entry(entry: &crate::doc_bundle::DocEntry, format: OutputFormat
             let _ = writeln!(
                 out,
                 "{}{}{}  {}[{}]{}",
-                p.bold, entry.key, p.reset, p.dim, entry.kind, p.reset
+                p.bold,
+                crate::style::TerminalSafe::sanitize(&entry.key),
+                p.reset,
+                p.dim,
+                entry.kind,
+                p.reset
             );
-            if !entry.body.is_empty() {
+            let body = entry.body.as_str();
+            if !body.is_empty() {
                 out.push('\n');
-                out.push_str(&entry.body);
-                if !entry.body.ends_with('\n') {
+                out.push_str(body);
+                if !body.ends_with('\n') {
                     out.push('\n');
                 }
             }
             screen.styled(&out).emit();
         }
     }
-}
-
-/// Locate the `docs/` directory relative to the binary's own location, falling
-/// back to the current directory's `docs/` when a repo layout is not found.
-/// Returns a path that may not exist; callers must tolerate an absent root.
-fn locate_docs_root() -> std::path::PathBuf {
-    // Walk up from cwd looking for a `docs/` that exists.
-    let mut dir = std::env::current_dir().unwrap_or_default();
-    loop {
-        let candidate = dir.join("docs");
-        if candidate.is_dir() {
-            return candidate;
-        }
-        match dir.parent() {
-            Some(parent) => dir = parent.to_owned(),
-            None => break,
-        }
-    }
-    std::path::PathBuf::from("docs")
 }
 
 /// Plain (terse) rendering of a documentation entry: signature + example.
@@ -2123,7 +2121,7 @@ fn query_module(term: &DocQuery, format: OutputFormat) -> Result<(), CliError> {
                 Err(ambiguous_module_error(module_name, &candidates, format))
             }
             MemberResolution::Miss => {
-                let bundle = build_doc_bundle(&locate_docs_root())?;
+                let bundle = build_doc_bundle(&DocsOverlay::Embedded)?;
                 Err(doc_miss(term, &bundle, format))
             }
         },
@@ -2767,8 +2765,7 @@ struct SearchEntry {
 fn generate(path: &Path, out: &Path, write_format: WriteFormat) -> Result<(), CliError> {
     crate::style::print_command_header();
     let (docs, inputs) = build_docs_or_stdlib(path)?;
-    let docs_root = locate_docs_root();
-    let bundle = build_doc_bundle(&docs_root)?;
+    let bundle = build_doc_bundle(&DocsOverlay::for_project(path)?)?;
 
     let (json_files, markdown_files, html_files) = render_site_split(&docs, &bundle, write_format);
 
@@ -3093,7 +3090,8 @@ fn extract_module_imports(src: &str) -> Vec<String> {
 
 /// Synthesize a minimal compilable module wrapping `body`.
 ///
-/// If `body` already starts with `module ` it is returned as-is. Otherwise a
+/// If `body` already starts with `module ` it is returned as-is; it is checked
+/// as its project's `Main` module, so its header must name `Main`. Otherwise a
 /// `module Main exposing (..)` header is prepended. The module that the
 /// doc-string belongs to (`source_module`, e.g. `Ipe.Maybe`) is imported with
 /// `exposing (..)` so unqualified names from it resolve, and that module's own
@@ -3279,42 +3277,35 @@ fn child_shared_target_dir() -> Option<std::ffi::OsString> {
     })
 }
 
-/// Run the compiled example at `snippet_path` and assert its output matches the
-/// `-->` annotated results (one per line, in order).
+/// Run the example project `root` and assert its output matches the `-->`
+/// annotated results (one per line, in order).
 ///
-/// Runs the current binary as `ipe dev run <snippet_path>`, held to
+/// Runs the current binary as `ipe dev run <root>` from the project's own
+/// directory, held to
 /// [`crate::remote_ingest::SELF_RUN_LIMITS`], and compares stdout against the
 /// expected output. Returns `Err(description)` on a mismatch or
 /// subprocess failure; `Ok(())` when the output matches.
 fn run_example_and_check(
-    snippet_path: &Path,
+    root: &crate::project_root::ProjectRoot,
     label: &str,
     expected: &[String],
 ) -> Result<(), String> {
-    use std::process::Command;
-
     // Locate this binary (we re-invoke ourselves as `ipe dev run`).
     let ipe_bin = std::env::current_exe()
         .map_err(|e| format!("{label}: could not locate ipe binary: {e}"))?;
 
-    let mut cmd = Command::new(&ipe_bin);
-    cmd.args(crate::verb::Verb::DEV_RUN.argv())
-        .arg(snippet_path);
+    let mut cmd = crate::coverage::probe::dev_run_project(&ipe_bin, root);
     // Forward the warm shared target into the `ipe dev run` child's CARGO_TARGET_DIR.
     // CI's e2e/seal jobs export ONLY IPE_ORACLE_SHARED_TARGET, which production
     // `ipe dev run` never reads; without this translation the child cold-builds the
     // whole runtime tree per example. Absent it (a bare local run) the child
     // inherits the ambient env unchanged.
+    //
+    // THE SEAL: sharing ONE warm target is sound because each example is its own
+    // project, whose emitted crate is named by its manifest and its own private
+    // directory, so no example's app crate is ever reused for another's.
     if let Some(target) = child_shared_target_dir() {
         cmd.env("CARGO_TARGET_DIR", target);
-        // THE SEAL: every example emits under the default `ipe-app` name, so
-        // sharing ONE warm target risks cargo reusing a prior example's compiled
-        // `ipe-app` crate and greening a broken emit. Give each example a UNIQUE
-        // package name (honoured by the single-file emit) so its app crate owns
-        // its own fingerprint — a genuinely broken emit still fails to build even
-        // against the warm target. Only set alongside the shared target, so an
-        // ordinary local run keeps the plain `ipe-app` default.
-        cmd.env("IPE_EMIT_PACKAGE_NAME", format!("ipe-doc-example-{label}"));
     }
     let out = crate::remote_ingest::run_local(
         cmd,
@@ -3379,17 +3370,6 @@ fn check_examples() -> Result<(), CliError> {
     let mut passed = 0usize;
     let mut failed: Vec<String> = Vec::new();
 
-    // Write examples to a temp dir; RAII cleanup on exit.
-    let tmp_dir =
-        crate::scratch::ScratchDir::new("ipe-doc-examples").map_err(|e| CliError::Io {
-            path: std::path::PathBuf::from("ipe-doc-examples"),
-            source: e,
-        })?;
-    let snippet_leaf = crate::scratch::LeafName::new("Main.ipe").map_err(|e| CliError::Io {
-        path: std::path::PathBuf::from("Main.ipe"),
-        source: e.into(),
-    })?;
-
     for (module_name, src) in &all_sources {
         let examples = extract_doc_examples(module_name, src);
         let module_imports = extract_module_imports(src);
@@ -3397,13 +3377,14 @@ fn check_examples() -> Result<(), CliError> {
             total += 1;
             let module_src = synthesize_module(&ex.body, module_name, &module_imports);
 
-            // Write to a temp file.
-            let snippet_path = tmp_dir.child(&snippet_leaf);
-            std::fs::write(&snippet_path, &module_src)
-                .map_err(|e| crate::io_err(&snippet_path, e))?;
+            // The example is the `Main` module of its own scratch project, so
+            // no file outside it is a module of the check; removed on drop.
+            let scratch = crate::project_root::ProjectRoot::scratch(&module_src)?;
 
             // Tier 1: type-check the example (always).
-            match crate::typecheck_entry_via_graph(&snippet_path) {
+            match crate::driver::typecheck_target(&crate::project_root::AnalysisTarget::Project(
+                scratch.root(),
+            )) {
                 Ok(()) => {
                     crate::screen::chatter(
                         crate::screen::Stream::Stderr,
@@ -3429,7 +3410,7 @@ fn check_examples() -> Result<(), CliError> {
             if !ex.expected_results.is_empty()
                 && ipe_env::var_os("IPE_E2E").is_some_and(|v| v == "1")
             {
-                match run_example_and_check(&snippet_path, &ex.label, &ex.expected_results) {
+                match run_example_and_check(scratch.root(), &ex.label, &ex.expected_results) {
                     Ok(()) => {}
                     Err(msg) => {
                         crate::screen::chatter(
@@ -4097,8 +4078,7 @@ p.entry-code { margin: 0.2rem 0 1rem; color: var(--muted); }
 /// Hides any module list item whose lowercased `data-name` does not contain
 /// the (lowercased) query, and collapses a section that ends up with no
 /// visible module. No external dependency.
-const FILTER_SCRIPT: &str = "\
-<script>
+const FILTER_SCRIPT_BODY: &str = "\n\
 (function () {
   var box = document.getElementById('filter');
   if (!box) return;
@@ -4116,19 +4096,29 @@ const FILTER_SCRIPT: &str = "\
     });
   });
 })();
-</script>
 ";
 
 /// The inline search script embedded in every HTML page.
 ///
-/// Reads the `ENTRY_INDEX` JSON variable (embedded per-page) and does
-/// client-side substring filtering against key and title. Selecting a result
-/// navigates to that entry's page. Degrades gracefully when JS is off: the
-/// header links still work, the search box is simply non-functional.
-const SEARCH_SCRIPT_TEMPLATE: &str = "\
-<script>
+/// Reads the page's index from the inert JSON block placed right before it,
+/// found through the prototype getters so no named element in the page can
+/// stand in for either node, and does client-side substring filtering against
+/// key and title. Selecting a result navigates to that entry's page. Without
+/// JS, or without a well-formed index block, the header links still work and
+/// the search box is simply non-functional.
+const SEARCH_SCRIPT_BODY: &str = "\n\
 (function () {
-  var INDEX = ENTRY_INDEX_PLACEHOLDER;
+  function getter(proto, name) {
+    var d = Object.getOwnPropertyDescriptor(proto, name);
+    return d && d.get ? d.get : function () { return null; };
+  }
+  var cur = getter(Document.prototype, 'currentScript').call(document);
+  var block = cur && getter(Element.prototype, 'previousElementSibling').call(cur);
+  if (!block || getter(Element.prototype, 'tagName').call(block) !== 'SCRIPT'
+      || block.getAttribute('type') !== 'application/json') return;
+  var INDEX;
+  try { INDEX = JSON.parse(getter(Node.prototype, 'textContent').call(block)); } catch (e) { return; }
+  if (!Array.isArray(INDEX)) return;
   var box = document.getElementById('nav-search');
   var list = document.getElementById('search-results');
   if (!box || !list) return;
@@ -4198,7 +4188,6 @@ const SEARCH_SCRIPT_TEMPLATE: &str = "\
     }
   });
 })();
-</script>
 ";
 
 /// Which section of the navigation is currently active.
@@ -4319,15 +4308,13 @@ fn render_header(active: NavSection, base: &str, search_script: &str) -> String 
     h.push_str("</div>\n");
     h.push_str("</nav>\n");
     h.push_str(search_script);
-    h.push_str(NAV_UX_SCRIPT);
+    h.push_str(&inline_script(NAV_UX_SCRIPT_BODY));
     h
 }
 
-/// The inline script powering the theme toggle (item 19), the mobile hamburger
-/// (item 20), and the floating scroll-to-top button (item 17). Static — no user
-/// content reaches it.
-const NAV_UX_SCRIPT: &str = "\
-<script>
+/// The inline script powering the theme toggle, the mobile hamburger and the
+/// floating scroll-to-top button. Static — no user content reaches it.
+const NAV_UX_SCRIPT_BODY: &str = "\n\
 (function () {
   var root = document.documentElement;
   // Theme: stored choice wins, else the system preference (the default).
@@ -4379,8 +4366,67 @@ const NAV_UX_SCRIPT: &str = "\
     });
   }
 })();
-</script>
 ";
+
+/// Every script a preview page can carry, as the exact text the policy hashes.
+const PREVIEW_SCRIPTS: [&str; 3] = [FILTER_SCRIPT_BODY, SEARCH_SCRIPT_BODY, NAV_UX_SCRIPT_BODY];
+
+/// The `id` of the inert JSON block holding a page's search index.
+const DOC_INDEX_ID: &str = "ipe-doc-index";
+
+/// The `frame-ancestors` directive: header-only, so the `<meta>` copy drops it.
+const FRAME_ANCESTORS_DIRECTIVE: &str = "; frame-ancestors 'none'";
+
+/// One script element around `body`, the text the policy hashes.
+fn inline_script(body: &str) -> String {
+    format!("<script>{body}</script>\n")
+}
+
+/// The `'sha256-…'` source admitting one inline script by its exact text.
+fn script_hash(text: &str) -> String {
+    use base64::Engine as _;
+    use sha2::{Digest, Sha256};
+    format!(
+        "'sha256-{}'",
+        base64::engine::general_purpose::STANDARD.encode(Sha256::digest(text.as_bytes()))
+    )
+}
+
+/// The hash sources of [`PREVIEW_SCRIPTS`], computed once.
+fn script_hashes() -> &'static [String; 3] {
+    static HASHES: OnceLock<[String; 3]> = OnceLock::new();
+    HASHES.get_or_init(|| PREVIEW_SCRIPTS.map(script_hash))
+}
+
+/// The security headers every preview response leaves under.
+///
+/// The one policy covers the whole site: a page's scripts are the hashed
+/// constants and its data is inert JSON, so no page needs a policy of its own.
+struct PreviewHeaders {
+    csp: String,
+}
+
+impl PreviewHeaders {
+    /// The policy as a written page's `<meta http-equiv>` carries it.
+    fn meta_csp(&self) -> String {
+        self.csp
+            .strip_suffix(FRAME_ANCESTORS_DIRECTIVE)
+            .unwrap_or(&self.csp)
+            .to_owned()
+    }
+}
+
+/// The preview's headers, built once from the script hashes.
+fn preview_headers() -> &'static PreviewHeaders {
+    static HEADERS: OnceLock<PreviewHeaders> = OnceLock::new();
+    HEADERS.get_or_init(|| PreviewHeaders {
+        csp: format!(
+            "default-src 'none'; script-src {}; style-src 'self'; img-src 'self' data:; \
+             font-src 'self'; base-uri 'none'; form-action 'none'{FRAME_ANCESTORS_DIRECTIVE}",
+            script_hashes().join(" ")
+        ),
+    })
+}
 
 /// Parse a leading `[label](url)` link. Returns the label text, the URL, and
 /// the byte length consumed, or `None` when the slice does not open a
@@ -4563,20 +4609,24 @@ fn html_page(title: &str, css_href: &str, header: &str, body: &str) -> String {
     format!(
         "<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n\
          <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n\
+         <meta http-equiv=\"Content-Security-Policy\" content=\"{}\">\n\
          <title>{}</title>\n<link rel=\"stylesheet\" href=\"{css_href}\">\n</head>\n\
          <body>\n{header}<main id=\"content\" class=\"page-body\">\n{body}</main>\n\
          <button id=\"scroll-top\" class=\"scroll-top\" type=\"button\" \
          aria-label=\"{}\">\u{2191}</button>\n</body>\n</html>\n",
+        preview_headers().meta_csp(),
         html::escape(title),
         html::escape(crate::text::site_scroll_top_label()),
     )
 }
 
-/// Build the search script with the embedded entry index.
+/// Build the page's search index block and the constant script that reads it.
 ///
-/// Each entry carries its already-resolved `href` (relative to the page the
-/// script is embedded in), so the JS navigates straight to a generated file and
-/// never rebuilds a path from parts.
+/// The index is inert data (`type="application/json"`), never script text, so
+/// the policy's script hashes stay the same for every page. Each entry carries
+/// its already-resolved `href` (relative to the page the script is embedded
+/// in), so the JS navigates straight to a generated file and never rebuilds a
+/// path from parts.
 fn build_search_script(entries: &[SearchEntry]) -> String {
     use crate::cli_args::json;
     let mut json_buf = String::from("[");
@@ -4602,7 +4652,10 @@ fn build_search_script(entries: &[SearchEntry]) -> String {
     // titles are repo-controlled.
     let json_buf = ipe_diagnostics::json::script_embed(&json_buf);
 
-    SEARCH_SCRIPT_TEMPLATE.replace("ENTRY_INDEX_PLACEHOLDER", &json_buf)
+    format!(
+        "<script type=\"application/json\" id=\"{DOC_INDEX_ID}\">{json_buf}</script>\n{}",
+        inline_script(SEARCH_SCRIPT_BODY)
+    )
 }
 
 /// Sort curated entries: entries with an explicit `order:` first (ascending),
@@ -4736,7 +4789,7 @@ fn render_reference_index(docs: &DocsJson, search_script: &str) -> String {
         crate::text::site_standard_library(),
     );
 
-    body.push_str(FILTER_SCRIPT);
+    body.push_str(&inline_script(FILTER_SCRIPT_BODY));
     html_page(title, "../style.css", &header, &body)
 }
 
@@ -4877,7 +4930,7 @@ fn render_cli_index(bundle: &crate::doc_bundle::DocBundle, search_script: &str) 
     for entry in entries {
         let href = entry_href(entry.kind, &entry.key, "../");
         let summary = if entry.title.is_empty() {
-            first_sentence(&entry.body)
+            first_sentence(entry.body.as_str())
         } else {
             entry.title.clone()
         };
@@ -4940,7 +4993,7 @@ fn render_curated_kind_indexes(
         body.push_str("<ul class=\"curated-entries\">\n");
         for entry in entries {
             let href = entry_href(kind, &entry.key, "../");
-            let summary = first_sentence(&entry.body);
+            let summary = first_sentence(entry.body.as_str());
             let _ = write!(
                 body,
                 "<li><a href=\"{}\" class=\"entry-title\">{}</a>",
@@ -4999,7 +5052,7 @@ fn render_entry_page(
             html::escape(&entry.key)
         );
     }
-    if entry.body.is_empty() {
+    if entry.body.as_str().is_empty() {
         let _ = writeln!(
             body,
             "<p class=\"comment\">{}</p>",
@@ -5011,7 +5064,7 @@ fn render_entry_page(
         // (`ipe_docs::markdown` port + escape-by-default walker) so headings, code
         // fences, tables, and links all work consistently. Fenced code is routed
         // through the shared token-classifier highlighter (no second lexer).
-        body.push_str(&ipe_docs::render::markdown_to_html(&entry.body));
+        body.push_str(&ipe_docs::render::markdown_to_html(entry.body.as_str()));
     }
     html_page(&entry.title, "../style.css", &header, &body)
 }
@@ -5091,7 +5144,7 @@ fn render_html_index(
         body.push_str("<ul class=\"curated-entries\">\n");
         for entry in entries {
             let href = entry_href(kind, &entry.key, "");
-            let summary = first_sentence(&entry.body);
+            let summary = first_sentence(entry.body.as_str());
             let _ = write!(
                 body,
                 "<li><a href=\"{}\" class=\"entry-title\">{}</a>",
@@ -5205,8 +5258,7 @@ fn serve(path: &Path, port: Option<u16>) -> Result<(), CliError> {
 
     crate::style::print_command_header();
     let (docs, _) = build_docs_or_stdlib(path)?;
-    let docs_root = locate_docs_root();
-    let bundle = build_doc_bundle(&docs_root)?;
+    let bundle = build_doc_bundle(&DocsOverlay::for_project(path)?)?;
     let site = render_site_for_serve(&docs, &bundle);
 
     let addr = format!("127.0.0.1:{}", port.unwrap_or(0));
@@ -5516,16 +5568,19 @@ fn serve_one(
     let Some(deadline) = Instant::now().checked_add(budget) else {
         return;
     };
+    let headers = preview_headers();
     let mut reader =
         BufReader::new(DeadlineConn { conn, deadline }.take(DOC_SERVE_REQUEST_HEAD_CAP as u64));
     let response = match read_head(&mut reader) {
         Err(HeadRefusal::Abandoned) => return,
         Err(HeadRefusal::TooLarge) => http_response(
+            headers,
             "431 Request Header Fields Too Large",
             "text/plain; charset=utf-8",
             "request head too large\n",
         ),
         Err(HeadRefusal::Malformed) => http_response(
+            headers,
             "400 Bad Request",
             "text/plain; charset=utf-8",
             "malformed request head\n",
@@ -5534,11 +5589,19 @@ fn serve_one(
             Ok(Some(path)) => {
                 let name = serve_file_name(path);
                 site.get(&name).map_or_else(
-                    || http_response("404 Not Found", "text/plain; charset=utf-8", "not found\n"),
-                    |body| http_response("200 OK", content_type(&name), body),
+                    || {
+                        http_response(
+                            headers,
+                            "404 Not Found",
+                            "text/plain; charset=utf-8",
+                            "not found\n",
+                        )
+                    },
+                    |body| http_response(headers, "200 OK", content_type(&name), body),
                 )
             }
             Ok(None) | Err(_) => http_response(
+                headers,
                 "421 Misdirected Request",
                 "application/json",
                 DOC_SERVE_REFUSED_HOST_BODY,
@@ -5578,20 +5641,54 @@ fn content_type(name: &str) -> &'static str {
     }
 }
 
-/// A complete HTTP/1.1 response with an explicit `Content-Length`, a
+/// A complete HTTP/1.1 response: the one production sink every served byte
+/// leaves through.
+///
+/// Every status and content type carries the security headers (the policy,
+/// `nosniff`, no referrer, no framing), an explicit `Content-Length`, a
 /// `Connection: close` (the loop serves one request per connection), and
 /// `Cache-Control: no-store` (the site is a live preview built in memory).
-fn http_response(status: &str, content_type: &str, body: &str) -> String {
+fn http_response(headers: &PreviewHeaders, status: &str, content_type: &str, body: &str) -> String {
     format!(
         "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\n\
-         Content-Length: {}\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n{body}",
-        body.len()
+         Content-Length: {}\r\nCache-Control: no-store\r\n\
+         Content-Security-Policy: {}\r\nX-Content-Type-Options: nosniff\r\n\
+         Referrer-Policy: no-referrer\r\nX-Frame-Options: DENY\r\n\
+         Connection: close\r\n\r\n{body}",
+        body.len(),
+        headers.csp,
     )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_construct_page_the_corpus_cannot_hold_refuses_the_index() {
+        use include_dir::{Dir, DirEntry, File};
+
+        let good = [DirEntry::File(File::new(
+            "constructs/case-of.md",
+            b"# Case\n",
+        ))];
+        let entries = construct_index_entries(&Dir::new("constructs", &good)).unwrap();
+        assert_eq!(entries.len(), 1, "a valid page is indexed");
+
+        let bad = [
+            DirEntry::File(File::new("constructs/case-of.md", b"# Case\n")),
+            DirEntry::File(File::new("constructs/Bad Name.md", b"# Bad\n")),
+        ];
+        assert!(
+            construct_index_entries(&Dir::new("constructs", &bad)).is_err(),
+            "a refused page fails the index, never shrinks it"
+        );
+    }
+
+    /// The overlay a site build at the repository root reads.
+    fn repo_overlay() -> DocsOverlay {
+        DocsOverlay::for_project(Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../.."))).unwrap()
+    }
 
     fn refusal_text(rest: &[&str]) -> String {
         let parsed = parse_doc(&s(rest));
@@ -5728,7 +5825,7 @@ mod tests {
             kind,
             key: key.to_owned(),
             title: key.to_owned(),
-            body: String::new(),
+            body: crate::style::TerminalSafe::sanitize(""),
             order: None,
         };
         let modules = [
@@ -5772,7 +5869,7 @@ mod tests {
     /// to a lookup that opens that same entry — the machine re-run contract.
     #[test]
     fn every_listed_term_opens_its_entry_when_passed_back() {
-        let bundle = build_doc_bundle(&locate_docs_root()).expect("the doc bundle builds");
+        let bundle = build_doc_bundle(&repo_overlay()).expect("the doc bundle builds");
         let index = build_index().expect("the doc index builds");
         let modules = stdlib_module_names();
         let mut checked = 0_usize;
@@ -5853,7 +5950,7 @@ mod tests {
     /// `source_key`, never a second entry for the same symbol.
     #[test]
     fn every_symbol_spelling_opens_its_one_canonical_entry() {
-        let bundle = build_doc_bundle(&locate_docs_root()).expect("the doc bundle builds");
+        let bundle = build_doc_bundle(&repo_overlay()).expect("the doc bundle builds");
         let index = build_index().expect("the doc index builds");
         let mut spellings = 0_usize;
         for key in index.keys() {
@@ -5887,7 +5984,7 @@ mod tests {
 
     #[test]
     fn a_miss_lists_only_rerun_terms_under_every_format() {
-        let bundle = build_doc_bundle(&locate_docs_root()).expect("the doc bundle builds");
+        let bundle = build_doc_bundle(&repo_overlay()).expect("the doc bundle builds");
         let query = DocQuery::parse("pipelin").expect("a valid query");
         let ranked = crate::doc_search::rank(bundle.all_entries(), bundle.all_aliases(), &query);
         let err = miss_error("pipelin", &ranked, OutputFormat::Human);
@@ -5914,7 +6011,7 @@ mod tests {
     /// holds the query's characters scattered in order.
     #[test]
     fn a_member_or_qualifier_typo_ranks_the_intended_symbol() {
-        let bundle = build_doc_bundle(&locate_docs_root()).expect("the doc bundle builds");
+        let bundle = build_doc_bundle(&repo_overlay()).expect("the doc bundle builds");
         let ranked = |raw: &str| {
             let query = DocQuery::parse(raw).expect("a valid query");
             crate::doc_search::rank(bundle.all_entries(), bundle.all_aliases(), &query)
@@ -5959,11 +6056,7 @@ mod tests {
             title: title.to_owned(),
             href: "Main.html#x".to_owned(),
         }]);
-        let index = script
-            .split_once("var INDEX = ")
-            .and_then(|(_, rest)| rest.split_once(";\n"))
-            .map(|(index, _)| index)
-            .expect("the index assignment");
+        let index = doc_index_json(&script).expect("the index block");
         for raw in ['<', '>', '&', '\u{2028}', '\u{2029}'] {
             assert!(
                 !index.contains(raw),
@@ -6714,7 +6807,7 @@ mod tests {
                 crate::doc_bundle::DocKind::Guide,
                 "g\"k".to_owned(),
                 "Guide".to_owned(),
-                String::new(),
+                "",
             )
             .expect("insert");
         let search = build_site_search_script(&docs, &bundle, "../");
@@ -6975,7 +7068,7 @@ mod tests {
             kind: crate::doc_bundle::DocKind::Cli,
             key: command.to_owned(),
             title: crate::help::command_summary(command).unwrap().to_owned(),
-            body: markdown,
+            body: crate::style::TerminalSafe::sanitize(&markdown),
             order: None,
         };
         let html = render_entry_page(crate::doc_bundle::DocKind::Cli, &entry, "");
@@ -7010,7 +7103,7 @@ mod tests {
     #[test]
     fn serve_html_matches_write_format_html_byte_for_byte() {
         let docs = build_stdlib_only_docs();
-        let bundle = build_doc_bundle(&locate_docs_root()).expect("bundle builds");
+        let bundle = build_doc_bundle(&repo_overlay()).expect("bundle builds");
         let (_json, _md, split_html) = render_site_split(&docs, &bundle, WriteFormat::Html);
         let serve_html = render_site_for_serve(&docs, &bundle);
         assert_eq!(
@@ -7031,11 +7124,206 @@ mod tests {
 
     #[test]
     fn http_response_has_length_and_close() {
-        let r = http_response("200 OK", "text/html; charset=utf-8", "hi");
+        let r = http_response(
+            preview_headers(),
+            "200 OK",
+            "text/html; charset=utf-8",
+            "hi",
+        );
         assert!(r.starts_with("HTTP/1.1 200 OK\r\n"));
         assert!(r.contains("Content-Length: 2\r\n"));
         assert!(r.contains("Connection: close\r\n"));
         assert!(r.ends_with("\r\n\r\nhi"));
+    }
+
+    /// The JSON text of a page's index block, when the page carries one.
+    fn doc_index_json(page: &str) -> Option<&str> {
+        let open = format!("<script type=\"application/json\" id=\"{DOC_INDEX_ID}\">");
+        let (_, rest) = page.split_once(open.as_str())?;
+        rest.split_once("</script>").map(|(json, _)| json)
+    }
+
+    /// The text of every script element on `page` that is not inert JSON.
+    fn inline_script_texts(page: &str) -> Vec<&str> {
+        let mut out = Vec::new();
+        let mut rest = page;
+        while let Some((_, after_open)) = rest.split_once("<script") {
+            let Some((attrs, after_tag)) = after_open.split_once('>') else {
+                break;
+            };
+            let Some((text, after_close)) = after_tag.split_once("</script>") else {
+                break;
+            };
+            if !attrs.contains("type=\"application/json\"") {
+                out.push(text);
+            }
+            rest = after_close;
+        }
+        out
+    }
+
+    /// The `script-src` sources of a policy.
+    fn csp_script_sources(csp: &str) -> BTreeSet<String> {
+        csp.split("; ")
+            .find_map(|directive| directive.strip_prefix("script-src "))
+            .map(|sources| sources.split(' ').map(str::to_owned).collect())
+            .unwrap_or_default()
+    }
+
+    /// Whether every script `page` carries is one the policy names.
+    fn policy_covers(page: &str) -> bool {
+        let named = csp_script_sources(&preview_headers().csp);
+        inline_script_texts(page)
+            .iter()
+            .all(|text| named.contains(&script_hash(text)))
+    }
+
+    #[test]
+    fn every_preview_response_carries_the_security_headers() {
+        let headers = preview_headers();
+        let responses = [
+            http_response(headers, "200 OK", content_type("index.html"), "<p>hi</p>"),
+            http_response(headers, "200 OK", content_type("style.css"), "body{}"),
+            http_response(headers, "200 OK", content_type("x.js"), "1"),
+            http_response(headers, "200 OK", content_type("M.md"), "# M"),
+            http_response(headers, "200 OK", content_type("notes.txt"), "plain"),
+            http_response(
+                headers,
+                "404 Not Found",
+                "text/plain; charset=utf-8",
+                "not found\n",
+            ),
+        ];
+        let expected = [
+            format!("Content-Security-Policy: {}\r\n", headers.csp),
+            "X-Content-Type-Options: nosniff\r\n".to_owned(),
+            "Referrer-Policy: no-referrer\r\n".to_owned(),
+            "X-Frame-Options: DENY\r\n".to_owned(),
+        ];
+        for response in &responses {
+            let (head, _) = response.split_once("\r\n\r\n").expect("head and body");
+            for header in &expected {
+                assert_eq!(
+                    head.matches(header.as_str()).count(),
+                    1,
+                    "{header:?} exactly once in {head:?}"
+                );
+            }
+        }
+        assert!(
+            headers
+                .csp
+                .starts_with("default-src 'none'; script-src 'sha256-"),
+            "the policy admits scripts by hash only: {}",
+            headers.csp
+        );
+        assert!(
+            csp_script_sources(&headers.csp)
+                .iter()
+                .all(|source| source.starts_with("'sha256-")),
+            "every script source is a hash: {}",
+            headers.csp
+        );
+    }
+
+    #[test]
+    fn the_policy_names_exactly_the_scripts_a_page_carries() {
+        let docs = build_stdlib_only_docs();
+        let bundle = build_doc_bundle(&repo_overlay()).expect("bundle builds");
+        let site = render_site_for_serve(&docs, &bundle);
+        let named = csp_script_sources(&preview_headers().csp);
+        assert_eq!(named.len(), PREVIEW_SCRIPTS.len(), "one hash per script");
+
+        let mut carried = BTreeSet::new();
+        let mut pages = 0;
+        for (name, page) in &site {
+            if !Path::new(name)
+                .extension()
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("html"))
+            {
+                continue;
+            }
+            pages += 1;
+            let texts = inline_script_texts(page);
+            assert!(
+                texts.len() >= 2,
+                "{name} carries the search and nav scripts"
+            );
+            assert!(
+                policy_covers(page),
+                "{name} carries only policy-named scripts"
+            );
+            carried.extend(texts.iter().map(|text| script_hash(text)));
+        }
+        assert!(pages > 1, "the site has pages");
+        assert_eq!(
+            carried, named,
+            "the policy names exactly the carried scripts"
+        );
+
+        let index = site.get("index.html").expect("the index page");
+        assert!(policy_covers(index), "the index page passes the check");
+        let tampered = format!("{index}<script>1</script>");
+        assert!(
+            !policy_covers(&tampered),
+            "a script the policy does not name fails the check"
+        );
+    }
+
+    #[test]
+    fn the_page_index_is_inert_json() {
+        let entries = [
+            SearchEntry {
+                kind: "symbol",
+                key: "Main.x".to_owned(),
+                title: "a</script><!--&\u{2028}b".to_owned(),
+                href: "Main.html#x".to_owned(),
+            },
+            SearchEntry {
+                kind: "module",
+                key: "Ipe.List".to_owned(),
+                title: "<List> & friends".to_owned(),
+                href: "Ipe.List.html".to_owned(),
+            },
+        ];
+        let script = build_search_script(&entries);
+        assert!(
+            script.starts_with("<script type=\"application/json\" id=\"ipe-doc-index\">"),
+            "the index is an inert block: {script}"
+        );
+        let json = doc_index_json(&script).expect("the index block");
+        for raw in ['<', '>', '&'] {
+            assert!(!json.contains(raw), "{raw:?} reached the block raw: {json}");
+        }
+        let parsed: serde_json::Value = serde_json::from_str(json).expect("valid JSON");
+        let titles: Vec<&str> = parsed
+            .as_array()
+            .expect("an array")
+            .iter()
+            .filter_map(|entry| entry.get("title").and_then(serde_json::Value::as_str))
+            .collect();
+        assert_eq!(titles, ["a</script><!--&\u{2028}b", "<List> & friends"]);
+        assert_eq!(
+            inline_script_texts(&script),
+            [SEARCH_SCRIPT_BODY],
+            "the one executable script is the constant"
+        );
+        assert!(policy_covers(&script), "the policy names the search script");
+    }
+
+    #[test]
+    fn meta_csp_equals_the_header_csp_without_frame_ancestors() {
+        let headers = preview_headers();
+        let meta = headers.meta_csp();
+        assert!(!meta.contains("frame-ancestors"), "header-only: {meta}");
+        assert_eq!(format!("{meta}{FRAME_ANCESTORS_DIRECTIVE}"), headers.csp);
+        let page = html_page("t", "style.css", "", "<p>b</p>");
+        assert!(
+            page.contains(&format!(
+                "<meta http-equiv=\"Content-Security-Policy\" content=\"{meta}\">\n"
+            )),
+            "the written page carries the policy: {page}"
+        );
     }
 
     // ── Per-format subfolder layout ────────────────────────────────────────
@@ -7544,11 +7832,16 @@ mod tests {
             "build",
             "Compile the project.",
         )];
-        // docs_root does not exist on disk; the embedded corpus still populates
-        // the four curated kinds (construct, idiom, topic, guide).
-        let docs_root = std::path::Path::new("/nonexistent");
-        DocBundle::build(docs_root, &modules, &symbols, &diagnostics, &cli)
-            .expect("nav_test_bundle")
+        // No overlay; the embedded corpus still populates the four curated
+        // kinds (construct, idiom, topic, guide).
+        DocBundle::build(
+            &DocsOverlay::Embedded,
+            &modules,
+            &symbols,
+            &diagnostics,
+            &cli,
+        )
+        .expect("nav_test_bundle")
     }
 
     #[test]
@@ -7608,14 +7901,14 @@ mod tests {
                 crate::doc_bundle::DocKind::Guide,
                 "getting-started".to_owned(),
                 "Getting Started".to_owned(),
-                "Begin here.".to_owned(),
+                "Begin here.",
             )
             .unwrap();
             b.insert(
                 crate::doc_bundle::DocKind::Topic,
                 "types".to_owned(),
                 "Types".to_owned(),
-                "Type system overview.".to_owned(),
+                "Type system overview.",
             )
             .unwrap();
             b
@@ -7639,21 +7932,21 @@ mod tests {
             kind: crate::doc_bundle::DocKind::Guide,
             key: "first".to_owned(),
             title: "First Guide".to_owned(),
-            body: String::new(),
+            body: crate::style::TerminalSafe::sanitize(""),
             order: Some(0),
         };
         let second = crate::doc_bundle::DocEntry {
             kind: crate::doc_bundle::DocKind::Guide,
             key: "second".to_owned(),
             title: "Second Guide".to_owned(),
-            body: String::new(),
+            body: crate::style::TerminalSafe::sanitize(""),
             order: Some(1),
         };
         let unordered = crate::doc_bundle::DocEntry {
             kind: crate::doc_bundle::DocKind::Guide,
             key: "zz-alpha".to_owned(),
             title: "Alpha".to_owned(),
-            body: String::new(),
+            body: crate::style::TerminalSafe::sanitize(""),
             order: None,
         };
         let mut to_sort = vec![&second, &unordered, &first];
@@ -7766,7 +8059,11 @@ mod tests {
             "search index contains multiple kinds: {json_str}"
         );
 
-        // The inline script element is present.
+        // The inert index block and the constant script element are present.
+        assert!(
+            script.contains("<script type=\"application/json\""),
+            "search index is an inert block"
+        );
         assert!(
             script.contains("<script>"),
             "search script contains <script> tag"
@@ -7840,8 +8137,7 @@ mod tests {
     #[test]
     fn every_generated_href_resolves_to_a_generated_file() {
         let docs = build_stdlib_only_docs();
-        let docs_root = locate_docs_root();
-        let bundle = build_doc_bundle(&docs_root).expect("bundle");
+        let bundle = build_doc_bundle(&repo_overlay()).expect("bundle");
         let site = render_site_for_serve(&docs, &bundle);
 
         let mut missing: Vec<String> = Vec::new();
@@ -7875,8 +8171,7 @@ mod tests {
     fn per_entry_pages_exist_for_every_linked_kind() {
         use crate::doc_bundle::DocKind;
         let docs = build_stdlib_only_docs();
-        let docs_root = locate_docs_root();
-        let bundle = build_doc_bundle(&docs_root).expect("bundle");
+        let bundle = build_doc_bundle(&repo_overlay()).expect("bundle");
         let site = render_site_for_serve(&docs, &bundle);
 
         for kind in [DocKind::Diagnostic, DocKind::Cli] {
@@ -8382,8 +8677,7 @@ withBaseMs = something
     #[test]
     fn command_page_html_mirrors_help_ssot() {
         let docs = build_stdlib_only_docs();
-        let docs_root = locate_docs_root();
-        let bundle = build_doc_bundle(&docs_root).expect("bundle");
+        let bundle = build_doc_bundle(&repo_overlay()).expect("bundle");
         let site = render_site_for_serve(&docs, &bundle);
 
         for name in crate::help::documented_command_keys() {
@@ -8416,8 +8710,7 @@ withBaseMs = something
     #[test]
     fn tea_terminal_namespace_absent_from_site() {
         let docs = build_stdlib_only_docs();
-        let docs_root = locate_docs_root();
-        let bundle = build_doc_bundle(&docs_root).expect("bundle");
+        let bundle = build_doc_bundle(&repo_overlay()).expect("bundle");
         let site = render_site_for_serve(&docs, &bundle);
 
         for path in site.keys() {
@@ -8438,8 +8731,7 @@ withBaseMs = something
     #[test]
     fn serve_html_equals_write_format_html() {
         let docs = build_stdlib_only_docs();
-        let docs_root = locate_docs_root();
-        let bundle = build_doc_bundle(&docs_root).expect("bundle");
+        let bundle = build_doc_bundle(&repo_overlay()).expect("bundle");
 
         let serve = render_site_for_serve(&docs, &bundle);
         let (_, _, write_html) = render_site_split(&docs, &bundle, WriteFormat::Html);

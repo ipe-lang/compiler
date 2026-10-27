@@ -173,6 +173,7 @@ fn collect_expr_spans(expr: &ipe_syntax::Expr, byte: u32, out: &mut Vec<Span>) {
         // Leaf expressions — span already pushed above.
         Expr_::VarLocal(_)
         | Expr_::VarQual(_, _)
+        | Expr_::TaskAndThen
         | Expr_::Int(_)
         | Expr_::Float(_)
         | Expr_::Str(_)

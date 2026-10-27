@@ -89,30 +89,23 @@ fn repo_root() -> PathBuf {
     std::fs::canonicalize(&joined).unwrap_or(joined)
 }
 
-fn fixture_entry(root: &Path, name: &str) -> PathBuf {
-    root.join("tests")
-        .join("golden")
-        .join(name)
-        .join("Main.ipe")
+fn fixture_project(root: &Path, name: &str) -> PathBuf {
+    root.join("tests").join("golden").join(name)
 }
 
-fn fixture_src_entry(root: &Path, name: &str) -> PathBuf {
-    root.join("tests")
-        .join("golden")
-        .join(name)
-        .join("src")
-        .join("Main.ipe")
+fn fixture_src_dir(root: &Path, name: &str) -> PathBuf {
+    root.join("tests").join("golden").join(name)
 }
 
 /// Build `name`'s `Main.ipe` and return the diagnostic code if the pipeline
 /// rejected it, `None` if it was accepted (or failed for a non-pipeline
 /// reason, which the caller's assertion will catch).
 fn built_code(root: &Path, name: &str) -> (Result<(), CliError>, PathBuf) {
-    let entry = fixture_entry(root, name);
+    let entry = fixture_project(root, name);
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("{name}_emit"));
     let _ = std::fs::remove_dir_all(&out);
     let runtime = e2e_support::require_runtime().into_path_buf();
-    (ipe::build(&entry, &out, &runtime), out)
+    (crate::support::build_golden(&entry, &out, &runtime), out)
 }
 
 // ── T1/T2: direct construction now ACCEPTED ─────────────────────────────────
@@ -381,12 +374,12 @@ fn and_map_record_field_extraction_stays_gated() {
 #[test]
 fn and_map_cross_module_annotated_wrapper_accepted() {
     let root = repo_root();
-    let entry = fixture_src_entry(&root, "and_map_cross_module_wrapper_accepted");
+    let golden_project = fixture_src_dir(&root, "and_map_cross_module_wrapper_accepted");
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
         .join("l0114_and_map_cross_module_wrapper_accepted_emit");
     let _ = std::fs::remove_dir_all(&out);
     let runtime = e2e_support::require_runtime().into_path_buf();
-    let built = ipe::build_loose_file(&entry, &out, &runtime);
+    let built = crate::support::build_golden(&golden_project, &out, &runtime);
     assert!(
         built.is_ok(),
         "an annotated andMap wrapper reused cross-module at two arity-1-safe \
@@ -405,12 +398,12 @@ fn and_map_cross_module_annotated_wrapper_accepted() {
 #[test]
 fn and_map_forwarder_curried_is_ipe_t0014() {
     let root = repo_root();
-    let entry = fixture_src_entry(&root, "and_map_forwarder_curried_is_t0014");
+    let golden_project = fixture_src_dir(&root, "and_map_forwarder_curried_is_t0014");
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
         .join("l0114_and_map_forwarder_curried_is_t0014_emit");
     let _ = std::fs::remove_dir_all(&out);
     let runtime = e2e_support::require_runtime().into_path_buf();
-    let built = ipe::build_loose_file(&entry, &out, &runtime);
+    let built = crate::support::build_golden(&golden_project, &out, &runtime);
     let code = match &built {
         Err(CliError::Pipeline { diag, .. }) => Some(diag.code()),
         _ => None,
@@ -602,12 +595,12 @@ fn and_map_untyped_double_forwarder_arity1_accepted() {
 #[test]
 fn and_map_cross_module_untyped_forwarder_curried_rejected() {
     let root = repo_root();
-    let entry = fixture_src_entry(&root, "and_map_cross_module_untyped_forwarder_curried");
+    let golden_project = fixture_src_dir(&root, "and_map_cross_module_untyped_forwarder_curried");
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
         .join("l0114_and_map_cross_module_untyped_forwarder_curried_emit");
     let _ = std::fs::remove_dir_all(&out);
     let runtime = e2e_support::require_runtime().into_path_buf();
-    let built = ipe::build_loose_file(&entry, &out, &runtime);
+    let built = crate::support::build_golden(&golden_project, &out, &runtime);
     let code = match &built {
         Err(CliError::Pipeline { diag, .. }) => Some(diag.code()),
         _ => None,

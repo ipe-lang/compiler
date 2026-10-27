@@ -19,15 +19,7 @@ use ipe::coverage::matrix;
 /// Empty means every column is green over the whole CLI surface. Add an entry
 /// here (with a tracking reason) only for a gap that is intentionally deferred,
 /// never to suppress a real untracked regression.
-const ALLOWLIST: &[(&str, &str, &str)] = &[
-    // ── tested gaps ──────────────────────────────────────────────────────────
-    // These subcommands have no standing integration test invoking them yet.
-    (
-        "tested",
-        "release eject",
-        "no integration test for ipe-release-eject path yet",
-    ),
-];
+const ALLOWLIST: &[(&str, &str, &str)] = &[];
 
 #[test]
 fn cli_surface_is_non_empty() {

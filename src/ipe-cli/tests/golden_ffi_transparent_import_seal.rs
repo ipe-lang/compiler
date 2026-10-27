@@ -19,6 +19,8 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use ipe::RootFixture;
+use ipe::project_root::SourceTree;
 use ipe_ffi::driver::{FfiCache, install_from_inspection};
 
 /// Seed the project's FFI cache with a hand-crafted inspection document for a
@@ -114,21 +116,26 @@ const MAIN_IPE: &str = "module Main exposing (main)\n\
     \x20               Err _ -> Io.println \"err classify\"\n\
     \x20       Err _ -> Io.println \"err shift\"\n";
 
-fn write_project(dir: &Path) -> bool {
-    write_project_with(dir, MAIN_IPE)
+/// The fixture's declared foreign crate: an FFI fixture is filtered by its
+/// declared `rustDependencies`, so it names the crate it binds.
+const TM_DEPENDENCY: &str = "rustDependencies = [ rustDep \"tm\" \"=0.1.0\" ]";
+
+/// A project fixture whose `Main` holds `main_ipe`, declaring `tm`, with its FFI cache seeded.
+fn ffi_fixture(main_ipe: &str) -> RootFixture {
+    let fixture = RootFixture::from_tree(&SourceTree::main(main_ipe).field(TM_DEPENDENCY))
+        .expect("the fixture project must be written and resolved");
+    assert!(
+        seed_transparent_ffi_cache(fixture.path()),
+        "must seed the fixture project's FFI cache"
+    );
+    fixture
 }
 
-/// Write a project whose `src/Main.ipe` is `main`, with the `tm` FFI cache seeded.
-fn write_project_with(dir: &Path, main: &str) -> bool {
-    let src = dir.join("src");
-    let _ = fs::remove_dir_all(dir);
-    if fs::create_dir_all(&src).is_err() {
-        return false;
-    }
-    if !seed_transparent_ffi_cache(dir) {
-        return false;
-    }
-    fs::write(src.join("Main.ipe"), main).is_ok()
+/// A fresh scratch directory `name` for files that sit outside the project.
+fn scratch(name: &str) -> PathBuf {
+    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(name);
+    let _ = fs::remove_dir_all(&dir);
+    dir
 }
 
 /// Read one emitted file, failing the test with a directory listing when the
@@ -216,18 +223,11 @@ pub fn brightness(s: Shade) -> i64 {
 fn transparent_import_emits_the_conversion_seam() {
     let runtime = e2e_support::require_runtime().into_path_buf();
 
-    let tmp =
-        std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("ipec_ffi_transparent_import");
-    assert!(
-        write_project(&tmp),
-        "must write the fixture project + FFI cache"
-    );
-
-    let entry = tmp.join("src").join("Main.ipe");
+    let fixture = ffi_fixture(MAIN_IPE);
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("ffi_transparent_import_out");
     let _ = fs::remove_dir_all(&out);
 
-    if let Err(err) = ipe::build_loose_file(&entry, &out, &runtime) {
+    if let Err(err) = ipe::build_fixture(&fixture, &out, &runtime) {
         panic!("transparent-import fixture must build, got: {err}")
     }
 
@@ -261,8 +261,6 @@ fn transparent_import_emits_the_conversion_seam() {
         ffi_rs.contains("pub fn tm_shift(arg0: ::tm::Point) -> IpeResult<IpeError, ::tm::Point>"),
         "wrapper signature must keep the foreign types; ffi.rs:\n{ffi_rs}"
     );
-
-    let _ = fs::remove_dir_all(&tmp);
 }
 
 /// SEAL proof under `IPE_E2E=1`: the emitted crate builds against a REAL
@@ -277,20 +275,14 @@ fn transparent_import_emitted_crate_builds_and_runs() {
     }
     let runtime = e2e_support::require_runtime().into_path_buf();
 
-    let tmp = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
-        .join("ipec_ffi_transparent_import_e2e");
-    assert!(
-        write_project(&tmp),
-        "must write the fixture project + FFI cache"
-    );
-
-    let entry = tmp.join("src").join("Main.ipe");
+    let fixture = ffi_fixture(MAIN_IPE);
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("ffi_transparent_import_e2e_out");
     let _ = fs::remove_dir_all(&out);
-    if let Err(err) = ipe::build_loose_file(&entry, &out, &runtime) {
+    if let Err(err) = ipe::build_fixture(&fixture, &out, &runtime) {
         panic!("transparent-import fixture must build, got: {err}")
     }
 
+    let tmp = scratch("ipec_ffi_transparent_import_e2e");
     let run = cargo_run_against_local_tm(&tmp, &out);
     let stdout = String::from_utf8_lossy(&run.stdout);
     let stderr = String::from_utf8_lossy(&run.stderr);
@@ -322,32 +314,27 @@ fn repo_root() -> PathBuf {
 /// `g_misc::golden_show_policy::showing_a_rust_handle_is_refused_before_cargo`.
 #[test]
 fn showing_a_transparent_union_is_accepted() {
-    let (tmp, _out) = build_show_transparent();
-    let _ = fs::remove_dir_all(&tmp);
+    let (_fixture, _out) = build_show_transparent();
 }
 
-/// Writes and builds the `show_transparent_foreign` project; returns its dir and build output.
-fn build_show_transparent() -> (PathBuf, PathBuf) {
+/// Writes and builds the `show_transparent_foreign` project; returns the fixture and build output.
+fn build_show_transparent() -> (RootFixture, PathBuf) {
     let runtime = e2e_support::require_runtime().into_path_buf();
     let source = repo_root()
         .join("tests")
         .join("golden")
         .join("show_transparent_foreign")
+        .join("src")
         .join("Main.ipe");
     let main =
         fs::read_to_string(&source).unwrap_or_else(|e| panic!("read {}: {e}", source.display()));
-    let tmp = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("ipec_show_transparent_foreign");
-    assert!(
-        write_project_with(&tmp, &main),
-        "must write the fixture project + FFI cache"
-    );
-    let entry = tmp.join("src").join("Main.ipe");
+    let fixture = ffi_fixture(&main);
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("show_transparent_foreign_out");
     let _ = fs::remove_dir_all(&out);
-    if let Err(err) = ipe::build_loose_file(&entry, &out, &runtime) {
+    if let Err(err) = ipe::build_fixture(&fixture, &out, &runtime) {
         panic!("showing a transparent union must be accepted, got: {err}")
     }
-    (tmp, out)
+    (fixture, out)
 }
 
 #[test]
@@ -355,7 +342,8 @@ fn showing_a_transparent_union_renders_it() {
     if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
         return;
     }
-    let (tmp, out) = build_show_transparent();
+    let (_fixture, out) = build_show_transparent();
+    let tmp = scratch("ipec_show_transparent_foreign");
     let run = cargo_run_against_local_tm(&tmp, &out);
     let stdout = String::from_utf8_lossy(&run.stdout);
     let stderr = String::from_utf8_lossy(&run.stderr);

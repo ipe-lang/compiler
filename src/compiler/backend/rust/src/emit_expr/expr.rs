@@ -1,14 +1,14 @@
 use super::{
     BinOp, Callee, DResult, Diagnostic, Expr, GenericScope, IrType, KernelClass, KernelFn,
-    LowerError, MAX_EMIT_DEPTH, Match, ModPath, Span, Symbol, callee_name, clone_targets_in_expr,
-    combine_guards, elem_clone_proof, emit_apply, emit_arm_head, emit_binding_stmts,
-    emit_config_ctor_call, emit_css_value_call, emit_db_call, emit_ffi_glued_call, emit_func_value,
-    emit_html_template, emit_http_builder_call, emit_http_call, emit_json_decoder_call,
-    emit_lambda, emit_lambda_unboxed, emit_match_scrutinee, emit_process_run_in_pty_call,
+    MAX_EMIT_DEPTH, Match, ModPath, Symbol, callee_name, clone_targets_in_expr, combine_guards,
+    elem_clone_proof, emit_apply, emit_arm_head, emit_binding_stmts, emit_config_ctor_call,
+    emit_css_value_call, emit_db_call, emit_ffi_glued_call, emit_func_value, emit_html_template,
+    emit_http_builder_call, emit_http_call, emit_json_decoder_call, emit_lambda,
+    emit_lambda_unboxed, emit_match_scrutinee, emit_process_run_in_pty_call,
     emit_process_run_with_call, emit_record, emit_server_call, emit_shared_lambda,
     emit_task_loop_call, emit_task_retry_call, emit_tea_call, emit_ui_call, emit_ui_template,
     emit_update, float_literal, free_vars, indent_of, infix, inlined_let_body, int_literal,
-    ir_type_is_definitely_copy, once_closure_bug, render_type, rust_str_lit,
+    ir_type_is_definitely_copy, nesting_refusal, once_closure_bug, render_type, rust_str_lit,
     swapped_container_clone_rewrite,
 };
 use crate::EmitCtx;
@@ -30,12 +30,7 @@ pub fn emit_expr_at(
     generics: GenericScope,
 ) -> DResult<String> {
     if depth > MAX_EMIT_DEPTH {
-        return Err(Diagnostic::Lower {
-            span: Span::DUMMY,
-            msg: LowerError::BackendNestingTooDeep {
-                limit: MAX_EMIT_DEPTH,
-            },
-        });
+        return Err(nesting_refusal());
     }
     let child = depth + 1;
     match expr {
@@ -87,8 +82,8 @@ pub fn emit_expr_at(
         Expr::Bool(b) => Ok(if *b { "true" } else { "false" }.to_owned()),
         // The unit value renders as the Rust unit expression `()`.
         Expr::Unit => Ok("()".to_owned()),
-        Expr::Var(sym) => ctx.emit_ident(*sym),
-        Expr::CloneVar(sym) => Ok(format!("{}.clone()", ctx.emit_ident(*sym)?)),
+        Expr::Var(sym) => ctx.emit_local_ident(*sym),
+        Expr::CloneVar(sym) => Ok(format!("{}.clone()", ctx.emit_local_ident(*sym)?)),
         Expr::Ctor {
             home,
             ty,
@@ -177,11 +172,26 @@ pub fn emit_expr_at(
                 let inlined_s = emit_expr_at(ctx, &inlined_body, indent, child, generics)?;
                 Ok(format!("({{ {inlined_s} }})"))
             } else {
-                let name_s = ctx.emit_ident(*name)?;
+                let name_s = ctx.emit_local_ident(*name)?;
                 let value_s = emit_expr_at(ctx, value, indent, child, generics)?;
                 let body_s = emit_expr_at(ctx, body, indent, child, generics)?;
                 Ok(format!("({{ let {name_s} = {value_s}; {body_s} }})"))
             }
+        }
+        Expr::CaptureClones { syms, body } => {
+            // One block for the whole run of pre-clones:
+            // `({ let a = a.clone(); let b = b.clone(); <body> })`. A single
+            // symbol renders exactly as the self-clone `let` it stands for, and
+            // a run costs one block (and one emit level), however long.
+            let lets = syms
+                .iter()
+                .map(|sym| {
+                    ctx.emit_local_ident(*sym)
+                        .map(|name_s| format!("let {name_s} = {name_s}.clone();"))
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let body_s = emit_expr_at(ctx, body, indent, child, generics)?;
+            Ok(format!("({{ {} {body_s} }})", lets.join(" ")))
         }
         Expr::Destructure {
             binder,
@@ -499,14 +509,13 @@ pub fn emit_expr_at(
                 return emit_ffi_glued_call(ctx, *ident, glue, args, indent, child, generics);
             }
             let name = callee_name(ctx, callee)?;
-            // a polymorphic-kernel turbofish the lowerer set because the
-            // solver left this call's result type parameter genuinely
-            // unconstrained (a discarded / empty / phantom position). Empty for
-            // every other call — `CallPin::None::turbofish()` is `""` — so an
-            // unpinned call emits no turbofish suffix. The
-            // suffix goes between the kernel name and its `(` argument list:
-            // `dict_empty::<String, i64>(…)`.
-            let pin_turbofish = pin.turbofish();
+            // the turbofish the lowerer pinned because the solver left one of
+            // this call's type parameters genuinely unconstrained (a discarded /
+            // empty / phantom position): a polymorphic kernel's default, or a
+            // user generic's parameter its arguments cannot infer. Empty for an unpinned
+            // call. The suffix goes between the callee name and its `(`
+            // argument list: `dict_empty::<String, i64>(…)`.
+            let pin_turbofish = ctx.call_pin_turbofish(callee, pin, generics)?;
             // `Ipe.Csv` parse kernels are generic over the error channel
             // (`csv_parse<E: From<String>>(...) -> IpeResult<E, CsvDoc>`); a
             // `Result`-returning call whose `Err` arm is often discarded leaves
@@ -518,7 +527,9 @@ pub fn emit_expr_at(
             // channel (`dsn_parse<E: From<String>>(...) -> IpeResult<E, Dsn>`) and
             // are called in a PURE `Result Error Dsn` context whose `Err` arm is
             // often discarded, leaving `E` unconstrained (E0283). Anchor `E` to
-            // `IpeError`, exactly like the Csv parse kernels above.
+            // `IpeError`, exactly like the Csv parse kernels above. The
+            // `Ipe.Db.Location.file` parse kernel
+            // (`db_location_file<E: From<IpeError>>`) is anchored the same way.
             let turbofish: &str = if pin_turbofish.is_empty()
                 && matches!(
                     callee,
@@ -527,12 +538,13 @@ pub fn emit_expr_at(
                             | KernelFn::CsvParseWithDelimiter
                             | KernelFn::DsnParse
                             | KernelFn::DsnBuild
+                            | KernelFn::DbLocationFile
                             | KernelFn::UrlRelativeParse
                     )
                 ) {
                 "::<IpeError>"
             } else {
-                pin_turbofish
+                &pin_turbofish
             };
             // A container-first kernel renders its container before the
             // function closure; clone the function's captures at their container
@@ -715,7 +727,7 @@ pub fn emit_expr_at(
                 }
                 return Ok(format!("({base}).{getter}().clone()"));
             }
-            let field = ctx.emit_ident(*field)?;
+            let field = ctx.emit_member_ident(*field)?;
             if moves || ir_type_is_definitely_copy(field_ty) {
                 Ok(format!("({base}).{field}"))
             } else {
@@ -917,7 +929,7 @@ pub fn emit_ctor(
     // (`IpeMaybe::Just(..)`, `IpeResult::Err(..)`); its payload is never a
     // self-recursive user field, so no field-boxing lookup applies.
     if let Some(runtime) = ctx.builtin_runtime_enum(home, ty) {
-        let path = format!("{runtime}::{}", ctx.emit_ident(variant)?);
+        let path = format!("{runtime}::{}", ctx.emit_member_ident(variant)?);
         if args.is_empty() {
             return Ok(path);
         }
@@ -927,7 +939,11 @@ pub fn emit_ctor(
         }
         return Ok(format!("{path}({})", parts.join(", ")));
     }
-    let path = format!("{}::{}", ctx.enum_name(home, ty)?, ctx.emit_ident(variant)?);
+    let path = format!(
+        "{}::{}",
+        ctx.enum_name(home, ty)?,
+        ctx.emit_member_ident(variant)?
+    );
     if args.is_empty() {
         return Ok(path);
     }
@@ -1063,14 +1079,14 @@ pub fn emit_transition_arm(ctx: &EmitCtx, body: &Expr) -> DResult<Option<String>
     // Resolve a field symbol to its serde key — the emitted Rust field ident,
     // which (no serde rename) is exactly the key the runtime Model JSON object is
     // keyed by. `None` for an unresolved symbol refuses (never a guessed key).
-    let resolve = |sym: Symbol| ctx.emit_ident(sym).ok();
+    let resolve = |sym: Symbol| ctx.emit_member_ident(sym).ok();
     let Some(ct) = crate::transition_classify::transition_of_arm(body, model_param, &resolve)
     else {
         return Ok(None);
     };
     // The model parameter's emitted ident, consumed by value by the arm (only one
     // match branch runs, so the move is sound).
-    let model_ident = ctx.emit_ident(model_param)?;
+    let model_ident = ctx.emit_local_ident(model_param)?;
     // The baked datum, as a Rust string literal. `to_json` emits only the JSON
     // grammar's own escapes; wrap it as a Rust string with the escapes a Rust
     // string literal needs (`"` and `\`), which the JSON writer already produced,
@@ -1109,7 +1125,7 @@ pub fn emit_sub_arm(ctx: &EmitCtx, kernel: KernelFn, args: &[Expr]) -> Option<St
     // which (no serde rename) is exactly the tag serde uses for the enum's
     // externally-tagged form. `None` for an unresolved symbol refuses (never a
     // guessed tag).
-    let resolve_variant = |sym: Symbol| ctx.emit_ident(sym).ok();
+    let resolve_variant = |sym: Symbol| ctx.emit_member_ident(sym).ok();
     let cs = crate::sub_classify::sub_of_call(kernel, args, &resolve_variant)?;
     // The baked datum, as a Rust string literal. `to_json` emits only the JSON
     // grammar's own escapes; wrap it as a Rust string with the escapes a Rust
@@ -1154,7 +1170,7 @@ pub fn emit_init_datum(
     depth: u16,
     generics: GenericScope,
 ) -> DResult<Option<String>> {
-    let resolve = |sym: Symbol| ctx.emit_ident(sym).ok();
+    let resolve = |sym: Symbol| ctx.emit_member_ident(sym).ok();
     let Some(cd) = crate::transition_classify::init_datum_of_body(body, &resolve) else {
         return Ok(None);
     };
@@ -1183,9 +1199,9 @@ pub fn emit_init_datum(
 ///
 /// Emits the whole arm body as
 /// `(<compiled model>, ipe_runtime::web::fire_cmd_wiring("<baked wiring JSON>",
-/// vec![Box::new(move || <compiled effect 0>), ...]))`: the model half is the arm's
-/// OWN compiled model (unchanged), and the Cmd half is the wiring dispatch. Each
-/// effect thunk builds ONE of the arm's compiled effects; the runtime selector
+/// vec![Box::new(move || <compiled effect 0>)]))`: the model half is the arm's
+/// OWN compiled model (unchanged), and the Cmd half is the wiring dispatch. The
+/// effect thunk builds the arm's sole compiled effect; the runtime selector
 /// picks WHICH id fires (dev overlay under the dev gate, the baked id otherwise —
 /// dev == prod) and runs only that thunk. The effect BODIES are compiled exactly as
 /// written — only the WIRING (which id fires) is data.
@@ -1228,10 +1244,10 @@ pub fn emit_cmd_wiring_arm(
     // The `Cmd.none` no-effect wiring is already handled by the transition path
     // (which emits `cmd_none()` at the Cmd position, fail-closed to no effect);
     // wiring it here would only churn its emit for zero behaviour gain. Compose only
-    // when the arm names at least one compiled effect (a real `Cmd.perform`).
-    if arm.effects.is_empty() {
+    // when the arm names its compiled effect (a real `Cmd.perform`).
+    let Some(effect) = arm.effect else {
         return Ok(None);
-    }
+    };
     // The arm body is `(Model, Cmd)`; re-extract the model sub-expression to emit as
     // the arm's own compiled model. A shape that does not match here would mean the
     // classifier and this extraction drifted; it fails closed (`None` → ordinary
@@ -1244,16 +1260,12 @@ pub fn emit_cmd_wiring_arm(
     };
     let child = depth + 1;
     let model_s = emit_expr_at(ctx, model_expr, indent + 1, child, generics)?;
-    // The ordered compiled-effect table: each effect wrapped in a `move` thunk so
-    // only the wiring-selected one is built and fired (the rest drop unrun). A
-    // `move` closure lets the effect capture the arm's bindings by value, sound
-    // because only one match arm runs.
-    let mut thunks = Vec::with_capacity(arm.effects.len());
-    for effect in &arm.effects {
-        let effect_s = emit_expr_at(ctx, effect, indent + 1, child, generics)?;
-        thunks.push(format!("Box::new(move || {effect_s})"));
-    }
-    let table = thunks.join(", ");
+    // The one-entry compiled-effect table: the sole effect wrapped in a `move`
+    // thunk, built and fired only when the wiring selects it. A `move` closure
+    // lets the effect capture the arm's bindings by value, sound because only one
+    // match arm runs and the arm has one effect, emitted after its model.
+    let effect_s = emit_expr_at(ctx, effect, indent + 1, child, generics)?;
+    let table = format!("Box::new(move || {effect_s})");
     let json = arm.wiring.to_json();
     let json_lit = rust_str_lit(&json);
     Ok(Some(format!(

@@ -2,18 +2,15 @@
 //! callback AND reused by a sibling.
 //!
 //! Without the fix, `ipe dev build` exits 0, but the emitted Rust fails `cargo build` with
-//! E0382 ("use of moved value: `habit`"). The lowerer pre-clones the checkbox
-//! `onChange` callback's captured `habit`
-//! (`let habit = habit.clone(); Lambda { … }`), but `arc_callback_wrap` then
-//! re-wrapped the WHOLE block in
-//! `Arc::new(move |_x| ({ let habit = habit.clone(); … })(_x))` — the outer
-//! `move` still move-captured the FREE outer `habit`, so a later sibling use
-//! (`RemoveHabit habit.id`, the button `onPress`) hit use-after-move.
+//! E0382 ("use of moved value: `habit`") whenever the checkbox `onChange`
+//! callback's capture-clone `let habit = habit.clone();` lands inside a `move`
+//! closure that captures the FREE outer `habit`, so a later sibling use
+//! (`RemoveHabit habit.id`, the button `onPress`) hits use-after-move.
 //!
-//! Fix (`emit_arc_callback_field` in `crates/ipe_backend_rust/src/emit_expr.rs`):
-//! hoist the leading capture-clone `let`s OUTSIDE the `Arc`'s `move` closure —
-//! `{ let habit = habit.clone(); ::std::sync::Arc::new(move |_x| (INNER)(_x)) }`
-//! — so the `Arc` owns the pre-made clone and the original binding survives for
+//! The callback field is an adapted slot in handler normal form: the emitter
+//! emits its leading `let`s OUTSIDE the closure it places in the `Arc` —
+//! `{ let habit = habit.clone(); ::std::sync::Arc::new(move |..| ..) }` — so
+//! the `Arc` owns the pre-made clone and the original binding survives for
 //! the sibling.
 //!
 //! Run:
@@ -28,11 +25,8 @@ fn repo_root() -> PathBuf {
     std::fs::canonicalize(&joined).unwrap_or(joined)
 }
 
-fn entry_path(root: &Path) -> PathBuf {
-    root.join("tests")
-        .join("golden")
-        .join("input_arc_capture")
-        .join("Main.ipe")
+fn project_path(root: &Path) -> PathBuf {
+    root.join("tests").join("golden").join("input_arc_capture")
 }
 
 /// ipe-0: the compiler must accept the program AND emit the capture-clone `let`
@@ -43,13 +37,13 @@ fn entry_path(root: &Path) -> PathBuf {
 #[test]
 fn i191_ipec_accepts_and_hoists_capture_clone() {
     let root = repo_root();
-    let entry = entry_path(&root);
+    let entry = project_path(&root);
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("i191_input_arc_capture_ipec_out");
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
 
-    let built = ipe::build_loose_file(&entry, &out, &runtime);
+    let built = crate::support::build_golden(&entry, &out, &runtime);
     assert!(
         built.is_ok(),
         "ipe dev build must succeed for input_arc_capture: {:?}",
@@ -102,13 +96,13 @@ fn i191_cargo_builds_and_runs() {
     }
 
     let root = repo_root();
-    let entry = entry_path(&root);
+    let entry = project_path(&root);
     let out = crate::support::scratch_root().join("ipec_i191_input_arc_capture_e2e");
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
 
-    let built = ipe::build_loose_file(&entry, &out, &runtime);
+    let built = crate::support::build_golden(&entry, &out, &runtime);
     assert!(
         built.is_ok(),
         "ipe dev build must succeed for input_arc_capture: {:?}",

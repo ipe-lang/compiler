@@ -31,11 +31,11 @@ const MAX_FILE_BYTES: u64 = 4 * 1024 * 1024;
 /// unparseable file, or a parser regression that starts rejecting more, goes
 /// red here instead of silently widening the skip set.
 const KNOWN_PARSE_REFUSALS: &[&str] = &[
-    "tests/golden/blockcomment_unterminated/Main.ipe",
-    "tests/golden/gate_malformed_char_pattern/Main.ipe",
-    "tests/golden/gate_malformed_char_scrutinee/Main.ipe",
-    "tests/golden/neg_int_lambda/Main.ipe",
-    "tests/golden/neg_list_lambda/Main.ipe",
+    "tests/golden/blockcomment_unterminated/src/Main.ipe",
+    "tests/golden/gate_malformed_char_pattern/src/Main.ipe",
+    "tests/golden/gate_malformed_char_scrutinee/src/Main.ipe",
+    "tests/golden/neg_int_lambda/src/Main.ipe",
+    "tests/golden/neg_list_lambda/src/Main.ipe",
 ];
 
 /// The floor a healthy walk must clear.
@@ -43,6 +43,10 @@ const KNOWN_PARSE_REFUSALS: &[&str] = &[
 /// Below it, the walk ran over far too little of the tree to mean anything —
 /// the anti-vacuity half of this test.
 const MIN_FORMATTED_FILES: usize = 1200;
+
+/// The fewest comment runs directly above a head the run guard must check
+/// over the corpus.
+const MIN_HEAD_RUNS: usize = 1000;
 
 fn workspace_root() -> PathBuf {
     Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../..")).to_path_buf()
@@ -135,6 +139,7 @@ fn every_repo_ipe_file_is_a_meaning_preserving_fixed_point() {
 
     let mut skipped: Vec<String> = Vec::new();
     let mut formatted_count = 0usize;
+    let mut head_runs = 0usize;
 
     for path in &files {
         let rel = path
@@ -162,6 +167,12 @@ fn every_repo_ipe_file_is_a_meaning_preserving_fixed_point() {
             let msg = format!("{rel}: format_source rejected a file the parser accepted");
             ipe_fmt::format_source(&src).expect(&msg)
         };
+        let verified = ipe_fmt::verify_rewrite(&src, &once);
+        assert!(
+            verified.is_ok(),
+            "{rel}: the print is not a faithful print of the source: {verified:?}"
+        );
+        head_runs += verified.map_or(0, ipe_fmt::Verified::head_runs);
         let twice = {
             let msg = format!("{rel}: the second format pass rejected the first pass's output");
             ipe_fmt::format_source(&once).expect(&msg)
@@ -190,5 +201,9 @@ fn every_repo_ipe_file_is_a_meaning_preserving_fixed_point() {
         formatted_count >= MIN_FORMATTED_FILES,
         "formatted_count {formatted_count} is below the anti-vacuity floor of \
          {MIN_FORMATTED_FILES} — the walk likely ran over far too little of the tree"
+    );
+    assert!(
+        head_runs >= MIN_HEAD_RUNS,
+        "the run guard checked only {head_runs} head runs, below the floor of {MIN_HEAD_RUNS}"
     );
 }

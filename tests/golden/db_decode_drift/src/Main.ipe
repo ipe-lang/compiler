@@ -1,0 +1,46 @@
+module Main exposing (main)
+import Ipe.Io as Io
+import Ipe.Db
+import Ipe.Db.Location as Location
+import Ipe.Db.Unsafe
+import Ipe.Db.Decode
+import Ipe.String
+import Ipe.Task
+
+-- Schema-drift through the typed row path is a caught `Err`, never a phantom
+-- value. A table has column `full_name`; the decoder names `name` (the shape a
+-- rename `name -> full_name` leaves behind). The absent column short-circuits
+-- the whole task to `IpeResult::Err`, surfaced as a `Task Error` and caught via
+-- `Task.onError` -- the same fail-closed shape the malformed-money arm proves,
+-- but for a missing/renamed column. This pins the safety property the whole
+-- typed-row surface exists for: drift fails closed.
+--
+-- Output: "drift:caught"
+
+main =
+    Task.andThen
+        (\conn ->
+            Db.withTransaction conn
+                (\txconn ->
+                    do
+                        Unsafe.unsafeExecRaw txconn
+                            "CREATE TABLE people (full_name TEXT)"
+                        Db.exec txconn
+                            "INSERT INTO people (full_name) VALUES (?)"
+                            [ SqlString "ada" ]
+                        Task.andThen
+                            (\line -> Io.println line)
+                            (Task.onError
+                                (\_ -> Task.succeed "drift:caught")
+                                (Task.andThen
+                                    (\names -> Task.succeed (String.join "," names))
+                                    (Db.queryDecode txconn
+                                        "SELECT full_name FROM people"
+                                        []
+                                        (Db.Decode.string "name")
+                                    )
+                                )
+                            )
+                )
+        )
+        (Db.open Location.memory)

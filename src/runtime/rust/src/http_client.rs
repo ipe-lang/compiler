@@ -30,6 +30,11 @@
 //!    on every `Location` target, since an IP literal bypasses any resolver.
 
 use super::*;
+#[cfg(any(
+    not(target_arch = "wasm32"),
+    all(target_arch = "wasm32", feature = "wasm-client")
+))]
+use crate::transport_timeout::{TimeoutRefusal, TransportTimeout};
 use std::collections::HashMap;
 // SSRF deny-private helpers live in the reqwest-free `ssrf` module (so the
 // WebSocket client can validate URLs without linking reqwest). The reqwest-
@@ -550,16 +555,50 @@ pub(crate) fn redacted_transport_error<E: From<String>>(e: reqwest::Error) -> E 
 // Core request executor
 // ---------------------------------------------------------------------------
 
+/// A refused request deadline as the Ipê program sees it, kinded `InvalidInput`.
 #[cfg(not(target_arch = "wasm32"))]
-async fn do_request<E: From<String> + FromLimitExceeded + Send + 'static>(
+fn timeout_refusal<E: FromIpeError>(refusal: TimeoutRefusal) -> E {
+    E::from_ipe_error(crate::error::IpeError::invalid_input(format!(
+        "http: timeout: {refusal}"
+    )))
+}
+
+/// Sends `req` under the process's dial policy and system resolver.
+#[cfg(not(target_arch = "wasm32"))]
+async fn do_request<E: From<String> + FromLimitExceeded + FromIpeError + Send + 'static>(
     req: HttpRequest,
 ) -> IpeResult<E, HttpResponse> {
+    let policy = DialPolicy::from_env();
+    let gate = match VettingResolver::system() {
+        Ok(gate) => gate,
+        Err(refusal) => return IpeResult::Err(format!("http: {refusal}").into()),
+    };
+    do_request_with(req, policy, gate).await
+}
+
+/// Sends `req` under an explicit dial `policy` and resolver `gate`.
+///
+/// The request deadline is parsed before anything resolves or dials, so a
+/// request with no admissible deadline never leaves the process.
+#[cfg(not(target_arch = "wasm32"))]
+async fn do_request_with<E, R>(
+    req: HttpRequest,
+    policy: DialPolicy,
+    gate: VettingResolver<R>,
+) -> IpeResult<E, HttpResponse>
+where
+    E: From<String> + FromLimitExceeded + FromIpeError + Send + 'static,
+    R: HostResolver + Send + 'static,
+{
+    let timeout = match TransportTimeout::parse(req.timeout) {
+        Ok(timeout) => timeout,
+        Err(refusal) => return IpeResult::Err(timeout_refusal(refusal)),
+    };
     // This surface (Http.get/post/request) accepts only http/https — ws/wss is
     // the WebSocket client's surface. When the SSRF guard is on, enforce that
     // narrower scheme set here, then delegate the host-resolve + DNS-rebinding
     // pin + per-redirect re-check to the SHARED `ssrf_apply_with` under the
     // same policy reading.
-    let policy = DialPolicy::from_env();
     if policy == DialPolicy::DenyPrivate
         && let Err(refusal) = parse_gated_url_within(&req.url, GatedSchemes::Http)
     {
@@ -567,25 +606,14 @@ async fn do_request<E: From<String> + FromLimitExceeded + Send + 'static>(
     }
 
     let builder = reqwest::Client::builder();
-    let gate = match VettingResolver::system() {
-        Ok(gate) => gate,
-        Err(refusal) => return IpeResult::Err(format!("http: {refusal}").into()),
-    };
     let (mut builder, budget) =
         match ssrf_apply_with(builder, &req.url, req.redirects, policy, gate).await {
             Ok(applied) => applied,
             Err(refusal) => return IpeResult::Err(format!("http: {refusal}").into()),
         };
 
-    // Always install a request deadline. A Ipê-controllable `timeout <= 0`
-    // would otherwise leave the request with no deadline (slowloris / hung-
-    // connection vector), so floor it to 30 s instead of disabling it.
-    let timeout_ms = if req.timeout > 0 {
-        req.timeout as u64
-    } else {
-        30_000
-    };
-    builder = builder.timeout(std::time::Duration::from_millis(timeout_ms));
+    // The one request deadline; its type proves it positive and bounded.
+    builder = builder.timeout(timeout.as_duration());
 
     let client = match builder.build() {
         Ok(c) => c,
@@ -608,22 +636,10 @@ async fn do_request<E: From<String> + FromLimitExceeded + Send + 'static>(
         }
     };
     let status = resp.status().as_u16() as i64;
-    let mut headers = HashMap::new();
-    for (k, v) in resp.headers() {
-        if let Ok(s) = v.to_str() {
-            // MIME-case parity: reqwest's `HeaderName::as_str()`
-            // ALWAYS returns lower-case, but canonical storage expects
-            // headers canonicalised (`net/http.Header` always is) — a Ipê
-            // program's `Dict.get "Content-Type" resp.headers` must find the
-            // key. Route through the SAME `canonical_header` the Server
-            // inbound path uses (its  table is pinned by
-            // `canonical_header_matches_go_canonical_mime_key`).
-            headers.insert(
-                crate::http_header::canonical_header(k.as_str()),
-                s.to_string(),
-            );
-        }
-    }
+    let headers = match response_header_dict(&resp) {
+        Ok(headers) => headers,
+        Err(refusal) => return IpeResult::Err(refusal.response_text().to_owned().into()),
+    };
     let body = match read_body_capped::<E>(resp).await {
         IpeResult::Ok(b) => b,
         IpeResult::Err(e) => return IpeResult::Err(e),
@@ -633,6 +649,21 @@ async fn do_request<E: From<String> + FromLimitExceeded + Send + 'static>(
         body,
         headers,
     })
+}
+
+/// The program-visible header dict of `resp`, through the shared header fold.
+///
+/// Keys take the canonical case the Server request dict uses, so
+/// `Dict.get "Content-Type" resp.headers` finds the key reqwest lower-cases.
+#[cfg(not(target_arch = "wasm32"))]
+fn response_header_dict(
+    resp: &reqwest::Response,
+) -> Result<HashMap<String, String>, crate::http_header::HeaderRefusal> {
+    crate::http_header::response_headers(
+        resp.headers()
+            .iter()
+            .map(|(name, value)| (name.as_str(), value.as_bytes())),
+    )
 }
 
 /// Default cap on a buffered HTTP response body (`Http.get`/`post`/`request`):
@@ -654,10 +685,7 @@ const HTTP_BODY_CEILING: crate::system::EnvCeiling = crate::system::EnvCeiling::
 );
 
 /// The buffered-body cap, refused as `http: …` when the variable is malformed.
-#[cfg(any(
-    not(target_arch = "wasm32"),
-    all(target_arch = "wasm32", feature = "wasm-client")
-))]
+#[cfg(not(target_arch = "wasm32"))]
 fn http_body_cap() -> Result<usize, String> {
     HTTP_BODY_CEILING
         .read()
@@ -735,7 +763,7 @@ async fn read_body_within<E: From<String> + FromLimitExceeded + Send + 'static>(
 /// the typed argument is the defence-in-depth guard at the API boundary, not a
 /// replacement for the runtime floor.
 #[cfg(not(target_arch = "wasm32"))]
-pub fn http_get<E: From<String> + FromLimitExceeded + Send + 'static>(
+pub fn http_get<E: From<String> + FromLimitExceeded + FromIpeError + Send + 'static>(
     url: crate::url::Url,
 ) -> IpeTask<E, HttpResponse> {
     Box::pin(do_request(HttpRequest {
@@ -754,7 +782,7 @@ pub fn http_get<E: From<String> + FromLimitExceeded + Send + 'static>(
 /// canonical serialization as the transport target. The runtime SSRF floor is
 /// unchanged.
 #[cfg(not(target_arch = "wasm32"))]
-pub fn http_post<E: From<String> + FromLimitExceeded + Send + 'static>(
+pub fn http_post<E: From<String> + FromLimitExceeded + FromIpeError + Send + 'static>(
     url: crate::url::Url,
     body: String,
 ) -> IpeTask<E, HttpResponse> {
@@ -770,7 +798,7 @@ pub fn http_post<E: From<String> + FromLimitExceeded + Send + 'static>(
 
 /// Http.request : HttpRequest -> Task Error HttpResponse
 #[cfg(not(target_arch = "wasm32"))]
-pub fn http_request<E: From<String> + FromLimitExceeded + Send + 'static>(
+pub fn http_request<E: From<String> + FromLimitExceeded + FromIpeError + Send + 'static>(
     req: HttpRequest,
 ) -> IpeTask<E, HttpResponse> {
     Box::pin(do_request(req))
@@ -832,8 +860,142 @@ fn query_refusal_error(refusal: crate::encoding::QueryRefusal) -> crate::error::
 //     reuse case is gone — spec's own stated tie-breaker).
 //
 // CORS blocks, network errors, and timeouts all reject the `fetch` Promise
-// rather than trapping the instance; every rejection here routes through the
-// SAME generic `Task.fail` arm — never a panic, never a silent drop.
+// rather than trapping the instance; every rejection here becomes one
+// fixed-text `FetchFailure` — never a panic, never a silent drop, never the
+// browser's own error text.
+
+/// A browser fetch target, parsed once: an `http` or `https` URL with a host
+/// and no user name or password.
+///
+/// The browser's `fetch` throws on a URL carrying credentials, and the thrown
+/// value's text echoes the URL, credentials included. Parsing here keeps every
+/// such URL out of `fetch` altogether, so no error text can carry it.
+#[cfg(any(test, all(target_arch = "wasm32", feature = "wasm-client")))]
+struct FetchTarget(String);
+
+#[cfg(any(test, all(target_arch = "wasm32", feature = "wasm-client")))]
+impl FetchTarget {
+    /// Parses `raw` into a target the browser will take.
+    ///
+    /// # Errors
+    ///
+    /// [`FetchFailure::InvalidUrl`] when `raw` does not parse or has no host,
+    /// [`FetchFailure::CredentialsInUrl`] when it carries a user name or a
+    /// password, [`FetchFailure::Scheme`] when its scheme is not `http(s)`.
+    fn parse(raw: &str) -> Result<Self, FetchFailure> {
+        let Ok(parsed) = ::url::Url::parse(raw) else {
+            return Err(FetchFailure::InvalidUrl);
+        };
+        if !parsed.username().is_empty() || parsed.password().is_some() {
+            return Err(FetchFailure::CredentialsInUrl);
+        }
+        if !matches!(parsed.scheme(), "http" | "https") {
+            return Err(FetchFailure::Scheme);
+        }
+        if parsed.host_str().is_none() {
+            return Err(FetchFailure::InvalidUrl);
+        }
+        Ok(Self(parsed.into()))
+    }
+
+    /// The target as the browser receives it.
+    fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// Every way a browser fetch fails, each shown as a fixed text.
+///
+/// No variant carries the URL, a header, or anything the browser said: the
+/// JavaScript value a rejected `fetch` or a refused `Request` carries echoes
+/// the request, so it is matched on and dropped, never formatted.
+#[cfg(any(test, all(target_arch = "wasm32", feature = "wasm-client")))]
+#[derive(Debug)]
+enum FetchFailure {
+    /// The URL does not parse or has no host.
+    InvalidUrl,
+    /// The URL carries a user name or a password.
+    CredentialsInUrl,
+    /// The URL's scheme is not `http` or `https`.
+    Scheme,
+    /// A request header has a name the browser refuses.
+    InvalidHeaderName,
+    /// The request deadline is outside the admitted range.
+    BadTimeout(TimeoutRefusal),
+    /// `IPE_HTTP_MAX_BODY_BYTES` is present but malformed.
+    BodyCeiling(crate::system::EnvCeilingRefusal),
+    /// The browser refused to build the request.
+    BrowserRefusedRequest,
+    /// The deadline fired before the response headers arrived.
+    TimedOut,
+    /// The fetch was rejected without the deadline firing.
+    NetworkOrCors,
+    /// The fetch settled with a value that is not a `Response`.
+    NotAResponse,
+    /// There is no window, so this is not a browser context.
+    NoWindow,
+    /// The browser cannot build a `Headers` object.
+    HeadersUnavailable,
+    /// The browser cannot build the `AbortController` that carries the
+    /// request deadline, so the request is refused rather than sent unbounded.
+    DeadlineUnavailable,
+    /// The response headers have no one program-visible reading.
+    ResponseHeaders(crate::http_header::HeaderRefusal),
+}
+
+#[cfg(any(test, all(target_arch = "wasm32", feature = "wasm-client")))]
+impl std::fmt::Display for FetchFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidUrl => f.write_str("http: the URL does not parse or has no host"),
+            Self::CredentialsInUrl => f.write_str(
+                "http: the URL carries a user name or password; the browser refuses it — send \
+                 credentials in a header",
+            ),
+            Self::Scheme => f.write_str("http: the URL's scheme is not http/https"),
+            Self::InvalidHeaderName => f.write_str("http: a request header has an invalid name"),
+            Self::BadTimeout(refusal) => write!(f, "http: timeout: {refusal}"),
+            Self::BodyCeiling(refusal) => write!(f, "http: {refusal}"),
+            Self::BrowserRefusedRequest => f.write_str("http: the browser refused the request"),
+            Self::TimedOut => f.write_str("http: the request timed out"),
+            Self::NetworkOrCors => f.write_str("http: fetch failed (network error or CORS block)"),
+            Self::NotAResponse => f.write_str("http: fetch did not return a Response"),
+            Self::NoWindow => f.write_str("http: no window (not a browser context?)"),
+            Self::HeadersUnavailable => f.write_str("http: failed to build request headers"),
+            Self::DeadlineUnavailable => {
+                f.write_str("http: the browser cannot arm the request deadline")
+            }
+            Self::ResponseHeaders(refusal) => f.write_str(refusal.response_text()),
+        }
+    }
+}
+
+#[cfg(any(test, all(target_arch = "wasm32", feature = "wasm-client")))]
+impl FetchFailure {
+    /// This failure as the task's error: a refused input is `InvalidInput`,
+    /// a transport failure keeps the sink's default kind.
+    fn into_error<E: From<String> + FromIpeError>(self) -> E {
+        let text = self.to_string();
+        match self {
+            Self::InvalidUrl
+            | Self::CredentialsInUrl
+            | Self::Scheme
+            | Self::InvalidHeaderName
+            | Self::BadTimeout(_)
+            | Self::BodyCeiling(_) => {
+                E::from_ipe_error(crate::error::IpeError::invalid_input(text))
+            }
+            Self::BrowserRefusedRequest
+            | Self::TimedOut
+            | Self::NetworkOrCors
+            | Self::NotAResponse
+            | Self::NoWindow
+            | Self::HeadersUnavailable
+            | Self::DeadlineUnavailable
+            | Self::ResponseHeaders(_) => text.into(),
+        }
+    }
+}
 
 // The browser `fetch` substitute is gated on `all(wasm32, wasm-client)`, never a
 // bare `wasm32`: the co-located WASI target (`wasm32-wasip1`, `wasm-client` off)
@@ -842,32 +1004,33 @@ fn query_refusal_error(refusal: crate::encoding::QueryRefusal) -> crate::error::
 // and fail cargo. `http_client` is not WASI-viable (reqwest is native-only), so
 // on WASI this whole substitute stays absent and no kernel references it.
 #[cfg(all(target_arch = "wasm32", feature = "wasm-client"))]
-async fn do_fetch<E: From<String> + FromLimitExceeded + 'static>(
+async fn do_fetch<E: From<String> + FromLimitExceeded + FromIpeError + 'static>(
     req: HttpRequest,
 ) -> IpeResult<E, HttpResponse> {
     use wasm_bindgen::{JsCast, JsValue};
     use wasm_bindgen_futures::JsFuture;
 
-    let window = match web_sys::window() {
-        Some(w) => w,
-        None => {
-            return IpeResult::Err(
-                "http: no window (not a browser context?)"
-                    .to_string()
-                    .into(),
-            );
-        }
+    // Both parses come first: a URL the browser would throw on, or a deadline
+    // outside the admitted range, never reaches `fetch`.
+    let target = match FetchTarget::parse(&req.url) {
+        Ok(target) => target,
+        Err(failure) => return IpeResult::Err(failure.into_error()),
+    };
+    let timeout = match TransportTimeout::parse(req.timeout) {
+        Ok(timeout) => timeout,
+        Err(refusal) => return IpeResult::Err(FetchFailure::BadTimeout(refusal).into_error()),
     };
 
-    let headers = match web_sys::Headers::new() {
-        Ok(h) => h,
-        Err(_) => {
-            return IpeResult::Err("http: failed to build request headers".to_string().into());
-        }
+    let Some(window) = web_sys::window() else {
+        return IpeResult::Err(FetchFailure::NoWindow.into_error());
+    };
+
+    let Ok(headers) = web_sys::Headers::new() else {
+        return IpeResult::Err(FetchFailure::HeadersUnavailable.into_error());
     };
     for (k, v) in &req.headers {
         if headers.set(k, v).is_err() {
-            return IpeResult::Err(format!("http: invalid header {k:?}").into());
+            return IpeResult::Err(FetchFailure::InvalidHeaderName.into_error());
         }
     }
 
@@ -884,56 +1047,62 @@ async fn do_fetch<E: From<String> + FromLimitExceeded + 'static>(
     }
 
     // Timeout via `AbortController` — the browser analogue of the native
-    // request deadline. A fired abort rejects the fetch Promise, routed
-    // through the same generic transport-error arm below (never a trap).
-    let controller = web_sys::AbortController::new().ok();
-    let _timeout_handle = controller.as_ref().map(|ctl| {
-        init.set_signal(Some(&ctl.signal()));
-        let timeout_ms = if req.timeout > 0 { req.timeout } else { 30_000 };
-        let ctl = ctl.clone();
-        gloo_timers::callback::Timeout::new(timeout_ms.max(0) as u32, move || {
-            ctl.abort();
-        })
+    // request deadline. A fired abort rejects the fetch Promise; the signal's
+    // aborted flag then tells a deadline from a network or CORS failure. With
+    // no controller there is no deadline, so the request is never sent.
+    let Ok(controller) = web_sys::AbortController::new() else {
+        return IpeResult::Err(FetchFailure::DeadlineUnavailable.into_error());
+    };
+    init.set_signal(Some(&controller.signal()));
+    let abort = controller.clone();
+    let _timeout_handle = gloo_timers::callback::Timeout::new(timeout.millis(), move || {
+        abort.abort();
     });
 
-    let request = match web_sys::Request::new_with_str_and_init(&req.url, &init) {
-        Ok(r) => r,
-        Err(e) => return IpeResult::Err(format!("http: bad request: {:?}", e).into()),
+    // The browser's thrown value is dropped unread: its text echoes the URL.
+    let Ok(request) = web_sys::Request::new_with_str_and_init(target.as_str(), &init) else {
+        return IpeResult::Err(FetchFailure::BrowserRefusedRequest.into_error());
     };
 
     let resp_value = match JsFuture::from(window.fetch_with_request(&request)).await {
         Ok(v) => v,
-        Err(e) => {
-            return IpeResult::Err(
-                format!(
-                    "http: fetch failed (network error, CORS block, or timeout): {:?}",
-                    e
-                )
-                .into(),
-            );
+        Err(_) => {
+            let failure = if controller.signal().aborted() {
+                FetchFailure::TimedOut
+            } else {
+                FetchFailure::NetworkOrCors
+            };
+            return IpeResult::Err(failure.into_error());
         }
     };
-    let resp: web_sys::Response = match resp_value.dyn_into() {
-        Ok(r) => r,
-        Err(_) => {
-            return IpeResult::Err("http: fetch did not return a Response".to_string().into());
-        }
+    let Ok(resp) = resp_value.dyn_into::<web_sys::Response>() else {
+        return IpeResult::Err(FetchFailure::NotAResponse.into_error());
     };
 
     let status = i64::from(resp.status());
 
-    let mut out_headers = HashMap::new();
+    // The browser has already combined repeated headers, so the fold sees each
+    // name once; it still applies the arity table and the byte check.
+    let mut pairs: Vec<(String, String)> = Vec::new();
     if let Ok(Some(iter)) = js_sys::try_iter(resp.headers().as_ref()) {
         for entry in iter.flatten() {
             if let Ok(pair) = entry.dyn_into::<js_sys::Array>() {
                 let k = pair.get(0).as_string().unwrap_or_default();
                 let v = pair.get(1).as_string().unwrap_or_default();
                 if !k.is_empty() {
-                    out_headers.insert(crate::http_header::canonical_header(&k), v);
+                    pairs.push((k, v));
                 }
             }
         }
     }
+    let out_headers = match crate::http_header::response_headers(
+        pairs.iter().map(|(k, v)| (k.as_str(), v.as_bytes())),
+    ) {
+        Ok(headers) => headers,
+        Err(refusal) => {
+            return IpeResult::Err(FetchFailure::ResponseHeaders(refusal).into_error());
+        }
+    };
 
     // Stream the body incrementally with a running cap so an untrusted (or
     // upstream-controlled) response is BOUNDED BY CONSTRUCTION — never fully
@@ -941,13 +1110,13 @@ async fn do_fetch<E: From<String> + FromLimitExceeded + 'static>(
     // `read_body_capped` incremental floor. `content_length()` is unreliable in a
     // browser (absent under transfer-encoding, or a lie), so the load-bearing
     // guard is the per-chunk cap in the loop, not a header pre-check.
-    let cap = match http_body_cap() {
+    let cap = match HTTP_BODY_CEILING.read() {
         Ok(cap) => cap,
-        Err(e) => return IpeResult::Err(e.into()),
+        Err(refusal) => return IpeResult::Err(FetchFailure::BodyCeiling(refusal).into_error()),
     };
     let body = match read_wasm_body_capped(&resp, cap).await {
         Ok(b) => b,
-        Err(e) => return IpeResult::Err(e),
+        Err(body_refusal) => return IpeResult::Err(body_refusal),
     };
 
     ok_res(HttpResponse {
@@ -1024,7 +1193,7 @@ async fn read_wasm_body_capped<E: From<String> + FromLimitExceeded>(
 
 /// Http.get : Url -> Task Error HttpResponse (browser substitute)
 #[cfg(all(target_arch = "wasm32", feature = "wasm-client"))]
-pub fn http_get<E: From<String> + FromLimitExceeded + 'static>(
+pub fn http_get<E: From<String> + FromLimitExceeded + FromIpeError + 'static>(
     url: crate::url::Url,
 ) -> IpeTask<E, HttpResponse> {
     Box::pin(do_fetch(HttpRequest {
@@ -1039,7 +1208,7 @@ pub fn http_get<E: From<String> + FromLimitExceeded + 'static>(
 
 /// Http.post : Url -> String -> Task Error HttpResponse (browser substitute)
 #[cfg(all(target_arch = "wasm32", feature = "wasm-client"))]
-pub fn http_post<E: From<String> + FromLimitExceeded + 'static>(
+pub fn http_post<E: From<String> + FromLimitExceeded + FromIpeError + 'static>(
     url: crate::url::Url,
     body: String,
 ) -> IpeTask<E, HttpResponse> {
@@ -1055,7 +1224,7 @@ pub fn http_post<E: From<String> + FromLimitExceeded + 'static>(
 
 /// Http.request : HttpRequest -> Task Error HttpResponse (browser substitute)
 #[cfg(all(target_arch = "wasm32", feature = "wasm-client"))]
-pub fn http_request<E: From<String> + FromLimitExceeded + 'static>(
+pub fn http_request<E: From<String> + FromLimitExceeded + FromIpeError + 'static>(
     req: HttpRequest,
 ) -> IpeTask<E, HttpResponse> {
     Box::pin(do_fetch(req))
@@ -1069,6 +1238,243 @@ mod tests {
     #[test]
     fn env_ceilings_honour_the_shared_contract() {
         crate::system::assert_env_ceiling_contract(HTTP_BODY_CEILING);
+    }
+
+    // ── Browser fetch target and fixed-text failures ─────────────────────────
+
+    /// Every `FetchFailure` variant, one each.
+    fn every_fetch_failure() -> Vec<FetchFailure> {
+        let refused_ceiling = HTTP_BODY_CEILING.parse_as::<usize>(Ok("junk".to_owned()));
+        assert!(refused_ceiling.is_err(), "a malformed ceiling is refused");
+        let Err(ceiling) = refused_ceiling else {
+            return Vec::new();
+        };
+        vec![
+            FetchFailure::InvalidUrl,
+            FetchFailure::CredentialsInUrl,
+            FetchFailure::Scheme,
+            FetchFailure::InvalidHeaderName,
+            FetchFailure::BadTimeout(TimeoutRefusal::NotPositive),
+            FetchFailure::BodyCeiling(ceiling),
+            FetchFailure::BrowserRefusedRequest,
+            FetchFailure::TimedOut,
+            FetchFailure::NetworkOrCors,
+            FetchFailure::NotAResponse,
+            FetchFailure::NoWindow,
+            FetchFailure::HeadersUnavailable,
+            FetchFailure::DeadlineUnavailable,
+            FetchFailure::ResponseHeaders(crate::http_header::HeaderRefusal::DuplicateSingleton),
+        ]
+    }
+
+    /// The position of `failure`'s variant.
+    ///
+    /// A new variant fails to build here until it is given a position and a
+    /// place in [`every_fetch_failure`].
+    const fn fetch_failure_position(failure: &FetchFailure) -> usize {
+        match failure {
+            FetchFailure::InvalidUrl => 0,
+            FetchFailure::CredentialsInUrl => 1,
+            FetchFailure::Scheme => 2,
+            FetchFailure::InvalidHeaderName => 3,
+            FetchFailure::BadTimeout(_) => 4,
+            FetchFailure::BodyCeiling(_) => 5,
+            FetchFailure::BrowserRefusedRequest => 6,
+            FetchFailure::TimedOut => 7,
+            FetchFailure::NetworkOrCors => 8,
+            FetchFailure::NotAResponse => 9,
+            FetchFailure::NoWindow => 10,
+            FetchFailure::HeadersUnavailable => 11,
+            FetchFailure::DeadlineUnavailable => 12,
+            FetchFailure::ResponseHeaders(_) => 13,
+        }
+    }
+
+    #[test]
+    fn fetch_target_refuses_userinfo() {
+        for raw in [
+            "https://u:hunter2@x.example/",
+            "https://u@x.example/",
+            "https://:hunter2@x.example/",
+            "http://u:hunter2@127.0.0.1:8080/p",
+        ] {
+            assert!(
+                matches!(FetchTarget::parse(raw), Err(FetchFailure::CredentialsInUrl)),
+                "{raw:?} must be refused for its credentials"
+            );
+        }
+    }
+
+    #[test]
+    fn fetch_target_refuses_ws_scheme() {
+        for raw in [
+            "ws://x.example/",
+            "wss://x.example/",
+            "ftp://x.example/",
+            "file:///etc/passwd",
+        ] {
+            assert!(
+                matches!(FetchTarget::parse(raw), Err(FetchFailure::Scheme)),
+                "{raw:?} must be refused for its scheme"
+            );
+        }
+    }
+
+    #[test]
+    fn fetch_target_refuses_what_does_not_parse() {
+        for raw in ["", "not a url", "/relative/path", "https://"] {
+            assert!(
+                matches!(FetchTarget::parse(raw), Err(FetchFailure::InvalidUrl)),
+                "{raw:?} must be refused as no URL"
+            );
+        }
+    }
+
+    #[test]
+    fn fetch_target_admits_plain_https() {
+        for (raw, shown) in [
+            ("https://api.example/v1?q=1", "https://api.example/v1?q=1"),
+            ("http://API.example", "http://api.example/"),
+            (
+                "https://api.example/?email=a@example.com",
+                "https://api.example/?email=a@example.com",
+            ),
+        ] {
+            let parsed = FetchTarget::parse(raw);
+            assert!(parsed.is_ok(), "{raw:?} must be admitted");
+            let Ok(target) = parsed else { return };
+            assert_eq!(target.as_str(), shown);
+        }
+    }
+
+    #[test]
+    fn every_fetch_failure_text_is_fixed() {
+        let failures = every_fetch_failure();
+        let positions: Vec<usize> = failures.iter().map(fetch_failure_position).collect();
+        let expected: Vec<usize> = (0..=fetch_failure_position(&FetchFailure::ResponseHeaders(
+            crate::http_header::HeaderRefusal::DuplicateSingleton,
+        )))
+            .collect();
+        assert_eq!(positions, expected, "every variant appears once, in order");
+        for failure in &failures {
+            let shown = failure.to_string();
+            assert!(shown.starts_with("http: "), "{shown}");
+            assert!(!shown.contains("://"), "a URL in {shown}");
+            assert!(!shown.contains('@'), "userinfo in {shown}");
+        }
+    }
+
+    #[test]
+    fn a_refused_fetch_input_is_invalid_input_and_a_transport_failure_is_not() {
+        for failure in every_fetch_failure() {
+            let refused_input = matches!(
+                failure,
+                FetchFailure::InvalidUrl
+                    | FetchFailure::CredentialsInUrl
+                    | FetchFailure::Scheme
+                    | FetchFailure::InvalidHeaderName
+                    | FetchFailure::BadTimeout(_)
+                    | FetchFailure::BodyCeiling(_)
+            );
+            let shown = failure.to_string();
+            let crate::error::IpeError::Error(kind, info) =
+                failure.into_error::<crate::error::IpeError>();
+            assert_eq!(
+                kind == crate::error::IpeErrorKind::InvalidInput,
+                refused_input,
+                "{shown}"
+            );
+            assert_eq!(info.message, shown);
+        }
+    }
+
+    // ── Native request deadline ──────────────────────────────────────────────
+
+    /// A request for `url` under `timeout` milliseconds.
+    fn deadline_request(url: String, timeout: i64) -> HttpRequest {
+        HttpRequest {
+            body: String::new(),
+            headers: Vec::new(),
+            method: HttpMethod::Get,
+            redirects: RedirectPolicy::NoRedirects,
+            timeout,
+            url,
+        }
+    }
+
+    /// `req` sent with no deny-private gate and a resolver that is never asked.
+    async fn send_unrestricted(
+        req: HttpRequest,
+    ) -> IpeResult<crate::error::IpeError, HttpResponse> {
+        let gate = VettingResolver::new(
+            std::sync::Arc::new(crate::ssrf::test_resolvers::NoDns),
+            std::time::Duration::from_secs(5),
+        );
+        do_request_with(req, DialPolicy::AllowAll, gate).await
+    }
+
+    /// A deadline of zero, a negative one, or one past the ceiling is refused.
+    ///
+    /// The refusal is `InvalidInput` and comes before any dial: the listener
+    /// the URL names sees no connection.
+    #[tokio::test]
+    async fn an_inadmissible_deadline_is_refused_before_any_dial() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await;
+        assert!(listener.is_ok(), "bind loopback");
+        let Ok(listener) = listener else { return };
+        let addr = listener.local_addr();
+        assert!(addr.is_ok(), "listener address");
+        let Ok(addr) = addr else { return };
+        let over = i64::from(crate::transport_timeout::MAX_TRANSPORT_TIMEOUT_MS) + 1;
+        for timeout in [0, -1, i64::MIN, over, (1_i64 << 32) | 1] {
+            let sent =
+                send_unrestricted(deadline_request(format!("http://{addr}/"), timeout)).await;
+            assert!(
+                matches!(
+                    &sent,
+                    IpeResult::Err(crate::error::IpeError::Error(
+                        crate::error::IpeErrorKind::InvalidInput,
+                        info,
+                    )) if info.message.starts_with("http: timeout: a span")
+                ),
+                "timeout {timeout} must be refused as InvalidInput"
+            );
+        }
+        let dialled =
+            tokio::time::timeout(std::time::Duration::from_millis(100), listener.accept()).await;
+        assert!(dialled.is_err(), "a refused deadline must never dial");
+    }
+
+    /// A one-millisecond deadline against a silent listener fails, not hangs.
+    #[tokio::test]
+    async fn the_shortest_deadline_times_out_a_silent_listener() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await;
+        assert!(listener.is_ok(), "bind loopback");
+        let Ok(listener) = listener else { return };
+        let addr = listener.local_addr();
+        assert!(addr.is_ok(), "listener address");
+        let Ok(addr) = addr else { return };
+        // Accept and hold every connection open without ever replying.
+        let holder = tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((sock, _)) = listener.accept().await {
+                held.push(sock);
+            }
+        });
+        let sent = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            send_unrestricted(deadline_request(format!("http://{addr}/"), 1)),
+        )
+        .await;
+        holder.abort();
+        assert!(
+            matches!(
+                &sent,
+                Ok(IpeResult::Err(crate::error::IpeError::Error(kind, _)))
+                    if *kind != crate::error::IpeErrorKind::InvalidInput
+            ),
+            "the request must fail at its deadline, got {sent:?}"
+        );
     }
 
     #[test]
@@ -1091,33 +1497,6 @@ mod tests {
             assert!(!shown.contains(planted), "{planted} leaked: {shown}");
         }
         assert!(shown.contains("status: 200"), "{shown}");
-    }
-
-    /// Wiring seal: the response-header collection loop must route
-    /// every key through `http_header::canonical_header` (reqwest's
-    /// `HeaderName::as_str()` is always lower-case;  `net/http.Header` is
-    /// always canonical — `Dict.get "Content-Type"` parity depends on it).
-    /// `do_request` needs a live round-trip to test end-to-end, so this pins
-    /// the call's PRESENCE at the source level; the transform itself is
-    /// proven by `http_header`'s own  table test.
-    #[test]
-    fn response_header_loop_canonicalises_keys() {
-        let src = include_str!("http_client.rs");
-        let loop_marker = "for (k, v) in resp.headers()";
-        let start = src.find(loop_marker);
-        assert!(start.is_some(), "response-header loop not found");
-        let Some(start) = start else { return };
-        // Window sized to comfortably cover the loop body INCLUDING its doc
-        // comment (the canonicalisation call sits ~700 bytes past the marker).
-        let window = &src[start..src.len().min(start + 1600)];
-        assert!(
-            window.contains("canonical_header(k.as_str())"),
-            "response-header keys must be canonicalised (MIME canonical case)"
-        );
-        assert!(
-            !window.contains("insert(k.as_str().to_string()"),
-            "raw lower-case header-key insert reintroduced (#33 §6.1 regression)"
-        );
     }
 
     #[test]
@@ -1673,6 +2052,65 @@ mod tests {
                 }
             });
             addr
+        }
+
+        /// The header dict `reply` reads as, through the response fold.
+        async fn headers_of(
+            reply: &'static str,
+        ) -> Result<std::collections::HashMap<String, String>, crate::http_header::HeaderRefusal>
+        {
+            let addr = fixed_reply(reply).await;
+            let client = reqwest::Client::builder()
+                .no_proxy()
+                .build()
+                .expect("client builds");
+            let resp = client
+                .get(format!("http://{addr}/"))
+                .send()
+                .await
+                .expect("loopback reply");
+            super::super::response_header_dict(&resp)
+        }
+
+        /// A response repeating `Content-Type` is refused with a fixed text that
+        /// names no header; one copy reads under its canonical key.
+        #[tokio::test]
+        async fn response_duplicate_content_type_refused() {
+            const TWICE: &str = "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Type: text/html\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+            const ONCE: &str = "HTTP/1.1 200 OK\r\ncontent-type: text/plain\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+            let refused = headers_of(TWICE).await;
+            assert_eq!(
+                refused,
+                Err(crate::http_header::HeaderRefusal::DuplicateSingleton)
+            );
+            let text = crate::http_header::HeaderRefusal::DuplicateSingleton.response_text();
+            assert!(!text.contains("Content-Type"), "refusal names no header");
+            let once = headers_of(ONCE).await.expect("one copy is admitted");
+            assert_eq!(
+                once.get("Content-Type").map(String::as_str),
+                Some("text/plain")
+            );
+        }
+
+        /// A response header value outside visible ASCII refuses the response,
+        /// never vanishes from the dict.
+        #[tokio::test]
+        async fn response_non_ascii_header_refused() {
+            const NON_ASCII: &str = "HTTP/1.1 200 OK\r\nX-Note: caf\u{e9}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+            assert_eq!(
+                headers_of(NON_ASCII).await,
+                Err(crate::http_header::HeaderRefusal::NotVisibleAscii)
+            );
+        }
+
+        /// List headers combine in arrival order; repeated `Set-Cookie` keeps
+        /// the last copy.
+        #[tokio::test]
+        async fn response_list_headers_combine_and_set_cookie_keeps_last() {
+            const REPLY: &str = "HTTP/1.1 200 OK\r\nVia: 1.1 a\r\nVia: 1.1 b\r\nSet-Cookie: a=1\r\nSet-Cookie: b=2\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+            let headers = headers_of(REPLY).await.expect("list copies are admitted");
+            assert_eq!(headers.get("Via").map(String::as_str), Some("1.1 a, 1.1 b"));
+            assert_eq!(headers.get("Set-Cookie").map(String::as_str), Some("b=2"));
         }
 
         /// The body `reply` carries, read under a `cap`-byte ceiling.

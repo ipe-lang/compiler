@@ -51,6 +51,27 @@ fn run_with_regions(
     regions: BTreeMap<Span, Ty>,
     interner: &mut Interner,
 ) -> DResult<ipe_ir::Program> {
+    run_owned(defs, env, regions, Generics::default(), interner, unions)
+}
+
+/// The type checker's per-binding generic tables a hand-built program carries.
+#[derive(Default)]
+struct Generics {
+    /// Each binding's solver variable to its emitted generic name.
+    poly_var_map: BTreeMap<(Vec<Symbol>, Symbol), BTreeMap<ipe_types::SolverVar, Symbol>>,
+    /// Each binding's generics the checker message-defaulted.
+    msg_defaulted_vars: BTreeMap<(Vec<Symbol>, Symbol), std::collections::BTreeSet<Symbol>>,
+}
+
+/// Lower a hand-built module with explicit regions and per-binding generic tables.
+fn run_owned(
+    defs: Vec<canon::Def>,
+    env: BTreeMap<(Vec<Symbol>, Symbol), Ty>,
+    regions: BTreeMap<Span, Ty>,
+    generics: Generics,
+    interner: &mut Interner,
+    unions: Vec<canon::Union>,
+) -> DResult<ipe_ir::Program> {
     let m = canon::Module {
         imports_unsafe_submodule: false,
         imported_web_capabilities: std::collections::BTreeSet::new(),
@@ -67,9 +88,9 @@ fn run_with_regions(
         expected: BTreeMap::new(),
         bounds: BTreeMap::new(),
         warnings: Vec::new(),
-        poly_var_map: BTreeMap::new(),
+        poly_var_map: generics.poly_var_map,
         untyped_type_params: BTreeMap::new(),
-        msg_defaulted_vars: BTreeMap::new(),
+        msg_defaulted_vars: generics.msg_defaulted_vars,
         signature_wildcards: BTreeMap::new(),
     };
     // `lower` pairs its diagnostic with the owning def's `home`;
@@ -201,6 +222,84 @@ fn unannotated_fn_with_polymorphic_solved_type_fails_with_polymorphism() -> DRes
     Ok(())
 }
 
+/// Lower untyped `chip x = 0` solved as `String -> Html t`, where `row` owns the solver variable `t` as its generic `msg`.
+///
+/// `withheld` lists `row`'s generics the checker message-defaulted.
+fn lower_chip_reading_row_msg(withheld: &[&str], i: &mut Interner) -> DResult<ipe_ir::Program> {
+    let chip = i.intern("chip")?;
+    let row = i.intern("row")?;
+    let msg = i.intern("msg")?;
+    let x = i.intern("x")?;
+    let string = Ty::Con {
+        module: vec![],
+        name: i.intern("String")?,
+        args: vec![],
+    };
+    let html = Ty::Con {
+        module: vec![],
+        name: i.intern("Html")?,
+        args: vec![Ty::Var(ipe_types::tag_solver_var(5))],
+    };
+    let def = canon::Def::Untyped {
+        home: vec![],
+        name: Located::new(Span::new(10, 11), chip),
+        patterns: vec![Located::new(Span::new(12, 13), canon::Pattern_::PVar(x))],
+        body: int(Span::new(14, 15), 0),
+    };
+    let mut env = BTreeMap::new();
+    env.insert((vec![], chip), Ty::Fun(Box::new(string), Box::new(html)));
+    let mut generics = Generics::default();
+    generics.poly_var_map.insert(
+        (vec![], row),
+        BTreeMap::from([(ipe_types::SolverVar::from_var(5), msg)]),
+    );
+    let withheld = withheld
+        .iter()
+        .map(|w| i.intern(w))
+        .collect::<DResult<std::collections::BTreeSet<_>>>()?;
+    generics.msg_defaulted_vars.insert((vec![], row), withheld);
+    run_owned(vec![def], env, BTreeMap::new(), generics, i, Vec::new())
+}
+
+/// An untyped helper whose message slot is another binding's generic is refused by name.
+///
+/// The lenient message default would emit `chip` returning `Html<()>` while
+/// `row` emits the same variable as its own generic, so a `row` call to
+/// `chip` would not type-check under cargo.
+#[test]
+#[allow(clippy::expect_used)] // a failed precondition is the test failure
+fn untyped_helper_reading_a_sibling_msg_generic_is_refused() {
+    let mut i = Interner::new();
+    let d = lower_chip_reading_row_msg(&[], &mut i)
+        .expect_err("a foreign message generic must not lower to `Html<()>`");
+    assert_eq!(d.code(), IPE_L0102, "{d:?}");
+    assert_eq!(d.primary_span(), Span::new(10, 11), "{d:?}");
+    assert!(
+        matches!(
+            &d,
+            Diagnostic::Lower {
+                msg: LowerError::ForeignTypeVariable { helper, owner, var },
+                ..
+            } if &**helper == "chip" && &**owner == "row" && &**var == "msg"
+        ),
+        "expected ForeignTypeVariable(chip, row, msg), got {d:?}"
+    );
+}
+
+/// Control: a generic the owner message-defaulted is in no binding's index, so the helper lowers to `Html<()>`.
+#[test]
+#[allow(clippy::expect_used)] // a failed precondition is the test failure
+fn untyped_helper_reading_a_message_defaulted_var_lowers_to_unit_msg() {
+    let mut i = Interner::new();
+    let res = lower_chip_reading_row_msg(&["msg"], &mut i);
+    let func = single_func(&res).expect("a message-defaulted variable must lower");
+    assert!(
+        matches!(&func.ret, IrType::Ui { msg, .. } if **msg == IrType::Unit),
+        "expected `Html<()>`, got {:?}",
+        func.ret
+    );
+}
+
 /// An unannotated function with a fully-concrete solved type (`f x = 0`,
 /// solved as `Int -> Int`) lowers cleanly without a type annotation — the
 /// IPE-L0106 gate does not apply to monomorphic bindings.
@@ -233,7 +332,7 @@ fn unannotated_fn_with_concrete_solved_type_lowers_cleanly() -> DResult<()> {
     let func = single_func(&res)
         .expect("unannotated monomorphic fn must lower cleanly without a type annotation");
     assert_eq!(func.params.len(), 1, "one typed param expected: {res:?}");
-    let param_ty = func.params.first().map(|(_, t)| t);
+    let param_ty = func.params.first().map(|ipe_ir::Param { ty: t, .. }| t);
     assert_eq!(
         param_ty,
         Some(&IrType::Int),
@@ -272,7 +371,7 @@ fn wildcard_parameter_lowers_to_a_fresh_binder() -> DResult<()> {
         1,
         "one synthetic param expected: {res:?}"
     );
-    let param_ty = func.params.first().map(|(_, t)| t);
+    let param_ty = func.params.first().map(|ipe_ir::Param { ty: t, .. }| t);
     assert_eq!(param_ty, Some(&IrType::Int), "param type is the annotation");
     assert_eq!(func.ret, IrType::Int, "return type is the annotation tail");
     Ok(())
@@ -299,7 +398,9 @@ fn function_type_in_annotation_argument_lowers_to_fun() -> DResult<()> {
     };
     let res = run(Vec::new(), vec![def], BTreeMap::new(), &mut i);
     let func = single_func(&res);
-    let param_ty = func.and_then(|fc| fc.params.first()).map(|(_, t)| t);
+    let param_ty = func
+        .and_then(|fc| fc.params.first())
+        .map(|ipe_ir::Param { ty: t, .. }| t);
     assert_eq!(
         param_ty,
         Some(&IrType::Fun(vec![IrType::Int], Box::new(IrType::Int))),
@@ -333,11 +434,12 @@ fn parametric_annotation_lowers_to_generic_func() -> DResult<()> {
     let func = single_func(&res);
     assert_eq!(
         func.map(|f| f.type_params.clone()),
-        Some(vec![(a, BoundSet::UNBOUNDED)]),
-        "identity quantifies exactly [a], unbounded: {res:?}"
+        Some(vec![(a, BoundSet::UNBOUNDED.with_clone())]),
+        "identity quantifies exactly [a], bounded by `Clone` only: {res:?}"
     );
     assert_eq!(
-        func.and_then(|f| f.params.first()).map(|(_, t)| t),
+        func.and_then(|f| f.params.first())
+            .map(|ipe_ir::Param { ty: t, .. }| t),
         Some(&IrType::Generic(a)),
         "the parameter type lowers to Generic(a): {res:?}"
     );
@@ -464,7 +566,7 @@ fn named_type_var_in_nested_return_lowers_cleanly() -> DResult<()> {
     );
     assert_eq!(
         func.type_params,
-        vec![(a, BoundSet::UNBOUNDED)],
+        vec![(a, BoundSet::UNBOUNDED.with_clone())],
         "quantifies exactly the named var [a]: {res:?}"
     );
     Ok(())
@@ -516,7 +618,7 @@ fn threaded_param_wildcard_any_concretizes_from_region() -> DResult<()> {
     let func = single_func(&res).expect("`thread : any -> any` must lower cleanly");
     assert_eq!(
         func.params,
-        vec![(x, IrType::Str)],
+        vec![ipe_ir::Param::owned(x, IrType::Str)],
         "the threaded parameter concretizes to the return's type (`String`): {res:?}"
     );
     assert_eq!(
@@ -574,7 +676,7 @@ fn unthreaded_param_wildcard_any_stays_generic() -> DResult<()> {
     let func = single_func(&res).expect("`constFn : any -> any` must lower cleanly");
     // The parameter stays a generic (its own minted `any` symbol); the return is
     // the concrete body type.
-    let (_, param_ty) = func.params.first().expect("one parameter");
+    let ipe_ir::Param { ty: param_ty, .. } = func.params.first().expect("one parameter");
     assert!(
         matches!(param_ty, IrType::Generic(_)),
         "an unthreaded parameter `any` stays generic: {res:?}"

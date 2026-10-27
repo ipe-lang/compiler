@@ -89,7 +89,10 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::output_dir::{EmitTarget, OutputRefusal, OwnedDir, ProjectPaths};
-use crate::project;
+use crate::package_manifest::PACKAGE_IPE;
+use crate::project_root::{ProjectRoot, RootArg, SourceDir};
+use crate::source_snapshot::{Limits, SourceOrigin, SourceSnapshot};
+use crate::target_dir::LinkableTargetDir;
 use crate::text;
 use crate::threads::{self, ThreadRole};
 use crate::{CliError, write_emitted_project};
@@ -205,11 +208,13 @@ pub struct WatchOptions {
     /// once from the environment (see [`crate::hot_appearance_enabled`]).
     pub hot_appearance: bool,
     /// Optional cargo target directory the rebuild's `cargo build` is pinned to.
-    /// `None` (the CLI default) leaves the build to honour an inherited
-    /// `CARGO_TARGET_DIR`, exactly as before. An embedder sets it to pin the
-    /// build to a specific — typically warm — target so a rebuild links against
-    /// a pre-compiled dependency tree instead of cold-building it; the E2E watch
-    /// suite uses it to forward the CI shard's warm shared target.
+    /// `None` (the CLI default) lets the session resolve it as every build does
+    /// (an inherited `CARGO_TARGET_DIR`, a pin, or the crate's own). An embedder
+    /// sets it to pin the build to a specific — typically warm — target so a
+    /// rebuild links against a pre-compiled dependency tree instead of
+    /// cold-building it; the E2E watch suite uses it to forward the CI shard's
+    /// warm shared target. Either way it is parsed for the host linker once per
+    /// session, before the first rebuild.
     pub target_dir: Option<PathBuf>,
     /// The proven target `out_dir` names, when the caller holds one.
     ///
@@ -442,50 +447,34 @@ impl RebuildTimings {
 /// of immediately compiled, so `ipe dev watch` can re-resolve on every settled
 /// batch and feed the result through a WARM, reused database via
 /// `ipe_db::LongLivedDb` rather than constructing a fresh one per
-/// build. Deliberately mirrors `run_build`'s own manifest-resolution
-/// dispatch (`crates/ipe/src/lib.rs`) without touching that code — the
-/// one-shot entry points stay exactly as tested by the golden suite; this
-/// is an independent, read-only duplicate of the RESOLUTION step only (no
-/// compiler stage runs here).
+/// build. Only the RESOLUTION step runs here (no compiler stage), over the
+/// one project root a build of the same directory resolves.
 pub(crate) struct ResolvedProject {
-    pub(crate) sources: BTreeMap<Vec<String>, (PathBuf, String)>,
-    pub(crate) discovered: Vec<project::DiscoveredModule>,
+    /// The held project root every path below derives from.
+    pub(crate) root: ProjectRoot,
+    /// Every module the build sees, read once through `root`'s held handles:
+    /// the `src/` modules, the stdlib closure and the FFI interfaces, each
+    /// tagged with its origin, over the catalog read through `root.cache_dir()`.
+    pub(crate) snapshot: SourceSnapshot,
     pub(crate) entry_path: Vec<String>,
-    pub(crate) blame_path: PathBuf,
-    pub(crate) db_driver: ipe_backend_rust::DbDriver,
-    /// The `[wasm] publicEnv` allowlist (empty for the no-manifest loose-file
-    /// path — there is no manifest to declare one).
-    pub(crate) wasm_public_env: Vec<String>,
-    /// The manifest's `browser.basePath` (the root for the no-manifest
-    /// loose-file path).
-    pub(crate) mount_base: ipe_backend_rust::MountBase,
-    /// The sanitized Cargo package name for the emitted crate (from `package.ipe`
-    /// name via [`ipe_backend_rust::sanitize_cargo_name`]). Empty string
-    /// when no manifest is present (sibling-discovery path uses `"ipe-app"`).
-    pub(crate) cargo_name: String,
     /// What the confined watcher observes for this snapshot.
     pub(crate) scope: ScopeSpec,
 }
 
-/// The inputs a [`ipe_watch::WatchScope`] is built from, per project shape.
+impl ResolvedProject {
+    /// The file a cross-module diagnostic with no single owner is charged to: the manifest.
+    fn blame_path(&self) -> PathBuf {
+        self.root.path().join(PACKAGE_IPE)
+    }
+}
+
+/// The inputs a [`ipe_watch::WatchScope`] is built from: the project directory, watched recursively.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum ScopeSpec {
-    /// A manifest project: the manifest's directory, watched recursively.
-    Package {
-        /// The manifest's directory.
-        root: PathBuf,
-        /// Every module file the bounded module discovery found.
-        source_files: Vec<PathBuf>,
-    },
-    /// A loose file: the entry and the sibling module files its import closure probes.
-    LooseFile {
-        /// The entry `.ipe` file as given on the command line.
-        entry: PathBuf,
-        /// Every probed module file, relative to the entry's directory.
-        module_files: Vec<PathBuf>,
-        /// Every module file the build loaded, relative to the entry's directory.
-        loaded_files: Vec<PathBuf>,
-    },
+pub(crate) struct ScopeSpec {
+    /// The project directory.
+    pub(crate) root: PathBuf,
+    /// Every `src/` module file of the snapshot.
+    pub(crate) source_files: Vec<PathBuf>,
 }
 
 impl ScopeSpec {
@@ -494,107 +483,53 @@ impl ScopeSpec {
     /// # Errors
     /// [`ipe_watch::ScopeError`] when the root is missing or the scope is too large.
     fn build(&self) -> Result<ipe_watch::WatchScope, ipe_watch::ScopeError> {
-        match self {
-            Self::Package { root, source_files } => {
-                ipe_watch::WatchScope::build(root, root, source_files)
-            }
-            Self::LooseFile {
-                entry,
-                module_files,
-                loaded_files,
-            } => ipe_watch::WatchScope::loose_file(entry, module_files, loaded_files),
-        }
+        ipe_watch::WatchScope::build(&self.root, &self.root, &self.source_files)
     }
 }
 
-/// Resolve `entry` (a `.ipe` file or a project directory) into a fresh
-/// [`ResolvedProject`] by re-reading every relevant file from disk. Mirrors
-/// `run_build`'s dispatch: directory → `package.ipe` inside it; `.ipe` → walk
-/// up for a manifest, else the loose-file import closure
-/// ([`crate::loose_file::resolve_loose_file`]).
+/// Resolve the modules of the held project `root` into a fresh [`ResolvedProject`].
 ///
-/// `entry_text_override`, when given, shadows the entry `.ipe` file's disk
-/// bytes in the no-manifest branch. `ipe dev watch` always passes `None` (disk
-/// is its truth).
+/// The modules are the [`SourceSnapshot`] `ipe dev build` reads for the same
+/// root: every component is opened beneath the root's held handles, a link
+/// anywhere in the tree is refused, and the FFI catalog is read through the
+/// root's held cache directory. No directory above or below the root is
+/// searched for a manifest, and no module is read again by path.
 ///
 /// # Errors
-/// [`CliError::Io`] on any filesystem failure; [`CliError::Pipeline`] if the
-/// entry file itself fails to parse (needed only to learn its imports in the
-/// no-manifest case); [`CliError::DiscoveryLimitReached`] when a loose
-/// file's import closure is too large.
-pub(crate) fn resolve_project_sources(
-    entry: &Path,
-    entry_text_override: Option<&str>,
-) -> Result<ResolvedProject, CliError> {
-    let manifest_path = if entry.is_dir() {
-        match project::manifest_in_dir(entry) {
-            Some(manifest) => Some(manifest),
-            None if project::has_only_legacy_toml(entry) => {
-                return Err(CliError::Usage(text::msg::legacy_toml_hint()));
-            }
-            None => {
-                return Err(CliError::Usage(text::msg::watch_dir_no_manifest()));
-            }
-        }
-    } else {
-        crate::find_manifest_for_ipe_file(entry)?
+/// Every refusal of [`SourceSnapshot::read`]; [`CliError::EntryMissing`] when
+/// the manifest's program entry is not spelled relative to `src/`.
+pub(crate) fn resolve_project_sources(root: ProjectRoot) -> Result<ResolvedProject, CliError> {
+    let snapshot = SourceSnapshot::read(&root, Limits::DEFAULT)?;
+    // The entry defaults to `["Main"]`; a `programs` manifest routes its
+    // (default) program's declared entry file through instead. Named
+    // multi-program selection is a reported residual — see
+    // `misc/docs/package-programs-design.md`.
+    let entry_path = root.manifest().resolved_entry()?;
+    let source_files = snapshot
+        .modules()
+        .values()
+        .filter(|held| held.origin() == SourceOrigin::Own(SourceDir::Src))
+        .map(|held| held.path().to_path_buf())
+        .collect();
+    let scope = ScopeSpec {
+        root: root.path().to_path_buf(),
+        source_files,
     };
-
-    if let Some(manifest_path) = manifest_path {
-        let manifest = project::parse_manifest(&manifest_path)?;
-        let discovered = project::discover_modules(&manifest.src_root)?;
-        let mut sources: BTreeMap<Vec<String>, (PathBuf, String)> = BTreeMap::new();
-        for m in &discovered {
-            let src = crate::io_bounded::read_walked_source(m.path())?;
-            sources.insert(m.module_path().to_vec(), (m.path().to_path_buf(), src));
-        }
-        let cargo_name = ipe_backend_rust::sanitize_cargo_name(&manifest.name);
-        // The entry defaults to `["Main"]`; a `programs` manifest routes its
-        // (default) program's declared entry file through instead. Named
-        // multi-program selection is a reported residual — see
-        // `misc/docs/package-programs-design.md`.
-        let entry_path = manifest.resolved_entry()?;
-        let package_root = manifest_path
-            .parent()
-            .map_or_else(|| PathBuf::from("."), Path::to_path_buf);
-        let source_files = discovered.iter().map(|m| m.path().to_path_buf()).collect();
-        return Ok(ResolvedProject {
-            sources,
-            discovered,
-            entry_path,
-            blame_path: manifest_path,
-            db_driver: manifest.driver,
-            wasm_public_env: manifest.wasm.public_env.to_names(),
-            mount_base: manifest.delivery.browser.base,
-            cargo_name,
-            scope: ScopeSpec::Package {
-                root: package_root,
-                source_files,
-            },
-        });
-    }
-
-    // No manifest: the loose-file closure, the same one `ipe dev build` compiles.
-    let loaded = crate::loose_file::resolve_loose_file(
-        entry,
-        entry_text_override,
-        crate::loose_file::LooseFileLimits::DEFAULT,
-    )?;
     Ok(ResolvedProject {
-        sources: loaded.sources,
-        discovered: loaded.discovered,
-        entry_path: loaded.entry_module,
-        blame_path: entry.to_path_buf(),
-        db_driver: ipe_backend_rust::DbDriver::Sqlite,
-        wasm_public_env: Vec::new(),
-        mount_base: ipe_backend_rust::MountBase::root(),
-        cargo_name: String::new(),
-        scope: ScopeSpec::LooseFile {
-            entry: entry.to_path_buf(),
-            module_files: loaded.probed_files,
-            loaded_files: loaded.loaded_files,
-        },
+        root,
+        snapshot,
+        entry_path,
+        scope,
     })
+}
+
+/// The database origin of a snapshot module.
+const fn db_origin(origin: SourceOrigin) -> ipe_db::ModuleOrigin {
+    match origin {
+        SourceOrigin::Own(SourceDir::Src | SourceDir::Tests) => ipe_db::ModuleOrigin::User,
+        SourceOrigin::Stdlib => ipe_db::ModuleOrigin::EmbeddedStdlib,
+        SourceOrigin::FfiInterface => ipe_db::ModuleOrigin::FfiInterface,
+    }
 }
 
 /// The directories a scope hands the OS-level watcher.
@@ -604,58 +539,6 @@ fn watched_roots(scope: &ipe_watch::WatchScope) -> BTreeSet<PathBuf> {
         .iter()
         .map(|watched| watched.as_path().to_path_buf())
         .collect()
-}
-
-/// Rebuild a loose-file scope from a fresh snapshot so the watcher follows the current import closure.
-///
-/// Directories the new closure needs are watched before the swap and
-/// directories it dropped are unwatched after it; a package scope is
-/// recursive and never changes. A scope that fails to build keeps the
-/// previous one in force, and a directory that fails to watch is logged.
-/// Returns whether a directory was added: an event inside it between the
-/// snapshot's read and the watch taking effect went unobserved, so the
-/// caller resolves once more.
-///
-/// The scope lock is never held across a watcher call, since the watcher's
-/// event thread takes the same lock.
-fn rescope(
-    watcher: &mut notify::RecommendedWatcher,
-    shared: &RwLock<ipe_watch::WatchScope>,
-    spec: &ScopeSpec,
-) -> bool {
-    if matches!(spec, ScopeSpec::Package { .. }) {
-        return false;
-    }
-    let next = match spec.build() {
-        Ok(next) => next,
-        Err(e) => {
-            emit_watch_line(
-                &crate::style::TerminalSafe::sanitize(text::Message::relay(&e).as_str()),
-                WatchRole::Failure,
-            );
-            return false;
-        }
-    };
-    let previous = watched_roots(&shared.read().unwrap_or_else(PoisonError::into_inner));
-    let current = watched_roots(&next);
-    let mode = next.recursive_mode();
-    let mut added = false;
-    for dir in current.difference(&previous) {
-        match notify::Watcher::watch(watcher, dir, mode) {
-            Ok(()) => added = true,
-            Err(e) => emit_watch_line(
-                &crate::style::TerminalSafe::sanitize(
-                    text::msg::watch_path_failed(&dir.display(), &e).as_str(),
-                ),
-                WatchRole::Failure,
-            ),
-        }
-    }
-    *shared.write().unwrap_or_else(PoisonError::into_inner) = next;
-    for dir in previous.difference(&current) {
-        let _ = notify::Watcher::unwatch(watcher, dir);
-    }
-    added
 }
 
 /// One event on the orchestrator's unified channel. Carries a `generation`
@@ -724,6 +607,39 @@ const REBUILD_TARGET: ipe_ir::Target = ipe_ir::Target::Native;
 /// The intent every watch rebuild emits with: a development loop, so `Debug.*`
 /// is allowed.
 const REBUILD_INTENT: ipe_backend_rust::BuildIntent = crate::verb::Verb::DEV_WATCH.intent();
+
+/// The emit settings a watch rebuild of `resolved` folds, before the FFI
+/// bindings and the runtime dependency are filled in.
+///
+/// The settings come from the build shape a cold build of the same project
+/// uses, so a manifest project's rebuilt crate carries the same identity name
+/// and links the same database driver. `ipe dev watch` reloads the
+/// served-live web app, so the host is always served: the webview-native
+/// desktop delivery is not a watch target. `debugger` compiles the in-app
+/// debugger overlay into the rebuilt runtime loop.
+fn watch_emit_settings(
+    resolved: &ResolvedProject,
+    debugger: bool,
+    hot_appearance: bool,
+) -> ipe_backend_rust::EmitSettings {
+    let options = crate::BuildOptions {
+        target: REBUILD_TARGET,
+        intent: REBUILD_INTENT,
+        debugger,
+        hot_appearance,
+        ..crate::BuildOptions::default()
+    };
+    let manifest_path = resolved.blame_path();
+    crate::driver::emit_settings(
+        &crate::driver::SettingsSource::Manifest {
+            manifest: resolved.root.manifest(),
+            manifest_path: &manifest_path,
+            host: crate::delivery::HostIntent::Served,
+        },
+        &options,
+        crate::runtime_embed::BundleRole::Out,
+    )
+}
 
 /// The floor every watch rebuild's crate carries: the development marker.
 const REBUILD_FLOOR: crate::run_sandbox::EmitFloor =
@@ -874,8 +790,31 @@ enum CompileOutcome {
 
 enum CargoOutcome {
     Green(PathBuf),
-    Red(String),
+    Red(CargoRed),
     Killed,
+}
+
+/// Why a watch rebuild is red.
+enum CargoRed {
+    /// `cargo` was stopped at its wall, its artifact stream was refused, or it
+    /// exited non-zero: the same typed error a one-shot build reports.
+    Refused(CliError),
+    /// The child's exit could not be observed.
+    ExitUnobserved,
+    /// `cargo` succeeded but named no executable artifact.
+    NoExecutable,
+}
+
+impl std::fmt::Display for CargoRed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Refused(e) => write!(f, "{e}"),
+            Self::ExitUnobserved => f.write_str("cargo build: could not observe exit status"),
+            Self::NoExecutable => {
+                f.write_str("cargo build succeeded but produced no executable artifact")
+            }
+        }
+    }
 }
 
 /// An in-flight `cargo build` child plus whether the orchestrator killed it.
@@ -923,11 +862,11 @@ fn run_inner(
     opts: &WatchOptions,
     external_stop: Option<mpsc::Receiver<()>>,
 ) -> Result<(), CliError> {
-    let initial = resolve_project_sources(&opts.entry, None)?;
+    let initial = resolve_project_sources(ProjectRoot::resolve(RootArg::at(&opts.entry))?)?;
     let out_target = EmitTarget::for_path(
         &opts.out_dir,
         opts.out_target.clone(),
-        &ProjectPaths::discover(&opts.entry)?,
+        &ProjectPaths::from_manifest(initial.root.manifest()),
     )?;
 
     let scope = initial
@@ -1136,6 +1075,9 @@ fn run_inner(
     let mut cargo_child: Option<Arc<std::sync::Mutex<CargoChild>>> = None;
     // The crate the in-flight cargo build compiles, proven again once it exits.
     let mut building: Option<OwnedDir> = None;
+    // The session's build directory, parsed for the host linker before the
+    // first rebuild and handed unchanged to every later one.
+    let mut session_target: Option<LinkableTargetDir> = None;
     // Set at `CompileDone` (Green), consumed at `CargoDone` (Green) — the
     // readiness strategy is a property of the SOURCE (does it call
     // `Web.tea`?), decided once per generation right after emit, not
@@ -1248,7 +1190,9 @@ fn run_inner(
                         .supersede();
                 }
 
-                let resolved = match resolve_project_sources(&opts.entry, None) {
+                let resolved = match ProjectRoot::resolve(RootArg::at(&opts.entry))
+                    .and_then(resolve_project_sources)
+                {
                     Ok(r) => r,
                     Err(e) => {
                         emit_watch_line(
@@ -1263,48 +1207,17 @@ fn run_inner(
                         continue;
                     }
                 };
-                if rescope(&mut watcher, &shared_scope, &resolved.scope) {
-                    schedule_resolve_retry(&evt_tx);
-                }
-
-                let mut sources = resolved.sources;
-                let mut discovered = resolved.discovered;
-                let injected = project::inject_compiled_std_closure(&mut sources, &mut discovered);
-
-                // Load the FFI catalog and inject installed-crate interface
-                // modules — the same seam `run_build` uses (CO-INCR-005).
-                // An error logs and skips the cycle (same policy as a
-                // resolution failure above) rather than tearing down the
-                // whole watch session.
-                let ffi_prep = match crate::ffi::prepare_ffi(&mut sources, &resolved.blame_path) {
-                    Ok(p) => p,
-                    Err(e) => {
-                        emit_watch_line(
-                            &crate::style::TerminalSafe::sanitize(&format!(
-                                "[ipe dev watch] FFI catalog error: {e}"
-                            )),
-                            WatchRole::Failure,
-                        );
-                        continue;
-                    }
-                };
-
-                // Borrow each module's text: `sync_source_root` clones only at
-                // the real mutation points (a new input, or an actually-changed
-                // set), so a settled batch that touches one file no longer copies
-                // every module's source (including the ~130-module injected
-                // stdlib closure) into a map that is immediately discarded.
-                let desired: BTreeMap<Vec<String>, (&str, ipe_db::ModuleOrigin)> = sources
+                let settings = watch_emit_settings(&resolved, opts.debugger, opts.hot_appearance);
+                // Borrow each module's text from the snapshot:
+                // `sync_source_root` clones only at the real mutation points
+                // (a new input, or an actually-changed set), so the database
+                // copies no unchanged module's source.
+                let modules = resolved.snapshot.modules();
+                let desired: BTreeMap<Vec<String>, (&str, ipe_db::ModuleOrigin)> = modules
                     .iter()
-                    .map(|(p, (_, text))| {
-                        let origin = if injected.contains(p) {
-                            ipe_db::ModuleOrigin::EmbeddedStdlib
-                        } else if ffi_prep.injected.contains(p) {
-                            ipe_db::ModuleOrigin::FfiInterface
-                        } else {
-                            ipe_db::ModuleOrigin::User
-                        };
-                        (p.clone(), (text.as_str(), origin))
+                    .map(|(module, held)| {
+                        let input = (held.text(), db_origin(held.origin()));
+                        (module.clone(), input)
                     })
                     .collect();
 
@@ -1316,32 +1229,22 @@ fn run_inner(
                 // Every field is reconciled on every pass, so a warm config
                 // holds exactly what a cold rebuild would build.
                 let cfg = db_main.sync_config(ipe_db::BuildConfigFields {
-                    db_driver: resolved.db_driver,
-                    // The backend writes FFI bindings (src/ffi.rs) into the
-                    // emitted project — the same slot `run_build` fills.
-                    ffi: ffi_prep.emit,
-                    target: REBUILD_TARGET,
-                    wasm_public_env: resolved.wasm_public_env.clone(),
-                    mount_base: resolved.mount_base.clone(),
-                    wasm_hydrate_mode: false,
-                    intent: REBUILD_INTENT,
-                    // Dependency-model emit: the project links the runtime as a
-                    // path dependency (what `ipe dev build` uses by default), so
-                    // no runtime source is vendored into `src/ipe_runtime/`.
-                    // `runtime_dep_root` is the verified crate root (holds
-                    // `Cargo.toml`), resolved once before the loop via
-                    // `runtime_embed::resolve()`, matching `ipe dev build`'s path.
-                    runtime_dep: Some(ipe_backend_rust::RuntimeDep {
-                        root: runtime_dep_root.clone(),
-                    }),
-                    // `ipe dev watch --debugger` compiles the in-app debugger
-                    // overlay into the rebuilt runtime loop.
-                    debugger: opts.debugger,
-                    cargo_name: resolved.cargo_name.clone(),
-                    hot_appearance: opts.hot_appearance,
-                    // `ipe dev watch` reloads the served-live web app; the
-                    // webview-native desktop delivery is not a watch target.
-                    webview_host: false,
+                    settings: ipe_backend_rust::EmitSettings {
+                        // The backend writes FFI bindings (src/ffi.rs) into the
+                        // emitted project — the same slot `run_build` fills.
+                        ffi: resolved.snapshot.ffi().emit.clone(),
+                        // Dependency-model emit: the project links the runtime
+                        // as a path dependency (what `ipe dev build` uses by
+                        // default), so no runtime source is vendored into
+                        // `src/ipe_runtime/`. `runtime_dep_root` is the verified
+                        // crate root (holds `Cargo.toml`), resolved once before
+                        // the loop via `runtime_embed::resolve()`, matching
+                        // `ipe dev build`'s path.
+                        runtime_dep: Some(ipe_backend_rust::RuntimeDep {
+                            root: runtime_dep_root.clone(),
+                        }),
+                        ..settings
+                    },
                 });
 
                 // The prior worker (if any) has already unwound by the time
@@ -1357,8 +1260,16 @@ fn run_inner(
                 timings.resolve = Some(resolve_started.elapsed());
 
                 let db_worker = db_main.db().clone();
+                // The worker owns its copy of the module texts the compile reads.
+                let sources: BTreeMap<Vec<String>, (PathBuf, String)> = modules
+                    .iter()
+                    .map(|(module, held)| {
+                        let read = (held.path().to_path_buf(), held.text().to_owned());
+                        (module.clone(), read)
+                    })
+                    .collect();
                 let entry_path = resolved.entry_path.clone();
-                let blame_path = resolved.blame_path.clone();
+                let blame_path = resolved.blame_path();
                 let worker_tx = evt_tx.clone();
                 let spawned = threads::spawn_named(ThreadRole::WatchCompile, move || {
                     // Measure the salsa warm-compile on the worker thread: the
@@ -1687,10 +1598,32 @@ fn run_inner(
                         ) {
                             post_watch_recompiling(app_port, tok);
                         }
+                        if session_target.is_none() {
+                            match LinkableTargetDir::for_crate(
+                                &opts.cargo_path,
+                                marked.path(),
+                                opts.target_dir.as_deref(),
+                            ) {
+                                Ok(resolved) => session_target = Some(resolved),
+                                Err(e) => {
+                                    emit_watch_line(
+                                        &crate::style::TerminalSafe::sanitize(&format!(
+                                            "[ipe dev watch] cannot start cargo build:\n{e}"
+                                        )),
+                                        WatchRole::Failure,
+                                    );
+                                    emit(opts, WatchEvent::CargoFailed { generation });
+                                    continue;
+                                }
+                            }
+                        }
+                        let Some(target_dir) = session_target.as_ref() else {
+                            continue;
+                        };
                         match spawn_cargo_build(
                             &opts.cargo_path,
                             marked,
-                            opts.target_dir.as_deref(),
+                            target_dir,
                             generation,
                             evt_tx.clone(),
                             opts.quiet,
@@ -1725,7 +1658,8 @@ fn run_inner(
                     CargoOutcome::Killed => {
                         emit(opts, WatchEvent::CargoKilled { generation: g });
                     }
-                    CargoOutcome::Red(msg) => {
+                    CargoOutcome::Red(red) => {
+                        let msg = red.to_string();
                         emit_watch_line(
                             &crate::style::TerminalSafe::sanitize(&format!(
                                 "[ipe dev watch] cargo build failed (last-good binary stays \
@@ -3108,24 +3042,13 @@ pub(crate) enum BuildAccel {
     WarmIncremental,
 }
 
-/// The target directory this watch build will use: an explicit
-/// [`WatchOptions::target_dir`] override wins, else an inherited
-/// `CARGO_TARGET_DIR`, else cargo's default of `<out_dir>/target`.
-fn watch_target_dir(out_dir: &Path, override_dir: Option<&Path>) -> PathBuf {
-    override_dir.map_or_else(
-        || {
-            ipe_env::var_os("CARGO_TARGET_DIR")
-                .map_or_else(|| out_dir.join("target"), PathBuf::from)
-        },
-        Path::to_path_buf,
-    )
-}
-
 /// Whether a resolved target directory already holds a compiled dependency
 /// library (a single `.rlib` under `debug/deps` — the registry crates the emitted
 /// app links). Fail-safe: any I/O error reads as no-rlib, so the worst case is one
-/// extra sccache-mode build, never a wrong-but-fast one. Pure in its argument —
-/// the ambient-env resolution lives in [`target_is_warm`].
+/// extra sccache-mode build, never a wrong-but-fast one. A target is *warm* once
+/// it holds one; a fresh (or pruned) target holds none. Pure in its argument:
+/// the directory is the session's resolved [`LinkableTargetDir`], the one the
+/// build itself is handed.
 fn dir_has_dep_rlib(target_dir: &Path) -> bool {
     let deps = target_dir.join("debug").join("deps");
     let Ok(entries) = std::fs::read_dir(&deps) else {
@@ -3134,14 +3057,6 @@ fn dir_has_dep_rlib(target_dir: &Path) -> bool {
     entries
         .flatten()
         .any(|e| e.path().extension().is_some_and(|x| x == "rlib"))
-}
-
-/// A target is *warm* once it already holds compiled dependency libraries; a
-/// fresh (or pruned) target holds none. Resolves the target directory cargo will
-/// actually use (honouring an inherited `CARGO_TARGET_DIR`, exactly as the watch
-/// build will) and checks it for a dependency `.rlib`.
-fn target_is_warm(out_dir: &Path, override_dir: Option<&Path>) -> bool {
-    dir_has_dep_rlib(&watch_target_dir(out_dir, override_dir))
 }
 
 /// Locate an `sccache` executable on `PATH`, if the machine has one. sccache is
@@ -3162,11 +3077,11 @@ fn find_sccache() -> Option<PathBuf> {
 ///
 /// The decision is computed at the call site and passed to
 /// [`apply_build_accel_env`], keeping the env-to-`Command` mapping a pure function.
-fn choose_build_accel(out_dir: &Path, override_dir: Option<&Path>, opt_out: bool) -> BuildAccel {
+fn choose_build_accel(target_dir: &Path, opt_out: bool) -> BuildAccel {
     if opt_out {
         return BuildAccel::MachineDefault;
     }
-    match (target_is_warm(out_dir, override_dir), find_sccache()) {
+    match (dir_has_dep_rlib(target_dir), find_sccache()) {
         (false, Some(sccache)) => BuildAccel::ColdSccache(sccache),
         _ => BuildAccel::WarmIncremental,
     }
@@ -3228,13 +3143,14 @@ fn env_flag_on(name: &str) -> bool {
 fn spawn_cargo_build(
     cargo_path: &Path,
     krate: crate::DevMarkedCrate<'_>,
-    target_dir: Option<&Path>,
+    target_dir: &LinkableTargetDir,
     generation: u64,
     evt_tx: mpsc::Sender<OrchestratorEvent>,
     quiet: bool,
     wall: crate::remote_ingest::LocalWall,
 ) -> std::io::Result<Arc<std::sync::Mutex<CargoChild>>> {
-    let accel = choose_build_accel(krate.path(), target_dir, env_flag_on(NO_INCREMENTAL_ENV));
+    let accel = choose_build_accel(target_dir.path(), env_flag_on(NO_INCREMENTAL_ENV));
+    let crate_path = krate.path().to_path_buf();
     let build = crate::cargo_step::WatchBuild {
         cargo: cargo_path,
         krate,
@@ -3291,24 +3207,35 @@ fn spawn_cargo_build(
         let out_buf = drained.stdout.text;
         let err_buf = drained.stderr.text;
         let outcome = match (drained.waited, drained.stdout.error) {
-            _ if timed_out => CargoOutcome::Red(CliError::CargoBuildTimedOut { wall }.to_string()),
-            (None, _) => CargoOutcome::Red("cargo build: could not observe exit status".to_owned()),
+            _ if timed_out => {
+                CargoOutcome::Red(CargoRed::Refused(CliError::CargoBuildTimedOut { wall }))
+            }
+            (None, _) => CargoOutcome::Red(CargoRed::ExitUnobserved),
             // A refused artifact stream (past its ceiling, not UTF-8, or a read
             // error) is never searched for an executable.
-            (Some((status, _)), Some(e)) if status.success() => {
-                CargoOutcome::Red(format!("cargo build: {e}"))
+            (Some((status, _)), Some(source)) if status.success() => {
+                CargoOutcome::Red(CargoRed::Refused(CliError::Io {
+                    path: crate_path.clone(),
+                    source,
+                }))
             }
-            (Some((status, _)), None) if status.success() => find_executable_path(&out_buf)
-                .map_or_else(
-                    || {
-                        CargoOutcome::Red(
-                            "cargo build succeeded but produced no executable artifact".to_owned(),
-                        )
-                    },
-                    CargoOutcome::Green,
-                ),
+            (Some((status, _)), None) if status.success() => find_executable_path(&out_buf).map_or(
+                CargoOutcome::Red(CargoRed::NoExecutable),
+                CargoOutcome::Green,
+            ),
             (Some((_, true)), _) => CargoOutcome::Killed,
-            (Some((_, false)), _) => CargoOutcome::Red(err_buf),
+            // Classified exactly as a one-shot build's failure is, so a link
+            // input the host linker cannot open reaches the screen as the
+            // environment fault it is.
+            (Some((status, false)), _) => {
+                CargoOutcome::Red(CargoRed::Refused(crate::cargo_step::emitted_build_failed(
+                    "the watch rebuild",
+                    status.code().unwrap_or(1),
+                    &out_buf,
+                    &err_buf,
+                    None,
+                )))
+            }
         };
         let _ = evt_tx.send(OrchestratorEvent::CargoDone {
             generation,
@@ -3350,15 +3277,41 @@ fn find_executable_path(cargo_json_stdout: &str) -> Option<PathBuf> {
 mod tests {
     use super::{
         AppearanceRoute, BuildAccel, Command, Duration, OrchestratorEvent, RESOLVE_RETRY_DELAY,
-        RebuildTimings, ResolvedProject, ScopeSpec, WatchRole, appearance_route,
-        apply_build_accel_env, child_command, child_env, choose_build_accel, compile_failed_frame,
-        dir_has_dep_rlib, emitted_binds_http, emitted_is_tui, emitted_is_web, env_flag_on,
-        first_error_line, mint_hot_token, mpsc, prove_green_crate, push_control_appearance,
-        resolve_project_sources, schedule_resolve_retry, send_control_frame, spawn_command,
-        strip_ansi, watch_line, watch_status_body,
+        RebuildTimings, WatchRole, appearance_route, apply_build_accel_env, child_command,
+        child_env, choose_build_accel, compile_failed_frame, dir_has_dep_rlib, emitted_binds_http,
+        emitted_is_tui, emitted_is_web, env_flag_on, first_error_line, mint_hot_token, mpsc,
+        prove_green_crate, push_control_appearance, resolve_project_sources,
+        schedule_resolve_retry, send_control_frame, spawn_command, strip_ansi, watch_emit_settings,
+        watch_line, watch_status_body,
     };
     use std::ffi::OsStr;
     use std::path::{Path, PathBuf};
+
+    /// A watch rebuild names its crate by the project's identity, exactly as a
+    /// cold build of the same project does.
+    #[test]
+    fn watch_name_matches_build() {
+        let fixture = crate::RootFixture::main("module Main exposing (main)\n\nmain =\n    1\n")
+            .expect("fixture");
+        let root = crate::project_root::ProjectRoot::resolve(crate::project_root::RootArg::at(
+            fixture.path(),
+        ))
+        .expect("root");
+        let resolved = resolve_project_sources(root).expect("resolved");
+        let settings = watch_emit_settings(&resolved, false, false);
+        let canonical = std::fs::canonicalize(fixture.path()).expect("canonical");
+        let expected = ipe_backend_rust::crate_identity(
+            &ipe_backend_rust::sanitize_cargo_name(&fixture.root().manifest().name),
+            &canonical,
+        );
+        assert_eq!(settings.crate_name.as_str(), expected.as_str());
+        assert_ne!(
+            settings.crate_name.as_str(),
+            ipe_backend_rust::sanitize_cargo_name(&fixture.root().manifest().name),
+            "the friendly name alone would share a cargo slot across projects"
+        );
+        assert_eq!(settings.host, ipe_backend_rust::EmitHost::Served);
+    }
 
     /// Build an `EmittedProject` whose `src/main.rs` carries `main_rs`, so the
     /// HTTP-detection predicates can be tested on their real scan surface without
@@ -3777,10 +3730,7 @@ mod tests {
     fn opt_out_chooses_machine_default() {
         let dir = ipe_test_temp::temp_root();
         assert!(
-            matches!(
-                choose_build_accel(&dir, None, true),
-                BuildAccel::MachineDefault
-            ),
+            matches!(choose_build_accel(&dir, true), BuildAccel::MachineDefault),
             "opt-out must choose MachineDefault"
         );
     }
@@ -4122,102 +4072,6 @@ mod tests {
         assert_ne!(a, b, "two mints must not collide");
     }
 
-    /// A fresh scratch directory unique to this test run.
-    fn loose_scratch(tag: &str) -> PathBuf {
-        let dir = ipe_test_temp::temp_root().join(format!(
-            "ipe_loose_watch_{tag}_{}_{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map_or(0, |d| d.as_nanos())
-        ));
-        std::fs::create_dir_all(&dir).expect("create scratch dir");
-        dir
-    }
-
-    /// Watch resolves a loose file to its import closure, beside an unreadable directory.
-    ///
-    /// A rebuild re-resolves from disk, so an import added to the entry pulls
-    /// the newly named sibling in, while an unimported sibling stays out.
-    #[cfg(unix)]
-    #[test]
-    fn watch_loose_file_resolves_the_import_closure_and_follows_a_new_import() {
-        use std::os::unix::fs::PermissionsExt;
-        let dir = loose_scratch("closure");
-        let entry = dir.join("Main.ipe");
-        std::fs::write(&entry, "module Main exposing (main)\n\nmain = 1\n").expect("write entry");
-        std::fs::write(
-            dir.join("Helper.ipe"),
-            "module Helper exposing (h)\n\nh = 1\n",
-        )
-        .expect("write helper");
-        std::fs::write(
-            dir.join("Stray.ipe"),
-            "module Stray exposing (s)\n\ns = ???\n",
-        )
-        .expect("write stray");
-        let locked = dir.join("locked");
-        std::fs::create_dir_all(&locked).expect("create locked dir");
-        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000))
-            .expect("chmod 000");
-
-        let before = resolve_project_sources(&entry, None);
-        std::fs::write(
-            &entry,
-            "module Main exposing (main)\n\nimport Helper\n\nmain = Helper.h\n",
-        )
-        .expect("rewrite entry");
-        let after = resolve_project_sources(&entry, None);
-        let after_scope = after.as_ref().map(|resolved| resolved.scope.build());
-        let canon_dir = std::fs::canonicalize(&dir);
-        let _ = std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755));
-        let _ = std::fs::remove_dir_all(&dir);
-
-        let canon_dir = canon_dir.expect("scratch dir canonicalises");
-        let after_scope = after_scope
-            .expect("loose file re-resolves")
-            .expect("the watch scope builds beside an unreadable directory");
-        let watched: Vec<&Path> = after_scope
-            .roots_to_watch()
-            .iter()
-            .map(ipe_watch::WatchedPath::as_path)
-            .collect();
-        assert_eq!(watched, vec![canon_dir.as_path()], "no directory is walked");
-        assert!(matches!(
-            after_scope.recursive_mode(),
-            notify::RecursiveMode::NonRecursive
-        ));
-        assert!(after_scope.is_relevant(&canon_dir.join("Helper.ipe")));
-        assert!(!after_scope.is_relevant(&canon_dir.join("Stray.ipe")));
-
-        let modules = |resolved: &ResolvedProject| -> Vec<Vec<String>> {
-            resolved.sources.keys().cloned().collect()
-        };
-        let before = before.expect("loose file resolves");
-        let after = after.expect("loose file re-resolves");
-        assert_eq!(
-            after_scope.file_count(),
-            after.sources.len(),
-            "the watch count is the build's read set"
-        );
-        assert_eq!(modules(&before), vec![vec!["Main".to_owned()]]);
-        assert_eq!(
-            modules(&after),
-            vec![vec!["Helper".to_owned()], vec!["Main".to_owned()]],
-            "the re-resolve picks up the newly imported sibling only"
-        );
-        assert_eq!(after.entry_path, vec!["Main".to_owned()]);
-        assert_eq!(
-            after.scope,
-            ScopeSpec::LooseFile {
-                entry: entry.clone(),
-                module_files: vec![PathBuf::from("Helper.ipe")],
-                loaded_files: vec![PathBuf::from("Helper.ipe")],
-            }
-        );
-        assert_eq!(after.blame_path, entry);
-    }
-
     /// Write an executable fake `cargo` running `body` into a fresh directory
     /// named after `name`, returning the script path.
     #[cfg(unix)]
@@ -4261,7 +4115,7 @@ mod tests {
         let child = super::spawn_cargo_build(
             cargo,
             crate::DevMarkedCrate::assume(out_dir),
-            Some(&out_dir.join("target")),
+            &crate::target_dir::LinkableTargetDir::assume(&out_dir.join("target")),
             1,
             tx,
             true,
@@ -4337,7 +4191,7 @@ mod tests {
         }
         .to_string();
         assert!(
-            matches!(&outcome, Some(super::CargoOutcome::Red(text)) if *text == wall_text),
+            matches!(&outcome, Some(super::CargoOutcome::Red(red)) if red.to_string() == wall_text),
             "a rebuild past its wall must report the wall's refusal"
         );
         assert!(
@@ -4369,7 +4223,7 @@ mod tests {
         let spawned = super::spawn_cargo_build(
             &cargo,
             crate::DevMarkedCrate::assume(out_dir),
-            Some(&out_dir.join("target")),
+            &crate::target_dir::LinkableTargetDir::assume(&out_dir.join("target")),
             1,
             tx,
             true,

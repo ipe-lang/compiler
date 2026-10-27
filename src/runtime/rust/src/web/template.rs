@@ -158,7 +158,7 @@ fn materialize_at<M>(template: &Template, depth: usize) -> Html<M> {
             attrs,
             children,
         } => {
-            let html_attrs = attrs
+            let html_attrs: Vec<Attribute<M>> = attrs
                 .iter()
                 .map(|a| Attribute::Attr(a.key.clone(), a.value.clone()))
                 .collect();
@@ -170,7 +170,7 @@ fn materialize_at<M>(template: &Template, depth: usize) -> Html<M> {
             // elements, never trusted raw markup, so a `<script>`/`<style>`
             // (or `<plaintext>`, or an unsafe tag name) from a baked or patched
             // slot materializes to inert empty text.
-            if admit_element(tag, &html_children).is_err() {
+            if admit_element(tag, &html_attrs, &html_children).is_err() {
                 return Html::HText(String::new());
             }
             Html::HElement(tag.clone(), html_attrs, html_children)
@@ -429,7 +429,7 @@ mod tests {
             "button".to_string(),
             vec![Attribute::EventAttr(crate::html::Event::OnMsg(
                 "click".to_string(),
-                1,
+                Box::new(1),
             ))],
             vec![Html::HText("+".to_string())],
         );

@@ -21,22 +21,16 @@ const HEAD: &str = "module Main exposing (main)\n\nimport Ipe.Io as Io\n";
 /// fails the test rather than passing it vacuously.
 fn build_source(name: &str, src: &str) -> Result<(), Option<ipe_diagnostics::Code>> {
     let scratch = PathBuf::from(env!("CARGO_TARGET_TMPDIR"));
-    let dir = scratch.join(format!("interp_scalars_{name}"));
     let out = scratch.join(format!("interp_scalars_{name}_out"));
-    let _ = std::fs::remove_dir_all(&dir);
     let _ = std::fs::remove_dir_all(&out);
-    assert!(
-        std::fs::create_dir_all(&dir).is_ok(),
-        "{name}: scratch dir must be creatable"
-    );
-    let entry = dir.join("Main.ipe");
-    assert!(
-        std::fs::write(&entry, src).is_ok(),
-        "{name}: fixture must be writable"
-    );
+    let fixture = ipe::RootFixture::main(src);
+    assert!(fixture.is_ok(), "{name}: fixture must be writable");
+    let Ok(fixture) = fixture else {
+        return Err(None);
+    };
     let runtime = e2e_support::require_runtime().into_path_buf();
-    match ipe::build(&entry, &out, &runtime) {
-        Ok(()) => Ok(()),
+    match ipe::build_fixture(&fixture, &out, &runtime) {
+        Ok(_) => Ok(()),
         Err(ipe::CliError::Pipeline { diag, .. }) => Err(Some(diag.code())),
         Err(_) => Err(None),
     }

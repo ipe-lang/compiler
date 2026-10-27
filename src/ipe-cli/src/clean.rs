@@ -44,7 +44,10 @@ enum Proof {
 
 /// The entries ipe writes in the `.ipe/` namespace: its build caches and the
 /// fetched package sources.
-const CACHE_NAMESPACE_ENTRIES: &[&str] = &["cache", "packages"];
+const CACHE_NAMESPACE_ENTRIES: &[&str] = &[
+    ipe_ffi::driver::CACHE_SUBDIR,
+    crate::output_dir::PACKAGES_SUBDIR,
+];
 
 /// The deletion allowlist — nothing outside it is ever a candidate.
 const GENERATED_DIRS: &[Generated] = &[
@@ -107,18 +110,130 @@ pub fn run_clean(rest: &[String]) -> Result<(), CliError> {
     Ok(())
 }
 
-/// Remove every generated directory under the canonical project `root`.
+/// Remove every generated directory under the canonical project `root`, and the
+/// per-user build directories its emitted crates were relocated to.
 ///
-/// Returns the removed paths, relative to `root`, for the summary.
+/// Returns the removed paths for the summary: a project directory relative to
+/// `root`, a relocated build directory in full.
 ///
 /// # Errors
-/// As [`remove_generated_dir`].
+/// As [`remove_generated_dir`] and [`remove_cache_target`].
 pub(crate) fn clean_root(root: &Path) -> Result<Vec<String>, CliError> {
+    // The relocated directories are keyed by the crate paths, so they are named
+    // before `out/` goes.
+    let relocated = relocated_targets(root);
     let mut removed: Vec<String> = Vec::new();
     for generated in GENERATED_DIRS {
         removed.extend(remove_generated_dir(root, generated)?);
     }
+    for target in relocated {
+        if remove_cache_target(&target)? {
+            // The cache path lies under the user's home: sanitised before any screen.
+            let shown = style::TerminalSafe::sanitize(&format!("{}/", target.display()));
+            removed.push(shown.as_str().to_owned());
+        }
+    }
     Ok(removed)
+}
+
+/// The emitted crates under `out/` a build may relocate the build directory of.
+const RELOCATABLE_CRATES: &[crate::output_dir::OutputArea] = &[
+    crate::output_dir::OutputArea::Rust,
+    crate::output_dir::OutputArea::App,
+];
+
+/// The per-user build directories `root`'s emitted crates would be relocated to.
+///
+/// Empty when no per-user cache base resolves, or when the `$IPE_HOME` pin
+/// cannot be read: without knowing every pin, nothing is named for removal.
+fn relocated_targets(root: &Path) -> Vec<PathBuf> {
+    let Ok(cache_base) = crate::resolve::default_cache_base() else {
+        return Vec::new();
+    };
+    let Ok(ipe_home_pin) = crate::health::shared_target_pin() else {
+        return Vec::new();
+    };
+    let env_pin = ipe_env::var_os("CARGO_TARGET_DIR")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from);
+    let pins: Vec<PathBuf> = env_pin.into_iter().chain(ipe_home_pin).collect();
+    relocated_targets_within(root, &cache_base, &pins)
+}
+
+/// The per-user build directories under `cache_base` keyed by `root`'s emitted
+/// crates, leaving out any one a pin in `pins` names.
+///
+/// A pinned build directory is the user's, so `clean` never names it, even
+/// when it sits where a relocation would.
+fn relocated_targets_within(root: &Path, cache_base: &Path, pins: &[PathBuf]) -> Vec<PathBuf> {
+    RELOCATABLE_CRATES
+        .iter()
+        .map(|area| {
+            let crate_dir = root
+                .join(crate::output_dir::DEFAULT_OUTPUT_DIR)
+                .join(area.dir_name());
+            let target = crate::target_dir::user_cache_target(cache_base, &crate_dir);
+            (crate_dir, target)
+        })
+        .filter(|(crate_dir, target)| {
+            !pins
+                .iter()
+                .any(|pin| names_same_dir(&crate_dir.join(pin), target))
+        })
+        .map(|(_, target)| target)
+        .collect()
+}
+
+/// Whether `pin` and `target` name one directory: spelled alike, or resolving
+/// to one path through a link, a case-folding filesystem, or a `..` step.
+fn names_same_dir(pin: &Path, target: &Path) -> bool {
+    pin == target
+        || matches!(
+            (std::fs::canonicalize(pin), std::fs::canonicalize(target)),
+            (Ok(pin), Ok(target)) if pin == target
+        )
+}
+
+/// The name of the tag cargo writes into every build directory it creates.
+const CACHEDIR_TAG: &str = "CACHEDIR.TAG";
+
+/// The exact bytes cargo writes into [`CACHEDIR_TAG`].
+const CARGO_CACHEDIR_TAG: &[u8] = b"Signature: 8a477f597d28d172789f06886806bc55\n\
+# This file is a cache directory tag created by cargo.\n\
+# For information about cache directory tags see https://bford.info/cachedir/\n";
+
+/// Remove the relocated build directory `target`, reporting whether it went.
+///
+/// `false` when it is absent. Its parent is held, the directory is opened
+/// through it without following a link, and it must carry cargo's
+/// [`CACHEDIR_TAG`] as a regular file: a link, a junction, or an untagged
+/// directory is refused and left in place.
+///
+/// # Errors
+/// [`CliError::OutputRefused`] for a link or an untagged directory;
+/// [`CliError::Io`] on a filesystem failure.
+fn remove_cache_target(target: &Path) -> Result<bool, CliError> {
+    use crate::output_dir::OutputRefusal;
+    use crate::output_dir::held::{EntryKind, HeldDir};
+    let (Some(parent), Some(key)) = (target.parent(), target.file_name()) else {
+        return Ok(false);
+    };
+    let Some(cache_root) = HeldDir::open(parent)? else {
+        return Ok(false);
+    };
+    match cache_root.kind_of(&cache_root.entry(key)?)? {
+        EntryKind::Symlink => return Err(OutputRefusal::Symlink(target.to_path_buf()).into()),
+        EntryKind::Absent | EntryKind::Other => return Ok(false),
+        EntryKind::Directory => {}
+    }
+    let Some(dir) = cache_root.child(key)? else {
+        return Ok(false);
+    };
+    if !dir.holds_contents(std::ffi::OsStr::new(CACHEDIR_TAG), CARGO_CACHEDIR_TAG) {
+        return Err(OutputRefusal::NotIpeOwned(target.to_path_buf()).into());
+    }
+    cache_root.remove_proven(key, dir)?;
+    Ok(true)
 }
 
 /// Resolve and validate the project root, the current directory holding a `package.ipe`.
@@ -170,7 +285,7 @@ fn remove_generated_dir(root: &Path, generated: &Generated) -> Result<Vec<String
         return Ok(Vec::new());
     };
     let os_name = std::ffi::OsStr::new(name);
-    match root_dir.kind_of(os_name)? {
+    match root_dir.kind_of(&root_dir.entry(os_name)?)? {
         EntryKind::Symlink => return Err(OutputRefusal::Symlink(candidate).into()),
         EntryKind::Absent | EntryKind::Other => return Ok(Vec::new()),
         EntryKind::Directory => {}
@@ -193,7 +308,7 @@ fn remove_generated_dir(root: &Path, generated: &Generated) -> Result<Vec<String
             let mut removed = Vec::new();
             for entry in entries {
                 let os_entry = std::ffi::OsStr::new(entry);
-                match dir.kind_of(os_entry)? {
+                match dir.kind_of(&dir.entry(os_entry)?)? {
                     EntryKind::Directory => {
                         dir.remove_entry(os_entry)?;
                         removed.push(format!("{name}/{entry}/"));
@@ -269,9 +384,17 @@ mod tests {
         proof: Proof::Marker,
     };
     const DOT_IPE: &Generated = &Generated {
-        name: ".ipe",
+        name: crate::output_dir::CACHE_NAMESPACE_DIR,
         proof: Proof::Namespace(CACHE_NAMESPACE_ENTRIES),
     };
+
+    /// The allowlist built from the layout constants spells the layout ipe writes.
+    #[test]
+    fn clean_entries_follow_layout() {
+        assert_eq!(CACHE_NAMESPACE_ENTRIES, ["cache", "packages"]);
+        let names: Vec<&str> = GENERATED_DIRS.iter().map(|g| g.name).collect();
+        assert_eq!(names, ["out", ".ipe"]);
+    }
 
     /// `remove_generated_dir` deletes an ipe-owned output directory and reports it.
     #[test]
@@ -467,6 +590,135 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A project root and a per-user cache base under one fresh scratch dir.
+    fn relocation_fixture(name: &str) -> (PathBuf, PathBuf, PathBuf) {
+        let scratch = ipe_test_temp::temp_root().join(format!("{name}_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&scratch);
+        std::fs::create_dir_all(scratch.join("project")).expect("make project");
+        std::fs::create_dir_all(scratch.join("cache")).expect("make cache");
+        let scratch = std::fs::canonicalize(&scratch).expect("canonicalize scratch");
+        let root = scratch.join("project");
+        let base = scratch.join("cache");
+        (scratch, root, base)
+    }
+
+    /// The relocated build directory of `root`'s `out/rust` crate.
+    fn relocated(root: &Path, base: &Path) -> PathBuf {
+        crate::target_dir::user_cache_target(base, &root.join("out").join("rust"))
+    }
+
+    /// A relocated build directory carrying cargo's tag is removed.
+    #[test]
+    fn removes_a_tagged_relocated_target() {
+        let (scratch, root, base) = relocation_fixture("ipe_clean_reloc_ok");
+        let target = relocated(&root, &base);
+        std::fs::create_dir_all(target.join("debug")).expect("make target");
+        std::fs::write(target.join(CACHEDIR_TAG), CARGO_CACHEDIR_TAG).expect("tag");
+        let named = relocated_targets_within(&root, &base, &[]);
+        assert!(
+            named.contains(&target),
+            "{named:?} names {}",
+            target.display()
+        );
+        assert!(
+            remove_cache_target(&target).expect("remove"),
+            "the tagged target goes"
+        );
+        assert!(!target.exists(), "the relocated target is gone");
+        let _ = std::fs::remove_dir_all(&scratch);
+    }
+
+    /// An untagged directory where a relocation would sit is refused and kept.
+    #[test]
+    fn refuses_an_untagged_relocated_target() {
+        let (scratch, root, base) = relocation_fixture("ipe_clean_reloc_untagged");
+        let target = relocated(&root, &base);
+        std::fs::create_dir_all(&target).expect("make target");
+        std::fs::write(target.join("keep.txt"), b"mine").expect("user file");
+        let result = remove_cache_target(&target);
+        assert!(
+            matches!(result, Err(CliError::OutputRefused(_))),
+            "an untagged target must be refused, got: {result:?}"
+        );
+        assert!(
+            target.join("keep.txt").is_file(),
+            "the untagged dir survives"
+        );
+        // A tag that is not cargo's is not the tag.
+        std::fs::write(target.join(CACHEDIR_TAG), b"Signature: forged\n").expect("forged tag");
+        assert!(
+            matches!(
+                remove_cache_target(&target),
+                Err(CliError::OutputRefused(_))
+            ),
+            "a forged tag must be refused"
+        );
+        assert!(
+            target.join("keep.txt").is_file(),
+            "the forged-tag dir survives"
+        );
+        let _ = std::fs::remove_dir_all(&scratch);
+    }
+
+    /// A relocated target planted as a link is refused, its target untouched.
+    #[test]
+    fn refuses_a_symlinked_relocated_target() {
+        let (scratch, root, base) = relocation_fixture("ipe_clean_reloc_link");
+        let target = relocated(&root, &base);
+        let outside = scratch.join("precious");
+        std::fs::create_dir_all(&outside).expect("make outside");
+        std::fs::write(outside.join(CACHEDIR_TAG), CARGO_CACHEDIR_TAG).expect("tag");
+        std::fs::write(outside.join("keep.txt"), b"do not delete").expect("victim");
+        std::fs::create_dir_all(target.parent().expect("cache root")).expect("make cache root");
+        plant_link(&outside, &target);
+        let result = remove_cache_target(&target);
+        assert!(
+            matches!(result, Err(CliError::OutputRefused(_))),
+            "a linked target must be refused, got: {result:?}"
+        );
+        assert!(
+            outside.join("keep.txt").is_file(),
+            "the link target survives"
+        );
+        let _ = std::fs::remove_dir_all(&scratch);
+    }
+
+    /// A pin naming the relocated path makes it the user's: never named for removal.
+    #[test]
+    fn a_pinned_target_is_never_removed() {
+        let (scratch, root, base) = relocation_fixture("ipe_clean_reloc_pin");
+        let target = relocated(&root, &base);
+        std::fs::create_dir_all(&target).expect("make target");
+        std::fs::write(target.join(CACHEDIR_TAG), CARGO_CACHEDIR_TAG).expect("tag");
+        let named = relocated_targets_within(&root, &base, std::slice::from_ref(&target));
+        assert!(
+            !named.contains(&target),
+            "a pinned target is not named: {named:?}"
+        );
+        assert!(
+            target.join(CACHEDIR_TAG).is_file(),
+            "the pinned target survives"
+        );
+        let _ = std::fs::remove_dir_all(&scratch);
+    }
+
+    /// A pin spelling the relocated path another way is still the user's.
+    #[test]
+    fn a_pin_spelled_another_way_is_never_removed() {
+        let (scratch, root, base) = relocation_fixture("ipe_clean_reloc_pin_alias");
+        let target = relocated(&root, &base);
+        std::fs::create_dir_all(&target).expect("make target");
+        std::fs::write(target.join(CACHEDIR_TAG), CARGO_CACHEDIR_TAG).expect("tag");
+        let key = target.file_name().expect("relocation key");
+        let pin = base.join("ipe").join("..").join("ipe").join("t").join(key);
+        let named = relocated_targets_within(&root, &base, std::slice::from_ref(&pin));
+        assert!(
+            !named.contains(&target),
+            "a pin through `..` is not named: {named:?}"
+        );
+        let _ = std::fs::remove_dir_all(&scratch);
     }
 
     /// A symlinked cache entry is refused, never followed.

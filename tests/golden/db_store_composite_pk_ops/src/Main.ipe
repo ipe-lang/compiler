@@ -1,0 +1,228 @@
+module Main exposing (main)
+
+-- Composite and illegal primary keys against a live `sqlite::memory:` table.
+-- The `memberships` table is created by raw DDL with a table-level
+-- `PRIMARY KEY (user_id, group_id)` (`createSql` does not render one yet), then
+-- seeded with two rows. Checks, one line each:
+--
+--   * the by-key operations `get` / `update` / `delete` on the composite store
+--     fail with the composite-key error, issuing no SQL;
+--   * `updateWhere` on the composite store scoped to one row rewrites `role`
+--     from a template whose key columns are a hijack payload, and leaves BOTH
+--     key columns untouched — every key column is dropped from the SET;
+--   * a store whose key declaration is illegal (a second `primaryKey`) is
+--     unusable: `updateWhere` / `insert` / `deleteWhere` / `findWhere` / `all` /
+--     `findBy` / `get` / `query` / `join` each fail with the recorded error, and
+--     `secured` refuses to classify its draft;
+--   * the final snapshot is unchanged by every refused operation, so none of
+--     them reached the database.
+--
+-- Output:
+--   composite-get:rejected
+--   composite-update:rejected
+--   composite-delete:rejected
+--   composite-update-where:1
+--   after-update-where:u1/g1/admin,u2/g1/member
+--   illegal-update-where:rejected
+--   illegal-insert:rejected
+--   illegal-delete-where:rejected
+--   illegal-find-where:rejected
+--   illegal-all:rejected
+--   illegal-find-by:rejected
+--   illegal-get:rejected
+--   illegal-query:rejected
+--   illegal-join:rejected
+--   illegal-secured:rejected
+--   final:u1/g1/admin,u2/g1/member
+
+import Ipe.Db as Db
+import Ipe.Db.Location as Location
+import Ipe.Db.Sql as Sql
+import Ipe.Db.Store as Store exposing (Draft, Store)
+import Ipe.Db.Store.Unsafe as StoreU
+import Ipe.Db.Unsafe as Unsafe
+import Ipe.Dict as Dict
+import Ipe.Error as Error exposing (Error)
+import Ipe.Io as Io
+import Ipe.List as List
+import Ipe.Maybe as Maybe exposing (Maybe(..))
+import Ipe.Result as Result exposing (Result(..))
+import Ipe.String as String
+import Ipe.Task as Task exposing (Task)
+
+
+compositeNeedle : String
+compositeNeedle =
+    "the store's key is composite (user_id, group_id)"
+
+
+illegalNeedle : String
+illegalNeedle =
+    "a second one was declared after primary key (user_id)"
+
+
+membershipDraft : Result Error (Draft Store.Row)
+membershipDraft =
+    Store.fromColumns "memberships"
+        [ Store.textColumn "user_id"
+        , Store.textColumn "group_id"
+        , Store.textColumn "role"
+        ]
+
+
+compositeStore : Result Error (Store Store.Row)
+compositeStore =
+    Result.map
+        (\d -> Store.public (StoreU.compositePrimaryKey [ "user_id", "group_id" ] d))
+        membershipDraft
+
+
+-- A draft whose key declaration is illegal: a second single-column key.
+illegalDraft : Result Error (Draft Store.Row)
+illegalDraft =
+    Result.map (\d -> StoreU.primaryKey "role" (StoreU.primaryKey "user_id" d)) membershipDraft
+
+
+-- A full-record template whose key columns carry a payload: if `updateWhere`
+-- wrote any key column, the scoped row would change identity.
+hijackTemplate : Store.Row
+hijackTemplate =
+    Dict.fromList
+        [ ( "user_id", Just "hijack" )
+        , ( "group_id", Just "hijack" )
+        , ( "role", Just "admin" )
+        ]
+
+
+newRow : Store.Row
+newRow =
+    Dict.fromList
+        [ ( "user_id", Just "u9" )
+        , ( "group_id", Just "g9" )
+        , ( "role", Just "member" )
+        ]
+
+
+main : Task Error ()
+main =
+    case ( compositeStore, illegalDraft ) of
+        ( Ok composite, Ok illegal ) ->
+            Task.andThen
+                (\conn ->
+                    Db.withTransaction conn
+                        (\txconn -> runChecks txconn composite illegal)
+                )
+                (Db.open Location.memory)
+
+        ( Err e, _ ) ->
+            Io.println (Error.toString e)
+
+        ( _, Err e ) ->
+            Io.println (Error.toString e)
+
+
+runChecks : Db -> Store Store.Row -> Draft Store.Row -> Task Error ()
+runChecks conn composite illegal =
+    Task.andThen
+        (\_ ->
+            Task.andThen
+                (\lines -> Io.println (String.join "\n" lines))
+                (Task.sequence (checks conn composite illegal))
+        )
+        (setup conn)
+
+
+setup : Db -> Task Error ()
+setup conn =
+    List.foldl
+        (\stmt acc -> Task.andThen (\_ -> Task.map (\_ -> ()) (Unsafe.unsafeExecRaw conn stmt)) acc)
+        (Task.succeed ())
+        [ "CREATE TABLE memberships (user_id TEXT NOT NULL, group_id TEXT NOT NULL, role TEXT NOT NULL, PRIMARY KEY (user_id, group_id))"
+        , "INSERT INTO memberships (user_id, group_id, role) VALUES ('u1', 'g1', 'member')"
+        , "INSERT INTO memberships (user_id, group_id, role) VALUES ('u2', 'g1', 'member')"
+        ]
+
+
+checks : Db -> Store Store.Row -> Draft Store.Row -> List (Task Error String)
+checks conn composite illegal =
+    let
+        bad =
+            Store.public illegal
+    in
+    [ refused "composite-get" compositeNeedle (Store.get conn composite (SqlString "u1"))
+    , refused "composite-update" compositeNeedle (Store.update conn composite hijackTemplate)
+    , refused "composite-delete" compositeNeedle (Store.delete conn composite (SqlString "u1"))
+    , Task.map
+        (\n -> String.concat [ "composite-update-where:", String.fromInt n ])
+        (Store.updateWhere conn composite (StoreU.eq "user_id" (SqlString "u1")) hijackTemplate)
+    , snapshot "after-update-where" conn composite
+    , refused "illegal-update-where" illegalNeedle (Store.updateWhere conn bad (StoreU.eq "user_id" (SqlString "u1")) hijackTemplate)
+    , refused "illegal-insert" illegalNeedle (Store.insert conn bad newRow)
+    , refused "illegal-delete-where" illegalNeedle (Store.deleteWhere conn bad (StoreU.eq "user_id" (SqlString "u1")))
+    , refused "illegal-find-where" illegalNeedle (Store.findWhere conn bad (Sql.eq (Sql.column "user_id") (Sql.string "u1")))
+    , refused "illegal-all" illegalNeedle (Store.all conn bad)
+    , refused "illegal-find-by" illegalNeedle (Store.findBy conn bad "user_id" (SqlString "u1"))
+    , refused "illegal-get" illegalNeedle (Store.get conn bad (SqlString "u1"))
+    , refused "illegal-query" illegalNeedle (Store.toList conn (Store.query bad))
+    , refused "illegal-join" illegalNeedle (Store.joinToList conn (Store.joinNamed composite "user_id" bad "user_id"))
+    , Task.succeed (securedLine illegal)
+    , snapshot "final" conn composite
+    ]
+
+
+-- `label:rejected` when `task` fails with an error whose message contains
+-- `needle`; any success or any other error is a FAIL line.
+refused : String -> String -> Task Error a -> Task Error String
+refused label needle task =
+    Task.onError
+        (\e ->
+            if String.contains needle (Error.message e) then
+                Task.succeed (String.concat [ label, ":rejected" ])
+
+            else
+                Task.succeed (String.concat [ label, ":FAIL-wrong-error:", Error.message e ])
+        )
+        (Task.map (\_ -> String.concat [ label, ":FAIL-accepted" ]) task)
+
+
+securedLine : Draft Store.Row -> String
+securedLine illegal =
+    case Store.secured (Store.readOnly Store.never) illegal of
+        Err e ->
+            if String.contains illegalNeedle (Error.message e) then
+                "illegal-secured:rejected"
+
+            else
+                String.concat [ "illegal-secured:FAIL-wrong-error:", Error.message e ]
+
+        Ok _ ->
+            "illegal-secured:FAIL-accepted"
+
+
+-- Every row as `user_id/group_id/role`, ordered by user id.
+snapshot : String -> Db -> Store Store.Row -> Task Error String
+snapshot label conn store =
+    Task.map
+        (\rows -> String.concat [ label, ":", String.join "," (List.map renderRow rows) ])
+        (Store.query store
+            |> Store.orderAsc "user_id"
+            |> Store.toList conn
+        )
+
+
+renderRow : Store.Row -> String
+renderRow row =
+    String.join "/" [ cell "user_id" row, cell "group_id" row, cell "role" row ]
+
+
+cell : String -> Store.Row -> String
+cell name row =
+    case Dict.get name row of
+        Just (Just s) ->
+            s
+
+        Just Nothing ->
+            "NULL"
+
+        Nothing ->
+            "?"

@@ -1,4 +1,8 @@
-use crate::html::{Attribute, ElementBody, Html, ParseContext, admit_rendered_in};
+use crate::html::{
+    Attribute, ElementBody, Html, ParseContext, RenderCtx, RenderedElement, STAMPED_ID_ATTR,
+    admit_rendered_in, attribute_pairs,
+};
+use std::borrow::Cow;
 use std::collections::HashMap;
 
 /// A single DOM patch emitted by `diff` (JSON: `id`, `text`, `html`, `attrs`,
@@ -18,10 +22,11 @@ pub struct Patch {
     pub text: Option<String>,
     #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
     pub html: Option<String>,
-    /// Attribute delta: present key with non-empty value → set; empty value → remove.
-    /// Convention: `""` means remove; `BoolAttr(k,true)` encodes as `{k:k}`.
+    /// Attribute delta: `Some(v)` sets the attribute to `v` (an empty `v`
+    /// included, as first paint writes `name=""`), `None` removes it. On the
+    /// wire a removal is JSON `null`, a set is a string.
     #[cfg_attr(feature = "serde", serde(skip_serializing_if = "HashMap::is_empty"))]
-    pub attrs: HashMap<String, String>,
+    pub attrs: HashMap<String, Option<String>>,
     #[cfg_attr(feature = "serde", serde(skip_serializing_if = "std::ops::Not::not"))]
     pub remove: bool,
 }
@@ -52,11 +57,197 @@ impl Patch {
 /// - Keyed identity is carried by `assign_ipe_ids` (the `:{key}` segment): a
 ///   position whose key differs between the trees holds a different node, so
 ///   its parent's children are replaced rather than patched under the old id.
+///
+/// Every subtree a patch carries as markup is rendered under `stamp`, the
+/// render context of the session the patches are sent to.
 #[must_use]
-pub fn diff<M>(old: &Html<M>, new: &Html<M>) -> Vec<Patch> {
+pub fn diff<M>(old: &Html<M>, new: &Html<M>, stamp: &RenderCtx<'_>) -> Vec<Patch> {
     let mut out = vec![];
-    diff_node_depth(old, new, ParseContext::Data, &mut out, 0);
+    // A root has no ancestor to hand an unaddressed change to. Every caller
+    // stamps the root through `assign_ipe_ids` with a non-empty path, so the
+    // root is addressable and its pair never reports `Unaddressed`.
+    let (Reach::Patched | Reach::Unaddressed) =
+        diff_node_depth(old, new, ParseContext::Data, &mut out, 0, stamp);
     out
+}
+
+/// The page events after which the load's own autofocus is spent: the user
+/// pressed a key or the pointer, or focus moved, before the first paint could
+/// focus anything. `client.js` listens for the same list at load; the wasm
+/// loader hears them through [`autofocus_spent_listener_js`].
+pub const AUTOFOCUS_SPENDING_EVENTS: [&str; 5] = [
+    "focusin",
+    "pointerdown",
+    "mousedown",
+    "touchstart",
+    "keydown",
+];
+
+/// Whether every name is non-empty ASCII lowercase letters, which need no
+/// escaping inside a JavaScript string in a `<script>`.
+const fn spending_events_plain() -> bool {
+    let mut names: &[&str] = &AUTOFOCUS_SPENDING_EVENTS;
+    while let [name, rest @ ..] = names {
+        let mut bytes = name.as_bytes();
+        if bytes.is_empty() {
+            return false;
+        }
+        while let [byte, tail @ ..] = bytes {
+            if !byte.is_ascii_lowercase() {
+                return false;
+            }
+            bytes = tail;
+        }
+        names = rest;
+    }
+    true
+}
+// IPE-RUST-AUDIT:ACCEPTED (Arthur Maciel) — compile-time `const` assertion (not a runtime panic); fails the BUILD if an autofocus-spending event name is empty or holds a byte other than an ASCII lowercase letter [ledger #boundary]
+const _: () = assert!(spending_events_plain());
+
+/// The page global the wasm loader sets once one of
+/// [`AUTOFOCUS_SPENDING_EVENTS`] fires; the wasm first paint reads it.
+pub const AUTOFOCUS_SPENT_GLOBAL: &str = "__ipeAutofocusSpent";
+
+/// The `keyCode` a browser gives a key an input method takes for its
+/// composition; neither client counts such a key as the user's act.
+pub const COMPOSING_KEY_CODE: u32 = 229;
+
+/// [`AUTOFOCUS_SPENDING_EVENTS`] as a JavaScript array literal.
+#[must_use]
+pub fn autofocus_spending_events_js() -> String {
+    let mut out = String::from("[");
+    for (i, name) in AUTOFOCUS_SPENDING_EVENTS.iter().enumerate() {
+        if i > 0 {
+            out.push_str(", ");
+        }
+        out.push('"');
+        crate::escape::json_str_body_into(name, &mut out);
+        out.push('"');
+    }
+    out.push(']');
+    out
+}
+
+/// The loader statements that set [`AUTOFOCUS_SPENT_GLOBAL`] on the first of
+/// [`AUTOFOCUS_SPENDING_EVENTS`], each heard in the capture phase from the
+/// moment the loader runs, before the wasm module is fetched.
+#[must_use]
+pub fn autofocus_spent_listener_js() -> String {
+    let mut out = String::from("for (const type of ");
+    out.push_str(&autofocus_spending_events_js());
+    out.push_str(") {\n  document.addEventListener(type, () => { globalThis.");
+    out.push_str(AUTOFOCUS_SPENT_GLOBAL);
+    out.push_str(" = true; }, true);\n}\n");
+    out
+}
+
+/// The server identity of a stamped element that a render asks to focus.
+///
+/// It is built only from the `ipe-id` the stamper wrote on an element of a
+/// rendered tree, never from program text, so the client resolves it with the
+/// same `[ipe-id=…]` lookup a patch uses.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize), serde(transparent))]
+pub struct StampedId(String);
+
+impl StampedId {
+    /// The stamped `ipe-id`.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// The element a render moves keyboard focus onto, if any.
+///
+/// It is the first element of `new`, in document order, that is on the page,
+/// carries a stamped `ipe-id` and an `autofocus` attribute, and whose identity
+/// carried no `autofocus` in `old`. The answer depends only on the two trees,
+/// never on how `diff` patches between them.
+#[must_use]
+pub fn focus_target<M>(old: &Html<M>, new: &Html<M>) -> Option<StampedId> {
+    let mut before = std::collections::HashSet::new();
+    for_each_autofocus(old, |id| {
+        before.insert(id);
+        false
+    });
+    let mut found = None;
+    for_each_autofocus(new, |id| {
+        if before.contains(id) {
+            return false;
+        }
+        found = Some(StampedId(id.to_owned()));
+        true
+    });
+    found
+}
+
+/// Whether `attrs` render an `autofocus` attribute.
+///
+/// A `BoolAttr(_, false)` renders nothing, so it neither adds nor removes one.
+fn has_autofocus<M>(attrs: &[Attribute<M>]) -> bool {
+    attrs.iter().any(|a| match a {
+        Attribute::Attr(k, _) | Attribute::BoolAttr(k, true) => k.eq_ignore_ascii_case("autofocus"),
+        Attribute::BoolAttr(_, false) | Attribute::EventAttr(_) | Attribute::NoAttr => false,
+    })
+}
+
+/// Visit the stamped `ipe-id` of each autofocus element of `root`, in document
+/// order, until `visit` returns true.
+///
+/// The walk admits nodes as the render sink does: a refused element is absent
+/// with its subtree, the `Html.doctype` wrapper is no element of its own, a
+/// raw-text body and the children of an RCDATA or RAWTEXT element are text, a
+/// `<template>`'s children are not in the document, and `HText` and `HRaw` are
+/// opaque. It stops at `MAX_HTML_DEPTH`, past which nothing is rendered, and
+/// keeps its own worklist, so the tree's depth never reaches the thread stack.
+fn for_each_autofocus<'a, M>(root: &'a Html<M>, mut visit: impl FnMut(&'a str) -> bool) {
+    let mut work: Vec<(&'a Html<M>, ParseContext, usize)> = vec![(root, ParseContext::Data, 0)];
+    while let Some((node, ctx, depth)) = work.pop() {
+        if depth >= crate::html::MAX_HTML_DEPTH {
+            continue;
+        }
+        let Html::HElement(tag, attrs, kids) = node else {
+            continue;
+        };
+        let Ok(rendered) = admit_rendered_in(ctx, tag, attrs, kids) else {
+            continue;
+        };
+        let child_ctx = match rendered {
+            RenderedElement::Doctype => ctx,
+            RenderedElement::Element(ElementBody::Script | ElementBody::Style) => continue,
+            RenderedElement::Element(ElementBody::Markup) => {
+                if has_autofocus(attrs)
+                    && let Some(id) = address(node)
+                    && visit(id)
+                {
+                    return;
+                }
+                if tag.eq_ignore_ascii_case("template") {
+                    continue;
+                }
+                ctx.enter(tag)
+            }
+        };
+        if child_ctx == ParseContext::RawOrRcdata {
+            continue;
+        }
+        let child_depth = depth.saturating_add(1);
+        work.extend(kids.iter().rev().map(|k| (k, child_ctx, child_depth)));
+    }
+}
+
+/// Whether every change between an element pair reached the patch list.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[must_use]
+enum Reach {
+    /// Every change is in the patch list, or the pair has none.
+    Patched,
+    /// The pair differs, but the change lies at an element with no `ipe-id`,
+    /// which no patch can address; the nearest addressable ancestor must
+    /// replace its children.
+    Unaddressed,
 }
 
 // ─── internal helpers ─────────────────────────────────────────────────────────
@@ -65,7 +256,7 @@ fn ipe_id<M>(n: &Html<M>) -> Option<&str> {
     if let Html::HElement(_, attrs, _) = n {
         for a in attrs {
             if let Attribute::Attr(k, v) = a
-                && k == "ipe-id"
+                && k == STAMPED_ID_ATTR
             {
                 return Some(v);
             }
@@ -74,10 +265,17 @@ fn ipe_id<M>(n: &Html<M>) -> Option<&str> {
     None
 }
 
+/// The `ipe-id` a patch to `n` is sent to, or `None` when no patch can reach it.
+fn address<M>(n: &Html<M>) -> Option<&str> {
+    ipe_id(n).filter(|id| !id.is_empty())
+}
+
 /// True when `old` and `new` are the same node for in-place patching: both
 /// elements with equal tags and equal server identity (`ipe-id`). An element
-/// unstamped on both sides lies past the stamping depth ceiling, where
-/// `diff_node_depth` emits nothing.
+/// unstamped on both sides lies past the stamping depth ceiling, where the
+/// renderer writes no node and `diff_node_depth` emits nothing, or was built
+/// after the stamper ran, where `diff_node_depth` reports a change beneath it
+/// as [`Reach::Unaddressed`].
 fn same_node<M>(old: &Html<M>, new: &Html<M>) -> bool {
     match (old, new) {
         (Html::HElement(ot, _, _), Html::HElement(nt, _, _)) => {
@@ -89,6 +287,9 @@ fn same_node<M>(old: &Html<M>, new: &Html<M>) -> bool {
 
 /// Emit a replace of every child of the element at `id`.
 ///
+/// With no `id` the replace cannot be addressed, so the change is handed to
+/// the nearest addressable ancestor as [`Reach::Unaddressed`].
+///
 /// `parent_body` is how `admit_rendered_in` admitted that element and
 /// `child_ctx` is the parse context it puts its children in. A markup body
 /// is sent as `Patch.html`, which the client parses as markup. A `<script>` or
@@ -99,29 +300,31 @@ fn same_node<M>(old: &Html<M>, new: &Html<M>) -> bool {
 /// `<img onerror>` or a `<script src>` inside it is live markup and an entity
 /// such as `&amp;` is decoded.
 fn push_children_replace<M>(
-    id: &str,
+    id: Option<&str>,
     parent_body: ElementBody,
     child_ctx: ParseContext,
     new_kids: &[Html<M>],
     out: &mut Vec<Patch>,
-) {
-    if id.is_empty() {
-        return;
-    }
+    stamp: &RenderCtx<'_>,
+) -> Reach {
+    let Some(id) = id else {
+        return Reach::Unaddressed;
+    };
     let mut p = Patch::for_id(id);
-    let body = render_children(parent_body, child_ctx, new_kids);
+    let body = render_children(parent_body, child_ctx, new_kids, stamp);
     match parent_body {
         ElementBody::Markup => p.html = Some(body),
         ElementBody::Script | ElementBody::Style => p.text = Some(body),
     }
     out.push(p);
+    Reach::Patched
 }
 
 /// True when `node`, written in `ctx`, is an element the render sink's
 /// admission rule refuses, so the renderer leaves it out of the page.
 fn is_refused_element<M>(ctx: ParseContext, node: &Html<M>) -> bool {
     match node {
-        Html::HElement(tag, _, kids) => admit_rendered_in(ctx, tag, kids).is_err(),
+        Html::HElement(tag, attrs, kids) => admit_rendered_in(ctx, tag, attrs, kids).is_err(),
         Html::HText(_) | Html::HRaw(_) => false,
     }
 }
@@ -130,16 +333,22 @@ fn is_refused_element<M>(ctx: ParseContext, node: &Html<M>) -> bool {
 /// `html.rs::render_into_ctx`) rather than recursing into an arbitrarily deep
 /// Model-derived tree that would overflow the thread stack. `ctx` is the parse
 /// context both nodes are written in, threaded from the root exactly as the
-/// render sink threads it.
+/// render sink threads it, and `stamp` is the session's render context.
+///
+/// A change at an element with no `ipe-id` is never dropped: it returns
+/// [`Reach::Unaddressed`], and the first addressable ancestor replaces its
+/// children, re-rendering the change.
 fn diff_node_depth<M>(
     old: &Html<M>,
     new: &Html<M>,
     ctx: ParseContext,
     out: &mut Vec<Patch>,
     depth: usize,
-) {
+    stamp: &RenderCtx<'_>,
+) -> Reach {
+    // Past the ceiling the renderer writes no node, so there is nothing to patch.
     if depth >= crate::html::MAX_HTML_DEPTH {
-        return;
+        return Reach::Patched;
     }
     let (ot, oa, ok, nt, na, nk) = match (old, new) {
         (Html::HElement(ot, oa, ok), Html::HElement(nt, na, nk)) if same_node(old, new) => {
@@ -150,7 +359,7 @@ fn diff_node_depth<M>(
         // so nothing is emitted; every caller stamps both trees from the same
         // root path, which a root's `ipe-id` equals, so a top-level identity
         // mismatch does not arise.
-        _ => return,
+        _ => return Reach::Patched,
     };
     // SECURITY: the render sink's own admission rule. A refused element is
     // absent from the rendered page, so neither side of a refused pair has a
@@ -159,23 +368,25 @@ fn diff_node_depth<M>(
     // same rule. The `Html.doctype` wrapper is admitted as markup, so a view
     // rooted at it is diffed through to its children.
     let (Ok(new_rendered), Ok(_)) = (
-        admit_rendered_in(ctx, nt, nk),
-        admit_rendered_in(ctx, ot, ok),
+        admit_rendered_in(ctx, nt, na, nk),
+        admit_rendered_in(ctx, ot, oa, ok),
     ) else {
-        return;
+        return Reach::Patched;
     };
     let body = new_rendered.body();
     let child_ctx = ctx.enter(nt);
-    // Patch id targets the element currently in the DOM — the OLD tree's id
-    // . Borrowed: `Patch::for_id` copies it only when
-    // a Patch is actually built, so an unchanged element pair allocates
-    // nothing here (efficiency-audit §6 medium).
-    let id: &str = ipe_id(old).unwrap_or("");
+    // Patch id targets the element currently in the DOM: the OLD tree's id.
+    // Borrowed: `Patch::for_id` copies it only when a Patch is actually built,
+    // so an unchanged element pair allocates nothing here.
+    let id = address(old);
 
     // Attribute + event delta.
-    let mut p = Patch::for_id(id);
-    diff_attrs(oa, na, &mut p);
-    if !id.is_empty() && !p.attrs.is_empty() {
+    let mut p = Patch::for_id(id.unwrap_or_default());
+    diff_attrs(child_ctx, nt, oa, na, &mut p);
+    if !p.attrs.is_empty() {
+        if id.is_none() {
+            return Reach::Unaddressed;
+        }
         out.push(p);
     }
 
@@ -184,18 +395,20 @@ fn diff_node_depth<M>(
         && nk.len() == 1
         && let (Some(Html::HText(o)), Some(Html::HText(n))) = (ok.first(), nk.first())
     {
-        if o != n && !id.is_empty() {
+        if o != n {
+            let Some(id) = id else {
+                return Reach::Unaddressed;
+            };
             let mut tp = Patch::for_id(id);
             tp.text = Some(n.clone());
             out.push(tp);
         }
-        return;
+        return Reach::Patched;
     }
 
     // Child-count change → replace the whole subtree.
     if ok.len() != nk.len() {
-        push_children_replace(id, body, child_ctx, nk, out);
-        return;
+        return push_children_replace(id, body, child_ctx, nk, out, stamp);
     }
 
     let child_depth = depth.saturating_add(1);
@@ -207,8 +420,7 @@ fn diff_node_depth<M>(
                 // (single-text is the fast path above; anything else is a
                 // parent html-replace).
                 if o != n {
-                    push_children_replace(id, body, child_ctx, nk, out);
-                    return;
+                    return push_children_replace(id, body, child_ctx, nk, out, stamp);
                 }
             }
             // A changed trusted raw body (a dynamic `styleNode`, an
@@ -216,66 +428,68 @@ fn diff_node_depth<M>(
             // the same body class the first paint used.
             (Html::HRaw(o), Html::HRaw(n)) => {
                 if o != n {
-                    push_children_replace(id, body, child_ctx, nk, out);
-                    return;
+                    return push_children_replace(id, body, child_ctx, nk, out, stamp);
                 }
             }
             (Html::HElement(..), Html::HElement(..)) if same_node(oc, nc) => {
                 // A child that gains or loses admission appears in or vanishes
                 // from the page, so the parent's subtree is replaced.
                 if is_refused_element(child_ctx, oc) != is_refused_element(child_ctx, nc) {
-                    push_children_replace(id, body, child_ctx, nk, out);
-                    return;
+                    return push_children_replace(id, body, child_ctx, nk, out, stamp);
                 }
-                diff_node_depth(oc, nc, child_ctx, out, child_depth);
+                // A change the child cannot address is re-rendered here.
+                if diff_node_depth(oc, nc, child_ctx, out, child_depth, stamp) == Reach::Unaddressed
+                {
+                    return push_children_replace(id, body, child_ctx, nk, out, stamp);
+                }
             }
             // Tag / kind / identity mismatch → replace the subtree at the parent.
             _ => {
-                push_children_replace(id, body, child_ctx, nk, out);
-                return;
+                return push_children_replace(id, body, child_ctx, nk, out, stamp);
             }
         }
     }
+    Reach::Patched
 }
 
-/// Compute the attribute + event delta between `old` and `new`.
-/// Keys changed or added → new value. Keys removed → `""` (signals removal).
-/// `ipe-id` is excluded (never patched as an attribute).
-fn diff_attrs<M>(old: &[Attribute<M>], new: &[Attribute<M>], p: &mut Patch) {
-    // Borrowed maps: cloning every key AND value of every element into two
-    // owned HashMaps per diff was the hottest allocation in the SSE path
-    // (efficiency-audit §6 high). The changed/added/removed key set is
-    // identical owned-or-borrowed; only `insert_safe_attr` (which already
-    // copies, post-XSS-gate) allocates, and only for changed attrs.
-    // (A named fn, not a closure — fn lifetime elision ties the borrowed map
-    // to the argument slice; closure elision can't express that tie.)
-    fn collect<M>(xs: &[Attribute<M>]) -> HashMap<&str, &str> {
-        let mut m = HashMap::new();
-        for a in xs {
-            match a {
-                Attribute::Attr(k, v) if k != "ipe-id" => {
-                    m.insert(k.as_str(), v.as_str());
-                }
-                Attribute::BoolAttr(k, true) => {
-                    // Key-as-value (`attr = k`) encodes a present boolean attr;
-                    // "" is the remove sentinel only.
-                    m.insert(k.as_str(), k.as_str());
-                }
-                _ => {}
-            }
-        }
-        m
+/// Compute the attribute + event delta between `old` and `new`, the
+/// attributes of two elements `tag` whose children are written in `child_ctx`.
+///
+/// Keys changed or added → `Some(new value)`; keys removed → `None`.
+/// The pairs compared are [`attribute_pairs`], the pairs first paint writes,
+/// so every key is the name the DOM stores (a key that changes only its ASCII
+/// case patches nothing) and an `iframe`'s canonical `sandbox` is on both
+/// sides and never removed. `ipe-id` is excluded (never patched as an
+/// attribute).
+fn diff_attrs<M>(
+    child_ctx: ParseContext,
+    tag: &str,
+    old: &[Attribute<M>],
+    new: &[Attribute<M>],
+    p: &mut Patch,
+) {
+    // Borrowed keys and values: only `insert_safe_attr` (which copies,
+    // post-XSS-gate) allocates, and only for a changed attribute; a merged
+    // `class`/`style` and a key written in another case are the owned ones.
+    fn collect<'a, M>(
+        child_ctx: ParseContext,
+        tag: &str,
+        xs: &'a [Attribute<M>],
+    ) -> HashMap<Cow<'a, str>, Cow<'a, str>> {
+        attribute_pairs(child_ctx, tag, xs)
+            .into_iter()
+            .filter(|(k, _)| *k != STAMPED_ID_ATTR)
+            .collect()
     }
-    let (om, nm) = (collect(old), collect(new));
+    let (om, nm) = (collect(child_ctx, tag, old), collect(child_ctx, tag, new));
     for (k, v) in &nm {
         if om.get(k) != Some(v) {
-            insert_safe_attr(p, k, v);
+            insert_safe_attr(p, k, Some(v.as_ref()));
         }
     }
     for k in om.keys() {
         if !nm.contains_key(k) {
-            // Signal removal with empty string.
-            insert_safe_attr(p, k, "");
+            insert_safe_attr(p, k, None);
         }
     }
     diff_events(old, new, p);
@@ -286,17 +500,18 @@ fn diff_attrs<M>(old: &[Attribute<M>], new: &[Attribute<M>], p: &mut Patch) {
 /// attribute-name gate (no `on*` handlers / `srcdoc` / structural-breakout
 /// charset) + URL-scheme sanitisation of the value. SSE patches are applied by
 /// the browser via `setAttribute`, which bypasses `render_into_ctx`'s gates, so
-/// this is THE gate for the patch path. A name that fails policy is dropped.
-fn insert_safe_attr(p: &mut Patch, key: &str, val: &str) {
-    if let Some((k, v)) = crate::html::safe_patch_attr(key, val) {
-        p.attrs.insert(k.to_string(), v.to_string());
+/// this is THE gate for the patch path. A name that fails policy is dropped,
+/// removal included.
+fn insert_safe_attr(p: &mut Patch, key: &str, val: Option<&str>) {
+    if let Some((k, v)) = crate::html::safe_patch_attr(key, val.unwrap_or_default()) {
+        p.attrs.insert(k.to_string(), val.map(|_| v.to_string()));
     }
 }
 
 /// Event-handler delta: an element gaining a handler emits `ipe-<event>` =
 /// `<event>` (the value the client posts back as `msg`, matching `render_html`)
 /// plus a fresh `data-ipe-hid`; an element losing a handler emits
-/// `ipe-<event>` = `""` (remove), and clears `data-ipe-hid` once the last
+/// a removal of `ipe-<event>`, and clears `data-ipe-hid` once the last
 /// handler is gone. Without this, toggling a handler leaves a stale listener
 /// marker and the user's gesture is silently dropped.
 fn diff_events<M>(old: &[Attribute<M>], new: &[Attribute<M>], p: &mut Patch) {
@@ -325,15 +540,15 @@ fn diff_events<M>(old: &[Attribute<M>], new: &[Attribute<M>], p: &mut Patch) {
     let hid = crate::html::HANDLER_ID_ATTR;
     for ev in &nn {
         if !on.contains(ev) {
-            insert_marker_attr(p, &ev_key(ev), ev);
-            insert_marker_attr(p, hid, &id);
+            insert_marker_attr(p, &ev_key(ev), Some(ev));
+            insert_marker_attr(p, hid, Some(&id));
         }
     }
     for ev in &on {
         if !nn.contains(ev) {
-            insert_marker_attr(p, &ev_key(ev), "");
+            insert_marker_attr(p, &ev_key(ev), None);
             if nn.is_empty() {
-                insert_marker_attr(p, hid, "");
+                insert_marker_attr(p, hid, None);
             }
         }
     }
@@ -342,9 +557,9 @@ fn diff_events<M>(old: &[Attribute<M>], new: &[Attribute<M>], p: &mut Patch) {
 /// Insert a listener marker of the event delta through
 /// [`crate::html::patch_marker_attr`]; a program-built attribute takes
 /// [`insert_safe_attr`] instead, which refuses every runtime wire-marker name.
-fn insert_marker_attr(p: &mut Patch, key: &str, val: &str) {
-    if let Some((k, v)) = crate::html::patch_marker_attr(key, val) {
-        p.attrs.insert(k.to_string(), v.to_string());
+fn insert_marker_attr(p: &mut Patch, key: &str, val: Option<&str>) {
+    if let Some((k, v)) = crate::html::patch_marker_attr(key, val.unwrap_or_default()) {
+        p.attrs.insert(k.to_string(), val.map(|_| v.to_string()));
     }
 }
 
@@ -357,9 +572,10 @@ fn render_children<M>(
     parent_body: ElementBody,
     child_ctx: ParseContext,
     kids: &[Html<M>],
+    stamp: &RenderCtx<'_>,
 ) -> String {
     let mut s = String::new();
-    crate::html::render_children_into(parent_body, child_ctx, kids, &mut s);
+    crate::html::render_children_into(parent_body, child_ctx, kids, &mut s, stamp);
     s
 }
 
@@ -371,6 +587,11 @@ mod tests {
     use super::*;
     use crate::{Event, assign_ipe_ids};
 
+    /// The diff of an unstamped render.
+    fn plain<M>(old: &Html<M>, new: &Html<M>) -> Vec<Patch> {
+        diff(old, new, &RenderCtx::Unstamped)
+    }
+
     fn ids(h: &mut Html<()>) {
         assign_ipe_ids(h, "r");
     }
@@ -381,7 +602,7 @@ mod tests {
         let mut b: Html<()> = Html::HElement("p".into(), vec![], vec![Html::HText("2".into())]);
         ids(&mut a);
         ids(&mut b);
-        let p = diff(&a, &b);
+        let p = plain(&a, &b);
         assert_eq!(p.len(), 1);
         assert_eq!(p[0].id, "r");
         assert_eq!(p[0].text.as_deref(), Some("2"));
@@ -404,11 +625,11 @@ mod tests {
         );
         ids(&mut a);
         ids(&mut b);
-        let p = diff(&a, &b);
+        let p = plain(&a, &b);
         assert_eq!(p.len(), 1);
         let attrs = &p[0].attrs;
-        assert_eq!(attrs.get("class").map(String::as_str), Some("y"));
-        assert_eq!(attrs.get("title").map(String::as_str), Some("t"));
+        assert_eq!(attrs.get("class").map(Option::as_deref), Some(Some("y")));
+        assert_eq!(attrs.get("title").map(Option::as_deref), Some(Some("t")));
     }
 
     #[test]
@@ -433,7 +654,7 @@ mod tests {
         );
         ids(&mut a);
         ids(&mut b);
-        let p = diff(&a, &b);
+        let p = plain(&a, &b);
         // The onerror attr never reaches the patch; only the (unchanged) src is
         // absent too, so the patch carries no dangerous attribute.
         assert!(
@@ -459,11 +680,11 @@ mod tests {
         );
         ids(&mut a);
         ids(&mut b);
-        let p = diff(&a, &b);
+        let p = plain(&a, &b);
         assert_eq!(p.len(), 1);
         // href is still patched (the key passes the name gate) but the
         // dangerous value is neutralised to empty.
-        assert_eq!(p[0].attrs.get("href").map(String::as_str), Some(""));
+        assert_eq!(p[0].attrs.get("href").map(Option::as_deref), Some(Some("")));
     }
 
     #[test]
@@ -472,11 +693,11 @@ mod tests {
         let mut b = a.clone();
         ids(&mut a);
         ids(&mut b);
-        assert!(diff(&a, &b).is_empty());
+        assert!(plain(&a, &b).is_empty());
     }
 
     #[test]
-    fn diff_bool_attr_add_uses_key_as_value() {
+    fn diff_bool_attr_add_patches_the_painted_value() {
         let mut a: Html<()> = Html::HElement("button".into(), vec![], vec![]);
         let mut b: Html<()> = Html::HElement(
             "button".into(),
@@ -485,12 +706,12 @@ mod tests {
         );
         ids(&mut a);
         ids(&mut b);
-        let p = diff(&a, &b);
+        let p = plain(&a, &b);
         assert_eq!(p.len(), 1);
-        // present BoolAttr encodes as {k: k}, NOT {k: ""}.
+        // A present BoolAttr patches the value first paint writes, `"true"`.
         assert_eq!(
-            p[0].attrs.get("disabled").map(String::as_str),
-            Some("disabled")
+            p[0].attrs.get("disabled").map(Option::as_deref),
+            Some(Some("true"))
         );
     }
 
@@ -500,20 +721,23 @@ mod tests {
         let mut a: Html<()> = Html::HElement("button".into(), vec![], vec![]);
         let mut b: Html<()> = Html::HElement(
             "button".into(),
-            vec![Attribute::EventAttr(Event::OnMsg("click".into(), ()))],
+            vec![Attribute::EventAttr(Event::OnMsg(
+                "click".into(),
+                Box::new(()),
+            ))],
             vec![],
         );
         ids(&mut a);
         ids(&mut b);
-        let p = diff(&a, &b);
+        let p = plain(&a, &b);
         assert_eq!(p.len(), 1);
         assert_eq!(
-            p[0].attrs.get("ipe-click").map(String::as_str),
-            Some("click")
+            p[0].attrs.get("ipe-click").map(Option::as_deref),
+            Some(Some("click"))
         );
         assert_eq!(
-            p[0].attrs.get("data-ipe-hid").map(String::as_str),
-            Some("r")
+            p[0].attrs.get("data-ipe-hid").map(Option::as_deref),
+            Some(Some("r"))
         );
     }
 
@@ -521,17 +745,26 @@ mod tests {
     fn diff_event_removed_clears_marker_and_hid() {
         let mut a: Html<()> = Html::HElement(
             "button".into(),
-            vec![Attribute::EventAttr(Event::OnMsg("click".into(), ()))],
+            vec![Attribute::EventAttr(Event::OnMsg(
+                "click".into(),
+                Box::new(()),
+            ))],
             vec![],
         );
         let mut b: Html<()> = Html::HElement("button".into(), vec![], vec![]);
         ids(&mut a);
         ids(&mut b);
-        let p = diff(&a, &b);
+        let p = plain(&a, &b);
         assert_eq!(p.len(), 1);
-        // Removal sentinel: empty string for both the marker and the (now-stale) hid.
-        assert_eq!(p[0].attrs.get("ipe-click").map(String::as_str), Some(""));
-        assert_eq!(p[0].attrs.get("data-ipe-hid").map(String::as_str), Some(""));
+        // Both the marker and the now-stale hid are removed.
+        assert_eq!(
+            p[0].attrs.get("ipe-click").map(Option::as_deref),
+            Some(None)
+        );
+        assert_eq!(
+            p[0].attrs.get("data-ipe-hid").map(Option::as_deref),
+            Some(None)
+        );
     }
 
     /// A program-built handler id is never patched onto an element: the
@@ -543,7 +776,7 @@ mod tests {
                 "button".into(),
                 vec![
                     Attribute::Attr("data-ipe-hid".into(), hid.into()),
-                    Attribute::EventAttr(Event::OnMsg("click".into(), ())),
+                    Attribute::EventAttr(Event::OnMsg("click".into(), Box::new(()))),
                 ],
                 vec![],
             )
@@ -552,7 +785,7 @@ mod tests {
         let mut b = button("r_9_button");
         ids(&mut a);
         ids(&mut b);
-        assert!(diff(&a, &b).is_empty());
+        assert!(plain(&a, &b).is_empty());
         let mut patch = Patch {
             id: "r".into(),
             text: None,
@@ -561,6 +794,8 @@ mod tests {
             remove: false,
         };
         diff_attrs::<()>(
+            ParseContext::Data,
+            "button",
             &[],
             &[Attribute::Attr("data-ipe-hid".into(), "r_9_button".into())],
             &mut patch,
@@ -586,7 +821,7 @@ mod tests {
         let mut b = mk("y");
         ids(&mut a);
         ids(&mut b);
-        let p = diff(&a, &b);
+        let p = plain(&a, &b);
         assert_eq!(p.len(), 1);
         assert_eq!(p[0].id, "r");
         assert!(p[0].html.is_some(), "expected html replace, got {:?}", p[0]);
@@ -610,13 +845,13 @@ mod tests {
         );
         ids(&mut a);
         ids(&mut b);
-        let p = diff(&a, &b);
+        let p = plain(&a, &b);
         assert_eq!(p.len(), 1);
         assert!(p[0].html.is_some());
     }
 
     #[test]
-    fn diff_bool_attr_remove_uses_empty_string() {
+    fn diff_bool_attr_remove_patches_a_removal() {
         let mut a: Html<()> = Html::HElement(
             "button".into(),
             vec![Attribute::BoolAttr("disabled".into(), true)],
@@ -625,10 +860,9 @@ mod tests {
         let mut b: Html<()> = Html::HElement("button".into(), vec![], vec![]);
         ids(&mut a);
         ids(&mut b);
-        let p = diff(&a, &b);
+        let p = plain(&a, &b);
         assert_eq!(p.len(), 1);
-        // Removal sentinel: empty string.
-        assert_eq!(p[0].attrs.get("disabled").map(String::as_str), Some(""));
+        assert_eq!(p[0].attrs.get("disabled").map(Option::as_deref), Some(None));
     }
 
     // RT-UI-001: depth cap — diff must return (not abort/stack-overflow) when
@@ -651,7 +885,7 @@ mod tests {
         assign_ipe_ids(&mut old, "r");
         assign_ipe_ids(&mut new, "r");
         // This call must return, not overflow the stack.
-        let patches = diff(&old, &new);
+        let patches = plain(&old, &new);
         // Identical trees produce no patches (or only structural no-ops).
         // The exact count is less important than the call completing.
         let _ = patches;
@@ -676,7 +910,7 @@ mod tests {
         );
         ids(&mut old);
         ids(&mut new);
-        let p = diff(&old, &new);
+        let p = plain(&old, &new);
         assert_eq!(p.len(), 1, "expected exactly one text-replace patch");
         let Some(patch) = p.first() else {
             return;
@@ -714,7 +948,7 @@ mod tests {
         );
         ids(&mut old);
         ids(&mut new);
-        let p = diff(&old, &new);
+        let p = plain(&old, &new);
         assert_eq!(p.len(), 1, "expected exactly one text-replace patch");
         let Some(patch) = p.first() else {
             return;
@@ -753,7 +987,7 @@ mod tests {
             ids(&mut old);
             ids(&mut new);
             assert!(
-                diff(&old, &new).is_empty(),
+                plain(&old, &new).is_empty(),
                 "<{tag}> text body must not be patched"
             );
         }
@@ -777,7 +1011,7 @@ mod tests {
         );
         ids(&mut old);
         ids(&mut new);
-        let p = diff(&old, &new);
+        let p = plain(&old, &new);
         assert_eq!(p.len(), 1, "expected exactly one html-replace patch");
         let html = p[0].html.as_deref().expect("expected html field on patch");
         assert!(
@@ -813,7 +1047,7 @@ mod tests {
             let mut new: Html<()> = Html::HElement(parent.into(), vec![], vec![script()]);
             ids(&mut old);
             ids(&mut new);
-            let patches = diff(&old, &new);
+            let patches = plain(&old, &new);
             assert_eq!(patches.len(), 1, "{parent}: {patches:?}");
             let [patch] = patches.as_slice() else {
                 return;
@@ -843,7 +1077,7 @@ mod tests {
         let mut new = page(vec![script]);
         ids(&mut old);
         ids(&mut new);
-        let patches = diff(&old, &new);
+        let patches = plain(&old, &new);
         assert_eq!(patches.len(), 1, "{patches:?}");
         for p in &patches {
             let html = p.html.as_deref().unwrap_or_default();
@@ -865,7 +1099,7 @@ mod tests {
         let mut new = page("<img src=x onerror=alert(1)>");
         ids(&mut old);
         ids(&mut new);
-        assert!(diff(&old, &new).is_empty());
+        assert!(plain(&old, &new).is_empty());
     }
 
     /// A child-count change that adds a text-bodied `<script>` (or an empty,
@@ -892,7 +1126,7 @@ mod tests {
         );
         ids(&mut old);
         ids(&mut new);
-        let p = diff(&old, &new);
+        let p = plain(&old, &new);
         assert_eq!(p.len(), 1, "expected exactly one html-replace patch");
         let html = p[0].html.as_deref().expect("expected html field on patch");
         assert!(
@@ -919,7 +1153,7 @@ mod tests {
         let mut new = page("after");
         ids(&mut old);
         ids(&mut new);
-        let patches = diff(&old, &new);
+        let patches = plain(&old, &new);
         assert_eq!(patches.len(), 1, "expected one text patch; got {patches:?}");
         let Some(patch) = patches.first() else {
             return;
@@ -941,7 +1175,7 @@ mod tests {
         let mut new = tree("after");
         ids(&mut old);
         ids(&mut new);
-        let patches = diff(&old, &new);
+        let patches = plain(&old, &new);
         assert_eq!(patches.len(), 1, "expected one text patch; got {patches:?}");
         let Some(patch) = patches.first() else {
             return;
@@ -975,7 +1209,7 @@ mod tests {
         let mut new: Html<()> = Html::HElement("div".into(), vec![], vec![script(body)]);
         ids(&mut old);
         ids(&mut new);
-        let patches = diff(&old, &new);
+        let patches = plain(&old, &new);
         assert_eq!(patches.len(), 1, "expected one text patch; got {patches:?}");
         assert!(
             patches
@@ -1014,7 +1248,7 @@ mod tests {
         );
         ids(&mut old);
         ids(&mut new);
-        let patches = diff(&old, &new);
+        let patches = plain(&old, &new);
         assert_eq!(patches.len(), 1, "expected one text patch; got {patches:?}");
         let Some(patch) = patches.first() else {
             return;
@@ -1057,7 +1291,7 @@ mod tests {
         let mut new = tree();
         ids(&mut old);
         ids(&mut new);
-        assert!(diff(&old, &new).is_empty());
+        assert!(plain(&old, &new).is_empty());
     }
 
     fn keyed_li(key: &str, text: &str) -> Html<()> {
@@ -1077,7 +1311,7 @@ mod tests {
         let mut new: Html<()> = Html::HElement("ul".into(), vec![], vec![keyed_li("b", "x")]);
         ids(&mut old);
         ids(&mut new);
-        let patches = diff(&old, &new);
+        let patches = plain(&old, &new);
         assert_eq!(patches.len(), 1, "{patches:?}");
         let Some(patch) = patches.first() else {
             return;
@@ -1104,7 +1338,7 @@ mod tests {
         let mut new: Html<()> = Html::HElement("ul".into(), vec![], vec![keyed_li("a", "y")]);
         ids(&mut old);
         ids(&mut new);
-        let patches = diff(&old, &new);
+        let patches = plain(&old, &new);
         assert_eq!(patches.len(), 1, "{patches:?}");
         let Some(patch) = patches.first() else {
             return;
@@ -1129,7 +1363,7 @@ mod tests {
         let mut new = list("b", "a");
         ids(&mut old);
         ids(&mut new);
-        let patches = diff(&old, &new);
+        let patches = plain(&old, &new);
         assert_eq!(patches.len(), 1, "{patches:?}");
         let Some(patch) = patches.first() else {
             return;
@@ -1157,7 +1391,7 @@ mod tests {
         let mut new = tree("b");
         ids(&mut old);
         ids(&mut new);
-        let patches = diff(&old, &new);
+        let patches = plain(&old, &new);
         assert_eq!(patches.len(), 1, "{patches:?}");
         let Some(patch) = patches.first() else {
             return;
@@ -1170,6 +1404,666 @@ mod tests {
         assert!(
             html.contains("ipe-id=\"r_0_ul_0_li:b\""),
             "the replace carries the new identity; got {html:?}"
+        );
+    }
+
+    /// An inserted `<style>` carries the session's nonce only under that
+    /// session's context, and a replaced style body never holds it.
+    #[test]
+    fn inserted_style_carries_the_session_nonce() {
+        let nonce = crate::csp::StyleNonce::from_random_bytes([0xa7; 16]);
+        let token = nonce.as_token();
+        let style = |css: &str| -> Html<()> {
+            Html::HElement("style".into(), vec![], vec![Html::HRaw(css.into())])
+        };
+        let mut old: Html<()> = Html::HElement("div".into(), vec![], vec![]);
+        let mut new: Html<()> = Html::HElement("div".into(), vec![], vec![style("p{}")]);
+        ids(&mut old);
+        ids(&mut new);
+        let stamped = diff(&old, &new, &RenderCtx::Session(&nonce));
+        let html: Vec<&str> = stamped.iter().filter_map(|p| p.html.as_deref()).collect();
+        assert_eq!(html.len(), 1, "{stamped:?}");
+        let want = format!("nonce=\"{token}\"");
+        assert!(html.iter().all(|h| h.contains(&want)), "{html:?}");
+        let unstamped = plain(&old, &new);
+        assert!(unstamped.iter().any(|p| p.html.is_some()), "{unstamped:?}");
+        assert!(
+            unstamped
+                .iter()
+                .filter_map(|p| p.html.as_deref())
+                .all(|h| !h.contains("nonce")),
+            "{unstamped:?}"
+        );
+
+        let mut old = Html::HElement("div".into(), vec![], vec![style("p{}")]);
+        let mut new = Html::HElement("div".into(), vec![], vec![style("a{}")]);
+        ids(&mut old);
+        ids(&mut new);
+        let patches = diff(&old, &new, &RenderCtx::Session(&nonce));
+        let texts: Vec<&str> = patches.iter().filter_map(|p| p.text.as_deref()).collect();
+        assert_eq!(texts, vec!["a{}"], "{patches:?}");
+        assert!(
+            patches.iter().all(|p| p.html.is_none()
+                && !p
+                    .attrs
+                    .values()
+                    .any(|v| v.as_deref().is_some_and(|v| v.contains(&token)))),
+            "{patches:?}"
+        );
+    }
+
+    /// An attribute delta that adds or drops a program-built `nonce` in any case
+    /// yields no attribute operation, so no program can forge, overwrite or
+    /// remove a stamp.
+    #[test]
+    fn author_nonce_is_never_patched() {
+        for name in ["nonce", "NONCE", "Nonce"] {
+            let mut old: Html<()> =
+                Html::HElement("style".into(), vec![], vec![Html::HRaw("p{}".into())]);
+            let mut new: Html<()> = Html::HElement(
+                "style".into(),
+                vec![Attribute::Attr(name.into(), "forged".into())],
+                vec![Html::HRaw("p{}".into())],
+            );
+            ids(&mut old);
+            ids(&mut new);
+            for patches in [
+                plain(&old, &new),
+                plain(&new, &old),
+                diff(
+                    &old,
+                    &new,
+                    &RenderCtx::Session(&crate::csp::StyleNonce::from_random_bytes([0x11; 16])),
+                ),
+            ] {
+                assert!(
+                    patches.iter().all(|p| p
+                        .attrs
+                        .keys()
+                        .all(|k| !k.eq_ignore_ascii_case("nonce"))
+                        && p.html.as_deref().is_none_or(|h| !h.contains("forged"))),
+                    "{name}: {patches:?}"
+                );
+            }
+        }
+    }
+
+    /// A stamped `div` holding a stamped `p`, then `extra` appended after the
+    /// stamper ran, so `extra` and everything beneath it carry no `ipe-id`.
+    fn with_unstamped_child(extra: Html<()>) -> Html<()> {
+        let mut tree: Html<()> = Html::HElement(
+            "div".into(),
+            vec![],
+            vec![Html::HElement(
+                "p".into(),
+                vec![],
+                vec![Html::HText("x".into())],
+            )],
+        );
+        ids(&mut tree);
+        if let Html::HElement(_, _, kids) = &mut tree {
+            kids.push(extra);
+        }
+        tree
+    }
+
+    /// The one patch a pair yields, which must replace the children of the
+    /// stamped root `r` with markup containing `needle`.
+    fn assert_root_children_replace(patches: &[Patch], needle: &str) {
+        assert_eq!(patches.len(), 1, "expected one replace; got {patches:?}");
+        let Some(patch) = patches.first() else {
+            return;
+        };
+        assert_eq!(patch.id, "r", "nearest addressed ancestor: {patch:?}");
+        let Some(html) = patch.html.as_deref() else {
+            assert!(
+                patch.html.is_some(),
+                "expected a children replace: {patch:?}"
+            );
+            return;
+        };
+        assert!(html.contains(needle), "the change is re-rendered: {html:?}");
+    }
+
+    fn raw_style(css: &str) -> Html<()> {
+        Html::HElement("style".into(), vec![], vec![Html::HRaw(css.into())])
+    }
+
+    /// A raw-text body change beneath an unstamped element reaches the client
+    /// as a replace at the nearest stamped ancestor, never as nothing.
+    #[test]
+    fn unaddressed_raw_body_change_replaces_at_nearest_addressed_ancestor() {
+        let old = with_unstamped_child(raw_style("p{color:red}"));
+        let new = with_unstamped_child(raw_style("p{color:green}"));
+        assert_root_children_replace(&plain(&old, &new), "p{color:green}");
+    }
+
+    /// An attribute change on an unstamped element is re-rendered at the
+    /// nearest stamped ancestor.
+    #[test]
+    fn unaddressed_attr_change_replaces_at_nearest_addressed_ancestor() {
+        let span = |class: &str| -> Html<()> {
+            Html::HElement(
+                "span".into(),
+                vec![Attribute::Attr("class".into(), class.into())],
+                vec![],
+            )
+        };
+        let old = with_unstamped_child(span("before"));
+        let new = with_unstamped_child(span("after"));
+        assert_root_children_replace(&plain(&old, &new), "after");
+    }
+
+    /// A sole-text change on an unstamped element is re-rendered at the
+    /// nearest stamped ancestor.
+    #[test]
+    fn unaddressed_text_change_replaces_at_nearest_addressed_ancestor() {
+        let span = |t: &str| -> Html<()> {
+            Html::HElement("span".into(), vec![], vec![Html::HText(t.into())])
+        };
+        let old = with_unstamped_child(span("before"));
+        let new = with_unstamped_child(span("after"));
+        assert_root_children_replace(&plain(&old, &new), "after");
+    }
+
+    /// An unaddressed change climbs past every unstamped ancestor to the first
+    /// stamped one.
+    #[test]
+    fn unaddressed_change_climbs_past_unstamped_ancestors() {
+        let nest = |t: &str| -> Html<()> {
+            Html::HElement(
+                "section".into(),
+                vec![],
+                vec![Html::HElement(
+                    "span".into(),
+                    vec![],
+                    vec![Html::HText(t.into())],
+                )],
+            )
+        };
+        let old = with_unstamped_child(nest("before"));
+        let new = with_unstamped_child(nest("after"));
+        assert_root_children_replace(&plain(&old, &new), "after");
+    }
+
+    /// An unchanged unstamped subtree yields no patch.
+    #[test]
+    fn unchanged_unaddressed_subtree_yields_no_patch() {
+        let old = with_unstamped_child(raw_style("p{color:red}"));
+        let new = with_unstamped_child(raw_style("p{color:red}"));
+        let patches = plain(&old, &new);
+        assert!(patches.is_empty(), "{patches:?}");
+    }
+
+    /// A change past the depth ceiling, where the renderer writes no node,
+    /// still yields no patch: the unaddressed signal is not raised there.
+    #[test]
+    fn change_past_depth_ceiling_yields_no_patch() {
+        fn chain(depth: usize, leaf: &str) -> Html<()> {
+            let mut h: Html<()> = Html::HText(leaf.into());
+            for _ in 0..depth {
+                h = Html::HElement("div".into(), vec![], vec![h]);
+            }
+            h
+        }
+        let depth = crate::html::MAX_HTML_DEPTH + 5;
+        let mut old = chain(depth, "before");
+        let mut new = chain(depth, "after");
+        ids(&mut old);
+        ids(&mut new);
+        let patches = plain(&old, &new);
+        assert!(patches.is_empty(), "{patches:?}");
+    }
+
+    // ── focus_target ──────────────────────────────────────────────────────
+
+    fn el(tag: &str, attrs: Vec<Attribute<()>>, kids: Vec<Html<()>>) -> Html<()> {
+        Html::HElement(tag.into(), attrs, kids)
+    }
+
+    fn dom_id(id: &str) -> Attribute<()> {
+        Attribute::Attr("id".into(), id.into())
+    }
+
+    fn autofocus() -> Attribute<()> {
+        Attribute::Attr("autofocus".into(), String::new())
+    }
+
+    fn input(id: &str, focus: bool) -> Html<()> {
+        let mut attrs = vec![dom_id(id)];
+        if focus {
+            attrs.push(autofocus());
+        }
+        el("input", attrs, vec![])
+    }
+
+    /// A tree stamped as every render is.
+    fn stamped(mut h: Html<()>) -> Html<()> {
+        ids(&mut h);
+        h
+    }
+
+    /// The stamped `ipe-id` of the element whose `id` attribute is `id`.
+    fn stamp_of(h: &Html<()>, id: &str) -> Option<String> {
+        let mut work = vec![h];
+        while let Some(node) = work.pop() {
+            if let Html::HElement(_, attrs, kids) = node {
+                let named = attrs
+                    .iter()
+                    .any(|a| matches!(a, Attribute::Attr(k, v) if k == "id" && v == id));
+                if named {
+                    return address(node).map(str::to_owned);
+                }
+                work.extend(kids.iter());
+            }
+        }
+        None
+    }
+
+    fn target(old: &Html<()>, new: &Html<()>) -> Option<String> {
+        focus_target(old, new).map(|s| s.as_str().to_owned())
+    }
+
+    /// U1: a stamped element that appears with `autofocus` is the target.
+    #[test]
+    fn focus_target_is_a_newly_appearing_autofocus_element() {
+        let old = stamped(el("div", vec![], vec![input("other", false)]));
+        let new = stamped(el(
+            "div",
+            vec![],
+            vec![input("other", false), input("x", true)],
+        ));
+        let want = stamp_of(&new, "x");
+        assert!(want.is_some(), "the fixture stamps the input");
+        assert_eq!(target(&old, &new), want);
+    }
+
+    /// U2: a re-render that keeps an element's `autofocus`, as each keystroke
+    /// in it does, moves no focus.
+    #[test]
+    fn focus_target_refuses_an_element_already_autofocused() {
+        let typed = |value: &str| {
+            stamped(el(
+                "div",
+                vec![],
+                vec![el(
+                    "input",
+                    vec![
+                        dom_id("x"),
+                        autofocus(),
+                        Attribute::Attr("value".into(), value.into()),
+                    ],
+                    vec![],
+                )],
+            ))
+        };
+        let old = typed("ab");
+        let new = typed("abc");
+        assert!(
+            !plain(&old, &new).is_empty(),
+            "the re-render patches the field"
+        );
+        assert_eq!(target(&old, &new), None);
+    }
+
+    /// U3: `autofocus` moved from one element to a new one targets the new one.
+    #[test]
+    fn focus_target_follows_autofocus_onto_a_new_element() {
+        let old = stamped(el("div", vec![], vec![input("a", true)]));
+        let new = stamped(el("div", vec![], vec![input("a", false), input("b", true)]));
+        let want = stamp_of(&new, "b");
+        assert!(want.is_some(), "the fixture stamps the input");
+        assert_eq!(target(&old, &new), want);
+    }
+
+    /// U4: of two new targets the first in document order wins, a deeper one
+    /// ahead of a shallower later sibling included.
+    #[test]
+    fn focus_target_takes_the_first_new_target_in_document_order() {
+        let old = stamped(el("div", vec![], vec![]));
+        let new = stamped(el(
+            "div",
+            vec![],
+            vec![el("div", vec![], vec![input("a", true)]), input("b", true)],
+        ));
+        let want = stamp_of(&new, "a");
+        assert!(want.is_some(), "the fixture stamps the input");
+        assert_eq!(target(&old, &new), want);
+    }
+
+    /// U5: an `autofocus` spelled inside trusted raw markup, with an `ipe-id`
+    /// of its own, is never a target.
+    #[test]
+    fn focus_target_refuses_autofocus_inside_raw_markup() {
+        let old = stamped(el("div", vec![], vec![]));
+        let new = stamped(el(
+            "div",
+            vec![],
+            vec![Html::HRaw(r#"<input autofocus ipe-id="r">"#.into())],
+        ));
+        assert_eq!(target(&old, &new), None);
+    }
+
+    /// An element written below an RCDATA element is that element's text,
+    /// never a page element.
+    #[test]
+    fn focus_target_refuses_an_element_below_rcdata() {
+        let old = stamped(el("div", vec![], vec![el("textarea", vec![], vec![])]));
+        let new = stamped(el(
+            "div",
+            vec![],
+            vec![el("textarea", vec![], vec![input("x", true)])],
+        ));
+        assert!(
+            stamp_of(&new, "x").is_some(),
+            "the stamper reaches the input"
+        );
+        assert_eq!(target(&old, &new), None);
+    }
+
+    /// An element the render sink refuses is absent, its subtree included.
+    #[test]
+    fn focus_target_refuses_an_element_the_sink_refuses() {
+        let old = stamped(el("div", vec![], vec![]));
+        let new = stamped(el(
+            "div",
+            vec![],
+            vec![el("plaintext", vec![autofocus()], vec![input("x", true)])],
+        ));
+        assert!(
+            stamp_of(&new, "x").is_some(),
+            "the stamper reaches the input"
+        );
+        assert_eq!(target(&old, &new), None);
+    }
+
+    /// A `<template>`'s children are not in the document.
+    #[test]
+    fn focus_target_refuses_an_element_inside_a_template() {
+        let old = stamped(el("div", vec![], vec![]));
+        let new = stamped(el(
+            "div",
+            vec![],
+            vec![el("template", vec![], vec![input("x", true)])],
+        ));
+        assert!(
+            stamp_of(&new, "x").is_some(),
+            "the stamper reaches the input"
+        );
+        assert_eq!(target(&old, &new), None);
+    }
+
+    /// An element past the depth ceiling is not rendered, so it is no target.
+    #[test]
+    fn focus_target_refuses_an_element_past_the_depth_ceiling() {
+        let mut deep = input("x", true);
+        for _ in 0..crate::html::MAX_HTML_DEPTH {
+            deep = el("div", vec![], vec![deep]);
+        }
+        let old = stamped(el("div", vec![], vec![]));
+        let new = stamped(deep);
+        assert_eq!(target(&old, &new), None);
+    }
+
+    /// The target is the stamper's identity, never an `ipe-id` the program
+    /// wrote.
+    #[test]
+    fn focus_target_is_the_stamped_identity_not_program_text() {
+        let old = stamped(el("div", vec![], vec![]));
+        let new = stamped(el(
+            "div",
+            vec![],
+            vec![el(
+                "input",
+                vec![
+                    dom_id("x"),
+                    Attribute::Attr("ipe-id".into(), "victim".into()),
+                    autofocus(),
+                ],
+                vec![],
+            )],
+        ));
+        let got = target(&old, &new);
+        assert!(got.is_some(), "the input is a target");
+        assert_ne!(got.as_deref(), Some("victim"));
+        assert_eq!(got, stamp_of(&new, "x"));
+    }
+
+    /// U6: the same change answers the same whether `diff` sends it as an
+    /// in-place attribute patch or as a subtree replace.
+    #[test]
+    fn focus_target_is_independent_of_patch_granularity() {
+        let new = stamped(el("div", vec![], vec![input("x", true)]));
+        let in_place = stamped(el("div", vec![], vec![input("x", false)]));
+        let replaced = stamped(el("div", vec![], vec![]));
+        let attr_patch = plain(&in_place, &new);
+        assert!(
+            attr_patch.iter().any(|p| p.attrs.contains_key("autofocus"))
+                && attr_patch.iter().all(|p| p.html.is_none()),
+            "{attr_patch:?}"
+        );
+        let html_patch = plain(&replaced, &new);
+        assert!(
+            html_patch.iter().any(|p| p.html.is_some()),
+            "{html_patch:?}"
+        );
+        let want = stamp_of(&new, "x");
+        assert!(want.is_some(), "the fixture stamps the input");
+        assert_eq!(target(&in_place, &new), want);
+        assert_eq!(target(&replaced, &new), want);
+    }
+
+    /// U7: `BoolAttr("autofocus", false)` renders nothing, so it is no target.
+    #[test]
+    fn focus_target_refuses_a_false_bool_autofocus() {
+        let with = |on: bool| {
+            stamped(el(
+                "div",
+                vec![],
+                vec![el(
+                    "input",
+                    vec![dom_id("x"), Attribute::BoolAttr("autofocus".into(), on)],
+                    vec![],
+                )],
+            ))
+        };
+        let old = stamped(el("div", vec![], vec![]));
+        assert_eq!(target(&old, &with(false)), None);
+        let on = with(true);
+        assert!(stamp_of(&on, "x").is_some(), "the fixture stamps the input");
+        assert_eq!(target(&old, &on), stamp_of(&on, "x"));
+    }
+
+    /// The one attribute value `p`'s single patch carries for `name`.
+    fn patched<'p>(p: &'p [Patch], name: &str) -> Option<Option<&'p str>> {
+        assert_eq!(p.len(), 1, "{p:?}");
+        p.first()?.attrs.get(name).map(Option::as_deref)
+    }
+
+    /// An attribute that appears with an empty value is set to it, as first
+    /// paint writes `name=""`; only a vanished attribute is removed.
+    #[test]
+    fn an_attribute_added_with_an_empty_value_is_set_not_removed() {
+        let button = |attrs: Vec<Attribute<()>>| -> Html<()> {
+            let mut b = Html::HElement("button".into(), attrs, vec![]);
+            ids(&mut b);
+            b
+        };
+        let bare = button(vec![]);
+        let empty = button(vec![
+            Attribute::Attr("autofocus".into(), String::new()),
+            Attribute::Attr("data-mark".into(), String::new()),
+        ]);
+        let p = plain(&bare, &empty);
+        assert_eq!(patched(&p, "autofocus"), Some(Some("")));
+        assert_eq!(patched(&p, "data-mark"), Some(Some("")));
+        assert!(crate::html::render_html(&empty).contains(" data-mark=\"\""));
+        let p = plain(&empty, &bare);
+        assert_eq!(patched(&p, "autofocus"), Some(None));
+        assert_eq!(patched(&p, "data-mark"), Some(None));
+    }
+
+    /// On the wire a set is a string, the empty one included, and a removal is
+    /// `null`, so no value an attribute can hold reads as a removal.
+    #[cfg(all(feature = "serde", feature = "json"))]
+    #[test]
+    fn a_removal_is_null_on_the_wire_and_an_empty_set_is_a_string() {
+        let mut p = Patch::for_id("r");
+        p.attrs.insert("gone".into(), None);
+        p.attrs.insert("empty".into(), Some(String::new()));
+        let wire = serde_json::to_value(&p).unwrap_or_default();
+        assert_eq!(wire["attrs"]["gone"], serde_json::Value::Null, "{wire}");
+        assert_eq!(wire["attrs"]["empty"], serde_json::json!(""), "{wire}");
+        assert_eq!(wire["attrs"].as_object().map(serde_json::Map::len), Some(2));
+    }
+
+    /// A repeated `style` or `class` patches the merged value first paint
+    /// writes, never only the last one.
+    #[test]
+    fn a_merged_multi_valued_attribute_patches_the_painted_value() {
+        let div = |attrs: Vec<Attribute<()>>| -> Html<()> {
+            let mut d = Html::HElement("div".into(), attrs, vec![]);
+            ids(&mut d);
+            d
+        };
+        let old = div(vec![Attribute::Attr("style".into(), "a: 1".into())]);
+        let new = div(vec![
+            Attribute::Attr("style".into(), "a: 1".into()),
+            Attribute::Attr("style".into(), "b: 2".into()),
+            Attribute::Attr("class".into(), "x".into()),
+            Attribute::Attr("class".into(), "y".into()),
+        ]);
+        let p = plain(&old, &new);
+        assert_eq!(patched(&p, "style"), Some(Some("a: 1; b: 2")));
+        assert_eq!(patched(&p, "class"), Some(Some("x y")));
+        let painted = crate::html::render_html(&new);
+        assert!(painted.contains(" class=\"x y\""), "{painted}");
+        assert!(painted.contains(" style=\"a: 1; b: 2\""), "{painted}");
+        assert!(plain(&new, &new.clone()).is_empty());
+    }
+
+    /// A stamped `iframe` with attributes `attrs`.
+    fn iframe(attrs: Vec<Attribute<()>>) -> Html<()> {
+        let mut f = Html::HElement("iframe".into(), attrs, vec![]);
+        ids(&mut f);
+        f
+    }
+
+    /// Dropping the app's `sandbox` patches the empty sandbox, never a removal.
+    #[test]
+    fn dropping_an_iframe_sandbox_patches_an_empty_sandbox() {
+        let opted = iframe(vec![Attribute::Attr(
+            "sandbox".into(),
+            "allow-scripts".into(),
+        )]);
+        let p = plain(&opted, &iframe(vec![]));
+        assert_eq!(patched(&p, "sandbox"), Some(Some("")));
+        let p = plain(&iframe(vec![]), &opted);
+        assert_eq!(patched(&p, "sandbox"), Some(Some("allow-scripts")));
+        let widened = iframe(vec![Attribute::Attr(
+            "sandbox".into(),
+            "allow-scripts allow-same-origin".into(),
+        )]);
+        assert!(plain(&opted, &widened).is_empty());
+    }
+
+    /// A `sandbox` that changes only its key's case, or its tokens' case and
+    /// order, paints the same value, so nothing is patched.
+    #[test]
+    fn a_case_variant_sandbox_change_patches_nothing() {
+        let old = iframe(vec![Attribute::Attr(
+            "sandbox".into(),
+            "allow-forms allow-scripts".into(),
+        )]);
+        let new = iframe(vec![Attribute::Attr(
+            "SANDBOX".into(),
+            "ALLOW-SCRIPTS allow-forms".into(),
+        )]);
+        assert!(plain(&old, &new).is_empty(), "{:?}", plain(&old, &new));
+        let new = iframe(vec![
+            Attribute::Attr("sandbox".into(), "allow-forms".into()),
+            Attribute::Attr("SandBox".into(), "allow-forms allow-scripts".into()),
+        ]);
+        assert!(plain(&old, &new).is_empty());
+    }
+
+    /// A stamped element `tag` with attributes `attrs`.
+    fn stamped_with(tag: &str, attrs: Vec<Attribute<()>>) -> Html<()> {
+        let mut e = Html::HElement(tag.into(), attrs, vec![]);
+        ids(&mut e);
+        e
+    }
+
+    /// A key that changes only its ASCII case names the same DOM attribute:
+    /// the diff patches nothing, and a value change under the other case
+    /// patches the stored name alone, never a removal of the old spelling.
+    #[test]
+    fn a_case_only_attribute_key_change_patches_nothing() {
+        let old = stamped_with("div", vec![Attribute::Attr("Title".into(), "a".into())]);
+        let new = stamped_with("div", vec![Attribute::Attr("title".into(), "a".into())]);
+        assert!(plain(&old, &new).is_empty(), "{:?}", plain(&old, &new));
+        let new = stamped_with("div", vec![Attribute::Attr("TITLE".into(), "b".into())]);
+        let p = plain(&old, &new);
+        assert_eq!(patched(&p, "title"), Some(Some("b")));
+        assert_eq!(p.first().map(|patch| patch.attrs.len()), Some(1), "{p:?}");
+        let both = stamped_with(
+            "div",
+            vec![
+                Attribute::Attr("Title".into(), "a".into()),
+                Attribute::Attr("title".into(), "b".into()),
+            ],
+        );
+        assert!(plain(&new, &both).is_empty(), "{:?}", plain(&new, &both));
+    }
+
+    /// A foreign element's patch carries the key in the case the parser stores
+    /// it, so `setAttribute` on the SVG node names the attribute first paint
+    /// created.
+    #[test]
+    fn a_foreign_attribute_patch_carries_its_stored_case() {
+        let old = stamped_with(
+            "svg",
+            vec![Attribute::Attr("viewBox".into(), "0 0 1 1".into())],
+        );
+        let new = stamped_with(
+            "svg",
+            vec![Attribute::Attr("VIEWBOX".into(), "0 0 2 2".into())],
+        );
+        let p = plain(&old, &new);
+        assert_eq!(patched(&p, "viewBox"), Some(Some("0 0 2 2")));
+        assert_eq!(p.first().map(|patch| patch.attrs.len()), Some(1), "{p:?}");
+        let same = stamped_with(
+            "svg",
+            vec![Attribute::Attr("ViewBox".into(), "0 0 1 1".into())],
+        );
+        assert!(plain(&old, &same).is_empty(), "{:?}", plain(&old, &same));
+    }
+
+    /// An `embed` gaining its `src` leaves the page: its parent's children are
+    /// replaced without it, and no attribute patch names `src`.
+    #[test]
+    fn an_embed_gaining_its_url_replaces_the_parent_without_it() {
+        let page = |embed_attrs: Vec<Attribute<()>>| {
+            let mut d: Html<()> = Html::HElement(
+                "div".into(),
+                vec![],
+                vec![Html::HElement("embed".into(), embed_attrs, vec![])],
+            );
+            ids(&mut d);
+            d
+        };
+        let old = page(vec![Attribute::Attr("type".into(), "x".into())]);
+        let new = page(vec![
+            Attribute::Attr("type".into(), "x".into()),
+            Attribute::Attr("src".into(), "/".into()),
+        ]);
+        let p = plain(&old, &new);
+        assert_eq!(p.len(), 1, "{p:?}");
+        let html = p.first().and_then(|x| x.html.as_deref());
+        assert!(html.is_some_and(|h| !h.contains("<embed")), "{p:?}");
+        assert!(
+            p.iter()
+                .all(|x| !x.attrs.keys().any(|k| k.eq_ignore_ascii_case("src")))
         );
     }
 }

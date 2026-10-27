@@ -119,7 +119,7 @@ fn maybe_program(i: &mut Interner) -> DResult<Program> {
         home: ModPath(vec![]),
         type_params: vec![],
         row_params: vec![],
-        params: vec![(
+        params: vec![ipe_ir::Param::owned(
             m,
             IrType::Enum {
                 home: ModPath(vec![]),
@@ -307,7 +307,7 @@ fn tree_sum_fn(interner: &mut Interner, syms: &TreeSyms) -> DResult<Func> {
         home: ModPath(vec![]),
         type_params: vec![],
         row_params: vec![],
-        params: vec![(scrut, syms.self_ty.clone())],
+        params: vec![ipe_ir::Param::owned(scrut, syms.self_ty.clone())],
         ret: IrType::Int,
         body: Expr::Match(Match::new(Expr::Var(scrut), arms, &[syms.leaf, syms.node])?),
     })
@@ -465,6 +465,48 @@ fn generic_enum_def_construction_and_pattern_emit() -> DResult<()> {
     Ok(())
 }
 
+/// An enum whose parameter only passes back to itself (`Just (Maybe a)`)
+/// declares a parameter rustc refuses (E0392): the emitter refuses it first.
+#[test]
+fn an_enum_parameter_no_field_uses_is_refused() -> DResult<()> {
+    let mut interner = Interner::new();
+    let mut prog = maybe_program(&mut interner)?;
+    let module = prog.modules.first_mut();
+    let def = module.and_then(|m| m.types.first_mut());
+    let Some(TypeDef::Enum(def)) = def else {
+        return Err(Diagnostic::CompilerBug {
+            where_: "adts test",
+            detail: "the Maybe program declares no enum".to_owned(),
+        });
+    };
+    let (home, name) = (def.home.clone(), def.name);
+    let param = def.type_params.first().copied();
+    let just = def.variants.first_mut().map(|v| &mut v.fields);
+    let (Some(fields), Some(param)) = (just, param) else {
+        return Err(Diagnostic::CompilerBug {
+            where_: "adts test",
+            detail: "Maybe declares no parameter or no Just".to_owned(),
+        });
+    };
+    *fields = vec![IrType::Enum {
+        home,
+        name,
+        args: vec![IrType::Generic(param)],
+    }];
+    let emitted = emit(&interner, &prog);
+    assert!(
+        matches!(
+            emitted,
+            Err(Diagnostic::CompilerBug {
+                where_: "ipe_ir::EnumParamUse::refuse_unused",
+                ..
+            })
+        ),
+        "expected the unused-parameter refusal, got {emitted:?}"
+    );
+    Ok(())
+}
+
 #[test]
 #[allow(clippy::too_many_lines)]
 fn concrete_multi_field_enum_emits() -> DResult<()> {
@@ -525,7 +567,7 @@ fn concrete_multi_field_enum_emits() -> DResult<()> {
         home: ModPath(vec![]),
         type_params: vec![],
         row_params: vec![],
-        params: vec![(
+        params: vec![ipe_ir::Param::owned(
             s,
             IrType::Enum {
                 home: ModPath(vec![]),

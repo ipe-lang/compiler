@@ -1,0 +1,183 @@
+module Main exposing (main)
+import Ipe.Io as Io
+import Ipe.Db
+import Ipe.Db.Location as Location
+import Ipe.Db.Unsafe
+import Ipe.Dict
+import Ipe.List
+import Ipe.String
+import Ipe.Task
+
+-- M5b-db golden: Db.findOneByField + Db.findManyByField (backlog follow-up —
+-- arity fixed by #70, but no golden E2E coverage until this fixture).
+--
+-- Inserts three rows into `items` (two "fruit", one "veggie"), then:
+--   * Db.findOneByField  … "name" "apple"      -> Just the apple row (match)
+--   * Db.findOneByField  … "name" "durian"     -> Nothing (no match)
+--   * Db.findManyByField … "category" "fruit"  -> [apple, banana] (match, sorted
+--                                                  by name so the assertion does
+--                                                  not depend on unspecified SQL
+--                                                  row order — the kernel issues
+--                                                  no ORDER BY)
+--   * Db.findManyByField … "category" "mineral" -> [] (no match)
+--
+-- `formatRow` is a TOP-LEVEL function (not a `let`-bound closure) so it can be
+-- passed as a bare value to `List.map` from inside deeply nested
+-- `Task.andThen` continuations without tripping the captured-closure-as-value
+-- limitation (IPE-L0126) — top-level function references are not local
+-- captures.
+--
+-- NOTE on the empty-vs-non-empty check for `many`/`none` (both
+-- `List (Dict String (Maybe String))`): this is written as
+-- `String.isEmpty (String.join "," (List.map ...))` rather than the more
+-- obvious `if List.isEmpty many then "empty" else ...many...`. The latter
+-- shape hits an UNRELATED, pre-existing emitter bug (found while writing this
+-- fixture, filed separately — NOT fixed here, this task is additive
+-- test-coverage only): inside a `Task.andThen (\x -> ...)` callback, a lambda
+-- PARAMETER (not a captured outer variable) that is read once in an
+-- `if`-condition kernel call (`List.isEmpty x`) and again in the `else`
+-- branch is emitted as a bare (un-cloned) `Var` for the first use, so
+-- `cargo build` fails with E0382 "use of moved value". The equivalent
+-- top-level function (`f xs = if List.isEmpty xs then .. else ...xs...`)
+-- clones correctly (`list_is_empty(xs.clone())`), so the bug is specific to
+-- the closure-parameter case. Minimal standalone repro:
+--
+--     main =
+--         Task.andThen
+--             (\xs ->
+--                 let
+--                     r =
+--                         if List.isEmpty xs then
+--                             "empty"
+--                         else
+--                             String.join "," (List.map String.fromInt xs)
+--                 in
+--                 Io.println r
+--             )
+--             (Task.succeed [ 1, 2, 3 ])
+--
+-- This is the same E0382 double-move class already tracked in
+-- `docs/architecture/seal-noncopy-move-design.md` /
+-- `docs/architecture/class5-emitter-clone-fix-spec-2026-07-09.md` (backlog
+-- rows #99 / #125 / #142), but this exact trigger (lambda-parameter reuse
+-- across if/else inside a `Task.andThen` callback) was not previously
+-- enumerated there — reported separately as a blocking finding.
+
+formatRow row =
+    cellText "name" row
+        ++ ":"
+        ++ cellText "category" row
+        ++ ":"
+        ++ String.fromInt (cellInt "qty" row)
+
+
+formatRows rows =
+    String.join "," (List.map formatRow rows)
+
+
+main =
+    Task.andThen
+        (\conn ->
+            Db.withTransaction conn
+                (\txconn ->
+                    do
+                        Unsafe.unsafeExecRaw txconn
+                            "CREATE TABLE items (name TEXT NOT NULL, category TEXT NOT NULL, qty INTEGER NOT NULL)"
+                        Db.exec txconn
+                            "INSERT INTO items (name, category, qty) VALUES (?, ?, ?)"
+                            [ SqlString "apple", SqlString "fruit", SqlInt 5 ]
+                        Db.exec txconn
+                            "INSERT INTO items (name, category, qty) VALUES (?, ?, ?)"
+                            [ SqlString "banana", SqlString "fruit", SqlInt 3 ]
+                        Db.exec txconn
+                            "INSERT INTO items (name, category, qty) VALUES (?, ?, ?)"
+                            [ SqlString "carrot", SqlString "veggie", SqlInt 8 ]
+                        Task.andThen
+                            (\found ->
+                                let
+                                    r1 =
+                                        case found of
+                                            Just row ->
+                                                formatRow row
+
+                                            Nothing ->
+                                                "missing"
+                                in
+                                Task.andThen
+                                    (\notFound ->
+                                        let
+                                            r2 =
+                                                case notFound of
+                                                    Just row ->
+                                                        formatRow row
+
+                                                    Nothing ->
+                                                        "missing"
+                                        in
+                                        Task.andThen
+                                            (\many ->
+                                                let
+                                                    sorted =
+                                                        List.sortBy (\r -> cellText "name" r) many
+
+                                                    joined3 =
+                                                        formatRows sorted
+
+                                                    r3 =
+                                                        if String.isEmpty joined3 then
+                                                            "empty"
+
+                                                        else
+                                                            joined3
+                                                in
+                                                Task.andThen
+                                                    (\none ->
+                                                        let
+                                                            joined4 =
+                                                                formatRows none
+
+                                                            r4 =
+                                                                if String.isEmpty joined4 then
+                                                                    "empty"
+
+                                                                else
+                                                                    joined4
+                                                        in
+                                                        Io.println (r1 ++ "\n" ++ r2 ++ "\n" ++ r3 ++ "\n" ++ r4)
+                                                    )
+                                                    (Db.findManyByField txconn "items" "category" "mineral")
+                                            )
+                                            (Db.findManyByField txconn "items" "category" "fruit")
+                                    )
+                                    (Db.findOneByField txconn "items" "name" "durian")
+                            )
+                            (Db.findOneByField txconn "items" "name" "apple")
+                )
+        )
+        (Db.open Location.memory)
+
+
+-- The text of column `key` in a raw Db row: a SQL `NULL` cell reads as `NULL`,
+-- a missing column as the empty string.
+cellText : String -> Dict String (Maybe String) -> String
+cellText key row =
+    case Dict.get key row of
+        Just (Just s) ->
+            s
+
+        Just Nothing ->
+            "NULL"
+
+        Nothing ->
+            ""
+
+
+-- The integer in column `key` of a raw Db row, `0` when the cell is not one.
+cellInt : String -> Dict String (Maybe String) -> Int
+cellInt key row =
+    case String.toInt (cellText key row) of
+        Just n ->
+            n
+
+        Nothing ->
+            0

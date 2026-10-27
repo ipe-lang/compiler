@@ -29,12 +29,11 @@ fn repo_root() -> PathBuf {
     std::fs::canonicalize(&joined).unwrap_or(joined)
 }
 
-fn fixture_entry() -> PathBuf {
+fn fixture_project() -> PathBuf {
     repo_root()
         .join("tests")
         .join("golden")
         .join("tuple_str_column_var_scrutinee")
-        .join("Main.ipe")
 }
 
 /// Fast gate: a multi-arm tuple `case` on a VARIABLE scrutinee with a
@@ -46,7 +45,7 @@ fn str_column_var_scrutinee_builds() {
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
-    let built = ipe::build(&fixture_entry(), &out, &runtime);
+    let built = crate::support::build_golden(&fixture_project(), &out, &runtime);
     assert!(
         built.is_ok(),
         "variable-scrutinee string-column tuple `case` must build (#182); got {:?}",
@@ -68,7 +67,7 @@ fn str_column_var_scrutinee_cargo_builds_and_runs() {
 
     let runtime = e2e_support::require_runtime().into_path_buf();
 
-    let built = ipe::build(&fixture_entry(), &out, &runtime);
+    let built = crate::support::build_golden(&fixture_project(), &out, &runtime);
     assert!(
         built.is_ok(),
         "ipe dev build must succeed for tuple_str_column_var_scrutinee: {:?}",

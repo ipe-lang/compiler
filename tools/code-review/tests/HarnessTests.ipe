@@ -23,10 +23,11 @@ import Ipe.Time.Timestamp as Timestamp
 import Lib.Db as LibDb exposing (Decision(..), HistoryCursor(..))
 import Lib.Format as Format
 import Lib.Highlight as Highlight exposing (Lang(..), Token(..))
+import Lib.History exposing (HistoryState(..))
 import Lib.Index as Index exposing (SourceView(..), StaleReason(..))
 import Lib.Keys as Keys exposing (KeyAction(..))
 import Lib.Links as Links exposing (Link(..))
-import Lib.Queue as Queue exposing (HistoryState(..), QueueState(..), UnitPageState(..))
+import Lib.Queue as Queue exposing (QueueState(..), UnitPageState(..))
 import Lib.RepoPath as RepoPath exposing (PathError(..), Root, RootMap)
 import Lib.SafeText as SafeText
 import Lib.Settings as Settings
@@ -68,8 +69,7 @@ erroringCheckReportedTo out =
         line <- Task.fromResult (Path.fromString out) |> Task.andThen File.readFile
         removeFileIfAny out
         Task.succeed
-            (results
-                == [ ( "the erroring probe", False ), ( "the probe after it", True ) ]
+            (results == [ ( "the erroring probe", False ), ( "the probe after it", True ) ]
                 && String.contains "the erroring probe" line
                 && String.contains "probe-boom" line
                 && not (String.contains (codeText 27) line)

@@ -1,7 +1,7 @@
 //! `Task.attempt` is CALLABLE from user code and completes the SEAL.
 //!
 //! `Task.attempt : (Result Error a -> msg) -> Task Error a -> Cmd msg` bridges a
-//! Task into a Cmd from `init` (`tests/golden/task_attempt/Main.ipe`). This pins
+//! Task into a Cmd from `init` (`tests/golden/task_attempt/src/Main.ipe`). This pins
 //! ipe-0 ∧ cargo-0 ∧ run-0 (THE SEAL: ipe exit 0 ⇒ emitted Rust builds and
 //! runs), that the combinator lowers to the runtime `cmd_perform`, and that the
 //! attempted task actually runs (the initial view shows `value: 0`, then the
@@ -25,14 +25,13 @@ fn task_attempt_ipec_cargo_and_run_zero() {
 
     let root = repo_root();
     let dir = root.join("tests").join("golden").join("task_attempt");
-    let entry = dir.join("Main.ipe");
     let out = crate::support::scratch_root().join("ipec_task_attempt_e2e");
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
 
     // ipe-0: compiling a program that calls Task.attempt must succeed.
-    let built = ipe::build(&entry, &out, &runtime);
+    let built = crate::support::build_golden(&dir, &out, &runtime);
     assert!(
         built.is_ok(),
         "ipe dev build must succeed for task_attempt: {:?}",

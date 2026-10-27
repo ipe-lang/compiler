@@ -1,0 +1,294 @@
+module Lib.Selected exposing (SelectedView(..), clearView, decidableSource, reloadView, runningView, selectView, selectedViewOf, selectedViewStatusText, viewArrived)
+
+import Ipe.Result as Result exposing (Result(..))
+import Lib.Epoch exposing (Epoch)
+import Lib.Failure as Failure exposing (LoadFailure)
+-- `Index.Unit` names `Highlight.Lang` and `Index.UnitView` names
+-- `Links.LinkSet`, and an imported alias resolves its qualified names in this
+-- module.
+import Lib.Highlight as Highlight
+import Lib.Index as Index exposing (SourceView(..))
+import Lib.Links as Links
+import Lib.SafeText as SafeText exposing (SafeText)
+import Lib.Slot as Slot exposing (Stamp)
+import Lib.Uid exposing (Uid)
+
+
+-- The session's one source slot, shared by the selected queue card and the
+-- unit page: nothing selected, one read in flight
+-- (with the unit wanted once it returns, when the selection moved during the
+-- read), the loaded view, no unit with the read's uid, or a failed read. At
+-- most one read is in flight: a selection made during a read only records
+-- `wanted`, and a response for any uid but the in-flight one is dropped.
+-- `fresh` is False once the queue page reloaded or cleared during the read,
+-- so its result predates the page and never settles the view: the in-flight
+-- unit selected again is read afresh, and with nothing wanted the result is
+-- dropped. `running` is the stamp of the read in flight: slot ownership is
+-- tied to process lifetime, so a read another process started is
+-- `NoneSelected` to every transition.
+type SelectedView
+    = NoneSelected
+    | ViewLoading { running : Stamp Uid, wanted : Maybe Uid, fresh : Bool }
+    | ViewShown Index.UnitView
+    | ViewMissing Uid
+    | ViewFailed Uid LoadFailure
+
+
+-- The stamp of the read in flight, whichever process started it.
+runningView : SelectedView -> Maybe (Stamp Uid)
+runningView state =
+    case state of
+        ViewLoading loading ->
+            Just loading.running
+
+        ViewShown _ ->
+            Nothing
+
+        NoneSelected ->
+            Nothing
+
+        ViewMissing _ ->
+            Nothing
+
+        ViewFailed _ _ ->
+            Nothing
+
+
+-- The slot as process `epoch` sees it: a read another process started has
+-- no completion left to settle it, so it is `NoneSelected`.
+ownView : Epoch -> SelectedView -> SelectedView
+ownView epoch state =
+    case Slot.running epoch (runningView state) of
+        Just _ ->
+            state
+
+        Nothing ->
+            case state of
+                ViewLoading _ ->
+                    NoneSelected
+
+                ViewShown _ ->
+                    state
+
+                NoneSelected ->
+                    state
+
+                ViewMissing _ ->
+                    state
+
+                ViewFailed _ _ ->
+                    state
+
+
+-- `uid` selected in process `epoch`, with the read to start, if any.
+-- During a read only the wanted unit is recorded; the shown unit selected
+-- again reads nothing.
+selectView : Epoch -> Uid -> SelectedView -> ( SelectedView, Maybe (Stamp Uid) )
+selectView epoch uid state =
+    case ownView epoch state of
+        ViewLoading loading ->
+            ( ViewLoading { running = loading.running, wanted = wantedAfter (Slot.stampKey loading.running) loading.fresh uid, fresh = loading.fresh }, Nothing )
+
+        ViewShown shown ->
+            if shown.unit.uid == uid then
+                ( ViewShown shown, Nothing )
+
+            else
+                startView epoch uid
+
+        NoneSelected ->
+            startView epoch uid
+
+        ViewMissing _ ->
+            startView epoch uid
+
+        ViewFailed _ _ ->
+            startView epoch uid
+
+
+-- `uid` selected after the queue page reloaded, so its view is read afresh
+-- even when it is the one shown; during a read it is read once that read
+-- returns.
+reloadView : Epoch -> Uid -> SelectedView -> ( SelectedView, Maybe (Stamp Uid) )
+reloadView epoch uid state =
+    case ownView epoch state of
+        ViewLoading loading ->
+            ( ViewLoading { running = loading.running, wanted = Just uid, fresh = False }, Nothing )
+
+        ViewShown _ ->
+            startView epoch uid
+
+        NoneSelected ->
+            startView epoch uid
+
+        ViewMissing _ ->
+            startView epoch uid
+
+        ViewFailed _ _ ->
+            startView epoch uid
+
+
+-- No unit to select. A read in flight stays recorded, with nothing wanted
+-- after it, so no second read can start beside it, and its result is
+-- dropped when it returns.
+clearView : Epoch -> SelectedView -> SelectedView
+clearView epoch state =
+    case ownView epoch state of
+        ViewLoading loading ->
+            ViewLoading { running = loading.running, wanted = Nothing, fresh = False }
+
+        ViewShown _ ->
+            NoneSelected
+
+        NoneSelected ->
+            NoneSelected
+
+        ViewMissing _ ->
+            NoneSelected
+
+        ViewFailed _ _ ->
+            NoneSelected
+
+
+-- The read stamped `arrived` returned to process `epoch` with `result`:
+-- when another unit was selected meanwhile its read starts, otherwise the
+-- result settles the view. A read the slot does not own changes nothing.
+viewArrived : Epoch -> Stamp Uid -> Result LoadFailure (Maybe Index.UnitView) -> SelectedView -> ( SelectedView, Maybe (Stamp Uid) )
+viewArrived epoch arrived result state =
+    if not (Slot.owns epoch arrived (runningView state)) then
+        ( state, Nothing )
+
+    else
+        case state of
+            ViewLoading loading ->
+                case loading.wanted of
+                    Just next ->
+                        startView epoch next
+
+                    Nothing ->
+                        if loading.fresh then
+                            ( settledView (Slot.stampKey arrived) result, Nothing )
+
+                        else
+                            ( NoneSelected, Nothing )
+
+            ViewShown _ ->
+                ( state, Nothing )
+
+            NoneSelected ->
+                ( state, Nothing )
+
+            ViewMissing _ ->
+                ( state, Nothing )
+
+            ViewFailed _ _ ->
+                ( state, Nothing )
+
+
+-- The one start of a source read: `uid` read by process `epoch`.
+startView : Epoch -> Uid -> ( SelectedView, Maybe (Stamp Uid) )
+startView epoch uid =
+    let
+        read =
+            Slot.stamp epoch uid
+    in
+    ( ViewLoading { running = read, wanted = Nothing, fresh = True }, Just read )
+
+
+-- The unit wanted after the in-flight read of `inFlight` when `uid` is
+-- selected: nothing when the in-flight unit is selected again and its read
+-- is fresh; a read that predates the page reads that unit again.
+wantedAfter : Uid -> Bool -> Uid -> Maybe Uid
+wantedAfter inFlight fresh uid =
+    if inFlight == uid && fresh then
+        Nothing
+
+    else
+        Just uid
+
+
+settledView : Uid -> Result LoadFailure (Maybe Index.UnitView) -> SelectedView
+settledView uid result =
+    case result of
+        Ok (Just loaded) ->
+            ViewShown loaded
+
+        Ok Nothing ->
+            ViewMissing uid
+
+        Err e ->
+            ViewFailed uid e
+
+
+-- The loaded view of the selected unit `uid`; Nothing while it loads, when
+-- its read failed or found no unit, or when the view is another unit's.
+selectedViewOf : Uid -> SelectedView -> Maybe Index.UnitView
+selectedViewOf uid state =
+    case state of
+        ViewShown shown ->
+            if shown.unit.uid == uid then
+                Just shown
+
+            else
+                Nothing
+
+        ViewLoading _ ->
+            Nothing
+
+        NoneSelected ->
+            Nothing
+
+        ViewMissing _ ->
+            Nothing
+
+        ViewFailed _ _ ->
+            Nothing
+
+
+-- The one source a decision on `uid` may be made on: the selected unit's
+-- verified view. Nothing for a withheld view, a view not loaded, or another
+-- unit's view, so nothing else can reach `decide`.
+decidableSource : Uid -> SelectedView -> Maybe Index.ShownSource
+decidableSource uid state =
+    case selectedViewOf uid state of
+        Just loaded ->
+            case loaded.view of
+                Shown shown ->
+                    Just shown
+
+                Stale _ ->
+                    Nothing
+
+                Unreadable _ ->
+                    Nothing
+
+                TooLarge _ ->
+                    Nothing
+
+        Nothing ->
+            Nothing
+
+
+-- The one-line text in place of the selected unit's source while it has no
+-- loaded view; Nothing once the view of `uid` is loaded.
+selectedViewStatusText : Uid -> SelectedView -> Maybe SafeText
+selectedViewStatusText uid state =
+    case state of
+        ViewShown shown ->
+            if shown.unit.uid == uid then
+                Nothing
+
+            else
+                Just (SafeText.literal "Loading source…")
+
+        ViewLoading _ ->
+            Just (SafeText.literal "Loading source…")
+
+        NoneSelected ->
+            Just (SafeText.literal "Loading source…")
+
+        ViewMissing _ ->
+            Just (SafeText.literal "This unit is no longer in the index.")
+
+        ViewFailed _ failure ->
+            Just (SafeText.literal ("Source load failed: " ++ Failure.loadFailureText failure))

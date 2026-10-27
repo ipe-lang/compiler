@@ -24,6 +24,13 @@ given `cols`×`rows`, and emits terminal control sequences. It captures the
 combined pty stream and the exit code. Unix-only (a non-unix target fails the
 Task with an unsupported error); same `subprocess` capability as `run`.
 
+Every child runs under two ceilings and one floor. Its captured output is
+bounded by `IPE_PROCESS_OUTPUT_MAX` (default 16 MiB per stream); a call
+still running after `IPE_PROCESS_TIMEOUT` (default 1 h) has its child
+killed and fails with a `Timeout` error; and a child dies with the Ipê
+process that started it (guaranteed on Linux, best effort elsewhere), so a
+killed server leaves no orphan behind.
+
 This is a server-only capability (`subprocess`): it is DEFAULT-DENIED under
 `--target wasm` (a browser bundle has no process surface), and a program
 that runs a child process is tagged with the `subprocess` capability so a
@@ -37,8 +44,10 @@ run : String -> List String -> Task Error String
 
 `run cmd argv` — run `cmd` with the argument vector `argv`, no shell.
 Succeeds with the child's captured stdout (bounded to guard memory);
-fails with a typed `Error` on a non-zero exit or a spawn failure, and with a
-`LimitExceeded` error when the output passes `IPE_PROCESS_OUTPUT_MAX`.
+fails with a typed `Error` on a non-zero exit or a spawn failure, with a
+`LimitExceeded` error when the output passes `IPE_PROCESS_OUTPUT_MAX`, and
+with a `Timeout` error when the child outlives `IPE_PROCESS_TIMEOUT` (it is
+killed first).
 
 ## `runWith`
 
@@ -63,7 +72,9 @@ A non-zero exit is a NORMAL result carried in `exitCode`; only a spawn
 failure (e.g. the executable does not exist) fails the Task.
 `stdout` and `stderr` are each captured independently (no pipe-deadlock
 risk) and bounded by `IPE_PROCESS_OUTPUT_MAX` (default 16 MiB per stream);
-a stream past it fails the Task with a `LimitExceeded` error.
+a stream past it fails the Task with a `LimitExceeded` error. A child still
+running after `IPE_PROCESS_TIMEOUT` (default 1 h) is killed and fails the
+Task with a `Timeout` error.
 
 ## `runInPty`
 
@@ -87,9 +98,11 @@ The `cfg` record:
 
 Captured `output` is bounded (`IPE_PROCESS_OUTPUT_MAX`, default 16 MiB); a
 child that floods the pty past the ceiling fails the Task with a
-`LimitExceeded` error rather than allocating without bound. This is the same
-`subprocess` capability as `run` (the pty is an implementation detail of
-running a child, not a new reach).
+`LimitExceeded` error rather than allocating without bound, and a child
+still running after `IPE_PROCESS_TIMEOUT` (default 1 h) is killed and fails
+the Task with a `Timeout` error. This is the same `subprocess` capability as
+`run` (the pty is an implementation detail of running a child, not a new
+reach).
 
 Unix-only: on a non-unix target the Task fails with an `unsupported` error.
 

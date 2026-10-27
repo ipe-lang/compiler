@@ -18,7 +18,6 @@ import Ipe.Io as Io
 --     first-class value, so a conditional can choose an attribute or nothing
 --     without a `Maybe` or a sentinel.
 
-
 -- A text input built from typed attribute builders. `autofocus` is chosen
 -- conditionally: when off, `noAttr` renders nothing at all.
 field : String -> String -> Bool -> Html msg

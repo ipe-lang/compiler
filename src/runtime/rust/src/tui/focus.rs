@@ -146,7 +146,7 @@ pub fn extract_click_msg<M: Clone>(events: &[Event<M>]) -> Option<M> {
 pub fn extract_msg_named<M: Clone>(events: &[Event<M>], name: &str) -> Option<M> {
     let i = event_named(events, name)?;
     match events.get(i)? {
-        Event::OnMsg(_, m) => Some(m.clone()),
+        Event::OnMsg(_, m) => Some(M::clone(m)),
         _ => None,
     }
 }
@@ -435,8 +435,8 @@ mod tests {
             Blurred,
         }
         let events: Vec<Event<M>> = vec![
-            Event::OnMsg("focus".into(), M::Focused),
-            Event::OnMsg("blur".into(), M::Blurred),
+            Event::OnMsg("focus".into(), Box::new(M::Focused)),
+            Event::OnMsg("blur".into(), Box::new(M::Blurred)),
         ];
         assert_eq!(extract_msg_named(&events, "focus"), Some(M::Focused));
         assert_eq!(extract_msg_named(&events, "blur"), Some(M::Blurred));
@@ -449,7 +449,7 @@ mod tests {
         enum M {
             Clicked,
         }
-        let events: Vec<Event<M>> = vec![Event::OnMsg("click".into(), M::Clicked)];
+        let events: Vec<Event<M>> = vec![Event::OnMsg("click".into(), Box::new(M::Clicked))];
         assert_eq!(extract_click_msg(&events), Some(M::Clicked));
     }
 

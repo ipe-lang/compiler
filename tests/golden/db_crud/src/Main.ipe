@@ -1,0 +1,93 @@
+module Main exposing (main)
+import Ipe.Io as Io
+import Ipe.Db
+import Ipe.Db.Location as Location
+import Ipe.Db.Unsafe
+import Ipe.Dict
+import Ipe.Task
+
+-- M5b-db golden: insertRow → getById → updateById → deleteById CRUD cycle.
+-- Exercises the upstream-parity `Dict String String` row surface for
+-- DbInsertRow / DbUpdateById (bdbc572); `Dict String String` lowers directly
+-- to `HashMap<String, String>` with no runtime conversion.
+
+main =
+    Task.andThen
+        (\conn ->
+            Db.withTransaction conn
+                (\txconn ->
+                    do
+                        Unsafe.unsafeExecRaw txconn
+                            "CREATE TABLE fruits (id TEXT PRIMARY KEY, name TEXT, qty TEXT)"
+                        Db.insertRow txconn
+                            "fruits"
+                            (Dict.fromList
+                                [ ( "id", "1" ), ( "name", "apple" ), ( "qty", "5" ) ]
+                            )
+                        Task.andThen
+                            (\before ->
+                                do
+                                    Db.updateById txconn
+                                        "fruits"
+                                        "1"
+                                        (Dict.fromList [ ( "qty", "10" ) ])
+                                    Task.andThen
+                                        (\after ->
+                                            do
+                                                Db.deleteById txconn "fruits" "1"
+                                                Task.andThen
+                                                    (\gone ->
+                                                        let
+                                                            r1 =
+                                                                case before of
+                                                                    Just row ->
+                                                                        cellText "name" row
+                                                                            ++ "/"
+                                                                            ++ cellText "qty" row
+
+                                                                    Nothing ->
+                                                                        "missing"
+
+                                                            r2 =
+                                                                case after of
+                                                                    Just row ->
+                                                                        cellText "name" row
+                                                                            ++ "/"
+                                                                            ++ cellText "qty" row
+
+                                                                    Nothing ->
+                                                                        "missing"
+
+                                                            r3 =
+                                                                case gone of
+                                                                    Just _ ->
+                                                                        "still-exists"
+
+                                                                    Nothing ->
+                                                                        "deleted"
+                                                        in
+                                                        Io.println (r1 ++ "\n" ++ r2 ++ "\n" ++ r3)
+                                                    )
+                                                    (Db.getById txconn "fruits" "1")
+                                        )
+                                        (Db.getById txconn "fruits" "1")
+                            )
+                            (Db.getById txconn "fruits" "1")
+                )
+        )
+        (Db.open Location.memory)
+
+
+-- The text of column `key` in a raw Db row: a SQL `NULL` cell reads as `NULL`,
+-- a missing column as the empty string.
+cellText : String -> Dict String (Maybe String) -> String
+cellText key row =
+    case Dict.get key row of
+        Just (Just s) ->
+            s
+
+        Just Nothing ->
+            "NULL"
+
+        Nothing ->
+            ""

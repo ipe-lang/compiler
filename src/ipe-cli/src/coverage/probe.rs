@@ -21,6 +21,7 @@ use std::path::Path;
 use ipe_env::artifact::{ProvenBin, ResolveError, Source, resolve_bin_from};
 
 use crate::coverage::contract::StdlibSymbol;
+use crate::project_root::{AnalysisTarget, ScratchRoot, SourceTree};
 use crate::remote_ingest::{LocalCeiling, LocalSource, RunError, SELF_RUN_LIMITS, run_local};
 
 /// The browser web axis a symbol's module discloses, when it lives under a
@@ -92,9 +93,10 @@ fn cli_error_code(err: &crate::CliError) -> Option<ipe_diagnostics::Code> {
 /// accessor/spec builder that reads its column from a `.field` at compile time
 /// ([`IPE_L0146`]), a committed-literal seal that must see its argument
 /// ([`IPE_L0151`]), a handler-wrapping kernel that must see its handler
-/// ([`IPE_L0152`]) — or the reference cannot be monomorphized because an unused
-/// binding leaves the value fully polymorphic ([`IPE_L0102`]). In each the
-/// diagnostic is provoked by the probe form, not by a gap in the symbol's own
+/// ([`IPE_L0152`]), a `Store.select` terminal that must see its `Store.select`
+/// expression at the call site ([`IPE_L0149`]) — or the reference cannot be
+/// monomorphized because an unused binding leaves the value fully polymorphic
+/// ([`IPE_L0102`]). In each the diagnostic is provoked by the probe form, not by a gap in the symbol's own
 /// lowering, so the column reports the symbol inapplicable rather than a false
 /// hole. This is exactly the "the resolver refuses to pass point-free" /
 /// "fully-polymorphic value with no determinable concrete type" case the columns'
@@ -102,12 +104,13 @@ fn cli_error_code(err: &crate::CliError) -> Option<ipe_diagnostics::Code> {
 /// class: it is a property of the program, so it stays a hole.
 #[must_use]
 pub fn is_probe_form_limitation(outcome: &StageOutcome) -> bool {
-    use ipe_diagnostics::{IPE_L0102, IPE_L0146, IPE_L0151, IPE_L0152};
+    use ipe_diagnostics::{IPE_L0102, IPE_L0146, IPE_L0149, IPE_L0151, IPE_L0152};
     matches!(
         outcome,
         StageOutcome::Failed { code: Some(code), .. }
             if *code == IPE_L0102
                 || *code == IPE_L0146
+                || *code == IPE_L0149
                 || *code == IPE_L0151
                 || *code == IPE_L0152
     )
@@ -273,39 +276,17 @@ pub fn nested_program(sym: &StdlibSymbol) -> Result<String, ProbeUnavailable> {
 
 /// Lower a probe program, returning whether it lowered.
 ///
-/// Writes the source to `snippet` and drives it through the same source-graph
-/// lowering pipeline `ipe dev build --emit-ir` uses (name-resolution + type-check +
-/// lower), so a symbol that resolves and type-checks but does not lower is
-/// reported as a stage failure.
+/// Writes the source as the one module of a scratch project under `base` and
+/// drives it through the same analysis lowering `ipe dev build --emit-ir` runs
+/// (name-resolution + type-check + lower), so a symbol that resolves and
+/// type-checks but does not lower is reported as a stage failure.
 #[must_use]
-pub fn lower(source: &str, snippet: &Path) -> StageOutcome {
-    if let Err(message) = write_probe_source(snippet, source) {
-        return StageOutcome::Failed {
-            code: None,
-            message,
-        };
-    }
-    match crate::lower_entry_via_graph(snippet) {
-        Ok(_) => StageOutcome::Ok,
-        Err(err) => StageOutcome::Failed {
-            code: cli_error_code(&err),
-            message: err.to_string(),
-        },
-    }
-}
-
-/// Write a probe source file, first ensuring its parent directory exists.
-///
-/// The parent is a scratch dir shared across a whole column run; recreating it
-/// before each write makes a probe resilient to a transient removal (a sibling's
-/// cleanup, an emitted-crate step that rewrites the tree) rather than reporting a
-/// spurious stage failure.
-fn write_probe_source(snippet: &Path, source: &str) -> Result<(), String> {
-    if let Some(parent) = snippet.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|e| format!("could not create the probe scratch directory: {e}"))?;
-    }
-    std::fs::write(snippet, source).map_err(|e| format!("could not write probe source: {e}"))
+pub fn lower(source: &str, base: &Path) -> StageOutcome {
+    let scratch = match probe_root(source, base) {
+        Ok(scratch) => scratch,
+        Err(outcome) => return outcome,
+    };
+    stage_outcome(crate::emit_ir_text(scratch.root(), None).map(|_| ()))
 }
 
 /// Type-check a probe program, returning whether it type-checks.
@@ -315,14 +296,38 @@ fn write_probe_source(snippet: &Path, source: &str) -> Result<(), String> {
 /// the nested-lowering column reports the symbol inapplicable rather than a false
 /// hole.
 #[must_use]
-pub fn typechecks(source: &str, snippet: &Path) -> StageOutcome {
-    if let Err(message) = write_probe_source(snippet, source) {
-        return StageOutcome::Failed {
-            code: None,
-            message,
-        };
-    }
-    match crate::typecheck_entry_via_graph(snippet) {
+pub fn typechecks(source: &str, base: &Path) -> StageOutcome {
+    let scratch = match probe_root(source, base) {
+        Ok(scratch) => scratch,
+        Err(outcome) => return outcome,
+    };
+    stage_outcome(crate::driver::typecheck_target(&AnalysisTarget::Project(
+        scratch.root(),
+    )))
+}
+
+/// The probe program `source` as the `Main` module of a one-module project in
+/// a private directory directly under `base`, removed on drop.
+///
+/// The project is the probe's whole world: no other file under `base` is a
+/// module of it, and it names its emitted crate from its own manifest and
+/// directory, so concurrent probes under one `base` never share an identity.
+///
+/// # Errors
+/// A [`StageOutcome::Failed`] naming why the project could not be written or
+/// resolved.
+fn probe_root(source: &str, base: &Path) -> Result<ScratchRoot, StageOutcome> {
+    SourceTree::main(source)
+        .resolve_under(base)
+        .map_err(|err| StageOutcome::Failed {
+            code: cli_error_code(&err),
+            message: format!("could not write the probe project: {err}"),
+        })
+}
+
+/// A stage's result as a probe outcome.
+fn stage_outcome(result: Result<(), crate::CliError>) -> StageOutcome {
+    match result {
         Ok(()) => StageOutcome::Ok,
         Err(err) => StageOutcome::Failed {
             code: cli_error_code(&err),
@@ -335,10 +340,6 @@ pub fn typechecks(source: &str, snippet: &Path) -> StageOutcome {
 /// links its dependency tree from, set by the CI e2e / seal-slice jobs. Mirrors
 /// the golden E2E harness (`tools/e2e-support`), which reads the same variable.
 const ORACLE_SHARED_TARGET: &str = "IPE_ORACLE_SHARED_TARGET";
-
-/// The env var naming a unique emitted-crate package name, honoured by the
-/// single-file `ipe dev run` emit ([`crate::driver::single_file_cargo_name_from_env`]).
-const EMIT_PACKAGE_NAME: &str = "IPE_EMIT_PACKAGE_NAME";
 
 /// Locate the `ipe` binary the probe drives `ipe dev run` through.
 ///
@@ -379,65 +380,40 @@ fn shared_dep_target() -> Option<String> {
     Some(trimmed.to_owned())
 }
 
-/// A process-monotonic counter giving every probe build a distinct identity.
-///
-/// The columns share ONE scratch dir across a run, so a per-probe working
-/// directory and package name cannot be derived from the (constant) snippet
-/// path alone. This counter names each probe's own working subdirectory and
-/// emitted crate, so no two probes collide in the shared cargo target.
-static PROBE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
-/// A cargo-package-safe, unique-per-probe crate name for the probe `seq`.
-///
-/// `sanitize_cargo_name` maps the token to a valid Cargo package name. The
-/// distinct `seq` per probe keeps each emitted app crate's cargo fingerprint on
-/// its own package id, so a shared target reuses only dependency artifacts and
-/// never masks a broken emit.
-fn unique_package_name(seq: u64) -> String {
-    ipe_backend_rust::sanitize_cargo_name(&format!("ipe-probe-{seq}"))
-}
-
 /// Build and RUN a probe program, returning whether the emitted crate builds and
 /// the produced binary runs to a zero exit.
 ///
-/// Re-invokes this binary as `ipe dev run <snippet>` from a per-probe working
-/// directory — the same emit → cargo build → execute path a user's `ipe dev run`
-/// takes — so a symbol whose program emits and type-checks but whose emitted
-/// crate does not build or whose binary does not run is a real gap. Heavy: the
-/// caller gates this behind the E2E path.
+/// Writes the source as the one module of a scratch project under `base` and
+/// re-invokes this binary as `ipe dev run <project>` from that project's
+/// directory — the same emit → cargo build → execute path a user's `ipe dev
+/// run` takes — so a symbol whose program emits and type-checks but whose
+/// emitted crate does not build or whose binary does not run is a real gap.
+/// Heavy: the caller gates this behind the E2E path.
 ///
-/// Each probe runs from its OWN working directory beside the snippet, so the
-/// default emitted-project dir (`out/rust`, resolved against the working dir)
-/// never collides with a sibling probe nor leaks an `out/` tree into the test's
-/// cwd. When the CI warm shared cargo target is offered
-/// (`IPE_ORACLE_SHARED_TARGET`) the emitted build links its heavy dependency
-/// tree from that pre-built target instead of cold-compiling it per symbol.
-/// Soundness is preserved by giving each probe a UNIQUE emitted-crate package
-/// name (`IPE_EMIT_PACKAGE_NAME`): cargo fingerprints an app crate on its own
-/// source hash under its own package id, so a genuinely broken emit still fails
-/// to build even against a warm target — the shared target reuses only
-/// DEPENDENCY artifacts, never masking a broken app. Without the shared-target
-/// env the build inherits the ambient target unchanged (a local `ipe dev run` is
-/// untouched).
-///
-/// The emit location is selected by the subprocess working directory rather
-/// than a `--out` flag, so the invocation surface stays exactly the plain
-/// `ipe dev run <snippet>` — the entry is passed absolute, and `out/rust` resolves
-/// under the per-probe working directory.
+/// Each probe is its OWN project in a private directory, so the default
+/// emitted-project dir (`out/rust`, resolved against the working dir) never
+/// collides with a sibling probe nor leaks an `out/` tree into the test's cwd,
+/// and is removed with the project. When the CI warm shared cargo target is
+/// offered (`IPE_ORACLE_SHARED_TARGET`) the emitted build links its heavy
+/// dependency tree from that pre-built target instead of cold-compiling it per
+/// symbol. Soundness is preserved by the project's own crate identity, its
+/// manifest name joined to a hash of its canonical directory: cargo
+/// fingerprints an app crate on its own source hash under its own package id,
+/// so a genuinely broken emit still fails to build even against a warm target
+/// — the shared target reuses only DEPENDENCY artifacts, never masking a broken
+/// app. Without the shared-target env the build inherits the ambient target
+/// unchanged (a local `ipe dev run` is untouched).
 ///
 /// The self-run is held to [`SELF_RUN_LIMITS`] through
 /// [`run_local`]: its stdout to 1 MiB and its run, cargo build included, to
 /// [`crate::remote_ingest::MAX_LOCAL_WALL_SECS`], its process group killed at
 /// either ceiling.
 #[must_use]
-pub fn build_and_run(source: &str, snippet: &Path) -> StageOutcome {
-    use std::process::Command;
-    if let Err(message) = write_probe_source(snippet, source) {
-        return StageOutcome::Failed {
-            code: None,
-            message,
-        };
-    }
+pub fn build_and_run(source: &str, base: &Path) -> StageOutcome {
+    let scratch = match probe_root(source, base) {
+        Ok(scratch) => scratch,
+        Err(outcome) => return outcome,
+    };
     let ipe_bin = match ipe_binary() {
         Ok(p) => p.into_path_buf(),
         Err(e) => {
@@ -448,42 +424,7 @@ pub fn build_and_run(source: &str, snippet: &Path) -> StageOutcome {
         }
     };
 
-    // A unique per-probe identity: the columns share ONE scratch dir, so a
-    // monotonic sequence names both this probe's own working subdirectory and
-    // its emitted crate. The working subdir under the shared scratch keeps the
-    // default `out/rust` emit unique per probe (self-cleaning with the scratch
-    // dir, never an `out/` tree in the test's cwd), and the crate name keeps the
-    // app-crate fingerprint distinct in the shared cargo target.
-    let seq = PROBE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let package_name = unique_package_name(seq);
-    let work_dir = snippet
-        .parent()
-        .unwrap_or_else(|| Path::new("."))
-        .join(format!("probe-{seq}"));
-    if let Err(e) = std::fs::create_dir_all(&work_dir) {
-        return StageOutcome::Failed {
-            code: None,
-            message: format!("could not create the probe working directory: {e}"),
-        };
-    }
-
-    // `ipe dev run` reads the snippet by an absolute path so it resolves regardless
-    // of the working directory the subprocess is launched in.
-    let entry = match std::path::absolute(snippet) {
-        Ok(p) => p,
-        Err(e) => {
-            return StageOutcome::Failed {
-                code: None,
-                message: format!("could not resolve the probe snippet path: {e}"),
-            };
-        }
-    };
-
-    let mut cmd = Command::new(&ipe_bin);
-    cmd.args(crate::verb::Verb::DEV_RUN.argv())
-        .arg(&entry)
-        .current_dir(&work_dir)
-        .env(EMIT_PACKAGE_NAME, &package_name);
+    let mut cmd = dev_run_project(&ipe_bin, scratch.root());
     // Link the heavy dependency tree from the warm shared target when the CI
     // job offers one; otherwise inherit the ambient env (isolate — the default
     // for a local run).
@@ -492,6 +433,24 @@ pub fn build_and_run(source: &str, snippet: &Path) -> StageOutcome {
     }
 
     self_run_outcome(cmd, SELF_RUN_LIMITS)
+}
+
+/// `ipe dev run` of the project `root`, launched by `ipe_bin` from the project's own directory.
+///
+/// The project is named by its directory, never by a file in it, and no
+/// environment override names its emitted crate: the crate identity is the
+/// manifest name joined to the canonical directory, so two projects sharing
+/// one cargo target never share an app crate.
+#[must_use]
+pub(crate) fn dev_run_project(
+    ipe_bin: &Path,
+    root: &crate::project_root::ProjectRoot,
+) -> std::process::Command {
+    let mut cmd = std::process::Command::new(ipe_bin);
+    cmd.args(crate::verb::Verb::DEV_RUN.argv())
+        .arg(root.path())
+        .current_dir(root.path());
+    cmd
 }
 
 /// Run the self-run `cmd` under `ceiling` and judge it.
@@ -538,6 +497,7 @@ mod tests {
         for code in [
             ipe_diagnostics::IPE_L0102,
             ipe_diagnostics::IPE_L0146,
+            ipe_diagnostics::IPE_L0149,
             ipe_diagnostics::IPE_L0151,
             ipe_diagnostics::IPE_L0152,
         ] {
@@ -592,6 +552,118 @@ mod tests {
             code: None,
             message: String::new(),
         }));
+    }
+}
+
+#[cfg(test)]
+mod root_tests {
+    use super::{StageOutcome, probe_root, typechecks};
+    use crate::project_root::{AnalysisTarget, ScratchRoot, SourceTree};
+    use crate::scratch::ScratchDir;
+
+    /// A probe importing `Helper`.
+    const IMPORTS_HELPER: &str =
+        "module Main exposing (value)\n\nimport Helper\n\nvalue : Int\nvalue =\n    Helper.h\n";
+
+    /// The module `Helper`.
+    const HELPER: &str = "module Helper exposing (h)\n\nh : Int\nh =\n    1\n";
+
+    /// A `Helper.ipe` planted beside a probe's scratch project, in the directory
+    /// the project is created under, is no module of it: the import is refused.
+    #[test]
+    fn a_module_beside_the_probe_project_is_not_importable() {
+        let base = ScratchDir::new("ipe-probe-sibling").expect("scratch base");
+        std::fs::write(base.path().join("Helper.ipe"), HELPER).expect("plant the sibling");
+        let outcome = typechecks(IMPORTS_HELPER, base.path());
+        assert!(
+            matches!(
+                outcome,
+                StageOutcome::Failed {
+                    code: Some(code),
+                    ..
+                } if code == ipe_diagnostics::IPE_N0020
+            ),
+            "a module beside the scratch project must not resolve, got {outcome:?}"
+        );
+        // Neighbour: the same module inside the project resolves.
+        let inside = SourceTree::main(IMPORTS_HELPER)
+            .module("Helper", HELPER)
+            .resolve_under(base.path())
+            .expect("project with its own Helper");
+        crate::driver::typecheck_target(&AnalysisTarget::Project(inside.root()))
+            .expect("a module of the project resolves");
+    }
+
+    /// The crate a scratch project's build emits, with no environment consulted.
+    fn crate_name(scratch: &ScratchRoot) -> ipe_backend_rust::CrateName {
+        let manifest_path = scratch
+            .root()
+            .path()
+            .join(crate::package_manifest::PACKAGE_IPE);
+        crate::driver::emit_settings(
+            &crate::driver::SettingsSource::Manifest {
+                manifest: scratch.root().manifest(),
+                manifest_path: &manifest_path,
+                host: crate::delivery::HostIntent::Served,
+            },
+            &crate::driver::BuildOptions::from_env(),
+            crate::runtime_embed::BundleRole::Out,
+        )
+        .crate_name
+    }
+
+    /// A probe run names its project by directory, from that directory, with no
+    /// environment override of the emitted crate's name.
+    #[test]
+    fn a_probe_run_names_its_project_by_directory_with_no_crate_override() {
+        let base = ScratchDir::new("ipe-probe-command").expect("scratch base");
+        let scratch = probe_root(
+            "module Main exposing (main)\n\nmain =\n    1\n",
+            base.path(),
+        )
+        .expect("probe project");
+        let project = scratch.root().path();
+        let cmd = super::dev_run_project(std::path::Path::new("ipe"), scratch.root());
+        let mut want: Vec<&std::ffi::OsStr> = crate::verb::Verb::DEV_RUN
+            .argv()
+            .into_iter()
+            .map(std::ffi::OsStr::new)
+            .collect();
+        want.push(project.as_os_str());
+        assert_eq!(cmd.get_args().collect::<Vec<_>>(), want);
+        assert_eq!(cmd.get_current_dir(), Some(project));
+        assert!(
+            cmd.get_envs().next().is_none(),
+            "a probe run sets no environment of its own: {:?}",
+            cmd.get_envs().collect::<Vec<_>>()
+        );
+    }
+
+    /// Two probe projects under one base, as two concurrent probe builds sharing
+    /// one cargo target are, each emit the crate named by their own manifest and
+    /// canonical directory, so neither can reuse the other's app crate.
+    #[test]
+    fn two_probe_projects_under_one_base_emit_distinct_crates() {
+        let base = ScratchDir::new("ipe-probe-identity").expect("scratch base");
+        let source = "module Main exposing (main)\n\nmain =\n    1\n";
+        let one = probe_root(source, base.path()).expect("first probe project");
+        let two = probe_root(source, base.path()).expect("second probe project");
+        for scratch in [&one, &two] {
+            let dir = std::fs::canonicalize(scratch.root().path()).expect("canonical dir");
+            assert_eq!(
+                crate_name(scratch),
+                ipe_backend_rust::CrateName::Identity(ipe_backend_rust::crate_identity(
+                    &ipe_backend_rust::sanitize_cargo_name(crate::project_root::DEFAULT_NAME),
+                    &dir,
+                )),
+                "a probe crate is named by its manifest and directory alone"
+            );
+        }
+        assert_ne!(
+            crate_name(&one),
+            crate_name(&two),
+            "two probe projects must not share an emitted crate"
+        );
     }
 }
 

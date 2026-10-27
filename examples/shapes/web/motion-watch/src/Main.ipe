@@ -13,13 +13,12 @@ module Main exposing (main)
 -- A missing devicemotion API arrives as `MotionUnavailable` — a typed variant,
 -- never a thrown error or a silently dropped frame.
 
-
+import Ipe.Browser.Motion as Motion exposing (MotionEvent(..))
+import Ipe.String as String
 import Ipe.Tea.Web as Web
 import Ipe.Tea.Web.Cmd as Cmd
 import Ipe.Tea.Web.Sub as Sub
 import Ipe.Ui as Ui
-import Ipe.Browser.Motion as Motion exposing (MotionEvent(..))
-import Ipe.String as String
 
 
 type alias Model =

@@ -2,6 +2,7 @@ module Main exposing (main)
 
 import Ipe.Io as Io
 
+
 -- Turning a value into text is always explicit in Ipê. Two ideas:
 --   • A standalone conversion names its type: `String.fromInt`,
 --     `String.fromFloat`, `String.fromBool` — each total, no `Maybe`, no
@@ -9,7 +10,6 @@ import Ipe.Io as Io
 --   • Inside a `"""..."""` triple-quoted string, `{{expr}}` interpolation
 --     renders each chunk the same way, and reads closer to the output than a
 --     `++`/`String.concat` chain of the same pieces.
-
 
 -- A one-line summary row, each field interpolated straight into the string.
 row : String -> Int -> Float -> Bool -> String

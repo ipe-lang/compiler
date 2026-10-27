@@ -22,14 +22,13 @@ fn out_dir() -> PathBuf {
 
 /// Compile the fixture into `out`.
 fn compile(out: &Path) -> Result<(), ipe::CliError> {
-    let entry = repo_root()
+    let golden_project = repo_root()
         .join("tests")
         .join("golden")
-        .join("middleware_csrf")
-        .join("Main.ipe");
+        .join("middleware_csrf");
     let _ = std::fs::remove_dir_all(out);
     let runtime = e2e_support::require_runtime().into_path_buf();
-    ipe::build(&entry, out, &runtime)
+    crate::support::build_golden(&golden_project, out, &runtime)
 }
 
 /// A `Server.post` route wrapped in `Middleware.withCsrf` must be ipe-0 and

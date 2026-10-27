@@ -1,0 +1,65 @@
+module Main exposing (main)
+import Ipe.Io as Io
+import Ipe.Db
+import Ipe.Db.Location as Location
+import Ipe.Db.Unsafe
+import Ipe.Dict
+import Ipe.List
+import Ipe.Db.Sql
+import Ipe.String
+import Ipe.Task
+
+-- M5b-db golden: Db.deleteWhere with a typed SqlFragment predicate (backlog #61).
+-- Inserts three rows, deletes the one matching `Sql.eq (Sql.column "name")
+-- (Sql.string "gadget")`, then queries all remaining rows ordered by name and
+-- prints them. Proves the row-count return value AND that only the matching
+-- row was removed.
+
+main =
+    Task.andThen
+        (\conn ->
+            Db.withTransaction conn
+                (\txconn ->
+                    do
+                        Unsafe.unsafeExecRaw txconn
+                            "CREATE TABLE products (name TEXT NOT NULL, qty INTEGER NOT NULL)"
+                        Db.exec txconn
+                            "INSERT INTO products (name, qty) VALUES (?, ?)"
+                            [ SqlString "widget", SqlInt 10 ]
+                        Db.exec txconn
+                            "INSERT INTO products (name, qty) VALUES (?, ?)"
+                            [ SqlString "gadget", SqlInt 7 ]
+                        Db.exec txconn
+                            "INSERT INTO products (name, qty) VALUES (?, ?)"
+                            [ SqlString "sprocket", SqlInt 3 ]
+                        Task.andThen
+                            (\deletedCount ->
+                                Task.andThen
+                                    (\rows ->
+                                        let
+                                            names =
+                                                List.map (\r -> cellText "name" r) rows
+                                        in
+                                        Io.println (String.fromInt deletedCount ++ ":" ++ String.join "," names)
+                                    )
+                                    (Unsafe.unsafeQuery txconn "SELECT * FROM products ORDER BY name" [])
+                            )
+                            (Db.deleteWhere txconn "products" (Sql.eq (Sql.column "name") (Sql.string "gadget")))
+                )
+        )
+        (Db.open Location.memory)
+
+
+-- The text of column `key` in a raw Db row: a SQL `NULL` cell reads as `NULL`,
+-- a missing column as the empty string.
+cellText : String -> Dict String (Maybe String) -> String
+cellText key row =
+    case Dict.get key row of
+        Just (Just s) ->
+            s
+
+        Just Nothing ->
+            "NULL"
+
+        Nothing ->
+            ""

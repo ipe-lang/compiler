@@ -1,0 +1,404 @@
+module Main exposing (main)
+
+-- SQL `NULL` is never text on any read path. One SQLite file is opened twice:
+-- through `Db.open` (the app connection) and through `Dsn.open` (an external,
+-- read-only `Connection`). Every non-codec-direct read path — the external
+-- `allOn` / `findWhereOn` / `getOn`, both sides of a join, a `Store.select`
+-- projection, a raw `Db.findWhere`, and a raw-column store's `readText` — keeps
+-- an all-`NULL` row's cells as `NULL`.
+--
+-- The output lines assert, in order:
+--   * `on-all` / `on-find-where` / `on-get`: the external reads decode the
+--     `NULL` reason as `Nothing`, never `Just ""`;
+--   * `on-strict`: an external read through a plain `String` field refuses the
+--     `NULL` row with a typed `Err`;
+--   * `join-list` / `join-maybe`: both join sides read their `NULL` cell as
+--     `Nothing`; `join-strict`: a plain `String` side refuses with a typed `Err`;
+--   * `raw-find-where`: a raw row maps the `NULL` column to `Just Nothing`;
+--   * `raw-store`: a raw-column store's `readText` on the `NULL` cell is a typed
+--     `Err` naming the column;
+--   * `select-null`: a `String` projection of the `NULL` cell is a typed `Err`;
+--   * `real-*`: the stored `REAL`s 1234567.5, 3.0 and -0.0 read as the same text
+--     on `all`, `allOn`, `joinToList`, `select` and a raw `findWhere`;
+--   * `non-finite-*`: a non-finite `REAL` is a typed `Err` on `allOn`, the join
+--     and a raw `findWhere`.
+--
+-- Output:
+--   on-all:n1 reason=Nothing
+--   on-find-where:n1 reason=Nothing
+--   on-get:n1 reason=Nothing
+--   on-strict:Err InvalidInput: Ipe.Db.Codec: column "reason" is NULL but its field is not a Maybe
+--   join-list:n1 reason=Nothing/t1 label=Nothing
+--   join-maybe:n1 reason=Nothing/t1 label=Nothing
+--   join-strict:Err InvalidInput: Ipe.Db.Codec: column "reason" is NULL but its field is not a Maybe
+--   raw-find-where:Just Nothing
+--   raw-store:Err InvalidInput: Ipe.Db.Store: column "reason" is NULL
+--   select-null:Err InvalidInput: Ipe.Db.Store: column "p0" is NULL
+--   real-all:a=1.2345675e+06,b=3,c=0
+--   real-on:a=1.2345675e+06,b=3,c=0
+--   real-join:a=1.2345675e+06,b=3,c=0
+--   real-select:a=1.2345675e+06,b=3,c=0
+--   real-raw:a=1.2345675e+06,b=3,c=0
+--   non-finite-on:Err Unexpected: db: column decode error at index 1
+--   non-finite-join:Err Unexpected: db: column decode error at index 1
+--   non-finite-raw:Err Unexpected: db: column decode error at index 1
+
+import Ipe.Codec as Codec exposing (Codec(..), Shape(..), ColType(..))
+import Ipe.Config as Config
+import Ipe.Db as Db exposing (Db)
+import Ipe.Db.Dsn as Dsn exposing (Connection, ReadOnly)
+import Ipe.Db.Location as Location exposing (Mode(..))
+import Ipe.Db.Sql as Sql
+import Ipe.Db.Store as Store exposing (Draft, Store)
+import Ipe.Db.Store.Unsafe as StoreU
+import Ipe.Db.Unsafe as Unsafe
+import Ipe.Dict as Dict exposing (Dict)
+import Ipe.Error as Error exposing (Error)
+import Ipe.File as File
+import Ipe.Io as Io
+import Ipe.Json.Encode as Encode
+import Ipe.List as List
+import Ipe.Maybe as Maybe exposing (Maybe(..))
+import Ipe.Path as Path exposing (Path)
+import Ipe.Result as Result exposing (Result(..))
+import Ipe.String as String
+import Ipe.Task as Task exposing (Task)
+
+
+type alias Note =
+    { id : String
+    , reason : Maybe String
+    }
+
+
+makeNote : String -> Maybe String -> Note
+makeNote id reason =
+    { id = id, reason = reason }
+
+
+type alias Tag =
+    { id : String
+    , note : String
+    , label : Maybe String
+    }
+
+
+makeTag : String -> String -> Maybe String -> Tag
+makeTag id note label =
+    { id = id, note = note, label = label }
+
+
+-- The `notes` table read through a plain `String` reason: a `NULL` cell has no
+-- value to decode into.
+type alias StrictNote =
+    { id : String
+    , reason : String
+    }
+
+
+type alias Real =
+    { id : String
+    , val : Float
+    }
+
+
+blankStrict : StrictNote
+blankStrict =
+    { id = "", reason = "" }
+
+
+blankReal : Real
+blankReal =
+    { id = "", val = 0.0 }
+
+
+encodeMaybe : Maybe String -> Value
+encodeMaybe m =
+    case m of
+        Just s ->
+            Encode.string s
+
+        Nothing ->
+            Encode.null
+
+
+noteCodec : Codec Note
+noteCodec =
+    Codec
+        { enc =
+            \n ->
+                Encode.object
+                    [ ( "id", Encode.string n.id )
+                    , ( "reason", encodeMaybe n.reason )
+                    ]
+        , mkDec =
+            \_ ->
+                Config.map2 makeNote
+                    (Config.field "id" Config.string)
+                    (Config.field "reason" (Config.nullable Config.string))
+        , shp =
+            SRecord
+                [ ( "id", CText )
+                , ( "reason", CNull CText )
+                ]
+        }
+
+
+tagCodec : Codec Tag
+tagCodec =
+    Codec
+        { enc =
+            \t ->
+                Encode.object
+                    [ ( "id", Encode.string t.id )
+                    , ( "note", Encode.string t.note )
+                    , ( "label", encodeMaybe t.label )
+                    ]
+        , mkDec =
+            \_ ->
+                Config.map3 makeTag
+                    (Config.field "id" Config.string)
+                    (Config.field "note" Config.string)
+                    (Config.field "label" (Config.nullable Config.string))
+        , shp =
+            SRecord
+                [ ( "id", CText )
+                , ( "note", CText )
+                , ( "label", CNull CText )
+                ]
+        }
+
+
+keyed : Draft a -> Store a
+keyed draft =
+    Store.public (StoreU.primaryKey "id" draft)
+
+
+type alias Stores =
+    { notes : Store Note
+    , strict : Store StrictNote
+    , tags : Store Tag
+    , reals : Store Real
+    , bad : Store Real
+    , raw : Store Store.Row
+    }
+
+
+stores : Result Error Stores
+stores =
+    Result.map3
+        (\( notes, strict ) ( tags, reals ) ( bad, raw ) ->
+            { notes = notes, strict = strict, tags = tags, reals = reals, bad = bad, raw = raw }
+        )
+        (Result.map2 (\a b -> ( a, b ))
+            (Result.map keyed (Store.fromCodec "notes" noteCodec))
+            (Result.map keyed (Store.fromCodec "notes" (Codec.auto blankStrict)))
+        )
+        (Result.map2 (\a b -> ( a, b ))
+            (Result.map keyed (Store.fromCodec "tags" tagCodec))
+            (Result.map keyed (Store.fromCodec "reals" (Codec.auto blankReal)))
+        )
+        (Result.map2 (\a b -> ( a, b ))
+            (Result.map keyed (Store.fromCodec "bad" (Codec.auto blankReal)))
+            (Result.map keyed (Store.fromColumns "notes" [ Store.textColumn "id", Store.textColumn "reason" ]))
+        )
+
+
+-- A line's text: the rendered value, or the typed error that refused it.
+line : String -> (a -> String) -> Task Error a -> Task Error String
+line label render task =
+    Task.onError
+        (\e -> Task.succeed (String.concat [ label, ":Err ", Error.toString e ]))
+        (Task.map (\v -> String.concat [ label, ":", render v ]) task)
+
+
+showReason : Maybe String -> String
+showReason m =
+    case m of
+        Just s ->
+            String.concat [ "Just \"", s, "\"" ]
+
+        Nothing ->
+            "Nothing"
+
+
+showNote : Note -> String
+showNote n =
+    String.concat [ n.id, " reason=", showReason n.reason ]
+
+
+showNotes : List Note -> String
+showNotes notes =
+    String.join "|" (List.map showNote notes)
+
+
+showMaybeNote : Maybe Note -> String
+showMaybeNote m =
+    case m of
+        Just n ->
+            showNote n
+
+        Nothing ->
+            "missing"
+
+
+showStrict : List StrictNote -> String
+showStrict notes =
+    String.join "|" (List.map (\n -> String.concat [ n.id, " reason=\"", n.reason, "\"" ]) notes)
+
+
+showPair : ( Note, Tag ) -> String
+showPair ( n, t ) =
+    String.concat [ showNote n, "/", t.id, " label=", showReason t.label ]
+
+
+showMaybePair : Maybe ( Note, Tag ) -> String
+showMaybePair m =
+    case m of
+        Just p ->
+            showPair p
+
+        Nothing ->
+            "missing"
+
+
+showCell : Maybe (Maybe String) -> String
+showCell m =
+    case m of
+        Just (Just s) ->
+            String.concat [ "Just (Just \"", s, "\")" ]
+
+        Just Nothing ->
+            "Just Nothing"
+
+        Nothing ->
+            "Nothing"
+
+
+showRawReason : List (Dict String (Maybe String)) -> String
+showRawReason rows =
+    String.join "|" (List.map (\row -> showCell (Dict.get "reason" row)) rows)
+
+
+showReadText : List Store.Row -> Task Error String
+showReadText rows =
+    Task.map (String.join "|") (Task.sequence (List.map (\row -> Task.fromResult (Store.readText "reason" row)) rows))
+
+
+showReals : List ( String, Float ) -> String
+showReals pairs =
+    String.join "," (List.map (\( id, v ) -> String.concat [ id, "=", String.fromFloat v ]) (List.sortBy (\( id, _ ) -> id) pairs))
+
+
+realPairs : List Real -> List ( String, Float )
+realPairs reals =
+    List.map (\r -> ( r.id, r.val )) reals
+
+
+cellText : String -> Dict String (Maybe String) -> String
+cellText key row =
+    case Dict.get key row of
+        Just (Just s) ->
+            s
+
+        Just Nothing ->
+            "NULL"
+
+        Nothing ->
+            "missing"
+
+
+showRawReals : List (Dict String (Maybe String)) -> String
+showRawReals rows =
+    String.join ","
+        (List.map (\row -> String.concat [ cellText "id" row, "=", cellText "val" row ])
+            (List.sortBy (cellText "id") rows)
+        )
+
+
+byId : String -> SqlFragment
+byId id =
+    Sql.eq (Sql.column "id") (Sql.param (SqlString id))
+
+
+everyRow : SqlFragment
+everyRow =
+    Sql.isNotNull (Sql.column "id")
+
+
+seed : Db -> Stores -> Task Error ()
+seed app s =
+    do
+        Store.create app s.notes
+        Store.create app s.tags
+        Store.create app s.reals
+        Store.create app s.bad
+        Store.insert app s.notes (makeNote "n1" Nothing)
+        Store.insert app s.tags (makeTag "t1" "n1" Nothing)
+        Store.insert app s.tags (makeTag "ta" "a" (Just "x"))
+        Store.insert app s.tags (makeTag "tb" "b" (Just "x"))
+        Store.insert app s.tags (makeTag "tc" "c" (Just "x"))
+        Store.insert app s.tags (makeTag "tz" "z" (Just "x"))
+        Store.insert app s.reals { id = "a", val = 1234567.5 }
+        Store.insert app s.reals { id = "b", val = 3.0 }
+        Store.insert app s.reals { id = "c", val = -0.0 }
+        Unsafe.unsafeExecRaw app "INSERT INTO bad (id, val) VALUES ('z', 9e999)"
+        Task.succeed ()
+
+
+report : Db -> Connection ReadOnly -> Stores -> Task Error ()
+report app ext s =
+    Task.andThen
+        (\lines -> Io.println (String.join "\n" lines))
+        (Task.sequence
+            [ line "on-all" showNotes (Store.allOn ext s.notes)
+            , line "on-find-where" showNotes (Store.findWhereOn ext s.notes (byId "n1"))
+            , line "on-get" showMaybeNote (Store.getOn ext s.notes (SqlString "n1"))
+            , line "on-strict" showStrict (Store.allOn ext s.strict)
+            , line "join-list" (\ps -> String.join "|" (List.map showPair ps)) (Store.join s.notes .id s.tags .note |> Store.joinToList app)
+            , line "join-maybe" showMaybePair (Store.join s.notes .id s.tags .note |> Store.joinToMaybe app)
+            , line "join-strict" (\ps -> String.fromInt (List.length ps)) (Store.join s.strict .id s.tags .note |> Store.joinToList app)
+            , line "raw-find-where" showRawReason (Db.findWhere app "notes" (byId "n1"))
+            , line "raw-store" (\t -> t) (Task.andThen showReadText (Store.all app s.raw))
+            , line "select-null" (String.join "|") (Store.join s.strict .id s.tags .note |> Store.select (\( n, _ ) -> n.reason) |> Store.selectToList app)
+            , line "real-all" (\rs -> showReals (realPairs rs)) (Store.all app s.reals)
+            , line "real-on" (\rs -> showReals (realPairs rs)) (Store.allOn ext s.reals)
+            , line "real-join" (\ps -> showReals (List.map (\( r, _ ) -> ( r.id, r.val )) ps)) (Store.join s.reals .id s.tags .note |> Store.joinToList app)
+            , line "real-select" showReals (Store.join s.reals .id s.tags .note |> Store.select (\( r, _ ) -> ( r.id, r.val )) |> Store.selectToList app)
+            , line "real-raw" showRawReals (Db.findWhere app "reals" everyRow)
+            , line "non-finite-on" (\rs -> showReals (realPairs rs)) (Store.allOn ext s.bad)
+            , line "non-finite-join" (\ps -> showReals (List.map (\( r, _ ) -> ( r.id, r.val )) ps)) (Store.join s.bad .id s.tags .note |> Store.joinToList app)
+            , line "non-finite-raw" showRawReals (Db.findWhere app "bad" everyRow)
+            ]
+        )
+
+
+toPath : String -> Task Error Path
+toPath raw =
+    Task.fromResult (Path.fromString raw)
+
+
+-- One SQLite file: written through the app connection, then read through both
+-- the app connection and an external `Dsn` connection to the same file.
+run : Stores -> String -> Task Error ()
+run s file =
+    do
+        path <- toPath file
+        location <- Task.fromResult (Location.file WriteExisting path)
+        app <- Db.open location
+        seed app s
+        dsn <- Task.fromResult (Dsn.parse (String.concat [ "sqlite:", file ]))
+        ext <- Dsn.open dsn
+        report app ext s
+        Dsn.close ext
+        File.remove path
+
+
+main : Task Error ()
+main =
+    case stores of
+        Err e ->
+            Io.println (Error.toString e)
+
+        Ok s ->
+            Task.andThen (run s) (File.tempFile "ipe-null-join")

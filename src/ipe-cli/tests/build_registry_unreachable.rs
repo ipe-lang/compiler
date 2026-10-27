@@ -51,16 +51,19 @@ fn build_registry_unreachable_renders_ipe_e0001_not_ice() {
         .join("ipe_build_registry_unreachable_e2e");
     let _ = fs::remove_dir_all(&dir);
     let bin_dir = dir.join("fakebin");
-    let entry = dir.join("Main.ipe");
     let out_dir = dir.join("out");
-    let setup = fs::create_dir_all(&bin_dir).and_then(|()| fs::write(&entry, SRC));
-    assert!(setup.is_ok(), "write source + fake-bin dir: {setup:?}");
+    let setup = fs::create_dir_all(&bin_dir);
+    assert!(setup.is_ok(), "make the fake-bin dir: {setup:?}");
+    let fixture = ipe::RootFixture::main(SRC);
+    let Ok(fixture) = fixture else {
+        panic!("write project: {fixture:?}")
+    };
 
     let fake_cargo = write_offline_cargo(&bin_dir);
     assert!(fake_cargo.is_ok(), "write fake cargo: {fake_cargo:?}");
 
     let out = std::process::Command::new(ipe_bin)
-        .args(["dev", "build", &entry.to_string_lossy(), "--out"])
+        .args(["dev", "build", &fixture.path().to_string_lossy(), "--out"])
         .arg(&out_dir)
         .env("PATH", &bin_dir)
         .env("IPE_RUNTIME_DIR", &runtime_dir)

@@ -36,12 +36,8 @@ fn repo_root() -> PathBuf {
 
 fn try_build(name: &str) -> Result<(), String> {
     let root = repo_root();
-    let entry = root
-        .join("tests")
-        .join("golden")
-        .join(name)
-        .join("src")
-        .join("Main.ipe");
+    let dir = root.join("tests").join("golden").join(name);
+    let entry = dir.join("src").join("Main.ipe");
     if !entry.exists() {
         return Err(format!("fixture not found: {}", entry.display()));
     }
@@ -49,7 +45,7 @@ fn try_build(name: &str) -> Result<(), String> {
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
-    ipe::build_loose_file(&entry, &out, &runtime).map_err(|e| e.to_string())
+    crate::support::build_golden(&dir, &out, &runtime).map_err(|e| e.to_string())
 }
 
 /// The IPE-T0012 must blame `Dep.ipe` (which owns `rec.missing`), never the

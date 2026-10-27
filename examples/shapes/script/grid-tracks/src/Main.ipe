@@ -1,7 +1,7 @@
 module Main exposing (main)
 
-import Ipe.Ui.Grid as Grid exposing (Track)
 import Ipe.Io as Io
+import Ipe.Ui.Grid as Grid exposing (Track)
 
 
 -- `Ipe.Ui.Grid` describes CSS grid track lists as typed VALUES, then lowers them
@@ -16,7 +16,6 @@ import Ipe.Io as Io
 --     is assembled from checked pieces, never string-concatenated by hand.
 --   • `tracksToCss` lowers a whole list to the space-joined CSS string a
 --     `grid-template-columns` value expects.
-
 
 -- A responsive column list: a fixed sidebar, a flexible main column with a
 -- minimum, and a repeated set of equal cards.

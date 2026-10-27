@@ -16,11 +16,17 @@ use std::collections::BTreeMap;
 
 use ipe_backend::Backend;
 use ipe_backend_rust::{FfiEmit, FfiWrapperGlue, RustBackend};
-use ipe_diagnostics::{DResult, Diagnostic, IPE_I0201, IPE_L0200, IPE_N0012};
+use ipe_diagnostics::nesting::{
+    COMPILE_STACK_BYTES, IR_EXPANSION_SLACK, SOURCE_NESTING_LIMIT, TYPE_DEPTH_LIMIT,
+    TYPE_LEVELS_PER_ARROW,
+};
+use ipe_diagnostics::{
+    DResult, Diagnostic, EmitSite, IPE_I0201, IPE_L0200, IPE_L0201, IPE_N0012, LowerError, Span,
+};
 use ipe_intern::{Interner, Symbol};
 use ipe_ir::{
-    Arm, BinOp, CallPin, Callee, EnumDef, Expr, Func, FuncId, IrType, Match, ModPath, Module,
-    OnFormKind, Pat, Program, SliceOwnership, TypeDef, Variant,
+    Arm, BinOp, CallPin, Callee, EnumDef, Expr, Func, FuncId, IrType, MAX_IR_RENDER_DEPTH, Match,
+    ModPath, Module, OnFormKind, Pat, Program, SliceOwnership, TypeDef, Variant,
 };
 
 /// A single-module program with the given types and funcs (no entry needed:
@@ -115,7 +121,7 @@ fn reserved_names_are_mangled_in_emitted_output() -> DResult<()> {
         home: ModPath(vec![]),
         type_params: vec![],
         row_params: vec![],
-        params: vec![(param, IrType::Int)],
+        params: vec![ipe_ir::Param::owned(param, IrType::Int)],
         ret: IrType::Int,
         body: Expr::Var(param),
     };
@@ -138,16 +144,43 @@ fn reserved_names_are_mangled_in_emitted_output() -> DResult<()> {
     Ok(())
 }
 
+/// Run `body` on a thread of the declared compile stack, the stack every
+/// compile path runs on, so a test measures the bound the build ships with.
+///
+/// A thread the OS refuses, or one whose body panics, fails the test here; the
+/// body's own panic message is reported by the thread as it unwinds.
+fn on_compile_stack(body: fn() -> DResult<()>) -> DResult<()> {
+    std::thread::scope(|scope| {
+        let joined = std::thread::Builder::new()
+            .stack_size(COMPILE_STACK_BYTES)
+            .spawn_scoped(scope, body)
+            .map(std::thread::ScopedJoinHandle::join);
+        assert!(
+            matches!(joined, Ok(Ok(_))),
+            "the compile-stack thread must spawn and finish without panicking"
+        );
+        joined.ok().and_then(Result::ok).unwrap_or(Ok(()))
+    })
+}
+
 /// A deeply nested `BinOp` spine must fail fast with IPE-L0200, not overflow the
 /// native stack. The chain is built well past the backend's emit-depth bound.
+///
+/// The refusal names the function and its home module, so the driver frames it
+/// against the module that defines the function, not the entry file.
 #[test]
 fn deeply_nested_expr_fails_fast_not_stack_overflow() -> DResult<()> {
+    on_compile_stack(deeply_nested_expr_fails_fast)
+}
+
+/// The body of [`deeply_nested_expr_fails_fast_not_stack_overflow`].
+fn deeply_nested_expr_fails_fast() -> DResult<()> {
     let mut interner = Interner::new();
     let main_mod = interner.intern("Main")?;
     let func = interner.intern("deep")?;
 
     // 4096 left-nested additions: (((… + 1) + 1) + 1). The leaf sits far below
-    // the backend's MAX_EMIT_DEPTH (~96), so the guard trips long before.
+    // the backend's emit-depth ceiling, so the guard trips long before.
     let mut body = Expr::Int(0);
     for _ in 0..4096 {
         body = Expr::BinOp {
@@ -159,7 +192,7 @@ fn deeply_nested_expr_fails_fast_not_stack_overflow() -> DResult<()> {
     let deep_fn = Func {
         id: FuncId::from_raw(0),
         name: func,
-        home: ModPath(vec![]),
+        home: ModPath(vec![main_mod]),
         type_params: vec![],
         row_params: vec![],
         params: vec![],
@@ -172,25 +205,41 @@ fn deeply_nested_expr_fails_fast_not_stack_overflow() -> DResult<()> {
     assert!(res.is_err(), "deep nesting must error, got {res:?}");
     if let Err(err) = res {
         assert_eq!(err.code(), IPE_L0200, "wrong code for over-deep nesting");
-        assert!(
-            matches!(err, Diagnostic::Lower { .. }),
-            "expected a Lower diagnostic, got {err:?}"
+        assert_eq!(
+            err,
+            Diagnostic::Lower {
+                span: Span::DUMMY,
+                msg: LowerError::BackendNestingTooDeep {
+                    limit: MAX_IR_RENDER_DEPTH,
+                    func: Some(EmitSite {
+                        home: Box::new(["Main".into()]),
+                        name: "deep".into(),
+                    }),
+                },
+            },
+            "the refusal names the function and its home module"
         );
     }
     Ok(())
 }
 
-/// An expression at the depth bound still emits successfully — the guard is a
-/// ceiling, not an off-by-one rejection of legitimate programs.
+/// An operator spine as deep as the source ceiling admits (one `BinOp` per
+/// operator of the longest chain the parser accepts) still emits on the
+/// declared compile stack: the guard is a ceiling, not an off-by-one rejection
+/// of legitimate programs.
 #[test]
 fn nesting_at_the_bound_still_emits() -> DResult<()> {
+    on_compile_stack(nesting_at_the_bound_emits)
+}
+
+/// The body of [`nesting_at_the_bound_still_emits`].
+fn nesting_at_the_bound_emits() -> DResult<()> {
     let mut interner = Interner::new();
     let main_mod = interner.intern("Main")?;
     let func = interner.intern("ok")?;
 
-    // 64 levels: comfortably under the emit-depth ceiling.
     let mut body = Expr::Int(0);
-    for _ in 0..64 {
+    for _ in 0..SOURCE_NESTING_LIMIT {
         body = Expr::BinOp {
             op: BinOp::IntAdd,
             lhs: Box::new(body),
@@ -212,6 +261,87 @@ fn nesting_at_the_bound_still_emits() -> DResult<()> {
     Ok(())
 }
 
+/// The deepest level the emitter's type backstop renders.
+const TYPE_RENDER_LIMIT: u16 = TYPE_DEPTH_LIMIT + IR_EXPANSION_SLACK;
+
+/// `inner` wrapped in `levels` `List`s.
+fn nested_lists(levels: u16, inner: IrType) -> IrType {
+    (0..levels).fold(inner, |ty, _| IrType::List(Box::new(ty)))
+}
+
+/// Emit a one-function `Main` program whose `deepType` returns `ret`.
+fn emit_returning(ret: IrType) -> DResult<String> {
+    let mut interner = Interner::new();
+    let main_mod = interner.intern("Main")?;
+    let func = interner.intern("deepType")?;
+    let deep_fn = Func {
+        id: FuncId::from_raw(0),
+        name: func,
+        home: ModPath(vec![main_mod]),
+        type_params: vec![],
+        row_params: vec![],
+        params: vec![],
+        ret,
+        body: Expr::Int(0),
+    };
+    emit(&interner, &program(main_mod, vec![], vec![deep_fn]))
+}
+
+/// The backstop refusal naming `Main.deepType`.
+fn type_too_deep_in_deep_type() -> Diagnostic {
+    Diagnostic::Lower {
+        span: Span::DUMMY,
+        msg: LowerError::BackendTypeTooDeep {
+            limit: TYPE_RENDER_LIMIT,
+            func: Some(EmitSite {
+                home: Box::new(["Main".into()]),
+                name: "deepType".into(),
+            }),
+        },
+    }
+}
+
+/// A rendered type one level past the emitter's backstop is refused at ipe
+/// time with IPE-L0201 naming the function, never handed to rustc; the type
+/// that reaches the backstop exactly still emits.
+#[test]
+fn rendered_type_past_the_backstop_is_refused_naming_the_function() {
+    // A leaf adds no level, so `levels` lists are `levels` deep, the
+    // checker's count for the same type.
+    let at_limit = emit_returning(nested_lists(TYPE_RENDER_LIMIT, IrType::Int));
+    assert!(
+        at_limit.is_ok(),
+        "a type at the backstop must emit, got {at_limit:?}"
+    );
+    let past = emit_returning(nested_lists(TYPE_RENDER_LIMIT + 1, IrType::Int));
+    assert!(past.is_err(), "a type past the backstop must be refused");
+    if let Err(err) = past {
+        assert_eq!(err.code(), IPE_L0201, "wrong code for an over-deep type");
+        assert_eq!(err, type_too_deep_in_deep_type());
+    }
+}
+
+/// A curried `FnOnce` chain charges [`TYPE_LEVELS_PER_ARROW`] per parameter,
+/// the unit the checker charges each arrow.
+#[test]
+fn fn_once_chain_charges_one_arrow_unit_per_parameter() {
+    let params = 3;
+    let chain = || {
+        IrType::FnOnceChain(
+            vec![IrType::Int; usize::from(params)],
+            Box::new(IrType::Int),
+        )
+    };
+    let lists = TYPE_RENDER_LIMIT - params * TYPE_LEVELS_PER_ARROW;
+    let at_limit = emit_returning(nested_lists(lists, chain()));
+    assert!(
+        at_limit.is_ok(),
+        "a chain reaching the backstop exactly must emit, got {at_limit:?}"
+    );
+    let past = emit_returning(nested_lists(lists + 1, chain()));
+    assert_eq!(past, Err(type_too_deep_in_deep_type()));
+}
+
 /// A param symbol that resolves to the empty string is a dangling-symbol
 /// invariant violation: emit must fail with IPE-I0201, never produce an empty
 /// Rust identifier.
@@ -230,7 +360,7 @@ fn empty_intended_symbol_is_rejected() -> DResult<()> {
         home: ModPath(vec![]),
         type_params: vec![],
         row_params: vec![],
-        params: vec![(empty, IrType::Int)],
+        params: vec![ipe_ir::Param::owned(empty, IrType::Int)],
         ret: IrType::Int,
         body: Expr::Int(0),
     };
@@ -424,7 +554,7 @@ fn let_if_and_extended_binops_emit_total_rust() -> DResult<()> {
         home: ModPath(vec![]),
         type_params: vec![],
         row_params: vec![],
-        params: vec![(n, IrType::Int)],
+        params: vec![ipe_ir::Param::owned(n, IrType::Int)],
         ret: IrType::Int,
         body,
     };
@@ -464,7 +594,7 @@ fn tuple_type_and_expr_emit_as_rust_tuples() -> DResult<()> {
         home: ModPath(vec![]),
         type_params: vec![],
         row_params: vec![],
-        params: vec![(n, IrType::Int)],
+        params: vec![ipe_ir::Param::owned(n, IrType::Int)],
         ret: IrType::Tuple(vec![IrType::Int, IrType::Int]),
         body: Expr::Tuple(vec![Expr::Var(n), Expr::Int(1)]),
     };
@@ -575,7 +705,7 @@ fn malformed_char_pattern_fails_closed_not_invalid_rust() -> DResult<()> {
         home: ModPath(vec![]),
         type_params: vec![],
         row_params: vec![],
-        params: vec![(
+        params: vec![ipe_ir::Param::owned(
             w_sym,
             IrType::Enum {
                 home: ModPath(vec![]),
@@ -659,7 +789,7 @@ fn valid_char_pattern_emits_char_literal() -> DResult<()> {
         home: ModPath(vec![]),
         type_params: vec![],
         row_params: vec![],
-        params: vec![(
+        params: vec![ipe_ir::Param::owned(
             w_sym,
             IrType::Enum {
                 home: ModPath(vec![]),
@@ -1017,7 +1147,7 @@ fn list_case_fn(name: Symbol, xs: Symbol, elem: IrType, arms: Vec<Arm>) -> DResu
         home: ModPath(vec![]),
         type_params: vec![],
         row_params: vec![],
-        params: vec![(xs, IrType::List(Box::new(elem)))],
+        params: vec![ipe_ir::Param::owned(xs, IrType::List(Box::new(elem)))],
         ret: IrType::Int,
         body: Expr::Match(Match::new_flat(Expr::Var(xs), arms)?),
     })
@@ -1307,7 +1437,10 @@ fn list_index_clone_proves_its_element_clone() -> DResult<()> {
         home: ModPath(vec![]),
         type_params: vec![],
         row_params: vec![],
-        params: vec![(xs, IrType::List(Box::new(IrType::Int)))],
+        params: vec![ipe_ir::Param::owned(
+            xs,
+            IrType::List(Box::new(IrType::Int)),
+        )],
         ret: IrType::Int,
         body: Expr::ListIndexClone {
             list: Box::new(Expr::Var(xs)),
@@ -1329,6 +1462,84 @@ fn list_index_clone_proves_its_element_clone() -> DResult<()> {
     assert!(
         src.contains("(xs)[0].clone()"),
         "an index read over a `Clone` element clones it, got:\n{src}"
+    );
+    Ok(())
+}
+
+/// Set the pass of every parameter of `json` (a serialized [`Program`]) to
+/// `pass`, returning how many it rewrote.
+fn forge_passes(json: &mut serde_json::Value, pass: &str) -> usize {
+    let mut rewritten = 0_usize;
+    let modules = json
+        .get_mut("modules")
+        .and_then(serde_json::Value::as_array_mut);
+    for module in modules.into_iter().flatten() {
+        let funcs = module
+            .get_mut("funcs")
+            .and_then(serde_json::Value::as_array_mut);
+        for func in funcs.into_iter().flatten() {
+            let params = func
+                .get_mut("params")
+                .and_then(serde_json::Value::as_array_mut);
+            for param in params.into_iter().flatten() {
+                if let Some(slot) = param.get_mut("pass") {
+                    *slot = serde_json::Value::String(pass.to_owned());
+                    rewritten = rewritten.saturating_add(1);
+                }
+            }
+        }
+    }
+    rewritten
+}
+
+/// A `Borrowed` pass forged through deserialization, on a parameter its body
+/// returns by value, is refused at emit rather than rendered as a reference.
+#[test]
+fn a_forged_borrowed_param_is_refused_at_emit() -> DResult<()> {
+    let bug = |detail: String| Diagnostic::CompilerBug {
+        where_: "hardening test",
+        detail,
+    };
+    let shared = std::sync::Arc::new(std::sync::Mutex::new(Interner::new()));
+    let (main_mod, name, param) = {
+        let mut interner = shared.lock().map_err(|e| bug(e.to_string()))?;
+        (
+            interner.intern("Main")?,
+            interner.intern("keep")?,
+            interner.intern("s")?,
+        )
+    };
+    let returning = Func {
+        id: FuncId::from_raw(0),
+        name,
+        home: ModPath(vec![]),
+        type_params: vec![],
+        row_params: vec![],
+        params: vec![ipe_ir::Param::owned(param, IrType::Str)],
+        ret: IrType::Str,
+        body: Expr::Var(param),
+    };
+    let honest = program(main_mod, vec![], vec![returning]);
+    let forged: Program = {
+        let _guard = ipe_intern::SerdeInternerGuard::install(std::sync::Arc::clone(&shared));
+        let mut json = serde_json::to_value(&honest).map_err(|e| bug(e.to_string()))?;
+        assert_eq!(forge_passes(&mut json, "Borrowed"), 1);
+        serde_json::from_value(json).map_err(|e| bug(e.to_string()))?
+    };
+    let (accepted, refused) = {
+        let interner = shared.lock().map_err(|e| bug(e.to_string()))?;
+        (emit(&interner, &honest), emit(&interner, &forged))
+    };
+    accepted?;
+    assert!(
+        matches!(
+            refused,
+            Err(Diagnostic::CompilerBug {
+                where_: "ipe_backend_rust::emit_func",
+                ..
+            })
+        ),
+        "{refused:?}"
     );
     Ok(())
 }

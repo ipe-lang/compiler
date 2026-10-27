@@ -3,9 +3,9 @@
 //! wired end-to-end through `ipe::run_cli`, exactly the boundary a real
 //! invocation crosses.
 //!
-//! `classify_entry_shape` only parses the entry file (no canon/infer/lower,
-//! no cargo), and the terminal gate fires immediately after — before
-//! `discover_manifest`'s emit step or any cargo work — so these two tests are
+//! The shape is classified from the entry's text in the held source snapshot
+//! (no canon/infer/lower, no cargo), and the terminal gate fires immediately after — before any
+//! emit step or cargo work — so these two tests are
 //! unconditional: no `IPE_E2E`, no build, no process replacement. Calling
 //! `ipe::run_cli` in process is safe here specifically because the refusal
 //! returns an `Err` before `run_run` / the watch loop ever reaches the point
@@ -25,34 +25,29 @@
 //! `ipe_runtime_rust::terminal_access::probe` exists to detect, so relying on
 //! it here tests the real thing rather than a simulation of it.
 
-use std::fs;
+use ipe::RootFixture;
 
 /// A minimal entry whose `main` pins the `Tui` shape — enough for
-/// `classify_entry_shape`'s parse-only check. `Tui.tea`'s callee is never
+/// the snapshot's shape classification. `Tui.tea`'s callee is never
 /// resolved, so `cfg` need not exist.
 const TUI_ENTRY: &str = "module Main exposing (main)\n\nimport Ipe.Tea.Tui\n\nmain = Tui.tea cfg\n";
 
-/// Write `src` as `Main.ipe` under a fresh per-test directory and return its
-/// path.
-fn write_entry(dir_name: &str, src: &str) -> std::path::PathBuf {
-    let dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(dir_name);
-    let _ = fs::remove_dir_all(&dir);
-    let entry = dir.join("Main.ipe");
-    let created = fs::create_dir_all(&dir).and_then(|()| fs::write(&entry, src));
-    assert!(created.is_ok(), "write fixture entry: {created:?}");
-    entry
+/// A project whose `src/Main.ipe` is [`TUI_ENTRY`].
+#[allow(clippy::expect_used)] // test helper: a failed fixture setup IS the failure
+fn tui_project() -> RootFixture {
+    RootFixture::main(TUI_ENTRY).expect("the TUI project resolves")
 }
 
-/// `ipe dev run <tui-entry>` under the test runner's non-interactive stdio must
+/// `ipe dev run <tui-project>` under the test runner's non-interactive stdio must
 /// refuse before any build: a `run` command-usage error whose reason names
 /// the missing interactive terminal.
 #[test]
 fn run_refuses_a_tui_entry_without_an_interactive_terminal() {
-    let entry = write_entry("ipe_run_tui_gate", TUI_ENTRY);
+    let project = tui_project();
     let args: Vec<String> = vec![
         "dev".to_owned(),
         "run".to_owned(),
-        entry.to_string_lossy().into_owned(),
+        project.path().to_string_lossy().into_owned(),
     ];
     let result = ipe::run_cli(&args);
     assert!(
@@ -65,15 +60,15 @@ fn run_refuses_a_tui_entry_without_an_interactive_terminal() {
     );
 }
 
-/// `ipe dev watch <tui-entry>` must refuse the same way, before the watch loop
+/// `ipe dev watch <tui-project>` must refuse the same way, before the watch loop
 /// itself ever starts — so this call returns promptly instead of looping.
 #[test]
 fn watch_refuses_a_tui_entry_without_an_interactive_terminal() {
-    let entry = write_entry("ipe_watch_tui_gate", TUI_ENTRY);
+    let project = tui_project();
     let args: Vec<String> = vec![
         "dev".to_owned(),
         "watch".to_owned(),
-        entry.to_string_lossy().into_owned(),
+        project.path().to_string_lossy().into_owned(),
     ];
     let result = ipe::run_cli(&args);
     assert!(

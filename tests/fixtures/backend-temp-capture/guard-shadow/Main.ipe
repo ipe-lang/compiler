@@ -1,0 +1,16 @@
+module Main exposing (main)
+
+import Ipe.Io as Io
+import Ipe.String as String
+
+-- A parameter spelled like the recursion-guard local every function body opens
+-- with. The guard must not shadow it, so the program builds and prints `42`.
+
+
+bump : Int -> Int
+bump _ipe_recursion_guard =
+    _ipe_recursion_guard + 1
+
+
+main =
+    Io.println (String.fromInt (bump 41))

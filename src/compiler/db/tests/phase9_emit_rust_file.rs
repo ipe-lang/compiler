@@ -14,7 +14,6 @@
 
 use std::sync::{Arc, Mutex, PoisonError};
 
-use ipe_backend_rust::DbDriver;
 use ipe_db::{BuildConfig, Db as _, IpeDatabase, ModuleOrigin, RustFileId, SourceFile, SourceRoot};
 use ipe_ir::ModPath;
 
@@ -185,18 +184,20 @@ fn emit_spine_file_memoized_coarse_floor() {
     let (root, _lib, main) = two_module_root(&db);
     let config = BuildConfig::new(
         &db,
-        DbDriver::Sqlite,
-        None,
-        ipe_ir::Target::Native,
-        Vec::new(),
-        ipe_backend_rust::MountBase::root(),
-        false,
-        ipe_backend_rust::BuildIntent::Development,
-        None,
-        false,
-        String::new(),
-        false,
-        false,
+        ipe_backend_rust::EmitSettings {
+            db_driver: ipe_backend_rust::DbDriver::Sqlite,
+            ffi: None,
+            target: ipe_ir::Target::Native,
+            wasm_public_env: Vec::new(),
+            mount_base: ipe_backend_rust::MountBase::root(),
+            wasm_hydrate_mode: false,
+            runtime_dep: None,
+            debugger: false,
+            crate_name: ipe_backend_rust::CrateName::SingleFile,
+            hot_appearance: false,
+            host: ipe_backend_rust::EmitHost::Served,
+            intent: ipe_backend_rust::BuildIntent::Development,
+        },
     );
 
     let spine = ipe_db::emit_spine_file(&db, root, main, config)
@@ -250,18 +251,20 @@ fn emit_rust_file_memoized_per_file() {
     let (root, lib, main) = two_module_root(&db);
     let config = BuildConfig::new(
         &db,
-        DbDriver::Sqlite,
-        None,
-        ipe_ir::Target::Native,
-        Vec::new(),
-        ipe_backend_rust::MountBase::root(),
-        false,
-        ipe_backend_rust::BuildIntent::Development,
-        None,
-        false,
-        String::new(),
-        false,
-        false,
+        ipe_backend_rust::EmitSettings {
+            db_driver: ipe_backend_rust::DbDriver::Sqlite,
+            ffi: None,
+            target: ipe_ir::Target::Native,
+            wasm_public_env: Vec::new(),
+            mount_base: ipe_backend_rust::MountBase::root(),
+            wasm_hydrate_mode: false,
+            runtime_dep: None,
+            debugger: false,
+            crate_name: ipe_backend_rust::CrateName::SingleFile,
+            hot_appearance: false,
+            host: ipe_backend_rust::EmitHost::Served,
+            intent: ipe_backend_rust::BuildIntent::Development,
+        },
     );
 
     // Interned ids carry `db`'s borrow, so they cannot be held across a
@@ -372,18 +375,20 @@ fn emit_manifest_matches_emit_project_for_single_module() {
     let root = root_of(&db, &[(&["Main"], main)]);
     let config = BuildConfig::new(
         &db,
-        DbDriver::Sqlite,
-        None,
-        ipe_ir::Target::Native,
-        Vec::new(),
-        ipe_backend_rust::MountBase::root(),
-        false,
-        ipe_backend_rust::BuildIntent::Development,
-        None,
-        false,
-        String::new(),
-        false,
-        false,
+        ipe_backend_rust::EmitSettings {
+            db_driver: ipe_backend_rust::DbDriver::Sqlite,
+            ffi: None,
+            target: ipe_ir::Target::Native,
+            wasm_public_env: Vec::new(),
+            mount_base: ipe_backend_rust::MountBase::root(),
+            wasm_hydrate_mode: false,
+            runtime_dep: None,
+            debugger: false,
+            crate_name: ipe_backend_rust::CrateName::SingleFile,
+            hot_appearance: false,
+            host: ipe_backend_rust::EmitHost::Served,
+            intent: ipe_backend_rust::BuildIntent::Development,
+        },
     );
 
     let via_project = ipe_db::emit_project(&db, root, main, config)
@@ -417,18 +422,20 @@ fn emit_manifest_matches_emit_project_for_two_modules() {
     let (root, _lib, main) = two_module_root(&db);
     let config = BuildConfig::new(
         &db,
-        DbDriver::Sqlite,
-        None,
-        ipe_ir::Target::Native,
-        Vec::new(),
-        ipe_backend_rust::MountBase::root(),
-        false,
-        ipe_backend_rust::BuildIntent::Development,
-        None,
-        false,
-        String::new(),
-        false,
-        false,
+        ipe_backend_rust::EmitSettings {
+            db_driver: ipe_backend_rust::DbDriver::Sqlite,
+            ffi: None,
+            target: ipe_ir::Target::Native,
+            wasm_public_env: Vec::new(),
+            mount_base: ipe_backend_rust::MountBase::root(),
+            wasm_hydrate_mode: false,
+            runtime_dep: None,
+            debugger: false,
+            crate_name: ipe_backend_rust::CrateName::SingleFile,
+            hot_appearance: false,
+            host: ipe_backend_rust::EmitHost::Served,
+            intent: ipe_backend_rust::BuildIntent::Development,
+        },
     );
 
     // Precondition: this program genuinely splits (2 distinct homes), so

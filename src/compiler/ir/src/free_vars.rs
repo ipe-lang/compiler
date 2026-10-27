@@ -6,10 +6,12 @@
 //! implementation.
 
 use std::collections::BTreeSet;
+use std::ops::ControlFlow;
 
 use ipe_intern::Symbol;
 
-use crate::{Expr, Pat};
+use crate::let_inline::pat_binds_target;
+use crate::{Expr, IrType, Pat};
 
 /// Collect every symbol a pattern binds (recursively) into `out`.
 ///
@@ -20,7 +22,8 @@ pub fn pat_bound_symbols(pat: &Pat, out: &mut BTreeSet<Symbol>) {
         Pat::Var(s) => {
             out.insert(*s);
         }
-        Pat::Wildcard | Pat::Int(_) | Pat::Bool(_) | Pat::Char(_) | Pat::Str(_) => {}
+        // A `SharedAlts` alternative is binder-free.
+        Pat::Wildcard | Pat::Int(_) | Pat::Bool(_) | Pat::Char(_) | Pat::Str(_) | Pat::Or(_) => {}
         Pat::Alias(inner, s) => {
             out.insert(*s);
             pat_bound_symbols(inner, out);
@@ -48,13 +51,6 @@ pub fn pat_bound_symbols(pat: &Pat, out: &mut BTreeSet<Symbol>) {
                 pat_bound_symbols(p, out);
             }
         }
-        // Every alternative of an or-pattern binds the same names, so the first
-        // alternative's binders are the whole set.
-        Pat::Or(alts) => {
-            if let Some(first) = alts.first() {
-                pat_bound_symbols(first, out);
-            }
-        }
     }
 }
 
@@ -74,8 +70,10 @@ pub fn pat_has_str_guard_slot(pat: &Pat) -> bool {
         Pat::Tuple(elems) => elems.iter().any(pat_has_str_guard_slot),
         Pat::Ctor { args, .. } => args.iter().any(pat_has_str_guard_slot),
         Pat::Record(fields) => fields.iter().any(|(_, p)| pat_has_str_guard_slot(p)),
-        Pat::Or(alts) => alts.iter().any(pat_has_str_guard_slot),
-        Pat::Var(_)
+        // A `SharedAlts` alternative is a constructor or an Int/Char/Bool literal,
+        // never a string leaf.
+        Pat::Or(_)
+        | Pat::Var(_)
         | Pat::Wildcard
         | Pat::Int(_)
         | Pat::Bool(_)
@@ -121,8 +119,111 @@ pub fn free_vars(expr: &Expr) -> BTreeSet<Symbol> {
 }
 
 /// Add the free symbols of `expr` to `out` (see [`free_vars`]).
-#[allow(clippy::too_many_lines)] // A recursive tree-walk over a large enum — necessarily long.
 pub fn collect_free_vars(expr: &Expr, out: &mut BTreeSet<Symbol>) {
+    let _ = walk_free(expr, &Scope::Top, &mut Sink::Collect(out));
+}
+
+/// Does `sym` occur free in `expr`?
+///
+/// The same walk as [`free_vars`], stopped at the first free occurrence, so
+/// `mentions_free(s, e) == free_vars(e).contains(&s)` for every `s` and `e`.
+/// A `move` closure captures by value every free local its body mentions,
+/// whatever the emitted form at the mention (a borrow, a `.clone()`, a record
+/// update base), so this is the capture predicate of a closure body.
+#[must_use]
+pub fn mentions_free(sym: Symbol, expr: &Expr) -> bool {
+    walk_free(expr, &Scope::Top, &mut Sink::Find(sym)).is_break()
+}
+
+/// The binders in scope at a point of a [`walk_free`] walk, innermost first.
+///
+/// A stack-linked chain, so entering a binder allocates nothing.
+#[derive(Clone, Copy)]
+enum Scope<'a> {
+    /// No binder of the walked expression is in scope.
+    Top,
+    /// A `let` name.
+    Name(Symbol, &'a Self),
+    /// The names a capture-clone node rebinds.
+    Names(&'a [Symbol], &'a Self),
+    /// Lambda or loop parameters.
+    Params(&'a [(Symbol, IrType)], &'a Self),
+    /// The names a destructure or arm pattern binds.
+    Pattern(&'a Pat, &'a Self),
+}
+
+impl Scope<'_> {
+    /// Is `sym` bound by some binder of this chain?
+    fn binds(&self, sym: Symbol) -> bool {
+        let mut cur = self;
+        loop {
+            match cur {
+                Self::Top => return false,
+                Self::Name(name, up) => {
+                    if *name == sym {
+                        return true;
+                    }
+                    cur = up;
+                }
+                Self::Names(names, up) => {
+                    if names.contains(&sym) {
+                        return true;
+                    }
+                    cur = up;
+                }
+                Self::Params(params, up) => {
+                    if params.iter().any(|(s, _)| *s == sym) {
+                        return true;
+                    }
+                    cur = up;
+                }
+                Self::Pattern(pat, up) => {
+                    if pat_binds_target(pat, sym) {
+                        return true;
+                    }
+                    cur = up;
+                }
+            }
+        }
+    }
+}
+
+/// What a [`walk_free`] walk does with each variable occurrence it meets.
+enum Sink<'o> {
+    /// Gather every free symbol.
+    Collect(&'o mut BTreeSet<Symbol>),
+    /// Stop at the first free occurrence of this symbol.
+    Find(Symbol),
+}
+
+impl Sink<'_> {
+    /// Record the occurrence of `sym` under `scope`; `Break` ends the walk.
+    fn occur(&mut self, sym: Symbol, scope: &Scope<'_>) -> ControlFlow<()> {
+        match self {
+            Self::Collect(out) => {
+                if !out.contains(&sym) && !scope.binds(sym) {
+                    out.insert(sym);
+                }
+                ControlFlow::Continue(())
+            }
+            Self::Find(wanted) => {
+                if *wanted == sym && !scope.binds(sym) {
+                    ControlFlow::Break(())
+                } else {
+                    ControlFlow::Continue(())
+                }
+            }
+        }
+    }
+}
+
+/// The one free-variable walk behind [`collect_free_vars`] and [`mentions_free`].
+///
+/// Every sub-expression is visited, the `Update` base included; a binder
+/// extends `scope` only over the sub-expressions it scopes. The match is
+/// exhaustive, so a new `Expr` variant is a build error here, never a silent
+/// skip one walker makes and another does not.
+fn walk_free(expr: &Expr, scope: &Scope<'_>, sink: &mut Sink<'_>) -> ControlFlow<()> {
     match expr {
         Expr::Int(_)
         | Expr::Bool(_)
@@ -131,108 +232,96 @@ pub fn collect_free_vars(expr: &Expr, out: &mut BTreeSet<Symbol>) {
         | Expr::CustomElementRef { .. }
         | Expr::Char(_)
         | Expr::Unit
-        | Expr::FuncValue { .. } => {}
-        Expr::Var(s) | Expr::CloneVar(s) => {
-            out.insert(*s);
-        }
+        | Expr::FuncValue { .. } => ControlFlow::Continue(()),
+        Expr::Var(s) | Expr::CloneVar(s) => sink.occur(*s, scope),
         Expr::Ctor { args, .. } | Expr::Call { args, .. } | Expr::TailRecur { args } => {
-            for a in args {
-                collect_free_vars(a, out);
-            }
+            walk_all(args, scope, sink)
         }
         Expr::BinOp { lhs, rhs, .. } => {
-            collect_free_vars(lhs, out);
-            collect_free_vars(rhs, out);
+            walk_free(lhs, scope, sink)?;
+            walk_free(rhs, scope, sink)
         }
         Expr::Let { name, value, body } => {
-            collect_free_vars(value, out);
-            let mut body_free = BTreeSet::new();
-            collect_free_vars(body, &mut body_free);
-            body_free.remove(name);
-            out.extend(body_free);
+            walk_free(value, scope, sink)?;
+            walk_free(body, &Scope::Name(*name, scope), sink)
         }
         Expr::Destructure {
             binder,
             value,
             body,
         } => {
-            collect_free_vars(value, out);
-            let mut bound = BTreeSet::new();
-            pat_bound_symbols(binder, &mut bound);
-            let mut body_free = BTreeSet::new();
-            collect_free_vars(body, &mut body_free);
-            for b in &bound {
-                body_free.remove(b);
-            }
-            out.extend(body_free);
+            walk_free(value, scope, sink)?;
+            walk_free(body, &Scope::Pattern(binder, scope), sink)
         }
         Expr::If { cond, then_, else_ } => {
-            collect_free_vars(cond, out);
-            collect_free_vars(then_, out);
-            collect_free_vars(else_, out);
+            walk_free(cond, scope, sink)?;
+            walk_free(then_, scope, sink)?;
+            walk_free(else_, scope, sink)
         }
         Expr::Match(m) => {
-            collect_free_vars(m.scrutinee(), out);
+            walk_free(m.scrutinee(), scope, sink)?;
             for arm in m.arms() {
-                let mut bound = BTreeSet::new();
-                pat_bound_symbols(&arm.pat, &mut bound);
-                let mut body_free = BTreeSet::new();
-                collect_free_vars(&arm.body, &mut body_free);
+                let arm_scope = Scope::Pattern(&arm.pat, scope);
+                walk_free(&arm.body, &arm_scope, sink)?;
                 if let Some(guard) = &arm.guard {
-                    collect_free_vars(guard, &mut body_free);
+                    walk_free(guard, &arm_scope, sink)?;
                 }
-                for b in &bound {
-                    body_free.remove(b);
-                }
-                out.extend(body_free);
             }
+            ControlFlow::Continue(())
         }
-        Expr::Tuple(items) | Expr::List { items, .. } => {
-            for e in items {
-                collect_free_vars(e, out);
-            }
-        }
+        Expr::Tuple(items) | Expr::List { items, .. } => walk_all(items, scope, sink),
         Expr::Cons { head, tail } => {
-            collect_free_vars(head, out);
-            collect_free_vars(tail, out);
+            walk_free(head, scope, sink)?;
+            walk_free(tail, scope, sink)
         }
         Expr::ListIndexClone { list, .. } | Expr::ListLenCheck { list, .. } => {
-            collect_free_vars(list, out);
+            walk_free(list, scope, sink)
         }
-        Expr::Record { fields, .. } => {
-            for (_, e) in fields {
-                collect_free_vars(e, out);
-            }
-        }
-        Expr::Access { record, .. } => collect_free_vars(record, out),
+        Expr::Record { fields, .. } => walk_fields(fields, scope, sink),
+        Expr::Access { record, .. } => walk_free(record, scope, sink),
         Expr::Update { record, fields } => {
-            collect_free_vars(record, out);
-            for (_, e) in fields {
-                collect_free_vars(e, out);
-            }
+            walk_free(record, scope, sink)?;
+            walk_fields(fields, scope, sink)
         }
         Expr::Lambda { params, body, .. }
         | Expr::SharedLambda { params, body, .. }
         | Expr::OnceLambda { params, body, .. }
-        | Expr::TailLoop { params, body } => {
-            let mut body_free = BTreeSet::new();
-            collect_free_vars(body, &mut body_free);
-            for (s, _) in params {
-                body_free.remove(s);
-            }
-            out.extend(body_free);
-        }
+        | Expr::TailLoop { params, body } => walk_free(body, &Scope::Params(params, scope), sink),
         Expr::Apply { func, args } => {
-            collect_free_vars(func, out);
-            for a in args {
-                collect_free_vars(a, out);
-            }
+            walk_free(func, scope, sink)?;
+            walk_all(args, scope, sink)
         }
         Expr::TaskSeq { effect, rest } => {
-            collect_free_vars(effect, out);
-            collect_free_vars(rest, out);
+            walk_free(effect, scope, sink)?;
+            walk_free(rest, scope, sink)
+        }
+        Expr::CaptureClones { syms, body } => {
+            for s in syms {
+                sink.occur(*s, scope)?;
+            }
+            walk_free(body, &Scope::Names(syms, scope), sink)
         }
     }
+}
+
+/// [`walk_free`] over each expression of `exprs`, in order.
+fn walk_all(exprs: &[Expr], scope: &Scope<'_>, sink: &mut Sink<'_>) -> ControlFlow<()> {
+    for e in exprs {
+        walk_free(e, scope, sink)?;
+    }
+    ControlFlow::Continue(())
+}
+
+/// [`walk_free`] over each field value of `fields`; field names are not variables.
+fn walk_fields(
+    fields: &[(Symbol, Expr)],
+    scope: &Scope<'_>,
+    sink: &mut Sink<'_>,
+) -> ControlFlow<()> {
+    for (_, e) in fields {
+        walk_free(e, scope, sink)?;
+    }
+    ControlFlow::Continue(())
 }
 
 #[cfg(test)]

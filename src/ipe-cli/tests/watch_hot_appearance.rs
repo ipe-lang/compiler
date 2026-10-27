@@ -407,7 +407,15 @@ fn fresh_dirs(tag: &str) -> Result<(PathBuf, PathBuf), BoxError> {
 }
 
 fn write_main(ipe_dir: &Path, source: &str) -> Result<(), BoxError> {
-    std::fs::write(ipe_dir.join("Main.ipe"), source)
+    let src_dir = ipe_dir.join("src");
+    std::fs::create_dir_all(&src_dir)
+        .map_err(|e| -> BoxError { format!("mkdir {}: {e}", src_dir.display()).into() })?;
+    std::fs::write(
+        ipe_dir.join("package.ipe"),
+        "module Package exposing (package)\n\n\npackage =\n    { name = \"watch-fixture\" }\n",
+    )
+    .map_err(|e| -> BoxError { format!("write package.ipe: {e}").into() })?;
+    std::fs::write(src_dir.join("Main.ipe"), source)
         .map_err(|e| -> BoxError { format!("write Main.ipe: {e}").into() })
 }
 
@@ -566,7 +574,7 @@ fn style_edit_hot_swaps_without_rebuild_and_structural_edit_recompiles() -> Resu
 
     let sink = EventSink::default();
     let port = 19171;
-    let (join, handle) = start_watch(&ipe_dir.join("Main.ipe"), &out_dir, port, &sink);
+    let (join, handle) = start_watch(&ipe_dir, &out_dir, port, &sink);
 
     assert!(
         wait_for_serving(port, Duration::from_mins(4)),
@@ -669,7 +677,7 @@ fn attribute_and_text_edits_hot_swap_without_rebuild() -> Result<(), BoxError> {
 
     let sink = EventSink::default();
     let port = 19172;
-    let (join, handle) = start_watch(&ipe_dir.join("Main.ipe"), &out_dir, port, &sink);
+    let (join, handle) = start_watch(&ipe_dir, &out_dir, port, &sink);
 
     assert!(
         wait_for_serving(port, Duration::from_mins(4)),
@@ -791,7 +799,7 @@ fn numeric_weight_edit_hot_swaps_without_rebuild() -> Result<(), BoxError> {
 
     let sink = EventSink::default();
     let port = 19175;
-    let (join, handle) = start_watch(&ipe_dir.join("Main.ipe"), &out_dir, port, &sink);
+    let (join, handle) = start_watch(&ipe_dir, &out_dir, port, &sink);
 
     assert!(
         wait_for_serving(port, Duration::from_mins(4)),
@@ -883,7 +891,7 @@ fn animation_duration_edit_hot_swaps_without_rebuild() -> Result<(), BoxError> {
 
     let sink = EventSink::default();
     let port = 19180;
-    let (join, handle) = start_watch(&ipe_dir.join("Main.ipe"), &out_dir, port, &sink);
+    let (join, handle) = start_watch(&ipe_dir, &out_dir, port, &sink);
 
     assert!(
         wait_for_serving(port, Duration::from_mins(4)),
@@ -973,7 +981,7 @@ fn grid_tracks_edit_hot_swaps_without_rebuild() -> Result<(), BoxError> {
 
     let sink = EventSink::default();
     let port = 19176;
-    let (join, handle) = start_watch(&ipe_dir.join("Main.ipe"), &out_dir, port, &sink);
+    let (join, handle) = start_watch(&ipe_dir, &out_dir, port, &sink);
 
     assert!(
         wait_for_serving(port, Duration::from_mins(4)),
@@ -1062,7 +1070,7 @@ fn image_alt_edit_hot_swaps_without_rebuild() -> Result<(), BoxError> {
 
     let sink = EventSink::default();
     let port = 19173;
-    let (join, handle) = start_watch(&ipe_dir.join("Main.ipe"), &out_dir, port, &sink);
+    let (join, handle) = start_watch(&ipe_dir, &out_dir, port, &sink);
 
     assert!(
         wait_for_serving(port, Duration::from_mins(4)),
@@ -1152,7 +1160,7 @@ fn css_value_edit_hot_swaps_and_is_byte_identical() -> Result<(), BoxError> {
 
     let sink = EventSink::default();
     let port = 19174;
-    let (join, handle) = start_watch(&ipe_dir.join("Main.ipe"), &out_dir, port, &sink);
+    let (join, handle) = start_watch(&ipe_dir, &out_dir, port, &sink);
 
     assert!(
         wait_for_serving(port, Duration::from_mins(4)),
@@ -1249,7 +1257,7 @@ fn static_html_subtree_structural_edit_hot_swaps_without_rebuild() -> Result<(),
 
     let sink = EventSink::default();
     let port = 19178;
-    let (join, handle) = start_watch(&ipe_dir.join("Main.ipe"), &out_dir, port, &sink);
+    let (join, handle) = start_watch(&ipe_dir, &out_dir, port, &sink);
 
     assert!(
         wait_for_serving(port, Duration::from_mins(4)),
@@ -1355,7 +1363,7 @@ fn static_ui_subtree_structural_edit_hot_swaps_without_rebuild() -> Result<(), B
 
     let sink = EventSink::default();
     let port = 19179;
-    let (join, handle) = start_watch(&ipe_dir.join("Main.ipe"), &out_dir, port, &sink);
+    let (join, handle) = start_watch(&ipe_dir, &out_dir, port, &sink);
 
     assert!(
         wait_for_serving(port, Duration::from_mins(4)),
@@ -1489,7 +1497,7 @@ fn static_ui_subtree_wrapper_hot_swaps_without_rebuild() -> Result<(), BoxError>
 
     let sink = EventSink::default();
     let port = 19181;
-    let (join, handle) = start_watch(&ipe_dir.join("Main.ipe"), &out_dir, port, &sink);
+    let (join, handle) = start_watch(&ipe_dir, &out_dir, port, &sink);
 
     assert!(
         wait_for_serving(port, Duration::from_mins(4)),
@@ -1626,7 +1634,7 @@ fn value_hole_static_sibling_hot_swaps_without_rebuild() -> Result<(), BoxError>
 
     let sink = EventSink::default();
     let port = 19187;
-    let (join, handle) = start_watch(&ipe_dir.join("Main.ipe"), &out_dir, port, &sink);
+    let (join, handle) = start_watch(&ipe_dir, &out_dir, port, &sink);
 
     assert!(
         wait_for_serving(port, Duration::from_mins(4)),
@@ -1678,6 +1686,72 @@ fn value_hole_static_sibling_hot_swaps_without_rebuild() -> Result<(), BoxError>
     eprintln!(
         "[measure] value-hole static sibling alpha->omega hot-swap: {} ms (no cargo, no restart)",
         swap_start.elapsed().as_millis()
+    );
+
+    stop_and_join(&handle, join)
+}
+
+/// A `Web.tea` whose view maps a lambda over `model.items` — under the flag the
+/// `List.map` becomes a template list hole whose per-item fills read the
+/// lambda's parameter `entry`.
+fn web_fixture_list_hole(label: &str) -> String {
+    format!(
+        "module Main exposing (main)\n\n\
+         import Ipe.Tea.Web as Web\n\
+         import Ipe.Ui as Ui\n\
+         import Ipe.List as List\n\
+         import Ipe.Tea.Web.Cmd\n\
+         import Ipe.Tea.Web.Sub\n\n\
+         type alias Model = {{ items : List String }}\n\n\
+         type Msg = Noop\n\n\
+         init : WebReq -> ( Model, Cmd Msg )\n\
+         init _req =\n    \
+             ( {{ items = [ \"apple\", \"pear\" ] }}, Cmd.none )\n\n\
+         update : Msg -> Model -> ( Model, Cmd Msg )\n\
+         update _msg model =\n    \
+             ( model, Cmd.none )\n\n\
+         view : Model -> Element Msg\n\
+         view model =\n    \
+             Ui.column []\n        \
+                 [ Ui.text \"{label}\"\n        \
+                 , Ui.column [] (List.map (\\entry -> Ui.row [] [ Ui.text entry ]) model.items)\n        \
+                 ]\n\n\
+         subscriptions : Model -> Sub Msg\n\
+         subscriptions _model =\n    \
+             Sub.none\n\n\
+         main =\n    \
+             Web.tea\n        \
+                 {{ init = init, update = update, view = view, subscriptions = subscriptions\n        \
+                 , routes = [], notFound = Noop\n        \
+                 }}\n",
+    )
+}
+
+/// A list hole's per-item closure binds the item under the same ident its fills
+/// read: the flag-on cold build cargo-compiles and serves every item.
+#[test]
+#[cfg(target_os = "linux")]
+fn list_hole_item_binder_matches_its_reads() -> Result<(), BoxError> {
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
+        eprintln!("skipping (set IPE_E2E=1 to run)");
+        return Ok(());
+    }
+
+    let (ipe_dir, out_dir) = fresh_dirs("listhole")?;
+    write_main(&ipe_dir, &web_fixture_list_hole("marker"))?;
+
+    let sink = EventSink::default();
+    let port = 19188;
+    let (join, handle) = start_watch(&ipe_dir, &out_dir, port, &sink);
+
+    assert!(
+        wait_for_serving(port, Duration::from_mins(4)),
+        "the flag-on cold build of a list-hole view must cargo-compile and serve"
+    );
+    let body = http_get_body(port).ok_or("server must serve a body after cold build")?;
+    assert!(
+        body.contains("apple") && body.contains("pear"),
+        "every list item must render through its list-hole fill: {body}"
     );
 
     stop_and_join(&handle, join)
@@ -1739,7 +1813,7 @@ fn update_arm_step_edit_hot_swaps_without_rebuild() -> Result<(), BoxError> {
 
     let sink = EventSink::default();
     let port = 19177;
-    let (join, handle) = start_watch(&ipe_dir.join("Main.ipe"), &out_dir, port, &sink);
+    let (join, handle) = start_watch(&ipe_dir, &out_dir, port, &sink);
 
     assert!(
         wait_for_serving(port, Duration::from_mins(4)),
@@ -1915,7 +1989,7 @@ fn non_additive_msg_change_recompiles() -> Result<(), BoxError> {
 
     let sink = EventSink::default();
     let port = 19182;
-    let (join, handle) = start_watch(&ipe_dir.join("Main.ipe"), &out_dir, port, &sink);
+    let (join, handle) = start_watch(&ipe_dir, &out_dir, port, &sink);
 
     assert!(
         wait_for_serving(port, Duration::from_mins(4)),
@@ -1972,7 +2046,7 @@ fn subscriptions_interval_edit_hot_swaps_without_rebuild() -> Result<(), BoxErro
 
     let sink = EventSink::default();
     let port = 19183;
-    let (join, handle) = start_watch(&ipe_dir.join("Main.ipe"), &out_dir, port, &sink);
+    let (join, handle) = start_watch(&ipe_dir, &out_dir, port, &sink);
 
     assert!(
         wait_for_serving(port, Duration::from_mins(4)),
@@ -2104,7 +2178,7 @@ fn cmd_perform_arm_composes_and_serves() -> Result<(), BoxError> {
 
     let sink = EventSink::default();
     let port = 19184;
-    let (join, handle) = start_watch(&ipe_dir.join("Main.ipe"), &out_dir, port, &sink);
+    let (join, handle) = start_watch(&ipe_dir, &out_dir, port, &sink);
 
     // Poll BOTH "serving" and "Restarted recorded" together, under the SAME
     // generous cold-build budget: the app answers HTTP the instant its

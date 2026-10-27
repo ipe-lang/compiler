@@ -14,14 +14,13 @@ module Main exposing (main)
 -- token to provision. `Ipe.Web.Console` provides the `Identity` builders so the
 -- record stays source-compatible as future fields are added.
 
-
+import Ipe.Maybe exposing (Maybe(..))
+import Ipe.Task as Task
 import Ipe.Tea.Web as Web
-import Ipe.Web.Console as Console exposing (Identity)
-import Ipe.Ui as Ui
 import Ipe.Tea.Web.Cmd as Cmd
 import Ipe.Tea.Web.Sub as Sub
-import Ipe.Task as Task
-import Ipe.Maybe exposing (Maybe(..))
+import Ipe.Ui as Ui
+import Ipe.Web.Console as Console exposing (Identity)
 
 
 type Msg

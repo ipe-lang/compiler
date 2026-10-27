@@ -12,11 +12,11 @@ use ipe_diagnostics::{
     ModulePlacementRejection, NameError, ParseError, SealRejection, SortedNames, Span, StdlibReach,
     TypeError,
 };
-use ipe_intern::{Interner, Symbol};
+use ipe_intern::{Interner, Symbol, SynthStem};
 use ipe_kernels::{AppSurface, BuiltinRow, BuiltinType, SealClass, StdlibKernel, WebCapability};
 use ipe_syntax as src;
+use ipe_syntax::BinOp;
 use ipe_syntax::fixity::{OperatorModule, PARSER_OPERATOR_MODULE};
-use ipe_syntax::{Assoc, BinOp};
 
 use crate::ast as canon;
 use crate::env::{
@@ -141,14 +141,14 @@ pub fn is_user_type_declaration_forbidden(name: &str) -> bool {
 
 /// Fixed type-argument arity for empty-home builtins, or `None`.
 ///
-/// Drives the IPE-N0031 canon gate: a mis-arity application would otherwise
+/// Feeds the IPE-N0031 canon gate: a mis-arity application would otherwise
 /// fall through to the lowerer's empty-home ICE catch-all (IPE-I0001). The
 /// arity is the row's [`BuiltinRow::fixed_arity`] column, which the kernels
 /// table proves reserved, so a fixed-arity head can never be user-shadowed.
 ///
 /// `Task`/`Cmd`/`Sub` carry no arity here (their gate is in
-/// `ipe_types::constrain`); `CustomElement` carries none either (its
-/// name-based gate is fused with its boundary SEAL).
+/// `ipe_types::constrain`); `CustomElement` carries none either (the gate
+/// checks it by name under any home).
 #[must_use]
 pub fn builtin_empty_home_arity(name: Option<&str>) -> Option<usize> {
     bare_builtin(name?)?.fixed_arity().map(usize::from)
@@ -319,6 +319,16 @@ const STDLIB_DEFINABLE_CARRIER_TYPES: &[&str] = &[
     // Opaque BCP-47 locale handle (`Ipe.Locale`). Same pattern as `Key`.
     "Locale",
 ];
+
+/// Whether `name` is a shared opaque carrier a trusted stdlib module
+/// re-declares as the same type the builtin of that name denotes.
+///
+/// Such a declaration (`Ipe.Config`'s `Decoder`) is the stdlib spelling of the
+/// builtin, so its `Ipe`-rooted head is identical to the empty-home builtin's.
+#[must_use]
+pub fn is_stdlib_shared_carrier_type(name: &str) -> bool {
+    STDLIB_DEFINABLE_CARRIER_TYPES.contains(&name)
+}
 
 /// Reject a `type` / `type alias` whose name shadows a reserved built-in type
 /// constructor. See [`is_user_type_declaration_forbidden`].
@@ -3726,10 +3736,9 @@ fn derive_record_codec(
         leaves.push((*fname, enc, dec));
     }
 
-    // The record parameter of the encoder lambda, a fresh name that cannot alias
-    // a field or a user binding. Its span seeds a unique name per record.
-    let name_span = sg.fresh();
-    let rec_param = interner.intern(&format!("codec_rec_{}", name_span.lo))?;
+    // The record parameter of the encoder lambda. Its span seeds a unique name
+    // per record, and `mint_site_binder` keeps it apart from every visible binding.
+    let rec_param = mint_site_binder(SiteBinder::CodecRecord(sg.fresh()), env, interner)?;
 
     // enc = \rec -> Encode.object [ (key, leafEnc rec.field), … ]
     let mut pairs = Vec::with_capacity(leaves.len());
@@ -4025,10 +4034,8 @@ fn project_codec_enc_dec(
     let ctor_name = ctor.name;
     let ctor_index = ctor.index;
 
-    let mut make_projection = |proj_field: Symbol, run_unit: bool| -> canon::Expr {
-        let binder = interner
-            .intern(&format!("codec_r_{}", sg.fresh().lo))
-            .unwrap_or(proj_field);
+    let mut make_projection = |proj_field: Symbol, run_unit: bool| -> DResult<canon::Expr> {
+        let binder = mint_site_binder(SiteBinder::CodecProjection(sg.fresh()), env, interner)?;
         let access = Located::new(
             sg.fresh(),
             canon::Expr_::Access(
@@ -4057,17 +4064,17 @@ fn project_codec_enc_dec(
                 args: vec![Located::new(sg.fresh(), canon::Pattern_::PVar(binder))],
             },
         );
-        Located::new(
+        Ok(Located::new(
             sg.fresh(),
             canon::Expr_::Case(
                 Box::new(Located::new(sg.fresh(), codec.clone())),
                 vec![canon::CaseBranch { pat, body }],
             ),
-        )
+        ))
     };
 
-    let enc = make_projection(enc_field, false);
-    let dec = make_projection(mkdec_field, true);
+    let enc = make_projection(enc_field, false)?;
+    let dec = make_projection(mkdec_field, true)?;
     Ok((enc, dec))
 }
 
@@ -4368,6 +4375,13 @@ fn inject_dep_exports(
     interner: &mut Interner,
 ) -> DResult<()> {
     let dep_path = &dep.path;
+    // A qualified use (`Dep.Widget`) names a union the clause may not expose,
+    // so every exported union's arity is recorded.
+    for (&type_name, exported) in &dep.types {
+        if let crate::ExportedType::Union { home, params } = exported {
+            Rc::make_mut(&mut env.union_params).declare(home, type_name, *params);
+        }
+    }
 
     match &import.exposing.value {
         src::Exposing::All => {
@@ -4375,11 +4389,11 @@ fn inject_dep_exports(
             for &name in &dep.values {
                 bind_dep_value(dep, name, Tier::Open, span, env, interner)?;
             }
-            for (&type_name, home) in &dep.types {
+            for (&type_name, exported) in &dep.types {
                 bind_dep_union(
                     dep,
                     type_name,
-                    home,
+                    exported.home(),
                     &CtorFilter::All,
                     Tier::Open,
                     span,
@@ -4419,7 +4433,7 @@ fn inject_dep_exports(
                         bind_dep_value(dep, *name, Tier::Explicit, item.span, env, interner)?;
                     }
                     src::Exposed::Type(type_name, privacy) => {
-                        let union_home = dep.types.get(type_name);
+                        let union_home = dep.types.get(type_name).map(crate::ExportedType::home);
                         let alias = dep.aliases.get(type_name);
                         if union_home.is_none() && alias.is_none() {
                             let name_s = name_str(interner, *type_name)?;
@@ -4589,13 +4603,21 @@ fn build_module_exports(
 
     // Sets of names defined by THIS module (not imported from deps).
     let own_values: BTreeSet<Symbol> = m.values.iter().map(|v| v.value.name.value).collect();
-    let own_types: BTreeSet<Symbol> = m.unions.iter().map(|u| u.value.name.value).collect();
+    let own_types: BTreeMap<Symbol, usize> = m
+        .unions
+        .iter()
+        .map(|u| (u.value.name.value, u.value.vars.len()))
+        .collect();
+    let own_union = |params: usize| crate::ExportedType::Union {
+        home: home.to_owned(),
+        params,
+    };
 
     match &m.exposing.value {
         src::Exposing::All => {
             exports.values = own_values;
-            for &type_name in &own_types {
-                exports.types.insert(type_name, home.to_owned());
+            for (&type_name, &params) in &own_types {
+                exports.types.insert(type_name, own_union(params));
                 for ctor_home in local_ctors(env) {
                     if ctor_home.type_name == type_name {
                         exports.ctors.insert(ctor_home.name, ctor_home.clone());
@@ -4625,8 +4647,8 @@ fn build_module_exports(
                         }
                     }
                     src::Exposed::Type(type_name, privacy) => {
-                        if own_types.contains(type_name) {
-                            exports.types.insert(*type_name, home.to_owned());
+                        if let Some(&params) = own_types.get(type_name) {
+                            exports.types.insert(*type_name, own_union(params));
                             let filter = exposed_ctor_filter(privacy);
                             if !matches!(filter, CtorFilter::None) {
                                 for ctor_home in local_ctors(env) {
@@ -4650,7 +4672,10 @@ fn build_module_exports(
                             // constructors (a builtin carrier has none at source).
                             let builtin_home =
                                 reexported_builtin_type_home(resolved, home, interner);
-                            exports.types.insert(*type_name, builtin_home);
+                            exports.types.insert(
+                                *type_name,
+                                crate::ExportedType::Builtin { home: builtin_home },
+                            );
                         } else if let Some(resolved) = own_aliases.get(type_name) {
                             exports.aliases.insert(*type_name, resolved.clone());
                             // Exposing a record alias also exposes its
@@ -4780,6 +4805,7 @@ fn register_union(
     interner: &Interner,
 ) -> DResult<()> {
     let type_name = u.name.value;
+    Rc::make_mut(&mut env.union_params).declare(home, type_name, u.vars.len());
     for (index, c) in u.ctors.iter().enumerate() {
         let name = c.value.name;
         let ctor = CtorHome {
@@ -5286,6 +5312,7 @@ fn canonicalise_expr(e: &src::Expr, env: &Env, interner: &mut Interner) -> DResu
         src::Expr_::Unit => canon::Expr_::Unit,
         src::Expr_::VarLocal(name) => resolve_var(*name, span, env, interner)?,
         src::Expr_::VarQual(qual, name) => resolve_qual_var(*qual, *name, span, env, interner)?,
+        src::Expr_::TaskAndThen => resolve_task_and_then(span, env, interner)?,
         src::Expr_::Call(f, args) => {
             if let Some(node) = canonicalise_foreign_call(f, args, span, env, interner)? {
                 node
@@ -5732,6 +5759,51 @@ fn import_required(
     }
 }
 
+/// The import path of the module every `do` bind sequences through.
+pub const DO_BIND_MODULE: &[&str] = &["Ipe", "Task"];
+
+/// The `do` statement operator whose bind sequences through [`DO_BIND_MODULE`].
+const DO_BIND_OPERATOR: &str = "<-";
+
+/// Resolve a `do` bind's [`src::Expr_::TaskAndThen`] to the `Task.andThen`
+/// kernel, by identity.
+///
+/// The gate is an import of [`DO_BIND_MODULE`] under any spelling: an alias
+/// renames the module, never what `do` means, and a different module aliased
+/// `Task` never stands in for it. With no such import the bind is IPE-N0034
+/// naming the `<-` the source wrote and `import Ipe.Task`, never a `Task`
+/// qualifier the source does not spell.
+///
+/// # Errors
+/// IPE-N0034 when no import of [`DO_BIND_MODULE`] exists;
+/// [`Diagnostic::CompilerBug`] if the interner is exhausted.
+fn resolve_task_and_then(span: Span, env: &Env, interner: &mut Interner) -> DResult<canon::Expr_> {
+    let kernel = StdlibKernel::TaskAndThen;
+    let def = kernel.def();
+    let path = DO_BIND_MODULE
+        .iter()
+        .map(|segment| interner.intern(segment))
+        .collect::<DResult<Vec<Symbol>>>()?;
+    if !env
+        .import_scope
+        .imported_modules
+        .contains(&ModuleIdentity::Source(path))
+    {
+        return Err(Diagnostic::Name {
+            span,
+            msg: NameError::OperatorImportRequired {
+                operator: DO_BIND_OPERATOR.into(),
+                module: DO_BIND_MODULE.join(".").into_boxed_str(),
+            },
+        });
+    }
+    Ok(canon::Expr_::VarKernel {
+        id: Some(kernel),
+        module: interner.intern(def.qualifier)?,
+        name: interner.intern(def.name)?,
+    })
+}
+
 /// The verdict for a qualified use of `qualifier`, which holds no members here.
 ///
 /// The one reading of [`Env::classify_absent`]: a spelling two imports share
@@ -5969,22 +6041,12 @@ fn canonicalise_binops(
     Ok(tree.value)
 }
 
-/// Precedence-climbing core. Consumes all operators from `ops`, pairing each
-/// with the next operand from `operands`, and folds them into `left` according
-/// to precedence and associativity.
+/// Folds the chain `left0 ops[0] operands[0] …` into one tree by
+/// [`ipe_syntax::fixity::climb`], the precedence climbing the formatter's
+/// operator grouping is checked against.
 ///
-/// Call-stack depth is O(1) in chain length: a `pending` heap-stack holds
-/// reduce-deferred `(left, op, prec)` frames so no native frame is opened per
-/// operator. Shares the heap-work-stack discipline of
-/// `module_classify::walk_expr`.
-///
-/// Reduce predicate (reproduces the recursive semantics byte-for-byte):
-/// - Left/non-assoc: reduce when a pending op is at least as tight as the
-///   incoming one (`top_prec >= prec`), restricting its right subtree to
-///   strictly-higher precedence.
-/// - Right-assoc: reduce only when the pending op is strictly tighter
-///   (`top_prec > prec`), leaving equal-precedence ops on the stack so they
-///   nest rightward.
+/// Each operator pairs with the operand after it; a count mismatch is a
+/// [`Diagnostic::CompilerBug`].
 fn climb_binops(
     left0: canon::Expr,
     operands: &mut VecDeque<canon::Expr>,
@@ -5993,45 +6055,21 @@ fn climb_binops(
     env: &Env,
     interner: &mut Interner,
 ) -> DResult<canon::Expr> {
-    // Pending frames: left operand + operator + its precedence, awaiting their
-    // right subtree once higher-precedence operators to the right are reduced.
-    let mut pending: Vec<(canon::Expr, Located<BinOp>, u8)> = Vec::new();
-    let mut left = left0;
-    while let Some(&op) = ops.front() {
-        let op_fixity = op.value.fixity();
-        let prec = op_fixity.prec();
-        // Reduce any pending frame whose operator binds at least as tightly as
-        // the incoming `op` (left/non-assoc) or strictly tighter (right-assoc).
-        while let Some(&(_, _, top_prec)) = pending.last() {
-            let should_reduce = match op_fixity.assoc() {
-                Assoc::Left | Assoc::None => top_prec >= prec,
-                Assoc::Right => top_prec > prec,
-            };
-            if !should_reduce {
-                break;
-            }
-            let (l, top_op, _) = pending.pop().ok_or_else(|| Diagnostic::CompilerBug {
-                where_: "ipe_canon::climb_binops",
-                detail: "pending stack empty after last() confirmed non-empty".to_owned(),
-            })?;
-            left = combine_binop(l, top_op, left, basics, env, interner)?;
-        }
-        ops.pop_front();
-        let next = operands
-            .pop_front()
-            .ok_or_else(|| Diagnostic::CompilerBug {
-                where_: "ipe_canon::climb_binops",
-                detail: "operator without a right operand".to_owned(),
-            })?;
-        pending.push((left, op, prec));
-        left = next;
+    if operands.len() != ops.len() {
+        return Err(Diagnostic::CompilerBug {
+            where_: "ipe_canon::climb_binops",
+            detail: "operator without a right operand".to_owned(),
+        });
     }
-    // Drain remaining pending frames right-to-left (rightmost operator was
-    // pushed last; LIFO pop folds left correctly).
-    while let Some((l, op, _)) = pending.pop() {
-        left = combine_binop(l, op, left, basics, env, interner)?;
-    }
-    Ok(left)
+    ipe_syntax::fixity::climb(
+        left0,
+        ops.drain(..).zip(operands.drain(..)),
+        |l, op, r| combine_binop(l, op, r, basics, env, interner),
+        || Diagnostic::CompilerBug {
+            where_: "ipe_canon::climb_binops",
+            detail: "pending stack empty after last() confirmed non-empty".to_owned(),
+        },
+    )
 }
 
 /// Resolve an interned `Symbol` to its text, or fail closed with a
@@ -6054,6 +6092,76 @@ fn resolve_or_bug<'a>(
             where_,
             detail: "interned symbol did not resolve".to_owned(),
         })
+}
+
+/// A binder the compiler wraps around user sub-expressions, with its site.
+#[derive(Clone, Copy, Debug)]
+enum SiteBinder {
+    /// The parameter of a `>>` or `<<` desugaring over the operator's span.
+    Compose(Span),
+    /// The record parameter of a derived record codec.
+    CodecRecord(Span),
+    /// The binder of a codec encoder or decoder projection.
+    CodecProjection(Span),
+}
+
+impl SiteBinder {
+    /// The site's preferred name: its stem and site offsets.
+    fn base_name(self) -> String {
+        match self {
+            Self::Compose(site) => {
+                format!("{}{}_{}", SynthStem::Compose.text(), site.lo, site.hi)
+            }
+            Self::CodecRecord(site) => format!("{}{}", SynthStem::CodecRecord.text(), site.lo),
+            Self::CodecProjection(site) => {
+                format!("{}{}", SynthStem::CodecProjection.text(), site.lo)
+            }
+        }
+    }
+}
+
+/// Mint a binder for a desugaring that wraps user sub-expressions.
+///
+/// The name is the site's base name, or `<base>_<k>` for the smallest
+/// `k >= 1` when the base name is bound at the site. A base name and a
+/// suffixed name of one stem differ in their count of numeric components, so
+/// a suffixed name never equals another site's base name.
+///
+/// # Errors
+///
+/// [`Diagnostic::CompilerBug`] when no free name exists within the bound
+/// the visible bindings imply (unreachable: each taken candidate is a
+/// distinct bound name), or when the interner is full.
+fn mint_site_binder(site: SiteBinder, env: &Env, interner: &mut Interner) -> DResult<Symbol> {
+    let taken = |interner: &Interner, name: &str| {
+        interner.lookup(name).is_some_and(|sym| {
+            env.vars.contains_key(&sym)
+                || !matches!(env.module_scope.expr.resolve(sym), Resolved::Missing)
+        })
+    };
+    let base = site.base_name();
+    if !taken(interner, &base) {
+        return interner.intern(&base);
+    }
+    let ceiling = env
+        .vars
+        .len()
+        .checked_add(env.module_scope.expr.names().count())
+        .and_then(|n| n.checked_add(1))
+        .ok_or_else(|| Diagnostic::CompilerBug {
+            where_: "canon.mint_site_binder",
+            detail: "visible binding count overflows usize".to_owned(),
+        })?;
+    for k in 1..=ceiling {
+        let candidate = format!("{base}_{k}");
+        if !taken(interner, &candidate) {
+            return interner.intern(&candidate);
+        }
+    }
+    Err(Diagnostic::CompilerBug {
+        where_: "canon.mint_site_binder",
+        detail: format!("no free binder for `{base}` within {ceiling} candidates"),
+    })
 }
 
 /// Build a single resolved binary-operation node.
@@ -6127,14 +6235,10 @@ fn combine_binop(
         // Composition operators eta-expand to a lambda over one fresh parameter:
         //   `f >> g`  ≡  `\x -> g (f x)`   (left-to-right composition)
         //   `f << g`  ≡  `\x -> f (g x)`   (right-to-left composition)
-        // The parameter name is derived from the operator's source span, so it
-        // is unique per occurrence. Its `compose_` prefix is distinct from every
-        // fresh pool the lowerer mints (`eta_`/`cap_`/`arg_`/…), so it cannot
-        // alias an eta-expansion name; a user binding the same name would be
-        // harmlessly shadowed, since this lambda's body references only the
-        // (already-resolved) `f`/`g` operands and its own parameter.
+        // The parameter is minted by `mint_site_binder`, so no binding visible
+        // here (and hence no free operand reference) shares its name.
         OpForm::Compose(direction) => {
-            let param = interner.intern(&format!("compose_{}_{}", span.lo, span.hi))?;
+            let param = mint_site_binder(SiteBinder::Compose(span), env, interner)?;
             // `>>` applies `f` (lhs) first then `g` (rhs); `<<` applies `g` (rhs)
             // first then `f` (lhs). `inner` is the first application, `outer`
             // wraps it.
@@ -6557,8 +6661,9 @@ fn is_wildcard_spelling(v: Symbol, interner: &Interner) -> bool {
 ///
 /// # Errors
 /// [`Diagnostic::Name`] ([`NameError::AliasArity`]) when an alias is applied to a
-/// number of type arguments that differs from its declared parameter count; the
-/// span is the enclosing annotation (the type AST carries no inner spans).
+/// number of type arguments that differs from its declared parameter count, and
+/// [`NameError::TypeArity`] when a union or fixed-arity builtin is; the span is
+/// the enclosing annotation (the type AST carries no inner spans).
 /// [`NameError::DuplicateValue`] when a record type repeats a label, at the
 /// repeated label; [`NameError::AliasRowArgument`] when an alias's row argument
 /// cannot extend its record.
@@ -6996,23 +7101,14 @@ fn canonicalise_type(
                     args,
                 });
             }
-            // A fixed-arity built-in that resolves to the empty-home sentinel
-            // (a closed container, or `Ipe.Db`'s `Connection mode` handle and
-            // its nullary `ReadOnly`/`ReadWrite` markers) has an exact-`args.len()`
-            // lowerer arm: a mis-application (`Maybe List String` parsed as
-            // `Maybe` over two args, a bare `List`, `Dict String`, `Connection`,
-            // `Connection a b`) would otherwise reach the lowerer's
-            // `ir_type_from_canon` empty-home catch-all and ICE (IPE-I0001).
-            // Fail closed here with a clean IPE-N0031, the sibling of
-            // `AliasArity` for the closed table. Gating on the empty home keeps a
-            // user `type List a b` (which wins by its real home) unaffected.
-            if home.is_empty()
-                && let Some(expected) = builtin_empty_home_arity(ctx.interner.resolve(name))
+            // Every type constructor with a fixed arity is applied to exactly
+            // that many arguments (IPE-N0031); see [`fixed_type_arity`].
+            if let Some(expected) = fixed_type_arity(&home, name, ctx)
                 && can_args.len() != expected
             {
                 return Err(Diagnostic::Name {
                     span: ctx.ann_span,
-                    msg: NameError::BuiltinTypeArity {
+                    msg: NameError::TypeArity {
                         name: name_str(ctx.interner, name)?,
                         expected,
                         found: can_args.len(),
@@ -7028,10 +7124,8 @@ fn canonicalise_type(
             // DEFINITION of the name is already rejected earlier (IPE-N0026).
             //
             //   (a) ARITY: exactly two type arguments — the sealed down-state and
-            //       the up-event. A mis-arity is a clean IPE-N0031, the same code
-            //       the closed builtin containers use; a dedicated NAME-based check
-            //       (not `builtin_container_arity`, which gates on the empty-home
-            //       sentinel) so the qualified spelling is gated too.
+            //       the up-event, refused above by [`fixed_type_arity`] on the
+            //       NAME, so the qualified spelling is gated too.
             //   (b) SEAL: each of the two parameters must be a plain, closed,
             //       concrete value type (§2.1). A function, an effect carrier, a
             //       view value, a `Secret`/reserved-sink type, an open row, or a
@@ -7041,16 +7135,6 @@ fn canonicalise_type(
             // On passing both, the type resolves to a `Con` with the empty-home
             // sentinel and lowers to the opaque widget handle.
             if ctx.interner.resolve(name) == Some("CustomElement") {
-                if can_args.len() != 2 {
-                    return Err(Diagnostic::Name {
-                        span: ctx.ann_span,
-                        msg: NameError::BuiltinTypeArity {
-                            name: name_str(ctx.interner, name)?,
-                            expected: 2,
-                            found: can_args.len(),
-                        },
-                    });
-                }
                 for arg in &can_args {
                     if let Some(reason) = boundary_seal_rejection(arg, ctx.interner) {
                         return Err(Diagnostic::Name {
@@ -7098,6 +7182,30 @@ fn canonicalise_type(
             })
         }
     }
+}
+
+/// The type-argument count the type constructor `name` at `home` takes, when
+/// it is fixed.
+///
+/// One rule for every non-alias head: a declared union takes its declared
+/// parameters (an over- or under-application has no emitted Rust spelling,
+/// E0107); `CustomElement` takes its down-state and up-event under any home;
+/// an empty-home builtin takes its [`builtin_empty_home_arity`] (a mis-arity
+/// would reach the lowerer's empty-home catch-all, IPE-I0001). `None` for a
+/// head the lowerer arity-fills (`Html`, `Attribute`) or whose gate lives in
+/// inference (`Task`, `Cmd`, `Sub`). An alias is checked where it expands.
+fn fixed_type_arity(home: &[Symbol], name: Symbol, ctx: &TypeCtx) -> Option<usize> {
+    if let Some(params) = ctx.env.union_params.of(home, name) {
+        return Some(params);
+    }
+    let spelled = ctx.interner.resolve(name);
+    if spelled == Some("CustomElement") {
+        return Some(2);
+    }
+    if home.is_empty() {
+        return builtin_empty_home_arity(spelled);
+    }
+    None
 }
 
 /// The reserved builtin a terminal engine's `Attribute` resolves to:
@@ -7814,7 +7922,7 @@ const fn name_zero() -> Symbol {
 //
 // The raw string is split into alternating `Lit` / `Interp` chunks, each
 // expression chunk is wrapped in the internal `Interpolate` renderer, and the
-// whole list is folded left into a `++` (String.append) binop chain.
+// whole list is joined into a balanced `++` (String.append) binop tree.
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// A parsed chunk from a triple-quoted string.
@@ -7933,7 +8041,7 @@ fn chunk_to_expr(
 ///
 /// Handles four shapes:
 ///   `foo`          — bare identifier → local var (or kernel if in scope)
-///   `record.field` — field access → `Access(VarLocal(record), field)`
+///   `record.field` — field access → `Access(record, field)`, `record` resolved as a bare name
 ///   `Module.func`  — qualified name → resolved through the qualified reader;
 ///                    an unresolved one is refused
 ///   `func arg`     — single function call → `Call(resolve(func), [resolve(arg)])`
@@ -8063,15 +8171,16 @@ fn resolve_simple_interp_ref(
         if first.starts_with(char::is_uppercase) {
             return resolve_interp_qualified(s, span, env, interner);
         }
-        // Lowercase `record.field` → `Access(VarLocal(record), field)`.
+        // Lowercase `record.field` → `Access(record, field)`, the record read
+        // through `resolve_var` exactly as a bare name is: a local stays
+        // `VarLocal`, a top-level value is `VarTopLevel`, an unknown name is
+        // IPE-N0001.
         let rec_sym = interner.intern(first)?;
         let field_sym = interner.intern(rest)?;
+        let record = resolve_var(rec_sym, span, env, interner)?;
         return Ok(Located::new(
             span,
-            canon::Expr_::Access(
-                Box::new(Located::new(span, canon::Expr_::VarLocal(rec_sym))),
-                field_sym,
-            ),
+            canon::Expr_::Access(Box::new(Located::new(span, record)), field_sym),
         ));
     }
     // Bare identifier — resolve through the one canonical bare-name path
@@ -8086,7 +8195,7 @@ fn resolve_simple_interp_ref(
     Ok(Located::new(span, resolve_var(sym, span, env, interner)?))
 }
 
-/// Desugar a triple-quoted string into a `++`-chained canonical expression.
+/// Desugar a triple-quoted string into a balanced `++` tree of its chunks.
 /// Entry point from `canonicalise_expr`. Port of
 /// `Ipe.Canonicalise.Expression.desugarMultiline`.
 fn desugar_multiline(
@@ -8113,36 +8222,54 @@ fn desugar_multiline(
         0 => Ok(canon::Expr_::Str(String::new())),
         1 => Ok(parts.remove(0).value),
         _ => {
-            // Left-fold into a `++` chain: ((a ++ b) ++ c) ++ …
-            let mut iter = parts.into_iter();
-            let Some(first) = iter.next() else {
-                // Unreachable: the match arm guards len >= 2.
-                return Ok(canon::Expr_::Str(String::new()));
-            };
             let op_sym = interner.intern("++")?;
             let home_sym = interner.intern("Basics")?;
             let func_sym = interner.intern("append")?;
-            let mut acc = first;
-            for part in iter {
-                let merged_span = Span::new(acc.span.lo, part.span.hi);
-                // Synthetic desugared `++`: no real operator glyph in source.
-                // Zero-width span at the join point — the token walker drops it.
-                let synthetic_op_span = Span::new(acc.span.hi, acc.span.hi);
-                acc = Located::new(
-                    merged_span,
-                    canon::Expr_::Binop {
-                        op: op_sym,
-                        op_span: synthetic_op_span,
-                        home: home_sym,
-                        func: func_sym,
-                        lhs: Box::new(acc),
-                        rhs: Box::new(part),
-                    },
-                );
-            }
-            Ok(acc.value)
+            Ok(balanced_append(parts, op_sym, home_sym, func_sym)
+                .map_or_else(|| canon::Expr_::Str(String::new()), |joined| joined.value))
         }
     }
+}
+
+/// Join `parts` with `++` into a balanced tree, at most `ceil(log2 n)` deep.
+///
+/// Each round appends adjacent pairs left to right (an odd last part passes
+/// to the next round alone), so the order of the parts is kept and, `++`
+/// being associative, so is the value. A flat list of chunks never becomes
+/// a spine as deep as the list is long. An empty `parts` joins to `None`.
+fn balanced_append(
+    mut parts: Vec<canon::Expr>,
+    op_sym: Symbol,
+    home_sym: Symbol,
+    func_sym: Symbol,
+) -> Option<canon::Expr> {
+    while parts.len() > 1 {
+        let mut joined = Vec::with_capacity(parts.len().div_ceil(2));
+        let mut iter = parts.into_iter();
+        while let Some(lhs) = iter.next() {
+            let Some(rhs) = iter.next() else {
+                joined.push(lhs);
+                break;
+            };
+            let merged_span = Span::new(lhs.span.lo, rhs.span.hi);
+            // Synthetic desugared `++`: no real operator glyph in source.
+            // Zero-width span at the join point — the token walker drops it.
+            let synthetic_op_span = Span::new(lhs.span.hi, lhs.span.hi);
+            joined.push(Located::new(
+                merged_span,
+                canon::Expr_::Binop {
+                    op: op_sym,
+                    op_span: synthetic_op_span,
+                    home: home_sym,
+                    func: func_sym,
+                    lhs: Box::new(lhs),
+                    rhs: Box::new(rhs),
+                },
+            ));
+        }
+        parts = joined;
+    }
+    parts.pop()
 }
 
 #[cfg(test)]
@@ -9248,6 +9375,117 @@ mod unary_minus_hygiene_tests {
 }
 
 #[cfg(test)]
+mod do_bind_identity_tests {
+    //! A `do` bind resolves to the `Task.andThen` kernel by identity: the gate
+    //! is an import of [`DO_BIND_MODULE`] under any spelling, so an alias can
+    //! neither retarget `do` (`import Ipe.Json.Decode as Task`) nor hide the
+    //! module it binds through (`import Ipe.Task as T`).
+    #![allow(clippy::panic, clippy::expect_used)] // test setup: a failed parse/canon IS the failure
+
+    use super::*;
+
+    fn sym(i: &mut Interner, s: &str) -> Symbol {
+        i.intern(s).expect("intern must succeed")
+    }
+
+    /// A `do`-only body: the bind names no qualifier at all.
+    const DO_BODY: &str = "main t =\n    do\n        a <- t\n        t\n";
+
+    /// Canonicalise `Main` (its `imports` then [`DO_BODY`]) against a stand-in
+    /// `Ipe.Task` producer.
+    fn canon_main(imports: &str) -> (DResult<canon::Module>, Interner) {
+        let mut i = Interner::new();
+        let task_path: Vec<Symbol> = DO_BIND_MODULE.iter().map(|s| sym(&mut i, s)).collect();
+        let main_path = vec![sym(&mut i, "Main")];
+        let mut deps: BTreeMap<Vec<Symbol>, crate::ModuleExports> = BTreeMap::new();
+        let producer =
+            "module Ipe.Task exposing (succeed)\n\nsucceed : a -> a\nsucceed a =\n    a\n";
+        let parsed_task = ipe_parse::parse_module(producer, &mut i).expect("producer parses");
+        let (_, exports) = canonicalise_module_with_origin(
+            &parsed_task,
+            &task_path,
+            &deps,
+            ModuleOrigin::EmbeddedStdlib,
+            &mut i,
+        )
+        .expect("producer canonicalises");
+        deps.insert(task_path, exports);
+
+        let src = format!("module Main exposing (main)\n\n{imports}\n\n{DO_BODY}");
+        let parsed = ipe_parse::parse_module(&src, &mut i).expect("importer parses");
+        let result =
+            canonicalise_module(&parsed, &main_path, &deps, &mut i).map(|(module, _)| module);
+        (result, i)
+    }
+
+    /// Whether `main`'s body is a call of the `Task.andThen` kernel.
+    fn binds_through_task_kernel(module: &canon::Module, i: &Interner) -> bool {
+        module
+            .defs
+            .iter()
+            .find(|d| i.resolve(d.name().value) == Some("main"))
+            .is_some_and(|d| match d {
+                canon::Def::Untyped { body, .. } | canon::Def::Typed { body, .. } => {
+                    matches!(&body.value, canon::Expr_::Call(callee, _) if is_task_and_then(callee))
+                }
+            })
+    }
+
+    /// Whether `result` is IPE-N0034 naming the `<-` the source wrote and
+    /// `import Ipe.Task`, never a `Task` qualifier the source does not spell
+    /// (a module aliased `Task` is imported, so "`Task` is the module
+    /// `Ipe.Task`" would misdescribe it).
+    fn requires_task_import(result: &DResult<canon::Module>) -> bool {
+        matches!(
+            result,
+            Err(Diagnostic::Name {
+                msg: NameError::OperatorImportRequired { operator, module },
+                ..
+            }) if &**operator == "<-" && &**module == "Ipe.Task"
+        )
+    }
+
+    /// A different module aliased `Task` never stands in for `Ipe.Task`: the
+    /// bind is refused, not sequenced through `Json.Decode.andThen`.
+    #[test]
+    fn module_aliased_task_does_not_retarget_do() {
+        let (result, _) = canon_main("import Ipe.Json.Decode as Task");
+        assert!(requires_task_import(&result), "{result:?}");
+    }
+
+    /// The remedy the refusal names clears it even while the `Task` alias
+    /// stays on `Json.Decode`.
+    #[test]
+    fn task_import_beside_a_task_alias_binds_through_ipe_task() {
+        let (result, i) = canon_main("import Ipe.Json.Decode as Task\nimport Ipe.Task");
+        let module = result.expect("the `Ipe.Task` import admits `do`");
+        assert!(binds_through_task_kernel(&module, &i));
+    }
+
+    /// With no `Ipe.Task` import, `do` is IPE-N0034.
+    #[test]
+    fn do_without_task_import_is_refused() {
+        let (result, _) = canon_main("import Ipe.Json.Decode as Decode");
+        assert!(requires_task_import(&result), "{result:?}");
+    }
+
+    /// `Ipe.Task` under any alias, or none, admits `do` and binds through the
+    /// `Task.andThen` kernel.
+    #[test]
+    fn task_import_under_any_alias_binds_through_task_kernel() {
+        for imports in [
+            "import Ipe.Task",
+            "import Ipe.Task as T",
+            "import Ipe.Task as Task",
+        ] {
+            let (result, i) = canon_main(imports);
+            let module = result.expect("an `Ipe.Task` import admits `do`");
+            assert!(binds_through_task_kernel(&module, &i), "{imports}");
+        }
+    }
+}
+
+#[cfg(test)]
 mod html_qualifier_type_home_tests {
     //! An Html-family stdlib qualifier (`import Ipe.Html.Attributes as Attr`)
     //! force-homes the reserved builtin VIEW-TYPE names (`Attribute`/`Html`) to
@@ -9274,9 +9512,15 @@ mod html_qualifier_type_home_tests {
         let attribute = sym(i, "Attribute");
         let html_home = vec![sym(i, "Html")];
 
-        let mut types: BTreeMap<Symbol, Vec<Symbol>> = BTreeMap::new();
-        types.insert(link_target, dep_path.to_vec());
-        types.insert(attribute, html_home);
+        let mut types: BTreeMap<Symbol, crate::ExportedType> = BTreeMap::new();
+        types.insert(
+            link_target,
+            crate::ExportedType::Union {
+                home: dep_path.to_vec(),
+                params: 0,
+            },
+        );
+        types.insert(attribute, crate::ExportedType::Builtin { home: html_home });
 
         let mut ctors: BTreeMap<Symbol, CtorHome> = BTreeMap::new();
         ctors.insert(

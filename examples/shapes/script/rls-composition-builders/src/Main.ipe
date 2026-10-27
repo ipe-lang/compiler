@@ -29,8 +29,8 @@ import Ipe.Io as Io
 import Ipe.Json.Decode as Decode
 import Ipe.Json.Encode as Encode
 import Ipe.List as List
-import Ipe.String as String
 import Ipe.Result as Result exposing (Result(..))
+import Ipe.String as String
 import Ipe.Task as Task
 import Rls.Owner
 import Rls.Rbac
@@ -47,7 +47,8 @@ thinOwnerCodec =
         { enc = \d -> Encode.object [ ( "body", Encode.string d.body ) ]
         , mkDec =
             \_ ->
-                Decode.map (\b -> { author = "", createdAt = "", body = b })
+                Decode.map
+                    (\b -> { author = "", createdAt = "", body = b })
                     (Decode.field "body" Decode.string)
         , shp = SRecord [ ( "body", CText ) ]
         }
@@ -98,12 +99,12 @@ main : Task Error ()
 main =
     Io.println
         (String.join "\n"
-            [ -- Owner
+            [
+            -- Owner
               ownerReadLine
             , ownerImmutableLine
             , ownerWriteLine
             , ownerClassifyLine
-
             -- Rbac
             , clauseLine "rbac-read" "read" Rls.Rbac.onlyRolePolicy
             , clauseLine "rbac-group" "read" Rls.Rbac.onlyGroupPolicy
@@ -112,18 +113,15 @@ main =
             , clauseLine "rbac-refuse-update" "update" Rls.Rbac.onlyRolePolicy
             , clauseLine "rbac-refuse-delete" "delete" Rls.Rbac.onlyRolePolicy
             , rbacPrincipalLeafLine
-
             -- Tenant
             , clauseLine "tenant-static" "read" Rls.Tenant.staticPolicy
             , clauseLine "tenant-refuse-insert" "insert" Rls.Tenant.staticPolicy
             , tenantDynamicReadLine
             , tenantDynamicOkLine
-
             -- Sharing
             , sharingReadLine
             , sharingOkLine
             , sharingRefuseInsertLine
-
             -- Refusal: a policy naming a column the store lacks fails closed
             , ownerMissingColumnLine
             ]

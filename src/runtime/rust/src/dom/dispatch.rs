@@ -1,4 +1,8 @@
-use crate::html::{Attribute, Event, FormData, Html};
+use crate::csp::{STYLE_NONCE_BYTES, StyleNonce};
+use crate::dom::diff::{Patch, diff};
+use crate::entropy::{EntropyError, fill_entropy};
+use crate::html::{Attribute, Event, FormData, Html, RenderCtx, StampedHtml, render_stamped};
+use crate::retained::{Bytes, RetainedBytes, hash_table};
 use std::collections::{HashMap, VecDeque};
 use std::num::{NonZeroU64, NonZeroUsize};
 
@@ -32,7 +36,7 @@ impl<M: Clone> HandlerIndex<M> {
     #[must_use]
     pub fn resolve(&self, ipe_id: &str, event: &str, args: &[String]) -> Option<M> {
         match self.map.get(ipe_id)?.get(event)? {
-            Event::OnMsg(_, m) => Some(m.clone()),
+            Event::OnMsg(_, m) => Some(M::clone(m)),
             Event::OnString(_, f) => Some(f(args.first().cloned().unwrap_or_default())),
             Event::OnBool(_, f) => Some(f(args.first().is_some_and(|s| s == "true"))),
             Event::OnForm(_, _) => None, // dispatched via resolve_form
@@ -52,6 +56,26 @@ impl<M: Clone> HandlerIndex<M> {
             Event::OnForm(_, f) => f(fd), // f already returns Option<M> (None on decode failure)
             _ => None,
         }
+    }
+}
+
+impl<M: RetainedBytes> HandlerIndex<M> {
+    /// The bytes this index keeps resident, each handler counted as a
+    /// committed view counts it.
+    fn resident_bytes(&self) -> Option<Bytes> {
+        let table = Bytes::inline::<Self>()?
+            .checked_add(hash_table::<(String, HashMap<String, Event<M>>)>(
+                self.map.capacity(),
+            )?)?;
+        self.map.iter().try_fold(table, |acc, (id, events)| {
+            let inner = acc
+                .plus(id)?
+                .checked_add(Bytes::inline::<HashMap<String, Event<M>>>()?)?
+                .checked_add(hash_table::<(String, Event<M>)>(events.capacity())?)?;
+            events.iter().try_fold(inner, |acc, (name, event)| {
+                acc.plus(name)?.checked_add(event.handler_floor()?)
+            })
+        })
     }
 }
 
@@ -124,11 +148,55 @@ const INCARNATION_HEX_LEN: usize = 32;
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Incarnation(u128);
 
-impl Incarnation {
-    /// An incarnation from 128 bits the caller drew from a CSPRNG.
-    #[must_use]
-    pub const fn from_random_bits(bits: u128) -> Self {
-        Self(bits)
+/// The keys a new render history is born with.
+///
+/// They are its [`Incarnation`] and the [`StyleNonce`] its renders are
+/// stamped with. [`Self::mint`] is the one place either is drawn, and it draws
+/// them separately, so neither value says anything about the other.
+#[derive(Debug)]
+pub struct SessionKeys {
+    incarnation: Incarnation,
+    style_nonce: StyleNonce,
+}
+
+impl SessionKeys {
+    /// Fresh keys from the OS CSPRNG.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EntropyError`] when the OS yields no entropy; the caller
+    /// refuses the session and never falls back to a fixed value.
+    pub fn mint() -> Result<Self, EntropyError> {
+        Self::mint_with(|buf| fill_entropy(buf))
+    }
+
+    /// Keys from two draws of `fill`: the incarnation first, then the nonce.
+    fn mint_with(
+        mut fill: impl FnMut(&mut [u8; STYLE_NONCE_BYTES]) -> Result<(), EntropyError>,
+    ) -> Result<Self, EntropyError> {
+        let mut incarnation = [0; STYLE_NONCE_BYTES];
+        fill(&mut incarnation)?;
+        let mut style_nonce = [0; STYLE_NONCE_BYTES];
+        fill(&mut style_nonce)?;
+        Ok(Self {
+            incarnation: Incarnation(u128::from_be_bytes(incarnation)),
+            style_nonce: StyleNonce::from_random_bytes(style_nonce),
+        })
+    }
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+impl SessionKeys {
+    /// Keys no earlier call returned, from a counter instead of the CSPRNG.
+    pub fn distinct() -> Self {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        let n = u128::from(NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
+        Self {
+            incarnation: Incarnation((n << 64) | 0x00c0_ffee),
+            style_nonce: StyleNonce::from_random_bytes(
+                (n.rotate_left(32) ^ 0x9e37_79b9_7f4a_7c15_f39c_c060_5ced_c834).to_be_bytes(),
+            ),
+        }
     }
 }
 
@@ -229,31 +297,99 @@ pub struct EpochStep {
     pub to: RenderEpoch,
 }
 
+/// One retained render: its counter, its handler index, and the index's
+/// measure taken when the render was committed.
+type RetainedRender<M> = (NonZeroU64, HandlerIndex<M>, Option<Bytes>);
+
 /// The last committed view and the handler indexes of the retained renders.
 ///
 /// The only way to install a new view is [`Self::commit`], which builds its
 /// index and mints its epoch together, so no index can change without a new
-/// epoch.
+/// epoch. A view and an index are immutable once committed, so each is
+/// measured once, where it is installed, and the measure is kept beside it:
+/// [`Self::resident_bytes`] reads those measures and walks no tree.
 pub struct Rendered<M> {
     incarnation: Incarnation,
+    style_nonce: StyleNonce,
     current: NonZeroU64,
     last_view: Html<M>,
-    history: VecDeque<(NonZeroU64, HandlerIndex<M>)>,
+    /// The measure of `last_view`, written only where `last_view` is.
+    view_bytes: Option<Bytes>,
+    history: VecDeque<RetainedRender<M>>,
 }
 
-impl<M: Clone> Rendered<M> {
-    /// The first render of a new history, at counter 1.
+impl<M: RetainedBytes> Rendered<M> {
+    /// The bytes the current view and every retained handler index keep resident.
+    ///
+    /// Reads the measures taken at commit, so its cost is the history depth,
+    /// never the size of a view; a part with no measure makes it `None`.
     #[must_use]
-    pub fn first(incarnation: Incarnation, tree: Html<M>) -> Self {
-        Self::starting_at(incarnation, NonZeroU64::MIN, tree)
+    pub fn resident_bytes(&self) -> Option<Bytes> {
+        self.resident_from(self.view_bytes, |(_, _, bytes)| *bytes)
     }
 
-    fn starting_at(incarnation: Incarnation, n: NonZeroU64, tree: Html<M>) -> Self {
+    /// The bytes [`Self::resident_bytes`] charges, measured afresh.
+    ///
+    /// Walks the current view and every retained index: the reference the
+    /// commit-time measures are checked against.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn measured_fresh(&self) -> Option<Bytes> {
+        self.resident_from(self.last_view.view_bytes(), |(_, index, _)| {
+            index.resident_bytes()
+        })
+    }
+
+    /// The resident total, given the current view's measure and how to
+    /// measure each retained render's index.
+    fn resident_from(
+        &self,
+        view: Option<Bytes>,
+        index: impl Fn(&RetainedRender<M>) -> Option<Bytes>,
+    ) -> Option<Bytes> {
+        let spare = self.history.capacity().checked_sub(self.history.len())?;
+        let base = Bytes::inline::<Self>()?
+            .checked_add(Bytes::slots::<RetainedRender<M>>(spare)?)?
+            .checked_add(view?)?;
+        self.history.iter().try_fold(base, |acc, render| {
+            acc.checked_add(Bytes::inline::<NonZeroU64>()?)?
+                .checked_add(Bytes::inline::<Option<Bytes>>()?)?
+                .checked_add(index(render)?)
+        })
+    }
+}
+
+#[cfg(all(test, feature = "web", not(target_arch = "wasm32")))]
+impl<M> Rendered<M> {
+    /// Move the counter to its last value, so the next commit is exhausted.
+    pub(crate) const fn exhaust(&mut self) {
+        self.current = NonZeroU64::MAX;
+    }
+}
+
+impl<M: Clone + RetainedBytes> Rendered<M> {
+    /// The first render of a new history, at counter 1.
+    ///
+    /// `keys` are the history's for its whole life: no method replaces them.
+    #[must_use]
+    pub fn first(keys: SessionKeys, tree: Html<M>) -> Self {
+        Self::starting_at(keys, NonZeroU64::MIN, tree)
+    }
+
+    fn starting_at(keys: SessionKeys, n: NonZeroU64, tree: Html<M>) -> Self {
+        let SessionKeys {
+            incarnation,
+            style_nonce,
+        } = keys;
+        let index = build_index(&tree);
+        let index_bytes = index.resident_bytes();
         let mut history = VecDeque::with_capacity(RENDER_HISTORY_DEPTH.get());
-        history.push_back((n, build_index(&tree)));
+        history.push_back((n, index, index_bytes));
         Self {
             incarnation,
+            style_nonce,
             current: n,
+            view_bytes: tree.view_bytes(),
             last_view: tree,
             history,
         }
@@ -261,8 +397,9 @@ impl<M: Clone> Rendered<M> {
 
     /// Install `tree` as the current view under a newly minted epoch.
     ///
-    /// The oldest retained index is evicted once the history holds
-    /// [`RENDER_HISTORY_DEPTH`] renders.
+    /// The oldest retained index is evicted before the new one is kept once
+    /// the history holds [`RENDER_HISTORY_DEPTH`] renders, so the history
+    /// never grows past the capacity it starts with.
     ///
     /// # Errors
     ///
@@ -271,18 +408,23 @@ impl<M: Clone> Rendered<M> {
     pub fn commit(&mut self, tree: Html<M>) -> Result<EpochStep, EpochExhausted> {
         let from = self.epoch();
         let next = self.current.checked_add(1).ok_or(EpochExhausted)?;
-        self.history.push_back((next, build_index(&tree)));
-        while self.history.len() > RENDER_HISTORY_DEPTH.get() {
+        let index = build_index(&tree);
+        let index_bytes = index.resident_bytes();
+        while self.history.len() >= RENDER_HISTORY_DEPTH.get() {
             self.history.pop_front();
         }
+        self.history.push_back((next, index, index_bytes));
         self.current = next;
+        self.view_bytes = tree.view_bytes();
         self.last_view = tree;
         Ok(EpochStep {
             from,
             to: self.epoch(),
         })
     }
+}
 
+impl<M: Clone> Rendered<M> {
     /// The epoch of the current view.
     #[must_use]
     pub const fn epoch(&self) -> RenderEpoch {
@@ -298,6 +440,29 @@ impl<M: Clone> Rendered<M> {
         &self.last_view
     }
 
+    /// A copy of the history's style nonce, for a render made before its
+    /// commit takes the session lock again.
+    #[must_use]
+    pub fn stamp(&self) -> StyleNonce {
+        self.style_nonce.clone()
+    }
+
+    /// The current view as the session's stamped markup.
+    #[must_use]
+    pub fn page(&self) -> StampedHtml {
+        render_stamped(&self.last_view, &self.style_nonce)
+    }
+
+    /// The patches from the current view to `tree`, stamped for this session.
+    #[must_use]
+    pub fn diff_to(&self, tree: &Html<M>) -> Vec<Patch> {
+        diff(
+            &self.last_view,
+            tree,
+            &RenderCtx::Session(&self.style_nonce),
+        )
+    }
+
     fn index_at(&self, at: &RenderEpoch) -> Result<&HandlerIndex<M>, StaleEpoch> {
         if at.incarnation != self.incarnation {
             return Err(StaleEpoch::OtherIncarnation);
@@ -307,8 +472,8 @@ impl<M: Clone> Rendered<M> {
         }
         self.history
             .iter()
-            .find(|(n, _)| *n == at.n)
-            .map(|(_, index)| index)
+            .find(|(n, _, _)| *n == at.n)
+            .map(|(_, index, _)| index)
             .ok_or(StaleEpoch::Evicted)
     }
 
@@ -352,11 +517,118 @@ impl<M: Clone> Rendered<M> {
 mod tests {
     use super::*;
     use crate::assign_ipe_ids;
+    use crate::html::drawn_shape::{DRAWN_LEVELS, DrawnShape, Wide};
 
     #[derive(Clone, Debug, PartialEq)]
     enum Msg {
         Inc,
         Typed(String),
+    }
+
+    impl RetainedBytes for Msg {
+        fn retained_bytes(&self) -> Option<Bytes> {
+            let inline = Bytes::inline::<Self>()?;
+            match self {
+                Self::Inc => Some(inline),
+                Self::Typed(text) => inline.plus_count(text.capacity()),
+            }
+        }
+    }
+
+    // A view with handlers is charged, and so is each retained handler
+    // index, up to the history depth and no further.
+    #[test]
+    fn a_rendered_history_counts_its_view_and_every_index() {
+        let mut rendered = Rendered::first(keys(), tree());
+        let first = rendered.resident_bytes().map(Bytes::get);
+        let view = tree().view_bytes().map(Bytes::get);
+        assert!(
+            first.zip(view).is_some_and(|(all, v)| all > v),
+            "{first:?} {view:?}"
+        );
+        let mut seen = Vec::new();
+        for _ in 0..RENDER_HISTORY_DEPTH.get() + 4 {
+            assert!(rendered.commit(tree()).is_ok());
+            seen.push(rendered.resident_bytes().map(Bytes::get));
+        }
+        let depth = RENDER_HISTORY_DEPTH.get();
+        assert!(
+            first < seen.first().copied().flatten(),
+            "{first:?} {seen:?}"
+        );
+        assert!(seen.iter().all(Option::is_some), "{seen:?}");
+        assert!(
+            seen.iter()
+                .skip(depth)
+                .all(|n| *n == seen.get(depth - 1).copied().flatten()),
+            "a full history holds steady: {seen:?}"
+        );
+    }
+
+    /// The shared drawn source view of `lines` lines, one coloured run each;
+    /// each line carries a click handler when `handlers` holds.
+    fn drawn(lines: usize, handlers: bool) -> Html<Wide> {
+        DrawnShape {
+            depth: DRAWN_LEVELS,
+            lines,
+            runs: 1,
+            escapes: 1,
+            handlers,
+            spare: false,
+        }
+        .build()
+    }
+
+    /// The bytes a full render history of `drawn(lines, handlers)` keeps
+    /// resident beyond its current view.
+    fn history_bytes(lines: usize, handlers: bool) -> Option<u64> {
+        let mut rendered = Rendered::first(keys(), drawn(lines, handlers));
+        for _ in 0..RENDER_HISTORY_DEPTH.get() {
+            rendered.commit(drawn(lines, handlers)).ok()?;
+        }
+        let all = rendered.resident_bytes()?.get();
+        all.checked_sub(rendered.last_view().view_bytes()?.get())
+    }
+
+    // A full history evicts before it keeps, so it never reallocates past the
+    // capacity it started with, and every slot it is charged for holds a render.
+    #[test]
+    fn a_full_history_keeps_its_starting_capacity() {
+        let mut rendered = Rendered::first(keys(), tree());
+        let start = rendered.history.capacity();
+        for _ in 0..RENDER_HISTORY_DEPTH.get() + 4 {
+            assert!(rendered.commit(tree()).is_ok());
+        }
+        assert_eq!(rendered.history.len(), RENDER_HISTORY_DEPTH.get());
+        assert_eq!(rendered.history.capacity(), start);
+    }
+
+    // An element with no handler costs the render history nothing, so a drawn
+    // view of handler-free elements is bounded by its view bytes alone.
+    #[test]
+    fn a_handler_free_element_adds_nothing_to_the_history() {
+        let few = history_bytes(10, false);
+        let many = history_bytes(1000, false);
+        assert!(few.is_some(), "{few:?}");
+        assert_eq!(few, many);
+    }
+
+    // Each retained render holds its own copy of every handler's message, so
+    // an element with a handler costs the history at least the history depth
+    // times the message's width: a per-element bound measured on the view
+    // alone does not cover it.
+    #[test]
+    fn a_handler_element_costs_the_history_its_message_per_render() {
+        let n = 100_usize;
+        let held = history_bytes(n, true);
+        let floor = n
+            .checked_mul(RENDER_HISTORY_DEPTH.get())
+            .and_then(|k| k.checked_mul(size_of::<Wide>()))
+            .and_then(|f| u64::try_from(f).ok());
+        assert!(
+            held.zip(floor).is_some_and(|(h, f)| h >= f),
+            "{held:?} < {floor:?}"
+        );
     }
 
     fn tree() -> Html<Msg> {
@@ -366,7 +638,10 @@ mod tests {
             vec![
                 Html::HElement(
                     "button".into(),
-                    vec![Attribute::EventAttr(Event::OnMsg("click".into(), Msg::Inc))],
+                    vec![Attribute::EventAttr(Event::OnMsg(
+                        "click".into(),
+                        Box::new(Msg::Inc),
+                    ))],
                     vec![],
                 ),
                 Html::HElement(
@@ -564,8 +839,15 @@ mod tests {
         );
     }
 
-    const INCARNATION: Incarnation =
-        Incarnation::from_random_bits(0x0123_4567_89ab_cdef_0011_2233_4455_6677);
+    const INCARNATION: Incarnation = Incarnation(0x0123_4567_89ab_cdef_0011_2233_4455_6677);
+
+    /// Keys with the fixed [`INCARNATION`].
+    fn keys() -> SessionKeys {
+        SessionKeys {
+            incarnation: INCARNATION,
+            style_nonce: StyleNonce::from_random_bytes([0x5c; STYLE_NONCE_BYTES]),
+        }
+    }
 
     /// A view whose first child button dispatches `Typed(label)` on click.
     fn labelled(label: &str) -> Html<Msg> {
@@ -576,7 +858,7 @@ mod tests {
                 "button".into(),
                 vec![Attribute::EventAttr(Event::OnMsg(
                     "click".into(),
-                    Msg::Typed(label.into()),
+                    Box::new(Msg::Typed(label.into())),
                 ))],
                 vec![],
             )],
@@ -592,7 +874,7 @@ mod tests {
     #[test]
     #[allow(clippy::expect_used)] // a commit below u64::MAX always mints an epoch
     fn ring_evicts_the_oldest_render_and_keeps_the_rest() {
-        let mut r = Rendered::first(INCARNATION, labelled("e1"));
+        let mut r = Rendered::first(keys(), labelled("e1"));
         let e1 = r.epoch();
         let e2 = r.commit(labelled("e2")).expect("second commit").to;
         for k in 3..=RENDER_HISTORY_DEPTH.get() + 1 {
@@ -617,7 +899,7 @@ mod tests {
     #[test]
     #[allow(clippy::expect_used)] // the tokens are built well-formed
     fn future_and_other_incarnation_refuse_with_their_own_variant() {
-        let r = Rendered::first(INCARNATION, labelled("only"));
+        let r = Rendered::first(keys(), labelled("only"));
         let current = r.epoch().to_token();
         let (hex, _) = current.split_once('.').expect("a token has a dot");
         let future = RenderEpoch::parse(&format!("{hex}.2")).expect("future token");
@@ -670,7 +952,7 @@ mod tests {
     #[test]
     #[allow(clippy::expect_used)] // the token was minted by `to_token`
     fn epoch_token_round_trips() {
-        let mut r = Rendered::first(INCARNATION, labelled("a"));
+        let mut r = Rendered::first(keys(), labelled("a"));
         let first = r.epoch();
         assert_eq!(RenderEpoch::parse(&first.to_token()), Ok(first));
         let step = r.commit(labelled("b")).expect("commit");
@@ -681,13 +963,55 @@ mod tests {
 
     #[test]
     fn commit_at_the_last_counter_is_exhausted_and_keeps_the_view() {
-        let mut r = Rendered::starting_at(INCARNATION, NonZeroU64::MAX, labelled("last"));
+        let mut r = Rendered::starting_at(keys(), NonZeroU64::MAX, labelled("last"));
         let before = r.epoch();
         assert_eq!(r.commit(labelled("past")), Err(EpochExhausted));
         assert_eq!(r.epoch(), before);
         assert_eq!(
             r.resolve(&before, "r_0_button", "click", &[]),
             Ok(Some(Msg::Typed("last".into())))
+        );
+    }
+
+    /// The incarnation and the nonce come from two separate draws, and a
+    /// failure of either draw refuses the keys.
+    #[test]
+    fn session_keys_are_two_draws() {
+        assert!(SessionKeys::mint_with(|_| Err(EntropyError)).is_err());
+        let mut calls = 0_u8;
+        let second_fails = SessionKeys::mint_with(|buf| {
+            calls += 1;
+            buf.fill(calls);
+            if calls == 2 {
+                Err(EntropyError)
+            } else {
+                Ok(())
+            }
+        });
+        assert!(second_fails.is_err(), "{second_fails:?}");
+
+        let mut calls = 0_u8;
+        let keys = SessionKeys::mint_with(|buf| {
+            calls += 1;
+            buf.fill(calls);
+            Ok(())
+        });
+        assert_eq!(calls, 2);
+        assert!(keys.is_ok(), "{keys:?}");
+        let Ok(keys) = keys else {
+            return;
+        };
+        assert_eq!(keys.incarnation, Incarnation(u128::from_be_bytes([1; 16])));
+        assert_eq!(keys.style_nonce.as_token(), "02".repeat(16));
+
+        let minted = SessionKeys::mint();
+        assert!(minted.is_ok(), "{minted:?}");
+        let Ok(minted) = minted else {
+            return;
+        };
+        assert_ne!(
+            format!("{:032x}", minted.incarnation.0),
+            minted.style_nonce.as_token()
         );
     }
 }

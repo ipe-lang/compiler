@@ -1,0 +1,18 @@
+module Main exposing (main)
+import Ipe.Db
+import Ipe.Db.Location as Location
+import Ipe.Task
+
+-- backlog #61 negative gate: a naive string-concatenated WHERE clause is a
+-- compile-time IPE-T0001 type mismatch at Db.findWhere (String vs
+-- SqlFragment) — never a runtime SQL-injection risk. This is the core
+-- "parse, don't validate" property the SqlFragment newtype exists to
+-- establish: there is no representable way to pass raw String content where
+-- a WHERE predicate is expected.
+
+main =
+    Task.andThen
+        (\conn ->
+            Db.findWhere conn "products" ("qty > " ++ "9")
+        )
+        (Db.open Location.memory)

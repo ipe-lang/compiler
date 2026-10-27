@@ -54,7 +54,7 @@ fn golden_dir(root: &Path, name: &str) -> PathBuf {
     root.join("tests").join("golden").join(name)
 }
 
-/// Compile `tests/golden/<name>/Main.ipe`, build the emitted Cargo project,
+/// Compile `tests/golden/<name>/src/Main.ipe`, build the emitted Cargo project,
 /// run it, and assert its stdout matches the cached oracle.  Gated on
 /// `IPE_E2E=1`.
 fn assert_runs_and_matches_oracle(name: &str) {
@@ -64,12 +64,11 @@ fn assert_runs_and_matches_oracle(name: &str) {
 
     let root = repo_root();
     let dir = golden_dir(&root, name);
-    let entry = dir.join("Main.ipe");
     let out = crate::support::scratch_root().join(format!("ipec_{name}_e2e"));
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
-    let built = ipe::build(&entry, &out, &runtime);
+    let built = crate::support::build_golden(&dir, &out, &runtime);
     assert!(built.is_ok(), "build failed for {name}: {:?}", built.err());
 
     let outcome = crate::support::build_and_run_emitted(name, &out);
@@ -115,16 +114,12 @@ fn sub_ctors() {
 /// code is returned.  A skip occurs only when the runtime cannot be resolved.
 fn assert_gate(fixture: &str, out_suffix: &str, expected: ipe_diagnostics::Code) {
     let root = repo_root();
-    let entry = root
-        .join("tests")
-        .join("golden")
-        .join(fixture)
-        .join("Main.ipe");
+    let golden_project = root.join("tests").join("golden").join(fixture);
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(out_suffix);
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
-    let built = ipe::build(&entry, &out, &runtime);
+    let built = crate::support::build_golden(&golden_project, &out, &runtime);
     let got = match &built {
         Err(CliError::Pipeline { diag, .. }) => Some(diag.code()),
         _ => None,

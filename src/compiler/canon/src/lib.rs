@@ -31,13 +31,13 @@ use ipe_diagnostics::DResult;
 use ipe_intern::{Interner, Symbol};
 
 pub use env::{
-    CtorHome, Env, ModuleCatalog, STDLIB_MODULE_QUALIFIERS, VarHome, bare_import_binds,
-    kernel_import_binds_last_segment, stdlib_canonical_qualifier,
+    CtorHome, Env, ModuleCatalog, STDLIB_MODULE_QUALIFIERS, UnionParams, VarHome,
+    bare_import_binds, const_str_eq, kernel_import_binds_last_segment, stdlib_canonical_qualifier,
 };
 pub use resolve::{
-    ModuleOrigin, QualifierForm, builtin_empty_home_arity, import_qualifier_forms,
-    import_qualifiers, is_reserved_builtin_type_name, is_user_type_declaration_forbidden,
-    to_snake_case,
+    DO_BIND_MODULE, ModuleOrigin, QualifierForm, builtin_empty_home_arity, import_qualifier_forms,
+    import_qualifiers, is_reserved_builtin_type_name, is_stdlib_shared_carrier_type,
+    is_user_type_declaration_forbidden, to_snake_case,
 };
 
 /// A type alias exported by a module, resolved in the defining module's scope.
@@ -76,9 +76,10 @@ pub struct ModuleExports {
     /// Exported value names (without their resolved `VarHome`; the home is
     /// always `TopLevel(path)`, reconstructed at injection time).
     pub values: BTreeSet<Symbol>,
-    /// Exported type names mapped to their home module path. For a type
-    /// `Widget` declared in `Lib.Utils`, this entry is `Widget → [Lib, Utils]`.
-    pub types: BTreeMap<Symbol, Vec<Symbol>>,
+    /// Exported type names mapped to their home module path and arity fact.
+    /// For a one-parameter type `Widget a` declared in `Lib.Utils`, this entry
+    /// is `Widget → Union { home: [Lib, Utils], params: 1 }`.
+    pub types: BTreeMap<Symbol, ExportedType>,
     /// Exported constructors by name.
     pub ctors: BTreeMap<Symbol, CtorHome>,
     /// Exported type aliases by name.
@@ -94,6 +95,26 @@ pub struct ModuleExports {
     /// disjointness with a normal value is by construction: `detect_kernel_alias`
     /// classifies each binding exactly once.
     pub kernel_aliases: BTreeMap<Symbol, ExportedKernelAlias>,
+}
+
+/// An exported type name: where it resolves, and who owns its arity.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum ExportedType {
+    /// A union the module declares, with its declared type-parameter count.
+    Union { home: Vec<Symbol>, params: usize },
+    /// A reserved builtin carrier the module re-exports; the builtin table
+    /// owns its arity.
+    Builtin { home: Vec<Symbol> },
+}
+
+impl ExportedType {
+    /// The home module path the type resolves to.
+    #[must_use]
+    pub fn home(&self) -> &[Symbol] {
+        match self {
+            Self::Union { home, .. } | Self::Builtin { home } => home,
+        }
+    }
 }
 
 /// The resolved target of an exported Stage-4 kernel alias — the `(StdlibKernel,
@@ -197,10 +218,10 @@ pub fn canonicalise_module_in_project(
 mod tests {
     use super::*;
     use ast::{Def, Expr, Expr_, Pattern_};
-    use ipe_diagnostics::{Diagnostic, NameError, StdlibReach};
+    use ipe_diagnostics::{Diagnostic, NameError, Span, StdlibReach};
     use ipe_intern::Symbol;
 
-    const GOLDEN: &str = include_str!("../../../../tests/golden/basics/Main.ipe");
+    const GOLDEN: &str = include_str!("../../../../tests/golden/basics/src/Main.ipe");
 
     /// Parse + canonicalise the golden module. Returns `None` (failing the
     /// caller's assertions) rather than panicking, per the no-panic gate.
@@ -2197,7 +2218,7 @@ mod tests {
             matches!(
                 err,
                 Some(Diagnostic::Name {
-                    msg: NameError::BuiltinTypeArity {
+                    msg: NameError::TypeArity {
                         ref name,
                         expected: 1,
                         found: 0,
@@ -2205,7 +2226,7 @@ mod tests {
                     ..
                 }) if name.as_ref() == "List"
             ),
-            "expected a BuiltinTypeArity(List, 1, 0) diagnostic, got {err:?}"
+            "expected a TypeArity(List, 1, 0) diagnostic, got {err:?}"
         );
     }
 
@@ -2223,7 +2244,7 @@ mod tests {
             matches!(
                 err,
                 Some(Diagnostic::Name {
-                    msg: NameError::BuiltinTypeArity {
+                    msg: NameError::TypeArity {
                         ref name,
                         expected: 1,
                         found: 2,
@@ -2231,7 +2252,7 @@ mod tests {
                     ..
                 }) if name.as_ref() == "Maybe"
             ),
-            "expected a BuiltinTypeArity(Maybe, 1, 2) diagnostic, got {err:?}"
+            "expected a TypeArity(Maybe, 1, 2) diagnostic, got {err:?}"
         );
     }
 
@@ -2247,7 +2268,7 @@ mod tests {
             matches!(
                 err,
                 Some(Diagnostic::Name {
-                    msg: NameError::BuiltinTypeArity {
+                    msg: NameError::TypeArity {
                         ref name,
                         expected: 2,
                         found: 1,
@@ -2255,7 +2276,7 @@ mod tests {
                     ..
                 }) if name.as_ref() == "Dict"
             ),
-            "expected a BuiltinTypeArity(Dict, 2, 1) diagnostic, got {err:?}"
+            "expected a TypeArity(Dict, 2, 1) diagnostic, got {err:?}"
         );
     }
 
@@ -2272,11 +2293,218 @@ mod tests {
             !matches!(
                 err,
                 Some(Diagnostic::Name {
-                    msg: NameError::BuiltinTypeArity { .. },
+                    msg: NameError::TypeArity { .. },
                     ..
                 })
             ),
             "well-formed `Maybe (List Int)` must not trip IPE-N0031, got {err:?}"
+        );
+    }
+
+    /// Whether `err` is IPE-N0031 for `name` (`expected` declared, `found`
+    /// given) at a span of `src_text` covering `excerpt`.
+    fn is_type_arity_at(
+        err: Option<&Diagnostic>,
+        src_text: &str,
+        name: &str,
+        (expected, found): (usize, usize),
+        excerpt: &str,
+    ) -> bool {
+        let Some(Diagnostic::Name {
+            span,
+            msg:
+                NameError::TypeArity {
+                    name: got_name,
+                    expected: got_expected,
+                    found: got_found,
+                },
+            ..
+        }) = err
+        else {
+            return false;
+        };
+        let covered = usize::try_from(span.lo)
+            .ok()
+            .zip(usize::try_from(span.hi).ok())
+            .and_then(|(lo, hi)| src_text.get(lo..hi));
+        got_name.as_ref() == name
+            && *got_expected == expected
+            && *got_found == found
+            && covered.is_some_and(|text| text.contains(excerpt))
+    }
+
+    /// A one-parameter union over-applied in a signature.
+    const UNION_OVER_APPLIED_SIGNATURE: &str = "module Main exposing (f)\n\
+         type X a = A a\n\n\
+         f : X Int Int -> Int\n\
+         f x =\n    0\n";
+
+    #[test]
+    fn union_over_applied_in_a_signature_is_a_type_arity_error() {
+        let err = canon_err(UNION_OVER_APPLIED_SIGNATURE);
+        assert!(
+            is_type_arity_at(
+                err.as_ref(),
+                UNION_OVER_APPLIED_SIGNATURE,
+                "X",
+                (1, 2),
+                "X Int Int"
+            ),
+            "expected TypeArity(X, 1, 2) at the signature, got {err:?}"
+        );
+    }
+
+    /// A one-parameter union applied to nothing in a signature.
+    const UNION_UNDER_APPLIED_SIGNATURE: &str = "module Main exposing (f)\n\
+         type X a = A a\n\n\
+         f : X -> Int\n\
+         f x =\n    0\n";
+
+    #[test]
+    fn union_under_applied_in_a_signature_is_a_type_arity_error() {
+        let err = canon_err(UNION_UNDER_APPLIED_SIGNATURE);
+        assert!(
+            is_type_arity_at(
+                err.as_ref(),
+                UNION_UNDER_APPLIED_SIGNATURE,
+                "X",
+                (1, 0),
+                "X -> Int"
+            ),
+            "expected TypeArity(X, 1, 0) at the signature, got {err:?}"
+        );
+    }
+
+    /// A nullary union given an argument in a value annotation.
+    const UNION_OVER_APPLIED_ANNOTATION: &str = "module Main exposing (v)\n\
+         type Z = Z\n\n\
+         v : Z Int\n\
+         v =\n    Z\n";
+
+    #[test]
+    fn union_over_applied_in_an_annotation_is_a_type_arity_error() {
+        let err = canon_err(UNION_OVER_APPLIED_ANNOTATION);
+        assert!(
+            is_type_arity_at(
+                err.as_ref(),
+                UNION_OVER_APPLIED_ANNOTATION,
+                "Z",
+                (0, 1),
+                "Z Int"
+            ),
+            "expected TypeArity(Z, 0, 1) at the annotation, got {err:?}"
+        );
+    }
+
+    /// A one-parameter union over-applied in another union's field.
+    const UNION_OVER_APPLIED_FIELD: &str = "module Main exposing (Y)\n\
+         type X a = A a\n\n\
+         type Y = Y (X Int Int)\n";
+
+    #[test]
+    fn union_over_applied_in_a_union_field_is_a_type_arity_error() {
+        let err = canon_err(UNION_OVER_APPLIED_FIELD);
+        assert!(
+            is_type_arity_at(err.as_ref(), UNION_OVER_APPLIED_FIELD, "X", (1, 2), "Y"),
+            "expected TypeArity(X, 1, 2) at the field's constructor, got {err:?}"
+        );
+    }
+
+    /// A union under-applied in its own recursive field.
+    const UNION_UNDER_APPLIED_SELF_FIELD: &str = "module Main exposing (T)\n\
+         type T a = Leaf | Node a T\n";
+
+    #[test]
+    fn union_under_applied_in_its_own_field_is_a_type_arity_error() {
+        let err = canon_err(UNION_UNDER_APPLIED_SELF_FIELD);
+        assert!(
+            is_type_arity_at(
+                err.as_ref(),
+                UNION_UNDER_APPLIED_SELF_FIELD,
+                "T",
+                (1, 0),
+                "Node"
+            ),
+            "expected TypeArity(T, 1, 0) at the field, got {err:?}"
+        );
+    }
+
+    /// An imported union over-applied through its qualified name, which the
+    /// import's clause does not expose.
+    const IMPORTED_UNION_OVER_APPLIED: &str = "module Main exposing (f)\n\
+         import Dep\n\n\
+         f : Dep.Box Int Int -> Int\n\
+         f b =\n    0\n";
+
+    #[test]
+    fn imported_union_over_applied_is_a_type_arity_error() {
+        let err = canon_main_with_dep(
+            "module Dep exposing (Box)\n\
+             type Box a = Box a\n",
+            IMPORTED_UNION_OVER_APPLIED,
+        );
+        assert!(
+            is_type_arity_at(
+                err.as_ref(),
+                IMPORTED_UNION_OVER_APPLIED,
+                "Box",
+                (1, 2),
+                "Dep.Box Int Int"
+            ),
+            "expected TypeArity(Box, 1, 2) at the signature, got {err:?}"
+        );
+    }
+
+    /// An imported union over-applied through the bare name its import's
+    /// clause exposes.
+    const EXPOSED_UNION_OVER_APPLIED: &str = "module Main exposing (f)\n\
+         import Dep exposing (Box)\n\n\
+         f : Box Int Int -> Int\n\
+         f b =\n    0\n";
+
+    #[test]
+    fn exposed_union_over_applied_is_a_type_arity_error() {
+        let err = canon_main_with_dep(
+            "module Dep exposing (Box)\n\
+             type Box a = Box a\n",
+            EXPOSED_UNION_OVER_APPLIED,
+        );
+        assert!(
+            is_type_arity_at(
+                err.as_ref(),
+                EXPOSED_UNION_OVER_APPLIED,
+                "Box",
+                (1, 2),
+                "Box Int Int"
+            ),
+            "expected TypeArity(Box, 1, 2) at the signature, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn union_applied_to_its_declared_parameters_is_accepted() {
+        let local = canon_err(
+            "module Main exposing (f)\n\
+             type X a = A a\n\n\
+             type Y = Y (X Int)\n\n\
+             f : X Int -> Y\n\
+             f x =\n    Y x\n",
+        );
+        assert!(
+            local.is_none(),
+            "a saturated union must resolve, got {local:?}"
+        );
+        let imported = canon_main_with_dep(
+            "module Dep exposing (Box)\n\
+             type Box a = Box a\n",
+            "module Main exposing (f)\n\
+             import Dep\n\n\
+             f : Dep.Box Int -> Int\n\
+             f b =\n    0\n",
+        );
+        assert!(
+            imported.is_none(),
+            "a saturated imported union must resolve, got {imported:?}"
         );
     }
 
@@ -5028,5 +5256,296 @@ mod tests {
                 "`Task.{removed_name}` must produce IPE-N0036 RemovedSurface; got: {diag:?}"
             );
         }
+    }
+
+    /// A program and its compose expression, rendered for a site `(lo, hi)`.
+    struct ComposeSite {
+        source: String,
+        lo: u32,
+        hi: u32,
+    }
+
+    /// Render `render(lo, hi)` until the expression it returns sits at `lo..hi`.
+    ///
+    /// The source spells names from the site's own offsets, so the offsets are
+    /// computed from the rendered text rather than taken on faith.
+    fn converge_site(render: impl Fn(u32, u32) -> (String, String)) -> Result<ComposeSite, String> {
+        let (mut lo, mut hi) = (0_u32, 0_u32);
+        for _ in 0..8 {
+            let (source, expr) = render(lo, hi);
+            let at = source
+                .find(&format!("= {expr}\n"))
+                .ok_or_else(|| format!("expression `{expr}` not found in the source"))?;
+            let start = at.checked_add(2).ok_or("offset overflow")?;
+            let end = start.checked_add(expr.len()).ok_or("offset overflow")?;
+            let next = (
+                u32::try_from(start).map_err(|e| e.to_string())?,
+                u32::try_from(end).map_err(|e| e.to_string())?,
+            );
+            if next == (lo, hi) {
+                return Ok(ComposeSite { source, lo, hi });
+            }
+            (lo, hi) = next;
+        }
+        Err("site offsets did not converge within 8 rounds".to_owned())
+    }
+
+    /// The canonical compose lambda bound by `apply`: its span, parameter and
+    /// the operand applied first.
+    fn compose_of_apply(m: &ast::Module, i: &Interner) -> Result<(Span, Symbol, Expr_), String> {
+        let def = find_def(m, i, "apply").ok_or("no `apply` def")?;
+        let (Def::Typed { body, .. } | Def::Untyped { body, .. }) = def;
+        let Expr_::Lambda(params, outer) = &body.value else {
+            return Err(format!("`apply` body is not a lambda: {:?}", body.value));
+        };
+        let [param] = params.as_slice() else {
+            return Err("the compose lambda takes exactly one parameter".to_owned());
+        };
+        let Pattern_::PVar(param) = param.value else {
+            return Err("the compose parameter is not a variable".to_owned());
+        };
+        let (_, outer_args) = as_call(outer).ok_or("outer node is not a call")?;
+        let [inner] = outer_args else {
+            return Err("outer call takes one argument".to_owned());
+        };
+        let (first, inner_args) = as_call(inner).ok_or("inner node is not a call")?;
+        let [arg] = inner_args else {
+            return Err("inner call takes one argument".to_owned());
+        };
+        if !matches!(arg.value, Expr_::VarLocal(s) if s == param) {
+            return Err(format!(
+                "inner argument is not the parameter: {:?}",
+                arg.value
+            ));
+        }
+        Ok((body.span, param, first.clone()))
+    }
+
+    fn compose_module(src: &str) -> Result<(ast::Module, Interner), String> {
+        canon_src(src).ok_or_else(|| format!("must parse and canonicalise:\n{src}"))
+    }
+
+    const INC: &str = "inc : Int -> Int\ninc n =\n    n + 1\n";
+
+    #[test]
+    fn compose_param_avoids_a_same_named_local() -> Result<(), String> {
+        let site = converge_site(|lo, hi| {
+            let name = format!("compose_{lo}_{hi}");
+            let expr = format!("{name} >> inc");
+            let source = format!(
+                "module Main exposing (apply)\n{INC}apply : (Int -> Int) -> Int -> Int\napply {name} = {expr}\n"
+            );
+            (source, expr)
+        })?;
+        let (m, i) = compose_module(&site.source)?;
+        let (span, param, first) = compose_of_apply(&m, &i)?;
+        assert_eq!(
+            (span.lo, span.hi),
+            (site.lo, site.hi),
+            "lambda span is the operator site"
+        );
+        let user = i
+            .lookup(&format!("compose_{}_{}", site.lo, site.hi))
+            .ok_or("the user's local is interned")?;
+        assert_ne!(
+            param, user,
+            "the parameter must not capture the user's local"
+        );
+        assert_eq!(
+            i.resolve(param),
+            Some(format!("compose_{}_{}_1", site.lo, site.hi).as_str())
+        );
+        assert!(
+            matches!(first, Expr_::VarLocal(s) if s == user),
+            "the operand stays the user's local: {first:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn compose_param_skips_every_taken_suffix() -> Result<(), String> {
+        let site = converge_site(|lo, hi| {
+            let name = format!("compose_{lo}_{hi}");
+            let expr = format!("{name} >> {name}_1");
+            let source = format!(
+                "module Main exposing (apply)\napply : (Int -> Int) -> (Int -> Int) -> Int -> Int\napply {name} {name}_1 = {expr}\n"
+            );
+            (source, expr)
+        })?;
+        let (m, i) = compose_module(&site.source)?;
+        let (span, param, first) = compose_of_apply(&m, &i)?;
+        assert_eq!(
+            (span.lo, span.hi),
+            (site.lo, site.hi),
+            "lambda span is the operator site"
+        );
+        assert_eq!(
+            i.resolve(param),
+            Some(format!("compose_{}_{}_2", site.lo, site.hi).as_str())
+        );
+        let user = i
+            .lookup(&format!("compose_{}_{}", site.lo, site.hi))
+            .ok_or("the user's local is interned")?;
+        assert!(
+            matches!(first, Expr_::VarLocal(s) if s == user),
+            "the operand stays the user's local: {first:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn compose_param_avoids_a_top_level_name() -> Result<(), String> {
+        let site = converge_site(|lo, hi| {
+            let name = format!("compose_{lo}_{hi}");
+            let expr = format!("{name} >> inc");
+            let source = format!(
+                "module Main exposing (apply)\n{INC}{name} : Int -> Int\n{name} n =\n    n + 2\napply : Int -> Int\napply = {expr}\n"
+            );
+            (source, expr)
+        })?;
+        let (m, i) = compose_module(&site.source)?;
+        let (span, param, first) = compose_of_apply(&m, &i)?;
+        assert_eq!(
+            (span.lo, span.hi),
+            (site.lo, site.hi),
+            "lambda span is the operator site"
+        );
+        let top = format!("compose_{}_{}", site.lo, site.hi);
+        assert_ne!(
+            i.resolve(param),
+            Some(top.as_str()),
+            "parameter must not shadow the top-level name"
+        );
+        assert!(
+            matches!(&first, Expr_::VarTopLevel { name, .. } if i.resolve(*name) == Some(top.as_str())),
+            "the operand stays the top-level binding: {first:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn compose_param_keeps_the_span_name_when_free() -> Result<(), String> {
+        let site = converge_site(|_, _| {
+            let expr = "inc >> inc".to_owned();
+            let source =
+                format!("module Main exposing (apply)\n{INC}apply : Int -> Int\napply = {expr}\n");
+            (source, expr)
+        })?;
+        let (m, i) = compose_module(&site.source)?;
+        let (span, param, _) = compose_of_apply(&m, &i)?;
+        assert_eq!(
+            (span.lo, span.hi),
+            (site.lo, site.hi),
+            "lambda span is the operator site"
+        );
+        assert_eq!(
+            i.resolve(param),
+            Some(format!("compose_{}_{}", site.lo, site.hi).as_str())
+        );
+        Ok(())
+    }
+
+    /// The interpolated `{{record.field}}`'s record, from `main`'s body.
+    fn interp_record_of(body: &Expr_) -> Result<&Expr_, String> {
+        let Expr_::Call(_, args) = body else {
+            return Err(format!("not an `Interpolate` call: {body:?}"));
+        };
+        let [arg] = args.as_slice() else {
+            return Err("the interpolation call takes one argument".to_owned());
+        };
+        let Expr_::Access(record, _) = &arg.value else {
+            return Err(format!(
+                "the argument is not a field access: {:?}",
+                arg.value
+            ));
+        };
+        Ok(&record.value)
+    }
+
+    /// `{{cfg.port}}` over a top-level record reads that record, as the same
+    /// `cfg.port` does outside an interpolation, never an unbound `VarLocal`.
+    #[test]
+    fn interp_record_field_reads_a_top_level_record() -> Result<(), String> {
+        let mut i = Interner::new();
+        let body = canon_body(
+            &mut i,
+            "module Main exposing (main)\n\
+             cfg = { port = 1 }\n\
+             main =\n    \"\"\"{{cfg.port}}\"\"\"\n",
+            "main",
+        )
+        .ok_or("must parse and canonicalise")?;
+        let record = interp_record_of(&body)?;
+        assert!(
+            matches!(record, Expr_::VarTopLevel { name, .. } if i.resolve(*name) == Some("cfg")),
+            "the record is the top-level `cfg`: {record:?}"
+        );
+        Ok(())
+    }
+
+    /// `{{r.port}}` over a parameter stays the parameter.
+    #[test]
+    fn interp_record_field_keeps_a_local_record_local() -> Result<(), String> {
+        let mut i = Interner::new();
+        let body = canon_body(
+            &mut i,
+            "module Main exposing (main)\n\
+             main r =\n    \"\"\"{{r.port}}\"\"\"\n",
+            "main",
+        )
+        .ok_or("must parse and canonicalise")?;
+        let record = interp_record_of(&body)?;
+        let r = i.lookup("r").ok_or("`r` is interned")?;
+        assert!(
+            matches!(record, Expr_::VarLocal(s) if *s == r),
+            "the record is the parameter `r`: {record:?}"
+        );
+        Ok(())
+    }
+
+    /// `{{nope.port}}` over an unknown name is IPE-N0001, never an unbound
+    /// `VarLocal` that reaches `constrain` as a violated invariant.
+    #[test]
+    fn interp_record_field_of_an_unknown_name_is_a_value_not_found() {
+        let err = canon_err(
+            "module Main exposing (main)\n\
+             main =\n    \"\"\"{{nope.port}}\"\"\"\n",
+        );
+        assert!(
+            matches!(
+                &err,
+                Some(Diagnostic::Name {
+                    msg: NameError::ValueNotFound { name, .. },
+                    ..
+                }) if &**name == "nope"
+            ),
+            "an unknown interpolated record must be ValueNotFound, got {err:?}"
+        );
+    }
+
+    /// An interpolated record spelled like a compose operator's parameter,
+    /// inside that operator's operand, is an unknown name: the parameter never
+    /// binds a name the program did not bind.
+    #[test]
+    fn compose_param_never_binds_an_interpolated_record() -> Result<(), String> {
+        let site = converge_site(|lo, hi| {
+            let name = format!("compose_{lo}_{hi}");
+            let expr = format!("(\\_ -> \"\"\"{{{{{name}.x}}}}\"\"\") >> inc");
+            let source = format!("module Main exposing (apply)\n{INC}apply = {expr}\n");
+            (source, expr)
+        })?;
+        let err = canon_err(&site.source);
+        let want = format!("compose_{}_{}", site.lo, site.hi);
+        assert!(
+            matches!(
+                &err,
+                Some(Diagnostic::Name {
+                    msg: NameError::ValueNotFound { name, .. },
+                    ..
+                }) if **name == *want
+            ),
+            "`{want}` is unbound, got {err:?}"
+        );
+        Ok(())
     }
 }

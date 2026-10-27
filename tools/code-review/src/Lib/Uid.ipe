@@ -1,10 +1,16 @@
-module Lib.Uid exposing (Uid, decoder, parse, toSql, toString)
+module Lib.Uid exposing (MacField, Uid, UidKey, decoder, isLowerHex, key, keyOrder, linkTarget, macField, macFieldText, parse, placeText, storedMacField, toSql, uidLength)
 
 -- A unit's ipe-index id: exactly 64 lowercase hex digits, the blake3 hex
 -- form `unit_uid` writes. Opaque: built only by `parse` and `decoder`, so a
 -- route segment, a link target or a stored row that is not such an id has
--- no representation. `toSql` and `toString` are the exits, used at an SQL,
--- link or display sink.
+-- no representation. Its text never leaves as a plain `String`: each sink
+-- has its own exit, typed for that sink, so a uid passed to the wrong sink
+-- does not type-check. `toSql` binds a parameter, `linkTarget` targets a
+-- unit page, `placeText` shows the disambiguator beside a unit's place,
+-- `key` dedupes links, and `macField` is the uid field of a row's mac input.
+-- `toSql`, `placeText` and `macFieldText` return a type the stdlib or the
+-- tool can read back as text, and `storedMacField` takes unchecked text,
+-- so `FailureScanTests` admits each of their call sites by name.
 
 import Ipe.Char as Char
 import Ipe.Db
@@ -12,12 +18,15 @@ import Ipe.Db.Decode
 import Ipe.Error as Error
 import Ipe.Result as Result exposing (Result(..))
 import Ipe.String as String
+import Ipe.Ui as Ui
+import Lib.SafeText as SafeText exposing (SafeText)
 
 
 type Uid
     = Uid String
 
 
+-- The characters of a unit id.
 uidLength : Int
 uidLength =
     64
@@ -33,7 +42,8 @@ parse raw =
         Err (Error.invalidInput "a unit id is exactly 64 lowercase hex digits")
 
 
--- `0`-`9` or `a`-`f`, ASCII only.
+-- `0`-`9` or `a`-`f`, ASCII only: the one lowercase-hex digit test of this
+-- tool, for a unit id and every other hex digest it parses.
 isLowerHex : Char -> Bool
 isLowerHex c =
     let
@@ -61,13 +71,78 @@ fromColumn column raw =
             Db.Decode.fail ("column " ++ column ++ " holds a value that is not a unit id")
 
 
+-- The uid as an SQL bind parameter.
 toSql : Uid -> SqlValue
 toSql uid =
-    SqlString (toString uid)
-
-
-toString : Uid -> String
-toString uid =
     case uid of
         Uid text ->
+            SqlString text
+
+
+-- The uid's unit page, the one route spelling. The route always parses,
+-- but the type cannot prove it: a caller shows the label unlinked on
+-- `Nothing`.
+linkTarget : Uid -> Maybe Ui.LinkTarget
+linkTarget uid =
+    case uid of
+        Uid text ->
+            Result.toMaybe (Ui.linkTarget ("/unit/" ++ text))
+
+
+-- The uid shown beside a unit's place, to tell apart two units the same
+-- name and line would merge.
+placeText : Uid -> SafeText
+placeText uid =
+    case uid of
+        Uid text ->
+            SafeText.renderForeign text
+
+
+-- A uid as a dedupe key: equal exactly when the uids are, ordered by
+-- `keyOrder`, and holding no exit to its text.
+type UidKey
+    = UidKey String
+
+
+key : Uid -> UidKey
+key uid =
+    case uid of
+        Uid text ->
+            UidKey text
+
+
+-- A total order on keys: the order of the uids' text.
+keyOrder : UidKey -> UidKey -> Order
+keyOrder a b =
+    case a of
+        UidKey x ->
+            case b of
+                UidKey y ->
+                    compare x y
+
+
+-- The uid field of a review row's mac input: a written row's from its
+-- `Uid` (`macField`), a read row's from the text its column holds
+-- (`storedMacField`), unverified until the mac over it checks.
+-- `macFieldText` is the one exit, read where the mac input is framed.
+type MacField
+    = MacField String
+
+
+macField : Uid -> MacField
+macField uid =
+    case uid of
+        Uid text ->
+            MacField text
+
+
+storedMacField : String -> MacField
+storedMacField stored =
+    MacField stored
+
+
+macFieldText : MacField -> String
+macFieldText field =
+    case field of
+        MacField text ->
             text

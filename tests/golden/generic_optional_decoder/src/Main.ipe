@@ -1,0 +1,111 @@
+module Main exposing (main)
+
+import Ipe.Io as Io
+import Ipe.Db
+import Ipe.Db.Location as Location
+import Ipe.Db.Unsafe
+import Ipe.Db.Decode
+import Ipe.Json.Decode
+import Ipe.Json.Decode.Pipeline
+import Ipe.String
+import Ipe.Result as Result
+import Ipe.Task
+
+
+-- A GENERIC combinator over a free type var `a`: it threads a caller-supplied
+-- field decoder and default of type `a` through `JsonDecP.optional`. The runtime
+-- `decode_pipeline_optional` bounds its element `T: Send + Sync`, so the emitted
+-- generic must carry `Sync` on `a` (but never on the result `b`) or the crate is
+-- `ipe`-accepted then `cargo`-fails E0277. Instantiated at two element types
+-- (`Int` and `String`) below to prove the bound across monomorphisations.
+jsonOptional : String -> Decoder a -> a -> Decoder (a -> b) -> Decoder b
+jsonOptional field dec default next =
+    JsonDecP.optional field dec default next
+
+
+-- The sibling combinator over `Db.Decode.optional`, whose runtime slot
+-- `db_decode_optional` bounds its column element `A: Send + Sync` identically.
+dbOptional : String -> Decoder a -> a -> Decoder (a -> b) -> Decoder b
+dbOptional col dec fallback next =
+    Db.Decode.optional col dec fallback next
+
+
+makeLabel : String -> Int -> String
+makeLabel name age =
+    name ++ "|" ++ String.fromInt age
+
+
+makeTag : String -> String -> String
+makeTag name nick =
+    name ++ "#" ++ nick
+
+
+-- Two JSON instantiations of `jsonOptional`: one at `Int` (age), one at
+-- `String` (nickname). Both build a decoder whose optional field rides the
+-- generic combinator.
+jsonIntResult : String -> Result Error String
+jsonIntResult s =
+    JsonDec.decodeString
+        (JsonDec.succeed makeLabel
+            |> JsonDecP.required "name" JsonDec.string
+            |> jsonOptional "age" JsonDec.int 0
+        )
+        s
+
+
+jsonStringResult : String -> Result Error String
+jsonStringResult s =
+    JsonDec.decodeString
+        (JsonDec.succeed makeTag
+            |> JsonDecP.required "name" JsonDec.string
+            |> jsonOptional "nick" JsonDec.string "none"
+        )
+        s
+
+
+rowDecoder =
+    Db.Decode.succeed makeLabel
+        |> Db.Decode.required "name" (Db.Decode.string "name")
+        |> dbOptional "age" (Db.Decode.int "age") 0
+
+
+reportJson : Result Error String -> String
+reportJson res =
+    case res of
+        Ok label ->
+            label
+
+        Err _ ->
+            "json-err"
+
+
+main =
+    Task.andThen
+        (\conn ->
+            Db.withTransaction conn
+                (\txconn ->
+                    do
+                        Unsafe.unsafeExecRaw txconn
+                            "CREATE TABLE people (name TEXT, age INT)"
+                        Db.exec txconn
+                            "INSERT INTO people VALUES (?, ?)"
+                            [ SqlString "Alice", SqlInt 30 ]
+                        j1 = reportJson (jsonIntResult "{\"name\":\"Bob\"}")
+                        j2 = reportJson (jsonIntResult "{\"name\":\"Cara\",\"age\":25}")
+                        j3 = reportJson (jsonStringResult "{\"name\":\"Dan\"}")
+                        j4 = reportJson (jsonStringResult "{\"name\":\"Eve\",\"nick\":\"E\"}")
+                        Task.andThen
+                            (\rows ->
+                                Io.println
+                                    (String.join "\n"
+                                        [ j1, j2, j3, j4, String.join "," rows ]
+                                    )
+                            )
+                            (Db.queryDecode txconn
+                                "SELECT name, age FROM people"
+                                []
+                                rowDecoder
+                            )
+                )
+        )
+        (Db.open Location.memory)

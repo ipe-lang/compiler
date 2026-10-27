@@ -17,15 +17,15 @@ module Main exposing (main)
 -- as the `Ui.cells` grid. `Screen msg` is terminal-only: this same view in the
 -- Web or WebView shape would fail to type-check (a Web view returns `Element`).
 
+import Ipe.File as File
+import Ipe.List as List
+import Ipe.Path as Path
 import Ipe.String as String
 import Ipe.System as System
-import Ipe.Tea.Tui as Tui
-import Ipe.File as File
-import Ipe.Path as Path
 import Ipe.Task as Task
+import Ipe.Tea.Tui as Tui
 import Ipe.Tea.Tui.Cmd as Cmd
 import Ipe.Tea.Tui.Sub as Sub
-import Ipe.List as List
 import Ipe.Ui.Tui as Ui
 import Ipe.Ui.Tui exposing (Screen)
 
@@ -44,7 +44,6 @@ type alias Model =
     { entries : List String
     , selected : Int
     , status : String
-
     -- The selected file's first bytes, or an empty list before anything is
     -- opened. Rendered as the `Cells.cells` hexdump island.
     , bytes : List Int
@@ -154,12 +153,12 @@ listAt index items =
 
 view : Model -> Screen Msg
 view model =
-    Ui.column [ Ui.spacing 1, Ui.padding 2 ]
+    Ui.column
+        [ Ui.spacing 1, Ui.padding 2 ]
         [ Ui.el [ Ui.bold ] (Ui.text "Ipê file browser")
         , Ui.text model.status
         , Ui.column [ Ui.spacing 1 ] (List.indexedMap (entryRow model.selected) model.entries)
         , Ui.el [ Ui.bold ] (Ui.text "hexdump:")
-
         -- The raw cell-grid island: a hexdump of the opened file's bytes,
         -- painted directly to the terminal.
         , Ui.cells (hexdump model.bytes)

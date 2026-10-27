@@ -118,23 +118,25 @@ fn compile_inner(source: &str) -> Result<ipe_backend::EmittedProject, String> {
     // affects emitted text (no rusqlite is linked into this crate).
     let config = ipe_db::BuildConfig::new(
         &db,
-        ipe_backend_rust::DbDriver::Sqlite,
-        None,
-        ipe_ir::Target::WasmClient,
-        Vec::new(),
-        ipe_backend_rust::MountBase::root(),
-        false,
-        // The browser playground is a development surface — Debug.* is allowed.
-        ipe_backend_rust::BuildIntent::Development,
-        // Wasm always vendors its runtime (closed template); dep model is a no-op.
-        None,
-        // The browser playground does not expose `--debugger`; never record.
-        false,
-        String::new(),
-        // The browser playground is not the dev watch loop; no appearance hoist.
-        false,
-        // The browser playground is a wasm SPA, never a webview-native delivery.
-        false,
+        ipe_backend_rust::EmitSettings {
+            db_driver: ipe_backend_rust::DbDriver::Sqlite,
+            ffi: None,
+            target: ipe_ir::Target::WasmClient,
+            wasm_public_env: Vec::new(),
+            mount_base: ipe_backend_rust::MountBase::root(),
+            wasm_hydrate_mode: false,
+            // Wasm always vendors its runtime (closed template); dep model is a no-op.
+            runtime_dep: None,
+            // The browser playground does not expose `--debugger`; never record.
+            debugger: false,
+            crate_name: ipe_backend_rust::CrateName::SingleFile,
+            // The browser playground is not the dev watch loop; no appearance hoist.
+            hot_appearance: false,
+            // The browser playground is a wasm SPA, never a webview-native delivery.
+            host: ipe_backend_rust::EmitHost::Served,
+            // The browser playground is a development surface — Debug.* is allowed.
+            intent: ipe_backend_rust::BuildIntent::Development,
+        },
     );
 
     // Per-module canonicalisation in dep-first order — purely for BLAME

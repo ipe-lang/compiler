@@ -1,12 +1,12 @@
 Emit a self-contained production Rust project with a tree-shaken runtime.
 
 ```
-ipe release eject [<path>]
+ipe release eject [<dir>]
 ```
 
 ## Arguments
 
-A source file, a project directory, or a package.ipe. Defaults to the current project.
+A project directory (default: the current directory).
 
 ## Options
 

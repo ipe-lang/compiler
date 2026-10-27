@@ -32,8 +32,10 @@
 //! universal `--plain --json` conflict, is still gated for every one of them.
 #![allow(clippy::expect_used)]
 
-use std::path::PathBuf;
+use std::fs;
+use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 mod support;
 
@@ -65,16 +67,47 @@ fn run(args: &[&str]) -> Run {
     }
 }
 
-/// A well-typed source file the self-contained success quadrants type-check /
-/// inspect.
-fn well_typed_entry() -> PathBuf {
-    support::manifest_dir().join("../../examples/shapes/non-tea/hello-world/src/Main.ipe")
+/// Run `ipe <args>` in `dir` with `NO_COLOR=1`, as [`run`] does.
+fn run_in(dir: &Path, args: &[&str]) -> Run {
+    match Command::new(support::ipe_bin())
+        .args(args)
+        .current_dir(dir)
+        .env("NO_COLOR", "1")
+        .output()
+    {
+        Ok(output) => Run {
+            ok: output.status.success(),
+            stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+        },
+        Err(e) => Run {
+            ok: false,
+            stdout: String::new(),
+            stderr: format!("failed to spawn ipe {args:?} in {}: {e}", dir.display()),
+        },
+    }
 }
 
-/// A fixture whose inferred capability set is a known, non-empty pair, for the
-/// `capabilities` success quadrant.
-fn capabilities_entry() -> PathBuf {
-    support::manifest_dir().join("tests/fixtures/capabilities/uses_http_and_clock.ipe")
+/// The well-typed `hello-world` example project.
+fn hello_world() -> PathBuf {
+    support::manifest_dir().join("../../examples/shapes/non-tea/hello-world")
+}
+
+/// A fresh project whose `src/Main.ipe` is the capabilities fixture using the network and the clock.
+fn capabilities_project() -> std::io::Result<PathBuf> {
+    static NEXT: AtomicUsize = AtomicUsize::new(0);
+    let dir = support::scratch_root().join(format!(
+        "capabilities_project_{}_{}",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ));
+    fs::create_dir_all(dir.join("src"))?;
+    fs::write(dir.join("package.ipe"), support::package_ipe("caps"))?;
+    fs::copy(
+        support::manifest_dir().join("tests/fixtures/capabilities/uses_http_and_clock.ipe"),
+        dir.join("src").join("Main.ipe"),
+    )?;
+    Ok(dir)
 }
 
 /// How a machine-capable command's success quadrant is driven, or that it is not
@@ -110,14 +143,13 @@ const MACHINE_CONFORMANCE: &[MachineConformance] = &[
     MachineConformance {
         command: "capabilities",
         success: MachineSuccess::Drive(|| {
-            Some(vec![capabilities_entry().to_string_lossy().into_owned()])
+            let dir = capabilities_project().expect("the capabilities fixture project is written");
+            Some(vec![dir.to_string_lossy().into_owned()])
         }),
     },
     MachineConformance {
         command: "type-check",
-        success: MachineSuccess::Drive(|| {
-            Some(vec![well_typed_entry().to_string_lossy().into_owned()])
-        }),
+        success: MachineSuccess::Drive(|| Some(vec![hello_world().to_string_lossy().into_owned()])),
     },
     MachineConformance {
         command: "diff",
@@ -461,7 +493,10 @@ fn machine_success_json_carries_the_envelope_schema_per_command() {
 /// command without exposing a raw internal string.
 #[test]
 fn machine_mode_operational_error_routes_through_the_error_envelope() {
-    let r = run(&["type-check", "--json", "/does-not-exist/nope.ipe"]);
+    let r = run_in(
+        &hello_world(),
+        &["type-check", "--json", "src/DoesNotExist.ipe"],
+    );
     assert!(!r.ok, "a missing file under --json must exit non-zero");
     assert!(
         r.stdout.is_empty(),
@@ -498,8 +533,7 @@ fn machine_mode_operational_error_routes_through_the_error_envelope() {
 /// the human vocabulary from the style SSOT, never flush-left machine text.
 #[test]
 fn human_success_quadrant_is_framed_and_guttered() {
-    let entry = well_typed_entry();
-    let r = run(&["type-check", &entry.to_string_lossy()]);
+    let r = run_in(&hello_world(), &["type-check"]);
     assert!(
         r.ok,
         "type-check on a well-typed program must exit 0; stderr: {}",

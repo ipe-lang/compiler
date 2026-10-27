@@ -1,0 +1,113 @@
+module Main exposing (main)
+import Ipe.Io as Io
+import Ipe.Db
+import Ipe.Db.Location as Location
+import Ipe.Db.Unsafe
+import Ipe.Dict
+import Ipe.List
+import Ipe.Db.Sql
+import Ipe.String
+import Ipe.Task
+
+-- M5b-db golden: Ipe.Db.Sql combinator coverage (backlog #61).
+-- Exercises every Sql.* combinator at least once: column, param via
+-- int/string/float/bool, eq, ne, gt, lt, gte, lte, and, or, not, isNotNull,
+-- isNull, like, inList (both non-empty and the empty-list `(1 = 0)`
+-- shortcut, rather than the SQL syntax error `IN ()`).
+
+main =
+    Task.andThen
+        (\conn ->
+            Db.withTransaction conn
+                (\txconn ->
+                    do
+                        Unsafe.unsafeExecRaw txconn
+                            "CREATE TABLE items (name TEXT NOT NULL, qty INTEGER NOT NULL, price REAL NOT NULL, active INTEGER NOT NULL, note TEXT)"
+                        Db.exec txconn
+                            "INSERT INTO items (name, qty, price, active, note) VALUES (?, ?, ?, ?, ?)"
+                            [ SqlString "widget", SqlInt 10, SqlFloat 9.99, SqlBool True, SqlString "fast shipping" ]
+                        Db.exec txconn
+                            "INSERT INTO items (name, qty, price, active, note) VALUES (?, ?, ?, ?, ?)"
+                            [ SqlString "gadget", SqlInt 7, SqlFloat 5.5, SqlBool False, SqlNull (SqlString "") ]
+                        Db.exec txconn
+                            "INSERT INTO items (name, qty, price, active, note) VALUES (?, ?, ?, ?, ?)"
+                            [ SqlString "sprocket", SqlInt 3, SqlFloat 1.25, SqlBool True, SqlString "slow" ]
+                        predicate =
+                            Sql.and
+                                (Sql.or
+                                    (Sql.eq (Sql.column "name") (Sql.string "widget"))
+                                    (Sql.and
+                                        (Sql.gt (Sql.column "qty") (Sql.int 5))
+                                        (Sql.lt (Sql.column "qty") (Sql.int 8))
+                                    )
+                                )
+                                (Sql.and
+                                    (Sql.gte (Sql.column "price") (Sql.float 1.0))
+                                    (Sql.and
+                                        (Sql.lte (Sql.column "price") (Sql.float 20.0))
+                                        (Sql.and
+                                            (Sql.ne (Sql.column "name") (Sql.string "sprocket"))
+                                            (Sql.and
+                                                (Sql.not (Sql.eq (Sql.column "active") (Sql.bool False)))
+                                                (Sql.and
+                                                    (Sql.isNotNull (Sql.column "note"))
+                                                    (Sql.and
+                                                        (Sql.like (Sql.column "note") "%shipping%")
+                                                        (Sql.inList (Sql.column "name") [ SqlString "widget", SqlString "gadget" ])
+                                                    )
+                                                )
+                                            )
+                                        )
+                                    )
+                                )
+
+                        emptyInListPredicate =
+                            Sql.inList (Sql.column "name") []
+
+                        isNullPredicate =
+                            Sql.isNull (Sql.column "note")
+                        Task.andThen
+                            (\matched ->
+                                Task.andThen
+                                    (\emptyMatched ->
+                                        Task.andThen
+                                            (\nullMatched ->
+                                                let
+                                                    names =
+                                                        List.map (\r -> cellText "name" r) matched
+
+                                                    nullNames =
+                                                        List.map (\r -> cellText "name" r) nullMatched
+
+                                                    summary =
+                                                        String.join "," names
+                                                            ++ "|"
+                                                            ++ String.fromInt (List.length emptyMatched)
+                                                            ++ "|"
+                                                            ++ String.join "," nullNames
+                                                in
+                                                Io.println summary
+                                            )
+                                            (Db.findWhere txconn "items" isNullPredicate)
+                                    )
+                                    (Db.findWhere txconn "items" emptyInListPredicate)
+                            )
+                            (Db.findWhere txconn "items" predicate)
+                )
+        )
+        (Db.open Location.memory)
+
+
+-- The text of column `key` in a raw Db row: a SQL `NULL` cell reads as `NULL`,
+-- a missing column as the empty string.
+cellText : String -> Dict String (Maybe String) -> String
+cellText key row =
+    case Dict.get key row of
+        Just (Just s) ->
+            s
+
+        Just Nothing ->
+            "NULL"
+
+        Nothing ->
+            ""

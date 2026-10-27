@@ -34,33 +34,23 @@ fn count_raw_prints(text: &str) -> usize {
         .sum()
 }
 
-/// Every `.rs` file under `dir`, recursively, relative to `root` with `/`
-/// separators.
+/// Every `.rs` file under `root`, relative to `root` with `/` separators.
+#[allow(clippy::expect_used)] // a tree the walker refuses leaves nothing the ratchet can certify
 fn rust_files(root: &Path) -> Vec<(String, PathBuf)> {
-    let mut found = Vec::new();
-    let mut pending = vec![root.to_path_buf()];
-    while let Some(dir) = pending.pop() {
-        let Ok(entries) = std::fs::read_dir(&dir) else {
-            continue;
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                pending.push(path);
-            } else if path.extension().is_some_and(|e| e == "rs")
-                && let Ok(rel) = path.strip_prefix(root)
-            {
-                let rel = rel
-                    .components()
-                    .map(|c| c.as_os_str().to_string_lossy().into_owned())
-                    .collect::<Vec<_>>()
-                    .join("/");
-                found.push((rel, path));
-            }
-        }
-    }
-    found.sort();
-    found
+    panic_scan::rust_sources(root, panic_scan::Want::RustFiles)
+        .expect("the source tree is listed whole")
+        .into_iter()
+        .map(|path| {
+            let rel = path
+                .strip_prefix(root)
+                .expect("a listed file lies under its root")
+                .components()
+                .map(|c| c.as_os_str().to_string_lossy().into_owned())
+                .collect::<Vec<_>>()
+                .join("/");
+            (rel, path)
+        })
+        .collect()
 }
 
 #[test]

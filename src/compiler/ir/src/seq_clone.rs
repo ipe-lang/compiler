@@ -296,6 +296,17 @@ fn rewrite(expr: Expr, target: Symbol, eager: bool, payloads: &EnumPayloadTable)
                 .map(|a| rewrite(a, target, eager, payloads))
                 .collect(),
         },
+        Expr::CaptureClones { syms, body } => {
+            let new_body = if syms.contains(&target) {
+                body
+            } else {
+                Box::new(rewrite(*body, target, eager, payloads))
+            };
+            Expr::CaptureClones {
+                syms,
+                body: new_body,
+            }
+        }
     }
 }
 
@@ -380,6 +391,7 @@ pub fn seq_rewrite_clones_symbol(sym: Symbol, expr: &Expr, payloads: &EnumPayloa
         | Expr::OnceLambda { params, body, .. }
         | Expr::TailLoop { params, body } => !params.iter().any(|(s, _)| *s == sym) && walk(body),
         Expr::Apply { func, args } => walk(func) || args.iter().any(walk),
+        Expr::CaptureClones { syms, body } => !syms.contains(&sym) && walk(body),
     }
 }
 

@@ -111,14 +111,18 @@ pub fn repo_root() -> PathBuf {
     std::fs::canonicalize(&joined).unwrap_or(joined)
 }
 
-/// The directory holding a golden's `main.rs` — i.e. `golden.parent()` — with a
-/// non-panicking fallback (a golden path built as `<dir>/main.rs` always has a
-/// parent; the fallback keeps this `expect`-free under the workspace-wide
-/// `clippy::expect_used` deny). Centralises the derivation for the 40+ golden
-/// tests that need it rather than copy-pasting `golden.parent().expect(...)`.
-#[allow(dead_code)] // shared helper: used by the 45 byte-diff goldens, not every binary
-pub fn golden_dir_of(golden: &Path) -> &Path {
-    golden.parent().unwrap_or(golden)
+/// The source file of module `module` (dotted, `Lib.Rows`) in the golden
+/// project `dir`: `dir/src/Lib/Rows.ipe`.
+///
+/// Every golden is a project whose modules live under `src/`; this is the one
+/// place a test spells that layout.
+#[must_use]
+#[allow(dead_code)] // shared helper: not every golden test binary reads a golden source
+pub fn golden_source(dir: &Path, module: &str) -> PathBuf {
+    let mut path = dir.join("src");
+    path.extend(module.split('.'));
+    path.set_extension("ipe");
+    path
 }
 
 /// Render a minimal `package.ipe` manifest body naming `name` — the project
@@ -393,6 +397,37 @@ pub fn assert_emitted_project_matches_golden_dir(emitted_out: &Path, golden_dir:
 /// failure, never silently a no-op empty haystack. A missing `ipe_mods/`
 /// directory is NOT a failure: the Spine-collapse invariant (§3.3) legitimately
 /// emits no `ipe_mods/` for a single-home program.
+/// The emitted signature of the function spelled `ipe_name`, from its `fn`
+/// line through the line that opens its body.
+///
+/// Matches the emitted `main_<snake_case>` name with its underscores removed
+/// against the lower-cased Ipê name, so a check does not re-derive the
+/// backend's snake-casing. Generics wrapped over several lines stay whole.
+#[must_use]
+#[allow(dead_code)] // used by the generic-bound goldens only
+pub fn emitted_signature(emitted: &str, ipe_name: &str) -> Option<String> {
+    let wanted = format!("main{}", ipe_name.to_lowercase());
+    let lines = emitted.lines().skip_while(|line| {
+        !line.split_once("fn ").is_some_and(|(_, rest)| {
+            let name: String = rest
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                .filter(|c| *c != '_')
+                .collect();
+            name == wanted
+        })
+    });
+    let mut signature = String::new();
+    for line in lines {
+        signature.push_str(line);
+        signature.push('\n');
+        if line.contains('{') {
+            return Some(signature);
+        }
+    }
+    None
+}
+
 #[must_use]
 #[allow(dead_code)] // adopted file-by-file as substring goldens migrate to the shared helper
 pub fn read_all_emitted_src(emitted_out: &Path) -> String {
@@ -441,6 +476,18 @@ pub struct RunOutcome {
     pub stdout: String,
     /// The process exit code (`None` if the process was killed by a signal).
     pub exit_code: Option<i32>,
+}
+
+/// Emit the checked-in golden directory `golden_dir` into `out`.
+///
+/// The same `ipe::build_golden_dir` `regen-goldens` blesses with, so a test
+/// compares against bytes built by one code path.
+///
+/// # Errors
+/// As `ipe::build_golden_dir`.
+#[allow(dead_code)] // not every golden test binary builds a golden directory
+pub fn build_golden(golden_dir: &Path, out: &Path, runtime: &Path) -> Result<(), ipe::CliError> {
+    ipe::build_golden_dir(golden_dir, out, runtime, &ipe::BuildOptions::from_env())
 }
 
 /// Build the emitted project at `emitted_dir` into the shared target WITHOUT
@@ -603,6 +650,277 @@ pub fn build_and_run_emitted_with_stdin(
         stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
         exit_code: output.status.code(),
     }
+}
+
+/// Outcome of one deadline-bounded run of an emitted binary.
+#[allow(dead_code)]
+pub struct TimedRunOutcome {
+    /// The program's standard output, decoded lossily from UTF-8.
+    pub stdout: String,
+    /// The program's standard error, decoded lossily from UTF-8.
+    pub stderr: String,
+    /// The process exit code (`None` if it was killed by a signal or at the
+    /// deadline).
+    pub exit_code: Option<i32>,
+    /// Wall time from spawn to the observed exit.
+    pub elapsed: std::time::Duration,
+    /// CPU time the child used; `None` off Linux or when `/proc` is unreadable.
+    pub cpu: Option<CpuTime>,
+}
+
+impl TimedRunOutcome {
+    #[allow(dead_code)] // reached only from the deadline-bounded runner
+    const fn failed() -> Self {
+        Self {
+            stdout: String::new(),
+            stderr: String::new(),
+            exit_code: None,
+            elapsed: std::time::Duration::ZERO,
+            cpu: None,
+        }
+    }
+}
+
+/// User plus system CPU time of one exited child, summed over its threads.
+///
+/// Only the runner reads one, from the kernel's own accounting of the child
+/// (elsewhere only the zero `Default` can be built), so a wall-clock reading
+/// cannot stand in for it: it measures work, which the host's load (scheduler
+/// delay, sibling processes) does not inflate.
+#[allow(dead_code)] // only work-measuring goldens read it
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
+pub struct CpuTime(std::time::Duration);
+
+#[allow(dead_code)] // only work-measuring goldens read it
+impl CpuTime {
+    /// The CPU time as a duration.
+    #[must_use]
+    pub const fn as_duration(self) -> std::time::Duration {
+        self.0
+    }
+
+    /// The CPU time left after `other`, zero when `other` is larger.
+    #[must_use]
+    pub const fn saturating_sub(self, other: Self) -> Self {
+        Self(self.0.saturating_sub(other.0))
+    }
+}
+
+/// The kernel's clock-tick rate, `AT_CLKTCK` from this process's auxiliary vector.
+#[cfg(target_os = "linux")]
+#[allow(dead_code)] // reached only from the deadline-bounded runner
+fn clock_ticks_per_second() -> Option<u64> {
+    const AT_CLKTCK: usize = 17;
+    let auxv = std::fs::read("/proc/self/auxv").ok()?;
+    let word = std::mem::size_of::<usize>();
+    let word_of = |bytes: &[u8]| bytes.try_into().ok().map(usize::from_ne_bytes);
+    auxv.chunks_exact(word * 2)
+        .find_map(|pair| {
+            let (key, value) = pair.split_at_checked(word)?;
+            if word_of(key)? == AT_CLKTCK {
+                word_of(value)
+            } else {
+                None
+            }
+        })
+        .and_then(|hz| u64::try_from(hz).ok())
+        .filter(|&hz| hz > 0)
+}
+
+/// The CPU time of the exited, not yet reaped child `pid`, from `/proc/<pid>/stat`.
+///
+/// The zombie keeps the kernel's whole-process `utime` and `stime` (fields 14
+/// and 15, in clock ticks) until it is reaped.
+#[cfg(target_os = "linux")]
+#[allow(dead_code)] // reached only from the deadline-bounded runner
+fn zombie_cpu_time(pid: u32) -> Option<CpuTime> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    // `comm` (field 2) may hold spaces and parentheses; the fields after its
+    // last `)` start at `state` (field 3).
+    let (_, after_comm) = stat.rsplit_once(')')?;
+    let mut fields = after_comm.split_whitespace().skip(11);
+    let utime: u64 = fields.next()?.parse().ok()?;
+    let stime: u64 = fields.next()?.parse().ok()?;
+    let nanos = utime
+        .checked_add(stime)?
+        .checked_mul(1_000_000_000)?
+        .checked_div(clock_ticks_per_second()?)?;
+    Some(CpuTime(std::time::Duration::from_nanos(nanos)))
+}
+
+/// One non-blocking poll of `child`: its exit status and CPU time once exited.
+///
+/// The exit is observed with `waitid(WNOWAIT)`, which leaves the child a zombie
+/// whose CPU time is still readable, and only then reaped.
+#[cfg(target_os = "linux")]
+#[allow(dead_code)] // reached only from the deadline-bounded runner
+fn poll_exit(
+    child: &mut std::process::Child,
+) -> std::io::Result<Option<(std::process::ExitStatus, Option<CpuTime>)>> {
+    use rustix::process::{Pid, WaitId, WaitidOptions, waitid};
+    let options = WaitidOptions::EXITED | WaitidOptions::NOHANG | WaitidOptions::NOWAIT;
+    if waitid(WaitId::Pid(Pid::from_child(child)), options)?.is_none() {
+        return Ok(None);
+    }
+    let cpu = zombie_cpu_time(child.id());
+    child.wait().map(|status| Some((status, cpu)))
+}
+
+/// One non-blocking poll of `child`: its exit status; no CPU time off Linux.
+#[cfg(not(target_os = "linux"))]
+#[allow(dead_code)] // reached only from the deadline-bounded runner
+fn poll_exit(
+    child: &mut std::process::Child,
+) -> std::io::Result<Option<(std::process::ExitStatus, Option<CpuTime>)>> {
+    child
+        .try_wait()
+        .map(|status| status.map(|status| (status, None)))
+}
+
+/// Build the emitted project at `emitted_dir` and return its binary path.
+///
+/// # Panics
+/// Fails the calling test if `cargo build` fails, surfacing cargo's stderr.
+#[must_use]
+#[allow(dead_code)] // only deadline-bounded goldens build once and run many times
+pub fn build_emitted_binary_checked(golden_name: &str, emitted_dir: &Path) -> Option<String> {
+    let exe = e2e_support::build_rust_binary(golden_name, emitted_dir);
+    assert!(
+        exe.is_ok(),
+        "{}",
+        exe.as_ref().err().map_or("", String::as_str)
+    );
+    exe.ok()
+}
+
+/// Run `exe` with `stdin_bytes` on stdin, killing and reaping it at `deadline`.
+///
+/// The child is polled without blocking; its stdout and stderr drain on reader
+/// threads so a full pipe never stalls it. Past `deadline` the child is killed
+/// and reaped, so no process outlives the call.
+///
+/// # Panics
+/// Fails the calling test if the binary cannot be spawned, its stdin cannot be
+/// written, or it has not exited by `deadline` ("superlinear or hung").
+#[must_use]
+#[allow(dead_code)] // only deadline-bounded goldens exercise this helper
+pub fn run_with_stdin_deadline(
+    golden_name: &str,
+    exe: &str,
+    stdin_bytes: &[u8],
+    deadline: std::time::Duration,
+) -> TimedRunOutcome {
+    let child = Command::new(exe)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn();
+    assert!(
+        child.is_ok(),
+        "{golden_name}: failed to spawn `{exe}`: {:?}",
+        child.as_ref().err()
+    );
+    let Ok(mut child) = child else {
+        return TimedRunOutcome::failed();
+    };
+    let started = std::time::Instant::now();
+    let stdout = child.stdout.take().map(drain_on_thread);
+    let stderr = child.stderr.take().map(drain_on_thread);
+    // The write runs on its own thread so a child that stops reading cannot
+    // hold the caller past `deadline`; the thread drops the handle after the
+    // write, which closes stdin, so the child sees EOF.
+    let feed = child.stdin.take().map(|mut stdin| {
+        let bytes = stdin_bytes.to_vec();
+        std::thread::Builder::new().spawn(move || stdin.write_all(&bytes))
+    });
+
+    let mut polled = Ok(None);
+    while started.elapsed() < deadline {
+        polled = poll_exit(&mut child);
+        if !matches!(polled, Ok(None)) {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+    let elapsed = started.elapsed();
+    let exited = polled.as_ref().ok().copied().flatten();
+    let status = exited.map(|(status, _)| status);
+    let cpu = exited.and_then(|(_, cpu)| cpu);
+    if status.is_none() {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+    let stdout = stdout.map_or_else(String::new, join_drain);
+    let stderr = stderr.map_or_else(String::new, join_drain);
+    // The child has exited or been reaped, so a pending write returns
+    // `BrokenPipe` instead of blocking the join.
+    let wrote = feed.map(|spawned| {
+        spawned
+            .map_err(|e| format!("stdin writer not spawned: {e}"))
+            .and_then(|h| h.join().map_err(|_| String::from("stdin writer panicked")))
+            .and_then(|w| w.map_err(|e| e.to_string()))
+    });
+    assert!(
+        polled.is_ok(),
+        "{golden_name}: failed to poll `{exe}`: {:?}",
+        polled.err()
+    );
+    assert!(
+        status.is_some(),
+        "{golden_name}: no exit within {deadline:?}, superlinear or hung; stderr:\n{stderr}"
+    );
+    assert!(
+        wrote.as_ref().is_none_or(Result::is_ok),
+        "{golden_name}: failed to write stdin: {wrote:?}"
+    );
+    TimedRunOutcome {
+        stdout,
+        stderr,
+        exit_code: status.and_then(|s| s.code()),
+        elapsed,
+        cpu,
+    }
+}
+
+/// Build the emitted project and run it once under [`run_with_stdin_deadline`].
+///
+/// # Panics
+/// Fails the calling test on a failed build, or as [`run_with_stdin_deadline`]
+/// does.
+#[must_use]
+#[allow(dead_code)] // only deadline-bounded goldens exercise this helper
+pub fn build_and_run_emitted_with_stdin_deadline(
+    golden_name: &str,
+    emitted_dir: &Path,
+    stdin_bytes: &[u8],
+    deadline: std::time::Duration,
+) -> TimedRunOutcome {
+    build_emitted_binary_checked(golden_name, emitted_dir)
+        .map_or_else(TimedRunOutcome::failed, |exe| {
+            run_with_stdin_deadline(golden_name, &exe, stdin_bytes, deadline)
+        })
+}
+
+type Drain = std::thread::JoinHandle<Vec<u8>>;
+
+#[allow(dead_code)] // reached only from the deadline-bounded runner
+#[allow(clippy::expect_used)] // a failed precondition is the test failure
+fn drain_on_thread(mut pipe: impl std::io::Read + Send + 'static) -> Drain {
+    std::thread::Builder::new()
+        .spawn(move || {
+            let mut bytes = Vec::new();
+            let _ = pipe.read_to_end(&mut bytes);
+            bytes
+        })
+        .expect("the OS spawns a drain thread")
+}
+
+#[allow(dead_code)] // reached only from the deadline-bounded runner
+fn join_drain(handle: Drain) -> String {
+    handle.join().map_or_else(
+        |_| String::new(),
+        |bytes| String::from_utf8_lossy(&bytes).into_owned(),
+    )
 }
 
 /// Build the emitted project and run its binary with the MAIN-THREAD stack

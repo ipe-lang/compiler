@@ -1,0 +1,55 @@
+module Main exposing (main)
+import Ipe.Io as Io
+import Ipe.Db
+import Ipe.Db.Location as Location
+import Ipe.Db.Unsafe
+import Ipe.Db.Decode
+import Ipe.List
+import Ipe.String
+import Ipe.Task
+
+-- M5b-db golden: Db.Decode.nullable — distinguishes SQL NULL from non-null rows.
+-- Exercises the IrType::Decoder(Maybe T) type fixed in constrain.rs (M5b-db).
+-- Two rows: id=1 has label="alpha"; id=2 has label=NULL (omitted in INSERT).
+-- Decoder: nullable(string "label") → Maybe String.
+-- Output: "just:alpha,nothing"
+
+main =
+    Task.andThen
+        (\conn ->
+            Db.withTransaction conn
+                (\txconn ->
+                    do
+                        Unsafe.unsafeExecRaw txconn
+                            "CREATE TABLE tags (id INTEGER, label TEXT)"
+                        Db.exec txconn
+                            "INSERT INTO tags VALUES (?, ?)"
+                            [ SqlInt 1, SqlString "alpha" ]
+                        Db.exec txconn
+                            "INSERT INTO tags (id) VALUES (?)"
+                            [ SqlInt 2 ]
+                        Task.andThen
+                            (\results ->
+                                Io.println
+                                    (String.join ","
+                                        (List.map
+                                            (\m ->
+                                                case m of
+                                                    Just s ->
+                                                        "just:" ++ s
+
+                                                    Nothing ->
+                                                        "nothing"
+                                            )
+                                            results
+                                        )
+                                    )
+                            )
+                            (Db.queryDecode txconn
+                                "SELECT label FROM tags ORDER BY id"
+                                []
+                                (Db.Decode.nullable (Db.Decode.string "label"))
+                            )
+                )
+        )
+        (Db.open Location.memory)

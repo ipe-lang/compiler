@@ -4,12 +4,39 @@
 
 mod support;
 
+#[path = "g_issues/root_fixture.rs"]
+mod root_fixture;
+
+#[path = "g_issues/golden_3121_boxed_field_nested_pat_seal.rs"]
+mod golden_3121_boxed_field_nested_pat_seal;
+#[path = "g_issues/golden_3610_or_pattern_normal_form.rs"]
+mod golden_3610_or_pattern_normal_form;
+#[path = "g_issues/golden_alpha_equivalent_record_templates_seal.rs"]
+mod golden_alpha_equivalent_record_templates_seal;
+#[path = "g_issues/golden_any_return_slot_pin_seal.rs"]
+mod golden_any_return_slot_pin_seal;
+#[path = "g_issues/golden_closure_capture_update_base_seal.rs"]
+mod golden_closure_capture_update_base_seal;
 #[path = "g_issues/golden_cross_module_chained_msg_slot_seal.rs"]
 mod golden_cross_module_chained_msg_slot_seal;
 #[path = "g_issues/golden_declared_any_param_seal.rs"]
 mod golden_declared_any_param_seal;
 #[path = "g_issues/golden_embed_fn_param_capture_seal.rs"]
 mod golden_embed_fn_param_capture_seal;
+#[path = "g_issues/golden_generic_bound_closure_capture.rs"]
+mod golden_generic_bound_closure_capture;
+#[path = "g_issues/golden_generic_bound_cross_module.rs"]
+mod golden_generic_bound_cross_module;
+#[path = "g_issues/golden_generic_bound_fn_param_forwarding.rs"]
+mod golden_generic_bound_fn_param_forwarding;
+#[path = "g_issues/golden_generic_bound_mutual_recursion.rs"]
+mod golden_generic_bound_mutual_recursion;
+#[path = "g_issues/golden_generic_bound_task_row.rs"]
+mod golden_generic_bound_task_row;
+#[path = "g_issues/golden_generic_bound_transitive_chain.rs"]
+mod golden_generic_bound_transitive_chain;
+#[path = "g_issues/golden_generic_bound_ui_msg.rs"]
+mod golden_generic_bound_ui_msg;
 #[path = "g_issues/golden_generic_carrier_send_seal.rs"]
 mod golden_generic_carrier_send_seal;
 #[path = "g_issues/golden_generic_msg_forward_sync_seal.rs"]
@@ -142,3 +169,7 @@ mod golden_swapped_effect_capture_seal;
 mod golden_unannotated_value_sync_seal;
 #[path = "g_issues/golden_untyped_app_entry_row_seal.rs"]
 mod golden_untyped_app_entry_row_seal;
+#[path = "g_issues/golden_untyped_helper_foreign_var.rs"]
+mod golden_untyped_helper_foreign_var;
+#[path = "g_issues/golden_use_site_msg_pin_seal.rs"]
+mod golden_use_site_msg_pin_seal;

@@ -3,7 +3,7 @@
 //!
 //! A JSON document is decoded through `map2` + `oneOf` + `index` (a record),
 //! `maybe` + `keyValuePairs`, and `dict`
-//! (`tests/golden/config_decoder_combinators/Main.ipe`). This pins ipe-0 ∧
+//! (`tests/golden/config_decoder_combinators/src/Main.ipe`). This pins ipe-0 ∧
 //! cargo-0 ∧ run-0 (THE SEAL: ipe exit 0 ⇒ emitted Rust builds and runs) and the
 //! decoded values are rendered (`server: alpha:5432 tags=1 limits=1`), proving
 //! each combinator routes to its runtime `decode_*` / `config_*`.
@@ -29,14 +29,13 @@ fn config_decoder_combinators_ipec_cargo_and_run_zero() {
         .join("tests")
         .join("golden")
         .join("config_decoder_combinators");
-    let entry = dir.join("Main.ipe");
     let out = crate::support::scratch_root().join("ipec_config_decoder_combinators_e2e");
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
 
     // ipe-0: compiling a program that calls the decoder combinators must succeed.
-    let built = ipe::build(&entry, &out, &runtime);
+    let built = crate::support::build_golden(&dir, &out, &runtime);
     assert!(
         built.is_ok(),
         "ipe dev build must succeed for config_decoder_combinators: {:?}",

@@ -1,0 +1,141 @@
+module Lib.Bind exposing (BindRefusal(..), Loopback, acceptedSpellings, loopbackAddress, parseBind, refusal)
+
+-- The listen address of the review server, proved loopback before anything
+-- else starts. The server is unauthenticated: any host that could reach a
+-- wider listener could open a session and record signed decisions, so a
+-- `Loopback` is the one value the listen accepts.
+--
+-- The runtime reads the same variable and binds `127.0.0.1` when it is unset
+-- (the app installs no host setting). This parser reads nothing as an
+-- address: it accepts exactly the unset value and the two byte strings
+-- `127.0.0.1` and `::1`, each of which the runtime binds on loopback, and
+-- refuses every other value. So it can disagree with the runtime only by
+-- refusing a spelling the runtime would also bind on loopback (another
+-- 127/8 address, another spelling of `::1`), never by admitting an exposed
+-- one.
+
+import Ipe.Error as Error exposing (Error)
+import Ipe.List as List
+import Ipe.Result as Result exposing (Result(..))
+import Ipe.String as String
+import Lib.EnvLookup as EnvLookup exposing (StartupVar(..))
+import Lib.Settings exposing (EnvValue(..))
+
+
+-- Proof that the server will listen on loopback. Opaque: only `parseBind`
+-- builds one.
+type Loopback
+    = DefaultLoopback
+    | Ipv4Loopback
+    | Ipv6Loopback
+
+
+-- Why a bind value is refused. `NotLoopback` holds the raw value, which is
+-- shown only through `refusal`, by the startup renderer: capped and escaped.
+type BindRefusal
+    = EmptyBind
+    | NotLoopback String
+    | UnreadableBind
+
+
+-- The bind the environment value proves, or why it proves none. A set value
+-- is compared whole, byte for byte: no trim, no case fold, no split.
+parseBind : EnvValue -> Result BindRefusal Loopback
+parseBind value =
+    case value of
+        EnvUnset ->
+            Ok DefaultLoopback
+
+        EnvSet raw ->
+            parseSetBind raw
+
+        EnvUnreadable ->
+            Err UnreadableBind
+
+
+parseSetBind : String -> Result BindRefusal Loopback
+parseSetBind raw =
+    case List.find (\( spelling, _ ) -> spelling == raw) acceptedBinds of
+        Just ( _, proof ) ->
+            Ok proof
+
+        Nothing ->
+            if String.isEmpty raw then
+                Err EmptyBind
+
+            else
+                Err (NotLoopback raw)
+
+
+-- Every accepted spelling with the proof it gives. The parser, the refusal's
+-- problem and its remedy all read this one list, so the text names exactly
+-- the values the parser accepts.
+acceptedBinds : List ( String, Loopback )
+acceptedBinds =
+    [ ( ipv4Text, Ipv4Loopback ), ( ipv6Text, Ipv6Loopback ) ]
+
+
+-- The set values `parseBind` accepts, in the order the refusal names them.
+acceptedSpellings : List String
+acceptedSpellings =
+    List.map (\( spelling, _ ) -> spelling) acceptedBinds
+
+
+ipv4Text : String
+ipv4Text =
+    "127.0.0.1"
+
+
+ipv6Text : String
+ipv6Text =
+    "::1"
+
+
+-- The address the server listens on under `bind`; unset is the runtime's
+-- default, `127.0.0.1`.
+loopbackAddress : Loopback -> String
+loopbackAddress bind =
+    case bind of
+        DefaultLoopback ->
+            ipv4Text
+
+        Ipv4Loopback ->
+            ipv4Text
+
+        Ipv6Loopback ->
+            ipv6Text
+
+
+-- The startup refusal of a bind value, one per reason: what is wrong with
+-- the value (for a set value, that it is not one of the accepted spellings,
+-- which are listed), why only loopback is accepted, and the one remedy. A
+-- refused value is handed to the renderer, which shows it capped and
+-- escaped, so it can neither flood nor forge the operator's terminal; an
+-- empty or unreadable value is never shown.
+refusal : BindRefusal -> Error
+refusal reason =
+    case reason of
+        EmptyBind ->
+            bindRefusal Nothing "it is set but empty"
+
+        NotLoopback raw ->
+            bindRefusal (Just raw) ("it is not one of the accepted loopback spellings (" ++ String.join ", " acceptedSpellings ++ ")")
+
+        UnreadableBind ->
+            bindRefusal Nothing "it is set but could not be read from the environment (it is not valid Unicode)"
+
+
+bindRefusal : Maybe String -> String -> Error
+bindRefusal given cause =
+    EnvLookup.startupRefusal
+        { var = HttpBindVar
+        , file = Nothing
+        , given = given
+        , problem = cause ++ ", and the review page is unauthenticated, so the server listens on loopback only"
+        , fix = remedyText
+        }
+
+
+remedyText : String
+remedyText =
+    "unset it (the server then binds " ++ ipv4Text ++ "), or set it to " ++ String.join " or " acceptedSpellings ++ ", and reach the server from another machine through an SSH tunnel, e.g. ssh -L 8000:127.0.0.1:8000 <host> (use the listening port if IPE_SERVER_PORT sets another)"

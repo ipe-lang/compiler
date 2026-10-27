@@ -23,28 +23,17 @@
 
 use std::path::{Path, PathBuf};
 
-use ipe::CliError;
+use ipe::{CliError, RootFixture};
 
 /// A runtime `false` the optimiser cannot fold — a deliberate failure marker.
 const fn false_marker() -> bool {
     std::hint::black_box(false)
 }
 
-/// Write `source` as a single-file `Main.ipe` under a fresh scratch dir keyed by
-/// `name`, returning the entry path; a failed scratch setup fails the test.
-fn write_single(name: &str, source: &str) -> PathBuf {
-    let dir = crate::support::scratch_root()
-        .join("ipec_enum_fn_payload_reuse")
-        .join(name);
-    let _ = std::fs::remove_dir_all(&dir);
-    let src = dir.join("src");
-    let entry = src.join("Main.ipe");
-    let written = std::fs::create_dir_all(&src).and_then(|()| std::fs::write(&entry, source));
-    assert!(
-        written.is_ok(),
-        "{name}: must write the fixture source to a scratch dir: {written:?}"
-    );
-    entry
+/// A project fixture whose only module `Main` holds `source`; a failed setup fails the test.
+#[allow(clippy::expect_used)] // a swallowed setup error would let a refusal test pass vacuously
+fn write_single(source: &str) -> RootFixture {
+    RootFixture::main(source).expect("the enum-fn-payload fixture project resolves")
 }
 
 /// The scratch output dir for `name`, cleared.
@@ -56,20 +45,20 @@ fn out_dir(name: &str) -> PathBuf {
     out
 }
 
-/// Assert `ipe` rejects the build of `entry` with the typed `expected` code.
+/// Assert `ipe` rejects the build of `fixture` with the typed `expected` code.
 #[track_caller]
-fn assert_rejected(name: &str, entry: &Path, expected: ipe_diagnostics::Code) {
+fn assert_rejected(name: &str, fixture: &RootFixture, expected: ipe_diagnostics::Code) {
     // A refusal test proves nothing if it skips silently: a missing runtime
     // would let the fail-closed assertion pass without driving the pipeline.
     let runtime = e2e_support::require_runtime().into_path_buf();
     let out = out_dir(name);
-    match ipe::build_loose_file(entry, &out, &runtime) {
+    match ipe::build_fixture(fixture, &out, &runtime) {
         Err(CliError::Pipeline { diag, .. }) => assert_eq!(
             diag.code(),
             expected,
             "{name}: expected a fail-closed {expected:?}, got a different diagnostic"
         ),
-        Ok(()) => assert!(
+        Ok(_) => assert!(
             false_marker(),
             "{name}: ipe ACCEPTED a reuse of a non-Clone fn-payload enum (exit 0) — \
              the emitted crate would fail cargo with a use-after-move, a SEAL break"
@@ -81,12 +70,12 @@ fn assert_rejected(name: &str, entry: &Path, expected: ipe_diagnostics::Code) {
     }
 }
 
-/// Build `entry` and return its output dir; an `ipe` refusal fails the test.
+/// Build `fixture` and return its output dir; an `ipe` refusal fails the test.
 #[track_caller]
-fn accepted_out(name: &str, entry: &Path) -> PathBuf {
+fn accepted_out(name: &str, fixture: &RootFixture) -> PathBuf {
     let runtime = e2e_support::require_runtime().into_path_buf();
     let out = out_dir(name);
-    let built = ipe::build_loose_file(entry, &out, &runtime);
+    let built = ipe::build_fixture(fixture, &out, &runtime);
     assert!(
         built.is_ok(),
         "{name}: ipe REJECTED a well-formed program — a false rejection: {built:?}"
@@ -245,38 +234,38 @@ main =
 #[test]
 fn boxed_fn_payload_enum_reuse_fails_closed() {
     let name = "boxed_fn_payload_enum_reuse";
-    let entry = write_single(name, BOXED_FN_PAYLOAD_ENUM_REUSE);
-    assert_rejected(name, &entry, ipe_diagnostics::IPE_L0127);
+    let fixture = write_single(BOXED_FN_PAYLOAD_ENUM_REUSE);
+    assert_rejected(name, &fixture, ipe_diagnostics::IPE_L0127);
 }
 
 #[test]
 fn boxed_fn_payload_enum_linear_builds() {
     let name = "boxed_fn_payload_enum_linear";
-    let entry = write_single(name, BOXED_FN_PAYLOAD_ENUM_LINEAR);
-    let out = accepted_out(name, &entry);
+    let fixture = write_single(BOXED_FN_PAYLOAD_ENUM_LINEAR);
+    let out = accepted_out(name, &fixture);
     assert_runs(name, &out, "42");
 }
 
 #[test]
 fn shared_fn_payload_enum_reuse_builds() {
     let name = "shared_fn_payload_enum_reuse";
-    let entry = write_single(name, SHARED_FN_PAYLOAD_ENUM_REUSE);
-    let out = accepted_out(name, &entry);
+    let fixture = write_single(SHARED_FN_PAYLOAD_ENUM_REUSE);
+    let out = accepted_out(name, &fixture);
     assert_runs(name, &out, "30");
 }
 
 #[test]
 fn enum_recursive_through_a_task_builds() {
     let name = "enum_recursive_through_a_task";
-    let entry = write_single(name, ENUM_RECURSIVE_THROUGH_A_TASK);
-    let out = accepted_out(name, &entry);
+    let fixture = write_single(ENUM_RECURSIVE_THROUGH_A_TASK);
+    let out = accepted_out(name, &fixture);
     assert_runs(name, &out, "7");
 }
 
 #[test]
 fn enums_mutually_recursive_through_tasks_build() {
     let name = "enums_mutually_recursive_through_tasks";
-    let entry = write_single(name, ENUMS_MUTUALLY_RECURSIVE_THROUGH_TASKS);
-    let out = accepted_out(name, &entry);
+    let fixture = write_single(ENUMS_MUTUALLY_RECURSIVE_THROUGH_TASKS);
+    let out = accepted_out(name, &fixture);
     assert_runs(name, &out, "3");
 }

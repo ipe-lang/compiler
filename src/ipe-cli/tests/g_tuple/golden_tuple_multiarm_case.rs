@@ -34,12 +34,11 @@ fn repo_root() -> PathBuf {
     std::fs::canonicalize(&joined).unwrap_or(joined)
 }
 
-fn fixture_entry() -> PathBuf {
+fn fixture_project() -> PathBuf {
     repo_root()
         .join("tests")
         .join("golden")
         .join("i_tuple_multiarm_case")
-        .join("Main.ipe")
 }
 
 /// Fast gate: a multi-arm LITERAL-tuple `case` builds cleanly — the IPE-L0115
@@ -50,7 +49,7 @@ fn multi_arm_tuple_case_builds() {
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
-    let built = ipe::build(&fixture_entry(), &out, &runtime);
+    let built = crate::support::build_golden(&fixture_project(), &out, &runtime);
     assert!(
         built.is_ok(),
         "multi-arm tuple `case` must build (IPE-L0115 close); got {:?}",
@@ -71,7 +70,7 @@ fn multi_arm_tuple_case_cargo_builds_and_runs() {
 
     let runtime = e2e_support::require_runtime().into_path_buf();
 
-    let built = ipe::build(&fixture_entry(), &out, &runtime);
+    let built = crate::support::build_golden(&fixture_project(), &out, &runtime);
     assert!(
         built.is_ok(),
         "ipe dev build must succeed for i_tuple_multiarm_case: {:?}",

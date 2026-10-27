@@ -1,4 +1,4 @@
-module Lib.ReviewKey exposing (MacKey, ReviewKey(..), keyFromLookup, keyVar, parseMacKey, readOnlyError, readOnlyNotice, readReviewKey, sign, verifies)
+module Lib.ReviewKey exposing (MacKey, ReviewKey(..), keyFromLookup, keyVar, parseMacKey, readOnlyError, readOnlyNotice, readOnlyText, readReviewKey, sign, verifies)
 
 import Ipe.Char as Char
 import Ipe.Crypto as Crypto
@@ -7,7 +7,7 @@ import Ipe.Result as Result exposing (Result(..))
 import Ipe.String as String
 import Ipe.System as System
 import Ipe.Task as Task
-import Lib.EnvLookup as EnvLookup
+import Lib.EnvLookup as EnvLookup exposing (StartupVar(..))
 
 
 -- The key that signs and verifies review-log rows. Opaque: built only by
@@ -29,7 +29,7 @@ type ReviewKey
 -- The environment variable that carries the key.
 keyVar : String
 keyVar =
-    "IPE_REVIEW_MAC_KEY"
+    EnvLookup.startupVarName ReviewKeyVar
 
 
 -- The key's one decode point: exactly 64 ASCII hex digits (32 random bytes),
@@ -52,7 +52,13 @@ parseMacKey raw =
 
 malformedKey : Error
 malformedKey =
-    Error.invalidInput (keyVar ++ " must be exactly 64 hexadecimal characters (32 random bytes); the value set is not.\n  fix: generate one with `openssl rand -hex 32`.")
+    EnvLookup.startupRefusal
+        { var = ReviewKeyVar
+        , file = Nothing
+        , given = Nothing
+        , problem = "it must be exactly 64 hexadecimal characters (32 random bytes), and the value set is not"
+        , fix = "generate one with `openssl rand -hex 32`"
+        }
 
 
 -- The key this server runs with, read once at startup.
@@ -84,19 +90,35 @@ keyFromLookup lookup =
 
 unreadableKey : Error
 unreadableKey =
-    Error.invalidInput (keyVar ++ " could not be read from the environment.\n  fix: set it to 64 hex characters (32 random bytes), e.g. `openssl rand -hex 32`, or unset it to run read-only.")
+    EnvLookup.startupRefusal
+        { var = ReviewKeyVar
+        , file = Nothing
+        , given = Nothing
+        , problem = "it could not be read from the environment"
+        , fix = "set it to 64 hex characters (32 random bytes), e.g. `openssl rand -hex 32`, or unset it to run read-only"
+        }
 
 
 -- The startup notice of a server running with no key.
 readOnlyNotice : String
 readOnlyNotice =
-    "code-review: " ++ keyVar ++ " is not set, so this server is read-only: it records no decision and counts none.\n  fix: set " ++ keyVar ++ " to 64 hex characters (32 random bytes), e.g. `openssl rand -hex 32`, stored outside the review database."
+    EnvLookup.startupNotice
+        { var = ReviewKeyVar
+        , problem = "it is not set, so this server is read-only: it records no decision and counts none"
+        , fix = "set it to 64 hex characters (32 random bytes), e.g. `openssl rand -hex 32`, stored outside the review database"
+        }
 
 
 -- The refusal of a decision on a server running with no key.
 readOnlyError : Error
 readOnlyError =
-    Error.withMessage ("This server is read-only: " ++ keyVar ++ " is not set, so no decision can be signed. Restart it with the key set to record decisions.") Error.permissionDenied
+    Error.withMessage readOnlyText Error.permissionDenied
+
+
+-- Why a server running with no key records no decision, as a page says it.
+readOnlyText : String
+readOnlyText =
+    "This server is read-only: " ++ keyVar ++ " is not set, so no decision can be signed. Restart it with the key set to record decisions."
 
 
 -- The HMAC-SHA-256 tag of `message`, as the lowercase hex the log stores.

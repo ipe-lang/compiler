@@ -31,11 +31,11 @@ mod seal_e2e;
 
 use ipe_backend::Backend;
 use ipe_backend_rust::RustBackend;
-use ipe_diagnostics::{DResult, Diagnostic};
+use ipe_diagnostics::{DResult, Diagnostic, Feature, LowerError, Span};
 use ipe_intern::Interner;
 use ipe_ir::{
     BinOp, BoundSet, CallPin, Callee, Expr, Func, FuncId, IrType, KernelFn, ModPath, Module,
-    OnFormKind, Program,
+    OnFormKind, Program, UserPin,
 };
 
 /// Build the canonical generic program:
@@ -71,9 +71,9 @@ fn build_identity_program(interner: &mut Interner) -> DResult<Program> {
         id: identity_id,
         name: identity,
         home: ModPath(vec![]),
-        type_params: vec![(a, BoundSet::UNBOUNDED)],
+        type_params: vec![(a, BoundSet::UNBOUNDED.with_clone())],
         row_params: vec![],
-        params: vec![(x, IrType::Generic(a))],
+        params: vec![ipe_ir::Param::owned(x, IrType::Generic(a))],
         ret: IrType::Generic(a),
         body: Expr::Var(x),
     };
@@ -257,14 +257,14 @@ fn build_bounded_program(interner: &mut Interner) -> DResult<Program> {
 
     // double x = x + x — the body adds `x` to itself, so `a` carries Add and is
     // reused (Copy). A reused (Copy) numeric-add variable.
-    let num_bounds = BoundSet::UNBOUNDED.with_add().with_copy();
+    let num_bounds = BoundSet::UNBOUNDED.with_add().with_copy().with_clone();
     let double_fn = Func {
         id: double_id,
         name: double,
         home: ModPath(vec![]),
         type_params: vec![(a, num_bounds)],
         row_params: vec![],
-        params: vec![(x, IrType::Generic(a))],
+        params: vec![ipe_ir::Param::owned(x, IrType::Generic(a))],
         ret: IrType::Generic(a),
         body: Expr::BinOp {
             op: BinOp::IntAdd,
@@ -274,14 +274,17 @@ fn build_bounded_program(interner: &mut Interner) -> DResult<Program> {
     };
 
     // max a b = if a > b then a else b — `a` is ordered and reused.
-    let ord_bounds = BoundSet::UNBOUNDED.with_ord().with_copy();
+    let ord_bounds = BoundSet::UNBOUNDED.with_ord().with_copy().with_clone();
     let max_fn = Func {
         id: max_id,
         name: max,
         home: ModPath(vec![]),
         type_params: vec![(a, ord_bounds)],
         row_params: vec![],
-        params: vec![(p, IrType::Generic(a)), (q, IrType::Generic(a))],
+        params: vec![
+            ipe_ir::Param::owned(p, IrType::Generic(a)),
+            ipe_ir::Param::owned(q, IrType::Generic(a)),
+        ],
         ret: IrType::Generic(a),
         body: Expr::If {
             cond: Box::new(Expr::BinOp {
@@ -464,5 +467,149 @@ fn end_to_end_builds_and_prints_forty_two() -> DResult<()> {
     if target_dir == out.join("target") {
         let _ = std::fs::remove_dir_all(&target_dir);
     }
+    Ok(())
+}
+
+/// The refusal a lowering produced for the instantiation of `empties`'s
+/// generic at the call in [`build_unlowered_pin_program`].
+const fn unlowered_pin_refusal() -> Diagnostic {
+    Diagnostic::Lower {
+        span: Span::new(3, 9),
+        msg: LowerError::Unsupported(Feature::Polymorphism),
+    }
+}
+
+/// `empties` (over `t: param_ty`, returning `List a`) and a `main` binding
+/// `empties 0` whose pin for `a` holds the [`unlowered_pin_refusal`] its
+/// instantiation failed to lower with.
+#[allow(clippy::too_many_lines)] // straight-line IR fixture builder
+fn build_unlowered_pin_program(interner: &mut Interner, param_ty: IrType) -> DResult<Program> {
+    let main_mod = interner.intern("Main")?;
+    let empties = interner.intern("empties")?;
+    let main = interner.intern("main")?;
+    let a = interner.intern("a")?;
+    let t = interner.intern("t")?;
+    let n = interner.intern("n")?;
+    let empties_id = FuncId::from_raw(0);
+    let main_id = FuncId::from_raw(1);
+    let empties_fn = Func {
+        id: empties_id,
+        name: empties,
+        home: ModPath(vec![]),
+        type_params: vec![(a, BoundSet::UNBOUNDED)],
+        row_params: vec![],
+        params: vec![ipe_ir::Param::owned(t, param_ty)],
+        ret: IrType::List(Box::new(IrType::Generic(a))),
+        body: Expr::List {
+            elem: IrType::Generic(a),
+            items: vec![],
+        },
+    };
+    let pins =
+        std::iter::once((a, UserPin::Unlowered(Box::new(unlowered_pin_refusal())))).collect();
+    let main_fn = Func {
+        id: main_id,
+        name: main,
+        home: ModPath(vec![]),
+        type_params: vec![],
+        row_params: vec![],
+        params: vec![],
+        ret: IrType::Task(Box::new(IrType::Unit)),
+        body: Expr::Let {
+            name: n,
+            value: Box::new(Expr::Call {
+                callee: Callee::Func(empties_id),
+                args: vec![Expr::Int(0)],
+                pin: CallPin::User(pins),
+                on_form: OnFormKind::NotForm,
+            }),
+            body: Box::new(Expr::Call {
+                callee: Callee::Kernel(KernelFn::IoPrintln),
+                args: vec![Expr::Str("ok".to_owned())],
+                pin: CallPin::None,
+                on_form: OnFormKind::NotForm,
+            }),
+        },
+    };
+    Ok(Program {
+        imports_unsafe_submodule: false,
+        imported_web_capabilities: std::collections::BTreeSet::new(),
+        modules: vec![Module {
+            name: ModPath(vec![main_mod]),
+            types: vec![],
+            funcs: vec![empties_fn, main_fn],
+            entry: Some(main_id),
+            records: vec![],
+            uses_tea: false,
+            uses_server: false,
+            uses_http: false,
+            uses_config: false,
+            uses_compression: false,
+            uses_csv: false,
+            uses_cache: false,
+            uses_encoding: false,
+            uses_regex: false,
+            uses_uuid: false,
+            uses_random: false,
+            uses_log: false,
+            uses_decimal: false,
+            uses_char_category: false,
+            uses_crypto_core: false,
+            uses_secret: false,
+            uses_json: false,
+            uses_crypto: false,
+            uses_jwt: false,
+            uses_url: false,
+            uses_ui: false,
+            uses_web: false,
+            uses_tui: false,
+            uses_console: false,
+            uses_webview: false,
+            uses_css: false,
+            uses_auth: false,
+            uses_principal: false,
+            uses_websocket: false,
+            uses_email: false,
+            uses_locale: false,
+            uses_time: false,
+            uses_env_public: false,
+            uses_debug: false,
+            uses_ffi: false,
+            uses_async_runtime: false,
+        }],
+    })
+}
+
+/// A pin whose instantiation did not lower, on a generic no parameter names,
+/// must render, so the emit returns the lowering's own refusal rather than a
+/// compiler bug in its place.
+#[test]
+fn an_unlowered_pin_that_must_render_returns_its_lowering_refusal() -> DResult<()> {
+    let mut interner = Interner::new();
+    let prog = build_unlowered_pin_program(&mut interner, IrType::Int)?;
+    let emitted = RustBackend::new(&interner).emit(&prog);
+    assert_eq!(emitted.err(), Some(unlowered_pin_refusal()));
+    Ok(())
+}
+
+/// The same unlowered pin on a generic a parameter names never renders: the
+/// argument lets rustc infer it, so the call emits without a turbofish.
+#[test]
+fn an_unlowered_pin_on_an_inferable_generic_is_not_rendered() -> DResult<()> {
+    let mut interner = Interner::new();
+    let a = interner.intern("a")?;
+    let prog = build_unlowered_pin_program(&mut interner, IrType::Generic(a))?;
+    let emitted = RustBackend::new(&interner).emit(&prog)?;
+    let main_rs = emitted
+        .files
+        .get(&ipe_backend::RelPath::new("src/main.rs")?)
+        .ok_or_else(|| Diagnostic::CompilerBug {
+            where_: "unlowered pin test",
+            detail: "emitted project is missing src/main.rs".to_owned(),
+        })?;
+    assert!(
+        main_rs.contains("main_empties(") && !main_rs.contains("main_empties::<"),
+        "the inferable call renders no turbofish:\n{main_rs}"
+    );
     Ok(())
 }

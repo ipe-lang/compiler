@@ -61,6 +61,7 @@ pub(super) fn ir_type_mentions(ty: &IrType, leaf: &impl Fn(&IrType) -> bool) -> 
         | IrType::Url
         | IrType::UrlRelative
         | IrType::Dsn
+        | IrType::DbLocation
         | IrType::Connection
         | IrType::ConnReadOnly
         | IrType::ConnReadWrite
@@ -387,6 +388,7 @@ pub(super) fn expr_type_mentions(expr: &Expr, pred: &impl Fn(&IrType) -> bool) -
         Expr::FuncValue { ty, .. } => pred(ty),
         Expr::TailLoop { params, .. } => params.iter().any(|(_, t)| pred(t)),
         Expr::Record { ty, .. } => matches!(ty, Some(t) if pred(t)),
+        Expr::Call { pin, .. } => pin.pinned_types().any(pred),
         Expr::Int(_)
         | Expr::Bool(_)
         | Expr::Float(_)
@@ -402,7 +404,6 @@ pub(super) fn expr_type_mentions(expr: &Expr, pred: &impl Fn(&IrType) -> bool) -
         | Expr::Destructure { .. }
         | Expr::If { .. }
         | Expr::Match(_)
-        | Expr::Call { .. }
         | Expr::Tuple(_)
         | Expr::Cons { .. }
         | Expr::ListIndexClone { .. }
@@ -410,7 +411,8 @@ pub(super) fn expr_type_mentions(expr: &Expr, pred: &impl Fn(&IrType) -> bool) -
         | Expr::Update { .. }
         | Expr::Apply { .. }
         | Expr::TaskSeq { .. }
-        | Expr::TailRecur { .. } => false,
+        | Expr::TailRecur { .. }
+        | Expr::CaptureClones { .. } => false,
     };
     if here {
         return true;
@@ -457,7 +459,8 @@ pub(super) fn expr_type_mentions(expr: &Expr, pred: &impl Fn(&IrType) -> bool) -
         Expr::Lambda { body, .. }
         | Expr::SharedLambda { body, .. }
         | Expr::OnceLambda { body, .. }
-        | Expr::TailLoop { body, .. } => expr_type_mentions(body, pred),
+        | Expr::TailLoop { body, .. }
+        | Expr::CaptureClones { body, .. } => expr_type_mentions(body, pred),
         Expr::Apply { func, args } => {
             expr_type_mentions(func, pred) || args.iter().any(|a| expr_type_mentions(a, pred))
         }
@@ -497,7 +500,7 @@ pub(super) fn expr_type_mentions(expr: &Expr, pred: &impl Fn(&IrType) -> bool) -
 /// so this is the sole position that reaches them.
 pub(super) fn func_type_mentions(f: &Func, pred: &impl Fn(&IrType) -> bool) -> bool {
     pred(&f.ret)
-        || f.params.iter().any(|(_, t)| pred(t))
+        || f.params.iter().any(|ipe_ir::Param { ty: t, .. }| pred(t))
         || expr_type_mentions(&f.body, pred)
         || f.row_params
             .iter()
@@ -598,6 +601,11 @@ pub(super) fn collect_body_record_shapes(
                 consider(t);
             }
         }
+        Expr::Call { pin, .. } => {
+            for ty in pin.pinned_types() {
+                consider(ty);
+            }
+        }
         Expr::Int(_)
         | Expr::Bool(_)
         | Expr::Float(_)
@@ -613,7 +621,6 @@ pub(super) fn collect_body_record_shapes(
         | Expr::Destructure { .. }
         | Expr::If { .. }
         | Expr::Match(_)
-        | Expr::Call { .. }
         | Expr::Tuple(_)
         | Expr::Cons { .. }
         | Expr::ListIndexClone { .. }
@@ -621,7 +628,8 @@ pub(super) fn collect_body_record_shapes(
         | Expr::Update { .. }
         | Expr::Apply { .. }
         | Expr::TaskSeq { .. }
-        | Expr::TailRecur { .. } => {}
+        | Expr::TailRecur { .. }
+        | Expr::CaptureClones { .. } => {}
     }
     // Recurse into every child expression.
     match expr {
@@ -681,7 +689,8 @@ pub(super) fn collect_body_record_shapes(
         Expr::Lambda { body, .. }
         | Expr::SharedLambda { body, .. }
         | Expr::OnceLambda { body, .. }
-        | Expr::TailLoop { body, .. } => collect_body_record_shapes(body, out, seen),
+        | Expr::TailLoop { body, .. }
+        | Expr::CaptureClones { body, .. } => collect_body_record_shapes(body, out, seen),
         Expr::Apply { func, args } => {
             collect_body_record_shapes(func, out, seen);
             for a in args {

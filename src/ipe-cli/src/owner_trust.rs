@@ -12,6 +12,7 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 
 use ipe_ffi::diag::Diagnostic;
+use ipe_ffi::driver::FFI_CACHE_COMPONENTS;
 
 use crate::CliError;
 use crate::text;
@@ -162,8 +163,10 @@ pub enum TrustRefusal {
     ManifestUnverifiable(PathBuf),
     /// This host has no owner check, so the FFI cache is not loaded.
     FfiCacheUnverifiable(PathBuf),
-    /// An FFI cache component or artifact is a symbolic link.
+    /// An FFI cache artifact is a symbolic link.
     FfiCacheSymlink(PathBuf),
+    /// An FFI cache directory component is a symbolic link or not a directory.
+    FfiCacheEscapes(PathBuf),
     /// Another user can write an FFI cache component or artifact.
     FfiCacheUntrusted(PathBuf),
     /// An FFI cache artifact is not a regular file.
@@ -189,6 +192,13 @@ pub enum TrustRefusal {
         /// The offending wrapper identifier.
         ident: String,
     },
+    /// A wrapper crate bound by path is no longer the directory below the project root.
+    FfiWrapperMoved {
+        /// The wrapper's `[package] name`.
+        package: String,
+        /// The path the `path` dependency binds.
+        path: PathBuf,
+    },
 }
 
 impl TrustRefusal {
@@ -201,12 +211,14 @@ impl TrustRefusal {
             | Self::ManifestUnverifiable(_) => TrustSubject::Manifest,
             Self::FfiCacheUnverifiable(_)
             | Self::FfiCacheSymlink(_)
+            | Self::FfiCacheEscapes(_)
             | Self::FfiCacheUntrusted(_)
             | Self::FfiCacheNotRegular(_)
             | Self::FfiCacheTooManyEntries { .. }
             | Self::FfiCatalog(_)
             | Self::FfiReservedModule { .. }
-            | Self::FfiReservedWrapperPrefix { .. } => TrustSubject::Ffi,
+            | Self::FfiReservedWrapperPrefix { .. }
+            | Self::FfiWrapperMoved { .. } => TrustSubject::Ffi,
         }
     }
 
@@ -219,6 +231,7 @@ impl TrustRefusal {
             Self::ManifestUnverifiable(path) => text::msg::manifest_unverifiable(&path.display()),
             Self::FfiCacheUnverifiable(path) => text::msg::ffi_cache_unverifiable(&path.display()),
             Self::FfiCacheSymlink(path) => text::msg::ffi_cache_symlink(&path.display()),
+            Self::FfiCacheEscapes(path) => text::msg::ffi_cache_escapes(&path.display()),
             Self::FfiCacheUntrusted(path) => text::msg::ffi_cache_untrusted(&path.display()),
             Self::FfiCacheNotRegular(path) => text::msg::ffi_cache_not_regular(&path.display()),
             Self::FfiCacheTooManyEntries { path, cap } => {
@@ -234,6 +247,9 @@ impl TrustRefusal {
                     ident,
                     &ipe_canon::asserted::ASSERTED_WRAPPER_PREFIX,
                 )
+            }
+            Self::FfiWrapperMoved { package, path } => {
+                text::msg::ffi_wrapper_moved(package, &path.display())
             }
         }
     }
@@ -335,7 +351,14 @@ pub fn refuse_unverifiable_manifest(manifest: &Path) -> Result<(), CliError> {
     )))
 }
 
-/// Refuse whatever exists at `anchor/rel` on a host with no owner check.
+/// The FFI cache below `anchor`, built from [`FFI_CACHE_COMPONENTS`] one component at a time.
+fn cache_below(anchor: &Path) -> PathBuf {
+    let mut candidate = anchor.to_path_buf();
+    candidate.extend(FFI_CACHE_COMPONENTS);
+    candidate
+}
+
+/// Refuse whatever exists at the FFI cache below `anchor` on a host with no owner check.
 ///
 /// Every platform compiles this, so its refusal is exercised everywhere, not
 /// only where it is the discovery rule. A missing entry, or a path through a
@@ -343,10 +366,10 @@ pub fn refuse_unverifiable_manifest(manifest: &Path) -> Result<(), CliError> {
 ///
 /// # Errors
 ///
-/// [`CliError::TrustRefused`] when anything exists at `anchor/rel`, link or not;
+/// [`CliError::TrustRefused`] when anything exists at the cache path, link or not;
 /// [`CliError::Io`] when its presence cannot be determined.
-pub fn refuse_unverifiable_cache(anchor: &Path, rel: &str) -> Result<(), CliError> {
-    let candidate = anchor.join(rel);
+pub fn refuse_unverifiable_cache(anchor: &Path) -> Result<(), CliError> {
+    let candidate = cache_below(anchor);
     match std::fs::symlink_metadata(&candidate) {
         Ok(_) => Err(CliError::TrustRefused(TrustRefusal::FfiCacheUnverifiable(
             candidate,
@@ -367,10 +390,10 @@ pub fn refuse_unverifiable_cache(anchor: &Path, rel: &str) -> Result<(), CliErro
 }
 
 #[cfg(unix)]
-pub use held::{TrustedCache, open_cache};
+pub use held::{TrustedCache, open_cache, open_cache_beneath};
 
 #[cfg(not(unix))]
-pub use unverifiable::{TrustedCache, open_cache};
+pub use unverifiable::{TrustedCache, open_cache, open_cache_beneath};
 
 /// Held, no-follow descriptors over the FFI cache.
 #[cfg(unix)]
@@ -379,7 +402,7 @@ mod held {
     use std::os::fd::{AsFd as _, BorrowedFd};
     use std::path::{Path, PathBuf};
 
-    use ipe_ffi::driver::CacheSource;
+    use ipe_ffi::driver::{CacheSource, FFI_CACHE_COMPONENTS};
     use rustix::fs::{AtFlags, CWD, FileType, Mode, OFlags};
     use rustix::io::Errno;
 
@@ -404,6 +427,17 @@ mod held {
         pub fn path(&self) -> &Path {
             &self.path
         }
+
+        /// This cache, its artifacts judged against `invoker` from here on.
+        ///
+        /// A test cannot own a file as another user, so it stands in for one
+        /// by judging the invoker's own artifact against a foreign identity.
+        #[cfg(test)]
+        #[must_use]
+        pub const fn judged_as(mut self, invoker: Invoker) -> Self {
+            self.invoker = invoker;
+            self
+        }
     }
 
     /// Flags for opening one cache directory component, never through a link.
@@ -425,12 +459,13 @@ mod held {
         }
     }
 
-    /// The component `name` under `parent`, or `None` when absent or not a directory.
+    /// The component `name` under `parent`, or `None` when absent.
     ///
     /// # Errors
     ///
-    /// [`CliError::TrustRefused`] when the component is a symbolic link; [`CliError::Io`]
-    /// when it cannot be opened for another reason.
+    /// [`CliError::TrustRefused`] with [`TrustRefusal::FfiCacheEscapes`] when the
+    /// component is a symbolic link or not a directory; [`CliError::Io`] when it
+    /// cannot be opened for another reason.
     fn open_component(
         parent: BorrowedFd<'_>,
         name: &Path,
@@ -442,51 +477,96 @@ mod held {
             Err(e) => e,
         };
         match entry_type(parent, name) {
-            Ok(Some(FileType::Symlink)) => Err(CliError::TrustRefused(
-                TrustRefusal::FfiCacheSymlink(shown.to_path_buf()),
-            )),
+            Ok(None) => Ok(None),
             Ok(Some(FileType::Directory)) | Err(_) => Err(CliError::Io {
                 path: shown.to_path_buf(),
                 source: open_err.into(),
             }),
-            Ok(
-                None
-                | Some(
-                    FileType::RegularFile
-                    | FileType::Fifo
-                    | FileType::Socket
-                    | FileType::CharacterDevice
-                    | FileType::BlockDevice
-                    | FileType::Unknown,
-                ),
-            ) => Ok(None),
+            Ok(Some(
+                FileType::Symlink
+                | FileType::RegularFile
+                | FileType::Fifo
+                | FileType::Socket
+                | FileType::CharacterDevice
+                | FileType::BlockDevice
+                | FileType::Unknown,
+            )) => Err(CliError::TrustRefused(TrustRefusal::FfiCacheEscapes(
+                shown.to_path_buf(),
+            ))),
         }
     }
 
-    /// Open the cache at `anchor/rel`, owner-checking every component below `anchor`.
+    /// Open the FFI cache below the directory at `anchor`, reached by path.
     ///
-    /// `anchor` itself is reached by path, following links; each component of
-    /// `rel` is opened relative to the handle on its parent without following
-    /// a link, then checked on the opened handle. `None` when a component is
-    /// absent or is not a directory.
+    /// `anchor` itself is opened following links (it is the caller's, not the
+    /// cache's); everything below it goes through [`open_cache_beneath`]. An
+    /// empty `anchor` is the current directory. `None` when `anchor` or a
+    /// component is absent.
     ///
     /// # Errors
     ///
-    /// [`CliError::TrustRefused`] when a component is a symbolic link or some user
-    /// other than the invoker can write it; [`CliError::Io`] when a component
-    /// cannot be opened or inspected.
-    pub fn open_cache(anchor: &Path, rel: &str) -> Result<Option<TrustedCache>, CliError> {
-        let invoker = Invoker::current();
-        let mut shown = anchor.to_path_buf();
+    /// As [`open_cache_beneath`]; [`CliError::Io`] when `anchor` cannot be opened.
+    pub fn open_cache(anchor: &Path) -> Result<Option<TrustedCache>, CliError> {
+        let at = if anchor.as_os_str().is_empty() {
+            Path::new(".")
+        } else {
+            anchor
+        };
+        let root = match rustix::fs::openat(
+            CWD,
+            at,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+            Mode::empty(),
+        ) {
+            Ok(fd) => File::from(fd),
+            Err(e) if e == Errno::NOENT => return Ok(None),
+            Err(e) => {
+                return Err(CliError::Io {
+                    path: anchor.to_path_buf(),
+                    source: e.into(),
+                });
+            }
+        };
+        open_cache_beneath(&root, anchor)
+    }
+
+    /// Open the FFI cache beneath the held directory `anchor`, owner-checking every component.
+    ///
+    /// Each of [`FFI_CACHE_COMPONENTS`] is opened relative to the handle on
+    /// its parent, starting at `anchor`, without following a link, then
+    /// checked on the opened handle; no path is resolved again, so the cache
+    /// held is the one checked. `anchor_path` names the anchor in diagnostics
+    /// only. `None` when a component is absent.
+    ///
+    /// # Errors
+    ///
+    /// [`CliError::TrustRefused`] when a component is a symbolic link or not a
+    /// directory, or some user other than the invoker can write it;
+    /// [`CliError::Io`] when a component cannot be opened or inspected.
+    pub fn open_cache_beneath(
+        anchor: &File,
+        anchor_path: &Path,
+    ) -> Result<Option<TrustedCache>, CliError> {
+        open_cache_beneath_as(anchor, anchor_path, Invoker::current())
+    }
+
+    /// Open the FFI cache beneath `anchor` as [`open_cache_beneath`] does, judged against `invoker`.
+    ///
+    /// # Errors
+    ///
+    /// As [`open_cache_beneath`].
+    pub fn open_cache_beneath_as(
+        anchor: &File,
+        anchor_path: &Path,
+        invoker: Invoker,
+    ) -> Result<Option<TrustedCache>, CliError> {
+        let mut shown = anchor_path.to_path_buf();
         let mut held: Option<File> = None;
         let mut breached: Option<PathBuf> = None;
-        for segment in rel.split('/') {
+        for segment in FFI_CACHE_COMPONENTS {
             shown.push(segment);
-            let opened = match &held {
-                None => open_component(CWD, &shown, &shown)?,
-                Some(dir) => open_component(dir.as_fd(), Path::new(segment), &shown)?,
-            };
-            let Some(dir) = opened else {
+            let parent = held.as_ref().map_or_else(|| anchor.as_fd(), File::as_fd);
+            let Some(dir) = open_component(parent, Path::new(segment), &shown)? else {
                 return Ok(None);
             };
             let meta = dir.metadata().map_err(|source| CliError::Io {
@@ -607,6 +687,7 @@ mod held {
 /// Off Unix no cache can be owner-checked, so none is ever held.
 #[cfg(not(unix))]
 mod unverifiable {
+    use std::fs::File;
     use std::path::Path;
 
     use ipe_ffi::driver::CacheSource;
@@ -642,13 +723,27 @@ mod unverifiable {
         }
     }
 
-    /// Refuse any entry at `anchor/rel`, since its ownership cannot be verified here.
+    /// Refuse any entry at the FFI cache below `anchor`, since its ownership cannot be verified here.
     ///
     /// # Errors
     ///
     /// As [`refuse_unverifiable_cache`].
-    pub fn open_cache(anchor: &Path, rel: &str) -> Result<Option<TrustedCache>, CliError> {
-        refuse_unverifiable_cache(anchor, rel).map(|()| None)
+    pub fn open_cache(anchor: &Path) -> Result<Option<TrustedCache>, CliError> {
+        refuse_unverifiable_cache(anchor).map(|()| None)
+    }
+
+    /// Refuse any entry at the FFI cache beneath the held `anchor`, named by `anchor_path`.
+    ///
+    /// No cache is ever held here, so the refusal needs no handle.
+    ///
+    /// # Errors
+    ///
+    /// As [`refuse_unverifiable_cache`].
+    pub fn open_cache_beneath(
+        _anchor: &File,
+        anchor_path: &Path,
+    ) -> Result<Option<TrustedCache>, CliError> {
+        refuse_unverifiable_cache(anchor_path).map(|()| None)
     }
 }
 

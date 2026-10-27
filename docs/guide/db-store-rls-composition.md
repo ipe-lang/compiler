@@ -38,7 +38,7 @@ demonstration runs deterministically. The multi-module package under
 [`examples/shapes/script/rls-composition-builders`](../../examples/shapes/script/rls-composition-builders/src/Main.ipe)
 puts each pattern in its own `Rls.*` sub-module of composition helpers, and its
 `Main` exercises all four. The sealed, self-contained twin is
-[`tests/golden/db_store_rls_composition_builders_seal`](../../tests/golden/db_store_rls_composition_builders_seal/Main.ipe).
+[`tests/golden/db_store_rls_composition_builders_seal`](../../tests/golden/db_store_rls_composition_builders_seal/src/Main.ipe).
 
 **Owner** — the simplest pattern: every row is private to the user who created it,
 and no one else can see or change it (think a personal notes or drafts table). A row
@@ -139,7 +139,7 @@ meaning, so a wrong composition is legible before it ships an insecure idiom.
   [`examples/shapes/script/rls-composition-builders`](../../examples/shapes/script/rls-composition-builders/src/Main.ipe)
   — the four patterns as `Rls.*` composition helpers.
 - **The SEAL:**
-  [`tests/golden/db_store_rls_composition_builders_seal`](../../tests/golden/db_store_rls_composition_builders_seal/Main.ipe)
+  [`tests/golden/db_store_rls_composition_builders_seal`](../../tests/golden/db_store_rls_composition_builders_seal/src/Main.ipe)
   — ipe-accepts ⇒ cargo-builds ⇒ runs ⇒ output matches `expected.txt`.
 - **Sibling guides:** [Store](db-store.md) — the typed table the policy secures.
   [Codec](codec.md) — the single source of truth a store and its columns derive

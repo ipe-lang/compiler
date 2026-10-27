@@ -45,11 +45,11 @@ fn golden_dir(root: &Path, name: &str) -> PathBuf {
 /// Cheap tier: ipe must accept the fixture (exit 0). Always runs.
 fn assert_ipec_ok(name: &str) -> PathBuf {
     let root = repo_root();
-    let entry = golden_dir(&root, name).join("Main.ipe");
+    let dir = golden_dir(&root, name);
     let out = crate::support::scratch_root().join(format!("ipec_{name}_e2e"));
     let _ = std::fs::remove_dir_all(&out);
     let runtime = e2e_support::require_runtime().into_path_buf();
-    let built = ipe::build(&entry, &out, &runtime);
+    let built = crate::support::build_golden(&dir, &out, &runtime);
     assert!(
         built.is_ok(),
         "#125: {name} must be ipe-0: {:?}",

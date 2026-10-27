@@ -21,7 +21,7 @@
 use std::path::{Path, PathBuf};
 
 use crate::CliError;
-use crate::index::{PinnedRev, Sha256Hex, SourceUrl};
+use crate::index::{PinnedRev, RemotePath, Sha256Hex, SourceUrl};
 use crate::package_name::PackageName;
 use crate::published_version::PublishedVersion;
 
@@ -58,6 +58,22 @@ pub enum LockRefusal {
         /// The refused `source` value, verbatim.
         raw: String,
     },
+    /// A path dependency's `source` names a network share or a device.
+    RemoteLocalSource {
+        /// The path dependency.
+        package: PackageName,
+        /// What the path names.
+        kind: RemotePath,
+        /// The refused `source` value, verbatim.
+        raw: String,
+    },
+    /// A path dependency's path holds a Windows device element (`CON`, `nul.txt`).
+    DeviceLocalSource {
+        /// The path dependency.
+        package: PackageName,
+        /// The refused path, verbatim.
+        raw: String,
+    },
     /// A path dependency's manifest path is not valid UTF-8.
     NonUtf8LocalPath {
         /// The path dependency.
@@ -81,6 +97,16 @@ impl std::fmt::Display for LockRefusal {
                     &MAX_LOCAL_SOURCE_LEN,
                     &raw.escape_debug(),
                 )
+            }
+            Self::RemoteLocalSource { package, kind, raw } => {
+                crate::text::lock_local_source_remote(
+                    package,
+                    &raw.escape_debug(),
+                    &kind.describe(),
+                )
+            }
+            Self::DeviceLocalSource { package, raw } => {
+                crate::text::lock_local_source_device(package, &raw.escape_debug())
             }
             Self::NonUtf8LocalPath { package, path } => crate::text::lock_non_utf8_local_path(
                 package,
@@ -108,7 +134,9 @@ const MAX_LOCAL_SOURCE_LEN: usize = 4096;
 /// is still written into a quoted, line-oriented lockfile, so the only
 /// inhabitants are non-empty, bounded, UTF-8 strings free of control characters
 /// and `"` — a value that could break out of its line or its quotes cannot be
-/// recorded or read back.
+/// recorded or read back. A path naming a network share or a device
+/// ([`crate::index::remote_path`]) has no representation either, so a shared
+/// `ipe.lock` never names a location that would contact another host.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LocalSource(String);
 
@@ -117,7 +145,8 @@ impl LocalSource {
     ///
     /// # Errors
     /// [`CliError::LockRefused`] when `raw` is empty, longer than
-    /// [`MAX_LOCAL_SOURCE_LEN`] bytes, or contains a control character or `"`.
+    /// [`MAX_LOCAL_SOURCE_LEN`] bytes, contains a control character or `"`, or
+    /// names a network share or a device.
     pub fn parse(pkg: &PackageName, raw: &str) -> Result<Self, CliError> {
         let recordable = !raw.is_empty()
             && raw.len() <= MAX_LOCAL_SOURCE_LEN
@@ -129,7 +158,24 @@ impl LocalSource {
             }
             .into());
         }
+        if let Some(kind) = crate::index::remote_path(raw) {
+            return Err(LockRefusal::RemoteLocalSource {
+                package: pkg.clone(),
+                kind,
+                raw: raw.to_owned(),
+            }
+            .into());
+        }
         Ok(Self(raw.to_owned()))
+    }
+
+    /// Does an element of the path open a Windows device (`CON`, `nul.txt`,
+    /// `COM1`) under `regime`? Never under [`Regime::Unix`](ipe_path_core::Regime::Unix).
+    #[must_use]
+    pub fn opens_a_device(&self, regime: ipe_path_core::Regime) -> bool {
+        regime.is_windows()
+            && ipe_path_core::ElementClass::windows_elements(&self.0)
+                .any(|class| class == ipe_path_core::ElementClass::DosDevice)
     }
 
     /// Record a manifest path, refusing one that is not valid UTF-8.
@@ -478,9 +524,10 @@ mod tests {
         LocalSource, LockRefusal, LockedDep, LockedOrigin, Lockfile, MAX_LOCAL_SOURCE_LEN,
     };
     use crate::CliError;
-    use crate::index::{PinnedRev, Sha256Hex, SourceUrl};
+    use crate::index::{PinnedRev, RemotePath, Sha256Hex, SourceUrl};
     use crate::package_name::PackageName;
     use crate::published_version::{PublishedVersion, VersionRefusal};
+    use ipe_path_core::Regime;
     use std::path::PathBuf;
 
     /// A valid 40-hex commit SHA used in fixtures.
@@ -1026,5 +1073,63 @@ mod tests {
     fn from_text_refuses_a_package_missing_its_fields() {
         let refused = Lockfile::from_text("[[package]]\nname = \"mylib\"\n");
         assert!(matches!(refused, Err(CliError::LockRefused(_))));
+    }
+
+    #[test]
+    fn a_locked_path_source_naming_a_network_share_is_refused() {
+        let pkg = name("mylib");
+        for (raw, kind) in [
+            ("//h/s", RemotePath::Unc),
+            (r"\\h\s", RemotePath::Unc),
+            (r"\\?\UNC\h\s", RemotePath::VerbatimUnc),
+        ] {
+            let expected = LockRefusal::RemoteLocalSource {
+                package: pkg.clone(),
+                kind,
+                raw: raw.to_owned(),
+            };
+            let err = LocalSource::parse(&pkg, raw).unwrap_err();
+            assert!(
+                matches!(&err, CliError::LockRefused(r) if **r == expected),
+                "{raw:?}: {err:?}"
+            );
+        }
+        assert!(LocalSource::parse(&pkg, "../local path/x").is_ok());
+
+        let escape = one_package("mylib", "0.0.0", "//h/s", "local", "kind = \"escape\"\n");
+        let err = Lockfile::from_text(&escape).unwrap_err();
+        assert!(
+            matches!(&err, CliError::LockRefused(r)
+                if matches!(**r, LockRefusal::RemoteLocalSource { kind: RemotePath::Unc, .. })),
+            "{err:?}"
+        );
+
+        let indexed = one_package("mylib", "1.0.0", "//h/s", FIXTURE_SHA, "");
+        let err = Lockfile::from_text(&indexed).unwrap_err();
+        let shown = crate::style::TerminalSafe::sanitize(&format!("{:?}", "//h/s"));
+        let expected =
+            crate::text::msg::index_source_url_remote(&pkg, &RemotePath::Unc.describe(), &shown);
+        assert!(
+            matches!(&err, CliError::Resolve(msg) if *msg == expected),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn a_locked_path_source_naming_a_device_opens_one_only_under_windows() {
+        let pkg = name("mylib");
+        for raw in [r"C:\r\CON", "lib/nul.txt", "COM1"] {
+            let source = LocalSource::parse(&pkg, raw).unwrap();
+            assert!(source.opens_a_device(Regime::Windows), "{raw:?}");
+            assert!(!source.opens_a_device(Regime::Unix), "{raw:?}");
+        }
+        let control = LocalSource::parse(&pkg, "lib/console").unwrap();
+        assert!(!control.opens_a_device(Regime::Windows));
+        let shown = LockRefusal::DeviceLocalSource {
+            package: pkg,
+            raw: "COM1".to_owned(),
+        }
+        .to_string();
+        assert!(shown.contains("names a Windows device"), "{shown}");
     }
 }

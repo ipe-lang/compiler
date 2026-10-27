@@ -16,8 +16,8 @@ src/ipe-cli/src/build_plan.rs 12
 src/ipe-cli/src/cache.rs 4
 src/ipe-cli/src/cargo_step.rs 2
 src/ipe-cli/src/coverage/columns_runtime.rs 2
-src/ipe-cli/src/coverage/probe.rs 2
-src/ipe-cli/src/doc.rs 5
+src/ipe-cli/src/coverage/probe.rs 1
+src/ipe-cli/src/doc.rs 4
 src/ipe-cli/src/driver/build_pipeline.rs 15
 src/ipe-cli/src/driver/commands.rs 2
 src/ipe-cli/src/env_dir.rs 1
@@ -30,7 +30,7 @@ src/ipe-cli/src/resolve.rs 2
 src/ipe-cli/src/runtime_embed.rs 5
 src/ipe-cli/src/ssh_signing_key.rs 4
 src/ipe-cli/src/watch.rs 18
-src/ipe-docs/src/env_vars.rs 130
+src/ipe-docs/src/env_vars.rs 129
 src/ipe-wrapper/build.rs 10
 src/runtime/rust/src/app_config.rs 6
 src/runtime/rust/src/compression.rs 2
@@ -49,8 +49,9 @@ src/runtime/rust/src/literal_table.rs 2
 src/runtime/rust/src/log.rs 3
 src/runtime/rust/src/regex_kernel.rs 1
 src/runtime/rust/src/server.rs 13
+src/runtime/rust/src/server/shutdown.rs 1
 src/runtime/rust/src/ssrf.rs 8
-src/runtime/rust/src/system.rs 5
+src/runtime/rust/src/system.rs 2
 src/runtime/rust/src/telemetry.rs 14
 src/runtime/rust/src/telemetry_spill.rs 4
 src/runtime/rust/src/trace.rs 2
@@ -58,11 +59,11 @@ src/runtime/rust/src/ui/render.rs 2
 src/runtime/rust/src/web/console.rs 13
 src/runtime/rust/src/web/console_proxy.rs 12
 src/runtime/rust/src/web/csrf.rs 2
-src/runtime/rust/src/web/mod.rs 44
+src/runtime/rust/src/web/mod.rs 42
 src/runtime/rust/src/web/observability.rs 5
 src/runtime/rust/src/web/push_exporter.rs 9
 src/runtime/rust/src/web/sse.rs 1
-src/runtime/rust/src/web/store.rs 4
+src/runtime/rust/src/web/store.rs 2
 src/runtime/rust/src/ws_client.rs 2
 tools/e2e-support/src/bin.rs 3
 tools/e2e-support/src/lib.rs 5

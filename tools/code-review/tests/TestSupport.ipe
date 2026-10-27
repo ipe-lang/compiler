@@ -23,13 +23,18 @@ module TestSupport exposing
     , check
     , checkReporting
     , onFreshReview
+    , withReviewDb
+    , bracketDb
+    , applyEdits
     , indexSchemaStatements
     , execIndexSchema
     , seedIndexDb
     , insertUnitRows
+    , insertUnboundUnit
     , setIndexEnv
     , envSettings
     , envReview
+    , optionalEnv
     , envAppSettings
     , loadFirstPage
     , indexConn
@@ -40,7 +45,14 @@ module TestSupport exposing
     , drainThenLoadNow
     , loadUnitViewNow
     , drainUnitNow
+    , attestedNow
+    , proveCopyNow
     , decideShownNow
+    , decidedRefusalNow
+    , decidedNow
+    , accepted
+    , refusedAs
+    , refusalOf
     , resyncReviewedNow
     , resyncReviewedWithinNow
     , checkUnits
@@ -59,6 +71,10 @@ module TestSupport exposing
     , noHazard
     , rendered
     , renderedForeign
+    , labelOf
+    , labelText
+    , quotedLabelOf
+    , piecesShown
     , describeText
     , refusedFor
     , migratedReviewAt
@@ -75,12 +91,15 @@ module TestSupport exposing
     , carriesFailure
     , carriesNoFailure
     , uid
+    , uidHex
     , resyncBoundOf
     , testKeyHex
     , testMacKey
     , testReviewKey
     , RawRow
+    , RawName(..)
     , rawRow
+    , rawMacInput
     , appendSigned
     , appendSignedAs
     , appendSignedClaiming
@@ -100,6 +119,8 @@ module TestSupport exposing
     , rawKeyCheckFor
     , isRefusal
     , refusedWith
+    , openFileAt
+    , record
     )
 
 import Ipe.ByteSize as ByteSize
@@ -108,6 +129,7 @@ import Ipe.Char as Char
 import Ipe.Crypto as Crypto
 import Ipe.Db as Db
 import Ipe.Db.Decode
+import Ipe.Db.Location as Location exposing (Mode(..))
 import Ipe.Db.Sql as Sql
 import Ipe.Dict as Dict
 import Ipe.Error as Error
@@ -125,16 +147,20 @@ import Ipe.Task as Task
 import Ipe.Time.Timestamp as Timestamp
 import Lib.Db as LibDb exposing (Decision(..), HistoryCursor(..))
 import Lib.Epoch as Epoch
+import Lib.Failure as Failure exposing (DecideRefusal(..), RefuseFailure(..))
 import Lib.Format as Format
 import Lib.Highlight as Highlight exposing (Lang(..), Token(..))
+import Lib.History as History exposing (HistoryState(..))
 import Lib.Index as Index exposing (Change(..), Oversize(..), SourceView(..), StaleReason(..), Written(..))
 import Lib.Keys as Keys exposing (KeyAction(..))
+import Lib.Label as Label exposing (Label, LabelPart(..), LabelPiece(..))
 import Lib.Links as Links exposing (Link(..))
 import Lib.PageSize as PageSize
-import Lib.Queue as Queue exposing (HistoryState(..), QueueState(..), UnitPageState(..))
+import Lib.Queue as Queue exposing (QueueState(..), UnitPageState(..))
 import Lib.RepoPath as RepoPath exposing (PathError(..), Root, RootMap)
 import Lib.ReviewKey as ReviewKey exposing (ReviewKey(..))
 import Lib.SafeText as SafeText
+import Lib.Session as Session exposing (Effect, Model, Msg)
 import Lib.Settings as Settings
 import Lib.Uid as Uid exposing (Uid)
 
@@ -163,6 +189,40 @@ uid label =
 
         Err _ ->
             uid ""
+
+
+-- A unit id's hex, for a test's fixture text and messages. `Lib.Uid` has
+-- no text exit, so this reads the text back from its SQL bind form; the
+-- source scans cover `src/Lib` only, which keeps the helper out of the app.
+uidHex : Uid -> String
+uidHex id =
+    case Uid.toSql id of
+        SqlString hex ->
+            hex
+
+        SqlInt _ ->
+            ""
+
+        SqlFloat _ ->
+            ""
+
+        SqlBool _ ->
+            ""
+
+        SqlBytes _ ->
+            ""
+
+        SqlTime _ ->
+            ""
+
+        SqlDecimal _ ->
+            ""
+
+        SqlMoney _ ->
+            ""
+
+        SqlNull _ ->
+            ""
 
 
 fixtureHex : String -> String
@@ -207,7 +267,12 @@ expectErr t =
 -- expects to be valid that `parseReason` refuses fails the run.
 refuse : String -> Task.Task Error Decision
 refuse text =
-    Task.fromResult (Result.map Refused (LibDb.parseReason text))
+    case LibDb.parseReason text of
+        Ok reason ->
+            Task.succeed (Refused reason)
+
+        Err refused ->
+            Task.fail (Error.invalidInput (Failure.refuseFailureText (DraftRefused refused)))
 
 
 seedIndex : String -> String -> Task.Task Error ()
@@ -271,7 +336,7 @@ viewTag view =
             "unverifiable"
 
         Unreadable failure ->
-            "unreadable: " ++ SafeText.toString (Index.readFailureText failure)
+            "unreadable: " ++ piecesShown (Index.readFailureText failure)
 
         TooLarge (SpanLines o) ->
             "too large lines " ++ String.fromInt o.lines
@@ -346,7 +411,7 @@ unitViewTag unit units =
 execIndex : String -> String -> List SqlValue -> Task.Task Error ()
 execIndex indexDb sql params =
     do
-        conn <- Db.open "sqlite" ("sqlite://" ++ indexDb ++ "?mode=rw")
+        conn <- openFileAt WriteExisting indexDb
         Db.exec conn sql params
         Task.succeed ()
 
@@ -357,7 +422,7 @@ execIndex indexDb sql params =
 execIndexUnchecked : String -> String -> List SqlValue -> Task.Task Error ()
 execIndexUnchecked indexDb sql params =
     do
-        conn <- Db.open "sqlite" ("sqlite://" ++ indexDb ++ "?mode=rw")
+        conn <- openFileAt WriteExisting indexDb
         Db.withTransaction conn
             (\tx ->
                 do
@@ -403,12 +468,57 @@ onFreshReview name f =
 onReviewAt : String -> (Db -> Task.Task Error Bool) -> Task.Task Error Bool
 onReviewAt reviewDb f =
     do
-        db <- migratedReviewAt reviewDb
-        ok <- f db
+        loc <- Settings.parseReviewDb reviewDb
+        key <- testReviewKey
+        LibDb.probe key loc
+        ok <- withReviewDb loc f
         removeFileIfAny reviewDb
         removeFileIfAny (reviewDb ++ "-wal")
         removeFileIfAny (reviewDb ++ "-shm")
         Task.succeed ok
+
+
+-- The review database at `loc` handed to `body`, and closed once `body`
+-- settles, on success and on failure alike; `body`'s result or error is then
+-- passed on unchanged.
+withReviewDb : Settings.ReviewFile -> (Db -> Task.Task Error a) -> Task.Task Error a
+withReviewDb loc body =
+    bracketDb (LibDb.openAt loc) body
+
+
+-- The database `open` yields handed to `body`, then closed whichever way
+-- `body` settles: the outcome is held as a `Result` across the one close, so
+-- the success and the failure path share it. A test that opens through here
+-- leaves no pool open on its file, so it never deletes the file under a live
+-- pool, nor reads through a pool opened before another one changed the file.
+bracketDb : Task.Task Error Db -> (Db -> Task.Task Error a) -> Task.Task Error a
+bracketDb open body =
+    open
+        |> Task.andThen
+            (\db ->
+                body db
+                    |> Task.map Ok
+                    |> Task.onError (\e -> Task.succeed (Err e))
+                    |> Task.andThen (\outcome -> Db.close db |> Task.andThen (\_ -> Task.fromResult outcome))
+            )
+
+
+-- `edits`, made outside the tool, run in order on one connection of `db`
+-- in one transaction, after a read of the schema table. A pooled connection
+-- keeps the schema it last read, and SQLite refuses a `CREATE TRIGGER` or a
+-- rename onto a name that stale schema still holds without reading it
+-- again, so an edit run on whichever connection the pool hands out passes or
+-- fails by which one it got. The read loads the file's schema as it stands,
+-- and the transaction holds every edit on that connection.
+applyEdits : Db -> List String -> Task.Task Error ()
+applyEdits db edits =
+    Db.withTransaction db
+        (\tx ->
+            do
+                Db.queryDecode tx "SELECT COUNT(*) AS total FROM sqlite_master" [] totalDecoder
+                Task.sequence (List.map (\sql -> Db.exec tx sql []) edits)
+                Task.succeed ()
+        )
 
 
 -- One named check. A check whose task fails is reported by name with its
@@ -463,7 +573,7 @@ execIndexSchema conn statements =
 
 seedIndexDb : String -> Task.Task Error ()
 seedIndexDb indexDb =
-    Db.open "sqlite" ("sqlite://" ++ indexDb ++ "?mode=rwc")
+    openFileAt CreateIfMissing indexDb
         |> Task.andThen
             (\conn ->
                 System.cwd ()
@@ -476,6 +586,13 @@ seedIndexDb indexDb =
 
 insertUnitRows : Db -> Task.Task Error Int
 insertUnitRows conn =
+    Db.exec conn "INSERT INTO repos (tag, outer, prefix) VALUES ('ipe', NULL, NULL)" []
+        |> Task.andThen (\_ -> insertUnits conn)
+
+
+-- The two fixture units, both under the `ipe` repository, and their queue rows.
+insertUnits : Db -> Task.Task Error Int
+insertUnits conn =
     Db.exec conn
         "INSERT INTO units (uid, path, kind, name, qualified, line_start, line_end, facing, purpose, body_hash, updated_sha) VALUES (?,?,?,?,?,?,?,?,?,?,?)"
         [ Uid.toSql (uid "u-a")
@@ -527,6 +644,31 @@ insertUnitRows conn =
             )
 
 
+-- One open unit under the unbound tag `ext`.
+insertUnboundUnit : String -> Task.Task Error ()
+insertUnboundUnit indexDb =
+    execIndex indexDb
+        "INSERT INTO units (uid, path, kind, name, qualified, line_start, line_end, facing, purpose, body_hash, updated_sha) VALUES (?,?,?,?,?,?,?,?,?,?,?)"
+        [ Uid.toSql (uid "u-ext")
+        , SqlString "ext:src/Lib.rs"
+        , SqlString "fn"
+        , SqlString "answer"
+        , SqlString "Ext.answer"
+        , SqlInt 3
+        , SqlInt 6
+        , SqlString "internal"
+        , SqlNull (SqlString "")
+        , SqlString (Index.attest viewA)
+        , SqlString "shaE"
+        ]
+        |> Task.andThen
+            (\_ ->
+                execIndex indexDb
+                    "INSERT INTO change_queue VALUES (?,?,?,?,?,?)"
+                    [ Uid.toSql (uid "u-ext"), SqlString "new", SqlNull (SqlString ""), SqlString (Index.attest viewA), SqlString "shaE", SqlInt 4 ]
+            )
+
+
 -- The settings a server resolves once at startup, here parsed from the
 -- current `IPE_INDEX_*` environment the way `main` reads and parses it. A test
 -- that calls a request-time function resolves them once and passes them in;
@@ -536,14 +678,26 @@ envSettings =
     do
         rawDb <- System.getenv "IPE_INDEX_DB"
         rawRoot <- System.getenv "IPE_INDEX_ROOT"
-        Settings.parseIndexSettings rawDb rawRoot
+        rawRepos <- optionalEnv "IPE_INDEX_REPOS"
+        Settings.parseIndexSettings rawDb rawRoot rawRepos
 
 
 -- The review store location a server resolves once at startup, here parsed
 -- from the current `IPE_REVIEW_DB` the way `main` reads and parses it.
-envReview : Task.Task Error Settings.DbLocation
+envReview : Task.Task Error Settings.ReviewFile
 envReview =
-    Settings.parseReviewDb (System.getenvOr "IPE_REVIEW_DB" "review.db")
+    optionalEnv "IPE_REVIEW_DB"
+        |> Task.andThen (Settings.valueOr "IPE_REVIEW_DB" "review.db")
+        |> Task.andThen Settings.parseReviewDb
+
+
+-- An optional variable read the way `main` reads one: unset, set, or set
+-- but unreadable, never folded into one another.
+optionalEnv : String -> Task.Task Error Settings.EnvValue
+optionalEnv key =
+    Task.onError
+        (\e -> Task.succeed (Settings.envFailure e))
+        (System.getenv key |> Task.map Settings.EnvSet)
 
 
 -- Every setting a server resolves once at startup, from the current
@@ -565,9 +719,9 @@ loadPageNow cursor =
     envAppSettings |> Task.andThen (\settings -> Queue.loadPage settings cursor)
 
 
-loadHistoryPageNow : LibDb.HistoryCursor -> Task.Task Error Queue.HistoryPage
+loadHistoryPageNow : LibDb.HistoryCursor -> Task.Task Error History.HistoryPage
 loadHistoryPageNow cursor =
-    envAppSettings |> Task.andThen (\settings -> Queue.loadHistoryPage settings cursor)
+    envAppSettings |> Task.andThen (\settings -> History.loadHistoryPage settings cursor)
 
 
 drainThenLoadNow : Index.Attested -> Index.Written -> Index.Cursor -> Task.Task Error Queue.QueuePage
@@ -580,14 +734,102 @@ loadUnitViewNow unit =
     envSettings |> Task.andThen (\settings -> Queue.loadUnitView settings unit)
 
 
-decideShownNow : Db -> Index.ShownSource -> LibDb.Decision -> Task.Task Error ( Index.Attested, Index.Written )
+-- `Queue.decide` on `shown` under the environment's signing key; a server
+-- with no signing key fails the run, since it decides nothing.
+decideShownNow : Db -> Index.ShownSource -> LibDb.Decision -> Task.Task Error (Result DecideRefusal ( Index.Attested, Index.Written ))
 decideShownNow db shown decision =
-    envAppSettings |> Task.andThen (\settings -> Queue.decide settings.key settings.index db shown decision)
+    envAppSettings
+        |> Task.andThen
+            (\settings ->
+                case settings.key of
+                    Signing macKey ->
+                        Queue.decide macKey settings.index db shown decision
+
+                    ReadOnly ->
+                        Task.fail (Error.conflict "the test environment has no signing key")
+            )
 
 
+-- `Queue.decideRefusal` approving refusal `label`, bound to `digest`, under
+-- the environment's signing key; a server with no signing key fails the
+-- run, since it acknowledges nothing.
+decidedRefusalNow : Db -> String -> Index.RefusalDigest -> Task.Task Error (Result DecideRefusal ( Index.Attested, Index.Written ))
+decidedRefusalNow db label digest =
+    envAppSettings
+        |> Task.andThen
+            (\settings ->
+                case settings.key of
+                    Signing macKey ->
+                        Queue.decideRefusal macKey settings.index db (uid label) digest Approved
+
+                    ReadOnly ->
+                        Task.fail (Error.conflict "the test environment has no signing key")
+            )
+
+
+-- `task`'s value when it is not refused; a refusal fails the run, naming
+-- `what`.
+accepted : String -> Task.Task Error (Result DecideRefusal a) -> Task.Task Error a
+accepted what task =
+    task
+        |> Task.andThen
+            (\result ->
+                case result of
+                    Ok value ->
+                        Task.succeed value
+
+                    Err _ ->
+                        Task.fail (Error.conflict (what ++ " was refused"))
+            )
+
+
+-- The refusal `result` carries, if any.
+refusalOf : Result DecideRefusal a -> Maybe DecideRefusal
+refusalOf result =
+    case result of
+        Ok _ ->
+            Nothing
+
+        Err refusal ->
+            Just refusal
+
+
+-- True when `task` succeeds with exactly the refusal `expected`; a failure
+-- or an accepted value is False.
+refusedAs : DecideRefusal -> Task.Task Error (Result DecideRefusal a) -> Task.Task Error Bool
+refusedAs expected task =
+    task
+        |> Task.map (\result -> refusalOf result == Just expected)
+        |> Task.onError (\_ -> Task.succeed False)
+
+
+-- A drain made the one way the app makes it: through `Queue.drainDecision`,
+-- which looks the attested pair up in the review log under the environment's
+-- key and writes only a verified row's pair.
 drainUnitNow : Index.Attested -> Index.Written -> Task.Task Error Int
 drainUnitNow attested written =
-    envSettings |> Task.andThen (\settings -> Index.drainUnit settings attested written)
+    envAppSettings |> Task.andThen (\settings -> Queue.drainDecision settings attested written)
+
+
+-- The `Attested` proof for fixture unit `unit` in the current scratch index,
+-- built the one way the app builds it: the unit is loaded and its shown
+-- source re-verified by `Index.reverify`. A unit that is not shown fails the
+-- run.
+attestedNow : Uid -> Task.Task Error Index.Attested
+attestedNow unit =
+    loadUnitNow unit |> Task.andThen (reverifyShown unit)
+
+
+-- `LibDb.proveCopy` run over the current scratch: the review log's verdict
+-- under the environment's key, against the index snapshot read at `cursor`.
+proveCopyNow : Db.Db -> Index.Cursor -> Task.Task Error (Result LibDb.CopyFault LibDb.ProvenCopy)
+proveCopyNow db cursor =
+    do
+        settings <- envAppSettings
+        state <- LibDb.logVerdict settings.key db
+        conn <- Index.readConnection settings.index
+        snap <- Index.readSnapshot settings.key settings.index.roots conn cursor
+        Task.succeed (LibDb.proveCopy state snap)
 
 
 resyncReviewedNow : Db -> Task.Task Error Int
@@ -604,6 +846,7 @@ setIndexEnv : String -> String -> Task.Task Error ()
 setIndexEnv indexDb repo =
     System.setenv "IPE_INDEX_DB" indexDb
         |> Task.andThen (\_ -> System.setenv "IPE_INDEX_ROOT" repo)
+        |> Task.andThen (\_ -> System.unsetenv "IPE_INDEX_REPOS")
 
 
 -- One first-page unit with the change the index recorded for its current
@@ -624,7 +867,7 @@ loadFirstPage =
     do
         settings <- envSettings
         conn <- Index.readConnection settings
-        snap <- Index.readSnapshot ReadOnly conn Index.Start
+        snap <- Index.readSnapshot ReadOnly settings.roots conn Index.Start
         entries <- Task.sequence (List.map (pageEntry conn settings.roots) snap.rows)
         Task.succeed { units = entries, total = snap.open }
 
@@ -645,7 +888,7 @@ pageEntry conn roots row =
                         Task.succeed { uid = unit, unit = loaded.unit, change = row.change, view = loaded.view }
 
                     Nothing ->
-                        Task.fail (Error.conflict ("queued unit " ++ Uid.toString unit ++ " has no view"))
+                        Task.fail (Error.conflict ("queued unit " ++ uidHex unit ++ " has no view"))
             )
 
 
@@ -669,6 +912,12 @@ loadUnitNow unit =
 -- the run.
 decideNow : Db -> Uid -> LibDb.Decision -> Task.Task Error ( Index.Attested, Index.Written )
 decideNow db unit decision =
+    accepted ("the decision on " ++ uidHex unit) (decidedNow db unit decision)
+
+
+-- `decideNow`'s result with a refusal kept as a value.
+decidedNow : Db -> Uid -> LibDb.Decision -> Task.Task Error (Result DecideRefusal ( Index.Attested, Index.Written ))
+decidedNow db unit decision =
     loadUnitNow unit
         |> Task.andThen
             (\found ->
@@ -677,7 +926,7 @@ decideNow db unit decision =
                         decideShownNow db shown decision
 
                     Nothing ->
-                        Task.fail (Error.conflict ("unit " ++ Uid.toString unit ++ " is not shown"))
+                        Task.fail (Error.conflict ("unit " ++ uidHex unit ++ " is not shown"))
             )
 
 
@@ -754,7 +1003,7 @@ modifiedFrom change =
 mirroredCount : String -> Task.Task Error Int
 mirroredCount indexDb =
     do
-        conn <- Db.open "sqlite" ("sqlite://" ++ indexDb ++ "?mode=ro")
+        conn <- openFileAt ReadExisting indexDb
         rows <- Db.queryDecode conn "SELECT COUNT(*) AS total FROM reviewed" [] totalDecoder
         case rows of
             [ n ] ->
@@ -773,7 +1022,7 @@ totalDecoder =
 -- The head stamped on the index's `reviewed` copy, Nothing when unstamped.
 stampOf : String -> Task.Task Error (Maybe String)
 stampOf indexDb =
-    Db.open "sqlite" ("sqlite://" ++ indexDb ++ "?mode=ro")
+    openFileAt ReadExisting indexDb
         |> Task.andThen Index.readStamp
 
 
@@ -868,12 +1117,46 @@ type alias RawRow =
     , decision : String
     , reason : Maybe String
     , reviewedAt : Int
+    , name : RawName
     }
 
 
+-- The name of a row's subject as its four name columns hold it: a unit's
+-- kind, qualified name, path and line, or a file's path alone.
+type RawName
+    = RawUnit { kind : String, qualified : String, path : String, line : Int }
+    | RawFile String
+
+
+-- A row naming the fixture unit `Lib.answer`; a test that needs another
+-- name sets `name`.
 rawRow : String -> String -> String -> Maybe String -> RawRow
 rawRow label bodyHash decision reason =
-    { uid = uid label, bodyHash = bodyHash, decision = decision, reason = reason, reviewedAt = 0 }
+    { uid = uid label, bodyHash = bodyHash, decision = decision, reason = reason, reviewedAt = 0, name = RawUnit { kind = "fn", qualified = "Lib.answer", path = "ipe:src/Lib.rs", line = 3 } }
+
+
+-- A row's name columns as bound parameters, in the order
+-- `unit_kind, unit_qualified, unit_path, unit_line`.
+rawNameValues : RawName -> List SqlValue
+rawNameValues name =
+    case name of
+        RawUnit parts ->
+            [ SqlString parts.kind, SqlString parts.qualified, SqlString parts.path, SqlInt parts.line ]
+
+        RawFile path ->
+            [ SqlNull (SqlString ""), SqlNull (SqlString ""), SqlString path, SqlNull (SqlInt 0) ]
+
+
+-- The name fields the mac covers after the row's own, spelled
+-- independently of the tool.
+rawNameFields : RawName -> List String
+rawNameFields name =
+    case name of
+        RawUnit parts ->
+            [ "unit", parts.kind, parts.qualified, parts.path, String.fromInt parts.line ]
+
+        RawFile path ->
+            [ "file", path ]
 
 
 -- The head row read as raw columns.
@@ -957,8 +1240,8 @@ appendSignedWithUidText db uidText row =
         head <- rawHead db
         mac <- Task.succeed (rawMac (rawMacInputWith head.logId (head.seq + 1) head.head uidText row))
         Db.exec db
-            "INSERT INTO review_log (seq, uid, body_hash, decision, reason, reviewed_at, prev, mac) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
-            [ SqlInt (head.seq + 1), SqlString uidText, SqlString row.bodyHash, SqlString row.decision, rawReason row.reason, SqlInt row.reviewedAt, SqlString head.head, SqlString mac ]
+            "INSERT INTO review_log (seq, uid, body_hash, decision, reason, reviewed_at, prev, mac, unit_kind, unit_qualified, unit_path, unit_line) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+            ([ SqlInt (head.seq + 1), SqlString uidText, SqlString row.bodyHash, SqlString row.decision, rawReason row.reason, SqlInt row.reviewedAt, SqlString head.head, SqlString mac ] ++ rawNameValues row.name)
         Db.exec db "UPDATE review_log_head SET seq = ?, head = ? WHERE one = 1" [ SqlInt (head.seq + 1), SqlString mac ]
 
 
@@ -979,8 +1262,8 @@ appendClaimedAt db logId claimed head row =
 insertClaimed : Db -> String -> RawHead -> RawHead -> RawRow -> Task.Task Error Int
 insertClaimed db logId claimed head row =
     Db.exec db
-        "INSERT INTO review_log (seq, uid, body_hash, decision, reason, reviewed_at, prev, mac) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
-        [ SqlInt (head.seq + 1), Uid.toSql row.uid, SqlString row.bodyHash, SqlString row.decision, rawReason row.reason, SqlInt row.reviewedAt, SqlString head.head, SqlString (claimedMac logId claimed row) ]
+        "INSERT INTO review_log (seq, uid, body_hash, decision, reason, reviewed_at, prev, mac, unit_kind, unit_qualified, unit_path, unit_line) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+        ([ SqlInt (head.seq + 1), Uid.toSql row.uid, SqlString row.bodyHash, SqlString row.decision, rawReason row.reason, SqlInt row.reviewedAt, SqlString head.head, SqlString (claimedMac logId claimed row) ] ++ rawNameValues row.name)
 
 
 claimedMac : String -> RawHead -> RawRow -> String
@@ -1024,10 +1307,10 @@ rawReason reason =
 
 -- The review-row mac input of the log format, spelled independently of the
 -- tool: each field length-prefixed in order, the reason marked present or
--- absent.
+-- absent, then the row's name.
 rawMacInput : String -> Int -> String -> RawRow -> String
 rawMacInput logId seq prev row =
-    rawMacInputWith logId seq prev (Uid.toString row.uid) row
+    rawMacInputWith logId seq prev (uidHex row.uid) row
 
 
 -- `rawMacInput` with `uidText` as the uid field.
@@ -1042,7 +1325,7 @@ rawMacInputWith logId seq prev uidText row =
                 Nothing ->
                     "-"
     in
-    [ "ipe-code-review/review-row/v1", logId, String.fromInt seq, prev, uidText, row.bodyHash, row.decision, reasonPart, String.fromInt row.reviewedAt ]
+    ([ "ipe-code-review/review-row/v2", logId, String.fromInt seq, prev, uidText, row.bodyHash, row.decision, reasonPart, String.fromInt row.reviewedAt ] ++ rawNameFields row.name)
         |> List.map (\part -> String.fromInt (String.length part) ++ ":" ++ part)
         |> String.concat
 
@@ -1086,31 +1369,18 @@ isUnitA entry =
         u =
             entry.unit
     in
-    u.uid
-        == uid "u-a"
+    u.uid == uid "u-a"
         && isNew entry.change
-        && SafeText.toString u.path
-        == "ipe:src/Lib.rs"
-        && SafeText.toString u.name
-        == "answer"
-        && SafeText.toString u.qualified
-        == "Lib.answer"
-        && SafeText.toString u.kind
-        == "fn"
-        && u.lineStart
-        == 3
-        && u.lineEnd
-        == 6
-        && SafeText.toString u.facing
-        == "internal"
-        && Maybe.map SafeText.toString u.purpose
-        == Just "purpose-A"
-        && Index.storedHash u.attested
-        == Index.attest viewA
-        && u.updatedSha
-        == "shaA"
-        && shownTextOf entry.view
-        == Just viewA
+        && labelText u.path == "ipe:src/Lib.rs"
+        && labelText u.name == "answer"
+        && labelText u.qualified == "Lib.answer"
+        && labelText u.kind == "fn"
+        && u.lineStart == 3
+        && u.lineEnd == 6
+        && labelText u.facing == "internal"
+        && Maybe.map labelText u.purpose == Just "purpose-A"
+        && Index.storedHash u.attested == Index.attest viewA
+        && shownTextOf entry.view == Just viewA
 
 
 isUnitB : PageEntry -> Bool
@@ -1119,20 +1389,13 @@ isUnitB entry =
         u =
             entry.unit
     in
-    u.uid
-        == uid "u-b"
-        && modifiedFrom entry.change
-        == Just "oldB"
-        && SafeText.toString u.path
-        == "ipe:src/Main.ipe"
-        && SafeText.toString u.kind
-        == "module"
-        && SafeText.toString u.facing
-        == "user"
-        && Maybe.map SafeText.toString u.purpose
-        == Nothing
-        && shownTextOf entry.view
-        == Just viewB
+    u.uid == uid "u-b"
+        && modifiedFrom entry.change == Just "oldB"
+        && labelText u.path == "ipe:src/Main.ipe"
+        && labelText u.kind == "module"
+        && labelText u.facing == "user"
+        && Maybe.map labelText u.purpose == Nothing
+        && shownTextOf entry.view == Just viewB
 
 
 cleanupIndex : String -> String -> Task.Task Error ()
@@ -1176,9 +1439,57 @@ renderedForeign raw =
     SafeText.toString (SafeText.renderForeign raw)
 
 
+-- Text the app holds whole, parsed as an index column of a unit's label.
+labelOf : String -> Label
+labelOf raw =
+    Label.fromText Label.labelCap raw
+
+
+-- A label's parts joined as the page draws them, its marker included.
+labelText : Label -> String
+labelText shown =
+    String.concat (List.map labelPartText (Label.parts shown))
+
+
+labelPartText : LabelPart -> String
+labelPartText part =
+    case part of
+        LabelText s ->
+            s
+
+        LabelEscapes s ->
+            s
+
+        LabelCut dropped hash ->
+            Label.markerText dropped hash
+
+
+-- Text the app holds whole, parsed as a stored path a refusal quotes.
+quotedLabelOf : String -> Label
+quotedLabelOf raw =
+    Label.fromQuotedText Label.labelCap raw
+
+
+-- A line's pieces joined as the page draws them: each label as `labelText`
+-- joins it, the tool's text flattened.
+piecesShown : List LabelPiece -> String
+piecesShown pieces =
+    String.concat (List.map pieceShown pieces)
+
+
+pieceShown : LabelPiece -> String
+pieceShown piece =
+    case piece of
+        IndexedLabel label ->
+            labelText label
+
+        ToolText text ->
+            SafeText.toString text
+
+
 describeText : PathError -> String
 describeText err =
-    SafeText.toString (RepoPath.describe err)
+    piecesShown (RepoPath.describe err)
 
 
 -- A parse that failed, and failed for `reason` rather than an unrelated one.
@@ -1197,7 +1508,7 @@ refusedFor reason refusal =
 migratedReviewAt : String -> Task.Task Error Db
 migratedReviewAt path =
     do
-        loc <- Settings.parseDbLocation "IPE_REVIEW_DB" path
+        loc <- Settings.parseReviewDb path
         key <- testReviewKey
         LibDb.probe key loc
         LibDb.openAt loc
@@ -1253,27 +1564,36 @@ reverifyShown unit found =
         Just loaded ->
             case loaded.view of
                 Shown shown ->
-                    envSettings |> Task.andThen (\settings -> Index.reverify settings shown)
+                    envSettings |> Task.andThen (\settings -> accepted ("fixture unit " ++ uidHex unit) (Index.reverify settings shown))
 
                 Stale _ ->
-                    Task.fail (Error.conflict ("fixture unit " ++ Uid.toString unit ++ " is stale"))
+                    Task.fail (Error.conflict ("fixture unit " ++ uidHex unit ++ " is stale"))
 
                 Unreadable _ ->
-                    Task.fail (Error.conflict ("fixture unit " ++ Uid.toString unit ++ " is unreadable"))
+                    Task.fail (Error.conflict ("fixture unit " ++ uidHex unit ++ " is unreadable"))
 
                 TooLarge _ ->
-                    Task.fail (Error.conflict ("fixture unit " ++ Uid.toString unit ++ " is too large"))
+                    Task.fail (Error.conflict ("fixture unit " ++ uidHex unit ++ " is too large"))
 
         Nothing ->
-            Task.fail (Error.conflict ("fixture unit " ++ Uid.toString unit ++ " is not in the index"))
+            Task.fail (Error.conflict ("fixture unit " ++ uidHex unit ++ " is not in the index"))
 
 
--- A test file path opened read-only through the app's read URL builder, so
--- every write on it fails without a key conflict.
+-- A test file path opened read-only through the location the app builds
+-- for the index, so every write on it fails without a key conflict.
 openReadOnlyAt : String -> Task.Task Error Db
 openReadOnlyAt path =
-    Settings.parseDbLocation "IPE_INDEX_DB" path
-        |> Task.andThen (\loc -> Db.open "sqlite" (Settings.indexReadUrl loc))
+    Settings.parseIndexDb path
+        |> Task.andThen (\loc -> Db.open loc.read)
+
+
+-- A test fixture's database file opened in `mode`.
+openFileAt : Mode -> String -> Task.Task Error Db
+openFileAt mode file =
+    Path.fromString file
+        |> Result.andThen (Location.file mode)
+        |> Task.fromResult
+        |> Task.andThen Db.open
 
 
 -- The vectors file beside this package: `tools/ipe-index/tests`, reached from
@@ -1389,3 +1709,26 @@ maybeContains needle message =
 
         Nothing ->
             False
+
+
+-- `model` stepped through `Session.step` by each of `msgs` in turn, with
+-- the effects each step returned, one list per message in message order.
+-- Every task a step asks for is one of those effects, so a step that
+-- starts nothing is one whose list is `[]`, read off the value rather
+-- than inferred from the slots it leaves.
+record : Settings.AppSettings -> List Msg -> Model -> ( Model, List (List Effect) )
+record settings msgs model =
+    let
+        ( final, steps ) =
+            List.foldl
+                (\msg ( current, done ) ->
+                    let
+                        ( next, effects ) =
+                            Session.step settings msg current
+                    in
+                    ( next, effects :: done )
+                )
+                ( model, [] )
+                msgs
+    in
+    ( final, List.reverse steps )

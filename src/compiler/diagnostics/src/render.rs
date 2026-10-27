@@ -32,13 +32,14 @@ use core::fmt::Write as _;
 use crate::code::{Severity, issue_tracker_url, title};
 use crate::diagnostic::{
     AppShape, Applicability, CaseDefect, CodecAutoRejection, ConsentError, Diagnostic, Expected,
-    ExpectedSet, ExposingDefect, Feature, FfiError, GenericAppEntryReach, HeaderDefect, HelpLine,
-    Hint, IfDefect, ImportedAs, LetDefect, LowerError, NameError, ParseError, RoutePatternDefect,
-    SandboxError, SealRejection, SpanRole, StoreEqAccessorDefect, StoreSelectProjectionDefect,
-    Suggestion, TokenKind, TyDoc, TypeDeclDefect, TypeError, WildcardDependence,
-    intercept_context_phrase,
+    ExpectedSet, ExposingDefect, Feature, FfiError, GenericAppEntryReach, HazardRefusal,
+    HeaderDefect, HelpLine, Hint, IfDefect, ImportedAs, LetDefect, LowerError, MountPrefixFault,
+    NameError, ParseError, RoutePatternDefect, SandboxError, SealRejection, SpanRole,
+    StoreEqAccessorDefect, StoreSelectProjectionDefect, Suggestion, TokenKind, TyDoc,
+    TypeDeclDefect, TypeError, TypeSizeOrigin, WildcardDependence, intercept_context_phrase,
 };
 use crate::span::Span;
+use crate::terminal::BIDI_ISOLATE_CLOSER;
 
 // ANSI escape sequences. Colour only ever *wraps* text, so stripping these
 // yields byte-identical output to the plain (non-tty / `NO_COLOR`) path.
@@ -263,6 +264,28 @@ fn prose_band(d: &Diagnostic) -> String {
                  Check your connection and try again. Run `{DOC_HINT_CMD} IPE-E0001` for more help."
             )
         }
+        Diagnostic::TargetDirUnlinkable { detail } => {
+            format!(
+                "The compiler stopped before building your program: the host linker cannot \
+                 open a directory the build would use. This is a problem with where the project \
+                 or the toolchain lives on your machine — not a mistake in your code.\n\
+                 \n\
+                 {detail}\n\
+                 \n\
+                 Run `{DOC_HINT_CMD} IPE-E0002` for more help."
+            )
+        }
+        Diagnostic::HostLinkerCannotOpenInput { detail } => {
+            format!(
+                "The host linker could not open one of its input files while building your \
+                 program. This is a problem with where the build lives on your machine — not a \
+                 mistake in your code.\n\
+                 \n\
+                 {detail}\n\
+                 \n\
+                 Run `{DOC_HINT_CMD} IPE-E0003` for more help."
+            )
+        }
     }
 }
 
@@ -346,30 +369,6 @@ fn parse_prose(msg: &ParseError) -> String {
         ParseError::NestingTooDeep { .. } | ParseError::TooDeep => {
             "This expression nests deeper than I can follow.".to_string()
         }
-        ParseError::UnknownChar(c) => {
-            format!("I don't recognise the character {} here.", char_repr(*c))
-        }
-        ParseError::StrayDot | ParseError::SpaceBeforeDot => {
-            "This `.` isn't attached to anything I can read as a field access.".to_string()
-        }
-        ParseError::NumberJoinedToName(_) => {
-            "This number runs straight into a name, so I can't tell where one ends and the \
-             other begins."
-                .to_string()
-        }
-        ParseError::IntLiteralOutOfRange => {
-            "This whole number does not fit in Ipê's `Int`.".to_string()
-        }
-        ParseError::FloatLiteralOutOfRange => {
-            "This number is too large for Ipê's `Float` to hold.".to_string()
-        }
-        ParseError::UnterminatedString => {
-            "This string opens with a `\"` but never closes.".to_string()
-        }
-        ParseError::MalformedChar => "I can't read this as a character literal.".to_string(),
-        ParseError::UnterminatedBlockComment => {
-            "This block comment opens with `{-` but never closes.".to_string()
-        }
         ParseError::MalformedModuleHeader(_) => {
             "I couldn't read the module header at the top of this file.".to_string()
         }
@@ -422,13 +421,139 @@ fn parse_prose(msg: &ParseError) -> String {
                  one declared type."
             )
         }
+        ParseError::UnknownChar(_)
+        | ParseError::StrayDot
+        | ParseError::SpaceBeforeDot
+        | ParseError::NumberJoinedToName(_)
+        | ParseError::IntLiteralOutOfRange
+        | ParseError::FloatLiteralOutOfRange
+        | ParseError::UnterminatedString
+        | ParseError::MalformedChar
+        | ParseError::UnterminatedBlockComment
+        | ParseError::SourceTooLarge { .. }
+        | ParseError::LoneCarriageReturn
+        | ParseError::SourceDisplayHazard { .. }
+        | ParseError::SourceTerminalControl { .. } => lexical_prose(msg),
+        ParseError::Unexpected => "I couldn't make sense of this part of the file.".to_string(),
+    }
+}
+
+/// The prose band for a source display hazard: what the character does, and why here.
+fn display_hazard_prose(ch: char, refusal: HazardRefusal) -> String {
+    let ch = char_repr(ch);
+    let closer = char_repr(BIDI_ISOLATE_CLOSER);
+    match refusal {
+        HazardRefusal::Anywhere => format!(
+            "The invisible character {ch} makes a viewer break the line or reorder the text \
+             around it, and I do not, so this file would read differently to you and to me. \
+             It is refused anywhere in a source file."
+        ),
+        HazardRefusal::OutsideLiteral => format!(
+            "The invisible character {ch} makes a viewer break the line or reorder the text \
+             around it, and I do not, so this file would read differently to you and to me. \
+             Only a string or character literal may hold it."
+        ),
+        HazardRefusal::UnclosedIsolate => format!(
+            "The bidirectional isolate {ch} is not closed by {closer} before its literal or \
+             line ends, so a viewer would reorder the text that follows it."
+        ),
+        HazardRefusal::UnopenedIsolate => format!(
+            "This {ch} closes no bidirectional isolate opened before it in its literal and \
+             line, so a viewer would reorder the text around it."
+        ),
+    }
+}
+
+/// The prose band for a raw terminal control: what a terminal does with it, and the fix.
+fn terminal_control_prose(ch: char) -> String {
+    format!(
+        "The control character {} is one a terminal that shows this file may run as a \
+         command (controls such as escape move the cursor, erase a line or step back \
+         over text), so the file could show you other code than I read. It is refused \
+         anywhere in a source file, literals included; build it in a value with \
+         `Char.fromCode` instead.",
+        char_repr(ch)
+    )
+}
+
+/// The primary label for a source display hazard.
+fn display_hazard_label(ch: char, refusal: HazardRefusal) -> String {
+    let ch = char_repr(ch);
+    match refusal {
+        HazardRefusal::Anywhere => format!("{ch} is refused anywhere in source"),
+        HazardRefusal::OutsideLiteral => format!("{ch} may stand only inside a literal"),
+        HazardRefusal::UnclosedIsolate => {
+            format!("{ch} is never closed by {}", char_repr(BIDI_ISOLATE_CLOSER))
+        }
+        HazardRefusal::UnopenedIsolate => format!("this {ch} closes no isolate"),
+    }
+}
+
+/// The prose band for a defect the lexer raises while it reads the source bytes.
+fn lexical_prose(msg: &ParseError) -> String {
+    match msg {
+        ParseError::UnknownChar(c) => {
+            format!("I don't recognise the character {} here.", char_repr(*c))
+        }
+        ParseError::StrayDot | ParseError::SpaceBeforeDot => {
+            "This `.` isn't attached to anything I can read as a field access.".to_string()
+        }
+        ParseError::NumberJoinedToName(_) => {
+            "This number runs straight into a name, so I can't tell where one ends and the \
+             other begins."
+                .to_string()
+        }
+        ParseError::IntLiteralOutOfRange => {
+            "This whole number does not fit in Ipê's `Int`.".to_string()
+        }
+        ParseError::FloatLiteralOutOfRange => {
+            "This number is too large for Ipê's `Float` to hold.".to_string()
+        }
+        ParseError::UnterminatedString => {
+            "This string opens with a `\"` but never closes.".to_string()
+        }
+        ParseError::MalformedChar => "I can't read this as a character literal.".to_string(),
+        ParseError::UnterminatedBlockComment => {
+            "This block comment opens with `{-` but never closes.".to_string()
+        }
         ParseError::SourceTooLarge { bytes } => {
             format!(
                 "this source file is {bytes} bytes, larger than I can compile — a file \
                  must fit in a 32-bit byte offset (under 4 GiB)."
             )
         }
-        ParseError::Unexpected => "I couldn't make sense of this part of the file.".to_string(),
+        ParseError::LoneCarriageReturn => {
+            "This carriage return (`\\r`) is not followed by a newline (`\\n`). An editor \
+             starts a new line here and I do not, so the file would read differently \
+             to you and to me."
+                .to_string()
+        }
+        ParseError::SourceDisplayHazard { ch, refusal } => display_hazard_prose(*ch, *refusal),
+        ParseError::SourceTerminalControl { ch } => terminal_control_prose(*ch),
+        // A grammar defect: `parse_prose` answers each of these in its own arm.
+        ParseError::Unexpected
+        | ParseError::TooDeep
+        | ParseError::UnexpectedToken { .. }
+        | ParseError::UnexpectedEof { .. }
+        | ParseError::NestingTooDeep { .. }
+        | ParseError::MalformedModuleHeader(_)
+        | ParseError::MalformedExposingList(_)
+        | ParseError::MissingEquals { .. }
+        | ParseError::MalformedTypeDeclaration(_)
+        | ParseError::TypeArgsOnNonConstructor
+        | ParseError::ExpectedType
+        | ParseError::UnclosedDelimiter { .. }
+        | ParseError::MalformedCase(_)
+        | ParseError::MalformedLet(_)
+        | ParseError::MalformedIf(_)
+        | ParseError::InvalidPathLiteral { .. }
+        | ParseError::SteplessDo
+        | ParseError::DocOnUnexported { .. }
+        | ParseError::MissingDocString { .. }
+        | ParseError::AnnotationWithoutBinding { .. }
+        | ParseError::DuplicateAnnotation { .. } => {
+            "I couldn't make sense of this part of the file.".to_string()
+        }
     }
 }
 
@@ -461,7 +586,7 @@ fn name_prose(msg: &NameError) -> String {
         | NameError::DuplicateType { name, .. } => {
             format!("`{name}` is already defined, so I found two definitions with the same name.")
         }
-        NameError::AliasArity { name, .. } | NameError::BuiltinTypeArity { name, .. } => {
+        NameError::AliasArity { name, .. } | NameError::TypeArity { name, .. } => {
             format!("`{name}` is applied to the wrong number of type arguments.")
         }
         NameError::ModuleNotFound { name, .. } => {
@@ -703,6 +828,24 @@ fn type_prose(msg: &TypeError) -> String {
         TypeError::BudgetExceeded | TypeError::StepBudgetExceeded { .. } => {
             "Type checking this took longer than I'm allowed to spend on it.".to_string()
         }
+        TypeError::TypeTooDeep { depth, limit } => {
+            format!("The type of this value nests {depth} levels deep, past the limit of {limit}.")
+        }
+        TypeError::TypeTooLarge {
+            limit,
+            origin: TypeSizeOrigin::Value,
+        } => format!("The type of this value is built from more than {limit} parts."),
+        TypeError::TypeTooLarge {
+            limit,
+            origin: TypeSizeOrigin::Declaration,
+        } => format!(
+            "The type this constructor holds is built from more than {limit} parts, \
+             because its type refers to itself with larger arguments."
+        ),
+        TypeError::ExpansiveRecursion { union, param } => format!(
+            "The type `{union}` refers to itself with its parameter `{param}` wrapped in a \
+             larger type, so every level of it is a bigger type than the last."
+        ),
     }
 }
 
@@ -718,6 +861,9 @@ fn lower_prose(msg: &LowerError) -> String {
         }
         LowerError::BackendNestingTooDeep { .. } => {
             "This expression nests deeper than I can compile.".to_string()
+        }
+        LowerError::BackendTypeTooDeep { .. } => {
+            "A type here nests deeper than I can compile.".to_string()
         }
         LowerError::DecodeSucceedArityTooHigh { .. } => {
             "This decoder builds a value with more fields than I can wire up at once.".to_string()
@@ -854,8 +1000,22 @@ fn lower_prose(msg: &LowerError) -> String {
         }
         LowerError::UnsaturatedHandlerKernel { kernel } => {
             format!(
-                "`{kernel}` has to be called with all its arguments — you can't \
-                 store it under a name or pass it around before its handler is given."
+                "`{kernel}` has to be called with its handler — you can't store it \
+                 under a name or pass it around before its handler is given."
+            )
+        }
+        LowerError::ForeignTypeVariable { helper, owner, var } => {
+            format!(
+                "`{helper}` has no type annotation, and its type borrows the type \
+                 variable `{var}` of `{owner}`, which uses it. Give `{helper}` its own \
+                 signature."
+            )
+        }
+        LowerError::UninferableErasedParameter { callee, var } => {
+            format!(
+                "This call leaves the type variable `{var}` of `{callee}` open. No \
+                 argument `{callee}` is given fixes `{var}`, but its result still \
+                 uses it. Fix `{var}` with a concrete type at the call."
             )
         }
         LowerError::StoreSelectProjectionInvalid(defect) => match defect {
@@ -886,6 +1046,16 @@ fn lower_prose(msg: &LowerError) -> String {
                     "`Store.literal` must bind a String, Int, Bool, or Float value — \
                      `{ty}` is not a supported scalar type."
                 )
+            }
+            StoreSelectProjectionDefect::SelectArgNotProjection => {
+                "`Store.selectToList` / `Store.selectToMaybe` needs the \
+                 `Store.select` expression itself as its `Select` argument."
+                    .to_string()
+            }
+            StoreSelectProjectionDefect::SelectToNotSaturated => {
+                "`Store.selectToList` / `Store.selectToMaybe` must be called with \
+                 its `Db` and its `Store.select` expression at one call site."
+                    .to_string()
             }
         },
     }
@@ -1381,7 +1551,9 @@ fn primary_label(d: &Diagnostic) -> Option<String> {
         | Diagnostic::Ffi { .. }
         | Diagnostic::Sandbox { .. }
         | Diagnostic::Consent { .. }
-        | Diagnostic::RegistryUnreachable { .. } => None,
+        | Diagnostic::RegistryUnreachable { .. }
+        | Diagnostic::TargetDirUnlinkable { .. }
+        | Diagnostic::HostLinkerCannotOpenInput { .. } => None,
     }
 }
 
@@ -1450,6 +1622,16 @@ fn parse_label(msg: &ParseError) -> Option<String> {
             };
             Some(detail)
         }
+        ParseError::LoneCarriageReturn => {
+            Some("a `\\r` here must be followed by `\\n`".to_string())
+        }
+        ParseError::SourceDisplayHazard { ch, refusal } => {
+            Some(display_hazard_label(*ch, *refusal))
+        }
+        ParseError::SourceTerminalControl { ch } => Some(format!(
+            "{} is a terminal control, refused anywhere in source",
+            char_repr(*ch)
+        )),
         ParseError::AnnotationWithoutBinding { .. } => {
             Some("this annotation has no matching definition".to_string())
         }
@@ -1496,7 +1678,7 @@ fn name_label(msg: &NameError) -> Option<String> {
         } => Some(format!(
             "`{name}` takes {expected} type argument(s), but {found} were given"
         )),
-        NameError::BuiltinTypeArity {
+        NameError::TypeArity {
             name,
             expected,
             found,
@@ -1557,7 +1739,9 @@ fn name_label(msg: &NameError) -> Option<String> {
             "this module has a plain `main` (a Program) but imports `{module}`; \
              a module that imports any `Ipe.Tea.*` shape is a TEA app, so give \
              `main` a shape entry (`Web.tea` / `Tui.tea` / \
-             `Cli.tea`), or drop the `{module}` import \
+             `Cli.tea`), end `main` in a direct \
+             `Server.listen port [ Server.mountApp path (Web.embed config) ]` \
+             to serve an embedded web app, or drop the `{module}` import \
              if this is a Program"
         )),
         NameError::RuntimeBranchedMain => Some(
@@ -1909,6 +2093,26 @@ fn type_label(msg: &TypeError) -> Option<String> {
                 ty_to_string(found)
             ),
         }),
+        TypeError::TypeTooDeep { limit, .. } => Some(format!(
+            "this value's type nests more than {limit} levels deep, which the generated \
+             Rust cannot build"
+        )),
+        TypeError::TypeTooLarge {
+            limit,
+            origin: TypeSizeOrigin::Value,
+        } => Some(format!(
+            "this value's type unfolds to more than {limit} parts"
+        )),
+        TypeError::TypeTooLarge {
+            limit,
+            origin: TypeSizeOrigin::Declaration,
+        } => Some(format!(
+            "this constructor's type unfolds to more than {limit} parts"
+        )),
+        TypeError::ExpansiveRecursion { param, .. } => Some(format!(
+            "`{param}` grows each time this type refers to itself, which the generated \
+             Rust cannot build"
+        )),
         TypeError::Mismatch | TypeError::BudgetExceeded | TypeError::StepBudgetExceeded { .. } => {
             None
         }
@@ -1925,9 +2129,24 @@ fn lower_label(msg: &LowerError) -> String {
         LowerError::InadmissibleAppMsg { app, field, leaf } => {
             crate::diagnostic::inadmissible_msg_message(*app, field, *leaf)
         }
-        LowerError::BackendNestingTooDeep { limit } => {
-            format!("nested past the backend limit of {limit}")
-        }
+        LowerError::BackendNestingTooDeep { limit, func } => func.as_ref().map_or_else(
+            || format!("nested past the backend limit of {limit}"),
+            |site| {
+                format!(
+                    "`{}` nests past the backend limit of {limit}",
+                    site.qualified()
+                )
+            },
+        ),
+        LowerError::BackendTypeTooDeep { limit, func } => func.as_ref().map_or_else(
+            || format!("a type nests past the backend limit of {limit}"),
+            |site| {
+                format!(
+                    "a type in `{}` nests past the backend limit of {limit}",
+                    site.qualified()
+                )
+            },
+        ),
         LowerError::DecodeSucceedArityTooHigh { n } => {
             format!("`succeed` constructor has {n} parameters; the `curry1`..`curry10` cap is 10")
         }
@@ -2068,14 +2287,26 @@ fn lower_label(msg: &LowerError) -> String {
         }
         LowerError::UnsaturatedHandlerKernel { kernel } => {
             format!(
-                "`{kernel}` must be applied to all its arguments here — it rebuilds its \
-                 handler for every request, so the handler must be given at the call: \
-                 write `{kernel} contentType handler` (piping the handler in with \
+                "`{kernel}` must be given its handler here — the handler is called \
+                 again and again, so the compiler needs the handler expression at the \
+                 call: apply `{kernel}` to its handler (piping the handler in with \
                  `<|` / `|>` is fine) instead of binding `{kernel}` or a partial \
                  application of it to a name or passing it as a value"
             )
         }
         LowerError::StoreSelectProjectionInvalid(defect) => store_select_projection_label(defect),
+        LowerError::ForeignTypeVariable { helper, owner, var } => {
+            format!(
+                "`{helper}` has no signature, so it cannot be generic over `{owner}`'s \
+                 type variable `{var}` — annotate `{helper}` with its own type"
+            )
+        }
+        LowerError::UninferableErasedParameter { callee, var } => {
+            format!(
+                "`{var}` is open here: no argument of `{callee}` fixes it, but its \
+                 result uses it — give `{var}` a concrete type at this call"
+            )
+        }
     }
 }
 
@@ -2110,6 +2341,16 @@ fn store_select_projection_label(defect: &StoreSelectProjectionDefect) -> String
             "`Store.literal` binds a scalar SQL parameter — `{ty}` is not a \
              supported scalar (String, Int, Bool, or Float)"
         ),
+        StoreSelectProjectionDefect::SelectArgNotProjection => {
+            "this `Select` is not a `Store.select` expression at the call — its \
+             projected column types are hidden behind a name, parameter, or result"
+                .to_string()
+        }
+        StoreSelectProjectionDefect::SelectToNotSaturated => {
+            "this reference is a partial application or a function value — no \
+             `Store.select` projection is visible here to build the row decode from"
+                .to_string()
+        }
     }
 }
 
@@ -2118,7 +2359,7 @@ fn store_select_projection_label(defect: &StoreSelectProjectionDefect) -> String
 fn route_pattern_label(defect: &RoutePatternDefect) -> String {
     match defect {
         RoutePatternDefect::ParamEmpty => {
-            "a `:` or `*` segment has no parameter name after it".to_string()
+            "a `:` segment has no parameter name after it".to_string()
         }
         RoutePatternDefect::ParamNotIdentifier { name, at } => format!(
             "parameter name `{name}` is not an identifier (byte {at} is not a letter, \
@@ -2136,11 +2377,50 @@ fn route_pattern_label(defect: &RoutePatternDefect) -> String {
         RoutePatternDefect::TooLong { cap } => {
             format!("this path is longer than the {cap}-byte route ceiling")
         }
+        RoutePatternDefect::NotAbsolute => "this path does not start with `/`".to_string(),
+        RoutePatternDefect::TooManyParams { cap } => {
+            format!("this path holds more than {cap} `:` parameters")
+        }
+        RoutePatternDefect::CatchAll { segment } => {
+            format!("segment `{segment}` is a `*` catch-all, which a route cannot hold")
+        }
+        RoutePatternDefect::MidSegmentSigil { segment, at } => format!(
+            "segment `{segment}` has a `:` or `*` at byte {at}, which is neither a parameter \
+             nor a literal"
+        ),
         RoutePatternDefect::UnrenderableLiteral { segment } => {
             format!(
                 "segment `{segment}` is empty, `.` or `..`, so this route's URL cannot be rendered"
             )
         }
+        RoutePatternDefect::UnknownMethod { method } => {
+            format!("`{method}` is not a method the server serves")
+        }
+        RoutePatternDefect::MountPrefixNotLiteral => {
+            "this mount prefix is computed, not a string literal".to_string()
+        }
+        RoutePatternDefect::MountPrefix { prefix, fault } => {
+            format!(
+                "mount prefix `{prefix}` {}",
+                mount_prefix_fault_label(*fault)
+            )
+        }
+        RoutePatternDefect::MountPrefixDuplicate { prefix } => {
+            format!("two mounts in this list serve the prefix `{prefix}`")
+        }
+    }
+}
+
+fn mount_prefix_fault_label(fault: MountPrefixFault) -> String {
+    match fault {
+        MountPrefixFault::NotAbsolute => "does not start with `/`".to_string(),
+        MountPrefixFault::TrailingSlash => "ends with `/`".to_string(),
+        MountPrefixFault::EmptySegment => "has an empty segment (`//`)".to_string(),
+        MountPrefixFault::DotSegment => "has a `.` or `..` segment".to_string(),
+        MountPrefixFault::Reserved { byte } => {
+            format!("holds byte 0x{byte:02X}, which a mount prefix cannot hold")
+        }
+        MountPrefixFault::TooLong { cap } => format!("is longer than the {cap}-byte ceiling"),
     }
 }
 
@@ -2306,9 +2586,7 @@ fn hint_text(hint: Hint) -> String {
         Hint::AddTypeSignature => {
             "add a top-level type signature, e.g. `f : Int -> Int`".to_string()
         }
-        Hint::RaiseSolverBudget => {
-            "raise the budget with `IPE_SOLVER_BUDGET=<n>` (0 disables the limit)".to_string()
-        }
+        Hint::RaiseSolverBudget => "raise the budget with `IPE_SOLVER_BUDGET=<n>`".to_string(),
         Hint::NestingBoundDeliberate => {
             "this limit is deliberate, to fail fast on pathologically nested input".to_string()
         }
@@ -2524,8 +2802,9 @@ const fn feature_label(f: Feature) -> &'static str {
              [feature: task-loop-function-state]"
         }
         Feature::StreamHandlerCapture => {
-            "a `Stream.stream` handler is rebuilt for every request, so each value \
-             it captures is copied into it — this capture cannot be copied (a \
+            "this handler (a `Stream.stream` request handler or a `Ui`/`Html` \
+             event handler) is shared and called again and again, so each value it \
+             captures is copied into it — this capture cannot be copied (a \
              function bound through a tuple/record destructure, a `Task`/`Cmd`/\
              `Sub`, or a value whose type could not be determined); bind a \
              captured function with a plain `let f = …` or take it as a parameter, \
@@ -3758,6 +4037,67 @@ mod tests {
                 out.ends_with(&format!("`{name}`")),
                 "the bare name should be the wrapped tail: {out:?}"
             );
+        }
+    }
+
+    /// Each lexer defect reaches its own prose through `lexical_prose`, never
+    /// the grammar fallback that function answers for a non-lexical defect.
+    #[test]
+    fn every_lexical_defect_has_its_own_prose() {
+        let fallback = parse_prose(&ParseError::Unexpected);
+        let lexical = [
+            ParseError::UnknownChar('\u{7}'),
+            ParseError::StrayDot,
+            ParseError::SpaceBeforeDot,
+            ParseError::IntLiteralOutOfRange,
+            ParseError::FloatLiteralOutOfRange,
+            ParseError::UnterminatedString,
+            ParseError::MalformedChar,
+            ParseError::UnterminatedBlockComment,
+            ParseError::SourceTooLarge { bytes: 1 },
+            ParseError::LoneCarriageReturn,
+            ParseError::SourceDisplayHazard {
+                ch: '\u{2028}',
+                refusal: HazardRefusal::OutsideLiteral,
+            },
+            ParseError::SourceTerminalControl { ch: '\u{1b}' },
+        ];
+        for msg in &lexical {
+            assert_ne!(parse_prose(msg), fallback, "{msg:?}");
+        }
+        assert!(
+            parse_prose(&ParseError::LoneCarriageReturn).contains("carriage return"),
+            "the lone `\\r` prose names the byte"
+        );
+    }
+
+    /// A source display hazard's prose and label name it by code point, never raw.
+    ///
+    /// The raw character would break or reorder the very line that reports it.
+    #[test]
+    fn a_display_hazard_is_named_by_its_code_point() {
+        let refusals = [
+            HazardRefusal::Anywhere,
+            HazardRefusal::OutsideLiteral,
+            HazardRefusal::UnclosedIsolate,
+            HazardRefusal::UnopenedIsolate,
+        ];
+        for (range, _) in crate::terminal::SOURCE_DISPLAY_HAZARDS {
+            for ch in range.clone() {
+                let code = format!("U+{:04X}", u32::from(ch));
+                let messages = refusals
+                    .map(|refusal| ParseError::SourceDisplayHazard { ch, refusal })
+                    .into_iter()
+                    .chain([ParseError::SourceTerminalControl { ch }]);
+                for msg in messages {
+                    let prose = parse_prose(&msg);
+                    let label = parse_label(&msg).unwrap_or_default();
+                    for text in [&prose, &label] {
+                        assert!(text.contains(&code), "{text:?} names {code}");
+                        assert!(!text.contains(ch), "{text:?} carries {code} raw");
+                    }
+                }
+            }
         }
     }
 }

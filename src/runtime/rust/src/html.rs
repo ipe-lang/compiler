@@ -1,6 +1,8 @@
+use std::borrow::Cow;
 use std::collections::HashMap;
 
 use super::css_safety;
+use crate::csp::StyleNonce;
 use crate::retained::{Bytes, RetainedBytes};
 
 /// Form data delivered to an `OnForm` handler (lower-cased keys; see dispatch).
@@ -69,9 +71,13 @@ pub enum Attribute<M> {
 /// at the codegen call site, never `Arc<dyn Any>`. A payload erased behind
 /// `Arc<dyn Any>` would be undispatchable in any backend, so no such variant
 /// exists.
+///
+/// `OnMsg` boxes its message, so an attribute's inline size is the same for
+/// every app's `Msg` and a wide `Msg` costs one allocation per handler, which
+/// the view measure counts.
 #[derive(Clone)]
 pub enum Event<M> {
-    OnMsg(String, M),
+    OnMsg(String, Box<M>),
     OnString(String, std::sync::Arc<dyn Fn(String) -> M + Send + Sync>),
     OnBool(String, std::sync::Arc<dyn Fn(bool) -> M + Send + Sync>),
     /// Form-submit handler. Returns `Option<M>`: a malformed/incomplete form
@@ -94,6 +100,9 @@ pub enum Event<M> {
         std::sync::Arc<dyn Fn(String) -> Option<M> + Send + Sync>,
     ),
 }
+
+// IPE-RUST-AUDIT:ACCEPTED (Arthur Maciel) — compile-time `const` assertion (not a runtime panic); fails the BUILD if an event's message is stored inline, so an attribute's size would depend on the app's `Msg` [ledger #boundary]
+const _: () = assert!(size_of::<Attribute<[u8; 4096]>>() == size_of::<Attribute<()>>());
 
 impl<M: PartialEq> PartialEq for Attribute<M> {
     fn eq(&self, o: &Self) -> bool {
@@ -192,9 +201,73 @@ pub(crate) fn is_void(tag: &str) -> bool {
 /// attribute that the browser client reads to bind listeners.
 #[must_use]
 pub fn render_html<M>(node: &Html<M>) -> String {
+    render_html_in(node, &RenderCtx::Unstamped)
+}
+
+/// How a render stamps the `<style>` elements it admits.
+///
+/// Every serialization of a session's tree passes the session's nonce, so a
+/// `<style>` written in HTML data or foreign content carries `nonce="…"`. A
+/// `<style>` under an RCDATA or RAWTEXT ancestor is text, never stamped.
+#[derive(Clone, Debug)]
+pub enum RenderCtx<'a> {
+    /// No stamp: emitted code, the static page render, the browser runtime.
+    Unstamped,
+    /// A session's render, stamped with that session's nonce.
+    Session(&'a StyleNonce),
+}
+
+/// Render an `Html` tree to an HTML string under `stamp`.
+///
+/// It is [`render_html`] with every admitted `<style>` in data or foreign
+/// content stamped as `stamp` says.
+#[must_use]
+pub fn render_html_in<M>(node: &Html<M>, stamp: &RenderCtx<'_>) -> String {
     let mut s = String::new();
-    render_into(node, &mut s);
+    render_into_ctx(node, &mut s, ParseContext::Data, None, 0, stamp);
     s
+}
+
+/// A session render's markup and the nonce its `<style>` elements carry.
+///
+/// Only [`render_stamped`] builds one, so the nonce is the one the markup was
+/// stamped with. Its `Debug` form shows only the markup's length, since the
+/// markup holds the nonce.
+#[derive(Clone)]
+pub struct StampedHtml {
+    html: String,
+    nonce: StyleNonce,
+}
+
+impl std::fmt::Debug for StampedHtml {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StampedHtml")
+            .field("len", &self.html.len())
+            .finish_non_exhaustive()
+    }
+}
+
+impl StampedHtml {
+    /// The rendered markup.
+    #[must_use]
+    pub const fn as_str(&self) -> &str {
+        self.html.as_str()
+    }
+
+    /// The nonce every `<style>` of the markup carries.
+    #[must_use]
+    pub const fn nonce(&self) -> &StyleNonce {
+        &self.nonce
+    }
+}
+
+/// Render `node` as a session's markup, stamped with `nonce`.
+#[must_use]
+pub fn render_stamped<M>(node: &Html<M>, nonce: &StyleNonce) -> StampedHtml {
+    StampedHtml {
+        html: render_html_in(node, &RenderCtx::Session(nonce)),
+        nonce: nonce.clone(),
+    }
 }
 
 /// Marker attribute on a radio group's `<fieldset>`.
@@ -219,28 +292,22 @@ pub(crate) const RADIO_GROUP_MARKER: &str = "data-ipe-radio-group";
 /// no drift.
 pub(crate) const MAX_HTML_DEPTH: usize = 1024;
 
-/// Render `node` directly into an existing accumulator. `pub(crate)` so the
-/// SSE diff's whole-subtree replace (`live/diff.rs::render_children`) can
-/// write every child into one shared String instead of allocating a
-/// throwaway String per child (efficiency-audit §6 medium).
-pub(crate) fn render_into<M>(node: &Html<M>, s: &mut String) {
-    render_into_ctx(node, s, ParseContext::Data, None, 0);
-}
-
 /// Render the children of an element admitted as `body` into `s`.
 ///
 /// The SSE diff's whole-subtree replace writes an element's new children
 /// through this, so a patched `<script>`/`<style>` body gets the same
 /// neutralisation the first paint applies. `child_ctx` is the context the
 /// element puts its children in (`ParseContext::enter` of its own context),
-/// so a patched subtree is admitted exactly as the first paint admitted it.
+/// so a patched subtree is admitted exactly as the first paint admitted it,
+/// and `stamp` is the render context of the session the patch is sent to.
 pub(crate) fn render_children_into<M>(
     body: ElementBody,
     child_ctx: ParseContext,
     kids: &[Html<M>],
     s: &mut String,
+    stamp: &RenderCtx<'_>,
 ) {
-    render_body_into(body, child_ctx, kids, s, None, 0);
+    render_body_into(body, child_ctx, kids, s, None, 0, stamp);
 }
 
 /// Render `kids`, the children of an element admitted as `body`, into `s`.
@@ -258,25 +325,26 @@ fn render_body_into<M>(
     s: &mut String,
     select_value: Option<&str>,
     depth: usize,
+    stamp: &RenderCtx<'_>,
 ) {
     let child_depth = depth.saturating_add(1);
     match body {
         ElementBody::Markup => {
             for c in kids {
-                render_into_ctx(c, s, child_ctx, select_value, child_depth);
+                render_into_ctx(c, s, child_ctx, select_value, child_depth, stamp);
             }
         }
         ElementBody::Script => {
             let mut raw = String::new();
             for c in kids {
-                render_into_ctx(c, &mut raw, child_ctx, None, child_depth);
+                render_into_ctx(c, &mut raw, child_ctx, None, child_depth, stamp);
             }
             s.push_str(&css_safety::neutralise_script_close(&raw));
         }
         ElementBody::Style => {
             let mut raw = String::new();
             for c in kids {
-                render_into_ctx(c, &mut raw, child_ctx, None, child_depth);
+                render_into_ctx(c, &mut raw, child_ctx, None, child_depth, stamp);
             }
             s.push_str(&css_safety::neutralise_style_body(&raw));
         }
@@ -285,7 +353,8 @@ fn render_body_into<M>(
 
 // `select_value`: when this node renders as a direct child of a `<select>` that
 // carries a value, the chosen value is threaded here so the matching `<option>`
-// flips `selected`. `ctx` is the parse context `node` is written in.
+// flips `selected`. `ctx` is the parse context `node` is written in, and
+// `stamp` says which nonce an admitted `<style>` carries.
 #[allow(clippy::too_many_lines)]
 fn render_into_ctx<M>(
     node: &Html<M>,
@@ -293,6 +362,7 @@ fn render_into_ctx<M>(
     ctx: ParseContext,
     select_value: Option<&str>,
     depth: usize,
+    stamp: &RenderCtx<'_>,
 ) {
     // Bounded descent: a tree deeper than the cap is dropped here rather than
     // recursed into (see MAX_HTML_DEPTH). The parent has already emitted its
@@ -310,10 +380,12 @@ fn render_into_ctx<M>(
             // SECURITY: the shared tag gate, re-checked at the sink. A refused
             // element (an unsafe tag name, an unclosable `<plaintext>`, or a
             // `<script>`/`<style>` whose body is not trusted raw markup, or a
-            // `<script>` outside an HTML data-state context) is dropped with
+            // `<script>` outside an HTML data-state context, or an `embed`,
+            // `object` or `frame` naming a document to load) is dropped with
             // its whole subtree, so no value built on the safe surface reaches
-            // a raw-text or executable element body.
-            let Ok(rendered) = admit_rendered_in(ctx, tag, kids) else {
+            // a raw-text or executable element body or loads a document that
+            // could share the app's origin.
+            let Ok(rendered) = admit_rendered_in(ctx, tag, attrs, kids) else {
                 return;
             };
             let body = match rendered {
@@ -322,78 +394,29 @@ fn render_into_ctx<M>(
                 // with full name/attr/text gating.
                 RenderedElement::Doctype => {
                     s.push_str("<!DOCTYPE html>");
-                    render_body_into(ElementBody::Markup, ctx, kids, s, None, depth);
+                    render_body_into(ElementBody::Markup, ctx, kids, s, None, depth, stamp);
                     return;
                 }
                 RenderedElement::Element(body) => body,
             };
             s.push('<');
             s.push_str(tag);
-            // Collect regular + bool attrs into (key, value) pairs, then sort
-            // by key — alphabetical order matches the byte-exact output expected
-            // by golden tests. A BoolAttr renders as `k="true"` (the string
-            // "true"), NOT a bare `k`.
-            let mut pairs: Vec<(&str, String)> = vec![];
-            let mut events: Vec<&str> = vec![];
-            let mut ipe_id: Option<&str> = None;
-            // Multi-valued attribute merge: `class` is HTML's space-separated
-            // and `style` HTML's semicolon-separated multi-valued attribute: an
-            // element carrying BOTH a Ipe.Ui-computed inline `style` (from
-            // padding/background/border attrs) AND a user
-            // `Ui.htmlAttribute "style" "z-index: 5"` must emit ONE merged
-            // `style="…computed…; z-index: 5"`, not two `style="…"`
-            // attributes (the browser keeps only the first → the user's
-            // declarations are silently dropped). The Rust attribute list
-            // never went through  map accumulation, so we fold the merge
-            // here at collection time. First-seen value keeps its position
-            // (Ipe.Ui composes the computed style first); later values append
-            // so a user style declared last can override. Every other key is
-            // last-wins (two `href`/`value` ⇒ override, matching  map set).
-            for a in attrs {
-                match a {
-                    Attribute::Attr(k, v) => {
-                        let k = k.as_str();
-                        if k == STAMPED_ID_ATTR {
-                            ipe_id = Some(v);
-                        }
-                        match pairs.iter_mut().find(|(pk, _)| *pk == k) {
-                            Some((_, existing)) if !existing.is_empty() && k == "class" => {
-                                existing.push(' ');
-                                existing.push_str(v);
-                            }
-                            Some((_, existing)) if !existing.is_empty() && k == "style" => {
-                                // `; ` separator unless `existing` already ends
-                                // with `;` (then a single space) — avoids `;;`.
-                                if existing.ends_with(';') {
-                                    existing.push(' ');
-                                } else {
-                                    existing.push_str("; ");
-                                }
-                                existing.push_str(v);
-                            }
-                            Some((_, existing)) => {
-                                // Last-wins for every other key (and for an
-                                // empty existing style/class — nothing to join).
-                                existing.clear();
-                                existing.push_str(v);
-                            }
-                            None => pairs.push((k, v.clone())),
-                        }
-                    }
-                    Attribute::BoolAttr(k, true) => {
-                        let k = k.as_str();
-                        match pairs.iter_mut().find(|(pk, _)| *pk == k) {
-                            Some((_, existing)) => {
-                                existing.clear();
-                                existing.push_str("true");
-                            }
-                            None => pairs.push((k, "true".to_string())),
-                        }
-                    }
-                    Attribute::BoolAttr(_, false) | Attribute::NoAttr => {}
-                    Attribute::EventAttr(e) => events.push(e.name()),
-                }
-            }
+            // Regular + bool attrs as (key, value) pairs, sorted by key below:
+            // alphabetical order matches the byte-exact output expected by
+            // golden tests.
+            let child_ctx = ctx.enter(tag);
+            let mut pairs = attribute_pairs(child_ctx, tag, attrs);
+            let ipe_id = attrs.iter().rev().find_map(|a| match a {
+                Attribute::Attr(k, v) if k == STAMPED_ID_ATTR => Some(v.as_str()),
+                _ => None,
+            });
+            let mut events: Vec<&str> = attrs
+                .iter()
+                .filter_map(|a| match a {
+                    Attribute::EventAttr(e) => Some(e.name()),
+                    _ => None,
+                })
+                .collect();
             // <textarea> and <select> have NO `value` attribute in the HTML spec
             // — a textarea's displayed value is its TEXT CONTENT; a select's is the
             // `selected` <option>. Emitting `<textarea value="…">` renders EMPTY in
@@ -406,7 +429,7 @@ fn render_into_ctx<M>(
                 && let Some(pos) = pairs.iter().position(|(k, _)| *k == "value")
             {
                 let (_, v) = pairs.remove(pos);
-                textarea_value = Some(v);
+                textarea_value = Some(v.into_owned());
             }
             // <option selected> flip: when rendered as a direct child of a
             // <select> with a value, set `selected` on the value-matching option
@@ -419,10 +442,10 @@ fn render_into_ctx<M>(
             {
                 pairs.retain(|(k, _)| *k != "selected");
                 if pairs.iter().any(|(k, v)| *k == "value" && v == sv) {
-                    pairs.push(("selected", "selected".to_string()));
+                    pairs.push((Cow::Borrowed("selected"), Cow::Borrowed("selected")));
                 }
             }
-            pairs.sort_by(|a, b| a.0.cmp(b.0));
+            pairs.sort_by(|a, b| a.0.cmp(&b.0));
             for (k, v) in &pairs {
                 // Attr KEY is emitted unescaped; an unsafe key (`x onload=…`)
                 // injects a new attribute, and a script-bearing key (`onerror`,
@@ -442,6 +465,16 @@ fn render_into_ctx<M>(
                 s.push_str(name);
                 s.push_str("=\"");
                 crate::escape::html_attr_into(sanitise_url_attr(k, v), s);
+                s.push('"');
+            }
+            // The session nonce is written by the sink alone: `nonce` is a
+            // reserved name, so no program-built attribute reaches this spot.
+            if body == ElementBody::Style
+                && ctx.opens_style_element()
+                && let RenderCtx::Session(nonce) = stamp
+            {
+                s.push_str(" nonce=\"");
+                nonce.write_token(s);
                 s.push('"');
             }
             // Browser-client wire markers (live/client.js): the delegated
@@ -509,7 +542,7 @@ fn render_into_ctx<M>(
             } else {
                 None
             };
-            render_body_into(body, ctx.enter(tag), kids, s, child_select_value, depth);
+            render_body_into(body, child_ctx, kids, s, child_select_value, depth, stamp);
             s.push_str("</");
             s.push_str(tag);
             s.push('>');
@@ -583,6 +616,139 @@ pub(crate) enum ElementRefusal {
     /// ancestor: its body would be read as text that can end that ancestor,
     /// or as live markup, instead of as script data.
     ScriptOutsideData,
+    /// An `embed`, `object` or `frame` that names a document to load. The
+    /// browser gives these elements no sandbox and the runtime holds no proof
+    /// that the document's origin differs from the app's, so the loaded
+    /// document could act as the app. Use `Html.iframe`, which the runtime
+    /// always sandboxes.
+    UnsandboxableFrame,
+}
+
+/// The `sandbox` tokens an `iframe` may hold, in the order the runtime paints
+/// them.
+///
+/// `allow-same-origin` and `allow-popups-to-escape-sandbox` are not in the
+/// table, so no [`SandboxTokens`] can hold them: either gives the framed
+/// document, or a popup it opens, the real origin of its URL, which may be the
+/// app's own. The browser client mirrors this table in `__IPE_SANDBOX_TOKENS`.
+pub(crate) const SANDBOX_TOKENS: [&str; 12] = [
+    "allow-downloads",
+    "allow-forms",
+    "allow-modals",
+    "allow-orientation-lock",
+    "allow-pointer-lock",
+    "allow-popups",
+    "allow-presentation",
+    "allow-scripts",
+    "allow-storage-access-by-user-activation",
+    "allow-top-navigation",
+    "allow-top-navigation-by-user-activation",
+    "allow-top-navigation-to-custom-protocols",
+];
+
+/// The frame-loading elements the browser gives no sandbox, each with the
+/// attribute it loads a document from. The browser client mirrors this table
+/// in `__IPE_FRAME_LOADERS`.
+pub(crate) const FRAME_LOADERS: [(&str, &str); 3] =
+    [("embed", "src"), ("object", "data"), ("frame", "src")];
+
+/// The attribute that sandboxes an `iframe`.
+pub(crate) const SANDBOX_ATTR: &str = "sandbox";
+
+/// The sandboxed frame element.
+pub(crate) const IFRAME_TAG: &str = "iframe";
+
+/// A `sandbox` value that can never grant the app's origin back: a set over
+/// [`SANDBOX_TOKENS`], painted lowercase, once each, in table order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct SandboxTokens([bool; SANDBOX_TOKENS.len()]);
+
+impl SandboxTokens {
+    /// The known tokens of `value`, split on ASCII whitespace as the browser
+    /// splits them and matched without regard to ASCII case; every other
+    /// token, a forbidden one included, is dropped.
+    pub(crate) fn parse(value: &str) -> Self {
+        let mut held = [false; SANDBOX_TOKENS.len()];
+        for token in value.split_ascii_whitespace() {
+            for (slot, known) in held.iter_mut().zip(SANDBOX_TOKENS) {
+                if known.eq_ignore_ascii_case(token) {
+                    *slot = true;
+                }
+            }
+        }
+        Self(held)
+    }
+
+    /// The canonical `sandbox` value: the held tokens, space-separated.
+    pub(crate) fn canonical(self) -> String {
+        let mut out = String::new();
+        for (_, token) in self.0.iter().zip(SANDBOX_TOKENS).filter(|(held, _)| **held) {
+            if !out.is_empty() {
+                out.push(' ');
+            }
+            out.push_str(token);
+        }
+        out
+    }
+}
+
+/// What the frame rule makes of an element before it renders.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum FrameVerdict {
+    /// Not a frame-loading element: render as is.
+    NotAFrame,
+    /// An `iframe`: render with this one canonical `sandbox` value, and drop
+    /// every `sandbox` pair the app wrote.
+    Sandboxed(SandboxTokens),
+    /// A frame-loading element carrying its loading attribute.
+    Refused(ElementRefusal),
+}
+
+/// The attribute a [`FRAME_LOADERS`] element `tag` loads its document from;
+/// `None` for every other tag. Tags match without regard to ASCII case.
+pub(crate) fn frame_loader_key(tag: &str) -> Option<&'static str> {
+    FRAME_LOADERS
+        .iter()
+        .find(|(loader, _)| tag.eq_ignore_ascii_case(loader))
+        .map(|(_, key)| *key)
+}
+
+/// The frame rule for an element `tag` whose attributes, in order, are the
+/// pairs `attrs`.
+///
+/// No document such an element loads can share the app's origin: an `iframe`
+/// always renders one sandbox, the last `sandbox` of any ASCII case read (an
+/// absent, empty or unknown value gives the empty sandbox), and a
+/// [`FRAME_LOADERS`] element that carries its loading attribute at all, in any
+/// key case and with any value, is refused, as `" "` resolves to the page
+/// itself. Tags and keys match without regard to ASCII case only.
+pub(crate) fn frame_verdict<'a>(
+    tag: &str,
+    mut attrs: impl Iterator<Item = (&'a str, &'a str)>,
+) -> FrameVerdict {
+    if tag.eq_ignore_ascii_case(IFRAME_TAG) {
+        let value = attrs
+            .filter(|(k, _)| k.eq_ignore_ascii_case(SANDBOX_ATTR))
+            .last()
+            .map_or("", |(_, v)| v);
+        return FrameVerdict::Sandboxed(SandboxTokens::parse(value));
+    }
+    match frame_loader_key(tag) {
+        Some(key) if attrs.any(|(k, _)| k.eq_ignore_ascii_case(key)) => {
+            FrameVerdict::Refused(ElementRefusal::UnsandboxableFrame)
+        }
+        Some(_) | None => FrameVerdict::NotAFrame,
+    }
+}
+
+/// The `(key, value)` pairs `attrs` paints, in order: a `BoolAttr` that holds
+/// is the value `"true"`; a false one, an event and `NoAttr` carry none.
+fn painted_pairs<M>(attrs: &[Attribute<M>]) -> impl Iterator<Item = (&str, &str)> {
+    attrs.iter().filter_map(|a| match a {
+        Attribute::Attr(k, v) => Some((k.as_str(), v.as_str())),
+        Attribute::BoolAttr(k, true) => Some((k.as_str(), "true")),
+        Attribute::BoolAttr(_, false) | Attribute::EventAttr(_) | Attribute::NoAttr => None,
+    })
 }
 
 /// Elements whose children the HTML tokenizer reads as RCDATA or RAWTEXT.
@@ -638,6 +804,16 @@ impl ParseContext {
         }
     }
 
+    /// True when a `<style>` start tag written here opens a style element.
+    ///
+    /// Under an RCDATA or RAWTEXT ancestor the tag is that ancestor's text.
+    const fn opens_style_element(self) -> bool {
+        match self {
+            Self::Data | Self::Foreign => true,
+            Self::RawOrRcdata => false,
+        }
+    }
+
     /// True when a `<script>` start tag written here enters script-data state.
     const fn admits_script(self) -> bool {
         match self {
@@ -647,7 +823,8 @@ impl ParseContext {
     }
 }
 
-/// Decide whether an element `tag` with children `kids` may be rendered.
+/// Decide whether an element `tag` with attributes `attrs` and children `kids`
+/// may be rendered.
 ///
 /// This is the one tag gate of the safe surface: every element constructor
 /// (`Html.node`, `Ui.taggedNode`, both template materialisers, `Ipe.Ui`'s
@@ -659,13 +836,18 @@ impl ParseContext {
 /// elements (`title`, `textarea`, `noscript`, `iframe`, `xmp`, `noembed`,
 /// `noframes`) are admitted as markup: their text children are entity-escaped
 /// and any trusted `<style>` inside them is markup-neutralised, so no child can
-/// end them early.
-pub(crate) fn admit_element<K: TrustedRawChild>(
+/// end them early. A frame-loading element runs [`frame_verdict`]: an
+/// `embed`, `object` or `frame` carrying its loading attribute is refused.
+pub(crate) fn admit_element<K: TrustedRawChild, M>(
     tag: &str,
+    attrs: &[Attribute<M>],
     kids: &[K],
 ) -> Result<ElementBody, ElementRefusal> {
     if !is_safe_html_name(tag) {
         return Err(ElementRefusal::UnsafeName);
+    }
+    if let FrameVerdict::Refused(refusal) = frame_verdict(tag, painted_pairs(attrs)) {
+        return Err(refusal);
     }
     if tag.eq_ignore_ascii_case("plaintext") {
         return Err(ElementRefusal::Unclosable);
@@ -688,19 +870,20 @@ pub(crate) fn admit_element<K: TrustedRawChild>(
     Ok(ElementBody::Markup)
 }
 
-/// Decide whether an element `tag` with children `kids`, written in `ctx`, may
-/// be rendered.
+/// Decide whether an element `tag` with attributes `attrs` and children
+/// `kids`, written in `ctx`, may be rendered.
 ///
 /// It runs `admit_element`, then refuses a `<script>` whose start tag would not
 /// put the tokenizer in script-data state. `<style>` is admitted in every
 /// context, as `neutralise_style_body` removes every markup opener from its
 /// body.
-pub(crate) fn admit_in_context<K: TrustedRawChild>(
+pub(crate) fn admit_in_context<K: TrustedRawChild, M>(
     ctx: ParseContext,
     tag: &str,
+    attrs: &[Attribute<M>],
     kids: &[K],
 ) -> Result<ElementBody, ElementRefusal> {
-    let body = admit_element(tag, kids)?;
+    let body = admit_element(tag, attrs, kids)?;
     match body {
         ElementBody::Script if !ctx.admits_script() => Err(ElementRefusal::ScriptOutsideData),
         ElementBody::Script | ElementBody::Markup | ElementBody::Style => Ok(body),
@@ -733,24 +916,26 @@ impl RenderedElement {
     }
 }
 
-/// Decide how an `Html` element node `tag` with children `kids`, written in
-/// `ctx`, is rendered.
+/// Decide how an `Html` element node `tag` with attributes `attrs` and
+/// children `kids`, written in `ctx`, is rendered.
 ///
 /// This is the one admission rule of every rendered-tree walker (the render
 /// sink and the SSE diff), so the two cannot disagree on which nodes are on
 /// the page: the `Html.doctype` wrapper is recognised by its exact pseudo-tag,
 /// before the name gate its `!` fails, and every other tag runs
-/// `admit_in_context`. The context is a required argument, so no walker can
-/// judge a raw body without its ancestors.
+/// `admit_in_context`. The context and the attributes are required
+/// arguments, so no walker can judge a raw body without its ancestors, nor a
+/// frame without its loading attribute.
 pub(crate) fn admit_rendered_in<M>(
     ctx: ParseContext,
     tag: &str,
+    attrs: &[Attribute<M>],
     kids: &[Html<M>],
 ) -> Result<RenderedElement, ElementRefusal> {
     if tag == DOCTYPE_WRAPPER_TAG {
         return Ok(RenderedElement::Doctype);
     }
-    admit_in_context(ctx, tag, kids).map(RenderedElement::Element)
+    admit_in_context(ctx, tag, attrs, kids).map(RenderedElement::Element)
 }
 
 /// Attribute NAMES that execute script (or embed a scripting context) regardless
@@ -773,7 +958,238 @@ fn is_dangerous_attr_name(name: &str) -> bool {
 const RESERVED_ATTR_PREFIX: &[u8] = b"ipe-";
 
 /// The attribute carrying the identity the ipe-id stamper assigns.
-const STAMPED_ID_ATTR: &str = "ipe-id";
+pub(crate) const STAMPED_ID_ATTR: &str = "ipe-id";
+
+/// The attribute names the HTML parser stores in mixed case on a foreign
+/// (SVG or MathML) element, keyed by their ASCII-lowercase spelling and sorted
+/// by that key.
+///
+/// The parser lowercases every attribute name it tokenizes and then, on a
+/// foreign element alone, restores these to their stored case ("adjust SVG
+/// attributes" and "adjust MathML attributes"); every other name stays
+/// lowercase. A key absent here is stored lowercase on every element.
+///
+/// [`ParseContext::Foreign`] does not tell an SVG subtree from a MathML one,
+/// so both adjustment lists apply to either: an SVG-list key on a MathML
+/// element (or `definitionURL` on an SVG one) is written in its adjusted
+/// case here where the parser stores it lowercase. Neither name means
+/// anything on the other namespace's elements; the divergence is deliberate.
+const FOREIGN_ATTR_CASE: [(&str, &str); 59] = [
+    ("attributename", "attributeName"),
+    ("attributetype", "attributeType"),
+    ("basefrequency", "baseFrequency"),
+    ("baseprofile", "baseProfile"),
+    ("calcmode", "calcMode"),
+    ("clippathunits", "clipPathUnits"),
+    ("definitionurl", "definitionURL"),
+    ("diffuseconstant", "diffuseConstant"),
+    ("edgemode", "edgeMode"),
+    ("filterunits", "filterUnits"),
+    ("glyphref", "glyphRef"),
+    ("gradienttransform", "gradientTransform"),
+    ("gradientunits", "gradientUnits"),
+    ("kernelmatrix", "kernelMatrix"),
+    ("kernelunitlength", "kernelUnitLength"),
+    ("keypoints", "keyPoints"),
+    ("keysplines", "keySplines"),
+    ("keytimes", "keyTimes"),
+    ("lengthadjust", "lengthAdjust"),
+    ("limitingconeangle", "limitingConeAngle"),
+    ("markerheight", "markerHeight"),
+    ("markerunits", "markerUnits"),
+    ("markerwidth", "markerWidth"),
+    ("maskcontentunits", "maskContentUnits"),
+    ("maskunits", "maskUnits"),
+    ("numoctaves", "numOctaves"),
+    ("pathlength", "pathLength"),
+    ("patterncontentunits", "patternContentUnits"),
+    ("patterntransform", "patternTransform"),
+    ("patternunits", "patternUnits"),
+    ("pointsatx", "pointsAtX"),
+    ("pointsaty", "pointsAtY"),
+    ("pointsatz", "pointsAtZ"),
+    ("preservealpha", "preserveAlpha"),
+    ("preserveaspectratio", "preserveAspectRatio"),
+    ("primitiveunits", "primitiveUnits"),
+    ("refx", "refX"),
+    ("refy", "refY"),
+    ("repeatcount", "repeatCount"),
+    ("repeatdur", "repeatDur"),
+    ("requiredextensions", "requiredExtensions"),
+    ("requiredfeatures", "requiredFeatures"),
+    ("specularconstant", "specularConstant"),
+    ("specularexponent", "specularExponent"),
+    ("spreadmethod", "spreadMethod"),
+    ("startoffset", "startOffset"),
+    ("stddeviation", "stdDeviation"),
+    ("stitchtiles", "stitchTiles"),
+    ("surfacescale", "surfaceScale"),
+    ("systemlanguage", "systemLanguage"),
+    ("tablevalues", "tableValues"),
+    ("targetx", "targetX"),
+    ("targety", "targetY"),
+    ("textlength", "textLength"),
+    ("viewbox", "viewBox"),
+    ("viewtarget", "viewTarget"),
+    ("xchannelselector", "xChannelSelector"),
+    ("ychannelselector", "yChannelSelector"),
+    ("zoomandpan", "zoomAndPan"),
+];
+
+/// Whether `a` sorts strictly before `b` byte-wise.
+const fn bytes_before(mut a: &[u8], mut b: &[u8]) -> bool {
+    while let ([x, a_rest @ ..], [y, b_rest @ ..]) = (a, b) {
+        if *x != *y {
+            return *x < *y;
+        }
+        a = a_rest;
+        b = b_rest;
+    }
+    a.is_empty() && !b.is_empty()
+}
+
+/// Whether `key` is the ASCII-lowercase fold of `stored`.
+const fn is_ascii_lowercase_of(mut key: &[u8], mut stored: &[u8]) -> bool {
+    while let ([k, key_rest @ ..], [s, stored_rest @ ..]) = (key, stored) {
+        if *k != s.to_ascii_lowercase() {
+            return false;
+        }
+        key = key_rest;
+        stored = stored_rest;
+    }
+    key.is_empty() && stored.is_empty()
+}
+
+/// Whether every key of `table` is the ASCII-lowercase fold of its stored
+/// name and the keys strictly increase, checked in one pass.
+const fn attr_case_table_sound(table: &[(&str, &str)]) -> bool {
+    let mut rest = table;
+    let mut prev: Option<&[u8]> = None;
+    while let Some(((key, stored), tail)) = rest.split_first() {
+        let key = key.as_bytes();
+        if !is_ascii_lowercase_of(key, stored.as_bytes()) {
+            return false;
+        }
+        if let Some(p) = prev
+            && !bytes_before(p, key)
+        {
+            return false;
+        }
+        prev = Some(key);
+        rest = tail;
+    }
+    true
+}
+
+// IPE-RUST-AUDIT:ACCEPTED (Arthur Maciel) — compile-time `const` assertion (not a runtime panic); fails the BUILD if a `FOREIGN_ATTR_CASE` key is not its stored name's lowercase fold or the keys are not strictly sorted, which the binary search in `stored_attr_key` requires [ledger #boundary]
+const _: () = assert!(attr_case_table_sound(&FOREIGN_ATTR_CASE));
+
+/// The name the DOM stores an attribute written as `key` under, on an element
+/// whose children are written in `child_ctx`.
+///
+/// The HTML parser lowercases every attribute name; on a foreign element it
+/// then restores the [`FOREIGN_ATTR_CASE`] spellings. `setAttribute` on an
+/// HTML element lowercases too, and on a foreign element keeps the name it is
+/// given, so a key folded here paints and patches as one DOM attribute. An
+/// element is foreign exactly when its children are: `svg` and `math` open
+/// foreign content and the sink keeps it for their whole subtree. A key
+/// already in its stored form is borrowed, never copied.
+fn stored_attr_key(child_ctx: ParseContext, key: &str) -> Cow<'_, str> {
+    let lower = if key.bytes().any(|b| b.is_ascii_uppercase()) {
+        Cow::Owned(key.to_ascii_lowercase())
+    } else {
+        Cow::Borrowed(key)
+    };
+    match child_ctx {
+        ParseContext::Data | ParseContext::RawOrRcdata => lower,
+        ParseContext::Foreign => FOREIGN_ATTR_CASE
+            .binary_search_by(|(folded, _)| folded.as_bytes().cmp(lower.as_bytes()))
+            .ok()
+            .and_then(|i| FOREIGN_ATTR_CASE.get(i))
+            .map_or(lower, |(_, stored)| Cow::Borrowed(*stored)),
+    }
+}
+
+/// The attribute pairs an element `tag` with attributes `attrs` carries, in
+/// first-appearance order: what the renderer writes at first paint and what
+/// the patch diff compares, so the two never disagree on a key or a value.
+///
+/// Every key is the name the DOM stores it under ([`stored_attr_key`] for
+/// `child_ctx`, the context the element puts its children in), so two keys
+/// that differ only in ASCII case are one attribute here as they are in the
+/// painted document: last write wins across case, and a diff never sets one
+/// spelling while removing another.
+///
+/// An `iframe` carries exactly one `sandbox`, last: the canonical value of
+/// [`frame_verdict`], in place of every ASCII case variant of `sandbox` the
+/// app wrote. Its old and new sides therefore always both hold `sandbox`, so
+/// no diff removes it.
+///
+/// A `BoolAttr` that holds is the value `"true"`; a false one, an event and
+/// `NoAttr` carry no pair. `class` (space-separated) and `style`
+/// (semicolon-separated) are HTML's multi-valued attributes: a later regular
+/// value of either joins the one already held, so a computed `style` and a
+/// user `Ui.htmlAttribute "style" "z-index: 5"` become one `style`, not two
+/// attributes of which the browser keeps only the first. Every other repeated
+/// key, an empty held value, or a `BoolAttr` takes the later value.
+pub(crate) fn attribute_pairs<'a, M>(
+    child_ctx: ParseContext,
+    tag: &str,
+    attrs: &'a [Attribute<M>],
+) -> Vec<(Cow<'a, str>, Cow<'a, str>)> {
+    /// Pair count past which a key lookup goes through a hash index rather
+    /// than a scan, so a long attribute list costs linear time.
+    const SCANNED_PAIRS: usize = 16;
+    let mut pairs: Vec<(Cow<'_, str>, Cow<'_, str>)> = Vec::with_capacity(attrs.len());
+    let mut index: HashMap<Cow<'_, str>, usize> = HashMap::new();
+    for a in attrs {
+        let (k, v, joins) = match a {
+            Attribute::Attr(k, v) => (k.as_str(), v.as_str(), true),
+            Attribute::BoolAttr(k, true) => (k.as_str(), "true", false),
+            Attribute::BoolAttr(_, false) | Attribute::EventAttr(_) | Attribute::NoAttr => {
+                continue;
+            }
+        };
+        if k != STAMPED_ID_ATTR && is_reserved_attr_name(k) {
+            continue;
+        }
+        let k = stored_attr_key(child_ctx, k);
+        let held = if pairs.len() <= SCANNED_PAIRS {
+            pairs.iter().position(|(pk, _)| *pk == k)
+        } else {
+            if index.is_empty() {
+                index.extend(pairs.iter().enumerate().map(|(i, (pk, _))| (pk.clone(), i)));
+            }
+            index.get(&k).copied()
+        };
+        let Some((_, existing)) = held.and_then(|i| pairs.get_mut(i)) else {
+            if !index.is_empty() {
+                index.insert(k.clone(), pairs.len());
+            }
+            pairs.push((k, Cow::Borrowed(v)));
+            continue;
+        };
+        let sep = match k.as_ref() {
+            "class" => Some(" "),
+            "style" if existing.ends_with(';') => Some(" "),
+            "style" => Some("; "),
+            _ => None,
+        };
+        match sep.filter(|_| joins && !existing.is_empty()) {
+            Some(sep) => {
+                let joined = existing.to_mut();
+                joined.push_str(sep);
+                joined.push_str(v);
+            }
+            None => *existing = Cow::Borrowed(v),
+        }
+    }
+    if let FrameVerdict::Sandboxed(tokens) = frame_verdict(tag, painted_pairs(attrs)) {
+        pairs.retain(|(k, _)| !k.eq_ignore_ascii_case(SANDBOX_ATTR));
+        pairs.push((Cow::Borrowed(SANDBOX_ATTR), Cow::Owned(tokens.canonical())));
+    }
+    pairs
+}
 
 /// The attribute `Html.keyed` sets; the stamper reads it as the key segment.
 const KEY_ATTR: &str = "ipe-key";
@@ -785,14 +1201,23 @@ const KEY_ATTR: &str = "ipe-key";
 /// program-built one would route the gesture to another element's handler.
 pub(crate) const HANDLER_ID_ATTR: &str = "data-ipe-hid";
 
-/// True for a runtime wire-marker name, compared ASCII-case-insensitively.
+/// The attribute carrying a session's style nonce.
 ///
-/// That is a name starting with [`RESERVED_ATTR_PREFIX`], or [`HANDLER_ID_ATTR`].
+/// Only the render sink writes it, from the session's `RenderCtx`; a
+/// program-built one would let a page's own data pick the value a policy
+/// admits styles by.
+const NONCE_ATTR: &str = "nonce";
+
+/// True for a name only the runtime writes, compared ASCII-case-insensitively.
+///
+/// That is a name starting with [`RESERVED_ATTR_PREFIX`], [`HANDLER_ID_ATTR`],
+/// or [`NONCE_ATTR`].
 fn is_reserved_attr_name(name: &str) -> bool {
     name.as_bytes()
         .get(..RESERVED_ATTR_PREFIX.len())
         .is_some_and(|head| head.eq_ignore_ascii_case(RESERVED_ATTR_PREFIX))
         || name.eq_ignore_ascii_case(HANDLER_ID_ATTR)
+        || name.eq_ignore_ascii_case(NONCE_ATTR)
 }
 
 /// A validated HTML **attribute** name (parse-don't-validate). The ONLY way to
@@ -1004,10 +1429,14 @@ pub(crate) fn patch_marker_attr<'a>(name: &'a str, value: &'a str) -> Option<(&'
 /// renders and distinct per group within one document. A radio that already
 /// has a non-empty `name` keeps it. A serialiser that does not stamp
 /// (`Html.toString`) leaves the marker and the radios unnamed.
+///
+/// Every id is built in one path buffer shared by the whole descent: a child's
+/// segment is appended, the child is stamped, and the buffer is truncated back
+/// to its parent's id, so an element's only id allocation is the stored value.
 pub fn assign_ipe_ids<M>(node: &mut Html<M>, path: &str) {
-    let mut root = String::with_capacity(path.len());
-    push_id_segment(path, &mut root);
-    assign_ipe_ids_depth(node, &root, 0, None);
+    let mut buf = String::with_capacity(path.len());
+    push_id_segment(path, &mut buf);
+    assign_ipe_ids_depth(node, &mut buf, 0, None);
 }
 
 /// Separator between an id's root, index and tag segments.
@@ -1055,13 +1484,25 @@ fn is_unstamped_reserved_attr<M>(attr: &Attribute<M>) -> bool {
 // stamper recurses once per nesting level, so an attacker-influenced deep tree
 // would overflow the stack. Stop descending at the cap. Kept in step with the
 // renderer's cap so a node the renderer drops is also left unstamped.
-fn assign_ipe_ids_depth<M>(node: &mut Html<M>, path: &str, depth: usize, group: Option<&str>) {
+//
+// `path` holds `node`'s own id on entry and holds it again on return: each
+// child's segment is truncated away at the length recorded before it was
+// pushed. Every pushed byte is ASCII (`push_id_segment` escapes the rest), so
+// that length is always a char boundary.
+fn assign_ipe_ids_depth<M>(
+    node: &mut Html<M>,
+    path: &mut String,
+    depth: usize,
+    group: Option<&str>,
+) {
+    use core::fmt::Write as _;
     if depth >= MAX_HTML_DEPTH {
         return;
     }
     if let Html::HElement(tag, attrs, kids) = node {
         attrs.retain(|a| !is_unstamped_reserved_attr(a));
-        attrs.push(Attribute::Attr(STAMPED_ID_ATTR.to_owned(), path.to_owned()));
+        attrs.reserve_exact(1);
+        attrs.push(Attribute::Attr(STAMPED_ID_ATTR.to_owned(), path.clone()));
         let own_group = (tag.as_str() == "fieldset" && take_radio_group_marker(attrs))
             .then(|| format!("ipe-rg-{path}"));
         let group = own_group.as_deref().or(group);
@@ -1070,22 +1511,24 @@ fn assign_ipe_ids_depth<M>(node: &mut Html<M>, path: &str, depth: usize, group: 
             if let Html::HElement(ctag, cattrs, _) = child {
                 if let Some(name) = group
                     && ctag.as_str() == "input"
-                    && attr_value(cattrs, "type") == Some("radio")
-                    && attr_value(cattrs, "name").is_none_or(str::is_empty)
+                    && painted_attr_value(cattrs, "type") == Some("radio")
+                    && painted_attr_value(cattrs, "name").is_none_or(str::is_empty)
                 {
                     set_attr(cattrs, "name", name);
                 }
-                let mut seg = String::from(path);
-                seg.push(ID_STEP_SEP);
-                seg.push_str(&idx.to_string());
-                seg.push(ID_STEP_SEP);
-                push_id_segment(ctag, &mut seg);
+                let parent_len = path.len();
+                path.push(ID_STEP_SEP);
+                // Writing into a `String` cannot fail.
+                let _ = write!(path, "{idx}");
+                path.push(ID_STEP_SEP);
+                push_id_segment(ctag, path);
                 if let Some(key) = ipe_id_key(ctag, cattrs) {
-                    seg.push(ID_KEY_SEP);
-                    push_id_segment(key, &mut seg);
+                    path.push(ID_KEY_SEP);
+                    push_id_segment(key, path);
                 }
                 idx = idx.saturating_add(1);
-                assign_ipe_ids_depth(child, &seg, depth.saturating_add(1), group);
+                assign_ipe_ids_depth(child, path, depth.saturating_add(1), group);
+                path.truncate(parent_len);
             }
         }
     }
@@ -1111,7 +1554,7 @@ fn ipe_id_key<'a, M>(tag: &str, attrs: &'a [Attribute<M>]) -> Option<&'a str> {
     if matches!(
         tag,
         "input" | "textarea" | "select" | "form" | "button" | "fieldset"
-    ) && let Some(k) = attr_value(attrs, "name")
+    ) && let Some(k) = painted_attr_value(attrs, "name")
         && !k.is_empty()
     {
         return Some(k);
@@ -1119,9 +1562,24 @@ fn ipe_id_key<'a, M>(tag: &str, attrs: &'a [Attribute<M>]) -> Option<&'a str> {
     None
 }
 
+/// The value of the attribute spelled exactly `key`, first written.
+///
+/// Reads the runtime's own reserved names (`ipe-key`), which the sink refuses
+/// in any other case, so an exact match is the one the painted document holds.
 fn attr_value<'a, M>(attrs: &'a [Attribute<M>], key: &str) -> Option<&'a str> {
     attrs.iter().find_map(|a| match a {
         Attribute::Attr(k, v) if k == key => Some(v.as_str()),
+        _ => None,
+    })
+}
+
+/// The value the painted document holds for the HTML attribute `key` on an
+/// HTML element: the last `Attr` whose key is `key` in any ASCII case, as
+/// [`attribute_pairs`] folds and keeps it. `key` must be lowercase and never
+/// a [`FOREIGN_ATTR_CASE`] key, so the fold is the plain ASCII one.
+fn painted_attr_value<'a, M>(attrs: &'a [Attribute<M>], key: &str) -> Option<&'a str> {
+    attrs.iter().rev().find_map(|a| match a {
+        Attribute::Attr(k, v) if k.eq_ignore_ascii_case(key) => Some(v.as_str()),
         _ => None,
     })
 }
@@ -1192,12 +1650,12 @@ pub fn html_no_attr_<M>() -> Attribute<M> {
 /// attacker data).
 #[must_use]
 pub fn html_on_msg_<M>(name: String, msg: M) -> Attribute<M> {
-    Attribute::EventAttr(Event::OnMsg(name, msg))
+    Attribute::EventAttr(Event::OnMsg(name, Box::new(msg)))
 }
 
 /// `Ipe.Html.Events.{onInput,onChange,onKeyDown,onKeyUp}` — a
 /// value-carrying event; the handler receives the input string. The compiler
-/// Arc-wraps the emitted Ipê fn before this call.
+/// passes the handler closure in its `Arc`.
 #[must_use]
 pub fn html_on_string_<M>(
     name: String,
@@ -1362,11 +1820,24 @@ crate::stringify::show_row!("HtmlEvent", Internals, [M] Event<M>, |_| "<Ipe.Html
 
 // ─── Retained measures for the Html runtime types ───────────────────────────
 
-impl<M: RetainedBytes> RetainedBytes for Html<M> {
+/// How a measure counts one event.
+type EventMeasure<M> = fn(&Event<M>) -> Option<Bytes>;
+
+impl<M: RetainedBytes> Html<M> {
+    /// The bytes a committed view keeps resident.
+    ///
+    /// As its [`RetainedBytes`] measure, except that a handler counts the
+    /// allocation of its closure and not the heap the closure's captures own,
+    /// which no `dyn Fn` exposes.
+    #[must_use]
+    pub fn view_bytes(&self) -> Option<Bytes> {
+        self.measure(Event::handler_floor)
+    }
+
     // Walked with an explicit worklist, as `Drop` is, so a deep tree is measured
     // without recursion. Each node counts its inline size once; an element adds
     // its tag, its attributes and its children list's spare slots.
-    fn retained_bytes(&self) -> Option<Bytes> {
+    fn measure(&self, event: EventMeasure<M>) -> Option<Bytes> {
         let node = Bytes::inline::<Self>()?;
         let mut total = Bytes::ZERO;
         let mut pending: Vec<&Self> = vec![self];
@@ -1375,10 +1846,15 @@ impl<M: RetainedBytes> RetainedBytes for Html<M> {
             match html {
                 Self::HElement(tag, attrs, children) => {
                     let spare = children.capacity().checked_sub(children.len())?;
+                    let attrs_spare = attrs.capacity().checked_sub(attrs.len())?;
                     total = total
                         .plus(tag)?
-                        .plus(attrs)?
+                        .checked_add(Bytes::inline::<Vec<Attribute<M>>>()?)?
+                        .checked_add(Bytes::slots::<Attribute<M>>(attrs_spare)?)?
                         .checked_add(Bytes::slots::<Self>(spare)?)?;
+                    for attr in attrs {
+                        total = total.checked_add(attr.measure(event)?)?;
+                    }
                     pending.extend(children);
                 }
                 Self::HText(text) | Self::HRaw(text) => total = total.plus(text)?,
@@ -1388,15 +1864,27 @@ impl<M: RetainedBytes> RetainedBytes for Html<M> {
     }
 }
 
-impl<M: RetainedBytes> RetainedBytes for Attribute<M> {
+impl<M: RetainedBytes> RetainedBytes for Html<M> {
     fn retained_bytes(&self) -> Option<Bytes> {
+        self.measure(<Event<M> as RetainedBytes>::retained_bytes)
+    }
+}
+
+impl<M: RetainedBytes> Attribute<M> {
+    fn measure(&self, event: EventMeasure<M>) -> Option<Bytes> {
         let inline = Bytes::inline::<Self>()?;
         match self {
             Self::Attr(key, value) => inline.plus(key)?.plus(value),
             Self::BoolAttr(key, on) => inline.plus(key)?.plus(on),
-            Self::EventAttr(event) => inline.plus(event),
+            Self::EventAttr(e) => inline.checked_add(event(e)?),
             Self::NoAttr => Some(inline),
         }
+    }
+}
+
+impl<M: RetainedBytes> RetainedBytes for Attribute<M> {
+    fn retained_bytes(&self) -> Option<Bytes> {
+        self.measure(<Event<M> as RetainedBytes>::retained_bytes)
     }
 }
 
@@ -1404,11 +1892,185 @@ impl<M: RetainedBytes> RetainedBytes for Event<M> {
     fn retained_bytes(&self) -> Option<Bytes> {
         let inline = Bytes::inline::<Self>()?;
         match self {
+            // `plus` on the box counts its allocation (`size_of::<M>()`) and
+            // the heap `M` owns.
             Self::OnMsg(name, msg) => inline.plus(name)?.plus(msg),
             // A handler's captured heap is not reachable through `dyn Fn`, so
             // its measure is unknown rather than an undercount.
             Self::OnString(..) | Self::OnBool(..) | Self::OnForm(..) | Self::OnWidget(..) => None,
         }
+    }
+}
+
+impl<M: RetainedBytes> Event<M> {
+    /// This event's bytes, a handler counting its closure's allocation but
+    /// not the heap its captures own.
+    pub(crate) fn handler_floor(&self) -> Option<Bytes> {
+        let inline = Bytes::inline::<Self>()?;
+        match self {
+            // As in the retained measure: the box's allocation and `M`'s heap.
+            Self::OnMsg(name, msg) => inline.plus(name)?.plus(msg),
+            Self::OnString(name, f) => inline.plus(name)?.checked_add(closure_bytes(f.as_ref())?),
+            Self::OnWidget(name, f) => inline.plus(name)?.checked_add(closure_bytes(f.as_ref())?),
+            Self::OnBool(name, f) => inline.plus(name)?.checked_add(closure_bytes(f.as_ref())?),
+            Self::OnForm(name, f) => inline.plus(name)?.checked_add(closure_bytes(f.as_ref())?),
+        }
+    }
+}
+
+/// The bytes the `Arc` allocation of closure `f` holds: its two reference
+/// counters and the closure itself.
+fn closure_bytes<F: ?Sized>(f: &F) -> Option<Bytes> {
+    Bytes::inline::<[usize; 2]>()?.plus_count(std::mem::size_of_val(f))
+}
+
+/// The drawn source view the runtime's view-measure tests share.
+///
+/// One builder for the element bound in this module and the render history
+/// in `dom::dispatch`, so the two modules' tests measure the same shape.
+#[cfg(test)]
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) mod drawn_shape {
+    use super::{Attribute, Event, Html, assign_ipe_ids};
+
+    /// A 600-byte message, as wide as a rich app `Msg`.
+    #[derive(Clone)]
+    #[allow(dead_code)] // the bytes are the width; nothing reads them
+    pub struct Wide(pub [u8; 600]);
+
+    crate::retained::inline_measure!(Wide);
+
+    /// An ancestor's key, as long as an app's `Attr.key` value.
+    const ANCESTOR_KEY: &str = "unit-row-key";
+
+    /// The levels from a `code` block down to its deepest drawn element.
+    ///
+    /// The `code` block, a line, a coloured run and the escape inside it.
+    pub const DRAWN_LEVELS: usize = 4;
+
+    /// A source view drawn as a code viewer draws it.
+    ///
+    /// `depth` is the nesting depth of its deepest element, the root counted:
+    /// `depth - DRAWN_LEVELS` keyed `div` ancestors hold one `code` block of
+    /// `lines` line elements with newline text between them. Each line holds
+    /// `runs` coloured runs, each followed by a text sibling; each run holds
+    /// `escapes` escape spans, each after a text sibling and holding its
+    /// spelling, the span both marked and styled. Each line carries a click
+    /// handler with a [`Wide`] message when `handlers` holds. When `spare`
+    /// holds, every children list keeps as many spare slots as it has
+    /// children, the most a list grown by doubling keeps.
+    #[derive(Clone, Copy)]
+    pub struct DrawnShape {
+        pub depth: usize,
+        pub lines: usize,
+        pub runs: usize,
+        pub escapes: usize,
+        pub handlers: bool,
+        pub spare: bool,
+    }
+
+    impl DrawnShape {
+        /// The keyed ancestors above the `code` block.
+        const fn ancestors(self) -> usize {
+            self.depth.saturating_sub(DRAWN_LEVELS)
+        }
+
+        /// The elements the shape draws, or `None` on overflow.
+        pub fn elements(self) -> Option<usize> {
+            let per_run = self.escapes.checked_add(1)?;
+            let per_line = self.runs.checked_mul(per_run)?.checked_add(1)?;
+            self.lines
+                .checked_mul(per_line)?
+                .checked_add(1)?
+                .checked_add(self.ancestors())
+        }
+
+        /// The view, stamped from root `"r"`.
+        pub fn build(self) -> Html<Wide> {
+            let mut view = self.code();
+            for _ in 0..self.ancestors() {
+                view = Html::HElement(
+                    "div".into(),
+                    vec![Attribute::Attr("ipe-key".into(), ANCESTOR_KEY.into())],
+                    vec![view],
+                );
+            }
+            assign_ipe_ids(&mut view, "r");
+            view
+        }
+
+        /// `kids` with the spare capacity the shape asks for.
+        fn children(self, mut kids: Vec<Html<Wide>>) -> Vec<Html<Wide>> {
+            if self.spare {
+                kids.reserve_exact(kids.len());
+            } else {
+                kids.shrink_to_fit();
+            }
+            kids
+        }
+
+        fn code(self) -> Html<Wide> {
+            let mut kids = Vec::new();
+            for row in 0..self.lines {
+                if row > 0 {
+                    kids.push(Html::HText("\n".into()));
+                }
+                kids.push(self.line(row));
+            }
+            Html::HElement(
+                "code".into(),
+                vec![Attribute::Attr(
+                    "style".into(),
+                    "display:block;flex:1;white-space:pre;color:#cdcdd7;unicode-bidi:bidi-override;direction:ltr".into(),
+                )],
+                self.children(kids),
+            )
+        }
+
+        fn line(self, row: usize) -> Html<Wide> {
+            let mut attrs = vec![Attribute::Attr("style".into(), "white-space:pre".into())];
+            if self.handlers {
+                attrs.push(Attribute::EventAttr(Event::OnMsg(
+                    "click".into(),
+                    Box::new(Wide([0; 600])),
+                )));
+            }
+            let mut kids = Vec::new();
+            for col in 0..self.runs {
+                kids.push(self.run(row, col));
+                kids.push(Html::HText(format!(" s{col}")));
+            }
+            Html::HElement("span".into(), attrs, self.children(kids))
+        }
+
+        /// One coloured run: `escapes` escape spans, each after its text.
+        fn run(self, row: usize, col: usize) -> Html<Wide> {
+            let mut kids = Vec::new();
+            for _ in 0..self.escapes {
+                kids.push(Html::HText(format!("t{row}x{col}")));
+                kids.push(escape());
+            }
+            Html::HElement(
+                "span".into(),
+                vec![Attribute::Attr("style".into(), "color:#c792ea".into())],
+                self.children(kids),
+            )
+        }
+    }
+
+    /// One escape span: marked, styled, holding one escape's spelling.
+    fn escape() -> Html<Wide> {
+        Html::HElement(
+            "span".into(),
+            vec![
+                Attribute::Attr("data-review-escape".into(), "true".into()),
+                Attribute::Attr(
+                    "style".into(),
+                    "background-color:#4a3410;border:1px solid #c98a2b;border-radius:2px;color:#ffd27a".into(),
+                ),
+            ],
+            vec![Html::HText("\\u{202E}".into())],
+        )
     }
 }
 
@@ -1419,6 +2081,324 @@ mod tests {
     #[derive(Clone, Debug, PartialEq)]
     enum Msg {
         Inc,
+    }
+
+    /// An element with no attributes.
+    const NO_ATTRS: &[Attribute<()>] = &[];
+
+    /// An element `tag` with attributes `attrs` and no children.
+    fn bare(tag: &str, attrs: Vec<Attribute<()>>) -> Html<()> {
+        Html::HElement(tag.into(), attrs, vec![])
+    }
+
+    fn attr(k: &str, v: &str) -> Attribute<()> {
+        Attribute::Attr(k.into(), v.into())
+    }
+
+    /// The `sandbox` attributes `out` paints, in any ASCII case.
+    fn sandboxes(out: &str) -> usize {
+        out.to_ascii_lowercase().matches(" sandbox=").count()
+    }
+
+    /// An `iframe` the app gave no `sandbox` paints the empty one, whatever
+    /// the tag's case.
+    #[test]
+    fn an_iframe_without_sandbox_renders_an_empty_sandbox() {
+        let built =
+            crate::ui::helpers::html_node_::<()>("iframe".into(), vec![attr("src", "/")], vec![]);
+        let out = render_html(&built);
+        assert_eq!(out, "<iframe sandbox=\"\" src=\"/\"></iframe>");
+        let out = render_html(&bare("IFRAME", vec![attr("src", "/")]));
+        assert_eq!(sandboxes(&out), 1, "{out}");
+        assert!(out.contains(" sandbox=\"\""), "{out}");
+    }
+
+    /// Every case variant of `sandbox` folds into one, the last one read.
+    #[test]
+    fn every_case_of_sandbox_folds_into_one_canonical_value() {
+        let out = render_html(&bare(
+            "iframe",
+            vec![
+                attr("sandbox", "allow-forms"),
+                attr("SANDBOX", "allow-modals"),
+                attr("SandBox", "ALLOW-SCRIPTS allow-popups allow-scripts"),
+            ],
+        ));
+        assert_eq!(sandboxes(&out), 1, "{out}");
+        assert!(
+            out.contains(" sandbox=\"allow-popups allow-scripts\""),
+            "{out}"
+        );
+    }
+
+    /// Neither token that gives the framed document or its popups the app's
+    /// origin back reaches the page, in any case; a token that is only ASCII
+    /// case-equal through a non-ASCII byte, or carries a NUL, is unknown.
+    #[test]
+    fn allow_same_origin_never_reaches_the_page() {
+        let out = render_html(&bare(
+            "iframe",
+            vec![attr(
+                "sandbox",
+                "allow-scripts ALLOW-SAME-ORIGIN allow-same-origin allow-popups-to-escape-sandbox",
+            )],
+        ));
+        assert_eq!(out, "<iframe sandbox=\"allow-scripts\"></iframe>");
+        let out = render_html(&bare(
+            "iframe",
+            vec![attr(
+                "sandbox",
+                "allow-pointer-loc\u{212A} allow-forms\u{0} allow-modals",
+            )],
+        ));
+        assert_eq!(out, "<iframe sandbox=\"allow-modals\"></iframe>");
+    }
+
+    /// An unknown token is dropped, and a held boolean `sandbox` (painted
+    /// `"true"`, no token) is the empty sandbox.
+    #[test]
+    fn unknown_sandbox_tokens_are_dropped() {
+        let out = render_html(&bare(
+            "iframe",
+            vec![attr("sandbox", "allow-everything allow-forms bogus")],
+        ));
+        assert_eq!(out, "<iframe sandbox=\"allow-forms\"></iframe>");
+        let out = render_html(&bare(
+            "iframe",
+            vec![Attribute::BoolAttr("sandbox".into(), true)],
+        ));
+        assert_eq!(out, "<iframe sandbox=\"\"></iframe>");
+    }
+
+    /// An `embed`, `object` or `frame` carrying its loading attribute, in any
+    /// key case and with any value, renders nothing, in HTML and in foreign
+    /// content alike; without that attribute it still renders.
+    #[test]
+    fn a_frame_loader_with_its_url_renders_nothing() {
+        let loaders = [
+            ("embed", "src"),
+            ("EMBED", "SRC"),
+            ("object", "data"),
+            ("Object", "Data"),
+            ("frame", "src"),
+            ("frame", "SRC"),
+        ];
+        for (tag, key) in loaders {
+            for value in ["", " ", "/", "https://x"] {
+                let loader = || bare(tag, vec![attr("title", "t"), attr(key, value)]);
+                let shown = |outer: Html<()>| {
+                    let out = render_html(&outer);
+                    assert!(
+                        !out.to_ascii_lowercase()
+                            .contains(&format!("<{}", tag.to_ascii_lowercase())),
+                        "<{tag} {key}={value:?}> rendered: {out}"
+                    );
+                };
+                shown(Html::HElement("div".into(), vec![], vec![loader()]));
+                shown(Html::HElement("svg".into(), vec![], vec![loader()]));
+                shown(Html::HElement(
+                    "svg".into(),
+                    vec![],
+                    vec![Html::HElement(
+                        "foreignObject".into(),
+                        vec![],
+                        vec![loader()],
+                    )],
+                ));
+            }
+            assert_eq!(
+                admit_element(tag, &[attr(key, "/")], &[] as &[Html<()>]),
+                Err(ElementRefusal::UnsandboxableFrame)
+            );
+        }
+        let held = bare("embed", vec![Attribute::BoolAttr("src".into(), true)]);
+        assert!(!render_html(&held).contains("<embed"));
+        let out = render_html(&bare("embed", vec![attr("type", "x")]));
+        assert!(out.starts_with("<embed"), "{out}");
+        let out = render_html(&bare("object", vec![attr("src", "/")]));
+        assert!(out.starts_with("<object"), "{out}");
+    }
+
+    /// `Html.node` builds a frame loader with its URL as empty text.
+    #[test]
+    fn html_node_refuses_a_frame_loader() {
+        for (tag, key) in FRAME_LOADERS {
+            let node =
+                crate::ui::helpers::html_node_::<()>(tag.into(), vec![attr(key, "/")], vec![]);
+            assert!(
+                matches!(&node, Html::HText(t) if t.is_empty()),
+                "<{tag} {key}>: {node:?}"
+            );
+        }
+        let kept = crate::ui::helpers::html_node_::<()>("embed".into(), vec![], vec![]);
+        assert!(matches!(kept, Html::HElement(..)));
+    }
+
+    /// The browser client's literal copy of the frame tables equals the
+    /// runtime's, and the rule covers exactly the four document-loading tags.
+    #[test]
+    fn client_js_frame_table_matches_the_runtime() {
+        const CLIENT_JS: &str = include_str!("web/client.js");
+        let tokens: Vec<String> = SANDBOX_TOKENS.iter().map(|t| format!("\"{t}\"")).collect();
+        let tokens = format!("var __IPE_SANDBOX_TOKENS = [{}];", tokens.join(", "));
+        let loaders: Vec<String> = FRAME_LOADERS
+            .iter()
+            .map(|(t, k)| format!("[\"{t}\", \"{k}\"]"))
+            .collect();
+        let loaders = format!("var __IPE_FRAME_LOADERS = [{}];", loaders.join(", "));
+        for (decl, name) in [
+            (tokens, "__IPE_SANDBOX_TOKENS ="),
+            (loaders, "__IPE_FRAME_LOADERS ="),
+        ] {
+            assert_eq!(CLIENT_JS.matches(name).count(), 1, "one {name}");
+            assert_eq!(CLIENT_JS.matches(decl.as_str()).count(), 1, "{decl}");
+        }
+        let mut tags: Vec<&str> = FRAME_LOADERS.iter().map(|(t, _)| *t).collect();
+        tags.push(IFRAME_TAG);
+        tags.sort_unstable();
+        assert_eq!(tags, ["embed", "frame", "iframe", "object"]);
+        for forbidden in ["allow-same-origin", "allow-popups-to-escape-sandbox"] {
+            assert!(!SANDBOX_TOKENS.contains(&forbidden), "{forbidden}");
+            assert_eq!(SandboxTokens::parse(forbidden).canonical(), "");
+        }
+    }
+
+    /// A long attribute list merges and overrides exactly as a short one: the
+    /// hash index past the scan threshold agrees with a plain scan, keys
+    /// written in another case included.
+    #[test]
+    fn attribute_pairs_agree_past_the_scan_threshold() {
+        fn scanned(attrs: &[Attribute<()>]) -> Vec<(String, String)> {
+            let mut pairs: Vec<(String, String)> = vec![];
+            for a in attrs {
+                let (k, v, joins) = match a {
+                    Attribute::Attr(k, v) => (k.to_ascii_lowercase(), v.as_str(), true),
+                    Attribute::BoolAttr(k, true) => (k.to_ascii_lowercase(), "true", false),
+                    _ => continue,
+                };
+                match pairs.iter_mut().find(|(pk, _)| *pk == k) {
+                    Some((_, e)) if joins && !e.is_empty() && k == "class" => {
+                        e.push(' ');
+                        e.push_str(v);
+                    }
+                    Some((_, e)) if joins && !e.is_empty() && k == "style" => {
+                        e.push_str(if e.ends_with(';') { " " } else { "; " });
+                        e.push_str(v);
+                    }
+                    Some((_, e)) => *e = v.to_owned(),
+                    None => pairs.push((k, v.to_owned())),
+                }
+            }
+            pairs
+        }
+        let mut attrs: Vec<Attribute<()>> = vec![
+            Attribute::Attr("class".into(), "a".into()),
+            Attribute::Attr("style".into(), "p: 1;".into()),
+        ];
+        attrs.extend((0..40).map(|i| Attribute::Attr(format!("data-{i}"), i.to_string())));
+        attrs.extend([
+            Attribute::Attr("class".into(), "b".into()),
+            Attribute::Attr("STYLE".into(), "q: 2".into()),
+            Attribute::Attr("Data-3".into(), "over".into()),
+            Attribute::BoolAttr("class".into(), true),
+            Attribute::Attr("Class".into(), "c".into()),
+            Attribute::Attr("data-late".into(), String::new()),
+            Attribute::Attr("DATA-LATE".into(), "set".into()),
+        ]);
+        for len in 0..=attrs.len() {
+            let slice = attrs.get(..len).unwrap_or_default();
+            let got: Vec<(String, String)> = attribute_pairs(ParseContext::Data, "div", slice)
+                .into_iter()
+                .map(|(k, v)| (k.into_owned(), v.into_owned()))
+                .collect();
+            assert_eq!(got, scanned(slice), "{len}");
+        }
+    }
+
+    /// Two keys that differ only in ASCII case are one attribute, as they are
+    /// in the painted document: the last write paints, a merged attribute
+    /// joins across case, and no key is written in the case the app spelled.
+    #[test]
+    fn attribute_keys_fold_to_the_name_the_dom_stores() {
+        let out = render_html(&bare(
+            "div",
+            vec![
+                attr("Title", "a"),
+                attr("title", "b"),
+                attr("Class", "x"),
+                attr("class", "y"),
+                attr("DATA-N", "1"),
+            ],
+        ));
+        assert_eq!(
+            out, r#"<div class="x y" data-n="1" title="b"></div>"#,
+            "{out}"
+        );
+        let out = render_html(&bare("input", vec![attr("Title", "a"), attr("title", "b")]));
+        assert!(
+            out.contains(r#" title="b""#) && !out.contains("Title"),
+            "{out}"
+        );
+        assert_eq!(out.matches("title=").count(), 1, "{out}");
+    }
+
+    /// On an HTML element a mixed-case key stores lowercase; on an SVG or
+    /// MathML element, and every element below one, the parser's adjusted
+    /// spellings store as adjusted, so a `VIEWBOX` and a `viewBox` are one
+    /// `viewBox`, and a `viewBox` already in its stored case is kept.
+    #[test]
+    fn foreign_attribute_keys_keep_their_stored_case() {
+        let svg = Html::HElement(
+            "svg".into(),
+            vec![
+                attr("VIEWBOX", "0 0 1 1"),
+                attr("viewBox", "0 0 2 2"),
+                attr("PreserveAspectRatio", "none"),
+                attr("Fill", "red"),
+            ],
+            vec![bare(
+                "linearGradient",
+                vec![attr("GRADIENTUNITS", "userSpaceOnUse")],
+            )],
+        );
+        let out = render_html(&svg);
+        assert_eq!(
+            out,
+            r#"<svg fill="red" preserveAspectRatio="none" viewBox="0 0 2 2"><linearGradient gradientUnits="userSpaceOnUse"></linearGradient></svg>"#,
+            "{out}"
+        );
+        let math = render_html(&bare("math", vec![attr("DefinitionURL", "u")]));
+        assert_eq!(math, r#"<math definitionURL="u"></math>"#, "{math}");
+        let html = render_html(&bare("div", vec![attr("viewBox", "0 0 1 1")]));
+        assert_eq!(html, r#"<div viewbox="0 0 1 1"></div>"#, "{html}");
+        for ctx in [ParseContext::Data, ParseContext::RawOrRcdata] {
+            assert_eq!(stored_attr_key(ctx, "viewBox"), "viewbox");
+            assert_eq!(stored_attr_key(ctx, "title"), "title");
+        }
+        assert_eq!(stored_attr_key(ParseContext::Foreign, "VIEWBOX"), "viewBox");
+        assert_eq!(stored_attr_key(ParseContext::Foreign, "Title"), "title");
+        assert!(matches!(
+            stored_attr_key(ParseContext::Foreign, "viewBox"),
+            Cow::Borrowed("viewBox")
+        ));
+        assert!(matches!(
+            stored_attr_key(ParseContext::Data, "title"),
+            Cow::Borrowed("title")
+        ));
+    }
+
+    /// Every stored spelling of the foreign table is reached from its own
+    /// lowercase fold and from any other ASCII case of it, so the binary
+    /// search over the table agrees with a scan.
+    #[test]
+    fn every_foreign_attr_spelling_is_reached_in_any_case() {
+        for (folded, stored) in &FOREIGN_ATTR_CASE {
+            assert_eq!(stored_attr_key(ParseContext::Foreign, folded), *stored);
+            assert_eq!(stored_attr_key(ParseContext::Foreign, stored), *stored);
+            let upper = stored.to_ascii_uppercase();
+            assert_eq!(stored_attr_key(ParseContext::Foreign, &upper), *stored);
+            assert_eq!(stored_attr_key(ParseContext::Data, &upper), *folded);
+        }
     }
 
     // A tree far deeper than any recursion could walk is measured on the heap,
@@ -1442,12 +2422,197 @@ mod tests {
         assert_eq!(attr.retained_bytes(), None);
     }
 
+    // A committed view counts a handler by its closure, so a view the
+    // retained measure refuses is still charged, and every text byte with it.
+    #[test]
+    fn a_view_with_handlers_is_measured_by_its_closures() {
+        let text = "t".repeat(4096);
+        let view: Html<String> = Html::HElement(
+            "input".into(),
+            vec![html_on_string_("input".into(), std::sync::Arc::new(|s| s))],
+            vec![Html::HText(text)],
+        );
+        assert_eq!(view.retained_bytes(), None);
+        assert!(view.view_bytes().is_some_and(|n| n.get() >= 4096));
+    }
+
+    // A view without handlers counts the same under both measures.
+    #[test]
+    fn a_handler_free_view_measures_alike() {
+        let view: Html<String> = Html::HElement(
+            "p".into(),
+            vec![
+                Attribute::Attr("class".into(), "c".repeat(64)),
+                Attribute::EventAttr(Event::OnMsg("click".into(), Box::new("m".repeat(64)))),
+            ],
+            vec![Html::HText("x".repeat(64))],
+        );
+        assert!(view.retained_bytes().is_some());
+        assert_eq!(view.view_bytes(), view.retained_bytes());
+    }
+
     // A message an event carries counts toward the attribute holding it.
     #[test]
     fn an_event_counts_its_message() {
         let msg = "m".repeat(4096);
-        let attr: Attribute<String> = Attribute::EventAttr(Event::OnMsg("click".into(), msg));
+        let attr: Attribute<String> =
+            Attribute::EventAttr(Event::OnMsg("click".into(), Box::new(msg)));
         assert!(attr.retained_bytes().is_some_and(|n| n.get() >= 4096));
+    }
+
+    use super::drawn_shape::{DrawnShape, Wide};
+
+    /// A 4 KiB message.
+    #[derive(Clone)]
+    #[allow(dead_code)] // the bytes are the width; nothing reads them
+    struct Huge([u8; 4096]);
+
+    crate::retained::inline_measure!(Huge);
+
+    // A wide message does not widen the attribute that carries it.
+    #[test]
+    fn a_wide_message_keeps_the_attribute_size() {
+        assert_eq!(size_of::<Attribute<Wide>>(), size_of::<Attribute<()>>());
+        assert_eq!(size_of::<Attribute<Huge>>(), size_of::<Attribute<()>>());
+    }
+
+    // Every boxed message is charged at its full width, not by its pointer.
+    #[test]
+    fn a_boxed_message_is_charged_at_its_width() {
+        let n = 32_usize;
+        let view: Html<Huge> = Html::HElement(
+            "div".into(),
+            Vec::new(),
+            (0..n)
+                .map(|_| {
+                    Html::HElement(
+                        "button".into(),
+                        vec![html_on_msg_("click".into(), Huge([0; 4096]))],
+                        Vec::new(),
+                    )
+                })
+                .collect(),
+        );
+        let floor = u64::try_from(n * 4096).ok();
+        let measured = view.view_bytes().map(Bytes::get);
+        assert!(
+            measured.zip(floor).is_some_and(|(m, f)| m >= f),
+            "{measured:?} < {floor:?}"
+        );
+    }
+
+    // Stamping an element adds exactly the one slot its id needs.
+    #[test]
+    fn a_stamped_element_holds_no_spare_attribute_slot() {
+        let mut view: Html<()> = Html::HElement(
+            "div".into(),
+            vec![Attribute::Attr("class".into(), "c".into())],
+            vec![Html::HElement("span".into(), Vec::new(), Vec::new())],
+        );
+        assign_ipe_ids(&mut view, "0");
+        let mut pending = vec![&view];
+        let mut seen = 0_usize;
+        while let Some(node) = pending.pop() {
+            if let Html::HElement(_, attrs, kids) = node {
+                assert_eq!(attrs.capacity(), attrs.len(), "{attrs:?}");
+                seen += 1;
+                pending.extend(kids);
+            }
+        }
+        assert_eq!(seen, 2);
+    }
+
+    // The shape's element count is the elements it draws, and its deepest
+    // element sits at its depth, so a bound taken per counted element at a
+    // declared depth is a bound per drawn one at that depth.
+    #[test]
+    fn the_drawn_shape_draws_the_elements_it_counts() {
+        let shape = DrawnShape {
+            depth: 9,
+            lines: 12,
+            runs: 3,
+            escapes: 2,
+            handlers: true,
+            spare: true,
+        };
+        let view = shape.build();
+        let mut pending = vec![(&view, 1_usize)];
+        let (mut seen, mut deepest) = (0_usize, 0_usize);
+        while let Some((node, depth)) = pending.pop() {
+            if let Html::HElement(_, _, kids) = node {
+                seen += 1;
+                deepest = deepest.max(depth);
+                pending.extend(kids.iter().map(|kid| (kid, depth + 1)));
+            }
+        }
+        assert_eq!(Some(seen), shape.elements());
+        assert_eq!(deepest, shape.depth);
+    }
+
+    /// The element bound at the declared depth, measured on the shared shape.
+    #[cfg(feature = "web")]
+    mod element_bound {
+        use super::super::drawn_shape::DrawnShape;
+        use crate::web::budget::{DRAWN_ELEMENT_BYTES, DRAWN_ELEMENT_DEPTH};
+
+        /// The resident bytes per element of `shape` once stamped, or `None` on overflow.
+        fn bytes_per_element(shape: DrawnShape) -> Option<u64> {
+            let measured = shape.build().view_bytes()?.get();
+            measured.checked_div(u64::try_from(shape.elements()?).ok()?)
+        }
+
+        /// Source views of about the app's element ceiling, their deepest
+        /// element at `depth`, every children list at its most spare: the line
+        /// ceiling's lines of two runs of one escape each; one line of one run
+        /// of six thousand escapes, the dearest element (two attributes, its
+        /// spelling and a text sibling) and the most of it; and a mix.
+        ///
+        /// A child index past the thousandth spells four digits.
+        fn drawn_at(depth: usize) -> [DrawnShape; 3] {
+            let shape = |lines, runs, escapes| DrawnShape {
+                depth,
+                lines,
+                runs,
+                escapes,
+                handlers: false,
+                spare: true,
+            };
+            [shape(5000, 2, 1), shape(1, 1, 6000), shape(1000, 1, 5)]
+        }
+
+        // Every composition of a source view a code viewer draws, its deepest
+        // element at the depth the contract declares under keyed ancestors,
+        // stays within the per-element bound once stamped: the bound is the
+        // dearest composition's, not one view's average.
+        #[test]
+        fn a_drawn_source_view_of_any_composition_stays_within_the_element_bound() {
+            for shape in drawn_at(DRAWN_ELEMENT_DEPTH) {
+                let per = bytes_per_element(shape);
+                assert!(
+                    per.is_some_and(|p| p <= DRAWN_ELEMENT_BYTES.get()),
+                    "{per:?} > {DRAWN_ELEMENT_BYTES:?} at {} lines x {} runs x {} escapes",
+                    shape.lines,
+                    shape.runs,
+                    shape.escapes
+                );
+            }
+        }
+
+        // The same views forty levels deeper than the contract pass the
+        // bound: the measure sees the depth, so a deeper page turns it red.
+        #[test]
+        fn a_drawn_source_view_past_the_declared_depth_breaks_the_element_bound() {
+            for shape in drawn_at(DRAWN_ELEMENT_DEPTH + 40) {
+                let per = bytes_per_element(shape);
+                assert!(
+                    per.is_some_and(|p| p > DRAWN_ELEMENT_BYTES.get()),
+                    "{per:?} <= {DRAWN_ELEMENT_BYTES:?} at {} lines x {} runs x {} escapes",
+                    shape.lines,
+                    shape.runs,
+                    shape.escapes
+                );
+            }
+        }
     }
 
     // An attribute's `{:?}` names the attribute and hides its value.
@@ -1731,7 +2896,10 @@ mod tests {
     fn render_emits_data_event_attr() {
         let t: Html<()> = Html::HElement(
             "button".into(),
-            vec![Attribute::EventAttr(Event::OnMsg("click".into(), ()))],
+            vec![Attribute::EventAttr(Event::OnMsg(
+                "click".into(),
+                Box::new(()),
+            ))],
             vec![],
         );
         let mut t = t;
@@ -2036,6 +3204,35 @@ mod tests {
         assert!(collect_ids(&t).contains(&"r_0_input:email".to_string()));
     }
 
+    /// The implicit key is the `name` the painted document holds: a `NAME`
+    /// written in another case names the same attribute, and the last write
+    /// is the one painted, so the key follows it.
+    #[test]
+    fn the_implicit_key_is_the_painted_name() {
+        let form = |attrs: Vec<Attribute<()>>| -> Html<()> {
+            Html::HElement(
+                "form".into(),
+                vec![],
+                vec![Html::HElement("input".into(), attrs, vec![])],
+            )
+        };
+        let mut t = form(vec![Attribute::Attr("NAME".into(), "email".into())]);
+        assign_ipe_ids(&mut t, "r");
+        assert_eq!(
+            collect_ids(&t),
+            vec!["r".to_string(), "r_0_input:email".to_string()]
+        );
+        let mut t = form(vec![
+            Attribute::Attr("name".into(), "first".into()),
+            Attribute::Attr("Name".into(), "last".into()),
+        ]);
+        assign_ipe_ids(&mut t, "r");
+        assert_eq!(
+            collect_ids(&t),
+            vec!["r".to_string(), "r_0_input:last".to_string()]
+        );
+    }
+
     /// Inverse of `push_id_segment`: `None` for a byte outside the encoding.
     fn decode_id_segment(encoded: &str) -> Option<String> {
         let mut out = Vec::new();
@@ -2204,6 +3401,35 @@ mod tests {
         assert!(!low.contains("ipe-"), "{low}");
     }
 
+    /// The case fold must never turn a program-built reserved key into the
+    /// exact stamped-id spelling the sinks admit.
+    #[test]
+    fn attribute_pairs_drop_reserved_keys_before_the_case_fold() {
+        let attrs: Vec<Attribute<()>> = vec![
+            Attribute::Attr("IPE-ID".into(), "forged".into()),
+            Attribute::Attr("Ipe-Id".into(), "forged".into()),
+            Attribute::BoolAttr("IPE-Flag".into(), true),
+            Attribute::Attr("NONCE".into(), "n".into()),
+            Attribute::Attr("Data-IPE-HID".into(), "h".into()),
+            Attribute::Attr(STAMPED_ID_ATTR.into(), "r".into()),
+            Attribute::Attr("Title".into(), "t".into()),
+        ];
+        for ctx in [ParseContext::Data, ParseContext::Foreign] {
+            let got: Vec<(String, String)> = attribute_pairs(ctx, "div", &attrs)
+                .into_iter()
+                .map(|(k, v)| (k.into_owned(), v.into_owned()))
+                .collect();
+            assert_eq!(
+                got,
+                vec![
+                    (STAMPED_ID_ATTR.to_owned(), "r".to_owned()),
+                    ("title".to_owned(), "t".to_owned()),
+                ],
+                "{ctx:?}"
+            );
+        }
+    }
+
     #[test]
     fn stamper_leaves_the_stamped_id_as_the_only_reserved_attr() {
         let mut t: Html<()> = Html::HElement(
@@ -2243,7 +3469,7 @@ mod tests {
             vec![
                 Attribute::Attr("data-ipe-hid".into(), "r_9_button".into()),
                 Attribute::Attr("Data-Ipe-Hid".into(), "r_9_button".into()),
-                Attribute::EventAttr(Event::OnMsg("click".into(), ())),
+                Attribute::EventAttr(Event::OnMsg("click".into(), Box::new(()))),
             ],
             vec![],
         );
@@ -2292,7 +3518,10 @@ mod tests {
     fn html_tree_constructs() {
         let t: Html<Msg> = Html::HElement(
             "button".into(),
-            vec![Attribute::EventAttr(Event::OnMsg("click".into(), Msg::Inc))],
+            vec![Attribute::EventAttr(Event::OnMsg(
+                "click".into(),
+                Box::new(Msg::Inc),
+            ))],
             vec![Html::HText("+".into())],
         );
         match &t {
@@ -2305,7 +3534,8 @@ mod tests {
         }
 
         // Clone + PartialEq round-trip on an attribute holding a closure.
-        let attr: Attribute<Msg> = Attribute::EventAttr(Event::OnMsg("click".into(), Msg::Inc));
+        let attr: Attribute<Msg> =
+            Attribute::EventAttr(Event::OnMsg("click".into(), Box::new(Msg::Inc)));
         assert_eq!(attr, attr.clone());
         // Debug prints the variant name + event name, not a numeric discriminant.
         let dbg = format!("{attr:?}");
@@ -2464,39 +3694,54 @@ mod tests {
         let raw = || vec![Html::<()>::HRaw("r".into())];
         let none: Vec<Html<()>> = Vec::new();
         assert_eq!(
-            admit_element("script", &text()),
+            admit_element("script", NO_ATTRS, &text()),
             Err(ElementRefusal::UntrustedScript)
         );
         assert_eq!(
-            admit_element("ScRiPt", &text()),
+            admit_element("ScRiPt", NO_ATTRS, &text()),
             Err(ElementRefusal::UntrustedScript)
         );
         assert_eq!(
-            admit_element("script", &none),
+            admit_element("script", NO_ATTRS, &none),
             Err(ElementRefusal::UntrustedScript)
         );
         assert_eq!(
-            admit_element("style", &text()),
+            admit_element("style", NO_ATTRS, &text()),
             Err(ElementRefusal::UntrustedStyle)
         );
         assert_eq!(
-            admit_element("STYLE", &text()),
+            admit_element("STYLE", NO_ATTRS, &text()),
             Err(ElementRefusal::UntrustedStyle)
         );
         assert_eq!(
-            admit_element("plaintext", &none),
+            admit_element("plaintext", NO_ATTRS, &none),
             Err(ElementRefusal::Unclosable)
         );
-        assert_eq!(admit_element("x y", &none), Err(ElementRefusal::UnsafeName));
-        assert_eq!(admit_element("script", &raw()), Ok(ElementBody::Script));
-        assert_eq!(admit_element("SCRIPT", &raw()), Ok(ElementBody::Script));
-        assert_eq!(admit_element("style", &raw()), Ok(ElementBody::Style));
-        assert_eq!(admit_element("style", &none), Ok(ElementBody::Style));
+        assert_eq!(
+            admit_element("x y", NO_ATTRS, &none),
+            Err(ElementRefusal::UnsafeName)
+        );
+        assert_eq!(
+            admit_element("script", NO_ATTRS, &raw()),
+            Ok(ElementBody::Script)
+        );
+        assert_eq!(
+            admit_element("SCRIPT", NO_ATTRS, &raw()),
+            Ok(ElementBody::Script)
+        );
+        assert_eq!(
+            admit_element("style", NO_ATTRS, &raw()),
+            Ok(ElementBody::Style)
+        );
+        assert_eq!(
+            admit_element("style", NO_ATTRS, &none),
+            Ok(ElementBody::Style)
+        );
         for tag in [
             "div", "p", "title", "textarea", "noscript", "iframe", "template", "svg",
         ] {
             assert_eq!(
-                admit_element(tag, &text()),
+                admit_element(tag, NO_ATTRS, &text()),
                 Ok(ElementBody::Markup),
                 "<{tag}>"
             );
@@ -2882,20 +4127,26 @@ mod tests {
     fn admit_in_context_refuses_a_script_outside_data_state() {
         let raw = vec![Html::<()>::HRaw("r".into())];
         assert_eq!(
-            admit_in_context(ParseContext::Data, "script", &raw),
+            admit_in_context(ParseContext::Data, "script", NO_ATTRS, &raw),
             Ok(ElementBody::Script)
         );
         for ctx in [ParseContext::RawOrRcdata, ParseContext::Foreign] {
             assert_eq!(
-                admit_in_context(ctx, "script", &raw),
+                admit_in_context(ctx, "script", NO_ATTRS, &raw),
                 Err(ElementRefusal::ScriptOutsideData)
             );
             assert_eq!(
-                admit_in_context(ctx, "SCRIPT", &raw),
+                admit_in_context(ctx, "SCRIPT", NO_ATTRS, &raw),
                 Err(ElementRefusal::ScriptOutsideData)
             );
-            assert_eq!(admit_in_context(ctx, "style", &raw), Ok(ElementBody::Style));
-            assert_eq!(admit_in_context(ctx, "div", &raw), Ok(ElementBody::Markup));
+            assert_eq!(
+                admit_in_context(ctx, "style", NO_ATTRS, &raw),
+                Ok(ElementBody::Style)
+            );
+            assert_eq!(
+                admit_in_context(ctx, "div", NO_ATTRS, &raw),
+                Ok(ElementBody::Markup)
+            );
         }
     }
 
@@ -2962,5 +4213,87 @@ mod tests {
             render_html(&element("div", vec![trusted_script("init();")])),
             "<div><script>init();</script></div>"
         );
+    }
+
+    fn css(css: &str) -> Html<()> {
+        element("style", vec![Html::HRaw(css.into())])
+    }
+
+    /// A `<style>` the tokenizer opens as an element, in HTML data state or in
+    /// foreign content, carries the session nonce; one in raw text or RCDATA
+    /// is text there, and an unstamped render stamps nothing.
+    #[test]
+    fn style_stamped_only_in_data_and_foreign() {
+        let nonce = StyleNonce::from_random_bytes([0x3e; 16]);
+        let attr = format!(" nonce=\"{}\"", nonce.as_token());
+        let page = render_stamped(&element("div", vec![css("p{}")]), &nonce);
+        assert_eq!(
+            page.as_str(),
+            format!("<div><style{attr}>p{{}}</style></div>")
+        );
+        assert_eq!(page.nonce().as_token(), nonce.as_token());
+        let shown = format!("{page:?}");
+        assert!(
+            !shown.contains(&nonce.as_token()) && !shown.contains("nonce"),
+            "{shown}"
+        );
+        let svg = render_stamped(&element("svg", vec![css("p{}")]), &nonce);
+        assert!(
+            svg.as_str().contains(&format!("<style{attr}>")),
+            "{}",
+            svg.as_str()
+        );
+        for host in ["textarea", "title"] {
+            let page = render_stamped(&element(host, vec![css("p{}")]), &nonce);
+            assert!(
+                !page.as_str().contains("nonce"),
+                "{host}: {}",
+                page.as_str()
+            );
+        }
+        for host in ["div", "svg"] {
+            let out = render_html_in(&element(host, vec![css("p{}")]), &RenderCtx::Unstamped);
+            assert!(!out.contains("nonce"), "{host}: {out}");
+            assert_eq!(out, render_html(&element(host, vec![css("p{}")])));
+        }
+    }
+
+    /// Trusted raw markup is written verbatim: a `<style>` inside it is the
+    /// author's and never gets the session nonce.
+    #[test]
+    fn raw_style_never_stamped() {
+        let nonce = StyleNonce::from_random_bytes([0x4f; 16]);
+        let raw = "<style>p{}</style>";
+        let page = render_stamped(&element("div", vec![Html::HRaw(raw.into())]), &nonce);
+        assert_eq!(page.as_str(), format!("<div>{raw}</div>"));
+    }
+
+    /// A program-built `nonce` attribute, in any case, is refused at the render
+    /// sink and the patch sink, so only the runtime's stamp is ever written.
+    #[test]
+    fn author_nonce_refused_at_render_and_patch() {
+        for name in ["nonce", "NONCE", "nOnCe"] {
+            assert!(SafeAttrName::parse(name).is_none(), "{name}");
+            assert!(safe_patch_attr(name, "forged").is_none(), "{name}");
+            let forged: Html<()> = Html::HElement(
+                "style".into(),
+                vec![Attribute::Attr(name.into(), "forged".into())],
+                vec![Html::HRaw("p{}".into())],
+            );
+            assert!(!render_html(&forged).contains("forged"), "{name}");
+            let nonce = StyleNonce::from_random_bytes([0x5a; 16]);
+            let page = render_stamped(&forged, &nonce);
+            assert!(
+                !page.as_str().contains("forged"),
+                "{name}: {}",
+                page.as_str()
+            );
+            assert_eq!(
+                page.as_str().matches("nonce=").count(),
+                1,
+                "{}",
+                page.as_str()
+            );
+        }
     }
 }

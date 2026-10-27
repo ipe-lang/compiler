@@ -26,11 +26,10 @@ fn repo_root() -> PathBuf {
     std::fs::canonicalize(&joined).unwrap_or(joined)
 }
 
-fn entry_path(root: &Path) -> PathBuf {
+fn project_path(root: &Path) -> PathBuf {
     root.join("tests")
         .join("golden")
         .join("display_false_positive")
-        .join("Main.ipe")
 }
 
 /// ipe-0 ∧ the wildcard row generic carries `IpeRow` but NOT `Display` —
@@ -38,14 +37,14 @@ fn entry_path(root: &Path) -> PathBuf {
 #[test]
 fn i186_false_positive_ipec_no_spurious_display() {
     let root = repo_root();
-    let entry = entry_path(&root);
+    let entry = project_path(&root);
     let out =
         PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("i186_display_false_positive_ipec_out");
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
 
-    let built = ipe::build_loose_file(&entry, &out, &runtime);
+    let built = crate::support::build_golden(&entry, &out, &runtime);
     assert!(
         built.is_ok(),
         "ipe dev build must succeed for display_false_positive: {:?}",
@@ -83,13 +82,13 @@ fn i186_false_positive_cargo_builds_and_runs() {
     }
 
     let root = repo_root();
-    let entry = entry_path(&root);
+    let entry = project_path(&root);
     let out = crate::support::scratch_root().join("ipec_i186_display_false_positive_e2e");
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
 
-    let built = ipe::build_loose_file(&entry, &out, &runtime);
+    let built = crate::support::build_golden(&entry, &out, &runtime);
     assert!(
         built.is_ok(),
         "ipe dev build must succeed for display_false_positive: {:?}",

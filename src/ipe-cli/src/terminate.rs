@@ -40,20 +40,9 @@ pub enum Effect {
     Continues,
 }
 
-/// A set of signals, bit `n - 1` standing for signal `n`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct SignalSet(pub u64);
-
-impl SignalSet {
-    /// Whether `signal` is in the set; a number outside `1..=64` never is.
-    pub fn contains(self, signal: c_int) -> bool {
-        u32::try_from(signal)
-            .ok()
-            .and_then(|number| number.checked_sub(1))
-            .and_then(|bit| 1u64.checked_shl(bit))
-            .is_some_and(|bit| self.0 & bit != 0)
-    }
-}
+/// The signal-set reading a served app's runtime decides from too, so the CLI
+/// and the app can never disagree on what a mask says.
+pub use ipe_runtime_rust::system::SignalSet;
 
 /// The signal dispositions the process held before the CLI registered a handler.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -107,38 +96,31 @@ pub fn inherited() -> Inherited {
 /// The dispositions of this process, read from `/proc/self/status`.
 #[cfg(target_os = "linux")]
 fn read() -> Inherited {
-    use std::io::Read as _;
-    let mut status = String::new();
-    let opened = std::fs::File::open("/proc/self/status")
-        .and_then(|file| file.take(64 * 1024).read_to_string(&mut status));
-    if opened.is_err() {
-        return Inherited::Unknown;
-    }
-    status_masks(&status).map_or(Inherited::Unknown, |(ignored, caught)| Inherited::Known {
-        ignored: SignalSet(ignored),
-        caught: SignalSet(caught),
-    })
+    ipe_runtime_rust::system::read_self_status()
+        .and_then(|status| status_masks(&status))
+        .map_or(Inherited::Unknown, |(ignored, caught)| Inherited::Known {
+            ignored,
+            caught,
+        })
 }
 
 /// The dispositions of this process, read through `ps`.
 #[cfg(not(target_os = "linux"))]
 fn read() -> Inherited {
     ps_masks(std::process::id()).map_or(Inherited::Unknown, |(ignored, caught)| Inherited::Known {
-        ignored: SignalSet(ignored),
-        caught: SignalSet(caught),
+        ignored,
+        caught,
     })
 }
 
 /// The `SigIgn:` and `SigCgt:` masks of a `/proc/<pid>/status` text.
 #[cfg(target_os = "linux")]
-fn status_masks(status: &str) -> Option<(u64, u64)> {
-    let mask = |key: &str| {
-        status
-            .lines()
-            .find_map(|line| line.strip_prefix(key))
-            .and_then(|hex| u64::from_str_radix(hex.trim(), 16).ok())
-    };
-    Some((mask("SigIgn:")?, mask("SigCgt:")?))
+fn status_masks(status: &str) -> Option<(SignalSet, SignalSet)> {
+    use ipe_runtime_rust::system::{StatusMask, status_mask};
+    Some((
+        status_mask(status, StatusMask::Ignored)?,
+        status_mask(status, StatusMask::Caught)?,
+    ))
 }
 
 /// The most `ps` may print for one process's two masks.
@@ -156,7 +138,7 @@ const PS_WALL: crate::remote_ingest::WallBudget = crate::remote_ingest::WallBudg
 /// neither `PATH` nor the environment chooses the program; a missing or
 /// failing `ps` reads as unknown.
 #[cfg(any(not(target_os = "linux"), test))]
-fn ps_masks(pid: u32) -> Option<(u64, u64)> {
+fn ps_masks(pid: u32) -> Option<(SignalSet, SignalSet)> {
     let mut command = std::process::Command::new("/bin/ps");
     command
         .env_clear()
@@ -171,20 +153,11 @@ fn ps_masks(pid: u32) -> Option<(u64, u64)> {
 
 /// The two hexadecimal masks `ps -o sigignore= -o sigcatch=` printed, in that order.
 #[cfg(any(not(target_os = "linux"), test))]
-fn ps_fields(stdout: &[u8]) -> Option<(u64, u64)> {
+fn ps_fields(stdout: &[u8]) -> Option<(SignalSet, SignalSet)> {
     let mut fields = std::str::from_utf8(stdout).ok()?.split_ascii_whitespace();
-    let ignored = hex_field(fields.next()?)?;
-    let caught = hex_field(fields.next()?)?;
+    let ignored = SignalSet::from_hex(fields.next()?)?;
+    let caught = SignalSet::from_hex(fields.next()?)?;
     fields.next().is_none().then_some((ignored, caught))
-}
-
-/// One field of hexadecimal digits, at most 64 bits wide.
-#[cfg(any(not(target_os = "linux"), test))]
-fn hex_field(field: &str) -> Option<u64> {
-    if field.is_empty() || !field.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-        return None;
-    }
-    u64::from_str_radix(field, 16).ok()
 }
 
 /// One shutdown subscriber: run once, on the first termination request.
@@ -299,7 +272,7 @@ fn respond(handling: Handling, shutdown: &mpsc::Sender<Vec<Subscriber>>) {
 
 #[cfg(test)]
 pub mod tests {
-    use super::{Effect, Handling, Inherited, SignalSet, hex_field, ps_fields};
+    use super::{Effect, Handling, Inherited, SignalSet, ps_fields};
     #[cfg(target_os = "linux")]
     use crate::remote_ingest::test_group;
     use signal_hook::consts::{SIGCONT, SIGHUP, SIGINT, SIGTERM, SIGTSTP};
@@ -407,17 +380,25 @@ pub mod tests {
     fn the_status_masks_parse_as_hex_and_need_both_lines() {
         let status =
             "Name:\tipe\nSigBlk:\t0\nSigIgn:\t0000000000000001\nSigCgt:\t0000000000004000\n";
-        assert_eq!(super::status_masks(status), Some((1, 0x4000)));
+        assert_eq!(
+            super::status_masks(status),
+            Some((SignalSet(1), SignalSet(0x4000)))
+        );
         assert_eq!(super::status_masks("Name:\tipe\nSigIgn:\t1\n"), None);
         assert_eq!(super::status_masks("SigIgn:\tzz\nSigCgt:\t0\n"), None);
+        assert_eq!(super::status_masks("SigIgn:\t+1\nSigCgt:\t0\n"), None);
+        assert_eq!(super::status_masks("SigIgn:\t1\nSigCgt:\t\n"), None);
     }
 
     #[test]
     fn the_ps_output_is_exactly_two_hex_fields() {
-        assert_eq!(ps_fields(b"00001000 0\n"), Some((0x1000, 0)));
+        assert_eq!(
+            ps_fields(b"00001000 0\n"),
+            Some((SignalSet(0x1000), SignalSet(0)))
+        );
         assert_eq!(
             ps_fields(b"  0000000000000001   4000 \n"),
-            Some((1, 0x4000))
+            Some((SignalSet(1), SignalSet(0x4000)))
         );
         assert_eq!(ps_fields(b""), None);
         assert_eq!(ps_fields(b"1\n"), None);
@@ -425,17 +406,16 @@ pub mod tests {
         assert_eq!(ps_fields(b"+1 0"), None);
         assert_eq!(ps_fields(b"SIGHUP 0"), None);
         assert_eq!(ps_fields(b"\xff 0"), None);
-        assert_eq!(hex_field("10000000000000000"), None);
-        assert_eq!(hex_field(""), None);
+        assert_eq!(ps_fields(b"10000000000000000 0"), None);
     }
 
     /// Poll `ps` for `pid` until it reports `signal` ignored, for at most 5 s.
     #[cfg(target_os = "linux")]
-    fn poll_ps(pid: u32, signal: i32) -> Option<(u64, u64)> {
+    fn poll_ps(pid: u32, signal: i32) -> Option<(SignalSet, SignalSet)> {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         loop {
             let seen = super::ps_masks(pid);
-            if seen.is_some_and(|(ignored, _)| SignalSet(ignored).contains(signal))
+            if seen.is_some_and(|(ignored, _)| ignored.contains(signal))
                 || std::time::Instant::now() >= deadline
             {
                 return seen;
@@ -459,13 +439,10 @@ pub mod tests {
         let _ = child.kill();
         let _ = child.wait();
         let (ignored, caught) = seen.expect("ps reports both masks");
-        assert!(
-            SignalSet(ignored).contains(SIGHUP),
-            "ps misses the ignored hangup"
-        );
+        assert!(ignored.contains(SIGHUP), "ps misses the ignored hangup");
         let (proc_ignored, proc_caught) = proc_masks.expect("SigIgn and SigCgt lines");
-        assert_eq!(ignored & 0xffff_ffff, proc_ignored & 0xffff_ffff);
-        assert_eq!(caught & 0xffff_ffff, proc_caught & 0xffff_ffff);
+        assert_eq!(ignored.0 & 0xffff_ffff, proc_ignored.0 & 0xffff_ffff);
+        assert_eq!(caught.0 & 0xffff_ffff, proc_caught.0 & 0xffff_ffff);
     }
 
     /// Printed by a child test just before it raises its first termination request.
@@ -502,19 +479,261 @@ pub mod tests {
         writeln!(std::io::stdout(), "{line}").expect("report a marker to the parent");
     }
 
-    /// Whether group `pid` holds no live process: gone, or only its unreaped leader.
+    /// One process's state as its `/proc/<pid>/stat` names it.
+    #[cfg(target_os = "linux")]
+    #[derive(Debug, Clone, Copy)]
+    enum Proc {
+        Running,
+        Zombie,
+        Absent,
+    }
+
+    /// A process group's liveness verdict.
+    #[cfg(target_os = "linux")]
+    #[derive(Debug, PartialEq, Eq, Clone, Copy)]
+    enum Group {
+        Alive,
+        Dead,
+    }
+
+    /// The verdict from probes taken in lifecycle order.
+    ///
+    /// The leader is probed first, then the rest of the group. A process only advances running, zombie, reaped, so probing the earlier
+    /// state first means a transition between probes can never make a dead
+    /// group read alive: every `Alive` is witnessed by a live process at the
+    /// instant of the probe that returned it.
+    #[cfg(target_os = "linux")]
+    fn group_verdict(
+        leader: impl FnOnce() -> Proc,
+        live_member_besides_leader: impl FnOnce() -> bool,
+        signalable: impl FnOnce() -> bool,
+    ) -> Group {
+        let alive = match leader() {
+            Proc::Running => true,
+            Proc::Zombie => live_member_besides_leader(),
+            Proc::Absent => signalable() && live_member_besides_leader(),
+        };
+        if alive { Group::Alive } else { Group::Dead }
+    }
+
+    /// The text of `/proc/<pid>/stat`, or `None` once the process is gone.
+    #[cfg(target_os = "linux")]
+    fn read_stat(pid: &str) -> Option<String> {
+        match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+            Err(error)
+                if error.kind() == std::io::ErrorKind::NotFound
+                    || error.raw_os_error() == Some(rustix::io::Errno::SRCH.raw_os_error()) =>
+            {
+                None
+            }
+            read => Some(read.expect("read a /proc stat")),
+        }
+    }
+
+    /// The fields after the command name of a `/proc/<pid>/stat` line: state, parent, group, and on.
+    #[cfg(target_os = "linux")]
+    fn stat_fields(stat: &str) -> std::str::SplitWhitespace<'_> {
+        stat.rsplit_once(") ")
+            .map(|(_, rest)| rest)
+            .expect("a stat line names its command")
+            .split_whitespace()
+    }
+
+    /// Whether a stat state names an exited process: a zombie, or one being reaped.
+    #[cfg(target_os = "linux")]
+    fn exited_state(state: &str) -> bool {
+        matches!(state, "Z" | "X")
+    }
+
+    /// The state of process `pid`.
+    #[cfg(target_os = "linux")]
+    fn proc_state(pid: i32) -> Proc {
+        read_stat(&pid.to_string()).map_or(Proc::Absent, |stat| {
+            let state = stat_fields(&stat).next().expect("a stat state field");
+            if exited_state(state) {
+                Proc::Zombie
+            } else {
+                Proc::Running
+            }
+        })
+    }
+
+    /// Whether a process other than the leader `pgid` runs in group `pgid`.
+    #[cfg(target_os = "linux")]
+    fn live_member_besides(pgid: i32) -> bool {
+        let leader = pgid.to_string();
+        for entry in std::fs::read_dir("/proc").expect("list /proc") {
+            let name = entry.expect("a /proc entry").file_name();
+            let Some(process) = name.to_str() else {
+                continue;
+            };
+            if process == leader || !process.bytes().all(|byte| byte.is_ascii_digit()) {
+                continue;
+            }
+            let Some(stat) = read_stat(process) else {
+                continue;
+            };
+            let mut fields = stat_fields(&stat);
+            let state = fields.next().expect("a stat state field");
+            let member = fields.nth(1).expect("a stat group field") == leader;
+            if member && !exited_state(state) {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Whether a signal can reach any process of group `pgid`, a zombie included.
+    #[cfg(target_os = "linux")]
+    fn signalable(pgid: i32) -> bool {
+        rustix::process::Pid::from_raw(pgid)
+            .is_some_and(|id| rustix::process::test_kill_process_group(id).is_ok())
+    }
+
+    /// Whether group `pid` holds no live process: gone, or only exited processes left unreaped.
     #[cfg(target_os = "linux")]
     fn group_is_dead(pid: i32) -> bool {
-        let gone = rustix::process::Pid::from_raw(pid)
-            .is_none_or(|id| rustix::process::test_kill_process_group(id).is_err());
-        let zombie = std::fs::read_to_string(format!("/proc/{pid}/stat"))
-            .ok()
-            .and_then(|stat| {
-                stat.rsplit_once(") ")
-                    .and_then(|(_, rest)| rest.chars().next())
-            })
-            .is_some_and(|state| state == 'Z');
-        gone || zombie
+        group_verdict(
+            || proc_state(pid),
+            || live_member_besides(pid),
+            || signalable(pid),
+        ) == Group::Dead
+    }
+
+    /// What every probe of a group answers while it holds one lifecycle stage.
+    #[cfg(target_os = "linux")]
+    #[derive(Debug, Clone, Copy)]
+    struct Stage {
+        leader: Proc,
+        live_member_besides_leader: bool,
+        signalable: bool,
+    }
+
+    /// The verdict when the group moves from `before` to `after` after `probes` probe calls.
+    #[cfg(target_os = "linux")]
+    fn verdict_across(before: Stage, after: Stage, probes: usize) -> Group {
+        let calls = std::cell::Cell::new(0_usize);
+        let stage = || {
+            let call = calls.get();
+            calls.set(call.saturating_add(1));
+            if call < probes { before } else { after }
+        };
+        group_verdict(
+            || stage().leader,
+            || stage().live_member_besides_leader,
+            || stage().signalable,
+        )
+    }
+
+    /// A group whose only process is its unreaped leader.
+    #[cfg(target_os = "linux")]
+    const ZOMBIE_LEADER_ALONE: Stage = Stage {
+        leader: Proc::Zombie,
+        live_member_besides_leader: false,
+        signalable: true,
+    };
+
+    /// A group with no process left, its leader reaped.
+    #[cfg(target_os = "linux")]
+    const GONE: Stage = Stage {
+        leader: Proc::Absent,
+        live_member_besides_leader: false,
+        signalable: false,
+    };
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_reap_between_the_probes_never_reads_a_dead_group_alive() {
+        let zombie_member_after_reap = Stage {
+            signalable: true,
+            ..GONE
+        };
+        for (before, after) in [
+            (ZOMBIE_LEADER_ALONE, GONE),
+            (ZOMBIE_LEADER_ALONE, zombie_member_after_reap),
+            (zombie_member_after_reap, GONE),
+        ] {
+            for probes in 0..=3 {
+                assert_eq!(
+                    verdict_across(before, after, probes),
+                    Group::Dead,
+                    "{before:?} -> {after:?} after {probes} probes"
+                );
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_live_group_never_reads_dead() {
+        let running = Stage {
+            leader: Proc::Running,
+            live_member_besides_leader: false,
+            signalable: true,
+        };
+        let running_with_member = Stage {
+            live_member_besides_leader: true,
+            ..running
+        };
+        let zombie_leader_with_member = Stage {
+            leader: Proc::Zombie,
+            ..running_with_member
+        };
+        let member_after_reap = Stage {
+            leader: Proc::Absent,
+            ..running_with_member
+        };
+        for (before, after) in [
+            (running, running),
+            (running_with_member, zombie_leader_with_member),
+            (zombie_leader_with_member, zombie_leader_with_member),
+            (zombie_leader_with_member, member_after_reap),
+            (member_after_reap, member_after_reap),
+        ] {
+            for probes in 0..=3 {
+                assert_eq!(
+                    verdict_across(before, after, probes),
+                    Group::Alive,
+                    "{before:?} -> {after:?} after {probes} probes"
+                );
+            }
+        }
+    }
+
+    /// Poll `done` every 20 ms for at most 5 s, returning the reading that ended the wait.
+    #[cfg(target_os = "linux")]
+    fn poll_until(mut done: impl FnMut() -> bool) -> bool {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut reading = done();
+        while !reading && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            reading = done();
+        }
+        reading
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_zombie_leader_with_a_live_member_is_not_a_dead_group() {
+        let mut shell = std::process::Command::new("/bin/sh");
+        shell.args(["-c", "sleep 30 & exit 0"]);
+        let (mut child, id) = test_group::spawn_detached(shell).expect("spawn sh");
+        let id = id.expect("a detached group");
+        let pgid = id.as_raw_nonzero().get();
+        let leader_exited = poll_until(|| test_group::exited(id).is_ok_and(|exited| exited));
+        let dead_with_member = group_is_dead(pgid);
+        test_group::kill(id);
+        let dead_after_kill = poll_until(|| group_is_dead(pgid));
+        test_group::forget(id);
+        let _ = child.wait();
+        let dead_after_reap = group_is_dead(pgid);
+        assert!(leader_exited, "the group leader never exited");
+        assert!(
+            !dead_with_member,
+            "a zombie leader with a live member read as a dead group"
+        );
+        assert!(dead_after_kill, "the killed group never read dead");
+        assert!(dead_after_reap, "the reaped group read alive");
     }
 
     /// Spawn a detached `sleep 30` transfer group.
@@ -544,11 +763,8 @@ pub mod tests {
             .find_map(|line| line.split_once(ARMED).map(|(_, pid)| pid))
             .and_then(|pid| pid.trim().parse::<i32>().ok())
             .expect("the child reports its transfer group");
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        while !group_is_dead(group) && std::time::Instant::now() < deadline {
-            std::thread::sleep(std::time::Duration::from_millis(50));
-        }
-        assert!(group_is_dead(group), "the transfer group outlived the CLI");
+        let dead = poll_until(|| group_is_dead(group));
+        assert!(dead, "the transfer group outlived the CLI");
     }
 
     #[cfg(target_os = "linux")]
@@ -641,7 +857,10 @@ pub mod tests {
         let captured =
             crate::remote_ingest::run_probe(probe, super::PS_STDOUT_MAX_BYTES, super::PS_WALL)
                 .expect("the probe runs");
-        assert_eq!(super::ps_fields(&captured.stdout), Some((0, 0)));
+        assert_eq!(
+            super::ps_fields(&captured.stdout),
+            Some((super::SignalSet(0), super::SignalSet(0)))
+        );
         assert!(
             super::INSTALLED.get().is_none(),
             "the probe installed a signal owner"

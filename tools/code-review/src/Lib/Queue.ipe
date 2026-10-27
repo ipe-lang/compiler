@@ -1,58 +1,194 @@
-module Lib.Queue exposing (DecisionSlot(..), HistoryPage, HistoryRow, HistoryState(..), LoadTicket, Progress, QueuePage, QueueState(..), QueuedUnit, ResyncBound, SelectedView(..), UnitPageState(..), chainBanner, clearView, decidableSource, decide, decisionSettled, drainThenLoad, entryUid, firstTicket, historyStateFromResult, historyStatusText, isCurrentLoad, loadHistoryPage, loadPage, makeResyncBound, nextTicket, loadUnitView, pageHeaderText, queueStatusText, reloadView, resyncBound, resyncPageCeiling, resyncReviewed, resyncReviewedWithin, selectView, selectedViewOf, selectedViewStatusText, sourceStatusText, startDecision, stateFromResult, unitPageEntry, unitPageOf, unitPageStatusText, viewArrived)
+module Lib.Queue exposing (Place(..), Progress, QueuePage, QueueState(..), QueueWant(..), QueuedUnit, ResyncBound, Tallies, UnitLabel, UnitPageState(..), chainBanner, decide, decideRefusal, drainDecision, drainThenLoad, freshStatus, loadPage, makeResyncBound, mergeQueueWant, loadUnitView, pageHeaderText, placeIn, queueLabels, queueStatusText, refusalReasonText, resyncBound, resyncPageCeiling, resyncReviewed, resyncReviewedWithin, sourceStatusText, stateFromResult, talliesOf, unitLabel, unitPageEntry, unitPageOf, unitPageStatusText)
 
 import Ipe.ByteSize as ByteSize
 import Ipe.Db as Db
+import Ipe.Dict as Dict
 import Ipe.Error as Error
 import Ipe.List as List
 import Ipe.Maybe as Maybe
 import Ipe.Result as Result exposing (Result(..))
 import Ipe.String as String
 import Ipe.Task as Task
-import Lib.Db as LibDb exposing (BreakAt(..), HistoryCursor(..), LogShown(..), LogVerdict(..), ReviewEntry(..))
-import Lib.Epoch exposing (Epoch)
+import Lib.Db as LibDb exposing (BreakAt(..), CopyFault(..), LogShown(..), LogVerdict(..), ReviewEntry(..))
+import Lib.Failure as Failure exposing (DecideRefusal, LoadFailure)
 import Lib.Format as Format
 -- `Index.Unit` names `Highlight.Lang` and `Index.UnitView` names
 -- `Links.LinkSet`, and an imported alias resolves its qualified names in this
 -- module.
 import Lib.Highlight as Highlight
-import Lib.Index as Index exposing (Oversize(..), SourceView(..), StaleReason(..))
+import Lib.Index as Index exposing (Oversize(..), RefusalReason(..), SourceView(..), StaleReason(..))
+import Lib.Label as Label exposing (Label, LabelPiece(..))
 import Lib.Links as Links
 import Lib.PageSize as PageSize exposing (PageSize)
-import Lib.ReviewKey as ReviewKey exposing (ReviewKey(..))
+import Lib.ReviewKey as ReviewKey exposing (MacKey, ReviewKey(..))
 import Lib.SafeText as SafeText exposing (SafeText)
+import Lib.Selected exposing (SelectedView(..))
 import Lib.Settings as Settings exposing (AppSettings, IndexSettings)
+import Lib.Standing exposing (Standing, standingOf)
 import Lib.Uid as Uid exposing (Uid)
+import Lib.UnitName as UnitName exposing (UnitName)
 
 
 -- An open unit plus its resurfacing state. `change` is what the index
 -- recorded about its current body. `changed` is Just the previous counted
 -- review when this uid was already decided on an OLDER body hash: the author
 -- edited the code after the review, so the unit must be reviewed again.
+-- `standing` is what the review log holds for its current body: a unit
+-- reopened because its decision does not count says why.
 type alias QueuedUnit =
     { unit : Index.Unit
     , change : Index.Change
     , changed : Maybe LibDb.VerifiedRow
+    , standing : Standing
     }
 
 
+-- What a unit is called on screen: its kind and qualified name, plus as
+-- much of its location as tells it apart from every other unit on the same
+-- page. Kept as separate typed fields so no two parts can run together.
+type alias UnitLabel =
+    { kind : Label
+    , name : Label
+    , place : Place
+    }
+
+
+-- `Named`: no other unit on the page shares the kind and name. `At`: one
+-- does, but none also starts at the same path and line. `AtUnit`: even the
+-- path and line are shared, so the uid, unique to a unit, settles it.
+type Place
+    = Named
+    | At Label Int
+    | AtUnit Label Int Uid
+
+
+-- The one label builder: every unit label on screen comes from a unit's
+-- name (`UnitName`: a live unit's, or one a verified review row signed),
+-- never from a raw string or a uid.
+unitLabel : Place -> UnitName -> UnitLabel
+unitLabel place name =
+    { kind = UnitName.kind name, name = UnitName.qualified name, place = place }
+
+
+-- Each unit of a page with its label; no two labels of one page are equal.
+queueLabels : List QueuedUnit -> List ( QueuedUnit, UnitLabel )
+queueLabels units =
+    let
+        tallies =
+            talliesOf (List.map (\q -> Index.unitName q.unit) units)
+    in
+    List.map
+        (\q ->
+            let
+                name =
+                    Index.unitName q.unit
+            in
+            ( q, unitLabel (placeIn tallies name) name )
+        )
+        units
+
+
+-- The distinct units of one page under each collision key, counted once
+-- for the page so every label reads the same counts.
+type alias Tallies =
+    { names : Dict String (List Uid)
+    , places : Dict String (List Uid)
+    }
+
+
+talliesOf : List UnitName -> Tallies
+talliesOf names =
+    { names = tally nameKey names, places = tally placeKey names }
+
+
+placeIn : Tallies -> UnitName -> Place
+placeIn tallies name =
+    if shared tallies.names (nameKey name) then
+        if shared tallies.places (placeKey name) then
+            AtUnit (UnitName.path name) (UnitName.line name) (UnitName.uid name)
+
+        else
+            At (UnitName.path name) (UnitName.line name)
+
+    else
+        Named
+
+
+-- The distinct uids under each key: one unit named twice on a page (two
+-- decisions of it in History) is one unit, never a collision with itself.
+tally : (UnitName -> String) -> List UnitName -> Dict String (List Uid)
+tally key names =
+    List.foldl (\name seen -> Dict.update (key name) (withUid (UnitName.uid name)) seen) Dict.empty names
+
+
+withUid : Uid -> Maybe (List Uid) -> Maybe (List Uid)
+withUid unit seen =
+    case seen of
+        Nothing ->
+            Just [ unit ]
+
+        Just uids ->
+            if List.member unit uids then
+                Just uids
+
+            else
+                Just (unit :: uids)
+
+
+shared : Dict String (List Uid) -> String -> Bool
+shared counts key =
+    List.length (Maybe.withDefault [] (Dict.get key counts)) > 1
+
+
+-- Collision keys over length-prefixed parts of the labels as shown, so no
+-- two different part lists spell the same key, and two units whose labels
+-- read alike (two long names cut to the same marker among them) count as
+-- shared and are told apart further.
+nameKey : UnitName -> String
+nameKey name =
+    keyPart (Label.key (UnitName.kind name)) ++ keyPart (Label.key (UnitName.qualified name))
+
+
+placeKey : UnitName -> String
+placeKey name =
+    nameKey name ++ keyPart (Label.key (UnitName.path name)) ++ keyPart (String.fromInt (UnitName.line name))
+
+
+keyPart : String -> String
+keyPart part =
+    String.fromInt (String.length part) ++ ":" ++ part
+
+
 -- One loaded page of the queue. `total` counts the whole queue (never this
--- page's length); `next` is the cursor of the following page, Nothing on the
--- last page; `dbName` is the index file's name, rendered once; `log` is the
--- review log's verdict the page was read under.
+-- page's length); `unbound` counts the index's units under a tag no
+-- configured root binds, which are in neither the queue nor its progress;
+-- `next` is the cursor of the following page, Nothing on the last page;
+-- `dbName` is the index file's name, rendered once; `log` is the review
+-- log's verdict the page was read under. `refusals` are the first open
+-- files the index could not review and `refusalsOpen` counts every open
+-- one: open review work the page shows apart from its units.
+-- `refusalsUnbound` counts the unreviewable files under a tag no
+-- configured root binds, said beside the unbound units.
 type alias QueuePage =
     { units : List QueuedUnit
     , total : Int
+    , unbound : Int
     , dbName : SafeText
     , dbBytes : Int
     , next : Maybe Index.Cursor
     , progress : Progress
     , log : LogShown
+    , refusals : List Index.RefusalRow
+    , refusalsOpen : Int
+    , refusalsUnbound : Int
     }
 
 
 -- Review progress over the index as it stands, never from a session:
--- `total` counts the index's units and `reviewed` those not open, so a unit
--- is reviewed exactly when its current (uid, body_hash) pair has a decision.
+-- `total` counts the index's units and unreviewable files under a bound
+-- tag and `reviewed` those not open, so `reviewed` reaches `total` only
+-- when every unit's current (uid, body_hash) pair and every unreviewable
+-- file's (uid, digest) pair has a decision.
 -- Both come from the same read as the page's rows, after the `reviewed`
 -- copy is proved current against the review log's head. Deciding a unit
 -- moves it from open to reviewed, so `total` holds while the queue drains,
@@ -248,138 +384,33 @@ resyncCeilingRefusal bound =
 type QueueState
     = Loading
     | Loaded QueuePage
-    | Failed Error
+    | Failed LoadFailure
 
 
--- The number of one load of a page slot (the queue, a History page, a unit
--- page). Each load a slot starts takes the ticket after the slot's latest,
--- and a result settles the slot only under the slot's latest ticket, so a
--- slower earlier load never replaces the result of a later one. Opaque:
--- built only by `firstTicket` and `nextTicket`.
-type LoadTicket
-    = LoadTicket Int
+-- What a queue load reads: the page at a cursor, or the drain of a saved
+-- decision's pair from the index, then that page.
+type QueueWant
+    = QueueReload Index.Cursor
+    | QueueDrain Index.Attested Index.Written Index.Cursor
 
 
-firstTicket : LoadTicket
-firstTicket =
-    LoadTicket 0
+-- Two queue loads asked for while one runs, as one: a drain is never lost
+-- to a reload, and the newer cursor is read. A drain asked over another
+-- drain keeps the newer; the older pair's copy row is rebuilt by the next
+-- load's snapshot (its copy no longer holds the log's head).
+mergeQueueWant : QueueWant -> QueueWant -> QueueWant
+mergeQueueWant held newer =
+    case newer of
+        QueueDrain _ _ _ ->
+            newer
 
+        QueueReload cursor ->
+            case held of
+                QueueDrain attested written _ ->
+                    QueueDrain attested written cursor
 
-nextTicket : LoadTicket -> LoadTicket
-nextTicket ticket =
-    case ticket of
-        LoadTicket n ->
-            LoadTicket (n + 1)
-
-
--- True when a result carrying `load` is the slot's latest load.
-isCurrentLoad : LoadTicket -> LoadTicket -> Bool
-isCurrentLoad load latest =
-    ticketNumber load == ticketNumber latest
-
-
-ticketNumber : LoadTicket -> Int
-ticketNumber ticket =
-    case ticket of
-        LoadTicket n ->
-            n
-
-
--- A review as the History page shows it: the review entry, counted or not,
--- plus the unit's qualified name resolved from the index db, rendered
--- (Nothing when the unit no longer exists there).
-type alias HistoryRow =
-    { entry : LibDb.ReviewEntry
-    , name : Maybe SafeText
-    }
-
-
--- One loaded History page: its rows, the cursor it was read from, the
--- cursor of the page after it (Nothing on the last page), and the review
--- log's verdict every row was classified under.
-type alias HistoryPage =
-    { rows : List HistoryRow
-    , at : LibDb.HistoryCursor
-    , next : Maybe LibDb.HistoryCursor
-    , log : LogShown
-    }
-
-
--- The History view's state. An empty history is only `HistoryLoaded` with
--- no rows from `HistoryStart`, so a load in flight or a failed load can
--- never render as "no reviews".
-type HistoryState
-    = HistoryLoading
-    | HistoryLoaded HistoryPage
-    | HistoryFailed Error
-
-
-historyStateFromResult : Result Error HistoryPage -> HistoryState
-historyStateFromResult result =
-    case result of
-        Ok page ->
-            HistoryLoaded page
-
-        Err e ->
-            HistoryFailed e
-
-
--- The one-line text for a History state that has no rows to show; Nothing
--- for a loaded page that holds rows.
-historyStatusText : HistoryState -> Maybe String
-historyStatusText state =
-    case state of
-        HistoryLoading ->
-            Just "Loading history…"
-
-        HistoryFailed e ->
-            Just ("History load failed: " ++ SafeText.toString (SafeText.renderForeign (Error.toString e)))
-
-        HistoryLoaded page ->
-            if List.isEmpty page.rows then
-                case page.at of
-                    HistoryStart ->
-                        Just "No reviews yet."
-
-                    HistoryAfter _ _ ->
-                        Just "No more reviews."
-
-                    HistoryLegacyAfter _ _ _ ->
-                        Just "No more reviews."
-
-            else
-                Nothing
-
-
--- One History page from `cursor`, newest first, each row classified under
--- the review log's verdict, taken once for the load with the `reviewed`
--- copy proved current for it (rebuilt once when its stamp is not), with the
--- unit's qualified name resolved from the index db named by `settings`. At
--- most `PageSize.history` rows are read, and one name lookup runs per row.
-loadHistoryPage : AppSettings -> LibDb.HistoryCursor -> Task.Task Error HistoryPage
-loadHistoryPage settings cursor =
-    do
-        db <- LibDb.openAt settings.review
-        conn <- Index.readConnection settings.index
-        state <- freshStatus settings conn db
-        page <- LibDb.historyPage (LibDb.verifier state) db PageSize.history cursor
-        rows <- Task.sequence (List.map (historyRow conn) page.rows)
-        Task.succeed { rows = rows, at = cursor, next = page.next, log = LibDb.logShown state }
-
-
-historyRow : Db.Db -> LibDb.ReviewEntry -> Task.Task Error HistoryRow
-historyRow conn entry =
-    Task.map (\name -> { entry = entry, name = name }) (Index.nameFor conn (entryUid entry))
-
-
-entryUid : LibDb.ReviewEntry -> Uid
-entryUid entry =
-    case entry of
-        Verified row ->
-            LibDb.verifiedUid row
-
-        Unverified row ->
-            row.uid
+                QueueReload _ ->
+                    newer
 
 
 -- The review log's verdict, taken once for the load, with the `reviewed`
@@ -405,34 +436,44 @@ freshStatus settings conn db =
                     Task.succeed state
 
                 else
-                    Task.fail stillBehind
+                    Task.fail (stillBehind StampStale)
 
 
-stillBehind : Error
-stillBehind =
-    Error.conflict "the review progress copy is still behind the review database after a rebuild; reload"
+-- The failed load for a `reviewed` copy that one rebuild under the log's
+-- verdict did not prove, named by the check it failed.
+stillBehind : LibDb.CopyFault -> Error
+stillBehind fault =
+    case fault of
+        StampStale ->
+            Error.conflict "the review progress copy's stamp is not current for the log's verdict after a rebuild; reload"
+
+        CopyUnproven ->
+            Error.conflict "the review progress copy has no proven digest (table shape or row count) after a rebuild; reload"
+
+        CopyDiffers ->
+            Error.conflict "the review progress copy is still behind the review database after a rebuild; reload"
 
 
 -- The banner a page shows when the review log is not proven under the
 -- server's key: where it breaks, or that another key signed it; Nothing for a
 -- proven log and for a server with no key.
-chainBanner : LogShown -> Maybe String
+chainBanner : LogShown -> Maybe SafeText
 chainBanner shown =
     case shown of
         ShownBroken (BreaksAt n) ->
-            Just ("The review log's chain breaks at entry " ++ String.fromInt n ++ ": a decision was removed, reordered or replaced outside this tool.")
+            Just (SafeText.literal ("The review log's chain breaks at entry " ++ String.fromInt n ++ ": a decision was removed, reordered or replaced outside this tool."))
 
         ShownBroken (PastHead n) ->
-            Just ("The review log holds " ++ pastHeadText n ++ " past its head: a decision was added outside this tool.")
+            Just (SafeText.literal ("The review log holds " ++ pastHeadText n ++ " past its head: a decision was added outside this tool."))
 
         ShownBroken (BeforeFirst n) ->
-            Just ("The review log holds " ++ pastHeadText n ++ " before its first: a decision was added outside this tool.")
+            Just (SafeText.literal ("The review log holds " ++ pastHeadText n ++ " before its first: a decision was added outside this tool."))
 
         ShownBroken (RepeatsAt n) ->
-            Just ("The review log's entry " ++ String.fromInt n ++ " decides a pair an earlier entry decided: a decision was added outside this tool.")
+            Just (SafeText.literal ("The review log's entry " ++ String.fromInt n ++ " decides a pair an earlier entry decided: a decision was added outside this tool."))
 
         ShownKeyMismatch ->
-            Just ("The review log was signed by a different " ++ ReviewKey.keyVar ++ ": no decision in it counts.")
+            Just (SafeText.literal ("The review log was signed by a different " ++ ReviewKey.keyVar ++ ": no decision in it counts."))
 
         ShownProven ->
             Nothing
@@ -450,277 +491,40 @@ pastHeadText n =
         String.fromInt n ++ " entries"
 
 
--- The one way a decision is recorded: only under a signing key, so a
--- read-only server refuses before it reads anything; only a shown source
--- can be decided, since only a verified view holds a `ShownSource`; and only
--- after `Index.reverify` re-proves it, so the hash written is the hash of
--- the bytes the reviewer saw.
-decide : ReviewKey -> IndexSettings -> Db.Db -> Index.ShownSource -> LibDb.Decision -> Task.Task Error ( Index.Attested, Index.Written )
-decide key settings db shown decision =
-    case key of
-        ReadOnly ->
-            Task.fail ReviewKey.readOnlyError
-
-        Signing macKey ->
-            do
-                attested <- Index.reverify settings shown
-                written <- LibDb.insertDecision macKey db attested decision
-                Task.succeed ( attested, written )
-
-
--- The session's one source slot, shared by the selected queue card and the
--- unit page: nothing selected, one read in flight
--- (with the unit wanted once it returns, when the selection moved during the
--- read), the loaded view, no unit with the read's uid, or a failed read. At
--- most one read is in flight: a selection made during a read only records
--- `wanted`, and a response for any uid but the in-flight one is dropped.
--- `fresh` is False once the queue page reloaded or cleared during the read,
--- so its result predates the page and never settles the view: the in-flight
--- unit selected again is read afresh, and with nothing wanted the result is
--- dropped. `owner` is the epoch whose process runs the read: slot ownership
--- is tied to process lifetime, so a read owned by another epoch is
--- `NoneSelected` to every transition.
-type SelectedView
-    = NoneSelected
-    | ViewLoading { uid : Uid, wanted : Maybe Uid, fresh : Bool, owner : Epoch }
-    | ViewShown Index.UnitView
-    | ViewMissing Uid
-    | ViewFailed Uid Error
-
-
--- The slot as process `epoch` sees it: a read owned by another epoch has no
--- completion left to settle it, so it is `NoneSelected`.
-ownedView : Epoch -> SelectedView -> SelectedView
-ownedView epoch state =
-    case state of
-        ViewLoading loading ->
-            if loading.owner == epoch then
-                state
-
-            else
-                NoneSelected
-
-        ViewShown _ ->
-            state
-
-        NoneSelected ->
-            state
-
-        ViewMissing _ ->
-            state
-
-        ViewFailed _ _ ->
-            state
-
-
--- `uid` selected in process `epoch`, with the uid to read next, if any.
--- During a read only the wanted unit is recorded; the shown unit selected
--- again reads nothing.
-selectView : Epoch -> Uid -> SelectedView -> ( SelectedView, Maybe Uid )
-selectView epoch uid state =
-    case ownedView epoch state of
-        ViewLoading loading ->
-            ( ViewLoading { uid = loading.uid, wanted = wantedAfter loading.uid loading.fresh uid, fresh = loading.fresh, owner = loading.owner }, Nothing )
-
-        ViewShown shown ->
-            if shown.unit.uid == uid then
-                ( ViewShown shown, Nothing )
-
-            else
-                startView epoch uid
-
-        NoneSelected ->
-            startView epoch uid
-
-        ViewMissing _ ->
-            startView epoch uid
-
-        ViewFailed _ _ ->
-            startView epoch uid
-
-
--- `uid` selected after the queue page reloaded, so its view is read afresh
--- even when it is the one shown; during a read it is read once that read
--- returns.
-reloadView : Epoch -> Uid -> SelectedView -> ( SelectedView, Maybe Uid )
-reloadView epoch uid state =
-    case ownedView epoch state of
-        ViewLoading loading ->
-            ( ViewLoading { uid = loading.uid, wanted = Just uid, fresh = False, owner = loading.owner }, Nothing )
-
-        ViewShown _ ->
-            startView epoch uid
-
-        NoneSelected ->
-            startView epoch uid
-
-        ViewMissing _ ->
-            startView epoch uid
-
-        ViewFailed _ _ ->
-            startView epoch uid
-
-
--- No unit to select. A read in flight stays recorded, with nothing wanted
--- after it, so no second read can start beside it, and its result is
--- dropped when it returns.
-clearView : Epoch -> SelectedView -> SelectedView
-clearView epoch state =
-    case ownedView epoch state of
-        ViewLoading loading ->
-            ViewLoading { uid = loading.uid, wanted = Nothing, fresh = False, owner = loading.owner }
-
-        ViewShown _ ->
-            NoneSelected
-
-        NoneSelected ->
-            NoneSelected
-
-        ViewMissing _ ->
-            NoneSelected
-
-        ViewFailed _ _ ->
-            NoneSelected
-
-
--- The read of `uid` run by process `epoch` returned with `result`: when
--- another unit was selected meanwhile its read starts, otherwise the result
--- settles the view. A response for any uid but the in-flight one, or from
--- any process but the read's owner, changes nothing.
-viewArrived : Epoch -> Uid -> Result Error (Maybe Index.UnitView) -> SelectedView -> ( SelectedView, Maybe Uid )
-viewArrived epoch uid result state =
-    case state of
-        ViewLoading loading ->
-            if loading.uid /= uid || loading.owner /= epoch then
-                ( state, Nothing )
-
-            else
-                case loading.wanted of
-                    Just next ->
-                        startView epoch next
-
-                    Nothing ->
-                        if loading.fresh then
-                            ( settledView uid result, Nothing )
-
-                        else
-                            ( NoneSelected, Nothing )
-
-        ViewShown _ ->
-            ( state, Nothing )
-
-        NoneSelected ->
-            ( state, Nothing )
-
-        ViewMissing _ ->
-            ( state, Nothing )
-
-        ViewFailed _ _ ->
-            ( state, Nothing )
-
-
-startView : Epoch -> Uid -> ( SelectedView, Maybe Uid )
-startView epoch uid =
-    ( ViewLoading { uid = uid, wanted = Nothing, fresh = True, owner = epoch }, Just uid )
-
-
--- The unit wanted after the in-flight read of `inFlight` when `uid` is
--- selected: nothing when the in-flight unit is selected again and its read
--- is fresh; a read that predates the page reads that unit again.
-wantedAfter : Uid -> Bool -> Uid -> Maybe Uid
-wantedAfter inFlight fresh uid =
-    if inFlight == uid && fresh then
-        Nothing
-
-    else
-        Just uid
-
-
-settledView : Uid -> Result Error (Maybe Index.UnitView) -> SelectedView
-settledView uid result =
-    case result of
-        Ok (Just loaded) ->
-            ViewShown loaded
-
-        Ok Nothing ->
-            ViewMissing uid
-
-        Err e ->
-            ViewFailed uid e
-
-
--- The loaded view of the selected unit `uid`; Nothing while it loads, when
--- its read failed or found no unit, or when the view is another unit's.
-selectedViewOf : Uid -> SelectedView -> Maybe Index.UnitView
-selectedViewOf uid state =
-    case state of
-        ViewShown shown ->
-            if shown.unit.uid == uid then
-                Just shown
-
-            else
-                Nothing
-
-        ViewLoading _ ->
-            Nothing
-
-        NoneSelected ->
-            Nothing
-
-        ViewMissing _ ->
-            Nothing
-
-        ViewFailed _ _ ->
-            Nothing
-
-
--- The one source a decision on `uid` may be made on: the selected unit's
--- verified view. Nothing for a withheld view, a view not loaded, or another
--- unit's view, so nothing else can reach `decide`.
-decidableSource : Uid -> SelectedView -> Maybe Index.ShownSource
-decidableSource uid state =
-    case selectedViewOf uid state of
-        Just loaded ->
-            case loaded.view of
-                Shown shown ->
-                    Just shown
-
-                Stale _ ->
-                    Nothing
-
-                Unreadable _ ->
-                    Nothing
-
-                TooLarge _ ->
-                    Nothing
-
-        Nothing ->
-            Nothing
-
-
--- The one-line text in place of the selected unit's source while it has no
--- loaded view; Nothing once the view of `uid` is loaded.
-selectedViewStatusText : Uid -> SelectedView -> Maybe String
-selectedViewStatusText uid state =
-    case state of
-        ViewShown shown ->
-            if shown.unit.uid == uid then
-                Nothing
-
-            else
-                Just "Loading source…"
-
-        ViewLoading _ ->
-            Just "Loading source…"
-
-        NoneSelected ->
-            Just "Loading source…"
-
-        ViewMissing _ ->
-            Just "This unit is no longer in the index."
-
-        ViewFailed _ e ->
-            Just ("Source load failed: " ++ SafeText.toString (SafeText.renderForeign (Error.toString e)))
+-- The one way a decision is recorded: only under a signing key, the
+-- `MacKey` a read-only server does not hold; only a shown source can be
+-- decided, since only a verified view holds a `ShownSource`; and only after
+-- `Index.reverify` re-proves it, so the hash written is the hash of the
+-- bytes the reviewer saw. A refusal either step decides is a value.
+decide : MacKey -> IndexSettings -> Db.Db -> Index.ShownSource -> LibDb.Decision -> Task.Task Error (Result DecideRefusal ( Index.Attested, Index.Written ))
+decide macKey settings db shown decision =
+    do
+        reverified <- Index.reverify settings shown
+        case reverified of
+            Ok attested ->
+                LibDb.insertDecision macKey db attested decision
+                    |> Task.map (Result.map (\written -> ( attested, written )))
+
+            Err refusal ->
+                Task.succeed (Err refusal)
+
+
+-- The one way a decision on an unreviewable file is recorded, `decide`'s
+-- counterpart: only under a signing key, the `MacKey` a read-only server
+-- does not hold, and only after `Index.reverifyRefusal` re-proves the row
+-- still carries `digest`, so the hash written is the digest the reviewer was
+-- shown. A refusal either step decides is a value.
+decideRefusal : MacKey -> IndexSettings -> Db.Db -> Uid -> Index.RefusalDigest -> LibDb.Decision -> Task.Task Error (Result DecideRefusal ( Index.Attested, Index.Written ))
+decideRefusal macKey settings db uid digest decision =
+    do
+        reverified <- Index.reverifyRefusal settings uid digest
+        case reverified of
+            Ok attested ->
+                LibDb.insertDecision macKey db attested decision
+                    |> Task.map (Result.map (\written -> ( attested, written )))
+
+            Err refusal ->
+                Task.succeed (Err refusal)
 
 
 -- The unit page: loading, the unit with its source and links, no such unit,
@@ -730,7 +534,7 @@ type UnitPageState
     = UnitLoading
     | UnitLoaded Index.UnitView
     | UnitNotFound
-    | UnitFailed Error
+    | UnitFailed LoadFailure
     | UnitIdRefused
 
 
@@ -781,97 +585,57 @@ unitPageOf uid state =
             UnitLoading
 
 
--- The session's one decision slot. A decision re-reads its source to re-prove
--- it, so at most one is in flight: a decision asked while one is saving
--- starts nothing. A saving decision records the epoch whose process runs it:
--- slot ownership is tied to process lifetime, so one owned by another epoch
--- is idle.
-type DecisionSlot
-    = DecisionIdle
-    | DecisionSaving Uid Epoch
-
-
--- The slot holding a decision on `uid` run by process `epoch`; Nothing
--- while another decision of that process is saving.
-startDecision : Epoch -> Uid -> DecisionSlot -> Maybe DecisionSlot
-startDecision epoch uid slot =
-    case slot of
-        DecisionIdle ->
-            Just (DecisionSaving uid epoch)
-
-        DecisionSaving _ owner ->
-            if owner == epoch then
-                Nothing
-
-            else
-                Just (DecisionSaving uid epoch)
-
-
--- The decision on `uid` run by process `epoch` settled; a result for any
--- other uid or from any other process leaves the slot.
-decisionSettled : Epoch -> Uid -> DecisionSlot -> DecisionSlot
-decisionSettled epoch uid slot =
-    case slot of
-        DecisionSaving saving owner ->
-            if saving == uid && owner == epoch then
-                DecisionIdle
-
-            else
-                slot
-
-        DecisionIdle ->
-            DecisionIdle
-
-
 -- The one-line text for a unit page that has no unit to show; Nothing once
 -- the unit is loaded.
-unitPageStatusText : UnitPageState -> Maybe String
+unitPageStatusText : UnitPageState -> Maybe SafeText
 unitPageStatusText state =
     case state of
         UnitLoading ->
-            Just "Loading unit…"
+            Just (SafeText.literal "Loading unit…")
 
         UnitNotFound ->
-            Just "No unit with this id is in the index."
+            Just (SafeText.literal "No unit with this id is in the index.")
 
-        UnitFailed e ->
-            Just ("Unit load failed: " ++ SafeText.toString (SafeText.renderForeign (Error.toString e)))
+        UnitFailed failure ->
+            Just (SafeText.literal ("Unit load failed: " ++ Failure.loadFailureText failure))
 
         UnitIdRefused ->
-            Just "This address does not name a unit."
+            Just (SafeText.literal "This address does not name a unit.")
 
         UnitLoaded _ ->
             Nothing
 
 
 -- Why a unit's source is withheld, in place of the source and the decision
--- buttons; Nothing only for a verified view.
-sourceStatusText : Index.SourceView -> Maybe String
+-- buttons; Nothing only for a verified view. A line is the tool's text
+-- around at most the stored path, which arrives as the failure's own label,
+-- so no index column reaches the line but as a `Label`.
+sourceStatusText : Index.SourceView -> Maybe (List LabelPiece)
 sourceStatusText view =
     case view of
         Shown _ ->
             Nothing
 
         Stale Drifted ->
-            Just "Source changed since it was indexed; re-run `ipe-index index` to review it."
+            Just [ ToolText (SafeText.literal "Source changed since it was indexed; re-run `ipe-index index` to review it.") ]
 
         Stale (RangeOutOfFile r) ->
-            Just ("The file now has " ++ String.fromInt r.lineCount ++ " lines, fewer than this unit's range; re-run `ipe-index index` to review it.")
+            Just [ ToolText (SafeText.literal ("The file now has " ++ String.fromInt r.lineCount ++ " lines, fewer than this unit's range; re-run `ipe-index index` to review it.")) ]
 
         Stale UnverifiableHash ->
-            Just "This unit's hash predates source attestation; re-run `ipe-index index` to verify it."
+            Just [ ToolText (SafeText.literal "This unit's hash predates source attestation; re-run `ipe-index index` to verify it.") ]
 
         Unreadable failure ->
-            Just ("Source unreadable: " ++ SafeText.toString (Index.readFailureText failure))
+            Just (ToolText (SafeText.literal "Source unreadable: ") :: Index.readFailureText failure)
 
         TooLarge (SpanLines o) ->
-            Just ("This unit spans " ++ String.fromInt o.lines ++ " lines, past the " ++ String.fromInt Index.viewLineCeiling ++ "-line review ceiling." ++ notShownRemedy)
+            Just [ ToolText (SafeText.literal ("This unit spans " ++ String.fromInt o.lines ++ " lines, past the " ++ String.fromInt Index.viewLineCeiling ++ "-line review ceiling." ++ notShownRemedy)) ]
 
         TooLarge (ViewBytes o) ->
-            Just ("This unit's source is " ++ kibText (ByteSize.toBytes o.size) ++ ", past the " ++ kibText (ByteSize.toBytes Index.viewByteCeiling) ++ " review ceiling." ++ notShownRemedy)
+            Just [ ToolText (SafeText.literal ("This unit's source is " ++ kibText (ByteSize.toBytes o.size) ++ ", past the " ++ kibText (ByteSize.toBytes Index.viewByteCeiling) ++ " review ceiling." ++ notShownRemedy)) ]
 
         TooLarge (ChildSpans o) ->
-            Just ("This file holds at least " ++ String.fromInt o.atLeast ++ " other units, past the " ++ String.fromInt Index.childSpanCeiling ++ "-unit review ceiling. It is not shown and cannot be decided here; split the file to review it.")
+            Just [ ToolText (SafeText.literal ("This file holds at least " ++ String.fromInt o.atLeast ++ " other units, past the " ++ String.fromInt Index.childSpanCeiling ++ "-unit review ceiling. It is not shown and cannot be decided here; split the file to review it.")) ]
 
 
 -- What a reviewer can do about a view past a ceiling.
@@ -898,7 +662,7 @@ loadUnitView settings uid =
         Index.loadView conn settings.roots uid
 
 
-stateFromResult : Result Error QueuePage -> QueueState
+stateFromResult : Result LoadFailure QueuePage -> QueueState
 stateFromResult result =
     case result of
         Ok page ->
@@ -910,39 +674,140 @@ stateFromResult result =
 
 -- The one-line text for a state that has no unit list to show; Nothing for a
 -- loaded page that holds units.
-queueStatusText : QueueState -> Maybe String
+queueStatusText : QueueState -> Maybe SafeText
 queueStatusText state =
     case state of
         Loading ->
-            Just "Loading queue…"
+            Just (SafeText.literal "Loading queue…")
 
-        Failed e ->
-            Just ("Queue failed to load: " ++ SafeText.toString (SafeText.renderForeign (Error.toString e)))
+        Failed failure ->
+            Just (SafeText.literal ("Queue failed to load: " ++ Failure.loadFailureText failure))
 
         Loaded page ->
-            if page.total == 0 then
-                Just "No units queued."
+            if page.total == 0 && page.refusalsOpen > 0 then
+                Just (SafeText.literal ("No units queued, but" ++ refusalsWord page.refusalsOpen ++ " still open." ++ unboundNotice page))
+
+            else if page.total == 0 then
+                Just (SafeText.literal ("No units queued." ++ unboundNotice page))
 
             else if List.isEmpty page.units then
-                Just "No units to review on this page."
+                Just (SafeText.literal ("No units to review on this page." ++ unboundNotice page))
 
             else
                 Nothing
 
 
--- The queue header: database name, size, and how many of the open units
--- this page shows.
-pageHeaderText : QueuePage -> String
+-- The queue header: database name, size, how many of the open units this
+-- page shows, how many unreviewable files are open, and how many units it
+-- leaves out as unbound.
+pageHeaderText : QueuePage -> SafeText
 pageHeaderText page =
-    String.concat
-        [ SafeText.toString page.dbName
-        , " · "
-        , Format.byteSize page.dbBytes
-        , " · showing "
-        , String.fromInt (List.length page.units)
-        , " of "
-        , String.fromInt page.total
+    SafeText.concat
+        [ page.dbName
+        , SafeText.literal
+            (String.concat
+                [ " · "
+                , Format.byteSize page.dbBytes
+                , " · showing "
+                , String.fromInt (List.length page.units)
+                , " of "
+                , String.fromInt page.total
+                , refusalsNotice page
+                , unboundNotice page
+                ]
+            )
         ]
+
+
+-- The open unreviewable files, said where the queue's counts are; empty
+-- when none is open.
+refusalsNotice : QueuePage -> String
+refusalsNotice page =
+    if page.refusalsOpen > 0 then
+        " ·" ++ refusalsWord page.refusalsOpen ++ " open"
+
+    else
+        ""
+
+
+-- " 1 unreviewable file" for one, " N unreviewable files" for any other
+-- count.
+refusalsWord : Int -> String
+refusalsWord count =
+    if count == 1 then
+        " 1 unreviewable file"
+
+    else
+        " " ++ String.fromInt count ++ " unreviewable files"
+
+
+-- The fixed text naming why the index could not review a file.
+refusalReasonText : Index.RefusalReason -> SafeText
+refusalReasonText reason =
+    case reason of
+        NotUtf8 ->
+            SafeText.literal "Not UTF-8 text"
+
+        Oversized ->
+            SafeText.literal "Larger than the index reads as source"
+
+        SymlinkEntry ->
+            SafeText.literal "A symbolic link"
+
+        GitlinkEntry ->
+            SafeText.literal "A submodule (gitlink) entry"
+
+        UnknownMode ->
+            SafeText.literal "A git entry of unknown mode"
+
+        PastHashCeiling ->
+            SafeText.literal "Too large to hash"
+
+        NonUtf8Name ->
+            SafeText.literal "Its name is not UTF-8"
+
+        NotRepoRelative ->
+            SafeText.literal "Its path is not inside the repository"
+
+        NestedRepository ->
+            SafeText.literal "Inside a nested repository"
+
+        NotRegular ->
+            SafeText.literal "Not a regular file"
+
+        UnreadableEntry ->
+            SafeText.literal "Could not be read"
+
+        ReplacedEntry ->
+            SafeText.literal "Replaced while the index read it"
+
+
+-- " unit" for one, " units" for any other count.
+unitsWord : Int -> String
+unitsWord count =
+    if count == 1 then
+        " unit"
+
+    else
+        " units"
+
+
+-- The units and the unreviewable files under a tag no configured root
+-- binds, left out of the queue and its progress, said where the queue's
+-- counts are; empty when none is.
+unboundNotice : QueuePage -> String
+unboundNotice page =
+    unboundPart page.unbound (String.fromInt page.unbound ++ unitsWord page.unbound)
+        ++ unboundPart page.refusalsUnbound (String.dropLeft 1 (refusalsWord page.refusalsUnbound))
+
+
+unboundPart : Int -> String -> String
+unboundPart count what =
+    if count > 0 then
+        " · " ++ what ++ " in unbound repositories not shown"
+
+    else
+        ""
 
 
 -- One page of the queue at `cursor`, as the review app sees it: the open
@@ -976,61 +841,102 @@ loadPage settings cursor =
         pageOf settings db fresh
 
 
-pageOf : AppSettings -> Db.Db -> ( LibDb.LogState, Index.Snapshot ) -> Task.Task Error QueuePage
-pageOf settings db fresh =
-    case fresh of
-        ( state, snap ) ->
-            do
-                units <- classify (LibDb.verifier state) db snap.rows
-                Task.succeed
-                    { units = units
-                    , total = snap.open
-                    , dbName = SafeText.renderForeign (Settings.dbFileName settings.index.db)
-                    , dbBytes = snap.bytes
-                    , next = nextCursor snap.rows
-                    , progress = { reviewed = snap.units - snap.open, total = snap.units }
-                    , log = LibDb.logShown state
-                    }
+-- The page built from a copy `proveCopy` signed off: the type admits no
+-- snapshot a prover did not pair with the verdict it holds for.
+pageOf : AppSettings -> Db.Db -> LibDb.ProvenCopy -> Task.Task Error QueuePage
+pageOf settings db proven =
+    let
+        state =
+            LibDb.provenState proven
+
+        snap =
+            LibDb.provenSnapshot proven
+    in
+    do
+        units <- classify (LibDb.verifier state) db snap.rows
+        Task.succeed
+            { units = units
+            , total = snap.open
+            , unbound = snap.unbound
+            , dbName = SafeText.renderForeign (Settings.dbFileName settings.index.db.path)
+            , dbBytes = snap.bytes
+            , next = nextCursor snap.rows
+            , progress =
+                { reviewed = snap.units - snap.open + (snap.refusalsAll - snap.refusalsOpen)
+                , total = snap.units + snap.refusalsAll
+                }
+            , log = LibDb.logShown state
+            , refusals = snap.refusals
+            , refusalsOpen = snap.refusalsOpen
+            , refusalsUnbound = snap.refusalsUnbound
+            }
 
 
 -- The index read at `cursor` with the review log's verdict, taken once for
--- the load, trusted only when the `reviewed` copy holds for it: a stamp
--- current for the verdict and exactly the pairs of the entries its walk
--- verified. It is read as is, or once more after one rebuild of the copy
--- under that same verdict; a copy that still does not hold is a failed
--- load. A pair written into the copy outside a drain is never counted: the
--- load rebuilds the copy from the log first. The verdict is taken
--- before the index is read: a decision recorded after it moves the head on,
--- so a match proves the copy holds every counted decision up to a head the
--- log really had, and an entry edited, removed or added outside this tool
--- changes the verdict, so the copy is rebuilt on this load. One walk of the
--- log per load.
-freshSnapshot : AppSettings -> Db.Db -> Db.Db -> Index.Cursor -> Task.Task Error ( LibDb.LogState, Index.Snapshot )
+-- the load, proven by `proveCopy`: a stamp current for the verdict and
+-- exactly the pairs of the entries its walk verified. It is read as is, or
+-- once more after one rebuild of the copy under that same verdict; a copy
+-- that still does not prove is a failed load naming the fault. A pair
+-- written into the copy outside a drain is never counted: the load rebuilds
+-- the copy from the log first. The verdict is taken before the index is
+-- read: a decision recorded after it moves the head on, so a match proves
+-- the copy holds every counted decision up to a head the log really had,
+-- and an entry edited, removed or added outside this tool changes the
+-- verdict, so the copy is rebuilt on this load. One walk of the log per
+-- load.
+freshSnapshot : AppSettings -> Db.Db -> Db.Db -> Index.Cursor -> Task.Task Error LibDb.ProvenCopy
 freshSnapshot settings conn db cursor =
     do
         state <- LibDb.logVerdict settings.key db
-        first <- Index.readSnapshot settings.key conn cursor
-        if LibDb.copyHolds state first then
-            Task.succeed ( state, first )
+        first <- Index.readSnapshot settings.key settings.index.roots conn cursor
+        case LibDb.proveCopy state first of
+            Ok proven ->
+                Task.succeed proven
 
-        else
-            do
-                rebuildUnder settings.index resyncBound state db
-                second <- Index.readSnapshot settings.key conn cursor
-                if LibDb.copyHolds state second then
-                    Task.succeed ( state, second )
+            Err _ ->
+                do
+                    rebuildUnder settings.index resyncBound state db
+                    second <- Index.readSnapshot settings.key settings.index.roots conn cursor
+                    case LibDb.proveCopy state second of
+                        Ok proven ->
+                            Task.succeed proven
 
-                else
-                    Task.fail stillBehind
+                        Err fault ->
+                            Task.fail (stillBehind fault)
 
 
--- A decided unit drained from the index, then the queue page at `cursor`
--- reloaded. The drain writes the index alone: the review database already
--- holds the decision, and `written` says how it moved the log's head, so
--- the drain moves the copy's stamp the same way.
+-- A decided unit drained from the index after its decision is found in the
+-- review log: the log is walked under the configured key, the attested
+-- pair is looked up in it, and only a verified row's pair drains. The pair
+-- written to `reviewed` is the log's, never the message's. An attested pair
+-- with no verified row — none recorded, another hash recorded, a row that
+-- fails the key, or a broken log — drains nothing and returns 0. `written`
+-- says how the decision moved the log's head, so the drain moves the copy's
+-- stamp the same way; it never decides what drains.
+drainDecision : AppSettings -> Index.Attested -> Index.Written -> Task.Task Error Int
+drainDecision settings attested written =
+    do
+        db <- LibDb.openAt settings.review
+        state <- LibDb.logVerdict settings.key db
+        entry <- LibDb.findDecision (LibDb.verifier state) db (Index.attestedUid attested) (Index.attestedHash attested)
+        case entry of
+            Just (Verified row) ->
+                Index.drainUnit settings.index (LibDb.verifiedPair row) written
+
+            Just (Unverified _) ->
+                Task.succeed 0
+
+            Nothing ->
+                Task.succeed 0
+
+
+-- A decided unit drained from the index through `drainDecision`, then the
+-- queue page at `cursor` reloaded. The drain writes the index alone: the
+-- review database already holds the decision, and the drain re-reads it
+-- there before writing.
 drainThenLoad : AppSettings -> Index.Attested -> Index.Written -> Index.Cursor -> Task.Task Error QueuePage
 drainThenLoad settings attested written cursor =
-    Index.drainUnit settings.index attested written |> Task.andThen (\_ -> loadPage settings cursor)
+    drainDecision settings attested written |> Task.andThen (\_ -> loadPage settings cursor)
 
 
 -- A full page may have rows after it; a short page is the last one.
@@ -1069,10 +975,12 @@ classifyUnit verify db row =
     in
     do
         latest <- LibDb.findLatestForUid verify db unit.uid
+        entry <- LibDb.findDecision verify db unit.uid current
         Task.succeed
             { unit = unit
             , change = row.change
             , changed = Maybe.andThen (previousReview current) latest
+            , standing = standingOf entry
             }
 
 

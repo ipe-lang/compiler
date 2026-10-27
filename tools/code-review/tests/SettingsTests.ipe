@@ -5,6 +5,7 @@ import Ipe.Char as Char
 import Ipe.Crypto as Crypto
 import Ipe.Db as Db
 import Ipe.Db.Decode
+import Ipe.Db.Location exposing (Mode(..))
 import Ipe.Db.Sql as Sql
 import Ipe.Dict as Dict
 import Ipe.Error as Error
@@ -20,19 +21,22 @@ import Ipe.String as String
 import Ipe.System as System
 import Ipe.Task as Task
 import Ipe.Time.Timestamp as Timestamp
+import Lib.Bind as Bind exposing (BindRefusal(..))
 import Lib.Db as LibDb exposing (Decision(..), HistoryCursor(..))
-import Lib.EnvLookup as EnvLookup
+import Lib.EnvLookup as EnvLookup exposing (StartupVar(..))
 import Lib.Format as Format
 import Lib.Highlight as Highlight exposing (Lang(..), Token(..))
+import Lib.History exposing (HistoryState(..))
 import Lib.Index as Index exposing (SourceView(..), StaleReason(..))
 import Lib.Keys as Keys exposing (KeyAction(..))
 import Lib.Links as Links exposing (Link(..))
-import Lib.Queue as Queue exposing (HistoryState(..), QueueState(..), UnitPageState(..))
+import Lib.PageSize as PageSize
+import Lib.Queue as Queue exposing (QueueState(..), UnitPageState(..))
 import Lib.RepoPath as RepoPath exposing (PathError(..), Root, RootMap)
 import Lib.ReviewKey as ReviewKey exposing (ReviewKey(..))
 import Lib.SafeText as SafeText
-import Lib.Settings as Settings
-import TestSupport exposing (tableExists, envReview, countReviewRows, expectErr, refuse, seedIndex, writeFileText, fixtureLibRs, fixtureMainIpe, viewA, viewB, viewTag, shownTextOf, unitViewTag, execIndex, execIndexUnchecked, Scratch, freshScratch, freshDir, check, indexSchemaStatements, execIndexSchema, seedIndexDb, insertUnitRows, setIndexEnv, envSettings, loadFirstPage, checkUnits, listSecond, isUnitA, isUnitB, cleanupIndex, removeFileIfAny, codeText, noHazard, rendered, renderedForeign, describeText, refusedFor, openReadOnlyAt, vectorsPath, ipeIndexTestFile, repoFile, probeMessage, probeNames, maybeContains)
+import Lib.Settings as Settings exposing (DbRefusal(..), LogBreak(..))
+import TestSupport exposing (openFileAt, tableExists, envReview, countReviewRows, expectErr, refuse, seedIndex, writeFileText, fixtureLibRs, fixtureMainIpe, viewA, viewB, viewTag, shownTextOf, unitViewTag, execIndex, execIndexUnchecked, Scratch, freshScratch, freshDir, check, indexSchemaStatements, execIndexSchema, seedIndexDb, insertUnitRows, setIndexEnv, envSettings, loadFirstPage, checkUnits, listSecond, isUnitA, isUnitB, cleanupIndex, removeFileIfAny, codeText, noHazard, rendered, renderedForeign, describeText, refusedFor, openReadOnlyAt, vectorsPath, ipeIndexTestFile, repoFile, probeMessage, probeNames, maybeContains)
 
 
 -- An `IPE_INDEX_DB` value carrying hazards is refused by naming the variable,
@@ -48,12 +52,12 @@ dbRefusalNamesOnlyVariable =
                 && not (refusedFor "]0;pwn" refusal)
                 && not (refusedFor "postgres://" refusal)
                 && (case refusal of
-                    Just message ->
-                        noHazard message
+                        Just message ->
+                            noHazard message
 
-                    Nothing ->
-                        False
-                )
+                        Nothing ->
+                            False
+                   )
             )
 
 
@@ -78,116 +82,87 @@ badIndexDbRefused =
         cwd <- System.cwd ()
         System.setenv "IPE_INDEX_ROOT" cwd
         blank <- settingsRefused "" "is empty"
-        otherScheme <- settingsRefused "postgres://localhost/index" "not `sqlite://`"
-        query <- settingsRefused "index.db?mode=rwc" "file path containing"
-        fragment <- settingsRefused "index.db#x" "file path containing"
-        percent <- settingsRefused "index%2e.db" "file path containing"
-        urlQuery <- settingsRefused "sqlite:///tmp/index.db?mode=rwc" "with a query"
-        urlOtherQuery <- settingsRefused "sqlite:///tmp/index.db?cache=shared" "with a query"
-        urlEmpty <- settingsRefused "sqlite://" "naming no database"
-        urlFragment <- settingsRefused "sqlite:///tmp/index.db#x" "with a query or fragment"
-        urlEncodedQuery <- settingsRefused "sqlite://file:/tmp/x.db%3Fmode=ro" "not absolute"
-        urlEncodedImmutable <- settingsRefused "sqlite://file:/x.db%3Fmode=ro%26immutable=1" "not absolute"
-        urlMemory <- settingsRefused "sqlite://:memory:" "not absolute"
-        urlRelative <- settingsRefused "sqlite://rel.db" "not absolute"
-        urlNested <- settingsRefused "sqlite://sqlite:" "not absolute"
-        urlBadEscape <- settingsRefused "sqlite:///tmp/index%zz.db" "malformed percent-escape"
-        urlNul <- settingsRefused "sqlite:///tmp/index%00.db" "not a valid file path"
-        urlAboveRoot <- settingsRefused "sqlite:///.." "root directory"
-        urlDeepAboveRoot <- settingsRefused "sqlite:///tmp/../../.." "root directory"
-        urlRoot <- settingsRefused "sqlite:///" "root directory"
+        otherScheme <- settingsRefused "postgres://localhost/index" "is a URL"
+        sqliteUrl <- settingsRefused "sqlite:///tmp/index.db" "is a URL"
+        memoryUrl <- settingsRefused "sqlite::memory:" "is a URL"
+        noSlashes <- settingsRefused "sqlite:index.db" "is a URL"
+        fileNoSlashes <- settingsRefused "file:index.db" "is a URL"
+        colon <- settingsRefused "/tmp/a:b.db" "cannot open as written"
+        relativeColon <- settingsRefused "a:b.db" "cannot open as written"
         pathAboveRoot <- settingsRefused "/.." "root directory"
-        urlDot <- settingsRefused "sqlite:///." "root directory"
-        urlDotSlash <- settingsRefused "sqlite:///./" "root directory"
-        urlDoubleSlash <- settingsRefused "sqlite:////" "root directory"
-        urlEncodedAboveRoot <- settingsRefused "sqlite:///%2e%2e" "root directory"
-        noSlashes <- settingsRefused "sqlite:index.db" "without `//`"
-        fileNoSlashes <- settingsRefused "file:index.db" "without `//`"
+        pathDeepAboveRoot <- settingsRefused "/tmp/../../.." "root directory"
+        pathRoot <- settingsRefused "/" "root directory"
         secret <- settingsRefusal "postgres://admin:s3cr3t-pw@db/index"
         Task.succeed
             (blank
                 && otherScheme
-                && query
-                && fragment
-                && percent
-                && urlQuery
-                && urlOtherQuery
-                && urlEmpty
-                && urlFragment
-                && urlEncodedQuery
-                && urlEncodedImmutable
-                && urlMemory
-                && urlRelative
-                && urlNested
-                && urlBadEscape
-                && urlNul
-                && urlAboveRoot
-                && urlDeepAboveRoot
-                && urlRoot
-                && pathAboveRoot
-                && urlDot
-                && urlDotSlash
-                && urlDoubleSlash
-                && urlEncodedAboveRoot
+                && sqliteUrl
+                && memoryUrl
                 && noSlashes
                 && fileNoSlashes
+                && colon
+                && relativeColon
+                && pathAboveRoot
+                && pathDeepAboveRoot
+                && pathRoot
                 && refusedFor "IPE_INDEX_DB" secret
                 && not (refusedFor "s3cr3t-pw" secret)
                 && not (refusedFor "admin" secret)
             )
 
 
--- Every open URL carries exactly the app's mode, for a file path and a
--- `sqlite://` URL alike, and a `sqlite://` URL parses to the same location as
--- the plain path it names; a `+` in the URL path is a literal `+`, never a
--- space.
-dbUrlsCarryAppMode : Task.Task Error Bool
-dbUrlsCarryAppMode =
+-- A setting is a file path made absolute once: an absolute path is kept as
+-- written, a relative one joins the working directory, and a `+` is a
+-- literal `+`. Both databases keep the path their refusals name.
+dbSettingParsesOnce : Task.Task Error Bool
+dbSettingParsesOnce =
     do
-        file <- Settings.parseDbLocation "IPE_INDEX_DB" "/tmp/a&b/index.db"
-        url <- Settings.parseDbLocation "IPE_INDEX_DB" "sqlite:///tmp/index%3F.db"
-        absUrl <- Settings.parseDbLocation "IPE_INDEX_DB" "sqlite:///abs/x.db"
-        absPath <- Settings.parseDbLocation "IPE_INDEX_DB" "/abs/x.db"
-        plusUrl <- Settings.parseDbLocation "IPE_INDEX_DB" "sqlite:///t/a+b.db"
-        escapedPlusUrl <- Settings.parseDbLocation "IPE_INDEX_DB" "sqlite:///t/a%2Bb.db"
-        plusPath <- Settings.parseDbLocation "IPE_INDEX_DB" "/t/a+b.db"
+        cwd <- System.cwd ()
+        absolute <- Settings.parseIndexDb "/abs/x.db"
+        plus <- Settings.parseIndexDb "/t/a+b.db"
+        relative <- Settings.parseIndexDb "rel.db"
+        review <- Settings.parseReviewDb "/abs/review.db"
         Task.succeed
-            (absUrl
-                == absPath
-                && plusUrl
-                == plusPath
-                && escapedPlusUrl
-                == plusPath
-                && Settings.reviewUrl plusUrl
-                == "sqlite:///t/a+b.db?mode=rwc"
-                && Settings.indexReadUrl absUrl
-                == "sqlite:///abs/x.db?mode=ro"
-                && Settings.indexReadUrl file
-                == "sqlite:///tmp/a&b/index.db?mode=ro"
-                && Settings.indexWriteUrl file
-                == "sqlite:///tmp/a&b/index.db?mode=rw"
-                && Settings.reviewUrl file
-                == "sqlite:///tmp/a&b/index.db?mode=rwc"
-                && Settings.indexReadUrl url
-                == "sqlite:///tmp/index%3F.db?mode=ro"
-                && Settings.indexWriteUrl url
-                == "sqlite:///tmp/index%3F.db?mode=rw"
-                && Settings.reviewUrl url
-                == "sqlite:///tmp/index%3F.db?mode=rwc"
+            (Path.toString absolute.path == "/abs/x.db"
+                && Path.toString plus.path == "/t/a+b.db"
+                && Path.toString relative.path == cwd ++ "/rel.db"
+                && Path.toString review.path == "/abs/review.db"
+                && Settings.dbFileName plus.path == "a+b.db"
             )
 
 
--- A working directory can hold `%`, `?` or `#`; each is escaped so the joined
--- file path survives the URL as the same name, with `%` escaped first so the
--- other escapes are not re-encoded.
-filePathsEncodeUrlSpecials : Bool
-filePathsEncodeUrlSpecials =
-    Settings.encodeFilePath "/w/a%b?c#d/index.db"
-        == "/w/a%25b%3Fc%23d/index.db"
-        && Settings.encodeFilePath "/w/%3F"
-        == "/w/%253F"
-        && Settings.encodeFilePath "/w/plain.db"
-        == "/w/plain.db"
+-- A file name holding `?`, `#`, `%` or `&` names that literal file: the
+-- review open creates exactly it, the index read opens the same file, and no
+-- file named by the text before the `?` or `#`, or by a percent-decoding,
+-- appears. Red if any byte of the setting reaches the driver as URL syntax.
+urlMetacharactersNameLiteralFiles : Task.Task Error Bool
+urlMetacharactersNameLiteralFiles =
+    do
+        dir <- freshDir "ipe-settings-literal-db"
+        opened <- [ "index.db?mode=ro", "index.db#x", "index%2e.db", "a&b.db" ]
+                    |> List.map (literalFileOpened dir)
+                    |> Task.sequence
+        strays <- [ "index.db", "index..db", "index.db?mode=rwc" ]
+                    |> List.map (\name -> Task.fromResult (Path.fromString (dir ++ "/" ++ name)) |> Task.andThen File.exists)
+                    |> Task.sequence
+        Task.succeed (List.all (\ok -> ok) opened && List.all not strays)
+
+
+literalFileOpened : String -> String -> Task.Task Error Bool
+literalFileOpened dir name =
+    let
+        file =
+            dir ++ "/" ++ name
+    in
+    do
+        review <- Settings.parseReviewDb file
+        conn <- Db.open review.open
+        Db.exec conn "CREATE TABLE IF NOT EXISTS literal (x INTEGER)" []
+        index <- Settings.parseIndexDb file
+        reader <- Db.open index.read
+        present <- tableExists reader "literal"
+        created <- Task.fromResult (Path.fromString file) |> Task.andThen File.exists
+        Task.succeed (Path.toString review.path == file && present && created)
 
 
 -- ── required resources probed before listen ─────────────────────────────
@@ -232,17 +207,35 @@ rootProbeJoinsIndexedPath =
         System.setenv "IPE_INDEX_ROOT" at.repo
         cleanupIndex at.indexDb at.repo
         Task.succeed
-            (good
-                == Nothing
-                && oneGone
-                == Nothing
-                && Maybe.map (String.startsWith "IPE_INDEX_ROOT ") wrong
-                == Just True
+            (good == Nothing
+                && oneGone == Nothing
+                && Maybe.map (String.startsWith "IPE_INDEX_ROOT ") wrong == Just True
                 && maybeContains "ipe:src/" wrong
                 && maybeContains empty wrong
                 && maybeContains " is not found under " wrong
                 && maybeContains "repository root the index was built from" wrong
                 && not (maybeContains "os error" wrong)
+            )
+
+
+-- A sampled index path longer than the read window is never joined and
+-- reaches the root refusal only as its bounded label: the message carries
+-- the truncation marker and stays far below the path's length. Red if the
+-- root check reads the raw path column again.
+rootProbeBoundsLongPath : Task.Task Error Bool
+rootProbeBoundsLongPath =
+    do
+        at <- freshScratch "ipe-index-root-long"
+        removeFileIfAny at.indexDb
+        seedIndex at.indexDb at.repo
+        execIndex at.indexDb "UPDATE units SET path = 'ipe:' || replace(hex(zeroblob(3000)), '0', 'a')" []
+        long <- probeMessage (envSettings |> Task.andThen Index.probeRoot)
+        cleanupIndex at.indexDb at.repo
+        Task.succeed
+            (Maybe.map (String.startsWith "IPE_INDEX_ROOT ") long == Just True
+                && maybeContains " is not found under " long
+                && maybeContains " bytes, #" long
+                && Maybe.map (\message -> String.length message < 2048) long == Just True
             )
 
 
@@ -262,12 +255,10 @@ rootProbeRefusesUntaggedIndex =
         emptied <- probeMessage (envSettings |> Task.andThen Index.probeRoot)
         cleanupIndex at.indexDb at.repo
         Task.succeed
-            (Maybe.map (String.startsWith "IPE_INDEX_DB ") untagged
-                == Just True
+            (Maybe.map (String.startsWith "IPE_INDEX_DB ") untagged == Just True
                 && maybeContains "no index path starts with a configured repo tag" untagged
                 && maybeContains "\"ipe:\"" untagged
-                && emptied
-                == Nothing
+                && emptied == Nothing
             )
 
 
@@ -294,7 +285,7 @@ foreignDbProbed at =
             at.repo ++ "/not-an-index.db"
     in
     do
-        conn <- Db.open "sqlite" ("sqlite://" ++ otherDb ++ "?mode=rwc")
+        conn <- openFileAt CreateIfMissing otherDb
         Db.exec conn "CREATE TABLE IF NOT EXISTS other (x INTEGER)" []
         System.setenv "IPE_INDEX_DB" otherDb
         message <- probeMessage (envSettings |> Task.andThen Index.probe)
@@ -387,20 +378,13 @@ classifiedAs ( present, failure, expected ) =
 -- narrower case.
 dbRefusalIgnoresMessage : Bool
 dbRefusalIgnoresMessage =
-    Settings.dbRefusalOf True (Error.unexpected "db: database error [5]")
-        == Settings.Unusable
-        && Settings.dbRefusalOf True (Error.unexpected "db: database error [14]")
-        == Settings.Unusable
-        && Settings.dbRefusalOf True (Error.unexpected "pool timed out")
-        == Settings.Unusable
-        && Settings.dbRefusalOf False (Error.unexpected "pool timed out")
-        == Settings.NoDatabaseFile
-        && Settings.dbRefusalOf True (Error.withDetails (Custom "Busy") (Error.unexpected "db failed"))
-        == Settings.Unusable
-        && Settings.dbRefusalOf True (Error.withDetails (Database Db.OtherFailure) (Error.unexpected "db: database error [5]"))
-        == Settings.Unusable
-        && Settings.dbRefusalOf True (Error.withDetails (Database Db.CannotOpen) (Error.unexpected "pool timed out"))
-        == Settings.NotPermitted
+    Settings.dbRefusalOf True (Error.unexpected "db: database error [5]") == Settings.Unusable
+        && Settings.dbRefusalOf True (Error.unexpected "db: database error [14]") == Settings.Unusable
+        && Settings.dbRefusalOf True (Error.unexpected "pool timed out") == Settings.Unusable
+        && Settings.dbRefusalOf False (Error.unexpected "pool timed out") == Settings.NoDatabaseFile
+        && Settings.dbRefusalOf True (Error.withDetails (Custom "Busy") (Error.unexpected "db failed")) == Settings.Unusable
+        && Settings.dbRefusalOf True (Error.withDetails (Database Db.OtherFailure) (Error.unexpected "db: database error [5]")) == Settings.Unusable
+        && Settings.dbRefusalOf True (Error.withDetails (Database Db.CannotOpen) (Error.unexpected "pool timed out")) == Settings.NotPermitted
 
 
 -- A file that is not a SQLite database is refused as one, at either
@@ -413,7 +397,7 @@ notSqliteRefused =
         cwd <- System.cwd ()
         writeFileText (base ++ "/index.db") "plain text, not a database\n"
         writeFileText (base ++ "/review.db") "plain text, not a database\n"
-        index <- probeMessage (Settings.parseIndexSettings (base ++ "/index.db") cwd |> Task.andThen Index.probe)
+        index <- probeMessage (Settings.parseIndexSettings (base ++ "/index.db") cwd Settings.EnvUnset |> Task.andThen Index.probe)
         review <- probeMessage (Settings.parseReviewDb (base ++ "/review.db") |> Task.andThen (LibDb.probe ReadOnly))
         removeFileIfAny (base ++ "/index.db")
         removeFileIfAny (base ++ "/review.db")
@@ -435,18 +419,14 @@ dbRefusalsStateOneFix =
         cwd <- System.cwd ()
         System.setenv "IPE_INDEX_ROOT" cwd
         refusals <- [ ""
-        , "postgres://localhost/index"
-        , "sqlite:index.db"
-        , "index.db?mode=rwc"
-        , "sqlite:///tmp/index.db?mode=rwc"
-        , "sqlite:///tmp/index%zz.db"
-        , "sqlite://"
-        , "sqlite:///tmp/index%00.db"
-        , "sqlite://rel.db"
-        , "sqlite:///"
-        ]
-            |> List.map settingsRefusal
-            |> Task.sequence
+                    , "postgres://localhost/index"
+                    , "sqlite:index.db"
+                    , "sqlite:///tmp/index.db?mode=rwc"
+                    , "/tmp/a:b.db"
+                    , "/"
+                    ]
+                        |> List.map settingsRefusal
+                        |> Task.sequence
         Task.succeed
             (List.all
                 (\refusal ->
@@ -471,10 +451,12 @@ dbRefusalsStateOneFix =
 -- and `*cwd` readers again by name, and the only admitted import is the
 -- exact `import Ipe.System as System`, so an alias or an `exposing` import
 -- cannot dodge the count. In `Main`: the environment is read on exactly two
--- code lines — `requireEnv`'s read and the `requireSettings` call in
--- `main` — and `requireEnv` is named only by its declaration and its two
--- literal-key calls, so no wrapper can pass it a key. `Settings` exports both
--- parsers and neither the bare `indexSettings` nor `reviewDb`.
+-- code lines — `requireEnv`'s read and `optionalEnv`'s read — and each of
+-- `requireEnv` and `optionalEnv` is named only by its declaration and its
+-- calls (two of `requireEnv`, each naming a `StartupVar` constructor, three
+-- of `optionalEnv`, each a literal key), so no wrapper can pass either
+-- reader its variable. `Settings` exports both parsers and neither the bare
+-- `indexSettings` nor `reviewDb`.
 startupReadsAdmittedOnly : Task.Task Error Bool
 startupReadsAdmittedOnly =
     do
@@ -482,16 +464,15 @@ startupReadsAdmittedOnly =
         topNames <- readDirAt (cwd ++ "/src")
         libNames <- readDirAt (cwd ++ "/src/Lib")
         sources <- Task.sequence
-            (List.map
-                (\rel -> readLibSource (cwd ++ "/src/" ++ rel) |> Task.map (\text -> ( rel, withoutCommentLines text )))
-                (moduleFiles topNames libNames)
-            )
+                    (List.map
+                        (\rel -> readLibSource (cwd ++ "/src/" ++ rel) |> Task.map (\text -> ( rel, withoutCommentLines text )))
+                        (moduleFiles topNames libNames)
+                    )
         settings <- readLibSource (cwd ++ "/src/Lib/Settings.ipe")
         mainSource <- readLibSource (cwd ++ "/src/Main.ipe") |> Task.map withoutCommentLines
         Task.succeed
             (layoutAdmits topNames libNames
-                && List.length sources
-                >= 12
+                && List.length sources >= 12
                 && sitesAdmitted sources
                 && mainAdmits mainSource
                 && settingsExports settings
@@ -540,31 +521,48 @@ occurrences needle text =
 
 -- Each needle and, for every module admitted to name it, the exact number of
 -- times its code does. A module absent from a needle's row names it zero
--- times. `System.` counts every qualified use of the module: `Main`'s
--- `getenv`, `getenvOr` and three `exit`s, `RepoPath`'s `cwd`, `ReviewKey`'s
+-- times. `System.` counts every qualified use of the module: `Main`'s two
+-- `getenv`s and its one `exit`, `RepoPath`'s `cwd`, `ReviewKey`'s
 -- one `getenv` of the review key. `absolute`
 -- counts `Path.absolute`, which resolves against the working directory, beside
--- the message text that names the word. `Ipe.Env` reads
+-- the fixes in `EnvLookup` and the message texts that name the word. `Ipe.Env` reads
 -- the live environment on the native target and `Ipe.Process` can run a
--- child that prints it, so neither is admitted anywhere.
+-- child that prints it, so neither is admitted anywhere. `IPE_HTTP_BIND` is
+-- read once, by `Main`, spelled once more as the name `EnvLookup` gives the
+-- variable, and parsed by `Bind.parseBind` alone, called once.
+-- The bind proof rests on the runtime resolving the same value: no module
+-- installs a host setting (`appWith`) or writes the environment overlay
+-- (`setenv`, `unsetenv`, `loadEnv`), by any spelling of the name. The
+-- server module is imported by `Main` alone, and `listen` is named only by
+-- the tail of `main`, over the `Loopback` proof, and by the refusal's prose,
+-- so no other module can listen through an alias or an `exposing` import.
 admittedSites : List ( String, List ( String, Int ) )
 admittedSites =
     [ ( "Ipe.System", [ ( "Main.ipe", 1 ), ( "Lib/RepoPath.ipe", 1 ), ( "Lib/ReviewKey.ipe", 1 ) ] )
     , ( "Ipe.Ffi", [] )
     , ( "Ipe.Env", [] )
     , ( "Ipe.Process", [] )
-    , ( "System.", [ ( "Main.ipe", 5 ), ( "Lib/RepoPath.ipe", 1 ), ( "Lib/ReviewKey.ipe", 1 ) ] )
+    , ( "System.", [ ( "Main.ipe", 3 ), ( "Lib/RepoPath.ipe", 1 ), ( "Lib/ReviewKey.ipe", 1 ) ] )
     , ( "getenv", [ ( "Main.ipe", 2 ), ( "Lib/ReviewKey.ipe", 1 ) ] )
     , ( "cwd", [ ( "Lib/RepoPath.ipe", 3 ) ] )
-    , ( "isDir", [ ( "Lib/RepoPath.ipe", 3 ), ( "Lib/Settings.ipe", 1 ) ] )
-    , ( "absolute", [ ( "Main.ipe", 2 ), ( "Lib/RepoPath.ipe", 1 ), ( "Lib/Settings.ipe", 3 ) ] )
+    , ( "isDir", [ ( "Lib/RepoPath.ipe", 6 ), ( "Lib/Settings.ipe", 1 ) ] )
+    , ( "absolute", [ ( "Lib/EnvLookup.ipe", 3 ), ( "Lib/RepoPath.ipe", 5 ), ( "Lib/Index.ipe", 1 ) ] )
     , ( "absolutize", [ ( "Lib/RepoPath.ipe", 4 ), ( "Lib/Settings.ipe", 1 ) ] )
     , ( "parseRoot", [ ( "Lib/RepoPath.ipe", 3 ), ( "Lib/Settings.ipe", 1 ) ] )
-    , ( "parseDbLocation", [ ( "Lib/Settings.ipe", 5 ) ] )
+    , ( "parseDbFile", [ ( "Lib/Settings.ipe", 4 ) ] )
     , ( "parseIndexSettings", [ ( "Lib/Settings.ipe", 3 ), ( "Main.ipe", 1 ) ] )
     , ( "parseReviewDb", [ ( "Lib/Settings.ipe", 3 ), ( "Main.ipe", 1 ) ] )
     , ( "readReviewKey", [ ( "Lib/ReviewKey.ipe", 3 ), ( "Main.ipe", 1 ) ] )
     , ( "parseMacKey", [ ( "Lib/ReviewKey.ipe", 4 ) ] )
+    , ( "parseBind", [ ( "Lib/Bind.ipe", 3 ), ( "Main.ipe", 1 ) ] )
+    , ( "IPE_HTTP_BIND", [ ( "Lib/EnvLookup.ipe", 1 ), ( "Main.ipe", 1 ) ] )
+    , ( "appWith", [] )
+    , ( "setenv", [] )
+    , ( "unsetenv", [] )
+    , ( "loadEnv", [] )
+    , ( "listen", [ ( "Main.ipe", 1 ), ( "Lib/Bind.ipe", 2 ) ] )
+    , ( "Ipe.Server", [ ( "Main.ipe", 1 ) ] )
+    , ( "Http.Server", [] )
     ]
 
 
@@ -603,7 +601,9 @@ systemImportAdmitted line =
 
 -- The scan refuses each way around it: a reader behind an alias or an
 -- `exposing` import, `getcwd` beside `cwd`, a wrapper that calls an admitted
--- parser from a request path, a reader in a module outside `src/Lib`, and a
+-- parser from a request path, a reader in a module outside `src/Lib`, a
+-- listen or server import outside `Main`, a listen that is not `main`'s
+-- tail or not over the proof-taking `mounts`, a second listen or mount, and a
 -- directory the inventory would not read. Red while the scan matches one
 -- qualified spelling per reader or reads `src/Lib` alone.
 startupScanRefusesEvasions : Task.Task Error Bool
@@ -613,10 +613,10 @@ startupScanRefusesEvasions =
         topNames <- readDirAt (cwd ++ "/src")
         libNames <- readDirAt (cwd ++ "/src/Lib")
         sources <- Task.sequence
-            (List.map
-                (\rel -> readLibSource (cwd ++ "/src/" ++ rel) |> Task.map (\text -> ( rel, withoutCommentLines text )))
-                (moduleFiles topNames libNames)
-            )
+                    (List.map
+                        (\rel -> readLibSource (cwd ++ "/src/" ++ rel) |> Task.map (\text -> ( rel, withoutCommentLines text )))
+                        (moduleFiles topNames libNames)
+                    )
         Task.succeed
             (sitesAdmitted sources
                 && evaded sources "Lib/Queue.ipe" "import Ipe.System as Sys\nroot = Sys.getcwd ()"
@@ -632,13 +632,31 @@ startupScanRefusesEvasions =
                 && evaded sources "Lib/Index.ipe" "fresh = Path.absolute"
                 && evaded sources "Lib/Queue.ipe" "import Ipe.Env as Env\nraw = Env.public \"INDEX_DB\""
                 && evaded sources "Lib/Queue.ipe" "import Ipe.Process as Process\nraw = Process.run \"printenv\" []"
+                && evaded sources "Lib/Queue.ipe" "again = Bind.parseBind (Settings.EnvSet \"0.0.0.0\")"
+                && evaded sources "Main.ipe" "rebind = setenv \"X\" \"0.0.0.0\""
+                && evaded sources "Lib/Queue.ipe" "unbind = Sys.unsetenv \"X\""
+                && evaded sources "Lib/Queue.ipe" "reload = loadEnv \".env\""
+                && evaded sources "Lib/Queue.ipe" "app = Web.appWith"
+                && evaded sources "Lib/Queue.ipe" "rogue settings = Server.listen 8000 []"
+                && evaded sources "Lib/App.ipe" "import Ipe.Http.Server as Http\nrogue = Http.mountApp"
+                && evaded sources "Lib/Queue.ipe" "import Ipe.Server.Http as Http\nrogue = Http.mountApp"
+                && evaded sources "Main.ipe" "rogue = listen 8000 []"
                 && not (sitesAdmitted (List.filter (\( rel, _ ) -> rel /= "Lib/RepoPath.ipe") sources))
                 && not (layoutAdmits ("Pages" :: topNames) libNames)
                 && not (layoutAdmits topNames ("Extra" :: libNames))
                 && not (systemImportAdmitted "import  Ipe.System  as  System exposing (cwd)")
                 && mainAdmits (mainCode sources)
-                && not (mainAdmits (mainCode sources ++ "\nreread name = requireEnv name \"\""))
-                && not (mainAdmits (String.replace "rawDb <- requireEnv \"IPE_INDEX_DB\" " "rawDb <- readDb " (mainCode sources) ++ "\nreadDb = requireEnv \"IPE_INDEX_DB\""))
+                && not (mainAdmits (mainCode sources ++ "\nreread var = requireEnv var"))
+                && not (mainAdmits (mainCode sources ++ "\nreread name = optionalEnv name"))
+                && not (mainAdmits (String.replace "rawRepos <- optionalEnv \"IPE_INDEX_REPOS\"" "rawRepos <- Task.succeed Settings.EnvUnset" (mainCode sources)))
+                && not (mainAdmits (String.replace "rawDb <- requireEnv EnvLookup.IndexDbVar" "rawDb <- readDb" (mainCode sources) ++ "\nreadDb = requireEnv EnvLookup.IndexDbVar"))
+                && not (mainAdmits (String.replace mainTail "        Server.listen 8000 [ Server.mountApp \"/\" (reviewApp settings) ]" (mainCode sources)))
+                && not (mainAdmits (String.replace mainTail "        open bind settings" (mainCode sources) ++ "\nopen b s =\n    Server.listen 8000 (mounts b s)"))
+                && not (mainAdmits (mainCode sources ++ "\n        Task.succeed ()"))
+                && not (mainAdmits (mainCode sources ++ "\nagain = Server.listen 8000 []"))
+                && not (mainAdmits (String.replace "mounts : Bind.Loopback -> Settings.AppSettings" "mounts : Settings.AppSettings" (mainCode sources)))
+                && not (mainAdmits (String.replace "(reviewApp settings) ]" "(reviewApp settings), Server.mountApp \"/x\" (reviewApp settings) ]" (mainCode sources)))
+                && not (mainAdmits (String.replace "        bind <- requireLoopbackBind rawBind\n" "" (mainCode sources) ++ "\nlater raw = requireLoopbackBind raw"))
             )
 
 
@@ -685,49 +703,79 @@ mainAdmits text =
         envLines =
             List.filter (String.contains "getenv") (String.lines text)
     in
-    List.length envLines
-        == 2
+    List.length envLines == 2
         && List.any (String.contains "(System.getenv key)") envLines
-        && List.any (\line -> String.startsWith "settings <- requireSettings" (String.trim line)) envLines
-        && occurrences "getenv" text
-        == 2
-        && occurrences "requireEnv \"" text
-        == 2
-        && occurrences "requireEnv" text
-        == 4
-        && occurrences "requireSettings" text
-        == 3
-        && occurrences "parseIndexSettings" text
-        == 1
-        && occurrences "parseReviewDb" text
-        == 1
-        && List.all (\needle -> occurrences needle text == 0) [ "parseDbLocation", "parseRoot", "absolutize", "isDir", "System.cwd" ]
+        && List.any (String.contains "(System.getenv key |> Task.map Settings.EnvSet)") envLines
+        && occurrences "getenv" text == 2
+        && occurrences "requireEnv EnvLookup." text == 2
+        && occurrences "requireEnv" text == 4
+        && occurrences "optionalEnv \"" text == 3
+        && occurrences "optionalEnv" text == 5
+        && occurrences "requireLoopbackBind" text == 3
+        && occurrences "Server.listen" text == 1
+        && occurrences mountsDefinition text == 1
+        && occurrences "mounts" text == 3
+        && occurrences "mountApp" text == 1
+        && occurrences "requireSettings" text == 3
+        && occurrences "parseIndexSettings" text == 1
+        && occurrences "parseReviewDb" text == 1
+        && List.all (\needle -> occurrences needle text == 0) [ "parseDbFile", "parseRoot", "absolutize", "isDir", "System.cwd" ]
         && mainPinned text
 
 
--- `main` opens with the two literal-key `requireEnv` reads, the review
--- key's read, the settings parse and the listen, in that order, so a partially applied `requireEnv`
--- that a request could run cannot take the place of either read.
+-- `main` opens with the bind's read and its loopback proof, then the two
+-- `requireEnv` reads, each naming its `StartupVar`, the two other
+-- literal-key `optionalEnv` reads, the review key's read, the settings parse and, as the block's tail,
+-- the listen over the proof-consuming `mounts`, in that order, so a refused
+-- bind stops startup before any other read, and a partially applied reader
+-- that a request could run cannot take the place of any read.
 mainPinned : String -> Bool
 mainPinned text =
     case String.split "\nmain =\n    do\n" text of
         [ _, body ] ->
-            case List.take 5 (String.lines body) of
-                [ dbLine, rootLine, keyLine, settingsLine, listenLine ] ->
-                    String.startsWith "        rawDb <- requireEnv \"IPE_INDEX_DB\" \"" dbLine
-                        && String.startsWith "        rawRoot <- requireEnv \"IPE_INDEX_ROOT\" \"" rootLine
-                        && keyLine
-                        == "        key <- requireReviewKey"
-                        && settingsLine
-                        == "        settings <- requireSettings key rawDb rawRoot (System.getenvOr \"IPE_REVIEW_DB\" \"review.db\")"
-                        && listenLine
-                        == "        Server.listen 8000 [ Server.mountApp \"/\" (reviewApp settings) ]"
+            case List.take 9 (String.lines body) of
+                [ rawBindLine, bindLine, dbLine, rootLine, reposLine, reviewLine, keyLine, settingsLine, listenLine ] ->
+                    endsBlock (List.drop 9 (String.lines body))
+                        && rawBindLine == "        rawBind <- optionalEnv \"IPE_HTTP_BIND\""
+                        && bindLine == "        bind <- requireLoopbackBind rawBind"
+                        && dbLine == "        rawDb <- requireEnv EnvLookup.IndexDbVar"
+                        && rootLine == "        rawRoot <- requireEnv EnvLookup.IndexRootVar"
+                        && reposLine == "        rawRepos <- optionalEnv \"IPE_INDEX_REPOS\""
+                        && reviewLine == "        rawReview <- optionalEnv \"IPE_REVIEW_DB\""
+                        && keyLine == "        key <- requireReviewKey"
+                        && settingsLine == "        settings <- requireSettings key rawDb rawRoot rawRepos rawReview"
+                        && listenLine == mainTail
 
                 _ ->
                     False
 
         _ ->
             False
+
+
+-- `main`'s tail: the one listen, over the routes `mounts` builds.
+mainTail : String
+mainTail =
+    "        Server.listen 8000 (mounts bind settings)"
+
+
+-- The one mount list, whose `Loopback` parameter makes a listen without a
+-- parsed bind fail to type-check.
+mountsDefinition : String
+mountsDefinition =
+    "\nmounts : Bind.Loopback -> Settings.AppSettings -> List Server.Route\nmounts _loopback settings =\n    [ Server.mountApp \"/\" (reviewApp settings) ]\n"
+
+
+-- True when no line of `rest` continues the block it follows: the first
+-- non-blank line, if any, starts a new top-level declaration.
+endsBlock : List String -> Bool
+endsBlock rest =
+    case List.filter (\line -> String.trim line /= "") rest of
+        [] ->
+            True
+
+        next :: _ ->
+            not (String.startsWith " " next)
 
 
 -- True when the module header exports both parsers and neither the bare
@@ -756,7 +804,7 @@ settingsExports source =
 -- every word by its unqualified name, so a
 -- qualified or wrapped spelling (`Settings.AppSettings`,
 -- `Maybe RepoPath.RootMap`) is caught alike. The `Model` is declared in
--- `src/Lib/App.ipe`; its source is scanned for the declaration, and the scan
+-- `src/Lib/Session.ipe`; its source is scanned for the declaration, and the scan
 -- must find `Model` there. Red while the `Model` holds a `settings` field.
 settingsNeverInSessionState : Task.Task Error Bool
 settingsNeverInSessionState =
@@ -765,10 +813,10 @@ settingsNeverInSessionState =
         topNames <- readDirAt (cwd ++ "/src")
         libNames <- readDirAt (cwd ++ "/src/Lib")
         sources <- Task.sequence
-            (List.map
-                (\rel -> readLibSource (cwd ++ "/src/" ++ rel) |> Task.map (\text -> ( rel, withoutCommentLines text )))
-                (moduleFiles topNames libNames)
-            )
+                    (List.map
+                        (\rel -> readLibSource (cwd ++ "/src/" ++ rel) |> Task.map (\text -> ( rel, withoutCommentLines text )))
+                        (moduleFiles topNames libNames)
+                    )
         Task.succeed
             (layoutAdmits topNames libNames
                 && stateAdmitted sources
@@ -776,13 +824,13 @@ settingsNeverInSessionState =
                 && not (stateAdmitted (appendTo "Main.ipe" "type alias Held =\n    { settings : Settings.AppSettings\n    }" sources))
                 && not (stateAdmitted (appendTo "Lib/Queue.ipe" "type Held\n    = Held IndexSettings" sources))
                 && not (stateAdmitted (appendTo "Lib/Index.ipe" "type alias Held =\n    { roots : Maybe RepoPath.RootMap }" sources))
-                && not (stateAdmitted (appendTo "Lib/Db.ipe" "type Held\n    = Held (List Settings.DbLocation)" sources))
+                && not (stateAdmitted (appendTo "Lib/Db.ipe" "type Held\n    = Held (List Settings.ReviewFile)" sources))
                 && not (stateAdmitted (appendTo "Lib/Queue.ipe" "type Held\n\t= Held IndexSettings" sources))
                 && not (stateAdmitted (appendTo "Lib/Queue.ipe" "type Held\n{- note -}\n    = Held IndexSettings" sources))
                 && not (stateAdmitted (appendTo "Lib/Queue.ipe" "type\tHeld\n    = Held IndexSettings" sources))
                 && not (stateAdmitted (appendTo "Lib/Queue.ipe" "{- note -} type Held\n    = Held IndexSettings" sources))
                 && not (stateAdmitted (appendTo "Lib/Queue.ipe" "type Held\n{- note\nend -}\n    = Held IndexSettings" sources))
-                && not (stateAdmitted (List.filter (\( rel, _ ) -> rel /= "Lib/App.ipe") sources))
+                && not (stateAdmitted (List.filter (\( rel, _ ) -> rel /= "Lib/Session.ipe") sources))
                 && statePinned sources
                 && not (statePinned (replaceIn "Main.ipe" "init : Web.WebReq -> ( Model, Cmd Msg )" "init : Web.WebReq -> ( ( Model, Settings.AppSettings ), Cmd Msg )" sources))
                 && not (statePinned (replaceIn "Lib/View.ipe" "view : Model -> Ui.Element Msg" "view : ( Model, Settings.AppSettings ) -> Ui.Element Msg" sources))
@@ -806,12 +854,9 @@ statePinned sources =
             mainCode sources
     in
     List.all (\( rel, line ) -> List.member line (String.lines (moduleCode rel sources))) stateAnnotations
-        && occurrences stateWiring code
-        == 1
-        && List.sum (List.map (\( _, text ) -> occurrences "embed" text) sources)
-        == 1
-        && List.sum (List.map (\( _, text ) -> occurrences "mountApp" text) sources)
-        == 1
+        && occurrences stateWiring code == 1
+        && List.sum (List.map (\( _, text ) -> occurrences "embed" text) sources) == 1
+        && List.sum (List.map (\( _, text ) -> occurrences "mountApp" text) sources) == 1
 
 
 stateAnnotations : List ( String, String )
@@ -843,12 +888,12 @@ replaceIn rel old new sources =
 
 
 -- `sources` with a `settings` field added to the `Model` declaration of
--- `Lib.App`, the shape a session carrying the startup settings takes.
+-- `Lib.Session`, the shape a session carrying the startup settings takes.
 withModelField : List ( String, String ) -> List ( String, String )
 withModelField sources =
     List.map
         (\( rel, text ) ->
-            if rel == "Lib/App.ipe" then
+            if rel == "Lib/Session.ipe" then
                 ( rel, String.replace "    { page : Page\n" "    { page : Page\n    , settings : Settings.AppSettings\n" text )
 
             else
@@ -860,23 +905,23 @@ withModelField sources =
 -- The types that carry a configured location, by unqualified name.
 settingsCarriers : List String
 settingsCarriers =
-    [ "AppSettings", "IndexSettings", "DbLocation", "RootMap", "Root", "Binding", "Entry" ]
+    [ "AppSettings", "IndexSettings", "IndexFile", "ReviewFile", "DbLocation", "RootMap", "Root", "Binding", "Entry" ]
 
 
 -- The declarations admitted to name a settings carrier: the ones that
 -- define the settings, each in its own module.
 admittedCarriers : List ( String, List String )
 admittedCarriers =
-    [ ( "Lib/Settings.ipe", [ "DbLocation", "IndexSettings", "AppSettings" ] )
+    [ ( "Lib/Settings.ipe", [ "IndexFile", "ReviewFile", "IndexSettings", "AppSettings" ] )
     , ( "Lib/RepoPath.ipe", [ "Root", "Entry", "Binding", "RootMap" ] )
     ]
 
 
--- `Lib.App` declares a `Model`, and no declaration outside `admittedCarriers`
+-- `Lib.Session` declares a `Model`, and no declaration outside `admittedCarriers`
 -- names a settings carrier.
 stateAdmitted : List ( String, String ) -> Bool
 stateAdmitted sources =
-    List.any (\( rel, text ) -> rel == "Lib/App.ipe" && List.any (\( name, _ ) -> name == "Model") (typeDeclarations text)) sources
+    List.any (\( rel, text ) -> rel == "Lib/Session.ipe" && List.any (\( name, _ ) -> name == "Model") (typeDeclarations text)) sources
         && List.all
             (\( rel, text ) ->
                 List.all
@@ -1038,7 +1083,7 @@ macKeyParseRefuses =
             "5c0ffee15dec1dedba5eba11c0de0f0a11c0ffee5ca1ab1e0ddba11fee1900d1"
 
         expected =
-            "IPE_REVIEW_MAC_KEY must be exactly 64 hexadecimal characters (32 random bytes); the value set is not.\n  fix: generate one with `openssl rand -hex 32`."
+            "IPE_REVIEW_MAC_KEY: it must be exactly 64 hexadecimal characters (32 random bytes), and the value set is not; fix: generate one with `openssl rand -hex 32`"
 
         refusedExactly raw =
             case ReviewKey.parseMacKey raw of
@@ -1046,10 +1091,8 @@ macKeyParseRefuses =
                     False
 
                 Err e ->
-                    Error.message e
-                        == expected
-                        && Error.kind e
-                        == Error.kind (Error.invalidInput "")
+                    Error.message e == expected
+                        && Error.kind e == Error.kind (Error.invalidInput "")
                         && (String.trim raw == "" || not (String.contains raw (Error.toString e)))
 
         signs raw =
@@ -1063,15 +1106,14 @@ macKeyParseRefuses =
         , String.repeat 64 " "
         , " " ++ String.dropRight 1 valid
         ]
-        && signs (String.toUpper valid)
-        == signs valid
+        && signs (String.toUpper valid) == signs valid
         && (case signs valid of
-            Ok _ ->
-                True
+                Ok _ ->
+                    True
 
-            Err _ ->
-                False
-        )
+                Err _ ->
+                    False
+           )
 
 
 -- Only a `NotFound` failure reads as read-only, decided by the error's kind
@@ -1098,46 +1140,62 @@ keyLookupFailsClosed =
             )
 
 
--- A required variable's startup refusal says which way its read failed by
--- the failure's kind, never its text: `NotFound` reads as not set; every
--- other kind, an `Unexpected` failure carrying the not-set wording included,
--- reads as could not be read. Each names the variable, ends with its fix and
--- repeats no byte of the failure. Red if the refusal ignores the kind (a
--- variable set to a value that is not valid Unicode then reads as unset) or
--- echoes the failure.
-requiredVarRefusalByKind : Bool
-requiredVarRefusalByKind =
+-- A required variable's startup refusal, printed as `main` prints it, is
+-- one exact line that says which way its read failed by the failure's kind,
+-- never its text: `NotFound` reads as not set; every other kind, an
+-- `Unexpected` failure carrying the not-set wording included, reads as could
+-- not be read. Each line names the variable, states its one fix and repeats
+-- no byte of the failure. Red if the two-line layout returns, the kind test
+-- reads the text, or the failure's message is echoed.
+requiredVarRefusalExactLine : Bool
+requiredVarRefusalExactLine =
     let
-        unset =
-            EnvLookup.requiredVarRefusal "IPE_INDEX_DB" "fix: set it" Error.notFound
-    in
-    namesVarAndFix unset
-        && String.contains "IPE_INDEX_DB is not set." unset
-        && not (String.contains "could not be read" unset)
-        && List.all unreadableRefusal
-            [ Error.invalidInput "environment variable \"IPE_INDEX_DB\" is set to zq9, not valid Unicode"
-            , Error.unexpected "environment variable \"IPE_INDEX_DB\" is not set zq9"
+        dbFix =
+            "set it to the path of the ipe-index index.db (absolute, or relative to the working directory); build it first from the repo root with `tools/scripts/ipe-index index`"
+
+        rootFix =
+            "set it to the repo root the index's tag:relative paths join to (absolute, or relative to the working directory)"
+
+        unsetFailures =
+            [ Error.notFound, Error.withMessage "zq9 is set to a value" Error.notFound ]
+
+        unreadableFailures =
+            [ Error.permissionDenied
             , Error.withMessage "zq9" Error.permissionDenied
+            , Error.invalidInput "environment variable \"IPE_INDEX_DB\" is set to zq9, not valid Unicode"
+            , Error.unexpected "environment variable \"IPE_INDEX_DB\" is not set zq9"
             ]
 
-
-unreadableRefusal : Error -> Bool
-unreadableRefusal failure =
-    let
-        refusal =
-            EnvLookup.requiredVarRefusal "IPE_INDEX_DB" "fix: set it" failure
+        pinned var failures line =
+            List.all (\failure -> printedRefusal (EnvLookup.requiredVarRefusal var failure) == line) failures
     in
-    namesVarAndFix refusal
-        && String.contains "IPE_INDEX_DB could not be read from the environment." refusal
-        && not (String.contains "is not set" refusal)
+    pinned IndexDbVar unsetFailures ("code-review: IPE_INDEX_DB: it is not set; fix: " ++ dbFix)
+        && pinned IndexDbVar unreadableFailures ("code-review: IPE_INDEX_DB: it could not be read from the environment; fix: " ++ dbFix)
+        && pinned IndexRootVar unsetFailures ("code-review: IPE_INDEX_ROOT: it is not set; fix: " ++ rootFix)
+        && pinned IndexRootVar unreadableFailures ("code-review: IPE_INDEX_ROOT: it could not be read from the environment; fix: " ++ rootFix)
+        && List.all (\failure -> echoesNoFailure (printedRefusal (EnvLookup.requiredVarRefusal IndexDbVar failure))) (unsetFailures ++ unreadableFailures)
 
 
-namesVarAndFix : String -> Bool
-namesVarAndFix refusal =
-    String.startsWith "code-review: required environment variable IPE_INDEX_DB " refusal
-        && String.endsWith "\n  fix: set it" refusal
-        && not (String.contains "zq9" refusal)
-        && not (String.contains "Unicode" refusal)
+-- One line holding no byte of the failures' own messages.
+echoesNoFailure : String -> Bool
+echoesNoFailure line =
+    not (String.contains "zq9" line) && not (String.contains "Unicode" line) && not (String.contains "\n" line)
+
+
+-- A startup refusal as `Main.printStartupFailure` prints it, before the line
+-- break the print adds.
+printedRefusal : Error -> String
+printedRefusal e =
+    "code-review: " ++ renderedForeign (Error.message e)
+
+
+-- The read-only notice is one exact line in the startup layout, with one
+-- fix. Red if its own layout, a line break or a second fix returns.
+readOnlyNoticeOneLine : Bool
+readOnlyNoticeOneLine =
+    ReviewKey.readOnlyNotice == "code-review: IPE_REVIEW_MAC_KEY: it is not set, so this server is read-only: it records no decision and counts none; fix: set it to 64 hex characters (32 random bytes), e.g. `openssl rand -hex 32`, stored outside the review database"
+        && not (String.contains "\n" ReviewKey.readOnlyNotice)
+        && List.length (String.split "; fix: " ReviewKey.readOnlyNotice) == 2
 
 
 keyReadOnly : Result Error ReviewKey -> Bool
@@ -1165,16 +1223,322 @@ refusesNamingVar failure =
                 && not (String.contains "OTHER_KEY" (Error.message e))
 
 
+-- An `IPE_INDEX_REPOS` that is set but unreadable refuses startup, naming the
+-- variable; it never reads as unset, which would bind `ipe` alone. Red if the
+-- unreadable value falls through to the unset branch.
+reposUnreadableRefused : Task.Task Error Bool
+reposUnreadableRefused =
+    do
+        base <- freshDir "ipe-repos-unreadable"
+        cwd <- System.cwd ()
+        unset <- probeMessage (Settings.parseIndexSettings (base ++ "/index.db") cwd Settings.EnvUnset |> Task.map (\_ -> ()))
+        unreadable <- probeMessage (Settings.parseIndexSettings (base ++ "/index.db") cwd Settings.EnvUnreadable |> Task.map (\_ -> ()))
+        Task.succeed
+            (unset == Nothing
+                && maybeContains "IPE_INDEX_REPOS" unreadable
+                && maybeContains "not valid Unicode" unreadable
+            )
+
+
+-- An `IPE_REVIEW_DB` that is set but unreadable refuses startup, naming the
+-- variable; only an unset one falls back to `review.db`. Red if the
+-- unreadable value reads as unset and the server opens `review.db`.
+reviewDbUnreadableRefused : Task.Task Error Bool
+reviewDbUnreadableRefused =
+    do
+        unset <- Settings.valueOr "IPE_REVIEW_DB" "review.db" Settings.EnvUnset
+        given <- Settings.valueOr "IPE_REVIEW_DB" "review.db" (Settings.EnvSet "/abs/review.db")
+        unreadable <- probeMessage (Settings.valueOr "IPE_REVIEW_DB" "review.db" Settings.EnvUnreadable |> Task.map (\_ -> ()))
+        Task.succeed
+            (unset == "review.db"
+                && given == "/abs/review.db"
+                && maybeContains "IPE_REVIEW_DB" unreadable
+                && maybeContains "not valid Unicode" unreadable
+            )
+
+
+-- The README's environment table lists exactly the variables the server
+-- reads: every row names a variable `main` or the review key reads, and every
+-- read has its row, each once. Red if a read is added without its row, or a
+-- row outlives its read.
+readmeEnvTableMatchesReads : Task.Task Error Bool
+readmeEnvTableMatchesReads =
+    do
+        cwd <- System.cwd ()
+        readme <- readLibSource (cwd ++ "/README.md")
+        mainSource <- readLibSource (cwd ++ "/src/Main.ipe") |> Task.map withoutCommentLines
+        Task.succeed
+            (envTableAgrees readme mainSource
+                && List.length (readmeEnvRows readme) == 6
+                && not (envTableAgrees (String.replace "| `IPE_INDEX_REPOS`" "| `UNLISTED`" readme) mainSource)
+                && not (envTableAgrees readme (mainSource ++ "\nextra = optionalEnv \"IPE_EXTRA\""))
+                && not (envTableAgrees (readme ++ "\n| `IPE_INDEX_DB` | again |") mainSource)
+            )
+
+
+-- The README rows and the reads name the same variables, each once.
+envTableAgrees : String -> String -> Bool
+envTableAgrees readme mainSource =
+    let
+        documented =
+            readmeEnvRows readme
+
+        reads =
+            ReviewKey.keyVar :: mainEnvReads mainSource
+    in
+    List.sort documented == List.sort reads && List.length (List.unique documented) == List.length documented
+
+
+-- The variable each environment-table row of the README names.
+readmeEnvRows : String -> List String
+readmeEnvRows readme =
+    String.lines readme
+        |> List.filter (String.startsWith "| `IPE_")
+        |> List.filterMap (\line -> List.head (List.drop 1 (String.split "`" line)))
+
+
+-- The variable every `requireEnv` and `optionalEnv` call in `main` reads:
+-- the name of the `StartupVar` a `requireEnv` call names, the literal key of
+-- an `optionalEnv` call.
+mainEnvReads : String -> List String
+mainEnvReads mainSource =
+    (String.split "requireEnv EnvLookup." mainSource
+        |> List.drop 1
+        |> List.filterMap (\chunk -> Maybe.andThen requiredVarName (List.head (String.words chunk)))
+    )
+        ++ (String.split "optionalEnv \"" mainSource
+                |> List.drop 1
+                |> List.filterMap (\chunk -> List.head (String.split "\"" chunk))
+           )
+
+
+-- The variable name of the `StartupVar` whose constructor is spelled `word`.
+requiredVarName : String -> Maybe String
+requiredVarName word =
+    List.find (\var -> ctorName var == word) EnvLookup.startupVars
+        |> Maybe.map EnvLookup.startupVarName
+
+
+ctorName : StartupVar -> String
+ctorName var =
+    case var of
+        IndexDbVar ->
+            "IndexDbVar"
+
+        IndexRootVar ->
+            "IndexRootVar"
+
+        IndexReposVar ->
+            "IndexReposVar"
+
+        ReviewDbVar ->
+            "ReviewDbVar"
+
+        ReviewKeyVar ->
+            "ReviewKeyVar"
+
+        HttpBindVar ->
+            "HttpBindVar"
+
+
+-- The bind as `parseBind` reads it, its proof shown as the address.
+bindParsed : Settings.EnvValue -> Result BindRefusal String
+bindParsed value =
+    Result.map Bind.loopbackAddress (Bind.parseBind value)
+
+
+-- Unset, exactly `127.0.0.1` and exactly `::1` are the binds accepted; unset
+-- is the runtime's own default, `127.0.0.1`.
+bindAcceptsLoopback : Bool
+bindAcceptsLoopback =
+    bindParsed Settings.EnvUnset == Ok "127.0.0.1"
+        && bindParsed (Settings.EnvSet "127.0.0.1") == Ok "127.0.0.1"
+        && bindParsed (Settings.EnvSet "::1") == Ok "::1"
+
+
+-- Every value outside the accepted set, each refused as `NotLoopback` with
+-- the value it read: exposed addresses, the other loopback spellings the
+-- parser does not read as addresses, socket, bracket and scope forms,
+-- hostnames, and padded or lookalike forms of the accepted two.
+refusedBinds : List String
+refusedBinds =
+    [ "0.0.0.0"
+    , "::"
+    , "192.168.15.9"
+    , "10.0.0.1"
+    , "fe80::1"
+    , "2001:db8::1"
+    , "255.255.255.255"
+    , "127.0.0.2"
+    , "127.1.2.3"
+    , "127.255.255.255"
+    , "127.1"
+    , "127.000.000.001"
+    , "0177.0.0.1"
+    , "2130706433"
+    , "0:0:0:0:0:0:0:1"
+    , "::0:1"
+    , "::ffff:127.0.0.1"
+    , "::ffff:7f00:1"
+    , "[::1]"
+    , "[::1]:8000"
+    , "127.0.0.1:8000"
+    , "::1%lo"
+    , "[127.0.0.1]"
+    , "localhost"
+    , "LOCALHOST"
+    , "localhost."
+    , "ip6-localhost"
+    , "evil.example"
+    , " 127.0.0.1"
+    , "127.0.0.1 "
+    , "127.0.0.1\n"
+    , "\t::1"
+    , codeText 65297 ++ codeText 65298 ++ codeText 65303 ++ ".0.0.1"
+    , "::1" ++ codeText 8203
+    ]
+
+
+bindRefusesOtherValues : Bool
+bindRefusesOtherValues =
+    List.length refusedBinds == 34
+        && List.all (\raw -> bindParsed (Settings.EnvSet raw) == Err (NotLoopback raw)) refusedBinds
+
+
+-- Set but empty is refused as empty, never read as unset, and a value that
+-- cannot be read is refused as unreadable.
+bindRefusesEmptyAndUnreadable : Bool
+bindRefusesEmptyAndUnreadable =
+    bindParsed (Settings.EnvSet "") == Err EmptyBind
+        && bindParsed Settings.EnvUnreadable == Err UnreadableBind
+
+
+-- The refusal's text names the variable, both accepted values and the SSH
+-- tunnel, and holds no hazard.
+namesBindRemedy : BindRefusal -> Bool
+namesBindRemedy refusal =
+    let
+        shown =
+            bindRefusalShown refusal
+    in
+    List.all (\needle -> String.contains needle shown) [ "IPE_HTTP_BIND", "127.0.0.1", "::1", "ssh -L" ]
+        && noHazard shown
+
+
+bindRefusalShown : BindRefusal -> String
+bindRefusalShown refusal =
+    renderedForeign (Error.message (Bind.refusal refusal))
+
+
+-- Each bind refusal, printed as `main` prints it, is one exact line: the
+-- variable, the refused value when there is one, quoted, escaped and cut at
+-- `EnvLookup.echoMaxChars` with a `…` mark, the problem, why only loopback
+-- is accepted, and the one remedy. A value holding a `"`, a `; fix: `, a line
+-- break and an ESC stays inside its quotes and reaches the terminal as
+-- escapes; an empty or unreadable value is never shown. Red if the value is
+-- shown unquoted or uncut, or a producer lays the line out by hand.
+bindRefusalExactLines : Bool
+bindRefusalExactLines =
+    let
+        hostile =
+            "\"; fix: \n" ++ codeText 27 ++ String.repeat (EnvLookup.echoMaxChars - 4) "a"
+
+        shownHostile =
+            "IPE_HTTP_BIND is \"\\\"; fix: \\n\\u{1b}" ++ String.repeat (EnvLookup.echoMaxChars - 10) "a" ++ "\"…: "
+
+        loopbackOnly =
+            ", and the review page is unauthenticated, so the server listens on loopback only; fix: unset it (the server then binds 127.0.0.1), or set it to 127.0.0.1 or ::1, and reach the server from another machine through an SSH tunnel, e.g. ssh -L 8000:127.0.0.1:8000 <host> (use the listening port if IPE_SERVER_PORT sets another)"
+
+        printed reason =
+            printedRefusal (Bind.refusal reason)
+    in
+    String.length hostile == EnvLookup.echoMaxChars + 6
+        && printed EmptyBind == "code-review: IPE_HTTP_BIND: it is set but empty" ++ loopbackOnly
+        && printed UnreadableBind == "code-review: IPE_HTTP_BIND: it is set but could not be read from the environment (it is not valid Unicode)" ++ loopbackOnly
+        && printed (NotLoopback "0.0.0.0") == "code-review: IPE_HTTP_BIND is \"0.0.0.0\": " ++ bindRule ++ loopbackOnly
+        && printed (NotLoopback hostile) == "code-review: " ++ shownHostile ++ bindRule ++ loopbackOnly
+        && not (String.contains "\n" (printed (NotLoopback hostile)))
+        && noHazard (printed (NotLoopback hostile))
+        && List.all (\reason -> oneLineRefusal ( HttpBindVar, Bind.refusal reason )) [ EmptyBind, UnreadableBind, NotLoopback "0.0.0.0" ]
+
+
+-- Every bind refusal names the variable, the two accepted values and the SSH
+-- tunnel; a refused value is shown quoted, capped at 64 characters with a
+-- `…` mark, and escaped; an unreadable value is never shown.
+bindRefusalNamesRemedy : Bool
+bindRefusalNamesRemedy =
+    let
+        long =
+            bindRefusalShown (NotLoopback (String.repeat 10000 "a"))
+
+        escaped =
+            bindRefusalShown (NotLoopback (codeText 27 ++ "[31m"))
+    in
+    List.all namesBindRemedy [ EmptyBind, UnreadableBind, NotLoopback "0.0.0.0" ]
+        && String.contains "\"0.0.0.0\"" (bindRefusalShown (NotLoopback "0.0.0.0"))
+        && not (String.contains "\"" (bindRefusalShown UnreadableBind))
+        && not (String.contains "\"" (bindRefusalShown EmptyBind))
+        && String.length long < 1000
+        && String.contains ("\"" ++ String.repeat 64 "a" ++ "\"…") long
+        && not (String.contains (String.repeat 65 "a") long)
+        && not (String.contains "…" (bindRefusalShown (NotLoopback (String.repeat 64 "a"))))
+        && noHazard escaped
+        && String.contains "\"\\u{1b}[31m\"" escaped
+
+
+-- The rule a refused value is told it broke: it is not one of the accepted
+-- spellings, which the text lists.
+bindRule : String
+bindRule =
+    "it is not one of the accepted loopback spellings (127.0.0.1, ::1)"
+
+
+-- A refusal states the accepted-spelling rule, never a claim about loopback
+-- addresses in general: `127.0.0.2` is a loopback address the parser does not
+-- read, so it is told the spellings, not that it is no loopback address. The
+-- same text refuses an exposed address.
+bindRefusalStatesRule : Bool
+bindRefusalStatesRule =
+    let
+        loopbackOther =
+            bindRefusalShown (NotLoopback "127.0.0.2")
+
+        exposed =
+            bindRefusalShown (NotLoopback "0.0.0.0")
+    in
+    String.contains ("IPE_HTTP_BIND is \"127.0.0.2\": " ++ bindRule) loopbackOther
+        && String.contains ("IPE_HTTP_BIND is \"0.0.0.0\": " ++ bindRule) exposed
+        && not (String.contains "not a loopback address" loopbackOther)
+        && not (String.contains "not a loopback address" exposed)
+
+
+-- The text cannot drift from the parser: there are exactly the two accepted
+-- spellings, each is accepted as itself, and each appears in the refusal's
+-- problem and its remedy, which lists them as `127.0.0.1 or ::1`.
+bindRefusalListsAcceptedSpellings : Bool
+bindRefusalListsAcceptedSpellings =
+    let
+        shown =
+            bindRefusalShown (NotLoopback "0.0.0.0")
+    in
+    Bind.acceptedSpellings == [ "127.0.0.1", "::1" ]
+        && List.all (\spelling -> bindParsed (Settings.EnvSet spelling) == Ok spelling) Bind.acceptedSpellings
+        && List.all (\spelling -> String.contains spelling shown) Bind.acceptedSpellings
+        && String.contains ("(" ++ String.join ", " Bind.acceptedSpellings ++ ")") shown
+        && String.contains ("set it to " ++ String.join " or " Bind.acceptedSpellings ++ ",") shown
+
+
 checks : Task.Task Error (List ( String, Bool ))
 checks =
     Task.sequence
-        [ Task.succeed ( "db file paths escape url specials", filePathsEncodeUrlSpecials )
+        [ check "a db file name holding url syntax names that literal file" urlMetacharactersNameLiteralFiles
         , Task.succeed ( "a review key that is not 64 hex digits is refused without echoing it", macKeyParseRefuses )
         , check "only an unset review key reads as read-only; any other read failure refuses" keyLookupFailsClosed
-        , Task.succeed ( "a required variable's refusal says by kind whether it is unset or unreadable, never echoing", requiredVarRefusalByKind )
+        , Task.succeed ( "a required variable's refusal is one exact line saying by kind whether it is unset or unreadable, never echoing", requiredVarRefusalExactLine )
+        , Task.succeed ( "the read-only notice is one exact line with one fix", readOnlyNoticeOneLine )
         , check "index db refusal names only the variable" dbRefusalNamesOnlyVariable
         , check "unusable index db locations refused" badIndexDbRefused
-        , check "db urls carry only the app's open mode" dbUrlsCarryAppMode
+        , check "a db setting is a file path made absolute once" dbSettingParsesOnce
         , check "each db refusal states one fix" dbRefusalsStateOneFix
         , check "startup probes name the variable and the file" probesNameTheirVariable
         , Task.succeed ( "a db open failure is classified by its typed failure", dbFailuresClassified )
@@ -1182,7 +1546,382 @@ checks =
         , check "a file that is not a SQLite database is refused as one" notSqliteRefused
         , check "a root holding none of the index's files is refused at startup" rootProbeJoinsIndexedPath
         , check "an index with no unit under a configured tag is refused at startup" rootProbeRefusesUntaggedIndex
+        , check "a sampled index path past the read window reaches the root refusal bounded" rootProbeBoundsLongPath
         , check "the environment is read and parsed only at its startup sites" startupReadsAdmittedOnly
         , check "the startup scan refuses an aliased, wrapped or relocated reader" startupScanRefusesEvasions
         , check "no session state type carries the startup settings" settingsNeverInSessionState
+        , check "an unreadable IPE_INDEX_REPOS refuses startup, never reads as unset" reposUnreadableRefused
+        , check "an unreadable IPE_REVIEW_DB refuses startup, never reads as unset" reviewDbUnreadableRefused
+        , check "the README env table lists exactly the variables the server reads" readmeEnvTableMatchesReads
+        , check "every page size the README states is the constant it names" readmePageSizesMatch
+        , check "every startup refusal is one line naming its variable and one fix" startupRefusalsOneLine
+        , check "a startup refusal quotes the file it names, so the file forges no line nor fix" startupRefusalQuotesFile
+        , Task.succeed ( "each broken-log refusal states its own problem and fix", logBreakTotal )
+        , Task.succeed ( "the bind is accepted only unset, exactly 127.0.0.1 or exactly ::1", bindAcceptsLoopback )
+        , Task.succeed ( "every other bind spelling is refused as not loopback, naming the value read", bindRefusesOtherValues )
+        , Task.succeed ( "an empty bind is refused as empty and an unreadable one as unreadable", bindRefusesEmptyAndUnreadable )
+        , Task.succeed ( "a bind refusal names the variable, both accepted values and the SSH tunnel, echoing capped and escaped", bindRefusalNamesRemedy )
+        , Task.succeed ( "each bind refusal is one exact line, a refused value quoted, escaped and cut", bindRefusalExactLines )
+        , Task.succeed ( "a bind refusal states the accepted-spelling rule for 127.0.0.2 and 0.0.0.0, never that the value is no loopback address", bindRefusalStatesRule )
+        , Task.succeed ( "a bind refusal lists exactly the spellings the parser accepts, each accepted as itself", bindRefusalListsAcceptedSpellings )
         ]
+
+
+-- Every page size the README states is the `PageSize` constant it names on
+-- the same line, and that constant is declared and exposed by
+-- `src/Lib/PageSize.ipe`; a line stating a number about pages, open files or
+-- open units without naming its constant is refused, as is a constant name
+-- that cannot be read or is not known. Red if the README restates a page
+-- size by hand, or the constant changes and the README does not.
+readmePageSizesMatch : Task.Task Error Bool
+readmePageSizesMatch =
+    do
+        cwd <- System.cwd ()
+        readme <- readLibSource (cwd ++ "/README.md")
+        pageSource <- readLibSource (cwd ++ "/src/Lib/PageSize.ipe")
+        let
+            agrees =
+                pageSizesAgree pageSource
+
+            movedQueue =
+                List.map
+                    (\( name, rows ) ->
+                        if name == "queue" then
+                            ( name, rows + 1 )
+
+                        else
+                            ( name, rows )
+                    )
+                    pageSizeConstants
+        in
+        Task.succeed
+            (agrees pageSizeConstants readme
+                && List.length (List.filter (String.contains "`PageSize.") (String.lines readme)) == 3
+                && not (agrees movedQueue readme)
+                && not (agrees pageSizeConstants (readme ++ "\nThe queue view loads one page of at most 200 open units (`pageSize` in `src/Lib/Index.ipe`)."))
+                && not (agrees pageSizeConstants (readme ++ "\nThe list shows up to 32 open files."))
+                && not (agrees pageSizeConstants (readme ++ "\nOne page holds 32 rows (`PageSize.unknown` in `src/Lib/PageSize.ipe`)."))
+                && not (agrees pageSizeConstants (readme ++ "\nOne page holds 32 rows (`PageSize.queue in `src/Lib/PageSize.ipe`)."))
+                && not (agrees pageSizeConstants (readme ++ "\nOne page holds 33 rows (`PageSize.queue` in `src/Lib/PageSize.ipe`)."))
+                && not (pageSizesAgree (String.replace "queue : PageSize" "queued : PageSize" pageSource) pageSizeConstants readme)
+            )
+
+
+-- Each page-size constant the README may name, with its size.
+pageSizeConstants : List ( String, Int )
+pageSizeConstants =
+    [ ( "queue", PageSize.toInt PageSize.queue )
+    , ( "history", PageSize.toInt PageSize.history )
+    , ( "pairs", PageSize.toInt PageSize.pairs )
+    ]
+
+
+pageSizesAgree : String -> List ( String, Int ) -> String -> Bool
+pageSizesAgree pageSource constants readme =
+    List.all (pageSizeLineAgrees pageSource constants) (String.lines readme)
+
+
+-- A README line naming no constant states no number about pages; a line
+-- naming constants names only known ones the module declares and exposes,
+-- and every number on it is the size of one of them.
+pageSizeLineAgrees : String -> List ( String, Int ) -> String -> Bool
+pageSizeLineAgrees pageSource constants line =
+    let
+        numbers =
+            digitRuns line
+    in
+    case pageSizeNames line of
+        Nothing ->
+            False
+
+        Just names ->
+            if List.isEmpty names then
+                List.isEmpty numbers || not (List.any (\word -> String.contains word (String.toLower line)) [ "page", "open files", "open units" ])
+
+            else
+                not (List.isEmpty numbers)
+                    && List.all (\name -> sizeOf constants name /= Nothing && pageSizeDeclared pageSource name) names
+                    && List.all (\number -> List.any (\name -> sizeOf constants name == Just number) names) numbers
+
+
+-- The constant names a line holds as "`PageSize.<name>`"; `Nothing` when one
+-- is not a closed, alphabetic name.
+pageSizeNames : String -> Maybe (List String)
+pageSizeNames line =
+    List.foldr
+        (\piece names ->
+            let
+                parts =
+                    String.split "`" piece
+
+                name =
+                    Maybe.withDefault "" (List.head parts)
+            in
+            if List.length parts >= 2 && name /= "" && List.all Char.isAlpha (String.toList name) then
+                Maybe.map (\rest -> name :: rest) names
+
+            else
+                Nothing
+        )
+        (Just [])
+        (List.drop 1 (String.split "`PageSize." line))
+
+
+sizeOf : List ( String, Int ) -> String -> Maybe Int
+sizeOf constants name =
+    List.head
+        (List.filterMap
+            (\( known, rows ) ->
+                if known == name then
+                    Just rows
+
+                else
+                    Nothing
+            )
+            constants
+        )
+
+
+-- `name` is declared a `PageSize` in the module source and exposed by its
+-- header.
+pageSizeDeclared : String -> String -> Bool
+pageSizeDeclared pageSource name =
+    let
+        header =
+            Maybe.withDefault "" (List.head (String.lines pageSource))
+    in
+    List.member (name ++ " : PageSize") (String.lines pageSource)
+        && List.any (\form -> String.contains form header) [ ", " ++ name ++ ",", ", " ++ name ++ ")", "(" ++ name ++ "," ]
+
+
+-- Each maximal run of decimal digits in `line`, as a number.
+digitRuns : String -> List Int
+digitRuns line =
+    let
+        step c ( current, runs ) =
+            if Char.isDigit c then
+                ( current ++ String.fromChar c, runs )
+
+            else if current == "" then
+                ( current, runs )
+
+            else
+                ( "", current :: runs )
+    in
+    case List.foldl step ( "", [] ) (String.toList line) of
+        ( last, runs ) ->
+            List.filterMap String.toInt (last :: runs)
+
+
+-- Every tool-authored startup refusal, printed as `main` prints it, is one
+-- line in the shared layout: it starts with its variable, states exactly one
+-- fix, and holds no line break nor any escape the printer adds. Covered: each
+-- variable through the renderer, with and without a file, each variable's
+-- required-read refusal for an unset and an unreadable variable, each bind
+-- refusal with a benign value, each `LogBreak`, the key mismatch, both key
+-- refusals, and each `DbRefusal` of `openFailure` for both databases. The
+-- variables are counted along the exhaustive `followingVar` chain, so a new
+-- `StartupVar` that `startupVars` leaves out is red. Red if a producer embeds
+-- a line break, lays its text out by hand, or appends a second fix.
+startupRefusalsOneLine : Task.Task Error Bool
+startupRefusalsOneLine =
+    do
+        base <- freshDir "ipe-settings-startup-one-line"
+        writeFileText (base ++ "/present.db") "not a database"
+        present <- Task.fromResult (Path.fromString (base ++ "/present.db"))
+        missing <- Task.fromResult (Path.fromString (base ++ "/missing.db"))
+        directory <- Task.fromResult (Path.fromString base)
+        opened <- Task.sequence (List.concatMap (\role -> List.map (openRefusal role present missing directory) dbRefusals) [ Settings.IndexDb, Settings.ReviewDb ])
+        let
+            bindRefusals =
+                List.map (\reason -> ( HttpBindVar, Bind.refusal reason )) [ EmptyBind, UnreadableBind, NotLoopback "0.0.0.0" ]
+
+            requiredRefusals =
+                List.concatMap (\var -> List.map (\failure -> ( var, EnvLookup.requiredVarRefusal var failure )) [ Error.notFound, Error.permissionDenied ]) EnvLookup.startupVars
+
+            chain =
+                varChain 16 (Just IndexDbVar)
+
+            rendered =
+                List.concatMap (\var -> [ ( var, sampleRefusal var Nothing ), ( var, sampleRefusal var (Just present) ) ]) EnvLookup.startupVars
+                    ++ bindRefusals
+                    ++ requiredRefusals
+                    ++ List.map (\break -> ( ReviewDbVar, Settings.brokenLog present break )) Settings.logBreaks
+                    ++ ( ReviewKeyVar, LibDb.keyMismatchRefusal present )
+                    :: keyRefusals
+                    ++ List.map (\( role, e ) -> ( Settings.roleVar role, e )) opened
+        in
+        Task.succeed
+            (List.length keyRefusals == 2
+                && List.length opened == 2 * List.length dbRefusals
+                && List.length chain == List.length EnvLookup.startupVars
+                && List.all (\var -> List.member var EnvLookup.startupVars) chain
+                && List.length (List.unique (List.map EnvLookup.startupVarName chain)) == List.length chain
+                && List.all oneLineRefusal rendered
+                && not (oneLineRefusal ( ReviewDbVar, Error.invalidInput "IPE_REVIEW_DB: it is refused.\n  fix: set it again" ))
+                && not (oneLineRefusal ( ReviewDbVar, Error.invalidInput "IPE_REVIEW_DB: it is refused; fix: set it again; fix: restore it" ))
+            )
+
+
+sampleRefusal : StartupVar -> Maybe Path.Path -> Error
+sampleRefusal var file =
+    EnvLookup.startupRefusal { var = var, file = file, given = Nothing, problem = "it is refused", fix = "set it again" }
+
+
+-- Each `StartupVar` and the one after it, ending at the last: a new
+-- constructor is a non-exhaustive case here until the chain names it.
+followingVar : StartupVar -> Maybe StartupVar
+followingVar var =
+    case var of
+        IndexDbVar ->
+            Just IndexRootVar
+
+        IndexRootVar ->
+            Just IndexReposVar
+
+        IndexReposVar ->
+            Just ReviewDbVar
+
+        ReviewDbVar ->
+            Just ReviewKeyVar
+
+        ReviewKeyVar ->
+            Just HttpBindVar
+
+        HttpBindVar ->
+            Nothing
+
+
+-- The variables along `followingVar` from `start`, at most `fuel` of them.
+varChain : Int -> Maybe StartupVar -> List StartupVar
+varChain fuel start =
+    case start of
+        Just var ->
+            if fuel <= 0 then
+                []
+
+            else
+                var :: varChain (fuel - 1) (followingVar var)
+
+        Nothing ->
+            []
+
+
+-- The file a startup refusal names came from the environment: it is quoted
+-- with its hazards and its `"` escaped, so a path holding a quote, a
+-- `; fix:`, a line break or an escape sequence cannot close its quotes,
+-- forge a second line or a second fix outside them, or reach the terminal
+-- as a control sequence. Red if the renderer writes the file unquoted.
+startupRefusalQuotesFile : Task.Task Error Bool
+startupRefusalQuotesFile =
+    let
+        raw =
+            "/tmp/x\"; fix: rm -rf ~\n" ++ codeText 27 ++ "[31my.db"
+    in
+    do
+        file <- Task.fromResult (Path.fromString raw)
+        let
+            shown =
+                renderedForeign (Error.message (sampleRefusal ReviewDbVar (Just file)))
+        in
+        Task.succeed
+            (Path.toString file == raw
+                && shown == "IPE_REVIEW_DB: cannot use \"/tmp/x\\\"; fix: rm -rf ~\\n\\u{1b}[31my.db\": it is refused; fix: set it again"
+                && not (String.contains "\n" shown)
+                && noHazard shown
+            )
+
+
+-- The two refusals of a review key: a value that is not a key, and a read
+-- of the variable that failed.
+keyRefusals : List ( StartupVar, Error )
+keyRefusals =
+    List.filterMap
+        (\result ->
+            case result of
+                Ok _ ->
+                    Nothing
+
+                Err e ->
+                    Just ( ReviewKeyVar, e )
+        )
+        [ Result.map (\_ -> ()) (ReviewKey.parseMacKey "x")
+        , Result.map (\_ -> ()) (ReviewKey.keyFromLookup (Err Error.permissionDenied))
+        ]
+
+
+-- The rendered refusal starts with its variable, then a colon or the value
+-- it refused, holds one fix, and carries no line break and no escape.
+oneLineRefusal : ( StartupVar, Error ) -> Bool
+oneLineRefusal ( var, e ) =
+    let
+        text =
+            renderedForeign (Error.message e)
+
+        name =
+            EnvLookup.startupVarName var
+    in
+    (String.startsWith (name ++ ":") text || String.startsWith (name ++ " is \"") text)
+        && not (String.contains "\\" text)
+        && not (String.contains "\n" text)
+        && List.length (String.split "; fix: " text) == 2
+
+
+-- Every `DbRefusal`.
+dbRefusals : List DbRefusal
+dbRefusals =
+    [ NoDatabaseFile, NotSqliteFile, Locked, NotPermitted, NotAFile, MissingSchema, Unusable ]
+
+
+-- The refusal `openFailure` gives for `refusal`, from a location and a
+-- typed failure that classify as it.
+openRefusal : Settings.DbRole -> Path.Path -> Path.Path -> Path.Path -> DbRefusal -> Task.Task Error ( Settings.DbRole, Error )
+openRefusal role present missing directory refusal =
+    let
+        failed at failure =
+            Settings.openFailure role at (Error.withDetails (Database failure) (Error.unexpected "db failed"))
+                |> Task.onError (\e -> Task.succeed ( role, e ))
+    in
+    case refusal of
+        NoDatabaseFile ->
+            failed missing Db.CannotOpen
+
+        NotSqliteFile ->
+            failed present Db.NotADatabase
+
+        Locked ->
+            failed present Db.Busy
+
+        NotPermitted ->
+            failed present Db.AccessDenied
+
+        NotAFile ->
+            failed directory Db.OtherFailure
+
+        MissingSchema ->
+            failed present Db.InvalidStatement
+
+        Unusable ->
+            failed present Db.OtherFailure
+
+
+-- Each `LogBreak` states a problem and a fix of its own: the problems are
+-- pairwise distinct, and a log recorded before names were kept, which no
+-- copy repairs, is never told to restore one. Red if a break shares another's
+-- problem or offers a remedy that cannot clear it.
+logBreakTotal : Bool
+logBreakTotal =
+    let
+        problems =
+            List.map Settings.logBreakProblem Settings.logBreaks
+
+        fixes =
+            List.map Settings.logBreakFix Settings.logBreaks
+    in
+    List.length Settings.logBreaks == 3
+        && List.all (\text -> String.trim text /= "") (problems ++ fixes)
+        && List.length (List.unique problems) == List.length problems
+        && not (String.contains "restore" (Settings.logBreakFix UnnamedRows))
+        && String.contains "new file" (Settings.logBreakFix UnnamedRows)
+        && Settings.logBreakFix UnnamedRows /= Settings.logBreakFix HeadMissing
+        && String.contains "restore" (Settings.logBreakFix GuardLost)

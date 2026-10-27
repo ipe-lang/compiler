@@ -23,6 +23,7 @@
 mod capabilities;
 mod lower;
 mod once_check;
+mod or_split;
 
 /// Whole-program capability inference: the exact security-capability set a
 /// lowered program exercises. Consumed by `ipe capabilities` (SP1) and, ahead,
@@ -49,7 +50,7 @@ pub use lower::tco_analysis;
 
 use ipe_canon::ast as canon;
 use ipe_diagnostics::Diagnostic;
-use ipe_intern::Interner;
+use ipe_intern::{Interner, SynthStem};
 use ipe_types::SolvedTypes;
 
 /// Lower a canonical module + its solved types into the typed IR.
@@ -84,6 +85,10 @@ pub fn lower(
     // cross-module misattribution lives inside `Lowerer::run`, at the
     // `lower_def` boundary.
     let homeless = |d: Diagnostic| (d, Vec::<ipe_intern::Symbol>::new());
+    // Establish the or-pattern normal form first: every pool count and
+    // lowering walk below reads the split module.
+    let normalized = or_split::normalize(m)?;
+    let m: &canon::Module = &normalized;
     // Eta-expansion synthesises fresh closure parameters that must not capture
     // any name free in the supplied arguments. Mint the pool up front through the
     // one `&mut Interner` the entry point owns, so the lowering walk itself stays
@@ -112,14 +117,15 @@ pub fn lower(
     // conflict within one `fresh_symbols` expression). Each field equals its
     // former standalone `count_*` / `max_*` walker.
     let pool_counts = lower::module_symbol_pool_counts(m, interner);
-    // Mapper wraps draw an eta block sized by the mapper's solved type, which
-    // the per-site charges above do not see; reserve it on top.
+    // Mapper wraps and flattened arrows draw eta blocks sized by solved types,
+    // which the per-site charges above do not see; reserve both on top.
     let eta_params = interner
         .fresh_symbols(
-            "eta_",
+            SynthStem::Eta,
             pool_counts
                 .max_live_eta_params
                 .saturating_add(lower::max_mapper_wrap_eta_demand(m, types))
+                .saturating_add(lower::max_arrow_eta_demand(m, types))
                 .max(max_ctor_arity)
                 .max(MAX_CALLEE_ARITY),
         )
@@ -130,7 +136,7 @@ pub fn lower(
     // and its sizing stays the per-module widest arity.
     let cap_params = interner
         .fresh_symbols(
-            "cap_",
+            SynthStem::Cap,
             lower::max_def_arity_per_module(m)
                 .max(max_ctor_arity)
                 .max(MAX_CALLEE_ARITY),
@@ -145,13 +151,13 @@ pub fn lower(
     // inside its body can never collide on `arg_i` (no reliance on shadowing).
     // Minted through the same owned `&mut Interner`.
     let param_binders = interner
-        .fresh_symbols("arg_", pool_counts.destructure_param_sites)
+        .fresh_symbols(SynthStem::Arg, pool_counts.destructure_param_sites)
         .map_err(homeless)?;
     // One fresh symbol per wildcard `any` occurrence in a typed signature, so
     // `split_typed_sig` never shares one symbol across two occurrences the
     // checker independently pinned to different concrete types.
     let any_param_binders = interner
-        .fresh_symbols("anyp_", lower::count_any_param_sites(m))
+        .fresh_symbols(SynthStem::AnyParam, lower::count_any_param_sites(m))
         .map_err(homeless)?;
     // The symbol every wildcard `any` lowers to before it is freshened or
     // pinned; no source identifier can spell it.
@@ -160,7 +166,7 @@ pub fn lower(
     // `Store.selectToMaybe` call site, for the concrete per-column decode the
     // intercept emits there.
     let projection_decode_binders = interner
-        .fresh_symbols("projdec_", pool_counts.projection_decode_sites)
+        .fresh_symbols(SynthStem::ProjDecode, pool_counts.projection_decode_sites)
         .map_err(homeless)?;
     // one fresh thunk-binder symbol per syntactic destructure-binder
     // `let` / single-arm product `case` site, consumed only when the bound
@@ -168,18 +174,21 @@ pub fn lower(
     // inside the lowerer; this count is purely syntactic, so it over-counts
     // harmlessly).
     let destructure_thunk_binders = interner
-        .fresh_symbols("destr_thunk_", pool_counts.destructure_thunk_sites)
+        .fresh_symbols(SynthStem::DestrThunk, pool_counts.destructure_thunk_sites)
         .map_err(homeless)?;
     // C2: one fresh `Vec` payload binder per `case`-arm site that nests a
     // list / cons sub-pattern inside a constructor payload.
     let nested_cons_binders = interner
-        .fresh_symbols("ncons_", pool_counts.nested_cons_payload_sites)
+        .fresh_symbols(SynthStem::NestedCons, pool_counts.nested_cons_payload_sites)
         .map_err(homeless)?;
     // Sibling desugaring: one fresh `String` payload binder per `case`-arm site
     // that nests a string-literal sub-pattern directly inside a constructor
     // payload (`Just "live"`).
     let nested_strlit_binders = interner
-        .fresh_symbols("nstrlit_", pool_counts.nested_strlit_payload_sites)
+        .fresh_symbols(
+            SynthStem::NestedStrLit,
+            pool_counts.nested_strlit_payload_sites,
+        )
         .map_err(homeless)?;
     // One fresh binder per tuple-element position for the tuple-elem-rebind
     // synthesis: a multi-arm `case` on a non-literal tuple scrutinee with
@@ -187,7 +196,7 @@ pub fn lower(
     // to fresh temps and construct a synthetic literal-tuple scrutinee, enabling
     // the coerced-column backend path. Sized as an upper bound.
     let tuple_elem_binders = interner
-        .fresh_symbols("telem_", pool_counts.tuple_elem_rebind_sites)
+        .fresh_symbols(SynthStem::TupleElem, pool_counts.tuple_elem_rebind_sites)
         .map_err(homeless)?;
     // The built-in `Maybe` / `Result` types + constructors are Prelude
     // built-ins (no `type` declaration), so the lowerer needs their symbols to
@@ -355,7 +364,7 @@ mod tests {
         }
     }
 
-    const GOLDEN: &str = include_str!("../../../../tests/golden/basics/Main.ipe");
+    const GOLDEN: &str = include_str!("../../../../tests/golden/basics/src/Main.ipe");
 
     /// Parse → canonicalise → infer the golden module, then return the
     /// lowered program alongside the interner. Returns `None` (failing the
@@ -466,10 +475,16 @@ mod tests {
 
         // params: msg : Enum(Msg), count : Int.
         assert_eq!(update.params.len(), 2);
-        let Some((p0, t0)) = update.params.first() else {
+        let Some(ipe_ir::Param {
+            sym: p0, ty: t0, ..
+        }) = update.params.first()
+        else {
             return;
         };
-        let Some((p1, t1)) = update.params.get(1) else {
+        let Some(ipe_ir::Param {
+            sym: p1, ty: t1, ..
+        }) = update.params.get(1)
+        else {
             return;
         };
         assert_eq!(i.resolve(*p0), Some("msg"));
@@ -578,6 +593,30 @@ mod tests {
         Some((func, i))
     }
 
+    /// Lower a free-standing module and return the [`ipe_ir::Func`] of `which`,
+    /// or the stage that refused it.
+    ///
+    /// A test reading bounds off the result must fail on the stage, never read
+    /// a refusal as "no bound".
+    fn lower_func_staged(source: &str, which: &str) -> Result<(ipe_ir::Func, Interner), String> {
+        let mut i = Interner::new();
+        let src = ipe_parse::parse_module(source, &mut i).map_err(|e| format!("parse: {e:?}"))?;
+        let m = ipe_canon::canonicalise(&src, &mut i).map_err(|e| format!("canon: {e:?}"))?;
+        let types = ipe_types::infer(&m, &mut i).map_err(|e| format!("infer: {e:?}"))?;
+        let program = lower(&m, &types, &mut i, "", "").map_err(|e| format!("lower: {e:?}"))?;
+        let module = program
+            .modules
+            .into_iter()
+            .next()
+            .ok_or_else(|| "no module".to_owned())?;
+        let func = module
+            .funcs
+            .into_iter()
+            .find(|f| i.resolve(f.name) == Some(which))
+            .ok_or_else(|| format!("no func `{which}`"))?;
+        Ok((func, i))
+    }
+
     #[test]
     fn tuple_parameter_lowers_to_synthetic_binder_plus_destructure() {
         // `fst (a, b) = a` — the tuple parameter has no single name, so it
@@ -591,9 +630,9 @@ mod tests {
         let Some((func, i)) = opt else { return };
         assert_eq!(func.params.len(), 1, "one (synthetic) parameter");
         assert!(
-            matches!(func.params.first(), Some((_, IrType::Tuple(es))) if es.len() == 2),
+            matches!(func.params.first(), Some(ipe_ir::Param { ty: IrType::Tuple(es), .. }) if es.len() == 2),
             "the parameter's type is a 2-element tuple, got {:?}",
-            func.params.first().map(|(_, t)| t)
+            func.params.first().map(|ipe_ir::Param { ty: t, .. }| t)
         );
         let Expr::Destructure {
             binder,
@@ -612,7 +651,7 @@ mod tests {
             "binder is `(a, b)`"
         );
         assert!(
-            matches!(value.as_ref(), Expr::Var(s) if i.resolve(*s).is_some_and(|n| n.starts_with("arg_"))),
+            matches!(value.as_ref(), Expr::Var(s) if i.resolve(*s).is_some_and(|n| n.starts_with(SynthStem::Arg.text()))),
             "destructured value is the synthetic parameter"
         );
         assert!(
@@ -709,11 +748,15 @@ mod tests {
         let Some(&(param_sym, bounds)) = func.type_params.first() else {
             return;
         };
-        // A structurally-parametric variable carries no bounds.
-        assert!(bounds.is_unbounded(), "wrap's `a` is an unbounded generic");
+        // A structurally-parametric variable carries only the value-semantics `Clone`.
+        assert_eq!(
+            bounds,
+            ipe_ir::BoundSet::UNBOUNDED.with_clone(),
+            "wrap's `a` is bounded by `Clone` alone"
+        );
         // The single parameter is `IrType::Generic(a)`.
         assert!(
-            matches!(func.params.first(), Some((_, IrType::Generic(s))) if *s == param_sym),
+            matches!(func.params.first(), Some(ipe_ir::Param { ty: IrType::Generic(s), .. }) if *s == param_sym),
             "parameter lowers to Generic(a), got {:?}",
             func.params
         );
@@ -1154,7 +1197,7 @@ mod tests {
 
         // The parameter's IrType is Generic(any_sym).
         assert_eq!(func.params.len(), 1, "one parameter");
-        let Some((_, param_ty)) = func.params.first() else {
+        let Some(ipe_ir::Param { ty: param_ty, .. }) = func.params.first() else {
             return;
         };
         assert!(
@@ -1162,7 +1205,8 @@ mod tests {
             "param type must be Generic(any_sym), got {param_ty:?}"
         );
         assert!(
-            i.resolve(*any_sym).is_some_and(|n| n.starts_with("anyp_")),
+            i.resolve(*any_sym)
+                .is_some_and(|n| n.starts_with(SynthStem::AnyParam.text())),
             "the wildcard's generic must be a freshened `anyp_N` symbol, got {:?}",
             i.resolve(*any_sym)
         );
@@ -1197,7 +1241,9 @@ mod tests {
         let Some((func, i)) = opt else { return };
 
         assert_eq!(func.params.len(), 2, "two parameters");
-        let (Some((_, a_ty)), Some((_, b_ty))) = (func.params.first(), func.params.get(1)) else {
+        let (Some(ipe_ir::Param { ty: a_ty, .. }), Some(ipe_ir::Param { ty: b_ty, .. })) =
+            (func.params.first(), func.params.get(1))
+        else {
             return;
         };
 
@@ -1361,6 +1407,191 @@ mod tests {
                 })
             ),
             "an `any` row param in call-arg position must be IPE-L0131, got {err:?}"
+        );
+    }
+
+    /// The finalized bounds of the generic named `name` in `func`.
+    fn generic_bounds(func: &ipe_ir::Func, i: &Interner, name: &str) -> Option<ipe_ir::BoundSet> {
+        func.type_params
+            .iter()
+            .find(|(sym, _)| i.resolve(*sym) == Some(name))
+            .map(|(_, bounds)| *bounds)
+    }
+
+    /// Whether `name`'s generic `var` in `source` carries `Send + 'static` after lowering.
+    fn generic_is_send(source: &str, name: &str, var: &str) -> bool {
+        lower_func(source, name)
+            .and_then(|(func, i)| generic_bounds(&func, &i, var))
+            .is_some_and(|bounds| bounds.has_send() && bounds.has_static())
+    }
+
+    /// The generic-key shape: `cardKey` forwards its `card` and `panel`, with a
+    /// constructor as the callback, into `onCard`, whose variables sit under a
+    /// function parameter. The callee's `Send + 'static` must reach the caller.
+    #[test]
+    fn forwarder_into_callback_helper_inherits_send() {
+        let src = "module Main exposing (cardKey)\n\
+                   type KeyAction card panel = ApproveSelected card | RefuseSelected card | Select Int | ConfirmRefuse panel | Ignore\n\
+                   cardKey : Maybe card -> Int -> String -> KeyAction card panel\n\
+                   cardKey card at key =\n\
+                   \x20   case key of\n\
+                   \x20       \"a\" -> onCard ApproveSelected card\n\
+                   \x20       \"r\" -> onCard RefuseSelected card\n\
+                   \x20       \"s\" -> Select at\n\
+                   \x20       _ -> Ignore\n\
+                   onCard : (card -> KeyAction card panel) -> Maybe card -> KeyAction card panel\n\
+                   onCard act card =\n\
+                   \x20   case card of\n\
+                   \x20       Just drawn -> act drawn\n\
+                   \x20       Nothing -> Ignore\n";
+        assert!(
+            generic_is_send(src, "onCard", "card") && generic_is_send(src, "onCard", "panel"),
+            "a generic under a callback parameter must carry `Send + 'static` in the IR"
+        );
+        assert!(
+            generic_is_send(src, "cardKey", "card") && generic_is_send(src, "cardKey", "panel"),
+            "`cardKey` instantiates `onCard`'s bounded generics and must inherit `Send + 'static`"
+        );
+    }
+
+    /// A chain `twice -> tagged -> label` where only `label` takes a callback:
+    /// the bound must travel two calls back.
+    #[test]
+    fn transitive_forwarders_inherit_send() {
+        let src = "module Main exposing (twice)\n\
+                   label : (x -> Int) -> x -> Int\n\
+                   label weigh v =\n\
+                   \x20   weigh v + 1\n\
+                   tagged : x -> Int\n\
+                   tagged v =\n\
+                   \x20   label (\\_ -> 1) v\n\
+                   twice : x -> Int\n\
+                   twice v =\n\
+                   \x20   tagged v + tagged v\n";
+        assert!(
+            generic_is_send(src, "tagged", "x"),
+            "`tagged` forwards into `label`'s callback-bound generic"
+        );
+        assert!(
+            generic_is_send(src, "twice", "x"),
+            "`twice` reaches `label` only through `tagged` and must still inherit `Send`"
+        );
+    }
+
+    /// Mutual recursion: `odds` forwards only into `evens`, and `evens` into a
+    /// callback-taking helper; both must end the fixpoint bounded.
+    #[test]
+    fn mutually_recursive_forwarders_inherit_send() {
+        let src = "module Main exposing (evens)\n\
+                   count : (x -> Int) -> x -> Int\n\
+                   count weigh v =\n\
+                   \x20   weigh v\n\
+                   evens : List x -> Int\n\
+                   evens xs =\n\
+                   \x20   case xs of\n\
+                   \x20       [] -> 0\n\
+                   \x20       y :: rest -> count (\\_ -> 1) y + odds rest\n\
+                   odds : List x -> Int\n\
+                   odds xs =\n\
+                   \x20   case xs of\n\
+                   \x20       [] -> 0\n\
+                   \x20       _ :: rest -> evens rest\n";
+        assert!(
+            generic_is_send(src, "evens", "x"),
+            "`evens` forwards into `count`"
+        );
+        assert!(
+            generic_is_send(src, "odds", "x"),
+            "`odds` forwards only into `evens` and must inherit its bound"
+        );
+    }
+
+    /// A `Task`-returning function's row variable carries `Send + 'static`,
+    /// and a caller forwarding that record into it is refused at ipe time.
+    ///
+    /// The refusal is what keeps a forwarder's clause from missing the bound:
+    /// a row value read anywhere but as a field receiver is IPE-L0131. The
+    /// fixture reaches `Task` through a kernel qualifier (`Ipe.Process`),
+    /// since the single-module harness resolves no compiled-source module.
+    #[test]
+    fn task_returning_row_variable_inherits_send() {
+        let greet = "module Main exposing (greet)\n\
+                     import Ipe.Process as Process\n\
+                     greet : { r | name : String } -> Task Error String\n\
+                     greet rec =\n\
+                     \x20   Process.run rec.name []\n";
+        let bounds = lower_func_staged(greet, "greet")
+            .map(|(func, _)| func.row_params.first().map(|row| row.bounds));
+        assert!(
+            matches!(bounds, Ok(Some(b)) if b.has_send() && b.has_static()),
+            "a `Task`-returning function's row variable must carry `Send + 'static` in the IR, got {bounds:?}"
+        );
+        let forwarded = lower_result(
+            "module Main exposing (greetings)\n\
+             import Ipe.Process as Process\n\
+             greet : { r | name : String } -> Task Error String\n\
+             greet rec =\n\
+             \x20   Process.run rec.name []\n\
+             greetings : { r | name : String } -> List (Task Error String)\n\
+             greetings rec =\n\
+             \x20   [ greet rec, greet rec ]\n",
+        );
+        assert!(
+            matches!(
+                forwarded,
+                Err(Diagnostic::Lower {
+                    msg: LowerError::Unsupported(Feature::RowPolyRecordAnnotation),
+                    ..
+                })
+            ),
+            "a row value forwarded into another function must be IPE-L0131, got {forwarded:?}"
+        );
+    }
+
+    /// A forwarder whose callee is bounded only by its return's UI message:
+    /// `label` inspects `badge`, whose `msg` needs `'static`.
+    ///
+    /// `Html` is the builtin type constructor, so the fixture needs no
+    /// compiled-source module the single-module harness cannot resolve.
+    #[test]
+    fn forwarder_into_ui_message_helper_inherits_static() {
+        let src = "module Main exposing (label)\n\
+                   badge : Maybe msg -> Html msg\n\
+                   badge m =\n\
+                   \x20   badge m\n\
+                   label : Maybe msg -> String\n\
+                   label m =\n\
+                   \x20   case badge m of\n\
+                   \x20       _ ->\n\
+                   \x20           \"badge\"\n";
+        let msg_bounds = |name: &str| {
+            lower_func_staged(src, name).map(|(func, i)| generic_bounds(&func, &i, "msg"))
+        };
+        let badge = msg_bounds("badge");
+        assert!(
+            matches!(badge, Ok(Some(b)) if b.has_static()),
+            "a UI-carrier message generic must carry `'static` in the IR, got {badge:?}"
+        );
+        let label = msg_bounds("label");
+        assert!(
+            matches!(label, Ok(Some(b)) if b.has_static()),
+            "`label` instantiates `badge`'s `'static` message and must inherit it, got {label:?}"
+        );
+    }
+
+    /// A pure generic with no callback, `Task` return, or UI carrier keeps
+    /// `Clone` alone: the shape rules never over-bound.
+    #[test]
+    fn plain_generic_gains_no_auto_trait() {
+        let opt = lower_func(
+            "module Main exposing (pick)\npick : x -> x -> x\npick a b =\n    a\n",
+            "pick",
+        );
+        let bounds = opt.and_then(|(func, i)| generic_bounds(&func, &i, "x"));
+        assert_eq!(
+            bounds,
+            Some(ipe_ir::BoundSet::UNBOUNDED.with_clone()),
+            "a plain generic must stay `Clone`-only"
         );
     }
 }

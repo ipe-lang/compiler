@@ -4,22 +4,14 @@
 //! sibling `onPress` button in the same view.
 //!
 //! **Without the fix, ** `ipe` exits 0, but the emitted Rust fails `cargo build` with
-//! E0382 ("use of moved value").  The lowerer's multi-use-clone rewrite wraps
-//! the `onInput` Lambda in `let item = item.clone(); Lambda { … }`, but the
-//! inline-wrap emitter (`KernelFn::UiOnInput`) then places the whole block
-//! inside `Arc::new(move |_x| …)`.  The outer `move` still move-captures the
+//! E0382 ("use of moved value") whenever the multi-use-clone rewrite's
+//! `let item = item.clone();` lands inside a `move` closure that captures the
 //! free outer `item`, so the sibling `onPress` hits use-after-move.
 //!
-//! This is the same bug shape as the `onChange` FIELD path handled by
-//! `emit_arc_callback_field`.  That path covers only the `on_change` FIELD
-//! path (via `input_checkbox_`/`Input.*` call arguments), NOT the two inline
-//! `Arc::new(move …)` wraps synthesized by the `UiOnInput`/`UiOnChange` kernel
-//! arms in `emit_expr.rs`.
-//!
-//! **Fix (D5):** route `KernelFn::UiOnInput` and `KernelFn::UiOnChange` through
-//! `emit_arc_callback_field`, which peels leading pure-alias `let`s OUTSIDE the
-//! synthesized `Arc`'s `move` closure.  Output is byte-identical when no
-//! capture-clone `let`s are present.
+//! The `onInput` handler is an adapted slot in handler normal form (`let`s
+//! around one closure literal): the emitter emits the leading `let`s OUTSIDE
+//! the closure it places in the `Arc`, the same rule every adapted slot
+//! (`Ui.on*`, `Input.*` callback fields) follows.
 //!
 //! Run:
 //! ```text
@@ -37,11 +29,10 @@ fn repo_root() -> PathBuf {
     std::fs::canonicalize(&joined).unwrap_or(joined)
 }
 
-fn entry_path(root: &Path) -> PathBuf {
+fn golden_dir(root: &Path) -> PathBuf {
     root.join("tests")
         .join("golden")
         .join("oninput_reused_capture")
-        .join("Main.ipe")
 }
 
 /// ipe-0: the compiler must accept the program AND emit the capture-clone `let`
@@ -53,14 +44,14 @@ fn entry_path(root: &Path) -> PathBuf {
 #[test]
 fn i193_oninput_ipec_accepts_and_hoists_capture_clone() {
     let root = repo_root();
-    let entry = entry_path(&root);
+    let golden = golden_dir(&root);
     let out =
         PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("i193_oninput_reused_capture_ipec_out");
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
 
-    let built = ipe::build_loose_file(&entry, &out, &runtime);
+    let built = crate::support::build_golden(&golden, &out, &runtime);
     assert!(
         built.is_ok(),
         "ipe dev build must succeed for oninput_reused_capture: {:?}",
@@ -113,13 +104,13 @@ fn i193_oninput_cargo_builds_and_runs() {
     }
 
     let root = repo_root();
-    let entry = entry_path(&root);
+    let golden = golden_dir(&root);
     let out = crate::support::scratch_root().join("ipec_i193_oninput_reused_capture_e2e");
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
 
-    let built = ipe::build_loose_file(&entry, &out, &runtime);
+    let built = crate::support::build_golden(&golden, &out, &runtime);
     assert!(
         built.is_ok(),
         "ipe dev build must succeed: {:?}",

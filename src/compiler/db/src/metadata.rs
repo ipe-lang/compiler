@@ -279,7 +279,8 @@ fn walk_expr(
             body,
             ..
         }
-        | Expr::TailLoop { params: _, body } => {
+        | Expr::TailLoop { params: _, body }
+        | Expr::CaptureClones { syms: _, body } => {
             walk_expr(body, direct_calls, types);
         }
         Expr::Apply { func, args } => {
@@ -364,10 +365,9 @@ fn walk_pat(pat: &Pat, types: &mut BTreeSet<(ModPath, Symbol)>) {
                 walk_pat(rest, types);
             }
         }
-        // An or-pattern's alternatives may each reference distinct enum
-        // identities (`Circle r | Square r`), so every alternative is walked.
+        // Each constructor alternative names its enum, so every one is walked.
         Pat::Or(alts) => {
-            for alt in alts {
+            for alt in alts.as_slice() {
                 walk_pat(alt, types);
             }
         }

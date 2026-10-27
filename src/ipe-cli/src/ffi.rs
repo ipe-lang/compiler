@@ -29,16 +29,13 @@ use crate::remote_ingest::{
 };
 use crate::text;
 
-/// The project-relative FFI cache directory.
-const CACHE_REL: &str = ipe_ffi::driver::FFI_CACHE_REL;
-
 /// The project manifest that bounds the upward cache-discovery walk.
-const PROJECT_MANIFEST: &str = "package.ipe";
+const PROJECT_MANIFEST: &str = crate::package_manifest::PACKAGE_IPE;
 
 /// The legacy TOML manifest name the `ipe rust install` text inspector reads
 /// for `[rust.dependencies]` / `[rust.wrapper]`, pending the ergonomic Rust-FFI
 /// work that lifts those bindings out of a `package.ipe`.
-const PROJECT_MANIFEST_TOML: &str = "ipe.toml";
+const PROJECT_MANIFEST_TOML: &str = crate::project::IPE_TOML;
 
 /// The most entries one source-tree read lists, across every level, before it is refused.
 const TREE_ENTRY_CAP: EntryCap = EntryCap::from_nonzero(NonZeroU32::MIN.saturating_add(65_535));
@@ -53,7 +50,7 @@ fn absent_as_none<T>(result: Result<T, OpenRefusal>, path: &Path) -> Result<Opti
 }
 
 /// `dir` joined with each of `below`.
-fn joined(dir: &Path, below: &[&str]) -> PathBuf {
+pub(crate) fn joined(dir: &Path, below: &[&str]) -> PathBuf {
     below
         .iter()
         .fold(dir.to_path_buf(), |path, name| path.join(name))
@@ -315,7 +312,7 @@ pub fn find_cache_root(start: &Path) -> Result<Option<TrustedCache>, CliError> {
         start.parent()
     };
     while let Some(d) = dir {
-        if let Some(cache) = owner_trust::open_cache(d, CACHE_REL)? {
+        if let Some(cache) = owner_trust::open_cache(d)? {
             return Ok(Some(cache));
         }
         // Stop at the project root: do not walk above the nearest package.ipe.
@@ -325,17 +322,6 @@ pub fn find_cache_root(start: &Path) -> Result<Option<TrustedCache>, CliError> {
         dir = d.parent();
     }
     Ok(None)
-}
-
-/// Load the installed-crate catalog for a build rooted at (or blamed on)
-/// `blame_path`. Absent cache ⇒ empty catalog.
-///
-/// # Errors
-/// [`CliError::TrustRefused`] relaying the catalog loader's diagnostic (a
-/// tampered or half-written cache is refused, never silently skipped), or
-/// refusing a cache entry that fails the owner rule.
-pub fn load_catalog_for(blame_path: &Path) -> Result<Vec<InstalledCrate>, CliError> {
-    load_located_catalog(blame_path).map(|(catalog, _)| catalog)
 }
 
 /// Whether a build can link Rust FFI: an installed crate catalog makes its
@@ -348,29 +334,58 @@ pub enum FfiPresence {
     Present,
 }
 
-/// The [`FfiPresence`] of the build rooted at (or blamed on) `blame_path`.
+/// The catalog of the cache one discovery walk up from `blame_path` finds.
+///
+/// Empty when no cache exists.
 ///
 /// # Errors
-/// As [`load_catalog_for`].
-pub fn project_ffi_presence(blame_path: &Path) -> Result<FfiPresence, CliError> {
-    Ok(if load_catalog_for(blame_path)?.is_empty() {
-        FfiPresence::Absent
-    } else {
-        FfiPresence::Present
-    })
+/// [`CliError::TrustRefused`] relaying the catalog loader's diagnostic (a
+/// tampered or half-written cache is refused, never silently skipped), or
+/// refusing a cache entry that fails the owner rule.
+fn load_located_catalog(blame_path: &Path) -> Result<Catalog, CliError> {
+    load_catalog(find_cache_root(blame_path)?.as_ref())
 }
 
-/// The catalog for `blame_path` with the path of the cache it was read from
-/// (empty when no cache exists), from one discovery walk.
+/// The installed-crate catalog of one build, read once through a held cache directory.
+///
+/// Fields are private: [`load_catalog`] is the only mint, so a catalog is
+/// always the content of a cache directory held open after its owner check,
+/// and preparing over it never opens the cache again.
+#[derive(Debug, Clone)]
+pub struct Catalog {
+    crates: Vec<InstalledCrate>,
+    /// Where the cache was found: the reported directory of injected
+    /// interface modules, never opened.
+    hint: PathBuf,
+}
+
+impl Catalog {
+    /// The installed crates, as read.
+    #[must_use]
+    pub fn crates(&self) -> &[InstalledCrate] {
+        &self.crates
+    }
+}
+
+/// Read the catalog of the held cache `cache`; no cache reads as an empty catalog.
+///
+/// Every catalog read goes through here, from the handle the owner check
+/// opened: the cache is never found again by its path.
 ///
 /// # Errors
-/// As [`load_catalog_for`].
-fn load_located_catalog(blame_path: &Path) -> Result<(Vec<InstalledCrate>, PathBuf), CliError> {
-    let Some(cache) = find_cache_root(blame_path)? else {
-        return Ok((Vec::new(), PathBuf::new()));
+/// [`CliError::TrustRefused`] relaying the catalog loader's diagnostic (a
+/// tampered or half-written cache is refused, never silently skipped).
+pub fn load_catalog(cache: Option<&TrustedCache>) -> Result<Catalog, CliError> {
+    let Some(cache) = cache else {
+        return Ok(Catalog {
+            crates: Vec::new(),
+            hint: PathBuf::new(),
+        });
     };
-    let catalog = ipe_ffi::driver::load_catalog_from(&cache)?;
-    Ok((catalog, cache.path().to_path_buf()))
+    Ok(Catalog {
+        crates: ipe_ffi::driver::load_catalog_from(cache)?,
+        hint: cache.path().to_path_buf(),
+    })
 }
 
 /// Inject each installed crate's interface module into the build's source
@@ -486,6 +501,44 @@ pub fn assemble_emit(catalog: &[InstalledCrate]) -> Result<Option<AssembledEmit>
     };
     seal_dependency_references(catalog, &merged, &emit).map_err(FfiPrepError::CatalogSeal)?;
     Ok(Some(AssembledEmit { emit, merged }))
+}
+
+/// Refuse a wrapper crate `catalog` binds by path that is no longer the directory below `root`.
+///
+/// A wrapper's `path` dependency is proven inside the project when the
+/// catalog is read. Between that read and the emit, a wrapper level swapped
+/// for a link, or the project renamed away and replaced, would make the path
+/// the emitted `Cargo.toml` binds name another tree; so at the emit each
+/// wrapper is proven to be the directory reached through the root's own
+/// handle.
+///
+/// This is a check-then-cargo window, not a hold: cargo later resolves the
+/// emitted `path = ...` by name. A co-tenant able to write a level of the
+/// wrapper's path can rename the wrapper directory and plant another tree
+/// after this check and before cargo resolves the path, and that tree is
+/// built. The structural close copies the wrapper through a held handle into
+/// the output directory and binds the copy, a separate design.
+///
+/// # Errors
+/// [`CliError::TrustRefused`] naming the first wrapper that is not;
+/// [`CliError::Io`] when a level cannot be opened or stat'd.
+pub fn hold_wrapper_deps(
+    root: &crate::project_root::ProjectRoot,
+    catalog: &[InstalledCrate],
+) -> Result<(), CliError> {
+    for dep in catalog.iter().flat_map(|c| &c.cargo_deps) {
+        if let CargoDep::Wrapper { dir, .. } = dep
+            && !root.holds_wrapper(Path::new(dir.as_str()))?
+        {
+            return Err(CliError::TrustRefused(
+                owner_trust::TrustRefusal::FfiWrapperMoved {
+                    package: dir.package().as_str().to_owned(),
+                    path: PathBuf::from(dir.as_str()),
+                },
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Every refusal FFI prep returns, one variant per cause.
@@ -1002,29 +1055,38 @@ pub struct FfiPrep {
     pub emit: Option<ipe_backend_rust::FfiEmit>,
 }
 
-/// Load, inject, and assemble the FFI catalog for a project in one step.
-///
-/// This is the shared seam used by `run_build`, `ipe dev watch`, and `ipe lsp` so
-/// all three compilation paths go through the SAME catalog-load → interface-
-/// inject → emit-assemble sequence. Each caller was previously duplicating
-/// these steps independently, or (in `watch`/`lsp`) skipping them entirely —
-/// both are bugs (CO-INCR-005).
+/// Load the catalog found up from `blame_path`, then [`prepare`] `sources` over it.
 ///
 /// `blame_path` is the project entry file or manifest: the catalog search
 /// walks up from it looking for `.ipe/cache/ffi/rust`.
 ///
-/// `sources` is mutated in-place: one `Rust.<Crate>` interface module is
-/// inserted per installed crate.
-///
 /// # Errors
-/// [`CliError`] when the catalog is tampered/unreadable, two installed
-/// crates pin the same dependency to conflicting version lines, or emitted
-/// code names a dependency the manifest leaves out.
+/// As [`load_located_catalog`] and [`prepare`].
 pub fn prepare_ffi(
     sources: &mut BTreeMap<Vec<String>, (PathBuf, String)>,
     blame_path: &Path,
 ) -> Result<FfiPrep, CliError> {
-    let (mut catalog, cache_hint) = load_located_catalog(blame_path)?;
+    prepare(sources, &load_located_catalog(blame_path)?)
+}
+
+/// Inject and assemble the FFI seam of `sources` over `catalog`.
+///
+/// The one seam every compilation path (build, `ipe dev watch`, `ipe lsp`)
+/// goes through: reserved-name check, nominal unification, asserted-call
+/// scan, interface injection and emit assembly, in that order. `sources`
+/// is mutated in place: one `Rust.<Crate>` interface module is inserted per
+/// installed crate. The cache is never opened here.
+///
+/// # Errors
+/// [`CliError`] when an installed crate claims a reserved name, two
+/// installed crates pin the same dependency to conflicting version lines, or
+/// emitted code names a dependency the manifest leaves out.
+pub fn prepare(
+    sources: &mut BTreeMap<Vec<String>, (PathBuf, String)>,
+    catalog: &Catalog,
+) -> Result<FfiPrep, CliError> {
+    let cache_hint = catalog.hint.as_path();
+    let mut catalog = catalog.crates.clone();
     // The asserted-call classifications lean on two unforgeable names: the
     // `Rust.Ffi` module and the `ipe_asserted_` wrapper prefix. No installed
     // crate may claim either — refused at load, before anything is injected.
@@ -1056,7 +1118,7 @@ pub fn prepare_ffi(
     // Scan for asserted calls BEFORE interface injection, while `sources`
     // holds only project (and stdlib) modules.
     let ScannedFfi { asserted, consts } = scan_asserted(sources, &catalog)?;
-    let mut injected = inject_interfaces(sources, &catalog, &cache_hint)?;
+    let mut injected = inject_interfaces(sources, &catalog, cache_hint)?;
     let mut assembled = assemble_emit(&catalog)?;
     if !asserted.is_empty() || !consts.is_empty() {
         let mod_path: Vec<String> = ipe_canon::asserted::ASSERTED_MODULE
@@ -4235,6 +4297,9 @@ pub(crate) fn rust_wrapper_header_accepted_by_ffi_reader(line: &str) -> bool {
 mod tests {
     use super::*;
 
+    /// The project-relative FFI cache directory.
+    const CACHE_REL: &str = ipe_ffi::driver::FFI_CACHE_REL;
+
     #[test]
     fn ffi_proc_cap_override_refuses_zero_and_overflow() {
         use ipe_sandbox::run_jail::{ProcCap, ProcCapError};
@@ -6330,9 +6395,11 @@ version = \"1\"
     /// Prep functions the reach walk must find from [`FFI_PREP_ENTRY`]: a walk
     /// that loses one (a rename, a parse that stopped early) goes red instead
     /// of passing over less code.
-    const FFI_PREP_REACHED: [&str; 11] = [
+    const FFI_PREP_REACHED: [&str; 13] = [
         "prepare_ffi",
         "load_located_catalog",
+        "load_catalog",
+        "prepare",
         "scan_asserted",
         "asserted_refused",
         "inject_interfaces",
@@ -6691,9 +6758,8 @@ version = \"1\"
         let outside = root.join("outside.rs");
         std::fs::write(&outside, "pub fn elsewhere() {}\n").expect("write link target");
         std::fs::write(cache.join("real_bindings.rs"), "pub fn f() {}\n").expect("write binding");
-        let cache_rel: Vec<&str> = ipe_ffi::driver::FFI_CACHE_REL.split('/').collect();
         let held = || {
-            open_project_dir(&root, &cache_rel)
+            open_project_dir(&root, &ipe_ffi::driver::FFI_CACHE_COMPONENTS)
                 .expect("open cache")
                 .expect("cache present")
         };
@@ -6957,7 +7023,10 @@ iced = "=0.12.1"
     }
 
     fn bwrap() -> ipe_sandbox::Mechanism {
-        ipe_sandbox::Mechanism::Bwrap(PathBuf::from("/usr/bin/bwrap"))
+        ipe_sandbox::Mechanism::Bwrap(
+            ipe_sandbox::ToolPath::assumed(Path::new("/usr/bin"), ipe_sandbox::HostTool::Bwrap)
+                .expect("an absolute test directory"),
+        )
     }
 
     #[test]

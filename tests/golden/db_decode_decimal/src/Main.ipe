@@ -1,0 +1,87 @@
+module Main exposing (main)
+import Ipe.Io as Io
+import Ipe.Db
+import Ipe.Db.Location as Location
+import Ipe.Db.Unsafe
+import Ipe.Db.Decode
+import Ipe.Decimal
+import Ipe.List
+import Ipe.String
+import Ipe.Task
+
+-- `Db.Decode.decimal` kernel wiring end-to-end.
+--
+-- `Db.Decode.decimal` reads a TEXT column written by `SqlDecimal` (the
+-- lossless exact-decimal serialisation) back into a `Decimal` value.
+-- Symmetric counterpart to `Db.Decode.money`: money returns
+-- `Decoder (Decimal, String)`, decimal returns `Decoder Decimal`.
+--
+-- Row "pi": value column = "3.14159" → decodes to Decimal "3.14159".
+-- Row "broken": value column = "NOT_A_NUMBER" → decode is a total `Err`,
+-- never a panic — caught via `Task.onError`.
+--
+-- Output: "3.14159\nmalformed:caught"
+
+main =
+    Task.andThen
+        (\conn ->
+            Db.withTransaction conn
+                (\txconn ->
+                    do
+                        Unsafe.unsafeExecRaw txconn
+                            "CREATE TABLE measurements (label TEXT, value TEXT)"
+                        Db.exec txconn
+                            "INSERT INTO measurements (label, value) VALUES (?, ?)"
+                            [ SqlString "pi", SqlDecimal (Decimal.fromMinor 5 314159) ]
+                        Db.exec txconn
+                            "INSERT INTO measurements (label, value) VALUES (?, ?)"
+                            [ SqlString "broken", SqlString "NOT_A_NUMBER" ]
+                        Task.andThen
+                            (\okLine ->
+                                Task.andThen
+                                    (\badLine ->
+                                        Io.println (okLine ++ "\n" ++ badLine)
+                                    )
+                                    (Task.onError
+                                        (\_ -> Task.succeed "malformed:caught")
+                                        (Task.andThen
+                                            (\rows ->
+                                                Task.succeed
+                                                    (String.join ","
+                                                        (List.map
+                                                            (\d ->
+                                                                Decimal.toString d
+                                                            )
+                                                            rows
+                                                        )
+                                                    )
+                                            )
+                                            (Db.queryDecode txconn
+                                                "SELECT value FROM measurements WHERE label = ?"
+                                                [ SqlString "broken" ]
+                                                (Db.Decode.decimal "value")
+                                            )
+                                        )
+                                    )
+                            )
+                            (Task.andThen
+                                (\rows ->
+                                    Task.succeed
+                                        (String.join ","
+                                            (List.map
+                                                (\d ->
+                                                    Decimal.toString d
+                                                )
+                                                rows
+                                            )
+                                        )
+                                )
+                                (Db.queryDecode txconn
+                                    "SELECT value FROM measurements WHERE label = ?"
+                                    [ SqlString "pi" ]
+                                    (Db.Decode.decimal "value")
+                                )
+                            )
+                )
+        )
+        (Db.open Location.memory)

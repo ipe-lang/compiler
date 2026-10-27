@@ -11,7 +11,7 @@
 -- Block types: headers (# / ## / ### / #### / ##### / ######), paragraphs,
 -- fenced code blocks (```), bullet lists (- / *), ordered lists (1.),
 -- horizontal rules (---), tables (| ... | separator | ... |),
--- blockquotes (> …, nestable).
+-- blockquotes (> …, nestable to 32 levels).
 --
 -- Inline: **bold**, *italic*, `code`, [text](url), ![alt](url) images,
 -- trailing-double-space → line break.
@@ -25,9 +25,14 @@
 -- (`sanitise_url_attr`) validates as the single SSOT guard: it normalises the
 -- scheme (stripping leading and intra-scheme control/whitespace, case) and
 -- neutralises `javascript:`/`vbscript:`/dangerous `data:` schemes, allowing
--- only safe schemes and raster `data:image` URLs. Feed untrusted markdown
--- without an extra sanitisation step. (Compare: HTML-string renderers need a
+-- only safe schemes and raster `data:image` URLs, so the output is HTML-safe
+-- with no extra sanitisation step. (Compare: HTML-string renderers need a
 -- sanitiser equivalent to bluemonday; this one does not.)
+--
+-- Bounds: parsing runs in time linear in the input's size, with a stack
+-- bounded by the quote ceiling. Quotes nest at most 32 deep; text
+-- quoted deeper renders as one flat paragraph. The caller bounds the input's
+-- size.
 --
 -- Chrome colours (code surfaces, dividers, list markers, blockquote
 -- left-rules) derive from the inherited theme foreground via `currentColor`,
@@ -103,87 +108,227 @@ type Block
 -- tree, for callers that render with their own typography and palette.
 parseBlocks : String -> List Block
 parseBlocks src =
-    blocksFromLines (String.lines src)
+    blocksAt 0 (String.lines src)
 
 
-blocksFromLines : List String -> List Block
-blocksFromLines lines =
-    case lines of
+-- The deepest blockquote nesting the parser builds: a quote opened at this
+-- depth renders its text as one flat paragraph instead of nesting further.
+-- The doc-side port mirrors it as `MAX_BLOCKQUOTE_DEPTH`; a parity test pins
+-- the two equal.
+maxQuoteDepth : Int
+maxQuoteDepth = 32
 
-        [] ->
-            []
 
-        l :: rest ->
-            let
-                t = String.trim l
-            in
-                if t == "" then
-                    blocksFromLines rest
+-- The block the line fold is inside of. `InPara` carries the body and whether
+-- the next line joins with a newline (the last line ended in two spaces);
+-- `PendingTableHead` holds a table-like line until the next line shows
+-- whether it heads a table.
+type BlockMode
+    = Idle
+    | InPara String Bool
+    | InFence (List String)
+    | InBullets (List String)
+    | InNumbered (List String)
+    | PendingTableHead String
+    | InTable (List String) (List (List String))
+    | InQuote (List String)
 
-                else if isHrLine t then
-                    RuleBlock :: blocksFromLines rest
 
-                else if String.startsWith "###### " l then
-                    HeaderBlock H6 (String.slice 7 (String.length l) l)
-                        :: blocksFromLines rest
+-- The line fold's state: quote depth, the open block, the finished blocks in
+-- document order.
+type BlockState
+    = BlockState Int BlockMode (List Block)
 
-                else if String.startsWith "##### " l then
-                    HeaderBlock H5 (String.slice 6 (String.length l) l)
-                        :: blocksFromLines rest
 
-                else if String.startsWith "#### " l then
-                    HeaderBlock H4 (String.slice 5 (String.length l) l)
-                        :: blocksFromLines rest
+-- Parse lines at quote depth `depth` in one forward fold: one step per line,
+-- no stack growth with document length.
+blocksAt : Int -> List String -> List Block
+blocksAt depth lines =
+    finishBlocks (List.foldl stepLine (BlockState depth Idle []) lines)
 
-                else if String.startsWith "### " l then
-                    HeaderBlock H3 (String.slice 4 (String.length l) l)
-                        :: blocksFromLines rest
 
-                else if String.startsWith "## " l then
-                    HeaderBlock H2 (String.slice 3 (String.length l) l)
-                        :: blocksFromLines rest
+-- Feed one line to the open block: a line the block takes extends it; any
+-- other line closes it and starts afresh from `stepIdle`.
+stepLine : String -> BlockState -> BlockState
+stepLine l state =
+    case state of
+        BlockState d mode out ->
+            case mode of
+                Idle ->
+                    stepIdle d l out
 
-                else if String.startsWith "# " l then
-                    HeaderBlock H1 (String.slice 2 (String.length l) l)
-                        :: blocksFromLines rest
+                InPara body hard ->
+                    stepPara d body hard l out
 
-                else if String.startsWith "```" l then
-                    let
-                        cf = takeCodeFence rest
-                    in
-                        CodeBlock (fst cf) :: blocksFromLines (snd cf)
+                InFence body ->
+                    if String.startsWith "```" l then
+                        BlockState d Idle (out ++ [ CodeBlock (String.join "\n" body) ])
 
-                else if isBulletLine l then
-                    let
-                        bl = takeBulletGroup lines
-                    in
-                        BulletBlock (fst bl) :: blocksFromLines (snd bl)
+                    else
+                        BlockState d (InFence (body ++ [ l ])) out
 
-                else if isNumberedLine l then
-                    let
-                        nl = takeNumberedGroup lines
-                    in
-                        NumberedBlock (fst nl) :: blocksFromLines (snd nl)
+                InBullets items ->
+                    if isBulletLine l then
+                        BlockState d (InBullets (items ++ [ stripBulletPrefix l ])) out
 
-                else if isTableHeaderLine l rest then
-                    let
-                        tbl = takeTable lines
-                    in
-                        TableBlock tbl.header tbl.rows
-                            :: blocksFromLines tbl.after
+                    else
+                        stepIdle d l (out ++ [ BulletBlock items ])
 
-                else if isBlockquoteLine l then
-                    let
-                        bq = takeBlockquoteGroup lines
-                    in
-                        BlockquoteBlock (blocksFromLines (fst bq))
-                            :: blocksFromLines (snd bq)
+                InNumbered items ->
+                    if isNumberedLine l then
+                        BlockState d (InNumbered (items ++ [ stripNumberedPrefix l ])) out
 
-                else
-                    let
-                        pp = takeParagraph lines
-                    in
-                        ParaBlock (fst pp) :: blocksFromLines (snd pp)
+                    else
+                        stepIdle d l (out ++ [ NumberedBlock items ])
+
+                PendingTableHead head ->
+                    if isTableSeparator l then
+                        BlockState d (InTable (parseTableRow head) []) out
+
+                    else
+                        stepPara d head (String.endsWith "  " head) l out
+
+                InTable header rows ->
+                    if looksLikeTableRow l then
+                        BlockState d (InTable header (rows ++ [ parseTableRow l ])) out
+
+                    else
+                        stepIdle d l (out ++ [ TableBlock header rows ])
+
+                InQuote inner ->
+                    if isBlockquoteLine l then
+                        BlockState d (InQuote (inner ++ [ stripQuotePrefix l ])) out
+
+                    else
+                        stepIdle d l (out ++ quoteBlocks d inner)
+
+
+-- Start a block from line `l` with no block open. The branch order is the
+-- precedence: blank, rule, header, fence, bullet, numbered, table head,
+-- blockquote, paragraph.
+stepIdle : Int -> String -> List Block -> BlockState
+stepIdle d l out =
+    let
+        t = String.trim l
+    in
+        if t == "" then
+            BlockState d Idle out
+
+        else if isHrLine t then
+            BlockState d Idle (out ++ [ RuleBlock ])
+
+        else if String.startsWith "###### " l then
+            BlockState d Idle (out ++ [ HeaderBlock H6 (String.dropLeft 7 l) ])
+
+        else if String.startsWith "##### " l then
+            BlockState d Idle (out ++ [ HeaderBlock H5 (String.dropLeft 6 l) ])
+
+        else if String.startsWith "#### " l then
+            BlockState d Idle (out ++ [ HeaderBlock H4 (String.dropLeft 5 l) ])
+
+        else if String.startsWith "### " l then
+            BlockState d Idle (out ++ [ HeaderBlock H3 (String.dropLeft 4 l) ])
+
+        else if String.startsWith "## " l then
+            BlockState d Idle (out ++ [ HeaderBlock H2 (String.dropLeft 3 l) ])
+
+        else if String.startsWith "# " l then
+            BlockState d Idle (out ++ [ HeaderBlock H1 (String.dropLeft 2 l) ])
+
+        else if String.startsWith "```" l then
+            BlockState d (InFence []) out
+
+        else if isBulletLine l then
+            BlockState d (InBullets [ stripBulletPrefix l ]) out
+
+        else if isNumberedLine l then
+            BlockState d (InNumbered [ stripNumberedPrefix l ]) out
+
+        else if looksLikeTableRow l then
+            BlockState d (PendingTableHead l) out
+
+        else if isBlockquoteLine l then
+            BlockState d (InQuote [ stripQuotePrefix l ]) out
+
+        else
+            BlockState d (InPara l (String.endsWith "  " l)) out
+
+
+-- Feed line `l` to an open paragraph: a blank line or a block starter closes
+-- it; any other line joins, with a newline after a line ending in two spaces
+-- (a hard break) and a space otherwise.
+stepPara : Int -> String -> Bool -> String -> List Block -> BlockState
+stepPara d body hard l out =
+    if String.trim l == "" || isBlockStarter l then
+        stepIdle d l (out ++ [ ParaBlock body ])
+
+    else
+        let
+            hardNext = String.endsWith "  " l
+        in
+            BlockState d (InPara (String.append (String.append body (paraJoin hard)) l) hardNext) out
+
+
+paraJoin : Bool -> String
+paraJoin hard =
+    if hard then
+        "\n"
+
+    else
+        " "
+
+
+-- Close whatever block is open at the end of the lines.
+finishBlocks : BlockState -> List Block
+finishBlocks state =
+    case state of
+        BlockState d mode out ->
+            case mode of
+                Idle ->
+                    out
+
+                InPara body _ ->
+                    out ++ [ ParaBlock body ]
+
+                InFence body ->
+                    out ++ [ CodeBlock (String.join "\n" body) ]
+
+                InBullets items ->
+                    out ++ [ BulletBlock items ]
+
+                InNumbered items ->
+                    out ++ [ NumberedBlock items ]
+
+                PendingTableHead head ->
+                    out ++ [ ParaBlock head ]
+
+                InTable header rows ->
+                    out ++ [ TableBlock header rows ]
+
+                InQuote inner ->
+                    out ++ quoteBlocks d inner
+
+
+-- The blocks a closed blockquote group at depth `d` yields: a nested
+-- `BlockquoteBlock` below the ceiling; at it, the inner lines joined by
+-- spaces as one paragraph (none when blank), so nesting stops at
+-- `maxQuoteDepth` levels.
+quoteBlocks : Int -> List String -> List Block
+quoteBlocks d inner =
+    if d >= maxQuoteDepth then
+        flatQuote (String.trim (String.join " " inner))
+
+    else
+        [ BlockquoteBlock (blocksAt (d + 1) inner) ]
+
+
+flatQuote : String -> List Block
+flatQuote text =
+    if String.isEmpty text then
+        []
+
+    else
+        [ ParaBlock text ]
 
 
 -- "---" / "***" / "___" with any repetition count → horizontal rule.
@@ -198,30 +343,14 @@ isBlockquoteLine l =
     String.startsWith "> " l || l == ">"
 
 
--- Collect consecutive blockquote lines; strip the `> ` prefix from each;
--- return (inner-lines, remaining-lines-after).
-takeBlockquoteGroup : List String -> ( List String, List String )
-takeBlockquoteGroup lines =
-    case lines of
+-- Drop a blockquote line's `> ` marker; a bare `>` is an empty inner line.
+stripQuotePrefix : String -> String
+stripQuotePrefix l =
+    if String.startsWith "> " l then
+        String.dropLeft 2 l
 
-        [] ->
-            ( [], [] )
-
-        l :: rest ->
-            if isBlockquoteLine l then
-                let
-                    stripped =
-                        if String.startsWith "> " l then
-                            String.slice 2 (String.length l) l
-
-                        else
-                            ""
-                    grouped = takeBlockquoteGroup rest
-                in
-                    ( stripped :: fst grouped, snd grouped )
-
-            else
-                ( [], lines )
+    else
+        ""
 
 
 isBulletLine : String -> Bool
@@ -246,70 +375,6 @@ isNumberedLine l =
         List.any (\p -> String.startsWith p l) prefixes
 
 
--- Consume a code fence body: everything up to the next closing ```.
--- Returns (body, lines-after-the-close).
-takeCodeFence : List String -> ( String, List String )
-takeCodeFence lines =
-    let
-        looped = codeFenceLoop lines []
-    in
-        ( String.join "\n" (List.reverse (fst looped)), snd looped )
-
-
-codeFenceLoop : List String -> List String -> ( List String, List String )
-codeFenceLoop lines acc =
-    case lines of
-
-        [] ->
-            ( acc, [] )
-
-        l :: rest ->
-            if String.startsWith "```" l then
-                ( acc, rest )
-
-            else
-                codeFenceLoop rest (l :: acc)
-
-
--- Group consecutive bullet lines. Stops at the first non-bullet, non-blank
--- line (or EOF).
-takeBulletGroup : List String -> ( List String, List String )
-takeBulletGroup lines =
-    case lines of
-
-        [] ->
-            ( [], [] )
-
-        l :: rest ->
-            if isBulletLine l then
-                let
-                    grouped = takeBulletGroup rest
-                in
-                    ( stripBulletPrefix l :: fst grouped, snd grouped )
-
-            else
-                ( [], lines )
-
-
--- Group consecutive numbered lines.
-takeNumberedGroup : List String -> ( List String, List String )
-takeNumberedGroup lines =
-    case lines of
-
-        [] ->
-            ( [], [] )
-
-        l :: rest ->
-            if isNumberedLine l then
-                let
-                    grouped = takeNumberedGroup rest
-                in
-                    ( stripNumberedPrefix l :: fst grouped, snd grouped )
-
-            else
-                ( [], lines )
-
-
 -- Drop "- " / "* " / "  - " / "  * " bullet prefix.
 stripBulletPrefix : String -> String
 stripBulletPrefix l =
@@ -332,34 +397,6 @@ stripNumberedPrefix l =
             l
 
 
--- Consume contiguous paragraph lines joined by a space. Stops at a blank
--- line or a block-starter.
-takeParagraph : List String -> ( String, List String )
-takeParagraph lines =
-    case lines of
-
-        [] ->
-            ( "", [] )
-
-        l :: rest ->
-            if String.trim l == "" || isBlockStarter l then
-                ( "", lines )
-
-            else
-                let
-                    p = takeParagraph rest
-                    more = fst p
-                    after = snd p
-
-                    -- A line ending in two-or-more spaces is a hard break; keep a
-                    -- newline so span parsing emits a `<br>`. Other lines fold
-                    -- into one soft-wrapped run separated by a space.
-                    sep = if String.endsWith "  " l then "\n" else " "
-                    body = if more == "" then l else l ++ sep ++ more
-                in
-                    ( body, after )
-
-
 isBlockStarter : String -> Bool
 isBlockStarter l =
     String.startsWith "# " l || String.startsWith "## " l
@@ -376,24 +413,9 @@ isBlockStarter l =
 
 -- ─── Table parsing ──────────────────────────────────────────────────────────
 
--- A table-header line is `| ... | ... |` IMMEDIATELY followed by a
--- separator row like `|---|---|`. Both conditions required to avoid
--- false-matching pipe-delimited paragraphs.
-isTableHeaderLine : String -> List String -> Bool
-isTableHeaderLine l rest =
-    if not (looksLikeTableRow l) then
-        False
-
-    else
-        case rest of
-
-            [] ->
-                False
-
-            next :: _ ->
-                isTableSeparator next
-
-
+-- A table-like line is `| ... |`; one heads a table only when the next line
+-- is a separator row like `|---|---|`, so a pipe-delimited paragraph is not
+-- misread.
 looksLikeTableRow : String -> Bool
 looksLikeTableRow l =
     let
@@ -425,51 +447,6 @@ tableSeparatorOk t =
                 |> String.trim
     in
         stripped == ""
-
-
--- Named record to carry the three-value table parse result (avoids nested
--- tuple destructuring which is unreliable in recursive contexts).
-type alias TableResult =
-    { header : List String
-    , rows : List (List String)
-    , after : List String
-    }
-
-
-takeTable : List String -> TableResult
-takeTable lines =
-    case lines of
-
-        header :: _sep :: dataLines ->
-            let
-                headerCells = parseTableRow header
-                tbl = takeTableRows dataLines
-            in
-                { header = headerCells
-                , rows = fst tbl
-                , after = snd tbl
-                }
-
-        _ ->
-            { header = [], rows = [], after = lines }
-
-
-takeTableRows : List String -> ( List (List String), List String )
-takeTableRows lines =
-    case lines of
-
-        [] ->
-            ( [], [] )
-
-        l :: rest ->
-            if looksLikeTableRow l then
-                let
-                    grouped = takeTableRows rest
-                in
-                    ( parseTableRow l :: fst grouped, snd grouped )
-
-            else
-                ( [], lines )
 
 
 -- "| a | b | c |" → [ "a", "b", "c" ]. Strips outer pipes, splits on `|`,
@@ -703,203 +680,312 @@ type Span
 -- tree, for callers rendering inline runs with their own styling.
 parseSpans : String -> List Span
 parseSpans s =
-    spanLoop s [] ""
+    finishSpans (String.foldl stepChar (SpanState Plain [] emptyRun False) s)
 
 
--- Character-by-character loop. `pending` accumulates plain text; on a
--- delimiter the pending run is flushed and the delimited span consumed.
--- Hard break: two or more trailing spaces before end-of-string emit
--- `HardBreakSpan` (trailing-double-space → <br>).
-spanLoop : String -> List Span -> String -> List Span
-spanLoop remaining acc pending =
-    if String.isEmpty remaining then
-        -- Flush any trailing `  ` (two-or-more spaces) in `pending` as a hard
-        -- break rather than plain whitespace.
-        if String.endsWith "  " pending then
-            let
-                trimmed = stripTrailingSpaces pending
-            in
-                List.reverse (HardBreakSpan :: flushPending trimmed acc)
-
-        else
-            List.reverse (flushPending pending acc)
-
-    else if String.startsWith "\n" remaining then
-        -- A newline inside a paragraph marks a hard break (`takeParagraph` keeps
-        -- a newline only where a line ended in two-or-more spaces): flush the run
-        -- without its trailing spaces and emit a `HardBreakSpan`.
-        spanLoop
-            (String.slice 1 (String.length remaining) remaining)
-            (HardBreakSpan :: flushPending (stripTrailingSpaces pending) acc)
-            ""
-
-    else if String.startsWith "![" remaining then
-        case takeImage remaining of
-
-            Just ( alt, url, after ) ->
-                spanLoop after (ImageSpan alt url :: flushPending pending acc) ""
-
-            Nothing ->
-                spanLoop
-                    (String.slice 1 (String.length remaining) remaining)
-                    acc
-                    (pending ++ "!")
-
-    else if String.startsWith "**" remaining then
-        let
-            tb = takeBetween "**" (String.slice 2 (String.length remaining) remaining)
-        in
-            spanLoop (snd tb) (BoldSpan (fst tb) :: flushPending pending acc) ""
-
-    else if String.startsWith "`" remaining then
-        let
-            tb = takeBetween "`" (String.slice 1 (String.length remaining) remaining)
-        in
-            spanLoop (snd tb) (CodeSpan (fst tb) :: flushPending pending acc) ""
-
-    else if String.startsWith "[" remaining then
-        case takeLink remaining of
-
-            Just ( text, url, after ) ->
-                spanLoop after (LinkSpan text url :: flushPending pending acc) ""
-
-            Nothing ->
-                spanLoop
-                    (String.slice 1 (String.length remaining) remaining)
-                    acc
-                    (pending ++ "[")
-
-    else if String.startsWith "*" remaining then
-        let
-            tb = takeBetween "*" (String.slice 1 (String.length remaining) remaining)
-        in
-            if fst tb == "" then
-                spanLoop
-                    (String.slice 1 (String.length remaining) remaining)
-                    acc
-                    (pending ++ "*")
-
-            else
-                spanLoop (snd tb) (ItalicSpan (fst tb) :: flushPending pending acc) ""
-
-    else
-        let
-            c = String.slice 0 1 remaining
-            rest = String.slice 1 (String.length remaining) remaining
-        in
-            spanLoop rest acc (pending ++ c)
+-- What the character fold is inside of: plain text; a `!` or a `*` the next
+-- character settles; a bold (with a lone `*` seen inside it), italic, or code
+-- run; or a link (`True` for an image) at its text, between `]` and `(`, or
+-- at its URL.
+type SpanMode
+    = Plain
+    | Bang
+    | Star
+    | Bold String Bool
+    | Italic String
+    | Code String
+    | LinkText Bool String
+    | LinkOpen Bool String
+    | LinkUrl Bool String String
 
 
-flushPending : String -> List Span -> List Span
-flushPending pending acc =
-    if pending == "" then
-        acc
-
-    else
-        PlainSpan pending :: acc
+-- Plain text not yet emitted: spaces only (the text and its length), or text
+-- holding a non-space character with the count of its trailing spaces.
+type Run
+    = RunSpaces String Int
+    | RunText String Int
 
 
--- Take text up to (and consuming) the closing delimiter. Returns
--- (inner, after). If no closing delimiter is found, treats the rest as
--- the inner — graceful degradation on malformed input.
-takeBetween : String -> String -> ( String, String )
-takeBetween delim s =
-    let
-        idx = indexOfFirst delim s
-    in
-        if idx < 0 then
-            ( s, "" )
-
-        else
-            ( String.slice 0 idx s
-            , String.slice (idx + String.length delim) (String.length s) s
-            )
+-- The character fold's state: mode, finished spans in order, the pending
+-- plain run, and whether `[` reads as literal text (while a failed link's
+-- characters are replayed).
+type SpanState
+    = SpanState SpanMode (List Span) Run Bool
 
 
-indexOfFirst : String -> String -> Int
-indexOfFirst needle hay =
-    indexLoop needle hay 0
+emptyRun : Run
+emptyRun =
+    RunSpaces "" 0
 
 
-indexLoop : String -> String -> Int -> Int
-indexLoop needle hay pos =
-    if pos + String.length needle > String.length hay then
-        -1
+-- Feed one character to the open span.
+stepChar : Char -> SpanState -> SpanState
+stepChar c state =
+    case state of
+        SpanState mode out run linksOff ->
+            case mode of
+                Plain ->
+                    stepPlain c out run linksOff
 
-    else if String.slice pos (pos + String.length needle) hay == needle then
-        pos
-
-    else
-        indexLoop needle hay (pos + 1)
-
-
--- Parse `[text](url)` at the current position. Returns Nothing if the
--- syntax does not match (e.g. a lone `[`).
-takeLink : String -> Maybe ( String, String, String )
-takeLink s =
-    let
-        close = indexOfFirst "]" s
-    in
-        if close < 0 then
-            Nothing
-
-        else
-            let
-                afterClose = String.slice (close + 1) (String.length s) s
-            in
-                if not (String.startsWith "(" afterClose) then
-                    Nothing
-
-                else
-                    let
-                        urlAndAfter = String.slice 1 (String.length afterClose) afterClose
-                        closeParen = indexOfFirst ")" urlAndAfter
-                    in
-                        if closeParen < 0 then
-                            Nothing
+                Bang ->
+                    if c == '[' then
+                        if linksOff then
+                            SpanState Plain out (pushText "![" run) linksOff
 
                         else
-                            let
-                                linkText = String.slice 1 close s
-                                linkUrl = String.slice 0 closeParen urlAndAfter
-                                afterLink = String.slice (closeParen + 1) (String.length urlAndAfter) urlAndAfter
-                            in
-                                Just ( linkText, linkUrl, afterLink )
+                            SpanState (LinkText True "") out run linksOff
+
+                    else
+                        stepPlain c out (pushText "!" run) linksOff
+
+                Star ->
+                    if c == '*' then
+                        SpanState (Bold "" False) out run linksOff
+
+                    else
+                        SpanState (Italic (String.fromChar c)) out run linksOff
+
+                Bold buf starSeen ->
+                    if c == '*' then
+                        if starSeen then
+                            SpanState Plain (emitSpan out run (BoldSpan buf)) emptyRun linksOff
+
+                        else
+                            SpanState (Bold buf True) out run linksOff
+
+                    else if starSeen then
+                        SpanState (Bold (extend (String.append buf "*") c) False) out run linksOff
+
+                    else
+                        SpanState (Bold (extend buf c) False) out run linksOff
+
+                Italic buf ->
+                    if c == '*' then
+                        SpanState Plain (emitSpan out run (ItalicSpan buf)) emptyRun linksOff
+
+                    else
+                        SpanState (Italic (extend buf c)) out run linksOff
+
+                Code buf ->
+                    if c == '`' then
+                        SpanState Plain (emitSpan out run (CodeSpan buf)) emptyRun linksOff
+
+                    else
+                        SpanState (Code (extend buf c)) out run linksOff
+
+                LinkText image text ->
+                    if c == ']' then
+                        SpanState (LinkOpen image text) out run linksOff
+
+                    else
+                        SpanState (LinkText image (extend text c)) out run linksOff
+
+                LinkOpen image text ->
+                    if c == '(' then
+                        SpanState (LinkUrl image text "") out run linksOff
+
+                    else
+                        stepChar c (replayLink image (String.append text "]") out run)
+
+                LinkUrl image text url ->
+                    if c == ')' then
+                        SpanState Plain (emitSpan out run (linkSpan image text url)) emptyRun linksOff
+
+                    else
+                        SpanState (LinkUrl image text (extend url c)) out run linksOff
 
 
--- Parse `![alt](url)` at the current position. `s` must start with `![`.
--- Returns Nothing if the syntax does not match.
-takeImage : String -> Maybe ( String, String, String )
-takeImage s =
-    -- s starts with "!["; slice past the "!" so takeLink can parse "[alt](url)".
-    let
-        withoutBang = String.slice 1 (String.length s) s
-    in
-        case takeLink withoutBang of
+-- Feed one character to plain text: `\n` is a hard break (the run loses its
+-- trailing spaces); `!`, `*`, a backtick and `[` may open a span.
+stepPlain : Char -> List Span -> Run -> Bool -> SpanState
+stepPlain c out run linksOff =
+    if c == '\n' then
+        SpanState Plain (out ++ strippedRun run ++ [ HardBreakSpan ]) emptyRun linksOff
 
-            Just ( alt, url, after ) ->
-                Just ( alt, url, after )
+    else if c == '!' then
+        SpanState Bang out run linksOff
 
-            Nothing ->
-                Nothing
+    else if c == '*' then
+        SpanState Star out run linksOff
 
+    else if c == '`' then
+        SpanState (Code "") out run linksOff
 
--- Strip trailing ASCII spaces from a string (right-trim spaces only).
--- Used to remove the double-space hard-break marker before flushing
--- the preceding text as a plain span.
-stripTrailingSpaces : String -> String
-stripTrailingSpaces s =
-    let
-        len = String.length s
-    in
-        if len == 0 then
-            s
-
-        else if String.slice (len - 1) len s == " " then
-            stripTrailingSpaces (String.slice 0 (len - 1) s)
+    else if c == '[' then
+        if linksOff then
+            SpanState Plain out (pushText "[" run) linksOff
 
         else
-            s
+            SpanState (LinkText False "") out run linksOff
+
+    else
+        SpanState Plain out (pushChar c run) linksOff
+
+
+-- A link that cannot close reads as literal text: its opener joins the run
+-- and its buffered characters replay as plain markup with `[` literal. A `[`
+-- inside the buffer closes at the same first `]`, or meets no `)` before the
+-- end, so no inner link could have parsed; every character replays at most
+-- once.
+replayLink : Bool -> String -> List Span -> Run -> SpanState
+replayLink image raw out run =
+    linksOn (String.foldl stepChar (SpanState Plain out (pushText (linkOpener image) run) True) raw)
+
+
+linksOn : SpanState -> SpanState
+linksOn state =
+    case state of
+        SpanState mode out run _ ->
+            SpanState mode out run False
+
+
+linkOpener : Bool -> String
+linkOpener image =
+    if image then
+        "!["
+
+    else
+        "["
+
+
+linkSpan : Bool -> String -> String -> Span
+linkSpan image text url =
+    if image then
+        ImageSpan text url
+
+    else
+        LinkSpan text url
+
+
+-- Close the open span at the end of the input. An unclosed bold, italic, or
+-- code run keeps the rest of the line; a lone `!` or `*` is literal text.
+finishSpans : SpanState -> List Span
+finishSpans state =
+    case state of
+        SpanState mode out run _ ->
+            case mode of
+                Plain ->
+                    out ++ endRun run
+
+                Bang ->
+                    out ++ endRun (pushText "!" run)
+
+                Star ->
+                    out ++ endRun (pushText "*" run)
+
+                Bold buf starSeen ->
+                    emitSpan out run (BoldSpan (boldTail buf starSeen))
+
+                Italic buf ->
+                    emitSpan out run (ItalicSpan buf)
+
+                Code buf ->
+                    emitSpan out run (CodeSpan buf)
+
+                LinkText image text ->
+                    finishSpans (replayLink image text out run)
+
+                LinkOpen image text ->
+                    finishSpans (replayLink image (String.append text "]") out run)
+
+                LinkUrl image text url ->
+                    finishSpans (replayLink image (String.concat [ text, "](", url ]) out run)
+
+
+boldTail : String -> Bool -> String
+boldTail buf starSeen =
+    if starSeen then
+        String.append buf "*"
+
+    else
+        buf
+
+
+-- Append the pending run, then a finished span.
+emitSpan : List Span -> Run -> Span -> List Span
+emitSpan out run span =
+    out ++ wholeRun run ++ [ span ]
+
+
+extend : String -> Char -> String
+extend buf c =
+    String.append buf (String.fromChar c)
+
+
+pushChar : Char -> Run -> Run
+pushChar c run =
+    case run of
+        RunSpaces text n ->
+            if c == ' ' then
+                RunSpaces (extend text c) (n + 1)
+
+            else
+                RunText (extend text c) 0
+
+        RunText text k ->
+            if c == ' ' then
+                RunText (extend text c) (k + 1)
+
+            else
+                RunText (extend text c) 0
+
+
+-- Append literal markup text, which never ends in a space.
+pushText : String -> Run -> Run
+pushText s run =
+    case run of
+        RunSpaces text _ ->
+            RunText (String.append text s) 0
+
+        RunText text _ ->
+            RunText (String.append text s) 0
+
+
+wholeRun : Run -> List Span
+wholeRun run =
+    case run of
+        RunSpaces text n ->
+            if n == 0 then
+                []
+
+            else
+                [ PlainSpan text ]
+
+        RunText text _ ->
+            [ PlainSpan text ]
+
+
+strippedRun : Run -> List Span
+strippedRun run =
+    case run of
+        RunSpaces _ _ ->
+            []
+
+        RunText text k ->
+            [ PlainSpan (String.dropRight k text) ]
+
+
+-- The run at the end of the input: two or more trailing spaces are a hard
+-- break.
+endRun : Run -> List Span
+endRun run =
+    case run of
+        RunSpaces text n ->
+            if n >= 2 then
+                [ HardBreakSpan ]
+
+            else if n == 0 then
+                []
+
+            else
+                [ PlainSpan text ]
+
+        RunText text k ->
+            if k >= 2 then
+                [ PlainSpan (String.dropRight k text), HardBreakSpan ]
+
+            else
+                [ PlainSpan text ]
 
 
 -- ─── Span rendering ─────────────────────────────────────────────────────────

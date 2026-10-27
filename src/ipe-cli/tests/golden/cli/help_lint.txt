@@ -8,7 +8,7 @@ exit: 0
   ipe lint [<path>]
 
   Arguments:
-    A source file or a project directory to lint. Defaults to the current project.
+    A module file of this project, whose findings alone are reported and fixed, or a project directory. Defaults to the current directory's project, every module.
 
   Options:
     [--fix]    apply every machine-applicable (semantics-preserving) fix instead of only reporting

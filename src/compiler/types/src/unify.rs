@@ -30,7 +30,7 @@ use std::collections::BTreeMap;
 use ipe_diagnostics::{DResult, Diagnostic, Span, TypeError};
 use ipe_intern::Interner;
 
-use crate::constrain::zonk;
+use crate::constrain::zonk_reported;
 use crate::doc::{VarNamer, ty_to_doc};
 use crate::homed::{InferError, ModuleHome};
 use crate::solve::Budget;
@@ -269,7 +269,7 @@ fn unify_step(
                 // An interpolation hole names the capability the value lacks
                 // (IPE-T0014), not a bare shape mismatch against no written type.
                 let structure_var = if a_is_structure { ra } else { rb };
-                let ty = zonk(uf, budget, structure_var)?;
+                let ty = zonk_reported(uf, budget, structure_var, span)?;
                 Err(crate::super_unsatisfied(interner, bounds, &ty, span))
             } else {
                 Err(mismatch(uf, budget, interner, span, ra, rb))
@@ -458,12 +458,18 @@ pub fn con_heads_compatible(
 ///   so any non-empty home for one is a builtin qualifier, never a user shadow.
 ///
 /// Everything else — a name with a *user* home (`type Order` in `Main` →
-/// `[Main]`) — is a genuinely distinct type and does NOT unify.
+/// `[Main]`), or a stdlib union listed in [`STDLIB_DISTINCT_UNIONS`] — is a
+/// genuinely distinct type and does NOT unify. A listed stdlib union is
+/// distinct even when its name is reserved (`Ipe.Css`'s `Length`): the listing
+/// is checked before either admitting shape.
 fn empty_home_compat(
     other_home: &[ipe_intern::Symbol],
     name: ipe_intern::Symbol,
     interner: &Interner,
 ) -> bool {
+    if is_stdlib_distinct_union(other_home, name, interner) {
+        return false;
+    }
     let ipe_rooted = other_home
         .first()
         .and_then(|s| interner.resolve(*s))
@@ -479,6 +485,48 @@ fn empty_home_compat(
 /// so an `Ipe`-rooted home is always the stdlib spelling of a builtin, never a
 /// user shadow.
 const IPE_STDLIB_ROOT: &str = "Ipe";
+
+/// Stdlib unions that share a builtin type name but are a different type.
+///
+/// Each entry is `(home, name)`. Such a union is its own head: its `Ipe`-rooted
+/// home must never merge with the empty-home builtin of the same name, or a
+/// value of one type would type-check where the other is expected
+/// (`Store.Asc == LT`, a `Css.Color` passed to `Color.toHex`). A test scans
+/// every stdlib source and fails when a union named like any builtin type
+/// (a builtin union, a reserved builtin name, or an empty-home type a kernel
+/// scheme mints) is neither that builtin's own spelling nor listed here, so a
+/// new colliding declaration cannot silently merge.
+pub const STDLIB_DISTINCT_UNIONS: &[(&[&str], &str)] = &[
+    // The CSS colour ADT, distinct from the opaque runtime `Color`.
+    (&["Ipe", "Css"], "Color"),
+    // The CSS length ADT, distinct from the opaque `Ipe.Ui` `Length`.
+    (&["Ipe", "Css"], "Length"),
+    // The join sort direction `Asc | Desc`, distinct from the comparison `Order`.
+    (&["Ipe", "Db", "Store"], "Order"),
+    // The typed table handle, distinct from the opaque web-session `Store`.
+    (&["Ipe", "Db", "Store"], "Store"),
+];
+
+/// Whether `home.name` is listed in [`STDLIB_DISTINCT_UNIONS`].
+fn is_stdlib_distinct_union(
+    home: &[ipe_intern::Symbol],
+    name: ipe_intern::Symbol,
+    interner: &Interner,
+) -> bool {
+    let Some(name) = interner.resolve(name) else {
+        return false;
+    };
+    STDLIB_DISTINCT_UNIONS
+        .iter()
+        .any(|(entry_home, entry_name)| {
+            *entry_name == name
+                && entry_home.len() == home.len()
+                && entry_home
+                    .iter()
+                    .zip(home)
+                    .all(|(want, got)| interner.resolve(*got).is_some_and(|got| got == *want))
+        })
+}
 
 /// Whether merging `ra` and `rb` would make the surviving class a direct child
 /// of itself — a depth-one cycle (`t = List t`) the structure-vs-structure path
@@ -882,11 +930,11 @@ fn mismatch(
     expected: VarId,
 ) -> Diagnostic {
     let mut namer = VarNamer::new();
-    let expected_ty = match zonk(uf, budget, expected) {
+    let expected_ty = match zonk_reported(uf, budget, expected, span) {
         Ok(t) => t,
         Err(bug) => return bug,
     };
-    let found_ty = match zonk(uf, budget, found) {
+    let found_ty = match zonk_reported(uf, budget, found, span) {
         Ok(t) => t,
         Err(bug) => return bug,
     };
@@ -967,7 +1015,7 @@ fn infinite_type(
     let mut namer = VarNamer::new();
     // Name the variable first so it reads as `a` and any same var inside the
     // structure renders consistently.
-    let var_ty = match zonk(uf, budget, var) {
+    let var_ty = match zonk_reported(uf, budget, var, span) {
         Ok(t) => t,
         Err(bug) => return bug,
     };
@@ -978,7 +1026,7 @@ fn infinite_type(
         Ok(_) => Box::from("?"),
         Err(bug) => return bug,
     };
-    let structure_ty = match zonk(uf, budget, structure) {
+    let structure_ty = match zonk_reported(uf, budget, structure, span) {
         Ok(t) => t,
         Err(bug) => return bug,
     };
@@ -1535,5 +1583,81 @@ mod tests {
             result.is_err(),
             "a non-builtin name with an empty home must not wildcard-match a user home"
         );
+    }
+
+    /// Intern a dotted module path into its home segments.
+    fn home(interner: &mut Interner, dotted: &str) -> Vec<ipe_intern::Symbol> {
+        dotted
+            .split('.')
+            .map(|seg| interner.intern(seg).unwrap())
+            .collect()
+    }
+
+    /// A stdlib union listed as distinct never shares a head with the builtin of
+    /// its name, while every other `Ipe`-rooted spelling still does.
+    #[test]
+    fn stdlib_distinct_union_is_its_own_head() {
+        let mut interner = Interner::new();
+        let order = interner.intern("Order").unwrap();
+        let store = home(&mut interner, "Ipe.Db.Store");
+        let basics = home(&mut interner, "Ipe.Basics");
+        assert!(
+            !con_heads_compatible(&store, order, &[], order, &interner),
+            "`Ipe.Db.Store.Order` (`Asc | Desc`) must not merge with the builtin `Order`"
+        );
+        assert!(
+            !con_heads_compatible(&[], order, &store, order, &interner),
+            "the refusal must hold with the builtin on either side"
+        );
+        assert!(
+            con_heads_compatible(&basics, order, &[], order, &interner),
+            "`Basics.Order` is the stdlib spelling of the builtin `Order`"
+        );
+        assert!(
+            con_heads_compatible(&store, order, &store, order, &interner),
+            "`Ipe.Db.Store.Order` is still identical to itself"
+        );
+    }
+
+    /// The distinct-union lookup matches the whole home, never a prefix or an
+    /// extension of a listed one.
+    #[test]
+    fn stdlib_distinct_union_matches_the_exact_home() {
+        let mut interner = Interner::new();
+        let order = interner.intern("Order").unwrap();
+        let prefix = home(&mut interner, "Ipe.Db");
+        let longer = home(&mut interner, "Ipe.Db.Store.Inner");
+        let exact = home(&mut interner, "Ipe.Db.Store");
+        assert!(!is_stdlib_distinct_union(&prefix, order, &interner));
+        assert!(!is_stdlib_distinct_union(&longer, order, &interner));
+        assert!(is_stdlib_distinct_union(&exact, order, &interner));
+    }
+
+    /// Every listed distinct union is its own head, including one whose name is
+    /// reserved (`Ipe.Css`'s `Length`) or an opaque builtin (`Ipe.Css`'s
+    /// `Color`, `Ipe.Db.Store`'s `Store`).
+    #[test]
+    fn every_listed_distinct_union_is_its_own_head() {
+        let mut interner = Interner::new();
+        for (owner_path, name) in STDLIB_DISTINCT_UNIONS {
+            let owner: Vec<ipe_intern::Symbol> = owner_path
+                .iter()
+                .map(|seg| interner.intern(seg).unwrap())
+                .collect();
+            let owner = &owner;
+            let sym = interner.intern(name).unwrap();
+            assert!(
+                !con_heads_compatible(owner, sym, &[], sym, &interner),
+                "a stdlib `{name}` ADT must not merge with the builtin `{name}`"
+            );
+            assert!(
+                !con_heads_compatible(&[], sym, owner, sym, &interner),
+                "the `{name}` refusal must hold with the builtin on either side"
+            );
+            assert!(
+                con_heads_compatible(owner, sym, owner, sym, &interner),
+                "a stdlib `{name}` ADT is still identical to itself"
+            );
+        }
     }
 }

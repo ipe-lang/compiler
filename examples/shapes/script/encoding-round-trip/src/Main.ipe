@@ -1,8 +1,8 @@
 module Main exposing (main)
 
 import Ipe.Encoding as Encoding
-import Ipe.Result as Result exposing (Result(..))
 import Ipe.Io as Io
+import Ipe.Result as Result exposing (Result(..))
 
 
 -- Round-trip a value through three text encodings — base64, percent (URL), and
@@ -28,7 +28,6 @@ roundTrip label encode decode =
 
         verdict =
             case decode encoded of
-
                 Ok back ->
                     if back == payload then
                         "round-trips"
@@ -47,7 +46,6 @@ roundTrip label encode decode =
 badDecode : String
 badDecode =
     case Encoding.base64Decode "!!!" of
-
         Ok _ ->
             "unexpectedly decoded"
 

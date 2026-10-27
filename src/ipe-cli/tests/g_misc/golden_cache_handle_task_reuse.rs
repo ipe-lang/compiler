@@ -22,19 +22,18 @@ fn repo_root() -> PathBuf {
     std::fs::canonicalize(&joined).unwrap_or(joined)
 }
 
-fn fixture_entry(root: &Path) -> PathBuf {
+fn fixture_project(root: &Path) -> PathBuf {
     root.join("tests")
         .join("golden")
         .join("cache_handle_task_reuse")
-        .join("Main.ipe")
 }
 
 /// Build the fixture; return whether the frontend accepted + emitted it.
 fn built(root: &Path, out: &Path) -> Result<(), ipe::CliError> {
-    let entry = fixture_entry(root);
+    let entry = fixture_project(root);
     let _ = std::fs::remove_dir_all(out);
     let runtime = e2e_support::require_runtime().into_path_buf();
-    ipe::build(&entry, out, &runtime)
+    crate::support::build_golden(&entry, out, &runtime)
 }
 
 /// Emit assertion (default gate): the frontend must accept the handle-reuse

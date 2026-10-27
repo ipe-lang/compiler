@@ -23,43 +23,29 @@
 //! ```
 
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
-fn write_project(dir: &Path, main: &str) -> bool {
-    let src = dir.join("src");
-    let _ = fs::remove_dir_all(dir);
-    if fs::create_dir_all(&src).is_err() {
-        return false;
-    }
-    fs::write(src.join("Main.ipe"), main).is_ok()
+/// A project fixture whose only module `Main` holds `main`.
+#[allow(clippy::expect_used)] // a fixture-setup failure must fail the test loudly
+fn write_project(main: &str) -> ipe::RootFixture {
+    ipe::RootFixture::main(main).expect("the fixture project resolves")
 }
 
 /// Compile `main` (a full `Main.ipe` program) through the ipe frontend into an
-/// emitted Rust project rooted at a per-`slug` temp dir. Asserts ipe exit 0 —
+/// emitted Rust project in a per-call output dir. Asserts ipe exit 0 —
 /// a resolution/seal regression fails loudly. Returns the emitted-project dir.
 #[allow(clippy::panic)] // a refused well-formed program is the test failure
 fn compile_module_probe(slug: &str, main: &str) -> PathBuf {
-    // Unique dir PER CALL AND PER PROCESS: the `_resolves_and_emits` and
-    // `_builds_and_runs` tests for one module share a slug and run concurrently under
-    // nextest, so a shared temp dir races (write vs remove_dir_all) and flakily fails
-    // write_project. The per-call counter alone is per-process, so two parallel test
-    // binaries restart at 0 and collide on the same path under the shared temp_dir;
-    // folding the PID in makes the path unforgeably unique across processes too.
     // Declared at scope top (before any statement) to satisfy
     // clippy::items_after_statements.
     static PROBE_SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
     let runtime = e2e_support::require_runtime().into_path_buf();
     let uid = PROBE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let pid = std::process::id();
-    let tmp = crate::support::scratch_root().join(format!("ipec_stdlib_seal_{slug}_{pid}_{uid}"));
-    assert!(
-        write_project(&tmp, main),
-        "must write the {slug} fixture project"
-    );
-    let entry = tmp.join("src").join("Main.ipe");
-    // Fold the PID into the emitted-project path too (as the source `tmp` above
-    // already does): a module's `_resolves_and_emits` and `_builds_and_runs`
-    // tests share a slug and the per-process `uid` counter both restart at 0, so
+    let fixture = write_project(main);
+    // Unique output dir PER CALL AND PER PROCESS: a module's `_resolves_and_emits`
+    // and `_builds_and_runs` tests share a slug and the per-process `uid` counter
+    // restarts at 0 in each test binary, so
     // without the PID two parallel test binaries collide on one `_out` path and
     // one test's start-of-run teardown unlinks the cwd of the other's live
     // `cargo build`, whose `rustc` then cannot locate its working directory.
@@ -67,7 +53,7 @@ fn compile_module_probe(slug: &str, main: &str) -> PathBuf {
         .join(format!("stdlib_seal_{slug}_{pid}_{uid}_out"));
     let _ = fs::remove_dir_all(&out);
 
-    let built = ipe::build_loose_file(&entry, &out, &runtime);
+    let built = ipe::build_fixture(&fixture, &out, &runtime);
     if let Err(e) = built {
         panic!("module `{slug}` must resolve + emit through ipec (exit 0), got: {e:?}");
     }
@@ -574,18 +560,10 @@ fn pubsub_topic_type_mismatch_is_rejected() {
     static SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
     let runtime = e2e_support::require_runtime().into_path_buf();
     let uid = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    // Fold the PID in so two parallel test binaries never collide on the shared
-    // temp_dir (the per-process counter alone restarts at 0 in each binary).
-    let pid = std::process::id();
-    let tmp = crate::support::scratch_root().join(format!("ipec_pubsub_mismatch_{pid}_{uid}"));
-    assert!(
-        write_project(&tmp, PUBSUB_TOPIC_MISMATCH),
-        "must write the pubsub_mismatch fixture"
-    );
-    let entry = tmp.join("src").join("Main.ipe");
+    let fixture = write_project(PUBSUB_TOPIC_MISMATCH);
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("pubsub_mismatch_{uid}_out"));
     let _ = fs::remove_dir_all(&out);
-    let res = ipe::build_loose_file(&entry, &out, &runtime);
+    let res = ipe::build_fixture(&fixture, &out, &runtime);
     assert!(
         res.is_err(),
         "mismatched Topic types (Int vs String) must be rejected; got Ok(_)"
@@ -887,4 +865,62 @@ fn markdown_features_builds_and_runs() {
         "trailing double-space must render a <br>:\n{}",
         out.stdout
     );
+}
+
+// ── A message parameter also used outside its slot ────────────────
+
+/// `wrap` uses `a` in `List a` and in `Html a`; `wrap []` inside a page
+/// fixes it by the page, so one Rust type reads both positions.
+const MIXED_MSG_PARAM_MAIN: &str = "module Main exposing (main)
+import Ipe.Io as Io
+import Ipe.Html as Html exposing (Html)
+
+wrap : List a -> Html a
+wrap xs =
+    Html.div [] []
+
+main =
+    Io.println (Html.htmlRender (Html.div [] [ wrap [] ]))
+";
+
+#[test]
+fn a_mixed_message_parameter_fixed_by_its_page_builds_and_runs() {
+    seal_module(
+        "mixed_msg_param",
+        MIXED_MSG_PARAM_MAIN,
+        "<div><div></div></div>",
+    );
+}
+
+// ── A generic only the return names, left open beside a sibling default ──
+
+/// `mk`'s `e` is named by its return's error slot alone, so the use pins
+/// nothing and the `Ok 4` sibling's wrapper fixes it. `pick` keeps `e`
+/// generic, so its own `Ok 4` stays `IpeResult::Ok` over that generic; `pick`
+/// is declared but never applied, because applying it leaves `e` with no
+/// reading at all.
+const OPEN_RESULT_ERROR_MAIN: &str = "module Main exposing (main)
+import Ipe.Io as Io
+import Ipe.String as String
+
+mk : Int -> Result e Int
+mk n =
+    Ok n
+
+pick : Bool -> Result e Int
+pick c =
+    if c then mk 3 else Ok 4
+
+shown r =
+    case r of
+        Ok n -> String.fromInt n
+        Err _ -> \"err\"
+
+main =
+    Io.println (shown (if String.length \"a\" > 0 then mk 3 else Ok 4))
+";
+
+#[test]
+fn an_open_result_error_beside_ok_builds_and_runs() {
+    seal_module("open_result_error", OPEN_RESULT_ERROR_MAIN, "3");
 }

@@ -1,8 +1,8 @@
 module Main exposing (main)
 
 import Ipe.Bitwise as Bitwise
-import Ipe.String as String
 import Ipe.Io as Io
+import Ipe.String as String
 
 
 -- A permission set packed into the low bits of one `Int`. Each capability is a

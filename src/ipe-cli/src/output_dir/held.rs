@@ -26,18 +26,19 @@
 //! write acts live in `unix` (descriptor-relative `*at` calls) and `windows`
 //! (handle-relative creates and deletes; path acts run under a sentinel pin).
 
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 use std::fs::File;
 use std::io::{self, Read as _, Seek as _, SeekFrom, Write as _};
 use std::num::NonZeroU64;
 use std::path::{Path, PathBuf};
 
-use ipe_fs_open::{ByteCap, EntryName, FileId, FileKind, OpenRefusal, RegularFile};
+use ipe_fs_open::{ByteCap, EntryCap, EntryName, FileId, FileKind, OpenRefusal, RegularFile};
 
 use super::{
     CLAIM_FILE, CLAIM_POLL, MARKER_HEADER, MARKER_READ_CAP, MARKER_TEXT, MAX_CLAIM_POLLS,
     OWNERSHIP_MARKER, OutputRefusal, Tolerated, temp_suffix, tolerated_entry,
 };
+use crate::io_bounded::{read_proven, refusal_error};
 use crate::{CliError, io_err};
 
 #[cfg(unix)]
@@ -133,6 +134,27 @@ pub enum EntryKind {
     Symlink,
     /// Anything else: a regular file, a FIFO, a socket, a device.
     Other,
+}
+
+/// One entry a directory listing yields, its name parsed once.
+///
+/// A listing hands its consumers this, never a raw name, so no consumer
+/// re-parses a name or carries one it could not act on: an `Entry` is opened
+/// handle-relative, an `Unnameable` one is reported by name and never acted on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Listed {
+    /// A name a held handle opens as the entry it spells.
+    Entry(EntryName),
+    /// A name no held handle can open (on Windows, one not valid Unicode or one Win32 reserves).
+    Unnameable(OsString),
+}
+
+impl Listed {
+    /// The listing entry `name`, parsed by the one entry-name rule.
+    #[must_use]
+    pub fn of(name: &OsStr) -> Self {
+        EntryName::new(name).map_or_else(|| Self::Unnameable(name.to_os_string()), Self::Entry)
+    }
 }
 
 /// An open directory handle and the path it was reached by.
@@ -317,26 +339,23 @@ impl HeldDir {
     /// The entry `name` of this directory as one plain entry name.
     ///
     /// # Errors
-    /// [`CliError::Io`] of [`io::ErrorKind::InvalidInput`] when it is not one.
-    fn entry(&self, name: &OsStr) -> Result<EntryName, CliError> {
-        EntryName::new(name).ok_or_else(|| {
-            act_err(
-                &self.path.join(name),
-                io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    format!("{} is not a plain entry name", name.to_string_lossy()),
-                ),
-            )
-        })
+    /// [`OutputRefusal::UnnameableEntry`] when it is not one.
+    pub fn entry(&self, name: &OsStr) -> Result<EntryName, CliError> {
+        EntryName::new(name)
+            .ok_or_else(|| OutputRefusal::UnnameableEntry(self.path.join(name)).into())
+    }
+
+    /// The refusal of the listed entry `name`, which no held handle can open.
+    fn unnameable(&self, name: &OsStr) -> CliError {
+        OutputRefusal::UnnameableEntry(self.path.join(name)).into()
     }
 
     /// Classify the entry `name` without following a link.
     ///
     /// # Errors
     /// [`CliError::Io`] on a failure other than absence.
-    pub fn kind_of(&self, name: &OsStr) -> Result<EntryKind, CliError> {
-        let entry = self.entry(name)?;
-        match self.dir.kind_of(&entry) {
+    pub fn kind_of(&self, name: &EntryName) -> Result<EntryKind, CliError> {
+        match self.dir.kind_of(name) {
             Ok(None) => Ok(EntryKind::Absent),
             Ok(Some(FileKind::Dir)) => Ok(EntryKind::Directory),
             Ok(Some(FileKind::Symlink)) => Ok(EntryKind::Symlink),
@@ -347,8 +366,53 @@ impl HeldDir {
                 | FileKind::Device
                 | FileKind::Other,
             )) => Ok(EntryKind::Other),
-            Err(refusal) => Err(refused(&self.path.join(name), refusal)),
+            Err(refusal) => Err(refused(&self.path.join(name.as_os_str()), refusal)),
         }
+    }
+
+    /// Every entry of this directory and its kind, listed through the held handle.
+    ///
+    /// Names keep their exact on-disk spelling (no case folding), and a link
+    /// (on Windows, any reparse point) is reported as [`FileKind::Symlink`],
+    /// never followed. The listing is [`ipe_fs_open::HeldDir::entries`].
+    ///
+    /// # Errors
+    /// [`CliError::DiscoveryLimitReached`] when the directory holds more than
+    /// `cap` entries; otherwise the source-read refusal of the listing
+    /// ([`refusal_error`]).
+    pub fn list_names(&self, cap: EntryCap) -> Result<Vec<(EntryName, FileKind)>, CliError> {
+        self.dir.entries(cap).map_err(|refusal| match refusal {
+            OpenRefusal::TooManyEntries(cap) => CliError::DiscoveryLimitReached {
+                detail: format!(
+                    "`{}` holds more than {} entries",
+                    self.path.display(),
+                    cap.get()
+                ),
+            },
+            other => refusal_error(&self.path, other),
+        })
+    }
+
+    /// The UTF-8 text of the regular file `name`, opened through the held handle under `cap`.
+    ///
+    /// The entry is opened without following a link and without blocking,
+    /// proven regular on its own handle, and read at most one byte past
+    /// `cap` ([`ipe_fs_open::HeldDir::open_regular`], then [`read_proven`]).
+    /// `name` is looked up as the file system matches names, case-insensitively
+    /// on a case-insensitive volume: only a name taken from [`HeldDir::list_names`]
+    /// is the on-disk spelling.
+    ///
+    /// # Errors
+    /// [`CliError::SourceRefused`] for a link, a non-regular entry, or a denied
+    /// open; [`CliError::FileTooLarge`] past `cap`; [`CliError::Io`] for an
+    /// absent entry, content that is not UTF-8, or another failure.
+    pub fn read_file_capped(&self, name: &EntryName, cap: ByteCap) -> Result<String, CliError> {
+        let path = self.path.join(name.as_os_str());
+        let file = self
+            .dir
+            .open_regular(name)
+            .map_err(|refusal| refusal_error(&path, refusal))?;
+        read_proven(file, &path, cap)
     }
 
     /// Open the subdirectory `name`, refusing a link or a non-directory.
@@ -529,19 +593,17 @@ impl HeldDir {
     fn has_foreign_entry(&self) -> Result<bool, CliError> {
         let names = sys::names(&self.dir).map_err(|e| act_err(&self.path, e))?;
         for name in names {
-            let name = match name {
-                Ok(name) => name,
+            let entry = match name {
+                Ok(Listed::Entry(entry)) => entry,
+                Ok(Listed::Unnameable(_)) => return Ok(true),
                 Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
                 Err(e) => return Err(act_err(&self.path, e)),
             };
-            let Some(entry) = EntryName::new(&name) else {
-                return Ok(true);
-            };
             let foreign = match self.dir.kind_of(&entry) {
                 Ok(None) => false,
-                Ok(Some(kind)) => tolerated_entry(&name, kind) == Tolerated::Foreign,
+                Ok(Some(kind)) => tolerated_entry(entry.as_os_str(), kind) == Tolerated::Foreign,
                 Err(OpenRefusal::Denied) => true,
-                Err(refusal) => return Err(refused(&self.path.join(&name), refusal)),
+                Err(refusal) => return Err(refused(&self.path.join(entry.as_os_str()), refusal)),
             };
             if foreign {
                 return Ok(true);
@@ -906,19 +968,19 @@ impl HeldDir {
         if Self::is_reserved(name) {
             return Err(OutputRefusal::UnsafeComponent(self.path.join(name)).into());
         }
-        if self.kind_of(name)? == EntryKind::Symlink {
+        if self.kind_of(&self.entry(name)?)? == EntryKind::Symlink {
             return Err(OutputRefusal::Symlink(self.path.join(name)).into());
         }
         let tmp = format!(".{}.ipe-tmp.{}", name.to_string_lossy(), temp_suffix());
         self.replace_file(name, OsStr::new(&tmp), permissions, fill)
     }
 
-    /// Whether `name` spells the marker or the claim name, in any ASCII case.
+    /// Whether a case-folding volume may open `name` as the marker or the
+    /// claim file ([`ipe_fs_open::may_open_as`]).
     fn is_reserved(name: &OsStr) -> bool {
-        let name = name.to_string_lossy();
         [OWNERSHIP_MARKER, CLAIM_FILE]
             .into_iter()
-            .any(|reserved| name.eq_ignore_ascii_case(reserved))
+            .any(|reserved| ipe_fs_open::may_open_as(name, reserved))
     }
 
     /// Fill the new file `tmp`, then rename it over `name`; `tmp` is removed on failure.
@@ -954,7 +1016,7 @@ impl HeldDir {
     /// [`OutputRefusal::Symlink`]; [`OutputRefusal::TooDeep`] for a tree nested
     /// deeper than [`MAX_REMOVE_DEPTH`]; [`CliError::Io`] on a filesystem failure.
     pub fn remove_entry(&self, name: &OsStr) -> Result<(), CliError> {
-        match self.kind_of(name)? {
+        match self.kind_of(&self.entry(name)?)? {
             EntryKind::Absent => Ok(()),
             EntryKind::Symlink => Err(OutputRefusal::Symlink(self.path.join(name)).into()),
             EntryKind::Directory => self.remove_dir(name, 0),
@@ -1012,15 +1074,17 @@ impl HeldDir {
     fn remove_contents(&self, depth: usize) -> Result<(), CliError> {
         let names = sys::names(&self.dir).map_err(|e| act_err(&self.path, e))?;
         for name in names {
-            let name = match name {
-                Ok(name) => name,
+            let entry = match name {
+                Ok(Listed::Entry(entry)) => entry,
+                Ok(Listed::Unnameable(name)) => return Err(self.unnameable(&name)),
                 Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
                 Err(e) => return Err(act_err(&self.path, e)),
             };
-            match self.kind_of(&name)? {
+            let name = entry.as_os_str();
+            match self.kind_of(&entry)? {
                 EntryKind::Absent => {}
-                EntryKind::Directory => self.remove_dir(&name, depth.saturating_add(1))?,
-                EntryKind::Symlink | EntryKind::Other => self.unlink(&name)?,
+                EntryKind::Directory => self.remove_dir(name, depth.saturating_add(1))?,
+                EntryKind::Symlink | EntryKind::Other => self.unlink(name)?,
             }
         }
         Ok(())
@@ -1040,13 +1104,26 @@ impl HeldDir {
         }
     }
 
-    /// Whether looking `path` up now reaches this very directory.
+    /// Whether opening `path` now holds this very directory.
+    ///
+    /// `path` is opened as [`HeldDir::open`] opens it: its parent followed,
+    /// its final component never. An absent `path`, a link, or a
+    /// non-directory there holds no directory, so it is not this one.
     ///
     /// # Errors
-    /// [`CliError::Io`] when `path` cannot be stat'd or the handle cannot be.
+    /// [`CliError::Io`] when `path` cannot be opened or either handle cannot
+    /// be stat'd; [`OutputRefusal::UnnameableEntry`] for a final component
+    /// no held handle can open.
     pub fn is_at(&self, path: &Path) -> Result<bool, CliError> {
-        let found = DirId::of_path(path).map_err(|refusal| refused(path, refusal))?;
-        Ok(found == self.id()?)
+        let found = match Self::open(path) {
+            Ok(Some(found)) => found,
+            Ok(None)
+            | Err(CliError::OutputRefused(
+                OutputRefusal::Symlink(_) | OutputRefusal::NotADirectory(_),
+            )) => return Ok(false),
+            Err(other) => return Err(other),
+        };
+        Ok(found.id()? == self.id()?)
     }
 
     /// Empty the held subdirectory `child`, then remove the entry `name` it was opened as.
@@ -1059,7 +1136,8 @@ impl HeldDir {
     /// [`OutputRefusal::Replaced`] when `name` no longer names `child`;
     /// [`OutputRefusal::Symlink`] for a link there; [`OutputRefusal::TooDeep`];
     /// [`OutputRefusal::InUse`] for an entry another program holds open
-    /// (Windows); [`CliError::Io`] on another filesystem failure.
+    /// (Windows); [`OutputRefusal::UnnameableEntry`] for a listed entry no
+    /// held handle can open; [`CliError::Io`] on another filesystem failure.
     pub fn remove_proven(&self, name: &OsStr, child: Self) -> Result<(), CliError> {
         self.remove_held(name, child, 0)
     }
@@ -1180,15 +1258,17 @@ impl HeldDir {
         }
         let names = sys::names(&self.dir).map_err(|e| act_err(&self.path, e))?;
         for name in names {
-            let name = match name {
-                Ok(name) => name,
+            let entry = match name {
+                Ok(Listed::Entry(entry)) => entry,
+                Ok(Listed::Unnameable(name)) => return Err(self.unnameable(&name)),
                 Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
                 Err(e) => return Err(act_err(&self.path, e)),
             };
-            rel.push(&name);
-            let result = match self.kind_of(&name) {
+            let name = entry.as_os_str();
+            rel.push(name);
+            let result = match self.kind_of(&entry) {
                 Ok(EntryKind::Absent) => Ok(()),
-                Ok(EntryKind::Directory) => self.child(&name).and_then(|child| {
+                Ok(EntryKind::Directory) => self.child(name).and_then(|child| {
                     child.map_or(Ok(()), |child| {
                         level_held(child.path());
                         child.prune(rel, keep, depth.saturating_add(1), max_depth)
@@ -1198,7 +1278,7 @@ impl HeldDir {
                     if keep(rel) {
                         Ok(())
                     } else {
-                        self.unlink(&name)
+                        self.unlink(name)
                     }
                 }
                 Err(e) => Err(e),
@@ -1364,6 +1444,93 @@ mod tests {
 
     use std::cell::Cell;
     use std::rc::Rc;
+
+    /// A listed name `EntryName::new` refuses is unnameable; one it admits is the entry it spells.
+    #[test]
+    fn listed_refuses_what_entry_name_refuses() {
+        for raw in ["", ".", "..", "a/b", "a\0b"] {
+            let listed = Listed::of(OsStr::new(raw));
+            assert_eq!(
+                listed,
+                Listed::Unnameable(OsString::from(raw)),
+                "{raw:?} must be unnameable"
+            );
+        }
+        for raw in ["plain", ".ipe-output", "with space", "caf\u{e9}"] {
+            let listed = Listed::of(OsStr::new(raw));
+            assert!(
+                matches!(&listed, Listed::Entry(entry) if entry.as_os_str() == raw),
+                "{raw:?} must be listed as itself, got {listed:?}"
+            );
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt as _;
+            let bytes = OsStr::from_bytes(b"not-utf8-\xff");
+            let listed = Listed::of(bytes);
+            assert!(
+                matches!(&listed, Listed::Entry(entry) if entry.as_os_str() == bytes),
+                "a Unix name of plain bytes is an entry, got {listed:?}"
+            );
+        }
+    }
+
+    /// No listing consumer takes a raw name: classification takes an `EntryName` and errors are typed.
+    #[test]
+    fn no_listing_consumer_takes_a_raw_name() {
+        let source = include_str!("held.rs");
+        for forbidden in [
+            concat!("fn kind_of(&self, name: ", "&OsStr"),
+            concat!("is not a plain ", "entry name"),
+        ] {
+            assert!(
+                !source.contains(forbidden),
+                "held.rs must not hold {forbidden:?}"
+            );
+        }
+    }
+
+    /// No identity is read from a path: every `FileId` comes from an open handle.
+    #[test]
+    fn no_file_id_from_a_path() {
+        let source = include_str!("held.rs");
+        for banned in [
+            concat!("fn of", "_path"),
+            concat!("fn id_of", "_path"),
+            concat!("::of", "_path("),
+            concat!("id_of", "_path("),
+        ] {
+            assert!(
+                !source.contains(banned),
+                "held.rs reads an identity from a path through {banned:?}"
+            );
+        }
+    }
+
+    /// A listed entry no held handle can open blocks a removal by name and leaves its directory intact.
+    #[cfg(windows)]
+    #[test]
+    fn a_non_unicode_entry_blocks_clean_and_is_named() {
+        use std::os::windows::ffi::OsStringExt as _;
+        let base = scratch("non-unicode-entry");
+        let name = OsStr::new("held");
+        let dir = base.join(name);
+        std::fs::create_dir_all(&dir).expect("make held");
+        let lone = OsString::from_wide(&[0x61, 0xD800]);
+        std::fs::write(dir.join(&lone), "x").expect("NTFS stores a lone surrogate name");
+        let (parent, child) = hold(&base, name);
+        let result = parent.remove_proven(name, child);
+        assert!(
+            matches!(
+                &result,
+                Err(CliError::OutputRefused(OutputRefusal::UnnameableEntry(path)))
+                    if path == &dir.join(&lone)
+            ),
+            "an unnameable entry must be named, got {result:?}"
+        );
+        assert!(dir.join(&lone).exists(), "the directory is left intact");
+        let _ = std::fs::remove_dir_all(&base);
+    }
 
     /// A fresh, empty scratch directory unique to this test process.
     fn scratch(tag: &str) -> PathBuf {
@@ -1727,6 +1894,56 @@ mod tests {
         HeldDir::open(path).expect("open dir").expect("dir exists")
     }
 
+    /// The identity of the file at `path`, read from a handle opened on it.
+    fn file_id_at(path: &Path) -> Option<FileId> {
+        std::fs::File::open(path)
+            .ok()
+            .and_then(|file| FileId::of_file(&file).ok())
+    }
+
+    /// A link to the held directory is not the directory: `is_at` holds it false.
+    #[cfg(unix)]
+    #[test]
+    fn is_at_refuses_a_link_to_the_held_dir() {
+        let base = scratch("is_at_link");
+        let real = base.join("real");
+        std::fs::create_dir(&real).expect("make real");
+        let link = base.join("link");
+        std::os::unix::fs::symlink(&real, &link).expect("plant link");
+        let dir = held_at(&real);
+        assert!(
+            matches!(dir.is_at(&real), Ok(true)),
+            "the held directory is at its own path"
+        );
+        assert!(
+            matches!(
+                HeldDir::open(&link),
+                Err(CliError::OutputRefused(OutputRefusal::Symlink(_)))
+            ),
+            "the link is refused as a link"
+        );
+        let through_link = dir.is_at(&link);
+        assert!(
+            matches!(through_link, Ok(false)),
+            "a link to the held directory is not it, got {through_link:?}"
+        );
+        let absent = dir.is_at(&base.join("absent"));
+        assert!(
+            matches!(absent, Ok(false)),
+            "an absent path is not it, got {absent:?}"
+        );
+        let other = base.join("other");
+        std::fs::create_dir(&other).expect("make other");
+        assert!(
+            matches!(dir.is_at(&other), Ok(false)),
+            "another directory is not it"
+        );
+        std::fs::write(base.join("file"), "x").expect("make file");
+        let file = dir.is_at(&base.join("file"));
+        assert!(matches!(file, Ok(false)), "a file is not it, got {file:?}");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
     /// Run `act` once, at the first time a claim reaches `at` on this thread.
     fn at_claim_point(at: ClaimPoint, act: impl FnOnce() + 'static) {
         let mut act = Some(act);
@@ -1836,14 +2053,14 @@ mod tests {
         at_claim_point(ClaimPoint::AfterLock, move || {
             std::fs::write(&written, MARKER_TEXT).expect("committed marker");
             std::fs::write(&filled, "built").expect("committed output");
-            seen.set(FileId::of_path(&written).ok());
+            seen.set(file_id_at(&written));
         });
         let claimed = held_at(&dir).claim();
         set_claim_hook(None);
         assert!(claimed.is_ok(), "claimed, got {claimed:?}");
         assert!(committed.get().is_some(), "the other claim committed");
         assert_eq!(
-            FileId::of_path(&marker).ok(),
+            file_id_at(&marker),
             committed.get(),
             "the committed marker is the one kept"
         );
@@ -1860,11 +2077,11 @@ mod tests {
         let dir = scratch("claim_stale_pending");
         let claim = dir.join(CLAIM_FILE);
         std::fs::write(&claim, b"").expect("stale claim file");
-        let stale = FileId::of_path(&claim).expect("stale id");
+        let stale = file_id_at(&claim).expect("stale id");
         let locked = Rc::new(Cell::new(None));
         let (seen, at) = (Rc::clone(&locked), claim.clone());
         at_claim_point(ClaimPoint::AfterLock, move || {
-            seen.set(FileId::of_path(&at).ok());
+            seen.set(file_id_at(&at));
         });
         let claimed = held_at(&dir).claim();
         set_claim_hook(None);
@@ -2232,6 +2449,8 @@ mod tests {
             CLAIM_FILE,
             ".IPE-OUTPUT",
             ".Ipe-Output.Claim",
+            ".\u{131}pe-output",
+            "\u{FEFF}.ipe-output.cla\u{131}m",
         ] {
             let written = held.write_file(OsStr::new(name), None, |file| {
                 file.write_all(MARKER_TEXT.as_bytes())
@@ -2306,5 +2525,254 @@ mod tests {
                 "{refusal:?} is an I/O error of its kind, got {error:?}"
             );
         }
+    }
+
+    /// An entry name the tests know is plain.
+    fn name(spelled: &str) -> EntryName {
+        EntryName::new(OsStr::new(spelled)).expect("plain entry name")
+    }
+
+    /// A non-zero entry cap of `entries`.
+    fn entry_cap(entries: u32) -> EntryCap {
+        EntryCap::new(entries).expect("non-zero entry cap")
+    }
+
+    /// A non-zero byte cap of `bytes`.
+    fn byte_cap(bytes: u64) -> ByteCap {
+        ByteCap::new(bytes).expect("non-zero byte cap")
+    }
+
+    /// The names a listing returned, in sorted order.
+    fn listed_names(listing: &[(EntryName, FileKind)]) -> Vec<String> {
+        let mut names: Vec<String> = listing
+            .iter()
+            .map(|(entry, _)| entry.as_os_str().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// A listing of exactly its cap is accepted; one entry past it is a discovery limit.
+    #[test]
+    fn list_names_accepts_its_cap_and_refuses_one_past() {
+        let base = scratch("list_cap");
+        for leaf in ["A.ipe", "B.ipe", "C.ipe"] {
+            std::fs::write(base.join(leaf), "module").expect("plant source");
+        }
+        let held = held_at(&base);
+        let at_cap = held
+            .list_names(entry_cap(3))
+            .expect("three entries at a cap of three");
+        assert_eq!(listed_names(&at_cap), ["A.ipe", "B.ipe", "C.ipe"]);
+        assert!(
+            at_cap.iter().all(|(_, kind)| *kind == FileKind::Regular),
+            "each entry is a regular file, got {at_cap:?}"
+        );
+        let past = held.list_names(entry_cap(2));
+        assert!(
+            matches!(&past, Err(CliError::DiscoveryLimitReached { detail }) if detail.contains("more than 2 entries")),
+            "one entry past the cap is refused, got {past:?}"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Names keep their exact spelling: two names differing only in case stay two entries.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn list_names_keeps_case_distinct_names_apart() {
+        let base = scratch("list_case");
+        std::fs::write(base.join("Foo.ipe"), "upper").expect("plant Foo.ipe");
+        std::fs::write(base.join("foo.ipe"), "lower").expect("plant foo.ipe");
+        let held = held_at(&base);
+        let listing = held.list_names(entry_cap(2)).expect("two entries");
+        assert_eq!(listed_names(&listing), ["Foo.ipe", "foo.ipe"]);
+        assert_eq!(
+            held.read_file_capped(&name("Foo.ipe"), byte_cap(16))
+                .ok()
+                .as_deref(),
+            Some("upper")
+        );
+        assert_eq!(
+            held.read_file_capped(&name("foo.ipe"), byte_cap(16))
+                .ok()
+                .as_deref(),
+            Some("lower")
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A name that differs from the on-disk name only in case does not read the file.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn read_file_capped_is_exact_case() {
+        let base = scratch("read_case");
+        std::fs::write(base.join("Foo.ipe"), "upper").expect("plant Foo.ipe");
+        let read = held_at(&base).read_file_capped(&name("foo.ipe"), byte_cap(16));
+        assert!(
+            matches!(&read, Err(CliError::Io { source, .. }) if source.kind() == io::ErrorKind::NotFound),
+            "a case-folded name is absent, got {read:?}"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A link in the listing is reported as a link, and what it points at is not listed.
+    #[cfg(unix)]
+    #[test]
+    fn list_names_reports_a_link_and_never_follows_it() {
+        let base = scratch("list_link");
+        let outside = base.join("outside");
+        std::fs::create_dir(&outside).expect("make outside");
+        std::fs::write(outside.join("Secret.ipe"), "secret").expect("plant outside source");
+        let src = base.join("src");
+        std::fs::create_dir(&src).expect("make src");
+        std::fs::write(src.join("Main.ipe"), "main").expect("plant source");
+        std::os::unix::fs::symlink(&outside, src.join("Escape")).expect("dir link");
+        std::os::unix::fs::symlink(outside.join("Secret.ipe"), src.join("Leak.ipe"))
+            .expect("file link");
+        let listing = held_at(&src).list_names(entry_cap(8)).expect("list src");
+        assert_eq!(listed_names(&listing), ["Escape", "Leak.ipe", "Main.ipe"]);
+        for (entry, kind) in &listing {
+            let expected = if entry.as_os_str() == "Main.ipe" {
+                FileKind::Regular
+            } else {
+                FileKind::Symlink
+            };
+            assert_eq!(*kind, expected, "{entry:?} is listed as what it is");
+        }
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A read of exactly its cap is accepted; one byte past it is refused as too large.
+    #[test]
+    fn read_file_capped_accepts_its_cap_and_refuses_one_past() {
+        let base = scratch("read_cap");
+        std::fs::write(base.join("Main.ipe"), "12345").expect("plant source");
+        let held = held_at(&base);
+        assert_eq!(
+            held.read_file_capped(&name("Main.ipe"), byte_cap(5))
+                .ok()
+                .as_deref(),
+            Some("12345")
+        );
+        let past = held.read_file_capped(&name("Main.ipe"), byte_cap(4));
+        assert!(
+            matches!(&past, Err(CliError::FileTooLarge { max: 4, path }) if path.ends_with("Main.ipe")),
+            "one byte past the cap is refused, got {past:?}"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A link to a regular file is refused as a link, never read through.
+    #[cfg(unix)]
+    #[test]
+    fn read_file_capped_refuses_a_link() {
+        let base = scratch("read_link");
+        std::fs::write(base.join("Target.ipe"), "secret").expect("plant target");
+        std::os::unix::fs::symlink(base.join("Target.ipe"), base.join("Main.ipe"))
+            .expect("file link");
+        let read = held_at(&base).read_file_capped(&name("Main.ipe"), byte_cap(64));
+        assert!(
+            matches!(
+                &read,
+                Err(CliError::SourceRefused {
+                    reason: crate::io_bounded::SourceRefusal::Symlink,
+                    ..
+                })
+            ),
+            "a link is refused as a link, got {read:?}"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A directory at the name is refused as not a regular file.
+    #[test]
+    fn read_file_capped_refuses_a_directory() {
+        let base = scratch("read_dir");
+        std::fs::create_dir(base.join("Main.ipe")).expect("dir at the name");
+        let read = held_at(&base).read_file_capped(&name("Main.ipe"), byte_cap(64));
+        assert!(
+            matches!(
+                &read,
+                Err(CliError::SourceRefused {
+                    reason: crate::io_bounded::SourceRefusal::NotRegularFile,
+                    ..
+                })
+            ),
+            "a directory is not a regular file, got {read:?}"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A FIFO at the name is refused as not a regular file, and the open never blocks.
+    #[cfg(unix)]
+    #[test]
+    fn read_file_capped_refuses_a_fifo_without_blocking() {
+        let base = scratch("read_fifo");
+        let made = std::process::Command::new("mkfifo")
+            .arg(base.join("Main.ipe"))
+            .status()
+            .expect("run mkfifo");
+        assert!(made.success(), "mkfifo creates the fixture");
+        let (sent, received) = std::sync::mpsc::channel();
+        let dir = base.clone();
+        std::thread::Builder::new()
+            .spawn(move || {
+                let read = held_at(&dir).read_file_capped(&name("Main.ipe"), byte_cap(64));
+                let _ = sent.send(matches!(
+                    read,
+                    Err(CliError::SourceRefused {
+                        reason: crate::io_bounded::SourceRefusal::NotRegularFile,
+                        ..
+                    })
+                ));
+            })
+            .expect("spawn the reader thread");
+        let refused = received
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("the read returns without blocking on the FIFO");
+        assert!(refused, "a FIFO is not a regular file");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Content that is not UTF-8 is an invalid-data read error, never lossily decoded.
+    #[test]
+    fn read_file_capped_refuses_content_that_is_not_utf8() {
+        let base = scratch("read_not_utf8");
+        std::fs::write(base.join("Main.ipe"), b"module \xff").expect("plant source");
+        let read = held_at(&base).read_file_capped(&name("Main.ipe"), byte_cap(64));
+        assert!(
+            matches!(&read, Err(CliError::Io { source, path }) if source.kind() == io::ErrorKind::InvalidData && path.ends_with("Main.ipe")),
+            "non-UTF-8 content is refused, got {read:?}"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// An absent entry is a not-found read error naming the entry.
+    #[test]
+    fn read_file_capped_reports_an_absent_entry_as_not_found() {
+        let base = scratch("read_absent");
+        let read = held_at(&base).read_file_capped(&name("Main.ipe"), byte_cap(64));
+        assert!(
+            matches!(&read, Err(CliError::Io { source, path }) if source.kind() == io::ErrorKind::NotFound && path.ends_with("Main.ipe")),
+            "an absent entry is not found, got {read:?}"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A held directory removed before its listing is refused, never listed as empty.
+    #[cfg(unix)]
+    #[test]
+    fn list_names_refuses_a_removed_directory() {
+        let base = scratch("list_removed");
+        let gone = base.join("gone");
+        std::fs::create_dir(&gone).expect("make dir");
+        let held = held_at(&gone);
+        std::fs::remove_dir(&gone).expect("remove the held dir");
+        let listing = held.list_names(entry_cap(8));
+        assert!(
+            matches!(&listing, Err(CliError::Io { source, .. }) if source.kind() == io::ErrorKind::NotFound),
+            "a removed directory is refused, got {listing:?}"
+        );
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

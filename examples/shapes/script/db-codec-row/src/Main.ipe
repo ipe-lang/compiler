@@ -3,9 +3,9 @@ module Main exposing (main)
 import Ipe.Codec as Codec exposing (Codec)
 import Ipe.Db.Codec as DbCodec
 import Ipe.Dict as Dict exposing (Dict)
+import Ipe.Io as Io
 import Ipe.Result as Result exposing (Result(..))
 import Ipe.String as String
-import Ipe.Io as Io
 
 
 -- `Ipe.Db.Codec` is the seam where ONE `Codec a` becomes a database row and

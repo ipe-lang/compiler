@@ -24,6 +24,8 @@ mod golden_attribute_home_disambiguation_179;
 mod golden_aud14_duplicate_qualifier;
 #[path = "g_misc/golden_auth_error.rs"]
 mod golden_auth_error;
+#[path = "g_misc/golden_backend_temp_capture.rs"]
+mod golden_backend_temp_capture;
 #[path = "g_misc/golden_bare_ui_arity_fill.rs"]
 mod golden_bare_ui_arity_fill;
 #[path = "g_misc/golden_basics.rs"]
@@ -102,6 +104,8 @@ mod golden_session_replay_seal;
 mod golden_show_policy;
 #[path = "g_misc/golden_static_bound.rs"]
 mod golden_static_bound;
+#[path = "g_misc/golden_stdlib_markdown_bounds.rs"]
+mod golden_stdlib_markdown_bounds;
 #[path = "g_misc/golden_stdlib_module_seal.rs"]
 mod golden_stdlib_module_seal;
 #[path = "g_misc/golden_test_summary_line_219.rs"]

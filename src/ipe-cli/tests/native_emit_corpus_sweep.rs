@@ -30,10 +30,9 @@ fn lower_entry(entry: &Path) -> Option<(Interner, ipe_ir::Program)> {
     Some((interner, program))
 }
 
-/// Every golden corpus directory that carries both a `Main.ipe` source and a
-/// checked-in `main.rs` emitted-Rust golden — the byte-exact reference the native
-/// path must reproduce.
-fn corpus_entries() -> Vec<PathBuf> {
+/// Every golden corpus directory that carries both a `src/Main.ipe` source and a checked-in `main.rs` emitted-Rust golden — the
+/// byte-exact reference the native path must reproduce — as `(directory name, source)`.
+fn corpus_entries() -> Vec<(String, PathBuf)> {
     let golden = repo_root().join("tests").join("golden");
     let mut entries = Vec::new();
     let Ok(read) = std::fs::read_dir(&golden) else {
@@ -41,8 +40,12 @@ fn corpus_entries() -> Vec<PathBuf> {
     };
     for dir in read.flatten() {
         let path = dir.path();
-        if path.join("Main.ipe").is_file() && path.join("main.rs").is_file() {
-            entries.push(path.join("Main.ipe"));
+        if !path.join("main.rs").is_file() {
+            continue;
+        }
+        let source = path.join("src").join("Main.ipe");
+        if source.is_file() {
+            entries.push((dir.file_name().to_string_lossy().into_owned(), source));
         }
     }
     entries.sort();
@@ -54,7 +57,7 @@ fn native_vs_legacy_whole_corpus_sweep() {
     let entries = corpus_entries();
     assert!(
         !entries.is_empty(),
-        "no corpus entries found under tests/golden (expected 70)"
+        "no corpus entries found under tests/golden"
     );
 
     let mut total_compared = 0usize;
@@ -62,7 +65,7 @@ fn native_vs_legacy_whole_corpus_sweep() {
     let mut all_divergences: Vec<String> = Vec::new();
     let mut lowered_programs = 0usize;
 
-    for entry in &entries {
+    for (fixture, entry) in &entries {
         let Some((interner, program)) = lower_entry(entry) else {
             // A fixture the single-file pipeline cannot lower (multi-module, or a
             // frontend-rejected shape) — its emitted bytes are covered by its own
@@ -75,11 +78,6 @@ fn native_vs_legacy_whole_corpus_sweep() {
                 .expect("sweep must not error");
         total_compared += compared;
         total_skipped += skipped;
-        let fixture = entry
-            .parent()
-            .and_then(|p| p.file_name())
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_default();
         for d in divergences {
             all_divergences.push(format!(
                 "DIVERGES in {fixture} :: fn {} (body {})\n  --- native ---\n{}\n  --- legacy ---\n{}\n",

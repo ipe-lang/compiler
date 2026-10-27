@@ -96,16 +96,9 @@ fn compile_and_build_as(
     ipe_source: &str,
     intent: ipe_backend_rust::BuildIntent,
 ) -> Result<PathBuf, BoxError> {
-    let ipe_dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
-        .join(format!("server_e2e_{test_name}_ipe"));
-    let _ = std::fs::remove_dir_all(&ipe_dir);
-    std::fs::create_dir_all(&ipe_dir).map_err(|e| -> BoxError {
-        format!("{test_name}: cannot create ipe source dir: {e}").into()
+    let fixture = ipe::RootFixture::main(ipe_source).map_err(|e| -> BoxError {
+        format!("{test_name}: cannot write the fixture: {e}").into()
     })?;
-
-    let entry = ipe_dir.join("Main.ipe");
-    std::fs::write(&entry, ipe_source)
-        .map_err(|e| -> BoxError { format!("{test_name}: cannot write Main.ipe: {e}").into() })?;
 
     let out_dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
         .join(format!("server_e2e_{test_name}_emitted"));
@@ -117,7 +110,7 @@ fn compile_and_build_as(
         intent,
         ..ipe::BuildOptions::from_env()
     };
-    ipe::build_with_options(&entry, &out_dir, &runtime, options)
+    ipe::build_fixture_with_options(&fixture, &out_dir, &runtime, &options)
         .map_err(|e| -> BoxError { format!("{test_name}: ipe dev build failed: {e}").into() })?;
 
     let exe = e2e_support::build_rust_binary(test_name, &out_dir)
@@ -301,13 +294,11 @@ main =
         ]
 "#;
 
-/// Ipê server that uses BOTH `Server.listen` and a `Db.open` call — the
+/// Ipê server that uses BOTH `Server.listen` and a `Db.connect` call — the
 /// minimal program that sets both `uses_server` and `uses_db` in the lowerer,
-/// exercising the server+db manifest composition (GAP 1 fix).
+/// exercising the server+db manifest composition.
 ///
-/// `Db.open : String -> String -> Task Error Db` (driver, url).
-/// `Db.connect : () -> Task Error Db` takes unit, not a URL string, so we use
-/// `Db.open` here for clarity.
+/// `Db.connect : () -> Task Error Db` opens the operator `DATABASE_URL`.
 const IPE_SERVER_AND_DB_PROGRAM: &str = r#"module Main exposing (main)
 
 import Ipe.Http.Server as Server
@@ -325,11 +316,11 @@ main =
             Server.listen port
                 [ Server.get "/" (\req -> Task.succeed (Server.text "ok"))
                 ])
-        (Db.open "sqlite" (System.getenvOr "DATABASE_URL" "sqlite::memory:"))
+        (Db.connect ())
 "#;
 
 /// Ipê server exercising `Middleware.withCsrf` end-to-end.  Mirrors
-/// `tests/golden/middleware_csrf/Main.ipe` but adds a `GET /action` route
+/// `tests/golden/middleware_csrf/src/Main.ipe` but adds a `GET /action` route
 /// (also wrapped in `Middleware.withCsrf`) so a real HTTP client can mint the
 /// double-submit cookie via a safe-method request before probing the
 /// CSRF-protected `POST /action`.

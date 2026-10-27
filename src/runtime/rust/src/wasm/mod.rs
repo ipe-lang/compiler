@@ -28,6 +28,7 @@
 
 #![allow(clippy::type_complexity)] // TEA fn-quadruples are inherent here
 
+use std::borrow::Cow;
 use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
 use std::rc::Rc;
@@ -36,8 +37,14 @@ use wasm_bindgen::JsCast;
 use wasm_bindgen::prelude::*;
 
 use crate::core::{IpeResult, IpeTask};
-use crate::dom::{HandlerIndex, WebReq, build_index, diff::Patch, diff::diff};
-use crate::html::{FormData, Html, assign_ipe_ids, render_html};
+use crate::dom::{
+    HandlerIndex, WebReq, build_index,
+    diff::{AUTOFOCUS_SPENT_GLOBAL, Patch, diff, focus_target},
+};
+use crate::html::{
+    FormData, Html, IFRAME_TAG, RenderCtx, SANDBOX_ATTR, SandboxTokens, assign_ipe_ids,
+    frame_loader_key, render_html,
+};
 use crate::tea::{IpeCmd, IpeSub};
 use crate::web::route::MountRefusal;
 
@@ -58,6 +65,22 @@ const ROOT_IPE_ID: &str = "r";
 fn console_fatal(class: &str, detail: &str) {
     let line = crate::web::route::console_line(Some(class), detail);
     web_sys::console::error_1(&JsValue::from_str(&line));
+}
+
+/// [`console_fatal`] for a mount refusal, whose `Display` is already scrubbed:
+/// the line is built by [`crate::web::route::console_refusal_line`], which
+/// scrubs only the class.
+fn console_fatal_refusal(class: &str, refusal: &MountRefusal) {
+    let line = crate::web::route::console_refusal_line(class, refusal);
+    web_sys::console::error_1(&JsValue::from_str(&line));
+}
+
+/// The warning-level sibling of [`console_fatal_refusal`], for a refusal the
+/// app survives.
+#[cfg(feature = "debugger")]
+fn console_warn_refusal(class: &str, refusal: &MountRefusal) {
+    let line = crate::web::route::console_refusal_line(class, refusal);
+    web_sys::console::warn_1(&JsValue::from_str(&line));
 }
 
 /// Shared non-fatal diagnostic sink — reused by `ws_client.rs`'s
@@ -113,7 +136,7 @@ where
         match mount_app(init, update, view, subscriptions) {
             Ok(()) => IpeResult::Ok(()),
             Err(e) => {
-                console_fatal("MountFailed", &e.to_string());
+                console_fatal_refusal("MountFailed", &e);
                 IpeResult::Err(E::from_ipe_error(e.into()))
             }
         }
@@ -128,7 +151,7 @@ where
 /// the caller, it falls back to calling `init` instead — this function is
 /// therefore always called with a valid, fully-typed model.
 ///
-/// The **adopt path** — unlike `mount_app`, does NOT call `set_inner_html`.
+/// The **adopt path** — unlike `mount_app`, does NOT repaint the body.
 /// The server-rendered DOM is already correct; we compute the virtual tree
 /// from `view(model)`, build the handler index, and wire delegated event
 /// listeners. The first user interaction triggers the normal diff→patch cycle.
@@ -156,7 +179,7 @@ where
         match adopt_app(model, update, view, subscriptions) {
             Ok(()) => IpeResult::Ok(()),
             Err(e) => {
-                console_fatal("AdoptFailed", &e.to_string());
+                console_fatal_refusal("AdoptFailed", &e);
                 IpeResult::Err(E::from_ipe_error(e.into()))
             }
         }
@@ -218,7 +241,7 @@ where
         ) {
             Ok(()) => IpeResult::Ok(()),
             Err(e) => {
-                console_fatal("MountFailed", &e.to_string());
+                console_fatal_refusal("MountFailed", &e);
                 IpeResult::Err(E::from_ipe_error(e.into()))
             }
         }
@@ -297,11 +320,131 @@ type WasmRouter<Model, Msg> = dyn Fn(
     Model,
 ) -> Option<crate::web::route::Entered<Model, IpeCmd<Msg>>>;
 
+/// Where a queued Msg came from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Source {
+    /// A trusted DOM event of a deliberate input kind (see
+    /// [`DELEGATED_EVENTS`]) raised while the runtime was not moving focus.
+    User,
+    /// An event that proves no act of the user's: a widget's up event (its
+    /// script raises it), an untrusted event, an incidental kind a render can
+    /// raise (a pointer crossing), one raised while the runtime moves focus,
+    /// an edit or key an input method is still composing, or any wire outside
+    /// [`DELEGATED_EVENTS`].
+    Unproven,
+    /// A Cmd result or a Sub delivery.
+    Effect,
+}
+
+/// Where focus stood at one moment: the count of the user's focus moves so far
+/// and the element holding focus.
+#[derive(Debug, PartialEq, Eq)]
+struct FocusMark<F> {
+    epoch: u64,
+    at: Option<F>,
+}
+
+/// What caused the Msgs queued since the last render.
+enum Cause<F = web_sys::Element> {
+    /// No Msg is queued.
+    Idle,
+    /// Only the user's own events, with focus as it stood when the first was
+    /// queued.
+    User(FocusMark<F>),
+    /// At least one Cmd result or Sub delivery.
+    Effect,
+}
+
+impl<F: PartialEq> Cause<F> {
+    /// The cause once a Msg from `source` joins the queue; `mark` reads focus
+    /// only when this Msg is the first of the user's.
+    fn with(self, source: Source, mark: impl FnOnce() -> FocusMark<F>) -> Self {
+        match (self, source) {
+            (Self::Idle, Source::User) => Self::User(mark()),
+            (Self::User(at), Source::User) => Self::User(at),
+            (Self::Idle | Self::User(_) | Self::Effect, Source::Unproven | Source::Effect)
+            | (Self::Effect, Source::User) => Self::Effect,
+        }
+    }
+
+    /// Whether the render of these Msgs may move focus: they are all the
+    /// user's own, and focus stands at `now` where it stood when the first
+    /// was queued.
+    fn addressed(&self, now: &FocusMark<F>) -> bool {
+        match self {
+            Self::User(then) => then == now,
+            Self::Idle | Self::Effect => false,
+        }
+    }
+}
+
+thread_local! {
+    /// The user's focus moves in this tab: each focus change or pointer press
+    /// the runtime did not cause itself, as `client.js` counts them.
+    static FOCUS_EPOCH: Cell<u64> = const { Cell::new(0) };
+    /// Set while the runtime itself moves focus.
+    static RUNTIME_FOCUSING: Cell<bool> = const { Cell::new(false) };
+    /// One-time guard for the focus-move listeners every mount shares.
+    static FOCUS_EPOCH_INSTALLED: Cell<bool> = const { Cell::new(false) };
+}
+
+/// The events that count a focus move. A key press is not one: it is what
+/// raises the user's event.
+const FOCUS_MOVE_EVENTS: &[&str] = &["focusin", "pointerdown", "mousedown", "touchstart"];
+
+/// Counts one focus move unless the runtime is moving focus itself.
+fn note_focus_move() {
+    if !RUNTIME_FOCUSING.with(Cell::get) {
+        FOCUS_EPOCH.with(|c| c.set(c.get().wrapping_add(1)));
+    }
+}
+
+/// Runs `move_focus` as the runtime's own focus move, which the epoch skips.
+fn runtime_focus(move_focus: impl FnOnce()) {
+    let was = RUNTIME_FOCUSING.with(|c| c.replace(true));
+    move_focus();
+    RUNTIME_FOCUSING.with(|c| c.set(was));
+}
+
+/// Install the capture listeners that count focus moves, once per tab.
+fn install_focus_epoch(document: &web_sys::Document) -> Result<(), MountRefusal> {
+    if FOCUS_EPOCH_INSTALLED.with(Cell::get) {
+        return Ok(());
+    }
+    for name in FOCUS_MOVE_EVENTS {
+        let event_name: &'static str = name;
+        let closure = Closure::<dyn Fn(web_sys::Event)>::new(move |_: web_sys::Event| {
+            note_focus_move();
+        });
+        document
+            .add_event_listener_with_callback_and_bool(
+                event_name,
+                closure.as_ref().unchecked_ref(),
+                true,
+            )
+            .map_err(|e| listener_refusal(event_name, &e))?;
+        // The counting listeners live for the whole tab lifetime.
+        closure.forget();
+    }
+    FOCUS_EPOCH_INSTALLED.with(|c| c.set(true));
+    Ok(())
+}
+
+/// Where focus stands in this document now.
+fn focus_mark() -> FocusMark<web_sys::Element> {
+    FocusMark {
+        epoch: FOCUS_EPOCH.with(Cell::get),
+        at: document().ok().and_then(|d| d.active_element()),
+    }
+}
+
 struct App<Model, Msg> {
     model: RefCell<Model>,
     tree: RefCell<Html<Msg>>,
     index: RefCell<HandlerIndex<Msg>>,
     queue: RefCell<VecDeque<Msg>>,
+    /// What caused the Msgs in `queue`.
+    cause: RefCell<Cause>,
     frame_scheduled: Cell<bool>,
     update: Box<dyn Fn(Msg, Model) -> (Model, IpeCmd<Msg>)>,
     view: Box<dyn Fn(Model) -> Html<Msg>>,
@@ -351,7 +494,7 @@ where
     let model = app.model.borrow().clone();
     let sub = pubsub::with_origin(&app.origin, || (app.subscriptions)(model));
     let app2 = Rc::clone(app);
-    let emit: Rc<dyn Fn(Msg)> = Rc::new(move |msg| enqueue(&app2, msg));
+    let emit: Rc<dyn Fn(Msg)> = Rc::new(move |msg| enqueue(&app2, msg, Source::Effect));
     app.submgr.borrow_mut().update(sub, &emit);
 }
 
@@ -379,7 +522,7 @@ where
     assign_ipe_ids(&mut tree, ROOT_IPE_ID);
     // One renderer: the DOM starts as exactly the bytes `render_html`
     // produces, so every later `diff` runs against known ground truth.
-    body.set_inner_html(&render_html(&tree));
+    paint_first(&document, &body, &render_html(&tree))?;
 
     let index = build_index(&tree);
     // Under the `debugger` feature the recorder seeds from the initial model, so
@@ -393,6 +536,7 @@ where
         tree: RefCell::new(tree),
         index: RefCell::new(index),
         queue: RefCell::new(VecDeque::new()),
+        cause: RefCell::new(Cause::Idle),
         frame_scheduled: Cell::new(false),
         update: Box::new(update),
         view: Box::new(view),
@@ -415,10 +559,10 @@ where
 
     #[cfg(feature = "debugger")]
     attach_overlay_listeners(&app);
+    install_focus_epoch(&document)?;
     attach_delegated_listeners(&body, &app)?;
     attach_widget_up_listener(&body, &app)?;
-    // The first paint went through `set_inner_html`, not the attribute-patch
-    // path, so deliver each `CustomElement.node`'s decoded down-state PROPERTY once here.
+    // The first paint parsed markup, not the attribute-patch path, so deliver each `CustomElement.node`'s decoded down-state PROPERTY once here.
     widget::sync_widget_properties(&document, &app.tree.borrow());
     // Wire the `Ipe.Ffi.Js` port inbound seam before the first `resync` spawns any
     // `Js.subscribe` drain, so no early page-JS frame is lost.
@@ -469,7 +613,7 @@ where
     // diff-and-replace on the first real update, never white-screens.
     {
         use crate::dom::diff::diff;
-        let self_patches = diff(&tree, &tree);
+        let self_patches = diff(&tree, &tree, &RenderCtx::Unstamped);
         if !self_patches.is_empty() {
             console_warn(&format!(
                 "hydration-mismatch: self-diff produced {} patch(es) — \
@@ -490,6 +634,7 @@ where
         tree: RefCell::new(tree),
         index: RefCell::new(index),
         queue: RefCell::new(VecDeque::new()),
+        cause: RefCell::new(Cause::Idle),
         frame_scheduled: Cell::new(false),
         update: Box::new(update),
         view: Box::new(view),
@@ -512,6 +657,7 @@ where
 
     #[cfg(feature = "debugger")]
     attach_overlay_listeners(&app);
+    install_focus_epoch(&document)?;
     attach_delegated_listeners(&body, &app)?;
     attach_widget_up_listener(&body, &app)?;
     // Adopt does NOT repaint (the server DOM is trusted), so the widget's `state`
@@ -580,7 +726,7 @@ where
 
     let mut tree = view(model.clone());
     assign_ipe_ids(&mut tree, ROOT_IPE_ID);
-    body.set_inner_html(&render_html(&tree));
+    paint_first(&document, &body, &render_html(&tree))?;
 
     let index = build_index(&tree);
 
@@ -616,6 +762,7 @@ where
         tree: RefCell::new(tree),
         index: RefCell::new(index),
         queue: RefCell::new(VecDeque::new()),
+        cause: RefCell::new(Cause::Idle),
         frame_scheduled: Cell::new(false),
         update: Box::new(update),
         view: Box::new(view),
@@ -638,10 +785,11 @@ where
 
     #[cfg(feature = "debugger")]
     attach_overlay_listeners(&app);
+    install_focus_epoch(&document)?;
     attach_delegated_listeners(&body, &app)?;
     attach_widget_up_listener(&body, &app)?;
     attach_popstate_listener(&app, base)?;
-    // First paint went through `set_inner_html`; deliver each widget's decoded
+    // The first paint parsed markup; deliver each widget's decoded
     // down-state PROPERTY once here (later changes ride the diff/patch route).
     widget::sync_widget_properties(&document, &app.tree.borrow());
     install_port_inbound_seam();
@@ -708,7 +856,7 @@ where
 
     let mut new_tree = (app.view)(new_model);
     assign_ipe_ids(&mut new_tree, ROOT_IPE_ID);
-    let patches = diff(&app.tree.borrow(), &new_tree);
+    let patches = diff(&app.tree.borrow(), &new_tree, &RenderCtx::Unstamped);
     apply_patches(&patches);
     *app.index.borrow_mut() = build_index(&new_tree);
     *app.tree.borrow_mut() = new_tree;
@@ -734,7 +882,7 @@ fn document() -> Result<web_sys::Document, MountRefusal> {
 fn listener_refusal(event: &'static str, error: &JsValue) -> MountRefusal {
     MountRefusal::Listener {
         event,
-        detail: format!("{error:?}"),
+        detail: crate::system::RefusedText::new(&format!("{error:?}")),
     }
 }
 
@@ -774,18 +922,30 @@ fn synthesize_req(document: &web_sys::Document) -> Result<(WebReq, Option<String
     Ok((req, pathname))
 }
 
+/// What a trusted delegated event says of the user.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Input {
+    /// A deliberate act: a key, a click, an edit, a submit. Only the user
+    /// raises a trusted one, outside the runtime's own focus moves.
+    Deliberate,
+    /// A pointer crossing: a render that shifts layout under a pointer at rest
+    /// raises a trusted one with no act of the user's.
+    Incidental,
+}
+
 /// The delegated event names — one listener per name on `<body>`, so nodes
 /// inserted by later patches need no re-wiring and no per-node `Closure`
-/// lifecycle exists to leak.
-const DELEGATED_EVENTS: &[&str] = &[
-    "click",
-    "input",
-    "change",
-    "submit",
-    "keydown",
-    "keyup",
-    "mouseover",
-    "mouseout",
+/// lifecycle exists to leak — each with what a trusted one says of the user.
+/// The deliberate kinds are the only ones whose render may move focus.
+const DELEGATED_EVENTS: &[(&str, Input)] = &[
+    ("click", Input::Deliberate),
+    ("input", Input::Deliberate),
+    ("change", Input::Deliberate),
+    ("submit", Input::Deliberate),
+    ("keydown", Input::Deliberate),
+    ("keyup", Input::Deliberate),
+    ("mouseover", Input::Incidental),
+    ("mouseout", Input::Incidental),
 ];
 
 fn attach_delegated_listeners<Model, Msg>(
@@ -796,7 +956,7 @@ where
     Model: Clone + 'static,
     Msg: Clone + 'static,
 {
-    for name in DELEGATED_EVENTS {
+    for &(name, _) in DELEGATED_EVENTS {
         let app = Rc::clone(app);
         let event_name: &'static str = name;
         let closure = Closure::<dyn Fn(web_sys::Event)>::new(move |ev: web_sys::Event| {
@@ -856,24 +1016,47 @@ where
         return;
     };
     let args = [detail];
-    let mut cur: Option<web_sys::Element> = ev
+    let target = ev
         .target()
         .and_then(|t| t.dyn_into::<web_sys::Element>().ok());
-    while let Some(el) = cur {
-        if let Some(ipe_id) = el.get_attribute("ipe-id") {
-            // The generated `OnWidget` closure runs the total, fail-closed seal
-            // up-decoder over `detail`; a mismatch yields `None` (clean drop).
-            if let Some(msg) = app
-                .index
-                .borrow()
-                .resolve(&ipe_id, widget::UP_WIRE_NAME, &args)
-            {
-                enqueue(app, msg);
-                return;
-            }
+    // The generated `OnWidget` closure runs the total, fail-closed seal
+    // up-decoder over `detail`; a mismatch yields `None` (clean drop).
+    let source = listener_source(widget::UP_WIRE_NAME, Arrival::of(ev));
+    dispatch(app, target, source, |_, ipe_id| {
+        app.index
+            .borrow()
+            .resolve(ipe_id, widget::UP_WIRE_NAME, &args)
+    });
+}
+
+/// What a delegated event says of itself as it arrives, read once.
+#[derive(Clone, Copy, Debug)]
+struct Arrival {
+    /// The browser raised it, not a page script.
+    trusted: bool,
+    /// An input method is still composing the edit or key it carries.
+    composing: bool,
+}
+
+impl Arrival {
+    fn of(ev: &web_sys::Event) -> Self {
+        Self {
+            trusted: ev.is_trusted(),
+            composing: composing(ev),
         }
-        cur = el.parent_element();
     }
+}
+
+/// Whether `ev` is an edit or a key an input method is still composing.
+fn composing(ev: &web_sys::Event) -> bool {
+    ev.dyn_ref::<web_sys::InputEvent>().map_or_else(
+        || {
+            ev.dyn_ref::<web_sys::KeyboardEvent>().is_some_and(|key| {
+                key.is_composing() || key.key_code() == crate::dom::diff::COMPOSING_KEY_CODE
+            })
+        },
+        web_sys::InputEvent::is_composing,
+    )
 }
 
 /// Decode + dispatch one delegated DOM event: climb from the target to the
@@ -887,21 +1070,55 @@ where
         .target()
         .and_then(|t| t.dyn_into::<web_sys::Element>().ok());
     let args = decode_event_args(name, ev, target.as_ref());
+    let source = listener_source(name, Arrival::of(ev));
+    dispatch(app, target, source, |el, ipe_id| {
+        if name == "submit" {
+            ev.prevent_default();
+            let fd = collect_form_data(el);
+            app.index.borrow().resolve_form(ipe_id, name, fd)
+        } else {
+            app.index.borrow().resolve(ipe_id, name, &args)
+        }
+    });
+}
 
+/// The source of a Msg a listener resolved under `wire`, read as the event
+/// arrives: the user's only for a trusted, uncomposed event of a deliberate
+/// kind in [`DELEGATED_EVENTS`] raised while the runtime is not moving focus.
+/// An event the runtime or a render can raise proves no act of the user's, so
+/// its render never moves focus: a widget's up event, an untrusted event, a
+/// pointer crossing, the `change` a runtime focus move commits, or any name
+/// outside the table. Nor does an edit or key an input method is composing:
+/// moving focus would cut the composition off.
+fn listener_source(wire: &str, arrival: Arrival) -> Source {
+    let deliberate = DELEGATED_EVENTS
+        .iter()
+        .any(|&(name, input)| name == wire && input == Input::Deliberate);
+    if deliberate && arrival.trusted && !arrival.composing && !RUNTIME_FOCUSING.with(Cell::get) {
+        Source::User
+    } else {
+        Source::Unproven
+    }
+}
+
+/// Climb from `target` to the nearest `ipe-id` ancestor whose handler
+/// `resolve` turns into a Msg, and queue that Msg with `source`.
+fn dispatch<Model, Msg>(
+    app: &Rc<App<Model, Msg>>,
+    target: Option<web_sys::Element>,
+    source: Source,
+    resolve: impl Fn(&web_sys::Element, &str) -> Option<Msg>,
+) where
+    Model: Clone + 'static,
+    Msg: Clone + 'static,
+{
     let mut cur = target;
     while let Some(el) = cur {
-        if let Some(ipe_id) = el.get_attribute("ipe-id") {
-            let resolved = if name == "submit" {
-                ev.prevent_default();
-                let fd = collect_form_data(&el);
-                app.index.borrow().resolve_form(&ipe_id, name, fd)
-            } else {
-                app.index.borrow().resolve(&ipe_id, name, &args)
-            };
-            if let Some(msg) = resolved {
-                enqueue(app, msg);
-                return;
-            }
+        if let Some(ipe_id) = el.get_attribute("ipe-id")
+            && let Some(msg) = resolve(&el, &ipe_id)
+        {
+            enqueue(app, msg, source);
+            return;
         }
         cur = el.parent_element();
     }
@@ -968,12 +1185,14 @@ fn collect_form_data(el: &web_sys::Element) -> FormData {
 /// Queue a message and coalesce processing into one rAF tick — one
 /// update+view+diff+patch per animation frame (the browser analogue of the
 /// SSE wire's seq-ordered batching).
-fn enqueue<Model, Msg>(app: &Rc<App<Model, Msg>>, msg: Msg)
+fn enqueue<Model, Msg>(app: &Rc<App<Model, Msg>>, msg: Msg, source: Source)
 where
     Model: Clone + 'static,
     Msg: Clone + 'static,
 {
     app.queue.borrow_mut().push_back(msg);
+    let cause = app.cause.replace(Cause::Idle);
+    app.cause.replace(cause.with(source, focus_mark));
     if app.frame_scheduled.get() {
         return;
     }
@@ -1004,6 +1223,7 @@ where
     Msg: Clone + 'static,
 {
     let msgs: Vec<Msg> = app.queue.borrow_mut().drain(..).collect();
+    let cause = app.cause.replace(Cause::Idle);
     if msgs.is_empty() {
         return;
     }
@@ -1059,8 +1279,16 @@ where
     if !scrub_active {
         let mut new_tree = (app.view)(model);
         assign_ipe_ids(&mut new_tree, ROOT_IPE_ID);
-        let patches = diff(&app.tree.borrow(), &new_tree);
+        let target = if cause.addressed(&focus_mark()) {
+            focus_target(&app.tree.borrow(), &new_tree)
+        } else {
+            None
+        };
+        let patches = diff(&app.tree.borrow(), &new_tree, &RenderCtx::Unstamped);
         apply_patches(&patches);
+        if let Some(target) = target {
+            focus_stamped(target.as_str());
+        }
         *app.index.borrow_mut() = build_index(&new_tree);
         *app.tree.borrow_mut() = new_tree;
         // A widget that first appears via an `html`-subtree replace bypasses the
@@ -1100,11 +1328,11 @@ where
                 run_cmd(app, c);
             }
         }
-        IpeCmd::Perform(thunk) => {
+        IpeCmd::Perform(body) => {
             let app = Rc::clone(app);
             wasm_bindgen_futures::spawn_local(async move {
-                let msg = thunk().await;
-                enqueue(&app, msg);
+                let msg = body.run().await;
+                enqueue(&app, msg, Source::Effect);
             });
         }
         IpeCmd::Publish(thunk) => {
@@ -1149,7 +1377,7 @@ where
     Msg: Clone + 'static,
 {
     use crate::dom::{build_index, diff::diff};
-    use crate::html::assign_ipe_ids;
+    use crate::html::{RenderCtx, assign_ipe_ids};
 
     let render_model = match step {
         None => {
@@ -1177,7 +1405,7 @@ where
 
     let mut new_tree = (app.view)(render_model);
     assign_ipe_ids(&mut new_tree, ROOT_IPE_ID);
-    let patches = diff(&app.tree.borrow(), &new_tree);
+    let patches = diff(&app.tree.borrow(), &new_tree, &RenderCtx::Unstamped);
     apply_patches(&patches);
     *app.index.borrow_mut() = build_index(&new_tree);
     *app.tree.borrow_mut() = new_tree;
@@ -1207,6 +1435,298 @@ where
     debugger_overlay::render_overlay(overlay, labels.into_iter(), len, selected);
 }
 
+/// Focus the element stamped `id`; an absent or unfocusable one is left alone.
+/// The move is the runtime's own: it does not count as the user's.
+fn focus_stamped(id: &str) {
+    let Ok(document) = document() else {
+        return;
+    };
+    if let Ok(Some(el)) = document.query_selector(&ipe_id_selector(id))
+        && let Some(html) = el.dyn_ref::<web_sys::HtmlElement>()
+    {
+        runtime_focus(|| {
+            let _ = html.focus();
+        });
+    }
+}
+
+/// The selector matching the element whose `ipe-id` is exactly `id`: the id is
+/// a CSS string, `"` and `\` escaped, NUL replaced as CSS parses it, and every
+/// other control character written as its code point.
+fn ipe_id_selector(id: &str) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::with_capacity(id.len().saturating_add(12));
+    out.push_str("[ipe-id=\"");
+    for c in id.chars() {
+        match c {
+            '"' | '\\' => {
+                out.push('\\');
+                out.push(c);
+            }
+            '\0' => out.push('\u{FFFD}'),
+            c if c.is_control() => {
+                let _ = write!(out, "\\{:x} ", u32::from(c));
+            }
+            c => out.push(c),
+        }
+    }
+    out.push_str("\"]");
+    out
+}
+
+/// How a patch writes one attribute.
+#[derive(Debug, PartialEq, Eq)]
+enum AttrWrite<'v> {
+    /// Set the attribute to this value.
+    Set(Cow<'v, str>),
+    /// Remove the attribute.
+    Remove,
+    /// Write nothing.
+    Keep,
+    /// Set the empty `sandbox` first, then the attribute to this value: the
+    /// sandbox binds when the frame navigates.
+    SandboxThenSet(&'v str),
+}
+
+/// The write for attribute `key` of an element `tag` patched to `value`, where
+/// `sandboxed` says whether the element holds a `sandbox` now.
+///
+/// `None` removes and a value sets, the empty one included. `autofocus` never
+/// reaches a live node, where a later move would focus it. The frame rule of
+/// `html.rs` holds on the live node: an `iframe`'s `sandbox` is never removed
+/// and is set canonical, a `src` or `srcdoc` on an unsandboxed `iframe` is
+/// preceded by the empty sandbox, and a frame loader never gains the
+/// attribute it loads from.
+fn attr_write<'v>(tag: &str, key: &str, value: Option<&'v str>, sandboxed: bool) -> AttrWrite<'v> {
+    if key.eq_ignore_ascii_case("autofocus") {
+        return AttrWrite::Remove;
+    }
+    if tag.eq_ignore_ascii_case(IFRAME_TAG) {
+        if key.eq_ignore_ascii_case(SANDBOX_ATTR) {
+            return value.map_or(AttrWrite::Keep, |v| {
+                AttrWrite::Set(Cow::Owned(SandboxTokens::parse(v).canonical()))
+            });
+        }
+        if let Some(v) = value
+            && !sandboxed
+            && (key.eq_ignore_ascii_case("src") || key.eq_ignore_ascii_case("srcdoc"))
+        {
+            return AttrWrite::SandboxThenSet(v);
+        }
+    } else if value.is_some()
+        && frame_loader_key(tag).is_some_and(|loads| key.eq_ignore_ascii_case(loads))
+    {
+        return AttrWrite::Keep;
+    }
+    value.map_or(AttrWrite::Remove, |v| AttrWrite::Set(Cow::Borrowed(v)))
+}
+
+/// The frame-loading elements a detached holder is fenced on.
+const FRAME_SELECTOR: &str = "iframe, embed, object, frame";
+
+/// Fence every frame `frames` of a detached holder before its nodes connect:
+/// an `iframe` gets the canonical sandbox, and an `embed`, `object` or `frame`
+/// holding the attribute it loads from is removed.
+fn fence_frames(frames: &web_sys::NodeList) -> Result<(), &'static str> {
+    for i in 0..frames.length() {
+        let Some(element) = frames
+            .item(i)
+            .and_then(|node| node.dyn_into::<web_sys::Element>().ok())
+        else {
+            continue;
+        };
+        let tag = element.local_name();
+        if tag.eq_ignore_ascii_case(IFRAME_TAG) {
+            let held = element.get_attribute(SANDBOX_ATTR).unwrap_or_default();
+            element
+                .set_attribute(SANDBOX_ATTR, &SandboxTokens::parse(&held).canonical())
+                .map_err(|_| "frame sandbox could not be set")?;
+        } else if frame_loader_key(&tag).is_some_and(|loads| element.has_attribute(loads)) {
+            element.remove();
+        }
+    }
+    Ok(())
+}
+
+/// The HTML namespace.
+const HTML_NS: &str = "http://www.w3.org/1999/xhtml";
+
+/// Markup parsed detached, every `autofocus` already removed and every frame
+/// fenced.
+struct Detached {
+    /// The holder whose children are the parsed nodes.
+    nodes: web_sys::Node,
+    /// The first element that carried `autofocus`, in document order.
+    autofocus: Option<web_sys::Element>,
+}
+
+/// `html` parsed detached in `el`'s own namespace and context, with every
+/// `autofocus` removed before the nodes connect: the browser focuses an
+/// autofocus element on insertion while focus is on the body. Every frame is
+/// fenced there too (`fence_frames`), as a detached holder loads no document,
+/// so no document a patch frames shares the app's origin. The holder is an
+/// element of `el`'s own tag, so the parser reads the markup in the insertion
+/// mode `el` sets (a `<tr>` below a `<tbody>`); a custom element's name would
+/// run its constructor on the holder, so it gets a `div`, and a template's
+/// markup is parsed into a template's inert content.
+fn parse_detached(
+    document: &web_sys::Document,
+    el: &web_sys::Element,
+    html: &str,
+) -> Result<Detached, &'static str> {
+    let local = el.local_name();
+    let ns = el.namespace_uri();
+    let html_ns = ns.as_deref() == Some(HTML_NS);
+    let tag = if html_ns && local.contains('-') {
+        "div"
+    } else {
+        local.as_str()
+    };
+    let holder = document
+        .create_element_ns(ns.as_deref(), tag)
+        .map_err(|_| "detached patch holder refused")?;
+    holder.set_inner_html(html);
+    let template = if html_ns {
+        holder.dyn_ref::<web_sys::HtmlTemplateElement>()
+    } else {
+        None
+    };
+    let (nodes, found, frames): (web_sys::Node, _, _) = if let Some(template) = template {
+        let content = template.content();
+        let found = content.query_selector_all("[autofocus]");
+        let frames = content.query_selector_all(FRAME_SELECTOR);
+        (content.into(), found, frames)
+    } else {
+        let found = holder.query_selector_all("[autofocus]");
+        let frames = holder.query_selector_all(FRAME_SELECTOR);
+        (holder.into(), found, frames)
+    };
+    fence_frames(&frames.map_err(|_| "frame query refused")?)?;
+    let found = found.map_err(|_| "autofocus query refused")?;
+    let mut autofocus = None;
+    for i in 0..found.length() {
+        let Some(element) = found
+            .item(i)
+            .and_then(|node| node.dyn_into::<web_sys::Element>().ok())
+        else {
+            continue;
+        };
+        element
+            .remove_attribute("autofocus")
+            .map_err(|_| "autofocus could not be removed")?;
+        if autofocus.is_none() {
+            autofocus = Some(element);
+        }
+    }
+    Ok(Detached { nodes, autofocus })
+}
+
+/// Move every child of `from` to the end of `to`, in order.
+fn move_children(from: &web_sys::Node, to: &web_sys::Node) -> Result<(), &'static str> {
+    while let Some(child) = from.first_child() {
+        to.append_child(&child)
+            .map_err(|_| "patched node could not be attached")?;
+    }
+    Ok(())
+}
+
+/// The node whose children are `el`'s markup: a template's inert content, or
+/// `el` itself.
+fn markup_parent(el: &web_sys::Element) -> web_sys::Node {
+    match el.dyn_ref::<web_sys::HtmlTemplateElement>() {
+        Some(template) if el.namespace_uri().as_deref() == Some(HTML_NS) => {
+            template.content().into()
+        }
+        _ => el.clone().into(),
+    }
+}
+
+/// Replace `el`'s children with `html`, parsed by [`parse_detached`].
+pub fn replace_children_html(document: &web_sys::Document, el: &web_sys::Element, html: &str) {
+    let replaced = parse_detached(document, el, html).and_then(|parsed| {
+        let live = markup_parent(el);
+        live.set_text_content(None);
+        move_children(&parsed.nodes, &live)
+    });
+    if let Err(why) = replaced {
+        console_fatal("PatchTargetLost", why);
+    }
+}
+
+/// Paint `html` as the mount root's first content, parsed by
+/// [`parse_detached`], and focus its first `autofocus` element only while the
+/// load's own autofocus is still due: focus is on the body, the user has not
+/// pressed a key or the pointer or moved focus since the loader ran
+/// ([`load_autofocus_spent`]), and the URL fragment names no element. The
+/// runtime makes the move, as `client.js` does at mount, so no render-inserted
+/// `autofocus` reaches the browser's own focus-on-insertion.
+///
+/// # Errors
+///
+/// [`MountRefusal::Dom`] when the browser refuses a step of the detached parse
+/// or the move into `root`.
+pub fn paint_first(
+    document: &web_sys::Document,
+    root: &web_sys::HtmlElement,
+    html: &str,
+) -> Result<(), MountRefusal> {
+    let refusal = |step: &'static str| MountRefusal::Dom { step, detail: None };
+    let due =
+        focus_on_body(document) && !load_autofocus_spent() && fragment_target(document).is_none();
+    let parsed = parse_detached(document, root, html).map_err(refusal)?;
+    root.set_text_content(None);
+    move_children(&parsed.nodes, root).map_err(refusal)?;
+    if due
+        && fragment_target(document).is_none()
+        && let Some(target) = parsed.autofocus
+        && let Some(target) = target.dyn_ref::<web_sys::HtmlElement>()
+    {
+        runtime_focus(|| {
+            let _ = target.focus();
+        });
+    }
+    Ok(())
+}
+
+/// Whether the loader heard one of
+/// [`AUTOFOCUS_SPENDING_EVENTS`](crate::dom::diff::AUTOFOCUS_SPENDING_EVENTS): it sets
+/// [`AUTOFOCUS_SPENT_GLOBAL`]. A global that cannot be read counts as spent.
+fn load_autofocus_spent() -> bool {
+    match js_sys::Reflect::get(
+        &js_sys::global(),
+        &JsValue::from_str(AUTOFOCUS_SPENT_GLOBAL),
+    ) {
+        Ok(value) => value.is_truthy(),
+        Err(_) => true,
+    }
+}
+
+/// Whether focus is on the body, or on nothing.
+fn focus_on_body(document: &web_sys::Document) -> bool {
+    match (document.active_element(), document.body()) {
+        (None, _) => true,
+        (Some(active), Some(body)) => {
+            let body: &web_sys::Element = body.as_ref();
+            active == *body
+        }
+        (Some(_), None) => false,
+    }
+}
+
+/// The element the URL fragment names, raw or percent-decoded, read from the
+/// URL itself: `:target` matches only once the browser has applied it.
+fn fragment_target(document: &web_sys::Document) -> Option<web_sys::Element> {
+    let hash = document.location()?.hash().ok()?;
+    let raw = hash.strip_prefix('#').unwrap_or(&hash);
+    if raw.is_empty() {
+        return None;
+    }
+    document.get_element_by_id(raw).or_else(|| {
+        let decoded: String = js_sys::decode_uri_component(raw).ok()?.into();
+        document.get_element_by_id(&decoded)
+    })
+}
+
 /// Apply the same `Vec<Patch>` the SSE wire serialises, via typed web-sys
 /// calls. Target lookup is by the `ipe-id` attribute, exactly as `client.js`.
 fn apply_patches(patches: &[Patch]) {
@@ -1215,8 +1735,7 @@ fn apply_patches(patches: &[Patch]) {
         return;
     };
     for p in patches {
-        let selector = format!("[ipe-id=\"{}\"]", p.id.replace('"', "\\\""));
-        let Ok(Some(el)) = document.query_selector(&selector) else {
+        let Ok(Some(el)) = document.query_selector(&ipe_id_selector(&p.id)) else {
             // A stale id can appear when a parent html-replace in this same
             // batch already rewrote the subtree — benign, matching client.js.
             continue;
@@ -1231,7 +1750,7 @@ fn apply_patches(patches: &[Patch]) {
         if let Some(html) = &p.html {
             // Sanitiser-gated: `Patch.html` is produced exclusively by
             // `render_html` over the new subtree.
-            el.set_inner_html(html);
+            replace_children_html(&document, &el, html);
         }
         for (k, v) in &p.attrs {
             // `CustomElement.node` down-state: on a compiler-generated `ipe-ce-*` node the
@@ -1240,23 +1759,43 @@ fn apply_patches(patches: &[Patch]) {
             // glue's `set state(v)` setter forwards the decoded object to the
             // author hook — data handed to a setter, never spliced into markup.
             if k == "state" && widget::is_widget_tag(&el.tag_name().to_lowercase()) {
-                widget::set_widget_down_property(&el, v);
+                widget::set_widget_down_property(&el, v.as_deref().unwrap_or_default());
                 continue;
             }
-            if v.is_empty() {
-                let _ = el.remove_attribute(k);
-            } else {
-                let _ = el.set_attribute(k, v);
-                sync_dom_property(&el, k, v);
-            }
+            write_patched_attr(&el, k, v.as_deref());
         }
     }
 }
 
+/// Write one patched attribute onto the live `el`: `Some` sets, `None`
+/// removes, both through the frame rule of `attr_write` — an iframe holds a
+/// sandbox before it holds a URL, and a frame loader never gains its URL.
+pub fn write_patched_attr(el: &web_sys::Element, key: &str, value: Option<&str>) {
+    let sandboxed = el.has_attribute(SANDBOX_ATTR);
+    match attr_write(&el.local_name(), key, value, sandboxed) {
+        AttrWrite::Set(v) => {
+            let _ = el.set_attribute(key, &v);
+            sync_dom_property(el, key, &v);
+        }
+        AttrWrite::SandboxThenSet(v) => {
+            if el.set_attribute(SANDBOX_ATTR, "").is_ok() {
+                let _ = el.set_attribute(key, v);
+            }
+        }
+        AttrWrite::Remove => {
+            let _ = el.remove_attribute(key);
+            clear_dom_property(el, key);
+        }
+        AttrWrite::Keep => {}
+    }
+}
+
 /// Attributes whose DOM *property* does not reflect from the attribute —
-/// mirror `client.js`'s value/checked/selected/disabled sync.
+/// mirror `client.js`'s value/checked/selected/disabled sync: a set property
+/// follows its value unless the value spells `false`, the empty value
+/// included, as the attribute `checked=""` checks.
 fn sync_dom_property(el: &web_sys::Element, key: &str, val: &str) {
-    let truthy = !val.is_empty() && val != "false";
+    let truthy = val != "false";
     match key {
         "value" => {
             if let Some(input) = el.dyn_ref::<web_sys::HtmlInputElement>() {
@@ -1278,5 +1817,211 @@ fn sync_dom_property(el: &web_sys::Element, key: &str, val: &str) {
             }
         }
         _ => {}
+    }
+}
+
+/// A removed attribute clears the property it mirrors, as `client.js`.
+fn clear_dom_property(el: &web_sys::Element, key: &str) {
+    if key == "checked" || key == "disabled" {
+        sync_dom_property(el, key, "false");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use wasm_bindgen_test::wasm_bindgen_test;
+
+    const TRUSTED: Arrival = Arrival {
+        trusted: true,
+        composing: false,
+    };
+    const UNTRUSTED: Arrival = Arrival {
+        trusted: false,
+        composing: false,
+    };
+    const COMPOSING: Arrival = Arrival {
+        trusted: true,
+        composing: true,
+    };
+
+    fn mark(epoch: u64, at: u8) -> FocusMark<u8> {
+        FocusMark {
+            epoch,
+            at: Some(at),
+        }
+    }
+
+    #[wasm_bindgen_test]
+    fn a_batch_of_the_users_own_events_with_focus_unmoved_is_addressed() {
+        let cause = Cause::Idle
+            .with(Source::User, || mark(3, 1))
+            .with(Source::User, || mark(4, 2));
+        assert!(cause.addressed(&mark(3, 1)));
+        assert!(!cause.addressed(&mark(4, 2)));
+    }
+
+    #[wasm_bindgen_test]
+    fn a_batch_an_effect_joined_never_moves_focus() {
+        let before = Cause::Idle
+            .with(Source::Effect, || mark(0, 1))
+            .with(Source::User, || mark(0, 1));
+        assert!(!before.addressed(&mark(0, 1)));
+        let after = Cause::Idle
+            .with(Source::User, || mark(0, 1))
+            .with(Source::Effect, || mark(0, 1))
+            .with(Source::User, || mark(0, 1));
+        assert!(!after.addressed(&mark(0, 1)));
+        assert!(!Cause::<u8>::Idle.addressed(&mark(0, 1)));
+    }
+
+    #[wasm_bindgen_test]
+    fn only_a_trusted_deliberate_input_counts_as_the_users() {
+        let alone = Cause::Idle.with(Source::Unproven, || mark(0, 1));
+        assert!(!alone.addressed(&mark(0, 1)));
+        let joined = Cause::Idle
+            .with(Source::User, || mark(0, 1))
+            .with(Source::Unproven, || mark(0, 1));
+        assert!(!joined.addressed(&mark(0, 1)));
+        let raised = [
+            widget::UP_WIRE_NAME,
+            widget::up_event_name(),
+            "mouseover",
+            "mouseout",
+            "focus",
+            "blur",
+            "focusin",
+            "focusout",
+            "dblclick",
+            "",
+            "CLICK",
+        ];
+        for name in raised {
+            assert_eq!(listener_source(name, TRUSTED), Source::Unproven, "{name}");
+        }
+        let acts = ["click", "input", "change", "submit", "keydown", "keyup"];
+        for name in acts {
+            assert_eq!(listener_source(name, TRUSTED), Source::User, "{name}");
+            assert_eq!(listener_source(name, UNTRUSTED), Source::Unproven, "{name}");
+            assert_eq!(listener_source(name, COMPOSING), Source::Unproven, "{name}");
+            runtime_focus(|| {
+                assert_eq!(listener_source(name, TRUSTED), Source::Unproven, "{name}");
+            });
+        }
+        for &(name, input) in DELEGATED_EVENTS {
+            let user = input == Input::Deliberate;
+            assert_eq!(
+                listener_source(name, TRUSTED) == Source::User,
+                user,
+                "{name}"
+            );
+            assert_eq!(acts.contains(&name), user, "{name}");
+        }
+    }
+
+    #[wasm_bindgen_test]
+    fn focus_moved_between_queue_and_frame_is_not_addressed() {
+        let cause = Cause::Idle.with(Source::User, || mark(5, 1));
+        assert!(!cause.addressed(&mark(6, 1)));
+        assert!(!cause.addressed(&mark(5, 2)));
+        assert!(!cause.addressed(&FocusMark { epoch: 5, at: None }));
+    }
+
+    #[wasm_bindgen_test]
+    fn the_runtimes_own_focus_move_is_not_the_users() {
+        let start = FOCUS_EPOCH.with(Cell::get);
+        runtime_focus(note_focus_move);
+        assert_eq!(FOCUS_EPOCH.with(Cell::get), start);
+        assert!(!RUNTIME_FOCUSING.with(Cell::get));
+        note_focus_move();
+        assert_eq!(FOCUS_EPOCH.with(Cell::get), start.wrapping_add(1));
+    }
+
+    #[wasm_bindgen_test]
+    fn an_ipe_id_selector_cannot_leave_its_string() {
+        assert_eq!(ipe_id_selector("r_0_1"), r#"[ipe-id="r_0_1"]"#);
+        assert_eq!(
+            ipe_id_selector(r#"a"],[autofocus"#),
+            r#"[ipe-id="a\"],[autofocus"]"#
+        );
+        assert_eq!(ipe_id_selector(r#"a\"b"#), r#"[ipe-id="a\\\"b"]"#);
+        assert_eq!(ipe_id_selector("a\nb\0"), "[ipe-id=\"a\\a b\u{FFFD}\"]");
+    }
+
+    /// The write of a set to `v`, borrowed.
+    const fn set(v: &str) -> AttrWrite<'_> {
+        AttrWrite::Set(Cow::Borrowed(v))
+    }
+
+    #[wasm_bindgen_test]
+    fn a_patch_never_writes_autofocus() {
+        let write = |key, value| attr_write("div", key, value, false);
+        assert_eq!(write("autofocus", Some("")), AttrWrite::Remove);
+        assert_eq!(write("autofocus", Some("autofocus")), AttrWrite::Remove);
+        assert_eq!(write("AutoFocus", Some("true")), AttrWrite::Remove);
+        assert_eq!(write("class", Some("a")), set("a"));
+        assert_eq!(write("class", Some("")), set(""));
+        assert_eq!(write("class", None), AttrWrite::Remove);
+    }
+
+    /// An `iframe`'s `sandbox` is never removed, and a set is canonical.
+    #[wasm_bindgen_test]
+    fn a_patch_never_removes_an_iframe_sandbox() {
+        for (tag, key) in [("iframe", "sandbox"), ("IFRAME", "SandBox")] {
+            assert_eq!(attr_write(tag, key, None, true), AttrWrite::Keep);
+            assert_eq!(
+                attr_write(
+                    tag,
+                    key,
+                    Some("ALLOW-SCRIPTS allow-same-origin allow-forms"),
+                    true
+                ),
+                set("allow-forms allow-scripts")
+            );
+            assert_eq!(
+                attr_write(tag, key, Some("allow-popups-to-escape-sandbox"), true),
+                set("")
+            );
+        }
+        assert_eq!(attr_write("div", "sandbox", None, false), AttrWrite::Remove);
+    }
+
+    /// A frame loader never gains the attribute it loads from, in any case.
+    #[wasm_bindgen_test]
+    fn a_patch_never_gives_a_frame_loader_its_url() {
+        for (tag, key) in [
+            ("embed", "src"),
+            ("EMBED", "SRC"),
+            ("object", "data"),
+            ("frame", "Src"),
+        ] {
+            for value in ["", " ", "/"] {
+                assert_eq!(
+                    attr_write(tag, key, Some(value), false),
+                    AttrWrite::Keep,
+                    "{tag} {key}"
+                );
+            }
+            assert_eq!(attr_write(tag, key, None, false), AttrWrite::Remove);
+        }
+        assert_eq!(attr_write("embed", "type", Some("x"), false), set("x"));
+        assert_eq!(attr_write("object", "src", Some("/"), false), set("/"));
+    }
+
+    /// A `src` patched onto an `iframe` with no sandbox writes the empty
+    /// sandbox first; one already sandboxed only sets the `src`.
+    #[wasm_bindgen_test]
+    fn an_iframe_src_patch_sandboxes_first() {
+        assert_eq!(
+            attr_write("iframe", "src", Some("/"), false),
+            AttrWrite::SandboxThenSet("/")
+        );
+        assert_eq!(
+            attr_write("iframe", "SRC", Some(""), false),
+            AttrWrite::SandboxThenSet("")
+        );
+        assert_eq!(attr_write("iframe", "src", Some("/"), true), set("/"));
+        assert_eq!(attr_write("iframe", "src", None, false), AttrWrite::Remove);
+        assert_eq!(attr_write("div", "src", Some("/"), false), set("/"));
     }
 }

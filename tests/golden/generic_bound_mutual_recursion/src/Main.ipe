@@ -1,0 +1,44 @@
+module Main exposing (main)
+
+-- SEAL repro: mutually recursive forwarders. `evens` forwards each element
+-- into `count`, whose `x` sits under a callback parameter and needs
+-- `Send + 'static`; `odds` reaches `count` only through `evens`. The fixpoint
+-- must carry the bound around the cycle, or the emitted crate is ipe-accepted
+-- but fails `cargo build` with E0277.
+--
+-- Output: the counts at two instantiations of `x`.
+
+import Ipe.Error exposing (Error)
+import Ipe.Io as Io
+import Ipe.String as String
+import Ipe.Task as Task exposing (Task)
+
+
+count : (x -> Int) -> x -> Int
+count weigh v =
+    weigh v
+
+
+evens : List x -> Int
+evens xs =
+    case xs of
+        [] ->
+            0
+
+        y :: rest ->
+            count (\_ -> 1) y + odds rest
+
+
+odds : List x -> Int
+odds xs =
+    case xs of
+        [] ->
+            0
+
+        _ :: rest ->
+            evens rest
+
+
+main : Task Error ()
+main =
+    Io.println (String.fromInt (evens [ 1, 2, 3, 4, 5 ]) ++ " " ++ String.fromInt (odds [ "a", "b", "c" ]))

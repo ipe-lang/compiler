@@ -1,6 +1,7 @@
 module TypedRowsTests exposing (checks)
 
 import Ipe.Db as Db
+import Ipe.Db.Location exposing (Mode(..))
 import Ipe.Error as Error
 import Ipe.List as List
 import Ipe.Maybe as Maybe
@@ -8,12 +9,13 @@ import Ipe.Result as Result exposing (Result(..))
 import Ipe.String as String
 import Ipe.Task as Task
 import Lib.Db as LibDb exposing (HistoryCursor(..), ReviewEntry(..), StoredDecision(..), Unverified(..))
+import Lib.Label as Label exposing (LabelPart(..))
 import Lib.Links as Links exposing (Link(..))
 import Lib.PageSize as PageSize exposing (PageSize)
 import Lib.Queue as Queue exposing (UnitPageState(..))
 import Lib.SafeText as SafeText
 import Lib.Uid as Uid exposing (Uid)
-import TestSupport exposing (appendSigned, check, codeText, countingVerifier, freshDir, rawKeyCheckFor, rawRow, uid)
+import TestSupport exposing (openFileAt, appendSigned, check, codeText, countingVerifier, freshDir, rawKeyCheckFor, rawRow, uid)
 
 
 -- ── unit ids ────────────────────────────────────────────────────────────
@@ -42,10 +44,8 @@ uidParseRefuses =
         , String.repeat 63 "a" ++ codeText 65345
         , String.repeat 63 "a" ++ codeText 1635
         ]
-        && Result.map Uid.toString (Uid.parse hex)
-        == Ok hex
-        && Result.map Uid.toString (Uid.parse "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef")
-        == Ok "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+        && Result.map TestSupport.uidHex (Uid.parse hex) == Ok hex
+        && Result.map TestSupport.uidHex (Uid.parse "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef") == Ok "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
 
 
 -- True when `raw` is refused as invalid input.
@@ -69,8 +69,7 @@ routeUidRefusedNotQueried =
         && entryRefused ("../" ++ String.repeat 61 "a")
         && entryRefused (String.repeat 64 "F")
         && entryAccepted (uid "u-a")
-        && Queue.unitPageStatusText UnitIdRefused
-        == Just "This address does not name a unit."
+        && Maybe.map SafeText.toString (Queue.unitPageStatusText UnitIdRefused) == Just "This address does not name a unit."
 
 
 entryRefused : String -> Bool
@@ -88,7 +87,7 @@ entryRefused raw =
 
 entryAccepted : Uid -> Bool
 entryAccepted unit =
-    case Queue.unitPageEntry (Uid.toString unit) of
+    case Queue.unitPageEntry (TestSupport.uidHex unit) of
         Ok entered ->
             entered == unit
 
@@ -97,27 +96,28 @@ entryAccepted unit =
 
 
 -- A stored link target that is not a unit id builds no internal link: its
--- name shows as plain text, keyed apart from every internal link, whether it
+-- name shows as its label, keyed apart from every internal link, whether it
 -- came from a callgraph edge or a resolved reference. Red if `Internal` is
 -- built from an unparsed uid.
 badLinkUidRendersText : Bool
 badLinkUidRendersText =
     let
+        name =
+            Label.fromText Label.labelCap "app::x"
+
         edge =
-            Links.internal "app::x" "zz"
+            Links.internal name "zz"
 
         resolved =
-            Links.resolveCandidates [ [ "x" ] ] [ ( "x", "../evil" ) ]
+            Links.resolveCandidates [ [ "x" ] ] [ ( "x", Just "../evil" ) ]
     in
     isUnlinked edge
-        && SafeText.toString (Links.label edge)
-        == "app::x"
-        && Links.linkKey edge
-        == "t:app::x"
+        && Links.label edge == name
+        && Label.parts name == [ LabelText "app::x" ]
+        && Links.linkKey edge == Links.UnlinkedKey (Label.key name)
         && List.all isUnlinked resolved
-        && List.length resolved
-        == 1
-        && not (isUnlinked (Links.internal "app::y" (Uid.toString (uid "u-y"))))
+        && List.length resolved == 1
+        && not (isUnlinked (Links.internal (Label.fromText Label.labelCap "app::y") (TestSupport.uidHex (uid "u-y"))))
 
 
 isUnlinked : Link -> Bool
@@ -236,10 +236,10 @@ uncheckedReview : String -> List (List SqlValue) -> Task.Task Error Db
 uncheckedReview name rows =
     do
         base <- freshDir name
-        db <- Db.open "sqlite" ("sqlite://" ++ base ++ "/review.db?mode=rwc")
+        db <- openFileAt CreateIfMissing (base ++ "/review.db")
         Db.exec db "CREATE TABLE review (uid TEXT NOT NULL, body_hash TEXT NOT NULL, decision TEXT NOT NULL, reason TEXT, reviewed_at INTEGER NOT NULL, PRIMARY KEY (uid, body_hash))" []
         Task.sequence (List.map (Db.exec db "INSERT INTO review (uid, body_hash, decision, reason, reviewed_at) VALUES (?,?,?,?,?)") rows)
-        Db.exec db "CREATE TABLE review_log (seq INTEGER PRIMARY KEY, uid TEXT NOT NULL, body_hash TEXT NOT NULL, decision TEXT NOT NULL, reason TEXT, reviewed_at INTEGER NOT NULL, prev TEXT NOT NULL, mac TEXT NOT NULL)" []
+        Db.exec db "CREATE TABLE review_log (seq INTEGER PRIMARY KEY, uid TEXT NOT NULL, body_hash TEXT NOT NULL, decision TEXT NOT NULL, reason TEXT, reviewed_at INTEGER NOT NULL, prev TEXT NOT NULL, mac TEXT NOT NULL, unit_kind TEXT, unit_qualified TEXT, unit_path TEXT, unit_line INTEGER)" []
         Db.exec db "CREATE TABLE review_log_head (one INTEGER PRIMARY KEY, log_id TEXT NOT NULL, seq INTEGER NOT NULL, head TEXT NOT NULL, key_check TEXT)" []
         Db.exec db "INSERT INTO review_log_head (one, log_id, seq, head, key_check) VALUES (1, ?, 0, 'genesis', ?)" [ SqlString uncheckedLogId, SqlString (rawKeyCheckFor uncheckedLogId) ]
         Task.succeed db
@@ -250,12 +250,13 @@ uncheckedLogId =
     "00112233445566778899aabbccddeeff"
 
 
--- True when `task` fails with an error that names `unit`.
-failsNaming : Uid -> String -> Task.Task Error a -> Task.Task Error Bool
-failsNaming unit stored task =
+-- True when `task` fails with an error that repeats neither `unit`'s text
+-- nor `stored`.
+failsUnnamed : Uid -> String -> Task.Task Error a -> Task.Task Error Bool
+failsUnnamed unit stored task =
     task
         |> Task.map (\_ -> False)
-        |> Task.onError (\e -> Task.succeed (String.contains (Uid.toString unit) (Error.toString e) && not (String.contains stored (Error.toString e))))
+        |> Task.onError (\e -> Task.succeed (not (String.contains (TestSupport.uidHex unit) (Error.toString e)) && not (String.contains stored (Error.toString e))))
 
 
 -- True when `task` fails with an error that does not repeat `stored`.
@@ -267,18 +268,20 @@ failsWithout stored task =
 
 
 -- A legacy decision that is neither `approve` nor `refuse` fails every read
--- of its row with a typed error naming the row's uid; a legacy uid that is
--- not a unit id fails the History page. Neither error repeats the stored
--- text. A signed log entry holding such a decision is never counted: it
--- reads `Tampered`, and the uid has no previous review.
--- Red if an unknown decision reads as any decision.
+-- of its row with a typed error; a legacy uid that is not a unit id fails
+-- the History page. Neither error repeats the stored text, and the first
+-- repeats no uid: a uid leaves its type only through its sink exits. A
+-- signed log entry holding such a decision is never counted: it reads
+-- `Tampered`, and the uid has no previous review.
+-- Red if an unknown decision reads as any decision, or its error names the
+-- uid.
 unknownStoredDecisionRefused : Task.Task Error Bool
 unknownStoredDecisionRefused =
     do
         db <- uncheckedReview "ipe-review-unknown-decision" [ [ Uid.toSql (uid "u-m"), SqlString "h", SqlString "maybe", SqlNull (SqlString ""), SqlInt 1 ] ]
         verify <- countingVerifier db
-        byPair <- failsNaming (uid "u-m") "maybe" (LibDb.findDecision verify db (uid "u-m") "h")
-        page <- failsNaming (uid "u-m") "maybe" (LibDb.historyPage verify db PageSize.history HistoryStart)
+        byPair <- failsUnnamed (uid "u-m") "maybe" (LibDb.findDecision verify db (uid "u-m") "h")
+        page <- failsUnnamed (uid "u-m") "maybe" (LibDb.historyPage verify db PageSize.history HistoryStart)
         bad <- uncheckedReview "ipe-review-bad-uid" [ [ SqlString "zz", SqlString "h", SqlString "approve", SqlNull (SqlString ""), SqlInt 1 ] ]
         badVerify <- countingVerifier bad
         badUid <- failsWithout "zz" (LibDb.historyPage badVerify bad PageSize.history HistoryStart)
@@ -356,6 +359,6 @@ checks =
         , Task.succeed ( "a page size below one row or past the ceiling has no representation", pageSizeRefuses )
         , Task.succeed ( "a rebuild bound that passes the largest integer has no representation", resyncBoundRefusesOverflow )
         , Task.succeed ( "a rebuild bound below one page has no representation", resyncBoundRefusesZeroCeiling )
-        , check "a stored decision this reviewer does not know fails its reads, naming the uid" unknownStoredDecisionRefused
+        , check "a stored decision this reviewer does not know fails its reads, naming neither the uid nor the decision" unknownStoredDecisionRefused
         , check "a stored refusal with no reason reads as a blank refusal" refuseWithNullReasonIsBlank
         ]

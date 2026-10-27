@@ -6,6 +6,18 @@ use std::collections::BTreeSet;
 use ipe_intern::Symbol;
 use ipe_ir::IrType;
 
+/// Every generic the emitted signature `params -> ret` names: the one set that
+/// decides both a def's declared Rust generics and the generics its body reads
+/// as erased (`Lowerer::with_erased_tvars`).
+pub(super) fn signature_generics(params: &[(Symbol, IrType)], ret: &IrType) -> BTreeSet<Symbol> {
+    let mut named = BTreeSet::new();
+    for (_, ty) in params {
+        collect_ir_generic_syms(ty, &mut named);
+    }
+    collect_ir_generic_syms(ret, &mut named);
+    named
+}
+
 /// Recursively collect every [`IrType::Generic`] symbol that appears
 /// structurally in `ty`.
 ///
@@ -18,7 +30,7 @@ use ipe_ir::IrType;
 /// `params`, so it appears in `used_generics` and therefore in `type_params`,
 /// while a return-position `any` resolved away from `ret` does not.
 #[allow(clippy::too_many_lines)] // one arm per IrType variant, deliberately exhaustive
-pub(super) fn collect_ir_generic_syms(ty: &IrType, out: &mut BTreeSet<Symbol>) {
+fn collect_ir_generic_syms(ty: &IrType, out: &mut BTreeSet<Symbol>) {
     match ty {
         IrType::Generic(sym) => {
             out.insert(*sym);
@@ -108,6 +120,7 @@ pub(super) fn collect_ir_generic_syms(ty: &IrType, out: &mut BTreeSet<Symbol>) {
         | IrType::UrlRelative
         // `Dsn` is non-parametric — no generic syms.
         | IrType::Dsn
+        | IrType::DbLocation
         | IrType::Connection | IrType::ConnReadOnly | IrType::ConnReadWrite
         | IrType::Setting | IrType::ShapeWeb | IrType::ShapeWebView | IrType::ShapeTerminal
         // Process-run-with cfg + Cache config / stats + Csv document are
@@ -251,6 +264,7 @@ pub(super) fn default_generics_to_unit(ty: IrType, targets: &BTreeSet<Symbol>) -
         | IrType::Url
         | IrType::UrlRelative
         | IrType::Dsn
+        | IrType::DbLocation
         | IrType::Connection
         | IrType::ConnReadOnly
         | IrType::ConnReadWrite

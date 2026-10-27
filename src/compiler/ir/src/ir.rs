@@ -117,7 +117,7 @@ pub struct Module {
     /// Set by `ipe_lower` when any call site resolves to a
     /// `KernelFn::is_config()` variant. The backend reads this flag to decide
     /// whether to declare `pub mod config_decode; pub use config_decode::*;` in
-    /// the emitted `ipe_runtime/mod.rs` and add the `toml` + `serde_yaml`
+    /// the emitted `ipe_runtime/mod.rs` and add the TOML and YAML parser
     /// dependencies. The JSON-backed `Config.*` combinators (`string` / `field`
     /// / `map` / …) emit into the `json` module and do NOT set this
     /// flag, so a JSON-only program pulls neither crate.
@@ -673,6 +673,36 @@ impl BoundSet {
         self.0 == 0
     }
 
+    /// Whether every bound in this set holds for [`IrType::Json`] (`JsonVal`,
+    /// which is `Clone + PartialEq + Eq + Hash + Send + Sync + 'static` and
+    /// nothing more). An ordering, `Copy`, arithmetic, rendering, row or
+    /// bind-parameter bound does not.
+    #[must_use]
+    pub const fn met_by_json(self) -> bool {
+        let json_traits =
+            Self::CLONE | Self::EQ | Self::HASH | Self::STATIC | Self::SEND | Self::SYNC;
+        self.0 & !json_traits == 0
+    }
+
+    /// Whether every bound in this set holds for [`IrType::Unit`] (`()`, which
+    /// is `Clone + Copy + PartialEq + Eq + PartialOrd + Ord + Hash +
+    /// IpeStringify + Send + Sync + 'static`). An arithmetic, interpolation,
+    /// row or bind-parameter bound does not.
+    #[must_use]
+    pub const fn met_by_unit(self) -> bool {
+        let unit_traits = Self::CLONE
+            | Self::COPY
+            | Self::EQ
+            | Self::ORD
+            | Self::ORD_TOTAL
+            | Self::HASH
+            | Self::SHOW
+            | Self::STATIC
+            | Self::SEND
+            | Self::SYNC;
+        self.0 & !unit_traits == 0
+    }
+
     /// This set with the `::core::ops::Add<Output = Self>` (Number `+`) bound.
     #[must_use]
     pub const fn with_add(self) -> Self {
@@ -897,9 +927,232 @@ pub struct Func {
     /// witness bounds, and every use-site agree. `R`-prefixed names cannot
     /// collide with the `T`-prefixed ordinary type generics.
     pub row_params: Vec<RowParam>,
-    pub params: Vec<(Symbol, IrType)>,
+    pub params: Vec<crate::Param>,
     pub ret: IrType,
     pub body: Expr,
+}
+
+impl Func {
+    /// The source-level name and home of this function.
+    ///
+    /// `None` when a symbol does not resolve through `interner`. Every
+    /// refusal that names a function builds its site here.
+    #[must_use]
+    pub fn emit_site(&self, interner: &ipe_intern::Interner) -> Option<ipe_diagnostics::EmitSite> {
+        let home = self
+            .home
+            .0
+            .iter()
+            .map(|segment| interner.resolve(*segment).map(Box::<str>::from))
+            .collect::<Option<Box<[Box<str>]>>>()?;
+        let name = interner.resolve(self.name)?.into();
+        Some(ipe_diagnostics::EmitSite { home, name })
+    }
+
+    /// This function's name and home as raw symbol indices, for the compiler
+    /// bug a refusal raises when [`Self::emit_site`] is `None`: the symbols do
+    /// not resolve, so their indices are the only faithful rendering.
+    #[must_use]
+    pub fn unresolved_symbols(&self) -> String {
+        let home = self
+            .home
+            .0
+            .iter()
+            .map(|segment| segment.as_raw().to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!(
+            "name symbol {} or home symbols [{home}]",
+            self.name.as_raw()
+        )
+    }
+
+    /// The type parameters some parameter type names. A call's arguments let
+    /// rustc infer each of them, so a pin on one renders only when it is
+    /// [`UserPin::Unit`] ([`UserPin::renders`]).
+    #[must_use]
+    pub fn generics_named_by_params(&self) -> BTreeSet<Symbol> {
+        let mut named: Vec<Symbol> = Vec::new();
+        for param in &self.params {
+            collect_generics(&param.ty, &mut named);
+        }
+        named.into_iter().collect()
+    }
+
+    /// The type parameters the return type names: a caller observes each of
+    /// them through the value the call returns.
+    #[must_use]
+    pub fn generics_named_by_ret(&self) -> BTreeSet<Symbol> {
+        let mut named: Vec<Symbol> = Vec::new();
+        collect_generics(&self.ret, &mut named);
+        named.into_iter().collect()
+    }
+
+    /// The type parameters a parameter of a closure the return type yields
+    /// names, along its arrow spine: a caller applying the returned closure
+    /// fixes each of them through the argument it passes.
+    #[must_use]
+    pub fn generics_named_by_ret_args(&self) -> BTreeSet<Symbol> {
+        let mut named: Vec<Symbol> = Vec::new();
+        let mut spine = &self.ret;
+        while let IrType::Fun(params, ret)
+        | IrType::SharedFun(params, ret)
+        | IrType::FnOnceChain(params, ret) = spine
+        {
+            for param in params {
+                collect_generics(param, &mut named);
+            }
+            spine = ret;
+        }
+        named.into_iter().collect()
+    }
+}
+
+/// Collect the distinct [`IrType::Generic`] symbols in `ty`, appending each (in
+/// first-occurrence order) to `out` if not already present.
+#[allow(clippy::too_many_lines)] // one exhaustive arm per IrType variant — the completeness is the point
+pub fn collect_generics(ty: &IrType, out: &mut Vec<Symbol>) {
+    match ty {
+        IrType::Generic(s) => {
+            if !out.contains(s) {
+                out.push(*s);
+            }
+        }
+        IrType::Tuple(elems) => {
+            for e in elems {
+                collect_generics(e, out);
+            }
+        }
+        IrType::Record(map) => {
+            for v in map.values() {
+                collect_generics(v, out);
+            }
+        }
+        IrType::Fun(params, ret)
+        | IrType::SharedFun(params, ret)
+        | IrType::FnOnceChain(params, ret) => {
+            for p in params {
+                collect_generics(p, out);
+            }
+            collect_generics(ret, out);
+        }
+        IrType::Enum { args, .. } => {
+            for a in args {
+                collect_generics(a, out);
+            }
+        }
+        IrType::Maybe(elem) | IrType::List(elem) => collect_generics(elem, out),
+        IrType::Result(err, ok) => {
+            collect_generics(err, out);
+            collect_generics(ok, out);
+        }
+        IrType::Dict(k, v) => {
+            collect_generics(k, out);
+            collect_generics(v, out);
+        }
+        IrType::Set(a) => collect_generics(a, out),
+        IrType::Decoder(inner) | IrType::Task(inner) | IrType::Cmd(inner) | IrType::Sub(inner) => {
+            collect_generics(inner, out);
+        }
+        IrType::Int
+        | IrType::Float
+        | IrType::Bool
+        | IrType::Str
+        | IrType::Char
+        | IrType::Unit
+        | IrType::Bytes
+        | IrType::Json
+        // `Db` is monomorphic — no generic parameters to collect.
+        | IrType::Db
+        // Opaque server types are monomorphic.
+        | IrType::ServerRequest
+        | IrType::ServerResponse
+        | IrType::ServerRoute
+        | IrType::ServerCookie
+        // `StreamWriter` is monomorphic — no generics to collect.
+        | IrType::StreamWriter
+        // `HttpRequest` is monomorphic — no generics to collect.
+        | IrType::HttpRequest
+        // `Regex` is a monomorphic opaque handle — no generics to collect.
+        | IrType::Regex
+        // `WsHandle` / `WsServerCfg` are monomorphic — no generics to collect.
+        | IrType::WebSocketServer
+        | IrType::WebSocketServerCfg
+        // nullary plain types and the opaque live request handle
+        // contribute no generics.
+        | IrType::UiPlain(_)
+        | IrType::WebReq
+        | IrType::SessionHandle
+        // `Order` is monomorphic — no generics to collect.
+        // `HttpMethod` is monomorphic — no generics to collect.
+        // `Decimal` is monomorphic — no generics to collect.
+        // `BackoffStrategy` is monomorphic — no generics to collect.
+        | IrType::BackoffStrategy
+        | IrType::Order
+        | IrType::HttpMethod
+        | IrType::Decimal
+        | IrType::ErrorKind
+        | IrType::Error
+        | IrType::ErrorDetails
+        // Nominal error-payload leaves (SEAL fix) — monomorphic
+        // runtime structs, same classification as `Error`/`ErrorDetails`.
+        | IrType::ErrorInfo
+        | IrType::PanicInfo
+        | IrType::TypeInfo
+        // `SqlFragment` is monomorphic — no generics to collect.
+        // `Secret` is monomorphic — no generics to collect.
+        | IrType::SqlFragment
+        | IrType::Secret
+        | IrType::Path
+        // `Url` is a monomorphic opaque wrapper — no generics to collect.
+        | IrType::Url
+        | IrType::UrlRelative
+        // `Dsn` is a monomorphic opaque wrapper — no generics to collect.
+        | IrType::Dsn
+        | IrType::DbLocation
+        | IrType::Connection
+        | IrType::ConnReadOnly
+        | IrType::ConnReadWrite
+        | IrType::Setting | IrType::ShapeWeb | IrType::ShapeWebView | IrType::ShapeTerminal
+        // Process-run-with cfg + Cache config / stats + Csv document are
+        // monomorphic — no generics to collect.
+        | IrType::ProcessRunWithCfg
+        | IrType::ProcessRunInPtyCfg
+        | IrType::CacheCfg
+        | IrType::WebSocketClientCfg
+        | IrType::CacheStats
+        | IrType::CsvDoc
+        // Ipe.Email records + provider ADT are monomorphic — no generics.
+        | IrType::EmailMessage
+        | IrType::EmailAttachment
+        | IrType::EmailSesConfig
+        | IrType::EmailSmtpConfig
+        | IrType::EmailProvider
+        // Typed security newtypes are monomorphic opaque wrappers — no generics.
+        | IrType::CryptoKey
+        | IrType::CryptoMac
+        | IrType::EmailAddress
+        // `Locale` is monomorphic — no generics to collect.
+        | IrType::Locale
+        // `Principal` is monomorphic — no generics to collect.
+        | IrType::Principal
+        // `AuthConfig` / `TokenSource` are monomorphic — no generics to collect.
+        | IrType::AuthConfig
+        | IrType::TokenSource
+        // Shape opaque app leaves — monomorphic, no generics to collect.
+        | IrType::WebApp | IrType::TuiApp | IrType::CliApp | IrType::WorkerApp
+        // A row variable is a separate row generic (`R{n}`), tracked in
+        // `Func::row_params`, never in the ordinary `T{n}` scope collected here.
+        | IrType::RowGeneric(_) => {}
+        // `WebRoute page` may carry generic parameters through `page`.
+        IrType::WebRoute(page) => collect_generics(page, out),
+        IrType::CustomElement { down, up } => {
+            collect_generics(down, out);
+            collect_generics(up, out);
+        }
+        // `Ui { ctor, msg }` may carry generic parameters through `msg`.
+        IrType::Ui { msg, .. } => collect_generics(msg, out),
+    }
 }
 
 /// A row variable's required-field contract — the single source of truth for
@@ -925,6 +1178,12 @@ pub struct RowParam {
     /// Field names from `fields` that are updated in the function body.
     /// Drives `IpeWithF` setter witness synthesis in the backend.
     pub updated_fields: BTreeSet<Symbol>,
+    /// The auto-trait and `Clone` bounds the lowerer finalized for this row
+    /// variable.
+    ///
+    /// Only `'static`, `Send`, `Sync` and `Clone` bits are meaningful; the
+    /// backend renders exactly this set beside the field witnesses.
+    pub bounds: BoundSet,
 }
 
 /// The type lattice.
@@ -1639,6 +1898,14 @@ pub enum IrType {
     /// (a `Dsn` in a Model field is a compile-time rejection, same posture as
     /// `Secret`/`Url`).
     Dsn,
+    // ── Ipe.Db.Location ─────────────────────────────────────────────────────
+    /// Opaque typed database location `Db.open` takes
+    /// (`ipe_runtime::db::DbLocation`).
+    ///
+    /// Minted only by `Ipe.Db.Location.file` (a fail-closed parse of a `Path`),
+    /// `memory`, and `dsn`; it may carry a `Dsn`, so it is `Clone`, `Debug` is
+    /// redacted, and it is non-serde (same posture as `Dsn`).
+    DbLocation,
     // ── Ipe.Db external Connection ──────────────────────────────────────────
     /// The external-database connection handle `Connection mode`
     /// (`ipe_runtime::external_conn::ExternalConnection`), distinct from the app's
@@ -1892,6 +2159,7 @@ pub fn ir_type_is_derivable(
         // `Dsn` derives Clone; `Debug` is hand-written (redacting) — fully
         // derivable, not serde (carries a `Secret`).
         | IrType::Dsn
+        | IrType::DbLocation
         // Cache config / stats + Csv document + process-run config runtime
         // structs derive Clone+Debug+PartialEq.
         | IrType::ProcessRunWithCfg
@@ -2168,6 +2436,7 @@ pub fn ir_type_is_serde(ty: &IrType, enum_serde: &impl Fn(&ModPath, Symbol) -> b
         // `ipe_runtime::dsn::Dsn` has no serde impl), so a Model field of type
         // `Dsn` is a compile-time IPE-L0120, same posture as `Url` / `Secret`.
         | IrType::Dsn
+        | IrType::DbLocation
         // Cache config / stats + Csv document + process-run config are
         // kernel-boundary data records — derivable (see `ir_type_is_derivable`)
         // but never persisted to a session store, so not serde.
@@ -2385,6 +2654,7 @@ pub const fn ir_type_feature_requirement(ty: &IrType) -> Option<RuntimeFeatureId
         // standalone but share `Connection`'s gate (fail-closed).
         IrType::SqlFragment
         | IrType::Dsn
+        | IrType::DbLocation
         | IrType::Connection
         | IrType::ConnReadOnly
         | IrType::ConnReadWrite => Some(RuntimeFeatureId::Db),
@@ -2549,6 +2819,7 @@ pub fn carrier_leaf(ty: &IrType) -> CarrierLeaf<'_> {
         | IrType::UrlRelative
         // `Dsn` clones its String fields + `Secret` (a String clone).
         | IrType::Dsn
+        | IrType::DbLocation
         | IrType::Db
         // The external connection wraps `Clone` sqlx pools; the phantom markers
         // never carry a runtime value but must stay exhaustive.
@@ -3158,6 +3429,151 @@ pub enum Expr {
     TailRecur {
         args: Vec<Self>,
     },
+    /// Clone each of `syms` from its enclosing binding, shadowing it, then `body`.
+    ///
+    /// Reads as `let s0 = s0.clone(); let s1 = s1.clone(); …; body`, in
+    /// `syms` order: a `move` closure in `body` then captures the fresh clone
+    /// and leaves the enclosing binding intact. Every capture pre-clone of one
+    /// closure boundary sits in this one node, so a boundary costs one IR
+    /// level however many symbols it clones. `syms` is never empty. Built
+    /// only by [`Self::pre_clone`] and [`Self::pre_clone_all`]; a self-clone
+    /// [`Self::Let`] (`let s = s.clone()`) is refused after lowering.
+    CaptureClones {
+        syms: Vec<Symbol>,
+        body: Box<Self>,
+    },
+}
+
+impl Expr {
+    /// Pre-clone `sym` around `node`, merging into a [`Self::CaptureClones`] `node`.
+    ///
+    /// `sym` is cloned first, before any symbol `node` already clones, which
+    /// is the order the nested single-symbol form would evaluate.
+    #[must_use]
+    pub fn pre_clone(sym: Symbol, node: Self) -> Self {
+        Self::pre_clone_all(vec![sym], node)
+    }
+
+    /// Pre-clone every symbol of `syms`, in order, around `node`.
+    ///
+    /// A [`Self::CaptureClones`] `node` absorbs `syms` ahead of its own list,
+    /// so pre-clones never nest; an empty `syms` returns `node` unchanged.
+    #[must_use]
+    pub fn pre_clone_all(mut syms: Vec<Symbol>, node: Self) -> Self {
+        if syms.is_empty() {
+            return node;
+        }
+        match node {
+            Self::CaptureClones { syms: inner, body } => {
+                syms.extend(inner);
+                Self::CaptureClones { syms, body }
+            }
+            other => Self::CaptureClones {
+                syms,
+                body: Box::new(other),
+            },
+        }
+    }
+
+    /// Is this a self-clone `let s = s.clone() in ..`, the shape [`Self::pre_clone`] replaces?
+    #[must_use]
+    pub fn is_self_clone_let(&self) -> bool {
+        matches!(self, Self::Let { name, value, .. } if matches!(**value, Self::CloneVar(v) if v == *name))
+    }
+}
+
+/// Refuse a lowered program that holds a self-clone [`Expr::Let`].
+///
+/// A capture clone is one [`Expr::CaptureClones`] node built by
+/// [`Expr::pre_clone`]; a nested self-clone `let` is a builder that bypassed
+/// it and would multiply the IR depth by the number of captured symbols. The
+/// walk stops at [`crate::MAX_IR_RENDER_DEPTH`], where the emitter's own
+/// depth refusal takes over.
+///
+/// # Errors
+/// [`Diagnostic::CompilerBug`] naming the first function that holds one.
+pub fn refuse_self_clone_lets(
+    program: &Program,
+    interner: &ipe_intern::Interner,
+) -> Result<(), Diagnostic> {
+    let Some(func) = program
+        .modules
+        .iter()
+        .flat_map(|m| m.funcs.iter())
+        .find(|f| holds_self_clone_let(&f.body, 0))
+    else {
+        return Ok(());
+    };
+    let named = func.emit_site(interner).map_or_else(
+        || format!("function {}", func.id.as_raw()),
+        |site| format!("function `{}`", site.qualified()),
+    );
+    Err(Diagnostic::CompilerBug {
+        where_: "ipe_ir::refuse_self_clone_lets",
+        detail: format!(
+            "{named} binds a capture clone as a nested `let`, not through `Expr::pre_clone`"
+        ),
+    })
+}
+
+/// Does `expr` hold a self-clone [`Expr::Let`] within the IR depth ceiling?
+fn holds_self_clone_let(expr: &Expr, depth: u16) -> bool {
+    let Some(next) = depth
+        .checked_add(1)
+        .filter(|d| *d <= crate::MAX_IR_RENDER_DEPTH)
+    else {
+        return false;
+    };
+    let go = |e: &Expr| holds_self_clone_let(e, next);
+    match expr {
+        Expr::Int(_)
+        | Expr::Bool(_)
+        | Expr::Float(_)
+        | Expr::Str(_)
+        | Expr::CustomElementRef { .. }
+        | Expr::Char(_)
+        | Expr::Unit
+        | Expr::FuncValue { .. }
+        | Expr::Var(_)
+        | Expr::CloneVar(_) => false,
+        Expr::Let { value, body, .. } => expr.is_self_clone_let() || go(value) || go(body),
+        Expr::Ctor { args, .. }
+        | Expr::Call { args, .. }
+        | Expr::TailRecur { args }
+        | Expr::Tuple(args)
+        | Expr::List { items: args, .. } => args.iter().any(go),
+        Expr::BinOp { lhs, rhs, .. }
+        | Expr::Cons {
+            head: lhs,
+            tail: rhs,
+        }
+        | Expr::TaskSeq {
+            effect: lhs,
+            rest: rhs,
+        }
+        | Expr::Destructure {
+            value: lhs,
+            body: rhs,
+            ..
+        } => go(lhs) || go(rhs),
+        Expr::If { cond, then_, else_ } => go(cond) || go(then_) || go(else_),
+        Expr::Match(m) => {
+            go(m.scrutinee())
+                || m.arms()
+                    .iter()
+                    .any(|arm| go(&arm.body) || arm.guard.as_ref().is_some_and(go))
+        }
+        Expr::ListIndexClone { list, .. } | Expr::ListLenCheck { list, .. } => go(list),
+        Expr::Access { record, .. } => go(record),
+        Expr::Record { fields, .. } => fields.iter().any(|(_, e)| go(e)),
+        Expr::Update { record, fields } => go(record) || fields.iter().any(|(_, e)| go(e)),
+        Expr::Lambda { body, .. }
+        | Expr::SharedLambda { body, .. }
+        | Expr::OnceLambda { body, .. }
+        | Expr::TailLoop { body, .. }
+        | Expr::CaptureClones { body, .. } => go(body),
+        Expr::Apply { func, args } => go(func) || args.iter().any(go),
+    }
 }
 
 /// The target of a [`Expr::Call`].
@@ -3260,10 +3676,10 @@ impl<'a> Iterator for EvalOrder<'a> {
     }
 }
 
-/// A per-call-site turbofish pin for a polymorphic kernel.
+/// A per-call-site turbofish pin for a polymorphic callee.
 ///
-/// Set when the HM solver left the kernel's free result type parameter
-/// genuinely unconstrained. Each variant names the SEMANTIC default the emitter
+/// Set when the HM solver left one of the callee's type parameters genuinely
+/// unconstrained at this use. Each variant names the SEMANTIC default the emitter
 /// renders; the mapping to a concrete `::<…>` suffix lives in the backend
 /// (`emit_expr`), so this enum stays a small, typed decision — never a raw
 /// string in the IR.
@@ -3272,7 +3688,7 @@ impl<'a> Iterator for EvalOrder<'a> {
 /// parameter is a bare type variable NOT bound by an enclosing generic
 /// signature; a concrete parameter needs no pin (rustc infers it) and stays
 /// [`Self::None`].
-#[derive(Clone, Copy, PartialEq, Eq, Debug, serde::Serialize, serde::Deserialize, Default)]
+#[derive(Clone, PartialEq, Eq, Debug, serde::Serialize, serde::Deserialize, Default)]
 pub enum CallPin {
     /// No turbofish — the common case (rustc infers every type parameter).
     #[default]
@@ -3293,13 +3709,84 @@ pub enum CallPin {
     /// error type — `::<IpeError>`. Used by `decimal_from_string<E: From<String>>`
     /// when the `Err` channel is discarded.
     ErrIpeError,
+    /// A USER generic function's type parameters this use pins, keyed by the
+    /// callee [`Func::type_params`] symbol; every other parameter renders `_`.
+    /// Only a [`Callee::Func`] call carries it.
+    User(BTreeMap<Symbol, UserPin>),
+}
+
+/// How a use pins one type parameter of a user generic callee.
+#[derive(Clone, PartialEq, Eq, Debug, serde::Serialize, serde::Deserialize)]
+pub enum UserPin {
+    /// `()`: a message slot or `any` return this use leaves unconstrained,
+    /// the type the use's own node type lowered it to.
+    Unit,
+    /// The use's solved instantiation of a parameter its declared arguments
+    /// name, rendered when no emitted parameter of the callee names it (an
+    /// argument lowering erased it), so its return alone cannot leave rustc
+    /// without the type.
+    Instance(IrType),
+    /// An instantiation the use could not lower, holding the lowering's own
+    /// refusal: the backend returns it when the parameter must render, so the
+    /// reason is never replaced by a compiler bug.
+    ///
+    /// Never serialized: a program holding one does not enter the IR cache,
+    /// and a cached program never deserializes into one.
+    #[serde(skip)]
+    Unlowered(Box<Diagnostic>),
+    /// An instantiation this use leaves open, of a parameter the callee's
+    /// declared arguments name, holding the refusal for a callee whose
+    /// emitted return still names the parameter, and whether a program enum
+    /// parameter no field uses holds it ([`ArgumentErasure`]).
+    ///
+    /// Settled once the callee's emitted signature is final: dropped when an
+    /// emitted parameter, or a parameter of a closure the return yields,
+    /// names it (the argument the caller passes fixes it); `()` when no
+    /// emitted position does; when only the return otherwise does, the
+    /// refusal for [`ArgumentErasure::UnusedEnumParameter`] (the caller would
+    /// observe a type no argument fixes) and dropped for
+    /// [`ArgumentErasure::Other`], leaving the type to the call's context.
+    /// Never reaches the backend.
+    #[serde(skip)]
+    Open(Box<Diagnostic>, ArgumentErasure),
+}
+
+/// Why the emitted parameters of a callee may not name a type parameter one
+/// of its declared arguments names, as the lowering that drops the argument
+/// decides it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ArgumentErasure {
+    /// A parameter of a program enum that no field uses holds the variable:
+    /// lowering erases that parameter from the declaration and every
+    /// application, since the declaration keeping it is refused by rustc
+    /// (E0392) whatever any call site supplies.
+    UnusedEnumParameter,
+    /// Any other position: an opaque carrier's dropped argument (`Cache k v`,
+    /// a store row type), a builtin's erased marker, or an emitted position.
+    Other,
+}
+
+impl UserPin {
+    /// Whether a call renders this pin for a callee type parameter, given
+    /// whether some callee parameter type names it
+    /// ([`Func::generics_named_by_params`]): the one rule the backend renders
+    /// by and the lowerer prunes by, so an unrendered pin never reaches the
+    /// type-mention walkers.
+    #[must_use]
+    pub const fn renders(&self, named_by_params: bool) -> bool {
+        match self {
+            Self::Unit => true,
+            Self::Instance(_) | Self::Unlowered(_) | Self::Open(..) => !named_by_params,
+        }
+    }
 }
 
 impl CallPin {
     /// The turbofish suffix this pin renders immediately after a kernel's name
     /// (before its `(` argument list): `dict_empty::<String, i64>(…)`, etc.
     /// [`Self::None`] renders the empty string, so an unpinned call emits no
-    /// turbofish.
+    /// turbofish. [`Self::User`] has no fixed suffix — its rendering needs
+    /// the callee's generic layout — so it is `None`.
     ///
     /// The concrete default types (`i64` / `String` / `IpeError`) mirror the
     /// polymorphic-kernel defaults: a genuinely
@@ -3308,14 +3795,32 @@ impl CallPin {
     /// inhabited default is sound — `i64` and `String` are the reference's
     /// canonical choices, `IpeError` the project's canonical error type.
     #[must_use]
-    pub const fn turbofish(self) -> &'static str {
+    pub const fn kernel_turbofish(&self) -> Option<&'static str> {
         match self {
-            Self::None => "",
-            Self::DefaultI64 => "::<i64>",
-            Self::DefaultDict => "::<String, i64>",
-            Self::DefaultResultMapErr => "::<_, _, i64>",
-            Self::ErrIpeError => "::<IpeError>",
+            Self::None => Some(""),
+            Self::DefaultI64 => Some("::<i64>"),
+            Self::DefaultDict => Some("::<String, i64>"),
+            Self::DefaultResultMapErr => Some("::<_, _, i64>"),
+            Self::ErrIpeError => Some("::<IpeError>"),
+            Self::User(_) => None,
         }
+    }
+
+    /// Every type this pin may render, the one source the type-mention walkers
+    /// read so a pinned type keeps its definitions and features alive.
+    pub fn pinned_types(&self) -> impl Iterator<Item = &IrType> {
+        let pins = match self {
+            Self::User(pins) => Some(pins.values()),
+            Self::None
+            | Self::DefaultI64
+            | Self::DefaultDict
+            | Self::DefaultResultMapErr
+            | Self::ErrIpeError => None,
+        };
+        pins.into_iter().flatten().filter_map(|pin| match pin {
+            UserPin::Instance(ty) => Some(ty),
+            UserPin::Unit | UserPin::Unlowered(_) | UserPin::Open(..) => None,
+        })
     }
 }
 
@@ -3586,16 +4091,91 @@ pub enum Pat {
         /// borrowing arm clones a binder out.
         elem: IrType,
     },
-    /// An or-pattern `p0 | p1 | …` — matches if ANY alternative matches. Each
-    /// alternative is an arbitrary [`Pat`] and recurses. Every alternative binds
-    /// the identical set of names at identical types (proved upstream in
-    /// canon/types), so a single copy of the arm body reads those binders
-    /// regardless of which alternative matched. The backend renders this as the
-    /// native Rust or-pattern `p0 | p1 | …`, joining the rendered sub-patterns
-    /// with ` | `, with the arm body emitted exactly once. Refutable (it
-    /// discriminates). Invariant: length ≥ 2 — the lowerer never wraps a lone
-    /// alternative.
-    Or(Vec<Self>),
+    /// An or-pattern `p0 | p1 | …` — matches if ANY alternative matches.
+    ///
+    /// The alternatives are a [`SharedAlts`]: binder-free constructor or
+    /// literal leaves that discriminate at depth 1, so no alternative carries a
+    /// binder, a string guard slot, a slice or a nested sub-pattern. It appears
+    /// only as a whole case-arm head; the lowerer splits every other or-pattern
+    /// into consecutive single-pattern arms before lowering. The backend renders
+    /// the native Rust or-pattern `p0 | p1 | …` with the arm body emitted once.
+    Or(SharedAlts),
+}
+
+/// The alternatives of an or-pattern.
+///
+/// At least two, each a constructor with every argument [`Pat::Wildcard`], or an
+/// [`Pat::Int`] / [`Pat::Char`] / [`Pat::Bool`] literal. Built only by
+/// [`SharedAlts::new`]; a decoded value passes the same proof.
+#[derive(Clone, PartialEq, Eq, Debug, serde::Serialize)]
+pub struct SharedAlts(Vec<Pat>);
+
+impl SharedAlts {
+    /// Prove `alts` is a binder-free depth-1 alternative set.
+    ///
+    /// `None` when fewer than two alternatives are given, or any alternative is
+    /// not a constructor whose every argument is `_`, nor an `Int` / `Char` /
+    /// `Bool` literal.
+    #[must_use]
+    pub fn new(alts: Vec<Pat>) -> Option<Self> {
+        (alts.len() >= 2 && alts.iter().all(is_shared_alternative)).then_some(Self(alts))
+    }
+
+    /// The alternatives, in source order.
+    #[must_use]
+    pub fn as_slice(&self) -> &[Pat] {
+        &self.0
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for SharedAlts {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let alts = <Vec<Pat> as serde::Deserialize>::deserialize(d)?;
+        Self::new(alts).ok_or_else(|| {
+            <D::Error as serde::de::Error>::custom(
+                "an or-pattern alternative set must hold at least two binder-free \
+                 constructor or Int/Char/Bool literal alternatives",
+            )
+        })
+    }
+}
+
+/// Whether `pat` may stand as one alternative of a [`SharedAlts`].
+fn is_shared_alternative(pat: &Pat) -> bool {
+    match pat {
+        Pat::Ctor { args, .. } => args.iter().all(|a| matches!(a, Pat::Wildcard)),
+        Pat::Int(_) | Pat::Char(_) | Pat::Bool(_) => true,
+        Pat::Var(_)
+        | Pat::Wildcard
+        | Pat::Str(_)
+        | Pat::Alias(..)
+        | Pat::Tuple(_)
+        | Pat::Record(_)
+        | Pat::Slice { .. }
+        | Pat::Or(_) => false,
+    }
+}
+
+/// The heads an arm pattern discriminates on.
+///
+/// An [`Pat::Or`]'s alternatives, or the pattern itself otherwise, so a
+/// head-keyed decision reads through the or-pattern instead of misclassifying it.
+#[must_use]
+pub fn head_alternatives(pat: &Pat) -> &[Pat] {
+    match pat {
+        Pat::Or(alts) => alts.as_slice(),
+        Pat::Var(_)
+        | Pat::Wildcard
+        | Pat::Int(_)
+        | Pat::Bool(_)
+        | Pat::Char(_)
+        | Pat::Str(_)
+        | Pat::Alias(..)
+        | Pat::Ctor { .. }
+        | Pat::Tuple(_)
+        | Pat::Record(_)
+        | Pat::Slice { .. } => std::slice::from_ref(pat),
+    }
 }
 
 /// How a list pattern's binders take their elements.
@@ -3612,19 +4192,22 @@ pub enum SliceOwnership {
 
 /// Whether a pattern matches EVERY value of its scrutinee type.
 ///
-/// True for a wildcard, a variable binder, or an alias whose inner pattern is
-/// itself irrefutable. Used to prove a flat `match`'s trailing arm is a genuine
-/// catch-all.
+/// Used to prove a flat `match`'s trailing arm is a genuine catch-all.
+///
+/// | Pattern | Irrefutable |
+/// |---|---|
+/// | `_`, a variable | yes |
+/// | `inner as name` | when `inner` is |
+/// | `p0 \| p1 \| …` | when any alternative is (the row canon's `Pattern_::is_irrefutable` shares) |
+/// | a tuple | no: product cover is proved by [`is_product_shaped`] (canon's `PTuple` is irrefutable when its elements are) |
+/// | a literal, constructor, record or slice | no |
 #[must_use]
 pub fn is_irrefutable(pat: &Pat) -> bool {
     match pat {
         Pat::Wildcard | Pat::Var(_) => true,
         Pat::Alias(inner, _) => is_irrefutable(inner),
-        // An or-pattern is irrefutable only if every alternative is — in practice
-        // never for a well-formed `≥ 2` or-pattern (two distinct irrefutable
-        // alternatives are redundant), so it routes through the refutable
-        // `Match` path.
-        Pat::Or(alts) => alts.iter().all(is_irrefutable),
+        // An or-pattern matches whenever one alternative does.
+        Pat::Or(alts) => alts.as_slice().iter().any(is_irrefutable),
         Pat::Int(_)
         | Pat::Bool(_)
         | Pat::Char(_)
@@ -3694,9 +4277,8 @@ pub fn is_list_shaped(pat: &Pat) -> bool {
     match pat {
         Pat::Slice { .. } | Pat::Wildcard | Pat::Var(_) => true,
         Pat::Alias(inner, _) => is_list_shaped(inner),
-        // An or-pattern is list-shaped iff every alternative is (`[] | [_]`),
-        // so a list `case` written with alternatives still reads as list-shaped.
-        Pat::Or(alts) => alts.iter().all(is_list_shaped),
+        // An or-pattern is list-shaped iff every alternative is.
+        Pat::Or(alts) => alts.as_slice().iter().all(is_list_shaped),
         Pat::Int(_)
         | Pat::Bool(_)
         | Pat::Char(_)
@@ -3720,7 +4302,7 @@ pub fn is_ctor_headed(pat: &Pat) -> bool {
         // An or-pattern is constructor-headed iff every alternative is
         // (`Red | Green`), so an alternative-written enum cover reads as a
         // constructor-discrimination arm set.
-        Pat::Or(alts) => alts.iter().all(is_ctor_headed),
+        Pat::Or(alts) => alts.as_slice().iter().all(is_ctor_headed),
         Pat::Wildcard
         | Pat::Var(_)
         | Pat::Int(_)
@@ -3745,7 +4327,7 @@ pub fn is_product_shaped(pat: &Pat) -> bool {
         Pat::Tuple(_) | Pat::Wildcard | Pat::Var(_) => true,
         Pat::Alias(inner, _) => is_product_shaped(inner),
         // An or-pattern is product-shaped iff every alternative is.
-        Pat::Or(alts) => alts.iter().all(is_product_shaped),
+        Pat::Or(alts) => alts.as_slice().iter().all(is_product_shaped),
         Pat::Int(_)
         | Pat::Bool(_)
         | Pat::Char(_)
@@ -3873,13 +4455,14 @@ impl Match {
         let expected: BTreeSet<Symbol> = variants.iter().copied().collect();
 
         let mut covered: BTreeSet<Symbol> = BTreeSet::new();
-        for arm in &arms {
-            // The case-arm head is always a constructor pattern (payload binders
-            // are sub-patterns). A bare variable / wildcard whole-scrutinee arm
-            // routes through `new_flat`, so a non-ctor arm head here is an
-            // internal invariant violation, surfaced as a `CompilerBug` rather
-            // than silently skewing the coverage set.
-            let Pat::Ctor { variant, .. } = &arm.pat else {
+        for head in arms.iter().flat_map(|a| head_alternatives(&a.pat)) {
+            // Every case-arm head (each alternative of a native or-pattern
+            // head) is a constructor pattern (payload binders are sub-patterns).
+            // A bare variable / wildcard whole-scrutinee arm routes through
+            // `new_flat`, so a non-ctor head here is an internal invariant
+            // violation, surfaced as a `CompilerBug` rather than silently skewing
+            // the coverage set.
+            let Pat::Ctor { variant, .. } = head else {
                 return Err(Diagnostic::CompilerBug {
                     where_: "ipe_ir::Match::new",
                     detail: "match arm head is not a constructor pattern".to_owned(),
@@ -3954,9 +4537,12 @@ impl Match {
             });
         };
         let trailing_catch_all = is_irrefutable(&last.pat);
-        let bool_complete = arms.iter().all(|a| matches!(a.pat, Pat::Bool(_)))
-            && arms.iter().any(|a| matches!(a.pat, Pat::Bool(true)))
-            && arms.iter().any(|a| matches!(a.pat, Pat::Bool(false)));
+        // Every head-keyed witness reads the flattened heads, so an or-pattern
+        // arm counts as each of its alternatives.
+        let heads = || arms.iter().flat_map(|a| head_alternatives(&a.pat));
+        let bool_complete = heads().all(|h| matches!(h, Pat::Bool(_)))
+            && heads().any(|h| matches!(h, Pat::Bool(true)))
+            && heads().any(|h| matches!(h, Pat::Bool(false)));
         // Constructor-shaped heads (a constructor, or an alias whose inner is one)
         // mean the scrutinee is a finite enum; the upstream Maranget check proved
         // its coverage, so an alias-over-constructor discrimination set with no
@@ -3970,16 +4556,16 @@ impl Match {
         // was proven UPSTREAM by the Maranget usefulness check (IPE-T0010), so an
         // arm set in this shape with no trailing catch-all (`x :: rest` then `[]`)
         // is still sound here.
-        let all_list_shaped = arms.iter().all(|a| is_list_shaped(&a.pat))
-            && arms.iter().any(|a| matches!(a.pat, Pat::Slice { .. }));
+        let all_list_shaped =
+            heads().all(is_list_shaped) && heads().any(|h| matches!(h, Pat::Slice { .. }));
         // A multi-arm tuple `case`: every arm is product-shaped (a tuple pattern,
         // an irrefutable whole-tuple binder, or an alias over those) and at least
         // one is a genuine tuple pattern. A product type is inhabited only by its
         // element tuples, so the upstream Maranget usefulness check (IPE-T0010)
         // already proved coverage before lowering — an arm set in this shape with
         // no trailing catch-all (`(True, _)` then `(False, _)`) is still sound.
-        let all_product_shaped = arms.iter().all(|a| is_product_shaped(&a.pat))
-            && arms.iter().any(|a| matches!(a.pat, Pat::Tuple(_)));
+        let all_product_shaped =
+            heads().all(is_product_shaped) && heads().any(|h| matches!(h, Pat::Tuple(_)));
         if !trailing_catch_all
             && !bool_complete
             && !all_ctor_headed
@@ -4153,6 +4739,7 @@ mod tests {
             (IrType::CryptoMac, RuntimeFeatureId::CryptoCore),
             (IrType::SqlFragment, RuntimeFeatureId::Db),
             (IrType::Dsn, RuntimeFeatureId::Db),
+            (IrType::DbLocation, RuntimeFeatureId::Db),
             (IrType::Connection, RuntimeFeatureId::Db),
             (IrType::ServerRequest, RuntimeFeatureId::Server),
             (IrType::StreamWriter, RuntimeFeatureId::Server),
@@ -4707,6 +5294,189 @@ mod tests {
         Ok(())
     }
 
+    fn nullary(ty: Symbol, variant: Symbol) -> Pat {
+        Pat::Ctor {
+            home: ModPath(vec![]),
+            ty,
+            variant,
+            args: vec![],
+        }
+    }
+
+    #[test]
+    fn shared_alts_new_accepts_binder_free_heads() -> DResult<()> {
+        let mut i = Interner::new();
+        let (ty, inc, dec) = msg_enum(&mut i)?;
+        let wild_arg = Pat::Ctor {
+            home: ModPath(vec![]),
+            ty,
+            variant: inc,
+            args: vec![Pat::Wildcard],
+        };
+        assert!(SharedAlts::new(vec![wild_arg, nullary(ty, dec)]).is_some());
+        assert!(SharedAlts::new(vec![Pat::Int(0), Pat::Int(1)]).is_some());
+        assert!(
+            SharedAlts::new(vec![Pat::Char("a".to_owned()), Pat::Char("b".to_owned())]).is_some()
+        );
+        assert!(SharedAlts::new(vec![Pat::Bool(true), Pat::Bool(false)]).is_some());
+        Ok(())
+    }
+
+    #[test]
+    fn shared_alts_new_refuses_binder() -> DResult<()> {
+        let mut i = Interner::new();
+        let (ty, inc, dec) = msg_enum(&mut i)?;
+        let x = i.intern("x")?;
+        let binds = Pat::Ctor {
+            home: ModPath(vec![]),
+            ty,
+            variant: inc,
+            args: vec![Pat::Var(x)],
+        };
+        assert!(SharedAlts::new(vec![binds, nullary(ty, dec)]).is_none());
+        assert!(SharedAlts::new(vec![Pat::Var(x), Pat::Int(0)]).is_none());
+        assert!(SharedAlts::new(vec![Pat::Wildcard, Pat::Int(0)]).is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn shared_alts_new_refuses_str() {
+        assert!(
+            SharedAlts::new(vec![Pat::Str("a".to_owned()), Pat::Str("b".to_owned())]).is_none()
+        );
+    }
+
+    #[test]
+    fn shared_alts_new_refuses_slice() {
+        let empty = Pat::Slice {
+            prefix: vec![],
+            rest: None,
+            own: SliceOwnership::BorrowClone,
+            elem: IrType::Int,
+        };
+        let one = Pat::Slice {
+            prefix: vec![Pat::Wildcard],
+            rest: None,
+            own: SliceOwnership::BorrowClone,
+            elem: IrType::Int,
+        };
+        assert!(SharedAlts::new(vec![empty, one]).is_none());
+    }
+
+    #[test]
+    fn shared_alts_new_refuses_alias() -> DResult<()> {
+        let mut i = Interner::new();
+        let x = i.intern("x")?;
+        let aliased = Pat::Alias(Box::new(Pat::Int(0)), x);
+        assert!(SharedAlts::new(vec![aliased, Pat::Int(1)]).is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn shared_alts_new_refuses_tuple() -> DResult<()> {
+        let mut i = Interner::new();
+        let (ty, inc, dec) = msg_enum(&mut i)?;
+        let nested = Pat::Ctor {
+            home: ModPath(vec![]),
+            ty,
+            variant: inc,
+            args: vec![nullary(ty, dec)],
+        };
+        assert!(SharedAlts::new(vec![nested, nullary(ty, dec)]).is_none());
+        let tuple = Pat::Tuple(vec![Pat::Int(0), Pat::Wildcard]);
+        let other = Pat::Tuple(vec![Pat::Wildcard, Pat::Int(0)]);
+        assert!(SharedAlts::new(vec![tuple, other]).is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn shared_alts_new_refuses_single() {
+        assert!(SharedAlts::new(vec![Pat::Int(0)]).is_none());
+        assert!(SharedAlts::new(vec![]).is_none());
+    }
+
+    #[test]
+    fn shared_alts_deserialize_refuses_binder() -> Result<(), serde_json::Error> {
+        let mut plain = Interner::new();
+        let x = plain
+            .intern("x")
+            .map_err(|_| <serde_json::Error as serde::de::Error>::custom("intern x"))?;
+        let interner = std::sync::Arc::new(std::sync::Mutex::new(plain));
+        let _guard = ipe_intern::SerdeInternerGuard::install(std::sync::Arc::clone(&interner));
+        let var = serde_json::to_string(&Pat::Var(x))?;
+        let int = serde_json::to_string(&Pat::Int(0))?;
+        let forged = format!("{{\"Or\":[{var},{int}]}}");
+        assert!(serde_json::from_str::<Pat>(&forged).is_err());
+        let sound = format!(
+            "{{\"Or\":[{int},{}]}}",
+            serde_json::to_string(&Pat::Int(1))?
+        );
+        let decoded = serde_json::from_str::<Pat>(&sound)?;
+        assert!(matches!(decoded, Pat::Or(alts) if alts.as_slice().len() == 2));
+        Ok(())
+    }
+
+    #[test]
+    fn new_flat_bool_or_cover() -> DResult<()> {
+        let mut i = Interner::new();
+        let b = i.intern("b")?;
+        // case b of True | False -> 1 — the or-head is a closed Bool cover.
+        let Some(alts) = SharedAlts::new(vec![Pat::Bool(true), Pat::Bool(false)]) else {
+            return Err(Diagnostic::CompilerBug {
+                where_: "test.new_flat_bool_or_cover",
+                detail: "a Bool alternative set is a sound SharedAlts".to_owned(),
+            });
+        };
+        let arms = vec![Arm {
+            pat: Pat::Or(alts),
+            body: Expr::Int(1),
+            guard: None,
+        }];
+        assert!(Match::new_flat(Expr::Var(b), arms).is_ok());
+        Ok(())
+    }
+
+    #[test]
+    fn match_new_covers_through_or_head() -> DResult<()> {
+        let mut i = Interner::new();
+        let (ty, inc, dec) = msg_enum(&mut i)?;
+        let m = i.intern("m")?;
+        let Some(alts) = SharedAlts::new(vec![nullary(ty, inc), nullary(ty, dec)]) else {
+            return Err(Diagnostic::CompilerBug {
+                where_: "test.match_new_covers_through_or_head",
+                detail: "a nullary constructor set is a sound SharedAlts".to_owned(),
+            });
+        };
+        let arms = vec![Arm {
+            pat: Pat::Or(alts),
+            body: Expr::Int(1),
+            guard: None,
+        }];
+        assert!(Match::new(Expr::Var(m), arms, &[inc, dec]).is_ok());
+        let partial = vec![Arm {
+            pat: nullary(ty, inc),
+            body: Expr::Int(1),
+            guard: None,
+        }];
+        assert!(Match::new(Expr::Var(m), partial, &[inc, dec]).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn is_irrefutable_or_any() -> DResult<()> {
+        let mut i = Interner::new();
+        let (ty, inc, dec) = msg_enum(&mut i)?;
+        let Some(alts) = SharedAlts::new(vec![nullary(ty, inc), nullary(ty, dec)]) else {
+            return Err(Diagnostic::CompilerBug {
+                where_: "test.is_irrefutable_or_any",
+                detail: "a nullary constructor set is a sound SharedAlts".to_owned(),
+            });
+        };
+        assert!(!is_irrefutable(&Pat::Or(alts)));
+        assert_eq!(head_alternatives(&Pat::Int(0)), &[Pat::Int(0)]);
+        Ok(())
+    }
+
     #[test]
     fn is_irrefutable_classifies_binders_only() -> DResult<()> {
         let mut i = Interner::new();
@@ -4927,7 +5697,7 @@ mod tests {
             home: ModPath(vec![]),
             type_params: vec![(a, BoundSet::UNBOUNDED)],
             row_params: vec![],
-            params: vec![(x, IrType::Generic(a))],
+            params: vec![crate::Param::owned(x, IrType::Generic(a))],
             ret: IrType::Generic(a),
             body: Expr::Var(x),
         };
@@ -4943,7 +5713,7 @@ mod tests {
             home: ModPath(vec![]),
             type_params: vec![(a, BoundSet::UNBOUNDED), (b, BoundSet::UNBOUNDED)],
             row_params: vec![],
-            params: vec![(x, IrType::Generic(a))],
+            params: vec![crate::Param::owned(x, IrType::Generic(a))],
             ret: IrType::Generic(b),
             body: Expr::Var(x),
         };
@@ -4964,7 +5734,7 @@ mod tests {
             home: ModPath(vec![]),
             type_params: vec![(a, bounds)],
             row_params: vec![],
-            params: vec![(x, IrType::Generic(a))],
+            params: vec![crate::Param::owned(x, IrType::Generic(a))],
             ret: IrType::Generic(a),
             body: Expr::Var(x),
         };
@@ -5483,7 +6253,7 @@ mod serde_persistence_tests {
     // A single exhaustive `Module` struct literal (every `uses_*` gate spelled
     // out) dominates the length; splitting it would only scatter the fixture.
     #[allow(clippy::too_many_lines)]
-    fn sample_program(i: &mut Interner) -> DResult<Program> {
+    pub fn sample_program(i: &mut Interner) -> DResult<Program> {
         let msg_ty = i.intern("Msg")?;
         let inc = i.intern("Increment")?;
         let dec = i.intern("Decrement")?;
@@ -5529,7 +6299,7 @@ mod serde_persistence_tests {
             home: ModPath(vec![]),
             type_params: vec![],
             row_params: vec![],
-            params: vec![(msg_param, IrType::Generic(msg_param))],
+            params: vec![crate::Param::owned(msg_param, IrType::Generic(msg_param))],
             ret: IrType::Unit,
             body,
         };
@@ -5887,6 +6657,100 @@ mod serde_persistence_tests {
         // accidental empty-string comparison).
         assert!(dump_b.contains("Increment") && dump_b.contains("Decrement"));
         assert!(dump_b.contains("main"));
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod capture_clone_tests {
+    use ipe_diagnostics::{DResult, Diagnostic};
+    use ipe_intern::Interner;
+
+    use super::serde_persistence_tests::sample_program;
+    use super::{Expr, IrType, Program, refuse_self_clone_lets};
+    use crate::pretty::pretty;
+
+    /// A closure over `captured`, returning it.
+    fn closure(captured: ipe_intern::Symbol) -> Expr {
+        Expr::Lambda {
+            params: vec![],
+            ret: IrType::Int,
+            body: Box::new(Expr::Var(captured)),
+        }
+    }
+
+    /// The sample program with its entry function's body replaced by `body`.
+    fn program_with_body(i: &mut Interner, body: Expr) -> DResult<Program> {
+        let mut program = sample_program(i)?;
+        if let Some(func) = program
+            .modules
+            .first_mut()
+            .and_then(|m| m.funcs.first_mut())
+        {
+            func.body = body;
+        }
+        Ok(program)
+    }
+
+    /// A capture clone hand-built as a nested self-clone `let` is refused at
+    /// lowering exit, naming the function; the same clone as one
+    /// `CaptureClones` node passes.
+    #[test]
+    fn self_clone_let_is_refused() -> DResult<()> {
+        let mut i = Interner::new();
+        let a = i.intern("a")?;
+        let nested = Expr::Let {
+            name: a,
+            value: Box::new(Expr::CloneVar(a)),
+            body: Box::new(closure(a)),
+        };
+        assert!(nested.is_self_clone_let());
+        let refused = refuse_self_clone_lets(&program_with_body(&mut i, nested)?, &i);
+        let Err(Diagnostic::CompilerBug { where_, detail }) = refused else {
+            assert!(
+                matches!(refused, Err(Diagnostic::CompilerBug { .. })),
+                "a self-clone `let` must be a compiler bug, got {refused:?}"
+            );
+            return Ok(());
+        };
+        assert_eq!(where_, "ipe_ir::refuse_self_clone_lets");
+        assert!(
+            detail.contains("function `main`"),
+            "the refusal names the function: {detail}"
+        );
+
+        let flat = Expr::pre_clone(a, closure(a));
+        let passed = refuse_self_clone_lets(&program_with_body(&mut i, flat)?, &i);
+        assert!(
+            passed.is_ok(),
+            "one `CaptureClones` node passes: {passed:?}"
+        );
+        Ok(())
+    }
+
+    /// Pre-cloning around a pre-clone merges into the one node, the outer
+    /// symbol first, and the node prints as one level.
+    #[test]
+    fn pre_clone_merges_into_one_node() -> DResult<()> {
+        let mut i = Interner::new();
+        let a = i.intern("a")?;
+        let b = i.intern("b")?;
+        let merged = Expr::pre_clone(b, Expr::pre_clone(a, closure(a)));
+        assert_eq!(
+            merged,
+            Expr::CaptureClones {
+                syms: vec![b, a],
+                body: Box::new(closure(a)),
+            }
+        );
+        assert_eq!(Expr::pre_clone_all(vec![], closure(a)), closure(a));
+        let text = pretty(&program_with_body(&mut i, merged)?, &i);
+        assert_eq!(
+            text.matches("CaptureClones").count(),
+            1,
+            "one node for both clones: {text}"
+        );
+        assert!(text.contains("CaptureClones b, a"), "{text}");
         Ok(())
     }
 }

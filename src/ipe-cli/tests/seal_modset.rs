@@ -33,15 +33,8 @@ type BoxError = Box<dyn std::error::Error + Send + Sync + 'static>;
 /// Emit `ipe_source` for shape `name` and `cargo build` the emitted crate.
 /// Returns `Ok(())` iff `ipe` exits 0 AND the emitted crate builds — THE SEAL.
 fn emit_and_build(name: &str, ipe_source: &str) -> Result<(), BoxError> {
-    let src_dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
-        .join(format!("seal_modset_{name}_ipe"));
-    let _ = std::fs::remove_dir_all(&src_dir);
-    std::fs::create_dir_all(&src_dir)
-        .map_err(|e| -> BoxError { format!("{name}: cannot create src dir: {e}").into() })?;
-
-    let entry = src_dir.join("Main.ipe");
-    std::fs::write(&entry, ipe_source)
-        .map_err(|e| -> BoxError { format!("{name}: cannot write Main.ipe: {e}").into() })?;
+    let fixture = ipe::RootFixture::main(ipe_source)
+        .map_err(|e| -> BoxError { format!("{name}: cannot write the fixture: {e}").into() })?;
 
     let out_dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
         .join(format!("seal_modset_{name}_emitted"));
@@ -50,7 +43,7 @@ fn emit_and_build(name: &str, ipe_source: &str) -> Result<(), BoxError> {
     let runtime = e2e_support::require_runtime().into_path_buf();
 
     // ipe accept — a codegen bug or a rejection surfaces here.
-    ipe::build(&entry, &out_dir, &runtime)
+    ipe::build_fixture(&fixture, &out_dir, &runtime)
         .map_err(|e| -> BoxError { format!("{name}: ipe dev build failed: {e}").into() })?;
 
     // THE real test: the emitted crate must `cargo build` (exit 0). A missing
@@ -69,15 +62,8 @@ fn emit_and_build(name: &str, ipe_source: &str) -> Result<(), BoxError> {
 /// items, causing E0425/E0412 at `cargo build` despite `ipe` exit 0 — a SEAL
 /// breach that the default dep-model tests cannot catch.
 fn emit_and_build_vendored(name: &str, ipe_source: &str) -> Result<(), BoxError> {
-    let src_dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
-        .join(format!("seal_modset_{name}_ipe"));
-    let _ = std::fs::remove_dir_all(&src_dir);
-    std::fs::create_dir_all(&src_dir)
-        .map_err(|e| -> BoxError { format!("{name}: cannot create src dir: {e}").into() })?;
-
-    let entry = src_dir.join("Main.ipe");
-    std::fs::write(&entry, ipe_source)
-        .map_err(|e| -> BoxError { format!("{name}: cannot write Main.ipe: {e}").into() })?;
+    let fixture = ipe::RootFixture::main(ipe_source)
+        .map_err(|e| -> BoxError { format!("{name}: cannot write the fixture: {e}").into() })?;
 
     let out_dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
         .join(format!("seal_modset_{name}_emitted"));
@@ -91,9 +77,9 @@ fn emit_and_build_vendored(name: &str, ipe_source: &str) -> Result<(), BoxError>
         runtime_dep: false,
         ..ipe::BuildOptions::default()
     };
-    ipe::build_with_options(&entry, &out_dir, &runtime, options).map_err(|e| -> BoxError {
-        format!("{name}: ipe dev build (vendored) failed: {e}").into()
-    })?;
+    ipe::build_fixture_with_options(&fixture, &out_dir, &runtime, &options).map_err(
+        |e| -> BoxError { format!("{name}: ipe dev build (vendored) failed: {e}").into() },
+    )?;
 
     e2e_support::build_rust_binary(name, &out_dir)
         .map(|_| ())
@@ -214,7 +200,7 @@ const HTTP_STREAM_CHUNKS: &str = "module Main exposing (main)\n\
 /// with E0425 (`AuthConfig` not found) — the SEAL breach this test gates.
 const AUTHED_ROUTE: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
-    "/../../tests/golden/authed_route_revocation_vendored_seal/Main.ipe"
+    "/../../tests/golden/authed_route_revocation_vendored_seal/src/Main.ipe"
 ));
 
 /// Authed-route + Db-store program using `Store.allAs` behind `Server.getAuthed`.
@@ -230,7 +216,7 @@ const AUTHED_ROUTE: &str = include_str!(concat!(
 /// class.
 const AUTHED_STORE_QUERY: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
-    "/../../tests/golden/authed_store_query_seal/Main.ipe"
+    "/../../tests/golden/authed_store_query_seal/src/Main.ipe"
 ));
 
 /// Authed-route program that calls `Revocation.revokeSession principal jti cap`
@@ -245,7 +231,7 @@ const AUTHED_STORE_QUERY: &str = include_str!(concat!(
 /// crate will not build.
 const REVOKE_SESSION_ARITY3: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
-    "/../../tests/golden/revoke_session_arity3_seal/Main.ipe"
+    "/../../tests/golden/revoke_session_arity3_seal/src/Main.ipe"
 ));
 
 /// Authed-route program that reads the principal's verified claims via
@@ -261,7 +247,7 @@ const REVOKE_SESSION_ARITY3: &str = include_str!(concat!(
 /// for the principal-read surface.
 const AUTHED_PRINCIPAL_CLAIMS: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
-    "/../../tests/golden/authed_principal_claims_seal/Main.ipe"
+    "/../../tests/golden/authed_principal_claims_seal/src/Main.ipe"
 ));
 
 // ── The gate: every shape emits AND cargo-builds ────────────────────────────
@@ -510,8 +496,8 @@ fn web_http_client_vendored_builds() {
 /// Minimal `Jwt.encodeHs256` program — no server/web surface, so no `server`/
 /// `web` feature to carry `uuid` transitively.
 ///
-/// `auth.rs` is compiled under `#[cfg(feature = "jwt")]` and calls
-/// `uuid::Uuid::new_v4()` to mint per-session `jti` ids in `auth_sign_token`.
+/// `auth.rs` is compiled under `#[cfg(feature = "jwt")]` and builds
+/// per-session `jti` ids with `uuid::Builder` in `auth_sign_token`.
 /// The `uuid` dep is optional in the runtime crate; without `"uuid"` in the
 /// emitted feature set the call fails with E0433 (`uuid` not in scope) despite
 /// `ipe` exit 0 — the SEAL breach class this test gates in BOTH emit models.
@@ -524,7 +510,7 @@ const JWT_SIGN: &str = "module Main exposing (main)\n\
             Ok _ -> Io.println \"ok\"\n";
 
 /// Under the dep-model a JWT-only program must emit a feature set that includes
-/// `uuid` (because `auth.rs` calls `uuid::Uuid::new_v4()` under the `jwt`
+/// `uuid` (because `auth.rs` names `uuid::Builder` under the `jwt`
 /// feature). Without it the emitted crate fails with E0433 at `cargo build`
 /// despite `ipe` exit 0.
 #[test]
@@ -534,13 +520,13 @@ fn jwt_sign_dep_model_builds() {
     }
     emit_and_build("jwt_sign_dep_model", JWT_SIGN).expect(
         "JWT program must cargo-build in the dep model \
-         (uuid feature must be selected — auth.rs calls uuid::Uuid::new_v4)",
+         (uuid feature must be selected — auth.rs builds ids with uuid::Builder)",
     );
 }
 
 /// Under the vendored emit model the same JWT-only program must cargo-build.
 /// `auth.rs` is compiled when the `jwt` feature is in `default = [...]`; it
-/// calls `uuid::Uuid::new_v4()`, so the `uuid` dep must be enabled. In the
+/// names `uuid::Builder`, so the `uuid` dep must be enabled. In the
 /// vendored template `uuid` is already a non-optional dep, so this test
 /// primarily validates that the `jwt` feature is in `default` (which
 /// `jwt_cargo_toml` handles) and that the dep is in scope for `auth.rs`.

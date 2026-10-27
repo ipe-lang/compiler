@@ -13,22 +13,14 @@ fn repo_root() -> PathBuf {
 #[test]
 fn emits_byte_identical_main_rs_as_runtime_dependency() {
     let root = repo_root();
-    let entry = root
-        .join("tests")
-        .join("golden")
-        .join("basics")
-        .join("Main.ipe");
-    let golden = root
-        .join("tests")
-        .join("golden")
-        .join("basics")
-        .join("main.rs");
+    let dir = root.join("tests").join("golden").join("basics");
+    let golden_project = root.join("tests").join("golden").join("basics");
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("m0_emit");
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
 
-    let built = ipe::build(&entry, &out, &runtime);
+    let built = crate::support::build_golden(&dir, &out, &runtime);
     assert!(built.is_ok(), "build failed: {:?}", built.err());
 
     // Directory-diff the emitted project against the golden dir: asserts the
@@ -36,10 +28,7 @@ fn emits_byte_identical_main_rs_as_runtime_dependency() {
     // match byte-for-byte. Replaces the former hand-rolled `read_to_string` +
     // `assert_eq!` pair — proven equal in discriminating power side by side
     // before that block was removed.
-    crate::support::assert_emitted_project_matches_golden_dir(
-        &out,
-        crate::support::golden_dir_of(&golden),
-    );
+    crate::support::assert_emitted_project_matches_golden_dir(&out, &golden_project);
 
     // The default native emit is the dependency model: no runtime source is
     // vendored into the user crate, and the manifest declares the runtime as a
@@ -67,11 +56,7 @@ fn end_to_end_builds_and_prints_one() {
     }
 
     let root = repo_root();
-    let entry = root
-        .join("tests")
-        .join("golden")
-        .join("basics")
-        .join("Main.ipe");
+    let dir = root.join("tests").join("golden").join("basics");
     // Build OUTSIDE the workspace tree: an emitted project under the workspace's
     // own target/ dir is (correctly) rejected by cargo as a non-member package,
     // and the golden Cargo.toml carries no detaching `[workspace]` stanza.
@@ -79,7 +64,7 @@ fn end_to_end_builds_and_prints_one() {
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
-    let built = ipe::build(&entry, &out, &runtime);
+    let built = crate::support::build_golden(&dir, &out, &runtime);
     assert!(built.is_ok(), "build failed: {:?}", built.err());
 
     let outcome = crate::support::build_and_run_emitted("basics", &out);
@@ -92,23 +77,21 @@ fn end_to_end_builds_and_prints_one() {
 }
 
 /// A `CliError::Pipeline` must render as a coded, prose-first report — not a
-/// `{:?}` debug dump. We feed `build` a deliberately ill-formed `.ipe` source and
+/// `{:?}` debug dump. We build a project whose `Main` is deliberately ill-formed and
 /// assert the displayed error carries a `-- … ERROR` title rule, its `IPE-…`
 /// code, and the `ipe explain` footer pointer.
 #[test]
 fn pipeline_error_renders_with_code_and_explain_pointer() {
     let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("pipeline_err");
-    let _ = std::fs::create_dir_all(&dir);
-    let entry = dir.join("Bad.ipe");
     // Malformed: a top-level declaration with no right-hand side. This is
     // rejected at the parse stage boundary, the first pipeline stage.
-    let wrote = std::fs::write(&entry, "module Main exposing (main)\n\nmain =\n");
-    assert!(wrote.is_ok(), "must write ill-formed source");
+    let fixture = ipe::RootFixture::main("module Main exposing (main)\n\nmain =\n")
+        .expect("an ill-formed module still resolves as a project");
 
     // The runtime dir is never reached: the parse error fires first. Pass a
     // path that need not exist.
     let runtime = dir.join("no-runtime");
-    let built = ipe::build(&entry, &dir.join("out"), &runtime);
+    let built = ipe::build_fixture(&fixture, &dir.join("out"), &runtime);
 
     assert!(
         matches!(&built, Err(ipe::CliError::Pipeline { .. })),

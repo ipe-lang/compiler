@@ -14,7 +14,7 @@
 //!
 //! * The Rust backend emits `sqlx` + `sqlx-sqlite` for database access.
 //! * The row type the runtime returns from `Db.query` is
-//!   `Vec<HashMap<String, String>>`.
+//!   `Vec<HashMap<String, IpeMaybe<String>>>`, SQL `NULL` as `Nothing`.
 //! * Connection management for `sqlite::memory:` pools uses async `sqlx`
 //!   pooling (serialised-mode `SQLite`).
 //!
@@ -35,7 +35,7 @@
 //! * `db_exec` — `Db.open` → `Db.withTransaction` → `Unsafe.unsafeExecRaw` (DDL,
 //!   from `Ipe.Db.Unsafe`) → `Db.exec` with `[SqlString, SqlInt]` params (two
 //!   INSERTs) → `Unsafe.unsafeQuery` with empty params (SELECT ORDER BY name) →
-//!   `Unsafe.unsafeGetString` / `unsafeGetInt` field access → `println`.
+//!   `cellText` / `cellInt` row-cell reads → `println`.
 //!   Output: `"apple:5\nbanana:3"`.
 //! * `db_find_by_conditions` — `Db.exec` two INSERTs →
 //!   `Db.findByConditions conn "items" (Dict.fromList [("name","apple")])` →
@@ -99,18 +99,17 @@ fn golden_dir(root: &Path, name: &str) -> PathBuf {
     root.join("tests").join("golden").join(name)
 }
 
-/// Compile `tests/golden/<name>/Main.ipe`, build the emitted Cargo project, run
+/// Compile `tests/golden/<name>/src/Main.ipe`, build the emitted Cargo project, run
 /// it, and return the golden directory plus the run outcome. The caller gates on
 /// `IPE_E2E`. Fails the test on any build/runtime error.
 fn build_run(name: &str) -> (PathBuf, crate::support::RunOutcome) {
     let root = repo_root();
     let dir = golden_dir(&root, name);
-    let entry = dir.join("Main.ipe");
     let out = crate::support::scratch_root().join(format!("ipec_{name}_e2e"));
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
-    let built = ipe::build(&entry, &out, &runtime);
+    let built = crate::support::build_golden(&dir, &out, &runtime);
     assert!(built.is_ok(), "build failed for {name}: {:?}", built.err());
 
     let outcome = crate::support::build_and_run_emitted(name, &out);
@@ -133,7 +132,7 @@ fn assert_runs_and_matches_oracle(name: &str) {
 /// `Db.open` → `Db.withTransaction` → `Db.unsafeExecRaw` (DDL) →
 /// `Db.exec [SqlString "apple", SqlInt 5]` + `[SqlString "banana", SqlInt 3]`
 /// (two INSERTs) → `Db.unsafeQuery [] (SELECT ORDER BY name)` →
-/// `Db.unsafeGetString` / `Db.unsafeGetInt` → `println`.
+/// `cellText` / `cellInt` row-cell reads → `println`.
 /// Output: `"apple:5\nbanana:3"`.
 ///
 /// Recorded sanctioned divergence (the prior backend `SQLite` vs Rust+sqlx): the Ipê source
@@ -154,6 +153,19 @@ fn db_exec() {
 #[test]
 fn db_query_decode() {
     assert_runs_and_matches_oracle("db_query_decode");
+}
+
+// ── A flat `do` inside a transaction lambda ──────────────────────────────────
+
+/// Thirty named binds in one `do` inside `Db.withTransaction`, every bind read
+/// by the final statement, emit and build: a long sequence costs no IR depth
+/// per bind, since each continuation's capture clones are one flat node.
+/// Output: `"465"`.
+///
+/// Sanctioned divergence: Ipê emits Rust+sqlx; oracle is Ipê's own output.
+#[test]
+fn do_transaction_fan_in() {
+    assert_runs_and_matches_oracle("do_transaction_fan_in");
 }
 
 // ── Db.Decode.andThen — function-first surface, decoder-first runtime ─────────
@@ -365,6 +377,23 @@ fn db_store_null_roundtrip() {
     assert_runs_and_matches_oracle("db_store_null_roundtrip");
 }
 
+/// SQL `NULL` is never text on any read path: one `SQLite` file opened through
+/// `Db.open` (app) and `Dsn.open` (external) reads an all-`NULL` row back as
+/// `Nothing` through `allOn` / `findWhereOn` / `getOn`, both join sides, a raw
+/// `Db.findWhere` (`Just Nothing`), and refuses it with a typed `Err` through a
+/// plain `String` field, a raw-column store's `readText`, and a `Store.select`
+/// projection. A stored `REAL` reads as one text on every path (`3.0` is `3`,
+/// `-0.0` is `0`), and a non-finite `REAL` is a typed `Err` on `allOn`, the join
+/// and the raw read.
+///
+/// Sanctioned divergence: Ipê emits Rust+sqlx; `Ipe.Db.Store` and external
+/// connections are Ipê-only additions with no prior counterpart; oracle is Ipê's
+/// own output.
+#[test]
+fn db_store_null_external_join() {
+    assert_runs_and_matches_oracle("db_store_null_external_join");
+}
+
 /// SEAL regression: cross-call auto-trait-bound propagation through a NON-BARE
 /// argument. `fetchAll conn s = Store.toList conn (Store.query s)` is generic
 /// over the row type; the caller's tvar rides inside the COMPUTED argument
@@ -530,9 +559,9 @@ fn db_store_starts_with() {
 /// no I/O beyond stdout). Parses a valid Postgres DSN carrying a password and
 /// prints its `Driver`, host, default TLS mode, and REDACTED render — the
 /// password sentinel `hunter2SENTINEL` NEVER appears (it is a `Secret`, rendered
-/// as `[redacted]`). Also proves: `sslmode=disable` is a hard typed `Err`
-/// (fail-closed TLS); an omitted sslmode defaults to `require` (secure default);
-/// and `Dsn.build` from typed parts runs the same validators. This is the SEAL
+/// as `[redacted]`). Also proves: `sslmode=disable` and `sslmode=require` are
+/// hard typed `Err`s (fail-closed TLS); an omitted sslmode defaults to
+/// `verify-full` (secure default); and `Dsn.build` from typed parts runs the same validators. This is the SEAL
 /// for the reserved `Dsn` type + the `Db.Dsn.*` parse kernels: the emitted crate
 /// must build and run, and the sentinel must be absent from stdout.
 ///
@@ -578,13 +607,12 @@ fn db_sql_decimal_money() {
 fn db_sql_decimal_accepts_decimal() {
     let root = repo_root();
     let dir = golden_dir(&root, "db_sql_decimal_money");
-    let entry = dir.join("Main.ipe");
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("db_sql_decimal_accepts");
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
 
-    let built = ipe::build(&entry, &out, &runtime);
+    let built = crate::support::build_golden(&dir, &out, &runtime);
     assert!(
         built.is_ok(),
         "`SqlDecimal (Decimal.fromMinor 5 314159)` must type-check and emit; got: {:?}",
@@ -600,13 +628,12 @@ fn db_sql_decimal_accepts_decimal() {
 fn db_sql_decimal_rejects_raw_string() {
     let root = repo_root();
     let dir = golden_dir(&root, "db_sql_decimal_rejects_string");
-    let entry = dir.join("Main.ipe");
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("db_sql_decimal_rejects");
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
 
-    let err = ipe::build(&entry, &out, &runtime)
+    let err = crate::support::build_golden(&dir, &out, &runtime)
         .map_err(|e| e.to_string())
         .expect_err(
             "`SqlDecimal \"1.5\"` must be rejected: the ctor takes a native `Decimal`, not a `String`",
@@ -638,14 +665,13 @@ fn db_sql_decimal_rejects_raw_string() {
 fn db_poly_params_compiles() {
     let root = repo_root();
     let dir = golden_dir(&root, "db_poly_params");
-    let entry = dir.join("Main.ipe");
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("db_poly_params");
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
 
     // Core assertion: `ipe::build` succeeds — no IPE-T0001 for any param-list shape.
-    let built = ipe::build(&entry, &out, &runtime);
+    let built = crate::support::build_golden(&dir, &out, &runtime);
     assert!(
         built.is_ok(),
         "IPE-T0001 regression: `Db.exec` with `List Int` / `List String` / mixed \

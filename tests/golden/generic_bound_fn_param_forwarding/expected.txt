@@ -1,0 +1,8 @@
+approve first
+refuse second
+confirm why
+approve 1,2
+cancel 3
+select 5
+ignore
+ignore

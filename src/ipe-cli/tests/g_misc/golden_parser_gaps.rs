@@ -6,7 +6,7 @@
 //!
 //! ## Positives (build → run → byte-diff against the cached oracle)
 //!
-//! Each single-file positive compiles `tests/golden/<name>/Main.ipe` through
+//! Each single-file positive compiles `tests/golden/<name>/src/Main.ipe` through
 //! `ipe`, builds the emitted Rust project in the shared cargo target, runs it,
 //! and checks stdout against the cached golden oracle (`oracle.meta` +
 //! `expected_go.txt`). All three carry `oracle_divergence = false` ...//! reference compiler produces byte-identical stdout, captured via
@@ -25,8 +25,8 @@
 //!   nested `{- {- -} -}` comment; both are skipped and the program prints.
 //!   Output: `"ok"`.
 //!
-//! The multi-module positive uses `ipe::build_project` (a `package.ipe` project
-//! with a `Lib` module) then runs the emitted binary:
+//! The multi-module positive builds a `package.ipe` golden project
+//! (with a `Lib` module) through `support::build_golden`, then runs the emitted binary:
 //!
 //! * `mm_qualtype` — `Lib` exposes `type Box a = Box a`; `Main` annotates a
 //!   binding with the *qualified* type name `Lib.Box Int` and unwraps it.
@@ -84,11 +84,10 @@ fn assert_single_oracle(name: &str) {
         return;
     }
     let dir = golden_dir(name);
-    let entry = dir.join("Main.ipe");
     let out = crate::support::scratch_root().join(format!("ipec_{name}_e2e"));
     let _ = std::fs::remove_dir_all(&out);
 
-    let built = ipe::build(&entry, &out, &runtime());
+    let built = crate::support::build_golden(&dir, &out, &runtime());
     assert!(built.is_ok(), "build failed for {name}: {:?}", built.err());
 
     let outcome = crate::support::build_and_run_emitted(name, &out);
@@ -112,7 +111,7 @@ fn blockcomment_builds_and_matches_oracle() {
 }
 
 // ---------------------------------------------------------------------------
-// Multi-module positive: build_project → run → literal hand-verified stdout.
+// Multi-module positive: build → run → literal hand-verified stdout.
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -125,12 +124,8 @@ fn qualtype_project_builds_and_prints_42() {
     let out = crate::support::scratch_root().join(format!("ipec_{name}_e2e"));
     let _ = std::fs::remove_dir_all(&out);
 
-    let built = ipe::build_project(&dir.join("package.ipe"), &out, &runtime());
-    assert!(
-        built.is_ok(),
-        "build_project failed for {name}: {:?}",
-        built.err()
-    );
+    let built = crate::support::build_golden(&dir, &out, &runtime());
+    assert!(built.is_ok(), "build failed for {name}: {:?}", built.err());
 
     let outcome = crate::support::build_and_run_emitted(name, &out);
     // hand-verified reference: `unbox (Box 42)` prints `42`. Multi-module goldens
@@ -153,13 +148,12 @@ fn intdiv_by_zero_aborts_exit_101() {
     }
     let name = "intdiv_divzero";
     let dir = golden_dir(name);
-    let entry = dir.join("Main.ipe");
     let out = crate::support::scratch_root().join(format!("ipec_{name}_e2e"));
     let _ = std::fs::remove_dir_all(&out);
 
     // Codegen succeeds — the failure is a *runtime* classification, not a
     // compile error.
-    let built = ipe::build(&entry, &out, &runtime());
+    let built = crate::support::build_golden(&dir, &out, &runtime());
     assert!(built.is_ok(), "build failed for {name}: {:?}", built.err());
 
     let outcome = crate::support::build_and_run_emitted(name, &out);
@@ -200,11 +194,11 @@ fn diag_code(err: &ipe::CliError) -> Option<ipe_diagnostics::Code> {
 #[test]
 fn unterminated_blockcomment_is_ipe_p0017() {
     let name = "blockcomment_unterminated";
-    let entry = golden_dir(name).join("Main.ipe");
+    let dir = golden_dir(name);
     let out = crate::support::scratch_root().join(format!("ipec_{name}"));
     let _ = std::fs::remove_dir_all(&out);
 
-    let res = ipe::build(&entry, &out, &runtime());
+    let res = crate::support::build_golden(&dir, &out, &runtime());
     assert!(res.is_err(), "{name} must fail to compile");
     let err = res.expect_err("`res` must be rejected");
     assert_eq!(
@@ -221,7 +215,7 @@ fn unknown_module_in_annotation_is_ipe_n0004() {
     let out = crate::support::scratch_root().join(format!("ipec_{name}"));
     let _ = std::fs::remove_dir_all(&out);
 
-    let res = ipe::build_project(&dir.join("package.ipe"), &out, &runtime());
+    let res = crate::support::build_golden(&dir, &out, &runtime());
     assert!(res.is_err(), "{name} must fail to compile");
     let err = res.expect_err("`res` must be rejected");
     assert_eq!(

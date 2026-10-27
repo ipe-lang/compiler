@@ -77,6 +77,9 @@ const ADMITTED: &[(&str, &str, &str, usize)] = &[
     // A view of the in-tree `config_postgres.rs`, which the walk also reads;
     // the module's `cfg(test)` lives on its declaration in the crate root.
     ("config_postgres_test.rs", MODULE_LEVEL, "#[path] mod pg", 1),
+    // The driver-selected `config`: under `db-postgres` the crate root names
+    // the in-tree `config_postgres.rs`, which the walk reads on its own.
+    ("mod.rs", MODULE_LEVEL, "#[path] mod config", 1),
 ];
 
 /// The bind type `ty` names, through any parentheses or invisible group.

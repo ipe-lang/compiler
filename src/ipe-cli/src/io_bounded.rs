@@ -252,8 +252,7 @@ fn open_nonblocking(path: &Path) -> Result<File, CliError> {
     use std::os::windows::fs::{MetadataExt as _, OpenOptionsExt as _};
     /// `FILE_FLAG_OPEN_REPARSE_POINT`: opens a reparse point itself, never its target.
     const OPEN_REPARSE_POINT: u32 = 0x0020_0000;
-    /// `FILE_ATTRIBUTE_REPARSE_POINT`.
-    const ATTR_REPARSE_POINT: u32 = 0x400;
+    use ipe_fs_open::reparse::FILE_ATTRIBUTE_REPARSE_POINT as ATTR_REPARSE_POINT;
     let file = std::fs::OpenOptions::new()
         .read(true)
         .custom_flags(OPEN_REPARSE_POINT)

@@ -67,11 +67,30 @@
     )
 )]
 
+// `db-sqlite` and `db-postgres` are mutually exclusive sqlx driver selectors:
+// the emitter enables exactly one, and this guard refuses a hand-written union.
+#[cfg(all(feature = "db-sqlite", feature = "db-postgres"))]
+compile_error!(
+    "db-sqlite and db-postgres are mutually exclusive: a project selects exactly one sqlx driver"
+);
+
+// The driver aliases (`DbPool`, `DbRow`, the placeholder and auto-id helpers)
+// a dependency-model project links: `db-postgres` selects the PostgreSQL set,
+// every other build the SQLite set. A vendored project overwrites `config.rs`.
+#[cfg(not(feature = "db-postgres"))]
 pub mod config;
-// Behavioral tests for the emit-only Postgres `config_postgres.rs` placeholder
-// rewriter, which is otherwise never compiled into this crate (see that file's
-// header). Test-only, gated on `db` so the re-included sqlx-typed source
-// compiles; nothing here is emitted.
+#[cfg(feature = "db-postgres")]
+#[path = "config_postgres.rs"]
+pub mod config;
+// The selected aliases speak the feature's driver: a `config` that drifts from
+// its feature is a type error here, not a pool opened on the other engine.
+#[cfg(all(feature = "db", feature = "db-postgres"))]
+const _: fn(config::DbRow) -> sqlx::postgres::PgRow = |row| row;
+#[cfg(all(feature = "db", not(feature = "db-postgres")))]
+const _: fn(config::DbRow) -> sqlx::sqlite::SqliteRow = |row| row;
+// Behavioral tests for the Postgres `config_postgres.rs` placeholder rewriter
+// in every build, whichever driver this one selects. Test-only, gated on `db`
+// so the re-included sqlx-typed source compiles; nothing here is emitted.
 #[cfg(feature = "config")]
 pub mod config_decode;
 #[cfg(all(test, feature = "db"))]
@@ -175,8 +194,8 @@ pub mod file;
 pub mod log;
 // `Ipe.Random` non-cryptographic PRNG. Behind the `random` feature: a program
 // that reaches no `Ipe.Random` kernel drops the module. The feature gates only
-// this module. `getrandom` (the entropy source shared with `crypto_core`,
-// `scratch_core`, and this module's seed) is always present.
+// this module. Its wasm seed draws through `entropy::fill_entropy`, the
+// runtime's one OS random source, which is always present.
 #[cfg(feature = "random")]
 pub mod random;
 // `system` is always compiled (not tokio-gated): it owns the process-local env
@@ -218,6 +237,10 @@ pub mod task;
 // set resolves; its arms read `js_sys::Date`/`gloo-timers`, not `chrono`.
 #[cfg(feature = "time-core")]
 pub mod time;
+// Always declared, matching the emitted floor and the browser module set: the
+// one parse of a transport deadline, shared by `http_client` and `ws_client`
+// on every target, with no dependency of its own.
+pub mod transport_timeout;
 // Always declared, matching the emitted floor (`templates/ipe_runtime/mod.rs`
 // declares `pub mod trace;` for every program). `trace.rs` builds a std
 // `IpeTask` future (`async move`/`.await` on the boxed future, no `tokio::`
@@ -295,6 +318,10 @@ pub use db::*;
 // db feature; the always-compiled telemetry sink calls its cfg-stubbed hook.
 #[cfg(feature = "db")]
 pub mod telemetry_spill;
+// `sql_text`: the single `sqlx::AssertSqlSafe` site. Behind `db`, the feature
+// that links sqlx for every query user (db, auth, web store and hub, spill).
+#[cfg(feature = "db")]
+mod sql_text;
 
 pub use config::*;
 #[cfg(feature = "config")]
@@ -398,9 +425,10 @@ pub mod tui;
 pub use tui::{tui_app, tui_app_ui};
 
 // `Ipe.Uuid` v4 / v7 / parse. Behind the `uuid` feature (the `uuid` crate is
-// optional): a program that reaches no `Ipe.Uuid` kernel — and no `server` /
-// `web` surface (whose runtime modules mint session/CSRF ids via `uuid::new_v4`,
-// so both imply `uuid`) — drops the crate.
+// optional, with no RNG feature: ids are built from `entropy::fill_entropy`
+// draws): a program that reaches no `Ipe.Uuid` kernel, no `jwt` surface (its
+// `jti` builder) and no `server` / `web` surface (both imply `uuid`) drops the
+// crate.
 #[cfg(feature = "uuid")]
 pub mod uuid_kernel;
 #[cfg(feature = "uuid")]
@@ -629,6 +657,10 @@ pub mod telemetry;
 // security headers are assembled from.
 pub mod csp;
 
+// The runtime's one OS entropy source: every random mint draws through
+// `entropy::fill_entropy`, which refuses instead of panicking.
+pub mod entropy;
+
 // Ipe.Ui shared element tree — the general UI abstraction (Element/Attribute/
 // Length/Color/...). Backends (Web/Tui/WebView) each render it to their target.
 // Referenced by qualified path (`ipe_runtime::ui::*`) from generated code; NOT
@@ -673,9 +705,12 @@ pub mod web_page_core;
 // `wasm-client` sink, neither of which runs an HTTP server — the module compiles
 // to just its server-free render core (`dom` diff/dispatch/form, `style_inject`,
 // `route`, `literal_table`, `template`, the pure hot-swap datum types, and the
-// `page_shell` scaffold). The `server` feature turns the full served surface
+// `page_shell` scaffold). The `web` feature turns the full served surface
 // (axum router, SSE, session store, CSRF middleware, pub/sub broker) back on;
-// every axum/SSE/session item inside `web/` is `#[cfg(feature = "server")]`. One
+// every axum/SSE/session item inside `web/` is `#[cfg(feature = "web")]`, never
+// `server`: `server` alone carries none of the served surface's deps, so a
+// `server` + `web-core` build (a webview app that also serves `Http.Server`)
+// compiles the render core only. One
 // `pub mod web;` for both hosts — the module-set closure sees a single `web`, no
 // shell.
 #[cfg(feature = "web-core")]

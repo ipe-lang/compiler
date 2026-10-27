@@ -14,13 +14,20 @@
 //! [`crate::doc_search`]'s job; this module only holds and resolves them.
 
 use std::collections::BTreeMap;
+use std::ffi::OsStr;
 use std::fmt;
-use std::path::Path;
+use std::num::{NonZeroU32, NonZeroU64};
+use std::path::{Path, PathBuf};
 
 use include_dir::{Dir, include_dir};
 use ipe_docs::{html, markdown_text};
+use ipe_fs_open::{ByteCap, EntryCap, EntryName};
 
+use crate::CliError;
 use crate::cli_args::json;
+use crate::io_bounded::SMALL_FILE_READ_CAP;
+use crate::output_dir::held::HeldDir;
+use crate::style::TerminalSafe;
 
 // == Embedded doc-corpus ======================================================
 
@@ -45,6 +52,97 @@ pub(crate) static EMBEDDED_TOPICS: Dir<'static> =
 pub(crate) static EMBEDDED_GUIDES: Dir<'static> =
     include_dir!("$CARGO_MANIFEST_DIR/../../docs/guide");
 
+// == On-disk overlay ==========================================================
+
+/// The most entries one overlay kind directory may hold.
+pub const OVERLAY_ENTRY_CAP: EntryCap =
+    EntryCap::from_nonzero(NonZeroU32::MIN.saturating_add(1023));
+
+/// The most bytes the whole overlay may read, summed over every page of every kind.
+///
+/// Each page is also capped at [`SMALL_FILE_READ_CAP`]; this ceiling bounds the
+/// sum those per-page reads hold at once.
+pub const OVERLAY_TOTAL_READ_CAP: u64 = 16 * 1024 * 1024;
+
+/// The overlay kind directories under `docs/`, each with the kind its pages become.
+const OVERLAY_KINDS: [(&str, DocKind); 4] = [
+    ("constructs", DocKind::Construct),
+    ("idioms", DocKind::Idiom),
+    ("topics", DocKind::Topic),
+    ("guide", DocKind::Guide),
+];
+
+/// The one Markdown file name a docs directory holds that is not a page.
+const HOUSEKEEPING_PAGE: &str = "README.md";
+
+/// Where the on-disk docs overlay comes from.
+///
+/// Built once per command from the directory the command names, never from the
+/// working directory or its ancestors.
+#[derive(Debug)]
+pub enum DocsOverlay {
+    /// The compile-time corpus only.
+    Embedded,
+    /// `<project>/docs`, held open; every listing and read goes through the handle.
+    Project(HeldDir),
+}
+
+impl DocsOverlay {
+    /// The overlay of `project`: its `docs` directory when present, else none.
+    ///
+    /// # Errors
+    ///
+    /// The [`HeldDir::open`] refusal for a `docs` entry that exists but is not a
+    /// directory ipe may hold (a link, a file).
+    pub fn for_project(project: &Path) -> Result<Self, CliError> {
+        Ok(HeldDir::open(&project.join("docs"))?.map_or(Self::Embedded, Self::Project))
+    }
+}
+
+/// What a Markdown file name found in a docs kind directory is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PageName<'a> {
+    /// A page whose file slug is this `[a-z0-9-]` text.
+    Page(&'a str),
+    /// The directory's [`HOUSEKEEPING_PAGE`], never an entry.
+    Housekeeping,
+    /// Any other name: refused, never skipped.
+    Refused,
+}
+
+/// Classify the `.md` file name `file_name` by the one page-name rule.
+fn page_name(file_name: &str) -> PageName<'_> {
+    if file_name == HOUSEKEEPING_PAGE {
+        return PageName::Housekeeping;
+    }
+    match file_name.strip_suffix(".md") {
+        Some(slug) if is_valid_slug(slug) => PageName::Page(slug),
+        _ => PageName::Refused,
+    }
+}
+
+/// Whether `name` carries the Markdown extension, compared ASCII case-insensitively.
+fn is_markdown_name(name: &OsStr) -> bool {
+    Path::new(name)
+        .extension()
+        .and_then(OsStr::to_str)
+        .is_some_and(|e| e.eq_ignore_ascii_case("md"))
+}
+
+/// The bytes the overlay may still read, shared by every kind directory.
+#[derive(Debug)]
+struct OverlayBudget {
+    left: u64,
+    limit: u64,
+}
+
+impl OverlayBudget {
+    /// A budget of `limit` bytes.
+    const fn of(limit: u64) -> Self {
+        Self { left: limit, limit }
+    }
+}
+
 // == DocKind ==================================================================
 
 /// The eight documentation kinds. Each kind has its own lookup namespace.
@@ -56,7 +154,7 @@ pub enum DocKind {
     Symbol,
     /// A compiler diagnostic code (e.g. `IPE-L0107`).
     Diagnostic,
-    /// A language construct page (from `docs/constructs/` or `docs/content/`).
+    /// A language construct page (from `docs/constructs/`).
     Construct,
     /// An idiom page (from `docs/idioms/`).
     Idiom,
@@ -120,8 +218,8 @@ pub struct DocEntry {
     /// The human-readable title -- the first `# ` heading, a humanised slug,
     /// or an overridden `title:` from YAML front-matter.
     pub title: String,
-    /// The raw Markdown body (front-matter already stripped when present).
-    pub body: String,
+    /// The Markdown body (front-matter already stripped when present), terminal-safe.
+    pub body: TerminalSafe,
     /// Optional sort position from front-matter `order:` -- lower values sort
     /// first. Absent means the entry sorts after all explicitly ordered entries,
     /// then alphabetically by title.
@@ -135,6 +233,7 @@ pub struct DocEntry {
 /// Eight per-kind maps, each keyed by the canonical key string. Built once
 /// via [`DocBundle::build`]; queried via [`DocBundle::resolve_qualified`] and
 /// ranked by [`crate::doc_search::rank`].
+#[derive(Debug)]
 pub struct DocBundle {
     maps: BTreeMap<DocKind, BTreeMap<String, DocEntry>>,
     /// Extra spellings that open an entry, per kind: alias -> canonical key.
@@ -152,18 +251,17 @@ impl DocBundle {
     /// serve` and `ipe doc --write-format html` render those sections correctly
     /// regardless of the working directory.
     ///
-    /// When `docs_root` exists on disk (the typical in-repo case), entries from
-    /// the on-disk tree that do not already appear in the embedded corpus are
-    /// merged in as an additive overlay. This lets a developer preview a new page
-    /// before committing it without modifying the binary. The embedded corpus is
-    /// always present; the on-disk overlay is optional.
+    /// A [`DocsOverlay::Project`] overlay adds its pages whose key the embedded
+    /// corpus does not already hold, so a project's own `docs/` pages render
+    /// beside the shipped ones. [`DocsOverlay::Embedded`] reads nothing from disk.
     ///
     /// # Errors
     ///
     /// Returns a [`BundleError`] for any hard error: a duplicate `(kind, key)`,
-    /// a malformed front-matter block, or a slug outside `[a-z0-9-]`.
+    /// a malformed front-matter block, a slug outside `[a-z0-9-]`, or an overlay
+    /// page refused by name, by read, or past [`OVERLAY_TOTAL_READ_CAP`].
     pub fn build(
-        docs_root: &Path,
+        overlay: &DocsOverlay,
         modules: &[BundleSource],
         symbols: &[BundleSource],
         diagnostics: &[BundleSource],
@@ -178,7 +276,7 @@ impl DocBundle {
                 DocKind::Module,
                 src.key.clone(),
                 src.title.clone(),
-                src.body.clone(),
+                TerminalSafe::sanitize(&src.body),
                 None,
             )?;
         }
@@ -188,7 +286,7 @@ impl DocBundle {
                 DocKind::Symbol,
                 src.key.clone(),
                 src.title.clone(),
-                src.body.clone(),
+                TerminalSafe::sanitize(&src.body),
                 None,
             )?;
         }
@@ -203,7 +301,7 @@ impl DocBundle {
                 DocKind::Diagnostic,
                 src.key.clone(),
                 src.title.clone(),
-                src.body.clone(),
+                TerminalSafe::sanitize(&src.body),
                 None,
             )?;
         }
@@ -213,7 +311,7 @@ impl DocBundle {
                 DocKind::Cli,
                 src.key.clone(),
                 src.title.clone(),
-                src.body.clone(),
+                TerminalSafe::sanitize(&src.body),
                 None,
             )?;
         }
@@ -225,21 +323,12 @@ impl DocBundle {
         ingest_embedded_dir(&EMBEDDED_TOPICS, DocKind::Topic, &mut maps)?;
         ingest_embedded_dir(&EMBEDDED_GUIDES, DocKind::Guide, &mut maps)?;
 
-        // Additive on-disk overlay: merge any file whose key is not already
-        // present (the embedded corpus wins on conflict).  Absent or
-        // unreadable directories are silently skipped.
-        if docs_root.is_dir() {
-            // Prefer `docs/constructs/`; fall back to `docs/content/`.
-            let construct_dir = docs_root.join("constructs");
-            let construct_root = if construct_dir.is_dir() {
-                construct_dir
-            } else {
-                docs_root.join("content")
-            };
-            ingest_markdown_dir_additive(&construct_root, DocKind::Construct, &mut maps)?;
-            ingest_markdown_dir_additive(&docs_root.join("idioms"), DocKind::Idiom, &mut maps)?;
-            ingest_markdown_dir_additive(&docs_root.join("topics"), DocKind::Topic, &mut maps)?;
-            ingest_markdown_dir_additive(&docs_root.join("guide"), DocKind::Guide, &mut maps)?;
+        if let DocsOverlay::Project(root) = overlay {
+            ingest_overlay(
+                root,
+                &mut maps,
+                &mut OverlayBudget::of(OVERLAY_TOTAL_READ_CAP),
+            )?;
         }
 
         Ok(Self { maps, aliases })
@@ -328,9 +417,16 @@ impl DocBundle {
         kind: DocKind,
         key: String,
         title: String,
-        body: String,
+        body: &str,
     ) -> Result<(), BundleError> {
-        insert_entry(&mut self.maps, kind, key, title, body, None)
+        insert_entry(
+            &mut self.maps,
+            kind,
+            key,
+            title,
+            TerminalSafe::sanitize(body),
+            None,
+        )
     }
 }
 
@@ -385,7 +481,7 @@ impl BundleSource {
 // == BundleError ==============================================================
 
 /// A typed error produced during bundle build or reference resolution.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug)]
 pub enum BundleError {
     /// A `kind:` prefix is not one of the eight known kinds.
     UnknownKind(String),
@@ -406,6 +502,12 @@ pub enum BundleError {
         reference: String,
         source_file: String,
     },
+    /// An overlay Markdown file whose name is neither a page slug nor the housekeeping page.
+    OverlayName { path: PathBuf },
+    /// An overlay directory or page the held handle refused to list, open, or read.
+    OverlayRead(Box<CliError>),
+    /// The overlay's pages together pass the summed read ceiling.
+    OverlayTooLarge { limit: u64 },
 }
 
 impl fmt::Display for BundleError {
@@ -436,6 +538,13 @@ impl fmt::Display for BundleError {
                 f,
                 "unresolved cross-reference `[[{reference}]]` in `{source_file}`"
             ),
+            Self::OverlayName { path } => f.write_str(&crate::text::msg::doc_overlay_name(
+                &TerminalSafe::sanitize(&path.display().to_string()),
+            )),
+            Self::OverlayRead(source) => write!(f, "{source}"),
+            Self::OverlayTooLarge { limit } => {
+                f.write_str(&crate::text::msg::doc_overlay_too_large(limit))
+            }
         }
     }
 }
@@ -444,11 +553,12 @@ impl fmt::Display for BundleError {
 
 /// Ingest all `.md` files from a compile-time embedded [`Dir`] as `kind` entries.
 ///
-/// Non-slug filenames (e.g. `README.md`) are silently skipped. A malformed
-/// front-matter block, an invalid slug in front-matter, or a duplicate key is a
-/// hard error. Every `include_dir` file whose content is valid UTF-8 is
-/// guaranteed present at compile time, so a read failure here is a bug — it is
-/// treated as a malformed-front-matter error with a descriptive detail string.
+/// The housekeeping `README.md` is skipped; any other name outside the page
+/// rule ([`page_name`]), a malformed front-matter block, an invalid slug in
+/// front-matter, or a duplicate key is a hard error. Every `include_dir` file
+/// whose content is valid UTF-8 is guaranteed present at compile time, so a
+/// read failure here is a bug — it is treated as a malformed-front-matter error
+/// with a descriptive detail string.
 pub(crate) fn ingest_embedded_dir(
     dir: &Dir<'_>,
     kind: DocKind,
@@ -472,13 +582,17 @@ pub(crate) fn ingest_embedded_dir(
             .file_name()
             .and_then(|n| n.to_str())
             .unwrap_or_default();
-        let slug = file_name.strip_suffix(".md").unwrap_or(file_name);
         let source_label = file.path().display().to_string();
-
-        if !is_valid_slug(slug) {
-            // Skip housekeeping files (e.g. `README.md`).
-            continue;
-        }
+        let slug = match page_name(file_name) {
+            PageName::Page(slug) => slug,
+            PageName::Housekeeping => continue,
+            PageName::Refused => {
+                return Err(BundleError::InvalidSlug {
+                    slug: file_name.to_owned(),
+                    source: source_label,
+                });
+            }
+        };
 
         let raw = file
             .contents_utf8()
@@ -493,133 +607,113 @@ pub(crate) fn ingest_embedded_dir(
             body,
             order,
         } = parse_markdown_file(slug, raw, &source_label)?;
-        insert_entry(maps, kind, key, title, body, order)?;
+        insert_entry(maps, kind, key, title, TerminalSafe::sanitize(&body), order)?;
     }
     Ok(())
 }
 
-/// Scan `dir` for `.md` files whose key is not already in `maps` and insert
-/// each as a `kind` entry (additive, non-overwriting overlay over the embedded
-/// corpus).
+/// Ingest every overlay kind directory under the held `root` within `budget`.
 ///
-/// An absent or non-directory `dir` yields zero entries (never an error). A
-/// malformed slug, bad front-matter, or a key that is already present in the
-/// embedded corpus are silently skipped (the embedded version wins).
-fn ingest_markdown_dir_additive(
-    dir: &Path,
-    kind: DocKind,
+/// An absent kind directory adds nothing; any other refusal of it is an error.
+fn ingest_overlay(
+    root: &HeldDir,
     maps: &mut BTreeMap<DocKind, BTreeMap<String, DocEntry>>,
+    budget: &mut OverlayBudget,
 ) -> Result<(), BundleError> {
-    if !dir.is_dir() {
-        return Ok(());
-    }
-    let Ok(rd) = std::fs::read_dir(dir) else {
-        return Ok(());
-    };
-    let mut paths: Vec<std::path::PathBuf> = rd
-        .filter_map(|e| e.ok().map(|e| e.path()))
-        .filter(|p| {
-            p.extension()
-                .and_then(|e| e.to_str())
-                .is_some_and(|e| e.eq_ignore_ascii_case("md"))
-        })
-        .collect();
-    paths.sort();
-
-    for path in paths {
-        let file_name = path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or_default();
-        let slug = file_name.strip_suffix(".md").unwrap_or(file_name);
-        let source_label = path.display().to_string();
-
-        if !is_valid_slug(slug) {
-            continue;
+    for (name, kind) in OVERLAY_KINDS {
+        let held = root
+            .child(OsStr::new(name))
+            .map_err(|e| BundleError::OverlayRead(Box::new(e)))?;
+        if let Some(dir) = held {
+            ingest_held_dir_additive(&dir, kind, maps, budget)?;
         }
-
-        let Ok(raw) = std::fs::read_to_string(&path) else {
-            continue;
-        };
-
-        let Ok(ParsedMarkdown {
-            key,
-            title,
-            body,
-            order,
-        }) = parse_markdown_file(slug, &raw, &source_label)
-        else {
-            continue;
-        };
-
-        // Embedded corpus wins: skip if the key is already present.
-        if maps.get(&kind).is_some_and(|m| m.contains_key(&key)) {
-            continue;
-        }
-
-        insert_entry(maps, kind, key, title, body, order)?;
     }
     Ok(())
 }
 
-/// Scan `dir` for `.md` files and insert each as a `kind` entry.
+/// Insert each page of the held overlay `dir` as a `kind` entry unless `maps` holds its key.
 ///
-/// An absent or non-directory `dir` yields zero entries (never an error).
-/// A malformed slug, duplicate key, or bad front-matter is a hard error.
-///
-/// Used directly in tests to exercise the parsing/validation semantics in
-/// isolation. Production ingestion routes through [`ingest_embedded_dir`]
-/// (always) and [`ingest_markdown_dir_additive`] (on-disk overlay).
-#[cfg(test)]
-fn ingest_markdown_dir(
-    dir: &Path,
+/// The embedded corpus wins a shared key; two pages of `dir` sharing one is an
+/// error. Every name and byte comes through
+/// the handle: the listing is capped at [`OVERLAY_ENTRY_CAP`], each page read
+/// at [`SMALL_FILE_READ_CAP`] and at what `budget` has left. A name outside the
+/// page rule, a refused read, or malformed front-matter is an error, never a skip.
+fn ingest_held_dir_additive(
+    dir: &HeldDir,
     kind: DocKind,
     maps: &mut BTreeMap<DocKind, BTreeMap<String, DocEntry>>,
+    budget: &mut OverlayBudget,
 ) -> Result<(), BundleError> {
-    if !dir.is_dir() {
-        return Ok(());
-    }
-    let Ok(rd) = std::fs::read_dir(dir) else {
-        return Ok(());
-    };
-    let mut paths: Vec<std::path::PathBuf> = rd
-        .filter_map(|e| e.ok().map(|e| e.path()))
-        .filter(|p| {
-            p.extension()
-                .and_then(|e| e.to_str())
-                .is_some_and(|e| e.eq_ignore_ascii_case("md"))
-        })
-        .collect();
-    paths.sort();
-
-    for path in paths {
-        let file_name = path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or_default();
-        let slug = file_name.strip_suffix(".md").unwrap_or(file_name);
-        let source_label = path.display().to_string();
-
-        if !is_valid_slug(slug) {
-            // Skip housekeeping files (README.md, etc.) that are not bundle entries.
+    let listed = dir
+        .list_names(OVERLAY_ENTRY_CAP)
+        .map_err(|e| BundleError::OverlayRead(Box::new(e)))?;
+    let mut pages: Vec<(String, EntryName)> = Vec::new();
+    for (name, _) in listed {
+        if !is_markdown_name(name.as_os_str()) {
             continue;
         }
+        let slug = match name.as_os_str().to_str().map(page_name) {
+            Some(PageName::Page(slug)) => slug.to_owned(),
+            Some(PageName::Housekeeping) => continue,
+            Some(PageName::Refused) | None => {
+                return Err(BundleError::OverlayName {
+                    path: dir.path().join(name.as_os_str()),
+                });
+            }
+        };
+        pages.push((slug, name));
+    }
+    pages.sort_by(|a, b| a.0.cmp(&b.0));
 
-        let raw =
-            std::fs::read_to_string(&path).map_err(|_| BundleError::MalformedFrontMatter {
-                source: source_label.clone(),
-                detail: "could not read file".to_owned(),
-            })?;
-
+    let mut overlay_keys = std::collections::BTreeSet::new();
+    for (slug, name) in pages {
+        let path = dir.path().join(name.as_os_str());
+        let raw = read_overlay_page(dir, &name, budget)?;
         let ParsedMarkdown {
             key,
             title,
             body,
             order,
-        } = parse_markdown_file(slug, &raw, &source_label)?;
-        insert_entry(maps, kind, key, title, body, order)?;
+        } = parse_markdown_file(&slug, &raw, &path.display().to_string())?;
+        if !overlay_keys.insert(key.clone()) {
+            return Err(BundleError::DuplicateKey {
+                kind,
+                key,
+                source: path.display().to_string(),
+            });
+        }
+        if maps.get(&kind).is_some_and(|m| m.contains_key(&key)) {
+            continue;
+        }
+        insert_entry(maps, kind, key, title, TerminalSafe::sanitize(&body), order)?;
     }
     Ok(())
+}
+
+/// The text of the overlay page `name`, read through `dir` and charged to `budget`.
+///
+/// The read cap is the per-page ceiling or what the budget has left, whichever
+/// is smaller; a page cut by the budget is the summed refusal, not the per-page one.
+fn read_overlay_page(
+    dir: &HeldDir,
+    name: &EntryName,
+    budget: &mut OverlayBudget,
+) -> Result<String, BundleError> {
+    let limit = budget.limit;
+    let total = || BundleError::OverlayTooLarge { limit };
+    let cap_bytes = budget.left.min(SMALL_FILE_READ_CAP);
+    // An exhausted budget still reads under one byte: an empty page fits, any other is refused.
+    let cap = ByteCap::new(cap_bytes).unwrap_or(ByteCap::from_nonzero(NonZeroU64::MIN));
+    let raw = match dir.read_file_capped(name, cap) {
+        Ok(raw) => raw,
+        Err(CliError::FileTooLarge { .. }) if cap_bytes < SMALL_FILE_READ_CAP => {
+            return Err(total());
+        }
+        Err(e) => return Err(BundleError::OverlayRead(Box::new(e))),
+    };
+    let read = u64::try_from(raw.len()).unwrap_or(u64::MAX);
+    budget.left = budget.left.checked_sub(read).ok_or_else(total)?;
+    Ok(raw)
 }
 
 /// Parse one markdown file's optional YAML front-matter and extract key, title,
@@ -669,7 +763,13 @@ fn parse_markdown_file(
                 "key" => fm_key = Some(value),
                 "title" => fm_title = Some(value),
                 "order" => {
-                    fm_order = value.parse::<i64>().ok();
+                    let Ok(order) = value.parse::<i64>() else {
+                        return Err(BundleError::MalformedFrontMatter {
+                            source: source_label.to_owned(),
+                            detail: format!("`order: {value}` is not a whole number"),
+                        });
+                    };
+                    fm_order = Some(order);
                 }
                 _ => {}
             }
@@ -756,7 +856,7 @@ fn insert_entry(
     kind: DocKind,
     key: String,
     title: String,
-    body: String,
+    body: TerminalSafe,
     order: Option<i64>,
 ) -> Result<(), BundleError> {
     let map = maps.entry(kind).or_default();
@@ -963,8 +1063,39 @@ mod tests {
     fn tempdir(name: &str) -> std::path::PathBuf {
         let dir = ipe_test_temp::temp_root()
             .join(format!("ipe-doc-bundle-{name}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    type Maps = BTreeMap<DocKind, BTreeMap<String, DocEntry>>;
+
+    /// Ingest the directory `dir` as `kind` overlay pages under the full overlay budget.
+    fn ingest(dir: &Path, kind: DocKind, maps: &mut Maps) -> Result<(), BundleError> {
+        let held = HeldDir::open(dir).unwrap().unwrap();
+        ingest_held_dir_additive(
+            &held,
+            kind,
+            maps,
+            &mut OverlayBudget::of(OVERLAY_TOTAL_READ_CAP),
+        )
+    }
+
+    /// A project directory whose `docs/topics` holds each `(file name, text)` page.
+    fn project_with_topics(name: &str, pages: &[(&str, &str)]) -> std::path::PathBuf {
+        let project = tempdir(name);
+        let topics = project.join("docs").join("topics");
+        fs::create_dir_all(&topics).unwrap();
+        for (file, text) in pages {
+            fs::write(topics.join(file), text).unwrap();
+        }
+        project
+    }
+
+    /// The bundle a site build of `project` reads, its own `docs` as the overlay.
+    fn project_bundle(project: &Path) -> Result<DocBundle, BundleError> {
+        let overlay = DocsOverlay::for_project(project).unwrap();
+        DocBundle::build(&overlay, &[], &[], &[], &[])
     }
 
     // -- Ingestion ------------------------------------------------------------
@@ -974,12 +1105,12 @@ mod tests {
         let tmp = tempdir("ingest_no_fm");
         fs::write(tmp.join("foo.md"), "# Foo topic\n\nSome prose.\n").unwrap();
         let mut maps = BTreeMap::new();
-        ingest_markdown_dir(&tmp, DocKind::Topic, &mut maps).expect("ingest");
+        ingest(&tmp, DocKind::Topic, &mut maps).expect("ingest");
         let map = maps.get(&DocKind::Topic).expect("topic map");
         let entry = map.get("foo").expect("foo entry");
         assert_eq!(entry.key, "foo");
         assert_eq!(entry.title, "Foo topic");
-        assert!(entry.body.contains("Some prose."));
+        assert!(entry.body.as_str().contains("Some prose."));
     }
 
     #[test]
@@ -991,26 +1122,60 @@ mod tests {
         )
         .unwrap();
         let mut maps = BTreeMap::new();
-        ingest_markdown_dir(&tmp, DocKind::Topic, &mut maps).expect("ingest");
+        ingest(&tmp, DocKind::Topic, &mut maps).expect("ingest");
         let map = maps.get(&DocKind::Topic).expect("topic map");
         assert!(map.contains_key("overridden"), "key overridden: {map:?}");
         assert_eq!(map["overridden"].title, "Overridden Title");
     }
 
     #[test]
-    fn ingest_absent_dir_yields_zero_entries() {
-        let tmp = tempdir("ingest_absent");
-        let nonexistent = tmp.join("doesnotexist");
+    fn an_order_that_is_not_a_number_is_refused() {
+        let parsed = parse_markdown_file("p", "---\norder: 2\n---\n# P\n", "p.md");
+        assert!(matches!(parsed, Ok(ParsedMarkdown { order: Some(2), .. })));
+        let refused = parse_markdown_file("p", "---\norder: second\n---\n# P\n", "p.md");
+        assert!(
+            matches!(&refused, Err(BundleError::MalformedFrontMatter { detail, .. }) if detail.contains("second")),
+            "{:?}",
+            refused.err()
+        );
+    }
+
+    #[test]
+    fn ingest_absent_kind_dirs_yield_zero_entries() {
+        let project = tempdir("ingest_absent");
+        fs::create_dir_all(project.join("docs")).unwrap();
+        let overlay = DocsOverlay::for_project(&project).unwrap();
+        let DocsOverlay::Project(root) = &overlay else {
+            assert!(
+                matches!(overlay, DocsOverlay::Project(_)),
+                "a present docs dir is the overlay"
+            );
+            return;
+        };
         let mut maps = BTreeMap::new();
-        ingest_markdown_dir(&nonexistent, DocKind::Topic, &mut maps).expect("absent dir is ok");
-        assert!(maps.is_empty(), "no entries from absent dir");
+        ingest_overlay(
+            root,
+            &mut maps,
+            &mut OverlayBudget::of(OVERLAY_TOTAL_READ_CAP),
+        )
+        .expect("absent kind dirs are ok");
+        assert!(maps.is_empty(), "no entries from absent kind dirs");
+    }
+
+    #[test]
+    fn a_project_without_docs_is_embedded_only() {
+        let project = tempdir("ingest_no_docs");
+        assert!(matches!(
+            DocsOverlay::for_project(&project),
+            Ok(DocsOverlay::Embedded)
+        ));
     }
 
     #[test]
     fn ingest_empty_dir_yields_zero_entries() {
         let tmp = tempdir("ingest_empty");
         let mut maps = BTreeMap::new();
-        ingest_markdown_dir(&tmp, DocKind::Topic, &mut maps).expect("empty dir is ok");
+        ingest(&tmp, DocKind::Topic, &mut maps).expect("empty dir is ok");
         assert!(maps.is_empty(), "no entries from empty dir");
     }
 
@@ -1024,18 +1189,246 @@ mod tests {
         )
         .unwrap();
         let mut maps = BTreeMap::new();
-        let err = ingest_markdown_dir(&tmp, DocKind::Topic, &mut maps)
-            .expect_err("duplicate key must error");
+        let err = ingest(&tmp, DocKind::Topic, &mut maps).expect_err("duplicate key must error");
         assert!(
             matches!(err, BundleError::DuplicateKey { .. }),
             "expected DuplicateKey: {err}"
         );
     }
 
+    #[test]
+    fn an_embedded_key_wins_over_an_overlay_page() {
+        let project = project_with_topics(
+            "ingest_embedded_wins",
+            &[("effects.md", "# Planted\n\nplanted-body\n")],
+        );
+        let bundle = project_bundle(&project).expect("overlay builds");
+        let entry = bundle
+            .resolve_qualified("topic:effects")
+            .expect("embedded topic");
+        assert!(
+            !entry.body.as_str().contains("planted-body"),
+            "the embedded page keeps its key"
+        );
+    }
+
+    // -- Overlay root and refusals --------------------------------------------
+
+    #[test]
+    fn an_overlay_page_is_read_from_the_project() {
+        let project = project_with_topics(
+            "overlay_reached",
+            &[("planted-reached.md", "# Planted\n\nreached\n")],
+        );
+        let bundle = project_bundle(&project).expect("overlay builds");
+        assert!(bundle.resolve_qualified("topic:planted-reached").is_ok());
+    }
+
+    #[test]
+    fn ancestor_docs_is_not_an_overlay() {
+        let ancestor = project_with_topics(
+            "overlay_ancestor",
+            &[("planted-ancestor.md", "# Planted\n")],
+        );
+        let project = ancestor.join("b");
+        fs::create_dir_all(&project).unwrap();
+        assert!(
+            project_bundle(&ancestor)
+                .expect("ancestor builds")
+                .resolve_qualified("topic:planted-ancestor")
+                .is_ok(),
+            "the plant is reachable from its own project"
+        );
+        let overlay = DocsOverlay::for_project(&project).unwrap();
+        assert!(matches!(overlay, DocsOverlay::Embedded), "{overlay:?}");
+        let bundle = DocBundle::build(&overlay, &[], &[], &[], &[]).expect("bundle builds");
+        assert!(bundle.resolve_qualified("topic:planted-ancestor").is_err());
+    }
+
+    #[test]
+    fn content_fallback_is_gone() {
+        let project = tempdir("overlay_content");
+        let topics = project.join("docs").join("content").join("topics");
+        fs::create_dir_all(&topics).unwrap();
+        fs::write(topics.join("planted-content.md"), "# Planted\n").unwrap();
+        let bundle = project_bundle(&project).expect("bundle builds");
+        assert!(bundle.resolve_qualified("topic:planted-content").is_err());
+    }
+
+    #[test]
+    fn query_mode_never_reads_disk() {
+        let doc = include_str!("doc.rs");
+        let bundle = include_str!("doc_bundle.rs");
+        for needle in [concat!("current_", "dir("), concat!("locate_", "docs_root")] {
+            assert!(!doc.contains(needle), "doc.rs holds `{needle}`");
+        }
+        for needle in [
+            concat!("fs::", "read_dir("),
+            concat!("fs::", "read_to_string("),
+        ] {
+            assert!(!bundle.contains(needle), "doc_bundle.rs holds `{needle}`");
+        }
+    }
+
+    #[test]
+    fn escape_in_overlay_body_is_inert() {
+        let project = project_with_topics(
+            "overlay_escape_body",
+            &[("planted-escape.md", "\u{1b}]52;c;aGk=\u{7}\u{1b}[2Jtext\n")],
+        );
+        let bundle = project_bundle(&project).expect("overlay builds");
+        let entry = bundle
+            .resolve_qualified("topic:planted-escape")
+            .expect("planted page");
+        let body = entry.body.as_str();
+        assert!(
+            !body.contains('\u{1b}') && !body.contains('\u{7}'),
+            "{body:?}"
+        );
+        assert_eq!(body, "text\n");
+    }
+
+    // Windows file names cannot hold a control character.
+    #[cfg(unix)]
+    #[test]
+    fn escape_in_overlay_key_is_refused() {
+        let project = project_with_topics("overlay_escape_key", &[("a\u{1b}b.md", "# A\n")]);
+        let err = project_bundle(&project).expect_err("escape in a name is refused");
+        assert!(matches!(err, BundleError::OverlayName { .. }), "{err:?}");
+        let shown = err.to_string();
+        assert!(!shown.contains('\u{1b}'), "{shown:?}");
+    }
+
+    #[test]
+    fn housekeeping_readme_is_skipped_while_other_non_slug_names_are_refused() {
+        let tmp = tempdir("ingest_non_slug");
+        fs::write(tmp.join("README.md"), "# README\n").unwrap();
+        fs::write(tmp.join("valid-entry.md"), "# Valid\n").unwrap();
+        let mut maps = BTreeMap::new();
+        ingest(&tmp, DocKind::Topic, &mut maps).expect("README.md is housekeeping");
+        let topics = maps.get(&DocKind::Topic);
+        assert!(topics.is_some_and(|m| m.contains_key("valid-entry")));
+        assert!(!topics.is_some_and(|m| m.contains_key("README") || m.contains_key("readme")));
+
+        fs::write(tmp.join("CHANGELOG.md"), "# Changes\n").unwrap();
+        let err = ingest(&tmp, DocKind::Topic, &mut BTreeMap::new())
+            .expect_err("a non-slug page name is refused");
+        assert!(
+            matches!(&err, BundleError::OverlayName { path } if path.ends_with("CHANGELOG.md")),
+            "{err:?}"
+        );
+    }
+
+    /// Whether `error` is the per-file read cap refusing the file `name`.
+    fn too_large_at(error: &CliError, name: &str) -> bool {
+        matches!(error, CliError::FileTooLarge { path, .. } if path.ends_with(name))
+    }
+
+    #[test]
+    fn overlay_file_past_cap_is_refused() {
+        let tmp = tempdir("overlay_file_cap");
+        let size = usize::try_from(SMALL_FILE_READ_CAP).unwrap();
+        fs::write(tmp.join("at-cap.md"), "a".repeat(size)).unwrap();
+        ingest(&tmp, DocKind::Topic, &mut BTreeMap::new()).expect("a page at the cap is read");
+        fs::write(tmp.join("past-cap.md"), "a".repeat(size + 1)).unwrap();
+        let err = ingest(&tmp, DocKind::Topic, &mut BTreeMap::new())
+            .expect_err("a page one byte past the cap is refused");
+        assert!(
+            matches!(&err, BundleError::OverlayRead(e) if too_large_at(e, "past-cap.md")),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn overlay_dir_past_entry_cap_is_refused() {
+        let tmp = tempdir("overlay_entry_cap");
+        let cap = OVERLAY_ENTRY_CAP.get();
+        for i in 0..cap {
+            fs::write(tmp.join(format!("p{i}.md")), "").unwrap();
+        }
+        ingest(&tmp, DocKind::Topic, &mut BTreeMap::new()).expect("a dir at the cap is listed");
+        fs::write(tmp.join("one-past.md"), "").unwrap();
+        let err = ingest(&tmp, DocKind::Topic, &mut BTreeMap::new())
+            .expect_err("one entry past the cap is refused");
+        let BundleError::OverlayRead(source) = &err else {
+            assert!(matches!(err, BundleError::OverlayRead(_)), "{err:?}");
+            return;
+        };
+        assert!(
+            matches!(**source, CliError::DiscoveryLimitReached { .. }),
+            "{source:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn overlay_symlink_entry_is_refused() {
+        let tmp = tempdir("overlay_symlink");
+        let target = tmp.join("outside.txt");
+        fs::write(&target, "# Outside\n").unwrap();
+        let pages = tmp.join("topics");
+        fs::create_dir_all(&pages).unwrap();
+        std::os::unix::fs::symlink(&target, pages.join("linked.md")).unwrap();
+        let err = ingest(&pages, DocKind::Topic, &mut BTreeMap::new())
+            .expect_err("a linked page is refused");
+        assert!(matches!(err, BundleError::OverlayRead(_)), "{err:?}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn overlay_symlinked_kind_dir_is_refused() {
+        let project = tempdir("overlay_symlink_dir");
+        let real = project.join("real-topics");
+        fs::create_dir_all(&real).unwrap();
+        fs::write(real.join("planted-linked.md"), "# Planted\n").unwrap();
+        fs::create_dir_all(project.join("docs")).unwrap();
+        std::os::unix::fs::symlink(&real, project.join("docs").join("topics")).unwrap();
+        let err = project_bundle(&project).expect_err("a linked kind dir is refused");
+        assert!(matches!(err, BundleError::OverlayRead(_)), "{err:?}");
+    }
+
+    #[test]
+    fn overlay_budget_admits_its_limit_and_refuses_one_past() {
+        let tmp = tempdir("overlay_budget");
+        fs::write(tmp.join("first.md"), "12345").unwrap();
+        fs::write(tmp.join("second.md"), "67890").unwrap();
+        fs::write(tmp.join("third.md"), "").unwrap();
+        let held = HeldDir::open(&tmp).unwrap().unwrap();
+        ingest_held_dir_additive(
+            &held,
+            DocKind::Topic,
+            &mut BTreeMap::new(),
+            &mut OverlayBudget::of(10),
+        )
+        .expect("pages summing to the limit are read");
+        let err = ingest_held_dir_additive(
+            &held,
+            DocKind::Topic,
+            &mut BTreeMap::new(),
+            &mut OverlayBudget::of(9),
+        )
+        .expect_err("pages summing one past the limit are refused");
+        assert!(
+            matches!(err, BundleError::OverlayTooLarge { limit: 9 }),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn overlay_refusals_render_their_catalog_messages() {
+        let named = BundleError::OverlayName {
+            path: std::path::PathBuf::from("docs/topics/Bad.md"),
+        }
+        .to_string();
+        assert!(named.contains("docs/topics/Bad.md"), "{named}");
+        let total = BundleError::OverlayTooLarge { limit: 9 }.to_string();
+        assert!(total.contains('9'), "{total}");
+    }
+
     // -- Aliases --------------------------------------------------------------
 
     fn symbol_bundle(symbols: &[BundleSource]) -> Result<DocBundle, BundleError> {
-        DocBundle::build(Path::new("/nonexistent"), &[], symbols, &[], &[])
+        DocBundle::build(&DocsOverlay::Embedded, &[], symbols, &[], &[])
     }
 
     #[test]
@@ -1089,7 +1482,11 @@ mod tests {
             via_alias.is_ok(),
             "an alias reference resolves: {via_alias:?}"
         );
-        assert_eq!(via_alias, via_key, "both spellings link the one page");
+        assert_eq!(
+            via_alias.ok(),
+            via_key.ok(),
+            "both spellings link the one page"
+        );
     }
 
     #[test]
@@ -1111,12 +1508,7 @@ mod tests {
     fn resolve_qualified_hit() {
         let mut bundle = DocBundle::empty();
         bundle
-            .insert(
-                DocKind::Topic,
-                "foo".to_owned(),
-                "Foo".to_owned(),
-                String::new(),
-            )
+            .insert(DocKind::Topic, "foo".to_owned(), "Foo".to_owned(), "")
             .unwrap();
         let entry = bundle.resolve_qualified("topic:foo").expect("hit");
         assert_eq!(entry.key, "foo");
@@ -1164,7 +1556,7 @@ mod tests {
             DocKind::Module,
             "Ipe.Db.Store".to_owned(),
             "the store".to_owned(),
-            String::new(),
+            "",
         )
         .unwrap();
         b
@@ -1276,32 +1668,6 @@ mod tests {
     // -- No-panic witness -----------------------------------------------------
 
     #[test]
-    fn non_slug_filename_is_skipped_not_an_error() {
-        // Files whose stem is not a valid slug (e.g. README.md, CHANGELOG.md)
-        // are housekeeping files, not bundle entries; they are skipped silently.
-        let tmp = tempdir("ingest_non_slug");
-        fs::write(tmp.join("README.md"), "# README\n").unwrap();
-        fs::write(tmp.join("valid-entry.md"), "# Valid\n").unwrap();
-        let mut maps = BTreeMap::new();
-        let result = ingest_markdown_dir(&tmp, DocKind::Topic, &mut maps);
-        assert!(
-            result.is_ok(),
-            "non-slug filename must be skipped, not an error"
-        );
-        assert!(
-            maps.get(&DocKind::Topic)
-                .is_some_and(|m| m.contains_key("valid-entry")),
-            "valid entry is still ingested"
-        );
-        assert!(
-            !maps
-                .get(&DocKind::Topic)
-                .is_some_and(|m| m.contains_key("README")),
-            "README is not ingested"
-        );
-    }
-
-    #[test]
     fn invalid_fm_key_returns_typed_error() {
         // A file with a valid slug filename but an explicit bad `key:` in
         // front-matter must still return an error.
@@ -1312,7 +1678,7 @@ mod tests {
         )
         .unwrap();
         let mut maps = BTreeMap::new();
-        let result = ingest_markdown_dir(&tmp, DocKind::Topic, &mut maps);
+        let result = ingest(&tmp, DocKind::Topic, &mut maps);
         assert!(result.is_err(), "invalid fm key must return Err");
         assert!(
             matches!(result, Err(BundleError::InvalidSlug { .. })),
@@ -1333,16 +1699,11 @@ mod tests {
 
     // -- Embedded-corpus regression tests ------------------------------------
 
-    /// The bug: with a nonexistent `docs_root` the four directory-convention kinds
-    /// previously yielded zero entries.  The fix embeds the corpus at compile
-    /// time, so all four kinds are non-empty regardless of the working directory.
+    /// The four directory-convention kinds come from the compile-time corpus with no overlay.
     #[test]
-    fn embedded_corpus_populates_curated_kinds_when_docs_root_is_absent() {
-        // Pass a docs_root that provably does not exist so the on-disk overlay
-        // path is completely bypassed.
-        let absent_root = std::path::Path::new("/nonexistent-ipe-doc-test-root-$$");
-        let bundle = DocBundle::build(absent_root, &[], &[], &[], &[])
-            .expect("bundle with absent docs_root must not error");
+    fn embedded_corpus_populates_curated_kinds_without_an_overlay() {
+        let bundle = DocBundle::build(&DocsOverlay::Embedded, &[], &[], &[], &[])
+            .expect("bundle without an overlay must not error");
 
         for kind in [
             DocKind::Construct,
@@ -1353,8 +1714,7 @@ mod tests {
             let count = bundle.entries_for_kind(kind).count();
             assert!(
                 count > 0,
-                "{kind} must have entries from the embedded corpus even with absent docs_root \
-                 (got 0 — this is the regression this test pins)"
+                "{kind} must have entries from the embedded corpus without an overlay"
             );
         }
     }
@@ -1379,8 +1739,7 @@ mod tests {
                 .count()
         }
 
-        let absent_root = std::path::Path::new("/nonexistent-ipe-doc-test-root-counts");
-        let bundle = DocBundle::build(absent_root, &[], &[], &[], &[])
+        let bundle = DocBundle::build(&DocsOverlay::Embedded, &[], &[], &[], &[])
             .expect("bundle builds from embedded corpus");
 
         for (kind, dir) in [
@@ -1401,8 +1760,7 @@ mod tests {
     /// A specific well-known key from each kind must resolve and have a non-empty body.
     #[test]
     fn embedded_corpus_known_keys_resolve_with_non_empty_body() {
-        let absent_root = std::path::Path::new("/nonexistent-ipe-doc-test-root-keys");
-        let bundle = DocBundle::build(absent_root, &[], &[], &[], &[])
+        let bundle = DocBundle::build(&DocsOverlay::Embedded, &[], &[], &[], &[])
             .expect("bundle builds from embedded corpus");
 
         let cases = [
@@ -1421,7 +1779,7 @@ mod tests {
                 .resolve_qualified(&qualified)
                 .expect("resolution checked directly above");
             assert!(
-                !entry.body.is_empty(),
+                !entry.body.as_str().is_empty(),
                 "{qualified} resolved but body is empty"
             );
         }

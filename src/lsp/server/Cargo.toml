@@ -20,6 +20,7 @@ crossbeam-channel = "0.5"
 salsa = "=0.28.5"
 
 [dev-dependencies]
+e2e-support = { path = "../../../tools/e2e-support" }
 ipe-test-temp = { path = "../../../tools/test-temp" }
 ipe_stdlib = { path = "../../stdlib" }
 

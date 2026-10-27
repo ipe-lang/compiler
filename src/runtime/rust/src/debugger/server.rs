@@ -5,7 +5,6 @@
 #![cfg(feature = "debugger")]
 
 use crate::debugger::History;
-use crate::retained::{Bytes, RetainedBytes};
 use crate::stringify::IpeStringify;
 use crate::tea::IpeCmd;
 
@@ -17,12 +16,6 @@ use crate::tea::IpeCmd;
 /// knows. Memory is bounded: at most `cap` messages plus one base `Model`.
 pub struct SessionHistory<Msg, Model> {
     inner: History<Msg, Model>,
-}
-
-impl<Msg: RetainedBytes, Model: RetainedBytes> RetainedBytes for SessionHistory<Msg, Model> {
-    fn retained_bytes(&self) -> Option<Bytes> {
-        Bytes::inline::<Self>()?.plus(&self.inner)
-    }
 }
 
 impl<Msg: Clone, Model: Clone> SessionHistory<Msg, Model> {
@@ -122,7 +115,9 @@ fn truncate(s: &str, max: usize) -> String {
 ///                `"/myapp"` for sub-apps.
 ///
 /// The overlay element carries `data-ipe-debugger` (no `ipe-id` attribute) so
-/// `assign_ipe_ids` / diff / patch never touch it.
+/// `assign_ipe_ids` / diff / patch never touch it. Every per-page value the
+/// script needs rides on the panel as an attribute, so the script element is
+/// the constant [`OVERLAY_JS`] the page policy admits by hash.
 ///
 /// The "reset to init" button POSTs to `/_ipe/debug/reset` and reloads the
 /// page on success, giving the dev the same fresh-`init` state as a
@@ -130,8 +125,8 @@ fn truncate(s: &str, max: usize) -> String {
 pub fn overlay_html(labels: &[String], total: usize, scrub_base: &str) -> String {
     let max_str = total.to_string();
     let cur_str = total.to_string(); // live mode: scrubber at rightmost position
-    let scrub_url = format!("{scrub_base}/_ipe/debug/scrub");
-    let reset_url = format!("{scrub_base}/_ipe/debug/reset");
+    let scrub_url = crate::escape::html_attr(&format!("{scrub_base}/_ipe/debug/scrub"));
+    let reset_url = crate::escape::html_attr(&format!("{scrub_base}/_ipe/debug/reset"));
 
     let mut rows = String::new();
     for (idx, label) in labels.iter().enumerate() {
@@ -145,15 +140,11 @@ pub fn overlay_html(labels: &[String], total: usize, scrub_base: &str) -> String
         ));
     }
 
-    let scrub_url_js = serde_json::to_string(&scrub_url)
-        .unwrap_or_else(|_| format!("\"{}\"", scrub_url.replace('"', "\\\"")));
-    let reset_url_js = serde_json::to_string(&reset_url)
-        .unwrap_or_else(|_| format!("\"{}\"", reset_url.replace('"', "\\\"")));
-
-    let script = build_overlay_script(&scrub_url_js, &reset_url_js, SELECTED_ROW_BG);
-
     format!(
-        "<div data-ipe-debugger style=\"{OVERLAY_STYLE}\">\
+        "<div data-ipe-debugger style=\"{OVERLAY_STYLE}\" \
+              data-ipe-dbg-scrub-url=\"{scrub_url}\" \
+              data-ipe-dbg-reset-url=\"{reset_url}\" \
+              data-ipe-dbg-selected=\"{SELECTED_ROW_BG}\">\
            <div style=\"display:flex;align-items:center;gap:6px;padding:4px 6px;\
                         background:#252526;flex-shrink:0;\">\
              <span style=\"flex-shrink:0;opacity:.7;\">▶ Debugger</span>\
@@ -171,94 +162,115 @@ pub fn overlay_html(labels: &[String], total: usize, scrub_base: &str) -> String
              {rows}\
            </div>\
          </div>\
-         {script}",
+         <script>{OVERLAY_JS}</script>",
     )
 }
 
-/// Emit the inline `<script>` block that wires the scrubber, row-click, and reset button.
+/// The overlay's one inline script: wires the scrubber, row-click, and reset
+/// button.
 ///
-/// The script runs in a self-calling function to avoid polluting the page's
-/// global scope. It binds the panel as its own tag's previous sibling and reads
-/// the document only through members bound from the prototypes, so app markup
-/// carrying `data-ipe-debugger`, or an `img`/`form` named after a document
-/// member, never stands in for the panel or the page root.
-fn build_overlay_script(scrub_url_js: &str, reset_url_js: &str, selected_bg: &str) -> String {
-    format!(
-        "<script>\n\
-(function(){{\n\
-  var doc=(function(d){{\n\
+/// It is a constant so the Web page policy admits it by the hash of these
+/// exact bytes (`csp::Guarded::WebPage`); per-page values (the endpoint URLs,
+/// the selected-row tint) are read from the panel's `data-ipe-dbg-*`
+/// attributes. Because injected markup can carry a copy of these bytes beside
+/// a forged panel, no attribute grants authority: an endpoint URL is posted to
+/// only when it equals the debug path under the mount base the client read
+/// from the page's boot block (`window.__IPE_BASE`), and a CSRF token is sent
+/// only when the client set it as a string. The script runs in a self-calling function to avoid polluting
+/// the page's global scope. It binds the panel as its own tag's previous
+/// sibling and reads the document only through members bound from the
+/// prototypes, so app markup carrying `data-ipe-debugger`, or an `img`/`form`
+/// named after a document member, never stands in for the panel or the page
+/// root.
+pub const OVERLAY_JS: &str = "\n\
+(function(){\n\
+  var doc=(function(d){\n\
     var cur=Object.getOwnPropertyDescriptor(Document.prototype,'currentScript');\n\
-    return {{script:function(){{return cur&&cur.get?cur.get.call(d):null;}},\n\
-      byId:Document.prototype.getElementById.bind(d)}};\n\
-  }})(document);\n\
+    return {script:function(){return cur&&cur.get?cur.get.call(d):null;},\n\
+      byId:Document.prototype.getElementById.bind(d)};\n\
+  })(document);\n\
   var own=doc.script();\n\
   var panel=own?own.previousElementSibling:null;\n\
   if(!panel||!panel.hasAttribute('data-ipe-debugger'))return;\n\
+  var selectedBg=panel.getAttribute('data-ipe-dbg-selected')||'';\n\
+  function endpoint(name,path){\n\
+    var base=window.__IPE_BASE;\n\
+    var url=panel.getAttribute(name);\n\
+    return typeof base==='string'&&url===base+path?url:null;\n\
+  }\n\
   var scrubber=panel.querySelector('input[type=range]');\n\
   var list=panel.querySelector('[data-ipe-dbg-list]');\n\
   var resetBtn=panel.querySelector('[data-ipe-dbg-reset]');\n\
-  function highlight(n){{\n\
+  function highlight(n){\n\
     var rows=list?list.querySelectorAll('[data-ipe-dbg-step]'):[];\n\
-    for(var i=0;i<rows.length;i++){{\n\
+    for(var i=0;i<rows.length;i++){\n\
       var step=parseInt(rows[i].getAttribute('data-ipe-dbg-step'),10);\n\
-      rows[i].style.background=step===n?'{selected_bg}':'';\n\
-    }}\n\
-  }}\n\
-  function csrfToken(){{\n\
-    return window.__IPE_CSRF_TOKEN||'';\n\
-  }}\n\
-  function post(n){{\n\
+      rows[i].style.background=step===n?selectedBg:'';\n\
+    }\n\
+  }\n\
+  function csrfToken(){\n\
+    var t=window.__IPE_CSRF_TOKEN;\n\
+    return typeof t==='string'?t:'';\n\
+  }\n\
+  function post(target){\n\
+    var url=endpoint('data-ipe-dbg-scrub-url','/_ipe/debug/scrub');\n\
+    if(!url)return;\n\
     var xhr=new XMLHttpRequest();\n\
-    xhr.open('POST',{scrub_url_js},true);\n\
+    xhr.open('POST',url,true);\n\
     xhr.setRequestHeader('Content-Type','application/json');\n\
     var csrf=csrfToken();\n\
     if(csrf)xhr.setRequestHeader('X-Ipe-Csrf',csrf);\n\
-    xhr.onload=function(){{\n\
-      if(xhr.status===200){{\n\
-        try{{\n\
+    xhr.onload=function(){\n\
+      if(xhr.status===200){\n\
+        try{\n\
           var d=JSON.parse(xhr.responseText);\n\
-          if(d&&d.body){{\n\
+          if(d&&d.body){\n\
             var root=doc.byId('ipe-root');\n\
-            if(root){{root.innerHTML=d.body;window.__ipeEpoch=typeof d.epoch==='string'?d.epoch:null;}}\n\
-          }}\n\
-        }}catch(e){{}}\n\
-      }}\n\
-    }};\n\
-    xhr.send(JSON.stringify({{index:n}}));\n\
-  }}\n\
-  if(scrubber)scrubber.addEventListener('input',function(){{\n\
+            var adopt=window.__ipeAdoptFullBody;\n\
+            var step=typeof d.step==='number'?d.step:-1;\n\
+            if(root&&typeof adopt==='function')adopt(d.epoch,function(){root.innerHTML=d.body;highlight(step);});\n\
+          }\n\
+        }catch(e){}\n\
+      }\n\
+    };\n\
+    xhr.send(JSON.stringify(target));\n\
+  }\n\
+  if(scrubber)scrubber.addEventListener('input',function(){\n\
     var v=parseInt(this.value,10);\n\
     var mx=parseInt(this.max,10);\n\
-    if(v>=mx){{window.location.reload();return;}}\n\
-    post(v);highlight(v);\n\
-  }});\n\
-  if(list)list.addEventListener('click',function(e){{\n\
+    if(!(v>=0))return;\n\
+    post(v>=mx?{newest:true}:{index:v});\n\
+  });\n\
+  if(list)list.addEventListener('click',function(e){\n\
     var el=e.target;\n\
-    while(el&&el!==list){{\n\
+    while(el&&el!==list){\n\
       var s=el.getAttribute('data-ipe-dbg-step');\n\
-      if(s!==null){{\n\
+      if(s!==null){\n\
         var n=parseInt(s,10);\n\
+        if(!(n>=0))return;\n\
         if(scrubber)scrubber.value=String(n);\n\
-        post(n);highlight(n);\n\
+        post({index:n});\n\
         return;\n\
-      }}\n\
+      }\n\
       el=el.parentElement;\n\
-    }}\n\
-  }});\n\
-  if(resetBtn)resetBtn.addEventListener('click',function(){{\n\
+    }\n\
+  });\n\
+  if(resetBtn)resetBtn.addEventListener('click',function(){\n\
+    var url=endpoint('data-ipe-dbg-reset-url','/_ipe/debug/reset');\n\
+    if(!url)return;\n\
     var xhr=new XMLHttpRequest();\n\
-    xhr.open('POST',{reset_url_js},true);\n\
+    xhr.open('POST',url,true);\n\
     var csrf=csrfToken();\n\
     if(csrf)xhr.setRequestHeader('X-Ipe-Csrf',csrf);\n\
-    xhr.onload=function(){{\n\
+    xhr.onload=function(){\n\
       if(xhr.status===200)window.location.reload();\n\
-    }};\n\
+    };\n\
     xhr.send();\n\
-  }});\n\
-}})();\n\
-</script>",
-    )
-}
+  });\n\
+})();\n";
+
+// IPE-RUST-AUDIT:ACCEPTED (Arthur Maciel) — compile-time `const` assertion (not a runtime panic); fails the BUILD if the overlay script could end its element early, serving bytes its policy hash does not cover [ledger #boundary]
+const _: () = assert!(!crate::csp::ends_raw_text_early(OVERLAY_JS));
 
 // ── Live inspection surface ───────────────────────────────────────────────────
 
@@ -337,9 +349,23 @@ mod tests {
             html.contains("data-ipe-dbg-reset"),
             "overlay must include the reset button"
         );
+        // A scrubbed render is a full render: it is applied, and its epoch
+        // adopted, only through the client's render-history gate, so a stale
+        // document or a render of another history never reaches the DOM.
         assert!(
-            html.contains("root.innerHTML=d.body;window.__ipeEpoch=typeof d.epoch==='string'"),
-            "a scrubbed render must replace the client's render epoch with its own"
+            html.contains(
+                "if(root&&typeof adopt==='function')adopt(d.epoch,function(){root.innerHTML=d.body;highlight(step);});"
+            ),
+            "a scrubbed render must pass the client's render-history gate"
+        );
+        assert!(
+            !html.contains("__ipeEpoch="),
+            "the overlay must never set the client's render epoch itself"
+        );
+        assert_eq!(
+            html.matches("innerHTML=").count(),
+            1,
+            "the overlay's one markup write is inside the gated apply"
         );
     }
 
@@ -371,6 +397,95 @@ mod tests {
             html.contains("/myapp/_ipe/debug/reset"),
             "overlay must use sub-app base prefix for the reset endpoint"
         );
+    }
+
+    /// The per-page values ride escaped panel attributes; the script stays the
+    /// one constant whatever the base.
+    #[test]
+    fn overlay_base_cannot_break_out_of_its_attribute_or_change_the_script() {
+        let html = overlay_html(&[], 0, "/a\"><script>x()</script>");
+        assert!(html.contains("data-ipe-dbg-scrub-url=\"/a&#34;&gt;&lt;script&gt;"));
+        assert_eq!(html.matches("<script>").count(), 1);
+        assert!(html.ends_with(&format!("<script>{OVERLAY_JS}</script>")));
+    }
+
+    /// The hash-admitted overlay script is reusable by injected markup, so its
+    /// two requests go only to the debug endpoints under the boot block's mount
+    /// base: each `open` takes the URL [`OVERLAY_JS`]'s `endpoint` check
+    /// returned, never a panel attribute read raw.
+    #[test]
+    fn overlay_script_posts_only_to_the_boot_base_debug_endpoints() {
+        let check = "return typeof base==='string'&&url===base+path?url:null;";
+        assert_eq!(OVERLAY_JS.matches(check).count(), 1, "{OVERLAY_JS}");
+        assert_eq!(OVERLAY_JS.matches("var base=window.__IPE_BASE;").count(), 1);
+        for (attr, path) in [
+            ("data-ipe-dbg-scrub-url", "/_ipe/debug/scrub"),
+            ("data-ipe-dbg-reset-url", "/_ipe/debug/reset"),
+        ] {
+            let call = format!("var url=endpoint('{attr}','{path}');\nif(!url)return;");
+            assert_eq!(OVERLAY_JS.matches(&call).count(), 1, "{attr}");
+            assert!(
+                !OVERLAY_JS.contains(&format!("getAttribute('{attr}')")),
+                "{attr}"
+            );
+        }
+        assert_eq!(OVERLAY_JS.matches(".open(").count(), 2);
+        assert_eq!(OVERLAY_JS.matches(".open('POST',url,true)").count(), 2);
+        assert!(OVERLAY_JS.contains("return typeof t==='string'?t:'';"));
+    }
+
+    /// The panel renders once, so its `max` is the step count at page load:
+    /// the scrubber's rightmost position names the newest step rather than an
+    /// index from that count, and every fixed index the overlay posts is a
+    /// position the panel lists.
+    #[test]
+    fn overlay_scrubber_end_scrubs_to_the_newest_step() {
+        assert!(
+            OVERLAY_JS.contains(
+                "var mx=parseInt(this.max,10);\nif(!(v>=0))return;\npost(v>=mx?{newest:true}:{index:v});"
+            ),
+            "{OVERLAY_JS}"
+        );
+        assert!(
+            OVERLAY_JS.contains(
+                "if(!(n>=0))return;\nif(scrubber)scrubber.value=String(n);\npost({index:n});"
+            ),
+            "{OVERLAY_JS}"
+        );
+        assert_eq!(
+            OVERLAY_JS.matches("post(").count(),
+            3,
+            "the definition and its two calls: {OVERLAY_JS}"
+        );
+        assert!(
+            !OVERLAY_JS.contains("mx-1"),
+            "no post names the load-time count"
+        );
+        assert_eq!(OVERLAY_JS.matches("JSON.stringify(").count(), 1);
+        assert!(OVERLAY_JS.contains("xhr.send(JSON.stringify(target));"));
+        assert_eq!(
+            OVERLAY_JS.matches("location.reload()").count(),
+            1,
+            "only the reset answer reloads the page"
+        );
+        assert!(OVERLAY_JS.contains("if(xhr.status===200)window.location.reload();"));
+    }
+
+    /// The highlighted row is the step the applied answer shows, never the
+    /// position posted: a `newest` answer may name a step the panel does not
+    /// list, and an answer the render-history gate refuses changes nothing.
+    #[test]
+    fn overlay_highlights_the_step_the_applied_answer_shows() {
+        assert!(
+            OVERLAY_JS.contains("var step=typeof d.step==='number'?d.step:-1;"),
+            "{OVERLAY_JS}"
+        );
+        assert_eq!(
+            OVERLAY_JS.matches("highlight(").count(),
+            2,
+            "the definition and the call inside the gated apply: {OVERLAY_JS}"
+        );
+        assert!(OVERLAY_JS.contains("root.innerHTML=d.body;highlight(step);});"));
     }
 
     // ── SessionHistory ─────────────────────────────────────────────────────────

@@ -25,13 +25,13 @@ import Lib.Format as Format
 import Lib.Highlight as Highlight exposing (Lang(..), Token(..))
 import Lib.Index as Index exposing (SourceView(..), StaleReason(..))
 import Lib.Keys as Keys exposing (KeyAction(..))
+import Lib.Label as Label exposing (ColumnExtent(..), Label, LabelPart(..))
 import Lib.Links as Links exposing (Link(..))
-import Lib.Queue as Queue exposing (HistoryState(..), QueueState(..), UnitPageState(..))
 import Lib.RepoPath as RepoPath exposing (PathError(..), Root, RootMap)
 import Lib.SafeText as SafeText exposing (Segment(..))
 import Lib.Settings as Settings
 import Lib.Uid as Uid
-import TestSupport exposing (tableExists, countReviewRows, expectErr, refuse, seedIndex, writeFileText, fixtureLibRs, fixtureMainIpe, viewA, viewB, viewTag, shownTextOf, unitViewTag, execIndex, execIndexUnchecked, Scratch, freshScratch, freshDir, check, indexSchemaStatements, execIndexSchema, seedIndexDb, insertUnitRows, setIndexEnv, loadFirstPage, PageEntry, checkUnits, listSecond, isUnitA, isUnitB, cleanupIndex, removeFileIfAny, codeText, noHazard, rendered, renderedForeign, describeText, refusedFor, openReadOnlyAt, vectorsPath, ipeIndexTestFile, repoFile, probeMessage, probeNames, maybeContains, uid)
+import TestSupport exposing (tableExists, countReviewRows, expectErr, refuse, seedIndex, writeFileText, fixtureLibRs, fixtureMainIpe, viewA, viewB, viewTag, shownTextOf, unitViewTag, execIndex, execIndexUnchecked, Scratch, freshScratch, freshDir, check, indexSchemaStatements, execIndexSchema, seedIndexDb, insertUnitRows, setIndexEnv, loadFirstPage, PageEntry, checkUnits, listSecond, isUnitA, isUnitB, cleanupIndex, removeFileIfAny, codeText, noHazard, rendered, renderedForeign, describeText, quotedLabelOf, refusedFor, openReadOnlyAt, vectorsPath, ipeIndexTestFile, repoFile, probeMessage, probeNames, maybeContains, uid, labelOf, labelText)
 
 
 -- Every member of the runtime's `is_log_hazard` set as it stood before the
@@ -62,8 +62,7 @@ safeTextHazardTable =
     List.all
         (\code ->
             SafeText.isHazard (Char.fromCode code)
-                && rendered (codeText code)
-                /= codeText code
+                && rendered (codeText code) /= codeText code
                 && noHazard (rendered (codeText code))
                 && noHazard (renderedForeign (codeText code))
         )
@@ -71,10 +70,8 @@ safeTextHazardTable =
         && List.all
             (\code ->
                 not (SafeText.isHazard (Char.fromCode code))
-                    && rendered (codeText code)
-                    == codeText code
-                    && renderedForeign (codeText code)
-                    == codeText code
+                    && rendered (codeText code) == codeText code
+                    && renderedForeign (codeText code) == codeText code
             )
             hazardNeighbours
         && List.all identity
@@ -121,8 +118,7 @@ logHazardsAreDisplayHazards =
         cwd <- System.cwd ()
         ranges <- readCodeRanges (repoFile cwd "src/runtime/rust/tests/log_hazard_ranges.json")
         Task.succeed
-            (List.length ranges
-                >= 20
+            (List.length ranges >= 20
                 && List.all
                     (\( lo, hi ) -> List.all (\code -> SafeText.isHazard (Char.fromCode code)) [ lo, (lo + hi) // 2, hi ])
                     ranges
@@ -158,12 +154,9 @@ invisibleCodepointsRendered : Bool
 invisibleCodepointsRendered =
     let
         escaped ( code, spelled ) =
-            rendered (codeText code)
-                == spelled
-                && renderedForeign (codeText code)
-                == spelled
-                && SafeText.toString (Highlight.tokenText (Plain (codeText code)))
-                == spelled
+            rendered (codeText code) == spelled
+                && renderedForeign (codeText code) == spelled
+                && SafeText.toString (Highlight.tokenText (Plain (codeText code))) == spelled
     in
     List.all escaped
         [ ( 173, "\\u{ad}" )
@@ -184,8 +177,7 @@ invisibleCodepointsRendered =
         , ( 160, "\\u{a0}" )
         , ( 12288, "\\u{3000}" )
         ]
-        && rendered "admin"
-        /= rendered ("admin" ++ codeText 8203)
+        && rendered "admin" /= rendered ("admin" ++ codeText 8203)
         && List.all (\code -> rendered (codeText code) == codeText code && SafeText.toString (Highlight.tokenText (Plain (codeText code))) == codeText code) [ 32, 233, 10003 ]
 
 
@@ -236,12 +228,9 @@ segmentsSpellRenderForeign =
                     SafeText.escapeSpelling c
     in
     List.all roleHolds segs
-        && List.length (List.filter isEscaped segs)
-        == List.length hazardMembers
-        && String.concat (List.map spell segs)
-        == renderedForeign mixed
-        && renderedForeign ("a" ++ codeText 8238 ++ "b\n\\" ++ codeText 9)
-        == "a\\u{202e}b\\n\\\\t"
+        && List.length (List.filter isEscaped segs) == List.length hazardMembers
+        && String.concat (List.map spell segs) == renderedForeign mixed
+        && renderedForeign ("a" ++ codeText 8238 ++ "b\n\\" ++ codeText 9) == "a\\u{202e}b\\n\\\\t"
 
 
 isEscaped : Segment -> Bool
@@ -274,21 +263,41 @@ quoteCannotForgeBoundary =
     List.all identity
         [ rendered "a\"b" == "a\\\"b"
         , SafeText.toString (SafeText.quoted "x\" ok \"y") == "\"x\\\" ok \\\"y\""
-        , String.contains "\"ipe:a\\\" has\"" (describeText (MissingTag "ipe:a\" has"))
+        , String.contains "\"ipe:a\\\" has\"" (describeText (MissingTag (quotedLabelOf "ipe:a\" has")))
         , rendered "\\\"" /= rendered "\""
         ]
 
 
--- The sink renders that live in `Lib`: the queue's failure line escapes a
--- hazard-bearing error.
-sinkRendersEscape : Bool
-sinkRendersEscape =
-    case Queue.queueStatusText (Failed (Error.unexpected (codeText 27 ++ "[2J" ++ codeText 8238))) of
-        Just text ->
-            noHazard text && String.contains "\\u{1b}[2J\\u{202e}" text
-
-        Nothing ->
-            False
+-- `spelled` escapes every character outside printable ASCII and every `\`,
+-- never `"`, so source text spelling an escape reads apart from the
+-- character it names, and no character drawing like `\` (U+29F5, U+FF3C)
+-- is left raw to make an escape read as source text; `render` and
+-- `renderForeign` keep their own sets. Red if the three sets' arms are
+-- swapped, `spelled` stops escaping `\`, or it leaves a character outside
+-- printable ASCII raw.
+spelledEscapesBackslashNotQuote : Bool
+spelledEscapesBackslashNotQuote =
+    let
+        spelledText raw =
+            SafeText.toString (SafeText.spelled raw)
+    in
+    List.all identity
+        [ SafeText.segments (SafeText.spelled "a\\b\"") == [ Verbatim "a", Escaped '\\', Verbatim "b\"" ]
+        , spelledText "\\u{1b}" == "\\\\u{1b}"
+        , spelledText (codeText 27) == "\\u{1b}"
+        , spelledText (codeText 8238) == "\\u{202e}"
+        , spelledText "\t" == "\\t"
+        , spelledText "\"q\"" == "\"q\""
+        , spelledText "a\\nb" /= spelledText "a\nb"
+        , spelledText (codeText 10741) == "\\u{29f5}"
+        , spelledText (codeText 65340) == "\\u{ff3c}"
+        , spelledText (codeText 233 ++ " ~") == "\\u{e9} ~"
+        , List.all (\c -> Char.toCode c >= 32 && Char.toCode c <= 126) (String.toList (spelledText (codeText 10741 ++ codeText 8238 ++ codeText 128512)))
+        , rendered "\"" == "\\\""
+        , renderedForeign "\\" == "\\"
+        , renderedForeign "\"" == "\""
+        , rendered "\\" == "\\\\"
+        ]
 
 
 -- ── text from the index never reaches a page raw ─────────────────────────
@@ -333,16 +342,15 @@ indexUnitRendered : Index.Unit -> Bool
 indexUnitRendered u =
     List.all safeShown [ u.name, u.qualified, u.kind, u.facing ]
         && (Maybe.map safeShown u.purpose == Just True)
-        && SafeText.toString u.qualified
-        == "Lib.\\u{202e}answer"
+        && labelText u.qualified == "Lib.\\u{202e}answer"
 
 
 -- Rendered text holds no hazard and spells at least one as an escape.
-safeShown : SafeText.SafeText -> Bool
+safeShown : Label -> Bool
 safeShown text =
     let
         shown =
-            SafeText.toString text
+            labelText text
     in
     noHazard shown && String.contains "\\u{" shown
 
@@ -359,14 +367,208 @@ sourceTokensRendered =
             String.concat (List.map (\tok -> SafeText.toString (Highlight.tokenText tok)) (Highlight.tokenize lang line))
 
         label =
-            [ Links.internal ("Lib." ++ rlo ++ "x") (Uid.toString (uid "u-x")) ]
-                |> List.map (\l -> SafeText.toString (Links.label l))
+            [ Links.internal (Label.fromText Label.labelCap ("Lib." ++ rlo ++ "x")) (TestSupport.uidHex (uid "u-x")) ]
+                |> List.map (\l -> Label.parts (Links.label l))
     in
     List.all
         (\lang -> noHazard (shownIn lang) && String.contains "\\u{202e}" (shownIn lang) && String.contains "\\u{2066}" (shownIn lang))
         [ Highlight.Rust, Highlight.Shell, Highlight.Ipe, Highlight.Unknown ]
-        && label
-        == [ "→ Lib.\\u{202e}x" ]
+        && label == [ [ LabelText "Lib.", LabelEscapes "\\u{202e}", LabelText "x" ] ]
+
+
+-- ── labels ──────────────────────────────────────────────────────────────
+-- Two long paths that agree on their first 300 bytes and differ after them
+-- read as different labels, though both drop the same byte count: their
+-- markers' hashes differ. Red if the hash stops covering the window past
+-- the cap.
+labelTruncationIsInjective : Bool
+labelTruncationIsInjective =
+    let
+        prefix =
+            String.repeat 300 "a"
+
+        one =
+            labelOf (prefix ++ "b" ++ String.repeat 3795 "c")
+
+        other =
+            labelOf (prefix ++ "d" ++ String.repeat 3795 "c")
+    in
+    Label.key one /= Label.key other
+        && labelText one /= labelText other
+        && droppedBytes one == Just (4096 - Label.capBytes Label.labelCap)
+        && droppedBytes other == droppedBytes one
+
+
+-- A hundred adjacent NULs are one escape run, cut at the cap with a marker
+-- for the rest. Red if adjacent escapes stop coalescing, one element each.
+escapeRunsCoalesce : Bool
+escapeRunsCoalesce =
+    let
+        spelling =
+            SafeText.escapeSpelling (Char.fromCode 0)
+
+        kept =
+            Label.capBytes Label.labelCap // String.length spelling
+
+        parts =
+            Label.parts (labelOf (String.repeat 100 (codeText 0)))
+    in
+    case parts of
+        [ LabelEscapes run, LabelCut dropped _ ] ->
+            run == String.repeat kept spelling && dropped == 100 - kept
+
+        _ ->
+            False
+
+
+-- A cap that falls inside a four-byte character drops the whole character:
+-- 254 bytes of text and an emoji keep the text and count the emoji's four
+-- bytes in the marker. Red if a cut splits a character.
+labelCutsOnCharBoundary : Bool
+labelCutsOnCharBoundary =
+    let
+        text =
+            String.repeat 254 "a"
+    in
+    case Label.parts (labelOf (text ++ codeText 128512)) of
+        [ LabelText shown, LabelCut dropped _ ] ->
+            shown == text && dropped == 4
+
+        _ ->
+            False
+
+
+-- A label within its cap shows all of it, with no marker.
+shortLabelUncut : Bool
+shortLabelUncut =
+    Label.parts (labelOf "ipe:src/lib.rs") == [ LabelText "ipe:src/lib.rs" ]
+
+
+-- A quoted label escapes `"` and `\` as `SafeText.quoted` does, so a stored
+-- path cannot close the quotes the tool draws around it; the same text as a
+-- plain label shows them as text. Red if the quoted parse stops escaping
+-- either character, or the plain parse starts.
+quotedLabelEscapesQuotes : Bool
+quotedLabelEscapesQuotes =
+    Label.parts (quotedLabelOf "a\"b\\c") == [ LabelText "a", LabelEscapes (SafeText.escapeSpelling '"'), LabelText "b", LabelEscapes (SafeText.escapeSpelling '\\'), LabelText "c" ]
+        && Label.parts (labelOf "a\"b\\c") == [ LabelText "a\"b\\c" ]
+        && labelText (quotedLabelOf "x\" ok \"y") == String.dropRight 1 (String.dropLeft 1 (SafeText.toString (SafeText.quoted "x\" ok \"y")))
+
+
+-- A stored path dense with hazards, quoted, still draws at most
+-- `elementCeiling` elements and ends in the marker for the rest. Red if the
+-- quoted parse stops bounding its escape runs.
+quotedLabelBounded : Bool
+quotedLabelBounded =
+    let
+        drawn =
+            Label.parts (quotedLabelOf (String.repeat 200 (codeText 27 ++ "\"a")))
+
+        elements =
+            List.length (List.filter isElement drawn)
+    in
+    elements <= Label.elementCeiling
+        && droppedBytes (quotedLabelOf (String.repeat 200 (codeText 27 ++ "\"a"))) /= Nothing
+        && List.length (List.filter isElement (Label.parts (quotedLabelOf "ipe:src/lib.rs"))) == 0
+
+
+isElement : LabelPart -> Bool
+isElement part =
+    case part of
+        LabelText _ ->
+            False
+
+        LabelEscapes _ ->
+            True
+
+        LabelCut _ _ ->
+            True
+
+
+-- A column is whole only when the window holds all of it: a column of
+-- exactly `windowChars` characters (one-byte or two-byte) is whole, one
+-- character more is not. A BLOB cell of `2 * windowChars` bytes reads its
+-- window of `windowChars` bytes as hex, a text whose byte count equals the
+-- whole cell's: it is still not whole. Red if `whole` trusts a cut window.
+wholeOnlyWithinWindow : Bool
+wholeOnlyWithinWindow =
+    let
+        at =
+            String.repeat Label.windowChars "a"
+
+        wide =
+            String.repeat Label.windowChars "é"
+
+        hexOfCutBlob =
+            String.repeat Label.windowChars "6c"
+    in
+    Label.whole { shown = hexOfCutBlob, bytes = 2 * Label.windowChars, window = Nothing } == Nothing
+        && Label.whole (Label.columnOf at) == Just at
+        && Label.whole (Label.columnOf wide) == Just wide
+        && Label.whole (Label.columnOf (at ++ "a")) == Nothing
+        && Label.whole (Label.columnOf (wide ++ "é")) == Nothing
+        && Label.whole { shown = "a", bytes = 2, window = Just 2 } == Nothing
+
+
+-- A column's extent names why its window falls short: a window of
+-- `windowChars` characters short of the column's bytes is cut at the
+-- window; a shorter window short of them was cut at a NUL byte; a window
+-- holding more bytes than the column, or wider than the window, is a BLOB's
+-- hex spelling; a cell not stored as text, or a window whose bytes are not
+-- the bytes SQLite returned (a non-UTF-8 text cut at a NUL reads as hex
+-- with the column's byte count), is not text. Red if a NUL cut reads as a
+-- long column, or a hex spelling or a non-text cell as text.
+extentNamesItsCause : Bool
+extentNamesItsCause =
+    let
+        at =
+            String.repeat Label.windowChars "a"
+    in
+    List.map
+        (\column -> extentName (Label.extent column))
+        [ Label.columnOf "ipe:src/Main.ipe"
+        , Label.columnOf (at ++ "a")
+        , { shown = "ipe:src/Ma", bytes = 17, window = Just 10 }
+        , { shown = "6970653a", bytes = 4, window = Nothing }
+        , { shown = String.repeat Label.windowChars "6c", bytes = 2 * Label.windowChars, window = Nothing }
+        , { shown = at, bytes = Label.windowChars + 1, window = Just Label.windowChars }
+        , { shown = "ffff", bytes = 4, window = Just 2 }
+        , { shown = "ipe:src/Main.ipe", bytes = 16, window = Nothing }
+        , { shown = "", bytes = 0, window = Nothing }
+        ]
+        == [ "whole ipe:src/Main.ipe", "window", "nul", "not text", "not text", "window", "not text", "not text", "not text" ]
+
+
+extentName : ColumnExtent -> String
+extentName found =
+    case found of
+        WholeColumn text ->
+            "whole " ++ text
+
+        CutAtWindow ->
+            "window"
+
+        CutAtNul ->
+            "nul"
+
+        NotTextCell ->
+            "not text"
+
+
+droppedBytes : Label -> Maybe Int
+droppedBytes label =
+    case List.head (List.reverse (Label.parts label)) of
+        Just (LabelCut dropped _) ->
+            Just dropped
+
+        Just (LabelText _) ->
+            Nothing
+
+        Just (LabelEscapes _) ->
+            Nothing
+
+        Nothing ->
+            Nothing
 
 
 checks : Task.Task Error (List ( String, Bool ))
@@ -378,9 +580,17 @@ checks =
         , Task.succeed ( "segments hold their role and spell back to the flat form", segmentsSpellRenderForeign )
         , Task.succeed ( "a literal backslash cannot forge an escape", backslashCannotForge )
         , Task.succeed ( "a quote cannot forge a quoted boundary", quoteCannotForgeBoundary )
-        , Task.succeed ( "queue failure line escapes its error", sinkRendersEscape )
+        , Task.succeed ( "spelled text escapes the hazards and backslash, never the quote", spelledEscapesBackslashNotQuote )
         , check "index text is rendered at the decode point" indexTextRendered
         , Task.succeed ( "source tokens and link labels render bidi visibly", sourceTokensRendered )
         , check "the hazard set equals the shared display-hazard vectors" hazardSetMatchesVectors
         , check "every runtime log hazard is a display hazard" logHazardsAreDisplayHazards
+        , Task.succeed ( "two long labels sharing a prefix past the cap read differently", labelTruncationIsInjective )
+        , Task.succeed ( "adjacent escapes in a label are one run", escapeRunsCoalesce )
+        , Task.succeed ( "a label cut inside a character drops the whole character", labelCutsOnCharBoundary )
+        , Task.succeed ( "a label within its cap shows all of it with no marker", shortLabelUncut )
+        , Task.succeed ( "a quoted label escapes its quote and backslash", quotedLabelEscapesQuotes )
+        , Task.succeed ( "a hazard-dense quoted label draws at most the element ceiling", quotedLabelBounded )
+        , Task.succeed ( "a column is whole only within the window", wholeOnlyWithinWindow )
+        , Task.succeed ( "a column's extent names why its window falls short", extentNamesItsCause )
         ]

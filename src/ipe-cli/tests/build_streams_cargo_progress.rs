@@ -50,7 +50,7 @@ fn write_progress_cargo(dir: &Path) -> std::io::Result<std::path::PathBuf> {
     Ok(path)
 }
 
-/// `ipe dev build <entry>` must relay the emitted crate's `cargo build` stderr to
+/// `ipe dev build <dir>` must relay the emitted crate's `cargo build` stderr to
 /// its own stderr — the progress the user watches while cargo compiles.
 #[cfg(unix)]
 #[test]
@@ -58,7 +58,7 @@ fn build_streams_the_emitted_cargo_progress() {
     assert_relays_cargo_progress("build");
 }
 
-/// `ipe dev run <entry>` builds the same way before it execs the binary, so it must
+/// `ipe dev run <dir>` builds the same way before it execs the binary, so it must
 /// relay cargo's progress just as `ipe dev build` does. The fake `cargo build`
 /// produces no `ipe-app` binary, so the exec step fails afterwards — but the
 /// progress line must already have been streamed before that, which is all this
@@ -69,7 +69,7 @@ fn run_streams_the_emitted_cargo_progress() {
     assert_relays_cargo_progress("run");
 }
 
-/// Spawn `ipe <subcommand> <entry>` with a fake progress-printing `cargo` on the
+/// Spawn `ipe dev <subcommand> <dir>` with a fake progress-printing `cargo` on the
 /// `PATH` and assert the fake's stderr marker is relayed to `ipe`'s stderr.
 #[cfg(unix)]
 fn assert_relays_cargo_progress(subcommand: &str) {
@@ -84,17 +84,26 @@ fn assert_relays_cargo_progress(subcommand: &str) {
         .join(format!("ipe_{subcommand}_stream_progress_e2e"));
     let _ = fs::remove_dir_all(&dir);
     let bin_dir = dir.join("fakebin");
-    let entry = dir.join("Main.ipe");
     let out_dir = dir.join("out");
-    let setup = fs::create_dir_all(&bin_dir).and_then(|()| fs::write(&entry, SRC));
-    assert!(setup.is_ok(), "write source + fake-bin dir: {setup:?}");
+    let setup = fs::create_dir_all(&bin_dir);
+    assert!(setup.is_ok(), "make the fake-bin dir: {setup:?}");
+    let fixture = ipe::RootFixture::main(SRC);
+    let Ok(fixture) = fixture else {
+        assert!(false_marker(), "write project: {fixture:?}");
+        return;
+    };
 
     let fake_cargo = write_progress_cargo(&bin_dir);
     assert!(fake_cargo.is_ok(), "write fake cargo: {fake_cargo:?}");
 
     // PATH holds ONLY the fake-bin dir, so the fake `cargo` is the one resolved.
     let out = std::process::Command::new(ipe_bin)
-        .args(["dev", subcommand, &entry.to_string_lossy(), "--out"])
+        .args([
+            "dev",
+            subcommand,
+            &fixture.path().to_string_lossy(),
+            "--out",
+        ])
         .arg(&out_dir)
         .env("PATH", &bin_dir)
         .env("IPE_RUNTIME_DIR", &runtime_dir)

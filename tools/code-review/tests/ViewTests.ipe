@@ -1,4 +1,4 @@
-module ViewTests exposing (checks)
+module ViewTests exposing (allKeys, checks)
 
 import Ipe.ByteSize as ByteSize
 import Ipe.Char as Char
@@ -9,6 +9,7 @@ import Ipe.Db.Sql as Sql
 import Ipe.Dict as Dict
 import Ipe.Error as Error
 import Ipe.File as File
+import Ipe.Html as Html
 import Ipe.Io as Io
 import Ipe.Json.Decode as Decode
 import Ipe.List as List
@@ -21,15 +22,18 @@ import Ipe.System as System
 import Ipe.Task as Task
 import Ipe.Time.Timestamp as Timestamp
 import Lib.Db as LibDb exposing (Decision(..), HistoryCursor(..))
+import Lib.Drawn as Drawn exposing (Drawing(..), Hue(..), LayoutNote(..), Mode(..), Part(..), Piece(..), RowLine(..), Run(..), SourceRow(..), SpelledRow(..))
 import Lib.Format as Format
-import Lib.Highlight as Highlight exposing (Lang(..), Token(..))
+import Lib.Highlight as Highlight exposing (Lang(..), LeadingMark(..), LineEnds(..), Token(..))
+import Lib.History exposing (HistoryState(..))
 import Lib.Index as Index exposing (SourceView(..), StaleReason(..))
-import Lib.Keys as Keys exposing (KeyAction(..))
+import Lib.Keys as Keys exposing (KeyAction(..), KeyMode(..))
 import Lib.Links as Links exposing (Link(..))
-import Lib.Queue as Queue exposing (HistoryState(..), QueueState(..), UnitPageState(..))
+import Lib.Queue as Queue exposing (QueueState(..), UnitPageState(..))
 import Lib.RepoPath as RepoPath exposing (PathError(..), Root, RootMap)
-import Lib.SafeText as SafeText
+import Lib.SafeText as SafeText exposing (Segment(..))
 import Lib.Settings as Settings
+import Lib.View as View
 import TestSupport exposing (tableExists, countReviewRows, expectErr, refuse, seedIndex, writeFileText, fixtureLibRs, fixtureMainIpe, viewA, viewB, viewTag, shownTextOf, unitViewTag, execIndex, execIndexUnchecked, Scratch, freshScratch, freshDir, check, indexSchemaStatements, execIndexSchema, seedIndexDb, insertUnitRows, setIndexEnv, loadFirstPage, checkUnits, listSecond, isUnitA, isUnitB, cleanupIndex, removeFileIfAny, codeText, noHazard, rendered, renderedForeign, describeText, refusedFor, openReadOnlyAt, vectorsPath, ipeIndexTestFile, langName, repoFile, probeMessage, probeNames, maybeContains)
 
 
@@ -279,62 +283,882 @@ largeTokenTokenizes =
     String.length src == 1048576 && Highlight.tokenize Highlight.Rust src == [ Comment src ]
 
 
--- The keyboard shortcuts drive exactly the messages the buttons send: a/r
--- act on the selected unit, j/k/g/1-5 move the selection, Enter/Escape
--- confirm/cancel an open refuse panel, and every key is ignored while the
--- refuse reason input is open (so typing a reason is not hijacked).
-testKeys : Bool
-testKeys =
-    List.all identity
-        [ Keys.label (Keys.keyAction False 3 0 "a") == "approve"
-        , Keys.label (Keys.keyAction False 3 0 "r") == "refuse"
-        , Keys.label (Keys.keyAction False 3 0 "j") == "select1"
-        , Keys.label (Keys.keyAction False 3 0 "k") == "select0"
-        , Keys.label (Keys.keyAction False 3 2 "g") == "select0"
-        , Keys.label (Keys.keyAction False 3 0 "2") == "select1"
-        , Keys.label (Keys.keyAction False 3 0 "5") == "select2"
-        , Keys.label (Keys.keyAction False 3 2 "j") == "select2"
-        , Keys.label (Keys.keyAction False 3 1 "Enter") == "ignore"
-        , Keys.label (Keys.keyAction False 0 0 "a") == "ignore"
-        , Keys.label (Keys.keyAction True 3 0 "a") == "ignore"
-        , Keys.label (Keys.keyAction True 3 0 "j") == "ignore"
-        , Keys.label (Keys.keyAction True 3 0 "Enter") == "confirm"
-        , Keys.label (Keys.keyAction True 3 0 "Escape") == "cancel"
-        ]
+-- Every walk on the view path is linear in the unit's bytes. Each check
+-- below drives one walk over a quarter-mebibyte or larger input; a walk that
+-- copies its rest or its accumulator per step does not finish in the test's
+-- time budget.
+rowTokens : RowLine -> List Token
+rowTokens row =
+    case row of
+        TokenLine _ toks ->
+            toks
+
+        CoveredLine ->
+            []
+
+
+hasComment : List Token -> Bool
+hasComment toks =
+    List.any isCommentToken toks
+
+
+isCommentToken : Token -> Bool
+isCommentToken tok =
+    case tok of
+        Comment _ ->
+            True
+
+        Keyword _ ->
+            False
+
+        Str _ ->
+            False
+
+        Num _ ->
+            False
+
+        Ident _ ->
+            False
+
+        Plain _ ->
+            False
+
+
+-- A 256 KiB one-line unit draws as one row whose tokens spell the line.
+hugeLineRows : Lang -> Bool
+hugeLineRows lang =
+    let
+        src =
+            String.repeat 32768 "a1 \"s\"; "
+    in
+    case Drawn.rowLines lang [ Numbered 1 src ] of
+        [ TokenLine 1 toks ] ->
+            String.length src == 262144 && String.concat (List.map rawText toks) == src
+
+        _ ->
+            False
+
+
+-- Ipê comments are `--` and nested `{- -}`; `//` is not one.
+ipeComments : Bool
+ipeComments =
+    Highlight.tokenize Ipe "x -- c" == [ Ident "x", Plain " ", Comment "-- c" ]
+        && Highlight.tokenize Ipe "{- a {- b -} c -} y" == [ Comment "{- a {- b -} c -}", Plain " ", Ident "y" ]
+        && not (hasComment (Highlight.tokenize Ipe "a // b"))
+        && not (hasComment (Highlight.tokenize Ipe "a /* b */"))
+        && reassembles Ipe "a // b"
+
+
+-- A shell `#` after a gap opens a comment; `#` inside a word and `/*` do not.
+shellComments : Bool
+shellComments =
+    List.any (isComment "# c") (Highlight.tokenize Shell "echo x # c")
+        && not (hasComment (Highlight.tokenize Shell "a#b"))
+        && not (hasComment (Highlight.tokenize Shell "/* x */"))
+        && not (hasComment (Highlight.tokenize Shell "// x"))
+
+
+-- A string spanning lines is never read as a comment, whether the unit is
+-- lexed whole or row by row.
+multiLineStrings : Bool
+multiLineStrings =
+    not (hasComment (Highlight.tokenize Rust "\"a\n// b\" c"))
+        && not (hasComment (Highlight.tokenize Ipe "\"\"\"a\n-- b\"\"\" c"))
+        && reassembles Rust "\"a\n// b\" c"
+        && reassembles Ipe "\"\"\"a\n-- b\"\"\" c"
+        && not (List.any hasComment (List.map rowTokens (Drawn.rowLines Rust [ Numbered 1 "\"a", Numbered 2 "// b\" c" ])))
+        && not (List.any hasComment (List.map rowTokens (Drawn.rowLines Ipe [ Numbered 1 "\"\"\"a", Numbered 2 "-- b\"\"\" c" ])))
+
+
+-- A block comment open at a row's end carries into the next row; a covered
+-- run between them starts the next row afresh.
+blockCarry : Bool
+blockCarry =
+    case Drawn.rowLines Ipe [ Numbered 1 "{- a", Numbered 2 "b -} x" ] of
+        [ TokenLine 1 first, TokenLine 2 second ] ->
+            first == [ Comment "{- a" ]
+                && List.any (isComment "b -}") second
+                && List.any (isIdent "x") second
+                && coveredResets
+
+        _ ->
+            False
+
+
+coveredResets : Bool
+coveredResets =
+    case Drawn.rowLines Ipe [ Numbered 1 "{- a", Covered, Numbered 3 "b -} x" ] of
+        [ _, CoveredLine, TokenLine 3 third ] ->
+            not (List.any (isComment "b -}") third)
+
+        _ ->
+            False
+
+
+-- A tab draws as the tab it is, never as an escape, while U+202E still draws
+-- as a marked escape and never as itself.
+tabDrawsAsTab : Bool
+tabDrawsAsTab =
+    let
+        html =
+            codeOf (Drawn.highlighted Rust [ Numbered 1 ("a\tb" ++ codeText 8238) ])
+    in
+    String.contains "\t" html
+        && not (String.contains "\\t" html)
+        && String.contains "\\u{202e}" html
+        && not (String.contains (codeText 8238) html)
+        && List.map SafeText.segments (Highlight.tokenRuns (Plain "a\tb")) == [ [ Verbatim "a" ], [ Verbatim "b" ] ]
+
+
+-- The references of a 64Ki-token unit are read in one pass: one per bare
+-- word, one per dotted path.
+hugeLinks : Bool
+hugeLinks =
+    List.length (Links.references Rust (String.repeat 65536 "a ")) == 65536
+        && List.length (Links.references Ipe (String.repeat 32768 "a.b ")) == 32768
+
+
+-- A 256 KiB URL word, and 64Ki URL words, are trimmed in one pass each.
+hugeUrls : Bool
+hugeUrls =
+    let
+        url =
+            "https://x.io/" ++ String.repeat 131072 "a" ++ String.repeat 131072 "." ++ "b"
+    in
+    Links.sourceUrls ("(" ++ url ++ ")),") == [ Links.external url ]
+        && List.length (Links.sourceUrls (String.repeat 65536 "https://x.io/p, ")) == 65536
+
+
+-- A 256 KiB token holding one U+202E is three segments: the text before,
+-- the escape, the text after. Joining 64Ki pieces stays one segment.
+hugeSegments : Bool
+hugeSegments =
+    let
+        before =
+            String.repeat 131072 "a"
+
+        after =
+            String.repeat 131071 "b"
+    in
+    SafeText.segments (SafeText.renderForeign (before ++ codeText 8238 ++ after)) == [ Verbatim before, Escaped (Char.fromCode 8238), Verbatim after ]
+        && SafeText.segments (SafeText.concat (List.repeat 65536 (SafeText.renderForeign "ab"))) == [ Verbatim (String.repeat 65536 "ab") ]
+
+
+-- A 128Ki-escape text is 256Ki segments, rendered and joined in one pass
+-- each. Red (the run never ends) if the scan or the join builds its segments
+-- by consing onto the head, which copies the list per escape.
+hugeEscapeRuns : Bool
+hugeEscapeRuns =
+    let
+        drawn =
+            SafeText.renderForeign (String.repeat 131072 (codeText 8238 ++ "a"))
+    in
+    List.length (SafeText.segments drawn) == 262144
+        && List.take 2 (SafeText.segments drawn) == [ Escaped (Char.fromCode 8238), Verbatim "a" ]
+        && List.length (SafeText.segments (SafeText.concat (List.repeat 131072 (SafeText.render "\"x")))) == 262144
+
+
+-- A residual over a million-line file, every second line covered, keeps
+-- each odd line with one covered row between neighbours.
+hugeResidual : Bool
+hugeResidual =
+    Index.residualText (List.map (\k -> ( 2 * k, 2 * k )) (List.range 1 500000)) (String.repeat 1000000 "x\n")
+        == "\nx" ++ String.repeat 499999 "\n\nx"
+
+
+-- A `\r` before a line's `\n` is the CRLF line break in Rust and Ipê, and
+-- text in shell, where `cd /x\r` names another directory than `cd /x`.
+crlfByLanguage : Bool
+crlfByLanguage =
+    case ( Drawn.rowLines Rust [ Numbered 1 "fn x\r" ], Drawn.rowLines Shell [ Numbered 1 "cd /x\r" ] ) of
+        ( [ TokenLine 1 rust ], [ TokenLine 1 shell ] ) ->
+            rust == [ Keyword "fn", Plain " ", Ident "x" ]
+                && List.member (Plain "\r") shell
+                && String.contains "data-review-escape" (codeOf (Drawn.highlighted Shell [ Numbered 1 "cd /x\r" ]))
+
+        _ ->
+            False
+
+
+-- The rendered code blocks of a drawing, in order, each from its `<code` to
+-- its `</code>`.
+codeOf : Drawn.DrawnSource -> String
+codeOf drawn =
+    case String.split "<code" (Html.render (View.drawnHtml drawn)) of
+        _ :: blocks ->
+            String.concat (List.map (\block -> "<code" ++ codeBlock block) blocks)
+
+        [] ->
+            ""
+
+
+codeBlock : String -> String
+codeBlock block =
+    case String.split "</code>" block of
+        inner :: _ ->
+            inner ++ "</code>"
+
+        [] ->
+            ""
+
+
+-- The text of rendered markup: every character outside a tag, in order.
+-- The fixtures it reads hold no character the markup escapes.
+markupText : String -> String
+markupText html =
+    case String.foldl markupStep ( False, "" ) html of
+        ( _, text ) ->
+            text
+
+
+markupStep : Char -> ( Bool, String ) -> ( Bool, String )
+markupStep c ( inTag, text ) =
+    if c == '<' then
+        ( True, text )
+
+    else if c == '>' then
+        ( False, text )
+
+    else if inTag then
+        ( True, text )
+
+    else
+        ( False, String.append text (String.fromChar c) )
+
+
+-- A run of lines copies as the source spells it: the code block's text is
+-- the lines joined by newlines with their spaces and tabs, one line element
+-- per line, and the line numbers sit apart in a gutter copying skips.
+sourceCopiesAsWritten : Bool
+sourceCopiesAsWritten =
+    let
+        code =
+            codeOf (Drawn.highlighted Rust [ Numbered 1 "fn a() {", Numbered 2 "\tlet  x = 1;", Numbered 3 "}" ])
+
+        gutter =
+            Html.render (View.gutterHtml [ "1", "2", "3" ])
+    in
+    markupText code == "fn a() {\n\tlet  x = 1;\n}"
+        && List.length (String.split "<span style=\"white-space:pre\">" code) == 4
+        && String.contains "white-space:pre" code
+        && markupText gutter == "1\n2\n3"
+        && String.contains "user-select:none" gutter
+        && String.contains "aria-hidden" gutter
+        && not (String.contains "user-select:none" code)
+
+
+-- How often `needle` occurs in `text`.
+occurrences : String -> String -> Int
+occurrences needle text =
+    List.length (String.split needle text) - 1
+
+
+-- The elements opened in rendered markup: each `<` that is not a `</`. The
+-- fixtures hold no `<` in text, which the markup escapes anyway.
+openedElements : String -> Int
+openedElements html =
+    occurrences "<" html - occurrences "</" html
+
+
+-- The fixture table the element count is checked over: plain text,
+-- keywords and other colours, tabs, escapes, mixed-direction text and its
+-- controls, a covered run, an empty line, in every language.
+drawnFixtures : List (List SourceRow)
+drawnFixtures =
+    [ [ Numbered 1 "hello world" ]
+    , [ Numbered 1 "fn main() { let x = 1; }", Numbered 2 "// done", Numbered 3 "\"s\" 2.5" ]
+    , [ Numbered 1 "\tlet\tx = 2;", Numbered 2 "\t\t" ]
+    , [ Numbered 1 ("a" ++ codeText 8238 ++ codeText 8238 ++ "b" ++ codeText 7 ++ "\t" ++ codeText 8203) ]
+    , [ Numbered 1 ("let " ++ codeText 1488 ++ codeText 1489 ++ " = " ++ codeText 8294 ++ "1" ++ codeText 8297 ++ " // " ++ codeText 1490) ]
+    , [ Numbered 1 "fn a", Covered, Numbered 5 "fn b", Covered ]
+    , [ Numbered 1 "", Numbered 2 "x", Numbered 3 "" ]
+    , [ Covered ]
+    , []
+    ]
+
+
+-- Each drawing renders exactly the elements `Drawn.elements` counts, in
+-- every mode and language; plain draws no more than coloured, and spelled
+-- out always four. Red if the drawing adds an element the count does not.
+drawnCountIsRenderedCount : Bool
+drawnCountIsRenderedCount =
+    let
+        agrees drawn =
+            openedElements (Html.render (View.drawnHtml drawn)) == Drawn.elements drawn
+
+        both lang rows =
+            agrees (Drawn.highlighted lang rows)
+                && agrees (Drawn.plain lang rows)
+                && agrees (Drawn.spelled lang rows)
+                && Drawn.elements (Drawn.spelled lang rows) == 4
+                && Drawn.elements (Drawn.plain lang rows) <= Drawn.elements (Drawn.highlighted lang rows)
+    in
+    List.all (\lang -> List.all (both lang) (drawnFixtures ++ hostileRows)) [ Rust, Ipe, Shell, Unknown ]
+        && Drawn.elements (Drawn.highlighted Rust [ Numbered 1 "fn x" ]) == 6
+
+
+-- Fifty adjacent escapes draw as one marked element holding all fifty
+-- spellings, coloured and plain. Red if escapes are drawn one element each.
+escapeRunIsOneElement : Bool
+escapeRunIsOneElement =
+    let
+        rows =
+            [ Numbered 1 ("a" ++ String.repeat 50 (codeText 8238) ++ "b") ]
+
+        oneMarked html =
+            occurrences "data-review-escape" html == 1 && occurrences "\\u{202e}" html == 50
+    in
+    oneMarked (codeOf (Drawn.highlighted Rust rows)) && oneMarked (codeOf (Drawn.plain Rust rows))
+
+
+-- An identifier, a space and an identifier share the code block's colour,
+-- so the line is one run drawn without an element of its own: the line's
+-- element is its only span. Red if each token draws its own span.
+sameColourTokensShareOneElement : Bool
+sameColourTokensShareOneElement =
+    let
+        rows =
+            [ Numbered 1 "a b" ]
+    in
+    Drawn.drawing (Drawn.highlighted Rust rows) == Colored [ LineRun [ 1 ] [ [ Run TextHue [ Chars "a b" ] ] ] ]
+        && occurrences "<span" (codeOf (Drawn.highlighted Rust rows)) == 1
+        && occurrences "<span" (codeOf (Drawn.highlighted Rust [ Numbered 1 "fn fn" ])) == 3
+        && Drawn.drawing (Drawn.plain Rust rows) == Uncolored [ LineRun [ 1 ] [ Chars "a b" ] ]
+
+
+-- Rows a spelled drawing must keep apart: an ASCII `\u{200b}` and a real
+-- U+200B, a doubled backslash, a source line spelling the gap text and one
+-- holding only `…`, quotes, tabs, a `\r` inside a shell line, the
+-- characters the markup escapes, and characters drawing like `\` (U+29F5,
+-- U+FF3C) before a real U+202E, before `…`, and before an ASCII escape.
+hostileRows : List (List SourceRow)
+hostileRows =
+    [ [ Numbered 1 "\\u{200b}" ]
+    , [ Numbered 1 (codeText 8203) ]
+    , [ Numbered 1 "\\\\", Numbered 2 "\\" ]
+    , [ Numbered 1 "\\…", Covered, Numbered 3 "…" ]
+    , [ Numbered 1 "say \"hi\" \\\"" ]
+    , [ Numbered 1 "\ta\t\tb\t" ]
+    , [ Numbered 1 "cd /x\ry", Numbered 2 "cd /z\r" ]
+    , [ Numbered 1 "'<&>' &amp; &#39;" ]
+    , [ Numbered 1 ("\\n" ++ "\n" ++ "\\u{" ++ codeText 8238 ++ "}") ]
+    , [ Numbered 1 ("s = \"" ++ codeText 10741 ++ codeText 8238 ++ "\"") ]
+    , [ Numbered 1 (codeText 10741 ++ "…"), Covered, Numbered 3 (codeText 65340 ++ "u{202e} ção") ]
+    ]
+
+
+-- The text of a drawing's one code block, its markup escapes undone.
+spelledCodeText : Drawn.DrawnSource -> String
+spelledCodeText drawn =
+    case String.split ">" (codeOf drawn) of
+        _ :: textAndClose :: _ ->
+            textAndClose
+                |> String.replace "</code" ""
+                |> String.replace "&lt;" "<"
+                |> String.replace "&gt;" ">"
+                |> String.replace "&#39;" "'"
+                |> String.replace "&amp;" "&"
+
+        _ ->
+            ""
+
+
+-- The rows a spelled text stands for, read by the spelling alone: each line
+-- between the newline joins, `Drawn.spelledGapText` a covered run (`Nothing`),
+-- every other line unspelled, or `Nothing` for the whole when a `\` starts no
+-- spelling.
+unspellRows : String -> Maybe (List (Maybe String))
+unspellRows text =
+    List.foldr (\line acc -> Maybe.map2 (\row rest -> row :: rest) (unspellRow line) acc) (Just []) (String.split "\n" text)
+
+
+unspellRow : String -> Maybe (Maybe String)
+unspellRow line =
+    if line == Drawn.spelledGapText then
+        Just Nothing
+
+    else
+        Maybe.map Just (unspell (String.toList line))
+
+
+unspell : List Char -> Maybe String
+unspell chars =
+    case chars of
+        [] ->
+            Just ""
+
+        c :: rest ->
+            if c == '\\' then
+                unspellEscape rest
+
+            else
+                Maybe.map (String.append (String.fromChar c)) (unspell rest)
+
+
+unspellEscape : List Char -> Maybe String
+unspellEscape chars =
+    case chars of
+        [] ->
+            Nothing
+
+        c :: rest ->
+            if c == 'u' then
+                unspellCode rest
+
+            else
+                Maybe.andThen (\s -> Maybe.map (String.append s) (unspell rest)) (namedSpelling c)
+
+
+namedSpelling : Char -> Maybe String
+namedSpelling c =
+    if c == 'n' then
+        Just "\n"
+
+    else if c == 'r' then
+        Just "\r"
+
+    else if c == 't' then
+        Just "\t"
+
+    else if c == '\\' then
+        Just "\\"
+
+    else
+        Nothing
+
+
+unspellCode : List Char -> Maybe String
+unspellCode chars =
+    case chars of
+        open :: rest ->
+            if open == '{' then
+                hexCode 0 rest
+
+            else
+                Nothing
+
+        [] ->
+            Nothing
+
+
+hexCode : Int -> List Char -> Maybe String
+hexCode acc chars =
+    case chars of
+        [] ->
+            Nothing
+
+        c :: rest ->
+            if c == '}' then
+                Maybe.map (String.append (String.fromChar (Char.fromCode acc))) (unspell rest)
+
+            else
+                Maybe.andThen (\d -> hexCode (acc * 16 + d) rest) (List.head (String.indexes (String.fromChar c) "0123456789abcdef"))
+
+
+-- What a spelled drawing must give back: each numbered line as its
+-- language's layout reads it, each covered run as a gap.
+laidOutRows : Lang -> List SourceRow -> List (Maybe String)
+laidOutRows lang rows =
+    List.map
+        (\row ->
+            case row of
+                Numbered n line ->
+                    Just (Drawn.layoutLine (Highlight.layoutOf lang) n line)
+
+                Covered ->
+                    Nothing
+        )
+        rows
+
+
+-- A spelled drawing's text alone gives back the rows it draws, so no two
+-- views draw alike: every fixture and hostile row in every language, and an
+-- ASCII `\u{200b}` draws apart from a real U+200B. The fixture with no rows
+-- is left out: its text is the one empty line's, and the gutter, which
+-- numbers that line, tells them apart. Red if `\` is not doubled, or the gap
+-- text is one a source line can spell.
+spelledIsInjective : Bool
+spelledIsInjective =
+    let
+        roundTrips lang rows =
+            unspellRows (spelledCodeText (Drawn.spelled lang rows)) == Just (laidOutRows lang rows)
+
+        rowsets =
+            List.filter (\rows -> rows /= []) (drawnFixtures ++ hostileRows)
+    in
+    List.all (\lang -> List.all (roundTrips lang) rowsets) [ Rust, Ipe, Shell, Unknown ]
+        && spelledCodeText (Drawn.spelled Unknown [ Numbered 1 "\\u{200b}" ]) /= spelledCodeText (Drawn.spelled Unknown [ Numbered 1 (codeText 8203) ])
+        && spelledCodeText (Drawn.spelled Unknown [ Numbered 1 "\\…" ]) /= spelledCodeText (Drawn.spelled Unknown [ Covered ])
+
+
+-- A spelled drawing's markup holds no display hazard but the newlines that
+-- join its lines and the tabs it keeps, every line of its text but the gap
+-- text is printable ASCII and tabs, so no source character draws like the
+-- `\` of an escape, and its code block draws in byte order. Red if the
+-- spelled builder bypasses `SafeText.spelled`, `spelled` leaves a character
+-- outside printable ASCII raw, or the block loses `displayOrderCss`.
+spelledDrawsNoRawHazard : Bool
+spelledDrawsNoRawHazard =
+    let
+        asciiLine line =
+            line == Drawn.spelledGapText || List.all (\c -> c == '\t' || (Char.toCode c >= 32 && Char.toCode c <= 126)) (String.toList line)
+
+        clean lang rows =
+            let
+                html =
+                    Html.render (View.drawnHtml (Drawn.spelled lang rows))
+            in
+            List.all (\c -> c == '\n' || c == '\t' || not (SafeText.isHazard c)) (String.toList html)
+                && List.all asciiLine (String.split "\n" (spelledCodeText (Drawn.spelled lang rows)))
+                && String.startsWith ("<code style=\"" ++ View.codeCss ++ ";") (codeOf (Drawn.spelled lang rows))
+    in
+    List.all (\lang -> List.all (clean lang) (drawnFixtures ++ hostileRows)) [ Rust, Ipe, Shell, Unknown ]
+        && String.contains View.displayOrderCss View.codeCss
+
+
+-- A line holding U+202E and U+2066 draws in byte order by its code block:
+-- the block carries `displayOrderCss`, and no line, run or escape element
+-- inside it sets `unicode-bidi` again. Red if the override moves off the
+-- block, or back onto each element.
+codeBlockHoldsDisplayOrder : Bool
+codeBlockHoldsDisplayOrder =
+    let
+        rows =
+            [ Numbered 1 ("let s = \"" ++ codeText 8238 ++ "x\"; // " ++ codeText 8294 ++ "y") ]
+
+        inOrder html =
+            String.startsWith ("<code style=\"" ++ View.codeCss ++ "\">") html
+                && String.contains View.displayOrderCss View.codeCss
+                && occurrences "unicode-bidi" html == 1
+                && occurrences "data-review-escape" html == 2
+    in
+    inOrder (codeOf (Drawn.highlighted Rust rows)) && inOrder (codeOf (Drawn.plain Rust rows))
+
+
+-- A tab, a CRLF line end in Rust and a byte-order mark opening a Rust file
+-- are layout: drawn as columns or not at all, each noted for the file. Every
+-- other hazard, and each of those where its language reads it as text,
+-- draws as a marked escape and never reaches the markup as itself.
+layoutOnlyWhereLanguageReadsIt : Bool
+layoutOnlyWhereLanguageReadsIt =
+    let
+        mark =
+            codeText 65279
+
+        drawn lang rows =
+            codeOf (Drawn.highlighted lang rows)
+
+        plainDrawn lang rows =
+            codeOf (Drawn.plain lang rows)
+
+        escapes raw html =
+            String.contains "data-review-escape" html && not (String.contains raw html)
+
+        layoutRows =
+            [ Numbered 1 (mark ++ "fn x\r"), Numbered 2 "\tfn y\r" ]
+
+        layout =
+            drawn Rust layoutRows ++ plainDrawn Rust layoutRows
+    in
+    not (String.contains "data-review-escape" layout)
+        && not (String.contains mark layout)
+        && not (String.contains "\r" layout)
+        && markupText (drawn Rust layoutRows) == "fn x\n\tfn y"
+        && markupText (plainDrawn Rust layoutRows) == "fn x\n\tfn y"
+        && Drawn.layoutNotes Rust [ Numbered 1 (mark ++ "fn x\r"), Numbered 2 "fn y" ] == [ ByteOrderMark, CrlfLineEnds ]
+        && Drawn.layoutNotes Rust [ Numbered 1 "fn x", Numbered 2 "fn y" ] == []
+        && List.all (\code -> escapes (codeText code) (drawn Rust [ Numbered 1 ("a" ++ codeText code ++ "b") ])) [ 7, 27, 127, 133, 155, 8203, 8238, 8294, 65279 ]
+        && List.all (\code -> escapes (codeText code) (plainDrawn Rust [ Numbered 1 ("a" ++ codeText code ++ "b") ])) [ 7, 27, 127, 133, 155, 8203, 8238, 8294, 65279 ]
+        && escapes "\r" (plainDrawn Shell [ Numbered 1 "cd /x\r" ])
+        && escapes mark (drawn Rust [ Numbered 2 (mark ++ "fn x") ])
+        && escapes mark (drawn Shell [ Numbered 1 (mark ++ "echo x") ])
+        && escapes mark (drawn Ipe [ Numbered 1 (mark ++ "x = 1") ])
+        && escapes mark (drawn Unknown [ Numbered 1 (mark ++ "x") ])
+        && escapes "\r" (drawn Shell [ Numbered 1 "cd /x\r" ])
+        && escapes "\r" (drawn Rust [ Numbered 1 "a\rb" ])
+        && Drawn.layoutNotes Shell [ Numbered 1 (mark ++ "cd /x\r") ] == []
+        && Drawn.layoutNotes Rust [ Numbered 2 (mark ++ "fn x") ] == []
+
+
+-- A layout's two facts alone decide what a line loses: where its grammar
+-- says a `\r` or a leading byte-order mark is text, the line keeps it; a
+-- mark is layout only on line 1, and a `\r` only at the line's end.
+layoutDecidesWhatIsHidden : Bool
+layoutDecidesWhatIsHidden =
+    let
+        mark =
+            codeText 65279
+
+        line =
+            mark ++ "x\r"
+
+        hiding =
+            { lineEnds = CrlfIsOneBreak, leadingMark = MarkSkipped }
+    in
+    Drawn.layoutLine hiding 1 line == "x"
+        && Drawn.layoutLine { lineEnds = CrIsText, leadingMark = MarkIsText } 1 line == line
+        && Drawn.layoutLine { lineEnds = CrIsText, leadingMark = MarkSkipped } 1 line == "x\r"
+        && Drawn.layoutLine { lineEnds = CrlfIsOneBreak, leadingMark = MarkIsText } 1 line == mark ++ "x"
+        && Drawn.layoutLine hiding 2 line == mark ++ "x"
+        && Drawn.layoutLine hiding 1 "a\rb" == "a\rb"
+
+
+-- A Rust `br"…"` or `cr"…"` is a raw string: its `\` escapes nothing, so
+-- the string closes at its quote and the next row is code.
+rawPrefixedStrings : Bool
+rawPrefixedStrings =
+    Highlight.tokenize Rust "br\"\\\" x" == [ Str "br\"\\\"", Plain " ", Ident "x" ]
+        && Highlight.tokenize Rust "cr#\"a\"#" == [ Str "cr#\"a\"#" ]
+        && Highlight.tokenize Rust "break crate" == [ Keyword "break", Plain " ", Keyword "crate" ]
+        && rawRowCloses
+
+
+rawRowCloses : Bool
+rawRowCloses =
+    case Drawn.rowLines Rust [ Numbered 1 "let s = br\"\\\";", Numbered 2 "fn x" ] of
+        [ _, TokenLine 2 second ] ->
+            second == [ Keyword "fn", Plain " ", Ident "x" ]
+
+        _ ->
+            False
+
+
+-- A shell heredoc body opens no string past its own line, so a `don't` in
+-- it leaves the code after the delimiter drawn as code; a `<<-` delimiter
+-- may follow tabs. A `<<<` here-string is no heredoc, so its quote carries.
+heredocBodies : Bool
+heredocBodies =
+    case Drawn.rowLines Shell [ Numbered 1 "cat <<EOF", Numbered 2 "don't", Numbered 3 "EOF", Numbered 4 "rm -rf x" ] of
+        [ _, _, _, TokenLine 4 fourth ] ->
+            fourth == [ Ident "rm", Plain " ", Plain "-", Ident "rf", Plain " ", Ident "x" ]
+                && heredocTabs
+                && hereStringCarries
+                && List.member (Ident "rm") (Highlight.tokenize Shell "cat <<EOF\ndon't\nEOF\nrm -rf x")
+
+        _ ->
+            False
+
+
+heredocTabs : Bool
+heredocTabs =
+    case Drawn.rowLines Shell [ Numbered 1 "cat <<-'END'", Numbered 2 "it's", Numbered 3 "\tEND", Numbered 4 "rm x" ] of
+        [ _, _, _, TokenLine 4 fourth ] ->
+            fourth == [ Ident "rm", Plain " ", Ident "x" ]
+
+        _ ->
+            False
+
+
+hereStringCarries : Bool
+hereStringCarries =
+    case Drawn.rowLines Shell [ Numbered 1 "cat <<<'a", Numbered 2 "b' c" ] of
+        [ _, TokenLine 2 second ] ->
+            List.take 1 second == [ Str "b'" ]
+
+        _ ->
+            False
+
+
+-- Every bound key, its shifted form, the neighbours of the digit range, and
+-- empties: the whole domain the key tests below walk.
+allKeys : List String
+allKeys =
+    [ "a", "r", "j", "k", "g", "1", "2", "3", "4", "5", "Enter", "Escape", "x", "A", "R", "J", "0", "6", "Tab", " ", "" ]
+
+
+-- An action spelled with the payload it carries and the position it moves
+-- to, so two actions compare by what they act on.
+spell : KeyAction String Int -> String
+spell action =
+    case action of
+        ApproveSelected card ->
+            "approve " ++ card
+
+        RefuseSelected card ->
+            "refuse " ++ card
+
+        Select at ->
+            "select " ++ String.fromInt (Keys.index at)
+
+        ConfirmRefuse row ->
+            "confirm " ++ String.fromInt row
+
+        CancelRefuse row ->
+            "cancel " ++ String.fromInt row
+
+        Ignore ->
+            "ignore"
+
+
+-- The spelling `bound` names for `key`, else "ignore".
+boundOr : String -> List ( String, String ) -> String
+boundOr key bound =
+    case bound of
+        [] ->
+            "ignore"
+
+        ( named, spelled ) :: rest ->
+            if named == key then
+                spelled
+
+            else
+                boundOr key rest
+
+
+-- Every key of `allKeys` in `mode` takes the action `bound` names for it,
+-- and every key `bound` does not name is ignored.
+keysSpell : KeyMode String Int -> List ( String, String ) -> Bool
+keysSpell mode bound =
+    List.all (\key -> spell (Keys.keyAction mode key) == boundOr key bound) allKeys
+
+
+-- The key `key` in `OnCards card` with the selection at `selected` of
+-- `count` cards, spelled.
+cardSpell : Maybe String -> Int -> Int -> String -> String
+cardSpell card selected count key =
+    case Keys.position selected count of
+        Just at ->
+            spell (Keys.keyAction (OnCards card at) key)
+
+        Nothing ->
+            "no position"
+
+
+-- The navigation a card shortcut takes from the second of three cards.
+navigationFromSecondOfThree : List ( String, String )
+navigationFromSecondOfThree =
+    [ ( "j", "select 2" ), ( "k", "select 0" ), ( "g", "select 0" ), ( "1", "select 0" ), ( "2", "select 1" ), ( "3", "select 2" ), ( "4", "select 2" ), ( "5", "select 2" ) ]
+
+
+-- A drawn panel's Enter and Escape act on its row; every other key is a
+-- reason's letter and acts on nothing.
+panelKeysActOnlyOnTheDrawnRow : Bool
+panelKeysActOnlyOnTheDrawnRow =
+    keysSpell (InPanel (Just 7)) [ ( "Enter", "confirm 7" ), ( "Escape", "cancel 7" ) ]
+
+
+-- A panel the render did not draw confirms and cancels nothing.
+undrawnPanelKeysActOnNothing : Bool
+undrawnPanelKeysActOnNothing =
+    keysSpell (InPanel Nothing) []
+
+
+dormantKeysActOnNothing : Bool
+dormantKeysActOnNothing =
+    keysSpell Dormant []
+
+
+-- On cards, a and r act on the drawn card and the navigation keys move the
+-- selection clamped into the cards; every other key is ignored.
+cardKeysMap : Bool
+cardKeysMap =
+    (case Keys.position 1 3 of
+        Just at ->
+            keysSpell (OnCards (Just "c") at) ([ ( "a", "approve c" ), ( "r", "refuse c" ) ] ++ navigationFromSecondOfThree)
+
+        Nothing ->
+            False
+    )
+        && cardSpell (Just "c") 2 3 "j" == "select 2"
+        && cardSpell (Just "c") 0 3 "k" == "select 0"
+
+
+-- With no card drawn, a and r decide nothing; navigation is unchanged.
+cardlessKeysNeverDecide : Bool
+cardlessKeysNeverDecide =
+    case Keys.position 1 3 of
+        Just at ->
+            keysSpell (OnCards Nothing at) navigationFromSecondOfThree
+
+        Nothing ->
+            False
+
+
+-- A position over no cards has no representation, and one built past the
+-- cards is clamped into them.
+positionRefusals : Bool
+positionRefusals =
+    Maybe.map Keys.index (Keys.position 0 0) == Nothing
+        && Maybe.map Keys.index (Keys.position 0 (-1)) == Nothing
+        && Maybe.map Keys.index (Keys.position 7 3) == Just 2
+        && Maybe.map Keys.index (Keys.position (-4) 3) == Just 0
+        && List.all (\key -> cardSpell (Just "c") 0 1 key == "select 0") [ "j", "k", "g", "5" ]
 
 
 -- A decision reaches `Queue.decide` only through the shown source
--- `Queue.decidableSource` gives: `Queue.decide ` appears once in the app
--- (inside `decideOn`), `decideOn ` exactly three times (its signature, its
--- definition and the one call in the `Just shown` arm), and neither in
--- `Main`. A site list with exact counts, since `ipe test` builds no
--- `update`. Red if a second path to `decide` is added.
+-- `DecisionSlot.offeredSource` gives (the decidable source, kept only while its
+-- digest is the one the offer drew): `decisionPlan` plans `WriteUnit` only in
+-- its `Just shown` arm, and `WriteFile` only in the arm of a refusal listed
+-- on the page under the digest the offer drew; `decidePlan` writes each plan
+-- through its one sink. `Queue.decide ` appears once in the app (inside
+-- `decideOn`), `decideOn ` exactly three times (its signature, its definition
+-- and the one call in the `WriteUnit` arm), `Queue.decideRefusal ` once, in
+-- the `WriteFile` arm, `WriteUnit` and `WriteFile` each three times as any
+-- token (the type's constructor, the one plan built and the one arm matched,
+-- so a plan built by passing the constructor as a function is counted too),
+-- and `decidePlan` three times (its signature, its definition and the one
+-- call in `run`), counted over `Lib.App` and `Lib.Session` together; the
+-- session names neither `decidePlan` nor `decideOn`, and only the one
+-- matched arm of each constructor is in `Lib.App`; none of them appears in
+-- `Main`. The arms are
+-- matched with whitespace runs collapsed, so re-indenting them keeps the
+-- scan. A site list with exact counts, since `ipe test` runs no `run`.
+-- Red if a second path to either decision is added.
 decisionReachedOnlyThroughDecidableSource : Task.Task Error Bool
 decisionReachedOnlyThroughDecidableSource =
     let
-        count needle text =
-            List.length (String.split needle text) - 1
+        count =
+            \needle text ->
+                List.length (String.split needle text) - 1
+
+        squashed =
+            \text -> String.join " " (String.words text)
+
+        onePlan =
+            "case DecisionSlot.offeredSource row model.selectedView of Just shown -> Ok (WriteUnit shown) "
 
         oneCall =
-            "case Queue.decidableSource uid model.selectedView of\n                Just shown ->\n                    decideOn settings shown decision\n"
+            "WriteUnit shown -> decideOn settings macKey shown decision "
+
+        oneRefusalPlan =
+            "case Maybe.map (\\listed -> listed.digest) (pageRefusal model uid) of Just (Just listed) -> if listed == digest then Ok (WriteFile uid digest) "
+
+        oneRefusalCall =
+            "WriteFile uid digest -> LibDb.openAt settings.review |> Task.andThen (\\db -> Queue.decideRefusal macKey settings.index db uid digest decision) "
     in
     do
         cwd <- System.cwd ()
         appPath <- Task.fromResult (Path.fromString (cwd ++ "/src/Lib/App.ipe"))
+        sessionPath <- Task.fromResult (Path.fromString (cwd ++ "/src/Lib/Session.ipe"))
         mainPath <- Task.fromResult (Path.fromString (cwd ++ "/src/Main.ipe"))
-        app <- File.readFileLimit appPath (ByteSize.kib 64)
+        interpreter <- File.readFileLimit appPath (ByteSize.kib 64)
+        session <- File.readFileLimit sessionPath (ByteSize.kib 64)
         mainSrc <- File.readFileLimit mainPath (ByteSize.kib 64)
+        let
+            app =
+                interpreter ++ "\n" ++ session
+        in
         Task.succeed
-            (count "Queue.decide " app
-                == 1
-                && count "decideOn " app
-                == 3
-                && count oneCall app
-                == 1
-                && count "Queue.decide " mainSrc
-                == 0
-                && count "decideOn" mainSrc
-                == 0
+            (count "Queue.decide " app == 1
+                && count "decideOn " app == 3
+                && count onePlan (squashed app) == 1
+                && count oneCall (squashed app) == 1
+                && count "Queue.decideRefusal " app == 1
+                && count oneRefusalPlan (squashed app) == 1
+                && count oneRefusalCall (squashed app) == 1
+                && count "WriteUnit" app == 3
+                && count "WriteFile" app == 3
+                && count "decidePlan" app == 3
+                && count "decidePlan" session == 0
+                && count "decideOn" session == 0
+                && count "WriteUnit" interpreter == 1
+                && count "WriteFile" interpreter == 1
+                && count "Queue.decide " mainSrc == 0
+                && count "decideOn" mainSrc == 0
+                && count "decideRefusal" mainSrc == 0
+                && count "WriteUnit" mainSrc == 0
+                && count "WriteFile" mainSrc == 0
+                && count "decidePlan" mainSrc == 0
             )
 
 
@@ -343,10 +1167,8 @@ checks =
     Task.sequence
         [ Task.succeed
             ( "formatReviewedAt renders UTC"
-            , Format.formatReviewedAt (Timestamp.fromUnixMillis 0)
-                == "1970-01-01 00:00:00"
-                && Format.formatReviewedAt (Timestamp.fromUnixMillis 1700000000000)
-                == "2023-11-14 22:13:20"
+            , Format.formatReviewedAt (Timestamp.fromUnixMillis 0) == "1970-01-01 00:00:00"
+                && Format.formatReviewedAt (Timestamp.fromUnixMillis 1700000000000) == "2023-11-14 22:13:20"
             )
         , Task.succeed
             ( "highlight: rust keywords vs identifiers"
@@ -371,18 +1193,18 @@ checks =
             )
         , Task.succeed
             ( "percent: decided over queued"
-            , Format.percent 3 4
-                == "75%"
-                && Format.percent 0 4
-                == "0%"
-                && Format.percent 4 4
-                == "100%"
-                && Format.percent 5 4
-                == "125%"
-                && Format.percent 0 0
-                == "0%"
+            , Format.percent 3 4 == "75%"
+                && Format.percent 0 4 == "0%"
+                && Format.percent 4 4 == "100%"
+                && Format.percent 5 4 == "125%"
+                && Format.percent 0 0 == "0%"
             )
-        , Task.succeed ( "keyboard shortcuts map to the button msgs", testKeys )
+        , Task.succeed ( "panel keys act only on the drawn row", panelKeysActOnlyOnTheDrawnRow )
+        , Task.succeed ( "undrawn panel keys act on nothing", undrawnPanelKeysActOnNothing )
+        , Task.succeed ( "dormant keys act on nothing", dormantKeysActOnNothing )
+        , Task.succeed ( "card keys map to the button msgs", cardKeysMap )
+        , Task.succeed ( "cardless keys never decide", cardlessKeysNeverDecide )
+        , Task.succeed ( "positions refuse no cards and clamp", positionRefusals )
         , check "a decision reaches Queue.decide only through the decidable source" decisionReachedOnlyThroughDecidableSource
         , check "highlight languages match the shared ipe-index language vectors" langVectorsHold
         , Task.succeed
@@ -397,15 +1219,34 @@ checks =
         , Task.succeed ( "a one-mebibyte block comment is one token", largeTokenTokenizes )
         , Task.succeed
             ( "an escaped quote stays inside its string literal"
-            , Highlight.tokenize Highlight.Rust "\"a\\\"b\" c"
-                == [ Str "\"a\\\"b\"", Plain " ", Ident "c" ]
-                && Highlight.tokenize Highlight.Rust "\"ab\\"
-                == [ Plain "\"ab\\" ]
-                && Highlight.tokenize Highlight.Rust "x // c\ny"
-                == [ Ident "x", Plain " ", Comment "// c", Plain "\n", Ident "y" ]
-                && Highlight.tokenize Highlight.Rust "a/b**/"
-                == [ Ident "a", Plain "/", Ident "b", Plain "*", Plain "*", Plain "/" ]
-                && Highlight.tokenize Highlight.Rust "/**/1.5_"
-                == [ Comment "/**/", Num "1.5_" ]
+            , Highlight.tokenize Highlight.Rust "\"a\\\"b\" c" == [ Str "\"a\\\"b\"", Plain " ", Ident "c" ]
+                && Highlight.tokenize Highlight.Rust "\"ab\\" == [ Plain "\"ab\\" ]
+                && Highlight.tokenize Highlight.Rust "x // c\ny" == [ Ident "x", Plain " ", Comment "// c", Plain "\n", Ident "y" ]
+                && Highlight.tokenize Highlight.Rust "a/b**/" == [ Ident "a", Plain "/", Ident "b", Plain "*", Plain "*", Plain "/" ]
+                && Highlight.tokenize Highlight.Rust "/**/1.5_" == [ Comment "/**/", Num "1.5_" ]
             )
+        , Task.succeed ( "a 256 KiB one-line Rust unit draws as one row", hugeLineRows Rust )
+        , Task.succeed ( "a 256 KiB one-line Ipe unit draws as one row", hugeLineRows Ipe )
+        , Task.succeed ( "Ipe comments are -- and nested {- -}, never //", ipeComments )
+        , Task.succeed ( "shell # after a gap is a comment, /* is not", shellComments )
+        , Task.succeed ( "a multi-line string is never a comment", multiLineStrings )
+        , Task.succeed ( "a block comment carries across rows, not across a covered run", blockCarry )
+        , Task.succeed ( "a tab draws as a tab while U+202E draws as an escape", tabDrawsAsTab )
+        , Task.succeed ( "references over a 64Ki-token unit finish", hugeLinks )
+        , Task.succeed ( "a 256 KiB URL word and 64Ki URL words are trimmed", hugeUrls )
+        , Task.succeed ( "a 256 KiB token with one U+202E is three segments", hugeSegments )
+        , Task.succeed ( "a 128Ki-escape text renders and joins in one linear pass", hugeEscapeRuns )
+        , Task.succeed ( "a million-line residual keeps every uncovered line", hugeResidual )
+        , Task.succeed ( "a CRLF \\r is a line break in Rust and text in shell", crlfByLanguage )
+        , Task.succeed ( "a run of source lines copies as the source spells it, line numbers apart", sourceCopiesAsWritten )
+        , Task.succeed ( "a drawing renders exactly the elements it counts, in every mode and language", drawnCountIsRenderedCount )
+        , Task.succeed ( "a spelled drawing's text alone gives back the rows it draws", spelledIsInjective )
+        , Task.succeed ( "a spelled drawing holds no raw display hazard and draws in byte order", spelledDrawsNoRawHazard )
+        , Task.succeed ( "a run of fifty escapes draws as one marked element", escapeRunIsOneElement )
+        , Task.succeed ( "tokens of one colour draw as one run, the text colour without an element", sameColourTokensShareOneElement )
+        , Task.succeed ( "the code block alone carries the byte-order override", codeBlockHoldsDisplayOrder )
+        , Task.succeed ( "only a tab, a Rust CRLF end and a Rust leading byte-order mark are layout; every other hazard draws escaped", layoutOnlyWhereLanguageReadsIt )
+        , Task.succeed ( "a layout hides a \\r or a leading mark only where its grammar reads it as layout", layoutDecidesWhatIsHidden )
+        , Task.succeed ( "a Rust br or cr string is raw", rawPrefixedStrings )
+        , Task.succeed ( "a shell heredoc body carries no quote past its line", heredocBodies )
         ]

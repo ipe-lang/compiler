@@ -42,12 +42,12 @@
 //! arms simply do not yet gain multi-line layout.
 //!
 //! This is the production function-body emit path: [`crate::emit_expr::emit_func`]
-//! renders every body through `build_doc` + [`crate::render::render`], so the
+//! renders every body through `build_doc` + [`crate::render::render_code`], so the
 //! emitted body is `rustfmt`-clean by construction. The string emitter's
 //! [`emit_expr_at`] survives as the leaf builder the structured arms delegate to
 //! (and as the SEAL / byte-golden test oracle), not as the body formatter.
 
-use ipe_diagnostics::{DResult, Diagnostic, LowerError, Span};
+use ipe_diagnostics::{DResult, Diagnostic};
 use ipe_intern::{Interner, Symbol, rust_str_lit};
 use ipe_ir::{BinOp, Callee, Expr, IrType, KernelFn, MAX_IR_RENDER_DEPTH, ModPath};
 
@@ -56,8 +56,8 @@ use crate::doc::{ChainOperand, Doc, Leaf};
 use crate::emit_expr::{
     call_has_kernel_special_case, callee_name, clone_targets_in_expr, combine_guards,
     emit_arm_head, emit_binding_stmts, emit_expr_at, emit_match_scrutinee, free_vars, infix,
-    inlined_let_body, once_closure_bug, record_struct_name, swapped_container_clone_rewrite,
-    wants_arc_ctor,
+    inlined_let_body, nesting_refusal, once_closure_bug, record_struct_name,
+    swapped_container_clone_rewrite, wants_arc_ctor,
 };
 use crate::emit_types::{GenericScope, render_type};
 use ipe_ir::once_closure::{ClosureParts, ClosureSite, admitted_once_parts};
@@ -83,12 +83,7 @@ pub fn build_doc(
     // can overflow the native stack. Shared with the string path via
     // [`MAX_IR_RENDER_DEPTH`] so the two never drift to different ceilings.
     if depth > MAX_IR_RENDER_DEPTH {
-        return Err(Diagnostic::Lower {
-            span: Span::DUMMY,
-            msg: LowerError::BackendNestingTooDeep {
-                limit: MAX_IR_RENDER_DEPTH,
-            },
-        });
+        return Err(nesting_refusal());
     }
     let child = depth + 1;
     match expr {
@@ -216,7 +211,7 @@ pub fn build_doc(
             )?
             && !crate::emit_expr::ffi_call_has_glue(ctx, callee)? =>
         {
-            build_generic_call(ctx, callee, args, *pin, indent, child, generics)
+            build_generic_call(ctx, callee, args, pin, indent, child, generics)
         }
 
         // A named-function value `{ let __ipe_fn: <TypedFn> = <ctor>::new(<name>);
@@ -328,6 +323,13 @@ pub fn build_doc(
         // [`crate::emit_expr::emit_expr_at`]'s `Expr::Let` arm decision exactly.
         Expr::Let { name, value, body } => {
             build_let(ctx, *name, value, body, indent, child, generics)
+        }
+
+        // A pre-clone run `({ let a = a.clone(); let b = b.clone(); body })`:
+        // one block whatever the number of symbols, each clone `let` on its own
+        // line, laid out as the one-statement `let` block above.
+        Expr::CaptureClones { syms, body } => {
+            build_capture_clones(ctx, syms, body, indent, child, generics)
         }
 
         // A `Destructure` block `({ <binding stmts> <body> })`. Like the `let`
@@ -468,23 +470,7 @@ pub fn native_vs_legacy_sweep(
     interner: &Interner,
     program: &ipe_ir::Program,
 ) -> DResult<(Vec<SweepDivergence>, usize, usize)> {
-    let ctx = EmitCtx::build(
-        interner,
-        program,
-        crate::DbDriver::Sqlite,
-        None,
-        ipe_ir::Target::Native,
-        Vec::new(),
-        crate::MountBase::root(),
-        false,
-        None,
-        false,
-        crate::BuildIntent::Release,
-        String::new(),
-        false,
-        false,
-        None,
-    )?;
+    let ctx = EmitCtx::build(interner, program, crate::EmitSettings::unconfigured())?;
     let mut divergences = Vec::new();
     let mut compared = 0usize;
     let mut skipped = 0usize;
@@ -504,7 +490,7 @@ pub fn native_vs_legacy_sweep(
                 continue;
             };
             let doc = build_doc(&ctx, &func.body, 1, 0, generics)?;
-            let native = render_body_dedented(&doc);
+            let native = render_body_dedented(&doc)?;
             compared += 1;
             if native != legacy {
                 divergences.push(SweepDivergence {
@@ -525,17 +511,23 @@ pub fn native_vs_legacy_sweep(
 /// body indent). The body's opening character lands at column 4 (matching the
 /// `fn f() {` body column rustfmt measures against), then the four-space prefix is
 /// removed from each line so both sides are compared at column 0.
-fn render_body_dedented(doc: &Doc) -> String {
+///
+/// # Errors
+///
+/// [`Diagnostic::CompilerBug`] `backend.leaf_not_code` when the rendered body is
+/// not code only.
+fn render_body_dedented(doc: &Doc) -> DResult<String> {
     // Seed the render with four spaces so the body starts at column 4, and wrap the
     // doc in `Nest(4)` so every internal newline indents from the block indent —
     // exactly the `render_fn_body` test framing.
     let seeded = Doc::nest(4, Doc::concat(vec![Doc::text(leaf!("    ")), doc.clone()]));
-    let rendered = crate::render::render(&seeded, crate::render::RenderConfig::default());
-    rendered
+    let (rendered, _) =
+        crate::render::render_code(&seeded, crate::render::RenderConfig::default(), 0, 0)?;
+    Ok(rendered
         .lines()
         .map(|l| l.strip_prefix("    ").unwrap_or(l))
         .collect::<Vec<_>>()
-        .join("\n")
+        .join("\n"))
 }
 
 /// A short identifying prefix of an [`Expr`]'s debug form (the variant name and a
@@ -641,12 +633,7 @@ fn build_binop_chain(
     // the same `Lower` diagnostic ([`emit_expr_at`]'s IPE-L0200) instead of
     // building a pathologically large `Doc::Chain`.
     if depth.saturating_add(u16::try_from(depth_count).unwrap_or(u16::MAX)) > MAX_IR_RENDER_DEPTH {
-        return Err(Diagnostic::Lower {
-            span: Span::DUMMY,
-            msg: LowerError::BackendNestingTooDeep {
-                limit: MAX_IR_RENDER_DEPTH,
-            },
-        });
+        return Err(nesting_refusal());
     }
 
     let mut operands: Vec<ChainOperand> = Vec::with_capacity(depth_count + 1);
@@ -1057,7 +1044,7 @@ fn build_generic_call(
     ctx: &EmitCtx,
     callee: &Callee,
     args: &[Expr],
-    pin: ipe_ir::CallPin,
+    pin: &ipe_ir::CallPin,
     indent: usize,
     child: u16,
     generics: GenericScope,
@@ -1067,7 +1054,7 @@ fn build_generic_call(
     // substitutes when the pin is empty (`csv_parse::<IpeError>(…)`). Every
     // kernel here returns `IpeResult<E, _>` generic over the error channel, so a
     // call whose result flows into a polymorphic context needs `E` pinned.
-    let pin_turbofish = pin.turbofish();
+    let pin_turbofish = ctx.call_pin_turbofish(callee, pin, generics)?;
     let turbofish: &str = if pin_turbofish.is_empty()
         && matches!(
             callee,
@@ -1077,7 +1064,7 @@ fn build_generic_call(
         ) {
         "::<IpeError>"
     } else {
-        pin_turbofish
+        &pin_turbofish
     };
     // A container-first kernel renders its container before the function
     // closure; clone the function's captures at their container use sites so the
@@ -1225,7 +1212,7 @@ fn build_ctor(
     // the runtime enum; its payload is never a self-recursive user field, so no
     // field-boxing lookup applies (matching the string emitter).
     if let Some(runtime) = ctx.builtin_runtime_enum(home, ty) {
-        let path = format!("{runtime}::{}", ctx.emit_ident(variant)?);
+        let path = format!("{runtime}::{}", ctx.emit_member_ident(variant)?);
         let docs = build_args(ctx, args, indent, child, generics)?;
         return Ok(delimited(
             Doc::owned(format!("{path}("))?,
@@ -1234,7 +1221,11 @@ fn build_ctor(
         ));
     }
 
-    let path = format!("{}::{}", ctx.enum_name(home, ty)?, ctx.emit_ident(variant)?);
+    let path = format!(
+        "{}::{}",
+        ctx.enum_name(home, ty)?,
+        ctx.emit_member_ident(variant)?
+    );
     let fields = ctx.variant_fields(home, ty, variant)?;
     if fields.len() != args.len() {
         return Err(Diagnostic::CompilerBug {
@@ -1312,7 +1303,7 @@ fn build_let(
             Doc::text(leaf!("})")),
         ])));
     }
-    let name_s = ctx.emit_ident(name)?;
+    let name_s = ctx.emit_local_ident(name)?;
     let value_doc = build_doc(ctx, value, indent, child, generics)?;
     let body_doc = build_doc(ctx, body, indent, child, generics)?;
     // One-statement block: `let name = value;` then `body`, each on its own line.
@@ -1329,6 +1320,36 @@ fn build_let(
                 body_doc,
             ]),
         ),
+        Doc::HardLine,
+        Doc::text(leaf!("})")),
+    ]))
+}
+
+/// Build the `Doc` for a pre-clone block, mirroring [`crate::emit_expr::emit_expr_at`]'s `Expr::CaptureClones` arm token-for-token.
+///
+/// Each `let <sym> = <sym>.clone();` statement is a leaf on its own
+/// `HardLine`, and the body follows on a further `HardLine`, all inside the
+/// block's sole `Nest(4)`. A single symbol renders exactly as the self-clone
+/// `let` block [`build_let`] builds.
+fn build_capture_clones(
+    ctx: &EmitCtx,
+    syms: &[Symbol],
+    body: &Expr,
+    indent: usize,
+    child: u16,
+    generics: GenericScope,
+) -> DResult<Doc> {
+    let mut inner = Vec::with_capacity(syms.len() * 2 + 2);
+    for sym in syms {
+        let name_s = ctx.emit_local_ident(*sym)?;
+        inner.push(Doc::HardLine);
+        inner.push(Doc::owned(format!("let {name_s} = {name_s}.clone();"))?);
+    }
+    inner.push(Doc::HardLine);
+    inner.push(build_doc(ctx, body, indent, child, generics)?);
+    Ok(Doc::concat(vec![
+        Doc::text(leaf!("({")),
+        Doc::nest(4, Doc::concat(inner)),
         Doc::HardLine,
         Doc::text(leaf!("})")),
     ]))
@@ -1399,7 +1420,7 @@ fn build_record(
     let (struct_name, is_server_response) = record_struct_name(ctx, fields, ty)?;
     let mut field_docs = Vec::with_capacity(fields.len() + usize::from(is_server_response));
     for (sym, value) in fields {
-        let field_ident = ctx.emit_ident(*sym)?;
+        let field_ident = ctx.emit_member_ident(*sym)?;
         let value_doc = build_doc(ctx, value, indent, child, generics)?;
         field_docs.push(Doc::concat(vec![
             Doc::owned(format!("{field_ident}: "))?,
@@ -1503,7 +1524,7 @@ fn build_update(
     inner.push(base_doc);
     inner.push(Doc::text(leaf!(";")));
     for (i, (sym, _value)) in fields.iter().enumerate() {
-        let field_ident = ctx.emit_ident(*sym)?;
+        let field_ident = ctx.emit_member_ident(*sym)?;
         inner.push(Doc::HardLine);
         inner.push(Doc::owned(format!(
             "__ipe_rec.{field_ident} = __ipe_upd_{i};"
@@ -1732,7 +1753,7 @@ fn build_closure(
     for (param, ty) in params {
         parts.push(format!(
             "{}: {}",
-            ctx.emit_ident(*param)?,
+            ctx.emit_local_ident(*param)?,
             render_type(ctx, ty, generics)?
         ));
     }
@@ -1874,7 +1895,7 @@ fn build_applied_lambda(
     let (own_args, surplus_args) = args.split_at(own);
     let mut inner = Vec::with_capacity(own * 4 + 2);
     for ((param, ty), arg) in params.iter().zip(own_args.iter()) {
-        let p = ctx.emit_ident(*param)?;
+        let p = ctx.emit_local_ident(*param)?;
         let t = render_type(ctx, ty, generics)?;
         let arg_doc = build_doc(ctx, arg, indent, child, generics)?;
         inner.push(Doc::HardLine);
@@ -1914,7 +1935,7 @@ fn build_applied_lambda(
 /// brackets (keeping the comma). This mirrors `rustfmt`'s arm-body rule: a call /
 /// constructor / application / tuple / list / cons / record / `task_and_then`
 /// tail overflows into its own argument list, so no braces are synthesized; an
-/// `if` / binary-operator chain / `let` / destructure / update / sync task block
+/// `if` / binary-operator chain / `let` / pre-clone / destructure / update / sync task block
 /// is parenthesized or block-shaped and gets wrapped.
 ///
 /// A body that is not one of the structured shapes (a plain leaf) is treated as
@@ -1924,7 +1945,11 @@ fn build_applied_lambda(
 const fn arm_body_is_control(body: &Expr) -> bool {
     match body {
         // Parenthesized or block-shaped: wrapped in synthesized braces when broken.
-        Expr::If { .. } | Expr::Let { .. } | Expr::Destructure { .. } | Expr::Update { .. } => true,
+        Expr::If { .. }
+        | Expr::Let { .. }
+        | Expr::CaptureClones { .. }
+        | Expr::Destructure { .. }
+        | Expr::Update { .. } => true,
         // A chain-eligible binary operator renders `(a + b)` and wraps when broken;
         // the call-shaped `Append` / `IntDiv` are leaves (delimited-tail).
         Expr::BinOp { op, .. } => infix(*op).is_some(),
@@ -2130,11 +2155,11 @@ mod tests {
     use ipe_ir::once_closure::MovedCapture;
 
     use super::build_doc;
+    use crate::EmitCtx;
     use crate::doc::{ChainOperand, Doc, whitespace_normalize};
     use crate::emit_expr::{InfixOp, emit_expr_at};
     use crate::emit_types::GenericScope;
     use crate::render::{RenderConfig, render};
-    use crate::{DbDriver, EmitCtx};
 
     /// A minimal one-module `Program` whose interner carries a handful of value
     /// identifiers (`a`, `b`, `c`, `x`) so `Expr::Var` fixtures resolve. The
@@ -2302,19 +2327,7 @@ mod tests {
         let ctx = EmitCtx::build(
             &fx.interner,
             &fx.program,
-            DbDriver::Sqlite,
-            None,
-            ipe_ir::Target::Native,
-            Vec::new(),
-            crate::MountBase::root(),
-            false,
-            None,
-            false,
-            crate::BuildIntent::Release,
-            String::new(),
-            false,
-            false,
-            None,
+            crate::EmitSettings::unconfigured(),
         )
         .expect("EmitCtx::build");
         f(&ctx)
@@ -3045,24 +3058,8 @@ mod tests {
                 uses_async_runtime: false,
             }],
         };
-        let ctx = EmitCtx::build(
-            &interner,
-            &program,
-            DbDriver::Sqlite,
-            None,
-            ipe_ir::Target::Native,
-            Vec::new(),
-            crate::MountBase::root(),
-            false,
-            None,
-            false,
-            crate::BuildIntent::Release,
-            String::new(),
-            false,
-            false,
-            None,
-        )
-        .expect("EmitCtx::build");
+        let ctx = EmitCtx::build(&interner, &program, crate::EmitSettings::unconfigured())
+            .expect("EmitCtx::build");
         let scope = GenericScope::new(&[]);
         let expr = Expr::If {
             cond: Box::new(Expr::Var(cond)),
@@ -3674,24 +3671,8 @@ mod tests {
                 uses_async_runtime: false,
             }],
         };
-        let ctx = EmitCtx::build(
-            &interner,
-            &program,
-            DbDriver::Sqlite,
-            None,
-            ipe_ir::Target::Native,
-            Vec::new(),
-            crate::MountBase::root(),
-            false,
-            None,
-            false,
-            crate::BuildIntent::Release,
-            String::new(),
-            false,
-            false,
-            None,
-        )
-        .expect("EmitCtx::build");
+        let ctx = EmitCtx::build(&interner, &program, crate::EmitSettings::unconfigured())
+            .expect("EmitCtx::build");
         let expr = Expr::Lambda {
             params: vec![(x, IrType::Int)],
             ret: IrType::Int,
@@ -4075,24 +4056,8 @@ mod tests {
                 uses_async_runtime: false,
             }],
         };
-        let ctx = EmitCtx::build(
-            &interner,
-            &program,
-            DbDriver::Sqlite,
-            None,
-            ipe_ir::Target::Native,
-            Vec::new(),
-            crate::MountBase::root(),
-            false,
-            None,
-            false,
-            crate::BuildIntent::Release,
-            String::new(),
-            false,
-            false,
-            None,
-        )
-        .expect("EmitCtx::build");
+        let ctx = EmitCtx::build(&interner, &program, crate::EmitSettings::unconfigured())
+            .expect("EmitCtx::build");
         let scope = GenericScope::new(&[]);
         let expr = Expr::TaskSeq {
             effect: Box::new(Expr::Var(short_eff)),

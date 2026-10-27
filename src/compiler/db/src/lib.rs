@@ -23,11 +23,22 @@
 //! standard input or the clock). The crate's `clippy.toml` bans those APIs,
 //! and the `clippy_paths_resolve` module proves each ban fires. File reading
 //! stays in the driver, which is where inputs are set. The inference queries
-//! (`typecheck`, `infer_module_scoped`) and every query built on them call
-//! into `ipe_types`, which reads the `IPE_SOLVER_BUDGET` and
-//! `IPE_EXHAUST_BUDGET` step budgets from the process environment on each
-//! inference, so a memoised result holds for the budgets of the process that
-//! computed it.
+//! (`typecheck`, `infer_module_scoped`, `program_types`) read the solver step
+//! budget and the scoped variable ceiling from the [`SolveLimits`] input,
+//! which the database reads from `IPE_SOLVER_BUDGET` once, at construction,
+//! and tests replace through [`IpeDatabase::set_solve_limits`]. One budget is
+//! still read inside `ipe_types` on each inference: the `IPE_EXHAUST_BUDGET`
+//! exhaustiveness budget, so a memoised result holds for the exhaustiveness
+//! budget of the process that computed it.
+//!
+//! The solver step budget `P` has one meaning: the joint program's budget.
+//! Each scoped module solve runs under the ceiling `P`, and the scoped
+//! assembly is served only while the modules' steps sum to at most `P / 2`;
+//! past either bound the joint solve decides under `P`, so every budget
+//! refusal is the joint solve's. Work is at most `(n + 1) · P` for `n`
+//! modules. A program whose joint solve spends more than twice its scoped
+//! solves' sum, while that sum sits inside the band, is the one shape the
+//! band does not route to the joint solve: a deliberate bound.
 //!
 //! The interning story is the plan's Option 3a: the database owns a
 //! [`SharedInterner`] (`Arc<Mutex<ipe_intern::Interner>>`) shared with the
@@ -130,17 +141,25 @@ pub trait Db: salsa::Database {
 
 /// The concrete Ipê compiler database.
 #[salsa::db]
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct IpeDatabase {
     storage: salsa::Storage<Self>,
     interner: SharedInterner,
 }
 
+impl Default for IpeDatabase {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl IpeDatabase {
     /// A fresh (cold) database with a fresh interner.
+    ///
+    /// Its [`SolveLimits`] are the ones the environment names.
     #[must_use]
     pub fn new() -> Self {
-        Self::default()
+        Self::with_storage(salsa::Storage::default())
     }
 
     /// A fresh database that forwards every salsa runtime event to
@@ -150,9 +169,30 @@ impl IpeDatabase {
     pub fn with_event_callback(
         callback: Box<dyn Fn(salsa::Event) + Send + Sync + 'static>,
     ) -> Self {
-        Self {
-            storage: salsa::Storage::new(Some(callback)),
+        Self::with_storage(salsa::Storage::new(Some(callback)))
+    }
+
+    /// A database over `storage`, holding the environment's solve limits.
+    fn with_storage(storage: salsa::Storage<Self>) -> Self {
+        let db = Self {
+            storage,
             interner: SharedInterner::new(),
+        };
+        SolveLimitsInput::new(&db, SolveLimits::from_env());
+        db
+    }
+
+    /// Replace the solve limits every inference query reads.
+    ///
+    /// A refused setting makes every program refuse with its diagnostic.
+    pub fn set_solve_limits(&mut self, setting: SolveSetting) {
+        match SolveLimitsInput::try_get(self) {
+            Some(input) => {
+                let _previous = input.set_setting(self).to(setting);
+            }
+            None => {
+                SolveLimitsInput::new(self, setting);
+            }
         }
     }
 }
@@ -170,6 +210,66 @@ impl Db for IpeDatabase {
 // ---------------------------------------------------------------------------
 // Inputs (the parse-don't-validate boundary; the driver sets these)
 // ---------------------------------------------------------------------------
+
+/// The ceilings every solve in a database runs under.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct SolveLimits {
+    /// The joint program's solver step budget, which is also each scoped
+    /// module solve's ceiling.
+    pub steps: ipe_types::SolverSteps,
+    /// The variable id space of a scoped renumbering (a module's slice and
+    /// the assembly); the joint solve's renumbering keeps the full solver
+    /// space.
+    pub var_ceiling: ipe_types::VarCeiling,
+}
+
+impl SolveLimits {
+    /// The default step budget over the full solver-variable space.
+    pub const DEFAULT: Self = Self {
+        steps: ipe_types::SolverSteps::DEFAULT,
+        var_ceiling: ipe_types::VarCeiling::SOLVER,
+    };
+
+    /// The limits the environment names, read once.
+    ///
+    /// # Errors
+    /// [`ipe_types::SolverStepsError::Zero`] when the solver budget is `0`.
+    pub fn from_env() -> SolveSetting {
+        ipe_types::SolverSteps::from_env().map(|steps| Self {
+            steps,
+            ..Self::DEFAULT
+        })
+    }
+}
+
+/// A database's solve limits, or the refusal of a setting that names none.
+pub type SolveSetting = Result<SolveLimits, ipe_types::SolverStepsError>;
+
+/// The solve setting as a salsa input, so every inference memo depends on it.
+#[salsa::input(singleton)]
+struct SolveLimitsInput {
+    setting: SolveSetting,
+}
+
+/// The solve limits, or the refusal every inference reports.
+///
+/// A database holding no limits is refused as a compiler bug, never solved
+/// under a guessed budget.
+fn solve_limits(db: &dyn Db) -> Result<SolveLimits, Diagnostic> {
+    SolveLimitsInput::try_get(db).map_or_else(
+        || {
+            Err(Diagnostic::CompilerBug {
+                where_: "ipe_db.solve_limits",
+                detail: "the database holds no solve limits".to_owned(),
+            })
+        },
+        |input| {
+            input
+                .setting(db)
+                .map_err(ipe_types::SolverStepsError::into_diagnostic)
+        },
+    )
+}
 
 /// One in-scope `.ipe` module: its module path (identity/diagnostic key) and
 /// full UTF-8 source text (the real input).
@@ -787,8 +887,10 @@ pub fn typecheck(db: &dyn Db, root: SourceRoot, entry: SourceFile) -> TypecheckR
     let linked = linked_program(db, root, entry)
         .clone()
         .map_err(TypecheckError::Link)?;
+    let limits = solve_limits(db)
+        .map_err(|refused| TypecheckError::Infer(ipe_types::InferError::unsited(refused)))?;
     let mut interner = db.interner().lock();
-    ipe_types::infer_attributed(&linked.module, &mut interner)
+    ipe_types::infer_attributed_with_budget(&linked.module, &mut interner, limits.steps)
         .map(Arc::new)
         .map_err(TypecheckError::Infer)
 }
@@ -980,6 +1082,12 @@ pub enum FallbackReason {
     ImporterDependent,
     /// The module's scoped solve refused it.
     SolveError,
+    /// The module's scoped solve ran past the solver step budget, or the
+    /// budget setting names no ceiling.
+    BudgetExceeded,
+    /// The scoped solves together spent more than half the solver step
+    /// budget, so the joint solve decides acceptance under the full budget.
+    BudgetBand,
     /// A renumbering ran out of solver-variable ids below its ceiling.
     VarSpaceExhausted,
     /// Two slices claim one key, or a slice holds a key outside its own home.
@@ -1076,6 +1184,8 @@ pub enum ScopedModuleTypes {
         solved: Arc<ipe_types::CanonicalTypes>,
         /// The module's closed typed interface, for importers' scoped solves.
         interface: Arc<ipe_types::TypedInterface>,
+        /// The solver steps the module's scoped solve spent.
+        steps: u64,
     },
     /// The module's interface is closed, so its importers solve against it,
     /// but its own solved facts read its importers' use sites, so its own
@@ -1098,6 +1208,9 @@ pub enum ScopedModuleTypes {
 /// scoped solve; when the dep's interface comes out equal, `typed_interface`
 /// backdates and THIS query's memo stands without re-executing.
 ///
+/// The solve runs under the [`SolveLimits`] step budget as its ceiling and
+/// renumbers within its variable ceiling.
+///
 /// Total (never `Err`): every shortfall yields
 /// [`ScopedModuleTypes::WholeProgram`] with its [`FallbackReason`]. The cycle
 /// gate reuses [`topo_order`] with this module as the DFS root, so a cyclic
@@ -1113,6 +1226,9 @@ pub fn infer_module_scoped(db: &dyn Db, root: SourceRoot, module: SourceFile) ->
     };
     let Ok(resolutions) = resolve_imports(db, root, module) else {
         return ScopedModuleTypes::WholeProgram(FallbackReason::ResolveError);
+    };
+    let Ok(limits) = solve_limits(db) else {
+        return ScopedModuleTypes::WholeProgram(FallbackReason::BudgetExceeded);
     };
 
     // Demand every dep interface BEFORE taking the interner lock: a cold
@@ -1140,8 +1256,13 @@ pub fn infer_module_scoped(db: &dyn Db, root: SourceRoot, module: SourceFile) ->
         return ScopedModuleTypes::WholeProgram(FallbackReason::InternError);
     };
 
-    let inference =
-        ipe_types::infer_module(&canonical.module, &canonical.exports, &deps, &mut interner);
+    let inference = ipe_types::infer_module_with_budget(
+        &canonical.module,
+        &canonical.exports,
+        &deps,
+        &mut interner,
+        limits.steps,
+    );
     drop(interner);
     match inference {
         Ok(inference) => match inference.interface {
@@ -1151,7 +1272,7 @@ pub fn infer_module_scoped(db: &dyn Db, root: SourceRoot, module: SourceFile) ->
                         ipe_types::canonicalize(
                             slice,
                             ipe_types::VarScope::PerHome,
-                            ipe_types::VarCeiling::SOLVER,
+                            limits.var_ceiling,
                         )
                         .map_err(FallbackReason::from)
                     })
@@ -1159,6 +1280,7 @@ pub fn infer_module_scoped(db: &dyn Db, root: SourceRoot, module: SourceFile) ->
                         ScopedModuleTypes::PerModule {
                             solved: Arc::new(solved),
                             interface: Arc::new(interface),
+                            steps: inference.steps,
                         }
                     })
             }
@@ -1171,8 +1293,22 @@ pub fn infer_module_scoped(db: &dyn Db, root: SourceRoot, module: SourceFile) ->
                 ScopedModuleTypes::WholeProgram(FallbackReason::OpenInterface)
             }
         },
+        Err(err) if exceeds_step_budget(&err) => {
+            ScopedModuleTypes::WholeProgram(FallbackReason::BudgetExceeded)
+        }
         Err(_) => ScopedModuleTypes::WholeProgram(FallbackReason::SolveError),
     }
+}
+
+/// Whether a solve refusal is a step-budget exhaustion.
+const fn exceeds_step_budget(err: &ipe_types::InferError) -> bool {
+    matches!(
+        err.diagnostic(),
+        Diagnostic::Type {
+            msg: ipe_diagnostics::TypeError::StepBudgetExceeded { .. },
+            ..
+        }
+    )
 }
 
 /// Intern each segment of a module path.
@@ -1430,8 +1566,11 @@ fn linked_homes(module: &ipe_canon::ast::Module) -> BTreeSet<Vec<Symbol>> {
 /// whole program's types reads.
 ///
 /// Serves the scoped assembly only when every module in [`topo_order`] is
-/// [`ScopedModuleTypes::PerModule`] and the assembly covers every linked
-/// module ([`assemble_scoped`]). Otherwise it serves the joint [`typecheck`]
+/// [`ScopedModuleTypes::PerModule`], the modules' solver steps sum to at most
+/// half the [`SolveLimits`] step budget, and the assembly covers every linked
+/// module within the variable ceiling ([`assemble_scoped`]). Past the budget
+/// band the joint solve decides acceptance under the full budget
+/// ([`FallbackReason::BudgetBand`]). Otherwise it serves the joint [`typecheck`]
 /// renumbered under [`ipe_types::VarScope::Program`], with the joint solve's
 /// error verbatim on a red program, so every error diagnostic comes from the
 /// joint solve. [`ProgramTypes::typed_by`] records which solve was served.
@@ -1441,7 +1580,10 @@ fn linked_homes(module: &ipe_canon::ast::Module) -> BTreeSet<Vec<Symbol>> {
 /// re-solved.
 #[salsa::tracked]
 pub fn program_types(db: &dyn Db, root: SourceRoot, entry: SourceFile) -> ProgramTypesResult {
-    let slices = match scoped_slices(db, root, entry) {
+    let Ok(limits) = solve_limits(db) else {
+        return joint_program_types(db, root, entry, FallbackReason::BudgetExceeded);
+    };
+    let slices = match scoped_slices(db, root, entry, limits.steps) {
         Ok(slices) => slices,
         Err(reason) => return joint_program_types(db, root, entry, reason),
     };
@@ -1451,12 +1593,7 @@ pub fn program_types(db: &dyn Db, root: SourceRoot, entry: SourceFile) -> Progra
     let Some(modules) = NonZeroUsize::new(slices.len()) else {
         return joint_program_types(db, root, entry, FallbackReason::IncompleteCover);
     };
-    assemble_scoped(
-        &slices,
-        &linked_homes(&linked.module),
-        ipe_types::VarCeiling::SOLVER,
-    )
-    .map_or_else(
+    assemble_scoped(&slices, &linked_homes(&linked.module), limits.var_ceiling).map_or_else(
         |reason| joint_program_types(db, root, entry, reason),
         |types| {
             Ok(Arc::new(ProgramTypes {
@@ -1469,10 +1606,15 @@ pub fn program_types(db: &dyn Db, root: SourceRoot, entry: SourceFile) -> Progra
 
 /// Every module's scoped slice in [`topo_order`], or the first module's reason
 /// to fall back.
+///
+/// # Errors
+/// [`FallbackReason::BudgetBand`] when the modules' solver steps sum past half
+/// of `budget`, an overflowing sum included.
 fn scoped_slices(
     db: &dyn Db,
     root: SourceRoot,
     entry: SourceFile,
+    budget: ipe_types::SolverSteps,
 ) -> Result<Vec<ModuleSlice>, FallbackReason> {
     let Ok(order) = topo_order(db, root, entry) else {
         return Err(FallbackReason::Cycle);
@@ -1480,12 +1622,14 @@ fn scoped_slices(
     let files = root.files(db);
     let mut scoped: Vec<(&[String], Arc<ipe_types::CanonicalTypes>)> =
         Vec::with_capacity(order.len());
+    let mut spent = Some(0_u64);
     for path in order.iter() {
         let Some(file) = files.get(path) else {
             return Err(FallbackReason::IncompleteCover);
         };
         match infer_module_scoped(db, root, *file) {
-            ScopedModuleTypes::PerModule { solved, .. } => {
+            ScopedModuleTypes::PerModule { solved, steps, .. } => {
+                spent = spent.and_then(|sum| sum.checked_add(*steps));
                 scoped.push((path.as_slice(), solved.clone()));
             }
             ScopedModuleTypes::InterfaceOnly { .. } => {
@@ -1493,6 +1637,9 @@ fn scoped_slices(
             }
             ScopedModuleTypes::WholeProgram(reason) => return Err(*reason),
         }
+    }
+    if spent.is_none_or(|sum| sum > budget.get() / 2) {
+        return Err(FallbackReason::BudgetBand);
     }
     let mut interner = db.interner().lock();
     scoped
@@ -1506,6 +1653,9 @@ fn scoped_slices(
 }
 
 /// The joint solve in canonical form, attributed to `reason`.
+///
+/// Renumbered within the full solver space: the joint solve's ids never
+/// exceed it.
 fn joint_program_types(
     db: &dyn Db,
     root: SourceRoot,
@@ -1654,116 +1804,22 @@ pub struct RustFileId {
 // Tracked queries: `BuildConfig` + emit_project
 // ---------------------------------------------------------------------------
 
-/// The build-wide, driver-supplied configuration that affects **emission**
-/// but nothing upstream of it — today exactly the `package.ipe [database]
-/// driver` selection.
+/// The build-wide, driver-supplied configuration that affects emission but
+/// nothing upstream of it.
 ///
-/// This is the incremental plan's `project_config()` seam (design doc Q1b),
-/// deliberately narrowed to the ONE field that has a real tracked-query
-/// consumer today ([`emit_project`]) rather than the full parsed-`package.ipe`
-/// shape the design doc sketches (`entry`, `codegen_flags`, `[log]`
-/// fields, …). The discipline: reserved seams stay design-level until a real
-/// consumer exists — a `ProjectConfig` with fields nothing reads is a
-/// dead-surface trap. `db_driver` earns its place because [`emit_project`]
-/// genuinely reads it (routing `RustBackend::with_db_driver`), and nothing
-/// upstream of emission (`canonicalize`, `typecheck`, `lower_program`) is
-/// affected by the SQL driver choice — `package.ipe`'s driver key changes the
-/// emitted `Cargo.toml`/`ipe_runtime/config.rs` shape only.
-///
-/// **Field-granularity, honestly scoped.** Salsa's `#[salsa::input]` macro
-/// already tracks reads PER FIELD (verified against the `salsa-0.27.2`
-/// source: `IngredientImpl::field` reports a tracked read keyed on
-/// `(ingredient_index.successor(field_index), id)`, not on the whole
-/// struct) — so a struct with two build-relevant fields would already get
-/// the design doc's "editing field A doesn't invalidate a query that only
-/// reads field B" property for free, with no hand-rolled projection query
-/// needed. `BuildConfig` has exactly ONE field today because no second
-/// field has a real consumer yet — so the MULTI-field half of the
-/// field-granularity story
-/// (`config_entry()` vs `config_log_level()` both projected off one
-/// `ProjectConfig`) is honestly out of scope until a second field earns its
-/// place. What this DOES prove today or scope, and what the
-/// `emit_project_config_change_does_not_retrigger_lower` test asserts, is
-/// the field's other half: a `BuildConfig`-only change never re-executes
-/// [`linked_program`] / [`typecheck`] / [`lower_program`] — config lives on
-/// its own input, entirely separate from [`SourceRoot`]/[`SourceFile`].
+/// It holds one [`ipe_backend_rust::EmitSettings`] value, and every emit query
+/// ([`emit_project`], [`emit_spine_file`], [`emit_rust_file`],
+/// [`emit_manifest`]) configures the backend from all of it through
+/// [`ipe_backend_rust::RustBackend::configured`], so the single-home and the
+/// split paths emit with the same settings. A settings change re-runs every
+/// emit query and never [`linked_program`] / [`typecheck`] /
+/// [`lower_program`]: config lives on its own input, separate from
+/// [`SourceRoot`]/[`SourceFile`].
 #[salsa::input]
 pub struct BuildConfig {
-    /// The SQL driver the emitted project targets (from `package.ipe`).
-    /// See [`ipe_backend_rust::DbDriver`].
-    pub db_driver: ipe_backend_rust::DbDriver,
-    /// The consumer-side FFI emission inputs (installed foreign-crate
-    /// bindings + opaque-type map + pinned dep lines), assembled by the
-    /// driver from the project's FFI artifact cache. `None` for a project
-    /// with no installed FFI crates. See [`ipe_backend_rust::FfiEmit`].
+    /// Every emit setting the build chose.
     #[returns(ref)]
-    pub ffi: Option<ipe_backend_rust::FfiEmit>,
-    /// The compilation target (`Native` | `WasmClient` under
-    /// `ipe dev build --target wasm`) — selects the emitted manifest template,
-    /// vendored runtime module set, and entry shape.
-    pub target: ipe_ir::Target,
-    /// The `[wasm] publicEnv` allowlist from `package.ipe`, already validated
-    /// against the secret-name denylist at PARSE time. Empty when the
-    /// section/key is absent. See [`ipe_backend_rust::RustBackend::with_wasm_public_env`].
-    #[returns(ref)]
-    pub wasm_public_env: Vec<String>,
-    /// The mount base the emitted browser shell is served under, parsed once
-    /// from the manifest's `browser.basePath`; the root for a single file.
-    /// See [`ipe_backend_rust::RustBackend::with_mount_base`].
-    #[returns(ref)]
-    pub mount_base: ipe_backend_rust::MountBase,
-    /// `true` when `[wasm] mode = "hydrate"` is set in `package.ipe`. Passed
-    /// through to [`ipe_backend_rust::RustBackend::with_wasm_hydrate_mode`]
-    /// to emit the `#[wasm_bindgen] pub fn hydrate(…)` export (M7 SSR +
-    /// hydration island parse + adopt path).
-    pub wasm_hydrate_mode: bool,
-    /// The verb family the build serves. A `Release` build rejects
-    /// development-only escape hatches (`Debug.*`) at emit demand (IPE-L0140)
-    /// so a shipped program never carries a debug window; a `Development`
-    /// build selects the runtime `dev-posture` feature (see
-    /// [`ipe_backend_rust::RustBackend::with_build_intent`]). Lives on
-    /// `BuildConfig` (not `SourceRoot`) so toggling it re-runs only
-    /// [`emit_project`], never [`lower_program`] / [`typecheck`].
-    pub intent: ipe_backend_rust::BuildIntent,
-    /// The dependency-model emit selector (opt-in `IPE_RUNTIME_DEP`). `Some` —
-    /// the emitted native project declares the runtime as the resolved path
-    /// dependency with a `runtime_features`-selected feature list and vendors no
-    /// runtime source; `None` (the default) emits the byte-identical vendored
-    /// project. Threaded to [`ipe_backend_rust::RustBackend::with_runtime_dep`].
-    #[returns(ref)]
-    pub runtime_dep: Option<ipe_backend_rust::RuntimeDep>,
-    /// `true` when `ipe dev build/run --debugger` selected the development-only
-    /// time-travelling debugger. Threaded to
-    /// [`ipe_backend_rust::RustBackend::with_debugger`], which adds the runtime
-    /// `debugger` feature to the emitted project's dependency feature list so the
-    /// TEA driver records each step. Lives on `BuildConfig` (not `SourceRoot`) so
-    /// toggling it re-runs only the emit demand, never lower/typecheck. Never set
-    /// for `ipe release` — the release command does not expose the flag, so no
-    /// production artifact carries recorder code.
-    pub debugger: bool,
-    /// The project name from `package.ipe`, already sanitized via
-    /// [`ipe_backend_rust::sanitize_cargo_name`] by the driver before storage.
-    /// Threaded to [`ipe_backend_rust::RustBackend::with_project_name`] so the
-    /// emitted crate carries `[package] name = "<cargo_name>"` rather than the
-    /// fixed `"ipe-app"`. An empty string signals "use the `ipe-app` default".
-    #[returns(ref)]
-    pub cargo_name: String,
-    /// `true` when the dev-only `IPE_WATCH_HOT_APPEARANCE` flag is set. Threaded
-    /// to [`ipe_backend_rust::RustBackend::with_hot_appearance`], which routes
-    /// style-value literals through a per-view `LiteralTable` for appearance
-    /// hot-swap. Lives on `BuildConfig` (not `SourceRoot`) so toggling it re-runs
-    /// only the emit demand, never lower/typecheck. Read from the environment
-    /// once by the CLI when the config is built; default off ⇒ byte-identical
-    /// emit.
-    pub hot_appearance: bool,
-    /// `true` when the resolved delivery is `web desktop` (webview-native).
-    /// Threaded to [`ipe_backend_rust::RustBackend::with_webview_host`], which
-    /// forces the `uses_webview` signal so the emitted project selects the
-    /// webview executor and promotes `webview` to the default feature list. The
-    /// webview delivery is a resolved HOST decision (from the CLI's
-    /// shape × runtime × host), not a source entry — lives on `BuildConfig` so
-    /// toggling it re-runs only the emit demand. Default off ⇒ served `web`.
-    pub webview_host: bool,
+    pub settings: ipe_backend_rust::EmitSettings,
 }
 
 /// The memoized result of emitting the linked, lowered program to Rust
@@ -1792,7 +1848,7 @@ fn reject_dev_only_in_production(
     program: &ipe_ir::Program,
     config: BuildConfig,
 ) -> Result<(), (Diagnostic, Vec<Symbol>)> {
-    if *config.intent(db) == ipe_backend_rust::BuildIntent::Release
+    if config.settings(db).intent == ipe_backend_rust::BuildIntent::Release
         && let Some(home) = program
             .modules
             .iter()
@@ -1813,7 +1869,7 @@ fn reject_dev_only_in_production(
 /// Emit [`lower_program`]'s IR to a Rust [`ipe_backend::EmittedProject`].
 ///
 /// **Coarse per-program SEAM**, the [`lower_program`] sibling: depends on
-/// [`lower_program`] (the IR) and [`BuildConfig::db_driver`] (the ONE
+/// [`lower_program`] (the IR) and [`BuildConfig::settings`] (the ONE
 /// emit-relevant config field), so it re-executes exactly when either would
 /// re-run [`ipe_backend_rust::RustBackend::emit`], now as a memoized salsa
 /// node. Memoizing here — the same win [`typecheck`]/[`lower_program`] get one
@@ -1839,32 +1895,8 @@ pub fn emit_project(
 
     reject_dev_only_in_production(db, &program, config)?;
 
-    let driver = *config.db_driver(db);
-    let ffi = config.ffi(db).clone();
-    let target = *config.target(db);
-    let wasm_public_env = config.wasm_public_env(db).clone();
-    let mount_base = config.mount_base(db).clone();
-    let wasm_hydrate_mode = *config.wasm_hydrate_mode(db);
-    let runtime_dep = config.runtime_dep(db).clone();
-    let debugger = *config.debugger(db);
-    let cargo_name = config.cargo_name(db).clone();
-    let hot_appearance = *config.hot_appearance(db);
-    let webview_host = *config.webview_host(db);
-    let intent = *config.intent(db);
     let interner = db.interner().lock();
-    ipe_backend_rust::RustBackend::new(&interner)
-        .with_db_driver(driver)
-        .with_ffi(ffi)
-        .with_target(target)
-        .with_wasm_public_env(wasm_public_env)
-        .with_mount_base(mount_base)
-        .with_wasm_hydrate_mode(wasm_hydrate_mode)
-        .with_runtime_dep(runtime_dep)
-        .with_debugger(debugger)
-        .with_project_name(&cargo_name)
-        .with_hot_appearance(hot_appearance)
-        .with_webview_host(webview_host)
-        .with_build_intent(intent)
+    ipe_backend_rust::RustBackend::configured(&interner, config.settings(db))
         .emit(&program)
         .map(Arc::new)
         .map_err(|d| (d, Vec::new()))
@@ -1931,7 +1963,7 @@ pub fn program_rust_file_ids(
 /// [`program_rust_file_ids`]); [`emit_manifest`] appends them during assembly,
 /// keeping this query's memoized value byte-stable under a barrel-only change.
 ///
-/// Depends on [`lower_program`] and [`BuildConfig::db_driver`] — re-executes
+/// Depends on [`lower_program`] and [`BuildConfig::settings`] — re-executes
 /// exactly when either would re-run the backend's spine render, now as a
 /// memoized salsa node.
 #[salsa::tracked]
@@ -1942,24 +1974,8 @@ pub fn emit_spine_file(
     config: BuildConfig,
 ) -> EmitTextResult {
     let program = folded_program(db, root, entry).clone()?;
-    let driver = *config.db_driver(db);
-    let ffi = config.ffi(db).clone();
-    let target = *config.target(db);
-    let wasm_public_env = config.wasm_public_env(db).clone();
-    let mount_base = config.mount_base(db).clone();
-    let wasm_hydrate_mode = *config.wasm_hydrate_mode(db);
-    let runtime_dep = config.runtime_dep(db).clone();
-    let hot_appearance = *config.hot_appearance(db);
     let interner = db.interner().lock();
-    ipe_backend_rust::RustBackend::new(&interner)
-        .with_db_driver(driver)
-        .with_ffi(ffi)
-        .with_target(target)
-        .with_wasm_public_env(wasm_public_env)
-        .with_mount_base(mount_base)
-        .with_wasm_hydrate_mode(wasm_hydrate_mode)
-        .with_runtime_dep(runtime_dep)
-        .with_hot_appearance(hot_appearance)
+    ipe_backend_rust::RustBackend::configured(&interner, config.settings(db))
         .emit_spine(&program)
         .map(Arc::new)
         .map_err(|d| (d, Vec::new()))
@@ -1968,7 +1984,7 @@ pub fn emit_spine_file(
 /// One `IpeModule` file's text (§4.2): that `home`'s `EnumDef`s + `Func`s only,
 /// each `pub(crate)` behind a `use crate::*;` glob header.
 ///
-/// Depends on [`lower_program`], [`BuildConfig::db_driver`], AND the `file` key
+/// Depends on [`lower_program`], [`BuildConfig::settings`], AND the `file` key
 /// — the `file` key is what makes this SEPARATELY memoized per module. §4.3's
 /// honest divergence: because it depends on the COARSE whole-program
 /// [`lower_program`] (per-module lowering does not exist yet), a body edit
@@ -1987,19 +2003,9 @@ pub fn emit_rust_file<'db>(
     file: RustFileId<'db>,
 ) -> EmitTextResult {
     let program = folded_program(db, root, entry).clone()?;
-    let driver = *config.db_driver(db);
-    let ffi = config.ffi(db).clone();
-    let target = *config.target(db);
-    let runtime_dep = config.runtime_dep(db).clone();
-    let hot_appearance = *config.hot_appearance(db);
     let home = file.home(db);
     let interner = db.interner().lock();
-    ipe_backend_rust::RustBackend::new(&interner)
-        .with_db_driver(driver)
-        .with_ffi(ffi)
-        .with_target(target)
-        .with_runtime_dep(runtime_dep)
-        .with_hot_appearance(hot_appearance)
+    ipe_backend_rust::RustBackend::configured(&interner, config.settings(db))
         .emit_module_file(&program, home)
         .map(Arc::new)
         .map_err(|d| (d, Vec::new()))
@@ -2060,30 +2066,8 @@ pub fn emit_manifest(
         module_texts.insert(home.clone(), (*text).clone());
     }
 
-    let driver = *config.db_driver(db);
-    let ffi = config.ffi(db).clone();
-    let target = *config.target(db);
-    let wasm_public_env = config.wasm_public_env(db).clone();
-    let mount_base = config.mount_base(db).clone();
-    let wasm_hydrate_mode = *config.wasm_hydrate_mode(db);
-    let runtime_dep = config.runtime_dep(db).clone();
-    let debugger = *config.debugger(db);
-    let hot_appearance = *config.hot_appearance(db);
-    let webview_host = *config.webview_host(db);
-    let intent = *config.intent(db);
     let interner = db.interner().lock();
-    ipe_backend_rust::RustBackend::new(&interner)
-        .with_db_driver(driver)
-        .with_ffi(ffi)
-        .with_target(target)
-        .with_wasm_public_env(wasm_public_env)
-        .with_mount_base(mount_base)
-        .with_wasm_hydrate_mode(wasm_hydrate_mode)
-        .with_runtime_dep(runtime_dep)
-        .with_debugger(debugger)
-        .with_hot_appearance(hot_appearance)
-        .with_webview_host(webview_host)
-        .with_build_intent(intent)
+    ipe_backend_rust::RustBackend::configured(&interner, config.settings(db))
         .assemble_split_manifest(&program, &spine, &module_texts)
         .map(Arc::new)
         .map_err(|d| (d, Vec::new()))

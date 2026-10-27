@@ -1,4 +1,5 @@
-valid: postgres db.example.com require postgres://reader@db.example.com:5432/appdb (tls=require, password=[redacted])
+valid: postgres db.example.com verify-full postgres://reader@db.example.com:5432/appdb (tls=verify-full, password=[redacted])
 disable: rejected
-default-tls: require
+require: rejected
+default-tls: verify-full
 build: postgres metrics

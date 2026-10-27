@@ -17,6 +17,7 @@ use ipe_kernels::{StdlibKernel, Target};
 
 use crate::coverage::contract::{AspectCheck, Cell, StdlibSymbol, SymbolKind};
 use crate::coverage::probe::{self, ProbeUnavailable, StageOutcome};
+use crate::coverage::source_tree::{TreeRefusal, for_each_source};
 
 /// A scratch dir shared by a program-running column across a whole run, so the
 /// per-symbol probes do not each pay a temp-dir setup. RAII-cleaned on drop.
@@ -121,14 +122,11 @@ impl AspectCheck<StdlibSymbol> for LowersColumn {
             Ok(s) => s,
             Err(reason) => return unavailable_cell(&reason),
         };
-        let snippet = match scratch_child(scratch, "Main.ipe") {
-            Ok(path) => path,
-            Err(cell) => return cell,
-        };
+        let base = scratch.path();
         // The seam is "type-checks but does not lower": a probe that does not
         // type-check is a point-free-reference limitation for this symbol, not a
         // lowering gap.
-        if let StageOutcome::Failed { .. } = probe::typechecks(&source, &snippet) {
+        if let StageOutcome::Failed { .. } = probe::typechecks(&source, base) {
             return Cell::not_applicable(format!(
                 "{}.{}: the point-free reference program does not type-check — a \
                  probe-form limitation for this symbol, not a lowering gap",
@@ -136,7 +134,7 @@ impl AspectCheck<StdlibSymbol> for LowersColumn {
                 sym.name
             ));
         }
-        let outcome = probe::lower(&source, &snippet);
+        let outcome = probe::lower(&source, base);
         classify_lower_outcome(sym, outcome, "type-checks but does not lower")
     }
 }
@@ -230,14 +228,11 @@ impl AspectCheck<StdlibSymbol> for ComposesColumn {
             Ok(s) => s,
             Err(reason) => return unavailable_cell(&reason),
         };
-        let snippet = match scratch_child(scratch, "Main.ipe") {
-            Ok(path) => path,
-            Err(cell) => return cell,
-        };
+        let base = scratch.path();
         // A nested probe that does not type-check is a generator limitation for
         // this symbol's shape, not a lowering gap: report it inapplicable so it
         // is not a false hole.
-        if let StageOutcome::Failed { .. } = probe::typechecks(&source, &snippet) {
+        if let StageOutcome::Failed { .. } = probe::typechecks(&source, base) {
             return Cell::not_applicable(format!(
                 "{}.{}: the nested reference program does not type-check — a generator \
                  limitation for this symbol's shape, not a lowering gap",
@@ -245,7 +240,7 @@ impl AspectCheck<StdlibSymbol> for ComposesColumn {
                 sym.name
             ));
         }
-        let outcome = probe::lower(&source, &snippet);
+        let outcome = probe::lower(&source, base);
         classify_lower_outcome(
             sym,
             outcome,
@@ -333,13 +328,11 @@ impl AspectCheck<StdlibSymbol> for BuildRunColumn {
             Ok(s) => s,
             Err(reason) => return unavailable_cell(&reason),
         };
-        // Each symbol writes its `Main.ipe` under its OWN subdirectory of the
+        // Each symbol's probe projects live under its OWN subdirectory of the
         // shared scratch, keyed on the dotted path, so a parallel sweep (distinct
-        // symbols on distinct threads) never clobbers a sibling's snippet. The
-        // module is `Main`, so the file must be named `Main.ipe`; the per-symbol
-        // parent is what keeps it unique.
-        let snippet = match scratch_child(scratch, &symbol_scratch_key(sym)) {
-            Ok(dir) => dir.join("Main.ipe"),
+        // symbols on distinct threads) keeps each symbol's projects apart.
+        let base = match scratch_child(scratch, &symbol_scratch_key(sym)) {
+            Ok(dir) => dir,
             Err(cell) => return cell,
         };
         // The point-free reference program can fail to compile for a reason that
@@ -348,7 +341,7 @@ impl AspectCheck<StdlibSymbol> for BuildRunColumn {
         // the probe reaches. Pre-check by lowering — build+run shells out and sees
         // only text, so it cannot classify — and defer to that verdict rather than
         // pay a full cargo build to reach a false hole.
-        let lowered = probe::lower(&source, &snippet);
+        let lowered = probe::lower(&source, &base);
         if probe::is_probe_form_limitation(&lowered) {
             return Cell::NotApplicable {
                 reason: format!(
@@ -389,7 +382,7 @@ impl AspectCheck<StdlibSymbol> for BuildRunColumn {
                 sym.name
             ));
         }
-        match probe::build_and_run(&source, &snippet) {
+        match probe::build_and_run(&source, &base) {
             StageOutcome::Ok => Cell::Ok,
             StageOutcome::Failed { message, .. } => Cell::Hole(format!(
                 "{}.{} emits but does not build+run: {message}",
@@ -457,16 +450,27 @@ fn kernel_for(sym: &StdlibSymbol) -> Option<StdlibKernel> {
 /// kernel whose emit token is not a plain identifier, is `NotApplicable`.
 pub struct RuntimeFnExistsColumn {
     /// Every identifier defined or re-exported in the runtime crate source.
-    runtime_symbols: BTreeSet<String>,
+    runtime_symbols: RuntimeSymbols,
 }
 
 impl RuntimeFnExistsColumn {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            runtime_symbols: scan_runtime_symbols().unwrap_or_default(),
+            runtime_symbols: scan_runtime_symbols(),
         }
     }
+}
+
+/// The runtime crate's identifiers, or why they could not be collected.
+#[derive(Debug)]
+enum RuntimeSymbols {
+    /// Every identifier the whole runtime source tree defines or re-exports.
+    Scanned(BTreeSet<String>),
+    /// No runtime crate source directory was found.
+    NotLocated,
+    /// The runtime source tree could not be read whole.
+    Refused(TreeRefusal),
 }
 
 impl Default for RuntimeFnExistsColumn {
@@ -497,12 +501,18 @@ impl AspectCheck<StdlibSymbol> for RuntimeFnExistsColumn {
                  constructor emission, not a free runtime function",
             );
         }
-        if self.runtime_symbols.is_empty() {
-            return Cell::Warn(
-                "runtime crate source not found; runtime-fn existence not checked".to_owned(),
-            );
-        }
-        if self.runtime_symbols.contains(runtime_fn) {
+        let symbols = match &self.runtime_symbols {
+            RuntimeSymbols::Scanned(symbols) if !symbols.is_empty() => symbols,
+            RuntimeSymbols::Scanned(_) | RuntimeSymbols::NotLocated => {
+                return Cell::Warn(
+                    "runtime crate source not found; runtime-fn existence not checked".to_owned(),
+                );
+            }
+            RuntimeSymbols::Refused(refusal) => {
+                return Cell::Warn(format!("runtime-fn existence not checked: {refusal}"));
+            }
+        };
+        if symbols.contains(runtime_fn) {
             Cell::Ok
         } else {
             Cell::Warn(format!(
@@ -523,14 +533,22 @@ impl AspectCheck<StdlibSymbol> for RuntimeFnExistsColumn {
 /// cfgs), which is the fail-safe direction: a genuinely missing symbol is still a
 /// hole, and a symbol present only under an off feature is not falsely flagged —
 /// the featureset-closure SEAL owns the cfg-reachability axis.
-fn scan_runtime_symbols() -> Option<BTreeSet<String>> {
-    let root = runtime_crate_src()?;
+fn scan_runtime_symbols() -> RuntimeSymbols {
+    let Some(root) = runtime_crate_src() else {
+        return RuntimeSymbols::NotLocated;
+    };
+    collect_symbols_under(&root)
+}
+
+/// Collect defined/re-exported identifiers from every `.rs` file under `root`,
+/// or the refusal that kept the walk from reading the tree whole.
+fn collect_symbols_under(root: &Path) -> RuntimeSymbols {
     let mut symbols = BTreeSet::new();
-    collect_symbols_in_dir(&root, &mut symbols);
-    if symbols.is_empty() {
-        None
-    } else {
-        Some(symbols)
+    match for_each_source(root, panic_scan::Want::RustFiles, |_, text| {
+        collect_symbols_in_text(text, &mut symbols);
+    }) {
+        Ok(()) => RuntimeSymbols::Scanned(symbols),
+        Err(refusal) => RuntimeSymbols::Refused(refusal),
     }
 }
 
@@ -556,24 +574,6 @@ fn runtime_crate_src() -> Option<PathBuf> {
         here = dir.parent().map(Path::to_path_buf);
     }
     None
-}
-
-/// Recursively collect defined/re-exported identifiers from every `.rs` file
-/// under `dir`.
-fn collect_symbols_in_dir(dir: &Path, out: &mut BTreeSet<String>) {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.is_dir() {
-            collect_symbols_in_dir(&path, out);
-        } else if path.extension().is_some_and(|e| e == "rs")
-            && let Ok(text) = std::fs::read_to_string(&path)
-        {
-            collect_symbols_in_text(&text, out);
-        }
-    }
 }
 
 /// Extract every runtime-symbol identifier a kernel emit could name from one
@@ -720,5 +720,34 @@ mod tests {
     fn scratch_key_is_deterministic() {
         let s = sym(&["Ipe", "List"], "map");
         assert_eq!(symbol_scratch_key(&s), symbol_scratch_key(&s));
+    }
+    /// A runtime tree the walk cannot read whole is a named refusal, and the
+    /// column reports the cause rather than "source not found" or a miss.
+    #[test]
+    fn an_unlisted_runtime_tree_is_a_named_refusal() {
+        let missing = ipe_test_temp::temp_root().join(format!(
+            "ipe-runtime-symbols-missing-{}",
+            std::process::id()
+        ));
+        let symbols = collect_symbols_under(&missing);
+        assert!(matches!(symbols, RuntimeSymbols::Refused(_)), "{symbols:?}");
+        let kernel = StdlibKernel::ALL
+            .iter()
+            .copied()
+            .find(|k| {
+                let token = k.def().runtime_fn;
+                !token.is_empty() && token.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+            })
+            .expect("a kernel lowers to a free runtime function");
+        let mut probe = sym(&[kernel.def().qualifier], kernel.def().name);
+        probe.has_kernel = true;
+        let column = RuntimeFnExistsColumn {
+            runtime_symbols: symbols,
+        };
+        let cell = column.check(&probe);
+        assert!(
+            matches!(&cell, Cell::Warn(msg) if msg.contains("cannot be listed whole")),
+            "{cell:?}"
+        );
     }
 }

@@ -1,0 +1,476 @@
+module Lib.Label exposing (Cap, Column, ColumnExtent(..), Label, LabelPart(..), LabelPiece(..), byteCount, capBytes, columnOf, elementCeiling, extent, fromQuotedText, fromText, key, labelCap, markerByteCeiling, markerText, parse, parseQuoted, parts, piecesText, purposeCap, runCeiling, textBytes, whole, windowChars)
+
+-- A display column of the index, parsed once into a bounded label: at most
+-- `capBytes cap` bytes of shown text (escape spellings counted at their
+-- spelled length), at most `runCeiling` escape runs, and a tool-written
+-- marker `… (+N bytes, #hash)` when the column held more. A label therefore
+-- draws at most `elementCeiling` elements and holds at most
+-- `capBytes cap + markerByteCeiling` bytes, whatever the column held.
+--
+-- The index read returns a bounded window of the column (`windowChars`
+-- characters) and the column's full byte length, so no read pulls an
+-- unbounded value into the app. The marker's hash is over that window and
+-- that length, so two long columns that differ anywhere in the window or in
+-- length read differently. Not guaranteed: two columns with the same first
+-- `windowChars` characters and the same byte length share a marker; the queue
+-- tells such units apart by their uid.
+--
+-- Hazard characters are escaped as `SafeText.renderForeign` escapes them;
+-- adjacent escapes coalesce into one `LabelEscapes` run, so a run of hostile
+-- characters draws one element, not one per character. A quoted label (one
+-- shown between the tool's `"` quotes) also escapes `\` and `"` as
+-- `SafeText.render` does, so the column cannot close the quotes it sits in.
+
+import Ipe.Char as Char
+import Ipe.Crypto as Crypto
+import Ipe.List as List
+import Ipe.String as String
+import Lib.SafeText as SafeText exposing (SafeText)
+
+
+type Label
+    = Label { parts : List LabelPart, bytes : Int }
+
+
+-- One drawn piece of a label: text shown as it arrived, a run of escape
+-- spellings the tool wrote, or the truncation marker with the bytes it
+-- dropped and the column's short hash.
+type LabelPart
+    = LabelText String
+    | LabelEscapes String
+    | LabelCut Int String
+
+
+-- One piece of a line the tool draws: a label read from the index, or text
+-- the tool wrote around it.
+type LabelPiece
+    = IndexedLabel Label
+    | ToolText SafeText
+
+
+-- The most bytes of shown text a label of this kind keeps.
+type Cap
+    = Cap Int
+
+
+-- What the index read returns for one display column: its first
+-- `windowChars` characters, the byte length of the whole column, and the
+-- byte length SQLite gives that window when the cell is stored as text
+-- (`Nothing` when it is not).
+type alias Column =
+    { shown : String, bytes : Int, window : Maybe Int }
+
+
+-- A unit's kind, name, qualified name, path and facing, and an unreviewable
+-- file's path.
+labelCap : Cap
+labelCap =
+    Cap 256
+
+
+-- A unit's purpose line.
+purposeCap : Cap
+purposeCap =
+    Cap 512
+
+
+capBytes : Cap -> Int
+capBytes cap =
+    case cap of
+        Cap n ->
+            n
+
+
+-- The characters of a column the index read returns. Every character is at
+-- least one byte, so the window is never shorter than any cap.
+windowChars : Int
+windowChars =
+    4096
+
+
+-- The most escape runs one label shows; the run past it ends the label.
+runCeiling : Int
+runCeiling =
+    3
+
+
+-- The most elements one label draws: one per escape run and one for the
+-- marker. Shown text is a text node, not an element.
+elementCeiling : Int
+elementCeiling =
+    runCeiling + 1
+
+
+-- The most bytes a marker takes: `… (+`, at most 19 digits, ` bytes, #`,
+-- eight hex digits and `)`.
+markerByteCeiling : Int
+markerByteCeiling =
+    48
+
+
+-- The marker a truncated label ends with.
+markerText : Int -> String -> String
+markerText dropped hash =
+    "… (+" ++ String.fromInt dropped ++ " bytes, #" ++ hash ++ ")"
+
+
+parts : Label -> List LabelPart
+parts label =
+    case label of
+        Label l ->
+            l.parts
+
+
+-- The bytes the label shows: its text, its escape spellings and its marker.
+byteCount : Label -> Int
+byteCount label =
+    case label of
+        Label l ->
+            l.bytes
+
+
+-- An injective flat form of the label for dedup and grouping keys: each part
+-- tagged and length-prefixed, so no two part lists share a key.
+key : Label -> String
+key label =
+    String.concat (List.map partKey (parts label))
+
+
+partKey : LabelPart -> String
+partKey part =
+    case part of
+        LabelText s ->
+            "t" ++ String.fromInt (String.length s) ++ ":" ++ s
+
+        LabelEscapes s ->
+            "e" ++ String.fromInt (String.length s) ++ ":" ++ s
+
+        LabelCut dropped hash ->
+            "c" ++ String.fromInt dropped ++ ":" ++ String.fromInt (String.length hash) ++ ":" ++ hash
+
+
+-- Text the app holds whole (a test's fixture, a value already in memory)
+-- parsed exactly as the index read of the same column would be.
+fromText : Cap -> String -> Label
+fromText cap raw =
+    parse cap (columnOf raw)
+
+
+-- `fromText` for a label shown between the tool's quotes.
+fromQuotedText : Cap -> String -> Label
+fromQuotedText cap raw =
+    parseQuoted cap (columnOf raw)
+
+
+-- Text the app holds whole, as the index read returns a column: the first
+-- `windowChars` characters and the byte length of the whole.
+columnOf : String -> Column
+columnOf raw =
+    let
+        shown =
+            String.left windowChars raw
+    in
+    { shown = shown, bytes = textBytes raw, window = Just (textBytes shown) }
+
+
+-- How much of a column its window holds, judged from the window, the
+-- column's byte length and the window's byte length as SQLite counted it:
+-- all of it, a window cut at `windowChars`, a text window the read cut
+-- early, or a cell that did not read as text. A cell not stored as text, or
+-- whose window did not decode to the bytes SQLite returned (a non-UTF-8
+-- text reads as its hex spelling), is not the column's text. SQLite's
+-- `substr` ends a text at its first NUL byte, so a faithful window shorter
+-- than `windowChars` whose bytes fall short of the column's held a NUL
+-- there.
+type ColumnExtent
+    = WholeColumn String
+    | CutAtWindow
+    | CutAtNul
+    | NotTextCell
+
+
+extent : Column -> ColumnExtent
+extent column =
+    case column.window of
+        Nothing ->
+            NotTextCell
+
+        Just windowBytes ->
+            let
+                chars =
+                    String.length column.shown
+            in
+            if chars > windowChars || textBytes column.shown /= windowBytes || windowBytes > column.bytes then
+                NotTextCell
+
+            else if windowBytes == column.bytes then
+                WholeColumn column.shown
+
+            else if chars < windowChars then
+                CutAtNul
+
+            else
+                CutAtWindow
+
+
+-- The column's whole text, when the window holds all of it: a value the app
+-- may act on (join, bind, compare). `Nothing` for every other `extent`, so
+-- no decision is ever taken on a prefix or on a hex spelling.
+whole : Column -> Maybe String
+whole column =
+    case extent column of
+        WholeColumn text ->
+            Just text
+
+        CutAtWindow ->
+            Nothing
+
+        CutAtNul ->
+            Nothing
+
+        NotTextCell ->
+            Nothing
+
+
+-- The pieces flattened for a terminal or an error: a label's text and escape
+-- runs as shown, its marker spelled out, the tool's text as written.
+piecesText : List LabelPiece -> SafeText
+piecesText pieces =
+    SafeText.concat (List.concatMap pieceText pieces)
+
+
+pieceText : LabelPiece -> List SafeText
+pieceText piece =
+    case piece of
+        IndexedLabel label ->
+            List.map partText (parts label)
+
+        ToolText text ->
+            [ text ]
+
+
+partText : LabelPart -> SafeText
+partText part =
+    case part of
+        LabelText s ->
+            SafeText.renderForeign s
+
+        LabelEscapes s ->
+            SafeText.renderForeign s
+
+        LabelCut dropped hash ->
+            SafeText.renderForeign (markerText dropped hash)
+
+
+-- The one constructor of a label from a column. Total: every column parses.
+-- One left-to-right pass over the window counts what is kept and where each
+-- part starts and ends; the parts are then cut from the kept text once each.
+-- The pass carries only counts and at most `2 * runCeiling + 1` closed
+-- spans, so its cost is linear in the window whatever the text holds; once
+-- the cap or the run ceiling stops it, the rest of the window is skipped.
+parse : Cap -> Column -> Label
+parse cap column =
+    parseWith SafeText.isHazard cap column
+
+
+-- `parse` for a label shown between the tool's quotes: `\` and `"` are
+-- escaped too.
+parseQuoted : Cap -> Column -> Label
+parseQuoted cap column =
+    parseWith (\c -> SafeText.isHazard c || c == '\\' || c == '"') cap column
+
+
+parseWith : (Char -> Bool) -> Cap -> Column -> Label
+parseWith escaped cap column =
+    let
+        window =
+            String.left windowChars column.shown
+
+        scanned =
+            String.foldl (scanChar escaped (capBytes cap)) startScan window
+
+        keptText =
+            String.left scanned.taken window
+
+        kept =
+            List.map (spanPart keptText) (closeOpen scanned.taken scanned.open scanned.closed)
+
+        dropped =
+            max 0 (column.bytes - scanned.raw)
+    in
+    if scanned.stopped || dropped > 0 then
+        let
+            hash =
+                columnHash column.bytes window
+        in
+        Label
+            { parts = kept ++ [ LabelCut dropped hash ]
+            , bytes = scanned.spent + textBytes (markerText dropped hash)
+            }
+
+    else
+        Label { parts = kept, bytes = scanned.spent }
+
+
+-- The first eight hex digits of the SHA-256 of the column's byte length and
+-- window.
+columnHash : Int -> String -> String
+columnHash bytes window =
+    String.left 8 (Crypto.sha256 (String.fromInt bytes ++ ":" ++ window))
+
+
+-- What a span of the kept text draws as: shown text or an escape run.
+type SpanKind
+    = TextSpan
+    | EscapeSpan
+
+
+-- The span a scan is still filling, from its first character.
+type alias OpenSpan =
+    { kind : SpanKind, start : Int }
+
+
+-- A finished span: the characters `start` up to `end` of the kept text.
+type alias Span =
+    { kind : SpanKind, start : Int, end : Int }
+
+
+-- A scan's state: the shown bytes spent against the cap, the raw column
+-- bytes and the characters kept, the escape runs opened, the open span, the
+-- finished spans (in order) and whether the scan has stopped.
+type alias Scan =
+    { spent : Int, raw : Int, taken : Int, runs : Int, open : Maybe OpenSpan, closed : List Span, stopped : Bool }
+
+
+startScan : Scan
+startScan =
+    { spent = 0, raw = 0, taken = 0, runs = 0, open = Nothing, closed = [], stopped = False }
+
+
+scanChar : (Char -> Bool) -> Int -> Char -> Scan -> Scan
+scanChar escaped cap c scan =
+    if scan.stopped then
+        scan
+
+    else
+        let
+            kind =
+                if escaped c then
+                    EscapeSpan
+
+                else
+                    TextSpan
+
+            opens =
+                not (continues kind scan.open)
+
+            runs =
+                if opens && isEscape kind then
+                    scan.runs + 1
+
+                else
+                    scan.runs
+
+            spent =
+                scan.spent + shownWidth kind c
+        in
+        if runs > runCeiling || spent > cap then
+            { scan | stopped = True }
+
+        else if opens then
+            { scan
+                | spent = spent
+                , raw = scan.raw + charBytes c
+                , taken = scan.taken + 1
+                , runs = runs
+                , open = Just { kind = kind, start = scan.taken }
+                , closed = closeOpen scan.taken scan.open scan.closed
+            }
+
+        else
+            { scan | spent = spent, raw = scan.raw + charBytes c, taken = scan.taken + 1 }
+
+
+-- The bytes one kept character shows: its escape spelling's, or its own.
+shownWidth : SpanKind -> Char -> Int
+shownWidth kind c =
+    case kind of
+        EscapeSpan ->
+            textBytes (SafeText.escapeSpelling c)
+
+        TextSpan ->
+            charBytes c
+
+
+isEscape : SpanKind -> Bool
+isEscape kind =
+    case kind of
+        EscapeSpan ->
+            True
+
+        TextSpan ->
+            False
+
+
+-- Whether a character of `kind` extends the open span.
+continues : SpanKind -> Maybe OpenSpan -> Bool
+continues kind open =
+    case open of
+        Just span ->
+            isEscape span.kind == isEscape kind
+
+        Nothing ->
+            False
+
+
+-- `closed` with the open span, if any, finished at character `at`.
+closeOpen : Int -> Maybe OpenSpan -> List Span -> List Span
+closeOpen at open closed =
+    case open of
+        Just span ->
+            closed ++ [ { kind = span.kind, start = span.start, end = at } ]
+
+        Nothing ->
+            closed
+
+
+-- A finished span cut from the kept text: its text as shown, or its
+-- characters' escape spellings joined.
+spanPart : String -> Span -> LabelPart
+spanPart keptText span =
+    let
+        piece =
+            String.slice span.start span.end keptText
+    in
+    case span.kind of
+        TextSpan ->
+            LabelText piece
+
+        EscapeSpan ->
+            LabelEscapes (String.concat (List.map SafeText.escapeSpelling (String.toList piece)))
+
+
+-- The UTF-8 bytes of a text.
+textBytes : String -> Int
+textBytes text =
+    String.foldl (\c n -> n + charBytes c) 0 text
+
+
+-- The UTF-8 width of one character.
+charBytes : Char -> Int
+charBytes c =
+    let
+        code =
+            Char.toCode c
+    in
+    if code < 128 then
+        1
+
+    else if code < 2048 then
+        2
+
+    else if code < 65536 then
+        3
+
+    else
+        4

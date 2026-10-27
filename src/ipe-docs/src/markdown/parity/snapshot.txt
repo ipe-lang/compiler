@@ -164,3 +164,493 @@ Intro **para**.
 )
 (table (hdr "H") (row "v"))
 --- end ---
+=== blank-run ===
+--- source ---
+alpha
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+beta
+--- blocks ---
+(para "alpha")
+(para "beta")
+--- end ---
+=== table-head-at-end ===
+--- source ---
+| A | B |
+--- blocks ---
+(para "| A | B |")
+--- end ---
+=== table-head-no-separator ===
+--- source ---
+| A | B |
+plain
+--- blocks ---
+(para "| A | B | plain")
+--- end ---
+=== paragraph-absorbs-table-row ===
+--- source ---
+alpha
+| A | B |
+|---|---|
+--- blocks ---
+(para "alpha | A | B | |---|---|")
+--- end ---
+=== code-fence-unclosed ===
+--- source ---
+```
+x =
+  y
+--- blocks ---
+(code "x =\n  y")
+--- end ---
+=== adjacent-groups ===
+--- source ---
+- a
+1. b
+> c
+| D |
+|---|
+| e |
+- f
+--- blocks ---
+(bullet "a")
+(numbered "b")
+(blockquote
+  (para "c")
+)
+(table (hdr "D") (row "e"))
+(bullet "f")
+--- end ---
+=== paragraph-hard-break-mid ===
+--- source ---
+a  
+b
+--- blocks ---
+(para "a  \nb")
+--- end ---
+=== quote-depth-31 ===
+--- source ---
+> > > > > > > > > > > > > > > > > > > > > > > > > > > > > > > - item
+--- blocks ---
+(blockquote
+  (blockquote
+    (blockquote
+      (blockquote
+        (blockquote
+          (blockquote
+            (blockquote
+              (blockquote
+                (blockquote
+                  (blockquote
+                    (blockquote
+                      (blockquote
+                        (blockquote
+                          (blockquote
+                            (blockquote
+                              (blockquote
+                                (blockquote
+                                  (blockquote
+                                    (blockquote
+                                      (blockquote
+                                        (blockquote
+                                          (blockquote
+                                            (blockquote
+                                              (blockquote
+                                                (blockquote
+                                                  (blockquote
+                                                    (blockquote
+                                                      (blockquote
+                                                        (blockquote
+                                                          (blockquote
+                                                            (blockquote
+                                                              (bullet "item")
+                                                            )
+                                                          )
+                                                        )
+                                                      )
+                                                    )
+                                                  )
+                                                )
+                                              )
+                                            )
+                                          )
+                                        )
+                                      )
+                                    )
+                                  )
+                                )
+                              )
+                            )
+                          )
+                        )
+                      )
+                    )
+                  )
+                )
+              )
+            )
+          )
+        )
+      )
+    )
+  )
+)
+--- end ---
+=== quote-depth-32 ===
+--- source ---
+> > > > > > > > > > > > > > > > > > > > > > > > > > > > > > > > - item
+--- blocks ---
+(blockquote
+  (blockquote
+    (blockquote
+      (blockquote
+        (blockquote
+          (blockquote
+            (blockquote
+              (blockquote
+                (blockquote
+                  (blockquote
+                    (blockquote
+                      (blockquote
+                        (blockquote
+                          (blockquote
+                            (blockquote
+                              (blockquote
+                                (blockquote
+                                  (blockquote
+                                    (blockquote
+                                      (blockquote
+                                        (blockquote
+                                          (blockquote
+                                            (blockquote
+                                              (blockquote
+                                                (blockquote
+                                                  (blockquote
+                                                    (blockquote
+                                                      (blockquote
+                                                        (blockquote
+                                                          (blockquote
+                                                            (blockquote
+                                                              (blockquote
+                                                                (bullet "item")
+                                                              )
+                                                            )
+                                                          )
+                                                        )
+                                                      )
+                                                    )
+                                                  )
+                                                )
+                                              )
+                                            )
+                                          )
+                                        )
+                                      )
+                                    )
+                                  )
+                                )
+                              )
+                            )
+                          )
+                        )
+                      )
+                    )
+                  )
+                )
+              )
+            )
+          )
+        )
+      )
+    )
+  )
+)
+--- end ---
+=== quote-depth-33 ===
+--- source ---
+> > > > > > > > > > > > > > > > > > > > > > > > > > > > > > > > > - item
+> > > > > > > > > > > > > > > > > > > > > > > > > > > > > > > > > # head
+--- blocks ---
+(blockquote
+  (blockquote
+    (blockquote
+      (blockquote
+        (blockquote
+          (blockquote
+            (blockquote
+              (blockquote
+                (blockquote
+                  (blockquote
+                    (blockquote
+                      (blockquote
+                        (blockquote
+                          (blockquote
+                            (blockquote
+                              (blockquote
+                                (blockquote
+                                  (blockquote
+                                    (blockquote
+                                      (blockquote
+                                        (blockquote
+                                          (blockquote
+                                            (blockquote
+                                              (blockquote
+                                                (blockquote
+                                                  (blockquote
+                                                    (blockquote
+                                                      (blockquote
+                                                        (blockquote
+                                                          (blockquote
+                                                            (blockquote
+                                                              (blockquote
+                                                                (para "- item # head")
+                                                              )
+                                                            )
+                                                          )
+                                                        )
+                                                      )
+                                                    )
+                                                  )
+                                                )
+                                              )
+                                            )
+                                          )
+                                        )
+                                      )
+                                    )
+                                  )
+                                )
+                              )
+                            )
+                          )
+                        )
+                      )
+                    )
+                  )
+                )
+              )
+            )
+          )
+        )
+      )
+    )
+  )
+)
+--- end ---
+=== quote-markers-run ===
+--- source ---
+>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>> deep
+--- blocks ---
+(para ">>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>> deep")
+--- end ---
+=== span-bracket-before-link ===
+--- source ---
+[[a](b)
+--- spans ---
+(link "[a" "b")
+--- end ---
+=== span-link-text-has-bracket ===
+--- source ---
+[a [b](c)
+--- spans ---
+(link "a [b" "c")
+--- end ---
+=== span-link-no-paren ===
+--- source ---
+[a]x(b)
+--- spans ---
+(plain "[a]x(b)")
+--- end ---
+=== span-image-bracket-link ===
+--- source ---
+![[a](b)
+--- spans ---
+(image "[a" "b")
+--- end ---
+=== span-link-no-close-paren ===
+--- source ---
+[a](b
+--- spans ---
+(plain "[a](b")
+--- end ---
+=== span-brackets-only ===
+--- source ---
+[[[
+--- spans ---
+(plain "[[[")
+--- end ---
+=== span-link-no-url ===
+--- source ---
+[a]
+--- spans ---
+(plain "[a]")
+--- end ---
+=== span-star ===
+--- source ---
+*
+--- spans ---
+(plain "*")
+--- end ---
+=== span-double-star ===
+--- source ---
+**
+--- spans ---
+(bold "")
+--- end ---
+=== span-triple-star ===
+--- source ---
+***
+--- spans ---
+(bold "*")
+--- end ---
+=== span-bold-unclosed ===
+--- source ---
+**a
+--- spans ---
+(bold "a")
+--- end ---
+=== span-bold-star-run ===
+--- source ---
+**a***b
+--- spans ---
+(bold "a")
+(italic "b")
+--- end ---
+=== span-italic ===
+--- source ---
+*a*
+--- spans ---
+(italic "a")
+--- end ---
+=== span-code-unclosed ===
+--- source ---
+`a
+--- spans ---
+(code "a")
+--- end ---
+=== span-code ===
+--- source ---
+`x`
+--- spans ---
+(code "x")
+--- end ---
+=== span-trailing-spaces ===
+--- source ---
+a  
+--- spans ---
+(plain "a")
+(hardbreak)
+--- end ---
+=== span-bang-text ===
+--- source ---
+!x
+--- spans ---
+(plain "!x")
+--- end ---
+=== span-bang-bracket ===
+--- source ---
+![
+--- spans ---
+(plain "![")
+--- end ---
+=== span-hard-break-mid ===
+--- source ---
+a  
+b
+--- spans ---
+(plain "a")
+(hardbreak)
+(plain "b")
+--- end ---
+=== span-newline ===
+--- source ---
+a
+b
+--- spans ---
+(plain "a")
+(hardbreak)
+(plain "b")
+--- end ---
+=== span-link-https ===
+--- source ---
+[t](https://a.example)
+--- spans ---
+(link "t" "https://a.example")
+--- end ---
+=== span-image ===
+--- source ---
+![i](img.png)
+--- spans ---
+(image "i" "img.png")
+--- end ---
+=== span-double-bang-link ===
+--- source ---
+!![a](b)
+--- spans ---
+(plain "!")
+(image "a" "b")
+--- end ---
+=== span-mailto ===
+--- source ---
+x [a](mailto:a@b.c) y
+--- spans ---
+(plain "x ")
+(link "a" "mailto:a@b.c")
+(plain " y")
+--- end ---
+=== span-link-after-miss ===
+--- source ---
+[a]x [b](c)
+--- spans ---
+(plain "[a]x ")
+(link "b" "c")
+--- end ---

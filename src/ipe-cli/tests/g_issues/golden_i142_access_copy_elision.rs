@@ -29,17 +29,16 @@ fn repo_root() -> PathBuf {
 /// Compile the fixture and return the concatenated emitted Rust sources.
 fn emit_fixture(out_name: &str) -> String {
     let root = repo_root();
-    let entry = root
+    let golden_dir = root
         .join("tests")
         .join("golden")
-        .join("copy_field_no_clone")
-        .join("Main.ipe");
+        .join("copy_field_no_clone");
     let out = crate::support::scratch_root().join(out_name);
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
 
-    let built = ipe::build(&entry, &out, &runtime);
+    let built = crate::support::build_golden(&golden_dir, &out, &runtime);
     assert!(
         built.is_ok(),
         "ipe dev build must succeed for copy_field_no_clone: {:?}",

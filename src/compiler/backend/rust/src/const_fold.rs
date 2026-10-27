@@ -360,6 +360,10 @@ fn fold_expr(expr: Expr, funcs: &BTreeMap<FuncId, &Func>, interner: &Interner) -
             effect: go_box(effect),
             rest: go_box(rest),
         },
+        Expr::CaptureClones { syms, body } => Expr::CaptureClones {
+            syms,
+            body: go_box(body),
+        },
         Expr::TailLoop { params, body } => Expr::TailLoop {
             params,
             body: go_box(body),
@@ -474,7 +478,9 @@ fn specialize_whitelisted_call(
             return None;
         }
         let mut subst = BTreeMap::new();
-        for (((param, _), arg), fold) in func.params.iter().zip(args).zip(&arg_folds) {
+        for ((ipe_ir::Param { sym: param, .. }, arg), fold) in
+            func.params.iter().zip(args).zip(&arg_folds)
+        {
             // A scalar-folding argument substitutes as its direct literal (the value
             // the inlined body's fold would reduce it to anyway); every other argument
             // substitutes verbatim so its own expression re-folds in place.
@@ -546,7 +552,8 @@ fn body_has_tail_construct(expr: &Expr) -> bool {
         Expr::Access { record, .. } => body_has_tail_construct(record),
         Expr::Lambda { body, .. }
         | Expr::SharedLambda { body, .. }
-        | Expr::OnceLambda { body, .. } => body_has_tail_construct(body),
+        | Expr::OnceLambda { body, .. }
+        | Expr::CaptureClones { body, .. } => body_has_tail_construct(body),
         Expr::TaskSeq { effect, rest } => {
             body_has_tail_construct(effect) || body_has_tail_construct(rest)
         }
@@ -721,6 +728,22 @@ fn substitute(expr: Expr, subst: &BTreeMap<Symbol, Expr>) -> Expr {
             effect: go_box(effect),
             rest: go_box(rest),
         },
+        // Each listed symbol rebinds itself over `body`, like a `let` of its
+        // own clone. A substituted symbol has no outer binding left to clone,
+        // so its rebinding takes the constant instead.
+        Expr::CaptureClones { syms, body } => {
+            let body = substitute_under_binders(*body, subst, &syms);
+            syms.into_iter()
+                .rev()
+                .fold(body, |body, sym| match subst.get(&sym) {
+                    Some(value) => Expr::Let {
+                        name: sym,
+                        value: Box::new(value.clone()),
+                        body: Box::new(body),
+                    },
+                    None => Expr::pre_clone(sym, body),
+                })
+        }
         Expr::TailLoop { params, body } => {
             let bound: Vec<Symbol> = params.iter().map(|(s, _)| *s).collect();
             let body = substitute_under_binders(*body, subst, &bound);
@@ -778,7 +801,7 @@ fn collect_pat_binders(pat: &Pat, out: &mut Vec<Symbol>) {
             out.push(*s);
             collect_pat_binders(inner, out);
         }
-        Pat::Ctor { args, .. } | Pat::Tuple(args) | Pat::Or(args) => {
+        Pat::Ctor { args, .. } | Pat::Tuple(args) => {
             for a in args {
                 collect_pat_binders(a, out);
             }
@@ -796,7 +819,8 @@ fn collect_pat_binders(pat: &Pat, out: &mut Vec<Symbol>) {
                 collect_pat_binders(r, out);
             }
         }
-        Pat::Wildcard | Pat::Int(_) | Pat::Bool(_) | Pat::Char(_) | Pat::Str(_) => {}
+        // A `SharedAlts` alternative is binder-free.
+        Pat::Wildcard | Pat::Int(_) | Pat::Bool(_) | Pat::Char(_) | Pat::Str(_) | Pat::Or(_) => {}
     }
 }
 
@@ -972,6 +996,14 @@ fn eval_inner(expr: &Expr, env: &FoldEnv, budget: &mut Budget) -> Option<ConstVa
         Expr::Let { name, value, body } => {
             let v = eval(value, env, budget)?;
             eval_with_local(*name, v, body, env, budget)
+        }
+
+        // Rebinding a symbol to its own clone leaves every local's value as it was.
+        Expr::CaptureClones { syms, body } => {
+            for sym in syms {
+                eval(&Expr::CloneVar(*sym), env, budget)?;
+            }
+            eval(body, env, budget)
         }
 
         Expr::Match(m) => eval_match(m, env, budget),
@@ -1189,7 +1221,7 @@ fn eval_func_body(
         return None;
     }
     let mut child_locals = BTreeMap::new();
-    for ((param, _), value) in func.params.iter().zip(arg_vals) {
+    for (ipe_ir::Param { sym: param, .. }, value) in func.params.iter().zip(arg_vals) {
         child_locals.insert(*param, value.clone());
     }
     let child = FoldEnv {
@@ -1437,7 +1469,7 @@ mod tests {
             home,
             type_params: vec![],
             row_params: vec![],
-            params: vec![(param, IrType::Str)],
+            params: vec![ipe_ir::Param::owned(param, IrType::Str)],
             ret: IrType::Str,
             body: Expr::Var(param),
         }

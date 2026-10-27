@@ -6,7 +6,7 @@
 //! `Ffi.kernel "Random_*"` aliases to the registered `Random*` kernels, and the
 //! seeded tier (`seed`/`seededInt`/`seededFloat`/`seededChoice` over the opaque
 //! `Seed`) is pure Ipê over the seeded raw kernels
-//! (`tests/golden/random_members/Main.ipe`). This pins ipe-0 ∧ cargo-0 ∧ run-0
+//! (`tests/golden/random_members/src/Main.ipe`). This pins ipe-0 ∧ cargo-0 ∧ run-0
 //! (THE SEAL: ipe exit 0 ⇒ emitted Rust builds and runs): the entropy tier is
 //! drawn through `Cmd.perform` and the seeded tier is asserted reproducible
 //! (two draws from one `Seed` agree), so the rendered line is stable.
@@ -29,14 +29,13 @@ fn random_members_ipec_cargo_and_run_zero() {
 
     let root = repo_root();
     let dir = root.join("tests").join("golden").join("random_members");
-    let entry = dir.join("Main.ipe");
     let out = crate::support::scratch_root().join("ipec_random_members_e2e");
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
 
     // ipe-0: compiling a program that calls every Random member must succeed.
-    let built = ipe::build(&entry, &out, &runtime);
+    let built = crate::support::build_golden(&dir, &out, &runtime);
     assert!(
         built.is_ok(),
         "ipe dev build must succeed for random_members: {:?}",

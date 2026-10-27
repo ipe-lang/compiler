@@ -187,12 +187,12 @@ const BUILD_BOUNDS: e2e_support::BoundedRun = e2e_support::BoundedRun {
     out_cap: 64 * 1024 * 1024,
 };
 
-/// Run `ipe <mode> build <project>/package.ipe --out <project>/out` with stdin
+/// Run `ipe <mode> build <project> --out <project>/out` with stdin
 /// closed (never a terminal), returning (success, stderr).
 fn spawn_build(mode: &str, dir: &std::path::Path) -> Result<(bool, String), Box<dyn Error>> {
     let mut cmd = std::process::Command::new(e2e_support::cargo_bin!("ipe").into_path_buf());
     cmd.args([mode, "build"])
-        .arg(dir.join("package.ipe"))
+        .arg(dir)
         .arg("--out")
         .arg(dir.join("out"))
         .current_dir(dir)

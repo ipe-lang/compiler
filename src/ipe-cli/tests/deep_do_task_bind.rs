@@ -12,7 +12,7 @@
 //! from the `task_and_then` parameter type and processes the chain in linear time.
 //!
 //! This test checks two properties:
-//!   1. `ipe::build` succeeds on a 20-bind do-block without error.
+//!   1. `ipe::build_fixture` succeeds on a 20-bind do-block without error.
 //!   2. The emitted `main.rs` contains `Box::new(move |` for continuations and
 //!      does NOT contain `__ipe_fn` type-annotation wrappers.
 
@@ -35,7 +35,7 @@ fn make_do_src(n: usize) -> String {
     src
 }
 
-/// `ipe::build` must succeed on a 20-bind do-block and the emitted Rust must
+/// `ipe::build_fixture` must succeed on a 20-bind do-block and the emitted Rust must
 /// use `Box::new(move |…|` for continuations (not `__ipe_fn` wrappers).
 #[test]
 fn deep_do_task_bind_emit_is_linear() {
@@ -45,19 +45,15 @@ fn deep_do_task_bind_emit_is_linear() {
 
     let src = make_do_src(N);
 
-    // Write source to a temp file.
     let out_dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("deep_do_task_bind");
     let _ = std::fs::remove_dir_all(&out_dir);
-    let src_dir = out_dir.join("src_input");
-    std::fs::create_dir_all(&src_dir).expect("create src dir");
-    let entry = src_dir.join("Main.ipe");
-    std::fs::write(&entry, &src).expect("write Main.ipe");
+    let fixture = ipe::RootFixture::main(&src).expect("write the project fixture");
 
     let emit_dir = out_dir.join("emit");
-    let built = ipe::build(&entry, &emit_dir, &runtime);
+    let built = ipe::build_fixture(&fixture, &emit_dir, &runtime);
     assert!(
         built.is_ok(),
-        "ipe::build must succeed for a {N}-bind do-block: {:?}",
+        "ipe::build_fixture must succeed for a {N}-bind do-block: {:?}",
         built.err()
     );
 
@@ -89,7 +85,7 @@ fn deep_do_task_bind_emit_is_linear() {
     let _ = std::fs::remove_dir_all(&out_dir);
 }
 
-/// `ipe::build` then `cargo build` must succeed on a 20-bind do-block.
+/// `ipe::build_fixture` then `cargo build` must succeed on a 20-bind do-block.
 /// Gated on `IPE_E2E=1` for the full cargo seal.
 #[test]
 fn deep_do_task_bind_e2e_seal() {
@@ -101,16 +97,13 @@ fn deep_do_task_bind_e2e_seal() {
 
         let out_dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("deep_do_task_bind_e2e");
         let _ = std::fs::remove_dir_all(&out_dir);
-        let src_dir = out_dir.join("src_input");
-        std::fs::create_dir_all(&src_dir).expect("create src dir");
-        let entry = src_dir.join("Main.ipe");
-        std::fs::write(&entry, &src).expect("write Main.ipe");
+        let fixture = ipe::RootFixture::main(&src).expect("write the project fixture");
 
         let emit_dir = out_dir.join("emit");
-        let built = ipe::build(&entry, &emit_dir, &runtime);
+        let built = ipe::build_fixture(&fixture, &emit_dir, &runtime);
         assert!(
             built.is_ok(),
-            "ipe::build must succeed for a {N}-bind do-block: {:?}",
+            "ipe::build_fixture must succeed for a {N}-bind do-block: {:?}",
             built.err()
         );
 

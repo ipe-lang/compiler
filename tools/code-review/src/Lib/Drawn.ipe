@@ -1,0 +1,600 @@
+module Lib.Drawn exposing (DrawnSource, Drawing(..), Hue(..), LayoutNote(..), Mode(..), Part(..), Piece(..), RowLine(..), Run(..), SourceRow(..), SpelledRow(..), drawing, elements, highlighted, layoutLine, layoutNotes, mode, notes, plain, rowLines, spelled, spelledGapMark, spelledGapText)
+
+import Ipe.Char as Char
+import Ipe.List as List
+import Ipe.String as String
+import Lib.Highlight as Highlight exposing (Layout, LeadingMark(..), LineEnds(..), Token(..))
+import Lib.SafeText as SafeText exposing (Segment(..))
+
+
+-- One row of a view: a source line with its 1-based number, or the marker
+-- standing for one run of lines child units cover.
+type SourceRow
+    = Numbered Int String
+    | Covered
+
+
+-- A view's source as it is drawn, built once when the view is judged: the
+-- notes on its file's layout, its drawing, and the number of elements
+-- drawing it takes. Opaque: built only by `highlighted`, `plain` and
+-- `spelled`, which count the elements of the drawing they build, so the
+-- count is the count of what is drawn.
+type DrawnSource
+    = DrawnSource { notes : List LayoutNote, drawing : Drawing, elements : Int }
+
+
+-- A view drawn with its tokens coloured; as plain text, each run of escapes
+-- its own marked element; or spelled out as one block of printable ASCII,
+-- every other character but a tab written as an escape and every `\` doubled,
+-- whose elements are a constant whatever the rows hold.
+type Drawing
+    = Colored (List (Part (List (List Run))))
+    | Uncolored (List (Part (List Piece)))
+    | Spelled (List SpelledRow)
+
+
+-- How a view is drawn, read off its `Drawing`.
+type Mode
+    = Highlighted
+    | Unhighlighted
+    | SpelledOut
+
+
+-- Consecutive numbered lines with their numbers and code, or one run of
+-- covered lines.
+type Part code
+    = LineRun (List Int) code
+    | CoveredRun
+
+
+-- One row of a spelled drawing: a numbered line's text, spelled through
+-- `SafeText.spelled` with each tab kept, or one run of covered lines.
+type SpelledRow
+    = SpelledLine Int (List Piece)
+    | SpelledGap
+
+
+-- Adjacent tokens of one colour.
+type Run
+    = Run Hue (List Piece)
+
+
+-- The colours a token draws in. Identifiers and other text share the code
+-- block's own colour, so a `TextHue` run draws without an element of its own.
+type Hue
+    = KeywordHue
+    | StringHue
+    | CommentHue
+    | NumberHue
+    | TextHue
+
+
+-- Text drawn as itself, or a run of escaped characters drawn as their
+-- escapes: display hazards, and in a spelled drawing `\` and every other
+-- character outside printable ASCII. No two `Chars` or two `Escapes` are
+-- adjacent, and a `Chars` is never empty.
+type Piece
+    = Chars String
+    | Escapes (List Char)
+
+
+notes : DrawnSource -> List LayoutNote
+notes drawn =
+    case drawn of
+        DrawnSource d ->
+            d.notes
+
+
+drawing : DrawnSource -> Drawing
+drawing drawn =
+    case drawn of
+        DrawnSource d ->
+            d.drawing
+
+
+mode : DrawnSource -> Mode
+mode drawn =
+    case drawing drawn of
+        Colored _ ->
+            Highlighted
+
+        Uncolored _ ->
+            Unhighlighted
+
+        Spelled _ ->
+            SpelledOut
+
+
+-- The elements drawing the view takes. Coloured or plain: one for the view,
+-- three for each line run (the run, its gutter, its code block), one for
+-- each covered run, one for each coloured line, one for each run not in the
+-- text colour, and one for each run of escapes. Spelled: four, the view, its
+-- one row, the gutter and the code block, whatever the rows hold. Every text
+-- node sits inside one of them, at most one per element.
+elements : DrawnSource -> Int
+elements drawn =
+    case drawn of
+        DrawnSource d ->
+            d.elements
+
+
+-- The text a spelled drawing's code block holds for one run of covered
+-- lines. It starts with `\` and is no escape `SafeText.spelled` writes, so
+-- no source line spells it.
+spelledGapText : String
+spelledGapText =
+    "\\…"
+
+
+-- The gutter entry beside `spelledGapText`.
+spelledGapMark : String
+spelledGapMark =
+    "⋮"
+
+
+-- The rows drawn with their tokens coloured.
+highlighted : Highlight.Lang -> List SourceRow -> DrawnSource
+highlighted lang rows =
+    drawnOf lang rows (Colored (List.map coloredPart (groupRuns rowLineEntry (rowLines lang rows))))
+
+
+-- The rows drawn as plain text: the same escapes and display order, no
+-- colours, so a run's text is one sequence of pieces.
+plain : Highlight.Lang -> List SourceRow -> DrawnSource
+plain lang rows =
+    let
+        layout =
+            Highlight.layoutOf lang
+    in
+    drawnOf lang rows (Uncolored (List.map plainPart (groupRuns (rowEntry layout) rows)))
+
+
+-- The rows spelled out: each line's text through `SafeText.spelled`, each
+-- tab kept, in byte order, each covered run as `spelledGapText`.
+spelled : Highlight.Lang -> List SourceRow -> DrawnSource
+spelled lang rows =
+    let
+        layout =
+            Highlight.layoutOf lang
+    in
+    drawnOf lang rows (Spelled (List.map (spelledRow layout) rows))
+
+
+spelledRow : Layout -> SourceRow -> SpelledRow
+spelledRow layout row =
+    case row of
+        Numbered n line ->
+            SpelledLine n (piecesOf (tabbedRaws (List.map SafeText.spelled (String.split "\t" (layoutLine layout n line)))))
+
+        Covered ->
+            SpelledGap
+
+
+drawnOf : Highlight.Lang -> List SourceRow -> Drawing -> DrawnSource
+drawnOf lang rows drawn =
+    DrawnSource
+        { notes = layoutNotes lang rows
+        , drawing = drawn
+        , elements = drawingElements drawn
+        }
+
+
+drawingElements : Drawing -> Int
+drawingElements drawn =
+    case drawn of
+        Colored drawnParts ->
+            1 + List.sum (List.map (partElements coloredElements) drawnParts)
+
+        Uncolored drawnParts ->
+            1 + List.sum (List.map (partElements escapeElements) drawnParts)
+
+        Spelled _ ->
+            4
+
+
+partElements : (code -> Int) -> Part code -> Int
+partElements codeElements part =
+    case part of
+        LineRun _ code ->
+            3 + codeElements code
+
+        CoveredRun ->
+            1
+
+
+coloredElements : List (List Run) -> Int
+coloredElements lines =
+    List.sum (List.map (\line -> 1 + List.sum (List.map runElements line)) lines)
+
+
+runElements : Run -> Int
+runElements run =
+    case run of
+        Run TextHue pieces ->
+            escapeElements pieces
+
+        Run _ pieces ->
+            1 + escapeElements pieces
+
+
+escapeElements : List Piece -> Int
+escapeElements pieces =
+    List.length (List.filter isEscapes pieces)
+
+
+isEscapes : Piece -> Bool
+isEscapes piece =
+    case piece of
+        Escapes _ ->
+            True
+
+        Chars _ ->
+            False
+
+
+-- Consecutive numbered lines, or one covered run.
+type Group a
+    = Lines (List ( Int, a ))
+    | Gap
+
+
+-- The rows in order as runs of numbered lines and covered runs. Each item is
+-- added at the end of its list, which moves the list, so the fold is linear.
+groupRuns : (r -> Maybe ( Int, a )) -> List r -> List (Group a)
+groupRuns entry rows =
+    case List.foldl (groupStep entry) ( [], [] ) rows of
+        ( run, groups ) ->
+            closeRun run groups
+
+
+groupStep : (r -> Maybe ( Int, a )) -> r -> ( List ( Int, a ), List (Group a) ) -> ( List ( Int, a ), List (Group a) )
+groupStep entry row ( run, groups ) =
+    case entry row of
+        Just line ->
+            ( run ++ [ line ], groups )
+
+        Nothing ->
+            ( [], closeRun run groups ++ [ Gap ] )
+
+
+closeRun : List ( Int, a ) -> List (Group a) -> List (Group a)
+closeRun run groups =
+    case run of
+        [] ->
+            groups
+
+        _ ->
+            groups ++ [ Lines run ]
+
+
+rowLineEntry : RowLine -> Maybe ( Int, List Token )
+rowLineEntry row =
+    case row of
+        TokenLine n toks ->
+            Just ( n, toks )
+
+        CoveredLine ->
+            Nothing
+
+
+rowEntry : Layout -> SourceRow -> Maybe ( Int, String )
+rowEntry layout row =
+    case row of
+        Numbered n line ->
+            Just ( n, layoutLine layout n line )
+
+        Covered ->
+            Nothing
+
+
+coloredPart : Group (List Token) -> Part (List (List Run))
+coloredPart group =
+    case group of
+        Lines run ->
+            LineRun (List.map (\( n, _ ) -> n) run) (List.map (\( _, toks ) -> lineRuns toks) run)
+
+        Gap ->
+            CoveredRun
+
+
+plainPart : Group String -> Part (List Piece)
+plainPart group =
+    case group of
+        Lines run ->
+            LineRun (List.map (\( n, _ ) -> n) run) (piecesOf (List.concat (List.intersperse [ RawChars "\n" ] (List.map (\( _, line ) -> textRaws line) run))))
+
+        Gap ->
+            CoveredRun
+
+
+-- A line's tokens as runs of one colour: adjacent tokens whose colour is the
+-- same draw as one run.
+lineRuns : List Token -> List Run
+lineRuns toks =
+    case List.foldl runStep ( TextHue, [], [] ) toks of
+        ( hue, raws, runs ) ->
+            closeHueRun hue raws runs
+
+
+runStep : Token -> ( Hue, List Raw, List Run ) -> ( Hue, List Raw, List Run )
+runStep tok ( hue, raws, runs ) =
+    let
+        tokHue =
+            hueOf tok
+    in
+    if tokHue == hue || List.isEmpty raws then
+        ( tokHue, raws ++ tokenRaws tok, runs )
+
+    else
+        ( tokHue, tokenRaws tok, closeHueRun hue raws runs )
+
+
+closeHueRun : Hue -> List Raw -> List Run -> List Run
+closeHueRun hue raws runs =
+    case piecesOf raws of
+        [] ->
+            runs
+
+        pieces ->
+            runs ++ [ Run hue pieces ]
+
+
+hueOf : Token -> Hue
+hueOf tok =
+    case tok of
+        Keyword _ ->
+            KeywordHue
+
+        Str _ ->
+            StringHue
+
+        Comment _ ->
+            CommentHue
+
+        Num _ ->
+            NumberHue
+
+        Ident _ ->
+            TextHue
+
+        Plain _ ->
+            TextHue
+
+
+-- A piece before adjacent pieces of one kind merge.
+type Raw
+    = RawChars String
+    | RawEscape Char
+
+
+-- A token's text through the untrusted-text sink, each tab kept as the tab
+-- it is.
+tokenRaws : Token -> List Raw
+tokenRaws tok =
+    tabbedRaws (Highlight.tokenRuns tok)
+
+
+-- A text's tab-free stretches, each already through a sink, joined by the
+-- tabs between them kept raw.
+tabbedRaws : List SafeText.SafeText -> List Raw
+tabbedRaws stretches =
+    List.concat (List.intersperse [ RawChars "\t" ] (List.map safeRaws stretches))
+
+
+-- A line's text as one plain token's.
+textRaws : String -> List Raw
+textRaws line =
+    tokenRaws (Plain line)
+
+
+safeRaws : SafeText.SafeText -> List Raw
+safeRaws text =
+    List.map segmentRaw (SafeText.segments text)
+
+
+segmentRaw : Segment -> Raw
+segmentRaw seg =
+    case seg of
+        Verbatim s ->
+            RawChars s
+
+        Escaped c ->
+            RawEscape c
+
+
+-- Adjacent text merged into one `Chars`, adjacent escapes into one
+-- `Escapes`, empty text dropped. Linear in the pieces.
+piecesOf : List Raw -> List Piece
+piecesOf raws =
+    case List.foldl pieceStep ( NoPending, [] ) raws of
+        ( pending, pieces ) ->
+            flushPending pending pieces
+
+
+type Pending
+    = NoPending
+    | PendingChars (List String)
+    | PendingEscapes (List Char)
+
+
+pieceStep : Raw -> ( Pending, List Piece ) -> ( Pending, List Piece )
+pieceStep raw ( pending, pieces ) =
+    case raw of
+        RawChars s ->
+            if String.isEmpty s then
+                ( pending, pieces )
+
+            else
+                case pending of
+                    PendingChars texts ->
+                        ( PendingChars (texts ++ [ s ]), pieces )
+
+                    NoPending ->
+                        ( PendingChars [ s ], pieces )
+
+                    PendingEscapes cs ->
+                        ( PendingChars [ s ], pieces ++ [ Escapes cs ] )
+
+        RawEscape c ->
+            case pending of
+                PendingEscapes cs ->
+                    ( PendingEscapes (cs ++ [ c ]), pieces )
+
+                NoPending ->
+                    ( PendingEscapes [ c ], pieces )
+
+                PendingChars texts ->
+                    ( PendingEscapes [ c ], pieces ++ [ Chars (String.concat texts) ] )
+
+
+flushPending : Pending -> List Piece -> List Piece
+flushPending pending pieces =
+    case pending of
+        NoPending ->
+            pieces
+
+        PendingChars texts ->
+            pieces ++ [ Chars (String.concat texts) ]
+
+        PendingEscapes cs ->
+            pieces ++ [ Escapes cs ]
+
+
+-- What the source view draws as layout rather than as text: a leading
+-- byte-order mark the language skips, or CRLF line ends it reads as line
+-- breaks.
+type LayoutNote
+    = ByteOrderMark
+    | CrlfLineEnds
+
+
+layoutNotes : Highlight.Lang -> List SourceRow -> List LayoutNote
+layoutNotes lang rows =
+    let
+        layout =
+            Highlight.layoutOf lang
+    in
+    noteIf (List.any (leadingMarkRow layout) rows) ByteOrderMark ++ noteIf (List.any (crlfRow layout) rows) CrlfLineEnds
+
+
+noteIf : Bool -> LayoutNote -> List LayoutNote
+noteIf present note =
+    if present then
+        [ note ]
+
+    else
+        []
+
+
+leadingMarkRow : Layout -> SourceRow -> Bool
+leadingMarkRow layout row =
+    case row of
+        Numbered n line ->
+            startsWithLayoutMark layout n line
+
+        Covered ->
+            False
+
+
+crlfRow : Layout -> SourceRow -> Bool
+crlfRow layout row =
+    case row of
+        Numbered _ line ->
+            endsWithLayoutCr layout line
+
+        Covered ->
+            False
+
+
+-- A shown row with its tokens: a numbered line, or a covered run.
+type RowLine
+    = TokenLine Int (List Token)
+    | CoveredLine
+
+
+-- The rows of a view with each line's tokens. A run of numbered rows is
+-- lexed as one text, a line's open lexeme (a block comment, a string that
+-- spans lines) carried into the next row, so a comment or string reads the
+-- same whatever line it starts on; a covered run starts afresh. Each line is
+-- added at the end of the list, which moves it, so the fold is linear in the
+-- rows' text.
+rowLines : Highlight.Lang -> List SourceRow -> List RowLine
+rowLines lang rows =
+    case List.foldl (rowLineStep lang (Highlight.layoutOf lang)) ( Highlight.lineStart, [] ) rows of
+        ( _, lines ) ->
+            lines
+
+
+rowLineStep : Highlight.Lang -> Layout -> SourceRow -> ( Highlight.Carry, List RowLine ) -> ( Highlight.Carry, List RowLine )
+rowLineStep lang layout row ( carry, lines ) =
+    case row of
+        Numbered n line ->
+            case Highlight.lexLine lang carry (layoutLine layout n line) of
+                ( toks, next ) ->
+                    ( next, lines ++ [ TokenLine n toks ] )
+
+        Covered ->
+            ( Highlight.lineStart, lines ++ [ CoveredLine ] )
+
+
+-- Line `n` without what its language's layout says is not text: the `\r`
+-- of a CRLF ending where a CRLF is one line break, and a byte-order mark
+-- opening line 1 where the compiler skips it. Where the layout says either
+-- is text (shell, where `cd dir\r` names another directory, and a language
+-- with no grammar), it stays, drawn as the escape every other hazard is.
+layoutLine : Layout -> Int -> String -> String
+layoutLine layout n line =
+    withoutLineEnd layout (withoutLeadingMark layout n line)
+
+
+withoutLineEnd : Layout -> String -> String
+withoutLineEnd layout line =
+    if endsWithLayoutCr layout line then
+        String.dropRight 1 line
+
+    else
+        line
+
+
+withoutLeadingMark : Layout -> Int -> String -> String
+withoutLeadingMark layout n line =
+    if startsWithLayoutMark layout n line then
+        String.dropLeft 1 line
+
+    else
+        line
+
+
+endsWithLayoutCr : Layout -> String -> Bool
+endsWithLayoutCr layout line =
+    crlfIsLineBreak layout.lineEnds && String.endsWith "\r" line
+
+
+startsWithLayoutMark : Layout -> Int -> String -> Bool
+startsWithLayoutMark layout n line =
+    n == 1 && skipsLeadingMark layout.leadingMark && String.startsWith byteOrderMark line
+
+
+byteOrderMark : String
+byteOrderMark =
+    String.fromChar (Char.fromCode 65279)
+
+
+skipsLeadingMark : LeadingMark -> Bool
+skipsLeadingMark mark =
+    case mark of
+        MarkSkipped ->
+            True
+
+        MarkIsText ->
+            False
+
+
+crlfIsLineBreak : LineEnds -> Bool
+crlfIsLineBreak ends =
+    case ends of
+        CrlfIsOneBreak ->
+            True
+
+        CrIsText ->
+            False

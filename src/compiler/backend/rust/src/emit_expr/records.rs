@@ -34,7 +34,7 @@ pub fn emit_record(
     let (struct_name, is_server_response) = record_struct_name(ctx, fields, ty)?;
     let mut parts = Vec::with_capacity(fields.len() + usize::from(is_server_response));
     for (sym, value) in fields {
-        let field_ident = ctx.emit_ident(*sym)?;
+        let field_ident = ctx.emit_member_ident(*sym)?;
         let rendered = emit_expr_at(ctx, value, indent, child, generics)?;
         parts.push(format!("{field_ident}: {rendered}"));
     }
@@ -268,7 +268,7 @@ pub fn emit_update(
     let mut binds = Vec::with_capacity(fields.len());
     let mut assigns = Vec::with_capacity(fields.len());
     for (i, (sym, value)) in fields.iter().enumerate() {
-        let field_ident = ctx.emit_ident(*sym)?;
+        let field_ident = ctx.emit_member_ident(*sym)?;
         let rendered = emit_expr_at(ctx, value, indent, child, generics)?;
         binds.push(format!(" let __ipe_upd_{i} = {rendered};"));
         assigns.push(format!(" __ipe_rec.{field_ident} = __ipe_upd_{i};"));

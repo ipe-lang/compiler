@@ -7,6 +7,5 @@ package : Package
 package =
     { name = "bevy-game"
     , version = "0.1.0"
-    , rustDependencies =
-        [ rustDep "bevy_ecs" "=0.19.0" ]
+    , rustDependencies = [ rustDep "bevy_ecs" "=0.19.0" ]
     }

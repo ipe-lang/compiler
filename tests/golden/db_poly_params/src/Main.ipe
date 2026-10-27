@@ -1,0 +1,48 @@
+module Main exposing (main)
+import Ipe.Io as Io
+import Ipe.Db
+import Ipe.Db.Location as Location
+import Ipe.Db.Unsafe
+import Ipe.List
+import Ipe.String
+import Ipe.Task
+
+-- T0001 regression (IPE-T0001 poly-params fix):
+--   `Db.exec` / `Unsafe.unsafeQuery` accept `List a` (polymorphic params), so callers may
+--   pass `List Int`, `List String`, or `List SqlValue` without a type mismatch.
+--
+-- This program exercises THREE param-list shapes in a single `Db.withTransaction`:
+--
+--   (a) `List Int`      — regression guard for examples/18-job-queue-style calls
+--   (b) `List String`   — regression guard for examples/17-ipemon-style calls
+--   (c) mixed `List SqlValue` (SqlString + SqlInt + SqlBool + SqlNull) —
+--       the canonical mixed-type path that triggered the original limitation
+--
+-- Expected output (one line): "3"  (three rows inserted and queried back)
+
+main =
+    Task.andThen
+        (\conn ->
+            Db.withTransaction conn
+                (\txconn ->
+                    do
+                        Unsafe.unsafeExecRaw txconn
+                            "CREATE TABLE t (v TEXT)"
+                        -- (a) List Int params — T0001 regression
+                        Db.exec txconn
+                            "INSERT INTO t (v) VALUES (CAST(? AS TEXT))"
+                            [ 1 ]
+                        -- (b) List String params — T0001 regression
+                        Db.exec txconn
+                            "INSERT INTO t (v) VALUES (?)"
+                            [ "hello" ]
+                        -- (c) mixed SqlValue params: SqlString + SqlInt + SqlBool + SqlNull
+                        Db.exec txconn
+                            "INSERT INTO t (v) VALUES (COALESCE(?, CAST(? AS TEXT), CAST(? AS TEXT)))"
+                            [ SqlNull (SqlString ""), SqlInt 42, SqlBool True ]
+                        Task.andThen
+                            (\rows -> Io.println (String.fromInt (List.length rows)))
+                            (Unsafe.unsafeQuery txconn "SELECT v FROM t" [])
+                )
+        )
+        (Db.open Location.memory)

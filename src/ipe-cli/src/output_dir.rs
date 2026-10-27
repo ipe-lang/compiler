@@ -46,6 +46,9 @@
 use std::io::Write as _;
 use std::path::{Component, Path, PathBuf};
 
+use ipe_canon::const_str_eq;
+use ipe_sandbox::VcsKind;
+
 use crate::{CliError, io_err, text};
 
 pub(crate) mod held;
@@ -71,16 +74,29 @@ const MAX_CLAIM_POLLS: u32 = 200;
 const _: () = assert!(MAX_CLAIM_POLLS > 0);
 
 /// The per-project namespace directory ipe keeps its caches in.
-pub const CACHE_NAMESPACE_DIR: &str = ".ipe";
+pub const CACHE_NAMESPACE_DIR: &str = ipe_ffi::driver::CACHE_NAMESPACE_DIR;
+
+/// The package cache entry inside [`CACHE_NAMESPACE_DIR`].
+pub const PACKAGES_SUBDIR: &str = "packages";
 
 /// A directory name no output may sit under, whichever project it belongs to.
 ///
-/// Matched per path component, ASCII case-insensitively (fail closed on a
-/// case-insensitive filesystem).
+/// Matched per path component as a case-folding volume may open it
+/// ([`ipe_fs_open::may_open_as`]), fail closed on a case-sensitive one.
+/// The set is closed: every variant has a directory name and a version-control
+/// kind through an exhaustive `match`, and a build-time check ties
+/// [`ReservedName::ALL`] to the declaration order, so none lacks a slot.
+/// `CacheNamespace` stays the last variant.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReservedName {
-    /// Version-control metadata (`.git`).
-    Vcs,
+    /// Git metadata (`.git`).
+    Git,
+    /// Mercurial metadata (`.hg`).
+    Mercurial,
+    /// Jujutsu metadata (`.jj`).
+    Jujutsu,
+    /// Darcs metadata (`_darcs`).
+    Darcs,
     /// An ipe cache namespace ([`CACHE_NAMESPACE_DIR`]).
     ///
     /// `ipe clean` and the FFI binding regeneration delete its contents by name
@@ -90,26 +106,238 @@ pub enum ReservedName {
 }
 
 impl ReservedName {
-    /// Every reserved name.
-    const ALL: [Self; 2] = [Self::Vcs, Self::CacheNamespace];
+    /// Every reserved name, once each, in declaration order.
+    const ALL: [Self; Self::CacheNamespace as usize + 1] = [
+        Self::Git,
+        Self::Mercurial,
+        Self::Jujutsu,
+        Self::Darcs,
+        Self::CacheNamespace,
+    ];
 
     /// The reserved directory name.
     #[must_use]
     pub const fn dir_name(self) -> &'static str {
         match self {
-            Self::Vcs => ".git",
+            Self::Git => VcsKind::Git.entry_name(),
+            Self::Mercurial => VcsKind::Mercurial.entry_name(),
+            Self::Jujutsu => VcsKind::Jujutsu.entry_name(),
+            Self::Darcs => VcsKind::Darcs.entry_name(),
             Self::CacheNamespace => CACHE_NAMESPACE_DIR,
         }
     }
 
-    /// The reserved name `component` spells, in any ASCII case.
-    fn of(component: &std::ffi::OsStr) -> Option<Self> {
-        let name = component.to_string_lossy();
-        Self::ALL
-            .into_iter()
-            .find(|reserved| name.eq_ignore_ascii_case(reserved.dir_name()))
+    /// The version-control system whose metadata the name holds, if any.
+    const fn vcs(self) -> Option<VcsKind> {
+        match self {
+            Self::Git => Some(VcsKind::Git),
+            Self::Mercurial => Some(VcsKind::Mercurial),
+            Self::Jujutsu => Some(VcsKind::Jujutsu),
+            Self::Darcs => Some(VcsKind::Darcs),
+            Self::CacheNamespace => None,
+        }
     }
 }
+
+// IPE-RUST-AUDIT:ACCEPTED (Arthur Maciel) — compile-time `const` assertion (not a runtime panic); fails the BUILD if `ALL` drifts from the variant order [ledger #boundary]
+const _: () = assert!({
+    let mut rest = ReservedName::ALL.as_slice();
+    let mut slot = 0;
+    let mut in_order = true;
+    while let [head, tail @ ..] = rest {
+        in_order = in_order && *head as usize == slot;
+        slot += 1;
+        rest = tail;
+    }
+    in_order
+});
+
+impl ReservedName {
+    /// The reserved name a case-folding volume may open `component` as
+    /// ([`ipe_fs_open::may_open_as`]).
+    fn of(component: &std::ffi::OsStr) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|reserved| ipe_fs_open::may_open_as(component, reserved.dir_name()))
+    }
+}
+
+/// Whether no two reserved names are equal in any ASCII case.
+const fn reserved_names_distinct() -> bool {
+    let mut rows: &[ReservedName] = &ReservedName::ALL;
+    while let [row, rest @ ..] = rows {
+        let mut others = rest;
+        while let [other, tail @ ..] = others {
+            if row
+                .dir_name()
+                .as_bytes()
+                .eq_ignore_ascii_case(other.dir_name().as_bytes())
+            {
+                return false;
+            }
+            others = tail;
+        }
+        rows = rest;
+    }
+    true
+}
+
+/// Whether every reserved name is one plain path component on every platform.
+///
+/// Non-empty, neither `.` nor `..`, ASCII, and free of `/`, `\`, `:` and NUL.
+const fn reserved_names_plain() -> bool {
+    let mut rows: &[ReservedName] = &ReservedName::ALL;
+    while let [row, rest @ ..] = rows {
+        let name = row.dir_name().as_bytes();
+        if matches!(name, [] | [b'.'] | [b'.', b'.']) {
+            return false;
+        }
+        let mut bytes = name;
+        while let [byte, tail @ ..] = bytes {
+            if !byte.is_ascii() || matches!(*byte, b'/' | b'\\' | b':' | 0) {
+                return false;
+            }
+            bytes = tail;
+        }
+        rows = rest;
+    }
+    true
+}
+
+/// Whether every version-control kind has a reserved row named as the kind names its metadata.
+///
+/// A row that claims a kind under any other name fails too.
+const fn every_vcs_kind_reserved() -> bool {
+    let mut rows: &[ReservedName] = &ReservedName::ALL;
+    while let [row, rest @ ..] = rows {
+        if let Some(kind) = row.vcs()
+            && !const_str_eq(row.dir_name(), kind.entry_name())
+        {
+            return false;
+        }
+        rows = rest;
+    }
+    let mut kinds: &[VcsKind] = &VcsKind::ALL;
+    while let [kind, rest @ ..] = kinds {
+        if !reserves_vcs_kind(*kind) {
+            return false;
+        }
+        kinds = rest;
+    }
+    true
+}
+
+/// Whether some reserved row names `kind` and its metadata entry.
+const fn reserves_vcs_kind(kind: VcsKind) -> bool {
+    let mut rows: &[ReservedName] = &ReservedName::ALL;
+    while let [row, rest @ ..] = rows {
+        if let Some(named) = row.vcs()
+            && const_str_eq(named.entry_name(), kind.entry_name())
+            && const_str_eq(row.dir_name(), kind.entry_name())
+        {
+            return true;
+        }
+        rows = rest;
+    }
+    false
+}
+
+/// Whether `names` holds `name`, byte for byte.
+const fn lists_name(names: &[&str], name: &str) -> bool {
+    let mut rest = names;
+    while let [listed, tail @ ..] = rest {
+        if const_str_eq(listed, name) {
+            return true;
+        }
+        rest = tail;
+    }
+    false
+}
+
+// IPE-RUST-AUDIT:ACCEPTED (Arthur Maciel) — compile-time `const` assertion (not a runtime panic); fails the BUILD if two reserved names collide in any ASCII case [ledger #boundary]
+const _: () = assert!(reserved_names_distinct());
+// IPE-RUST-AUDIT:ACCEPTED (Arthur Maciel) — compile-time `const` assertion (not a runtime panic); fails the BUILD if a reserved name is not one plain path component [ledger #boundary]
+const _: () = assert!(reserved_names_plain());
+// IPE-RUST-AUDIT:ACCEPTED (Arthur Maciel) — compile-time `const` assertion (not a runtime panic); fails the BUILD if a version-control kind has no reserved row [ledger #boundary]
+const _: () = assert!(every_vcs_kind_reserved());
+// The watcher cannot import this crate, so its copies of the layout names are asserted equal here.
+// IPE-RUST-AUDIT:ACCEPTED (Arthur Maciel) — compile-time `const` assertion (not a runtime panic); fails the BUILD if the watcher's excluded directories or manifest name drift from the project layout [ledger #boundary]
+const _: () = assert!(
+    lists_name(ipe_watch::scope::EXCLUDED_DIR_NAMES, CACHE_NAMESPACE_DIR)
+        && lists_name(
+            ipe_watch::scope::EXCLUDED_DIR_NAMES,
+            crate::cache::CACHE_DIR_NAME
+        )
+        && lists_name(ipe_watch::scope::EXCLUDED_DIR_NAMES, DEFAULT_OUTPUT_DIR)
+        && const_str_eq(
+            ipe_watch::scope::MANIFEST_FILE,
+            crate::package_manifest::PACKAGE_IPE
+        )
+);
+
+/// Whether `a` and `b` hold the same names in the same order, byte for byte.
+#[cfg(test)]
+const fn same_names(a: &[&str], b: &[&str]) -> bool {
+    let (mut a, mut b) = (a, b);
+    loop {
+        match (a, b) {
+            ([], []) => return true,
+            ([x, a_tail @ ..], [y, b_tail @ ..]) if const_str_eq(x, y) => {
+                a = a_tail;
+                b = b_tail;
+            }
+            _ => return false,
+        }
+    }
+}
+
+/// Whether `a` and `b` hold the same component paths in the same order, component by component.
+#[cfg(test)]
+const fn same_markers(a: &[&[&str]], b: &[&[&str]]) -> bool {
+    let (mut a, mut b) = (a, b);
+    loop {
+        match (a, b) {
+            ([], []) => return true,
+            ([x, a_tail @ ..], [y, b_tail @ ..]) if same_names(x, y) => {
+                a = a_tail;
+                b = b_tail;
+            }
+            _ => return false,
+        }
+    }
+}
+
+/// Whether `names` are the [`ReservedName::ALL`] directory names, in order.
+#[cfg(test)]
+const fn reserved_names_are(names: &[&str]) -> bool {
+    let (mut rows, mut names): (&[ReservedName], &[&str]) = (&ReservedName::ALL, names);
+    loop {
+        match (rows, names) {
+            ([], []) => return true,
+            ([row, rows_tail @ ..], [name, names_tail @ ..])
+                if const_str_eq(row.dir_name(), name) =>
+            {
+                rows = rows_tail;
+                names = names_tail;
+            }
+            _ => return false,
+        }
+    }
+}
+
+// The test temp root cannot import this crate, so its copies of the project markers and reserved names are asserted equal here.
+#[cfg(test)]
+// IPE-RUST-AUDIT:ACCEPTED (Arthur Maciel) — compile-time `const` assertion (not a runtime panic); fails the test BUILD if the temp-root proof's markers or reserved names drift from the project layout [ledger #boundary]
+const _: () = assert!(
+    same_markers(
+        &ipe_test_temp::PROJECT_MARKERS,
+        &[
+            &[crate::package_manifest::PACKAGE_IPE],
+            &[crate::project::IPE_TOML],
+            &ipe_ffi::driver::FFI_CACHE_COMPONENTS,
+        ]
+    ) && reserved_names_are(&ipe_test_temp::RESERVED_COMPONENTS)
+);
 
 /// The first line of every [`OWNERSHIP_MARKER`].
 ///
@@ -196,12 +424,32 @@ pub enum OutputRefusal {
     /// A Windows drive-relative path (`C:x`) depends on a per-drive working
     /// directory, and a `/` inside a verbatim (`\\?\`) component is a separator
     /// on some platforms and part of a name on others. A `.` or `..` inside a
-    /// verbatim path is a literal name there, not a step; a device namespace
-    /// (`\\.\pipe`) or another non-disk verbatim root (`\\?\GLOBALROOT`)
-    /// names no directory tree; and Windows opens a name with a trailing `.` or
-    /// space, a `:`, or a device stem (`NUL`, `COM1`) as some other entry than
-    /// the one spelled.
+    /// verbatim path is a literal name there, not a step. The prefix must be
+    /// an `ipe_fs_open::PlaceablePrefix`: a drive, or a `\\server\share` whose
+    /// server and share Windows each opens as spelled (a host, computer,
+    /// `wsl$` or web-folder server name); a device namespace (`\\.\pipe`) or
+    /// another verbatim root (`\\?\GLOBALROOT`, `\\?\Volume{..}`) names no
+    /// directory tree. And Windows opens a name with a trailing `.` or space, a
+    /// `:`, or a device stem (`NUL`, `COM1`) as some other entry than the one
+    /// spelled.
     Unplaceable(PathBuf),
+    /// The working directory a relative request is walked on from names no single absolute place.
+    ///
+    /// The same rules as [`OutputRefusal::Unplaceable`] hold for the part of
+    /// the walk the working directory supplies; the cause is the working
+    /// directory (a `\\?\Volume{..}` path, a device namespace, a rooted `\x`
+    /// with no drive to stand on), so it is named, not the request.
+    UnplaceableCwd {
+        /// The working directory.
+        cwd: PathBuf,
+        /// The request walked on from it.
+        request: PathBuf,
+    },
+    /// A listed entry has a name no held handle can open, so ipe cannot inspect or remove it.
+    ///
+    /// On Windows a name that is not valid Unicode, or one Win32 reserves,
+    /// cannot be opened handle-relative; the directory is left untouched.
+    UnnameableEntry(PathBuf),
     /// An ejected project must go to a fresh (absent or empty) directory.
     ///
     /// The result is handed to the user, so nothing already there may be replaced.
@@ -282,14 +530,22 @@ impl std::fmt::Display for OutputRefusal {
             }
             Self::InsideReservedDir {
                 out,
-                reserved: ReservedName::Vcs,
-            } => text::output_inside_vcs(&out.display()),
+                reserved:
+                    reserved @ (ReservedName::Git
+                    | ReservedName::Mercurial
+                    | ReservedName::Jujutsu
+                    | ReservedName::Darcs),
+            } => text::output_inside_vcs(&out.display(), &reserved.dir_name()),
             Self::InsideReservedDir {
                 out,
                 reserved: ReservedName::CacheNamespace,
             } => text::output_inside_cache_namespace(&out.display(), &CACHE_NAMESPACE_DIR),
             Self::ParentTraversal(p) => text::output_parent_traversal(&p.display()),
             Self::Unplaceable(p) => text::output_unplaceable(&p.display()),
+            Self::UnplaceableCwd { cwd, request } => {
+                text::output_unplaceable_cwd(&cwd.display(), &request.display())
+            }
+            Self::UnnameableEntry(p) => text::output_unnameable_entry(&p.display()),
             Self::NotFresh(p) => text::output_not_fresh(&p.display()),
             Self::UnsafeComponent(p) => text::output_unsafe_component(&p.display()),
             Self::OutsideProject { path, root } => {
@@ -642,6 +898,29 @@ fn claim_in(parent: &held::HeldDir, name: &std::ffi::OsStr) -> Result<held::Held
     Ok(dir)
 }
 
+/// The one mtime every scratch runtime bundle file carries.
+///
+/// Its freshness is then its content alone: cargo's mtime check never sees a
+/// newer file, and the bundle's content digest, stamped into its version, is
+/// the unit's identity. Non-zero, since zero is a sentinel to some tools.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BundleMtime(std::time::Duration);
+
+/// The pinned mtime of a scratch runtime bundle file: one billion seconds after the epoch.
+pub const BUNDLE_MTIME: BundleMtime = BundleMtime(std::time::Duration::from_secs(1_000_000_000));
+
+impl BundleMtime {
+    /// The instant.
+    ///
+    /// # Errors
+    /// An I/O error when the host clock cannot represent it.
+    pub fn at(self) -> std::io::Result<std::time::SystemTime> {
+        std::time::UNIX_EPOCH
+            .checked_add(self.0)
+            .ok_or_else(|| std::io::Error::other("the pinned bundle mtime is not representable"))
+    }
+}
+
 /// A path under an [`OwnedDir`] with no symlink at any level.
 ///
 /// Built only by [`OwnedDir::path_to`]. Every operation re-walks the levels
@@ -674,6 +953,20 @@ impl OwnedPath {
     /// filesystem failure.
     pub fn write(&self, contents: &[u8]) -> Result<(), CliError> {
         self.replace_with(None, |file| file.write_all(contents))
+    }
+
+    /// Replace the file with `contents`, atomically, its mtime set to `mtime`.
+    ///
+    /// The mtime is set on the exclusive temp file before the rename, so the
+    /// entry never shows the contents under another mtime.
+    ///
+    /// # Errors
+    /// As [`OwnedPath::write`].
+    pub fn write_pinned(&self, contents: &[u8], mtime: BundleMtime) -> Result<(), CliError> {
+        self.replace_with(None, |file| {
+            file.write_all(contents)?;
+            file.set_modified(mtime.at()?)
+        })
     }
 
     /// Replace the file with a copy of `source`, carrying its permission bits.
@@ -748,11 +1041,25 @@ impl OwnedPath {
     /// Check every existing level, final entry included; create nothing.
     fn check(&self) -> Result<(), CliError> {
         match self.held_parent(false)? {
-            Some((dir, name)) if dir.kind_of(name)? == held::EntryKind::Symlink => {
+            Some((dir, name)) if dir.kind_of(&dir.entry(name)?)? == held::EntryKind::Symlink => {
                 Err(OutputRefusal::Symlink(self.path()).into())
             }
             Some(_) | None => Ok(()),
         }
+    }
+
+    /// The final entry's kind, read through the held level above it without following a link.
+    ///
+    /// A missing level above the entry reads as [`held::EntryKind::Absent`].
+    ///
+    /// # Errors
+    /// [`CliError::OutputRefused`] for a symlink above the entry or a replaced
+    /// root; [`CliError::Io`] on a filesystem failure.
+    pub(crate) fn entry_kind(&self) -> Result<held::EntryKind, CliError> {
+        self.held_parent(false)?
+            .map_or(Ok(held::EntryKind::Absent), |(dir, name)| {
+                dir.kind_of(&dir.entry(name)?)
+            })
     }
 
     /// Create the directory itself (and every missing level above it).
@@ -805,7 +1112,7 @@ impl OwnedPath {
         let Some((dir, name)) = self.held_parent(false)? else {
             return Ok(false);
         };
-        if dir.kind_of(name)? == held::EntryKind::Symlink {
+        if dir.kind_of(&dir.entry(name)?)? == held::EntryKind::Symlink {
             return Err(OutputRefusal::Symlink(self.path()).into());
         }
         Ok(dir.holds_contents(name, contents))
@@ -1233,6 +1540,14 @@ impl AreaClaim {
     }
 }
 
+/// The root of a private scratch directory, as an [`EmitTarget`].
+///
+/// Built only by [`EmitTarget::in_scratch`] from a borrowed
+/// [`crate::scratch::ScratchDir`], the proof the directory was created
+/// exclusively, unpredictably named, owner-only, and fresh.
+#[derive(Debug, Clone)]
+pub struct ScratchArea(AreaClaim);
+
 /// Where an emitted project is written: an area still to claim, or a directory already claimed.
 ///
 /// Every variant carries a disjointness proof; a bare path cannot name a
@@ -1243,6 +1558,8 @@ pub enum EmitTarget {
     Area(AreaClaim),
     /// A directory claimed earlier, proven still the same when written.
     Claimed(OwnedDir),
+    /// The root of a private scratch directory.
+    Scratch(ScratchArea),
 }
 
 impl EmitTarget {
@@ -1258,13 +1575,38 @@ impl EmitTarget {
         Ok(Self::Area(OutputRoot::at(out_dir, project)?.area(&[])))
     }
 
+    /// The root of `scratch` as a target, proven disjoint from `project`.
+    ///
+    /// # Errors
+    /// As [`OutputRoot::resolve`].
+    pub fn in_scratch(
+        scratch: &crate::scratch::ScratchDir,
+        project: &ProjectPaths,
+    ) -> Result<Self, CliError> {
+        Ok(Self::Scratch(ScratchArea(
+            OutputRoot::at(scratch.path(), project)?.area(&[]),
+        )))
+    }
+
+    /// The role of the runtime bundle written under this target.
+    ///
+    /// Only a scratch target bundles the scratch role, so no other emission
+    /// can stamp, or pin the mtimes of, a scratch bundle.
+    #[must_use]
+    pub const fn bundle_role(&self) -> crate::runtime_embed::BundleRole {
+        match self {
+            Self::Area(_) | Self::Claimed(_) => crate::runtime_embed::BundleRole::Out,
+            Self::Scratch(_) => crate::runtime_embed::BundleRole::Scratch,
+        }
+    }
+
     /// The target directory's absolute path.
     ///
     /// # Errors
     /// As [`OutputRoot::area_path`].
     pub fn path(&self) -> Result<PathBuf, CliError> {
         match self {
-            Self::Area(area) => area.path(),
+            Self::Area(area) | Self::Scratch(ScratchArea(area)) => area.path(),
             Self::Claimed(dir) => Ok(dir.path().to_path_buf()),
         }
     }
@@ -1275,7 +1617,7 @@ impl EmitTarget {
     /// As [`AreaClaim::claim`] and [`OwnedDir::verify`].
     pub fn claim(&self) -> Result<OwnedDir, CliError> {
         match self {
-            Self::Area(area) => area.claim(),
+            Self::Area(area) | Self::Scratch(ScratchArea(area)) => area.claim(),
             Self::Claimed(dir) => {
                 dir.verify()?;
                 Ok(dir.clone())
@@ -2315,11 +2657,73 @@ mod tests {
             );
             let result = prove_parent_steps_from(Path::new("x"), &Cwd::assumed(raw.clone()));
             assert!(
-                matches!(refused(&result), Some(OutputRefusal::Unplaceable(_))),
-                "x against {} must be refused, got {result:?}",
+                matches!(
+                    refused(&result),
+                    Some(OutputRefusal::UnplaceableCwd { cwd, request })
+                        if cwd == &raw && request == Path::new("x")
+                ),
+                "x against {} must be refused naming the working directory, got {result:?}",
                 raw.display()
             );
         }
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A volume-GUID working directory has no placeable prefix, so a relative request is refused naming it.
+    #[cfg(windows)]
+    #[test]
+    fn a_volume_guid_cwd_is_named_as_the_cwd() {
+        let cwd = PathBuf::from(r"\\?\Volume{00000000-0000-0000-0000-000000000000}\x");
+        let result = prove_parent_steps_from(Path::new("out"), &Cwd::assumed(cwd.clone()));
+        assert!(
+            matches!(
+                refused(&result),
+                Some(OutputRefusal::UnplaceableCwd { cwd: named, request })
+                    if named == &cwd && request == Path::new("out")
+            ),
+            "out against {} must be refused naming the working directory, got {result:?}",
+            cwd.display()
+        );
+    }
+
+    /// An output under the local admin share `\\localhost\C$` is a share path like any other, so it is placed.
+    #[cfg(windows)]
+    #[test]
+    fn an_unc_out_under_localhost_admin_share_is_placed() {
+        use std::path::Prefix;
+        let base = scratch("localhost-share");
+        let proj = project(&base);
+        let plain = unverbatim(&base);
+        let letter = plain
+            .components()
+            .next()
+            .and_then(|first| match first {
+                Component::Prefix(prefix) => match prefix.kind() {
+                    Prefix::Disk(letter) => Some(char::from(letter)),
+                    Prefix::VerbatimDisk(_)
+                    | Prefix::Verbatim(_)
+                    | Prefix::VerbatimUNC(..)
+                    | Prefix::DeviceNS(_)
+                    | Prefix::UNC(..) => None,
+                },
+                Component::RootDir
+                | Component::CurDir
+                | Component::ParentDir
+                | Component::Normal(_) => None,
+            })
+            .expect("scratch sits on a drive");
+        let rest = plain
+            .strip_prefix(format!(r"{letter}:\"))
+            .expect("scratch sits under its drive root");
+        let share = PathBuf::from(format!(r"\\localhost\{letter}$"))
+            .join(rest)
+            .join("out");
+        let result = OutputRoot::resolve(Some(&share.to_string_lossy()), &proj);
+        assert!(
+            result.is_ok(),
+            "--out {} must be placed, got {result:?}",
+            share.display()
+        );
         let _ = std::fs::remove_dir_all(&base);
     }
 
@@ -2694,6 +3098,39 @@ mod tests {
             .remove()
             .expect("remove tree");
         assert!(!out.path().join("a").exists());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A pinned write leaves the pinned mtime, and still refuses a planted link.
+    #[test]
+    fn write_pinned_sets_the_bundle_mtime_and_refuses_a_link() {
+        let base = scratch("pinned");
+        let out = OwnedDir::claim(&base.join("out")).expect("claim out");
+        let file = out.path_to("dep/src/lib.rs").expect("path");
+        file.write_pinned(b"pub fn a() {}", BUNDLE_MTIME)
+            .expect("pinned write");
+        let modified = std::fs::metadata(out.path().join("dep/src/lib.rs"))
+            .and_then(|meta| meta.modified())
+            .expect("mtime");
+        assert_eq!(modified, BUNDLE_MTIME.at().expect("representable"));
+        assert_ne!(modified, std::time::UNIX_EPOCH);
+
+        let victim = base.join("victim.txt");
+        std::fs::write(&victim, "keep").expect("victim file");
+        let late = out.path_to("late.rs").expect("late path");
+        plant_link(&victim, &out.path().join("late.rs"));
+        let wrote = late.write_pinned(b"payload", BUNDLE_MTIME);
+        assert!(
+            matches!(
+                wrote,
+                Err(CliError::OutputRefused(OutputRefusal::Symlink(_)))
+            ),
+            "a pinned write refuses the planted link, got {wrote:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&victim).ok().as_deref(),
+            Some("keep")
+        );
         let _ = std::fs::remove_dir_all(&base);
     }
 
@@ -3166,13 +3603,142 @@ mod tests {
             matches!(
                 refused(&result),
                 Some(OutputRefusal::InsideReservedDir {
-                    reserved: ReservedName::Vcs,
+                    reserved: ReservedName::Git,
                     ..
                 })
             ),
             "--out under .git must be refused, got {result:?}"
         );
         assert!(!raw.exists());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// The reserved set, spelled out once, so a row dropped from the list is seen.
+    #[test]
+    fn reserved_names_pin() {
+        let names: std::collections::BTreeSet<&str> = ReservedName::ALL
+            .into_iter()
+            .map(ReservedName::dir_name)
+            .collect();
+        let pinned = std::collections::BTreeSet::from([".git", ".hg", ".jj", "_darcs", ".ipe"]);
+        assert_eq!(names, pinned);
+        assert_eq!(
+            ReservedName::ALL.len(),
+            pinned.len(),
+            "no name is listed twice"
+        );
+    }
+
+    /// `name` with its letters alternately upper- and lower-cased, starting upper.
+    fn mixed_case(name: &str) -> String {
+        name.chars()
+            .enumerate()
+            .map(|(i, c)| {
+                if i.is_multiple_of(2) {
+                    c.to_ascii_uppercase()
+                } else {
+                    c.to_ascii_lowercase()
+                }
+            })
+            .collect()
+    }
+
+    /// `name` as a Unicode-folding volume still opens it: led by a byte-order
+    /// mark HFS+ ignores, with `s`, `i` and `k` swapped for the long s, the
+    /// dotless i and the Kelvin sign.
+    fn unicode_folded(name: &str) -> String {
+        std::iter::once('\u{FEFF}')
+            .chain(name.chars().map(|c| match c {
+                's' => '\u{17F}',
+                'i' => '\u{131}',
+                'k' => '\u{212A}',
+                other => other,
+            }))
+            .collect()
+    }
+
+    /// Every reserved name refuses an output, in any case or Unicode fold, as
+    /// the last or an inner component.
+    #[test]
+    fn every_reserved_name_refuses_output() {
+        let base = scratch("every_reserved");
+        let proj = project(&base);
+        let elsewhere = base.join("elsewhere");
+        for reserved in ReservedName::ALL {
+            let name = reserved.dir_name();
+            for spelled in [
+                name.to_owned(),
+                name.to_ascii_uppercase(),
+                mixed_case(name),
+                unicode_folded(name),
+                unicode_folded(&name.to_ascii_uppercase()),
+            ] {
+                for target in [
+                    elsewhere.join(spelled.as_str()),
+                    elsewhere.join(spelled.as_str()).join("out"),
+                ] {
+                    let result = check_disjoint(&target, &proj).map(|_| ());
+                    assert!(
+                        matches!(
+                            refused(&result),
+                            Some(OutputRefusal::InsideReservedDir { reserved: got, .. })
+                                if *got == reserved
+                        ),
+                        "output at {} must be refused as {reserved:?}, got {result:?}",
+                        target.display()
+                    );
+                }
+            }
+        }
+        assert!(
+            check_disjoint(&elsewhere.join("out"), &proj).is_ok(),
+            "the same base with no reserved component is admitted"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Each version-control refusal names its own directory, not another system's.
+    #[test]
+    fn reserved_dir_refusal_names_the_dir() {
+        for reserved in ReservedName::ALL {
+            let shown = OutputRefusal::InsideReservedDir {
+                out: PathBuf::from("o"),
+                reserved,
+            }
+            .to_string();
+            let name = format!("`{}`", reserved.dir_name());
+            assert!(
+                shown.contains(&name),
+                "{reserved:?} refusal must name {name}, got {shown:?}"
+            );
+            for other in ReservedName::ALL.into_iter().filter(|o| *o != reserved) {
+                let other = format!("`{}`", other.dir_name());
+                assert!(
+                    !shown.contains(&other),
+                    "{reserved:?} refusal must not name {other}, got {shown:?}"
+                );
+            }
+        }
+    }
+
+    /// A name that only resembles a reserved one is admitted: the match is per whole component.
+    #[test]
+    fn near_reserved_names_admit() {
+        let base = scratch("near_reserved");
+        let proj = project(&base);
+        for name in [".gitx", ".ipe-cache", "ipe", ".i pe", "git", "_darcsx"] {
+            assert_eq!(
+                ReservedName::of(std::ffi::OsStr::new(name)),
+                None,
+                "{name:?} is not reserved"
+            );
+            let target = base.join("elsewhere").join(name).join("out");
+            let result = check_disjoint(&target, &proj).map(|_| ());
+            assert!(
+                result.is_ok(),
+                "output under {name:?} is admitted, got {result:?}"
+            );
+        }
         let _ = std::fs::remove_dir_all(&base);
     }
 
@@ -3608,6 +4174,43 @@ mod tests {
                     "{op} at level {level:?} creates nothing in the link target"
                 );
             }
+        }
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn entry_kind_reports_absent_file_dir_and_refuses_no_link() {
+        let base = scratch("entry_kind");
+        let out = OwnedDir::claim(&base.join("out")).expect("claim out");
+        let kind = |rel: &str| out.path_to(rel).expect("path").entry_kind();
+        assert!(matches!(kind("lock"), Ok(held::EntryKind::Absent)));
+        assert!(matches!(kind("missing/lock"), Ok(held::EntryKind::Absent)));
+        std::fs::write(out.path().join("lock"), b"x").expect("write file");
+        assert!(matches!(kind("lock"), Ok(held::EntryKind::Other)));
+        std::fs::create_dir(out.path().join("sub")).expect("make dir");
+        assert!(matches!(kind("sub"), Ok(held::EntryKind::Directory)));
+        #[cfg(unix)]
+        {
+            let elsewhere = base.join("elsewhere");
+            std::fs::create_dir(&elsewhere).expect("make link target");
+            let linked = out.path_to("linked").expect("path before the link");
+            plant_link(&elsewhere, &out.path().join("linked"));
+            assert!(
+                matches!(linked.entry_kind(), Ok(held::EntryKind::Symlink)),
+                "a link to a directory is reported as the link, never followed"
+            );
+            plant_link(&elsewhere, &out.path().join("hop"));
+            let below = OwnedPath {
+                parts: vec!["hop".into(), "lock".into()],
+                ..linked
+            };
+            assert!(
+                matches!(
+                    below.entry_kind(),
+                    Err(CliError::OutputRefused(OutputRefusal::Symlink(_)))
+                ),
+                "a link above the entry is refused, never walked through"
+            );
         }
         let _ = std::fs::remove_dir_all(&base);
     }

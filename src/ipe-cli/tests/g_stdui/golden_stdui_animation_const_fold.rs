@@ -96,18 +96,16 @@ fn build_project(slot: &str, hot: bool) -> (PathBuf, Result<(), ipe::CliError>) 
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
         .join(format!("stdui_animation_const_fold_{slot}"));
     let _ = std::fs::remove_dir_all(&out);
-    let src = out.join("src");
-    std::fs::create_dir_all(&src).expect("mk const-fold test project dirs");
-    let entry = src.join("Main.ipe");
-    std::fs::write(&entry, MAIN_IPE).expect("write Main.ipe");
+    std::fs::create_dir_all(&out).expect("create the scratch output dir");
+    let fixture = ipe::RootFixture::main(MAIN_IPE).expect("the inline Main project resolves");
     let emit = out.join("emit");
-    // `ipe::build` is the prod entry and keeps `hot_appearance` off regardless of
-    // environment; drive the hot-swap hoist explicitly through the option instead.
+    // The default build keeps `hot_appearance` off regardless of environment;
+    // drive the hot-swap hoist explicitly through the option instead.
     let options = ipe::BuildOptions {
         hot_appearance: hot,
         ..ipe::BuildOptions::from_env()
     };
-    let res = ipe::build_with_options(&entry, &emit, &runtime(), options);
+    let res = ipe::build_fixture_with_options(&fixture, &emit, &runtime(), &options).map(drop);
     (emit, res)
 }
 

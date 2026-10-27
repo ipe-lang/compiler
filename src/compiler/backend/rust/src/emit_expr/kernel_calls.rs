@@ -1,13 +1,14 @@
 use super::{
     ArgPlan, Callee, DResult, Diagnostic, Expr, GenericScope, Guard, IrType, KernelClass, KernelFn,
     LitKind, LowerError, NativeUiEmit, Span, Symbol, UiDelegate, UiEmitPlan,
-    appearance_literal_record_fields, callee_name, clone_targets_in_expr, collect_free_vars,
-    emit_expr_at, emit_lambda_unboxed, emit_shared_lambda, emit_sub_arm, float_literal, free_vars,
-    int_literal, kernel_name, render_type, shape_appearance_literal_args, ui_call_shape,
+    appearance_literal_record_fields, callee_name, clone_targets_in_expr, emit_expr_at,
+    emit_lambda_unboxed, emit_shared_lambda, emit_sub_arm, float_literal, free_vars, int_literal,
+    kernel_name, once_closure_bug, render_type, shape_appearance_literal_args, ui_call_shape,
 };
 use crate::EmitCtx;
 use core::fmt::Write as _;
 use ipe_intern::rust_str_lit;
+use ipe_kernels::AdaptedSlot;
 
 /// The clone-rewritten container argument of a call whose runtime takes its
 /// arguments reversed ([`Callee::evaluates_args_reversed`], the single source of
@@ -739,8 +740,8 @@ pub fn emit_task_loop_call(
         });
     }
     let path = ctx.enum_name(home, *name)?;
-    let continue_ident = ctx.emit_ident(*continue_sym)?;
-    let done_ident = ctx.emit_ident(*done_sym)?;
+    let continue_ident = ctx.emit_member_ident(*continue_sym)?;
+    let done_ident = ctx.emit_member_ident(*done_sym)?;
     let ceiling_s = emit_expr_at(ctx, ceiling, indent, child, generics)?;
     let init_s = emit_expr_at(ctx, init, indent, child, generics)?;
     let step_s = emit_expr_at(ctx, step, indent, child, generics)?;
@@ -779,20 +780,12 @@ pub fn emit_task_retry_call(
     child: u16,
     generics: GenericScope,
 ) -> DResult<Option<String>> {
-    let Callee::Kernel(
-        k @ (KernelFn::TaskRetryWith
-        | KernelFn::TaskLinearBackoff
-        | KernelFn::TaskExponentialBackoff
-        | KernelFn::TaskWithJitter
-        | KernelFn::TaskRetryOn
-        | KernelFn::TaskWithRetryOn
-        | KernelFn::TaskDefaultRetryPolicy
-        | KernelFn::TaskWithMaxAttempts
-        | KernelFn::TaskWithBaseMs),
-    ) = callee
-    else {
+    let Callee::Kernel(k) = callee else {
         return Ok(None);
     };
+    if !k.names_retry_policy_struct() {
+        return Ok(None);
+    }
 
     // `RetryPolicy e = { baseMs, maxAttempts, shouldRetry, strategy }` —
     // alphabetical BTreeMap order matches the emitted struct name.
@@ -919,6 +912,11 @@ pub fn emit_task_retry_call(
             )))
         }
         KernelFn::TaskRetryOn | KernelFn::TaskWithRetryOn => {
+            // IPE-RUST-AUDIT:ACCEPTED (Arthur Maciel) — compile-time `const` assertion (not a runtime panic); fails the BUILD if this arm adapts a slot `KernelFn::adapted_slots` does not list, so lowering would leave it un-normalized [ledger #boundary]
+            const _: () = assert!(all_adapt(
+                &[KernelFn::TaskRetryOn, KernelFn::TaskWithRetryOn],
+                AdaptedSlot::Arg(0)
+            ));
             // `retryOn pred policy` / `withRetryOn pred policy` — move-update shouldRetry.
             let pred = args.first().ok_or_else(|| Diagnostic::CompilerBug {
                 where_: "ipe_backend_rust::emit_task_retry_call",
@@ -928,25 +926,35 @@ pub fn emit_task_retry_call(
                 where_: "ipe_backend_rust::emit_task_retry_call",
                 detail: "TaskRetryOn/TaskWithRetryOn expects 2 arguments (pred, policy)".to_owned(),
             })?;
-            let pred_s = emit_expr_at(ctx, pred, indent, child, generics)?;
-            let policy_s = emit_expr_at(ctx, policy, indent, child, generics)?;
             // The `shouldRetry` field carrier is `Arc<dyn Fn(IpeError) -> bool>`
-            // (record-field function carrier). Re-wrap the predicate — carried as
-            // a `Box<dyn Fn>` (or a bare closure) — in a fresh `Arc` closure of
-            // the field's exact signature so the move-update assigns the field's
-            // own carrier type, not a `Box` (which would be an `E0308`).
+            // (record-field function carrier): the predicate closure fills it
+            // directly, so the move-update assigns the field's own carrier type.
+            // The predicate is bound before the policy is evaluated, matching
+            // the argument order the lowerer's last-use clone rewrite walks.
+            let pred_s = emit_adapted_arc(
+                ctx,
+                pred,
+                "ipe_backend_rust::emit_task_retry_call::TaskRetryOn",
+                indent,
+                child,
+                generics,
+            )?;
+            let policy_s = emit_expr_at(ctx, policy, indent, child, generics)?;
             Ok(Some(format!(
-                "{{ let mut __ipe_rec = ({policy_s}); \
-                 __ipe_rec.shouldRetry = ::std::sync::Arc::new(\
-                 move |__ipe_x: IpeError| ({pred_s})(__ipe_x)); __ipe_rec }}"
+                "{{ let __ipe_pred = {pred_s}; \
+                 let mut __ipe_rec = ({policy_s}); \
+                 __ipe_rec.shouldRetry = __ipe_pred; __ipe_rec }}"
             )))
         }
         KernelFn::TaskRetryWith => {
+            // IPE-RUST-AUDIT:ACCEPTED (Arthur Maciel) — compile-time `const` assertion (not a runtime panic); fails the BUILD if this arm adapts a slot `KernelFn::adapted_slots` does not list, so lowering would leave it un-normalized [ledger #boundary]
+            const _: () = assert!(all_adapt(&[KernelFn::TaskRetryWith], AdaptedSlot::Thunk(1)));
             // `retryWith policy task` — decompose policy, call runtime.
             // The `shouldRetry` field is `Arc<dyn Fn(IpeError) -> bool>` (directly
-            // callable) but `task_retry_with` expects `impl Fn(&IpeError) -> bool`.
-            // The adapter closure bridges the gap by cloning the (cheap String)
-            // error ref.
+            // callable) but `task_retry_with` expects `impl Fn(&IpeError) -> bool`;
+            // the bridge closure wraps only that runtime field value, cloning the
+            // error ref. The task argument is the lowered zero-parameter thunk
+            // that rebuilds the task per attempt.
             let policy = args.first().ok_or_else(|| Diagnostic::CompilerBug {
                 where_: "ipe_backend_rust::emit_task_retry_call",
                 detail: "TaskRetryWith expects 2 arguments (policy, task)".to_owned(),
@@ -956,7 +964,14 @@ pub fn emit_task_retry_call(
                 detail: "TaskRetryWith expects 2 arguments (policy, task)".to_owned(),
             })?;
             let policy_s = emit_expr_at(ctx, policy, indent, child, generics)?;
-            let task_s = emit_expr_at(ctx, task, indent, child, generics)?;
+            let task_s = emit_adapted_closure(
+                ctx,
+                task,
+                "ipe_backend_rust::emit_task_retry_call::TaskRetryWith",
+                indent,
+                child,
+                generics,
+            )?;
             Ok(Some(format!(
                 "{{ \
                  let __ipe_p = {policy_s}; \
@@ -966,13 +981,14 @@ pub fn emit_task_retry_call(
                  __ipe_p.baseMs, \
                  __ipe_p.strategy, \
                  move |__ipe_e: &IpeError| (__ipe_sr)(__ipe_e.clone()), \
-                 move || {{ {task_s} }}\
+                 {task_s}\
                  ) }}"
             )))
         }
         _ => Err(Diagnostic::CompilerBug {
             where_: "ipe_backend_rust::emit_task_retry_call",
-            detail: "non-retry kernel reached retry dispatch arm — guard should have excluded it"
+            detail: "`KernelFn::names_retry_policy_struct` lists a kernel the retry dispatch \
+                     has no arm for"
                 .to_owned(),
         }),
     }
@@ -1637,6 +1653,10 @@ pub fn emit_db_call(
         | KernelFn::DsnUser
         | KernelFn::DsnTlsTag
         | KernelFn::DsnRedacted
+        // `Db.Location.*` — `Int` tag + `Path` / no arg / `Dsn` scalar args.
+        | KernelFn::DbLocationFile
+        | KernelFn::DbLocationMemory
+        | KernelFn::DbLocationDsn
         | KernelFn::DbDecString
         | KernelFn::DbDecInt
         | KernelFn::DbDecFloat
@@ -2015,50 +2035,6 @@ pub fn emit_tea_call(
     }
 }
 
-// The `StreamStream` arm re-wraps argument 1: the lowerer's non-`Clone`
-// capture gate reads the same index, so a drift breaks the build.
-// IPE-RUST-AUDIT:ACCEPTED (Arthur Maciel) — compile-time `const` assertion (not a runtime panic); fails the BUILD if the re-wrapped handler index drifts from the lowerer's capture-gate index, the capture-clone SEAL invariant [ledger #boundary]
-const _: () = assert!(matches!(
-    KernelFn::StreamStream.capture_cloned_handler_arg(),
-    Some(1)
-));
-
-/// Build the capture-clone prologue for the `StreamStream` re-wrap closure.
-///
-/// The `StreamStream` arm wraps the handler in `move |_x| (handler)(_x)` to
-/// recover the runtime's `+Sync` bound by rebuilding the handler box as SOURCE
-/// per call (see the `UiOnSubmit` doc). But the handler's own `move` captures
-/// its enclosing non-`Copy` locals (the `header`/`body` `String`s of a
-/// Csv-stream handler); the re-embedded box steals them from the `move |_x|`
-/// wrapper's env on the first call, so the wrapper degrades to `FnOnce` and
-/// `server_stream_stream`'s `Fn` bound rejects it (`E0507` after `ipe` exit
-/// 0 — a SEAL break). The lowerer's capture-clone rewrite only reaches INTO
-/// the handler body; this synthesized wrapper is emit-only, invisible to it.
-///
-/// So this returns a `let <v> = <v>.clone(); …` prologue for every free local
-/// `v` the handler captures, spliced INSIDE the wrapper body: the box moves the
-/// fresh shadowing clones, the wrapper keeps its originals for the next call.
-/// Same shape as the `TaskSeq` clone-capture prologue, applied at
-/// an emit-synthesized closure. Every captured free local is `Clone` by a
-/// lowerer guarantee, not an assumption here: `StreamStream` names this handler
-/// in `KernelFn::capture_cloned_handler_arg`, and the lowerer classifies each of
-/// its captures (`Copy` leaf, `Clone` carrier, or a pure-`Fun` binder promoted
-/// to the `Arc` carrier — `StreamStream` is in `requires_sync_capture`) and
-/// refuses a non-`Clone` one (a destructure-bound `Box<dyn Fn>`) with IPE-L0126.
-pub fn stream_handler_capture_prologue(ctx: &EmitCtx, handler: &Expr) -> DResult<String> {
-    let mut captured = std::collections::BTreeSet::new();
-    collect_free_vars(handler, &mut captured);
-    let mut prologue = String::new();
-    for sym in captured {
-        let id = ctx.emit_ident(sym)?;
-        write!(prologue, "let {id} = {id}.clone(); ").map_err(|_| Diagnostic::CompilerBug {
-            where_: "ipe_backend_rust::stream_handler_capture_prologue",
-            detail: "writing capture-clone prologue failed".to_owned(),
-        })?;
-    }
-    Ok(prologue)
-}
-
 /// Handle a `Ipe.Http.Server` / `Middleware` / `RateLimit` kernel call.
 ///
 /// Returns `Ok(None)` for all wired server kernels (they all use the standard
@@ -2129,32 +2105,15 @@ pub fn emit_server_call(
         // `Ipe.Http.Server.Stream.stream : String -> (StreamWriter -> Task Error ()) -> Task Error Response`
         //
         // `server_stream_stream`'s bound is
-        // `H: Fn(StreamWriter) -> IpeTask<E, ()> + Send + Sync + 'static`,
-        // and unlike `sub_subscribe_stream` (relaxed to Send-only — see that
-        // fn's doc comment in `http_stream.rs`), THIS `+Sync` bound is
-        // genuinely required: `server_stream_stream` internally does
-        // `Arc::new(move |w| { let task = handler(w); .. })` and stores that
-        // `Arc` in the `RequestStreams` table of the request it runs in,
-        // taken by that request's `claim_streaming_sentinel` and driven on a
-        // spawned task (`server_stream.rs`).
-        // Unsizing `Arc<ConcreteClosure>` to the table's
-        // `Arc<dyn Fn(..) -> .. + Send + Sync>` slot requires the captured
-        // `handler: H` to itself be `Sync` — the same "value must legitimately
-        // live behind a shared `Arc`" shape as `html_on_raw_`'s `Event::OnForm`
-        // slot, not the "moved into exactly one spawned task" shape of
-        // `sub_subscribe_stream` / `sub_subscribe_topic`. But this kernel
-        // reaches codegen through the SAME shared generic N-arg call-emit
-        // fallback that passes the codegen's `Box<dyn Fn(..) -> .. + Send +
-        // 'static>` value straight through as `H` — a trait object's
-        // auto-trait set is exactly its bound list, so that box can never
-        // satisfy `+Sync` regardless of what the boxed closure captures.
-        // Fix: apply the SAME re-wrap technique used for
-        // `html_on_raw_`/`ui_on_submit_` — re-embed the box construction as
-        // SOURCE inside a freshly-declared closure built anew at the call
-        // site, so the wrapper's own Send+Sync-ness depends only on the Ipê
-        // closure's legitimate `move` captures, never the erased trait-object
-        // type.
+        // `H: Fn(StreamWriter) -> IpeTask<E, ()> + Send + Sync + 'static`: it
+        // stores the handler behind a shared `Arc` in the request's stream
+        // table, so `+Sync` is genuinely required. The handler closure goes in
+        // directly; the lowerer promotes its function captures to the `Sync`
+        // carrier for this kernel (`requires_sync_capture`) and refuses a
+        // non-`Clone` one (IPE-L0126).
         KernelFn::StreamStream => {
+            // IPE-RUST-AUDIT:ACCEPTED (Arthur Maciel) — compile-time `const` assertion (not a runtime panic); fails the BUILD if this arm adapts a slot `KernelFn::adapted_slots` does not list, so lowering would leave it un-normalized [ledger #boundary]
+            const _: () = assert!(all_adapt(&[KernelFn::StreamStream], AdaptedSlot::Arg(1)));
             let [ct_e, handler_expr] = args else {
                 return Err(Diagnostic::CompilerBug {
                     where_: "ipe_backend_rust::emit_server_call::StreamStream",
@@ -2163,11 +2122,15 @@ pub fn emit_server_call(
             };
             let fn_name = kernel_name(*k);
             let ct_s = emit_expr_at(ctx, ct_e, indent, child, generics)?;
-            let handler_src = emit_expr_at(ctx, handler_expr, indent, child, generics)?;
-            let prologue = stream_handler_capture_prologue(ctx, handler_expr)?;
-            Ok(Some(format!(
-                "{fn_name}({ct_s}, move |_x| {{ {prologue}({handler_src})(_x) }})"
-            )))
+            let handler_s = emit_adapted_closure(
+                ctx,
+                handler_expr,
+                "ipe_backend_rust::emit_server_call::StreamStream",
+                indent,
+                child,
+                generics,
+            )?;
+            Ok(Some(format!("{fn_name}({ct_s}, {handler_s})")))
         }
 
         // Route constructors whose first argument is the route path use the
@@ -2384,149 +2347,200 @@ pub fn lookup_field<'f>(
     })
 }
 
-/// Arc-wrap an already-emitted callback expression so it fills a runtime
-/// `Arc<dyn Fn(_) -> _ + Send + Sync>` slot.
+/// A kernel callback slot in handler normal form: leading `let`s around one closure literal.
 ///
-/// The `Ipe.Ui.Input.*` runtime functions (`input_text_`, `input_slider_`,
-/// `input_checkbox_`, `input_radio_`, …) take their callback fields (`onChange`,
-/// checkbox `icon`) as `Arc<dyn Fn(_) -> _ + Send + Sync + 'static>` — the same
-/// shared-callback shape every Ipe.Ui / Ipe.Web event slot uses. But an
-/// `onChange` field expression lowers as an ordinary value: a bare
-/// `Msg`-constructor eta-expands to a plain lambda, and both [`emit_lambda`] and
-/// [`emit_func_value`] pin `Box::new(..)` for every non-Server/WS `Fun` shape
-/// (see [`wants_arc_ctor`]). Passing that `Box<dyn Fn(_) -> _ + Send>` into the
-/// `Arc<.. + Send + Sync>` parameter is an E0308 — a SEAL break.
-///
-/// Rather than special-casing every callback-carrying shape at the box site,
-/// this mirrors the existing `ui_on_input_` / `ui_on_change_` arms (this same
-/// file): eta-wrap the emitted callback in a fresh `Arc`-owned closure
-/// `::std::sync::Arc::new(move |_x| (f)(_x))`. Rust infers `_x`, so ONE wrap
-/// serves every arity-1 callback regardless of arg type (`String` or `bool`) or
-/// return type (`Msg` or `Element<Msg>`). The wrap is sound: an emitted Ipê
-/// callback is always `'static` (it captures no borrow-lifetime context), so the
-/// `move` capture yields a `Send + Sync` `Arc`. This is the reference's uniform
-/// Arc-callback policy applied at the call-argument boundary.
-pub fn arc_callback_wrap(handler_src: &str) -> String {
-    format!("::std::sync::Arc::new(move |_x| ({handler_src})(_x))")
+/// Lowering (`normalize_adapted_handler_args`) puts every
+/// [`KernelFn::adapted_slots`] slot in this form, so the closure the capture
+/// analysis classified is the callback the runtime calls: the backend never
+/// prints an IR value's text inside a `move` closure of its own, where a
+/// capture would be moved per call (E0507) or out from under a sibling
+/// (E0382). Any other slot shape is a compiler bug, refused at ipe time.
+#[derive(Debug)]
+pub struct AdaptedHandler<'e> {
+    lets: Vec<HandlerLet<'e>>,
+    params: &'e [(Symbol, IrType)],
+    ret: &'e IrType,
+    body: &'e Expr,
 }
 
-/// Emit a `Ipe.Ui.Input.*` callback field, Arc-wrapping it for the runtime's
-/// `Arc<dyn Fn(_) -> _ + Send + Sync>` slot (see [`arc_callback_wrap`]) while
-/// HOISTING any leading capture-clone `let`s OUTSIDE the `Arc`'s `move` closure.
-///
-/// the lowerer's multi-use-capture rewrite
-/// ([`rewrite_multiuse_clones`]) wraps a callback lambda that captures a
-/// non-`Copy` binding used again by a sibling in a pre-clone
-/// `let sym = sym.clone() in Lambda { … }`. Emitted naively, that whole block
-/// is the string `arc_callback_wrap` wraps, giving
-/// `Arc::new(move |_x| (({ let habit = habit.clone(); … }))(_x))`. The `.clone()`
-/// reads the FREE outer `habit`, but the enclosing `move |_x|` still
-/// move-captures that same outer `habit` — so a later sibling use
-/// (`StateMsg::RemoveHabit((habit).id)`) hits use-after-move (E0382). The
-/// hoist was already correct for a plain (un-Arc-wrapped) callback arg — the
-/// pre-clone `let` sat in the enclosing scope, and only the INNER `move`
-/// captured the clone; the `Arc` re-wrap is what re-introduced the outer
-/// `move`.
-///
-/// Fix: peel the leading pure-alias `let`s (`let n = <Var/CloneVar>`; each a
-/// value-preserving re-bind) off the callback expression and emit them as a
-/// prefix OUTSIDE the `Arc::new`, so the Arc closure owns the pre-made clone
-/// and the original binding survives for later sibling uses:
-///
-/// ```text
-/// { let habit = habit.clone(); ::std::sync::Arc::new(move |_x| ((INNER))(_x)) }
-/// ```
-///
-/// Only a `let` whose value is a bare `Var`/`CloneVar` is peeled — a pure
-/// alias/clone of an outer symbol whose hoist out of the `move` closure is
-/// always semantics-preserving (Ipê values are immutable). A `let` binding a
-/// COMPUTED value stays inside, untouched, so no re-ordering of effects or
-/// widening of a capture's scope can occur. When there are no such leading
-/// `let`s the output is byte-identical to the previous
-/// `arc_callback_wrap(&emit_expr_at(..))`.
-/// Peel the leading pure-alias capture-clone `let`s off a synthesised callback
-/// expression, returning the hoisted bindings and the innermost expression.
-///
-/// The lowerer's multi-use-capture rewrite ([`rewrite_multiuse_clones`]) wraps a
-/// callback lambda that captures a non-`Copy` binding also read by a sibling in
-/// a pre-clone `let sym = sym.clone() in Lambda { … }`. Every synthesised event
-/// arm emits its handler inside a `move` closure; if that pre-clone `let` is
-/// rendered INSIDE the `move`, the closure move-captures the outer binding while
-/// the `.clone()` also reads it, and a sibling field/arg reading the same
-/// binding then hits use-after-move (E0382 — an accept-then-cargo-fail SEAL
-/// break). Peeling the `let` here lets each arm emit it OUTSIDE its `move`
-/// closure, so the closure owns the pre-made clone and the original survives.
-///
-/// Only a `let` whose value is a bare `Var`/`CloneVar` is peeled — a pure
-/// alias/clone of an outer symbol whose hoist out of the `move` closure is
-/// always semantics-preserving (Ipê values are immutable). A `let` binding a
-/// COMPUTED value stays inside, so no re-ordering of effects can occur.
-pub fn peel_callback_capture_clones(field: &Expr) -> (Vec<(Symbol, &Expr)>, &Expr) {
-    let mut hoisted: Vec<(Symbol, &Expr)> = Vec::new();
-    let mut inner = field;
-    while let Expr::Let { name, value, body } = inner {
-        if matches!(value.as_ref(), Expr::Var(_) | Expr::CloneVar(_)) {
-            hoisted.push((*name, value.as_ref()));
-            inner = body.as_ref();
-        } else {
-            break;
+/// One leading binding of an [`AdaptedHandler`].
+#[derive(Debug, Clone, Copy)]
+enum HandlerLet<'e> {
+    /// `let name = <value>;` from an [`Expr::Let`].
+    Value(Symbol, &'e Expr),
+    /// `let name = name.clone();`, one symbol of an [`Expr::CaptureClones`].
+    SelfClone(Symbol),
+}
+
+impl<'e> AdaptedHandler<'e> {
+    /// Read the adapted slot value `slot` as leading `let`s around a closure literal.
+    ///
+    /// # Errors
+    ///
+    /// [`Diagnostic::CompilerBug`] at `where_` when the core under the `let`s
+    /// is not a [`Expr::Lambda`] / [`Expr::SharedLambda`]; an
+    /// [`Expr::OnceLambda`] is the once check's to refuse first.
+    pub fn from_ir(slot: &'e Expr, where_: &'static str) -> DResult<Self> {
+        let mut lets = Vec::new();
+        let mut core = slot;
+        loop {
+            core = match core {
+                Expr::Let { name, value, body } => {
+                    lets.push(HandlerLet::Value(*name, value.as_ref()));
+                    body.as_ref()
+                }
+                Expr::CaptureClones { syms, body } => {
+                    lets.extend(syms.iter().copied().map(HandlerLet::SelfClone));
+                    body.as_ref()
+                }
+                _ => break,
+            };
+        }
+        match core {
+            Expr::Lambda { params, ret, body } | Expr::SharedLambda { params, ret, body } => {
+                Ok(Self {
+                    lets,
+                    params,
+                    ret,
+                    body,
+                })
+            }
+            Expr::OnceLambda { .. } => Err(once_closure_bug(where_)),
+            _ => Err(Diagnostic::CompilerBug {
+                where_,
+                detail: "an adapted callback slot is not in handler normal form \
+                         (leading `let`s around one closure literal); lowering must \
+                         normalize every `KernelFn::adapted_slots` slot"
+                    .to_owned(),
+            }),
         }
     }
-    (hoisted, inner)
-}
 
-/// Render the peeled capture-clone `let`s ([`peel_callback_capture_clones`]) as
-/// a `let n = <value>; ` prefix. Empty when there are no leading pure-alias
-/// `let`s, so a capture-free callback's emitted text is byte-identical to the
-/// un-peeled form.
-pub fn render_hoisted_clone_prefix(
-    ctx: &EmitCtx,
-    hoisted: &[(Symbol, &Expr)],
-    indent: usize,
-    child: u16,
-    generics: GenericScope,
-) -> DResult<String> {
-    let mut prefix = String::new();
-    for &(name, value) in hoisted {
-        let name_s = ctx.emit_ident(name)?;
-        let value_s = emit_expr_at(ctx, value, indent, child, generics)?;
-        write!(prefix, "let {name_s} = {value_s}; ").map_err(|e| Diagnostic::CompilerBug {
-            where_: "ipe_backend_rust::render_hoisted_clone_prefix",
-            detail: format!("fmt::Write into String failed: {e}"),
-        })?;
+    /// Emit the handler as `{ <lets>; wrap(<closure>) }`, the closure unboxed.
+    ///
+    /// `wrap` receives the emitted `move |..| -> R { .. }` closure and places
+    /// it in the runtime slot (an `Arc::new(..)`, or the closure itself for a
+    /// generic `impl Fn` bound). The `let`s are evaluated once, where the
+    /// handler is built, and the closure moves their values.
+    pub fn emit(
+        &self,
+        ctx: &EmitCtx,
+        indent: usize,
+        child: u16,
+        generics: GenericScope,
+        wrap: impl FnOnce(String) -> String,
+    ) -> DResult<String> {
+        let mut prefix = String::new();
+        for binding in &self.lets {
+            let (name_s, value_s) = match *binding {
+                HandlerLet::Value(name, value) => (
+                    ctx.emit_local_ident(name)?,
+                    emit_expr_at(ctx, value, indent, child, generics)?,
+                ),
+                HandlerLet::SelfClone(name) => {
+                    let name_s = ctx.emit_local_ident(name)?;
+                    let value_s = format!("{name_s}.clone()");
+                    (name_s, value_s)
+                }
+            };
+            write!(prefix, "let {name_s} = {value_s}; ").map_err(|e| Diagnostic::CompilerBug {
+                where_: "ipe_backend_rust::AdaptedHandler::emit",
+                detail: format!("fmt::Write into String failed: {e}"),
+            })?;
+        }
+        let closure = emit_lambda_unboxed(
+            ctx,
+            self.params,
+            self.ret,
+            self.body,
+            indent,
+            child,
+            generics,
+        )?;
+        let placed = wrap(closure);
+        if prefix.is_empty() {
+            Ok(placed)
+        } else {
+            Ok(format!("{{ {prefix}{placed} }}"))
+        }
     }
-    Ok(prefix)
 }
 
-pub fn emit_arc_callback_field(
+/// Emit the adapted slot value `slot` into a runtime `Arc<dyn Fn(..) -> .. + Send + Sync>` slot.
+///
+/// # Errors
+///
+/// As [`AdaptedHandler::from_ir`], and any emission error of the handler.
+pub fn emit_adapted_arc(
     ctx: &EmitCtx,
-    field: &Expr,
+    slot: &Expr,
+    where_: &'static str,
     indent: usize,
     child: u16,
     generics: GenericScope,
 ) -> DResult<String> {
-    // Peel leading pure-alias `let`s (`let n = Var(v)` / `let n = CloneVar(v)`).
-    let (hoisted, inner) = peel_callback_capture_clones(field);
-    // An inline lambda literal goes STRAIGHT into the `Arc` — one closure
-    // boundary. The generic wrap-and-redispatch below builds a fresh boxed
-    // closure per call of the `Arc` closure, so a callee-position capture of
-    // a `Box<dyn Fn>` param would be moved out of the `Fn` env per call
-    // (E0507); the direct form moves the capture ONCE at `Arc` construction
-    // and every call merely borrows it.
-    let arc = if let Expr::Lambda { params, ret, body } | Expr::SharedLambda { params, ret, body } =
-        inner
-    {
-        let closure = emit_lambda_unboxed(ctx, params, ret, body, indent, child, generics)?;
+    AdaptedHandler::from_ir(slot, where_)?.emit(ctx, indent, child, generics, |closure| {
         format!("::std::sync::Arc::new({closure})")
-    } else {
-        let inner_s = emit_expr_at(ctx, inner, indent, child, generics)?;
-        arc_callback_wrap(&inner_s)
-    };
-    if hoisted.is_empty() {
-        return Ok(arc);
+    })
+}
+
+/// Emit the adapted slot value `slot` as its bare closure, for a generic `impl Fn` bound.
+///
+/// # Errors
+///
+/// As [`AdaptedHandler::from_ir`], and any emission error of the handler.
+pub fn emit_adapted_closure(
+    ctx: &EmitCtx,
+    slot: &Expr,
+    where_: &'static str,
+    indent: usize,
+    child: u16,
+    generics: GenericScope,
+) -> DResult<String> {
+    AdaptedHandler::from_ir(slot, where_)?.emit(ctx, indent, child, generics, |closure| closure)
+}
+
+/// The `where_` of an `Ipe.Ui.Input.*` callback field refused as not in handler normal form.
+const INPUT_FIELD: &str = "ipe_backend_rust::emit_ui_call::InputField";
+/// The `where_` of a `Ui.on*` handler refused as not in handler normal form.
+const UI_EVENT: &str = "ipe_backend_rust::emit_ui_call::UiOnEvent";
+/// The `where_` of an `Ipe.Html.Events` handler refused as not in handler normal form.
+const HTML_EVENT: &str = "ipe_backend_rust::emit_ui_call::HtmlEvent";
+
+/// Whether every kernel of `kernels` lists `slot` among its adapted slots.
+const fn all_adapt(kernels: &[KernelFn], slot: AdaptedSlot) -> bool {
+    let mut rest = kernels;
+    while let Some((kernel, tail)) = rest.split_first() {
+        if !kernel.adapted_callback_slot(slot) {
+            return false;
+        }
+        rest = tail;
     }
-    let prefix = render_hoisted_clone_prefix(ctx, &hoisted, indent, child, generics)?;
-    Ok(format!("{{ {prefix}{arc} }}"))
+    true
+}
+
+/// Whether every `Ipe.Html.Events` kernel of `kernels` whose shape takes a handler lists it as adapted.
+///
+/// A `String` / `Bool` shape's handler is [`AdaptedSlot::Arg`] `0`; the `Raw`
+/// shape's is [`AdaptedSlot::FormHandler`] `0`.
+const fn html_events_adapt(kernels: &[KernelFn]) -> bool {
+    let mut rest = kernels;
+    while let Some((kernel, tail)) = rest.split_first() {
+        let listed = match kernel.html_event_shape() {
+            Some(ipe_ir::HtmlEventShape::String | ipe_ir::HtmlEventShape::Bool) => {
+                kernel.adapted_callback_slot(AdaptedSlot::Arg(0))
+            }
+            Some(ipe_ir::HtmlEventShape::Raw) => {
+                kernel.adapted_callback_slot(AdaptedSlot::FormHandler(0))
+            }
+            Some(ipe_ir::HtmlEventShape::Msg) | None => true,
+        };
+        if !listed {
+            return false;
+        }
+        rest = tail;
+    }
+    true
 }
 
 /// Appearance hot-swap for the one `Ipe.Css` value that reaches Rust: the value
@@ -2705,7 +2719,10 @@ pub fn compile_list_fills(
     let mut v = Vec::with_capacity(list_holes.len());
     for lh in list_holes {
         let xs_code = emit_expr_at(ctx, &lh.xs, indent, child, generics)?;
-        let item_name = format!("__ipe_li_{}", lh.item_sym.as_raw());
+        // The fills read the item through its own symbol, so the binder is the
+        // same local ident a `Var` of that symbol emits; the item is owned,
+        // exactly as the `List.map` lambda param it replaces.
+        let item_name = ctx.emit_local_ident(lh.item_sym)?;
         let mut fills = Vec::with_capacity(lh.item_fills.len());
         for fill_expr in &lh.item_fills {
             fills.push(emit_expr_at(ctx, fill_expr, indent, child, generics)?);
@@ -2716,7 +2733,7 @@ pub fn compile_list_fills(
             format!("vec![{}]", fills.join(", "))
         };
         v.push(format!(
-            "({xs_code}).iter().map(|{item_name}| {fills_vec}).collect::<Vec<_>>()"
+            "({xs_code}).into_iter().map(|{item_name}| {fills_vec}).collect::<Vec<_>>()"
         ));
     }
     Ok(v)
@@ -3099,8 +3116,8 @@ pub fn emit_ui_plan(
             let Expr::Record { fields, .. } = cfg_e else {
                 return Err(Diagnostic::CompilerBug {
                     where_: "ipe_backend_rust::emit_ui_call::UiLayoutWith",
-                    detail: "Ui.layoutWith cfg must be an inline record literal \
-                             in Phase 0; non-literal cfg is deferred to Phase 1"
+                    detail: "Ui.layoutWith cfg must be an inline record literal; \
+                             lowering passes no other cfg shape"
                         .into(),
                 });
             };
@@ -3150,8 +3167,8 @@ pub fn emit_ui_plan(
             let Expr::Record { fields, .. } = cfg_e else {
                 return Err(Diagnostic::CompilerBug {
                     where_: "ipe_backend_rust::emit_ui_call::UiButton",
-                    detail: "Ui.button cfg must be an inline record literal \
-                             in Phase 0; non-literal cfg is deferred to Phase 1"
+                    detail: "Ui.button cfg must be an inline record literal; \
+                             lowering passes no other cfg shape"
                         .into(),
                 });
             };
@@ -3181,8 +3198,8 @@ pub fn emit_ui_plan(
             let Expr::Record { fields, .. } = cfg_e else {
                 return Err(Diagnostic::CompilerBug {
                     where_: "ipe_backend_rust::emit_ui_call::UiLink",
-                    detail: "Ui.link cfg must be an inline record literal \
-                             in Phase 0; non-literal cfg is deferred to Phase 1"
+                    detail: "Ui.link cfg must be an inline record literal; \
+                             lowering passes no other cfg shape"
                         .into(),
                 });
             };
@@ -3212,8 +3229,8 @@ pub fn emit_ui_plan(
             let Expr::Record { fields, .. } = cfg_e else {
                 return Err(Diagnostic::CompilerBug {
                     where_: "ipe_backend_rust::emit_ui_call::UiImage",
-                    detail: "Ui.image cfg must be an inline record literal \
-                             in Phase 0; non-literal cfg is deferred to Phase 1"
+                    detail: "Ui.image cfg must be an inline record literal; \
+                             lowering passes no other cfg shape"
                         .into(),
                 });
             };
@@ -3447,6 +3464,18 @@ pub fn emit_ui_plan(
 
         // ── Ipe.Ui.Input — text-family controls ────────────────────────
         NativeUiEmit::InputText => {
+            // IPE-RUST-AUDIT:ACCEPTED (Arthur Maciel) — compile-time `const` assertion (not a runtime panic); fails the BUILD if this arm adapts a slot `KernelFn::adapted_slots` does not list, so lowering would leave it un-normalized [ledger #boundary]
+            const _: () = assert!(all_adapt(
+                &[
+                    KernelFn::InputText,
+                    KernelFn::InputEmail,
+                    KernelFn::InputUsername,
+                    KernelFn::InputSearch,
+                    KernelFn::InputCurrentPassword,
+                    KernelFn::InputNewPassword
+                ],
+                AdaptedSlot::Field { arg: 1 }
+            ));
             let [attrs_e, cfg_e] = args else {
                 return Err(Diagnostic::CompilerBug {
                     where_: "ipe_backend_rust::emit_ui_call::InputText",
@@ -3459,8 +3488,8 @@ pub fn emit_ui_plan(
             let Expr::Record { fields, .. } = cfg_e else {
                 return Err(Diagnostic::CompilerBug {
                     where_: "ipe_backend_rust::emit_ui_call::InputText",
-                    detail: "Input.text cfg must be an inline record literal in Phase 0; \
-                             non-literal cfg is deferred to Phase 1"
+                    detail: "Input.text cfg must be an inline record literal; \
+                             lowering passes no other cfg shape"
                         .into(),
                 });
             };
@@ -3489,7 +3518,8 @@ pub fn emit_ui_plan(
                 "ipe_backend_rust::emit_ui_call::InputText::label",
             )?;
             let attrs_s = emit_expr_at(ctx, attrs_e, indent, child, generics)?;
-            let on_change_s = emit_arc_callback_field(ctx, on_change_e, indent, child, generics)?;
+            let on_change_s =
+                emit_adapted_arc(ctx, on_change_e, INPUT_FIELD, indent, child, generics)?;
             let text_s = emit_expr_at(ctx, text_e, indent, child, generics)?;
             let placeholder_s = emit_expr_at(ctx, placeholder_e, indent, child, generics)?;
             let label_s = emit_expr_at(ctx, label_e, indent, child, generics)?;
@@ -3507,6 +3537,11 @@ pub fn emit_ui_plan(
         }
 
         NativeUiEmit::InputMultiline => {
+            // IPE-RUST-AUDIT:ACCEPTED (Arthur Maciel) — compile-time `const` assertion (not a runtime panic); fails the BUILD if this arm adapts a slot `KernelFn::adapted_slots` does not list, so lowering would leave it un-normalized [ledger #boundary]
+            const _: () = assert!(all_adapt(
+                &[KernelFn::InputMultiline],
+                AdaptedSlot::Field { arg: 1 }
+            ));
             let [attrs_e, cfg_e] = args else {
                 return Err(Diagnostic::CompilerBug {
                     where_: "ipe_backend_rust::emit_ui_call::InputMultiline",
@@ -3516,7 +3551,7 @@ pub fn emit_ui_plan(
             let Expr::Record { fields, .. } = cfg_e else {
                 return Err(Diagnostic::CompilerBug {
                     where_: "ipe_backend_rust::emit_ui_call::InputMultiline",
-                    detail: "Input.multiline cfg must be an inline record literal in Phase 0"
+                    detail: "Input.multiline cfg must be an inline record literal; lowering passes no other cfg shape"
                         .into(),
                 });
             };
@@ -3551,7 +3586,8 @@ pub fn emit_ui_plan(
                 "ipe_backend_rust::emit_ui_call::InputMultiline::spellcheck",
             )?;
             let attrs_s = emit_expr_at(ctx, attrs_e, indent, child, generics)?;
-            let on_change_s = emit_arc_callback_field(ctx, on_change_e, indent, child, generics)?;
+            let on_change_s =
+                emit_adapted_arc(ctx, on_change_e, INPUT_FIELD, indent, child, generics)?;
             let text_s = emit_expr_at(ctx, text_e, indent, child, generics)?;
             let placeholder_s = emit_expr_at(ctx, placeholder_e, indent, child, generics)?;
             let label_s = emit_expr_at(ctx, label_e, indent, child, generics)?;
@@ -3562,6 +3598,11 @@ pub fn emit_ui_plan(
         }
 
         NativeUiEmit::InputCheckbox => {
+            // IPE-RUST-AUDIT:ACCEPTED (Arthur Maciel) — compile-time `const` assertion (not a runtime panic); fails the BUILD if this arm adapts a slot `KernelFn::adapted_slots` does not list, so lowering would leave it un-normalized [ledger #boundary]
+            const _: () = assert!(all_adapt(
+                &[KernelFn::InputCheckbox],
+                AdaptedSlot::Field { arg: 1 }
+            ));
             let [attrs_e, cfg_e] = args else {
                 return Err(Diagnostic::CompilerBug {
                     where_: "ipe_backend_rust::emit_ui_call::InputCheckbox",
@@ -3571,7 +3612,7 @@ pub fn emit_ui_plan(
             let Expr::Record { fields, .. } = cfg_e else {
                 return Err(Diagnostic::CompilerBug {
                     where_: "ipe_backend_rust::emit_ui_call::InputCheckbox",
-                    detail: "Input.checkbox cfg must be an inline record literal in Phase 0".into(),
+                    detail: "Input.checkbox cfg must be an inline record literal; lowering passes no other cfg shape".into(),
                 });
             };
             let on_change_e = lookup_field(
@@ -3599,8 +3640,9 @@ pub fn emit_ui_plan(
                 "ipe_backend_rust::emit_ui_call::InputCheckbox::label",
             )?;
             let attrs_s = emit_expr_at(ctx, attrs_e, indent, child, generics)?;
-            let on_change_s = emit_arc_callback_field(ctx, on_change_e, indent, child, generics)?;
-            let icon_s = emit_arc_callback_field(ctx, icon_e, indent, child, generics)?;
+            let on_change_s =
+                emit_adapted_arc(ctx, on_change_e, INPUT_FIELD, indent, child, generics)?;
+            let icon_s = emit_adapted_arc(ctx, icon_e, INPUT_FIELD, indent, child, generics)?;
             let checked_s = emit_expr_at(ctx, checked_e, indent, child, generics)?;
             let label_s = emit_expr_at(ctx, label_e, indent, child, generics)?;
             Ok(format!(
@@ -3610,6 +3652,11 @@ pub fn emit_ui_plan(
 
         // `Input.slider attrs { onChange, value, min, max, step, label }`
         NativeUiEmit::InputSlider => {
+            // IPE-RUST-AUDIT:ACCEPTED (Arthur Maciel) — compile-time `const` assertion (not a runtime panic); fails the BUILD if this arm adapts a slot `KernelFn::adapted_slots` does not list, so lowering would leave it un-normalized [ledger #boundary]
+            const _: () = assert!(all_adapt(
+                &[KernelFn::InputSlider],
+                AdaptedSlot::Field { arg: 1 }
+            ));
             let [attrs_e, cfg_e] = args else {
                 return Err(Diagnostic::CompilerBug {
                     where_: "ipe_backend_rust::emit_ui_call::InputSlider",
@@ -3619,7 +3666,7 @@ pub fn emit_ui_plan(
             let Expr::Record { fields, .. } = cfg_e else {
                 return Err(Diagnostic::CompilerBug {
                     where_: "ipe_backend_rust::emit_ui_call::InputSlider",
-                    detail: "Input.slider cfg must be an inline record literal in Phase 0".into(),
+                    detail: "Input.slider cfg must be an inline record literal; lowering passes no other cfg shape".into(),
                 });
             };
             let on_change_e = lookup_field(
@@ -3659,7 +3706,8 @@ pub fn emit_ui_plan(
                 "ipe_backend_rust::emit_ui_call::InputSlider::label",
             )?;
             let attrs_s = emit_expr_at(ctx, attrs_e, indent, child, generics)?;
-            let on_change_s = emit_arc_callback_field(ctx, on_change_e, indent, child, generics)?;
+            let on_change_s =
+                emit_adapted_arc(ctx, on_change_e, INPUT_FIELD, indent, child, generics)?;
             let value_s = emit_expr_at(ctx, value_e, indent, child, generics)?;
             let min_s = emit_expr_at(ctx, min_e, indent, child, generics)?;
             let max_s = emit_expr_at(ctx, max_e, indent, child, generics)?;
@@ -3672,6 +3720,11 @@ pub fn emit_ui_plan(
 
         // `Input.radio attrs { onChange, options, selected, label }`
         NativeUiEmit::InputRadio => {
+            // IPE-RUST-AUDIT:ACCEPTED (Arthur Maciel) — compile-time `const` assertion (not a runtime panic); fails the BUILD if this arm adapts a slot `KernelFn::adapted_slots` does not list, so lowering would leave it un-normalized [ledger #boundary]
+            const _: () = assert!(all_adapt(
+                &[KernelFn::InputRadio],
+                AdaptedSlot::Field { arg: 1 }
+            ));
             let [attrs_e, cfg_e] = args else {
                 return Err(Diagnostic::CompilerBug {
                     where_: "ipe_backend_rust::emit_ui_call::InputRadio",
@@ -3681,7 +3734,7 @@ pub fn emit_ui_plan(
             let Expr::Record { fields, .. } = cfg_e else {
                 return Err(Diagnostic::CompilerBug {
                     where_: "ipe_backend_rust::emit_ui_call::InputRadio",
-                    detail: "Input.radio cfg must be an inline record literal in Phase 0".into(),
+                    detail: "Input.radio cfg must be an inline record literal; lowering passes no other cfg shape".into(),
                 });
             };
             let on_change_e = lookup_field(
@@ -3709,7 +3762,8 @@ pub fn emit_ui_plan(
                 "ipe_backend_rust::emit_ui_call::InputRadio::label",
             )?;
             let attrs_s = emit_expr_at(ctx, attrs_e, indent, child, generics)?;
-            let on_change_s = emit_arc_callback_field(ctx, on_change_e, indent, child, generics)?;
+            let on_change_s =
+                emit_adapted_arc(ctx, on_change_e, INPUT_FIELD, indent, child, generics)?;
             let options_s = emit_expr_at(ctx, options_e, indent, child, generics)?;
             let selected_s = emit_expr_at(ctx, selected_e, indent, child, generics)?;
             let label_s = emit_expr_at(ctx, label_e, indent, child, generics)?;
@@ -3720,6 +3774,11 @@ pub fn emit_ui_plan(
 
         // `Input.radioRow attrs { onChange, options, selected, label }`
         NativeUiEmit::InputRadioRow => {
+            // IPE-RUST-AUDIT:ACCEPTED (Arthur Maciel) — compile-time `const` assertion (not a runtime panic); fails the BUILD if this arm adapts a slot `KernelFn::adapted_slots` does not list, so lowering would leave it un-normalized [ledger #boundary]
+            const _: () = assert!(all_adapt(
+                &[KernelFn::InputRadioRow],
+                AdaptedSlot::Field { arg: 1 }
+            ));
             let [attrs_e, cfg_e] = args else {
                 return Err(Diagnostic::CompilerBug {
                     where_: "ipe_backend_rust::emit_ui_call::InputRadioRow",
@@ -3729,7 +3788,7 @@ pub fn emit_ui_plan(
             let Expr::Record { fields, .. } = cfg_e else {
                 return Err(Diagnostic::CompilerBug {
                     where_: "ipe_backend_rust::emit_ui_call::InputRadioRow",
-                    detail: "Input.radioRow cfg must be an inline record literal in Phase 0".into(),
+                    detail: "Input.radioRow cfg must be an inline record literal; lowering passes no other cfg shape".into(),
                 });
             };
             let on_change_e = lookup_field(
@@ -3757,7 +3816,8 @@ pub fn emit_ui_plan(
                 "ipe_backend_rust::emit_ui_call::InputRadioRow::label",
             )?;
             let attrs_s = emit_expr_at(ctx, attrs_e, indent, child, generics)?;
-            let on_change_s = emit_arc_callback_field(ctx, on_change_e, indent, child, generics)?;
+            let on_change_s =
+                emit_adapted_arc(ctx, on_change_e, INPUT_FIELD, indent, child, generics)?;
             let options_s = emit_expr_at(ctx, options_e, indent, child, generics)?;
             let selected_s = emit_expr_at(ctx, selected_e, indent, child, generics)?;
             let label_s = emit_expr_at(ctx, label_e, indent, child, generics)?;
@@ -3784,146 +3844,122 @@ pub fn emit_ui_plan(
             ))
         }
 
-        // `Ui.onInput : (String -> msg) -> Attribute msg`  (Arc-wrap the fn)
-        //
-        // D5: route through `emit_arc_callback_field` so any lowerer-hoisted
-        // capture-clone `let`s (pre-clone `Let { value: CloneVar }` wrapping the
-        // Lambda) are peeled OUTSIDE the synthesized `Arc::new(move |_x| …)`.
-        // Without this, the outer `move` still move-captures the free outer binding
-        // and a sibling use hits E0382 — the same move-capture bug shape the
-        // on_change FIELD path guards against, applied to the inline-wrap sites.
-        // When there are no leading pure-alias `let`s, `emit_arc_callback_field`
-        // produces output byte-identical to a plain `arc_callback_wrap` call.
+        // `Ui.onInput : (String -> msg) -> Attribute msg`: the handler closure fills the `Arc` slot.
         NativeUiEmit::OnInput => {
+            // IPE-RUST-AUDIT:ACCEPTED (Arthur Maciel) — compile-time `const` assertion (not a runtime panic); fails the BUILD if this arm adapts a slot `KernelFn::adapted_slots` does not list, so lowering would leave it un-normalized [ledger #boundary]
+            const _: () = assert!(all_adapt(&[KernelFn::UiOnInput], AdaptedSlot::Arg(0)));
             let [handler_expr] = args else {
                 return Err(Diagnostic::CompilerBug {
                     where_: "ipe_backend_rust::emit_ui_call::UiOnInput",
                     detail: format!("Ui.onInput requires 1 argument, got {}", args.len()),
                 });
             };
-            // Peel any leading capture-clone `let`s outside the Arc closure.
-            let peeled = emit_arc_callback_field(ctx, handler_expr, indent, child, generics)?;
-            Ok(format!("ipe_runtime::ui::helpers::ui_on_input_({peeled})"))
+            let handler_s = emit_adapted_arc(ctx, handler_expr, UI_EVENT, indent, child, generics)?;
+            Ok(format!(
+                "ipe_runtime::ui::helpers::ui_on_input_({handler_s})"
+            ))
         }
 
-        // `Ui.onChange : (String -> msg) -> Attribute msg`  (Arc-wrap)
-        // D5: same peel-hoist as UiOnInput above.
+        // `Ui.onChange : (String -> msg) -> Attribute msg`
         NativeUiEmit::OnChange => {
+            // IPE-RUST-AUDIT:ACCEPTED (Arthur Maciel) — compile-time `const` assertion (not a runtime panic); fails the BUILD if this arm adapts a slot `KernelFn::adapted_slots` does not list, so lowering would leave it un-normalized [ledger #boundary]
+            const _: () = assert!(all_adapt(&[KernelFn::UiOnChange], AdaptedSlot::Arg(0)));
             let [handler_expr] = args else {
                 return Err(Diagnostic::CompilerBug {
                     where_: "ipe_backend_rust::emit_ui_call::UiOnChange",
                     detail: format!("Ui.onChange requires 1 argument, got {}", args.len()),
                 });
             };
-            let peeled = emit_arc_callback_field(ctx, handler_expr, indent, child, generics)?;
-            Ok(format!("ipe_runtime::ui::helpers::ui_on_change_({peeled})"))
+            let handler_s = emit_adapted_arc(ctx, handler_expr, UI_EVENT, indent, child, generics)?;
+            Ok(format!(
+                "ipe_runtime::ui::helpers::ui_on_change_({handler_s})"
+            ))
         }
 
-        // `Ui.onKeyDown : (String -> msg) -> Attribute msg`  (Arc-wrap)
-        //
-        // D5: route through `emit_arc_callback_field` so any lowerer-hoisted
-        // capture-clone `let`s are peeled OUTSIDE the synthesized Arc closure.
-        // Without this, a sibling attribute sharing the same capture hits E0382
-        // (use after move) — a SEAL break.
+        // `Ui.onKeyDown : (String -> msg) -> Attribute msg`
         NativeUiEmit::OnKeyDown => {
+            // IPE-RUST-AUDIT:ACCEPTED (Arthur Maciel) — compile-time `const` assertion (not a runtime panic); fails the BUILD if this arm adapts a slot `KernelFn::adapted_slots` does not list, so lowering would leave it un-normalized [ledger #boundary]
+            const _: () = assert!(all_adapt(&[KernelFn::UiOnKeyDown], AdaptedSlot::Arg(0)));
             let [handler_expr] = args else {
                 return Err(Diagnostic::CompilerBug {
                     where_: "ipe_backend_rust::emit_ui_call::UiOnKeyDown",
                     detail: format!("Ui.onKeyDown requires 1 argument, got {}", args.len()),
                 });
             };
-            let peeled = emit_arc_callback_field(ctx, handler_expr, indent, child, generics)?;
+            let handler_s = emit_adapted_arc(ctx, handler_expr, UI_EVENT, indent, child, generics)?;
             Ok(format!(
-                "ipe_runtime::ui::helpers::ui_on_key_down_({peeled})"
+                "ipe_runtime::ui::helpers::ui_on_key_down_({handler_s})"
             ))
         }
 
-        // `Ui.onKeyUp : (String -> msg) -> Attribute msg`  (Arc-wrap)
-        // D5: same peel-hoist as OnKeyDown above.
+        // `Ui.onKeyUp : (String -> msg) -> Attribute msg`
         NativeUiEmit::OnKeyUp => {
+            // IPE-RUST-AUDIT:ACCEPTED (Arthur Maciel) — compile-time `const` assertion (not a runtime panic); fails the BUILD if this arm adapts a slot `KernelFn::adapted_slots` does not list, so lowering would leave it un-normalized [ledger #boundary]
+            const _: () = assert!(all_adapt(&[KernelFn::UiOnKeyUp], AdaptedSlot::Arg(0)));
             let [handler_expr] = args else {
                 return Err(Diagnostic::CompilerBug {
                     where_: "ipe_backend_rust::emit_ui_call::UiOnKeyUp",
                     detail: format!("Ui.onKeyUp requires 1 argument, got {}", args.len()),
                 });
             };
-            let peeled = emit_arc_callback_field(ctx, handler_expr, indent, child, generics)?;
-            Ok(format!("ipe_runtime::ui::helpers::ui_on_key_up_({peeled})"))
+            let handler_s = emit_adapted_arc(ctx, handler_expr, UI_EVENT, indent, child, generics)?;
+            Ok(format!(
+                "ipe_runtime::ui::helpers::ui_on_key_up_({handler_s})"
+            ))
         }
 
-        // `Ui.onFile : (String -> msg) -> Attribute msg`  (Arc-wrap)
-        // D5: same peel-hoist as OnKeyDown above.
+        // `Ui.onFile : (String -> msg) -> Attribute msg`
         NativeUiEmit::OnFile => {
+            // IPE-RUST-AUDIT:ACCEPTED (Arthur Maciel) — compile-time `const` assertion (not a runtime panic); fails the BUILD if this arm adapts a slot `KernelFn::adapted_slots` does not list, so lowering would leave it un-normalized [ledger #boundary]
+            const _: () = assert!(all_adapt(&[KernelFn::UiOnFile], AdaptedSlot::Arg(0)));
             let [handler_expr] = args else {
                 return Err(Diagnostic::CompilerBug {
                     where_: "ipe_backend_rust::emit_ui_call::UiOnFile",
                     detail: format!("Ui.onFile requires 1 argument, got {}", args.len()),
                 });
             };
-            let peeled = emit_arc_callback_field(ctx, handler_expr, indent, child, generics)?;
-            Ok(format!("ipe_runtime::ui::helpers::ui_on_file_({peeled})"))
+            let handler_s = emit_adapted_arc(ctx, handler_expr, UI_EVENT, indent, child, generics)?;
+            Ok(format!(
+                "ipe_runtime::ui::helpers::ui_on_file_({handler_s})"
+            ))
         }
 
-        // `Event.onBool : (Bool -> msg) -> Attribute msg`  (Arc-wrap, bool arg)
-        // D5: same peel-hoist as OnKeyDown above.
+        // `Event.onBool : (Bool -> msg) -> Attribute msg`
         NativeUiEmit::OnBool => {
+            // IPE-RUST-AUDIT:ACCEPTED (Arthur Maciel) — compile-time `const` assertion (not a runtime panic); fails the BUILD if this arm adapts a slot `KernelFn::adapted_slots` does not list, so lowering would leave it un-normalized [ledger #boundary]
+            const _: () = assert!(all_adapt(&[KernelFn::UiOnBool], AdaptedSlot::Arg(0)));
             let [handler_expr] = args else {
                 return Err(Diagnostic::CompilerBug {
                     where_: "ipe_backend_rust::emit_ui_call::UiOnBool",
                     detail: format!("Event.onBool requires 1 argument, got {}", args.len()),
                 });
             };
-            let peeled = emit_arc_callback_field(ctx, handler_expr, indent, child, generics)?;
-            Ok(format!("ipe_runtime::ui::helpers::ui_on_bool_({peeled})"))
+            let handler_s = emit_adapted_arc(ctx, handler_expr, UI_EVENT, indent, child, generics)?;
+            Ok(format!(
+                "ipe_runtime::ui::helpers::ui_on_bool_({handler_s})"
+            ))
         }
 
         // `Ui.onSubmit : (a -> msg) -> Attribute msg`
         // `ui_on_submit_` builds `Event::OnForm` with the concrete argument
-        // type recovered by Rust generic inference on the emitted handler
-        // closure `handler_src` — this emit site is generic over that type, and the
-        // runtime function's signature carries it (never `Arc<dyn Any>`).
-        //
-        // `ui_on_submit_`'s generic bound is `F: Fn(T) -> M + Send +
-        // Sync + 'static`, but `handler_src` here is a `Box<dyn Fn(T) -> M + Send +
-        // 'static>` trait object (the generic `IrType::Fun` rendering in
-        // `emit_types.rs` never claims `+Sync`) — passed straight through as
-        // `F`, that box can never satisfy `+ Sync` regardless of what the
-        // closure inside captures (a trait object's auto-trait set is
-        // exactly its bound list). Wrap in a freshly-declared closure
-        // (`move |_x| ({handler_src})(_x)`) the same way the `HtmlEvent` String/Bool
-        // arms above do: `handler_src`'s box-construction is re-embedded as SOURCE
-        // inside the wrapper's body, so it is built anew on every call
-        // rather than captured — the wrapper's own Send+Sync-ness then
-        // depends only on the Ipê closure's legitimate `move` captures
-        // (Send+'static by construction), not on the erased trait-object
-        // type.
-        //
-        // this re-wrap ONLY helps when `handler_expr` is an INLINE
-        // `Lambda`/`FuncValue` here (the box is rebuilt as source inside the
-        // wrapper body, never captured). When `handler_expr` is `Expr::Var(sym)`
-        // referencing a PREVIOUSLY `let`-bound closure, `handler_src` is the bare
-        // identifier, and `move |_x| (handler)(_x)` MOVES the already-built
-        // `Box<dyn Fn + Send>` into the wrapper's captures — a non-`Sync`
-        // capture makes the wrapper non-`Sync`, so no emit-site fix is
-        // possible for that shape (the box already exists by the time this arm
-        // runs). The real fix is upstream in `ipe_lower::lower_let_pvar`:
-        // `flows_into_sync_kernel_call` promotes the LET-BOUND VALUE itself to
-        // `Expr::SharedLambda` (`Arc<dyn Fn + Send + Sync>`), so `handler_src` here is
-        // already `Send + Sync` — no change needed in this arm.
+        // type recovered by Rust generic inference on the handler closure, so
+        // this site is generic over that type (never `Arc<dyn Any>`). Its bound
+        // is `F: Fn(T) -> M + Send + Sync + 'static`: the handler closure goes
+        // in directly, so its `Sync`-ness is that of its own captures, which
+        // the lowerer promotes to the `Sync` carrier for this kernel
+        // (`requires_sync_capture`).
         NativeUiEmit::OnSubmit => {
+            // IPE-RUST-AUDIT:ACCEPTED (Arthur Maciel) — compile-time `const` assertion (not a runtime panic); fails the BUILD if this arm adapts a slot `KernelFn::adapted_slots` does not list, so lowering would leave it un-normalized [ledger #boundary]
+            const _: () = assert!(all_adapt(
+                &[KernelFn::UiOnSubmit],
+                AdaptedSlot::FormHandler(0)
+            ));
             let [handler_expr] = args else {
                 return Err(Diagnostic::CompilerBug {
                     where_: "ipe_backend_rust::emit_ui_call::UiOnSubmit",
                     detail: format!("Ui.onSubmit requires 1 argument, got {}", args.len()),
                 });
             };
-            // Peel any lowerer-hoisted capture-clone `let`s OUT of the `move`
-            // closure so a sibling attribute reading the same captured binding
-            // survives (E0382 — accept-then-cargo-fail SEAL break). The FixedValue
-            // handler is a bare value, not a `move` closure, so it never needs the
-            // hoist; only the Decoder path wraps in `move |_x| …`.
-            let (hoisted, peeled_handler) = peel_callback_capture_clones(handler_expr);
-            let handler_src = emit_expr_at(ctx, peeled_handler, indent, child, generics)?;
             // Type-directed dispatch. The lowerer classified the handler
             // by its SOLVED type; a non-arrow value routes to the fixed-dispatch
             // runtime helper (no `(m)(_x)` call against a non-callable value —
@@ -3932,16 +3968,15 @@ pub fn emit_ui_plan(
             // onSubmit kernel and fails closed rather than guessing.
             let call = match on_form {
                 ipe_ir::OnFormKind::Decoder => {
-                    let prefix =
-                        render_hoisted_clone_prefix(ctx, &hoisted, indent, child, generics)?;
-                    let inner = format!(
-                        "ipe_runtime::ui::helpers::ui_on_submit_(move |_x| ({handler_src})(_x))"
-                    );
-                    if prefix.is_empty() {
-                        inner
-                    } else {
-                        format!("{{ {prefix}{inner} }}")
-                    }
+                    let handler_s = emit_adapted_closure(
+                        ctx,
+                        handler_expr,
+                        "ipe_backend_rust::emit_ui_call::UiOnSubmit",
+                        indent,
+                        child,
+                        generics,
+                    )?;
+                    format!("ipe_runtime::ui::helpers::ui_on_submit_({handler_s})")
                 }
                 ipe_ir::OnFormKind::FixedValue => {
                     let handler_src = emit_expr_at(ctx, handler_expr, indent, child, generics)?;
@@ -3960,6 +3995,8 @@ pub fn emit_ui_plan(
 
         // `CustomElement.node ce state on_up` — the server-driven custom-element node.
         NativeUiEmit::Widget => {
+            // IPE-RUST-AUDIT:ACCEPTED (Arthur Maciel) — compile-time `const` assertion (not a runtime panic); fails the BUILD if this arm adapts a slot `KernelFn::adapted_slots` does not list, so lowering would leave it un-normalized [ledger #boundary]
+            const _: () = assert!(all_adapt(&[KernelFn::UiWidget], AdaptedSlot::Arg(2)));
             let [ce_expr, state_expr, handler_expr] = args else {
                 return Err(Diagnostic::CompilerBug {
                     where_: "ipe_backend_rust::emit_ui_call::UiWidget",
@@ -3971,29 +4008,19 @@ pub fn emit_ui_plan(
             };
             let ce_src = emit_expr_at(ctx, ce_expr, indent, child, generics)?;
             let state_src = emit_expr_at(ctx, state_expr, indent, child, generics)?;
-            // The handler carries `F: Fn(Up) -> M + Send + Sync + 'static`, which
-            // the codegen's default `Box<dyn Fn + Send>` fn-value rendering does
-            // NOT satisfy (a boxed trait object is `Sync` only if its bound list
-            // says so). Re-wrap its SOURCE in a freshly-declared closure at the
-            // call site — `move |_x| ({handler})(_x)` — so the box is built anew
-            // inside the wrapper's body and never captured, exactly as the
-            // `OnSubmit` / `String` / `Bool` event arms do. Peel any
-            // lowerer-hoisted capture-clone `let`s OUT of the wrapping `move` so a
-            // sibling attribute reading the same captured binding survives (E0382,
-            // an accept-then-cargo-fail SEAL break).
-            let (hoisted, peeled_handler) = peel_callback_capture_clones(handler_expr);
-            let handler_src = emit_expr_at(ctx, peeled_handler, indent, child, generics)?;
-            let prefix = render_hoisted_clone_prefix(ctx, &hoisted, indent, child, generics)?;
-            let inner = format!(
-                "ipe_runtime::ui::widget::ui_widget_({ce_src}, {state_src}, \
-                 move |_x| ({handler_src})(_x))"
-            );
-            let call = if prefix.is_empty() {
-                inner
-            } else {
-                format!("{{ {prefix}{inner} }}")
-            };
-            Ok(call)
+            // `ui_widget_`'s bound is `F: Fn(Up) -> M + Send + Sync + 'static`;
+            // the handler closure goes in directly.
+            let handler_s = emit_adapted_closure(
+                ctx,
+                handler_expr,
+                "ipe_backend_rust::emit_ui_call::UiWidget",
+                indent,
+                child,
+                generics,
+            )?;
+            Ok(format!(
+                "ipe_runtime::ui::widget::ui_widget_({ce_src}, {state_src}, {handler_s})"
+            ))
         }
 
         // ── Ipe.Html.Events builders ────────────────────────────────────
@@ -4001,12 +4028,14 @@ pub fn emit_ui_plan(
         // runtime constructor. The fixed wire event name (`"click"`, `"input"`,
         // …) is a compile-time constant from `html_event_wire_name`; the payload
         // shape (Msg / String / Bool / Raw) comes from `html_event_shape`. The
-        // `String`/`Bool` forms Arc-wrap the emitted Ipê fn (`f` is a 'static
-        // closure); the `Raw` (onSubmit) form (`html_on_raw_`) builds
+        // `String`/`Bool` forms place the handler closure in the runtime's
+        // `Arc` slot; the `Raw` (onSubmit) form (`html_on_raw_`) builds
         // `Event::OnForm` with the concrete payload type recovered by Rust
-        // generic inference on the emitted closure — never a type-erased
+        // generic inference on the handler closure — never a type-erased
         // handler.
         NativeUiEmit::HtmlEvent => {
+            // IPE-RUST-AUDIT:ACCEPTED (Arthur Maciel) — compile-time `const` assertion (not a runtime panic); fails the BUILD if this arm adapts a slot `KernelFn::adapted_slots` does not list, so lowering would leave it un-normalized [ledger #boundary]
+            const _: () = assert!(html_events_adapt(KernelFn::ALL));
             let (Some(shape), Some(name)) = (k.html_event_shape(), k.html_event_wire_name()) else {
                 return Err(Diagnostic::CompilerBug {
                     where_: "ipe_backend_rust::emit_ui_call::HtmlEvent",
@@ -4020,115 +4049,48 @@ pub fn emit_ui_plan(
                     detail: format!("{k:?} requires exactly 1 argument, got {}", args.len()),
                 });
             };
-            let payload_s = emit_expr_at(ctx, payload_e, indent, child, generics)?;
-            // The `String`/`Bool` (and `Raw` decoder) forms wrap the handler in a
-            // `move |_x| …` closure; peel any lowerer-hoisted capture-clone `let`s
-            // OUT of that closure so a sibling attribute reading the same captured
-            // binding survives (E0382 — accept-then-cargo-fail SEAL break). The
-            // `Msg` and `Raw` fixed-value forms pass the payload as a plain value,
-            // never a `move` closure, so they need no peel and keep `payload_s`.
-            let (payload_hoisted, peeled_payload) = peel_callback_capture_clones(payload_e);
-            let peeled_payload_src = emit_expr_at(ctx, peeled_payload, indent, child, generics)?;
-            let payload_prefix =
-                render_hoisted_clone_prefix(ctx, &payload_hoisted, indent, child, generics)?;
-            let wrap_hoisted = |wrapped: String| {
-                if payload_prefix.is_empty() {
-                    wrapped
-                } else {
-                    format!("{{ {payload_prefix}{wrapped} }}")
-                }
-            };
             let call = match shape {
                 ipe_ir::HtmlEventShape::Msg => {
+                    let payload_s = emit_expr_at(ctx, payload_e, indent, child, generics)?;
                     format!("ipe_runtime::html::html_on_msg_({name_lit}.to_owned(), {payload_s})")
                 }
-                ipe_ir::HtmlEventShape::String => wrap_hoisted(format!(
-                    "ipe_runtime::html::html_on_string_({name_lit}.to_owned(), \
-                     ::std::sync::Arc::new(move |_x| ({peeled_payload_src})(_x)))"
-                )),
-                ipe_ir::HtmlEventShape::Bool => wrap_hoisted(format!(
-                    "ipe_runtime::html::html_on_bool_({name_lit}.to_owned(), \
-                     ::std::sync::Arc::new(move |_x| ({peeled_payload_src})(_x)))"
-                )),
-                // `html_on_raw_`'s own signature requires
-                // `F: Fn(T) -> M + Send + Sync + 'static` (the runtime's
-                // `Event::OnForm` slot is `Arc<dyn Fn(FormData) -> Option<M> +
-                // Send + Sync>`, shared across the live session's dispatch
-                // table — see `html.rs`'s `Event` doc comment). But
-                // `payload_s` here is a `Box<dyn Fn(T) -> M + Send + 'static>`
-                // trait object (the generic `IrType::Fun` rendering in
-                // `emit_types.rs`, which never claims `+Sync` for a boxed
-                // first-class function value) — a trait object's auto-trait
-                // set is exactly what its bound lists, so passing that Box
-                // value THROUGH unchanged as `F` can never satisfy `+ Sync`
-                // regardless of what the closure inside actually captures.
-                // The `String`/`Bool` arms above dodge this by re-embedding
-                // `payload_s`'s SOURCE inside a freshly-declared wrapping
-                // closure (`move |_x| ({payload_s})(_x)`) rather than passing
-                // the boxed VALUE itself — the box is constructed anew each
-                // call, inside the wrapping closure's body, so it is never
-                // part of the wrapping closure's captured environment and
-                // the wrapping closure's own Send+Sync-ness depends only on
-                // whatever the Ipê closure itself legitimately captures
-                // (`move` locals, all Send+'static by construction). Apply
-                // the same technique here so `F` is this freshly-Sync outer
-                // closure, not the non-Sync boxed trait object.
-                //
-                // `onSubmit`'s Ipê-level scheme (`constrain.rs`'s
-                // `HtmlEventShape::Raw` arm) deliberately leaves the argument
-                // type UNCONSTRAINED (decoupled from `msg`) so the typed-
-                // record decode idiom above works. That also legitimately
-                // types a BARE (non-function) `msg` value — the canonical
-                // "form fields already synced into Model via onInput/
-                // onChange; submit just triggers a fixed action" idiom
-                // (`onSubmit DoSignUp` with `DoSignUp : Msg` carrying no
-                // payload — `examples/12-ipevote`'s Auth/Submit/Detail
-                // pages). `payload_s` there renders as the bare enum value
-                // itself (e.g. `MainMsg::DoSignUp`), which is NOT callable —
-                // `(payload_s)(_x)` is E0618 ("expected function, found
-                // MainMsg"), a ipe-exit-0-then-cargo-fail SEAL violation.
-                // `lower_expr`'s `VarCtor` arm already proves the shape: a
-                // NULLARY constructor reference lowers straight to
-                // `Expr::Ctor { args: [] }` (a saturated value), while a
-                // PAYLOAD constructor reference used as a value is
-                // eta-expanded into a genuine `Expr::Lambda` there — so
-                // `Expr::Ctor` reaching this position (any arity — `Ctor`
-                // is always fully saturated by construction, see its doc)
-                // is PROVABLY not a function. Route it (and the other
-                // leaf-literal shapes that are equally provably not
-                // callable) to `html_on_raw_fixed_`, which dispatches the
-                // fixed value directly and never attempts to decode
-                // `FormData` into a placeholder type (that would risk a
-                // spurious decode failure silently swallowing a real
-                // form's submit — see that fn's doc). Every other shape
-                // (`Lambda`, `FuncValue`, `Var`, `Apply`, `Call`, …) keeps
-                // today's wrap-and-call path unchanged — conservative
-                // default, since those CAN legitimately be a function
-                // value (a let-bound handler, a named decoder function).
-                // `onSubmit` (the only `Raw`-shape kernel). The
-                // decode-vs-fixed decision is TYPE-DIRECTED: the lowerer read
-                // the handler's SOLVED type and recorded the verdict on the
-                // `Call` (`on_form`), so acceptance never depends on the
-                // payload's syntactic shape — a `Var` bound to a bare `Msg`
-                // and a `Var` bound to a decoder fn read identically
-                // here, but the solver told them apart upstream.
-                //
-                // FixedValue → dispatch the value directly via
-                // `html_on_raw_fixed_` (no `(payload_s)(_x)` call against a
-                // non-callable value — the reported cargo `E0618` after `ipe`
-                // exit 0). Decoder → the wrap-and-call path: `payload_s` (a
-                // `Box<dyn Fn(T) -> M + Send + 'static>` trait object) is
-                // re-embedded as SOURCE inside a freshly-declared wrapper
-                // closure so its box is rebuilt per call rather than captured,
-                // laundering the missing `+Sync` the `html_on_raw_` bound
-                // (`F: Fn(T) -> M + Send + Sync + 'static`) requires.
+                ipe_ir::HtmlEventShape::String => {
+                    let payload_s =
+                        emit_adapted_arc(ctx, payload_e, HTML_EVENT, indent, child, generics)?;
+                    format!(
+                        "ipe_runtime::html::html_on_string_({name_lit}.to_owned(), {payload_s})"
+                    )
+                }
+                ipe_ir::HtmlEventShape::Bool => {
+                    let payload_s =
+                        emit_adapted_arc(ctx, payload_e, HTML_EVENT, indent, child, generics)?;
+                    format!("ipe_runtime::html::html_on_bool_({name_lit}.to_owned(), {payload_s})")
+                }
+                // `onSubmit` (the only `Raw`-shape kernel). Its Ipê scheme leaves
+                // the argument type unconstrained, so the handler is either a
+                // decoder function or a bare fixed `msg` value. The decision is
+                // type-directed: the lowerer read the handler's solved type and
+                // recorded the verdict on the `Call` (`on_form`), never the
+                // payload's syntactic shape. FixedValue dispatches the value
+                // through `html_on_raw_fixed_` (no call against a non-callable
+                // value, E0618); Decoder passes the handler closure to
+                // `html_on_raw_`, whose bound is
+                // `F: Fn(T) -> M + Send + Sync + 'static`.
                 ipe_ir::HtmlEventShape::Raw => match on_form {
-                    ipe_ir::OnFormKind::FixedValue => format!(
-                        "ipe_runtime::html::html_on_raw_fixed_({name_lit}.to_owned(), {payload_s})"
-                    ),
-                    ipe_ir::OnFormKind::Decoder => wrap_hoisted(format!(
-                        "ipe_runtime::html::html_on_raw_({name_lit}.to_owned(), move |_x| ({peeled_payload_src})(_x))"
-                    )),
+                    ipe_ir::OnFormKind::FixedValue => {
+                        let payload_s = emit_expr_at(ctx, payload_e, indent, child, generics)?;
+                        format!(
+                            "ipe_runtime::html::html_on_raw_fixed_({name_lit}.to_owned(), {payload_s})"
+                        )
+                    }
+                    ipe_ir::OnFormKind::Decoder => {
+                        let payload_s = emit_adapted_closure(
+                            ctx, payload_e, HTML_EVENT, indent, child, generics,
+                        )?;
+                        format!(
+                            "ipe_runtime::html::html_on_raw_({name_lit}.to_owned(), {payload_s})"
+                        )
+                    }
                     ipe_ir::OnFormKind::NotForm => {
                         return Err(Diagnostic::CompilerBug {
                             where_: "ipe_backend_rust::emit_ui_call::HtmlOnSubmit",
@@ -4142,128 +4104,132 @@ pub fn emit_ui_plan(
         }
 
         // ── Ipe.Ui.Lazy — deferred subtree helpers ───────────────────────────
-        // Each variant carries (f, a..e) — f is a function-valued Ipê expr;
-        // we eta-wrap it so any callable shape (fn item, Box<dyn Fn>, closure)
-        // is accepted by the `impl Fn` bound without Arc overhead.
-        // Arg order MUST match the runtime signature; a swap is a silent bug.
-        //
-        // The eta-wrap is a `move |_a…| …` thunk closure; peel any lowerer-hoisted
-        // capture-clone `let`s OUT of it ([`peel_callback_capture_clones`]) so a
-        // positional key arg (`a..e`) that legitimately `.clone()`s the same
-        // captured binding survives (E0382 — accept-then-cargo-fail SEAL break).
-        // The key args are emitted from their ORIGINAL exprs, untouched.
+        // Each variant carries (f, a..e): `f` is the view closure, passed
+        // directly to the runtime's `impl Fn` bound. Arg order MUST match the
+        // runtime signature; a swap is a silent bug.
         NativeUiEmit::LazyLazy => {
+            // IPE-RUST-AUDIT:ACCEPTED (Arthur Maciel) — compile-time `const` assertion (not a runtime panic); fails the BUILD if this arm adapts a slot `KernelFn::adapted_slots` does not list, so lowering would leave it un-normalized [ledger #boundary]
+            const _: () = assert!(all_adapt(&[KernelFn::LazyLazy], AdaptedSlot::Arg(0)));
             let [handler_expr, a_e] = args else {
                 return Err(Diagnostic::CompilerBug {
                     where_: "ipe_backend_rust::emit_ui_call::LazyLazy",
                     detail: format!("Lazy.lazy requires 2 arguments, got {}", args.len()),
                 });
             };
-            let (hoisted, peeled_handler) = peel_callback_capture_clones(handler_expr);
-            let handler_src = emit_expr_at(ctx, peeled_handler, indent, child, generics)?;
+            let handler_s = emit_adapted_closure(
+                ctx,
+                handler_expr,
+                "ipe_backend_rust::emit_ui_call::LazyLazy",
+                indent,
+                child,
+                generics,
+            )?;
             let a_s = emit_expr_at(ctx, a_e, indent, child, generics)?;
-            let prefix = render_hoisted_clone_prefix(ctx, &hoisted, indent, child, generics)?;
-            let call =
-                format!("ipe_runtime::ui::lazy::lazy_lazy_(move |_a| ({handler_src})(_a), {a_s})");
-            Ok(if prefix.is_empty() {
-                call
-            } else {
-                format!("{{ {prefix}{call} }}")
-            })
+            Ok(format!(
+                "ipe_runtime::ui::lazy::lazy_lazy_({handler_s}, {a_s})"
+            ))
         }
 
         NativeUiEmit::LazyLazy2 => {
+            // IPE-RUST-AUDIT:ACCEPTED (Arthur Maciel) — compile-time `const` assertion (not a runtime panic); fails the BUILD if this arm adapts a slot `KernelFn::adapted_slots` does not list, so lowering would leave it un-normalized [ledger #boundary]
+            const _: () = assert!(all_adapt(&[KernelFn::LazyLazy2], AdaptedSlot::Arg(0)));
             let [handler_expr, a_e, b_e] = args else {
                 return Err(Diagnostic::CompilerBug {
                     where_: "ipe_backend_rust::emit_ui_call::LazyLazy2",
                     detail: format!("Lazy.lazy2 requires 3 arguments, got {}", args.len()),
                 });
             };
-            let (hoisted, peeled_handler) = peel_callback_capture_clones(handler_expr);
-            let handler_src = emit_expr_at(ctx, peeled_handler, indent, child, generics)?;
+            let handler_s = emit_adapted_closure(
+                ctx,
+                handler_expr,
+                "ipe_backend_rust::emit_ui_call::LazyLazy2",
+                indent,
+                child,
+                generics,
+            )?;
             let a_s = emit_expr_at(ctx, a_e, indent, child, generics)?;
             let b_s = emit_expr_at(ctx, b_e, indent, child, generics)?;
-            let prefix = render_hoisted_clone_prefix(ctx, &hoisted, indent, child, generics)?;
-            let call = format!(
-                "ipe_runtime::ui::lazy::lazy_lazy2_(move |_a, _b| ({handler_src})(_a, _b), {a_s}, {b_s})"
-            );
-            Ok(if prefix.is_empty() {
-                call
-            } else {
-                format!("{{ {prefix}{call} }}")
-            })
+            Ok(format!(
+                "ipe_runtime::ui::lazy::lazy_lazy2_({handler_s}, {a_s}, {b_s})"
+            ))
         }
 
         NativeUiEmit::LazyLazy3 => {
+            // IPE-RUST-AUDIT:ACCEPTED (Arthur Maciel) — compile-time `const` assertion (not a runtime panic); fails the BUILD if this arm adapts a slot `KernelFn::adapted_slots` does not list, so lowering would leave it un-normalized [ledger #boundary]
+            const _: () = assert!(all_adapt(&[KernelFn::LazyLazy3], AdaptedSlot::Arg(0)));
             let [handler_expr, a_e, b_e, c_e] = args else {
                 return Err(Diagnostic::CompilerBug {
                     where_: "ipe_backend_rust::emit_ui_call::LazyLazy3",
                     detail: format!("Lazy.lazy3 requires 4 arguments, got {}", args.len()),
                 });
             };
-            let (hoisted, peeled_handler) = peel_callback_capture_clones(handler_expr);
-            let handler_src = emit_expr_at(ctx, peeled_handler, indent, child, generics)?;
+            let handler_s = emit_adapted_closure(
+                ctx,
+                handler_expr,
+                "ipe_backend_rust::emit_ui_call::LazyLazy3",
+                indent,
+                child,
+                generics,
+            )?;
             let a_s = emit_expr_at(ctx, a_e, indent, child, generics)?;
             let b_s = emit_expr_at(ctx, b_e, indent, child, generics)?;
             let c_s = emit_expr_at(ctx, c_e, indent, child, generics)?;
-            let prefix = render_hoisted_clone_prefix(ctx, &hoisted, indent, child, generics)?;
-            let call = format!(
-                "ipe_runtime::ui::lazy::lazy_lazy3_(move |_a, _b, _c| ({handler_src})(_a, _b, _c), {a_s}, {b_s}, {c_s})"
-            );
-            Ok(if prefix.is_empty() {
-                call
-            } else {
-                format!("{{ {prefix}{call} }}")
-            })
+            Ok(format!(
+                "ipe_runtime::ui::lazy::lazy_lazy3_({handler_s}, {a_s}, {b_s}, {c_s})"
+            ))
         }
 
         NativeUiEmit::LazyLazy4 => {
+            // IPE-RUST-AUDIT:ACCEPTED (Arthur Maciel) — compile-time `const` assertion (not a runtime panic); fails the BUILD if this arm adapts a slot `KernelFn::adapted_slots` does not list, so lowering would leave it un-normalized [ledger #boundary]
+            const _: () = assert!(all_adapt(&[KernelFn::LazyLazy4], AdaptedSlot::Arg(0)));
             let [handler_expr, a_e, b_e, c_e, d_e] = args else {
                 return Err(Diagnostic::CompilerBug {
                     where_: "ipe_backend_rust::emit_ui_call::LazyLazy4",
                     detail: format!("Lazy.lazy4 requires 5 arguments, got {}", args.len()),
                 });
             };
-            let (hoisted, peeled_handler) = peel_callback_capture_clones(handler_expr);
-            let handler_src = emit_expr_at(ctx, peeled_handler, indent, child, generics)?;
+            let handler_s = emit_adapted_closure(
+                ctx,
+                handler_expr,
+                "ipe_backend_rust::emit_ui_call::LazyLazy4",
+                indent,
+                child,
+                generics,
+            )?;
             let a_s = emit_expr_at(ctx, a_e, indent, child, generics)?;
             let b_s = emit_expr_at(ctx, b_e, indent, child, generics)?;
             let c_s = emit_expr_at(ctx, c_e, indent, child, generics)?;
             let d_s = emit_expr_at(ctx, d_e, indent, child, generics)?;
-            let prefix = render_hoisted_clone_prefix(ctx, &hoisted, indent, child, generics)?;
-            let call = format!(
-                "ipe_runtime::ui::lazy::lazy_lazy4_(move |_a, _b, _c, _d| ({handler_src})(_a, _b, _c, _d), {a_s}, {b_s}, {c_s}, {d_s})"
-            );
-            Ok(if prefix.is_empty() {
-                call
-            } else {
-                format!("{{ {prefix}{call} }}")
-            })
+            Ok(format!(
+                "ipe_runtime::ui::lazy::lazy_lazy4_({handler_s}, {a_s}, {b_s}, {c_s}, {d_s})"
+            ))
         }
 
         NativeUiEmit::LazyLazy5 => {
+            // IPE-RUST-AUDIT:ACCEPTED (Arthur Maciel) — compile-time `const` assertion (not a runtime panic); fails the BUILD if this arm adapts a slot `KernelFn::adapted_slots` does not list, so lowering would leave it un-normalized [ledger #boundary]
+            const _: () = assert!(all_adapt(&[KernelFn::LazyLazy5], AdaptedSlot::Arg(0)));
             let [handler_expr, a_e, b_e, c_e, d_e, e_e] = args else {
                 return Err(Diagnostic::CompilerBug {
                     where_: "ipe_backend_rust::emit_ui_call::LazyLazy5",
                     detail: format!("Lazy.lazy5 requires 6 arguments, got {}", args.len()),
                 });
             };
-            let (hoisted, peeled_handler) = peel_callback_capture_clones(handler_expr);
-            let handler_src = emit_expr_at(ctx, peeled_handler, indent, child, generics)?;
+            let handler_s = emit_adapted_closure(
+                ctx,
+                handler_expr,
+                "ipe_backend_rust::emit_ui_call::LazyLazy5",
+                indent,
+                child,
+                generics,
+            )?;
             let a_s = emit_expr_at(ctx, a_e, indent, child, generics)?;
             let b_s = emit_expr_at(ctx, b_e, indent, child, generics)?;
             let c_s = emit_expr_at(ctx, c_e, indent, child, generics)?;
             let d_s = emit_expr_at(ctx, d_e, indent, child, generics)?;
             let e_s = emit_expr_at(ctx, e_e, indent, child, generics)?;
-            let prefix = render_hoisted_clone_prefix(ctx, &hoisted, indent, child, generics)?;
-            let call = format!(
-                "ipe_runtime::ui::lazy::lazy_lazy5_(move |_a, _b, _c, _d, _e| ({handler_src})(_a, _b, _c, _d, _e), {a_s}, {b_s}, {c_s}, {d_s}, {e_s})"
-            );
-            Ok(if prefix.is_empty() {
-                call
-            } else {
-                format!("{{ {prefix}{call} }}")
-            })
+            Ok(format!(
+                "ipe_runtime::ui::lazy::lazy_lazy5_({handler_s}, {a_s}, {b_s}, {c_s}, {d_s}, {e_s})"
+            ))
         }
 
         // ── Ipe.PubSub.publish / publishNoEcho ────────────────────────────

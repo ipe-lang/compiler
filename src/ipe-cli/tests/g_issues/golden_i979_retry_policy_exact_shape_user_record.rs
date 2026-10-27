@@ -16,11 +16,10 @@ use std::path::{Path, PathBuf};
 
 use crate::support::repo_root;
 
-fn fixture_entry(root: &Path) -> PathBuf {
+fn fixture_dir(root: &Path) -> PathBuf {
     root.join("tests")
         .join("golden")
         .join("retry_policy_exact_shape_user_record")
-        .join("Main.ipe")
 }
 
 /// The frontend must accept the user record with `shouldRetry : Int -> Bool`
@@ -28,11 +27,11 @@ fn fixture_entry(root: &Path) -> PathBuf {
 #[test]
 fn retry_policy_exact_shape_user_record_emits() {
     let root = repo_root();
-    let entry = fixture_entry(&root);
+    let golden_dir = fixture_dir(&root);
     let out = crate::support::scratch_root().join("ipec_i979_exact_shape_emit");
     let _ = std::fs::remove_dir_all(&out);
     let runtime = e2e_support::require_runtime().into_path_buf();
-    let built = ipe::build(&entry, &out, &runtime);
+    let built = crate::support::build_golden(&golden_dir, &out, &runtime);
     assert!(
         built.is_ok(),
         "a user record with `shouldRetry : Int -> Bool` and a non-matching fourth \
@@ -50,11 +49,11 @@ fn retry_policy_exact_shape_user_record_emits() {
 #[test]
 fn retry_policy_exact_shape_user_record_builds_and_runs() {
     let root = repo_root();
-    let entry = fixture_entry(&root);
+    let golden_dir = fixture_dir(&root);
     let out = crate::support::scratch_root().join("ipec_i979_exact_shape_e2e");
     let _ = std::fs::remove_dir_all(&out);
     let runtime = e2e_support::require_runtime().into_path_buf();
-    let built = ipe::build(&entry, &out, &runtime);
+    let built = crate::support::build_golden(&golden_dir, &out, &runtime);
     assert!(
         built.is_ok(),
         "retry_policy_exact_shape_user_record: must be accepted; got: {built:?}"

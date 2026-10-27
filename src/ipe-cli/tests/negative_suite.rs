@@ -47,6 +47,12 @@ fn write_entry(name: &str, source: &str) -> PathBuf {
     entry
 }
 
+/// `source` as the `Main` module of a fresh project fixture.
+#[allow(clippy::expect_used)] // a failed scratch setup is the test failure
+fn write_fixture(source: &str) -> ipe::RootFixture {
+    ipe::RootFixture::main(source).expect("scratch setup must succeed")
+}
+
 /// The outcome of running the pipeline over a fixture.
 #[derive(Debug)]
 enum Outcome {
@@ -60,7 +66,7 @@ enum Outcome {
 }
 
 fn compile(name: &str, source: &str, target: Target) -> Outcome {
-    let entry = write_entry(name, source);
+    let fixture = write_fixture(source);
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
         .join("negsuite-out")
         .join(name);
@@ -71,8 +77,8 @@ fn compile(name: &str, source: &str, target: Target) -> Outcome {
         intent: ipe_backend_rust::BuildIntent::Development,
         ..BuildOptions::default()
     };
-    match ipe::build_with_options(&entry, &out, &runtime, options) {
-        Ok(()) => Outcome::Accepted("compiled successfully (exit 0)".to_owned()),
+    match ipe::build_fixture_with_options(&fixture, &out, &runtime, &options) {
+        Ok(_) => Outcome::Accepted("compiled successfully (exit 0)".to_owned()),
         Err(CliError::Pipeline { diag, .. }) => Outcome::Rejected(diag.code().as_str()),
         Err(other) => Outcome::Accepted(format!("non-pipeline error: {other:?}")),
     }
@@ -81,7 +87,7 @@ fn compile(name: &str, source: &str, target: Target) -> Outcome {
 /// Like [`compile`] but with the production flag set — simulates `ipe release`
 /// so the `Debug.*` gate (IPE-L0140) fires without spawning a real release build.
 fn compile_production(name: &str, source: &str) -> Outcome {
-    let entry = write_entry(name, source);
+    let fixture = write_fixture(source);
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
         .join("negsuite-prod-out")
         .join(name);
@@ -91,8 +97,8 @@ fn compile_production(name: &str, source: &str) -> Outcome {
         intent: ipe_backend_rust::BuildIntent::Release,
         ..BuildOptions::default()
     };
-    match ipe::build_with_options(&entry, &out, &runtime, options) {
-        Ok(()) => Outcome::Accepted("compiled successfully (exit 0)".to_owned()),
+    match ipe::build_fixture_with_options(&fixture, &out, &runtime, &options) {
+        Ok(_) => Outcome::Accepted("compiled successfully (exit 0)".to_owned()),
         Err(CliError::Pipeline { diag, .. }) => Outcome::Rejected(diag.code().as_str()),
         Err(other) => Outcome::Accepted(format!("non-pipeline error: {other:?}")),
     }
@@ -117,23 +123,26 @@ fn assert_rejected_production(name: &str, source: &str, expected: &str) {
 /// the entry. Needed for cross-module gates (e.g. duplicate import qualifier)
 /// that the single-file path cannot observe.
 fn compile_project(name: &str, files: &[(&str, &str)]) -> Outcome {
-    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
-        .join("negsuite-proj")
-        .join(name);
-    let _ = std::fs::remove_dir_all(&dir);
-    let src = dir.join("src");
-    crate::support::expect_scratch_step(name, std::fs::create_dir_all(&src));
-    for (fname, contents) in files {
-        crate::support::expect_scratch_step(name, std::fs::write(src.join(fname), contents));
-    }
+    let tree = files.iter().fold(
+        ipe::project_root::SourceTree::new(),
+        |tree, (fname, contents)| tree.module(fname.trim_end_matches(".ipe"), contents),
+    );
+    let fixture = ipe::RootFixture::from_tree(&tree);
+    assert!(
+        fixture.is_ok(),
+        "{name}: scratch fixture setup failed: {:?}",
+        fixture.as_ref().err()
+    );
+    let Ok(fixture) = fixture else {
+        return Outcome::Accepted("scratch fixture setup failed".to_owned());
+    };
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
         .join("negsuite-proj-out")
         .join(name);
     let _ = std::fs::remove_dir_all(&out);
     let runtime = e2e_support::require_runtime().into_path_buf();
-    let entry = src.join("Main.ipe");
-    match ipe::build_loose_file(&entry, &out, &runtime) {
-        Ok(()) => Outcome::Accepted("compiled successfully (exit 0)".to_owned()),
+    match ipe::build_fixture(&fixture, &out, &runtime) {
+        Ok(_) => Outcome::Accepted("compiled successfully (exit 0)".to_owned()),
         Err(CliError::Pipeline { diag, .. }) => Outcome::Rejected(diag.code().as_str()),
         Err(other) => Outcome::Accepted(format!("non-pipeline error: {other:?}")),
     }
@@ -259,12 +268,27 @@ fn parse_malformed_type_decl() {
     assert_rejected("parse_type_decl", &src, "IPE-P0031");
 }
 
-/// An unknown character in source (a raw control/garbage byte the lexer cannot
+/// An unknown character in source (a printable symbol the lexer cannot
 /// classify) — lexical rejection.
 #[test]
 fn parse_unknown_character() {
-    let src = format!("{HEAD}main =\n    1 \u{0007} 2\n");
+    let src = format!("{HEAD}main =\n    1 \u{00A7} 2\n");
     assert_rejected("parse_unknown_char", &src, "IPE-P0010");
+}
+
+/// A raw control a terminal runs as a command (here ESC opening a cursor-up and
+/// erase-line sequence in a comment) is refused anywhere in source.
+#[test]
+fn parse_terminal_control() {
+    let src = format!("{HEAD}main =\n    -- ok\u{001B}[1A\u{001B}[2K\n    1\n");
+    assert_rejected("parse_terminal_control", &src, "IPE-P0073");
+}
+
+/// A raw control is refused inside a string literal too; `Char.fromCode` builds one.
+#[test]
+fn parse_terminal_control_in_string() {
+    let src = format!("{HEAD}main =\n    \"a\u{0008}b\"\n");
+    assert_rejected("parse_terminal_control_str", &src, "IPE-P0073");
 }
 
 /// A malformed character literal (empty `''`).
@@ -519,9 +543,10 @@ fn security_ui_html_typed_bridge_compiles() {
 fn security_db_unsafe_exec_raw_off_plain_db_is_rejected() {
     let src = "module Main exposing (main)\n\
                import Ipe.Db as Db\n\
+               import Ipe.Db.Location as Location\n\
                import Ipe.Task as Task\n\
                main =\n\
-                   Task.andThen (\\conn -> Db.unsafeExecRaw conn \"SELECT 1\") (Db.open \"sqlite\" \"sqlite::memory:\")\n";
+                   Task.andThen (\\conn -> Db.unsafeExecRaw conn \"SELECT 1\") (Db.open Location.memory)\n";
     assert_rejected("security_db_unsafe_exec_raw_off_plain", src, "IPE-N0005");
 }
 
@@ -536,9 +561,10 @@ fn security_store_checked_write_kernels_are_unreachable() {
         let via_db = format!(
             "module Main exposing (main)\n\
              import Ipe.Db as Db\n\
+             import Ipe.Db.Location as Location\n\
              import Ipe.Task as Task\n\
              main =\n\
-             \x20   Task.andThen (\\conn -> Db.{member} conn \"t\" []) (Db.open \"sqlite\" \"sqlite::memory:\")\n"
+             \x20   Task.andThen (\\conn -> Db.{member} conn \"t\" []) (Db.open Location.memory)\n"
         );
         assert_rejected(
             &format!("security_db_{member}_unreachable"),
@@ -558,6 +584,90 @@ fn security_store_checked_write_kernels_are_unreachable() {
             "IPE-N0005",
         );
     }
+}
+
+/// A `Db.open` program whose open expression is `open`, then printing `ok`.
+fn db_open_program(open: &str) -> String {
+    format!(
+        "module Main exposing (main)\n\
+         import Ipe.Db as Db\n\
+         import Ipe.Db.Dsn as Dsn\n\
+         import Ipe.Db.Location as Location exposing (Mode(..))\n\
+         import Ipe.Io as Io\n\
+         import Ipe.Path as Path\n\
+         import Ipe.Result as Result\n\
+         import Ipe.Task as Task\n\
+         main : Task Error ()\n\
+         main =\n\
+         \x20   {open}\n\
+         \x20       |> Task.andThen (\\_ -> Io.println \"ok\")\n"
+    )
+}
+
+/// SECURITY: `Db.open` takes one typed `DbLocation`. The driver-and-URL pair
+/// and a bare path string have no representation, so neither reaches a URL
+/// parser: each is a type error at `ipe` time.
+#[test]
+fn security_db_open_refuses_text() {
+    assert_rejected(
+        "security_db_open_driver_and_url",
+        &db_open_program("Db.open \"sqlite\" \"x.db\""),
+        "IPE-T0001",
+    );
+    assert_rejected(
+        "security_db_open_bare_path",
+        &db_open_program("Db.open \"x.db\""),
+        "IPE-T0001",
+    );
+    assert_rejected(
+        "security_db_location_dsn_text",
+        &db_open_program("Db.open (Location.dsn \"postgres://h/d\")"),
+        "IPE-T0001",
+    );
+}
+
+/// SECURITY (contrapositive): every typed location constructor opens.
+#[test]
+fn security_db_open_typed_locations_compile() {
+    assert_compiles(
+        "security_db_open_memory",
+        &db_open_program("Db.open Location.memory"),
+    );
+    assert_compiles(
+        "security_db_open_file",
+        &db_open_program(
+            "Path.fromString \"app.db\"\n\
+             \x20       |> Result.andThen (Location.file CreateIfMissing)\n\
+             \x20       |> Task.fromResult\n\
+             \x20       |> Task.andThen Db.open",
+        ),
+    );
+    assert_compiles(
+        "security_db_open_dsn",
+        &db_open_program(
+            "Dsn.parse \"sqlite:app.db\"\n\
+             \x20       |> Task.fromResult\n\
+             \x20       |> Task.andThen (\\dsn -> Db.open (Location.dsn dsn))",
+        ),
+    );
+}
+
+/// SECURITY: `DbLocation` is a reserved builtin, so a user type cannot shadow
+/// the proof `Db.open` accepts. The same declaration under another name is
+/// accepted.
+#[test]
+fn security_db_location_name_reserved() {
+    assert_rejected(
+        "security_db_location_reserved",
+        &format!("{HEAD}type DbLocation = DbLocation String\nmain = 1\n"),
+        "IPE-N0026",
+    );
+    assert_compiles(
+        "security_db_location_renamed",
+        &format!(
+            "{HEAD}import Ipe.Io as Io\ntype AppLocation = AppLocation String\nmain : Task Error ()\nmain = Io.println \"ok\"\n"
+        ),
+    );
 }
 
 /// SECURITY: the untyped row read `unsafeGetField` no longer lives on the plain
@@ -659,7 +769,7 @@ probe conn =
     (
         "unsafe_query",
         "import Ipe.Db as Db\nimport Ipe.Db.Unsafe as Unsafe\n",
-        r#"probe : Db -> Task Error (List (Dict String String))
+        r#"probe : Db -> Task Error (List (Dict String (Maybe String)))
 probe conn =
     Unsafe.unsafeQuery conn "SELECT 1" @binds@
 "#,
@@ -683,7 +793,7 @@ probe conn =
     (
         "find_projection",
         "import Ipe.Db as Db\nimport Ipe.Db.Sql as Sql\n",
-        r#"probe : Db -> Task Error (List (Dict String String))
+        r#"probe : Db -> Task Error (List (Dict String (Maybe String)))
 probe conn =
     Db.findProjection conn "t" "a0" "u" "a1" (Sql.eq (Sql.column "a0.id") (Sql.int 1)) [] @binds@
 "#,
@@ -691,7 +801,7 @@ probe conn =
     (
         "find_projection_ordered",
         "import Ipe.Db as Db\nimport Ipe.Db.Sql as Sql\n",
-        r#"probe : Db -> Task Error (List (Dict String String))
+        r#"probe : Db -> Task Error (List (Dict String (Maybe String)))
 probe conn =
     Db.findProjectionOrdered conn "t" "a0" "u" "a1" (Sql.eq (Sql.column "a0.id") (Sql.int 1)) [] @binds@ "a0" "id" True
 "#,
@@ -1418,6 +1528,34 @@ fn canon_connection_arity_too_many() {
     assert_rejected("canon_connection_arity2", &src, "IPE-N0031");
 }
 
+/// A declared union takes exactly its declared parameters: over-applied
+/// (`X Int Int` for `type X a`) it is IPE-N0031, never an emitted enum use
+/// cargo refuses (E0107).
+#[test]
+fn canon_union_arity_too_many() {
+    let src = format!(
+        "{HEAD}type X a = A a
+f : X Int Int -> Int
+f x = 0
+main = 1
+"
+    );
+    assert_rejected("canon_union_arity2", &src, "IPE-N0031");
+}
+
+/// A bare one-parameter union is the same arity rejection (IPE-N0031).
+#[test]
+fn canon_union_arity_too_few() {
+    let src = format!(
+        "{HEAD}type X a = A a
+f : X -> Int
+f x = 0
+main = 1
+"
+    );
+    assert_rejected("canon_union_arity0", &src, "IPE-N0031");
+}
+
 /// The SEAL rejects a function-carrying boundary parameter (IPE-N0039): a
 /// function is behaviour, not a serialisable value, and must never cross the
 /// Ipê↔JS seam. Fail-closed at the type level, before emission.
@@ -1485,11 +1623,9 @@ fn canon_custom_element_seal_rejects_type_variable() {
 /// [`Outcome`] the shared harness produces — used for the widget-file-exists path,
 /// which needs a real JS file on disk next to the entry.
 fn compile_with_files(name: &str, source: &str, extra: &[(&str, &str)]) -> Outcome {
-    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
-        .join("negsuite-ce")
-        .join(name);
-    let _ = std::fs::remove_dir_all(&dir);
-    crate::support::expect_scratch_step(name, std::fs::create_dir_all(&dir));
+    let fixture = write_fixture(source);
+    // Widget hooks resolve beside the entry module, under the project's `src/`.
+    let dir = fixture.path().join("src");
     for (rel, contents) in extra {
         let path = dir.join(rel);
         if let Some(parent) = path.parent() {
@@ -1497,15 +1633,13 @@ fn compile_with_files(name: &str, source: &str, extra: &[(&str, &str)]) -> Outco
         }
         crate::support::expect_scratch_step(name, std::fs::write(&path, contents));
     }
-    let entry = dir.join("Main.ipe");
-    crate::support::expect_scratch_step(name, std::fs::write(&entry, source));
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
         .join("negsuite-ce-out")
         .join(name);
     let _ = std::fs::remove_dir_all(&out);
     let runtime = e2e_support::require_runtime().into_path_buf();
-    match ipe::build_with_options(&entry, &out, &runtime, BuildOptions::default()) {
-        Ok(()) => Outcome::Accepted("compiled successfully (exit 0)".to_owned()),
+    match ipe::build_fixture_with_options(&fixture, &out, &runtime, &BuildOptions::default()) {
+        Ok(_) => Outcome::Accepted("compiled successfully (exit 0)".to_owned()),
         Err(CliError::Pipeline { diag, .. }) => Outcome::Rejected(diag.code().as_str()),
         Err(other) => Outcome::Accepted(format!("non-pipeline error: {other:?}")),
     }
@@ -1786,7 +1920,6 @@ fn custom_element_ctor_symlink_escape_rejected_at_build_gate() {
     let name = "custom_element_symlink_escape";
     let base = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("negsuite-ce-symlink");
     let _ = std::fs::remove_dir_all(&base);
-    let project = base.join("project");
     let outside = base.join("outside");
     // The out-of-project directory and a real file inside it (the escape target).
     crate::support::expect_scratch_step(name, std::fs::create_dir_all(&outside));
@@ -1797,28 +1930,28 @@ fn custom_element_ctor_symlink_escape_rejected_at_build_gate() {
             "export function mount(host, emit) { return {}; }\n",
         ),
     );
-    crate::support::expect_scratch_step(name, std::fs::create_dir_all(&project));
-    // In-tree `js` is a SYMLINK to the outside directory.
-    crate::support::expect_scratch_step(
-        name,
-        std::os::unix::fs::symlink(&outside, project.join("js")),
-    );
     let src = format!(
         "{HEAD}import Ipe.Ffi.Js.CustomElement as CustomElement\n\
          editor : CustomElement Int String\n\
          editor = CustomElement.fromFile \"js/evil.js\"\n\
          main = 1\n"
     );
-    let entry = project.join("Main.ipe");
-    crate::support::expect_scratch_step(name, std::fs::write(&entry, &src));
+    let fixture = write_fixture(&src);
+    // In-tree `js` (beside the entry module, under `src/`) is a SYMLINK to the
+    // outside directory.
+    crate::support::expect_scratch_step(
+        name,
+        std::os::unix::fs::symlink(&outside, fixture.path().join("src").join("js")),
+    );
     let out = base.join("out");
     let _ = std::fs::remove_dir_all(&out);
     let runtime = e2e_support::require_runtime().into_path_buf();
-    let outcome = match ipe::build_with_options(&entry, &out, &runtime, BuildOptions::default()) {
-        Ok(()) => Outcome::Accepted("compiled successfully (exit 0)".to_owned()),
-        Err(CliError::Pipeline { diag, .. }) => Outcome::Rejected(diag.code().as_str()),
-        Err(other) => Outcome::Accepted(format!("non-pipeline error: {other:?}")),
-    };
+    let outcome =
+        match ipe::build_fixture_with_options(&fixture, &out, &runtime, &BuildOptions::default()) {
+            Ok(_) => Outcome::Accepted("compiled successfully (exit 0)".to_owned()),
+            Err(CliError::Pipeline { diag, .. }) => Outcome::Rejected(diag.code().as_str()),
+            Err(other) => Outcome::Accepted(format!("non-pipeline error: {other:?}")),
+        };
     let _ = std::fs::remove_dir_all(&base);
     match outcome {
         Outcome::Rejected(got) => assert_eq!(
@@ -3674,9 +3807,9 @@ main =
 
 // ===========================================================================
 // Literal route paths follow the runtime's grammar — IPE-L0156. A `:name` is
-// `[A-Za-z_][A-Za-z0-9_]*` and unique per path; a `Web.route` literal segment
-// is strictly percent-decodable. A literal that breaks it is refused at ipe
-// time rather than at listener startup.
+// `[A-Za-z_][A-Za-z0-9_]*` and unique per path; no segment is a `*` catch-all;
+// a literal segment holds no `:` or `*` and is strictly percent-decodable. A
+// literal that breaks it is refused at ipe time rather than at listener startup.
 // ===========================================================================
 
 /// A `Web.tea` app whose second route pattern is `pattern`, built by the
@@ -3748,6 +3881,18 @@ fn lower_web_route_malformed_escape() {
 }
 
 #[test]
+fn lower_web_route_catch_all() {
+    let src = web_route_fixture("/files/*rest", "HomePage");
+    assert_rejected("lower_web_route_catch_all", &src, "IPE-L0156");
+}
+
+#[test]
+fn lower_web_route_mid_segment_sigil() {
+    let src = web_route_fixture("/file:id", "HomePage");
+    assert_rejected("lower_web_route_mid_segment_sigil", &src, "IPE-L0156");
+}
+
+#[test]
 fn lower_server_route_param_not_identifier() {
     let src = server_route_fixture(r#"Server.get "/:post-id""#);
     assert_rejected("lower_server_route_param_not_identifier", &src, "IPE-L0156");
@@ -3766,6 +3911,77 @@ fn lower_server_route_param_empty() {
 }
 
 #[test]
+fn lower_server_route_catch_all() {
+    let src = server_route_fixture(r#"Server.get "/files/*rest""#);
+    assert_rejected("lower_server_route_catch_all", &src, "IPE-L0156");
+}
+
+#[test]
+fn lower_server_route_mid_segment_sigil() {
+    let src = server_route_fixture(r#"Server.get "/v-:id""#);
+    assert_rejected("lower_server_route_mid_segment_sigil", &src, "IPE-L0156");
+}
+
+#[test]
+fn lower_server_route_not_absolute() {
+    let src = server_route_fixture(r#"Server.get "health""#);
+    assert_rejected("lower_server_route_not_absolute", &src, "IPE-L0156");
+}
+
+#[test]
+fn lower_server_route_malformed_escape() {
+    let src = server_route_fixture(r#"Server.get "/a/%zz""#);
+    assert_rejected("lower_server_route_malformed_escape", &src, "IPE-L0156");
+}
+
+/// A `Server.listen` program over the literal route list `routes`.
+fn server_routes_fixture(routes: &str) -> String {
+    format!(
+        r"module Main exposing (main)
+import Ipe.Http.Server as Server
+import Ipe.Task
+main =
+    Server.listen 8000
+        [ {routes} ]
+"
+    )
+}
+
+#[test]
+fn lower_server_static_prefix_reserved_byte() {
+    for prefix in ["/a?b", "/a#b", "/a/%zz", "/a:b", "/caf\u{e9}", "/assets/"] {
+        let src = server_routes_fixture(&format!(r#"Server.static "{prefix}" "public""#));
+        assert_rejected(
+            "lower_server_static_prefix_reserved_byte",
+            &src,
+            "IPE-L0156",
+        );
+    }
+}
+
+#[test]
+fn lower_server_static_prefix_not_literal() {
+    let src = r#"module Main exposing (main)
+import Ipe.Http.Server as Server
+import Ipe.Task
+assets : String -> Route
+assets prefix = Server.static prefix "public"
+main =
+    Server.listen 8000
+        [ assets "/assets" ]
+"#;
+    assert_rejected("lower_server_static_prefix_not_literal", src, "IPE-L0156");
+}
+
+#[test]
+fn lower_server_static_prefix_duplicate() {
+    let src = server_routes_fixture(
+        r#"Server.static "/assets" "public", Server.static "/assets" "other""#,
+    );
+    assert_rejected("lower_server_static_prefix_duplicate", &src, "IPE-L0156");
+}
+
+#[test]
 fn lower_server_api_path_param_not_identifier() {
     let src = server_route_fixture(r#"Server.api "GET /v1/:a-b""#);
     assert_rejected(
@@ -3773,6 +3989,14 @@ fn lower_server_api_path_param_not_identifier() {
         &src,
         "IPE-L0156",
     );
+}
+
+#[test]
+fn lower_server_api_unknown_method() {
+    for spec in ["FETCH /x", "po\u{17f}t /x"] {
+        let src = server_route_fixture(&format!(r#"Server.api "{spec}""#));
+        assert_rejected("lower_server_api_unknown_method", &src, "IPE-L0156");
+    }
 }
 
 /// A routed `Web.tea` app (its Model has a `page` field) over `page_ty`,
@@ -4024,7 +4248,7 @@ fn well_formed_route_paths_compile() {
     );
     assert_compiles(
         "server_route_well_formed",
-        &server_route_fixture(r#"Server.get "/files/:_dir/*rest""#),
+        &server_route_fixture(r#"Server.get "/files/:_dir/:name""#),
     );
     assert_compiles(
         "server_api_well_formed",
@@ -4200,8 +4424,8 @@ fn generic_row_model_web_embed_rejected() {
 /// A mounted `Web.embed` built inside a definition whose annotation carries a
 /// row generic the entry's model does not visibly use: the model is the
 /// concrete `Model`, and `r` is only the open tail of the `cfg` parameter the
-/// view reads a label from. Region types carry no record row tails, so whether
-/// the entry reaches `r` cannot be determined, and the entry is refused
+/// view reads a label from. The entry's region type does not mention `r`, so
+/// whether the entry reaches it cannot be determined, and the entry is refused
 /// fail-closed.
 const WEB_EMBED_ROW_IN_SCOPE: &str = r#"module Main exposing (main)
 import Ipe.Server.Http as Server
@@ -4234,13 +4458,13 @@ main =
 #[test]
 fn row_generic_in_scope_web_embed_refused_undetermined() {
     let name = "row_generic_in_scope_web_embed";
-    let entry = write_entry(name, WEB_EMBED_ROW_IN_SCOPE);
+    let fixture = write_fixture(WEB_EMBED_ROW_IN_SCOPE);
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
         .join("negsuite-out")
         .join(name);
     let _ = std::fs::remove_dir_all(&out);
     let runtime = e2e_support::require_runtime().into_path_buf();
-    match ipe::build_with_options(&entry, &out, &runtime, BuildOptions::default()) {
+    match ipe::build_fixture_with_options(&fixture, &out, &runtime, &BuildOptions::default()) {
         Err(CliError::Pipeline { diag, .. }) => match *diag {
             ipe_diagnostics::Diagnostic::Name {
                 msg:
@@ -4265,7 +4489,7 @@ fn row_generic_in_scope_web_embed_refused_undetermined() {
                 other.code().as_str()
             ),
         },
-        Ok(()) => fail_accepted(name, "IPE-N0051", "compiled successfully (exit 0)"),
+        Ok(_) => fail_accepted(name, "IPE-N0051", "compiled successfully (exit 0)"),
         Err(other) => fail_accepted(name, "IPE-N0051", &format!("non-pipeline error: {other:?}")),
     }
 }
@@ -4303,13 +4527,13 @@ main =
 #[test]
 fn unpinned_msg_web_embed_refused() {
     let name = "unpinned_msg_web_embed";
-    let entry = write_entry(name, WEB_EMBED_UNPINNED_MSG);
+    let fixture = write_fixture(WEB_EMBED_UNPINNED_MSG);
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
         .join("negsuite-out")
         .join(name);
     let _ = std::fs::remove_dir_all(&out);
     let runtime = e2e_support::require_runtime().into_path_buf();
-    match ipe::build_with_options(&entry, &out, &runtime, BuildOptions::default()) {
+    match ipe::build_fixture_with_options(&fixture, &out, &runtime, &BuildOptions::default()) {
         Err(CliError::Pipeline { diag, .. }) => match *diag {
             ipe_diagnostics::Diagnostic::Name {
                 msg: ipe_diagnostics::NameError::UnpinnedAppEntry { entry },
@@ -4324,7 +4548,7 @@ fn unpinned_msg_web_embed_refused() {
                 other.code().as_str()
             ),
         },
-        Ok(()) => fail_accepted(name, "IPE-N0051", "compiled successfully (exit 0)"),
+        Ok(_) => fail_accepted(name, "IPE-N0051", "compiled successfully (exit 0)"),
         Err(other) => fail_accepted(name, "IPE-N0051", &format!("non-pipeline error: {other:?}")),
     }
 }

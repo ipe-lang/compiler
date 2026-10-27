@@ -1,0 +1,54 @@
+module Main exposing (main)
+import Ipe.Io as Io
+import Ipe.Db
+import Ipe.Db.Location as Location
+import Ipe.String
+import Ipe.Task
+
+-- M5b-db golden: Db.migrate — versioned forward-only schema migrations.
+-- All operations run inside a single withTransaction so the in-memory SQLite
+-- pool routes every call through one connection (each pool connection is a
+-- separate in-memory DB; the task-local flattens nested txns onto it).
+--
+-- First call applies two migrations → returns their names joined by ",".
+-- Second call (same migrations) → idempotent → returns [] → empty string.
+-- Output: "001_create_users,002_add_email|"
+-- (the "|" separator shows the second call returned an empty list)
+
+main =
+    Task.andThen
+        (\conn ->
+            Db.withTransaction conn
+                (\txconn ->
+                    Task.andThen
+                        (\applied1 ->
+                            Task.andThen
+                                (\applied2 ->
+                                    Io.println
+                                        (String.join "," applied1
+                                            ++ "|"
+                                            ++ String.join "," applied2
+                                        )
+                                )
+                                (Db.migrate txconn
+                                    [ { name = "001_create_users"
+                                      , sql = "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)"
+                                      }
+                                    , { name = "002_add_email"
+                                      , sql = "ALTER TABLE users ADD COLUMN email TEXT"
+                                      }
+                                    ]
+                                )
+                        )
+                        (Db.migrate txconn
+                            [ { name = "001_create_users"
+                              , sql = "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)"
+                              }
+                            , { name = "002_add_email"
+                              , sql = "ALTER TABLE users ADD COLUMN email TEXT"
+                              }
+                            ]
+                        )
+                )
+        )
+        (Db.open Location.memory)

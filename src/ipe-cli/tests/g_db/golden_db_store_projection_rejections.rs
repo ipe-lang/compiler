@@ -20,11 +20,8 @@ use ipe_diagnostics::{Diagnostic, LowerError, StoreSelectProjectionDefect};
 
 use crate::support::repo_root;
 
-fn fixture_entry(root: &Path, golden: &str) -> PathBuf {
-    root.join("tests")
-        .join("golden")
-        .join(golden)
-        .join("Main.ipe")
+fn fixture_project(root: &Path, golden: &str) -> PathBuf {
+    root.join("tests").join("golden").join(golden)
 }
 
 /// Build `golden` and return the diagnostic code it was rejected with.
@@ -42,12 +39,12 @@ fn rejection_code(golden: &str) -> ipe_diagnostics::Code {
 /// crate.
 fn rejection_diagnostic(golden: &str) -> Diagnostic {
     let root = repo_root();
-    let entry = fixture_entry(&root, golden);
+    let entry = fixture_project(&root, golden);
     let out = crate::support::scratch_root().join(format!("ipec_{golden}"));
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
-    let diag = match ipe::build(&entry, &out, &runtime) {
+    let diag = match crate::support::build_golden(&entry, &out, &runtime) {
         Err(CliError::Pipeline { diag, .. }) => *diag,
         other => panic!("{golden}: must be rejected with a pipeline diagnostic, got {other:?}"),
     };
@@ -228,5 +225,88 @@ fn literal_unsupported_type_is_rejected_with_type_name() {
     assert!(
         ty.contains("record"),
         "diagnostic must name the unsupported type; got type label: {ty:?}"
+    );
+}
+
+/// Build `golden`, require IPE-L0149, and return its `Store.select` projection defect.
+///
+/// `None` when the rejection is not a `StoreSelectProjectionInvalid` lowering
+/// diagnostic, so the caller's equality assertion names the mismatch.
+fn projection_defect(golden: &str) -> Option<StoreSelectProjectionDefect> {
+    let diag = rejection_diagnostic(golden);
+    assert_eq!(
+        diag.code(),
+        ipe_diagnostics::IPE_L0149,
+        "{golden}: must fail closed with IPE-L0149, got {diag:?}"
+    );
+    match diag {
+        Diagnostic::Lower {
+            msg: LowerError::StoreSelectProjectionInvalid(defect),
+            ..
+        } => Some(defect),
+        _ => None,
+    }
+}
+
+/// `let readAll = Store.selectToList db in readAll sel` is a partial
+/// application: no projection is visible where it is built, so it is refused
+/// with `SelectToNotSaturated` rather than running the placeholder body.
+#[test]
+fn select_to_partial_let_rejected() {
+    assert_eq!(
+        projection_defect("db_store_select_to_partial_let_rejected"),
+        Some(StoreSelectProjectionDefect::SelectToNotSaturated)
+    );
+}
+
+/// `List.map (Store.selectToList db) sels` passes a partial application as a
+/// function value and is refused with `SelectToNotSaturated`.
+#[test]
+fn select_to_partial_map_rejected() {
+    assert_eq!(
+        projection_defect("db_store_select_to_partial_map_rejected"),
+        Some(StoreSelectProjectionDefect::SelectToNotSaturated)
+    );
+}
+
+/// `Task.andThen (Store.selectToMaybe db) task` passes a `selectToMaybe`
+/// partial application as a function value and is refused with
+/// `SelectToNotSaturated`.
+#[test]
+fn select_to_maybe_partial_rejected() {
+    assert_eq!(
+        projection_defect("db_store_select_to_maybe_partial_rejected"),
+        Some(StoreSelectProjectionDefect::SelectToNotSaturated)
+    );
+}
+
+/// `apply Store.selectToList db sel` passes the bare binding as a function
+/// value and is refused with `SelectToNotSaturated` at the reference.
+#[test]
+fn select_to_point_free_rejected() {
+    assert_eq!(
+        projection_defect("db_store_select_to_point_free_rejected"),
+        Some(StoreSelectProjectionDefect::SelectToNotSaturated)
+    );
+}
+
+/// A `Select` bound to a name and piped into `Store.selectToList` hides its
+/// projected column types. After the pipe collapses to the direct call, it is
+/// refused with `SelectArgNotProjection`.
+#[test]
+fn select_to_let_bound_select_rejected() {
+    assert_eq!(
+        projection_defect("db_store_select_to_let_bound_select_rejected"),
+        Some(StoreSelectProjectionDefect::SelectArgNotProjection)
+    );
+}
+
+/// A `Select` taken as a parameter hides its projected column types and is
+/// refused with `SelectArgNotProjection`.
+#[test]
+fn select_to_param_select_rejected() {
+    assert_eq!(
+        projection_defect("db_store_select_to_param_select_rejected"),
+        Some(StoreSelectProjectionDefect::SelectArgNotProjection)
     );
 }

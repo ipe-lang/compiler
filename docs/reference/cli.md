@@ -63,7 +63,7 @@ Type-check a program without building or running it.
 ipe type-check [<path>]
 ```
 
-**Arguments:** A source file, a project directory, or a package.ipe. Defaults to the current project.
+**Arguments:** A module file under `src/` or `tests/` of the current directory's project, a project directory, or a package.ipe. Defaults to the current directory's project, every entry.
 
 **Flags:**
 
@@ -77,7 +77,7 @@ Run extensible static analysis over Ipê source (idiom, consistency, safety-by-c
 ipe lint [<path>]
 ```
 
-**Arguments:** A source file or a project directory to lint. Defaults to the current project.
+**Arguments:** A module file of this project, whose findings alone are reported and fixed, or a project directory. Defaults to the current directory's project, every module.
 
 **Flags:**
 
@@ -93,7 +93,7 @@ Build and run the project's tests/Main.ipe, reporting pass/fail.
 ipe test [<path>]
 ```
 
-**Arguments:** A source file, a project directory, or a package.ipe. Defaults to the current project.
+**Arguments:** A project directory, its package.ipe, or a module file under `src/` or `tests/` of the current directory's project, which selects that project. Defaults to the current directory's project. The tests always run from the project's tests/Main.ipe and build with its package.ipe settings, its database driver included.
 
 **Flags:**
 
@@ -107,7 +107,7 @@ Run the whole project gate: format, type-check, build, then test.
 ipe verify [<path>]
 ```
 
-**Arguments:** A source file, a project directory, or a package.ipe. Defaults to the current project.
+**Arguments:** A project directory, its package.ipe, or a module file under `src/` or `tests/` of the current directory's project. Defaults to the current directory's project.
 
 **Flags:**
 
@@ -137,7 +137,7 @@ Audit a package against the Tier-1 quality gate, publish it to the index, valida
 ipe package <audit|audit-entry|publish|validate-entry> [<path>]
 ```
 
-**Arguments:** The subcommand and its path: `audit`/`publish` take the project directory or `package.ipe` (defaults to the current project); `validate-entry` takes a `packages/<name>.toml` entry file (schema check only); `audit-entry` takes the same entry file and runs the full index CI receiving gate: schema, fetch+integrity-verify, and the complete Tier-1 (+ Tier-2) audit for every new version.
+**Arguments:** The subcommand and its path: `audit`/`publish` take the project directory or `package.ipe` (defaults to the current project); `validate-entry` takes a `packages/<name>.toml` entry file (schema check only); `audit-entry` takes the same entry file and runs the full index CI receiving gate: schema, fetch+integrity-verify, and the complete Tier-1 (+ Tier-2) audit for every new version. `audit` regenerates a native package's FFI bindings only inside a jail — a host without bubblewrap, or with `IPE_FFI_ALLOW_UNSANDBOXED=1` set, is refused — and applies the supply-chain policy built into the compiler, never one from the package, the working directory, or a runtime tree found on disk. The audited program links the runtime embedded in the compiler: `IPE_RUNTIME_DIR`, `IPE_RUNTIME_VENDORED`, and a runtime tree above the working directory are ignored.
 
 **Flags:**
 
@@ -246,7 +246,7 @@ Report the security capabilities a program exercises, inferred from its code.
 ipe capabilities [<path>]
 ```
 
-**Arguments:** A source file, a project directory, or a package.ipe. Defaults to the current project.
+**Arguments:** A project directory, its package.ipe, or one of its entry files under `src/`; a file must lie in the current directory's project. Defaults to the current directory's project, every entry.
 
 **Flags:**
 
@@ -276,7 +276,7 @@ Apply the compiler's machine-applicable fixes to a source file.
 ipe fix <path>
 ```
 
-**Arguments:** The source file to fix.
+**Arguments:** The module file to fix, under `src/` or `tests/` of the current directory's project.
 
 **Flags:**
 
@@ -323,16 +323,16 @@ A group is invoked as `ipe <group> <verb>`; the group fixes the verb's build pos
 Compile a program to a native or WebAssembly development artifact, with Debug.* on.
 
 ```
-ipe dev build [<path>] [<shape>] [<runtime>] [<host>] [<target>]
+ipe dev build [<dir>] [<shape>] [<runtime>] [<host>] [<target>]
 ```
 
-**Arguments:** path: a source file, a project directory, or a package.ipe (default: the current project). shape is derived from `main` and, if written, only cross-checked. runtime/host apply to `web` only: `web` = served (served is the unnamed default, never written), `web solo` = self-contained browser client, and a host is desktop/ios/android. A `desktop`/`ios`/`android` host lays out the app bundle for that host (a fast dev bundle; `release build web <host>` produces the production distributable). With no delivery args, `dev build` builds the default delivery — the fast one-artifact inner loop; `release build` builds every declared delivery. Delivery args select a subset or override for this invocation only and never edit package.ipe.
+**Arguments:** dir: a project directory (default: the current directory). shape is derived from `main` and, if written, only cross-checked. runtime/host apply to `web` only: `web` = served (served is the unnamed default, never written), `web solo` = self-contained browser client, and a host is desktop/ios/android. A `desktop`/`ios`/`android` host lays out the app bundle for that host (a fast dev bundle; `release build web <host>` produces the production distributable). With no delivery args, `dev build` builds the default delivery — the fast one-artifact inner loop; `release build` builds every declared delivery. Delivery args select a subset or override for this invocation only and never edit package.ipe.
 
 **Output:** a native build lands the runnable binary at `out/bin/<project-name>` under the project (copied there within the build), so it is findable even when a shared `CARGO_TARGET_DIR` places cargo's own output outside the project.
 
 **Flags:**
 
-- `[--out <dir>]` — put build output under <dir> (default: out/ in the project)
+- `[--out <dir>]` — put build output under <dir> (default: out/ in the project); on Windows a drive or `\\server\share` path is accepted, a device (`\\.\pipe`), object-namespace (`\\?\GLOBALROOT`), or volume-GUID (`\\?\Volume{..}`) path is not
 - `[--runtime <dir>]` — vendor the Ipê runtime from <dir>
 - `[--emit-ir]` — also emit the intermediate representation
 - `[--fix]` — apply machine-applicable fixes before building
@@ -349,14 +349,14 @@ ipe dev build [<path>] [<shape>] [<runtime>] [<host>] [<target>]
 Compile a program as a development build and run the resulting binary.
 
 ```
-ipe dev run [<path>]
+ipe dev run [<dir>]
 ```
 
-**Arguments:** A source file, a project directory, or a package.ipe. Defaults to the current project.
+**Arguments:** A project directory (default: the current directory).
 
 **Flags:**
 
-- `[--out <dir>]` — put build output under <dir> (default: out/ in the project)
+- `[--out <dir>]` — put build output under <dir> (default: out/ in the project); on Windows a drive or `\\server\share` path is accepted, a device (`\\.\pipe`), object-namespace (`\\?\GLOBALROOT`), or volume-GUID (`\\?\Volume{..}`) path is not
 - `[--runtime <dir>]` — vendor the Ipê runtime from <dir>
 - `[--static]` — produce a statically linked binary
 - `[--target <wasm|wasi|triple>]` — compile for `wasm` (a browser bundle), `wasi` (a wasm32-wasip1 module), or a musl-static native <triple>; a native triple needs --static on `dev build` and `dev run`, `release build` is always static (default: x86_64-unknown-linux-musl); `dev run` cannot execute `wasm`, and `release build` does not produce `wasi`
@@ -374,14 +374,14 @@ ipe dev run [<path>]
 Rebuild and re-run a development build on every source change.
 
 ```
-ipe dev watch [<path>]
+ipe dev watch [<dir>]
 ```
 
-**Arguments:** A source file, a project directory, or a package.ipe. Defaults to the current project.
+**Arguments:** A project directory (default: the current directory).
 
 **Flags:**
 
-- `[--out <dir>]` — put build output under <dir> (default: out/ in the project)
+- `[--out <dir>]` — put build output under <dir> (default: out/ in the project); on Windows a drive or `\\server\share` path is accepted, a device (`\\.\pipe`), object-namespace (`\\?\GLOBALROOT`), or volume-GUID (`\\?\Volume{..}`) path is not
 - `[--runtime <dir>]` — vendor the Ipê runtime from <dir>
 - `[--port <n>]` — serve on port <n> (default: 8000)
 - `[--debugger]` — compile the in-app time-travelling debugger overlay into the served app
@@ -395,10 +395,10 @@ ipe dev watch [<path>]
 Build the production artifact — optimised, Debug.* gated. Native-bearing apps get a jailed bundle; pure-native apps get a plain optimised binary; `web desktop|ios|android` produces a production app bundle; `--target wasm` produces a production browser bundle.
 
 ```
-ipe release build [<path>] [<shape>] [<runtime>] [<host>]
+ipe release build [<dir>] [<shape>] [<runtime>] [<host>]
 ```
 
-**Arguments:** A source file, a project directory, or a package.ipe (default: the current project). shape/runtime/host are the delivery grammar shared with `dev build`: a `desktop`/`ios`/`android` host lays out the production app bundle for that host (a self-contained desktop bundle, or a native mobile system-webview shell). An `android` host produces an unsigned Gradle project: a store build needs your own keystore configured in Gradle. With no delivery args, `release build` builds every delivery declared in package.ipe (`dev build` builds only the default one).
+**Arguments:** A project directory (default: the current directory). shape/runtime/host are the delivery grammar shared with `dev build`: a `desktop`/`ios`/`android` host lays out the production app bundle for that host (a self-contained desktop bundle, or a native mobile system-webview shell). An `android` host produces an unsigned Gradle project: a store build needs your own keystore configured in Gradle. With no delivery args, `release build` builds every delivery declared in package.ipe (`dev build` builds only the default one).
 
 **Flags:**
 
@@ -416,10 +416,10 @@ ipe release build [<path>] [<shape>] [<runtime>] [<host>]
 Build the production artifact (cached), then run exactly that artifact, jailed to its capabilities.
 
 ```
-ipe release run [<path>|<artifact-dir>]
+ipe release run [<dir>|<artifact-dir>]
 ```
 
-**Arguments:** A source file, a project directory, or a package.ipe (default: the current project), or a built artifact directory holding `ipe-wrapper`. Every run is confined: the default single binary jails itself, a bundle is verified against the floor embedded in its app and then jailed, and a pure-native binary runs jailed to its consented capabilities. An artifact directory runs as built, so it takes no build options. A `--target wasm` or `web solo|desktop|ios|android` build has no run form and is refused: build it with `ipe release build`.
+**Arguments:** A project directory (default: the current directory), or a built artifact directory holding `ipe-wrapper`. Every run is confined: the default single binary jails itself, a bundle is verified against the floor embedded in its app and then jailed, and a pure-native binary runs jailed to its consented capabilities. An artifact directory runs as built, so it takes no build options. A `--target wasm` or `web solo|desktop|ios|android` build has no run form and is refused: build it with `ipe release build`.
 
 **Flags:**
 
@@ -433,10 +433,10 @@ ipe release run [<path>|<artifact-dir>]
 Emit a self-contained production Rust project with a tree-shaken runtime.
 
 ```
-ipe release eject [<path>]
+ipe release eject [<dir>]
 ```
 
-**Arguments:** A source file, a project directory, or a package.ipe. Defaults to the current project.
+**Arguments:** A project directory (default: the current directory).
 
 **Flags:**
 

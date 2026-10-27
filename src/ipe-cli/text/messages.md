@@ -204,6 +204,10 @@ ipe package publish: expected a single <path> argument
 
 directory supplied but no package.ipe found inside it
 
+## webview-needs-manifest
+
+a `web desktop` build needs a project: its desktop window comes from `delivery.desktop` in `package.ipe`, and this entry file has none
+
 ## legacy-toml-hint
 
 no package.ipe in this directory (found a legacy ipe.toml — package.ipe is the project manifest the toolchain reads)
@@ -235,6 +239,10 @@ internal: module in topo order not in source map
 ## library-package-no-entry
 
 this is a library package (it declares `exposedModules` and no runnable program) — there is no entry to build. Use `ipe type-check` to verify its public surface, or add a `Package.programs [ … ]` stage to declare a runnable entry
+
+## capabilities-not-an-entry
+
+{arg} is not an entry of this project: a capability set is a program's, so name one of its entries ({entries}), or give no argument to report every entry
 
 ## debugger-needs-runtime-dep
 
@@ -271,6 +279,10 @@ package.ipe: missing a `name = "…"` field — a package must be named
 ## package-manifest-src-root-missing
 
 package.ipe: the source root directory does not exist
+
+## package-manifest-source-root-removed
+
+package.ipe: `sourceRoot` is not a package field. For security reasons, source files must live in `src/`. Move your `*.ipe` sources there (`package.ipe` stays at the project root).
 
 ## package-manifest-no-package-binding
 
@@ -489,6 +501,10 @@ could not determine the per-user cache directory: neither XDG_CACHE_HOME nor the
 
 {var} is set but is not an absolute path; set it to an absolute directory or unset it to use the default location
 
+## cli-registry-url-not-https
+
+{var} must be an https:// URL ({reason}); set it to an https:// base URL, set it to empty to read only the local registry checkout, or unset it to use the default registry
+
 ## cli-runtime-dir-invalid
 
 IPE_RUNTIME_DIR points at {path}, which is not an Ipe runtime crate root (its Cargo.toml must declare `name = "ipe-runtime-rust"`)
@@ -683,6 +699,75 @@ a signal ended the transfer — stopped; nothing was recorded
 
 cargo build did not finish within {wall} — stopped with every process it started; run `cargo build -vv` in the crate to see the step that hangs
 
+## cli-target-dir-unlinkable
+
+{what} {path} cannot be opened by {linker}
+
+## cli-target-dir-from-embedder
+
+the build directory the caller chose
+
+## cli-target-dir-from-env
+
+the build directory `CARGO_TARGET_DIR` names
+
+## cli-target-dir-from-ipe-home
+
+the build directory the `[build] target-dir` key of `$IPE_HOME/config.toml` names
+
+## cli-target-dir-from-cargo-config
+
+the build directory a Cargo config `build.target-dir` names
+
+## cli-target-dir-crate-local
+
+the project's build directory
+
+## cli-target-dir-user-cache
+
+the per-user build cache the compiler would build in instead
+
+## cli-target-dir-scratch-cache
+
+the shared test build directory in the per-user cache
+
+## cli-test-target-busy
+
+another `ipe test` held the test build lock {path} for longer than {wall}; wait for it to finish, remove {path} if no `ipe test` is running, or set `CARGO_TARGET_DIR` to build elsewhere
+
+## cli-bundled-manifest
+
+could not prepare the bundled runtime manifest: {detail}
+  the build was stopped rather than link a runtime of unknown identity
+
+## cli-target-dir-sysroot
+
+the Rust toolchain at
+
+## cli-host-linker-ascii-only
+
+this host's linker, which opens only ASCII paths (GNU ld on a `*-windows-gnu` host)
+
+## cli-host-linker-unicode
+
+this host's linker, which opens only absolute paths
+
+## cli-target-dir-guidance
+
+Move the project to an ASCII path, or set `CARGO_TARGET_DIR` to an ASCII directory you own under your user profile (for example `%USERPROFILE%\ipe-target`) — never a folder at the root of a drive, which other accounts can write to; or install the `x86_64-pc-windows-msvc` or `x86_64-pc-windows-gnullvm` host toolchain, whose linker opens any path.
+
+## cli-sysroot-guidance
+
+Move `RUSTUP_HOME` and `CARGO_HOME` to an ASCII directory you own under your user profile and reinstall the toolchain there, or install the `x86_64-pc-windows-msvc` or `x86_64-pc-windows-gnullvm` host toolchain, whose linker opens any path.
+
+## cli-link-input-unopenable
+
+the linker `{linker}` could not open {missing}
+
+## cli-link-input-non-ascii
+
+The path holds non-ASCII characters, which a GNU linker on a `*-windows-gnu` host cannot open.
+
 ## cli-local-tree-refused
 
 {source}: holds {shape}, which ipe does not accept — stopped; nothing was recorded
@@ -736,6 +821,42 @@ output directory refused: {refusal}
 ## cli-discovery-limit-reached
 
 module-discovery walk aborted: {detail}
+
+## project-no-manifest
+
+error[IPE-E0004]: no package.ipe at {dir}; run `ipe init` there
+
+## project-no-src-dir
+
+error[IPE-E0005]: {root} has no `src/` directory (a symbolic link named `src` counts as none); create `src/` beside package.ipe and keep the modules in it
+
+## project-entry-missing
+
+error[IPE-E0006]: package.ipe declares the program entry {entry}, but `src/` holds no such file; create it, or fix the entry (it is spelled relative to `src/`)
+
+## project-no-default-entry
+
+error[IPE-E0007]: {root} names no entry module; create `src/Main.ipe`, or declare an entry in package.ipe: `programs = [ { name = "app", entry = "App.ipe" } ]`
+
+## project-entry-escapes
+
+error[IPE-E0008]: package.ipe program entry {entry} passes through the symbolic link {path}; ipe never follows a link inside a project, so replace it with the real file or directory
+
+## project-exposed-module-missing
+
+error[IPE-E0009]: package.ipe exposes the module {module}, but `src/` holds no file for it; create it, or remove it from `exposedModules`
+
+## project-symlink-in-source
+
+error[IPE-E0010]: {path} is a symbolic link; ipe never follows a link inside a project, so replace it with the real file or directory
+
+## project-file-outside-root
+
+error[IPE-E0011]: {arg} names no module of this project: a file argument must lie under `src/` or `tests/` of the current directory, or be its package.ipe; cd into {root} and run ipe there
+
+## project-directory-expected
+
+error[IPE-E0012]: `{arg}` is a file; `ipe {verb}` takes a project directory. Pass the directory instead: `ipe {verb} {parent}`
 
 ## cli-device-named-module
 
@@ -821,6 +942,10 @@ watch dependency-resolve retry
 
 watch compile worker
 
+## thread-role-compile
+
+compile worker
+
 ## thread-role-watch-cargo-waiter
 
 watch cargo-build waiter
@@ -880,6 +1005,14 @@ ipe.lock: package `{package}` is an index dependency but records a `local` rev �
 ## lock-unrecordable-local-source
 
 package `{package}`: a path dependency's `source` must be a non-empty path of at most {max} bytes with no control characters or `"`, got: "{raw}"
+
+## lock-local-source-remote
+
+package `{package}`: path dependency "{raw}" names a network share or device ({kind}), not a local directory — name a local directory instead
+
+## lock-local-source-device
+
+package `{package}`: path dependency "{raw}" names a Windows device (`CON`, `NUL`, `COM1`, …), not a directory — name a local directory instead
 
 ## lock-non-utf8-local-path
 
@@ -1052,7 +1185,7 @@ the source root {path} cannot be resolved — ipe cannot prove the output stays 
 
 ## output-inside-vcs
 
-{out} is inside a `.git` directory — build output must stay out of version-control metadata; choose another --out
+{out} is inside a `{dir}` directory — build output must stay out of version-control metadata; choose another --out
 
 ## output-inside-cache-namespace
 
@@ -1064,7 +1197,15 @@ the source root {path} cannot be resolved — ipe cannot prove the output stays 
 
 ## output-unplaceable
 
-{path} does not name one absolute place on every platform (a drive-relative path, a device path such as `\\.\pipe`, a `/`, `.` or `..` inside a `\\?\` path, or a name Windows rewrites: a trailing `.` or space, a `:`, a device name such as `NUL` or `COM1`) — name the directory by its full path
+{path} does not name one absolute place on every platform: its prefix or one of its names is refused (a drive-relative path, a device or volume path such as `\\.\pipe` or `\\?\Volume{..}`, a share whose server or share name Windows would read as another, such as one with a trailing `.`, a `:` or a space in the server, a `/`, `.` or `..` inside a `\\?\` path, or a name Windows rewrites: a trailing `.` or space, a `:`, a device name such as `NUL` or `COM1`) — name the directory by its full drive or `\\server\share` path
+
+## output-unplaceable-cwd
+
+{request} is relative, but the working directory {cwd} does not name one absolute place on every platform (a device or volume path such as `\\?\Volume{..}`, or no drive for a rooted path) — run ipe from a drive or `\\server\share` path, or name the directory by its full path
+
+## output-unnameable-entry
+
+{path} has a name ipe cannot open as spelled (not valid Unicode, or a name Windows reserves), so ipe stops before acting on it — rename or remove that entry yourself
 
 ## output-not-fresh
 
@@ -1177,6 +1318,14 @@ ipe package audit: no `package.ipe` in `{path}` — the gate audits a publishabl
 ## audit-not-a-package
 
 ipe package audit: `{path}` is neither an Ipê project directory nor a package.ipe
+
+## audit-refuses-unsandboxed-override
+
+`IPE_FFI_ALLOW_UNSANDBOXED=1` is set — the gate regenerates a native package's FFI bindings only inside the sandbox and never honours the unsandboxed override; unset it and run the audit again
+
+## audit-requires-a-jail
+
+no sandbox mechanism is available on this host — the gate regenerates a native package's FFI bindings only inside a bubblewrap jail; install bubblewrap (`bwrap`) and run the audit again
 
 ## index-entry-path-invalid
 
@@ -1313,11 +1462,11 @@ package.ipe: program entry {entry} does not end in `.ipe`. An entry names an Ip�
 
 ## manifest-entry-segment-invalid
 
-package.ipe: program entry {entry} has a path segment {segment} that is not a valid module name (segments must match [A-Z][A-Za-z0-9_]*)
+package.ipe: program entry {entry} has a path segment {segment} that is not a valid module name (segments must match [A-Z][A-Za-z0-9_]*). Name each directory and the file after the module it holds, e.g. `Cli/Main.ipe`.
 
 ## manifest-entry-no-module
 
-package.ipe: program entry {entry} names no module
+package.ipe: program entry {entry} names no module. An entry names a module file under `src/`, e.g. `Cli/Main.ipe`.
 
 ## manifest-base-path-too-long
 
@@ -1415,6 +1564,14 @@ ipe doc: stdlib index failed: {detail}
 
 ipe doc: bundle build error: {detail}
 
+## doc-overlay-name
+
+ipe doc: `{path}` in the docs directory is not a page name; name a page with lowercase letters, digits and hyphens (`my-page.md`), or move it out of the docs directory
+
+## doc-overlay-too-large
+
+ipe doc: the pages in the docs directory together pass {limit} bytes; remove pages from the docs directory
+
 ## doc-unknown-kind
 
 ipe doc: `{prefix}` is not a known documentation kind
@@ -1485,6 +1642,10 @@ refusing to load the FFI cache at `{path}`: its ownership cannot be verified on 
 
 refusing to load the FFI cache: `{path}` is a symbolic link, which could redirect the cache to files another user controls. Replace it with a real directory or file, or remove it
 
+## ffi-cache-escapes
+
+refusing to load the FFI cache: `{path}` is a symbolic link or not a directory, so the cache path could lead to files another user controls. Replace it with a real directory, or remove it
+
 ## ffi-cache-not-regular
 
 refusing to load the FFI cache: `{path}` is not a regular file. Remove it and re-run `ipe rust add` for the crate
@@ -1534,6 +1695,10 @@ installed FFI crate `{krate}` claims the module `{module}`, which is reserved fo
 ## ffi-reserved-wrapper-prefix
 
 installed FFI crate `{krate}` declares wrapper `{wrapper}`, which uses the reserved asserted-shim prefix `{prefix}` — refusing to load the cache
+
+## ffi-wrapper-moved
+
+refusing to emit: the wrapper crate `{package}` at `{path}` is no longer the directory the project's FFI catalog was read from, so the emitted `Cargo.toml` would bind another tree. Replace any link there with the wrapper directory itself and build again
 
 ## ffi-reserved-module-exists
 
@@ -2283,6 +2448,10 @@ error[IPE-P0001]: the packaged {platform} manifest declares OS permission(s) the
 ## index-source-url-invalid
 
 package `{pkg}`: `source` must be an https://, ssh://, or file:// URL (or a bare absolute path), got: {raw}
+
+## index-source-url-remote
+
+package `{pkg}`: `source` names a network share or device ({kind}), and opening it would contact another host — use the repository's https:// URL, got: {raw}
 
 ## index-source-url-plaintext
 

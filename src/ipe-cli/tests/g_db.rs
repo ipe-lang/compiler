@@ -30,8 +30,12 @@ mod golden_db_store_index_seal;
 mod golden_db_store_insert_returning_seal;
 #[path = "g_db/golden_db_store_join_seal.rs"]
 mod golden_db_store_join_seal;
+#[path = "g_db/golden_db_store_order_builtin_order_rejected.rs"]
+mod golden_db_store_order_builtin_order_rejected;
 #[path = "g_db/golden_db_store_order_by_seal.rs"]
 mod golden_db_store_order_by_seal;
+#[path = "g_db/golden_db_store_order_value.rs"]
+mod golden_db_store_order_value;
 #[path = "g_db/golden_db_store_placeholder_off_intercept.rs"]
 mod golden_db_store_placeholder_off_intercept;
 #[path = "g_db/golden_db_store_policy_algebra.rs"]
@@ -54,6 +58,8 @@ mod golden_db_store_projection_upper_lower_seal;
 mod golden_db_store_rename_column;
 #[path = "g_db/golden_db_store_rls_composition_builders_seal.rs"]
 mod golden_db_store_rls_composition_builders_seal;
+#[path = "g_db/golden_db_store_select_pipe.rs"]
+mod golden_db_store_select_pipe;
 #[path = "g_db/golden_db_store_upsert.rs"]
 mod golden_db_store_upsert;
 #[path = "g_db/golden_db_wrapper_empty_params_165.rs"]

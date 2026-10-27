@@ -21,11 +21,15 @@ pub use const_fold::fold_program;
 pub use emit_expr::rust_str_lit;
 /// The typed mount base the emitted browser shell is served under.
 pub use ipe_runtime_rust::encoding::MountBase;
-mod crate_specs;
+pub mod crate_specs;
 #[macro_use]
 mod doc;
 mod emit_console;
 mod emit_doc;
+mod emit_settings;
+pub use emit_settings::{
+    CrateName, EmitHost, EmitSettings, SINGLE_FILE_CRATE_NAME, TEST_CRATE_NAME,
+};
 mod emit_expr;
 mod emit_model_gate;
 mod emit_model_schema;
@@ -73,8 +77,8 @@ use ipe_backend::{Backend, EmittedProject};
 use ipe_diagnostics::{DResult, Diagnostic, NameError, RustNameFoldKind, Span};
 use ipe_intern::{Interner, Symbol};
 use ipe_ir::{
-    Callee, EnumTraits, Expr, FuncId, IrType, KernelFn, ModPath, Program, RuntimeBridgedEnum,
-    TypeDef,
+    CallPin, Callee, EnumTraits, Expr, FuncId, IrType, KernelFn, ModPath, Program,
+    RuntimeBridgedEnum, TypeDef, UserPin, collect_generics,
 };
 
 pub use emit_doc::{SweepDivergence, native_vs_legacy_sweep};
@@ -231,50 +235,11 @@ pub enum FfiGluePayload {
 ///
 /// Holds a reference to the [`Interner`] used to build the program, so it can
 /// resolve the [`Symbol`]s carried by the IR without widening the
-/// [`Backend::emit`] signature.
-// Each boolean is an independent emit-shape switch (production gate, debugger,
-// hot-appearance, webview-host) set by its own `with_*` builder; a bit-flags
-// enum would obscure that each is toggled in isolation.
-#[allow(clippy::struct_excessive_bools)]
+/// [`Backend::emit`] signature, plus the [`EmitSettings`] every emit reads.
+/// Production chains build it through [`Self::configured`].
 pub struct RustBackend<'a> {
     interner: &'a Interner,
-    db_driver: DbDriver,
-    ffi: Option<FfiEmit>,
-    target: ipe_ir::Target,
-    wasm_public_env: Vec<String>,
-    mount_base: MountBase,
-    wasm_hydrate_mode: bool,
-    runtime_dep: Option<RuntimeDep>,
-    /// `true` when `ipe dev build --debugger` / `ipe dev run --debugger` was passed. Adds
-    /// the runtime `debugger` feature to the emitted project's dependency feature
-    /// list so the TEA driver instantiates the recorder. Never set for
-    /// `ipe release` (the release command does not expose the flag), so no
-    /// production artifact carries recorder code. Set via [`Self::with_debugger`].
-    debugger: bool,
-    /// The verb family this emit serves; selects the `dev-posture` runtime
-    /// feature. Set via [`Self::with_build_intent`]; default `Release`.
-    build_intent: BuildIntent,
-    /// The project name from `package.ipe`, sanitized into a valid Cargo package
-    /// name via [`sanitize_cargo_name`]. Becomes the emitted crate's
-    /// `[package] name`. Empty string signals "use the safe fallback
-    /// `ipe-app`" — set via [`Self::with_project_name`].
-    cargo_name: String,
-    /// `true` when the dev-only `IPE_WATCH_HOT_APPEARANCE` flag is set. Routes
-    /// style-value literals through a per-view `LiteralTable` for appearance
-    /// hot-swap. Set via [`Self::with_hot_appearance`]; default off.
-    hot_appearance: bool,
-    /// `true` when the resolved delivery is `web desktop` — webview-native. The
-    /// webview delivery is a HOST decision (from the CLI's resolved
-    /// shape × runtime × host), not a distinct `main` entry, so it is threaded in
-    /// here rather than read from a source leaf. It forces `uses_webview` on,
-    /// which selects the webview executor and the `default = ["webview"]` feature.
-    /// Set via [`Self::with_webview_host`]; default off (served `web`).
-    webview_host: bool,
-    /// The desktop window configuration for a webview-native (`web desktop`)
-    /// delivery, resolved from the manifest `delivery.desktop` block. `None`
-    /// (the default, and always for a served `web`) selects the built-in
-    /// fallback window. Set via [`Self::with_webview_window`].
-    webview_window: Option<WebViewWindow>,
+    settings: EmitSettings,
 }
 
 /// The desktop window configuration for a webview-native (`web desktop`)
@@ -438,6 +403,24 @@ pub fn sanitize_cargo_name(name: &str) -> String {
 /// a single shared target dir ever holds, while keeping the emitted name short.
 const CRATE_IDENTITY_HEX_LEN: usize = 8;
 
+/// The lowercase-hex SHA-256 of `canonical_dir`'s bytes: the one digest naming a project.
+///
+/// [`crate_identity`] suffixes the crate name with its prefix, and the CLI keys
+/// a project's relocated build directory by it, so both name one project alike.
+#[must_use]
+pub fn identity_hex(canonical_dir: &std::path::Path) -> String {
+    use sha2::{Digest as _, Sha256};
+    use std::fmt::Write as _;
+
+    let digest = Sha256::digest(canonical_dir.as_os_str().as_encoded_bytes());
+    let mut hex = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        // `{byte:02x}` is exactly two lowercase-hex chars per byte, all Cargo-valid.
+        let _ = write!(hex, "{byte:02x}");
+    }
+    hex
+}
+
 /// Derive the emitted crate's unique identity from its sanitized friendly name
 /// and the canonical project directory.
 ///
@@ -461,20 +444,9 @@ const CRATE_IDENTITY_HEX_LEN: usize = 8;
 /// messages keep the plain project name; only the internal crate identity carries
 /// the suffix.
 #[must_use]
-pub fn crate_identity(base: &str, canonical_dir: &std::path::Path) -> String {
-    use sha2::{Digest as _, Sha256};
-
-    let mut hasher = Sha256::new();
-    hasher.update(canonical_dir.as_os_str().as_encoded_bytes());
-    let digest = hasher.finalize();
-
-    let mut hex = String::with_capacity(CRATE_IDENTITY_HEX_LEN);
-    for byte in digest.iter().take(CRATE_IDENTITY_HEX_LEN / 2) {
-        // `{byte:02x}` is exactly two lowercase-hex chars per byte — total width
-        // is `CRATE_IDENTITY_HEX_LEN`, both Cargo-valid.
-        use std::fmt::Write as _;
-        let _ = write!(hex, "{byte:02x}");
-    }
+pub fn crate_identity(base: &str, canonical_dir: &std::path::Path) -> CrateIdentity {
+    let digest = identity_hex(canonical_dir);
+    let hex = digest.get(..CRATE_IDENTITY_HEX_LEN).unwrap_or(&digest);
 
     // Reserve room for `_<hex>` under the 64-char ceiling so the join never
     // produces an over-long (Cargo-rejected) name; trim the base, never the hash.
@@ -484,7 +456,22 @@ pub fn crate_identity(base: &str, canonical_dir: &std::path::Path) -> String {
         base_trunc = base_trunc.get(..max_base).unwrap_or(base_trunc);
     }
     let base_trunc = base_trunc.trim_end_matches('-');
-    format!("{base_trunc}_{hex}")
+    CrateIdentity(format!("{base_trunc}_{hex}"))
+}
+
+/// A manifest project's crate identity: its sanitized name joined with the
+/// canonical-path digest.
+///
+/// Built only by [`crate_identity`], so no other string can stand in for it.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct CrateIdentity(String);
+
+impl CrateIdentity {
+    /// Borrow the identity as the emitted `[package] name`.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
 }
 
 /// The dependency-model emit selector.
@@ -509,38 +496,60 @@ pub struct RuntimeDep {
 }
 
 impl<'a> RustBackend<'a> {
-    /// Construct a backend that resolves IR symbols through `interner`.
-    /// Defaults to [`DbDriver::Sqlite`] — call [`Self::with_db_driver`] to
-    /// target Postgres.
+    /// Construct a backend with the settings of a bare single-file release
+    /// emit, for the backend's own tests and sweeps.
     #[must_use]
-    #[allow(clippy::missing_const_for_fn)] // String::new() is not const-stable
-    pub fn new(interner: &'a Interner) -> Self {
+    pub const fn new(interner: &'a Interner) -> Self {
         Self {
             interner,
-            db_driver: DbDriver::Sqlite,
-            ffi: None,
-            target: ipe_ir::Target::Native,
-            wasm_public_env: Vec::new(),
-            mount_base: MountBase::root(),
-            wasm_hydrate_mode: false,
-            runtime_dep: None,
-            debugger: false,
-            build_intent: BuildIntent::Release,
-            cargo_name: String::new(),
-            hot_appearance: false,
-            webview_host: false,
-            webview_window: None,
+            settings: EmitSettings::unconfigured(),
         }
     }
 
-    /// Set the emitted crate's package name from the `package.ipe` name field.
-    /// The value is sanitized via [`sanitize_cargo_name`] before use, so any
-    /// valid (or invalid) name produces a valid Cargo package name.
-    /// When not called (or called with an empty string), the emitted crate is
-    /// named `ipe-app` — the safe default.
+    /// Construct a backend that emits with exactly `settings`.
+    ///
+    /// The one constructor every production chain uses: each field of the
+    /// settings value is applied, so no chain can leave one at a default.
+    #[must_use]
+    pub fn configured(interner: &'a Interner, settings: &EmitSettings) -> Self {
+        let EmitSettings {
+            db_driver,
+            ffi,
+            target,
+            wasm_public_env,
+            mount_base,
+            wasm_hydrate_mode,
+            runtime_dep,
+            debugger,
+            crate_name,
+            hot_appearance,
+            host,
+            intent,
+        } = settings;
+        Self {
+            interner,
+            settings: EmitSettings {
+                db_driver: *db_driver,
+                ffi: ffi.clone(),
+                target: *target,
+                wasm_public_env: wasm_public_env.clone(),
+                mount_base: mount_base.clone(),
+                wasm_hydrate_mode: *wasm_hydrate_mode,
+                runtime_dep: runtime_dep.clone(),
+                debugger: *debugger,
+                crate_name: crate_name.clone(),
+                hot_appearance: *hot_appearance,
+                host: host.clone(),
+                intent: *intent,
+            },
+        }
+    }
+
+    /// Pin the emitted crate's package name, sanitized via
+    /// [`CargoPackageName::sanitize`].
     #[must_use]
     pub fn with_project_name(mut self, name: &str) -> Self {
-        self.cargo_name = sanitize_cargo_name(name);
+        self.settings.crate_name = CrateName::Pinned(CargoPackageName::sanitize(name));
         self
     }
 
@@ -555,7 +564,7 @@ impl<'a> RustBackend<'a> {
     /// subtree on either target.
     #[must_use]
     pub fn with_runtime_dep(mut self, runtime_dep: Option<RuntimeDep>) -> Self {
-        self.runtime_dep = runtime_dep;
+        self.settings.runtime_dep = runtime_dep;
         self
     }
 
@@ -566,7 +575,7 @@ impl<'a> RustBackend<'a> {
     /// carries recorder code.
     #[must_use]
     pub const fn with_debugger(mut self, debugger: bool) -> Self {
-        self.debugger = debugger;
+        self.settings.debugger = debugger;
         self
     }
 
@@ -577,28 +586,7 @@ impl<'a> RustBackend<'a> {
     /// emits neither, so the shipped binary has no development console default.
     #[must_use]
     pub const fn with_build_intent(mut self, intent: BuildIntent) -> Self {
-        self.build_intent = intent;
-        self
-    }
-
-    /// Mark the emit as a webview-native (`web desktop`) delivery. This is the
-    /// single source of the `uses_webview` signal: it is a resolved host
-    /// decision from the CLI, not a source-level entry. When set, the emitted
-    /// project selects the webview executor and promotes `webview` to the default
-    /// feature list; a served `web` (the default host) leaves it unset.
-    #[must_use]
-    pub const fn with_webview_host(mut self, webview_host: bool) -> Self {
-        self.webview_host = webview_host;
-        self
-    }
-
-    /// Set the desktop window configuration for a webview-native (`web desktop`)
-    /// delivery. Sourced from the manifest `delivery.desktop` block by the CLI.
-    /// Only consulted when [`Self::with_webview_host`] is set; a served `web`
-    /// leaves it `None`.
-    #[must_use]
-    pub fn with_webview_window(mut self, window: Option<WebViewWindow>) -> Self {
-        self.webview_window = window;
+        self.settings.intent = intent;
         self
     }
 
@@ -609,7 +597,7 @@ impl<'a> RustBackend<'a> {
     /// in which case the emit is byte-identical to the direct-literal form.
     #[must_use]
     pub const fn with_hot_appearance(mut self, hot_appearance: bool) -> Self {
-        self.hot_appearance = hot_appearance;
+        self.settings.hot_appearance = hot_appearance;
         self
     }
 
@@ -617,7 +605,7 @@ impl<'a> RustBackend<'a> {
     /// (`Native` by default; `WasmClient` under `ipe dev build --target wasm`).
     #[must_use]
     pub const fn with_target(mut self, target: ipe_ir::Target) -> Self {
-        self.target = target;
+        self.settings.target = target;
         self
     }
 
@@ -625,7 +613,7 @@ impl<'a> RustBackend<'a> {
     /// database setting). No-op on programs that don't use any Db kernel.
     #[must_use]
     pub const fn with_db_driver(mut self, driver: DbDriver) -> Self {
-        self.db_driver = driver;
+        self.settings.db_driver = driver;
         self
     }
 
@@ -634,7 +622,7 @@ impl<'a> RustBackend<'a> {
     /// foreign-wrapper call.
     #[must_use]
     pub fn with_ffi(mut self, ffi: Option<FfiEmit>) -> Self {
-        self.ffi = ffi;
+        self.settings.ffi = ffi;
         self
     }
 
@@ -646,7 +634,7 @@ impl<'a> RustBackend<'a> {
     /// `WasmClient` gets the SAME allowlist on each.
     #[must_use]
     pub fn with_wasm_public_env(mut self, names: Vec<String>) -> Self {
-        self.wasm_public_env = names;
+        self.settings.wasm_public_env = names;
         self
     }
 
@@ -657,7 +645,7 @@ impl<'a> RustBackend<'a> {
     /// default is [`MountBase::root`].
     #[must_use]
     pub fn with_mount_base(mut self, base: MountBase) -> Self {
-        self.mount_base = base;
+        self.settings.mount_base = base;
         self
     }
 
@@ -670,7 +658,7 @@ impl<'a> RustBackend<'a> {
     /// hydrate — spec Q6 §"Fault-tolerant hydrate — parse, don't unwrap").
     #[must_use]
     pub const fn with_wasm_hydrate_mode(mut self, enabled: bool) -> Self {
-        self.wasm_hydrate_mode = enabled;
+        self.settings.wasm_hydrate_mode = enabled;
         self
     }
 
@@ -685,23 +673,7 @@ impl<'a> RustBackend<'a> {
     /// Propagates any [`Diagnostic`] from [`EmitCtx::build`] or
     /// [`project::emit_spine`].
     pub fn emit_spine(&self, program: &Program) -> DResult<String> {
-        let ctx = EmitCtx::build(
-            self.interner,
-            program,
-            self.db_driver,
-            self.ffi.clone(),
-            self.target,
-            self.wasm_public_env.clone(),
-            self.mount_base.clone(),
-            self.wasm_hydrate_mode,
-            self.runtime_dep.clone(),
-            self.debugger,
-            self.build_intent,
-            self.cargo_name.clone(),
-            self.hot_appearance,
-            self.webview_host,
-            self.webview_window.clone(),
-        )?;
+        let ctx = EmitCtx::build(self.interner, program, self.settings.clone())?;
         project::emit_spine(&ctx, program)
     }
 
@@ -715,23 +687,7 @@ impl<'a> RustBackend<'a> {
     /// Propagates any [`Diagnostic`] from [`EmitCtx::build`].
     #[cfg(test)]
     pub(crate) fn emit_ctx_for_tests(&self, program: &Program) -> DResult<EmitCtx<'a>> {
-        EmitCtx::build(
-            self.interner,
-            program,
-            self.db_driver,
-            self.ffi.clone(),
-            self.target,
-            self.wasm_public_env.clone(),
-            self.mount_base.clone(),
-            self.wasm_hydrate_mode,
-            self.runtime_dep.clone(),
-            self.debugger,
-            self.build_intent,
-            self.cargo_name.clone(),
-            self.hot_appearance,
-            self.webview_host,
-            self.webview_window.clone(),
-        )
+        EmitCtx::build(self.interner, program, self.settings.clone())
     }
 
     /// The runtime-crate cargo features `program` selects — the SSOT
@@ -745,23 +701,7 @@ impl<'a> RustBackend<'a> {
     ///
     /// Propagates any [`Diagnostic`] from [`EmitCtx::build`].
     pub fn runtime_feature_names(&self, program: &Program) -> DResult<Vec<&'static str>> {
-        let ctx = EmitCtx::build(
-            self.interner,
-            program,
-            self.db_driver,
-            self.ffi.clone(),
-            self.target,
-            self.wasm_public_env.clone(),
-            self.mount_base.clone(),
-            self.wasm_hydrate_mode,
-            self.runtime_dep.clone(),
-            self.debugger,
-            self.build_intent,
-            self.cargo_name.clone(),
-            self.hot_appearance,
-            self.webview_host,
-            self.webview_window.clone(),
-        )?;
+        let ctx = EmitCtx::build(self.interner, program, self.settings.clone())?;
         Ok(runtime_features::runtime_features(&ctx).as_feature_names())
     }
 
@@ -775,23 +715,7 @@ impl<'a> RustBackend<'a> {
     /// Propagates any [`Diagnostic`] from [`EmitCtx::build`] or
     /// [`project::emit_module_file`].
     pub fn emit_module_file(&self, program: &Program, home: &ModPath) -> DResult<String> {
-        let ctx = EmitCtx::build(
-            self.interner,
-            program,
-            self.db_driver,
-            self.ffi.clone(),
-            self.target,
-            self.wasm_public_env.clone(),
-            self.mount_base.clone(),
-            self.wasm_hydrate_mode,
-            self.runtime_dep.clone(),
-            self.debugger,
-            self.build_intent,
-            self.cargo_name.clone(),
-            self.hot_appearance,
-            self.webview_host,
-            self.webview_window.clone(),
-        )?;
+        let ctx = EmitCtx::build(self.interner, program, self.settings.clone())?;
         project::emit_module_file(
             &ctx,
             program,
@@ -820,23 +744,7 @@ impl<'a> RustBackend<'a> {
         spine_text: &str,
         module_texts: &BTreeMap<ModPath, String>,
     ) -> DResult<EmittedProject> {
-        let ctx = EmitCtx::build(
-            self.interner,
-            program,
-            self.db_driver,
-            self.ffi.clone(),
-            self.target,
-            self.wasm_public_env.clone(),
-            self.mount_base.clone(),
-            self.wasm_hydrate_mode,
-            self.runtime_dep.clone(),
-            self.debugger,
-            self.build_intent,
-            self.cargo_name.clone(),
-            self.hot_appearance,
-            self.webview_host,
-            self.webview_window.clone(),
-        )?;
+        let ctx = EmitCtx::build(self.interner, program, self.settings.clone())?;
         project::assemble_split_manifest(&ctx, program, spine_text, module_texts)
     }
 }
@@ -872,23 +780,7 @@ impl Backend for RustBackend<'_> {
     }
 
     fn emit(&self, program: &Program) -> DResult<EmittedProject> {
-        let ctx = EmitCtx::build(
-            self.interner,
-            program,
-            self.db_driver,
-            self.ffi.clone(),
-            self.target,
-            self.wasm_public_env.clone(),
-            self.mount_base.clone(),
-            self.wasm_hydrate_mode,
-            self.runtime_dep.clone(),
-            self.debugger,
-            self.build_intent,
-            self.cargo_name.clone(),
-            self.hot_appearance,
-            self.webview_host,
-            self.webview_window.clone(),
-        )?;
+        let ctx = EmitCtx::build(self.interner, program, self.settings.clone())?;
         project::emit_program(&ctx, program)
     }
 }
@@ -1218,7 +1110,7 @@ pub(crate) struct EmitCtx<'a> {
     ///
     /// * declares `pub mod config_decode; pub use config_decode::*;` in the
     ///   emitted `ipe_runtime/mod.rs`;
-    /// * adds the `toml` + `serde_yaml` dependencies to the emitted `Cargo.toml`.
+    /// * adds the TOML and YAML parser dependencies to the emitted `Cargo.toml`.
     ///
     /// The JSON-backed `Config.*` combinators (`string` / `field` / `map` / …)
     /// emit into the `json` module, so a program that only decodes
@@ -1279,8 +1171,8 @@ pub(crate) struct EmitCtx<'a> {
     pub(crate) uses_regex: bool,
     /// `true` when the program reaches an `Ipe.Uuid` kernel. The `uuid` runtime
     /// feature — the `uuid` crate plus the `uuid_kernel.rs` module — is selected
-    /// under [`Self::reaches_uuid`]: this flag unioned with the `server` and `web`
-    /// surfaces, whose runtime modules mint session/CSRF ids via `uuid::new_v4`.
+    /// under [`Self::reaches_uuid`]: this flag unioned with the `jwt` surface and
+    /// the `server` and `web` surfaces, which imply the feature.
     pub(crate) uses_uuid: bool,
     /// `true` when the program reaches an `Ipe.Random` kernel. The `random`
     /// runtime feature gates the `random.rs` module declaration; this flag alone
@@ -1570,6 +1462,14 @@ pub(crate) struct EmitCtx<'a> {
     /// the inlined `impl Fn` fast path rather than a wasted heap allocation. A
     /// function with no such params carries no entry (the common case).
     impl_fn_params: BTreeMap<FuncId, Vec<usize>>,
+    /// The pass of every parameter of every function in the program, read to
+    /// re-prove each function's borrow facts at emit entry
+    /// ([`ipe_ir::borrow::verify`]).
+    passes: ipe_ir::borrow::PassTable,
+    /// Function id → the order of its explicit Rust generics, for a function
+    /// that declares any ([`GenericLayout`]). Read to render a use-site
+    /// [`ipe_ir::CallPin::User`] turbofish against the callee's own clause.
+    generic_layouts: BTreeMap<FuncId, GenericLayout>,
     /// Every distinct record shape synthesised for the program, in emission
     /// order (sorted by field-name set).
     record_structs: Vec<RecordStruct>,
@@ -1579,13 +1479,9 @@ pub(crate) struct EmitCtx<'a> {
     /// field names; the resolver then disambiguates by the record's full shape.
     /// Every `IrType::Record` and every record literal resolves through this map.
     record_by_fieldset: BTreeMap<Vec<String>, Vec<usize>>,
-    /// The sanitized Cargo package name for the emitted crate. Derived from
-    /// the `package.ipe` name field via [`sanitize_cargo_name`] and threaded in
-    /// through [`RustBackend::with_project_name`]. Used by
-    /// [`crate::project::assemble_project_files`] to write `[package] name =
-    /// "<cargo_name>"` into the emitted `Cargo.toml`. Defaults to `"ipe-app"`
-    /// when no project name is supplied.
-    pub(crate) cargo_name: String,
+    /// The emitted crate's `[package] name`, written into the emitted
+    /// `Cargo.toml`.
+    pub(crate) crate_name: CrateName,
     /// `true` when `IPE_WATCH_HOT_APPEARANCE` is set — the dev-only flag that
     /// routes style-value literals through a per-view [`ipe_runtime::literal_table::LiteralTable`]
     /// so a `view` appearance edit can hot-swap without recompiling. Default off:
@@ -1836,25 +1732,25 @@ fn clone_under(
 impl<'a> EmitCtx<'a> {
     #[allow(clippy::too_many_lines)]
     #[allow(clippy::similar_names)] // `uses_ui` / `uses_tui` are intentionally similar
-    #[allow(clippy::too_many_arguments)] // the backend-config thread-through (driver, ffi, target, wasm, runtime-dep, debugger, cargo_name)
-    #[allow(clippy::fn_params_excessive_bools)] // each bool is an independent emit-shape switch threaded from BuildConfig
-    fn build(
-        interner: &'a Interner,
-        program: &Program,
-        db_driver: DbDriver,
-        ffi: Option<FfiEmit>,
-        target: ipe_ir::Target,
-        wasm_public_env: Vec<String>,
-        mount_base: MountBase,
-        wasm_hydrate_mode: bool,
-        runtime_dep: Option<RuntimeDep>,
-        debugger: bool,
-        build_intent: BuildIntent,
-        cargo_name: String,
-        hot_appearance: bool,
-        webview_host: bool,
-        webview_window: Option<WebViewWindow>,
-    ) -> DResult<Self> {
+    fn build(interner: &'a Interner, program: &Program, settings: EmitSettings) -> DResult<Self> {
+        let EmitSettings {
+            db_driver,
+            ffi,
+            target,
+            wasm_public_env,
+            mount_base,
+            wasm_hydrate_mode,
+            runtime_dep,
+            debugger,
+            crate_name,
+            hot_appearance,
+            host,
+            intent: build_intent,
+        } = settings;
+        let (webview_host, webview_window) = match host {
+            EmitHost::Served => (false, None),
+            EmitHost::WebView(window) => (true, Some(window)),
+        };
         // Every emission entry builds its context here, so a malformed literal
         // route path is refused whether or not emission reaches the route.
         route_grammar::refuse_malformed_literals(program)?;
@@ -1874,6 +1770,7 @@ impl<'a> EmitCtx<'a> {
         // recover a source spelling on its own.
         let mut func_ipe_names: BTreeMap<String, String> = BTreeMap::new();
         let mut impl_fn_params: BTreeMap<FuncId, Vec<usize>> = BTreeMap::new();
+        let mut generic_layouts: BTreeMap<FuncId, GenericLayout> = BTreeMap::new();
         for module in &program.modules {
             let segs = module
                 .name
@@ -2010,6 +1907,14 @@ impl<'a> EmitCtx<'a> {
                 // ONCE here (from the same `Func`) so signature and call site can
                 // never disagree on the carrier.
                 let idxs = crate::emit_expr::impl_fn_param_indices(func);
+                let layout = GenericLayout {
+                    type_params: func.type_params.iter().map(|(sym, _)| *sym).collect(),
+                    named_by_params: func.generics_named_by_params(),
+                    inferred_tail: idxs.len().saturating_add(func.row_params.len()),
+                };
+                if !layout.type_params.is_empty() {
+                    generic_layouts.insert(func.id, layout);
+                }
                 if !idxs.is_empty() {
                     impl_fn_params.insert(func.id, idxs);
                 }
@@ -2031,9 +1936,20 @@ impl<'a> EmitCtx<'a> {
         // parametric signature) and concrete instantiations (`{ value : Int }`):
         // [`canonicalise_shape`] reconciles them into a single struct.
         let mut shapes: BTreeMap<Vec<String>, ShapeOccurrences> = BTreeMap::new();
+        // seal: rustc refuses an enum type parameter no field uses (E0392).
+        // The lowerer erases every such parameter through the same table, so
+        // one surviving here is a lowering bug, refused before any emission.
+        ipe_ir::EnumParamUse::of(
+            program
+                .modules
+                .iter()
+                .flat_map(|module| module.types.iter())
+                .map(|TypeDef::Enum(def)| def),
+        )
+        .refuse_unused()?;
         for module in &program.modules {
             for func in &module.funcs {
-                for (_, ty) in &func.params {
+                for ipe_ir::Param { ty, .. } in &func.params {
                     collect_record_shapes(interner, ty, &mut shapes)?;
                 }
                 collect_record_shapes(interner, &func.ret, &mut shapes)?;
@@ -2222,7 +2138,7 @@ impl<'a> EmitCtx<'a> {
         let uses_http = program.modules.iter().any(|m| m.uses_http);
 
         // detect Ipe.Config TOML/YAML decoder usage (gates `config_decode` +
-        // `toml` + `serde_yaml`).
+        // the TOML and YAML parser crates).
         let uses_config = program.modules.iter().any(|m| m.uses_config);
 
         // detect Ipe.Compression usage (gates `compression` + `flate2` + `zstd`).
@@ -2300,7 +2216,7 @@ impl<'a> EmitCtx<'a> {
 
         // detect Ipe.Ui / Ipe.Html / Ipe.Web / Ipe.Tui / Ipe.Console / Ipe.WebView usage.
         // `uses_webview` is the webview-native delivery signal: the resolved
-        // `web desktop` host (threaded in as `webview_host`) OR a source module
+        // `web desktop` host (`EmitHost::WebView`) OR a source module
         // that still carries the leaf. A webview-native delivery renders the
         // server-free `web-core` core over a local IPC bridge; it does NOT run the
         // axum `web` surface, so `uses_webview` does NOT force `uses_web`. The
@@ -2430,7 +2346,7 @@ impl<'a> EmitCtx<'a> {
                 .flat_map(|m| m.funcs.iter())
                 .filter(|f| is_ipe_ui_structural_wrapper(f, interner))
                 .map(|f| {
-                    let params: Vec<Symbol> = f.params.iter().map(|(s, _)| *s).collect();
+                    let params: Vec<Symbol> = f.params.iter().map(|p| p.sym).collect();
                     (f.id, (params, f.body.clone()))
                 })
                 .collect();
@@ -2506,9 +2422,11 @@ impl<'a> EmitCtx<'a> {
             enum_traits,
             func_names,
             impl_fn_params,
+            passes: ipe_ir::borrow::PassTable::of_program(program),
+            generic_layouts,
             record_structs,
             record_by_fieldset,
-            cargo_name,
+            crate_name,
             // Appearance hot-swap routes literals through the crate-root
             // `LiteralTable` (`ipe_runtime::literal_table`), a pure module a
             // dev-loop build compiles under either `web-core` (the served render
@@ -2561,7 +2479,7 @@ impl<'a> EmitCtx<'a> {
                 if self.interner.resolve(func.name) != Some(ipe_ir::HYDRATION_PROJECTION_NAME) {
                     continue;
                 }
-                let Some((_, param_ty)) = func.params.first() else {
+                let Some(ipe_ir::Param { ty: param_ty, .. }) = func.params.first() else {
                     // A `fromHydrationState` with no parameter cannot name an
                     // island type — treat as absent (fall through to clean init).
                     return Ok(None);
@@ -2866,12 +2784,13 @@ impl<'a> EmitCtx<'a> {
     /// Reached directly by an `Ipe.Uuid` kernel ([`Self::uses_uuid`]), OR
     /// transitively by:
     /// - the `server` ([`Self::uses_server`]) and `web` ([`Self::uses_web`] /
-    ///   [`Self::uses_webview`]) surfaces, whose runtime modules mint session ids /
-    ///   CSRF tokens via `uuid::new_v4` directly. Web implies server, but both are
-    ///   listed for locality.
+    ///   [`Self::uses_webview`]) surfaces, which imply the runtime `uuid` feature;
+    ///   their session ids and CSRF tokens draw through `entropy::fill_entropy`
+    ///   and name no `uuid` item. Web implies server, but both are listed for
+    ///   locality.
     /// - the `jwt` / `auth` surface ([`Self::reaches_jwt`]): `auth.rs` is compiled
-    ///   under `#[cfg(feature = "jwt")]` and calls `uuid::Uuid::new_v4()` to mint
-    ///   per-session `jti` ids in `auth_sign_token`. The `uuid` dep is optional in
+    ///   under `#[cfg(feature = "jwt")]` and builds per-session `jti` ids in
+    ///   `auth_sign_token` with `uuid::Builder`. The `uuid` dep is optional in
     ///   the runtime crate; without this gate a jwt-only program (no server/web)
     ///   fails with E0433 at cargo build despite `ipe` exit 0.
     ///
@@ -3352,6 +3271,7 @@ impl<'a> EmitCtx<'a> {
         &self,
         fields: &BTreeMap<Symbol, IrType>,
         generics: emit_types::GenericScope,
+        depth: emit_types::TypeDepth,
     ) -> DResult<String> {
         let mut key = Vec::with_capacity(fields.len());
         for sym in fields.keys() {
@@ -3396,7 +3316,7 @@ impl<'a> EmitCtx<'a> {
                     param.as_raw()
                 ),
             })?;
-            args.push(emit_types::render_type(self, arg_ty, generics)?);
+            args.push(emit_types::render_type_at(self, arg_ty, generics, depth)?);
         }
         Ok(format!("{}<{}>", rec.name, args.join(", ")))
     }
@@ -3445,10 +3365,10 @@ impl<'a> EmitCtx<'a> {
     }
 
     /// Among the candidate structs for one field-name set, the one whose field
-    /// template is ALPHA-EQUIVALENT to `shape_by_name` (identical `skeleton_key`,
-    /// the canonical normal form). Two distinct generic siblings (`{q:a}` and
-    /// `{q:(a,a)}`) both instantiation-match a generic use site, so the exact
-    /// skeleton match is what makes the resolution unambiguous. `None` when no
+    /// template is ALPHA-EQUIVALENT to `shape_by_name`
+    /// ([`ipe_ir::alpha_equivalent_fields`]). Two distinct generic siblings
+    /// (`{q:a}` and `{q:(a,a)}`) both instantiation-match a generic use site, so
+    /// the alpha-equivalence match is what makes the resolution unambiguous. `None` when no
     /// candidate is alpha-equivalent — a concrete instantiation of a lone generic
     /// template, left to the caller's instantiation scan.
     fn record_struct_alpha_equivalent(
@@ -3462,7 +3382,6 @@ impl<'a> EmitCtx<'a> {
             .map(|(n, t)| ((*n).to_owned(), (*t).clone()))
             .collect();
         named.sort_by(|a, b| a.0.cmp(&b.0));
-        let shape_skeleton = skeleton_key(&named);
         for &i in indices {
             let rec = self
                 .record_structs
@@ -3474,7 +3393,7 @@ impl<'a> EmitCtx<'a> {
                         key.join(", ")
                     ),
                 })?;
-            if skeleton_key(&rec.fields) == shape_skeleton {
+            if ipe_ir::alpha_equivalent_fields(&rec.fields, &named) {
                 return Ok(Some(rec));
             }
         }
@@ -3550,7 +3469,7 @@ impl<'a> EmitCtx<'a> {
         // use-site shape (`{q:(a,a)}`) instantiation-matches BOTH the exact struct
         // AND any strictly-more-general one (`{q:a}` binds `a := (a,a)`), which
         // would read as an ambiguous "matched more than one". The exact struct is
-        // the alpha-equivalent one: its skeleton equals the shape's. Prefer that —
+        // the alpha-equivalent one: a renaming of the shape's type variables. Prefer that —
         // it is the canonical, most-specific choice — and only fall back to the
         // instantiation scan when no candidate is alpha-equivalent (a genuine
         // monomorphic instantiation of a single generic template).
@@ -3688,11 +3607,21 @@ impl<'a> EmitCtx<'a> {
         }
     }
 
-    /// Resolve a symbol to the Rust identifier to emit for it: checked for
-    /// emptiness ([`Self::resolve_ident`]) and then mangled if it collides with
-    /// a Rust keyword ([`naming::mangle_reserved`]). Used for every emitted
-    /// value/variant/param name.
-    pub(crate) fn emit_ident(&self, sym: Symbol) -> DResult<String> {
+    /// The Rust identifier for a local binder and every read of it.
+    ///
+    /// A local is a parameter, a `let` or pattern binder, or a closure
+    /// parameter. Spelled by [`naming::local_ident`], whose image is disjoint
+    /// from the backend's `__ipe_` temporaries, so no temporary can shadow a
+    /// user local. A binder and its references must both come through here.
+    pub(crate) fn emit_local_ident(&self, sym: Symbol) -> DResult<String> {
+        Ok(naming::local_ident(self.resolve_ident(sym)?))
+    }
+
+    /// The Rust identifier for a member name: a record field or an enum variant.
+    ///
+    /// Only keyword-mangled ([`naming::mangle_reserved`]), never escaped: a
+    /// field ident is also its serde key, and a variant ident its serde tag.
+    pub(crate) fn emit_member_ident(&self, sym: Symbol) -> DResult<String> {
         Ok(naming::mangle_reserved(self.resolve_ident(sym)?.to_owned()))
     }
 
@@ -3865,6 +3794,17 @@ impl<'a> EmitCtx<'a> {
             })
     }
 
+    /// Re-prove `func`'s parameter pass facts before any of its Rust is rendered.
+    ///
+    /// # Errors
+    /// [`Diagnostic::CompilerBug`] when a `Borrowed` parameter is not provably
+    /// read-only, so a fact that did not come from the borrow analysis (a
+    /// deserialized cache entry, a hand-built program) is refused here.
+    pub(crate) fn verify_borrows(&self, func: &ipe_ir::Func) -> DResult<()> {
+        ipe_ir::borrow::verify(func, &self.passes, &self.enum_variants)
+            .map_err(|v| v.into_diagnostic(func, self.interner, "ipe_backend_rust::emit_func"))
+    }
+
     /// Was the 0-based parameter `idx` of function `id` monomorphized to an
     /// `impl Fn` generic (so a call site passes its closure argument UNBOXED)?
     /// `false` for a call to any function that took no such param — the common
@@ -3874,6 +3814,101 @@ impl<'a> EmitCtx<'a> {
             .get(&id)
             .is_some_and(|idxs| idxs.contains(&idx))
     }
+
+    /// The turbofish a call to `callee` carrying `pin` renders between the
+    /// callee's name and its `(`, inside the caller's generic scope `generics`.
+    ///
+    /// A [`CallPin::User`] renders one entry per explicit generic of the
+    /// callee, in [`GenericLayout`] order: `()` for a [`UserPin::Unit`]
+    /// parameter; the pinned type for a [`UserPin::Instance`] parameter no
+    /// emitted parameter of the callee names (the arguments cannot let rustc
+    /// infer it); `_` for every other one. A pin rendering only `_` renders
+    /// nothing. A [`UserPin::Unlowered`] parameter that must render returns
+    /// the refusal its lowering produced; the pin on a non-[`Callee::Func`]
+    /// callee is a lowering bug, never a silent drop.
+    ///
+    /// # Errors
+    ///
+    /// The lowering refusal a must-render [`UserPin::Unlowered`] holds;
+    /// [`Diagnostic::CompilerBug`] on a pin over a non-user callee; any error
+    /// of [`crate::emit_types::render_type`].
+    pub(crate) fn call_pin_turbofish(
+        &self,
+        callee: &Callee,
+        pin: &CallPin,
+        generics: emit_types::GenericScope,
+    ) -> DResult<String> {
+        let pins = match pin {
+            CallPin::User(pins) => pins,
+            CallPin::None
+            | CallPin::DefaultI64
+            | CallPin::DefaultDict
+            | CallPin::DefaultResultMapErr
+            | CallPin::ErrIpeError => {
+                return pin.kernel_turbofish().map(str::to_owned).ok_or_else(|| {
+                    Diagnostic::CompilerBug {
+                        where_: "ipe_backend_rust::EmitCtx::call_pin_turbofish",
+                        detail: "a kernel pin rendered no turbofish".to_owned(),
+                    }
+                });
+            }
+        };
+        let id = match callee {
+            Callee::Func(id) => *id,
+            Callee::Kernel(_) | Callee::Ffi { .. } => {
+                return Err(Diagnostic::CompilerBug {
+                    where_: "ipe_backend_rust::EmitCtx::call_pin_turbofish",
+                    detail: "a user-generic pin on a non-user callee".to_owned(),
+                });
+            }
+        };
+        let Some(layout) = self.generic_layouts.get(&id) else {
+            return Ok(String::new());
+        };
+        let mut entries: Vec<String> = Vec::with_capacity(
+            layout
+                .type_params
+                .len()
+                .saturating_add(layout.inferred_tail),
+        );
+        let mut any_pinned = false;
+        for sym in &layout.type_params {
+            let inferable = layout.named_by_params.contains(sym);
+            let entry = match pins.get(sym) {
+                Some(pin) if pin.renders(inferable) => match pin {
+                    UserPin::Unit => Some("()".to_owned()),
+                    UserPin::Instance(ty) => Some(emit_types::render_type(self, ty, generics)?),
+                    UserPin::Unlowered(refusal) => return Err(Diagnostic::clone(refusal)),
+                    UserPin::Open(..) => {
+                        return Err(Diagnostic::CompilerBug {
+                            where_: "ipe_backend_rust::EmitCtx::call_pin_turbofish",
+                            detail: "an open user pin reached the emitter unsettled".to_owned(),
+                        });
+                    }
+                },
+                Some(_) | None => None,
+            };
+            any_pinned |= entry.is_some();
+            entries.push(entry.unwrap_or_else(|| "_".to_owned()));
+        }
+        if !any_pinned {
+            return Ok(String::new());
+        }
+        entries.extend(std::iter::repeat_n("_".to_owned(), layout.inferred_tail));
+        Ok(format!("::<{}>", entries.join(", ")))
+    }
+}
+
+/// The explicit Rust generics of an emitted user function, in the order its
+/// clause declares them: one `T{n}` per [`ipe_ir::Func::type_params`] entry, then
+/// `inferred_tail` generics (its `FN{i}` and `R{n}` parameters) a call site
+/// always leaves to inference.
+struct GenericLayout {
+    type_params: Vec<Symbol>,
+    /// The type parameters some emitted parameter type names, which a call's
+    /// arguments let rustc infer.
+    named_by_params: BTreeSet<Symbol>,
+    inferred_tail: usize,
 }
 
 /// Fold every runtime-feature requirement a type's leaves declare into `out`, via
@@ -3923,6 +3958,7 @@ fn collect_type_feature_requirements(ty: &IrType, out: &mut BTreeSet<ipe_ir::Run
         | IrType::Url
         | IrType::UrlRelative
         | IrType::Dsn
+        | IrType::DbLocation
         | IrType::Connection
         | IrType::ConnReadOnly
         | IrType::ConnReadWrite
@@ -4018,7 +4054,7 @@ fn program_type_feature_requirements(program: &Program) -> BTreeSet<ipe_ir::Runt
     let mut out = BTreeSet::new();
     for module in &program.modules {
         for func in &module.funcs {
-            for (_, ty) in &func.params {
+            for ipe_ir::Param { ty, .. } in &func.params {
                 collect_type_feature_requirements(ty, &mut out);
             }
             collect_type_feature_requirements(&func.ret, &mut out);
@@ -4229,7 +4265,7 @@ fn collect_record_shapes(
         | IrType::UrlRelative
         // `Dsn` + the external `Connection`/markers + the runtime-config
         // `Setting`/markers are opaque wrappers — no shape.
-        | IrType::Dsn | IrType::Connection | IrType::ConnReadOnly | IrType::ConnReadWrite
+        | IrType::Dsn | IrType::DbLocation | IrType::Connection | IrType::ConnReadOnly | IrType::ConnReadWrite
         | IrType::Setting | IrType::ShapeWeb | IrType::ShapeWebView | IrType::ShapeTerminal
         // Process-run-with cfg + Cache config / stats + Csv document fold to
         // nominal runtime structs — no structural record shape to synthesise.
@@ -4407,6 +4443,7 @@ fn type_reaches_enum(
         | IrType::UrlRelative
         // `Dsn` is a monomorphic opaque wrapper — no reachable enum edge.
         | IrType::Dsn
+        | IrType::DbLocation
         | IrType::Connection | IrType::ConnReadOnly | IrType::ConnReadWrite
         | IrType::Setting | IrType::ShapeWeb | IrType::ShapeWebView | IrType::ShapeTerminal
         // Process-run-with cfg + Cache config / stats + Csv document are
@@ -4522,6 +4559,7 @@ fn contains_generic(ty: &IrType) -> bool {
         | IrType::UrlRelative
         // `Dsn` is a monomorphic opaque wrapper — no generic parameters.
         | IrType::Dsn
+        | IrType::DbLocation
         | IrType::Connection
         | IrType::ConnReadOnly
         | IrType::ConnReadWrite
@@ -4569,152 +4607,6 @@ fn contains_generic(ty: &IrType) -> bool {
     }
 }
 
-/// Collect the distinct [`IrType::Generic`] symbols in `ty`, appending each (in
-/// first-occurrence order) to `out` if not already present.
-#[allow(clippy::too_many_lines)] // one exhaustive arm per IrType variant — the completeness is the point
-fn collect_generics(ty: &IrType, out: &mut Vec<Symbol>) {
-    match ty {
-        IrType::Generic(s) => {
-            if !out.contains(s) {
-                out.push(*s);
-            }
-        }
-        IrType::Tuple(elems) => {
-            for e in elems {
-                collect_generics(e, out);
-            }
-        }
-        IrType::Record(map) => {
-            for v in map.values() {
-                collect_generics(v, out);
-            }
-        }
-        IrType::Fun(params, ret)
-        | IrType::SharedFun(params, ret)
-        | IrType::FnOnceChain(params, ret) => {
-            for p in params {
-                collect_generics(p, out);
-            }
-            collect_generics(ret, out);
-        }
-        IrType::Enum { args, .. } => {
-            for a in args {
-                collect_generics(a, out);
-            }
-        }
-        IrType::Maybe(elem) | IrType::List(elem) => collect_generics(elem, out),
-        IrType::Result(err, ok) => {
-            collect_generics(err, out);
-            collect_generics(ok, out);
-        }
-        IrType::Dict(k, v) => {
-            collect_generics(k, out);
-            collect_generics(v, out);
-        }
-        IrType::Set(a) => collect_generics(a, out),
-        IrType::Decoder(inner) | IrType::Task(inner) | IrType::Cmd(inner) | IrType::Sub(inner) => {
-            collect_generics(inner, out);
-        }
-        IrType::Int
-        | IrType::Float
-        | IrType::Bool
-        | IrType::Str
-        | IrType::Char
-        | IrType::Unit
-        | IrType::Bytes
-        | IrType::Json
-        // `Db` is monomorphic — no generic parameters to collect.
-        | IrType::Db
-        // Opaque server types are monomorphic.
-        | IrType::ServerRequest
-        | IrType::ServerResponse
-        | IrType::ServerRoute
-        | IrType::ServerCookie
-        // `StreamWriter` is monomorphic — no generics to collect.
-        | IrType::StreamWriter
-        // `HttpRequest` is monomorphic — no generics to collect.
-        | IrType::HttpRequest
-        // `Regex` is a monomorphic opaque handle — no generics to collect.
-        | IrType::Regex
-        // `WsHandle` / `WsServerCfg` are monomorphic — no generics to collect.
-        | IrType::WebSocketServer
-        | IrType::WebSocketServerCfg
-        // nullary plain types and the opaque live request handle
-        // contribute no generics.
-        | IrType::UiPlain(_)
-        | IrType::WebReq
-        | IrType::SessionHandle
-        // `Order` is monomorphic — no generics to collect.
-        // `HttpMethod` is monomorphic — no generics to collect.
-        // `Decimal` is monomorphic — no generics to collect.
-        // `BackoffStrategy` is monomorphic — no generics to collect.
-        | IrType::BackoffStrategy
-        | IrType::Order
-        | IrType::HttpMethod
-        | IrType::Decimal
-        | IrType::ErrorKind
-        | IrType::Error
-        | IrType::ErrorDetails
-        // Nominal error-payload leaves (SEAL fix) — monomorphic
-        // runtime structs, same classification as `Error`/`ErrorDetails`.
-        | IrType::ErrorInfo
-        | IrType::PanicInfo
-        | IrType::TypeInfo
-        // `SqlFragment` is monomorphic — no generics to collect.
-        // `Secret` is monomorphic — no generics to collect.
-        | IrType::SqlFragment
-        | IrType::Secret
-        | IrType::Path
-        // `Url` is a monomorphic opaque wrapper — no generics to collect.
-        | IrType::Url
-        | IrType::UrlRelative
-        // `Dsn` is a monomorphic opaque wrapper — no generics to collect.
-        | IrType::Dsn
-        | IrType::Connection
-        | IrType::ConnReadOnly
-        | IrType::ConnReadWrite
-        | IrType::Setting | IrType::ShapeWeb | IrType::ShapeWebView | IrType::ShapeTerminal
-        // Process-run-with cfg + Cache config / stats + Csv document are
-        // monomorphic — no generics to collect.
-        | IrType::ProcessRunWithCfg
-        | IrType::ProcessRunInPtyCfg
-        | IrType::CacheCfg
-        | IrType::WebSocketClientCfg
-        | IrType::CacheStats
-        | IrType::CsvDoc
-        // Ipe.Email records + provider ADT are monomorphic — no generics.
-        | IrType::EmailMessage
-        | IrType::EmailAttachment
-        | IrType::EmailSesConfig
-        | IrType::EmailSmtpConfig
-        | IrType::EmailProvider
-        // Typed security newtypes are monomorphic opaque wrappers — no generics.
-        | IrType::CryptoKey
-        | IrType::CryptoMac
-        | IrType::EmailAddress
-        // `Locale` is monomorphic — no generics to collect.
-        | IrType::Locale
-        // `Principal` is monomorphic — no generics to collect.
-        | IrType::Principal
-        // `AuthConfig` / `TokenSource` are monomorphic — no generics to collect.
-        | IrType::AuthConfig
-        | IrType::TokenSource
-        // Shape opaque app leaves — monomorphic, no generics to collect.
-        | IrType::WebApp | IrType::TuiApp | IrType::CliApp | IrType::WorkerApp
-        // A row variable is a separate row generic (`R{n}`), tracked in
-        // `Func::row_params`, never in the ordinary `T{n}` scope collected here.
-        | IrType::RowGeneric(_) => {}
-        // `WebRoute page` may carry generic parameters through `page`.
-        IrType::WebRoute(page) => collect_generics(page, out),
-        IrType::CustomElement { down, up } => {
-            collect_generics(down, out);
-            collect_generics(up, out);
-        }
-        // `Ui { ctor, msg }` may carry generic parameters through `msg`.
-        IrType::Ui { msg, .. } => collect_generics(msg, out),
-    }
-}
-
 /// The app surface the program's entry `main` pins, from its lowered return type.
 ///
 /// A `WebApp` leaf under a webview host is the `WebView` surface; an entry that
@@ -4732,111 +4624,6 @@ fn entry_app_surface(program: &Program, webview: bool) -> ipe_ir::AppSurface {
         Some(IrType::CliApp) => AppSurface::Cli,
         Some(IrType::WorkerApp) => AppSurface::Worker,
         _ => AppSurface::Script,
-    }
-}
-
-/// A position-canonical rendering of a field-shape: every [`IrType::Generic`]
-/// symbol is replaced by its first-occurrence index, so two alpha-equivalent
-/// templates (`{ value : a }` and `{ value : b }`) render the same string and a
-/// non-equivalent one (`{ x : a, y : a }` vs `{ x : a, y : b }`) does not. Used
-/// only for equality, never emitted.
-fn skeleton_key(fields: &[(String, IrType)]) -> String {
-    let mut idx: BTreeMap<Symbol, usize> = BTreeMap::new();
-    let mut out = String::new();
-    for (name, ty) in fields {
-        out.push_str(name);
-        out.push(':');
-        skeleton_ty(ty, &mut idx, &mut out);
-        out.push(';');
-    }
-    out
-}
-
-fn skeleton_ty(ty: &IrType, idx: &mut BTreeMap<Symbol, usize>, out: &mut String) {
-    match ty {
-        IrType::Generic(s) => {
-            let next = idx.len();
-            let n = *idx.entry(*s).or_insert(next);
-            out.push('G');
-            out.push_str(&n.to_string());
-        }
-        IrType::Tuple(elems) => {
-            out.push('(');
-            for e in elems {
-                skeleton_ty(e, idx, out);
-                out.push(',');
-            }
-            out.push(')');
-        }
-        IrType::Record(map) => {
-            out.push('{');
-            for (k, v) in map {
-                out.push_str(&k.as_raw().to_string());
-                out.push(':');
-                skeleton_ty(v, idx, out);
-                out.push(',');
-            }
-            out.push('}');
-        }
-        IrType::Fun(params, ret) => {
-            out.push_str("fn(");
-            for p in params {
-                skeleton_ty(p, idx, out);
-                out.push(',');
-            }
-            out.push_str(")->");
-            skeleton_ty(ret, idx, out);
-        }
-        IrType::Enum { home, name, args } => {
-            // Key by the enum's nominal identity (home + symbol) plus its
-            // (possibly generic) type args, so `Maybe a` and `Maybe Int`
-            // skeletonise distinctly while `Maybe a` and `Maybe b`
-            // (alpha-equivalent) coincide. Home is included so two same-short-named
-            // types from different modules do not conflate record shapes.
-            out.push('E');
-            for seg in &home.0 {
-                out.push_str(&seg.as_raw().to_string());
-                out.push('.');
-            }
-            out.push_str(&name.as_raw().to_string());
-            out.push('<');
-            for a in args {
-                skeleton_ty(a, idx, out);
-                out.push(',');
-            }
-            out.push('>');
-        }
-        IrType::Dict(k, v) => {
-            out.push_str("Dict<");
-            skeleton_ty(k, idx, out);
-            out.push(',');
-            skeleton_ty(v, idx, out);
-            out.push('>');
-        }
-        IrType::Set(a) => {
-            out.push_str("Set<");
-            skeleton_ty(a, idx, out);
-            out.push('>');
-        }
-        // `IpeCmd<M>` / `IpeSub<M>` carry a message type parameter; recurse so
-        // `IpeCmd<G0>` and `IpeCmd<G1>` (alpha-equivalent) get the same key.
-        IrType::Cmd(inner) => {
-            out.push_str("Cmd<");
-            skeleton_ty(inner, idx, out);
-            out.push('>');
-        }
-        IrType::Sub(inner) => {
-            out.push_str("Sub<");
-            skeleton_ty(inner, idx, out);
-            out.push('>');
-        }
-        // Scalar / leaf types (Int / Bool / …): their `Debug` form is a stable,
-        // generic-free discriminator — exactly what a skeleton needs.
-        other => {
-            use core::fmt::Write as _;
-            // Writing to a `String` is infallible; the `Result` is discarded.
-            let _ = write!(out, "{other:?}");
-        }
     }
 }
 
@@ -4973,6 +4760,7 @@ fn match_template(
         | IrType::UrlRelative
         // `Dsn` is a monomorphic opaque leaf — must equal exactly.
         | IrType::Dsn
+        | IrType::DbLocation
         | IrType::Connection
         | IrType::ConnReadOnly
         | IrType::ConnReadWrite
@@ -5033,29 +4821,15 @@ fn match_template(
 fn template_specificity(ty: &IrType) -> usize {
     match ty {
         IrType::Generic(_) | IrType::RowGeneric(_) => 0,
-        IrType::Tuple(elems) => 1 + elems.iter().map(template_specificity).sum::<usize>(),
         IrType::Record(map) => 1 + map.values().map(template_specificity).sum::<usize>(),
-        IrType::Fun(params, ret)
-        | IrType::SharedFun(params, ret)
-        | IrType::FnOnceChain(params, ret) => {
-            1 + params.iter().map(template_specificity).sum::<usize>() + template_specificity(ret)
+        // Every other node is one head plus its children, which the head-identity
+        // SSOT `paired_children` enumerates exhaustively (a node paired with
+        // itself); a leaf has none.
+        _ => {
+            1 + ipe_ir::paired_children(ty, ty).map_or(0, |children| {
+                children.map(|(child, _)| template_specificity(child)).sum()
+            })
         }
-        IrType::Enum { args, .. } => 1 + args.iter().map(template_specificity).sum::<usize>(),
-        IrType::Maybe(e)
-        | IrType::List(e)
-        | IrType::Set(e)
-        | IrType::Decoder(e)
-        | IrType::Task(e)
-        | IrType::Cmd(e)
-        | IrType::Sub(e)
-        | IrType::WebRoute(e)
-        | IrType::Ui { msg: e, .. } => 1 + template_specificity(e),
-        IrType::Result(a, b) | IrType::Dict(a, b) => {
-            1 + template_specificity(a) + template_specificity(b)
-        }
-        // Every remaining variant is a concrete leaf (`Int`, opaque handles,
-        // nullary plain types, …): it contributes 1 and has no children.
-        _ => 1,
     }
 }
 
@@ -5100,16 +4874,16 @@ fn reconcile_shapes(key: &[String], occurrences: &[RecordFields]) -> DResult<Vec
     // uniquely: body-local shape surfacing (and signatures generally) can feed
     // two GENUINELY-DISTINCT generic shapes under one set — `{ q = a }` (shape
     // `{q:a}`) in one function and `{ q = (a, a) }` (shape `{q:(a,a)}`) in
-    // another. Both are well-typed, so each synthesises its own struct, keyed by
-    // its `skeleton_key` (the alpha-equivalence normal form). Alpha-EQUIVALENT
-    // occurrences share one skeleton and fold to a single struct — no spurious
-    // duplication. This mirrors the monomorphic-sibling path below, where
+    // another. Both are well-typed, so each synthesises its own struct.
+    // Alpha-EQUIVALENT occurrences (`ipe_ir::alpha_equivalent_fields`) fold to a
+    // single struct — no spurious duplication. This mirrors the monomorphic-sibling path below, where
     // structurally-distinct concrete shapes sharing a name set each get a struct.
     let mut templates: Vec<CanonicalShape> = Vec::new();
-    let mut template_skeletons: Vec<String> = Vec::new();
     for occ in occurrences.iter().filter(|f| is_generic(f)) {
-        let sk = skeleton_key(occ);
-        if template_skeletons.contains(&sk) {
+        if templates
+            .iter()
+            .any(|(template, _)| ipe_ir::alpha_equivalent_fields(template, occ))
+        {
             // An alpha-equivalent generic occurrence: already has its struct.
             continue;
         }
@@ -5117,14 +4891,13 @@ fn reconcile_shapes(key: &[String], occurrences: &[RecordFields]) -> DResult<Vec
         for (_, ty) in occ {
             collect_generics(ty, &mut type_params);
         }
-        template_skeletons.push(sk);
         templates.push((occ.clone(), type_params));
     }
 
     let mut classes: Vec<CanonicalShape> = Vec::new();
     for occ in occurrences {
         if is_generic(occ) {
-            // Folds into its own generic struct (grouped above by skeleton).
+            // Folds into its own generic struct (grouped above by alpha-equivalence).
             continue;
         }
         // A concrete occurrence that instantiates SOME generic template belongs to
@@ -5143,8 +4916,8 @@ fn reconcile_shapes(key: &[String], occurrences: &[RecordFields]) -> DResult<Vec
         }
     }
 
-    // The generic structs lead (each template is its skeleton's first generic
-    // occurrence, in first-occurrence order); genuinely-distinct concrete
+    // The generic structs lead (each template is its alpha-equivalence class's
+    // first generic occurrence, in first-occurrence order); genuinely-distinct concrete
     // siblings follow, also in first-occurrence order.
     let mut out = Vec::with_capacity(templates.len() + classes.len());
     out.extend(templates);
@@ -5446,23 +5219,7 @@ mod record_struct_namespace_tests {
         // `EmitCtx::build` itself must still succeed today — the
         // record-vs-enum collision is a PRE-EXISTING gap `build` does not
         // check; this task adds the check as a SEPARATE, explicit gate.
-        let ctx = EmitCtx::build(
-            &interner,
-            &program,
-            DbDriver::Sqlite,
-            None,
-            ipe_ir::Target::Native,
-            Vec::new(),
-            crate::MountBase::root(),
-            false,
-            None,
-            false,
-            BuildIntent::Release,
-            String::new(),
-            false,
-            false,
-            None,
-        )?;
+        let ctx = EmitCtx::build(&interner, &program, crate::EmitSettings::unconfigured())?;
         assert_eq!(ctx.record_structs().len(), 1);
         assert_eq!(
             ctx.record_structs().first().map(|r| r.name.as_str()),
@@ -5554,23 +5311,7 @@ mod record_struct_namespace_tests {
             }],
         };
 
-        let ctx = EmitCtx::build(
-            &interner,
-            &program,
-            DbDriver::Sqlite,
-            None,
-            ipe_ir::Target::Native,
-            Vec::new(),
-            crate::MountBase::root(),
-            false,
-            None,
-            false,
-            BuildIntent::Release,
-            String::new(),
-            false,
-            false,
-            None,
-        )?;
+        let ctx = EmitCtx::build(&interner, &program, crate::EmitSettings::unconfigured())?;
         ctx.assert_record_structs_disjoint_from_type_namespace(&BTreeSet::new())
     }
 
@@ -5646,23 +5387,7 @@ mod record_struct_namespace_tests {
             }],
         };
 
-        let ctx = EmitCtx::build(
-            &interner,
-            &program,
-            DbDriver::Sqlite,
-            None,
-            ipe_ir::Target::Native,
-            Vec::new(),
-            crate::MountBase::root(),
-            false,
-            None,
-            false,
-            BuildIntent::Release,
-            String::new(),
-            false,
-            false,
-            None,
-        )?;
+        let ctx = EmitCtx::build(&interner, &program, crate::EmitSettings::unconfigured())?;
 
         let colliding: BTreeSet<Symbol> = [snake, camel].into_iter().collect();
         let result = ctx.assert_row_witness_names_disjoint(&colliding, &BTreeSet::new());
@@ -5998,7 +5723,8 @@ mod crate_identity_tests {
 
     #[test]
     fn identity_keeps_the_friendly_base_as_prefix() {
-        let id = crate_identity("my-app", Path::new("/tmp/one"));
+        let identity = crate_identity("my-app", Path::new("/tmp/one"));
+        let id = identity.as_str();
         assert!(
             id.starts_with("my-app_"),
             "identity must keep the friendly base as its prefix, got {id:?}"
@@ -6019,7 +5745,8 @@ mod crate_identity_tests {
     #[test]
     fn over_long_base_is_truncated_under_the_cargo_ceiling() {
         let long_base = "a".repeat(100);
-        let id = crate_identity(&long_base, Path::new("/tmp/x"));
+        let identity = crate_identity(&long_base, Path::new("/tmp/x"));
+        let id = identity.as_str();
         assert!(id.len() <= 64, "identity {} chars exceeds 64", id.len());
         assert!(id.ends_with(&format!("_{}", id.rsplit('_').next().unwrap_or_default())));
     }

@@ -21,26 +21,27 @@
 //! now exercises the full `ipe::build` path this fixture originally had to
 //! route around.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+
+/// The IR text of every entry of the project at `dir`.
+fn emit_ir(dir: &Path) -> Result<String, ipe::CliError> {
+    let root = ipe::project_root::ProjectRoot::resolve(ipe::project_root::RootArg::at(dir))?;
+    ipe::emit_ir_text(&root, None)
+}
 
 fn repo_root() -> PathBuf {
     let joined = e2e_support::manifest_dir!().join("..").join("..");
     std::fs::canonicalize(&joined).unwrap_or(joined)
 }
 
-/// Parse + type-check + lower `tests/golden/http_stream_id/Main.ipe`.
+/// Parse + type-check + lower `tests/golden/http_stream_id/src/Main.ipe`.
 /// Asserts the pipeline succeeds (no IPE-T0001 from mismatched `Int` vs
 /// `StreamId`, and no `callee_arity` panic from a missing lower arm).
 #[test]
 fn http_stream_open_returns_stream_id_not_int() {
     let root = repo_root();
-    let entry = root
-        .join("tests")
-        .join("golden")
-        .join("http_stream_id")
-        .join("Main.ipe");
-
-    let result = ipe::emit_ir_text(&entry);
+    let golden_project = root.join("tests").join("golden").join("http_stream_id");
+    let result = emit_ir(&golden_project);
     assert!(
         result.is_ok(),
         "HttpStream.open typed as `Task Error StreamId` must pass type-check + lower \
@@ -59,17 +60,13 @@ fn http_stream_open_returns_stream_id_not_int() {
 #[test]
 fn http_stream_open_full_emit_succeeds() {
     let root = repo_root();
-    let entry = root
-        .join("tests")
-        .join("golden")
-        .join("http_stream_id")
-        .join("Main.ipe");
+    let golden_project = root.join("tests").join("golden").join("http_stream_id");
     let out = crate::support::scratch_root().join("ipec_i148_http_stream_id_full_emit");
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
 
-    let built = ipe::build(&entry, &out, &runtime);
+    let built = crate::support::build_golden(&golden_project, &out, &runtime);
     assert!(
         built.is_ok(),
         "ipe dev build must succeed for HttpStream.open's HttpRequest arg (no \

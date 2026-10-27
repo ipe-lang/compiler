@@ -2,13 +2,15 @@ module Main exposing (main)
 
 import Ipe.Error as Error exposing (Error)
 import Ipe.Io as Io
+import Ipe.Result exposing (Result(..))
 import Ipe.Server.Http as Server
 import Ipe.System as System
 import Ipe.Task as Task
 import Ipe.Tea.Web as Web
 import Ipe.Tea.Web.Cmd as Cmd
 import Ipe.Tea.Web.Sub as Sub
-import Lib.App as App exposing (Model, Msg(..), Page(..))
+import Lib.App as App
+import Lib.Bind as Bind
 import Lib.Db as LibDb
 import Lib.EnvLookup as EnvLookup
 import Lib.Epoch as Epoch
@@ -16,6 +18,7 @@ import Lib.Index as Index
 import Lib.Queue as Queue
 import Lib.ReviewKey as ReviewKey exposing (ReviewKey(..))
 import Lib.SafeText as SafeText
+import Lib.Session as Session exposing (Model, Msg(..), Page(..))
 import Lib.Settings as Settings
 import Lib.View as View
 
@@ -23,7 +26,7 @@ import Lib.View as View
 -- The session's first model; the route entry that follows loads the page.
 init : Web.WebReq -> ( Model, Cmd Msg )
 init _req =
-    ( App.initialModel, Cmd.none )
+    ( Session.initialModel, Cmd.none )
 
 
 subscriptions : Model -> Sub Msg
@@ -47,21 +50,31 @@ reviewApp settings =
 
 
 -- Require an environment variable, failing closed with an actionable message
--- when it cannot be read. The recovery branch names the variable, says by
--- the failure's kind whether it is not set or could not be read, never
--- repeats the failure's text, adds that variable's own fix, then exits
--- non-zero. The app never falls back to a silent default that would surface
--- later as an opaque SQLITE_CANTOPEN when the index db is not where a bare
--- default points. `key` and `fix` are this tool's own text.
-requireEnv : String -> String -> Task Error String
-requireEnv key fix =
+-- when it cannot be read. The recovery branch prints that variable's startup
+-- refusal, which says by the failure's kind whether it is not set or could
+-- not be read, never repeats the failure's text and names the one fix, then
+-- exits non-zero. The app never falls back to a silent default that would
+-- surface later as an opaque SQLITE_CANTOPEN when the index db is not where a
+-- bare default points.
+requireEnv : EnvLookup.StartupVar -> Task Error String
+requireEnv var =
+    let
+        key =
+            EnvLookup.startupVarName var
+    in
     Task.onError
-        (\e ->
-            do
-                Io.eprintln (EnvLookup.requiredVarRefusal key fix e)
-                System.exit 1
-        )
+        (\e -> printStartupFailure (EnvLookup.requiredVarRefusal var e))
         (System.getenv key)
+
+
+-- Read an optional environment variable: not set, set, or set but
+-- unreadable, the last never mistaken for not set. The caller decides what
+-- each means; `key` is this tool's own text.
+optionalEnv : String -> Task Error Settings.EnvValue
+optionalEnv key =
+    Task.onError
+        (\e -> Task.succeed (Settings.envFailure e))
+        (System.getenv key |> Task.map Settings.EnvSet)
 
 
 -- The review-log key, read and parsed once: a malformed value stops startup
@@ -69,13 +82,19 @@ requireEnv key fix =
 -- the server read-only, with a notice saying so.
 requireReviewKey : Task Error ReviewKey
 requireReviewKey =
-    Task.onError
-        (\e ->
-            do
-                Io.eprintln ("code-review: " ++ Error.message e)
-                System.exit 1
-        )
+    Task.onError printStartupFailure
         (ReviewKey.readReviewKey |> Task.andThen announceKey)
+
+
+-- A startup refusal printed on one line under the tool's name, its text
+-- rendered so no control character reaches the terminal, then exit 1. The
+-- one printer of every startup refusal, and the one place that writes the
+-- tool's name before one.
+printStartupFailure : Error -> Task Error a
+printStartupFailure e =
+    do
+        Io.eprintln ("code-review: " ++ SafeText.toString (SafeText.renderForeign (Error.message e)))
+        System.exit 1
 
 
 announceKey : ReviewKey -> Task Error ReviewKey
@@ -90,28 +109,27 @@ announceKey key =
 
 -- Parse every configured location, then open and probe each one before
 -- serving: the index read-only with every column a page reads, the review
--- database created and migrated with its log bound to `key`, and the root, which the parse requires to
--- be an existing directory and `Index.probeRoot` to hold the index's files.
--- A relative value resolves against the working directory. Then the index's
+-- database created and migrated with its log bound to `key`, and the roots,
+-- which the parse requires to be existing directories,
+-- `Index.probeRepos` to be exactly the repositories the index records, nested
+-- as it records them, and `Index.probeRoot` to hold the index's files. A
+-- relative `IPE_INDEX_ROOT` resolves against the working directory; an unset
+-- `IPE_REVIEW_DB` is `review.db` there, an unreadable one is refused. Then the index's
 -- `reviewed` copy is rebuilt from the review database once and stamped with
 -- the review log's head under `key`, so the first load already reads a
 -- current copy. Any failure stops startup with a message naming the
 -- variable and one fix.
 -- Last, this process's epoch is minted.
 -- Returns the settings, the one value the app serves from.
-requireSettings : ReviewKey -> String -> String -> String -> Task Error Settings.AppSettings
-requireSettings key rawDb rawRoot rawReview =
-    Task.onError
-        (\e ->
-            do
-                Io.eprintln ("code-review: " ++ SafeText.toString (SafeText.renderForeign (Error.message e)))
-                System.exit 1
-        )
+requireSettings : ReviewKey -> String -> String -> Settings.EnvValue -> Settings.EnvValue -> Task Error Settings.AppSettings
+requireSettings key rawDb rawRoot rawRepos rawReview =
+    Task.onError printStartupFailure
         (do
-            index <- Settings.parseIndexSettings rawDb rawRoot
+            index <- Settings.parseIndexSettings rawDb rawRoot rawRepos
             Index.probe index
+            Index.probeRepos index
             Index.probeRoot index
-            review <- Settings.parseReviewDb rawReview
+            review <- Settings.valueOr "IPE_REVIEW_DB" "review.db" rawReview |> Task.andThen Settings.parseReviewDb
             LibDb.probe key review
             db <- LibDb.openAt review
             Queue.resyncReviewed key index db
@@ -120,11 +138,38 @@ requireSettings key rawDb rawRoot rawReview =
         )
 
 
+-- The listen address, proved loopback before anything else is read: a
+-- refused value stops startup with its refusal and exit status 1, before any
+-- database is opened, the review key is read, or a socket is bound.
+requireLoopbackBind : Settings.EnvValue -> Task Error Bind.Loopback
+requireLoopbackBind raw =
+    case Bind.parseBind raw of
+        Ok bind ->
+            Task.succeed bind
+
+        Err refusal ->
+            printStartupFailure (Bind.refusal refusal)
+
+
+-- The one mount list. It takes the `Loopback` proof, so the server cannot
+-- listen without a bind `Bind.parseBind` accepted; the runtime resolves the
+-- address from the same variable the proof was parsed from. `main` ends in
+-- `Server.listen` itself, the one head the managed-update-loop import check
+-- admits.
+mounts : Bind.Loopback -> Settings.AppSettings -> List Server.Route
+mounts _loopback settings =
+    [ Server.mountApp "/" (reviewApp settings) ]
+
+
 main : Task Error ()
 main =
     do
-        rawDb <- requireEnv "IPE_INDEX_DB" "Set it to the path or sqlite:// URL of the ipe-index index.db (absolute, or relative to the working directory).\n  Build the index first from the repo root:  tools/scripts/ipe-index index"
-        rawRoot <- requireEnv "IPE_INDEX_ROOT" "Set it to the repo root the index's tag:relative paths join to (absolute, or relative to the working directory)."
+        rawBind <- optionalEnv "IPE_HTTP_BIND"
+        bind <- requireLoopbackBind rawBind
+        rawDb <- requireEnv EnvLookup.IndexDbVar
+        rawRoot <- requireEnv EnvLookup.IndexRootVar
+        rawRepos <- optionalEnv "IPE_INDEX_REPOS"
+        rawReview <- optionalEnv "IPE_REVIEW_DB"
         key <- requireReviewKey
-        settings <- requireSettings key rawDb rawRoot (System.getenvOr "IPE_REVIEW_DB" "review.db")
-        Server.listen 8000 [ Server.mountApp "/" (reviewApp settings) ]
+        settings <- requireSettings key rawDb rawRoot rawRepos rawReview
+        Server.listen 8000 (mounts bind settings)

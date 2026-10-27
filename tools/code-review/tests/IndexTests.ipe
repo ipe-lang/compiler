@@ -1,6 +1,7 @@
 module IndexTests exposing (checks)
 
 import Ipe.ByteSize as ByteSize
+import Ipe.Bytes as Bytes
 import Ipe.Char as Char
 import Ipe.Crypto as Crypto
 import Ipe.Db as Db
@@ -21,17 +22,22 @@ import Ipe.System as System
 import Ipe.Task as Task
 import Ipe.Time.Timestamp as Timestamp
 import Lib.Db as LibDb exposing (Decision(..), HistoryCursor(..))
+import Lib.Drawn as Drawn exposing (Mode(..), SourceRow(..))
+import Lib.Failure exposing (DecideRefusal(..))
 import Lib.Format as Format
 import Lib.Highlight as Highlight exposing (Lang(..), Token(..))
-import Lib.Index as Index exposing (Body(..), Oversize(..), SourceRow(..), SourceView(..), StaleReason(..))
+import Lib.History exposing (HistoryState(..))
+import Lib.Index as Index exposing (Body(..), Oversize(..), ReadFailure(..), SourceView(..), StaleReason(..))
 import Lib.Keys as Keys exposing (KeyAction(..))
+import Lib.Label as Label exposing (Label, LabelPart(..))
 import Lib.Links as Links exposing (Link(..))
-import Lib.Queue as Queue exposing (HistoryState(..), QueueState(..), UnitPageState(..))
+import Lib.Queue as Queue exposing (QueueState(..), UnitPageState(..))
 import Lib.RepoPath as RepoPath exposing (PathError(..), Root, RootMap)
 import Lib.ReviewKey as ReviewKey
-import Lib.SafeText as SafeText
+import Lib.Settings as Settings
 import Lib.Uid as Uid exposing (Uid)
-import TestSupport exposing (tableExists, countReviewRows, expectErr, refuse, seedIndex, writeFileText, fixtureLibRs, fixtureMainIpe, viewA, viewB, viewTag, shownTextOf, unitViewTag, execIndex, execIndexUnchecked, Scratch, freshScratch, freshDir, check, indexSchemaStatements, execIndexSchema, seedIndexDb, insertUnitRows, setIndexEnv, envSettings, loadFirstPage, indexConn, loadUnitNow, checkUnits, listSecond, isUnitA, isUnitB, cleanupIndex, removeFileIfAny, codeText, noHazard, rendered, renderedForeign, describeText, refusedFor, openReadOnlyAt, vectorsPath, ipeIndexTestFile, langName, repoFile, probeMessage, probeNames, maybeContains, isUnrecorded, modifiedFrom, shownOf, uid)
+import Lib.UnitName as UnitName exposing (NameRefusal(..))
+import TestSupport exposing (tableExists, countReviewRows, expectErr, refuse, seedIndex, writeFileText, fixtureLibRs, fixtureMainIpe, viewA, viewB, viewTag, shownTextOf, unitViewTag, execIndex, execIndexUnchecked, Scratch, freshScratch, freshDir, check, indexSchemaStatements, execIndexSchema, seedIndexDb, insertUnitRows, setIndexEnv, envSettings, loadFirstPage, indexConn, loadUnitNow, checkUnits, listSecond, isUnitA, isUnitB, cleanupIndex, removeFileIfAny, codeText, noHazard, rendered, renderedForeign, describeText, refusedFor, openReadOnlyAt, vectorsPath, ipeIndexTestFile, langName, repoFile, probeMessage, probeNames, maybeContains, isUnrecorded, modifiedFrom, shownOf, uid, insertUnboundUnit, labelText, piecesShown)
 
 
 -- ── ipe-index bridge ───────────────────────────────────────────────────
@@ -85,7 +91,7 @@ fixtureLabel unit =
         "u-b"
 
     else
-        Uid.toString unit
+        TestSupport.uidHex unit
 
 
 -- True for an `Unreadable` view tag whose rendered error contains `needle`.
@@ -163,6 +169,191 @@ unreadableReasonsTyped =
         gone <- viewTagsAfter "ipe-index-unreadable-gone" (\at -> removeFileIfAny (at.repo ++ "/src/Main.ipe"))
         dir <- viewTagsAfter "ipe-index-unreadable-dir" mainIpeAsDirectory
         Task.succeed (typedUnreadable "names no file" gone && typedUnreadable "did not read as text" dir)
+
+
+-- A stored path one character longer than the index read's window is
+-- refused before any join or read, named by a bounded label; a path exactly
+-- at the window is not refused for its length (it names no file). Red if a
+-- cut path reaches `resolve` or the read, or if the window refuses a whole
+-- path.
+pathPastWindowRefused : Task.Task Error Bool
+pathPastWindowRefused =
+    do
+        at <- freshScratch "ipe-index-path-past-window"
+        removeFileIfAny at.indexDb
+        seedIndex at.indexDb at.repo
+        execIndexUnchecked at.indexDb "UPDATE units SET path = ? WHERE uid = ?" [ SqlString (storedPathOf (Label.windowChars + 1)), Uid.toSql (uid "u-b") ]
+        past <- loadUnitNow (uid "u-b")
+        execIndexUnchecked at.indexDb "UPDATE units SET path = ? WHERE uid = ?" [ SqlString (storedPathOf Label.windowChars), Uid.toSql (uid "u-b") ]
+        within <- loadUnitNow (uid "u-b")
+        cleanupIndex at.indexDb at.repo
+        Task.succeed
+            (case ( Maybe.map .view past, Maybe.map .view within ) of
+                ( Just (Unreadable (PathPastWindow stored)), Just (Unreadable failure) ) ->
+                    Label.byteCount stored <= Label.capBytes Label.labelCap + Label.markerByteCeiling
+                        && List.length (Label.parts stored) <= Label.elementCeiling
+                        && not (windowFailure failure)
+
+                _ ->
+                    False
+            )
+
+
+-- A stored path cut at a NUL byte inside the read window is refused before
+-- any join or read under that cause, never as a path past the window, and is
+-- named by a bounded label. Red if the NUL cut is misreported as a long path
+-- or the cut prefix reaches `resolve` or the read.
+pathCutAtNulRefused : Task.Task Error Bool
+pathCutAtNulRefused =
+    do
+        at <- freshScratch "ipe-index-path-nul"
+        removeFileIfAny at.indexDb
+        seedIndex at.indexDb at.repo
+        execIndexUnchecked at.indexDb "UPDATE units SET path = 'ipe:src/Ma' || char(0) || 'in.ipe' WHERE uid = ?" [ Uid.toSql (uid "u-b") ]
+        cut <- loadUnitNow (uid "u-b")
+        cleanupIndex at.indexDb at.repo
+        Task.succeed
+            (case Maybe.map .view cut of
+                Just (Unreadable (PathHoldsNul stored)) ->
+                    Label.byteCount stored <= Label.capBytes Label.labelCap + Label.markerByteCeiling
+                        && List.any isCut (Label.parts stored)
+                        && String.contains "holds a NUL byte" (piecesShown (Index.readFailureText (PathHoldsNul stored)))
+
+                Just _ ->
+                    False
+
+                Nothing ->
+                    False
+            )
+
+
+-- A stored body hash longer than the read window fails the unit's read,
+-- never parsed from its prefix, and the failure never repeats the stored
+-- value. Red if a cut hash reaches `parseAttested` or the review lookup.
+bodyHashPastWindowFailsRead : Task.Task Error Bool
+bodyHashPastWindowFailsRead =
+    do
+        at <- freshScratch "ipe-index-hash-past-window"
+        removeFileIfAny at.indexDb
+        seedIndex at.indexDb at.repo
+        execIndexUnchecked at.indexDb "UPDATE units SET body_hash = 'sha256:' || replace(hex(zeroblob(3000)), '0', 'a') WHERE uid = ?" [ Uid.toSql (uid "u-b") ]
+        failed <- probeMessage (loadUnitNow (uid "u-b") |> Task.map (\_ -> ()))
+        cleanupIndex at.indexDb at.repo
+        Task.succeed
+            (failed /= Nothing
+                && not (maybeContains (String.repeat 64 "a") failed)
+            )
+
+
+-- A stored path that is text but not UTF-8, cut at a NUL byte so that the
+-- hex spelling of its window has exactly the column's byte count, is refused
+-- as not text, never read as that hex spelling. Red if a window is judged
+-- whole from the bytes of its decoded text rather than the bytes SQLite
+-- returned for it.
+pathNotUtf8Refused : Task.Task Error Bool
+pathNotUtf8Refused =
+    do
+        at <- freshScratch "ipe-index-path-not-utf8"
+        removeFileIfAny at.indexDb
+        seedIndex at.indexDb at.repo
+        execIndexUnchecked at.indexDb "UPDATE units SET path = CAST(X'6970653AFFFF004141414141' AS TEXT) WHERE uid = ?" [ Uid.toSql (uid "u-b") ]
+        found <- loadUnitNow (uid "u-b")
+        cleanupIndex at.indexDb at.repo
+        Task.succeed
+            (case Maybe.map .view found of
+                Just (Unreadable (PathNotText _)) ->
+                    True
+
+                Just _ ->
+                    False
+
+                Nothing ->
+                    False
+            )
+
+
+-- A column the app acts on that is longer than the read window fails the
+-- read naming the column, never the value, wherever it is read: a queue
+-- row's old hash, a recorded repository tag, a `reviewed` pair and the
+-- copy's stamp. Red if any of them is read whole, unbounded, again.
+actedColumnsPastWindowFailRead : Task.Task Error Bool
+actedColumnsPastWindowFailRead =
+    let
+        long =
+            "replace(hex(zeroblob(3000)), '0', 'a')"
+
+        past col message =
+            maybeContains (col ++ " is longer than the " ++ String.fromInt Label.windowChars ++ " characters") message
+                && not (maybeContains (String.repeat 64 "a") message)
+    in
+    do
+        oldHash <- readMessageAfter "ipe-index-old-hash-past-window" ("UPDATE change_queue SET old_hash = " ++ long ++ " WHERE uid = '" ++ TestSupport.uidHex (uid "u-b") ++ "'") (\conn -> pendingRows conn |> Task.map (\_ -> ()))
+        pair <- readMessageAfter "ipe-index-pair-past-window" ("INSERT INTO reviewed VALUES ('x', " ++ long ++ ")") (\conn -> snapshotOn conn |> Task.map (\_ -> ()))
+        stamp <- readMessageAfter "ipe-index-stamp-past-window" ("INSERT OR REPLACE INTO reviewed_stamp (one, head) VALUES (1, " ++ long ++ ")") (\conn -> Index.readStamp conn |> Task.map (\_ -> ()))
+        tag <- reposProbeAfter "ipe-index-repos-tag-past-window" [ "INSERT INTO repos (tag, outer, prefix) VALUES (" ++ long ++ ", NULL, NULL)" ] noRepos
+        Task.succeed
+            (past "old_hash" oldHash
+                && past "body_hash" pair
+                && past "head" stamp
+                && tag /= Nothing
+                && not (maybeContains (String.repeat 64 "a") tag)
+            )
+
+
+-- The failure message, if any, of `read` on a seeded index after `sql` ran.
+readMessageAfter : String -> String -> (Db -> Task.Task Error ()) -> Task.Task Error (Maybe String)
+readMessageAfter name sql read =
+    do
+        at <- freshScratch name
+        removeFileIfAny at.indexDb
+        seedIndex at.indexDb at.repo
+        execIndexScript at.indexDb sql
+        conn <- indexConn
+        message <- probeMessage (read conn)
+        cleanupIndex at.indexDb at.repo
+        Task.succeed message
+
+
+isCut : LabelPart -> Bool
+isCut part =
+    case part of
+        LabelCut _ _ ->
+            True
+
+        LabelText _ ->
+            False
+
+        LabelEscapes _ ->
+            False
+
+
+-- Whether a read failure is the index read not returning the whole path.
+windowFailure : ReadFailure -> Bool
+windowFailure failure =
+    case failure of
+        PathPastWindow _ ->
+            True
+
+        PathHoldsNul _ ->
+            True
+
+        PathNotText _ ->
+            True
+
+        PathRefused _ ->
+            False
+
+        NoFile _ ->
+            False
+
+        CannotRead _ ->
+            False
+
+
+-- A stored path under the `ipe` tag of `chars` characters in all.
+storedPathOf : Int -> String
+storedPathOf chars =
+    "ipe:" ++ String.repeat (chars - 4) "a"
 
 
 -- `src/Main.ipe` replaced by a directory of that name.
@@ -376,10 +567,8 @@ spanPreCheckNoOverflow =
         huge <- oversizeTag False fixtureLibRs 1 9223372036854775807 (Index.attest viewA)
         invalid <- oversizeTag False fixtureLibRs (0 - 9223372036854775807) 9223372036854775807 (Index.attest viewA)
         Task.succeed
-            (huge
-                == "too large lines 9223372036854775807"
-                && invalid
-                == "range 10"
+            (huge == "too large lines 9223372036854775807"
+                && invalid == "range 10"
                 && notJudged 0 Index.viewLineCeiling
                 && notJudged 2 (0 - 9223372036854775807)
             )
@@ -407,7 +596,7 @@ classifyRefusesPastLineCeiling =
         text =
             xLines past
     in
-    case Index.classifyView (uid "u-a") (Index.attest text) (LineRange 1 past) text of
+    case Index.classifyView (uid "u-a") Rust (Index.attest text) (LineRange 1 past) text of
         TooLarge (SpanLines o) ->
             o.lines == past
 
@@ -427,17 +616,296 @@ classifyRefusesPastLineCeiling =
             False
 
 
+-- One Rust line of `count` escapes, each after an `a`: drawn plain it is
+-- the view, its line run, gutter and code block, and one element per escape.
+escapeLine : Int -> String
+escapeLine count =
+    String.repeat count ("a" ++ String.fromChar (Char.fromCode 8238))
+
+
+classifyLine : String -> SourceView
+classifyLine line =
+    Index.classifyView (uid "u-n") Rust (Index.attest line) (LineRange 1 1) line
+
+
+-- The elements and mode of a shown view's drawing.
+drawnShape : SourceView -> Maybe ( Int, Mode )
+drawnShape view =
+    Maybe.map (\shown -> ( Drawn.elements (Index.shownDrawn shown), Drawn.mode (Index.shownDrawn shown) )) (shownOf view)
+
+
+-- The control for `viewPastNodeCeilingSpelled`: a line drawn in exactly
+-- `viewNodeCeiling` elements, too many to highlight, is shown plain with
+-- that count. Red if the ceiling is compared with `<`.
+viewAtNodeCeilingShown : Bool
+viewAtNodeCeilingShown =
+    drawnShape (classifyLine (escapeLine (Index.viewNodeCeiling - 4)))
+        == Just ( Index.viewNodeCeiling, Unhighlighted )
+
+
+-- One element past the ceiling plain, with one line and a few KiB, under
+-- the line and byte ceilings, is shown spelled out in four elements, never
+-- withheld. Red if the spelled drawing is not tried, or a drawing past the
+-- ceiling is kept.
+viewPastNodeCeilingSpelled : Bool
+viewPastNodeCeilingSpelled =
+    let
+        line =
+            escapeLine (Index.viewNodeCeiling - 3)
+    in
+    drawnShape (classifyLine line) == Just ( 4, SpelledOut )
+        && String.length line < ByteSize.toBytes Index.viewByteCeiling
+
+
+-- A line of 7000 keywords takes more elements coloured than the ceiling and
+-- four plain, so it is shown plain, not spelled out; a short line is shown
+-- coloured. Red if the plain drawing is not tried, or tried first, or the
+-- spelled one is tried first.
+plainFallbackWhenColorsTooMany : Bool
+plainFallbackWhenColorsTooMany =
+    let
+        keywords =
+            String.repeat 7000 "fn "
+    in
+    Drawn.elements (Drawn.highlighted Rust [ Numbered 1 keywords ]) > Index.viewNodeCeiling
+        && drawnShape (classifyLine keywords) == Just ( 4, Unhighlighted )
+        && Maybe.map (\( _, drawnMode ) -> drawnMode) (drawnShape (classifyLine "fn x() {}")) == Just Highlighted
+
+
+-- A 14 KB line of one token per byte, and a 129 KiB one, are shown plain
+-- or spelled out, never coloured past the ceiling; a 129 KiB line of escapes
+-- is shown spelled out. Red if a drawing past the ceiling is kept.
+longTokenLinesNeverHighlighted : Bool
+longTokenLinesNeverHighlighted =
+    let
+        withinCeiling view =
+            case drawnShape view of
+                Just ( count, Unhighlighted ) ->
+                    count <= Index.viewNodeCeiling
+
+                Just ( count, SpelledOut ) ->
+                    count == 4
+
+                Just ( _, Highlighted ) ->
+                    False
+
+                Nothing ->
+                    False
+
+        escapes =
+            escapeLine 33024
+    in
+    withinCeiling (classifyLine (String.repeat 7000 "1 "))
+        && withinCeiling (classifyLine (String.repeat 66048 "1 "))
+        && drawnShape (classifyLine escapes) == Just ( 4, SpelledOut )
+        && 4 * 33024 < ByteSize.toBytes Index.viewByteCeiling
+
+
+-- An escape-dense view under a wrong hash is drifted: with no element
+-- refusal left, the attestation compare follows the byte check.
+escapeDenseWrongHashDrifted : Bool
+escapeDenseWrongHashDrifted =
+    let
+        line =
+            escapeLine Index.viewNodeCeiling
+    in
+    viewTag (Index.classifyView (uid "u-n") Rust (Index.attest "another view") (LineRange 1 1) line) == "drifted"
+
+
+-- A thousand lines of thirty escapes each, past the element ceiling drawn
+-- plain and under the line and byte ceilings, are shown spelled out in four
+-- elements, never withheld for their escapes. Red if the spelled drawing is
+-- dropped or an element refusal returns.
+escapeDenseUnitShownSpelled : Bool
+escapeDenseUnitShownSpelled =
+    let
+        text =
+            String.join "\n" (List.repeat 1000 (escapeLine 30))
+
+        view =
+            Index.classifyView (uid "u-d") Rust (Index.attest text) (LineRange 1 1000) text
+    in
+    drawnShape view == Just ( 4, SpelledOut )
+        && Maybe.map Index.shownText (shownOf view) == Just text
+        && Bytes.length (Bytes.fromString text) < ByteSize.toBytes Index.viewByteCeiling
+
+
+-- A file unit whose every other line another unit covers, 4999 lines with
+-- 2499 covered runs, inside the line and child-span ceilings, draws plain
+-- past the element ceiling and is shown spelled out in four elements. Red
+-- if a residual's gaps are drawn one element each past the ceiling.
+alternatingResidualShownSpelled : Bool
+alternatingResidualShownSpelled =
+    let
+        src =
+            xLines 4999
+
+        spans =
+            List.map (\k -> ( 2 * k, 2 * k )) (List.range 1 2499)
+
+        view =
+            Index.classifyView (uid "u-file") Rust (Index.attestResidual (Index.residualText spans src)) (Residual spans) src
+    in
+    List.length spans <= Index.childSpanCeiling
+        && drawnShape view == Just ( 4, SpelledOut )
+
+
+-- The relation the element ceiling is chosen by: its elements at the cost
+-- of one, plus the reserve, fit three quarters of the runtime's session
+-- ceiling, and the reserve holds the largest view's text sixteen times over
+-- with 128 bytes for each of its lines, and a spelled drawing's gap text,
+-- gap mark and two line breaks for each line. Red if a ceiling or a cost
+-- moves without the other.
+nodeCeilingFitsSessionCeiling : Bool
+nodeCeilingFitsSessionCeiling =
+    let
+        spelledLineBytes =
+            Bytes.length (Bytes.fromString Drawn.spelledGapText) + Bytes.length (Bytes.fromString Drawn.spelledGapMark) + 2
+    in
+    0 < Index.viewNodeCeiling
+        && Index.viewNodeCeiling * ByteSize.toBytes Index.elementResidentBytes + ByteSize.toBytes Index.viewReserve <= ByteSize.toBytes Index.runtimeSessionCeiling // 4 * 3
+        && 16 * ByteSize.toBytes Index.viewByteCeiling + 128 * Index.viewLineCeiling + spelledLineBytes * Index.viewLineCeiling <= ByteSize.toBytes Index.viewReserve
+
+
+-- The relation the queue page is sized by: a full page's elements at the
+-- cost of one, plus its label bytes held twice (in the model and in the
+-- drawn tree) and the session's fixed charge, fit the quarter of the session
+-- ceiling the unit view leaves.
+-- Red if the page size, a label cap or a cost moves without the other.
+queueCeilingFitsQuarter : Bool
+queueCeilingFitsQuarter =
+    0 < Index.queueElementCeiling
+        && Index.queueElementCeiling * ByteSize.toBytes Index.elementResidentBytes + 2 * Index.queueLabelByteCeiling + ByteSize.toBytes Index.runtimeEntryOverhead <= ByteSize.toBytes Index.runtimeSessionCeiling // 4
+
+
+-- A unit whose stored purpose is a mebibyte reaches the queue page and the
+-- unit page as a label of at most the purpose cap plus its marker, whose
+-- marker counts every byte the label dropped. Red if a read pulls the whole
+-- column or the label stops bounding what it was given.
+purposeOfOneMibIsBounded : Task.Task Error Bool
+purposeOfOneMibIsBounded =
+    let
+        stored =
+            1024 * 1024
+
+        bounded purpose =
+            case purpose of
+                Just label ->
+                    Label.byteCount label <= Label.capBytes Label.purposeCap + Label.markerByteCeiling
+                        && droppedOf label == Just (stored - Label.capBytes Label.purposeCap)
+
+                Nothing ->
+                    False
+    in
+    do
+        at <- freshScratch "ipe-index-purpose-bounded"
+        removeFileIfAny at.indexDb
+        seedIndex at.indexDb at.repo
+        execIndexUnchecked at.indexDb "UPDATE units SET purpose = ? WHERE uid = ?" [ SqlString (String.repeat stored "p"), Uid.toSql (uid "u-a") ]
+        conn <- indexConn
+        rows <- pendingRows conn
+        loaded <- loadUnitNow (uid "u-a")
+        cleanupIndex at.indexDb at.repo
+        Task.succeed
+            (List.any (\row -> row.unit.uid == uid "u-a" && bounded row.unit.purpose) rows
+                && Maybe.map (\view -> bounded view.unit.purpose) loaded == Just True
+            )
+
+
+-- The bytes a label's marker says it dropped, when it ends in one.
+droppedOf : Label -> Maybe Int
+droppedOf label =
+    case List.head (List.reverse (Label.parts label)) of
+        Just (LabelCut dropped _) ->
+            Just dropped
+
+        Just (LabelText _) ->
+            Nothing
+
+        Just (LabelEscapes _) ->
+            Nothing
+
+        Nothing ->
+            Nothing
+
+
+-- The fixed per-session charge counted against the queue page's quarter is
+-- the one the runtime's budget source declares as `ENTRY_OVERHEAD`, in whole
+-- KiB. Red when either side changes alone.
+entryOverheadMirrorsRuntime : Task.Task Error Bool
+entryOverheadMirrorsRuntime =
+    let
+        kib =
+            1024
+
+        overhead =
+            ByteSize.toBytes Index.runtimeEntryOverhead
+    in
+    Task.map
+        (\source ->
+            modBy kib overhead == 0
+                && String.contains ("\npub const ENTRY_OVERHEAD: Bytes = Bytes::new(" ++ String.fromInt (overhead // kib) ++ " * 1024);\n") source
+        )
+        runtimeBudgetSource
+
+
+-- The session ceiling the element ceiling is sized under is the runtime's:
+-- the runtime's budget source declares `SESSION_CEILING` as the same whole
+-- number of MiB. Red when either side changes alone.
+sessionCeilingMirrorsRuntime : Task.Task Error Bool
+sessionCeilingMirrorsRuntime =
+    let
+        mib =
+            1024 * 1024
+
+        ceiling =
+            ByteSize.toBytes Index.runtimeSessionCeiling
+    in
+    Task.map
+        (\source ->
+            modBy mib ceiling == 0
+                && String.contains ("\npub const SESSION_CEILING: Bytes = Bytes::mib(" ++ String.fromInt (ceiling // mib) ++ ");\n") source
+        )
+        runtimeBudgetSource
+
+
+-- The cost per element the element ceiling is sized by is the runtime's:
+-- the runtime's budget source declares `DRAWN_ELEMENT_BYTES` as the same
+-- number of bytes. Red when either side changes alone.
+elementBytesMirrorsRuntime : Task.Task Error Bool
+elementBytesMirrorsRuntime =
+    Task.map
+        (String.contains ("\npub const DRAWN_ELEMENT_BYTES: Bytes = Bytes::new(" ++ String.fromInt (ByteSize.toBytes Index.elementResidentBytes) ++ ");\n"))
+        runtimeBudgetSource
+
+
+-- The depth the cost per element holds at is the runtime's: the runtime's
+-- budget source declares `DRAWN_ELEMENT_DEPTH` as the same depth. Red when
+-- either side changes alone.
+drawnDepthMirrorsRuntime : Task.Task Error Bool
+drawnDepthMirrorsRuntime =
+    Task.map
+        (String.contains ("\npub const DRAWN_ELEMENT_DEPTH: usize = " ++ String.fromInt Index.drawnDepthCeiling ++ ";\n"))
+        runtimeBudgetSource
+
+
+-- The runtime's budget source, which declares the numbers this app mirrors.
+runtimeBudgetSource : Task.Task Error String
+runtimeBudgetSource =
+    do
+        cwd <- System.cwd ()
+        path <- Task.fromResult (Path.fromString (repoFile cwd "src/runtime/rust/src/web/budget.rs"))
+        File.readFileLimit path (ByteSize.kib 256)
+
+
 -- Both ceilings are positive, and the byte ceiling is within the read
 -- ceiling, so it can bind. Red on a zero sentinel or a byte ceiling above
 -- the read ceiling.
 viewCeilingsWellFormed : Bool
 viewCeilingsWellFormed =
-    0
-        < Index.viewLineCeiling
-        && 0
-        < ByteSize.toBytes Index.viewByteCeiling
-        && ByteSize.toBytes Index.viewByteCeiling
-        <= ByteSize.toBytes Index.sourceCeiling
+    0 < Index.viewLineCeiling
+        && 0 < ByteSize.toBytes Index.viewByteCeiling
+        && ByteSize.toBytes Index.viewByteCeiling <= ByteSize.toBytes Index.sourceCeiling
 
 
 -- The drawn lines are the attested lines: a `\r` is kept, and a trailing
@@ -457,16 +925,12 @@ shownLinesAreAttestedLines =
             String.join "\n" span
 
         drawn text first last =
-            Maybe.map Index.shownRows (shownOf (Index.classifyView (uid "u-x") (Index.attest text) (LineRange first last) file))
+            Maybe.map Index.shownRows (shownOf (Index.classifyView (uid "u-x") Rust (Index.attest text) (LineRange first last) file))
     in
-    span
-        == [ "a\r", "b", "", "" ]
-        && drawn crView 1 4
-        == Just [ Numbered 1 "a\r", Numbered 2 "b", Numbered 3 "", Numbered 4 "" ]
-        && drawn "b\n" 2 3
-        == Just [ Numbered 2 "b", Numbered 3 "" ]
-        && Maybe.map Index.shownRows (shownOf (Index.classifyView (uid "u-b") (Index.attest viewB) (LineRange 1 2) fixtureMainIpe))
-        == Just [ Numbered 1 "module Main exposing (main)", Numbered 2 "" ]
+    span == [ "a\r", "b", "", "" ]
+        && drawn crView 1 4 == Just [ Numbered 1 "a\r", Numbered 2 "b", Numbered 3 "", Numbered 4 "" ]
+        && drawn "b\n" 2 3 == Just [ Numbered 2 "b", Numbered 3 "" ]
+        && Maybe.map Index.shownRows (shownOf (Index.classifyView (uid "u-b") Rust (Index.attest viewB) (LineRange 1 2) fixtureMainIpe)) == Just [ Numbered 1 "module Main exposing (main)", Numbered 2 "" ]
 
 
 -- The unit page's data path: a uid that exists loads with its source and
@@ -503,13 +967,10 @@ unitPageLoadIn base =
                             case mb of
                                 Just loaded ->
                                     Task.succeed
-                                        (SafeText.toString loaded.unit.qualified
-                                            == "Lib.answer"
-                                            && shownTextOf loaded.view
-                                            == Just viewA
+                                        (labelText loaded.unit.qualified == "Lib.answer"
+                                            && shownTextOf loaded.view == Just viewA
                                             && List.isEmpty loaded.links.links
-                                            && loaded.links.hidden
-                                            == Links.NoneHidden
+                                            && loaded.links.hidden == Links.NoneHidden
                                         )
 
                                 Nothing ->
@@ -666,15 +1127,11 @@ residualVectorHolds v =
         spans =
             List.filterMap spanPair v.spans
     in
-    List.length spans
-        == List.length v.spans
-        && Index.residualText spans v.src
-        == v.residual
+    List.length spans == List.length v.spans
+        && Index.residualText spans v.src == v.residual
         && (String.isEmpty v.residual || String.startsWith "\n" v.residual)
-        && Index.attestResidual v.residual
-        == v.hash
-        && shownTextOf (Index.classifyView (uid "u-file") v.hash (Residual spans) v.src)
-        == Just v.residual
+        && Index.attestResidual v.residual == v.hash
+        && shownTextOf (Index.classifyView (uid "u-file") Rust v.hash (Residual spans) v.src) == Just v.residual
 
 
 spanPair : List Int -> Maybe ( Int, Int )
@@ -735,14 +1192,10 @@ fileUnitShowsResidual =
                 Maybe.map Index.shownRows (Maybe.andThen shownOf residual)
         in
         Task.succeed
-            (rows
-                == Just [ Numbered 1 "// fixture library", Covered, Numbered 8 "pub fn other() -> i32 {", Numbered 9 "    7", Numbered 10 "}" ]
-                && Maybe.andThen shownTextOf residual
-                == Just libResidual
-                && Maybe.map viewTag whole
-                == Just "drifted"
-                && Maybe.map viewTag viewScheme
-                == Just "drifted"
+            (rows == Just [ Numbered 1 "// fixture library", Covered, Numbered 8 "pub fn other() -> i32 {", Numbered 9 "    7", Numbered 10 "}" ]
+                && Maybe.andThen shownTextOf residual == Just libResidual
+                && Maybe.map viewTag whole == Just "drifted"
+                && Maybe.map viewTag viewScheme == Just "drifted"
             )
 
 
@@ -755,10 +1208,8 @@ fileUnitPastChildSpanCeiling =
         past <- fileUnitView "ipe-index-file-spans-past" (Index.attestResidual libResidual) (childUnits Index.childSpanCeiling)
         at <- fileUnitView "ipe-index-file-spans-at" (Index.attestResidual libResidual) (childUnits (Index.childSpanCeiling - 1))
         Task.succeed
-            (Maybe.map viewTag past
-                == Just ("too large spans " ++ String.fromInt (Index.childSpanCeiling + 1))
-                && Maybe.map viewTag at
-                == Just "shown"
+            (Maybe.map viewTag past == Just ("too large spans " ++ String.fromInt (Index.childSpanCeiling + 1))
+                && Maybe.map viewTag at == Just "shown"
             )
 
 
@@ -782,10 +1233,10 @@ everySharedVectorsFileRead =
         names <- Task.fromResult (Path.fromString (String.dropRight 1 (ipeIndexTestFile cwd ""))) |> Task.andThen File.readDir
         suiteNames <- Task.fromResult (Path.fromString (cwd ++ "/tests")) |> Task.andThen File.readDir
         sources <- Task.sequence
-            (List.map
-                (\file -> Task.fromResult (Path.fromString (cwd ++ "/tests/" ++ file)) |> Task.andThen (\p -> File.readFileLimit p (ByteSize.kib 256)))
-                (List.filter (String.endsWith ".ipe") suiteNames)
-            )
+                    (List.map
+                        (\file -> Task.fromResult (Path.fromString (cwd ++ "/tests/" ++ file)) |> Task.andThen (\p -> File.readFileLimit p (ByteSize.kib 256)))
+                        (List.filter (String.endsWith ".ipe") suiteNames)
+                    )
         let
             code =
                 String.join "\n" (List.map codeLines sources)
@@ -835,8 +1286,7 @@ pageReadsNoSource =
         found <- Index.loadView conn settings.roots (uid "u-b")
         cleanupIndex at.indexDb at.repo
         Task.succeed
-            (List.map (\r -> r.unit.uid) rows
-                == [ uid "u-a", uid "u-b" ]
+            (List.map (\r -> r.unit.uid) rows == [ uid "u-a", uid "u-b" ]
                 && String.startsWith "unreadable: " (loadedViewTag found)
             )
 
@@ -906,6 +1356,83 @@ probeAfter name sql =
         Task.succeed (probeNames "IPE_INDEX_DB" at.indexDb message)
 
 
+-- An index without the `refusals` table stops startup naming `IPE_INDEX_DB`:
+-- a queue that could not list the files the index refused would read as all
+-- reviewed. Red if the probe stops selecting the refusal columns.
+probeRefusesIndexWithoutRefusals : Task.Task Error Bool
+probeRefusesIndexWithoutRefusals =
+    probeAfter "ipe-index-probe-refusals" "DROP TABLE refusals"
+
+
+-- A refusal row the real schema would refuse fails the snapshot rather than
+-- show the file under some other reason or digest: an unknown reason, a
+-- digest of another scheme or in uppercase, a digest on a blocking reason,
+-- none on an acknowledgeable one, a negative size. The row is written with
+-- the schema's CHECKs off, as a foreign or tampered index could hold it; the
+-- same row with a well-formed digest reads. Red if the decoder has a
+-- catch-all reason, or reads the digest without its scheme or its pairing
+-- with the reason.
+refusalDecodeFailsClosed : Task.Task Error Bool
+refusalDecodeFailsClosed =
+    let
+        lower =
+            SqlString ("refusal-blake3:" ++ String.repeat 64 "a")
+    in
+    do
+        valid <- refusalReadFailsWith "ipe-index-refusal-valid" "not-utf8" (SqlInt 3) lower
+        unknown <- refusalReadFailsWith "ipe-index-refusal-unknown" "binary" (SqlInt 3) lower
+        otherScheme <- refusalReadFailsWith "ipe-index-refusal-foreign" "not-utf8" (SqlInt 3) (SqlString ("blake3:" ++ String.repeat 64 "a"))
+        upper <- refusalReadFailsWith "ipe-index-refusal-upper" "not-utf8" (SqlInt 3) (SqlString ("refusal-blake3:" ++ String.repeat 64 "A"))
+        blocking <- refusalReadFailsWith "ipe-index-refusal-blocking" "replaced" (SqlInt 3) lower
+        undigested <- refusalReadFailsWith "ipe-index-refusal-undigested" "not-utf8" (SqlInt 3) (SqlNull (SqlString ""))
+        negative <- refusalReadFailsWith "ipe-index-refusal-negative" "not-utf8" (SqlInt (0 - 1)) lower
+        Task.succeed (not valid && unknown && otherScheme && upper && blocking && undigested && negative)
+
+
+-- True when the first page's snapshot fails on a seeded index holding one
+-- refusal row of `reason`, `size` and `digest`, written with CHECKs off.
+refusalReadFailsWith : String -> String -> SqlValue -> SqlValue -> Task.Task Error Bool
+refusalReadFailsWith name reason size digest =
+    do
+        at <- freshScratch name
+        removeFileIfAny at.indexDb
+        seedIndex at.indexDb at.repo
+        execIndexUnchecked at.indexDb
+            "INSERT INTO refusals (uid, path, lang, reason, size, digest) VALUES (?, ?, 'other', ?, ?, ?)"
+            [ Uid.toSql (uid "r-x"), SqlString "ipe:src/x.bin", SqlString reason, size, digest ]
+        conn <- indexConn
+        failed <- snapshotOn conn
+                    |> Task.map (\_ -> False)
+                    |> Task.onError (\_ -> Task.succeed True)
+        cleanupIndex at.indexDb at.repo
+        Task.succeed failed
+
+
+-- The app's reasons are the index's: the real schema's `reason` CHECK lists
+-- exactly `Index.refusalReasons` in order, and its blocking list exactly
+-- the reasons `Index.ackable` refuses. Red if either side gains, loses or
+-- reorders a reason without the other.
+refusalReasonsMatchSchema : Task.Task Error Bool
+refusalReasonsMatchSchema =
+    let
+        quoted reasons =
+            "reason IN (" ++ String.join "," (List.map (\r -> "'" ++ Index.refusalTag r ++ "'") reasons) ++ ")"
+
+        allReasons =
+            quoted Index.refusalReasons
+
+        blocking =
+            "(digest IS NULL) = (" ++ quoted (List.filter (\r -> not (Index.ackable r)) Index.refusalReasons) ++ ")"
+    in
+    do
+        cwd <- System.cwd ()
+        statements <- indexSchemaStatements cwd
+        Task.succeed
+            (List.any (\s -> String.contains allReasons s && String.contains blocking s) statements
+                && List.length (List.filter Index.ackable Index.refusalReasons) == 5
+            )
+
+
 -- A unit with no change_queue row for its current body is still open: it
 -- is listed and counted, its change `Unrecorded`. Membership is the current
 -- pair against the decided set, never the event log. Red while the page
@@ -920,10 +1447,8 @@ unrecordedUnitListed =
         r <- loadFirstPage
         cleanupIndex at.indexDb at.repo
         Task.succeed
-            (r.total
-                == 2
-                && List.map (\e -> e.uid) r.units
-                == [ uid "u-a", uid "u-b" ]
+            (r.total == 2
+                && List.map (\e -> e.uid) r.units == [ uid "u-a", uid "u-b" ]
                 && List.all (\e -> e.uid /= uid "u-a" || isUnrecorded e.change) r.units
                 && List.all (\e -> e.uid /= uid "u-b" || modifiedFrom e.change == Just "oldB") r.units
             )
@@ -934,7 +1459,7 @@ unrecordedUnitListed =
 -- in a missing `old_hash`.
 changeDecodeRefusesModifiedWithoutOld : Task.Task Error Bool
 changeDecodeRefusesModifiedWithoutOld =
-    pageReadFailsAfter "ipe-index-modified-no-old" ("UPDATE change_queue SET old_hash = NULL WHERE uid = '" ++ Uid.toString (uid "u-b") ++ "'")
+    pageReadFailsAfter "ipe-index-modified-no-old" ("UPDATE change_queue SET old_hash = NULL WHERE uid = '" ++ TestSupport.uidHex (uid "u-b") ++ "'")
 
 
 -- An index whose queue row reports a change kind this reviewer does not
@@ -974,7 +1499,7 @@ redefinedViewHidesNoUnit =
         at <- freshScratch "ipe-index-redefined-view"
         removeFileIfAny at.indexDb
         seedIndex at.indexDb at.repo
-        execIndexScript at.indexDb ("DROP VIEW open_units; CREATE VIEW open_units AS SELECT uid, path, name, qualified, kind, line_start, line_end, facing, purpose, body_hash, updated_sha, NULL AS lang, NULL AS change, NULL AS old_hash, 0 AS enqueued_at FROM units WHERE uid <> '" ++ Uid.toString (uid "u-b") ++ "'")
+        execIndexScript at.indexDb ("DROP VIEW open_units; CREATE VIEW open_units AS SELECT uid, path, name, qualified, kind, line_start, line_end, facing, purpose, body_hash, updated_sha, NULL AS lang, NULL AS change, NULL AS old_hash, 0 AS enqueued_at FROM units WHERE uid <> '" ++ TestSupport.uidHex (uid "u-b") ++ "'")
         r <- loadFirstPage
         cleanupIndex at.indexDb at.repo
         Task.succeed (r.total == 2 && List.map (\e -> e.uid) r.units == [ uid "u-a", uid "u-b" ])
@@ -1019,7 +1544,7 @@ copyReadAfter name sql =
         seedIndex at.indexDb at.repo
         execIndexScript at.indexDb sql
         conn <- indexConn
-        snap <- Index.readSnapshot ReviewKey.ReadOnly conn Index.Start
+        snap <- snapshotOn conn
         cleanupIndex at.indexDb at.repo
         Task.succeed (Maybe.withDefault False (Maybe.map (\_ -> True) snap.copy))
 
@@ -1034,8 +1559,8 @@ pageReadFailsAfter name sql =
         execIndexScript at.indexDb sql
         conn <- indexConn
         failed <- pendingRows conn
-            |> Task.map (\_ -> False)
-            |> Task.onError (\_ -> Task.succeed True)
+                    |> Task.map (\_ -> False)
+                    |> Task.onError (\_ -> Task.succeed True)
         cleanupIndex at.indexDb at.repo
         Task.succeed failed
 
@@ -1053,7 +1578,14 @@ execIndexScript indexDb sql =
 -- one reader of a page `Lib.Index` exposes.
 pendingRows : Db -> Task.Task Error (List Index.PendingRow)
 pendingRows conn =
-    Index.readSnapshot ReviewKey.ReadOnly conn Index.Start |> Task.map (\snap -> snap.rows)
+    snapshotOn conn |> Task.map (\snap -> snap.rows)
+
+
+-- The first page's snapshot on `conn`, under the roots the current
+-- environment binds.
+snapshotOn : Db -> Task.Task Error Index.Snapshot
+snapshotOn conn =
+    envSettings |> Task.andThen (\settings -> Index.readSnapshot ReviewKey.ReadOnly settings.roots conn Index.Start)
 
 
 -- ── one reader of a page ───────────────────────────────────────────────
@@ -1105,13 +1637,13 @@ indexExposingScanRefusesEvasions =
 -- Every name `Lib.Index` exposes, a type's constructors written bare.
 indexExposes : List String
 indexExposes =
-    [ "Attested", "AttestedHash", "Body", "ChainHead", "ChainVerdict", "Change", "Cursor", "DecidedPair", "LogStatus", "Oversize", "PendingRow", "ReadFailure", "ShownSource", "Snapshot", "SourceRow", "SourceView", "StaleReason", "Stamp", "Unit", "UnitView", "Written", "attest", "attestResidual", "attestedHash", "attestedUid", "candidateQuery", "chainHeadDecoder", "chainHeadText", "chainKeyCheck", "chainLogId", "chainMac", "chainNext", "chainSeq", "childSpanCeiling", "classifyView", "decidedPairDecoder", "decidedPairKey", "digestPair", "drainDecided", "drainUnit", "lengthPrefixed", "loadView", "nameFor", "placeholders", "probe", "probeRoot", "readConnection", "readFailureText", "readSnapshot", "readStamp", "rebuildReviewed", "residualText", "reverify", "shortHash", "shownHash", "shownRows", "shownText", "signedStamp", "sourceCeiling", "spanOversize", "stampStatus", "stampText", "storedHash", "unsignedStamp", "viewByteCeiling", "viewLineCeiling", "viewLines", "viewText" ]
+    [ "Attested", "AttestedHash", "Body", "ChainHead", "ChainVerdict", "Change", "Cursor", "DecidedPair", "LogStatus", "Oversize", "PendingRow", "ReadFailure", "RefusalDigest", "RefusalReason", "RefusalRow", "ShownHash", "ShownSource", "Snapshot", "SourceView", "StaleReason", "Stamp", "Unit", "UnitView", "Written", "ackable", "attest", "attestResidual", "attestedHash", "attestedHashMaxBytes", "attestedName", "attestedUid", "candidateQuery", "chainHeadDecoder", "chainHeadText", "chainKeyCheck", "chainLogId", "chainMac", "chainNext", "chainSeq", "childSpanCeiling", "classifyView", "decidedPairDecoder", "decidedPairKey", "digestPair", "drainDecided", "drainUnit", "drawnDepthCeiling", "elementResidentBytes", "lengthPrefixed", "linkElements", "liveFiles", "liveUnits", "loadView", "nameDecision", "placeholders", "probe", "probeRepos", "probeRoot", "queueElementCeiling", "queueLabelByteCeiling", "readConnection", "readFailureText", "readSnapshot", "readStamp", "rebuildReviewed", "refusalDigestText", "refusalReasons", "refusalRowDecoder", "refusalTag", "residualText", "reverify", "reverifyRefusal", "runtimeEntryOverhead", "runtimeSessionCeiling", "shortHash", "shownDigest", "shownDrawn", "shownHash", "shownRows", "shownText", "signedStamp", "sourceCeiling", "spanOversize", "stampStatus", "stampText", "storedHash", "unescapeShown", "unitName", "unsignedStamp", "viewByteCeiling", "viewLineCeiling", "viewLines", "viewNodeCeiling", "viewReserve", "viewText" ]
 
 
 -- The readers `Index.readSnapshot` runs in its transaction.
 snapshotReaders : List String
 snapshotReaders =
-    [ "reviewedDigest", "loadPendingPage", "countPending", "countUnits", "dbBytes" ]
+    [ "reviewedDigest", "loadPendingPage", "countPending", "countUnits", "countUnbound", "countAll", "loadRefusalPage", "countOpenRefusals", "countRefusals", "countRefusalsPartitioned", "countUnboundRefusals", "countAllRefusals", "dbBytes" ]
 
 
 -- True when the module header of `source` exposes exactly `indexExposes`.
@@ -1148,6 +1680,236 @@ exposedNames source =
             Nothing
 
 
+-- ── the recorded repository set ─────────────────────────────────────────
+--
+-- At startup `Index.probeRepos` checks the configured roots against the
+-- repositories the index records: every bound tag recorded, every recorded
+-- tag bound, each nested as recorded, and the set within the ceiling.
+-- The `probeRepos` refusal, if any, of a seeded index after `statements`
+-- ran on it, with `IPE_INDEX_REPOS` set to `repos repo outside` (unset when
+-- empty). `repo/vendor/ext` and `outside` are existing directories.
+reposProbeAfter : String -> List String -> (String -> String -> String) -> Task.Task Error (Maybe String)
+reposProbeAfter name statements repos =
+    do
+        at <- freshScratch name
+        outside <- freshDir (name ++ "-outside")
+        removeFileIfAny at.indexDb
+        seedIndex at.indexDb at.repo
+        Task.fromResult (Path.fromString (at.repo ++ "/vendor/ext")) |> Task.andThen File.mkdirAll
+        Task.sequence (List.map (\stmt -> execIndex at.indexDb stmt []) statements) |> Task.map (\_ -> ())
+        message <- probeMessage (reposSettings at.indexDb at.repo (repos at.repo outside) |> Task.andThen Index.probeRepos)
+        cleanupIndex at.indexDb at.repo
+        Task.succeed message
+
+
+-- The index settings for `IPE_INDEX_REPOS` value `raw`, unset when empty.
+reposSettings : String -> String -> String -> Task.Task Error Settings.IndexSettings
+reposSettings indexDb repo raw =
+    if raw == "" then
+        Settings.parseIndexSettings indexDb repo Settings.EnvUnset
+
+    else
+        Settings.parseIndexSettings indexDb repo (Settings.EnvSet raw)
+
+
+noRepos : String -> String -> String
+noRepos _ _ =
+    ""
+
+
+nestedExt : String -> String -> String
+nestedExt repo _ =
+    "ext=" ++ repo ++ "/vendor/ext"
+
+
+outsideExt : String -> String -> String
+outsideExt _ outside =
+    "ext=" ++ outside
+
+
+-- Roots that agree with the recorded set pass: `ipe` alone, and `ext`
+-- nested under `ipe` at the recorded path, compared case-folded.
+reposProbeAccepts : Task.Task Error Bool
+reposProbeAccepts =
+    do
+        alone <- reposProbeAfter "ipe-index-repos-alone" [] noRepos
+        nested <- reposProbeAfter "ipe-index-repos-nested" [ "INSERT INTO repos (tag, outer, prefix) VALUES ('ext', 'ipe', 'vendor/ext')" ] nestedExt
+        folded <- reposProbeAfter "ipe-index-repos-folded" [ "INSERT INTO repos (tag, outer, prefix) VALUES ('ext', 'ipe', 'Vendor/Ext')" ] nestedExt
+        outside <- reposProbeAfter "ipe-index-repos-outside" [ "INSERT INTO repos (tag, outer, prefix) VALUES ('ext', NULL, NULL)" ] outsideExt
+        Task.succeed (alone == Nothing && nested == Nothing && folded == Nothing && outside == Nothing)
+
+
+-- An index holding units but no recorded set, or a set past the ceiling,
+-- refuses startup; exactly the ceiling is judged tag by tag instead. Red if
+-- a missing set reads as `ipe` alone, or an oversized one is read whole.
+reposProbeRefusesSetShape : Task.Task Error Bool
+reposProbeRefusesSetShape =
+    do
+        missing <- reposProbeAfter "ipe-index-repos-missing" [ "DELETE FROM repos" ] noRepos
+        tooLarge <- reposProbeAfter "ipe-index-repos-too-large" [ recordedTags RepoPath.maxRoots ] noRepos
+        atCeiling <- reposProbeAfter "ipe-index-repos-at-ceiling" [ recordedTags (RepoPath.maxRoots - 1) ] noRepos
+        Task.succeed
+            (maybeContains "holds units but records no repositories" missing
+                && maybeContains ("records more than " ++ String.fromInt RepoPath.maxRoots ++ " repositories") tooLarge
+                && maybeContains "records repo tag \"r0\"" atCeiling
+                && not (maybeContains "records more than" atCeiling)
+            )
+
+
+-- `count` recorded tags `r0`, `r1`, ... beside the seeded `ipe`.
+recordedTags : Int -> String
+recordedTags count =
+    "WITH RECURSIVE n(i) AS (SELECT 0 UNION ALL SELECT i + 1 FROM n WHERE i < "
+        ++ String.fromInt (count - 1)
+        ++ ") INSERT INTO repos (tag, outer, prefix) SELECT 'r' || i, NULL, NULL FROM n"
+
+
+-- A bound tag the index does not record, a recorded tag no root binds, and
+-- a tag nested otherwise than recorded each refuse startup, naming the tag
+-- and, for a bound one, the entry that bound it. Red if any disagreement
+-- passes, leaving units no root can decide or a root reading another tree.
+reposProbeRefusesDisagreement : Task.Task Error Bool
+reposProbeRefusesDisagreement =
+    do
+        notIndexed <- reposProbeAfter "ipe-index-repos-not-indexed" [] outsideExt
+        notBound <- reposProbeAfter "ipe-index-repos-not-bound" [ "INSERT INTO repos (tag, outer, prefix) VALUES ('ext', NULL, NULL)" ] noRepos
+        nestedAsTop <- reposProbeAfter "ipe-index-repos-nested-as-top" [ "INSERT INTO repos (tag, outer, prefix) VALUES ('ext', NULL, NULL)" ] nestedExt
+        topAsNested <- reposProbeAfter "ipe-index-repos-top-as-nested" [ "INSERT INTO repos (tag, outer, prefix) VALUES ('ext', 'ipe', 'vendor/ext')" ] outsideExt
+        otherPrefix <- reposProbeAfter "ipe-index-repos-other-prefix" [ "INSERT INTO repos (tag, outer, prefix) VALUES ('ext', 'ipe', 'third/ext')" ] nestedExt
+        Task.succeed
+            (maybeContains "IPE_INDEX_REPOS entry 1 (" notIndexed
+                && maybeContains "binds repo tag \"ext\", which IPE_INDEX_DB does not record" notIndexed
+                && maybeContains "IPE_INDEX_DB records repo tag \"ext\", which no configured root binds" notBound
+                && List.all
+                    (\message -> maybeContains "IPE_INDEX_REPOS entry 1 (" message && maybeContains "nests repo tag \"ext\" otherwise than IPE_INDEX_DB records it" message)
+                    [ nestedAsTop, topAsNested, otherPrefix ]
+            )
+
+
+-- A unit under a tag no root binds is never read as a page row, an open or
+-- a unit count, or a view; it is counted as unbound. Red if an unbound
+-- unit is shown, or vanishes uncounted.
+unboundUnitsExcluded : Task.Task Error Bool
+unboundUnitsExcluded =
+    do
+        at <- freshScratch "ipe-index-unbound-excluded"
+        removeFileIfAny at.indexDb
+        seedIndex at.indexDb at.repo
+        before <- indexConn |> Task.andThen snapshotOn
+        insertUnboundUnit at.indexDb
+        settings <- envSettings
+        conn <- Index.readConnection settings
+        after <- snapshotOn conn
+        view <- Index.loadView conn settings.roots (uid "u-ext")
+        cleanupIndex at.indexDb at.repo
+        Task.succeed
+            (before.unbound == 0
+                && after.unbound == 1
+                && after.units == before.units
+                && after.open == before.open
+                && List.length after.rows == List.length before.rows
+                && not (List.any (\row -> TestSupport.uidHex row.unit.uid == TestSupport.uidHex (uid "u-ext")) after.rows)
+                && (case view of
+                        Just _ ->
+                            False
+
+                        Nothing ->
+                            True
+                   )
+            )
+
+
+-- A unit whose path the tag condition cannot judge (here a NULL path in a
+-- table rebuilt without the schema's NOT NULL) is in neither count, and the
+-- snapshot read fails rather than report totals that hide it. Red if the
+-- bound and unbound counts may fall short of the units held.
+unjudgedUnitFailsSnapshot : Task.Task Error Bool
+unjudgedUnitFailsSnapshot =
+    do
+        at <- freshScratch "ipe-index-unjudged-unit"
+        removeFileIfAny at.indexDb
+        seedIndex at.indexDb at.repo
+        intact <- indexConn |> Task.andThen snapshotOn |> Task.map (\_ -> True) |> Task.onError (\_ -> Task.succeed False)
+        execIndexScript at.indexDb ("CREATE TABLE units_copy AS SELECT * FROM units; DROP TABLE units; CREATE TABLE units AS SELECT * FROM units_copy; DROP TABLE units_copy; UPDATE units SET path = NULL WHERE uid = '" ++ TestSupport.uidHex (uid "u-a") ++ "'")
+        message <- probeMessage (indexConn |> Task.andThen snapshotOn |> Task.map (\_ -> ()))
+        cleanupIndex at.indexDb at.repo
+        Task.succeed (intact && maybeContains "the index's unit counts do not add up" message)
+
+
+-- A refusal whose path the tag condition cannot judge (a NULL path in a
+-- table rebuilt without the schema's NOT NULL) is in neither refusal count,
+-- and the snapshot read fails rather than report totals that hide it. Red
+-- if the bound and unbound refusal counts may fall short of the rows held.
+unjudgedRefusalFailsSnapshot : Task.Task Error Bool
+unjudgedRefusalFailsSnapshot =
+    do
+        at <- freshScratch "ipe-index-unjudged-refusal"
+        removeFileIfAny at.indexDb
+        seedIndex at.indexDb at.repo
+        execIndex at.indexDb
+            "INSERT INTO refusals (uid, path, lang, reason, size, digest) VALUES (?, ?, 'other', 'replaced', NULL, NULL)"
+            [ Uid.toSql (uid "r-x"), SqlString "ipe:src/x.bin" ]
+        intact <- indexConn |> Task.andThen snapshotOn |> Task.map (\_ -> True) |> Task.onError (\_ -> Task.succeed False)
+        execIndexScript at.indexDb "CREATE TABLE refusals_copy AS SELECT * FROM refusals; DROP TABLE refusals; CREATE TABLE refusals AS SELECT * FROM refusals_copy; DROP TABLE refusals_copy; UPDATE refusals SET path = NULL"
+        message <- probeMessage (indexConn |> Task.andThen snapshotOn |> Task.map (\_ -> ()))
+        cleanupIndex at.indexDb at.repo
+        Task.succeed (intact && maybeContains "the index's refusal counts do not add up" message)
+
+
+-- An index whose `units` and `refusals` tables were rebuilt without their
+-- primary key holds three rows under one uid: History's live name reads
+-- return one row per uid asked. Asked beside a uid the index holds once,
+-- the repeated uid does not crowd it out of the read. Red if a read's row
+-- count is set by the index rather than by its own bound, or if a repeated
+-- uid takes another uid's row.
+liveReadsBoundedByUids : Task.Task Error Bool
+liveReadsBoundedByUids =
+    do
+        at <- freshScratch "ipe-index-live-reads-bounded"
+        removeFileIfAny at.indexDb
+        seedIndex at.indexDb at.repo
+        execIndex at.indexDb
+            "INSERT INTO refusals (uid, path, lang, reason, size, digest) VALUES (?, ?, 'other', 'replaced', NULL, NULL)"
+            [ Uid.toSql (uid "r-x"), SqlString "ipe:src/x.bin" ]
+        execIndex at.indexDb
+            "INSERT INTO refusals (uid, path, lang, reason, size, digest) VALUES (?, ?, 'other', 'replaced', NULL, NULL)"
+            [ Uid.toSql (uid "r-y"), SqlString "ipe:src/y.bin" ]
+        execIndexScript at.indexDb
+            ("CREATE TABLE units_copy AS SELECT * FROM units; DROP TABLE units; CREATE TABLE units AS SELECT * FROM units_copy; DROP TABLE units_copy; "
+                ++ "INSERT INTO units SELECT * FROM units WHERE uid = '"
+                ++ TestSupport.uidHex (uid "u-a")
+                ++ "'; INSERT INTO units SELECT * FROM units WHERE uid = '"
+                ++ TestSupport.uidHex (uid "u-a")
+                ++ "' LIMIT 1; "
+                ++ "CREATE TABLE refusals_copy AS SELECT * FROM refusals; DROP TABLE refusals; CREATE TABLE refusals AS SELECT * FROM refusals_copy; DROP TABLE refusals_copy; "
+                ++ "INSERT INTO refusals SELECT * FROM refusals; INSERT INTO refusals SELECT * FROM refusals LIMIT 1"
+            )
+        conn <- indexConn
+        settings <- envSettings
+        held <- Db.queryDecode conn "SELECT (SELECT COUNT(*) FROM units WHERE uid = ?) AS units, (SELECT COUNT(*) FROM refusals WHERE uid = ?) AS refusals" [ Uid.toSql (uid "u-a"), Uid.toSql (uid "r-x") ] heldDecoder
+        units <- Index.liveUnits conn settings.roots [ uid "u-a" ]
+        files <- Index.liveFiles conn settings.roots [ uid "r-x" ]
+        bothUnits <- Index.liveUnits conn settings.roots [ uid "u-a", uid "u-b" ]
+        bothFiles <- Index.liveFiles conn settings.roots [ uid "r-x", uid "r-y" ]
+        cleanupIndex at.indexDb at.repo
+        Task.succeed
+            (held == [ ( 3, 3 ) ]
+                && List.length units == 1
+                && List.length files == 1
+                && List.length bothUnits == 2
+                && List.any (\unit -> unit.uid == uid "u-b") bothUnits
+                && List.length bothFiles == 2
+                && List.any (\( fileUid, _ ) -> fileUid == uid "r-y") bothFiles
+            )
+
+
+heldDecoder : Db.Decode.Decoder ( Int, Int )
+heldDecoder =
+    Db.Decode.succeed (\units refusals -> ( units, refusals ))
+        |> Db.Decode.required "units" (Db.Decode.int "units")
+        |> Db.Decode.required "refusals" (Db.Decode.int "refusals")
+
+
 checks : Task.Task Error (List ( String, Bool ))
 checks =
     Task.sequence
@@ -1158,6 +1920,11 @@ checks =
         , check "one missing file fails only its unit" oneMissingFileIsolated
         , check "source file past the read ceiling refused" oversizedSourceRefused
         , check "an unreadable file renders a typed reason, never the OS error" unreadableReasonsTyped
+        , check "a stored path past the read window is refused before the join" pathPastWindowRefused
+        , check "a stored path cut at a NUL byte is refused under that cause" pathCutAtNulRefused
+        , check "a stored body hash past the read window fails the unit's read" bodyHashPastWindowFailsRead
+        , check "a stored path that is not UTF-8 is refused as not text, never as its hex spelling" pathNotUtf8Refused
+        , check "an old hash, recorded tag, reviewed pair or stamp past the read window fails its read" actedColumnsPastWindowFailRead
         , check "view and attestation match the shared ipe-index vectors" viewHashVectors
         , check "a file unit's residual matches the shared ipe-index vectors" residualVectors
         , check "a file unit shows and attests its residual, never its whole range" fileUnitShowsResidual
@@ -1168,6 +1935,9 @@ checks =
         , check "a unit's language comes from its file's indexed language" langFromFilesTable
         , check "an index without a files table fails the probe" probeRefusesIndexWithoutFiles
         , check "an index without the change queue or the stamp fails the probe" probeRefusesIndexWithoutQueueOrStamp
+        , check "an index without the refusals table fails the probe" probeRefusesIndexWithoutRefusals
+        , check "a refusal row the schema would refuse fails the snapshot" refusalDecodeFailsClosed
+        , check "the refusal reasons and blocking reasons are the schema's" refusalReasonsMatchSchema
         , check "a unit with no change row is still listed" unrecordedUnitListed
         , check "a modified row without its old hash fails the page" changeDecodeRefusesModifiedWithoutOld
         , check "an unknown change kind fails the page" changeDecodeRefusesUnknown
@@ -1186,4 +1956,51 @@ checks =
         , Task.succeed ( "classifying a span past the line ceiling withholds it", classifyRefusesPastLineCeiling )
         , Task.succeed ( "the view ceilings are positive and within the read ceiling", viewCeilingsWellFormed )
         , Task.succeed ( "the drawn lines are the attested lines", shownLinesAreAttestedLines )
+        , Task.succeed ( "a view drawn in exactly the element ceiling is shown", viewAtNodeCeilingShown )
+        , Task.succeed ( "a view one element past the element ceiling plain is shown spelled out", viewPastNodeCeilingSpelled )
+        , Task.succeed ( "a view too many elements to highlight is shown plain, a small one highlighted", plainFallbackWhenColorsTooMany )
+        , Task.succeed ( "a long line of one token per byte is never shown highlighted, and one of escapes is shown spelled out", longTokenLinesNeverHighlighted )
+        , Task.succeed ( "an escape-dense view under a wrong hash is drifted", escapeDenseWrongHashDrifted )
+        , Task.succeed ( "a unit of a thousand escape-dense lines is shown spelled out, never withheld", escapeDenseUnitShownSpelled )
+        , Task.succeed ( "a file unit with every other line covered is shown spelled out", alternatingResidualShownSpelled )
+        , Task.succeed ( "the element ceiling, at the cost per element, fits three quarters of the runtime's session ceiling", nodeCeilingFitsSessionCeiling )
+        , Task.succeed ( "a full queue page's elements and label bytes fit the quarter of the session ceiling the unit view leaves", queueCeilingFitsQuarter )
+        , check "a mebibyte purpose reaches the queue page and the unit page cut to the purpose cap, its marker counting the dropped bytes" purposeOfOneMibIsBounded
+        , check "the mirrored session ceiling is the runtime's" sessionCeilingMirrorsRuntime
+        , check "the mirrored entry overhead is the runtime's" entryOverheadMirrorsRuntime
+        , check "the mirrored cost per drawn element is the runtime's" elementBytesMirrorsRuntime
+        , check "the mirrored drawn depth is the runtime's" drawnDepthMirrorsRuntime
+        , check "roots agreeing with the recorded repositories pass the startup check" reposProbeAccepts
+        , check "a missing or oversized recorded repository set refuses startup" reposProbeRefusesSetShape
+        , check "a bound, recorded or nested tag the index disagrees on refuses startup" reposProbeRefusesDisagreement
+        , check "a unit under an unbound tag is counted, never shown" unboundUnitsExcluded
+        , check "a unit neither bound nor unbound fails the snapshot" unjudgedUnitFailsSnapshot
+        , check "a refusal neither bound nor unbound fails the snapshot" unjudgedRefusalFailsSnapshot
+        , check "History's live name reads return at most one row per uid asked, however many the index holds" liveReadsBoundedByUids
+        , check "every name refusal maps to the decision refusal a click on its row is refused with" nameDecisionTotal
         ]
+
+
+-- The one map from a name refusal to the decision refusal the row carries:
+-- past the ceiling is `NamePastCeiling`, any other refusal `NameUnreadable`,
+-- and a recorded name stays recorded.
+nameDecisionTotal : Task.Task Error Bool
+nameDecisionTotal =
+    Task.succeed
+        (decisionRefusal (Index.nameDecision (Err PartPastCeiling)) == Just NamePastCeiling
+            && decisionRefusal (Index.nameDecision (Err PartEmpty)) == Just NameUnreadable
+            && decisionRefusal (Index.nameDecision (Err PartNotText)) == Just NameUnreadable
+            && decisionRefusal (Index.nameDecision (Err LineNegative)) == Just NameUnreadable
+            && decisionRefusal (Index.nameDecision (UnitName.recordFile "ipe:src/a.rs")) == Nothing
+            && decisionRefusal (Index.nameDecision (UnitName.recordFile ("ipe:" ++ String.repeat 2045 "p"))) == Just NamePastCeiling
+        )
+
+
+decisionRefusal : Result DecideRefusal a -> Maybe DecideRefusal
+decisionRefusal decided =
+    case decided of
+        Err refusal ->
+            Just refusal
+
+        Ok _ ->
+            Nothing

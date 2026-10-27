@@ -22,6 +22,13 @@ Modes:
               `--fetch` with a ruleset-admin token: the body must also carry
               `bypass_actors`, the list must be empty, and the token's
               environment must admit `main` alone.
+  --render-put FILE
+              print the ruleset PUT body that applies `required-set.json`:
+              the admin-read ruleset JSON in FILE, parsed like `--live` save
+              for its required pairs and its pinned rules' settings, with those
+              pairs replaced by the set, those settings by `PINNED_RULES`, and
+              only the writable keys (`PUT_KEYS`) kept. The body is printed
+              only once it, re-parsed, passes `--live`.
 
 The live ruleset is parsed into a closed `Ruleset`: every key the API
 returns is either examined and pinned or named as display metadata, and any
@@ -29,9 +36,11 @@ other key, rule type, or parameter is refused, so a protection GitHub adds
 or an owner toggles is never waved through unread.  It must be active on the
 default branch with no exclusions and no bypass actors, carry exactly one
 `required_status_checks` rule (strict policy off, enforced on create) whose
-pairs equal the derived set in both directions, and exactly one all-green
-`merge_queue` rule. GitHub returns `bypass_actors` only to a ruleset admin, so
-`--fetch` (a workflow token) cannot see them: it refuses a non-empty list when
+pairs equal the derived set in both directions, and exactly one
+`pull_request` and one `merge_queue` rule whose every setting equals
+`PULL_REQUEST` and `MERGE_QUEUE`. GitHub returns
+`bypass_actors` only to a ruleset admin, so `--fetch` (a workflow token)
+cannot see them: it refuses a non-empty list when
 one is returned and otherwise leaves the bypass proof to an admin read.
 `--fetch-admin` and `--live` are admin reads: a body without the list is
 refused, so a token that cannot see bypass actors fails rather than passes.
@@ -50,6 +59,7 @@ included — fails closed (exit 1) with nothing printed to stdout.
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 import os
 import sys
@@ -165,8 +175,13 @@ def _closed(obj: object, what: str, keys: frozenset[str], optional: frozenset[st
 
 
 def _pin(value: object, want: object, what: str) -> None:
-    # `type` too: `False == 0`, and a ruleset parameter's JSON type is part of it.
-    if type(value) is not type(want) or value != want:
+    # The JSON text too: `False == 0` and `2.0 == 2`, at the top and nested in
+    # a list or object alike, and a ruleset parameter's JSON type is part of it.
+    if (
+        type(value) is not type(want)
+        or value != want
+        or json.dumps(value, sort_keys=True) != json.dumps(want, sort_keys=True)
+    ):
         raise Refused(f"{what} is {value!r}, not {want!r}")
 
 
@@ -182,29 +197,51 @@ _RULESET_KEYS = frozenset({"id", "target", "enforcement", "conditions", "rules"}
 # Keys present only in some responses; each is pinned when present.
 _RULESET_VIEWER_KEYS = frozenset({"source_type", "current_user_can_bypass", "bypass_actors"})
 
-_PULL_REQUEST_PARAMS: dict[str, type] = {
-    "required_approving_review_count": int,
-    "dismiss_stale_reviews_on_push": bool,
-    "required_reviewers": list,
-    "require_code_owner_review": bool,
-    "dismissal_restriction": dict,
-    "require_last_push_approval": bool,
-    "required_review_thread_resolution": bool,
-    "require_extra_approval_for_unattributed_changes": bool,
-    "allowed_merge_methods": list,
+# The pull-request rule's settings, pinned like `MERGE_QUEUE`: a review
+# protection switched off by hand turns the parse red rather than passing typed.
+PULL_REQUEST: dict[str, object] = {
+    # No approval is required: the required checks and the queue gate a merge.
+    "required_approving_review_count": 0,
+    "dismiss_stale_reviews_on_push": True,
+    "required_reviewers": [],
+    "require_code_owner_review": False,
+    "dismissal_restriction": {"enabled": False, "allowed_actors": []},
+    "require_last_push_approval": False,
+    # An unresolved review thread blocks the merge.
+    "required_review_thread_resolution": True,
+    "require_extra_approval_for_unattributed_changes": True,
+    # The queue's `merge_method` decides how an entry lands on `main`.
+    "allowed_merge_methods": ["merge", "squash", "rebase"],
 }
-_MERGE_QUEUE_PARAMS: dict[str, type] = {
-    "merge_method": str,
-    "max_entries_to_build": int,
-    "min_entries_to_merge": int,
-    "max_entries_to_merge": int,
-    "min_entries_to_merge_wait_minutes": int,
-    "grouping_strategy": str,
-    "check_response_timeout_minutes": int,
+# The merge queue's settings: every parameter the `merge_queue` rule carries,
+# each pinned to its value here (its JSON type included), so the parse refuses
+# a missing, unknown, retyped, or changed one. This table is the parse table:
+# a parameter cannot be parsed without being pinned.
+MERGE_QUEUE: dict[str, object] = {
+    # Each entry lands as one commit on `main`.
+    "merge_method": "SQUASH",
+    # Every queued entry gets its own full run, so the runs in flight at once
+    # are this many; past what the runner pool carries, every run slows.
+    "max_entries_to_build": 2,
+    "min_entries_to_merge": 1,
+    # Under `ALLGREEN` a group merges only once each entry's own run is green,
+    # so a larger group than the build width buys nothing.
+    "max_entries_to_merge": 2,
+    "min_entries_to_merge_wait_minutes": 5,
+    # Each entry's own checks must pass: the strict policy stays off because
+    # the queue builds every entry on the combined tree, and `HEADGREEN` would
+    # land the group's inner commits with no green run of their own.
+    "grouping_strategy": "ALLGREEN",
+    # The longest full run fits inside it; a context that never reports fails
+    # the entry rather than holding the queue.
+    "check_response_timeout_minutes": 120,
 }
 _STATUS_PARAMS = frozenset(
     {"strict_required_status_checks_policy", "do_not_enforce_on_create", "required_status_checks"}
 )
+# The rules whose every parameter is pinned, by rule type; `render_put` writes
+# these tables as it writes the required pairs.
+PINNED_RULES: dict[str, dict[str, object]] = {"pull_request": PULL_REQUEST, "merge_queue": MERGE_QUEUE}
 # Every rule type the ruleset must carry, exactly once each.  A type outside
 # this set is one this check has not examined, so it is refused.
 RULE_TYPES = frozenset({"deletion", "non_fast_forward", "pull_request", "required_status_checks", "merge_queue"})
@@ -218,13 +255,6 @@ class Ruleset:
     required: tuple[Pair, ...]
 
 
-def _typed_params(params: object, what: str, shape: dict[str, type]) -> dict:
-    params = _closed(params, what, frozenset(shape))
-    for key, kind in shape.items():
-        _typed(params[key], kind, f"{what} `{key}`")
-    return params
-
-
 def _rule(rule: object) -> tuple[str, tuple[Pair, ...]]:
     """A rule's type, and the pairs it requires when it is the status rule."""
     head = rule.get("type") if isinstance(rule, dict) else None
@@ -235,14 +265,11 @@ def _rule(rule: object) -> tuple[str, tuple[Pair, ...]]:
         _closed(rule, what, frozenset({"type"}))
         return head, ()
     params = _closed(rule, what, frozenset({"type", "parameters"}))["parameters"]
-    if head == "pull_request":
-        _typed_params(params, f"{what}'s parameters", _PULL_REQUEST_PARAMS)
-        return head, ()
-    if head == "merge_queue":
-        params = _typed_params(params, f"{what}'s parameters", _MERGE_QUEUE_PARAMS)
-        # The strict policy stays off because the queue builds every entry on
-        # the combined tree; only `ALLGREEN` requires each entry's own checks.
-        _pin(params["grouping_strategy"], "ALLGREEN", f"{what}'s grouping_strategy")
+    pinned = PINNED_RULES.get(head)
+    if pinned is not None:
+        params = _closed(params, f"{what}'s parameters", frozenset(pinned))
+        for key, want in pinned.items():
+            _pin(params[key], want, f"{what}'s {key}")
         return head, ()
     params = _closed(params, f"{what}'s parameters", _STATUS_PARAMS)
     _pin(params["strict_required_status_checks_policy"], False, f"{what}'s strict_required_status_checks_policy")
@@ -291,6 +318,39 @@ def parse_ruleset(rs: object, *, admin_read: bool) -> Ruleset:
         if seen.get(head, 0) != 1:
             raise Refused(f"the ruleset has {seen.get(head, 0)} {head} rules, not 1")
     return Ruleset(required=required)
+
+
+# The keys of a ruleset PUT body: the writable part of the GET body.
+PUT_KEYS = ("name", "target", "enforcement", "conditions", "bypass_actors", "rules")
+
+
+def render_put(rs: object, required: list[Pair]) -> str:
+    """The PUT body applying `required` and `PINNED_RULES` to the ruleset GET
+    body `rs`, or `Refused`. `rs`, with its pinned rules' settings set to
+    `PINNED_RULES`, must pass the admin-read parse (its own required pairs
+    aside, which the body replaces); the body, re-read as the GET would
+    return it, must pass the same parse with exactly `required`."""
+    if not isinstance(rs, dict) or not isinstance(rs.get("rules"), list):
+        raise Refused("the ruleset is not an object with a `rules` list")
+    pinned = [
+        {**r, "parameters": {**r["parameters"], **copy.deepcopy(PINNED_RULES[r["type"]])}}
+        if isinstance(r, dict) and r.get("type") in PINNED_RULES and isinstance(r.get("parameters"), dict) else r
+        for r in rs["rules"]
+    ]
+    rs = {**rs, "rules": pinned}
+    parse_ruleset(rs, admin_read=True)
+    want = json.loads(render(required))
+    rules = [
+        {**r, "parameters": {**r["parameters"], "required_status_checks": want}}
+        if r["type"] == "required_status_checks" else r
+        for r in rs["rules"]
+    ]
+    body = {k: rs[k] for k in PUT_KEYS if k in rs and k != "rules"} | {"rules": rules}
+    got = parse_ruleset({**body, "id": RULESET_ID}, admin_read=True).required
+    problems = diff(required, list(got), "the rendered PUT body", "this is a defect in render_put")
+    if problems:
+        raise Refused("; ".join(problems))
+    return json.dumps(body, indent=2) + "\n"
 
 
 def diff(expected: list[Pair], actual: list[Pair], what: str, fix: str) -> list[str]:
@@ -472,6 +532,7 @@ def main(argv: list[str] | None = None) -> int:
     mode.add_argument("--live", metavar="FILE")
     mode.add_argument("--fetch", action="store_true")
     mode.add_argument("--fetch-admin", action="store_true")
+    mode.add_argument("--render-put", metavar="FILE")
     args = ap.parse_args(argv)
     try:
         required = derive(_load_manifest())
@@ -487,6 +548,11 @@ def main(argv: list[str] | None = None) -> int:
             required, on_disk, ".github/ci/required-set.json",
             "regenerate it: python3 .github/ci/check_required_set.py --write",
         )
+        if args.render_put:
+            if problems:
+                raise Refused("; ".join(problems))
+            sys.stdout.write(render_put(_load_json(args.render_put, args.render_put), required))
+            return 0
         live = bool(args.live or args.fetch or args.fetch_admin)
         if live:
             rs = _load_json(args.live, args.live) if args.live else fetch_live(admin=bool(args.fetch_admin))

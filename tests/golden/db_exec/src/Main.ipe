@@ -1,0 +1,77 @@
+module Main exposing (main)
+import Ipe.Io as Io
+import Ipe.Db
+import Ipe.Db.Location as Location
+import Ipe.Db.Unsafe
+import Ipe.Dict
+import Ipe.List
+import Ipe.String
+import Ipe.Task
+
+-- M5b-db golden: SqlValue-parameterized Db.exec + Unsafe.unsafeQuery on in-memory SQLite.
+-- Db.withTransaction pins all DDL + DML + SELECT to ONE pool connection so the
+-- sqlite::memory: database is visible to every operation (each connection in the
+-- 16-connection pool is a separate in-memory DB; the transaction task-local
+-- routes all ops through the single acquired connection).
+
+main =
+    Task.andThen
+        (\conn ->
+            Db.withTransaction conn
+                (\txconn ->
+                    do
+                        Unsafe.unsafeExecRaw txconn
+                            "CREATE TABLE items (name TEXT, qty INTEGER)"
+                        Db.exec txconn
+                            "INSERT INTO items (name, qty) VALUES (?, ?)"
+                            [ SqlString "apple", SqlInt 5 ]
+                        Db.exec txconn
+                            "INSERT INTO items (name, qty) VALUES (?, ?)"
+                            [ SqlString "banana", SqlInt 3 ]
+                        Task.andThen
+                            (\rows ->
+                                Io.println
+                                    (String.join "\n"
+                                        (List.map
+                                            (\row ->
+                                                cellText "name" row
+                                                    ++ ":"
+                                                    ++ String.fromInt (cellInt "qty" row)
+                                            )
+                                            rows
+                                        )
+                                    )
+                            )
+                            (Unsafe.unsafeQuery txconn
+                                "SELECT name, qty FROM items ORDER BY name"
+                                []
+                            )
+                )
+        )
+        (Db.open Location.memory)
+
+
+-- The text of column `key` in a raw Db row: a SQL `NULL` cell reads as `NULL`,
+-- a missing column as the empty string.
+cellText : String -> Dict String (Maybe String) -> String
+cellText key row =
+    case Dict.get key row of
+        Just (Just s) ->
+            s
+
+        Just Nothing ->
+            "NULL"
+
+        Nothing ->
+            ""
+
+
+-- The integer in column `key` of a raw Db row, `0` when the cell is not one.
+cellInt : String -> Dict String (Maybe String) -> Int
+cellInt key row =
+    case String.toInt (cellText key row) of
+        Just n ->
+            n
+
+        Nothing ->
+            0

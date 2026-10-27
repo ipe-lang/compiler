@@ -73,6 +73,7 @@ Each module listed below links to a detail page with the full documentation and 
 - [Csv](#csv)
 - [Db.Codec](#dbcodec)
 - [Db.Dsn](#dbdsn)
+- [Db.Location](#dblocation)
 - [Db.Store](#dbstore)
 - [Db.Store.Unsafe](#dbstoreunsafe)
 - [Db.Unsafe](#dbunsafe)
@@ -1450,7 +1451,7 @@ Ipe.Db.Dsn — a typed, opaque database connection descriptor
 | Export | Summary |
 |--------|----------|
 | `Driver` | The closed set of drivers the runtime can describe — exactly the two the |
-| `TlsMode` | The transport-security posture. `Require` is the secure default when a DSN |
+| `TlsMode` | The transport-security posture: TLS with the server certificate verified. |
 | `parse` | `parse raw` — THE seal from a full DSN URL string. Returns `Err` on any |
 | `build` | `build parts` — THE seal from typed parts, enforcing the invariants `parse` |
 | `driver` | `driver dsn` — the descriptor's driver. |
@@ -1462,6 +1463,19 @@ Ipe.Db.Dsn — a typed, opaque database connection descriptor
 | `redacted` | `redacted dsn` — a credential-free, human-readable rendering. The password is |
 | `open` | `open dsn` — connect a parsed `Dsn` to a live, read-only external database. |
 | `close` | `close conn` — return the connection's pool. Total and idempotent over either |
+
+## Db.Location
+
+[Full reference](stdlib/Db.Location.md)
+
+Ipe.Db.Location — the typed location `Db.open` opens.
+
+| Export | Summary |
+|--------|----------|
+| `Mode` | How `file` opens its file. |
+| `file` | `file mode path` — the SQLite file at `path`, opened under `mode`. |
+| `memory` | `memory` — a fresh private in-memory SQLite database. Each `Db.open` of it |
+| `dsn` | `dsn descriptor` — the database a parsed `Dsn` names. |
 
 ## Db.Store
 
@@ -1477,7 +1491,7 @@ Ipe.Db.Store — typed, injection-safe persistence over the audited `Ipe.Db`.
 | `ColumnSpec` | A DB-only fact the record type cannot express: primary key, serial |
 | `PrimaryKeyDecl` | The table's primary key: none, one column, or several columns forming one |
 | `IndexSpec` | A declarative performance index over one or more of the store's columns. |
-| `Row` | A row read back from the database: every column keyed by its name, values |
+| `Row` | A row read back from the database: every column keyed by its name, each |
 | `validSqlIdent` | `validSqlIdent name` — accept `name` as a (possibly dotted) SQL identifier, |
 | `validSqlIdentPlain` | `validSqlIdentPlain name` — the dot-free identifier gate, byte-equivalent to |
 | `column` | `column name colType` — a column of an explicit `ColType`. The name is |
@@ -1511,10 +1525,10 @@ Ipe.Db.Store — typed, injection-safe persistence over the audited `Ipe.Db`.
 | `tableName` | The store's current table name (reflects any `renameTable` ops applied). |
 | `columnNames` | The store's current column names, in declaration order (reflects any |
 | `createSql` | `createSql store` — the `CREATE TABLE` DDL for the store, or `Err`. Every |
-| `readText` | Read a column as a `String`. A missing column is a typed `Err`. |
-| `readInt` | Read a column as an `Int`. A missing or non-integer column is a typed `Err`. |
+| `readText` | Read a column as a `String`. A missing or `NULL` column is a typed `Err`. |
+| `readInt` | Read a column as an `Int`. A missing, `NULL` or non-integer column is a |
 | `readBool` | Read a column as a `Bool`. The stored form is SQLite's `0` / `1` integer |
-| `readFloat` | Read a column as a `Float`. A missing or non-numeric column is a typed |
+| `readFloat` | Read a column as a `Float`. A missing, `NULL` or non-numeric column is a |
 | `insert` | `insert conn store row` — insert one row and return its generated id. The |
 | `insertReturning` | `insertReturning conn store row` — insert one row and return the stored row |
 | `upsert` | `upsert conn store row` — insert `row`, or, when a row with the same key |
@@ -1665,10 +1679,10 @@ Ipe.Db.Unsafe — the raw-SQL and untyped-column-read escape hatches for
 |--------|----------|
 | `unsafeExecRaw` | `unsafeExecRaw conn sql` — run verbatim, caller-authored SQL. No validator |
 | `unsafeQuery` | `unsafeQuery conn sql binds` — the query TEXT is caller-authored verbatim; |
-| `unsafeGetString` | `unsafeGetString key row` — read column `key` as a `String`, bypassing the |
-| `unsafeGetInt` | `unsafeGetInt key row` — read column `key` as an `Int`, bypassing the typed |
-| `unsafeGetBool` | `unsafeGetBool key row` — read column `key` as a `Bool`, bypassing the typed |
-| `unsafeGetField` | `unsafeGetField key row` — read column `key` as an untyped string field, |
+| `unsafeGetString` | `unsafeGetString key payload` — read field `key` of a payload map as a |
+| `unsafeGetInt` | `unsafeGetInt key payload` — read field `key` of a payload map as an `Int`, |
+| `unsafeGetBool` | `unsafeGetBool key payload` — read field `key` of a payload map as a |
+| `unsafeGetField` | `unsafeGetField key payload` — read field `key` of a payload map as an |
 | `unsafeFragment` | `unsafeFragment s` — mint a `SqlFragment` from `s` verbatim, WITHOUT the |
 | `unsafeExecRawOn` | `unsafeExecRawOn conn sql` — run verbatim, caller-authored SQL against an |
 
@@ -2007,7 +2021,7 @@ Ipe.Html — HTML element builders.
 | `video` | (no summary) |
 | `audio` | (no summary) |
 | `canvas` | (no summary) |
-| `iframe` | (no summary) |
+| `iframe` | `iframe attrs children` — an `<iframe>` element. Always sandboxed. The |
 | `progress` | (no summary) |
 | `meter` | (no summary) |
 | `script` | `script attrs children` — a `<script>` element. It renders only over a |
@@ -2026,7 +2040,7 @@ Ipe.Html — HTML element builders.
 | `area` | (no summary) |
 | `base` | (no summary) |
 | `col` | (no summary) |
-| `embed` | (no summary) |
+| `embed` | `embed attrs` — an `<embed>` element. An `embed` with a `src`, an `object` |
 | `source` | (no summary) |
 | `track` | (no summary) |
 | `wbr` | (no summary) |
@@ -2072,7 +2086,7 @@ Ipe.Html — HTML element builders.
 | `required` | (no summary) |
 | `multiple` | (no summary) |
 | `selected` | (no summary) |
-| `autofocus` | (no summary) |
+| `autofocus` | `autofocus True` — a control with `autofocus` takes focus at load, and |
 | `tabindex` | (no summary) |
 | `rows` | `rows n` — the `<textarea>` `rows` attribute, rendered as its decimal |
 | `Role` | (no summary) |
@@ -3336,7 +3350,7 @@ Ipe.WebSocket — outbound WebSocket client.
 | `withPingInterval` | Override the ping interval (default 30 s).  Takes a typed `Ipe.Duration`; |
 | `connect` | `connect wsUrl` — open a new WebSocket to `wsUrl` (`ws://` or `wss://`). |
 | `connectWith` | `connectWith cfg` — connect with custom headers / timeout / |
-| `send` | `send sock text` — write a text frame.  Blocks up to 30 s if |
+| `send` | `send sock text` — queue a text frame.  Never blocks: a full |
 | `sendBinary` | `sendBinary sock bytes` — write a binary frame.  Takes `Bytes` |
 | `close` | `close sock` — release the connection (sends a Normal close |
 | `closeWithCode` | `closeWithCode code reason sock` — release the connection with |

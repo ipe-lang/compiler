@@ -1,6 +1,8 @@
-use super::{Expr, Func, IrType, MAX_IR_RENDER_DEPTH, Symbol, wants_arc_ctor};
+use super::{
+    Diagnostic, Expr, Func, IrType, LowerError, MAX_IR_RENDER_DEPTH, Span, Symbol, wants_arc_ctor,
+};
 
-pub use ipe_ir::free_vars::{collect_free_vars, free_vars};
+pub use ipe_ir::free_vars::free_vars;
 pub use ipe_ir::let_inline::inlined_let_body;
 use ipe_ir::let_inline::pat_binds_target;
 pub use ipe_ir::seq_clone::clone_targets_in_expr;
@@ -8,19 +10,31 @@ pub use ipe_ir::seq_clone::clone_targets_in_expr;
 /// The deepest expression nesting the backend will descend before failing fast.
 ///
 /// `emit_expr` recurses one Rust stack frame per IR-expression level (`BinOp`
-/// operands, call arguments, match scrutinee/arm bodies). An adversarially or
-/// buggily deep IR spine would otherwise overflow the native stack with no
-/// diagnostic. The parser already caps *source* nesting at 256 (IPE-P0003);
-/// this matching bound is defence-in-depth against an IR produced past that —
-/// well below the native stack ceiling (≤ 2 MB default thread stack), so the
-/// guard fires first. Sized conservatively to leave headroom for the frame size
-/// of `emit_expr_at` in debug builds.
-///
-/// Shares [`ipe_ir::MAX_IR_RENDER_DEPTH`] rather than a separately-declared
-/// copy of the same value — a `--emit-ir` dev-flag dump and the real emitter
-/// must refuse a program at the identical depth, not two independently
-/// tuned bounds that can drift apart.
+/// operands, call arguments, match scrutinee/arm bodies). It is
+/// [`ipe_ir::MAX_IR_RENDER_DEPTH`], the compiler-wide
+/// `ipe_diagnostics::nesting::IR_NESTING_LIMIT` the parser's source ceiling
+/// derives. Lowering keeps every form the parser admits under that ceiling
+/// (capture clones are one flat node, an interpolation folds to logarithmic
+/// depth), so this refusal fires only on a lowering bug. The declared compile
+/// stack is sized for this depth.
 pub const MAX_EMIT_DEPTH: u16 = MAX_IR_RENDER_DEPTH;
+
+/// The refusal a body nested past [`MAX_EMIT_DEPTH`] gets.
+///
+/// It leaves the expression walk without its function; [`emit_func_vis`]
+/// names the function before the diagnostic leaves the backend.
+///
+/// [`emit_func_vis`]: super::emit_func_vis
+#[must_use]
+pub const fn nesting_refusal() -> Diagnostic {
+    Diagnostic::Lower {
+        span: Span::DUMMY,
+        msg: LowerError::BackendNestingTooDeep {
+            limit: MAX_EMIT_DEPTH,
+            func: None,
+        },
+    }
+}
 
 /// One indentation level: four spaces, matching the golden's formatting.
 pub fn indent_of(level: usize) -> String {
@@ -89,6 +103,11 @@ pub fn fn_binder_used_as_value(sym: Symbol, body: &Expr) -> bool {
         Expr::Let { name, value, body } => {
             fn_binder_used_as_value(sym, value)
                 || (*name != sym && fn_binder_used_as_value(sym, body))
+        }
+        // Each listed symbol is a `CloneVar` read of the outer binding (a value
+        // use), then shadows it over `body`.
+        Expr::CaptureClones { syms, body } => {
+            syms.contains(&sym) || fn_binder_used_as_value(sym, body)
         }
         Expr::Destructure {
             binder,
@@ -167,6 +186,7 @@ pub fn expr_refs_symbol(sym: Symbol, expr: &Expr) -> bool {
         Expr::Let { name, value, body } => {
             expr_refs_symbol(sym, value) || (*name != sym && expr_refs_symbol(sym, body))
         }
+        Expr::CaptureClones { syms, body } => syms.contains(&sym) || expr_refs_symbol(sym, body),
         Expr::Destructure {
             binder,
             value,
@@ -241,9 +261,7 @@ pub fn impl_fn_param_indices(func: &Func) -> Vec<usize> {
     func.params
         .iter()
         .enumerate()
-        .filter(|(_, (sym, ty))| {
-            is_plain_boxed_fun(ty) && !fn_binder_used_as_value(*sym, &func.body)
-        })
+        .filter(|(_, p)| is_plain_boxed_fun(&p.ty) && !fn_binder_used_as_value(p.sym, &func.body))
         .map(|(i, _)| i)
         .collect()
 }

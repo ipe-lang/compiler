@@ -1,0 +1,20 @@
+module Lib exposing (Choice(..), pick)
+
+-- `pick`'s `item` sits under a callback parameter, so it needs
+-- `Send + 'static`; `Main.firstOf` forwards its own `item` into it from
+-- another module.
+
+
+type Choice item
+    = Picked item
+    | Skipped
+
+
+pick : (item -> Choice item) -> Maybe item -> Choice item
+pick choose found =
+    case found of
+        Just it ->
+            choose it
+
+        Nothing ->
+            Skipped

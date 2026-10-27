@@ -47,28 +47,23 @@ fn solo_out() -> PathBuf {
 /// Compile the on-disk solo golden (`tests/golden/live_param_routes`) into
 /// `out`. Returns
 fn compile_solo_into(out: &Path) -> Result<(), CliError> {
-    let entry = repo_root()
+    let golden_project = repo_root()
         .join("tests")
         .join("golden")
-        .join("live_param_routes")
-        .join("Main.ipe");
+        .join("live_param_routes");
     let _ = std::fs::remove_dir_all(out);
     let runtime = e2e_support::require_runtime().into_path_buf();
-    ipe::build(&entry, out, &runtime)
+    crate::support::build_golden(&golden_project, out, &runtime)
 }
 
 /// Compile an inline source through the ipe pipeline (no cargo).
 #[allow(clippy::expect_used)] // an unwritable scratch dir is the test failure
 fn compile_src(test_name: &str, source: &str) -> Result<(), CliError> {
-    let ipe_dir = crate::support::scratch_root().join(format!("param_routes_{test_name}_ipe"));
-    let _ = std::fs::remove_dir_all(&ipe_dir);
-    std::fs::create_dir_all(&ipe_dir).expect("the fixture scratch dir must be writable");
-    let entry = ipe_dir.join("Main.ipe");
-    std::fs::write(&entry, source).expect("the fixture scratch dir must be writable");
+    let project = ipe::RootFixture::main(source).expect("the fixture project resolves");
     let out = crate::support::scratch_root().join(format!("param_routes_{test_name}_out"));
     let _ = std::fs::remove_dir_all(&out);
     let runtime = e2e_support::require_runtime().into_path_buf();
-    ipe::build(&entry, &out, &runtime)
+    ipe::build_fixture(&project, &out, &runtime).map(drop)
 }
 
 /// MIXED: one nullary route + one `:param` route in the SAME routes list.

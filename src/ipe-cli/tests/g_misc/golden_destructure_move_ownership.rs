@@ -23,11 +23,10 @@ fn repo_root() -> PathBuf {
     std::fs::canonicalize(&joined).unwrap_or(joined)
 }
 
-fn entry_path(root: &Path) -> PathBuf {
+fn project_path(root: &Path) -> PathBuf {
     root.join("tests")
         .join("golden")
         .join("destructure_move_ownership")
-        .join("Main.ipe")
 }
 
 /// ipe-0: the compiler accepts the program AND the reused destructure component
@@ -35,13 +34,13 @@ fn entry_path(root: &Path) -> PathBuf {
 #[test]
 fn i224_destructure_ipec_accepts_and_clones_reused_component() {
     let root = repo_root();
-    let entry = entry_path(&root);
+    let entry = project_path(&root);
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("i224_destructure_ipec_out");
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
 
-    let built = ipe::build_loose_file(&entry, &out, &runtime);
+    let built = crate::support::build_golden(&entry, &out, &runtime);
     assert!(
         built.is_ok(),
         "ipe dev build must succeed for destructure_move_ownership: {:?}",
@@ -69,13 +68,13 @@ fn i224_destructure_cargo_builds_and_runs() {
     }
 
     let root = repo_root();
-    let entry = entry_path(&root);
+    let entry = project_path(&root);
     let out = crate::support::scratch_root().join("ipec_i224_destructure_move_ownership_e2e");
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
 
-    let built = ipe::build_loose_file(&entry, &out, &runtime);
+    let built = crate::support::build_golden(&entry, &out, &runtime);
     assert!(
         built.is_ok(),
         "ipe dev build must succeed: {:?}",

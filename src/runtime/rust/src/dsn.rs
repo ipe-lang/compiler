@@ -3,8 +3,8 @@
 //!
 //! The ONLY way to obtain a `Dsn` is through [`dsn_parse`] (from a URL string) or
 //! [`dsn_build`] (from typed parts). Both enforce the same invariants on what
-//! they admit — known driver, bounded control-free parts, in-range port, no
-//! cleartext transport, no password without a user name — so a `Dsn` value is
+//! they admit — known driver, bounded control-free parts, in-range port, a
+//! verified TLS transport, no password without a user name — so a `Dsn` value is
 //! a proof that the connection descriptor passed every fail-closed check.
 //! There is no un-parsed way to construct one.
 //!
@@ -19,8 +19,9 @@
 //!
 //! A `Dsn` guarantees the descriptor is structurally valid and TLS-secure: a
 //! known driver, a present host for a network driver, an in-range port, no
-//! control characters in any component, and a transport that is not explicitly
-//! downgraded to cleartext (`sslmode=disable` is a hard parse error). It
+//! control characters in any component, and a transport that verifies the
+//! server certificate ([`TlsMode`]; every `sslmode` that accepts an unverified
+//! peer or cleartext is a hard parse error). It
 //! deliberately does NOT decide whether the host is safe to REACH — that is the
 //! separate authority of the connect step (a future slice), which owns the
 //! `network` capability and any SSRF-style host policy. `Dsn` is the syntactic
@@ -41,15 +42,63 @@ pub enum DsnDriver {
     Sqlite,
 }
 
-/// The transport-security posture. `Require`/`Prefer` are the two accepted modes;
-/// `Disable` exists for exhaustiveness and a future explicitly-disclosed
-/// opt-in, but the parse path REJECTS it — a `Dsn` is never a proof of a
-/// cleartext transport.
+/// The transport-security posture: TLS with the server certificate verified.
+///
+/// No inhabitant accepts an unverified peer or a cleartext transport, so a
+/// `Dsn` is a proof that its connection authenticates the server. The
+/// certificate must chain to a root in the `webpki-roots` set the runtime is
+/// built with, or to one the process environment names in `PGSSLROOTCERT`
+/// (read by the driver); the operating system's store is not consulted.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TlsMode {
-    Require,
-    Prefer,
+    /// The certificate chains to a trusted root and names the dialled host
+    /// (`sslmode=verify-full`, the default).
+    VerifyFull,
+    /// The certificate chains to a trusted root; its host name is not checked
+    /// (`sslmode=verify-ca`), for a server whose certificate names no host.
+    VerifyCa,
+}
+
+impl TlsMode {
+    /// The `sslmode` token the driver reads for this posture.
+    const fn sslmode(self) -> &'static str {
+        match self {
+            Self::VerifyFull => "verify-full",
+            Self::VerifyCa => "verify-ca",
+        }
+    }
+
+    /// The discriminant the `Ipe.Db.Dsn` `TlsMode` ADT marshals to.
+    const fn tag(self) -> i64 {
+        match self {
+            Self::VerifyFull => 0,
+            Self::VerifyCa => 1,
+        }
+    }
+
+    /// The posture `tag` marshals, or `None` for a tag no posture carries.
+    const fn of_tag(tag: i64) -> Option<Self> {
+        match tag {
+            0 => Some(Self::VerifyFull),
+            1 => Some(Self::VerifyCa),
+            _ => None,
+        }
+    }
+}
+
+/// A PostgreSQL `sslmode` that does not verify the server certificate.
+///
+/// No `Dsn` carries one: each is a parse refusal naming the remedy.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum UnverifiedSslMode {
+    /// Cleartext only.
     Disable,
+    /// Cleartext unless the server demands TLS.
+    Allow,
+    /// TLS unless the server declines it, then cleartext.
+    Prefer,
+    /// TLS against any certificate.
+    Require,
 }
 
 /// A DSN's network host, proven not to be part of its credentials.
@@ -104,9 +153,11 @@ impl DsnHost {
 /// Holds its decoded text and reaches a connection URL only percent-encoded
 /// ([`DsnPart::encoded`]), so no character in it can end the component it sits
 /// in and add URL syntax such as a `sslmode` parameter. A user name is
-/// credential-adjacent, so it has no derived (early-exit) equality.
+/// credential-adjacent, so its equality is constant-time, never derived.
 #[derive(Clone, Debug)]
 struct DsnPart(String);
+
+crate::ct_eq::impl_ct_eq!(DsnPart);
 
 impl DsnPart {
     /// A part written percent-encoded in a URL, held decoded.
@@ -169,11 +220,12 @@ enum SqliteDb {
 impl SqliteDb {
     /// The database a literal file name opens.
     ///
-    /// `:memory:` names the in-memory database; a name starting `file:` is
+    /// `:memory:` names the in-memory database; a name starting `file:` or
+    /// naming a network share or device ([`names_network_or_device`]) is
     /// refused.
     fn of_name(name: String) -> Result<Self, DsnReject> {
         clean_text(&name)?;
-        if name.starts_with("file:") {
+        if name.starts_with("file:") || names_network_or_device(&name) {
             Err(DsnReject::InvalidComponent)
         } else if name == SQLITE_MEMORY {
             Ok(Self::Memory)
@@ -245,6 +297,16 @@ struct Credentials {
     password: Option<Secret>,
 }
 
+impl PartialEq for Credentials {
+    /// Both halves are always compared, so a matching user name does not
+    /// shorten the time a differing password takes.
+    fn eq(&self, other: &Self) -> bool {
+        let same_user = self.user == other.user;
+        let same_password = self.password == other.password;
+        same_user && same_password
+    }
+}
+
 impl Credentials {
     /// The credentials of an optional user name and a literal password.
     ///
@@ -264,7 +326,7 @@ impl Credentials {
 }
 
 /// What a DSN connects to, per driver.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 enum DsnTarget {
     /// A PostgreSQL database name.
     Postgres(DsnPart),
@@ -279,7 +341,11 @@ enum DsnTarget {
 /// (cloning observes no plaintext — `Secret`'s own `Clone` does not reveal the
 /// payload). No `Display`/`IpeStringify` is derived: a `Dsn` is only ever
 /// rendered through its explicit redacted form.
-#[derive(Clone)]
+///
+/// `PartialEq` compares the non-secret fields, then the credentials in
+/// constant time ([`Credentials`]), so a record holding a `Dsn` derives
+/// equality like every other derivable field.
+#[derive(Clone, PartialEq)]
 pub struct Dsn {
     target: DsnTarget,
     host: DsnHost,
@@ -309,9 +375,8 @@ impl Dsn {
             DsnTarget::Sqlite(SqliteDb::File(name)) => format!("Sqlite {name}"),
         };
         let tls = match self.tls {
-            TlsMode::Require => "Require",
-            TlsMode::Prefer => "Prefer",
-            TlsMode::Disable => "Disable",
+            TlsMode::VerifyFull => "VerifyFull",
+            TlsMode::VerifyCa => "VerifyCa",
         };
         let mut fields = vec![
             ("target", target),
@@ -354,7 +419,7 @@ enum DsnReject {
     UnknownDriver,
     MissingHost,
     InvalidPort,
-    TlsDisabled,
+    TlsUnverified(UnverifiedSslMode),
     UnknownSslMode,
     ConflictingParameter,
     InvalidComponent,
@@ -374,7 +439,7 @@ impl DsnReject {
             | Self::UnknownDriver
             | Self::MissingHost
             | Self::InvalidPort
-            | Self::TlsDisabled
+            | Self::TlsUnverified(_)
             | Self::UnknownSslMode
             | Self::ConflictingParameter
             | Self::InvalidComponent
@@ -391,7 +456,22 @@ impl DsnReject {
             Self::UnknownDriver => "Ipe.Db.Dsn: unknown driver",
             Self::MissingHost => "Ipe.Db.Dsn: missing host",
             Self::InvalidPort => "Ipe.Db.Dsn: invalid port",
-            Self::TlsDisabled => "Ipe.Db.Dsn: TLS disabled is not permitted",
+            Self::TlsUnverified(UnverifiedSslMode::Disable) => {
+                "Ipe.Db.Dsn: sslmode=disable connects in cleartext; use sslmode=verify-full \
+                 (the default) or sslmode=verify-ca"
+            }
+            Self::TlsUnverified(UnverifiedSslMode::Allow) => {
+                "Ipe.Db.Dsn: sslmode=allow may connect in cleartext and does not verify the \
+                 server certificate; use sslmode=verify-full (the default) or sslmode=verify-ca"
+            }
+            Self::TlsUnverified(UnverifiedSslMode::Prefer) => {
+                "Ipe.Db.Dsn: sslmode=prefer may fall back to cleartext and does not verify the \
+                 server certificate; use sslmode=verify-full (the default) or sslmode=verify-ca"
+            }
+            Self::TlsUnverified(UnverifiedSslMode::Require) => {
+                "Ipe.Db.Dsn: sslmode=require does not verify the server certificate; use \
+                 sslmode=verify-full (the default) or sslmode=verify-ca"
+            }
             Self::UnknownSslMode => "Ipe.Db.Dsn: unknown sslmode",
             Self::ConflictingParameter => "Ipe.Db.Dsn: conflicting or misplaced parameter",
             Self::InvalidComponent => "Ipe.Db.Dsn: invalid DSN component",
@@ -452,6 +532,18 @@ fn clean_text(s: &str) -> Result<(), DsnReject> {
     }
 }
 
+/// True when the file name `name` starts with two separators (`//`, `\\`, or a
+/// mix) or the NT object prefix `\??\` (either separator).
+///
+/// On Windows each names a network share or a device, so opening it can dial
+/// a remote host; no SQLite file name may take either form on any platform.
+pub(crate) fn names_network_or_device(name: &str) -> bool {
+    let separator = |b: &u8| matches!(b, b'/' | b'\\');
+    let bytes = name.as_bytes();
+    matches!(bytes, [a, b, ..] if separator(a) && separator(b))
+        || matches!(bytes, [a, b'?', b'?', d, ..] if separator(a) && separator(d))
+}
+
 /// True when `s` names the Postgres driver.
 fn driver_is_postgres(scheme: &str) -> bool {
     matches!(scheme, "postgres" | "postgresql")
@@ -462,20 +554,25 @@ fn driver_is_sqlite(scheme: &str) -> bool {
     matches!(scheme, "sqlite" | "file")
 }
 
-/// Parse an `sslmode` token into a `TlsMode`, or a rejection. `disable` is a
-/// hard reject (a downgraded transport is not a value the parser mints); an
-/// unrecognised token is fail-closed, never coerced to a permissive default.
+/// Parse an `sslmode` token into a `TlsMode`, or a rejection.
+///
+/// A mode that does not verify the server certificate is refused with the
+/// remedy (a transport an on-path party can read is not a value the parser
+/// mints); an unrecognised token is fail-closed, never coerced to a default.
 fn parse_sslmode(token: &str) -> Result<TlsMode, DsnReject> {
     match token {
-        "require" => Ok(TlsMode::Require),
-        "prefer" => Ok(TlsMode::Prefer),
-        "disable" => Err(DsnReject::TlsDisabled),
+        "verify-full" => Ok(TlsMode::VerifyFull),
+        "verify-ca" => Ok(TlsMode::VerifyCa),
+        "require" => Err(DsnReject::TlsUnverified(UnverifiedSslMode::Require)),
+        "prefer" => Err(DsnReject::TlsUnverified(UnverifiedSslMode::Prefer)),
+        "allow" => Err(DsnReject::TlsUnverified(UnverifiedSslMode::Allow)),
+        "disable" => Err(DsnReject::TlsUnverified(UnverifiedSslMode::Disable)),
         _ => Err(DsnReject::UnknownSslMode),
     }
 }
 
 /// Read the TLS posture from a URL's query pairs, applying the SECURE DEFAULT
-/// (`Require`) when no `sslmode` is present. A `password=` in the query string, a
+/// (`VerifyFull`) when no `sslmode` is present. A `password=` in the query string, a
 /// duplicated `sslmode` with differing values, or any of the credential-smuggling
 /// shapes is a `ConflictingParameter` rejection: the password must arrive through
 /// the structured userinfo, never a re-parseable query segment.
@@ -502,7 +599,7 @@ fn tls_from_query(url: &UnambiguousUrl) -> Result<TlsMode, DsnReject> {
             _ => {}
         }
     }
-    Ok(chosen.unwrap_or(TlsMode::Require))
+    Ok(chosen.unwrap_or(TlsMode::VerifyFull))
 }
 
 /// `Ipe.Db.Dsn.parse : String -> Result Error Dsn` — THE seal from a full URL
@@ -511,7 +608,8 @@ fn tls_from_query(url: &UnambiguousUrl) -> Result<TlsMode, DsnReject> {
 ///
 /// Fails closed on all of: an unparseable string; an unknown driver scheme; a
 /// missing host for a network driver; an out-of-range/non-numeric port; an
-/// explicit `sslmode=disable`; an unknown `sslmode`; a credential or duplicated
+/// `sslmode` that does not verify the server (`disable`, `allow`, `prefer`,
+/// `require`); an unknown `sslmode`; a credential or duplicated
 /// security key smuggled into the query; a PostgreSQL URL whose user name or
 /// password may run past its authority (`crate::ssrf::userinfo_is_ambiguous`);
 /// and a control-character/oversized component. The password is captured as a
@@ -578,7 +676,12 @@ pub fn dsn_parse<E: From<String> + FromLimitExceeded>(s: String) -> IpeResult<E,
             // no `sslmode` can be present and the posture is the secure default.
             let rest = s.split_once(':').map_or("", |(_, rest)| rest);
             match SqliteDb::of_dsn_rest(rest) {
-                Ok(db) => (DsnHost::none(), 0, DsnTarget::Sqlite(db), TlsMode::Require),
+                Ok(db) => (
+                    DsnHost::none(),
+                    0,
+                    DsnTarget::Sqlite(db),
+                    TlsMode::VerifyFull,
+                ),
                 Err(r) => return reject(r),
             }
         }
@@ -627,8 +730,8 @@ pub fn dsn_parse<E: From<String> + FromLimitExceeded>(s: String) -> IpeResult<E,
 /// starting `file:` is refused.
 ///
 /// The driver/TLS tags are passed as their small-integer discriminants
-/// (`0 = Postgres`, `1 = Sqlite`; `0 = Require`, `1 = Prefer`, `2 = Disable`),
-/// which is how the emitted ADT constructors marshal. An out-of-set discriminant
+/// (`0 = Postgres`, `1 = Sqlite`; `0 = VerifyFull`, `1 = VerifyCa`), which is
+/// how the emitted ADT constructors marshal. An out-of-set discriminant
 /// is a rejection rather than a panic.
 #[must_use]
 #[allow(clippy::too_many_arguments)]
@@ -646,16 +749,9 @@ pub fn dsn_build<E: From<String> + FromLimitExceeded>(
         1 => DsnDriver::Sqlite,
         _ => return reject(DsnReject::UnknownDriver),
     };
-    let tls = match tls_tag {
-        0 => TlsMode::Require,
-        1 => TlsMode::Prefer,
-        2 => TlsMode::Disable,
-        _ => return reject(DsnReject::UnknownSslMode),
+    let Some(tls) = TlsMode::of_tag(tls_tag) else {
+        return reject(DsnReject::UnknownSslMode);
     };
-    if tls == TlsMode::Disable {
-        // A downgraded transport is never a value the seal mints.
-        return reject(DsnReject::TlsDisabled);
-    }
 
     // Port must be proven in range; no `as u16` narrowing (that truncation is
     // itself the bug being banned). Sqlite carries no port (0 is the sentinel).
@@ -757,21 +853,12 @@ impl Dsn {
     /// the sqlx connector and dropped, never logged or returned to Ipê.
     ///
     /// For Postgres the user name, password, and database are percent-encoded,
-    /// so the only query is the `sslmode` written here: the TLS posture is
-    /// folded into it so the parsed secure default (`Require`/`Prefer`) survives
-    /// the round-trip; `Disable` is unrepresentable (the parse/build path
-    /// rejected it). For Sqlite see [`SqliteDb::connection_url`].
+    /// so the only query is the `sslmode` written here: the verified TLS
+    /// posture reaches the driver. For Sqlite see [`SqliteDb::connection_url`].
     pub(crate) fn connection_url(&self) -> String {
         match &self.target {
             DsnTarget::Sqlite(db) => db.connection_url(),
             DsnTarget::Postgres(database) => {
-                let sslmode = match self.tls {
-                    TlsMode::Require => "require",
-                    TlsMode::Prefer => "prefer",
-                    // Unreachable: a `Dsn` never carries `Disable`. Fall back to
-                    // the strongest posture rather than emitting a downgrade.
-                    TlsMode::Disable => "require",
-                };
                 let mut url = String::from("postgres://");
                 if let Some(credentials) = &self.credentials {
                     url.push_str(&credentials.user.encoded());
@@ -789,7 +876,7 @@ impl Dsn {
                 url.push('/');
                 url.push_str(&database.encoded());
                 url.push_str("?sslmode=");
-                url.push_str(sslmode);
+                url.push_str(self.tls.sslmode());
                 url
             }
         }
@@ -840,15 +927,11 @@ pub fn dsn_user(d: Dsn) -> String {
 }
 
 /// `Ipe.Db.Dsn.tls : Dsn -> TlsMode` — the transport posture as its discriminant
-/// (`0 = Require`, `1 = Prefer`, `2 = Disable`), which the emitted `TlsMode` ADT
+/// (`0 = VerifyFull`, `1 = VerifyCa`), which the emitted `TlsMode` ADT
 /// constructor re-tags. Non-secret.
 #[must_use]
 pub fn dsn_tls(d: Dsn) -> i64 {
-    match d.tls {
-        TlsMode::Require => 0,
-        TlsMode::Prefer => 1,
-        TlsMode::Disable => 2,
-    }
+    d.tls.tag()
 }
 
 /// `Ipe.Db.Dsn.redacted : Dsn -> String` — a credential-free, human-readable
@@ -861,11 +944,7 @@ pub fn dsn_redacted(d: Dsn) -> String {
         DsnDriver::Postgres => "postgres",
         DsnDriver::Sqlite => "sqlite",
     };
-    let tls = match d.tls {
-        TlsMode::Require => "require",
-        TlsMode::Prefer => "prefer",
-        TlsMode::Disable => "disable",
-    };
+    let tls = d.tls.sslmode();
     // The `Secret`'s own `IpeStringify` yields the redacted placeholder; use it so
     // there is exactly one redaction convention.
     let user_part = d
@@ -907,6 +986,23 @@ mod tests {
         }
     }
 
+    #[test]
+    fn equality_compares_every_part_including_credentials() {
+        let base = "postgres://alice:pw1@db.example:5432/app";
+        assert!(parse_ok(base) == parse_ok(base));
+        for other in [
+            "postgres://bob:pw1@db.example:5432/app",
+            "postgres://alice:pw2@db.example:5432/app",
+            "postgres://alice@db.example:5432/app",
+            "postgres://alice:pw1@db.example:5433/app",
+            "postgres://alice:pw1@other.example:5432/app",
+            "postgres://alice:pw1@db.example:5432/other",
+            "postgres://alice:pw1@db.example:5432/app?sslmode=verify-ca",
+        ] {
+            assert!(parse_ok(base) != parse_ok(other), "{other} must differ");
+        }
+    }
+
     // ── The eight fail-closed parse cases ────────────────────────────────────
 
     #[test]
@@ -934,9 +1030,108 @@ mod tests {
         assert!(e.contains("cannot parse") || e.contains("invalid port"));
     }
 
+    /// Every `sslmode` that does not verify the server is refused with a
+    /// message naming the remedy, and the same DSN under that remedy parses.
     #[test]
-    fn rejects_explicit_tls_disable() {
-        assert!(parse_err("postgres://h:5432/d?sslmode=disable").contains("TLS disabled"));
+    fn rejects_every_unverified_sslmode_with_the_remedy() {
+        let remedy = "use sslmode=verify-full (the default) or sslmode=verify-ca";
+        for (mode, reason) in [
+            ("disable", "sslmode=disable connects in cleartext"),
+            (
+                "allow",
+                "sslmode=allow may connect in cleartext and does not verify the server certificate",
+            ),
+            (
+                "prefer",
+                "sslmode=prefer may fall back to cleartext and does not verify the server certificate",
+            ),
+            (
+                "require",
+                "sslmode=require does not verify the server certificate",
+            ),
+        ] {
+            let refused = parse_err(&format!("postgres://u:p@h:5432/d?sslmode={mode}"));
+            assert_eq!(refused, format!("Ipe.Db.Dsn: {reason}; {remedy}"), "{mode}");
+        }
+        for (mode, tag) in [("verify-full", 0), ("verify-ca", 1)] {
+            let d = parse_ok(&format!("postgres://u:p@h:5432/d?sslmode={mode}"));
+            assert_eq!(dsn_tls(d), tag, "{mode}");
+        }
+    }
+
+    /// Every posture a `Dsn` can carry, minted by parse or by build, reaches
+    /// the driver as a verifying `sslmode`.
+    #[test]
+    fn every_accepted_posture_verifies_the_server() {
+        let verifying = |d: &Dsn| {
+            let (_, options) = reread(d);
+            options.is_some_and(|o| {
+                matches!(
+                    o.get_ssl_mode(),
+                    sqlx::postgres::PgSslMode::VerifyFull | sqlx::postgres::PgSslMode::VerifyCa
+                )
+            })
+        };
+        let mut built = 0;
+        for tls_tag in -1..8 {
+            let minted = dsn_build::<String>(
+                0,
+                "db.example".into(),
+                5432,
+                "app".into(),
+                "reader".into(),
+                secret_from_string("pw".into()),
+                tls_tag,
+            );
+            if let IpeResult::Ok(d) = minted {
+                built += 1;
+                assert!(verifying(&d), "tag {tls_tag} reached the driver unverified");
+            }
+        }
+        assert_eq!(built, 2, "exactly the two verifying postures are buildable");
+        for mode in [
+            "",
+            "disable",
+            "allow",
+            "prefer",
+            "require",
+            "verify-ca",
+            "verify-full",
+        ] {
+            let query = if mode.is_empty() {
+                String::new()
+            } else {
+                format!("?sslmode={mode}")
+            };
+            let parsed = dsn_parse::<String>(format!("postgres://u@db.example/app{query}"));
+            if let IpeResult::Ok(d) = parsed {
+                assert!(
+                    verifying(&d),
+                    "sslmode {mode:?} reached the driver unverified"
+                );
+            }
+        }
+    }
+
+    /// The `sslmode` render names only verifying modes.
+    #[test]
+    fn sslmode_render_names_no_unverified_mode() {
+        let src = include_str!("dsn.rs");
+        let start = format!("const fn {}(self)", "sslmode");
+        let end = format!("const fn {}(self)", "tag");
+        let render = src.find(&start).and_then(|from| {
+            src.get(from..)
+                .and_then(|rest| rest.find(&end).and_then(|to| rest.get(..to)))
+        });
+        assert!(render.is_some(), "the sslmode render is not found");
+        let Some(render) = render else {
+            return;
+        };
+        assert!(render.contains("\"verify-full\""));
+        for mode in ["disable", "allow", "prefer", "require"] {
+            let needle = format!("\"{mode}\"");
+            assert!(!render.contains(&needle), "the render names {mode}");
+        }
     }
 
     #[test]
@@ -948,7 +1143,7 @@ mod tests {
     fn rejects_smuggled_credential_and_conflicting_keys() {
         assert!(parse_err("postgres://h:5432/d?password=x").contains("conflicting or misplaced"));
         assert!(
-            parse_err("postgres://h:5432/d?sslmode=require&sslmode=prefer")
+            parse_err("postgres://h:5432/d?sslmode=verify-full&sslmode=verify-ca")
                 .contains("conflicting or misplaced")
         );
     }
@@ -1231,7 +1426,7 @@ mod tests {
     ];
 
     /// A built database name, user name, or password holding URL syntax stays
-    /// inside its component: the connection URL keeps `sslmode=require` for
+    /// inside its component: the connection URL keeps `sslmode=verify-full` for
     /// both the `Dsn` parser and the driver, and each part reads back exactly.
     #[test]
     fn build_parts_cannot_inject_url_syntax() {
@@ -1257,7 +1452,10 @@ mod tests {
                     continue;
                 };
                 assert!(
-                    matches!(options.get_ssl_mode(), sqlx::postgres::PgSslMode::Require),
+                    matches!(
+                        options.get_ssl_mode(),
+                        sqlx::postgres::PgSslMode::VerifyFull
+                    ),
                     "{part:?} in slot {slot} downgraded the driver's TLS"
                 );
                 assert_eq!(options.get_host(), "db.example", "{part:?} in slot {slot}");
@@ -1327,7 +1525,7 @@ mod tests {
         assert_eq!(options.get_database(), Some("my?db"));
         assert!(matches!(
             options.get_ssl_mode(),
-            sqlx::postgres::PgSslMode::Require
+            sqlx::postgres::PgSslMode::VerifyFull
         ));
         assert_eq!(revealed_password(d).as_deref(), Some("s3cr@t"));
     }
@@ -1401,7 +1599,7 @@ mod tests {
         "sqlite:x.db",
         "u:p@x.db",
         "/abs/p?q#r.db",
-        "//x/caf\u{e9}[1].db",
+        "x/caf\u{e9}[1].db",
     ];
 
     /// A built SQLite file name opens that very file `mode=rwc`, for the
@@ -1524,23 +1722,68 @@ mod tests {
         }
     }
 
+    /// A SQLite file name naming a network share or device is refused, built
+    /// or parsed (spelled out or percent-encoded); a single leading separator
+    /// is the control.
+    #[test]
+    fn sqlite_network_and_device_names_are_refused() {
+        for name in [
+            "//host/s/x.db",
+            "\\\\host\\s\\x.db",
+            "\\\\?\\C:\\x.db",
+            "\\\\.\\pipe\\x",
+            "/\\host\\s\\x.db",
+            "\\/host/s/x.db",
+            "\\??\\UNC\\host\\s\\x.db",
+            "/??/UNC/host/s/x.db",
+        ] {
+            assert!(
+                matches!(sqlite_build(name), IpeResult::Err(ref e) if e.contains("invalid DSN component")),
+                "{name:?} must be refused"
+            );
+        }
+        for dsn in [
+            "sqlite:////host/s/x.db",
+            "sqlite://%5C%5Chost%5Cs%5Cx.db",
+            "sqlite:%5C%3F%3F%5CUNC%5Chost%5Cs%5Cx.db",
+            "sqlite:/%2Fhost/s/x.db",
+        ] {
+            assert!(
+                matches!(dsn_parse::<String>(dsn.to_owned()), IpeResult::Err(ref e) if e.contains("invalid DSN component")),
+                "{dsn:?} must be refused"
+            );
+        }
+        assert!(matches!(sqlite_build("/host/s/x.db"), IpeResult::Ok(_)));
+        assert!(matches!(
+            dsn_parse::<String>("sqlite:///host/s/x.db".to_owned()),
+            IpeResult::Ok(_)
+        ));
+    }
+
     // ── Secure defaults ──────────────────────────────────────────────────────
 
     #[test]
-    fn omitted_sslmode_defaults_to_require() {
+    fn omitted_sslmode_defaults_to_verify_full() {
         let d = parse_ok("postgres://user@h:5432/mydb");
-        assert_eq!(dsn_tls(d), 0); // 0 = Require
+        assert_eq!(dsn_tls(d.clone()), 0); // 0 = VerifyFull
+        assert!(d.connection_url().contains("sslmode=verify-full"));
+        let (_, options) = reread(&d);
+        assert!(
+            options
+                .is_some_and(|o| matches!(o.get_ssl_mode(), sqlx::postgres::PgSslMode::VerifyFull))
+        );
     }
 
     #[test]
-    fn accepts_explicit_prefer() {
-        let d = parse_ok("postgres://h:5432/d?sslmode=prefer");
-        assert_eq!(dsn_tls(d), 1); // 1 = Prefer
+    fn accepts_explicit_verify_ca() {
+        let d = parse_ok("postgres://h:5432/d?sslmode=verify-ca");
+        assert_eq!(dsn_tls(d.clone()), 1); // 1 = VerifyCa
+        assert!(d.connection_url().contains("sslmode=verify-ca"));
     }
 
     #[test]
-    fn build_rejects_tls_disable_and_out_of_range_port() {
-        // tls_tag 2 = Disable → reject.
+    fn build_rejects_unknown_tls_tag_and_out_of_range_port() {
+        // tls_tag 2 names no posture → reject.
         assert!(matches!(
             dsn_build::<String>(
                 0,

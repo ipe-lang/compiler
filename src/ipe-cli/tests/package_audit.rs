@@ -412,7 +412,7 @@ fn a_committed_ffi_cache_is_never_loaded_by_the_audit() {
         "module Package exposing (package)\n\n\npackage =\n    { name = \"ffi-pkg\", version = \"0.1.0\" }\n",
         PURE_MAIN,
     );
-    let cache = pkg.join(".ipe/cache/ffi/rust");
+    let cache = pkg.join(ipe_ffi::driver::FFI_CACHE_REL);
     std::fs::create_dir_all(&cache).expect("create ffi cache dir");
     std::fs::write(
         cache.join("mycrate_bindings.rs"),
@@ -535,7 +535,7 @@ fn committed_bindings_are_ignored_for_native_packages() {
     );
     // Plant a committed `_bindings.rs` with a panic — what a hostile publisher
     // might submit to slip past the provenance scan if committed bindings were trusted.
-    let cache = pkg.join(".ipe/cache/ffi/rust");
+    let cache = pkg.join(ipe_ffi::driver::FFI_CACHE_REL);
     std::fs::create_dir_all(&cache).expect("create committed ffi cache dir");
     std::fs::write(
         cache.join("ipe_does_not_exist_xyz_q9z_bindings.rs"),

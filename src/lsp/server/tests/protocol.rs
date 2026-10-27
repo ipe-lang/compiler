@@ -5,7 +5,8 @@
 //! project).
 
 use std::collections::BTreeMap;
-use std::path::Path;
+use std::fmt::Write as _;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use lsp_server::{Connection, Message, Notification, Request, RequestId};
@@ -18,14 +19,14 @@ use ipe_lsp_server::{LoadError, LoadedFile, LoadedProject, ModuleOrigin, Project
 // ---------------------------------------------------------------------------
 
 /// A loader for the lint-config protocol test. The `lint.ipe` file is written
-/// to the workspace directory before the server starts; the server discovers it
-/// via the `workspaceFolders` URI passed in `InitializeParams`.
+/// to the workspace directory before the server starts; the server passes the
+/// `workspaceFolders` of `InitializeParams` to every load.
 struct WorkspaceLoader;
 
 impl ProjectLoader for WorkspaceLoader {
     fn load(
         &self,
-        workspace_root: Option<&Path>,
+        workspace_roots: &[PathBuf],
         open_file: &Path,
         open_text: Option<&str>,
     ) -> Result<LoadedProject, LoadError> {
@@ -55,12 +56,13 @@ impl ProjectLoader for WorkspaceLoader {
         Ok(LoadedProject {
             files,
             entry_module: vec!["Main".to_owned()],
-            // `lint.ipe` is discovered at the workspace root, not next to the
-            // (possibly virtual) open file — matching the real driver, which
-            // anchors on the project root it resolves, never the open file's
-            // own directory.
-            lint_config_dir: workspace_root
-                .map_or_else(|| ipe_lint::lint_config_dir(open_file), Path::to_path_buf),
+            // `lint.ipe` is discovered at the workspace folder, not next to
+            // the (possibly virtual) open file — matching the real driver,
+            // which anchors on the project root it resolves, never the open
+            // file's own directory.
+            lint_config_dir: workspace_roots
+                .first()
+                .map_or_else(|| ipe_lint::lint_config_dir(open_file), PathBuf::clone),
         })
     }
 }
@@ -94,7 +96,7 @@ fn lint_ipe_workspace_config_is_respected() {
         .spawn(move || ipe_lsp_server::run_with_connection(&server_side, &loader))
         .expect("spawn test thread");
 
-    // Handshake — pass the workspace folder so the server sets workspace_root.
+    // Handshake — pass the workspace folder so the server hands it to the loader.
     let ws_uri = lsp_types::Url::from_file_path(&ws_root).expect("ws uri");
     client
         .sender
@@ -184,7 +186,7 @@ struct FixtureLoader;
 impl ProjectLoader for FixtureLoader {
     fn load(
         &self,
-        _workspace_root: Option<&Path>,
+        _workspace_roots: &[PathBuf],
         open_file: &Path,
         open_text: Option<&str>,
     ) -> Result<LoadedProject, LoadError> {
@@ -273,6 +275,105 @@ fn await_diagnostics(
             return diags;
         }
     }
+}
+
+/// A `do` of as many named binds as the parser admits inside a `Task` lambda
+/// over a handle, every bind read by the final statement: the `do` atom sits
+/// at depth 13, the final statement's list element atom at `25 + 2n`.
+fn at_ceiling_fan_in() -> String {
+    let limit = usize::try_from(ipe_diagnostics::nesting::SOURCE_NESTING_LIMIT).unwrap_or(0);
+    let binds = limit.saturating_sub(25) / 2;
+    let mut src = String::from(
+        "module Main exposing (main)\n\nimport Ipe.Io as Io\nimport Ipe.List as List\n\
+         import Ipe.String as String\nimport Ipe.Task as Task\n\n\n\
+         main =\n    withHandle\n        (\\h ->\n            do\n",
+    );
+    let names: Vec<String> = (1..=binds).map(|i| format!("x{i}")).collect();
+    for name in &names {
+        let _ = writeln!(src, "                {name} <- Task.succeed h");
+    }
+    let _ = write!(
+        src,
+        "                report [ {} ]\n        )\n\n\n\
+         withHandle : (Int -> Task Error ()) -> Task Error ()\n\
+         withHandle f =\n    f 0\n\n\n\
+         report : List Int -> Task Error ()\n\
+         report xs =\n    Io.println (String.fromInt (List.length xs))\n",
+        names.join(", ")
+    );
+    src
+}
+
+/// The diagnostics worker compiles a program at the parser's ceiling on the
+/// declared compile stack and publishes its (clean) diagnostics; the server
+/// stays up to answer the shutdown that follows.
+#[test]
+fn at_ceiling_program_publishes_diagnostics_from_the_worker() {
+    let (server_side, client) = Connection::memory();
+    let server = std::thread::Builder::new()
+        .spawn(move || ipe_lsp_server::run_with_connection(&server_side, &FixtureLoader))
+        .expect("spawn test thread");
+    client
+        .sender
+        .send(Message::Request(Request::new(
+            RequestId::from(1),
+            "initialize".to_owned(),
+            serde_json::json!({ "capabilities": {} }),
+        )))
+        .expect("send initialize");
+    let _ = recv_response(&client, 1);
+    client
+        .sender
+        .send(Message::Notification(Notification::new(
+            "initialized".to_owned(),
+            serde_json::json!({}),
+        )))
+        .expect("send initialized");
+
+    let uri = format!("file://{VIRTUAL_PATH}");
+    client
+        .sender
+        .send(Message::Notification(Notification::new(
+            "textDocument/didOpen".to_owned(),
+            serde_json::json!({
+                "textDocument": {
+                    "uri": uri, "languageId": "ipe", "version": 1, "text": at_ceiling_fan_in()
+                }
+            }),
+        )))
+        .expect("send didOpen");
+    let diags = await_diagnostics(&client, &uri, |diags| {
+        diags
+            .iter()
+            .all(|d| d.get("severity") != Some(&serde_json::json!(1)))
+    });
+    assert!(
+        diags
+            .iter()
+            .all(|d| d.get("severity") != Some(&serde_json::json!(1))),
+        "the at-ceiling program has no error: {diags:?}"
+    );
+
+    client
+        .sender
+        .send(Message::Request(Request::new(
+            RequestId::from(2),
+            "shutdown".to_owned(),
+            serde_json::Value::Null,
+        )))
+        .expect("send shutdown");
+    let _ = recv_response(&client, 2);
+    client
+        .sender
+        .send(Message::Notification(Notification::new(
+            "exit".to_owned(),
+            serde_json::Value::Null,
+        )))
+        .expect("send exit");
+    server
+        .join()
+        .expect("server thread joins")
+        .expect("server exits clean");
 }
 
 #[test]
@@ -465,7 +566,7 @@ struct CyclicLoader;
 impl ProjectLoader for CyclicLoader {
     fn load(
         &self,
-        _workspace_root: Option<&Path>,
+        _workspace_roots: &[PathBuf],
         open_file: &Path,
         _open_text: Option<&str>,
     ) -> Result<LoadedProject, LoadError> {

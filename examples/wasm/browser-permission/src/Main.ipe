@@ -13,7 +13,6 @@ module Main exposing (main)
 -- is the capability consent gate: the compiler refuses to build the example if
 -- the declaration is absent.
 
-
 import Ipe.Browser.Permission as Permission exposing (PermissionState(..))
 import Ipe.Browser.Permission.Internals as Internals
 import Ipe.Error as Error exposing (Error)

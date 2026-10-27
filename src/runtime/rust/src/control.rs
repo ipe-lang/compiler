@@ -565,6 +565,9 @@ pub mod server {
     /// but never sends a complete record is dropped at the deadline rather than
     /// holding a task forever.
     ///
+    /// In a served app the loop ends with `Ok(Some(()))` once the server
+    /// drains, so no listener task outlives the drain.
+    ///
     /// # Errors
     /// An I/O error if the listener cannot bind the loopback port.
     pub async fn serve_control<H, Fut>(handler: H) -> std::io::Result<Option<()>>
@@ -589,7 +592,19 @@ pub mod server {
         let listener = TcpListener::bind(addr).await?;
         let handler = Arc::new(handler);
         loop {
-            match listener.accept().await {
+            #[cfg(feature = "server")]
+            let accepted = {
+                // Re-read per accept, so an owner armed after the bind is seen.
+                let mut drain = crate::server::shutdown::drain();
+                tokio::select! {
+                    biased;
+                    () = drain.wait() => return Ok(Some(())),
+                    accepted = listener.accept() => accepted,
+                }
+            };
+            #[cfg(not(feature = "server"))]
+            let accepted = listener.accept().await;
+            match accepted {
                 Ok((stream, _peer)) => {
                     // A single connection is served on its own task under a read
                     // deadline: one slow or hung peer never blocks the accept loop,

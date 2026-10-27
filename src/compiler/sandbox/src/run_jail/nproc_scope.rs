@@ -14,14 +14,13 @@
 
 use std::ffi::OsString;
 use std::io::Read as _;
-use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::sync::{Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
-use super::{ProcCap, RunJailDefect, RunJailTools, SandboxProfile, jail_argv_unproven};
+use super::{BwrapTools, ProcCap, RunJailDefect, RunJailTools, SandboxProfile, jail_argv_unproven};
 use crate::scratch::{ScratchDir, ScratchFile};
-use crate::{CanonicalPath, JailMounts};
+use crate::{CanonicalPath, JailMounts, ToolPath};
 
 impl ProcCap {
     /// The cap every canary jail runs under.
@@ -140,27 +139,27 @@ pub const fn classify(
 /// before the scope was measured.
 #[derive(Debug)]
 pub struct NprocScope {
-    tools: RunJailTools,
+    tools: BwrapTools,
 }
 
 impl NprocScope {
     /// The tools the proof was measured with, which the jail argv names.
     #[must_use]
-    pub const fn tools(&self) -> &RunJailTools {
+    pub const fn tools(&self) -> &BwrapTools {
         &self.tools
     }
 
     /// A proof over `tools` that was never measured, for argv-rendering tests.
     #[cfg(test)]
-    pub(crate) const fn for_test(tools: RunJailTools) -> Self {
+    pub(crate) const fn for_test(tools: BwrapTools) -> Self {
         Self { tools }
     }
 }
 
 /// One cached measurement.
 struct Verdict {
-    bwrap: PathBuf,
-    prlimit: PathBuf,
+    bwrap: ToolPath,
+    prlimit: ToolPath,
     result: Result<(), RunJailDefect>,
 }
 
@@ -170,11 +169,13 @@ struct Verdict {
 /// a refusal included, is kept for the life of the process.
 ///
 /// # Errors
-/// [`RunJailDefect::ProcCapUnscoped`] when the cap counts the whole user or is
-/// not enforced; [`RunJailDefect::Spawn`] or [`RunJailDefect::Path`] when a
-/// canary jail cannot be established.
+/// [`RunJailDefect::PrimitiveUnavailable`] when `tools` is not the bubblewrap
+/// arm; [`RunJailDefect::ProcCapUnscoped`] when the cap counts the whole user
+/// or is not enforced; [`RunJailDefect::Spawn`] or [`RunJailDefect::Path`]
+/// when a canary jail cannot be established.
 pub fn prove(tools: &RunJailTools) -> Result<NprocScope, RunJailDefect> {
     static VERDICTS: Mutex<Vec<Verdict>> = Mutex::new(Vec::new());
+    let tools = tools.bwrap_tools()?;
     // The lock is held across the measurement so concurrent callers run one
     // set of canaries, not one each.
     let mut verdicts = VERDICTS.lock().unwrap_or_else(PoisonError::into_inner);
@@ -200,7 +201,7 @@ pub fn prove(tools: &RunJailTools) -> Result<NprocScope, RunJailDefect> {
 }
 
 /// Run the canary jails and classify their outcomes.
-fn measure(tools: &RunJailTools) -> Result<(), RunJailDefect> {
+fn measure(tools: &BwrapTools) -> Result<(), RunJailDefect> {
     let scratch = ScratchDir::new("ipe-nproc-canary").map_err(|e| RunJailDefect::Spawn {
         detail: format!("the process-cap canary's scratch directory could not be created: {e}"),
     })?;
@@ -288,7 +289,7 @@ fn shell(script: &str) -> [OsString; 3] {
 
 /// Run one canary jail to completion within [`CANARY_WALL`].
 fn run_canary(
-    tools: &RunJailTools,
+    tools: &BwrapTools,
     profile: &SandboxProfile,
     mounts: &JailMounts,
     payload: &[OsString],

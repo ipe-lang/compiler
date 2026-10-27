@@ -55,6 +55,17 @@ impl RegName {
     fn is_loopback(&self) -> bool {
         self.0.rsplit('.').next() == Some(LOOPBACK_LABEL)
     }
+
+    /// Whether the name's last label is a decimal or `0x` hex number, which
+    /// makes the whole name an IPv4 address to a browser.
+    fn ends_in_number(&self) -> bool {
+        self.0.rsplit('.').next().is_some_and(|last| {
+            last.bytes().all(|b| b.is_ascii_digit())
+                || last
+                    .strip_prefix("0x")
+                    .is_some_and(|hex| hex.bytes().all(|b| b.is_ascii_hexdigit()))
+        })
+    }
 }
 
 /// Whether `label` is 1 to 63 letters, digits and inner hyphens.
@@ -161,11 +172,15 @@ impl DeclaredNames {
 
 /// A host list item's name, or `None` for an IP literal, a loopback name, or
 /// anything that is not a DNS name.
+///
+/// A name whose last label is a number (`127.1`, `0x7f.1`) is an IPv4 address
+/// to a browser, which never sends it as a name, so declaring one is refused
+/// like a strict IP literal.
 fn declared_name(raw: &str) -> Option<RegName> {
     if Ipv4Addr::from_str(raw).is_ok() {
         return None;
     }
-    RegName::parse(raw).filter(|name| !name.is_loopback())
+    RegName::parse(raw).filter(|name| !name.is_loopback() && !name.ends_in_number())
 }
 
 /// Why a declared host list is refused; never echoes the value.
@@ -279,9 +294,9 @@ impl Authority {
     }
 }
 
-/// A decimal port in `1..=65535`.
+/// A canonical decimal port in `1..=65535`: digits only, no leading zero.
 fn parse_port(raw: &str) -> Result<NonZeroU16, AuthorityRefusal> {
-    if raw.is_empty() || !raw.bytes().all(|b| b.is_ascii_digit()) {
+    if raw.is_empty() || raw.starts_with('0') || !raw.bytes().all(|b| b.is_ascii_digit()) {
         return Err(AuthorityRefusal::Malformed);
     }
     raw.parse::<u16>()
@@ -747,6 +762,10 @@ mod tests {
             "evil.example:0",
             "evil.example:65536",
             "evil.example:+80",
+            "evil.example:080",
+            "127.0.0.1:080",
+            "[::1]:080",
+            "127.0.0.1:00080",
             ":80",
             "user@127.0.0.1",
             "127.0.0.1:80:80",
@@ -867,6 +886,11 @@ mod tests {
             ("*", HostListRefusal::Malformed { index: 0 }),
             ("*.a.com", HostListRefusal::Malformed { index: 0 }),
             ("127.0.0.1", HostListRefusal::Malformed { index: 0 }),
+            ("[::1]", HostListRefusal::Malformed { index: 0 }),
+            ("a.com,127.1", HostListRefusal::Malformed { index: 1 }),
+            ("0x7f.1", HostListRefusal::Malformed { index: 0 }),
+            ("10.0.0x0A", HostListRefusal::Malformed { index: 0 }),
+            (".1", HostListRefusal::Malformed { index: 0 }),
             ("localhost", HostListRefusal::Malformed { index: 0 }),
             (".localhost", HostListRefusal::Malformed { index: 0 }),
             (too_many.as_str(), HostListRefusal::TooMany),
@@ -888,6 +912,12 @@ mod tests {
         assert_eq!(
             DeclaredNames::parse(" a.com , .b.com ").map(|n| n.len()),
             Ok(2)
+        );
+        // A numeric label short of the last, and a last label that only
+        // starts like a number, are names.
+        assert_eq!(
+            DeclaredNames::parse("1.example, 0xz.example, a.0xg").map(|n| n.len()),
+            Ok(3)
         );
     }
 }

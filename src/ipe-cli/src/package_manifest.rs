@@ -61,7 +61,7 @@ use crate::delivery_set::{BinaryTarget, ShipEntry};
 use crate::project::{
     BrowserDelivery, Capability, DeliveryConfig, DesktopDelivery, EntryShape, IpeDep,
     MobileDelivery, Program, ProjectManifest, PublicEnvAllowlist, PublicEnvName, RustDep,
-    ScreenOrientation, WasmConfig,
+    ScreenOrientation, WasmBundle, WasmConfig, WasmMode,
 };
 use crate::text;
 
@@ -262,7 +262,7 @@ impl ManifestFields {
             root: root.to_path_buf(),
             src_root,
             icon,
-            driver: self.driver.unwrap_or(ipe_backend_rust::DbDriver::Sqlite),
+            driver: self.driver.unwrap_or(crate::project::UNDECLARED_DB_DRIVER),
             static_request: crate::build_plan::StaticRequestLayer {
                 static_build: self.static_build,
                 target: self.target,
@@ -1027,7 +1027,7 @@ impl Reader<'_> {
     fn read_wasm(&self, expr: &Expr) -> Result<WasmConfig, CliError> {
         let (ctor, args) = self.expect_ctor_app(expr, "a wasm setting")?;
         match ctor {
-            "Off" => Ok(WasmConfig::default()),
+            "Off" => Ok(WasmConfig::Off),
             "On" => {
                 let options = self.nth_arg(expr.span, ctor, args, 0)?;
                 self.read_wasm_options(options)
@@ -1042,18 +1042,18 @@ impl Reader<'_> {
     /// Read an `On { mode, entry, mount, publicEnv, optLevel }` options record.
     /// `mode` is required (an active bundle must name its rendering strategy).
     fn read_wasm_options(&self, expr: &Expr) -> Result<WasmConfig, CliError> {
-        let mut wasm = WasmConfig::default();
-        let mut saw_mode = false;
+        let mut mode = None;
+        let mut entry = None;
+        let mut mount = None;
+        let mut public_env = PublicEnvAllowlist::default();
+        let mut opt_level = None;
         for (fname, value) in self.expect_record(expr)? {
             match self.text(fname.value) {
-                "mode" => {
-                    wasm.mode = Some(self.read_wasm_mode(value)?);
-                    saw_mode = true;
-                }
-                "entry" => wasm.entry = Some(self.expect_string(value)?),
-                "mount" => wasm.mount = Some(self.expect_string(value)?),
-                "publicEnv" => wasm.public_env = self.read_public_env(value)?,
-                "optLevel" => wasm.opt_level = Some(self.expect_string(value)?),
+                "mode" => mode = Some(self.read_wasm_mode(value)?),
+                "entry" => entry = Some(self.expect_string(value)?),
+                "mount" => mount = Some(self.expect_string(value)?),
+                "publicEnv" => public_env = self.read_public_env(value)?,
+                "optLevel" => opt_level = Some(self.expect_string(value)?),
                 other => {
                     return Err(self.reject(
                         fname.span,
@@ -1065,20 +1065,26 @@ impl Reader<'_> {
                 }
             }
         }
-        if !saw_mode {
+        let Some(mode) = mode else {
             return Err(self.reject(
                 expr.span,
                 "an `On { … }` wasm bundle must set `mode = Solo` or `mode = Hydrate`",
             ));
-        }
-        Ok(wasm)
+        };
+        Ok(WasmConfig::On(WasmBundle {
+            mode,
+            entry,
+            mount,
+            public_env,
+            opt_level,
+        }))
     }
 
-    /// Read a `wasm` `mode` field: `Solo` / `Hydrate`, mapped to its wire mode.
-    fn read_wasm_mode(&self, expr: &Expr) -> Result<String, CliError> {
+    /// Read a `wasm` `mode` field: `Solo` / `Hydrate`.
+    fn read_wasm_mode(&self, expr: &Expr) -> Result<WasmMode, CliError> {
         match self.expect_ctor(expr, "a wasm mode")? {
-            "Solo" => Ok("solo".to_owned()),
-            "Hydrate" => Ok("hydrate".to_owned()),
+            "Solo" => Ok(WasmMode::Solo),
+            "Hydrate" => Ok(WasmMode::Hydrate),
             other => Err(self.reject(
                 expr.span,
                 &format!("`{other}` is not a wasm mode — use `Solo` or `Hydrate`"),
@@ -1631,22 +1637,22 @@ const fn shape_ctor_name(shape: EntryShape) -> &'static str {
 /// Render the `wasm = …` field, or `None` when the config is the default (no
 /// active bundle) — an absent field reads back as `Off`.
 fn render_wasm(wasm: &WasmConfig) -> Option<String> {
-    if *wasm == WasmConfig::default() {
+    let WasmConfig::On(bundle) = wasm else {
         return None;
-    }
-    let mode = match wasm.mode.as_deref() {
-        Some("hydrate") => "Hydrate",
-        _ => "Solo",
+    };
+    let mode = match bundle.mode {
+        WasmMode::Solo => "Solo",
+        WasmMode::Hydrate => "Hydrate",
     };
     let mut parts = vec![format!("mode = {mode}")];
-    if let Some(entry) = &wasm.entry {
+    if let Some(entry) = &bundle.entry {
         parts.push(format!("entry = {}", quote(entry)));
     }
-    if let Some(mount) = &wasm.mount {
+    if let Some(mount) = &bundle.mount {
         parts.push(format!("mount = {}", quote(mount)));
     }
-    if !wasm.public_env.is_empty() {
-        let names = wasm
+    if !bundle.public_env.is_empty() {
+        let names = bundle
             .public_env
             .iter()
             .map(|n| quote(n.as_str()))
@@ -1654,7 +1660,7 @@ fn render_wasm(wasm: &WasmConfig) -> Option<String> {
             .join(", ");
         parts.push(format!("publicEnv = [ {names} ]"));
     }
-    if let Some(opt) = &wasm.opt_level {
+    if let Some(opt) = &bundle.opt_level {
         parts.push(format!("optLevel = {}", quote(opt)));
     }
     Some(format!("wasm =\n        On {{ {} }}", parts.join(", ")))
@@ -1699,7 +1705,7 @@ fn ship_builder_expr(entry: ShipEntry) -> String {
 /// Render the `build = { … }` field, or `None` when every build setting is at
 /// its default (an absent field reads back as all-defaults).
 fn render_build(manifest: &ProjectManifest) -> Option<String> {
-    let driver_default = manifest.driver == ipe_backend_rust::DbDriver::Sqlite;
+    let driver_default = manifest.driver == crate::project::UNDECLARED_DB_DRIVER;
     let static_layer = &manifest.static_request;
     if driver_default && *static_layer == crate::build_plan::StaticRequestLayer::default() {
         return None;
@@ -2143,8 +2149,8 @@ mod tests {
         );
     }
 
-    /// A bare `package.ipe` filename (as `ipe dev build package.ipe` passes it from
-    /// inside the project dir) has an EMPTY parent, not an absolute one. The
+    /// A bare `package.ipe` filename (as a caller passes it from inside the
+    /// project dir) has an EMPTY parent, not an absolute one. The
     /// path-containment root must resolve to the current directory, so a
     /// legitimate in-tree `src/` is accepted rather than refused as an escape.
     #[test]
@@ -2158,7 +2164,7 @@ mod tests {
             format!("{HEADER}package =\n    {{ name = \"bare\" }}\n"),
         )
         .expect("write package.ipe");
-        // `ipe dev build package.ipe` runs with cwd == project root and a bare path.
+        // The caller runs with cwd == project root and a bare path.
         let _guard = CWD_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -2279,14 +2285,15 @@ mod tests {
         let accept_names: Vec<&str> = m.capabilities_accept.iter().map(|c| c.as_str()).collect();
         assert_eq!(accept_names, vec!["unsafe"]);
 
-        assert_eq!(m.wasm.mode.as_deref(), Some("solo"));
-        assert_eq!(m.wasm.entry.as_deref(), Some("src/Client.ipe"));
-        assert_eq!(m.wasm.mount.as_deref(), Some("#app"));
+        let bundle = bundle_of(&m);
+        assert_eq!(bundle.mode, WasmMode::Solo);
+        assert_eq!(bundle.entry.as_deref(), Some("src/Client.ipe"));
+        assert_eq!(bundle.mount.as_deref(), Some("#app"));
         assert_eq!(
-            m.wasm.public_env.to_names(),
+            bundle.public_env.to_names(),
             vec!["API_BASE_URL", "APP_VERSION"]
         );
-        assert_eq!(m.wasm.opt_level.as_deref(), Some("z"));
+        assert_eq!(bundle.opt_level.as_deref(), Some("z"));
     }
 
     #[test]
@@ -2679,7 +2686,7 @@ mod tests {
         )
         .expect("names that only embed a refused name are accepted");
         assert_eq!(
-            m.wasm.public_env.to_names(),
+            bundle_of(&m).public_env.to_names(),
             vec!["TMPDIR_HINT", "TEMPLATE_ID", "HOME_URL", "_X1"]
         );
     }
@@ -2856,7 +2863,7 @@ mod tests {
             ),
         );
         let m = r.expect("allowed env must parse");
-        assert_eq!(m.wasm.public_env.to_names(), vec!["API_BASE_URL"]);
+        assert_eq!(bundle_of(&m).public_env.to_names(), vec!["API_BASE_URL"]);
     }
 
     #[test]
@@ -2866,7 +2873,16 @@ mod tests {
             &format!("{HEADER}package =\n    {{ name = \"x\", wasm = Off }}\n"),
         )
         .expect("Off must parse");
-        assert_eq!(m.wasm, WasmConfig::default());
+        assert_eq!(m.wasm, WasmConfig::Off);
+    }
+
+    /// The bundle of a manifest that declares `wasm = On { … }`.
+    fn bundle_of(m: &ProjectManifest) -> &WasmBundle {
+        let bundle = match &m.wasm {
+            WasmConfig::On(bundle) => Some(bundle),
+            WasmConfig::Off => None,
+        };
+        bundle.expect("the manifest declares an `On` wasm bundle")
     }
 
     #[test]
@@ -2877,7 +2893,64 @@ mod tests {
                 "{HEADER}package =\n    {{ name = \"x\", wasm = On {{ mount = \"#app\" }} }}\n"
             ),
         );
-        assert_rejected(&r);
+        assert!(
+            matches!(
+                &r,
+                Err(CliError::Usage(message))
+                    if message.contains("must set `mode = Solo` or `mode = Hydrate`")
+            ),
+            "a bundle without a mode keeps its refusal: {r:?}"
+        );
+    }
+
+    #[test]
+    fn reject_wasm_unknown_mode() {
+        for mode in ["Off", "Spa"] {
+            let r = read(
+                "reject_wasm_unknown_mode",
+                &format!(
+                    "{HEADER}package =\n    {{ name = \"x\", wasm = On {{ mode = {mode} }} }}\n"
+                ),
+            );
+            assert!(
+                matches!(
+                    &r,
+                    Err(CliError::Usage(message))
+                        if message.contains(&format!(
+                            "`{mode}` is not a wasm mode — use `Solo` or `Hydrate`"
+                        ))
+                ),
+                "mode `{mode}` is refused with the mode diagnostic: {r:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn wasm_render_round_trips_both_modes() {
+        for (name, mode) in [("Solo", WasmMode::Solo), ("Hydrate", WasmMode::Hydrate)] {
+            let m = read(
+                "wasm_render_in",
+                &format!(
+                    "{HEADER}package =\n    {{ name = \"x\", wasm = On {{ mode = {name}, \
+                     entry = \"src/Client.ipe\", mount = \"#app\", \
+                     publicEnv = [ \"API_BASE_URL\" ], optLevel = \"z\" }} }}\n"
+                ),
+            )
+            .expect("an `On` bundle parses");
+            assert_eq!(bundle_of(&m).mode, mode);
+            let rendered = render_manifest_record(&m);
+            assert!(
+                rendered.contains(&format!("mode = {name}")),
+                "the render names the mode: {rendered}"
+            );
+            let reparsed = read("wasm_render_out", &rendered).expect("rendered manifest re-parses");
+            assert_eq!(reparsed.wasm, m.wasm, "the {name} bundle round-trips");
+        }
+    }
+
+    #[test]
+    fn wasm_off_renders_no_field() {
+        assert_eq!(render_wasm(&WasmConfig::Off), None);
     }
 
     // ── programs / exposedModules ─────────────────────────────────────────────

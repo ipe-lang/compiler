@@ -18,6 +18,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use ipe::RootFixture;
 use ipe_ffi::driver::{FfiCache, install_from_inspection};
 
 use crate::support;
@@ -67,18 +68,16 @@ fn seed_nonclone_ffi_cache(project_root: &Path) -> bool {
     install_from_inspection(&cache, &doc.to_string()).is_ok()
 }
 
-/// Write `main` as `src/Main.ipe` under a fresh `dir` whose FFI cache is seeded
-/// with the non-`Clone` `handle-demo` crate. Returns false on any I/O failure.
-pub fn write_project(dir: &Path, main: &str) -> bool {
-    let src = dir.join("src");
-    let _ = fs::remove_dir_all(dir);
-    if fs::create_dir_all(&src).is_err() {
-        return false;
-    }
-    if !seed_nonclone_ffi_cache(dir) {
-        return false;
-    }
-    fs::write(src.join("Main.ipe"), main).is_ok()
+/// A project fixture whose `Main` holds `main` and whose FFI cache is seeded
+/// with the non-`Clone` `handle-demo` crate.
+#[allow(clippy::expect_used)] // fixture-setup failure must fail the seal test loudly
+pub fn ffi_fixture(main: &str) -> RootFixture {
+    let fixture = RootFixture::main(main).expect("the fixture project resolves");
+    assert!(
+        seed_nonclone_ffi_cache(fixture.path()),
+        "must seed the fixture project's FFI cache"
+    );
+    fixture
 }
 
 /// FAIL-CLOSED BACKSTOP: the `w` handle (a non-`Clone` `Rust.Handle_demo.Widget`)
@@ -91,13 +90,11 @@ pub fn write_project(dir: &Path, main: &str) -> bool {
 fn nonclone_handle_reused_fails_closed_before_cargo() {
     let runtime = e2e_support::require_runtime().into_path_buf();
 
-    let tmp = crate::support::scratch_root().join("ipec_ffi_nonclone_handle_reuse");
     // `w` is bound once, then read by TWO `slot_count` calls that both discard
     // the threaded-back receiver and re-use the ORIGINAL `w` — a non-linear use
     // of a non-`Clone` foreign handle. `slot_count` now binds as
     // `Widget -> Result Error (Int, Widget)`; each read drops its `.second`.
-    let wrote = write_project(
-        &tmp,
+    let fixture = ffi_fixture(
         "module Main exposing (main)\n\
          import Ipe.Io as Io\n\
          import Ipe.Result as Result\n\
@@ -115,16 +112,11 @@ fn nonclone_handle_reused_fails_closed_before_cargo() {
          \x20       Ok n -> Io.println (String.fromInt n)\n\
          \x20       Err _ -> Io.println \"err\"\n",
     );
-    assert!(
-        wrote,
-        "must write the fixture project + FFI cache to a temp dir"
-    );
 
-    let entry = tmp.join("src").join("Main.ipe");
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("ffi_nonclone_handle_reuse_out");
     let _ = fs::remove_dir_all(&out);
 
-    let built = ipe::build_loose_file(&entry, &out, &runtime);
+    let built = ipe::build_fixture(&fixture, &out, &runtime);
     let Err(err) = built else {
         panic!(
             "expected IPE-L0130 rejection for reusing a non-`Clone` FFI handle, \
@@ -153,11 +145,9 @@ fn nonclone_handle_reused_fails_closed_before_cargo() {
 fn nonclone_handle_threaded_linearly_builds() {
     let runtime = e2e_support::require_runtime().into_path_buf();
 
-    let tmp = crate::support::scratch_root().join("ipec_ffi_nonclone_handle_thread");
     // Each read consumes the world and hands the RETURNED handle to the next —
     // one linear chain, so the non-`Clone` handle never needs a clone.
-    let wrote = write_project(
-        &tmp,
+    let fixture = ffi_fixture(
         "module Main exposing (main)\n\
          import Ipe.Io as Io\n\
          import Ipe.Result as Result\n\
@@ -176,23 +166,18 @@ fn nonclone_handle_threaded_linearly_builds() {
          \x20       Ok n -> Io.println (String.fromInt n)\n\
          \x20       Err _ -> Io.println \"err\"\n",
     );
-    assert!(
-        wrote,
-        "must write the fixture project + FFI cache to a temp dir"
-    );
 
-    let entry = tmp.join("src").join("Main.ipe");
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("ffi_nonclone_handle_thread_out");
     let _ = fs::remove_dir_all(&out);
 
-    match ipe::build_loose_file(&entry, &out, &runtime) {
-        Ok(()) => {}
+    match ipe::build_fixture(&fixture, &out, &runtime) {
+        Ok(_) => {}
         Err(err) => {
             panic!("linear borrow-threaded handle use must ipe-accept, got: {err}")
         }
     }
 
-    provision_handle_demo(&tmp, &out);
+    provision_handle_demo(fixture.path(), &out);
 
     support::assert_seal_builds("ffi_nonclone_handle_thread", &out);
 }

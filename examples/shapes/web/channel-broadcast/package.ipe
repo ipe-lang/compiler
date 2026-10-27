@@ -9,7 +9,6 @@ package =
     , version = "0.1.0"
     , capabilities =
         { declares = []
-
         -- The `Ipe.Browser.Channel` import discloses `js-port:channel`;
         -- the `:raw` floor is also disclosed. Both must be accepted here or the
         -- build fails closed (IPE-S0002).

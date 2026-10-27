@@ -61,6 +61,7 @@ use ipe_diagnostics::{Located, Span};
 use ipe_intern::{Interner, Symbol};
 use ipe_syntax::{Expr, Expr_, Module, TypeAnnotation, Value};
 
+use crate::cancel::CancelProbe;
 use crate::finding::{Finding, Fix, SigFix};
 
 /// The read-only context every rule shares for one module: its path, its source
@@ -155,44 +156,62 @@ impl Ctx<'_> {
     }
 }
 
+/// One single-module rule: a pure function from a module's context to findings.
+pub type Rule = fn(&Ctx<'_>) -> Vec<Finding>;
+
+/// Every shipped single-module rule, in registry order.
+pub const PER_MODULE_RULES: [Rule; 19] = [
+    prim_param::check,
+    adjacent_bools::check,
+    wrapper_consistency::check,
+    unsafe_convention::check,
+    prefer_pipeline::check,
+    unused_imports::check,
+    unused_bindings::check,
+    no_silent_outline_none::check,
+    no_empty_icon_button_label::check,
+    multiline_lambda_arg::check,
+    no_bool_literal_compare::check,
+    no_redundant_bool_if::check,
+    no_simple_let_body::check,
+    simplify_double_not::check,
+    simplify_map_identity::check,
+    simplify_cons_append::check,
+    no_redundant_cons::check,
+    no_redundant_concat::check,
+    no_missing_type_annotation::check,
+];
+
 /// Run every shipped single-module rule over `ctx`, in registry order.
-pub fn run_all(ctx: &Ctx) -> Vec<Finding> {
+///
+/// `probe` is polled before each rule; once it fires the run stops and returns
+/// its `Cancelled` value, never the findings gathered so far.
+pub fn run_all<P: CancelProbe>(ctx: &Ctx<'_>, probe: &P) -> Result<Vec<Finding>, P::Cancelled> {
     let mut findings = Vec::new();
-    findings.extend(prim_param::check(ctx));
-    findings.extend(adjacent_bools::check(ctx));
-    findings.extend(wrapper_consistency::check(ctx));
-    findings.extend(unsafe_convention::check(ctx));
-    findings.extend(prefer_pipeline::check(ctx));
-    findings.extend(unused_imports::check(ctx));
-    findings.extend(unused_bindings::check(ctx));
-    findings.extend(no_silent_outline_none::check(ctx));
-    findings.extend(no_empty_icon_button_label::check(ctx));
-    findings.extend(multiline_lambda_arg::check(ctx));
-    findings.extend(no_bool_literal_compare::check(ctx));
-    findings.extend(no_redundant_bool_if::check(ctx));
-    findings.extend(no_simple_let_body::check(ctx));
-    findings.extend(simplify_double_not::check(ctx));
-    findings.extend(simplify_map_identity::check(ctx));
-    findings.extend(simplify_cons_append::check(ctx));
-    findings.extend(no_redundant_cons::check(ctx));
-    findings.extend(no_redundant_concat::check(ctx));
-    findings.extend(no_missing_type_annotation::check(ctx));
-    findings
+    for rule in PER_MODULE_RULES {
+        probe.poll()?;
+        findings.extend(rule(ctx));
+    }
+    Ok(findings)
 }
 
 /// True when `expr` is a function application the author wrote.
 ///
 /// The parser spans a source call from its callee through its last argument,
 /// with every child in source order inside it. Desugared calls break that
-/// shape: a `do`-block `x <- task` becomes `Task.andThen (\x -> rest) task`
+/// shape: a `do`-block `x <- task` becomes the `Task.andThen` bind call
 /// spanned on the `<-` token, with the lambda zero-width and the task after it,
 /// and a restamped `do` block carries the `do` keyword's span. Rules that
 /// reason about how a call reads test this before treating a `Call` node as
-/// source.
+/// source. A `do` bind is refused by its [`Expr_::TaskAndThen`] head first, so
+/// the span shape is a second, independent check.
 pub fn is_source_call(expr: &Expr) -> bool {
     let Expr_::Call(callee, args) = &expr.value else {
         return false;
     };
+    if matches!(callee.value, Expr_::TaskAndThen) {
+        return false;
+    }
     if callee.span.lo < expr.span.lo || callee.span.hi <= callee.span.lo {
         return false;
     }
@@ -279,6 +298,7 @@ fn visit_expr(expr: &Expr, f: &mut impl FnMut(&Expr)) {
         }
         Expr_::VarLocal(_)
         | Expr_::VarQual(_, _)
+        | Expr_::TaskAndThen
         | Expr_::Int(_)
         | Expr_::Float(_)
         | Expr_::Str(_)
@@ -302,8 +322,15 @@ pub fn bool_literal(ctx: &Ctx, expr: &Expr) -> Option<bool> {
 
 /// Run cross-module rules that require all modules simultaneously.
 /// Called once per lint run after all per-module passes complete.
-pub fn run_cross_module<'a>(ctxs: &[&'a Ctx<'a>]) -> Vec<Finding> {
-    wrapper_consistency_cross::check_cross(ctxs)
+///
+/// `probe` is polled before each module a cross-module rule aggregates and each
+/// site it emits; once it fires the pass returns its `Cancelled` value, never a
+/// partial finding set.
+pub fn run_cross_module<'a, P: CancelProbe>(
+    ctxs: &[&'a Ctx<'a>],
+    probe: &P,
+) -> Result<Vec<Finding>, P::Cancelled> {
+    wrapper_consistency_cross::check_cross(ctxs, probe)
 }
 
 /// True when `name` appears in the module's `exposing (...)` list (or the list

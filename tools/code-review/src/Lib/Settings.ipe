@@ -1,7 +1,7 @@
-module Lib.Settings exposing (AppSettings, DbLocation, DbRefusal(..), DbRole(..), IndexSettings, brokenLog, dbFileName, dbRefusalOf, encodeFilePath, indexReadUrl, indexWriteUrl, ipeTag, openFailure, parseDbLocation, parseIndexSettings, parseReviewDb, reviewUrl)
+module Lib.Settings exposing (AppSettings, DbRefusal(..), DbRole(..), EnvValue(..), IndexFile, IndexSettings, LogBreak(..), ReviewFile, brokenLog, dbFileName, dbRefusalOf, envFailure, ipeTag, logBreakFix, logBreakProblem, logBreaks, openFailure, parseIndexDb, parseIndexSettings, parseReviewDb, roleVar, valueOr)
 
 import Ipe.Db as Db exposing (DbFailure(..))
-import Ipe.Encoding as Encoding
+import Ipe.Db.Location as Location exposing (DbLocation, Mode(..))
 import Ipe.Error as Error
 import Ipe.File as File
 import Ipe.List as List
@@ -10,25 +10,39 @@ import Ipe.Path as Path exposing (Path)
 import Ipe.Result as Result exposing (Result(..))
 import Ipe.String as String
 import Ipe.Task as Task
+import Lib.EnvLookup as EnvLookup exposing (StartupVar(..))
 import Lib.Epoch exposing (Epoch)
+import Lib.Label as Label
 import Lib.RepoPath as RepoPath exposing (PathError, RootMap, Tag)
 import Lib.ReviewKey exposing (ReviewKey)
 import Lib.SafeText as SafeText exposing (SafeText)
 
 
--- Where a SQLite database lives: an absolute file path. Every accepted
--- spelling of the setting — a plain path, relative or absolute, or a
--- `sqlite://` URL — is parsed into this one form, so no raw URL reaches the
--- driver and the open mode each URL builder appends is the only one it reads.
--- The path always starts with `/`, so the driver never takes it for a
--- `file:` URI or `:memory:`.
-type DbLocation
-    = DbFile Path
+-- The index database: the absolute file a refusal names, and the two typed
+-- locations that open it. `read` (`ReadExisting`) lists and can never create
+-- or modify the file; `write` (`WriteExisting`) drains and never creates it,
+-- so a mistyped location fails instead of draining an empty new database.
+-- Both are built once at startup, so no request re-derives either.
+type alias IndexFile =
+    { path : Path
+    , read : DbLocation
+    , write : DbLocation
+    }
 
 
--- The index configuration, parsed from `IPE_INDEX_DB` and `IPE_INDEX_ROOT`.
+-- The review database: the absolute file a refusal names, and the typed
+-- location that opens it, created on first open (`CreateIfMissing`) — the
+-- app owns it.
+type alias ReviewFile =
+    { path : Path
+    , open : DbLocation
+    }
+
+
+-- The index configuration, parsed from `IPE_INDEX_DB`, `IPE_INDEX_ROOT` and
+-- `IPE_INDEX_REPOS`.
 type alias IndexSettings =
-    { db : DbLocation
+    { db : IndexFile
     , roots : RootMap
     }
 
@@ -41,127 +55,182 @@ type alias IndexSettings =
 -- never enters the model, a session, a view or a log line.
 type alias AppSettings =
     { index : IndexSettings
-    , review : DbLocation
+    , review : ReviewFile
     , key : ReviewKey
     , epoch : Epoch
     }
 
 
 -- The repo tag `IPE_INDEX_ROOT` binds: `ipe`, the tag of ipe-index's default
--- `--repo ipe:.`. It is the only bound tag, so a unit stored under any other
--- tag is refused as `UnknownTag` rather than read from this root.
+-- `--repo ipe:.`. Every other tag is bound by an `IPE_INDEX_REPOS` entry or
+-- not at all: a unit stored under an unbound tag is refused as `UnknownTag`
+-- rather than read from this root.
 ipeTag : Result PathError Tag
 ipeTag =
     RepoPath.parseTag "ipe"
 
 
+-- An optional variable as one read finds it: not set, set to a value, or set
+-- but unreadable (not valid Unicode). Unreadable is never taken for unset, so
+-- a value the operator wrote is never silently replaced by a default.
+type EnvValue
+    = EnvUnset
+    | EnvSet String
+    | EnvUnreadable
+
+
+-- What a failed read of an optional variable means, by the failure's kind:
+-- absence is `EnvUnset`; every other failure is `EnvUnreadable`.
+envFailure : Error -> EnvValue
+envFailure failure =
+    if EnvLookup.isUnset failure then
+        EnvUnset
+
+    else
+        EnvUnreadable
+
+
+-- The value of optional variable `key`, or `fallback` when it is not set. An
+-- unreadable value is refused naming the variable, never its value.
+valueOr : String -> String -> EnvValue -> Task.Task Error String
+valueOr key fallback value =
+    case value of
+        EnvUnset ->
+            Task.succeed fallback
+
+        EnvSet raw ->
+            Task.succeed raw
+
+        EnvUnreadable ->
+            Task.fail (Error.invalidInput (key ++ " is set but could not be read from the environment (it is not valid Unicode); unset it to use " ++ fallback ++ ", or set it to a valid value"))
+
+
 -- The one boundary that turns the index environment's text into typed values.
--- `main` reads `IPE_INDEX_DB` and `IPE_INDEX_ROOT` once at startup and parses
--- them here, so a bad value stops the server before it listens. The value it
--- returns is the one every request reads: no request reads the environment or
--- checks the root again, so a request never serves a tree other than the one
--- startup validated.
-parseIndexSettings : String -> String -> Task.Task Error IndexSettings
-parseIndexSettings rawDb rawRoot =
+-- `main` reads `IPE_INDEX_DB`, `IPE_INDEX_ROOT` and `IPE_INDEX_REPOS` once at
+-- startup and parses them here, so a bad value stops the server before it
+-- listens. `IPE_INDEX_ROOT` binds `ipe`; each `IPE_INDEX_REPOS` entry binds
+-- one more tag, after it in the map. The value it returns is the one every
+-- request reads: no request reads the environment or checks a root again, so
+-- a request never serves a tree other than the one startup validated.
+parseIndexSettings : String -> String -> EnvValue -> Task.Task Error IndexSettings
+parseIndexSettings rawDb rawRoot rawRepos =
     do
-        db <- parseDbLocation "IPE_INDEX_DB" rawDb
+        db <- parseIndexDb rawDb
         root <- RepoPath.parseRoot rawRoot
+        extra <- parseRepoRoots rawRepos
         roots <- ipeTag
-            |> Result.andThen (\tag -> RepoPath.rootMap [ ( tag, root ) ])
-            |> Result.mapError RepoPath.toError
-            |> Task.fromResult
+                    |> Result.andThen (\tag -> RepoPath.rootMap (( tag, root ) :: extra))
+                    |> Result.mapError rootsRefusal
+                    |> Task.fromResult
         Task.succeed { db = db, roots = roots }
 
 
--- The review database location from the raw `IPE_REVIEW_DB` value `main`
--- reads once at startup (`review.db` in the working directory when unset).
-parseReviewDb : String -> Task.Task Error DbLocation
+-- The roots `IPE_INDEX_REPOS` binds: none when it is not set; an unreadable
+-- or malformed value is refused.
+parseRepoRoots : EnvValue -> Task.Task Error (List ( Tag, RepoPath.Root ))
+parseRepoRoots value =
+    case value of
+        EnvUnset ->
+            Task.succeed []
+
+        EnvUnreadable ->
+            Task.fail (RepoPath.reposToError "" RepoPath.ReposUnreadable)
+
+        EnvSet raw ->
+            RepoPath.parseRepos raw
+                |> Task.andThen
+                    (\parsed ->
+                        case parsed of
+                            Ok roots ->
+                                Task.succeed roots
+
+                            Err e ->
+                                Task.fail (RepoPath.reposToError raw e)
+                    )
+
+
+-- A root map refused over the two variables together: a repeated name or
+-- `ipe` again, two names on one directory, or too many roots.
+rootsRefusal : PathError -> Error
+rootsRefusal err =
+    Error.invalidInput
+        (SafeText.toString
+            (SafeText.concat
+                [ SafeText.literal "IPE_INDEX_ROOT and IPE_INDEX_REPOS: "
+                , Label.piecesText (RepoPath.describe err)
+                , SafeText.literal "; bind each repository once, `ipe` through IPE_INDEX_ROOT and every other through one IPE_INDEX_REPOS entry"
+                ]
+            )
+        )
+
+
+-- The index database from the raw `IPE_INDEX_DB` value.
+parseIndexDb : String -> Task.Task Error IndexFile
+parseIndexDb raw =
+    do
+        path <- parseDbFile IndexDbVar raw
+        read <- dbLocation IndexDbVar ReadExisting path
+        write <- dbLocation IndexDbVar WriteExisting path
+        Task.succeed { path = path, read = read, write = write }
+
+
+-- The review database from the raw `IPE_REVIEW_DB` value `main` reads once
+-- at startup (`review.db` in the working directory when unset).
+parseReviewDb : String -> Task.Task Error ReviewFile
 parseReviewDb raw =
-    parseDbLocation "IPE_REVIEW_DB" raw
+    do
+        path <- parseDbFile ReviewDbVar raw
+        open <- dbLocation ReviewDbVar CreateIfMissing path
+        Task.succeed { path = path, open = open }
 
 
--- A file path is refused when blank or when it carries `?`, `#` or `%` (each
--- changes meaning inside a URL), and is otherwise made absolute. A
--- `sqlite://` URL is parsed by `parseSqliteUrl`. Any other URL, and a
--- `sqlite:` or `file:` value without `//`, is refused rather than read as a
--- file of that name. A refusal names the variable, never its value: a
--- mistyped URL can carry a password. Each refusal states its problem and
--- exactly one fix.
-parseDbLocation : String -> String -> Task.Task Error DbLocation
-parseDbLocation var raw =
+-- A database setting is a file path, absolute or relative to the working
+-- directory, made absolute here. Blank is refused, and so is a URL or a
+-- `sqlite:` or `file:` value, rather than read as a file of that name. Every
+-- other byte is literal: the database layer never reads the name as URL
+-- syntax. A refusal names the variable, never its value: a mistyped URL can
+-- carry a password. Each refusal states its problem and exactly one fix.
+parseDbFile : StartupVar -> String -> Task.Task Error Path
+parseDbFile var raw =
     if String.trim raw == "" then
-        Task.fail (Error.invalidInput (dbRefusal var "is empty" dbFix))
+        Task.fail (dbRefusal var "it is empty")
 
-    else if String.startsWith "sqlite://" raw then
-        parseSqliteUrl var (String.dropLeft (String.length "sqlite://") raw)
-
-    else if String.contains "://" raw then
-        Task.fail (Error.invalidInput (dbRefusal var "is a URL that is not `sqlite://`" dbFix))
-
-    else if String.startsWith "sqlite:" raw || String.startsWith "file:" raw then
-        Task.fail (Error.invalidInput (dbRefusal var "is a `sqlite:` or `file:` value without `//`" "write `sqlite:///absolute/path` or a plain file path"))
-
-    else if String.contains "?" raw || String.contains "#" raw || String.contains "%" raw then
-        Task.fail (Error.invalidInput (dbRefusal var "is a file path containing `?`, `#` or `%`" "pass it as a percent-encoded `sqlite://` URL instead"))
+    else if String.contains "://" raw || String.startsWith "sqlite:" raw || String.startsWith "file:" raw then
+        Task.fail (dbRefusal var "it is a URL, not a file path")
 
     else
         RepoPath.absolutize raw
-            |> Task.mapError (\_ -> Error.invalidInput (dbRefusal var "is not a valid file path" dbFix))
+            |> Task.mapError (\_ -> dbRefusal var "it is not a valid file path")
             |> Task.andThen (toDbFile var)
 
 
--- The part of a `sqlite://` URL after the scheme, percent-decoded (RFC 3986,
--- so a `+` stays a `+` and names the same file as the plain path) into an
--- absolute file path. Refused: a query or fragment (a query can set its own
--- `mode`, and the open mode is the app's to choose), a malformed escape, an
--- empty path, and any decoded path not starting with `/` — which covers
--- `:memory:`, a working-directory-relative name, a host, and a nested
--- `file:` or `sqlite:` URI whose own parameters would override the mode.
-parseSqliteUrl : String -> String -> Task.Task Error DbLocation
-parseSqliteUrl var encoded =
-    if String.contains "?" encoded || String.contains "#" encoded then
-        Task.fail (Error.invalidInput (dbRefusal var "is a `sqlite://` URL with a query or fragment" "drop it: the app sets the open mode"))
-
-    else
-        case Encoding.percentDecode encoded of
-            Err _ ->
-                Task.fail (Error.invalidInput (dbRefusal var "is a `sqlite://` URL with a malformed percent-escape" dbFix))
-
-            Ok decoded ->
-                if decoded == "" then
-                    Task.fail (Error.invalidInput (dbRefusal var "is a `sqlite://` URL naming no database" dbFix))
-
-                else if String.startsWith "/" decoded then
-                    Path.fromString decoded
-                        |> Task.fromResult
-                        |> Task.mapError (\_ -> Error.invalidInput (dbRefusal var "is a `sqlite://` URL whose path is not a valid file path" dbFix))
-                        |> Task.andThen (toDbFile var)
-
-                else
-                    Task.fail (Error.invalidInput (dbRefusal var "is a `sqlite://` URL whose path is not absolute" "write `sqlite:///absolute/path`"))
-
-
--- The one step both spellings end in: a cleaned absolute path becomes a
--- `DbLocation` unless it is the root directory itself, which a `..` climbing
--- past `/` cleans to and which can never be a database file.
-toDbFile : String -> Path -> Task.Task Error DbLocation
+-- A cleaned absolute path names a database file unless it is the root
+-- directory itself, which a `..` climbing past `/` cleans to and which can
+-- never be a database file.
+toDbFile : StartupVar -> Path -> Task.Task Error Path
 toDbFile var path =
     if Path.toString path == "/" then
-        Task.fail (Error.invalidInput (dbRefusal var "names the root directory, not a database file" dbFix))
+        Task.fail (dbRefusal var "it names the root directory, not a database file")
 
     else
-        Task.succeed (DbFile path)
+        Task.succeed path
 
 
-dbRefusal : String -> String -> String -> String
-dbRefusal var problem fix =
-    String.concat [ var, " ", problem, "; ", fix ]
+-- `path` opened in `mode`. The database layer refuses a file name it cannot
+-- open as written, such as one holding a `:`; that refusal is reported by
+-- variable name, like every other.
+dbLocation : StartupVar -> Mode -> Path -> Task.Task Error DbLocation
+dbLocation var mode path =
+    Location.file mode path
+        |> Task.fromResult
+        |> Task.mapError (\_ -> dbRefusal var "it is a file path the database cannot open as written, such as one holding a `:`")
 
 
--- The fix for a refusal whose problem names no more specific one.
-dbFix : String
-dbFix =
-    "set it to a SQLite file path or a `sqlite://` URL"
+-- A database setting refused before it names a file: the value is never
+-- repeated, and every such problem has the one fix.
+dbRefusal : StartupVar -> String -> Error
+dbRefusal var problem =
+    EnvLookup.startupRefusal { var = var, file = Nothing, given = Nothing, problem = problem, fix = "set it to the path of a SQLite database file" }
 
 
 -- The database a startup refusal is about, which names its variable and
@@ -185,7 +254,7 @@ type DbRefusal
     | Unusable
 
 
--- The refusal for a failed open or probe of `loc`: whether a file is there
+-- The refusal for a failed open or probe of a database file: whether a file is there
 -- and the `DbFailure` the error carries decide the case. An error that
 -- carries no `DbFailure` is `Unusable`, never a guess at a narrower case.
 dbRefusalOf : Bool -> Error -> DbRefusal
@@ -275,17 +344,17 @@ absentOr present fallback =
         NoDatabaseFile
 
 
--- A parsed location that failed to open or to pass its startup probe,
+-- A parsed database file that failed to open or to pass its startup probe,
 -- refused as one `DbRefusal`: the variable, the resolved file, the problem
--- and one fix, never the driver's own text or code. A parsed location is a
--- plain file path (`parseDbLocation` refuses a URL with a host, credentials
--- or a query), so naming it leaks no secret; it is still quoted, since it
--- came from the environment. A directory at the location is `NotAFile`
--- whatever the driver reported, since no access grant makes it a database.
-openFailure : DbRole -> DbLocation -> Error -> Task.Task Error a
-openFailure role loc e =
-    locationRefusal (locationFile loc) e
-        |> Task.andThen (\refusal -> Task.fail (useRefusal role loc (refusalProblem role refusal)))
+-- and one fix, never the driver's own text or code. A parsed setting is a
+-- plain file path (`parseDbFile` refuses a URL, which can carry
+-- credentials), so naming it leaks no secret; it is still quoted, since it
+-- came from the environment. A directory at the path is `NotAFile` whatever
+-- the driver reported, since no access grant makes it a database.
+openFailure : DbRole -> Path -> Error -> Task.Task Error a
+openFailure role file e =
+    locationRefusal file e
+        |> Task.andThen (\refusal -> Task.fail (useRefusal role file (refusalProblem role refusal)))
 
 
 locationRefusal : Path -> Error -> Task.Task Error DbRefusal
@@ -304,39 +373,70 @@ locationRefusal file e =
             )
 
 
--- A migrated review file that opens and reads but whose log is broken: an
--- append-only trigger gone, or its head row missing. No change of access
--- repairs it, so the fix is a sound copy or a fresh log.
-brokenLog : DbLocation -> String -> Error
-brokenLog loc problem =
-    useRefusal ReviewDb loc ( problem, "restore it from a copy whose log is intact, or point IPE_REVIEW_DB at a new file to start a fresh log" )
+-- How a migrated review file that opens and reads can still have a broken
+-- log: its head row missing, an append-only guard gone, or rows recorded
+-- before unit names were kept. No change of access repairs any of them.
+type LogBreak
+    = HeadMissing
+    | GuardLost
+    | UnnamedRows
 
 
-useRefusal : DbRole -> DbLocation -> ( String, String ) -> Error
-useRefusal role loc ( problem, fix ) =
-    Error.invalidInput
-        (SafeText.toString
-            (SafeText.concat
-                [ SafeText.literal (roleVar role)
-                , SafeText.literal ": cannot use "
-                , SafeText.quoted (locationPath loc)
-                , SafeText.literal ": "
-                , SafeText.literal problem
-                , SafeText.literal "; "
-                , SafeText.literal fix
-                ]
-            )
-        )
+-- Every `LogBreak`, for the checks that cover each one.
+logBreaks : List LogBreak
+logBreaks =
+    [ HeadMissing, GuardLost, UnnamedRows ]
 
 
-roleVar : DbRole -> String
+-- The refusal of a review file whose log is broken in the way `break` names,
+-- with that break's own fix.
+brokenLog : Path -> LogBreak -> Error
+brokenLog file break =
+    useRefusal ReviewDb file ( logBreakProblem break, logBreakFix break )
+
+
+logBreakProblem : LogBreak -> String
+logBreakProblem break =
+    case break of
+        HeadMissing ->
+            "its review log has no single head row"
+
+        GuardLost ->
+            "its review log has lost an append-only trigger, so its decisions could be rewritten unseen"
+
+        UnnamedRows ->
+            "its review log holds decisions recorded before unit names were kept, which this reviewer cannot verify"
+
+
+-- The one fix of each break. A log damaged after it was written can be
+-- restored from a sound copy; a log recorded before names were kept is
+-- refused however intact any copy of it is, so only a fresh log clears it.
+logBreakFix : LogBreak -> String
+logBreakFix break =
+    case break of
+        HeadMissing ->
+            "restore it from a copy whose log is intact, or point IPE_REVIEW_DB at a new file to start a fresh log"
+
+        GuardLost ->
+            "restore it from a copy whose log is intact, or point IPE_REVIEW_DB at a new file to start a fresh log"
+
+        UnnamedRows ->
+            "point IPE_REVIEW_DB at a new file to start a fresh log"
+
+
+useRefusal : DbRole -> Path -> ( String, String ) -> Error
+useRefusal role file ( problem, fix ) =
+    EnvLookup.startupRefusal { var = roleVar role, file = Just file, given = Nothing, problem = problem, fix = fix }
+
+
+roleVar : DbRole -> StartupVar
 roleVar role =
     case role of
         IndexDb ->
-            "IPE_INDEX_DB"
+            IndexDbVar
 
         ReviewDb ->
-            "IPE_REVIEW_DB"
+            ReviewDbVar
 
 
 -- Each refusal's problem and its one fix, per database.
@@ -405,63 +505,7 @@ reviewLogFix =
     "point IPE_REVIEW_DB at the review database this tool created, or at a new file to start a fresh log"
 
 
-locationFile : DbLocation -> Path
-locationFile loc =
-    case loc of
-        DbFile path ->
-            path
-
-
-locationPath : DbLocation -> String
-locationPath loc =
-    case loc of
-        DbFile path ->
-            Path.toString path
-
-
 -- The database file's name without its directory, for display.
-dbFileName : DbLocation -> String
-dbFileName loc =
-    case loc of
-        DbFile path ->
-            Path.base path
-
-
--- The URL for `loc` opened in SQLite `mode`. The path is percent-encoded
--- (`%` first, then `?` and `#`), so a working directory holding any of them
--- still names the same file instead of starting a query or fragment or
--- decoding to another name.
-urlWithMode : String -> DbLocation -> String
-urlWithMode mode loc =
-    case loc of
-        DbFile path ->
-            "sqlite://" ++ encodeFilePath (Path.toString path) ++ "?mode=" ++ mode
-
-
-encodeFilePath : String -> String
-encodeFilePath path =
-    path
-        |> String.replace "%" "%25"
-        |> String.replace "?" "%3F"
-        |> String.replace "#" "%23"
-
-
--- The index opened read-only (`mode=ro`), so listing can never create or
--- modify it.
-indexReadUrl : DbLocation -> String
-indexReadUrl loc =
-    urlWithMode "ro" loc
-
-
--- The index opened read-write (`mode=rw`) for the drain step. `rw` never
--- creates the file, so a mistyped location fails instead of draining an empty
--- new database.
-indexWriteUrl : DbLocation -> String
-indexWriteUrl loc =
-    urlWithMode "rw" loc
-
-
--- The review database, created on first open (`mode=rwc`) — the app owns it.
-reviewUrl : DbLocation -> String
-reviewUrl loc =
-    urlWithMode "rwc" loc
+dbFileName : Path -> String
+dbFileName path =
+    Path.base path

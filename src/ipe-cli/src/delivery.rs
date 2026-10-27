@@ -304,6 +304,25 @@ impl TargetTriple {
     }
 }
 
+/// The host a build asks the emit for.
+///
+/// The webview arm carries a [`WebViewProof`], which only
+/// [`Delivery::host_intent`] mints, so a webview emit always traces back to a
+/// resolved `web desktop` delivery.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HostIntent {
+    /// The served host: every delivery except `web desktop`.
+    Served,
+    /// The webview-native `web desktop` host.
+    WebView(WebViewProof),
+}
+
+/// Proof that a resolved delivery is webview-native.
+///
+/// Its field is private and [`Delivery::host_intent`] is its one constructor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WebViewProof(());
+
 /// A fully-resolved delivery target — a shape, its (web-only) runtime, and a
 /// valid host.
 ///
@@ -351,6 +370,27 @@ impl Delivery {
                 host: Host::Desktop,
             }
         )
+    }
+
+    /// The host this delivery asks the emit for: the webview host exactly when
+    /// [`Self::is_webview_native`].
+    #[must_use]
+    pub const fn host_intent(self) -> HostIntent {
+        if self.is_webview_native() {
+            HostIntent::WebView(WebViewProof(()))
+        } else {
+            HostIntent::Served
+        }
+    }
+
+    /// The `web desktop` delivery, the one the desktop packager ships.
+    #[must_use]
+    pub const fn web_desktop() -> Self {
+        Self {
+            shape: Shape::Web,
+            runtime: Some(Runtime::Served),
+            host: Host::Desktop,
+        }
     }
 
     /// `true` when a static (musl) artifact is admissible for this delivery.
@@ -821,6 +861,44 @@ mod tests {
         assert!(!d.is_webview_native());
         assert!(d.allows_static(), "served is a co-located static target");
         assert_eq!(d.to_string(), "web");
+    }
+
+    #[test]
+    fn host_intent_matches_webview_native() {
+        let shapes = [
+            Shape::Script,
+            Shape::Tui,
+            Shape::Cli,
+            Shape::Worker,
+            Shape::Web,
+        ];
+        let runtimes = [None, Some(Runtime::Served), Some(Runtime::Solo)];
+        let hosts = [Host::Default, Host::Desktop, Host::Ios, Host::Android];
+        let mut webview = Vec::new();
+        for shape in shapes {
+            for runtime in runtimes {
+                for host in hosts {
+                    let Ok(delivery) = Delivery::resolve(shape, runtime, host) else {
+                        continue;
+                    };
+                    let intent = delivery.host_intent();
+                    assert_eq!(
+                        matches!(intent, HostIntent::WebView(_)),
+                        delivery.is_webview_native(),
+                        "{delivery}: {intent:?}"
+                    );
+                    if matches!(intent, HostIntent::WebView(_)) {
+                        webview.push(delivery.to_string());
+                    }
+                }
+            }
+        }
+        webview.dedup();
+        assert_eq!(webview, ["web desktop"]);
+        assert_eq!(
+            Delivery::resolve(Shape::Web, None, Host::Desktop).ok(),
+            Some(Delivery::web_desktop())
+        );
     }
 
     #[test]
