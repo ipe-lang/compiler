@@ -3500,6 +3500,31 @@ fn migration_status_line(mark: &str, name: &str, detail: &str, width: usize) -> 
     line
 }
 
+/// The `migrate` refusal line for a declared migration whose SQL changed after it was applied.
+///
+/// Names only the migration, scrubbed of terminal controls: never the SQL body
+/// (which may carry seed-data literals) nor its hash.
+fn migration_drift_line(name: &str) -> String {
+    format!(
+        "db: migration '{}' changed after it was applied — checksum mismatch",
+        crate::system::scrub_log_controls(name)
+    )
+}
+
+/// The `migrate` summary line naming the migrations just applied, each scrubbed of terminal controls.
+fn migration_applied_line(applied: &[String]) -> String {
+    let names: Vec<std::borrow::Cow<'_, str>> = applied
+        .iter()
+        .map(String::as_str)
+        .map(crate::system::scrub_log_controls)
+        .collect();
+    format!(
+        "db: applied {} migration(s): {}",
+        applied.len(),
+        names.join(", ")
+    )
+}
+
 /// The refusal [`db_migrate_apply`] gives a ledger row with a `NULL` `name` or `checksum`.
 const MIGRATION_LEDGER_NULL_IDENTITY: &str =
     "db.migrate: corrupt _ipe_migrations ledger: a row has a NULL name or checksum";
@@ -3676,9 +3701,7 @@ pub fn db_migrate_apply<E: Send + From<String> + crate::FromIpeError + 'static>(
                     // Drift: error embeds only the app-authored NAME, never the
                     // SQL body (which may carry seed-data literals) nor the hash.
                     if op == "migrate" {
-                        crate::system::write_stderr_line(&format!(
-                            "db: migration '{name}' changed after it was applied — checksum mismatch"
-                        ));
+                        crate::system::write_stderr_line(&migration_drift_line(&name));
                         let _ = std::io::Write::flush(&mut std::io::stderr());
                         // `ipe db migrate` CLI-op boundary: applied migration changed (checksum mismatch), exit non-zero
                         crate::system::exit_process(1);
@@ -3741,11 +3764,7 @@ pub fn db_migrate_apply<E: Send + From<String> + crate::FromIpeError + 'static>(
                     "db: schema already up to date — 0 migrations applied",
                 );
             } else {
-                crate::system::write_stdout_line(&format!(
-                    "db: applied {} migration(s): {}",
-                    out.len(),
-                    out.join(", ")
-                ));
+                crate::system::write_stdout_line(&migration_applied_line(&out));
             }
             let _ = std::io::Write::flush(&mut std::io::stdout());
             // `ipe db migrate` CLI-op boundary: migrations applied, exit zero
@@ -8180,6 +8199,19 @@ mod tests {
             2 + 1 + 2 + 70_005 + 2 + "pending".len()
         );
         assert!(line.ends_with(&format!("{}  pending", " ".repeat(5))));
+    }
+
+    #[test]
+    fn migration_drift_and_applied_lines_escape_terminal_controls() {
+        let name = "seed\u{1b}[2J";
+        assert_eq!(
+            super::migration_drift_line(name),
+            "db: migration 'seed\\u{1b}[2J' changed after it was applied — checksum mismatch"
+        );
+        assert_eq!(
+            super::migration_applied_line(&["init".to_owned(), name.to_owned()]),
+            "db: applied 2 migration(s): init, seed\\u{1b}[2J"
+        );
     }
 
     #[test]

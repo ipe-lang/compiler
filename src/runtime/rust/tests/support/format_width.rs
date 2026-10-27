@@ -58,7 +58,7 @@ pub fn width_arguments(fmt: &str) -> Vec<String> {
                     name.to_owned()
                 });
             }
-            if c.is_ascii_alphanumeric() || c == '_' {
+            if c.is_alphanumeric() || c == '_' {
                 run.push(c);
             } else {
                 run.clear();

@@ -95,6 +95,7 @@ fn placeholders_are_read_the_way_the_formatter_reads_them() {
     assert_eq!(width_arguments("{:$>w$}"), vec!["w"]);
     assert_eq!(width_arguments("{x:0w$.p$}"), vec!["w", "p"]);
     assert_eq!(width_arguments("{:05$}"), vec!["05"]);
+    assert_eq!(width_arguments("{:wé$}"), vec!["wé"]);
     assert_eq!(width_arguments("{{:w$}} {:<8}"), Vec::<String>::new());
     assert_eq!(width_arguments("${x} {y}"), Vec::<String>::new());
 }
