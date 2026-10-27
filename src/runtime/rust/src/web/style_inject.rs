@@ -125,25 +125,33 @@ impl StyleBlock {
     }
 }
 
-/// Run every style-marker pass over the tree in  fixed order. Call
-/// immediately after `assign_ipe_ids`, on the SAME tree that becomes both the
-/// render output AND the diff baseline (applied before render + before
-/// storing the tree, so the diff compares two already-injected trees and never
-/// sees a marker-attr-vs-style-child asymmetry → no spurious replace).
-/// Hard recursion-depth bound for the style-injection tree walk — same rationale
-/// and value as html's MAX_HTML_DEPTH: a deeply-nested (attacker-influenced) tree
-/// would overflow the thread stack. Past the cap we stop descending (deeper nodes
-/// keep their markers) rather than abort the process.
+/// Hard recursion-depth bound for the style-injection tree walk.
+///
+/// Same rationale and value as html's `MAX_HTML_DEPTH`: a deeply-nested
+/// (attacker-influenced) tree would overflow the thread stack. Past the cap the
+/// walk stops descending (deeper nodes keep their markers) rather than abort
+/// the process.
 const MAX_STYLE_DEPTH: usize = 1024;
 
+/// Build every kind's scoped `<style>` block over the tree in one walk.
+///
+/// Call immediately after `assign_ipe_ids`, on the SAME tree that becomes both
+/// the render output AND the diff baseline (applied before render + before
+/// storing the tree, so the diff compares two already-injected trees and never
+/// sees a marker-attr-vs-style-child asymmetry → no spurious replace).
+///
+/// The walk visits each element once and builds all of its blocks from the
+/// [`StyleBlock::ALL`] table, so its cost does not grow with the number of
+/// kinds. Each kind reads and strips only its own markers, so one element's
+/// blocks are independent of each other, and placing them in reverse `ALL`
+/// order (the last kind's block first) yields the same tree as one walk per
+/// kind run in `ALL` order.
 pub fn apply_style_injections<M>(node: &mut Html<M>) {
-    for kind in StyleBlock::ALL {
-        inject_pass(node, kind, 0);
-    }
+    inject_pass(node, 0);
     // An element that takes no style child (void, or value-bearing
     // textarea/select) at the TREE ROOT is never self-handled (inject_pass skips
     // its self-build) and has no parent to hoist a sibling <style> after it. Its
-    // markers would therefore survive every pass and leak as inert data-* attrs,
+    // markers would therefore survive the walk and leak as inert data-* attrs,
     // breaking the post-condition. Strip them here. The CSS is necessarily
     // dropped — such a root has nowhere to carry a <style> node. (The same node
     // WITH a parent is unaffected: the parent's loop still finds its markers
@@ -157,10 +165,12 @@ pub fn apply_style_injections<M>(node: &mut Html<M>) {
     }
 }
 
-/// One style-injection pass over a subtree: self-handle (non-void prepends a
-/// style child), then walk children splicing a sibling `<style>` after any void
-/// child whose marker survived (the void child's own self-handler bails).
-fn inject_pass<M>(node: &mut Html<M>, kind: StyleBlock, depth: usize) {
+/// The style-injection walk over a subtree.
+///
+/// A style-child-bearing element prepends its own blocks; a child that takes no
+/// style child of its own gets its blocks hoisted into the sibling slots right
+/// after it (its own self-build is skipped).
+fn inject_pass<M>(node: &mut Html<M>, depth: usize) {
     // Stack-overflow guard: stop descending a pathologically deep tree (deeper
     // nodes keep their markers — a truncated injection beats a process abort).
     if depth >= MAX_STYLE_DEPTH {
@@ -170,30 +180,54 @@ fn inject_pass<M>(node: &mut Html<M>, kind: StyleBlock, depth: usize) {
         Html::HElement(t, a, k) => (t, a, k),
         _ => return,
     };
-    // Style-child-bearing self: build + prepend the style child (build_style_node
-    // strips the markers regardless of outcome). Elements that take no style child
-    // (void, or value-bearing textarea/select) are hoisted by the parent below.
-    if !takes_no_style_child(tag)
-        && let Some(style) = build_style_node(attrs, kind)
-    {
-        kids.insert(0, style);
-    }
-    // Walk children, recursing into each and hoisting a sibling style block
-    // after any child that can't take a style child of its own but still
-    // carries a marker.
+    // Style-child-bearing self: build + prepend the style children
+    // (build_style_node strips the markers regardless of outcome). Elements
+    // that take no style child (void, or value-bearing textarea/select) are
+    // hoisted by the parent below.
+    let own = if takes_no_style_child(tag) {
+        no_style_blocks()
+    } else {
+        build_style_blocks(attrs)
+    };
     let mut out: Vec<Html<M>> = Vec::with_capacity(kids.len());
+    out.extend(own.into_iter().rev().flatten());
     for mut child in std::mem::take(kids) {
-        inject_pass(&mut child, kind, depth + 1);
-        let hoist = match &mut child {
-            Html::HElement(ct, ca, _) if takes_no_style_child(ct) => build_style_node(ca, kind),
-            _ => None,
+        inject_pass(&mut child, depth + 1);
+        let hoisted = match &mut child {
+            Html::HElement(ct, ca, _) if takes_no_style_child(ct) => build_style_blocks(ca),
+            _ => no_style_blocks(),
         };
         out.push(child);
-        if let Some(h) = hoist {
-            out.push(h);
-        }
+        out.extend(hoisted.into_iter().rev().flatten());
     }
     *kids = out;
+}
+
+/// One optional block per kind, slotted in [`StyleBlock::ALL`] order.
+type StyleBlocks<M> = [Option<Html<M>>; StyleBlock::ALL.len()];
+
+/// The block slots of an element that builds no block.
+const fn no_style_blocks<M>() -> StyleBlocks<M> {
+    [None, None, None, None]
+}
+
+/// Build every kind's block for one element and strip every marker it holds.
+///
+/// An element holding no marker key of any kind (the common case) builds
+/// nothing and has nothing to strip, so it costs one scan of its attrs.
+fn build_style_blocks<M>(attrs: &mut Vec<Attribute<M>>) -> StyleBlocks<M> {
+    if !has_marker_key(attrs) {
+        return no_style_blocks();
+    }
+    StyleBlock::ALL.map(|kind| build_style_node(attrs, kind))
+}
+
+/// True when `attrs` holds any kind's marker key, empty-valued included.
+fn has_marker_key<M>(attrs: &[Attribute<M>]) -> bool {
+    attrs.iter().any(|a| {
+        matches!(a, Attribute::Attr(k, _)
+            if StyleBlock::ALL.iter().any(|kind| kind.markers().contains(&k.as_str())))
+    })
 }
 
 /// Build the `<style>` node for an element's markers and strip those markers
@@ -1513,5 +1547,232 @@ mod tests {
                 "{id}"
             );
         }
+    }
+
+    /// The tree one walk per kind builds, in `ALL` order: the reference the
+    /// fused walk must reproduce byte for byte.
+    fn reference_apply(node: &mut Html<()>) {
+        for kind in StyleBlock::ALL {
+            reference_pass(node, kind, 0);
+        }
+        if let Html::HElement(t, attrs, _) = node
+            && takes_no_style_child(t)
+        {
+            for kind in StyleBlock::ALL {
+                strip_markers(attrs, kind.markers());
+            }
+        }
+    }
+
+    /// One kind's walk: prepend the element's own block, hoist a block after
+    /// each child that takes no style child.
+    fn reference_pass(node: &mut Html<()>, kind: StyleBlock, depth: usize) {
+        if depth >= MAX_STYLE_DEPTH {
+            return;
+        }
+        let Html::HElement(tag, attrs, kids) = node else {
+            return;
+        };
+        if !takes_no_style_child(tag)
+            && let Some(style) = build_style_node(attrs, kind)
+        {
+            kids.insert(0, style);
+        }
+        let mut out = Vec::with_capacity(kids.len());
+        for mut child in std::mem::take(kids) {
+            reference_pass(&mut child, kind, depth + 1);
+            let hoist = match &mut child {
+                Html::HElement(ct, ca, _) if takes_no_style_child(ct) => build_style_node(ca, kind),
+                _ => None,
+            };
+            out.push(child);
+            out.extend(hoist);
+        }
+        *kids = out;
+    }
+
+    /// Inject `tree` with the fused walk and with the reference.
+    ///
+    /// Both must render the same bytes and be the same tree; the fused tree is
+    /// returned.
+    fn fused_matches_reference(tree: &Html<()>) -> Html<()> {
+        use crate::html::render_html;
+        let mut fused = tree.clone();
+        apply_style_injections(&mut fused);
+        let mut reference = tree.clone();
+        reference_apply(&mut reference);
+        assert_eq!(render_html(&fused), render_html(&reference));
+        assert_eq!(fused, reference);
+        fused
+    }
+
+    type Markers = &'static [(&'static str, &'static str)];
+
+    const MQ: Markers = &[
+        ("data-ipe-mq-q", "(min-width: 768px)"),
+        ("data-ipe-mq-rules", "color:red"),
+    ];
+    const PC: Markers = &[("data-ipe-pc-rules", "h|color: blue||f|outline: none")];
+    const TR: Markers = &[
+        ("data-ipe-tr-rules", "color 200ms"),
+        ("data-ipe-tr-respect", "0"),
+    ];
+    const ANIM: Markers = &[(
+        "data-ipe-anim-rules",
+        "spin||300ms ease||0% { opacity: 0 } 100% { opacity: 1 }||1",
+    )];
+    const ALL_KINDS: [Markers; 4] = [MQ, PC, TR, ANIM];
+    const EMPTY_MQ_RULES: Markers = &[
+        ("data-ipe-mq-q", "(min-width: 1px)"),
+        ("data-ipe-mq-rules", ""),
+    ];
+    const REFUSED_MQ_QUERY: Markers = &[
+        ("data-ipe-mq-q", "(x){"),
+        ("data-ipe-mq-rules", "color:red"),
+    ];
+
+    /// An element with an optional `ipe-id`, the given marker groups and kids.
+    fn marked(tag: &str, id: Option<&str>, groups: &[Markers], kids: Vec<Html<()>>) -> Html<()> {
+        let mut attrs: Vec<Attribute<()>> = id.map(|i| attr("ipe-id", i)).into_iter().collect();
+        attrs.extend(
+            groups
+                .iter()
+                .flat_map(|g| g.iter().map(|(k, v)| attr(k, v))),
+        );
+        Html::HElement(tag.to_string(), attrs, kids)
+    }
+
+    /// A tree carrying every kind, nested, repeated and hoisted.
+    ///
+    /// It also drives each branch that builds no block: an empty marker, no
+    /// `ipe-id`, a forged `ipe-id`, and CSS the sink refuses.
+    fn representative_tree() -> Html<()> {
+        let rows = vec![
+            marked("li", Some("r_2_ul_0_li"), &[PC, TR], vec![]),
+            marked("li", Some("r_2_ul_1_li"), &[EMPTY_MQ_RULES], vec![]),
+            marked("li", Some("r_2_ul_2_li"), &[PC, TR], vec![]),
+        ];
+        let options = vec![marked("option", Some("r_3_select_0_option"), &[PC], vec![])];
+        marked(
+            "div",
+            Some("r"),
+            &ALL_KINDS,
+            vec![
+                Html::HText("lead".to_string()),
+                marked("input", Some("r_1_input"), &ALL_KINDS, vec![]),
+                marked("ul", Some("r_2_ul"), &[], rows),
+                marked("select", Some("r_3_select"), &[PC, ANIM], options),
+                marked("textarea", Some("r_4_textarea"), &[TR], vec![]),
+                marked("span", None, &[PC], vec![]),
+                marked("button", Some("a]"), &[PC, MQ], vec![]),
+                marked("div", Some("r_7_div"), &[REFUSED_MQ_QUERY], vec![]),
+                marked("input", Some("r_8_input"), &[MQ, ANIM], vec![]),
+                marked("img", Some("r_9_img"), &[], vec![]),
+                Html::HRaw("<b>raw</b>".to_string()),
+            ],
+        )
+    }
+
+    fn leaks_marker(n: &Html<()>) -> bool {
+        match n {
+            Html::HElement(_, attrs, kids) => {
+                has_marker_key(attrs) || kids.iter().any(leaks_marker)
+            }
+            _ => false,
+        }
+    }
+
+    /// The fused walk builds the same tree as one walk per kind on a tree that
+    /// carries every kind, and that tree holds every block it should.
+    #[test]
+    fn fused_walk_matches_one_walk_per_kind_on_a_representative_tree() {
+        let fused = fused_matches_reference(&representative_tree());
+        assert_eq!(count_styles(&fused), 18, "{fused:?}");
+        assert!(!leaks_marker(&fused), "{fused:?}");
+        let Html::HElement(_, _, kids) = &fused else {
+            assert!(matches!(fused, Html::HElement(..)), "{fused:?}");
+            return;
+        };
+        let leading: Vec<Option<String>> = kids
+            .iter()
+            .take(7)
+            .map(|k| match k {
+                Html::HElement(_, a, _) => attr_get(a, "ipe-id"),
+                _ => None,
+            })
+            .collect();
+        let expected = [
+            Some("r_anim"),
+            Some("r_tr"),
+            Some("r_pc"),
+            Some("r_mq"),
+            None,
+            Some("r_1_input"),
+            Some("r_1_input_anim"),
+        ];
+        assert_eq!(
+            leading.iter().map(Option::as_deref).collect::<Vec<_>>(),
+            expected,
+            "own blocks lead in reverse kind order, hoisted ones follow their owner"
+        );
+    }
+
+    /// An already-injected tree is left as it is, by both walks.
+    #[test]
+    fn fused_walk_matches_one_walk_per_kind_on_an_injected_tree() {
+        let once = fused_matches_reference(&representative_tree());
+        let twice = fused_matches_reference(&once);
+        assert_eq!(twice, once);
+    }
+
+    /// Roots that take no style child lose their markers; empty or
+    /// marker-free roots stay as they are.
+    #[test]
+    fn fused_walk_matches_one_walk_per_kind_at_the_root() {
+        let opt = marked("option", Some("r_0_option"), &[PC], vec![]);
+        let roots = [
+            marked("input", Some("r"), &ALL_KINDS, vec![]),
+            marked(
+                "textarea",
+                Some("r"),
+                &ALL_KINDS,
+                vec![Html::HText("v".to_string())],
+            ),
+            marked("select", Some("r"), &[TR], vec![opt]),
+            marked("div", Some("r"), &[], vec![]),
+            marked("div", None, &[], vec![]),
+            Html::HElement(
+                "div".to_string(),
+                vec![
+                    Attribute::BoolAttr("hidden".to_string(), true),
+                    Attribute::NoAttr,
+                ],
+                vec![],
+            ),
+            Html::HText("text".to_string()),
+            Html::HRaw(String::new()),
+        ];
+        for root in &roots {
+            let fused = fused_matches_reference(root);
+            assert!(!leaks_marker(&fused), "{fused:?}");
+        }
+    }
+
+    /// Past the depth cap both walks stop descending, and the deeper markers
+    /// stay where they are.
+    #[test]
+    fn fused_walk_matches_one_walk_per_kind_past_the_depth_cap() {
+        let mut node = marked("input", Some("leaf"), &[PC, TR], vec![]);
+        for d in (0..MAX_STYLE_DEPTH + 2).rev() {
+            let id = format!("r{d}");
+            node = marked("div", Some(&id), &[PC, MQ], vec![node]);
+        }
+        let fused = fused_matches_reference(&node);
+        assert_eq!(
+            count_styles(&fused),
+            2 * MAX_STYLE_DEPTH,
+            "one pc and one mq block per walked div"
+        );
+        assert!(leaks_marker(&fused), "markers below the cap stay");
     }
 }
