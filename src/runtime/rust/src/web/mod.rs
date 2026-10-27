@@ -20892,10 +20892,14 @@ mod base_sink_escape_tests {
     /// bracket from `HOSTILE` survived unescaped.
     fn inert(tag: &str, open: &str) -> bool {
         let brackets = if open == "<script" { 2 } else { 1 };
+        let inside = tag
+            .strip_suffix("></script>")
+            .or_else(|| tag.strip_suffix('>'))
+            .unwrap_or(tag);
         tag.matches('<').count() == brackets
             && tag.starts_with(open)
             && !tag.contains("<img")
-            && !tag.contains("\"><")
+            && !inside.contains("\"><")
     }
 
     #[test]
