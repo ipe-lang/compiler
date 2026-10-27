@@ -11,6 +11,7 @@
 //! otherwise. A backend that receives a [`Program`] never has to re-check
 //! exhaustiveness.
 
+mod alpha;
 pub mod borrow;
 mod carrier;
 mod enum_facts;
@@ -26,6 +27,7 @@ pub mod record_shapes;
 pub mod seq_clone;
 mod show_policy;
 
+pub use alpha::alpha_equivalent_fields;
 pub use borrow::{Param, ParamPass};
 pub use carrier::wants_arc_ctor;
 pub use enum_facts::{
