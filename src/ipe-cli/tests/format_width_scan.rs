@@ -21,6 +21,7 @@ mod format_width;
 use format_width::{runtime_widths, width_arguments};
 
 #[test]
+#[allow(clippy::literal_string_with_formatting_args)] // the fixture spells placeholders as data
 fn a_width_a_local_decides_is_caught() {
     let src = r#"
 fn production(term_width: usize, term: &str) -> String {
@@ -32,6 +33,7 @@ fn production(term_width: usize, term: &str) -> String {
 }
 
 #[test]
+#[allow(clippy::literal_string_with_formatting_args)] // the fixture spells placeholders as data
 fn a_const_width_is_admitted() {
     let src = r#"
 fn production() -> String {
