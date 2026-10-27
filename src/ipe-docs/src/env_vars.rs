@@ -215,17 +215,17 @@ static HAND_TABLE: &[EnvVar] = &[
     EnvVar {
         name: "IPE_BUILD_CACHE",
         default: Cow::Borrowed("on"),
-        purpose: "Set to `0`, `off`, or `false` to disable the incremental build cache. \
-                  Default is on; the cache directory is `<out>/.ipe-cache/<per-user salt>` unless \
-                  `IPE_BUILD_CACHE_DIR` is set.",
+        purpose: "`1`, `on`, `true` keep the incremental build cache on (the default); \
+                  `0`, `off`, `false` turn it off; any other value, the empty one included, \
+                  is refused.",
         subsystem: Subsystem::Build,
         class: Class::Tunable,
     },
     EnvVar {
         name: "IPE_BUILD_CACHE_DIR",
         default: Cow::Borrowed("unset (<out>/.ipe-cache/<per-user salt>)"),
-        purpose: "Explicit path for the incremental build cache directory. Takes effect \
-                  only when the cache is enabled (`IPE_BUILD_CACHE` not `off`).",
+        purpose: "Absolute path of the incremental build cache directory, used while the \
+                  cache is on; a relative or empty value is refused, the cache on or off.",
         subsystem: Subsystem::Build,
         class: Class::Tunable,
     },

@@ -112,12 +112,26 @@ pub enum CliError {
     /// nor the home (`HOME`, or `USERPROFILE` on Windows) names an absolute path. Refused rather than falling back to a
     /// directory relative to the current working directory.
     CacheHomeUnknown,
-    /// An explicit directory override (`IPE_INDEX_DIR`, `IPE_HOME`) is set but is
+    /// An explicit directory override (`IPE_INDEX_DIR`, `IPE_HOME`,
+    /// `IPE_BUILD_CACHE_DIR`) is set but is
     /// not an absolute path. Refused rather than resolved against the current
     /// working directory or silently replaced by the default location.
     EnvDirNotAbsolute {
         /// The environment variable carrying the refused value.
         var: &'static str,
+    },
+    /// A switch environment variable is set outside its spellings.
+    ///
+    /// `IPE_BUILD_CACHE` admits a closed spelling set; any other set value,
+    /// the empty and the non-UTF-8 value included, is refused rather than
+    /// read as the default.
+    EnvSwitchNotRecognised {
+        /// The environment variable carrying the refused value.
+        var: &'static str,
+        /// The refused value, rendered lossily and sanitised.
+        got: TerminalSafe,
+        /// Every spelling the variable admits.
+        admitted: Vec<&'static str>,
     },
     /// Writing the embedded runtime source to `<IPE_HOME>/runtime/<version>/rust`
     /// failed (disk full, permission denied, or a drifted embed). This is a
@@ -774,6 +788,7 @@ impl CliError {
             Self::RuntimeHomeUnknown => "runtime-home-unknown",
             Self::CacheHomeUnknown => "cache-home-unknown",
             Self::EnvDirNotAbsolute { .. } => "env-dir-not-absolute",
+            Self::EnvSwitchNotRecognised { .. } => "env-switch-not-recognised",
             Self::RuntimeMaterializeFailed { .. } => "runtime-materialize-failed",
             Self::RuntimeVersionMismatch { .. } => "runtime-version-mismatch",
             Self::EmittedBuildFailed { .. } => "emitted-build-failed",
@@ -879,6 +894,7 @@ impl CliError {
             | Self::RuntimeHomeUnknown
             | Self::CacheHomeUnknown
             | Self::EnvDirNotAbsolute { .. }
+            | Self::EnvSwitchNotRecognised { .. }
             | Self::RuntimeMaterializeFailed { .. }
             | Self::UnknownCode { .. }
             | Self::DocNotFound { .. }
@@ -1012,6 +1028,9 @@ impl std::fmt::Display for CliError {
             Self::RuntimeNotFound => f.write_str(text::cli_runtime_not_found()),
             Self::CacheHomeUnknown => f.write_str(text::cli_cache_home_unknown()),
             Self::EnvDirNotAbsolute { var } => f.write_str(&text::cli_env_dir_not_absolute(var)),
+            Self::EnvSwitchNotRecognised { var, got, admitted } => f.write_str(
+                &text::cli_env_switch_not_recognised(var, got, &admitted.join(", ")),
+            ),
             Self::RuntimeDirInvalid { .. }
             | Self::RuntimeHomeUnknown
             | Self::RuntimeMaterializeFailed { .. }

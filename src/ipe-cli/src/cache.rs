@@ -105,6 +105,7 @@
 //! build failure.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -1059,10 +1060,111 @@ fn read_below(dir: &HeldDir, parts: &[&str], cap: u64) -> Option<Vec<u8>> {
     dir.open_rel(&names).ok()?.read_bytes(cap).ok()
 }
 
+/// The variable that switches the build cache on or off.
+const CACHE_SWITCH_VAR: &str = "IPE_BUILD_CACHE";
+
+/// The variable naming an explicit build-cache directory.
+const CACHE_DIR_VAR: &str = "IPE_BUILD_CACHE_DIR";
+
+/// Whether the build cache is on, as `IPE_BUILD_CACHE` names it.
+///
+/// Unset means [`BuildCacheSwitch::On`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BuildCacheSwitch {
+    /// The cache is read and written.
+    On,
+    /// No cache is read or written.
+    Off,
+}
+
+/// Every admitted spelling of `IPE_BUILD_CACHE` and the switch it names.
+///
+/// The table is the whole grammar: a match is exact (no case folding, no
+/// trimming), and a set value outside it is refused.
+const BUILD_CACHE_SPELLINGS: &[(&str, BuildCacheSwitch)] = &[
+    ("1", BuildCacheSwitch::On),
+    ("on", BuildCacheSwitch::On),
+    ("true", BuildCacheSwitch::On),
+    ("0", BuildCacheSwitch::Off),
+    ("off", BuildCacheSwitch::Off),
+    ("false", BuildCacheSwitch::Off),
+];
+
+impl BuildCacheSwitch {
+    /// The switch a raw `IPE_BUILD_CACHE` value names; unset is `On`.
+    ///
+    /// # Errors
+    /// [`crate::CliError::EnvSwitchNotRecognised`] for a set value outside
+    /// [`BUILD_CACHE_SPELLINGS`], the empty and the non-UTF-8 value included.
+    fn parse(raw: Option<&OsStr>) -> Result<Self, crate::CliError> {
+        let Some(raw) = raw else {
+            return Ok(Self::On);
+        };
+        BUILD_CACHE_SPELLINGS
+            .iter()
+            .find(|(spelling, _)| raw == OsStr::new(spelling))
+            .map(|&(_, switch)| switch)
+            .ok_or_else(|| crate::CliError::EnvSwitchNotRecognised {
+                var: CACHE_SWITCH_VAR,
+                got: crate::style::TerminalSafe::sanitize(&raw.to_string_lossy()),
+                admitted: BUILD_CACHE_SPELLINGS
+                    .iter()
+                    .map(|&(spelling, _)| spelling)
+                    .collect(),
+            })
+    }
+}
+
+/// What the environment asks of the build cache, parsed once.
+#[derive(Debug, PartialEq, Eq)]
+struct CacheRequest {
+    /// Whether the cache is on.
+    switch: BuildCacheSwitch,
+    /// The absolute directory `IPE_BUILD_CACHE_DIR` names, when set.
+    dir: Option<PathBuf>,
+}
+
+impl CacheRequest {
+    /// The request the process environment makes.
+    fn from_env() -> Result<Self, crate::CliError> {
+        Self::parse(
+            ipe_env::var_os(CACHE_SWITCH_VAR).as_deref(),
+            ipe_env::var_os(CACHE_DIR_VAR),
+        )
+    }
+
+    /// The request the raw switch and directory values make.
+    ///
+    /// Both are parsed whatever the switch says: a set directory must be
+    /// absolute even while the cache is off.
+    ///
+    /// # Errors
+    /// [`crate::CliError::EnvSwitchNotRecognised`] for a switch outside its
+    /// spellings; [`crate::CliError::EnvDirNotAbsolute`] for a set directory
+    /// (empty included) that is not an absolute path.
+    fn parse(switch: Option<&OsStr>, dir: Option<OsString>) -> Result<Self, crate::CliError> {
+        Ok(Self {
+            switch: BuildCacheSwitch::parse(switch)?,
+            dir: crate::env_dir::explicit_override(CACHE_DIR_VAR, dir)?,
+        })
+    }
+
+    /// The cache site this request names for a build writing to `out_dir`.
+    fn site(self, out_dir: &Path) -> Option<CacheSite> {
+        match (self.switch, self.dir) {
+            (BuildCacheSwitch::Off, _) => None,
+            (BuildCacheSwitch::On, Some(dir)) => Some(CacheSite::Explicit(dir)),
+            (BuildCacheSwitch::On, None) => default_cache_site(out_dir),
+        }
+    }
+}
+
 /// The cache site for a build writing to `out_dir`.
 ///
-/// - `IPE_BUILD_CACHE=0` (also `off` / `false`) disables the cache entirely.
-/// - `IPE_BUILD_CACHE_DIR=<path>` overrides the default location.
+/// - `IPE_BUILD_CACHE` set to `0`, `off` or `false` disables the cache; `1`,
+///   `on`, `true` or unset leaves it on; any other value is refused.
+/// - `IPE_BUILD_CACHE_DIR=<absolute path>` overrides the default location; a
+///   relative or empty value is refused, the cache on or off.
 /// - Otherwise: `<out_dir>/.ipe-cache/<user salt>`, colocated with the build
 ///   output so removing it also resets the cache.
 ///
@@ -1071,18 +1173,12 @@ fn read_below(dir: &HeldDir, parts: &[&str], cap: u64) -> Option<Vec<u8>> {
 /// inside a force-added `out/` sits under a name this user never reads, and can
 /// never substitute the Rust built from the sources. No salt (no resolvable
 /// `IPE_HOME`) disables the default cache.
-#[must_use]
-pub fn env_cache_dir(out_dir: &Path) -> Option<CacheSite> {
-    if matches!(
-        ipe_env::var("IPE_BUILD_CACHE").as_deref(),
-        Ok("0" | "off" | "false")
-    ) {
-        return None;
-    }
-    if let Ok(dir) = ipe_env::var("IPE_BUILD_CACHE_DIR") {
-        return Some(CacheSite::Explicit(PathBuf::from(dir)));
-    }
-    default_cache_site(out_dir)
+///
+/// # Errors
+/// [`crate::CliError::EnvSwitchNotRecognised`] or
+/// [`crate::CliError::EnvDirNotAbsolute`] when either variable is malformed.
+pub fn env_cache_dir(out_dir: &Path) -> Result<Option<CacheSite>, crate::CliError> {
+    Ok(CacheRequest::from_env()?.site(out_dir))
 }
 
 /// `<out_dir>/.ipe-cache/<user salt>`, or `None` when no salt is available.
@@ -1217,7 +1313,6 @@ fn create_salt(dir: &OwnerDir, name: &EntryName) -> Option<String> {
 fn write_entry(cache_root: &Path, epoch: &str, file_name: &str, bytes: &[u8]) {
     use crate::output_dir::held::{HeldDir, level_held};
     use ipe_fs_open::is_one_spelled_name;
-    use std::ffi::OsStr;
     use std::io::Write as _;
     if !is_one_spelled_name(OsStr::new(epoch))
         || !is_one_spelled_name(OsStr::new(file_name))
@@ -2117,12 +2212,9 @@ mod tests {
 
     #[test]
     fn env_cache_dir_respects_disable_and_override() {
-        // Pure-function shape avoided here on purpose: `env_cache_dir` reads
-        // process env, so this test only checks the UNSET default (the
-        // env-mutation cases are exercised end-to-end in
-        // `crates/ipe/src/lib.rs`'s cache integration tests via the
-        // explicit-cache-dir seam, never via `std::env::set_var` — see that
-        // module's doc for why).
+        // The variables' grammar is driven through `CacheRequest::parse` on raw
+        // values, never through `std::env::set_var`; this test checks the
+        // default site an unset environment yields.
         let out_dir = Path::new("/tmp/ipe-cache-dir-does-not-need-to-exist");
         let default = default_cache_site(out_dir);
         // The default sits under `<out>/.ipe-cache/` in a partition named by
@@ -2141,6 +2233,203 @@ mod tests {
                 "the default is `<out>/.ipe-cache/<hex salt>`, got {site:?}"
             );
         }
+    }
+
+    /// Whether `result` is the `IPE_BUILD_CACHE` spelling refusal.
+    fn is_switch_refusal(result: &Result<BuildCacheSwitch, crate::CliError>) -> bool {
+        matches!(
+            result,
+            Err(crate::CliError::EnvSwitchNotRecognised {
+                var: "IPE_BUILD_CACHE",
+                ..
+            })
+        )
+    }
+
+    /// Whether `result` is the `IPE_BUILD_CACHE_DIR` not-absolute refusal.
+    fn is_dir_refusal(result: &Result<CacheRequest, crate::CliError>) -> bool {
+        matches!(
+            result,
+            Err(crate::CliError::EnvDirNotAbsolute {
+                var: "IPE_BUILD_CACHE_DIR"
+            })
+        )
+    }
+
+    /// An absolute directory for an explicit cache root; nothing is created.
+    fn absolute_cache_dir() -> PathBuf {
+        ipe_test_temp::temp_root().join(format!("ipe-cache-explicit-{}", std::process::id()))
+    }
+
+    #[test]
+    fn unset_switch_is_on() {
+        assert_eq!(
+            BuildCacheSwitch::parse(None).ok(),
+            Some(BuildCacheSwitch::On)
+        );
+    }
+
+    #[test]
+    fn unknown_switch_spelling_is_refused() {
+        assert!(is_switch_refusal(&BuildCacheSwitch::parse(Some(
+            OsStr::new("yes")
+        ))));
+        assert_eq!(
+            BuildCacheSwitch::parse(Some(OsStr::new("off"))).ok(),
+            Some(BuildCacheSwitch::Off),
+            "a table spelling in the same slot parses"
+        );
+    }
+
+    #[test]
+    fn empty_switch_is_refused() {
+        assert!(is_switch_refusal(&BuildCacheSwitch::parse(Some(
+            OsStr::new("")
+        ))));
+    }
+
+    #[test]
+    fn uppercase_off_is_refused() {
+        for raw in ["OFF", "Off", " off", "off ", "FALSE", "On"] {
+            assert!(
+                is_switch_refusal(&BuildCacheSwitch::parse(Some(OsStr::new(raw)))),
+                "{raw:?} is outside the exact-match grammar"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_utf8_switch_is_refused() {
+        use std::os::unix::ffi::OsStrExt as _;
+        let raw = OsStr::from_bytes(b"\xff");
+        let result = BuildCacheSwitch::parse(Some(raw));
+        assert!(is_switch_refusal(&result));
+        let Err(crate::CliError::EnvSwitchNotRecognised { got, .. }) = result else {
+            return;
+        };
+        assert_eq!(
+            got.as_str(),
+            "\u{fffd}",
+            "a non-UTF-8 value is rendered lossily"
+        );
+    }
+
+    #[test]
+    fn switch_refusal_text_carries_no_escape_and_names_every_spelling() {
+        let err = BuildCacheSwitch::parse(Some(OsStr::new("\u{1b}[2Jyes")))
+            .expect_err("an escape-laden value is outside the grammar");
+        assert_eq!(err.machine_kind(), "env-switch-not-recognised");
+        let text = err.to_string();
+        assert!(
+            !text.contains('\u{1b}'),
+            "no ESC reaches the terminal: {text:?}"
+        );
+        assert!(text.contains("IPE_BUILD_CACHE"), "{text:?}");
+        assert!(
+            text.contains("yes"),
+            "the printable rest is shown: {text:?}"
+        );
+        for (spelling, _) in BUILD_CACHE_SPELLINGS {
+            assert!(text.contains(spelling), "{spelling} is named: {text:?}");
+        }
+    }
+
+    #[test]
+    fn every_table_row_parses_to_its_switch() {
+        for &(spelling, switch) in BUILD_CACHE_SPELLINGS {
+            assert_eq!(
+                BuildCacheSwitch::parse(Some(OsStr::new(spelling))).ok(),
+                Some(switch),
+                "{spelling:?}"
+            );
+        }
+        let distinct: BTreeSet<&str> = BUILD_CACHE_SPELLINGS.iter().map(|(s, _)| *s).collect();
+        assert_eq!(
+            distinct.len(),
+            BUILD_CACHE_SPELLINGS.len(),
+            "no spelling twice"
+        );
+        for switch in [BuildCacheSwitch::On, BuildCacheSwitch::Off] {
+            assert!(
+                BUILD_CACHE_SPELLINGS.iter().any(|(_, s)| *s == switch),
+                "{switch:?} has a spelling"
+            );
+        }
+    }
+
+    #[test]
+    fn relative_cache_dir_is_refused() {
+        for raw in ["cache", "./cache", "../cache"] {
+            assert!(
+                is_dir_refusal(&CacheRequest::parse(None, Some(raw.into()))),
+                "{raw:?}"
+            );
+        }
+        assert!(
+            CacheRequest::parse(None, Some(absolute_cache_dir().into())).is_ok(),
+            "an absolute directory in the same slot parses"
+        );
+    }
+
+    #[test]
+    fn empty_cache_dir_is_refused() {
+        assert!(is_dir_refusal(&CacheRequest::parse(
+            None,
+            Some(OsString::new())
+        )));
+    }
+
+    #[test]
+    fn relative_dir_refused_even_when_cache_off() {
+        assert!(is_dir_refusal(&CacheRequest::parse(
+            Some(OsStr::new("off")),
+            Some("cache".into())
+        )));
+    }
+
+    #[test]
+    fn absolute_cache_dir_is_explicit_site() {
+        let dir = absolute_cache_dir();
+        let request = CacheRequest::parse(None, Some(dir.clone().into()))
+            .expect("an absolute directory with the cache on by default");
+        assert_eq!(
+            request.site(Path::new("/unused-out")),
+            Some(CacheSite::Explicit(dir))
+        );
+    }
+
+    #[test]
+    fn off_disables_default_and_explicit() {
+        let request =
+            CacheRequest::parse(Some(OsStr::new("off")), Some(absolute_cache_dir().into()))
+                .expect("a well-formed off request");
+        assert_eq!(request.site(Path::new("/unused-out")), None);
+        let request =
+            CacheRequest::parse(Some(OsStr::new("0")), None).expect("a well-formed off request");
+        assert_eq!(request.site(Path::new("/unused-out")), None);
+    }
+
+    #[test]
+    fn registry_names_exactly_the_spelling_table() {
+        let entry = ipe_docs::env_vars::ENV_VARS
+            .iter()
+            .find(|var| var.name == CACHE_SWITCH_VAR)
+            .expect("IPE_BUILD_CACHE is in the env-var registry");
+        let named: BTreeSet<&str> = entry.purpose.split('`').skip(1).step_by(2).collect();
+        let table: BTreeSet<&str> = BUILD_CACHE_SPELLINGS.iter().map(|(s, _)| *s).collect();
+        assert_eq!(named, table, "the documented grammar is the parsed grammar");
+        assert_eq!(
+            BuildCacheSwitch::parse(Some(OsStr::new(&*entry.default))).ok(),
+            Some(BuildCacheSwitch::On),
+            "the documented default is a spelling of the unset default"
+        );
+        assert!(
+            ipe_docs::env_vars::ENV_VARS
+                .iter()
+                .any(|var| var.name == CACHE_DIR_VAR),
+            "IPE_BUILD_CACHE_DIR is in the env-var registry"
+        );
     }
 
     /// A claimed `out/` in a fresh scratch base, plus a directory outside it.
