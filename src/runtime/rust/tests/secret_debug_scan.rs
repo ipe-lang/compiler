@@ -163,7 +163,6 @@ const DIAGNOSTIC: &str = "a compiler diagnostic's text, never emitted";
 const EXPR_HEAD: &str = "the head of the divergence report's expression dump, never emitted";
 const SCHEMA_HASH: &str =
     "a model-schema hash input from a closed fieldless enum's name, never emitted";
-const SKELETON_KEY: &str = "a skeleton key from a leaf type's variant name, never emitted";
 const ENV_NAME_LITERAL: &str = "quotes a public env name into emitted Rust; a `str`'s `Debug` \
      escapes are Rust string-literal escapes";
 const SERDE_REFUSAL: &str = "a serde error carrying a path-refusal diagnostic, never emitted";
@@ -281,12 +280,6 @@ const DEBUG_SITES: &[DebugSite] = &[
         func: "resolve_ident",
         count: 1,
         why: DIAGNOSTIC,
-    },
-    DebugSite {
-        file: "rust/src/lib.rs",
-        func: "skeleton_ty",
-        count: 1,
-        why: SKELETON_KEY,
     },
     DebugSite {
         file: "rust/src/preamble.rs",
