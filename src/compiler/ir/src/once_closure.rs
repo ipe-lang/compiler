@@ -120,6 +120,7 @@ pub const fn boundary_kind(expr: &Expr) -> Option<ClosureKind> {
         | Expr::Ctor { .. }
         | Expr::BinOp { .. }
         | Expr::Let { .. }
+        | Expr::CaptureClones { .. }
         | Expr::Destructure { .. }
         | Expr::If { .. }
         | Expr::Match(_)

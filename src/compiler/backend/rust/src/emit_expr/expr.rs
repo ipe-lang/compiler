@@ -178,6 +178,21 @@ pub fn emit_expr_at(
                 Ok(format!("({{ let {name_s} = {value_s}; {body_s} }})"))
             }
         }
+        Expr::CaptureClones { syms, body } => {
+            // One block for the whole run of pre-clones:
+            // `({ let a = a.clone(); let b = b.clone(); <body> })`. A single
+            // symbol renders exactly as the self-clone `let` it stands for, and
+            // a run costs one block (and one emit level), however long.
+            let lets = syms
+                .iter()
+                .map(|sym| {
+                    ctx.emit_local_ident(*sym)
+                        .map(|name_s| format!("let {name_s} = {name_s}.clone();"))
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let body_s = emit_expr_at(ctx, body, indent, child, generics)?;
+            Ok(format!("({{ {} {body_s} }})", lets.join(" ")))
+        }
         Expr::Destructure {
             binder,
             value,

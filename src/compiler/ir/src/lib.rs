@@ -47,6 +47,7 @@ pub use ir::{
     carrier_is_clone_bounded, carrier_leaf, collect_generics, fun_value_arc_promotable,
     head_alternatives, ir_type_feature_requirement, ir_type_has_effect_carrier,
     ir_type_is_derivable, ir_type_is_serde, is_dispatch_free, is_irrefutable,
+    refuse_self_clone_lets,
 };
 pub use pairing::{PairedChildren, paired_children};
 pub use pretty::{MAX_IR_RENDER_DEPTH, pretty};

@@ -1202,8 +1202,11 @@ fn recompute(state: &mut State, diag_tx: &Sender<DiagnosticsBatch>) {
     let cancel = Arc::new(AtomicBool::new(false));
     state.worker_cancel = Some(cancel.clone());
     let tx = diag_tx.clone();
+    // The worker runs every compile stage, so it gets the stack the at-ceiling
+    // shapes are proven on.
     let spawned = thread::Builder::new()
         .name("ipe-lsp-diagnostics".to_owned())
+        .stack_size(ipe_diagnostics::nesting::COMPILE_STACK_BYTES)
         .spawn(move || {
             let outcome = std::panic::catch_unwind(AssertUnwindSafe(|| {
                 // The demand stage consumes the clone; the lint stage runs

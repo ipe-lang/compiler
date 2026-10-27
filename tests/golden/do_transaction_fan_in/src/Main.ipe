@@ -1,0 +1,54 @@
+module Main exposing (main)
+import Ipe.Io as Io
+import Ipe.Db
+import Ipe.Db.Location as Location
+import Ipe.Db.Unsafe
+import Ipe.List
+import Ipe.String
+import Ipe.Task
+
+-- A flat `do` of thirty named binds inside a transaction lambda, every bind
+-- read by the final statement: a sequence, not nesting, so it emits.
+
+main =
+    Task.andThen
+        (\conn ->
+            Db.withTransaction conn
+                (\txconn ->
+                    do
+                        Unsafe.unsafeExecRaw txconn
+                            "CREATE TABLE marks (n INTEGER)"
+                        n1 <- Task.succeed 1
+                        n2 <- Task.succeed 2
+                        n3 <- Task.succeed 3
+                        n4 <- Task.succeed 4
+                        n5 <- Task.succeed 5
+                        n6 <- Task.succeed 6
+                        n7 <- Task.succeed 7
+                        n8 <- Task.succeed 8
+                        n9 <- Task.succeed 9
+                        n10 <- Task.succeed 10
+                        n11 <- Task.succeed 11
+                        n12 <- Task.succeed 12
+                        n13 <- Task.succeed 13
+                        n14 <- Task.succeed 14
+                        n15 <- Task.succeed 15
+                        n16 <- Task.succeed 16
+                        n17 <- Task.succeed 17
+                        n18 <- Task.succeed 18
+                        n19 <- Task.succeed 19
+                        n20 <- Task.succeed 20
+                        n21 <- Task.succeed 21
+                        n22 <- Task.succeed 22
+                        n23 <- Task.succeed 23
+                        n24 <- Task.succeed 24
+                        n25 <- Task.succeed 25
+                        n26 <- Task.succeed 26
+                        n27 <- Task.succeed 27
+                        n28 <- Task.succeed 28
+                        n29 <- Task.succeed 29
+                        n30 <- Task.succeed 30
+                        Io.println (String.fromInt (List.sum [ n1, n2, n3, n4, n5, n6, n7, n8, n9, n10, n11, n12, n13, n14, n15, n16, n17, n18, n19, n20, n21, n22, n23, n24, n25, n26, n27, n28, n29, n30 ]))
+                )
+        )
+        (Db.open Location.memory)

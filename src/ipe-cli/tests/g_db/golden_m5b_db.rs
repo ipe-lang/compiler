@@ -155,6 +155,19 @@ fn db_query_decode() {
     assert_runs_and_matches_oracle("db_query_decode");
 }
 
+// ── A flat `do` inside a transaction lambda ──────────────────────────────────
+
+/// Thirty named binds in one `do` inside `Db.withTransaction`, every bind read
+/// by the final statement, emit and build: a long sequence costs no IR depth
+/// per bind, since each continuation's capture clones are one flat node.
+/// Output: `"465"`.
+///
+/// Sanctioned divergence: Ipê emits Rust+sqlx; oracle is Ipê's own output.
+#[test]
+fn do_transaction_fan_in() {
+    assert_runs_and_matches_oracle("do_transaction_fan_in");
+}
+
 // ── Db.Decode.andThen — function-first surface, decoder-first runtime ─────────
 
 /// `Db.Decode.andThen (\n -> Db.Decode.succeed (String.toUpper n))

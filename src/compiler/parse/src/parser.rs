@@ -14,7 +14,8 @@
 //! defect-precise variant. Recursion is bounded by [`MAX_DEPTH`]; every
 //! recursive entry threads a depth counter and fails with
 //! [`ParseError::NestingTooDeep`] (IPE-P0003) before the native stack can
-//! overflow on adversarial input.
+//! overflow on adversarial input. A refusal spans the sequence that crossed
+//! the ceiling, from the start of that sequence to the crossing token.
 //!
 //! Qualified upper-case names in **type** and **pattern** position are rejected
 //! with a typed error rather than collapsed into a non-reference AST: the parser
@@ -55,7 +56,24 @@ pub struct Parser<'a> {
     toks: Vec<Token>,
     pos: usize,
     interner: &'a mut Interner,
+    /// The deepest level the expression being parsed has reached, counting
+    /// the levels an operator chain it sits under adds once re-associated.
+    deepest: u32,
+    /// The start of the innermost statement run whose charge the current
+    /// depth includes: a `do` block's statements, a `let`'s bindings, or an
+    /// `else if` chain's arms.
+    run: Option<SequenceStart>,
 }
+
+/// Where a sequence the parser charges nesting levels for begins.
+///
+/// The sequences are a `do` block's statements, a `let`'s bindings, an
+/// `else if` chain, an operator chain and a field-access chain. Every
+/// `NestingTooDeep` refusal is built from one by `Parser::too_deep_from`, so
+/// its span runs from the start of the sequence that crossed the ceiling to
+/// the crossing token.
+#[derive(Clone, Copy, Debug)]
+struct SequenceStart(u32);
 
 /// The result of splitting parsed declarations into their four kinds: value
 /// bindings (with annotations attached), union types, type aliases, and foreign
@@ -241,6 +259,14 @@ fn int_value(magnitude: IntMagnitude, sign: Sign, span: Span) -> DResult<i64> {
     }
 }
 
+/// The frames from a chain's expression to a bare operand's atom.
+///
+/// An operand is parsed below the expression, application and postfix
+/// frames, none of which builds a node of its own, so a chain of bare atoms
+/// at depth `d` with `c` levels charged nests `d + c` deep. A deeper operand
+/// adds the levels it reaches past that atom.
+const OPERAND_ATOM_FRAMES: u32 = 3;
+
 /// The source nesting levels one operator of a chain is charged.
 ///
 /// A composition desugars to a lambda over two calls, so it is charged
@@ -282,6 +308,8 @@ impl<'a> Parser<'a> {
             toks,
             pos: 0,
             interner,
+            deepest: 0,
+            run: None,
         }
     }
 
@@ -330,15 +358,23 @@ impl<'a> Parser<'a> {
         self.peek().map_or_else(|| self.eof_err_span(), |t| t.span)
     }
 
+    /// The `NestingTooDeep` refusal of a construct that crosses the ceiling at
+    /// the next token.
+    ///
+    /// Inside a statement run the run's charge is part of the depth that
+    /// crossed, so the refusal spans from the run's start; outside one it is
+    /// the token alone.
     fn too_deep(&self, construct: Construct) -> Diagnostic {
-        Self::too_deep_at(self.err_here_span(), construct)
+        let crossing = self.err_here_span();
+        let start = self.run.unwrap_or(SequenceStart(crossing.lo));
+        Self::too_deep_from(start, crossing, construct)
     }
 
-    /// The `NestingTooDeep` refusal at `span`, for a level carved out of a
-    /// token already consumed.
-    const fn too_deep_at(span: Span, construct: Construct) -> Diagnostic {
+    /// The `NestingTooDeep` refusal of the sequence begun at `start`, spanning
+    /// through the `crossing` token.
+    fn too_deep_from(start: SequenceStart, crossing: Span, construct: Construct) -> Diagnostic {
         Diagnostic::Parse {
-            span,
+            span: Span::new(start.0.min(crossing.lo), crossing.hi),
             msg: ParseError::NestingTooDeep {
                 construct,
                 limit: NESTING_LIMIT_U16,
@@ -1443,25 +1479,37 @@ impl<'a> Parser<'a> {
         if depth > MAX_DEPTH {
             return Err(self.too_deep(Construct::Expression));
         }
+        let outer = std::mem::replace(&mut self.deepest, depth);
         let first = self.parse_app(threshold, depth + 1)?;
+        let chain = SequenceStart(first.span.lo);
         let mut ops: Vec<(Expr, Located<Symbol>)> = Vec::new();
         let mut operand = first;
         // A flat operator chain re-associates into a nesting-deep tree
         // downstream, so each operator is charged the levels its desugar nests
         // ([`op_nesting`]), cumulatively, or the chain escapes `MAX_DEPTH` and
         // overflows the recursive walkers (and Drop) that traverse the tree.
+        // Re-association can put any operand under the whole chain, so every
+        // operand is charged it: the chain's deepest operand level plus the
+        // levels charged must stay within the ceiling. The operator that
+        // crosses it is refused with the chain from its first operand.
         let mut charged: u32 = 0;
         while let Some((op, op_span)) = self.peek_binop(threshold) {
             charged = charged.saturating_add(op_nesting(op));
-            let op_depth = depth.saturating_add(charged);
-            if op_depth > MAX_DEPTH {
-                return Err(self.too_deep(Construct::Expression));
+            if self.chain_too_deep(charged) {
+                return Err(Self::too_deep_from(chain, op_span, Construct::Expression));
             }
             let op_sym = self.intern(op.text())?;
             self.bump(Construct::Expression)?;
             ops.push((operand, Located::new(op_span, op_sym)));
             operand = self.parse_app(threshold, depth + 1)?;
+            if self.chain_too_deep(charged) {
+                return Err(Self::too_deep_from(chain, op_span, Construct::Expression));
+            }
         }
+        // An enclosing chain charges this one's operands as nested under every
+        // level but the first, which sits where this expression's frame was.
+        let reached = self.deepest.saturating_add(charged.saturating_sub(1));
+        self.deepest = outer.max(reached);
         if ops.is_empty() {
             Ok(operand)
         } else {
@@ -1471,10 +1519,22 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// Whether a chain with `charged` levels over its deepest operand so far
+    /// nests past [`MAX_DEPTH`].
+    const fn chain_too_deep(&self, charged: u32) -> bool {
+        self.deepest.saturating_add(charged) > MAX_DEPTH + OPERAND_ATOM_FRAMES
+    }
+
+    /// Raise the deepest level reached to `depth`.
+    fn reach(&mut self, depth: u32) {
+        self.deepest = self.deepest.max(depth);
+    }
+
     fn parse_app(&mut self, threshold: u32, depth: u32) -> DResult<Expr> {
         if depth > MAX_DEPTH {
             return Err(self.too_deep(Construct::Expression));
         }
+        self.reach(depth);
         let head = self.parse_atom_postfix(threshold, depth + 1)?;
         let mut args = Vec::new();
         let mut end = head.span;
@@ -1574,6 +1634,7 @@ impl<'a> Parser<'a> {
     /// teaching diagnostic rather than silently parsed as field access.
     fn parse_atom_postfix(&mut self, threshold: u32, depth: u32) -> DResult<Expr> {
         let atom_depth = depth + 1;
+        self.reach(atom_depth);
         let mut expr = self.parse_atom(threshold, atom_depth)?;
         // Every `Access` this postfix run wraps around the atom nests one level
         // over the last, across every dotted token the run consumes.
@@ -1723,7 +1784,7 @@ impl<'a> Parser<'a> {
     ///
     /// `depth` is the depth of `base`. The `k`-th `Access` nests `k` levels
     /// over it, so the segment that would sit past [`MAX_DEPTH`] is refused
-    /// with `NestingTooDeep` at its own sub-span.
+    /// with `NestingTooDeep` spanning from `base` through that segment.
     ///
     /// Called from three sites that all produce an `Access` chain from a single
     /// dotted identifier token: `parse_atom_postfix`, `parse_field_accessor`,
@@ -1735,19 +1796,25 @@ impl<'a> Parser<'a> {
         text: &str,
         depth: u32,
     ) -> DResult<Expr> {
+        let chain = SequenceStart(base.span.lo);
         let mut cursor = tok_span.lo;
         for (seg_count, seg) in (1_u32..).zip(text.split('.')) {
             let seg_len = u32::try_from(seg.len()).unwrap_or(0);
             let field_lo = cursor;
             let field_span = Span::from_start_width(field_lo, seg_len);
             if depth.saturating_add(seg_count) > MAX_DEPTH {
-                return Err(Self::too_deep_at(field_span, Construct::Expression));
+                return Err(Self::too_deep_from(
+                    chain,
+                    field_span,
+                    Construct::Expression,
+                ));
             }
             cursor = field_lo.saturating_add(seg_len);
             let field = Located::new(field_span, self.interner.intern(seg)?);
             let span = Span::new(base.span.lo, cursor);
             base = Located::new(span, Expr_::Access(Box::new(base), field));
             cursor = cursor.saturating_add(1); // step past the '.' before the next segment
+            self.reach(depth.saturating_add(seg_count));
         }
         Ok(base)
     }
@@ -2284,11 +2351,11 @@ impl<'a> Parser<'a> {
 
         // The first binding establishes the alignment column for the block. A
         // `let` immediately followed by `in` (or end of input) has no bindings.
-        let binding_col = match self.peek() {
+        let (binding_col, first_binding) = match self.peek() {
             Some(t) if t.kind == Tok::In => {
                 return Err(Self::malformed_let(t.span, LetDefect::NoBindings));
             }
-            Some(t) => t.col,
+            Some(t) => (t.col, t.span),
             None => {
                 return Err(Self::malformed_let(
                     self.eof_err_span(),
@@ -2298,9 +2365,11 @@ impl<'a> Parser<'a> {
         };
 
         // Each binding lowers to one more nested `Let` around everything after
-        // it, so the block charges one level per binding, cumulatively. A
-        // binding that crosses the ceiling is refused at its own head token;
-        // the charge ends with the block.
+        // it, so the block charges one level per binding, cumulatively, and
+        // the bindings and the body are a run: a refusal inside them spans
+        // from the first binding to the crossing token. The charge and the run
+        // end with the block.
+        let outer_run = self.run.replace(SequenceStart(first_binding.lo));
         let mut charged: u32 = 0;
         let mut bindings = Vec::new();
         loop {
@@ -2340,6 +2409,7 @@ impl<'a> Parser<'a> {
         }
 
         let body = self.parse_expr(threshold, depth.saturating_add(1).saturating_add(charged))?;
+        self.run = outer_run;
         let span = Self::span_merge(let_tok.span, body.span);
         Ok(Located::new(span, Expr_::Let(bindings, Box::new(body))))
     }
@@ -2411,7 +2481,9 @@ impl<'a> Parser<'a> {
 
         // Lowering folds the flat `else if` chain into right-nested `If`s, so
         // each `else if` costs one depth level, as a nested `if` would; the
-        // arm's `parse_expr` refuses the one that crosses the ceiling.
+        // arm's `parse_expr` refuses the one that crosses the ceiling. From
+        // the first `else if` on, the arms are a run that spans from the `if`.
+        let outer_run = self.run;
         let mut arm_depth = depth + 1;
         let mut branches = Vec::new();
         loop {
@@ -2467,6 +2539,7 @@ impl<'a> Parser<'a> {
             // a plain `else` ends it with the final expression below.
             if self.peek_kind() == Some(&Tok::If) {
                 arm_depth = arm_depth.saturating_add(1);
+                self.run = Some(SequenceStart(if_tok.span.lo));
                 self.bump(Construct::If)?;
                 continue;
             }
@@ -2474,6 +2547,7 @@ impl<'a> Parser<'a> {
         }
 
         let else_branch = self.parse_expr(threshold, arm_depth)?;
+        self.run = outer_run;
         let span = Self::span_merge(if_tok.span, else_branch.span);
         Ok(Located::new(
             span,
@@ -2606,21 +2680,24 @@ impl<'a> Parser<'a> {
             });
         };
         let block_col = first.col;
+        let first_statement = first.span;
         // The first statement must be indented past the enclosing layout
         // threshold; otherwise a statement at or before it belongs to an outer
         // block, and consuming it would swallow following top-level
         // declarations. Fail closed, mirroring `parse_case`'s first-branch gate.
         if block_col <= threshold {
             return Err(Diagnostic::Parse {
-                span: first.span,
+                span: first_statement,
                 msg: ParseError::Unexpected,
             });
         }
         // The desugar nests the rest of the block inside each statement, so
         // the block charges each statement's manufactured nesting
         // ([`DoHead::nesting`]), cumulatively, and parses the statement at the
-        // charged depth. A statement that crosses the ceiling is refused at its
-        // own head token; the charge ends with the block.
+        // charged depth. The statements are a run: a refusal inside them spans
+        // from the first statement to the crossing token. The charge and the
+        // run end with the block.
+        let outer_run = self.run.replace(SequenceStart(first_statement.lo));
         let mut charged: u32 = 0;
         let mut stmts = Vec::new();
         loop {
@@ -2638,6 +2715,7 @@ impl<'a> Parser<'a> {
                 break;
             }
         }
+        self.run = outer_run;
         Self::desugar_do(do_tok.span, stmts)
     }
 

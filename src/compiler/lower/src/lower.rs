@@ -575,6 +575,10 @@ fn clear_let_bound_task_fail_pins(expr: Expr) -> Expr {
             effect: Box::new(recur(*effect)),
             rest: Box::new(recur(*rest)),
         },
+        Expr::CaptureClones { syms, body } => Expr::CaptureClones {
+            syms,
+            body: Box::new(recur(*body)),
+        },
         Expr::ListIndexClone { list, index, elem } => Expr::ListIndexClone {
             list: Box::new(recur(*list)),
             index,
@@ -1301,6 +1305,10 @@ fn escapes(body: &Expr, row_syms: &BTreeSet<Symbol>, tail_sym: Option<Symbol>) -
         Expr::TaskSeq { effect, rest } => {
             escapes(effect, row_syms, None) || escapes(rest, row_syms, tail_sym)
         }
+        // Each listed symbol is a `CloneVar` read of the enclosing scope.
+        Expr::CaptureClones { syms, body } => {
+            syms.iter().any(|s| row_syms.contains(s)) || escapes(body, row_syms, tail_sym)
+        }
         Expr::TailLoop { body, .. } => escapes(body, row_syms, tail_sym),
         Expr::TailRecur { args } => args.iter().any(|a| escapes(a, row_syms, None)),
     }
@@ -1730,6 +1738,14 @@ fn collect_capture_scopes(
             collect_capture_scopes(sym, effect, scope, out);
             collect_capture_scopes(sym, rest, scope.enter_boundary(expr), out);
         }
+        Expr::CaptureClones { syms, body } => {
+            for _ in syms.iter().filter(|s| **s == sym) {
+                out.push(scope);
+            }
+            if !syms.contains(&sym) {
+                collect_capture_scopes(sym, body, scope, out);
+            }
+        }
         Expr::Access { record, .. } => {
             collect_capture_scopes(sym, record, scope, out);
         }
@@ -1901,6 +1917,9 @@ fn flows_into_sync_kernel_call(sym: Symbol, expr: &Expr) -> bool {
         Expr::TaskSeq { effect, rest } => {
             flows_into_sync_kernel_call(sym, effect) || flows_into_sync_kernel_call(sym, rest)
         }
+        Expr::CaptureClones { syms, body } => {
+            !syms.contains(&sym) && flows_into_sync_kernel_call(sym, body)
+        }
         Expr::Access { record, .. } => flows_into_sync_kernel_call(sym, record),
         Expr::Int(_)
         | Expr::Bool(_)
@@ -1970,6 +1989,9 @@ fn branch_value_leaf_reads_sym(name: Symbol, branch: &Expr) -> bool {
         } => *let_name != name && branch_value_leaf_reads_sym(name, body),
         Expr::Destructure { binder, body, .. } => {
             !pat_binds_symbol(binder, name) && branch_value_leaf_reads_sym(name, body)
+        }
+        Expr::CaptureClones { syms, body } => {
+            !syms.contains(&name) && branch_value_leaf_reads_sym(name, body)
         }
         Expr::If { then_, else_, .. } => {
             branch_value_leaf_reads_sym(name, then_) || branch_value_leaf_reads_sym(name, else_)
@@ -2143,6 +2165,10 @@ fn unify_group_value_leaves(
                 name, *body, params, ret, eta_pool,
             )?),
         }),
+        Expr::CaptureClones { syms, body } => Ok(Expr::pre_clone_all(
+            syms,
+            unify_group_value_leaves(name, *body, params, ret, eta_pool)?,
+        )),
         Expr::Destructure {
             binder,
             value,
@@ -2494,6 +2520,13 @@ fn promote_unification_sibling_lambdas(
             effect: Box::new(recur(*effect)?),
             rest: Box::new(recur(*rest)?),
         }),
+        Expr::CaptureClones { syms, body } => {
+            if syms.contains(&name) {
+                Ok(Expr::CaptureClones { syms, body })
+            } else {
+                Ok(Expr::pre_clone_all(syms, recur(*body)?))
+            }
+        }
         Expr::TailRecur { args } => Ok(Expr::TailRecur {
             args: args.into_iter().map(recur).collect::<DResult<Vec<_>>>()?,
         }),
@@ -2724,6 +2757,15 @@ fn count_var_uses(sym: Symbol, expr: &Expr) -> usize {
         }
         Expr::Ctor { args, .. } => args.iter().map(|a| count_var_uses(sym, a)).sum(),
         Expr::TaskSeq { effect, rest } => count_var_uses(sym, effect) + count_var_uses(sym, rest),
+        Expr::CaptureClones { syms, body } => {
+            let in_syms = syms.iter().filter(|s| **s == sym).count();
+            let in_body = if syms.contains(&sym) {
+                0
+            } else {
+                count_var_uses(sym, body)
+            };
+            in_syms + in_body
+        }
         Expr::TailLoop { params, body } => {
             if params.iter().any(|(s, _)| *s == sym) {
                 0
@@ -2907,12 +2949,12 @@ fn body_calls_kernel_on_param(
             body_calls_kernel_on_param(param, effect, matcher)
                 || body_calls_kernel_on_param(param, rest, matcher)
         }
+        Expr::CaptureClones { syms, body } => {
+            !syms.contains(&param) && body_calls_kernel_on_param(param, body, matcher)
+        }
         Expr::TailLoop { params, body } => {
-            if params.iter().any(|(s, _)| *s == param) {
-                false
-            } else {
-                body_calls_kernel_on_param(param, body, matcher)
-            }
+            !params.iter().any(|(s, _)| *s == param)
+                && body_calls_kernel_on_param(param, body, matcher)
         }
         Expr::TailRecur { args } => args
             .iter()
@@ -3006,6 +3048,9 @@ fn body_reads_field_of_param(param: Symbol, expr: &Expr) -> bool {
         Expr::TaskSeq { effect, rest } => {
             body_reads_field_of_param(param, effect) || body_reads_field_of_param(param, rest)
         }
+        Expr::CaptureClones { syms, body } => {
+            !syms.contains(&param) && body_reads_field_of_param(param, body)
+        }
         Expr::TailLoop { params, body } => {
             if params.iter().any(|(s, _)| *s == param) {
                 false
@@ -3084,6 +3129,9 @@ fn body_tail_threaded_param(expr: &Expr, params: &BTreeSet<Symbol>) -> Option<Sy
                 return Some(*s);
             }
             None
+        }
+        Expr::CaptureClones { syms, body } if !syms.iter().any(|s| params.contains(s)) => {
+            body_tail_threaded_param(body, params)
         }
         _ => None,
     }
@@ -3176,6 +3224,7 @@ fn collect_row_update_fields(
             collect_row_update_fields(effect, sym_to_rp, row_params);
             collect_row_update_fields(rest, sym_to_rp, row_params);
         }
+        Expr::CaptureClones { body, .. } => collect_row_update_fields(body, sym_to_rp, row_params),
         Expr::ListIndexClone { list, .. } | Expr::ListLenCheck { list, .. } => {
             collect_row_update_fields(list, sym_to_rp, row_params);
         }
@@ -3629,6 +3678,7 @@ fn body_succeeds_on_bare_var(expr: &Expr) -> bool {
         | Expr::SharedLambda { body, .. }
         | Expr::OnceLambda { body, .. }
         | Expr::TailLoop { body, .. }
+        | Expr::CaptureClones { body, .. }
         | Expr::Access { record: body, .. } => body_succeeds_on_bare_var(body),
         Expr::Let { value, body, .. } | Expr::Destructure { value, body, .. } => {
             body_succeeds_on_bare_var(value) || body_succeeds_on_bare_var(body)
@@ -3753,7 +3803,9 @@ fn body_boxes_generic_callback(tv: Symbol, expr: &Expr) -> bool {
         Expr::TaskSeq { effect, rest } => {
             body_boxes_generic_callback(tv, effect) || body_boxes_generic_callback(tv, rest)
         }
-        Expr::TailLoop { body, .. } => body_boxes_generic_callback(tv, body),
+        Expr::CaptureClones { body, .. } | Expr::TailLoop { body, .. } => {
+            body_boxes_generic_callback(tv, body)
+        }
         Expr::Access { record, .. } => body_boxes_generic_callback(tv, record),
         Expr::Int(_)
         | Expr::Bool(_)
@@ -3858,7 +3910,9 @@ fn body_materializes_generic_decoder(tv: Symbol, expr: &Expr) -> bool {
             body_materializes_generic_decoder(tv, effect)
                 || body_materializes_generic_decoder(tv, rest)
         }
-        Expr::TailLoop { body, .. } => body_materializes_generic_decoder(tv, body),
+        Expr::CaptureClones { body, .. } | Expr::TailLoop { body, .. } => {
+            body_materializes_generic_decoder(tv, body)
+        }
         Expr::Int(_)
         | Expr::Bool(_)
         | Expr::Float(_)
@@ -3954,6 +4008,9 @@ fn binder_captured_in_move_closure(binder: Symbol, expr: &Expr) -> bool {
         Expr::TaskSeq { effect, rest } => {
             binder_captured_in_move_closure(binder, effect)
                 || binder_captured_in_move_closure(binder, rest)
+        }
+        Expr::CaptureClones { syms, body } => {
+            !syms.contains(&binder) && binder_captured_in_move_closure(binder, body)
         }
         Expr::TailLoop { params, body } => {
             !params.iter().any(|(s, _)| *s == binder)
@@ -4098,6 +4155,13 @@ fn closure_captures_bare_generic(
         Expr::TaskSeq { effect, rest } => {
             recur(locally_bound, effect) || recur(locally_bound, rest)
         }
+        Expr::CaptureClones { syms, body } => {
+            (!typed_capture_only && syms.iter().any(|s| !locally_bound.contains(s))) || {
+                let mut inner = locally_bound.clone();
+                inner.extend(syms.iter().copied());
+                recur(&inner, body)
+            }
+        }
         Expr::FuncValue { .. }
         | Expr::Int(_)
         | Expr::Bool(_)
@@ -4232,7 +4296,9 @@ fn body_move_closure_captures_generic(tv: Symbol, expr: &Expr) -> bool {
             // even when this one does not.
             body_move_closure_captures_generic(tv, body)
         }
-        Expr::TailLoop { body, .. } => body_move_closure_captures_generic(tv, body),
+        Expr::TailLoop { body, .. } | Expr::CaptureClones { body, .. } => {
+            body_move_closure_captures_generic(tv, body)
+        }
         Expr::Let { value, body, .. } | Expr::Destructure { value, body, .. } => {
             body_move_closure_captures_generic(tv, value)
                 || body_move_closure_captures_generic(tv, body)
@@ -4574,6 +4640,7 @@ fn collect_user_calls<'e>(expr: &'e Expr, out: &mut Vec<(FuncId, &'e [Expr])>) {
         Expr::Lambda { body, .. }
         | Expr::SharedLambda { body, .. }
         | Expr::OnceLambda { body, .. }
+        | Expr::CaptureClones { body, .. }
         | Expr::TailLoop { body, .. } => collect_user_calls(body, out),
         Expr::Let { value, body, .. } | Expr::Destructure { value, body, .. } => {
             collect_user_calls(value, out);
@@ -4706,6 +4773,10 @@ fn arg_forwarded_binders(arg: &Expr, out: &mut Vec<Symbol>) {
         Expr::TaskSeq { effect, rest } => {
             arg_forwarded_binders(effect, out);
             arg_forwarded_binders(rest, out);
+        }
+        Expr::CaptureClones { syms, body } => {
+            out.extend(syms.iter().copied());
+            arg_forwarded_binders(body, out);
         }
         Expr::Access { record, .. } => arg_forwarded_binders(record, out),
         Expr::FuncValue { .. }
@@ -4894,6 +4965,15 @@ fn collect_local_derived_tvars(
         Expr::TaskSeq { effect, rest } => {
             collect_local_derived_tvars(effect, derived);
             collect_local_derived_tvars(rest, derived);
+        }
+        Expr::CaptureClones { syms, body } => {
+            for s in syms {
+                let tvars = value_tvars(&Expr::CloneVar(*s), derived);
+                if !tvars.is_empty() {
+                    derived.entry(*s).or_default().extend(tvars);
+                }
+            }
+            collect_local_derived_tvars(body, derived);
         }
         Expr::Access { record, .. } => collect_local_derived_tvars(record, derived),
         Expr::Var(_)
@@ -5248,7 +5328,9 @@ fn collect_tail_call_callees(expr: &Expr, out: &mut Vec<FuncId>) {
         } => {
             out.push(*id);
         }
-        Expr::Let { body, .. } | Expr::Destructure { body, .. } => {
+        Expr::Let { body, .. }
+        | Expr::Destructure { body, .. }
+        | Expr::CaptureClones { body, .. } => {
             collect_tail_call_callees(body, out);
         }
         Expr::If { then_, else_, .. } => {
@@ -5574,6 +5656,13 @@ fn collect_let_site_types(
             collect_let_site_types(effect, site_types);
             collect_let_site_types(rest, site_types);
         }
+        Expr::CaptureClones { syms, body } => {
+            for s in syms {
+                let ty = arg_site_type(&Expr::CloneVar(*s), site_types);
+                record_site_type(site_types, *s, ty);
+            }
+            collect_let_site_types(body, site_types);
+        }
         Expr::Access { record, .. } => collect_let_site_types(record, site_types),
         Expr::Var(_)
         | Expr::CloneVar(_)
@@ -5757,6 +5846,10 @@ fn count_fn_value_uses(sym: Symbol, expr: &Expr) -> usize {
             count_fn_value_uses(sym, effect)
                 + count_fn_value_uses(sym, rest).max(usize::from(lambda_body_refs_sym(sym, rest)))
         }
+        Expr::CaptureClones { syms, body } => match syms.iter().filter(|s| **s == sym).count() {
+            0 => count_fn_value_uses(sym, body),
+            shadowed => shadowed,
+        },
         Expr::TailLoop { params, body } => {
             if params.iter().any(|(s, _)| *s == sym) {
                 0
@@ -5895,6 +5988,14 @@ fn fn_value_move_walk(
                 if *name != sym {
                     fn_value_move_walk(sym, body, state, payloads);
                 }
+            }
+        }
+        Expr::CaptureClones { syms, body } => {
+            for _ in syms.iter().filter(|s| **s == sym) {
+                state.read(true);
+            }
+            if !syms.contains(&sym) {
+                fn_value_move_walk(sym, body, state, payloads);
             }
         }
         Expr::Destructure {
@@ -6327,6 +6428,15 @@ fn count_value_consumes(sym: Symbol, copy_fields: &BTreeSet<Symbol>, expr: &Expr
             count_value_consumes(sym, copy_fields, effect)
                 + count_value_consumes(sym, copy_fields, rest)
         }
+        Expr::CaptureClones { syms, body } => {
+            let in_syms = syms.iter().filter(|s| **s == sym).count();
+            let in_body = if syms.contains(&sym) {
+                0
+            } else {
+                count_value_consumes(sym, copy_fields, body)
+            };
+            in_syms + in_body
+        }
         Expr::TailLoop { params, body } => {
             if params.iter().any(|(s, _)| *s == sym) {
                 0
@@ -6707,6 +6817,14 @@ fn nonclone_move_walk(sym: Symbol, expr: &Expr, state: &mut NonCloneMoveState<'_
             nonclone_move_walk(sym, effect, state);
             nonclone_move_walk(sym, rest, state);
         }
+        Expr::CaptureClones { syms, body } => {
+            for _ in syms.iter().filter(|s| **s == sym) {
+                state.read_whole(true);
+            }
+            if !syms.contains(&sym) {
+                nonclone_move_walk(sym, body, state);
+            }
+        }
         Expr::TailLoop { params, body } => {
             if !params.iter().any(|(s, _)| *s == sym) {
                 nonclone_move_walk(sym, body, state);
@@ -6819,6 +6937,9 @@ fn sym_is_bare_update_base(sym: Symbol, expr: &Expr) -> bool {
         Expr::Ctor { args, .. } => args.iter().any(|a| sym_is_bare_update_base(sym, a)),
         Expr::TaskSeq { effect, rest } => {
             sym_is_bare_update_base(sym, effect) || sym_is_bare_update_base(sym, rest)
+        }
+        Expr::CaptureClones { syms, body } => {
+            !syms.contains(&sym) && sym_is_bare_update_base(sym, body)
         }
         Expr::TailLoop { params, body } => {
             !params.iter().any(|(s, _)| *s == sym) && sym_is_bare_update_base(sym, body)
@@ -6957,6 +7078,15 @@ fn count_var_uses_update_aware(sym: Symbol, expr: &Expr) -> usize {
             .sum(),
         Expr::TaskSeq { effect, rest } => {
             count_var_uses_update_aware(sym, effect) + count_var_uses_update_aware(sym, rest)
+        }
+        Expr::CaptureClones { syms, body } => {
+            let in_syms = syms.iter().filter(|s| **s == sym).count();
+            let in_body = if syms.contains(&sym) {
+                0
+            } else {
+                count_var_uses_update_aware(sym, body)
+            };
+            in_syms + in_body
         }
         Expr::TailLoop { params, body } => {
             if params.iter().any(|(s, _)| *s == sym) {
@@ -7237,6 +7367,10 @@ fn collect_mentioned_syms(expr: &Expr, out: &mut BTreeSet<Symbol>) {
             collect_mentioned_syms(effect, out);
             collect_mentioned_syms(rest, out);
         }
+        Expr::CaptureClones { syms, body } => {
+            out.extend(syms.iter().copied());
+            collect_mentioned_syms(body, out);
+        }
         Expr::TailLoop { body, .. } => {
             collect_mentioned_syms(body, out);
         }
@@ -7394,6 +7528,15 @@ fn fn_value_read_flags_walk(
         Expr::TaskSeq { effect, rest } => {
             fn_value_read_flags_walk(sym, effect, scope, flags);
             fn_value_read_flags_walk(sym, rest, scope.enter_boundary(expr), flags);
+        }
+        Expr::CaptureClones { syms, body } => {
+            for _ in syms.iter().filter(|s| **s == sym) {
+                flags.move_in_recallable |= scope.move_is_hazard();
+                flags.any_past |= scope.borrow_is_hazard();
+            }
+            if !syms.contains(&sym) {
+                fn_value_read_flags_walk(sym, body, scope, flags);
+            }
         }
         Expr::Access { record, .. } => {
             fn_value_read_flags_walk(sym, record, scope, flags);
@@ -7578,6 +7721,7 @@ fn is_direct_closure(expr: &Expr) -> bool {
     match expr {
         Expr::Lambda { .. } | Expr::OnceLambda { .. } => true,
         Expr::Let { body, .. } => matches!(**body, Expr::Lambda { .. }),
+        Expr::CaptureClones { body, .. } => matches!(**body, Expr::Lambda { .. }),
         _ => false,
     }
 }
@@ -8746,6 +8890,21 @@ fn shim_fn_value_reads_at(site: &ShimSite<'_>, expr: Expr, in_storage: bool) -> 
             effect: Box::new(recurse(*effect)?),
             rest: Box::new(recurse(*rest)?),
         }),
+        // The clone of `sym` reads it like a `let` value: that read is shimmed
+        // and rebinds `sym`, which then shadows the clones after it and `body`.
+        Expr::CaptureClones { mut syms, body } => {
+            let Some(at) = syms.iter().position(|s| *s == sym) else {
+                return Ok(Expr::pre_clone_all(syms, recurse(*body)?));
+            };
+            let after = syms.split_off(at + 1);
+            syms.truncate(at);
+            let rebound = Expr::Let {
+                name: sym,
+                value: Box::new(recurse(Expr::CloneVar(sym))?),
+                body: Box::new(Expr::pre_clone_all(after, *body)),
+            };
+            Ok(Expr::pre_clone_all(syms, rebound))
+        }
         Expr::TailRecur { args } => Ok(Expr::TailRecur {
             args: recurse_all(args)?,
         }),
@@ -9014,8 +9173,9 @@ fn count_self_calls(
         // The TCO nodes are not yet produced when analysis runs (the rewrite is
         // the sole producer and runs AFTER analysis), but the walk stays explicit
         // and total: a `TailLoop` body is tail (`TailRecur` is merged into the
-        // args-descent arm above).
-        Expr::TailLoop { body, .. } => {
+        // args-descent arm above). A `CaptureClones` wrapper is transparent to
+        // tail position.
+        Expr::CaptureClones { body, .. } | Expr::TailLoop { body, .. } => {
             count_self_calls(self_id, arity, body, in_tail, tail, non_tail);
         }
     }
@@ -9079,6 +9239,10 @@ fn rewrite_in_tail(self_id: FuncId, arity: usize, expr: Expr) -> Expr {
         Expr::Let { name, value, body } => Expr::Let {
             name,
             value,
+            body: Box::new(rewrite_in_tail(self_id, arity, *body)),
+        },
+        Expr::CaptureClones { syms, body } => Expr::CaptureClones {
+            syms,
             body: Box::new(rewrite_in_tail(self_id, arity, *body)),
         },
         Expr::Destructure {
@@ -9493,7 +9657,8 @@ fn collect_func_edges(expr: &Expr, out: &mut BTreeSet<FuncId>) {
         Expr::Lambda { body, .. }
         | Expr::SharedLambda { body, .. }
         | Expr::OnceLambda { body, .. }
-        | Expr::TailLoop { body, .. } => collect_func_edges(body, out),
+        | Expr::TailLoop { body, .. }
+        | Expr::CaptureClones { body, .. } => collect_func_edges(body, out),
         Expr::Cons { head, tail } => {
             collect_func_edges(head, out);
             collect_func_edges(tail, out);
@@ -9588,6 +9753,7 @@ fn body_uses_kernel_where(expr: &Expr, wanted: impl Fn(KernelFn) -> bool + Copy)
         Expr::Lambda { body, .. }
         | Expr::SharedLambda { body, .. }
         | Expr::OnceLambda { body, .. }
+        | Expr::CaptureClones { body, .. }
         | Expr::TailLoop { body, .. } => recur(body),
         Expr::Cons { head, tail } => recur(head) || recur(tail),
         Expr::ListIndexClone { list, .. } | Expr::ListLenCheck { list, .. } => recur(list),
@@ -9988,6 +10154,7 @@ fn collect_node_head_type_refs(
             | Expr::Update { .. }
             | Expr::Apply { .. }
             | Expr::TaskSeq { .. }
+            | Expr::CaptureClones { .. }
             | Expr::TailRecur { .. } => {}
         }
     }
@@ -10040,7 +10207,8 @@ fn collect_child_ir_type_refs(
         Expr::Lambda { body, .. }
         | Expr::SharedLambda { body, .. }
         | Expr::OnceLambda { body, .. }
-        | Expr::TailLoop { body, .. } => collect_body_ir_type_refs(body, enums, records),
+        | Expr::TailLoop { body, .. }
+        | Expr::CaptureClones { body, .. } => collect_body_ir_type_refs(body, enums, records),
         Expr::Cons { head, tail } => {
             collect_body_ir_type_refs(head, enums, records);
             collect_body_ir_type_refs(tail, enums, records);
@@ -10324,6 +10492,7 @@ fn scan_kernel_usage(expr: &Expr, usage: &mut KernelUsage) {
             scan_kernel_usage(effect, usage);
             scan_kernel_usage(rest, usage);
         }
+        Expr::CaptureClones { body, .. } => scan_kernel_usage(body, usage),
         Expr::Ctor { args, .. } | Expr::TailRecur { args } => {
             for a in args {
                 scan_kernel_usage(a, usage);
@@ -10389,7 +10558,8 @@ fn expr_constructs_sqlvalue(expr: &Expr, enums: &[Symbol]) -> bool {
         Expr::Lambda { body, .. }
         | Expr::SharedLambda { body, .. }
         | Expr::OnceLambda { body, .. }
-        | Expr::TailLoop { body, .. } => expr_constructs_sqlvalue(body, enums),
+        | Expr::TailLoop { body, .. }
+        | Expr::CaptureClones { body, .. } => expr_constructs_sqlvalue(body, enums),
         Expr::Cons { head, tail } => {
             expr_constructs_sqlvalue(head, enums) || expr_constructs_sqlvalue(tail, enums)
         }
@@ -11018,13 +11188,17 @@ fn hoistable_plain_lets<'c>(expr: &'c canon::Expr, names: &[Symbol]) -> (usize, 
 
 /// `lets` (outermost first) wrapped around `body`.
 fn fold_lets(lets: Vec<(Symbol, Expr)>, body: Expr) -> Expr {
-    lets.into_iter()
-        .rev()
-        .fold(body, |body, (name, value)| Expr::Let {
-            name,
-            value: Box::new(value),
-            body: Box::new(body),
-        })
+    lets.into_iter().rev().fold(body, |body, (name, value)| {
+        if matches!(value, Expr::CloneVar(v) if v == name) {
+            Expr::pre_clone(name, body)
+        } else {
+            Expr::Let {
+                name,
+                value: Box::new(value),
+                body: Box::new(body),
+            }
+        }
+    })
 }
 
 /// Fail-closed SEAL gate for an adapted-callback kernel whose handler is not supplied.
@@ -11505,6 +11679,13 @@ fn rewrite_var_free_occurrences(
             effect: Box::new(rewrite_var_free_occurrences(target, *effect, on_hit)),
             rest: Box::new(rewrite_var_free_occurrences(target, *rest, on_hit)),
         },
+        Expr::CaptureClones { syms, body } => {
+            if syms.contains(&target) {
+                Expr::CaptureClones { syms, body }
+            } else {
+                Expr::pre_clone_all(syms, rewrite_var_free_occurrences(target, *body, on_hit))
+            }
+        }
         Expr::Ctor {
             home,
             ty,
@@ -17323,10 +17504,11 @@ impl<'a> Lowerer<'a> {
         // The pass fact of every parameter is decided once over the whole
         // program and re-proven at lowering exit; `borrow::run` verifies.
         let env = self.clone_env();
-        ipe_ir::borrow::run(&mut program, |ty| {
+        ipe_ir::borrow::run(&mut program, self.interner, |ty| {
             clone_class::param_is_multiuse_clonable(env, ty)
         })
         .map_err(|d| (d, Vec::new()))?;
+        ipe_ir::refuse_self_clone_lets(&program, self.interner).map_err(|d| (d, Vec::new()))?;
         Ok(program)
     }
 
@@ -20976,10 +21158,21 @@ impl<'a> Lowerer<'a> {
     ) -> DResult<EtaDemand> {
         let mut lets: Vec<(Symbol, Expr)> = Vec::new();
         let mut core = std::mem::replace(slot, Expr::Unit);
-        while let Expr::Let { name, value, body } = core {
-            lets.push((name, *value));
-            core = *body;
-        }
+        // A pre-clone node peels like the self-clone `let`s it stands for;
+        // `fold_lets` rebuilds them as one node.
+        let mut core = loop {
+            core = match core {
+                Expr::Let { name, value, body } => {
+                    lets.push((name, *value));
+                    *body
+                }
+                Expr::CaptureClones { syms, body } => {
+                    lets.extend(syms.into_iter().map(|s| (s, Expr::CloneVar(s))));
+                    *body
+                }
+                other => break other,
+            };
+        };
         let mut site = site;
         if !matches!(
             core,
@@ -42493,7 +42686,7 @@ mod tests {
             let rewritten = rewrite_multiuse_clones(card, &mut remaining, closure_over(param));
             assert_eq!(remaining, 2 - uses, "rewrite_multiuse_clones slot");
             assert_eq!(
-                matches!(rewritten, Expr::Let { .. }),
+                matches!(rewritten, Expr::CaptureClones { .. }),
                 captures,
                 "rewrite_multiuse_clones pre-clone wrap"
             );

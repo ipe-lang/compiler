@@ -5,9 +5,11 @@
 //! source ceiling times [`LOWER_FRAMES_PER_LEVEL`]. The parser's charge keeps
 //! `do`/`let` blocks, operator chains (a composition charged
 //! [`COMPOSE_NESTING`] levels), pipelines, lambdas, `else if` chains and
-//! field-access chains under that IR ceiling. The clone `let`s a capture
-//! rewrite adds and an interpolation's `++` spine are not charged at the
-//! parser, so the emitter's guard may still refuse them.
+//! field-access chains under that IR ceiling, an operator chain charged over
+//! its deepest operand. Lowering adds no nesting of its own past that charge:
+//! the clones a capture rewrite takes are one flat node however many it takes,
+//! and an interpolation's chunks join in a balanced tree as deep as the
+//! logarithm of their count.
 //! [`COMPILE_STACK_BYTES`] is the native stack every compile thread is spawned
 //! with, sized so the at-ceiling shapes fit it.
 //!
@@ -27,7 +29,10 @@ pub const SOURCE_NESTING_LIMIT: u32 = 256;
 /// Most IR levels one source level lowers to.
 ///
 /// A `do` bind lowers to a call plus its continuation lambda, which the
-/// emitter enters as two levels.
+/// emitter enters as two levels. The at-ceiling shapes in the `ipe` crate's
+/// `compile_stack` tests (a `do` read back at its end, an operator chain over
+/// a deep operand, an interpolation sixteen times the ceiling) and the IR
+/// tests of the flat capture-clone node prove the factor holds.
 pub const LOWER_FRAMES_PER_LEVEL: u32 = 2;
 
 /// IR levels one `>>` / `<<` desugars to: a lambda over two nested calls.

@@ -411,7 +411,8 @@ pub(super) fn expr_type_mentions(expr: &Expr, pred: &impl Fn(&IrType) -> bool) -
         | Expr::Update { .. }
         | Expr::Apply { .. }
         | Expr::TaskSeq { .. }
-        | Expr::TailRecur { .. } => false,
+        | Expr::TailRecur { .. }
+        | Expr::CaptureClones { .. } => false,
     };
     if here {
         return true;
@@ -458,7 +459,8 @@ pub(super) fn expr_type_mentions(expr: &Expr, pred: &impl Fn(&IrType) -> bool) -
         Expr::Lambda { body, .. }
         | Expr::SharedLambda { body, .. }
         | Expr::OnceLambda { body, .. }
-        | Expr::TailLoop { body, .. } => expr_type_mentions(body, pred),
+        | Expr::TailLoop { body, .. }
+        | Expr::CaptureClones { body, .. } => expr_type_mentions(body, pred),
         Expr::Apply { func, args } => {
             expr_type_mentions(func, pred) || args.iter().any(|a| expr_type_mentions(a, pred))
         }
@@ -626,7 +628,8 @@ pub(super) fn collect_body_record_shapes(
         | Expr::Update { .. }
         | Expr::Apply { .. }
         | Expr::TaskSeq { .. }
-        | Expr::TailRecur { .. } => {}
+        | Expr::TailRecur { .. }
+        | Expr::CaptureClones { .. } => {}
     }
     // Recurse into every child expression.
     match expr {
@@ -686,7 +689,8 @@ pub(super) fn collect_body_record_shapes(
         Expr::Lambda { body, .. }
         | Expr::SharedLambda { body, .. }
         | Expr::OnceLambda { body, .. }
-        | Expr::TailLoop { body, .. } => collect_body_record_shapes(body, out, seen),
+        | Expr::TailLoop { body, .. }
+        | Expr::CaptureClones { body, .. } => collect_body_record_shapes(body, out, seen),
         Expr::Apply { func, args } => {
             collect_body_record_shapes(func, out, seen);
             for a in args {

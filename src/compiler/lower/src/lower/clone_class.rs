@@ -837,6 +837,25 @@ pub(super) fn rewrite_captured_clones(
                 })
             }
         }
+        // Each listed symbol is cloned from the enclosing scope (a `CloneVar`
+        // read, never a move) and rebinds itself over `body`, like a `Let`.
+        Expr::CaptureClones { syms, body } => {
+            let inner_clone: BTreeSet<Symbol> = clone_set
+                .iter()
+                .copied()
+                .filter(|s| !syms.contains(s))
+                .collect();
+            let inner_noncl: BTreeSet<Symbol> = noncl_set
+                .iter()
+                .copied()
+                .filter(|s| !syms.contains(s))
+                .collect();
+            let body = rewrite_captured_clones(&inner_clone, &inner_noncl, walk, *body, scope)?;
+            Ok(Expr::CaptureClones {
+                syms,
+                body: Box::new(body),
+            })
+        }
         Expr::Destructure {
             binder,
             value,
@@ -1243,7 +1262,7 @@ fn match_arm_peak_uses(sym: Symbol, m: &ipe_ir::Match) -> usize {
 /// and is rewritten:
 /// * bare `Var(sym)` → `CloneVar(sym)`;
 /// * Lambda that captures sym (no parameter re-binds it) →
-///   `Let { name: sym, value: CloneVar(sym), body: Lambda }`.
+///   `CaptureClones { syms: [sym], body: Lambda }` ([`Expr::pre_clone`]).
 ///   The pre-clone rebinding captures the CLONE into the closure while the
 ///   OUTER `sym` remains alive for subsequent uses.
 ///
@@ -1286,7 +1305,7 @@ pub(super) fn rewrite_multiuse_clones(sym: Symbol, remaining: &mut usize, expr: 
                 // `task_map`/`task_and_then` closure nested inside the pipeline
                 // eta-lambda AND consumed by-value in the outer `db_exec` arg).
                 // `force_shared_capture_clones` walks the body and gives every
-                // directly-capturing nested lambda its OWN `let sym = sym.clone()`
+                // directly-capturing nested lambda its OWN pre-clone
                 // wrap, sourced from the fresh owned `sym` this lambda captures.
                 // It is a no-op when there is no nested capturing lambda, so the
                 // steady-state single-closure case stays byte-identical. Applied
@@ -1295,14 +1314,9 @@ pub(super) fn rewrite_multiuse_clones(sym: Symbol, remaining: &mut usize, expr: 
                 let body = Box::new(force_shared_capture_clones(sym, *body));
                 if *remaining > 1 {
                     *remaining -= 1;
-                    // Pre-clone: `let sym = sym.clone() in Lambda { … }`.
-                    // The inner rebinding `sym` shadows the outer; the `move`
-                    // closure inside captures the inner sym (the clone).
-                    Expr::Let {
-                        name: sym,
-                        value: Box::new(Expr::CloneVar(sym)),
-                        body: Box::new(Expr::Lambda { params, ret, body }),
-                    }
+                    // Pre-clone: the inner rebinding `sym` shadows the outer;
+                    // the `move` closure inside captures the clone.
+                    Expr::pre_clone(sym, Expr::Lambda { params, ret, body })
                 } else {
                     *remaining -= 1;
                     Expr::Lambda { params, ret, body }
@@ -1320,11 +1334,7 @@ pub(super) fn rewrite_multiuse_clones(sym: Symbol, remaining: &mut usize, expr: 
                 let body = Box::new(force_shared_capture_clones(sym, *body));
                 if *remaining > 1 {
                     *remaining -= 1;
-                    Expr::Let {
-                        name: sym,
-                        value: Box::new(Expr::CloneVar(sym)),
-                        body: Box::new(Expr::SharedLambda { params, ret, body }),
-                    }
+                    Expr::pre_clone(sym, Expr::SharedLambda { params, ret, body })
                 } else {
                     *remaining -= 1;
                     Expr::SharedLambda { params, ret, body }
@@ -1344,16 +1354,15 @@ pub(super) fn rewrite_multiuse_clones(sym: Symbol, remaining: &mut usize, expr: 
                 let body = Box::new(force_shared_capture_clones(sym, *body));
                 if *remaining > 1 {
                     *remaining -= 1;
-                    Expr::Let {
-                        name: sym,
-                        value: Box::new(Expr::CloneVar(sym)),
-                        body: Box::new(Expr::OnceLambda {
+                    Expr::pre_clone(
+                        sym,
+                        Expr::OnceLambda {
                             params,
                             ret,
                             body,
                             capture,
-                        }),
-                    }
+                        },
+                    )
                 } else {
                     *remaining -= 1;
                     Expr::OnceLambda {
@@ -1424,6 +1433,19 @@ pub(super) fn rewrite_multiuse_clones(sym: Symbol, remaining: &mut usize, expr: 
                 name,
                 value: new_value,
                 body: new_body,
+            }
+        }
+        // Each listed symbol is a `CloneVar` read in the outer scope; a node
+        // listing `sym` shadows it over `body`. A pre-clone the body grows at
+        // its head merges into this node, so pre-clones never nest.
+        Expr::CaptureClones { syms, body } => {
+            for _ in syms.iter().filter(|s| **s == sym) {
+                *remaining = remaining.saturating_sub(1);
+            }
+            if syms.contains(&sym) {
+                Expr::CaptureClones { syms, body }
+            } else {
+                Expr::pre_clone_all(syms, rewrite_multiuse_clones(sym, remaining, *body))
             }
         }
         Expr::Destructure {
@@ -1744,8 +1766,8 @@ mod tests {
         assert!(
             matches!(
                 args.as_slice(),
-                [Expr::Let { name, value, .. }, Expr::Var(s)]
-                    if *name == SYM && matches!(**value, Expr::CloneVar(v) if v == SYM) && *s == SYM
+                [Expr::CaptureClones { syms, .. }, Expr::Var(s)]
+                    if syms.as_slice() == [SYM] && *s == SYM
             ),
             "the capture is the non-last use in Ipê order: {args:?}"
         );

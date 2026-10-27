@@ -276,26 +276,73 @@ fn deep_record_expr_is_p0003() {
 // the source indentation, decides the depth every later stage walks. The
 // boundary is found by search (the enclosing frames' cost is the parser's
 // business), then pinned: the block one statement shorter parses, and the
-// block at the boundary is refused with `NestingTooDeep` in the tail the last
-// statement pushed past the ceiling: that statement or the block's result.
+// block at the boundary is refused with `NestingTooDeep` spanning the whole
+// offending sequence, from its first statement, operand or `if` to the token
+// that crossed the ceiling.
 
-/// A block module's source plus the byte range from its last statement to the end.
+/// A block module's source plus the exact span its refusal must carry.
 type Block = (String, (u32, u32));
 
+/// The module text before `main`'s body.
+const HEADER: &str = "module Main exposing (main)\n\nmain =\n";
+
+/// The `u32` byte offset of `at`.
+fn offset(at: usize) -> u32 {
+    u32::try_from(at).unwrap_or(u32::MAX)
+}
+
+/// The token a block's refusal crosses the ceiling at.
+#[derive(Clone, Copy)]
+enum Crossing {
+    /// The last token of the block's last statement.
+    LastStatement,
+    /// The last token of the block's closing text.
+    Close,
+}
+
 /// A module whose `main` is a block of `n` statements framed by `open` / `close`.
-fn block_module(n: usize, open: &str, stmt: impl Fn(usize) -> String, close: &str) -> Block {
-    let mut src = String::from("module Main exposing (main)\n\nmain =\n");
+fn block_module(
+    n: usize,
+    open: &str,
+    stmt: impl Fn(usize) -> String,
+    close: &str,
+    crossing: Crossing,
+) -> Block {
+    let mut src = String::from(HEADER);
     src.push_str(open);
-    let mut last = 0;
+    let first = stmt(0);
+    let start = src.len() + first.len() - first.trim_start().len();
+    let mut last_end = src.len();
     for i in 0..n {
-        last = src.len();
         src.push_str(&stmt(i));
+        last_end = src.len();
         src.push('\n');
     }
     src.push_str(close);
-    let offset = |at: usize| u32::try_from(at).unwrap_or(u32::MAX);
-    let tail = (offset(last), offset(src.len()));
-    (src, tail)
+    let end = match crossing {
+        Crossing::LastStatement => last_end,
+        Crossing::Close => src.trim_end().len(),
+    };
+    (src, (offset(start), offset(end)))
+}
+
+/// A module whose `main` is `head` followed by `n` copies of `step`, refused
+/// from `head`'s first token through byte `crossing_end` of the last copy.
+fn chain_module(
+    head: &str,
+    n: usize,
+    step: impl Fn(usize) -> String,
+    crossing_end: usize,
+) -> Block {
+    let mut src = format!("{HEADER}    {head}");
+    let start = HEADER.len() + 4;
+    let mut last = src.len();
+    for i in 0..n {
+        last = src.len();
+        src.push_str(&step(i));
+    }
+    src.push('\n');
+    (src, (offset(start), offset(last + crossing_end)))
 }
 
 /// The ceiling as a statement count.
@@ -312,8 +359,8 @@ fn first_refused(build: impl Fn(usize) -> Block) -> Option<usize> {
 }
 
 /// Assert the block of `boundary - 1` statements parses and the block of
-/// `boundary` is refused as `NestingTooDeep` in the tail statement `boundary`
-/// starts.
+/// `boundary` is refused as `NestingTooDeep` spanning exactly the offending
+/// sequence `build` names.
 ///
 /// Returns the boundary.
 fn assert_block_boundary(build: impl Fn(usize) -> Block, label: &str) -> usize {
@@ -335,7 +382,7 @@ fn assert_block_boundary(build: impl Fn(usize) -> Block, label: &str) -> usize {
         boundary - 1
     );
 
-    let (at, (lo, hi)) = build(boundary);
+    let (at, expected) = build(boundary);
     let refused = parse_module(&at, &mut Interner::new());
     assert!(
         matches!(
@@ -359,11 +406,10 @@ fn assert_block_boundary(build: impl Fn(usize) -> Block, label: &str) -> usize {
         SOURCE_NESTING_LIMIT,
         "{label}: the refusal names the ceiling"
     );
-    assert!(
-        span.lo >= lo && span.hi <= hi,
-        "{label}: span {}..{} lies in the crossing tail {lo}..{hi}",
-        span.lo,
-        span.hi
+    assert_eq!(
+        (span.lo, span.hi),
+        expected,
+        "{label}: the refusal spans the offending sequence"
     );
     boundary
 }
@@ -390,6 +436,7 @@ fn do_block_of_binds_is_refused_at_the_ceiling() {
             "    do\n",
             |i| format!("        x{i} <- t"),
             "        t\n",
+            Crossing::LastStatement,
         )
     };
     let boundary = assert_block_boundary(build, "do binds");
@@ -405,7 +452,15 @@ fn do_block_of_binds_is_refused_at_the_ceiling() {
 /// more: with `n` runs the final run's operand sits at depth `10 + n`.
 #[test]
 fn do_block_of_runs_is_refused_at_the_ceiling() {
-    let build = |n: usize| block_module(n, "    do\n", |i| format!("        t{i}"), "        t\n");
+    let build = |n: usize| {
+        block_module(
+            n,
+            "    do\n",
+            |i| format!("        t{i}"),
+            "        t\n",
+            Crossing::Close,
+        )
+    };
     let boundary = assert_block_boundary(build, "do runs");
     let final_atom = FIRST_STATEMENT_DEPTH + STATEMENT_TO_ATOM + 1;
     assert_eq!(
@@ -425,6 +480,7 @@ fn let_block_is_refused_at_the_ceiling() {
             "    let\n",
             |i| format!("        x{i} = 1"),
             "    in\n    1\n",
+            Crossing::LastStatement,
         )
     };
     let boundary = assert_block_boundary(build, "let bindings");
@@ -438,41 +494,84 @@ fn let_block_is_refused_at_the_ceiling() {
 
 /// An operator chain charges one level per operator from its expression's
 /// depth. A declaration body's expression is at depth 0, so the ceiling admits
-/// exactly that many operators and the next one is refused at that operator.
+/// exactly that many operators and the next one is refused, spanning the chain
+/// from its first operand to that operator.
 #[test]
 fn operator_chain_is_refused_one_past_the_ceiling() {
-    let build = |n: usize| {
-        let mut src = String::from("module Main exposing (main)\n\nmain =\n    1");
-        let mut last = src.len();
-        for _ in 0..n {
-            last = src.len();
-            src.push_str(" + 1");
-        }
-        src.push('\n');
-        let offset = |at: usize| u32::try_from(at).unwrap_or(u32::MAX);
-        let tail = (offset(last), offset(src.len()));
-        (src, tail)
-    };
+    let build = |n: usize| chain_module("1", n, |_| " + 1".to_owned(), 2);
     let boundary = assert_block_boundary(build, "operator chain");
     assert_eq!(boundary, ceiling() + 1, "each operator charges one level");
 }
 
+/// The parentheses around the deep operand of a chain-depth test.
+const OPERAND_PARENS: usize = 8;
+
+/// The levels each parenthesis adds over the atom it sits in: its own frame
+/// and the expression, application, postfix and atom frames of its contents.
+const LEVELS_PER_PAREN: usize = 5;
+
+/// `1` wrapped in [`OPERAND_PARENS`] parentheses.
+fn deep_operand() -> String {
+    format!(
+        "{}1{}",
+        "(".repeat(OPERAND_PARENS),
+        ")".repeat(OPERAND_PARENS)
+    )
+}
+
+/// A chain whose first operand nests deep is charged the whole chain over
+/// that operand's depth, since re-association puts it under every operator;
+/// the refusal spans from that operand's first `(` to the crossing operator.
+#[test]
+fn deep_first_operand_charges_the_chain() {
+    let build = |n: usize| chain_module(&deep_operand(), n, |_| " + 1".to_owned(), 2);
+    let boundary = assert_block_boundary(build, "deep first operand");
+    assert_eq!(
+        boundary,
+        ceiling() + 1 - LEVELS_PER_PAREN * OPERAND_PARENS,
+        "the chain is charged over its deepest operand"
+    );
+}
+
+/// A chain whose last operand nests deep is refused once that operand is
+/// parsed, by the same count as a deep first one, spanning from the chain's
+/// first operand to the operator before the deep one.
+#[test]
+fn deep_last_operand_charges_the_chain() {
+    let build = |n: usize| {
+        let step = move |i: usize| {
+            if i + 1 == n {
+                format!(" + {}", deep_operand())
+            } else {
+                " + 1".to_owned()
+            }
+        };
+        chain_module("1", n, step, 2)
+    };
+    let boundary = assert_block_boundary(build, "deep last operand");
+    assert_eq!(
+        boundary,
+        ceiling() + 1 - LEVELS_PER_PAREN * OPERAND_PARENS,
+        "the chain is charged over its deepest operand"
+    );
+}
+
 /// An `else if` chain lowers to right-nested `If`s, so each `else if` charges
 /// one level: the `if` opens at depth 4 and its arms at 5, so the `k`-th
-/// `else if`'s condition atom sits at depth `8 + k`.
+/// `else if`'s condition atom sits at depth `8 + k`, and the refusal spans
+/// from the `if` to that condition.
 #[test]
 fn else_if_chain_is_refused_at_the_ceiling() {
     let build = |n: usize| {
-        let mut src = String::from("module Main exposing (main)\n\nmain =\n    if True then 1");
-        let mut last = src.len();
-        for _ in 0..n {
-            last = src.len();
-            src.push_str(" else if True then 1");
-        }
+        let (mut src, span) = chain_module(
+            "if True then 1",
+            n,
+            |_| " else if True then 1".to_owned(),
+            13,
+        );
+        src.pop();
         src.push_str(" else 1\n");
-        let offset = |at: usize| u32::try_from(at).unwrap_or(u32::MAX);
-        let tail = (offset(last), offset(src.len()));
-        (src, tail)
+        (src, span)
     };
     let boundary = assert_block_boundary(build, "else if chain");
     let arm_atom = FIRST_STATEMENT_DEPTH + STATEMENT_TO_ATOM - 1;
@@ -486,21 +585,10 @@ fn else_if_chain_is_refused_at_the_ceiling() {
 /// A composition desugars to a lambda over two calls, so each `>>` charges
 /// `COMPOSE_NESTING` levels from its expression's depth: a declaration body's
 /// expression is at depth 0, so the first `>>` whose cumulative charge passes
-/// the ceiling is refused at that operator.
+/// the ceiling is refused, spanning the chain from `f` to that operator.
 #[test]
 fn composition_chain_is_refused_at_its_charged_ceiling() {
-    let build = |n: usize| {
-        let mut src = String::from("module Main exposing (main)\n\nmain =\n    f");
-        let mut last = src.len();
-        for _ in 0..n {
-            last = src.len();
-            src.push_str(" >> f");
-        }
-        src.push('\n');
-        let offset = |at: usize| u32::try_from(at).unwrap_or(u32::MAX);
-        let tail = (offset(last), offset(src.len()));
-        (src, tail)
-    };
+    let build = |n: usize| chain_module("f", n, |_| " >> f".to_owned(), 3);
     let boundary = assert_block_boundary(build, "composition chain");
     let charge = usize::try_from(COMPOSE_NESTING).unwrap_or(usize::MAX);
     assert_eq!(
@@ -514,31 +602,32 @@ fn composition_chain_is_refused_at_its_charged_ceiling() {
 //
 // A dotted run `r.a.….a` is one token but builds one nested `Access` per
 // segment, so each segment costs one level over the depth of the atom it
-// wraps; the segment past the ceiling is refused at its own sub-span.
+// wraps; the segment past the ceiling is refused spanning the chain from its
+// base through that segment.
 
 /// Depth a declaration body's atom is parsed at: below the body's expression,
 /// application and postfix frames.
 const BODY_ATOM_DEPTH: usize = 3;
 
-/// A module whose `main` is `before` followed by `n` `.a` segments.
-fn access_module(before: &str, n: usize) -> Block {
-    let mut src = format!("module Main exposing (main)\n\nmain =\n{before}");
+/// A module whose `main` is `before` followed by `n` `.a` segments, refused
+/// from the chain's base at byte `base` of `before` through the last segment.
+fn access_module(before: &str, base: usize, n: usize) -> Block {
+    let mut src = format!("{HEADER}{before}");
+    let start = HEADER.len() + base;
     let mut last = src.len();
     for _ in 0..n {
         last = src.len();
         src.push_str(".a");
     }
     src.push('\n');
-    let offset = |at: usize| u32::try_from(at).unwrap_or(u32::MAX);
-    let tail = (offset(last), offset(src.len()));
-    (src, tail)
+    (src, (offset(start), offset(last + 2)))
 }
 
 /// `r.a.….a` in a declaration body: the identifier's atom sits at depth 3,
 /// so the ceiling admits that many fewer segments.
 #[test]
 fn access_chain_is_refused_at_the_ceiling() {
-    let boundary = assert_block_boundary(|n| access_module("    r", n), "access chain");
+    let boundary = assert_block_boundary(|n| access_module("    r", 4, n), "access chain");
     assert_eq!(
         boundary,
         ceiling() + 1 - BODY_ATOM_DEPTH,
@@ -550,7 +639,7 @@ fn access_chain_is_refused_at_the_ceiling() {
 /// bare dotted identifier sits at.
 #[test]
 fn postfix_access_chain_is_refused_at_the_ceiling() {
-    let boundary = assert_block_boundary(|n| access_module("    (r)", n), "postfix access");
+    let boundary = assert_block_boundary(|n| access_module("    (r)", 4, n), "postfix access");
     assert_eq!(
         boundary,
         ceiling() + 1 - BODY_ATOM_DEPTH,
@@ -562,7 +651,7 @@ fn postfix_access_chain_is_refused_at_the_ceiling() {
 /// desugars to, one level below the atom.
 #[test]
 fn accessor_chain_is_refused_at_the_ceiling() {
-    let boundary = assert_block_boundary(|n| access_module("    ", n), "accessor chain");
+    let boundary = assert_block_boundary(|n| access_module("    ", 4, n), "accessor chain");
     assert_eq!(
         boundary,
         ceiling() + 1 - (BODY_ATOM_DEPTH + 1),
@@ -574,14 +663,15 @@ fn accessor_chain_is_refused_at_the_ceiling() {
 const MIXED_BINDS: usize = 120;
 
 /// A `do` block of `MIXED_BINDS` binds whose final statement is `r` and `n`
-/// segments.
+/// segments, refused as the access chain from `r` on.
 fn do_then_access(n: usize) -> Block {
     let mut block = String::from("    do\n");
     for i in 0..MIXED_BINDS {
         let _ = writeln!(block, "        x{i} <- t");
     }
     block.push_str("        r");
-    access_module(&block, n)
+    let base = block.len() - 1;
+    access_module(&block, base, n)
 }
 
 /// A chain closing a `do` block charges from the block's charged depth, so a
@@ -600,16 +690,17 @@ fn access_chain_after_do_block_is_refused_at_parse() {
     );
 
     let long = ceiling() - BODY_ATOM_DEPTH;
-    let (alone, _) = access_module("    r", long);
+    let (alone, _) = access_module("    r", 4, long);
     let admitted = parse_module(&alone, &mut Interner::new());
     assert!(
         admitted.is_ok(),
         "{long} segments in a declaration body must parse: {admitted:?}"
     );
-    let (mixed, (_, hi)) = do_then_access(long);
-    let lo = mixed.find("        r.a").map_or(0, |at| {
-        u32::try_from(at + "        r".len()).unwrap_or(u32::MAX)
-    });
+    let (mixed, _) = do_then_access(long);
+    let base = mixed
+        .find("        r.a")
+        .map_or(0, |at| at + "        ".len());
+    let expected = (offset(base), offset(base + 1 + 2 * boundary));
     let refused = parse_module(&mixed, &mut Interner::new());
     assert!(
         matches!(
@@ -625,8 +716,9 @@ fn access_chain_after_do_block_is_refused_at_parse() {
         Err(Diagnostic::Parse { span, .. }) => (span.lo, span.hi),
         _ => (0, 0),
     };
-    assert!(
-        at_lo >= lo && at_hi <= hi,
-        "the refusal at {at_lo}..{at_hi} lies in the chain {lo}..{hi}"
+    assert_eq!(
+        (at_lo, at_hi),
+        expected,
+        "the refusal spans the chain from `r` through segment {boundary}"
     );
 }

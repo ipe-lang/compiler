@@ -7922,7 +7922,7 @@ const fn name_zero() -> Symbol {
 //
 // The raw string is split into alternating `Lit` / `Interp` chunks, each
 // expression chunk is wrapped in the internal `Interpolate` renderer, and the
-// whole list is folded left into a `++` (String.append) binop chain.
+// whole list is joined into a balanced `++` (String.append) binop tree.
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// A parsed chunk from a triple-quoted string.
@@ -8195,7 +8195,7 @@ fn resolve_simple_interp_ref(
     Ok(Located::new(span, resolve_var(sym, span, env, interner)?))
 }
 
-/// Desugar a triple-quoted string into a `++`-chained canonical expression.
+/// Desugar a triple-quoted string into a balanced `++` tree of its chunks.
 /// Entry point from `canonicalise_expr`. Port of
 /// `Ipe.Canonicalise.Expression.desugarMultiline`.
 fn desugar_multiline(
@@ -8222,36 +8222,54 @@ fn desugar_multiline(
         0 => Ok(canon::Expr_::Str(String::new())),
         1 => Ok(parts.remove(0).value),
         _ => {
-            // Left-fold into a `++` chain: ((a ++ b) ++ c) ++ …
-            let mut iter = parts.into_iter();
-            let Some(first) = iter.next() else {
-                // Unreachable: the match arm guards len >= 2.
-                return Ok(canon::Expr_::Str(String::new()));
-            };
             let op_sym = interner.intern("++")?;
             let home_sym = interner.intern("Basics")?;
             let func_sym = interner.intern("append")?;
-            let mut acc = first;
-            for part in iter {
-                let merged_span = Span::new(acc.span.lo, part.span.hi);
-                // Synthetic desugared `++`: no real operator glyph in source.
-                // Zero-width span at the join point — the token walker drops it.
-                let synthetic_op_span = Span::new(acc.span.hi, acc.span.hi);
-                acc = Located::new(
-                    merged_span,
-                    canon::Expr_::Binop {
-                        op: op_sym,
-                        op_span: synthetic_op_span,
-                        home: home_sym,
-                        func: func_sym,
-                        lhs: Box::new(acc),
-                        rhs: Box::new(part),
-                    },
-                );
-            }
-            Ok(acc.value)
+            Ok(balanced_append(parts, op_sym, home_sym, func_sym)
+                .map_or_else(|| canon::Expr_::Str(String::new()), |joined| joined.value))
         }
     }
+}
+
+/// Join `parts` with `++` into a balanced tree, at most `ceil(log2 n)` deep.
+///
+/// Each round appends adjacent pairs left to right (an odd last part passes
+/// to the next round alone), so the order of the parts is kept and, `++`
+/// being associative, so is the value. A flat list of chunks never becomes
+/// a spine as deep as the list is long. An empty `parts` joins to `None`.
+fn balanced_append(
+    mut parts: Vec<canon::Expr>,
+    op_sym: Symbol,
+    home_sym: Symbol,
+    func_sym: Symbol,
+) -> Option<canon::Expr> {
+    while parts.len() > 1 {
+        let mut joined = Vec::with_capacity(parts.len().div_ceil(2));
+        let mut iter = parts.into_iter();
+        while let Some(lhs) = iter.next() {
+            let Some(rhs) = iter.next() else {
+                joined.push(lhs);
+                break;
+            };
+            let merged_span = Span::new(lhs.span.lo, rhs.span.hi);
+            // Synthetic desugared `++`: no real operator glyph in source.
+            // Zero-width span at the join point — the token walker drops it.
+            let synthetic_op_span = Span::new(lhs.span.hi, lhs.span.hi);
+            joined.push(Located::new(
+                merged_span,
+                canon::Expr_::Binop {
+                    op: op_sym,
+                    op_span: synthetic_op_span,
+                    home: home_sym,
+                    func: func_sym,
+                    lhs: Box::new(lhs),
+                    rhs: Box::new(rhs),
+                },
+            ));
+        }
+        parts = joined;
+    }
+    parts.pop()
 }
 
 #[cfg(test)]

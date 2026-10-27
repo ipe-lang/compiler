@@ -6,8 +6,10 @@
 //! depth the parser admits, on the one compile door the commands use
 //! ([`crate::threads::run_compile`], a thread of exactly
 //! [`crate::threads::COMPILE_STACK_BYTES`]); one level deeper is refused by the
-//! parser with `NestingTooDeep` inside its innermost level, never by a later
-//! stage or a stack overflow. Under `IPE_E2E=1` the at-ceiling program of each
+//! parser with `NestingTooDeep` at its innermost level, never by a later stage
+//! or a stack overflow. A shape built as a sequence (a statement run, an
+//! operator chain, an `else if` chain) is refused spanning that whole sequence,
+//! from its first statement, operand or `if` to the token that crossed. Under `IPE_E2E=1` the at-ceiling program of each
 //! shape is also built with cargo.
 //!
 //! A source ceiling and a type ceiling bound different things: an access chain
@@ -48,12 +50,25 @@ const HEADER: &str = "module Main exposing (main)\n\n\
 const DEEP_HEAD: &str = "main =\n    Io.println (String.fromInt (deep 1))\n\n\n\
                          deep : Int -> Int\ndeep x =\n";
 
-/// A shape's source and the byte range its refusal one level past the ceiling
-/// must lie in: the innermost nesting level, or a sequence's last element
-/// through the end.
+/// A shape's source and where its refusal one level past the ceiling must sit.
+///
+/// The refusal ends in `tail`: the innermost nesting level, or a sequence's
+/// last element through the end. For a sequence it starts exactly at `start`,
+/// the sequence's first byte; otherwise it lies wholly in `tail`.
 struct Shaped {
     src: String,
     tail: (u32, u32),
+    start: Option<u32>,
+}
+
+impl Shaped {
+    /// This shape, refused as the sequence that begins at byte `at`.
+    fn starting_at(self, at: usize) -> Self {
+        Self {
+            start: Some(offset(at)),
+            ..self
+        }
+    }
 }
 
 /// A source generator of one nesting shape, by depth.
@@ -101,6 +116,7 @@ fn nested(n: usize, before: &str, open: &str, core: &str, close: &str, after: &s
     Shaped {
         src,
         tail: (offset(lo), offset(hi)),
+        start: None,
     }
 }
 
@@ -115,48 +131,60 @@ fn sequence(n: usize, before: &str, step: impl Fn(usize) -> String, after: &str)
     }
     src.push_str(after);
     let tail = (offset(lo), offset(src.len()));
-    Shaped { src, tail }
+    Shaped {
+        src,
+        tail,
+        start: None,
+    }
 }
 
-/// A `do` block of `n` binds.
+/// The indentation of a `do` or `let` block's statements under `main`.
+const BLOCK_INDENT: usize = 8;
+
+/// A `do` block of `n` binds, refused from its first statement.
 fn do_binds(n: usize) -> Shaped {
+    let before = "main =\n    do\n";
     sequence(
         n,
-        "main =\n    do\n",
+        before,
         |_| "        _ <- Io.println \"s\"\n".to_owned(),
         "        Io.println \"e\"\n",
     )
+    .starting_at(HEADER.len() + before.len() + BLOCK_INDENT)
 }
 
-/// A `let` block of `n` bindings after `x0`, each reading the one before it.
+/// A `let` block of `n` bindings after `x0`, each reading the one before it,
+/// refused from `x0`.
 fn let_block(n: usize) -> Shaped {
+    let before = "main =\n    let\n";
     let body = format!("    in\n    Io.println (String.fromInt x{n})\n");
     sequence(
         n,
-        "main =\n    let\n        x0 = 0\n",
+        &format!("{before}        x0 = 0\n"),
         |i| format!("        x{} = x{i} + 1\n", i + 1),
         &body,
     )
+    .starting_at(HEADER.len() + before.len() + BLOCK_INDENT)
 }
 
-/// A chain of `n` `+` operators.
+/// A chain of `n` `+` operators, refused from its first operand.
 fn binop_chain(n: usize) -> Shaped {
-    sequence(
-        n,
-        "main =\n    Io.println (String.fromInt (1",
-        |_| " + 1".to_owned(),
-        "))\n",
-    )
+    let before = "main =\n    Io.println (String.fromInt (1";
+    sequence(n, before, |_| " + 1".to_owned(), "))\n")
+        .starting_at(HEADER.len() + before.len() - "1".len())
 }
 
-/// A composition of `n + 1` `inc`s by `>>`, applied to `1`.
+/// A composition of `n + 1` `inc`s by `>>`, applied to `1`, refused from the
+/// first `inc`.
 fn compose_chain(n: usize) -> Shaped {
+    let before = "main =\n    Io.println (String.fromInt ((inc";
     sequence(
         n,
-        "main =\n    Io.println (String.fromInt ((inc",
+        before,
         |_| " >> inc".to_owned(),
         ") 1))\n\n\ninc : Int -> Int\ninc x =\n    x + 1\n",
     )
+    .starting_at(HEADER.len() + before.len() - "inc".len())
 }
 
 /// The bindings `{name}1 = { a = {name}0 }` through `{name}{n}` of a `let`
@@ -185,7 +213,7 @@ fn ceiling_record_access_chain(n: usize) -> Shaped {
 }
 
 /// `n` field accesses `r.a.a.….a` in one dotted identifier, over a record
-/// nested `depth` deep.
+/// nested `depth` deep, refused from `r`.
 ///
 /// The record is built by two top-level `let` blocks of about `depth / 2`
 /// bindings each, so building it stays far under the source ceiling.
@@ -198,22 +226,60 @@ fn access_over(depth: usize, n: usize) -> Shaped {
         record_wraps("x", inner),
         record_wraps("y", outer)
     );
-    sequence(
-        n,
-        "main =\n    Io.println (String.fromInt r",
-        |_| ".a".to_owned(),
-        &after,
-    )
+    let before = "main =\n    Io.println (String.fromInt r";
+    sequence(n, before, |_| ".a".to_owned(), &after)
+        .starting_at(HEADER.len() + before.len() - "r".len())
 }
 
-/// A pipeline of `n` `Task.andThen` continuations.
-fn pipeline(n: usize) -> Shaped {
+/// A `do` of `n` named binds inside a `Task` lambda over a handle, every
+/// bind read by the final statement, refused from the first bind.
+fn do_fan_in(n: usize) -> Shaped {
+    let names: Vec<String> = (1..=n).map(|i| format!("x{i}")).collect();
+    let after = format!(
+        "                report [ {} ]\n        )\n\n\n\
+         withHandle : (Int -> Task Error ()) -> Task Error ()\n\
+         withHandle f =\n    f 0\n\n\n\
+         report : List Int -> Task Error ()\n\
+         report xs =\n    Io.println (String.fromInt (List.length xs))\n",
+        names.join(", ")
+    );
+    let before = "main =\n    withHandle\n        (\\h ->\n            do\n";
+    let indent = "                ";
     sequence(
         n,
-        "main =\n    Io.println \"s\"",
+        before,
+        |i| format!("{indent}x{} <- Task.succeed h\n", i + 1),
+        &after,
+    )
+    .starting_at(HEADER.len() + before.len() + indent.len())
+}
+
+/// The parentheses around the first operand of [`deep_operand_chain`].
+const OPERAND_PARENS: usize = 8;
+
+/// A chain of `n` `+` operators whose first operand is `1` inside
+/// [`OPERAND_PARENS`] parentheses, refused from that operand's first `(`.
+fn deep_operand_chain(n: usize) -> Shaped {
+    let group = "main =\n    Io.println (String.fromInt (";
+    let before = format!(
+        "{group}{}1{}",
+        "(".repeat(OPERAND_PARENS),
+        ")".repeat(OPERAND_PARENS)
+    );
+    sequence(n, &before, |_| " + 1".to_owned(), "))\n").starting_at(HEADER.len() + group.len())
+}
+
+/// A pipeline of `n` `Task.andThen` continuations, refused from its first
+/// operand.
+fn pipeline(n: usize) -> Shaped {
+    let body = "main =\n    ";
+    sequence(
+        n,
+        &format!("{body}Io.println \"s\""),
         |_| " |> Task.andThen (\\_ -> Io.println \"s\")".to_owned(),
         "\n",
     )
+    .starting_at(HEADER.len() + body.len())
 }
 
 /// `n` continuation lambdas, each nested inside the last.
@@ -268,7 +334,11 @@ fn nested_case(n: usize) -> Shaped {
     src.push_str(&" ".repeat(4 + 8 * n));
     src.push_str("x\n");
     let tail = (offset(lo), offset(src.len()));
-    Shaped { src, tail }
+    Shaped {
+        src,
+        tail,
+        start: None,
+    }
 }
 
 /// `n` nested `if` expressions, each in the last one's `then` branch.
@@ -277,31 +347,38 @@ fn nested_if(n: usize) -> Shaped {
     nested(n, &before, "if x > 0 then ", "x", " else 0", "\n")
 }
 
-/// An `if` with `n` `else if` arms.
+/// An `if` with `n` `else if` arms, refused from the `if`.
 fn else_if_chain(n: usize) -> Shaped {
-    let before = format!("{DEEP_HEAD}    if x > 0 then 1");
+    let body = format!("{DEEP_HEAD}    ");
+    let before = format!("{body}if x > 0 then 1");
     sequence(
         n,
         &before,
         |_| " else if x > 1 then 1".to_owned(),
         " else 0\n",
     )
+    .starting_at(HEADER.len() + body.len())
 }
 
 /// `n` nested records `{ a = { a = … } }`, read back through `n` accesses.
+///
+/// The records are the `let` block's binding, so the refusal spans the block
+/// from that binding's name.
 fn nested_record(n: usize) -> Shaped {
+    let block = "main =\n    let\n";
     let after = format!(
         "\n    in\n    Io.println (String.fromInt r{})\n",
         ".a".repeat(n)
     );
     nested(
         n,
-        "main =\n    let\n        r =\n            ",
+        &format!("{block}        r =\n            "),
         "{ a = ",
         "1",
         " }",
         &after,
     )
+    .starting_at(HEADER.len() + block.len() + BLOCK_INDENT)
 }
 
 /// `n` nested list literals, measured by `List.length`.
@@ -330,7 +407,7 @@ fn lambda_chain(n: usize) -> Shaped {
 ///
 /// `L` is the ceiling. A shape's deepest count is the largest `n` whose
 /// deepest atom (named per entry) still sits at depth `L` or less.
-fn shapes() -> [(&'static str, Shape, usize, AtCeiling); 15] {
+fn shapes() -> [(&'static str, Shape, usize, AtCeiling); 17] {
     use AtCeiling::{Builds, TypeRefused};
     let limit = ceiling();
     let compose = usize::try_from(COMPOSE_NESTING).unwrap_or(usize::MAX);
@@ -338,10 +415,21 @@ fn shapes() -> [(&'static str, Shape, usize, AtCeiling); 15] {
     [
         // Bind `k`'s operand atom at depth `9 + 2k`, the final run's at `10 + 2n`.
         ("do_bind", do_binds, (limit - 10) / 2, Builds),
+        // The `do` atom at depth 13 in the lambda body, the final statement's
+        // list element atom at `25 + 2n`.
+        ("do_fan_in", do_fan_in, (limit - 25) / 2, Builds),
         // The body's `String.fromInt` atom at depth `14 + n`.
         ("let_block", let_block, limit - 14, Builds),
         // The chain's expression at depth 10, each operator one level more.
         ("binop_chain", binop_chain, limit - 10, Builds),
+        // The same chain charged over its first operand, whose atom sits five
+        // levels deeper per parenthesis.
+        (
+            "deep_operand_chain",
+            deep_operand_chain,
+            limit - 10 - 5 * OPERAND_PARENS,
+            Builds,
+        ),
         // The chain's expression at depth 15, each `>>` charged its desugar's levels.
         (
             "compose_chain",
@@ -356,8 +444,10 @@ fn shapes() -> [(&'static str, Shape, usize, AtCeiling); 15] {
             limit - 8,
             TypeRefused,
         ),
-        // The chain's expression at depth 0, each operator one level more.
-        ("pipeline", pipeline, limit, Builds),
+        // Each operator one level more, charged over the chain's deepest
+        // operand: a continuation's body atom sits at depth 13, ten past the
+        // depth 3 a chain of bare atoms is measured from.
+        ("pipeline", pipeline, limit - 10, Builds),
         // Ten levels per continuation; the innermost atom at depth `10n + 3`.
         ("nested_lambda", nested_lambda, (limit - 3) / 10, Builds),
         // The innermost atom at depth `13 + 5n` inside `String.fromInt (…)`.
@@ -443,8 +533,14 @@ fn parser_refusal_span(result: &Result<(), CliError>) -> Option<(u32, u32)> {
     Some((span.lo, span.hi))
 }
 
-/// Assert `result` is the parser's `NestingTooDeep` refusal inside `tail`.
-fn assert_refused_in(result: &Result<(), CliError>, (lo, hi): (u32, u32), name: &str) {
+/// Assert `result` is the parser's `NestingTooDeep` refusal where `tail` and
+/// `start` place it (see [`Shaped`]).
+fn assert_refused_in(
+    result: &Result<(), CliError>,
+    (lo, hi): (u32, u32),
+    start: Option<u32>,
+    name: &str,
+) {
     let span = parser_refusal_span(result);
     assert!(
         span.is_some(),
@@ -454,8 +550,13 @@ fn assert_refused_in(result: &Result<(), CliError>, (lo, hi): (u32, u32), name: 
         return;
     };
     assert!(
-        at_lo >= lo && at_hi <= hi,
-        "{name}: the refusal at {at_lo}..{at_hi} lies in the innermost level {lo}..{hi}"
+        at_hi > lo && at_hi <= hi,
+        "{name}: the refusal at {at_lo}..{at_hi} ends in the innermost level {lo}..{hi}"
+    );
+    assert_eq!(
+        at_lo,
+        start.unwrap_or_else(|| at_lo.max(lo)),
+        "{name}: the refusal at {at_lo}..{at_hi} starts where its sequence does"
     );
 }
 
@@ -480,8 +581,8 @@ fn assert_at_ceiling(result: &Result<(), CliError>, expected: AtCeiling, name: &
 
 /// Every nesting shape compiles at the parser's ceiling on the declared stack,
 /// or is refused there by the type checker when the shape's types pass the
-/// type ceiling first, and one level deeper is refused by the parser inside
-/// its innermost level.
+/// type ceiling first, and one level deeper is refused by the parser at its
+/// innermost level, spanning the whole sequence for a sequence shape.
 #[test]
 fn at_ceiling_shapes_fit_declared_stack() {
     for (name, shape, deepest, expected) in shapes() {
@@ -495,7 +596,7 @@ fn at_ceiling_shapes_fit_declared_stack() {
         assert_at_ceiling(&admitted, expected, name, deepest);
         let past = shape(deepest + 1);
         let refused = compile_on_compile_door(past.src);
-        assert_refused_in(&refused, past.tail, name);
+        assert_refused_in(&refused, past.tail, past.start, name);
     }
 }
 
@@ -545,7 +646,7 @@ fn at_ceiling_shapes_build_with_cargo() {
             }
             let past = shape(deepest + 1);
             let refused = build_shape(&past.src, &scratch.join(format!("{name}_past")), &runtime);
-            assert_refused_in(&refused, past.tail, name);
+            assert_refused_in(&refused, past.tail, past.start, name);
         }
         let _ = std::fs::remove_dir_all(&scratch);
     }
@@ -592,14 +693,18 @@ fn access_chain_at_the_type_ceiling_builds_with_cargo() {
     }
 }
 
-/// An interpolation of as many chunks as the ceiling counts compiles through
-/// emit on the declared stack.
+/// The interpolations of [`interpolation_past_the_source_ceiling_compiles`],
+/// sixteen times the source ceiling.
+const INTERPOLATION_CHUNKS: usize = 4096;
+
+/// An interpolation of far more chunks than the source ceiling counts compiles
+/// through emit on the declared stack: its chunks join in a balanced tree, as
+/// deep as the logarithm of their count.
 #[test]
-fn ceiling_count_interpolation_fits_declared_stack() {
-    let admitted = compile_on_compile_door(interpolation(ceiling()));
+fn interpolation_past_the_source_ceiling_compiles() {
+    let admitted = compile_on_compile_door(interpolation(INTERPOLATION_CHUNKS));
     assert!(
         admitted.is_ok(),
-        "{} interpolations must compile through emit: {admitted:?}",
-        ceiling()
+        "{INTERPOLATION_CHUNKS} interpolations must compile through emit: {admitted:?}"
     );
 }

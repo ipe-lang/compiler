@@ -545,7 +545,8 @@ fn literal_routes(expr: &Expr) -> DResult<()> {
         Expr::Lambda { body, .. }
         | Expr::SharedLambda { body, .. }
         | Expr::OnceLambda { body, .. }
-        | Expr::TailLoop { body, .. } => literal_routes(body),
+        | Expr::TailLoop { body, .. }
+        | Expr::CaptureClones { body, .. } => literal_routes(body),
         Expr::Apply { func, args } => {
             literal_routes(func)?;
             args.iter().try_for_each(literal_routes)
