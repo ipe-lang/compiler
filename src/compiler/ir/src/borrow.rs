@@ -253,10 +253,9 @@ impl BorrowViolation {
                 callee.as_raw()
             ),
             Self::TooDeep { func: id } => format!(
-                "function {} nests deeper than {MAX_IR_RENDER_DEPTH} levels and its name {:?} or home {:?} does not resolve",
+                "function {} nests deeper than {MAX_IR_RENDER_DEPTH} levels and its {} does not resolve",
                 id.as_raw(),
-                owner.name,
-                owner.home.0
+                owner.unresolved_symbols()
             ),
         };
         Diagnostic::CompilerBug { where_, detail }

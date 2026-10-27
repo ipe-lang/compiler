@@ -891,10 +891,9 @@ fn unresolved_site(func: &Func) -> Diagnostic {
     Diagnostic::CompilerBug {
         where_: "ipe_backend_rust::emit_func",
         detail: format!(
-            "function {} nests past the emit ceiling and its name {:?} or home {:?} does not resolve",
+            "function {} nests past the emit ceiling and its {} does not resolve",
             func.id.as_raw(),
-            func.name,
-            func.home.0
+            func.unresolved_symbols()
         ),
     }
 }

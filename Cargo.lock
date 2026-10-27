@@ -3461,6 +3461,7 @@ name = "ipe_lsp_server"
 version = "0.7.1"
 dependencies = [
  "crossbeam-channel",
+ "e2e-support",
  "ipe-test-temp",
  "ipe_db",
  "ipe_diagnostics",

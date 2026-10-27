@@ -52,7 +52,7 @@ fn spawn_chains(text: &str) -> Vec<&str> {
 /// [`STACK_CONSTANT`].
 #[test]
 fn diagnostics_worker_runs_on_the_compile_stack() {
-    let lsp = Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+    let lsp = e2e_support::manifest_dir!().join("..");
     let mut files = Vec::new();
     for crate_dir in std::fs::read_dir(&lsp).into_iter().flatten().flatten() {
         rust_files(&crate_dir.path().join("src"), &mut files);

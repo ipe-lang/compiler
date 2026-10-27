@@ -949,6 +949,24 @@ impl Func {
         Some(ipe_diagnostics::EmitSite { home, name })
     }
 
+    /// This function's name and home as raw symbol indices, for the compiler
+    /// bug a refusal raises when [`Self::emit_site`] is `None`: the symbols do
+    /// not resolve, so their indices are the only faithful rendering.
+    #[must_use]
+    pub fn unresolved_symbols(&self) -> String {
+        let home = self
+            .home
+            .0
+            .iter()
+            .map(|segment| segment.as_raw().to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!(
+            "name symbol {} or home symbols [{home}]",
+            self.name.as_raw()
+        )
+    }
+
     /// The type parameters some parameter type names. A call's arguments let
     /// rustc infer each of them, so a pin on one renders only when it is
     /// [`UserPin::Unit`] ([`UserPin::renders`]).
