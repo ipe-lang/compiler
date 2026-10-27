@@ -63,7 +63,7 @@ struct Shaped {
 
 impl Shaped {
     /// This shape, refused as the sequence that begins at byte `at`.
-    fn from_byte(self, at: usize) -> Self {
+    fn starting_at(self, at: usize) -> Self {
         Self {
             start: Some(offset(at)),
             ..self
@@ -150,7 +150,7 @@ fn do_binds(n: usize) -> Shaped {
         |_| "        _ <- Io.println \"s\"\n".to_owned(),
         "        Io.println \"e\"\n",
     )
-    .from_byte(HEADER.len() + before.len() + BLOCK_INDENT)
+    .starting_at(HEADER.len() + before.len() + BLOCK_INDENT)
 }
 
 /// A `let` block of `n` bindings after `x0`, each reading the one before it,
@@ -164,14 +164,14 @@ fn let_block(n: usize) -> Shaped {
         |i| format!("        x{} = x{i} + 1\n", i + 1),
         &body,
     )
-    .from_byte(HEADER.len() + before.len() + BLOCK_INDENT)
+    .starting_at(HEADER.len() + before.len() + BLOCK_INDENT)
 }
 
 /// A chain of `n` `+` operators, refused from its first operand.
 fn binop_chain(n: usize) -> Shaped {
     let before = "main =\n    Io.println (String.fromInt (1";
     sequence(n, before, |_| " + 1".to_owned(), "))\n")
-        .from_byte(HEADER.len() + before.len() - "1".len())
+        .starting_at(HEADER.len() + before.len() - "1".len())
 }
 
 /// A composition of `n + 1` `inc`s by `>>`, applied to `1`, refused from the
@@ -184,7 +184,7 @@ fn compose_chain(n: usize) -> Shaped {
         |_| " >> inc".to_owned(),
         ") 1))\n\n\ninc : Int -> Int\ninc x =\n    x + 1\n",
     )
-    .from_byte(HEADER.len() + before.len() - "inc".len())
+    .starting_at(HEADER.len() + before.len() - "inc".len())
 }
 
 /// The bindings `{name}1 = { a = {name}0 }` through `{name}{n}` of a `let`
@@ -228,7 +228,7 @@ fn access_over(depth: usize, n: usize) -> Shaped {
     );
     let before = "main =\n    Io.println (String.fromInt r";
     sequence(n, before, |_| ".a".to_owned(), &after)
-        .from_byte(HEADER.len() + before.len() - "r".len())
+        .starting_at(HEADER.len() + before.len() - "r".len())
 }
 
 /// A `do` of `n` named binds inside a `Task` lambda over a handle, every
@@ -251,7 +251,7 @@ fn do_fan_in(n: usize) -> Shaped {
         |i| format!("{indent}x{} <- Task.succeed h\n", i + 1),
         &after,
     )
-    .from_byte(HEADER.len() + before.len() + indent.len())
+    .starting_at(HEADER.len() + before.len() + indent.len())
 }
 
 /// The parentheses around the first operand of [`deep_operand_chain`].
@@ -266,7 +266,7 @@ fn deep_operand_chain(n: usize) -> Shaped {
         "(".repeat(OPERAND_PARENS),
         ")".repeat(OPERAND_PARENS)
     );
-    sequence(n, &before, |_| " + 1".to_owned(), "))\n").from_byte(HEADER.len() + group.len())
+    sequence(n, &before, |_| " + 1".to_owned(), "))\n").starting_at(HEADER.len() + group.len())
 }
 
 /// A pipeline of `n` `Task.andThen` continuations, refused from its first
@@ -279,7 +279,7 @@ fn pipeline(n: usize) -> Shaped {
         |_| " |> Task.andThen (\\_ -> Io.println \"s\")".to_owned(),
         "\n",
     )
-    .from_byte(HEADER.len() + body.len())
+    .starting_at(HEADER.len() + body.len())
 }
 
 /// `n` continuation lambdas, each nested inside the last.
@@ -357,7 +357,7 @@ fn else_if_chain(n: usize) -> Shaped {
         |_| " else if x > 1 then 1".to_owned(),
         " else 0\n",
     )
-    .from_byte(HEADER.len() + body.len())
+    .starting_at(HEADER.len() + body.len())
 }
 
 /// `n` nested records `{ a = { a = … } }`, read back through `n` accesses.
@@ -378,7 +378,7 @@ fn nested_record(n: usize) -> Shaped {
         " }",
         &after,
     )
-    .from_byte(HEADER.len() + block.len() + BLOCK_INDENT)
+    .starting_at(HEADER.len() + block.len() + BLOCK_INDENT)
 }
 
 /// `n` nested list literals, measured by `List.length`.
@@ -555,7 +555,7 @@ fn assert_refused_in(
     );
     assert_eq!(
         at_lo,
-        start.unwrap_or(at_lo.max(lo)),
+        start.unwrap_or_else(|| at_lo.max(lo)),
         "{name}: the refusal at {at_lo}..{at_hi} starts where its sequence does"
     );
 }
