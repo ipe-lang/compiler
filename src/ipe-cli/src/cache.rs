@@ -2211,7 +2211,7 @@ mod tests {
     }
 
     #[test]
-    fn env_cache_dir_respects_disable_and_override() {
+    fn env_cache_dir_is_unset_by_default() {
         // The variables' grammar is driven through `CacheRequest::parse` on raw
         // values, never through `std::env::set_var`; this test checks the
         // default site an unset environment yields.
