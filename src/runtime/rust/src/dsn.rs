@@ -88,9 +88,11 @@ impl TlsMode {
 
 /// A PostgreSQL `sslmode` that does not verify the server certificate.
 ///
-/// No `Dsn` carries one: each is a parse refusal naming the remedy.
+/// No `Dsn` carries one: each is a parse refusal naming the remedy. An
+/// operator connection URL carries one only when every target it dials is
+/// local (`db::PgTransport`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum UnverifiedSslMode {
+pub enum UnverifiedSslMode {
     /// Cleartext only.
     Disable,
     /// Cleartext unless the server demands TLS.
@@ -99,6 +101,19 @@ enum UnverifiedSslMode {
     Prefer,
     /// TLS against any certificate.
     Require,
+}
+
+impl UnverifiedSslMode {
+    /// The `sslmode` token the driver reads for this mode.
+    #[must_use]
+    pub const fn sslmode(self) -> &'static str {
+        match self {
+            Self::Disable => "disable",
+            Self::Allow => "allow",
+            Self::Prefer => "prefer",
+            Self::Require => "require",
+        }
+    }
 }
 
 /// A DSN's network host, proven not to be part of its credentials.

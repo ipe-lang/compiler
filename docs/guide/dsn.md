@@ -8,7 +8,7 @@ is a `Secret` with no accessor, so a descriptor cannot leak a credential.
 
 ## The mental model
 
-Three knots.
+Four knots.
 
 - **`parse` and `build` are the only seals, and they enforce the same invariants.**
   You obtain a `Dsn` from a full URL string (`Dsn.parse`) or from typed parts
@@ -28,6 +28,20 @@ Three knots.
   safe and side-effect-free. `Dsn.open` — which actually dials the host —
   discloses `network` and returns a `Connection ReadOnly`, whose read-only posture
   is a *type*, not a runtime flag: a write against it is a compile error.
+- **The app database URL verifies a remote server too.** The URL the app's own
+  pool dials (`DATABASE_URL`, else the `Db.url` setting, else
+  `postgres://postgres@localhost/ipe`) is not a `Dsn`, but its transport follows
+  the same rule. With no `sslmode`, a remote server is dialled with
+  `sslmode=verify-full`. `sslmode=disable`, `allow`, `prefer` and `require` are
+  admitted only when every host the URL names is a loopback address,
+  `localhost` or a Unix socket (with no `sslmode` there, the connection uses
+  `prefer`); on any other host the app refuses to start. A URL that names no
+  host lets the driver take one from `PGHOST`, so it counts as remote: give a
+  local socket as `?host=/var/run/postgresql`. `PGSSLMODE` never decides the
+  mode. The driver still reads `PGSSLROOTCERT` (an extra trust root),
+  `PGSSLCERT`, `PGSSLKEY`, `PGPASSWORD`, `PGOPTIONS`, `PGAPPNAME` and
+  `~/.pgpass` from the process environment for every Postgres connection; they
+  are operator configuration, so set them only where you mean to.
 
 ## A worked example: parse, redact, reject
 
