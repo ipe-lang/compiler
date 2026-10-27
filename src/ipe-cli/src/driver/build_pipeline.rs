@@ -682,7 +682,7 @@ pub fn build_test_into(
     let blame_path = view
         .module(view.entry())
         .map_or_else(|| manifest_path.clone(), |held| held.path().to_path_buf());
-    let cache_site = cache::env_cache_dir(&target.path()?);
+    let cache_site = cache::env_cache_dir(&target.path()?)?;
     compile_source_set_observed(
         super::PackageSourceSet::from_test_view(view),
         view.entry(),
@@ -955,7 +955,7 @@ pub fn compile_modules(
     source: &SettingsSource<'_>,
     options: BuildOptions,
 ) -> Result<EmittedCrate, CliError> {
-    let cache_site = cache::env_cache_dir(&target.path()?);
+    let cache_site = cache::env_cache_dir(&target.path()?)?;
     compile_modules_observed(
         sources,
         discovered,
@@ -3083,7 +3083,7 @@ fn build_from_sources_for(
         options,
         target.bundle_role(),
     );
-    let cache_site = cache::env_cache_dir(&target.path()?);
+    let cache_site = cache::env_cache_dir(&target.path()?)?;
     compile_source_set_observed(
         source_set,
         &entry_path,

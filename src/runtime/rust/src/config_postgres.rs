@@ -20,6 +20,8 @@ pub fn ipe_db_url() -> String {
     // One config precedence `env > setting-in-code > fallback`: `DATABASE_URL`
     // wins, else an installed `Db.url` setting (a `Secret`, revealed only here at
     // the point of use, never logged), else the built-in local fallback.
+    // `DbUrl::parse` fixes the TLS mode: the `localhost` fallback dials with
+    // `prefer`, and a URL naming any remote host must verify the server.
     crate::system::read_env_var("DATABASE_URL")
         .ok()
         .or_else(crate::app_config::resolve_db_url_override)

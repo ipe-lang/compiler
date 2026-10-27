@@ -21,8 +21,8 @@ const fn json_ct() -> (header::HeaderName, &'static str) {
 /// `false` → the caller skips the console entirely (in-process or proxy).
 ///
 /// Conditions that suppress the console mount:
-/// - sub-app context: the parent owns its own console; a nested app must not
-///   recursively mount one (`IPE_WEB_BASE_PATH` non-empty);
+/// - sub-app context: the parent owns its own console; an app `mount` names a
+///   proxied child or an embedded app must not recursively mount one;
 /// - explicit opt-out via `IPE_CONSOLE_EMBED=off|0|false`;
 /// - `IPE_CONSOLE_AUTH` resolving to `off` (operator declared the surface
 ///   absent, or set an unrecognised value — fail closed);
@@ -32,11 +32,8 @@ const fn json_ct() -> (header::HeaderName, &'static str) {
 ///
 /// This function is reqwest-free; it lives here so the mount decision is
 /// available regardless of whether `http_client` is compiled in.
-pub fn gate_allows() -> bool {
-    if crate::system::read_env_var("IPE_WEB_BASE_PATH")
-        .map(|v| !v.is_empty())
-        .unwrap_or(false)
-    {
+pub(crate) fn gate_allows(mount: &super::MountContext) -> bool {
+    if mount.is_sub_app() {
         return false;
     }
     if matches!(
@@ -701,7 +698,7 @@ mod tests {
             assert_eq!(resolved.posture, Posture::Production);
         }
         assert!(
-            !gate_allows(),
+            !gate_allows(&super::super::MountContext::Root),
             "no admin credential: the console must not mount"
         );
         for surface in [Surface::Console, Surface::Metrics] {
@@ -725,7 +722,7 @@ mod tests {
         };
         assert_eq!(resolved.posture, posture);
         assert_eq!(resolved.mode, ConsoleAuthMode::UnsetProd);
-        assert!(!gate_allows());
+        assert!(!gate_allows(&super::super::MountContext::Root));
         assert!(gate_blocked(Surface::Console, &axum::http::HeaderMap::new()).is_some());
         seed_console_env(&[]);
     }
@@ -840,17 +837,49 @@ mod tests {
         assert!(!ends_raw_text_early(CONSOLE_JS) && !ends_raw_text_early(CONSOLE_CSS));
     }
 
+    /// A proxied child and an embedded app never mount a console, even with the
+    /// admin credential that mounts the root app's console.
     #[test]
+    #[allow(clippy::expect_used)] // `/billing` is a grammar base
     fn gate_skips_in_subapp_context() {
-        crate::system::locked_set_var("IPE_WEB_BASE_PATH", "/billing");
-        assert!(!gate_allows());
-        crate::system::locked_remove_var("IPE_WEB_BASE_PATH");
+        use super::super::MountContext;
+        let base = crate::encoding::MountBase::parse("/billing").expect("a grammar base");
+        seed_console_env(&[("IPE_ADMIN_TOKEN", "an-admin-token")]);
+        assert!(
+            gate_allows(&MountContext::Root),
+            "the root app mounts its console"
+        );
+        for mount in [
+            MountContext::ProxiedChild { base: base.clone() },
+            MountContext::Embedded { base },
+            MountContext::Embedded {
+                base: crate::encoding::MountBase::root(),
+            },
+        ] {
+            assert!(!gate_allows(&mount), "{mount:?} must not mount a console");
+        }
+        seed_console_env(&[]);
+    }
+
+    /// The root app's console decision reads only its own context: building an
+    /// embedded app's context first leaves it unchanged.
+    #[test]
+    #[allow(clippy::expect_used)] // `/billing` is a grammar base
+    fn root_gate_ignores_an_embedded_context_built_first() {
+        use super::super::MountContext;
+        seed_console_env(&[]);
+        let before = gate_allows(&MountContext::Root);
+        let embedded = MountContext::Embedded {
+            base: crate::encoding::MountBase::parse("/billing").expect("a grammar base"),
+        };
+        assert!(!gate_allows(&embedded));
+        assert_eq!(gate_allows(&MountContext::Root), before);
     }
 
     #[test]
     fn gate_skips_on_explicit_off() {
         crate::system::locked_set_var("IPE_CONSOLE_EMBED", "off");
-        assert!(!gate_allows());
+        assert!(!gate_allows(&super::super::MountContext::Root));
         crate::system::locked_remove_var("IPE_CONSOLE_EMBED");
     }
 

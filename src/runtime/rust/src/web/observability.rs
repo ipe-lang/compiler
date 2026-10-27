@@ -81,8 +81,10 @@ pub async fn metrics() -> impl IntoResponse {
 /// axum middleware: per-request observability (— its access-log +
 /// OTel-span middleware wraps the whole mux). Counts every request, and for
 /// user-facing requests auto-records a span + an access log so the console has
-/// data without the app calling `Ipe.Trace`/`Ipe.Log` itself.
-pub async fn track(
+/// data without the app calling `Ipe.Trace`/`Ipe.Log` itself. `mount` names the
+/// app this layer wraps.
+pub(crate) async fn track(
+    axum::extract::State(mount): axum::extract::State<std::sync::Arc<super::MountContext>>,
     req: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> axum::response::Response {
@@ -103,10 +105,11 @@ pub async fn track(
     // Auto request span + access log — but NOT for the internal observability
     // surface (SSE long-poll → multi-minute span; console proxy / metrics /
     // health → console's own polling noise) and NOT for a sub-app. A sub-app
-    // (`IPE_WEB_BASE_PATH` set — e.g. the console child collector) must not
-    // self-instrument into the store it serves; it shows the PARENT's pushed
-    // telemetry, not its own page renders.
-    if !is_internal_path(&path) && !is_sub_app() {
+    // (a proxied child such as the console collector, or an embedded app) must
+    // not self-instrument into the store it serves; it shows the PARENT's
+    // pushed telemetry, not its own page renders. The decision is this mount's
+    // own, so an embedded app never switches off the root app's telemetry.
+    if !is_internal_path(&path) && !mount.is_sub_app() {
         let dur_us = start.elapsed().as_micros().min(u64::MAX as u128) as u64;
         // Request-latency histogram .
         // UNLABELED on purpose — labeling by the raw path would be an unbounded-
@@ -192,21 +195,6 @@ fn sanitise_path(path: &str) -> String {
 /// the SSE long-poll (a multi-minute span), the console reverse-proxy + its
 /// events (the console's own traffic), and the health/metrics/build/ingest
 /// endpoints (operator polling noise).
-/// True when this process runs as a sub-app (mounted behind a parent's proxy,
-/// `IPE_WEB_BASE_PATH` non-empty) — e.g. the bundled console child. Fixed for
-/// the process lifetime (set once at spawn by the parent's `MountSubApp`), so
-/// the env read is memoized: `track` runs this on every user-facing request,
-/// and `env::var` both locks the process-global env mutex and heap-allocates a
-/// `String` per call.
-fn is_sub_app() -> bool {
-    static SUB_APP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *SUB_APP.get_or_init(|| {
-        crate::system::read_env_var("IPE_WEB_BASE_PATH")
-            .map(|v| !v.is_empty())
-            .unwrap_or(false)
-    })
-}
-
 fn is_internal_path(path: &str) -> bool {
     path == "/_ipe/sse"
         || path == "/_ipe/event"
@@ -357,7 +345,10 @@ mod tests {
                         .into_response()
                 },
             ))
-            .layer(axum::middleware::from_fn(track));
+            .layer(axum::middleware::from_fn_with_state(
+                std::sync::Arc::new(crate::web::MountContext::Root),
+                track,
+            ));
 
         let req = match Request::builder().uri("/boom").body(Body::empty()) {
             Ok(r) => r,
@@ -435,7 +426,10 @@ mod tests {
                         .into_response()
                 },
             ))
-            .layer(axum::middleware::from_fn(track));
+            .layer(axum::middleware::from_fn_with_state(
+                std::sync::Arc::new(crate::web::MountContext::Root),
+                track,
+            ));
 
         let call = |path: &'static str| {
             let app = app.clone();
@@ -496,5 +490,56 @@ mod tests {
         assert!(body_string(r2).await.contains("draining"));
         // Restore for any other test ordering (process-global flag).
         READY.store(true, Ordering::SeqCst);
+    }
+
+    /// The request `path` served through `track` for the app `mount` names.
+    #[allow(clippy::expect_used)] // test helper: a request build failure is an environment issue
+    async fn serve_at(mount: crate::web::MountContext, path: &str) {
+        use tower::ServiceExt; // oneshot
+        async fn ok() -> axum::response::Response {
+            (StatusCode::OK, "ok").into_response()
+        }
+        let app = axum::Router::new().fallback(axum::routing::get(ok)).layer(
+            axum::middleware::from_fn_with_state(std::sync::Arc::new(mount), track),
+        );
+        let req = axum::http::Request::builder()
+            .uri(path)
+            .body(axum::body::Body::empty())
+            .expect("build request");
+        let resp = app.oneshot(req).await.unwrap_or_else(|e| match e {});
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    /// Whether the access log names a request to `path`.
+    fn logged(path: &str) -> bool {
+        crate::telemetry::recent_logs(usize::MAX)
+            .iter()
+            .any(|entry| entry.message.contains(path))
+    }
+
+    /// An embedded or proxied-child mount records no access log of its own,
+    /// and serving one never switches off the root app's: the root app logs
+    /// before and after a sub-app is served.
+    #[tokio::test]
+    #[allow(clippy::expect_used)] // `/billing` is a grammar base
+    async fn a_sub_app_mount_never_silences_the_root_app_telemetry() {
+        use crate::web::MountContext;
+        let base = crate::encoding::MountBase::parse("/billing").expect("a grammar base");
+        serve_at(MountContext::Root, "/root-before-sub-app").await;
+        serve_at(
+            MountContext::Embedded { base: base.clone() },
+            "/embedded-request",
+        )
+        .await;
+        serve_at(
+            MountContext::ProxiedChild { base },
+            "/proxied-child-request",
+        )
+        .await;
+        serve_at(MountContext::Root, "/root-after-sub-app").await;
+        assert!(logged("/root-before-sub-app"));
+        assert!(!logged("/embedded-request"));
+        assert!(!logged("/proxied-child-request"));
+        assert!(logged("/root-after-sub-app"));
     }
 }

@@ -214,8 +214,9 @@ fn ipe_err<E: crate::FromIpeError>(engine: DbEngine, e: &sqlx::Error) -> E {
 /// The Ipê `Error` for a refused connect.
 ///
 /// A driver failure keeps its classification; the dial-target ceiling is a
-/// `LimitExceeded` refusal; a malformed or mismatched location is
-/// `InvalidInput`, a dial policy refusal `PermissionDenied`, and a missing
+/// `LimitExceeded` refusal; a malformed or mismatched location, or one whose
+/// TLS mode does not verify a remote server, is `InvalidInput`, a dial policy
+/// refusal `PermissionDenied`, and a missing
 /// relay `Unavailable`. `context` prefixes the message.
 pub(crate) fn connect_refusal<E: crate::FromIpeError>(
     context: &str,
@@ -239,6 +240,7 @@ pub(crate) fn connect_refusal<E: crate::FromIpeError>(
         DbConnectError::InvalidUrl
         | DbConnectError::MisplacedUserinfo
         | DbConnectError::UnsupportedScheme
+        | DbConnectError::UnverifiedTls { .. }
         | DbConnectError::EngineMismatch { .. }
         | DbConnectError::EngineRefused(_) => {
             E::from_ipe_error(IpeError::invalid_input(format!("{context}{refused}")))
@@ -1694,6 +1696,16 @@ pub enum DbConnectError {
     },
     /// The SSRF gate refused a target the URL dials.
     HostRefused(crate::ssrf::SsrfRefusal),
+    /// A PostgreSQL URL names an `sslmode` that does not verify the server
+    /// while it dials a target that is not local.
+    ///
+    /// Only a loopback address, `localhost`, or a Unix socket has no on-path
+    /// party to read or alter the connection, so only there is such a mode
+    /// admitted (see `PgTransport`).
+    UnverifiedTls {
+        /// The unverified mode the URL names.
+        mode: crate::dsn::UnverifiedSslMode,
+    },
     /// The driver could not open the pool.
     Unreachable(DriverFailure),
     /// The local relay that pins a TLS dial to its vetted address could not
@@ -1729,6 +1741,14 @@ impl std::fmt::Display for DbConnectError {
                 driver.name()
             ),
             Self::HostRefused(refusal) => write!(f, "db: {refusal}"),
+            Self::UnverifiedTls { mode } => write!(
+                f,
+                "db: sslmode={} {}, so it is admitted only when every host the connection \
+                 URL names is a loopback address, `localhost` or a Unix socket; use \
+                 sslmode=verify-full (the default) or sslmode=verify-ca",
+                mode.sslmode(),
+                mode.risk()
+            ),
             Self::Unreachable(failure) | Self::VersionUnreadable(failure) => {
                 write!(f, "db: {failure}")
             }
@@ -1866,25 +1886,152 @@ pub struct SqliteUrl {
     shared_file: bool,
 }
 
-/// A PostgreSQL connection URL and every target it makes the driver dial.
+/// How a PostgreSQL connection protects its transport, read once from its URL.
+///
+/// The driver is always handed this mode explicitly, so neither `PGSSLMODE`
+/// nor the driver's own `prefer` default ever decides it. A mode that does not
+/// verify the server is representable only for a URL whose every dial target
+/// is local, where no on-path party exists.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PgTransport {
+    /// TLS that verifies the server certificate: what any URL that dials a
+    /// remote target must carry, and what an absent `sslmode` there means.
+    Verified(crate::dsn::TlsMode),
+    /// A mode that does not verify the server, on a URL that dials only a
+    /// loopback address, `localhost`, or a Unix socket. An absent `sslmode`
+    /// there means `prefer`.
+    Local(crate::dsn::UnverifiedSslMode),
+}
+
+impl PgTransport {
+    /// The posture of a URL naming `written` (its `sslmode`, if any) that dials `targets`.
+    ///
+    /// # Errors
+    ///
+    /// [`DbConnectError::UnverifiedTls`] for an unverified mode on a URL with
+    /// a target that is not local.
+    fn of(
+        written: Option<sqlx::postgres::PgSslMode>,
+        targets: &[DialTarget],
+    ) -> Result<Self, DbConnectError> {
+        use crate::dsn::{TlsMode, UnverifiedSslMode};
+        use sqlx::postgres::PgSslMode;
+        let local = !targets.is_empty() && targets.iter().all(DialTarget::is_local);
+        let unverified = match written {
+            Some(PgSslMode::VerifyFull) => return Ok(Self::Verified(TlsMode::VerifyFull)),
+            Some(PgSslMode::VerifyCa) => return Ok(Self::Verified(TlsMode::VerifyCa)),
+            None if local => return Ok(Self::Local(UnverifiedSslMode::Prefer)),
+            None => return Ok(Self::Verified(TlsMode::VerifyFull)),
+            Some(PgSslMode::Disable) => UnverifiedSslMode::Disable,
+            Some(PgSslMode::Allow) => UnverifiedSslMode::Allow,
+            Some(PgSslMode::Prefer) => UnverifiedSslMode::Prefer,
+            Some(PgSslMode::Require) => UnverifiedSslMode::Require,
+        };
+        if local {
+            Ok(Self::Local(unverified))
+        } else {
+            Err(DbConnectError::UnverifiedTls { mode: unverified })
+        }
+    }
+
+    /// Whether the driver may negotiate TLS under this posture.
+    const fn negotiates_tls(self) -> bool {
+        use crate::dsn::UnverifiedSslMode;
+        match self {
+            Self::Verified(_)
+            | Self::Local(UnverifiedSslMode::Prefer | UnverifiedSslMode::Require) => true,
+            Self::Local(UnverifiedSslMode::Disable | UnverifiedSslMode::Allow) => false,
+        }
+    }
+
+    /// The driver's mode for this posture.
+    const fn ssl_mode(self) -> sqlx::postgres::PgSslMode {
+        use crate::dsn::{TlsMode, UnverifiedSslMode};
+        use sqlx::postgres::PgSslMode;
+        match self {
+            Self::Verified(TlsMode::VerifyFull) => PgSslMode::VerifyFull,
+            Self::Verified(TlsMode::VerifyCa) => PgSslMode::VerifyCa,
+            Self::Local(UnverifiedSslMode::Disable) => PgSslMode::Disable,
+            Self::Local(UnverifiedSslMode::Allow) => PgSslMode::Allow,
+            Self::Local(UnverifiedSslMode::Prefer) => PgSslMode::Prefer,
+            Self::Local(UnverifiedSslMode::Require) => PgSslMode::Require,
+        }
+    }
+}
+
+/// The `sslmode` `url` names, read as the driver reads it, or `None` when it names none.
+///
+/// The driver reads both `sslmode` and `ssl-mode`, refuses any value it does
+/// not know, and keeps the last; so does this.
+///
+/// # Errors
+///
+/// [`DbConnectError::InvalidUrl`] for a value the driver does not know.
+fn written_ssl_mode(
+    url: &UnambiguousUrl,
+) -> Result<Option<sqlx::postgres::PgSslMode>, DbConnectError> {
+    let mut written = None;
+    for (key, value) in crate::ssrf::DriverParityQuery::of(url).pairs() {
+        if matches!(&*key, "sslmode" | "ssl-mode") {
+            written = Some(
+                value
+                    .parse::<sqlx::postgres::PgSslMode>()
+                    .map_err(|_| DbConnectError::InvalidUrl)?,
+            );
+        }
+    }
+    Ok(written)
+}
+
+impl DialTarget {
+    /// Whether this target is local: a Unix socket, a loopback IP literal, or `localhost`.
+    ///
+    /// A driver default is not local: the driver may take its host from
+    /// `PGHOST`, which can name any host.
+    fn is_local(&self) -> bool {
+        match self {
+            Self::Socket => true,
+            Self::DriverDefault => false,
+            Self::Tcp { host, .. } => {
+                let host = host.as_str();
+                host.eq_ignore_ascii_case("localhost")
+                    || crate::ssrf::strip_ipv6_brackets(host)
+                        .parse::<std::net::IpAddr>()
+                        .is_ok_and(|ip| ip.is_loopback())
+            }
+        }
+    }
+}
+
+/// A PostgreSQL connection URL, every target it makes the driver dial, and
+/// the transport its connections use.
 pub struct PostgresUrl {
     url: UnambiguousUrl,
     targets: Vec<DialTarget>,
+    transport: PgTransport,
 }
 
 impl PostgresUrl {
-    /// Read every dial target of `url`.
+    /// Read every dial target of `url` and the transport they are dialled with.
     ///
     /// # Errors
     ///
     /// [`DbConnectError::MisplacedUserinfo`] when the userinfo is ambiguous,
-    /// and [`DbConnectError::InvalidUrl`] when the targets cannot be read.
+    /// [`DbConnectError::InvalidUrl`] when the targets or the `sslmode` cannot
+    /// be read, and [`DbConnectError::UnverifiedTls`] when an unverified mode
+    /// meets a target that is not local.
     fn parse(url: &str) -> Result<Self, DbConnectError> {
         let url = UnambiguousUrl::parse(url).map_err(|unproven| match unproven {
             UrlUnproven::AmbiguousUserinfo => DbConnectError::MisplacedUserinfo,
             UrlUnproven::Invalid => DbConnectError::InvalidUrl,
         })?;
-        read_dial_targets(&url).map(|targets| Self { url, targets })
+        let targets = read_dial_targets(&url)?;
+        let transport = PgTransport::of(written_ssl_mode(&url)?, &targets)?;
+        Ok(Self {
+            url,
+            targets,
+            transport,
+        })
     }
 }
 
@@ -1909,7 +2056,9 @@ impl DbUrl {
     ///
     /// [`DbConnectError::UnsupportedScheme`] for any other scheme, and
     /// [`DbConnectError::InvalidUrl`] for a SQLite URL the driver cannot read
-    /// or a PostgreSQL URL whose dial targets cannot be read.
+    /// or a PostgreSQL URL whose dial targets or `sslmode` cannot be read,
+    /// and [`DbConnectError::UnverifiedTls`] for a PostgreSQL URL whose
+    /// `sslmode` does not verify a server it dials beyond this host.
     pub fn parse(url: &str) -> Result<Self, DbConnectError> {
         match url_scheme(url) {
             None | Some("sqlite" | "file") => Ok(Self::Sqlite(SqliteUrl {
@@ -2009,15 +2158,16 @@ async fn postgres_connect_options<R: HostResolver>(
         let dial = vet_dial_target(target, policy, resolver).await?;
         vetted.push((target.clone(), dial));
     }
-    let options: sqlx::postgres::PgConnectOptions = url
+    let options = url
         .url
         .as_str()
-        .parse()
-        .map_err(|_| DbConnectError::InvalidUrl)?;
+        .parse::<sqlx::postgres::PgConnectOptions>()
+        .map_err(|_| DbConnectError::InvalidUrl)?
+        .ssl_mode(url.transport.ssl_mode());
     match policy {
         DialPolicy::AllowAll => Ok((options, None)),
         DialPolicy::DenyPrivate => {
-            pin_postgres_options(&url.url, options, &vetted, relay, resolver, max_connections).await
+            pin_postgres_options(url, options, &vetted, relay, resolver, max_connections).await
         }
     }
 }
@@ -2044,15 +2194,16 @@ const HOST_RELAY: RelaySupport = if cfg!(unix) {
 /// host and port, so the name is resolved once; a host the target scan did not
 /// name is vetted here. A host `url` does not name is refused as unproven.
 ///
-/// An IP-literal host, or any host under a mode that never negotiates TLS, is
-/// replaced by the vetted address. A named host that may negotiate TLS keeps
-/// its name, because the driver sends it as SNI and verifies the certificate
+/// The TLS decision is read from `url`'s [`PgTransport`], the posture the
+/// options were built with. An IP-literal host, or any host under a mode that
+/// never negotiates TLS, is replaced by the vetted address. A named host that
+/// may negotiate TLS keeps its name, because the driver sends it as SNI and verifies the certificate
 /// against it; the driver instead dials the socket of a `PinnedRelay` that
 /// carries every connection to the vetted address, so no dial resolves the
 /// name again. Where `relay` is [`RelaySupport::Absent`], `verify-full` on a
 /// named host is refused rather than silently weakened.
 async fn pin_postgres_options<R: HostResolver>(
-    url: &UnambiguousUrl,
+    url: &PostgresUrl,
     options: sqlx::postgres::PgConnectOptions,
     vetted: &[(DialTarget, VettedDial)],
     relay: RelaySupport,
@@ -2063,7 +2214,7 @@ async fn pin_postgres_options<R: HostResolver>(
         return Err(DbConnectError::HostRefused(SsrfRefusal::LocalSocket));
     }
     let host = options.get_host().to_owned();
-    let Some(named) = url.named_host(&host) else {
+    let Some(named) = url.url.named_host(&host) else {
         return Err(DbConnectError::HostRefused(SsrfRefusal::UnprovenTarget));
     };
     let port = options.get_port();
@@ -2074,10 +2225,7 @@ async fn pin_postgres_options<R: HostResolver>(
     let _no_relay_to_cap = max_connections;
     if relay == RelaySupport::Absent
         && !literal
-        && matches!(
-            options.get_ssl_mode(),
-            sqlx::postgres::PgSslMode::VerifyFull
-        )
+        && url.transport == PgTransport::Verified(crate::dsn::TlsMode::VerifyFull)
     {
         return Err(DbConnectError::HostRefused(
             SsrfRefusal::UnpinnableTlsName { host: named },
@@ -2105,10 +2253,7 @@ async fn pin_postgres_options<R: HostResolver>(
     if relay == RelaySupport::Available
         && let VettedDial::Pinned(target) = dial
         && !literal
-        && !matches!(
-            options.get_ssl_mode(),
-            sqlx::postgres::PgSslMode::Disable | sqlx::postgres::PgSslMode::Allow
-        )
+        && url.transport.negotiates_tls()
     {
         let relay = crate::ssrf::PinnedRelay::open(target, port, max_connections)?;
         let relayed = options.socket(relay.socket_dir());
@@ -13215,7 +13360,7 @@ mod tests {
     /// unproven target, before any lookup.
     #[tokio::test]
     async fn pin_refuses_options_for_a_host_the_url_does_not_name() {
-        let url = UnambiguousUrl::parse("postgres://8.8.8.8/x");
+        let url = PostgresUrl::parse("postgres://8.8.8.8/x");
         let options = "postgres://1.1.1.1/x".parse::<sqlx::postgres::PgConnectOptions>();
         assert!(url.is_ok() && options.is_ok());
         let (Ok(url), Ok(options)) = (url, options) else {
@@ -13281,9 +13426,9 @@ mod tests {
     #[tokio::test]
     async fn pg_gate_pins_a_named_host_against_rebinding() {
         let resolver = PublicThenPrivate::new();
-        let gated = pg_gate_with(
-            "postgres://u:p@rebind.example:5432/x?sslmode=disable",
-            DialPolicy::DenyPrivate,
+        let gated = pg_gate_relay(
+            "postgres://u:p@rebind.example:5432/x?sslmode=verify-ca",
+            RelaySupport::Absent,
             &resolver,
         )
         .await
@@ -13356,20 +13501,14 @@ mod tests {
         assert!(admitted.is_ok(), "{:?}", admitted.err());
     }
 
-    /// DNS rebinding under every mode that may negotiate TLS: the host keeps
+    /// DNS rebinding under every mode a remote host may use: the host keeps
     /// its name for SNI and certificate verification, the driver dials the
     /// relay socket, and the relay carries the dial to the address vetted by
     /// the only lookup, so the rebound (private) answer is never dialled.
     #[cfg(unix)]
     #[tokio::test]
     async fn pg_gate_relays_a_tls_named_host_to_its_vetted_address() {
-        for mode in [
-            "",
-            "?sslmode=prefer",
-            "?sslmode=require",
-            "?sslmode=verify-ca",
-            "?sslmode=verify-full",
-        ] {
+        for mode in ["", "?sslmode=verify-ca", "?sslmode=verify-full"] {
             let resolver = PublicThenPrivate::new();
             let url = format!("postgres://u:p@rebind.example:5432/x{mode}");
             let gated = pg_gate_with(&url, DialPolicy::DenyPrivate, &resolver).await;
@@ -13394,6 +13533,219 @@ mod tests {
                 "{url:?}: the name must be resolved exactly once"
             );
         }
+    }
+
+    /// The `sslmode` the gated options carry for `url` under allow-all, by its driver name.
+    async fn gated_ssl_mode(url: &str) -> Result<String, DbConnectError> {
+        pg_gate(url, DialPolicy::AllowAll)
+            .await
+            .map(|(options, _)| format!("{:?}", options.get_ssl_mode()))
+    }
+
+    /// A URL naming no `sslmode` that dials a remote host verifies the
+    /// server, whatever the driver would default to.
+    #[tokio::test]
+    async fn an_absent_sslmode_on_a_remote_host_verifies_the_server() {
+        for url in [
+            "postgres://u@db.example/x",
+            "postgres://u@1.1.1.1/x",
+            "postgres://u@127.0.0.1/x?host=db.example",
+        ] {
+            assert_eq!(
+                gated_ssl_mode(url).await,
+                Ok("VerifyFull".to_owned()),
+                "{url:?}"
+            );
+        }
+    }
+
+    /// A URL naming no host leaves the host to the driver, which may read
+    /// `PGHOST`, so it is treated as remote.
+    #[test]
+    fn a_driver_default_target_is_not_local() {
+        for url in ["postgres:///db", "postgres:db?user=admin"] {
+            let transport = PostgresUrl::parse(url).map(|url| url.transport);
+            assert_eq!(
+                transport.ok(),
+                Some(PgTransport::Verified(crate::dsn::TlsMode::VerifyFull)),
+                "{url:?}"
+            );
+        }
+        for url in [
+            "postgres:///db?sslmode=disable",
+            "postgres:db?sslmode=require",
+        ] {
+            assert!(
+                matches!(
+                    PostgresUrl::parse(url).err(),
+                    Some(DbConnectError::UnverifiedTls { .. })
+                ),
+                "{url:?}"
+            );
+        }
+    }
+
+    /// Every unverified `sslmode` spelling on a remote host is refused at
+    /// parse, naming the mode.
+    #[test]
+    fn an_unverified_sslmode_on_a_remote_host_is_refused() {
+        use crate::dsn::UnverifiedSslMode;
+        for host in [
+            "db.example",
+            "1.1.1.1",
+            "[2606:4700::1111]",
+            "localhost.db.example",
+        ] {
+            for (query, mode) in [
+                ("sslmode=disable", UnverifiedSslMode::Disable),
+                ("sslmode=allow", UnverifiedSslMode::Allow),
+                ("sslmode=prefer", UnverifiedSslMode::Prefer),
+                ("sslmode=require", UnverifiedSslMode::Require),
+                ("ssl-mode=require", UnverifiedSslMode::Require),
+                ("sslmode=REQUIRE", UnverifiedSslMode::Require),
+                (
+                    "sslmode=verify-full&sslmode=disable",
+                    UnverifiedSslMode::Disable,
+                ),
+            ] {
+                let url = format!("postgres://u:p@{host}/x?{query}");
+                assert_eq!(
+                    PostgresUrl::parse(&url).err(),
+                    Some(DbConnectError::UnverifiedTls { mode }),
+                    "{url:?}"
+                );
+                assert_eq!(
+                    DbUrl::parse(&url).err(),
+                    Some(DbConnectError::UnverifiedTls { mode }),
+                    "{url:?}"
+                );
+            }
+        }
+    }
+
+    /// An unverified `sslmode` on a URL with one remote target among local
+    /// ones is refused, since that target has an on-path party.
+    #[test]
+    fn an_unverified_sslmode_with_any_remote_target_is_refused() {
+        for url in [
+            "postgres://127.0.0.1/x?host=db.example&sslmode=disable",
+            "postgres://localhost/x?hostaddr=8.8.8.8&sslmode=disable",
+            "postgres:///x?host=/var/run/postgresql&host=db.example&sslmode=require",
+            "postgres://[::ffff:127.0.0.1]/x?sslmode=disable",
+        ] {
+            assert!(
+                matches!(
+                    PostgresUrl::parse(url).err(),
+                    Some(DbConnectError::UnverifiedTls { .. })
+                ),
+                "{url:?}"
+            );
+        }
+    }
+
+    /// On local targets an unverified `sslmode` is dialled as written, and an
+    /// absent one dials as `prefer`.
+    #[tokio::test]
+    async fn an_unverified_sslmode_on_local_targets_is_dialled_as_written() {
+        for base in [
+            "postgres://u@127.0.0.1/x",
+            "postgres://u@127.0.0.2/x",
+            "postgres://u@[::1]/x",
+            "postgres://u@LocalHost/x",
+            "postgres://u@%2Fvar%2Frun%2Fpostgresql/x",
+            "postgres:///x?host=/var/run/postgresql",
+        ] {
+            for (query, mode) in [
+                ("", "Prefer"),
+                ("sslmode=disable", "Disable"),
+                ("sslmode=allow", "Allow"),
+                ("sslmode=prefer", "Prefer"),
+                ("ssl-mode=require", "Require"),
+                ("sslmode=verify-ca", "VerifyCa"),
+            ] {
+                let url = match (query.is_empty(), base.contains('?')) {
+                    (true, _) => base.to_owned(),
+                    (false, true) => format!("{base}&{query}"),
+                    (false, false) => format!("{base}?{query}"),
+                };
+                assert_eq!(gated_ssl_mode(&url).await, Ok(mode.to_owned()), "{url:?}");
+            }
+        }
+    }
+
+    /// The refusal names the mode, its risk and the remedy, and the remedy
+    /// it names is a URL that parses.
+    #[test]
+    fn an_unverified_tls_refusal_names_a_remedy_that_parses() {
+        let refused = PostgresUrl::parse("postgres://u:s3cr3t@db.example/x?sslmode=require").err();
+        let text = refused
+            .as_ref()
+            .map(ToString::to_string)
+            .unwrap_or_default();
+        assert!(
+            matches!(refused, Some(DbConnectError::UnverifiedTls { .. })),
+            "{text}"
+        );
+        for part in [
+            "sslmode=require",
+            "does not verify the server certificate",
+            "sslmode=verify-full",
+        ] {
+            assert!(text.contains(part), "{text:?} must name {part:?}");
+        }
+        assert!(!text.contains("s3cr3t"), "{text:?}");
+        assert!(PostgresUrl::parse("postgres://u:s3cr3t@db.example/x?sslmode=verify-full").is_ok());
+    }
+
+    /// Printed by [`ambient_pgsslmode_child`] once its checks hold.
+    const AMBIENT_SSLMODE_IGNORED: &str = "ambient PGSSLMODE ignored";
+
+    /// Runs under `PGSSLMODE=disable` as a child process of
+    /// [`an_ambient_pgsslmode_never_decides_the_transport`].
+    #[ignore = "run as a child process by an_ambient_pgsslmode_never_decides_the_transport"]
+    #[tokio::test]
+    async fn ambient_pgsslmode_child() {
+        assert_eq!(
+            gated_ssl_mode("postgres://u@db.example/x").await,
+            Ok("VerifyFull".to_owned())
+        );
+        assert_eq!(
+            gated_ssl_mode("postgres://u@127.0.0.1/x").await,
+            Ok("Prefer".to_owned())
+        );
+        println!("{AMBIENT_SSLMODE_IGNORED}");
+    }
+
+    /// `PGSSLMODE` in the environment never decides an operator URL's
+    /// transport: the child holding `PGSSLMODE=disable` still verifies a
+    /// remote server.
+    #[allow(clippy::expect_used)] // test harness: a test binary that cannot re-run itself is an environment issue
+    #[test]
+    fn an_ambient_pgsslmode_never_decides_the_transport() {
+        let module = module_path!();
+        let module = module.split_once("::").map_or(module, |(_, rest)| rest);
+        let filter = format!("{module}::ambient_pgsslmode_child");
+        let exe = std::env::current_exe().expect("the test binary");
+        let out = std::process::Command::new(exe)
+            .args([
+                "--exact",
+                filter.as_str(),
+                "--ignored",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env("PGSSLMODE", "disable")
+            .stdin(std::process::Stdio::null())
+            .output()
+            .expect("run the child test");
+        let stdout = String::from_utf8(out.stdout).unwrap_or_default();
+        let stderr = String::from_utf8(out.stderr).unwrap_or_default();
+        assert!(
+            out.status.success()
+                && stdout.contains(AMBIENT_SSLMODE_IGNORED)
+                && stdout.contains("ok. 1 passed;"),
+            "the child must run its one test and pass:\n{stdout}\n{stderr}"
+        );
     }
 
     /// A relay that could not be opened refuses the dial as `RelayUnavailable`.

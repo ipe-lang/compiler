@@ -88,9 +88,11 @@ impl TlsMode {
 
 /// A PostgreSQL `sslmode` that does not verify the server certificate.
 ///
-/// No `Dsn` carries one: each is a parse refusal naming the remedy.
+/// No `Dsn` carries one: each is a parse refusal naming the remedy. An
+/// operator connection URL carries one only when every target it dials is
+/// local (`db::PgTransport`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum UnverifiedSslMode {
+pub enum UnverifiedSslMode {
     /// Cleartext only.
     Disable,
     /// Cleartext unless the server demands TLS.
@@ -99,6 +101,30 @@ enum UnverifiedSslMode {
     Prefer,
     /// TLS against any certificate.
     Require,
+}
+
+impl UnverifiedSslMode {
+    /// The `sslmode` token the driver reads for this mode.
+    #[must_use]
+    pub const fn sslmode(self) -> &'static str {
+        match self {
+            Self::Disable => "disable",
+            Self::Allow => "allow",
+            Self::Prefer => "prefer",
+            Self::Require => "require",
+        }
+    }
+
+    /// What this mode exposes to an on-path party, for a refusal naming it.
+    #[must_use]
+    pub const fn risk(self) -> &'static str {
+        match self {
+            Self::Disable => "connects in cleartext",
+            Self::Allow => "may connect in cleartext and does not verify the server certificate",
+            Self::Prefer => "may fall back to cleartext and does not verify the server certificate",
+            Self::Require => "does not verify the server certificate",
+        }
+    }
 }
 
 /// A DSN's network host, proven not to be part of its credentials.
@@ -585,7 +611,7 @@ fn tls_from_query(url: &UnambiguousUrl) -> Result<TlsMode, DsnReject> {
                 // belong in the structured userinfo only.
                 return Err(DsnReject::ConflictingParameter);
             }
-            "sslmode" => {
+            "sslmode" | "ssl-mode" => {
                 let mode = parse_sslmode(value.as_ref())?;
                 match chosen {
                     Some(prev) if prev != mode => {
@@ -1132,6 +1158,48 @@ mod tests {
             let needle = format!("\"{mode}\"");
             assert!(!render.contains(&needle), "the render names {mode}");
         }
+    }
+
+    /// Each unverified-mode refusal states the risk `UnverifiedSslMode::risk`
+    /// names, the one text the operator URL refusal also prints.
+    #[test]
+    fn unverified_sslmode_refusals_state_the_shared_risk() {
+        for mode in [
+            UnverifiedSslMode::Disable,
+            UnverifiedSslMode::Allow,
+            UnverifiedSslMode::Prefer,
+            UnverifiedSslMode::Require,
+        ] {
+            assert_eq!(
+                DsnReject::TlsUnverified(mode).message(),
+                format!(
+                    "Ipe.Db.Dsn: sslmode={} {}; use sslmode=verify-full (the default) or \
+                     sslmode=verify-ca",
+                    mode.sslmode(),
+                    mode.risk()
+                ),
+                "{mode:?}"
+            );
+        }
+    }
+
+    /// The driver reads `ssl-mode` as `sslmode`, so the parse does too: an
+    /// unverified mode under either key is refused, and two keys naming
+    /// different modes conflict.
+    #[test]
+    fn rejects_an_unverified_or_conflicting_ssl_mode_key() {
+        assert!(
+            parse_err("postgres://u:p@h:5432/d?ssl-mode=disable")
+                .contains("sslmode=disable connects in cleartext")
+        );
+        assert!(
+            parse_err("postgres://u:p@h:5432/d?sslmode=verify-full&ssl-mode=verify-ca")
+                .contains("conflicting or misplaced")
+        );
+        assert_eq!(
+            dsn_tls(parse_ok("postgres://u:p@h:5432/d?ssl-mode=verify-ca")),
+            1
+        );
     }
 
     #[test]

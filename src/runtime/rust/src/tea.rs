@@ -1382,15 +1382,17 @@ where
 // msg/model type parameters from the program's `main` type signature while
 // keeping the emit path concrete (no `dyn`).
 
-/// A concrete-erased builder that, given a mount base-path prefix, produces the
-/// embedded web app's fully-layered axum `Router` (the same router the
+/// A concrete-erased builder that, given the app's parsed mount base, produces
+/// the embedded web app's fully-layered axum `Router` (the same router the
 /// standalone `serve_web` binds). Boxed so `WebApp` stays non-generic — the box
 /// is over the *builder*, NOT the app's handlers: `init`/`update`/`view`/`subs`
 /// are concrete monomorphised closures captured inside, so the mounted app is
 /// erased-free at the handler level (§9: no `dyn` over the app / handlers).
 #[cfg(all(not(target_arch = "wasm32"), feature = "web"))]
 pub type MountBuilder = Box<
-    dyn FnOnce(String) -> std::pin::Pin<Box<dyn std::future::Future<Output = axum::Router> + Send>>
+    dyn FnOnce(
+            crate::encoding::MountBase,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = axum::Router> + Send>>
         + Send,
 >;
 
