@@ -38,8 +38,8 @@ Every `IPE_*` variable the runtime, CLI, and compiler read. The table is grouped
 | `IPE_ALLOC` | unset (system allocator) | Select the memory allocator: `mimalloc`, `jemalloc`, or `system`. Mirrors `--allocator`; env wins over `package.ipe [rust] allocator`. | `Tunable` |
 | `IPE_BIN` | unset | Path to the `ipe` binary used by the build driver when invoking itself recursively. Set automatically by the wrapper; operator override is rarely needed. | `Tunable` |
 | `IPE_BUILD_AT` | unknown | Build timestamp baked in by CI (`option_env!`). Surfaced at `GET /_ipe/buildinfo`. Not read at runtime via `env::var`. | `Tunable` |
-| `IPE_BUILD_CACHE` | on | Set to `0`, `off`, or `false` to disable the incremental build cache. Default is on; the cache directory is `<out>/.ipe-cache/<per-user salt>` unless `IPE_BUILD_CACHE_DIR` is set. | `Tunable` |
-| `IPE_BUILD_CACHE_DIR` | unset (<out>/.ipe-cache/<per-user salt>) | Explicit path for the incremental build cache directory. Takes effect only when the cache is enabled (`IPE_BUILD_CACHE` not `off`). | `Tunable` |
+| `IPE_BUILD_CACHE` | on | `1`, `on`, `true` keep the incremental build cache on (the default); `0`, `off`, `false` turn it off; any other value, the empty one included, is refused. | `Tunable` |
+| `IPE_BUILD_CACHE_DIR` | unset (<out>/.ipe-cache/<per-user salt>) | Absolute path of the incremental build cache directory, used while the cache is on; a relative or empty value is refused, the cache on or off. | `Tunable` |
 | `IPE_BUILD_COMMIT` | dev | Git commit SHA baked in by CI (`option_env!`). Surfaced at `GET /_ipe/buildinfo`. Not read at runtime via `env::var`. | `Tunable` |
 | `IPE_CFREE` | unset (false) | Set to `1` or `true` to build without linking any C code. Mirrors `--cfree`; incompatible with allocators that require C (e.g. mimalloc). | `Tunable` |
 | `IPE_EMBED_APP` | unset | Path to the compiled app binary embedded into a wrapper binary. Set by the build driver; not intended for operator use. | `Tunable` |
