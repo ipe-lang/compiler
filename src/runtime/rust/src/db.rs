@@ -1747,7 +1747,7 @@ impl std::fmt::Display for DbConnectError {
                  URL names is a loopback address, `localhost` or a Unix socket; use \
                  sslmode=verify-full (the default) or sslmode=verify-ca",
                 mode.sslmode(),
-                unverified_risk(*mode)
+                mode.risk()
             ),
             Self::Unreachable(failure) | Self::VersionUnreadable(failure) => {
                 write!(f, "db: {failure}")
@@ -1884,20 +1884,6 @@ pub struct SqliteUrl {
     options: sqlx::sqlite::SqliteConnectOptions,
     /// A file every pool connection shares, as opposed to a private in-memory database.
     shared_file: bool,
-}
-
-/// What an unverified `sslmode` exposes, for its refusal text.
-const fn unverified_risk(mode: crate::dsn::UnverifiedSslMode) -> &'static str {
-    match mode {
-        crate::dsn::UnverifiedSslMode::Disable => "connects in cleartext",
-        crate::dsn::UnverifiedSslMode::Allow => {
-            "may connect in cleartext and does not verify the server certificate"
-        }
-        crate::dsn::UnverifiedSslMode::Prefer => {
-            "may fall back to cleartext and does not verify the server certificate"
-        }
-        crate::dsn::UnverifiedSslMode::Require => "does not verify the server certificate",
-    }
 }
 
 /// How a PostgreSQL connection protects its transport, read once from its URL.
