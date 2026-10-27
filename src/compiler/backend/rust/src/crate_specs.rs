@@ -229,7 +229,7 @@ pub const FLATE2: CrateSpec = CrateSpec {
 };
 pub const ZSTD: CrateSpec = CrateSpec {
     name: "zstd",
-    version: "0.13",
+    version: "0.14",
 };
 pub const CSV: CrateSpec = CrateSpec {
     name: "csv",
