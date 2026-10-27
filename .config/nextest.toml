@@ -169,6 +169,19 @@ slow-timeout = { period = "60s", terminate-after = 20 }
 filter = 'test(hydrate_glue_type_name_matches_emitted_struct_and_compiles_for_wasm)'
 test-group = 'wasm-external-cargo'
 
+# A test that judges how work grows with input size runs alone: it holds every
+# test thread, so no sibling test competes for the cores, caches and memory
+# bandwidth while it measures. The test reads the child's CPU time, which already
+# excludes the time a child waits for a core; running alone also keeps a
+# sibling's cache and memory traffic out of that CPU time.
+[[profile.ci.overrides]]
+filter = 'binary(g_misc) & test(=golden_stdlib_markdown_bounds::doubling_is_linear)'
+threads-required = 'num-test-threads'
+
+[[profile.default.overrides]]
+filter = 'binary(g_misc) & test(=golden_stdlib_markdown_bounds::doubling_is_linear)'
+threads-required = 'num-test-threads'
+
 [[profile.default.overrides]]
 filter = 'test(hydrate_glue_type_name_matches_emitted_struct_and_compiles_for_wasm)'
 test-group = 'wasm-external-cargo'
