@@ -107,8 +107,8 @@ const LENIENT_QUERY_SITES: &[(&str, &str, usize)] = &[
 /// Every `DriverParityQuery::of` call, as (runtime-relative file, number of
 /// calls); each hands it a URL whose userinfo the ambiguity check cleared.
 const DRIVER_PARITY_SITES: &[(&str, usize)] = &[
-    // A database's SSRF target host.
-    ("src/db.rs", 1),
+    // A database's SSRF target host, and the `sslmode` its driver will use.
+    ("src/db.rs", 2),
     // The DSN's `sslmode`.
     ("src/dsn.rs", 1),
     // `UnambiguousUrl::query_host`.
