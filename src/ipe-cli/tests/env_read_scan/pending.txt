@@ -56,11 +56,11 @@ src/runtime/rust/src/telemetry.rs 14
 src/runtime/rust/src/telemetry_spill.rs 4
 src/runtime/rust/src/trace.rs 2
 src/runtime/rust/src/ui/render.rs 2
-src/runtime/rust/src/web/console.rs 13
+src/runtime/rust/src/web/console.rs 11
 src/runtime/rust/src/web/console_proxy.rs 12
 src/runtime/rust/src/web/csrf.rs 2
-src/runtime/rust/src/web/mod.rs 42
-src/runtime/rust/src/web/observability.rs 5
+src/runtime/rust/src/web/mod.rs 40
+src/runtime/rust/src/web/observability.rs 3
 src/runtime/rust/src/web/push_exporter.rs 9
 src/runtime/rust/src/web/sse.rs 1
 src/runtime/rust/src/web/store.rs 2

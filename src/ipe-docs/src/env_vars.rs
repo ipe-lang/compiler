@@ -1062,15 +1062,17 @@ static HAND_TABLE: &[EnvVar] = &[
     EnvVar {
         name: "IPE_WEB_BASE_PATH",
         default: Cow::Borrowed("unset (root-mounted)"),
-        purpose: "Sub-app mount prefix, e.g. `/billing`. All session-cookie, \
-                  CSRF-cookie, and asset paths are scoped to this prefix. Set \
-                  automatically when mounting a sub-app. After trimming, \
-                  dropping a trailing `/` and adding a missing leading `/`, a \
-                  value that is not one or more `/segment` parts made only of \
-                  `A-Z a-z 0-9 - . _ ~` (no empty, `.`, or `..` segment, no `%` \
-                  escape, at most 1024 bytes) refuses the app: a standalone \
-                  server does not start and a mounted app answers every \
-                  request with 503.",
+        purpose: "Mount prefix of a standalone app served behind a parent's \
+                  proxy, e.g. `/billing` (the console child is started with \
+                  `/_ipe/console`). Its session-cookie, CSRF-cookie, and asset \
+                  paths are scoped to this prefix. Read once at startup; unset, \
+                  empty, or `/` is the root. The value is taken as given, never \
+                  repaired: one that is not one or more `/segment` parts made \
+                  only of `A-Z a-z 0-9 - . _ ~` (no empty, `.`, or `..` segment, \
+                  no trailing `/`, no `%` escape, at most 1024 bytes) refuses \
+                  the app, which does not start. An app mounted with \
+                  `Server.mountApp` takes its prefix from the mount, never from \
+                  this variable.",
         subsystem: Subsystem::Web,
         class: Class::Tunable,
     },

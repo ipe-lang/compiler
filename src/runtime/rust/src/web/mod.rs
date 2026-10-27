@@ -578,11 +578,8 @@ fn render_live_page(
     let dev_banner = dev_console_banner(prefix);
     // Content-addressed client asset URL and SRI hash — computed once at first call.
     let (hex16, b64) = client_js_hashes();
-    // Honour the sub-app base prefix so the external script request goes through
-    // the parent proxy (same as /_ipe/sse, /_ipe/event, /_ipe/console).
-    let client_src = format!("{prefix}/_ipe/client.{hex16}.js");
-    let integrity = format!("sha256-{b64}");
-    let head_extra = format!("<meta name=\"ipe-base\" content=\"{prefix}\">");
+    let client_script = client_script_tag(prefix, hex16, b64);
+    let head_extra = base_meta(prefix);
     let body_inner = format!("<div id=\"ipe-root\">{body}</div>{dev_banner}{overlay}");
     // Custom-element glue: an EXTERNAL, SRI-pinned `<script type="module">` plus a
     // `modulepreload` SRI pin per author asset. Empty when the program registers
@@ -590,12 +587,31 @@ fn render_live_page(
     // It loads AFTER the client core so `__ipeEmitWidgetUp` can reuse `__ipeSend`.
     let widget_scripts = widget_assets::page_scripts(base, widget_assets::WidgetTransport::Server);
     let port_glue = port_glue_script(prefix);
-    let tail_scripts = format!(
-        "{boot}\
-         <script src=\"{client_src}\" integrity=\"{integrity}\" crossorigin=\"anonymous\"></script>\
-         {widget_scripts}{port_glue}"
-    );
+    let tail_scripts = format!("{boot}{client_script}{widget_scripts}{port_glue}");
     Ok(page_shell(&head_extra, &body_inner, &tail_scripts))
+}
+
+/// The `<meta name="ipe-base">` tag naming the app's base `prefix` to the client.
+///
+/// The prefix is attribute-escaped: the mount-base grammar already admits only
+/// unreserved bytes, and the escape keeps the tag inert should a caller ever
+/// hand it anything else.
+#[cfg(feature = "web")]
+fn base_meta(prefix: &str) -> String {
+    let content = crate::escape::html_attr(prefix);
+    format!("<meta name=\"ipe-base\" content=\"{content}\">")
+}
+
+/// The SRI-pinned `<script>` tag that loads the content-addressed client core.
+///
+/// The URL honours the base `prefix`, so the request goes through a parent
+/// proxy like `/_ipe/sse` and `/_ipe/event` do; it is attribute-escaped like
+/// [`base_meta`].
+#[cfg(feature = "web")]
+fn client_script_tag(prefix: &str, hex16: &str, b64: &str) -> String {
+    let src = crate::escape::html_attr(&format!("{prefix}/_ipe/client.{hex16}.js"));
+    let integrity = crate::escape::html_attr(&format!("sha256-{b64}"));
+    format!("<script src=\"{src}\" integrity=\"{integrity}\" crossorigin=\"anonymous\"></script>")
 }
 
 /// The SRI-pinned `<script>` tag that loads the `Ipe.Ffi.Js` browser port surface,
@@ -607,10 +623,9 @@ fn render_live_page(
 #[cfg(feature = "widget-assets")]
 fn port_glue_script(base: &str) -> String {
     let path = crate::js_port_glue::port_glue_path();
-    let integrity = crate::js_port_glue::port_glue_integrity();
-    format!(
-        "<script src=\"{base}{path}\" integrity=\"{integrity}\" crossorigin=\"anonymous\"></script>"
-    )
+    let src = crate::escape::html_attr(&format!("{base}{path}"));
+    let integrity = crate::escape::html_attr(&crate::js_port_glue::port_glue_integrity());
+    format!("<script src=\"{src}\" integrity=\"{integrity}\" crossorigin=\"anonymous\"></script>")
 }
 
 /// No `Ipe.Ffi.Js` port glue when the widget-asset serving surface is absent: the
@@ -1314,8 +1329,9 @@ impl axum::response::IntoResponse for CookieRefusal {
 #[cfg(feature = "web")]
 fn rejoin_from_cookie(
     headers: &axum::http::HeaderMap,
+    base: &crate::encoding::MountBase,
 ) -> Result<mint_proof::RejoinProof, CookieRefusal> {
-    let key = sid_from_cookie(headers)
+    let key = sid_from_cookie(headers, base)
         .as_deref()
         .and_then(store::SessionKey::parse)
         .ok_or(CookieRefusal::Lost)?;
@@ -2217,9 +2233,10 @@ fn store_unavailable() -> axum::response::Response {
 #[cfg(feature = "web")]
 fn page_csrf_token(
     headers: &axum::http::HeaderMap,
+    base: &crate::encoding::MountBase,
     mint: impl FnOnce() -> Result<String, crate::entropy::EntropyError>,
 ) -> Result<String, Box<axum::response::Response>> {
-    csrf::cookie_value(headers, &csrf::csrf_cookie_name_for(&web_base_path()))
+    csrf::cookie_value(headers, &csrf::csrf_cookie_name_for(base))
         .filter(|t| csrf::token_is_well_formed(t))
         .map_or_else(mint, Ok)
         .map_err(|_| Box::new(entry_unavailable()))
@@ -2599,6 +2616,8 @@ pub(crate) struct WebState<Model, Msg, FInit, FUpdate, FView, FSubs> {
     /// Populated only when the dev watch/status endpoint is mounted;
     /// inert (always `None`) in production.
     watch_build_status: Arc<Mutex<Option<WatchBuildStatus>>>,
+    /// Where this app is served: every base-scoped URL and cookie derives from it.
+    mount: Arc<MountContext>,
 }
 
 // Manual Clone — derive would demand Clone on the closures (they're behind Arc).
@@ -2620,6 +2639,7 @@ impl<Model, Msg, FInit, FUpdate, FView, FSubs> Clone
             max_sessions: self.max_sessions,
             budget: self.budget.clone(),
             watch_build_status: self.watch_build_status.clone(),
+            mount: self.mount.clone(),
         }
     }
 }
@@ -3398,26 +3418,79 @@ fn new_sid() -> String {
         .expect("the test host's CSPRNG yields entropy")
 }
 
-/// Normalise a raw `IPE_WEB_BASE_PATH` value: trim, drop a trailing slash,
-/// ensure a single leading slash. `""` / `"/"` collapse to `""` (root-mounted —
-/// no prefix).
+/// Where a live web app is served, fixed once when its router state is built.
+///
+/// Every base-scoped value the app produces (page URLs, cookie names and
+/// paths, the CSRF cookie it reads) is derived from this one value, so two
+/// apps in one process never share a base through process state.
 #[cfg(feature = "web")]
-fn normalise_base_path(raw: &str) -> String {
-    let t = raw.trim().trim_end_matches('/');
-    if t.is_empty() {
-        String::new()
-    } else if t.starts_with('/') {
-        t.to_string()
-    } else {
-        format!("/{t}")
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum MountContext {
+    /// A standalone app at the root of its own listener.
+    Root,
+    /// A standalone app a parent process reverse-proxies below `base`.
+    ProxiedChild { base: crate::encoding::MountBase },
+    /// An app `Server.mountApp` serves below `base` on the server's listener.
+    Embedded { base: crate::encoding::MountBase },
+}
+
+/// The base of a [`MountContext::Root`] app.
+#[cfg(feature = "web")]
+static ROOT_BASE: crate::encoding::MountBase = crate::encoding::MountBase::root();
+
+#[cfg(feature = "web")]
+impl MountContext {
+    /// The base every URL and cookie of this app is scoped to.
+    pub(crate) fn base(&self) -> &crate::encoding::MountBase {
+        match self {
+            Self::Root => &ROOT_BASE,
+            Self::ProxiedChild { base } | Self::Embedded { base } => base,
+        }
+    }
+
+    /// Whether another app owns this app's console and request telemetry.
+    pub(crate) const fn is_sub_app(&self) -> bool {
+        !matches!(self, Self::Root)
+    }
+
+    /// The standalone app's context, read from `IPE_WEB_BASE_PATH` once at startup.
+    ///
+    /// A value that is not Unicode is judged by its lossy spelling, whose
+    /// `U+FFFD` the grammar refuses, so it never reads as unset.
+    ///
+    /// # Errors
+    ///
+    /// [`StartupRefusal::MountBase`] for a value outside the mount-base grammar.
+    fn from_env() -> Result<Self, StartupRefusal> {
+        match crate::system::read_env_var("IPE_WEB_BASE_PATH") {
+            Ok(raw) => Self::standalone(Some(&raw)),
+            Err(std::env::VarError::NotPresent) => Self::standalone(None),
+            Err(std::env::VarError::NotUnicode(raw)) => {
+                Self::standalone(Some(&raw.to_string_lossy()))
+            }
+        }
+    }
+
+    /// The standalone app's context for the variable's value `raw`, `None` when unset.
+    ///
+    /// # Errors
+    ///
+    /// [`StartupRefusal::MountBase`] for a value outside the mount-base grammar.
+    fn standalone(raw: Option<&str>) -> Result<Self, StartupRefusal> {
+        let base = parse_mount_base(raw.unwrap_or_default())?;
+        Ok(if base.prefix().is_empty() {
+            Self::Root
+        } else {
+            Self::ProxiedChild { base }
+        })
     }
 }
 
-/// The session cookie name for a given (normalised) base path. At the root,
+/// The session cookie name of the app served at `base`. At the root,
 /// `__Host-ipe_sid` in secure mode (production / frame-ancestors) else `ipe_sid`;
-/// for a sub-app a base-derived DISTINCT name so this child's session cookie can
-/// never clobber the PARENT app's `ipe_sid` (both would otherwise be `Path=/` and
-/// share the browser's cookie jar on the proxied paths).
+/// below a base, `ipe_sid` followed by the base's injective
+/// [`crate::encoding::CookieSuffix`], so no two mounts, and no mount and the
+/// root app, share a session cookie in one browser's jar.
 ///
 /// SECURITY (root, secure mode): the session cookie is the SOLE bearer credential
 /// (`sid_from_cookie` + `store.get` authorise every `/_ipe/event` + `/_ipe/sse`),
@@ -3426,20 +3499,20 @@ fn normalise_base_path(raw: &str) -> String {
 /// session-fixation vector (an attacker on `evil.example.com` with a valid cert
 /// could otherwise plant `ipe_sid` for `example.com`). `__Host-` MANDATES
 /// Secure + Path=/ + no-Domain — `page_response` satisfies all three in secure
-/// mode (Secure flag set, root `cookie_path()` is `/`, no Domain attribute).
+/// mode (Secure flag set, the root cookie path is `/`, no Domain attribute).
 /// Mirrors `csrf::csrf_cookie_name_for`. Plain-HTTP dev keeps the bare `ipe_sid`
 /// (`__Host-` requires Secure, which a browser drops over `http://`). A sub-app
 /// (Path != `/`) can never use `__Host-`, so it keeps the base-scoped name.
 #[cfg(feature = "web")]
-fn cookie_name_for(base: &str) -> crate::server::CookieName {
+fn cookie_name_for(base: &crate::encoding::MountBase) -> crate::server::CookieName {
     cookie_name_with(base, csrf::cookies_secure())
 }
 
 /// [`cookie_name_for`] under an explicit `Secure` decision.
 #[cfg(feature = "web")]
-fn cookie_name_with(base: &str, secure: bool) -> crate::server::CookieName {
+fn cookie_name_with(base: &crate::encoding::MountBase, secure: bool) -> crate::server::CookieName {
     use crate::server::{CookieName, RuntimeCookie};
-    if base.is_empty() {
+    if base.prefix().is_empty() {
         let root = if secure {
             RuntimeCookie::HostSession
         } else {
@@ -3447,67 +3520,39 @@ fn cookie_name_with(base: &str, secure: bool) -> crate::server::CookieName {
         };
         CookieName::runtime(root, "")
     } else {
-        let suffix: String = base
-            .chars()
-            .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
-            .collect();
-        CookieName::runtime(RuntimeCookie::Session, &suffix)
+        CookieName::runtime(RuntimeCookie::Session, base.cookie_suffix().as_str())
     }
 }
 
-/// Cookie `Path` for a given (normalised) base path: the base for a sub-app
-/// (scopes the cookie to `/<base>/*` so it is never sent to the parent's own
-/// routes — protecting the parent session), else `/`.
+/// Cookie `Path` for the app served at `base`: the base for a sub-app (scopes
+/// the cookie to `/<base>/*` so it is never sent to the parent's own routes —
+/// protecting the parent session), else `/`.
 #[cfg(feature = "web")]
-fn cookie_path_for(base: &str) -> String {
-    if base.is_empty() {
-        "/".to_string()
+fn cookie_path_for(base: &crate::encoding::MountBase) -> &str {
+    if base.prefix().is_empty() {
+        "/"
     } else {
-        base.to_string()
+        base.prefix()
     }
 }
 
-/// Normalised sub-app base path, read from `IPE_WEB_BASE_PATH`. Empty when
-/// unset (root-mounted app). When set (this app runs as a reverse-proxied
-/// sub-app — e.g. the bundled console mounted at `/_ipe/console`), the value
-/// is threaded into `render_page_full` so the client JS prefixes both the
-/// `/_ipe/event` and `/_ipe/sse` paths with it. The browser reaches this child
-/// only through the parent proxy, which strips the prefix before forwarding —
-/// so the child's own router stays root-relative.
-#[cfg(feature = "web")]
-pub(super) fn web_base_path() -> String {
-    normalise_base_path(&crate::system::read_env_var("IPE_WEB_BASE_PATH").unwrap_or_default())
-}
-
-/// The active session cookie name (read AND write must agree, so both
-/// `page_response` and `sid_from_cookie` route through this).
-#[cfg(feature = "web")]
-fn session_cookie_name() -> crate::server::CookieName {
-    cookie_name_for(&web_base_path())
-}
-
-/// The active session cookie `Path`.
-#[cfg(feature = "web")]
-fn cookie_path() -> String {
-    cookie_path_for(&web_base_path())
-}
-
-/// The session cookie line: `Path` is the app's base, `HttpOnly`, `Max-Age` is
-/// the store `ttl`. `Secure` when cookies are secure or this request arrived over
-/// TLS at a trusted proxy; `SameSite=None` (always `Secure`) when the app may be
-/// framed cross-origin, else `Lax`.
+/// The session cookie line of the app served at `base`: `Path` is the base,
+/// `HttpOnly`, `Max-Age` is the store `ttl`. `Secure` when cookies are secure or
+/// this request arrived over TLS at a trusted proxy; `SameSite=None` (always
+/// `Secure`) when the app may be framed cross-origin, else `Lax`.
 #[cfg(feature = "web")]
 fn session_set_cookie(
     sid: &str,
+    base: &crate::encoding::MountBase,
     headers: &axum::http::HeaderMap,
     ttl: std::time::Duration,
 ) -> crate::server::SetCookie {
     use crate::server::{CookieAttributes, CookiePath, CookieValue, SameSite, SetCookie};
     SetCookie::new(
-        &session_cookie_name(),
+        &cookie_name_for(base),
         &CookieValue::encode(sid),
         CookieAttributes {
-            path: CookiePath::encode(&cookie_path()),
+            path: CookiePath::encode(cookie_path_for(base)),
             http_only: true,
             same_site: if csrf::frame_ancestors().is_some() {
                 SameSite::None
@@ -3571,15 +3616,13 @@ fn request_is_https(headers: &axum::http::HeaderMap) -> bool {
 #[cfg(all(feature = "web", not(feature = "debugger")))]
 fn page_response(
     sid: &str,
+    base: &crate::encoding::MountBase,
     page: &PageRender,
     csrf_token: &str,
     headers: &axum::http::HeaderMap,
 ) -> axum::response::Response {
     use axum::response::IntoResponse;
-    let Ok(base) = web_mount_base() else {
-        return ttl_unavailable_response();
-    };
-    let Ok(html) = render_page_full(sid, &base, page.html.as_str(), &page.epoch, csrf_token) else {
+    let Ok(html) = render_page_full(sid, base, page.html.as_str(), &page.epoch, csrf_token) else {
         return axum::http::StatusCode::INTERNAL_SERVER_ERROR.into_response();
     };
     // Session cookie carries `Secure` without a dev intent / in frame-ancestors mode, OR
@@ -3605,8 +3648,8 @@ fn page_response(
     let Ok(ttl) = web_ttl() else {
         return ttl_unavailable_response();
     };
-    let session_cookie = session_set_cookie(sid, headers, ttl);
-    let csrf_cookie = csrf::csrf_set_cookie(csrf_token, &web_base_path());
+    let session_cookie = session_set_cookie(sid, base, headers, ttl);
+    let csrf_cookie = csrf::csrf_set_cookie(csrf_token, base);
     let resp = (
         axum::http::StatusCode::OK,
         [
@@ -3631,18 +3674,16 @@ fn page_response(
 #[cfg(all(feature = "web", feature = "debugger"))]
 fn page_response_with_overlay(
     sid: &str,
+    base: &crate::encoding::MountBase,
     page: &PageRender,
     overlay: &str,
     csrf_token: &str,
     headers: &axum::http::HeaderMap,
 ) -> axum::response::Response {
     use axum::response::IntoResponse;
-    let Ok(base) = web_mount_base() else {
-        return ttl_unavailable_response();
-    };
     let Ok(html) = render_page_full_with_overlay(
         sid,
-        &base,
+        base,
         page.html.as_str(),
         &page.epoch,
         csrf_token,
@@ -3653,8 +3694,8 @@ fn page_response_with_overlay(
     let Ok(ttl) = web_ttl() else {
         return ttl_unavailable_response();
     };
-    let session_cookie = session_set_cookie(sid, headers, ttl);
-    let csrf_cookie = csrf::csrf_set_cookie(csrf_token, &web_base_path());
+    let session_cookie = session_set_cookie(sid, base, headers, ttl);
+    let csrf_cookie = csrf::csrf_set_cookie(csrf_token, base);
     let resp = (
         axum::http::StatusCode::OK,
         [
@@ -4176,6 +4217,12 @@ where
         // A fail-closed store config (e.g. prod `IPE_WEB_STORE=sqlite` in a
         // build with no `db` feature) surfaces as a task error → stderr + exit
         // 1, never a silent downgrade to a different backend.
+        // The app's base is read from the environment once, here; a value
+        // outside the mount-base grammar refuses the start.
+        let mount = match MountContext::from_env() {
+            Ok(mount) => mount,
+            Err(refusal) => return IpeResult::Err(E::from_ipe_error(refusal.into())),
+        };
         let ttl = match web_ttl() {
             Ok(ttl) => ttl,
             Err(refusal) => {
@@ -4219,6 +4266,7 @@ where
             max_sessions,
             budget: budget::shared(),
             watch_build_status: Arc::new(Mutex::new(None)),
+            mount: Arc::new(mount),
         };
         serve_web(state).await
     })
@@ -4230,9 +4278,9 @@ where
 /// (via [`build_web_router`]) for `Server.mountApp` to nest under that prefix
 /// on the shared server port.
 ///
-/// The base-path prefix is installed process-wide (`IPE_WEB_BASE_PATH`) at
-/// build time so the embedded app's session-cookie / CSRF-cookie / asset paths
-/// scope to the mount, reusing the existing sub-app base-path machinery. The
+/// The mount's parsed base is carried in this app's router state as a
+/// [`MountContext::Embedded`], so its session-cookie / CSRF-cookie / asset
+/// paths scope to the mount and to no other app in the process. The
 /// console/proxy surface is OFF for a mounted sub-app (the parent server owns
 /// those concerns), so `use_console_proxy` is `false`.
 ///
@@ -4274,19 +4322,8 @@ where
     FView: Fn(Model) -> Html<Msg> + Send + Sync + 'static,
     FSubs: Fn(Model) -> IpeSub<Msg> + Send + Sync + 'static,
 {
-    Box::new(move |prefix: String| {
+    Box::new(move |base: crate::encoding::MountBase| {
         Box::pin(async move {
-            // Scope the embedded app's cookies + assets to the mount prefix,
-            // reusing the sub-app base-path mechanism. A single mounted WebApp
-            // per server is the current contract (multiple distinct-prefix web
-            // mounts would need per-mount base-path threading).
-            let base = normalise_base_path(&prefix);
-            if !base.is_empty() {
-                // Write the process-local env overlay, never the real `environ`:
-                // a raw `set_var` here races any concurrent libc `environ` reader
-                // (a parallel `getaddrinfo`) and is undefined behavior.
-                crate::system::locked_set_var("IPE_WEB_BASE_PATH", &base);
-            }
             // A mount has no task-error channel (it yields a `Router`, not an
             // `IpeTask`), so an unhonourable store config fails closed as a
             // router that answers every path with the fixed 503 body (the
@@ -4323,6 +4360,7 @@ where
                 max_sessions,
                 budget: budget::shared(),
                 watch_build_status: Arc::new(Mutex::new(None)),
+                mount: Arc::new(MountContext::Embedded { base }),
             };
             // The router is E-free (E only surfaces on the standalone
             // `serve_web` task's result), so `build_web_router` carries no `E`.
@@ -4385,14 +4423,8 @@ where
     FSetPage: Fn(Page, Model) -> (Model, IpeCmd<Msg>) + Send + Sync + 'static,
     FRender: Fn(&Page) -> Result<route::RoutePath, route::RenderRefusal> + Send + Sync + 'static,
 {
-    Box::new(move |prefix: String| {
+    Box::new(move |base: crate::encoding::MountBase| {
         Box::pin(async move {
-            // Scope the embedded app's cookies + assets to the mount prefix,
-            // reusing the sub-app base-path mechanism (see `web_embed_router`).
-            let base = normalise_base_path(&prefix);
-            if !base.is_empty() {
-                crate::system::locked_set_var("IPE_WEB_BASE_PATH", &base);
-            }
             // A malformed route pattern refuses the mount, never a dead route.
             if let Err(refusal) = route::check_route_table(&routes) {
                 return fail_closed_router(&StartupRefusal::RouteTable(refusal));
@@ -4431,6 +4463,7 @@ where
                 max_sessions,
                 budget: budget::shared(),
                 watch_build_status: Arc::new(Mutex::new(None)),
+                mount: Arc::new(MountContext::Embedded { base }),
             };
             build_web_router::<Model, Msg, FInit, FUpdate, FView, FSubs>(state, false)
                 .unwrap_or_else(|cause| fail_closed_router(&cause))
@@ -4615,12 +4648,7 @@ pub(crate) enum StartupRefusal {
     RouteTable(route::RoutePatternRefusal),
     /// The session store config cannot be honoured.
     SessionStore(store::StoreConfigError),
-    /// The base path (`IPE_WEB_BASE_PATH` / the mount prefix) does not decode.
-    BasePath {
-        base: crate::system::RefusedText,
-        refusal: crate::encoding::DecodeRefusal,
-    },
-    /// The base path is outside the mount-base grammar every shell URL uses.
+    /// The base path (`IPE_WEB_BASE_PATH`) is outside the mount-base grammar.
     MountBase {
         base: crate::system::RefusedText,
         refusal: crate::encoding::MountBaseRefusal,
@@ -4641,9 +4669,6 @@ impl std::fmt::Display for StartupRefusal {
         match self {
             Self::RouteTable(refusal) => write!(f, "{refusal}"),
             Self::SessionStore(e) => write!(f, "session store misconfigured: {e}"),
-            Self::BasePath { base, refusal } => {
-                write!(f, "web base path `{base}` is malformed: {refusal}")
-            }
             Self::MountBase { base, refusal } => {
                 write!(f, "web base path `{base}` is not a mount base: {refusal}")
             }
@@ -4670,22 +4695,8 @@ impl From<StartupRefusal> for crate::error::IpeError {
 pub(crate) const FAIL_CLOSED_BODY: &str =
     "Service Unavailable: this app could not start. The server log names the fault.";
 
-/// Parse the normalised base path once into the [`route::DecodedPath`] the
-/// SSE reconnect strips from a client route. The empty base is the root.
-///
-/// # Errors
-///
-/// [`StartupRefusal::BasePath`] for a base that is not a well-formed path.
-#[cfg(feature = "web")]
-fn parse_route_base(base: &str) -> Result<route::DecodedPath, StartupRefusal> {
-    route::DecodedPath::parse(base).map_err(|refusal| StartupRefusal::BasePath {
-        base: crate::system::RefusedText::new(base),
-        refusal,
-    })
-}
-
-/// Parse the normalised base path into the [`crate::encoding::MountBase`]
-/// every page and widget URL is built from. The empty base is the root.
+/// Parse a raw base into the [`crate::encoding::MountBase`] every page,
+/// widget and cookie of an app is scoped to. `""` and `"/"` are the root.
 ///
 /// # Errors
 ///
@@ -4696,17 +4707,6 @@ fn parse_mount_base(base: &str) -> Result<crate::encoding::MountBase, StartupRef
         base: crate::system::RefusedText::new(base),
         refusal,
     })
-}
-
-/// The process's [`crate::encoding::MountBase`], read from `IPE_WEB_BASE_PATH`.
-///
-/// # Errors
-///
-/// [`StartupRefusal::MountBase`] for a base outside the mount-base grammar;
-/// [`build_web_router`] refuses such a base before any request is served.
-#[cfg(feature = "web")]
-fn web_mount_base() -> Result<crate::encoding::MountBase, StartupRefusal> {
-    parse_mount_base(&web_base_path())
 }
 
 /// The `/static` file service of a `Web` app over `dir`: a [`MountTable`]
@@ -4814,6 +4814,12 @@ where
         let (route_entry, param_resolver, route_matched) =
             routed_resolvers(routes, not_found, set_page, render);
         // Fail-closed on an unhonourable store config (see `web_app`).
+        // The app's base is read from the environment once, here; a value
+        // outside the mount-base grammar refuses the start.
+        let mount = match MountContext::from_env() {
+            Ok(mount) => mount,
+            Err(refusal) => return IpeResult::Err(E::from_ipe_error(refusal.into())),
+        };
         let ttl = match web_ttl() {
             Ok(ttl) => ttl,
             Err(refusal) => {
@@ -4852,6 +4858,7 @@ where
             max_sessions,
             budget: budget::shared(),
             watch_build_status: Arc::new(Mutex::new(None)),
+            mount: Arc::new(mount),
         };
         serve_web(state).await
     })
@@ -4977,8 +4984,8 @@ fn static_noise_mime(ext: &str) -> &'static str {
 /// touched. A value that is not a bare path (no leading `/`, or carrying a `?`
 /// or `#`) names nothing to reconcile (`Ok(None)`).
 ///
-/// `base` is the normalised `IPE_WEB_BASE_PATH`, parsed once when the router
-/// is built (the root when unset, which strips nothing). It is stripped on a
+/// `base` is the decoded form of the app's `MountBase`, parsed once when its
+/// state is built (the root when unset, which strips nothing). It is stripped on a
 /// whole-segment boundary ([`route::DecodedPath::strip_base`]): base `/app`
 /// strips `/app/x` to `/x` and `/app` to `/`, and never touches `/apple`. A
 /// path not under the base names nothing this app displays (`Ok(None)`).
@@ -5070,6 +5077,7 @@ mod handlers {
             Err(rejection) => return rejection.status_and_reason().into_response(),
         };
         let path = strict.path();
+        let mount = Arc::clone(&st.mount);
         let lookup = (st.route_matched)(path);
         // A routed page reached by a path other than the one it renders to (a
         // trailing `/`, an escape its route decodes, `007` for an `Int` `7`) is
@@ -5078,13 +5086,7 @@ mod handlers {
         if let RouteLookup::Page(canonical) = &lookup
             && (method == axum::http::Method::GET || method == axum::http::Method::HEAD)
         {
-            let Some(base) = route::DecodedPath::parse(&web_base_path())
-                .ok()
-                .and_then(|base| crate::encoding::EncodedBase::encode(&base).ok())
-            else {
-                return (StatusCode::INTERNAL_SERVER_ERROR, "500 base path unusable")
-                    .into_response();
-            };
+            let base = mount.base().encoded();
             match route::canonical_redirect(
                 &base,
                 strict.spelling(),
@@ -5113,12 +5115,12 @@ mod handlers {
         //   * Rebuilt   → a persisted model spliced onto a fresh `init` across an
         //                 additive Model change; init's Cmd runs, then the entry's.
         //   * miss      → init a new session.
-        let cookie_sid = sid_from_cookie(&headers);
+        let cookie_sid = sid_from_cookie(&headers, mount.base());
         // CSRF double-submit token: reuse the browser's existing well-formed
         // per-app CSRF cookie (so a reload keeps the same token), else mint a
         // fresh one. `page_response` sets the cookie + injects the value into
         // the page JS; the client echoes it back in the `X-Ipê-Csrf` header.
-        let csrf_tok = match page_csrf_token(&headers, csrf::mint_token) {
+        let csrf_tok = match page_csrf_token(&headers, mount.base(), csrf::mint_token) {
             Ok(token) => token,
             Err(refusal) => return *refusal,
         };
@@ -5309,12 +5311,19 @@ mod handlers {
                     let overlay = crate::debugger::server::overlay_html(
                         &labels,
                         labels.len(),
-                        &web_base_path(),
+                        mount.base().prefix(),
                     );
-                    return page_response_with_overlay(&sid, &page, &overlay, &csrf_tok, &headers);
+                    return page_response_with_overlay(
+                        &sid,
+                        mount.base(),
+                        &page,
+                        &overlay,
+                        &csrf_tok,
+                        &headers,
+                    );
                 }
                 #[cfg(not(feature = "debugger"))]
-                return page_response(&sid, &page, &csrf_tok, &headers);
+                return page_response(&sid, mount.base(), &page, &csrf_tok, &headers);
             }
             Some((_, store::Rejoin::Restored { claim, model, .. })) => {
                 // A returning session drives under the admission its claim
@@ -5531,12 +5540,11 @@ mod handlers {
 
         #[cfg(feature = "debugger")]
         {
-            let base = web_base_path();
-            let overlay = crate::debugger::server::overlay_html(&[], 0, &base);
-            page_response_with_overlay(&sid, &page, &overlay, &csrf_tok, &headers)
+            let overlay = crate::debugger::server::overlay_html(&[], 0, mount.base().prefix());
+            page_response_with_overlay(&sid, mount.base(), &page, &overlay, &csrf_tok, &headers)
         }
         #[cfg(not(feature = "debugger"))]
-        page_response(&sid, &page, &csrf_tok, &headers)
+        page_response(&sid, mount.base(), &page, &csrf_tok, &headers)
     }
 
     // ── GET /_ipe/sse ─────────────────────────────────────────────────
@@ -5574,7 +5582,7 @@ mod handlers {
         // this request's Fetch Metadata: the `?path=` reconcile below runs a
         // route entry, so a subresource (a cross-site `<img>` carrying a
         // `SameSite=None` cookie) is refused before any lookup.
-        let proof = match rejoin_from_cookie(&headers) {
+        let proof = match rejoin_from_cookie(&headers, st.mount.base()) {
             Ok(proof) => proof,
             Err(refused) => return refused.into_response(),
         };
@@ -5817,7 +5825,7 @@ mod handlers {
         // no longer stand is closed by the lookup and answers session-lost.
         // A mutating POST: the CSRF middleware's token pair is its cross-site gate.
         let _ = &parsed.session_id; // body field retained for wire-compat; not trusted for auth
-        let Some(cookie_sid) = sid_from_cookie(&headers) else {
+        let Some(cookie_sid) = sid_from_cookie(&headers, st.mount.base()) else {
             return SessionLost.into_response();
         };
         let LiveSession {
@@ -6533,7 +6541,7 @@ mod handlers {
         };
         // Authenticate by the COOKIE sid ONLY (same rule as event_handler) —
         // never trust a body-supplied session id.
-        let sid = match sid_from_cookie(&headers) {
+        let sid = match sid_from_cookie(&headers, st.mount.base()) {
             Some(s) => s,
             None => {
                 return (
@@ -6659,7 +6667,7 @@ mod handlers {
         FSubs: Send + Sync + 'static,
     {
         use axum::response::IntoResponse;
-        let sid = match sid_from_cookie(&headers) {
+        let sid = match sid_from_cookie(&headers, st.mount.base()) {
             Some(s) => s,
             None => {
                 return (axum::http::StatusCode::UNAUTHORIZED, "no session").into_response();
@@ -6747,7 +6755,7 @@ mod handlers {
         FSubs: Send + Sync + 'static,
     {
         use axum::response::IntoResponse;
-        let sid = match sid_from_cookie(&headers) {
+        let sid = match sid_from_cookie(&headers, st.mount.base()) {
             Some(s) => s,
             None => {
                 return (axum::http::StatusCode::UNAUTHORIZED, "no session").into_response();
@@ -6810,7 +6818,7 @@ mod handlers {
         FSubs: Send + Sync + 'static,
     {
         use axum::response::IntoResponse;
-        let sid = match sid_from_cookie(&headers) {
+        let sid = match sid_from_cookie(&headers, st.mount.base()) {
             Some(s) => s,
             None => {
                 return (axum::http::StatusCode::UNAUTHORIZED, "no session").into_response();
@@ -6881,7 +6889,7 @@ mod handlers {
         FSubs: Send + Sync + 'static,
     {
         use axum::response::IntoResponse;
-        let sid = match sid_from_cookie(&headers) {
+        let sid = match sid_from_cookie(&headers, st.mount.base()) {
             Some(s) => s,
             None => {
                 return (axum::http::StatusCode::UNAUTHORIZED, "no session").into_response();
@@ -6973,7 +6981,7 @@ mod handlers {
         FSubs: Send + Sync + 'static,
     {
         use axum::response::IntoResponse;
-        let sid = match sid_from_cookie(&headers) {
+        let sid = match sid_from_cookie(&headers, st.mount.base()) {
             Some(s) => s,
             None => {
                 return (axum::http::StatusCode::UNAUTHORIZED, "no session").into_response();
@@ -7058,7 +7066,7 @@ mod handlers {
         FSubs: Send + Sync + 'static,
     {
         use axum::response::IntoResponse;
-        let sid = match sid_from_cookie(&headers) {
+        let sid = match sid_from_cookie(&headers, st.mount.base()) {
             Some(s) => s,
             None => {
                 return (axum::http::StatusCode::UNAUTHORIZED, "no session").into_response();
@@ -7145,7 +7153,7 @@ mod handlers {
         FSubs: Send + Sync + 'static,
     {
         use axum::response::IntoResponse;
-        let sid = match sid_from_cookie(&headers) {
+        let sid = match sid_from_cookie(&headers, st.mount.base()) {
             Some(s) => s,
             None => {
                 return (axum::http::StatusCode::UNAUTHORIZED, "no session").into_response();
@@ -7234,7 +7242,7 @@ mod handlers {
         FSubs: Send + Sync + 'static,
     {
         use axum::response::IntoResponse;
-        let sid = match sid_from_cookie(&headers) {
+        let sid = match sid_from_cookie(&headers, st.mount.base()) {
             Some(s) => s,
             None => {
                 return (axum::http::StatusCode::UNAUTHORIZED, "no session").into_response();
@@ -7333,7 +7341,7 @@ where
         Err(cause) => return IpeResult::Err(E::from_ipe_error(cause.into())),
     };
     #[cfg(all(feature = "web", feature = "http_client"))]
-    let use_console_proxy = console_proxy::ensure_console_proxy().await;
+    let use_console_proxy = console_proxy::ensure_console_proxy(&state.mount).await;
 
     // Cloned for the shutdown path's dev-only reload push — the router's
     // `.with_state(state)` takes ownership of `state` below.
@@ -7475,11 +7483,11 @@ where
     use axum::Router;
     use axum::routing::{get, post};
 
-    // The base the SSE reconnect strips from a client route, parsed once here:
-    // a malformed base refuses the router rather than a per-request re-parse
-    // that silently matches the unstripped path.
-    let sse_base = Arc::new(parse_route_base(&web_base_path())?);
-    let mount_base = web_mount_base()?;
+    // The app's base, parsed once where its state was built: the SSE
+    // reconnect strips it from a client route, the widget routes scope to it,
+    // and the CSRF and telemetry layers read the app's own context.
+    let mount = Arc::clone(&state.mount);
+    let sse_base = Arc::new(mount.base().to_decoded().clone());
     // Every environment ceiling the app applies resolves here, so a malformed
     // one refuses the router instead of a request; the per-request sites
     // re-read and refuse that request on their own.
@@ -7707,7 +7715,7 @@ where
     // is active (non-production + banner not disabled + root-mounted). The
     // handler additionally token-gates each request (same `IPE_WATCH_HOT_TOKEN`
     // mechanism as `/_ipe/hot-appearance`). Never reachable in production.
-    let router = if watch_banner_active(&web_base_path()) {
+    let router = if watch_banner_active(mount.base().prefix()) {
         router.route(
             "/_ipe/watch/status",
             post(handlers::watch_status_handler::<Model, Msg, FInit, FUpdate, FView, FSubs>)
@@ -7764,7 +7772,7 @@ where
             false
         }
     };
-    if !proxy_active && console::gate_allows() {
+    if !proxy_active && console::gate_allows(&mount) {
         store::emit_memory_store_log(session_ttl);
         crate::system::emit_runtime_log(
             "console",
@@ -7792,7 +7800,7 @@ where
     if widget_assets::has_widgets() {
         // The child router is root-relative: a parent proxy strips the base
         // before forwarding, so routes sit at the root and only the URLs the
-        // page and glue carry are built from `mount_base`.
+        // page and glue carry are built from the app's base.
         let route_root = crate::encoding::MountBase::root();
         for asset in widget_assets::registered() {
             let path = route_root.url_of(&widget_assets::widget_asset_path(&asset.content));
@@ -7800,15 +7808,15 @@ where
             router = router.route(&path, get(move || async move { serve_widget_js(content) }));
         }
         let glue_path = route_root.url_of(&widget_assets::glue_path(
-            &mount_base,
+            mount.base(),
             widget_assets::WidgetTransport::Server,
         ));
         // The glue body folds in the base-prefixed author URLs, so it is
-        // computed once here for the process (base is stable at startup) and
-        // leaked to `'static` for the handler — a one-time, bounded allocation
-        // sized by the program's widget count, never per-request.
+        // computed once here per mounted app (its base is fixed in its state)
+        // and leaked to `'static` for the handler — a bounded allocation sized
+        // by the program's widget count, never per-request.
         let glue_body: &'static str = Box::leak(
-            widget_assets::glue_js(&mount_base, widget_assets::WidgetTransport::Server)
+            widget_assets::glue_js(mount.base(), widget_assets::WidgetTransport::Server)
                 .into_boxed_str(),
         );
         router = router.route(
@@ -7849,7 +7857,10 @@ where
         // Layer order (axum: last `.layer` = outermost): CSRF is INNER of
         // observability::track so a rejected CSRF POST still gets counted +
         // access-logged.
-        .layer(axum::middleware::from_fn(csrf::csrf_middleware))
+        .layer(axum::middleware::from_fn_with_state(
+            Arc::clone(&mount),
+            csrf::csrf_middleware,
+        ))
         // Second boundary over every route here (page, SSE, event, port,
         // assets, static): a request that reaches this router without the
         // listener's URL parse is answered with the fixed 500 before CSRF or
@@ -7883,7 +7894,10 @@ where
                     .into_response()
             },
         ))
-        .layer(axum::middleware::from_fn(observability::track))
+        .layer(axum::middleware::from_fn_with_state(
+            mount,
+            observability::track,
+        ))
         .with_state(state);
 
     pubsub::mark_web_running();
@@ -7905,12 +7919,16 @@ pub fn web_serving() -> bool {
     WEB_SERVING.load(std::sync::atomic::Ordering::Acquire)
 }
 
-/// Read the session cookie from request headers. Uses the base-path-aware
-/// cookie name (`session_cookie_name`) so a sub-app reads its own scoped cookie,
-/// never the parent's `ipe_sid`.
+/// The session cookie of the app served at `base` from request headers.
+///
+/// The name is the base-scoped [`cookie_name_for`], so a sub-app reads its own
+/// cookie, never the parent's or a sibling mount's.
 #[cfg(feature = "web")]
-fn sid_from_cookie(headers: &axum::http::HeaderMap) -> Option<String> {
-    crate::server::request_cookie(headers, &session_cookie_name())
+fn sid_from_cookie(
+    headers: &axum::http::HeaderMap,
+    base: &crate::encoding::MountBase,
+) -> Option<String> {
+    crate::server::request_cookie(headers, &cookie_name_for(base))
 }
 
 // The Ipe.Html `Ffi.callPure "htmlXxx"` kernel wrappers (html_render_,
@@ -8396,7 +8414,6 @@ mod canonical_redirect_handler_tests {
     //! cookie, no `init`, a same-origin relative `Location` under the base.
 
     use super::*;
-    use crate::system::{locked_remove_var, locked_set_var};
     use crate::web::req::WebReq;
     use crate::web::route::{RenderArg, RenderRefusal, Route, RoutePath, render_route};
     use crate::web::store::MemoryStore;
@@ -8470,6 +8487,10 @@ mod canonical_redirect_handler_tests {
     type Subs = fn(Model) -> IpeSub<()>;
 
     fn make_router() -> Router {
+        make_router_at(crate::web::MountContext::Root)
+    }
+
+    fn make_router_at(mount: crate::web::MountContext) -> Router {
         let (route_entry, param_resolver, route_matched) = routed_resolvers(
             routes(),
             Page::Home,
@@ -8490,6 +8511,7 @@ mod canonical_redirect_handler_tests {
             max_sessions: std::num::NonZeroUsize::MAX,
             budget: crate::web::budget::SessionBudget::process(crate::web::budget::SESSION_BUDGET),
             watch_build_status: Arc::new(Mutex::new(None)),
+            mount: Arc::new(mount),
         };
         crate::server::behind_listener(
             Router::new()
@@ -8500,12 +8522,17 @@ mod canonical_redirect_handler_tests {
 
     #[allow(clippy::expect_used)] // test helper: request build and router failure are environment issues
     async fn send(method: &str, uri: &str) -> axum::response::Response {
+        send_to(make_router(), method, uri).await
+    }
+
+    #[allow(clippy::expect_used)] // test helper: request build and router failure are environment issues
+    async fn send_to(router: Router, method: &str, uri: &str) -> axum::response::Response {
         let req = Request::builder()
             .method(method)
             .uri(uri)
             .body(Body::empty())
             .expect("build request");
-        make_router().oneshot(req).await.expect("router responds")
+        router.oneshot(req).await.expect("router responds")
     }
 
     fn location(resp: &axum::response::Response) -> Option<String> {
@@ -8527,7 +8554,6 @@ mod canonical_redirect_handler_tests {
     /// runs no `init`; GET and HEAD agree.
     #[tokio::test]
     async fn non_canonical_get_and_head_redirect_before_init() {
-        locked_remove_var("IPE_WEB_BASE_PATH");
         let before = INIT_RUNS.load(Ordering::SeqCst);
         for method in ["GET", "HEAD"] {
             let resp = send(method, "/about/?x=1").await;
@@ -8549,7 +8575,6 @@ mod canonical_redirect_handler_tests {
     /// The canonical spelling is served, not redirected.
     #[tokio::test]
     async fn canonical_get_is_served() {
-        locked_remove_var("IPE_WEB_BASE_PATH");
         let resp = send("GET", "/about").await;
         assert_eq!(resp.status(), StatusCode::OK);
         assert!(location(&resp).is_none());
@@ -8559,7 +8584,6 @@ mod canonical_redirect_handler_tests {
     /// redirect never leaves the origin: `Location` is one `/` then a non-`/`.
     #[tokio::test]
     async fn redirect_location_is_same_origin_relative() {
-        locked_remove_var("IPE_WEB_BASE_PATH");
         let resp = send("GET", "/%2f%2fevil.com").await;
         assert_eq!(resp.status(), StatusCode::PERMANENT_REDIRECT);
         assert_eq!(location(&resp).as_deref(), Some("/%2F%2Fevil.com"));
@@ -8577,10 +8601,10 @@ mod canonical_redirect_handler_tests {
 
     /// Under a base path the redirect targets the base plus the canonical path.
     #[tokio::test]
+    #[allow(clippy::expect_used)] // `/app` is a grammar base
     async fn redirect_targets_the_base() {
-        locked_set_var("IPE_WEB_BASE_PATH", "/app");
-        let resp = send("GET", "/about/").await;
-        locked_remove_var("IPE_WEB_BASE_PATH");
+        let mount = crate::web::MountContext::standalone(Some("/app")).expect("a grammar base");
+        let resp = send_to(make_router_at(mount), "GET", "/about/").await;
         assert_eq!(resp.status(), StatusCode::PERMANENT_REDIRECT);
         assert_eq!(location(&resp).as_deref(), Some("/app/about"));
     }
@@ -8589,41 +8613,84 @@ mod canonical_redirect_handler_tests {
 #[cfg(all(test, feature = "web"))]
 mod base_path_tests {
     use super::{
-        Html, RenderEpoch, Rendered, SessionKeys, client_js_path, cookie_name_for,
-        cookie_name_with, cookie_path_for, normalise_base_path, render_page_full,
+        Html, MountContext, RenderEpoch, Rendered, SessionKeys, client_js_path, cookie_name_for,
+        cookie_name_with, cookie_path_for, render_page_full,
     };
+    use crate::encoding::MountBase;
 
+    /// A standalone base is taken as given: unset, empty and `/` are the root,
+    /// a grammar base is a proxied child, and a value the grammar refuses (a
+    /// trailing `/`, a missing leading `/`, padding, a cookie or HTML
+    /// metacharacter) refuses the start instead of being repaired.
     #[test]
-    fn normalise_root_and_empty_collapse() {
-        assert_eq!(normalise_base_path(""), "");
-        assert_eq!(normalise_base_path("/"), "");
-        assert_eq!(normalise_base_path("   "), "");
+    fn standalone_base_is_parsed_never_normalised() {
+        for root in [None, Some(""), Some("/")] {
+            assert_eq!(
+                MountContext::standalone(root),
+                Ok(MountContext::Root),
+                "{root:?}"
+            );
+        }
+        assert!(matches!(
+            MountContext::standalone(Some("/billing")),
+            Ok(MountContext::ProxiedChild { ref base }) if base.prefix() == "/billing"
+        ));
+        for bad in [
+            "/billing/",
+            "billing",
+            "  /billing",
+            "/a;b",
+            "/a\"b",
+            "/a<b",
+            "/a?b",
+            "/a#b",
+            "/a\u{fffd}",
+        ] {
+            assert!(
+                matches!(
+                    MountContext::standalone(Some(bad)),
+                    Err(super::StartupRefusal::MountBase { ref base, .. }) if base.as_str() == bad
+                ),
+                "{bad:?} must refuse the start"
+            );
+        }
     }
 
     #[test]
-    fn normalise_adds_leading_drops_trailing() {
-        assert_eq!(normalise_base_path("/_ipe/console"), "/_ipe/console");
-        assert_eq!(normalise_base_path("/_ipe/console/"), "/_ipe/console");
-        assert_eq!(normalise_base_path("_ipe/console"), "/_ipe/console");
-        assert_eq!(normalise_base_path("  /billing/  "), "/billing");
-    }
-
-    #[test]
+    #[allow(clippy::expect_used)] // the bases are grammar bases
     fn cookie_name_is_ipe_sid_at_root_distinct_under_base() {
+        let root = MountBase::root();
+        let console = MountBase::parse("/_ipe/console").expect("a grammar base");
         // Plain-http dev: the root cookie keeps its plain name.
-        assert_eq!(cookie_name_with("", false).text(), "ipe_sid");
-        assert_eq!(cookie_name_with("", true).text(), "__Host-ipe_sid");
+        assert_eq!(cookie_name_with(&root, false).text(), "ipe_sid");
+        assert_eq!(cookie_name_with(&root, true).text(), "__Host-ipe_sid");
         // Distinct from the parent's `ipe_sid` so the proxied child can't clobber it.
         for secure in [false, true] {
             assert_eq!(
-                cookie_name_with("/_ipe/console", secure).text(),
-                "ipe_sid__ipe_console"
+                cookie_name_with(&console, secure).text(),
+                "ipe_sid_2F_5Fipe_2Fconsole"
             );
         }
         assert_eq!(
-            cookie_name_for("/_ipe/console").text(),
-            "ipe_sid__ipe_console"
+            cookie_name_for(&console).text(),
+            "ipe_sid_2F_5Fipe_2Fconsole"
         );
+    }
+
+    /// Bases the old alphanumeric map folded onto one name get distinct session
+    /// cookies, so co-mounted apps never read each other's session.
+    #[test]
+    #[allow(clippy::expect_used)] // the bases are grammar bases
+    fn session_cookie_names_are_distinct_per_base() {
+        let names: Vec<_> = ["/a-b", "/a_b", "/a/b", "/a.b", "/a~b"]
+            .into_iter()
+            .map(|raw| cookie_name_for(&MountBase::parse(raw).expect("a grammar base")))
+            .collect();
+        for (i, a) in names.iter().enumerate() {
+            for b in names.iter().skip(i + 1) {
+                assert_ne!(a, b);
+            }
+        }
     }
 
     // A release binary under `ENV=dev` still names its root session cookie
@@ -8633,15 +8700,17 @@ mod base_path_tests {
     fn session_cookie_host_prefixed_on_release_under_env_dev() {
         crate::system::locked_set_var("ENV", "dev");
         assert!(super::csrf::cookies_secure());
-        assert_eq!(cookie_name_for("").text(), "__Host-ipe_sid");
+        assert_eq!(cookie_name_for(&MountBase::root()).text(), "__Host-ipe_sid");
         crate::system::locked_remove_var("ENV");
     }
 
     #[test]
+    #[allow(clippy::expect_used)] // `/_ipe/console` is a grammar base
     fn cookie_path_scopes_to_base() {
-        assert_eq!(cookie_path_for(""), "/");
+        assert_eq!(cookie_path_for(&MountBase::root()), "/");
         // Scoped → the cookie is never sent to the parent's own routes.
-        assert_eq!(cookie_path_for("/_ipe/console"), "/_ipe/console");
+        let console = MountBase::parse("/_ipe/console").expect("a grammar base");
+        assert_eq!(cookie_path_for(&console), "/_ipe/console");
     }
 
     /// The typed session line keeps the exact bytes of the hand-formatted one,
@@ -8660,14 +8729,15 @@ mod base_path_tests {
         } else {
             "Lax"
         };
+        let base = MountBase::root();
         let expected = format!(
             "{}=0f3a-sid; Path={}; HttpOnly; SameSite={same_site}{secure}; Max-Age={}",
-            super::session_cookie_name(),
-            super::cookie_path(),
+            cookie_name_for(&base),
+            cookie_path_for(&base),
             ttl.as_secs()
         );
         assert_eq!(
-            super::session_set_cookie("0f3a-sid", &headers, ttl).as_str(),
+            super::session_set_cookie("0f3a-sid", &base, &headers, ttl).as_str(),
             expected
         );
     }
@@ -9991,15 +10061,15 @@ mod sse_reconnect_reconcile_tests {
         route::DecodedPath::parse(path).expect("well-formed test path")
     }
 
-    /// `client_route_path` under `base`, parsed the way `build_web_router`
-    /// parses it (once, through `parse_route_base`).
+    /// `client_route_path` under `base`, stripped the way `build_web_router`
+    /// strips it (the decoded form of the app's [`crate::encoding::MountBase`]).
     #[allow(clippy::expect_used)] // test helper: every base passed here is well-formed
     fn route_path(
         raw: &str,
         base: &str,
     ) -> Result<Option<route::DecodedPath>, crate::server::RequestRejection> {
-        let base = parse_route_base(base).expect("well-formed test base");
-        client_route_path(raw, &base)
+        let base = parse_mount_base(base).expect("well-formed test base");
+        client_route_path(raw, base.to_decoded())
     }
 
     fn make_session(page: TestPage, entered_path: Option<&str>, view: TestView) -> Fixture {
@@ -10446,11 +10516,11 @@ mod sse_reconnect_reconcile_tests {
     #[test]
     fn startup_refusal_scrubs_the_base_once() {
         let refusals = [
-            parse_route_base("/%zz\\").err(),
+            parse_mount_base("/%zz\\").err(),
             parse_mount_base("/a\\b").err(),
         ];
         let expected = [
-            "web base path `/%zz\\\\` is malformed",
+            "web base path `/%zz\\\\` is not a mount base",
             "web base path `/a\\\\b` is not a mount base",
         ];
         for (refusal, expected) in refusals.into_iter().zip(expected) {
@@ -10467,15 +10537,12 @@ mod sse_reconnect_reconcile_tests {
     #[test]
     fn startup_refusal_scrubs_bidi_and_controls() {
         let hostile = "/%zz\u{202e}\n\u{1b}[31m";
-        let refusals = [
-            parse_route_base(hostile).err(),
-            parse_mount_base(hostile).err(),
-        ];
-        for refusal in refusals {
+        {
+            let refusal = parse_mount_base(hostile).err();
             assert!(
                 matches!(
                     &refusal,
-                    Some(StartupRefusal::BasePath { base, .. } | StartupRefusal::MountBase { base, .. })
+                    Some(StartupRefusal::MountBase { base, .. })
                         if *base == crate::system::RefusedText::new(hostile)
                 ),
                 "{refusal:?}"
@@ -10490,21 +10557,24 @@ mod sse_reconnect_reconcile_tests {
         }
     }
 
-    /// A base path that does not decode is refused when the router is built,
-    /// as the typed `StartupRefusal::BasePath` naming the base; the empty base
-    /// is the root, which strips nothing.
+    /// A base path that does not decode is refused where the app's context is
+    /// built, as the typed `StartupRefusal::MountBase` naming the base; the
+    /// empty base is the root, which strips nothing.
     #[test]
     fn malformed_base_path_is_refused_at_build() {
         for bad in ["/%zz", "/app/%", "/%C0%AF"] {
             assert!(
                 matches!(
-                    parse_route_base(bad),
-                    Err(StartupRefusal::BasePath { ref base, .. }) if base.as_str() == bad
+                    parse_mount_base(bad),
+                    Err(StartupRefusal::MountBase { ref base, .. }) if base.as_str() == bad
                 ),
                 "base {bad} must be refused"
             );
         }
-        assert_eq!(parse_route_base(""), Ok(dp("/")));
+        assert_eq!(
+            parse_mount_base("").map(|base| base.to_decoded().clone()),
+            Ok(dp("/"))
+        );
         assert_eq!(
             route_path("/items/5", "").ok().flatten(),
             Some(dp("/items/5"))
@@ -10803,6 +10873,7 @@ mod watch_status_handler_tests {
             max_sessions: std::num::NonZeroUsize::MAX,
             budget: crate::web::budget::SessionBudget::process(crate::web::budget::SESSION_BUDGET),
             watch_build_status: Arc::new(Mutex::new(None)),
+            mount: Arc::new(crate::web::MountContext::Root),
         }
     }
 
@@ -11383,6 +11454,7 @@ mod watch_status_handler_tests {
                     crate::web::budget::SESSION_BUDGET,
                 ),
                 watch_build_status: wbs,
+                mount: Arc::new(crate::web::MountContext::Root),
             }
         }
 
@@ -11491,6 +11563,7 @@ mod hot_transition_handler_tests {
             max_sessions: std::num::NonZeroUsize::MAX,
             budget: crate::web::budget::SessionBudget::process(crate::web::budget::SESSION_BUDGET),
             watch_build_status: Arc::new(Mutex::new(None)),
+            mount: Arc::new(crate::web::MountContext::Root),
         };
         Router::new()
             .route(
@@ -11753,6 +11826,7 @@ mod hot_init_session_scoping_tests {
             max_sessions: std::num::NonZeroUsize::MAX,
             budget: crate::web::budget::SessionBudget::process(crate::web::budget::SESSION_BUDGET),
             watch_build_status: Arc::new(Mutex::new(None)),
+            mount: Arc::new(crate::web::MountContext::Root),
         };
         crate::server::behind_listener(
             Router::new()
@@ -11793,7 +11867,7 @@ mod hot_init_session_scoping_tests {
             for part in s.split(';') {
                 let part = part.trim();
                 if let Some((k, v)) = part.split_once('=')
-                    && k.trim() == cookie_name_for("").as_str()
+                    && k.trim() == cookie_name_for(&crate::encoding::MountBase::root()).as_str()
                 {
                     return v.trim().to_string();
                 }
@@ -12010,6 +12084,7 @@ mod hot_msg_handler_tests {
             max_sessions: std::num::NonZeroUsize::MAX,
             budget: crate::web::budget::SessionBudget::process(crate::web::budget::SESSION_BUDGET),
             watch_build_status: Arc::new(Mutex::new(None)),
+            mount: Arc::new(crate::web::MountContext::Root),
         };
         Router::new()
             .route(
@@ -12225,6 +12300,7 @@ mod hot_init_handler_tests {
             max_sessions: std::num::NonZeroUsize::MAX,
             budget: crate::web::budget::SessionBudget::process(crate::web::budget::SESSION_BUDGET),
             watch_build_status: Arc::new(Mutex::new(None)),
+            mount: Arc::new(crate::web::MountContext::Root),
         };
         Router::new()
             .route(
@@ -12444,6 +12520,7 @@ mod hot_wiring_handler_tests {
             max_sessions: std::num::NonZeroUsize::MAX,
             budget: crate::web::budget::SessionBudget::process(crate::web::budget::SESSION_BUDGET),
             watch_build_status: Arc::new(Mutex::new(None)),
+            mount: Arc::new(crate::web::MountContext::Root),
         };
         Router::new()
             .route(
@@ -12982,6 +13059,7 @@ mod emitted_router_behavior_tests {
             max_sessions: std::num::NonZeroUsize::MAX,
             budget: crate::web::budget::SessionBudget::process(crate::web::budget::SESSION_BUDGET),
             watch_build_status: Arc::new(Mutex::new(None)),
+            mount: Arc::new(crate::web::MountContext::Root),
         }
     }
 
@@ -13034,7 +13112,13 @@ mod emitted_router_behavior_tests {
     async fn get(router: axum::Router, path: &str, cookie: Option<&str>) -> (String, String) {
         let mut b = Request::builder().method("GET").uri(path);
         if let Some(c) = cookie {
-            b = b.header(header::COOKIE, format!("{}={c}", cookie_name_for("")));
+            b = b.header(
+                header::COOKIE,
+                format!(
+                    "{}={c}",
+                    cookie_name_for(&crate::encoding::MountBase::root())
+                ),
+            );
         }
         let resp = router
             .oneshot(b.body(Body::empty()).expect("build GET"))
@@ -13043,7 +13127,10 @@ mod emitted_router_behavior_tests {
         let mut sid = String::new();
         for val in resp.headers().get_all(header::SET_COOKIE) {
             let s = val.to_str().unwrap_or("");
-            if let Some(rest) = s.strip_prefix(&format!("{}=", cookie_name_for(""))) {
+            if let Some(rest) = s.strip_prefix(&format!(
+                "{}=",
+                cookie_name_for(&crate::encoding::MountBase::root())
+            )) {
                 sid = rest.split(';').next().unwrap_or("").trim().to_string();
                 break;
             }
@@ -13065,7 +13152,13 @@ mod emitted_router_behavior_tests {
                     .method("POST")
                     .uri("/_ipe/event")
                     .header(header::CONTENT_TYPE, "application/json")
-                    .header(header::COOKIE, format!("{}={cookie}", cookie_name_for("")))
+                    .header(
+                        header::COOKIE,
+                        format!(
+                            "{}={cookie}",
+                            cookie_name_for(&crate::encoding::MountBase::root())
+                        ),
+                    )
                     .body(Body::from(body.to_owned()))
                     .expect("build POST"),
             )
@@ -13148,27 +13241,16 @@ mod emitted_router_behavior_tests {
     }
 
     /// A base path that decodes but is outside the mount-base grammar refuses
-    /// the router at startup, so no page or widget URL is built from it.
-    #[tokio::test]
-    async fn a_non_mount_base_path_refuses_the_router() {
-        crate::system::locked_set_var("IPE_WEB_BASE_PATH", "/app/x%41");
-        let refused = build_web_router::<
-            Model,
-            Msg,
-            fn(WebReq) -> (Model, IpeCmd<Msg>),
-            fn(Msg, Model) -> (Model, IpeCmd<Msg>),
-            fn(Model) -> Html<Msg>,
-            fn(Model) -> IpeSub<Msg>,
-        >(
-            make_state(Arc::new(Store::new(Duration::from_secs(60)))),
-            false,
-        )
-        .err();
-        crate::system::locked_remove_var("IPE_WEB_BASE_PATH");
+    /// the app's context at startup, so no router, page or widget URL is built
+    /// from it; a grammar base is admitted.
+    #[test]
+    fn a_non_mount_base_path_refuses_the_start() {
+        let refused = MountContext::standalone(Some("/app/x%41")).err();
         assert!(
             matches!(&refused, Some(StartupRefusal::MountBase { base, .. }) if base.as_str() == "/app/x%41"),
-            "a non-mount base must refuse the router, got {refused:?}"
+            "a non-mount base must refuse the start, got {refused:?}"
         );
+        assert!(MountContext::standalone(Some("/app/xA")).is_ok());
     }
 
     /// The router built with the current environment and installed config.
@@ -13482,7 +13564,13 @@ mod emitted_router_behavior_tests {
                         .method("GET")
                         .uri("/_ipe/sse?path=%2F")
                         .header(header::ACCEPT, "text/event-stream")
-                        .header(header::COOKIE, format!("{}={sid}", cookie_name_for("")))
+                        .header(
+                            header::COOKIE,
+                            format!(
+                                "{}={sid}",
+                                cookie_name_for(&crate::encoding::MountBase::root())
+                            ),
+                        )
                         .body(Body::empty())
                         .expect("build SSE GET"),
                 )
@@ -13615,7 +13703,13 @@ mod emitted_router_behavior_tests {
                     .method("POST")
                     .uri("/_ipe/event")
                     .header(header::CONTENT_TYPE, "application/json")
-                    .header(header::COOKIE, format!("{}={cookie}", cookie_name_for("")))
+                    .header(
+                        header::COOKIE,
+                        format!(
+                            "{}={cookie}",
+                            cookie_name_for(&crate::encoding::MountBase::root())
+                        ),
+                    )
                     .body(Body::from(body.to_owned()))
                     .expect("build POST"),
             )
@@ -13649,7 +13743,13 @@ mod emitted_router_behavior_tests {
                 Request::builder()
                     .method("GET")
                     .uri(path)
-                    .header(header::COOKIE, format!("{}={cookie}", cookie_name_for("")))
+                    .header(
+                        header::COOKIE,
+                        format!(
+                            "{}={cookie}",
+                            cookie_name_for(&crate::encoding::MountBase::root())
+                        ),
+                    )
                     .body(Body::empty())
                     .expect("build GET"),
             )
@@ -13930,7 +14030,10 @@ mod emitted_router_behavior_tests {
             let store = Arc::new(Store::new(Duration::from_secs(60)));
             let (sid, body) = get(make_router(store.clone()), "/", None).await;
             let plus = hid_near_text(&body, "+").expect("data-ipe-hid near >+<");
-            let cookie = format!("{}={sid}", cookie_name_for(""));
+            let cookie = format!(
+                "{}={sid}",
+                cookie_name_for(&crate::encoding::MountBase::root())
+            );
             let cache = |resp: &axum::response::Response| {
                 resp.headers()
                     .get_all(header::CACHE_CONTROL)
@@ -14150,7 +14253,13 @@ mod emitted_router_behavior_tests {
                         .method("POST")
                         .uri("/_ipe/debug/step-to")
                         .header(header::CONTENT_TYPE, "application/json")
-                        .header(header::COOKIE, format!("{}={sid}", cookie_name_for("")))
+                        .header(
+                            header::COOKIE,
+                            format!(
+                                "{}={sid}",
+                                cookie_name_for(&crate::encoding::MountBase::root())
+                            ),
+                        )
                         .body(Body::from(r#"{"index":0}"#))
                         .expect("build POST"),
                 )
@@ -14256,7 +14365,13 @@ mod emitted_router_behavior_tests {
                     .method("POST")
                     .uri("/_ipe/debug/scrub")
                     .header(header::CONTENT_TYPE, "application/json")
-                    .header(header::COOKIE, format!("{}={sid}", cookie_name_for("")))
+                    .header(
+                        header::COOKIE,
+                        format!(
+                            "{}={sid}",
+                            cookie_name_for(&crate::encoding::MountBase::root())
+                        ),
+                    )
                     .body(Body::from(body.to_owned()))
                     .expect("build POST"),
             )
@@ -14404,7 +14519,13 @@ mod emitted_router_behavior_tests {
                     .method("GET")
                     .uri("/_ipe/sse?path=%2F")
                     .header(header::ACCEPT, "text/event-stream")
-                    .header(header::COOKIE, format!("{}={sid}", cookie_name_for("")))
+                    .header(
+                        header::COOKIE,
+                        format!(
+                            "{}={sid}",
+                            cookie_name_for(&crate::encoding::MountBase::root())
+                        ),
+                    )
                     .body(Body::empty())
                     .expect("build SSE GET"),
             )
@@ -14595,7 +14716,13 @@ mod emitted_router_behavior_tests {
                         .method("GET")
                         .uri("/_ipe/sse?path=%2F")
                         .header(header::ACCEPT, "text/event-stream")
-                        .header(header::COOKIE, format!("{}={sid}", cookie_name_for("")))
+                        .header(
+                            header::COOKIE,
+                            format!(
+                                "{}={sid}",
+                                cookie_name_for(&crate::encoding::MountBase::root())
+                            ),
+                        )
                         .body(Body::empty())
                         .expect("build SSE GET"),
                 )
@@ -14819,7 +14946,8 @@ mod emitted_router_behavior_tests {
             )
             .await;
             assert_eq!(admitted.status(), StatusCode::OK);
-            let session_prefix = format!("{}=", cookie_name_for(""));
+            let session_prefix =
+                format!("{}=", cookie_name_for(&crate::encoding::MountBase::root()));
             assert!(
                 admitted
                     .headers()
@@ -14879,7 +15007,13 @@ mod emitted_router_behavior_tests {
     ) -> (StatusCode, String) {
         let mut b = Request::builder().method("GET").uri(uri);
         if let Some(c) = cookie {
-            b = b.header(header::COOKIE, format!("{}={c}", cookie_name_for("")));
+            b = b.header(
+                header::COOKIE,
+                format!(
+                    "{}={c}",
+                    cookie_name_for(&crate::encoding::MountBase::root())
+                ),
+            );
         }
         let resp = router
             .oneshot(b.body(Body::empty()).expect("build GET"))
@@ -15141,8 +15275,9 @@ mod emitted_router_behavior_tests {
             String::new(),
             [0u8; 32],
         );
-        let (status, body) =
-            block_on(async move { mounted_get(builder(String::new()).await).await });
+        let (status, body) = block_on(async move {
+            mounted_get(builder(crate::encoding::MountBase::root()).await).await
+        });
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(body, FAIL_CLOSED_BODY);
         assert!(!body.contains("%zz"), "the 503 must not echo the refusal");
@@ -15164,7 +15299,7 @@ mod emitted_router_behavior_tests {
         );
         block_on(async move {
             let base = crate::encoding::MountBase::parse("/billing").expect("the prefix parses");
-            let sub = builder(String::new()).await;
+            let sub = builder(base.clone()).await;
             let app = crate::server::behind_listener(
                 crate::server::MountTable::new(vec![(base, sub)]).below(axum::Router::new()),
             );
@@ -15193,6 +15328,59 @@ mod emitted_router_behavior_tests {
         });
     }
 
+    /// Two `Web.embed` apps on one listener each serve below their own prefix
+    /// and scope their session cookie to it, whichever was built first.
+    #[test]
+    fn two_embedded_apps_serve_their_own_base() {
+        let build = || {
+            web_embed_router(
+                init,
+                update,
+                view,
+                subs,
+                "memory".to_string(),
+                String::new(),
+                [0u8; 32],
+            )
+        };
+        let (first, second) = (build(), build());
+        block_on(async move {
+            let a = crate::encoding::MountBase::parse("/a").expect("the prefix parses");
+            let b = crate::encoding::MountBase::parse("/b").expect("the prefix parses");
+            let sub_b = second(b.clone()).await;
+            let sub_a = first(a.clone()).await;
+            let app = crate::server::behind_listener(
+                crate::server::MountTable::new(vec![(a.clone(), sub_a), (b.clone(), sub_b)])
+                    .below(axum::Router::new()),
+            );
+            for base in [a, b] {
+                let resp = app
+                    .clone()
+                    .oneshot(
+                        Request::builder()
+                            .method("GET")
+                            .uri(base.prefix())
+                            .body(Body::empty())
+                            .expect("build GET"),
+                    )
+                    .await
+                    .expect("router responds");
+                assert_eq!(resp.status(), StatusCode::OK, "{}", base.prefix());
+                let session = format!("{}=", cookie_name_for(&base).as_str());
+                let scoped = format!("Path={}", base.prefix());
+                assert!(
+                    resp.headers()
+                        .get_all(axum::http::header::SET_COOKIE)
+                        .iter()
+                        .filter_map(|v| v.to_str().ok())
+                        .any(|line| line.starts_with(&session) && line.contains(&scoped)),
+                    "{} sets its own session cookie",
+                    base.prefix()
+                );
+            }
+        });
+    }
+
     /// A mounted app whose store config this build cannot honour answers every
     /// path with the fixed 503 body, never the store detail.
     #[cfg(not(feature = "redis_store"))]
@@ -15207,8 +15395,9 @@ mod emitted_router_behavior_tests {
             String::new(),
             [0u8; 32],
         );
-        let (status, body) =
-            block_on(async move { mounted_get(builder(String::new()).await).await });
+        let (status, body) = block_on(async move {
+            mounted_get(builder(crate::encoding::MountBase::root()).await).await
+        });
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(body, FAIL_CLOSED_BODY);
         assert!(
@@ -15230,7 +15419,7 @@ mod emitted_router_behavior_tests {
                 backend: "postgres",
                 cause: crate::system::RefusedText::new("postgres://user:hunter2@db.internal/app"),
             }),
-            parse_route_base("/%zz").expect_err("the base is malformed"),
+            parse_mount_base("/%zz").expect_err("the base is malformed"),
             StartupRefusal::FrameAncestors(
                 crate::telemetry::FrameAncestors::parse("https://a.example\r\n")
                     .expect_err("a CR/LF source list is refused"),
@@ -15270,7 +15459,8 @@ mod emitted_router_behavior_tests {
 
 #[cfg(all(test, feature = "web"))]
 mod page_mount_base_tests {
-    use axum::http::{HeaderMap, StatusCode};
+    use crate::encoding::MountBase;
+    use axum::http::{HeaderMap, StatusCode, header};
 
     /// The first render of a fresh render history.
     fn first_page() -> super::PageRender {
@@ -15280,31 +15470,83 @@ mod page_mount_base_tests {
         ))
     }
 
-    /// The page under the current `IPE_WEB_BASE_PATH`.
+    /// The page of the app served at `base`.
     #[cfg(not(feature = "debugger"))]
-    fn page(headers: &HeaderMap) -> axum::response::Response {
-        super::page_response("sid", &first_page(), "tok", headers)
+    fn page(base: &MountBase, headers: &HeaderMap) -> axum::response::Response {
+        super::page_response("sid", base, &first_page(), "tok", headers)
     }
 
-    /// The page under the current `IPE_WEB_BASE_PATH`.
+    /// The page of the app served at `base`.
     #[cfg(feature = "debugger")]
-    fn page(headers: &HeaderMap) -> axum::response::Response {
-        super::page_response_with_overlay("sid", &first_page(), "", "tok", headers)
+    fn page(base: &MountBase, headers: &HeaderMap) -> axum::response::Response {
+        super::page_response_with_overlay("sid", base, &first_page(), "", "tok", headers)
     }
 
-    /// A page asked for under a base outside the mount-base grammar answers the
-    /// fixed 503, never a page whose URLs and `ipe-base` meta carry that base; a
-    /// grammar base renders the page.
+    /// The status, `Set-Cookie` lines and body of the page served at `base`.
+    #[allow(clippy::expect_used)] // test helper: a runtime or body failure is an environment issue
+    fn served(base: &MountBase) -> (StatusCode, Vec<String>, String) {
+        let resp = page(base, &HeaderMap::new());
+        let status = resp.status();
+        let cookies = resp
+            .headers()
+            .get_all(header::SET_COOKIE)
+            .iter()
+            .filter_map(|v| v.to_str().ok().map(str::to_owned))
+            .collect();
+        let bytes = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("current-thread runtime")
+            .block_on(axum::body::to_bytes(resp.into_body(), usize::MAX))
+            .expect("read body");
+        (
+            status,
+            cookies,
+            String::from_utf8(bytes.to_vec()).expect("utf-8 body"),
+        )
+    }
+
+    /// A page is built only under a parsed base: a base outside the mount-base
+    /// grammar has no [`MountBase`] to render under, and a grammar base renders
+    /// the page.
     #[test]
-    fn a_non_mount_base_path_refuses_the_page() {
-        let headers = HeaderMap::new();
-        crate::system::locked_set_var("IPE_WEB_BASE_PATH", "/a\"b");
-        let refused = page(&headers).status();
-        crate::system::locked_set_var("IPE_WEB_BASE_PATH", "/app");
-        let admitted = page(&headers).status();
-        crate::system::locked_remove_var("IPE_WEB_BASE_PATH");
-        assert_eq!(refused, StatusCode::SERVICE_UNAVAILABLE);
-        assert_eq!(admitted, StatusCode::OK);
+    fn a_page_renders_only_under_a_parsed_base() {
+        assert!(MountBase::parse("/a\"b").is_err());
+        assert!(MountBase::parse("/a;b").is_err());
+        let base = MountBase::parse("/app").expect("a grammar base");
+        assert_eq!(served(&base).0, StatusCode::OK);
+    }
+
+    /// Two apps in one process each render their own `ipe-base` meta, client
+    /// `src`, session cookie name and cookie `Path`, whichever was built first.
+    #[test]
+    fn two_mounts_render_their_own_base() {
+        let a = MountBase::parse("/a").expect("a grammar base");
+        let b = MountBase::parse("/b").expect("a grammar base");
+        for (base, other) in [(&a, &b), (&b, &a), (&a, &b)] {
+            let (status, cookies, body) = served(base);
+            assert_eq!(status, StatusCode::OK);
+            let prefix = base.prefix();
+            assert!(body.contains(&format!("<meta name=\"ipe-base\" content=\"{prefix}\">")));
+            assert!(body.contains(&format!("<script src=\"{prefix}/_ipe/client.")));
+            assert!(!body.contains(&format!("content=\"{}\"", other.prefix())));
+            let session = super::cookie_name_for(base);
+            let session_line = cookies
+                .iter()
+                .find(|line| line.starts_with(&format!("{}=", session.as_str())));
+            assert!(
+                session_line.is_some_and(|line| line.contains(&format!("Path={prefix};"))
+                    || line.ends_with(&format!("Path={prefix}"))),
+                "{cookies:?}"
+            );
+            assert_ne!(super::cookie_name_for(other), session);
+            assert!(
+                cookies.iter().any(|line| line.starts_with(&format!(
+                    "{}=",
+                    super::csrf::csrf_cookie_name_for(base).as_str()
+                ))),
+                "{cookies:?}"
+            );
+        }
     }
 }
 
@@ -15486,6 +15728,7 @@ mod route_entry_cmd_tests {
             max_sessions: std::num::NonZeroUsize::MAX,
             budget: crate::web::budget::SessionBudget::process(crate::web::budget::SESSION_BUDGET),
             watch_build_status: Arc::new(Mutex::new(None)),
+            mount: Arc::new(crate::web::MountContext::Root),
         }
     }
 
@@ -16105,7 +16348,13 @@ mod route_entry_cmd_tests {
                         .method("GET")
                         .uri("/_ipe/sse?path=%2F")
                         .header(header::ACCEPT, "text/event-stream")
-                        .header(header::COOKIE, format!("{}={sid}", cookie_name_for("")))
+                        .header(
+                            header::COOKIE,
+                            format!(
+                                "{}={sid}",
+                                cookie_name_for(&crate::encoding::MountBase::root())
+                            ),
+                        )
                         .body(Body::empty())
                         .expect("build SSE GET"),
                 )
@@ -16349,7 +16598,7 @@ mod route_entry_cmd_tests {
         path: &str,
         cookie: Option<&str>,
     ) -> (StatusCode, Option<String>, String, String) {
-        let name = super::cookie_name_for("");
+        let name = super::cookie_name_for(&crate::encoding::MountBase::root());
         let prefix = format!("{name}=");
         let mut b = Request::builder().method("GET").uri(path);
         if let Some(c) = cookie {
@@ -16686,7 +16935,10 @@ mod route_entry_cmd_tests {
         if let Some(c) = cookie {
             b = b.header(
                 header::COOKIE,
-                format!("{}={c}", super::cookie_name_for("")),
+                format!(
+                    "{}={c}",
+                    super::cookie_name_for(&crate::encoding::MountBase::root())
+                ),
             );
         }
         for (name, value) in metadata {
@@ -17463,7 +17715,10 @@ mod route_entry_cmd_tests {
                     .header(header::ACCEPT, "text/event-stream")
                     .header(
                         header::COOKIE,
-                        format!("{}={sid}", super::cookie_name_for("")),
+                        format!(
+                            "{}={sid}",
+                            super::cookie_name_for(&crate::encoding::MountBase::root())
+                        ),
                     )
                     .body(Body::empty())
                     .expect("build SSE GET"),
@@ -17561,7 +17816,7 @@ mod route_entry_cmd_tests {
         path: &str,
         cookie: Option<&str>,
     ) -> (StatusCode, String, String, String) {
-        let name = super::cookie_name_for("");
+        let name = super::cookie_name_for(&crate::encoding::MountBase::root());
         let prefix = format!("{name}=");
         let mut b = Request::builder().method("GET").uri(path);
         if let Some(c) = cookie {
@@ -17704,7 +17959,10 @@ mod route_entry_cmd_tests {
             .header(header::ACCEPT, "text/event-stream")
             .header(
                 header::COOKIE,
-                format!("{}={sid}", super::cookie_name_for("")),
+                format!(
+                    "{}={sid}",
+                    super::cookie_name_for(&crate::encoding::MountBase::root())
+                ),
             );
         for (name, value) in metadata {
             b = b.header(*name, *value);
@@ -18112,6 +18370,7 @@ mod web_revocation_tests {
             max_sessions: std::num::NonZeroUsize::MAX,
             budget: crate::web::budget::SessionBudget::process(crate::web::budget::SESSION_BUDGET),
             watch_build_status: Arc::new(Mutex::new(None)),
+            mount: Arc::new(crate::web::MountContext::Root),
         };
         build_web_router(state, false)
             .map(crate::server::behind_listener)
@@ -18165,7 +18424,10 @@ mod web_revocation_tests {
 
     /// The session cookie pair for `sid`.
     fn sid_cookie(sid: &str) -> String {
-        format!("{}={sid}", cookie_name_for(""))
+        format!(
+            "{}={sid}",
+            cookie_name_for(&crate::encoding::MountBase::root())
+        )
     }
 
     /// Send one request through `router`.
@@ -18193,7 +18455,7 @@ mod web_revocation_tests {
 
     /// The session sid a response sets, or empty when it sets none.
     fn minted_sid(resp: &Response) -> String {
-        let prefix = format!("{}=", cookie_name_for(""));
+        let prefix = format!("{}=", cookie_name_for(&crate::encoding::MountBase::root()));
         resp.headers()
             .get_all(header::SET_COOKIE)
             .iter()
@@ -20181,7 +20443,9 @@ mod page_csrf_mint_tests {
     #[test]
     fn page_csrf_mint_failure_is_503() {
         let headers = axum::http::HeaderMap::new();
-        let refused = page_csrf_token(&headers, || Err(EntropyError));
+        let refused = page_csrf_token(&headers, &crate::encoding::MountBase::root(), || {
+            Err(EntropyError)
+        });
         assert!(refused.is_err(), "a refused mint yields no token");
         let Err(resp) = refused else { return };
         assert_eq!(resp.status(), axum::http::StatusCode::SERVICE_UNAVAILABLE);
@@ -20199,7 +20463,7 @@ mod page_csrf_mint_tests {
     #[allow(clippy::expect_used)] // test: a fixed ASCII cookie header
     fn page_csrf_reuses_a_well_formed_cookie_without_minting() {
         let token = "ab".repeat(32);
-        let name = super::csrf::csrf_cookie_name_for(&super::web_base_path());
+        let name = super::csrf::csrf_cookie_name_for(&crate::encoding::MountBase::root());
         let mut headers = axum::http::HeaderMap::new();
         let cookie = format!("{}={token}", name.as_str());
         headers.insert(
@@ -20207,7 +20471,7 @@ mod page_csrf_mint_tests {
             axum::http::HeaderValue::from_str(&cookie).expect("an ASCII cookie header"),
         );
         let mints = Cell::new(0_u32);
-        let reused = page_csrf_token(&headers, || {
+        let reused = page_csrf_token(&headers, &crate::encoding::MountBase::root(), || {
             mints.set(mints.get() + 1);
             Err(EntropyError)
         });
@@ -20614,5 +20878,57 @@ mod shutdown_work_tests {
             finished_line::<i64>(&Ok(cmd_admission::Delivery::Delivered)),
             None
         );
+    }
+}
+
+#[cfg(all(test, feature = "web"))]
+mod base_sink_escape_tests {
+    //! The base reaches the page only through attribute-escaped sinks.
+
+    /// A prefix that would close the attribute and open a tag.
+    const HOSTILE: &str = "\"><img src=x onerror=alert(1)></script><script>";
+
+    /// Whether `tag` holds exactly one element of its own: no quote or angle
+    /// bracket from `HOSTILE` survived unescaped.
+    fn inert(tag: &str, open: &str) -> bool {
+        let brackets = if open == "<script" { 2 } else { 1 };
+        let inside = tag
+            .strip_suffix("></script>")
+            .or_else(|| tag.strip_suffix('>'))
+            .unwrap_or(tag);
+        tag.matches('<').count() == brackets
+            && tag.starts_with(open)
+            && !tag.contains("<img")
+            && !inside.contains("\"><")
+    }
+
+    #[test]
+    fn base_meta_escapes_the_prefix() {
+        assert_eq!(
+            super::base_meta("/app"),
+            "<meta name=\"ipe-base\" content=\"/app\">"
+        );
+        let tag = super::base_meta(HOSTILE);
+        assert!(inert(&tag, "<meta"), "{tag}");
+    }
+
+    #[test]
+    fn client_script_tag_escapes_the_prefix() {
+        assert_eq!(
+            super::client_script_tag("/app", "0123", "AbC="),
+            "<script src=\"/app/_ipe/client.0123.js\" integrity=\"sha256-AbC=\" \
+             crossorigin=\"anonymous\"></script>"
+        );
+        let tag = super::client_script_tag(HOSTILE, "0123", "AbC=");
+        assert!(inert(&tag, "<script"), "{tag}");
+    }
+
+    #[cfg(feature = "widget-assets")]
+    #[test]
+    fn port_glue_script_escapes_the_prefix() {
+        let plain = super::port_glue_script("/app");
+        assert!(plain.starts_with("<script src=\"/app/"), "{plain}");
+        let tag = super::port_glue_script(HOSTILE);
+        assert!(inert(&tag, "<script"), "{tag}");
     }
 }
