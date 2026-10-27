@@ -14,7 +14,7 @@
 use std::path::PathBuf;
 
 /// A generic signature template and an alpha-equivalent literal in another function.
-const FOLDED: &str = r#"module Main exposing (main)
+const FOLDED: &str = r"module Main exposing (main)
 
 import Ipe.Io as Io
 import Ipe.List as List
@@ -34,7 +34,7 @@ wrapCount x =
 main : Task Error ()
 main =
     Io.println (String.fromInt (wrapCount 1))
-"#;
+";
 
 /// Two generic templates sharing a name set that no renaming makes one.
 const DISTINCT: &str = r#"module Main exposing (main)
