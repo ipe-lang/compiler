@@ -8,6 +8,8 @@
 //! the Ipê source by the parity snapshot), and the count, tags and depth are
 //! also derived from the parser's rule. Every run is deadline-bounded: a
 //! superlinear parse or a recursion-guard trip fails the test, never hangs it.
+//! Linearity is judged on the child's CPU time, which the host's load does not
+//! inflate, never on its wall time.
 
 use std::fs;
 use std::path::PathBuf;
@@ -17,6 +19,8 @@ use ipe_docs::markdown::MAX_BLOCKQUOTE_DEPTH;
 use ipe_docs::markdown::parse::{parse_blocks, parse_spans};
 use ipe_docs::markdown::{Block, Span};
 
+#[cfg(target_os = "linux")]
+use crate::support::CpuTime;
 use crate::support::{TimedRunOutcome, build_emitted_binary_checked, run_with_stdin_deadline};
 
 /// Wall-time ceiling for one run of the emitted binary.
@@ -620,48 +624,183 @@ fn span_runs_finish_in_deadline() {
     }
 }
 
-/// Run time past the binary's startup, the minimum of three runs.
-fn parse_time(exe: &str, case: Case, n: usize, startup: Duration) -> Duration {
-    let best = (0..3)
-        .map(|_| {
-            let out = run_case(exe, case, n);
-            assert_eq!(out.exit_code, Some(0), "`{} {n}` must exit 0", case.name());
-            out.elapsed
-        })
-        .min()
-        .unwrap_or(Duration::ZERO);
-    best.saturating_sub(startup)
+/// Largest `w(4n)/w(n)` a linear parse may show: `n log n` gives about 4.5,
+/// `n^1.5` gives 8 and `n^2` gives 16.
+const LINEAR_CEILING: f64 = 6.0;
+
+/// Work below which a reading is clock-tick noise, not growth.
+const WORK_FLOOR: Duration = Duration::from_millis(200);
+
+/// `w(4n)/w(n)` when it shows growth past linear, else `None`.
+///
+/// A base under `WORK_FLOOR` is read as `WORK_FLOOR`, so tick noise at a small
+/// size never reads as growth.
+fn superlinear_ratio(base: Duration, quadrupled: Duration) -> Option<f64> {
+    let ratio = quadrupled.as_secs_f64() / base.max(WORK_FLOOR).as_secs_f64();
+    (ratio > LINEAR_CEILING).then_some(ratio)
 }
 
+/// CPU time of one run, the minimum of three; the measure of the parse's work.
+///
+/// CPU time, never wall time: a wall clock also counts the time the child
+/// waited for a core while sibling tests ran, which reads as growth.
+#[cfg(target_os = "linux")]
+fn parse_work(exe: &str, case: Case, n: usize) -> CpuTime {
+    let runs = (0..3).map(|_| {
+        let out = run_case(exe, case, n);
+        assert_eq!(out.exit_code, Some(0), "`{} {n}` must exit 0", case.name());
+        assert!(
+            out.cpu.is_some(),
+            "`{} {n}`: the child's CPU time must be readable from `/proc`",
+            case.name()
+        );
+        out.cpu
+    });
+    runs.flatten().min().unwrap_or_default()
+}
+
+#[cfg(target_os = "linux")]
 #[test]
 fn doubling_is_linear() {
     if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
         return;
     }
     let exe = bounds_binary("doubling");
-    let startup = (0..3)
-        .map(|_| run_case(&exe, Case::Brackets, 0).elapsed)
-        .min()
-        .unwrap_or(Duration::ZERO);
-    let floor = Duration::from_millis(200);
+    let startup = parse_work(&exe, Case::Brackets, 0);
+    let work = |case: Case, n: usize| {
+        parse_work(&exe, case, n)
+            .saturating_sub(startup)
+            .as_duration()
+    };
     let cap = 1 << 20;
     for case in [Case::Brackets, Case::Stars, Case::ParaLines, Case::Line] {
         let mut n = 2_000;
-        let mut base = parse_time(&exe, case, n, startup);
-        while base < floor && n < cap {
+        let mut base = work(case, n);
+        while base < WORK_FLOOR && n < cap {
             n *= 2;
-            base = parse_time(&exe, case, n, startup);
+            base = work(case, n);
         }
-        let quadrupled = parse_time(&exe, case, 4 * n, startup);
-        // A case still under `floor` at `cap` is noise-dominated; dividing by
-        // `floor` keeps that noise from reading as growth.
-        let ratio = quadrupled.as_secs_f64() / base.max(floor).as_secs_f64();
+        let quadrupled = work(case, 4 * n);
+        let ratio = superlinear_ratio(base, quadrupled);
         assert!(
-            ratio <= 6.0,
-            "`{}`: t(4n)/t(n) = {ratio:.2} at n = {n} ({base:?} -> {quadrupled:?}); linear is about 4",
-            case.name()
+            ratio.is_none(),
+            "`{}`: w(4n)/w(n) = {:.2} at n = {n} (CPU {base:?} -> {quadrupled:?}); linear is about 4",
+            case.name(),
+            ratio.unwrap_or_default()
         );
     }
+}
+
+/// Synthetic `w(4n)` for a base of one second under each growth law.
+fn quadrupled_under(exponent: f64) -> Duration {
+    Duration::from_secs_f64(4.0_f64.powf(exponent))
+}
+
+#[test]
+fn the_linearity_judge_admits_linear_and_n_log_n_growth() {
+    let base = Duration::from_secs(1);
+    assert!(
+        superlinear_ratio(base, quadrupled_under(1.0)).is_none(),
+        "n"
+    );
+    // `n log n` at n = 2 000: 4 * log(8 000) / log(2 000) is about 4.73.
+    assert!(
+        superlinear_ratio(base, Duration::from_millis(4_730)).is_none(),
+        "n log n"
+    );
+    assert!(
+        superlinear_ratio(base, Duration::from_secs(6)).is_none(),
+        "the ceiling itself"
+    );
+}
+
+#[test]
+fn the_linearity_judge_refuses_superlinear_growth() {
+    let base = Duration::from_secs(1);
+    for (law, exponent) in [("n^1.5", 1.5), ("n^2", 2.0), ("n^3", 3.0)] {
+        assert!(
+            superlinear_ratio(base, quadrupled_under(exponent)).is_some(),
+            "{law} must read as superlinear"
+        );
+    }
+    assert!(
+        superlinear_ratio(base, Duration::from_millis(6_010)).is_some(),
+        "one step past the ceiling"
+    );
+    assert!(
+        superlinear_ratio(Duration::from_millis(50), Duration::from_millis(1_250)).is_some(),
+        "a base under the floor still refuses growth past the ceiling over the floor"
+    );
+}
+
+#[test]
+fn the_linearity_judge_reads_tick_noise_under_the_floor_as_no_growth() {
+    // 10 ms -> 120 ms is a ratio of 12, but both sit under the floor.
+    assert!(
+        superlinear_ratio(Duration::from_millis(10), Duration::from_millis(120)).is_none(),
+        "noise under the floor"
+    );
+}
+
+/// Run `script` under `/bin/sh` through the deadline-bounded runner.
+#[cfg(target_os = "linux")]
+fn run_shell(name: &str, script: &str) -> TimedRunOutcome {
+    let dir = ipe_test_temp::temp_root().join(format!("ipe-cpu-{name}-{}", std::process::id()));
+    assert!(fs::create_dir_all(&dir).is_ok(), "scratch dir");
+    let path = dir.join(name);
+    assert!(
+        fs::write(&path, format!("#!/bin/sh\n{script}\n")).is_ok(),
+        "write script"
+    );
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert!(
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).is_ok(),
+            "chmod script"
+        );
+    }
+    let exe = path.to_string_lossy().into_owned();
+    let out = run_with_stdin_deadline(name, &exe, b"", DEADLINE);
+    let _ = fs::remove_dir_all(&dir);
+    out
+}
+
+/// A child that only waits uses almost no CPU, however long its wall time:
+/// the measure counts work, not the time a run spends off a core.
+#[cfg(target_os = "linux")]
+#[test]
+fn the_work_measure_does_not_count_waiting() {
+    let out = run_shell("waits", "exec sleep 1");
+    assert_eq!(out.exit_code, Some(0), "stderr:\n{}", out.stderr);
+    assert!(
+        out.elapsed >= Duration::from_secs(1),
+        "wall {:?}",
+        out.elapsed
+    );
+    assert!(
+        out.cpu.is_some(),
+        "the CPU time of an exited child is read on Linux"
+    );
+    let cpu = out.cpu.map_or(Duration::MAX, CpuTime::as_duration);
+    assert!(
+        cpu < Duration::from_millis(500),
+        "a sleeping child read {cpu:?} of CPU over {:?} of wall time",
+        out.elapsed
+    );
+}
+
+/// A child that computes reads its CPU time, so the measure is never vacuously zero.
+#[cfg(target_os = "linux")]
+#[test]
+fn the_work_measure_counts_computation() {
+    let out = run_shell("spins", "i=0; while [ $i -lt 300000 ]; do i=$((i+1)); done");
+    assert_eq!(out.exit_code, Some(0), "stderr:\n{}", out.stderr);
+    let cpu = out.cpu.map_or(Duration::ZERO, CpuTime::as_duration);
+    assert!(
+        cpu >= Duration::from_millis(100),
+        "a spinning child read only {cpu:?} of CPU over {:?} of wall time",
+        out.elapsed
+    );
 }
 
 /// A child that never reads its stdin and never exits is killed at the

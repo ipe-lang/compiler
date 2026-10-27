@@ -48,7 +48,7 @@ aes-gcm = "0.10"
 chacha20poly1305 = "0.10"
 pbkdf2 = "0.12"
 flate2 = "1"
-zstd = "0.13"
+zstd = "0.14"
 csv = "1"
 jsonwebtoken = "9"
 uuid = { version = "1", features = ["v4", "v7"] }
