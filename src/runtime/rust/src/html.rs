@@ -1429,10 +1429,14 @@ pub(crate) fn patch_marker_attr<'a>(name: &'a str, value: &'a str) -> Option<(&'
 /// renders and distinct per group within one document. A radio that already
 /// has a non-empty `name` keeps it. A serialiser that does not stamp
 /// (`Html.toString`) leaves the marker and the radios unnamed.
+///
+/// Every id is built in one path buffer shared by the whole descent: a child's
+/// segment is appended, the child is stamped, and the buffer is truncated back
+/// to its parent's id, so an element's only id allocation is the stored value.
 pub fn assign_ipe_ids<M>(node: &mut Html<M>, path: &str) {
-    let mut root = String::with_capacity(path.len());
-    push_id_segment(path, &mut root);
-    assign_ipe_ids_depth(node, &root, 0, None);
+    let mut buf = String::with_capacity(path.len());
+    push_id_segment(path, &mut buf);
+    assign_ipe_ids_depth(node, &mut buf, 0, None);
 }
 
 /// Separator between an id's root, index and tag segments.
@@ -1480,14 +1484,25 @@ fn is_unstamped_reserved_attr<M>(attr: &Attribute<M>) -> bool {
 // stamper recurses once per nesting level, so an attacker-influenced deep tree
 // would overflow the stack. Stop descending at the cap. Kept in step with the
 // renderer's cap so a node the renderer drops is also left unstamped.
-fn assign_ipe_ids_depth<M>(node: &mut Html<M>, path: &str, depth: usize, group: Option<&str>) {
+//
+// `path` holds `node`'s own id on entry and holds it again on return: each
+// child's segment is truncated away at the length recorded before it was
+// pushed. Every pushed byte is ASCII (`push_id_segment` escapes the rest), so
+// that length is always a char boundary.
+fn assign_ipe_ids_depth<M>(
+    node: &mut Html<M>,
+    path: &mut String,
+    depth: usize,
+    group: Option<&str>,
+) {
+    use core::fmt::Write as _;
     if depth >= MAX_HTML_DEPTH {
         return;
     }
     if let Html::HElement(tag, attrs, kids) = node {
         attrs.retain(|a| !is_unstamped_reserved_attr(a));
         attrs.reserve_exact(1);
-        attrs.push(Attribute::Attr(STAMPED_ID_ATTR.to_owned(), path.to_owned()));
+        attrs.push(Attribute::Attr(STAMPED_ID_ATTR.to_owned(), path.clone()));
         let own_group = (tag.as_str() == "fieldset" && take_radio_group_marker(attrs))
             .then(|| format!("ipe-rg-{path}"));
         let group = own_group.as_deref().or(group);
@@ -1501,17 +1516,19 @@ fn assign_ipe_ids_depth<M>(node: &mut Html<M>, path: &str, depth: usize, group: 
                 {
                     set_attr(cattrs, "name", name);
                 }
-                let mut seg = String::from(path);
-                seg.push(ID_STEP_SEP);
-                seg.push_str(&idx.to_string());
-                seg.push(ID_STEP_SEP);
-                push_id_segment(ctag, &mut seg);
+                let parent_len = path.len();
+                path.push(ID_STEP_SEP);
+                // Writing into a `String` cannot fail.
+                let _ = write!(path, "{idx}");
+                path.push(ID_STEP_SEP);
+                push_id_segment(ctag, path);
                 if let Some(key) = ipe_id_key(ctag, cattrs) {
-                    seg.push(ID_KEY_SEP);
-                    push_id_segment(key, &mut seg);
+                    path.push(ID_KEY_SEP);
+                    push_id_segment(key, path);
                 }
                 idx = idx.saturating_add(1);
-                assign_ipe_ids_depth(child, &seg, depth.saturating_add(1), group);
+                assign_ipe_ids_depth(child, path, depth.saturating_add(1), group);
+                path.truncate(parent_len);
             }
         }
     }
