@@ -1422,6 +1422,7 @@ jobs:
               exit 0
             fi
             echo "apt attempt $attempt did not finish within its 6 minute cap"
+            sudo sed -i 's|azure\.archive\.ubuntu\.com|archive.ubuntu.com|g' /etc/apt/apt-mirrors.txt
           done
           exit 1
       - name: Save webview link dep archives
