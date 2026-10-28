@@ -276,13 +276,12 @@ fn parse_fcm_identifier(text: &str) -> Result<String, FcmIdentifierRefusal> {
     if text.len() > MAX_FCM_IDENTIFIER_LEN {
         return Err(FcmIdentifierRefusal::TooLong { len: text.len() });
     }
-    match text
-        .bytes()
+    text.bytes()
         .find(|b| !(b.is_ascii_alphanumeric() || matches!(b, b':' | b'_' | b'.' | b'-')))
-    {
-        Some(byte) => Err(FcmIdentifierRefusal::Byte { byte }),
-        None => Ok(text.to_owned()),
-    }
+        .map_or_else(
+            || Ok(text.to_owned()),
+            |byte| Err(FcmIdentifierRefusal::Byte { byte }),
+        )
 }
 
 /// Declares one role-typed FCM identifier, so no identifier is passable for

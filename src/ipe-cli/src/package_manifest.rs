@@ -1095,7 +1095,7 @@ impl Reader<'_> {
             let key = self.text(fname.value);
             match key {
                 "projectId" => {
-                    project_id = Some(self.fcm_field(value, key, FcmProjectId::parse)?)
+                    project_id = Some(self.fcm_field(value, key, FcmProjectId::parse)?);
                 }
                 "applicationId" => {
                     application_id = Some(self.fcm_field(value, key, FcmApplicationId::parse)?);
