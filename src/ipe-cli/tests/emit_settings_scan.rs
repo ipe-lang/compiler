@@ -11,10 +11,13 @@
 //! (file, function) sites admitted below, macro bodies included. Patterns are
 //! never counted: matching on a host builds nothing.
 //!
-//! The settings a manifest owns (the browser mount base, the `[wasm]` public-env
-//! allowlist and mode) are derived into `EmitSettings` at one site,
-//! `manifest_emit_settings`: the driver reads each of those member chains, and
-//! names the hydrate mode, nowhere else but the admitted sites below.
+//! The settings a manifest owns (the browser mount base, the server origins,
+//! the `[wasm]` public-env allowlist and mode) are derived into `EmitSettings`
+//! at one site, `manifest_emit_settings`: the driver reads each of those member
+//! chains, and names the hydrate mode, nowhere else but the admitted sites
+//! below. The mobile packager reads the fields its shell and the bundle must
+//! agree on (the mount base, the server origins, the push identifiers) only
+//! through `ManifestPin::of`, so no shell input bypasses the pin.
 //!
 //! Every `EmitSettings` comes from `build_pipeline::emit_settings`, which picks
 //! one of its two constructors from the build shape: the constructors are
@@ -79,15 +82,16 @@ const SETTERS: &[&str] = &[
 const MEMBER_CHAINS: &[&[&str]] = &[
     &["delivery", "browser", "base"],
     &["delivery", "servers"],
+    &["delivery", "mobile", "push"],
     &["public_env"],
 ];
 
 /// The guarded paths that, like the member chains, are judged only in
-/// [`CHAIN_TREE`]: the manifest parser and renderer spell the mode elsewhere.
+/// [`CHAIN_TREES`]: the manifest parser and renderer spell the mode elsewhere.
 const CHAIN_TREE_PATHS: &[&str] = &["WasmMode::Hydrate"];
 
-/// The tree the member chains are guarded in.
-const CHAIN_TREE: &str = "src/ipe-cli/src/driver/";
+/// The trees the member chains are guarded in: the driver and the packagers.
+const CHAIN_TREES: &[&str] = &["src/ipe-cli/src/driver/", "src/ipe-cli/src/pack/"];
 
 /// The guarded paths judged only in the CLI: the wasm playground has no
 /// manifest, so its one settings literal names the driver itself.
@@ -102,7 +106,7 @@ fn chain_label(chain: &[&str]) -> String {
 }
 
 /// Whether `what` is the label of a guarded member chain, or of a guarded path
-/// that is judged only in [`CHAIN_TREE`].
+/// that is judged only in [`CHAIN_TREES`].
 fn is_chain_label(what: &str) -> bool {
     MEMBER_CHAINS.iter().any(|chain| chain_label(chain) == what) || CHAIN_TREE_PATHS.contains(&what)
 }
@@ -176,19 +180,25 @@ const ADMITTED: &[(&str, &str, &str, usize)] = &[
         "manifest_emit_settings",
         1,
     ),
-    // The mobile shell is laid out for the manifest's mount base, and a base
-    // that changes during the build is refused: reads of the base, not
-    // derivations of emit settings.
+    // The mobile shell is laid out from the manifest pin, and a pin that
+    // changes during the build is refused: the pin's one constructor reads
+    // each field, the driver none.
     (
         "field delivery.browser.base",
-        "src/ipe-cli/src/driver/commands_pkg.rs",
-        "assemble_mobile",
+        "src/ipe-cli/src/pack/mobile.rs",
+        "of",
         1,
     ),
     (
-        "field delivery.browser.base",
-        "src/ipe-cli/src/driver/commands_pkg.rs",
-        "build_under_fixed_base",
+        "field delivery.servers",
+        "src/ipe-cli/src/pack/mobile.rs",
+        "of",
+        1,
+    ),
+    (
+        "field delivery.mobile.push",
+        "src/ipe-cli/src/pack/mobile.rs",
+        "of",
         1,
     ),
     (PROOF, "src/ipe-cli/src/delivery.rs", "host_intent", 1),
@@ -697,7 +707,7 @@ fn refusals(found: &BTreeMap<String, Scan>) -> Vec<String> {
     let mut out = Vec::new();
     for (rel, scan) in found {
         for ((site, what), count) in &scan.sites {
-            if (is_chain_label(what) && !rel.starts_with(CHAIN_TREE))
+            if (is_chain_label(what) && !CHAIN_TREES.iter().any(|tree| rel.starts_with(tree)))
                 || (CLI_TREE_PATHS.contains(&what.as_str()) && !rel.starts_with(CLI_TREE))
             {
                 continue;
@@ -996,6 +1006,49 @@ fn a_planted_browser_delivery_read_is_refused() -> Result<(), String> {
     refused_by_scan(&breaches)
 }
 
+/// Each planted read of a pinned field outside the pin's constructor is
+/// refused, in the driver and in the packagers alike.
+#[test]
+fn a_planted_pinned_field_read_is_refused() -> Result<(), String> {
+    let commands_pkg = "src/ipe-cli/src/driver/commands_pkg.rs";
+    let mobile = "src/ipe-cli/src/pack/mobile.rs";
+    let breaches = [
+        (
+            commands_pkg,
+            "fn build_under_pinned_manifest() { let after = parse(p)?.delivery.browser.base; }\n",
+        ),
+        (
+            commands_pkg,
+            "fn assemble_mobile() { let base = &manifest.delivery.browser.base; }\n",
+        ),
+        (
+            commands_pkg,
+            "fn assemble_mobile() { let s = &manifest.delivery.servers; }\n",
+        ),
+        (
+            commands_pkg,
+            "fn assemble_mobile() { let p = manifest.delivery.mobile.push.clone(); }\n",
+        ),
+        (
+            commands_pkg,
+            "fn gate_mobile() { m!(manifest.delivery.mobile.push); }\n",
+        ),
+        (
+            mobile,
+            "fn layout() { let b = &m.delivery.browser.base; }\n",
+        ),
+        (
+            mobile,
+            "fn layout() { let p = m.delivery.mobile.push.as_ref(); }\n",
+        ),
+        (
+            mobile,
+            "fn of() { let a = m.delivery.servers.clone(); let b = m.delivery.servers.clone(); }\n",
+        ),
+    ];
+    refused_by_scan(&breaches)
+}
+
 /// Every planted breach draws a refusal the empty source at its file does not.
 fn refused_by_scan(breaches: &[(&str, &str)]) -> Result<(), String> {
     // An empty source at `rel` already misses each admitted row there; a
@@ -1042,6 +1095,11 @@ fn an_admitted_site_is_not_refused() -> Result<(), String> {
              fn compile_source_set_here() { EmitSettings { ffi, ..settings }; }\n",
         ),
         (
+            "src/ipe-cli/src/pack/mobile.rs",
+            "fn of() { Self { base: m.delivery.browser.base.clone(), \
+             servers: m.delivery\n.servers\n.clone(), push: m.delivery.mobile.push.clone() } }\n",
+        ),
+        (
             "src/ipe-cli/src/package_manifest.rs",
             "fn read_database() { Ok(DbDriver::Sqlite) }\n\
              fn render() { match d { DbDriver::Sqlite => \"Sqlite\", DbDriver::Postgres => \"Postgres\" } }\n",
@@ -1059,8 +1117,8 @@ fn an_admitted_site_is_not_refused() -> Result<(), String> {
             "src/ipe-cli/src/driver/commands_pkg.rs",
             "fn gate_desktop() { let HostIntent::WebView(p) = Delivery::web_desktop().host_intent() \
              else { return }; }\n\
-             fn assemble_mobile() { let base = &manifest.delivery.browser.base; }\n\
-             fn build_under_fixed_base() { let after = parse(p)?\n.delivery\n.browser\n.base; }\n\
+             fn assemble_mobile() { let pin = ManifestPin::of(manifest); layout(pin.base()); }\n\
+             fn build_under_pinned_manifest() { let after = ManifestPin::of(&parse(p)?); }\n\
              fn run_project_tests_with() { go(HostIntent::Served); }\n",
         ),
     ];
@@ -1091,7 +1149,7 @@ fn an_admitted_site_is_not_refused() -> Result<(), String> {
             "fn other() { let b = parsed.delivery.browser.base; let h = w.mode == WasmMode::Hydrate; }\n"
         )?,
         Vec::<String>::new(),
-        "the guard covers the driver tree only"
+        "the guard covers the driver and packager trees only"
     );
     assert_eq!(
         planted("src/ipe-cli/src/other.rs", out_of_scope)?,
