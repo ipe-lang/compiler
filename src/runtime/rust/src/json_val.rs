@@ -26,7 +26,9 @@ use serde::ser::{self, SerializeMap, SerializeSeq};
 pub type JsonMap = indexmap::IndexMap<String, JsonVal>;
 
 /// One JSON node.
+#[derive(Default)]
 pub enum JsonVal {
+    #[default]
     Null,
     Bool(bool),
     Number(serde_json::Number),
@@ -61,12 +63,6 @@ const INDENT: &str = "                ";
 
 // IPE-RUST-AUDIT:ACCEPTED (Arthur Maciel) — compile-time `const` assertion (not a runtime panic); fails the BUILD if the indent slice is narrower than the widest indent [ledger #boundary]
 const _: () = assert!(INDENT.len() == MAX_JSON_INDENT);
-
-impl Default for JsonVal {
-    fn default() -> Self {
-        Self::Null
-    }
-}
 
 impl Drop for JsonVal {
     // Children move onto a heap stack before their parent's storage frees, so

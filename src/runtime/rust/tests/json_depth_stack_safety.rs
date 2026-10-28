@@ -34,11 +34,14 @@ const SMALL_STACK: usize = 256 * 1024;
 
 /// Runs `body` on a fresh thread with `stack` bytes of stack and waits for it.
 fn on_stack(stack: usize, body: impl FnOnce() + Send + 'static) {
-    let handle = std::thread::Builder::new()
+    let finished = std::thread::Builder::new()
         .stack_size(stack)
         .spawn(body)
-        .expect("spawn the depth-test thread");
-    assert!(handle.join().is_ok(), "the depth-test thread failed");
+        .map(|handle| handle.join().is_ok());
+    assert!(
+        matches!(finished, Ok(true)),
+        "the depth-test thread failed to spawn or to finish"
+    );
 }
 
 /// `depth` nested arrays around an empty one: `json_depth` is `depth`.
