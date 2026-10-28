@@ -11,7 +11,7 @@ use std::path::Path;
 
 use crate::{
     BuildIntent, CargoPackageName, CrateIdentity, DbDriver, FfiEmit, MountBase, RuntimeDep,
-    WebViewWindow,
+    ServerOrigins, WebViewWindow,
 };
 
 /// The emitted crate's `[package] name`.
@@ -75,6 +75,8 @@ pub struct EmitSettings {
     pub wasm_public_env: Vec<String>,
     /// The mount base the emitted browser shell is served under.
     pub mount_base: MountBase,
+    /// The `delivery.servers` origins the browser bundle may reach.
+    pub server_origins: ServerOrigins,
     /// `true` when the wasm bundle emits the hydrate export.
     pub wasm_hydrate_mode: bool,
     /// The dependency-model selector; `None` emits the vendored project.
@@ -102,6 +104,7 @@ impl EmitSettings {
             target: ipe_ir::Target::Native,
             wasm_public_env: Vec::new(),
             mount_base: MountBase::root(),
+            server_origins: ServerOrigins::none(),
             wasm_hydrate_mode: false,
             runtime_dep: None,
             debugger: false,
@@ -124,6 +127,7 @@ impl EmitSettings {
             target,
             wasm_public_env,
             mount_base,
+            server_origins,
             wasm_hydrate_mode,
             runtime_dep,
             debugger,
@@ -164,6 +168,14 @@ impl EmitSettings {
         emit_field(sink, FieldTag::WasmPublicEnv, &payload);
 
         emit_field(sink, FieldTag::MountBase, mount_base.prefix().as_bytes());
+
+        let mut payload = Vec::new();
+        push_len(&mut payload, server_origins.len());
+        for origin in server_origins.origins() {
+            push_framed(&mut payload, origin.authority().as_bytes());
+        }
+        emit_field(sink, FieldTag::ServerOrigins, &payload);
+
         emit_field(
             sink,
             FieldTag::WasmHydrateMode,
@@ -243,6 +255,7 @@ enum FieldTag {
     HotAppearance = 10,
     Host = 11,
     Intent = 12,
+    ServerOrigins = 13,
 }
 
 /// Write one field record: tag, payload length, payload.

@@ -124,6 +124,7 @@ fn compile_inner(source: &str) -> Result<ipe_backend::EmittedProject, String> {
             target: ipe_ir::Target::WasmClient,
             wasm_public_env: Vec::new(),
             mount_base: ipe_backend_rust::MountBase::root(),
+            server_origins: ipe_backend_rust::ServerOrigins::none(),
             wasm_hydrate_mode: false,
             // Wasm always vendors its runtime (closed template); dep model is a no-op.
             runtime_dep: None,

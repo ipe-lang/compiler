@@ -76,7 +76,11 @@ const SETTERS: &[&str] = &[
 
 /// The manifest member chains the driver reads only at admitted sites, as the
 /// field names from the manifest value down.
-const MEMBER_CHAINS: &[&[&str]] = &[&["delivery", "browser", "base"], &["public_env"]];
+const MEMBER_CHAINS: &[&[&str]] = &[
+    &["delivery", "browser", "base"],
+    &["delivery", "servers"],
+    &["public_env"],
+];
 
 /// The guarded paths that, like the member chains, are judged only in
 /// [`CHAIN_TREE`]: the manifest parser and renderer spell the mode elsewhere.
@@ -150,6 +154,12 @@ const ADMITTED: &[(&str, &str, &str, usize)] = &[
     ),
     (
         "field delivery.browser.base",
+        "src/ipe-cli/src/driver/build_pipeline.rs",
+        "manifest_emit_settings",
+        1,
+    ),
+    (
+        "field delivery.servers",
         "src/ipe-cli/src/driver/build_pipeline.rs",
         "manifest_emit_settings",
         1,
@@ -960,6 +970,10 @@ fn a_planted_browser_delivery_read_is_refused() -> Result<(), String> {
         ),
         (
             commands,
+            "fn release_pipeline() { let v = manifest.delivery.servers.clone(); }\n",
+        ),
+        (
+            commands,
             "fn release_pipeline() { let h = w.mode == WasmMode::Hydrate; }\n",
         ),
         (
@@ -1019,7 +1033,8 @@ fn an_admitted_site_is_not_refused() -> Result<(), String> {
              fn build_project_with_options() { go(HostIntent::Served); }\n\
              fn build_from_sources() { go(HostIntent::Served); }\n\
              fn manifest_emit_settings() { let e = m.wasm.public_env.to_names(); \
-             let b = m.delivery.browser.base.clone(); let h = w.mode == WasmMode::Hydrate; }\n\
+             let b = m.delivery.browser.base.clone(); let h = w.mode == WasmMode::Hydrate; \
+             let v = m.delivery.servers.clone(); }\n\
              fn emit_settings() { match s { Loose => loose_emit_settings(o, r), \
              Manifest { .. } => manifest_emit_settings(m, p, o, h, r) } }\n\
              fn loose_emit_settings() { EmitSettings { db_driver: d }; }\n\
