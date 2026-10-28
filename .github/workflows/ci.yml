@@ -721,7 +721,7 @@ jobs:
         env:
           CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER: wasm-bindgen-test-runner
           CHROMEDRIVER: chromedriver
-        run: cargo test -p ipe-runtime-rust --target wasm32-unknown-unknown --features wasm-client --test wasm_js_port_bridge | python3 tools/scripts/wasm-test/wasm_test_count.py 4
+        run: cargo test -p ipe-runtime-rust --target wasm32-unknown-unknown --features wasm-client --test wasm_js_port_bridge | python3 tools/scripts/wasm-test/wasm_test_count.py 5
       - name: Run the DOM paint tests (headless Chrome)
         if: needs.changes.outputs.release_only != 'true'
         shell: bash

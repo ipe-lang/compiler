@@ -209,3 +209,40 @@ async fn throwing_host_yields_host_threw() {
         "the refusal must not wait out the deadline ({elapsed} ms)"
     );
 }
+
+/// No page host: opening a session refuses as `Unavailable`, and closing an open
+/// session whose host went away refuses at once, never at the session deadline.
+#[wasm_bindgen_test]
+async fn session_with_no_host_refuses_open_and_close_at_once() {
+    set_page_host(None);
+    let refused = js_open_session::<i64, i64>(1, int_decoder()).await;
+    assert!(
+        is_unavailable(&refused),
+        "opening a session with no host must refuse as unavailable"
+    );
+
+    let takes = Closure::<dyn Fn(JsValue) -> JsValue>::new(|_raw: JsValue| JsValue::TRUE);
+    set_page_host(Some(takes.as_ref()));
+    takes.forget();
+    let opened = js_open_session::<i64, i64>(2, int_decoder()).await;
+    assert!(
+        matches!(opened, IpeResult::Ok(_)),
+        "a host that takes the frame opens the session"
+    );
+    let IpeResult::Ok(handle) = opened else {
+        return;
+    };
+
+    set_page_host(None);
+    let started = js_sys::Date::now();
+    let closed = js_close_session::<i64, i64>(handle, 3, int_decoder()).await;
+    let elapsed = js_sys::Date::now() - started;
+    assert!(
+        is_unavailable(&closed),
+        "closing a session with no host must refuse as unavailable"
+    );
+    assert!(
+        elapsed < deadline_ms(),
+        "the close refusal must not wait out a deadline ({elapsed} ms)"
+    );
+}
