@@ -1,186 +1,79 @@
-//! Layer 2 of the wasm security gate (spec Q5): module `server`/`shared`
-//! classification + client-entry reachability closure.
+//! Layer 2 of the wasm security gate (spec Q5): the exact chain from the
+//! client entry to a reached server-only def.
 //!
-//! [`crate::target_gate`] (Layer 1) is naming-based over the WHOLE linked
-//! program: a kernel with no `WasmClient` denotation fails wherever it is
-//! named, even inside a def the client entry can never reach. This
-//! module supplies the promised compositional guarantee: it classifies every
-//! module actually linked into the build, then walks ONLY the transitive
-//! import closure from the client entry, so a `server` module the entry
-//! never reaches is not an error, and one it DOES reach is reported by name
-//! — the exact chain, not "not allowed".
+//! [`crate::target_gate`] (Layer 1) refuses every server-only kernel or FFI
+//! call in the entry closure ([`crate::reach::EntryClosure`]) at the reference
+//! itself. This layer runs first over the SAME closure and, when the offending
+//! def sits in a module other than the entry, names the route instead: the
+//! modules along the shortest def chain from the entry to it, labelled
+//! `client`, `shared` and `server: imports <kernel>` — the exact chain, not
+//! "not allowed".
 //!
-//! A module is `server` if ANY of its own defs directly names a kernel with
-//! no `WasmClient` denotation (or a foreign FFI call — Q5: FFI is a
-//! native-target concept). Every other module defaults to `shared` — the
-//! same default the spec assigns pure/UI modules, so a shared `view` module
-//! type-checks against both targets without duplication.
+//! Judging defs, not whole modules, is what keeps a module usable from the
+//! client when only some of its defs are server-only: a def the entry never
+//! reaches is not emitted, so it classifies nothing.
 //!
-//! Dependency edges are read off `Expr_::VarTopLevel { module, .. }` — every
-//! cross-module reference in the canonical AST already carries its target
-//! module's path (see `link.rs`), so no separate import-graph structure is
-//! needed: the defs THEMSELVES are the edge list.
-
-use std::collections::{HashMap, HashSet, VecDeque};
+//! A def reached only within the entry's own module is Layer 1's direct
+//! naming case (IPE-N0029); this layer leaves it there and keeps walking, so
+//! the same violation never surfaces under two diagnostics.
 
 use ipe_diagnostics::{DResult, Diagnostic, NameError, Span};
 use ipe_intern::{Interner, Symbol};
 use ipe_kernels::Target;
 
-use crate::ast::{CaseBranch, Def, Expr, Expr_, LetBinding, Module};
+use crate::ast::Module;
+use crate::reach::{EntryClosure, def_body, module_display_name};
+use crate::target_gate::{Denied, first_denied};
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum ModuleClass {
-    Shared,
-    Server,
-}
-
-/// Why a module earned [`ModuleClass::Server`] — the specific kernel/FFI
-/// reference, so the chain error can name it (`Data(server: imports
-/// Ipe.Db.query)`), never a bare "not allowed".
-struct ServerCause {
-    qualifier: String,
-    name: String,
-}
-
-struct ModuleInfo {
-    class: ModuleClass,
-    cause: Option<ServerCause>,
-}
-
-/// Reject a wasm client entry whose reachability closure transitively
-/// touches a `server`-classified module.
+/// Reject a wasm client entry whose closure reaches a server-only def in
+/// another module.
 ///
 /// `entry` is the client entry module's path (`linked.name` for today's
-/// single-entry `ipe dev build --target wasm`; a distinct `[wasm].entry` module
-/// takes the same role once M6 wires it through). Walks the linked program's
-/// defs, grouped by their retained `home` (original source module — see
-/// `ast::Def::home`), classifying each and building the module dependency
-/// graph from `VarTopLevel` references, then BFS-walks from `entry`.
+/// single-entry `ipe dev build --target wasm`). Walks the entry closure of
+/// `linked` breadth-first and reports the first reached def that names a kernel
+/// with no `WasmClient` denotation (or a foreign FFI call) and whose chain
+/// from the entry leaves the entry module.
 ///
 /// # Errors
-/// [`Diagnostic::Name`] (IPE-N0030) naming the exact chain from `entry` to
-/// the first server module reached, in breadth-first (shortest-chain) order.
+/// [`Diagnostic::Name`] (IPE-N0030) naming the exact module chain from `entry`
+/// to the first such def, in breadth-first (shortest-chain) order.
 pub fn check_client_reachability(
     linked: &Module,
     entry: &[Symbol],
     interner: &Interner,
 ) -> DResult<()> {
-    let mut by_home: HashMap<Vec<Symbol>, Vec<&Def>> = HashMap::new();
-    for def in &linked.defs {
-        by_home.entry(def.home().to_vec()).or_default().push(def);
-    }
-
-    let mut infos: HashMap<Vec<Symbol>, ModuleInfo> = HashMap::new();
-    let mut edges: HashMap<Vec<Symbol>, Vec<Vec<Symbol>>> = HashMap::new();
-
-    for (home, defs) in &by_home {
-        let mut cause: Option<ServerCause> = None;
-        let mut deps: HashSet<Vec<Symbol>> = HashSet::new();
-        for def in defs {
-            let body = match def {
-                Def::Untyped { body, .. } | Def::Typed { body, .. } => body,
-            };
-            walk_expr(body, &mut |e| match &e.value {
-                Expr_::VarKernel { id, module, name } => {
-                    let allowed = id.is_some_and(|k| k.available_on(Target::WasmClient));
-                    if !allowed && cause.is_none() {
-                        cause = Some(ServerCause {
-                            qualifier: interner.resolve(*module).unwrap_or("?").to_owned(),
-                            name: interner.resolve(*name).unwrap_or("?").to_owned(),
-                        });
-                    }
-                }
-                Expr_::ForeignCall { .. } => {
-                    if cause.is_none() {
-                        cause = Some(ServerCause {
-                            qualifier: "Ffi".to_owned(),
-                            name: "binding".to_owned(),
-                        });
-                    }
-                }
-                Expr_::VarTopLevel { module, .. } if module != home => {
-                    deps.insert(module.clone());
-                }
-                _ => {}
-            });
-        }
-        let class = if cause.is_some() {
-            ModuleClass::Server
-        } else {
-            ModuleClass::Shared
-        };
-        infos.insert(home.clone(), ModuleInfo { class, cause });
-        // Order the neighbour list by resolved dot-string so the BFS reaches
-        // equal-depth siblings in a fixed order — which sibling wins the
-        // shortest-chain tie-break is decided by the module name, not by
-        // `HashSet` iteration order.
-        let mut deps: Vec<Vec<Symbol>> = deps.into_iter().collect();
-        deps.sort_by(|a, b| {
-            module_display_name(a, interner).cmp(&module_display_name(b, interner))
-        });
-        edges.insert(home.clone(), deps);
-    }
-
-    // BFS from `entry`, tracking the path so far — gives the SHORTEST chain
-    // to the first-reached server module (breadth-first = fewest hops),
-    // matching the spec's "exact import path" requirement.
-    let mut visited: HashSet<Vec<Symbol>> = HashSet::new();
-    let mut queue: VecDeque<Vec<Vec<Symbol>>> = VecDeque::new();
-    let entry = entry.to_vec();
-    visited.insert(entry.clone());
-    queue.push_back(vec![entry]);
-
-    while let Some(path) = queue.pop_front() {
-        let Some(current) = path.last() else {
+    let closure = EntryClosure::of(linked, interner);
+    for i in closure.breadth_first() {
+        let Some(def) = linked.defs.get(i) else {
             continue;
         };
-        // A length-1 "chain" (the entry module directly names the bad
-        // kernel) is Layer 1's job (IPE-N0029) — that is direct naming, not
-        // a compositional/transitive reachability violation, and Layer 1
-        // already covers it unconditionally. Reporting it here too would
-        // make the SAME violation surface under two different diagnostics
-        // depending on unrelated ordering; skip and keep walking so a
-        // DEEPER transitive violation (the case this layer exists for)
-        // still gets its own chain.
-        if path.len() > 1
-            && let Some(info) = infos.get(current)
-            && info.class == ModuleClass::Server
-        {
-            return Err(chain_error(&path, info, interner));
-        }
-        if let Some(deps) = edges.get(current) {
-            for dep in deps {
-                if visited.insert(dep.clone()) {
-                    let mut next = path.clone();
-                    next.push(dep.clone());
-                    queue.push_back(next);
-                }
-            }
+        let Some(denied) = first_denied(def_body(def), interner, Target::WasmClient) else {
+            continue;
+        };
+        let mut homes: Vec<&[Symbol]> = closure
+            .chain_to(i)
+            .into_iter()
+            .filter_map(|j| linked.defs.get(j).map(crate::ast::Def::home))
+            .collect();
+        homes.dedup();
+        let leaves_entry = homes.first().copied() == Some(entry)
+            && homes.last().copied().is_some_and(|home| home != entry);
+        if leaves_entry {
+            return Err(chain_error(&homes, denied, interner));
         }
     }
     Ok(())
 }
 
-fn module_display_name(path: &[Symbol], interner: &Interner) -> String {
-    path.iter()
-        .map(|s| interner.resolve(*s).unwrap_or("?"))
-        .collect::<Vec<_>>()
-        .join(".")
-}
-
-fn chain_error(path: &[Vec<Symbol>], offending: &ModuleInfo, interner: &Interner) -> Diagnostic {
-    let cause = offending
-        .cause
-        .as_ref()
-        .map_or_else(|| "?".to_owned(), |c| format!("{}.{}", c.qualifier, c.name));
-    let mut segments: Vec<String> = Vec::with_capacity(path.len());
-    for (i, module) in path.iter().enumerate() {
+fn chain_error(homes: &[&[Symbol]], denied: Denied<'_>, interner: &Interner) -> Diagnostic {
+    let cause = format!("{}.{}", denied.qualifier, denied.name);
+    let mut segments: Vec<String> = Vec::with_capacity(homes.len());
+    for (i, module) in homes.iter().enumerate() {
         let name = module_display_name(module, interner);
-        let label = if i == 0 {
-            "client".to_owned()
-        } else if i + 1 == path.len() {
+        let label = if i + 1 == homes.len() {
             format!("server: imports {cause}")
+        } else if i == 0 {
+            "client".to_owned()
         } else {
             "shared".to_owned()
         };
@@ -194,71 +87,10 @@ fn chain_error(path: &[Vec<Symbol>], offending: &ModuleInfo, interner: &Interner
     }
 }
 
-/// An iterative (heap-stack) traversal, generalised to a visitor called on
-/// every node. Unlike `target_gate::first_denied`, which recurses over the same
-/// expression shape, this keeps native call depth O(1).
-fn walk_expr<'e>(root: &'e Expr, visit: &mut impl FnMut(&'e Expr)) {
-    let mut stack: Vec<&'e Expr> = vec![root];
-    while let Some(e) = stack.pop() {
-        visit(e);
-        match &e.value {
-            Expr_::VarLocal(_)
-            | Expr_::VarTopLevel { .. }
-            | Expr_::VarKernel { .. }
-            | Expr_::VarCtor { .. }
-            | Expr_::Int(_)
-            | Expr_::Float(_)
-            | Expr_::Str(_)
-            | Expr_::CustomElementCtor(_)
-            | Expr_::Char(_)
-            | Expr_::Unit => {}
-            Expr_::Call(f, args) => {
-                stack.push(f);
-                stack.extend(args.iter());
-            }
-            Expr_::ForeignCall { args, .. } => stack.extend(args.iter()),
-            Expr_::Case(scrut, branches) => {
-                stack.push(scrut);
-                for CaseBranch { body, .. } in branches {
-                    stack.push(body);
-                }
-            }
-            Expr_::Lambda(_, body) => stack.push(body),
-            Expr_::Binop { lhs, rhs, .. } => {
-                stack.push(lhs);
-                stack.push(rhs);
-            }
-            Expr_::Let(bindings, body) => {
-                for LetBinding { body: b, .. } in bindings {
-                    stack.push(b);
-                }
-                stack.push(body);
-            }
-            Expr_::If(arms, els) => {
-                for (c, b) in arms {
-                    stack.push(c);
-                    stack.push(b);
-                }
-                stack.push(els);
-            }
-            Expr_::Tuple(items) | Expr_::List(items) => stack.extend(items.iter()),
-            Expr_::Cons(h, t) => {
-                stack.push(h);
-                stack.push(t);
-            }
-            Expr_::Record(fields) => stack.extend(fields.iter().map(|(_, v)| v)),
-            Expr_::Access(base, _) => stack.push(base),
-            Expr_::Update(base, fields) => {
-                stack.push(base);
-                stack.extend(fields.iter().map(|(_, v)| v));
-            }
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ast::{Def, Expr_};
     use ipe_diagnostics::Located;
 
     #[allow(clippy::expect_used)] // test helper: an intern failure IS the failure
@@ -350,6 +182,158 @@ mod tests {
         assert_eq!(
             chain.as_ref(),
             "Main(client) -> View(shared) -> Data(server: imports Ipe.Db.query)"
+        );
+    }
+
+    /// One imported module holds a clean def the entry calls and a server-only
+    /// def nothing calls (the `Ipe.Task` shape: `map` beside `linearBackoff`).
+    /// Only reached defs classify, so neither layer refuses the build.
+    #[test]
+    fn unreached_server_def_beside_a_reached_clean_def_passes() {
+        let mut interner = Interner::new();
+        let main = path(&mut interner, "Main");
+        let task = path(&mut interner, "Task");
+        let entry_fn = sym(&mut interner, "main");
+        let map = sym(&mut interner, "map");
+        let backoff = sym(&mut interner, "linearBackoff");
+        let ipe_task = sym(&mut interner, "Ipe.Task");
+        let kernel = sym(&mut interner, "linearBackoffKernel");
+
+        let defs = vec![
+            top_level(
+                main.clone(),
+                entry_fn,
+                Expr_::Call(
+                    Box::new(Located::new(Span::DUMMY, var_top(task.clone(), map))),
+                    vec![],
+                ),
+            ),
+            top_level(task.clone(), map, Expr_::Unit),
+            top_level(
+                task,
+                backoff,
+                Expr_::VarKernel {
+                    id: None,
+                    module: ipe_task,
+                    name: kernel,
+                },
+            ),
+        ];
+        let linked = Module {
+            imports_unsafe_submodule: false,
+            imported_web_capabilities: std::collections::BTreeSet::new(),
+            name: main.clone(),
+            unions: Vec::new(),
+            defs,
+        };
+
+        check_client_reachability(&linked, &main, &interner)
+            .expect("an unreached server-only def must not classify its module");
+        crate::target_gate::check_wasm_client(&linked, &interner)
+            .expect("an unreached server-only def must not reach Layer 1");
+    }
+
+    /// The same module reached through the server-only def itself is refused
+    /// with the chain to it.
+    #[test]
+    fn reached_server_def_in_imported_module_names_the_chain() {
+        let mut interner = Interner::new();
+        let main = path(&mut interner, "Main");
+        let task = path(&mut interner, "Task");
+        let entry_fn = sym(&mut interner, "main");
+        let map = sym(&mut interner, "map");
+        let backoff = sym(&mut interner, "linearBackoff");
+        let ipe_task = sym(&mut interner, "Ipe.Task");
+        let kernel = sym(&mut interner, "linearBackoffKernel");
+
+        let defs = vec![
+            top_level(
+                main.clone(),
+                entry_fn,
+                Expr_::Call(
+                    Box::new(Located::new(Span::DUMMY, var_top(task.clone(), backoff))),
+                    vec![],
+                ),
+            ),
+            top_level(task.clone(), map, Expr_::Unit),
+            top_level(
+                task,
+                backoff,
+                Expr_::VarKernel {
+                    id: None,
+                    module: ipe_task,
+                    name: kernel,
+                },
+            ),
+        ];
+        let linked = Module {
+            imports_unsafe_submodule: false,
+            imported_web_capabilities: std::collections::BTreeSet::new(),
+            name: main.clone(),
+            unions: Vec::new(),
+            defs,
+        };
+
+        let err = check_client_reachability(&linked, &main, &interner)
+            .expect_err("a reached server-only def in an imported module is refused");
+        assert!(
+            format!("{err:?}")
+                .contains("Main(client) -> Task(server: imports Ipe.Task.linearBackoffKernel)"),
+            "expected the exact chain, got {err:?}"
+        );
+    }
+
+    /// A server-only def reached only inside the entry module is Layer 1's
+    /// direct-naming case: Layer 2 passes it through, Layer 1 refuses it.
+    #[test]
+    fn entry_module_server_def_is_left_to_layer_one() {
+        let mut interner = Interner::new();
+        let main = path(&mut interner, "Main");
+        let entry_fn = sym(&mut interner, "main");
+        let helper = sym(&mut interner, "helper");
+        let ipe_db = sym(&mut interner, "Ipe.Db");
+        let query = sym(&mut interner, "query");
+
+        let defs = vec![
+            top_level(
+                main.clone(),
+                entry_fn,
+                Expr_::Call(
+                    Box::new(Located::new(Span::DUMMY, var_top(main.clone(), helper))),
+                    vec![],
+                ),
+            ),
+            top_level(
+                main.clone(),
+                helper,
+                Expr_::VarKernel {
+                    id: None,
+                    module: ipe_db,
+                    name: query,
+                },
+            ),
+        ];
+        let linked = Module {
+            imports_unsafe_submodule: false,
+            imported_web_capabilities: std::collections::BTreeSet::new(),
+            name: main.clone(),
+            unions: Vec::new(),
+            defs,
+        };
+
+        check_client_reachability(&linked, &main, &interner)
+            .expect("an entry-module offender is not a transitive chain");
+        let err = crate::target_gate::check_wasm_client(&linked, &interner)
+            .expect_err("a helper main calls is refused by Layer 1");
+        assert!(
+            matches!(
+                err,
+                Diagnostic::Name {
+                    msg: NameError::ServerOnlyKernelForWasm { .. },
+                    ..
+                }
+            ),
+            "expected IPE-N0029, got {err:?}"
         );
     }
 

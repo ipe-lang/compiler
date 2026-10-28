@@ -1,35 +1,43 @@
 //! Layer-1 wasm security gate: server-only kernels have no denotation in a
 //! `--target wasm` build.
 //!
-//! Walks the (linked) canonical module and rejects every kernel reference
-//! that is not on the `WasmClient` allowlist
-//! (`ipe_kernels::StdlibKernel::available_on` — default-deny). Emitted code
-//! contains every linked def, so the check is naming-based over the whole
-//! module: a kernel outside the allowlist has no runtime symbol in the wasm
-//! crate, and letting it through would trade this compile error for a cargo
-//! failure (THE SEAL) — or, worse, a secret consumer in a public bundle.
+//! Walks the entry closure of the linked canonical module
+//! ([`crate::reach::EntryClosure`], the defs the emitted crate is cut down to)
+//! and rejects every kernel reference that is not on the target's allowlist
+//! (`ipe_kernels::StdlibKernel::available_on`, default-deny). A kernel outside
+//! the allowlist has no runtime symbol in the wasm crate, and letting a reached
+//! one through would trade this compile error for a cargo failure (THE SEAL),
+//! or, worse, a secret consumer in a public bundle. A def the entry cannot
+//! reach is not emitted, so naming a server-only kernel there is not an error.
+//!
+//! [`check_emitted_for_target`] re-judges the functions lowering actually kept,
+//! so the gate never rests on the closure alone matching the lowerer's prune.
 //!
 //! Foreign-crate FFI calls are equally unrepresentable client-side: the wasm
 //! crate's only host surface is the fixed web-sys allowlist.
 
+use std::collections::HashMap;
+
 use ipe_diagnostics::{DResult, Diagnostic, NameError, Span};
-use ipe_intern::Interner;
+use ipe_intern::{Interner, Symbol};
 use ipe_kernels::Target;
 
 use crate::ast::{CaseBranch, Def, Expr, Expr_, LetBinding, Module};
+use crate::reach::{EntryClosure, def_body, module_display_name};
 
-/// Reject every kernel/FFI reference in `module` that has no `WasmClient`
-/// denotation.
+/// Reject every kernel/FFI reference reachable from the entry of `module` that
+/// has no `WasmClient` denotation.
 ///
 /// # Errors
 /// [`Diagnostic::Name`] (IPE-N0029) at the first offending reference, in
-/// source order within each def.
+/// source order within each reached def, defs in linked order.
 pub fn check_wasm_client(module: &Module, interner: &Interner) -> DResult<()> {
     check_wasm_target(module, interner, Target::WasmClient)
 }
 
-/// Reject every kernel/FFI reference in `module` that has no denotation on the
-/// co-located WASI (`wasm32-wasip1`) target — the sealed-floor gate.
+/// Reject every kernel/FFI reference reachable from the entry of `module` that
+/// has no denotation on the co-located WASI (`wasm32-wasip1`) target, the
+/// sealed-floor gate.
 ///
 /// The SAME default-deny walk as [`check_wasm_client`], keyed to the WASI
 /// availability set (`available_on(Target::WasmWasi)`): a kernel outside the
@@ -41,34 +49,94 @@ pub fn check_wasm_client(module: &Module, interner: &Interner) -> DResult<()> {
 ///
 /// # Errors
 /// [`Diagnostic::Name`] (IPE-N0029) at the first offending reference, in
-/// source order within each def.
+/// source order within each reached def, defs in linked order.
 pub fn check_wasm_wasi(module: &Module, interner: &Interner) -> DResult<()> {
     check_wasm_target(module, interner, Target::WasmWasi)
 }
 
-/// The shared default-deny walk over `module`, parameterised by the wasm
-/// [`Target`] whose `available_on` set decides admission. One walker, two
-/// targets — the SSOT for "a kernel with no denotation on this wasm target is
-/// rejected before it can become a cargo failure".
-fn check_wasm_target(module: &Module, interner: &Interner, target: Target) -> DResult<()> {
-    for def in &module.defs {
-        let body = match def {
-            Def::Untyped { body, .. } | Def::Typed { body, .. } => body,
-        };
-        if let Some(d) = first_denied(body, interner, target) {
-            return Err(d);
+/// Re-judge, after lowering, every function the emitted crate will contain.
+///
+/// `emitted` names each surviving lowered function by `(home, name)`; each is
+/// judged by the canonical def it was lowered from, with the same default-deny
+/// walk as [`check_wasm_client`]. This is the second, independent boundary of
+/// the gate: an edge the lowerer adds that [`EntryClosure`] does not model
+/// still cannot ship a server-only kernel.
+///
+/// # Errors
+/// [`Diagnostic::Name`] (IPE-N0029) at the first offending reference of the
+/// first offending function, in `emitted` order; [`Diagnostic::CompilerBug`]
+/// for an emitted function no canonical def accounts for, which the gate
+/// cannot judge and so refuses.
+pub fn check_emitted_for_target(
+    linked: &Module,
+    emitted: &[(&[Symbol], Symbol)],
+    interner: &Interner,
+    target: Target,
+) -> DResult<()> {
+    let mut by_name: HashMap<Symbol, Vec<&Def>> = HashMap::new();
+    for def in &linked.defs {
+        by_name.entry(def.name().value).or_default().push(def);
+    }
+    for &(home, name) in emitted {
+        let sources: Vec<&Def> = by_name
+            .get(&name)
+            .into_iter()
+            .flatten()
+            .copied()
+            .filter(|def| def.home() == home)
+            .collect();
+        if sources.is_empty() {
+            return Err(Diagnostic::CompilerBug {
+                where_: "ipe_canon::target_gate::check_emitted_for_target",
+                detail: format!(
+                    "the emitted function `{}.{}` has no canonical definition, so \
+                     the wasm gate cannot judge it",
+                    module_display_name(home, interner),
+                    interner.resolve(name).unwrap_or("?"),
+                ),
+            });
+        }
+        for def in sources {
+            if let Some(denied) = first_denied(def_body(def), interner, target) {
+                return Err(denied.into_diagnostic());
+            }
         }
     }
     Ok(())
 }
 
-fn deny(span: Span, qualifier: &str, name: &str) -> Diagnostic {
-    Diagnostic::Name {
-        span,
-        msg: NameError::ServerOnlyKernelForWasm {
-            qualifier: qualifier.into(),
-            name: name.into(),
-        },
+/// The shared default-deny walk over the entry closure of `module`,
+/// parameterised by the wasm [`Target`] whose `available_on` set decides
+/// admission. One walker, two targets — the SSOT for "a kernel with no
+/// denotation on this wasm target is rejected before it can become a cargo
+/// failure".
+fn check_wasm_target(module: &Module, interner: &Interner, target: Target) -> DResult<()> {
+    let closure = EntryClosure::of(module, interner);
+    for def in closure.defs(module) {
+        if let Some(denied) = first_denied(def_body(def), interner, target) {
+            return Err(denied.into_diagnostic());
+        }
+    }
+    Ok(())
+}
+
+/// A kernel or FFI reference with no denotation on the judged target.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Denied<'i> {
+    pub(crate) span: Span,
+    pub(crate) qualifier: &'i str,
+    pub(crate) name: &'i str,
+}
+
+impl Denied<'_> {
+    fn into_diagnostic(self) -> Diagnostic {
+        Diagnostic::Name {
+            span: self.span,
+            msg: NameError::ServerOnlyKernelForWasm {
+                qualifier: self.qualifier.into(),
+                name: self.name.into(),
+            },
+        }
     }
 }
 
@@ -99,7 +167,11 @@ fn single_def_module(interner: &mut Interner, body_expr: Expr_) -> Module {
 /// contract: callee before arguments, scrutinee before arms, each binding
 /// before its continuation, if-condition before body before else, and
 /// tuple/list/record/update fields in their declaration order.
-fn first_denied(e: &Expr, interner: &Interner, target: Target) -> Option<Diagnostic> {
+pub(crate) fn first_denied<'i>(
+    e: &Expr,
+    interner: &'i Interner,
+    target: Target,
+) -> Option<Denied<'i>> {
     match &e.value {
         Expr_::VarKernel { id, module, name } => {
             let allowed = id.is_some_and(|k| k.available_on(target));
@@ -110,13 +182,21 @@ fn first_denied(e: &Expr, interner: &Interner, target: Target) -> Option<Diagnos
             } else {
                 let q = interner.resolve(*module).unwrap_or("?");
                 let n = interner.resolve(*name).unwrap_or("?");
-                Some(deny(e.span, q, n))
+                Some(Denied {
+                    span: e.span,
+                    qualifier: q,
+                    name: n,
+                })
             }
         }
         Expr_::ForeignCall { .. } => {
             // FFI bindings are a native-target concept: the client's only
             // host surface is the fixed web-sys allowlist.
-            Some(deny(e.span, "Ffi", "binding"))
+            Some(Denied {
+                span: e.span,
+                qualifier: "Ffi",
+                name: "binding",
+            })
         }
         Expr_::VarLocal(_)
         | Expr_::VarTopLevel { .. }
@@ -514,6 +594,244 @@ mod tests {
         assert_eq!(
             span.lo, 10,
             "update: base (lo=10) must precede field (lo=20)"
+        );
+    }
+
+    fn plain_def(home: Vec<ipe_intern::Symbol>, name: ipe_intern::Symbol, body: Expr) -> Def {
+        use ipe_diagnostics::Located;
+        Def::Untyped {
+            home,
+            name: Located::new(Span::DUMMY, name),
+            patterns: Vec::new(),
+            body,
+        }
+    }
+
+    fn call_top(module: Vec<ipe_intern::Symbol>, name: ipe_intern::Symbol) -> Expr {
+        use ipe_diagnostics::Located;
+        Located::new(
+            Span::DUMMY,
+            Expr_::Call(
+                Box::new(Located::new(
+                    Span::DUMMY,
+                    Expr_::VarTopLevel { module, name },
+                )),
+                Vec::new(),
+            ),
+        )
+    }
+
+    fn linked_module(name: Vec<ipe_intern::Symbol>, defs: Vec<Def>) -> Module {
+        Module {
+            imports_unsafe_submodule: false,
+            imported_web_capabilities: std::collections::BTreeSet::new(),
+            name,
+            unions: Vec::new(),
+            defs,
+        }
+    }
+
+    /// The `Ipe.Task` shape: `Main.main` calls `Ipe.Task.map`, while the
+    /// sibling `Ipe.Task.linearBackoff` names the tokio-bound
+    /// `Task_linearBackoff` kernel and nothing calls it. The entry closure
+    /// excludes it, so the wasm client gate passes.
+    #[test]
+    fn unreached_server_only_def_in_imported_module_passes() {
+        use ipe_diagnostics::Located;
+        assert!(
+            !StdlibKernel::TaskLinearBackoff.available_on(Target::WasmClient),
+            "the premise: Task.linearBackoff has no wasm client denotation"
+        );
+        let mut interner = Interner::new();
+        let main_mod = vec![intern(&mut interner, "Main")];
+        let task_mod = vec![intern(&mut interner, "Ipe"), intern(&mut interner, "Task")];
+        let main_fn = intern(&mut interner, "main");
+        let map = intern(&mut interner, "map");
+        let backoff = intern(&mut interner, "linearBackoff");
+        let qualifier = intern(&mut interner, "Task");
+        let kernel = Located::new(
+            Span::new(30, 31),
+            Expr_::VarKernel {
+                id: Some(StdlibKernel::TaskLinearBackoff),
+                module: qualifier,
+                name: backoff,
+            },
+        );
+        let linked = linked_module(
+            main_mod.clone(),
+            vec![
+                plain_def(task_mod.clone(), map, unit_at(0)),
+                plain_def(task_mod.clone(), backoff, kernel),
+                plain_def(main_mod, main_fn, call_top(task_mod, map)),
+            ],
+        );
+        check_wasm_client(&linked, &interner)
+            .expect("an unreached server-only stdlib def must not refuse the client build");
+        check_wasm_wasi(&linked, &interner)
+            .expect("an unreached server-only stdlib def must not refuse the WASI build");
+    }
+
+    /// The same program reaching `Ipe.Task.linearBackoff` from `main` is
+    /// refused (IPE-N0029) at the kernel inside the imported def.
+    #[test]
+    fn reached_server_only_def_in_imported_module_is_denied() {
+        use ipe_diagnostics::Located;
+        let mut interner = Interner::new();
+        let main_mod = vec![intern(&mut interner, "Main")];
+        let task_mod = vec![intern(&mut interner, "Ipe"), intern(&mut interner, "Task")];
+        let main_fn = intern(&mut interner, "main");
+        let backoff = intern(&mut interner, "linearBackoff");
+        let qualifier = intern(&mut interner, "Task");
+        let kernel = Located::new(
+            Span::new(30, 31),
+            Expr_::VarKernel {
+                id: Some(StdlibKernel::TaskLinearBackoff),
+                module: qualifier,
+                name: backoff,
+            },
+        );
+        let linked = linked_module(
+            main_mod.clone(),
+            vec![
+                plain_def(task_mod.clone(), backoff, kernel),
+                plain_def(main_mod, main_fn, call_top(task_mod, backoff)),
+            ],
+        );
+        let err = check_wasm_client(&linked, &interner)
+            .expect_err("a reached server-only stdlib def must be refused");
+        match err {
+            Diagnostic::Name {
+                span,
+                msg: NameError::ServerOnlyKernelForWasm { qualifier, name },
+            } => {
+                assert_eq!(qualifier.as_ref(), "Task");
+                assert_eq!(name.as_ref(), "linearBackoff");
+                assert_eq!(span.lo, 30, "blame the kernel inside the imported def");
+            }
+            other => assert_eq!(
+                format!("{other:?}"),
+                "ServerOnlyKernelForWasm",
+                "expected ServerOnlyKernelForWasm"
+            ),
+        }
+    }
+
+    /// A same-module helper `main` calls is reached, so its server-only kernel
+    /// is refused; the identical helper uncalled is not.
+    #[test]
+    fn same_module_helper_is_judged_by_reach() {
+        let mut interner = Interner::new();
+        let main_mod = vec![intern(&mut interner, "Main")];
+        let main_fn = intern(&mut interner, "main");
+        let helper = intern(&mut interner, "helper");
+
+        let called = linked_module(
+            main_mod.clone(),
+            vec![
+                plain_def(
+                    main_mod.clone(),
+                    helper,
+                    denied_kernel_at(&mut interner, 10),
+                ),
+                plain_def(
+                    main_mod.clone(),
+                    main_fn,
+                    call_top(main_mod.clone(), helper),
+                ),
+            ],
+        );
+        let err = check_wasm_client(&called, &interner)
+            .expect_err("a helper main calls is in the bundle and must be refused");
+        assert_eq!(name_span(&err, "called helper").lo, 10);
+
+        let uncalled = linked_module(
+            main_mod.clone(),
+            vec![
+                plain_def(
+                    main_mod.clone(),
+                    helper,
+                    denied_kernel_at(&mut interner, 10),
+                ),
+                plain_def(main_mod, main_fn, unit_at(0)),
+            ],
+        );
+        check_wasm_client(&uncalled, &interner)
+            .expect("an uncalled helper is not emitted and must not be refused");
+    }
+
+    /// No `main` at all: nothing is pruned, so every def is judged and a
+    /// server-only kernel anywhere is refused (fail closed).
+    #[test]
+    fn missing_entry_judges_every_def() {
+        let mut interner = Interner::new();
+        let main_mod = vec![intern(&mut interner, "Main")];
+        let helper = intern(&mut interner, "helper");
+        let linked = linked_module(
+            main_mod.clone(),
+            vec![plain_def(
+                main_mod,
+                helper,
+                denied_kernel_at(&mut interner, 10),
+            )],
+        );
+        check_wasm_client(&linked, &interner)
+            .expect_err("with no entry every def ships, so every def is judged");
+    }
+
+    /// The post-lowering backstop judges what lowering kept, whatever the
+    /// closure said: an emitted server-only def is refused, an emitted clean
+    /// def passes, and an emitted function with no canonical def is a refused
+    /// compiler bug, never a pass.
+    #[test]
+    fn emitted_set_is_rejudged() {
+        let mut interner = Interner::new();
+        let main_mod = vec![intern(&mut interner, "Main")];
+        let main_fn = intern(&mut interner, "main");
+        let helper = intern(&mut interner, "helper");
+        let ghost = intern(&mut interner, "ghost");
+        let linked = linked_module(
+            main_mod.clone(),
+            vec![
+                plain_def(
+                    main_mod.clone(),
+                    helper,
+                    denied_kernel_at(&mut interner, 10),
+                ),
+                plain_def(main_mod.clone(), main_fn, unit_at(0)),
+            ],
+        );
+        check_wasm_client(&linked, &interner).expect("the helper is outside the closure");
+
+        check_emitted_for_target(
+            &linked,
+            &[(main_mod.as_slice(), main_fn)],
+            &interner,
+            Target::WasmClient,
+        )
+        .expect("only the clean main is emitted");
+
+        let err = check_emitted_for_target(
+            &linked,
+            &[
+                (main_mod.as_slice(), main_fn),
+                (main_mod.as_slice(), helper),
+            ],
+            &interner,
+            Target::WasmClient,
+        )
+        .expect_err("an emitted server-only def is refused after lowering");
+        assert_eq!(name_span(&err, "emitted helper").lo, 10);
+
+        let err = check_emitted_for_target(
+            &linked,
+            &[(main_mod.as_slice(), ghost)],
+            &interner,
+            Target::WasmClient,
+        )
+        .expect_err("an emitted function the gate cannot judge is refused");
+        assert!(
+            matches!(err, Diagnostic::CompilerBug { .. }),
+            "expected CompilerBug, got {err:?}"
         );
     }
 

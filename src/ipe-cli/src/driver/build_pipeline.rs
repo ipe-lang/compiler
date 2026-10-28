@@ -1878,16 +1878,14 @@ pub fn compile_prepared(
         widget_manifest.entry(tag).or_insert(content);
     }
 
-    // Layer-2 wasm security gate (IPE-N0030, M5): the client entry's
-    // reachability closure must not transitively reach a server-classified
-    // module. Runs BEFORE Layer 1 so a reachability violation gets the
-    // friendlier exact-chain message; Layer 1 remains the flat,
-    // defense-in-depth backstop for everything this closure does not cover
-    // (e.g. a server kernel named directly in the entry's own module).
-    // `linked.name` is the client entry's module path for today's
-    // single-entry `--target wasm` build (a distinct `[wasm].entry` module
-    // takes the same role once the M6 integration wires a separate client
-    // entry through).
+    // Layer-2 wasm security gate (IPE-N0030, M5): the client entry's closure
+    // (`ipe_canon::reach::EntryClosure`, the defs the emitted crate is cut down
+    // to) must not reach a server-only def in another module. Runs BEFORE
+    // Layer 1 so a reachability violation gets the friendlier exact-chain
+    // message; Layer 1 judges the same closure at each reference (e.g. a server
+    // kernel named directly in the entry's own module). `linked.name` is the
+    // client entry's module path for today's single-entry `--target wasm`
+    // build.
     if config.settings(db).target == ipe_ir::Target::WasmClient {
         let gate_result = {
             let interner = shared_interner.lock();
@@ -1905,11 +1903,12 @@ pub fn compile_prepared(
     }
 
     // Layer-1 wasm security gate (IPE-N0029): under `--target wasm`, every
-    // kernel named anywhere in the linked program must be on the WasmClient
-    // allowlist. Runs on the LINKED module (everything linked is emitted, so
-    // a denied kernel anywhere would otherwise become a cargo failure — THE
-    // SEAL — or a secret consumer in a public bundle). Blame via the same
-    // span→file heuristic the type errors use.
+    // kernel named in a def the entry can reach must be on the WasmClient
+    // allowlist (a reached denied kernel would otherwise become a cargo
+    // failure — THE SEAL — or a secret consumer in a public bundle). A def the
+    // entry cannot reach is pruned before emit, and the emitted set is
+    // re-judged after lowering below. Blame via the same span→file heuristic
+    // the type errors use.
     if config.settings(db).target == ipe_ir::Target::WasmClient {
         let gate_result = {
             let interner = shared_interner.lock();
@@ -1927,8 +1926,8 @@ pub fn compile_prepared(
     }
 
     // Co-located WASI (`wasm32-wasip1`) sealed-floor gate: the build-boundary
-    // backstop to the delivery matrix's shape gate. Every kernel named anywhere
-    // in the linked program must be on the WASI-viable sealed floor
+    // backstop to the delivery matrix's shape gate. Every kernel named in a def
+    // the entry can reach must be on the WASI-viable sealed floor
     // (`available_on(WasmWasi)`); a kernel outside it has no wasip1 runtime
     // symbol, so this refusal replaces a `cargo build --target wasm32-wasip1`
     // failure (THE SEAL). Defense in depth: even a kernel reached through a path
@@ -2014,16 +2013,55 @@ pub fn compile_prepared(
     // would be a redundant duplicate of the SAME memoized query (its error
     // maps through the same `span_attributed_err` closure either way).
     // Demanded here, on the production path, purely as a FORWARD SEAM:
-    // nothing downstream consumes its value yet (no pruning pass exists —
-    // see the query's own doc for the honestly-recorded scope), matching the
-    // `kernel_types` precedent (materialized and proven memoized
-    // before it has a real consumer). The demand costs nothing observable in
-    // emitted bytes — the point is to put the query on the same path the
-    // clean-vs-incremental parity gate drives, so a future divergence in this
-    // analysis cannot go undetected.
+    // nothing downstream consumes its value yet (see the query's own doc for
+    // the honestly-recorded scope), matching the `kernel_types` precedent
+    // (materialized and proven memoized before it has a real consumer). The
+    // demand costs nothing observable in emitted bytes — the point is to put
+    // the query on the same path the clean-vs-incremental parity gate drives,
+    // so a future divergence in this analysis cannot go undetected.
     ipe_db::program_metadata(db, source_root, entry_file)
         .clone()
         .map_err(homed_err)?;
+
+    // Post-lowering wasm gate (IPE-N0029): re-judge every function lowering
+    // kept, the exact set the emitted crate contains, against the target's
+    // allowlist. The pre-lowering layers judge the canonical entry closure;
+    // this second, independent boundary holds even where the lowerer keeps a
+    // function that closure does not model. `folded_program` is the memoized
+    // program every emit below reads, so the demand adds no work.
+    let wasm_target = config.settings(db).target;
+    if matches!(
+        wasm_target,
+        ipe_ir::Target::WasmClient | ipe_ir::Target::WasmWasi
+    ) {
+        let program = ipe_db::folded_program(db, source_root, entry_file)
+            .clone()
+            .map_err(span_attributed_err)?;
+        let emitted: Vec<(&[ipe_intern::Symbol], ipe_intern::Symbol)> = program
+            .modules
+            .iter()
+            .flat_map(|module| module.funcs.iter())
+            .map(|func| (func.home.0.as_slice(), func.name))
+            .collect();
+        let gate_result = {
+            let interner = shared_interner.lock();
+            ipe_canon::target_gate::check_emitted_for_target(
+                linked,
+                &emitted,
+                &interner,
+                wasm_target,
+            )
+        };
+        gate_result.map_err(|diag| {
+            let span = diag_span(&diag);
+            let (file, src) = source_for_span(span);
+            CliError::Pipeline {
+                file,
+                src,
+                diag: Box::new(diag),
+            }
+        })?;
+    }
 
     // `ipe_db::emit_manifest` (design doc §4.4) — the top-level
     // emit demand, assembled from the per-`RustFileId` query graph:
