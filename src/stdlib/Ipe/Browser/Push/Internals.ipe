@@ -1,0 +1,641 @@
+-- | Ipe.Browser.Push.Internals — the low-level push subscription port surface:
+-- the opaque application key and subscription, their one parser and one encoder,
+-- and the raw `Ipe.Ffi.Js` request/subscribe wiring the high-level
+-- `Ipe.Browser.Push` layer wraps.
+--
+-- Importing this submodule discloses the same `js-port:push` axis as the
+-- top-level module (the disclosure is keyed on the `Ipe.Browser.Push` path
+-- prefix), so the raw port surface cannot be reached undisclosed.
+--
+-- The outbound command type is private: the only way to ask the host for a
+-- subscription is `requestSubscribe` with an `ApplicationKey`, so a key that
+-- failed `applicationKey` has no representation on the port.
+module Ipe.Browser.Push.Internals exposing
+    ( ApplicationKey
+    , Subscription
+    , applicationKey
+    , decodeSubscription
+    , encodeSubscription
+    , requestSubscribe
+    , requestCurrent
+    , requestUnsubscribe
+    , subscribeChanges
+    , subscribeOpened
+    , subscribeReply
+    , currentReply
+    , unsubscribeReply
+    , changesInbound
+    , openedInbound
+    )
+
+import Ipe.Basics as Basics
+import Ipe.Bytes as Bytes exposing (Bytes)
+import Ipe.Char as Char
+import Ipe.Error as Error exposing (Error)
+import Ipe.Ffi.Js as Js
+import Ipe.Json.Decode as Decode
+import Ipe.Json.Encode as Encode
+import Ipe.Maybe as Maybe exposing (Maybe(..))
+import Ipe.Result as Result exposing (Result(..))
+import Ipe.String as String
+import Ipe.Task as Task
+import Ipe.Tea.Web.Sub as Sub
+
+
+-- | An application server's public key: a 65-byte uncompressed P-256 point,
+-- held as its canonical unpadded base64url text. The only constructor is
+-- `applicationKey`.
+type ApplicationKey
+    = ApplicationKey String
+
+
+-- | A push subscription the host returned, one variant per transport. The only
+-- constructor is `decodeSubscription`; `encodeSubscription` is its one
+-- canonical rendering.
+type Subscription
+    = WebSubscription Endpoint ReceiverKey AuthSecret
+    | ApnsSubscription DeviceToken ApnsEnvironment ReceiverKey AuthSecret
+    | FcmSubscription DeviceToken ReceiverKey AuthSecret
+
+
+-- | A Web Push endpoint: an `https` URL of printable ASCII.
+type Endpoint
+    = Endpoint String
+
+
+-- | A provider device token: lowercase hex for APNs, the FCM token grammar for FCM.
+type DeviceToken
+    = DeviceToken String
+
+
+-- | The receiving device's 65-byte P-256 public key, as canonical base64url.
+type ReceiverKey
+    = ReceiverKey String
+
+
+-- | The receiving device's 16-byte authentication secret, as canonical base64url.
+type AuthSecret
+    = AuthSecret String
+
+
+-- | The APNs environment a device token belongs to.
+type ApnsEnvironment
+    = ApnsProduction
+    | ApnsDevelopment
+
+
+-- | The closed outbound vocabulary of the push port.
+type JsCmd
+    = PushSubscribe String
+    | PushCurrent
+    | PushUnsubscribe
+
+
+-- | The version every canonical subscription text carries.
+subscriptionVersion : Int
+subscriptionVersion =
+    1
+
+
+-- | The byte ceiling on a subscription text.
+subscriptionMaxBytes : Int
+subscriptionMaxBytes =
+    4096
+
+
+-- | The byte ceiling on a Web Push endpoint.
+endpointMaxBytes : Int
+endpointMaxBytes =
+    2048
+
+
+-- | The character ceiling on an APNs device token.
+apnsTokenMaxChars : Int
+apnsTokenMaxChars =
+    200
+
+
+-- | The character ceiling on an FCM device token.
+fcmTokenMaxChars : Int
+fcmTokenMaxChars =
+    1024
+
+
+-- | The byte length of an uncompressed P-256 point.
+pointBytes : Int
+pointBytes =
+    65
+
+
+-- | The unpadded base64url length of an uncompressed P-256 point.
+pointChars : Int
+pointChars =
+    87
+
+
+-- | The byte length of a receiving device's authentication secret.
+authSecretBytes : Int
+authSecretBytes =
+    16
+
+
+-- | The unpadded base64url length of an authentication secret.
+authSecretChars : Int
+authSecretChars =
+    22
+
+
+-- | `applicationKey text` — parse an application server's public key.
+--
+-- `Ok` only for exactly 87 characters of unpadded base64url, in their one
+-- canonical spelling, that decode to 65 bytes starting with the uncompressed
+-- point tag `0x04`. Anything else is an `Error.invalidInput`.
+applicationKey : String -> Result Error ApplicationKey
+applicationKey text =
+    case pointText text of
+        Just canonical ->
+            Ok (ApplicationKey canonical)
+
+        Nothing ->
+            Err (Error.invalidInput "a push application key must be a 65-byte uncompressed P-256 point in base64url")
+
+
+-- | `decodeSubscription text` — parse a canonical subscription text.
+--
+-- `Ok` only for a text within the byte ceiling whose version, kind and fields
+-- each parse, and which is exactly the text `encodeSubscription` renders for the
+-- result: a second spelling of the same subscription is refused.
+decodeSubscription : String -> Result Error Subscription
+decodeSubscription text =
+    if Bytes.length (Bytes.fromString text) > subscriptionMaxBytes then
+        Err (Error.limitExceeded "a push subscription text is past its ceiling")
+
+    else
+        case Decode.decodeString subscriptionDecoder text of
+            Ok subscription ->
+                if encodeSubscription subscription == text then
+                    Ok subscription
+
+                else
+                    Err malformedSubscription
+
+            Err _ ->
+                Err malformedSubscription
+
+
+-- | `encodeSubscription subscription` — the one canonical subscription text.
+encodeSubscription : Subscription -> String
+encodeSubscription subscription =
+    Encode.encode 0 (Encode.object (subscriptionFields subscription))
+
+
+malformedSubscription : Error
+malformedSubscription =
+    Error.invalidInput "a push subscription text is malformed"
+
+
+subscriptionFields : Subscription -> List ( String, Value )
+subscriptionFields subscription =
+    case subscription of
+        WebSubscription (Endpoint endpoint) receiver auth ->
+            [ ( "v", Encode.int subscriptionVersion )
+            , ( "kind", Encode.string "web" )
+            , ( "endpoint", Encode.string endpoint )
+            ]
+                ++ keyFields receiver auth
+
+        ApnsSubscription (DeviceToken token) environment receiver auth ->
+            [ ( "v", Encode.int subscriptionVersion )
+            , ( "kind", Encode.string "apns" )
+            , ( "token", Encode.string token )
+            , ( "env", Encode.string (apnsEnvironmentText environment) )
+            ]
+                ++ keyFields receiver auth
+
+        FcmSubscription (DeviceToken token) receiver auth ->
+            [ ( "v", Encode.int subscriptionVersion )
+            , ( "kind", Encode.string "fcm" )
+            , ( "token", Encode.string token )
+            ]
+                ++ keyFields receiver auth
+
+
+keyFields : ReceiverKey -> AuthSecret -> List ( String, Value )
+keyFields receiver auth =
+    case ( receiver, auth ) of
+        ( ReceiverKey receiverText, AuthSecret authText ) ->
+            [ ( "p256dh", Encode.string receiverText )
+            , ( "auth", Encode.string authText )
+            ]
+
+
+apnsEnvironmentText : ApnsEnvironment -> String
+apnsEnvironmentText environment =
+    case environment of
+        ApnsProduction ->
+            "production"
+
+        ApnsDevelopment ->
+            "development"
+
+
+subscriptionDecoder : Decode.Decoder Subscription
+subscriptionDecoder =
+    Decode.andThen byVersion (Decode.field "v" Decode.int)
+
+
+byVersion : Int -> Decode.Decoder Subscription
+byVersion version =
+    if version == subscriptionVersion then
+        Decode.andThen byKind (Decode.field "kind" Decode.string)
+
+    else
+        Decode.fail "unsupported push subscription version"
+
+
+byKind : String -> Decode.Decoder Subscription
+byKind kind =
+    case kind of
+        "web" ->
+            Decode.map3 WebSubscription
+                (Decode.field "endpoint" (parsed endpointText))
+                (Decode.field "p256dh" (parsed receiverKeyText))
+                (Decode.field "auth" (parsed authSecretText))
+
+        "apns" ->
+            Decode.map4 ApnsSubscription
+                (Decode.field "token" (parsed apnsTokenText))
+                (Decode.field "env" (parsed apnsEnvironment))
+                (Decode.field "p256dh" (parsed receiverKeyText))
+                (Decode.field "auth" (parsed authSecretText))
+
+        "fcm" ->
+            Decode.map3 FcmSubscription
+                (Decode.field "token" (parsed fcmTokenText))
+                (Decode.field "p256dh" (parsed receiverKeyText))
+                (Decode.field "auth" (parsed authSecretText))
+
+        _ ->
+            Decode.fail "unknown push subscription kind"
+
+
+parsed : (String -> Maybe a) -> Decode.Decoder a
+parsed parse =
+    Decode.andThen (\text -> fromMaybe (parse text)) Decode.string
+
+
+fromMaybe : Maybe a -> Decode.Decoder a
+fromMaybe value =
+    case value of
+        Just parsedValue ->
+            Decode.succeed parsedValue
+
+        Nothing ->
+            Decode.fail "malformed push subscription field"
+
+
+endpointText : String -> Maybe Endpoint
+endpointText text =
+    let
+        wellFormed =
+            String.length text <= endpointMaxBytes
+                && String.all isUrlChar text
+                && String.startsWith "https://" text
+                && String.length text > String.length "https://"
+    in
+    if wellFormed then
+        Just (Endpoint text)
+
+    else
+        Nothing
+
+
+apnsTokenText : String -> Maybe DeviceToken
+apnsTokenText text =
+    let
+        wellFormed =
+            String.length text <= apnsTokenMaxChars
+                && Basics.not (String.isEmpty text)
+                && Basics.modBy 2 (String.length text) == 0
+                && String.all isLowerHexChar text
+    in
+    if wellFormed then
+        Just (DeviceToken text)
+
+    else
+        Nothing
+
+
+fcmTokenText : String -> Maybe DeviceToken
+fcmTokenText text =
+    let
+        wellFormed =
+            String.length text <= fcmTokenMaxChars
+                && Basics.not (String.isEmpty text)
+                && String.all isFcmTokenChar text
+    in
+    if wellFormed then
+        Just (DeviceToken text)
+
+    else
+        Nothing
+
+
+apnsEnvironment : String -> Maybe ApnsEnvironment
+apnsEnvironment text =
+    case text of
+        "production" ->
+            Just ApnsProduction
+
+        "development" ->
+            Just ApnsDevelopment
+
+        _ ->
+            Nothing
+
+
+receiverKeyText : String -> Maybe ReceiverKey
+receiverKeyText text =
+    Maybe.map ReceiverKey (pointText text)
+
+
+authSecretText : String -> Maybe AuthSecret
+authSecretText text =
+    Maybe.map (\_ -> AuthSecret text) (base64UrlBytes authSecretChars authSecretBytes text)
+
+
+-- | The canonical base64url text of an uncompressed P-256 point, or `Nothing`.
+pointText : String -> Maybe String
+pointText text =
+    case base64UrlBytes pointChars pointBytes text of
+        Just bytes ->
+            if Bytes.toHex (Bytes.slice 0 1 bytes) == "04" then
+                Just text
+
+            else
+                Nothing
+
+        Nothing ->
+            Nothing
+
+
+-- | `base64UrlBytes chars bytes text` — the `bytes`-long value `text` spells in
+-- exactly `chars` characters of unpadded base64url, or `Nothing`. Only the one
+-- canonical spelling parses: the decoded value must re-encode to `text`.
+base64UrlBytes : Int -> Int -> String -> Maybe Bytes
+base64UrlBytes chars bytes text =
+    if String.length text == chars && String.all isBase64UrlChar text then
+        case Maybe.andThen Bytes.fromBase64 (standardBase64 text) of
+            Just decoded ->
+                if Bytes.length decoded == bytes && toBase64Url decoded == text then
+                    Just decoded
+
+                else
+                    Nothing
+
+            Nothing ->
+                Nothing
+
+    else
+        Nothing
+
+
+-- | The padded standard-alphabet spelling of an unpadded base64url text.
+standardBase64 : String -> Maybe String
+standardBase64 text =
+    let
+        standard =
+            String.replace "_" "/" (String.replace "-" "+" text)
+    in
+    case Basics.modBy 4 (String.length text) of
+        0 ->
+            Just standard
+
+        2 ->
+            Just (standard ++ "==")
+
+        3 ->
+            Just (standard ++ "=")
+
+        _ ->
+            Nothing
+
+
+toBase64Url : Bytes -> String
+toBase64Url bytes =
+    String.replace "=" "" (String.replace "/" "_" (String.replace "+" "-" (Bytes.toBase64 bytes)))
+
+
+isBase64UrlChar : Char -> Bool
+isBase64UrlChar c =
+    isAsciiAlphaNum c || Char.toCode c == 45 || Char.toCode c == 95
+
+
+isFcmTokenChar : Char -> Bool
+isFcmTokenChar c =
+    isBase64UrlChar c || Char.toCode c == 58
+
+
+isLowerHexChar : Char -> Bool
+isLowerHexChar c =
+    let
+        code =
+            Char.toCode c
+    in
+    (code >= 48 && code <= 57) || (code >= 97 && code <= 102)
+
+
+isAsciiAlphaNum : Char -> Bool
+isAsciiAlphaNum c =
+    let
+        code =
+            Char.toCode c
+    in
+    (code >= 48 && code <= 57) || (code >= 65 && code <= 90) || (code >= 97 && code <= 122)
+
+
+-- | A printable ASCII character other than `"`, `<`, `>`, a backslash or a
+-- backtick: the characters an endpoint URL can carry unescaped.
+isUrlChar : Char -> Bool
+isUrlChar c =
+    let
+        code =
+            Char.toCode c
+    in
+    code >= 33 && code <= 126 && code /= 34 && code /= 60 && code /= 62 && code /= 92 && code /= 96
+
+
+-- | `requestSubscribe key` — ask the host to subscribe this device under `key`.
+requestSubscribe : ApplicationKey -> Task Error Subscription
+requestSubscribe key =
+    case key of
+        ApplicationKey text ->
+            Js.request (PushSubscribe text) subscribeReply
+                |> Task.andThenResult (\outcome -> outcome)
+
+
+-- | `requestCurrent` — ask the host for this device's current subscription.
+requestCurrent : Task Error (Maybe Subscription)
+requestCurrent =
+    Js.request PushCurrent currentReply
+        |> Task.andThenResult (\outcome -> outcome)
+
+
+-- | `requestUnsubscribe` — ask the host to drop this device's subscription.
+requestUnsubscribe : Task Error ()
+requestUnsubscribe =
+    Js.request PushUnsubscribe unsubscribeReply
+        |> Task.andThenResult (\outcome -> outcome)
+
+
+-- | `subscribeChanges toMsg` — the inbound subscription over `changesInbound`.
+subscribeChanges : (Maybe Subscription -> msg) -> Sub.Sub msg
+subscribeChanges toMsg =
+    Js.subscribe changesInbound toMsg
+
+
+-- | `subscribeOpened toMsg` — the inbound subscription over `openedInbound`.
+subscribeOpened : (String -> msg) -> Sub.Sub msg
+subscribeOpened toMsg =
+    Js.subscribe openedInbound toMsg
+
+
+-- | The reply to a subscribe request: a `subscribed` event carrying a
+-- subscription text that `decodeSubscription` accepts, or a refusal.
+subscribeReply : Decode.Decoder (Result Error Subscription)
+subscribeReply =
+    reply "subscribed"
+        (Decode.map decodeSubscription (Decode.field "subscription" Decode.string))
+
+
+-- | The reply to a current request: a `current` event carrying a subscription
+-- text or `null`, or a refusal.
+currentReply : Decode.Decoder (Result Error (Maybe Subscription))
+currentReply =
+    reply "current"
+        (Decode.map currentOutcome (Decode.field "subscription" (Decode.nullable Decode.string)))
+
+
+-- | The reply to an unsubscribe request: an `unsubscribed` event, or a refusal.
+unsubscribeReply : Decode.Decoder (Result Error ())
+unsubscribeReply =
+    reply "unsubscribed" (Decode.succeed (Ok ()))
+
+
+currentOutcome : Maybe String -> Result Error (Maybe Subscription)
+currentOutcome text =
+    case text of
+        Just subscription ->
+            Result.map Just (decodeSubscription subscription)
+
+        Nothing ->
+            Ok Nothing
+
+
+-- | A correlated reply: `ok` true with exactly the `expected` event, or `ok`
+-- false with one of the closed refusal codes. Any other frame fails the decode.
+reply : String -> Decode.Decoder (Result Error a) -> Decode.Decoder (Result Error a)
+reply expected success =
+    Decode.andThen (replyByOk expected success) (Decode.field "ok" Decode.bool)
+
+
+replyByOk : String -> Decode.Decoder (Result Error a) -> Bool -> Decode.Decoder (Result Error a)
+replyByOk expected success ok =
+    if ok then
+        Decode.andThen (replyEvent expected success) (Decode.field "event" Decode.string)
+
+    else
+        Decode.andThen refusal (Decode.field "error" Decode.string)
+
+
+replyEvent : String -> Decode.Decoder (Result Error a) -> String -> Decode.Decoder (Result Error a)
+replyEvent expected success event =
+    if event == expected then
+        success
+
+    else
+        Decode.fail "unexpected push reply event"
+
+
+-- | The error each closed refusal code becomes.
+refusal : String -> Decode.Decoder (Result Error a)
+refusal code =
+    case code of
+        "denied" ->
+            Decode.succeed (Err Error.permissionDenied)
+
+        "unavailable" ->
+            Decode.succeed (Err (Error.unavailable "unavailable on this device"))
+
+        "cancelled" ->
+            Decode.succeed (Err (Error.unavailable "the prompt was dismissed"))
+
+        "refused" ->
+            Decode.succeed (Err (Error.invalidInput "the device refused the request"))
+
+        "limit" ->
+            Decode.succeed (Err (Error.limitExceeded "a device limit was reached"))
+
+        "version" ->
+            Decode.succeed (Err (Error.unavailable "the device speaks another bridge version"))
+
+        _ ->
+            Decode.fail "unknown push refusal code"
+
+
+-- | A `subscriptionChanged` broadcast: the device's subscription now, or
+-- `Nothing` once it has none. A frame whose subscription text does not parse is
+-- dropped.
+changesInbound : Decode.Decoder (Maybe Subscription)
+changesInbound =
+    Decode.andThen changedFrame (broadcast "subscriptionChanged")
+
+
+changedFrame : () -> Decode.Decoder (Maybe Subscription)
+changedFrame _ =
+    Decode.andThen changedSubscription (Decode.field "subscription" (Decode.nullable Decode.string))
+
+
+changedSubscription : Maybe String -> Decode.Decoder (Maybe Subscription)
+changedSubscription text =
+    case text of
+        Just subscription ->
+            case decodeSubscription subscription of
+                Ok parsedSubscription ->
+                    Decode.succeed (Just parsedSubscription)
+
+                Err _ ->
+                    Decode.fail "malformed push subscription"
+
+        Nothing ->
+            Decode.succeed Nothing
+
+
+-- | A `notificationOpened` broadcast: the tag of the notification the user tapped.
+openedInbound : Decode.Decoder String
+openedInbound =
+    Decode.andThen (\_ -> Decode.field "notification" Decode.string) (broadcast "notificationOpened")
+
+
+-- | Succeeds on an `ok` frame carrying exactly the `expected` event.
+broadcast : String -> Decode.Decoder ()
+broadcast expected =
+    Decode.andThen (broadcastEvent expected) (Decode.field "ok" Decode.bool)
+
+
+broadcastEvent : String -> Bool -> Decode.Decoder ()
+broadcastEvent expected ok =
+    if ok then
+        Decode.andThen (expectEvent expected) (Decode.field "event" Decode.string)
+
+    else
+        Decode.fail "not a push broadcast"
+
+
+expectEvent : String -> String -> Decode.Decoder ()
+expectEvent expected event =
+    if event == expected then
+        Decode.succeed ()
+
+    else
+        Decode.fail "unexpected push event"

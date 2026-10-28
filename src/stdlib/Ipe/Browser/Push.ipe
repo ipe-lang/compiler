@@ -1,0 +1,120 @@
+-- | Ipe.Browser.Push — subscribe this device to sealed push over `Ipe.Ffi.Js` ports.
+--
+-- A push subscription is what an app server needs to reach this device while
+-- the app is closed. Every push message is encrypted end to end to keys the
+-- receiving device generated, so the push provider only relays ciphertext. In a
+-- browser the subscription comes from the Push API; in a mobile shell it comes
+-- from the shell's native push service (APNs or FCM). Either way it reaches the
+-- app as one opaque `Subscription` with one canonical text, `subscriptionText`,
+-- which the app posts to its server.
+--
+-- Importing this reserved `Ipe.Browser.<Api>` module discloses `js-port:push`
+-- (import-derived, keyed on the canonical `Ipe.Browser.Push` path prefix via
+-- `WebCapability::for_browser_module`, alias-immune); only the top-level app's
+-- `[capabilities] accepts` set can grant it.
+--
+-- The two layers:
+--
+--   * `Ipe.Browser.Push.Internals` publishes the parser and encoder of the
+--     canonical subscription text and the reply decoders the port runs.
+--   * this module is the high-level layer: `applicationKey` parses the app
+--     server's public key, `subscribe` / `current` / `unsubscribe` are
+--     `Task Error` requests, and `changes` / `opened` are the inbound
+--     subscriptions for a changed subscription and a tapped notification.
+--
+-- A refusal on any path is a typed `Err`: a denied permission is
+-- `Error.permissionDenied`, a device or browser without push is
+-- `Error.unavailable`, a dismissed prompt is `Error.unavailable` with its own
+-- message, a request the host refused is `Error.invalidInput`, and a host
+-- ceiling is `Error.limitExceeded`.
+module Ipe.Browser.Push exposing
+    ( ApplicationKey
+    , Subscription
+    , applicationKey
+    , subscribe
+    , current
+    , unsubscribe
+    , subscriptionText
+    , changes
+    , opened
+    )
+
+import Ipe.Browser.Push.Internals as Internals
+import Ipe.Error as Error exposing (Error)
+import Ipe.Maybe exposing (Maybe(..))
+import Ipe.Result exposing (Result)
+import Ipe.Tea.Web.Sub as Sub
+
+
+-- | An application server's public key (its VAPID key): a 65-byte uncompressed
+-- P-256 point. The only constructor is `applicationKey`.
+type alias ApplicationKey =
+    Internals.ApplicationKey
+
+
+-- | This device's push subscription. Opaque; `subscriptionText` renders it for
+-- the app server.
+type alias Subscription =
+    Internals.Subscription
+
+
+-- | `applicationKey text` — parse the app server's public key from its
+-- unpadded base64url text.
+--
+-- `Ok` only for 87 characters of base64url, in their one canonical spelling,
+-- that decode to 65 bytes starting with the uncompressed point tag. Anything
+-- else, a 64-byte value, a padded or standard-alphabet spelling, is an
+-- `Error.invalidInput`. In a browser the key is also checked to lie on the
+-- P-256 curve before it reaches the Push API.
+applicationKey : String -> Result Error ApplicationKey
+applicationKey text =
+    Internals.applicationKey text
+
+
+-- | `subscribe key` — subscribe this device to push from the server that holds
+-- `key`, asking for permission when it has not been granted.
+--
+-- In a browser this needs the app's push service worker to be registered; with
+-- no worker the `Task` fails with `Error.unavailable`.
+subscribe : ApplicationKey -> Task Error Subscription
+subscribe key =
+    Internals.requestSubscribe key
+
+
+-- | `current` — this device's push subscription, or `Nothing` when it has none.
+-- Never asks for permission.
+current : Task Error (Maybe Subscription)
+current =
+    Internals.requestCurrent
+
+
+-- | `unsubscribe` — drop this device's push subscription. Succeeds when the
+-- device has none.
+unsubscribe : Task Error ()
+unsubscribe =
+    Internals.requestUnsubscribe
+
+
+-- | `subscriptionText subscription` — the canonical text to post to the app
+-- server, which parses it again before it sends a push.
+--
+-- The text is a capability: whoever holds it can send this device a push the
+-- device decrypts. Send it to the app server over an authenticated request and
+-- never log it.
+subscriptionText : Subscription -> String
+subscriptionText subscription =
+    Internals.encodeSubscription subscription
+
+
+-- | `changes toMsg` — the inbound subscription for a subscription the host
+-- replaced or dropped: `Just` the new one, or `Nothing` when the device has none.
+changes : (Maybe Subscription -> msg) -> Sub.Sub msg
+changes toMsg =
+    Internals.subscribeChanges toMsg
+
+
+-- | `opened toMsg` — the inbound subscription for a tapped push notification,
+-- carrying its tag.
+opened : (String -> msg) -> Sub.Sub msg
+opened toMsg =
+    Internals.subscribeOpened toMsg

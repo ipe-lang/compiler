@@ -755,6 +755,22 @@ const IPE_BROWSER_NOTIFICATION: &str = include_str!("../Ipe/Browser/Notification
 const IPE_BROWSER_NOTIFICATION_INTERNALS: &str =
     include_str!("../Ipe/Browser/Notification/Internals.ipe");
 
+/// `Ipe.Browser.Push` — subscribe the device to sealed push over `Ipe.Ffi.Js` ports
+/// (compiled source): the opaque `ApplicationKey` and `Subscription`, correlated
+/// `subscribe` / `current` / `unsubscribe` requests, and the `changes` / `opened`
+/// inbound subscriptions. Importing it discloses `js-port:push` (import-derived,
+/// keyed on the canonical `Ipe.Browser.Push` path prefix via
+/// `WebCapability::for_browser_module`). Registered in [`COMPILED_STD_MODULES`]
+/// (NOT `MODULES`); NOT in `STDLIB_MODULE_QUALIFIERS`.
+const IPE_BROWSER_PUSH: &str = include_str!("../Ipe/Browser/Push.ipe");
+
+/// `Ipe.Browser.Push.Internals` — the low-level push port surface: the one parser
+/// and one encoder of the canonical subscription text and the reply decoders the
+/// port runs. Importing it discloses the same `js-port:push` axis (the prefix key
+/// covers the submodule). Registered in [`COMPILED_STD_MODULES`] (NOT `MODULES`);
+/// NOT in `STDLIB_MODULE_QUALIFIERS`.
+const IPE_BROWSER_PUSH_INTERNALS: &str = include_str!("../Ipe/Browser/Push/Internals.ipe");
+
 /// `Ipe.Browser.Storage` — read from and write to Web Storage (`localStorage`)
 /// over `Ipe.Ffi.Js` ports (compiled source), spanning BOTH port directions: an
 /// outbound `JsCmd` request (`get` / `set` / `remove` / `clear`) and an inbound
@@ -1621,6 +1637,14 @@ pub const COMPILED_STD_MODULES: &[CompiledStdModule] = &[
     CompiledStdModule {
         dotted: "Ipe.Browser.Notification.Internals",
         source: IPE_BROWSER_NOTIFICATION_INTERNALS,
+    },
+    CompiledStdModule {
+        dotted: "Ipe.Browser.Push",
+        source: IPE_BROWSER_PUSH,
+    },
+    CompiledStdModule {
+        dotted: "Ipe.Browser.Push.Internals",
+        source: IPE_BROWSER_PUSH_INTERNALS,
     },
     CompiledStdModule {
         dotted: "Ipe.Browser.Storage",
