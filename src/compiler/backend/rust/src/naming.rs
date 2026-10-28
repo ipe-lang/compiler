@@ -189,29 +189,32 @@ pub fn mangle_reserved(name: String) -> String {
     }
 }
 
-/// The prefix that moves an `_`-leading user local out of the backend temporary namespace.
-pub const USER_LOCAL_ESCAPE: &str = "__u";
+/// The prefix that moves every `_`-bearing user local out of the backend's own value namespace.
+pub const USER_LOCAL_ESCAPE: &str = "__u_";
 
 /// The Rust spelling of a user local binder: a parameter, a `let` or pattern binder, a closure parameter.
 ///
-/// The backend mints its own locals with a leading `_` (`__ipe_bind_0`,
-/// `__ipe_box_0`, `__tco_0`, `_ipe_recursion_guard`, ...), and the lexer admits
-/// a user identifier spelled the same, so a verbatim user local could be
-/// shadowed by a temporary. A user identifier that starts with `_`, other than
-/// the bare wildcard `_`, is therefore emitted as [`USER_LOCAL_ESCAPE`]
-/// followed by the identifier, so its image starts with `__u_`, which no
-/// backend temporary does; every other identifier passes through.
-/// [`mangle_reserved`] then applies to the result. The image still starts with
-/// `_`, so an unused `_x` stays exempt from Rust's unused-variable lint.
+/// A Rust `let` local shadows a same-named fn item, and the backend refers to
+/// globals bare: every kernel call (`string_from_int(..)`), every user
+/// top-level function (`main_depth(..)`), and its own temporaries
+/// (`__ipe_bind_0`, `__tco_0`, `_ipe_recursion_guard`, ...). The lexer admits a
+/// user identifier spelled like any of them. Every such global carries an `_`
+/// followed by a letter or digit and none starts with `__u_`
+/// ([`ipe_kernels::outside_user_local_namespace`], a build-time assertion over
+/// the kernel table). So a user identifier holding an `_`, other than the bare
+/// wildcard `_`, is emitted as [`USER_LOCAL_ESCAPE`] followed by the
+/// identifier; every other identifier passes through. [`mangle_reserved`] then
+/// applies to the result. An `_`-leading image still starts with `_`, so an
+/// unused `_x` stays exempt from Rust's unused-variable lint.
 ///
-/// The fold is injective: the escaped class gains one fixed prefix, the
-/// pass-through class never starts with `_` except the bare `_`, and the
-/// escaped image always starts with `__u_`, so the two images are disjoint. A
-/// keyword stem never starts with `_`, so the escape and the keyword mangle
-/// touch disjoint inputs.
+/// Every image is therefore `_`, `_`-free, a keyword followed only by `_`s, or
+/// starts with `__u_`, and none of those shapes is a backend global. The fold
+/// is injective: the escaped class gains one fixed prefix, the pass-through
+/// class never starts with `__u_`, and a keyword stem never contains `_`, so
+/// the escape and the keyword mangle touch disjoint inputs.
 #[must_use]
 pub fn local_ident(name: &str) -> String {
-    if name.starts_with('_') && name != "_" {
+    if name.contains('_') && name != "_" {
         mangle_reserved(format!("{USER_LOCAL_ESCAPE}{name}"))
     } else {
         mangle_reserved(name.to_owned())
@@ -667,6 +670,12 @@ mod tests {
             "__update_shared",
             "count",
             "match_x",
+            "string_from_int",
+            "i_f0",
+            "pdate_shared",
+            "u_x",
+            "u__x",
+            "_u_x",
         ]
         .iter()
         .map(|s| (*s).to_owned())
@@ -719,14 +728,70 @@ mod tests {
                 "{input:?} folds to the temporary {out:?}"
             );
         }
-        assert_eq!(super::local_ident("__ipe_bind_0"), "__u__ipe_bind_0");
+        assert_eq!(super::local_ident("__ipe_bind_0"), "__u___ipe_bind_0");
         assert_eq!(super::local_ident("count"), "count");
         assert_eq!(super::local_ident("match"), "match_");
-        assert_eq!(super::local_ident("_x"), "__u_x");
+        assert_eq!(super::local_ident("_x"), "__u__x");
         assert_eq!(super::local_ident("_"), "_");
         assert_eq!(
             super::local_ident("_ipe_recursion_guard"),
-            "__u_ipe_recursion_guard"
+            "__u__ipe_recursion_guard"
         );
+    }
+
+    /// No user local folds onto a name the backend refers to bare: a kernel
+    /// runtime name or a user top-level function.
+    ///
+    /// Each image fails [`ipe_kernels::outside_user_local_namespace`], which
+    /// every kernel runtime name and every `module_value` satisfies, so a `let`
+    /// binder can never shadow a bare call.
+    #[test]
+    fn local_ident_is_disjoint_from_bare_globals() {
+        let mut inputs = local_ident_inputs();
+        for k in KernelFn::ALL {
+            inputs.push(kernel_name(*k).to_owned());
+        }
+        for name in [
+            "main_depth",
+            "user_auth_x",
+            "ipe_main",
+            "curry2",
+            "i_f0",
+            "pdate_shared",
+        ] {
+            inputs.push(name.to_owned());
+        }
+        for input in &inputs {
+            let out = super::local_ident(input);
+            assert!(
+                !ipe_kernels::outside_user_local_namespace(&out),
+                "{input:?} folds to {out:?}, a spelling a backend global may carry"
+            );
+        }
+        for k in KernelFn::ALL {
+            assert!(
+                ipe_kernels::outside_user_local_namespace(kernel_name(*k)),
+                "{k:?} has a runtime name a user local can spell"
+            );
+        }
+        for (module, name) in [
+            (&["Main"][..], "main"),
+            (&["Main"][..], "depth"),
+            (&["Main"][..], "x"),
+            (&["Auth"][..], "hashPassword"),
+            (&["A", "B_c"][..], "d"),
+            (&["Main"][..], "Row"),
+            (&["Main"][..], "loop"),
+        ] {
+            let value = module_value(module, name);
+            assert!(
+                ipe_kernels::outside_user_local_namespace(&value),
+                "module_value({module:?}, {name:?}) = {value:?} is a spelling a user local can take"
+            );
+        }
+        assert_eq!(super::local_ident("string_from_int"), "__u_string_from_int");
+        assert_eq!(super::local_ident("i_f0"), "__u_i_f0");
+        assert_eq!(super::local_ident("match_"), "__u_match_");
+        assert_eq!(super::local_ident("curry2"), "curry2");
     }
 }

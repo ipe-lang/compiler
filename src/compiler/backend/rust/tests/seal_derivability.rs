@@ -1278,11 +1278,11 @@ fn computed_capture_let_is_emitted_outside_every_adapted_closure() -> DResult<()
         let (_, after) = src.split_once(runtime_path).unwrap_or(("", ""));
         let (head, tail_text) = after.split_once("move |").unwrap_or(("", ""));
         assert!(
-            head.contains("let cap_0 ="),
+            head.contains("let __u_cap_0 ="),
             "{kernel:?}: the computed capture `let` must precede the arm's `move |`:\n{src}"
         );
         assert!(
-            !tail_text.contains("let cap_0 ="),
+            !tail_text.contains("let __u_cap_0 ="),
             "{kernel:?}: the computed capture `let` must not re-run inside the closure:\n{src}"
         );
     }

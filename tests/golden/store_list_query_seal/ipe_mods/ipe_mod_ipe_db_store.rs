@@ -403,7 +403,7 @@ pub(crate) fn user_ipe_db_store_row_codec(
                         + Sync
                         + 'static,
                 > = ::std::sync::Arc::new(
-                    move |arg_13: Rec_| -> Decoder<HashMap<String, IpeMaybe<String>>> {
+                    move |__u_arg_13: Rec_| -> Decoder<HashMap<String, IpeMaybe<String>>> {
                         config_dict(config_nullable(json_decode_string::<IpeError>()))
                     },
                 );

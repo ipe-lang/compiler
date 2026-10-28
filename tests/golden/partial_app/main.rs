@@ -265,20 +265,20 @@ pub fn ipe_main() -> IpeTask<()> {
         ({
             let h = {
                 let __ipe_fn: Box<dyn Fn(i64) -> i64 + Send + Sync + 'static> =
-                    Box::new(move |eta_2: i64| -> i64 { (g)(2i64, eta_2) });
+                    Box::new(move |__u_eta_2: i64| -> i64 { (g)(2i64, __u_eta_2) });
                 __ipe_fn
             };
             ({
                 let boundPartial = (h)(3i64);
                 ({
                     let overPartial = ({
-                        let eta_1: i64 = 3i64;
-                        (crate::main_f(10i64))(20i64, eta_1)
+                        let __u_eta_1: i64 = 3i64;
+                        (crate::main_f(10i64))(20i64, __u_eta_1)
                     });
                     ({
                         let pipePartial = ({
-                            let eta_0: i64 = 100i64;
-                            crate::main_add3(1i64, 2i64, eta_0)
+                            let __u_eta_0: i64 = 100i64;
+                            crate::main_add3(1i64, 2i64, __u_eta_0)
                         });
                         task_and_then(
                             io_println(string_from_int(boundPartial)),

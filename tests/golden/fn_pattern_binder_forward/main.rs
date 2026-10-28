@@ -282,7 +282,7 @@ pub fn main_run(codec: MainCodec, xs: Vec<i64>) -> Vec<i64> {
             ({
                 let f = {
                     let __ipe_fn: ::std::sync::Arc<dyn Fn(i64) -> i64 + Send + Sync + 'static> =
-                        ::std::sync::Arc::new(move |eta_1: i64| -> i64 { (f)(eta_1) });
+                        ::std::sync::Arc::new(move |__u_eta_1: i64| -> i64 { (f)(__u_eta_1) });
                     __ipe_fn
                 };
                 list_map_consume(
@@ -298,8 +298,8 @@ pub fn main_run(codec: MainCodec, xs: Vec<i64>) -> Vec<i64> {
                                             {
                                                 let __ipe_fn: Box<
                                                     dyn Fn(i64) -> i64 + Send + Sync + 'static,
-                                                > = Box::new(move |eta_0: i64| -> i64 {
-                                                    (f)(eta_0)
+                                                > = Box::new(move |__u_eta_0: i64| -> i64 {
+                                                    (f)(__u_eta_0)
                                                 });
                                                 __ipe_fn
                                             }

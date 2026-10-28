@@ -2,7 +2,7 @@
 //!
 //! The backend mints locals such as `__ipe_bind_0`, `__ipe_box_0` and
 //! `_ipe_recursion_guard`, and the lexer admits a user identifier spelled the
-//! same. Every `_`-leading user local other than the bare `_` is emitted
+//! same. Every `_`-bearing user local other than the bare `_` is emitted
 //! escaped as `__u_…`, outside the temporary namespace, so the temporary can no
 //! longer shadow it: without the escape `bind-shadow` prints `5` (a silent
 //! miscompile), and `bind-type`, `box-shadow` and `guard-shadow` pass `ipe` but
@@ -65,7 +65,7 @@ fn assert_runs(name: &str, expected: &str) {
 
 #[test]
 fn a_param_spelled_like_the_tuple_temp_is_escaped() {
-    assert_emits_escaped("bind-shadow", "__u__ipe_bind_0");
+    assert_emits_escaped("bind-shadow", "__u___ipe_bind_0");
 }
 
 #[test]
@@ -75,18 +75,18 @@ fn a_param_spelled_like_the_tuple_temp_keeps_its_value() {
 
 #[test]
 fn a_param_spelled_like_the_tuple_temp_keeps_its_type() {
-    assert_emits_escaped("bind-type", "__u__ipe_bind_0");
+    assert_emits_escaped("bind-type", "__u___ipe_bind_0");
     assert_runs("bind-type", "hi0\n");
 }
 
 #[test]
 fn a_binder_spelled_like_the_box_temp_stays_distinct() {
-    assert_emits_escaped("box-shadow", "__u__ipe_box_0");
+    assert_emits_escaped("box-shadow", "__u___ipe_box_0");
     assert_runs("box-shadow", "42\n");
 }
 
 #[test]
 fn a_param_spelled_like_the_recursion_guard_keeps_its_value() {
-    assert_emits_escaped("guard-shadow", "__u_ipe_recursion_guard");
+    assert_emits_escaped("guard-shadow", "__u__ipe_recursion_guard");
     assert_runs("guard-shadow", "42\n");
 }

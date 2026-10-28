@@ -272,7 +272,7 @@ pub fn main_enum_name<T1: 'static + Send + Sync + Clone>(
 ) -> IpeMaybe<String> {
     let _ipe_recursion_guard = crate::recursion_guard();
     ({
-        let eta_0: IpeMaybe<(T1, String)> =
+        let __u_eta_0: IpeMaybe<(T1, String)> =
             list_find(
                 {
                     let __ipe_fn: Box<dyn Fn((T1, String)) -> bool + Send + Sync + 'static> =
@@ -286,7 +286,7 @@ pub fn main_enum_name<T1: 'static + Send + Sync + Clone>(
                 },
                 pairs,
             );
-        ipe_maybe_map(eta_0, {
+        ipe_maybe_map(__u_eta_0, {
             let __ipe_fn: Box<dyn Fn((T1, String)) -> String + Send + Sync + 'static> =
                 Box::new(move |pair: (T1, String)| -> String {
                     ({

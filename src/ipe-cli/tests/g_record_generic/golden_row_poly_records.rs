@@ -384,7 +384,7 @@ fn accessor_ipec_accepts_and_resolves_concrete_getter() {
          main.rs:\n{emitted}"
     );
     assert!(
-        emitted.contains("move |ipe_accessor_arg: RecAgeName| -> String"),
+        emitted.contains("move |__u_ipe_accessor_arg: RecAgeName| -> String"),
         "the accessor `.name` must lower to a CONCRETE getter closure over the \
          resolved superset struct (the A7 exact-key path), not a generic; got \
          main.rs:\n{emitted}"

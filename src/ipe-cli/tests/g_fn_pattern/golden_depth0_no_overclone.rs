@@ -4,13 +4,13 @@
 //! must not receive a spurious depth-0 pre-clone. Without the fix, the open-coded
 //! `n == 1` binder branch called `force_shared_capture_clones` directly, which
 //! wrapped EVERY directly-referencing lambda — including the OUTERMOST
-//! (depth-0) pipeline-synthesized `move |eta_0|` closure — minting a spurious
+//! (depth-0) pipeline-synthesized `move |__u_eta_0|` closure — minting a spurious
 //! depth-0 relay shadow around a last-use single-boundary capture.
 //!
 //! The fix routes the param through `apply_move_ownership`, whose
 //! `rewrite_multiuse_clones(remaining = 1)` leaves the depth-0 boundary bare
 //! (no `force_shared_capture_clones` at the binder site). The spurious
-//! depth-0 `move |eta_0|` over-clone closure disappears: `eta_0` lowers to a
+//! depth-0 `move |__u_eta_0|` over-clone closure disappears: `eta_0` lowers to a
 //! plain `let` value, not a capturing closure.
 //!
 //! Run:
@@ -34,8 +34,8 @@ fn golden_dir(root: &Path) -> PathBuf {
 
 /// ipe-0: the compiler accepts the program AND does NOT mint the spurious
 /// depth-0 over-clone closure. The pipeline stage `eta_0` must be a plain
-/// `let` value binding (`let eta_0: IpeTask`), never a capturing
-/// `move |eta_0|` closure — the over-clone signature.
+/// `let` value binding (`let __u_eta_0: IpeTask`), never a capturing
+/// `move |__u_eta_0|` closure — the over-clone signature.
 #[test]
 fn i225_depth0_no_overclone_ipec_accepts_lean() {
     let root = repo_root();
@@ -54,19 +54,19 @@ fn i225_depth0_no_overclone_ipec_accepts_lean() {
 
     let emitted = crate::support::read_all_emitted_src(&out);
 
-    // The over-clone signature: a spurious depth-0 `move |eta_0|` closure that
+    // The over-clone signature: a spurious depth-0 `move |__u_eta_0|` closure that
     // captured `msg`. Post-fix `eta_0` is a plain value binding, so no
-    // `move |eta_0` closure may appear.
+    // `move |__u_eta_0` closure may appear.
     assert!(
-        !emitted.contains("move |eta_0"),
+        !emitted.contains("move |__u_eta_0"),
         "depth-0 pipeline stage must be a plain `let` value, not a spurious \
-         over-clone `move |eta_0|` closure; got emitted user source:\n{emitted}"
+         over-clone `move |__u_eta_0|` closure; got emitted user source:\n{emitted}"
     );
     // `eta_0` still exists — but as a value binding, confirming the stage
     // lowered leanly rather than being elided entirely.
     assert!(
-        emitted.contains("let eta_0"),
-        "the pipeline stage should lower to a plain `let eta_0` value binding; \
+        emitted.contains("let __u_eta_0"),
+        "the pipeline stage should lower to a plain `let __u_eta_0` value binding; \
          got emitted user source:\n{emitted}"
     );
 }

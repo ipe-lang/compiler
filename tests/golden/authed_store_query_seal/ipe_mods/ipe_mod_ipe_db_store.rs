@@ -904,8 +904,8 @@ pub(crate) fn user_ipe_db_store_fold_conds(
                     + Sync
                     + 'static,
             > = ::std::sync::Arc::new(
-                move |eta_0: ipe_runtime::db::SqlFragment, eta_1: ipe_runtime::db::SqlFragment| -> ipe_runtime::db::SqlFragment {
-                    (join)(eta_0, eta_1)
+                move |__u_eta_0: ipe_runtime::db::SqlFragment, __u_eta_1: ipe_runtime::db::SqlFragment| -> ipe_runtime::db::SqlFragment {
+                    (join)(__u_eta_0, __u_eta_1)
                 },
             );
             __ipe_fn
@@ -933,8 +933,8 @@ pub(crate) fn user_ipe_db_store_fold_conds(
                                             + Sync
                                             + 'static,
                                     > = Box::new(
-                                        move |eta_0: ipe_runtime::db::SqlFragment, eta_1: ipe_runtime::db::SqlFragment| -> ipe_runtime::db::SqlFragment {
-                                            (join.clone())(eta_0, eta_1)
+                                        move |__u_eta_0: ipe_runtime::db::SqlFragment, __u_eta_1: ipe_runtime::db::SqlFragment| -> ipe_runtime::db::SqlFragment {
+                                            (join.clone())(__u_eta_0, __u_eta_1)
                                         },
                                     );
                                     __ipe_fn
@@ -1648,8 +1648,8 @@ pub(crate) fn user_ipe_db_store_fold_preds(
                     + Sync
                     + 'static,
             > = ::std::sync::Arc::new(
-                move |eta_0: ipe_runtime::db::SqlFragment, eta_1: ipe_runtime::db::SqlFragment| -> ipe_runtime::db::SqlFragment {
-                    (join)(eta_0, eta_1)
+                move |__u_eta_0: ipe_runtime::db::SqlFragment, __u_eta_1: ipe_runtime::db::SqlFragment| -> ipe_runtime::db::SqlFragment {
+                    (join)(__u_eta_0, __u_eta_1)
                 },
             );
             __ipe_fn
@@ -1680,8 +1680,8 @@ pub(crate) fn user_ipe_db_store_fold_preds(
                                             + Sync
                                             + 'static,
                                     > = Box::new(
-                                        move |eta_0: ipe_runtime::db::SqlFragment, eta_1: ipe_runtime::db::SqlFragment| -> ipe_runtime::db::SqlFragment {
-                                            (join.clone())(eta_0, eta_1)
+                                        move |__u_eta_0: ipe_runtime::db::SqlFragment, __u_eta_1: ipe_runtime::db::SqlFragment| -> ipe_runtime::db::SqlFragment {
+                                            (join.clone())(__u_eta_0, __u_eta_1)
                                         },
                                     );
                                     __ipe_fn
