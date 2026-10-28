@@ -223,6 +223,24 @@ pub const SERDE_SAPHYR: PinnedCrate = PinnedCrate {
     default_features: false,
     features: &["deserialize"],
 };
+/// `serde_json` with insertion-ordered objects, so every model (dependency,
+/// vendored, wasm, jail) encodes an object's keys in the order it was built.
+pub const SERDE_JSON: PinnedCrate = PinnedCrate {
+    spec: CrateSpec {
+        name: "serde_json",
+        version: "1",
+    },
+    default_features: true,
+    features: &["preserve_order"],
+};
+// The map behind the runtime's `JsonMap`. Not surgery-emitted (the vendored and
+// wasm templates spell it); consulted only by the drift guards under
+// `cfg(test)`.
+#[cfg(test)]
+pub const INDEXMAP: CrateSpec = CrateSpec {
+    name: "indexmap",
+    version: "2",
+};
 pub const FLATE2: CrateSpec = CrateSpec {
     name: "flate2",
     version: "1",
@@ -347,6 +365,8 @@ pub const ALL: &[CrateSpec] = &[
     CHRONO_TZ,
     RUST_DECIMAL,
     UNICODE_GENERAL_CATEGORY,
+    SERDE_JSON.spec,
+    INDEXMAP,
 ];
 
 /// Every crate whose feature set is fixed here.
@@ -364,12 +384,13 @@ pub const ALL_PINNED: &[PinnedCrate] = &[
     AXUM,
     TOWER_HTTP,
     RSA,
+    SERDE_JSON,
 ];
 
 #[cfg(test)]
 mod tests {
     use super::{
-        ALL, ALL_PINNED, LETTRE, PinnedCrate, REQWEST, SERDE_SAPHYR, SQLX, SQLX_DRIVERS,
+        ALL, ALL_PINNED, INDEXMAP, LETTRE, PinnedCrate, REQWEST, SERDE_SAPHYR, SQLX, SQLX_DRIVERS,
         WEBPKI_ROOTS,
     };
     use std::collections::{BTreeMap, BTreeSet};
@@ -384,7 +405,7 @@ mod tests {
             assert!(!spec.name.is_empty(), "empty crate name in ALL");
             assert!(!spec.version.is_empty(), "empty version for {}", spec.name);
         }
-        assert_eq!(ALL.len(), 37, "expected 37 surgery-emitted crate specs");
+        assert_eq!(ALL.len(), 39, "expected 39 surgery-emitted crate specs");
         for pinned in ALL_PINNED {
             assert!(
                 ALL.iter().any(|spec| spec.name == pinned.spec.name),
@@ -514,6 +535,64 @@ mod tests {
             problems.is_empty(),
             "crate drift between the SSOT and the manifests:\n  {}",
             problems.join("\n  ")
+        );
+    }
+
+    /// Every vendored manifest the backend emits spells each pinned crate it
+    /// names exactly as the SSOT renders it, and the `indexmap` version the
+    /// runtime builds with.
+    #[test]
+    fn a_vendored_manifest_names_every_pin_exactly() {
+        let manifests = [
+            ("templates/Cargo.toml", crate::project::CARGO_TOML),
+            (
+                "project.rs WASM_CARGO_TOML",
+                crate::project::WASM_CARGO_TOML,
+            ),
+        ];
+        let mut problems = Vec::new();
+        for (origin, text) in manifests {
+            for pinned in ALL_PINNED {
+                if dep_line(text, pinned.spec.name).is_some() {
+                    problems.extend(pin_drift(pinned, text, origin));
+                }
+            }
+            if dep_line(text, super::SERDE_JSON.spec.name).is_none() {
+                problems.push(format!("serde_json: absent from {origin}"));
+            }
+            let indexmap = dep_line(text, INDEXMAP.name)
+                .and_then(|line| line.split_once('='))
+                .and_then(|(_, value)| version_of(value));
+            if indexmap.as_deref() != Some(INDEXMAP.version) {
+                problems.push(format!(
+                    "indexmap: SSOT = {}, {origin} = {indexmap:?}",
+                    INDEXMAP.version
+                ));
+            }
+        }
+        assert!(
+            problems.is_empty(),
+            "vendored manifest drift from the SSOT:\n  {}",
+            problems.join("\n  ")
+        );
+    }
+
+    /// A vendored manifest whose `serde_json` line drops `preserve_order` is
+    /// refused by the pin check the vendored-manifest test runs.
+    #[test]
+    fn a_vendored_manifest_without_preserve_order_is_refused() {
+        let drifted = "[dependencies]\nserde_json = \"1\"\nindexmap = \"2\"\n";
+        assert!(
+            !pin_drift(&super::SERDE_JSON, drifted, "fixture").is_empty(),
+            "a serde_json line without preserve_order must drift"
+        );
+        let pinned = format!(
+            "[dependencies]\n{}\n",
+            super::SERDE_JSON.dependency_line(&[])
+        );
+        assert_eq!(
+            pin_drift(&super::SERDE_JSON, &pinned, "fixture"),
+            Vec::<String>::new()
         );
     }
 

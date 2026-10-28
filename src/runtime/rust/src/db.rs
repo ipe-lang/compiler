@@ -813,7 +813,7 @@ where
     for<'a> Option<Vec<u8>>: sqlx::Decode<'a, R::Database> + sqlx::Type<R::Database>,
 {
     let cols = row.columns();
-    let mut map = serde_json::Map::new();
+    let mut map = super::json::JsonMap::new();
     for (i, col) in cols.iter().enumerate() {
         map.insert(col.name().to_string(), read_cell(row, i)?.into_json());
     }
@@ -10555,28 +10555,28 @@ mod tests {
         let dec = db_decode_int::<String>("n".to_string());
 
         // In-range: a decimal string truncates toward zero, still Ok.
-        let in_range = serde_json::json!({ "n": "3.7" });
+        let in_range = crate::json_val::json_val!({ "n": "3.7" });
         match (dec.run)(&in_range) {
             IpeResult::Ok(i) => assert_eq!(i, 3),
             IpeResult::Err(e) => panic!("in-range decode failed: {:?}", e),
         }
 
         // In-range: a JSON float that is integral and representable decodes.
-        let in_range_num = serde_json::json!({ "n": 42.0 });
+        let in_range_num = crate::json_val::json_val!({ "n": 42.0 });
         match (db_decode_int::<String>("n".to_string()).run)(&in_range_num) {
             IpeResult::Ok(i) => assert_eq!(i, 42),
             IpeResult::Err(e) => panic!("in-range numeric decode failed: {:?}", e),
         }
 
         // Out-of-range: `1e30` past i64::MAX must REJECT, not saturate to i64::MAX.
-        let over = serde_json::json!({ "n": 1e30 });
+        let over = crate::json_val::json_val!({ "n": 1e30 });
         match (db_decode_int::<String>("n".to_string()).run)(&over) {
             IpeResult::Ok(i) => panic!("out-of-range float saturated to {i} instead of erroring"),
             IpeResult::Err(_) => {}
         }
 
         // Out-of-range as a decimal string is rejected on the same path.
-        let over_str = serde_json::json!({ "n": "1e30" });
+        let over_str = crate::json_val::json_val!({ "n": "1e30" });
         match (db_decode_int::<String>("n".to_string()).run)(&over_str) {
             IpeResult::Ok(i) => panic!("out-of-range string saturated to {i} instead of erroring"),
             IpeResult::Err(_) => {}
@@ -10584,14 +10584,14 @@ mod tests {
 
         // i64::MIN-1 rounds to i64::MIN as f64; a non-strict lower bound would
         // admit it and saturate to i64::MIN. It must reject.
-        let under = serde_json::json!({ "n": "-9223372036854775809" });
+        let under = crate::json_val::json_val!({ "n": "-9223372036854775809" });
         match (db_decode_int::<String>("n".to_string()).run)(&under) {
             IpeResult::Ok(i) => panic!("i64::MIN-1 saturated to {i} instead of erroring"),
             IpeResult::Err(_) => {}
         }
 
         // The exact boundaries still decode through the integer path.
-        let min = serde_json::json!({ "n": "-9223372036854775808" });
+        let min = crate::json_val::json_val!({ "n": "-9223372036854775808" });
         match (db_decode_int::<String>("n".to_string()).run)(&min) {
             IpeResult::Ok(i) => assert_eq!(i, i64::MIN),
             IpeResult::Err(e) => panic!("i64::MIN decode failed: {:?}", e),
@@ -10705,7 +10705,7 @@ mod tests {
         // Verify db_decode_money parses "USD 12.34" → (Decimal(12.34), "USD").
         use rust_decimal::Decimal as RD;
         use std::str::FromStr;
-        let val = serde_json::json!({ "price": "USD 12.34" });
+        let val = crate::json_val::json_val!({ "price": "USD 12.34" });
         let result = (db_decode_money::<String>("price".to_string()).run)(&val);
         match result {
             IpeResult::Ok((amount, code)) => {
@@ -10716,14 +10716,14 @@ mod tests {
         }
 
         // NULL → Err.
-        let val_null = serde_json::json!({ "price": null });
+        let val_null = crate::json_val::json_val!({ "price": null });
         assert!(matches!(
             (db_decode_money::<String>("price".to_string()).run)(&val_null),
             IpeResult::Err(_)
         ));
 
         // Bad format → Err.
-        let val_bad = serde_json::json!({ "price": "NODECIMAL" });
+        let val_bad = crate::json_val::json_val!({ "price": "NODECIMAL" });
         assert!(matches!(
             (db_decode_money::<String>("price".to_string()).run)(&val_bad),
             IpeResult::Err(_)
@@ -10735,7 +10735,7 @@ mod tests {
         // Verify db_decode_decimal parses "3.14159" → Decimal(3.14159).
         use rust_decimal::Decimal as RD;
         use std::str::FromStr;
-        let val = serde_json::json!({ "amount": "3.14159" });
+        let val = crate::json_val::json_val!({ "amount": "3.14159" });
         let result = (db_decode_decimal::<String>("amount".to_string()).run)(&val);
         match result {
             IpeResult::Ok(d) => {
@@ -10745,21 +10745,21 @@ mod tests {
         }
 
         // NULL → Err.
-        let val_null = serde_json::json!({ "amount": null });
+        let val_null = crate::json_val::json_val!({ "amount": null });
         assert!(matches!(
             (db_decode_decimal::<String>("amount".to_string()).run)(&val_null),
             IpeResult::Err(_)
         ));
 
         // Non-numeric text → Err.
-        let val_bad = serde_json::json!({ "amount": "not-a-number" });
+        let val_bad = crate::json_val::json_val!({ "amount": "not-a-number" });
         assert!(matches!(
             (db_decode_decimal::<String>("amount".to_string()).run)(&val_bad),
             IpeResult::Err(_)
         ));
 
         // Missing column → Err.
-        let val_missing = serde_json::json!({ "other": "x" });
+        let val_missing = crate::json_val::json_val!({ "other": "x" });
         assert!(matches!(
             (db_decode_decimal::<String>("amount".to_string()).run)(&val_missing),
             IpeResult::Err(_)
@@ -11026,10 +11026,10 @@ mod tests {
             json,
             vec![
                 Some(JsonVal::Null),
-                Some(serde_json::json!("")),
-                Some(serde_json::json!(0)),
-                Some(serde_json::json!(1.5)),
-                Some(serde_json::json!("00ff")),
+                Some(crate::json_val::json_val!("")),
+                Some(crate::json_val::json_val!(0)),
+                Some(crate::json_val::json_val!(1.5)),
+                Some(crate::json_val::json_val!("00ff")),
                 Some(JsonVal::Bool(true)),
             ]
         );
@@ -11042,7 +11042,7 @@ mod tests {
             .expect("fetch finite cells");
         assert_eq!(
             row_to_json(&finite).ok(),
-            Some(serde_json::json!({
+            Some(crate::json_val::json_val!({
                 "nul": null, "empty": "", "zero": 0, "ratio": 1.5, "bytes": "00ff", "flag": true
             }))
         );
@@ -11060,11 +11060,11 @@ mod tests {
         assert!(FiniteF64::new(f64::NEG_INFINITY).is_none());
         assert_eq!(
             FiniteF64::new(-0.0).map(|f| Cell::Float(f).into_json()),
-            Some(serde_json::json!(-0.0))
+            Some(crate::json_val::json_val!(-0.0))
         );
         assert_eq!(
             FiniteF64::new(f64::MAX).map(|f| Cell::Float(f).into_json()),
-            Some(serde_json::json!(f64::MAX))
+            Some(crate::json_val::json_val!(f64::MAX))
         );
     }
 
