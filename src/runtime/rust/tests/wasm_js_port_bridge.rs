@@ -23,8 +23,8 @@ use std::rc::Rc;
 use ipe_runtime_rust::core::IpeResult;
 use ipe_runtime_rust::error::{IpeError, IpeErrorKind};
 use ipe_runtime_rust::js_port::{
-    DeliverOutcome, REQUEST_TIMEOUT_MS, deliver_outbound, js_request, js_send, js_subscribe,
-    push_inbound,
+    DeliverOutcome, REQUEST_TIMEOUT_MS, deliver_outbound, js_close_session, js_open_session,
+    js_request, js_send, js_subscribe, push_inbound,
 };
 use ipe_runtime_rust::json::{Decoder, json_decode_int};
 use ipe_runtime_rust::tea::{IpeCmd, IpeSub};
