@@ -157,7 +157,11 @@ const PORT_GLUE_JS_BRIDGE: &str = r#"  // The native bridge to a mobile shell. T
   function nativeRoute(cap, viaNative, viaWeb, refuse) {
     if (nativeState === "pending") {
       if (nativeQueue.length >= BRIDGE_MAX_OUTSTANDING) { refuse(REJECT_LIMIT); return; }
-      nativeQueue.push(function () { nativeRoute(cap, viaNative, viaWeb, refuse); });
+      // A queued call runs inside the handshake's settle, past `deliver`: a throw
+      // answers its own call unavailable and leaves the rest of the queue running.
+      nativeQueue.push(function () {
+        try { nativeRoute(cap, viaNative, viaWeb, refuse); } catch (_e) { refuse(REJECT_UNAVAILABLE); }
+      });
       return;
     }
     if (nativeState === "ready" && nativeCaps[cap] === true) { viaNative(); } else { viaWeb(); }
@@ -1973,6 +1977,20 @@ mod tests {
         ] {
             assert_eq!(js.matches(literal).count(), 1, "{literal}");
         }
+    }
+
+    /// A call queued behind the handshake that throws answers itself unavailable,
+    /// so neither it nor the calls queued after it wait out a deadline.
+    #[test]
+    fn a_queued_call_that_throws_answers_unavailable() {
+        let js = port_glue_js();
+        let guarded = "try { nativeRoute(cap, viaNative, viaWeb, refuse); } catch (_e) { refuse(REJECT_UNAVAILABLE); }";
+        assert_eq!(js.matches(guarded).count(), 1);
+        let queue_pushes: Vec<&str> = js
+            .lines()
+            .filter(|line| line.contains("nativeQueue.push("))
+            .collect();
+        assert_eq!(queue_pushes, ["      nativeQueue.push(function () {"]);
     }
 
     /// A bridge refusal becomes a notification error frame, never a success.

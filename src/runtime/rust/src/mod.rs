@@ -1084,6 +1084,11 @@ mod js_document_scan {
                 "var w = window;",
                 "keys(window);",
                 "var h = window.self[x];",
+                "var { __ipeNative: h } = window;",
+                "with (window) { h = __x; }",
+                "var d = Object.getOwnPropertyDescriptor(window, k);",
+                "var h = Reflect.get(globalThis, k);",
+                "var h = typeof window[k];",
             ] {
                 assert!(
                     !bare_global_sites(computed, GLOBALS).is_empty(),

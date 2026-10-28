@@ -964,10 +964,9 @@ mod tests {
             .and_then(|request| request.encode())
             .map(|text| text.len())
         };
-        let Ok(base) = encoded_len("") else {
-            return;
-        };
-        let at = "k".repeat(BRIDGE_MAX_REQUEST_BYTES - base);
+        let base = encoded_len("");
+        assert!(base.is_ok(), "{base:?}");
+        let at = "k".repeat(BRIDGE_MAX_REQUEST_BYTES - base.unwrap_or_default());
         assert_eq!(encoded_len(&at), Ok(BRIDGE_MAX_REQUEST_BYTES));
         assert_eq!(encoded_len(&format!("{at}k")), Err(BridgeRefusal::TooLarge));
     }
