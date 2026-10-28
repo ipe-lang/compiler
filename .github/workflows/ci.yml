@@ -204,6 +204,8 @@ jobs:
         run: python3 .github/ci/test_check_required_set.py -v
       - name: Prove the in-repo ipe-fmt check refusals (unit tests)
         run: python3 .github/ci/test_ipe_fmt_check.py -v
+      - name: Prove the static cache-prune refusals (unit tests)
+        run: python3 .github/ci/test_cache_prune.py -v
       - name: The derived required-set is in sync with the manifest
         run: python3 .github/ci/check_required_set.py
 
@@ -375,8 +377,12 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: ./.github/actions/rust-toolchain-pinned
       - uses: ./.github/actions/mold
+      # `ipe-nextest-deps` is shared by explain-examples, registry-admission-run
+      # and seal-modset-vendored: each runs `cargo nextest run -p ipe` with the
+      # same toolchain, RUSTFLAGS and features, so their dependencies match.
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
+          shared-key: ipe-nextest-deps
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - uses: taiki-e/install-action@23d41aa71228a2692ee31bb433f070fd4bdc6661 # nextest
       - name: Judge every explain-page and docs-page example
@@ -428,8 +434,12 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: ./.github/actions/rust-toolchain-pinned
       - uses: ./.github/actions/mold
+      # `ipe-nextest-deps` is shared by explain-examples, registry-admission-run
+      # and seal-modset-vendored: each runs `cargo nextest run -p ipe` with the
+      # same toolchain, RUSTFLAGS and features, so their dependencies match.
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
+          shared-key: ipe-nextest-deps
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - uses: taiki-e/install-action@23d41aa71228a2692ee31bb433f070fd4bdc6661 # nextest
       # The fixtures shell out to `git init/commit/push`; give the runner an
@@ -1577,8 +1587,12 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: ./.github/actions/rust-toolchain-pinned
       - uses: ./.github/actions/mold
+      # `ipe-nextest-deps` is shared by explain-examples, registry-admission-run
+      # and seal-modset-vendored: each runs `cargo nextest run -p ipe` with the
+      # same toolchain, RUSTFLAGS and features, so their dependencies match.
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
+          shared-key: ipe-nextest-deps
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - uses: taiki-e/install-action@23d41aa71228a2692ee31bb433f070fd4bdc6661 # nextest
       - name: Run seal_modset under the vendored emit model

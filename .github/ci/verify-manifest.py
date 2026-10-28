@@ -1713,6 +1713,7 @@ WRITE_GRANTS: dict[tuple[str, str | None, str], str] = {
     ("nightly-full-gate.yml", None, "actions"): "dispatches ci.yml",
     ("rerun-failed-once.yml", None, "actions"): "reads job logs and reruns failed jobs",
     ("ci.yml", "cancel-on-cheap-red", "actions"): "cancels the run once a cheap check is red",
+    ("static.yml", "cache-prune", "actions"): "deletes the static caches a newer Cargo.lock superseded",
     ("ci-health.yml", None, "issues"): "opens and updates the CI health issue",
 }
 
@@ -5991,12 +5992,14 @@ TOOL_INVOCATIONS: dict[str, dict[Argv, ToolRole]] = {
     "test_claims_table.py": _SELF_TEST,
     "test_check_required_set.py": _SELF_TEST,
     "test_ipe_fmt_check.py": _SELF_TEST,
+    "test_cache_prune.py": _SELF_TEST,
     "rerun_policy.py": {("--lint",): _V, ("--decide",): _O, ("--proven-test-red",): _O},
     "nightly_green.py": {("--lint",): _V, ("--verdict",): _V},
     "check_required_set.py": {(): _V, ("--fetch",): _V, ("--fetch-admin",): _V},
     "manifest-lock-consistency.sh": {(): _V},
     "ci_health_surface.py": {(): _V},
     "deterministic_checks_output.py": {(): _O},
+    "cache_prune.py": {(): _O},
 }
 # Maintainer-only invocations, each a tool and its leading flag (the words
 # after it are the maintainer's operands): each rewrites a committed file or
@@ -6229,6 +6232,9 @@ TOOL_ENV_ALLOWLIST: dict[str, frozenset[EnvScope]] = {
     # the producer context whose failed legs it classifies.
     "RUN_ATTEMPT": frozenset({EnvScope.STEP}),
     "PRODUCER": frozenset({EnvScope.STEP}),
+    # The `Cargo.lock` hash the static cache keys carry, read by the step that
+    # prunes the generations it superseded.
+    "CACHE_LOCK": frozenset({EnvScope.STEP}),
     "CARGO_TERM_COLOR": frozenset({EnvScope.WORKFLOW}),
     "CARGO_INCREMENTAL": frozenset({EnvScope.WORKFLOW}),
 }

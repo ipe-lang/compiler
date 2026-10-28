@@ -185,6 +185,7 @@ PRODUCERS: tuple[Producer, ...] = (
                 "linux-static-arm64 (dlmalloc)",
                 "windows-static (dlmalloc, MSVC +crt-static)",
                 "freebsd-cross (x86_64-unknown-freebsd, build-only)",
+                "static cache prune (one lock generation)",
             }
         ),
     ),
