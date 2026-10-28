@@ -234,55 +234,71 @@ pub(super) fn canon_covers_as_template(
     concrete: &Ty,
     lowering: &dyn EmittedHeads,
 ) -> bool {
-    match (template, concrete) {
-        (canon::Type::Var(_) | canon::Type::Wildcard, _) | (canon::Type::Unit, Ty::Unit) => true,
-        (canon::Type::Lambda(tp, tr), Ty::Fun(cp, cr)) => {
+    // One arm per template shape, so a new canonical variant is a compile
+    // error here; a concrete of another shape is a mismatch and never covers.
+    match template {
+        canon::Type::Var(_) | canon::Type::Wildcard => true,
+        canon::Type::Unit => matches!(concrete, Ty::Unit),
+        canon::Type::Lambda(tp, tr) => {
+            let Ty::Fun(cp, cr) = concrete else {
+                return false;
+            };
             canon_covers_as_template(tp, cp, lowering) && canon_covers_as_template(tr, cr, lowering)
         }
-        (canon::Type::Tuple(ts), Ty::Tuple(cs)) => {
+        canon::Type::Tuple(ts) => {
+            let Ty::Tuple(cs) = concrete else {
+                return false;
+            };
             ts.len() == cs.len()
                 && ts
                     .iter()
                     .zip(cs)
                     .all(|(t, c)| canon_covers_as_template(t, c, lowering))
         }
-        (
-            canon::Type::Con {
-                home: th,
-                name: tn,
-                args: ta,
-            },
-            Ty::Con {
+        canon::Type::Con {
+            home: th,
+            name: tn,
+            args: ta,
+        } => {
+            let Ty::Con {
                 module: cm,
                 name: cn,
                 args: ca,
-            },
-        ) => HeadIdentity::Emitted(lowering)
-            .paired_args(
-                ConHead {
-                    home: th,
-                    name: *tn,
-                    args: ta,
-                },
-                ConHead {
-                    home: cm,
-                    name: *cn,
-                    args: ca,
-                },
-            )
-            .is_some_and(|mut pairs| pairs.all(|(t, c)| canon_covers_as_template(t, c, lowering))),
+            } = concrete
+            else {
+                return false;
+            };
+            HeadIdentity::Emitted(lowering)
+                .paired_args(
+                    ConHead {
+                        home: th,
+                        name: *tn,
+                        args: ta,
+                    },
+                    ConHead {
+                        home: cm,
+                        name: *cn,
+                        args: ca,
+                    },
+                )
+                .is_some_and(|mut pairs| {
+                    pairs.all(|(t, c)| canon_covers_as_template(t, c, lowering))
+                })
+        }
         // A closed record must cover the literal field-for-field. An open row
         // `{ r | … }` is treated the same: its declared fields must present and
         // match the literal exactly (the literal is a closed record, so extra
         // absorbed fields would change the synthesised struct — reject them).
-        (canon::Type::Record(tf) | canon::Type::RecordOpen(_, tf), Ty::Record(cf, _)) => {
+        canon::Type::Record(tf) | canon::Type::RecordOpen(_, tf) => {
+            let Ty::Record(cf, _) = concrete else {
+                return false;
+            };
             tf.len() == cf.len()
                 && tf.iter().all(|(k, tv)| {
                     cf.get(k)
                         .is_some_and(|cv| canon_covers_as_template(tv, cv, lowering))
                 })
         }
-        _ => false,
     }
 }
 
