@@ -961,11 +961,9 @@ mod native {
                         .to_string()
                         .into(),
                 ),
-                Err(_) => crate::core::IpeResult::Err(
-                    delivered
-                        .refusal("js_close_session")
-                        .unwrap_or_else(|| "js_close_session: timeout".to_string().into()),
-                ),
+                Err(_) => {
+                    crate::core::IpeResult::Err("js_close_session: timeout".to_string().into())
+                }
             }
         })
     }
@@ -1550,9 +1548,11 @@ mod wasm {
                         )),
                     }
                 }
-                Err(_) => {
-                    crate::core::IpeResult::Err("js_close_session: timeout".to_string().into())
-                }
+                Err(_) => crate::core::IpeResult::Err(
+                    delivered
+                        .refusal("js_close_session")
+                        .unwrap_or_else(|| "js_close_session: timeout".to_string().into()),
+                ),
             }
         })
     }
