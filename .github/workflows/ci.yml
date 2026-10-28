@@ -1033,7 +1033,14 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: ./.github/actions/rust-toolchain-pinned
+        with:
+          targets: wasm32-unknown-unknown
       - uses: ./.github/actions/mold
+      # The wasm-bindgen CLI, pinned to the Cargo.lock wasm-bindgen version: a
+      # shape that declares a wasm client builds as its `web solo` bundle.
+      - uses: taiki-e/install-action@4cef1412cce204788f482e778a0b9187f9626a29 # v2
+        with:
+          tool: wasm-bindgen@0.2.126
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
@@ -1067,6 +1074,18 @@ jobs:
             echo "::group::$dir"
             if ! "$IPE" type-check "$dir"; then
               echo "::error::ipe type-check regressed: $dir"; fail=1; echo "::endgroup::"; continue
+            fi
+            # A package that declares a wasm client builds as its `web solo`
+            # bundle: that build compiles the wasm32 crate and runs wasm-bindgen
+            # itself, and mold links host binaries only, so RUSTFLAGS is cleared.
+            if grep -Eq '^[[:space:],]*wasm[[:space:]]*=[[:space:]]*On' "$toml"; then
+              if ! RUSTFLAGS="" "$IPE" dev build "$dir" web solo --out "$dir/out"; then
+                echo "::error::ipe dev build regressed: $dir"; fail=1; echo "::endgroup::"; continue
+              fi
+              if [ ! -f "$dir/out/rust/www/index.html" ]; then
+                echo "::error::wasm bundle has no www/index.html: $dir"; fail=1
+              fi
+              echo "::endgroup::"; continue
             fi
             if ! "$IPE" dev build "$dir" --out "$dir/out"; then
               echo "::error::ipe dev build regressed: $dir"; fail=1; echo "::endgroup::"; continue
