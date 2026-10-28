@@ -403,10 +403,10 @@ mod native {
         // session's stream/terminal BEFORE the one-shot-reply check, so a session
         // frame can never be misrouted to a `js_request` waiter or a broadcast
         // subscriber. An unknown/closed/foreign session id is dropped fail-closed.
-        if let Ok(mut value) = serde_json::from_str::<serde_json::Value>(&raw)
+        if let Ok(mut value) = serde_json::from_str::<JsonVal>(&raw)
             && let Some(sess_val) = value
                 .as_object_mut()
-                .and_then(|o| o.remove(SESSION_ID_FIELD))
+                .and_then(|o| o.swap_remove(SESSION_ID_FIELD))
             && let Some(session_id) = sess_val.as_u64()
         {
             deliver_session_frame(sid, session_id, value);
@@ -417,8 +417,10 @@ mod native {
         // Wire format: `{"__ipe_id": <u64>, "payload": <sealed_reply>}`.
         // After stripping `__ipe_id`, the remaining object's `"payload"` field is
         // the sealed reply value forwarded to the waiting decoder.
-        if let Ok(mut value) = serde_json::from_str::<serde_json::Value>(&raw)
-            && let Some(id_val) = value.as_object_mut().and_then(|o| o.remove(COR_ID_FIELD))
+        if let Ok(mut value) = serde_json::from_str::<JsonVal>(&raw)
+            && let Some(id_val) = value
+                .as_object_mut()
+                .and_then(|o| o.swap_remove(COR_ID_FIELD))
             && let Some(id) = id_val.as_u64()
         {
             // Extract the `"payload"` field from the remaining envelope,
@@ -426,7 +428,7 @@ mod native {
             // the wrapper is still decoded (fail-closed if neither decodes).
             let payload = value
                 .as_object_mut()
-                .and_then(|o| o.remove("payload"))
+                .and_then(|o| o.swap_remove("payload"))
                 .unwrap_or(value);
             let waiter = lock_sessions()
                 .get_mut(&sid.0)
@@ -461,16 +463,16 @@ mod native {
     /// The `session_id` is the registry key minted by [`next_cor_id`]; a
     /// JS-injected id cannot forge a live session because the key is never derived
     /// from an inbound frame.
-    fn deliver_session_frame(sid: &SessionId, session_id: u64, mut value: serde_json::Value) {
+    fn deliver_session_frame(sid: &SessionId, session_id: u64, mut value: JsonVal) {
         let is_terminal = value
             .as_object_mut()
-            .and_then(|o| o.remove(SESSION_TERMINAL_FIELD))
+            .and_then(|o| o.swap_remove(SESSION_TERMINAL_FIELD))
             .and_then(|t| t.as_bool())
             .unwrap_or(false);
         // Extract the inner `"payload"`, falling back to the whole remaining value.
         let payload = value
             .as_object_mut()
-            .and_then(|o| o.remove("payload"))
+            .and_then(|o| o.swap_remove("payload"))
             .unwrap_or(value);
 
         let mut g = lock_sessions();
@@ -525,7 +527,7 @@ mod native {
             // malformed wire string. The seal is not loosened either way.
             match serde_json::to_value(&payload) {
                 Ok(value) => {
-                    let encoded = seal_encode(&value);
+                    let encoded = seal_encode(&JsonVal::from_serde(value));
                     if let Some(sid) = SessionId::parse(origin) {
                         deliver_or_buffer(&sid, &encoded);
                     }
@@ -652,7 +654,7 @@ mod native {
                 COR_ID_FIELD: cor_id,
                 "payload": outbound_json,
             });
-            let encoded = seal_encode(&envelope);
+            let encoded = seal_encode(&JsonVal::from_serde(envelope));
 
             // Register the one-shot waiter.
             let (tx, rx) = oneshot::channel::<JsonVal>();
@@ -774,7 +776,7 @@ mod native {
                 SESSION_ID_FIELD: session_id,
                 "payload": outbound_json,
             });
-            let encoded = seal_encode(&envelope);
+            let encoded = seal_encode(&JsonVal::from_serde(envelope));
             deliver_or_buffer(&sid, &encoded);
             crate::core::IpeResult::Ok(session_id as i64)
         })
@@ -848,7 +850,7 @@ mod native {
                         SESSION_ID_FIELD: session_id,
                         "payload": value,
                     });
-                    let encoded = seal_encode(&envelope);
+                    let encoded = seal_encode(&JsonVal::from_serde(envelope));
                     if let Some(sid) = SessionId::parse(origin) {
                         deliver_or_buffer(&sid, &encoded);
                     }
@@ -915,7 +917,7 @@ mod native {
                         SESSION_ID_FIELD: session_id,
                         "payload": v,
                     });
-                    let encoded = seal_encode(&envelope);
+                    let encoded = seal_encode(&JsonVal::from_serde(envelope));
                     // Route through the single delivery chokepoint so a close
                     // Cmd fired during an SSE reopen window (sink not yet
                     // rebound) is buffered in the session's bounded
@@ -1048,10 +1050,10 @@ mod wasm {
     pub fn push_inbound(raw: &str) {
         // A session-tagged frame is routed to its session BEFORE the one-shot-reply
         // check, so a session frame can never be misrouted. Unknown id → dropped.
-        if let Ok(mut value) = serde_json::from_str::<serde_json::Value>(raw)
+        if let Ok(mut value) = serde_json::from_str::<JsonVal>(raw)
             && let Some(sess_val) = value
                 .as_object_mut()
-                .and_then(|o| o.remove(SESSION_ID_FIELD))
+                .and_then(|o| o.swap_remove(SESSION_ID_FIELD))
             && let Some(session_id) = sess_val.as_u64()
         {
             deliver_session_frame(session_id, value);
@@ -1059,14 +1061,16 @@ mod wasm {
         }
         // Peek for a correlation id (fail-closed: a parse error falls through).
         // Wire format: `{"__ipe_id": <u64>, "payload": <sealed_reply>}`.
-        if let Ok(mut value) = serde_json::from_str::<serde_json::Value>(raw)
-            && let Some(id_val) = value.as_object_mut().and_then(|o| o.remove(COR_ID_FIELD))
+        if let Ok(mut value) = serde_json::from_str::<JsonVal>(raw)
+            && let Some(id_val) = value
+                .as_object_mut()
+                .and_then(|o| o.swap_remove(COR_ID_FIELD))
             && let Some(id) = id_val.as_u64()
         {
             // Extract `"payload"`, falling back to the whole remaining value.
             let payload = value
                 .as_object_mut()
-                .and_then(|o| o.remove("payload"))
+                .and_then(|o| o.swap_remove("payload"))
                 .unwrap_or(value);
             let waiter = PENDING.with(|p| p.borrow_mut().remove(&id));
             if let Some(cb) = waiter {
@@ -1086,15 +1090,15 @@ mod wasm {
     /// Fail-closed: an unknown/closed session id is dropped whole; a terminal
     /// resolves the close waiter and evicts; an ordinary frame is charged against
     /// the budget and fanned to the session's drains, terminating on overflow.
-    fn deliver_session_frame(session_id: u64, mut value: serde_json::Value) {
+    fn deliver_session_frame(session_id: u64, mut value: JsonVal) {
         let is_terminal = value
             .as_object_mut()
-            .and_then(|o| o.remove(SESSION_TERMINAL_FIELD))
+            .and_then(|o| o.swap_remove(SESSION_TERMINAL_FIELD))
             .and_then(|t| t.as_bool())
             .unwrap_or(false);
         let payload = value
             .as_object_mut()
-            .and_then(|o| o.remove("payload"))
+            .and_then(|o| o.swap_remove("payload"))
             .unwrap_or(value);
 
         if is_terminal {
@@ -1157,7 +1161,7 @@ mod wasm {
     {
         IpeCmd::Publish(Box::new(move |_origin| {
             if let Ok(value) = serde_json::to_value(&payload) {
-                deliver_outbound(&seal_encode(&value));
+                deliver_outbound(&seal_encode(&JsonVal::from_serde(value)));
             }
             0
         }))
@@ -1228,7 +1232,7 @@ mod wasm {
                 COR_ID_FIELD: cor_id,
                 "payload": outbound_json,
             });
-            let encoded = seal_encode(&envelope);
+            let encoded = seal_encode(&JsonVal::from_serde(envelope));
 
             // Build a Promise whose resolve/reject pair is stored as the waiter.
             // When `push_inbound` gets a correlated reply it calls the stored
@@ -1339,7 +1343,7 @@ mod wasm {
                 SESSION_ID_FIELD: session_id,
                 "payload": outbound_json,
             });
-            deliver_outbound(&seal_encode(&envelope));
+            deliver_outbound(&seal_encode(&JsonVal::from_serde(envelope)));
             crate::core::IpeResult::Ok(session_id as i64)
         })
     }
@@ -1395,7 +1399,7 @@ mod wasm {
                     SESSION_ID_FIELD: session_id,
                     "payload": value,
                 });
-                deliver_outbound(&seal_encode(&envelope));
+                deliver_outbound(&seal_encode(&JsonVal::from_serde(envelope)));
             }
             0
         }))
@@ -1457,7 +1461,7 @@ mod wasm {
                 SESSION_ID_FIELD: session_id,
                 "payload": outbound_json,
             });
-            deliver_outbound(&seal_encode(&envelope));
+            deliver_outbound(&seal_encode(&JsonVal::from_serde(envelope)));
 
             let js_fut = wasm_bindgen_futures::JsFuture::from(promise);
             let outcome = js_fut.await;
@@ -1528,7 +1532,7 @@ mod tests {
     #[test]
     fn outbound_encodes_record_canonically() {
         // A record payload seal-encodes to canonical sorted-key JSON.
-        let value: JsonVal = serde_json::json!({ "b": 2, "a": 1 });
+        let value: JsonVal = crate::json_val::json_val!({ "b": 2, "a": 1 });
         assert_eq!(seal_encode(&value), r#"{"a":1,"b":2}"#);
     }
 

@@ -21,6 +21,7 @@ path = "src/mod.rs"
 # whose order is part of the contract; the `Map` must keep insertion order rather
 # than sort keys, so serialization emits keys in the order given.
 serde_json = { version = "1", features = ["preserve_order"], optional = true }
+indexmap = { version = "2", optional = true }
 jsonwebtoken = { version = "9", optional = true }
 # `crypto_core.rs` (the cryptographic floor: SHA-2 hash + HMAC family + typed
 # Key/Mac + entropy pair + constant-time compare) is behind the `crypto-core`
@@ -402,7 +403,7 @@ serde = ["dep:serde", "rust_decimal?/serde"]
 # `serde_json::Value` stringify + every `IpeMaybe`/record round-trip need the
 # derives). It must NOT drag `jsonwebtoken` (+ ring) into a plain JSON program —
 # the JWT surface is the separate `jwt` feature.
-json = ["dep:serde_json", "serde"]
+json = ["dep:serde_json", "dep:indexmap", "serde"]
 # `sha2` (the `_ipe_migrations` ledger checksum, a cross-backend byte-exact DB
 # contract) rides the `crypto-core` feature `db` lists below. `tokio/sync`:
 # `db.rs`, `telemetry_spill.rs`, and the `tea` loop use `tokio::sync`. BOTH the

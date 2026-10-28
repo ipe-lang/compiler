@@ -541,6 +541,38 @@ fn jwt_sign_vendored_builds() {
     );
 }
 
+/// A `Json.Encode` program whose object lists `b` before `a`.
+const JSON_OBJECT_ORDER: &str = "module Main exposing (main)\n\
+    import Ipe.Io as Io\n\
+    import Ipe.Json.Encode as Encode\n\
+    main = Io.println (Encode.encode 0 (Encode.object [ ( \"b\", Encode.int 1 ), ( \"a\", Encode.int 2 ) ]))\n";
+
+/// Under the vendored emit model a `Json.Encode` program builds, and an object
+/// keeps the order it was built in: the vendored manifest enables the same
+/// insertion-ordered `serde_json` as the runtime crate.
+#[test]
+fn json_object_order_vendored_builds_and_keeps_insertion_order() {
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
+        return;
+    }
+    let name = "json_object_order_vendored";
+    let fixture = ipe::RootFixture::main(JSON_OBJECT_ORDER).expect("write the fixture");
+    let out_dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("seal_modset_{name}_emitted"));
+    let _ = std::fs::remove_dir_all(&out_dir);
+    let runtime = e2e_support::require_runtime().into_path_buf();
+    let options = ipe::BuildOptions {
+        runtime_dep: false,
+        ..ipe::BuildOptions::default()
+    };
+    ipe::build_fixture_with_options(&fixture, &out_dir, &runtime, &options)
+        .expect("ipe dev build (vendored) of the Json.Encode program");
+    let run = e2e_support::build_and_run_rust(name, &out_dir)
+        .expect("the vendored Json.Encode program must cargo-build and run");
+    assert_eq!(run.exit_code, Some(0), "{}", run.stdout);
+    assert_eq!(run.stdout, "{\"b\":1,\"a\":2}\n");
+}
+
 /// Arity-3 tripwire for `Revocation.revokeSession`.
 ///
 /// The kernel signature is `Principal -> String -> Int -> Task Error ()`.  Any

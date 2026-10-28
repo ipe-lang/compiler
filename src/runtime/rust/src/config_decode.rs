@@ -2,7 +2,7 @@
 // Ipe.Config — typed TOML / YAML / JSON config decoders.
 //
 // Config reuses the JSON Decoder representation (`Decoder<E, T>` over a
-// `serde_json::Value`): TOML and YAML are parsed into the same `Value`, then the
+// `JsonVal`): TOML and YAML are parsed into the same `JsonVal`, then the
 // decoder runs unchanged. The combinators (string / int / float / bool / field /
 // at / list / map / andThen / succeed / fail) ARE the shared `decode_*` kernels — the
 // Ipê codegen maps `Config.*` straight onto them. Only the format front-ends,
@@ -147,6 +147,9 @@ pub fn config_decode_yaml<E: From<String> + FromLimitExceeded + 'static, T>(
 
 /// Deepest container nesting a YAML source may reach.
 const YAML_MAX_DEPTH: usize = 128;
+
+// IPE-RUST-AUDIT:ACCEPTED (Arthur Maciel) — compile-time `const` assertion (not a runtime panic); fails the BUILD if a YAML document the budget admits could pass the `JsonVal` serde backstop [ledger #boundary]
+const _: () = assert!(YAML_MAX_DEPTH < crate::json_val::JSON_SERDE_NESTING_BACKSTOP);
 
 /// Most times one anchor may be replayed through its aliases.
 const YAML_MAX_EXPANSIONS_PER_ANCHOR: usize = 10_000;
@@ -704,7 +707,7 @@ mod load_from_file_spawn_blocking_tests {
 mod yaml_tests {
     use super::*;
     use crate::json::decode_value_identity;
-    use serde_json::json;
+    use crate::json_val::json_val as json;
 
     fn yaml(src: &str) -> IpeResult<crate::IpeError, JsonVal> {
         config_decode_yaml(src.to_string(), decode_value_identity::<crate::IpeError>())
