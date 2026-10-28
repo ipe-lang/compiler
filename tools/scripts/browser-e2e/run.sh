@@ -12,7 +12,7 @@
 #      csp-styles) via `ipe dev build`.
 #   3. Cargo-builds each emitted Rust project.
 #   4. Spawns each binary on its port.
-#   5. Builds the wasm-solo-clipboard browser bundle (`ipe dev build … web solo`),
+#   5. Builds the wasm-solo-clipboard browser bundle (`ipe dev build … web solo --target wasm`),
 #      which the spec serves from its `www/` directory with no server.
 #   6. Runs the Playwright specs.
 #   7. Kills the binaries on exit.
@@ -97,7 +97,7 @@ bundle_solo() {
 
   echo "==> Building the $name browser bundle..."
   rm -rf "$out"
-  "$IPE" dev build "$REPO_ROOT/examples/shapes/web/$name" web solo --out "$out"
+  "$IPE" dev build "$REPO_ROOT/examples/shapes/web/$name" web solo --target wasm --out "$out"
   # Fail closed: a bundle without its shell leaves the spec nothing to serve.
   if [ ! -f "$out/rust/www/index.html" ]; then
     echo "   $name bundle has no www/index.html under '$out/rust'" >&2
