@@ -266,7 +266,7 @@ pub fn ipe_main() -> IpeTask<()> {
     ({
         let f = {
             let __ipe_fn: Box<dyn Fn(i64) -> i64 + Send + Sync + 'static> =
-                Box::new(move |eta_1: i64| -> i64 { crate::main_add(2i64, eta_1) });
+                Box::new(move |__u_eta_1: i64| -> i64 { crate::main_add(2i64, __u_eta_1) });
             __ipe_fn
         };
         ({
@@ -275,7 +275,7 @@ pub fn ipe_main() -> IpeTask<()> {
                 let o = (crate::main_over(1i64))(2i64);
                 ({
                     let h = crate::main_apply_twice(
-                        move |eta_0: i64| -> i64 { crate::main_add(1i64, eta_0) },
+                        move |__u_eta_0: i64| -> i64 { crate::main_add(1i64, __u_eta_0) },
                         5i64,
                     );
                     io_println(string_from_int(ipe_runtime::math::ipe_int_add(

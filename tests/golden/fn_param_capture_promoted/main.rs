@@ -252,7 +252,7 @@ pub fn main_compose2(f: Box<dyn Fn(i64) -> i64 + Send + Sync + 'static>, a: i64,
     ({
         let f = {
             let __ipe_fn: ::std::sync::Arc<dyn Fn(i64) -> i64 + Send + Sync + 'static> =
-                ::std::sync::Arc::new(move |eta_2: i64| -> i64 { (f)(eta_2) });
+                ::std::sync::Arc::new(move |__u_eta_2: i64| -> i64 { (f)(__u_eta_2) });
             __ipe_fn
         };
         ({
@@ -260,20 +260,20 @@ pub fn main_compose2(f: Box<dyn Fn(i64) -> i64 + Send + Sync + 'static>, a: i64,
                 let f = f.clone();
                 {
                     let __ipe_fn: Box<dyn Fn(i64) -> i64 + Send + Sync + 'static> =
-                        Box::new(move |eta_0: i64| -> i64 {
+                        Box::new(move |__u_eta_0: i64| -> i64 {
                             crate::main_apply(
                                 ({
                                     let f = f.clone();
                                     {
                                         let __ipe_fn: Box<
                                             dyn Fn(i64) -> i64 + Send + Sync + 'static,
-                                        > = Box::new(move |eta_2: i64| -> i64 {
-                                            (f.clone())(eta_2)
+                                        > = Box::new(move |__u_eta_2: i64| -> i64 {
+                                            (f.clone())(__u_eta_2)
                                         });
                                         __ipe_fn
                                     }
                                 }),
-                                eta_0,
+                                __u_eta_0,
                             )
                         });
                     __ipe_fn

@@ -323,7 +323,7 @@ pub fn main_int_codec() -> MainCodec<i64> {
         },
         mkDec: {
             let __ipe_fn: ::std::sync::Arc<dyn Fn(Rec_) -> Decoder<i64> + Send + Sync + 'static> =
-                ::std::sync::Arc::new(move |arg_0: Rec_| -> Decoder<i64> {
+                ::std::sync::Arc::new(move |__u_arg_0: Rec_| -> Decoder<i64> {
                     json_decode_int::<IpeError>()
                 });
             __ipe_fn
@@ -342,7 +342,7 @@ pub fn main_string_codec() -> MainCodec<String> {
         mkDec: {
             let __ipe_fn: ::std::sync::Arc<
                 dyn Fn(Rec_) -> Decoder<String> + Send + Sync + 'static,
-            > = ::std::sync::Arc::new(move |arg_1: Rec_| -> Decoder<String> {
+            > = ::std::sync::Arc::new(move |__u_arg_1: Rec_| -> Decoder<String> {
                 json_decode_string::<IpeError>()
             });
             __ipe_fn
@@ -360,10 +360,10 @@ pub fn main_encode_list<T1: 'static + Send + Sync + Clone>(
             0i64,
             json_enc_list(
                 ({
-                    let eta_1 = (r).enc.clone();
+                    let __u_eta_1 = (r).enc.clone();
                     {
                         let __ipe_fn: Box<dyn Fn(T1) -> JsonVal + Send + Sync + 'static> =
-                            Box::new(move |eta_0: T1| -> JsonVal { (eta_1)(eta_0) });
+                            Box::new(move |__u_eta_0: T1| -> JsonVal { (__u_eta_1)(__u_eta_0) });
                         __ipe_fn
                     }
                 }),

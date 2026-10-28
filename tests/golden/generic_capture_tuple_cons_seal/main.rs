@@ -294,7 +294,7 @@ pub fn ipe_main() -> IpeTask<()> {
         task_map(
             {
                 let __ipe_fn: Box<dyn Fn(Vec<(i64, i64)>) -> () + Send + Sync + 'static> =
-                    Box::new(move |arg_1: Vec<(i64, i64)>| -> () { () });
+                    Box::new(move |__u_arg_1: Vec<(i64, i64)>| -> () { () });
                 __ipe_fn
             },
             crate::main_tag_rows(
@@ -310,7 +310,7 @@ pub fn ipe_main() -> IpeTask<()> {
                 vec![1i64, 2i64, 3i64],
             ),
         ),
-        Box::new(move |arg_0: ()| -> IpeTask<()> {
+        Box::new(move |__u_arg_0: ()| -> IpeTask<()> {
             io_println("generic-capture-tuple-cons-seal".to_string())
         }),
     )
