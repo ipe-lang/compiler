@@ -1166,7 +1166,7 @@ mod tests {
         for &op in BridgeOp::ALL {
             for &code in Reject::ALL {
                 let reply = round_trip(op, Answer::Reject(code));
-                assert!(matches!(reply, Ok(_)), "{op:?} {code:?}: {reply:?}");
+                assert!(reply.is_ok(), "{op:?} {code:?}: {reply:?}");
                 let Ok(reply) = reply else { return };
                 assert_eq!(
                     reply,
@@ -1240,7 +1240,7 @@ mod tests {
     fn a_permission_reply_off_its_payload_reads_unavailable() {
         let outstanding = [id("6")];
         let reply = parse_reply(r#"{"v":1,"id":"6","ok":{"state":"maybe"}}"#, &outstanding);
-        assert!(matches!(reply, Ok(_)), "{reply:?}");
+        assert!(reply.is_ok(), "{reply:?}");
         let Ok(reply) = reply else { return };
         assert_eq!(
             notification_frame(BridgeOp::NotificationRequest, &reply),
