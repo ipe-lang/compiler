@@ -204,6 +204,8 @@ jobs:
         run: python3 .github/ci/test_check_required_set.py -v
       - name: Prove the in-repo ipe-fmt check refusals (unit tests)
         run: python3 .github/ci/test_ipe_fmt_check.py -v
+      - name: Prove the static cache-prune refusals (unit tests)
+        run: python3 .github/ci/test_cache_prune.py -v
       - name: The derived required-set is in sync with the manifest
         run: python3 .github/ci/check_required_set.py
 

@@ -551,3 +551,54 @@ jobs:
             ~/.cargo/registry
             ${{ github.workspace }}/.cache/ipe-lang-target
           key: ${{ steps.cargo-cache.outputs.cache-primary-key }}
+
+  # ─── One lock generation per cache ─────────────────────────────────────────
+  # Every job above keys its cache on `hashFiles('Cargo.lock')`, so each lock
+  # change leaves the previous generation in the repository cache until it
+  # ages out, and that dead weight evicts the caches CI reads. Once the jobs
+  # finish, a run on main's head deletes each entry a current-lock entry of
+  # the same key family superseded (`.github/ci/cache_prune.py` picks them). A
+  # family whose job saved nothing on this lock keeps its old entry, a listing
+  # that cannot be read in full deletes nothing, and a run that is no longer
+  # main's head deletes nothing (it would judge against an older lock).
+  cache-prune:
+    name: static cache prune (one lock generation)
+    runs-on: ubuntu-latest
+    needs: [linux-static-x64, linux-static-arm64, linux-cfree-gate, windows-static, freebsd-cross]
+    if: always() && github.ref == 'refs/heads/main'
+    timeout-minutes: 10
+    permissions:
+      actions: write
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+          sparse-checkout: |
+            Cargo.lock
+            .github/ci/cache_prune.py
+          sparse-checkout-cone-mode: false
+
+      # Writes `ids=` (nothing) on any refusal or when main moved past this
+      # run; a crash leaves the output unset, which also deletes nothing.
+      - name: Pick the caches a newer Cargo.lock superseded
+        id: pick
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          CACHE_LOCK: ${{ hashFiles('Cargo.lock') }}
+        run: python3 .github/ci/cache_prune.py
+
+      - name: Delete the superseded caches
+        if: ${{ steps.pick.outputs.ids != '' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          IDS: ${{ steps.pick.outputs.ids }}
+        run: |
+          set -euo pipefail
+          for id in $IDS; do
+            [[ "$id" =~ ^[1-9][0-9]*$ ]] || { echo "refusing cache id '$id'"; exit 1; }
+            echo "deleting superseded cache $id"
+            timeout 60 gh api -X DELETE "repos/$REPO/actions/caches/$id"
+          done
