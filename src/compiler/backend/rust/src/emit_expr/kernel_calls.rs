@@ -4323,6 +4323,11 @@ pub fn emit_ui_plan(
     }
 }
 
+/// `decode_succeed` over an N-ary function, curried through the runtime's qualified `curry{n}`.
+fn decode_succeed_curried(n: usize, function: &str) -> String {
+    format!("decode_succeed(ipe_runtime::json::curry{n}({function}))")
+}
+
 /// Handle JSON / Db decoder kernel calls that require custom argument wrapping.
 ///
 /// Returns `Some(emitted)` for the four special cases:
@@ -4403,9 +4408,7 @@ pub fn emit_json_decoder_call(
                     });
                 }
                 let fn_name = callee_name(ctx, fn_callee)?;
-                return Ok(Some(format!(
-                    "decode_succeed(ipe_runtime::json::curry{n}({fn_name}))"
-                )));
+                return Ok(Some(decode_succeed_curried(n, &fn_name)));
             }
             // Case 2: lambda — curry{n}(move |params| -> ret { body })
             Expr::Lambda { params, ret, body } if !params.is_empty() => {
@@ -4417,9 +4420,7 @@ pub fn emit_json_decoder_call(
                     });
                 }
                 let closure = emit_lambda_unboxed(ctx, params, ret, body, indent, child, generics)?;
-                return Ok(Some(format!(
-                    "decode_succeed(ipe_runtime::json::curry{n}({closure}))"
-                )));
+                return Ok(Some(decode_succeed_curried(n, &closure)));
             }
             // Case 2b: an `Arc`-carried function payload (the lowerer eta-expands
             // a non-literal function-value leaf here — a let-bound name, a field
@@ -4457,9 +4458,7 @@ pub fn emit_json_decoder_call(
                     param_decls.join(", "),
                     param_names.join(", ")
                 );
-                return Ok(Some(format!(
-                    "decode_succeed(ipe_runtime::json::curry{n}({wrapper}))"
-                )));
+                return Ok(Some(decode_succeed_curried(n, &wrapper)));
             }
             // Case 3: any other value — factory-wrap so it is called per run.
             // Turbofish `<IpeError, _>` pins the error type when there is no

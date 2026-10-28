@@ -29,6 +29,9 @@ use proc_macro2::{Delimiter, TokenStream, TokenTree};
 /// named fn or const.
 type Site = (String, String);
 
+/// Sites paired with how many refused literals each holds.
+type SiteCounts = Vec<(Site, usize)>;
+
 /// The one sanctioned site: the escape prefix const in `naming.rs`.
 const ALLOWED: &[(&str, &str, usize)] = &[("naming.rs", "USER_LOCAL_ESCAPE", 1)];
 
@@ -260,7 +263,7 @@ fn scan_source(file: &str, src: &str) -> Result<Refused, String> {
 fn drift(
     found: &BTreeMap<Site, usize>,
     allowed: &[(&str, &str, usize)],
-) -> (Vec<(Site, usize)>, Vec<(Site, usize)>) {
+) -> (SiteCounts, SiteCounts) {
     let allowed: BTreeMap<Site, usize> = allowed
         .iter()
         .map(|&(file, item, count)| ((file.to_owned(), item.to_owned()), count))
