@@ -47,6 +47,9 @@ module Ipe.Package exposing
     , soloAndroid
     , DesktopConfig
     , MobileConfig
+    , PushConfig
+    , ApnsEnvironment(..)
+    , FcmConfig
     , BrowserConfig
     , Orientation(..)
     , Capability(..)
@@ -84,11 +87,22 @@ type alias Package =
 -- All three sections are present and live — the active target is the CLI's
 -- resolved shape+runtime+host, not a field here. `ipe dev build` reads only the
 -- section matching the resolved target; the others are inert at that run.
+--
+-- `servers` lists the origins a client bundle may reach: its
+-- Content-Security-Policy allows `connect-src` to `'self'` plus each listed
+-- origin over `https://` and `wss://`, and nothing else. An omitted or empty
+-- list is an offline bundle. Each entry is exactly `https://` followed by a
+-- lowercase host of `a-z 0-9 -` labels (each 1 to 63 bytes, not starting or
+-- ending with `-`, at most 253 bytes in all) and an optional `:port` (1 to
+-- 65535, no leading zero, never `:443`), with nothing after it. An IP address,
+-- a `user@` part, a `*` wildcard, uppercase and non-ASCII are refused. At most
+-- 16 origins are listed, each once.
 type alias Delivery =
     { ships : List Ship
     , desktop : DesktopConfig
     , mobile : MobileConfig
     , browser : BrowserConfig
+    , servers : List String
     }
 
 
@@ -176,10 +190,40 @@ type alias DesktopConfig =
 --
 -- `bundleId` is the reverse-DNS application identifier required by both
 -- platforms (`com.example.myapp`). `orientation` locks the device orientation
--- on launch; the host's native shell enforces it.
+-- on launch; the host's native shell enforces it. `push` names the identifiers
+-- the shells register for push messages with; it is refused unless
+-- `capabilities.accepts` lists `JsPort Push`, and an iOS or Android pack of an
+-- app that accepts `JsPort Push` is refused without it.
 type alias MobileConfig =
     { bundleId : String
     , orientation : Orientation
+    , push : PushConfig
+    }
+
+
+-- | `delivery.mobile.push`: the APNs environment and the Firebase client
+-- identifiers. Both fields are required.
+type alias PushConfig =
+    { apns : ApnsEnvironment
+    , fcm : FcmConfig
+    }
+
+
+-- | The APNs environment an iOS shell registers in: `Development` for a
+-- development-signed build, `Production` for a distribution-signed one.
+type ApnsEnvironment
+    = Development
+    | Production
+
+
+-- | The Firebase client identifiers the Android shell registers with. They are
+-- public client identifiers, never server credentials. Every field is
+-- required; each is 1 to 128 bytes of `A-Z a-z 0-9 : _ . -`.
+type alias FcmConfig =
+    { projectId : String
+    , applicationId : String
+    , apiKey : String
+    , senderId : String
     }
 
 

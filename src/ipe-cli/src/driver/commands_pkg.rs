@@ -246,6 +246,34 @@ pub fn validate_mobile_shape(
     pack::mobile::require_web_spa(cap).map_err(|r| CliError::Usage(crate::text::Message::relay(&r)))
 }
 
+/// Every refusal [`BundleAssembler::gate_mobile`] runs before it mints a
+/// [`GatedMobile`]: the shape gate ([`validate_mobile_shape`]), then the push
+/// configuration a mobile shell needs to register when the project accepts
+/// push.
+///
+/// # Errors
+/// [`CliError::Usage`] wrapping a [`pack::mobile::MobileRefusal`] when the
+/// shape is not a wasm-enabled `Web` app, or when the project accepts push but
+/// names no `delivery.mobile.push`.
+fn validate_mobile_pack(
+    manifest: &project::ProjectManifest,
+    built: delivery::Shape,
+) -> Result<(), CliError> {
+    validate_mobile_shape(
+        manifest.default_program().and_then(|p| p.shape),
+        built,
+        &manifest.wasm,
+    )?;
+    manifest
+        .mobile_push()
+        .map_err(|project::PushUnconfigured| {
+            CliError::Usage(crate::text::Message::relay(
+                &pack::mobile::MobileRefusal::PushUnconfigured,
+            ))
+        })?;
+    Ok(())
+}
+
 // ── Assembly seam ─────────────────────────────────────────────────────────────
 //
 // `BundleAssembler` owns the cargo-spawn and filesystem I/O that must happen
@@ -379,19 +407,7 @@ impl<'a> BundleAssembler<'a> {
         held: &'a HeldBuild,
         profile: BundleProfile,
     ) -> Result<GatedMobile<'a>, CliError> {
-        let manifest = held.root().manifest();
-        validate_mobile_shape(
-            manifest.default_program().and_then(|p| p.shape),
-            held.shape(),
-            &manifest.wasm,
-        )?;
-        manifest
-            .mobile_push()
-            .map_err(|project::PushUnconfigured| {
-                CliError::Usage(crate::text::Message::relay(
-                    &pack::mobile::MobileRefusal::PushUnconfigured,
-                ))
-            })?;
+        validate_mobile_pack(held.root().manifest(), held.shape())?;
         Ok(GatedMobile(Self::new(held, profile)))
     }
 
@@ -4024,6 +4040,48 @@ mod mobile_base_tests {
             matches!(&result, Err(CliError::Usage(shown)) if *shown == refusal),
             "a base changed during the build must be refused, got {result:?}"
         );
+    }
+
+    /// Read a wasm-solo project accepting push whose `delivery.mobile` is the
+    /// record `mobile`, through the manifest reader the pack reads.
+    fn push_project(test_name: &str, mobile: &str) -> project::ProjectManifest {
+        let manifest = write_project(test_name, "/");
+        std::fs::write(
+            &manifest,
+            format!(
+                "module Package exposing (package)\n\npackage =\n    {{ name = \"x\"\n    \
+                 , wasm = On {{ mode = Solo }}\n    \
+                 , capabilities = {{ accepts = [ JsPort Push ] }}\n    \
+                 , delivery = {{ mobile = {mobile} }}\n    }}\n"
+            ),
+        )
+        .expect("write package.ipe");
+        let parsed = project::parse_manifest(&manifest);
+        let _ = std::fs::remove_dir_all(manifest.parent().expect("project root"));
+        parsed.expect("a push-accepting manifest reads")
+    }
+
+    /// A mobile pack of a project that accepts push but names no
+    /// `delivery.mobile.push` is refused by the gate itself; the same project
+    /// with identifiers passes.
+    #[test]
+    fn mobile_gate_refuses_accepted_push_without_identifiers() {
+        let unconfigured = push_project("push_unconfigured", "{ bundleId = \"com.example.app\" }");
+        let result = validate_mobile_pack(&unconfigured, delivery::Shape::Web);
+        let refusal = text::Message::relay(&pack::mobile::MobileRefusal::PushUnconfigured);
+        assert!(
+            matches!(&result, Err(CliError::Usage(shown)) if *shown == refusal),
+            "accepted push without identifiers must be refused, got {result:?}"
+        );
+
+        let configured = push_project(
+            "push_configured",
+            "{ bundleId = \"com.example.app\", push = { apns = Development, fcm = { \
+             projectId = \"example-app\", applicationId = \"1:123:android:abc\", \
+             apiKey = \"AIza-key_1\", senderId = \"123\" } } }",
+        );
+        let result = validate_mobile_pack(&configured, delivery::Shape::Web);
+        assert!(result.is_ok(), "{result:?}");
     }
 
     /// An unchanged base passes once the build has run.

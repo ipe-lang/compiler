@@ -285,13 +285,20 @@ fn parse_fcm_identifier(text: &str) -> Result<String, FcmIdentifierRefusal> {
 }
 
 /// Declares one role-typed FCM identifier, so no identifier is passable for
-/// another.
+/// another. `Debug` names the role and never the text, so a debug dump of a
+/// manifest cannot carry an identifier into a log or a diagnostic.
 macro_rules! fcm_identifier {
     ($($(#[doc = $doc:expr])* $name:ident,)+) => {
         $(
             $(#[doc = $doc])*
-            #[derive(Clone, Debug, PartialEq, Eq)]
+            #[derive(Clone, PartialEq, Eq)]
             pub struct $name(String);
+
+            impl std::fmt::Debug for $name {
+                fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                    f.write_str(concat!(stringify!($name), "(..)"))
+                }
+            }
 
             impl $name {
                 /// Parse `text` against the FCM identifier grammar.
@@ -1740,6 +1747,24 @@ pub use ipe_db::extract_imports_from_source;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fcm_identifier_debug_never_prints_the_text() {
+        let key = "AIzaSyKeyMaterial_1";
+        let ids = FcmIdentifiers {
+            project_id: FcmProjectId::parse("proj-one").expect("a valid project id"),
+            application_id: FcmApplicationId::parse("1:23:android:ab")
+                .expect("a valid application id"),
+            api_key: FcmApiKey::parse(key).expect("a valid api key"),
+            sender_id: FcmSenderId::parse("12345").expect("a valid sender id"),
+        };
+        let dump = format!("{ids:?}");
+        for text in [key, "proj-one", "1:23:android:ab", "12345"] {
+            assert!(!dump.contains(text), "`{text}` leaked into `{dump}`");
+        }
+        assert!(dump.contains("FcmApiKey(..)"), "{dump}");
+        assert_eq!(ids.api_key.as_str(), key);
+    }
 
     #[test]
     fn is_module_segment_rules() {

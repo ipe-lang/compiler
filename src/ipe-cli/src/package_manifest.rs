@@ -520,14 +520,31 @@ impl Reader<'_> {
     // ── shared record primitives (reused by the FFI foreign-record reader) ────
 
     /// Require `expr` to be a record literal `{ … }`, returning its
-    /// `(field-name, value)` pairs. Any other shape is rejected — a manifest
-    /// section is data, never a computed value.
+    /// `(field-name, value)` pairs, each name once. Any other shape is rejected
+    /// — a manifest section is data, never a computed value — and so is a
+    /// repeated field, which would otherwise let the last spelling silently
+    /// win.
     fn expect_record<'e>(
         &self,
         expr: &'e Expr,
     ) -> Result<&'e [(Located<ipe_intern::Symbol>, Expr)], CliError> {
         match &expr.value {
-            Expr_::Record(fields) => Ok(fields.as_slice()),
+            Expr_::Record(fields) => {
+                let mut seen = BTreeSet::new();
+                for (fname, _) in fields {
+                    if !seen.insert(fname.value) {
+                        return Err(self.reject(
+                            fname.span,
+                            &format!(
+                                "`{}` is set twice in one record — a field is written once. \
+                                 Remove the repeat.",
+                                self.text(fname.value)
+                            ),
+                        ));
+                    }
+                }
+                Ok(fields.as_slice())
+            }
             _ => Err(self.reject(
                 expr.span,
                 "expected a record literal `{ … }` — a package.ipe section is written as a record \
@@ -3003,6 +3020,44 @@ mod tests {
         format!(
             "{{ mobile = {{ bundleId = \"com.example.app\", push = {{ apns = Production, fcm = {{ projectId = \"example-app\", applicationId = \"1:123:android:abc\", apiKey = {api_key:?}, senderId = \"123\" }} }} }} }}"
         )
+    }
+
+    #[test]
+    fn manifest_repeated_record_field_is_refused() {
+        let twice_key = refusal_text(
+            "push_api_key_twice_refused",
+            &delivery_manifest(
+                "{ mobile = { bundleId = \"com.example.app\", push = { apns = Production, fcm = { projectId = \"example-app\", applicationId = \"1:123:android:abc\", apiKey = \"AIza-first\", apiKey = \"AIza-second\", senderId = \"123\" } } } }",
+                "JsPort Push",
+            ),
+        );
+        assert!(
+            twice_key
+                .as_deref()
+                .is_some_and(|msg| msg.contains("`apiKey` is set twice")),
+            "a repeated fcm field is refused, never last-wins: {twice_key:?}"
+        );
+        let twice_servers = refusal_text(
+            "servers_key_twice_refused",
+            &delivery_manifest(
+                "{ servers = [ \"https://a.example\" ], servers = [ \"https://b.example\" ] }",
+                "",
+            ),
+        );
+        assert!(
+            twice_servers
+                .as_deref()
+                .is_some_and(|msg| msg.contains("`servers` is set twice")),
+            "a repeated delivery field is refused: {twice_servers:?}"
+        );
+        assert!(
+            read(
+                "servers_key_once_accepted",
+                &delivery_manifest("{ servers = [ \"https://a.example\" ] }", ""),
+            )
+            .is_ok(),
+            "the same record with the field once reads"
+        );
     }
 
     #[test]
