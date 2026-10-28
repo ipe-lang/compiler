@@ -8,14 +8,13 @@
 //! that sits in an imported module but is never reached is neither refused nor
 //! emitted, and one that is reached is refused at `ipe` time.
 //!
-//! The closure is a superset of the lowered survivors by construction: the
-//! seeds are the lowerer's seeds (its backend roots unconditionally), and every
-//! lowered call edge comes from a canonical `VarTopLevel` reference. A program
-//! whose entry is missing, or is not the linked module's own `main`, keeps every
-//! def — the same fail-closed fallback the lowerer takes, where nothing is
-//! pruned. The build re-judges the lowered survivors after lowering
-//! (`target_gate::check_emitted_for_target`), so an edge the lowerer adds that
-//! this closure does not model is still refused.
+//! The closure covers every canonical `VarTopLevel` edge, from the lowerer's own
+//! seeds (its backend roots unconditionally). Edges the lowerer synthesises with
+//! no canonical reference (the `Ipe.Db.Store` helpers) lie outside it; only
+//! `target_gate::check_emitted_for_target`, which re-judges the lowered
+//! survivors after lowering, covers those. A program whose entry is missing, or
+//! is not the linked module's own `main`, keeps every def — the same fail-closed
+//! fallback the lowerer takes, where nothing is pruned.
 
 use std::collections::{HashMap, VecDeque};
 

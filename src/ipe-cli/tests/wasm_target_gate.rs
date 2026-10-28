@@ -52,6 +52,24 @@ fn build_wasm(fixture: &ipe::RootFixture, out: &Path) -> Result<(), CliError> {
     ipe::build_fixture_with_options(fixture, out, &runtime, &wasm_options()).map(drop)
 }
 
+/// Every emitted `.rs` file under `out/src`, concatenated: a function lives in
+/// `main.rs` or in a per-module file, so an absence check must read them all.
+fn emitted_sources(out: &Path) -> Result<String, Box<dyn std::error::Error>> {
+    let mut all = String::new();
+    let mut pending = vec![out.join("src")];
+    while let Some(dir) = pending.pop() {
+        for entry in std::fs::read_dir(&dir)? {
+            let path = entry?.path();
+            if path.is_dir() {
+                pending.push(path);
+            } else if path.extension().is_some_and(|ext| ext == "rs") {
+                all.push_str(&std::fs::read_to_string(&path)?);
+            }
+        }
+    }
+    Ok(all)
+}
+
 /// A pure `Ipe.Ui` TEA app: the smallest program the wasm target accepts.
 const PURE_UI_APP: &str = "module Main exposing (main)\n\
          import Ipe.String as String\n\
@@ -627,7 +645,8 @@ fn task_map_and_attempt_build_for_the_client() -> Result<(), Box<dyn std::error:
     build_wasm(&fixture, &out).map_err(|e| format!("Ipe.Task must pass the wasm gate: {e:?}"))?;
     let main_rs = std::fs::read_to_string(out.join("src/main.rs"))?;
     assert!(main_rs.contains("fn main_count_label"), "{main_rs}");
-    assert!(!main_rs.contains("linear_backoff"), "{main_rs}");
+    let emitted = emitted_sources(&out)?;
+    assert!(!emitted.contains("linear_backoff"), "{emitted}");
     Ok(())
 }
 
@@ -702,7 +721,8 @@ fn server_only_kernel_behind_an_unreached_helper_builds_and_is_not_emitted()
         .map_err(|e| format!("an unreached server-only helper must not refuse: {e:?}"))?;
     let main_rs = std::fs::read_to_string(out.join("src/main.rs"))?;
     assert!(main_rs.contains("fn main_count_label"), "{main_rs}");
-    assert!(!main_rs.contains("unused_load"), "{main_rs}");
+    let emitted = emitted_sources(&out)?;
+    assert!(!emitted.contains("unused_load"), "{emitted}");
     Ok(())
 }
 
@@ -809,4 +829,21 @@ fn server_only_kernel_still_builds_natively() {
     let runtime = e2e_support::require_runtime().into_path_buf();
     ipe::build_fixture_with_options(&fixture, &out, &runtime, &BuildOptions::default())
         .expect("native build of the same program must stay green");
+}
+
+/// The post-lowering re-judge is the backstop for edges the lowerer synthesises
+/// with no canonical reference; it must run on the program the manifest is cut
+/// from, before any file is emitted.
+#[test]
+fn the_emitted_set_is_rejudged_before_the_manifest_is_emitted() {
+    let source = include_str!("../src/driver/build_pipeline.rs");
+    let body = source
+        .split_once("pub fn compile_prepared(")
+        .map_or("", |(_, rest)| rest);
+    let judged = body.find("check_emitted_for_target(");
+    let emitted = body.find("ipe_db::emit_manifest(");
+    assert!(
+        judged.is_some() && emitted.is_some() && judged < emitted,
+        "compile_prepared must call check_emitted_for_target before emit_manifest"
+    );
 }
