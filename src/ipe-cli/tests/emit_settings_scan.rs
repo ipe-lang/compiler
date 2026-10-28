@@ -1115,13 +1115,12 @@ fn refused_by_scan(breaches: &[(&str, &str)]) -> Result<(), String> {
     Ok(())
 }
 
-/// Each guarded spelling at its admitted site, and every pattern or test
-/// item, is out of scope.
-#[test]
-fn an_admitted_site_is_not_refused() -> Result<(), String> {
+/// One source per file, each holding every guarded spelling the file's
+/// admitted sites name.
+fn admitted_sources() -> [(&'static str, &'static str); 7] {
     let pipeline = "src/ipe-cli/src/driver/build_pipeline.rs";
     let delivery = "src/ipe-cli/src/delivery.rs";
-    let admitted = [
+    [
         (
             pipeline,
             "fn manifest_emit_settings() { match h { HostIntent::Served => EmitHost::Served, \
@@ -1152,7 +1151,11 @@ fn an_admitted_site_is_not_refused() -> Result<(), String> {
         (
             "src/ipe-cli/src/driver/commands.rs",
             "fn acknowledge_unsafe_imports() { gate(&manifest.capabilities_accept); }\n\
-             fn gate_web_consent() { gate(&manifest.capabilities_accept); }\n",
+             fn gate_web_consent() { gate(&manifest.capabilities_accept); }\n\
+             fn run_eject() { go(HostIntent::Served); }\n\
+             fn release_pipeline() { go(HostIntent::Served); go(HostIntent::Served); \
+             go(HostIntent::Served); }\n\
+             fn front_check() { go(HostIntent::Served); }\n",
         ),
         (
             "src/ipe-cli/src/run_sandbox.rs",
@@ -1174,8 +1177,14 @@ fn an_admitted_site_is_not_refused() -> Result<(), String> {
              fn build_under_pinned_manifest() { let after = ManifestPin::of(&parse(p)?); }\n\
              fn run_project_tests_with() { go(HostIntent::Served); }\n",
         ),
-    ];
-    for (rel, source) in admitted {
+    ]
+}
+
+/// Each guarded spelling at its admitted site, and every pattern or test
+/// item, is out of scope.
+#[test]
+fn an_admitted_site_is_not_refused() -> Result<(), String> {
+    for (rel, source) in admitted_sources() {
         assert_eq!(
             planted(rel, source)?,
             Vec::<String>::new(),
