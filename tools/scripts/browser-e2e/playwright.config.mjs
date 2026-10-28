@@ -4,7 +4,8 @@
  * select-hold and live-property specs on the geo-clipboard app, and the
  * focus-across-patch refusals on their own app, the host-rebind refusal
  * on the layout-fill app, and the live-tabs, closed-session and event-answer
- * refusals on the geo-clipboard app).
+ * refusals on the geo-clipboard app, and the wasm-solo port round-trip and
+ * glue refusals on the serverless wasm-solo-clipboard bundle).
  *
  * A single Chromium project — the only browser target for these tests.
  * The geo/clipboard browser APIs (navigator.geolocation,
@@ -31,6 +32,7 @@ export default {
     "csp.spec.mjs",
     "session-closed.spec.mjs",
     "event-refused.spec.mjs",
+    "wasm-solo-port.spec.mjs",
   ],
   timeout: 30_000,
   retries: 0,

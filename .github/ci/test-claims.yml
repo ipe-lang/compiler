@@ -22,7 +22,7 @@ cells:
     platform: wasm32-unknown-unknown
     features: [wasm-client]
     owner: wasm-floor
-    expect_tests: 2
+    expect_tests: 4
   - package: ipe-runtime-rust
     target: {test: wasm_dom_paint}
     platform: wasm32-unknown-unknown

@@ -12,10 +12,13 @@
 #      csp-styles) via `ipe dev build`.
 #   3. Cargo-builds each emitted Rust project.
 #   4. Spawns each binary on its port.
-#   5. Runs the Playwright specs.
-#   6. Kills the binaries on exit.
+#   5. Builds the wasm-solo-clipboard browser bundle (`ipe dev build … web solo`),
+#      which the spec serves from its `www/` directory with no server.
+#   6. Runs the Playwright specs.
+#   7. Kills the binaries on exit.
 #
-# Prerequisites: node, npx, Rust toolchain, IPE_RUNTIME_DIR set (or run
+# Prerequisites: node, npx, Rust toolchain with the wasm32-unknown-unknown
+# target, the wasm-bindgen CLI, IPE_RUNTIME_DIR set (or run
 # from the repo root where scripts/ipe-index wakeup auto-discovers it).
 set -euo pipefail
 
@@ -85,6 +88,25 @@ serve geo-clipboard "$GEO_PORT"
 serve layout-fill "$LAYOUT_PORT"
 serve focus-across-patch "$FOCUS_PORT"
 serve csp-styles "$CSP_STYLES_PORT"
+
+# bundle_solo NAME — build examples/shapes/web/NAME as the `web solo` browser
+# bundle and export its `www/` directory, which the spec serves with no server.
+bundle_solo() {
+  local name="$1"
+  local out="${TMPDIR:-/tmp}/$name-browser-e2e"
+
+  echo "==> Building the $name browser bundle..."
+  rm -rf "$out"
+  "$IPE" dev build "$REPO_ROOT/examples/shapes/web/$name" web solo --out "$out"
+  # Fail closed: a bundle without its shell leaves the spec nothing to serve.
+  if [ ! -f "$out/rust/www/index.html" ]; then
+    echo "   $name bundle has no www/index.html under '$out/rust'" >&2
+    exit 1
+  fi
+  export IPE_WASM_SOLO_WWW="$out/rust/www"
+}
+
+bundle_solo wasm-solo-clipboard
 
 echo "==> Installing Playwright + Chromium (if not cached)..."
 cd "$SPEC_DIR"

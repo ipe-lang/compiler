@@ -1,0 +1,22 @@
+module Package exposing (package)
+
+import Ipe.Package exposing (..)
+
+
+package : Package
+package =
+    { name = "wasm-solo-clipboard"
+    , version = "0.1.0"
+    , capabilities =
+        { declares = []
+        -- `Ipe.Browser.Clipboard` discloses its own port axis and the `:raw`
+        -- floor it reaches through `Js.send`/`Js.subscribe`.
+        , accepts = [ JsPort Clipboard, JsPort Raw ]
+        }
+    , delivery =
+        { ships = [ solo ]
+        , desktop = { title = "wasm-solo-clipboard", width = 1024, height = 768 }
+        , mobile = { bundleId = "com.example.wasmsoloclipboard", orientation = Portrait }
+        , browser = { basePath = "/" }
+        }
+    }
