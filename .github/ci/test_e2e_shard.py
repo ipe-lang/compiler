@@ -82,8 +82,9 @@ class SelectionTest(unittest.TestCase):
         self.assertEqual([es.selection(k) for k in range(1, es.SHARDS + 1)], want)
 
     def test_groups_are_sized_to_the_matrix_width(self) -> None:
-        self.assertEqual(es.SHARDS, 14)
-        self.assertEqual(es.shard_total(es.GROUPS), 14)
+        self.assertEqual(es.TOTAL_SHARDS, 14)
+        self.assertEqual(es.SHARDS, es.TOTAL_SHARDS)
+        self.assertEqual(es.shard_total(es.GROUPS), es.TOTAL_SHARDS)
 
     def test_named_groups_split_the_heavy_set(self) -> None:
         # The two multi-minute coverage columns each run on a shard alone, and
@@ -98,9 +99,9 @@ class SelectionTest(unittest.TestCase):
                 path = os.path.join(REPO, "src", "ipe-cli", "tests", "stdlib_coverage_dynamic.rs")
                 with open(path, encoding="utf-8") as fh:
                     self.assertIn(f"\n#[test]\nfn {test}() {{", fh.read())
-        self.assertEqual(by_name["heavy"], (es.HEAVY, 3))
-        self.assertEqual(by_name["db-issues"], ("binary(g_db) | binary(g_issues)", 3))
-        self.assertEqual(es.GROUPS[-1], ("light", es.COMPLEMENT, 6))
+        self.assertEqual(by_name["heavy"][0], es.HEAVY)
+        self.assertEqual(by_name["db-issues"][0], "binary(g_db) | binary(g_issues)")
+        self.assertEqual(es.GROUPS[-1][:2], ("light", es.COMPLEMENT))
 
     def test_a_named_group_matching_nothing_is_red(self) -> None:
         # A renamed test leaves its one-test group with an empty selection;
@@ -187,14 +188,162 @@ class GroupTableTest(unittest.TestCase):
                 self.assertTrue(es.group_errors(groups))
 
     def test_shard_total_off_the_matrix_refused(self) -> None:
-        wider = (*es.GROUPS[:-1], ("light", es.COMPLEMENT, 7))
-        narrower = (*es.GROUPS[:-1], ("light", es.COMPLEMENT, 5))
+        light = es.GROUPS[-1][2]
+        wider = (*es.GROUPS[:-1], ("light", es.COMPLEMENT, light + 1))
+        narrower = (*es.GROUPS[:-1], ("light", es.COMPLEMENT, light - 1))
         for groups in (wider, narrower):
             with self.subTest(total=es.shard_total(groups)):
                 self.assertTrue(any("expected 1.." in e for e in es.wiring_errors(WORKFLOW, groups)))
 
     def test_malformed_table_refused_by_the_wiring_check(self) -> None:
         self.assertTrue(es.wiring_errors(WORKFLOW, (*es.GROUPS[:-1], ("light", "binary(x)", 6))))
+
+
+def _times(*rows: str) -> object:
+    return es.parse_times("\n".join(rows) + "\n")
+
+
+def _nextest_group(specs: tuple, binary_id: str, test: str) -> int:
+    """The index of the first group whose filter selects `binary_id test`,
+    read off the same spec `spec_filter` writes the filter from."""
+    name = es.binary_name(binary_id)
+    for i, spec in enumerate(specs):
+        if isinstance(spec, es.OneTest) and name == spec.binary and test == spec.test:
+            return i
+        if isinstance(spec, es.Binaries) and name in spec.binaries:
+            return i
+        if isinstance(spec, es.Rest):
+            return i
+    raise AssertionError("the last group is the complement")
+
+
+class WeightedShardTest(unittest.TestCase):
+    def test_committed_table_loads_and_names_every_isolated_test(self) -> None:
+        times = es.load_times()
+        for spec in es.SPECS:
+            if isinstance(spec, es.OneTest):
+                with self.subTest(spec.name):
+                    self.assertTrue(
+                        any(es.binary_name(b) == spec.binary and t == spec.test for b, t in times.tests),
+                        "regenerate e2e-shard-times.txt with this group's test line",
+                    )
+
+    def test_groups_are_the_allocation_of_the_committed_table(self) -> None:
+        self.assertEqual(es.GROUPS, es.allocate(es.SPECS, es.load_times()))
+        self.assertEqual([name for name, _, _ in es.GROUPS], [s.name for s in es.SPECS])
+        self.assertEqual([f for _, f, _ in es.GROUPS], [es.spec_filter(s) for s in es.SPECS])
+
+    def test_every_test_lands_on_exactly_one_shard(self) -> None:
+        # The self-test of the sharder: model every measured binary (and one
+        # the table lacks, a library and a `bin/` target) as tests, place
+        # each test in its first matching group and then on the shard its
+        # `count:k/n` index picks, and require that the shards together hold
+        # the whole set, each test once, on shards 1..SHARDS only.
+        times = es.load_times()
+        universe: list[tuple[str, str]] = [k for k in times.tests]
+        for binary in [*times.binaries, "ipe::not_in_the_table", "some_lib", "some_crate::bin/tool"]:
+            universe += [(binary, f"t{i}") for i in range(7)]
+        first = [1]
+        for _, _, n in es.GROUPS[:-1]:
+            first.append(first[-1] + n)
+        placed: dict[tuple[str, str], list[int]] = {t: [] for t in universe}
+        index: dict[tuple[int, str], int] = {}
+        for binary, test in universe:
+            g = _nextest_group(es.SPECS, binary, test)
+            n = es.GROUPS[g][2]
+            k = index.get((g, binary), 0)
+            index[(g, binary)] = k + 1
+            placed[(binary, test)].append(first[g] + k % n)
+        self.assertEqual(sum(n for _, _, n in es.GROUPS), es.SHARDS)
+        self.assertTrue(all(len(v) == 1 for v in placed.values()))
+        self.assertEqual(set(placed), set(universe))
+        self.assertTrue(all(1 <= v[0] <= es.SHARDS for v in placed.values()))
+        # And each shard's plan entry names exactly that group and index.
+        plan = es.plan()
+        for g, (start, (_, _, n)) in enumerate(zip(first, es.GROUPS, strict=True)):
+            for k in range(n):
+                entry = plan[str(start + k)]
+                self.assertEqual(entry["partition"], f"count:{k + 1}/{n}")
+                self.assertEqual(entry["filter"], es.effective_filters(es.GROUPS)[g])
+
+    def test_longest_group_gets_the_spare_shards(self) -> None:
+        specs = (
+            es.OneTest("one", "b", "t"),
+            es.Binaries("serial", ("s",), 1),
+            es.Rest("rest", 2),
+        )
+        times = _times("c::b 100", "c::b t 90", "c::s 600", "c::x 1200")
+        # serial: 600 s one at a time; rest: b's other 10 s + x's 1200 s, two at
+        # a time (605 s a shard). Spare shards go rest (302.5), serial (300),
+        # then rest again.
+        self.assertEqual([n for _, _, n in es.allocate(specs, times, total=6)], [1, 2, 3])
+        self.assertEqual(es.group_weights(specs, times), [90, 600, 1210])
+
+    def test_unmeasured_named_binary_weighs_the_default(self) -> None:
+        specs = (es.Binaries("named", ("absent", "s"), 1), es.Rest("rest", 1))
+        times = _times("c::s 10", "c::x 5")
+        self.assertEqual(es.group_weights(specs, times), [es.DEFAULT_WEIGHT_S + 10, 5])
+
+    def test_every_sized_group_keeps_a_shard(self) -> None:
+        specs = (es.Binaries("tiny", ("s",), 1), es.Rest("rest", 1))
+        groups = es.allocate(specs, _times("c::s 0", "c::x 10000"), total=5)
+        self.assertEqual([n for _, _, n in groups], [1, 4])
+
+    def test_more_groups_than_shards_is_refused(self) -> None:
+        with self.assertRaises(es.ShardError):
+            es.allocate(es.SPECS, es.load_times(), total=len(es.SPECS) - 1)
+
+    def test_malformed_specs_are_refused(self) -> None:
+        for specs in (
+            (),
+            (es.Binaries("a", ("x",), 1),),
+            (es.Rest("a", 1), es.Rest("b", 1)),
+            (es.Binaries("a", (), 1), es.Rest("b", 1)),
+            (es.Binaries("a", ("x",), 0), es.Rest("b", 1)),
+            (es.Binaries("a", ("x",), True), es.Rest("b", 1)),
+            (es.Rest("b", 0),),
+            ("all()",),
+        ):
+            with self.subTest(specs=specs):
+                self.assertTrue(es.spec_errors(specs))
+                with self.assertRaises(es.ShardError):
+                    es.allocate(specs, _times("c::x 1"))  # type: ignore[arg-type]
+
+    def test_malformed_time_tables_are_refused(self) -> None:
+        for rows in (
+            (),
+            ("# only a comment",),
+            ("c::x",),
+            ("c::x 1 2 3",),
+            ("c::x -1",),
+            ("c::x 1.5",),
+            ("c::x ten",),
+            ("c::x \u0661",),
+            (f"c::x {es.MAX_WEIGHT_S + 1}",),
+            ("c::x 1", "c::x 2"),
+            ("c x 1",),
+            ("c::bad/path 1",),
+            ("c::x t 1",),
+            ("c::x 1", "c::x t 2"),
+            ("c::x 5", "c::x t 1", "c::x t 1"),
+            ("c::x 5", "c::x t(=x) 1"),
+            ("c::x  5",),
+        ):
+            with self.subTest(rows=rows), self.assertRaises(es.ShardError):
+                _times(*rows)
+
+    def test_time_table_past_its_ceilings_is_refused(self) -> None:
+        with self.assertRaises(es.ShardError):
+            es.parse_times("\n".join(f"c::b{i} 1" for i in range(es.MAX_TIMES_ROWS + 1)))
+        with self.assertRaises(es.ShardError):
+            es.parse_times("#" * (es.MAX_TIMES_BYTES + 1))
+        with self.assertRaises(es.ShardError):
+            es.load_times(os.path.join(HERE, "no-such-times.txt"))
+
+    def test_binary_names_follow_nextest_binary_ids(self) -> None:
+        self.assertEqual(es.binary_name("ipe::g_db"), "g_db")
+        self.assertIsNone(es.binary_name("ipe"))
+        self.assertIsNone(es.binary_name("ipe_docs::bin/gen_site"))
 
 
 class PlanTest(unittest.TestCase):

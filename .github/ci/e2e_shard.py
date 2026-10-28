@@ -2,7 +2,8 @@
 """SSOT for the e2e SEAL shard partition: its selection, its plan, its wiring.
 
 A shard's test selection is defined here once, as an ordered table of shard
-groups whose last group takes the complement. `--plan` publishes every shard's
+groups whose last group takes the complement, sized from the measured time
+table `e2e-shard-times.txt`. `--plan` publishes every shard's
 selection as the `changes` job output `e2e_plan`; each `e2e` matrix shard runs
 `cargo nextest run` on its own entry of that plan, and `seal-slice-cover`
 proves (`tools/scripts/e2e-shard-cover.py`, from the run's own nextest archive,
@@ -28,7 +29,9 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
+from dataclasses import dataclass
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(os.path.dirname(HERE))
@@ -56,35 +59,93 @@ SHARD_ENV = {
 # `ci` nextest profile serializes this set into `heavy-server-e2e`
 # (max-threads=1), so its tests are spread across parallel runners rather than
 # queued behind each other on one.
-HEAVY = (
-    "binary(watch_sigterm) | binary(watch_integration) | binary(watch_hot_appearance)"
-    " | binary(watch_bluegreen) | binary(watch_cancellation) | binary(server_e2e)"
-    " | binary(live_e2e) | binary(http_e2e) | binary(g_http_live) | binary(webview_e2e)"
-    " | binary(secured_store_e2e) | binary(server_shutdown_e2e) | binary(test_command) | binary(verify) | binary(stdlib_coverage_dynamic)"
+HEAVY_BINARIES = (
+    "watch_sigterm",
+    "watch_integration",
+    "watch_hot_appearance",
+    "watch_bluegreen",
+    "watch_cancellation",
+    "server_e2e",
+    "live_e2e",
+    "http_e2e",
+    "g_http_live",
+    "webview_e2e",
+    "secured_store_e2e",
+    "server_shutdown_e2e",
+    "test_command",
+    "verify",
+    "stdlib_coverage_dynamic",
 )
+HEAVY = " | ".join(f"binary({b})" for b in HEAVY_BINARIES)
 COMPLEMENT = "all()"
+# Every e2e shard runs nextest with `--test-threads=TEST_THREADS`.
+TEST_THREADS = 2
+# The `e2e` matrix width: the shard groups share exactly this many shards.
+TOTAL_SHARDS = 14
 
-# The shard groups, in order: `(name, filter, shards)`. Group i selects
-# `filter_i` minus every earlier group's filter (`effective_filters`), and the
-# last group's filter is `COMPLEMENT`, so every test is in exactly one group
-# whatever the filters match; each group's tests are split by
-# `--partition count:k/shards`. The sizes balance measured test time and are
-# advisory only: a test no named group matches still runs in the complement,
-# and `e2e-shard-cover.py` proves the partition on every run's archive.
+
+@dataclass(frozen=True)
+class OneTest:
+    """A group of one test, on one shard of its own."""
+
+    name: str
+    binary: str
+    test: str
+
+
+@dataclass(frozen=True)
+class Binaries:
+    """A group of whole test binaries, `in_flight` of its tests at a time."""
+
+    name: str
+    binaries: tuple[str, ...]
+    in_flight: int
+
+
+@dataclass(frozen=True)
+class Rest:
+    """The complement: every test no earlier group selects."""
+
+    name: str
+    in_flight: int
+
+
+GroupSpec = OneTest | Binaries | Rest
+
+# The shard groups, in order. Group i selects its own filter minus every
+# earlier group's (`effective_filters`), and the last group is the complement,
+# so every test is in exactly one group whatever the filters match; each
+# group's tests are split by `--partition count:k/shards`. A `OneTest` group
+# takes one shard; the `Binaries` and `Rest` groups share the rest of the
+# `TOTAL_SHARDS` in proportion to their measured time (`allocate`, from
+# `TIMES_FILE`). The sizes are advisory only: a test no named group matches
+# still runs in the complement, and `e2e-shard-cover.py` proves the partition
+# on every run's archive.
 # - each multi-minute `stdlib_coverage_dynamic` column test gets a shard alone,
 #   since the heavy group runs serially and either one would set a shard's
 #   length;
-# - the rest of the serialized heavy set;
+# - the rest of the serialized heavy set, one test at a time;
 # - the two longest light binaries, kept apart from the rest so their tests
 #   spread evenly instead of landing in one complement shard;
-# - the complement, at full width.
-GROUPS: tuple[tuple[str, str, int], ...] = (
-    ("coverage-build-run", "binary(stdlib_coverage_dynamic) & test(=build_run_column_over_a_representative_slice)", 1),
-    ("coverage-dynamic-columns", "binary(stdlib_coverage_dynamic) & test(=dynamic_columns_pass_over_the_whole_surface)", 1),
-    ("heavy", HEAVY, 3),
-    ("db-issues", "binary(g_db) | binary(g_issues)", 3),
-    ("light", COMPLEMENT, 6),
+# - the complement.
+SPECS: tuple[GroupSpec, ...] = (
+    OneTest("coverage-build-run", "stdlib_coverage_dynamic", "build_run_column_over_a_representative_slice"),
+    OneTest("coverage-dynamic-columns", "stdlib_coverage_dynamic", "dynamic_columns_pass_over_the_whole_surface"),
+    Binaries("heavy", HEAVY_BINARIES, 1),
+    Binaries("db-issues", ("g_db", "g_issues"), TEST_THREADS),
+    Rest("light", TEST_THREADS),
 )
+
+TIMES_FILE = os.path.join(HERE, "e2e-shard-times.txt")
+# The weight of a binary a group names but `TIMES_FILE` lacks: the `ci`
+# profile's per-test ceiling (300 s), so an unmeasured binary is sized as at
+# least one test at the longest a test may run, never as free.
+DEFAULT_WEIGHT_S = 300
+MAX_WEIGHT_S = 7 * 24 * 3600
+MAX_TIMES_BYTES = 1024 * 1024
+MAX_TIMES_ROWS = 20_000
+_BINARY_ID = re.compile(r"[A-Za-z0-9_-]+(::(bin/)?[A-Za-z0-9_-]+)?\Z")
+_TEST_NAME = re.compile(r"[A-Za-z0-9_:]+\Z")
 
 
 class ShardError(Exception):
@@ -136,6 +197,153 @@ def effective_filters(groups: tuple[tuple[str, str, int], ...]) -> list[str]:
     return out
 
 
+@dataclass(frozen=True)
+class Times:
+    """`TIMES_FILE`: seconds per nextest binary id, and per isolated test."""
+
+    binaries: dict[str, int]
+    tests: dict[tuple[str, str], int]
+
+
+def parse_times(text: str) -> Times:
+    """Parse the time table; any malformed, duplicate, or oversized row refuses it all."""
+    if len(text.encode()) > MAX_TIMES_BYTES:
+        raise ShardError(f"the time table is over {MAX_TIMES_BYTES} bytes")
+    binaries: dict[str, int] = {}
+    tests: dict[tuple[str, str], int] = {}
+    rows = 0
+    for n, line in enumerate(text.splitlines(), 1):
+        if not line.strip() or line.startswith("#"):
+            continue
+        rows += 1
+        if rows > MAX_TIMES_ROWS:
+            raise ShardError(f"the time table has over {MAX_TIMES_ROWS} rows")
+        words = line.split(" ")
+        if len(words) not in (2, 3) or not words[-1].isascii() or not words[-1].isdigit():
+            raise ShardError(f"time table line {n} is not `<binary-id> [<test>] <seconds>`: {line!r}")
+        seconds = int(words[-1])
+        if seconds > MAX_WEIGHT_S:
+            raise ShardError(f"time table line {n}: {seconds} s is over {MAX_WEIGHT_S}")
+        if not _BINARY_ID.match(words[0]):
+            raise ShardError(f"time table line {n}: {words[0]!r} is not a nextest binary id")
+        if len(words) == 2:
+            if words[0] in binaries:
+                raise ShardError(f"time table line {n}: {words[0]!r} is listed twice")
+            binaries[words[0]] = seconds
+            continue
+        key = (words[0], words[1])
+        if not _TEST_NAME.match(words[1]):
+            raise ShardError(f"time table line {n}: {words[1]!r} is not a test name")
+        if words[0] not in binaries:
+            raise ShardError(f"time table line {n}: test of {words[0]!r} precedes that binary's own line")
+        if key in tests:
+            raise ShardError(f"time table line {n}: test {words[1]!r} is listed twice")
+        if seconds > binaries[words[0]]:
+            raise ShardError(f"time table line {n}: a test outweighs its whole binary")
+        tests[key] = seconds
+    if not binaries:
+        raise ShardError("the time table lists no binary")
+    return Times(binaries, tests)
+
+
+def load_times(path: str = TIMES_FILE) -> Times:
+    """Read and parse the time table; an unreadable one is refused."""
+    try:
+        with open(path, encoding="utf-8") as fh:
+            text = fh.read(MAX_TIMES_BYTES + 1)
+    except (OSError, UnicodeDecodeError) as exc:
+        raise ShardError(f"the time table is unreadable: {exc}") from None
+    return parse_times(text)
+
+
+def binary_name(binary_id: str) -> str | None:
+    """The name `binary(...)` matches for an integration-test binary id
+    (`crate::name`), or None for a library or `bin/` target, which no named
+    group selects."""
+    _, sep, name = binary_id.partition("::")
+    return name if sep and not name.startswith("bin/") else None
+
+
+def spec_filter(spec: GroupSpec) -> str:
+    """The nextest filter of one group, before earlier groups are excluded."""
+    if isinstance(spec, OneTest):
+        return f"binary({spec.binary}) & test(={spec.test})"
+    if isinstance(spec, Binaries):
+        return " | ".join(f"binary({b})" for b in spec.binaries)
+    return COMPLEMENT
+
+
+def spec_errors(specs: object) -> list[str]:
+    """Why `specs` is not a group spec table a time table can size, or []."""
+    if not isinstance(specs, tuple) or not specs:
+        return ["the group specs must be a non-empty tuple"]
+    errors: list[str] = []
+    for i, spec in enumerate(specs, start=1):
+        if not isinstance(spec, (OneTest, Binaries, Rest)):
+            errors.append(f"group spec {i} is not a OneTest, Binaries, or Rest")
+        elif isinstance(spec, Rest) != (i == len(specs)):
+            errors.append(f"group spec {i} ({spec.name!r}): the complement must be the last group, and only it")
+        elif isinstance(spec, Binaries) and not spec.binaries:
+            errors.append(f"group spec {i} ({spec.name!r}) names no binary")
+        elif not isinstance(spec, OneTest) and (
+            isinstance(spec.in_flight, bool) or not isinstance(spec.in_flight, int) or spec.in_flight < 1
+        ):
+            errors.append(f"group spec {i} ({spec.name!r}) must run at least one test at a time")
+    return errors
+
+
+def group_weights(specs: tuple[GroupSpec, ...], times: Times) -> list[int]:
+    """Each group's measured seconds, over the tests it selects once earlier
+    groups are excluded; a named binary the table lacks weighs
+    `DEFAULT_WEIGHT_S`. A `OneTest` group's weight is not used (it takes one
+    shard) and is reported as its test's own time."""
+    claimed_tests: set[tuple[str, str]] = set()
+    claimed_names: set[str] = set()
+    out: list[int] = []
+    for spec in specs:
+        if isinstance(spec, OneTest):
+            keys = {k for k in times.tests if binary_name(k[0]) == spec.binary and k[1] == spec.test}
+            keys -= claimed_tests
+            out.append(sum(times.tests[k] for k in keys))
+            claimed_tests |= keys
+            continue
+        if isinstance(spec, Binaries):
+            names = [b for b in spec.binaries if b not in claimed_names]
+            ids = [i for i in times.binaries if binary_name(i) in names]
+            missing = [b for b in names if not any(binary_name(i) == b for i in ids)]
+            claimed_names |= set(names)
+        else:
+            ids = [i for i in times.binaries if binary_name(i) not in claimed_names]
+            missing = []
+        weight = DEFAULT_WEIGHT_S * len(missing)
+        for i in ids:
+            isolated = sum(t for k, t in times.tests.items() if k[0] == i and k in claimed_tests)
+            weight += max(times.binaries[i] - isolated, 0)
+        out.append(weight)
+    return out
+
+
+def allocate(specs: tuple[GroupSpec, ...], times: Times, total: int = TOTAL_SHARDS) -> tuple[tuple[str, str, int], ...]:
+    """The `(name, filter, shards)` table: one shard per `OneTest` group, and
+    the rest of `total` over the other groups, each at least one, every next
+    shard to the group whose per-shard time (weight / in-flight / shards) is
+    longest (the earliest on a tie)."""
+    errors = spec_errors(specs)
+    if errors:
+        raise ShardError("; ".join(errors))
+    weights = group_weights(specs, times)
+    shards = [1] * len(specs)
+    sized = [(i, s.in_flight) for i, s in enumerate(specs) if not isinstance(s, OneTest)]
+    spare = total - len(specs)
+    if spare < 0:
+        raise ShardError(f"{len(specs)} groups do not fit in {total} shards")
+    for _ in range(spare):
+        longest, _ = max(sized, key=lambda g: weights[g[0]] / g[1] / shards[g[0]])
+        shards[longest] += 1
+    return tuple((s.name, spec_filter(s), n) for s, n in zip(specs, shards, strict=True))
+
+
+GROUPS = allocate(SPECS, load_times())
 SHARDS = shard_total(GROUPS)
 
 ARCHIVE_ARGS = ("--archive-file", "nextest.tar.zst", "--workspace-remap", ".", "--profile", "ci")
@@ -143,7 +351,7 @@ ARCHIVE_ARGS = ("--archive-file", "nextest.tar.zst", "--workspace-remap", ".", "
 # `cargo build` that itself uses every core; two in flight fit the runner.
 # `--no-tests=fail`: a shard whose selection matches nothing is red, never a
 # vacuous green.
-RUN_ONLY_ARGS = ("--no-fail-fast", "--test-threads=2", "--no-tests=fail")
+RUN_ONLY_ARGS = ("--no-fail-fast", f"--test-threads={TEST_THREADS}", "--no-tests=fail")
 RUN_COMMAND = " ".join(
     ("cargo", "nextest", "run", *ARCHIVE_ARGS, *RUN_ONLY_ARGS, '-E "$SHARD_FILTER"', '--partition "$SHARD_PARTITION"')
 )
