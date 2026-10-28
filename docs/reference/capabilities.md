@@ -61,4 +61,5 @@ Ipê runs programs under a deny-by-default capability model. Every operation tha
 | `js-port:screen-orientation` | Locking and unlocking the screen orientation via screen.orientation.lock / screen.orientation.unlock, and reading the current screen.orientation.type. |
 | `js-port:wake-lock` | Acquiring a screen wake lock via navigator.wakeLock.request("screen") that prevents the device from dimming or sleeping, and releasing it. |
 | `js-port:web-authn` | Registering and authenticating a public-key credential (a passkey) via navigator.credentials.create / navigator.credentials.get; results are opaque base64url credential envelopes verified by the relying party server. |
+| `js-port:push` | Subscribing to server-sent push messages delivered while the app is not in the foreground, and reading or dropping that subscription. |
 

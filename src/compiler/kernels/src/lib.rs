@@ -20,7 +20,7 @@ pub use builtin_type::{
 };
 
 mod capability;
-pub use capability::{Capability, ElementCapability, UnknownCapability, WebCapability};
+pub use capability::{BridgeCap, Capability, ElementCapability, UnknownCapability, WebCapability};
 
 pub mod css_value_safety;
 pub use css_value_safety::css_value_is_safe;
