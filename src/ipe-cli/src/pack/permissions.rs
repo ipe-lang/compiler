@@ -1506,12 +1506,14 @@ mod tests {
             .into_iter()
             .map(|row| (row.permission, row.code.get()))
             .collect();
-        // VIBRATE is install-time, so it has no request row.
+        // VIBRATE is install-time, so it has no request row. Rows follow the
+        // rendered name order; each code is the permission's position among
+        // the runtime-requested ones.
         assert_eq!(
             rows,
             vec![
-                (AndroidPermission::AccessFineLocation, 1),
                 (AndroidPermission::AccessCoarseLocation, 2),
+                (AndroidPermission::AccessFineLocation, 1),
                 (AndroidPermission::PostNotifications, 3),
             ]
         );
