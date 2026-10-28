@@ -2261,10 +2261,10 @@ fn rewrite_runtime_paths_for_dep(src: &str) -> String {
 /// The policy's sources are fixed keywords and parsed origins, whose bytes are
 /// `[a-z0-9.:/-]`, so the attribute value needs no escaping.
 fn shell_policy_meta(servers: &ServerOrigins, worker: BundleWorker) -> String {
-    format!(
-        "<meta http-equiv=\"Content-Security-Policy\" content=\"{}\">\n",
-        ContentSecurityPolicy::bundle(servers, worker).header_value()
-    )
+    let mut meta = String::from("<meta http-equiv=\"Content-Security-Policy\" content=\"");
+    meta.push_str(&ContentSecurityPolicy::bundle(servers, worker).header_value());
+    meta.push_str("\">\n");
+    meta
 }
 
 /// The wasm files shared by both emit models: the target-scoped `.cargo/config`

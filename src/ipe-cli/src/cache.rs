@@ -1972,7 +1972,7 @@ mod tests {
             );
             keys.push((*field, flipped));
         }
-        assert_eq!(keys.len(), 13, "every field is flipped once");
+        assert_eq!(keys.len(), 14, "every field is flipped once");
     }
 
     /// Two settings whose field bytes concatenate to the same stream still

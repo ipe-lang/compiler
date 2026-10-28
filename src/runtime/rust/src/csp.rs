@@ -458,7 +458,7 @@ impl<'a> ContentSecurityPolicy<'a> {
     pub fn bundle(servers: &'a ServerOrigins, worker: BundleWorker) -> Self {
         use Directive as D;
         use Source as S;
-        let connect = std::iter::once(S::SelfOrigin)
+        let reachable = std::iter::once(S::SelfOrigin)
             .chain(
                 servers
                     .origins()
@@ -469,7 +469,7 @@ impl<'a> ContentSecurityPolicy<'a> {
             .with(D::DefaultSrc, vec![S::SelfOrigin])
             .with(D::ScriptSrc, vec![S::SelfOrigin, S::WasmUnsafeEval])
             .with(D::StyleSrc, vec![S::SelfOrigin, S::UnsafeInline])
-            .with(D::ConnectSrc, connect);
+            .with(D::ConnectSrc, reachable);
         match worker {
             BundleWorker::None => policy,
             BundleWorker::Push => policy.with(D::WorkerSrc, vec![S::SelfOrigin]),
