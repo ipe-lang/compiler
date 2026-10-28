@@ -17,7 +17,8 @@ use std::hash::{DefaultHasher, Hash, Hasher};
 use ipe_runtime_rust::RetainedBytes;
 use ipe_runtime_rust::json::{json_enc_canonical, json_enc_encode, json_enc_int, json_enc_object};
 use ipe_runtime_rust::json_val::{
-    BACKSTOP_REFUSAL, JSON_SERDE_NESTING_BACKSTOP, JsonMap, JsonVal, json_depth,
+    BACKSTOP_REFUSAL, JSON_SERDE_NESTING_BACKSTOP, JsonMap, JsonVal, SERDE_CONTAINER_FLOOR,
+    json_depth,
 };
 use proc_macro2::{Ident, Spacing, TokenStream, TokenTree};
 use syn::visit::{self, Visit};
@@ -71,6 +72,11 @@ fn deep_object(depth: usize) -> JsonVal {
     value
 }
 
+/// `depth` nested flow arrays as text, readable as JSON and as YAML.
+fn flow(depth: usize) -> String {
+    format!("{}{}", "[".repeat(depth), "]".repeat(depth))
+}
+
 fn hash_of(value: &JsonVal) -> u64 {
     let mut hasher = DefaultHasher::new();
     value.hash(&mut hasher);
@@ -105,19 +111,52 @@ fn deep_value_clone_eq_hash_debug_display() {
         assert_eq!(hash_of(&value), hash_of(&copy));
         assert!(format!("{value:?}").starts_with("Array ["));
         assert_eq!(value.to_string().len(), 200_000);
-        assert!(format!("{value:#}").starts_with("[\n  ["));
         let object = deep_object(100_000);
         assert!(object.clone() == object);
         assert_eq!(hash_of(&object.clone()), hash_of(&object));
     });
 }
 
+/// The depth the pretty layouts are walked at. Pretty text grows with the
+/// square of the depth ([`pretty_list_len`]), so this stays shallow enough to
+/// print about 8 MB, on a 64 KiB stack where a writer recursing once per level
+/// would need frames under 32 bytes to survive.
+const PRETTY_DEPTH: usize = 2_048;
+
+/// The length of `deep_list(depth)` in the pretty layout `width` spaces wide:
+/// two brackets a level, and every non-empty level breaks a line before its
+/// child, one unit deeper, and before its own `]`.
+const fn pretty_list_len(depth: usize, width: usize) -> usize {
+    2 * depth + 2 * (depth - 1) + width * (depth - 1) * (depth - 1)
+}
+
+#[test]
+fn deep_value_pretty_display_and_encode() {
+    on_stack(SMALL_STACK / 4, || {
+        let value = deep_list(PRETTY_DEPTH);
+        let shown = format!("{value:#}");
+        assert!(shown.starts_with("[\n  [\n    ["));
+        assert_eq!(shown.len(), pretty_list_len(PRETTY_DEPTH, 2));
+        let encoded = json_enc_encode(2, value);
+        assert!(
+            encoded == shown,
+            "pretty encode differs from pretty display"
+        );
+    });
+}
+
 #[test]
 fn deep_value_canonical() {
+    const DEPTH: usize = 100_000;
     on_stack(SMALL_STACK, || {
-        let canonical = json_enc_canonical(&deep_object(100_000));
-        assert!(canonical.starts_with("{\"k"));
-        assert!(canonical.ends_with("null}}"));
+        let canonical = json_enc_canonical(&deep_object(DEPTH));
+        let mut expected: String = (0..DEPTH)
+            .rev()
+            .map(|at| format!("{{\"k{}\":", at % 3))
+            .collect();
+        expected.push_str("null");
+        expected.push_str(&"}".repeat(DEPTH));
+        assert!(canonical == expected, "canonical text differs");
     });
 }
 
@@ -148,19 +187,17 @@ fn serde_serialize_refuses_past_backstop() {
 #[cfg(feature = "config")]
 #[test]
 fn serde_deserialize_refuses_past_backstop() {
-    fn flow(depth: usize) -> String {
-        format!("{}{}", "[".repeat(depth), "]".repeat(depth))
-    }
     fn parse(source: &str) -> Result<JsonVal, String> {
         let mut budget = serde_saphyr::Budget::default();
         budget.max_depth = JSON_SERDE_NESTING_BACKSTOP + 8;
+        budget.flow_nesting_limit = JSON_SERDE_NESTING_BACKSTOP + 8;
         budget.max_documents = 1;
         let mut options = serde_saphyr::Options::default();
         options.budget = Some(budget);
         serde_saphyr::from_str_with_options::<JsonVal>(source, options)
             .map_err(|error| error.to_string())
     }
-    on_stack(1024 * 1024, || {
+    on_stack(8 * 1024 * 1024, || {
         let at = parse(&flow(JSON_SERDE_NESTING_BACKSTOP));
         assert!(
             at.as_ref()
@@ -168,7 +205,31 @@ fn serde_deserialize_refuses_past_backstop() {
             "{at:?}"
         );
         let past = parse(&flow(JSON_SERDE_NESTING_BACKSTOP + 1));
-        assert!(past.is_err(), "{past:?}");
+        assert!(
+            past.as_ref()
+                .is_err_and(|error| error.contains(BACKSTOP_REFUSAL)),
+            "{past:?}"
+        );
+    });
+}
+
+/// `serde_json`'s own recursion limit refuses a document before the backstop
+/// can: [`SERDE_CONTAINER_FLOOR`] containers parse, one more does not.
+#[test]
+fn serde_json_parse_stops_at_its_floor() {
+    on_stack(SMALL_STACK * 4, || {
+        let at = serde_json::from_str::<JsonVal>(&flow(SERDE_CONTAINER_FLOOR));
+        assert!(
+            at.as_ref()
+                .is_ok_and(|value| json_depth(value) == SERDE_CONTAINER_FLOOR),
+            "{at:?}"
+        );
+        let past = serde_json::from_str::<JsonVal>(&flow(SERDE_CONTAINER_FLOOR + 1));
+        assert!(
+            past.as_ref()
+                .is_err_and(|error| error.to_string().contains("recursion limit exceeded")),
+            "{past:?}"
+        );
     });
 }
 
