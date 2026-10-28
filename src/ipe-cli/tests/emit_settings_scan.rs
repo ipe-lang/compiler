@@ -16,8 +16,10 @@
 //! at one site, `manifest_emit_settings`: the driver reads each of those member
 //! chains, and names the hydrate mode, nowhere else but the admitted sites
 //! below. The mobile packager reads the fields its shell and the bundle must
-//! agree on (the mount base, the server origins, the push identifiers) only
-//! through `ManifestPin::of`, so no shell input bypasses the pin.
+//! agree on (the mount base, the server origins, the push identifiers, the
+//! accepted capabilities) only through `ManifestPin::of`, so no shell input
+//! bypasses the pin; the accepted capabilities are read elsewhere only by the
+//! desktop packager, the permission report and the build's consent gates.
 //!
 //! Every `EmitSettings` comes from `build_pipeline::emit_settings`, which picks
 //! one of its two constructors from the build shape: the constructors are
@@ -84,6 +86,7 @@ const MEMBER_CHAINS: &[&[&str]] = &[
     &["delivery", "servers"],
     &["delivery", "mobile", "push"],
     &["public_env"],
+    &["capabilities_accept"],
 ];
 
 /// The guarded paths that, like the member chains, are judged only in
@@ -199,6 +202,39 @@ const ADMITTED: &[(&str, &str, &str, usize)] = &[
         "field delivery.mobile.push",
         "src/ipe-cli/src/pack/mobile.rs",
         "of",
+        1,
+    ),
+    (
+        "field capabilities_accept",
+        "src/ipe-cli/src/pack/mobile.rs",
+        "of",
+        1,
+    ),
+    // The accepted capabilities outside the mobile shell: the desktop bundle's
+    // permissions, the permission report, and the build's consent gates, each
+    // judging the manifest the build itself read.
+    (
+        "field capabilities_accept",
+        "src/ipe-cli/src/driver/commands_pkg.rs",
+        "assemble_desktop",
+        1,
+    ),
+    (
+        "field capabilities_accept",
+        "src/ipe-cli/src/driver/commands_pkg.rs",
+        "emit_permissions",
+        1,
+    ),
+    (
+        "field capabilities_accept",
+        "src/ipe-cli/src/driver/commands.rs",
+        "acknowledge_unsafe_imports",
+        1,
+    ),
+    (
+        "field capabilities_accept",
+        "src/ipe-cli/src/driver/commands.rs",
+        "gate_web_consent",
         1,
     ),
     (PROOF, "src/ipe-cli/src/delivery.rs", "host_intent", 1),
@@ -1045,6 +1081,14 @@ fn a_planted_pinned_field_read_is_refused() -> Result<(), String> {
             mobile,
             "fn of() { let a = m.delivery.servers.clone(); let b = m.delivery.servers.clone(); }\n",
         ),
+        (
+            commands_pkg,
+            "fn assemble_mobile() { let a = &manifest.capabilities_accept; }\n",
+        ),
+        (
+            mobile,
+            "fn layout() { let a = m.capabilities_accept.iter(); }\n",
+        ),
     ];
     refused_by_scan(&breaches)
 }
@@ -1097,12 +1141,18 @@ fn an_admitted_site_is_not_refused() -> Result<(), String> {
         (
             "src/ipe-cli/src/pack/mobile.rs",
             "fn of() { Self { base: m.delivery.browser.base.clone(), \
-             servers: m.delivery\n.servers\n.clone(), push: m.delivery.mobile.push.clone() } }\n",
+             servers: m.delivery\n.servers\n.clone(), push: m.delivery.mobile.push.clone(), \
+             accepts: m.capabilities_accept.clone() } }\n",
         ),
         (
             "src/ipe-cli/src/package_manifest.rs",
             "fn read_database() { Ok(DbDriver::Sqlite) }\n\
              fn render() { match d { DbDriver::Sqlite => \"Sqlite\", DbDriver::Postgres => \"Postgres\" } }\n",
+        ),
+        (
+            "src/ipe-cli/src/driver/commands.rs",
+            "fn acknowledge_unsafe_imports() { gate(&manifest.capabilities_accept); }\n\
+             fn gate_web_consent() { gate(&manifest.capabilities_accept); }\n",
         ),
         (
             "src/ipe-cli/src/run_sandbox.rs",
@@ -1117,7 +1167,10 @@ fn an_admitted_site_is_not_refused() -> Result<(), String> {
             "src/ipe-cli/src/driver/commands_pkg.rs",
             "fn gate_desktop() { let HostIntent::WebView(p) = Delivery::web_desktop().host_intent() \
              else { return }; }\n\
-             fn assemble_mobile() { let pin = ManifestPin::of(manifest); layout(pin.base()); }\n\
+             fn assemble_desktop() { let a = &manifest.capabilities_accept; }\n\
+             fn emit_permissions() { let a = &manifest.capabilities_accept; }\n\
+             fn assemble_mobile() { let pin = ManifestPin::of(manifest); \
+             layout(pin.accepts(), pin.base()); }\n\
              fn build_under_pinned_manifest() { let after = ManifestPin::of(&parse(p)?); }\n\
              fn run_project_tests_with() { go(HostIntent::Served); }\n",
         ),
@@ -1136,7 +1189,7 @@ fn an_admitted_site_is_not_refused() -> Result<(), String> {
         match mode { WasmMode::Hydrate => 1, WasmMode::Solo => 2 }; let b = &m.wasm; }\n\
         #[cfg(test)]\nmod tests { fn t() { m.delivery.browser.base; b.public_env; WasmMode::Hydrate; } }\n";
     assert_eq!(
-        planted("src/ipe-cli/src/driver/commands.rs", chains_out_of_scope)?
+        planted("src/ipe-cli/src/driver/other.rs", chains_out_of_scope)?
             .iter()
             .filter(|refusal| refusal.contains("field ") || refusal.contains("WasmMode"))
             .count(),

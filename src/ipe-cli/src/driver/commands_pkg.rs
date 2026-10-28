@@ -557,7 +557,7 @@ impl<'a> BundleAssembler<'a> {
                 .as_deref(),
             None,
         );
-        let accepts = &manifest.capabilities_accept;
+        let accepts = pin.accepts();
         let icon = manifest.icon.as_deref();
 
         // Build the `--target wasm` SPA into the project's output root, then
@@ -4014,13 +4014,20 @@ mod mobile_base_tests {
         MountBase::parse(raw).expect("a legal mount base")
     }
 
-    /// Write a project accepting push whose `delivery` record is `delivery`.
-    fn write_delivery(manifest: &Path, delivery: &str) {
+    /// A project's `capabilities.accepts` list and `delivery` record.
+    type Planned<'a> = (&'a str, &'a str);
+
+    /// The accepts list of a project that accepts push and nothing else.
+    const PUSH_ONLY: &str = "[ JsPort Push ]";
+
+    /// Write a project whose `capabilities.accepts` and `delivery` are
+    /// `(accepts, delivery)`.
+    fn write_delivery(manifest: &Path, (accepts, delivery): Planned<'_>) {
         std::fs::write(
             manifest,
             format!(
                 "module Package exposing (package)\n\npackage =\n    {{ name = \"x\"\n    \
-                 , capabilities = {{ accepts = [ JsPort Push ] }}\n    \
+                 , capabilities = {{ accepts = {accepts} }}\n    \
                  , delivery = {delivery}\n    }}\n"
             ),
         )
@@ -4045,7 +4052,11 @@ mod mobile_base_tests {
 
     /// Plan the pack for `planned`, let the stub build rewrite the manifest
     /// to `rebuilt`, and return the pack's verdict.
-    fn pack_across_edit(test_name: &str, planned: &str, rebuilt: &str) -> Result<(), CliError> {
+    fn pack_across_edit(
+        test_name: &str,
+        planned: Planned<'_>,
+        rebuilt: Planned<'_>,
+    ) -> Result<(), CliError> {
         let manifest = write_project(test_name, "/");
         write_delivery(&manifest, planned);
         let pin = pin_of(&manifest);
@@ -4097,22 +4108,35 @@ mod mobile_base_tests {
         let cases = [
             (
                 "pin_base",
+                PUSH_ONLY,
                 delivery_record("/v2", "\"https://api.example\"", "Production"),
                 PinnedField::BasePath,
             ),
             (
                 "pin_servers",
+                PUSH_ONLY,
                 delivery_record("/app", "\"https://other.example\"", "Production"),
                 PinnedField::Servers,
             ),
             (
                 "pin_push",
+                PUSH_ONLY,
                 delivery_record("/app", "\"https://api.example\"", "Development"),
                 PinnedField::Push,
             ),
+            (
+                "pin_accepts",
+                "[ JsPort Push, JsPort Geolocation ]",
+                planned.clone(),
+                PinnedField::Accepts,
+            ),
         ];
-        for (test_name, rebuilt, field) in cases {
-            let result = pack_across_edit(test_name, &planned, &rebuilt);
+        for (test_name, accepts, rebuilt, field) in cases {
+            let result = pack_across_edit(
+                test_name,
+                (PUSH_ONLY, planned.as_str()),
+                (accepts, rebuilt.as_str()),
+            );
             assert!(
                 refused_naming(&result, &[field]),
                 "{field:?} changed during the build must be refused by name, got {result:?}"
@@ -4124,7 +4148,11 @@ mod mobile_base_tests {
     #[test]
     fn mobile_pack_accepts_a_rewrite_that_moves_no_pinned_field() {
         let planned = delivery_record("/app", "\"https://api.example\"", "Production");
-        let result = pack_across_edit("pin_unmoved", &planned, &planned);
+        let result = pack_across_edit(
+            "pin_unmoved",
+            (PUSH_ONLY, planned.as_str()),
+            (PUSH_ONLY, planned.as_str()),
+        );
         assert!(result.is_ok(), "{result:?}");
     }
 

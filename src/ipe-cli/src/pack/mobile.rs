@@ -256,6 +256,9 @@ pub struct ManifestPin {
     /// `delivery.mobile.push`: the identifiers the shell registers for push
     /// with; its `Debug` never prints an identifier.
     push: Option<PushDelivery>,
+    /// `capabilities.accepts`: the capabilities the bundle's consent gate
+    /// grants and the shell's OS permissions are derived from.
+    accepts: BTreeSet<Capability>,
 }
 
 impl ManifestPin {
@@ -266,6 +269,7 @@ impl ManifestPin {
             base: manifest.delivery.browser.base.clone(),
             servers: manifest.delivery.servers.clone(),
             push: manifest.delivery.mobile.push.clone(),
+            accepts: manifest.capabilities_accept.clone(),
         }
     }
 
@@ -273,6 +277,12 @@ impl ManifestPin {
     #[must_use]
     pub const fn base(&self) -> &MountBase {
         &self.base
+    }
+
+    /// The accepted capabilities the shell's permissions are derived from.
+    #[must_use]
+    pub const fn accepts(&self) -> &BTreeSet<Capability> {
+        &self.accepts
     }
 
     /// The fields of `after` that differ from this pin, or `None` when every
@@ -286,16 +296,19 @@ impl ManifestPin {
             base,
             servers,
             push,
+            accepts,
         } = self;
         let Self {
             base: base_after,
             servers: servers_after,
             push: push_after,
+            accepts: accepts_after,
         } = after;
         let fields: Vec<PinnedField> = [
             (PinnedField::BasePath, base != base_after),
             (PinnedField::Servers, servers != servers_after),
             (PinnedField::Push, push != push_after),
+            (PinnedField::Accepts, accepts != accepts_after),
         ]
         .into_iter()
         .filter_map(|(field, moved)| moved.then_some(field))
@@ -317,6 +330,8 @@ pub enum PinnedField {
     Servers,
     /// `delivery.mobile.push`.
     Push,
+    /// `capabilities.accepts`.
+    Accepts,
 }
 
 impl PinnedField {
@@ -327,6 +342,7 @@ impl PinnedField {
             Self::BasePath => "delivery.browser.basePath",
             Self::Servers => "delivery.servers",
             Self::Push => "delivery.mobile.push",
+            Self::Accepts => "capabilities.accepts",
         }
     }
 }
@@ -2673,6 +2689,7 @@ mod tests {
             }))
             .expect("a legal origin set"),
             push: None,
+            accepts: BTreeSet::new(),
         }
     }
 
@@ -2694,5 +2711,14 @@ mod tests {
         assert!(!shown.contains("delivery.mobile.push"), "{shown}");
         assert!(shown.contains("run it again"), "{shown}");
         assert_eq!(before.moved_to(&before), None, "an equal pin moved nothing");
+        let granted = ManifestPin {
+            accepts: accepts(&[web(WebCapability::Geolocation)]),
+            ..pin("/", &[])
+        };
+        assert_eq!(
+            before.moved_to(&granted),
+            Some(MovedFields(vec![PinnedField::Accepts])),
+            "an accept granted during the build moves the accepts"
+        );
     }
 }
