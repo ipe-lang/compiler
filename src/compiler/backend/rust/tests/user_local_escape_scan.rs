@@ -1,15 +1,24 @@
-//! No backend-minted Rust name enters the escaped user-local namespace.
+//! No backend-referenced Rust name can be spelled by an emitted user local.
 //!
-//! `naming::local_ident` moves every `_`-leading user local to
-//! `USER_LOCAL_ESCAPE` + name, so its image starts with `__u_`. That keeps a
-//! user local apart from the backend's own temporaries only while no temporary
-//! the backend mints, and no name its templates carry, starts with `__u_`
-//! itself. This ratchet lexes every non-test function of `backend/rust/src` and
-//! refuses each string literal that can spell such a name: one holding `__u_`,
-//! one holding `__u` right before a format placeholder, and one ending in
-//! `__u` (a prefix glued on by a push). The emitted templates under
-//! `backend/rust/templates` are refused on any `__u_`. The single sanctioned
-//! site is the `USER_LOCAL_ESCAPE` const itself.
+//! `naming::local_ident` emits a user local with no `_` verbatim and moves
+//! every other one to `USER_LOCAL_ESCAPE` + name, so its image starts with
+//! `__u_`. A Rust `let` local shadows a same-named fn item, so that keeps a
+//! user local apart from the names the backend refers to bare only while
+//!
+//! - no temporary the backend mints, and no name its templates carry, starts
+//!   with `__u_`; and
+//! - no emitted call names an `_`-free function bare.
+//!
+//! This ratchet lexes every non-test function of `backend/rust/src` and refuses
+//! each string literal that can spell a name in the escaped namespace: one
+//! holding `__u_`, one holding `__u` right before a format placeholder, and one
+//! ending in `__u` (a prefix glued on by a push). Its single sanctioned site is
+//! the `USER_LOCAL_ESCAPE` const itself. It also refuses each bare call an
+//! emitted literal spells with an `_`-free lowercase head (`curry2(`,
+//! `curry{n}(`), which a user local of that name would shadow: such a call must
+//! go through a path (`ipe_runtime::json::curry2(`). Its sanctioned sites are
+//! the non-Rust text the backend emits, listed in `BARE_CALL_ALLOWED`. The
+//! emitted templates under `backend/rust/templates` are refused on any `__u_`.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -22,6 +31,70 @@ type Site = (String, String);
 
 /// The one sanctioned site: the escape prefix const in `naming.rs`.
 const ALLOWED: &[(&str, &str, usize)] = &[("naming.rs", "USER_LOCAL_ESCAPE", 1)];
+
+/// The sanctioned bare calls, none of them Rust: the wasm boot module's
+/// `init(` is JavaScript, and a tuple-arm diagnostic counts `column(s)`.
+const BARE_CALL_ALLOWED: &[(&str, &str, usize)] = &[
+    ("emit_expr/patterns.rs", "emit_tuple_arm_head", 1),
+    ("project.rs", "shell_boot_js", 1),
+];
+
+/// Words a literal may put before `(` that are no value-namespace call: Rust
+/// keywords and the attribute and `cfg` predicate words.
+const NOT_A_CALL: &[&str] = &[
+    "allow", "all", "any", "as", "break", "cfg", "continue", "crate", "deny", "derive", "doc",
+    "dyn", "else", "expect", "fn", "for", "if", "impl", "in", "inline", "let", "loop", "match",
+    "mod", "move", "mut", "not", "pub", "ref", "repr", "return", "self", "super", "unsafe", "use",
+    "warn", "where", "while",
+];
+
+/// How many bare calls with an `_`-free lowercase head `text` spells.
+///
+/// A head is a maximal run of lowercase ASCII letters and digits starting with
+/// a letter, optionally followed by one format placeholder, then `(`. It is not
+/// bare when an identifier byte, `:`, `.`, `'`, `$`, `#`, `-`, `!` or `}`
+/// precedes it (a path, a method, a lifetime, a raw string, a CSS value, a
+/// macro, a glued placeholder), nor when it follows `fn ` (a definition).
+fn bare_calls(text: &str) -> usize {
+    let ident = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+    let bytes = text.as_bytes();
+    let mut count = 0;
+    let mut start = 0;
+    while let Some(&first) = bytes.get(start) {
+        if !ident(first) {
+            start += 1;
+            continue;
+        }
+        let mut end = start;
+        while bytes.get(end).copied().is_some_and(ident) {
+            end += 1;
+        }
+        let word = text.get(start..end).unwrap_or_default();
+        let before = start.checked_sub(1).and_then(|i| bytes.get(i).copied());
+        let mut after = end;
+        if bytes.get(after) == Some(&b'{') {
+            while bytes.get(after).is_some_and(|&b| b != b'}') {
+                after += 1;
+            }
+            after += 1;
+        }
+        let head = first.is_ascii_lowercase()
+            && word
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit());
+        let opens = bytes.get(after) == Some(&b'(');
+        let glued = before.is_some_and(|b| b":.'$#-!}".contains(&b));
+        let defined = text
+            .get(..start)
+            .and_then(|pre| pre.trim_end().strip_suffix("fn"))
+            .is_some_and(|pre| !pre.bytes().next_back().is_some_and(ident));
+        if head && opens && !glued && !defined && !NOT_A_CALL.contains(&word) {
+            count += 1;
+        }
+        start = end;
+    }
+    count
+}
 
 /// The value of a string literal token, `None` for any other token.
 fn str_value(tok: &TokenTree) -> Option<String> {
@@ -61,6 +134,7 @@ fn is_test_attr(body: &TokenStream) -> bool {
 struct Scan<'a> {
     file: &'a str,
     hits: BTreeMap<Site, usize>,
+    bare: BTreeMap<Site, usize>,
 }
 
 impl Scan<'_> {
@@ -130,11 +204,15 @@ impl Scan<'_> {
                     continue;
                 }
             }
-            if str_value(tok).is_some_and(|text| spells_escaped(&text)) {
-                *self
-                    .hits
-                    .entry((self.file.to_owned(), item.to_owned()))
-                    .or_insert(0) += 1;
+            if let Some(text) = str_value(tok) {
+                let site = (self.file.to_owned(), item.to_owned());
+                if spells_escaped(&text) {
+                    *self.hits.entry(site.clone()).or_insert(0) += 1;
+                }
+                let calls = bare_calls(&text);
+                if calls > 0 {
+                    *self.bare.entry(site).or_insert(0) += calls;
+                }
             }
             if let TokenTree::Group(g) = tok {
                 let brace = g.delimiter() == Delimiter::Brace;
@@ -153,17 +231,51 @@ impl Scan<'_> {
     }
 }
 
-/// The refused literals in one source file, keyed by `(file, item)`.
-fn scan_source(file: &str, src: &str) -> Result<BTreeMap<Site, usize>, String> {
+/// The refused sites of one source file, keyed by `(file, item)`.
+struct Refused {
+    /// The literals spelling a name in the escaped namespace.
+    escaped: BTreeMap<Site, usize>,
+    /// The bare calls with an `_`-free head.
+    bare: BTreeMap<Site, usize>,
+}
+
+/// The refused sites in one source file.
+fn scan_source(file: &str, src: &str) -> Result<Refused, String> {
     let stream: TokenStream = src
         .parse()
         .map_err(|e| format!("{file} does not lex: {e}"))?;
     let mut scan = Scan {
         file,
         hits: BTreeMap::new(),
+        bare: BTreeMap::new(),
     };
     scan.stream(&stream, "<file>");
-    Ok(scan.hits)
+    Ok(Refused {
+        escaped: scan.hits,
+        bare: scan.bare,
+    })
+}
+
+/// The found sites that disagree with `allowed`, and the allowlist entries no site matches.
+fn drift(
+    found: &BTreeMap<Site, usize>,
+    allowed: &[(&str, &str, usize)],
+) -> (Vec<(Site, usize)>, Vec<(Site, usize)>) {
+    let allowed: BTreeMap<Site, usize> = allowed
+        .iter()
+        .map(|&(file, item, count)| ((file.to_owned(), item.to_owned()), count))
+        .collect();
+    let unexpected = found
+        .iter()
+        .filter(|(site, count)| allowed.get(*site) != Some(*count))
+        .map(|(site, count)| (site.clone(), *count))
+        .collect();
+    let stale = allowed
+        .iter()
+        .filter(|(site, count)| found.get(*site) != Some(*count))
+        .map(|(site, count)| (site.clone(), *count))
+        .collect();
+    (unexpected, stale)
 }
 
 /// The sorted files under `dir`, recursively, skipping `tests` directories.
@@ -207,12 +319,15 @@ fn no_backend_name_enters_the_escaped_user_local_namespace() -> Result<(), Strin
     let mut files = Vec::new();
     files_under(&src_root, &mut files)?;
     let mut found = BTreeMap::new();
+    let mut bare = BTreeMap::new();
     let mut scanned = 0usize;
     for path in &files {
         if path.extension().is_some_and(|e| e == "rs") {
             let text =
                 std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
-            found.extend(scan_source(&rel(&src_root, path)?, &text)?);
+            let refused = scan_source(&rel(&src_root, path)?, &text)?;
+            found.extend(refused.escaped);
+            bare.extend(refused.bare);
             scanned += 1;
         }
     }
@@ -220,23 +335,20 @@ fn no_backend_name_enters_the_escaped_user_local_namespace() -> Result<(), Strin
         scanned > 20,
         "the scan read only {scanned} backend source files"
     );
-    let allowed: BTreeMap<Site, usize> = ALLOWED
-        .iter()
-        .map(|&(file, item, count)| ((file.to_owned(), item.to_owned()), count))
-        .collect();
-    let unexpected: Vec<_> = found
-        .iter()
-        .filter(|(site, count)| allowed.get(*site) != Some(*count))
-        .collect();
-    let stale: Vec<_> = allowed
-        .iter()
-        .filter(|(site, count)| found.get(*site) != Some(*count))
-        .collect();
+    let (unexpected, stale) = drift(&found, ALLOWED);
     assert!(
         unexpected.is_empty() && stale.is_empty(),
         "a backend temporary must not start with `__u_`, the escaped user-local prefix of \
          `naming::local_ident`.\nunexpected (site, count): {unexpected:?}\nstale allowlist \
          entries (site, count): {stale:?}"
+    );
+    let (unexpected, stale) = drift(&bare, BARE_CALL_ALLOWED);
+    assert!(
+        unexpected.is_empty() && stale.is_empty(),
+        "an emitted call to an `_`-free function must go through a path (`ipe_runtime::json::\
+         curry2(`): a user local of that name, which `naming::local_ident` emits verbatim, \
+         would shadow the bare call.\nunexpected (site, count): {unexpected:?}\nstale \
+         allowlist entries (site, count): {stale:?}"
     );
 
     let templates_root = manifest.join("templates");
@@ -257,9 +369,71 @@ fn no_backend_name_enters_the_escaped_user_local_namespace() -> Result<(), Strin
 /// The refused literals of a synthetic source, as `(item, count)`.
 fn synthetic(src: &str) -> Result<Vec<(String, usize)>, String> {
     Ok(scan_source("synthetic.rs", src)?
+        .escaped
         .into_iter()
         .map(|((_, item), count)| (item, count))
         .collect())
+}
+
+/// The bare calls of a synthetic source, as `(item, count)`.
+fn synthetic_bare(src: &str) -> Result<Vec<(String, usize)>, String> {
+    Ok(scan_source("synthetic.rs", src)?
+        .bare
+        .into_iter()
+        .map(|((_, item), count)| (item, count))
+        .collect())
+}
+
+/// Each bare call with an `_`-free head goes red.
+#[test]
+fn each_bare_underscore_free_call_is_refused() -> Result<(), String> {
+    for (src, item, count) in [
+        (
+            r#"fn emit(n: usize, f: &str) -> String { format!("decode_succeed(curry{n}({f}))") }"#,
+            "emit",
+            1,
+        ),
+        (r#"fn emit() -> &'static str { "curry2(f)" }"#, "emit", 1),
+        (
+            r#"fn emit() -> &'static str { "let y = (helper(x));" }"#,
+            "emit",
+            1,
+        ),
+        (r#"fn emit() -> &'static str { "{ drop(x); }" }"#, "emit", 1),
+        (r#"fn emit() -> &'static str { "a(b(c))" }"#, "emit", 2),
+        (r#"const CALL: &str = "f2(x)";"#, "CALL", 1),
+    ] {
+        assert_eq!(
+            synthetic_bare(src)?,
+            vec![(item.to_owned(), count)],
+            "{src}"
+        );
+    }
+    Ok(())
+}
+
+/// One step past each bare call: a path, a method, an `_`-bearing head, a
+/// definition, a macro, an attribute, a CSS value, and test code are accepted.
+#[test]
+fn qualified_and_non_call_parentheses_are_accepted() -> Result<(), String> {
+    for src in [
+        r#"fn ok(n: usize) -> String { format!("ipe_runtime::json::curry{n}(f)") }"#,
+        r#"fn ok() -> &'static str { "x.len()" }"#,
+        r#"fn ok() -> &'static str { "string_from_int(x)" }"#,
+        r#"fn ok() -> &'static str { "Some(x)" }"#,
+        r#"fn ok() -> &'static str { "fn main() {}" }"#,
+        r#"fn ok() -> &'static str { "pub(crate) fn go(x: i64) {}" }"#,
+        r#"fn ok() -> &'static str { "vec![x]; format!("{}", x)" }"#,
+        r##"fn ok() -> &'static str { "#[cfg(not(any(test)))] #[derive(Clone)]" }"##,
+        r#"fn ok() -> &'static str { "cubic-bezier(0, 0, 1, 1)" }"#,
+        r#"fn ok(p: &str) -> String { format!("{p}x(y)") }"#,
+        r#"fn ok() -> &'static str { "if (x) { match (y) {} }" }"#,
+        r#"#[test] fn t() { let _ = "curry2(f)"; }"#,
+        r#"#[cfg(test)] mod tests { fn t() -> &'static str { "g(x)" } }"#,
+    ] {
+        assert_eq!(synthetic_bare(src)?, vec![], "{src}");
+    }
+    Ok(())
 }
 
 /// Each way a backend literal can mint a name in the escaped namespace goes red.

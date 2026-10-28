@@ -74,24 +74,24 @@ fn emission_preserves_the_load_bearing_shapes() {
     // single-file emit; match the function signature without the visibility
     // keyword so the assertion holds under both layouts.
     assert!(
-        src.contains("fn main_ignore_arg(arg_0: i64) -> i64 {"),
+        src.contains("fn main_ignore_arg(__u_arg_0: i64) -> i64 {"),
         "wildcard def param → fresh unused binder, no destructure:\n{src}"
     );
     // A record param recovers its COMPLETE field set from the solved type.
     assert!(
-        src.contains("let RecXY { x: _, y, .. } = arg_2;"),
+        src.contains("let RecXY { x: _, y, .. } = __u_arg_2;"),
         "record param → complete field set (x wildcarded, y bound):\n{src}"
     );
     // The tail-recursive tuple destructure re-runs INSIDE the loop, and the
     // synthetic binder is reassigned each iteration.
     assert!(
-        src.contains("let mut arg_4 = arg_4;") && src.contains("let (n, acc) = arg_4;"),
+        src.contains("let mut __u_arg_4 = __u_arg_4;") && src.contains("let (n, acc) = __u_arg_4;"),
         "tail-recursive tuple destructure must re-run per iteration:\n{src}"
     );
     // Globally-unique binders: the lambda inside the body uses a DISTINCT name
     // (`arg_5`), never a shadowed reuse of a def param binder.
     assert!(
-        src.contains("move |arg_5: i64| -> i64 { 42i64 }"),
+        src.contains("move |__u_arg_5: i64| -> i64 { 42i64 }"),
         "`\\_ ->` lambda → distinct fresh binder, no destructure:\n{src}"
     );
 }
