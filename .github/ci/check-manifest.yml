@@ -144,6 +144,7 @@ checks:
         - python3 .github/ci/test_claims_table.py -v
         - python3 .github/ci/test_check_required_set.py -v
         - python3 .github/ci/test_ipe_fmt_check.py -v
+        - python3 .github/ci/test_cache_prune.py -v
         - python3 .github/ci/check_required_set.py
   - context: manifest-lock-consistency
     disposition: gate
@@ -630,6 +631,14 @@ checks:
     note: >-
       Cross build-only. Currently continue-on-error:true; drop it so the
       surface sees a red.
+  - context: "static cache prune (one lock generation)"
+    disposition: informational
+    producer: static.yml
+    owner: release
+    note: >-
+      Cache upkeep, not a guarantee: deletes the static.yml caches a newer
+      Cargo.lock superseded so their dead weight does not evict the caches CI
+      reads. A red is a failed delete; the caches it would remove age out.
 
   # ── Registry publish smoke — informational (advisory live push-path proof) ──
   - context: "publish → admit clean + reject bad → cleanup"
