@@ -1171,13 +1171,13 @@ impl Visitor<'_> for KeyClassifier {
 }
 
 /// Builds a [`JsonVal`] from `serde_json::json!` syntax.
-#[cfg(test)]
+#[cfg(all(test, not(target_arch = "wasm32")))]
 macro_rules! json_val {
     ($($json:tt)+) => {
         $crate::json_val::JsonVal::from_serde(::serde_json::json!($($json)+))
     };
 }
-#[cfg(test)]
+#[cfg(all(test, not(target_arch = "wasm32")))]
 pub(crate) use json_val;
 
 #[cfg(all(test, not(target_arch = "wasm32")))]
