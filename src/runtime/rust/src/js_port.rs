@@ -143,7 +143,7 @@ pub(crate) const MAX_OUTSTANDING: usize = 256;
 /// that does not reply within this window resolves the Task with `Err`. The
 /// value is generous — it covers slow-permission-prompt flows. A per-call
 /// override is a tracked follow-up.
-const REQUEST_TIMEOUT_MS: u64 = 10_000;
+pub const REQUEST_TIMEOUT_MS: u64 = 10_000;
 
 // ─── Session-stream wire keys + bounds ──────────────────────────────────────
 
@@ -1134,18 +1134,63 @@ mod wasm {
         }
     }
 
-    /// Deliver one seal-encoded outbound frame to the browser by calling the
-    /// registered `window.ipeOnReceive` handler. A missing or non-callable
-    /// handler is a no-op (the page simply has not wired a receiver yet).
-    fn deliver_outbound(encoded: &str) {
+    /// What became of one outbound frame handed to the page host.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum DeliverOutcome {
+        /// The host took the frame.
+        Delivered,
+        /// No callable `window.ipeOnReceive` exists, or it answered that nothing
+        /// on the page takes the frame.
+        NoHost,
+        /// The host threw while taking the frame.
+        HostThrew,
+    }
+
+    impl DeliverOutcome {
+        /// The typed refusal a call reports when its frame found no host.
+        ///
+        /// `None` when the frame was delivered.
+        fn refusal(self, call: &str) -> Option<IpeError> {
+            match self {
+                Self::Delivered => None,
+                Self::NoHost => Some(IpeError::unavailable(format!(
+                    "{call}: no page host takes port frames"
+                ))),
+                Self::HostThrew => Some(IpeError::unavailable(format!(
+                    "{call}: the page host threw on the port frame"
+                ))),
+            }
+        }
+
+        /// Report a fire-and-forget frame no host took.
+        ///
+        /// The line names the call only, never the payload.
+        fn warn_undelivered(self, call: &str) {
+            if let Some(refusal) = self.refusal(call) {
+                crate::wasm::console_warn(&refusal.to_string());
+            }
+        }
+    }
+
+    /// Deliver one seal-encoded outbound frame to the page host.
+    ///
+    /// The host is the registered `window.ipeOnReceive` handler. A handler that
+    /// answers `false` reports that no sink or receiver on the page takes the
+    /// frame; any other answer is a delivery.
+    pub fn deliver_outbound(encoded: &str) -> DeliverOutcome {
         let Some(window) = web_sys::window() else {
-            return;
+            return DeliverOutcome::NoHost;
         };
         let Ok(handler) = js_sys::Reflect::get(&window, &JsValue::from_str("ipeOnReceive")) else {
-            return;
+            return DeliverOutcome::NoHost;
         };
-        if let Ok(func) = handler.dyn_into::<js_sys::Function>() {
-            let _ = func.call1(&JsValue::NULL, &JsValue::from_str(encoded));
+        let Ok(func) = handler.dyn_into::<js_sys::Function>() else {
+            return DeliverOutcome::NoHost;
+        };
+        match func.call1(&JsValue::NULL, &JsValue::from_str(encoded)) {
+            Ok(answer) if answer.as_bool() == Some(false) => DeliverOutcome::NoHost,
+            Ok(_) => DeliverOutcome::Delivered,
+            Err(_) => DeliverOutcome::HostThrew,
         }
     }
 
@@ -1161,7 +1206,8 @@ mod wasm {
     {
         IpeCmd::Publish(Box::new(move |_origin| {
             if let Ok(value) = serde_json::to_value(&payload) {
-                deliver_outbound(&seal_encode(&JsonVal::from_serde(value)));
+                deliver_outbound(&seal_encode(&JsonVal::from_serde(value)))
+                    .warn_undelivered("js_send");
             }
             0
         }))
@@ -1240,9 +1286,14 @@ mod wasm {
             // The `Closure`s are `forget`-ed so they live until the promise
             // settles — a bounded leak (one per outstanding request, cleaned up
             // when the promise resolves or the timeout fires).
+            // The frame is delivered inside the executor, after the waiter is
+            // registered, so no reply can arrive before the waiter exists and a
+            // frame no host takes rejects the promise at once.
+            let mut outcome = DeliverOutcome::Delivered;
             let promise = js_sys::Promise::new(&mut |resolve, reject| {
                 // `resolve` receives the reply payload JSON as a JsValue string.
-                // `reject` is called by the timeout closure.
+                // `reject` is called by the timeout closure, or at once when no
+                // host takes the frame.
                 let resolve_rc = Rc::new(resolve);
                 let reject_rc = Rc::new(reject);
 
@@ -1258,6 +1309,13 @@ mod wasm {
                     );
                 });
 
+                outcome = deliver_outbound(&encoded);
+                if outcome != DeliverOutcome::Delivered {
+                    PENDING.with(|p| p.borrow_mut().remove(&cor_id));
+                    let _ = reject_rc.call0(&JsValue::NULL);
+                    return;
+                }
+
                 // Set up the timeout to call reject.
                 let reject_cb = wasm_bindgen::closure::Closure::once(move || {
                     let _ = reject_rc.call0(&JsValue::NULL);
@@ -1272,11 +1330,8 @@ mod wasm {
                 reject_cb.forget();
             });
 
-            // Deliver outbound AFTER registering the waiter so no reply can
-            // arrive before the waiter is installed.
-            deliver_outbound(&encoded);
-
-            // Await the promise (resolve = reply arrived; reject = timeout).
+            // Await the promise (resolve = reply arrived; reject = no host or
+            // timeout).
             let js_fut = wasm_bindgen_futures::JsFuture::from(promise);
             match js_fut.await {
                 Ok(reply_js) => {
@@ -1292,9 +1347,12 @@ mod wasm {
                     }
                 }
                 Err(_) => {
-                    // Timeout (promise rejected by setTimeout) or unknown error.
                     PENDING.with(|p| p.borrow_mut().remove(&cor_id));
-                    crate::core::IpeResult::Err("js_request: timeout".to_string().into())
+                    crate::core::IpeResult::Err(
+                        outcome
+                            .refusal("js_request")
+                            .unwrap_or_else(|| "js_request: timeout".to_string().into()),
+                    )
                 }
             }
         })
@@ -1343,7 +1401,11 @@ mod wasm {
                 SESSION_ID_FIELD: session_id,
                 "payload": outbound_json,
             });
-            deliver_outbound(&seal_encode(&JsonVal::from_serde(envelope)));
+            let outcome = deliver_outbound(&seal_encode(&JsonVal::from_serde(envelope)));
+            if let Some(refusal) = outcome.refusal("js_open_session") {
+                SESSIONS.with(|s| s.borrow_mut().remove(&session_id));
+                return crate::core::IpeResult::Err(refusal);
+            }
             crate::core::IpeResult::Ok(session_id as i64)
         })
     }
@@ -1399,7 +1461,8 @@ mod wasm {
                     SESSION_ID_FIELD: session_id,
                     "payload": value,
                 });
-                deliver_outbound(&seal_encode(&JsonVal::from_serde(envelope)));
+                deliver_outbound(&seal_encode(&JsonVal::from_serde(envelope)))
+                    .warn_undelivered("js_send_to_session");
             }
             0
         }))
@@ -1434,6 +1497,14 @@ mod wasm {
                     );
                 }
             };
+            let envelope = serde_json::json!({
+                SESSION_ID_FIELD: session_id,
+                "payload": outbound_json,
+            });
+            let encoded = seal_encode(&JsonVal::from_serde(envelope));
+            // Delivered inside the executor, after the terminal waiter is
+            // installed, so a frame no host takes rejects the promise at once.
+            let mut delivered = DeliverOutcome::Delivered;
             let promise = js_sys::Promise::new(&mut |resolve, reject| {
                 let resolve_rc = Rc::new(resolve);
                 let reject_rc = Rc::new(reject);
@@ -1446,6 +1517,11 @@ mod wasm {
                         }));
                     }
                 });
+                delivered = deliver_outbound(&encoded);
+                if delivered != DeliverOutcome::Delivered {
+                    let _ = reject_rc.call0(&JsValue::NULL);
+                    return;
+                }
                 let reject_cb = wasm_bindgen::closure::Closure::once(move || {
                     let _ = reject_rc.call0(&JsValue::NULL);
                 });
@@ -1457,11 +1533,6 @@ mod wasm {
                 }
                 reject_cb.forget();
             });
-            let envelope = serde_json::json!({
-                SESSION_ID_FIELD: session_id,
-                "payload": outbound_json,
-            });
-            deliver_outbound(&seal_encode(&JsonVal::from_serde(envelope)));
 
             let js_fut = wasm_bindgen_futures::JsFuture::from(promise);
             let outcome = js_fut.await;
@@ -1477,9 +1548,11 @@ mod wasm {
                         )),
                     }
                 }
-                Err(_) => {
-                    crate::core::IpeResult::Err("js_close_session: timeout".to_string().into())
-                }
+                Err(_) => crate::core::IpeResult::Err(
+                    delivered
+                        .refusal("js_close_session")
+                        .unwrap_or_else(|| "js_close_session: timeout".to_string().into()),
+                ),
             }
         })
     }
@@ -1487,8 +1560,8 @@ mod wasm {
 
 #[cfg(all(target_arch = "wasm32", feature = "wasm-client"))]
 pub use wasm::{
-    js_close_session, js_open_session, js_request, js_send, js_send_to_session, js_session_frames,
-    js_subscribe, push_inbound,
+    DeliverOutcome, deliver_outbound, js_close_session, js_open_session, js_request, js_send,
+    js_send_to_session, js_session_frames, js_subscribe, push_inbound,
 };
 
 #[cfg(all(test, not(target_arch = "wasm32")))]
