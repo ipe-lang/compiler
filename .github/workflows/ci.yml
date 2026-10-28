@@ -2627,7 +2627,7 @@ jobs:
         run: |
           set -euo pipefail
           OUT="$RUNNER_TEMP/wasm-solo-clipboard-emitted"
-          "$RUNNER_TEMP/ipe-release/ipe" dev build examples/shapes/web/wasm-solo-clipboard web solo --target wasm --out "$OUT"
+          "$RUNNER_TEMP/ipe-release/ipe" dev build examples/shapes/web/wasm-solo-clipboard web solo --out "$OUT"
           # Fail closed: a bundle without its shell leaves the spec nothing to serve.
           if [ ! -f "$OUT/rust/www/index.html" ]; then
             echo "wasm-solo-clipboard bundle has no www/index.html under '$OUT/rust'" >&2
