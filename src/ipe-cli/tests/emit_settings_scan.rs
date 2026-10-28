@@ -1117,7 +1117,7 @@ fn refused_by_scan(breaches: &[(&str, &str)]) -> Result<(), String> {
 
 /// One source per file, each holding every guarded spelling the file's
 /// admitted sites name.
-fn admitted_sources() -> [(&'static str, &'static str); 7] {
+const fn admitted_sources() -> [(&'static str, &'static str); 7] {
     let pipeline = "src/ipe-cli/src/driver/build_pipeline.rs";
     let delivery = "src/ipe-cli/src/delivery.rs";
     [
