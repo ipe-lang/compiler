@@ -29,11 +29,12 @@ use std::path::{Path, PathBuf};
 
 use ipe_fs_open::{EntryCap, EntryName, FileId, FileKind, HeldDir, OpenRefusal};
 use ipe_ir::Capability;
-use ipe_runtime_rust::encoding::MountBase;
+use ipe_runtime_rust::encoding::{MountBase, ServerOrigins};
 
 use crate::CliError;
 use crate::driver::BundleProfile;
 use crate::output_dir::OwnedDir;
+use crate::project::{ProjectManifest, PushDelivery};
 use crate::text;
 
 use super::permissions::{self, Platform};
@@ -179,14 +180,12 @@ pub enum MobileRefusal {
     /// The app is a `Web` app but its `[wasm]` mode is off/absent, so a
     /// `--target wasm` build produces no hostable SPA bundle.
     WasmDisabled,
-    /// `delivery.browser.basePath` read after the wasm build differs from the one the
-    /// shell was planned for, so the bundle's URLs and the shell's handlers
-    /// would name two different mount paths.
+    /// The [`ManifestPin`] read after the wasm build differs from the one the
+    /// shell was planned for, so the bundle and the shell would be built from
+    /// two manifests.
     ManifestChanged {
-        /// The mount base read before the build.
-        before: MountBase,
-        /// The mount base read after the build.
-        after: MountBase,
+        /// The pinned fields that differ.
+        moved: MovedFields,
     },
     /// The project accepts push but names no `delivery.mobile.push`, so the
     /// shell has no identifiers to register with.
@@ -221,14 +220,11 @@ impl std::fmt::Display for MobileRefusal {
                  = enable the wasm client target so a hostable browser bundle exists: set \
                  `[wasm] mode = Solo` (or `Hydrate`) in package.ipe."
             ),
-            Self::ManifestChanged { before, after } => write!(
+            Self::ManifestChanged { moved } => write!(
                 f,
-                "error: `delivery.browser.basePath` changed from `{}` to `{}` while the \
-                 wasm bundle was building\n  \
-                 = the bundle and the mobile shell must serve one mount path; leave \
-                 package.ipe unchanged during the pack and run it again.",
-                before.dir_url(),
-                after.dir_url()
+                "error: {moved} changed in package.ipe while the wasm bundle was building\n  \
+                 = the bundle and the mobile shell must be built from one manifest; leave \
+                 package.ipe unchanged during the pack and run it again."
             ),
             Self::PushUnconfigured => write!(
                 f,
@@ -243,6 +239,139 @@ impl std::fmt::Display for MobileRefusal {
 }
 
 impl std::error::Error for MobileRefusal {}
+
+/// Everything the mobile shell and the wasm bundle must agree on.
+///
+/// The shell is laid out from the pin captured before the wasm build, and the
+/// build reads the manifest again on its own; a pin read after the build that
+/// differs is refused ([`ManifestPin::moved_to`]). Every field is compared, so a
+/// field added here is compared too.
+#[derive(Clone, Debug)]
+pub struct ManifestPin {
+    /// `delivery.browser.basePath`: the mount path the bundle's URLs and the
+    /// shell's handlers name.
+    base: MountBase,
+    /// `delivery.servers`: the origins the bundle may reach besides its own.
+    servers: ServerOrigins,
+    /// `delivery.mobile.push`: the identifiers the shell registers for push
+    /// with; its `Debug` never prints an identifier.
+    push: Option<PushDelivery>,
+    /// `capabilities.accepts`: the capabilities the bundle's consent gate
+    /// grants and the shell's OS permissions are derived from.
+    accepts: BTreeSet<Capability>,
+}
+
+impl ManifestPin {
+    /// The pin of the parsed manifest `manifest`.
+    #[must_use]
+    pub fn of(manifest: &ProjectManifest) -> Self {
+        Self {
+            base: manifest.delivery.browser.base.clone(),
+            servers: manifest.delivery.servers.clone(),
+            push: manifest.delivery.mobile.push.clone(),
+            accepts: manifest.capabilities_accept.clone(),
+        }
+    }
+
+    /// The mount base the shell is laid out for.
+    #[must_use]
+    pub const fn base(&self) -> &MountBase {
+        &self.base
+    }
+
+    /// The accepted capabilities the shell's permissions are derived from.
+    #[must_use]
+    pub const fn accepts(&self) -> &BTreeSet<Capability> {
+        &self.accepts
+    }
+
+    /// The fields of `after` that differ from this pin, or `None` when every
+    /// field is equal.
+    ///
+    /// The one comparison of two pins: both are destructured in full, so a
+    /// field added to the pin does not compile until it is compared here.
+    #[must_use]
+    pub fn moved_to(&self, after: &Self) -> Option<MovedFields> {
+        let Self {
+            base,
+            servers,
+            push,
+            accepts,
+        } = self;
+        let Self {
+            base: base_after,
+            servers: servers_after,
+            push: push_after,
+            accepts: accepts_after,
+        } = after;
+        let fields: Vec<PinnedField> = [
+            (PinnedField::BasePath, base != base_after),
+            (PinnedField::Servers, servers != servers_after),
+            (PinnedField::Push, push != push_after),
+            (PinnedField::Accepts, accepts != accepts_after),
+        ]
+        .into_iter()
+        .filter_map(|(field, moved)| moved.then_some(field))
+        .collect();
+        if fields.is_empty() {
+            None
+        } else {
+            Some(MovedFields(fields))
+        }
+    }
+}
+
+/// One field of a [`ManifestPin`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum PinnedField {
+    /// `delivery.browser.basePath`.
+    BasePath,
+    /// `delivery.servers`.
+    Servers,
+    /// `delivery.mobile.push`.
+    Push,
+    /// `capabilities.accepts`.
+    Accepts,
+}
+
+impl PinnedField {
+    /// The manifest key the field is read from.
+    #[must_use]
+    pub const fn manifest_key(self) -> &'static str {
+        match self {
+            Self::BasePath => "delivery.browser.basePath",
+            Self::Servers => "delivery.servers",
+            Self::Push => "delivery.mobile.push",
+            Self::Accepts => "capabilities.accepts",
+        }
+    }
+}
+
+/// The fields two pins differ in, in [`PinnedField`] order; never empty.
+///
+/// Built only by [`ManifestPin::moved_to`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MovedFields(Vec<PinnedField>);
+
+impl MovedFields {
+    /// The fields that differ.
+    #[must_use]
+    pub fn fields(&self) -> &[PinnedField] {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for MovedFields {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        for (index, field) in self.0.iter().enumerate() {
+            if index > 0 {
+                f.write_str(", ")?;
+            }
+            write!(f, "`{}`", field.manifest_key())?;
+        }
+        Ok(())
+    }
+}
 
 /// How deep below `www/` the asset walk descends, in directory levels.
 ///
@@ -2551,14 +2680,45 @@ mod tests {
         }
     }
 
-    #[test]
-    fn manifest_changed_names_both_bases_and_the_remedy() {
-        let shown = MobileRefusal::ManifestChanged {
-            before: MountBase::root(),
-            after: MountBase::parse("/app").expect("a legal mount base"),
+    /// A pin over `base` and `servers`, with no push identifiers.
+    fn pin(base: &str, servers: &[&str]) -> ManifestPin {
+        ManifestPin {
+            base: MountBase::parse(base).expect("a legal mount base"),
+            servers: ServerOrigins::new(servers.iter().map(|raw| {
+                ipe_runtime_rust::encoding::ServerOrigin::parse(raw).expect("a legal origin")
+            }))
+            .expect("a legal origin set"),
+            push: None,
+            accepts: BTreeSet::new(),
         }
-        .to_string();
-        assert!(shown.contains("from `/` to `/app/`"), "{shown}");
+    }
+
+    #[test]
+    fn manifest_changed_names_every_moved_field_and_the_remedy() {
+        let before = pin("/", &[]);
+        let after = pin("/app", &["https://api.example"]);
+        let moved = before.moved_to(&after).expect("two fields moved");
+        assert_eq!(
+            moved.fields(),
+            [PinnedField::BasePath, PinnedField::Servers]
+        );
+        let shown = MobileRefusal::ManifestChanged { moved }.to_string();
+        assert!(
+            shown
+                .contains("`delivery.browser.basePath`, `delivery.servers` changed in package.ipe"),
+            "{shown}"
+        );
+        assert!(!shown.contains("delivery.mobile.push"), "{shown}");
         assert!(shown.contains("run it again"), "{shown}");
+        assert_eq!(before.moved_to(&before), None, "an equal pin moved nothing");
+        let granted = ManifestPin {
+            accepts: accepts(&[web(WebCapability::Geolocation)]),
+            ..pin("/", &[])
+        };
+        assert_eq!(
+            before.moved_to(&granted),
+            Some(MovedFields(vec![PinnedField::Accepts])),
+            "an accept granted during the build moves the accepts"
+        );
     }
 }
