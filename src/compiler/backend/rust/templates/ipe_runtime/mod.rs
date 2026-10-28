@@ -31,6 +31,7 @@ pub mod http_header;
 pub mod inbound_authority;
 pub mod io;
 pub mod json;
+pub mod json_val;
 pub mod bitwise;
 pub mod list;
 pub mod log;

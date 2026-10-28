@@ -305,6 +305,8 @@ pub use external_conn::*;
 // compiled in-workspace (the standalone crate uses the sqlite `config.rs`).
 #[cfg(feature = "json")]
 pub mod json;
+#[cfg(feature = "json")]
+pub mod json_val;
 #[cfg(all(test, feature = "db"))]
 mod postgres_placeholder_rewrite_test;
 // The Ipê↔JS boundary-seal codec: the total, fail-closed decode gate a generated

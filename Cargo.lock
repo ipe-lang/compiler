@@ -3151,6 +3151,7 @@ dependencies = [
  "hmac 0.12.1",
  "icu_casemap",
  "icu_locale_core",
+ "indexmap 2.14.0",
  "ipe_diagnostics",
  "ipe_kernels",
  "js-sys",

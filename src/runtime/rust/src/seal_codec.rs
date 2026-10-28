@@ -35,6 +35,8 @@
 #[cfg(feature = "json")]
 use crate::json::{Decoder, JsonVal};
 #[cfg(feature = "json")]
+use crate::json_val::{SERDE_CONTAINER_FLOOR, json_depth};
+#[cfg(feature = "json")]
 use crate::{IpeError, IpeResult};
 
 /// Why a value was refused at the seal boundary.
@@ -221,9 +223,12 @@ pub fn seal_decode_serde<T: serde::de::DeserializeOwned>(
     }
     // Depth-bound the untrusted document first (same post-parse structural check
     // as `seal_decode`), so an adversarial `[[[[…]]]]` is refused before the
-    // typed decode. `JsonVal` is `serde_json::Value`, so the parsed value feeds
-    // `from_value` with no re-serialisation.
+    // typed decode. The bounded value then crosses into `serde_json::Value`,
+    // whose own walks recurse, under the serde backstop.
     let value = parse_depth_bounded(input, limits.max_nesting_depth)?;
+    let value = value.to_serde().map_err(|_| SealDecodeError::TooDeep {
+        max: limits.max_nesting_depth,
+    })?;
     serde_json::from_value::<T>(value).map_err(|e| SealDecodeError::TypeMismatch {
         detail: e.to_string(),
     })
@@ -248,12 +253,6 @@ pub fn seal_boundary_check(input: &str, limits: SealLimits) -> Result<(), SealDe
     }
     parse_depth_bounded(input, limits.max_nesting_depth).map(|_| ())
 }
-
-/// Most containers `serde_json` nests before it refuses with its own recursion
-/// error: its deserializer starts with a remaining depth of 128 and refuses the
-/// container that brings it to 0.
-#[cfg(feature = "json")]
-const SERDE_CONTAINER_FLOOR: usize = 127;
 
 /// Parse `input` into a [`JsonVal`], refusing a document nested past
 /// `max_depth` as [`SealDecodeError::TooDeep`] and a syntax error as
@@ -311,36 +310,6 @@ fn containers_nest_within(input: &str, cap: usize) -> bool {
         }
     }
     true
-}
-
-/// Structural nesting depth of a parsed JSON value: a scalar is depth 1, a
-/// container is 1 + the deepest child. Iterative over an explicit work stack so a
-/// pathological (but under-serde's-128-limit) document cannot recurse the native
-/// stack while we re-check the seal's own, possibly stricter, depth budget.
-#[cfg(feature = "json")]
-fn json_depth(root: &JsonVal) -> usize {
-    // (node, depth-at-node); the max depth seen is the answer.
-    let mut stack: Vec<(&JsonVal, usize)> = vec![(root, 1)];
-    let mut max_depth = 0usize;
-    while let Some((node, depth)) = stack.pop() {
-        if depth > max_depth {
-            max_depth = depth;
-        }
-        match node {
-            JsonVal::Array(items) => {
-                for item in items {
-                    stack.push((item, depth + 1));
-                }
-            }
-            JsonVal::Object(map) => {
-                for (_, v) in map {
-                    stack.push((v, depth + 1));
-                }
-            }
-            _ => {}
-        }
-    }
-    max_depth
 }
 
 /// Encode a `JsonVal` (built by the generated per-type encoder from the

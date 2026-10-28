@@ -28,7 +28,7 @@ fn test_only(predicate: &Meta) -> bool {
                 false
             }
         }
-        _ => false,
+        Meta::NameValue(_) => false,
     }
 }
 

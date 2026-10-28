@@ -813,7 +813,7 @@ where
     for<'a> Option<Vec<u8>>: sqlx::Decode<'a, R::Database> + sqlx::Type<R::Database>,
 {
     let cols = row.columns();
-    let mut map = serde_json::Map::new();
+    let mut map = super::json::JsonMap::new();
     for (i, col) in cols.iter().enumerate() {
         map.insert(col.name().to_string(), read_cell(row, i)?.into_json());
     }
@@ -3466,6 +3466,65 @@ fn migrate_checksum(sql: &str) -> String {
     format!("{:x}", h.finalize())
 }
 
+/// The characters a migration name occupies on a `status` line.
+///
+/// Counted on the scrubbed text [`migration_status_line`] prints, so the
+/// column the names align to matches what reaches the terminal.
+fn migration_status_name_width(name: &str) -> usize {
+    crate::system::scrub_log_controls(name).chars().count()
+}
+
+/// One `status` report line: the mark, the name padded to `width` characters, the detail.
+///
+/// The name and the detail (which quotes the ledger's `applied_at` text) are
+/// scrubbed of terminal controls. The padding is a `repeat`, never a runtime
+/// format width: a width past `u16::MAX` panics the formatter.
+fn migration_status_line(mark: &str, name: &str, detail: &str, width: usize) -> String {
+    let name = crate::system::scrub_log_controls(name);
+    let detail = crate::system::scrub_log_controls(detail);
+    let pad = width.saturating_sub(name.chars().count());
+    let mut line = String::with_capacity(
+        mark.len()
+            .saturating_add(name.len())
+            .saturating_add(pad)
+            .saturating_add(detail.len())
+            .saturating_add(6),
+    );
+    line.push_str("  ");
+    line.push_str(mark);
+    line.push_str("  ");
+    line.push_str(&name);
+    line.push_str(&" ".repeat(pad));
+    line.push_str("  ");
+    line.push_str(&detail);
+    line
+}
+
+/// The `migrate` refusal line for a declared migration whose SQL changed after it was applied.
+///
+/// Names only the migration, scrubbed of terminal controls: never the SQL body
+/// (which may carry seed-data literals) nor its hash.
+fn migration_drift_line(name: &str) -> String {
+    format!(
+        "db: migration '{}' changed after it was applied — checksum mismatch",
+        crate::system::scrub_log_controls(name)
+    )
+}
+
+/// The `migrate` summary line naming the migrations just applied, each scrubbed of terminal controls.
+fn migration_applied_line(applied: &[String]) -> String {
+    let names: Vec<std::borrow::Cow<'_, str>> = applied
+        .iter()
+        .map(String::as_str)
+        .map(crate::system::scrub_log_controls)
+        .collect();
+    format!(
+        "db: applied {} migration(s): {}",
+        applied.len(),
+        names.join(", ")
+    )
+}
+
 /// The refusal [`db_migrate_apply`] gives a ledger row with a `NULL` `name` or `checksum`.
 const MIGRATION_LEDGER_NULL_IDENTITY: &str =
     "db.migrate: corrupt _ipe_migrations ledger: a row has a NULL name or checksum";
@@ -3609,9 +3668,13 @@ pub fn db_migrate_apply<E: Send + From<String> + crate::FromIpeError + 'static>(
             }
             crate::system::write_stdout_line(&header);
             crate::system::write_stdout_line("");
-            let width = lines.iter().map(|(_, n, _)| n.len()).max().unwrap_or(0);
+            let width = lines
+                .iter()
+                .map(|(_, n, _)| migration_status_name_width(n))
+                .max()
+                .unwrap_or(0);
             for (mark, name, detail) in &lines {
-                crate::system::write_stdout_line(&format!("  {mark}  {name:<width$}  {detail}"));
+                crate::system::write_stdout_line(&migration_status_line(mark, name, detail, width));
             }
             if lines.is_empty() {
                 crate::system::write_stdout_line("  (no migrations declared)");
@@ -3638,9 +3701,7 @@ pub fn db_migrate_apply<E: Send + From<String> + crate::FromIpeError + 'static>(
                     // Drift: error embeds only the app-authored NAME, never the
                     // SQL body (which may carry seed-data literals) nor the hash.
                     if op == "migrate" {
-                        crate::system::write_stderr_line(&format!(
-                            "db: migration '{name}' changed after it was applied — checksum mismatch"
-                        ));
+                        crate::system::write_stderr_line(&migration_drift_line(&name));
                         let _ = std::io::Write::flush(&mut std::io::stderr());
                         // `ipe db migrate` CLI-op boundary: applied migration changed (checksum mismatch), exit non-zero
                         crate::system::exit_process(1);
@@ -3703,11 +3764,7 @@ pub fn db_migrate_apply<E: Send + From<String> + crate::FromIpeError + 'static>(
                     "db: schema already up to date — 0 migrations applied",
                 );
             } else {
-                crate::system::write_stdout_line(&format!(
-                    "db: applied {} migration(s): {}",
-                    out.len(),
-                    out.join(", ")
-                ));
+                crate::system::write_stdout_line(&migration_applied_line(&out));
             }
             let _ = std::io::Write::flush(&mut std::io::stdout());
             // `ipe db migrate` CLI-op boundary: migrations applied, exit zero
@@ -8132,6 +8189,47 @@ mod tests {
         );
     }
 
+    #[test]
+    fn migration_status_line_pads_a_name_past_the_formatter_width_limit() {
+        let name = "m".repeat(70_000);
+        let width = super::migration_status_name_width(&name).saturating_add(5);
+        let line = super::migration_status_line("•", &name, "pending", width);
+        assert_eq!(
+            line.chars().count(),
+            2 + 1 + 2 + 70_005 + 2 + "pending".len()
+        );
+        assert!(line.ends_with(&format!("{}  pending", " ".repeat(5))));
+    }
+
+    #[test]
+    fn migration_drift_and_applied_lines_escape_terminal_controls() {
+        let name = "seed\u{1b}[2J";
+        assert_eq!(
+            super::migration_drift_line(name),
+            "db: migration 'seed\\u{1b}[2J' changed after it was applied — checksum mismatch"
+        );
+        assert_eq!(
+            super::migration_applied_line(&["init".to_owned(), name.to_owned()]),
+            "db: applied 2 migration(s): init, seed\\u{1b}[2J"
+        );
+    }
+
+    #[test]
+    fn migration_status_line_escapes_terminal_controls_in_name_and_detail() {
+        let name = "init\u{1b}[2J";
+        let line = super::migration_status_line(
+            "✓",
+            name,
+            "applied 2026\u{1b}]0;x\u{7}",
+            super::migration_status_name_width(name),
+        );
+        assert!(
+            !line.contains('\u{1b}') && !line.contains('\u{7}'),
+            "{line}"
+        );
+        assert_eq!(line, "  ✓  init\\u{1b}[2J  applied 2026\\u{1b}]0;x\\u{7}");
+    }
+
     #[tokio::test]
     async fn migrate_is_idempotent_and_drift_guarded() {
         let db = fresh_db().await;
@@ -10555,28 +10653,28 @@ mod tests {
         let dec = db_decode_int::<String>("n".to_string());
 
         // In-range: a decimal string truncates toward zero, still Ok.
-        let in_range = serde_json::json!({ "n": "3.7" });
+        let in_range = crate::json_val::json_val!({ "n": "3.7" });
         match (dec.run)(&in_range) {
             IpeResult::Ok(i) => assert_eq!(i, 3),
             IpeResult::Err(e) => panic!("in-range decode failed: {:?}", e),
         }
 
         // In-range: a JSON float that is integral and representable decodes.
-        let in_range_num = serde_json::json!({ "n": 42.0 });
+        let in_range_num = crate::json_val::json_val!({ "n": 42.0 });
         match (db_decode_int::<String>("n".to_string()).run)(&in_range_num) {
             IpeResult::Ok(i) => assert_eq!(i, 42),
             IpeResult::Err(e) => panic!("in-range numeric decode failed: {:?}", e),
         }
 
         // Out-of-range: `1e30` past i64::MAX must REJECT, not saturate to i64::MAX.
-        let over = serde_json::json!({ "n": 1e30 });
+        let over = crate::json_val::json_val!({ "n": 1e30 });
         match (db_decode_int::<String>("n".to_string()).run)(&over) {
             IpeResult::Ok(i) => panic!("out-of-range float saturated to {i} instead of erroring"),
             IpeResult::Err(_) => {}
         }
 
         // Out-of-range as a decimal string is rejected on the same path.
-        let over_str = serde_json::json!({ "n": "1e30" });
+        let over_str = crate::json_val::json_val!({ "n": "1e30" });
         match (db_decode_int::<String>("n".to_string()).run)(&over_str) {
             IpeResult::Ok(i) => panic!("out-of-range string saturated to {i} instead of erroring"),
             IpeResult::Err(_) => {}
@@ -10584,14 +10682,14 @@ mod tests {
 
         // i64::MIN-1 rounds to i64::MIN as f64; a non-strict lower bound would
         // admit it and saturate to i64::MIN. It must reject.
-        let under = serde_json::json!({ "n": "-9223372036854775809" });
+        let under = crate::json_val::json_val!({ "n": "-9223372036854775809" });
         match (db_decode_int::<String>("n".to_string()).run)(&under) {
             IpeResult::Ok(i) => panic!("i64::MIN-1 saturated to {i} instead of erroring"),
             IpeResult::Err(_) => {}
         }
 
         // The exact boundaries still decode through the integer path.
-        let min = serde_json::json!({ "n": "-9223372036854775808" });
+        let min = crate::json_val::json_val!({ "n": "-9223372036854775808" });
         match (db_decode_int::<String>("n".to_string()).run)(&min) {
             IpeResult::Ok(i) => assert_eq!(i, i64::MIN),
             IpeResult::Err(e) => panic!("i64::MIN decode failed: {:?}", e),
@@ -10705,7 +10803,7 @@ mod tests {
         // Verify db_decode_money parses "USD 12.34" → (Decimal(12.34), "USD").
         use rust_decimal::Decimal as RD;
         use std::str::FromStr;
-        let val = serde_json::json!({ "price": "USD 12.34" });
+        let val = crate::json_val::json_val!({ "price": "USD 12.34" });
         let result = (db_decode_money::<String>("price".to_string()).run)(&val);
         match result {
             IpeResult::Ok((amount, code)) => {
@@ -10716,14 +10814,14 @@ mod tests {
         }
 
         // NULL → Err.
-        let val_null = serde_json::json!({ "price": null });
+        let val_null = crate::json_val::json_val!({ "price": null });
         assert!(matches!(
             (db_decode_money::<String>("price".to_string()).run)(&val_null),
             IpeResult::Err(_)
         ));
 
         // Bad format → Err.
-        let val_bad = serde_json::json!({ "price": "NODECIMAL" });
+        let val_bad = crate::json_val::json_val!({ "price": "NODECIMAL" });
         assert!(matches!(
             (db_decode_money::<String>("price".to_string()).run)(&val_bad),
             IpeResult::Err(_)
@@ -10735,7 +10833,7 @@ mod tests {
         // Verify db_decode_decimal parses "3.14159" → Decimal(3.14159).
         use rust_decimal::Decimal as RD;
         use std::str::FromStr;
-        let val = serde_json::json!({ "amount": "3.14159" });
+        let val = crate::json_val::json_val!({ "amount": "3.14159" });
         let result = (db_decode_decimal::<String>("amount".to_string()).run)(&val);
         match result {
             IpeResult::Ok(d) => {
@@ -10745,21 +10843,21 @@ mod tests {
         }
 
         // NULL → Err.
-        let val_null = serde_json::json!({ "amount": null });
+        let val_null = crate::json_val::json_val!({ "amount": null });
         assert!(matches!(
             (db_decode_decimal::<String>("amount".to_string()).run)(&val_null),
             IpeResult::Err(_)
         ));
 
         // Non-numeric text → Err.
-        let val_bad = serde_json::json!({ "amount": "not-a-number" });
+        let val_bad = crate::json_val::json_val!({ "amount": "not-a-number" });
         assert!(matches!(
             (db_decode_decimal::<String>("amount".to_string()).run)(&val_bad),
             IpeResult::Err(_)
         ));
 
         // Missing column → Err.
-        let val_missing = serde_json::json!({ "other": "x" });
+        let val_missing = crate::json_val::json_val!({ "other": "x" });
         assert!(matches!(
             (db_decode_decimal::<String>("amount".to_string()).run)(&val_missing),
             IpeResult::Err(_)
@@ -11026,10 +11124,10 @@ mod tests {
             json,
             vec![
                 Some(JsonVal::Null),
-                Some(serde_json::json!("")),
-                Some(serde_json::json!(0)),
-                Some(serde_json::json!(1.5)),
-                Some(serde_json::json!("00ff")),
+                Some(crate::json_val::json_val!("")),
+                Some(crate::json_val::json_val!(0)),
+                Some(crate::json_val::json_val!(1.5)),
+                Some(crate::json_val::json_val!("00ff")),
                 Some(JsonVal::Bool(true)),
             ]
         );
@@ -11042,7 +11140,7 @@ mod tests {
             .expect("fetch finite cells");
         assert_eq!(
             row_to_json(&finite).ok(),
-            Some(serde_json::json!({
+            Some(crate::json_val::json_val!({
                 "nul": null, "empty": "", "zero": 0, "ratio": 1.5, "bytes": "00ff", "flag": true
             }))
         );
@@ -11060,11 +11158,11 @@ mod tests {
         assert!(FiniteF64::new(f64::NEG_INFINITY).is_none());
         assert_eq!(
             FiniteF64::new(-0.0).map(|f| Cell::Float(f).into_json()),
-            Some(serde_json::json!(-0.0))
+            Some(crate::json_val::json_val!(-0.0))
         );
         assert_eq!(
             FiniteF64::new(f64::MAX).map(|f| Cell::Float(f).into_json()),
-            Some(serde_json::json!(f64::MAX))
+            Some(crate::json_val::json_val!(f64::MAX))
         );
     }
 

@@ -29,6 +29,7 @@
 
 use super::IpeResult;
 
+use super::{JsonMap, JsonVal};
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode};
 use serde_json::Value as JsonValue;
@@ -60,7 +61,7 @@ fn header_json(alg: &str) -> String {
 /// are byte-stable, independent of the ambient object-order encoder setting.
 /// Returns the bad-claims error message on a parse failure.
 fn payload_json(claims_json: &str) -> Result<String, String> {
-    let value: JsonValue =
+    let value: JsonVal =
         serde_json::from_str(claims_json).map_err(|e| format!("bad claims json: {}", e))?;
     Ok(super::json_enc_canonical(&value))
 }
@@ -455,16 +456,16 @@ pub fn ipe_jwt_decode_rs256(
 // `Ipe.Jwt` exposes a builder pattern:
 //   `Jwt.encode (Jwt.hs256 secret) (Jwt.claims |> Jwt.subject "alice" |> …)`
 //
-// `Claims` is represented as a `serde_json::Value` (the `IrType::Json` opaque).
+// `Claims` is represented as a `JsonVal` (the `IrType::Json` opaque).
 // `Algorithm` is encoded as a `String` with a prefix: `"HS256:<secret>"` or
 // `"RS256:<pem>"` (the `IrType::Str` opaque).  The encode / decode functions
 // parse the prefix to dispatch to the appropriate flat kernel, using the same
 // deterministic JSON encoder as the flat `encodeHs256` / `decodeHs256` kernels.
 
 /// `Jwt.claims : Claims` — returns an empty JSON object to start the builder
-/// chain.  Backed as `serde_json::Value::Object` (IrType::Json).
-pub fn ipe_jwt_claims() -> JsonValue {
-    JsonValue::Object(serde_json::Map::new())
+/// chain.  Backed as `JsonVal::Object` (IrType::Json).
+pub fn ipe_jwt_claims() -> JsonVal {
+    JsonVal::Object(JsonMap::new())
 }
 
 /// `Jwt.hs256 : String -> Algorithm` — builds an HS256 algorithm descriptor.
@@ -491,34 +492,33 @@ pub fn ipe_jwt_rs256(key_pem: String) -> super::secret::Secret {
 /// Helper: insert (or overwrite) a key-value pair in a JSON object.
 /// If `claims` is not an object, a new object is created containing only this
 /// claim (defensive; the builder chain guarantees object inputs from `claims`).
-fn claims_set(claims: JsonValue, key: &str, value: JsonValue) -> JsonValue {
-    let mut map = match claims {
-        JsonValue::Object(m) => m,
-        other => {
-            // Defensive: wrap the non-object in a fresh map.  This should
-            // never happen in a well-typed builder chain.
-            let mut m = serde_json::Map::new();
-            m.insert("_value".to_string(), other);
-            m
-        }
+fn claims_set(claims: JsonVal, key: &str, value: JsonVal) -> JsonVal {
+    let mut map = if claims.is_object() {
+        claims.into_object().unwrap_or_default()
+    } else {
+        // Defensive: wrap the non-object in a fresh map.  This should
+        // never happen in a well-typed builder chain.
+        let mut m = JsonMap::new();
+        m.insert("_value".to_string(), claims);
+        m
     };
     map.insert(key.to_string(), value);
-    JsonValue::Object(map)
+    JsonVal::Object(map)
 }
 
 /// `Jwt.subject : String -> Claims -> Claims` — sets the `sub` claim.
-pub fn ipe_jwt_subject(sub: String, claims: JsonValue) -> JsonValue {
-    claims_set(claims, "sub", JsonValue::String(sub))
+pub fn ipe_jwt_subject(sub: String, claims: JsonVal) -> JsonVal {
+    claims_set(claims, "sub", JsonVal::String(sub))
 }
 
 /// `Jwt.issuer : String -> Claims -> Claims` — sets the `iss` claim.
-pub fn ipe_jwt_issuer(iss: String, claims: JsonValue) -> JsonValue {
-    claims_set(claims, "iss", JsonValue::String(iss))
+pub fn ipe_jwt_issuer(iss: String, claims: JsonVal) -> JsonVal {
+    claims_set(claims, "iss", JsonVal::String(iss))
 }
 
 /// `Jwt.audience : String -> Claims -> Claims` — sets the `aud` claim.
-pub fn ipe_jwt_audience(aud: String, claims: JsonValue) -> JsonValue {
-    claims_set(claims, "aud", JsonValue::String(aud))
+pub fn ipe_jwt_audience(aud: String, claims: JsonVal) -> JsonVal {
+    claims_set(claims, "aud", JsonVal::String(aud))
 }
 
 /// `Jwt.expiresAt : Int -> Claims -> Claims` — sets the `exp` claim (Unix
@@ -526,44 +526,44 @@ pub fn ipe_jwt_audience(aud: String, claims: JsonValue) -> JsonValue {
 /// milliseconds but RFC 7519 uses Unix SECONDS.  The `Jwt.ipe` stdlib module
 /// passes the value straight through as a JSON number; the caller is responsible
 /// for providing the right unit.
-pub fn ipe_jwt_expires_at(exp: i64, claims: JsonValue) -> JsonValue {
+pub fn ipe_jwt_expires_at(exp: i64, claims: JsonVal) -> JsonVal {
     claims_set(
         claims,
         "exp",
-        JsonValue::Number(serde_json::Number::from(exp)),
+        JsonVal::Number(serde_json::Number::from(exp)),
     )
 }
 
 /// `Jwt.notBefore : Int -> Claims -> Claims` — sets the `nbf` claim.
-pub fn ipe_jwt_not_before(nbf: i64, claims: JsonValue) -> JsonValue {
+pub fn ipe_jwt_not_before(nbf: i64, claims: JsonVal) -> JsonVal {
     claims_set(
         claims,
         "nbf",
-        JsonValue::Number(serde_json::Number::from(nbf)),
+        JsonVal::Number(serde_json::Number::from(nbf)),
     )
 }
 
 /// `Jwt.issuedAt : Int -> Claims -> Claims` — sets the `iat` claim.
-pub fn ipe_jwt_issued_at(iat: i64, claims: JsonValue) -> JsonValue {
+pub fn ipe_jwt_issued_at(iat: i64, claims: JsonVal) -> JsonVal {
     claims_set(
         claims,
         "iat",
-        JsonValue::Number(serde_json::Number::from(iat)),
+        JsonVal::Number(serde_json::Number::from(iat)),
     )
 }
 
 /// `Jwt.jwtId : String -> Claims -> Claims` — sets the `jti` claim.
-pub fn ipe_jwt_jwt_id(jti: String, claims: JsonValue) -> JsonValue {
-    claims_set(claims, "jti", JsonValue::String(jti))
+pub fn ipe_jwt_jwt_id(jti: String, claims: JsonVal) -> JsonVal {
+    claims_set(claims, "jti", JsonVal::String(jti))
 }
 
 /// `Jwt.withClaim : String -> JsonEnc.Value -> Claims -> Claims` — inserts an
 /// arbitrary claim whose value is any encoded JSON node.  Matches the reference
 /// `Ipê/Core/Jwt.ipe:79`: the value is a `JsonEnc.Value` (itself a
-/// `serde_json::Value` at runtime, exactly like `Claims`), so it is inserted
+/// `JsonVal` at runtime, exactly like `Claims`), so it is inserted
 /// directly — a string / int / bool / nested object all round-trip with the
 /// correct token bytes.
-pub fn ipe_jwt_with_claim(key: String, value: JsonValue, claims: JsonValue) -> JsonValue {
+pub fn ipe_jwt_with_claim(key: String, value: JsonVal, claims: JsonVal) -> JsonVal {
     claims_set(claims, &key, value)
 }
 
@@ -573,7 +573,7 @@ pub fn ipe_jwt_with_claim(key: String, value: JsonValue, claims: JsonValue) -> J
 /// claims through the deterministic JSON encoder (sorted keys).
 pub fn ipe_jwt_encode(
     algorithm_descriptor: super::secret::Secret,
-    claims: JsonValue,
+    claims: JsonVal,
 ) -> IpeResult<crate::error::IpeError, String> {
     // Serialise the claims through the deterministic encoder (sorted keys).
     let claims_json = super::json_enc_encode(0, claims);
@@ -1217,7 +1217,7 @@ mod tests {
     #[test]
     fn ipe_jwt_encode_unknown_algorithm_multibyte_boundary_does_not_panic() {
         let desc = crate::secret::secret_from_string(multibyte_boundary_descriptor());
-        let claims = JsonValue::Null;
+        let claims = JsonVal::Null;
         let result = ipe_jwt_encode(desc, claims);
         match result {
             IpeResult::Err(msg) => {
