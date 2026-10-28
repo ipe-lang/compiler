@@ -491,7 +491,8 @@ const fn permission_table_agrees(axes: &[WebCapability]) -> bool {
         if bridged && row.android.is_empty() {
             return false;
         }
-        if !bridged && !(row.ios_entitlements.is_empty() && row.ios_background_modes.is_empty()) {
+        let native_only = !row.ios_entitlements.is_empty() || !row.ios_background_modes.is_empty();
+        if native_only && !bridged {
             return false;
         }
         let mut permissions = row.android;
@@ -610,6 +611,7 @@ impl PermissionSet {
         let lines = self
             .android
             .iter()
+            .copied()
             .map(render_android_entry)
             .collect::<Vec<_>>();
         AndroidManifestFragment { lines }
@@ -650,7 +652,7 @@ impl AndroidManifestFragment {
 /// value is a fixed constant from the closed vocabulary, never user text, so no
 /// XML escaping of untrusted input is required; the constants are ASCII
 /// identifiers.
-fn render_android_entry(entry: &AndroidEntry) -> String {
+fn render_android_entry(entry: AndroidEntry) -> String {
     format!(
         "<uses-permission android:name=\"{}\" />",
         android_entry_name(entry)
@@ -739,7 +741,7 @@ fn entitled_permission_names(
         }
     } else {
         for entry in &derived.android {
-            names.insert(android_entry_name(entry));
+            names.insert(android_entry_name(*entry));
         }
     }
     Ok(names)
@@ -747,7 +749,7 @@ fn entitled_permission_names(
 
 /// The qualified `android:name` identifier of an Android entry, used in the
 /// rendered manifest and to reconcile an override against the entitled set.
-fn android_entry_name(entry: &AndroidEntry) -> String {
+fn android_entry_name(entry: AndroidEntry) -> String {
     match entry {
         AndroidEntry::UsesPermission(permission) => {
             format!("android.permission.{}", permission.name())
@@ -839,7 +841,7 @@ pub fn per_axis_breakdown(
             Platform::Android => row
                 .android
                 .iter()
-                .map(|p| android_entry_name(&AndroidEntry::UsesPermission(*p)))
+                .map(|p| android_entry_name(AndroidEntry::UsesPermission(*p)))
                 .collect(),
         };
         by_axis.insert(axis.as_str(), entries);
