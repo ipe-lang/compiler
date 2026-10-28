@@ -731,7 +731,7 @@ jobs:
         env:
           CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER: wasm-bindgen-test-runner
           CHROMEDRIVER: chromedriver
-        run: cargo test -p ipe-runtime-rust --target wasm32-unknown-unknown --features wasm-client --test wasm_js_port_bridge | python3 tools/scripts/wasm-test/wasm_test_count.py 2
+        run: cargo test -p ipe-runtime-rust --target wasm32-unknown-unknown --features wasm-client --test wasm_js_port_bridge | python3 tools/scripts/wasm-test/wasm_test_count.py 4
       - name: Run the DOM paint tests (headless Chrome)
         if: needs.changes.outputs.release_only != 'true'
         shell: bash
@@ -2611,17 +2611,35 @@ jobs:
             echo "csp-styles server never became ready on port $IPE_CSP_STYLES_PORT" >&2
             exit 1
           fi
-      - name: Run Playwright specs (geo + clipboard, layout fill, focus across patch, csp styles)
-        working-directory: tools/scripts/browser-e2e
-        run: npx playwright test --config playwright.config.mjs
-      - name: Kill server
-        if: always()
-        run: kill "$CI_JOB_GEO_SERVER_PID" "$CI_JOB_LAYOUT_SERVER_PID" "$CI_JOB_FOCUS_SERVER_PID" "$CI_JOB_CSP_STYLES_SERVER_PID" 2>/dev/null || true
-      # The wasm test runner, pinned to the Cargo.lock wasm-bindgen version
+      # The wasm-bindgen CLI, pinned to the Cargo.lock wasm-bindgen version: the
+      # `web solo` bundle build below runs it, and so does the wasm test runner
       # (a runner of another version refuses the test binary).
       - uses: taiki-e/install-action@4cef1412cce204788f482e778a0b9187f9626a29 # v2
         with:
           tool: wasm-bindgen@0.2.126
+      # The serverless browser bundle: the spec serves its `www/` directory by
+      # request interception, so no server is spawned. mold links host binaries
+      # only, so the wasm32 build clears the job's RUSTFLAGS.
+      - name: Build the wasm-solo-clipboard browser bundle
+        env:
+          RUSTFLAGS: ""
+          CARGO_TARGET_DIR: ${{ github.workspace }}/.cache/browser-e2e-target/wasm-solo-clipboard
+        run: |
+          set -euo pipefail
+          OUT="$RUNNER_TEMP/wasm-solo-clipboard-emitted"
+          "$RUNNER_TEMP/ipe-release/ipe" dev build examples/shapes/web/wasm-solo-clipboard web solo --out "$OUT"
+          # Fail closed: a bundle without its shell leaves the spec nothing to serve.
+          if [ ! -f "$OUT/rust/www/index.html" ]; then
+            echo "wasm-solo-clipboard bundle has no www/index.html under '$OUT/rust'" >&2
+            exit 1
+          fi
+          bash "$GITHUB_WORKSPACE/.github/ci/github-env.sh" CI_JOB_WASM_SOLO_WWW "$OUT/rust/www"
+      - name: Run Playwright specs (geo + clipboard, layout fill, focus across patch, csp styles)
+        working-directory: tools/scripts/browser-e2e
+        run: IPE_WASM_SOLO_WWW="$CI_JOB_WASM_SOLO_WWW" npx playwright test --config playwright.config.mjs
+      - name: Kill server
+        if: always()
+        run: kill "$CI_JOB_GEO_SERVER_PID" "$CI_JOB_LAYOUT_SERVER_PID" "$CI_JOB_FOCUS_SERVER_PID" "$CI_JOB_CSP_STYLES_SERVER_PID" 2>/dev/null || true
       - name: Self-test the echo server and the count proof
         run: |
           set -euo pipefail

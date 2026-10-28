@@ -1431,9 +1431,12 @@ const PORT_GLUE_JS_TAIL: &str = r#"    try {
     if (webAuthnSink(value, corId)) return true;
     return false;
   }
+  // Answers whether a sink or the registered receiver took the frame: `false`
+  // tells the runtime no host exists for it, so a correlated request refuses at
+  // once instead of waiting out its deadline.
   function deliver(raw) {
     var value;
-    try { value = JSON.parse(raw); } catch (_e) { return; /* drop a malformed frame */ }
+    try { value = JSON.parse(raw); } catch (_e) { return false; /* drop a malformed frame */ }
     // If this frame carries a correlation id, it is a `js_request` envelope:
     // extract the id and the inner payload command, and pass the id through to
     // the reply so the runtime can route it to the one-shot waiter.
@@ -1444,10 +1447,11 @@ const PORT_GLUE_JS_TAIL: &str = r#"    try {
     }
     // A first-party browser-capability command is handled by its built-in sink;
     // anything else is a developer port frame routed to the registered receiver.
-    if (builtinSink(value, corId)) return;
+    if (builtinSink(value, corId)) return true;
     // For non-first-party frames, if there is a correlation id the developer JS
     // handler must echo it back; we pass it as a second argument to onReceive.
-    if (typeof onReceive === "function") { onReceive(value, corId); }
+    if (typeof onReceive === "function") { onReceive(value, corId); return true; }
+    return false;
   }
   // The runtime calls this with each outbound seal frame (a JSON string).
   window.ipeOnReceive = deliver;
@@ -1541,6 +1545,18 @@ mod tests {
         let i = port_glue_integrity();
         assert!(i.starts_with("sha256-"));
         assert_eq!(i, port_glue_integrity()); // deterministic
+    }
+
+    /// A frame no sink and no receiver takes answers `false`, the runtime's
+    /// signal that the page has no host for it.
+    #[test]
+    fn deliver_answers_whether_a_host_took_the_frame() {
+        let js = port_glue_js();
+        assert!(js.contains("if (builtinSink(value, corId)) return true;"));
+        assert!(js.contains(
+            "if (typeof onReceive === \"function\") { onReceive(value, corId); return true; }\n    return false;\n  }"
+        ));
+        assert!(js.contains("catch (_e) { return false; /* drop a malformed frame */ }"));
     }
 
     #[test]

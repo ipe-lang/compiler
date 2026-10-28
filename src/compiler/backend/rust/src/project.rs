@@ -2257,7 +2257,8 @@ fn rewrite_runtime_paths_for_dep(src: &str) -> String {
 
 /// The wasm files shared by both emit models: the target-scoped `.cargo/config`
 /// (so a host mold/native-linker `build.rustflags` cannot leak into the wasm32
-/// link) and the static browser shell (`index.html` + `boot.js`). The
+/// link), the static browser shell (`index.html` + `boot.js`) and the
+/// content-addressed port glue the shell loads with its SRI pin. The
 /// wasm-bindgen CLI drops the JS glue + `.wasm` beside them under `www/pkg/`.
 ///
 /// Every URL the shell loads is `base.url_of` of its bundle path, so a deep
@@ -2283,9 +2284,17 @@ fn insert_wasm_shared_files(
          rustflags = [\"-C\", \"debuginfo=0\"]\n"
             .to_owned(),
     );
+    // The port glue: the same bytes, path and integrity the server-driven page
+    // serves, so `window.ipeOnReceive` exists before the boot module runs.
+    let glue = port_glue_bundle_path()?;
+    files.insert(
+        RelPath::new(format!("www/{}", glue.rel()))?,
+        ipe_runtime_rust::js_port_glue::port_glue_js().to_owned(),
+    );
     // The static browser shell (CSP: `script-src 'self' 'wasm-unsafe-eval'` —
-    // wasm instantiation allowed, JS eval not; boot module external so no inline
-    // allowance is needed).
+    // wasm instantiation allowed, JS eval not; every script external so no inline
+    // allowance is needed). The classic glue script runs during parsing, before
+    // the deferred boot module.
     files.insert(
         RelPath::new("www/index.html")?,
         "<!doctype html>\n<html>\n<head>\n<meta charset=\"utf-8\">\n\
@@ -2295,6 +2304,10 @@ fn insert_wasm_shared_files(
          connect-src 'self'\">\n\
          <title>Ip\u{ea} App</title>\n</head>\n<body>\n"
             .to_owned()
+            + &shell_port_glue_script(
+                &base.url_of(&glue),
+                &ipe_runtime_rust::js_port_glue::port_glue_integrity(),
+            )
             + &shell_boot_script(&base.url_of(&shell_path("boot.js")?))
             + "</body>\n</html>\n",
     );
@@ -2319,6 +2332,38 @@ fn shell_path(rel: &str) -> DResult<BundlePath> {
         where_: "backend.wasm_shell",
         detail: format!("shell file `{rel}` is not a bundle path: {refusal}"),
     })
+}
+
+/// The bundle path of the port glue, from the runtime's content-addressed URL
+/// path.
+///
+/// # Errors
+///
+/// [`Diagnostic::CompilerBug`] when the runtime path is not rooted or not a
+/// bundle path.
+fn port_glue_bundle_path() -> DResult<BundlePath> {
+    let url_path = ipe_runtime_rust::js_port_glue::port_glue_path();
+    let Some(rel) = url_path.strip_prefix('/') else {
+        return Err(Diagnostic::CompilerBug {
+            where_: "backend.wasm_shell",
+            detail: format!("port glue path `{url_path}` is not rooted"),
+        });
+    };
+    shell_path(rel)
+}
+
+/// The `<script>` element that loads the port glue from `glue_url`, pinned to
+/// `integrity`.
+///
+/// Both values are attribute-escaped, so no byte of either can close its
+/// attribute.
+fn shell_port_glue_script(glue_url: &str, integrity: &str) -> String {
+    let mut out = String::from("<script src=\"");
+    ipe_runtime_rust::escape::html_attr_into(glue_url, &mut out);
+    out.push_str("\" integrity=\"");
+    ipe_runtime_rust::escape::html_attr_into(integrity, &mut out);
+    out.push_str("\" crossorigin=\"anonymous\"></script>\n");
+    out
 }
 
 /// The `<script>` element that loads the boot module from `boot_url`.
@@ -6828,10 +6873,62 @@ mod vendored_feature_tests;
 
 #[cfg(test)]
 mod wasm_shell_tests {
-    use super::{insert_wasm_shared_files, shell_boot_js, shell_boot_script};
+    use super::{
+        insert_wasm_shared_files, port_glue_bundle_path, shell_boot_js, shell_boot_script,
+        shell_port_glue_script,
+    };
     use ipe_backend::RelPath;
     use ipe_runtime_rust::encoding::MountBase;
+    use ipe_runtime_rust::js_port_glue::{port_glue_integrity, port_glue_js, port_glue_path};
     use std::collections::BTreeMap;
+
+    /// Every client-wasm bundle ships the port glue at its content-addressed
+    /// path and loads it, SRI-pinned, before the boot module: without it no
+    /// page host exists and every port call finds nothing to take its frame.
+    #[test]
+    fn shell_loads_the_pinned_port_glue_before_boot() -> Result<(), String> {
+        for base in [
+            MountBase::root(),
+            MountBase::parse("/app").map_err(|r| r.to_string())?,
+        ] {
+            let mut files: BTreeMap<RelPath, String> = BTreeMap::new();
+            insert_wasm_shared_files(&mut files, &base).map_err(|d| format!("{d:?}"))?;
+            let glue = port_glue_bundle_path().map_err(|d| format!("{d:?}"))?;
+            assert_eq!(format!("/{}", glue.rel()), port_glue_path());
+            let shipped = files
+                .get(format!("www/{}", glue.rel()).as_str())
+                .ok_or("no port glue in the bundle")?;
+            assert_eq!(
+                shipped,
+                port_glue_js(),
+                "the shipped bytes are the pinned bytes"
+            );
+
+            let index = files.get("www/index.html").ok_or("no index.html")?;
+            let tag = format!(
+                "<script src=\"{}\" integrity=\"{}\" crossorigin=\"anonymous\"></script>\n",
+                base.url_of(&glue),
+                port_glue_integrity()
+            );
+            let glue_at = index
+                .find(&tag)
+                .ok_or_else(|| format!("no glue tag: {index}"))?;
+            let boot_at = index
+                .find("<script type=\"module\"")
+                .ok_or_else(|| format!("no boot tag: {index}"))?;
+            assert!(glue_at < boot_at, "the glue must load before boot: {index}");
+            assert_eq!(index.matches("<script").count(), 2, "{index}");
+        }
+        Ok(())
+    }
+
+    /// The glue tag's URL and integrity cannot close their attributes.
+    #[test]
+    fn port_glue_script_escapes_its_attributes() {
+        let hostile = shell_port_glue_script("/a\"><script>x</script>", "sha256-\"><b>");
+        assert!(!hostile.contains("\"><script>x"), "{hostile}");
+        assert!(!hostile.contains("\"><b>"), "{hostile}");
+    }
 
     /// The emitted `www/index.html` and `www/boot.js` under `base`.
     fn shell(base: &MountBase) -> Result<(String, String), String> {
