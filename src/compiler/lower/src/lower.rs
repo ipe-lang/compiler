@@ -41212,6 +41212,102 @@ mod tests {
         );
     }
 
+    /// A canonical template of each shape refuses a concrete of every other shape.
+    ///
+    /// The step past each covering pair: a unit, arrow, tuple, constructor or
+    /// record template against a solved type of another shape, a tuple of
+    /// another length, and a record with one field more, never covers.
+    #[test]
+    fn canon_template_refuses_every_other_concrete_shape() {
+        use super::ty_templates::canon_covers_as_template;
+        let mut interner = Interner::new();
+        let builtins = build_test_builtin_ctors(&mut interner);
+        #[allow(clippy::expect_used)] // a fresh interner accepts these names
+        let [main, t, a, mk_t, run, row] = ["Main", "T", "a", "MkT", "run", "r"]
+            .map(|name| interner.intern(name).expect("intern name"));
+        let module = canon::Module {
+            imports_unsafe_submodule: false,
+            imported_web_capabilities: std::collections::BTreeSet::new(),
+            name: vec![main],
+            unions: vec![covers_fixture_union(vec![main], t, vec![a], mk_t)],
+            defs: vec![],
+        };
+        let types = empty_solved_types();
+        let lowerer = covers_fixture_lowerer(&module, &types, &interner, &builtins);
+        let record = |n: usize| {
+            Ty::Record(
+                (0..n)
+                    .map(|i| (if i == 0 { run } else { a }, Ty::Unit))
+                    .collect(),
+                ipe_types::RowTail::Closed,
+            )
+        };
+        let concretes = [
+            ("unit", Ty::Unit),
+            ("arrow", Ty::Fun(Box::new(Ty::Unit), Box::new(Ty::Unit))),
+            ("pair", Ty::Tuple(vec![Ty::Unit, Ty::Unit])),
+            (
+                "constructor",
+                Ty::Con {
+                    module: vec![main],
+                    name: t,
+                    args: vec![Ty::Unit],
+                },
+            ),
+            ("record", record(1)),
+        ];
+        let templates = [
+            ("unit", canon::Type::Unit),
+            (
+                "arrow",
+                canon::Type::Lambda(Box::new(canon::Type::Unit), Box::new(canon::Type::Unit)),
+            ),
+            (
+                "pair",
+                canon::Type::Tuple(vec![canon::Type::Unit, canon::Type::Unit]),
+            ),
+            (
+                "constructor",
+                canon::Type::Con {
+                    home: vec![main],
+                    name: t,
+                    args: vec![canon::Type::Unit],
+                },
+            ),
+            (
+                "record",
+                canon::Type::Record(vec![(run, canon::Type::Unit)]),
+            ),
+        ];
+        for (tname, template) in &templates {
+            for (cname, concrete) in &concretes {
+                assert_eq!(
+                    canon_covers_as_template(template, concrete, &lowerer),
+                    tname == cname,
+                    "a canonical {tname} template against a solved {cname}"
+                );
+            }
+        }
+        let open = canon::Type::RecordOpen(row, vec![(run, canon::Type::Unit)]);
+        assert!(canon_covers_as_template(&open, &record(1), &lowerer));
+        assert!(
+            !canon_covers_as_template(&open, &record(2), &lowerer),
+            "an open row must not cover a literal with a field it does not declare"
+        );
+        assert!(
+            !canon_covers_as_template(&open, &Ty::Unit, &lowerer),
+            "an open row must not cover a non-record"
+        );
+        assert!(
+            !canon_covers_as_template(
+                &canon::Type::Tuple(vec![canon::Type::Unit, canon::Type::Unit]),
+                &Ty::Tuple(vec![Ty::Unit, Ty::Unit, Ty::Unit]),
+                &lowerer
+            ),
+            "a pair must not cover a triple"
+        );
+    }
+
     /// An opaque wrapper or collection head follows the type checker's head-identity rule.
     ///
     /// `Task`/`Decoder` and `List`/`Set` are reserved names no program can
