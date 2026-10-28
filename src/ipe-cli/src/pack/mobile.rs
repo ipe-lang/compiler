@@ -188,6 +188,9 @@ pub enum MobileRefusal {
         /// The mount base read after the build.
         after: MountBase,
     },
+    /// The project accepts push but names no `delivery.mobile.push`, so the
+    /// shell has no identifiers to register with.
+    PushUnconfigured,
 }
 
 impl std::fmt::Display for MobileRefusal {
@@ -226,6 +229,14 @@ impl std::fmt::Display for MobileRefusal {
                  package.ipe unchanged during the pack and run it again.",
                 before.dir_url(),
                 after.dir_url()
+            ),
+            Self::PushUnconfigured => write!(
+                f,
+                "error: this project accepts `JsPort Push`, but package.ipe names no \
+                 `delivery.mobile.push`\n  \
+                 = a mobile shell registers for push with its APNs environment and Firebase \
+                 client identifiers: set `delivery.mobile.push = {{ apns = Production, fcm = \
+                 {{ projectId, applicationId, apiKey, senderId }} }}`."
             ),
         }
     }

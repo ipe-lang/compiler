@@ -13,6 +13,9 @@
 
 use crate::telemetry::FrameAncestors;
 
+#[cfg(feature = "encoding")]
+use crate::encoding::{ServerOrigin, ServerOrigins};
+
 #[cfg(feature = "web")]
 use crate::web::console::{CONSOLE_CSS, CONSOLE_JS};
 
@@ -203,6 +206,14 @@ pub enum Source<'a> {
     Embed(&'a FrameAncestors),
     /// `'nonce-…'`: the elements stamped with one page's style nonce.
     Nonce(&'a StyleNonce),
+    /// `'wasm-unsafe-eval'`: WebAssembly compilation, never an `eval` of text.
+    WasmUnsafeEval,
+    /// One parsed server origin in its `https` form.
+    #[cfg(feature = "encoding")]
+    Origin(&'a ServerOrigin),
+    /// One parsed server origin in its `wss` form.
+    #[cfg(feature = "encoding")]
+    WsOrigin(&'a ServerOrigin),
 }
 
 impl Source<'_> {
@@ -216,15 +227,36 @@ impl Source<'_> {
             Self::Blob => "blob:",
             Self::Hash(hash) => hash.as_str(),
             Self::Embed(framing) => framing.sources(),
+            Self::WasmUnsafeEval => "'wasm-unsafe-eval'",
             Self::Nonce(nonce) => {
                 out.push_str("'nonce-");
                 nonce.write_token(out);
                 out.push('\'');
                 return;
             }
+            #[cfg(feature = "encoding")]
+            Self::Origin(origin) => {
+                origin.write_https(out);
+                return;
+            }
+            #[cfg(feature = "encoding")]
+            Self::WsOrigin(origin) => {
+                origin.write_wss(out);
+                return;
+            }
         };
         out.push_str(text);
     }
+}
+
+/// Whether a static browser bundle registers a service worker.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BundleWorker {
+    /// No worker: the policy names no `worker-src`.
+    None,
+    /// The program reaches `Ipe.Browser.Push`, whose same-origin worker
+    /// receives the push messages.
+    Push,
 }
 
 /// Declares [`Profile`] and [`Profile::ALL`] from one variant list.
@@ -412,6 +444,35 @@ impl<'a> ContentSecurityPolicy<'a> {
             Guarded::Console => Self::console(ancestors),
             #[cfg(feature = "web")]
             Guarded::WebPage { style_nonce } => Self::web_page(ancestors, style_nonce),
+        }
+    }
+
+    /// The policy a static browser bundle's shell carries in its `<meta>`.
+    ///
+    /// The bundle loads its own script, styles and WebAssembly; it reaches
+    /// its own origin and, per entry of `servers`, that origin's `https` and
+    /// `wss` forms; and, when `worker` is [`BundleWorker::Push`], it registers
+    /// a same-origin service worker. An empty `servers` is an offline bundle.
+    #[cfg(feature = "encoding")]
+    #[must_use]
+    pub fn bundle(servers: &'a ServerOrigins, worker: BundleWorker) -> Self {
+        use Directive as D;
+        use Source as S;
+        let connect = std::iter::once(S::SelfOrigin)
+            .chain(
+                servers
+                    .origins()
+                    .flat_map(|origin| [S::Origin(origin), S::WsOrigin(origin)]),
+            )
+            .collect();
+        let policy = Self::default()
+            .with(D::DefaultSrc, vec![S::SelfOrigin])
+            .with(D::ScriptSrc, vec![S::SelfOrigin, S::WasmUnsafeEval])
+            .with(D::StyleSrc, vec![S::SelfOrigin, S::UnsafeInline])
+            .with(D::ConnectSrc, connect);
+        match worker {
+            BundleWorker::None => policy,
+            BundleWorker::Push => policy.with(D::WorkerSrc, vec![S::SelfOrigin]),
         }
     }
 
@@ -975,5 +1036,60 @@ mod tests {
         );
         assert!(value.starts_with("default-src 'none'; "), "{value}");
         assert_ne!(value, "frame-ancestors https://a.example https://b.example");
+    }
+}
+
+#[cfg(all(test, feature = "encoding", not(target_arch = "wasm32")))]
+mod bundle_tests {
+    use super::*;
+
+    /// The offline bundle's policy: today's shell, byte for byte.
+    const OFFLINE: &str = "default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; \
+        style-src 'self' 'unsafe-inline'; connect-src 'self'";
+
+    #[allow(clippy::expect_used)] // both origins are well-formed
+    fn two() -> ServerOrigins {
+        ServerOrigins::new([
+            ServerOrigin::parse("https://media.example:8443").expect("origin"),
+            ServerOrigin::parse("https://api.example").expect("origin"),
+        ])
+        .expect("two origins")
+    }
+
+    #[test]
+    fn an_offline_bundle_reaches_only_its_own_origin() {
+        let none = ServerOrigins::none();
+        let policy = ContentSecurityPolicy::bundle(&none, BundleWorker::None);
+        assert_eq!(policy.header_value(), OFFLINE);
+        assert_eq!(policy.sources(Directive::WorkerSrc), None);
+    }
+
+    /// Each server origin adds its `https` and `wss` forms to `connect-src`
+    /// only, in sorted order.
+    #[test]
+    fn server_origins_widen_connect_src_only() {
+        let servers = two();
+        let value = ContentSecurityPolicy::bundle(&servers, BundleWorker::None).header_value();
+        assert_eq!(
+            value,
+            "default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; \
+             style-src 'self' 'unsafe-inline'; connect-src 'self' \
+             https://api.example wss://api.example \
+             https://media.example:8443 wss://media.example:8443"
+        );
+        assert_ne!(value, OFFLINE);
+    }
+
+    /// A program reaching push gets a same-origin `worker-src`; one that does
+    /// not gets none.
+    #[test]
+    fn push_adds_a_same_origin_worker_src() {
+        let none = ServerOrigins::none();
+        let push = ContentSecurityPolicy::bundle(&none, BundleWorker::Push);
+        assert_eq!(
+            push.sources(Directive::WorkerSrc),
+            Some([Source::SelfOrigin].as_slice())
+        );
+        assert_eq!(push.header_value(), format!("{OFFLINE}; worker-src 'self'"));
     }
 }

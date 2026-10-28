@@ -373,7 +373,8 @@ impl<'a> BundleAssembler<'a> {
     ///
     /// # Errors
     /// [`CliError::Usage`] wrapping a [`pack::mobile::MobileRefusal`] when
-    /// the shape is not a wasm-enabled `Web` app.
+    /// the shape is not a wasm-enabled `Web` app, or when the project accepts
+    /// push but names no `delivery.mobile.push`.
     pub fn gate_mobile(
         held: &'a HeldBuild,
         profile: BundleProfile,
@@ -384,6 +385,13 @@ impl<'a> BundleAssembler<'a> {
             held.shape(),
             &manifest.wasm,
         )?;
+        manifest
+            .mobile_push()
+            .map_err(|project::PushUnconfigured| {
+                CliError::Usage(crate::text::Message::relay(
+                    &pack::mobile::MobileRefusal::PushUnconfigured,
+                ))
+            })?;
         Ok(GatedMobile(Self::new(held, profile)))
     }
 

@@ -1701,6 +1701,7 @@ mod tests {
             target: ipe_ir::Target::Native,
             wasm_public_env: Vec::new(),
             mount_base: MountBase::root(),
+            server_origins: ipe_backend_rust::ServerOrigins::none(),
             wasm_hydrate_mode: false,
             runtime_dep: None,
             debugger: false,
@@ -1906,6 +1907,7 @@ mod tests {
             target: _,
             wasm_public_env: _,
             mount_base: _,
+            server_origins: _,
             wasm_hydrate_mode: _,
             runtime_dep: _,
             debugger: _,
@@ -1915,6 +1917,8 @@ mod tests {
             intent: _,
         } = key_settings();
         let mount_base = MountBase::parse("/app").expect("`/app` is a mount base");
+        let server = ipe_backend_rust::ServerOrigin::parse("https://api.example")
+            .expect("`https://api.example` is a server origin");
         let window = WebViewWindow {
             title: "W".to_owned(),
             width: 1,
@@ -1928,6 +1932,10 @@ mod tests {
                 s.wasm_public_env = vec!["API".to_owned()];
             }),
             flip("mount_base", |s| s.mount_base = mount_base),
+            flip("server_origins", |s| {
+                s.server_origins =
+                    ipe_backend_rust::ServerOrigins::new([server]).expect("one origin is a list");
+            }),
             flip("wasm_hydrate_mode", |s| s.wasm_hydrate_mode = true),
             flip("runtime_dep", |s| {
                 s.runtime_dep = Some(RuntimeDep {
@@ -2063,6 +2071,42 @@ mod tests {
         assert_ne!(key(&root), key(&app), "the mount base is part of the key");
         assert_ne!(key(&app), key(&nested), "each base keys its own entry");
         assert_eq!(key(&app), key(&app_again), "an equal base reuses the entry");
+    }
+
+    /// The server origins are part of the key: a bundle allowed to reach a
+    /// server and an offline one never share an entry, nor do two different
+    /// lists, while the same list twice yields the same key.
+    #[test]
+    fn cache_key_changes_with_server_origins() {
+        let (sources, injected) = sample_sources();
+        let key = |servers: &[&str]| {
+            let origins = servers
+                .iter()
+                .map(|text| ipe_backend_rust::ServerOrigin::parse(text).ok())
+                .collect::<Option<Vec<_>>>()?;
+            let servers = ipe_backend_rust::ServerOrigins::new(origins).ok()?;
+            Some(compute_project_key(
+                &sources,
+                &injected,
+                &entry(),
+                &ipe_backend_rust::EmitSettings {
+                    target: ipe_ir::Target::WasmClient,
+                    server_origins: servers,
+                    ..key_settings()
+                },
+            ))
+        };
+        let offline = key(&[]);
+        let api = key(&["https://api.example"]);
+        let media = key(&["https://media.example:8443"]);
+        assert!(offline.is_some() && api.is_some() && media.is_some());
+        assert_ne!(offline, api, "the server origins are part of the key");
+        assert_ne!(api, media, "each list keys its own entry");
+        assert_eq!(
+            api,
+            key(&["https://api.example"]),
+            "an equal list reuses the entry"
+        );
     }
 
     #[test]

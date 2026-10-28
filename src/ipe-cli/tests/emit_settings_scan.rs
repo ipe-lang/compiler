@@ -76,7 +76,11 @@ const SETTERS: &[&str] = &[
 
 /// The manifest member chains the driver reads only at admitted sites, as the
 /// field names from the manifest value down.
-const MEMBER_CHAINS: &[&[&str]] = &[&["delivery", "browser", "base"], &["public_env"]];
+const MEMBER_CHAINS: &[&[&str]] = &[
+    &["delivery", "browser", "base"],
+    &["delivery", "servers"],
+    &["public_env"],
+];
 
 /// The guarded paths that, like the member chains, are judged only in
 /// [`CHAIN_TREE`]: the manifest parser and renderer spell the mode elsewhere.
@@ -150,6 +154,12 @@ const ADMITTED: &[(&str, &str, &str, usize)] = &[
     ),
     (
         "field delivery.browser.base",
+        "src/ipe-cli/src/driver/build_pipeline.rs",
+        "manifest_emit_settings",
+        1,
+    ),
+    (
+        "field delivery.servers",
         "src/ipe-cli/src/driver/build_pipeline.rs",
         "manifest_emit_settings",
         1,
