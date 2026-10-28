@@ -9898,6 +9898,12 @@ fn is_retry_policy_ir(interner: &Interner, ty: &IrType) -> bool {
         })
 }
 
+// IPE-RUST-AUDIT:ACCEPTED (Arthur Maciel) — compile-time `const` assertion (not a runtime panic); fails the BUILD if the wasm gates' entry closure and this prune seed from different hydration names
+const _: () = assert!(ipe_canon::const_str_eq(
+    ipe_canon::reach::HYDRATION_PROJECTION_NAME,
+    ipe_ir::HYDRATION_PROJECTION_NAME
+));
+
 /// The functions the backend invokes without any IR call edge naming them.
 ///
 /// Two kinds, in function order: every wasm-hydration island projection
@@ -9907,7 +9913,9 @@ fn is_retry_policy_ir(interner: &Interner, ty: &IrType) -> bool {
 /// `Duration` — rooted iff some function uses `withTimeout`. Both reachability
 /// consumers — the emitted-binary prune and the package capability audit —
 /// seed from this one list, so a backend-synthesised call can never be kept by
-/// one and missed by the other.
+/// one and missed by the other. The wasm gates' canonical entry closure
+/// (`ipe_canon::reach::EntryClosure`) seeds from the same names, read from
+/// the same constants.
 fn backend_invoked_roots<'a, I>(funcs: &I, interner: &Interner) -> Vec<FuncId>
 where
     I: Iterator<Item = &'a Func> + Clone,
@@ -9919,12 +9927,13 @@ where
         .collect();
     // Matched on both the name and the `["Ipe", "Duration"]` home, so an
     // unrelated `toMillis` in another module is never mistaken for it.
+    let [home0, home1] = ipe_canon::reach::DURATION_TO_MILLIS_HOME;
     let duration_to_millis = funcs.clone().find(|f| {
-        interner.resolve(f.name) == Some("toMillis")
+        interner.resolve(f.name) == Some(ipe_canon::reach::DURATION_TO_MILLIS_NAME)
             && matches!(
                 f.home.0.as_slice(),
-                [seg0, seg1] if interner.resolve(*seg0) == Some("Ipe")
-                    && interner.resolve(*seg1) == Some("Duration")
+                [seg0, seg1] if interner.resolve(*seg0) == Some(home0)
+                    && interner.resolve(*seg1) == Some(home1)
             )
     });
     if let Some(to_millis) = duration_to_millis
@@ -16936,7 +16945,7 @@ impl<'a> Lowerer<'a> {
             refuse_select_to_edges(std::slice::from_ref(&func), &select_to_ids, def.name().span)
                 .map_err(|d| (d, def.home().to_vec()))?;
             callee_instances.insert(func.id, self.callee_instances.take());
-            if self.interner.resolve(func.name) == Some("main") {
+            if self.interner.resolve(func.name) == Some(ipe_canon::reach::ENTRY_NAME) {
                 entry = Some(func.id);
                 entry_span = Some(def.name().span);
             }
