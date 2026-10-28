@@ -26,6 +26,7 @@
 //! is no wildcard), so a future device module cannot ship without its OS-permission
 //! mapping considered.
 
+use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
 
 use ipe_ir::{Capability, WebCapability};
@@ -108,8 +109,9 @@ impl std::error::Error for UnknownPlatform {}
 /// holds one key twice. The purpose is the human-readable reason shown at the
 /// permission prompt; it is invariantly non-empty (Apple rejects an empty usage
 /// description at review), guaranteed by construction since every arm of
-/// [`Self::purpose`] is a literal.
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug, Hash)]
+/// [`Self::purpose`] is a literal. Keys order by their plist spelling, so a
+/// rendered plist lists them alphabetically whatever the declaration order.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
 pub enum PlistKey {
     /// `NSLocationWhenInUseUsageDescription` — location while the app is in use.
     LocationWhenInUse,
@@ -120,6 +122,9 @@ pub enum PlistKey {
 }
 
 impl PlistKey {
+    /// Every usage-description key the table can name, in declaration order.
+    pub const ALL: &'static [Self] = &[Self::LocationWhenInUse, Self::Camera, Self::Microphone];
+
     /// The `NS…UsageDescription` plist key.
     #[must_use]
     pub const fn key(self) -> &'static str {
@@ -143,13 +148,26 @@ impl PlistKey {
     }
 }
 
+impl Ord for PlistKey {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.key().cmp(other.key())
+    }
+}
+
+impl PartialOrd for PlistKey {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
 /// An Android permission a web axis can need, without the `android.permission.`
 /// prefix.
 ///
 /// A closed set, so a permission is matched and de-duplicated by identity rather
 /// than by text, and its runtime request code is a property of the permission
-/// itself.
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug, Hash)]
+/// itself. Permissions order by their constant name, so a rendered manifest
+/// lists them alphabetically whatever the declaration order.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
 pub enum AndroidPermission {
     /// `ACCESS_FINE_LOCATION`.
     AccessFineLocation,
@@ -193,21 +211,59 @@ impl AndroidPermission {
         }
     }
 
+    /// Whether the shell asks for this permission at the moment of use, rather
+    /// than the OS granting it at install.
+    #[must_use]
+    pub const fn is_runtime_requested(self) -> bool {
+        match self {
+            Self::AccessFineLocation
+            | Self::AccessCoarseLocation
+            | Self::PostNotifications
+            | Self::RecordAudio
+            | Self::Camera => true,
+            Self::Vibrate | Self::AccessNetworkState => false,
+        }
+    }
+
     /// The stable request code the shell uses to ask for this permission at the
     /// moment of use, or `None` for a permission the OS grants at install.
     ///
-    /// Only a runtime-requested permission has a code; the codes are distinct,
-    /// which the build-time agreement check below enforces.
+    /// The code is one plus the number of runtime-requested permissions before
+    /// this one in [`Self::ALL`], so permissions with distinct names never share
+    /// a code. A permission absent from [`Self::ALL`] has no code, and the
+    /// build-time agreement check below refuses a bridged row naming one.
     #[must_use]
     pub const fn runtime_request_code(self) -> Option<RequestCode> {
-        match self {
-            Self::AccessFineLocation => Some(RequestCode(1)),
-            Self::AccessCoarseLocation => Some(RequestCode(2)),
-            Self::PostNotifications => Some(RequestCode(3)),
-            Self::RecordAudio => Some(RequestCode(4)),
-            Self::Camera => Some(RequestCode(5)),
-            Self::Vibrate | Self::AccessNetworkState => None,
+        if !self.is_runtime_requested() {
+            return None;
         }
+        let mut rest = Self::ALL;
+        let mut code: u16 = 1;
+        while let Some((candidate, tail)) = rest.split_first() {
+            if const_str_eq(candidate.name(), self.name()) {
+                return Some(RequestCode(code));
+            }
+            if candidate.is_runtime_requested() {
+                match code.checked_add(1) {
+                    Some(next) => code = next,
+                    None => return None,
+                }
+            }
+            rest = tail;
+        }
+        None
+    }
+}
+
+impl Ord for AndroidPermission {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.name().cmp(other.name())
+    }
+}
+
+impl PartialOrd for AndroidPermission {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
     }
 }
 
@@ -283,6 +339,15 @@ impl IosBackgroundMode {
             Self::RemoteNotification => "remote-notification",
         }
     }
+
+    /// The member qualified by its array key, `UIBackgroundModes:<member>`.
+    ///
+    /// The identifier an override must name to declare this one member, never
+    /// the bare array key that would stand for every member.
+    #[must_use]
+    pub fn qualified_name(self) -> String {
+        format!("{UI_BACKGROUND_MODES_KEY}:{}", self.value())
+    }
 }
 
 /// The `Info.plist` array key holding every [`IosBackgroundMode`].
@@ -324,6 +389,7 @@ const NO_OS_PERMISSION: AxisRequirement = AxisRequirement {
 /// the make-invalid-states-unrepresentable guarantee: no web axis can silently
 /// ship un-permissioned. A `const fn`, so the build-time agreement check below
 /// reads the same rows the derivation does.
+#[deny(clippy::wildcard_enum_match_arm)]
 const fn requirement_for(axis: WebCapability) -> AxisRequirement {
     match axis {
         WebCapability::Geolocation => AxisRequirement {
@@ -384,11 +450,18 @@ const fn requirement_for(axis: WebCapability) -> AxisRequirement {
             ios_only: &[PlistKey::Camera],
             ..NO_OS_PERMISSION
         },
+        // The iOS file picker offers to take a photo or record a video in place,
+        // which opens the camera and the microphone, so iOS declares both keys.
+        // The macOS and Android pickers open no capture device.
+        WebCapability::File => AxisRequirement {
+            ios_only: &[PlistKey::Camera, PlistKey::Microphone],
+            ..NO_OS_PERMISSION
+        },
         // The axes that reach no permission-gated OS surface on any target:
         // clipboard (user-initiated paste), storage (in-sandbox persistence),
-        // share (user-initiated share sheet), battery (ungated status), file (a
-        // user-gesture picker), gamepad (an input device the browser mediates),
-        // visibility / media-query / connectivity (user-context reads), the
+        // share (user-initiated share sheet), battery (ungated status), gamepad
+        // (an input device the browser mediates), visibility / media-query /
+        // connectivity (user-context reads), the
         // `raw` floor (an uncharacterised port reaches no compiler-known surface;
         // its disclosure is enforced by the consent gate, not an OS
         // declaration), speech synthesis, the Permissions API (it queries
@@ -402,7 +475,6 @@ const fn requirement_for(axis: WebCapability) -> AxisRequirement {
         | WebCapability::Storage
         | WebCapability::Share
         | WebCapability::Battery
-        | WebCapability::File
         | WebCapability::Gamepad
         | WebCapability::Visibility
         | WebCapability::MediaQuery
@@ -450,72 +522,120 @@ const fn lists_permission(listed: &[AndroidPermission], permission: AndroidPermi
     false
 }
 
-/// Whether the Android permission vocabulary `listed` names each permission once
-/// and gives each runtime-requested permission a code no other one shares.
+/// Whether the Android permission vocabulary `listed` names each permission
+/// once. Distinct names give distinct request codes by construction of
+/// [`AndroidPermission::runtime_request_code`].
 const fn android_permissions_agree(listed: &[AndroidPermission]) -> bool {
     let mut rest = listed;
     while let Some((permission, tail)) = rest.split_first() {
         if lists_permission(tail, *permission) {
             return false;
         }
-        if let Some(code) = permission.runtime_request_code() {
-            let mut others = tail;
-            while let Some((other, more)) = others.split_first() {
-                if let Some(other_code) = other.runtime_request_code()
-                    && other_code.get() == code.get()
-                {
-                    return false;
-                }
-                others = more;
-            }
+        rest = tail;
+    }
+    true
+}
+
+/// Whether `key` appears in `listed`, compared by its plist spelling.
+const fn lists_plist_key(listed: &[PlistKey], key: PlistKey) -> bool {
+    let mut rest = listed;
+    while let Some((candidate, tail)) = rest.split_first() {
+        if const_str_eq(candidate.key(), key.key()) {
+            return true;
+        }
+        rest = tail;
+    }
+    false
+}
+
+/// Whether the usage-description vocabulary `listed` names each plist key once.
+const fn plist_keys_agree(listed: &[PlistKey]) -> bool {
+    let mut rest = listed;
+    while let Some((key, tail)) = rest.split_first() {
+        if lists_plist_key(tail, *key) {
+            return false;
         }
         rest = tail;
     }
     true
 }
 
-/// Whether the permission table agrees with the bridge vocabulary and the
-/// Android permission vocabulary over `axes`.
+/// Whether one table row agrees with its bridge status and with the
+/// vocabularies `keys` and `permissions`.
 ///
-/// For every axis: each Android permission it names is in
-/// [`AndroidPermission::ALL`] (so the request-code rows are complete); an axis
-/// the shell bridges natively ([`BridgeCap::for_axis`]) declares at least one
-/// Android permission and every one it declares is runtime-requested (the
-/// bridge asks at the moment of use); and an iOS entitlement or background mode
-/// appears only on a bridged axis, since only native shell code uses one.
+/// Each plist key the row names is in `keys` (so the distinct-key check covers
+/// it); each Android permission it names is in `permissions` (so the
+/// request-code rows are complete); a `bridged` row declares at least one
+/// Android permission and every one it declares is runtime-requested (the bridge
+/// asks at the moment of use); and an iOS entitlement or background mode
+/// appears only on a bridged row, since only native shell code uses one.
+const fn row_agrees(
+    row: &AxisRequirement,
+    bridged: bool,
+    keys: &[PlistKey],
+    permissions: &[AndroidPermission],
+) -> bool {
+    if bridged && row.android.is_empty() {
+        return false;
+    }
+    let native_only = !row.ios_entitlements.is_empty() || !row.ios_background_modes.is_empty();
+    if native_only && !bridged {
+        return false;
+    }
+    let mut apple = row.apple;
+    while let Some((key, more)) = apple.split_first() {
+        if !lists_plist_key(keys, *key) {
+            return false;
+        }
+        apple = more;
+    }
+    let mut ios_only = row.ios_only;
+    while let Some((key, more)) = ios_only.split_first() {
+        if !lists_plist_key(keys, *key) {
+            return false;
+        }
+        ios_only = more;
+    }
+    let mut android = row.android;
+    while let Some((permission, more)) = android.split_first() {
+        if !lists_permission(permissions, *permission) {
+            return false;
+        }
+        if bridged && !permission.is_runtime_requested() {
+            return false;
+        }
+        android = more;
+    }
+    true
+}
+
+/// Whether every row of the permission table over `axes` agrees with its bridge
+/// status ([`BridgeCap::for_axis`]), [`PlistKey::ALL`] and
+/// [`AndroidPermission::ALL`], per [`row_agrees`].
 const fn permission_table_agrees(axes: &[WebCapability]) -> bool {
     let mut rest = axes;
     while let Some((axis, tail)) = rest.split_first() {
-        let row = requirement_for(*axis);
         let bridged = BridgeCap::for_axis(*axis).is_some();
-        if bridged && row.android.is_empty() {
+        if !row_agrees(
+            &requirement_for(*axis),
+            bridged,
+            PlistKey::ALL,
+            AndroidPermission::ALL,
+        ) {
             return false;
-        }
-        let native_only = !row.ios_entitlements.is_empty() || !row.ios_background_modes.is_empty();
-        if native_only && !bridged {
-            return false;
-        }
-        let mut permissions = row.android;
-        while let Some((permission, more)) = permissions.split_first() {
-            if !lists_permission(AndroidPermission::ALL, *permission) {
-                return false;
-            }
-            if bridged && permission.runtime_request_code().is_none() {
-                return false;
-            }
-            permissions = more;
         }
         rest = tail;
     }
     true
 }
 
-// IPE-RUST-AUDIT:ACCEPTED (Arthur Maciel) — compile-time `const` assertion (not a runtime panic); fails the BUILD if a natively bridged web axis lacks its runtime-requested Android permission, an entitlement or background mode sits on an axis no native code serves, or an Android permission has no complete request-code row [ledger #boundary]
+// IPE-RUST-AUDIT:ACCEPTED (Arthur Maciel) — compile-time `const` assertion (not a runtime panic); fails the BUILD if a natively bridged web axis lacks its runtime-requested Android permission, an entitlement or background mode sits on an axis no native code serves, or an Android permission or plist key is missing from or repeated in its vocabulary [ledger #boundary]
 #[allow(clippy::assertions_on_constants)] // the constant IS the tripwire
 const _: () = assert!(
     permission_table_agrees(WebCapability::ALL)
-        && android_permissions_agree(AndroidPermission::ALL),
-    "the OS-permission table disagrees with BridgeCap or with the Android request-code rows",
+        && android_permissions_agree(AndroidPermission::ALL)
+        && plist_keys_agree(PlistKey::ALL),
+    "the OS-permission table disagrees with BridgeCap, the Android permission vocabulary or the plist key vocabulary",
 );
 
 /// The typed, per-platform OS-permission declarations derived for an app.
@@ -716,8 +836,9 @@ pub fn derive_permissions(
 }
 
 /// The set of OS permissions the app is entitled to on `platform`, as bare
-/// identifiers: Apple plist keys (the `UIBackgroundModes` array key included)
-/// and iOS entitlement keys, or Android permission `android:name`s.
+/// identifiers: Apple plist keys, iOS entitlement keys and each
+/// `UIBackgroundModes` member qualified by its array key, or Android permission
+/// `android:name`s.
 ///
 /// This is the completeness anchor for the fail-closed reconciliation: a merged
 /// manifest may declare only permissions in this set. Built from the same
@@ -736,8 +857,8 @@ fn entitled_permission_names(
         for entitlement in &derived.ios_entitlements {
             names.insert(entitlement.key().to_owned());
         }
-        if !derived.ios_background_modes.is_empty() {
-            names.insert(UI_BACKGROUND_MODES_KEY.to_owned());
+        for mode in &derived.ios_background_modes {
+            names.insert(mode.qualified_name());
         }
     } else {
         for entry in &derived.android {
@@ -834,7 +955,8 @@ pub fn per_axis_breakdown(
                 .chain(
                     row.ios_background_modes
                         .iter()
-                        .map(|m| format!("{UI_BACKGROUND_MODES_KEY}:{}", m.value())),
+                        .copied()
+                        .map(IosBackgroundMode::qualified_name),
                 )
                 .collect(),
             Platform::MacOs => row.apple.iter().map(|k| k.key().to_owned()).collect(),
@@ -900,15 +1022,62 @@ mod tests {
 
         let android = derive_permissions(&a, Platform::Android).expect("android");
         assert!(android.to_info_plist_entries().is_empty());
-        let xml = android.to_android_manifest_entries().to_xml();
-        assert!(
-            xml.contains("android.permission.ACCESS_FINE_LOCATION"),
-            "fine location: {xml}"
+        // The fragment lists permissions by constant name, whatever the order
+        // the table or the enum declares them in.
+        assert_eq!(
+            android.to_android_manifest_entries().lines(),
+            [
+                "<uses-permission android:name=\"android.permission.ACCESS_COARSE_LOCATION\" />",
+                "<uses-permission android:name=\"android.permission.ACCESS_FINE_LOCATION\" />",
+            ]
         );
-        assert!(
-            xml.contains("android.permission.ACCESS_COARSE_LOCATION"),
-            "coarse location: {xml}"
+    }
+
+    #[test]
+    fn plist_keys_render_in_key_order() {
+        // A plist lists its usage keys by key spelling, whatever the order the
+        // enum declares them in.
+        let a = accepts(&[
+            web(WebCapability::Recorder),
+            web(WebCapability::Geolocation),
+        ]);
+        let keys: Vec<String> = derive_permissions(&a, Platform::Ios)
+            .expect("ios")
+            .to_info_plist_entries()
+            .into_iter()
+            .map(|(key, _purpose)| key)
+            .collect();
+        assert_eq!(
+            keys,
+            [
+                "NSCameraUsageDescription",
+                "NSLocationWhenInUseUsageDescription",
+                "NSMicrophoneUsageDescription",
+            ]
         );
+    }
+
+    #[test]
+    fn an_ios_file_grant_declares_the_capture_usage_keys() {
+        // The iOS file picker can open the camera and the microphone in place,
+        // so a File grant declares both keys there and nothing elsewhere.
+        let a = accepts(&[web(WebCapability::File)]);
+        let keys: Vec<String> = derive_permissions(&a, Platform::Ios)
+            .expect("ios")
+            .to_info_plist_entries()
+            .into_iter()
+            .map(|(key, _purpose)| key)
+            .collect();
+        assert_eq!(
+            keys,
+            ["NSCameraUsageDescription", "NSMicrophoneUsageDescription"]
+        );
+        for platform in [Platform::MacOs, Platform::Android] {
+            assert!(
+                derive_permissions(&a, platform).expect("derive").is_empty(),
+                "a file grant declares nothing on {platform:?}"
+            );
+        }
     }
 
     #[test]
@@ -1292,9 +1461,11 @@ mod tests {
     }
 
     #[test]
-    fn push_backs_its_entitlement_and_background_modes_and_nothing_else_does() {
+    fn push_backs_its_entitlement_and_background_mode_and_nothing_else_does() {
         let push = accepts(&[web(WebCapability::Push)]);
-        for name in ["aps-environment", UI_BACKGROUND_MODES_KEY] {
+        let mode = IosBackgroundMode::RemoteNotification.qualified_name();
+        assert_eq!(mode, "UIBackgroundModes:remote-notification");
+        for name in ["aps-environment", mode.as_str()] {
             reconcile_override(&push, Platform::Ios, &one_override(name))
                 .expect("a push grant backs its iOS declarations");
             let err = reconcile_override(
@@ -1303,6 +1474,19 @@ mod tests {
                 &one_override(name),
             )
             .expect_err("a notification grant does not back a push declaration");
+            assert!(err.to_string().contains(name), "names {name}: {err}");
+        }
+    }
+
+    #[test]
+    fn a_bare_background_modes_override_is_refused_even_with_push() {
+        // The bare array key would stand for every background mode; a push grant
+        // entitles only its own member, so the bare key and any other member
+        // are refused.
+        let push = accepts(&[web(WebCapability::Push)]);
+        for name in [UI_BACKGROUND_MODES_KEY, "UIBackgroundModes:audio"] {
+            let err = reconcile_override(&push, Platform::Ios, &one_override(name))
+                .expect_err("a push grant backs only its own background mode");
             assert!(err.to_string().contains(name), "names {name}: {err}");
         }
     }
@@ -1342,13 +1526,101 @@ mod tests {
     #[test]
     fn the_android_permission_agreement_check_refuses_a_duplicate() {
         // The build-time check is live: the real vocabulary passes, and a list
-        // naming one permission twice (so its request code repeats) is refused.
+        // naming one permission twice is refused.
         assert!(android_permissions_agree(AndroidPermission::ALL));
         assert!(!android_permissions_agree(&[
             AndroidPermission::Camera,
             AndroidPermission::Camera,
         ]));
         assert!(permission_table_agrees(WebCapability::ALL));
+    }
+
+    #[test]
+    fn the_plist_key_agreement_check_refuses_a_duplicate() {
+        assert!(plist_keys_agree(PlistKey::ALL));
+        assert!(!plist_keys_agree(&[PlistKey::Camera, PlistKey::Camera]));
+    }
+
+    #[test]
+    fn runtime_request_codes_are_distinct_and_absent_for_install_time_permissions() {
+        let mut seen = BTreeSet::new();
+        for &permission in AndroidPermission::ALL {
+            match permission.runtime_request_code() {
+                Some(code) => {
+                    assert!(permission.is_runtime_requested(), "{permission:?}");
+                    assert!(seen.insert(code.get()), "{permission:?} repeats a code");
+                }
+                None => assert!(!permission.is_runtime_requested(), "{permission:?}"),
+            }
+        }
+        assert_eq!(
+            AndroidPermission::ALL
+                .iter()
+                .copied()
+                .filter_map(AndroidPermission::runtime_request_code)
+                .map(RequestCode::get)
+                .collect::<Vec<_>>(),
+            [1, 2, 3, 4, 5]
+        );
+    }
+
+    /// One synthetic table row, for driving each refusal of [`row_agrees`].
+    const fn row(
+        apple: &'static [PlistKey],
+        android: &'static [AndroidPermission],
+        ios_entitlements: &'static [IosEntitlement],
+        ios_background_modes: &'static [IosBackgroundMode],
+    ) -> AxisRequirement {
+        AxisRequirement {
+            apple,
+            android,
+            ios_entitlements,
+            ios_background_modes,
+            ..NO_OS_PERMISSION
+        }
+    }
+
+    #[test]
+    fn the_row_agreement_check_refuses_each_disagreement() {
+        let keys = PlistKey::ALL;
+        let all = AndroidPermission::ALL;
+        let camera: &[PlistKey] = &[PlistKey::Camera];
+        let post: &[AndroidPermission] = &[AndroidPermission::PostNotifications];
+        let vibrate: &[AndroidPermission] = &[AndroidPermission::Vibrate];
+        let aps: &[IosEntitlement] = &[IosEntitlement::ApsEnvironment];
+        let remote: &[IosBackgroundMode] = &[IosBackgroundMode::RemoteNotification];
+        // Controls: a bridged row with a runtime permission and native-only
+        // entries, and an unbridged row with a plist key and an install-time
+        // permission.
+        assert!(row_agrees(&row(&[], post, aps, remote), true, keys, all));
+        assert!(row_agrees(
+            &row(camera, vibrate, &[], &[]),
+            false,
+            keys,
+            all
+        ));
+        // A bridged row with no Android permission.
+        assert!(!row_agrees(&row(&[], &[], aps, remote), true, keys, all));
+        // An entitlement or a background mode on an unbridged row.
+        assert!(!row_agrees(&row(&[], post, aps, &[]), false, keys, all));
+        assert!(!row_agrees(&row(&[], post, &[], remote), false, keys, all));
+        // A bridged row naming an install-time permission.
+        assert!(!row_agrees(&row(&[], vibrate, &[], &[]), true, keys, all));
+        // A permission or a plist key missing from its vocabulary.
+        let only_camera: &[AndroidPermission] = &[AndroidPermission::Camera];
+        assert!(!row_agrees(
+            &row(&[], post, &[], &[]),
+            false,
+            keys,
+            only_camera
+        ));
+        let only_microphone: &[PlistKey] = &[PlistKey::Microphone];
+        assert!(!row_agrees(
+            &row(camera, &[], &[], &[]),
+            false,
+            only_microphone,
+            all
+        ));
     }
 
     #[test]

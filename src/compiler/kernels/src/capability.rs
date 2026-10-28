@@ -663,6 +663,7 @@ impl BridgeCap {
     /// Exhaustive over [`WebCapability`] with no wildcard arm, so a new web axis
     /// does not compile until its bridge decision is written here.
     #[must_use]
+    #[deny(clippy::wildcard_enum_match_arm)]
     pub const fn for_axis(axis: WebCapability) -> Option<Self> {
         match axis {
             WebCapability::Notification => Some(Self::Notification),
@@ -967,19 +968,36 @@ impl std::str::FromStr for Capability {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct UnknownCapability(pub String);
 
+/// Names every capability the parser accepts.
+///
+/// The list is read from [`Capability::ALL`] and [`WebCapability::ALL`], so a
+/// new capability or web axis appears in it without a second edit.
 impl std::fmt::Display for UnknownCapability {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "unknown capability {:?} (expected one of: network, filesystem, \
-             database, env, subprocess, clock, random, native-ffi, ffi-raw, unsafe, \
-             custom-element, js-port:<axis> where <axis> is one of geolocation, \
-             clipboard, notification, storage, vibration, share, battery, \
-             network-info, file, camera, microphone, gamepad, recorder, visibility, \
-             media-query, connectivity, raw, speech, permission, orientation, motion, \
-             channel, fullscreen, screen-orientation, wake-lock, web-authn, push)",
-            self.0
-        )
+        write!(f, "unknown capability {:?} (expected one of: ", self.0)?;
+        for cap in Capability::ALL {
+            match cap {
+                Capability::JsPort(_) => {}
+                Capability::Network
+                | Capability::Filesystem
+                | Capability::Database
+                | Capability::Env
+                | Capability::Subprocess
+                | Capability::Clock
+                | Capability::Random
+                | Capability::NativeFfi
+                | Capability::FfiRaw
+                | Capability::Unsafe
+                | Capability::CustomElement => write!(f, "{}, ", cap.as_str())?,
+            }
+        }
+        f.write_str("js-port:<axis> where <axis> is one of ")?;
+        let mut sep = "";
+        for axis in WebCapability::ALL {
+            write!(f, "{sep}{}", axis.as_str())?;
+            sep = ", ";
+        }
+        f.write_str(")")
     }
 }
 
@@ -1352,20 +1370,37 @@ mod tests {
     fn the_bridge_agreement_check_refuses_a_duplicate_or_missing_member() {
         // The build-time check is live: the real tables pass, a list naming one
         // member twice is refused, and a list missing a member the axis table
-        // reaches is refused.
+        // reaches is refused. The duplicate list has as many entries as there
+        // are bridged axes, so only the duplicate check can refuse it.
         assert!(bridge_caps_agree(BridgeCap::ALL, WebCapability::ALL));
         assert!(!bridge_caps_agree(
-            &[
-                BridgeCap::Notification,
-                BridgeCap::Notification,
-                BridgeCap::Push
-            ],
+            &[BridgeCap::Notification, BridgeCap::Notification],
             WebCapability::ALL
         ));
         assert!(!bridge_caps_agree(
             &[BridgeCap::Notification],
             WebCapability::ALL
         ));
+    }
+
+    #[test]
+    fn unknown_capability_names_every_capability_in_order() {
+        let shown = super::UnknownCapability("x".to_owned()).to_string();
+        assert_eq!(
+            shown,
+            "unknown capability \"x\" (expected one of: network, filesystem, \
+             database, env, subprocess, clock, random, native-ffi, ffi-raw, unsafe, \
+             custom-element, js-port:<axis> where <axis> is one of geolocation, \
+             clipboard, notification, storage, vibration, share, battery, \
+             network-info, file, camera, microphone, gamepad, recorder, visibility, \
+             media-query, connectivity, raw, speech, permission, orientation, motion, \
+             channel, fullscreen, screen-orientation, wake-lock, web-authn, push)"
+        );
+        for cap in Capability::ALL {
+            let name = cap.as_str();
+            let listed = name.strip_prefix("js-port:").unwrap_or(name);
+            assert!(shown.contains(listed), "{name} is not listed: {shown}");
+        }
     }
 
     #[test]
