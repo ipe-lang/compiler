@@ -538,43 +538,84 @@ mod tests {
         );
     }
 
-    /// Every vendored manifest the backend emits spells each pinned crate it
-    /// names exactly as the SSOT renders it, and the `indexmap` version the
-    /// runtime builds with.
+    /// Every vendored manifest the backend emits, and the jail-runner crate
+    /// template, spells each pinned crate it names exactly as the SSOT renders
+    /// it, and the `indexmap` version the runtime builds with.
     #[test]
     fn a_vendored_manifest_names_every_pin_exactly() {
+        let jail_path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(
+            "../../../../examples/wasm/language-playground/jail-runner/src/crate_template/Cargo.toml",
+        );
+        let jail_txt = std::fs::read_to_string(&jail_path)
+            .expect("crate_specs drift guard: cannot read the jail-runner crate template");
         let manifests = [
             ("templates/Cargo.toml", crate::project::CARGO_TOML),
             (
                 "project.rs WASM_CARGO_TOML",
                 crate::project::WASM_CARGO_TOML,
             ),
+            ("jail-runner crate template", jail_txt.as_str()),
         ];
-        let mut problems = Vec::new();
-        for (origin, text) in manifests {
-            for pinned in ALL_PINNED {
-                if dep_line(text, pinned.spec.name).is_some() {
-                    problems.extend(pin_drift(pinned, text, origin));
-                }
-            }
-            if dep_line(text, super::SERDE_JSON.spec.name).is_none() {
-                problems.push(format!("serde_json: absent from {origin}"));
-            }
-            let indexmap = dep_line(text, INDEXMAP.name)
-                .and_then(|line| line.split_once('='))
-                .and_then(|(_, value)| version_of(value));
-            if indexmap.as_deref() != Some(INDEXMAP.version) {
-                problems.push(format!(
-                    "indexmap: SSOT = {}, {origin} = {indexmap:?}",
-                    INDEXMAP.version
-                ));
-            }
-        }
+        let problems: Vec<String> = manifests
+            .into_iter()
+            .flat_map(|(origin, text)| vendored_manifest_drift(text, origin))
+            .collect();
         assert!(
             problems.is_empty(),
             "vendored manifest drift from the SSOT:\n  {}",
             problems.join("\n  ")
         );
+    }
+
+    /// A jail template that drops `indexmap`, or loses `preserve_order` on its
+    /// `serde_json` line, is refused by the vendored-manifest check.
+    #[test]
+    fn a_jail_template_without_indexmap_is_refused() {
+        let pinned_json = super::SERDE_JSON.dependency_line(&[]);
+        let no_indexmap = format!("[dependencies]\n{pinned_json}\n");
+        assert!(
+            vendored_manifest_drift(&no_indexmap, "fixture")
+                .iter()
+                .any(|problem| problem.starts_with("indexmap:")),
+            "a template without indexmap must drift"
+        );
+        let unordered = "[dependencies]\nserde_json = \"1\"\nindexmap = \"2\"\n";
+        assert!(
+            vendored_manifest_drift(unordered, "fixture")
+                .iter()
+                .any(|problem| problem.contains("preserve_order")),
+            "a template without preserve_order must drift"
+        );
+        let pinned = format!("[dependencies]\n{pinned_json}\nindexmap = \"2\"\n");
+        assert_eq!(
+            vendored_manifest_drift(&pinned, "fixture"),
+            Vec::<String>::new()
+        );
+    }
+
+    /// Every way one vendored manifest departs from the SSOT: a pinned crate it
+    /// names off its pinned line, a missing `serde_json`, or an `indexmap`
+    /// version other than the runtime's.
+    fn vendored_manifest_drift(text: &str, origin: &str) -> Vec<String> {
+        let mut problems = Vec::new();
+        for pinned in ALL_PINNED {
+            if dep_line(text, pinned.spec.name).is_some() {
+                problems.extend(pin_drift(pinned, text, origin));
+            }
+        }
+        if dep_line(text, super::SERDE_JSON.spec.name).is_none() {
+            problems.push(format!("serde_json: absent from {origin}"));
+        }
+        let indexmap = dep_line(text, INDEXMAP.name)
+            .and_then(|line| line.split_once('='))
+            .and_then(|(_, value)| version_of(value));
+        if indexmap.as_deref() != Some(INDEXMAP.version) {
+            problems.push(format!(
+                "indexmap: SSOT = {}, {origin} = {indexmap:?}",
+                INDEXMAP.version
+            ));
+        }
+        problems
     }
 
     /// A vendored manifest whose `serde_json` line drops `preserve_order` is

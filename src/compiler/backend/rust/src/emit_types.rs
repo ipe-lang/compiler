@@ -473,9 +473,8 @@ pub fn render_type_at(
         // Ipê: Ipê aliases Bytes = String; Rust's String is UTF-8 constrained,
         // so Bytes maps to Vec<u8> for lossless arbitrary binary.
         IrType::Bytes => "Vec<u8>".to_owned(),
-        // `Json` is the opaque JSON value type, `serde_json::Value`, exposed
-        // from the runtime as `JsonVal` (re-exported via `pub use ipe_runtime::*`
-        // in the emitted crate).
+        // `Json` is the runtime's opaque JSON value type, `JsonVal`
+        // (re-exported via `pub use ipe_runtime::*` in the emitted crate).
         IrType::Json => "JsonVal".to_owned(),
         // `Decoder<T>` is the JSON decoder type, aliased in the emitted project's
         // preamble as `pub type Decoder<T> = ipe_runtime::json::Decoder<IpeError, T>`.
