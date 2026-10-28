@@ -38,9 +38,10 @@ pub const DURATION_TO_MILLIS_HOME: [&str; 2] = ["Ipe", "Duration"];
 /// kernel's emitted code calls.
 pub const DURATION_TO_MILLIS_NAME: &str = "toMillis";
 
-/// The defs of a linked [`Module`] reachable from its entry, indexed by their
-/// position in `Module::defs`, with the breadth-first parent of each so a
-/// diagnostic can name the shortest chain that reaches it.
+/// The defs of a linked [`Module`] reachable from its entry.
+///
+/// Indexed by position in `Module::defs`, with the breadth-first parent of each
+/// so a diagnostic can name the shortest chain that reaches it.
 #[derive(Debug, Clone)]
 pub struct EntryClosure {
     order: Vec<usize>,
@@ -410,14 +411,22 @@ mod tests {
         let mut interner = Interner::new();
         let main_mod = vec![sym(&mut interner, "Main")];
         let main_fn = sym(&mut interner, ENTRY_NAME);
-        let ping = sym(&mut interner, "ping");
-        let pong = sym(&mut interner, "pong");
+        let first_fn = sym(&mut interner, "first_fn");
+        let second_fn = sym(&mut interner, "second_fn");
         let linked = module(
             main_mod.clone(),
             vec![
-                def(main_mod.clone(), ping, call(main_mod.clone(), pong)),
-                def(main_mod.clone(), pong, call(main_mod.clone(), ping)),
-                def(main_mod.clone(), main_fn, call(main_mod, ping)),
+                def(
+                    main_mod.clone(),
+                    first_fn,
+                    call(main_mod.clone(), second_fn),
+                ),
+                def(
+                    main_mod.clone(),
+                    second_fn,
+                    call(main_mod.clone(), first_fn),
+                ),
+                def(main_mod.clone(), main_fn, call(main_mod, first_fn)),
             ],
         );
         let closure = EntryClosure::of(&linked, &interner);

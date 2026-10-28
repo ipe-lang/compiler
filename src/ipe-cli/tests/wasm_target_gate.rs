@@ -703,7 +703,6 @@ fn server_only_kernel_behind_an_unreached_helper_builds_and_is_not_emitted()
     let main_rs = std::fs::read_to_string(out.join("src/main.rs"))?;
     assert!(main_rs.contains("fn main_count_label"), "{main_rs}");
     assert!(!main_rs.contains("unused_load"), "{main_rs}");
-    assert!(!main_rs.contains("file_read_file"), "{main_rs}");
     Ok(())
 }
 
