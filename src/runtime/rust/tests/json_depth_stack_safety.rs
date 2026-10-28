@@ -925,6 +925,12 @@ const ALLOWED_SITES: &[(&str, &str, Stack, &str)] = &[
         "reads one claims object's entries",
     ),
     (
+        "native_bridge.rs",
+        "wire::parse_reply",
+        Stack::OneLevel,
+        "reads one reply's fields after serde's own nesting limit",
+    ),
+    (
         "web/additive.rs",
         "merge_additive",
         Stack::OneLevel,
