@@ -983,6 +983,9 @@ isStoredApproved decision =
         StoredApproved ->
             True
 
+        StoredAcknowledged ->
+            False
+
         StoredRefused _ ->
             False
 

@@ -42,6 +42,7 @@ import RepoPathTests
 import SafeTextTests
 import SettingsTests
 import SingleFlightTests
+import TestSupport
 import TextSinkScanTests
 import TypedRowsTests
 import ViewRenderTests
@@ -114,7 +115,27 @@ finish results =
 
 -- Every check opens the stores it reads under a directory of its own
 -- (`TestSupport.freshDir`), so the run shares no database between checks.
+-- The ledger of those directories is opened before any check runs, and the
+-- sweep removes them once the suite ends: as a named check on the pass
+-- path, and before the error propagates when `gatherChecks` itself fails.
 main : Task.Task Error ()
 main =
-    gatherChecks
+    TestSupport.openTempDirLedger
+        |> Task.andThen (\_ -> gatherChecks)
+        |> Task.andThen sweepTempDirs
+        |> Task.onError
+            (\err ->
+                TestSupport.reclaimLeakedDirs
+                    |> Task.map (\_ -> ())
+                    |> Task.onError (\_ -> Task.succeed ())
+                    |> Task.andThen (\_ -> Task.fail err)
+            )
         |> Task.andThen finish
+
+
+-- The gathered results with the leak sweep's own check last, so a directory
+-- left behind is a named failure in the same report.
+sweepTempDirs : List ( String, Bool ) -> Task.Task Error (List ( String, Bool ))
+sweepTempDirs results =
+    TestSupport.check "every directory freshDir made is removed when the suite ends" TestSupport.noLeakedTempDirs
+        |> Task.map (\swept -> results ++ [ swept ])
