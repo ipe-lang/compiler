@@ -239,19 +239,10 @@ fn origin_mismatch(check: EnvFlag, framed: bool, parts: &Parts) -> bool {
     if matches!(check, EnvFlag::Off) || framed {
         return false;
     }
-    let mut origins = parts.headers.get_all(axum::http::header::ORIGIN).iter();
-    let Some(origin) = origins.next() else {
-        return false;
-    };
-    if origins.next().is_some() {
-        return true;
-    }
-    let Ok(origin) = origin.to_str() else {
-        return true;
-    };
-    // The comparison normalises each side's scheme-implied default port, shared
-    // with `console.rs::is_cross_origin_ingest` and `server.rs::ws_cross_origin`.
-    crate::http_header::origin_host_mismatch(origin, RequestAuthority::of(parts))
+    // The one `Origin` reading, shared with `console.rs::is_cross_origin_ingest`
+    // and `server.rs::ws_cross_origin`.
+    crate::http_header::OriginHeader::of(&parts.headers)
+        .is_cross_origin(RequestAuthority::of(parts))
 }
 
 /// The axum middleware. Validates CSRF on mutating, non-exempt requests; passes

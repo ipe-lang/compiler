@@ -556,20 +556,15 @@ fn fold_log(it: &serde_json::Value) {
 ///
 /// Absent `Origin` (same-origin fetch/XHR, curl, server-to-server pushes from
 /// `push_exporter.rs`) is not flagged: requiring it would break legitimate
-/// non-browser ingest pushes. An `Origin` on a request naming no single
-/// well-formed authority is flagged. The comparison is the shared
-/// `origin_host_mismatch`, also behind `csrf.rs::origin_mismatch` and
-/// `server.rs::ws_cross_origin`, applied unconditionally here since it is the
-/// only defense when `IPE_INGEST_TOKEN` is unset.
+/// non-browser ingest pushes. A second `Origin`, one that is not visible ASCII,
+/// or one on a request naming no single well-formed authority is flagged. The
+/// reading is the shared `http_header::OriginHeader`, also behind
+/// `csrf.rs::origin_mismatch` and `server.rs::ws_cross_origin`, applied
+/// unconditionally here since it is the only defense when `IPE_INGEST_TOKEN`
+/// is unset.
 fn is_cross_origin_ingest(head: &axum::http::request::Parts) -> bool {
-    let Some(origin) = head
-        .headers
-        .get(axum::http::header::ORIGIN)
-        .and_then(|h| h.to_str().ok())
-    else {
-        return false;
-    };
-    crate::http_header::origin_host_mismatch(origin, crate::http_header::RequestAuthority::of(head))
+    crate::http_header::OriginHeader::of(&head.headers)
+        .is_cross_origin(crate::http_header::RequestAuthority::of(head))
 }
 
 /// The ingest gate over the process environment: the configured
@@ -1322,6 +1317,47 @@ mod tests {
         assert_eq!(
             status_of(ingest_decision(&head_of(no_host), None, Some(&dev))),
             Some(StatusCode::FORBIDDEN)
+        );
+    }
+
+    /// A second `Origin`, or one that is not visible ASCII, has no one reading:
+    /// the ingest gate takes it as cross-origin, even when every copy names
+    /// the request's own host.
+    #[test]
+    fn ingest_refuses_a_repeated_or_undecodable_origin() {
+        let mk = |origins: &[&[u8]]| {
+            let mut h = axum::http::HeaderMap::new();
+            for origin in origins {
+                if let Ok(value) = axum::http::HeaderValue::from_bytes(origin) {
+                    h.append(axum::http::header::ORIGIN, value);
+                }
+            }
+            h.insert(
+                axum::http::header::HOST,
+                axum::http::HeaderValue::from_static("victim.example"),
+            );
+            head_of(h)
+        };
+        assert!(!is_cross_origin_ingest(&mk(&[b"https://victim.example"])));
+        assert!(is_cross_origin_ingest(&mk(&[
+            b"https://victim.example",
+            b"https://victim.example"
+        ])));
+        assert!(is_cross_origin_ingest(&mk(&[
+            b"https://victim.example\xff"
+        ])));
+        let dev = test_dev_surface();
+        assert_eq!(
+            status_of(ingest_decision(
+                &mk(&[b"https://victim.example", b"https://victim.example"]),
+                None,
+                Some(&dev)
+            )),
+            Some(StatusCode::FORBIDDEN)
+        );
+        assert!(
+            ingest_decision(&mk(&[b"https://victim.example"]), None, Some(&dev)).is_none(),
+            "the one same-origin copy is admitted"
         );
     }
 

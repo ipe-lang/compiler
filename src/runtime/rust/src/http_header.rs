@@ -331,19 +331,86 @@ impl HeldAuthority {
     }
 }
 
+/// A request's `Origin` header, read once.
+///
+/// The one reader behind every `Origin` site (`csrf.rs::origin_mismatch`,
+/// `console.rs::is_cross_origin_ingest`, `server.rs::ws_cross_origin`, the
+/// WebSocket allowlist and `Middleware.withCors`), so a repeated or
+/// undecodable `Origin` reads the same everywhere.
+#[cfg(feature = "server")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum OriginHeader<'a> {
+    /// The request carries no `Origin`.
+    Absent,
+    /// The request's one `Origin`, visible ASCII, space or tab.
+    One(&'a str),
+    /// Two `Origin` headers, or one that is not visible ASCII: no one reading.
+    Refused,
+}
+
+#[cfg(feature = "server")]
+impl<'a> OriginHeader<'a> {
+    /// The `Origin` of a request head's raw header map.
+    pub(crate) fn of(headers: &'a axum::http::HeaderMap) -> Self {
+        Self::read(
+            headers
+                .get_all(axum::http::header::ORIGIN)
+                .iter()
+                .map(axum::http::HeaderValue::as_bytes),
+        )
+    }
+
+    /// The `Origin` of a program-visible header dict, its name matched in any
+    /// case: two spellings of the name are two copies.
+    pub(crate) fn of_dict(headers: &'a crate::dict::IpeDict<String>) -> Self {
+        Self::read(
+            headers
+                .iter()
+                .filter(|(name, _)| name.eq_ignore_ascii_case("origin"))
+                .map(|(_, value)| value.as_bytes()),
+        )
+    }
+
+    fn read(mut copies: impl Iterator<Item = &'a [u8]>) -> Self {
+        let Some(first) = copies.next() else {
+            return Self::Absent;
+        };
+        if copies.next().is_some() {
+            return Self::Refused;
+        }
+        header_text(first).map_or(Self::Refused, Self::One)
+    }
+
+    /// The one `Origin`, when the request carries exactly one readable copy.
+    pub(crate) const fn single(self) -> Option<&'a str> {
+        match self {
+            Self::One(origin) => Some(origin),
+            Self::Absent | Self::Refused => None,
+        }
+    }
+
+    /// Whether this `Origin` makes a request addressed to `authority`
+    /// cross-origin: an absent one never does, a refused one always does.
+    pub(crate) fn is_cross_origin(self, authority: Option<RequestAuthority<'_>>) -> bool {
+        match self {
+            Self::Absent => false,
+            Self::Refused => true,
+            Self::One(origin) => origin_host_mismatch(origin, authority),
+        }
+    }
+}
+
 /// Whether an `Origin` disagrees with the request's authority.
 ///
 /// Each side's scheme-implied default port is normalized away first. A request
 /// naming no single authority (`None`) is a mismatch: with nothing to compare
-/// the `Origin` against, the check fails closed. Shared by every "compare
-/// Origin against the request authority" site (`csrf.rs::origin_mismatch`,
-/// `console.rs::is_cross_origin_ingest`, `server.rs::ws_cross_origin`) so they
-/// never drift. Browsers omit the default port from both `Origin` and `Host`,
-/// but a proxy or non-browser client may send an explicit `:443`/`:80`
-/// (`Origin: https://example.com` against `Host: example.com:443`), which is
-/// the same origin.
+/// the `Origin` against, the check fails closed. Reached only through
+/// [`OriginHeader::is_cross_origin`]. Browsers omit the default port from both
+/// `Origin` and `Host`, but a proxy or non-browser client may send an explicit
+/// `:443`/`:80` (`Origin: https://example.com` against `Host: example.com:443`),
+/// which is the same origin.
 #[cfg(feature = "server")]
-pub(crate) fn origin_host_mismatch(origin: &str, authority: Option<RequestAuthority<'_>>) -> bool {
+fn origin_host_mismatch(origin: &str, authority: Option<RequestAuthority<'_>>) -> bool {
     let Some(authority) = authority else {
         return true;
     };
@@ -771,6 +838,54 @@ mod tests {
     fn canonical_header_invalid_token_is_accepted_divergence() {
         assert_eq!(canonical_header("foo bar"), "Foo bar");
         assert_eq!(canonical_header("über-key"), "über-Key");
+    }
+
+    /// The one `Origin` reading: absent, one visible-ASCII copy, or refused
+    /// when repeated (in the raw map or as two spellings in a dict) or not
+    /// visible ASCII.
+    #[test]
+    fn origin_header_reads_one_copy_or_refuses() {
+        use super::OriginHeader;
+        use axum::http::{HeaderMap, HeaderValue, header::ORIGIN};
+        let map = |copies: &[&[u8]]| {
+            let mut h = HeaderMap::new();
+            for copy in copies {
+                if let Ok(value) = HeaderValue::from_bytes(copy) {
+                    h.append(ORIGIN, value);
+                }
+            }
+            h
+        };
+        let one = map(&[b"https://a.example"]);
+        assert_eq!(
+            OriginHeader::of(&one),
+            OriginHeader::One("https://a.example")
+        );
+        assert_eq!(OriginHeader::of(&map(&[])), OriginHeader::Absent);
+        let two = map(&[b"https://a.example", b"https://a.example"]);
+        assert_eq!(OriginHeader::of(&two), OriginHeader::Refused);
+        let obs = map(&[b"https://a.example\xe9"]);
+        assert_eq!(OriginHeader::of(&obs), OriginHeader::Refused);
+        let dict = |pairs: &[(&str, &str)]| -> crate::dict::IpeDict<String> {
+            pairs
+                .iter()
+                .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+                .collect()
+        };
+        let one = dict(&[("ORIGIN", "https://a.example")]);
+        assert_eq!(
+            OriginHeader::of_dict(&one),
+            OriginHeader::One("https://a.example")
+        );
+        let two = dict(&[
+            ("Origin", "https://a.example"),
+            ("origin", "https://a.example"),
+        ]);
+        assert_eq!(OriginHeader::of_dict(&two), OriginHeader::Refused);
+        let ctl = dict(&[("Origin", "https://a.example\u{7f}")]);
+        assert_eq!(OriginHeader::of_dict(&ctl), OriginHeader::Refused);
+        assert!(OriginHeader::Refused.is_cross_origin(None));
+        assert!(!OriginHeader::Absent.is_cross_origin(None));
     }
 
     /// Whether `origin` mismatches the authority of a request whose one

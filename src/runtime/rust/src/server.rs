@@ -4300,19 +4300,15 @@ fn ws_origin_matches(pattern: &str, origin: &str) -> bool {
 /// authority the request was addressed to (cross-origin).
 ///
 /// Absent `Origin` (non-browser WS clients, proxies that strip it) is not
-/// flagged; an `Origin` on a request naming no single well-formed authority
-/// (`None`) is. The comparison is the shared `http_header::origin_host_mismatch`,
-/// also behind `csrf.rs::origin_mismatch` and
-/// `console.rs::is_cross_origin_ingest`, so the three never drift.
+/// flagged; a second `Origin`, one that is not visible ASCII, or one on a
+/// request naming no single well-formed authority (`None`) is. The reading is
+/// the shared `http_header::OriginHeader`, also behind `csrf.rs::origin_mismatch`
+/// and `console.rs::is_cross_origin_ingest`, so the three never drift.
 fn ws_cross_origin(
     req: &ServerRequest,
     authority: Option<crate::http_header::RequestAuthority<'_>>,
 ) -> bool {
-    let origin = match header_ci(&req.headers, "origin") {
-        Some(o) if !o.is_empty() => o,
-        _ => return false,
-    };
-    crate::http_header::origin_host_mismatch(origin, authority)
+    crate::http_header::OriginHeader::of_dict(&req.headers).is_cross_origin(authority)
 }
 
 /// [`ws_cross_origin`] against the in-flight request's authority.
@@ -4362,17 +4358,19 @@ pub fn server_web_socket_upgrade<E: From<String> + Send + 'static>(
             return ok_res(ws_resp(status, body));
         }
         if !cfg.originPatterns.is_empty() {
-            let origin = req
-                .headers
-                .iter()
-                .find(|(k, _)| k.eq_ignore_ascii_case("origin"))
-                .map(|(_, v)| v.as_str())
-                .unwrap_or("");
-            if !cfg
-                .originPatterns
-                .iter()
-                .any(|p| ws_origin_matches(p, origin))
-            {
+            // An absent `Origin` is matched as the empty text; a repeated or
+            // undecodable one matches no pattern.
+            let allowed = match crate::http_header::OriginHeader::of_dict(&req.headers) {
+                crate::http_header::OriginHeader::Absent => Some(""),
+                crate::http_header::OriginHeader::One(origin) => Some(origin),
+                crate::http_header::OriginHeader::Refused => None,
+            }
+            .is_some_and(|origin| {
+                cfg.originPatterns
+                    .iter()
+                    .any(|p| ws_origin_matches(p, origin))
+            });
+            if !allowed {
                 return ok_res(ws_resp(403, "websocket: origin not allowed"));
             }
         } else if ws_request_cross_origin(&req) {
@@ -4977,7 +4975,7 @@ where
     let h = h.into_server_handler();
     let policy = CorsPolicy::parse(origins);
     Arc::new(move |req: ServerRequest| {
-        let tag = policy.tag(header_ci(&req.headers, "origin"));
+        let tag = policy.tag(crate::http_header::OriginHeader::of_dict(&req.headers).single());
         if req.method.eq_ignore_ascii_case("OPTIONS") {
             let mut resp = plain_resp(
                 204,
@@ -8140,6 +8138,53 @@ mod tests {
         assert!(!ws_request_cross_origin(&mk_ws_req(&[])));
     }
 
+    /// A request whose program-visible headers spell `Origin` twice, or carry
+    /// one that is not visible ASCII, is cross-origin: no copy is picked.
+    #[test]
+    fn ws_refuses_a_repeated_or_undecodable_origin() {
+        let host = Some("victim.example");
+        assert!(!ws_cross(&[("Origin", "https://victim.example")], host));
+        assert!(ws_cross(
+            &[
+                ("Origin", "https://victim.example"),
+                ("origin", "https://victim.example")
+            ],
+            host
+        ));
+        assert!(ws_cross(&[("Origin", "https://victim.example\u{1}")], host));
+    }
+
+    /// Under an origin allowlist a repeated or undecodable `Origin` matches no
+    /// pattern, not even a trailing allow-all; the one readable copy passes
+    /// the allowlist (400 = no real upgrader in this unit test).
+    #[tokio::test]
+    async fn ws_allowlist_refuses_a_repeated_or_undecodable_origin() {
+        let status = |pattern: &str, headers: &[(&str, &str)]| {
+            let mut cfg = ws_server_default_cfg::<String>();
+            cfg.originPatterns = vec![pattern.to_owned()];
+            let req = mk_ws_req(headers);
+            async move {
+                match server_web_socket_upgrade::<String>(req, cfg).await {
+                    IpeResult::Ok(r) => r.status,
+                    IpeResult::Err(_) => 0,
+                }
+            }
+        };
+        crate::system::locked_remove_var("IPE_WS_MAX_CONNECTIONS");
+        let exact = "https://victim.example";
+        assert_eq!(status(exact, &[("Origin", exact)]).await, 400);
+        assert_eq!(
+            status(exact, &[("Origin", exact), ("origin", exact)]).await,
+            403
+        );
+        let open_tail = "https://victim.example*";
+        assert_eq!(status(open_tail, &[("Origin", exact)]).await, 400);
+        assert_eq!(
+            status(open_tail, &[("Origin", "https://victim.example\u{1}")]).await,
+            403
+        );
+    }
+
     /// The authority a request carries reaches the upgrade's origin check: an
     /// absolute-form request with no `Host` is judged against its target, and
     /// one naming no authority at all is refused.
@@ -9463,6 +9508,38 @@ mod tests {
             panic!("the CORS middleware must pass the handler's response through");
         };
         to_axum_response_with(r, RequestStreams::new(), framed_security())
+    }
+
+    /// A request spelling `Origin` twice gets no grant, even when both copies
+    /// name an allowed origin; the one copy is granted.
+    #[tokio::test]
+    async fn cors_grants_no_repeated_origin() {
+        let h = middleware_with_cors::<String, _>(
+            vec!["https://a.example".to_owned()],
+            move |_req: ServerRequest| {
+                Box::pin(ready(ok_res::<String, _>(server_text("ok".into()))))
+                    as IpeTask<String, ServerResponse>
+            },
+        );
+        let granted = |names: &[&str]| {
+            let headers: HashMap<String, String> = names
+                .iter()
+                .map(|name| ((*name).to_owned(), "https://a.example".to_owned()))
+                .collect();
+            let h = h.clone();
+            async move {
+                let IpeResult::Ok(r) = h(mk_req("GET", HashMap::new(), headers)).await else {
+                    return None;
+                };
+                let resp = to_axum_response_with(r, RequestStreams::new(), framed_security());
+                single_header(&resp, "access-control-allow-origin").map(str::to_owned)
+            }
+        };
+        assert_eq!(
+            granted(&["Origin"]).await.as_deref(),
+            Some("https://a.example")
+        );
+        assert_eq!(granted(&["Origin", "origin"]).await, None);
     }
 
     /// A handler's `Access-Control-Allow-Origin` in any case is replaced by
