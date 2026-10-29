@@ -308,8 +308,8 @@ parseRoot raw =
             path <- absolutize raw
                         |> Task.mapError (\e -> rootRefusal (Just raw) Nothing (failureProblem NotAPath e))
             checked <- File.isDir path
-                           |> Task.map Ok
-                           |> Task.onError (\e -> Task.succeed (Err e))
+                        |> Task.map Ok
+                        |> Task.onError (\e -> Task.succeed (Err e))
             case rootCheckRefusal raw path checked of
                 Nothing ->
                     Task.succeed (Root IndexRootVar path)
