@@ -955,8 +955,9 @@ fn push_stdlib_sizes_are_the_runtime_constants() {
 /// One test case per bridge refusal, naming the error the runtime defines for it.
 fn push_refusal_cases() -> String {
     use ipe_runtime_rust::js_port_glue::native_bridge::{BridgeErrorKind, Reject};
-    let mut cases = String::new();
-    for reject in Reject::ALL {
+    Reject::ALL
+        .iter()
+        .map(|reject| {
         let code = reject.as_str();
         let message = reject.message();
         let expected = match reject.error_kind() {
@@ -965,12 +966,12 @@ fn push_refusal_cases() -> String {
             BridgeErrorKind::InvalidInput => format!("(Error.invalidInput \"{message}\")"),
             BridgeErrorKind::LimitExceeded => format!("(Error.limitExceeded \"{message}\")"),
         };
-        cases.push_str(&format!(
+        format!(
             "        , Test.test \"the {code} refusal\" (\\_ -> Test.equal (Error.toString {expected}) \
              (replyOutcome Internals.unsubscribeReply \"{{\\\"ok\\\":false,\\\"error\\\":\\\"{code}\\\"}}\"))\n"
-        ));
-    }
-    cases
+        )
+        })
+        .collect()
 }
 
 /// `Ipe.Browser.Push` parses keys and subscription texts in one spelling.

@@ -41,7 +41,7 @@ pub const PUSH_SUBSCRIPTION_VERSION: u32 = 1;
 /// The characters `Ipe.Json.Encode` writes as a `\uXXXX` escape where
 /// `JSON.stringify` leaves them bare. The glue escapes them in a subscription
 /// text, so the text it hands the app is the one spelling the Ipê parser accepts.
-pub const PUSH_ENCODE_ESCAPED: [char; 5] = ['<', '>', '&', '\u{2028}', '\u{2029}'];
+pub const PUSH_ENCODE_ESCAPED: [char; 5] = ['&', '<', '>', '\u{2028}', '\u{2029}'];
 
 // --- port glue JS assembly ---
 //
@@ -2358,7 +2358,7 @@ mod tests {
     fn push_web_text_escapes_what_the_ipe_encoder_escapes() {
         let js = port_glue_js();
         assert_eq!(
-            js.matches(r"  var PUSH_ENCODE_ESCAPED = /[\u{3c}\u{3e}\u{26}\u{2028}\u{2029}]/gu;")
+            js.matches(r"  var PUSH_ENCODE_ESCAPED = /[\u{26}\u{3c}\u{3e}\u{2028}\u{2029}]/gu;")
                 .count(),
             1
         );
