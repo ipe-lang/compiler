@@ -7012,7 +7012,9 @@ mod wasm_shell_tests {
         let value = shell_policy(&servers, BundleWorker::None)?;
         assert_eq!(
             value,
-            ContentSecurityPolicy::bundle(&servers, BundleWorker::None).header_value()
+            ipe_runtime_rust::escape::html_attr(
+                &ContentSecurityPolicy::bundle(&servers, BundleWorker::None).header_value()
+            )
         );
         let named: Vec<&str> = value
             .split([' ', ';'])
@@ -7031,8 +7033,10 @@ mod wasm_shell_tests {
         assert!(!offline.contains("://"), "{offline}");
         assert_eq!(
             offline,
-            ContentSecurityPolicy::bundle(&ServerOrigins::none(), BundleWorker::None)
-                .header_value()
+            ipe_runtime_rust::escape::html_attr(
+                &ContentSecurityPolicy::bundle(&ServerOrigins::none(), BundleWorker::None)
+                    .header_value()
+            )
         );
         Ok(())
     }
@@ -7042,7 +7046,7 @@ mod wasm_shell_tests {
     #[test]
     fn shell_policy_names_a_worker_only_for_push() -> Result<(), String> {
         let push = shell_policy(&ServerOrigins::none(), BundleWorker::Push)?;
-        assert!(push.ends_with("; worker-src 'self'"), "{push}");
+        assert!(push.ends_with("; worker-src &#39;self&#39;"), "{push}");
         let plain = shell_policy(&ServerOrigins::none(), BundleWorker::None)?;
         assert!(!plain.contains("worker-src"), "{plain}");
         Ok(())

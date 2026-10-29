@@ -797,15 +797,7 @@ impl<'a> ContentSecurityPolicy<'a> {
         out.push_str("<meta http-equiv=\"");
         out.push_str(HEADER_NAME);
         out.push_str("\" content=\"");
-        for c in value.chars() {
-            match c {
-                '&' => out.push_str("&amp;"),
-                '"' => out.push_str("&quot;"),
-                '<' => out.push_str("&lt;"),
-                '>' => out.push_str("&gt;"),
-                other => out.push(other),
-            }
-        }
+        crate::escape::html_attr_into(&value, &mut out);
         out.push_str("\">\n");
         out
     }
@@ -1449,7 +1441,10 @@ mod bundle_tests {
                 );
                 assert_eq!(
                     policy.meta_element(),
-                    format!("<meta http-equiv=\"Content-Security-Policy\" content=\"{value}\">\n")
+                    format!(
+                        "<meta http-equiv=\"Content-Security-Policy\" content=\"{}\">\n",
+                        crate::escape::html_attr(&value)
+                    )
                 );
             }
         }
@@ -1484,7 +1479,10 @@ mod bundle_tests {
         let none = ServerOrigins::none();
         assert_eq!(
             ContentSecurityPolicy::bundle(&none, BundleWorker::None).meta_element(),
-            format!("<meta http-equiv=\"Content-Security-Policy\" content=\"{OFFLINE}\">\n")
+            format!(
+                "<meta http-equiv=\"Content-Security-Policy\" content=\"{}\">\n",
+                crate::escape::html_attr(OFFLINE)
+            )
         );
     }
 
@@ -1538,7 +1536,7 @@ mod bundle_tests {
         assert_eq!(
             meta,
             "<meta http-equiv=\"Content-Security-Policy\" \
-             content=\"script-src 'a&quot;b&lt;c&gt;d&amp;e'\">\n"
+             content=\"script-src &#39;a&#34;b&lt;c&gt;d&amp;e&#39;\">\n"
         );
     }
 
