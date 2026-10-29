@@ -38,6 +38,11 @@ pub const PUSH_AUTH_SECRET_BYTES: usize = 16;
 /// The version every canonical push subscription text carries.
 pub const PUSH_SUBSCRIPTION_VERSION: u32 = 1;
 
+/// The characters `Ipe.Json.Encode` writes as a `\uXXXX` escape where
+/// `JSON.stringify` leaves them bare. The glue escapes them in a subscription
+/// text, so the text it hands the app is the one spelling the Ipê parser accepts.
+pub const PUSH_ENCODE_ESCAPED: [char; 5] = ['<', '>', '&', '\u{2028}', '\u{2029}'];
+
 // --- port glue JS assembly ---
 //
 // The ES module is assembled from two raw-string halves; the scheme-check snippet
@@ -554,7 +559,9 @@ const PORT_GLUE_JS_HEAD: &str = r#"  var onReceive = null;
       );
   }
   // The canonical text of a browser subscription, or null when its keys are not
-  // the expected sizes.
+  // the expected sizes. It is spelled as `Ipe.Json.Encode` spells it, which
+  // escapes five characters `JSON.stringify` leaves bare: the Ipê parser accepts
+  // only the text its own encoder renders.
   function pushWebText(subscription) {
     if (!subscription || typeof subscription.endpoint !== "string" || typeof subscription.getKey !== "function") return null;
     var receiver = bufToB64url(subscription.getKey("p256dh"));
@@ -562,7 +569,10 @@ const PORT_GLUE_JS_HEAD: &str = r#"  var onReceive = null;
     if (pushPointBytes(receiver) === null || pushBase64UrlBytes(auth, PUSH_AUTH_SECRET_BYTES) === null) return null;
     return JSON.stringify({
       v: PUSH_SUBSCRIPTION_VERSION, kind: "web", endpoint: subscription.endpoint, p256dh: receiver, auth: auth,
-    });
+    }).replace(PUSH_ENCODE_ESCAPED, pushEncodeEscape);
+  }
+  function pushEncodeEscape(c) {
+    return "\\u" + ("000" + c.charCodeAt(0).toString(16)).slice(-4);
   }
   function pushWebRefusal(err) {
     return err && err.name === "NotAllowedError" ? REJECT_DENIED : REJECT_UNAVAILABLE;
@@ -1810,6 +1820,16 @@ fn js_string(text: &str) -> String {
     format!("\"{text}\"")
 }
 
+/// The glue's pattern over [`PUSH_ENCODE_ESCAPED`], each character spelled as a
+/// Unicode-mode regex escape `\u{X}`.
+fn push_encode_escaped_js() -> String {
+    let class: String = PUSH_ENCODE_ESCAPED
+        .into_iter()
+        .flat_map(char::escape_unicode)
+        .collect();
+    format!("var PUSH_ENCODE_ESCAPED = /[{class}]/gu;")
+}
+
 /// The bridge constants the glue reads, each rendered from its one Rust definition.
 fn bridge_constants_js() -> String {
     use native_bridge::{
@@ -1834,6 +1854,7 @@ fn bridge_constants_js() -> String {
         format!("var PUSH_APPLICATION_KEY_BYTES = {PUSH_APPLICATION_KEY_BYTES};"),
         format!("var PUSH_AUTH_SECRET_BYTES = {PUSH_AUTH_SECRET_BYTES};"),
         format!("var PUSH_SUBSCRIPTION_VERSION = {PUSH_SUBSCRIPTION_VERSION};"),
+        push_encode_escaped_js(),
     ];
     for reject in Reject::ALL {
         lines.push(format!(
@@ -2328,6 +2349,66 @@ mod tests {
         }
         let version = format!("  var PUSH_SUBSCRIPTION_VERSION = {PUSH_SUBSCRIPTION_VERSION};\n");
         assert_eq!(js.matches(version.as_str()).count(), 1);
+    }
+
+    /// A browser subscription text is spelled as `Ipe.Json.Encode` spells it: the
+    /// characters `JSON.stringify` leaves bare are escaped before the text
+    /// reaches the app, so an endpoint carrying `&` still parses.
+    #[test]
+    fn push_web_text_escapes_what_the_ipe_encoder_escapes() {
+        let js = port_glue_js();
+        assert_eq!(
+            js.matches(r"  var PUSH_ENCODE_ESCAPED = /[\u{3c}\u{3e}\u{26}\u{2028}\u{2029}]/gu;")
+                .count(),
+            1
+        );
+        let text = js
+            .find("  function pushWebText(subscription) {")
+            .expect("the push text renderer is assembled");
+        let body = js
+            .get(text..)
+            .expect("the renderer starts on a char boundary");
+        let end = body.find("\n  }\n").expect("the renderer ends");
+        let body = body
+            .get(..end)
+            .expect("the renderer ends on a char boundary");
+        assert_eq!(body.matches("JSON.stringify(").count(), 1);
+        assert!(body.ends_with("}).replace(PUSH_ENCODE_ESCAPED, pushEncodeEscape);"));
+        assert_eq!(
+            js.matches(r#"    return "\\u" + ("000" + c.charCodeAt(0).toString(16)).slice(-4);"#)
+                .count(),
+            1
+        );
+    }
+
+    /// [`PUSH_ENCODE_ESCAPED`] is exactly the set of characters the
+    /// `Json.Encode.encode` writer escapes beyond the plain JSON writer, and each
+    /// is spelled as the glue spells it: four lowercase hex digits.
+    #[cfg(feature = "json")]
+    #[test]
+    fn push_encode_escaped_is_the_encoder_escape_set() {
+        use crate::json_val::{JsonVal, Layout, Policy, write_json};
+        let render = |c: char, policy: Policy| {
+            let mut out = String::new();
+            write_json(
+                &mut out,
+                &JsonVal::String(c.to_string()),
+                Layout::Compact,
+                policy,
+            );
+            out
+        };
+        let differing: Vec<char> = (0..=0xFFFF_u32)
+            .filter_map(char::from_u32)
+            .filter(|c| render(*c, Policy::Encode) != render(*c, Policy::Display))
+            .collect();
+        assert_eq!(differing, PUSH_ENCODE_ESCAPED.to_vec());
+        for c in PUSH_ENCODE_ESCAPED {
+            assert_eq!(
+                render(c, Policy::Encode),
+                format!("\"\\u{:04x}\"", u32::from(c))
+            );
+        }
     }
 
     #[test]

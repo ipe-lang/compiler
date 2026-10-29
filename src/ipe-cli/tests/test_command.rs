@@ -832,6 +832,11 @@ webText =
     webOpen ++ "}"
 
 
+webAmpersand : String
+webAmpersand =
+    String.replace "/send/abc" "/send/a\\u0026b" webText
+
+
 apnsText : String
 apnsText =
     "{\"v\":1,\"kind\":\"apns\",\"token\":\"" ++ String.repeat 8 "0a1b2c3d" ++ "\",\"env\":\"production\",\"p256dh\":\"" ++ receiver ++ "\",\"auth\":\"" ++ auth ++ "\"}"
@@ -863,6 +868,8 @@ tests =
         , Test.test "an fcm subscription round-trips" (\_ -> Test.equal (Ok fcmText) (roundTrip fcmText))
         , Test.test "another version is refused" (\_ -> Test.equal (Err malformed) (roundTrip (String.replace "\"v\":1" "\"v\":2" webText)))
         , Test.test "an unknown kind is refused" (\_ -> Test.equal (Err malformed) (roundTrip (String.replace "\"kind\":\"web\"" "\"kind\":\"mail\"" webText)))
+        , Test.test "an endpoint with an escaped ampersand round-trips" (\_ -> Test.equal (Ok webAmpersand) (roundTrip webAmpersand))
+        , Test.test "an endpoint with a bare ampersand is refused" (\_ -> Test.equal (Err malformed) (roundTrip (String.replace "\\u0026" "&" webAmpersand)))
         , Test.test "a plain http endpoint is refused" (\_ -> Test.equal (Err malformed) (roundTrip (String.replace "https://" "http://" webText)))
         , Test.test "a 15-byte secret is refused" (\_ -> Test.equal (Err malformed) (roundTrip (String.replace auth "BTBZMqHH6r4Tts7J_aSI" webText)))
         , Test.test "reordered keys are refused" (\_ -> Test.equal (Err malformed) (roundTrip ("{\"v\":1,\"kind\":\"web\",\"endpoint\":\"https://push.example.net/send/abc\",\"auth\":\"" ++ auth ++ "\",\"p256dh\":\"" ++ receiver ++ "\"}")))
