@@ -30,7 +30,7 @@
 
 use std::borrow::Cow;
 use std::cell::{Cell, RefCell};
-use std::collections::VecDeque;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::rc::Rc;
 
 use wasm_bindgen::JsCast;
@@ -39,11 +39,15 @@ use wasm_bindgen::prelude::*;
 use crate::core::{IpeResult, IpeTask};
 use crate::dom::{
     HandlerIndex, WebReq, build_index,
-    diff::{AUTOFOCUS_SPENT_GLOBAL, Patch, diff, focus_target},
+    diff::{AUTOFOCUS_SPENT_GLOBAL, Patch, StampedId, diff, focus_target},
+    focus::{
+        FocusLink, Now, Recorded, WINDOW_FOCUS_MOVES, chain_from_ancestry, landing, settle_due,
+    },
+    keep::{AUTHORITY_ATTRS, Control, Field, Keep, is_authority_attr, keep},
 };
 use crate::html::{
-    FormData, Html, IFRAME_TAG, RenderCtx, SANDBOX_ATTR, SandboxTokens, assign_ipe_ids,
-    frame_loader_key, render_html,
+    FormData, Html, IFRAME_TAG, RenderCtx, SANDBOX_ATTR, STAMPED_ID_ATTR, SandboxTokens,
+    assign_ipe_ids, frame_loader_key, render_html,
 };
 use crate::tea::{IpeCmd, IpeSub};
 use crate::web::route::MountRefusal;
@@ -376,6 +380,39 @@ impl<F: PartialEq> Cause<F> {
             Self::Idle | Self::Effect => false,
         }
     }
+
+    /// Moves a pending user mark onto `at`, where the focus keep put focus.
+    ///
+    /// A restore is the runtime's own move: it never changes whether the
+    /// user's queued Msgs may move focus.
+    fn restamp(&mut self, at: F) {
+        if let Self::User(mark) = self {
+            mark.at = Some(at);
+        }
+    }
+}
+
+/// The cause of the Msgs queued since the last render, shared with each
+/// frame's deferred focus check.
+#[derive(Clone)]
+pub struct QueuedCause(Rc<RefCell<Cause>>);
+
+impl Default for QueuedCause {
+    fn default() -> Self {
+        Self(Rc::new(RefCell::new(Cause::Idle)))
+    }
+}
+
+impl QueuedCause {
+    /// Puts `cause` in place and returns the one it replaced.
+    fn replace(&self, cause: Cause) -> Cause {
+        self.0.replace(cause)
+    }
+
+    /// Moves a pending user mark onto `at`.
+    fn restamp(&self, at: &web_sys::Element) {
+        self.0.borrow_mut().restamp(at.clone());
+    }
 }
 
 thread_local! {
@@ -386,6 +423,8 @@ thread_local! {
     static RUNTIME_FOCUSING: Cell<bool> = const { Cell::new(false) };
     /// One-time guard for the focus-move listeners every mount shares.
     static FOCUS_EPOCH_INSTALLED: Cell<bool> = const { Cell::new(false) };
+    /// The token of the newest frame committed, compared for equality only.
+    static FRAME_TOKEN: Cell<u64> = const { Cell::new(0) };
 }
 
 /// The events that count a focus move. A key press is not one: it is what
@@ -396,6 +435,15 @@ const FOCUS_MOVE_EVENTS: &[&str] = &["focusin", "pointerdown", "mousedown", "tou
 fn note_focus_move() {
     if !RUNTIME_FOCUSING.with(Cell::get) {
         FOCUS_EPOCH.with(|c| c.set(c.get().wrapping_add(1)));
+    }
+}
+
+/// Counts one focus move for a window event whose target is the window itself
+/// (`on_window`): focus leaving the document. An element's own event crossing
+/// the window's capture phase is not one.
+fn note_window_focus_move(on_window: bool) {
+    if on_window {
+        note_focus_move();
     }
 }
 
@@ -426,6 +474,24 @@ fn install_focus_epoch(document: &web_sys::Document) -> Result<(), MountRefusal>
         // The counting listeners live for the whole tab lifetime.
         closure.forget();
     }
+    let window = web_sys::window().ok_or(MountRefusal::NoWindow)?;
+    for event_name in WINDOW_FOCUS_MOVES {
+        let closure = Closure::<dyn Fn(web_sys::Event)>::new(move |ev: web_sys::Event| {
+            note_window_focus_move(
+                ev.target()
+                    .is_some_and(|target| target.dyn_ref::<web_sys::Window>().is_some()),
+            );
+        });
+        window
+            .add_event_listener_with_callback_and_bool(
+                event_name,
+                closure.as_ref().unchecked_ref(),
+                true,
+            )
+            .map_err(|e| listener_refusal(event_name, &e))?;
+        // The counting listeners live for the whole tab lifetime.
+        closure.forget();
+    }
     FOCUS_EPOCH_INSTALLED.with(|c| c.set(true));
     Ok(())
 }
@@ -444,7 +510,7 @@ struct App<Model, Msg> {
     index: RefCell<HandlerIndex<Msg>>,
     queue: RefCell<VecDeque<Msg>>,
     /// What caused the Msgs in `queue`.
-    cause: RefCell<Cause>,
+    cause: QueuedCause,
     frame_scheduled: Cell<bool>,
     update: Box<dyn Fn(Msg, Model) -> (Model, IpeCmd<Msg>)>,
     view: Box<dyn Fn(Model) -> Html<Msg>>,
@@ -536,7 +602,7 @@ where
         tree: RefCell::new(tree),
         index: RefCell::new(index),
         queue: RefCell::new(VecDeque::new()),
-        cause: RefCell::new(Cause::Idle),
+        cause: QueuedCause::default(),
         frame_scheduled: Cell::new(false),
         update: Box::new(update),
         view: Box::new(view),
@@ -634,7 +700,7 @@ where
         tree: RefCell::new(tree),
         index: RefCell::new(index),
         queue: RefCell::new(VecDeque::new()),
-        cause: RefCell::new(Cause::Idle),
+        cause: QueuedCause::default(),
         frame_scheduled: Cell::new(false),
         update: Box::new(update),
         view: Box::new(view),
@@ -762,7 +828,7 @@ where
         tree: RefCell::new(tree),
         index: RefCell::new(index),
         queue: RefCell::new(VecDeque::new()),
-        cause: RefCell::new(Cause::Idle),
+        cause: QueuedCause::default(),
         frame_scheduled: Cell::new(false),
         update: Box::new(update),
         view: Box::new(view),
@@ -856,16 +922,7 @@ where
 
     let mut new_tree = (app.view)(new_model);
     assign_ipe_ids(&mut new_tree, ROOT_IPE_ID);
-    let patches = diff(&app.tree.borrow(), &new_tree, &RenderCtx::Unstamped);
-    apply_patches(&patches);
-    *app.index.borrow_mut() = build_index(&new_tree);
-    *app.tree.borrow_mut() = new_tree;
-    // A widget that first appears via an `html`-subtree replace bypasses the
-    // attribute-patch property route; re-deliver each widget's decoded down-state
-    // PROPERTY (idempotent, bounded by the widget count).
-    if let Ok(document) = document() {
-        widget::sync_widget_properties(&document, &app.tree.borrow());
-    }
+    commit_view(app, new_tree, None);
 
     run_cmd(app, cmd);
     resync_subscriptions(app);
@@ -1284,19 +1341,7 @@ where
         } else {
             None
         };
-        let patches = diff(&app.tree.borrow(), &new_tree, &RenderCtx::Unstamped);
-        apply_patches(&patches);
-        if let Some(target) = target {
-            focus_stamped(target.as_str());
-        }
-        *app.index.borrow_mut() = build_index(&new_tree);
-        *app.tree.borrow_mut() = new_tree;
-        // A widget that first appears via an `html`-subtree replace bypasses the
-        // attribute-patch property route; re-deliver each widget's decoded down-state
-        // PROPERTY (idempotent, bounded by the widget count).
-        if let Ok(document) = document() {
-            widget::sync_widget_properties(&document, &app.tree.borrow());
-        }
+        commit_view(app, new_tree, target.as_ref());
     }
 
     for cmd in cmds {
@@ -1376,8 +1421,7 @@ where
     Model: Clone + 'static,
     Msg: Clone + 'static,
 {
-    use crate::dom::{build_index, diff::diff};
-    use crate::html::{RenderCtx, assign_ipe_ids};
+    use crate::html::assign_ipe_ids;
 
     let render_model = match step {
         None => {
@@ -1405,13 +1449,7 @@ where
 
     let mut new_tree = (app.view)(render_model);
     assign_ipe_ids(&mut new_tree, ROOT_IPE_ID);
-    let patches = diff(&app.tree.borrow(), &new_tree, &RenderCtx::Unstamped);
-    apply_patches(&patches);
-    *app.index.borrow_mut() = build_index(&new_tree);
-    *app.tree.borrow_mut() = new_tree;
-    if let Ok(document) = document() {
-        widget::sync_widget_properties(&document, &app.tree.borrow());
-    }
+    commit_view(app, new_tree, None);
 
     // Refresh the overlay panel to highlight the newly selected step.
     refresh_overlay(app);
@@ -1437,10 +1475,7 @@ where
 
 /// Focus the element stamped `id`; an absent or unfocusable one is left alone.
 /// The move is the runtime's own: it does not count as the user's.
-fn focus_stamped(id: &str) {
-    let Ok(document) = document() else {
-        return;
-    };
+fn focus_stamped(document: &web_sys::Document, id: &str) {
     if let Ok(Some(el)) = document.query_selector(&ipe_id_selector(id))
         && let Some(html) = el.dyn_ref::<web_sys::HtmlElement>()
     {
@@ -1641,16 +1676,190 @@ fn markup_parent(el: &web_sys::Element) -> web_sys::Node {
     }
 }
 
-/// Replace `el`'s children with `html`, parsed by [`parse_detached`].
+/// Replace `el`'s children with `html`, parsed by [`parse_detached`], keeping
+/// each live node the new markup repeats by the rule of [`crate::dom::keep`].
 pub fn replace_children_html(document: &web_sys::Document, el: &web_sys::Element, html: &str) {
     let replaced = parse_detached(document, el, html).and_then(|parsed| {
-        let live = markup_parent(el);
-        live.set_text_content(None);
-        move_children(&parsed.nodes, &live)
+        let focused = document.active_element();
+        swap_keeping(&markup_parent(el), &parsed.nodes, focused.as_ref())
     });
     if let Err(why) = replaced {
         console_fatal("PatchTargetLost", why);
     }
+}
+
+/// A live parent whose children a swap writes, and the parsed node holding
+/// its new children.
+struct SwapPair {
+    live: web_sys::Node,
+    parsed: web_sys::Node,
+    /// Whether the pair lies inside a kept field, whose authority attributes
+    /// the user owns.
+    in_field: bool,
+}
+
+/// Swap `live`'s children for `parsed`'s, keeping every live node the new
+/// markup repeats below a kept parent.
+///
+/// Each pair is walked once and a kept node is taken from its parent's
+/// children at most once, so the walk is bounded by the live tree's size.
+fn swap_keeping(
+    live: &web_sys::Node,
+    parsed: &web_sys::Node,
+    focused: Option<&web_sys::Element>,
+) -> Result<(), &'static str> {
+    let mut pending = vec![SwapPair {
+        live: live.clone(),
+        parsed: parsed.clone(),
+        in_field: false,
+    }];
+    while let Some(pair) = pending.pop() {
+        swap_children(&pair, focused, &mut pending)?;
+    }
+    Ok(())
+}
+
+/// The children of `node`, in order.
+fn children_of(node: &web_sys::Node) -> Vec<web_sys::Node> {
+    let list = node.child_nodes();
+    (0..list.length()).filter_map(|i| list.item(i)).collect()
+}
+
+/// The identity a swap keeps a node by: its non-empty `ipe-id` and its tag,
+/// for an HTML element only. A foreign element is always rebuilt.
+fn keep_key(node: &web_sys::Node) -> Option<(String, String)> {
+    let el = node.dyn_ref::<web_sys::Element>()?;
+    if el.namespace_uri().as_deref() != Some(HTML_NS) {
+        return None;
+    }
+    let id = el
+        .get_attribute(STAMPED_ID_ATTR)
+        .filter(|id| !id.is_empty())?;
+    Some((id, el.local_name()))
+}
+
+/// What the new markup `el` of `field` says about its value. A selected-option
+/// query the browser refuses reads as controlled, so the program's value wins.
+fn control_of(field: Field, el: &web_sys::Element) -> Control {
+    let authority = AUTHORITY_ATTRS.iter().any(|name| el.has_attribute(name));
+    let text = el.text_content().is_some_and(|t| !t.is_empty());
+    let selected = !matches!(el.query_selector("option[selected]"), Ok(None));
+    Control::of(field, authority, text, selected)
+}
+
+/// Write `pair.live`'s children to `pair.parsed`'s, keeping each live child
+/// [`keep`] admits and queueing it to have its own children written.
+///
+/// A kept node already in place is never moved: the children the new markup
+/// drops leave first, and each child is then inserted only where it does not
+/// already stand.
+fn swap_children(
+    pair: &SwapPair,
+    focused: Option<&web_sys::Element>,
+    pending: &mut Vec<SwapPair>,
+) -> Result<(), &'static str> {
+    let old = children_of(&pair.live);
+    let mut by_key: HashMap<(String, String), VecDeque<usize>> = HashMap::new();
+    for (index, node) in old.iter().enumerate() {
+        if let Some(key) = keep_key(node) {
+            by_key.entry(key).or_default().push_back(index);
+        }
+    }
+    let mut taken = vec![false; old.len()];
+    let mut placed = Vec::new();
+    for new in children_of(&pair.parsed) {
+        let matched = keep_key(&new)
+            .and_then(|key| by_key.get_mut(&key)?.pop_front())
+            .and_then(|index| Some((index, old.get(index)?.dyn_ref::<web_sys::Element>()?)));
+        let (Some((index, live)), Some(markup)) = (matched, new.dyn_ref::<web_sys::Element>())
+        else {
+            placed.push(new);
+            continue;
+        };
+        let kept = keep(&live.local_name(), focused == Some(live), |field| {
+            control_of(field, markup)
+        });
+        let in_field = match kept {
+            Keep::Rebuild => {
+                placed.push(new);
+                continue;
+            }
+            Keep::Node => pair.in_field,
+            Keep::Field(_) => true,
+        };
+        write_kept_attrs(live, markup, in_field)?;
+        if let Some(slot) = taken.get_mut(index) {
+            *slot = true;
+        }
+        let live: web_sys::Node = live.clone().into();
+        // A kept `textarea`'s text is its value, which the user owns.
+        if kept != Keep::Field(Field::Textarea) {
+            pending.push(SwapPair {
+                live: live.clone(),
+                parsed: new,
+                in_field,
+            });
+        }
+        placed.push(live);
+    }
+    for (node, kept) in old.iter().zip(&taken) {
+        if !kept {
+            pair.live
+                .remove_child(node)
+                .map_err(|_| "patched node could not be detached")?;
+        }
+    }
+    let mut cursor = pair.live.first_child();
+    for node in &placed {
+        if cursor.as_ref() == Some(node) {
+            cursor = node.next_sibling();
+        } else {
+            pair.live
+                .insert_before(node, cursor.as_ref())
+                .map_err(|_| "patched node could not be attached")?;
+        }
+    }
+    Ok(())
+}
+
+/// The attribute names `el` carries.
+fn attribute_names(el: &web_sys::Element) -> Vec<String> {
+    el.get_attribute_names()
+        .iter()
+        .filter_map(|name| name.as_string())
+        .collect()
+}
+
+/// Write `live`'s attributes to `markup`'s: a missing one is removed, a
+/// different one set, an equal one left alone. Inside a kept field
+/// (`in_field`) the authority attributes stay as the user left them.
+fn write_kept_attrs(
+    live: &web_sys::Element,
+    markup: &web_sys::Element,
+    in_field: bool,
+) -> Result<(), &'static str> {
+    let owned = |name: &str| in_field && is_authority_attr(name);
+    let names = attribute_names(markup);
+    let wanted: HashSet<&str> = names.iter().map(String::as_str).collect();
+    for name in attribute_names(live) {
+        if !owned(&name) && !wanted.contains(name.as_str()) {
+            live.remove_attribute(&name)
+                .map_err(|_| "kept node attribute could not be removed")?;
+        }
+    }
+    for name in &names {
+        if owned(name) {
+            continue;
+        }
+        let Some(value) = markup.get_attribute(name) else {
+            continue;
+        };
+        if live.get_attribute(name).as_deref() != Some(value.as_str()) {
+            live.set_attribute(name, &value)
+                .map_err(|_| "kept node attribute could not be set")?;
+        }
+    }
+    Ok(())
 }
 
 /// Paint `html` as the mount root's first content, parsed by
@@ -1727,44 +1936,167 @@ fn fragment_target(document: &web_sys::Document) -> Option<web_sys::Element> {
     })
 }
 
-/// Apply the same `Vec<Patch>` the SSE wire serialises, via typed web-sys
-/// calls. Target lookup is by the `ipe-id` attribute, exactly as `client.js`.
-fn apply_patches(patches: &[Patch]) {
+/// Commits `new_tree` as the app's next frame, focusing `target` when the
+/// frame addresses one.
+///
+/// The view the handlers resolve against becomes `new_tree` BEFORE the frame
+/// applies: the frame's own focus moves (the focus keep, `target`) raise
+/// `focus`/`focusin` synchronously, and the Msg such an event resolves to must
+/// come from the view on screen, never from the one the frame replaced.
+fn commit_view<Model, Msg: Clone>(
+    app: &App<Model, Msg>,
+    new_tree: Html<Msg>,
+    target: Option<&StampedId>,
+) {
+    let patches = diff(&app.tree.borrow(), &new_tree, &RenderCtx::Unstamped);
+    *app.index.borrow_mut() = build_index(&new_tree);
+    *app.tree.borrow_mut() = new_tree;
+    commit_frame(&patches, target, &app.cause);
+    // A widget that first appears via an `html`-subtree replace bypasses the
+    // attribute-patch property route; re-deliver each widget's decoded down-state
+    // PROPERTY (idempotent, bounded by the widget count).
+    if let Ok(document) = document() {
+        widget::sync_widget_properties(&document, &app.tree.borrow());
+    }
+}
+
+/// [`apply_frame`] on this tab's document; a vanished document applies nothing.
+fn commit_frame(patches: &[Patch], target: Option<&StampedId>, queued: &QueuedCause) {
     let Ok(document) = document() else {
         console_fatal("PatchTargetLost", "document vanished during patch apply");
         return;
     };
-    for p in patches {
-        let Ok(Some(el)) = document.query_selector(&ipe_id_selector(&p.id)) else {
-            // A stale id can appear when a parent html-replace in this same
-            // batch already rewrote the subtree — benign, matching client.js.
-            continue;
-        };
-        if p.remove {
-            el.remove();
-            continue;
-        }
-        if let Some(text) = &p.text {
-            el.set_text_content(Some(text));
-        }
-        if let Some(html) = &p.html {
-            // Sanitiser-gated: `Patch.html` is produced exclusively by
-            // `render_html` over the new subtree.
-            replace_children_html(&document, &el, html);
-        }
-        for (k, v) in &p.attrs {
-            // `CustomElement.node` down-state: on a compiler-generated `ipe-ce-*` node the
-            // `state` value crosses as a DECODED PROPERTY (the wasm-client
-            // adapter), never the escaped attribute the server path writes. The
-            // glue's `set state(v)` setter forwards the decoded object to the
-            // author hook — data handed to a setter, never spliced into markup.
-            if k == "state" && widget::is_widget_tag(&el.tag_name().to_lowercase()) {
-                widget::set_widget_down_property(&el, v.as_deref().unwrap_or_default());
+    apply_frame(&document, patches, target, queued);
+}
+
+/// Commits one frame inside the focus keep: the one site that applies patches.
+///
+/// Applies `patches` (the `Vec<Patch>` the SSE wire serialises, through typed
+/// web-sys calls, each target found by its `ipe-id` as in `client.js`), then
+/// focuses `target`. Focus the frame left on the body is put back by the rule
+/// of [`crate::dom::focus`] at once and again two animation frames later,
+/// after the browser's own fixup for a node a patch made unfocusable; a
+/// restore moves a pending user mark in `queued` onto the landing node.
+pub fn apply_frame(
+    document: &web_sys::Document,
+    patches: &[Patch],
+    target: Option<&StampedId>,
+    queued: &QueuedCause,
+) {
+    fn apply(document: &web_sys::Document, patches: &[Patch]) {
+        for p in patches {
+            let Ok(Some(el)) = document.query_selector(&ipe_id_selector(&p.id)) else {
+                // A stale id can appear when a parent html-replace in this same
+                // batch already rewrote the subtree — benign, matching client.js.
                 continue;
+            };
+            if let Some(text) = &p.text {
+                el.set_text_content(Some(text));
             }
-            write_patched_attr(&el, k, v.as_deref());
+            if let Some(html) = &p.html {
+                // Sanitiser-gated: `Patch.html` is produced exclusively by
+                // `render_html` over the new subtree.
+                replace_children_html(document, &el, html);
+            }
+            for (k, v) in &p.attrs {
+                // `CustomElement.node` down-state: on a compiler-generated `ipe-ce-*` node the
+                // `state` value crosses as a DECODED PROPERTY (the wasm-client
+                // adapter), never the escaped attribute the server path writes. The
+                // glue's `set state(v)` setter forwards the decoded object to the
+                // author hook — data handed to a setter, never spliced into markup.
+                if k == "state" && widget::is_widget_tag(&el.tag_name().to_lowercase()) {
+                    widget::set_widget_down_property(&el, v.as_deref().unwrap_or_default());
+                    continue;
+                }
+                write_patched_attr(&el, k, v.as_deref());
+            }
         }
     }
+
+    let chain = document
+        .active_element()
+        .and_then(|focused| view_chain(document, focused));
+    let focus_epoch = FOCUS_EPOCH.with(Cell::get);
+    apply(document, patches);
+    if let Some(target) = target {
+        focus_stamped(document, target.as_str());
+    }
+    let frame = FRAME_TOKEN.with(|c| {
+        let next = c.get().wrapping_add(1);
+        c.set(next);
+        next
+    });
+    let Some(chain) = chain else {
+        return;
+    };
+    let rec = Recorded { focus_epoch, frame };
+    keep_focus(document, &chain, rec, queued);
+    settle_later(chain, rec, queued.clone());
+}
+
+/// The view chain of `focused` below the body, the wasm mount container.
+fn view_chain(document: &web_sys::Document, focused: web_sys::Element) -> Option<Vec<FocusLink>> {
+    let body = document.body()?;
+    let root: &web_sys::Element = body.as_ref();
+    if focused == *root || !root.contains(Some(&focused)) {
+        return None;
+    }
+    let upward = std::iter::successors(Some(focused), |el: &web_sys::Element| el.parent_element())
+        .take_while(|el| el != root)
+        .map(|el| (el.get_attribute(STAMPED_ID_ATTR), el.tag_name()));
+    chain_from_ancestry(upward)
+}
+
+/// Puts focus on the landing of `chain` when [`settle_due`] holds for `rec`.
+fn keep_focus(
+    document: &web_sys::Document,
+    chain: &[FocusLink],
+    rec: Recorded,
+    queued: &QueuedCause,
+) {
+    let now = Now {
+        focus_held: !focus_on_body(document),
+        focus_epoch: FOCUS_EPOCH.with(Cell::get),
+        newest_frame: FRAME_TOKEN.with(Cell::get),
+        runtime_focusing: RUNTIME_FOCUSING.with(Cell::get),
+    };
+    if !settle_due(&rec, &now) {
+        return;
+    }
+    let Some(body) = document.body() else {
+        return;
+    };
+    let root: &web_sys::Element = body.as_ref();
+    for node in landing(root, chain) {
+        let Some(html) = node.dyn_ref::<web_sys::HtmlElement>() else {
+            continue;
+        };
+        runtime_focus(|| {
+            let _ = html.focus();
+        });
+        if document.active_element().as_ref() == Some(&node) {
+            queued.restamp(&node);
+            return;
+        }
+    }
+}
+
+/// Runs [`keep_focus`] for `rec` two animation frames on; with no animation
+/// frame the deferred check is skipped.
+fn settle_later(chain: Vec<FocusLink>, rec: Recorded, queued: QueuedCause) {
+    let Some(window) = web_sys::window() else {
+        return;
+    };
+    let again = window.clone();
+    let second = Closure::once_into_js(move || {
+        if let Ok(document) = document() {
+            keep_focus(&document, &chain, rec, &queued);
+        }
+    });
+    let first = Closure::once_into_js(move || {
+        let _ = again.request_animation_frame(second.unchecked_ref());
+    });
+    let _ = window.request_animation_frame(first.unchecked_ref());
 }
 
 /// Write one patched attribute onto the live `el`: `Some` sets, `None`
@@ -1934,6 +2266,34 @@ mod tests {
         assert_eq!(FOCUS_EPOCH.with(Cell::get), start);
         assert!(!RUNTIME_FOCUSING.with(Cell::get));
         note_focus_move();
+        assert_eq!(FOCUS_EPOCH.with(Cell::get), start.wrapping_add(1));
+    }
+
+    #[wasm_bindgen_test]
+    fn a_restore_restamps_the_pending_user_mark() {
+        let mut cause = Cause::Idle.with(Source::User, || mark(5, 1));
+        cause.restamp(2);
+        assert!(cause.addressed(&mark(5, 2)));
+        assert!(!cause.addressed(&mark(5, 1)));
+        assert!(!cause.addressed(&mark(6, 2)));
+        let mut effect: Cause<u8> = Cause::Effect;
+        effect.restamp(2);
+        assert!(!effect.addressed(&mark(5, 2)));
+        let mut idle: Cause<u8> = Cause::Idle;
+        idle.restamp(2);
+        assert!(matches!(idle, Cause::Idle));
+    }
+
+    #[wasm_bindgen_test]
+    fn window_blur_is_a_focus_move() {
+        assert!(WINDOW_FOCUS_MOVES.contains(&"blur"));
+        assert!(!FOCUS_MOVE_EVENTS.contains(&"blur"));
+        let start = FOCUS_EPOCH.with(Cell::get);
+        note_window_focus_move(false);
+        assert_eq!(FOCUS_EPOCH.with(Cell::get), start);
+        runtime_focus(|| note_window_focus_move(true));
+        assert_eq!(FOCUS_EPOCH.with(Cell::get), start);
+        note_window_focus_move(true);
         assert_eq!(FOCUS_EPOCH.with(Cell::get), start.wrapping_add(1));
     }
 

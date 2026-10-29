@@ -1659,12 +1659,16 @@ impl<Model, Msg> SqliteStore<Model, Msg> {
         // column then fail as a typed write fault the caller matches on — the
         // store degrades fail-closed (new sessions refused, held ones kept
         // live), never crashes and never mis-decodes.
-        sqlx::query(
-            "CREATE TABLE IF NOT EXISTS ipe_sessions (\
-             sid TEXT PRIMARY KEY, blob TEXT NOT NULL, last_seen INTEGER NOT NULL, \
-             schema_tag TEXT NOT NULL)",
-        )
-        .execute(&pool)
+        async {
+            let mut held = crate::db::checkout(&pool).await?;
+            sqlx::query(
+                "CREATE TABLE IF NOT EXISTS ipe_sessions (\
+                 sid TEXT PRIMARY KEY, blob TEXT NOT NULL, last_seen INTEGER NOT NULL, \
+                 schema_tag TEXT NOT NULL)",
+            )
+            .execute(&mut *held)
+            .await
+        }
         .await
         .map_err(|e| StoreOpenError::Schema(Self::failure(&e)))?;
         crate::db::own_pool(crate::db::PoolRole::SessionStore, &pool);
@@ -1696,53 +1700,73 @@ impl<Model, Msg> SqliteStore<Model, Msg> {
     }
 
     async fn write_row(&self, sid: &str, blob: String) -> Result<(), WriteFault> {
-        let done = sqlx::query(
-            "INSERT INTO ipe_sessions (sid, blob, last_seen, schema_tag) VALUES (?, ?, ?, ?) \
+        let done = async {
+            let mut held = crate::db::checkout(&self.pool).await?;
+            sqlx::query(
+                "INSERT INTO ipe_sessions (sid, blob, last_seen, schema_tag) VALUES (?, ?, ?, ?) \
              ON CONFLICT(sid) DO UPDATE SET blob=excluded.blob, \
              last_seen=excluded.last_seen, schema_tag=excluded.schema_tag",
-        )
-        .bind(sid)
-        .bind(blob)
-        .bind(now_secs())
-        .bind(hex::encode(self.schema_tag))
-        .execute(&self.pool)
+            )
+            .bind(sid)
+            .bind(blob)
+            .bind(now_secs())
+            .bind(hex::encode(self.schema_tag))
+            .execute(&mut *held)
+            .await
+        }
         .await;
         self.settle(done)
     }
 
     async fn touch_row(&self, sid: &str) -> Result<(), WriteFault> {
-        let done = sqlx::query("UPDATE ipe_sessions SET last_seen = ? WHERE sid = ?")
-            .bind(now_secs())
-            .bind(sid)
-            .execute(&self.pool)
-            .await;
+        let done = async {
+            let mut held = crate::db::checkout(&self.pool).await?;
+            sqlx::query("UPDATE ipe_sessions SET last_seen = ? WHERE sid = ?")
+                .bind(now_secs())
+                .bind(sid)
+                .execute(&mut *held)
+                .await
+        }
+        .await;
         self.settle(done)
     }
 
     async fn delete_row(&self, sid: &str) -> Result<(), WriteFault> {
-        let done = sqlx::query("DELETE FROM ipe_sessions WHERE sid = ?")
-            .bind(sid)
-            .execute(&self.pool)
-            .await;
+        let done = async {
+            let mut held = crate::db::checkout(&self.pool).await?;
+            sqlx::query("DELETE FROM ipe_sessions WHERE sid = ?")
+                .bind(sid)
+                .execute(&mut *held)
+                .await
+        }
+        .await;
         self.settle(done)
     }
 
     async fn prune_rows(&self) -> Result<(), WriteFault> {
-        let done = sqlx::query("DELETE FROM ipe_sessions WHERE last_seen < ?")
-            .bind(ttl_cutoff(now_secs(), self.ttl))
-            .execute(&self.pool)
-            .await;
+        let done = async {
+            let mut held = crate::db::checkout(&self.pool).await?;
+            sqlx::query("DELETE FROM ipe_sessions WHERE last_seen < ?")
+                .bind(ttl_cutoff(now_secs(), self.ttl))
+                .execute(&mut *held)
+                .await
+        }
+        .await;
         self.settle(done)
     }
 
     /// The persisted blob under `sid`, if its row is within the idle TTL.
     async fn read_row(&self, sid: &str) -> Option<String> {
-        let row = sqlx::query_as::<_, (String,)>(
-            "SELECT blob FROM ipe_sessions WHERE sid = ? AND last_seen >= ?",
-        )
-        .bind(sid)
-        .bind(ttl_cutoff(now_secs(), self.ttl))
-        .fetch_optional(&self.pool)
+        let row = async {
+            let mut held = crate::db::checkout(&self.pool).await?;
+            sqlx::query_as::<_, (String,)>(
+                "SELECT blob FROM ipe_sessions WHERE sid = ? AND last_seen >= ?",
+            )
+            .bind(sid)
+            .bind(ttl_cutoff(now_secs(), self.ttl))
+            .fetch_optional(&mut *held)
+            .await
+        }
         .await
         .map_err(|e| WriteFault::Driver(Self::failure(&e)));
         self.streak
@@ -1888,12 +1912,16 @@ impl<Model, Msg> PostgresStore<Model, Msg> {
                 .into_pool();
         // Pre-existing tables keep their old column set (IF NOT EXISTS) —
         // same fail-closed degradation as SqliteStore::new.
-        sqlx::query(
-            "CREATE TABLE IF NOT EXISTS ipe_sessions (\
-             sid TEXT PRIMARY KEY, blob TEXT NOT NULL, last_seen BIGINT NOT NULL, \
-             schema_tag TEXT NOT NULL)",
-        )
-        .execute(&pool)
+        async {
+            let mut held = crate::db::checkout(&pool).await?;
+            sqlx::query(
+                "CREATE TABLE IF NOT EXISTS ipe_sessions (\
+                 sid TEXT PRIMARY KEY, blob TEXT NOT NULL, last_seen BIGINT NOT NULL, \
+                 schema_tag TEXT NOT NULL)",
+            )
+            .execute(&mut *held)
+            .await
+        }
         .await
         .map_err(|e| StoreOpenError::Schema(Self::failure(&e)))?;
         crate::db::own_pool(crate::db::PoolRole::SessionStore, &pool);
@@ -1925,54 +1953,74 @@ impl<Model, Msg> PostgresStore<Model, Msg> {
     }
 
     async fn write_row(&self, sid: &str, blob: String) -> Result<(), WriteFault> {
-        let done = sqlx::query(
-            "INSERT INTO ipe_sessions (sid, blob, last_seen, schema_tag) \
+        let done = async {
+            let mut held = crate::db::checkout(&self.pool).await?;
+            sqlx::query(
+                "INSERT INTO ipe_sessions (sid, blob, last_seen, schema_tag) \
              VALUES ($1, $2, $3, $4) \
              ON CONFLICT (sid) DO UPDATE SET blob = EXCLUDED.blob, \
              last_seen = EXCLUDED.last_seen, schema_tag = EXCLUDED.schema_tag",
-        )
-        .bind(sid)
-        .bind(blob)
-        .bind(now_secs())
-        .bind(hex::encode(self.schema_tag))
-        .execute(&self.pool)
+            )
+            .bind(sid)
+            .bind(blob)
+            .bind(now_secs())
+            .bind(hex::encode(self.schema_tag))
+            .execute(&mut *held)
+            .await
+        }
         .await;
         self.settle(done)
     }
 
     async fn touch_row(&self, sid: &str) -> Result<(), WriteFault> {
-        let done = sqlx::query("UPDATE ipe_sessions SET last_seen = $1 WHERE sid = $2")
-            .bind(now_secs())
-            .bind(sid)
-            .execute(&self.pool)
-            .await;
+        let done = async {
+            let mut held = crate::db::checkout(&self.pool).await?;
+            sqlx::query("UPDATE ipe_sessions SET last_seen = $1 WHERE sid = $2")
+                .bind(now_secs())
+                .bind(sid)
+                .execute(&mut *held)
+                .await
+        }
+        .await;
         self.settle(done)
     }
 
     async fn delete_row(&self, sid: &str) -> Result<(), WriteFault> {
-        let done = sqlx::query("DELETE FROM ipe_sessions WHERE sid = $1")
-            .bind(sid)
-            .execute(&self.pool)
-            .await;
+        let done = async {
+            let mut held = crate::db::checkout(&self.pool).await?;
+            sqlx::query("DELETE FROM ipe_sessions WHERE sid = $1")
+                .bind(sid)
+                .execute(&mut *held)
+                .await
+        }
+        .await;
         self.settle(done)
     }
 
     async fn prune_rows(&self) -> Result<(), WriteFault> {
-        let done = sqlx::query("DELETE FROM ipe_sessions WHERE last_seen < $1")
-            .bind(ttl_cutoff(now_secs(), self.ttl))
-            .execute(&self.pool)
-            .await;
+        let done = async {
+            let mut held = crate::db::checkout(&self.pool).await?;
+            sqlx::query("DELETE FROM ipe_sessions WHERE last_seen < $1")
+                .bind(ttl_cutoff(now_secs(), self.ttl))
+                .execute(&mut *held)
+                .await
+        }
+        .await;
         self.settle(done)
     }
 
     /// The persisted blob under `sid`, if its row is within the idle TTL.
     async fn read_row(&self, sid: &str) -> Option<String> {
-        let row = sqlx::query_as::<_, (String,)>(
-            "SELECT blob FROM ipe_sessions WHERE sid = $1 AND last_seen >= $2",
-        )
-        .bind(sid)
-        .bind(ttl_cutoff(now_secs(), self.ttl))
-        .fetch_optional(&self.pool)
+        let row = async {
+            let mut held = crate::db::checkout(&self.pool).await?;
+            sqlx::query_as::<_, (String,)>(
+                "SELECT blob FROM ipe_sessions WHERE sid = $1 AND last_seen >= $2",
+            )
+            .bind(sid)
+            .bind(ttl_cutoff(now_secs(), self.ttl))
+            .fetch_optional(&mut *held)
+            .await
+        }
         .await
         .map_err(|e| WriteFault::Driver(Self::failure(&e)));
         self.streak

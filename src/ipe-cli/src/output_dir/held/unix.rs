@@ -100,6 +100,52 @@ pub fn rename(dir: &HeldDir, from: &EntryName, to: &EntryName) -> io::Result<()>
     )?)
 }
 
+/// Rename the entry `from` to the absent name `to`, both in `dir`, never replacing an entry there.
+///
+/// Linux refuses an existing `to` atomically (`RENAME_NOREPLACE`). Elsewhere,
+/// and on a Linux filesystem without the flag, the caller has proven `to`
+/// absent and a plain `renameat` follows: in that window an empty directory
+/// planted at `to` is replaced, and anything else there refuses the rename.
+pub fn rename_noreplace(dir: &HeldDir, from: &EntryName, to: &EntryName) -> io::Result<()> {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    match rustix::fs::renameat_with(
+        dir.handle(),
+        from.as_os_str(),
+        dir.handle(),
+        to.as_os_str(),
+        rustix::fs::RenameFlags::NOREPLACE,
+    ) {
+        Err(rustix::io::Errno::INVAL | rustix::io::Errno::NOSYS) => {}
+        other => return other.map_err(io::Error::from),
+    }
+    rename(dir, from, to)
+}
+
+/// Swap the entries `a` and `b` of `dir` in one atomic step.
+///
+/// `Ok(false)` when the filesystem has no exchange (`RENAME_EXCHANGE`), with
+/// nothing changed.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub fn exchange(dir: &HeldDir, a: &EntryName, b: &EntryName) -> io::Result<bool> {
+    match rustix::fs::renameat_with(
+        dir.handle(),
+        a.as_os_str(),
+        dir.handle(),
+        b.as_os_str(),
+        rustix::fs::RenameFlags::EXCHANGE,
+    ) {
+        Ok(()) => Ok(true),
+        Err(rustix::io::Errno::INVAL | rustix::io::Errno::NOSYS) => Ok(false),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// Swap the entries `a` and `b` of `dir` in one atomic step; this platform has none, so `Ok(false)`.
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+pub const fn exchange(_dir: &HeldDir, _a: &EntryName, _b: &EntryName) -> io::Result<bool> {
+    Ok(false)
+}
+
 /// Unlink the non-directory entry `name` of `dir`; a link is removed, never followed.
 pub fn unlink(dir: &HeldDir, name: &EntryName) -> io::Result<()> {
     Ok(rustix::fs::unlinkat(

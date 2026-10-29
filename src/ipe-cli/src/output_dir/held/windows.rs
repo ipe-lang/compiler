@@ -303,6 +303,27 @@ pub fn rename(dir: &HeldDir, from: &EntryName, to: &EntryName) -> io::Result<()>
     std::fs::rename(from, to)
 }
 
+/// Rename the entry `from` to the absent name `to`, both in `dir`, refusing an entry at `to`.
+///
+/// `to` is proven absent under the pin, then the rename runs. The rename is
+/// `std::fs::rename` (`MoveFileExW` with `MOVEFILE_REPLACE_EXISTING`), the one
+/// rename reachable without `unsafe`, so an entry planted at `to` inside that
+/// window meets the replacing rename: a directory target refuses it, a file
+/// target may be replaced.
+pub fn rename_noreplace(dir: &HeldDir, from: &EntryName, to: &EntryName) -> io::Result<()> {
+    let (from_path, to_path) = (entry_path(dir, from), entry_path(dir, to));
+    let _pin = pin(dir)?;
+    if attributes(dir, to)?.is_some() {
+        return Err(io::ErrorKind::AlreadyExists.into());
+    }
+    std::fs::rename(from_path, to_path)
+}
+
+/// Swap the entries `a` and `b` of `dir` in one atomic step; Windows has none, so `Ok(false)`.
+pub const fn exchange(_dir: &HeldDir, _a: &EntryName, _b: &EntryName) -> io::Result<bool> {
+    Ok(false)
+}
+
 /// Remove the non-directory entry `name` of `dir`; a reparse point is removed as itself.
 ///
 /// A directory junction or directory link is removed as the link it is; a

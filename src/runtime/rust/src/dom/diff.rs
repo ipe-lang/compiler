@@ -5,8 +5,7 @@ use crate::html::{
 use std::borrow::Cow;
 use std::collections::HashMap;
 
-/// A single DOM patch emitted by `diff` (JSON: `id`, `text`, `html`, `attrs`,
-/// `remove`).
+/// A single DOM patch emitted by `diff` (JSON: `id`, `text`, `html`, `attrs`).
 ///
 /// `diff` is in the always-compiled `dom` data path, but `Patch` is serialized
 /// only by the Web SSE wire / the browser-WASM sink — surfaces that imply the
@@ -27,8 +26,6 @@ pub struct Patch {
     /// wire a removal is JSON `null`, a set is a string.
     #[cfg_attr(feature = "serde", serde(skip_serializing_if = "HashMap::is_empty"))]
     pub attrs: HashMap<String, Option<String>>,
-    #[cfg_attr(feature = "serde", serde(skip_serializing_if = "std::ops::Not::not"))]
-    pub remove: bool,
 }
 
 impl Patch {
@@ -38,7 +35,6 @@ impl Patch {
             text: None,
             html: None,
             attrs: HashMap::new(),
-            remove: false,
         }
     }
 }
@@ -791,7 +787,6 @@ mod tests {
             text: None,
             html: None,
             attrs: HashMap::new(),
-            remove: false,
         };
         diff_attrs::<()>(
             ParseContext::Data,

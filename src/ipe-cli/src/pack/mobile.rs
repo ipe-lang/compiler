@@ -24,12 +24,15 @@
 //! module never fakes a mobile toolchain invocation.
 
 use std::collections::BTreeSet;
-use std::num::{NonZeroU32, NonZeroUsize};
+use std::num::{NonZeroU32, NonZeroU64, NonZeroUsize};
 use std::path::{Path, PathBuf};
 
-use ipe_fs_open::{EntryCap, EntryName, FileId, FileKind, HeldDir, OpenRefusal};
+use ipe_fs_open::{ByteCap, EntryCap, EntryName, FileId, FileKind, HeldDir, OpenRefusal};
 use ipe_ir::{Capability, WebCapability};
-use ipe_runtime_rust::encoding::{MountBase, ServerOrigins};
+use ipe_runtime_rust::csp::{
+    self, BundleHost, BundleReach, BundleWorker, ContentSecurityPolicy, ReachRefusal,
+};
+use ipe_runtime_rust::encoding::{MountBase, ServerOrigin};
 use ipe_runtime_rust::js_port_glue::native_bridge;
 
 use crate::CliError;
@@ -191,6 +194,20 @@ pub enum MobileRefusal {
     /// The project accepts push but names no `delivery.mobile.push`, so the
     /// shell has no identifiers to register with.
     PushUnconfigured,
+    /// `delivery.servers` names the Android shell's local asset host, so the
+    /// local origin and that server would be one origin to the shell.
+    AssetOriginListed {
+        /// The refused server origin.
+        origin: ServerOrigin,
+    },
+}
+
+impl From<ReachRefusal> for MobileRefusal {
+    fn from(refusal: ReachRefusal) -> Self {
+        match refusal {
+            ReachRefusal::LocalOriginListed { origin } => Self::AssetOriginListed { origin },
+        }
+    }
 }
 
 impl std::fmt::Display for MobileRefusal {
@@ -235,6 +252,9 @@ impl std::fmt::Display for MobileRefusal {
                  client identifiers: set `delivery.mobile.push = {{ apns = Production, fcm = \
                  {{ projectId, applicationId, apiKey, senderId }} }}`."
             ),
+            Self::AssetOriginListed { origin } => {
+                f.write_str(&text::mobile_asset_origin_listed(&origin.https()))
+            }
         }
     }
 }
@@ -252,8 +272,9 @@ pub struct ManifestPin {
     /// `delivery.browser.basePath`: the mount path the bundle's URLs and the
     /// shell's handlers name.
     base: MountBase,
-    /// `delivery.servers`: the origins the bundle may reach besides its own.
-    servers: ServerOrigins,
+    /// `delivery.servers`: the origins the bundle may reach besides its own,
+    /// read only as a [`BundleReach`].
+    servers: PinnedServers,
     /// `delivery.mobile.push`: the identifiers the shell registers for push
     /// with; its `Debug` never prints an identifier.
     push: Option<PushDelivery>,
@@ -268,7 +289,7 @@ impl ManifestPin {
     pub fn of(manifest: &ProjectManifest) -> Self {
         Self {
             base: manifest.delivery.browser.base.clone(),
-            servers: manifest.delivery.servers.clone(),
+            servers: PinnedServers::new(manifest.delivery.servers.clone()),
             push: manifest.delivery.mobile.push.clone(),
             accepts: manifest.capabilities_accept.clone(),
         }
@@ -286,10 +307,38 @@ impl ManifestPin {
         &self.accepts
     }
 
-    /// The origins the shell lets the bundle reach besides its own.
-    #[must_use]
-    pub const fn servers(&self) -> &ServerOrigins {
-        &self.servers
+    /// What a bundle on `host` laid out from this pin may reach: the one input
+    /// to every confinement list a shell renders.
+    ///
+    /// # Errors
+    /// [`MobileRefusal::AssetOriginListed`] when `host` is
+    /// [`BundleHost::AndroidAssets`] and `delivery.servers` names its asset host.
+    pub fn reach(&self, host: BundleHost) -> Result<BundleReach<'_>, MobileRefusal> {
+        Ok(self.servers.reach(host)?)
+    }
+
+    /// The bundle policies the wasm build may have rendered for this pin.
+    ///
+    /// The build's worker follows the capabilities the program reaches, which
+    /// the consent gate holds within the accepted ones, so a push worker is
+    /// admitted only when push is accepted. The pack never sees the reached
+    /// set, so an accepted push the program does not reach still admits the
+    /// worker-free page; the Android header then carries `worker-src 'self'`
+    /// where that page falls back to `script-src 'self'`, which admits the
+    /// same scripts, and `connect-src` is identical for both workers.
+    fn served_policies(&self) -> Vec<(BundleWorker, String)> {
+        let reach = self.servers.served();
+        let push = self
+            .accepts
+            .contains(&Capability::JsPort(WebCapability::Push));
+        [BundleWorker::None, BundleWorker::Push]
+            .into_iter()
+            .filter(|worker| push || *worker == BundleWorker::None)
+            .map(|worker| {
+                let meta = ContentSecurityPolicy::for_bundle(&reach, worker).meta_element();
+                (worker, meta)
+            })
+            .collect()
     }
 
     /// The push identifiers the shell registers with, when the manifest names them.
@@ -333,6 +382,50 @@ impl ManifestPin {
         }
     }
 }
+
+mod pinned_servers {
+    use ipe_runtime_rust::csp::{BundleHost, BundleReach, ReachRefusal};
+    use ipe_runtime_rust::encoding::ServerOrigins;
+
+    /// A pin's `delivery.servers`, readable only as a [`BundleReach`].
+    ///
+    /// Its origins are private to this module, so every confinement list a
+    /// shell renders is derived from one reach, never from the origins read
+    /// again beside it.
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub struct PinnedServers(ServerOrigins);
+
+    impl PinnedServers {
+        /// Pin `origins`.
+        #[must_use]
+        pub const fn new(origins: ServerOrigins) -> Self {
+            Self(origins)
+        }
+
+        /// What a bundle on `host` may reach.
+        ///
+        /// # Errors
+        /// The refusal of a server `host` answers locally.
+        pub fn reach(&self, host: BundleHost) -> Result<BundleReach<'_>, ReachRefusal> {
+            BundleReach::new(host, &self.0)
+        }
+
+        /// What the bundle a web server serves may reach.
+        #[must_use]
+        pub const fn served(&self) -> BundleReach<'_> {
+            BundleReach::served(&self.0)
+        }
+
+        /// The pinned origins, for a test to render what the wasm build renders.
+        #[cfg(test)]
+        #[must_use]
+        pub const fn origins(&self) -> &ServerOrigins {
+            &self.0
+        }
+    }
+}
+
+use pinned_servers::PinnedServers;
 
 /// One field of a [`ManifestPin`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -507,8 +600,19 @@ impl SpaRoot {
     /// [`BundleError::Replaced`] when `www/` is gone or now names another
     /// object; [`BundleError::Io`] when it cannot be opened or identified.
     pub fn verify_unreplaced(&self) -> Result<(), BundleError> {
-        match open_www(&self.path).and_then(|dir| dir.id()) {
-            Ok(id) if id == self.id => Ok(()),
+        self.hold().map(drop)
+    }
+
+    /// Hold `www/`, proven to be the directory the bundle was collected from.
+    ///
+    /// Every asset is read through the returned handle, so an entry swapped
+    /// for a link after the walk is refused rather than followed.
+    ///
+    /// # Errors
+    /// As [`SpaRoot::verify_unreplaced`].
+    fn hold(&self) -> Result<HeldDir, BundleError> {
+        match open_www(&self.path).and_then(|dir| dir.id().map(|id| (dir, id))) {
+            Ok((dir, id)) if id == self.id => Ok(dir),
             Ok(_) | Err(OpenRefusal::Absent | OpenRefusal::Link | OpenRefusal::NotRegular(_)) => {
                 Err(BundleError::Replaced {
                     path: self.path.clone(),
@@ -521,9 +625,20 @@ impl SpaRoot {
         }
     }
 
-    /// The path of `asset` below this root, joined from its entry names.
-    fn source_of(&self, asset: &AssetPath) -> PathBuf {
+    /// The path of `asset` below this root, joined from its entry names; for
+    /// messages only, never reopened.
+    fn shown(&self, asset: &AssetPath) -> PathBuf {
         joined(&self.path, asset.segments())
+    }
+
+    /// The bytes of `asset`, read through `www`, the handle [`SpaRoot::hold`]
+    /// proved, without following a link at any level.
+    ///
+    /// # Errors
+    /// The refusal met opening or reading it; [`OpenRefusal::TooLarge`] past `cap`.
+    fn read(www: &HeldDir, asset: &AssetPath, cap: ByteCap) -> Result<Vec<u8>, OpenRefusal> {
+        www.open_rel(asset.segments())
+            .and_then(|file| file.read_bytes(cap))
     }
 }
 
@@ -727,32 +842,38 @@ impl AssetWalk<'_> {
     /// An entry that turned into a link or another kind between its listing
     /// and its open is refused as that kind, never followed or skipped.
     fn refused(&self, path: PathBuf, refusal: OpenRefusal) -> BundleError {
-        match refusal {
-            OpenRefusal::Link => BundleError::UnplaceableAsset {
-                path,
-                reason: AssetRefusal::Kind(FileKind::Symlink),
-            },
-            OpenRefusal::NotRegular(kind) => BundleError::UnplaceableAsset {
-                path,
-                reason: AssetRefusal::Kind(kind),
-            },
-            OpenRefusal::BadName => BundleError::UnplaceableAsset {
-                path,
-                reason: AssetRefusal::BadName,
-            },
-            OpenRefusal::TooManyEntries(_) => BundleError::TooManyAssets {
-                limit: self.limits.entries,
-            },
-            OpenRefusal::Absent
-            | OpenRefusal::Denied
-            | OpenRefusal::InUse
-            | OpenRefusal::TooLarge(_)
-            | OpenRefusal::NotUtf8
-            | OpenRefusal::Io(_) => BundleError::Io {
-                path,
-                source: refusal.into_io(),
-            },
-        }
+        bundle_refusal(path, refusal, self.limits.entries)
+    }
+}
+
+/// The bundle error for `refusal` met at `path`, under an entry budget of `entries`.
+///
+/// An entry that turned into a link or another kind between its listing and
+/// its open is refused as that kind, never followed or skipped.
+fn bundle_refusal(path: PathBuf, refusal: OpenRefusal, entries: NonZeroU32) -> BundleError {
+    match refusal {
+        OpenRefusal::Link => BundleError::UnplaceableAsset {
+            path,
+            reason: AssetRefusal::Kind(FileKind::Symlink),
+        },
+        OpenRefusal::NotRegular(kind) => BundleError::UnplaceableAsset {
+            path,
+            reason: AssetRefusal::Kind(kind),
+        },
+        OpenRefusal::BadName => BundleError::UnplaceableAsset {
+            path,
+            reason: AssetRefusal::BadName,
+        },
+        OpenRefusal::TooManyEntries(_) => BundleError::TooManyAssets { limit: entries },
+        OpenRefusal::Absent
+        | OpenRefusal::Denied
+        | OpenRefusal::InUse
+        | OpenRefusal::TooLarge(_)
+        | OpenRefusal::NotUtf8
+        | OpenRefusal::Io(_) => BundleError::Io {
+            path,
+            source: refusal.into_io(),
+        },
     }
 }
 
@@ -824,6 +945,19 @@ pub enum BundleError {
         /// The `www/` path.
         path: PathBuf,
     },
+    /// The bundle's `index.html` does not carry exactly one policy meta the
+    /// wasm build renders for the pinned servers and capabilities.
+    PolicyMismatch {
+        /// The `index.html` path, for the message only.
+        path: PathBuf,
+    },
+    /// The bundle's `index.html` is larger than the pack reads.
+    IndexTooLarge {
+        /// The `index.html` path, for the message only.
+        path: PathBuf,
+        /// The most bytes the pack reads.
+        cap: u64,
+    },
     /// A filesystem error while walking the `www/` tree.
     Io {
         /// The path the walk failed on.
@@ -845,6 +979,12 @@ impl std::fmt::Display for BundleError {
             }
             Self::TooManyAssets { limit } => text::mobile_bundle_too_many(limit),
             Self::Replaced { path } => text::mobile_bundle_replaced(&EscapedPath(path)),
+            Self::PolicyMismatch { path } => {
+                text::mobile_bundle_policy_mismatch(&EscapedPath(path))
+            }
+            Self::IndexTooLarge { path, cap } => {
+                text::mobile_bundle_index_too_large(&EscapedPath(path), cap)
+            }
             Self::Io { path, source } => text::mobile_bundle_io(&EscapedPath(path), source),
         };
         f.write_str(&message)
@@ -861,8 +1001,122 @@ pub enum ShellContent {
     Generated(String),
     /// Copy the bundled SPA asset at this path below the emitted `www/` tree.
     Asset(AssetPath),
+    /// Copy the bundle's `index.html` with its policy meta swapped for the
+    /// shell host's.
+    ///
+    /// The copy holds exactly one policy meta the wasm build may have rendered
+    /// for the pin, replaced by the shell host's form of the same policy; any
+    /// other content is refused, never copied.
+    PolicedIndex {
+        /// The `index.html` asset.
+        asset: AssetPath,
+        /// Each policy meta the build may have rendered, with its host form.
+        swaps: Vec<PolicySwap>,
+    },
     /// Copy the rendered app icon here from the source icon.
     Icon,
+}
+
+/// One bundle policy meta and its shell-host form, for one worker choice.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PolicySwap {
+    /// The meta the wasm build renders for a web server.
+    served: String,
+    /// The same policy rendered for the shell's host.
+    hosted: String,
+}
+
+/// The most bytes of a bundle's `index.html` the pack reads.
+///
+/// The emitted page is under 2 KiB, so a larger file is refused unread.
+pub const MAX_INDEX_HTML_BYTES: u64 = 64 * 1024;
+
+/// [`MAX_INDEX_HTML_BYTES`] as the cap a held read takes.
+const INDEX_HTML_CAP: ByteCap =
+    ByteCap::from_nonzero(NonZeroU64::MIN.saturating_add(MAX_INDEX_HTML_BYTES.saturating_sub(1)));
+
+/// The most bytes of any one bundled asset the pack reads.
+///
+/// An emitted bundle's largest asset, its wasm module, stays far below this;
+/// a larger file is refused before it is read.
+pub const MAX_ASSET_BYTES: u64 = 256 * 1024 * 1024;
+
+/// [`MAX_ASSET_BYTES`] as the cap a held read takes.
+const ASSET_CAP: ByteCap =
+    ByteCap::from_nonzero(NonZeroU64::MIN.saturating_add(MAX_ASSET_BYTES.saturating_sub(1)));
+
+/// How a bundled asset at `asset` is laid out for a shell whose bundle has
+/// `reach`.
+///
+/// The top-level `index.html` is policed; every other asset is copied.
+fn bundle_content(asset: &AssetPath, pin: &ManifestPin, reach: &BundleReach<'_>) -> ShellContent {
+    if !asset.is_index_html() {
+        return ShellContent::Asset(asset.clone());
+    }
+    let swaps = pin
+        .served_policies()
+        .into_iter()
+        .map(|(worker, served)| PolicySwap {
+            served,
+            hosted: ContentSecurityPolicy::for_bundle(reach, worker).meta_element(),
+        })
+        .collect();
+    ShellContent::PolicedIndex {
+        asset: asset.clone(),
+        swaps,
+    }
+}
+
+/// The `index.html` asset `asset`, read through `www`, with its one policy
+/// meta swapped.
+///
+/// # Errors
+/// [`BundleError::IndexTooLarge`] past [`MAX_INDEX_HTML_BYTES`];
+/// [`BundleError::PolicyMismatch`] when the page is not UTF-8, or does not
+/// hold exactly one meta of exactly one of `swaps`; the refusal of a link,
+/// another kind of entry, or a read failure met on the way.
+fn policed_index(
+    spa: &SpaRoot,
+    www: &HeldDir,
+    asset: &AssetPath,
+    swaps: &[PolicySwap],
+) -> Result<String, BundleError> {
+    let shown = spa.shown(asset);
+    let bytes = match SpaRoot::read(www, asset, INDEX_HTML_CAP) {
+        Ok(bytes) => bytes,
+        Err(OpenRefusal::TooLarge(_)) => {
+            return Err(BundleError::IndexTooLarge {
+                path: shown,
+                cap: MAX_INDEX_HTML_BYTES,
+            });
+        }
+        Err(refusal) => return Err(bundle_refusal(shown, refusal, MAX_ASSETS)),
+    };
+    swapped_policy(&shown, bytes, swaps)
+}
+
+/// `bytes`, the page at `shown`, with its one policy meta swapped.
+///
+/// # Errors
+/// [`BundleError::PolicyMismatch`] when the page is not UTF-8, or does not
+/// hold exactly one meta of exactly one of `swaps`.
+fn swapped_policy(
+    shown: &Path,
+    bytes: Vec<u8>,
+    swaps: &[PolicySwap],
+) -> Result<String, BundleError> {
+    let mismatch = || BundleError::PolicyMismatch {
+        path: shown.to_path_buf(),
+    };
+    let page = String::from_utf8(bytes).map_err(|_| mismatch())?;
+    let mut held = swaps.iter().filter(|swap| page.contains(&swap.served));
+    let (Some(swap), None) = (held.next(), held.next()) else {
+        return Err(mismatch());
+    };
+    if page.matches(&swap.served).nth(1).is_some() {
+        return Err(mismatch());
+    }
+    Ok(page.replacen(&swap.served, &swap.hosted, 1))
 }
 
 /// One file the native shell project lays down: its project-relative path and
@@ -924,7 +1178,8 @@ impl ShellLayout {
 /// # Errors
 /// Propagates any error from the permission derivation, and refuses an Android
 /// shell that serves push when the pin names no push identifiers
-/// ([`MobileRefusal::PushUnconfigured`]).
+/// ([`MobileRefusal::PushUnconfigured`]) or whose `delivery.servers` names its
+/// local asset host ([`MobileRefusal::AssetOriginListed`]).
 pub fn layout(
     os: MobileOs,
     profile: BundleProfile,
@@ -935,7 +1190,7 @@ pub fn layout(
 ) -> Result<ShellLayout, super::super::CliError> {
     match os {
         MobileOs::Android => android_layout(profile, identity, pin, bundle, icon),
-        MobileOs::Ios => ios_layout(identity, pin.accepts(), bundle, icon, pin.base()),
+        MobileOs::Ios => ios_layout(identity, pin, bundle, icon),
     }
 }
 
@@ -1174,6 +1429,8 @@ struct AndroidPlan<'a> {
     identity: &'a super::desktop::BundleIdentity,
     /// The manifest pin the shell is laid out from.
     pin: &'a ManifestPin,
+    /// What the bundle may reach: the one input to every confinement list.
+    reach: BundleReach<'a>,
     /// The OS permissions the accepted capabilities derive.
     permissions: permissions::PermissionSet,
     /// The request groups the manifest declares in full.
@@ -1192,6 +1449,9 @@ impl<'a> AndroidPlan<'a> {
         identity: &'a super::desktop::BundleIdentity,
         pin: &'a ManifestPin,
     ) -> Result<Self, super::super::CliError> {
+        let reach = pin
+            .reach(BundleHost::AndroidAssets)
+            .map_err(|refusal| CliError::Usage(text::Message::relay(&refusal)))?;
         let accepts = pin.accepts();
         let permissions = permissions::derive_permissions(accepts, Platform::Android)?;
         let groups = permissions.android_runtime_request_groups();
@@ -1218,6 +1478,7 @@ impl<'a> AndroidPlan<'a> {
             package: android_package_id(identity),
             identity,
             pin,
+            reach,
             permissions,
             groups,
             facilities,
@@ -1229,6 +1490,16 @@ impl<'a> AndroidPlan<'a> {
     /// Whether the shell serves `facility`.
     fn serves(&self, facility: ChromeFacility) -> bool {
         self.facilities.contains(&facility)
+    }
+
+    /// The policy every response the shell builds carries as a header.
+    fn policy(&self) -> ContentSecurityPolicy<'a> {
+        let worker = if self.push.is_some() {
+            BundleWorker::Push
+        } else {
+            BundleWorker::None
+        };
+        ContentSecurityPolicy::for_bundle(&self.reach, worker)
     }
 }
 
@@ -1293,7 +1564,7 @@ fn android_layout(
     for asset in &bundle.assets {
         files.push(ShellFile {
             rel_path: format!("app/src/main/assets/www/{}", asset.path.to_shell_rel()),
-            content: ShellContent::Asset(asset.path.clone()),
+            content: bundle_content(&asset.path, pin, &plan.reach),
         });
     }
 
@@ -1484,17 +1755,22 @@ fn render_shell_identity(out: &mut String, plan: &AndroidPlan<'_>) {
             .map_or(0, u32::from)
             .to_string(),
     );
-    java_string(out, "LOCAL_ORIGIN", ANDROID_ASSET_ORIGIN);
+    java_string(out, "LOCAL_ORIGIN", csp::ANDROID_ASSET_ORIGIN);
     java_const(
         out,
         "String[]",
         "ALLOWED_ORIGINS",
         &java_array(
-            plan.pin
-                .servers()
-                .origins()
+            plan.reach
+                .network_origins()
                 .map(|origin| JavaStringLiteral::of(&origin.https()).to_string()),
         ),
+    );
+    java_string(out, "CSP_HEADER", csp::HEADER_NAME);
+    java_string(
+        out,
+        "CONTENT_SECURITY_POLICY",
+        &plan.policy().header_value(),
     );
     java_string(out, "BLOCKED_HEADER", BLOCKED_HEADER.0);
     java_string(out, "BLOCKED_ORIGIN", BLOCKED_HEADER.1);
@@ -1673,7 +1949,7 @@ const ANDROID_PUSH_XML: &str = r#"        <meta-data
 /// lines (from the permission derivation, never authored here) into a fixed
 /// application element.
 ///
-/// `INTERNET` is declared only when `delivery.servers` lists an origin, the
+/// `INTERNET` is declared only when the bundle reaches a server origin, the
 /// capture file provider only for the capture facility, and the push service
 /// only when the shell serves push.
 fn render_android_manifest(plan: &AndroidPlan<'_>, icon: bool) -> String {
@@ -1690,7 +1966,7 @@ fn render_android_manifest(plan: &AndroidPlan<'_>, icon: bool) -> String {
         // table, never user text.
         let _ = writeln!(out, "    {line}");
     }
-    if !plan.pin.servers().is_empty() {
+    if plan.reach.network_origins().next().is_some() {
         out.push_str("    <uses-permission android:name=\"android.permission.INTERNET\" />\n");
     }
     out.push_str("    <application\n");
@@ -1841,15 +2117,12 @@ fn render_android_build_gradle(plan: &AndroidPlan<'_>) -> String {
     )
 }
 
-/// The local origin a `WebViewAssetLoader` serves on; it never leaves the device.
-const ANDROID_ASSET_ORIGIN: &str = "https://appassets.androidplatform.net";
-
-/// The URL the Android shell opens: [`ANDROID_ASSET_ORIGIN`] plus `base`'s
-/// [`MountBase::dir_url`].
+/// The URL the Android shell opens: [`csp::ANDROID_ASSET_ORIGIN`] plus
+/// `base`'s [`MountBase::dir_url`].
 fn android_entry_url(base: &MountBase) -> String {
     let dir = base.dir_url();
-    let mut url = String::with_capacity(ANDROID_ASSET_ORIGIN.len().saturating_add(dir.len()));
-    url.push_str(ANDROID_ASSET_ORIGIN);
+    let mut url = String::with_capacity(csp::ANDROID_ASSET_ORIGIN.len().saturating_add(dir.len()));
+    url.push_str(csp::ANDROID_ASSET_ORIGIN);
     url.push_str(&dir);
     url
 }
@@ -1862,7 +2135,9 @@ fn android_entry_url(base: &MountBase) -> String {
 /// and an empty, `.` or `..` segment. A local request the loader leaves
 /// unmapped answers a local 404, a request to an origin of `Shell.ALLOWED_ORIGINS`
 /// goes to the network unless it is the main frame, and any other answers a
-/// local 403; the page and its service workers share that one `answer`. A
+/// local 403; the page and its service workers share that one `answer`. Every
+/// response the shell builds is made by one `confined`, which sets the bundle
+/// policy header. A
 /// permission is
 /// asked only when a page asks for the facility it backs, and a media request
 /// is granted only the resources an accepted axis covers.
@@ -1898,10 +2173,13 @@ import androidx.webkit.WebViewAssetLoader;
 import java.io.ByteArrayInputStream;
 import java.io.File;
 import java.io.IOException;
+import java.io.InputStream;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Locale;
+import java.util.Map;
 
 public final class MainActivity extends Activity {
     /** The directory the bundle is served at: the manifest's mount base. */
@@ -1934,16 +2212,74 @@ public final class MainActivity extends Activity {
         }
     }
 
+    /**
+     * The one constructor of every response the shell builds: it drops any
+     * policy header in headers, and any header with no name or value, and sets
+     * the bundle policy in its place. A status and reason the constructor
+     * would throw on read 200 OK.
+     */
+    private static WebResourceResponse confined(String mime, String encoding, int status,
+            String reason, Map<String, String> headers, InputStream data) {
+        Map<String, String> policed = new HashMap<>();
+        if (headers != null) {
+            for (Map.Entry<String, String> header : headers.entrySet()) {
+                String name = header.getKey();
+                String value = header.getValue();
+                if (name != null && value != null && !Shell.CSP_HEADER.equalsIgnoreCase(name)) {
+                    policed.put(name, value);
+                }
+            }
+        }
+        policed.put(Shell.CSP_HEADER, Shell.CONTENT_SECURITY_POLICY);
+        if (!settable(status, reason)) {
+            status = 200;
+            reason = "OK";
+        }
+        return new WebResourceResponse(mime, encoding, status, reason, policed, data);
+    }
+
+    /**
+     * Whether the response constructor takes status and reason: a status in
+     * 100..299 or 400..599 and a reason of printable ASCII that is not blank.
+     */
+    private static boolean settable(int status, String reason) {
+        if (status < 100 || status > 599 || (status >= 300 && status <= 399)) {
+            return false;
+        }
+        if (reason == null || reason.trim().isEmpty()) {
+            return false;
+        }
+        for (int i = 0; i < reason.length(); i++) {
+            char c = reason.charAt(i);
+            if (c < 0x20 || c > 0x7E) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /**
+     * The answer to a local request: the bundle file the loader mapped, rebuilt
+     * through confined, or a local 404 when it mapped none.
+     */
+    private static WebResourceResponse local(WebResourceResponse mapped) {
+        if (mapped == null || mapped.getData() == null) {
+            return localNotFound();
+        }
+        return confined(mapped.getMimeType(), mapped.getEncoding(), mapped.getStatusCode(),
+                mapped.getReasonPhrase(), mapped.getResponseHeaders(), mapped.getData());
+    }
+
     /** The answer to every local request the loader leaves unmapped: a local 404. */
     private static WebResourceResponse localNotFound() {
-        return new WebResourceResponse("text/plain", "utf-8", 404, "Not Found",
+        return confined("text/plain", "utf-8", 404, "Not Found",
                 Collections.<String, String>emptyMap(),
                 new ByteArrayInputStream(new byte[0]));
     }
 
     /** The answer to a request for an origin outside delivery.servers: a local 403. */
     private static WebResourceResponse blocked() {
-        return new WebResourceResponse("text/plain", "utf-8", 403, "Forbidden",
+        return confined("text/plain", "utf-8", 403, "Forbidden",
                 Collections.singletonMap(Shell.BLOCKED_HEADER, Shell.BLOCKED_ORIGIN),
                 new ByteArrayInputStream(new byte[0]));
     }
@@ -1983,8 +2319,7 @@ public final class MainActivity extends Activity {
     static WebResourceResponse answer(WebViewAssetLoader loader, Uri url, boolean mainFrame) {
         String origin = originOf(url);
         if (Shell.LOCAL_ORIGIN.equals(origin)) {
-            WebResourceResponse mapped = loader.shouldInterceptRequest(url);
-            return mapped != null ? mapped : localNotFound();
+            return local(loader.shouldInterceptRequest(url));
         }
         return !mainFrame && isAllowed(origin) ? null : blocked();
     }
@@ -3572,6 +3907,9 @@ fn android_readme(root_name: &str, profile: BundleProfile, base: &MountBase) -> 
          - a request to an origin listed in delivery.servers goes to the network,\n\
          \x20 except as the page itself;\n\
          - any other request is answered by a local 403 carrying {header}: {value}.\n\
+         Every response the shell builds carries a {csp_header} header, and the\n\
+         bundle's own policy meta is rewritten to the same connect-src: exactly\n\
+         {local} plus the https and wss forms of each delivery.servers origin.\n\
          The <uses-permission> lines in AndroidManifest.xml are derived from the app's\n\
          accepted web capabilities — never hand-authored — and each is asked only\n\
          when the page first uses the facility it backs.\n\
@@ -3596,6 +3934,8 @@ fn android_readme(root_name: &str, profile: BundleProfile, base: &MountBase) -> 
         entry = android_entry_url(base),
         header = BLOCKED_HEADER.0,
         value = BLOCKED_HEADER.1,
+        csp_header = csp::HEADER_NAME,
+        local = csp::ANDROID_ASSET_ORIGIN,
     )
 }
 
@@ -3611,11 +3951,15 @@ fn android_readme(root_name: &str, profile: BundleProfile, base: &MountBase) -> 
 /// permission derivation.
 fn ios_layout(
     identity: &super::desktop::BundleIdentity,
-    accepts: &BTreeSet<Capability>,
+    pin: &ManifestPin,
     bundle: &SpaBundle,
     icon: Option<&Path>,
-    base: &MountBase,
 ) -> Result<ShellLayout, super::super::CliError> {
+    let accepts = pin.accepts();
+    let base = pin.base();
+    let reach = pin
+        .reach(BundleHost::IosScheme)
+        .map_err(|refusal| CliError::Usage(text::Message::relay(&refusal)))?;
     let slug = app_slug(&identity.name);
     let root_name = format!("{slug}-ios");
     let mut files = Vec::new();
@@ -3641,7 +3985,7 @@ fn ios_layout(
     for asset in &bundle.assets {
         files.push(ShellFile {
             rel_path: format!("App/www/{}", asset.path.to_shell_rel()),
-            content: ShellContent::Asset(asset.path.clone()),
+            content: bundle_content(&asset.path, pin, &reach),
         });
     }
 
@@ -3703,15 +4047,12 @@ fn render_ios_info_plist(
     ))
 }
 
-/// The custom-scheme origin the iOS shell serves on; it never leaves the device.
-const IOS_SCHEME_ORIGIN: &str = "ipe-app://app";
-
-/// The URL the iOS shell opens: [`IOS_SCHEME_ORIGIN`] plus `base`'s
+/// The URL the iOS shell opens: [`csp::IOS_SCHEME_ORIGIN`] plus `base`'s
 /// [`MountBase::dir_url`].
 fn ios_entry_url(base: &MountBase) -> String {
     let dir = base.dir_url();
-    let mut url = String::with_capacity(IOS_SCHEME_ORIGIN.len().saturating_add(dir.len()));
-    url.push_str(IOS_SCHEME_ORIGIN);
+    let mut url = String::with_capacity(csp::IOS_SCHEME_ORIGIN.len().saturating_add(dir.len()));
+    url.push_str(csp::IOS_SCHEME_ORIGIN);
     url.push_str(&dir);
     url
 }
@@ -4001,9 +4342,12 @@ impl std::fmt::Display for SwiftStringLiteral {
 
 /// Materialise `layout` as the shell `dist/<root_name>` inside the owned `dist`.
 ///
-/// Generated files are written verbatim, bundled SPA assets and the source icon
-/// are copied into place. A fresh, deterministic tree: an existing shell directory
-/// of the same name is removed first so a re-pack never leaves stale files behind.
+/// Generated files are written verbatim, bundled SPA assets are read through
+/// the held `www/` and written, and the source icon is copied into place. The
+/// shell is built whole in a staging directory beside `dist/<root_name>` and
+/// put there in one rename ([`OwnedDir::stage_dir`]): a fresh, deterministic
+/// tree that replaces the previous shell only once complete, so a refusal at
+/// any file leaves the previous shell exactly as it was, and no staging entry.
 /// Every path is a [`crate::output_dir::OwnedPath`], so a symlink planted in the
 /// owned `dist` is refused — never removed through, written through, or copied
 /// onto.
@@ -4012,34 +4356,73 @@ impl std::fmt::Display for SwiftStringLiteral {
 /// [`CliError::Usage`] carrying [`BundleError::Replaced`] when the emitted
 /// `www/` is no longer the directory the bundle was collected from;
 /// [`CliError::OutputRefused`] for a symlink or non-plain name on the way;
+/// [`CliError::Usage`] carrying [`BundleError::PolicyMismatch`] or
+/// [`BundleError::IndexTooLarge`] when the bundle's `index.html` cannot be
+/// policed, before any shell file is written;
+/// [`CliError::Usage`] carrying [`BundleError::UnplaceableAsset`] for an asset
+/// that is no longer a regular file below the held `www/` (a link, a FIFO),
+/// or [`BundleError::Io`] for one past [`MAX_ASSET_BYTES`], never read;
 /// [`CliError::Io`] naming the exact path on any filesystem failure.
 pub fn materialise(
     layout: &ShellLayout,
     icon: Option<&Path>,
     dist: &OwnedDir,
 ) -> Result<PathBuf, CliError> {
-    layout
-        .spa
-        .verify_unreplaced()
-        .map_err(|e| CliError::Usage(crate::text::Message::relay(&e)))?;
-    let root = dist.path_to(&layout.root_name)?;
-    root.remove()?;
-    root.ensure_dir()?;
+    let refused = |e: BundleError| CliError::Usage(crate::text::Message::relay(&e));
+    // Every asset is read through this one held `www/`, proven to be the
+    // directory collected, never reopened by path.
+    let www = layout.spa.hold().map_err(refused)?;
+    // Every policed page is read and proven before the shell directory is
+    // touched, so a refusal lays nothing down.
+    let laid = layout
+        .files
+        .iter()
+        .map(|file| -> Result<_, BundleError> {
+            let bytes = match &file.content {
+                ShellContent::Generated(text) => Laid::Text(text),
+                ShellContent::Asset(asset) => Laid::Copy(asset),
+                ShellContent::PolicedIndex { asset, swaps } => {
+                    Laid::Policed(policed_index(&layout.spa, &www, asset, swaps)?)
+                }
+                ShellContent::Icon => Laid::Icon,
+            };
+            Ok((file, bytes))
+        })
+        .collect::<Result<Vec<_>, BundleError>>()
+        .map_err(refused)?;
+    let staged = dist.stage_dir(&layout.root_name)?;
 
-    for file in &layout.files {
-        let out_file =
-            dist.path_to(Path::new(&layout.root_name).join(rel_to_native(&file.rel_path)))?;
-        match &file.content {
-            ShellContent::Generated(text) => out_file.write(text.as_bytes())?,
-            ShellContent::Asset(asset) => out_file.copy_from(&layout.spa.source_of(asset))?,
-            ShellContent::Icon => {
+    for (file, bytes) in laid {
+        let out_file = staged.path_to(rel_to_native(&file.rel_path))?;
+        match bytes {
+            Laid::Text(text) => out_file.write(text.as_bytes())?,
+            Laid::Policed(page) => out_file.write(page.as_bytes())?,
+            Laid::Copy(asset) => {
+                let copied = SpaRoot::read(&www, asset, ASSET_CAP).map_err(|refusal| {
+                    refused(bundle_refusal(layout.spa.shown(asset), refusal, MAX_ASSETS))
+                })?;
+                out_file.write(&copied)?;
+            }
+            Laid::Icon => {
                 if let Some(src) = icon {
                     out_file.copy_from(src)?;
                 }
             }
         }
     }
-    Ok(root.path())
+    staged.promote()
+}
+
+/// The bytes one shell file is laid down with, read before any is written.
+enum Laid<'layout> {
+    /// Generated text, written verbatim.
+    Text(&'layout str),
+    /// A bundle asset, read through the held `www/` as it is written.
+    Copy(&'layout AssetPath),
+    /// A policed `index.html`, already read and proven.
+    Policed(String),
+    /// The source icon, copied when given.
+    Icon,
 }
 
 /// Translate a shell-relative `/`-separated path into a native `PathBuf`.
@@ -4050,6 +4433,8 @@ fn rel_to_native(rel: &str) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::output_dir::test_links::{staging_leftovers, tree_snapshot};
+    use ipe_runtime_rust::encoding::ServerOrigins;
 
     fn accepts(items: &[Capability]) -> BTreeSet<Capability> {
         items.iter().copied().collect()
@@ -4926,7 +5311,11 @@ mod tests {
                 "only the local origin is answered from the bundle: {activity}"
             );
             assert!(
-                activity.contains("return mapped != null ? mapped : localNotFound();"),
+                activity.contains("return local(loader.shouldInterceptRequest(url));"),
+                "{activity}"
+            );
+            assert!(
+                activity.contains("if (mapped == null || mapped.getData() == null) {"),
                 "{activity}"
             );
             assert!(
@@ -5094,10 +5483,12 @@ mod tests {
     fn pin(base: &str, servers: &[&str]) -> ManifestPin {
         ManifestPin {
             base: MountBase::parse(base).expect("a legal mount base"),
-            servers: ServerOrigins::new(servers.iter().map(|raw| {
-                ipe_runtime_rust::encoding::ServerOrigin::parse(raw).expect("a legal origin")
-            }))
-            .expect("a legal origin set"),
+            servers: PinnedServers::new(
+                ServerOrigins::new(servers.iter().map(|raw| {
+                    ipe_runtime_rust::encoding::ServerOrigin::parse(raw).expect("a legal origin")
+                }))
+                .expect("a legal origin set"),
+            ),
             push: None,
             accepts: BTreeSet::new(),
         }
@@ -5138,7 +5529,7 @@ mod tests {
     fn shell_pin(accepts: &BTreeSet<Capability>, base: &MountBase) -> ManifestPin {
         ManifestPin {
             base: base.clone(),
-            servers: ServerOrigins::none(),
+            servers: PinnedServers::new(ServerOrigins::none()),
             push: None,
             accepts: accepts.clone(),
         }
@@ -5207,7 +5598,10 @@ mod tests {
                 ShellContent::Generated(text) if file.rel_path.starts_with(ANDROID_JAVA_DIR) => {
                     Some((file.rel_path.as_str(), text.as_str()))
                 }
-                ShellContent::Generated(_) | ShellContent::Asset(_) | ShellContent::Icon => None,
+                ShellContent::Generated(_)
+                | ShellContent::Asset(_)
+                | ShellContent::PolicedIndex { .. }
+                | ShellContent::Icon => None,
             })
             .collect()
     }
@@ -5296,7 +5690,7 @@ mod tests {
         let activity = text_of(&shell, &java_path("MainActivity.java"));
         for needle in [
             "if (Shell.LOCAL_ORIGIN.equals(origin)) {",
-            "return mapped != null ? mapped : localNotFound();",
+            "return local(loader.shouldInterceptRequest(url));",
             "return !mainFrame && isAllowed(origin) ? null : blocked();",
             "403, \"Forbidden\"",
             "Collections.singletonMap(Shell.BLOCKED_HEADER, Shell.BLOCKED_ORIGIN)",
@@ -5314,7 +5708,7 @@ mod tests {
         );
         assert_eq!(
             constant(&shell, "LOCAL_ORIGIN"),
-            Some(quoted(ANDROID_ASSET_ORIGIN))
+            Some(quoted(csp::ANDROID_ASSET_ORIGIN))
         );
     }
 
@@ -5873,9 +6267,652 @@ mod tests {
     #[test]
     fn pin_accessors_return_the_pinned_fields() {
         let full = full_pin();
-        assert_eq!(full.servers().len(), 2);
+        let reach = full.reach(BundleHost::Served).expect("a served reach");
+        assert_eq!(reach.network_origins().count(), 2);
         assert_eq!(full.push(), Some(&push_delivery()));
         assert!(pin("/", &[]).push().is_none());
-        assert!(pin("/", &[]).servers().is_empty());
+        let none = pin("/", &[]);
+        let reach = none.reach(BundleHost::Served).expect("a served reach");
+        assert_eq!(reach.network_origins().next(), None);
+    }
+
+    // ── Bundle policy: header, meta and their one reach ───────────────────────
+
+    /// The server sets the policy tests lay shells out over.
+    const SERVER_SETS: [&[&str]; 3] = [
+        &[],
+        &["https://api.example"],
+        &["https://push.example:8443", "https://api.example"],
+    ];
+
+    /// The pin over `servers` with push configured and accepted.
+    fn push_pin(servers: &[&str]) -> ManifestPin {
+        ManifestPin {
+            servers: pin("/", servers).servers,
+            ..full_pin()
+        }
+    }
+
+    /// The raw value of the `Shell.java` string constant `name`.
+    fn string_constant(shell: &ShellLayout, name: &str) -> String {
+        constant(shell, name)
+            .and_then(|value| Some(value.strip_prefix('"')?.strip_suffix('"')?.to_owned()))
+            .unwrap_or_default()
+    }
+
+    /// The directives of the policy `value`, each with its source words.
+    fn directives_of(value: &str) -> Vec<(String, Vec<String>)> {
+        value
+            .split(';')
+            .filter_map(|directive| {
+                let mut words = directive.split_whitespace();
+                let name = words.next()?.to_owned();
+                Some((name, words.map(str::to_owned).collect()))
+            })
+            .collect()
+    }
+
+    /// The `connect-src` sources of the policy `value`.
+    fn connect_of(value: &str) -> BTreeSet<String> {
+        directives_of(value)
+            .into_iter()
+            .filter(|(name, _)| name == "connect-src")
+            .flat_map(|(_, sources)| sources)
+            .collect()
+    }
+
+    /// `text` with every whitespace run collapsed to one space.
+    fn collapsed(text: &str) -> String {
+        text.split_whitespace().collect::<Vec<_>>().join(" ")
+    }
+
+    #[test]
+    fn android_header_connect_src_is_the_asset_origin_and_each_server() {
+        for servers in SERVER_SETS {
+            let shell = android(&pin("/", servers));
+            let header = string_constant(&shell, "CONTENT_SECURITY_POLICY");
+            let allowed = constant(&shell, "ALLOWED_ORIGINS").unwrap_or_default();
+            let mut expected: BTreeSet<String> = allowed
+                .trim_matches(|c| c == '{' || c == '}')
+                .split(", ")
+                .filter_map(|item| Some(item.strip_prefix('"')?.strip_suffix('"')?.to_owned()))
+                .flat_map(|origin| [origin.replacen("https://", "wss://", 1), origin])
+                .collect();
+            expected.insert(csp::ANDROID_ASSET_ORIGIN.to_owned());
+            assert_eq!(connect_of(&header), expected, "{header}");
+            for server in servers {
+                assert!(expected.contains(*server), "{server}: {expected:?}");
+            }
+            assert_eq!(
+                expected.len(),
+                servers.len().saturating_mul(2).saturating_add(1),
+                "{expected:?}"
+            );
+            assert!(!header.contains("'self' wss"), "{header}");
+        }
+    }
+
+    #[test]
+    fn android_every_shell_built_response_is_confined() {
+        let shell = android(&full_pin());
+        let activity = collapsed(text_of(&shell, &java_path("MainActivity.java")));
+        assert_eq!(
+            activity.matches("new WebResourceResponse(").count(),
+            1,
+            "one constructor builds every response: {activity}"
+        );
+        assert!(
+            !activity.contains("return mapped != null ? mapped"),
+            "the loader's response is never returned as built: {activity}"
+        );
+        for needle in [
+            "return local(loader.shouldInterceptRequest(url));",
+            "return confined(mapped.getMimeType(), mapped.getEncoding(), mapped.getStatusCode(), \
+             mapped.getReasonPhrase(), mapped.getResponseHeaders(), mapped.getData());",
+            "if (name != null && value != null && !Shell.CSP_HEADER.equalsIgnoreCase(name)) {",
+            "policed.put(Shell.CSP_HEADER, Shell.CONTENT_SECURITY_POLICY); \
+             if (!settable(status, reason)) { status = 200; reason = \"OK\"; } \
+             return new WebResourceResponse(mime, encoding, status, reason, policed, data);",
+            "if (status < 100 || status > 599 || (status >= 300 && status <= 399)) { return false; }",
+            "if (reason == null || reason.trim().isEmpty()) { return false; }",
+            "if (c < 0x20 || c > 0x7E) { return false; }",
+            "return confined(\"text/plain\", \"utf-8\", 404, \"Not Found\",",
+            "return confined(\"text/plain\", \"utf-8\", 403, \"Forbidden\",",
+        ] {
+            assert!(activity.contains(needle), "{needle}: {activity}");
+        }
+        assert_eq!(
+            activity.matches("Shell.CONTENT_SECURITY_POLICY").count(),
+            1,
+            "{activity}"
+        );
+    }
+
+    #[test]
+    fn android_policy_constants_are_declared_once() {
+        let shell = android(&full_pin());
+        let all = shell_constants(&shell);
+        for name in [
+            "LOCAL_ORIGIN",
+            "ALLOWED_ORIGINS",
+            "CSP_HEADER",
+            "CONTENT_SECURITY_POLICY",
+        ] {
+            assert_eq!(
+                all.iter().filter(|(declared, _)| declared == name).count(),
+                1,
+                "{name}: {all:?}"
+            );
+        }
+        assert_eq!(
+            constant(&shell, "CSP_HEADER"),
+            Some(quoted(csp::HEADER_NAME))
+        );
+    }
+
+    #[test]
+    fn android_header_keeps_every_bundle_directive_but_connect_src() {
+        let others = |value: &str| {
+            directives_of(value)
+                .into_iter()
+                .filter(|(name, _)| name != "connect-src")
+                .collect::<Vec<_>>()
+        };
+        for servers in SERVER_SETS {
+            for (laid, worker) in [
+                (pin("/", servers), BundleWorker::None),
+                (push_pin(servers), BundleWorker::Push),
+            ] {
+                let shell = android(&laid);
+                let header = string_constant(&shell, "CONTENT_SECURITY_POLICY");
+                let meta =
+                    ContentSecurityPolicy::bundle(laid.servers.origins(), worker).header_value();
+                assert_eq!(others(&header), others(&meta), "{header} / {meta}");
+                let mut admitted = connect_of(&meta);
+                assert!(admitted.remove("'self'"), "{meta}");
+                admitted.insert(csp::ANDROID_ASSET_ORIGIN.to_owned());
+                assert!(connect_of(&header).is_subset(&admitted), "{header}");
+                assert!(!connect_of(&header).contains("'self'"), "{header}");
+            }
+        }
+    }
+
+    #[test]
+    fn the_pinned_servers_are_read_only_through_the_reach() {
+        // The origins are a private field of `pinned_servers::PinnedServers`,
+        // so the compiler refuses a read anywhere else; this pins what the
+        // module itself hands out.
+        let source = include_str!("mobile.rs");
+        let production = source
+            .split_once("#[cfg(test)]\nmod tests {")
+            .map_or(source, |(head, _)| head);
+        let module = production
+            .split_once("mod pinned_servers {")
+            .and_then(|(_, rest)| rest.split_once("\n}\n"))
+            .map(|(body, _)| body)
+            .expect("the pinned servers module");
+        assert!(
+            module.contains("pub struct PinnedServers(ServerOrigins);"),
+            "the origins stay a private field: {module}"
+        );
+        let readers: Vec<&str> = module
+            .match_indices("self.0")
+            .filter_map(|(at, _)| {
+                let (_, signature) = module.get(..at)?.rsplit_once("fn ")?;
+                signature.split_once('(').map(|(name, _)| name)
+            })
+            .collect();
+        assert_eq!(readers, ["reach", "served", "origins"]);
+        let fields = module.matches(".0").count();
+        assert_eq!(fields, 3, "every field read is one of the listed: {module}");
+        // A destructuring read (`let Self(o) = self`, `|PinnedServers(o)| o`)
+        // names no `.0`, so every function and every tuple pattern the module
+        // holds is listed too.
+        let functions: Vec<&str> = module
+            .split("fn ")
+            .skip(1)
+            .filter_map(|rest| rest.split_once('(').map(|(name, _)| name))
+            .collect();
+        assert_eq!(functions, ["new", "reach", "served", "origins"], "{module}");
+        assert_eq!(
+            module.matches("Self(").count(),
+            1,
+            "only `new` builds: {module}"
+        );
+        assert_eq!(
+            module.matches("PinnedServers(").count(),
+            1,
+            "only the declaration names the tuple: {module}"
+        );
+        assert!(
+            module.contains("#[cfg(test)]\n        #[must_use]\n        pub const fn origins("),
+            "the bare origins are a test's only: {module}"
+        );
+        assert_eq!(production.matches("impl PinnedServers").count(), 1);
+        assert_eq!(production.matches("for PinnedServers").count(), 0);
+    }
+
+    #[test]
+    fn an_android_shell_refuses_a_server_on_its_asset_host() {
+        let with_port = format!("{}:8443", csp::ANDROID_ASSET_ORIGIN);
+        let lay = |os: MobileOs, laid: &ManifestPin| {
+            layout(os, BundleProfile::Dev, &identity(), laid, &bundle(), None)
+        };
+        for listed in [csp::ANDROID_ASSET_ORIGIN, with_port.as_str()] {
+            let refused = pin("/", &["https://api.example", listed]);
+            let result = lay(MobileOs::Android, &refused);
+            assert!(matches!(result, Err(CliError::Usage(_))), "{listed}");
+            assert!(
+                lay(MobileOs::Ios, &refused).is_ok(),
+                "only the Android shell answers that host locally"
+            );
+            let Err(err) = result else { return };
+            let shown = err.to_string();
+            assert!(
+                shown.contains("`delivery.servers`") && shown.contains(listed),
+                "{shown}"
+            );
+        }
+        assert!(lay(MobileOs::Android, &pin("/", &["https://api.example"])).is_ok());
+    }
+
+    #[test]
+    fn both_shells_police_only_the_top_level_index() {
+        for os in [MobileOs::Android, MobileOs::Ios] {
+            let shell = layout(
+                os,
+                BundleProfile::Dev,
+                &identity(),
+                &pin("/", &[]),
+                &bundle(),
+                None,
+            )
+            .expect("layout");
+            let policed: Vec<&str> = shell
+                .files
+                .iter()
+                .filter(|file| matches!(file.content, ShellContent::PolicedIndex { .. }))
+                .map(|file| file.rel_path.as_str())
+                .collect();
+            assert_eq!(policed.len(), 1, "{policed:?}");
+            assert!(
+                policed.iter().all(|rel| rel.ends_with("www/index.html")),
+                "{policed:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn android_readme_states_the_policy_header() {
+        let shell = android(&pin("/", &["https://api.example"]));
+        let readme = collapsed(text_of(&shell, "README.txt"));
+        let reach = format!(
+            "exactly {} plus the https and wss forms of each delivery.servers origin",
+            csp::ANDROID_ASSET_ORIGIN
+        );
+        for needle in [
+            "Every response the shell builds carries a Content-Security-Policy header",
+            reach.as_str(),
+        ] {
+            assert!(readme.contains(needle), "{needle}: {readme}");
+        }
+    }
+
+    // ── Bundle policy: the page the shell lays down ───────────────────────────
+
+    /// A collected bundle whose `index.html` is `page`, with its scratch base.
+    fn bundle_with_page(tag: &str, page: &str) -> (PathBuf, SpaBundle) {
+        let (base, www) = www_with(tag, &["boot.js"]);
+        std::fs::write(www.join("index.html"), page).expect("write index");
+        let spa = SpaBundle::from_www_dir(&www).expect("collect");
+        (base, spa)
+    }
+
+    /// A page carrying `metas` in its head.
+    fn page_with(metas: &[&str]) -> String {
+        let mut page = String::from("<!doctype html>\n<html><head>\n");
+        for meta in metas {
+            page.push_str(meta);
+        }
+        page.push_str("</head><body></body></html>\n");
+        page
+    }
+
+    /// The policy meta the wasm build renders for `servers` and `worker`.
+    fn served_meta(servers: &ServerOrigins, worker: BundleWorker) -> String {
+        ContentSecurityPolicy::bundle(servers, worker).meta_element()
+    }
+
+    /// The `os` shell laid out from `laid` over `spa`, materialised under `base`.
+    fn materialised(
+        os: MobileOs,
+        laid: &ManifestPin,
+        base: &Path,
+        spa: &SpaBundle,
+    ) -> (ShellLayout, Result<PathBuf, CliError>) {
+        let shell = layout(os, BundleProfile::Dev, &identity(), laid, spa, None).expect("layout");
+        let dist = OwnedDir::claim(&base.join("dist")).expect("claim dist");
+        let result = materialise(&shell, None, &dist);
+        (shell, result)
+    }
+
+    #[test]
+    fn a_shell_page_carries_its_host_policy() {
+        let laid = pin("/", &["https://api.example"]);
+        let page = page_with(&[&served_meta(laid.servers.origins(), BundleWorker::None)]);
+        for (os, rel, host) in [
+            (
+                MobileOs::Android,
+                "app/src/main/assets/www/index.html",
+                BundleHost::AndroidAssets,
+            ),
+            (MobileOs::Ios, "App/www/index.html", BundleHost::IosScheme),
+        ] {
+            let (base, spa) = bundle_with_page("policed", &page);
+            let (_, result) = materialised(os, &laid, &base, &spa);
+            let root = result.expect("materialised");
+            let written =
+                std::fs::read_to_string(root.join(rel_to_native(rel))).expect("read the page");
+            let reach = laid.reach(host).expect("a reach");
+            let hosted = ContentSecurityPolicy::for_bundle(&reach, BundleWorker::None);
+            assert_eq!(written, page_with(&[&hosted.meta_element()]));
+            assert_eq!(
+                connect_of(&hosted.header_value()).contains("'self'"),
+                matches!(host, BundleHost::IosScheme),
+                "{written}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_page_without_the_pinned_policy_lays_nothing_down() {
+        let laid = pin("/", &["https://api.example"]);
+        let other = pin("/", &["https://other.example"]);
+        let meta = served_meta(laid.servers.origins(), BundleWorker::None);
+        let pages = [
+            page_with(&[]),
+            page_with(&[&meta, &meta]),
+            page_with(&[&served_meta(other.servers.origins(), BundleWorker::None)]),
+            page_with(&[&served_meta(laid.servers.origins(), BundleWorker::Push)]),
+        ];
+        for page in &pages {
+            let (base, spa) = bundle_with_page("mismatch", page);
+            let (shell, result) = materialised(MobileOs::Android, &laid, &base, &spa);
+            assert!(matches!(result, Err(CliError::Usage(_))), "{page}");
+            assert!(
+                !base.join("dist").join(&shell.root_name).exists(),
+                "nothing is laid down: {page}"
+            );
+            let Err(err) = result else { return };
+            assert!(
+                err.to_string().contains("Content-Security-Policy meta"),
+                "{err}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_push_shell_admits_the_page_with_or_without_its_worker() {
+        let laid = push_pin(&["https://api.example"]);
+        for worker in [BundleWorker::None, BundleWorker::Push] {
+            let page = page_with(&[&served_meta(laid.servers.origins(), worker)]);
+            let (base, spa) = bundle_with_page("push", &page);
+            let (_, result) = materialised(MobileOs::Android, &laid, &base, &spa);
+            let root = result.expect("a reached or unreached worker both lay out");
+            let rel = rel_to_native("app/src/main/assets/www/index.html");
+            let written = std::fs::read_to_string(root.join(rel)).expect("read the page");
+            let reach = laid.reach(BundleHost::AndroidAssets).expect("a reach");
+            let hosted = ContentSecurityPolicy::for_bundle(&reach, worker);
+            assert_eq!(written, page_with(&[&hosted.meta_element()]));
+        }
+    }
+
+    #[test]
+    fn a_page_past_the_cap_or_not_utf8_is_refused() {
+        let laid = pin("/", &[]);
+        let mut page = page_with(&[&served_meta(laid.servers.origins(), BundleWorker::None)]);
+        let cap = usize::try_from(MAX_INDEX_HTML_BYTES).expect("a usize cap");
+        page.push_str(&" ".repeat(cap.saturating_add(1).saturating_sub(page.len())));
+        let (_base, spa) = bundle_with_page("oversized", &page);
+        let index = spa
+            .assets()
+            .iter()
+            .find(|asset| asset.path.is_index_html())
+            .expect("an index");
+        let reach = laid.reach(BundleHost::AndroidAssets).expect("a reach");
+        let content = bundle_content(&index.path, &laid, &reach);
+        assert!(matches!(content, ShellContent::PolicedIndex { .. }));
+        let ShellContent::PolicedIndex { swaps, .. } = content else {
+            return;
+        };
+        let www = spa.spa.hold().expect("hold www");
+        let source = spa.spa.shown(&index.path);
+        let refused = policed_index(&spa.spa, &www, &index.path, &swaps);
+        assert!(matches!(
+            refused,
+            Err(BundleError::IndexTooLarge {
+                cap: MAX_INDEX_HTML_BYTES,
+                ..
+            })
+        ));
+        page.truncate(cap);
+        std::fs::write(&source, &page).expect("write the page at the cap");
+        assert!(
+            policed_index(&spa.spa, &www, &index.path, &swaps).is_ok(),
+            "the cap itself is read"
+        );
+        let mut bytes = page.into_bytes();
+        bytes.pop();
+        bytes.insert(0, 0xff);
+        std::fs::write(&source, bytes).expect("write a non-UTF-8 page at the cap");
+        assert!(matches!(
+            policed_index(&spa.spa, &www, &index.path, &swaps),
+            Err(BundleError::PolicyMismatch { .. })
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_asset_swapped_for_a_link_after_the_walk_is_refused_not_copied() {
+        let laid = pin("/", &[]);
+        let page = page_with(&[&served_meta(laid.servers.origins(), BundleWorker::None)]);
+        for victim in ["boot.js", "index.html"] {
+            let (base, spa) = bundle_with_page("asset-link", &page);
+            // The outside file is a page the policing admits, so only the
+            // held read refuses it.
+            let outside = base.join("outside.html");
+            std::fs::write(&outside, &page).expect("write the outside file");
+            let shell = layout(
+                MobileOs::Android,
+                BundleProfile::Dev,
+                &identity(),
+                &laid,
+                &spa,
+                None,
+            )
+            .expect("layout");
+            let planted = base.join("www").join(victim);
+            std::fs::remove_file(&planted).expect("remove the collected asset");
+            std::os::unix::fs::symlink(&outside, &planted).expect("plant a link");
+            let dist = OwnedDir::claim(&base.join("dist")).expect("claim dist");
+            let err = materialise(&shell, None, &dist).expect_err("a linked asset is refused");
+            assert!(matches!(err, CliError::Usage(_)), "{victim}: {err}");
+            assert!(
+                err.to_string()
+                    .contains(text::mobile_asset_kind(&FileKind::Symlink).as_str()),
+                "{victim}: {err}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_asset_swapped_for_a_fifo_after_the_walk_is_refused_unread() {
+        let laid = pin("/", &[]);
+        let page = page_with(&[&served_meta(laid.servers.origins(), BundleWorker::None)]);
+        let (base, spa) = bundle_with_page("asset-fifo", &page);
+        let shell = layout(
+            MobileOs::Android,
+            BundleProfile::Dev,
+            &identity(),
+            &laid,
+            &spa,
+            None,
+        )
+        .expect("layout");
+        let planted = base.join("www").join("boot.js");
+        std::fs::remove_file(&planted).expect("remove the collected asset");
+        let made = std::process::Command::new("mkfifo").arg(&planted).status();
+        assert!(
+            made.is_ok_and(|status| status.success()),
+            "mkfifo plants the fixture"
+        );
+        let dist = OwnedDir::claim(&base.join("dist")).expect("claim dist");
+        let err = materialise(&shell, None, &dist).expect_err("a fifo asset is refused");
+        assert!(
+            err.to_string()
+                .contains(text::mobile_asset_kind(&FileKind::Fifo).as_str()),
+            "{err}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_directory_swapped_for_a_link_after_the_walk_is_refused_not_copied() {
+        let laid = pin("/", &[]);
+        let page = page_with(&[&served_meta(laid.servers.origins(), BundleWorker::None)]);
+        let (base, www) = www_with("dir-link", &["pkg/app.js"]);
+        std::fs::write(www.join("index.html"), &page).expect("write index");
+        let spa = SpaBundle::from_www_dir(&www).expect("collect");
+        let shell = layout(
+            MobileOs::Android,
+            BundleProfile::Dev,
+            &identity(),
+            &laid,
+            &spa,
+            None,
+        )
+        .expect("layout");
+        // The outside directory holds the same name, so only the held,
+        // no-follow descent refuses it.
+        let outside = base.join("outside");
+        std::fs::create_dir_all(&outside).expect("mk outside");
+        std::fs::write(outside.join("app.js"), b"outside").expect("write outside asset");
+        std::fs::remove_dir_all(www.join("pkg")).expect("remove the collected directory");
+        std::os::unix::fs::symlink(&outside, www.join("pkg")).expect("plant a link");
+        let dist = OwnedDir::claim(&base.join("dist")).expect("claim dist");
+        let err = materialise(&shell, None, &dist).expect_err("a linked directory is refused");
+        assert!(
+            err.to_string()
+                .contains(text::mobile_asset_kind(&FileKind::Symlink).as_str()),
+            "{err}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_asset_past_the_cap_is_refused_unread() {
+        let laid = pin("/", &[]);
+        let page = page_with(&[&served_meta(laid.servers.origins(), BundleWorker::None)]);
+        let (base, spa) = bundle_with_page("asset-cap", &page);
+        let shell = layout(
+            MobileOs::Android,
+            BundleProfile::Dev,
+            &identity(),
+            &laid,
+            &spa,
+            None,
+        )
+        .expect("layout");
+        // A sparse file: its length is past the cap, its blocks are not
+        // written, and the held read refuses it on that length alone.
+        std::fs::File::options()
+            .write(true)
+            .open(base.join("www").join("boot.js"))
+            .and_then(|file| file.set_len(MAX_ASSET_BYTES.saturating_add(1)))
+            .expect("grow the asset past the cap");
+        let dist = OwnedDir::claim(&base.join("dist")).expect("claim dist");
+        let err = materialise(&shell, None, &dist).expect_err("an oversized asset is refused");
+        assert!(matches!(err, CliError::Usage(_)), "{err}");
+        assert!(
+            err.to_string()
+                .contains(&format!("larger than {MAX_ASSET_BYTES} bytes")),
+            "{err}"
+        );
+    }
+
+    // ── Staged shell: complete or absent ──────────────────────────────────────
+
+    /// An Android shell over a bundle whose `boot.js` asset is read after other shell files.
+    fn staged_shell(tag: &str) -> (PathBuf, ShellLayout, OwnedDir) {
+        let laid = pin("/", &[]);
+        let page = page_with(&[&served_meta(laid.servers.origins(), BundleWorker::None)]);
+        let (base, spa) = bundle_with_page(tag, &page);
+        let shell = layout(
+            MobileOs::Android,
+            BundleProfile::Dev,
+            &identity(),
+            &laid,
+            &spa,
+            None,
+        )
+        .expect("layout");
+        assert!(
+            shell
+                .files
+                .iter()
+                .position(|file| file.rel_path.ends_with("boot.js"))
+                > Some(0),
+            "control: a shell file is written before the asset"
+        );
+        let dist = OwnedDir::claim(&base.join("dist")).expect("claim dist");
+        (base, shell, dist)
+    }
+
+    /// Remove the collected `boot.js`, so the shell's read of it is refused mid-write.
+    fn drop_asset(base: &Path) {
+        std::fs::remove_file(base.join("www").join("boot.js")).expect("remove the asset");
+    }
+
+    #[test]
+    fn a_shell_refused_mid_write_lays_nothing_down() {
+        let (base, shell, dist) = staged_shell("staged-absent");
+        drop_asset(&base);
+        let result = materialise(&shell, None, &dist);
+        assert!(matches!(result, Err(CliError::Usage(_))), "{result:?}");
+        assert!(
+            !dist.path().join(&shell.root_name).exists(),
+            "no partial shell"
+        );
+        assert!(staging_leftovers(dist.path()).is_empty());
+    }
+
+    #[test]
+    fn a_shell_refused_mid_write_keeps_the_previous_shell_byte_for_byte() {
+        let (base, shell, dist) = staged_shell("staged-previous");
+        let root = materialise(&shell, None, &dist).expect("the previous shell");
+        let before = tree_snapshot(&root);
+        assert!(before.len() > 1, "control: the previous shell holds files");
+        drop_asset(&base);
+        let result = materialise(&shell, None, &dist);
+        assert!(matches!(result, Err(CliError::Usage(_))), "{result:?}");
+        assert_eq!(tree_snapshot(&root), before);
+        assert!(staging_leftovers(dist.path()).is_empty());
+    }
+
+    #[test]
+    fn a_staged_shell_lands_every_file_and_leaves_nothing_behind() {
+        let (_base, shell, dist) = staged_shell("staged-happy");
+        let root = materialise(&shell, None, &dist).expect("materialise");
+        for file in &shell.files {
+            assert!(
+                root.join(rel_to_native(&file.rel_path)).is_file(),
+                "{}",
+                file.rel_path
+            );
+        }
+        let again = materialise(&shell, None, &dist).expect("a re-pack");
+        assert_eq!(again, root);
+        assert!(staging_leftovers(dist.path()).is_empty());
     }
 }

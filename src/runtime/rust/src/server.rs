@@ -1591,6 +1591,165 @@ pub(crate) async fn refuse_unparsed_url(
     }
 }
 
+/// The file name of a web app's worker script, served below the app's base.
+pub(crate) const WORKER_SCRIPT_NAME: &str = "ipe-sw.js";
+
+/// The request header a browser sends on every worker script fetch.
+///
+/// `Service-Worker-Navigation-Preload` is another header and is never read.
+const SERVICE_WORKER_HEADER: &str = "service-worker";
+
+/// What the `Service-Worker` request header says a request is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum WorkerFetch {
+    /// No `Service-Worker` header: not a worker script fetch.
+    Absent,
+    /// One `Service-Worker: script`: the browser fetches a worker script.
+    Script,
+}
+
+/// Why a `Service-Worker` header has no one reading.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum WorkerFetchRefusal {
+    /// The one value is not exactly `script`.
+    Unknown,
+    /// The header is sent on more than one line.
+    Repeated,
+}
+
+impl WorkerFetch {
+    /// The one reading of the `Service-Worker` lines in `headers`.
+    ///
+    /// # Errors
+    ///
+    /// `Unknown` for a value other than `script` (another case, an empty value
+    /// and a list included), `Repeated` for a second line.
+    pub(crate) fn parse(headers: &axum::http::HeaderMap) -> Result<Self, WorkerFetchRefusal> {
+        let mut lines = headers.get_all(SERVICE_WORKER_HEADER).iter();
+        match (lines.next(), lines.next()) {
+            (None, _) => Ok(Self::Absent),
+            (Some(_), Some(_)) => Err(WorkerFetchRefusal::Repeated),
+            (Some(value), None) if value.as_bytes() == b"script" => Ok(Self::Script),
+            (Some(_), None) => Err(WorkerFetchRefusal::Unknown),
+        }
+    }
+}
+
+/// The request paths a worker script fetch may reach on one router.
+///
+/// Each is the worker route below one admitted base.
+#[derive(Clone, Debug)]
+pub(crate) struct AdmittedWorkerPaths(Vec<crate::encoding::DecodedPath>);
+
+impl AdmittedWorkerPaths {
+    /// No path: every worker script fetch is refused.
+    pub(crate) const fn none() -> Self {
+        Self(Vec::new())
+    }
+
+    /// The worker route below each of `bases`.
+    #[cfg(any(test, feature = "web"))]
+    pub(crate) fn of_bases<'a>(
+        bases: impl IntoIterator<Item = &'a crate::encoding::MountBase>,
+    ) -> Self {
+        Self(
+            bases
+                .into_iter()
+                .map(|base| base.to_decoded().clone())
+                .collect(),
+        )
+    }
+
+    /// Whether `path` is the worker route below an admitted base.
+    ///
+    /// The path must hold exactly one segment, the worker name, after the
+    /// base, and no trailing slash.
+    fn admits(&self, path: &crate::encoding::RequestPath) -> bool {
+        path.trailing() == crate::encoding::TrailingSlash::Absent
+            && self.0.iter().any(|base| {
+                path.decoded().strip_base(base).is_some_and(
+                    |rest| matches!(rest.segments(), [only] if only == WORKER_SCRIPT_NAME),
+                )
+            })
+    }
+}
+
+/// Why a request is refused as a worker script fetch.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ForeignWorker {
+    /// The `Service-Worker` header has no one reading.
+    Header(WorkerFetchRefusal),
+    /// A worker script fetch of a path that is not an admitted worker route.
+    Path,
+}
+
+/// Whether a request with `headers` for `path` may pass the worker gate.
+///
+/// # Errors
+///
+/// The [`ForeignWorker`] reason when it may not.
+pub(crate) fn judge_worker_fetch(
+    headers: &axum::http::HeaderMap,
+    path: &crate::encoding::RequestPath,
+    admitted: &AdmittedWorkerPaths,
+) -> Result<(), ForeignWorker> {
+    match WorkerFetch::parse(headers).map_err(ForeignWorker::Header)? {
+        WorkerFetch::Absent => Ok(()),
+        WorkerFetch::Script if admitted.admits(path) => Ok(()),
+        WorkerFetch::Script => Err(ForeignWorker::Path),
+    }
+}
+
+/// Middleware refusing every worker script fetch but one of an admitted
+/// worker route.
+///
+/// The refusal is an empty 403 carrying the security headers, so only the
+/// runtime's own worker can be installed on the origin: a static file, a
+/// browser-noise file or a user route answered to a worker fetch never reaches
+/// the browser. A request without the listener's [`StrictUrl`] gets the fixed
+/// 500.
+pub(crate) async fn refuse_foreign_worker(
+    axum::extract::State(admitted): axum::extract::State<Arc<AdmittedWorkerPaths>>,
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    let judged = match strict_url(req.extensions().get()) {
+        Ok(url) => judge_worker_fetch(req.headers(), url.request_path(), &admitted),
+        Err(rejection) => return rejection.status_and_reason().into_response(),
+    };
+    match judged {
+        Ok(()) => next.run(req).await,
+        Err(_) => with_security_headers(
+            axum::http::StatusCode::FORBIDDEN.into_response(),
+            response_security_headers(),
+        ),
+    }
+}
+
+/// `routes` with `mounts` served below them, each behind the worker gate.
+///
+/// A handler route admits no worker fetch at all, so a user route that
+/// shadows a mount's worker path cannot serve a worker. The whole router
+/// admits only the worker route below each `Server.mountApp` base in
+/// `mounted`, whose own router gates the stripped path again.
+fn worker_gated(
+    routes: axum::Router,
+    mounts: Vec<(crate::encoding::MountBase, axum::Router)>,
+    mounted: AdmittedWorkerPaths,
+) -> axum::Router {
+    let routes = routes.layer(axum::middleware::from_fn_with_state(
+        Arc::new(AdmittedWorkerPaths::none()),
+        refuse_foreign_worker,
+    ));
+    MountTable::new(mounts)
+        .below(routes)
+        .layer(axum::middleware::from_fn_with_state(
+            Arc::new(mounted),
+            refuse_foreign_worker,
+        ))
+}
+
 /// How a request spelled its path against the one canonical spelling.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Spelling {
@@ -2296,7 +2455,7 @@ fn to_axum_response(r: ServerResponse, streams: RequestStreams) -> axum::respons
 
 /// The security headers of a handler response or a static file: the
 /// [`crate::csp::Guarded::Response`] policy.
-fn response_security_headers()
+pub(crate) fn response_security_headers()
 -> Result<Vec<(&'static str, String)>, crate::telemetry::FrameAncestorsRefusal> {
     crate::telemetry::security_headers(&crate::csp::Guarded::Response)
 }
@@ -3134,6 +3293,10 @@ pub fn server_listen<E: crate::FromIpeError + Send + 'static>(
         }
         let mut app: axum::Router = axum::Router::new();
         let mut mounts = Vec::new();
+        // The bases of the mounted web apps: the only prefixes below which a
+        // worker script fetch may pass the listener's worker gate.
+        #[cfg(feature = "web")]
+        let mut worker_bases = Vec::new();
         for r in routes {
             match r.target {
                 ParsedTarget::Static(base, dir) => {
@@ -3164,12 +3327,17 @@ pub fn server_listen<E: crate::FromIpeError + Send + 'static>(
                         .take();
                     if let Some(build) = builder {
                         let sub = build(base.clone()).await;
+                        worker_bases.push(base.clone());
                         mounts.push((base, sub));
                     }
                 }
             }
         }
-        let app = MountTable::new(mounts).below(app);
+        #[cfg(feature = "web")]
+        let mounted_workers = AdmittedWorkerPaths::of_bases(&worker_bases);
+        #[cfg(not(feature = "web"))]
+        let mounted_workers = AdmittedWorkerPaths::none();
+        let app = worker_gated(app, mounts, mounted_workers);
         // Ipê doctrine: a panicking handler returns 500, never crashes the
         // process. The custom
         // responder classifies + logs the panic SERVER-SIDE (errId) and returns a
@@ -11758,5 +11926,284 @@ mod tests {
                 "the frame never reaches the handler"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod worker_gate_tests {
+    use super::*;
+    use axum::http::{HeaderMap, HeaderValue, StatusCode};
+    use tower::ServiceExt;
+
+    /// The value a request carries for one `Service-Worker` line.
+    const SCRIPT: &str = "script";
+
+    /// A header map holding one `Service-Worker` line per entry of `values`.
+    #[allow(clippy::expect_used)] // test: every fixture value is a valid header value
+    fn worker_lines(values: &[&str]) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        for value in values {
+            headers.append(
+                SERVICE_WORKER_HEADER,
+                HeaderValue::from_str(value).expect("a valid header value"),
+            );
+        }
+        headers
+    }
+
+    #[test]
+    fn worker_fetch_reads_only_one_exact_script_line() {
+        assert_eq!(
+            WorkerFetch::parse(&worker_lines(&[])),
+            Ok(WorkerFetch::Absent)
+        );
+        assert_eq!(
+            WorkerFetch::parse(&worker_lines(&[SCRIPT])),
+            Ok(WorkerFetch::Script)
+        );
+        for value in [
+            "Script",
+            "SCRIPT",
+            "script, script",
+            "",
+            "worker",
+            "script;",
+        ] {
+            assert_eq!(
+                WorkerFetch::parse(&worker_lines(&[value])),
+                Err(WorkerFetchRefusal::Unknown),
+                "{value:?}"
+            );
+        }
+        assert_eq!(
+            WorkerFetch::parse(&worker_lines(&[SCRIPT, SCRIPT])),
+            Err(WorkerFetchRefusal::Repeated)
+        );
+        assert_eq!(
+            WorkerFetch::parse(&worker_lines(&[SCRIPT, "other"])),
+            Err(WorkerFetchRefusal::Repeated)
+        );
+    }
+
+    #[test]
+    fn the_navigation_preload_header_is_not_judged() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "service-worker-navigation-preload",
+            HeaderValue::from_static("true"),
+        );
+        assert_eq!(WorkerFetch::parse(&headers), Ok(WorkerFetch::Absent));
+    }
+
+    #[test]
+    #[allow(clippy::expect_used)] // test: fixed bases and paths parse
+    fn only_the_worker_route_below_an_admitted_base_is_admitted() {
+        let app = crate::encoding::MountBase::parse("/app").expect("a mount base");
+        let admitted = AdmittedWorkerPaths::of_bases([&app]);
+        let path = |raw: &str| crate::encoding::RequestPath::parse(raw).expect("a request path");
+        let script = worker_lines(&[SCRIPT]);
+        assert_eq!(
+            judge_worker_fetch(&script, &path("/app/ipe-sw.js"), &admitted),
+            Ok(())
+        );
+        for raw in [
+            "/ipe-sw.js",
+            "/other/ipe-sw.js",
+            "/app/ipe-sw.js/",
+            "/app/x/ipe-sw.js",
+            "/app//ipe-sw.js",
+            "/app",
+            "/apple/ipe-sw.js",
+            "/app/sw.js",
+        ] {
+            assert_eq!(
+                judge_worker_fetch(&script, &path(raw), &admitted),
+                Err(ForeignWorker::Path),
+                "{raw:?}"
+            );
+        }
+        assert_eq!(
+            judge_worker_fetch(&script, &path("/ipe-sw.js"), &AdmittedWorkerPaths::none()),
+            Err(ForeignWorker::Path)
+        );
+        assert_eq!(
+            judge_worker_fetch(&worker_lines(&[]), &path("/other"), &admitted),
+            Ok(())
+        );
+        assert_eq!(
+            judge_worker_fetch(
+                &worker_lines(&["Script"]),
+                &path("/app/ipe-sw.js"),
+                &admitted
+            ),
+            Err(ForeignWorker::Header(WorkerFetchRefusal::Unknown))
+        );
+    }
+
+    /// A user handler answering a script body, as a route returning JavaScript.
+    fn script_handler() -> ErasedHandler {
+        Arc::new(|_req: ServerRequest| {
+            let body = resp(200, "self.x=1;".to_owned(), "text/javascript");
+            Box::pin(async move { Ok(body) })
+                as Pin<Box<dyn Future<Output = Result<ServerResponse, String>> + Send>>
+        })
+    }
+
+    /// The user routes: `/sw.js` and `/app/ipe-sw.js`, each answering a script.
+    #[allow(clippy::expect_used)] // test: fixed endpoint paths parse
+    fn user_routes() -> axum::Router {
+        ["/sw.js", "/app/ipe-sw.js"]
+            .into_iter()
+            .fold(axum::Router::new(), |router, raw| {
+                let pattern = crate::encoding::ServerPattern::parse(raw).expect("well-formed");
+                let path = pattern.router_path().to_owned();
+                router.route(
+                    &path,
+                    method_router(EndpointMethod::Get, pattern, script_handler()),
+                )
+            })
+    }
+
+    /// A mounted app's router: its own worker route answers `mounted-worker`.
+    fn mounted_app() -> axum::Router {
+        axum::Router::new().route(
+            "/ipe-sw.js",
+            axum::routing::get(|| async { "mounted-worker" }),
+        )
+    }
+
+    /// The listener's router: `routes` with web apps mounted at each of
+    /// `apps`, every one admitted, gated as `server_listen` gates them.
+    #[allow(clippy::expect_used)] // test: fixed mount bases parse
+    fn listener(routes: axum::Router, apps: &[&str]) -> axum::Router {
+        let bases: Vec<_> = apps
+            .iter()
+            .map(|raw| crate::encoding::MountBase::parse(raw).expect("a mount base"))
+            .collect();
+        let admitted = AdmittedWorkerPaths::of_bases(&bases);
+        let mounts = bases
+            .into_iter()
+            .map(|base| (base, mounted_app()))
+            .collect();
+        behind_listener(worker_gated(routes, mounts, admitted))
+    }
+
+    /// GET `uri` through `app` with one `Service-Worker` line per `worker`
+    /// entry: the status, the headers and the body.
+    #[allow(clippy::expect_used)] // test: a fixed request builds and its body is UTF-8
+    async fn get(app: axum::Router, uri: &str, worker: &[&str]) -> (StatusCode, HeaderMap, String) {
+        let mut wire = axum::http::Request::builder().method("GET").uri(uri);
+        for value in worker {
+            wire = wire.header(SERVICE_WORKER_HEADER, *value);
+        }
+        let resp = match app
+            .oneshot(wire.body(axum::body::Body::empty()).expect("a request"))
+            .await
+        {
+            Ok(resp) => resp,
+            Err(never) => match never {},
+        };
+        let status = resp.status();
+        let headers = resp.headers().clone();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("a body");
+        (
+            status,
+            headers,
+            String::from_utf8(bytes.to_vec()).expect("UTF-8"),
+        )
+    }
+
+    /// The refusal of a foreign worker fetch: an empty 403 with the security headers.
+    fn assert_refused(answer: &(StatusCode, HeaderMap, String), uri: &str) {
+        let (status, headers, body) = answer;
+        assert_eq!(*status, StatusCode::FORBIDDEN, "{uri:?}");
+        assert!(body.is_empty(), "{uri:?} refusal carries no body");
+        for name in ["content-security-policy", "x-content-type-options"] {
+            assert!(headers.contains_key(name), "{uri:?} refusal lacks {name}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_user_route_answering_javascript_is_never_a_worker() {
+        let answer = get(listener(user_routes(), &[]), "/sw.js", &[SCRIPT]).await;
+        assert_refused(&answer, "/sw.js");
+        let (status, _, body) = get(listener(user_routes(), &[]), "/sw.js", &[]).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "the route still answers a plain fetch"
+        );
+        assert_eq!(body, "self.x=1;");
+    }
+
+    #[tokio::test]
+    async fn the_admitted_set_is_the_mounted_worker_routes() {
+        let (status, _, body) = get(
+            listener(axum::Router::new(), &["/app"]),
+            "/app/ipe-sw.js",
+            &[SCRIPT],
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, "mounted-worker");
+        for uri in ["/ipe-sw.js", "/other/ipe-sw.js", "/app/ipe-sw.js/"] {
+            let answer = get(listener(axum::Router::new(), &["/app"]), uri, &[SCRIPT]).await;
+            assert_refused(&answer, uri);
+        }
+    }
+
+    #[tokio::test]
+    async fn with_nothing_mounted_no_worker_path_is_admitted() {
+        let answer = get(listener(axum::Router::new(), &[]), "/ipe-sw.js", &[SCRIPT]).await;
+        assert_refused(&answer, "/ipe-sw.js");
+    }
+
+    #[tokio::test]
+    async fn a_user_route_shadowing_a_mounted_worker_route_is_refused() {
+        let answer = get(
+            listener(user_routes(), &["/app"]),
+            "/app/ipe-sw.js",
+            &[SCRIPT],
+        )
+        .await;
+        assert_refused(&answer, "/app/ipe-sw.js");
+    }
+
+    #[tokio::test]
+    async fn an_unknown_worker_value_is_refused() {
+        for value in ["Script", "script, script", ""] {
+            let answer = get(
+                listener(axum::Router::new(), &["/app"]),
+                "/app/ipe-sw.js",
+                &[value],
+            )
+            .await;
+            assert_refused(&answer, value);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_repeated_worker_line_is_refused_at_the_listener() {
+        let (status, _, body) = get(
+            listener(axum::Router::new(), &["/app"]),
+            "/app/ipe-sw.js",
+            &[SCRIPT, SCRIPT],
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "a repeated singleton header"
+        );
+        assert_ne!(body, "mounted-worker");
+    }
+
+    #[tokio::test]
+    async fn a_request_without_the_listener_parse_is_refused() {
+        let gated = worker_gated(axum::Router::new(), Vec::new(), AdmittedWorkerPaths::none());
+        let (status, _, _) = get(gated, "/ipe-sw.js", &[SCRIPT]).await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
     }
 }
