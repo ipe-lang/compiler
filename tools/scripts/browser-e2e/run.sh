@@ -2,14 +2,15 @@
 # Run the browser E2E Playwright specs against locally built binaries.
 #
 # Usage:
-#   bash tools/scripts/browser-e2e/run.sh [GEO_PORT] [LAYOUT_PORT] [FOCUS_PORT] [CSP_STYLES_PORT]
+#   bash tools/scripts/browser-e2e/run.sh [GEO_PORT] [LAYOUT_PORT] [FOCUS_PORT] [CSP_STYLES_PORT] [INSTALL_OFFER_PORT] [INSTALL_OFFER_OFF_PORT]
 #
-# GEO_PORT defaults to 18080, LAYOUT_PORT to 18081, FOCUS_PORT to 18082 and
-# CSP_STYLES_PORT to 18083.
+# GEO_PORT defaults to 18080, LAYOUT_PORT to 18081, FOCUS_PORT to 18082,
+# CSP_STYLES_PORT to 18083, INSTALL_OFFER_PORT to 18084 and
+# INSTALL_OFFER_OFF_PORT to 18085.
 # The script:
 #   1. Builds the ipe compiler (cargo build -p ipe --release).
 #   2. Compiles each example (geo-clipboard, layout-fill, focus-across-patch,
-#      csp-styles) via `ipe dev build`.
+#      csp-styles, install-offer, install-offer-off) via `ipe dev build`.
 #   3. Cargo-builds each emitted Rust project.
 #   4. Spawns each binary on its port.
 #   5. Builds the wasm-solo-clipboard browser bundle (`ipe dev build … web solo`),
@@ -28,11 +29,15 @@ GEO_PORT="${1:-18080}"
 LAYOUT_PORT="${2:-18081}"
 FOCUS_PORT="${3:-18082}"
 CSP_STYLES_PORT="${4:-18083}"
+INSTALL_OFFER_PORT="${5:-18084}"
+INSTALL_OFFER_OFF_PORT="${6:-18085}"
 
 export IPE_GEO_CLIPBOARD_PORT="$GEO_PORT"
 export IPE_LAYOUT_FILL_PORT="$LAYOUT_PORT"
 export IPE_FOCUS_ACROSS_PATCH_PORT="$FOCUS_PORT"
 export IPE_CSP_STYLES_PORT="$CSP_STYLES_PORT"
+export IPE_INSTALL_OFFER_PORT="$INSTALL_OFFER_PORT"
+export IPE_INSTALL_OFFER_OFF_PORT="$INSTALL_OFFER_OFF_PORT"
 export IPE_RUNTIME_DIR="${IPE_RUNTIME_DIR:-$REPO_ROOT/src/runtime/rust/src}"
 
 echo "==> Building ipe compiler..."
@@ -88,6 +93,8 @@ serve geo-clipboard "$GEO_PORT"
 serve layout-fill "$LAYOUT_PORT"
 serve focus-across-patch "$FOCUS_PORT"
 serve csp-styles "$CSP_STYLES_PORT"
+serve install-offer "$INSTALL_OFFER_PORT"
+serve install-offer-off "$INSTALL_OFFER_OFF_PORT"
 
 # bundle_solo NAME — build examples/shapes/web/NAME as the `web solo` browser
 # bundle and export its `www/` directory, which the spec serves with no server.
