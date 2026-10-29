@@ -30,7 +30,7 @@
 
 use std::borrow::Cow;
 use std::cell::{Cell, RefCell};
-use std::collections::VecDeque;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::rc::Rc;
 
 use wasm_bindgen::JsCast;
@@ -43,6 +43,7 @@ use crate::dom::{
     focus::{
         FocusLink, Now, Recorded, WINDOW_FOCUS_MOVES, chain_from_ancestry, landing, settle_due,
     },
+    keep::{AUTHORITY_ATTRS, Control, Field, Keep, is_authority_attr, keep},
 };
 use crate::html::{
     FormData, Html, IFRAME_TAG, RenderCtx, SANDBOX_ATTR, STAMPED_ID_ATTR, SandboxTokens,
@@ -1675,16 +1676,190 @@ fn markup_parent(el: &web_sys::Element) -> web_sys::Node {
     }
 }
 
-/// Replace `el`'s children with `html`, parsed by [`parse_detached`].
+/// Replace `el`'s children with `html`, parsed by [`parse_detached`], keeping
+/// each live node the new markup repeats by the rule of [`crate::dom::keep`].
 pub fn replace_children_html(document: &web_sys::Document, el: &web_sys::Element, html: &str) {
     let replaced = parse_detached(document, el, html).and_then(|parsed| {
-        let live = markup_parent(el);
-        live.set_text_content(None);
-        move_children(&parsed.nodes, &live)
+        let focused = document.active_element();
+        swap_keeping(&markup_parent(el), &parsed.nodes, focused.as_ref())
     });
     if let Err(why) = replaced {
         console_fatal("PatchTargetLost", why);
     }
+}
+
+/// A live parent whose children a swap writes, and the parsed node holding
+/// its new children.
+struct SwapPair {
+    live: web_sys::Node,
+    parsed: web_sys::Node,
+    /// Whether the pair lies inside a kept field, whose authority attributes
+    /// the user owns.
+    in_field: bool,
+}
+
+/// Swap `live`'s children for `parsed`'s, keeping every live node the new
+/// markup repeats below a kept parent.
+///
+/// Each pair is walked once and a kept node is taken from its parent's
+/// children at most once, so the walk is bounded by the live tree's size.
+fn swap_keeping(
+    live: &web_sys::Node,
+    parsed: &web_sys::Node,
+    focused: Option<&web_sys::Element>,
+) -> Result<(), &'static str> {
+    let mut pending = vec![SwapPair {
+        live: live.clone(),
+        parsed: parsed.clone(),
+        in_field: false,
+    }];
+    while let Some(pair) = pending.pop() {
+        swap_children(&pair, focused, &mut pending)?;
+    }
+    Ok(())
+}
+
+/// The children of `node`, in order.
+fn children_of(node: &web_sys::Node) -> Vec<web_sys::Node> {
+    let list = node.child_nodes();
+    (0..list.length()).filter_map(|i| list.item(i)).collect()
+}
+
+/// The identity a swap keeps a node by: its non-empty `ipe-id` and its tag,
+/// for an HTML element only. A foreign element is always rebuilt.
+fn keep_key(node: &web_sys::Node) -> Option<(String, String)> {
+    let el = node.dyn_ref::<web_sys::Element>()?;
+    if el.namespace_uri().as_deref() != Some(HTML_NS) {
+        return None;
+    }
+    let id = el
+        .get_attribute(STAMPED_ID_ATTR)
+        .filter(|id| !id.is_empty())?;
+    Some((id, el.local_name()))
+}
+
+/// What the new markup `el` of `field` says about its value. A selected-option
+/// query the browser refuses reads as controlled, so the program's value wins.
+fn control_of(field: Field, el: &web_sys::Element) -> Control {
+    let authority = AUTHORITY_ATTRS.iter().any(|name| el.has_attribute(name));
+    let text = el.text_content().is_some_and(|t| !t.is_empty());
+    let selected = !matches!(el.query_selector("option[selected]"), Ok(None));
+    Control::of(field, authority, text, selected)
+}
+
+/// Write `pair.live`'s children to `pair.parsed`'s, keeping each live child
+/// [`keep`] admits and queueing it to have its own children written.
+///
+/// A kept node already in place is never moved: the children the new markup
+/// drops leave first, and each child is then inserted only where it does not
+/// already stand.
+fn swap_children(
+    pair: &SwapPair,
+    focused: Option<&web_sys::Element>,
+    pending: &mut Vec<SwapPair>,
+) -> Result<(), &'static str> {
+    let old = children_of(&pair.live);
+    let mut by_key: HashMap<(String, String), VecDeque<usize>> = HashMap::new();
+    for (index, node) in old.iter().enumerate() {
+        if let Some(key) = keep_key(node) {
+            by_key.entry(key).or_default().push_back(index);
+        }
+    }
+    let mut taken = vec![false; old.len()];
+    let mut placed = Vec::new();
+    for new in children_of(&pair.parsed) {
+        let matched = keep_key(&new)
+            .and_then(|key| by_key.get_mut(&key)?.pop_front())
+            .and_then(|index| Some((index, old.get(index)?.dyn_ref::<web_sys::Element>()?)));
+        let (Some((index, live)), Some(markup)) = (matched, new.dyn_ref::<web_sys::Element>())
+        else {
+            placed.push(new);
+            continue;
+        };
+        let kept = keep(&live.local_name(), focused == Some(live), |field| {
+            control_of(field, markup)
+        });
+        let in_field = match kept {
+            Keep::Rebuild => {
+                placed.push(new);
+                continue;
+            }
+            Keep::Node => pair.in_field,
+            Keep::Field(_) => true,
+        };
+        write_kept_attrs(live, markup, in_field)?;
+        if let Some(slot) = taken.get_mut(index) {
+            *slot = true;
+        }
+        let live: web_sys::Node = live.clone().into();
+        // A kept `textarea`'s text is its value, which the user owns.
+        if kept != Keep::Field(Field::Textarea) {
+            pending.push(SwapPair {
+                live: live.clone(),
+                parsed: new,
+                in_field,
+            });
+        }
+        placed.push(live);
+    }
+    for (node, kept) in old.iter().zip(&taken) {
+        if !kept {
+            pair.live
+                .remove_child(node)
+                .map_err(|_| "patched node could not be detached")?;
+        }
+    }
+    let mut cursor = pair.live.first_child();
+    for node in &placed {
+        if cursor.as_ref() == Some(node) {
+            cursor = node.next_sibling();
+        } else {
+            pair.live
+                .insert_before(node, cursor.as_ref())
+                .map_err(|_| "patched node could not be attached")?;
+        }
+    }
+    Ok(())
+}
+
+/// The attribute names `el` carries.
+fn attribute_names(el: &web_sys::Element) -> Vec<String> {
+    el.get_attribute_names()
+        .iter()
+        .filter_map(|name| name.as_string())
+        .collect()
+}
+
+/// Write `live`'s attributes to `markup`'s: a missing one is removed, a
+/// different one set, an equal one left alone. Inside a kept field
+/// (`in_field`) the authority attributes stay as the user left them.
+fn write_kept_attrs(
+    live: &web_sys::Element,
+    markup: &web_sys::Element,
+    in_field: bool,
+) -> Result<(), &'static str> {
+    let owned = |name: &str| in_field && is_authority_attr(name);
+    let names = attribute_names(markup);
+    let wanted: HashSet<&str> = names.iter().map(String::as_str).collect();
+    for name in attribute_names(live) {
+        if !owned(&name) && !wanted.contains(name.as_str()) {
+            live.remove_attribute(&name)
+                .map_err(|_| "kept node attribute could not be removed")?;
+        }
+    }
+    for name in &names {
+        if owned(name) {
+            continue;
+        }
+        let Some(value) = markup.get_attribute(name) else {
+            continue;
+        };
+        if live.get_attribute(name).as_deref() != Some(value.as_str()) {
+            live.set_attribute(name, &value)
+                .map_err(|_| "kept node attribute could not be set")?;
+        }
+    }
+    Ok(())
 }
 
 /// Paint `html` as the mount root's first content, parsed by
