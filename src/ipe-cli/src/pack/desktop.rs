@@ -630,8 +630,11 @@ fn desktop_value_escape(text: &str) -> String {
 ///
 /// Generated files are written verbatim, the compiled `binary` is copied (and
 /// made executable on Unix), and the source `icon` is rendered into the bundle's
-/// per-OS icon slot. A fresh, deterministic tree: an existing bundle directory of
-/// the same name is removed first so a re-pack never leaves stale files behind.
+/// per-OS icon slot. The bundle is built whole in a staging directory beside
+/// `dist/<root_name>` and put there in one rename ([`OwnedDir::stage_dir`]): a
+/// fresh, deterministic tree that replaces the previous bundle only once
+/// complete, so a refusal at any file leaves the previous bundle exactly as it
+/// was, and no staging entry.
 /// Every path is a [`crate::output_dir::OwnedPath`], so a symlink planted in the owned `dist` is
 /// refused — never removed through, written through, or copied onto.
 ///
@@ -650,19 +653,13 @@ pub fn materialise(
     icon: Option<&Path>,
     dist: &OwnedDir,
 ) -> Result<PathBuf, CliError> {
-    let bundle_root = dist.path_to(&layout.root_name)?;
-    bundle_root.remove()?;
-    bundle_root.ensure_dir()?;
+    let staged = dist.stage_dir(&layout.root_name)?;
 
     for file in &layout.files {
-        let out_file =
-            dist.path_to(Path::new(&layout.root_name).join(rel_to_native(&file.rel_path)))?;
+        let out_file = staged.path_to(rel_to_native(&file.rel_path))?;
         match &file.content {
             BundleContent::Generated(text) => out_file.write(text.as_bytes())?,
-            BundleContent::AppBinary => {
-                out_file.copy_from(binary)?;
-                make_executable(&out_file.path())?;
-            }
+            BundleContent::AppBinary => out_file.copy_executable_from(binary)?,
             BundleContent::Icon => {
                 // Present only when the layout carries an icon, which the layout
                 // builder emits only when a source icon was given.
@@ -672,7 +669,7 @@ pub fn materialise(
             }
         }
     }
-    Ok(bundle_root.path())
+    staged.promote()
 }
 
 /// Translate a bundle-relative `/`-separated path into a native `PathBuf`.
@@ -680,24 +677,10 @@ fn rel_to_native(rel: &str) -> PathBuf {
     rel.split('/').collect()
 }
 
-/// Set the owner-execute bit on a materialised file on Unix; a no-op elsewhere.
-#[cfg(unix)]
-fn make_executable(path: &Path) -> Result<(), CliError> {
-    use std::os::unix::fs::PermissionsExt as _;
-    let meta = std::fs::symlink_metadata(path).map_err(|e| crate::io_err(path, e))?;
-    let mut perms = meta.permissions();
-    perms.set_mode(perms.mode() | 0o755);
-    std::fs::set_permissions(path, perms).map_err(|e| crate::io_err(path, e))
-}
-
-#[cfg(not(unix))]
-fn make_executable(_path: &Path) -> Result<(), CliError> {
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::output_dir::test_links::{staging_leftovers, tree_snapshot};
     use ipe_ir::WebCapability;
 
     fn accepts(items: &[Capability]) -> BTreeSet<Capability> {
@@ -977,5 +960,91 @@ mod tests {
                 _ => None,
             })
             .expect("a generated file ending in the suffix")
+    }
+
+    // ── Staged bundle: complete or absent ─────────────────────────────────────
+
+    /// A Linux bundle laid out with an icon, a scratch base holding a real binary, and an owned `dist`.
+    fn staged_bundle(tag: &str) -> (PathBuf, BundleLayout, OwnedDir) {
+        let base =
+            ipe_test_temp::temp_root().join(format!("ipe-desktop-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).expect("scratch");
+        std::fs::write(base.join("app"), b"\x7fELF binary").expect("binary");
+        std::fs::write(base.join("icon.png"), b"png").expect("icon");
+        let identity = BundleIdentity::new("My App", Some("2.0.0"), None);
+        let bundle = layout(
+            DesktopOs::Linux,
+            &identity,
+            &accepts(&[]),
+            Some(&base.join("icon.png")),
+        )
+        .expect("layout");
+        assert!(
+            bundle
+                .files
+                .iter()
+                .position(|file| matches!(file.content, BundleContent::Icon))
+                > Some(0),
+            "control: a bundle file is written before the icon"
+        );
+        let dist = OwnedDir::claim(&base.join("dist")).expect("claim dist");
+        (base, bundle, dist)
+    }
+
+    #[test]
+    fn a_bundle_refused_mid_write_lays_nothing_down() {
+        let (base, bundle, dist) = staged_bundle("staged-absent");
+        let missing = base.join("no-icon.png");
+        let result = materialise(&bundle, &base.join("app"), Some(&missing), &dist);
+        assert!(matches!(result, Err(CliError::Io { .. })), "{result:?}");
+        assert!(
+            !dist.path().join(&bundle.root_name).exists(),
+            "no partial bundle"
+        );
+        assert!(staging_leftovers(dist.path()).is_empty());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn a_bundle_refused_mid_write_keeps_the_previous_bundle_byte_for_byte() {
+        let (base, bundle, dist) = staged_bundle("staged-previous");
+        let (binary, icon) = (base.join("app"), base.join("icon.png"));
+        let root = materialise(&bundle, &binary, Some(&icon), &dist).expect("the previous bundle");
+        let before = tree_snapshot(&root);
+        assert!(before.len() > 1, "control: the previous bundle holds files");
+        let missing = base.join("no-icon.png");
+        let result = materialise(&bundle, &binary, Some(&missing), &dist);
+        assert!(matches!(result, Err(CliError::Io { .. })), "{result:?}");
+        assert_eq!(tree_snapshot(&root), before);
+        assert!(staging_leftovers(dist.path()).is_empty());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn a_staged_bundle_lands_every_file_and_leaves_nothing_behind() {
+        let (base, bundle, dist) = staged_bundle("staged-happy");
+        let (binary, icon) = (base.join("app"), base.join("icon.png"));
+        let root = materialise(&bundle, &binary, Some(&icon), &dist).expect("materialise");
+        for file in &bundle.files {
+            assert!(
+                root.join(rel_to_native(&file.rel_path)).is_file(),
+                "{}",
+                file.rel_path
+            );
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mode = std::fs::metadata(root.join("bin").join("my-app"))
+                .expect("binary")
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o755, 0o755, "the binary is executable");
+        }
+        let again = materialise(&bundle, &binary, Some(&icon), &dist).expect("a re-pack");
+        assert_eq!(again, root);
+        assert!(staging_leftovers(dist.path()).is_empty());
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

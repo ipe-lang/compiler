@@ -683,17 +683,72 @@ impl OwnedDir {
         self.owned_path(rel.as_ref())?.unlink()
     }
 
-    /// Claim the plain-named subdirectory `name` through this directory's held handle.
-    fn claim_child(&self, name: &str) -> Result<Self, CliError> {
-        let parent = held::HeldDir::open(&self.path)?.ok_or_else(|| {
+    /// Hold this directory, proven to be the one that was claimed.
+    ///
+    /// # Errors
+    /// [`OutputRefusal::Replaced`] when the path names another directory;
+    /// [`CliError::Io`] when it is absent or on a filesystem failure.
+    fn held(&self) -> Result<held::HeldDir, CliError> {
+        let dir = held::HeldDir::open(&self.path)?.ok_or_else(|| {
             io_err(
                 &self.path,
                 std::io::Error::from(std::io::ErrorKind::NotFound),
             )
         })?;
-        if parent.id()? != self.id {
+        if dir.id()? != self.id {
             return Err(OutputRefusal::Replaced(self.path.clone()).into());
         }
+        Ok(dir)
+    }
+
+    /// Start the product directory `name`, built in a sibling staging directory until promoted.
+    ///
+    /// The staging directory, `.<name>.ipe-stage.<pid>.<n>`, is created
+    /// exclusively beside `name`; every write goes there through
+    /// [`StagedDir::path_to`], and [`StagedDir::promote`] puts the finished
+    /// tree at `name` in one rename. Until then `name` keeps whatever it held,
+    /// and a staged tree never promoted is removed when the [`StagedDir`] is
+    /// dropped. Staging and set-aside entries a killed run left for `name` are
+    /// removed first, each one this run cannot remove skipped.
+    ///
+    /// # Errors
+    /// [`OutputRefusal::UnsafeComponent`] unless `name` is one name that reads
+    /// back as itself and not the marker or claim name;
+    /// [`OutputRefusal::Replaced`] when this directory was swapped;
+    /// [`CliError::Io`] when the staging directory already exists or on a
+    /// filesystem failure.
+    pub fn stage_dir(&self, name: &str) -> Result<StagedDir, CliError> {
+        let raw = std::ffi::OsStr::new(name);
+        if !ipe_fs_open::is_one_spelled_name(raw) || held::HeldDir::is_reserved(raw) {
+            return Err(OutputRefusal::UnsafeComponent(PathBuf::from(name)).into());
+        }
+        let parent = self.held()?;
+        parent.remove_prefixed(&[stage_prefix(name), aside_prefix(name)])?;
+        let staging = std::ffi::OsString::from(format!("{}{}", stage_prefix(name), temp_suffix()));
+        let staging_path = self.path.join(&staging);
+        let (child, created) = parent.create_child(&staging)?;
+        if !created {
+            return Err(io_err(
+                &staging_path,
+                std::io::Error::from(std::io::ErrorKind::AlreadyExists),
+            ));
+        }
+        let dir = Self {
+            path: staging_path,
+            id: child.id()?,
+        };
+        Ok(StagedDir {
+            parent: self.clone(),
+            target: raw.to_os_string(),
+            staging,
+            dir,
+            pending: true,
+        })
+    }
+
+    /// Claim the plain-named subdirectory `name` through this directory's held handle.
+    fn claim_child(&self, name: &str) -> Result<Self, CliError> {
+        let parent = self.held()?;
         let dir = claim_in(&parent, std::ffi::OsStr::new(name))?;
         Ok(Self {
             path: self.path.join(name),
@@ -726,6 +781,97 @@ impl OwnedDir {
             root_id: self.id,
             parts,
         })
+    }
+}
+
+/// The name prefix of every staging directory for the product `name`.
+fn stage_prefix(name: &str) -> String {
+    format!(".{name}.ipe-stage.")
+}
+
+/// The name prefix of every set-aside previous tree of the product `name`.
+fn aside_prefix(name: &str) -> String {
+    format!(".{name}.ipe-old.")
+}
+
+/// A product directory being built beside its final name, put there whole by [`StagedDir::promote`].
+///
+/// Built only by [`OwnedDir::stage_dir`]. The staging directory is recorded
+/// by identity; promotion and the drop-time discard each re-prove it before
+/// acting, so a directory swapped in at the staging name is neither promoted
+/// nor removed.
+#[must_use]
+#[derive(Debug)]
+pub struct StagedDir {
+    /// The owned directory holding the product.
+    parent: OwnedDir,
+    /// The product's final name in `parent`.
+    target: std::ffi::OsString,
+    /// The staging directory's name in `parent`.
+    staging: std::ffi::OsString,
+    /// The staging directory itself.
+    dir: OwnedDir,
+    /// Whether the staged tree still awaits promotion, so a drop discards it.
+    pending: bool,
+}
+
+impl StagedDir {
+    /// A path `rel` inside the staged tree, checked as [`OwnedDir::path_to`] checks it.
+    ///
+    /// # Errors
+    /// As [`OwnedDir::path_to`].
+    pub fn path_to(&self, rel: impl AsRef<Path>) -> Result<OwnedPath, CliError> {
+        self.dir.path_to(rel)
+    }
+
+    /// Put the staged tree at the product's name in one rename, returning the product's path.
+    ///
+    /// An absent product name is taken without replacing anything planted
+    /// there in between; an existing product directory is swapped out whole
+    /// and then removed. A link or a non-directory at the product name is
+    /// refused and left as it is, and the staged tree is discarded.
+    ///
+    /// # Errors
+    /// [`OutputRefusal::Replaced`] when the owned directory or the staging
+    /// directory was swapped; [`OutputRefusal::Symlink`] or
+    /// [`OutputRefusal::NotADirectory`] for the product name; [`CliError::Io`]
+    /// on a failed rename, or when the displaced previous tree cannot be
+    /// removed (the new tree is in place by then).
+    pub fn promote(mut self) -> Result<PathBuf, CliError> {
+        let parent = self.parent.held()?;
+        let staged = parent
+            .child(&self.staging)?
+            .ok_or_else(|| OutputRefusal::Replaced(self.dir.path.clone()))?;
+        if staged.id()? != self.dir.id {
+            return Err(OutputRefusal::Replaced(self.dir.path.clone()).into());
+        }
+        let target = self.target.to_string_lossy().into_owned();
+        let aside = std::ffi::OsString::from(format!("{}{}", aside_prefix(&target), temp_suffix()));
+        let displaced = parent.promote_dir(&self.staging, staged, &self.target, &aside)?;
+        self.pending = false;
+        if let Some(previous) = displaced {
+            parent.remove_leftover(&previous)?;
+        }
+        Ok(self.parent.path.join(&self.target))
+    }
+
+    /// Remove the staged tree, once proven still the directory this staging created.
+    fn discard(&self) -> Result<(), CliError> {
+        let parent = self.parent.held()?;
+        match parent.child(&self.staging)? {
+            Some(staged) if staged.id()? == self.dir.id => {
+                parent.remove_proven(&self.staging, staged)
+            }
+            Some(_) | None => Ok(()),
+        }
+    }
+}
+
+impl Drop for StagedDir {
+    fn drop(&mut self) {
+        if self.pending {
+            let _best_effort = self.discard();
+        }
     }
 }
 
@@ -975,14 +1121,48 @@ impl OwnedPath {
     /// [`CliError::OutputRefused`] for a symlink on the way; [`CliError::Io`] on a
     /// filesystem failure.
     pub fn copy_from(&self, source: &Path) -> Result<(), CliError> {
+        self.copy_with(source, |permissions| permissions)
+    }
+
+    /// Replace the file with a copy of `source`, its permission bits made executable.
+    ///
+    /// On Unix read and execute are added for everyone (`0o755`); elsewhere
+    /// the bits are `source`'s. The bits are set on the exclusive temp file
+    /// before the rename, so the entry is never reached by path afterwards.
+    ///
+    /// # Errors
+    /// As [`OwnedPath::copy_from`].
+    pub fn copy_executable_from(&self, source: &Path) -> Result<(), CliError> {
+        self.copy_with(source, executable)
+    }
+
+    /// Replace the file with a copy of `source`, carrying its permission bits as `adjust` maps them.
+    fn copy_with(
+        &self,
+        source: &Path,
+        adjust: impl FnOnce(std::fs::Permissions) -> std::fs::Permissions,
+    ) -> Result<(), CliError> {
         let permissions = std::fs::metadata(source)
             .map_err(|e| io_err(source, e))?
             .permissions();
         let mut reader = std::fs::File::open(source).map_err(|e| io_err(source, e))?;
-        self.replace_with(Some(permissions), |file| {
+        self.replace_with(Some(adjust(permissions)), |file| {
             std::io::copy(&mut reader, file).map(|_| ())
         })
     }
+}
+
+/// `permissions` with read and execute added for everyone.
+#[cfg(unix)]
+fn executable(permissions: std::fs::Permissions) -> std::fs::Permissions {
+    use std::os::unix::fs::PermissionsExt as _;
+    std::fs::Permissions::from_mode(permissions.mode() | 0o755)
+}
+
+/// `permissions` as they are: this platform has no execute bit.
+#[cfg(not(unix))]
+const fn executable(permissions: std::fs::Permissions) -> std::fs::Permissions {
+    permissions
 }
 
 /// The directory holding an [`OwnedPath`]'s final entry, with that entry's name.
@@ -2090,7 +2270,7 @@ mod tests {
     use super::proven::{Cwd, prove_parent_steps_from};
     #[cfg(windows)]
     use super::test_links::junction_in_place;
-    use super::test_links::plant_link;
+    use super::test_links::{plant_link, staging_leftovers};
     use super::*;
 
     /// A hostile path in any refusal cannot carry an escape sequence or open a line.
@@ -5543,12 +5723,217 @@ mod tests {
         assert_user_root_refused(&root, &claimed);
         let _ = std::fs::remove_dir_all(&base);
     }
+
+    /// An owned `dist` under a fresh scratch directory.
+    fn staged_dist(tag: &str) -> (PathBuf, OwnedDir) {
+        let base = scratch(tag);
+        let dist = OwnedDir::claim(&base.join("dist")).expect("claim dist");
+        (base, dist)
+    }
+
+    /// Stage the product `shell` in `dist` holding `file` with `contents`.
+    fn staged_with(dist: &OwnedDir, file: &str, contents: &[u8]) -> StagedDir {
+        let staged = dist.stage_dir("shell").expect("stage");
+        staged
+            .path_to(Path::new("sub").join(file))
+            .expect("staged path")
+            .write(contents)
+            .expect("staged write");
+        staged
+    }
+
+    #[test]
+    fn a_staged_product_is_promoted_into_an_absent_name() {
+        let (base, dist) = staged_dist("stage-absent");
+        let staged = staged_with(&dist, "a.txt", b"new");
+        let promoted = staged.promote().expect("promote");
+        assert_eq!(promoted, dist.path().join("shell"));
+        assert_eq!(
+            std::fs::read(promoted.join("sub").join("a.txt")).expect("read"),
+            b"new"
+        );
+        assert!(staging_leftovers(dist.path()).is_empty());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn a_staged_product_replaces_the_previous_tree_whole() {
+        let (base, dist) = staged_dist("stage-over");
+        let old = dist.path().join("shell");
+        std::fs::create_dir_all(old.join("deep")).expect("old tree");
+        std::fs::write(old.join("deep").join("old.txt"), "old").expect("old file");
+        let promoted = staged_with(&dist, "a.txt", b"new")
+            .promote()
+            .expect("promote");
+        assert!(!promoted.join("deep").exists(), "the previous tree is gone");
+        assert_eq!(
+            std::fs::read(promoted.join("sub").join("a.txt")).expect("read"),
+            b"new"
+        );
+        assert!(staging_leftovers(dist.path()).is_empty());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn a_link_at_the_product_name_is_refused_and_left_untouched() {
+        let (base, dist) = staged_dist("stage-link");
+        let victim = base.join("victim");
+        std::fs::create_dir_all(&victim).expect("victim");
+        std::fs::write(victim.join("keep.txt"), "keep").expect("victim file");
+        plant_link(&victim, &dist.path().join("shell"));
+        let promoted = staged_with(&dist, "a.txt", b"new").promote();
+        assert!(
+            matches!(
+                promoted,
+                Err(CliError::OutputRefused(OutputRefusal::Symlink(_)))
+            ),
+            "{promoted:?}"
+        );
+        let link = std::fs::symlink_metadata(dist.path().join("shell")).expect("link stays");
+        assert!(link.file_type().is_symlink());
+        assert_eq!(
+            std::fs::read(victim.join("keep.txt")).expect("victim"),
+            b"keep"
+        );
+        assert!(!victim.join("sub").exists(), "nothing written through");
+        assert!(staging_leftovers(dist.path()).is_empty());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn a_file_at_the_product_name_is_refused_and_left_untouched() {
+        let (base, dist) = staged_dist("stage-file");
+        std::fs::write(dist.path().join("shell"), "mine").expect("file");
+        let promoted = staged_with(&dist, "a.txt", b"new").promote();
+        assert!(
+            matches!(
+                promoted,
+                Err(CliError::OutputRefused(OutputRefusal::NotADirectory(_)))
+            ),
+            "{promoted:?}"
+        );
+        assert_eq!(
+            std::fs::read(dist.path().join("shell")).expect("file stays"),
+            b"mine"
+        );
+        assert!(staging_leftovers(dist.path()).is_empty());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn a_swapped_staging_directory_is_neither_promoted_nor_removed() {
+        let (base, dist) = staged_dist("stage-swap");
+        let staged = staged_with(&dist, "a.txt", b"new");
+        let staging = staged.dir.path().to_path_buf();
+        std::fs::rename(&staging, base.join("moved")).expect("move staging away");
+        std::fs::create_dir(&staging).expect("impostor");
+        std::fs::write(staging.join("theirs.txt"), "theirs").expect("impostor file");
+        let promoted = staged.promote();
+        assert!(
+            matches!(
+                promoted,
+                Err(CliError::OutputRefused(OutputRefusal::Replaced(_)))
+            ),
+            "{promoted:?}"
+        );
+        assert!(!dist.path().join("shell").exists(), "nothing promoted");
+        assert_eq!(
+            std::fs::read(staging.join("theirs.txt")).expect("impostor kept"),
+            b"theirs"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn a_staged_product_dropped_unpromoted_leaves_nothing() {
+        let (base, dist) = staged_dist("stage-drop");
+        let staged = staged_with(&dist, "a.txt", b"new");
+        let staging = staged.dir.path().to_path_buf();
+        assert!(
+            staging.join("sub").join("a.txt").exists(),
+            "control: staged"
+        );
+        drop(staged);
+        assert!(!staging.exists());
+        assert!(!dist.path().join("shell").exists());
+        assert!(staging_leftovers(dist.path()).is_empty());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn leftovers_of_a_killed_staging_are_removed_at_the_next_stage() {
+        let (base, dist) = staged_dist("stage-stale");
+        let stale = dist.path().join(".shell.ipe-stage.1.0");
+        std::fs::create_dir_all(stale.join("deep")).expect("stale stage");
+        std::fs::write(stale.join("deep").join("x"), "x").expect("stale file");
+        std::fs::create_dir(dist.path().join(".shell.ipe-old.1.1")).expect("stale aside");
+        let other = dist.path().join(".other.ipe-stage.1.2");
+        std::fs::create_dir(&other).expect("another product's stage");
+        let staged = dist.stage_dir("shell").expect("stage");
+        let live = staged
+            .dir
+            .path()
+            .file_name()
+            .expect("name")
+            .to_string_lossy()
+            .into_owned();
+        let mut left = staging_leftovers(dist.path());
+        left.sort();
+        assert_eq!(left, vec![".other.ipe-stage.1.2".to_owned(), live]);
+        drop(staged);
+        let _ = std::fs::remove_dir_all(&base);
+    }
 }
 
 /// Link-planting helpers shared by the tests of every module that walks owned trees.
 #[cfg(test)]
 pub mod test_links {
-    use std::path::Path;
+    use std::collections::BTreeMap;
+    use std::path::{Path, PathBuf};
+
+    /// The entries of `dir` a staged product leaves behind: staging or set-aside directories.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `dir` cannot be listed (a test-setup failure).
+    #[must_use]
+    pub fn staging_leftovers(dir: &Path) -> Vec<String> {
+        std::fs::read_dir(dir)
+            .expect("list dist")
+            .map(|entry| {
+                entry
+                    .expect("dist entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .filter(|name| name.contains(".ipe-stage.") || name.contains(".ipe-old."))
+            .collect()
+    }
+
+    /// Every path under `root`, relative to it, with a file's bytes (`None` for a directory).
+    ///
+    /// # Panics
+    ///
+    /// Panics if the tree cannot be read (a test-setup failure).
+    #[must_use]
+    pub fn tree_snapshot(root: &Path) -> BTreeMap<PathBuf, Option<Vec<u8>>> {
+        let mut tree = BTreeMap::new();
+        let mut pending = vec![root.to_path_buf()];
+        while let Some(dir) = pending.pop() {
+            for entry in std::fs::read_dir(&dir).expect("list tree") {
+                let path = entry.expect("tree entry").path();
+                let rel = path.strip_prefix(root).expect("under root").to_path_buf();
+                if std::fs::symlink_metadata(&path).expect("stat").is_dir() {
+                    pending.push(path);
+                    tree.insert(rel, None);
+                } else {
+                    tree.insert(rel, Some(std::fs::read(&path).expect("read tree file")));
+                }
+            }
+        }
+        tree
+    }
 
     /// Plant a symbolic link at `link` pointing to `target`.
     ///
