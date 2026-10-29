@@ -15,7 +15,7 @@ import Lib.PageSize as PageSize exposing (PageSize)
 import Lib.Queue as Queue exposing (UnitPageState(..))
 import Lib.SafeText as SafeText
 import Lib.Uid as Uid exposing (Uid)
-import TestSupport exposing (openFileAt, appendSigned, check, codeText, countingVerifier, freshDir, rawKeyCheckFor, rawRow, uid)
+import TestSupport exposing (openFileAt, appendSigned, check, codeText, countingVerifier, freshDir, rawKeyCheckFor, RawName(..), RawRow, rawRow, uid)
 
 
 -- ── unit ids ────────────────────────────────────────────────────────────
@@ -273,6 +273,8 @@ failsWithout stored task =
 -- repeats no uid: a uid leaves its type only through its sink exits. A
 -- signed log entry holding such a decision is never counted: it reads
 -- `Tampered`, and the uid has no previous review.
+-- A signed `acknowledge` on a file, a word no writer stores, reads
+-- `Tampered` too, never as an acknowledgement or an approval.
 -- Red if an unknown decision reads as any decision, or its error names the
 -- uid.
 unknownStoredDecisionRefused : Task.Task Error Bool
@@ -287,10 +289,18 @@ unknownStoredDecisionRefused =
         badUid <- failsWithout "zz" (LibDb.historyPage badVerify bad PageSize.history HistoryStart)
         logged <- uncheckedReview "ipe-review-unknown-logged" []
         appendSigned logged (rawRow "u-l" "h" "maybe" Nothing)
+        appendSigned logged (rawFileRow "u-k" "h" "acknowledge")
         loggedVerify <- countingVerifier logged
         loggedPair <- LibDb.findDecision loggedVerify logged (uid "u-l") "h"
         loggedUid <- LibDb.findLatestForUid loggedVerify logged (uid "u-l")
-        Task.succeed (byPair && page && badUid && isTampered loggedPair && loggedUid == Nothing)
+        ackPair <- LibDb.findDecision loggedVerify logged (uid "u-k") "h"
+        Task.succeed (byPair && page && badUid && isTampered loggedPair && loggedUid == Nothing && isTampered ackPair)
+
+
+-- A signed row naming a file with no reason.
+rawFileRow : String -> String -> String -> RawRow
+rawFileRow label bodyHash decision =
+    { name = RawFile "ipe:src/blob.bin", uid = uid label, bodyHash = bodyHash, decision = decision, reason = Nothing, reviewedAt = 0 }
 
 
 isTampered : Maybe ReviewEntry -> Bool
@@ -339,6 +349,9 @@ blankRefusal decision =
             SafeText.toString (LibDb.storedReasonText reason) == "reason not shown: it is blank"
 
         StoredApproved ->
+            False
+
+        StoredAcknowledged ->
             False
 
 
