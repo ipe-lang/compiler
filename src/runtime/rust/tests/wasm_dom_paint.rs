@@ -6,6 +6,10 @@
 //! at first paint only while the load's own autofocus is due. Real Chromium
 //! (`wasm-bindgen-test-runner` + `chromedriver`): no other runner has a DOM.
 //!
+//! A children swap keeps each live node its new markup repeats by `ipe-id`
+//! and tag (`dom::keep`): a focused field keeps its value and selection, and a
+//! changed tag builds a new node.
+//!
 //! Each test paints into its own element below the body, never the body
 //! itself, which holds the runner's own report.
 //!
@@ -402,4 +406,167 @@ async fn focus_in_the_overlay_records_nothing() {
     frames(3).await;
     assert_eq!(focused_id(&doc), "");
     overlay.remove();
+}
+
+/// The element `id` below `document`.
+fn by_id(document: &web_sys::Document, id: &str) -> Option<web_sys::Element> {
+    document.get_element_by_id(id)
+}
+
+/// Whether `a` and `b` are the same DOM node, the same JS object.
+fn same_object(a: &web_sys::Element, b: &web_sys::Element) -> bool {
+    js_sys::Object::is(a.as_ref(), b.as_ref())
+}
+
+#[wasm_bindgen_test]
+fn a_sibling_swap_keeps_the_focused_field_node() {
+    let doc = document();
+    assert!(doc.is_some(), "run_in_browser must provide a document");
+    let Some(doc) = doc else { return };
+    let root = view(
+        &doc,
+        "kpf",
+        r#"<div ipe-id="kpf_0_div"><span ipe-id="kpf_0_div_0_span" id="kpf-old">a</span><input ipe-id="kpf_0_div_1_input" id="kpf-field" class="before" data-stale="x"></div>"#,
+    );
+    assert!(root.is_some(), "the view must attach");
+    let Some(root) = root else { return };
+    let field =
+        by_id(&doc, "kpf-field").and_then(|el| el.dyn_into::<web_sys::HtmlInputElement>().ok());
+    assert!(field.is_some(), "the field must attach");
+    let Some(field) = field else { return };
+    assert!(focus_on(&doc, "kpf-field"));
+    field.set_value("typed");
+    assert!(field.set_selection_range(2, 3).is_ok());
+    let swap = [patch(
+        "kpf_0_div",
+        Some(
+            r#"<p ipe-id="kpf_0_div_0_p" id="kpf-new">b</p><input ipe-id="kpf_0_div_1_input" id="kpf-field" class="after">"#,
+        ),
+        &[],
+    )];
+    apply_frame(&doc, &swap, None, &QueuedCause::default());
+    let now = by_id(&doc, "kpf-field");
+    assert!(now.is_some(), "the field must stay in the view");
+    let Some(now) = now else { return };
+    assert!(
+        same_object(&now, field.as_ref()),
+        "the field stays the same node"
+    );
+    assert_eq!(field.value(), "typed");
+    assert_eq!(field.selection_start().ok().flatten(), Some(2));
+    assert_eq!(field.selection_end().ok().flatten(), Some(3));
+    assert_eq!(focused_id(&doc), "kpf-field");
+    assert_eq!(now.get_attribute("class").as_deref(), Some("after"));
+    assert!(!now.has_attribute("data-stale"), "no stale attribute stays");
+    assert!(by_id(&doc, "kpf-old").is_none());
+    assert!(by_id(&doc, "kpf-new").is_some());
+    root.remove();
+}
+
+#[wasm_bindgen_test]
+fn a_tag_change_under_the_same_id_rebuilds() {
+    let doc = document();
+    assert!(doc.is_some(), "run_in_browser must provide a document");
+    let Some(doc) = doc else { return };
+    let root = view(
+        &doc,
+        "kpt",
+        r#"<div ipe-id="kpt_0_div"><span ipe-id="kpt_0_div_0_x" id="kpt-node">a</span></div>"#,
+    );
+    assert!(root.is_some(), "the view must attach");
+    let Some(root) = root else { return };
+    let before = by_id(&doc, "kpt-node");
+    assert!(before.is_some(), "the node must attach");
+    let Some(before) = before else { return };
+    let swap = [patch(
+        "kpt_0_div",
+        Some(r#"<b ipe-id="kpt_0_div_0_x" id="kpt-node">a</b>"#),
+        &[],
+    )];
+    apply_frame(&doc, &swap, None, &QueuedCause::default());
+    let after = by_id(&doc, "kpt-node");
+    assert!(after.is_some(), "the new node must attach");
+    let Some(after) = after else { return };
+    assert!(!same_object(&before, &after), "a new tag is a new node");
+    assert_eq!(after.local_name(), "b");
+    root.remove();
+}
+
+#[wasm_bindgen_test]
+fn a_kept_node_has_its_own_children_swapped_in_place() {
+    let doc = document();
+    assert!(doc.is_some(), "run_in_browser must provide a document");
+    let Some(doc) = doc else { return };
+    let root = view(
+        &doc,
+        "kpn",
+        r#"<ul ipe-id="kpn_0_ul"><li ipe-id="kpn_d" id="kpn-a" title="x">a</li><li ipe-id="kpn_d" id="kpn-b">b</li><li ipe-id="kpn_0_ul_2_li" id="kpn-gone">c</li></ul>"#,
+    );
+    assert!(root.is_some(), "the view must attach");
+    let Some(root) = root else { return };
+    let list = root.query_selector("ul").ok().flatten();
+    let first = by_id(&doc, "kpn-a");
+    let second = by_id(&doc, "kpn-b");
+    assert!(
+        list.is_some() && first.is_some() && second.is_some(),
+        "the list must attach"
+    );
+    let (Some(list), Some(first), Some(second)) = (list, first, second) else {
+        return;
+    };
+    // Two siblings share an `ipe-id`: each new one keeps the live one at its
+    // own rank, in order.
+    let swap = [patch(
+        "kpn",
+        Some(
+            r#"<ul ipe-id="kpn_0_ul"><li ipe-id="kpn_d" id="kpn-a">A<em>!</em></li><li ipe-id="kpn_d" id="kpn-b">B</li></ul>"#,
+        ),
+        &[],
+    )];
+    apply_frame(&doc, &swap, None, &QueuedCause::default());
+    let kept = root.query_selector("ul").ok().flatten();
+    assert!(
+        kept.is_some_and(|now| same_object(&now, &list)),
+        "the list stays the same node"
+    );
+    assert!(by_id(&doc, "kpn-a").is_some_and(|now| same_object(&now, &first)));
+    assert!(by_id(&doc, "kpn-b").is_some_and(|now| same_object(&now, &second)));
+    assert_eq!(first.inner_html(), "A<em>!</em>");
+    assert_eq!(second.text_content().as_deref(), Some("B"));
+    assert!(!first.has_attribute("title"), "no stale attribute stays");
+    assert!(by_id(&doc, "kpn-gone").is_none());
+    root.remove();
+}
+
+#[wasm_bindgen_test]
+fn an_unfocused_controlled_field_is_rebuilt_with_the_programs_value() {
+    let doc = document();
+    assert!(doc.is_some(), "run_in_browser must provide a document");
+    let Some(doc) = doc else { return };
+    let root = view(
+        &doc,
+        "kpc",
+        r#"<input ipe-id="kpc_0_input" id="kpc-field" value="old">"#,
+    );
+    assert!(root.is_some(), "the view must attach");
+    let Some(root) = root else { return };
+    let before = by_id(&doc, "kpc-field");
+    assert!(before.is_some(), "the field must attach");
+    let Some(before) = before else { return };
+    let swap = [patch(
+        "kpc",
+        Some(r#"<input ipe-id="kpc_0_input" id="kpc-field" value="new">"#),
+        &[],
+    )];
+    apply_frame(&doc, &swap, None, &QueuedCause::default());
+    let after =
+        by_id(&doc, "kpc-field").and_then(|el| el.dyn_into::<web_sys::HtmlInputElement>().ok());
+    assert!(after.is_some(), "the field must attach");
+    let Some(after) = after else { return };
+    assert!(
+        !same_object(&before, after.as_ref()),
+        "the program's value wins"
+    );
+    assert_eq!(after.value(), "new");
+    root.remove();
 }
