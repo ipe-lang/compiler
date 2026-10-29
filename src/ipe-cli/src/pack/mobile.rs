@@ -6320,13 +6320,6 @@ mod tests {
             .collect()
     }
 
-    /// The `content` of the first policy meta in `page`.
-    fn meta_policy(page: &str) -> &str {
-        page.split_once("<meta http-equiv=\"Content-Security-Policy\" content=\"")
-            .and_then(|(_, rest)| rest.split_once('"'))
-            .map_or("", |(content, _)| content)
-    }
-
     /// `text` with every whitespace run collapsed to one space.
     fn collapsed(text: &str) -> String {
         text.split_whitespace().collect::<Vec<_>>().join(" ")
@@ -6623,7 +6616,7 @@ mod tests {
             let hosted = ContentSecurityPolicy::for_bundle(&reach, BundleWorker::None);
             assert_eq!(written, page_with(&[&hosted.meta_element()]));
             assert_eq!(
-                connect_of(meta_policy(&written)).contains("'self'"),
+                connect_of(&hosted.header_value()).contains("'self'"),
                 matches!(host, BundleHost::IosScheme),
                 "{written}"
             );
