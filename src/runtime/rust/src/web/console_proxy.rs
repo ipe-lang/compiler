@@ -564,8 +564,9 @@ mod tests {
     use super::*;
 
     /// The proxy routes spell their catch-all in the router's syntax: the base
-    /// and every path beneath it reach the proxy entry, a sibling prefix does
-    /// not.
+    /// and every path beneath it reach the proxy entry; a sibling prefix does
+    /// not, nor the base with only a trailing slash (`{*rest}` matches no
+    /// empty rest).
     #[tokio::test]
     #[allow(clippy::expect_used)] // test: fixed requests build
     async fn proxy_routes_cover_the_console_base_and_beneath_it() {
@@ -574,6 +575,7 @@ mod tests {
         for (path, routed) in [
             ("/_ipe/console", true),
             ("/_ipe/console/api/x", true),
+            ("/_ipe/console/", false),
             ("/_ipe/consolex", false),
             ("/_ipe", false),
         ] {
