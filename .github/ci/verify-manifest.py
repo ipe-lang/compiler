@@ -5914,7 +5914,7 @@ PINNED_CHECKOUT_USES = frozenset({
     "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
 })
 CHECKOUT_WITH_KEYS = frozenset({"fetch-depth", "persist-credentials", "sparse-checkout", "sparse-checkout-cone-mode"})
-PINNED_SETUP_PYTHON_USES = frozenset({"actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97"})
+PINNED_SETUP_PYTHON_USES = frozenset({"actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0"})
 SETUP_PYTHON_WITH_KEYS = frozenset({"python-version"})
 # The keys that can turn a red step or job green: a skipped step or job, and a
 # failure-ignored one, both report success (GitHub counts a skipped required
