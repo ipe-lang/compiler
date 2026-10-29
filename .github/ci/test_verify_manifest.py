@@ -9338,6 +9338,18 @@ class TestWasmClippyLegs(unittest.TestCase):
         steps = tuple(_wc_step(leg) if _WC_LEG_A in s else s for s in _WC_OK)
         self.assertRefused(steps, "test cell ipe-runtime-rust test:wasm_dom_paint")
 
+    def test_wasm_default_features_join_the_effective_set(self) -> None:
+        # A cell compiles with its package's defaults on; a `--no-default-features`
+        # leg drops them, so once `default` gains a feature that leg no longer
+        # lints the cell's cfg set, while a default-on leg still does.
+        _write(os.path.join(self.repo, "rt/Cargo.toml"), _WC_RT.replace("default = []", 'default = ["json"]'))
+        errors = self.errors(*_WC_OK)
+        self.assertTrue(
+            any(e.startswith("check 25: test cell ipe-runtime-rust lib wasm32-unknown-unknown") for e in errors),
+            errors,
+        )
+        self.assertFalse(any("test:wasm_dom_paint" in e for e in errors), errors)
+
     def test_missing_lint_job_refused(self) -> None:
         _write(os.path.join(self.root, "workflows", "ci.yml"), _wc_ci(*_WC_OK).replace("wasm-floor:", "other:"))
         errors: list[str] = []

@@ -14,6 +14,8 @@
 //! so this is not currying — it's a function that returns a function-typed
 //! value. These are recognised structurally (return-Fn arg == `ServerRequest`)
 //! so new middleware don't need allowlisting.
+// Native only: a source walk over native-only dev-dependencies.
+#![cfg(not(target_arch = "wasm32"))]
 
 #[test]
 fn no_unintended_curried_helpers() {

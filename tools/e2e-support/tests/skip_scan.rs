@@ -210,6 +210,11 @@ const ENV_SKIPS: &[(&str, &str, &str)] = &[
         "the wasm32 rustup target is not installed",
     ),
     (
+        "src/ipe-cli/tests/wasm_target_gate.rs",
+        "routed_web_app_compiles_for_wasm",
+        "the wasm32 rustup target is not installed",
+    ),
+    (
         "src/ipe-cli/tests/static_emit.rs",
         "end_to_end_static_binary_is_static_and_runs",
         "the static-linking tier is opt-in and needs a static toolchain",

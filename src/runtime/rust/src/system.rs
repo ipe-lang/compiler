@@ -2323,8 +2323,17 @@ fn admit_named(raw: std::os::fd::RawFd, flags: rustix::io::FdFlags) -> Result<()
 type NamedSet = NamedFds;
 /// The set a spawn hands its child: [`NamedFds`] on Unix, nothing elsewhere.
 #[cfg(not(unix))]
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Debug)]
 struct NamedSet;
+
+#[cfg(not(unix))]
+impl NamedSet {
+    /// The empty set, spelled as `NamedFds::none` is on Unix so every spawn
+    /// site names the empty set the same way on both cfgs.
+    const fn none() -> Self {
+        Self
+    }
+}
 
 /// Write `n`'s listing name (its decimal digits) into `buf`.
 ///
@@ -2648,7 +2657,7 @@ fn request_spawn<T: Send + 'static>(
 /// (`DescriptorTableUnlisted`), or when the spawn itself fails. No refusal
 /// leaves a child running, and none ever falls back to an unhardened spawn.
 pub fn spawn_hardened(cmd: std::process::Command) -> Result<std::process::Child, SpawnRefusal> {
-    spawn_hardened_on(spawner()?, SPAWN_REPLY_CEILING, cmd, NamedSet::default())
+    spawn_hardened_on(spawner()?, SPAWN_REPLY_CEILING, cmd, NamedSet::none())
 }
 
 /// [`spawn_hardened`], also handing the child every descriptor in `named`.
@@ -2723,7 +2732,7 @@ pub fn spawn_hardened_tokio(
             let _runtime = handle.enter();
             #[cfg(unix)]
             let _drivers = probe_child_listener()?;
-            harden_spawned_child(cmd.as_std_mut(), NamedSet::default())?;
+            harden_spawned_child(cmd.as_std_mut(), NamedSet::none())?;
             cmd.spawn().map_err(SpawnRefusal::Spawn)
         },
         |mut child: tokio::process::Child| {
@@ -5428,7 +5437,7 @@ mod parent_death_floor_tests {
         let _ = std::fs::remove_file(&marker);
         let mut cmd = std::process::Command::new("/bin/sh");
         cmd.arg("-c").arg(": > \"$1\"").arg("sh").arg(&marker);
-        let refused = spawn_hardened_on(&jobs, Duration::from_secs(5), cmd, NamedSet::default());
+        let refused = spawn_hardened_on(&jobs, Duration::from_secs(5), cmd, NamedSet::none());
         assert!(
             matches!(refused, Err(SpawnRefusal::SpawnerGone)),
             "{refused:?}"
@@ -5450,7 +5459,7 @@ mod parent_death_floor_tests {
         let _ = std::fs::remove_file(&marker);
         let mut cmd = std::process::Command::new("/bin/sh");
         cmd.arg("-c").arg(": > \"$1\"").arg("sh").arg(&marker);
-        let refused = spawn_hardened_on(&jobs, Duration::ZERO, cmd, NamedSet::default());
+        let refused = spawn_hardened_on(&jobs, Duration::ZERO, cmd, NamedSet::none());
         assert!(
             matches!(refused, Err(SpawnRefusal::ReplyTimedOut)),
             "{refused:?}"
@@ -5563,7 +5572,7 @@ mod parent_death_floor_tests {
             &jobs,
             Duration::from_secs(5),
             std::process::Command::new("/bin/true"),
-            NamedSet::default(),
+            NamedSet::none(),
         );
         dropper.join().expect("dropper thread");
         assert!(
@@ -5584,7 +5593,7 @@ mod parent_death_floor_tests {
         let (mut reader, writer) = std::io::pipe().expect("pipe");
         let mut cmd = std::process::Command::new("/bin/sleep");
         cmd.arg("30").stdout(writer);
-        let refused = spawn_hardened_on(&jobs, Duration::ZERO, cmd, NamedSet::default());
+        let refused = spawn_hardened_on(&jobs, Duration::ZERO, cmd, NamedSet::none());
         assert!(
             matches!(refused, Err(SpawnRefusal::ReplyTimedOut)),
             "{refused:?}"

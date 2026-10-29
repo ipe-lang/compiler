@@ -70,6 +70,37 @@ fn emitted_sources(out: &Path) -> Result<String, Box<dyn std::error::Error>> {
     Ok(all)
 }
 
+/// Whether `rustc` lists `wasm32-unknown-unknown`. An emitted-crate check skips
+/// cleanly without it (a missing target is an environment gap, not a codegen
+/// defect); the pinned toolchain carries it in CI.
+fn wasm32_installed() -> bool {
+    std::process::Command::new("rustc")
+        .args(["--print", "target-list"])
+        .output()
+        .is_ok_and(|o| String::from_utf8_lossy(&o.stdout).contains("wasm32-unknown-unknown"))
+}
+
+/// `cargo check --target wasm32-unknown-unknown` on the emitted crate at `out`.
+///
+/// The external `cargo check` runs against a STABLE wasm target dir that
+/// persists across the run, so the wasm dependency graph compiles once and
+/// stays warm: no first-time registry fetch or cold dep compile happens under
+/// shard load. Paired with the `wasm-external-cargo` serialization group
+/// (`.config/nextest.toml`) every caller joins, only one wasm `cargo check`
+/// runs at a time, so it never contends the global cargo registry/target lock
+/// with a concurrent build.
+#[allow(clippy::expect_used)] // test helper: a failed cargo spawn IS the failure
+fn cargo_check_wasm(out: &Path, runtime: &Path) -> std::process::ExitStatus {
+    let wasm_target = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("wasm_hydrate_seal_target");
+    std::process::Command::new("cargo")
+        .args(["check", "--target", "wasm32-unknown-unknown"])
+        .current_dir(out)
+        .env("CARGO_TARGET_DIR", &wasm_target)
+        .env("IPE_RUNTIME_DIR", runtime)
+        .status()
+        .expect("spawn cargo check")
+}
+
 /// A pure `Ipe.Ui` TEA app: the smallest program the wasm target accepts.
 const PURE_UI_APP: &str = "module Main exposing (main)\n\
          import Ipe.String as String\n\
@@ -295,6 +326,79 @@ fn wasm_web_app_ipe_main_return_type_is_ipe_task() {
     );
 }
 
+/// A routed `Web.tea`: the Model has a `page` field and `routes` is non-empty.
+const ROUTED_APP: &str = "module Main exposing (main)\n\
+     import Ipe.String as String\n\
+     import Ipe.Tea.Web exposing (tea, route)\n\
+     import Ipe.Tea.Web.Cmd as Cmd\n\
+     import Ipe.Tea.Web.Sub as Sub\n\
+     import Ipe.Ui as Ui\n\
+     \n\
+     type Page = Home | About\n\
+     type Msg = NoOp\n\
+     type alias Model = { page : Page, count : Int }\n\
+     \n\
+     init : WebReq -> ( Model, Cmd Msg )\n\
+     init _req = ( { page = Home, count = 0 }, Cmd.none )\n\
+     \n\
+     update : Msg -> Model -> ( Model, Cmd Msg )\n\
+     update msg model =\n\
+     \x20   case msg of\n\
+     \x20       NoOp -> ( model, Cmd.none )\n\
+     \n\
+     subscriptions : Model -> Sub Msg\n\
+     subscriptions _model = Sub.none\n\
+     \n\
+     view : Model -> Element Msg\n\
+     view _model = Ui.text \"hello\"\n\
+     \n\
+     main =\n\
+     \x20   tea\n\
+     \x20       { init = init\n\
+     \x20       , update = update\n\
+     \x20       , view = view\n\
+     \x20       , subscriptions = subscriptions\n\
+     \x20       , routes = [ route \"/\" Home, route \"/about\" About ]\n\
+     \x20       , notFound = Home\n\
+     \x20       }\n";
+
+/// [`ROUTED_APP`] with `onNavigate`, so `set_page` shares `update`.
+const ROUTED_ON_NAVIGATE_APP: &str = "module Main exposing (main)\n\
+     import Ipe.String as String\n\
+     import Ipe.Tea.Web exposing (tea, route)\n\
+     import Ipe.Tea.Web.Cmd as Cmd\n\
+     import Ipe.Tea.Web.Sub as Sub\n\
+     import Ipe.Ui as Ui\n\
+     \n\
+     type Page = Home | About\n\
+     type Msg = Navigate Page\n\
+     type alias Model = { page : Page, count : Int }\n\
+     \n\
+     init : WebReq -> ( Model, Cmd Msg )\n\
+     init _req = ( { page = Home, count = 0 }, Cmd.none )\n\
+     \n\
+     update : Msg -> Model -> ( Model, Cmd Msg )\n\
+     update msg model =\n\
+     \x20   case msg of\n\
+     \x20       Navigate page -> ( { model | page = page }, Cmd.none )\n\
+     \n\
+     subscriptions : Model -> Sub Msg\n\
+     subscriptions _model = Sub.none\n\
+     \n\
+     view : Model -> Element Msg\n\
+     view _model = Ui.text \"hello\"\n\
+     \n\
+     main =\n\
+     \x20   tea\n\
+     \x20       { init = init\n\
+     \x20       , update = update\n\
+     \x20       , view = view\n\
+     \x20       , subscriptions = subscriptions\n\
+     \x20       , routes = [ route \"/\" Home, route \"/about\" About ]\n\
+     \x20       , notFound = Home\n\
+     \x20       , onNavigate = Navigate\n\
+     \x20       }\n";
+
 /// A routed `Web.tea` (Model has a `page` field, `routes` non-empty) emits
 /// `wasm_app_routed` under `--target wasm`. The emitted manifest must have the
 /// same closed cdylib shape as the non-routed app, and the emitted `main.rs`
@@ -302,42 +406,7 @@ fn wasm_web_app_ipe_main_return_type_is_ipe_task() {
 #[test]
 fn routed_web_app_emits_wasm_app_routed() {
     let dir = scratch("wasm_gate_routed");
-    let fixture = write_fixture(
-        "module Main exposing (main)\n\
-         import Ipe.String as String\n\
-         import Ipe.Tea.Web exposing (tea, route)\n\
-         import Ipe.Tea.Web.Cmd as Cmd\n\
-         import Ipe.Tea.Web.Sub as Sub\n\
-         import Ipe.Ui as Ui\n\
-         \n\
-         type Page = Home | About\n\
-         type Msg = NoOp\n\
-         type alias Model = { page : Page, count : Int }\n\
-         \n\
-         init : WebReq -> ( Model, Cmd Msg )\n\
-         init _req = ( { page = Home, count = 0 }, Cmd.none )\n\
-         \n\
-         update : Msg -> Model -> ( Model, Cmd Msg )\n\
-         update msg model =\n\
-         \x20   case msg of\n\
-         \x20       NoOp -> ( model, Cmd.none )\n\
-         \n\
-         subscriptions : Model -> Sub Msg\n\
-         subscriptions _model = Sub.none\n\
-         \n\
-         view : Model -> Element Msg\n\
-         view _model = Ui.text \"hello\"\n\
-         \n\
-         main =\n\
-         \x20   tea\n\
-         \x20       { init = init\n\
-         \x20       , update = update\n\
-         \x20       , view = view\n\
-         \x20       , subscriptions = subscriptions\n\
-         \x20       , routes = [ route \"/\" Home, route \"/about\" About ]\n\
-         \x20       , notFound = Home\n\
-         \x20       }\n",
-    );
+    let fixture = write_fixture(ROUTED_APP);
     let out = dir.join("out");
     build_wasm(&fixture, &out).expect("routed Web.tea must build under --target wasm");
 
@@ -374,43 +443,7 @@ fn routed_web_app_emits_wasm_app_routed() {
 #[test]
 fn routed_web_app_with_on_navigate_emits_update_once() {
     let dir = scratch("wasm_gate_routed_on_navigate");
-    let fixture = write_fixture(
-        "module Main exposing (main)\n\
-         import Ipe.String as String\n\
-         import Ipe.Tea.Web exposing (tea, route)\n\
-         import Ipe.Tea.Web.Cmd as Cmd\n\
-         import Ipe.Tea.Web.Sub as Sub\n\
-         import Ipe.Ui as Ui\n\
-         \n\
-         type Page = Home | About\n\
-         type Msg = Navigate Page\n\
-         type alias Model = { page : Page, count : Int }\n\
-         \n\
-         init : WebReq -> ( Model, Cmd Msg )\n\
-         init _req = ( { page = Home, count = 0 }, Cmd.none )\n\
-         \n\
-         update : Msg -> Model -> ( Model, Cmd Msg )\n\
-         update msg model =\n\
-         \x20   case msg of\n\
-         \x20       Navigate page -> ( { model | page = page }, Cmd.none )\n\
-         \n\
-         subscriptions : Model -> Sub Msg\n\
-         subscriptions _model = Sub.none\n\
-         \n\
-         view : Model -> Element Msg\n\
-         view _model = Ui.text \"hello\"\n\
-         \n\
-         main =\n\
-         \x20   tea\n\
-         \x20       { init = init\n\
-         \x20       , update = update\n\
-         \x20       , view = view\n\
-         \x20       , subscriptions = subscriptions\n\
-         \x20       , routes = [ route \"/\" Home, route \"/about\" About ]\n\
-         \x20       , notFound = Home\n\
-         \x20       , onNavigate = Navigate\n\
-         \x20       }\n",
-    );
+    let fixture = write_fixture(ROUTED_ON_NAVIGATE_APP);
     let out = dir.join("out");
     build_wasm(&fixture, &out)
         .expect("routed Web.tea with onNavigate must build under --target wasm");
@@ -423,6 +456,42 @@ fn routed_web_app_with_on_navigate_emits_update_once() {
         1,
         "onNavigate present ⇒ `update` is emitted once and shared, got:\n{main_rs}"
     );
+}
+
+/// THE ROUTED SEAL: a routed `Web.tea` emitted for the browser must
+/// `cargo check` for `wasm32-unknown-unknown`. The emitter spells the runtime's
+/// `wasm_app_routed` signature (its `RoutedPages` argument and the `set_page`
+/// and `render` closures) by hand, so an emitter/runtime drift is an
+/// ipe-exit-0-then-cargo-fail only this build can see. Both `set_page` shapes
+/// are built: the record update, and the shared `update` an `onNavigate`
+/// routes through.
+///
+/// Gated on `IPE_E2E=1` (needs a working cargo) AND the wasm target.
+#[test]
+#[allow(clippy::expect_used)] // test setup: a failed emit IS the failure
+fn routed_web_app_compiles_for_wasm() {
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
+        return;
+    }
+    if !wasm32_installed() {
+        return;
+    }
+    let runtime = e2e_support::require_runtime().into_path_buf();
+    for (name, source) in [
+        ("wasm_routed_seal", ROUTED_APP),
+        ("wasm_routed_on_navigate_seal", ROUTED_ON_NAVIGATE_APP),
+    ] {
+        let fixture = write_fixture(source);
+        let out = scratch_isolated(name).join("out");
+        build_wasm(&fixture, &out).expect("a routed Web.tea must emit under --target wasm");
+        let status = cargo_check_wasm(&out, &runtime);
+        assert!(
+            status.success(),
+            "the emitted routed wasm crate `{name}` must `cargo check` for \
+             wasm32-unknown-unknown (the emitted `wasm_app_routed` call must match \
+             the runtime signature)"
+        );
+    }
 }
 
 /// Naming a server-only kernel under `--target wasm` is a compile error
@@ -747,13 +816,7 @@ fn hydrate_glue_type_name_matches_emitted_struct_and_compiles_for_wasm() {
     if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
         return;
     }
-    // Skip cleanly when the wasm target is not installed (cargo check would
-    // fail on a missing target — an environment gap, not a codegen defect).
-    let target_installed = std::process::Command::new("rustc")
-        .args(["--print", "target-list"])
-        .output()
-        .is_ok_and(|o| String::from_utf8_lossy(&o.stdout).contains("wasm32-unknown-unknown"));
-    if !target_installed {
+    if !wasm32_installed() {
         return;
     }
     let runtime = e2e_support::require_runtime().into_path_buf();
@@ -784,24 +847,7 @@ fn hydrate_glue_type_name_matches_emitted_struct_and_compiles_for_wasm() {
 
     // THE SEAL: the emitted crate must actually compile for wasm. A glue/type
     // name mismatch is an E0433/E0425 here, turning ipe-exit-0 into a hard red.
-    //
-    // The external `cargo check` runs against a STABLE wasm target dir that
-    // persists across the run, so the wasm dependency graph compiles once and
-    // stays warm: no first-time registry fetch or cold dep compile happens under
-    // shard load. Paired with this test's `wasm-external-cargo` serialization
-    // group (`.config/nextest.toml`), only one wasm `cargo check` runs at a time,
-    // so it never contends the global cargo registry/target lock with a
-    // concurrent build. A throwaway per-invocation target would instead force a
-    // cold compile every run, which under CI load was the transient failure a
-    // retry used to mask.
-    let wasm_target = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("wasm_hydrate_seal_target");
-    let status = std::process::Command::new("cargo")
-        .args(["check", "--target", "wasm32-unknown-unknown"])
-        .current_dir(&out)
-        .env("CARGO_TARGET_DIR", &wasm_target)
-        .env("IPE_RUNTIME_DIR", &runtime)
-        .status()
-        .expect("spawn cargo check");
+    let status = cargo_check_wasm(&out, &runtime);
     assert!(
         status.success(),
         "the emitted wasm-hydration crate must `cargo check` for wasm32-unknown-unknown \
