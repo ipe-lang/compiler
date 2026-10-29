@@ -200,6 +200,7 @@ pub(crate) fn install_assets(
         ServedInstall::On { name: _, icon } => {
             if files.contains_key(INSTALL_ICON_FILE) {
                 return Err(Diagnostic::CompilerBug {
+                    where_: "ipe_backend_rust::served_install::install_assets",
                     detail: format!(
                         "a text file already holds the install icon's path {INSTALL_ICON_FILE}"
                     ),

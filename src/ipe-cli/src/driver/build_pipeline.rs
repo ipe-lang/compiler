@@ -2739,6 +2739,7 @@ fn asset_manifest<'a>(
         let path = PathBuf::from(rel.as_str());
         if manifest.contains_key(&path) {
             return Err(backend_invariant_err(Diagnostic::CompilerBug {
+                where_: "ipe::driver::build_pipeline::asset_manifest",
                 detail: format!("the emitted asset {} is also a text file", rel.as_str()),
             }));
         }
