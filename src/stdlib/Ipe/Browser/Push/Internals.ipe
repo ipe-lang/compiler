@@ -184,6 +184,10 @@ decodeSubscription text =
 
 
 -- | `encodeSubscription subscription` — the one canonical subscription text.
+--
+-- Its string escapes are `Ipe.Json.Encode`'s, which also escape `<`, `>`, `&`,
+-- U+2028 and U+2029, so a host that renders the text must spell them the same
+-- way or `decodeSubscription` refuses it.
 encodeSubscription : Subscription -> String
 encodeSubscription subscription =
     Encode.encode 0 (Encode.object (subscriptionFields subscription))
