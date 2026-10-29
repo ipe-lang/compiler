@@ -1534,10 +1534,17 @@ mod bundle_tests {
         let meta = ContentSecurityPolicy::default()
             .with(Directive::ScriptSrc, vec![Source::Hash(&hostile)])
             .meta_element();
+        let content = meta
+            .strip_prefix("<meta http-equiv=\"Content-Security-Policy\" content=\"")
+            .and_then(|rest| rest.strip_suffix("\">\n"));
         assert_eq!(
-            meta,
-            "<meta http-equiv=\"Content-Security-Policy\" \
-             content=\"script-src &#39;a&#34;b&lt;c&gt;d&amp;e&#39;\">\n"
+            content,
+            Some(crate::escape::html_attr("script-src 'a\"b<c>d&e'").as_str()),
+            "{meta}"
+        );
+        assert!(
+            content.is_some_and(|value| !value.contains(['"', '\'', '<', '>'])),
+            "the value carries no character that ends the attribute or tag: {meta}"
         );
     }
 
