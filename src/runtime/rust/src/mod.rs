@@ -173,13 +173,11 @@ pub mod crypto;
 // Heavy-crypto glob re-export — the legacy `crypto_sha1` / `crypto_md5` checksums
 // and the AEAD/PBKDF2 kernels are named unqualified at the crate root by emitted
 // user bodies (`Crypto.sha1` → `crypto_sha1`), so the glob must surface them.
-// Gated on the same `crypto` feature as the module. `crypto.rs` also re-globs the
-// `crypto_core` floor; when both are on, a glob of identical items is not
-// ambiguous.
-#[cfg(any(
-    feature = "crypto",
-    all(target_arch = "wasm32", feature = "wasm-client")
-))]
+// Native only: every item `crypto.rs` defines is `cfg(not(target_arch =
+// "wasm32"))`, and its `crypto_core` re-glob is already surfaced above, so on
+// wasm32 the glob would re-export nothing. When both are on, a glob of
+// identical items is not ambiguous.
+#[cfg(all(feature = "crypto", not(target_arch = "wasm32")))]
 pub use crypto::*;
 pub mod file;
 // `log` is behind the `log` feature: `log.rs`'s native RFC3339-nano timestamp is

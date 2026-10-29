@@ -217,6 +217,12 @@ checks:
         - cargo build -p ipe-runtime-rust --target wasm32-unknown-unknown --no-default-features --features wasm-client,debugger
         - cargo build -p ipe-runtime-rust --target wasm32-wasip1 --no-default-features
         - cargo build -p ipe-runtime-rust --target wasm32-wasip1 --no-default-features --features time,log,json,uuid,random,decimal,regex,crypto-core,secret,char-category
+        - cargo clippy -p ipe-runtime-rust --target wasm32-unknown-unknown --features wasm-client --all-targets -- -D warnings
+        - cargo clippy -p ipe-runtime-rust --target wasm32-unknown-unknown --no-default-features --features wasm-client,debugger --all-targets -- -D warnings
+        - cargo clippy -p ipe-runtime-rust --target wasm32-unknown-unknown --lib -- -D warnings
+        - cargo clippy -p ipe-runtime-rust --target wasm32-unknown-unknown --features json --lib -- -D warnings
+        - cargo clippy -p ipe-runtime-rust --target wasm32-wasip1 --no-default-features --features time,log,json,uuid,random,decimal,regex,crypto-core,secret,char-category --lib -- -D warnings
+        - cargo clippy -p ipe-runtime-rust --target wasm32-wasip1 --no-default-features --lib -- -D warnings
   - context: seal-smoke
     disposition: gate
     producer: ci.yml

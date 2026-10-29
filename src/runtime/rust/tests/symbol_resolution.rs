@@ -22,6 +22,8 @@
 //! so that future visitors understand the dispatch structure.  The epilogue entry
 //! (`list_map_consume`) is defined inline in the generated-code preamble, not in
 //! the runtime library.
+// Native only: `ipe_kernels` is a native-only dev-dependency.
+#![cfg(not(target_arch = "wasm32"))]
 
 use std::collections::HashSet;
 

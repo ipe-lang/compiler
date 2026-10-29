@@ -532,7 +532,7 @@ impl Guarded {
 
     /// The guard of `profile`; a `WebPage` carries a fixed nonce drawn from
     /// `seed`.
-    #[cfg(test)]
+    #[cfg(all(test, not(target_arch = "wasm32")))]
     pub(crate) const fn sample(profile: Profile, seed: u8) -> Self {
         let _ = seed;
         match profile {

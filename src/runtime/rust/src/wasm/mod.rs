@@ -190,6 +190,22 @@ where
     })
 }
 
+/// The route-table half of a routed `Web.tea` that [`wasm_app_routed`] mounts.
+///
+/// `routes` match a path to a `Page`, `not_found` is entered when none does,
+/// `set_page` applies an entered page to the model (yielding its entry Cmd),
+/// and `render` turns a page back into its canonical path for navigation.
+pub struct RoutedPages<Page, FSetPage, FRender> {
+    /// The declared route table, checked once at mount.
+    pub routes: Vec<crate::web::route::Route<Page>>,
+    /// The page a path matching no route enters.
+    pub not_found: Page,
+    /// Applies an entered page to the model.
+    pub set_page: FSetPage,
+    /// Renders a page to its canonical path.
+    pub render: FRender,
+}
+
 /// `Web.tea { …, routes, notFound }` with a `page` field compiled for the
 /// browser. Mirrors `web_app_routed` on the server, but session-free: the
 /// model lives in the tab, URLs are matched client-side, and navigation uses
@@ -214,10 +230,7 @@ pub fn wasm_app_routed<E, Model, Msg, Page, FInit, FUpdate, FView, FSubs, FSetPa
     update: FUpdate,
     view: FView,
     subscriptions: FSubs,
-    routes: Vec<crate::web::route::Route<Page>>,
-    not_found: Page,
-    set_page: FSetPage,
-    render: FRender,
+    pages: RoutedPages<Page, FSetPage, FRender>,
 ) -> IpeTask<E, ()>
 where
     E: crate::FromIpeError + 'static,
@@ -233,16 +246,7 @@ where
         + 'static,
 {
     Box::pin(async move {
-        match mount_app_routed(
-            init,
-            update,
-            view,
-            subscriptions,
-            routes,
-            not_found,
-            set_page,
-            render,
-        ) {
+        match mount_app_routed(init, update, view, subscriptions, pages) {
             Ok(()) => IpeResult::Ok(()),
             Err(e) => {
                 console_fatal_refusal("MountFailed", &e);
@@ -747,10 +751,7 @@ fn mount_app_routed<Model, Msg, Page, FInit, FUpdate, FView, FSubs, FSetPage, FR
     update: FUpdate,
     view: FView,
     subscriptions: FSubs,
-    routes: Vec<crate::web::route::Route<Page>>,
-    not_found: Page,
-    set_page: FSetPage,
-    render: FRender,
+    pages: RoutedPages<Page, FSetPage, FRender>,
 ) -> Result<(), MountRefusal>
 where
     Model: Clone + 'static,
@@ -765,6 +766,13 @@ where
         + 'static,
 {
     use crate::web::route::{DecodedPath, check_route_table, enter_located, navigate};
+
+    let RoutedPages {
+        routes,
+        not_found,
+        set_page,
+        render,
+    } = pages;
 
     // A malformed literal in the route table fails the mount loudly, with the
     // same refusal the server's `web_app_routed` starts with.

@@ -132,10 +132,10 @@ pub fn sync_widget_properties<M>(document: &web_sys::Document, tree: &crate::htm
                         }
                     }
                 }
-                if let (Some(id), Some(encoded)) = (ipe_id, state) {
-                    if let Ok(Some(el)) = document.query_selector(&super::ipe_id_selector(id)) {
-                        set_widget_down_property(&el, encoded);
-                    }
+                if let (Some(id), Some(encoded)) = (ipe_id, state)
+                    && let Ok(Some(el)) = document.query_selector(&super::ipe_id_selector(id))
+                {
+                    set_widget_down_property(&el, encoded);
                 }
             }
             for c in kids {

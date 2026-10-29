@@ -572,7 +572,7 @@ enum NodeTag {
 
 impl NodeTag {
     /// Every tag, in declaration order.
-    #[cfg(test)]
+    #[cfg(all(test, not(target_arch = "wasm32")))]
     const ALL: [Self; 20] = [
         Self::Div,
         Self::Main,

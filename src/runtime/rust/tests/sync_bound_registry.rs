@@ -17,6 +17,8 @@
 //! refuses with a non-concrete `Model` / `Msg`), or a runtime-internal helper.
 //! A new `Sync`-bounded runtime function, a registry entry dropped from a
 //! kernel, or a program entry no longer gated fails here.
+// Native only: a source walk over native-only dev-dependencies.
+#![cfg(not(target_arch = "wasm32"))]
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;

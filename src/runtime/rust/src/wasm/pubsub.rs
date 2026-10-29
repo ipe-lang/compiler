@@ -150,7 +150,7 @@ fn broker<T: Clone + 'static>() -> Rc<Broker<T>> {
 // ─── Mount-instance origin (the `with_session` analogue) ───────────────
 
 thread_local! {
-    static CURRENT_ORIGIN: RefCell<String> = RefCell::new(String::new());
+    static CURRENT_ORIGIN: RefCell<String> = const { RefCell::new(String::new()) };
 }
 
 /// Run `f` with `origin` available to [`current_origin`] — the wasm scheduler
