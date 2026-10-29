@@ -194,9 +194,14 @@ fn an_installable_build_serves_its_manifest_and_icon() {
     assert!(status.contains(" 200 "), "the manifest is served: {status}");
     let manifest: serde_json::Value =
         serde_json::from_slice(&manifest).expect("the manifest is JSON");
-    assert_eq!(manifest["display"], "standalone");
-    assert_eq!(manifest["icons"][0]["src"], icon_href);
-    assert_eq!(manifest["icons"][0]["sizes"], "512x512");
+    let field = |pointer: &str| {
+        manifest
+            .pointer(pointer)
+            .and_then(serde_json::Value::as_str)
+    };
+    assert_eq!(field("/display"), Some("standalone"));
+    assert_eq!(field("/icons/0/src"), Some(icon_href));
+    assert_eq!(field("/icons/0/sizes"), Some("512x512"));
     let (status, served) = http_get(port, icon_href).expect("the icon answers");
     assert!(status.contains(" 200 "), "the icon is served: {status}");
     assert_eq!(served, icon, "the served icon is the project icon");
