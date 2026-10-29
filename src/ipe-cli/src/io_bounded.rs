@@ -16,7 +16,7 @@
 
 use std::fs::File;
 use std::num::NonZeroU64;
-use std::path::{Component, Path};
+use std::path::{Component, Path, PathBuf};
 
 use ipe_fs_open::{ByteCap, EntryName, HeldDir, OpenRefusal, RegularFile};
 
@@ -289,13 +289,19 @@ fn open_nonblocking(path: &Path) -> Result<File, CliError> {
 /// - [`CliError::FileTooLarge`] past `cap`.
 /// - [`CliError::Io`] for content that is not UTF-8 or any other failure.
 pub fn read_in(dir: &Path, rel: &[EntryName], cap: ByteCap) -> Result<String, CliError> {
+    let (file, path) = open_in(dir, rel)?;
+    read_proven(file, &path, cap)
+}
+
+/// Open the file at `rel` below `dir` through held directory levels, with the path errors name.
+fn open_in(dir: &Path, rel: &[EntryName]) -> Result<(RegularFile, PathBuf), CliError> {
     let path = rel
         .iter()
         .fold(dir.to_path_buf(), |path, name| path.join(name.as_os_str()));
-    let file = HeldDir::open_root(dir)
-        .and_then(|root| root.open_rel(rel))
-        .map_err(|refusal| refusal_error(&path, refusal))?;
-    read_proven(file, &path, cap)
+    match HeldDir::open_root(dir).and_then(|root| root.open_rel(rel)) {
+        Ok(file) => Ok((file, path)),
+        Err(refusal) => Err(refusal_error(&path, refusal)),
+    }
 }
 
 /// [`read_in`] for a relative path spelled as text, one entry name per level.
@@ -331,6 +337,23 @@ pub fn read_named_in(dir: &Path, names: &[&str], cap: ByteCap) -> Result<String,
 /// `path` is not below `root` or a level is not one plain entry name;
 /// otherwise as [`read_in`].
 pub fn read_beneath(root: &Path, path: &Path, cap: ByteCap) -> Result<String, CliError> {
+    let (file, named) = open_beneath(root, path)?;
+    read_proven(file, &named, cap)
+}
+
+/// [`read_beneath`] for raw bytes: the same held-directory open, decoded as bytes, not UTF-8.
+///
+/// # Errors
+///
+/// As [`read_beneath`], except that content is never refused for not being UTF-8.
+pub fn read_bytes_beneath(root: &Path, path: &Path, cap: ByteCap) -> Result<Vec<u8>, CliError> {
+    let (file, named) = open_beneath(root, path)?;
+    file.read_bytes(cap)
+        .map_err(|refusal| refusal_error(&named, refusal))
+}
+
+/// Open `path` below `root` through held directory levels, never following a link below `root`.
+fn open_beneath(root: &Path, path: &Path) -> Result<(RegularFile, PathBuf), CliError> {
     let not_below = || refusal_error(path, OpenRefusal::BadName);
     let (base, rel) = if let Ok(rel) = path.strip_prefix(root) {
         (root.to_path_buf(), rel)
@@ -354,7 +377,7 @@ pub fn read_beneath(root: &Path, path: &Path, cap: ByteCap) -> Result<String, Cl
     if names.is_empty() {
         return Err(not_below());
     }
-    read_in(&base, &names, cap)
+    open_in(&base, &names)
 }
 
 /// Read the file the invoking user named at `path` to a `String` under `cap`.

@@ -1289,6 +1289,22 @@ messages! {
     manifest_base_path_dot_segment(base) = "manifest-base-path-dot-segment";
     /// `delivery.browser.basePath` holds a byte outside the unreserved set.
     manifest_base_path_reserved_byte(base, byte) = "manifest-base-path-reserved-byte";
+    /// `delivery.browser.installable = True` with no top-level `icon`.
+    manifest_installable_without_icon = "manifest-installable-without-icon";
+    /// The installable app's `icon` cannot be read beneath the project root.
+    manifest_icon_unreadable(icon, reason) = "manifest-icon-unreadable";
+    /// The installable app's `icon` is past the icon size cap.
+    manifest_icon_too_large(icon, max) = "manifest-icon-too-large";
+    /// The installable app's `icon` does not open with the PNG signature.
+    manifest_icon_not_png(icon) = "manifest-icon-not-png";
+    /// The installable app's `icon` has a missing or cut-short PNG header.
+    manifest_icon_truncated_header(icon) = "manifest-icon-truncated-header";
+    /// The installable app's `icon` declares a zero width or height.
+    manifest_icon_zero_side(icon) = "manifest-icon-zero-side";
+    /// The installable app's `icon` is not square.
+    manifest_icon_not_square(icon, width, height) = "manifest-icon-not-square";
+    /// The installable app's `icon` is smaller than the minimum side.
+    manifest_icon_too_small(icon, side, min) = "manifest-icon-too-small";
     /// A manifest path is not a `package.ipe`.
     manifest_not_package_ipe(path, hint) = "manifest-not-package-ipe";
     /// A package name is not a single path component for a bundle.
