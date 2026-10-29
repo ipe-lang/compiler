@@ -541,6 +541,9 @@ historyCard row =
 
                     StoredApproved ->
                         Ui.none
+
+                    StoredAcknowledged ->
+                        Ui.none
                 ]
 
             Unverified u ->
@@ -801,6 +804,9 @@ standingReason standing =
         Decided StoredApproved ->
             Ui.none
 
+        Decided StoredAcknowledged ->
+            Ui.none
+
         Undecided ->
             Ui.none
 
@@ -813,6 +819,9 @@ decisionBadge d =
     case d of
         StoredApproved ->
             chipColored (SafeText.literal "✓ Approved") (Ui.rgb 35 120 55)
+
+        StoredAcknowledged ->
+            chipColored (SafeText.literal "✓ Acknowledged") (Ui.rgb 60 90 130)
 
         StoredRefused _ ->
             chipColored (SafeText.literal "✗ Refused") (Ui.rgb 130 45 45)
@@ -1008,6 +1017,9 @@ previousLabel row =
     case LibDb.verifiedDecision row of
         StoredApproved ->
             SafeText.literal "Previously Approved"
+
+        StoredAcknowledged ->
+            SafeText.literal "Previously Acknowledged"
 
         StoredRefused r ->
             SafeText.concat [ SafeText.literal "Previously Refused (", LibDb.storedReasonText r, SafeText.literal ")" ]

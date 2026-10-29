@@ -887,6 +887,22 @@ seededChecks epoch a b =
         tamperedCard =
             page { baseModel | queueState = Loaded (queuePage [ { unit = a.unit, change = Unrecorded, changed = Nothing, standing = Standing.NotCounted Tampered } ] 1 { reviewed = 0, total = 1 }), selectedView = ViewShown a }
 
+        acknowledgedPage =
+            standingPage currentHash (Standing.Decided StoredAcknowledged)
+
+        changeCard change =
+            page { baseModel | queueState = Loaded (queuePage [ { unit = a.unit, change = change, changed = Nothing, standing = Standing.Undecided } ] 1 { reviewed = 0, total = 1 }), selectedView = ViewShown a }
+
+        changeBadges =
+            [ ( New, "NEW" ), ( Modified { old = "sha256:older" }, "MODIFIED" ), ( Unrecorded, "UNRECORDED" ) ]
+
+        drawsOnlyItsBadge ( change, badge ) =
+            let
+                html =
+                    changeCard change
+            in
+            List.all (\( _, other ) -> has (">" ++ other ++ "<") html == (other == badge)) changeBadges
+
         noControl html =
             not (button "Approve" html) && not (button "Refuse" html) && not (has "a approve" html)
 
@@ -931,6 +947,10 @@ seededChecks epoch a b =
             && not (has "Approved" undecidedPage)
             && noDecisionButtons approvedPage
       )
+    , ( "an acknowledgement's standing says Acknowledged, never Approved"
+      , has "✓ Acknowledged" acknowledgedPage && not (has "Approved" acknowledgedPage)
+      )
+    , ( "each change kind draws its own badge and no other's", List.all drawsOnlyItsBadge changeBadges )
     , ( "a standing read for another body of the unit shows no decision, only that the read is running"
       , not (has "Approved" olderBodyPage)
             && has "Reading review status" olderBodyPage
@@ -1440,6 +1460,7 @@ refusalChecks =
             , ( "only the acknowledgeable file is offered Acknowledge; the blocking one says to fix it", List.length (String.split ">Acknowledge<" proven) == 2 && has "Cannot be acknowledged: fix it in the tree." proven && has "Replaced while the index read it" proven )
             , ( "a server that cannot sign offers no acknowledgement", not (button "Acknowledge" unkeyed) && has "Cannot be acknowledged: fix it in the tree." unkeyed )
             , ( "an acknowledged file is named on the History page, its hostile path escaped", decided && escapesHostile historyHtml )
+            , ( "an acknowledged file's History badge says Acknowledged, never Approved", decided && has "✓ Acknowledged" historyHtml && not (has "✓ Approved" historyHtml) )
             ]
 
 
