@@ -708,22 +708,51 @@ impl OwnedDir {
     /// [`StagedDir::path_to`], and [`StagedDir::promote`] puts the finished
     /// tree at `name` in one rename. Until then `name` keeps whatever it held,
     /// and a staged tree never promoted is removed when the [`StagedDir`] is
-    /// dropped. Staging and set-aside entries a killed run left for `name` are
-    /// removed first, each one this run cannot remove skipped.
+    /// dropped. Staging directories a killed run left for `name` are removed
+    /// first, each one this run cannot remove skipped. A set-aside previous
+    /// tree (`.<name>.ipe-old.<pid>.<n>`) is never removed: only a promotion
+    /// that did not finish leaves one, and it may then hold the only copy of
+    /// the previous product, so staging is refused until the user moves it.
+    /// A leftover is recognised by its whole spelling, so another product's
+    /// entries are never taken for this one's.
     ///
     /// # Errors
     /// [`OutputRefusal::UnsafeComponent`] unless `name` is one name that reads
-    /// back as itself and not the marker or claim name;
-    /// [`OutputRefusal::Replaced`] when this directory was swapped;
-    /// [`CliError::Io`] when the staging directory already exists or on a
-    /// filesystem failure.
+    /// back as itself, not the marker or claim name, and free of the staging
+    /// and set-aside infixes; [`OutputRefusal::Replaced`] when this directory
+    /// was swapped; [`CliError::Io`] naming `name` when its staging name could
+    /// pass the 255-byte entry-name ceiling, naming a set-aside previous tree of
+    /// `name` (`AlreadyExists`), when the staging directory already exists,
+    /// or on a filesystem failure.
     pub fn stage_dir(&self, name: &str) -> Result<StagedDir, CliError> {
         let raw = std::ffi::OsStr::new(name);
-        if !ipe_fs_open::is_one_spelled_name(raw) || held::HeldDir::is_reserved(raw) {
+        if !ipe_fs_open::is_one_spelled_name(raw)
+            || held::HeldDir::is_reserved(raw)
+            || name.contains(STAGE_INFIX)
+            || name.contains(ASIDE_INFIX)
+        {
             return Err(OutputRefusal::UnsafeComponent(PathBuf::from(name)).into());
         }
+        if stage_prefix(name)
+            .len()
+            .saturating_add(TEMP_SUFFIX_MAX_BYTES)
+            > ENTRY_NAME_MAX_BYTES
+        {
+            return Err(io_err(
+                &self.path.join(name),
+                std::io::Error::from(std::io::ErrorKind::InvalidFilename),
+            ));
+        }
         let parent = self.held()?;
-        parent.remove_prefixed(&[stage_prefix(name), aside_prefix(name)])?;
+        if let Some(aside) =
+            parent.find_matching(|entry| leftover_of(name, entry) == Some(Leftover::Aside))?
+        {
+            return Err(io_err(
+                &self.path.join(aside.as_os_str()),
+                std::io::Error::from(std::io::ErrorKind::AlreadyExists),
+            ));
+        }
+        parent.remove_matching(|entry| leftover_of(name, entry) == Some(Leftover::Staging))?;
         let staging = std::ffi::OsString::from(format!("{}{}", stage_prefix(name), temp_suffix()));
         let staging_path = self.path.join(&staging);
         let (child, created) = parent.create_child(&staging)?;
@@ -784,14 +813,61 @@ impl OwnedDir {
     }
 }
 
+/// The infix naming a staging directory: `.<name>.ipe-stage.<pid>.<n>`.
+const STAGE_INFIX: &str = ".ipe-stage.";
+
+/// The infix naming a set-aside previous tree: `.<name>.ipe-old.<pid>.<n>`.
+const ASIDE_INFIX: &str = ".ipe-old.";
+
+/// The longest suffix [`temp_suffix`] writes: a `u32` pid, a dot, and a `u64` count, in decimal.
+const TEMP_SUFFIX_MAX_BYTES: usize = 10 + 1 + 20;
+
+/// The longest entry name every supported filesystem stores, in bytes.
+///
+/// Unix filesystems cap a name at 255 bytes (`NAME_MAX`); Windows caps it at
+/// 255 UTF-16 units, never fewer than its UTF-8 bytes.
+const ENTRY_NAME_MAX_BYTES: usize = 255;
+
 /// The name prefix of every staging directory for the product `name`.
 fn stage_prefix(name: &str) -> String {
-    format!(".{name}.ipe-stage.")
+    format!(".{name}{STAGE_INFIX}")
 }
 
 /// The name prefix of every set-aside previous tree of the product `name`.
 fn aside_prefix(name: &str) -> String {
-    format!(".{name}.ipe-old.")
+    format!(".{name}{ASIDE_INFIX}")
+}
+
+/// What a staged product `name` leaves behind under one entry name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Leftover {
+    /// A staging directory (`.<name>.ipe-stage.<pid>.<n>`).
+    Staging,
+    /// A set-aside previous tree (`.<name>.ipe-old.<pid>.<n>`).
+    Aside,
+}
+
+/// The leftover of the product `name` that `entry` spells exactly, if any.
+///
+/// The whole spelling is parsed, suffix included, so an entry of another
+/// product whose name starts with `name` is never one of `name`'s.
+fn leftover_of(name: &str, entry: &str) -> Option<Leftover> {
+    let rest = entry.strip_prefix('.')?.strip_prefix(name)?;
+    let (kind, suffix) = match (
+        rest.strip_prefix(STAGE_INFIX),
+        rest.strip_prefix(ASIDE_INFIX),
+    ) {
+        (Some(suffix), _) => (Leftover::Staging, suffix),
+        (None, Some(suffix)) => (Leftover::Aside, suffix),
+        (None, None) => return None,
+    };
+    let (pid, n) = suffix.split_once('.')?;
+    (is_decimal(pid) && is_decimal(n)).then_some(kind)
+}
+
+/// Whether `text` is one or more ASCII digits.
+fn is_decimal(text: &str) -> bool {
+    !text.is_empty() && text.bytes().all(|b| b.is_ascii_digit())
 }
 
 /// A product directory being built beside its final name, put there whole by [`StagedDir::promote`].
@@ -1126,9 +1202,11 @@ impl OwnedPath {
 
     /// Replace the file with a copy of `source`, its permission bits made executable.
     ///
-    /// On Unix read and execute are added for everyone (`0o755`); elsewhere
-    /// the bits are `source`'s. The bits are set on the exclusive temp file
-    /// before the rename, so the entry is never reached by path afterwards.
+    /// On Unix read and execute are added for everyone (`0o755`) and the
+    /// set-user-ID, set-group-ID and sticky bits are cleared, so a copy never
+    /// runs with its owner's rights; elsewhere the bits are `source`'s. The
+    /// bits are set on the exclusive temp file before the rename, so the entry
+    /// is never reached by path afterwards.
     ///
     /// # Errors
     /// As [`OwnedPath::copy_from`].
@@ -1152,11 +1230,11 @@ impl OwnedPath {
     }
 }
 
-/// `permissions` with read and execute added for everyone.
+/// `permissions` made readable and executable by everyone, with no set-ID or sticky bit.
 #[cfg(unix)]
 fn executable(mut permissions: std::fs::Permissions) -> std::fs::Permissions {
     use std::os::unix::fs::PermissionsExt as _;
-    permissions.set_mode(permissions.mode() | 0o755);
+    permissions.set_mode((permissions.mode() & 0o777) | 0o755);
     permissions
 }
 
@@ -5867,7 +5945,6 @@ mod tests {
         let stale = dist.path().join(".shell.ipe-stage.1.0");
         std::fs::create_dir_all(stale.join("deep")).expect("stale stage");
         std::fs::write(stale.join("deep").join("x"), "x").expect("stale file");
-        std::fs::create_dir(dist.path().join(".shell.ipe-old.1.1")).expect("stale aside");
         let other = dist.path().join(".other.ipe-stage.1.2");
         std::fs::create_dir(&other).expect("another product's stage");
         let staged = dist.stage_dir("shell").expect("stage");
@@ -5882,6 +5959,145 @@ mod tests {
         left.sort();
         assert_eq!(left, vec![".other.ipe-stage.1.2".to_owned(), live]);
         drop(staged);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn a_set_aside_previous_tree_is_refused_and_kept() {
+        let (base, dist) = staged_dist("stage-aside");
+        let aside = dist.path().join(".shell.ipe-old.1.1");
+        std::fs::create_dir_all(aside.join("deep")).expect("aside tree");
+        std::fs::write(aside.join("deep").join("only.txt"), "only").expect("aside file");
+        let refused = dist.stage_dir("shell");
+        assert!(
+            matches!(
+                &refused,
+                Err(CliError::Io { path, source })
+                    if *path == aside && source.kind() == std::io::ErrorKind::AlreadyExists
+            ),
+            "{refused:?}"
+        );
+        assert_eq!(
+            std::fs::read(aside.join("deep").join("only.txt")).expect("aside kept"),
+            b"only"
+        );
+        assert_eq!(
+            staging_leftovers(dist.path()),
+            vec![".shell.ipe-old.1.1".to_owned()],
+            "no staging made beside it"
+        );
+        std::fs::remove_dir_all(&aside).expect("the user moves it");
+        let staged = dist
+            .stage_dir("shell")
+            .expect("control: stages once it is gone");
+        drop(staged);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn another_products_entries_sharing_the_prefix_are_kept() {
+        let (base, dist) = staged_dist("stage-prefix");
+        let kept = [
+            ".shell.ipe-stage.x.ipe-stage.1.2",
+            ".shell.ipe-stage.1.2.extra",
+            ".shell.ipe-stage.1",
+            ".shell.ipe-stage..2",
+            ".shell.ipe-old.x.ipe-old.1.2",
+        ];
+        for name in kept {
+            std::fs::create_dir(dist.path().join(name)).expect("foreign entry");
+        }
+        let stale = ".shell.ipe-stage.7.8";
+        std::fs::create_dir(dist.path().join(stale)).expect("control: a stale stage");
+        let staged = dist.stage_dir("shell").expect("stage");
+        let live = staged
+            .dir
+            .path()
+            .file_name()
+            .expect("name")
+            .to_string_lossy()
+            .into_owned();
+        let mut left = staging_leftovers(dist.path());
+        left.sort();
+        let mut want: Vec<String> = kept.iter().map(|name| (*name).to_owned()).collect();
+        want.push(live);
+        want.sort();
+        assert_eq!(left, want, "only the stale stage is removed");
+        drop(staged);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn a_product_name_spelled_like_a_leftover_is_refused() {
+        let (base, dist) = staged_dist("stage-infix");
+        for name in [".a.ipe-stage.1.2", "a.ipe-old.b", "x.ipe-stage.y"] {
+            let refused = dist.stage_dir(name);
+            assert!(
+                matches!(
+                    refused,
+                    Err(CliError::OutputRefused(OutputRefusal::UnsafeComponent(_)))
+                ),
+                "{name}: {refused:?}"
+            );
+        }
+        assert!(
+            staging_leftovers(dist.path()).is_empty(),
+            "nothing staged for a refused name"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn a_product_name_too_long_to_stage_is_refused_before_anything_is_made() {
+        let (base, dist) = staged_dist("stage-long");
+        let longest =
+            "a".repeat(ENTRY_NAME_MAX_BYTES - 1 - STAGE_INFIX.len() - TEMP_SUFFIX_MAX_BYTES);
+        let promoted = dist
+            .stage_dir(&longest)
+            .expect("control: the longest name stages")
+            .promote()
+            .expect("control: and is promoted");
+        assert_eq!(promoted, dist.path().join(&longest));
+        let past = format!("{longest}a");
+        let refused = dist.stage_dir(&past);
+        assert!(
+            matches!(
+                &refused,
+                Err(CliError::Io { path, source })
+                    if *path == dist.path().join(&past)
+                        && source.kind() == std::io::ErrorKind::InvalidFilename
+            ),
+            "{refused:?}"
+        );
+        assert!(staging_leftovers(dist.path()).is_empty());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_executable_copy_drops_the_set_user_id_bit() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let (base, dist) = staged_dist("exec-bits");
+        let source = base.join("app");
+        std::fs::write(&source, b"binary").expect("source");
+        std::fs::set_permissions(&source, std::fs::Permissions::from_mode(0o4644))
+            .expect("set-user-ID source");
+        assert_eq!(
+            std::fs::metadata(&source)
+                .expect("source")
+                .permissions()
+                .mode()
+                & 0o7000,
+            0o4000,
+            "control: the source is set-user-ID"
+        );
+        let out = dist.path_to("app").expect("path");
+        out.copy_executable_from(&source).expect("copy");
+        let mode = std::fs::metadata(out.path())
+            .expect("copy")
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o7777, 0o755, "{mode:o}");
         let _ = std::fs::remove_dir_all(&base);
     }
 }

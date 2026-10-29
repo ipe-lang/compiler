@@ -1324,7 +1324,12 @@ impl HeldDir {
     /// tree; without an exchange it is absent between the two renames.
     ///
     /// The name now holding the displaced tree is returned for the caller to
-    /// remove; `None` when the target was absent.
+    /// remove; `None` when the target was absent. It is `staging` whenever
+    /// the rename back there succeeds: a displaced tree is moved out of
+    /// `aside` as soon as the staged tree is in place, so an entry left at
+    /// `aside` only ever holds a previous tree no promotion replaced (a run
+    /// killed between the renames, or a failed move back), which the next
+    /// staging refuses to discard.
     ///
     /// # Errors
     /// [`OutputRefusal::UnsafeComponent`] for the marker or claim name;
@@ -1366,7 +1371,12 @@ impl HeldDir {
                 sys::rename_noreplace(&self.dir, &to, &aside_entry)
                     .map_err(|e| act_err(&aside_path, e))?;
                 match sys::rename_noreplace(&self.dir, &from, &to) {
-                    Ok(()) => Ok(Some(aside_entry)),
+                    Ok(()) => Ok(Some(
+                        match sys::rename_noreplace(&self.dir, &aside_entry, &from) {
+                            Ok(()) => from,
+                            Err(_kept) => aside_entry,
+                        },
+                    )),
                     Err(e) => Err(
                         sys::rename_noreplace(&self.dir, &aside_entry, &to).map_or_else(
                             |back| act_err(&aside_path, back),
@@ -1395,7 +1405,7 @@ impl HeldDir {
         }
     }
 
-    /// Remove every entry whose name starts with one of `prefixes`, skipping any it cannot remove.
+    /// Remove every entry whose name `ours` accepts, skipping any it cannot remove.
     ///
     /// The listing streams through the held handle and retains nothing. An
     /// entry that vanished, or that another user or program keeps, is skipped,
@@ -1403,22 +1413,42 @@ impl HeldDir {
     ///
     /// # Errors
     /// [`CliError::Io`] when the directory cannot be listed.
-    pub fn remove_prefixed(&self, prefixes: &[String]) -> Result<(), CliError> {
+    pub fn remove_matching(&self, ours: impl Fn(&str) -> bool) -> Result<(), CliError> {
         let names = sys::names(&self.dir).map_err(|e| act_err(&self.path, e))?;
         for name in names {
             let Ok(Listed::Entry(entry)) = name else {
                 continue;
             };
-            let ours = entry.as_os_str().to_str().is_some_and(|text| {
-                prefixes
-                    .iter()
-                    .any(|prefix| text.starts_with(prefix.as_str()))
-            });
-            if ours {
+            if entry.as_os_str().to_str().is_some_and(&ours) {
                 let _skipped = self.remove_leftover(&entry);
             }
         }
         Ok(())
+    }
+
+    /// The first entry whose name `wanted` accepts, listed through the held handle.
+    ///
+    /// A name no held handle can open is not one ipe wrote, so it is passed
+    /// over; a listing failure fails the search rather than miss an entry.
+    ///
+    /// # Errors
+    /// [`CliError::Io`] when the directory cannot be listed.
+    pub fn find_matching(
+        &self,
+        wanted: impl Fn(&str) -> bool,
+    ) -> Result<Option<EntryName>, CliError> {
+        let names = sys::names(&self.dir).map_err(|e| act_err(&self.path, e))?;
+        for name in names {
+            match name {
+                Ok(Listed::Entry(entry)) if entry.as_os_str().to_str().is_some_and(&wanted) => {
+                    return Ok(Some(entry));
+                }
+                Ok(Listed::Entry(_) | Listed::Unnameable(_)) => {}
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(e) => return Err(act_err(&self.path, e)),
+            }
+        }
+        Ok(None)
     }
 }
 
