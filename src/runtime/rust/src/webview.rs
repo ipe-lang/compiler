@@ -62,8 +62,63 @@ const BRIDGE_JS: &str = r#"
   // named after a document member shadows that member with the element.
   var doc=(function(d){
     var body=Object.getOwnPropertyDescriptor(Document.prototype,'body');
-    return { body:function(){ return body.get.call(d); }, on:EventTarget.prototype.addEventListener.bind(d) };
+    var active=Object.getOwnPropertyDescriptor(Document.prototype,'activeElement');
+    return { body:function(){ return body.get.call(d); }, active:function(){ return active.get.call(d); }, on:EventTarget.prototype.addEventListener.bind(d) };
   })(document);
+  // The element members the focus keep reads, bound from the prototypes: a
+  // `form` names its controls as its own members.
+  var node=(function(){
+    function getter(p,n){ return Object.getOwnPropertyDescriptor(p,n).get; }
+    var attr=Element.prototype.getAttribute, has=Node.prototype.contains;
+    var parent=getter(Node.prototype,'parentElement'), first=getter(Element.prototype,'firstElementChild');
+    var next=getter(Element.prototype,'nextElementSibling'), tag=getter(Element.prototype,'tagName');
+    var focusers=[[HTMLElement,HTMLElement.prototype.focus],[SVGElement,SVGElement.prototype.focus]];
+    return {
+      attr:function(el,n){ return attr.call(el,n); }, contains:function(el,o){ return has.call(el,o); },
+      parent:function(el){ return parent.call(el); }, first:function(el){ return first.call(el); },
+      next:function(el){ return next.call(el); }, tag:function(el){ return tag.call(el); },
+      focus:function(el){
+        for(var i=0;i<focusers.length;i++){
+          if(el instanceof focusers[i][0]){ try{ focusers[i][1].call(el,{preventScroll:true}); }catch(e){} break; }
+        }
+        return doc.active()===el;
+      }
+    };
+  })();
+  // The focus keep (`dom::focus`, the rule `client.js` and the wasm client run
+  // too): each render replaces the body's markup, which drops focus to the
+  // body. Before it, the view chain of the focused node is recorded: the
+  // `ipe-id` and tag of each element from the body's child down to it, cut at
+  // the first element with no `ipe-id`, and only when the first carries one.
+  // After it, when nothing holds focus, focus goes to the deepest node of the
+  // chain still in the view that takes focus: each depth takes the ONE child
+  // whose `ipe-id` and tag equal the link (none or several end the descent),
+  // so an equal `ipe-id` under another chain never matches.
+  var FOCUS_CHAIN_MAX=1024;
+  function focusChain(root){
+    var now=doc.active();
+    if(!now||now===root||!node.contains(root,now)) return null;
+    var up=[];
+    for(var at=now; at&&at!==root; at=node.parent(at)){
+      if(up.length>=FOCUS_CHAIN_MAX) return null;
+      up.push({id:node.attr(at,'ipe-id'), tag:node.tag(at)});
+    }
+    var chain=[];
+    for(var i=up.length-1; i>=0&&up[i].id!==null; i--) chain.push(up[i]);
+    return chain.length>0 ? chain : null;
+  }
+  function restoreFocus(root, chain){
+    var found=[], at=root;
+    for(var d=0; d<chain.length; d++){
+      var only=null, count=0;
+      for(var kid=node.first(at); kid; kid=node.next(kid)){
+        if(node.attr(kid,'ipe-id')===chain[d].id && node.tag(kid)===chain[d].tag){ only=kid; count++; }
+      }
+      if(count!==1) break;
+      found.push(only); at=only;
+    }
+    for(var m=found.length-1; m>=0; m--){ if(node.focus(found[m])) return; }
+  }
   function send(ipeId, ev, args){ try{ window.ipc.postMessage(JSON.stringify({ipeId:ipeId, event:ev, args:args})); }catch(e){} }
   function idOf(el){ return el && el.getAttribute ? el.getAttribute('ipe-id') : null; }
   // Match the wire-event arg table the HandlerIndex consumes: a checkbox/radio
@@ -78,7 +133,13 @@ const BRIDGE_JS: &str = r#"
   // which HTML-escapes every text + attribute node — so this innerHTML assignment
   // is not an XSS sink for user data. Any future RAW-html node added to the
   // renderer becomes the XSS boundary and must be audited there.
-  window.__ipeApply = function(html){ var b=doc.body(); if(b) b.innerHTML = html; };
+  window.__ipeApply = function(html){
+    var b=doc.body(); if(!b) return;
+    var chain=focusChain(b);
+    b.innerHTML = html;
+    var now=doc.active();
+    if(chain!==null && (!now||now===b)) restoreFocus(b, chain);
+  };
 })();
 "#;
 
@@ -93,6 +154,40 @@ mod tests {
             "the webview bridge names `document` only in its bound table"
         );
         assert_eq!(super::BRIDGE_JS.matches("})(document);").count(), 1);
+    }
+
+    /// Each render, a whole-body swap, runs inside the focus keep: the chain is
+    /// recorded before the swap and put back after it only while nothing holds
+    /// focus, by the runtime's own chain bound.
+    ///
+    /// Without it every webview render dropped focus to the body, so a key
+    /// handler on an ancestor of the focused control stopped hearing keys.
+    #[test]
+    fn bridge_renders_inside_the_focus_keep() {
+        let js = super::BRIDGE_JS;
+        let open = "var FOCUS_CHAIN_MAX=";
+        let bound = js
+            .find(open)
+            .and_then(|at| js.get(at + open.len()..))
+            .and_then(|rest| rest.get(..rest.find(';')?))
+            .and_then(|n| n.parse::<usize>().ok());
+        assert_eq!(bound, Some(crate::dom::focus::FOCUS_CHAIN_MAX));
+        assert_eq!(js.matches("innerHTML =").count(), 1, "one swap site");
+        assert!(
+            js.contains(
+                "var chain=focusChain(b);\n    b.innerHTML = html;\n    var now=doc.active();\n    if(chain!==null && (!now||now===b)) restoreFocus(b, chain);"
+            ),
+            "the swap is bracketed by the record and the guarded restore"
+        );
+        assert!(
+            js.contains("if(up.length>=FOCUS_CHAIN_MAX) return null;")
+                && js.contains("i>=0&&up[i].id!==null")
+                && js.contains("if(count!==1) break;")
+                && js.contains(
+                    "node.attr(kid,'ipe-id')===chain[d].id && node.tag(kid)===chain[d].tag"
+                ),
+            "the chain is bounded, cut at raw markup, and matched by id and tag at one child per depth"
+        );
     }
 }
 

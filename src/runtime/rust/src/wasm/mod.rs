@@ -921,16 +921,7 @@ where
 
     let mut new_tree = (app.view)(new_model);
     assign_ipe_ids(&mut new_tree, ROOT_IPE_ID);
-    let patches = diff(&app.tree.borrow(), &new_tree, &RenderCtx::Unstamped);
-    commit_frame(&patches, None, &app.cause);
-    *app.index.borrow_mut() = build_index(&new_tree);
-    *app.tree.borrow_mut() = new_tree;
-    // A widget that first appears via an `html`-subtree replace bypasses the
-    // attribute-patch property route; re-deliver each widget's decoded down-state
-    // PROPERTY (idempotent, bounded by the widget count).
-    if let Ok(document) = document() {
-        widget::sync_widget_properties(&document, &app.tree.borrow());
-    }
+    commit_view(app, new_tree, None);
 
     run_cmd(app, cmd);
     resync_subscriptions(app);
@@ -1349,16 +1340,7 @@ where
         } else {
             None
         };
-        let patches = diff(&app.tree.borrow(), &new_tree, &RenderCtx::Unstamped);
-        commit_frame(&patches, target.as_ref(), &app.cause);
-        *app.index.borrow_mut() = build_index(&new_tree);
-        *app.tree.borrow_mut() = new_tree;
-        // A widget that first appears via an `html`-subtree replace bypasses the
-        // attribute-patch property route; re-deliver each widget's decoded down-state
-        // PROPERTY (idempotent, bounded by the widget count).
-        if let Ok(document) = document() {
-            widget::sync_widget_properties(&document, &app.tree.borrow());
-        }
+        commit_view(app, new_tree, target.as_ref());
     }
 
     for cmd in cmds {
@@ -1467,13 +1449,7 @@ where
 
     let mut new_tree = (app.view)(render_model);
     assign_ipe_ids(&mut new_tree, ROOT_IPE_ID);
-    let patches = diff(&app.tree.borrow(), &new_tree, &RenderCtx::Unstamped);
-    commit_frame(&patches, None, &app.cause);
-    *app.index.borrow_mut() = build_index(&new_tree);
-    *app.tree.borrow_mut() = new_tree;
-    if let Ok(document) = document() {
-        widget::sync_widget_properties(&document, &app.tree.borrow());
-    }
+    commit_view(app, new_tree, None);
 
     // Refresh the overlay panel to highlight the newly selected step.
     refresh_overlay(app);
@@ -1784,6 +1760,30 @@ fn fragment_target(document: &web_sys::Document) -> Option<web_sys::Element> {
         let decoded: String = js_sys::decode_uri_component(raw).ok()?.into();
         document.get_element_by_id(&decoded)
     })
+}
+
+/// Commits `new_tree` as the app's next frame, focusing `target` when the
+/// frame addresses one.
+///
+/// The view the handlers resolve against becomes `new_tree` BEFORE the frame
+/// applies: the frame's own focus moves (the focus keep, `target`) raise
+/// `focus`/`focusin` synchronously, and the Msg such an event resolves to must
+/// come from the view on screen, never from the one the frame replaced.
+fn commit_view<Model, Msg: Clone>(
+    app: &App<Model, Msg>,
+    new_tree: Html<Msg>,
+    target: Option<&StampedId>,
+) {
+    let patches = diff(&app.tree.borrow(), &new_tree, &RenderCtx::Unstamped);
+    *app.index.borrow_mut() = build_index(&new_tree);
+    *app.tree.borrow_mut() = new_tree;
+    commit_frame(&patches, target, &app.cause);
+    // A widget that first appears via an `html`-subtree replace bypasses the
+    // attribute-patch property route; re-deliver each widget's decoded down-state
+    // PROPERTY (idempotent, bounded by the widget count).
+    if let Ok(document) = document() {
+        widget::sync_widget_properties(&document, &app.tree.borrow());
+    }
 }
 
 /// [`apply_frame`] on this tab's document; a vanished document applies nothing.

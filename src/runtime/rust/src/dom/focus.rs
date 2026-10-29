@@ -313,6 +313,37 @@ mod tests {
         );
     }
 
+    /// The wasm client installs a frame's view (handler index and tree) before
+    /// it applies the frame, through the one committer.
+    ///
+    /// The focus keep and the addressed focus move raise `focus`/`focusin`
+    /// synchronously inside the commit; resolved against the replaced view,
+    /// such an event would send the Msg the previous render bound to that id.
+    #[test]
+    fn wasm_commits_a_frame_after_its_view_is_installed() {
+        let src = include_str!("../wasm/mod.rs");
+        assert_eq!(
+            src.matches("commit_frame(&").count(),
+            1,
+            "`commit_view` is the one caller of `commit_frame`"
+        );
+        let body = src
+            .split_once("fn commit_view<")
+            .and_then(|(_, rest)| rest.split_once("\n}\n"))
+            .map(|(body, _)| body)
+            .unwrap_or_default();
+        let at = |needle: &str| body.find(needle);
+        let (index, tree, commit) = (
+            at("*app.index.borrow_mut() = build_index(&new_tree);"),
+            at("*app.tree.borrow_mut() = new_tree;"),
+            at("commit_frame(&patches"),
+        );
+        assert!(
+            matches!((index, tree, commit), (Some(i), Some(t), Some(c)) if i < c && t < c),
+            "the view is installed before the frame applies: {index:?} {tree:?} {commit:?}"
+        );
+    }
+
     #[test]
     fn a_chain_cuts_at_raw_markup_and_needs_a_stamped_top() {
         // Upward: the focused raw node, its stamped host, the view root.
