@@ -18182,7 +18182,7 @@ mod route_entry_cmd_tests {
             .await;
             assert_eq!(status, StatusCode::OK);
             assert!(
-                String::from_utf8_lossy(&body).contains("page-home"),
+                std::str::from_utf8(&body).is_ok_and(|page| page.contains("page-home")),
                 "the page is served"
             );
         });
