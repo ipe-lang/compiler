@@ -9209,7 +9209,7 @@ mod base_path_tests {
         );
         assert!(
             full.contains("var next = __ipeOwnEpoch(token);")
-                && diff.contains("__ipePatchStep(from, to) !== \"next\"")
+                && diff.contains("__ipePatchStep(frame.from, frame.to) !== \"next\"")
                 && step.contains("var a = __ipeOwnEpoch(from);")
                 && step.contains("var b = __ipeOwnEpoch(to);"),
             "each adopt function parses the epochs it adopts"
@@ -9220,7 +9220,7 @@ mod base_path_tests {
             "`__ipeApplyPatches` has its definition and one caller"
         );
         assert!(
-            diff.contains("__ipeApplyPatches(patches);"),
+            diff.contains("__ipeApplyPatches(frame.patches);"),
             "the one caller of `__ipeApplyPatches` is `__ipeAdoptPatches`"
         );
     }
@@ -9321,9 +9321,10 @@ mod base_path_tests {
         assert_eq!(
             (
                 js.matches("__ipeRunPaths()").count(),
-                full.matches("__ipeEpoch = token;\n  __ipeRunPaths();")
+                full.matches("__ipeEpoch = token;\n    __ipeRunPaths();")
                     .count(),
-                diff.matches("__ipeEpoch = to;\n  __ipeRunPaths();").count()
+                diff.matches("__ipeEpoch = frame.to;\n    __ipeRunPaths();")
+                    .count()
             ),
             (3, 1, 1),
             "a render's `data-ipe-path` is read after its epoch is adopted, in the two adopt functions only"
@@ -9462,6 +9463,107 @@ mod base_path_tests {
         assert_eq!(listed, Some(shared));
     }
 
+    /// Every frame `client.js` commits runs inside the focus keep, which alone
+    /// puts lost focus back.
+    ///
+    /// A repair inside one patch kind's path (the swap) leaves every other kind
+    /// (an attribute written in place) dropping focus to the body; the keep
+    /// brackets the commit, so where focus ends never depends on the patch the
+    /// diff chose.
+    #[test]
+    fn client_applies_frames_only_inside_the_focus_keep() {
+        let js = super::CLIENT_JS;
+        let full = js_function(js, "__ipeAdoptFullBody").unwrap_or_default();
+        let diff = js_function(js, "__ipeAdoptPatches").unwrap_or_default();
+        let keep = js_function(js, "__ipeKeepFocus").unwrap_or_default();
+        let settle = js_function(js, "__ipeFocusSettleDue").unwrap_or_default();
+        let swap = js_function(js, "__ipeSwapPreservingFocus").unwrap_or_default();
+        assert_eq!(
+            js.matches("__ipeKeepFocus(").count(),
+            3,
+            "`__ipeKeepFocus` has its definition and the two adopt functions as callers"
+        );
+        assert!(
+            full.contains("__ipeKeepFocus(function() {\n    applyFn();")
+                && diff
+                    .contains("__ipeKeepFocus(function() {\n    __ipeApplyPatches(frame.patches);"),
+            "each adopt function commits its frame inside the focus keep"
+        );
+        let patch_calls: Vec<&str> = js
+            .lines()
+            .filter(|line| line.contains("__ipePatch(") && !line.contains("function __ipePatch("))
+            .collect();
+        assert!(
+            !patch_calls.is_empty()
+                && patch_calls
+                    .iter()
+                    .all(|line| line.contains("__ipeAdoptFullBody(")),
+            "a full render is committed only through `__ipeAdoptFullBody`: {patch_calls:?}"
+        );
+        assert_eq!(
+            (
+                js.matches("__ipeRestoreFocus(").count(),
+                keep.matches("__ipeRestoreFocus(").count()
+            ),
+            (3, 2),
+            "`__ipeRestoreFocus` is called only by the keep, at its two check points"
+        );
+        assert!(
+            !swap.contains("__ipeRestoreFocus") && !swap.contains("__ipeNode.focus("),
+            "a swap restores no focus itself"
+        );
+        assert!(
+            keep.contains("if (__ipeFocusKeep !== rec) return;")
+                && keep
+                    .matches("window.requestAnimationFrame(function() {")
+                    .count()
+                    == 2,
+            "the deferred check runs two animation frames on, for the newest frame only"
+        );
+        assert!(
+            settle.contains("return !held && __ipeFocusEpoch === rec.epoch && __ipeEpoch === rec.frame &&\n      !__ipeRuntimeFocusing;"),
+            "the keep refuses focus held, a user focus move, a newer frame and a runtime move"
+        );
+    }
+
+    /// `client.js` bounds the view chain it records by the runtime's own bound.
+    #[test]
+    fn client_focus_chain_max_matches_the_runtime() {
+        let js = super::CLIENT_JS;
+        let open = "var __IPE_FOCUS_CHAIN_MAX = ";
+        let bound = js
+            .find(open)
+            .and_then(|at| js.get(at + open.len()..))
+            .and_then(|rest| rest.get(..rest.find(';')?))
+            .and_then(|n| n.parse::<usize>().ok());
+        assert_eq!(bound, Some(crate::dom::focus::FOCUS_CHAIN_MAX));
+    }
+
+    /// Focus leaving the document is a user focus move in `client.js`, as in
+    /// the wasm client, and only when the window itself is the event's target.
+    ///
+    /// Without it the deferred focus check would take focus back after the
+    /// user tabbed into the browser chrome; counting an element's own `blur`
+    /// instead would refuse the check for the node a patch made unfocusable.
+    #[test]
+    fn client_window_blur_counts_a_focus_move() {
+        let js = super::CLIENT_JS;
+        let shared: Vec<String> = crate::dom::focus::WINDOW_FOCUS_MOVES
+            .iter()
+            .map(|name| (*name).to_string())
+            .collect();
+        assert_eq!(
+            js_string_array(js, "__IPE_WINDOW_FOCUS_MOVES"),
+            Some(shared)
+        );
+        assert!(
+            js.contains(
+                "__IPE_WINDOW_FOCUS_MOVES.forEach(function(type) {\n  window.addEventListener(type, function(ev) {\n    if (ev.target === window && !__ipeRuntimeFocusing) __ipeFocusEpoch += 1;"
+            ),
+            "a window blur counts a focus move only with the window as its target"
+        );
+    }
+
     /// The keys of `var {name} = Object.freeze({ key: 1, … });` in `js`.
     fn js_flag_keys(js: &str, name: &str) -> Option<Vec<String>> {
         let open = format!("var {name} = Object.freeze({{");
@@ -9569,7 +9671,7 @@ mod base_path_tests {
         assert_eq!(
             js.matches("__ipeAsRuntimeFocus(function() {").count(),
             2,
-            "the node focus and the swap's focus restore both go through the guard"
+            "the node focus and the swap's live-field refocus both go through the guard"
         );
     }
 
