@@ -273,8 +273,11 @@ failsWithout stored task =
 -- repeats no uid: a uid leaves its type only through its sink exits. A
 -- signed log entry holding such a decision is never counted: it reads
 -- `Tampered`, and the uid has no previous review.
--- A signed `acknowledge` on a file, a word no writer stores, reads
--- `Tampered` too, never as an acknowledgement or an approval.
+-- A signed unknown word on a file reads `Tampered` too, never as an
+-- acknowledgement or an approval: `ack`, held and verified on a chain that
+-- counts (the unit row beside it reads `Tampered`, not `ChainBroken`), and
+-- `acknowledge`, a word no writer stores and past the decision cell's
+-- ceiling, alone in its own log.
 -- Red if an unknown decision reads as any decision, or its error names the
 -- uid.
 unknownStoredDecisionRefused : Task.Task Error Bool
@@ -289,12 +292,16 @@ unknownStoredDecisionRefused =
         badUid <- failsWithout "zz" (LibDb.historyPage badVerify bad PageSize.history HistoryStart)
         logged <- uncheckedReview "ipe-review-unknown-logged" []
         appendSigned logged (rawRow "u-l" "h" "maybe" Nothing)
-        appendSigned logged (rawFileRow "u-k" "h" "acknowledge")
+        appendSigned logged (rawFileRow "u-k" "h" "ack")
         loggedVerify <- countingVerifier logged
         loggedPair <- LibDb.findDecision loggedVerify logged (uid "u-l") "h"
         loggedUid <- LibDb.findLatestForUid loggedVerify logged (uid "u-l")
         ackPair <- LibDb.findDecision loggedVerify logged (uid "u-k") "h"
-        Task.succeed (byPair && page && badUid && isTampered loggedPair && loggedUid == Nothing && isTampered ackPair)
+        long <- uncheckedReview "ipe-review-unknown-long" []
+        appendSigned long (rawFileRow "u-n" "h" "acknowledge")
+        longVerify <- countingVerifier long
+        longPair <- LibDb.findDecision longVerify long (uid "u-n") "h"
+        Task.succeed (byPair && page && badUid && isTampered loggedPair && loggedUid == Nothing && isTampered ackPair && isTampered longPair)
 
 
 -- A signed row naming a file with no reason.
