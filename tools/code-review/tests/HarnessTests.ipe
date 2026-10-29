@@ -31,7 +31,7 @@ import Lib.Queue as Queue exposing (QueueState(..), UnitPageState(..))
 import Lib.RepoPath as RepoPath exposing (PathError(..), Root, RootMap)
 import Lib.SafeText as SafeText
 import Lib.Settings as Settings
-import TestSupport exposing (tableExists, countReviewRows, expectErr, refuse, seedIndex, writeFileText, fixtureLibRs, fixtureMainIpe, viewA, viewB, viewTag, shownTextOf, unitViewTag, execIndex, execIndexUnchecked, Scratch, freshScratch, freshDir, check, checkReporting, indexSchemaStatements, execIndexSchema, seedIndexDb, insertUnitRows, setIndexEnv, loadFirstPage, checkUnits, listSecond, isUnitA, isUnitB, cleanupIndex, removeFileIfAny, codeText, noHazard, rendered, renderedForeign, describeText, refusedFor, openReadOnlyAt, vectorsPath, ipeIndexTestFile, repoFile, probeMessage, probeNames, maybeContains)
+import TestSupport exposing (ownedTempDir, tableExists, countReviewRows, expectErr, refuse, seedIndex, writeFileText, fixtureLibRs, fixtureMainIpe, viewA, viewB, viewTag, shownTextOf, unitViewTag, execIndex, execIndexUnchecked, Scratch, freshScratch, freshDir, check, checkReporting, indexSchemaStatements, execIndexSchema, seedIndexDb, insertUnitRows, setIndexEnv, loadFirstPage, checkUnits, listSecond, isUnitA, isUnitB, cleanupIndex, removeFileIfAny, codeText, noHazard, rendered, renderedForeign, describeText, refusedFor, openReadOnlyAt, vectorsPath, ipeIndexTestFile, repoFile, probeMessage, probeNames, maybeContains)
 
 
 -- One fixture name asked for twice yields two directories, and the second
@@ -84,9 +84,125 @@ reportedProbes out =
     ]
 
 
+-- The suite-end sweep removes only a ledger line that parses as a direct
+-- `ipe-*` child of the directory holding the ledger, in clean absolute form:
+-- an empty line, the root, the temp root itself, a relative path, a path
+-- outside the temp root or below one of its children, an unclean spelling,
+-- a NUL, a non-`ipe-` name and the ledger itself are refused, and under a
+-- ledger at the filesystem root nothing is removable. Red when any of them
+-- would reach `rm -rf`, or a real `freshDir` directory would not.
+sweepRemovesOnlyOwnedDirs : Task.Task Error Bool
+sweepRemovesOnlyOwnedDirs =
+    do
+        ledger <- Task.fromResult (Path.fromString "/tmp/ipe-review-test-dirs-abc")
+        atRoot <- Task.fromResult (Path.fromString "/ipe-review-test-dirs-abc")
+        Task.succeed
+            (ownedLine ledger "/tmp/ipe-review-x-0123"
+                && List.all (\line -> not (ownedLine ledger line)) foreignLines
+                && not (ownedLine atRoot "/ipe-x")
+                && not (ownedLine atRoot "/etc")
+            )
+
+
+ownedLine : Path.Path -> String -> Bool
+ownedLine at line =
+    case ownedTempDir at line of
+        Just _ ->
+            True
+
+        Nothing ->
+            False
+
+
+-- Ledger lines the sweep must never remove under `/tmp/ipe-review-test-dirs-abc`.
+foreignLines : List String
+foreignLines =
+    [ ""
+    , "/"
+    , "/tmp"
+    , "/tmp/"
+    , "ipe-x"
+    , "tmp/ipe-x"
+    , "/etc"
+    , "/etc/ipe-x"
+    , "/home/ipe-x"
+    , "/tmp/x"
+    , "/tmp/review-x"
+    , "/tmp/ipe-x/inner"
+    , "/tmp//ipe-x"
+    , "/tmp/ipe-x/"
+    , "/tmp/./ipe-x"
+    , "/tmp/ipe-a/../ipe-b"
+    , "/tmp/../ipe-x"
+    , "/tmp/ipe-x" ++ codeText 0
+    , "/tmp/ipe-review-test-dirs-abc"
+    ]
+
+
+-- The one way a check gets a scratch directory is `freshDir`: across the
+-- suite's modules the temp-directory and temp-file kernels are named once
+-- each, in `TestSupport`, so no directory escapes the ledger the sweep
+-- empties. Red when another module names either kernel, through any
+-- qualifier or an exposing import.
+scratchOnlyThroughFreshDir : Task.Task Error Bool
+scratchOnlyThroughFreshDir =
+    do
+        cwd <- System.cwd ()
+        dir <- Task.fromResult (Path.fromString (cwd ++ "/tests"))
+        names <- File.readDir dir
+        sources <- Task.sequence
+                    (List.map
+                        (\name ->
+                            Task.fromResult (Path.fromString (cwd ++ "/tests/" ++ name))
+                                |> Task.andThen (\p -> File.readFileLimit p (ByteSize.mib 4))
+                                |> Task.map (\text -> ( name, text ))
+                        )
+                        (List.filter (String.endsWith ".ipe") names)
+                    )
+        Task.succeed
+            (tempSitesAdmitted sources
+                && List.any (\( name, _ ) -> name == "TestSupport.ipe") sources
+                && not (tempSitesAdmitted (( "Planted.ipe", "x = File." ++ dirKernelName ++ " \"p\"" ) :: sources))
+                && not (tempSitesAdmitted (( "Planted.ipe", "import Ipe.File exposing (" ++ fileKernelName ++ ")" ) :: sources))
+                && not (tempSitesAdmitted (( "TestSupport.ipe", "y = F." ++ dirKernelName ++ " \"q\"" ) :: sources))
+            )
+
+
+dirKernelName : String
+dirKernelName =
+    "temp" ++ "Dir"
+
+
+fileKernelName : String
+fileKernelName =
+    "temp" ++ "File"
+
+
+-- Each kernel named exactly once over every code line of `sources`, and
+-- only in `TestSupport.ipe`. A whole-line comment is not code.
+tempSitesAdmitted : List ( String, String ) -> Bool
+tempSitesAdmitted sources =
+    let
+        sites kernel ( _, text ) =
+            List.sum (List.map (\line -> List.length (String.split kernel line) - 1) (codeLines text))
+
+        admitted kernel =
+            List.sum (List.map (sites kernel) sources) == 1
+                && List.sum (List.map (sites kernel) (List.filter (\( name, _ ) -> name == "TestSupport.ipe") sources)) == 1
+    in
+    admitted dirKernelName && admitted fileKernelName
+
+
+codeLines : String -> List String
+codeLines text =
+    List.filter (\line -> not (String.startsWith "--" (String.trim line))) (String.lines text)
+
+
 checks : Task.Task Error (List ( String, Bool ))
 checks =
     Task.sequence
         [ check "one fixture name seeded twice gets two fresh stores" reseededNameGetsFreshStore
         , check "an erroring check is named, counted failed, and the run goes on" erroringCheckNamedAndCounted
+        , check "the suite-end sweep removes only a direct ipe- child of the temp root" sweepRemovesOnlyOwnedDirs
+        , check "a scratch directory is made only through freshDir" scratchOnlyThroughFreshDir
         ]
