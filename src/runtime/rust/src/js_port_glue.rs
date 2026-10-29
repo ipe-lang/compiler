@@ -1820,14 +1820,17 @@ fn js_string(text: &str) -> String {
     format!("\"{text}\"")
 }
 
-/// The glue's pattern over [`PUSH_ENCODE_ESCAPED`], each character spelled as a
-/// Unicode-mode regex escape `\u{X}`.
+/// The glue's pattern over [`PUSH_ENCODE_ESCAPED`], each character named by its
+/// code point so the constant holds no escape.
 fn push_encode_escaped_js() -> String {
-    let class: String = PUSH_ENCODE_ESCAPED
+    let points: Vec<String> = PUSH_ENCODE_ESCAPED
         .into_iter()
-        .flat_map(char::escape_unicode)
+        .map(|c| format!("0x{:x}", u32::from(c)))
         .collect();
-    format!("var PUSH_ENCODE_ESCAPED = /[{class}]/gu;")
+    format!(
+        "var PUSH_ENCODE_ESCAPED = new RegExp(\"[\" + String.fromCodePoint({}) + \"]\", \"gu\");",
+        points.join(", ")
+    )
 }
 
 /// The bridge constants the glue reads, each rendered from its one Rust definition.
@@ -2358,7 +2361,9 @@ mod tests {
     fn push_web_text_escapes_what_the_ipe_encoder_escapes() {
         let js = port_glue_js();
         assert_eq!(
-            js.matches(r"  var PUSH_ENCODE_ESCAPED = /[\u{26}\u{3c}\u{3e}\u{2028}\u{2029}]/gu;")
+            js.matches(
+                r#"  var PUSH_ENCODE_ESCAPED = new RegExp("[" + String.fromCodePoint(0x26, 0x3c, 0x3e, 0x2028, 0x2029) + "]", "gu");"#
+            )
                 .count(),
             1
         );
