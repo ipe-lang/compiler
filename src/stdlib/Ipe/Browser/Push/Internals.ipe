@@ -1,6 +1,6 @@
 -- | Ipe.Browser.Push.Internals — the low-level push subscription port surface:
 -- the opaque application key and subscription, their one parser and one encoder,
--- and the raw `Ipe.Ffi.Js` request/subscribe wiring the high-level
+-- and the raw `Ipe.Ffi.Js` request wiring the high-level
 -- `Ipe.Browser.Push` layer wraps.
 --
 -- Importing this submodule discloses the same `js-port:push` axis as the
@@ -19,13 +19,9 @@ module Ipe.Browser.Push.Internals exposing
     , requestSubscribe
     , requestCurrent
     , requestUnsubscribe
-    , subscribeChanges
-    , subscribeOpened
     , subscribeReply
     , currentReply
     , unsubscribeReply
-    , changesInbound
-    , openedInbound
     )
 
 import Ipe.Basics as Basics
@@ -39,7 +35,6 @@ import Ipe.Maybe as Maybe exposing (Maybe(..))
 import Ipe.Result as Result exposing (Result(..))
 import Ipe.String as String
 import Ipe.Task as Task
-import Ipe.Tea.Web.Sub as Sub
 
 
 -- | An application server's public key: a 65-byte uncompressed P-256 point,
@@ -492,18 +487,6 @@ requestUnsubscribe =
         |> Task.andThenResult (\outcome -> outcome)
 
 
--- | `subscribeChanges toMsg` — the inbound subscription over `changesInbound`.
-subscribeChanges : (Maybe Subscription -> msg) -> Sub.Sub msg
-subscribeChanges toMsg =
-    Js.subscribe changesInbound toMsg
-
-
--- | `subscribeOpened toMsg` — the inbound subscription over `openedInbound`.
-subscribeOpened : (String -> msg) -> Sub.Sub msg
-subscribeOpened toMsg =
-    Js.subscribe openedInbound toMsg
-
-
 -- | The reply to a subscribe request: a `subscribed` event carrying a
 -- subscription text that `decodeSubscription` accepts, or a refusal.
 subscribeReply : Decode.Decoder (Result Error Subscription)
@@ -586,60 +569,3 @@ refusal code =
         _ ->
             Decode.fail "unknown push refusal code"
 
-
--- | A `subscriptionChanged` broadcast: the device's subscription now, or
--- `Nothing` once it has none. A frame whose subscription text does not parse is
--- dropped.
-changesInbound : Decode.Decoder (Maybe Subscription)
-changesInbound =
-    Decode.andThen changedFrame (broadcast "subscriptionChanged")
-
-
-changedFrame : () -> Decode.Decoder (Maybe Subscription)
-changedFrame _ =
-    Decode.andThen changedSubscription (Decode.field "subscription" (Decode.nullable Decode.string))
-
-
-changedSubscription : Maybe String -> Decode.Decoder (Maybe Subscription)
-changedSubscription text =
-    case text of
-        Just subscription ->
-            case decodeSubscription subscription of
-                Ok parsedSubscription ->
-                    Decode.succeed (Just parsedSubscription)
-
-                Err _ ->
-                    Decode.fail "malformed push subscription"
-
-        Nothing ->
-            Decode.succeed Nothing
-
-
--- | A `notificationOpened` broadcast: the tag of the notification the user tapped.
-openedInbound : Decode.Decoder String
-openedInbound =
-    Decode.andThen (\_ -> Decode.field "notification" Decode.string) (broadcast "notificationOpened")
-
-
--- | Succeeds on an `ok` frame carrying exactly the `expected` event.
-broadcast : String -> Decode.Decoder ()
-broadcast expected =
-    Decode.andThen (broadcastEvent expected) (Decode.field "ok" Decode.bool)
-
-
-broadcastEvent : String -> Bool -> Decode.Decoder ()
-broadcastEvent expected ok =
-    if ok then
-        Decode.andThen (expectEvent expected) (Decode.field "event" Decode.string)
-
-    else
-        Decode.fail "not a push broadcast"
-
-
-expectEvent : String -> String -> Decode.Decoder ()
-expectEvent expected event =
-    if event == expected then
-        Decode.succeed ()
-
-    else
-        Decode.fail "unexpected push event"

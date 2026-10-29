@@ -18,9 +18,8 @@
 --   * `Ipe.Browser.Push.Internals` publishes the parser and encoder of the
 --     canonical subscription text and the reply decoders the port runs.
 --   * this module is the high-level layer: `applicationKey` parses the app
---     server's public key, `subscribe` / `current` / `unsubscribe` are
---     `Task Error` requests, and `changes` / `opened` are the inbound
---     subscriptions for a changed subscription and a tapped notification.
+--     server's public key, and `subscribe` / `current` / `unsubscribe` are
+--     `Task Error` requests.
 --
 -- A refusal on any path is a typed `Err`: a denied permission is
 -- `Error.permissionDenied`, a device or browser without push is
@@ -35,15 +34,12 @@ module Ipe.Browser.Push exposing
     , current
     , unsubscribe
     , subscriptionText
-    , changes
-    , opened
     )
 
 import Ipe.Browser.Push.Internals as Internals
 import Ipe.Error as Error exposing (Error)
 import Ipe.Maybe exposing (Maybe(..))
 import Ipe.Result exposing (Result)
-import Ipe.Tea.Web.Sub as Sub
 
 
 -- | An application server's public key (its VAPID key): a 65-byte uncompressed
@@ -104,17 +100,3 @@ unsubscribe =
 subscriptionText : Subscription -> String
 subscriptionText subscription =
     Internals.encodeSubscription subscription
-
-
--- | `changes toMsg` — the inbound subscription for a subscription the host
--- replaced or dropped: `Just` the new one, or `Nothing` when the device has none.
-changes : (Maybe Subscription -> msg) -> Sub.Sub msg
-changes toMsg =
-    Internals.subscribeChanges toMsg
-
-
--- | `opened toMsg` — the inbound subscription for a tapped push notification,
--- carrying its tag.
-opened : (String -> msg) -> Sub.Sub msg
-opened toMsg =
-    Internals.subscribeOpened toMsg
