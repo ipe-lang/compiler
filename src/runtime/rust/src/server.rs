@@ -7691,7 +7691,7 @@ mod tests {
         };
         let inner = axum::Router::new()
             .route(
-                "/raw/*rest",
+                "/raw/{*rest}",
                 axum::routing::get(seen("route", Arc::clone(&runs))),
             )
             .route("/api", axum::routing::get(seen("api", Arc::clone(&runs))))
