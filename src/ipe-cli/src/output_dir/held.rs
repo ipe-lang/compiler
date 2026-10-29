@@ -977,7 +977,7 @@ impl HeldDir {
 
     /// Whether a case-folding volume may open `name` as the marker or the
     /// claim file ([`ipe_fs_open::may_open_as`]).
-    fn is_reserved(name: &OsStr) -> bool {
+    pub fn is_reserved(name: &OsStr) -> bool {
         [OWNERSHIP_MARKER, CLAIM_FILE]
             .into_iter()
             .any(|reserved| ipe_fs_open::may_open_as(name, reserved))
@@ -1311,6 +1311,144 @@ impl HeldDir {
         let cap = ByteCap::from_nonzero(NonZeroU64::new(len).unwrap_or(NonZeroU64::MIN));
         file.read_bytes(cap)
             .is_ok_and(|existing| existing == contents)
+    }
+
+    /// Put the held subdirectory `staged`, opened as `staging`, at `target` in one rename.
+    ///
+    /// `staging` is re-proven to name `staged` first, and `staged`'s handle is
+    /// released, since a held directory cannot be renamed on every platform. An
+    /// absent `target` is taken by a no-replace rename; a directory there is
+    /// swapped out in one exchange where the filesystem has one, and otherwise
+    /// renamed to `aside` before the staged tree takes its place, moved back
+    /// when that second rename fails. The target name never shows a partial
+    /// tree; without an exchange it is absent between the two renames.
+    ///
+    /// The name now holding the displaced tree is returned for the caller to
+    /// remove; `None` when the target was absent. It is `staging` whenever
+    /// the rename back there succeeds: a displaced tree is moved out of
+    /// `aside` as soon as the staged tree is in place, so an entry left at
+    /// `aside` only ever holds a previous tree no promotion replaced (a run
+    /// killed between the renames, or a failed move back), which the next
+    /// staging refuses to discard.
+    ///
+    /// # Errors
+    /// [`OutputRefusal::UnsafeComponent`] for the marker or claim name;
+    /// [`OutputRefusal::Replaced`] when `staging` no longer names `staged`;
+    /// [`OutputRefusal::Symlink`] or [`OutputRefusal::NotADirectory`] for a
+    /// link or a non-directory at `target`, left untouched; [`CliError::Io`]
+    /// on a failed rename, naming `aside` when the displaced tree could not be
+    /// moved back.
+    pub fn promote_dir(
+        &self,
+        staging: &OsStr,
+        staged: Self,
+        target: &OsStr,
+        aside: &OsStr,
+    ) -> Result<Option<EntryName>, CliError> {
+        let target_path = self.path.join(target);
+        if Self::is_reserved(target) {
+            return Err(OutputRefusal::UnsafeComponent(target_path).into());
+        }
+        let (from, to, aside_entry) = (
+            self.entry(staging)?,
+            self.entry(target)?,
+            self.entry(aside)?,
+        );
+        let _proof: Released<'_> = self.release_proven(staging, staged)?;
+        match self.kind_of(&to)? {
+            EntryKind::Symlink => Err(OutputRefusal::Symlink(target_path).into()),
+            EntryKind::Other => Err(OutputRefusal::NotADirectory(target_path).into()),
+            EntryKind::Absent => {
+                sys::rename_noreplace(&self.dir, &from, &to)
+                    .map_err(|e| act_err(&target_path, e))?;
+                Ok(None)
+            }
+            EntryKind::Directory => {
+                if sys::exchange(&self.dir, &from, &to).map_err(|e| act_err(&target_path, e))? {
+                    return Ok(Some(from));
+                }
+                let aside_path = self.path.join(aside);
+                sys::rename_noreplace(&self.dir, &to, &aside_entry)
+                    .map_err(|e| act_err(&aside_path, e))?;
+                match sys::rename_noreplace(&self.dir, &from, &to) {
+                    Ok(()) => Ok(Some(
+                        match sys::rename_noreplace(&self.dir, &aside_entry, &from) {
+                            Ok(()) => from,
+                            Err(_kept) => aside_entry,
+                        },
+                    )),
+                    Err(e) => Err(
+                        sys::rename_noreplace(&self.dir, &aside_entry, &to).map_or_else(
+                            |back| act_err(&aside_path, back),
+                            |()| act_err(&target_path, e),
+                        ),
+                    ),
+                }
+            }
+        }
+    }
+
+    /// Remove the entry `name` left behind by a staged product, whatever it now is.
+    ///
+    /// A directory tree is removed as [`HeldDir::remove_entry`] removes one; a
+    /// link or a file is unlinked as itself, never followed. An absent entry
+    /// is already removed.
+    ///
+    /// # Errors
+    /// [`OutputRefusal::TooDeep`]; [`CliError::Io`] on a filesystem failure.
+    pub fn remove_leftover(&self, name: &EntryName) -> Result<(), CliError> {
+        let raw = name.as_os_str();
+        match self.kind_of(name)? {
+            EntryKind::Absent => Ok(()),
+            EntryKind::Directory => self.remove_dir(raw, 0),
+            EntryKind::Symlink | EntryKind::Other => self.unlink(raw),
+        }
+    }
+
+    /// Remove every entry whose name `ours` accepts, skipping any it cannot remove.
+    ///
+    /// The listing streams through the held handle and retains nothing. An
+    /// entry that vanished, or that another user or program keeps, is skipped,
+    /// so a leftover ipe cannot remove never fails the run that found it.
+    ///
+    /// # Errors
+    /// [`CliError::Io`] when the directory cannot be listed.
+    pub fn remove_matching(&self, ours: impl Fn(&str) -> bool) -> Result<(), CliError> {
+        let names = sys::names(&self.dir).map_err(|e| act_err(&self.path, e))?;
+        for name in names {
+            let Ok(Listed::Entry(entry)) = name else {
+                continue;
+            };
+            if entry.as_os_str().to_str().is_some_and(&ours) {
+                let _skipped = self.remove_leftover(&entry);
+            }
+        }
+        Ok(())
+    }
+
+    /// The first entry whose name `wanted` accepts, listed through the held handle.
+    ///
+    /// A name no held handle can open is not one ipe wrote, so it is passed
+    /// over; a listing failure fails the search rather than miss an entry.
+    ///
+    /// # Errors
+    /// [`CliError::Io`] when the directory cannot be listed.
+    pub fn find_matching(
+        &self,
+        wanted: impl Fn(&str) -> bool,
+    ) -> Result<Option<EntryName>, CliError> {
+        let names = sys::names(&self.dir).map_err(|e| act_err(&self.path, e))?;
+        for name in names {
+            match name {
+                Ok(Listed::Entry(entry)) if entry.as_os_str().to_str().is_some_and(&wanted) => {
+                    return Ok(Some(entry));
+                }
+                Ok(Listed::Entry(_) | Listed::Unnameable(_)) => {}
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(e) => return Err(act_err(&self.path, e)),
+            }
+        }
+        Ok(None)
     }
 }
 

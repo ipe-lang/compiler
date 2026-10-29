@@ -4343,8 +4343,11 @@ impl std::fmt::Display for SwiftStringLiteral {
 /// Materialise `layout` as the shell `dist/<root_name>` inside the owned `dist`.
 ///
 /// Generated files are written verbatim, bundled SPA assets are read through
-/// the held `www/` and written, and the source icon is copied into place. A fresh, deterministic tree: an existing shell directory
-/// of the same name is removed first so a re-pack never leaves stale files behind.
+/// the held `www/` and written, and the source icon is copied into place. The
+/// shell is built whole in a staging directory beside `dist/<root_name>` and
+/// put there in one rename ([`OwnedDir::stage_dir`]): a fresh, deterministic
+/// tree that replaces the previous shell only once complete, so a refusal at
+/// any file leaves the previous shell exactly as it was, and no staging entry.
 /// Every path is a [`crate::output_dir::OwnedPath`], so a symlink planted in the
 /// owned `dist` is refused — never removed through, written through, or copied
 /// onto.
@@ -4387,13 +4390,10 @@ pub fn materialise(
         })
         .collect::<Result<Vec<_>, BundleError>>()
         .map_err(refused)?;
-    let root = dist.path_to(&layout.root_name)?;
-    root.remove()?;
-    root.ensure_dir()?;
+    let staged = dist.stage_dir(&layout.root_name)?;
 
     for (file, bytes) in laid {
-        let out_file =
-            dist.path_to(Path::new(&layout.root_name).join(rel_to_native(&file.rel_path)))?;
+        let out_file = staged.path_to(rel_to_native(&file.rel_path))?;
         match bytes {
             Laid::Text(text) => out_file.write(text.as_bytes())?,
             Laid::Policed(page) => out_file.write(page.as_bytes())?,
@@ -4410,7 +4410,7 @@ pub fn materialise(
             }
         }
     }
-    Ok(root.path())
+    staged.promote()
 }
 
 /// The bytes one shell file is laid down with, read before any is written.
@@ -4433,6 +4433,7 @@ fn rel_to_native(rel: &str) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::output_dir::test_links::{staging_leftovers, tree_snapshot};
     use ipe_runtime_rust::encoding::ServerOrigins;
 
     fn accepts(items: &[Capability]) -> BTreeSet<Capability> {
@@ -6838,5 +6839,80 @@ mod tests {
                 .contains(&format!("larger than {MAX_ASSET_BYTES} bytes")),
             "{err}"
         );
+    }
+
+    // ── Staged shell: complete or absent ──────────────────────────────────────
+
+    /// An Android shell over a bundle whose `boot.js` asset is read after other shell files.
+    fn staged_shell(tag: &str) -> (PathBuf, ShellLayout, OwnedDir) {
+        let laid = pin("/", &[]);
+        let page = page_with(&[&served_meta(laid.servers.origins(), BundleWorker::None)]);
+        let (base, spa) = bundle_with_page(tag, &page);
+        let shell = layout(
+            MobileOs::Android,
+            BundleProfile::Dev,
+            &identity(),
+            &laid,
+            &spa,
+            None,
+        )
+        .expect("layout");
+        assert!(
+            shell
+                .files
+                .iter()
+                .position(|file| file.rel_path.ends_with("boot.js"))
+                > Some(0),
+            "control: a shell file is written before the asset"
+        );
+        let dist = OwnedDir::claim(&base.join("dist")).expect("claim dist");
+        (base, shell, dist)
+    }
+
+    /// Remove the collected `boot.js`, so the shell's read of it is refused mid-write.
+    fn drop_asset(base: &Path) {
+        std::fs::remove_file(base.join("www").join("boot.js")).expect("remove the asset");
+    }
+
+    #[test]
+    fn a_shell_refused_mid_write_lays_nothing_down() {
+        let (base, shell, dist) = staged_shell("staged-absent");
+        drop_asset(&base);
+        let result = materialise(&shell, None, &dist);
+        assert!(matches!(result, Err(CliError::Usage(_))), "{result:?}");
+        assert!(
+            !dist.path().join(&shell.root_name).exists(),
+            "no partial shell"
+        );
+        assert!(staging_leftovers(dist.path()).is_empty());
+    }
+
+    #[test]
+    fn a_shell_refused_mid_write_keeps_the_previous_shell_byte_for_byte() {
+        let (base, shell, dist) = staged_shell("staged-previous");
+        let root = materialise(&shell, None, &dist).expect("the previous shell");
+        let before = tree_snapshot(&root);
+        assert!(before.len() > 1, "control: the previous shell holds files");
+        drop_asset(&base);
+        let result = materialise(&shell, None, &dist);
+        assert!(matches!(result, Err(CliError::Usage(_))), "{result:?}");
+        assert_eq!(tree_snapshot(&root), before);
+        assert!(staging_leftovers(dist.path()).is_empty());
+    }
+
+    #[test]
+    fn a_staged_shell_lands_every_file_and_leaves_nothing_behind() {
+        let (_base, shell, dist) = staged_shell("staged-happy");
+        let root = materialise(&shell, None, &dist).expect("materialise");
+        for file in &shell.files {
+            assert!(
+                root.join(rel_to_native(&file.rel_path)).is_file(),
+                "{}",
+                file.rel_path
+            );
+        }
+        let again = materialise(&shell, None, &dist).expect("a re-pack");
+        assert_eq!(again, root);
+        assert!(staging_leftovers(dist.path()).is_empty());
     }
 }
