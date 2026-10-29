@@ -1526,6 +1526,18 @@ the emitted wasm bundle holds more than {limit} entries
 
 the emitted wasm bundle at {path} was replaced after it was collected — build and package again
 
+## mobile-bundle-policy-mismatch
+
+the emitted wasm bundle's page at {path} does not carry exactly one Content-Security-Policy meta for this package.ipe's `delivery.servers` and accepted capabilities — the bundle was built from other settings; build and package again
+
+## mobile-bundle-index-too-large
+
+the emitted wasm bundle's page at {path} is larger than {cap} bytes, more than a bundle page holds — build and package again
+
+## mobile-asset-origin-listed
+
+package.ipe: `delivery.servers` lists {origin}, the Android shell's own local asset origin — the shell answers that origin from the bundle, so it cannot also be a server. Remove it from `delivery.servers`.
+
 ## mobile-bundle-io
 
 reading {path}: {detail}
