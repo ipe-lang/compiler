@@ -394,6 +394,37 @@ where
     sqlx::query::<DB>(probe).execute(conn).await.map(|_| ())
 }
 
+/// Check a connection out of `pool`; the checkout runs to its end even when
+/// its caller is dropped first.
+///
+/// A checkout cut mid-way (in its liveness ping, its checkout hook or a fresh
+/// connect) drops its connection outside the pool: the pool slot frees at once
+/// while the connection closes later on its own thread, so a pool close can
+/// return, and the process exit, with that connection still open (a SQLite
+/// file then keeps its `-wal`). On its own task an abandoned checkout still
+/// ends in a pooled connection, whose drop returns it through the pool and
+/// holds the pool slot until it has closed, which a pool close waits for.
+pub(crate) async fn checkout<DB: sqlx::Database>(
+    pool: &sqlx::Pool<DB>,
+) -> Result<sqlx::pool::PoolConnection<DB>, sqlx::Error> {
+    let pool = pool.clone();
+    shielded(async move { pool.acquire().await }).await
+}
+
+/// Run `op` on its own task to its end, even when the caller is dropped first.
+///
+/// A task the runtime cancelled reads as a closed pool; a panicked one as a
+/// crashed driver.
+async fn shielded<T: Send + 'static>(
+    op: impl std::future::Future<Output = Result<T, sqlx::Error>> + Send + 'static,
+) -> Result<T, sqlx::Error> {
+    match tokio::spawn(op).await {
+        Ok(done) => done,
+        Err(join) if join.is_cancelled() => Err(sqlx::Error::PoolClosed),
+        Err(_) => Err(sqlx::Error::WorkerCrashed),
+    }
+}
+
 /// Opens a top-level transaction that may write on a connection from `pool`.
 ///
 /// The one site a transaction begins on a pool connection; a nested scope on a
@@ -402,10 +433,14 @@ where
 /// the transaction compiles against every schema change committed before its
 /// lock, and no other connection can commit one until it ends.
 async fn begin_write_txn(pool: &Db) -> Result<sqlx::Transaction<'static, DbDatabase>, sqlx::Error> {
-    let mut tx = match KERNEL_WRITE_BEGIN.statement() {
-        Some(statement) => pool.begin_with(statement).await,
-        None => pool.begin().await,
-    }?;
+    let pool = pool.clone();
+    let mut tx = shielded(async move {
+        match KERNEL_WRITE_BEGIN.statement() {
+            Some(statement) => pool.begin_with(statement).await,
+            None => pool.begin().await,
+        }
+    })
+    .await?;
     refresh_schema_cache::<DbDatabase>(&mut *tx, KERNEL_SCHEMA_CACHE).await?;
     Ok(tx)
 }
@@ -493,7 +528,10 @@ impl QueryTarget<'_> {
         query: DbQuery<'q>,
     ) -> Result<<DbDatabase as sqlx::Database>::QueryResult, sqlx::Error> {
         match self {
-            QueryTarget::Pool(pool) => query.execute(*pool).await,
+            QueryTarget::Pool(pool) => {
+                let mut conn = checkout(*pool).await?;
+                query.execute(&mut *conn).await
+            }
             QueryTarget::Txn(conn) => {
                 let mut guard = conn.lock().await;
                 query.execute(&mut **guard).await
@@ -503,7 +541,10 @@ impl QueryTarget<'_> {
 
     async fn fetch_all<'q>(&self, query: DbQuery<'q>) -> Result<Vec<DbRow>, sqlx::Error> {
         match self {
-            QueryTarget::Pool(pool) => query.fetch_all(*pool).await,
+            QueryTarget::Pool(pool) => {
+                let mut conn = checkout(*pool).await?;
+                query.fetch_all(&mut *conn).await
+            }
             QueryTarget::Txn(conn) => {
                 let mut guard = conn.lock().await;
                 query.fetch_all(&mut **guard).await
@@ -513,7 +554,10 @@ impl QueryTarget<'_> {
 
     async fn fetch_optional<'q>(&self, query: DbQuery<'q>) -> Result<Option<DbRow>, sqlx::Error> {
         match self {
-            QueryTarget::Pool(pool) => query.fetch_optional(*pool).await,
+            QueryTarget::Pool(pool) => {
+                let mut conn = checkout(*pool).await?;
+                query.fetch_optional(&mut *conn).await
+            }
             QueryTarget::Txn(conn) => {
                 let mut guard = conn.lock().await;
                 query.fetch_optional(&mut **guard).await
@@ -523,7 +567,10 @@ impl QueryTarget<'_> {
 
     async fn fetch_one<'q>(&self, query: DbQuery<'q>) -> Result<DbRow, sqlx::Error> {
         match self {
-            QueryTarget::Pool(pool) => query.fetch_one(*pool).await,
+            QueryTarget::Pool(pool) => {
+                let mut conn = checkout(*pool).await?;
+                query.fetch_one(&mut *conn).await
+            }
             QueryTarget::Txn(conn) => {
                 let mut guard = conn.lock().await;
                 query.fetch_one(&mut **guard).await
@@ -9530,6 +9577,72 @@ mod tests {
         );
     }
 
+    /// Every runtime statement on an owned pool runs on a connection checked
+    /// out through [`checkout`], never on the pool as its executor: a pool
+    /// executor checks out inline, and a cut inline checkout frees its pool
+    /// slot before its connection closes.
+    #[test]
+    fn every_owned_pool_statement_checks_out_through_the_shielded_checkout() {
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let read = |rel: &str| {
+            let source = std::fs::read_to_string(src.join(rel)).expect("read a source file");
+            source
+                .split_once("\n#[cfg(test)]\nmod ")
+                .map_or_else(|| source.clone(), |(head, _)| head.to_owned())
+        };
+        let db = read("db.rs");
+        let arms: Vec<&str> = db
+            .split("QueryTarget::Pool(pool) =>")
+            .skip(1)
+            .filter_map(|rest| rest.lines().nth(1))
+            .collect();
+        assert_eq!(arms.len(), 5, "the five pool arms of the statement runner");
+        assert!(
+            arms.iter().all(|line| {
+                let line = line.trim();
+                line == "let mut conn = checkout(*pool).await?;"
+                    || line == "let savepoint = begin_write_txn(pool).await?;"
+            }),
+            "a pool arm runs its statement on the pool itself: {arms:?}"
+        );
+        let begin = db
+            .split_once("async fn begin_write_txn(")
+            .and_then(|(_, rest)| rest.split_once("\n}\n"))
+            .map(|(body, _)| body);
+        assert!(
+            begin.is_some_and(|body| body.contains("shielded(async move")),
+            "the write begin checks out inline"
+        );
+        let executors = [
+            ".execute(",
+            ".fetch_one(",
+            ".fetch_optional(",
+            ".fetch_all(",
+        ];
+        for rel in ["auth.rs", "web/store.rs"] {
+            let production = read(rel);
+            let inline: Vec<&str> = production
+                .lines()
+                .filter(|line| !line.trim_start().starts_with("//"))
+                .filter(|line| {
+                    executors.iter().any(|call| {
+                        line.split(call)
+                            .skip(1)
+                            .any(|arg| !arg.starts_with("&mut *held)"))
+                    })
+                })
+                .collect();
+            assert!(
+                inline.is_empty(),
+                "{rel} runs a statement on its pool itself: {inline:?}"
+            );
+            assert!(
+                production.contains("crate::db::checkout("),
+                "{rel} reaches its pool"
+            );
+        }
+    }
+
     /// Statements that fail at prepare time on a connection whose cached schema
     /// predates another connection's DDL, before any schema-cookie check runs.
     const STALE_SENSITIVE: [&str; 2] = [
@@ -15291,6 +15404,91 @@ mod tests {
             "the write survives the close: {kept:?}"
         );
         reopened.close().await;
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A checkout cut while its checkout hook is still running on the
+    /// connection holds the owned-pool close until that connection has closed:
+    /// the close returns with no `-wal` left behind.
+    #[tokio::test]
+    async fn a_checkout_cut_mid_hook_closes_its_connection_before_the_pools_close() {
+        let mut path = crate::scratch_core::test_temp_root();
+        path.push(format!(
+            "ipe_cut_checkout_{}_{}.db",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let _ = std::fs::remove_file(&path);
+        let options = sqlx::sqlite::SqliteConnectOptions::new()
+            .filename(&path)
+            .create_if_missing(true)
+            .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal)
+            .busy_timeout(SQLITE_BUSY_TIMEOUT);
+        let armed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let in_hook = std::sync::Arc::new(tokio::sync::Notify::new());
+        let (hook_armed, hook_entered) = (armed.clone(), in_hook.clone());
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .before_acquire(move |conn, _meta| {
+                let armed = hook_armed.load(std::sync::atomic::Ordering::SeqCst);
+                let entered = hook_entered.clone();
+                Box::pin(async move {
+                    if armed {
+                        entered.notify_one();
+                        sqlx::query(
+                            "WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c \
+                             WHERE x < 3000000) SELECT count(*) FROM c",
+                        )
+                        .execute(&mut *conn)
+                        .await?;
+                    }
+                    Ok(true)
+                })
+            })
+            .connect_with(options)
+            .await;
+        assert!(pool.is_ok(), "the WAL pool opens: {pool:?}");
+        let Ok(pool) = pool else {
+            return;
+        };
+        let created = sqlx::query("CREATE TABLE kept (v INTEGER)")
+            .execute(&pool)
+            .await;
+        assert!(created.is_ok(), "the table opens: {created:?}");
+        let wrote = sqlx::query("INSERT INTO kept VALUES (1)")
+            .execute(&pool)
+            .await;
+        assert!(wrote.is_ok(), "the write lands: {wrote:?}");
+        assert!(
+            sidecar(&path, "-wal").exists(),
+            "a WAL write leaves its sidecar open"
+        );
+        armed.store(true, std::sync::atomic::Ordering::SeqCst);
+        let cut_pool = pool.clone();
+        let cut = tokio::spawn(async move { checkout(&cut_pool).await.map(drop) });
+        in_hook.notified().await;
+        cut.abort();
+        let cut = cut.await;
+        assert!(
+            cut.as_ref()
+                .is_err_and(tokio::task::JoinError::is_cancelled),
+            "the checkout is cut mid-hook: {cut:?}"
+        );
+        let pools = OwnedPools::new();
+        assert!(
+            pools
+                .register(PoolRole::Cached, Box::new(pool.clone()), 1)
+                .is_ok()
+        );
+        pools.close_all(std::time::Duration::from_secs(10)).await;
+        assert!(pool.is_closed());
+        assert!(
+            !sidecar(&path, "-wal").exists(),
+            "the cut checkout's connection closed before the pools' close returned"
+        );
         let _ = std::fs::remove_file(&path);
     }
 
