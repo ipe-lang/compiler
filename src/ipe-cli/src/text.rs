@@ -1303,6 +1303,12 @@ messages! {
     mobile_bundle_too_many(limit) = "mobile-bundle-too-many";
     /// The emitted wasm bundle was replaced between its collection and its copy.
     mobile_bundle_replaced(path) = "mobile-bundle-replaced";
+    /// The bundle's `index.html` does not carry the one policy meta the pin admits.
+    mobile_bundle_policy_mismatch(path) = "mobile-bundle-policy-mismatch";
+    /// The bundle's `index.html` is larger than the pack reads.
+    mobile_bundle_index_too_large(path, cap) = "mobile-bundle-index-too-large";
+    /// `delivery.servers` names the Android shell's local asset origin.
+    mobile_asset_origin_listed(origin) = "mobile-asset-origin-listed";
     /// A filesystem failure while walking the emitted wasm bundle.
     mobile_bundle_io(path, detail) = "mobile-bundle-io";
     /// A bundle entry's name is not UTF-8.
