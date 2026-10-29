@@ -62,6 +62,9 @@ pub mod console_proxy;
 // Observability middleware + noise ingest — axum request/response types, server-only.
 #[cfg(feature = "web")]
 pub mod observability;
+// The worker script bodies served at the app's worker route.
+#[cfg(feature = "web")]
+pub mod worker;
 // Observability export pipelines: federation push to a parent ingest
 // and remote-hub OTLP push. Both env-gated + inert by default.
 // Use reqwest for outbound push; gated so a web app with no outbound HTTP
@@ -7572,11 +7575,36 @@ where
         )
     }
 
+    // Serve the app's worker script. The route answers in every build, so a
+    // worker an earlier build installed is always retired; `no-cache` makes
+    // the browser revalidate it on every update check, and no cookie is set.
+    async fn serve_worker() -> axum::response::Response {
+        use axum::http::header;
+        use axum::response::IntoResponse;
+        crate::server::with_security_headers(
+            (
+                [
+                    (header::CONTENT_TYPE, "text/javascript; charset=utf-8"),
+                    (header::CACHE_CONTROL, "no-cache"),
+                ],
+                worker::WorkerBody::Retire.source(),
+            )
+                .into_response(),
+            crate::server::response_security_headers(),
+        )
+    }
+
     let router = Router::new()
         .route("/_ipe/sse", sse_route)
         .route("/_ipe/event", event_route)
         .route("/_ipe/port", port_route)
-        .route(&client_js_route_path, get(serve_client_js));
+        .route(&client_js_route_path, get(serve_client_js))
+        // The worker route is root-relative like every route here; a mount
+        // strips its base before this router sees the path.
+        .route(
+            &format!("/{}", crate::server::WORKER_SCRIPT_NAME),
+            get(serve_worker),
+        );
     // The `Ipe.Ffi.Js` browser port surface (`window.ipe`), served
     // content-addressed with SRI — the same static, immutable discipline as
     // the client core and widget glue. A GET of fixed bytes (no user input),
@@ -7868,6 +7896,17 @@ where
         // and access-logged.
         .layer(axum::middleware::from_fn(
             crate::server::refuse_unparsed_url,
+        ))
+        // Every worker script fetch but one of this app's worker route is
+        // refused before CSRF or any handler runs, so a static file, a
+        // browser-noise file or a page can never be installed as a worker.
+        // The router is root-relative, so the admitted base is the root; a
+        // parent `Ipe.Http.Server` gates the unstripped path too.
+        .layer(axum::middleware::from_fn_with_state(
+            Arc::new(crate::server::AdmittedWorkerPaths::of_bases([
+                &crate::encoding::MountBase::root(),
+            ])),
+            crate::server::refuse_foreign_worker,
         ))
         // Per-request panic recovery: a handler or csrf-mw panic becomes a 500
         // instead of an unwound tokio task that drops the connection with no
@@ -18011,6 +18050,165 @@ mod route_entry_cmd_tests {
             assert!(frame.contains("page-item-8"), "{frame}");
             let m = settled(&store, &sid, 3).await;
             assert_eq!(m.map(|m| count(&m, "enter:item-8")), Some(1));
+        });
+    }
+
+    /// The `Service-Worker` value a browser sends on a worker script fetch.
+    const WORKER_SCRIPT: (&str, &str) = ("service-worker", "script");
+
+    /// GET `path` through `app` carrying `extra` headers: the status, the
+    /// response headers and the body.
+    #[allow(clippy::expect_used)] // test helper: a fixed request builds and its body reads
+    async fn fetch_with(
+        app: axum::Router,
+        path: &str,
+        extra: &[(&str, &str)],
+    ) -> (StatusCode, axum::http::HeaderMap, Vec<u8>) {
+        let mut wire = Request::builder().method("GET").uri(path);
+        for (name, value) in extra {
+            wire = wire.header(*name, *value);
+        }
+        let resp = app
+            .oneshot(wire.body(Body::empty()).expect("build GET"))
+            .await
+            .expect("router responds");
+        let status = resp.status();
+        let headers = resp.headers().clone();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("read body");
+        (status, headers, body.to_vec())
+    }
+
+    /// The refusal of a foreign worker fetch: an empty 403 with the security
+    /// headers and no cookie.
+    fn assert_worker_refused(answer: &(StatusCode, axum::http::HeaderMap, Vec<u8>), what: &str) {
+        let (status, headers, body) = answer;
+        assert_eq!(*status, StatusCode::FORBIDDEN, "{what}");
+        assert!(body.is_empty(), "{what}: a refusal carries no body");
+        for name in ["content-security-policy", "x-content-type-options"] {
+            assert!(
+                headers.contains_key(name),
+                "{what}: the refusal lacks {name}"
+            );
+        }
+        assert!(
+            !headers.contains_key(header::SET_COOKIE),
+            "{what}: a refusal sets no cookie"
+        );
+    }
+
+    /// A directory holding `sw.js`, served as the app's static dir while `body` runs.
+    #[allow(clippy::expect_used)] // test helper: the fixture directory and file are writable
+    async fn with_static_worker_file<F: std::future::Future<Output = ()>>(
+        body: impl FnOnce() -> F,
+    ) {
+        let dir = crate::scratch_core::test_temp_root()
+            .join(format!("ipe-worker-gate-static-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp static dir");
+        std::fs::write(dir.join("sw.js"), "self.planted=1;").expect("static worker file");
+        crate::system::locked_set_var(
+            "IPE_WEB_STATIC_DIR",
+            dir.to_str().expect("a UTF-8 temp path"),
+        );
+        body().await;
+        crate::system::locked_remove_var("IPE_WEB_STATIC_DIR");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A static file and a browser-noise file are served to a plain fetch,
+    /// and refused to a worker script fetch.
+    #[test]
+    fn a_static_or_noise_file_is_never_a_worker() {
+        run(false, || async {
+            with_static_worker_file(|| async {
+                for path in ["/static/sw.js", "/sw.js"] {
+                    let (status, _, body) = fetch_with(router(memory()), path, &[]).await;
+                    assert_eq!(status, StatusCode::OK, "{path} is served to a plain fetch");
+                    assert_eq!(body, b"self.planted=1;", "{path}");
+                    let answer = fetch_with(router(memory()), path, &[WORKER_SCRIPT]).await;
+                    assert_worker_refused(&answer, path);
+                }
+            })
+            .await;
+        });
+    }
+
+    /// A page, routed or the root, is never a worker.
+    #[test]
+    fn a_page_is_never_a_worker() {
+        run(false, || async {
+            for path in ["/", "/items/7"] {
+                let answer = fetch_with(router(memory()), path, &[WORKER_SCRIPT]).await;
+                assert_worker_refused(&answer, path);
+            }
+        });
+    }
+
+    /// Only the one exact `script` value reaches the worker route.
+    #[test]
+    fn an_unknown_worker_value_is_refused_on_the_worker_route() {
+        run(false, || async {
+            for value in ["Script", "script, script", ""] {
+                let answer =
+                    fetch_with(router(memory()), "/ipe-sw.js", &[("service-worker", value)]).await;
+                assert_worker_refused(&answer, value);
+            }
+            let (status, _, body) = fetch_with(
+                router(memory()),
+                "/ipe-sw.js",
+                &[WORKER_SCRIPT, WORKER_SCRIPT],
+            )
+            .await;
+            assert_eq!(
+                status,
+                StatusCode::BAD_REQUEST,
+                "a repeated singleton header"
+            );
+            assert_ne!(body, worker::RETIRE_BODY.as_bytes());
+        });
+    }
+
+    /// The navigation preload header is another name: a page fetch carrying
+    /// it is answered as a page.
+    #[test]
+    fn a_navigation_preload_fetch_is_answered_normally() {
+        run(false, || async {
+            let (status, _, body) = fetch_with(
+                router(memory()),
+                "/",
+                &[("service-worker-navigation-preload", "true")],
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK);
+            assert!(
+                String::from_utf8_lossy(&body).contains("page-home"),
+                "the page is served"
+            );
+        });
+    }
+
+    /// The worker route answers the retire body to a worker script fetch:
+    /// `no-cache`, the security headers, and no cookie.
+    #[test]
+    fn the_worker_route_serves_the_retire_body() {
+        run(false, || async {
+            let (status, headers, body) =
+                fetch_with(router(memory()), "/ipe-sw.js", &[WORKER_SCRIPT]).await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(body, worker::RETIRE_BODY.as_bytes());
+            assert_eq!(
+                headers.get(header::CACHE_CONTROL).map(|v| v.as_bytes()),
+                Some(b"no-cache".as_slice())
+            );
+            assert_eq!(
+                headers.get(header::CONTENT_TYPE).map(|v| v.as_bytes()),
+                Some(b"text/javascript; charset=utf-8".as_slice())
+            );
+            for name in ["content-security-policy", "x-content-type-options"] {
+                assert!(headers.contains_key(name), "the worker route lacks {name}");
+            }
+            assert!(!headers.contains_key(header::SET_COOKIE), "no cookie");
         });
     }
 }
