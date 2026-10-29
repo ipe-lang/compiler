@@ -393,7 +393,7 @@ impl<'a> BundleReach<'a> {
             BundleHost::AndroidAssets => {
                 if let Some(origin) = servers
                     .origins()
-                    .find(|origin| host_of(origin) == ANDROID_ASSET_HOST)
+                    .find(|origin| names_asset_host(origin.authority()))
                 {
                     return Err(ReachRefusal::LocalOriginListed {
                         origin: origin.clone(),
@@ -446,13 +446,22 @@ impl<'a> BundleReach<'a> {
     }
 }
 
-/// The host of `origin`'s authority, without its `:port`.
+/// Whether `authority` names [`ANDROID_ASSET_HOST`], at any port.
+///
+/// It drops any `user@` and `:port`, one trailing `.`, and ASCII case: the
+/// spellings a resolver reads as the same host. [`ServerOrigin::parse`]
+/// already refuses each, so this holds without trusting that it does.
 #[cfg(feature = "encoding")]
-fn host_of(origin: &ServerOrigin) -> &str {
-    let authority = origin.authority();
-    authority
+fn names_asset_host(authority: &str) -> bool {
+    let host_port = authority
+        .rsplit_once('@')
+        .map_or(authority, |(_, host_port)| host_port);
+    let host = host_port
         .split_once(':')
-        .map_or(authority, |(host, _)| host)
+        .map_or(host_port, |(host, _)| host);
+    host.strip_suffix('.')
+        .unwrap_or(host)
+        .eq_ignore_ascii_case(ANDROID_ASSET_HOST)
 }
 
 /// Declares [`Profile`] and [`Profile::ALL`] from one variant list.
@@ -1531,5 +1540,44 @@ mod bundle_tests {
             "<meta http-equiv=\"Content-Security-Policy\" \
              content=\"script-src 'a&quot;b&lt;c&gt;d&amp;e'\">\n"
         );
+    }
+
+    /// The asset-host test reads every spelling a resolver equates with the
+    /// host, and the origin parser refuses each non-canonical one first.
+    #[test]
+    fn asset_host_spellings_cannot_slip_past_the_refusal() {
+        for named in [
+            "appassets.androidplatform.net",
+            "appassets.androidplatform.net:8443",
+            "APPASSETS.AndroidPlatform.NET",
+            "appassets.androidplatform.net.",
+            "appassets.androidplatform.net.:443",
+            "user@appassets.androidplatform.net",
+            "user:pass@appassets.androidplatform.net:1",
+        ] {
+            assert!(names_asset_host(named), "{named}");
+        }
+        for other in [
+            "appassets.androidplatform.net.example",
+            "xappassets.androidplatform.net",
+            "appassets.androidplatform.net..",
+            "appassets.androidplatform.net@api.example",
+            "api.example",
+            "",
+        ] {
+            assert!(!names_asset_host(other), "{other}");
+        }
+        for unparsed in [
+            "https://APPASSETS.androidplatform.net",
+            "https://appassets.androidplatform.net.",
+            "https://appassets.androidplatform.net.:8443",
+            "https://user@appassets.androidplatform.net",
+            "https://appassets.androidplatform.net:08443",
+            "https://appassets.androidplatform.net:443",
+            "https://appassets.androidplatform.net:",
+            "https://appassets.androidplatform.net:1:2",
+        ] {
+            assert!(ServerOrigin::parse(unparsed).is_err(), "{unparsed}");
+        }
     }
 }
