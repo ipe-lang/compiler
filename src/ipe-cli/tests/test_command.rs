@@ -971,7 +971,8 @@ fn push_refusal_cases() -> String {
              (replyOutcome Internals.unsubscribeReply \"{{\\\"ok\\\":false,\\\"error\\\":\\\"{code}\\\"}}\"))\n"
         )
         })
-        .collect()
+        .collect::<Vec<_>>()
+        .concat()
 }
 
 /// `Ipe.Browser.Push` parses keys and subscription texts in one spelling.
