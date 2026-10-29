@@ -536,8 +536,8 @@ admittedFlattening =
     , "Lib/Index.ipe:noTaggedPath"
     , "Lib/Index.ipe:probeRepos"
     , "Lib/Index.ipe:rootMismatch"
+    , "Lib/RepoPath.ipe:failureProblem"
     , "Lib/RepoPath.ipe:reposToError"
-    , "Lib/RepoPath.ipe:rootRefusal"
     , "Lib/RepoPath.ipe:toError"
     , "Lib/Settings.ipe:rootsRefusal"
     , "Lib/EnvLookup.ipe:startupNotice"
@@ -1721,6 +1721,8 @@ startupLayoutHasOneRenderer sources =
         && caughtBy StartupLayout (inQueue "shown =\n    \"\"\"IPE_X: it is refused; fix: set it\"\"\"")
         && caughtBy StartupLayout (appendTo "Main.ipe" "shown =\n    \"code-review: \"" sources)
         && caughtBy StartupLayout (appendTo "Lib/EnvLookup.ipe" "shown =\n    \"code-review: \"" sources)
+        && caughtBy StartupLayout (appendTo "Lib/RepoPath.ipe" "shown =\n    \"IPE_INDEX_ROOT: it is refused; fix: set it\"" sources)
+        && caughtBy StartupLayout (appendTo "Lib/Index.ipe" "shown =\n    \"IPE_INDEX_ROOT: it is refused; fix: set it\"" sources)
         && clean (inQueue "-- IPE_X: it is refused; fix: set it\nshown =\n    \"IPE_X\"")
         && clean (inQueue "shown =\n    \"IPE_X: a \\\\n is a backslash and n\"")
         && clean (inQueue "shown =\n    \"\\r\\n\"")
