@@ -6471,6 +6471,25 @@ mod tests {
         assert_eq!(readers, ["reach", "served", "origins"]);
         let fields = module.matches(".0").count();
         assert_eq!(fields, 3, "every field read is one of the listed: {module}");
+        // A destructuring read (`let Self(o) = self`, `|PinnedServers(o)| o`)
+        // names no `.0`, so every function and every tuple pattern the module
+        // holds is listed too.
+        let functions: Vec<&str> = module
+            .split("fn ")
+            .skip(1)
+            .filter_map(|rest| rest.split_once('(').map(|(name, _)| name))
+            .collect();
+        assert_eq!(functions, ["new", "reach", "served", "origins"], "{module}");
+        assert_eq!(
+            module.matches("Self(").count(),
+            1,
+            "only `new` builds: {module}"
+        );
+        assert_eq!(
+            module.matches("PinnedServers(").count(),
+            1,
+            "only the declaration names the tuple: {module}"
+        );
         assert!(
             module.contains("#[cfg(test)]\n        #[must_use]\n        pub const fn origins("),
             "the bare origins are a test's only: {module}"
@@ -6759,6 +6778,71 @@ mod tests {
         assert!(
             err.to_string()
                 .contains(text::mobile_asset_kind(&FileKind::Fifo).as_str()),
+            "{err}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_directory_swapped_for_a_link_after_the_walk_is_refused_not_copied() {
+        let laid = pin("/", &[]);
+        let page = page_with(&[&served_meta(laid.servers.origins(), BundleWorker::None)]);
+        let (base, www) = www_with("dir-link", &["pkg/app.js"]);
+        std::fs::write(www.join("index.html"), &page).expect("write index");
+        let spa = SpaBundle::from_www_dir(&www).expect("collect");
+        let shell = layout(
+            MobileOs::Android,
+            BundleProfile::Dev,
+            &identity(),
+            &laid,
+            &spa,
+            None,
+        )
+        .expect("layout");
+        // The outside directory holds the same name, so only the held,
+        // no-follow descent refuses it.
+        let outside = base.join("outside");
+        std::fs::create_dir_all(&outside).expect("mk outside");
+        std::fs::write(outside.join("app.js"), b"outside").expect("write outside asset");
+        std::fs::remove_dir_all(www.join("pkg")).expect("remove the collected directory");
+        std::os::unix::fs::symlink(&outside, www.join("pkg")).expect("plant a link");
+        let dist = OwnedDir::claim(&base.join("dist")).expect("claim dist");
+        let err = materialise(&shell, None, &dist).expect_err("a linked directory is refused");
+        assert!(
+            err.to_string()
+                .contains(text::mobile_asset_kind(&FileKind::Symlink).as_str()),
+            "{err}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_asset_past_the_cap_is_refused_unread() {
+        let laid = pin("/", &[]);
+        let page = page_with(&[&served_meta(laid.servers.origins(), BundleWorker::None)]);
+        let (base, spa) = bundle_with_page("asset-cap", &page);
+        let shell = layout(
+            MobileOs::Android,
+            BundleProfile::Dev,
+            &identity(),
+            &laid,
+            &spa,
+            None,
+        )
+        .expect("layout");
+        // A sparse file: its length is past the cap, its blocks are not
+        // written, and the held read refuses it on that length alone.
+        std::fs::File::options()
+            .write(true)
+            .open(base.join("www").join("boot.js"))
+            .and_then(|file| file.set_len(MAX_ASSET_BYTES.saturating_add(1)))
+            .expect("grow the asset past the cap");
+        let dist = OwnedDir::claim(&base.join("dist")).expect("claim dist");
+        let err = materialise(&shell, None, &dist).expect_err("an oversized asset is refused");
+        assert!(matches!(err, CliError::Usage(_)), "{err}");
+        assert!(
+            err.to_string()
+                .contains(&format!("larger than {MAX_ASSET_BYTES} bytes")),
             "{err}"
         );
     }
