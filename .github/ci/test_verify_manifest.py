@@ -144,7 +144,7 @@ class TestRustcWiringRefusals(unittest.TestCase):
                     runs-on: ubuntu-latest
                     steps:
                       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-                      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
+                      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0
                         with:
                           save-if: ${{ github.ref == 'refs/heads/main' }}
                       - run: cargo build
@@ -188,7 +188,7 @@ class TestRustcWiringRefusals(unittest.TestCase):
                   build:
                     runs-on: ubuntu-latest
                     steps:
-                      - uses: swatinem/Rust-Cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
+                      - uses: swatinem/Rust-Cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0
                       - run: cargo build
                 """
             ),
@@ -389,7 +389,7 @@ class TestRustcWiringRefusals(unittest.TestCase):
                   build:
                     runs-on: ubuntu-latest
                     steps:
-                      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
+                      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0
                 """
             ),
         )
@@ -747,13 +747,13 @@ class TestRustcWiringClosure(unittest.TestCase):
     def test_action_yaml_extension_is_resolved(self) -> None:
         _write(
             os.path.join(self.fx.root, "actions", "w", "action.yaml"),
-            "runs:\n  using: composite\n  steps:\n    - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6\n",
+            "runs:\n  using: composite\n  steps:\n    - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0\n",
         )
         self.ci("steps:\n  - uses: ./.github/actions/w\n")
         self.assertRefused("./.github/actions/w/action.yml", "save-if None")
 
     def test_composite_outside_github_actions_is_audited(self) -> None:
-        self.repo_action("tools/ci/cache", "runs:\n  using: composite\n  steps:\n    - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6\n")
+        self.repo_action("tools/ci/cache", "runs:\n  using: composite\n  steps:\n    - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0\n")
         self.ci("steps:\n  - uses: ./tools/ci/cache\n  - run: cargo build\n")
         self.assertRefused("./tools/ci/cache/action.yml", "save-if None")
 
@@ -765,7 +765,7 @@ class TestRustcWiringClosure(unittest.TestCase):
                 self.assertEqual(self.fx.errors(), [])
 
     def test_nested_path_composite_is_audited(self) -> None:
-        self.fx.composite("x/y", "runs:\n  using: composite\n  steps:\n    - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6\n")
+        self.fx.composite("x/y", "runs:\n  using: composite\n  steps:\n    - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0\n")
         self.ci("steps:\n  - uses: ./.github/actions/x/y\n")
         self.assertRefused("./.github/actions/x/y/action.yml", "save-if None")
 
@@ -981,7 +981,7 @@ class TestRustCacheSavesMainOnly(unittest.TestCase):
         self.addCleanup(self._tmpdir.cleanup)
         self.fx = WorkflowFixture(self._tmpdir.name)
 
-    def cache_step(self, uses: str = "Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6", with_: str | None = None) -> None:
+    def cache_step(self, uses: str = "Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0", with_: str | None = None) -> None:
         step = f"steps:\n  - uses: {uses}\n"
         if with_ is not None:
             step += "    with:\n" + textwrap.indent(with_, "      ")
@@ -1018,13 +1018,13 @@ class TestRustCacheSavesMainOnly(unittest.TestCase):
                 self.assertEqual(len(self.refusals()), 1, self.fx.errors())
 
     def test_case_and_subpath_variants_are_refused(self) -> None:
-        for uses in ("swatinem/RUST-CACHE@6323deb102c322ba6fcbdcafc7e3dddab59af2b6", "Swatinem/rust-cache/sub@6323deb102c322ba6fcbdcafc7e3dddab59af2b6"):
+        for uses in ("swatinem/RUST-CACHE@d1527c8f67ef9af357290475d4af4b0fab8f12e0", "Swatinem/rust-cache/sub@d1527c8f67ef9af357290475d4af4b0fab8f12e0"):
             with self.subTest(uses=uses):
                 self.cache_step(uses=uses)
                 self.assertEqual(len(self.refusals()), 1, self.fx.errors())
 
     def test_rust_cache_inside_local_composite_is_refused(self) -> None:
-        self.fx.composite("c", "runs:\n  using: composite\n  steps:\n    - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6\n")
+        self.fx.composite("c", "runs:\n  using: composite\n  steps:\n    - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0\n")
         self.fx.workflow("ci.yml", _ci("steps:\n  - uses: ./.github/actions/c\n"))
         (e,) = self.refusals()
         self.assertIn("./.github/actions/c/action.yml", e)
@@ -1819,7 +1819,7 @@ class TestTypedExpressionAndShellReads(unittest.TestCase):
 
 
 _CHECKOUT = "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1"
-_SETUP_PY = "actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97"
+_SETUP_PY = "actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0"
 _TOOL = "python3 .github/ci/verify-manifest.py"
 _LIVE_PIP = verify_manifest.CANONICAL_PIP_INSTALL
 
@@ -1918,6 +1918,8 @@ class TestToolOrderingAndClosedShells(unittest.TestCase):
             f"- name: Pre\n  uses: actions/checkout@{_PINNED_SHA}\n",
             f"- name: Pre\n  uses: {_CHECKOUT}\n  with:\n    ref: evil\n",
             f"- name: Pre\n  uses: {_SETUP_PY}\n  with:\n    python-version: '3.12'\n    cache: pip\n",
+            f"- name: Pre\n  uses: {_SETUP_PY}\n  with:\n    python-version: '3.12'\n    mirror: https://evil.example\n",
+            f"- name: Pre\n  uses: actions/setup-python@{_PINNED_SHA}\n  with:\n    python-version: '3.12'\n",
             f"- name: Pre\n  uses: some/action@{_PINNED_SHA}\n",
             f"- name: Pre\n  uses: {_CHECKOUT}\n  env:\n    PYTHONPATH: /tmp\n",
         ):
