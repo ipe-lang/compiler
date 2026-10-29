@@ -1420,8 +1420,7 @@ where
     Model: Clone + 'static,
     Msg: Clone + 'static,
 {
-    use crate::dom::{build_index, diff::diff};
-    use crate::html::{RenderCtx, assign_ipe_ids};
+    use crate::html::assign_ipe_ids;
 
     let render_model = match step {
         None => {
