@@ -797,15 +797,7 @@ impl<'a> ContentSecurityPolicy<'a> {
         out.push_str("<meta http-equiv=\"");
         out.push_str(HEADER_NAME);
         out.push_str("\" content=\"");
-        for c in value.chars() {
-            match c {
-                '&' => out.push_str("&amp;"),
-                '"' => out.push_str("&quot;"),
-                '<' => out.push_str("&lt;"),
-                '>' => out.push_str("&gt;"),
-                other => out.push(other),
-            }
-        }
+        crate::escape::html_attr_into(&value, &mut out);
         out.push_str("\">\n");
         out
     }
@@ -828,7 +820,8 @@ impl<'a> ContentSecurityPolicy<'a> {
     }
 }
 
-#[cfg(all(test, not(target_arch = "wasm32")))]
+#[cfg(test)]
+#[cfg(not(target_arch = "wasm32"))]
 mod tests {
     use super::*;
 
@@ -1449,7 +1442,10 @@ mod bundle_tests {
                 );
                 assert_eq!(
                     policy.meta_element(),
-                    format!("<meta http-equiv=\"Content-Security-Policy\" content=\"{value}\">\n")
+                    format!(
+                        "<meta http-equiv=\"Content-Security-Policy\" content=\"{}\">\n",
+                        crate::escape::html_attr(&value)
+                    )
                 );
             }
         }
@@ -1484,7 +1480,10 @@ mod bundle_tests {
         let none = ServerOrigins::none();
         assert_eq!(
             ContentSecurityPolicy::bundle(&none, BundleWorker::None).meta_element(),
-            format!("<meta http-equiv=\"Content-Security-Policy\" content=\"{OFFLINE}\">\n")
+            format!(
+                "<meta http-equiv=\"Content-Security-Policy\" content=\"{}\">\n",
+                crate::escape::html_attr(OFFLINE)
+            )
         );
     }
 
@@ -1535,10 +1534,17 @@ mod bundle_tests {
         let meta = ContentSecurityPolicy::default()
             .with(Directive::ScriptSrc, vec![Source::Hash(&hostile)])
             .meta_element();
+        let content = meta
+            .strip_prefix("<meta http-equiv=\"Content-Security-Policy\" content=\"")
+            .and_then(|rest| rest.strip_suffix("\">\n"));
         assert_eq!(
-            meta,
-            "<meta http-equiv=\"Content-Security-Policy\" \
-             content=\"script-src 'a&quot;b&lt;c&gt;d&amp;e'\">\n"
+            content,
+            Some(crate::escape::html_attr("script-src 'a\"b<c>d&e'").as_str()),
+            "{meta}"
+        );
+        assert!(
+            content.is_some_and(|value| !value.contains(['"', '\'', '<', '>'])),
+            "the value carries no character that ends the attribute or tag: {meta}"
         );
     }
 

@@ -172,6 +172,7 @@ impl FocusNode for web_sys::Element {
 }
 
 #[cfg(test)]
+#[cfg(not(target_arch = "wasm32"))]
 mod tests {
     use super::*;
 
