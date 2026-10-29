@@ -2523,6 +2523,9 @@ mod wasm_client {
     use wasm_bindgen::JsCast;
     use wasm_bindgen::closure::Closure;
 
+    /// Holds one socket listener's JS closure alive until its subscription ends.
+    type ClosureSlot<E> = Rc<RefCell<Option<Closure<dyn FnMut(E)>>>>;
+
     thread_local! {
         static SOCKETS: RefCell<HashMap<i64, web_sys::WebSocket>> = RefCell::new(HashMap::new());
     }
@@ -2756,8 +2759,7 @@ mod wasm_client {
             // never should be one; browsers fire `open` exactly once) a no-op
             // instead of a double-emit.
             let msg_cell: Rc<RefCell<Option<M>>> = Rc::new(RefCell::new(Some(msg)));
-            let closure_slot: Rc<RefCell<Option<Closure<dyn FnMut(web_sys::Event)>>>> =
-                Rc::new(RefCell::new(None));
+            let closure_slot: ClosureSlot<web_sys::Event> = Rc::new(RefCell::new(None));
             SOCKETS.with(|s| {
                 if let Some(ws) = s.borrow().get(&sid) {
                     let emit = Rc::clone(&emit);
@@ -2794,8 +2796,7 @@ mod wasm_client {
     {
         IpeSub::Source(Box::new(move |emit: Rc<dyn Fn(M)>| {
             let sid = socket_id;
-            let closure_slot: Rc<RefCell<Option<Closure<dyn FnMut(web_sys::MessageEvent)>>>> =
-                Rc::new(RefCell::new(None));
+            let closure_slot: ClosureSlot<web_sys::MessageEvent> = Rc::new(RefCell::new(None));
             SOCKETS.with(|s| {
                 if let Some(ws) = s.borrow().get(&sid) {
                     let emit = Rc::clone(&emit);
@@ -2828,8 +2829,7 @@ mod wasm_client {
     {
         IpeSub::Source(Box::new(move |emit: Rc<dyn Fn(M)>| {
             let sid = socket_id;
-            let closure_slot: Rc<RefCell<Option<Closure<dyn FnMut(web_sys::CloseEvent)>>>> =
-                Rc::new(RefCell::new(None));
+            let closure_slot: ClosureSlot<web_sys::CloseEvent> = Rc::new(RefCell::new(None));
             SOCKETS.with(|s| {
                 if let Some(ws) = s.borrow().get(&sid) {
                     let emit = Rc::clone(&emit);
@@ -2870,8 +2870,7 @@ mod wasm_client {
     {
         IpeSub::Source(Box::new(move |emit: Rc<dyn Fn(M)>| {
             let sid = socket_id;
-            let closure_slot: Rc<RefCell<Option<Closure<dyn FnMut(web_sys::Event)>>>> =
-                Rc::new(RefCell::new(None));
+            let closure_slot: ClosureSlot<web_sys::Event> = Rc::new(RefCell::new(None));
             SOCKETS.with(|s| {
                 if let Some(ws) = s.borrow().get(&sid) {
                     let emit = Rc::clone(&emit);

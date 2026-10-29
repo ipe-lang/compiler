@@ -464,10 +464,12 @@ fn emit_web_app_inner(
                  {handler}, \
                  {view_s}, \
                  {subs_s}, \
-                 {routes_s}, \
-                 {not_found_s}, \
-                 {set_page}, \
-                 {render_s}\
+                 ipe_runtime::wasm::RoutedPages {{ \
+                 routes: {routes_s}, \
+                 not_found: {not_found_s}, \
+                 set_page: {set_page}, \
+                 render: {render_s} \
+                 }}\
                  )"
             );
             return Ok(Some(if update.prelude.is_empty() {

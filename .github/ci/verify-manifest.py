@@ -545,6 +545,21 @@ skipped. Limits are listed on `check_workflow_steps`. Likewise mold is
       deprecated-and-ignored one not marked `deprecationMessage`) is
       admitted.  LIMIT: git object ids are SHA-1 without collision
       detection here; a crafted collision under the pinned id is not seen.
+  25. Every wasm32 (target, feature set) the runtime builds or tests is
+      linted: ci.yml's `wasm-floor` job holds, for each
+      `ci/test-claims.yml` cell whatever its owner, a `cargo clippy` with
+      the cell's `-p`, its platform as `--target`, `--all-targets` and its
+      effective feature set (the listed features plus the package's
+      `[features].default` unless `--no-default-features`, compared as
+      sets), and for each of its own `cargo build --target wasm32-*` a
+      `cargo clippy` with the same package, target, features and
+      default/all-features flags.  Each such clippy is the step's whole
+      `run:`, passes exactly `-- -D warnings`, carries no `env:` and no
+      `continue-on-error` (nor does the job), and no `if:` beyond the
+      release-only guard; one that breaks any of these covers nothing and
+      is refused.  So a rustc warning or clippy lint that fires only under
+      a wasm32 cfg cannot merge.  LIMIT: native (target, feature) legs have
+      no such check.
   LIMIT (checks 15, 16, 20, 22): a cargo line is read as run, not proven
   to reach its step's exit status — `cargo .. || true`, an `exit 0` before
   it, `set +e`, `if ! cargo ..` or a pipeline without `pipefail` are not
@@ -7669,6 +7684,154 @@ def check_feature_coverage(
             )
 
 
+# Check 25: every wasm32 (target, feature set) the runtime builds or tests is
+# linted with `-D warnings` in the one required job that owns the wasm floor.
+WASM_LINT_JOB = "wasm-floor"
+_WASM_CLIPPY_TAIL = ["-D", "warnings"]
+
+
+@dataclass(frozen=True)
+class _WasmLeg:
+    """One cargo command of the wasm lint job: what it compiles, where."""
+
+    loc: str
+    line: str
+    package: tuple[str, ...]
+    target: str
+    features: frozenset[str]
+    no_default_features: bool
+    all_features: bool
+    all_targets: bool
+
+
+def _package_defaults(repo: str, errors: list[str]) -> dict[str, frozenset[str]] | None:
+    """Each workspace member's `[features].default`, keyed by package name;
+    None (with the reason in `errors`) when the workspace cannot be read."""
+    top = _load_toml(os.path.join(repo, "Cargo.toml"))
+    ws = top.get("workspace") if isinstance(top, dict) else None
+    dirs = ws.get("members") if isinstance(ws, dict) else None
+    if not isinstance(dirs, list) or not all(isinstance(d, str) for d in dirs):
+        errors.append("check 25: the root Cargo.toml needs a literal `[workspace] members` list; refused")
+        return None
+    out: dict[str, frozenset[str]] = {}
+    for d in dirs:
+        doc = _load_toml(os.path.join(repo, d, "Cargo.toml"))
+        pkg = doc.get("package") if isinstance(doc, dict) else None
+        name = pkg.get("name") if isinstance(pkg, dict) else None
+        if not isinstance(name, str):
+            errors.append(f"check 25: {d}/Cargo.toml names no package; refused")
+            return None
+        feats = doc.get("features") if isinstance(doc, dict) else None
+        default = feats.get("default", []) if isinstance(feats, dict) else []
+        out[name] = frozenset(_str_list(default))
+    return out
+
+
+def _wasm_effective(leg: _WasmLeg | claims_table.Cell, defaults: dict[str, frozenset[str]]) -> frozenset[str] | None:
+    """The features a command or cell switches on, its package's defaults
+    included unless `--no-default-features`; None for `--all-features`."""
+    if isinstance(leg, claims_table.Cell):
+        return leg.features | defaults.get(leg.package, frozenset())
+    if leg.all_features:
+        return None
+    base = frozenset() if leg.no_default_features else frozenset().union(*(defaults.get(p, frozenset()) for p in leg.package))
+    return leg.features | base
+
+
+def _wasm_clippy_tail(line: str) -> list[str] | None:
+    """The words after the first `--` of `line`, or None when it has none."""
+    words = line.split(" ")
+    return words[words.index("--") + 1 :] if "--" in words else None
+
+
+def check_wasm_clippy_legs(wfs: WorkflowSet, errors: list[str]) -> None:
+    """Check 25 (see the module docstring)."""
+    root = wfs.root
+    repo = os.path.dirname(root)
+    cells = claims_table.load_cells(os.path.join(root, *TEST_CLAIMS))
+    if isinstance(cells, str):
+        errors.append(f"check 25: {cells}; refused")
+        return
+    defaults = _package_defaults(repo, errors)
+    if defaults is None:
+        return
+    job: dict | None = None
+    for wf in wfs.workflows:
+        if wf.fname != "ci.yml":
+            continue
+        for wj in wf.jobs:
+            if wj.job_id == WASM_LINT_JOB:
+                job = wj.raw
+    if job is None:
+        errors.append(f"check 25: ci.yml has no `{WASM_LINT_JOB}` job to lint the wasm32 floor; refused")
+        return
+    if job.get("continue-on-error", False) is not False:
+        errors.append(f"check 25: ci.yml job {WASM_LINT_JOB!r} carries `continue-on-error`, so a red lint leg passes; refused")
+    builds: list[_WasmLeg] = []
+    clippies: list[_WasmLeg] = []
+    steps = job.get("steps") if isinstance(job.get("steps"), list) else []
+    for i, st in enumerate(steps):
+        run = st.get("run") if isinstance(st, dict) else None
+        if not isinstance(run, str):
+            continue
+        loc = f"ci.yml: job {WASM_LINT_JOB!r} step {i}"
+        found = [f for text in _shell_texts(run) for f in cargo_invocation.in_shell(text, "")]
+        for f in found:
+            inv = f.invocation
+            if isinstance(inv, str):
+                if "wasm32" in f.line:
+                    errors.append(f"check 25: {loc} runs `{f.line}`, which this check cannot read: {inv}; refused")
+                continue
+            if inv.subcommand not in ("build", "clippy") or not (inv.target or "").startswith("wasm32"):
+                continue
+            sel = inv.selection
+            leg = _WasmLeg(
+                loc, f.line, tuple(sorted(inv.packages)), inv.target or "", inv.features, inv.no_default_features,
+                inv.all_features,
+                isinstance(sel, cargo_invocation.ExplicitTargets) and sel.lib and sel.all_tests,
+            )
+            if inv.subcommand == "build":
+                builds.append(leg)
+                continue
+            why = None
+            if _wasm_clippy_tail(f.line) != _WASM_CLIPPY_TAIL:
+                why = f"passes {_wasm_clippy_tail(f.line)!r} after `--`; a lint leg passes exactly `-- -D warnings`"
+            elif len(found) != 1 or run.strip() != f.line:
+                why = "is not the step's whole `run:`; another command could mask its exit"
+            elif st.get("continue-on-error", False) is not False:
+                why = "carries `continue-on-error`, so a red lint leg passes"
+            elif "if" in st and st["if"] not in _CLAIM_STEP_GUARDS:
+                why = f"carries `if: {st['if']}`; only the release-only guard may skip a lint leg"
+            elif "env" in st:
+                why = "carries `env:`, which can cap or retarget the lints it denies"
+            if why is not None:
+                errors.append(f"check 25: {loc} `{f.line}` {why}; refused")
+                continue
+            clippies.append(leg)
+    for cell in cells:
+        want = _wasm_effective(cell, defaults)
+        if not any(
+            c.package == (cell.package,) and c.target == cell.platform and c.all_targets
+            and _wasm_effective(c, defaults) == want
+            for c in clippies
+        ):
+            errors.append(
+                f"check 25: test cell {' '.join(cell.key)} {sorted(cell.features)} has no "
+                f"`cargo clippy -p {cell.package} --target {cell.platform} … --all-targets -- -D warnings` leg "
+                f"with its feature set in ci.yml job {WASM_LINT_JOB!r}; refused"
+            )
+    for b in builds:
+        if not any(
+            c.package == b.package and c.target == b.target and c.features == b.features
+            and c.no_default_features == b.no_default_features and c.all_features == b.all_features
+            for c in clippies
+        ):
+            errors.append(
+                f"check 25: {b.loc} `{b.line}` has no `cargo clippy` leg with its package, target and "
+                "features passing `-- -D warnings` in the same job; refused"
+            )
+
+
 # Check 23: the release workflow's jobs and the ci.yml jobs that check them.
 RELEASE_WORKFLOW = "release.yml"
 RELEASE_NATIVE_JOB = "build"
@@ -8555,6 +8718,9 @@ def main() -> int:
 
     # ---- 24. every `with:` key is an input its pinned action declares ----
     check_action_inputs(workflows, local_actions, errors)
+
+    # ---- 25. every wasm32 build and test set has a `-D warnings` lint leg ----
+    check_wasm_clippy_legs(workflows, errors)
 
     # ---- 3. fail-closed dependency surfacing ----
     def surfaced_dispositions(job: Job) -> set[str]:

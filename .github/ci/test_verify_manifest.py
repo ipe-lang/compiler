@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Refusal proofs for `verify-manifest.py`'s step checks (checks 6 and 7),
 merge-queue safety check (check 8), release-only skip-as-pass check
-(check 9), fast-gate-first check (check 10), one-lock-per-graph check (check 14), and test-claims check
-(check 20).
+(check 9), fast-gate-first check (check 10), one-lock-per-graph check (check 14), test-claims check (check 20), and
+wasm32 lint-leg check (check 25).
 
 Check 7 covers content-pinned `uses:`/images, the hash-checked pip shape, and
 env-file writes only through `github-env.sh`; its cases sit in
@@ -61,6 +61,7 @@ check_test_claims = verify_manifest.check_test_claims
 check_ci_suites_required = verify_manifest.check_ci_suites_required
 check_feature_coverage = verify_manifest.check_feature_coverage
 check_release_target_parity = verify_manifest.check_release_target_parity
+check_wasm_clippy_legs = verify_manifest.check_wasm_clippy_legs
 
 def _load(root: str, errors: list[str]) -> verify_manifest.WorkflowSet:
     """The typed workflow load `main` runs once, its refusals recorded as
@@ -9211,6 +9212,137 @@ class TestMergeGroupTestWatchers(unittest.TestCase):
             "PRODUCER: 'seal-modset (vendored emit model)'",
             self.block(verify_manifest.TEST_WATCHER_PREFIX + "seal-modset-vendored"),
         )
+
+
+_WC_CLAIMS = """\
+cells:
+  - package: ipe-runtime-rust
+    target: lib
+    platform: wasm32-unknown-unknown
+    features: [wasm-client, debugger]
+    owner: wasm-floor
+    expect_tests: 3
+  - package: ipe-runtime-rust
+    target: {test: wasm_dom_paint}
+    platform: wasm32-unknown-unknown
+    features: [wasm-client]
+    owner: wasm-floor
+    expect_tests: 2
+"""
+_WC_ROOT = '[workspace]\nmembers = ["rt"]\n'
+_WC_RT = '[package]\nname = "ipe-runtime-rust"\n\n[features]\ndefault = []\njson = []\nwasm-client = []\ndebugger = []\n'
+_WC_GUARD = "        if: needs.changes.outputs.release_only != 'true'\n"
+_WC_P = "cargo %s -p ipe-runtime-rust --target wasm32-unknown-unknown"
+_WC_BUILD_B = _WC_P % "build" + " --no-default-features --features wasm-client,debugger"
+_WC_BUILD_D = _WC_P % "build" + " --features json"
+_WC_LEG_A = _WC_P % "clippy" + " --features wasm-client --all-targets -- -D warnings"
+_WC_LEG_B = _WC_P % "clippy" + " --no-default-features --features wasm-client,debugger --all-targets -- -D warnings"
+_WC_LEG_D = _WC_P % "clippy" + " --features json --lib -- -D warnings"
+
+
+def _wc_step(run: str, extra: str = "") -> str:
+    return f"      - {_WC_GUARD[8:]}{extra}        run: {run}\n"
+
+
+def _wc_ci(*steps: str) -> str:
+    return (
+        "name: ci\non: [push]\njobs:\n  wasm-floor:\n    runs-on: ubuntu-latest\n    steps:\n"
+        + "".join(steps)
+    )
+
+
+_WC_OK = (_wc_step(_WC_BUILD_B), _wc_step(_WC_BUILD_D), _wc_step(_WC_LEG_A), _wc_step(_WC_LEG_B), _wc_step(_WC_LEG_D))
+
+
+class TestWasmClippyLegs(unittest.TestCase):
+    """Check 25: every wasm32 build and test feature set has a `-D warnings` lint leg."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.repo = self._tmp.name
+        self.root = os.path.join(self.repo, ".github")
+        for rel, text in (
+            ("Cargo.toml", _WC_ROOT),
+            ("rt/Cargo.toml", _WC_RT),
+            (".github/ci/test-claims.yml", _WC_CLAIMS),
+        ):
+            _write(os.path.join(self.repo, rel), text)
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def errors(self, *steps: str) -> list[str]:
+        _write(os.path.join(self.root, "workflows", "ci.yml"), _wc_ci(*steps))
+        errors: list[str] = []
+        check_wasm_clippy_legs(_load(self.root, errors), errors)
+        return errors
+
+    def assertRefused(self, steps: tuple[str, ...], needle: str) -> None:
+        errors = self.errors(*steps)
+        self.assertTrue(any(needle in e and e.startswith("check 25:") for e in errors), f"expected {needle!r} in {errors}")
+
+    def test_valid_legs_pass(self) -> None:
+        self.assertEqual(self.errors(*_WC_OK), [])
+
+    def test_wasm_clippy_legs_accept_current_tree(self) -> None:
+        errors: list[str] = []
+        check_wasm_clippy_legs(_load(verify_manifest.REPO_ROOT, errors), errors)
+        self.assertEqual(errors, [])
+
+    def test_wasm_claim_cell_without_clippy_leg_refused(self) -> None:
+        steps = tuple(s for s in _WC_OK if _WC_LEG_B not in s)
+        self.assertRefused(steps, "test cell ipe-runtime-rust lib wasm32-unknown-unknown ['debugger', 'wasm-client'] has no")
+
+    def test_wasm_build_leg_without_clippy_refused(self) -> None:
+        steps = tuple(s for s in _WC_OK if _WC_LEG_D not in s)
+        self.assertRefused(steps, f"`{_WC_BUILD_D}` has no `cargo clippy` leg")
+
+    def test_wasm_clippy_leg_without_deny_refused(self) -> None:
+        for tail in (" -- -W warnings", "", " -- -D warnings -A clippy::all"):
+            with self.subTest(tail=tail):
+                leg = _WC_LEG_A.replace(" -- -D warnings", tail)
+                steps = tuple(_wc_step(leg) if _WC_LEG_A in s else s for s in _WC_OK)
+                self.assertRefused(steps, "a lint leg passes exactly `-- -D warnings`")
+                self.assertRefused(steps, "test cell ipe-runtime-rust test:wasm_dom_paint")
+
+    def test_wasm_clippy_leg_continue_on_error_refused(self) -> None:
+        steps = tuple(_wc_step(_WC_LEG_A, "        continue-on-error: true\n") if _WC_LEG_A in s else s for s in _WC_OK)
+        self.assertRefused(steps, "carries `continue-on-error`")
+        self.assertRefused(steps, "test cell ipe-runtime-rust test:wasm_dom_paint")
+
+    def test_wasm_job_continue_on_error_refused(self) -> None:
+        _write(os.path.join(self.root, "workflows", "ci.yml"), _wc_ci(*_WC_OK).replace(
+            "    runs-on: ubuntu-latest\n", "    runs-on: ubuntu-latest\n    continue-on-error: true\n"))
+        errors: list[str] = []
+        check_wasm_clippy_legs(_load(self.root, errors), errors)
+        self.assertTrue(any("job 'wasm-floor' carries `continue-on-error`" in e for e in errors), errors)
+
+    def test_wasm_clippy_leg_masked_or_guarded_refused(self) -> None:
+        for step, needle in (
+            (_wc_step(_WC_LEG_A + " || true"), "is not the step's whole `run:`"),
+            (f"      - if: always()\n        run: {_WC_LEG_A}\n", "only the release-only guard"),
+            (_wc_step(_WC_LEG_A, "        env:\n          RUSTFLAGS: --cap-lints=allow\n"), "carries `env:`"),
+        ):
+            with self.subTest(needle=needle):
+                steps = tuple(step if _WC_LEG_A in s else s for s in _WC_OK)
+                self.assertRefused(steps, needle)
+
+    def test_wasm_clippy_leg_feature_mismatch_refused(self) -> None:
+        leg = _WC_LEG_B.replace("wasm-client,debugger", "wasm-client")
+        steps = tuple(_wc_step(leg) if _WC_LEG_B in s else s for s in _WC_OK)
+        self.assertRefused(steps, "test cell ipe-runtime-rust lib wasm32-unknown-unknown")
+        self.assertRefused(steps, f"`{_WC_BUILD_B}` has no `cargo clippy` leg")
+
+    def test_wasm_clippy_leg_without_all_targets_refused(self) -> None:
+        leg = _WC_LEG_A.replace("--all-targets", "--lib")
+        steps = tuple(_wc_step(leg) if _WC_LEG_A in s else s for s in _WC_OK)
+        self.assertRefused(steps, "test cell ipe-runtime-rust test:wasm_dom_paint")
+
+    def test_missing_lint_job_refused(self) -> None:
+        _write(os.path.join(self.root, "workflows", "ci.yml"), _wc_ci(*_WC_OK).replace("wasm-floor:", "other:"))
+        errors: list[str] = []
+        check_wasm_clippy_legs(_load(self.root, errors), errors)
+        self.assertTrue(any("has no `wasm-floor` job" in e for e in errors), errors)
 
 
 if __name__ == "__main__":

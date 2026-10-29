@@ -1447,7 +1447,7 @@ impl ProcessDeadline {
     }
 
     /// A ceiling a unit test picks directly.
-    #[cfg(test)]
+    #[cfg(all(test, not(target_arch = "wasm32")))]
     pub(crate) const fn for_test(ceiling: std::time::Duration) -> Self {
         Self(ceiling)
     }
@@ -1467,7 +1467,7 @@ pub struct ProcessBounds {
 
 impl ProcessBounds {
     /// Bounds a unit test picks directly, with a generous wall ceiling.
-    #[cfg(test)]
+    #[cfg(all(test, not(target_arch = "wasm32")))]
     pub(crate) const fn for_test(output: u64) -> Self {
         Self {
             output,
@@ -2323,7 +2323,8 @@ fn admit_named(raw: std::os::fd::RawFd, flags: rustix::io::FdFlags) -> Result<()
 type NamedSet = NamedFds;
 /// The set a spawn hands its child: [`NamedFds`] on Unix, nothing elsewhere.
 #[cfg(not(unix))]
-type NamedSet = ();
+#[derive(Clone, Copy, Debug, Default)]
+struct NamedSet;
 
 /// Write `n`'s listing name (its decimal digits) into `buf`.
 ///
