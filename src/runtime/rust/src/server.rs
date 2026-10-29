@@ -2401,12 +2401,12 @@ async fn build_request(
         cookies.entry(name).or_insert(value);
     }
     let (mut parts, body) = req.into_parts();
-    // The upgrader and the authority are stashed via task-local so
-    // server_web_socket_upgrade can reach them.
+    // The upgrader and the authority travel together in the WS_HANDSHAKE
+    // task-local so server_web_socket_upgrade can reach them.
     let handshake = Handshake {
         authority: crate::http_header::RequestAuthority::of(&parts)
             .map(crate::http_header::RequestAuthority::hold),
-        upgrader: websocket_upgrader(&mut parts).await.ok(),
+        upgrader: std::cell::Cell::new(websocket_upgrader(&mut parts).await.ok()),
     };
     // A malformed ceiling refuses the request rather than widening the cap.
     let Ok(cap) = max_body() else {
@@ -2447,10 +2447,12 @@ async fn build_request(
     ))
 }
 
-/// What a WebSocket upgrade of the request needs from its head.
+/// What a WebSocket upgrade of the request needs from its head, scoped as one
+/// task-local ([`WS_HANDSHAKE`]) so an upgrader is never in scope without the
+/// authority read from the same head.
 struct Handshake {
-    /// The upgrader, when the request is a WebSocket upgrade.
-    upgrader: Option<axum::extract::ws::WebSocketUpgrade>,
+    /// The upgrader, when the request is a WebSocket upgrade; taken at most once.
+    upgrader: std::cell::Cell<Option<axum::extract::ws::WebSocketUpgrade>>,
     /// The authority the request was addressed to, when it names one.
     authority: Option<crate::http_header::HeldAuthority>,
 }
@@ -2556,11 +2558,11 @@ fn method_router(
                 Ok(v) => v,
                 Err(rejection) => return rejection.status_and_reason().into_response(),
             };
-            // Run the handler with the WS upgrader, the request authority and
-            // a response slot in scope. If the handler called
-            // server_web_socket_upgrade, it stashed the real 101 response in
-            // WS_RESPONSE — prefer it over the sentinel.
-            let scoped = WS_UPGRADER.scope(std::cell::Cell::new(handshake.upgrader), async move {
+            // Run the handler with the request's handshake and a response
+            // slot in scope. If the handler called server_web_socket_upgrade,
+            // it stashed the real 101 response in WS_RESPONSE — prefer it
+            // over the sentinel.
+            let scoped = WS_HANDSHAKE.scope(handshake, async move {
                 WS_RESPONSE
                     .scope(std::cell::Cell::new(None), async move {
                         let (result, streams) = dispatch(&h, ipe_req).await;
@@ -2580,7 +2582,7 @@ fn method_router(
                     })
                     .await
             });
-            WS_AUTHORITY.scope(handshake.authority, scoped).await
+            scoped.await
         }
     };
     match method.filter() {
@@ -3992,10 +3994,9 @@ where
 }
 
 tokio::task_local! {
-    // The axum upgrader for the in-flight request (Some only on a WS upgrade).
-    static WS_UPGRADER: std::cell::Cell<Option<axum::extract::ws::WebSocketUpgrade>>;
-    // The authority the in-flight request was addressed to, if it names one.
-    static WS_AUTHORITY: Option<crate::http_header::HeldAuthority>;
+    // The in-flight request's upgrader (Some only on a WS upgrade) and the
+    // authority it was addressed to, read from one head.
+    static WS_HANDSHAKE: Handshake;
     // The 101 response server_web_socket_upgrade produced (preferred by method_router).
     static WS_RESPONSE: std::cell::Cell<Option<axum::response::Response>>;
 }
@@ -4318,11 +4319,14 @@ fn ws_cross_origin(
 ///
 /// Outside a request scope no authority is known, so an `Origin` is flagged.
 fn ws_request_cross_origin(req: &ServerRequest) -> bool {
-    WS_AUTHORITY
-        .try_with(|held| {
+    WS_HANDSHAKE
+        .try_with(|handshake| {
             ws_cross_origin(
                 req,
-                held.as_ref().map(crate::http_header::HeldAuthority::get),
+                handshake
+                    .authority
+                    .as_ref()
+                    .map(crate::http_header::HeldAuthority::get),
             )
         })
         .unwrap_or_else(|_| ws_cross_origin(req, None))
@@ -4407,7 +4411,10 @@ pub fn server_web_socket_upgrade<E: From<String> + Send + 'static>(
                 return ok_res(ws_resp(503, "websocket: server at connection capacity"));
             }
         }
-        let upgrader = WS_UPGRADER.try_with(|c| c.take()).ok().flatten();
+        let upgrader = WS_HANDSHAKE
+            .try_with(|handshake| handshake.upgrader.take())
+            .ok()
+            .flatten();
         match upgrader {
             Some(up) => {
                 let id = WS_NEXT_ID.fetch_add(1, Ordering::Relaxed);
@@ -8159,8 +8166,8 @@ mod tests {
                 want,
                 "{uri}"
             );
-            let cross = WS_AUTHORITY
-                .scope(handshake.authority, async { ws_request_cross_origin(&req) })
+            let cross = WS_HANDSHAKE
+                .scope(handshake, async { ws_request_cross_origin(&req) })
                 .await;
             assert!(cross, "{uri}: an evil Origin is cross-origin");
         }
@@ -8215,7 +8222,7 @@ mod tests {
             ("origin", "https://evil.example"),
             ("host", "victim.example"),
         ]);
-        // No WS_UPGRADER task-local is set in a plain unit test, so a request
+        // No WS_HANDSHAKE task-local is set in a plain unit test, so a request
         // that PASSES the origin check would hit the `None => 400` upgrader
         // branch instead of 403 — the origin check must short-circuit before
         // that point for this assertion to distinguish the two paths.
@@ -8242,9 +8249,12 @@ mod tests {
             ("origin", "https://victim.example"),
             ("host", "victim.example"),
         ]);
-        let result = WS_AUTHORITY
+        let result = WS_HANDSHAKE
             .scope(
-                Some(held_authority("victim.example")),
+                Handshake {
+                    upgrader: std::cell::Cell::new(None),
+                    authority: Some(held_authority("victim.example")),
+                },
                 server_web_socket_upgrade::<String>(req, ws_server_default_cfg::<String>()),
             )
             .await;
