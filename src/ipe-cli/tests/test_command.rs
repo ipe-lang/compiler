@@ -890,6 +890,37 @@ main =
     Test.runMain tests
 "#;
 
+/// The low-level push module's source, as the stdlib compiles it.
+const PUSH_INTERNALS_SOURCE: &str = include_str!("../../stdlib/Ipe/Browser/Push/Internals.ipe");
+
+/// Every port event a push reply decoder waits for is an event the glue answers
+/// with, and the push modules subscribe to no inbound frame the glue never sends:
+/// a reply decoder waiting for an unsent event refuses every answer, and a `Sub`
+/// over an unsent frame never fires.
+#[test]
+fn every_push_event_a_decoder_waits_for_is_one_the_glue_sends() {
+    let glue = ipe_runtime_rust::js_port_glue::port_glue_js();
+    let mut events = Vec::new();
+    for piece in PUSH_INTERNALS_SOURCE.split("reply \"").skip(1) {
+        let event = piece.split('"').next().unwrap_or_default();
+        assert!(
+            glue.contains(&format!("event: \"{event}\"")),
+            "the glue never answers the push event {event:?}"
+        );
+        events.push(event);
+    }
+    assert_eq!(events, ["subscribed", "current", "unsubscribed"]);
+    for source in [
+        include_str!("../../stdlib/Ipe/Browser/Push.ipe"),
+        PUSH_INTERNALS_SOURCE,
+    ] {
+        assert!(
+            !source.contains("Js.subscribe") && !source.contains("Sub.Sub"),
+            "a push inbound subscription has no frame producer in the glue"
+        );
+    }
+}
+
 /// One test case per bridge refusal, naming the error the runtime defines for it.
 fn push_refusal_cases() -> String {
     use ipe_runtime_rust::js_port_glue::native_bridge::{BridgeErrorKind, Reject};
