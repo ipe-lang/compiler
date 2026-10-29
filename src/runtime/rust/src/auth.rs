@@ -1099,10 +1099,13 @@ async fn ensure_users_schema<E: crate::FromIpeError + Send>(conn: &Db) -> IpeRes
         )",
         db_auto_id_column()
     );
-    match sqlx::query(super::sql_text::assembled(schema))
-        .execute(conn)
-        .await
-    {
+    let created = async {
+        let mut held = crate::db::checkout(conn).await?;
+        sqlx::query(super::sql_text::assembled(schema))
+            .execute(&mut *held)
+            .await
+    };
+    match created.await {
         Ok(_) => IpeResult::Ok(()),
         Err(e) => IpeResult::Err(auth_db_error("auth.users schema: db: ", &e)),
     }
@@ -1154,13 +1157,17 @@ pub fn auth_register<
             "INSERT INTO users (email, password_hash, role, created_at) VALUES (?, ?, ?, ?)"
                 .to_string(),
         );
-        let result = sqlx::query(super::sql_text::assembled(sql))
-            .bind(&email)
-            .bind(&hash)
-            .bind("user")
-            .bind(now)
-            .execute(&conn)
-            .await;
+        let result = async {
+            let mut held = crate::db::checkout(&conn).await?;
+            sqlx::query(super::sql_text::assembled(sql))
+                .bind(&email)
+                .bind(&hash)
+                .bind("user")
+                .bind(now)
+                .execute(&mut *held)
+                .await
+        }
+        .await;
         match result {
             Ok(res) => IpeResult::Ok(db_last_insert_id(&res)),
             Err(e) => {
@@ -1201,11 +1208,14 @@ pub fn auth_login<
             return IpeResult::Err(e);
         }
         let sql = db_format_sql("SELECT id, password_hash FROM users WHERE email = ?".to_string());
-        let row = match sqlx::query(super::sql_text::assembled(sql))
-            .bind(&email)
-            .fetch_optional(&conn)
-            .await
-        {
+        let fetched = async {
+            let mut held = crate::db::checkout(&conn).await?;
+            sqlx::query(super::sql_text::assembled(sql))
+                .bind(&email)
+                .fetch_optional(&mut *held)
+                .await
+        };
+        let row = match fetched.await {
             Ok(row) => row,
             Err(e) => return IpeResult::Err(auth_db_error("auth.login: db: ", &e)),
         };
@@ -1251,12 +1261,15 @@ pub fn auth_set_role<E: Send + From<String> + crate::FromIpeError + 'static>(
             return IpeResult::Err(e);
         }
         let sql = db_format_sql("UPDATE users SET role = ? WHERE id = ?".to_string());
-        match sqlx::query(super::sql_text::assembled(sql))
-            .bind(&role)
-            .bind(user_id)
-            .execute(&conn)
-            .await
-        {
+        let updated = async {
+            let mut held = crate::db::checkout(&conn).await?;
+            sqlx::query(super::sql_text::assembled(sql))
+                .bind(&role)
+                .bind(user_id)
+                .execute(&mut *held)
+                .await
+        };
+        match updated.await {
             Ok(_) => IpeResult::Ok(()),
             Err(e) => IpeResult::Err(auth_db_error("auth.setRole: db: ", &e)),
         }
