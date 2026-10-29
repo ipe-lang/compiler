@@ -115,25 +115,27 @@ finish results =
 
 -- Every check opens the stores it reads under a directory of its own
 -- (`TestSupport.freshDir`), so the run shares no database between checks.
--- `sweepTempDirs` removes every one of them once the suite ends, on both
--- the pass and the fail path, so a wiring bug that makes `gatherChecks`
--- itself fail still runs the sweep before the error propagates.
+-- The ledger of those directories is opened before any check runs, and the
+-- sweep removes them once the suite ends: as a named check on the pass
+-- path, and before the error propagates when `gatherChecks` itself fails.
 main : Task.Task Error ()
 main =
-    gatherChecks
+    TestSupport.openTempDirLedger
+        |> Task.andThen (\_ -> gatherChecks)
         |> Task.andThen sweepTempDirs
         |> Task.onError
             (\err ->
                 TestSupport.reclaimLeakedDirs
+                    |> Task.map (\_ -> ())
+                    |> Task.onError (\_ -> Task.succeed ())
                     |> Task.andThen (\_ -> Task.fail err)
             )
         |> Task.andThen finish
 
 
--- Appends the leak-sweep refusal test to the gathered results, so a dir
--- `freshDir` created and never reclaimed shows up as a named failure in the
--- same report as every other check, not as a silent leftover on disk.
+-- The gathered results with the leak sweep's own check last, so a directory
+-- left behind is a named failure in the same report.
 sweepTempDirs : List ( String, Bool ) -> Task.Task Error (List ( String, Bool ))
 sweepTempDirs results =
-    TestSupport.noLeakedTempDirs
-        |> Task.map (\ok -> results ++ [ ( "no leaked ipe-* temp dirs", ok ) ])
+    TestSupport.check "every directory freshDir made is removed when the suite ends" TestSupport.noLeakedTempDirs
+        |> Task.map (\swept -> results ++ [ swept ])
