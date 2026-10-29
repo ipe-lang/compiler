@@ -1740,10 +1740,6 @@ fn apply_patches(patches: &[Patch]) {
             // batch already rewrote the subtree — benign, matching client.js.
             continue;
         };
-        if p.remove {
-            el.remove();
-            continue;
-        }
         if let Some(text) = &p.text {
             el.set_text_content(Some(text));
         }
