@@ -65,6 +65,9 @@ pub mod observability;
 // The worker script bodies served at the app's worker route.
 #[cfg(feature = "web")]
 pub mod worker;
+// The browser install offer: the web app manifest, the icon and their head links.
+#[cfg(feature = "web")]
+pub mod install;
 // Observability export pipelines: federation push to a parent ingest
 // and remote-hub OTLP push. Both env-gated + inert by default.
 // Use reqwest for outbound push; gated so a web app with no outbound HTTP
@@ -535,6 +538,7 @@ pub fn render_page_full(
 ) -> Result<String, BootRefusal> {
     render_live_page(
         client_tuning().as_ref(),
+        install::registered(),
         sid,
         base,
         body,
@@ -558,10 +562,14 @@ pub fn render_page_full(
 ///      SRI-pinned.
 ///
 /// `tuning` is the process's resolved client tuning; a refused one refuses the
-/// page. `overlay` is raw HTML placed after `#ipe-root` (empty for none).
+/// page. `install` is the build's install offer: with one, the head carries
+/// the manifest and touch-icon links; with none, the page has neither.
+/// `overlay` is raw HTML placed after `#ipe-root` (empty for none).
 #[cfg(feature = "web")]
+#[allow(clippy::too_many_arguments)] // the one builder of every live page; each input is a distinct page fact
 fn render_live_page(
     tuning: Result<&ClientTuning, &crate::system::EnvCeilingRefusal>,
+    install: Option<&install::InstallOffer>,
     sid: &str,
     base: &crate::encoding::MountBase,
     body: &str,
@@ -582,7 +590,8 @@ fn render_live_page(
     // Content-addressed client asset URL and SRI hash — computed once at first call.
     let (hex16, b64) = client_js_hashes();
     let client_script = client_script_tag(prefix, hex16, b64);
-    let head_extra = base_meta(prefix);
+    let mut head_extra = base_meta(prefix);
+    head_extra.push_str(&install::head_links(install, base));
     let body_inner = format!("<div id=\"ipe-root\">{body}</div>{dev_banner}{overlay}");
     // Custom-element glue: an EXTERNAL, SRI-pinned `<script type="module">` plus a
     // `modulepreload` SRI pin per author asset. Empty when the program registers
@@ -656,6 +665,7 @@ fn render_page_full_with_overlay(
 ) -> Result<String, BootRefusal> {
     render_live_page(
         client_tuning().as_ref(),
+        install::registered(),
         sid,
         base,
         body,
@@ -4895,8 +4905,20 @@ fn is_browser_noise_path(p: &str) -> bool {
     // Requests for assets by well-known extension are browser noise — real
     // page routes never end in these suffixes.
     [
-        ".ico", ".png", ".jpg", ".jpeg", ".gif", ".svg", ".webp", ".css", ".js", ".map", ".woff",
-        ".woff2", ".ttf",
+        ".ico",
+        ".png",
+        ".jpg",
+        ".jpeg",
+        ".gif",
+        ".svg",
+        ".webp",
+        ".css",
+        ".js",
+        ".map",
+        ".woff",
+        ".woff2",
+        ".ttf",
+        ".webmanifest",
     ]
     .iter()
     .any(|ext| p.ends_with(ext))
@@ -4919,14 +4941,15 @@ async fn serve_noise_from_static_root(path: &str) -> Option<axum::response::Resp
         .filter(|d| !d.is_empty())?;
     let (candidate, mime) = noise_candidate(&dir, path, crate::path_core::HOST)?;
     let bytes = tokio::fs::read(&candidate).await.ok()?;
-    Some(
+    Some(crate::server::with_security_headers(
         (
             axum::http::StatusCode::OK,
             [(axum::http::header::CONTENT_TYPE, mime)],
             bytes,
         )
             .into_response(),
-    )
+        crate::server::response_security_headers(),
+    ))
 }
 
 /// The file beneath `dir` a browser-noise request path names under `regime`,
@@ -5137,7 +5160,10 @@ mod handlers {
             if let Some(resp) = serve_noise_from_static_root(uri.path()).await {
                 return resp;
             }
-            return (StatusCode::NOT_FOUND, "404 page not found").into_response();
+            return crate::server::with_security_headers(
+                (StatusCode::NOT_FOUND, "404 page not found").into_response(),
+                crate::server::response_security_headers(),
+            );
         }
 
         // A returning session whose persisted checkpoint predates a purely
@@ -7853,7 +7879,12 @@ where
         );
     }
 
-    // package.ipe `[web] static` (baked as IPE_WEB_STATIC_DIR) → serve files at
+    // The install offer's manifest and icon: explicit content-addressed
+    // routes, registered before the page catch-alls so they never reach the
+    // page handler or touch a session. No offer mounts nothing.
+    router = install::mount_routes(router, install::registered(), mount.base());
+
+    // `IPE_WEB_STATIC_DIR`, set by whoever runs the app → serve files at
     // /static/* via ServeDir. The nest outranks the `/*path` page catch-all, so
     // a /static/<file> request hits ServeDir, not the page handler (which
     // would return HTML). Inside the nest a `MountTable` re-bases the
@@ -7862,8 +7893,8 @@ where
     // could never produce (`/static//x`) is a 404. `strict_serve_dir` admits
     // only a path whose segments are plain names under the host regime, the
     // join re-checked, before `ServeDir` reads it. NOTE: like http.FileServer
-    // it FOLLOWS symlinks inside the dir — the dir is author-controlled
-    // (package.ipe [web] static), so that is the intended contract, NOT a
+    // it FOLLOWS symlinks inside the dir — the dir is operator-controlled
+    // (`IPE_WEB_STATIC_DIR`), so that is the intended contract, NOT a
     // confinement guarantee. Absent/empty → no static mount.
     // IPE_WEB_STATIC_DIR: non-empty value mounts the named directory at /static.
     if let Some(dir) = crate::system::read_env_var("IPE_WEB_STATIC_DIR")
@@ -8912,6 +8943,7 @@ mod base_path_tests {
         let Err(refusal) = refused else { return };
         let page = super::render_live_page(
             Err(&refusal),
+            None,
             "sid1",
             &crate::encoding::MountBase::root(),
             "<b>x</b>",
@@ -9801,6 +9833,96 @@ mod base_path_tests {
             hash_part.chars().all(|c| c.is_ascii_hexdigit()),
             "URL hash should be hex: {hash_part}"
         );
+    }
+
+    /// An installable build's facts, for the page renders below.
+    static INSTALL_FACTS: super::install::InstallFacts = super::install::InstallFacts {
+        name: "todo",
+        icon_png: b"\x89PNG\r\n\x1a\nicon",
+        icon_side: 512,
+    };
+
+    /// The live page under `base` at `epoch` with `install`, as every shell
+    /// renders it.
+    #[allow(clippy::expect_used)] // the default tuning resolves in a clean test env
+    fn page_with(
+        base: &MountBase,
+        epoch: &RenderEpoch,
+        install: Option<&super::install::InstallOffer>,
+    ) -> String {
+        super::render_live_page(
+            super::client_tuning().as_ref(),
+            install,
+            "sid1",
+            base,
+            "<b>x</b>",
+            epoch,
+            "tok1",
+            "",
+        )
+        .expect("the page builds")
+    }
+
+    /// With no install offer the page is the page without the feature: its
+    /// head ends at the base meta, with no manifest and no touch-icon link.
+    #[test]
+    #[allow(clippy::expect_used)] // `/app` is a grammar base
+    fn install_off_page_has_no_install_links() {
+        for base in [
+            MountBase::root(),
+            MountBase::parse("/app").expect("a grammar base"),
+        ] {
+            let epoch = page_epoch();
+            let off = page_with(&base, &epoch, None);
+            assert_eq!(off, page("sid1", &base, &epoch, "tok1"));
+            let head_end = format!("{}</head>", super::base_meta(base.prefix()));
+            assert!(off.contains(&head_end), "the head ends at the base meta");
+            assert!(!off.contains("rel=\"manifest\""), "no manifest link");
+            assert!(!off.contains("apple-touch-icon"), "no touch-icon link");
+        }
+    }
+
+    /// With an install offer the head carries exactly the two links, after the
+    /// base meta and before any page content, under the app's base.
+    #[test]
+    #[allow(clippy::expect_used)] // `/app` is a grammar base; the fixture facts make an offer
+    fn install_on_page_carries_both_links_in_the_head() {
+        let offer = super::install::InstallOffer::of(&INSTALL_FACTS).expect("an offer");
+        for base in [
+            MountBase::root(),
+            MountBase::parse("/app").expect("a grammar base"),
+        ] {
+            let meta = super::base_meta(base.prefix());
+            let links = super::install::head_links(Some(&offer), &base);
+            let epoch = page_epoch();
+            let on = page_with(&base, &epoch, Some(&offer));
+            let off = page_with(&base, &epoch, None);
+            assert_eq!(
+                on,
+                off.replacen(
+                    &format!("{meta}</head>"),
+                    &format!("{meta}{links}</head>"),
+                    1
+                )
+            );
+            let manifest = format!("href=\"{}/_ipe/manifest.", base.prefix());
+            assert!(on.contains(&manifest), "{manifest}");
+            assert!(!on.contains("theme-color"), "no theme colour");
+        }
+    }
+
+    /// The inline console page never carries a manifest link.
+    #[tokio::test]
+    #[allow(clippy::expect_used)] // the console body is in memory
+    async fn the_console_page_has_no_manifest_link() {
+        let resp = super::console::console_html().await;
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("read the console body");
+        let html = std::str::from_utf8(&body).expect("the console page is UTF-8");
+        assert!(html.contains("Ipe Console"), "the console page");
+        assert!(!html.contains("rel=\"manifest\""), "no manifest link");
+        assert!(!html.contains("apple-touch-icon"), "no touch-icon link");
     }
 }
 
@@ -18311,6 +18433,135 @@ mod route_entry_cmd_tests {
                 assert!(headers.contains_key(name), "the worker route lacks {name}");
             }
             assert!(!headers.contains_key(header::SET_COOKIE), "no cookie");
+        });
+    }
+
+    /// An installable build's facts, for the install route tests.
+    static INSTALL_FACTS: install::InstallFacts = install::InstallFacts {
+        name: "todo",
+        icon_png: b"\x89PNG\r\n\x1a\nicon",
+        icon_side: 512,
+    };
+
+    /// A wrong-hash manifest or icon path is browser noise: a 404 with the
+    /// security headers, no cookie, and no session, never the page.
+    #[test]
+    fn a_wrong_hash_install_asset_is_a_404() {
+        run(false, || async {
+            let sessions = Arc::new(AtomicUsize::new(0));
+            for path in [
+                "/_ipe/manifest.0000000000000000.webmanifest",
+                "/_ipe/icon.0000000000000000.png",
+                "/app.webmanifest",
+            ] {
+                let (status, headers, body) =
+                    fetch_with(router_counted(memory(), Arc::clone(&sessions)), path, &[]).await;
+                assert_eq!(status, StatusCode::NOT_FOUND, "{path}");
+                assert!(
+                    !body.windows(9).any(|w| w == b"page-home"),
+                    "{path} is never the page"
+                );
+                for name in ["content-security-policy", "x-content-type-options"] {
+                    assert!(headers.contains_key(name), "{path}: the 404 lacks {name}");
+                }
+                assert!(
+                    !headers.contains_key(header::SET_COOKIE),
+                    "{path}: no cookie"
+                );
+            }
+            assert_eq!(
+                sessions.load(std::sync::atomic::Ordering::SeqCst),
+                0,
+                "no session"
+            );
+        });
+    }
+
+    /// A noise file served from the static root carries the security headers.
+    #[test]
+    fn a_static_root_noise_file_carries_the_security_headers() {
+        run(false, || async {
+            with_static_worker_file(|| async {
+                let (status, headers, _) = fetch_with(router(memory()), "/sw.js", &[]).await;
+                assert_eq!(status, StatusCode::OK);
+                for name in ["content-security-policy", "x-content-type-options"] {
+                    assert!(headers.contains_key(name), "the noise answer lacks {name}");
+                }
+                assert!(!headers.contains_key(header::SET_COOKIE), "no cookie");
+            })
+            .await;
+        });
+    }
+
+    /// The manifest and icon routes answer the same bytes to every caller:
+    /// `immutable`, the security headers, no cookie and no `Vary`, and never
+    /// the catch-all behind them, under the root and under a base.
+    #[test]
+    #[allow(clippy::expect_used)] // the fixture facts make an offer; `/app` is a grammar base
+    fn the_install_routes_never_reach_the_page() {
+        run(false, || async {
+            let offer: &'static install::InstallOffer = Box::leak(Box::new(
+                install::InstallOffer::of(&INSTALL_FACTS).expect("an offer"),
+            ));
+            for base in [
+                crate::encoding::MountBase::root(),
+                crate::encoding::MountBase::parse("/app").expect("a grammar base"),
+            ] {
+                let page_hits = Arc::new(AtomicUsize::new(0));
+                let hits = Arc::clone(&page_hits);
+                let catch_all = axum::Router::new().route(
+                    "/*path",
+                    axum::routing::get(move || {
+                        let hits = Arc::clone(&hits);
+                        async move {
+                            hits.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                            ([(header::SET_COOKIE, "ipe_sid=minted")], "page")
+                        }
+                    }),
+                );
+                let app = install::mount_routes(catch_all, Some(offer), &base);
+                let root = crate::encoding::MountBase::root();
+                for (path, content_type, want) in [
+                    (
+                        root.url_of(offer.manifest_path()),
+                        install::MANIFEST_CONTENT_TYPE,
+                        offer.manifest_json(&base).into_bytes(),
+                    ),
+                    (
+                        root.url_of(offer.icon_path()),
+                        install::ICON_CONTENT_TYPE,
+                        offer.icon_png().to_vec(),
+                    ),
+                ] {
+                    let (status, headers, body) =
+                        fetch_with(app.clone(), &path, &[("cookie", "ipe_sid=held")]).await;
+                    assert_eq!(status, StatusCode::OK, "{path}");
+                    assert_eq!(body, want, "{path}");
+                    assert_eq!(
+                        headers.get(header::CONTENT_TYPE).map(|v| v.as_bytes()),
+                        Some(content_type.as_bytes()),
+                        "{path}"
+                    );
+                    assert_eq!(
+                        headers.get(header::CACHE_CONTROL).map(|v| v.as_bytes()),
+                        Some(install::IMMUTABLE.as_bytes()),
+                        "{path}"
+                    );
+                    for name in ["content-security-policy", "x-content-type-options"] {
+                        assert!(headers.contains_key(name), "{path} lacks {name}");
+                    }
+                    assert!(
+                        !headers.contains_key(header::SET_COOKIE),
+                        "{path}: no cookie"
+                    );
+                    assert!(!headers.contains_key(header::VARY), "{path}: no Vary");
+                }
+                assert_eq!(
+                    page_hits.load(std::sync::atomic::Ordering::SeqCst),
+                    0,
+                    "the catch-all is never reached"
+                );
+            }
         });
     }
 }

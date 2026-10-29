@@ -1496,6 +1496,38 @@ package.ipe: program entry {entry} names no module. An entry names a module file
 
 `delivery.browser.basePath` {base} holds the byte {byte}. A segment holds only `A-Z a-z 0-9 - . _ ~`, and segments are joined by `/`, e.g. `/my-app`.
 
+## manifest-installable-without-icon
+
+`delivery.browser.installable` is `True`, but the package has no `icon`. An installable app needs a square PNG icon of at least 192 by 192 px and at most 2 MiB: add one, e.g. `icon = "assets/icon-512.png"`, or set `installable = False`.
+
+## manifest-icon-unreadable
+
+`icon` {icon} cannot be read: {reason}. An installable app's icon is a PNG file inside the project, e.g. `icon = "assets/icon-512.png"`.
+
+## manifest-icon-too-large
+
+`icon` {icon} is larger than {max} bytes. An installable app's icon is a square PNG of at least 192 by 192 px and at most 2 MiB: export a smaller file.
+
+## manifest-icon-not-png
+
+`icon` {icon} is not a PNG file. An installable app's icon is a square PNG of at least 192 by 192 px and at most 2 MiB: export the image as PNG.
+
+## manifest-icon-truncated-header
+
+`icon` {icon} has a missing or cut-short PNG header. An installable app's icon is a square PNG of at least 192 by 192 px and at most 2 MiB: export the image again.
+
+## manifest-icon-zero-side
+
+`icon` {icon} declares a width or height of zero. An installable app's icon is a square PNG of at least 192 by 192 px and at most 2 MiB: export the image again.
+
+## manifest-icon-not-square
+
+`icon` {icon} is {width} by {height} px, not square. An installable app's icon is a square PNG of at least 192 by 192 px and at most 2 MiB: crop or pad it to a square, e.g. 512 by 512 px.
+
+## manifest-icon-too-small
+
+`icon` {icon} is {side} by {side} px, under the {min} px minimum. An installable app's icon is a square PNG of at least 192 by 192 px and at most 2 MiB: export it at 512 by 512 px.
+
 ## manifest-not-package-ipe
 
 {path}: not a package.ipe manifest. {hint}

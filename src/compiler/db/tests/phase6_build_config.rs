@@ -114,7 +114,7 @@ fn emit_project_memoized_coarse_floor() {
             debugger: false,
             crate_name: ipe_backend_rust::CrateName::SingleFile,
             hot_appearance: false,
-            host: ipe_backend_rust::EmitHost::Served,
+            host: ipe_backend_rust::EmitHost::Served(ipe_backend_rust::ServedInstall::Off),
             intent: ipe_backend_rust::BuildIntent::Development,
         },
     );
@@ -182,7 +182,7 @@ fn emit_project_config_change_does_not_retrigger_lower() {
             debugger: false,
             crate_name: ipe_backend_rust::CrateName::SingleFile,
             hot_appearance: false,
-            host: ipe_backend_rust::EmitHost::Served,
+            host: ipe_backend_rust::EmitHost::Served(ipe_backend_rust::ServedInstall::Off),
             intent: ipe_backend_rust::BuildIntent::Development,
         },
     );
@@ -252,7 +252,7 @@ fn emit_project_source_edit_retriggers_lower_and_emit() {
             debugger: false,
             crate_name: ipe_backend_rust::CrateName::SingleFile,
             hot_appearance: false,
-            host: ipe_backend_rust::EmitHost::Served,
+            host: ipe_backend_rust::EmitHost::Served(ipe_backend_rust::ServedInstall::Off),
             intent: ipe_backend_rust::BuildIntent::Development,
         },
     );
@@ -292,7 +292,7 @@ fn emit_project_short_circuits_on_lower_error() {
             debugger: false,
             crate_name: ipe_backend_rust::CrateName::SingleFile,
             hot_appearance: false,
-            host: ipe_backend_rust::EmitHost::Served,
+            host: ipe_backend_rust::EmitHost::Served(ipe_backend_rust::ServedInstall::Off),
             intent: ipe_backend_rust::BuildIntent::Development,
         },
     );

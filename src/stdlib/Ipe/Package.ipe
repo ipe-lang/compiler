@@ -65,6 +65,10 @@ module Ipe.Package exposing
 
 -- | The whole manifest. Only `name` is strictly required; every other field
 -- defaults to its absent-section default when omitted (see each field's type).
+--
+-- `icon` is the app icon, a path relative to the project root that must stay
+-- inside it. An installable `web served` app (`installable` in
+-- `BrowserConfig`) requires it, as a square PNG of at least 192 by 192 px.
 type alias Package =
     { name : String
     , version : String
@@ -243,8 +247,25 @@ type Orientation
 -- made only of the bytes `A-Z a-z 0-9 - . _ ~`, with no trailing `/`, no empty,
 -- `.`, or `..` segment, and at most 1024 bytes in all. The manifest refuses any
 -- other value.
+--
+-- `installable` (default `False`): when `True`, a `web served` app offers
+-- browser install (a web app manifest, a home-screen icon, a standalone window)
+-- and an offline notice page. It requires the top-level `icon`: a PNG, square,
+-- at least 192 by 192 px, at most 2 MiB; anything else stops the build with an
+-- error naming the rule. The app still needs a connection to work; offline it
+-- shows a notice and nothing else. The served base path comes from the server
+-- (`IPE_WEB_BASE_PATH` or `Server.mountApp`), not from `basePath`.
+--
+-- ```
+-- package =
+--     { name = "todo"
+--     , icon = "assets/icon-512.png"
+--     , delivery = { browser = { basePath = "/", installable = True } }
+--     }
+-- ```
 type alias BrowserConfig =
     { basePath : String
+    , installable : Bool
     }
 
 

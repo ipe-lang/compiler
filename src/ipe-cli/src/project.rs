@@ -143,7 +143,7 @@ pub struct DeliveryConfig {
     pub desktop: DesktopDelivery,
     /// Bundle identifier and orientation for `web solo ios` / `web solo android`.
     pub mobile: MobileDelivery,
-    /// Base path for the `web solo` browser host.
+    /// The `web solo` base path and the `web served` install offer.
     pub browser: BrowserDelivery,
     /// The `https` origins the browser bundle may reach besides its own;
     /// empty for an offline bundle.
@@ -353,14 +353,30 @@ pub enum ScreenOrientation {
 pub struct BrowserDelivery {
     /// The URL path every shell serves the bundle at, parsed from `basePath`.
     pub base: ipe_runtime_rust::encoding::MountBase,
+    /// Whether a `web served` app offers browser install, from `installable`.
+    pub install: Install,
 }
 
 impl Default for BrowserDelivery {
     fn default() -> Self {
         Self {
             base: ipe_runtime_rust::encoding::MountBase::root(),
+            install: Install::Off,
         }
     }
+}
+
+/// Whether a `web served` app offers browser install (a web app manifest and a home-screen icon).
+///
+/// Built once at the manifest finish step from `delivery.browser.installable`
+/// and the resolved top-level `icon`, so an installable app always carries an
+/// icon proven fit for install.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Install {
+    /// No install offer: `installable` is absent or `False`.
+    Off,
+    /// `installable = True`, with the project icon.
+    On(crate::pwa_icon::PwaIcon),
 }
 
 impl ProjectManifest {

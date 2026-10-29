@@ -11,7 +11,7 @@ use std::path::Path;
 
 use crate::{
     BuildIntent, CargoPackageName, CrateIdentity, DbDriver, FfiEmit, MountBase, RuntimeDep,
-    ServerOrigins, WebViewWindow,
+    ServedInstall, ServerOrigins, WebViewWindow,
 };
 
 /// The emitted crate's `[package] name`.
@@ -52,8 +52,9 @@ pub const TEST_CRATE_NAME: &str = "ipe-test";
 /// How the emitted program is hosted.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum EmitHost {
-    /// The served host: a web program listens over HTTP.
-    Served,
+    /// The served host: a web program listens over HTTP, with or without a
+    /// browser-install offer.
+    Served(ServedInstall),
     /// The webview-native `web desktop` host, with its desktop window.
     WebView(WebViewWindow),
 }
@@ -110,7 +111,7 @@ impl EmitSettings {
             debugger: false,
             crate_name: CrateName::SingleFile,
             hot_appearance: false,
-            host: EmitHost::Served,
+            host: EmitHost::Served(ServedInstall::Off),
             intent: BuildIntent::Release,
         }
     }
@@ -211,22 +212,7 @@ impl EmitSettings {
 
         emit_field(sink, FieldTag::HotAppearance, &[u8::from(*hot_appearance)]);
 
-        let mut payload = Vec::new();
-        match host {
-            EmitHost::Served => payload.push(0),
-            EmitHost::WebView(window) => {
-                let WebViewWindow {
-                    title,
-                    width,
-                    height,
-                } = window;
-                payload.push(1);
-                push_framed(&mut payload, title.as_bytes());
-                payload.extend_from_slice(&width.to_le_bytes());
-                payload.extend_from_slice(&height.to_le_bytes());
-            }
-        }
-        emit_field(sink, FieldTag::Host, &payload);
+        emit_field(sink, FieldTag::Host, &host_payload(host));
 
         emit_field(
             sink,
@@ -237,6 +223,34 @@ impl EmitSettings {
             }],
         );
     }
+}
+
+/// The [`FieldTag::Host`] payload of `host`.
+fn host_payload(host: &EmitHost) -> Vec<u8> {
+    let mut payload = Vec::new();
+    match host {
+        // `Off` is the plain served payload; `On` takes the next free
+        // discriminant.
+        EmitHost::Served(ServedInstall::Off) => payload.push(0),
+        EmitHost::Served(ServedInstall::On { name, icon }) => {
+            payload.push(2);
+            push_framed(&mut payload, name.as_bytes());
+            payload.extend_from_slice(&icon.side().get().to_le_bytes());
+            payload.extend_from_slice(icon.digest());
+        }
+        EmitHost::WebView(window) => {
+            let WebViewWindow {
+                title,
+                width,
+                height,
+            } = window;
+            payload.push(1);
+            push_framed(&mut payload, title.as_bytes());
+            payload.extend_from_slice(&width.to_le_bytes());
+            payload.extend_from_slice(&height.to_le_bytes());
+        }
+    }
+    payload
 }
 
 /// The one-byte tag that opens each field's record in [`EmitSettings::fold_key`].
@@ -285,4 +299,55 @@ fn len_bytes(len: usize) -> [u8; 8] {
 /// A path's platform bytes.
 fn path_bytes(path: &Path) -> &[u8] {
     path.as_os_str().as_encoded_bytes()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{ServedIcon, served_install::test_png};
+
+    /// The `fold_key` records of `settings`, one `[tag, length, payload]` each.
+    fn records(settings: &EmitSettings) -> Vec<Vec<u8>> {
+        let mut chunks = Vec::new();
+        settings.fold_key(&mut |chunk| chunks.push(chunk.to_vec()));
+        chunks
+    }
+
+    /// The unconfigured settings served with `install`.
+    fn served(install: ServedInstall) -> EmitSettings {
+        EmitSettings {
+            host: EmitHost::Served(install),
+            ..EmitSettings::unconfigured()
+        }
+    }
+
+    /// An install offer named `name` with a 512 px icon whose bytes end in `tail`.
+    fn offer(name: &str, tail: &[u8]) -> ServedInstall {
+        let mut png = test_png(512, 512);
+        png.extend_from_slice(tail);
+        ServedInstall::On {
+            name: name.to_owned(),
+            icon: ServedIcon::from_png(png).expect("square PNG"),
+        }
+    }
+
+    #[test]
+    fn the_install_offer_and_its_icon_bytes_split_the_key() {
+        let off = records(&served(ServedInstall::Off));
+        let on = records(&served(offer("todo", b"a")));
+        assert_ne!(off, on);
+        assert_ne!(on, records(&served(offer("todo", b"b"))));
+        assert_ne!(on, records(&served(offer("done", b"a"))));
+        assert_eq!(on, records(&served(offer("todo", b"a"))));
+    }
+
+    #[test]
+    fn a_served_build_without_install_keeps_its_host_payload() {
+        let chunks = records(&served(ServedInstall::Off));
+        let host = chunks
+            .chunks(3)
+            .find(|record| record.first().map(Vec::as_slice) == Some(&[FieldTag::Host as u8]))
+            .and_then(|record| record.get(2));
+        assert_eq!(host.map(Vec::as_slice), Some(&[0_u8][..]));
+    }
 }

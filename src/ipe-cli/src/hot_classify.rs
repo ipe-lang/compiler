@@ -199,17 +199,35 @@ pub enum Classification {
 /// byte-identical); otherwise [`Classification::Logic`].
 #[must_use]
 pub fn classify(prev: &EmittedProject, next: &EmittedProject) -> Classification {
-    // The Cargo.toml is code (deps, features) — any change there is Logic.
-    if prev.cargo_toml != next.cargo_toml {
+    // Every field is named here, so a field added to the project is a build
+    // error until this classifier weighs it.
+    let EmittedProject {
+        files: prev_files,
+        cargo_toml: prev_cargo_toml,
+        uses_webview: prev_uses_webview,
+        assets: prev_assets,
+    } = prev;
+    let EmittedProject {
+        files: next_files,
+        cargo_toml: next_cargo_toml,
+        uses_webview: next_uses_webview,
+        assets: next_assets,
+    } = next;
+    // The Cargo.toml is code (deps, features), the host is code, and a binary
+    // file is compiled in by `include_bytes!` — any change in them is Logic.
+    if prev_cargo_toml != next_cargo_toml
+        || prev_uses_webview != next_uses_webview
+        || prev_assets != next_assets
+    {
         return Classification::Logic;
     }
     // A file added or removed is a structural change.
-    if prev.files.len() != next.files.len() {
+    if prev_files.len() != next_files.len() {
         return Classification::Logic;
     }
     let mut hot = HotSwap::default();
-    for (rel, prev_src) in &prev.files {
-        let Some(next_src) = next.files.get(rel) else {
+    for (rel, prev_src) in prev_files {
+        let Some(next_src) = next_files.get(rel) else {
             // A renamed/removed path — structural.
             return Classification::Logic;
         };
@@ -1122,6 +1140,7 @@ mod tests {
             files: map,
             cargo_toml: cargo.to_owned(),
             uses_webview: false,
+            assets: std::collections::BTreeMap::new(),
         }
     }
 
@@ -1181,6 +1200,30 @@ mod tests {
     fn first_patch(ps: &[ViewPatch]) -> ViewPatch {
         assert!(!ps.is_empty(), "expected at least one view patch");
         ps.first().cloned().unwrap_or_default()
+    }
+
+    /// A changed binary asset (an install icon) is compiled in by
+    /// `include_bytes!`, so it is Logic even when every text file is equal.
+    #[test]
+    fn a_changed_asset_is_logic() {
+        let with_icon = |byte: u8| {
+            let mut emitted = project(&[("src/main.rs", "fn main() {}")], "cargo");
+            emitted.assets.insert(
+                ipe_backend::RelPath::new("src/ipe_install_icon.png").expect("asset path"),
+                ipe_backend::Asset::new(vec![byte]),
+            );
+            emitted
+        };
+        assert_eq!(
+            classify(&with_icon(1), &with_icon(2)),
+            Classification::Logic
+        );
+        let bare = project(&[("src/main.rs", "fn main() {}")], "cargo");
+        assert_eq!(classify(&bare, &with_icon(1)), Classification::Logic);
+        assert!(matches!(
+            classify(&with_icon(1), &with_icon(1)),
+            Classification::HotSwappable(_)
+        ));
     }
 
     // ── (a) padding 12 → 16: AppearanceOnly, 1-entry patch ────────────────

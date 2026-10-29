@@ -2191,7 +2191,7 @@ INLINE_DECIDERS: dict[tuple[str, str], str] = {
     ("admission-sandbox.yml", "linux-x64-jail"): "Run admission jail",
     ("admission-sandbox.yml", "macos-arm64-jail"): "Run admission jail",
     ("ci.yml", "asan"): "ASAN shard ${{ matrix.shard }}/6 (build-std, instrumented std)",
-    ("ci.yml", "browser-e2e"): "Run Playwright specs (geo + clipboard, layout fill, focus across patch, csp styles)",
+    ("ci.yml", "browser-e2e"): "Run Playwright specs (geo + clipboard, layout fill, focus across patch, csp styles, install offer)",
     ("ci.yml", "build-tools"): "Build ipe and the doc/golden regenerator binaries",
     ("ci.yml", "e2e"): "E2E shard ${{ matrix.shard }}/14 (THE SEAL — build+run emitted Rust)",
     ("ci.yml", "linux-arm64-tier2"): "audit_native fail-closed refuse-to-certify on aarch64",
@@ -4106,14 +4106,16 @@ _CLAIM_ENV: dict[str, frozenset[str] | None] = {
     "CARGO_TERM_COLOR": frozenset({"always", "never", "auto"}),
     "CARGO_INCREMENTAL": frozenset({"0", "1"}),
     # Read by other steps of the job (the `ipe` CLI and the geo-clipboard,
-    # layout-fill, focus-across-patch and csp-styles servers); neither cargo nor rustc
-    # reads them, and no build script of the tree does
+    # layout-fill, focus-across-patch, csp-styles and install-offer servers);
+    # neither cargo nor rustc reads them, and no build script of the tree does
     # (`test_inert_claim_env_unread_by_build_scripts`).
     "IPE_RUNTIME_DIR": None,
     "IPE_GEO_CLIPBOARD_PORT": None,
     "IPE_LAYOUT_FILL_PORT": None,
     "IPE_FOCUS_ACROSS_PATCH_PORT": None,
     "IPE_CSP_STYLES_PORT": None,
+    "IPE_INSTALL_OFFER_PORT": None,
+    "IPE_INSTALL_OFFER_OFF_PORT": None,
 }
 # The `.cargo/config.toml` a claimed run reads: its admitted tables, the keys
 # of `[build]` and of a `[target]` table that applies to the claim platform,

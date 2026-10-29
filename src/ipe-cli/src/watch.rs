@@ -3310,7 +3310,10 @@ mod tests {
             ipe_backend_rust::sanitize_cargo_name(&fixture.root().manifest().name),
             "the friendly name alone would share a cargo slot across projects"
         );
-        assert_eq!(settings.host, ipe_backend_rust::EmitHost::Served);
+        assert_eq!(
+            settings.host,
+            ipe_backend_rust::EmitHost::Served(ipe_backend_rust::ServedInstall::Off)
+        );
     }
 
     /// Build an `EmittedProject` whose `src/main.rs` carries `main_rs`, so the
@@ -3324,6 +3327,7 @@ mod tests {
             files,
             cargo_toml: String::new(),
             uses_webview: false,
+            assets: std::collections::BTreeMap::new(),
         }
     }
 
@@ -3344,6 +3348,7 @@ mod tests {
             files,
             cargo_toml: String::new(),
             uses_webview: false,
+            assets: std::collections::BTreeMap::new(),
         }
     }
 

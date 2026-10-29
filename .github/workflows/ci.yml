@@ -2458,6 +2458,8 @@ jobs:
       IPE_LAYOUT_FILL_PORT: "18081"
       IPE_FOCUS_ACROSS_PATCH_PORT: "18082"
       IPE_CSP_STYLES_PORT: "18083"
+      IPE_INSTALL_OFFER_PORT: "18084"
+      IPE_INSTALL_OFFER_OFF_PORT: "18085"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: ./.github/actions/rust-toolchain-pinned
@@ -2646,6 +2648,80 @@ jobs:
             echo "csp-styles server never became ready on port $IPE_CSP_STYLES_PORT" >&2
             exit 1
           fi
+      - name: Compile + cargo-build install-offer example
+        env:
+          CARGO_TARGET_DIR: ${{ github.workspace }}/.cache/browser-e2e-target/install-offer
+        run: |
+          set -euo pipefail
+          OUT="$RUNNER_TEMP/install-offer-emitted"
+          "$RUNNER_TEMP/ipe-release/ipe" dev build examples/shapes/web/install-offer --out "$OUT"
+          cd "$OUT/rust"
+          cargo build --release
+          NAME="$(sed -n 's/^name = "\(.*\)"$/\1/p;T;q' Cargo.toml)"
+          BIN="$CARGO_TARGET_DIR/release/$NAME"
+          # Fail closed: no executable named after the emitted package means the
+          # spawn below would run nothing.
+          if [ -z "$NAME" ] || [ ! -x "$BIN" ]; then
+            echo "install-offer binary not found at '$BIN'" >&2
+            exit 1
+          fi
+          bash "$GITHUB_WORKSPACE/.github/ci/github-env.sh" CI_JOB_INSTALL_OFFER_BIN "$BIN"
+      - name: Spawn install-offer server
+        run: |
+          set -euo pipefail
+          IPE_WEB_PORT="$IPE_INSTALL_OFFER_PORT" \
+          IPE_CSRF=off \
+          IPE_CONSOLE_EMBED=off \
+          "$CI_JOB_INSTALL_OFFER_BIN" &
+          bash "$GITHUB_WORKSPACE/.github/ci/github-env.sh" CI_JOB_INSTALL_OFFER_SERVER_PID "$!"
+          ready=""
+          for i in $(seq 1 40); do
+            if curl -sf --max-time 2 "http://127.0.0.1:$IPE_INSTALL_OFFER_PORT/" >/dev/null 2>&1; then
+              echo "server ready (attempt $i)"; ready=1; break
+            fi
+            sleep 0.5
+          done
+          if [ -z "$ready" ]; then
+            echo "install-offer server never became ready on port $IPE_INSTALL_OFFER_PORT" >&2
+            exit 1
+          fi
+      - name: Compile + cargo-build install-offer-off example
+        env:
+          CARGO_TARGET_DIR: ${{ github.workspace }}/.cache/browser-e2e-target/install-offer-off
+        run: |
+          set -euo pipefail
+          OUT="$RUNNER_TEMP/install-offer-off-emitted"
+          "$RUNNER_TEMP/ipe-release/ipe" dev build examples/shapes/web/install-offer-off --out "$OUT"
+          cd "$OUT/rust"
+          cargo build --release
+          NAME="$(sed -n 's/^name = "\(.*\)"$/\1/p;T;q' Cargo.toml)"
+          BIN="$CARGO_TARGET_DIR/release/$NAME"
+          # Fail closed: no executable named after the emitted package means the
+          # spawn below would run nothing.
+          if [ -z "$NAME" ] || [ ! -x "$BIN" ]; then
+            echo "install-offer-off binary not found at '$BIN'" >&2
+            exit 1
+          fi
+          bash "$GITHUB_WORKSPACE/.github/ci/github-env.sh" CI_JOB_INSTALL_OFFER_OFF_BIN "$BIN"
+      - name: Spawn install-offer-off server
+        run: |
+          set -euo pipefail
+          IPE_WEB_PORT="$IPE_INSTALL_OFFER_OFF_PORT" \
+          IPE_CSRF=off \
+          IPE_CONSOLE_EMBED=off \
+          "$CI_JOB_INSTALL_OFFER_OFF_BIN" &
+          bash "$GITHUB_WORKSPACE/.github/ci/github-env.sh" CI_JOB_INSTALL_OFFER_OFF_SERVER_PID "$!"
+          ready=""
+          for i in $(seq 1 40); do
+            if curl -sf --max-time 2 "http://127.0.0.1:$IPE_INSTALL_OFFER_OFF_PORT/" >/dev/null 2>&1; then
+              echo "server ready (attempt $i)"; ready=1; break
+            fi
+            sleep 0.5
+          done
+          if [ -z "$ready" ]; then
+            echo "install-offer-off server never became ready on port $IPE_INSTALL_OFFER_OFF_PORT" >&2
+            exit 1
+          fi
       # The wasm-bindgen CLI, pinned to the Cargo.lock wasm-bindgen version: the
       # `web solo` bundle build below runs it, and so does the wasm test runner
       # (a runner of another version refuses the test binary).
@@ -2669,12 +2745,12 @@ jobs:
             exit 1
           fi
           bash "$GITHUB_WORKSPACE/.github/ci/github-env.sh" CI_JOB_WASM_SOLO_WWW "$OUT/rust/www"
-      - name: Run Playwright specs (geo + clipboard, layout fill, focus across patch, csp styles)
+      - name: Run Playwright specs (geo + clipboard, layout fill, focus across patch, csp styles, install offer)
         working-directory: tools/scripts/browser-e2e
         run: IPE_WASM_SOLO_WWW="$CI_JOB_WASM_SOLO_WWW" npx playwright test --config playwright.config.mjs
       - name: Kill server
         if: always()
-        run: kill "$CI_JOB_GEO_SERVER_PID" "$CI_JOB_LAYOUT_SERVER_PID" "$CI_JOB_FOCUS_SERVER_PID" "$CI_JOB_CSP_STYLES_SERVER_PID" 2>/dev/null || true
+        run: kill "$CI_JOB_GEO_SERVER_PID" "$CI_JOB_LAYOUT_SERVER_PID" "$CI_JOB_FOCUS_SERVER_PID" "$CI_JOB_CSP_STYLES_SERVER_PID" "$CI_JOB_INSTALL_OFFER_SERVER_PID" "$CI_JOB_INSTALL_OFFER_OFF_SERVER_PID" 2>/dev/null || true
       - name: Self-test the echo server and the count proof
         run: |
           set -euo pipefail

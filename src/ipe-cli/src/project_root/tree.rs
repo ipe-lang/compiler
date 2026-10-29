@@ -33,7 +33,8 @@ struct TreeModule {
     source: String,
 }
 
-/// The description of a project: its name, manifest fields and module sources.
+/// The description of a project: its name, manifest fields, module sources
+/// and the files its manifest names (an icon).
 ///
 /// Nothing is written until [`SourceTree::resolve`] or
 /// [`SourceTree::resolve_under`].
@@ -42,6 +43,7 @@ pub struct SourceTree {
     name: String,
     fields: Vec<String>,
     modules: Vec<TreeModule>,
+    files: Vec<(String, Vec<u8>)>,
 }
 
 impl Default for SourceTree {
@@ -58,6 +60,7 @@ impl SourceTree {
             name: DEFAULT_NAME.to_owned(),
             fields: Vec::new(),
             modules: Vec::new(),
+            files: Vec::new(),
         }
     }
 
@@ -81,6 +84,15 @@ impl SourceTree {
     #[must_use]
     pub fn field(mut self, field: &str) -> Self {
         self.fields.push(field.to_owned());
+        self
+    }
+
+    /// Add the file at `path` (relative, `/`-separated) holding `bytes`, written
+    /// before the tree is resolved so a manifest field naming it reads it.
+    #[cfg(any(test, feature = "test-fixtures"))]
+    #[must_use]
+    pub fn file(mut self, path: &str, bytes: &[u8]) -> Self {
+        self.files.push((path.to_owned(), bytes.to_vec()));
         self
     }
 
@@ -135,7 +147,7 @@ impl SourceTree {
         let files = self.files()?;
         let manifest = self.manifest()?;
         let root = dir.path();
-        write_file(&root.join(PACKAGE_IPE), &manifest)?;
+        write_file(&root.join(PACKAGE_IPE), manifest.as_bytes())?;
         let src = root.join(SRC_DIR);
         fs::create_dir(&src).map_err(|source| io_error(&src, source))?;
         for (rel, source) in &files {
@@ -159,21 +171,31 @@ impl SourceTree {
         ))
     }
 
-    /// Every module file as its path below the root and its text, all paths proven first.
-    fn files(&self) -> Result<Vec<(PathBuf, &str)>, CliError> {
+    /// Every module and named file as its path below the root and its bytes,
+    /// all paths proven first.
+    fn files(&self) -> Result<Vec<(PathBuf, &[u8])>, CliError> {
         self.plan().map_err(CliError::SourceTree)
     }
 
-    /// Every module file below the root, refusing a name that is not a dotted
-    /// module name and two paths one case-insensitive file system would merge.
-    fn plan(&self) -> Result<Vec<(PathBuf, &str)>, TreeRefusal> {
+    /// Every module and named file below the root, refusing a name that is not
+    /// a dotted module name, a file path that is not relative, and two paths one
+    /// case-insensitive file system would merge.
+    fn plan(&self) -> Result<Vec<(PathBuf, &[u8])>, TreeRefusal> {
         let mut claimed = FoldedPaths::default();
-        self.modules
+        let modules = self
+            .modules
             .iter()
-            .map(|m| {
-                let path = module_file(m.dir, &m.module)?;
+            .map(|m| Ok((module_file(m.dir, &m.module)?, m.source.as_bytes())));
+        let files = self
+            .files
+            .iter()
+            .map(|(path, bytes)| Ok((relative_file(path)?, bytes.as_slice())));
+        modules
+            .chain(files)
+            .map(|planned| {
+                let (path, bytes) = planned?;
                 claimed.claim(&path)?;
-                Ok((path, m.source.as_str()))
+                Ok((path, bytes))
             })
             .collect()
     }
@@ -189,6 +211,11 @@ pub enum TreeRefusal {
         module: String,
         /// The refused segment.
         segment: String,
+    },
+    /// A named file path that is empty or has a root, `.` or `..` component.
+    NotRelativeFile {
+        /// The path as given.
+        path: String,
     },
     /// Two module files, or two of their directories, that differ at most in ASCII case.
     Collision {
@@ -206,6 +233,9 @@ impl fmt::Display for TreeRefusal {
                 f,
                 "`{module}` is not a module name: `{segment}` is not a module segment"
             ),
+            Self::NotRelativeFile { path } => {
+                write!(f, "`{path}` is not a file path below the project root")
+            }
             Self::Collision { first, second } => write!(
                 f,
                 "`{}` and `{}` are one path on a case-insensitive file system",
@@ -286,10 +316,25 @@ fn module_file(dir: SourceDir, module: &str) -> Result<PathBuf, TreeRefusal> {
     Ok(path)
 }
 
-/// Write `text` to a new file at `path`, creating its parent directories.
+/// `path` as a path below the root: non-empty, every component a plain name.
+fn relative_file(path: &str) -> Result<PathBuf, TreeRefusal> {
+    let rel = PathBuf::from(path);
+    let plain = rel
+        .components()
+        .all(|c| matches!(c, std::path::Component::Normal(_)));
+    if plain && rel.components().next().is_some() {
+        Ok(rel)
+    } else {
+        Err(TreeRefusal::NotRelativeFile {
+            path: path.to_owned(),
+        })
+    }
+}
+
+/// Write `bytes` to a new file at `path`, creating its parent directories.
 ///
 /// A file already at `path` is refused, never overwritten.
-fn write_file(path: &Path, text: &str) -> Result<(), CliError> {
+fn write_file(path: &Path, bytes: &[u8]) -> Result<(), CliError> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|source| io_error(parent, source))?;
     }
@@ -297,7 +342,7 @@ fn write_file(path: &Path, text: &str) -> Result<(), CliError> {
         .write(true)
         .create_new(true)
         .open(path)
-        .and_then(|mut file| file.write_all(text.as_bytes()))
+        .and_then(|mut file| file.write_all(bytes))
         .map_err(|source| io_error(path, source))
 }
 
@@ -517,6 +562,37 @@ mod tests {
         assert!(
             matches!(&err, CliError::SourceTree(TreeRefusal::Collision { .. })),
             "{err}"
+        );
+    }
+
+    #[test]
+    fn a_named_file_outside_the_root_or_on_a_module_is_refused() {
+        let plan = |path: &str| tree().file(path, b"x").plan().map(drop);
+        let not_relative = |path: &str| {
+            Err(TreeRefusal::NotRelativeFile {
+                path: path.to_owned(),
+            })
+        };
+        for path in [
+            "",
+            "/etc/icon.png",
+            "../icon.png",
+            "assets/../icon.png",
+            "./icon.png",
+        ] {
+            assert_eq!(plan(path), not_relative(path), "{path:?}");
+        }
+        assert_eq!(plan("assets/icon.png"), Ok(()));
+        assert_eq!(
+            tree()
+                .module("Lib", MODULE)
+                .file("src/LIB.ipe", b"x")
+                .plan()
+                .map(drop),
+            Err(TreeRefusal::Collision {
+                first: PathBuf::from("src/Lib.ipe"),
+                second: PathBuf::from("src/LIB.ipe"),
+            })
         );
     }
 

@@ -30,6 +30,7 @@ use crate::items::Items;
 use crate::preamble::{epilogue, preamble};
 use crate::rust_file;
 use crate::rust_file::{Partitioned, RustFileId, partition_items};
+use crate::served_install::install_assets;
 
 /// The canonical emit template, embedded at compile time. The fixed
 /// runtime-bindings block (kernel wrappers) is an exact substring of it. This is
@@ -2924,10 +2925,12 @@ fn assemble_project_text(
                 relocate_env_public_to_user_crate(&mut files, &ctx.wasm_public_env)?;
             }
             let cargo_toml = apply_cargo_name(&cargo_toml, &safe_name);
+            let assets = install_assets(&ctx.served_install, &files)?;
             return Ok(EmittedProject {
                 files,
                 cargo_toml,
                 uses_webview: ctx.uses_webview,
+                assets,
             });
         }
 
@@ -2963,10 +2966,12 @@ fn assemble_project_text(
             WASM_CARGO_TOML.to_owned()
         };
         let wasm_cargo_toml = apply_cargo_name(&wasm_cargo_toml, &safe_name);
+        let assets = install_assets(&ctx.served_install, &files)?;
         return Ok(EmittedProject {
             files,
             cargo_toml: wasm_cargo_toml,
             uses_webview: ctx.uses_webview,
+            assets,
         });
     }
 
@@ -3033,10 +3038,12 @@ fn assemble_project_text(
             insert_wasi_linker_config(&mut files)?;
         }
         let cargo_toml = apply_cargo_name(&cargo_toml, &safe_name);
+        let assets = install_assets(&ctx.served_install, &files)?;
         return Ok(EmittedProject {
             files,
             cargo_toml,
             uses_webview: ctx.uses_webview,
+            assets,
         });
     }
 
@@ -3387,10 +3394,12 @@ fn assemble_project_text(
         insert_wasi_linker_config(&mut files)?;
     }
     let cargo_toml = apply_cargo_name(&cargo_toml, &safe_name);
+    let assets = install_assets(&ctx.served_install, &files)?;
     Ok(EmittedProject {
         files,
         cargo_toml,
         uses_webview: ctx.uses_webview,
+        assets,
     })
 }
 
@@ -7406,6 +7415,7 @@ mod non_serde_tests {
                     files: BTreeMap::new(),
                     cargo_toml: String::new(),
                     uses_webview: false,
+                    assets: std::collections::BTreeMap::new(),
                 };
             };
             map.insert(path, (*text).to_owned());
@@ -7414,6 +7424,7 @@ mod non_serde_tests {
             files: map,
             cargo_toml: String::new(),
             uses_webview: false,
+            assets: std::collections::BTreeMap::new(),
         }
     }
 
