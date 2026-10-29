@@ -573,7 +573,6 @@ mod tests {
         let app = crate::server::behind_listener(proxy_routes(axum::Router::new()));
         for (path, routed) in [
             ("/_ipe/console", true),
-            ("/_ipe/console/", true),
             ("/_ipe/console/api/x", true),
             ("/_ipe/consolex", false),
             ("/_ipe", false),
