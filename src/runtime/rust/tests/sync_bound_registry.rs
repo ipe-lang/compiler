@@ -94,6 +94,7 @@ const SYNC_SITES: &[(&str, SyncSite)] = &[
         SyncSite::ProgramEntry(&[StdlibKernel::WebEmbed]),
     ),
     ("choose_store", SyncSite::Internal),
+    ("mount_routes", SyncSite::Internal),
     ("proxy_routes", SyncSite::Internal),
 ];
 
