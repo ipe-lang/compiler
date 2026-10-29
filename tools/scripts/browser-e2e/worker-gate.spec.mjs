@@ -5,10 +5,12 @@
  * installed on an Ipê origin:
  *
  *   1. Registering the app's own `client.js`, a same-origin script the server
- *      answers with a JavaScript type, rejects: the worker gate refuses the
- *      browser's `Service-Worker: script` fetch. A plain fetch of the same
- *      script still answers 200, so the refusal is the gate, not a dead route.
- *   2. Registering `/static/sw.js` rejects.
+ *      answers with a JavaScript type, rejects with the gate's 403: the worker
+ *      gate refuses the browser's `Service-Worker: script` fetch. A plain fetch
+ *      of the same script still answers 200, so the refusal is the gate, not a
+ *      dead route.
+ *   2. Registering `/static/sw.js` rejects with the gate's 403, not the 404 an
+ *      ungated miss would answer.
  *   3. Registering the runtime's worker route `/ipe-sw.js` resolves, and the
  *      retire body then unregisters the worker: no registration is left.
  *
@@ -20,6 +22,13 @@ import { test, expect } from "@playwright/test";
 const PORT = process.env.IPE_GEO_CLIPBOARD_PORT ?? "18080";
 const BASE = `http://127.0.0.1:${PORT}`;
 
+/**
+ * The rejection the gate's 403 produces. Asserting the status, not only a
+ * rejection, keeps each case red without the gate: `client.js` would fail at
+ * worker evaluation and `/static/sw.js` would answer 404.
+ */
+const REFUSED = /^rejected:.*\(403\)/;
+
 /** Open the app page in a fresh context and wait for it to go live. */
 async function openApp(browser) {
   const ctx = await browser.newContext();
@@ -29,14 +38,14 @@ async function openApp(browser) {
   return { ctx, page };
 }
 
-/** Register `url` as a worker; resolve to "registered" or the rejection's name. */
+/** Register `url` as a worker; resolve to "registered" or the rejection's message. */
 function register(page, url) {
   return page.evaluate(async (scriptUrl) => {
     try {
       await navigator.serviceWorker.register(scriptUrl);
       return "registered";
     } catch (err) {
-      return `rejected:${err?.name ?? "unknown"}`;
+      return `rejected:${err?.message ?? "unknown"}`;
     }
   }, url);
 }
@@ -55,8 +64,8 @@ test("a same-origin script the runtime serves is never installed as a worker", a
     expect(plain.status).toBe(200);
     expect(plain.type).toContain("javascript");
 
-    expect(await register(page, src)).toMatch(/^rejected:/);
-    expect(await register(page, "/static/sw.js")).toMatch(/^rejected:/);
+    expect(await register(page, src)).toMatch(REFUSED);
+    expect(await register(page, "/static/sw.js")).toMatch(REFUSED);
     const left = await page.evaluate(async () => (await navigator.serviceWorker.getRegistrations()).length);
     expect(left).toBe(0);
   } finally {

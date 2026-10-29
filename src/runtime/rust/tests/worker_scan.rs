@@ -1,8 +1,9 @@
 //! Worker scan: every worker script body makes only admitted calls.
 //!
 //! `src/web/worker.rs` is parsed with `syn`. Every string constant there must
-//! be listed in `WORKER_CONSTANTS`, the file holds no other string literal and
-//! no macro, so no body can be built where the scan cannot read it. Each listed
+//! be listed in `WORKER_CONSTANTS`, and the file holds no other literal, no
+//! macro, no `use`, no method call and no path reaching outside the file, so
+//! no body can be built where the scan cannot read it. Each listed
 //! body is then read by a JavaScript tokenizer that admits a closed vocabulary:
 //! a call is admitted only when its whole member chain is in [`ADMITTED_CALLS`],
 //! every identifier must be in [`VOCABULARY`], `addEventListener` takes only an
@@ -15,7 +16,10 @@
 use std::collections::BTreeMap;
 
 use syn::visit::{self, Visit};
-use syn::{Attribute, Expr, ExprArray, ExprReference, Item, ItemConst, Lit, LitStr, Macro};
+use syn::{
+    Attribute, Expr, ExprArray, ExprMethodCall, ExprPath, ExprReference, Item, ItemConst, ItemUse,
+    Lit, LitStr, Macro,
+};
 
 /// The `worker.rs` source the scan reads.
 const WORKER_SOURCE: &str = include_str!("../src/web/worker.rs");
@@ -297,6 +301,44 @@ impl<'ast> Visit<'ast> for WorkerFile {
             .push(format!("macro {:?}", mac.path.get_ident()));
     }
 
+    fn visit_lit(&mut self, lit: &'ast Lit) {
+        match lit {
+            Lit::Str(text) => self.visit_lit_str(text),
+            _ => self
+                .strays
+                .push("a literal that is not a string".to_owned()),
+        }
+    }
+
+    fn visit_item_use(&mut self, _item: &'ast ItemUse) {
+        self.strays.push("a use item".to_owned());
+    }
+
+    fn visit_expr_path(&mut self, expr: &'ast ExprPath) {
+        let segments: Vec<String> = expr
+            .path
+            .segments
+            .iter()
+            .map(|segment| segment.ident.to_string())
+            .collect();
+        let local = expr.qself.is_none()
+            && expr.path.leading_colon.is_none()
+            && match segments.as_slice() {
+                [_] => true,
+                [first, _] => first == "Self",
+                _ => false,
+            };
+        if !local {
+            self.strays.push(format!("path {}", segments.join("::")));
+        }
+        visit::visit_expr_path(self, expr);
+    }
+
+    fn visit_expr_method_call(&mut self, call: &'ast ExprMethodCall) {
+        self.strays.push(format!("method call {}", call.method));
+        visit::visit_expr_method_call(self, call);
+    }
+
     fn visit_item(&mut self, item: &'ast Item) {
         if let Item::Static(item) = item {
             self.strays.push(format!("static {}", item.ident));
@@ -442,4 +484,60 @@ fn a_planted_unlisted_constant_or_macro_fails_the_listing() {
         "a body built by a macro is a stray: {:?}",
         found.strays
     );
+}
+
+/// The strays a planted copy of `worker.rs` with `suffix` appended holds.
+fn planted_strays(suffix: &str) -> Vec<String> {
+    let mut found = WorkerFile::default();
+    if let Ok(parsed) = syn::parse_file(&format!("{WORKER_SOURCE}\n{suffix}\n")) {
+        found.visit_file(&parsed);
+    } else {
+        found
+            .strays
+            .push("the planted copy does not parse".to_owned());
+    }
+    found.strays
+}
+
+#[test]
+fn a_body_built_outside_a_string_constant_fails_the_listing() {
+    assert_eq!(
+        planted_strays(""),
+        Vec::<String>::new(),
+        "the real file is clean"
+    );
+    let planted: &[(&str, &str)] = &[
+        (
+            "pub const BYTES: &[u8] = b\"fetch('/x');\";",
+            "a literal that is not a string",
+        ),
+        (
+            "pub const CODES: [u8; 1] = [102];",
+            "a literal that is not a string",
+        ),
+        (
+            "pub const CHARS: [char; 1] = ['f'];",
+            "a literal that is not a string",
+        ),
+        ("use crate::web::OTHER_BODY;", "a use item"),
+        (
+            "pub const FOREIGN: &str = crate::web::OTHER_BODY;",
+            "path crate::web::OTHER_BODY",
+        ),
+        (
+            "pub const FOREIGN: &str = ::core::primitive::str::trim(RETIRE_BODY);",
+            "path core::primitive::str::trim",
+        ),
+        (
+            "pub fn body() -> &'static str { RETIRE_BODY.trim_start() }",
+            "method call trim_start",
+        ),
+    ];
+    for (suffix, expected) in planted {
+        let strays = planted_strays(suffix);
+        assert!(
+            strays.iter().any(|stray| stray == expected),
+            "{suffix:?} yields {expected:?}, got {strays:?}"
+        );
+    }
 }
