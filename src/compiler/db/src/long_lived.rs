@@ -479,6 +479,7 @@ mod tests {
                 target: ipe_ir::Target::Native,
                 wasm_public_env: Vec::new(),
                 mount_base: ipe_backend_rust::MountBase::root(),
+                server_origins: ipe_backend_rust::ServerOrigins::none(),
                 wasm_hydrate_mode: false,
                 runtime_dep: None,
                 debugger: false,
@@ -508,6 +509,10 @@ mod tests {
                 wasm_public_env: vec!["PUBLIC_KEY".to_owned()],
                 mount_base: ipe_backend_rust::MountBase::parse("/app")
                     .unwrap_or_else(|_| ipe_backend_rust::MountBase::root()),
+                server_origins: ipe_backend_rust::ServerOrigin::parse("https://api.example")
+                    .ok()
+                    .and_then(|origin| ipe_backend_rust::ServerOrigins::new([origin]).ok())
+                    .unwrap_or_else(ipe_backend_rust::ServerOrigins::none),
                 wasm_hydrate_mode: true,
                 runtime_dep: Some(ipe_backend_rust::RuntimeDep {
                     root: std::path::PathBuf::from("/runtime"),
@@ -527,6 +532,7 @@ mod tests {
             changed.settings.mount_base,
             ipe_backend_rust::MountBase::root()
         );
+        assert!(!changed.settings.server_origins.is_empty());
         let second = owner.sync_config(changed.clone());
         assert!(first == second, "a warm sync keeps the one config handle");
         let held = BuildConfigFields {

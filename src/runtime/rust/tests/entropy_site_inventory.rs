@@ -115,6 +115,14 @@ const ADMITTED: &[(&str, &str, &str, usize)] = &[
     ),
     // The driver-selected `config`: the in-tree `config_postgres.rs`.
     ("mod.rs", MODULE_LEVEL, "#[path] mod config", 1),
+    // The bridge's wire grammar, a child module of the port glue; it draws
+    // no entropy.
+    (
+        "js_port_glue.rs",
+        MODULE_LEVEL,
+        "#[path] mod native_bridge",
+        1,
+    ),
     // The shared home-reader rows, [`INCLUDED_OUTSIDE_SRC`], scanned below.
     ("system.rs", MODULE_LEVEL, INCLUDE, 1),
 ];

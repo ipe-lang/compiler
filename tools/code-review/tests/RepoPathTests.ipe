@@ -335,12 +335,12 @@ pathRefusalPageTextFixed =
             )
 
 
--- A directory `File.tempDir` makes unique to this call, holding the two
--- subdirectories `a` and `b`, so concurrent runs never share roots.
+-- A `freshDir` unique to this call, holding the two subdirectories `a` and
+-- `b`, so concurrent runs never share roots.
 freshRootBase : Task.Task Error String
 freshRootBase =
     do
-        base <- File.tempDir "ipe-review-tag-roots-"
+        base <- freshDir "ipe-review-tag-roots"
         Task.fromResult (Path.fromString (base ++ "/a")) |> Task.andThen File.mkdirAll
         Task.fromResult (Path.fromString (base ++ "/b")) |> Task.andThen File.mkdirAll
         Task.succeed base
@@ -532,6 +532,32 @@ rootRefusalEscapesEnv =
             )
 
 
+-- A directory check that fails (an IO failure) is never read as the check
+-- succeeding with "not a directory": each names its own problem, and
+-- neither carries the other's wording. The live kernel folds a real
+-- permission failure into `Ok False`, so the `Err` branch is driven
+-- directly here rather than through an unreadable directory. A directory
+-- that is one is no refusal.
+rootCheckRefusalNamesIoFailure : Task.Task Error Bool
+rootCheckRefusalNamesIoFailure =
+    do
+        cwd <- System.cwd ()
+        dir <- Task.fromResult (Path.fromString cwd)
+        Task.succeed
+            (case ( RepoPath.rootCheckRefusal "irrelevant" dir (Ok False) |> Maybe.map Error.message, RepoPath.rootCheckRefusal "irrelevant" dir (Err (Error.unexpected "offload failed")) |> Maybe.map Error.message ) of
+                ( Just notDir, Just io ) ->
+                    String.contains "not a directory" notDir
+                        && not (String.contains "could not be checked" notDir)
+                        && String.contains "could not be checked" io
+                        && not (String.contains "not a directory" io)
+                        && String.contains "offload failed" io
+                        && (RepoPath.rootCheckRefusal "irrelevant" dir (Ok True) |> Maybe.map (\_ -> False) |> Maybe.withDefault True)
+
+                _ ->
+                    False
+            )
+
+
 -- The same refusal with every foreign field replaced: the `case` names every
 -- `PathError` constructor, so a new one cannot join `allPathErrors` without an
 -- arm here.
@@ -641,7 +667,7 @@ makeDir dir =
 freshNested : Task.Task Error Nested
 freshNested =
     do
-        base <- File.tempDir "ipe-review-nested-roots-"
+        base <- freshDir "ipe-review-nested-roots"
         makeDir (base ++ "/r/inner/deep")
         makeDir (base ++ "/r/inner2")
         outer <- RepoPath.parseRoot (base ++ "/r")
@@ -864,7 +890,7 @@ maxReposVector =
 distinctRoots : Int -> Task.Task Error (List ( String, Root ))
 distinctRoots count =
     do
-        base <- File.tempDir "ipe-review-root-ceiling-"
+        base <- freshDir "ipe-review-root-ceiling"
         List.range 0 (count - 1)
             |> List.map
                 (\i ->
@@ -1197,6 +1223,7 @@ checks =
         , check "a path refusal's page text is fixed and names no root" pathRefusalPageTextFixed
         , Task.succeed ( "describe escapes the stored path", describeEscapesStoredPath )
         , check "blank, missing and non-directory roots refused" badRootsRefused
+        , check "an IO failure checking the root is never read as not a directory" rootCheckRefusalNamesIoFailure
         , check "relative root loads the queue" relativeRootLoadsQueue
         , check "tag grammar matches the shared ipe-index tag vectors" tagGrammarMatchesVectors
         , check "two tags on one directory refused" sameRootTwoTagsRefused

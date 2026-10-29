@@ -258,6 +258,7 @@ fn loose_emit_settings(
         target: *target,
         wasm_public_env: Vec::new(),
         mount_base: MountBase::root(),
+        server_origins: ipe_backend_rust::ServerOrigins::none(),
         wasm_hydrate_mode: false,
         runtime_dep: None,
         debugger: *debugger,
@@ -329,6 +330,7 @@ fn manifest_emit_settings(
             project::WasmConfig::On(bundle) => bundle.public_env.to_names(),
         },
         mount_base: manifest.delivery.browser.base.clone(),
+        server_origins: manifest.delivery.servers.clone(),
         wasm_hydrate_mode: matches!(
             &manifest.wasm,
             project::WasmConfig::On(bundle) if bundle.mode == project::WasmMode::Hydrate

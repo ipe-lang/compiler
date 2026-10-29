@@ -21,6 +21,8 @@ pub use const_fold::fold_program;
 pub use emit_expr::rust_str_lit;
 /// The typed mount base the emitted browser shell is served under.
 pub use ipe_runtime_rust::encoding::MountBase;
+/// The parsed `delivery.servers` origins a browser bundle may reach.
+pub use ipe_runtime_rust::encoding::{ServerOrigin, ServerOrigins};
 pub mod crate_specs;
 #[macro_use]
 mod doc;
@@ -518,6 +520,7 @@ impl<'a> RustBackend<'a> {
             target,
             wasm_public_env,
             mount_base,
+            server_origins,
             wasm_hydrate_mode,
             runtime_dep,
             debugger,
@@ -534,6 +537,7 @@ impl<'a> RustBackend<'a> {
                 target: *target,
                 wasm_public_env: wasm_public_env.clone(),
                 mount_base: mount_base.clone(),
+                server_origins: server_origins.clone(),
                 wasm_hydrate_mode: *wasm_hydrate_mode,
                 runtime_dep: runtime_dep.clone(),
                 debugger: *debugger,
@@ -1382,6 +1386,8 @@ pub(crate) struct EmitCtx<'a> {
     /// Where the emitted browser shell is served, threaded in via
     /// [`RustBackend::with_mount_base`]; every shell URL is built from it.
     pub(crate) mount_base: MountBase,
+    /// The `delivery.servers` origins the browser shell's policy admits.
+    pub(crate) server_origins: ServerOrigins,
     /// `true` when `[wasm] mode = "hydrate"` was set in `package.ipe`. When set,
     /// the emitted wasm epilogue includes a `#[wasm_bindgen] pub fn hydrate(…)`
     /// export in addition to the `#[wasm_bindgen(start)] ipe_start` entry —
@@ -1739,6 +1745,7 @@ impl<'a> EmitCtx<'a> {
             target,
             wasm_public_env,
             mount_base,
+            server_origins,
             wasm_hydrate_mode,
             runtime_dep,
             debugger,
@@ -2409,6 +2416,7 @@ impl<'a> EmitCtx<'a> {
             uses_async_runtime,
             wasm_public_env,
             mount_base,
+            server_origins,
             wasm_hydrate_mode,
             runtime_dep,
             debugger,

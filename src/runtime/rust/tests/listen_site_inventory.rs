@@ -80,6 +80,14 @@ const ADMITTED: &[(&str, &str, &str, usize)] = &[
     // The driver-selected `config`: under `db-postgres` the crate root names
     // the in-tree `config_postgres.rs`, which the walk reads on its own.
     ("mod.rs", MODULE_LEVEL, "#[path] mod config", 1),
+    // The bridge's wire grammar, a child module of the port glue; it binds
+    // no socket.
+    (
+        "js_port_glue.rs",
+        MODULE_LEVEL,
+        "#[path] mod native_bridge",
+        1,
+    ),
 ];
 
 /// The bind type `ty` names, through any parentheses or invisible group.
