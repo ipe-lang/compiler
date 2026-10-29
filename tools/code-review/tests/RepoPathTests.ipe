@@ -335,12 +335,12 @@ pathRefusalPageTextFixed =
             )
 
 
--- A directory `File.tempDir` makes unique to this call, holding the two
--- subdirectories `a` and `b`, so concurrent runs never share roots.
+-- A `freshDir` unique to this call, holding the two subdirectories `a` and
+-- `b`, so concurrent runs never share roots.
 freshRootBase : Task.Task Error String
 freshRootBase =
     do
-        base <- File.tempDir "ipe-review-tag-roots-"
+        base <- freshDir "ipe-review-tag-roots"
         Task.fromResult (Path.fromString (base ++ "/a")) |> Task.andThen File.mkdirAll
         Task.fromResult (Path.fromString (base ++ "/b")) |> Task.andThen File.mkdirAll
         Task.succeed base
@@ -671,7 +671,7 @@ makeDir dir =
 freshNested : Task.Task Error Nested
 freshNested =
     do
-        base <- File.tempDir "ipe-review-nested-roots-"
+        base <- freshDir "ipe-review-nested-roots"
         makeDir (base ++ "/r/inner/deep")
         makeDir (base ++ "/r/inner2")
         outer <- RepoPath.parseRoot (base ++ "/r")
@@ -894,7 +894,7 @@ maxReposVector =
 distinctRoots : Int -> Task.Task Error (List ( String, Root ))
 distinctRoots count =
     do
-        base <- File.tempDir "ipe-review-root-ceiling-"
+        base <- freshDir "ipe-review-root-ceiling"
         List.range 0 (count - 1)
             |> List.map
                 (\i ->
