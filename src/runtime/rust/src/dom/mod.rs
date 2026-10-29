@@ -1,5 +1,5 @@
 //! Target-neutral DOM data path: structural diff (`Html` → `Vec<Patch>`),
-//! the per-commit handler index, and typed form decoding.
+//! the per-commit handler index, the focus keep, and typed form decoding.
 //!
 //! These are pure over `crate::html` (no tokio, no server dependency) and are
 //! shared by every patch consumer: the Ipe.Web SSE wire, the Webview IPC
@@ -10,6 +10,7 @@ pub mod diff;
 pub use diff::*;
 pub mod dispatch;
 pub use dispatch::*;
+pub mod focus;
 // `form.rs` decodes typed form records through `serde_urlencoded`. Its consumers
 // are the render hosts — the Live web wire (`web::mod`), the browser-WASM sink
 // (`wasm::mod`), and the native webview bridge — all of which select the

@@ -2256,17 +2256,6 @@ fn rewrite_runtime_paths_for_dep(src: &str) -> String {
     src.replace("crate::ipe_runtime::", "ipe_runtime::")
 }
 
-/// The shell's `Content-Security-Policy` `<meta>` element.
-///
-/// The policy's sources are fixed keywords and parsed origins, whose bytes are
-/// `[a-z0-9.:/-]`, so the attribute value needs no escaping.
-fn shell_policy_meta(servers: &ServerOrigins, worker: BundleWorker) -> String {
-    let mut meta = String::from("<meta http-equiv=\"Content-Security-Policy\" content=\"");
-    meta.push_str(&ContentSecurityPolicy::bundle(servers, worker).header_value());
-    meta.push_str("\">\n");
-    meta
-}
-
 /// The wasm files shared by both emit models: the target-scoped `.cargo/config`
 /// (so a host mold/native-linker `build.rustflags` cannot leak into the wasm32
 /// link), the static browser shell (`index.html` + `boot.js`) and the
@@ -2315,7 +2304,7 @@ fn insert_wasm_shared_files(
         "<!doctype html>\n<html>\n<head>\n<meta charset=\"utf-8\">\n\
          <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n"
             .to_owned()
-            + &shell_policy_meta(servers, worker)
+            + &ContentSecurityPolicy::bundle(servers, worker).meta_element()
             + "<title>Ip\u{ea} App</title>\n</head>\n<body>\n"
             + &shell_port_glue_script(
                 &base.url_of(&glue),
@@ -7023,7 +7012,9 @@ mod wasm_shell_tests {
         let value = shell_policy(&servers, BundleWorker::None)?;
         assert_eq!(
             value,
-            ContentSecurityPolicy::bundle(&servers, BundleWorker::None).header_value()
+            ipe_runtime_rust::escape::html_attr(
+                &ContentSecurityPolicy::bundle(&servers, BundleWorker::None).header_value()
+            )
         );
         let named: Vec<&str> = value
             .split([' ', ';'])
@@ -7042,8 +7033,10 @@ mod wasm_shell_tests {
         assert!(!offline.contains("://"), "{offline}");
         assert_eq!(
             offline,
-            ContentSecurityPolicy::bundle(&ServerOrigins::none(), BundleWorker::None)
-                .header_value()
+            ipe_runtime_rust::escape::html_attr(
+                &ContentSecurityPolicy::bundle(&ServerOrigins::none(), BundleWorker::None)
+                    .header_value()
+            )
         );
         Ok(())
     }
@@ -7053,7 +7046,7 @@ mod wasm_shell_tests {
     #[test]
     fn shell_policy_names_a_worker_only_for_push() -> Result<(), String> {
         let push = shell_policy(&ServerOrigins::none(), BundleWorker::Push)?;
-        assert!(push.ends_with("; worker-src 'self'"), "{push}");
+        assert!(push.ends_with("; worker-src &#39;self&#39;"), "{push}");
         let plain = shell_policy(&ServerOrigins::none(), BundleWorker::None)?;
         assert!(!plain.contains("worker-src"), "{plain}");
         Ok(())

@@ -1,6 +1,6 @@
 //! Browser-run proof that the wasm client's markup paths never let a rendered
-//! `autofocus` reach the live DOM, and parse markup in its container's own
-//! context. The browser focuses an `autofocus` element on insertion while focus
+//! `autofocus` reach the live DOM, parse markup in its container's own
+//! context, and keep focus after a frame by the view, never by the patch. The browser focuses an `autofocus` element on insertion while focus
 //! is on the body, so a render the user did not cause would move focus; the
 //! runtime strips the attribute from the detached parse and moves focus itself,
 //! at first paint only while the load's own autofocus is due. Real Chromium
@@ -16,8 +16,12 @@
 
 #![cfg(all(target_arch = "wasm32", feature = "wasm-client"))]
 
-use ipe_runtime_rust::dom::diff::AUTOFOCUS_SPENT_GLOBAL;
-use ipe_runtime_rust::wasm::{paint_first, replace_children_html, write_patched_attr};
+use std::collections::HashMap;
+
+use ipe_runtime_rust::dom::diff::{AUTOFOCUS_SPENT_GLOBAL, Patch};
+use ipe_runtime_rust::wasm::{
+    QueuedCause, apply_frame, paint_first, replace_children_html, write_patched_attr,
+};
 use wasm_bindgen::JsCast;
 use wasm_bindgen_test::*;
 
@@ -259,4 +263,143 @@ fn a_patched_attribute_keeps_the_frame_rule_on_a_live_node() {
     assert!(!embed.has_attribute("src"));
     assert_eq!(embed.get_attribute("title").as_deref(), Some("kept"));
     root.remove();
+}
+
+/// A fresh view root stamped `id` holding `markup`, below the body as the
+/// wasm mount's own view root sits.
+fn view(document: &web_sys::Document, id: &str, markup: &str) -> Option<web_sys::HtmlElement> {
+    let root = fresh(document, "div")?;
+    root.set_attribute("ipe-id", id).ok()?;
+    root.set_inner_html(markup);
+    Some(root)
+}
+
+/// Focuses the element `id` below `document`; whether it took focus.
+fn focus_on(document: &web_sys::Document, id: &str) -> bool {
+    document
+        .get_element_by_id(id)
+        .and_then(|el| el.dyn_into::<web_sys::HtmlElement>().ok())
+        .is_some_and(|el| el.focus().is_ok())
+        && focused_id(document) == id
+}
+
+/// A patch of the element stamped `id`.
+fn patch(id: &str, html: Option<&str>, attrs: &[(&str, Option<&str>)]) -> Patch {
+    Patch {
+        id: id.into(),
+        text: None,
+        html: html.map(str::to_string),
+        attrs: attrs
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), v.map(str::to_string)))
+            .collect::<HashMap<_, _>>(),
+    }
+}
+
+/// Resolves after `n` animation frames; a stalled frame resolves on a timeout.
+async fn frames(n: u32) {
+    for _ in 0..n {
+        let tick = js_sys::Promise::new(&mut |resolve: js_sys::Function, _reject| {
+            if let Some(window) = web_sys::window() {
+                let _ = window.request_animation_frame(&resolve);
+                let _ = window.set_timeout_with_callback_and_timeout_and_arguments_0(&resolve, 500);
+            } else {
+                let _ = resolve.call0(&wasm_bindgen::JsValue::NULL);
+            }
+        });
+        let _ = wasm_bindgen_futures::JsFuture::from(tick).await;
+    }
+}
+
+#[wasm_bindgen_test]
+async fn a_swap_that_drops_focus_lands_on_the_nearest_stamped_host() {
+    let doc = document();
+    assert!(doc.is_some(), "run_in_browser must provide a document");
+    let Some(doc) = doc else { return };
+    let root = view(
+        &doc,
+        "fks",
+        r#"<div ipe-id="fks_0_div" id="fks-host" tabindex="-1"><button ipe-id="fks_0_div_0_button" id="fks-old">x</button></div>"#,
+    );
+    assert!(root.is_some(), "the view must attach");
+    let Some(root) = root else { return };
+    assert!(focus_on(&doc, "fks-old"));
+    let swap = [patch(
+        "fks_0_div",
+        Some(r#"<p ipe-id="fks_0_div_0_p">y</p>"#),
+        &[],
+    )];
+    apply_frame(&doc, &swap, None, &QueuedCause::default());
+    assert_eq!(focused_id(&doc), "fks-host");
+    frames(3).await;
+    assert_eq!(focused_id(&doc), "fks-host");
+    root.remove();
+}
+
+#[wasm_bindgen_test]
+async fn an_in_place_untab_lands_on_the_ancestor_at_the_deferred_check() {
+    let doc = document();
+    assert!(doc.is_some(), "run_in_browser must provide a document");
+    let Some(doc) = doc else { return };
+    let root = view(
+        &doc,
+        "fku",
+        r#"<div ipe-id="fku_0_div" id="fku-host" tabindex="-1"><div ipe-id="fku_0_div_0_div" id="fku-row" tabindex="0">row</div></div>"#,
+    );
+    assert!(root.is_some(), "the view must attach");
+    let Some(root) = root else { return };
+    assert!(focus_on(&doc, "fku-row"));
+    let untab = [patch("fku_0_div_0_div", None, &[("tabindex", None)])];
+    apply_frame(&doc, &untab, None, &QueuedCause::default());
+    frames(3).await;
+    assert_eq!(focused_id(&doc), "fku-host");
+    root.remove();
+}
+
+#[wasm_bindgen_test]
+async fn focus_the_user_placed_elsewhere_is_never_taken() {
+    let doc = document();
+    assert!(doc.is_some(), "run_in_browser must provide a document");
+    let Some(doc) = doc else { return };
+    let root = view(
+        &doc,
+        "fke",
+        r#"<div ipe-id="fke_0_div" id="fke-host" tabindex="-1"><div ipe-id="fke_0_div_0_div" id="fke-row" tabindex="0">row</div></div>"#,
+    );
+    let held = fresh(&doc, "input");
+    assert!(root.is_some() && held.is_some(), "the elements must attach");
+    let (Some(root), Some(held)) = (root, held) else {
+        return;
+    };
+    held.set_id("fke-held");
+    assert!(focus_on(&doc, "fke-row"));
+    let untab = [patch("fke_0_div_0_div", None, &[("tabindex", None)])];
+    apply_frame(&doc, &untab, None, &QueuedCause::default());
+    // The user moves focus out of the view before the deferred check.
+    assert!(focus_on(&doc, "fke-held"));
+    frames(3).await;
+    assert_eq!(focused_id(&doc), "fke-held");
+    root.remove();
+    held.remove();
+}
+
+#[wasm_bindgen_test]
+async fn focus_in_the_overlay_records_nothing() {
+    let doc = document();
+    assert!(doc.is_some(), "run_in_browser must provide a document");
+    let Some(doc) = doc else { return };
+    // An unstamped sibling of the view, as the debugger overlay is.
+    let overlay = fresh(&doc, "div");
+    assert!(overlay.is_some(), "the overlay must attach");
+    let Some(overlay) = overlay else { return };
+    overlay.set_inner_html(
+        r#"<div ipe-id="fko_0_div" id="fko-host" tabindex="-1"><button ipe-id="fko_0_div_0_button" id="fko-btn">x</button></div>"#,
+    );
+    assert!(focus_on(&doc, "fko-btn"));
+    let swap = [patch("fko_0_div", Some("<p>y</p>"), &[])];
+    apply_frame(&doc, &swap, None, &QueuedCause::default());
+    assert_eq!(focused_id(&doc), "");
+    frames(3).await;
+    assert_eq!(focused_id(&doc), "");
+    overlay.remove();
 }

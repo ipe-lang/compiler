@@ -40,6 +40,11 @@ module Main exposing (main)
 -- A query holding `frame` makes the first tick add two frames of the fixture's
 -- own root, which carries `autofocus`: `frame`, built with `Html.iframe`, and
 -- `rawframe`, inside `Ipe.Html.Unsafe.unsafeRaw` markup.
+-- The focusable column `keephost` holds three controls, each made unfocusable
+-- by an attribute written in place on it: `F7` drops `untab`'s `tabindex`,
+-- clicking `disableself` disables it and clicking `hideself` gives it
+-- `hidden`. `F6` drops `untab`'s `tabindex` and adds a row after it in the
+-- same render, so the client swaps `keephost`'s children instead.
 --
 -- Co-located, no JS ports; `rawframe` is why the package accepts `Unsafe`.
 
@@ -83,6 +88,10 @@ type alias Model =
     , hoverAsk : Bool
     , framing : Bool
     , framed : Bool
+    , untabbed : Bool
+    , selfDisabled : Bool
+    , selfHidden : Bool
+    , keepRow : Bool
     }
 
 
@@ -102,12 +111,14 @@ type Msg
     | Picked String
     | Focused
     | Hovered
+    | DisableSelf
+    | HideSelf
     | NoOp
 
 
 init : WebReq -> ( Model, Cmd.Cmd Msg )
 init req =
-    ( { keys = "", row = False, drop = True, note = "", swapped = False, pressed = False, deep = False, tagSwapped = False, hostRow = False, formDrop = True, mathRow = False, ask = False, answer = "", ticking = String.contains "tick" req.query, subAsk = False, loadAuto = not (String.contains "noauto" req.query), picked = False, flag = False, tableRow = False, shifting = False, shifted = False, focusAsk = False, hovering = False, hoverShift = False, hoverAsk = False, framing = String.contains "frame" req.query, framed = False }, Cmd.none )
+    ( { keys = "", row = False, drop = True, note = "", swapped = False, pressed = False, deep = False, tagSwapped = False, hostRow = False, formDrop = True, mathRow = False, ask = False, answer = "", ticking = String.contains "tick" req.query, subAsk = False, loadAuto = not (String.contains "noauto" req.query), picked = False, flag = False, tableRow = False, shifting = False, shifted = False, focusAsk = False, hovering = False, hoverShift = False, hoverAsk = False, framing = String.contains "frame" req.query, framed = False, untabbed = False, selfDisabled = False, selfHidden = False, keepRow = False }, Cmd.none )
 
 
 update : Msg -> Model -> ( Model, Cmd.Cmd Msg )
@@ -137,6 +148,12 @@ update msg model =
 
             else if key == "F5" then
                 ( { model | keys = key, hovering = True }, Cmd.none )
+
+            else if key == "F6" then
+                ( { model | keys = key, untabbed = True, keepRow = True }, Cmd.none )
+
+            else if key == "F7" then
+                ( { model | keys = key, untabbed = True }, Cmd.none )
 
             else
                 ( { model | keys = key }, Cmd.none )
@@ -192,6 +209,12 @@ update msg model =
 
         Hovered ->
             ( { model | hoverAsk = model.hoverAsk || model.hoverShift }, Cmd.none )
+
+        DisableSelf ->
+            ( { model | selfDisabled = True }, Cmd.none )
+
+        HideSelf ->
+            ( { model | selfHidden = True }, Cmd.none )
 
         NoOp ->
             ( model, Cmd.none )
@@ -487,6 +510,61 @@ frames on =
         []
 
 
+-- `untab`'s `tabindex` until `F6` or `F7`.
+untabAttrs : Bool -> List (Ui.Attribute Msg)
+untabAttrs untabbed =
+    if untabbed then
+        []
+
+    else
+        [ Ui.htmlAttribute "tabindex" "0" ]
+
+
+-- `hideself`'s `hidden` once it is clicked.
+hiddenAttrs : Bool -> List (Ui.Attribute Msg)
+hiddenAttrs hidden =
+    if hidden then
+        [ Ui.htmlAttribute "hidden" "" ]
+
+    else
+        []
+
+
+-- What `disableself` sends while it is enabled.
+disablePress : Bool -> Maybe Msg
+disablePress disabled =
+    if disabled then
+        Nothing
+
+    else
+        Just DisableSelf
+
+
+-- The row `F6` adds after `keephost`'s controls.
+keepRow : Bool -> List (Ui.Element Msg)
+keepRow on =
+    if on then
+        [ Ui.el [ Ui.id "keeprow" ] (Ui.text "keep row") ]
+
+    else
+        []
+
+
+-- The focusable column whose controls each become unfocusable in place.
+keepHost : Model -> Ui.Element Msg
+keepHost model =
+    Ui.column
+        [ Ui.id "keephost", Ui.htmlAttribute "tabindex" "-1" ]
+        ([ Ui.el (Ui.id "untab" :: untabAttrs model.untabbed) (Ui.text "untab")
+         , Ui.button [ Ui.id "disableself" ] { onPress = disablePress model.selfDisabled, label = Ui.text "disable" }
+         , Ui.el
+            ([ Ui.id "hideself", Ui.htmlAttribute "tabindex" "0", Ui.onClick HideSelf ] ++ hiddenAttrs model.selfHidden)
+            (Ui.text "hide")
+         ]
+            ++ keepRow model.keepRow
+        )
+
+
 -- The root's `autofocus` unless the page loaded with `noauto`.
 rootAutofocus : Model -> List (Ui.Attribute Msg)
 rootAutofocus model =
@@ -590,6 +668,7 @@ view model =
             )
         , Ui.column [ Ui.id "hoveraskhost" ] (askPanel model.hoverAsk "hoverask" model)
         , Ui.column [ Ui.id "framehost" ] (frames model.framed)
+        , keepHost model
         ]
 
 

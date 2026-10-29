@@ -110,6 +110,16 @@ attribute never reaches the live page from a later render, so the browser's
 own focus-on-insertion never fires, and a CSS `[autofocus]` selector matches
 at most the page as loaded.
 
+**Focus across a render.** Where focus ends after a render depends on the view,
+never on how the runtime changed the page. When a render leaves focus on the
+page body (the focused control is gone, or became disabled, hidden or
+untabbable), the runtime puts focus on the nearest enclosing element of the
+new view that takes focus, else on the view's root, so a key handler on an
+ancestor keeps receiving keys. It checks once the render lands and again two
+animation frames later, after the browser has dropped focus from a control a
+render made unfocusable. It never moves focus the user moved after the render,
+focus a newer render owns, or focus outside the view.
+
 **Frames.** A framed document never shares the app's origin, so it cannot
 reach the page, its storage, or its session. Every `Html.iframe` is sandboxed:
 the runtime paints `sandbox` on it at every render and patch, keeping only the

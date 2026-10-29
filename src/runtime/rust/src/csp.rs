@@ -25,6 +25,49 @@ use crate::debugger::server::OVERLAY_JS;
 #[cfg(feature = "web")]
 use crate::web_page_core::{BASE_CSS, STATUS_CSS};
 
+/// The response header, and the `<meta http-equiv>` name, a policy travels in.
+pub const HEADER_NAME: &str = "Content-Security-Policy";
+
+/// Expands to the Android asset host literal, so the host and the origin
+/// built from it are one spelling.
+macro_rules! android_asset_host {
+    () => {
+        "appassets.androidplatform.net"
+    };
+}
+
+/// The host `WebViewAssetLoader` serves a packaged Android bundle from.
+pub const ANDROID_ASSET_HOST: &str = android_asset_host!();
+
+/// The page origin of a packaged Android bundle.
+///
+/// It is a public `https` host name the shell answers locally.
+pub const ANDROID_ASSET_ORIGIN: &str = concat!("https://", android_asset_host!());
+
+/// The page origin of a packaged iOS bundle.
+///
+/// The shell's custom URL scheme handler serves it.
+pub const IOS_SCHEME_ORIGIN: &str = "ipe-app://app";
+
+/// The host that serves a static browser bundle's page.
+///
+/// Closed: a new host is a new variant, and every exhaustive match then
+/// decides its local `connect-src` token.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BundleHost {
+    /// A web server serving the bundle under its own origin.
+    Served,
+    /// The Android shell, serving the bundle from [`ANDROID_ASSET_ORIGIN`].
+    AndroidAssets,
+    /// The iOS shell, serving the bundle from [`IOS_SCHEME_ORIGIN`].
+    IosScheme,
+}
+
+impl BundleHost {
+    /// Every host, in declaration order.
+    pub const ALL: [Self; 3] = [Self::Served, Self::AndroidAssets, Self::IosScheme];
+}
+
 /// A policy directive the runtime emits.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Directive {
@@ -208,6 +251,9 @@ pub enum Source<'a> {
     Nonce(&'a StyleNonce),
     /// `'wasm-unsafe-eval'`: WebAssembly compilation, never an `eval` of text.
     WasmUnsafeEval,
+    /// [`ANDROID_ASSET_ORIGIN`], the Android shell's page origin, named
+    /// explicitly so its `wss` twin is not admitted.
+    AssetOrigin,
     /// One parsed server origin in its `https` form.
     #[cfg(feature = "encoding")]
     Origin(&'a ServerOrigin),
@@ -228,6 +274,7 @@ impl Source<'_> {
             Self::Hash(hash) => hash.as_str(),
             Self::Embed(framing) => framing.sources(),
             Self::WasmUnsafeEval => "'wasm-unsafe-eval'",
+            Self::AssetOrigin => ANDROID_ASSET_ORIGIN,
             Self::Nonce(nonce) => {
                 out.push_str("'nonce-");
                 nonce.write_token(out);
@@ -257,6 +304,164 @@ pub enum BundleWorker {
     /// The program reaches `Ipe.Browser.Push`, whose same-origin worker
     /// receives the push messages.
     Push,
+}
+
+/// One `connect-src` source a bundle may reach.
+///
+/// Closed: it has no wildcard, scheme-only, `http`, `ws`, `data`, `blob` or
+/// `'unsafe-*'` form, so no bundle policy can name one.
+#[cfg(feature = "encoding")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ConnectSource<'a> {
+    /// `'self'`: the page origin, under a host whose origin has no public
+    /// `wss` twin.
+    SelfOrigin,
+    /// [`ANDROID_ASSET_ORIGIN`], named explicitly.
+    AndroidAssets,
+    /// A pinned server origin in its `https` form.
+    Https(&'a ServerOrigin),
+    /// A pinned server origin in its `wss` form.
+    Wss(&'a ServerOrigin),
+}
+
+#[cfg(feature = "encoding")]
+impl<'a> ConnectSource<'a> {
+    /// The policy source the connect source is written as.
+    #[must_use]
+    pub const fn source(self) -> Source<'a> {
+        match self {
+            Self::SelfOrigin => Source::SelfOrigin,
+            Self::AndroidAssets => Source::AssetOrigin,
+            Self::Https(origin) => Source::Origin(origin),
+            Self::Wss(origin) => Source::WsOrigin(origin),
+        }
+    }
+}
+
+/// Why a bundle's reach was refused.
+#[cfg(feature = "encoding")]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ReachRefusal {
+    /// A server names the Android asset host, which the shell answers
+    /// locally, so the local origin and a network origin would be one.
+    LocalOriginListed {
+        /// The refused server origin.
+        origin: ServerOrigin,
+    },
+}
+
+#[cfg(feature = "encoding")]
+impl std::fmt::Display for ReachRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::LocalOriginListed { origin } => write!(
+                f,
+                "server origin {} names the Android shell's local asset host",
+                origin.https()
+            ),
+        }
+    }
+}
+
+#[cfg(feature = "encoding")]
+impl std::error::Error for ReachRefusal {}
+
+/// What a bundle on one host may reach.
+///
+/// That is its local origin and the pinned servers' `https` and `wss` forms.
+/// Built only by [`BundleReach::new`] or [`BundleReach::served`], it is the
+/// one input to a bundle's `connect-src`.
+#[cfg(feature = "encoding")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BundleReach<'a> {
+    host: BundleHost,
+    servers: &'a ServerOrigins,
+}
+
+#[cfg(feature = "encoding")]
+impl<'a> BundleReach<'a> {
+    /// The reach of a bundle on `host` pinned to `servers`.
+    ///
+    /// # Errors
+    ///
+    /// `LocalOriginListed` when `host` is [`BundleHost::AndroidAssets`] and a
+    /// server's host is [`ANDROID_ASSET_HOST`], at any port. Under every other
+    /// host the reach is always built.
+    pub fn new(host: BundleHost, servers: &'a ServerOrigins) -> Result<Self, ReachRefusal> {
+        match host {
+            BundleHost::Served | BundleHost::IosScheme => {}
+            BundleHost::AndroidAssets => {
+                if let Some(origin) = servers
+                    .origins()
+                    .find(|origin| names_asset_host(origin.authority()))
+                {
+                    return Err(ReachRefusal::LocalOriginListed {
+                        origin: origin.clone(),
+                    });
+                }
+            }
+        }
+        Ok(Self { host, servers })
+    }
+
+    /// The reach of a bundle a web server serves, pinned to `servers`.
+    #[must_use]
+    pub const fn served(servers: &'a ServerOrigins) -> Self {
+        Self {
+            host: BundleHost::Served,
+            servers,
+        }
+    }
+
+    /// The host the bundle is served from.
+    #[must_use]
+    pub const fn host(&self) -> BundleHost {
+        self.host
+    }
+
+    /// The local `connect-src` token of the host.
+    const fn local(&self) -> ConnectSource<'a> {
+        match self.host {
+            BundleHost::Served | BundleHost::IosScheme => ConnectSource::SelfOrigin,
+            BundleHost::AndroidAssets => ConnectSource::AndroidAssets,
+        }
+    }
+
+    /// The `connect-src` sources, local token first.
+    ///
+    /// Each server's `https` then `wss` form follows, in the servers' order.
+    #[must_use = "the iterator is lazy"]
+    pub fn connect_sources(&self) -> impl Iterator<Item = ConnectSource<'a>> {
+        std::iter::once(self.local()).chain(
+            self.servers
+                .origins()
+                .flat_map(|origin| [ConnectSource::Https(origin), ConnectSource::Wss(origin)]),
+        )
+    }
+
+    /// The pinned server origins: the one list a shell's request gate reads.
+    #[must_use = "the iterator is lazy"]
+    pub fn network_origins(&self) -> impl Iterator<Item = &'a ServerOrigin> {
+        self.servers.origins()
+    }
+}
+
+/// Whether `authority` names [`ANDROID_ASSET_HOST`], at any port.
+///
+/// It drops any `user@` and `:port`, one trailing `.`, and ASCII case: the
+/// spellings a resolver reads as the same host. [`ServerOrigin::parse`]
+/// already refuses each, so this holds without trusting that it does.
+#[cfg(feature = "encoding")]
+fn names_asset_host(authority: &str) -> bool {
+    let host_port = authority
+        .rsplit_once('@')
+        .map_or(authority, |(_, host_port)| host_port);
+    let host = host_port
+        .split_once(':')
+        .map_or(host_port, |(host, _)| host);
+    host.strip_suffix('.')
+        .unwrap_or(host)
+        .eq_ignore_ascii_case(ANDROID_ASSET_HOST)
 }
 
 /// Declares [`Profile`] and [`Profile::ALL`] from one variant list.
@@ -447,24 +652,27 @@ impl<'a> ContentSecurityPolicy<'a> {
         }
     }
 
-    /// The policy a static browser bundle's shell carries in its `<meta>`.
+    /// The policy a static browser bundle a web server serves carries.
     ///
-    /// The bundle loads its own script, styles and WebAssembly; it reaches
-    /// its own origin and, per entry of `servers`, that origin's `https` and
-    /// `wss` forms; and, when `worker` is [`BundleWorker::Push`], it registers
-    /// a same-origin service worker. An empty `servers` is an offline bundle.
+    /// It is [`Self::for_bundle`] of [`BundleReach::served`] of `servers`.
     #[cfg(feature = "encoding")]
     #[must_use]
     pub fn bundle(servers: &'a ServerOrigins, worker: BundleWorker) -> Self {
+        Self::for_bundle(&BundleReach::served(servers), worker)
+    }
+
+    /// The policy of a static browser bundle with `reach`.
+    ///
+    /// The bundle loads its own script, styles and WebAssembly; its
+    /// `connect-src` is exactly `reach`'s connect sources; and, when `worker`
+    /// is [`BundleWorker::Push`], it registers a same-origin service worker.
+    /// An empty server list is an offline bundle.
+    #[cfg(feature = "encoding")]
+    #[must_use]
+    pub fn for_bundle(reach: &BundleReach<'a>, worker: BundleWorker) -> Self {
         use Directive as D;
         use Source as S;
-        let reachable = std::iter::once(S::SelfOrigin)
-            .chain(
-                servers
-                    .origins()
-                    .flat_map(|origin| [S::Origin(origin), S::WsOrigin(origin)]),
-            )
-            .collect();
+        let reachable = reach.connect_sources().map(ConnectSource::source).collect();
         let policy = Self::default()
             .with(D::DefaultSrc, vec![S::SelfOrigin])
             .with(D::ScriptSrc, vec![S::SelfOrigin, S::WasmUnsafeEval])
@@ -577,6 +785,23 @@ impl<'a> ContentSecurityPolicy<'a> {
             .map(|(d, sources)| (*d, sources.as_slice()))
     }
 
+    /// The policy as a newline-terminated `<meta http-equiv>` element.
+    ///
+    /// A bundle policy's bytes are `[a-z0-9.:/'-]`, space and `;`, which need
+    /// no escaping; an `&`, `"`, `<` or `>` another policy holds is escaped,
+    /// so no value can close the attribute.
+    #[must_use]
+    pub fn meta_element(&self) -> String {
+        let value = self.header_value();
+        let mut out = String::with_capacity(value.len().saturating_add(48));
+        out.push_str("<meta http-equiv=\"");
+        out.push_str(HEADER_NAME);
+        out.push_str("\" content=\"");
+        crate::escape::html_attr_into(&value, &mut out);
+        out.push_str("\">\n");
+        out
+    }
+
     /// The header value: `name source…` directives joined by `"; "`.
     #[must_use]
     pub fn header_value(&self) -> String {
@@ -595,7 +820,8 @@ impl<'a> ContentSecurityPolicy<'a> {
     }
 }
 
-#[cfg(all(test, not(target_arch = "wasm32")))]
+#[cfg(test)]
+#[cfg(not(target_arch = "wasm32"))]
 mod tests {
     use super::*;
 
@@ -1091,5 +1317,273 @@ mod bundle_tests {
             Some([Source::SelfOrigin].as_slice())
         );
         assert_eq!(push.header_value(), format!("{OFFLINE}; worker-src 'self'"));
+    }
+
+    #[allow(clippy::expect_used)] // the origin is well-formed
+    fn one() -> ServerOrigins {
+        ServerOrigins::new([ServerOrigin::parse("https://api.example").expect("origin")])
+            .expect("one origin")
+    }
+
+    /// The server lists every reach test walks: none, one, two with a port.
+    fn server_lists() -> [ServerOrigins; 3] {
+        [ServerOrigins::none(), one(), two()]
+    }
+
+    /// The reach of `host` over `servers`, built through the refusing
+    /// constructor.
+    #[allow(clippy::expect_used)] // no list here names the asset host
+    fn reach(host: BundleHost, servers: &ServerOrigins) -> BundleReach<'_> {
+        BundleReach::new(host, servers).expect("reach")
+    }
+
+    /// The `connect-src` tokens of a rendered header value, split at the
+    /// directive and token boundaries.
+    fn connect_tokens(value: &str) -> Vec<&str> {
+        value
+            .split(';')
+            .map(str::trim)
+            .find_map(|directive| directive.strip_prefix("connect-src "))
+            .map_or_else(Vec::new, |rest| rest.split(' ').collect())
+    }
+
+    /// The local token each host's `connect-src` must open with.
+    const fn local_token(host: BundleHost) -> &'static str {
+        match host {
+            BundleHost::Served | BundleHost::IosScheme => "'self'",
+            BundleHost::AndroidAssets => "https://appassets.androidplatform.net",
+        }
+    }
+
+    /// The runtime-owned origins and header name are the shells' spellings.
+    #[test]
+    fn host_constants_are_the_shell_spellings() {
+        assert_eq!(ANDROID_ASSET_HOST, "appassets.androidplatform.net");
+        assert_eq!(
+            ANDROID_ASSET_ORIGIN,
+            format!("https://{ANDROID_ASSET_HOST}")
+        );
+        assert_eq!(IOS_SCHEME_ORIGIN, "ipe-app://app");
+        assert_eq!(HEADER_NAME, "Content-Security-Policy");
+        assert_eq!(BundleHost::ALL.len(), 3);
+        for (i, h) in BundleHost::ALL.iter().enumerate() {
+            assert_eq!(
+                BundleHost::ALL.iter().position(|g| g == h),
+                Some(i),
+                "{h:?}"
+            );
+        }
+    }
+
+    /// R1: under the Android shell `connect-src` names the asset origin
+    /// explicitly and never `'self'`, whose `wss` twin is a public host.
+    #[test]
+    fn android_connect_src_names_the_asset_origin_not_self() {
+        for servers in &server_lists() {
+            for worker in [BundleWorker::None, BundleWorker::Push] {
+                let value = ContentSecurityPolicy::for_bundle(
+                    &reach(BundleHost::AndroidAssets, servers),
+                    worker,
+                )
+                .header_value();
+                let tokens = connect_tokens(&value);
+                assert_eq!(tokens.first(), Some(&ANDROID_ASSET_ORIGIN), "{value}");
+                assert!(!tokens.contains(&"'self'"), "{value}");
+                assert!(
+                    !tokens.contains(&"wss://appassets.androidplatform.net"),
+                    "{value}"
+                );
+            }
+        }
+    }
+
+    /// R2: every `connect-src` token is the host's local token or a listed
+    /// origin's `https` or `wss` form, each listed origin's two forms both
+    /// appear, and no token is a wildcard, a bare scheme or an unsafe keyword.
+    #[test]
+    fn connect_src_is_exactly_local_plus_listed_twins() {
+        for host in BundleHost::ALL {
+            for servers in &server_lists() {
+                let bundle_reach = reach(host, servers);
+                assert_eq!(bundle_reach.host(), host);
+                let policy = ContentSecurityPolicy::for_bundle(&bundle_reach, BundleWorker::Push);
+                let value = policy.header_value();
+                let tokens = connect_tokens(&value);
+                let mut want = vec![local_token(host).to_owned()];
+                for origin in servers.origins() {
+                    want.push(format!("https://{}", origin.authority()));
+                    want.push(format!("wss://{}", origin.authority()));
+                }
+                assert_eq!(tokens, want, "{host:?}: {value}");
+                let listed: Vec<String> = bundle_reach
+                    .network_origins()
+                    .map(ServerOrigin::https)
+                    .collect();
+                let expected: Vec<String> = servers.origins().map(ServerOrigin::https).collect();
+                assert_eq!(listed, expected, "{host:?}");
+                for token in &tokens {
+                    for banned in [
+                        "*", "http:", "ws:", "data:", "blob:", "http://", "ws://", "'unsafe-",
+                    ] {
+                        assert!(!token.starts_with(banned), "{host:?} admits {token}");
+                    }
+                    assert!(
+                        !matches!(*token, "https:" | "wss:"),
+                        "{host:?} admits {token}"
+                    );
+                    assert!(!token.contains('*'), "{host:?} admits {token}");
+                }
+                assert!(
+                    value.bytes().all(|b| matches!(
+                        b,
+                        b'a'..=b'z' | b'0'..=b'9' | b'.' | b':' | b'/' | b'\'' | b'-' | b' ' | b';'
+                    )),
+                    "{value}"
+                );
+                assert_eq!(
+                    policy.meta_element(),
+                    format!(
+                        "<meta http-equiv=\"Content-Security-Policy\" content=\"{}\">\n",
+                        crate::escape::html_attr(&value)
+                    )
+                );
+            }
+        }
+    }
+
+    /// R3: the served bundle's policy is byte-identical through `bundle` and
+    /// through `for_bundle` of either served constructor.
+    #[test]
+    fn served_bundle_bytes_are_unchanged() {
+        let servers = two();
+        let push = ContentSecurityPolicy::bundle(&servers, BundleWorker::Push).header_value();
+        assert_eq!(
+            push,
+            "default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; \
+             style-src 'self' 'unsafe-inline'; connect-src 'self' \
+             https://api.example wss://api.example \
+             https://media.example:8443 wss://media.example:8443; worker-src 'self'"
+        );
+        for servers in &server_lists() {
+            for worker in [BundleWorker::None, BundleWorker::Push] {
+                let bundled = ContentSecurityPolicy::bundle(servers, worker);
+                assert_eq!(
+                    bundled,
+                    ContentSecurityPolicy::for_bundle(&BundleReach::served(servers), worker)
+                );
+                assert_eq!(
+                    bundled,
+                    ContentSecurityPolicy::for_bundle(&reach(BundleHost::Served, servers), worker)
+                );
+            }
+        }
+        let none = ServerOrigins::none();
+        assert_eq!(
+            ContentSecurityPolicy::bundle(&none, BundleWorker::None).meta_element(),
+            format!(
+                "<meta http-equiv=\"Content-Security-Policy\" content=\"{}\">\n",
+                crate::escape::html_attr(OFFLINE)
+            )
+        );
+    }
+
+    /// R4: the Android reach refuses a server on the asset host at any port,
+    /// admits a look-alike host, and the other hosts admit the same list.
+    #[test]
+    #[allow(clippy::expect_used)] // every origin here is well-formed
+    fn android_reach_refuses_the_asset_host_at_any_port() {
+        let parse = |text: &str| ServerOrigin::parse(text).expect("origin");
+        for refused in [
+            "https://appassets.androidplatform.net",
+            "https://appassets.androidplatform.net:8443",
+        ] {
+            let origin = parse(refused);
+            let servers =
+                ServerOrigins::new([parse("https://api.example"), origin.clone()]).expect("list");
+            assert_eq!(
+                BundleReach::new(BundleHost::AndroidAssets, &servers),
+                Err(ReachRefusal::LocalOriginListed { origin }),
+                "{refused}"
+            );
+            for host in [BundleHost::Served, BundleHost::IosScheme] {
+                assert!(
+                    BundleReach::new(host, &servers).is_ok(),
+                    "{host:?} {refused}"
+                );
+            }
+        }
+        for admitted in [
+            "https://api.example",
+            "https://appassets.androidplatform.net.example",
+            "https://xappassets.androidplatform.net",
+        ] {
+            let servers = ServerOrigins::new([parse(admitted)]).expect("list");
+            for host in BundleHost::ALL {
+                assert!(
+                    BundleReach::new(host, &servers).is_ok(),
+                    "{host:?} {admitted}"
+                );
+            }
+        }
+    }
+
+    /// The meta element escapes every byte that could close its attribute.
+    #[test]
+    fn meta_element_cannot_close_its_attribute() {
+        let hostile = CspHash("'a\"b<c>d&e'".to_owned());
+        let meta = ContentSecurityPolicy::default()
+            .with(Directive::ScriptSrc, vec![Source::Hash(&hostile)])
+            .meta_element();
+        let content = meta
+            .strip_prefix("<meta http-equiv=\"Content-Security-Policy\" content=\"")
+            .and_then(|rest| rest.strip_suffix("\">\n"));
+        assert_eq!(
+            content,
+            Some(crate::escape::html_attr("script-src 'a\"b<c>d&e'").as_str()),
+            "{meta}"
+        );
+        assert!(
+            content.is_some_and(|value| !value.contains(['"', '\'', '<', '>'])),
+            "the value carries no character that ends the attribute or tag: {meta}"
+        );
+    }
+
+    /// The asset-host test reads every spelling a resolver equates with the
+    /// host, and the origin parser refuses each non-canonical one first.
+    #[test]
+    fn asset_host_spellings_cannot_slip_past_the_refusal() {
+        for named in [
+            "appassets.androidplatform.net",
+            "appassets.androidplatform.net:8443",
+            "APPASSETS.AndroidPlatform.NET",
+            "appassets.androidplatform.net.",
+            "appassets.androidplatform.net.:443",
+            "user@appassets.androidplatform.net",
+            "user:pass@appassets.androidplatform.net:1",
+        ] {
+            assert!(names_asset_host(named), "{named}");
+        }
+        for other in [
+            "appassets.androidplatform.net.example",
+            "xappassets.androidplatform.net",
+            "appassets.androidplatform.net..",
+            "appassets.androidplatform.net@api.example",
+            "api.example",
+            "",
+        ] {
+            assert!(!names_asset_host(other), "{other}");
+        }
+        for unparsed in [
+            "https://APPASSETS.androidplatform.net",
+            "https://appassets.androidplatform.net.",
+            "https://appassets.androidplatform.net.:8443",
+            "https://user@appassets.androidplatform.net",
+            "https://appassets.androidplatform.net:08443",
+            "https://appassets.androidplatform.net:443",
+            "https://appassets.androidplatform.net:",
+            "https://appassets.androidplatform.net:1:2",
+        ] {
+            assert!(ServerOrigin::parse(unparsed).is_err(), "{unparsed}");
+        }
     }
 }
