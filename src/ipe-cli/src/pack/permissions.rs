@@ -211,47 +211,24 @@ impl AndroidPermission {
         }
     }
 
+    /// The runtime request group the shell asks for this permission in, or
+    /// `None` for a permission the OS grants at install.
+    #[must_use]
+    pub const fn request_group(self) -> Option<RequestGroup> {
+        match self {
+            Self::AccessFineLocation | Self::AccessCoarseLocation => Some(RequestGroup::Location),
+            Self::PostNotifications => Some(RequestGroup::Notifications),
+            Self::RecordAudio => Some(RequestGroup::RecordAudio),
+            Self::Camera => Some(RequestGroup::Camera),
+            Self::Vibrate | Self::AccessNetworkState => None,
+        }
+    }
+
     /// Whether the shell asks for this permission at the moment of use, rather
     /// than the OS granting it at install.
     #[must_use]
     pub const fn is_runtime_requested(self) -> bool {
-        match self {
-            Self::AccessFineLocation
-            | Self::AccessCoarseLocation
-            | Self::PostNotifications
-            | Self::RecordAudio
-            | Self::Camera => true,
-            Self::Vibrate | Self::AccessNetworkState => false,
-        }
-    }
-
-    /// The stable request code the shell uses to ask for this permission at the
-    /// moment of use, or `None` for a permission the OS grants at install.
-    ///
-    /// The code is one plus the number of runtime-requested permissions before
-    /// this one in [`Self::ALL`], so permissions with distinct names never share
-    /// a code. A permission absent from [`Self::ALL`] has no code, and the
-    /// build-time agreement check below refuses a bridged row naming one.
-    #[must_use]
-    pub const fn runtime_request_code(self) -> Option<RequestCode> {
-        if !self.is_runtime_requested() {
-            return None;
-        }
-        let mut rest = Self::ALL;
-        let mut code: u16 = 1;
-        while let Some((candidate, tail)) = rest.split_first() {
-            if const_str_eq(candidate.name(), self.name()) {
-                return Some(RequestCode(code));
-            }
-            if candidate.is_runtime_requested() {
-                match code.checked_add(1) {
-                    Some(next) => code = next,
-                    None => return None,
-                }
-            }
-            rest = tail;
-        }
-        None
+        self.request_group().is_some()
     }
 }
 
@@ -281,13 +258,95 @@ impl RequestCode {
     }
 }
 
-/// One runtime permission request row: the permission and its stable code.
+/// One runtime permission request the shell makes at the moment of use.
+///
+/// Permissions the OS presents as one prompt share a group, so the shell asks
+/// for them in a single request: the precise and approximate location
+/// permissions are one group, never two requests racing each other.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug, Hash)]
-pub struct RuntimeRequest {
-    /// The permission requested at the moment of use.
-    pub permission: AndroidPermission,
+pub enum RequestGroup {
+    /// `ACCESS_FINE_LOCATION` and `ACCESS_COARSE_LOCATION`, asked together.
+    Location,
+    /// `POST_NOTIFICATIONS`, a runtime permission from API 33.
+    Notifications,
+    /// `RECORD_AUDIO`.
+    RecordAudio,
+    /// `CAMERA`.
+    Camera,
+}
+
+impl RequestGroup {
+    /// Every runtime request group, in request-code order.
+    pub const ALL: &'static [Self] = &[
+        Self::Location,
+        Self::Notifications,
+        Self::RecordAudio,
+        Self::Camera,
+    ];
+
+    /// The permissions the shell asks for in this group's one request.
+    #[must_use]
+    pub const fn permissions(self) -> &'static [AndroidPermission] {
+        match self {
+            Self::Location => &[
+                AndroidPermission::AccessFineLocation,
+                AndroidPermission::AccessCoarseLocation,
+            ],
+            Self::Notifications => &[AndroidPermission::PostNotifications],
+            Self::RecordAudio => &[AndroidPermission::RecordAudio],
+            Self::Camera => &[AndroidPermission::Camera],
+        }
+    }
+
+    /// The first API level at which the OS gates this group behind a runtime
+    /// request, or `None` when every supported level does.
+    ///
+    /// Below it the permission is granted at install and the shell asks nothing.
+    #[must_use]
+    pub const fn min_sdk(self) -> Option<u16> {
+        match self {
+            Self::Notifications => Some(33),
+            Self::Location | Self::RecordAudio | Self::Camera => None,
+        }
+    }
+
+    /// The stable request code the shell passes with this group's request.
+    #[must_use]
+    pub const fn code(self) -> RequestCode {
+        match self {
+            Self::Location => RequestCode(1),
+            Self::Notifications => RequestCode(2),
+            Self::RecordAudio => RequestCode(3),
+            Self::Camera => RequestCode(4),
+        }
+    }
+}
+
+/// One runtime permission request row: the group's permissions, its stable
+/// code and the API level from which it is asked.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
+pub struct RuntimeRequestGroup {
+    /// The group this row requests.
+    pub group: RequestGroup,
+    /// The permissions requested together at the moment of use.
+    pub permissions: &'static [AndroidPermission],
     /// The stable request code identifying the request.
     pub code: RequestCode,
+    /// The first API level at which the request is made, if not every one.
+    pub min_sdk: Option<u16>,
+}
+
+impl RuntimeRequestGroup {
+    /// The request row of `group`, read from the group's own table.
+    #[must_use]
+    pub const fn of(group: RequestGroup) -> Self {
+        Self {
+            group,
+            permissions: group.permissions(),
+            code: group.code(),
+            min_sdk: group.min_sdk(),
+        }
+    }
 }
 
 /// One Android manifest element derived for a web axis: a `<uses-permission>`.
@@ -523,13 +582,83 @@ const fn lists_permission(listed: &[AndroidPermission], permission: AndroidPermi
 }
 
 /// Whether the Android permission vocabulary `listed` names each permission
-/// once. Distinct names give distinct request codes by construction of
-/// [`AndroidPermission::runtime_request_code`].
+/// once.
 const fn android_permissions_agree(listed: &[AndroidPermission]) -> bool {
     let mut rest = listed;
     while let Some((permission, tail)) = rest.split_first() {
         if lists_permission(tail, *permission) {
             return false;
+        }
+        rest = tail;
+    }
+    true
+}
+
+/// Whether the request groups `groups` agree with the permission vocabulary.
+///
+/// Each group's code is its own; every permission a group lists names that
+/// group as its own; and every runtime-requested permission in `permissions`
+/// is listed by its group, so each one is asked in exactly one request.
+const fn request_groups_agree(groups: &[RequestGroup], permissions: &[AndroidPermission]) -> bool {
+    let mut rest = groups;
+    while let Some((group, tail)) = rest.split_first() {
+        let mut later = tail;
+        while let Some((other, more)) = later.split_first() {
+            if other.code().get() == group.code().get() {
+                return false;
+            }
+            later = more;
+        }
+        let mut members = group.permissions();
+        if members.is_empty() {
+            return false;
+        }
+        while let Some((member, more)) = members.split_first() {
+            match member.request_group() {
+                Some(own) if own.code().get() == group.code().get() => {}
+                Some(_) | None => return false,
+            }
+            members = more;
+        }
+        rest = tail;
+    }
+    let mut vocabulary = permissions;
+    while let Some((permission, tail)) = vocabulary.split_first() {
+        if let Some(group) = permission.request_group()
+            && (!lists_group(groups, group) || !lists_permission(group.permissions(), *permission))
+        {
+            return false;
+        }
+        vocabulary = tail;
+    }
+    true
+}
+
+/// Whether `group` appears in `groups`, compared by its request code.
+const fn lists_group(groups: &[RequestGroup], group: RequestGroup) -> bool {
+    let mut rest = groups;
+    while let Some((candidate, tail)) = rest.split_first() {
+        if candidate.code().get() == group.code().get() {
+            return true;
+        }
+        rest = tail;
+    }
+    false
+}
+
+/// Whether every permission in `android` brings the rest of its request group,
+/// so a derived set never holds part of a group the shell asks for as a whole.
+const fn names_whole_groups(android: &[AndroidPermission]) -> bool {
+    let mut rest = android;
+    while let Some((permission, tail)) = rest.split_first() {
+        if let Some(group) = permission.request_group() {
+            let mut members = group.permissions();
+            while let Some((member, more)) = members.split_first() {
+                if !lists_permission(android, *member) {
+                    return false;
+                }
+                members = more;
+            }
         }
         rest = tail;
     }
@@ -565,9 +694,10 @@ const fn plist_keys_agree(listed: &[PlistKey]) -> bool {
 ///
 /// Each plist key the row names is in `keys` (so the distinct-key check covers
 /// it); each Android permission it names is in `permissions` (so the
-/// request-code rows are complete); a `bridged` row declares at least one
-/// Android permission and every one it declares is runtime-requested (the bridge
-/// asks at the moment of use); and an iOS entitlement or background mode
+/// request groups are complete); a runtime-requested permission comes with the
+/// rest of its request group; a `bridged` row declares at least one Android
+/// permission and every one it declares is runtime-requested (the bridge asks
+/// at the moment of use); and an iOS entitlement or background mode
 /// appears only on a bridged row, since only native shell code uses one.
 const fn row_agrees(
     row: &AxisRequirement,
@@ -576,6 +706,9 @@ const fn row_agrees(
     permissions: &[AndroidPermission],
 ) -> bool {
     if bridged && row.android.is_empty() {
+        return false;
+    }
+    if !names_whole_groups(row.android) {
         return false;
     }
     let native_only = !row.ios_entitlements.is_empty() || !row.ios_background_modes.is_empty();
@@ -629,13 +762,14 @@ const fn permission_table_agrees(axes: &[WebCapability]) -> bool {
     true
 }
 
-// IPE-RUST-AUDIT:ACCEPTED (Arthur Maciel) — compile-time `const` assertion (not a runtime panic); fails the BUILD if a natively bridged web axis lacks its runtime-requested Android permission, an entitlement or background mode sits on an axis no native code serves, or an Android permission or plist key is missing from or repeated in its vocabulary [ledger #boundary]
+// IPE-RUST-AUDIT:ACCEPTED (Arthur Maciel) — compile-time `const` assertion (not a runtime panic); fails the BUILD if a natively bridged web axis lacks its runtime-requested Android permission, an entitlement or background mode sits on an axis no native code serves, or an Android permission or plist key is missing from or repeated in its vocabulary, or a runtime-requested permission sits outside exactly one request group [ledger #boundary]
 #[allow(clippy::assertions_on_constants)] // the constant IS the tripwire
 const _: () = assert!(
     permission_table_agrees(WebCapability::ALL)
         && android_permissions_agree(AndroidPermission::ALL)
+        && request_groups_agree(RequestGroup::ALL, AndroidPermission::ALL)
         && plist_keys_agree(PlistKey::ALL),
-    "the OS-permission table disagrees with BridgeCap, the Android permission vocabulary or the plist key vocabulary",
+    "the OS-permission table disagrees with BridgeCap, the Android permission vocabulary, its request groups or the plist key vocabulary",
 );
 
 /// The typed, per-platform OS-permission declarations derived for an app.
@@ -702,23 +836,25 @@ impl PermissionSet {
         self.ios_background_modes.iter().copied().collect()
     }
 
-    /// The runtime permission request rows, one per declared Android permission
-    /// the shell asks for at the moment of use, sorted. Empty on the Apple
-    /// platforms.
+    /// The runtime permission request groups the shell asks for at the moment
+    /// of use, in request-code order: one per group whose every permission
+    /// the set declares.
+    ///
+    /// Empty on the Apple platforms. A group the set declares only in part is
+    /// left out, since asking for an undeclared permission is denied outright;
+    /// the table check keeps a derived set from ever holding one.
     #[must_use]
-    pub fn android_runtime_requests(&self) -> Vec<RuntimeRequest> {
-        self.android
+    pub fn android_runtime_request_groups(&self) -> Vec<RuntimeRequestGroup> {
+        RequestGroup::ALL
             .iter()
-            .filter_map(|entry| match entry {
-                AndroidEntry::UsesPermission(permission) => {
-                    permission
-                        .runtime_request_code()
-                        .map(|code| RuntimeRequest {
-                            permission: *permission,
-                            code,
-                        })
-                }
+            .copied()
+            .filter(|group| {
+                group.permissions().iter().all(|permission| {
+                    self.android
+                        .contains(&AndroidEntry::UsesPermission(*permission))
+                })
             })
+            .map(RuntimeRequestGroup::of)
             .collect()
     }
 
@@ -1491,38 +1627,97 @@ mod tests {
         }
     }
 
-    // ── Runtime request rows ──────────────────────────────────────────────────
+    // ── Runtime request groups ────────────────────────────────────────────────
 
     #[test]
-    fn runtime_request_rows_cover_exactly_the_runtime_requested_permissions() {
+    fn geolocation_asks_for_both_location_permissions_in_one_request() {
+        let a = accepts(&[web(WebCapability::Geolocation)]);
+        let android = derive_permissions(&a, Platform::Android).expect("android");
+        let groups = android.android_runtime_request_groups();
+        assert_eq!(groups.len(), 1, "one request, never two racing: {groups:?}");
+        let Some(location) = groups.first() else {
+            return;
+        };
+        assert_eq!(location.group, RequestGroup::Location);
+        assert_eq!(
+            location.permissions,
+            [
+                AndroidPermission::AccessFineLocation,
+                AndroidPermission::AccessCoarseLocation,
+            ]
+        );
+        assert_eq!(location.code, RequestGroup::Location.code());
+        assert_eq!(location.min_sdk, None);
+    }
+
+    #[test]
+    fn runtime_request_groups_cover_exactly_the_runtime_requested_permissions() {
         let a = accepts(&[
             web(WebCapability::Geolocation),
             web(WebCapability::Vibration),
             web(WebCapability::Push),
         ]);
         let android = derive_permissions(&a, Platform::Android).expect("android");
-        let rows: Vec<(AndroidPermission, u16)> = android
-            .android_runtime_requests()
+        let rows: Vec<(RequestGroup, u16, Option<u16>)> = android
+            .android_runtime_request_groups()
             .into_iter()
-            .map(|row| (row.permission, row.code.get()))
+            .map(|row| (row.group, row.code.get(), row.min_sdk))
             .collect();
-        // VIBRATE is install-time, so it has no request row. Rows follow the
-        // rendered name order; each code is the permission's position among
-        // the runtime-requested ones.
+        // VIBRATE is install-time, so it has no request group; notifications
+        // are asked only from the API level that gates them.
         assert_eq!(
             rows,
             vec![
-                (AndroidPermission::AccessCoarseLocation, 2),
-                (AndroidPermission::AccessFineLocation, 1),
-                (AndroidPermission::PostNotifications, 3),
+                (RequestGroup::Location, 1, None),
+                (RequestGroup::Notifications, 2, Some(33)),
             ]
         );
         assert!(
             derive_permissions(&a, Platform::Ios)
                 .expect("ios")
-                .android_runtime_requests()
+                .android_runtime_request_groups()
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn a_recorder_asks_for_camera_and_microphone_as_separate_groups() {
+        let a = accepts(&[web(WebCapability::Recorder)]);
+        let android = derive_permissions(&a, Platform::Android).expect("android");
+        let groups: Vec<RequestGroup> = android
+            .android_runtime_request_groups()
+            .into_iter()
+            .map(|row| row.group)
+            .collect();
+        assert_eq!(groups, [RequestGroup::RecordAudio, RequestGroup::Camera]);
+    }
+
+    #[test]
+    fn the_request_group_checks_refuse_a_split_or_shared_group() {
+        assert!(request_groups_agree(
+            RequestGroup::ALL,
+            AndroidPermission::ALL
+        ));
+        // Two groups sharing one code are refused.
+        assert!(!request_groups_agree(
+            &[RequestGroup::Camera, RequestGroup::Camera],
+            AndroidPermission::ALL,
+        ));
+        // A runtime permission whose group the list omits is never asked: refused.
+        assert!(!request_groups_agree(
+            &[
+                RequestGroup::Location,
+                RequestGroup::Notifications,
+                RequestGroup::RecordAudio,
+            ],
+            AndroidPermission::ALL,
+        ));
+        // A row holding half of the location group is refused.
+        assert!(names_whole_groups(RequestGroup::Location.permissions()));
+        assert!(!names_whole_groups(&[
+            AndroidPermission::AccessCoarseLocation
+        ]));
+        assert!(names_whole_groups(&[AndroidPermission::Vibrate]));
     }
 
     #[test]
@@ -1544,25 +1739,21 @@ mod tests {
     }
 
     #[test]
-    fn runtime_request_codes_are_distinct_and_absent_for_install_time_permissions() {
-        let mut seen = BTreeSet::new();
+    fn every_runtime_permission_sits_in_exactly_one_request_group() {
         for &permission in AndroidPermission::ALL {
-            match permission.runtime_request_code() {
-                Some(code) => {
-                    assert!(permission.is_runtime_requested(), "{permission:?}");
-                    assert!(seen.insert(code.get()), "{permission:?} repeats a code");
-                }
-                None => assert!(!permission.is_runtime_requested(), "{permission:?}"),
-            }
+            let holders = RequestGroup::ALL
+                .iter()
+                .filter(|group| group.permissions().contains(&permission))
+                .count();
+            let expected = usize::from(permission.is_runtime_requested());
+            assert_eq!(holders, expected, "{permission:?}");
         }
         assert_eq!(
-            AndroidPermission::ALL
+            RequestGroup::ALL
                 .iter()
-                .copied()
-                .filter_map(AndroidPermission::runtime_request_code)
-                .map(RequestCode::get)
+                .map(|group| group.code().get())
                 .collect::<Vec<_>>(),
-            [1, 2, 3, 4, 5]
+            [1, 2, 3, 4]
         );
     }
 
