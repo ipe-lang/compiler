@@ -7851,7 +7851,7 @@ where
             get(handlers::page::<Model, Msg, FInit, FUpdate, FView, FSubs>),
         )
         .route(
-            "/*path",
+            "/{*path}",
             get(handlers::page::<Model, Msg, FInit, FUpdate, FView, FSubs>),
         )
         // Layer order (axum: last `.layer` = outermost): CSRF is INNER of

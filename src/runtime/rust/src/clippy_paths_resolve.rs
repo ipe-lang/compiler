@@ -99,6 +99,9 @@ const _AXUM: () = {
     let _: Option<QueryAlias<()>> = None;
     let _: Option<FormAlias<()>> = None;
     #[expect(clippy::disallowed_methods)]
-    let _ =
-        ::axum::serve::serve::<::axum::routing::IntoMakeService<::axum::Router>, ::axum::Router>;
+    let _ = ::axum::serve::serve::<
+        ::tokio::net::TcpListener,
+        ::axum::routing::IntoMakeService<::axum::Router>,
+        ::axum::Router,
+    >;
 };

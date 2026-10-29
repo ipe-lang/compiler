@@ -3932,7 +3932,7 @@ async fn ws_loop<E, S>(
                     }
                     let handled = work
                         .unless_cancelled(
-                            credentials.scoped(|| (cfg.onMessage)(WsHandle::WebSocketServer(id), t)),
+                            credentials.scoped(|| (cfg.onMessage)(WsHandle::WebSocketServer(id), t.as_str().to_owned())),
                         )
                         .await;
                     if handled.is_none() {
@@ -3981,8 +3981,8 @@ async fn ws_loop<E, S>(
                 }
             },
             outgoing = rx.recv() => match outgoing {
-                Some(WsOut::Text(s)) => { if socket.send(Message::Text(s)).await.is_err() { break; } }
-                Some(WsOut::Binary(b)) => { if socket.send(Message::Binary(b)).await.is_err() { break; } }
+                Some(WsOut::Text(s)) => { if socket.send(Message::Text(s.into())).await.is_err() { break; } }
+                Some(WsOut::Binary(b)) => { if socket.send(Message::Binary(b.into())).await.is_err() { break; } }
                 Some(WsOut::Close) => { ws_send_close(&mut socket, Message::Close(None)).await; break; }
                 None => break,
             },
@@ -3993,7 +3993,7 @@ async fn ws_loop<E, S>(
                 }
                 // Send a Ping frame; if the peer has gone away the send will
                 // fail and we break, triggering onClose cleanup.
-                if socket.send(Message::Ping(vec![])).await.is_err() {
+                if socket.send(Message::Ping(axum::body::Bytes::new())).await.is_err() {
                     break;
                 }
             },
@@ -11095,7 +11095,7 @@ mod tests {
             let (credentials, gate) = gate_of_authed_request(&claims).await;
             assert!(gate.is_some(), "a socket of an armed authed route is gated");
             let mut peer = serve_ws(credentials, gate).await;
-            let before = axum::extract::ws::Message::Text("before".to_string());
+            let before = axum::extract::ws::Message::Text("before".into());
             assert!(peer.to_server.send(before).is_ok());
             let delivered = tokio::time::timeout(RECHECK_COALESCE, peer.delivered.recv()).await;
             assert!(
@@ -11103,7 +11103,7 @@ mod tests {
                 "a frame before the revocation reaches the handler"
             );
             crate::revocation::revoke_session("ws-inbound-jti".to_string(), cap).expect("revoke");
-            let after = axum::extract::ws::Message::Text("after".to_string());
+            let after = axum::extract::ws::Message::Text("after".into());
             assert!(peer.to_server.send(after).is_ok());
             let frame = next_frame(&mut peer, 2 * RECHECK_COALESCE).await;
             assert!(
@@ -11246,7 +11246,7 @@ mod tests {
             .expect("revoke");
             let frame = next_frame(&mut peer, 2 * RECHECK_COALESCE).await;
             assert!(frame.is_none(), "an ungated socket stays open: {frame:?}");
-            let text = axum::extract::ws::Message::Text("still-open".to_string());
+            let text = axum::extract::ws::Message::Text("still-open".into());
             assert!(peer.to_server.send(text).is_ok());
             let delivered = tokio::time::timeout(RECHECK_COALESCE, peer.delivered.recv()).await;
             assert!(
@@ -11471,7 +11471,7 @@ mod tests {
             let token = hs256(&session_claims("ws-message-subject", "ws-message-jti", cap));
             assert!(
                 peer.to_server
-                    .send(axum::extract::ws::Message::Text(token))
+                    .send(axum::extract::ws::Message::Text(token.into()))
                     .is_ok()
             );
             let delivered = tokio::time::timeout(RECHECK_COALESCE, peer.delivered.recv()).await;
@@ -11563,7 +11563,7 @@ mod tests {
                 let release = Arc::new(tokio::sync::Notify::new());
                 let mut peer =
                     serve_ws_with(credentials, gate, OnMessage::Hold(Arc::clone(&release))).await;
-                let hold = axum::extract::ws::Message::Text("hold".to_string());
+                let hold = axum::extract::ws::Message::Text("hold".into());
                 assert!(peer.to_server.send(hold).is_ok());
                 let held = tokio::time::timeout(RECHECK_COALESCE, peer.delivered.recv()).await;
                 assert!(matches!(held, Ok(Some(_))), "onMessage is holding the loop");
@@ -11591,7 +11591,8 @@ mod tests {
             let (credentials, gate) = gate_of_authed_request(&claims).await;
             let mut peer = serve_ws(credentials, gate).await;
             crate::revocation::revoke_session("ws-binary-jti".to_string(), cap).expect("revoke");
-            let after = axum::extract::ws::Message::Binary(b"after".to_vec());
+            let after =
+                axum::extract::ws::Message::Binary(axum::body::Bytes::from_static(b"after"));
             assert!(peer.to_server.send(after).is_ok());
             let frame = next_frame(&mut peer, 2 * RECHECK_COALESCE).await;
             assert!(
@@ -11700,7 +11701,7 @@ mod tests {
             };
             let poisoned = poisoner.join();
             assert!(poisoned.is_err(), "the binding set is poisoned");
-            let text = axum::extract::ws::Message::Text("after".to_string());
+            let text = axum::extract::ws::Message::Text("after".into());
             assert!(peer.to_server.send(text).is_ok());
             let frame = next_frame(&mut peer, 2 * RECHECK_COALESCE).await;
             assert!(

@@ -556,7 +556,7 @@ where
     use axum::routing::any;
     router
         .route(CONSOLE_BASE, any(proxy_entry))
-        .route(&format!("{CONSOLE_BASE}/*rest"), any(proxy_entry))
+        .route(&format!("{CONSOLE_BASE}/{{*rest}}"), any(proxy_entry))
 }
 
 #[cfg(test)]
