@@ -430,8 +430,9 @@ test("focus-across-patch: a full re-render after the user acted never autofocuse
 });
 
 test("focus-across-patch: a DOM member the browser lacks never stops the client", async ({ page }) => {
-  // The client reads `nextElementSibling` only while putting focus back, and
-  // `createRange` only to parse foreign (SVG, MathML) content.
+  // The client reads `nextElementSibling` only to find a full page's root, and
+  // `createRange` only to parse foreign (SVG, MathML) content; the first
+  // render's swap drops the root's focus, which is put back without either.
   await page.addInitScript(() => {
     delete Element.prototype.nextElementSibling;
     delete Document.prototype.createRange;
@@ -1090,8 +1091,11 @@ test("focus-across-patch: a click on blank space after a frame keeps focus on th
   await page.evaluate(() => {
     document.body.insertAdjacentHTML("beforeend", '<div id="away">away</div>');
   });
-  const frame = await untabHeld(page, "F7");
-  expect(inPlace(frame, "tabindex")).toBe(true);
+  // Chromium drops focus from a button disabled in place only at its next
+  // rendering step, after the commit; a node made untabbable or hidden loses
+  // focus inside the commit, where the keep's first check already lands it.
+  const frame = await clickHeld(page, "#disableself");
+  expect(inPlace(frame, "disabled")).toBe(true);
   await deliverHeldBeforeAnimationFrames(page);
   await expect.poll(() => onBody(page)).toBe(true);
   await page.click("#away");
@@ -1101,8 +1105,11 @@ test("focus-across-patch: a click on blank space after a frame keeps focus on th
 
 test("focus-across-patch: Tab into the browser chrome after a frame is never undone", async ({ page }) => {
   await open(page);
-  const frame = await untabHeld(page, "F7");
-  expect(inPlace(frame, "tabindex")).toBe(true);
+  // Chromium drops focus from a button disabled in place only at its next
+  // rendering step, after the commit; a node made untabbable or hidden loses
+  // focus inside the commit, where the keep's first check already lands it.
+  const frame = await clickHeld(page, "#disableself");
+  expect(inPlace(frame, "disabled")).toBe(true);
   await deliverHeldBeforeAnimationFrames(page);
   await expect.poll(() => onBody(page)).toBe(true);
   // A headless browser has no chrome to tab into: the window's own `blur`,

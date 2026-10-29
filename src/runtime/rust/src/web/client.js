@@ -109,6 +109,7 @@ var __ipeNode = (function() {
   var parentElement = getter(Node.prototype, "parentElement");
   var parentNode = getter(Node.prototype, "parentNode");
   var firstChild = getter(Node.prototype, "firstChild");
+  var nextSibling = getter(Node.prototype, "nextSibling");
   var textContent = setter(Node.prototype, "textContent");
   var firstElementChild = getter(Element.prototype, "firstElementChild");
   var nextElementSibling = getter(Element.prototype, "nextElementSibling");
@@ -140,6 +141,7 @@ var __ipeNode = (function() {
     parent: function(el) { return parentElement.call(el); },
     parentNode: function(el) { return parentNode.call(el); },
     firstChild: function(el) { return firstChild.call(el); },
+    nextSibling: function(el) { return nextSibling.call(el); },
     firstElement: function(el) { return firstElementChild.call(el); },
     next: function(el) { return nextElementSibling.call(el); },
     removeChild: function(el, child) { removeChild.call(el, child); },
@@ -937,27 +939,42 @@ function __ipeKeepFocus(run) {
     });
   });
 }
+// The ONE element child of `at` whose `ipe-id` and tag equal `link`; null when
+// none or several do, or when the children cannot be read. The children are
+// walked through the core node members (`firstChild`, `nextSibling`), which
+// every DOM has.
+function __ipeOnlyChild(at, link) {
+  try {
+    var only = null;
+    var count = 0;
+    for (var kid = __ipeNode.firstChild(at); kid; kid = __ipeNode.nextSibling(kid)) {
+      if (!(kid instanceof Element)) continue;
+      if (__ipeNode.attr(kid, "ipe-id") === link.id && __ipeNode.tag(kid) === link.tag) {
+        only = kid;
+        count++;
+      }
+    }
+    return count === 1 ? only : null;
+  } catch (_) {
+    return null;
+  }
+}
 // Puts focus on the landing of `chain`: descending from `#ipe-root`, each
 // depth takes the ONE element child whose `ipe-id` and tag equal the link (none
 // or several end the descent); the matched nodes, deepest first, then
 // `#ipe-root`, are tried until one takes focus. An equal `ipe-id` under another
 // tag or another chain never matches, and a node that moved keeps its match.
-// A landing node bound to `onFocus` delivers that message once.
+// A landing node bound to `onFocus` delivers that message once. A depth whose
+// children cannot be read (a DOM member the browser lacks) ends the descent:
+// the depths above it are proven, so focus still lands, never stops.
 function __ipeRestoreFocus(chain) {
   var root = __ipeDoc.byId("ipe-root");
   if (!root) return;
   var found = [];
   var at = root;
   for (var d = 0; d < chain.length; d++) {
-    var only = null;
-    var count = 0;
-    for (var kid = __ipeNode.firstElement(at); kid; kid = __ipeNode.next(kid)) {
-      if (__ipeNode.attr(kid, "ipe-id") === chain[d].id && __ipeNode.tag(kid) === chain[d].tag) {
-        only = kid;
-        count++;
-      }
-    }
-    if (count !== 1) break;
+    var only = __ipeOnlyChild(at, chain[d]);
+    if (only === null) break;
     found.push(only);
     at = only;
   }
