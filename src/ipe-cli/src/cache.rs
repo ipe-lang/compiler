@@ -1707,7 +1707,7 @@ mod tests {
             debugger: false,
             crate_name: ipe_backend_rust::CrateName::SingleFile,
             hot_appearance: false,
-            host: ipe_backend_rust::EmitHost::Served,
+            host: ipe_backend_rust::EmitHost::Served(ipe_backend_rust::ServedInstall::Off),
             intent: ipe_backend_rust::BuildIntent::Development,
         }
     }
@@ -1832,7 +1832,9 @@ mod tests {
             )
         };
         assert_ne!(
-            key(ipe_backend_rust::EmitHost::Served),
+            key(ipe_backend_rust::EmitHost::Served(
+                ipe_backend_rust::ServedInstall::Off
+            )),
             key(ipe_backend_rust::EmitHost::WebView(small.clone())),
             "a webview host must differ from the served host"
         );
@@ -2195,6 +2197,7 @@ mod tests {
             files,
             cargo_toml: "[package]\nname = \"x\"\n".to_owned(),
             uses_webview: false,
+            assets: std::collections::BTreeMap::new(),
         };
 
         assert!(
@@ -2504,6 +2507,7 @@ mod tests {
             files,
             cargo_toml: "[package]\nname = \"x\"\n".to_owned(),
             uses_webview: false,
+            assets: std::collections::BTreeMap::new(),
         }
     }
 

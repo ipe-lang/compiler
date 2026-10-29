@@ -131,6 +131,87 @@ impl<'de> serde::Deserialize<'de> for RelPath {
     }
 }
 
+/// The bytes of one binary file an emitted project carries beside its text
+/// files (an icon the emitted Rust pulls in with `include_bytes!`).
+///
+/// It serialises as lower-case hex, so the JSON build cache holds it as one
+/// string. The hand-written [`Deserialize`](serde::Deserialize) refuses an
+/// odd length or a non-hex digit: a cache file is untrusted input.
+#[derive(Clone, PartialEq, Eq, Default)]
+pub struct Asset(Vec<u8>);
+
+impl Asset {
+    /// The asset holding `bytes`.
+    #[must_use]
+    pub const fn new(bytes: Vec<u8>) -> Self {
+        Self(bytes)
+    }
+
+    /// The asset's bytes.
+    #[must_use]
+    pub fn bytes(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for Asset {
+    /// The length only: an asset can be megabytes.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Asset")
+            .field("len", &self.0.len())
+            .finish_non_exhaustive()
+    }
+}
+
+/// The lower-case hex digits, indexed by nibble.
+const HEX_DIGITS: &[u8; 16] = b"0123456789abcdef";
+
+impl serde::Serialize for Asset {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut text = String::with_capacity(self.0.len().saturating_mul(2));
+        for byte in &self.0 {
+            for nibble in [byte >> 4, byte & 0x0F] {
+                let digit = HEX_DIGITS
+                    .get(usize::from(nibble))
+                    .copied()
+                    .map_or('0', char::from);
+                text.push(digit);
+            }
+        }
+        text.serialize(serializer)
+    }
+}
+
+/// The value of one hex digit, either case.
+const fn hex_value(digit: u8) -> Option<u8> {
+    match digit {
+        b'0'..=b'9' => Some(digit - b'0'),
+        b'a'..=b'f' => Some(digit - b'a' + 10),
+        b'A'..=b'F' => Some(digit - b'A' + 10),
+        _ => None,
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for Asset {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let text = String::deserialize(deserializer)?;
+        let (pairs, rest) = text.as_bytes().as_chunks::<2>();
+        if !rest.is_empty() {
+            return Err(serde::de::Error::custom("an asset has an odd hex length"));
+        }
+        pairs
+            .iter()
+            .map(|[high, low]| {
+                hex_value(*high)
+                    .zip(hex_value(*low))
+                    .map(|(high, low)| (high << 4) | low)
+            })
+            .collect::<Option<Vec<u8>>>()
+            .map(Self)
+            .ok_or_else(|| serde::de::Error::custom("an asset carries a non-hex digit"))
+    }
+}
+
 /// An emitted project, fully materialised in memory.
 ///
 /// `files` maps a validated project-relative [`RelPath`] to its file contents. A
@@ -151,6 +232,11 @@ pub struct EmittedProject {
     /// even on a cache-deserialized project.
     #[serde(default)]
     pub uses_webview: bool,
+    /// Validated relative path -> binary file bytes, written beside
+    /// [`Self::files`]. No key is also a key of [`Self::files`]; the writer
+    /// refuses a project where one is.
+    #[serde(default)]
+    pub assets: BTreeMap<RelPath, Asset>,
 }
 
 /// A code-generation backend: turns a typed IR [`Program`] into an
@@ -278,11 +364,35 @@ mod tests {
             files,
             cargo_toml: "[package]\nname = \"app\"\n".to_owned(),
             uses_webview: false,
+            assets: BTreeMap::from([(
+                RelPath::new("src/icon.png")?,
+                Asset::new(vec![0x00, 0x89, 0xAB, 0xFF]),
+            )]),
         };
         let json = serde_json::to_string(&project).expect("serialize must succeed");
         let back: EmittedProject = serde_json::from_str(&json).expect("deserialize must succeed");
         assert_eq!(back, project);
         Ok(())
+    }
+
+    #[test]
+    fn an_asset_serialises_as_hex_and_refuses_a_malformed_hex_string() {
+        let json = serde_json::to_string(&Asset::new(vec![0x00, 0x89, 0xAB, 0xFF]))
+            .expect("serialize must succeed");
+        assert_eq!(json, "\"0089abff\"");
+        let back: Asset = serde_json::from_str("\"0089ABff\"").expect("either case decodes");
+        assert_eq!(back.bytes(), &[0x00, 0x89, 0xAB, 0xFF]);
+        for bad in ["\"0\"", "\"0g\"", "\"zz00\"", "\"00 1\""] {
+            let result: Result<Asset, _> = serde_json::from_str(bad);
+            assert!(result.is_err(), "{bad} must be refused, got {result:?}");
+        }
+    }
+
+    #[test]
+    fn an_asset_with_an_escaping_key_fails_the_whole_project() {
+        let poisoned = r#"{"files":{},"cargo_toml":"","assets":{"../../icon.png":"00"}}"#;
+        let result: Result<EmittedProject, _> = serde_json::from_str(poisoned);
+        assert!(result.is_err(), "{result:?}");
     }
 
     /// A cache entry that has been tampered with to carry an escaping key

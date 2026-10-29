@@ -201,10 +201,19 @@ fn console_call(files: &[String]) -> Option<String> {
 #[test]
 #[allow(clippy::expect_used)]
 fn split_debugger_module_passes_codec() {
-    let plain = console_call(&split_files(CLI_MAIN, settings(false, EmitHost::Served)))
-        .expect("the plain build calls console_app");
-    let debug = console_call(&split_files(CLI_MAIN, settings(true, EmitHost::Served)))
-        .expect("the debugger build calls console_app");
+    let plain = console_call(&split_files(
+        CLI_MAIN,
+        settings(
+            false,
+            EmitHost::Served(ipe_backend_rust::ServedInstall::Off),
+        ),
+    ))
+    .expect("the plain build calls console_app");
+    let debug = console_call(&split_files(
+        CLI_MAIN,
+        settings(true, EmitHost::Served(ipe_backend_rust::ServedInstall::Off)),
+    ))
+    .expect("the debugger build calls console_app");
     assert!(
         !plain.contains(SESSION_CODEC),
         "a plain build passed a codec: {plain}"

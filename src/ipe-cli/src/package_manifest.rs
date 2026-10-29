@@ -64,9 +64,10 @@ use crate::delivery_set::{BinaryTarget, ShipEntry};
 use crate::project::{
     ApnsEnvironment, BrowserDelivery, Capability, DeliveryConfig, DesktopDelivery, EntryShape,
     FcmApiKey, FcmApplicationId, FcmIdentifierRefusal, FcmIdentifiers, FcmProjectId, FcmSenderId,
-    IpeDep, MobileDelivery, Program, ProjectManifest, PublicEnvAllowlist, PublicEnvName,
+    Install, IpeDep, MobileDelivery, Program, ProjectManifest, PublicEnvAllowlist, PublicEnvName,
     PushDelivery, RustDep, ScreenOrientation, WasmBundle, WasmConfig, WasmMode,
 };
+use crate::pwa_icon::{self, PwaIconRefusal};
 use crate::text;
 
 /// The manifest filename read by this reader.
@@ -128,7 +129,7 @@ pub fn parse_package_manifest_source(
         .as_deref()
         .unwrap_or(DEFAULT_SOURCE_ROOT)
         .to_owned();
-    Ok((fields.into_manifest(&root)?, spelled))
+    Ok((fields.into_manifest(&root, text, manifest_path)?, spelled))
 }
 
 /// The total core: `&str -> Result<ProjectManifest, CliError>`, given the
@@ -144,7 +145,7 @@ pub fn read_package_manifest(
     root: &Path,
     manifest_path: &Path,
 ) -> Result<ProjectManifest, CliError> {
-    read_manifest_fields(src, manifest_path)?.into_manifest(root)
+    read_manifest_fields(src, manifest_path)?.into_manifest(root, src, manifest_path)
 }
 
 /// Parse `src` and read the record of its sole `package` binding into fields.
@@ -189,6 +190,73 @@ fn base_path_refusal(raw: &str, refusal: &MountBaseRefusal) -> text::Message {
     }
 }
 
+/// The manifest refusal for an `icon` that [`pwa_icon::parse`] turned away, one catalog message per refusal.
+///
+/// The icon path is author text, so it renders through `{:?}` (escaped).
+fn icon_refusal(raw: &str, refusal: &PwaIconRefusal) -> text::Message {
+    let icon = format!("{raw:?}");
+    match refusal {
+        PwaIconRefusal::Unreadable(error) => {
+            text::msg::manifest_icon_unreadable(&icon, &error.to_string())
+        }
+        PwaIconRefusal::TooLarge => {
+            text::msg::manifest_icon_too_large(&icon, &pwa_icon::ICON_READ_CAP)
+        }
+        PwaIconRefusal::NotPng => text::msg::manifest_icon_not_png(&icon),
+        PwaIconRefusal::TruncatedHeader => text::msg::manifest_icon_truncated_header(&icon),
+        PwaIconRefusal::ZeroSide => text::msg::manifest_icon_zero_side(&icon),
+        PwaIconRefusal::NotSquare { width, height } => {
+            text::msg::manifest_icon_not_square(&icon, width, height)
+        }
+        PwaIconRefusal::TooSmall { side } => {
+            text::msg::manifest_icon_too_small(&icon, side, &pwa_icon::MIN_ICON_SIDE)
+        }
+    }
+}
+
+/// One field of the `delivery.browser` record.
+#[derive(Clone, Copy)]
+enum BrowserField {
+    /// `basePath`: the URL path a `web solo` bundle is served at.
+    BasePath,
+    /// `installable`: whether a `web served` app offers browser install.
+    Installable,
+}
+
+/// The `delivery.browser` fields [`Reader::read_browser`] accepts, by name.
+///
+/// The reader dispatches only through this table, so its accepted names are
+/// exactly these; a unit test pins them to the `BrowserConfig` schema.
+const BROWSER_FIELDS: [(&str, BrowserField); 2] = [
+    ("basePath", BrowserField::BasePath),
+    ("installable", BrowserField::Installable),
+];
+
+/// `installable = True` as the manifest wrote it, at the field's span.
+#[derive(Clone, Copy)]
+struct InstallRequest {
+    span: Span,
+}
+
+/// The top-level `icon` path as the manifest wrote it, at its value's span.
+struct IconField {
+    raw: String,
+    span: Span,
+}
+
+/// A `package.ipe:LINE:COL: <reason>` [`CliError::Usage`] for `span` in `src`.
+///
+/// Line and column are 1-based; an out-of-range offset degrades to `1:1`.
+fn located_refusal(src: &str, manifest_path: &Path, span: Span, reason: &str) -> CliError {
+    let (line, col) = line_col(src, span.lo);
+    CliError::Usage(text::msg::located_refusal(
+        &manifest_path.display(),
+        &line,
+        &col,
+        &reason,
+    ))
+}
+
 /// The located text of a refused `delivery.servers` entry.
 ///
 /// The entry is shown through its `Debug` escape, which renders every control
@@ -220,7 +288,8 @@ struct ManifestFields {
     name: Option<String>,
     version: Option<semver::Version>,
     src_rel: Option<String>,
-    icon_rel: Option<String>,
+    icon: Option<IconField>,
+    install_request: Option<InstallRequest>,
     driver: Option<ipe_backend_rust::DbDriver>,
     static_build: Option<bool>,
     target: Option<String>,
@@ -240,9 +309,17 @@ struct ManifestFields {
 
 impl ManifestFields {
     /// Assemble the accumulated fields into a [`ProjectManifest`], applying the
-    /// two remaining whole-manifest validations: `name` is required, and the
-    /// source-root directory must exist.
-    fn into_manifest(self, root: &Path) -> Result<ProjectManifest, CliError> {
+    /// remaining whole-manifest validations: `name` is required, the
+    /// source-root directory must exist, and an install request carries an
+    /// icon proven fit for install.
+    ///
+    /// `src` and `manifest_path` locate a refusal of the install request.
+    fn into_manifest(
+        mut self,
+        root: &Path,
+        src: &str,
+        manifest_path: &Path,
+    ) -> Result<ProjectManifest, CliError> {
         let name = self
             .name
             .ok_or(CliError::Usage(text::msg::package_manifest_name_required()))?;
@@ -262,17 +339,41 @@ impl ManifestFields {
         // at parse time, so a packager consumes a validated path and can never be
         // handed one that escapes the project root.
         let icon = self
-            .icon_rel
-            .as_deref()
-            .map(|raw| {
-                crate::contained_path::ContainedRelPath::parse(root, raw)
-                    .map(|c| c.resolved().to_path_buf())
-                    .map_err(|reason| CliError::PathEscape {
-                        raw: raw.to_owned(),
+            .icon
+            .map(
+                |field| match crate::contained_path::ContainedRelPath::parse(root, &field.raw) {
+                    Ok(contained) => Ok((contained.resolved().to_path_buf(), field)),
+                    Err(reason) => Err(CliError::PathEscape {
+                        raw: field.raw,
                         reason,
-                    })
-            })
+                    }),
+                },
+            )
             .transpose()?;
+        // The install offer is decided here, where the icon is resolved, so
+        // `installable` never travels past the manifest as a bare flag.
+        self.delivery.browser.install = match (self.install_request, &icon) {
+            (None, _) => Install::Off,
+            (Some(request), None) => {
+                return Err(located_refusal(
+                    src,
+                    manifest_path,
+                    request.span,
+                    &text::msg::manifest_installable_without_icon(),
+                ));
+            }
+            (Some(_), Some((path, field))) => {
+                Install::On(pwa_icon::parse(root, path).map_err(|refusal| {
+                    located_refusal(
+                        src,
+                        manifest_path,
+                        field.span,
+                        &icon_refusal(&field.raw, &refusal),
+                    )
+                })?)
+            }
+        };
+        let icon = icon.map(|(path, _)| path);
         Ok(ProjectManifest {
             name,
             version: self.version,
@@ -314,13 +415,7 @@ impl Reader<'_> {
     /// against the source; an out-of-range offset degrades to `1:1` rather than
     /// panicking (totality).
     fn reject(&self, span: Span, reason: &str) -> CliError {
-        let (line, col) = line_col(self.src, span.lo);
-        CliError::Usage(text::msg::located_refusal(
-            &self.manifest_path.display(),
-            &line,
-            &col,
-            &reason,
-        ))
+        located_refusal(self.src, self.manifest_path, span, reason)
     }
 
     /// Walk a whole parsed module into the accumulated [`ManifestFields`],
@@ -421,7 +516,12 @@ impl Reader<'_> {
                     fields.version = Some(version);
                 }
                 "sourceRoot" => fields.src_rel = Some(self.expect_string(value)?),
-                "icon" => fields.icon_rel = Some(self.expect_string(value)?),
+                "icon" => {
+                    fields.icon = Some(IconField {
+                        raw: self.expect_string(value)?,
+                        span: value.span,
+                    });
+                }
                 "dependencies" => fields.dependencies = self.read_dependencies(value)?,
                 "rustDependencies" => {
                     fields.rust_dependencies = self.read_rust_dependencies(value)?;
@@ -433,7 +533,7 @@ impl Reader<'_> {
                 "wrapper" => fields.has_rust_wrapper = self.read_wrapper(value)?,
                 "build" => self.read_build_record(value, &mut fields)?,
                 "delivery" => {
-                    fields.delivery = self.read_delivery(value)?;
+                    (fields.delivery, fields.install_request) = self.read_delivery(value)?;
                     delivery_span = Some(value.span);
                 }
                 other => {
@@ -887,14 +987,18 @@ impl Reader<'_> {
     /// Read the `delivery = { desktop = { … }, mobile = { … }, browser = { … } }`
     /// record. All three sub-sections default to their [`Default`] values when
     /// omitted; the toolchain reads only the section matching the resolved target.
-    fn read_delivery(&self, expr: &Expr) -> Result<DeliveryConfig, CliError> {
+    fn read_delivery(
+        &self,
+        expr: &Expr,
+    ) -> Result<(DeliveryConfig, Option<InstallRequest>), CliError> {
         let mut config = DeliveryConfig::default();
+        let mut install_request = None;
         for (fname, value) in self.expect_record(expr)? {
             match self.text(fname.value) {
                 "ships" => config.ships = self.read_ships(value)?,
                 "desktop" => config.desktop = self.read_desktop(value)?,
                 "mobile" => config.mobile = self.read_mobile(value)?,
-                "browser" => config.browser = self.read_browser(value)?,
+                "browser" => (config.browser, install_request) = self.read_browser(value)?,
                 "servers" => config.servers = self.read_servers(value)?,
                 other => {
                     return Err(self.reject(
@@ -907,7 +1011,7 @@ impl Reader<'_> {
                 }
             }
         }
-        Ok(config)
+        Ok((config, install_request))
     }
 
     /// Read the `delivery.ships = [ … ]` list into the typed [`ShipEntry`]
@@ -1176,27 +1280,46 @@ impl Reader<'_> {
         }
     }
 
-    /// Read `delivery.browser = { basePath }`; `basePath` parses into a
-    /// [`MountBase`], and an absent one is [`MountBase::root`].
-    fn read_browser(&self, expr: &Expr) -> Result<BrowserDelivery, CliError> {
+    /// Read `delivery.browser = { basePath, installable }`; `basePath` parses
+    /// into a [`MountBase`], and an absent one is [`MountBase::root`].
+    ///
+    /// `installable = True` is returned as an [`InstallRequest`] at its span,
+    /// for the finish step to pair with the resolved `icon`; `False` and an
+    /// absent field are no request.
+    fn read_browser(
+        &self,
+        expr: &Expr,
+    ) -> Result<(BrowserDelivery, Option<InstallRequest>), CliError> {
         let mut b = BrowserDelivery::default();
+        let mut install_request = None;
         for (fname, value) in self.expect_record(expr)? {
-            match self.text(fname.value) {
-                "basePath" => {
+            let name = self.text(fname.value);
+            let Some((_, field)) = BROWSER_FIELDS.iter().find(|(known, _)| *known == name) else {
+                let expected = BROWSER_FIELDS
+                    .iter()
+                    .map(|(known, _)| format!("`{known}`"))
+                    .collect::<Vec<_>>()
+                    .join(" or ");
+                return Err(self.reject(
+                    fname.span,
+                    &format!("`{name}` is not a browser field — expected {expected}"),
+                ));
+            };
+            match field {
+                BrowserField::BasePath => {
                     let raw = self.expect_string(value)?;
                     b.base = MountBase::parse(&raw).map_err(|refusal| {
                         self.reject(value.span, &base_path_refusal(&raw, &refusal))
                     })?;
                 }
-                other => {
-                    return Err(self.reject(
-                        fname.span,
-                        &format!("`{other}` is not a browser field — expected `basePath`"),
-                    ));
+                BrowserField::Installable => {
+                    install_request = self
+                        .expect_bool(value)?
+                        .then_some(InstallRequest { span: fname.span });
                 }
             }
         }
-        Ok(b)
+        Ok((b, install_request))
     }
 
     /// Read a non-negative integer literal, used for pixel dimensions. Negative
@@ -2579,6 +2702,178 @@ mod tests {
                 "error names the secret: {msg}"
             );
         }
+    }
+
+    /// Read `source` against a fresh project root holding `icon` at `assets/icon.png`.
+    fn read_with_icon(
+        test_name: &str,
+        source: &str,
+        icon: &[u8],
+    ) -> Result<ProjectManifest, CliError> {
+        let root = fresh_project(test_name);
+        std::fs::create_dir_all(root.join("assets")).expect("create assets/");
+        std::fs::write(root.join("assets").join("icon.png"), icon).expect("write icon");
+        let path = root.join(PACKAGE_IPE);
+        std::fs::write(&path, source).expect("write package.ipe");
+        let result = parse_package_manifest(&path);
+        let _ = std::fs::remove_dir_all(&root);
+        result
+    }
+
+    /// A manifest with `icon` (when given) and `delivery.browser` set to `browser`.
+    fn install_manifest(icon: Option<&str>, browser: &str) -> String {
+        let icon = icon.map_or_else(String::new, |icon| format!(", icon = {icon:?}"));
+        format!(
+            "{HEADER}package =\n    {{ name = \"x\"{icon}, delivery = {{ browser = {browser} }} }}\n"
+        )
+    }
+
+    /// The `:LINE:COL:` a located refusal at the first `needle` in `source` carries.
+    fn located_at(source: &str, needle: &str) -> String {
+        let off = source.find(needle).expect("needle in source");
+        let (line, col) = line_col(source, u32::try_from(off).expect("offset fits u32"));
+        format!(":{line}:{col}:")
+    }
+
+    #[test]
+    fn installable_without_icon_is_refused_at_installable() {
+        let source = install_manifest(None, "{ installable = True }");
+        let result = read("installable_without_icon", &source);
+        let expected = text::msg::manifest_installable_without_icon().to_string();
+        let at = located_at(&source, "installable");
+        assert!(
+            matches!(&result, Err(CliError::Usage(msg))
+                if msg.contains(&expected) && msg.contains(&at)),
+            "`installable = True` with no `icon` is refused at `installable` ({at}): {:?}",
+            result.map(|m| m.name)
+        );
+    }
+
+    #[test]
+    fn installable_must_be_a_bool_literal() {
+        let source = install_manifest(Some("assets/icon.png"), "{ installable = \"yes\" }");
+        let result = read_with_icon(
+            "installable_not_bool",
+            &source,
+            &pwa_icon::test_png(512, 512),
+        );
+        assert!(
+            matches!(&result, Err(CliError::Usage(msg))
+                if msg.contains("expected `True` or `False`")),
+            "`installable = \"yes\"` is the bool type refusal: {:?}",
+            result.map(|m| m.name)
+        );
+    }
+
+    #[test]
+    fn installable_absent_or_false_is_off() {
+        let icon = pwa_icon::test_png(512, 512);
+        for (tag, browser) in [
+            ("absent", "{ basePath = \"/\" }"),
+            ("false", "{ installable = False }"),
+        ] {
+            let source = install_manifest(Some("assets/icon.png"), browser);
+            let manifest = read_with_icon(&format!("installable_off_{tag}"), &source, &icon)
+                .expect("an install-off manifest reads");
+            assert_eq!(manifest.delivery.browser.install, Install::Off, "{tag}");
+        }
+        let manifest = read(
+            "installable_no_browser",
+            &format!("{HEADER}package = {{ name = \"x\" }}\n"),
+        )
+        .expect("a manifest without delivery reads");
+        assert_eq!(manifest.delivery.browser.install, Install::Off);
+    }
+
+    #[test]
+    fn installable_with_a_fit_icon_is_on() {
+        let source = install_manifest(Some("assets/icon.png"), "{ installable = True }");
+        let manifest = read_with_icon("installable_on", &source, &pwa_icon::test_png(512, 512))
+            .expect("an installable manifest with a fit icon reads");
+        assert!(
+            matches!(&manifest.delivery.browser.install, Install::On(icon) if icon.side().get() == 512),
+            "{:?}",
+            manifest.delivery.browser.install
+        );
+    }
+
+    #[test]
+    fn installable_with_an_unfit_icon_is_refused_at_icon() {
+        let source = install_manifest(Some("assets/icon.png"), "{ installable = True }");
+        let at = located_at(&source, "\"assets/icon.png\"");
+        let cases: [(&str, Vec<u8>, String); 3] = [
+            (
+                "not_png",
+                b"GIF89a\x00\x02\x00\x02".to_vec(),
+                text::msg::manifest_icon_not_png(&"\"assets/icon.png\"").to_string(),
+            ),
+            (
+                "not_square",
+                pwa_icon::test_png(512, 256),
+                text::msg::manifest_icon_not_square(&"\"assets/icon.png\"", &512, &256).to_string(),
+            ),
+            (
+                "too_small",
+                pwa_icon::test_png(191, 191),
+                text::msg::manifest_icon_too_small(&"\"assets/icon.png\"", &191, &192).to_string(),
+            ),
+        ];
+        for (tag, icon, expected) in cases {
+            let result = read_with_icon(&format!("installable_unfit_{tag}"), &source, &icon);
+            assert!(
+                matches!(&result, Err(CliError::Usage(msg))
+                    if msg.contains(&expected) && msg.contains(&at)),
+                "{tag}: refused at the icon ({at}) with {expected:?}: {:?}",
+                result.map(|m| m.name)
+            );
+        }
+    }
+
+    #[test]
+    fn installable_with_an_icon_outside_the_root_is_refused() {
+        let source = install_manifest(Some("../outside.png"), "{ installable = True }");
+        let result = read_with_icon(
+            "installable_icon_escape",
+            &source,
+            &pwa_icon::test_png(512, 512),
+        );
+        assert!(
+            matches!(result, Err(CliError::PathEscape { .. })),
+            "an icon outside the project root is refused: {:?}",
+            result.map(|m| m.name)
+        );
+    }
+
+    #[test]
+    fn an_unknown_browser_field_names_every_field() {
+        let source = install_manifest(None, "{ themeColor = \"#000\" }");
+        let result = read("unknown_browser_field", &source);
+        assert!(
+            matches!(&result, Err(CliError::Usage(msg))
+                if msg.contains("`themeColor` is not a browser field")
+                    && msg.contains("`basePath`")
+                    && msg.contains("`installable`")),
+            "{:?}",
+            result.map(|m| m.name)
+        );
+    }
+
+    /// The field names of `BrowserConfig` in the `Ipe.Package` schema are the fields the reader accepts.
+    #[test]
+    fn browser_fields_match_the_package_schema() {
+        let schema_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../stdlib/Ipe/Package.ipe");
+        let schema = std::fs::read_to_string(&schema_path).expect("read Ipe.Package schema");
+        let (_, alias) = schema
+            .split_once("type alias BrowserConfig =")
+            .expect("BrowserConfig alias in the schema");
+        let (record, _) = alias.split_once('}').expect("BrowserConfig record closes");
+        let schema_fields: Vec<&str> = record
+            .split(['{', ','])
+            .filter_map(|field| field.split_once(':'))
+            .map(|(name, _)| name.trim())
+            .collect();
+        let reader_fields: Vec<&str> = BROWSER_FIELDS.iter().map(|(name, _)| *name).collect();
+        assert_eq!(schema_fields, reader_fields);
     }
 
     /// Read a manifest whose `delivery.browser.basePath` is the string `raw`.

@@ -141,7 +141,7 @@ fn compile_worker_is_cancelled_by_a_concurrent_input_edit() {
             debugger: false,
             crate_name: ipe_backend_rust::CrateName::SingleFile,
             hot_appearance: false,
-            host: ipe_backend_rust::EmitHost::Served,
+            host: ipe_backend_rust::EmitHost::Served(ipe_backend_rust::ServedInstall::Off),
             intent: ipe_backend_rust::BuildIntent::Development,
         },
     );
@@ -227,7 +227,7 @@ fn the_same_fixture_compiles_cleanly_without_a_concurrent_edit() {
             debugger: false,
             crate_name: ipe_backend_rust::CrateName::SingleFile,
             hot_appearance: false,
-            host: ipe_backend_rust::EmitHost::Served,
+            host: ipe_backend_rust::EmitHost::Served(ipe_backend_rust::ServedInstall::Off),
             intent: ipe_backend_rust::BuildIntent::Development,
         },
     );

@@ -57,6 +57,26 @@ host, static hosts, and mobile shells all serve the bundle under it. It is `"/"`
 `A-Z a-z 0-9 - . _ ~`, with no trailing `/`, no empty, `.`, or `..` segment, and
 at most 1024 bytes in all; the manifest refuses any other value.
 
+`installable` (default `False`): when `True`, a `web served` app offers browser
+install: a web app manifest, a home-screen icon, and a standalone window. It
+requires the top-level `icon`, a PNG that is square, at least 192 by 192 px,
+and at most 2 MiB; any other icon stops the build with an error naming the
+rule. The served base path comes from the server (`IPE_WEB_BASE_PATH` or
+`Server.mountApp`), not from `basePath`.
+
+```ipe
+package : Package
+package =
+    { name = "todo"
+    , icon = "assets/icon-512.png"
+    , delivery = { browser = { basePath = "/", installable = True } }
+    }
+```
+
+An installed app still needs a connection: its model lives on the server.
+Offline it shows a notice and nothing else; it never imitates
+a working app.
+
 Run `ipe doc Ipe.Package` for every field.
 
 ## Desktop: a webview-native bundle

@@ -1192,8 +1192,8 @@ static HAND_TABLE: &[EnvVar] = &[
     EnvVar {
         name: "IPE_WEB_STATIC_DIR",
         default: Cow::Borrowed("unset"),
-        purpose: "Directory served at `/static/*`. Populated from `package.ipe [web] \
-                  static`. Path traversal is blocked by construction.",
+        purpose: "Directory served at `/static/*`, set by whoever runs the app. \
+                  Path traversal is blocked by construction.",
         subsystem: Subsystem::Web,
         class: Class::Tunable,
     },

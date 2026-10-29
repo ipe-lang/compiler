@@ -1,0 +1,56 @@
+module Main exposing (main)
+
+-- | install-offer — the smallest `web served` app with `installable = True`.
+--
+-- No capabilities, no JS ports: a pure counter over the closed Web renderer,
+-- used only to prove the install offer (manifest link, touch-icon link, and
+-- an empty `Page.getInstallabilityErrors` list) in a real browser.
+
+import Ipe.String as String
+import Ipe.Tea.Web as Web
+import Ipe.Tea.Web.Cmd as Cmd
+import Ipe.Tea.Web.Sub as Sub
+import Ipe.Ui as Ui
+
+
+type alias Model =
+    { count : Int }
+
+
+type Msg
+    = Increment
+
+
+init : WebReq -> ( Model, Cmd.Cmd Msg )
+init _req =
+    ( { count = 0 }, Cmd.none )
+
+
+update : Msg -> Model -> ( Model, Cmd.Cmd Msg )
+update msg model =
+    case msg of
+        Increment ->
+            ( { model | count = model.count + 1 }, Cmd.none )
+
+
+subscriptions : Model -> Sub.Sub Msg
+subscriptions _model =
+    Sub.none
+
+
+view : Model -> Element Msg
+view model =
+    Ui.column
+        []
+        [ Ui.button [] { onPress = Just Increment, label = Ui.text (String.fromInt model.count) } ]
+
+
+main =
+    Web.tea
+        { init = init
+        , update = update
+        , view = view
+        , subscriptions = subscriptions
+        , routes = []
+        , notFound = Increment
+        }

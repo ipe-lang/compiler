@@ -166,6 +166,8 @@ const SCHEMA_HASH: &str =
 const ENV_NAME_LITERAL: &str = "quotes a public env name into emitted Rust; a `str`'s `Debug` \
      escapes are Rust string-literal escapes";
 const SERDE_REFUSAL: &str = "a serde error carrying a path-refusal diagnostic, never emitted";
+const BYTES_DEBUG: &str = "a hand-written `Debug` header for a byte carrier that prints its \
+     length, side or digest, never its bytes; never emitted";
 const CACHE_KEY: &str = "bytes folded into a build-cache key from non-secret emit settings, never \
      emitted";
 
@@ -504,10 +506,22 @@ const DEBUG_SITES: &[DebugSite] = &[
         why: DIAGNOSTIC,
     },
     DebugSite {
+        file: "rust/src/served_install.rs",
+        func: NO_FUNC,
+        count: 1,
+        why: BYTES_DEBUG,
+    },
+    DebugSite {
         file: "rust/src/static_build.rs",
         func: "staticize_manifest",
         count: 2,
         why: DIAGNOSTIC,
+    },
+    DebugSite {
+        file: "src/lib.rs",
+        func: NO_FUNC,
+        count: 1,
+        why: BYTES_DEBUG,
     },
     DebugSite {
         file: "src/lib.rs",

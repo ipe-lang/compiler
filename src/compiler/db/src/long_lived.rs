@@ -485,7 +485,7 @@ mod tests {
                 debugger: false,
                 crate_name,
                 hot_appearance: false,
-                host: ipe_backend_rust::EmitHost::Served,
+                host: ipe_backend_rust::EmitHost::Served(ipe_backend_rust::ServedInstall::Off),
                 intent: ipe_backend_rust::BuildIntent::Development,
             },
         }

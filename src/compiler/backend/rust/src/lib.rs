@@ -34,6 +34,10 @@ pub use emit_settings::{
 };
 mod emit_expr;
 mod emit_model_gate;
+mod served_install;
+pub use served_install::{
+    ICON_MAX_BYTES, IconRefusal, IconSide, MIN_ICON_SIDE, ServedIcon, ServedInstall, test_png,
+};
 mod emit_model_schema;
 mod emit_template;
 mod emit_tui;
@@ -1292,6 +1296,10 @@ pub(crate) struct EmitCtx<'a> {
     /// from the CLI's resolved `delivery.desktop`. `None` selects the runtime's
     /// built-in fallback window; only consulted when [`Self::uses_webview`].
     pub(crate) webview_window: Option<WebViewWindow>,
+    /// The browser-install offer of a served build; [`ServedInstall::Off`]
+    /// for every other host. Read by the web app leaf, which registers the
+    /// facts, and by the project writer, which writes the icon file.
+    pub(crate) served_install: ServedInstall,
     /// `true` when the program uses at least one `Ipe.CssSafety` leaf
     /// security kernel (the `Ipe.Css` backing).  When set (independently of
     /// [`Self::uses_ui`]), [`crate::project::emit_program`] declares
@@ -1754,9 +1762,9 @@ impl<'a> EmitCtx<'a> {
             host,
             intent: build_intent,
         } = settings;
-        let (webview_host, webview_window) = match host {
-            EmitHost::Served => (false, None),
-            EmitHost::WebView(window) => (true, Some(window)),
+        let (webview_host, webview_window, served_install) = match host {
+            EmitHost::Served(install) => (false, None, install),
+            EmitHost::WebView(window) => (true, Some(window), ServedInstall::Off),
         };
         // Every emission entry builds its context here, so a malformed literal
         // route path is refused whether or not emission reaches the route.
@@ -2403,6 +2411,7 @@ impl<'a> EmitCtx<'a> {
             entry_surface,
             uses_webview,
             webview_window,
+            served_install,
             uses_css,
             uses_auth,
             uses_principal,

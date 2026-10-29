@@ -92,7 +92,7 @@ fn cold_compile(user: &UserSources) -> CompileOutcome {
             debugger: false,
             crate_name: ipe_backend_rust::CrateName::SingleFile,
             hot_appearance: false,
-            host: ipe_backend_rust::EmitHost::Served,
+            host: ipe_backend_rust::EmitHost::Served(ipe_backend_rust::ServedInstall::Off),
             intent: ipe_backend_rust::BuildIntent::Development,
         },
     );
@@ -170,7 +170,7 @@ impl WarmSession {
                     debugger: false,
                     crate_name: ipe_backend_rust::CrateName::SingleFile,
                     hot_appearance: false,
-                    host: ipe_backend_rust::EmitHost::Served,
+                    host: ipe_backend_rust::EmitHost::Served(ipe_backend_rust::ServedInstall::Off),
                     intent: ipe_backend_rust::BuildIntent::Development,
                 },
             )
