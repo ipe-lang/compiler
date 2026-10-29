@@ -222,11 +222,13 @@ subscriptionFields subscription =
 
 keyFields : ReceiverKey -> AuthSecret -> List ( String, Value )
 keyFields receiver auth =
-    case ( receiver, auth ) of
-        ( ReceiverKey receiverText, AuthSecret authText ) ->
-            [ ( "p256dh", Encode.string receiverText )
-            , ( "auth", Encode.string authText )
-            ]
+    case receiver of
+        ReceiverKey receiverText ->
+            case auth of
+                AuthSecret authText ->
+                    [ ( "p256dh", Encode.string receiverText )
+                    , ( "auth", Encode.string authText )
+                    ]
 
 
 apnsEnvironmentText : ApnsEnvironment -> String
