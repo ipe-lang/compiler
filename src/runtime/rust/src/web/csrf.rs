@@ -16,6 +16,7 @@
 
 use crate::env_grammar::EnvFlag;
 use crate::env_registry::security::WEB_CSRF_ORIGIN_CHECK;
+use crate::http_header::RequestAuthority;
 use crate::telemetry;
 use axum::http::{HeaderMap, StatusCode, request::Parts};
 use axum::response::{IntoResponse, Response};
@@ -213,45 +214,6 @@ pub fn is_exempt_path(path: &str) -> bool {
         || path.starts_with("/_ipe/console/")
 }
 
-/// The authority a request was addressed to, as the app listener's Host
-/// admission parses it: the target URI's (absolute-form, HTTP/2 `:authority`),
-/// else the one `Host` header.
-///
-/// Never empty and never ambiguous, so a comparison against it can never pass
-/// vacuously or against one of two disagreeing authorities.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct RequestAuthority<'a>(&'a str);
-
-impl<'a> RequestAuthority<'a> {
-    /// The authority `parts` names, or `None` when
-    /// [`crate::inbound_authority::Authority::from_request`] refuses it: no
-    /// authority, two `Host` headers, a `Host` disagreeing with the target URI,
-    /// or a malformed one.
-    #[must_use]
-    pub fn of(parts: &'a Parts) -> Option<Self> {
-        if crate::inbound_authority::Authority::from_request(parts).is_err() {
-            return None;
-        }
-        parts
-            .uri
-            .authority()
-            .map(axum::http::uri::Authority::as_str)
-            .or_else(|| {
-                parts
-                    .headers
-                    .get(axum::http::header::HOST)
-                    .and_then(|host| host.to_str().ok())
-            })
-            .map(Self)
-    }
-
-    /// The authority text.
-    #[must_use]
-    pub const fn as_str(self) -> &'a str {
-        self.0
-    }
-}
-
 /// The origin-check switch, read once per process.
 ///
 /// A refused value reads as `On`: the startup check has already refused the
@@ -289,9 +251,7 @@ fn origin_mismatch(check: EnvFlag, framed: bool, parts: &Parts) -> bool {
     };
     // The comparison normalises each side's scheme-implied default port, shared
     // with `console.rs::is_cross_origin_ingest` and `server.rs::ws_cross_origin`.
-    RequestAuthority::of(parts).is_none_or(|authority| {
-        crate::http_header::origin_host_mismatch(origin, authority.as_str())
-    })
+    crate::http_header::origin_host_mismatch(origin, RequestAuthority::of(parts))
 }
 
 /// The axum middleware. Validates CSRF on mutating, non-exempt requests; passes

@@ -2362,8 +2362,7 @@ fn remote_address(
 async fn build_request(
     req: axum::extract::Request,
     pattern: &crate::encoding::ServerPattern,
-) -> Result<(ServerRequest, Option<axum::extract::ws::WebSocketUpgrade>), RequestRejection> {
-    use axum::extract::FromRequestParts;
+) -> Result<(ServerRequest, Handshake), RequestRejection> {
     let method = req.method().as_str().to_string();
     let uri = req.uri().clone();
     // The listener respelled the path canonically: this is the encoder's text.
@@ -2402,12 +2401,13 @@ async fn build_request(
         cookies.entry(name).or_insert(value);
     }
     let (mut parts, body) = req.into_parts();
-    // Extract the WebSocket upgrader if this is an upgrade request
-    // (succeeds only when the Connection/Upgrade/Sec-WebSocket-* headers are
-    // present). Stashed via task-local so server_web_socket_upgrade can reach it.
-    let upgrader = axum::extract::ws::WebSocketUpgrade::from_request_parts(&mut parts, &())
-        .await
-        .ok();
+    // The upgrader and the authority are stashed via task-local so
+    // server_web_socket_upgrade can reach them.
+    let handshake = Handshake {
+        authority: crate::http_header::RequestAuthority::of(&parts)
+            .map(crate::http_header::RequestAuthority::hold),
+        upgrader: websocket_upgrader(&mut parts).await.ok(),
+    };
     // A malformed ceiling refuses the request rather than widening the cap.
     let Ok(cap) = max_body() else {
         return Err(RequestRejection::Unavailable);
@@ -2443,8 +2443,39 @@ async fn build_request(
             cookies,
             remoteAddr: remote_addr,
         },
-        upgrader,
+        handshake,
     ))
+}
+
+/// What a WebSocket upgrade of the request needs from its head.
+struct Handshake {
+    /// The upgrader, when the request is a WebSocket upgrade.
+    upgrader: Option<axum::extract::ws::WebSocketUpgrade>,
+    /// The authority the request was addressed to, when it names one.
+    authority: Option<crate::http_header::HeldAuthority>,
+}
+
+/// Why a request head yields no WebSocket upgrader.
+#[derive(Debug, PartialEq, Eq)]
+enum NoUpgrader {
+    /// The request is not a `GET`: the only upgrade the server serves is the
+    /// HTTP/1.1 handshake, never an HTTP/2 extended `CONNECT`.
+    NotGet,
+    /// The head is not a well-formed upgrade request.
+    NotUpgrade,
+}
+
+/// The WebSocket upgrader of a `GET` request carrying the upgrade headers.
+async fn websocket_upgrader(
+    parts: &mut axum::http::request::Parts,
+) -> Result<axum::extract::ws::WebSocketUpgrade, NoUpgrader> {
+    use axum::extract::FromRequestParts;
+    if parts.method != axum::http::Method::GET {
+        return Err(NoUpgrader::NotGet);
+    }
+    axum::extract::ws::WebSocketUpgrade::from_request_parts(parts, &())
+        .await
+        .map_err(|_| NoUpgrader::NotUpgrade)
 }
 
 /// The response `r` sends, claiming its stream from `streams`, the table of
@@ -2521,35 +2552,35 @@ fn method_router(
         let h = h.clone();
         let pattern = Arc::clone(&pattern);
         async move {
-            let (ipe_req, upgrader) = match build_request(req, &pattern).await {
+            let (ipe_req, handshake) = match build_request(req, &pattern).await {
                 Ok(v) => v,
                 Err(rejection) => return rejection.status_and_reason().into_response(),
             };
-            // Run the handler with the WS upgrader + a response slot in scope.
-            // If the handler called server_web_socket_upgrade, it stashed the
-            // real 101 response in WS_RESPONSE — prefer it over the sentinel.
-            WS_UPGRADER
-                .scope(std::cell::Cell::new(upgrader), async move {
-                    WS_RESPONSE
-                        .scope(std::cell::Cell::new(None), async move {
-                            let (result, streams) = dispatch(&h, ipe_req).await;
-                            // An upgraded socket answers the request; the
-                            // streams it registered drop unclaimed.
-                            if let Some(ws_resp) = WS_RESPONSE.with(|c| c.take()) {
-                                return ws_resp;
-                            }
-                            match result {
-                                Ok(resp) => to_axum_response(resp, streams),
-                                Err(_) => (
-                                    axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-                                    "Internal Server Error",
-                                )
-                                    .into_response(),
-                            }
-                        })
-                        .await
-                })
-                .await
+            // Run the handler with the WS upgrader, the request authority and
+            // a response slot in scope. If the handler called
+            // server_web_socket_upgrade, it stashed the real 101 response in
+            // WS_RESPONSE — prefer it over the sentinel.
+            let scoped = WS_UPGRADER.scope(std::cell::Cell::new(handshake.upgrader), async move {
+                WS_RESPONSE
+                    .scope(std::cell::Cell::new(None), async move {
+                        let (result, streams) = dispatch(&h, ipe_req).await;
+                        // An upgraded socket answers the request; the
+                        // streams it registered drop unclaimed.
+                        if let Some(ws_resp) = WS_RESPONSE.with(|c| c.take()) {
+                            return ws_resp;
+                        }
+                        match result {
+                            Ok(resp) => to_axum_response(resp, streams),
+                            Err(_) => (
+                                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                                "Internal Server Error",
+                            )
+                                .into_response(),
+                        }
+                    })
+                    .await
+            });
+            WS_AUTHORITY.scope(handshake.authority, scoped).await
         }
     };
     match method.filter() {
@@ -3963,6 +3994,8 @@ where
 tokio::task_local! {
     // The axum upgrader for the in-flight request (Some only on a WS upgrade).
     static WS_UPGRADER: std::cell::Cell<Option<axum::extract::ws::WebSocketUpgrade>>;
+    // The authority the in-flight request was addressed to, if it names one.
+    static WS_AUTHORITY: Option<crate::http_header::HeldAuthority>;
     // The 101 response server_web_socket_upgrade produced (preferred by method_router).
     static WS_RESPONSE: std::cell::Cell<Option<axum::response::Response>>;
 }
@@ -4020,7 +4053,7 @@ async fn ws_loop<E, S>(
     let max_bytes: usize = ws_max_message_bytes(cfg.maxMessageBytes);
     // Framing-layer enforcement lives on the `WebSocketUpgrade` builder, applied
     // at upgrade time in `server_web_socket_upgrade` (`.max_message_size()` /
-    // `.max_frame_size()` — axum 0.7.9 exposes both). A frame over the cap is
+    // `.max_frame_size()`). A frame over the cap is
     // rejected by tokio-tungstenite before it reaches this loop. The Text/Binary
     // size checks below are application-layer defense in depth (belt-and-braces
     // against a future axum/tungstenite version silently dropping the cap).
@@ -4262,23 +4295,37 @@ fn ws_origin_matches(pattern: &str, origin: &str) -> bool {
     host_safe(rest.get(..rest.len() - last.len()).unwrap_or(""))
 }
 
-/// True when `Origin` is present and does not match `Host` (cross-origin).
-/// Absent `Origin` (same-origin browsers on older UA quirks, non-browser WS
-/// clients, and legitimate same-origin pages under some proxy setups that
-/// strip it) is NOT flagged — matches the equivalent CSRF/ingest same-origin
-/// helpers elsewhere in this runtime (`csrf.rs::origin_mismatch`,
-/// `console.rs::is_cross_origin_ingest`), via the shared `origin_host_mismatch`
-/// helper in `http_header` (normalizes away each side's scheme-implied
-/// default port so the three never drift to different behavior).
-/// `http_header` is gated on `feature = "server"` only (not `live`), so this
-/// reuse still builds standalone under `--features server` without `live`.
-fn ws_cross_origin(req: &ServerRequest) -> bool {
+/// True when `Origin` is present and does not match `authority`, the
+/// authority the request was addressed to (cross-origin).
+///
+/// Absent `Origin` (non-browser WS clients, proxies that strip it) is not
+/// flagged; an `Origin` on a request naming no single well-formed authority
+/// (`None`) is. The comparison is the shared `http_header::origin_host_mismatch`,
+/// also behind `csrf.rs::origin_mismatch` and
+/// `console.rs::is_cross_origin_ingest`, so the three never drift.
+fn ws_cross_origin(
+    req: &ServerRequest,
+    authority: Option<crate::http_header::RequestAuthority<'_>>,
+) -> bool {
     let origin = match header_ci(&req.headers, "origin") {
         Some(o) if !o.is_empty() => o,
         _ => return false,
     };
-    let host = header_ci(&req.headers, "host").unwrap_or("");
-    crate::http_header::origin_host_mismatch(origin, host)
+    crate::http_header::origin_host_mismatch(origin, authority)
+}
+
+/// [`ws_cross_origin`] against the in-flight request's authority.
+///
+/// Outside a request scope no authority is known, so an `Origin` is flagged.
+fn ws_request_cross_origin(req: &ServerRequest) -> bool {
+    WS_AUTHORITY
+        .try_with(|held| {
+            ws_cross_origin(
+                req,
+                held.as_ref().map(crate::http_header::HeldAuthority::get),
+            )
+        })
+        .unwrap_or_else(|_| ws_cross_origin(req, None))
 }
 
 /// The refusal for a WebSocket upgrade with no origin allowlist, if any.
@@ -4324,7 +4371,7 @@ pub fn server_web_socket_upgrade<E: From<String> + Send + 'static>(
             {
                 return ok_res(ws_resp(403, "websocket: origin not allowed"));
             }
-        } else if ws_cross_origin(&req) {
+        } else if ws_request_cross_origin(&req) {
             // Dev mode, no explicit allowlist: default to same-origin rather
             // than allow-all (closes CSWSH — Cross-Site WebSocket Hijacking. A
             // WS handshake can't carry a custom header, so unlike a
@@ -8023,24 +8070,136 @@ mod tests {
         }
     }
 
+    /// The authority of a request whose one `Host` header is `host`.
+    #[allow(clippy::expect_used)] // test: a fixed request builds and names a host
+    fn held_authority(host: &str) -> crate::http_header::HeldAuthority {
+        let (parts, ()) = axum::http::Request::builder()
+            .uri("/ws")
+            .header(axum::http::header::HOST, host)
+            .body(())
+            .expect("test request builds")
+            .into_parts();
+        crate::http_header::RequestAuthority::of(&parts)
+            .expect("a well-formed host")
+            .hold()
+    }
+
+    /// [`ws_cross_origin`] of a request carrying `headers`, addressed to `host`.
+    fn ws_cross(headers: &[(&str, &str)], host: Option<&str>) -> bool {
+        let held = host.map(held_authority);
+        ws_cross_origin(
+            &mk_ws_req(headers),
+            held.as_ref().map(crate::http_header::HeldAuthority::get),
+        )
+    }
+
     #[test]
     fn ws_cross_origin_detection() {
-        assert!(ws_cross_origin(&mk_ws_req(&[
-            ("origin", "https://evil.example"),
-            ("host", "victim.example:8000"),
-        ])));
-        assert!(!ws_cross_origin(&mk_ws_req(&[
-            ("origin", "https://victim.example:8000"),
-            ("host", "victim.example:8000"),
-        ])));
+        assert!(ws_cross(
+            &[("origin", "https://evil.example")],
+            Some("victim.example:8000")
+        ));
+        assert!(!ws_cross(
+            &[("origin", "https://victim.example:8000")],
+            Some("victim.example:8000")
+        ));
         // No Origin header at all → not flagged (non-browser client).
-        assert!(!ws_cross_origin(&mk_ws_req(&[("host", "victim.example")])));
-        // Backlog port-mismatch fix: an implicit-default-port Origin against
-        // an explicit-default-port Host is the SAME origin, not a mismatch.
-        assert!(!ws_cross_origin(&mk_ws_req(&[
-            ("origin", "https://victim.example"),
-            ("host", "victim.example:443"),
-        ])));
+        assert!(!ws_cross(&[], Some("victim.example")));
+        // An implicit-default-port Origin against an explicit-default-port
+        // authority is the SAME origin, not a mismatch.
+        assert!(!ws_cross(
+            &[("origin", "https://victim.example")],
+            Some("victim.example:443")
+        ));
+    }
+
+    /// An `Origin` on a request naming no authority is cross-origin, never
+    /// admitted for want of a `Host` to compare against — whatever `Host` the
+    /// program-visible request carries.
+    #[test]
+    fn ws_origin_without_an_authority_is_cross_origin() {
+        assert!(ws_cross(&[("origin", "https://evil.example")], None));
+        assert!(ws_cross(
+            &[
+                ("origin", "https://victim.example"),
+                ("host", "victim.example")
+            ],
+            None
+        ));
+        assert!(ws_request_cross_origin(&mk_ws_req(&[(
+            "origin",
+            "https://evil.example"
+        )])));
+        assert!(!ws_request_cross_origin(&mk_ws_req(&[])));
+    }
+
+    /// The authority a request carries reaches the upgrade's origin check: an
+    /// absolute-form request with no `Host` is judged against its target, and
+    /// one naming no authority at all is refused.
+    #[tokio::test]
+    #[allow(clippy::expect_used)] // test: fixed patterns parse and fixed requests build
+    async fn build_request_carries_the_request_authority() {
+        let pattern = crate::encoding::ServerPattern::parse("/ws").expect("well-formed");
+        for (uri, want) in [
+            ("http://victim.example/ws", Some("victim.example")),
+            ("/ws", None),
+        ] {
+            let mut wire = axum::http::Request::builder()
+                .method("GET")
+                .uri(uri)
+                .header(axum::http::header::ORIGIN, "https://evil.example")
+                .body(axum::body::Body::empty())
+                .expect("test request builds");
+            assert!(canonicalise(&mut wire).is_ok(), "{uri} parses");
+            let built = build_request(wire, &pattern).await;
+            assert!(built.is_ok(), "{uri} builds");
+            let Ok((req, handshake)) = built else { return };
+            assert_eq!(
+                handshake.authority.as_ref().map(|held| held.get().as_str()),
+                want,
+                "{uri}"
+            );
+            let cross = WS_AUTHORITY
+                .scope(handshake.authority, async { ws_request_cross_origin(&req) })
+                .await;
+            assert!(cross, "{uri}: an evil Origin is cross-origin");
+        }
+    }
+
+    /// Only a `GET` yields an upgrader: an HTTP/2 extended `CONNECT` carrying
+    /// the WebSocket headers is refused before axum's own extractor, which
+    /// would accept it; the `GET` control reaches that extractor.
+    #[tokio::test]
+    #[allow(clippy::expect_used)] // test: fixed requests build
+    async fn websocket_upgrader_refuses_a_connect() {
+        let head = |method: axum::http::Method, version: axum::http::Version| {
+            let (parts, ()) = axum::http::Request::builder()
+                .method(method)
+                .version(version)
+                .uri("/ws")
+                .header(axum::http::header::CONNECTION, "upgrade")
+                .header(axum::http::header::UPGRADE, "websocket")
+                .header(
+                    axum::http::header::SEC_WEBSOCKET_KEY,
+                    "dGhlIHNhbXBsZSBub25jZQ==",
+                )
+                .header(axum::http::header::SEC_WEBSOCKET_VERSION, "13")
+                .body(())
+                .expect("test request builds")
+                .into_parts();
+            parts
+        };
+        let mut connect = head(axum::http::Method::CONNECT, axum::http::Version::HTTP_2);
+        assert_eq!(
+            websocket_upgrader(&mut connect).await.err(),
+            Some(NoUpgrader::NotGet)
+        );
+        let mut get = head(axum::http::Method::GET, axum::http::Version::HTTP_11);
+        assert_eq!(
+            websocket_upgrader(&mut get).await.err(),
+            Some(NoUpgrader::NotUpgrade),
+            "a GET reaches the extractor (no connection to upgrade in a unit test)"
+        );
     }
 
     #[tokio::test]
@@ -8083,8 +8242,12 @@ mod tests {
             ("origin", "https://victim.example"),
             ("host", "victim.example"),
         ]);
-        let result =
-            server_web_socket_upgrade::<String>(req, ws_server_default_cfg::<String>()).await;
+        let result = WS_AUTHORITY
+            .scope(
+                Some(held_authority("victim.example")),
+                server_web_socket_upgrade::<String>(req, ws_server_default_cfg::<String>()),
+            )
+            .await;
         crate::system::locked_remove_var("ENV");
         crate::system::locked_remove_var("IPE_ENV");
         let IpeResult::Ok(resp) = result else {

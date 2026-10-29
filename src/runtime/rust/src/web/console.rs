@@ -484,8 +484,8 @@ fn token_blocked(
 /// accepted. With the token unset, the endpoint fails CLOSED in production
 /// (401) and, in dev, accepts only same-origin requests — a cross-origin POST
 /// (the CSRF-log-injection shape) is rejected (403).
-pub async fn ingest(headers: axum::http::HeaderMap, body: String) -> axum::response::Response {
-    if let Some(resp) = ingest_token_blocked(&headers) {
+pub async fn ingest(head: axum::http::request::Parts, body: String) -> axum::response::Response {
+    if let Some(resp) = ingest_token_blocked(&head) {
         return resp;
     }
     // Two accepted shapes: a bare array of `{level, message}` (legacy), or the
@@ -551,36 +551,31 @@ fn fold_log(it: &serde_json::Value) {
     }
 }
 
-/// True when `Origin` is present AND does not match `Host` — i.e. this is a
-/// cross-origin request. Absent `Origin` (same-origin fetch/XHR, curl,
-/// server-to-server pushes from `push_exporter.rs`) is NOT flagged: those
-/// callers never send a hostile cross-origin request by construction, and
-/// requiring `Origin` would break legitimate non-browser ingest pushes.
-/// Mirrors `csrf.rs::origin_mismatch`'s same-origin comparison (via the
-/// shared `origin_host_mismatch` helper, also used by
-/// `server.rs::ws_cross_origin` — normalizes away each side's scheme-implied
-/// default port so the three never drift to different behavior), applied
-/// unconditionally here (not opt-in) since it's the ONLY defense available
-/// when `IPE_INGEST_TOKEN` is unset.
-fn is_cross_origin_ingest(headers: &axum::http::HeaderMap) -> bool {
-    let origin = match headers
+/// True when `Origin` is present and does not match the request's authority —
+/// a cross-origin request.
+///
+/// Absent `Origin` (same-origin fetch/XHR, curl, server-to-server pushes from
+/// `push_exporter.rs`) is not flagged: requiring it would break legitimate
+/// non-browser ingest pushes. An `Origin` on a request naming no single
+/// well-formed authority is flagged. The comparison is the shared
+/// `origin_host_mismatch`, also behind `csrf.rs::origin_mismatch` and
+/// `server.rs::ws_cross_origin`, applied unconditionally here since it is the
+/// only defense when `IPE_INGEST_TOKEN` is unset.
+fn is_cross_origin_ingest(head: &axum::http::request::Parts) -> bool {
+    let Some(origin) = head
+        .headers
         .get(axum::http::header::ORIGIN)
         .and_then(|h| h.to_str().ok())
-    {
-        Some(o) => o,
-        None => return false,
+    else {
+        return false;
     };
-    let host = headers
-        .get(axum::http::header::HOST)
-        .and_then(|h| h.to_str().ok())
-        .unwrap_or("");
-    crate::http_header::origin_host_mismatch(origin, host)
+    crate::http_header::origin_host_mismatch(origin, crate::http_header::RequestAuthority::of(head))
 }
 
 /// The ingest gate over the process environment: the configured
 /// `IPE_INGEST_TOKEN` (env, then in-code `Console.ingestToken`) and
 /// [`telemetry::dev_surface_from_env`].
-fn ingest_token_blocked(headers: &axum::http::HeaderMap) -> Option<axum::response::Response> {
+fn ingest_token_blocked(head: &axum::http::request::Parts) -> Option<axum::response::Response> {
     let want = crate::system::read_env_var("IPE_INGEST_TOKEN")
         .ok()
         .filter(|t| !t.is_empty())
@@ -591,7 +586,7 @@ fn ingest_token_blocked(headers: &axum::http::HeaderMap) -> Option<axum::respons
                 .filter(|t| !t.is_empty())
         });
     ingest_decision(
-        headers,
+        head,
         want.as_deref(),
         telemetry::dev_surface_from_env().as_ref(),
     )
@@ -603,7 +598,7 @@ fn ingest_token_blocked(headers: &axum::http::HeaderMap) -> Option<axum::respons
 /// whose every listener is loopback); there, a cross-origin browser POST (log-injection CSRF shape —
 /// see `is_cross_origin_ingest`) is still refused.
 pub(super) fn ingest_decision(
-    headers: &axum::http::HeaderMap,
+    head: &axum::http::request::Parts,
     want: Option<&str>,
     dev: Option<&telemetry::DevSurface>,
 ) -> Option<axum::response::Response> {
@@ -630,7 +625,7 @@ pub(super) fn ingest_decision(
             // `Content-Type: text/plain` and no custom header is a CORS
             // "simple request", so a malicious cross-origin page can fire it
             // without a preflight) is rejected.
-            if is_cross_origin_ingest(headers) {
+            if is_cross_origin_ingest(head) {
                 return Some(
                     (
                         StatusCode::FORBIDDEN,
@@ -642,7 +637,8 @@ pub(super) fn ingest_decision(
             return None;
         }
     };
-    let got = headers
+    let got = head
+        .headers
         .get("x-ipe-ingest-token")
         .and_then(|h| h.to_str().ok())
         .unwrap_or("");
@@ -1255,37 +1251,81 @@ mod tests {
         assert_eq!(Surface::of_path("/"), None);
     }
 
+    /// The head of a request carrying `headers`.
+    #[allow(clippy::expect_used)] // test: a fixed request builds
+    fn head_of(headers: axum::http::HeaderMap) -> axum::http::request::Parts {
+        let (mut head, ()) = axum::http::Request::builder()
+            .uri("/_ipe/observability/ingest")
+            .body(())
+            .expect("test request builds")
+            .into_parts();
+        head.headers = headers;
+        head
+    }
+
     // Pure (no env dependency) — safe as its own test, no race with
     // ingest_token_gate's IPE_INGEST_TOKEN mutation below.
     #[test]
     fn is_cross_origin_ingest_detection() {
-        let mk = |origin: Option<&str>, host: &str| {
+        let mk = |origin: Option<&str>, host: Option<&str>| {
             let mut h = axum::http::HeaderMap::new();
             if let Some(o) = origin {
                 h.insert("origin", o.parse().unwrap());
             }
-            h.insert("host", host.parse().unwrap());
-            h
+            if let Some(host) = host {
+                h.insert("host", host.parse().unwrap());
+            }
+            head_of(h)
         };
         assert!(is_cross_origin_ingest(&mk(
             Some("https://evil.example"),
-            "victim.example"
+            Some("victim.example")
         )));
         assert!(!is_cross_origin_ingest(&mk(
             Some("https://victim.example"),
-            "victim.example"
+            Some("victim.example")
         )));
         // No Origin header at all → not flagged (curl / server-to-server push).
-        assert!(!is_cross_origin_ingest(&mk(None, "victim.example")));
+        assert!(!is_cross_origin_ingest(&mk(None, Some("victim.example"))));
         // An implicit-default-port Origin against an explicit-default-port
         // Host is the SAME origin, not a mismatch.
         assert!(!is_cross_origin_ingest(&mk(
             Some("https://victim.example"),
-            "victim.example:443"
+            Some("victim.example:443")
         )));
     }
 
-    fn origin_headers(origin: Option<&'static str>) -> axum::http::HeaderMap {
+    /// An `Origin` on a request naming no authority is cross-origin, never
+    /// admitted for want of a `Host` to compare against; the absolute-form
+    /// target's authority stands in for an absent `Host`.
+    #[test]
+    #[allow(clippy::expect_used)] // test: fixed requests build
+    fn ingest_origin_without_an_authority_is_cross_origin() {
+        let mut no_host = axum::http::HeaderMap::new();
+        no_host.insert("origin", "https://evil.example".parse().unwrap());
+        assert!(is_cross_origin_ingest(&head_of(no_host.clone())));
+        let mut empty_host = no_host.clone();
+        empty_host.insert("host", axum::http::HeaderValue::from_static(""));
+        assert!(is_cross_origin_ingest(&head_of(empty_host)));
+        let absolute = |origin: &'static str| {
+            let (head, ()) = axum::http::Request::builder()
+                .uri("http://victim.example/_ipe/observability/ingest")
+                .header("origin", origin)
+                .body(())
+                .expect("test request builds")
+                .into_parts();
+            head
+        };
+        assert!(is_cross_origin_ingest(&absolute("https://evil.example")));
+        assert!(!is_cross_origin_ingest(&absolute("http://victim.example")));
+        let dev = test_dev_surface();
+        assert_eq!(
+            status_of(ingest_decision(&head_of(no_host), None, Some(&dev))),
+            Some(StatusCode::FORBIDDEN)
+        );
+    }
+
+    fn origin_headers(origin: Option<&'static str>) -> axum::http::request::Parts {
         let mut h = axum::http::HeaderMap::new();
         if let Some(origin) = origin {
             h.insert("origin", axum::http::HeaderValue::from_static(origin));
@@ -1294,7 +1334,7 @@ mod tests {
                 axum::http::HeaderValue::from_static("victim.example"),
             );
         }
-        h
+        head_of(h)
     }
 
     #[test]
@@ -1415,8 +1455,9 @@ mod tests {
                 ingest_decision(&origin_headers(None), want, dev).is_some(),
                 "missing header blocked"
             );
-            let mut h = axum::http::HeaderMap::new();
-            h.insert("x-ipe-ingest-token", "wrong".parse().unwrap());
+            let mut h = head_of(axum::http::HeaderMap::new());
+            h.headers
+                .insert("x-ipe-ingest-token", "wrong".parse().unwrap());
             assert!(
                 ingest_decision(&h, want, dev).is_some(),
                 "wrong token blocked"
@@ -1424,7 +1465,8 @@ mod tests {
             // Correct token → allowed, even cross-origin (bearer-token auth
             // makes the same-origin check redundant).
             let mut h = origin_headers(Some("https://evil.example"));
-            h.insert("x-ipe-ingest-token", "secret123".parse().unwrap());
+            h.headers
+                .insert("x-ipe-ingest-token", "secret123".parse().unwrap());
             assert!(
                 ingest_decision(&h, want, dev).is_none(),
                 "correct token allowed even cross-origin"

@@ -1325,9 +1325,9 @@ mod tests {
         use axum::{Router, routing::any};
         async fn gate(
             State((want, accepted)): State<(String, Arc<AtomicUsize>)>,
-            headers: axum::http::HeaderMap,
+            head: axum::http::request::Parts,
         ) -> axum::response::Response {
-            match super::super::console::ingest_decision(&headers, Some(&want), None) {
+            match super::super::console::ingest_decision(&head, Some(&want), None) {
                 Some(refusal) => refusal,
                 None => {
                     accepted.fetch_add(1, Ordering::SeqCst);
