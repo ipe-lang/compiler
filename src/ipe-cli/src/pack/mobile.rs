@@ -917,8 +917,9 @@ impl ShellLayout {
 /// mount path the wasm build baked into the bundle's own URLs. The Android shell
 /// answers every request one of three ways: a request to its local origin is
 /// served from the bundle or answered by a local 404, a request to an origin of
-/// `delivery.servers` goes to the network, and any other request is answered by
-/// a local 403.
+/// `delivery.servers` goes to the network (never as the main frame), and any
+/// other request is answered by a local 403; service-worker requests follow the
+/// same rule.
 ///
 /// # Errors
 /// Propagates any error from the permission derivation, and refuses an Android
@@ -1072,8 +1073,8 @@ const fn group_field(group: RequestGroup) -> &'static str {
     }
 }
 
-/// A web-view facility the Android shell's chrome client serves, only for an
-/// accepted axis that covers it.
+/// A web-view facility the Android shell's web view or chrome client serves,
+/// only for an accepted axis that covers it.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
 enum ChromeFacility {
     /// The page's location prompt.
@@ -1086,6 +1087,8 @@ enum ChromeFacility {
     AudioCapture,
     /// The camera stream of `getUserMedia`.
     VideoCapture,
+    /// The page's `localStorage`.
+    DomStorage,
 }
 
 impl ChromeFacility {
@@ -1096,6 +1099,7 @@ impl ChromeFacility {
         Self::Capture,
         Self::AudioCapture,
         Self::VideoCapture,
+        Self::DomStorage,
     ];
 
     /// The `Shell` flag that turns the facility on.
@@ -1106,6 +1110,7 @@ impl ChromeFacility {
             Self::Capture => "CAPTURE",
             Self::AudioCapture => "AUDIO_CAPTURE",
             Self::VideoCapture => "VIDEO_CAPTURE",
+            Self::DomStorage => "DOM_STORAGE",
         }
     }
 }
@@ -1122,12 +1127,12 @@ const fn chrome_facilities(axis: WebCapability) -> &'static [ChromeFacility] {
         WebCapability::Camera => &[ChromeFacility::FileChooser, ChromeFacility::Capture],
         WebCapability::Microphone => &[ChromeFacility::AudioCapture],
         WebCapability::Recorder => &[ChromeFacility::AudioCapture, ChromeFacility::VideoCapture],
+        WebCapability::Storage => &[ChromeFacility::DomStorage],
         WebCapability::Notification
         | WebCapability::Push
         | WebCapability::Vibration
         | WebCapability::NetworkInfo
         | WebCapability::Clipboard
-        | WebCapability::Storage
         | WebCapability::Share
         | WebCapability::Battery
         | WebCapability::Gamepad
@@ -1233,8 +1238,9 @@ impl<'a> AndroidPlan<'a> {
 /// path handler registered at the pin's base directory serves them at
 /// [`android_entry_url`]. A request to that local origin is served from the
 /// bundle or answered by a local 404, a request to an origin of
-/// `delivery.servers` goes to the network, and any other request is answered
-/// by a local 403. The `AndroidManifest.xml` `<uses-permission>` lines come only
+/// `delivery.servers` goes to the network (never as the main frame), and any
+/// other request, a service worker's included, is answered by a local 403. The
+/// `AndroidManifest.xml` `<uses-permission>` lines come only
 /// from the permission derivation, and each is asked at the moment of use.
 fn android_layout(
     profile: BundleProfile,
@@ -1249,7 +1255,7 @@ fn android_layout(
     let mut files = vec![
         generated_file(
             "app/src/main/AndroidManifest.xml".to_owned(),
-            render_android_manifest(&plan),
+            render_android_manifest(&plan, icon.is_some()),
         ),
         generated_file(
             "app/build.gradle".to_owned(),
@@ -1262,9 +1268,13 @@ fn android_layout(
         generated_file(
             "settings.gradle".to_owned(),
             format!(
-                "rootProject.name = '{}'\ninclude \":app\"\n",
+                "{ANDROID_GRADLE_REPOSITORIES}rootProject.name = '{}'\ninclude \":app\"\n",
                 gradle_string_escape(&identity.name)
             ),
+        ),
+        generated_file(
+            "gradle.properties".to_owned(),
+            ANDROID_GRADLE_PROPERTIES.to_owned(),
         ),
         generated_file(
             "README.txt".to_owned(),
@@ -1666,16 +1676,14 @@ const ANDROID_PUSH_XML: &str = r#"        <meta-data
 /// `INTERNET` is declared only when `delivery.servers` lists an origin, the
 /// capture file provider only for the capture facility, and the push service
 /// only when the shell serves push.
-fn render_android_manifest(plan: &AndroidPlan<'_>) -> String {
+fn render_android_manifest(plan: &AndroidPlan<'_>, icon: bool) -> String {
     use std::fmt::Write as _;
 
-    let package = xml_attr_escape(&plan.package);
-    let mut out = String::new();
-    let _ = writeln!(
-        out,
+    // The package is the Gradle `namespace` (Android Gradle plugin 8 refuses a
+    // manifest `package` attribute).
+    let mut out = String::from(
         "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n\
-         <manifest xmlns:android=\"http://schemas.android.com/apk/res/android\"\n\
-         \x20   package=\"{package}\">"
+         <manifest xmlns:android=\"http://schemas.android.com/apk/res/android\">\n",
     );
     for line in plan.permissions.to_android_manifest_entries().lines() {
         // The derived line's `android:name` is a fixed constant from the closed
@@ -1691,11 +1699,14 @@ fn render_android_manifest(plan: &AndroidPlan<'_>) -> String {
     }
     let _ = writeln!(
         out,
-        "        android:label=\"{label}\"\n\
-         \x20       android:icon=\"@mipmap/ic_launcher\"\n\
-         \x20       android:usesCleartextTraffic=\"false\">",
+        "        android:label=\"{label}\"",
         label = xml_attr_escape(&plan.identity.name),
     );
+    // The launcher icon resource exists only when the manifest names an icon.
+    if icon {
+        out.push_str("        android:icon=\"@mipmap/ic_launcher\"\n");
+    }
+    out.push_str("        android:usesCleartextTraffic=\"false\">\n");
     out.push_str(ANDROID_ACTIVITY_XML);
     if plan.serves(ChromeFacility::Capture) {
         let _ = writeln!(
@@ -1767,6 +1778,31 @@ fn java_identifier_segment(segment: &str) -> String {
     out
 }
 
+/// The Android Gradle plugin the app module applies.
+const ANDROID_GRADLE_PLUGIN_VERSION: &str = "8.5.2";
+
+/// The oldest Gradle the pinned Android Gradle plugin runs on.
+const ANDROID_GRADLE_MIN_VERSION: &str = "8.7";
+
+/// The repositories `settings.gradle` resolves plugins and dependencies from.
+const ANDROID_GRADLE_REPOSITORIES: &str = "pluginManagement {\n\
+    \x20   repositories {\n\
+    \x20       google()\n\
+    \x20       mavenCentral()\n\
+    \x20       gradlePluginPortal()\n\
+    \x20   }\n\
+    }\n\
+    dependencyResolutionManagement {\n\
+    \x20   repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)\n\
+    \x20   repositories {\n\
+    \x20       google()\n\
+    \x20       mavenCentral()\n\
+    \x20   }\n\
+    }\n";
+
+/// `gradle.properties`: the `AndroidX` libraries the shell links need it.
+const ANDROID_GRADLE_PROPERTIES: &str = "android.useAndroidX=true\n";
+
 /// Render the app-module `build.gradle`; the Firebase library is linked only
 /// when the shell serves push.
 fn render_android_build_gradle(plan: &AndroidPlan<'_>) -> String {
@@ -1778,7 +1814,7 @@ fn render_android_build_gradle(plan: &AndroidPlan<'_>) -> String {
         String::new()
     };
     format!(
-        "plugins {{ id 'com.android.application' }}\n\
+        "plugins {{ id 'com.android.application' version '{ANDROID_GRADLE_PLUGIN_VERSION}' }}\n\
          android {{\n\
          \x20   namespace '{ns}'\n\
          \x20   compileSdk 34\n\
@@ -1825,7 +1861,9 @@ fn android_entry_url(base: &MountBase) -> String {
 /// into `assets/www/` (the empty path is `index.html`) and refuses a `\`, a `%`,
 /// and an empty, `.` or `..` segment. A local request the loader leaves
 /// unmapped answers a local 404, a request to an origin of `Shell.ALLOWED_ORIGINS`
-/// goes to the network, and any other answers a local 403. A permission is
+/// goes to the network unless it is the main frame, and any other answers a
+/// local 403; the page and its service workers share that one `answer`. A
+/// permission is
 /// asked only when a page asks for the facility it backs, and a media request
 /// is granted only the resources an accepted axis covers.
 const MAIN_ACTIVITY_JAVA: &str = r#"package dev.ipe.app;
@@ -1845,6 +1883,9 @@ import android.os.Message;
 import android.provider.MediaStore;
 import android.webkit.GeolocationPermissions;
 import android.webkit.PermissionRequest;
+import android.webkit.ServiceWorkerClient;
+import android.webkit.ServiceWorkerController;
+import android.webkit.ServiceWorkerWebSettings;
 import android.webkit.ValueCallback;
 import android.webkit.WebChromeClient;
 import android.webkit.WebResourceRequest;
@@ -1932,6 +1973,20 @@ public final class MainActivity extends Activity {
             }
         }
         return false;
+    }
+
+    /**
+     * The one answer to every request the page or its service worker makes: the
+     * local origin from the bundle (else a local 404); a delivery.servers origin
+     * passed through, but never as the main frame; anything else a local 403.
+     */
+    static WebResourceResponse answer(WebViewAssetLoader loader, Uri url, boolean mainFrame) {
+        String origin = originOf(url);
+        if (Shell.LOCAL_ORIGIN.equals(origin)) {
+            WebResourceResponse mapped = loader.shouldInterceptRequest(url);
+            return mapped != null ? mapped : localNotFound();
+        }
+        return !mainFrame && isAllowed(origin) ? null : blocked();
     }
 
     /** The outcome of one runtime permission request. */
@@ -2033,26 +2088,33 @@ public final class MainActivity extends Activity {
         settings.setSupportMultipleWindows(false);
         settings.setJavaScriptCanOpenWindowsAutomatically(false);
         settings.setGeolocationEnabled(Shell.GEOLOCATION);
+        settings.setDomStorageEnabled(Shell.DOM_STORAGE);
+        ServiceWorkerController workers = ServiceWorkerController.getInstance();
+        ServiceWorkerWebSettings workerSettings = workers.getServiceWorkerWebSettings();
+        workerSettings.setAllowFileAccess(false);
+        workerSettings.setAllowContentAccess(false);
+        workers.setServiceWorkerClient(new ServiceWorkerClient() {
+            @Override
+            public WebResourceResponse shouldInterceptRequest(WebResourceRequest request) {
+                return answer(loader, request.getUrl(), request.isForMainFrame());
+            }
+        });
         webView.setWebViewClient(new WebViewClient() {
             @Override
             public WebResourceResponse shouldInterceptRequest(
                     WebView view, WebResourceRequest request) {
-                Uri url = request.getUrl();
-                String origin = originOf(url);
-                if (Shell.LOCAL_ORIGIN.equals(origin)) {
-                    WebResourceResponse mapped = loader.shouldInterceptRequest(url);
-                    return mapped != null ? mapped : localNotFound();
-                }
-                return isAllowed(origin) ? null : blocked();
+                return answer(loader, request.getUrl(), request.isForMainFrame());
             }
 
             @Override
             public boolean shouldOverrideUrlLoading(WebView view, WebResourceRequest request) {
                 Uri url = request.getUrl();
-                if (request.isForMainFrame() && Shell.LOCAL_ORIGIN.equals(originOf(url))) {
+                String origin = originOf(url);
+                boolean local = Shell.LOCAL_ORIGIN.equals(origin);
+                if (request.isForMainFrame() && local) {
                     return false;
                 }
-                if (request.hasGesture() && originOf(url) != null) {
+                if (request.hasGesture() && origin != null && !local) {
                     openExternally(url);
                 }
                 return true;
@@ -3507,7 +3569,8 @@ fn android_readme(root_name: &str, profile: BundleProfile, base: &MountBase) -> 
          file:// access). Every request is answered one of three ways:\n\
          - a request to that local origin is served from the bundle, or answered by a\n\
          \x20 local 404;\n\
-         - a request to an origin listed in delivery.servers goes to the network;\n\
+         - a request to an origin listed in delivery.servers goes to the network,\n\
+         \x20 except as the page itself;\n\
          - any other request is answered by a local 403 carrying {header}: {value}.\n\
          The <uses-permission> lines in AndroidManifest.xml are derived from the app's\n\
          accepted web capabilities — never hand-authored — and each is asked only\n\
@@ -3521,11 +3584,15 @@ fn android_readme(root_name: &str, profile: BundleProfile, base: &MountBase) -> 
          Not checked without a device: the permission prompts, the camera capture,\n\
          notification taps and push delivery. Check them on a device before release.\n\
          \n\
+         Gradle: no wrapper ships with the project. Run `gradle wrapper` once with\n\
+         Gradle {gradle} or newer, then use ./gradlew.\n\
+         \n\
          Signing: this Gradle project is unsigned.\n\
          - ./gradlew assembleDebug (requires the Android SDK; API 34) builds an APK\n\
          \x20 signed with the SDK's debug key, for local install only.\n\
          - A store build needs your own keystore: add a signingConfig for it to\n\
          \x20 app/build.gradle, then run ./gradlew assembleRelease.\n",
+        gradle = ANDROID_GRADLE_MIN_VERSION,
         entry = android_entry_url(base),
         header = BLOCKED_HEADER.0,
         value = BLOCKED_HEADER.1,
@@ -4437,8 +4504,9 @@ mod tests {
     #[test]
     fn android_package_id_is_a_valid_java_identifier() {
         // A hyphenated app name yields an Apple identifier segment with a `-`,
-        // which is illegal in an Android package/applicationId. The manifest must
-        // carry a coerced, hyphen-free package.
+        // which is illegal in an Android package/applicationId. The Gradle
+        // namespace must carry a coerced, hyphen-free package; the manifest
+        // carries no `package` attribute (Android Gradle plugin 8 refuses one).
         let hyphenated = super::super::desktop::BundleIdentity::new("wasm-spa", None, None);
         let layout = layout(
             MobileOs::Android,
@@ -4453,15 +4521,18 @@ mod tests {
             .generated("app/src/main/AndroidManifest.xml")
             .expect("android manifest");
         assert!(
-            manifest.contains("package=\"com.ipe.wasm_spa\""),
-            "the Android package is a hyphen-free Java identifier: {manifest}"
+            !manifest.contains("package="),
+            "the package lives in the Gradle namespace only: {manifest}"
         );
-        // The package attribute specifically carries no hyphen (the human label
-        // legitimately keeps the raw name).
-        assert!(!manifest.contains("package=\"com.ipe.wasm-spa\""));
-        // build.gradle's namespace/applicationId agree.
         let gradle = layout.generated("app/build.gradle").expect("build.gradle");
-        assert!(gradle.contains("com.ipe.wasm_spa"));
+        assert!(
+            gradle.contains("namespace 'com.ipe.wasm_spa'"),
+            "the Android package is a hyphen-free Java identifier: {gradle}"
+        );
+        assert!(
+            gradle.contains("applicationId 'com.ipe.wasm_spa'"),
+            "{gradle}"
+        );
         assert!(!gradle.contains("wasm-spa"));
     }
 
@@ -4664,6 +4735,43 @@ mod tests {
         );
     }
 
+    /// The Gradle project resolves on its own: `settings.gradle` names where
+    /// plugins and libraries come from, the plugin carries a version, and
+    /// `gradle.properties` enables the `AndroidX` libraries the shell links.
+    #[test]
+    fn android_gradle_project_names_its_repositories_and_plugin_version() {
+        let shell = android(&full_pin());
+        let settings = text_of(&shell, "settings.gradle");
+        for needle in [
+            "pluginManagement {",
+            "dependencyResolutionManagement {",
+            "google()",
+            "mavenCentral()",
+            "gradlePluginPortal()",
+        ] {
+            assert!(settings.contains(needle), "{needle}: {settings}");
+        }
+        assert!(
+            settings.find("pluginManagement {") < settings.find("rootProject.name"),
+            "pluginManagement leads settings.gradle: {settings}"
+        );
+        let gradle = text_of(&shell, "app/build.gradle");
+        let plugin =
+            format!("id 'com.android.application' version '{ANDROID_GRADLE_PLUGIN_VERSION}'");
+        assert!(gradle.contains(&plugin), "{gradle}");
+        assert!(!gradle.contains("repositories"), "{gradle}");
+        let properties = text_of(&shell, "gradle.properties");
+        assert!(
+            properties
+                .lines()
+                .any(|line| line == "android.useAndroidX=true"),
+            "{properties}"
+        );
+        let readme = text_of(&shell, "README.txt");
+        assert!(readme.contains("gradle wrapper"), "{readme}");
+        assert!(readme.contains(ANDROID_GRADLE_MIN_VERSION), "{readme}");
+    }
+
     // ── Icon ──────────────────────────────────────────────────────────────────
 
     #[test]
@@ -4683,6 +4791,13 @@ mod tests {
                 with.files.iter().any(|f| f.content == ShellContent::Icon),
                 "an icon file is present on {os:?} when the manifest declares one"
             );
+            if os == MobileOs::Android {
+                let manifest = text_of(&with, "app/src/main/AndroidManifest.xml");
+                assert!(
+                    manifest.contains("android:icon=\"@mipmap/ic_launcher\""),
+                    "{manifest}"
+                );
+            }
             let without = layout(
                 os,
                 BundleProfile::Dev,
@@ -4699,6 +4814,17 @@ mod tests {
                     .all(|f| f.content != ShellContent::Icon),
                 "no icon file on {os:?} when the manifest declares none"
             );
+            if os == MobileOs::Android {
+                let manifest = text_of(&without, "app/src/main/AndroidManifest.xml");
+                assert!(
+                    !manifest.contains("android:icon="),
+                    "no icon reference without an icon resource: {manifest}"
+                );
+                assert!(
+                    manifest.contains("android:usesCleartextTraffic=\"false\">"),
+                    "{manifest}"
+                );
+            }
         }
     }
 
@@ -5171,7 +5297,7 @@ mod tests {
         for needle in [
             "if (Shell.LOCAL_ORIGIN.equals(origin)) {",
             "return mapped != null ? mapped : localNotFound();",
-            "return isAllowed(origin) ? null : blocked();",
+            "return !mainFrame && isAllowed(origin) ? null : blocked();",
             "403, \"Forbidden\"",
             "Collections.singletonMap(Shell.BLOCKED_HEADER, Shell.BLOCKED_ORIGIN)",
             "!\"https\".equals(url.getScheme())",
@@ -5189,6 +5315,53 @@ mod tests {
         assert_eq!(
             constant(&shell, "LOCAL_ORIGIN"),
             Some(quoted(ANDROID_ASSET_ORIGIN))
+        );
+    }
+
+    #[test]
+    fn android_every_request_path_answers_through_the_one_rule() {
+        let shell = android(&full_pin());
+        let activity = text_of(&shell, &java_path("MainActivity.java"));
+        let call = "return answer(loader, request.getUrl(), request.isForMainFrame());";
+        assert_eq!(
+            activity.matches(call).count(),
+            2,
+            "the page and its service workers answer through one rule: {activity}"
+        );
+        assert_eq!(
+            activity.matches("loader.shouldInterceptRequest(").count(),
+            1,
+            "{activity}"
+        );
+        let client = activity.find("workers.setServiceWorkerClient(");
+        let load = activity.find("webView.loadUrl(ENTRY_URL);");
+        assert!(
+            client.is_some() && client < load,
+            "the service-worker client is installed before the first load: {activity}"
+        );
+        for needle in [
+            "workerSettings.setAllowFileAccess(false);",
+            "workerSettings.setAllowContentAccess(false);",
+        ] {
+            assert!(activity.contains(needle), "{needle}: {activity}");
+        }
+    }
+
+    #[test]
+    fn android_main_frame_never_leaves_the_local_origin() {
+        let shell = android(&full_pin());
+        let activity = text_of(&shell, &java_path("MainActivity.java"));
+        assert!(
+            activity.contains("return !mainFrame && isAllowed(origin) ? null : blocked();"),
+            "a server document is refused as the main frame: {activity}"
+        );
+        assert!(
+            !activity.contains("return isAllowed(origin) ? null : blocked();"),
+            "{activity}"
+        );
+        assert!(
+            activity.contains("if (request.hasGesture() && origin != null && !local) {"),
+            "a gesture link to the local origin never leaves the app: {activity}"
         );
     }
 
@@ -5671,6 +5844,22 @@ mod tests {
                 Some("false")
             );
         }
+    }
+
+    #[test]
+    fn android_dom_storage_follows_the_storage_axis() {
+        let stored = android(&shell_pin(
+            &accepts(&[web(WebCapability::Storage)]),
+            &MountBase::root(),
+        ));
+        assert_eq!(constant(&stored, "DOM_STORAGE").as_deref(), Some("true"));
+        let activity = text_of(&stored, &java_path("MainActivity.java"));
+        assert!(
+            activity.contains("settings.setDomStorageEnabled(Shell.DOM_STORAGE);"),
+            "{activity}"
+        );
+        let plain = android(&pin("/", &[]));
+        assert_eq!(constant(&plain, "DOM_STORAGE").as_deref(), Some("false"));
     }
 
     #[test]

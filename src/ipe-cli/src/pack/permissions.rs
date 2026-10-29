@@ -625,13 +625,25 @@ const fn request_groups_agree(groups: &[RequestGroup], permissions: &[AndroidPer
     let mut vocabulary = permissions;
     while let Some((permission, tail)) = vocabulary.split_first() {
         if let Some(group) = permission.request_group()
-            && !lists_permission(group.permissions(), *permission)
+            && (!lists_group(groups, group) || !lists_permission(group.permissions(), *permission))
         {
             return false;
         }
         vocabulary = tail;
     }
     true
+}
+
+/// Whether `group` appears in `groups`, compared by its request code.
+const fn lists_group(groups: &[RequestGroup], group: RequestGroup) -> bool {
+    let mut rest = groups;
+    while let Some((candidate, tail)) = rest.split_first() {
+        if candidate.code().get() == group.code().get() {
+            return true;
+        }
+        rest = tail;
+    }
+    false
 }
 
 /// Whether every permission in `android` brings the rest of its request group,
@@ -1689,6 +1701,15 @@ mod tests {
         // Two groups sharing one code are refused.
         assert!(!request_groups_agree(
             &[RequestGroup::Camera, RequestGroup::Camera],
+            AndroidPermission::ALL,
+        ));
+        // A runtime permission whose group the list omits is never asked: refused.
+        assert!(!request_groups_agree(
+            &[
+                RequestGroup::Location,
+                RequestGroup::Notifications,
+                RequestGroup::RecordAudio,
+            ],
             AndroidPermission::ALL,
         ));
         // A row holding half of the location group is refused.
