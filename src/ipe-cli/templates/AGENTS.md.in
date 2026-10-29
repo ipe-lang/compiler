@@ -1098,23 +1098,23 @@ instance); `Log.*` goes to `console.{log,error}`; `Random.int`/`float`/
 `Task.*`). CORS/timeout/connect failures surface as `Task.fail`, never a
 trap. Server-only effects (`Db.*`, `File.*`, `Auth.*`, `System.getenv`,
 `Server.*`, `Task.parallel`/`retryWith`, …) have NO wasm denotation —
-naming one is IPE-N0029 at compile time; route them through a native server
+naming one in code the client entry reaches is IPE-N0029 at compile time (a
+definition the entry never reaches is neither judged nor emitted, so importing
+`Ipe.Task` for `Task.map` is fine); route them through a native server
 and call it over HTTP. Public, non-secret build-time config reaches the
 browser through `Ipe.Env.public` (see `[wasm].publicEnv` below) —
 `System.getenv` itself stays a DOES-NOT-exist-for-wasm kernel. Routed apps
 (Model with a `page` field) are IPE-L0129 until the client router ships;
 use `routes = []` + a page-free Model.
 
-**Module classification + reachability closure (IPE-N0030).** Every module
-linked into a `--target wasm` build is `shared` (default) or `server` (it
-directly names a kernel with no `WasmClient` denotation). The client entry's
-reachability closure — every module transitively reachable via imports — must
-never touch a `server` module; violating this fails naming the EXACT chain,
-e.g. `Main(client) -> View(shared) -> Data(server: imports Db.query)`, not
-just "not allowed". A `server` module the entry never imports is not an
-error — only the reachable subset matters, so a shared `view` module used by
-both a server SSR path and a wasm client type-checks against both targets
-without duplication.
+**Reachability closure (IPE-N0030).** The client entry's closure is every
+definition `main` reaches, transitively, across modules. If it reaches a
+definition in another module that names a kernel with no `WasmClient`
+denotation, the build fails naming the EXACT chain, e.g.
+`Main(client) -> View(shared) -> Data(server: imports Db.query)`, not just
+"not allowed". A server-only definition the entry never reaches is not an
+error and is not emitted, so a shared `view` module used by both a server SSR
+path and a wasm client type-checks against both targets without duplication.
 
 **The `wasm` field in `package.ipe`**:
 

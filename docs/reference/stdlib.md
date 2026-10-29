@@ -41,6 +41,8 @@ Each module listed below links to a detail page with the full documentation and 
 - [Browser.Orientation.Internals](#browserorientationinternals)
 - [Browser.Permission](#browserpermission)
 - [Browser.Permission.Internals](#browserpermissioninternals)
+- [Browser.Push](#browserpush)
+- [Browser.Push.Internals](#browserpushinternals)
 - [Browser.Recorder](#browserrecorder)
 - [Browser.Recorder.Internals](#browserrecorderinternals)
 - [Browser.ScreenOrientation](#browserscreenorientation)
@@ -672,6 +674,42 @@ Ipe.Browser.Permission.Internals — the low-level Permissions API port
 | `inbound` | The total, fail-closed decoder for the inbound `JsMsg`. It reads the `ok` |
 | `inboundFor` | `inboundFor name` — the name-scoped variant of `inbound`. It first reads |
 | `nameToken` | The canonical wire token for each permission name — the single source of |
+
+## Browser.Push
+
+[Full reference](stdlib/Browser.Push.md)
+
+Ipe.Browser.Push — subscribe this device to sealed push over `Ipe.Ffi.Js` ports.
+
+| Export | Summary |
+|--------|----------|
+| `ApplicationKey` | An application server's public key (its VAPID key): a 65-byte uncompressed |
+| `Subscription` | This device's push subscription. Opaque; `subscriptionText` renders it for |
+| `applicationKey` | `applicationKey text` — parse the app server's public key from its |
+| `subscribe` | `subscribe key` — subscribe this device to push from the server that holds |
+| `current` | `current` — this device's push subscription, or `Nothing` when it has none. |
+| `unsubscribe` | `unsubscribe` — drop this device's push subscription. Succeeds when the |
+| `subscriptionText` | `subscriptionText subscription` — the canonical text to post to the app |
+
+## Browser.Push.Internals
+
+[Full reference](stdlib/Browser.Push.Internals.md)
+
+Ipe.Browser.Push.Internals — the low-level push subscription port surface:
+
+| Export | Summary |
+|--------|----------|
+| `ApplicationKey` | An application server's public key: a 65-byte uncompressed P-256 point, |
+| `Subscription` | A push subscription the host returned, one variant per transport. The only |
+| `applicationKey` | `applicationKey text` — parse an application server's public key. |
+| `decodeSubscription` | `decodeSubscription text` — parse a canonical subscription text. |
+| `encodeSubscription` | `encodeSubscription subscription` — the one canonical subscription text. |
+| `requestSubscribe` | `requestSubscribe key` — ask the host to subscribe this device under `key`. |
+| `requestCurrent` | `requestCurrent` — ask the host for this device's current subscription. |
+| `requestUnsubscribe` | `requestUnsubscribe` — ask the host to drop this device's subscription. |
+| `subscribeReply` | The reply to a subscribe request: a `subscribed` event carrying a |
+| `currentReply` | The reply to a current request: a `current` event carrying a subscription |
+| `unsubscribeReply` | The reply to an unsubscribe request: an `unsubscribed` event, or a refusal. |
 
 ## Browser.Recorder
 

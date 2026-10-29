@@ -130,7 +130,7 @@ pub struct ProjectManifest {
 /// All three sections are present and live: every project's manifest carries
 /// defaults for all hosts, and `ipe dev build` reads only the one matching the
 /// resolved target. There is no `active` selector — that is the CLI.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct DeliveryConfig {
     /// The declared delivery set — which deliveries `ipe release` produces.
     /// Empty when the manifest omits the `ships` field, meaning the implicit
@@ -145,6 +145,21 @@ pub struct DeliveryConfig {
     pub mobile: MobileDelivery,
     /// Base path for the `web solo` browser host.
     pub browser: BrowserDelivery,
+    /// The `https` origins the browser bundle may reach besides its own;
+    /// empty for an offline bundle.
+    pub servers: ipe_runtime_rust::encoding::ServerOrigins,
+}
+
+impl Default for DeliveryConfig {
+    fn default() -> Self {
+        Self {
+            ships: Vec::new(),
+            desktop: DesktopDelivery::default(),
+            mobile: MobileDelivery::default(),
+            browser: BrowserDelivery::default(),
+            servers: ipe_runtime_rust::encoding::ServerOrigins::none(),
+        }
+    }
 }
 
 /// `delivery.desktop` — webview-native window settings.
@@ -175,7 +190,151 @@ pub struct MobileDelivery {
     pub bundle_id: String,
     /// Locked launch orientation.
     pub orientation: ScreenOrientation,
+    /// The push registration identifiers; `None` when the field is absent.
+    pub push: Option<PushDelivery>,
 }
+
+/// `delivery.mobile.push`: the identifiers a mobile shell registers for push
+/// messages with.
+///
+/// Every field is parsed once at the manifest boundary. The FCM values are
+/// public client identifiers, never credentials; a server credential has no
+/// field here.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PushDelivery {
+    /// The APNs environment the iOS entitlement names.
+    pub apns: ApnsEnvironment,
+    /// The Firebase client identifiers the Android shell initializes with.
+    pub fcm: FcmIdentifiers,
+}
+
+/// The APNs environment an iOS shell registers in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ApnsEnvironment {
+    /// The sandbox environment a development-signed build reaches.
+    Development,
+    /// The environment a distribution-signed build reaches.
+    Production,
+}
+
+/// The four Firebase client identifiers of `delivery.mobile.push.fcm`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FcmIdentifiers {
+    /// `projectId`.
+    pub project_id: FcmProjectId,
+    /// `applicationId`.
+    pub application_id: FcmApplicationId,
+    /// `apiKey`: a public client key, not a secret.
+    pub api_key: FcmApiKey,
+    /// `senderId`.
+    pub sender_id: FcmSenderId,
+}
+
+/// The longest FCM identifier [`parse_fcm_identifier`] admits, in bytes.
+pub const MAX_FCM_IDENTIFIER_LEN: usize = 128;
+
+/// Why a text is not an FCM identifier. No variant carries the refused text.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FcmIdentifierRefusal {
+    /// The empty string.
+    Empty,
+    /// Longer than [`MAX_FCM_IDENTIFIER_LEN`].
+    TooLong {
+        /// The refused length, in bytes.
+        len: usize,
+    },
+    /// A byte outside `[A-Za-z0-9:_.-]`.
+    Byte {
+        /// The first refused byte.
+        byte: u8,
+    },
+}
+
+impl std::fmt::Display for FcmIdentifierRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Empty => write!(f, "an FCM identifier is not empty"),
+            Self::TooLong { len } => write!(
+                f,
+                "an FCM identifier is at most {MAX_FCM_IDENTIFIER_LEN} bytes (this one is {len})"
+            ),
+            Self::Byte { byte } => write!(
+                f,
+                "an FCM identifier holds only A-Z a-z 0-9 `:` `_` `.` and `-` (found byte \
+                 0x{byte:02X})"
+            ),
+        }
+    }
+}
+
+/// Judge `text` against the FCM identifier grammar: 1 to
+/// [`MAX_FCM_IDENTIFIER_LEN`] bytes of `[A-Za-z0-9:_.-]`.
+fn parse_fcm_identifier(text: &str) -> Result<String, FcmIdentifierRefusal> {
+    if text.is_empty() {
+        return Err(FcmIdentifierRefusal::Empty);
+    }
+    if text.len() > MAX_FCM_IDENTIFIER_LEN {
+        return Err(FcmIdentifierRefusal::TooLong { len: text.len() });
+    }
+    text.bytes()
+        .find(|b| !(b.is_ascii_alphanumeric() || matches!(b, b':' | b'_' | b'.' | b'-')))
+        .map_or_else(
+            || Ok(text.to_owned()),
+            |byte| Err(FcmIdentifierRefusal::Byte { byte }),
+        )
+}
+
+/// Declares one role-typed FCM identifier, so no identifier is passable for
+/// another. `Debug` names the role and never the text, so a debug dump of a
+/// manifest cannot carry an identifier into a log or a diagnostic.
+macro_rules! fcm_identifier {
+    ($($(#[doc = $doc:expr])* $name:ident,)+) => {
+        $(
+            $(#[doc = $doc])*
+            #[derive(Clone, PartialEq, Eq)]
+            pub struct $name(String);
+
+            impl std::fmt::Debug for $name {
+                fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                    f.write_str(concat!(stringify!($name), "(..)"))
+                }
+            }
+
+            impl $name {
+                /// Parse `text` against the FCM identifier grammar.
+                ///
+                /// # Errors
+                ///
+                /// `Empty`, then `TooLong`, then the first refused `Byte`.
+                pub fn parse(text: &str) -> Result<Self, FcmIdentifierRefusal> {
+                    parse_fcm_identifier(text).map(Self)
+                }
+
+                /// The identifier's text.
+                #[must_use]
+                pub fn as_str(&self) -> &str {
+                    &self.0
+                }
+            }
+        )+
+    };
+}
+
+fcm_identifier! {
+    /// The Firebase project identifier.
+    FcmProjectId,
+    /// The Firebase application identifier.
+    FcmApplicationId,
+    /// The Firebase public client key.
+    FcmApiKey,
+    /// The FCM sender identifier.
+    FcmSenderId,
+}
+
+/// A mobile pack of a program that accepts push, with no
+/// `delivery.mobile.push` to register it with.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PushUnconfigured;
 
 /// The allowed screen orientations for a mobile host launch.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -239,6 +398,26 @@ impl ProjectManifest {
     #[must_use]
     pub fn default_program(&self) -> Option<&Program> {
         self.programs.first()
+    }
+
+    /// The push identifiers a mobile shell registers with.
+    ///
+    /// `None` when the project does not accept push. The manifest read already
+    /// refused `delivery.mobile.push` without the accept, so the two agree.
+    ///
+    /// # Errors
+    ///
+    /// [`PushUnconfigured`] when the project accepts push but names no
+    /// `delivery.mobile.push`: a mobile shell cannot register without it.
+    pub fn mobile_push(&self) -> Result<Option<&PushDelivery>, PushUnconfigured> {
+        let accepts_push = self
+            .capabilities_accept
+            .contains(&Capability::JsPort(ipe_kernels::WebCapability::Push));
+        match (accepts_push, self.delivery.mobile.push.as_ref()) {
+            (true, None) => Err(PushUnconfigured),
+            (true, Some(push)) => Ok(Some(push)),
+            (false, _) => Ok(None),
+        }
     }
 
     /// A one-line notice naming which program a multi-program build compiled and
@@ -1568,6 +1747,24 @@ pub use ipe_db::extract_imports_from_source;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fcm_identifier_debug_never_prints_the_text() {
+        let key = "AIzaSyKeyMaterial_1";
+        let ids = FcmIdentifiers {
+            project_id: FcmProjectId::parse("proj-one").expect("a valid project id"),
+            application_id: FcmApplicationId::parse("1:23:android:ab")
+                .expect("a valid application id"),
+            api_key: FcmApiKey::parse(key).expect("a valid api key"),
+            sender_id: FcmSenderId::parse("12345").expect("a valid sender id"),
+        };
+        let dump = format!("{ids:?}");
+        for text in [key, "proj-one", "1:23:android:ab", "12345"] {
+            assert!(!dump.contains(text), "`{text}` leaked into `{dump}`");
+        }
+        assert!(dump.contains("FcmApiKey(..)"), "{dump}");
+        assert_eq!(ids.api_key.as_str(), key);
+    }
 
     #[test]
     fn is_module_segment_rules() {

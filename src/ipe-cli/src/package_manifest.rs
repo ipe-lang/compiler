@@ -54,14 +54,18 @@ use ipe_syntax::{Expr, Expr_, Module};
 
 use ipe_backend_rust::static_build::StaticTriple;
 use ipe_kernels::WebCapability;
-use ipe_runtime_rust::encoding::{MAX_MOUNT_BASE_LEN, MountBase, MountBaseRefusal};
+use ipe_runtime_rust::encoding::{
+    MAX_MOUNT_BASE_LEN, MAX_SERVER_ORIGINS, MountBase, MountBaseRefusal, ServerOrigin,
+    ServerOriginRefusal, ServerOrigins,
+};
 
 use crate::CliError;
 use crate::delivery_set::{BinaryTarget, ShipEntry};
 use crate::project::{
-    BrowserDelivery, Capability, DeliveryConfig, DesktopDelivery, EntryShape, IpeDep,
-    MobileDelivery, Program, ProjectManifest, PublicEnvAllowlist, PublicEnvName, RustDep,
-    ScreenOrientation, WasmBundle, WasmConfig, WasmMode,
+    ApnsEnvironment, BrowserDelivery, Capability, DeliveryConfig, DesktopDelivery, EntryShape,
+    FcmApiKey, FcmApplicationId, FcmIdentifierRefusal, FcmIdentifiers, FcmProjectId, FcmSenderId,
+    IpeDep, MobileDelivery, Program, ProjectManifest, PublicEnvAllowlist, PublicEnvName,
+    PushDelivery, RustDep, ScreenOrientation, WasmBundle, WasmConfig, WasmMode,
 };
 use crate::text;
 
@@ -182,6 +186,19 @@ fn base_path_refusal(raw: &str, refusal: &MountBaseRefusal) -> text::Message {
         MountBaseRefusal::Reserved { byte } => {
             text::msg::manifest_base_path_reserved_byte(&base, &format!("0x{byte:02X}"))
         }
+    }
+}
+
+/// The located text of a refused `delivery.servers` entry.
+///
+/// The entry is shown through its `Debug` escape, which renders every control
+/// and non-ASCII byte visibly; a too-long entry is not shown at all.
+fn server_origin_refusal(raw: &str, refusal: ServerOriginRefusal) -> String {
+    match refusal {
+        ServerOriginRefusal::TooLong { .. } => {
+            format!("a `delivery.servers` entry is refused: {refusal}")
+        }
+        _ => format!("`delivery.servers` entry {raw:?} is refused: {refusal}"),
     }
 }
 
@@ -389,6 +406,7 @@ impl Reader<'_> {
     fn read_package_record(&self, body: &Expr) -> Result<ManifestFields, CliError> {
         let record = self.expect_record(body)?;
         let mut fields = ManifestFields::default();
+        let mut delivery_span = None;
         for (fname, value) in record {
             match self.text(fname.value) {
                 "name" => fields.name = Some(self.expect_string(value)?),
@@ -414,7 +432,10 @@ impl Reader<'_> {
                 "wasm" => fields.wasm = self.read_wasm(value)?,
                 "wrapper" => fields.has_rust_wrapper = self.read_wrapper(value)?,
                 "build" => self.read_build_record(value, &mut fields)?,
-                "delivery" => fields.delivery = self.read_delivery(value)?,
+                "delivery" => {
+                    fields.delivery = self.read_delivery(value)?;
+                    delivery_span = Some(value.span);
+                }
                 other => {
                     return Err(self.reject(
                         fname.span,
@@ -426,6 +447,21 @@ impl Reader<'_> {
                     ));
                 }
             }
+        }
+        let accepts_push = fields
+            .capabilities_accept
+            .contains(&Capability::JsPort(WebCapability::Push));
+        if let (Some(span), Some(_), false) = (
+            delivery_span,
+            fields.delivery.mobile.push.as_ref(),
+            accepts_push,
+        ) {
+            return Err(self.reject(
+                span,
+                "`delivery.mobile.push` is set, but `capabilities.accepts` lists no `JsPort Push` — \
+                 push identifiers configure a capability the project accepts. Add \
+                 `JsPort Push` to `accepts`, or remove `delivery.mobile.push`.",
+            ));
         }
         Ok(fields)
     }
@@ -484,14 +520,31 @@ impl Reader<'_> {
     // ── shared record primitives (reused by the FFI foreign-record reader) ────
 
     /// Require `expr` to be a record literal `{ … }`, returning its
-    /// `(field-name, value)` pairs. Any other shape is rejected — a manifest
-    /// section is data, never a computed value.
+    /// `(field-name, value)` pairs, each name once. Any other shape is rejected
+    /// — a manifest section is data, never a computed value — and so is a
+    /// repeated field, which would otherwise let the last spelling silently
+    /// win.
     fn expect_record<'e>(
         &self,
         expr: &'e Expr,
     ) -> Result<&'e [(Located<ipe_intern::Symbol>, Expr)], CliError> {
         match &expr.value {
-            Expr_::Record(fields) => Ok(fields.as_slice()),
+            Expr_::Record(fields) => {
+                let mut seen = BTreeSet::new();
+                for (fname, _) in fields {
+                    if !seen.insert(fname.value) {
+                        return Err(self.reject(
+                            fname.span,
+                            &format!(
+                                "`{}` is set twice in one record — a field is written once. \
+                                 Remove the repeat.",
+                                self.text(fname.value)
+                            ),
+                        ));
+                    }
+                }
+                Ok(fields.as_slice())
+            }
             _ => Err(self.reject(
                 expr.span,
                 "expected a record literal `{ … }` — a package.ipe section is written as a record \
@@ -842,12 +895,13 @@ impl Reader<'_> {
                 "desktop" => config.desktop = self.read_desktop(value)?,
                 "mobile" => config.mobile = self.read_mobile(value)?,
                 "browser" => config.browser = self.read_browser(value)?,
+                "servers" => config.servers = self.read_servers(value)?,
                 other => {
                     return Err(self.reject(
                         fname.span,
                         &format!(
                             "`{other}` is not a delivery field — expected `ships`, `desktop`, \
-                             `mobile`, or `browser`"
+                             `mobile`, `browser`, or `servers`"
                         ),
                     ));
                 }
@@ -923,6 +977,42 @@ impl Reader<'_> {
         }
     }
 
+    /// Read `delivery.servers = [ "https://…", … ]`: each entry parses once into
+    /// a [`ServerOrigin`], and the list into [`ServerOrigins`].
+    ///
+    /// A refused entry, a repeated one, or a list past [`MAX_SERVER_ORIGINS`] is
+    /// a located rejection; an empty list is an offline bundle.
+    fn read_servers(&self, expr: &Expr) -> Result<ServerOrigins, CliError> {
+        let items = self.expect_list(expr)?;
+        if items.len() > MAX_SERVER_ORIGINS {
+            return Err(self.reject(
+                expr.span,
+                &format!(
+                    "`delivery.servers` lists {} origins — a bundle names at most \
+                     {MAX_SERVER_ORIGINS}",
+                    items.len()
+                ),
+            ));
+        }
+        let mut origins: Vec<ServerOrigin> = Vec::with_capacity(items.len());
+        for item in items {
+            let raw = self.expect_string(item)?;
+            let origin = ServerOrigin::parse(&raw)
+                .map_err(|refusal| self.reject(item.span, &server_origin_refusal(&raw, refusal)))?;
+            if origins.contains(&origin) {
+                return Err(self.reject(
+                    item.span,
+                    &format!(
+                        "`delivery.servers` lists {raw:?} twice — an origin is listed once. \
+                         Remove the repeat."
+                    ),
+                ));
+            }
+            origins.push(origin);
+        }
+        ServerOrigins::new(origins).map_err(|refusal| self.reject(expr.span, &refusal.to_string()))
+    }
+
     /// Read `delivery.desktop = { title, width, height }`.
     fn read_desktop(&self, expr: &Expr) -> Result<DesktopDelivery, CliError> {
         let mut d = DesktopDelivery::default();
@@ -945,25 +1035,132 @@ impl Reader<'_> {
         Ok(d)
     }
 
-    /// Read `delivery.mobile = { bundleId, orientation }`.
+    /// Read `delivery.mobile = { bundleId, orientation, push }`.
     fn read_mobile(&self, expr: &Expr) -> Result<MobileDelivery, CliError> {
         let mut m = MobileDelivery::default();
         for (fname, value) in self.expect_record(expr)? {
             match self.text(fname.value) {
                 "bundleId" => m.bundle_id = self.expect_string(value)?,
                 "orientation" => m.orientation = self.read_orientation(value)?,
+                "push" => m.push = Some(self.read_push(value)?),
                 other => {
                     return Err(self.reject(
                         fname.span,
                         &format!(
-                            "`{other}` is not a mobile field — expected `bundleId` or \
-                             `orientation`"
+                            "`{other}` is not a mobile field — expected `bundleId`, \
+                             `orientation`, or `push`"
                         ),
                     ));
                 }
             }
         }
         Ok(m)
+    }
+
+    /// Read `delivery.mobile.push = { apns, fcm }`; both fields are required.
+    fn read_push(&self, expr: &Expr) -> Result<PushDelivery, CliError> {
+        let mut apns = None;
+        let mut fcm = None;
+        for (fname, value) in self.expect_record(expr)? {
+            match self.text(fname.value) {
+                "apns" => apns = Some(self.read_apns(value)?),
+                "fcm" => fcm = Some(self.read_fcm(value)?),
+                other => {
+                    return Err(self.reject(
+                        fname.span,
+                        &format!("`{other}` is not a push field — expected `apns` or `fcm`"),
+                    ));
+                }
+            }
+        }
+        match (apns, fcm) {
+            (Some(apns), Some(fcm)) => Ok(PushDelivery { apns, fcm }),
+            (None, _) => Err(self.reject(
+                expr.span,
+                "`delivery.mobile.push` needs `apns = Development` or `apns = Production`",
+            )),
+            (Some(_), None) => Err(self.reject(
+                expr.span,
+                "`delivery.mobile.push` needs `fcm = { projectId, applicationId, apiKey, \
+                 senderId }`",
+            )),
+        }
+    }
+
+    /// Read `delivery.mobile.push.apns`: `Development` / `Production`.
+    fn read_apns(&self, expr: &Expr) -> Result<ApnsEnvironment, CliError> {
+        match self.expect_ctor(expr, "an APNs environment")? {
+            "Development" => Ok(ApnsEnvironment::Development),
+            "Production" => Ok(ApnsEnvironment::Production),
+            other => Err(self.reject(
+                expr.span,
+                &format!(
+                    "`{other}` is not an APNs environment — use `Development` or `Production`"
+                ),
+            )),
+        }
+    }
+
+    /// Read `delivery.mobile.push.fcm = { projectId, applicationId, apiKey,
+    /// senderId }`; every field is required and parsed once.
+    fn read_fcm(&self, expr: &Expr) -> Result<FcmIdentifiers, CliError> {
+        let mut project_id = None;
+        let mut application_id = None;
+        let mut api_key = None;
+        let mut sender_id = None;
+        for (fname, value) in self.expect_record(expr)? {
+            let key = self.text(fname.value);
+            match key {
+                "projectId" => {
+                    project_id = Some(self.fcm_field(value, key, FcmProjectId::parse)?);
+                }
+                "applicationId" => {
+                    application_id = Some(self.fcm_field(value, key, FcmApplicationId::parse)?);
+                }
+                "apiKey" => api_key = Some(self.fcm_field(value, key, FcmApiKey::parse)?),
+                "senderId" => sender_id = Some(self.fcm_field(value, key, FcmSenderId::parse)?),
+                other => {
+                    return Err(self.reject(
+                        fname.span,
+                        &format!(
+                            "`{other}` is not an fcm field — expected `projectId`, \
+                             `applicationId`, `apiKey`, or `senderId`"
+                        ),
+                    ));
+                }
+            }
+        }
+        match (project_id, application_id, api_key, sender_id) {
+            (Some(project_id), Some(application_id), Some(api_key), Some(sender_id)) => {
+                Ok(FcmIdentifiers {
+                    project_id,
+                    application_id,
+                    api_key,
+                    sender_id,
+                })
+            }
+            _ => Err(self.reject(
+                expr.span,
+                "`delivery.mobile.push.fcm` needs all of `projectId`, `applicationId`, \
+                 `apiKey`, and `senderId`",
+            )),
+        }
+    }
+
+    /// Read one `delivery.mobile.push.fcm` string through its role's `parse`.
+    fn fcm_field<T>(
+        &self,
+        value: &Expr,
+        key: &str,
+        parse: fn(&str) -> Result<T, FcmIdentifierRefusal>,
+    ) -> Result<T, CliError> {
+        let raw = self.expect_string(value)?;
+        parse(&raw).map_err(|refusal| {
+            self.reject(
+                value.span,
+                &format!("`delivery.mobile.push.fcm.{key}` is refused: {refusal}"),
+            )
+        })
     }
 
     /// Read `delivery.mobile.orientation`: `Portrait` / `Landscape` / `Any`.
@@ -2688,6 +2885,253 @@ mod tests {
         assert_eq!(
             bundle_of(&m).public_env.to_names(),
             vec!["TMPDIR_HINT", "TEMPLATE_ID", "HOME_URL", "_X1"]
+        );
+    }
+
+    /// A `package.ipe` whose `delivery` record is `delivery` and whose
+    /// `capabilities.accepts` list is `accepts`.
+    fn delivery_manifest(delivery: &str, accepts: &str) -> String {
+        format!(
+            "{HEADER}package =\n    {{ name = \"x\"\n    , capabilities = {{ accepts = [ {accepts} ] }}\n    , delivery = {delivery}\n    }}\n"
+        )
+    }
+
+    /// The refusal text a read returned, or `None` when it was accepted.
+    fn refusal_text(test_name: &str, source: &str) -> Option<String> {
+        match read(test_name, source) {
+            Err(CliError::Usage(msg)) => Some(msg.to_string()),
+            _ => None,
+        }
+    }
+
+    /// The `delivery` record listing `servers` (each already a quoted string).
+    fn servers_delivery(servers: &[String]) -> String {
+        format!("{{ servers = [ {} ] }}", servers.join(", "))
+    }
+
+    #[test]
+    fn manifest_servers_parse_once_into_origins() {
+        let manifest = read(
+            "servers_parse_once",
+            &delivery_manifest(
+                &servers_delivery(&[
+                    "\"https://media.example:8443\"".to_owned(),
+                    "\"https://api.example\"".to_owned(),
+                ]),
+                "",
+            ),
+        )
+        .expect("two legal origins parse");
+        let authorities: Vec<&str> = manifest
+            .delivery
+            .servers
+            .origins()
+            .map(ServerOrigin::authority)
+            .collect();
+        assert_eq!(authorities, ["api.example", "media.example:8443"]);
+        let bare = read(
+            "servers_absent_is_offline",
+            &format!("{HEADER}package =\n    {{ name = \"x\" }}\n"),
+        )
+        .expect("a manifest without `delivery` parses");
+        assert!(bare.delivery.servers.is_empty(), "no `servers` is offline");
+    }
+
+    #[test]
+    fn manifest_servers_refusal_names_the_key_and_the_entry() {
+        let refusal = refusal_text(
+            "servers_refusal_names_entry",
+            &delivery_manifest(
+                &servers_delivery(&["\"http://api.example\"".to_owned()]),
+                "",
+            ),
+        );
+        assert!(
+            refusal
+                .as_deref()
+                .is_some_and(|msg| msg.contains("delivery.servers")
+                    && msg.contains("\"http://api.example\"")
+                    && msg.contains(&ServerOriginRefusal::NotHttps.to_string())
+                    && msg.contains("package.ipe:")),
+            "a refused origin is a located refusal naming the key, the entry and the \
+             reason: {refusal:?}"
+        );
+        let too_long = format!("https://{}.example", "a".repeat(300));
+        let hidden = refusal_text(
+            "servers_refusal_hides_long_entry",
+            &delivery_manifest(&servers_delivery(&[format!("{too_long:?}")]), ""),
+        );
+        assert!(
+            hidden
+                .as_deref()
+                .is_some_and(|msg| msg.contains("delivery.servers") && !msg.contains(&too_long)),
+            "a too-long entry is refused without being echoed: {hidden:?}"
+        );
+    }
+
+    #[test]
+    fn manifest_servers_refuse_a_seventeenth_entry() {
+        let origins = |count: usize| -> Vec<String> {
+            (0..count)
+                .map(|n| format!("\"https://s{n}.example\""))
+                .collect()
+        };
+        assert!(
+            read(
+                "servers_sixteen_accepted",
+                &delivery_manifest(&servers_delivery(&origins(MAX_SERVER_ORIGINS)), ""),
+            )
+            .is_ok_and(|m| m.delivery.servers.len() == MAX_SERVER_ORIGINS),
+            "{MAX_SERVER_ORIGINS} origins are a list"
+        );
+        let refusal = refusal_text(
+            "servers_seventeen_refused",
+            &delivery_manifest(&servers_delivery(&origins(MAX_SERVER_ORIGINS + 1)), ""),
+        );
+        assert!(
+            refusal
+                .as_deref()
+                .is_some_and(|msg| msg.contains("delivery.servers") && msg.contains("at most")),
+            "one origin past the bound is refused: {refusal:?}"
+        );
+    }
+
+    #[test]
+    fn manifest_servers_refuse_a_repeat() {
+        let refusal = refusal_text(
+            "servers_repeat_refused",
+            &delivery_manifest(
+                &servers_delivery(&[
+                    "\"https://api.example\"".to_owned(),
+                    "\"https://api.example\"".to_owned(),
+                ]),
+                "",
+            ),
+        );
+        assert!(
+            refusal.as_deref().is_some_and(|msg| msg.contains("twice")),
+            "a repeated origin is refused: {refusal:?}"
+        );
+    }
+
+    /// A `delivery.mobile` record carrying push identifiers, with `api_key` as
+    /// the Firebase API key.
+    fn push_delivery(api_key: &str) -> String {
+        format!(
+            "{{ mobile = {{ bundleId = \"com.example.app\", push = {{ apns = Production, fcm = {{ projectId = \"example-app\", applicationId = \"1:123:android:abc\", apiKey = {api_key:?}, senderId = \"123\" }} }} }} }}"
+        )
+    }
+
+    #[test]
+    fn manifest_repeated_record_field_is_refused() {
+        let twice_key = refusal_text(
+            "push_api_key_twice_refused",
+            &delivery_manifest(
+                "{ mobile = { bundleId = \"com.example.app\", push = { apns = Production, fcm = { projectId = \"example-app\", applicationId = \"1:123:android:abc\", apiKey = \"AIza-first\", apiKey = \"AIza-second\", senderId = \"123\" } } } }",
+                "JsPort Push",
+            ),
+        );
+        assert!(
+            twice_key
+                .as_deref()
+                .is_some_and(|msg| msg.contains("`apiKey` is set twice")),
+            "a repeated fcm field is refused, never last-wins: {twice_key:?}"
+        );
+        let twice_servers = refusal_text(
+            "servers_key_twice_refused",
+            &delivery_manifest(
+                "{ servers = [ \"https://a.example\" ], servers = [ \"https://b.example\" ] }",
+                "",
+            ),
+        );
+        assert!(
+            twice_servers
+                .as_deref()
+                .is_some_and(|msg| msg.contains("`servers` is set twice")),
+            "a repeated delivery field is refused: {twice_servers:?}"
+        );
+        assert!(
+            read(
+                "servers_key_once_accepted",
+                &delivery_manifest("{ servers = [ \"https://a.example\" ] }", ""),
+            )
+            .is_ok(),
+            "the same record with the field once reads"
+        );
+    }
+
+    #[test]
+    fn manifest_push_is_refused_without_the_accept() {
+        let refusal = refusal_text(
+            "push_without_accept_refused",
+            &delivery_manifest(&push_delivery("AIza-key_1"), ""),
+        );
+        assert!(
+            refusal.as_deref().is_some_and(
+                |msg| msg.contains("delivery.mobile.push") && msg.contains("JsPort Push")
+            ),
+            "push identifiers without the accepted capability are refused: {refusal:?}"
+        );
+        let manifest = read(
+            "push_with_accept_accepted",
+            &delivery_manifest(&push_delivery("AIza-key_1"), "JsPort Push"),
+        )
+        .expect("push identifiers with the accepted capability parse");
+        let push = manifest
+            .mobile_push()
+            .ok()
+            .flatten()
+            .expect("an accepted, configured push is returned");
+        assert_eq!(push.apns, ApnsEnvironment::Production);
+        assert_eq!(push.fcm.api_key.as_str(), "AIza-key_1");
+    }
+
+    #[test]
+    fn manifest_push_accept_without_identifiers_is_unconfigured() {
+        let manifest = read(
+            "push_accept_without_identifiers",
+            &delivery_manifest(
+                "{ mobile = { bundleId = \"com.example.app\" } }",
+                "JsPort Push",
+            ),
+        )
+        .expect("the manifest reads; a web-only bundle needs no identifiers");
+        assert!(
+            manifest.mobile_push().is_err(),
+            "a mobile pack accepting push without identifiers is refused"
+        );
+        let offline = read(
+            "push_neither_accept_nor_identifiers",
+            &delivery_manifest("{ mobile = { bundleId = \"com.example.app\" } }", ""),
+        )
+        .expect("a manifest without push parses");
+        assert!(
+            matches!(offline.mobile_push(), Ok(None)),
+            "no accepted push needs no identifiers"
+        );
+    }
+
+    #[test]
+    fn manifest_push_identifier_grammar_is_refused() {
+        let refusal = refusal_text(
+            "push_identifier_grammar_refused",
+            &delivery_manifest(&push_delivery("AIza key"), "JsPort Push"),
+        );
+        assert!(
+            refusal
+                .as_deref()
+                .is_some_and(|msg| msg.contains("delivery.mobile.push.fcm.apiKey")
+                    && msg.contains(&FcmIdentifierRefusal::Byte { byte: b' ' }.to_string())),
+            "an identifier byte outside the grammar is refused: {refusal:?}"
+        );
+        let empty = refusal_text(
+            "push_identifier_empty_refused",
+            &delivery_manifest(&push_delivery(""), "JsPort Push"),
+        );
+        assert!(
+            empty.as_deref().is_some_and(|msg| msg.contains("apiKey")
+                && msg.contains(&FcmIdentifierRefusal::Empty.to_string())),
+            "an empty identifier is refused: {empty:?}"
         );
     }
 

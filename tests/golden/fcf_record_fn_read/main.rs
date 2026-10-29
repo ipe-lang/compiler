@@ -287,7 +287,7 @@ pub fn main_apply_it<FN0: Fn(i64) -> i64 + Send + Sync + 'static>(f: FN0, x: i64
 pub fn ipe_main() -> IpeTask<()> {
     let _ipe_recursion_guard = crate::recursion_guard();
     io_println(string_from_int(crate::main_apply_it(
-        move |eta_0: i64| -> i64 { (crate::main_runner()).run.clone()(eta_0) },
+        move |__u_eta_0: i64| -> i64 { (crate::main_runner()).run.clone()(__u_eta_0) },
         7i64,
     )))
 }

@@ -204,6 +204,8 @@ jobs:
         run: python3 .github/ci/test_check_required_set.py -v
       - name: Prove the in-repo ipe-fmt check refusals (unit tests)
         run: python3 .github/ci/test_ipe_fmt_check.py -v
+      - name: Prove the static cache-prune refusals (unit tests)
+        run: python3 .github/ci/test_cache_prune.py -v
       - name: The derived required-set is in sync with the manifest
         run: python3 .github/ci/check_required_set.py
 
@@ -375,8 +377,12 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: ./.github/actions/rust-toolchain-pinned
       - uses: ./.github/actions/mold
+      # `ipe-nextest-deps` is shared by explain-examples, registry-admission-run
+      # and seal-modset-vendored: each runs `cargo nextest run -p ipe` with the
+      # same toolchain, RUSTFLAGS and features, so their dependencies match.
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
+          shared-key: ipe-nextest-deps
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - uses: taiki-e/install-action@23d41aa71228a2692ee31bb433f070fd4bdc6661 # nextest
       - name: Judge every explain-page and docs-page example
@@ -428,8 +434,12 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: ./.github/actions/rust-toolchain-pinned
       - uses: ./.github/actions/mold
+      # `ipe-nextest-deps` is shared by explain-examples, registry-admission-run
+      # and seal-modset-vendored: each runs `cargo nextest run -p ipe` with the
+      # same toolchain, RUSTFLAGS and features, so their dependencies match.
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
+          shared-key: ipe-nextest-deps
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - uses: taiki-e/install-action@23d41aa71228a2692ee31bb433f070fd4bdc6661 # nextest
       # The fixtures shell out to `git init/commit/push`; give the runner an
@@ -721,7 +731,7 @@ jobs:
         env:
           CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER: wasm-bindgen-test-runner
           CHROMEDRIVER: chromedriver
-        run: cargo test -p ipe-runtime-rust --target wasm32-unknown-unknown --features wasm-client --test wasm_js_port_bridge | python3 tools/scripts/wasm-test/wasm_test_count.py 2
+        run: cargo test -p ipe-runtime-rust --target wasm32-unknown-unknown --features wasm-client --test wasm_js_port_bridge | python3 tools/scripts/wasm-test/wasm_test_count.py 5
       - name: Run the DOM paint tests (headless Chrome)
         if: needs.changes.outputs.release_only != 'true'
         shell: bash
@@ -1023,7 +1033,14 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: ./.github/actions/rust-toolchain-pinned
+        with:
+          targets: wasm32-unknown-unknown
       - uses: ./.github/actions/mold
+      # The wasm-bindgen CLI, pinned to the Cargo.lock wasm-bindgen version: a
+      # shape that declares a wasm client builds as its `web solo` bundle.
+      - uses: taiki-e/install-action@4cef1412cce204788f482e778a0b9187f9626a29 # v2
+        with:
+          tool: wasm-bindgen@0.2.126
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
@@ -1057,6 +1074,18 @@ jobs:
             echo "::group::$dir"
             if ! "$IPE" type-check "$dir"; then
               echo "::error::ipe type-check regressed: $dir"; fail=1; echo "::endgroup::"; continue
+            fi
+            # A package that declares a wasm client builds as its `web solo`
+            # bundle: that build compiles the wasm32 crate and runs wasm-bindgen
+            # itself, and mold links host binaries only, so RUSTFLAGS is cleared.
+            if grep -Eq '^[[:space:],]*wasm[[:space:]]*=[[:space:]]*On' "$toml"; then
+              if ! RUSTFLAGS="" "$IPE" dev build "$dir" web solo --out "$dir/out"; then
+                echo "::error::ipe dev build regressed: $dir"; fail=1; echo "::endgroup::"; continue
+              fi
+              if [ ! -f "$dir/out/rust/www/index.html" ]; then
+                echo "::error::wasm bundle has no www/index.html: $dir"; fail=1
+              fi
+              echo "::endgroup::"; continue
             fi
             if ! "$IPE" dev build "$dir" --out "$dir/out"; then
               echo "::error::ipe dev build regressed: $dir"; fail=1; echo "::endgroup::"; continue
@@ -1577,8 +1606,12 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: ./.github/actions/rust-toolchain-pinned
       - uses: ./.github/actions/mold
+      # `ipe-nextest-deps` is shared by explain-examples, registry-admission-run
+      # and seal-modset-vendored: each runs `cargo nextest run -p ipe` with the
+      # same toolchain, RUSTFLAGS and features, so their dependencies match.
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
+          shared-key: ipe-nextest-deps
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - uses: taiki-e/install-action@23d41aa71228a2692ee31bb433f070fd4bdc6661 # nextest
       - name: Run seal_modset under the vendored emit model
@@ -1748,15 +1781,16 @@ jobs:
   # release builds, so they share one dependency build. `ci/verify-manifest.py`
   # check 15 refuses a `cargo build`/`run`/`install` of `ipe` in any other job
   # of this workflow, and a job that downloads these artifacts without
-  # `needs: build-tools`. needs quick-check so a workspace that does not even
-  # compile never pays for this build.
+  # `needs: build-tools`. It runs beside quick-check, not behind it: it reads
+  # no quick-check output, and both are required contexts, so a workspace that
+  # does not compile is still refused by quick-check.
   #
   # Cheap phase on `code`, which covers every consumer's condition (the cheap
   # `code` jobs and the tests-phase `code` jobs, since the cheap phase also runs
   # in the merge queue), so no consumer is skipped behind a skipped build.
   build-tools:
     runs-on: ubuntu-latest
-    needs: [changes, quick-check]
+    needs: changes
     if: needs.changes.outputs.cheap == 'true' && needs.changes.outputs.code == 'true'
     env:
       RUSTFLAGS: -C link-arg=-fuse-ld=mold
@@ -1997,8 +2031,8 @@ jobs:
   #
   # Latency: a job starts only after EVERY `needs:` entry has finished, so the
   # cancel lands when the slowest member finishes (the docs-drift jobs:
-  # quick-check, then build-tools' one shared release build, then a
-  # prebuilt-binary regenerate), not when the first red appears. Members
+  # build-tools' one shared release build, then a prebuilt-binary
+  # regenerate), not when the first red appears. Members
   # that run an emitted `cargo build` of their own are deliberately left out
   # so that bound stays one shared compile rather than growing with it.
   #
@@ -2596,17 +2630,35 @@ jobs:
             echo "csp-styles server never became ready on port $IPE_CSP_STYLES_PORT" >&2
             exit 1
           fi
-      - name: Run Playwright specs (geo + clipboard, layout fill, focus across patch, csp styles)
-        working-directory: tools/scripts/browser-e2e
-        run: npx playwright test --config playwright.config.mjs
-      - name: Kill server
-        if: always()
-        run: kill "$CI_JOB_GEO_SERVER_PID" "$CI_JOB_LAYOUT_SERVER_PID" "$CI_JOB_FOCUS_SERVER_PID" "$CI_JOB_CSP_STYLES_SERVER_PID" 2>/dev/null || true
-      # The wasm test runner, pinned to the Cargo.lock wasm-bindgen version
+      # The wasm-bindgen CLI, pinned to the Cargo.lock wasm-bindgen version: the
+      # `web solo` bundle build below runs it, and so does the wasm test runner
       # (a runner of another version refuses the test binary).
       - uses: taiki-e/install-action@4cef1412cce204788f482e778a0b9187f9626a29 # v2
         with:
           tool: wasm-bindgen@0.2.126
+      # The serverless browser bundle: the spec serves its `www/` directory by
+      # request interception, so no server is spawned. mold links host binaries
+      # only, so the wasm32 build clears the job's RUSTFLAGS.
+      - name: Build the wasm-solo-clipboard browser bundle
+        env:
+          RUSTFLAGS: ""
+          CARGO_TARGET_DIR: ${{ github.workspace }}/.cache/browser-e2e-target/wasm-solo-clipboard
+        run: |
+          set -euo pipefail
+          OUT="$RUNNER_TEMP/wasm-solo-clipboard-emitted"
+          "$RUNNER_TEMP/ipe-release/ipe" dev build examples/shapes/web/wasm-solo-clipboard web solo --out "$OUT"
+          # Fail closed: a bundle without its shell leaves the spec nothing to serve.
+          if [ ! -f "$OUT/rust/www/index.html" ]; then
+            echo "wasm-solo-clipboard bundle has no www/index.html under '$OUT/rust'" >&2
+            exit 1
+          fi
+          bash "$GITHUB_WORKSPACE/.github/ci/github-env.sh" CI_JOB_WASM_SOLO_WWW "$OUT/rust/www"
+      - name: Run Playwright specs (geo + clipboard, layout fill, focus across patch, csp styles)
+        working-directory: tools/scripts/browser-e2e
+        run: IPE_WASM_SOLO_WWW="$CI_JOB_WASM_SOLO_WWW" npx playwright test --config playwright.config.mjs
+      - name: Kill server
+        if: always()
+        run: kill "$CI_JOB_GEO_SERVER_PID" "$CI_JOB_LAYOUT_SERVER_PID" "$CI_JOB_FOCUS_SERVER_PID" "$CI_JOB_CSP_STYLES_SERVER_PID" 2>/dev/null || true
       - name: Self-test the echo server and the count proof
         run: |
           set -euo pipefail

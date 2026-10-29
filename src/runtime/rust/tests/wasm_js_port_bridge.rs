@@ -20,8 +20,12 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use ipe_runtime_rust::error::IpeError;
-use ipe_runtime_rust::js_port::{js_send, js_subscribe, push_inbound};
+use ipe_runtime_rust::core::IpeResult;
+use ipe_runtime_rust::error::{IpeError, IpeErrorKind};
+use ipe_runtime_rust::js_port::{
+    DeliverOutcome, REQUEST_TIMEOUT_MS, deliver_outbound, js_close_session, js_open_session,
+    js_request, js_send, js_subscribe, push_inbound,
+};
 use ipe_runtime_rust::json::{Decoder, json_decode_int};
 use ipe_runtime_rust::tea::{IpeCmd, IpeSub};
 use wasm_bindgen::prelude::*;
@@ -120,5 +124,125 @@ fn outbound_encodes_and_delivers_to_page_handler() {
         seen.borrow().last().map(String::as_str),
         Some("42"),
         "outbound frame must be the canonical seal encoding of 42"
+    );
+}
+
+/// Point `window.ipeOnReceive` at `handler`, or remove it when `None`.
+fn set_page_host(handler: Option<&JsValue>) {
+    let window = web_sys::window();
+    assert!(window.is_some(), "run_in_browser must provide a Window");
+    let Some(window) = window else {
+        return;
+    };
+    let key = JsValue::from_str("ipeOnReceive");
+    let changed = handler.map_or_else(
+        || js_sys::Reflect::delete_property(&window, &key).unwrap_or(false),
+        |h| js_sys::Reflect::set(&window, &key, h).unwrap_or(false),
+    );
+    assert!(changed, "could not change window.ipeOnReceive");
+}
+
+/// Whether `result` is the typed `Unavailable` refusal.
+fn is_unavailable(result: &IpeResult<IpeError, i64>) -> bool {
+    matches!(
+        result,
+        IpeResult::Err(IpeError::Error(IpeErrorKind::Unavailable, _))
+    )
+}
+
+/// The request deadline in the clock's unit, read from the runtime constant.
+fn deadline_ms() -> f64 {
+    f64::from(u32::try_from(REQUEST_TIMEOUT_MS).unwrap_or(u32::MAX))
+}
+
+/// No page host: the frame is reported undelivered, and a correlated request
+/// resolves with the typed `Unavailable` refusal at once, never at the deadline.
+/// A host that answers that nothing on the page takes the frame is no host.
+#[wasm_bindgen_test]
+async fn request_with_no_host_refuses_before_the_deadline() {
+    set_page_host(None);
+    assert_eq!(deliver_outbound("1"), DeliverOutcome::NoHost);
+
+    let started = js_sys::Date::now();
+    let result = js_request::<i64, i64>(1, int_decoder()).await;
+    let elapsed = js_sys::Date::now() - started;
+    assert!(
+        is_unavailable(&result),
+        "a request with no host must refuse as unavailable"
+    );
+    assert!(
+        elapsed < deadline_ms(),
+        "the refusal must not wait out the deadline ({elapsed} ms)"
+    );
+
+    let declines = Closure::<dyn Fn(JsValue) -> JsValue>::new(|_raw: JsValue| JsValue::FALSE);
+    set_page_host(Some(declines.as_ref()));
+    declines.forget();
+    assert_eq!(deliver_outbound("1"), DeliverOutcome::NoHost);
+    let result = js_request::<i64, i64>(2, int_decoder()).await;
+    assert!(
+        is_unavailable(&result),
+        "a host that takes no frame must refuse as unavailable"
+    );
+}
+
+/// A host that throws: the frame is reported as `HostThrew`, and a correlated
+/// request resolves with the typed `Unavailable` refusal at once.
+#[wasm_bindgen_test]
+async fn throwing_host_yields_host_threw() {
+    let throws = Closure::<dyn Fn(JsValue) -> Result<(), JsValue>>::new(|_raw: JsValue| {
+        Err(JsValue::from_str("host fault"))
+    });
+    set_page_host(Some(throws.as_ref()));
+    throws.forget();
+    assert_eq!(deliver_outbound("1"), DeliverOutcome::HostThrew);
+
+    let started = js_sys::Date::now();
+    let result = js_request::<i64, i64>(3, int_decoder()).await;
+    let elapsed = js_sys::Date::now() - started;
+    assert!(
+        is_unavailable(&result),
+        "a request whose host threw must refuse as unavailable"
+    );
+    assert!(
+        elapsed < deadline_ms(),
+        "the refusal must not wait out the deadline ({elapsed} ms)"
+    );
+}
+
+/// No page host: opening a session refuses as `Unavailable`, and closing an open
+/// session whose host went away refuses at once, never at the session deadline.
+#[wasm_bindgen_test]
+async fn session_with_no_host_refuses_open_and_close_at_once() {
+    set_page_host(None);
+    let refused = js_open_session::<i64, i64>(1, int_decoder()).await;
+    assert!(
+        is_unavailable(&refused),
+        "opening a session with no host must refuse as unavailable"
+    );
+
+    let takes = Closure::<dyn Fn(JsValue) -> JsValue>::new(|_raw: JsValue| JsValue::TRUE);
+    set_page_host(Some(takes.as_ref()));
+    takes.forget();
+    let opened = js_open_session::<i64, i64>(2, int_decoder()).await;
+    assert!(
+        matches!(opened, IpeResult::Ok(_)),
+        "a host that takes the frame opens the session"
+    );
+    let IpeResult::Ok(handle) = opened else {
+        return;
+    };
+
+    set_page_host(None);
+    let started = js_sys::Date::now();
+    let closed = js_close_session::<i64, i64>(handle, 3, int_decoder()).await;
+    let elapsed = js_sys::Date::now() - started;
+    assert!(
+        is_unavailable(&closed),
+        "closing a session with no host must refuse as unavailable"
+    );
+    assert!(
+        elapsed < deadline_ms(),
+        "the close refusal must not wait out a deadline ({elapsed} ms)"
     );
 }

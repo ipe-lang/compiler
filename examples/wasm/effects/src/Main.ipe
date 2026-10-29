@@ -7,19 +7,7 @@ module Main exposing (main)
 --   * PubSub.publish / Sub.subscribeTopic -> the in-tab pub/sub broker
 --   * Http.get              -> fetch                (a typed absolute Url; CORS)
 --
--- `Ipe.WebSocket` is deliberately NOT imported here: the M1 target-keyed
--- gate (`ipe_canon::target_gate`) walks every function LINKED into a module
--- once any name from it is imported, not just the ones this program actually
--- calls (reachability pruning is M5's client-entry closure, not yet landed).
--- `Ipe.WebSocket`'s `onOpen`/`onMessage`/`onClose`/`onError` route through
--- `Sub_subscribeWebSocket`, which is unreachable on EVERY target today (no
--- `KernelFn` wires codegen to it — see `ws_client.rs`'s module doc), so
--- importing the module at all currently fails under `--target wasm` even
--- though `connect`/`send`/`close` have real browser substitutes. The M4
--- `web_sys::WebSocket` substitute is instead proven directly at the Rust
--- level (`src/runtime/rust/tests/wasm_effects_bridge.rs`, run in headless
--- Chromium via `wasm-bindgen-test`), and this gap is closed structurally by
--- M5's reachability closure, not by a per-module workaround here.
+-- The WebSocket client has its own example (`examples/wasm/websocket`).
 
 import Ipe.Http as Http
 import Ipe.Log as Log

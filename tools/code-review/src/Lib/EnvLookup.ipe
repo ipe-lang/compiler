@@ -1,4 +1,4 @@
-module Lib.EnvLookup exposing (StartupNotice, StartupRefusal, StartupVar(..), echoMaxChars, isUnset, requiredVarRefusal, startupNotice, startupRefusal, startupVarName, startupVars)
+module Lib.EnvLookup exposing (StartupNotice, StartupRefusal, StartupVar(..), echoMaxChars, fixSuffix, isUnset, requiredVarRefusal, startupNotice, startupRefusal, startupVarName, startupVars)
 
 import Ipe.Error as Error exposing (Error)
 import Ipe.Path as Path exposing (Path)
@@ -154,6 +154,15 @@ startupLine var shown problem fix =
         , SafeText.literal "; fix: "
         , SafeText.literal fix
         ]
+
+
+-- The `"; fix: "` suffix a startup line ends with, for a refusal laid out
+-- by a renderer other than `startupRefusal` (its own shape does not fit
+-- `StartupRefusal`): the one place that literal is written, so every
+-- startup line's fix marker still comes from this module.
+fixSuffix : SafeText -> SafeText
+fixSuffix fix =
+    SafeText.concat [ SafeText.literal "; fix: ", fix ]
 
 
 -- The longest prefix of a variable's value a refusal shows, in code points.

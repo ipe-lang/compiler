@@ -753,3 +753,252 @@ fn a_postgres_project_test_cannot_open_an_sqlite_location() -> TestResult {
     );
     Ok(())
 }
+
+/// The push test entry: its `@REFUSALS@` line takes one case per bridge refusal.
+const PUSH_TEST_ENTRY: &str = r#"module Main exposing (main)
+
+import Ipe.Browser.Push as Push
+import Ipe.Browser.Push.Internals as Internals
+import Ipe.Error as Error exposing (Error)
+import Ipe.Json.Decode as Decode
+import Ipe.Json.Encode as Encode
+import Ipe.Result as Result exposing (Result(..))
+import Ipe.String as String
+import Ipe.Test as Test exposing (Test)
+
+
+outcome : Result Error a -> String
+outcome result =
+    case result of
+        Ok _ ->
+            "ok"
+
+        Err err ->
+            Error.toString err
+
+
+replyOutcome : Decode.Decoder (Result Error a) -> String -> String
+replyOutcome decoder frame =
+    case Decode.decodeString decoder frame of
+        Ok result ->
+            outcome result
+
+        Err _ ->
+            "malformed"
+
+
+roundTrip : String -> Result String String
+roundTrip text =
+    Result.mapError Error.toString (Result.map Internals.encodeSubscription (Internals.decodeSubscription text))
+
+
+badKey : String
+badKey =
+    Error.toString (Error.invalidInput "a push application key must be a 65-byte uncompressed P-256 point in base64url")
+
+
+malformed : String
+malformed =
+    Error.toString (Error.invalidInput "a push subscription text is malformed")
+
+
+pastCeiling : String
+pastCeiling =
+    Error.toString (Error.limitExceeded "a push subscription text is past its ceiling")
+
+
+validKey : String
+validKey =
+    "BP4z9KsN6nGRTbVYI_c7VJSPQTBtkgcy27mlmlMoZIIgDll6e3vCYLocInmYWAmS6TlzAC8wEqKK6PBru3jl7A8"
+
+
+receiver : String
+receiver =
+    "BCVxsr7N_eNgVRqvHtD0zTZsEc6-VV-JvLexhqUzORcxaOzi6-AYWXvTBHm4bjyPjs7Vd8pZGH6SRpkNtoIAiw4"
+
+
+auth : String
+auth =
+    "BTBZMqHH6r4Tts7J_aSIgg"
+
+
+webOpen : String
+webOpen =
+    "{\"v\":1,\"kind\":\"web\",\"endpoint\":\"https://push.example.net/send/abc\",\"p256dh\":\"" ++ receiver ++ "\",\"auth\":\"" ++ auth ++ "\""
+
+
+webText : String
+webText =
+    webOpen ++ "}"
+
+
+webAmpersand : String
+webAmpersand =
+    String.replace "/send/abc" "/send/a\\u0026b" webText
+
+
+apnsText : String
+apnsText =
+    "{\"v\":1,\"kind\":\"apns\",\"token\":\"" ++ String.repeat 8 "0a1b2c3d" ++ "\",\"env\":\"production\",\"p256dh\":\"" ++ receiver ++ "\",\"auth\":\"" ++ auth ++ "\"}"
+
+
+fcmText : String
+fcmText =
+    "{\"v\":1,\"kind\":\"fcm\",\"token\":\"fcmToken:APA91b_x-Y0\",\"p256dh\":\"" ++ receiver ++ "\",\"auth\":\"" ++ auth ++ "\"}"
+
+
+subscribedFrame : String -> String
+subscribedFrame event =
+    Encode.encode 0 (Encode.object [ ( "ok", Encode.bool True ), ( "event", Encode.string event ), ( "subscription", Encode.string webText ) ])
+
+
+tests : List Test
+tests =
+    [ Test.suite "applicationKey"
+        [ Test.test "a 65-byte point is a key" (\_ -> Test.equal "ok" (outcome (Push.applicationKey validKey)))
+        , Test.test "a 64-byte value is refused" (\_ -> Test.equal badKey (outcome (Push.applicationKey "BP4z9KsN6nGRTbVYI_c7VJSPQTBtkgcy27mlmlMoZIIgDll6e3vCYLocInmYWAmS6TlzAC8wEqKK6PBru3jl7A")))
+        , Test.test "another point tag is refused" (\_ -> Test.equal badKey (outcome (Push.applicationKey "Bf4z9KsN6nGRTbVYI_c7VJSPQTBtkgcy27mlmlMoZIIgDll6e3vCYLocInmYWAmS6TlzAC8wEqKK6PBru3jl7A8")))
+        , Test.test "the standard alphabet is refused" (\_ -> Test.equal badKey (outcome (Push.applicationKey (String.replace "_" "/" validKey))))
+        , Test.test "padding is refused" (\_ -> Test.equal badKey (outcome (Push.applicationKey (validKey ++ "="))))
+        , Test.test "a second spelling is refused" (\_ -> Test.equal badKey (outcome (Push.applicationKey "BP4z9KsN6nGRTbVYI_c7VJSPQTBtkgcy27mlmlMoZIIgDll6e3vCYLocInmYWAmS6TlzAC8wEqKK6PBru3jl7A9")))
+        ]
+    , Test.suite "subscriptionText"
+        [ Test.test "a web subscription round-trips" (\_ -> Test.equal (Ok webText) (roundTrip webText))
+        , Test.test "an apns subscription round-trips" (\_ -> Test.equal (Ok apnsText) (roundTrip apnsText))
+        , Test.test "an fcm subscription round-trips" (\_ -> Test.equal (Ok fcmText) (roundTrip fcmText))
+        , Test.test "another version is refused" (\_ -> Test.equal (Err malformed) (roundTrip (String.replace "\"v\":1" "\"v\":2" webText)))
+        , Test.test "an unknown kind is refused" (\_ -> Test.equal (Err malformed) (roundTrip (String.replace "\"kind\":\"web\"" "\"kind\":\"mail\"" webText)))
+        , Test.test "an endpoint with an escaped ampersand round-trips" (\_ -> Test.equal (Ok webAmpersand) (roundTrip webAmpersand))
+        , Test.test "an endpoint with a bare ampersand is refused" (\_ -> Test.equal (Err malformed) (roundTrip (String.replace "\\u0026" "&" webAmpersand)))
+        , Test.test "a plain http endpoint is refused" (\_ -> Test.equal (Err malformed) (roundTrip (String.replace "https://" "http://" webText)))
+        , Test.test "a 15-byte secret is refused" (\_ -> Test.equal (Err malformed) (roundTrip (String.replace auth "BTBZMqHH6r4Tts7J_aSI" webText)))
+        , Test.test "reordered keys are refused" (\_ -> Test.equal (Err malformed) (roundTrip ("{\"v\":1,\"kind\":\"web\",\"endpoint\":\"https://push.example.net/send/abc\",\"auth\":\"" ++ auth ++ "\",\"p256dh\":\"" ++ receiver ++ "\"}")))
+        , Test.test "an extra key is refused" (\_ -> Test.equal (Err malformed) (roundTrip (webOpen ++ ",\"x\":1}")))
+        , Test.test "a text under the ceiling is read" (\_ -> Test.equal (Err malformed) (roundTrip (webText ++ " ")))
+        , Test.test "a text past the ceiling is refused unread" (\_ -> Test.equal (Err pastCeiling) (roundTrip (webText ++ String.repeat 4096 " ")))
+        ]
+    , Test.suite "replies"
+        [ Test.test "a subscribed reply carries the subscription" (\_ -> Test.equal "ok" (replyOutcome Internals.subscribeReply (subscribedFrame "subscribed")))
+        , Test.test "another event is refused" (\_ -> Test.equal "malformed" (replyOutcome Internals.subscribeReply (subscribedFrame "current")))
+        , Test.test "an unsubscribed reply succeeds" (\_ -> Test.equal "ok" (replyOutcome Internals.unsubscribeReply "{\"ok\":true,\"event\":\"unsubscribed\"}"))
+        , Test.test "an unknown refusal code is refused" (\_ -> Test.equal "malformed" (replyOutcome Internals.unsubscribeReply "{\"ok\":false,\"error\":\"nope\"}"))
+@REFUSALS@        ]
+    ]
+
+
+main =
+    Test.runMain tests
+"#;
+
+/// The low-level push module's source, as the stdlib compiles it.
+const PUSH_INTERNALS_SOURCE: &str = include_str!("../../stdlib/Ipe/Browser/Push/Internals.ipe");
+
+/// Every port event a push reply decoder waits for is an event the glue answers
+/// with, and the push modules subscribe to no inbound frame the glue never sends:
+/// a reply decoder waiting for an unsent event refuses every answer, and a `Sub`
+/// over an unsent frame never fires.
+#[test]
+fn every_push_event_a_decoder_waits_for_is_one_the_glue_sends() {
+    let glue = ipe_runtime_rust::js_port_glue::port_glue_js();
+    let mut events = Vec::new();
+    for piece in PUSH_INTERNALS_SOURCE.split("reply \"").skip(1) {
+        let event = piece.split('"').next().unwrap_or_default();
+        assert!(
+            glue.contains(&format!("event: \"{event}\"")),
+            "the glue never answers the push event {event:?}"
+        );
+        events.push(event);
+    }
+    assert_eq!(events, ["subscribed", "current", "unsubscribed"]);
+    for source in [
+        include_str!("../../stdlib/Ipe/Browser/Push.ipe"),
+        PUSH_INTERNALS_SOURCE,
+    ] {
+        assert!(
+            !source.contains("Js.subscribe") && !source.contains("Sub.Sub"),
+            "a push inbound subscription has no frame producer in the glue"
+        );
+    }
+}
+
+/// The push sizes and version the stdlib parses by are the ones the runtime
+/// glue checks: each is defined once in the Ipê source, with the runtime's value,
+/// and each base64url length is the unpadded spelling of its byte length.
+#[test]
+fn push_stdlib_sizes_are_the_runtime_constants() {
+    use ipe_runtime_rust::js_port_glue::{
+        PUSH_APPLICATION_KEY_BYTES, PUSH_AUTH_SECRET_BYTES, PUSH_SUBSCRIPTION_VERSION,
+    };
+    let version = usize::try_from(PUSH_SUBSCRIPTION_VERSION).unwrap_or(usize::MAX);
+    for (name, value) in [
+        ("subscriptionVersion", version),
+        ("pointBytes", PUSH_APPLICATION_KEY_BYTES),
+        ("pointChars", (PUSH_APPLICATION_KEY_BYTES * 4).div_ceil(3)),
+        ("authSecretBytes", PUSH_AUTH_SECRET_BYTES),
+        ("authSecretChars", (PUSH_AUTH_SECRET_BYTES * 4).div_ceil(3)),
+    ] {
+        let head = format!("\n{name} =\n");
+        assert_eq!(
+            PUSH_INTERNALS_SOURCE.matches(head.as_str()).count(),
+            1,
+            "{name}"
+        );
+        let definition = format!("\n{name} : Int\n{name} =\n    {value}\n");
+        assert_eq!(
+            PUSH_INTERNALS_SOURCE.matches(definition.as_str()).count(),
+            1,
+            "{name} must be defined as {value}"
+        );
+    }
+}
+
+/// One test case per bridge refusal, naming the error the runtime defines for it.
+fn push_refusal_cases() -> String {
+    use ipe_runtime_rust::js_port_glue::native_bridge::{BridgeErrorKind, Reject};
+    Reject::ALL
+        .iter()
+        .map(|reject| {
+        let code = reject.as_str();
+        let message = reject.message();
+        let expected = match reject.error_kind() {
+            BridgeErrorKind::PermissionDenied => "Error.permissionDenied".to_owned(),
+            BridgeErrorKind::Unavailable => format!("(Error.unavailable \"{message}\")"),
+            BridgeErrorKind::InvalidInput => format!("(Error.invalidInput \"{message}\")"),
+            BridgeErrorKind::LimitExceeded => format!("(Error.limitExceeded \"{message}\")"),
+        };
+        format!(
+            "        , Test.test \"the {code} refusal\" (\\_ -> Test.equal (Error.toString {expected}) \
+             (replyOutcome Internals.unsubscribeReply \"{{\\\"ok\\\":false,\\\"error\\\":\\\"{code}\\\"}}\"))\n"
+        )
+        })
+        .collect::<Vec<_>>()
+        .concat()
+}
+
+/// `Ipe.Browser.Push` parses keys and subscription texts in one spelling.
+///
+/// A malformed key, a second spelling of a subscription and an unknown reply
+/// are refused beside a valid neighbour, and every bridge refusal decodes to
+/// the error the runtime defines for its code. Gated on `IPE_E2E=1` — it builds
+/// and runs the emitted test binary.
+#[test]
+fn push_parses_one_spelling_and_decodes_every_bridge_refusal() -> TestResult {
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
+        eprintln!("skipping: set IPE_E2E=1 to run the push test E2E");
+        return Ok(());
+    }
+    let entry = PUSH_TEST_ENTRY.replace("@REFUSALS@", &push_refusal_cases());
+    let dir = write_db_test_project("ipe_test_push", &entry)?;
+
+    let (ok, stdout, stderr) = run_ipe(&["test", &dir.to_string_lossy()])?;
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(
+        ok,
+        "the push test entry must pass, got stdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        stdout.contains("all tests passed"),
+        "the settled outcome must appear, got stdout:\n{stdout}"
+    );
+    Ok(())
+}

@@ -96,6 +96,7 @@ fn body_edit_reexecutes_only_the_edited_module_file() {
             target: ipe_ir::Target::Native,
             wasm_public_env: Vec::new(),
             mount_base: ipe_backend_rust::MountBase::root(),
+            server_origins: ipe_backend_rust::ServerOrigins::none(),
             wasm_hydrate_mode: false,
             runtime_dep: None,
             debugger: false,

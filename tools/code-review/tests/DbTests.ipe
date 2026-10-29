@@ -470,6 +470,9 @@ storedReasonShown expected found =
                 StoredApproved ->
                     False
 
+                StoredAcknowledged ->
+                    False
+
                 StoredRefused r ->
                     SafeText.toString (LibDb.storedReasonText r) == expected
 
@@ -521,6 +524,43 @@ storedBlankReasonDecodes db =
         verify <- countingVerifier db
         found <- LibDb.findDecision verify db (uid "blank-uid") "hB"
         Task.succeed (storedReasonShown "reason not shown: it is blank" found)
+
+
+-- A signed `approve` reads back by the subject the same mac signs: of a
+-- file as an acknowledgement, of a unit as an approval, so a log written
+-- before acknowledgements had their own form reads back unchanged; a
+-- refusal of a file stays a refusal. Red if an acknowledgement reads as an
+-- approval, or an approval as an acknowledgement.
+acknowledgementReadsBack : Db -> Task.Task Error Bool
+acknowledgementReadsBack db =
+    let
+        fileRow label decision reason =
+            { name = RawFile "ipe:src/blob.bin", uid = uid label, bodyHash = "hF", decision = decision, reason = reason, reviewedAt = 0 }
+
+        decisionOf found =
+            case found of
+                Just (Verified row) ->
+                    Just (LibDb.verifiedDecision row)
+
+                Just (Unverified _) ->
+                    Nothing
+
+                Nothing ->
+                    Nothing
+    in
+    do
+        appendSigned db (fileRow "acked-file" "approve" Nothing)
+        appendSigned db (fileRow "refused-file" "refuse" (Just "fix it"))
+        appendSigned db (rawRow "approved-unit" "hU" "approve" Nothing)
+        verify <- countingVerifier db
+        acked <- LibDb.findDecision verify db (uid "acked-file") "hF"
+        refusedFile <- LibDb.findDecision verify db (uid "refused-file") "hF"
+        approved <- LibDb.findDecision verify db (uid "approved-unit") "hU"
+        Task.succeed
+            (decisionOf acked == Just StoredAcknowledged
+                && storedReasonShown "fix it" refusedFile
+                && decisionOf approved == Just StoredApproved
+            )
 
 
 -- A signed review-log cell past its ceiling is never read: a reason of
@@ -995,6 +1035,9 @@ historyKey entry =
         Verified row ->
             case LibDb.verifiedDecision row of
                 StoredApproved ->
+                    ( Just (LibDb.verifiedUid row), Nothing )
+
+                StoredAcknowledged ->
                     ( Just (LibDb.verifiedUid row), Nothing )
 
                 StoredRefused reason ->
@@ -2156,6 +2199,7 @@ storedRowChecks =
         [ check "refusal reason is non-blank and bounded" (onFreshReview "ipe-review-reasonBounded" reasonBounded)
         , check "a stored over-long reason decodes and shows its length" (onFreshReview "ipe-review-storedOverlongReasonDecodes" storedOverlongReasonDecodes)
         , check "a stored blank reason decodes as blank" (onFreshReview "ipe-review-storedBlankReasonDecodes" storedBlankReasonDecodes)
+        , check "a signed approval of a file reads back as an acknowledgement, of a unit as an approval" (onFreshReview "ipe-review-acknowledgementReadsBack" acknowledgementReadsBack)
         , check "a signed review-log cell past its ceiling reads as tampered and the History still loads" (onFreshReview "ipe-review-logCellPastCeilingRefused" logCellPastCeilingRefused)
         , check "a review-log integer cell holding a blob reads as tampered and a page cannot continue from it" (onFreshReview "ipe-review-integerCellPastTypeRefused" integerCellPastTypeRefused)
         , check "a legacy integer cell holding a blob fails the History page" (onFreshReview "ipe-review-legacyIntegerCellPastTypeRefused" legacyIntegerCellPastTypeRefused)

@@ -265,13 +265,13 @@ pub fn ipe_main() -> IpeTask<()> {
         ({
             let h1 = {
                 let __ipe_fn: Box<dyn Fn(i64) -> i64 + Send + Sync + 'static> =
-                    Box::new(move |eta_2: i64| -> i64 { crate::main_add(1i64, eta_2) });
+                    Box::new(move |__u_eta_2: i64| -> i64 { crate::main_add(1i64, __u_eta_2) });
                 __ipe_fn
             };
             ({
                 let h2 = {
                     let __ipe_fn: Box<dyn Fn(i64) -> i64 + Send + Sync + 'static> =
-                        Box::new(move |eta_0: i64| -> i64 { crate::main_add(2i64, eta_0) });
+                        Box::new(move |__u_eta_0: i64| -> i64 { crate::main_add(2i64, __u_eta_0) });
                     __ipe_fn
                 };
                 ({
@@ -280,7 +280,9 @@ pub fn ipe_main() -> IpeTask<()> {
                             let double = double.clone();
                             {
                                 let __ipe_fn: Box<dyn Fn(i64) -> i64 + Send + Sync + 'static> =
-                                    Box::new(move |eta_4: i64| -> i64 { (double.clone())(eta_4) });
+                                    Box::new(move |__u_eta_4: i64| -> i64 {
+                                        (double.clone())(__u_eta_4)
+                                    });
                                 __ipe_fn
                             }
                         }),
@@ -292,8 +294,8 @@ pub fn ipe_main() -> IpeTask<()> {
                                 let double = double.clone();
                                 {
                                     let __ipe_fn: Box<dyn Fn(i64) -> i64 + Send + Sync + 'static> =
-                                        Box::new(move |eta_4: i64| -> i64 {
-                                            (double.clone())(eta_4)
+                                        Box::new(move |__u_eta_4: i64| -> i64 {
+                                            (double.clone())(__u_eta_4)
                                         });
                                     __ipe_fn
                                 }

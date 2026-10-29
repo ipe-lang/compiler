@@ -306,14 +306,14 @@ pub fn main_runner() -> RecRun {
     RecRun {
         run: {
             let __ipe_fn: ::std::sync::Arc<dyn Fn(i64) -> i64 + Send + Sync + 'static> =
-                ::std::sync::Arc::new(move |eta_0: i64| -> i64 {
+                ::std::sync::Arc::new(move |__u_eta_0: i64| -> i64 {
                     (crate::main_wrap({
                         let __ipe_fn: Box<dyn Fn(i64) -> i64 + Send + Sync + 'static> =
                             Box::new(move |n: i64| -> i64 {
                                 ipe_runtime::math::ipe_int_mul(n, 2i64)
                             });
                         __ipe_fn
-                    }))(eta_0)
+                    }))(__u_eta_0)
                 });
             __ipe_fn
         },
@@ -325,14 +325,14 @@ pub fn main_guard() -> RecShouldRetry {
     RecShouldRetry {
         shouldRetry: {
             let __ipe_fn: ::std::sync::Arc<dyn Fn(i64) -> i64 + Send + Sync + 'static> =
-                ::std::sync::Arc::new(move |eta_0: i64| -> i64 {
+                ::std::sync::Arc::new(move |__u_eta_0: i64| -> i64 {
                     (crate::main_wrap({
                         let __ipe_fn: Box<dyn Fn(i64) -> i64 + Send + Sync + 'static> =
                             Box::new(move |n: i64| -> i64 {
                                 ipe_runtime::math::ipe_int_add(n, 10i64)
                             });
                         __ipe_fn
-                    }))(eta_0)
+                    }))(__u_eta_0)
                 });
             __ipe_fn
         },

@@ -784,6 +784,330 @@ impl CookieSuffix {
     }
 }
 
+/// The scheme every [`ServerOrigin`] is written with.
+const ORIGIN_SCHEME: &str = "https://";
+
+/// The WebSocket scheme of a [`ServerOrigin`]'s authority.
+const ORIGIN_WS_SCHEME: &str = "wss://";
+
+/// The longest host a [`ServerOrigin`] admits, in bytes.
+pub const MAX_ORIGIN_HOST_LEN: usize = 253;
+
+/// The longest dot-separated label of a [`ServerOrigin`] host, in bytes.
+pub const MAX_ORIGIN_LABEL_LEN: usize = 63;
+
+/// The longest text [`ServerOrigin::parse`] scans: `https://`, a host and `:65535`.
+pub const MAX_ORIGIN_LEN: usize = ORIGIN_SCHEME.len() + MAX_ORIGIN_HOST_LEN + 6;
+
+/// The most origins a [`ServerOrigins`] list holds.
+pub const MAX_SERVER_ORIGINS: usize = 16;
+
+/// The port an `https` origin names when it writes none.
+const DEFAULT_HTTPS_PORT: u16 = 443;
+
+/// Why a text is not a server origin.
+///
+/// No variant carries the refused text, so a refusal is shown without
+/// echoing author input.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ServerOriginRefusal {
+    /// Longer than [`MAX_ORIGIN_LEN`]; judged before any byte is scanned.
+    TooLong { len: usize },
+    /// The text does not open with `https://` (`http://`, `wss://`, `HTTPS://`).
+    NotHttps,
+    /// A `*` wildcard.
+    Wildcard,
+    /// A `@`: the authority names a user.
+    Userinfo,
+    /// A `/`, `?` or `#`: something follows the authority.
+    AfterAuthority,
+    /// An uppercase letter; a host is written in lowercase only.
+    Uppercase,
+    /// An IP literal: a `[` or `]`, or a host whose last label is a number.
+    IpLiteral,
+    /// A byte outside `[a-z0-9.-]` and the port's `:`, whitespace, controls
+    /// and non-ASCII included.
+    Byte { byte: u8 },
+    /// No host between the scheme and the port.
+    EmptyHost,
+    /// The host is longer than [`MAX_ORIGIN_HOST_LEN`].
+    HostTooLong { len: usize },
+    /// Two adjacent dots, or a leading or trailing dot.
+    EmptyLabel,
+    /// A label longer than [`MAX_ORIGIN_LABEL_LEN`].
+    LabelTooLong { len: usize },
+    /// A label that starts or ends with `-`.
+    LabelHyphen,
+    /// A `:` with no digits after it, or a port holding a non-digit.
+    PortMalformed,
+    /// A port written with a leading zero (`:0443`).
+    PortLeadingZero,
+    /// A port outside `1..=65535`.
+    PortOutOfRange,
+    /// The port `443` written out; that origin is written without a port.
+    DefaultPort,
+}
+
+impl std::fmt::Display for ServerOriginRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::TooLong { len } => write!(
+                f,
+                "a server origin is at most {MAX_ORIGIN_LEN} bytes (this one is {len})"
+            ),
+            Self::NotHttps => write!(f, "a server origin starts with `https://`"),
+            Self::Wildcard => write!(f, "a server origin names one host, never a `*` wildcard"),
+            Self::Userinfo => write!(f, "a server origin carries no user name (`@`)"),
+            Self::AfterAuthority => write!(
+                f,
+                "a server origin ends after its host and port: no `/`, path, query or fragment"
+            ),
+            Self::Uppercase => write!(f, "a server origin host is written in lowercase"),
+            Self::IpLiteral => write!(f, "a server origin names a host name, never an IP address"),
+            Self::Byte { byte } => write!(
+                f,
+                "a server origin host holds only the bytes a-z 0-9 - and `.` (found byte 0x{byte:02X})"
+            ),
+            Self::EmptyHost => write!(f, "a server origin names a host"),
+            Self::HostTooLong { len } => write!(
+                f,
+                "a server origin host is at most {MAX_ORIGIN_HOST_LEN} bytes (this one is {len})"
+            ),
+            Self::EmptyLabel => write!(
+                f,
+                "a server origin host has no empty label (`..`, or a leading or trailing `.`)"
+            ),
+            Self::LabelTooLong { len } => write!(
+                f,
+                "a server origin host label is at most {MAX_ORIGIN_LABEL_LEN} bytes (this one is {len})"
+            ),
+            Self::LabelHyphen => write!(
+                f,
+                "a server origin host label neither starts nor ends with `-`"
+            ),
+            Self::PortMalformed => write!(f, "a server origin port is digits after `:`"),
+            Self::PortLeadingZero => write!(f, "a server origin port has no leading zero"),
+            Self::PortOutOfRange => write!(f, "a server origin port is in 1..=65535"),
+            Self::DefaultPort => {
+                write!(f, "a server origin on port 443 is written without the port")
+            }
+        }
+    }
+}
+
+/// One `https` origin a bundle may reach: `https://`, a host, an optional port.
+///
+/// Built only by [`ServerOrigin::parse`], so every value has one spelling: a
+/// lowercase host name of dot-separated `[a-z0-9-]` labels that is not an IP
+/// address, and a port other than `443` written without leading zeros. The
+/// same value renders the `https` and `wss` forms, so no consumer joins a
+/// scheme to author text.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ServerOrigin {
+    authority: String,
+}
+
+impl ServerOrigin {
+    /// Parse `text` as `https://`, a host, then an optional `:` port.
+    ///
+    /// # Errors
+    ///
+    /// `TooLong` before any byte is scanned, `NotHttps`, then the first
+    /// refused byte (`Wildcard`, `Userinfo`, `AfterAuthority`, `Uppercase`,
+    /// `IpLiteral`, `Byte`), then the port, then the host's shape.
+    pub fn parse(text: &str) -> Result<Self, ServerOriginRefusal> {
+        if text.len() > MAX_ORIGIN_LEN {
+            return Err(ServerOriginRefusal::TooLong { len: text.len() });
+        }
+        let authority = text
+            .strip_prefix(ORIGIN_SCHEME)
+            .ok_or(ServerOriginRefusal::NotHttps)?;
+        if let Some(byte) = authority.bytes().find(|&b| !is_origin_byte(b)) {
+            return Err(origin_byte_refusal(byte));
+        }
+        let (host, port) = authority
+            .split_once(':')
+            .map_or((authority, None), |(host, port)| (host, Some(port)));
+        if let Some(port) = port {
+            check_origin_port(port)?;
+        }
+        check_origin_host(host)?;
+        Ok(Self {
+            authority: authority.to_owned(),
+        })
+    }
+
+    /// The host and the optional `:port`, without a scheme.
+    #[must_use]
+    pub fn authority(&self) -> &str {
+        &self.authority
+    }
+
+    /// The origin as `https://`, the host, then the optional `:port`.
+    #[must_use]
+    pub fn https(&self) -> String {
+        let mut out = String::new();
+        self.write_https(&mut out);
+        out
+    }
+
+    /// The same authority under `wss://`, the origin's WebSocket form.
+    #[must_use]
+    pub fn wss(&self) -> String {
+        let mut out = String::new();
+        self.write_wss(&mut out);
+        out
+    }
+
+    /// Append the `https` form to `out`.
+    pub fn write_https(&self, out: &mut String) {
+        out.push_str(ORIGIN_SCHEME);
+        out.push_str(&self.authority);
+    }
+
+    /// Append the `wss` form to `out`.
+    pub fn write_wss(&self, out: &mut String) {
+        out.push_str(ORIGIN_WS_SCHEME);
+        out.push_str(&self.authority);
+    }
+}
+
+/// The bytes an origin's authority may hold: a host's, and the port's `:`.
+const fn is_origin_byte(b: u8) -> bool {
+    matches!(b, b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b':')
+}
+
+/// The refusal a byte outside [`is_origin_byte`] earns.
+const fn origin_byte_refusal(byte: u8) -> ServerOriginRefusal {
+    match byte {
+        b'*' => ServerOriginRefusal::Wildcard,
+        b'@' => ServerOriginRefusal::Userinfo,
+        b'/' | b'?' | b'#' => ServerOriginRefusal::AfterAuthority,
+        b'A'..=b'Z' => ServerOriginRefusal::Uppercase,
+        b'[' | b']' => ServerOriginRefusal::IpLiteral,
+        _ => ServerOriginRefusal::Byte { byte },
+    }
+}
+
+/// Judge the port text after the `:`.
+fn check_origin_port(port: &str) -> Result<(), ServerOriginRefusal> {
+    if port.is_empty() || !port.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(ServerOriginRefusal::PortMalformed);
+    }
+    if port.len() > 1 && port.starts_with('0') {
+        return Err(ServerOriginRefusal::PortLeadingZero);
+    }
+    match port.parse::<u16>() {
+        Ok(0) | Err(_) => Err(ServerOriginRefusal::PortOutOfRange),
+        Ok(DEFAULT_HTTPS_PORT) => Err(ServerOriginRefusal::DefaultPort),
+        Ok(_) => Ok(()),
+    }
+}
+
+/// Judge the host: its length, each label, and that it is not a number.
+fn check_origin_host(host: &str) -> Result<(), ServerOriginRefusal> {
+    if host.is_empty() {
+        return Err(ServerOriginRefusal::EmptyHost);
+    }
+    if host.len() > MAX_ORIGIN_HOST_LEN {
+        return Err(ServerOriginRefusal::HostTooLong { len: host.len() });
+    }
+    for label in host.split('.') {
+        if label.is_empty() {
+            return Err(ServerOriginRefusal::EmptyLabel);
+        }
+        if label.len() > MAX_ORIGIN_LABEL_LEN {
+            return Err(ServerOriginRefusal::LabelTooLong { len: label.len() });
+        }
+        if label.starts_with('-') || label.ends_with('-') {
+            return Err(ServerOriginRefusal::LabelHyphen);
+        }
+    }
+    if host.rsplit('.').next().is_some_and(is_numeric_label) {
+        return Err(ServerOriginRefusal::IpLiteral);
+    }
+    Ok(())
+}
+
+/// Whether a URL parser reads `label`, as a host's last label, as an IPv4
+/// number: decimal digits, or `0x` and hex digits.
+fn is_numeric_label(label: &str) -> bool {
+    label.strip_prefix("0x").map_or_else(
+        || label.bytes().all(|b| b.is_ascii_digit()),
+        |hex| hex.bytes().all(|b| b.is_ascii_hexdigit()),
+    )
+}
+
+/// Why a list of origins is not a [`ServerOrigins`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ServerOriginsRefusal {
+    /// More than [`MAX_SERVER_ORIGINS`] distinct origins.
+    LimitExceeded,
+}
+
+impl std::fmt::Display for ServerOriginsRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::LimitExceeded => write!(
+                f,
+                "a bundle names at most {MAX_SERVER_ORIGINS} server origins"
+            ),
+        }
+    }
+}
+
+/// The origins a bundle may reach besides its own.
+///
+/// Sorted, distinct, and at most [`MAX_SERVER_ORIGINS`] long. The empty list
+/// is an offline bundle. There is no `Default`: a site that means none names
+/// [`ServerOrigins::none`].
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct ServerOrigins(Vec<ServerOrigin>);
+
+impl ServerOrigins {
+    /// No server origin: the bundle reaches only its own origin.
+    #[must_use]
+    pub const fn none() -> Self {
+        Self(Vec::new())
+    }
+
+    /// The sorted, de-duplicated list of `origins`.
+    ///
+    /// # Errors
+    ///
+    /// `LimitExceeded` as soon as more than [`MAX_SERVER_ORIGINS`] distinct
+    /// origins are seen; nothing more of `origins` is read.
+    pub fn new(
+        origins: impl IntoIterator<Item = ServerOrigin>,
+    ) -> Result<Self, ServerOriginsRefusal> {
+        let mut set = std::collections::BTreeSet::new();
+        for origin in origins {
+            set.insert(origin);
+            if set.len() > MAX_SERVER_ORIGINS {
+                return Err(ServerOriginsRefusal::LimitExceeded);
+            }
+        }
+        Ok(Self(set.into_iter().collect()))
+    }
+
+    /// The origins, in sorted order.
+    pub fn origins(&self) -> impl Iterator<Item = &ServerOrigin> {
+        self.0.iter()
+    }
+
+    /// The number of origins.
+    #[must_use]
+    pub const fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    /// Whether the list is empty: an offline bundle.
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
 /// A bundle-relative asset path: `/`-separated segments of `[A-Za-z0-9._-]`.
 ///
 /// It has no leading `/` and no empty, `.` or `..` segment. The asset's URL is
@@ -2678,5 +3002,238 @@ mod server_pattern_tests {
                 request.canonical().ok().as_ref().map(CanonicalPath::as_str),
             );
         }
+    }
+}
+
+#[cfg(test)]
+#[cfg(not(target_arch = "wasm32"))]
+mod server_origin_tests {
+    use super::*;
+
+    /// A host of exactly `len` bytes: 63-byte labels of `a` joined by dots,
+    /// then a shorter last label.
+    fn host_of(len: usize) -> String {
+        let mut host = String::new();
+        while host.len() < len {
+            if !host.is_empty() {
+                host.push('.');
+            }
+            let room = len.saturating_sub(host.len()).min(MAX_ORIGIN_LABEL_LEN);
+            host.push_str(&"a".repeat(room));
+        }
+        host
+    }
+
+    /// Each refused spelling beside the valid neighbour that parses, so each
+    /// refusal is pinned to its one defect.
+    #[test]
+    fn each_refused_shape_has_a_parsing_neighbour() {
+        let cases: [(&str, &str, ServerOriginRefusal); 12] = [
+            (
+                "http://api.example",
+                "https://api.example",
+                ServerOriginRefusal::NotHttps,
+            ),
+            (
+                "HTTPS://api.example",
+                "https://api.example",
+                ServerOriginRefusal::NotHttps,
+            ),
+            ("https://*", "https://a", ServerOriginRefusal::Wildcard),
+            (
+                "https://*.example",
+                "https://a.example",
+                ServerOriginRefusal::Wildcard,
+            ),
+            (
+                "https://u@api.example",
+                "https://api.example",
+                ServerOriginRefusal::Userinfo,
+            ),
+            (
+                "https://api.example/",
+                "https://api.example",
+                ServerOriginRefusal::AfterAuthority,
+            ),
+            (
+                "https://api.example?q",
+                "https://api.example",
+                ServerOriginRefusal::AfterAuthority,
+            ),
+            (
+                "https://api.example#f",
+                "https://api.example",
+                ServerOriginRefusal::AfterAuthority,
+            ),
+            (
+                "https://Api.example",
+                "https://api.example",
+                ServerOriginRefusal::Uppercase,
+            ),
+            (
+                "https://-api.example",
+                "https://api.example",
+                ServerOriginRefusal::LabelHyphen,
+            ),
+            (
+                "https://api..example",
+                "https://api.example",
+                ServerOriginRefusal::EmptyLabel,
+            ),
+            (
+                "https://api.example.",
+                "https://api.example",
+                ServerOriginRefusal::EmptyLabel,
+            ),
+        ];
+        for (refused, neighbour, why) in cases {
+            assert_eq!(ServerOrigin::parse(refused), Err(why), "{refused:?}");
+            assert!(ServerOrigin::parse(neighbour).is_ok(), "{neighbour:?}");
+        }
+    }
+
+    /// IP literals of either family, and bytes outside the host alphabet.
+    #[test]
+    fn ip_literals_and_foreign_bytes_are_refused() {
+        let cases: [(&str, &str, ServerOriginRefusal); 6] = [
+            (
+                "https://1.2.3.4",
+                "https://1.2.3.a",
+                ServerOriginRefusal::IpLiteral,
+            ),
+            (
+                "https://0x7f000001",
+                "https://x7f000001",
+                ServerOriginRefusal::IpLiteral,
+            ),
+            (
+                "https://[::1]",
+                "https://a1",
+                ServerOriginRefusal::IpLiteral,
+            ),
+            (
+                "https://ap\u{ed}.example",
+                "https://api.example",
+                ServerOriginRefusal::Byte { byte: 0xC3 },
+            ),
+            (
+                "https://api .example",
+                "https://api.example",
+                ServerOriginRefusal::Byte { byte: b' ' },
+            ),
+            (
+                "https://api\n.example",
+                "https://api.example",
+                ServerOriginRefusal::Byte { byte: b'\n' },
+            ),
+        ];
+        for (refused, neighbour, why) in cases {
+            assert_eq!(ServerOrigin::parse(refused), Err(why), "{refused:?}");
+            assert!(ServerOrigin::parse(neighbour).is_ok(), "{neighbour:?}");
+        }
+    }
+
+    /// Ports: the default written out, zero, past `u16`, a leading zero, none.
+    #[test]
+    fn malformed_ports_are_refused() {
+        let cases: [(&str, &str, ServerOriginRefusal); 5] = [
+            (
+                "https://api.example:443",
+                "https://api.example:444",
+                ServerOriginRefusal::DefaultPort,
+            ),
+            (
+                "https://api.example:0",
+                "https://api.example:1",
+                ServerOriginRefusal::PortOutOfRange,
+            ),
+            (
+                "https://api.example:65536",
+                "https://api.example:65535",
+                ServerOriginRefusal::PortOutOfRange,
+            ),
+            (
+                "https://api.example:08443",
+                "https://api.example:8443",
+                ServerOriginRefusal::PortLeadingZero,
+            ),
+            (
+                "https://api.example:",
+                "https://api.example:9",
+                ServerOriginRefusal::PortMalformed,
+            ),
+        ];
+        for (refused, neighbour, why) in cases {
+            assert_eq!(ServerOrigin::parse(refused), Err(why), "{refused:?}");
+            assert!(ServerOrigin::parse(neighbour).is_ok(), "{neighbour:?}");
+        }
+    }
+
+    /// A 64-byte label and a 254-byte host are refused; one byte less parses.
+    #[test]
+    fn label_and_host_lengths_are_bounded() {
+        let label = |len: usize| format!("https://{}.example", "a".repeat(len));
+        assert_eq!(
+            ServerOrigin::parse(&label(MAX_ORIGIN_LABEL_LEN + 1)),
+            Err(ServerOriginRefusal::LabelTooLong { len: 64 })
+        );
+        assert!(ServerOrigin::parse(&label(MAX_ORIGIN_LABEL_LEN)).is_ok());
+        let host = |len: usize| format!("https://{}", host_of(len));
+        assert_eq!(host_of(MAX_ORIGIN_HOST_LEN).len(), 253);
+        assert_eq!(
+            ServerOrigin::parse(&host(MAX_ORIGIN_HOST_LEN + 1)),
+            Err(ServerOriginRefusal::HostTooLong { len: 254 })
+        );
+        assert!(ServerOrigin::parse(&host(MAX_ORIGIN_HOST_LEN)).is_ok());
+        let text = format!("https://{}", "a".repeat(MAX_ORIGIN_LEN));
+        assert_eq!(
+            ServerOrigin::parse(&text),
+            Err(ServerOriginRefusal::TooLong { len: text.len() })
+        );
+    }
+
+    /// A parsed origin renders its two schemes over one authority.
+    #[test]
+    fn an_origin_renders_https_and_wss() {
+        let origin = ServerOrigin::parse("https://media.example:8443");
+        assert_eq!(
+            origin.as_ref().map(ServerOrigin::https).ok().as_deref(),
+            Some("https://media.example:8443")
+        );
+        assert_eq!(
+            origin.as_ref().map(ServerOrigin::wss).ok().as_deref(),
+            Some("wss://media.example:8443")
+        );
+    }
+
+    /// Sixteen distinct origins are a list; a seventeenth is refused, and a
+    /// repeat neither counts nor appears twice.
+    #[test]
+    #[allow(clippy::expect_used)] // every generated origin is well-formed
+    fn a_seventeenth_origin_is_refused() {
+        let origin =
+            |i: usize| ServerOrigin::parse(&format!("https://s{i}.example")).expect("origin");
+        let sixteen: Vec<ServerOrigin> = (0..MAX_SERVER_ORIGINS).map(origin).collect();
+        let doubled = ServerOrigins::new(sixteen.iter().cloned().chain(sixteen.iter().cloned()));
+        assert_eq!(
+            doubled.as_ref().map(ServerOrigins::len),
+            Ok(MAX_SERVER_ORIGINS)
+        );
+        let mut seventeen = sixteen;
+        seventeen.push(origin(MAX_SERVER_ORIGINS));
+        assert_eq!(
+            ServerOrigins::new(seventeen),
+            Err(ServerOriginsRefusal::LimitExceeded)
+        );
+    }
+
+    /// The list is sorted whatever order it was given in.
+    #[test]
+    #[allow(clippy::expect_used)] // both origins are well-formed
+    fn origins_are_sorted() {
+        let b = ServerOrigin::parse("https://b.example").expect("origin");
+        let a = ServerOrigin::parse("https://a.example").expect("origin");
+        let list = ServerOrigins::new([b.clone(), a.clone()]).expect("two origins");
+        assert_eq!(list.origins().collect::<Vec<_>>(), vec![&a, &b]);
     }
 }

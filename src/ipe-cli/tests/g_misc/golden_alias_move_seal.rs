@@ -84,12 +84,12 @@ fn no_by_value_alias_uses_at_subpattern() {
     // rustfmt puts each `let` on its own line, so match the stable fragments
     // rather than a single-line span.
     assert!(
-        src.contains("let whole = arg_0;") && src.contains("let (a, b) = whole.clone();"),
+        src.contains("let whole = __u_arg_0;") && src.contains("let (a, b) = whole.clone();"),
         "PARAM alias must bind the whole then clone-destructure:\n{src}"
     );
     // Nested alias inside a tuple → fresh temps, then clone the inner shape.
     assert!(
-        src.contains("let (__ipe_bind_0, __ipe_bind_1) = arg_1;")
+        src.contains("let (__ipe_bind_0, __ipe_bind_1) = __u_arg_1;")
             && src.contains("let inner = __ipe_bind_1;")
             && src.contains("let (c, d) = inner.clone();"),
         "NESTED alias must bind fresh temps then clone the inner shape:\n{src}"

@@ -9898,6 +9898,12 @@ fn is_retry_policy_ir(interner: &Interner, ty: &IrType) -> bool {
         })
 }
 
+// IPE-RUST-AUDIT:ACCEPTED (Arthur Maciel) — compile-time `const` assertion (not a runtime panic); fails the BUILD if the wasm gates' entry closure and this prune seed from different hydration names
+const _: () = assert!(ipe_canon::const_str_eq(
+    ipe_canon::reach::HYDRATION_PROJECTION_NAME,
+    ipe_ir::HYDRATION_PROJECTION_NAME
+));
+
 /// The functions the backend invokes without any IR call edge naming them.
 ///
 /// Two kinds, in function order: every wasm-hydration island projection
@@ -9907,7 +9913,9 @@ fn is_retry_policy_ir(interner: &Interner, ty: &IrType) -> bool {
 /// `Duration` — rooted iff some function uses `withTimeout`. Both reachability
 /// consumers — the emitted-binary prune and the package capability audit —
 /// seed from this one list, so a backend-synthesised call can never be kept by
-/// one and missed by the other.
+/// one and missed by the other. The wasm gates' canonical entry closure
+/// (`ipe_canon::reach::EntryClosure`) seeds from the same names, read from
+/// the same constants.
 fn backend_invoked_roots<'a, I>(funcs: &I, interner: &Interner) -> Vec<FuncId>
 where
     I: Iterator<Item = &'a Func> + Clone,
@@ -9919,12 +9927,13 @@ where
         .collect();
     // Matched on both the name and the `["Ipe", "Duration"]` home, so an
     // unrelated `toMillis` in another module is never mistaken for it.
+    let [home0, home1] = ipe_canon::reach::DURATION_TO_MILLIS_HOME;
     let duration_to_millis = funcs.clone().find(|f| {
-        interner.resolve(f.name) == Some("toMillis")
+        interner.resolve(f.name) == Some(ipe_canon::reach::DURATION_TO_MILLIS_NAME)
             && matches!(
                 f.home.0.as_slice(),
-                [seg0, seg1] if interner.resolve(*seg0) == Some("Ipe")
-                    && interner.resolve(*seg1) == Some("Duration")
+                [seg0, seg1] if interner.resolve(*seg0) == Some(home0)
+                    && interner.resolve(*seg1) == Some(home1)
             )
     });
     if let Some(to_millis) = duration_to_millis
@@ -16936,7 +16945,7 @@ impl<'a> Lowerer<'a> {
             refuse_select_to_edges(std::slice::from_ref(&func), &select_to_ids, def.name().span)
                 .map_err(|d| (d, def.home().to_vec()))?;
             callee_instances.insert(func.id, self.callee_instances.take());
-            if self.interner.resolve(func.name) == Some("main") {
+            if self.interner.resolve(func.name) == Some(ipe_canon::reach::ENTRY_NAME) {
                 entry = Some(func.id);
                 entry_span = Some(def.name().span);
             }
@@ -41209,6 +41218,102 @@ mod tests {
                 &lowerer
             ),
             "the canon mirror refuses the Ipe.Css Color union too"
+        );
+    }
+
+    /// A canonical template of each shape refuses a concrete of every other shape.
+    ///
+    /// The step past each covering pair: a unit, arrow, tuple, constructor or
+    /// record template against a solved type of another shape, a tuple of
+    /// another length, and a record with one field more, never covers.
+    #[test]
+    fn canon_template_refuses_every_other_concrete_shape() {
+        use super::ty_templates::canon_covers_as_template;
+        let mut interner = Interner::new();
+        let builtins = build_test_builtin_ctors(&mut interner);
+        #[allow(clippy::expect_used)] // a fresh interner accepts these names
+        let [main, t, a, mk_t, run, row] = ["Main", "T", "a", "MkT", "run", "r"]
+            .map(|name| interner.intern(name).expect("intern name"));
+        let module = canon::Module {
+            imports_unsafe_submodule: false,
+            imported_web_capabilities: std::collections::BTreeSet::new(),
+            name: vec![main],
+            unions: vec![covers_fixture_union(vec![main], t, vec![a], mk_t)],
+            defs: vec![],
+        };
+        let types = empty_solved_types();
+        let lowerer = covers_fixture_lowerer(&module, &types, &interner, &builtins);
+        let record = |n: usize| {
+            Ty::Record(
+                (0..n)
+                    .map(|i| (if i == 0 { run } else { a }, Ty::Unit))
+                    .collect(),
+                ipe_types::RowTail::Closed,
+            )
+        };
+        let concretes = [
+            ("unit", Ty::Unit),
+            ("arrow", Ty::Fun(Box::new(Ty::Unit), Box::new(Ty::Unit))),
+            ("pair", Ty::Tuple(vec![Ty::Unit, Ty::Unit])),
+            (
+                "constructor",
+                Ty::Con {
+                    module: vec![main],
+                    name: t,
+                    args: vec![Ty::Unit],
+                },
+            ),
+            ("record", record(1)),
+        ];
+        let templates = [
+            ("unit", canon::Type::Unit),
+            (
+                "arrow",
+                canon::Type::Lambda(Box::new(canon::Type::Unit), Box::new(canon::Type::Unit)),
+            ),
+            (
+                "pair",
+                canon::Type::Tuple(vec![canon::Type::Unit, canon::Type::Unit]),
+            ),
+            (
+                "constructor",
+                canon::Type::Con {
+                    home: vec![main],
+                    name: t,
+                    args: vec![canon::Type::Unit],
+                },
+            ),
+            (
+                "record",
+                canon::Type::Record(vec![(run, canon::Type::Unit)]),
+            ),
+        ];
+        for (tname, template) in &templates {
+            for (cname, concrete) in &concretes {
+                assert_eq!(
+                    canon_covers_as_template(template, concrete, &lowerer),
+                    tname == cname,
+                    "a canonical {tname} template against a solved {cname}"
+                );
+            }
+        }
+        let open = canon::Type::RecordOpen(row, vec![(run, canon::Type::Unit)]);
+        assert!(canon_covers_as_template(&open, &record(1), &lowerer));
+        assert!(
+            !canon_covers_as_template(&open, &record(2), &lowerer),
+            "an open row must not cover a literal with a field it does not declare"
+        );
+        assert!(
+            !canon_covers_as_template(&open, &Ty::Unit, &lowerer),
+            "an open row must not cover a non-record"
+        );
+        assert!(
+            !canon_covers_as_template(
+                &canon::Type::Tuple(vec![canon::Type::Unit, canon::Type::Unit]),
+                &Ty::Tuple(vec![Ty::Unit, Ty::Unit, Ty::Unit]),
+                &lowerer
+            ),
+            "a pair must not cover a triple"
         );
     }
 
