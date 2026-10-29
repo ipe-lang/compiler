@@ -39,7 +39,8 @@ subscriptions _model =
 
 view : Model -> Element Msg
 view model =
-    Ui.column []
+    Ui.column
+        []
         [ Ui.button [] { onPress = Just Increment, label = Ui.text (String.fromInt model.count) } ]
 
 
