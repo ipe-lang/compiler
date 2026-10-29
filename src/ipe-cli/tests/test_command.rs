@@ -921,6 +921,37 @@ fn every_push_event_a_decoder_waits_for_is_one_the_glue_sends() {
     }
 }
 
+/// The push sizes and version the stdlib parses by are the ones the runtime
+/// glue checks: each is defined once in the Ipê source, with the runtime's value,
+/// and each base64url length is the unpadded spelling of its byte length.
+#[test]
+fn push_stdlib_sizes_are_the_runtime_constants() {
+    use ipe_runtime_rust::js_port_glue::{
+        PUSH_APPLICATION_KEY_BYTES, PUSH_AUTH_SECRET_BYTES, PUSH_SUBSCRIPTION_VERSION,
+    };
+    let version = usize::try_from(PUSH_SUBSCRIPTION_VERSION).unwrap_or(usize::MAX);
+    for (name, value) in [
+        ("subscriptionVersion", version),
+        ("pointBytes", PUSH_APPLICATION_KEY_BYTES),
+        ("pointChars", (PUSH_APPLICATION_KEY_BYTES * 4).div_ceil(3)),
+        ("authSecretBytes", PUSH_AUTH_SECRET_BYTES),
+        ("authSecretChars", (PUSH_AUTH_SECRET_BYTES * 4).div_ceil(3)),
+    ] {
+        let head = format!("\n{name} =\n");
+        assert_eq!(
+            PUSH_INTERNALS_SOURCE.matches(head.as_str()).count(),
+            1,
+            "{name}"
+        );
+        let definition = format!("\n{name} : Int\n{name} =\n    {value}\n");
+        assert_eq!(
+            PUSH_INTERNALS_SOURCE.matches(definition.as_str()).count(),
+            1,
+            "{name} must be defined as {value}"
+        );
+    }
+}
+
 /// One test case per bridge refusal, naming the error the runtime defines for it.
 fn push_refusal_cases() -> String {
     use ipe_runtime_rust::js_port_glue::native_bridge::{BridgeErrorKind, Reject};
