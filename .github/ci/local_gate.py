@@ -306,6 +306,13 @@ def _parse_command(raw: object, loc: str, errors: list[str], default_tier: Tier)
     if "package" in raw and (not isinstance(package, str) or not PACKAGE_NAME_RE.match(package)):
         errors.append(f"{loc}: `package` must be a crate name, got {package!r}")
         ok = False
+    elif package is not None:
+        # The condition names the crate the command itself runs over, so a
+        # misspelt condition cannot leave the command silently never planned.
+        targets = [argv[i + 1] for i, w in enumerate(argv[:-1]) if w == "-p"]
+        if targets != [package]:
+            errors.append(f"{loc}: `package` {package!r} must be the command's one `-p` crate, got {targets}")
+            ok = False
     if not ok:
         return None
     return Command(

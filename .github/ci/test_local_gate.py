@@ -118,6 +118,24 @@ class ShapeRefusals(Fixture):
     def test_bad_tier(self) -> None:
         self.refuses("tier 'nightly'", gate("fmt", run("cargo fmt --all -- --check", tier="nightly")))
 
+    def test_bad_command_tier(self) -> None:
+        self.refuses("tier 'nightly'", gate("fmt", run({"cmd": "cargo fmt --all -- --check", "tier": "nightly"})))
+
+    def test_package_not_a_crate_name(self) -> None:
+        self.refuses("must be a crate name", gate("fmt", run({"cmd": "cargo fmt --all -- --check", "package": "a b"})))
+
+    def test_package_other_than_the_commands_crate(self) -> None:
+        self.refuses(
+            "must be the command's one `-p` crate",
+            gate("fmt", run({"cmd": "cargo nextest run -p core", "package": "cores", "differs": "narrowed"})),
+        )
+
+    def test_package_on_a_command_with_no_crate(self) -> None:
+        self.refuses(
+            "must be the command's one `-p` crate",
+            gate("fmt", run({"cmd": "cargo fmt --all -- --check", "package": "core"})),
+        )
+
     def test_empty_run(self) -> None:
         self.refuses("non-empty list", gate("fmt", {"tier": "quick", "run": []}))
 
