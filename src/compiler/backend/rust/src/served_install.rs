@@ -228,10 +228,10 @@ pub fn register_stmt(install: &ServedInstall) -> String {
             let side = icon.side().get();
             let file = rust_str_lit(&format!("/{INSTALL_ICON_FILE}"));
             format!(
-                "static IPE_INSTALL: ipe_runtime::web::install::InstallFacts = \
+                "static INSTALL_FACTS: ipe_runtime::web::install::InstallFacts = \
                  ipe_runtime::web::install::InstallFacts {{ name: {name}, icon_png: \
                  include_bytes!(concat!(env!(\"CARGO_MANIFEST_DIR\"), {file})), \
-                 icon_side: {side} }}; ipe_runtime::web::install::register(&IPE_INSTALL); "
+                 icon_side: {side} }}; ipe_runtime::web::install::register(&INSTALL_FACTS); "
             )
         }
     }
