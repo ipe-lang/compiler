@@ -6,7 +6,8 @@
  * on the layout-fill app, and the live-tabs, closed-session and event-answer
  * refusals on the geo-clipboard app, and the wasm-solo port round-trip and
  * glue refusals on the serverless wasm-solo-clipboard bundle, and the worker
- * gate on the geo-clipboard app).
+ * gate on the geo-clipboard app, and the install offer on the install-offer /
+ * install-offer-off apps).
  *
  * A single Chromium project — the only browser target for these tests.
  * The geo/clipboard browser APIs (navigator.geolocation,
@@ -35,6 +36,7 @@ export default {
     "event-refused.spec.mjs",
     "wasm-solo-port.spec.mjs",
     "worker-gate.spec.mjs",
+    "install.spec.mjs",
   ],
   timeout: 30_000,
   retries: 0,

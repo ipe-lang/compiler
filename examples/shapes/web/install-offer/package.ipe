@@ -1,0 +1,12 @@
+module Package exposing (package)
+
+import Ipe.Package exposing (..)
+
+
+package : Package
+package =
+    { name = "install-offer"
+    , version = "0.1.0"
+    , icon = "assets/icon-512.png"
+    , delivery = { browser = { installable = True } }
+    }
