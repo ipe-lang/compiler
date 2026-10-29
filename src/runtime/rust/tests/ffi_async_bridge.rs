@@ -11,7 +11,8 @@
 //! 3. A poll-time panic inside the spawned foreign future surfaces as the
 //!    wrapper's typed `Err` through the join-error arm and the redacting
 //!    foreign-error funnel — never a process abort, never a silent hang.
-#![cfg(feature = "tokio")]
+// `tokio` is a native-only dependency: the feature names it, wasm32 has no crate.
+#![cfg(all(feature = "tokio", not(target_arch = "wasm32")))]
 
 use ipe_runtime_rust::{
     AbortOnDrop, IpeError, IpeResult, IpeTask, block_on, ffi_spawn_guarded, ipe_error_from_foreign,

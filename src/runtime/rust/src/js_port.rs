@@ -180,18 +180,6 @@ pub(crate) const SESSION_FRAME_BUDGET: u64 = 100_000;
 /// indefinitely. Generous — a long recording session stays well under it.
 const SESSION_DEADLINE_MS: u64 = 3_600_000;
 
-/// Hard ceiling on outbound port frames buffered for a session whose browser
-/// out-sink is not yet bound (the window between session creation and the SSE
-/// connection that installs the sink). An outbound `Cmd` — `Geo.current`,
-/// `Clipboard.read` — dispatched in that window is queued here and flushed in
-/// FIFO order the instant the sink binds, so a fast action taken before the
-/// handshake lands is delivered, never dropped fire-and-forget. Bounded by
-/// construction: the queue is drop-oldest at the ceiling (the same fail-closed
-/// shape as [`MAX_OUTSTANDING`]), so a remote party cannot grow it without
-/// limit. The pre-bind window is sub-second, so a small ceiling covers every
-/// legitimate burst.
-pub(crate) const MAX_OUT_PENDING: usize = 64;
-
 // ─── Native (server) transport ─────────────────────────────────────────────
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -207,6 +195,18 @@ mod native {
         atomic::{AtomicU64, Ordering},
     };
     use tokio::sync::{broadcast, oneshot};
+
+    /// Hard ceiling on outbound port frames buffered for a session whose browser
+    /// out-sink is not yet bound (the window between session creation and the SSE
+    /// connection that installs the sink). An outbound `Cmd` — `Geo.current`,
+    /// `Clipboard.read` — dispatched in that window is queued here and flushed in
+    /// FIFO order the instant the sink binds, so a fast action taken before the
+    /// handshake lands is delivered, never dropped fire-and-forget. Bounded by
+    /// construction: the queue is drop-oldest at the ceiling (the same fail-closed
+    /// shape as [`MAX_OUTSTANDING`]), so a remote party cannot grow it without
+    /// limit. The pre-bind window is sub-second, so a small ceiling covers every
+    /// legitimate burst.
+    pub(super) const MAX_OUT_PENDING: usize = 64;
 
     /// Broadcast buffer for one direction. A lagging subscriber drops the gap
     /// (never panics); the size bounds the queue an inbound burst can hold.
@@ -998,9 +998,15 @@ mod wasm {
     use std::rc::Rc;
     use wasm_bindgen::{JsCast, JsValue};
 
-    /// Process-local monotonic correlation-id counter for the wasm target.
-    /// Single-threaded (wasm32 is `!Send`), so `Cell<u64>` is safe.
+    /// One inbound-string drain: a `js_subscribe` or `sessionFrames` decoder.
+    type Drain = Rc<dyn Fn(&str)>;
+
+    /// A one-shot waiter resolved by a correlated reply or a session terminal.
+    type ReplyWaiter = Box<dyn FnOnce(JsonVal)>;
+
     thread_local! {
+        /// Process-local monotonic correlation-id counter for the wasm target.
+        /// Single-threaded (wasm32 is `!Send`), so `Cell<u64>` is safe.
         static NEXT_ID: std::cell::Cell<u64> = const { std::cell::Cell::new(1) };
     }
 
@@ -1016,11 +1022,11 @@ mod wasm {
         /// The in-tab inbound queue's drains. The browser's `window.ipe.send(raw)`
         /// pushes a string here (via [`push_inbound`]); each active `js_subscribe`
         /// registers a drain closure that fires on every pushed string.
-        static INBOUND: RefCell<Vec<Rc<dyn Fn(&str)>>> = const { RefCell::new(Vec::new()) };
+        static INBOUND: RefCell<Vec<Drain>> = const { RefCell::new(Vec::new()) };
 
         /// In-flight correlated one-shot waiters. Key = runtime-minted id.
         /// A reply whose id is not in this map is dropped fail-closed.
-        static PENDING: RefCell<HashMap<u64, Box<dyn FnOnce(JsonVal)>>> =
+        static PENDING: RefCell<HashMap<u64, ReplyWaiter>> =
             RefCell::new(HashMap::new());
 
         /// Open session streams, keyed by runtime-minted session id (never derived
@@ -1034,12 +1040,12 @@ mod wasm {
     /// One open session's browser-local state.
     struct WasmSession {
         /// The `sessionFrames` drains for THIS session (each a fail-closed decoder).
-        drains: Vec<Rc<dyn Fn(&str)>>,
+        drains: Vec<Drain>,
         /// Frames routed so far; charged before delivery so an overflow terminates
         /// the session rather than delivering past the budget.
         frames_seen: u64,
         /// The `closeSession` terminal one-shot (resolves the awaiting Task once).
-        terminal: Option<Box<dyn FnOnce(JsonVal)>>,
+        terminal: Option<ReplyWaiter>,
     }
 
     /// The browser-facing entry the JS glue calls to push an inbound port
@@ -1079,8 +1085,7 @@ mod wasm {
             // Unknown/duplicate/late id: dropped fail-closed.
             return;
         }
-        let drains: Vec<Rc<dyn Fn(&str)>> =
-            INBOUND.with(|q| q.borrow().iter().map(Rc::clone).collect());
+        let drains: Vec<Drain> = INBOUND.with(|q| q.borrow().iter().map(Rc::clone).collect());
         for drain in drains {
             drain(raw);
         }
@@ -1116,9 +1121,7 @@ mod wasm {
         // close Task resolves Err) rather than deliver past the bound.
         let drains = SESSIONS.with(|s| {
             let mut map = s.borrow_mut();
-            let Some(sess) = map.get_mut(&session_id) else {
-                return None;
-            };
+            let sess = map.get_mut(&session_id)?;
             sess.frames_seen = sess.frames_seen.saturating_add(1);
             if sess.frames_seen > SESSION_FRAME_BUDGET {
                 map.remove(&session_id);
@@ -1225,7 +1228,7 @@ mod wasm {
     {
         IpeSub::Source(Box::new(move |emit: Rc<dyn Fn(M)>| {
             let decoder = decoder.clone();
-            let drain: Rc<dyn Fn(&str)> = Rc::new(move |raw: &str| {
+            let drain: Drain = Rc::new(move |raw: &str| {
                 if let Ok(value) = seal_decode(raw, &decoder, SealLimits::default()) {
                     (emit)(to_msg(value));
                 }
@@ -1426,7 +1429,7 @@ mod wasm {
         let session_id = handle as u64;
         IpeSub::Source(Box::new(move |emit: Rc<dyn Fn(M)>| {
             let decoder = decoder.clone();
-            let drain: Rc<dyn Fn(&str)> = Rc::new(move |raw: &str| {
+            let drain: Drain = Rc::new(move |raw: &str| {
                 if let Ok(value) = seal_decode(raw, &decoder, SealLimits::default()) {
                     (emit)(to_msg(value));
                 }
@@ -1617,6 +1620,7 @@ mod tests {
     // `pubsub::with_session`).
     #[cfg(feature = "web")]
     mod per_session {
+        use super::super::native::MAX_OUT_PENDING;
         use super::super::*;
         use crate::IpeResult;
         use crate::error::IpeError;

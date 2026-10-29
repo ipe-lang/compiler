@@ -706,6 +706,22 @@ jobs:
       # instead of shipping an ipe-accept-then-cargo-fail.
       - if: needs.changes.outputs.release_only != 'true'
         run: cargo build -p ipe-runtime-rust --target wasm32-wasip1 --no-default-features --features time,log,json,uuid,random,decimal,regex,crypto-core,secret,char-category
+      # Lint every wasm32 (target, feature set) this job builds, plus the
+      # wasm-client sets its claimed test cells compile: rustc warnings and
+      # clippy lints that only fire under a wasm32 cfg are denied here, where
+      # no native leg compiles them (verify-manifest check 25 holds the set).
+      - if: needs.changes.outputs.release_only != 'true'
+        run: cargo clippy -p ipe-runtime-rust --target wasm32-unknown-unknown --features wasm-client --all-targets -- -D warnings
+      - if: needs.changes.outputs.release_only != 'true'
+        run: cargo clippy -p ipe-runtime-rust --target wasm32-unknown-unknown --no-default-features --features wasm-client,debugger --all-targets -- -D warnings
+      - if: needs.changes.outputs.release_only != 'true'
+        run: cargo clippy -p ipe-runtime-rust --target wasm32-unknown-unknown --lib -- -D warnings
+      - if: needs.changes.outputs.release_only != 'true'
+        run: cargo clippy -p ipe-runtime-rust --target wasm32-unknown-unknown --features json --lib -- -D warnings
+      - if: needs.changes.outputs.release_only != 'true'
+        run: cargo clippy -p ipe-runtime-rust --target wasm32-wasip1 --no-default-features --features time,log,json,uuid,random,decimal,regex,crypto-core,secret,char-category --lib -- -D warnings
+      - if: needs.changes.outputs.release_only != 'true'
+        run: cargo clippy -p ipe-runtime-rust --target wasm32-wasip1 --no-default-features --lib -- -D warnings
       # The wasm test runner, pinned to the Cargo.lock wasm-bindgen version
       # (a runner of another version refuses the test binary).
       - uses: taiki-e/install-action@4cef1412cce204788f482e778a0b9187f9626a29 # v2

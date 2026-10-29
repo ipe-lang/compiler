@@ -181,13 +181,10 @@ pub fn crypto_mac_from_hex(s: String) -> IpeMaybe<Mac> {
 /// Crate-internal `Key` unwrap — the sibling `crypto` module's typed AEAD
 /// wrappers (`crypto_aes_gcm_encrypt_key` / `crypto_chacha20_encrypt_key` / …)
 /// recover the raw key blob to forward to the AEAD primitives. `pub(crate)` so the
-/// opaque key material still cannot escape the runtime crate. Gated to its sole
-/// (feature-gated) consumer now that the `crypto_core` floor compiles without
-/// the heavy `crypto` feature.
-#[cfg(any(
-    feature = "crypto",
-    all(target_arch = "wasm32", feature = "wasm-client")
-))]
+/// opaque key material still cannot escape the runtime crate. Gated to its only
+/// consumers, the native AEAD wrappers in `crypto.rs`; on wasm32 no
+/// caller can unwrap a key.
+#[cfg(all(feature = "crypto", not(target_arch = "wasm32")))]
 #[must_use]
 pub(crate) fn crypto_key_reveal(key: Key) -> String {
     key.0
