@@ -23,6 +23,8 @@ module TestSupport exposing
     , check
     , checkReporting
     , onFreshReview
+    , noLeakedTempDirs
+    , reclaimLeakedDirs
     , withReviewDb
     , bracketDb
     , applyEdits
@@ -139,6 +141,7 @@ import Ipe.Json.Decode as Decode
 import Ipe.List as List
 import Ipe.Maybe as Maybe
 import Ipe.Path as Path
+import Ipe.Process as Process
 import Ipe.Result as Result exposing (Result(..))
 import Ipe.Set as Set
 import Ipe.String as String
@@ -445,9 +448,13 @@ type alias Scratch =
 -- No two calls share a path, so no store a check opens can be one another
 -- check (or an earlier run) already wrote, and no connection the runtime
 -- keeps open for a path can serve a later check a file it has since removed.
+-- Every path handed back is also logged (`logCreatedDir`) so this run's
+-- `noLeakedTempDirs` can remove it once the suite ends, pass or fail,
+-- without any caller doing its own cleanup.
 freshDir : String -> Task.Task Error String
 freshDir name =
     File.tempDir (name ++ "-")
+        |> Task.andThen (\path -> logCreatedDir path |> Task.map (\_ -> path))
 
 
 -- The scratch paths of one check, under its own `freshDir`.
@@ -476,6 +483,157 @@ onReviewAt reviewDb f =
         removeFileIfAny (reviewDb ++ "-wal")
         removeFileIfAny (reviewDb ++ "-shm")
         Task.succeed ok
+
+
+-- ── temp-dir leak tracking ───────────────────────────────────────────────
+--
+-- Every `freshDir` call this process makes is appended to one ledger file,
+-- named by an env var set once per process (`System.setenv` — never visible
+-- to a sibling process, so two runs sharing one OS temp root can never race
+-- each other's sweep). `noLeakedTempDirs` reads the ledger back, removes
+-- every path it names, and proves none remain: the class-closing property
+-- is that a dir can only ever be obtained through `freshDir`, and `freshDir`
+-- is the one place that both creates it and records it for this removal, so
+-- no caller can create a dir this run is not already committed to removing.
+leakLedgerVar : String
+leakLedgerVar =
+    "IPE_REVIEW_TEST_LEDGER"
+
+
+-- The ledger path already recorded for this process, if `freshDir` has run
+-- before; never mints one (that is `freshDir`'s job via `logCreatedDir`), so
+-- reading the ledger before any dir exists costs nothing.
+peekLedger : Task.Task Error (Maybe String)
+peekLedger =
+    case System.getenvOr leakLedgerVar "" of
+        "" ->
+            Task.succeed Nothing
+
+        path ->
+            Task.succeed (Just path)
+
+
+-- The ledger path for this process, minting one the first time any
+-- `freshDir` runs so every later call in the same process appends to the
+-- same file.
+leakLedger : Task.Task Error String
+leakLedger =
+    peekLedger
+        |> Task.andThen
+            (\existing ->
+                case existing of
+                    Just path ->
+                        Task.succeed path
+
+                    Nothing ->
+                        File.tempFile "ipe-review-test-dirs-"
+                            |> Task.andThen
+                                (\path ->
+                                    System.setenv leakLedgerVar path
+                                        |> Task.map (\_ -> path)
+                                )
+            )
+
+
+-- Records `path` in this process's ledger; best-effort, since a leak
+-- tracked imperfectly must never fail the check that created the dir.
+logCreatedDir : String -> Task.Task Error ()
+logCreatedDir path =
+    leakLedger
+        |> Task.andThen (\ledger -> Task.fromResult (Path.fromString ledger))
+        |> Task.andThen (\p -> File.append p (path ++ "\n"))
+        |> Task.onError (\_ -> Task.succeed ())
+
+
+-- Every dir this process's `freshDir` has logged so far, oldest first;
+-- blank lines (an absent ledger reads as "") drop out rather than becoming
+-- a bogus empty-string path.
+loggedDirs : Task.Task Error (List String)
+loggedDirs =
+    peekLedger
+        |> Task.andThen
+            (\existing ->
+                case existing of
+                    Nothing ->
+                        Task.succeed []
+
+                    Just ledger ->
+                        Task.fromResult (Path.fromString ledger)
+                            |> Task.andThen (\p -> File.readFileLimit p (ByteSize.mib 8))
+                            |> Task.map (\text -> List.filter (\line -> line /= "") (String.lines text))
+                            |> Task.onError (\_ -> Task.succeed [])
+            )
+
+
+-- `rm -rf` via `Process.run`: the only existing-surface path that removes a
+-- non-empty directory (`File.remove` wraps `remove_file` only, and no
+-- stdlib kernel removes a directory tree). `path` is always one this same
+-- process minted through `File.tempDir`, never attacker- or user-supplied,
+-- and `Process.run` never goes through a shell, so this carries no
+-- injection surface.
+removeDirRecursive : String -> Task.Task Error ()
+removeDirRecursive path =
+    Process.run "rm" [ "-rf", "--", path ]
+        |> Task.map (\_ -> ())
+        |> Task.onError (\_ -> Task.succeed ())
+
+
+-- Drops the ledger file itself and the env var naming it, so a later
+-- `freshDir` call in the same process starts a fresh ledger instead of
+-- appending to a removed file.
+clearLedger : Maybe String -> Task.Task Error ()
+clearLedger existing =
+    case existing of
+        Nothing ->
+            Task.succeed ()
+
+        Just ledger ->
+            removeFileIfAny ledger
+                |> Task.andThen (\_ -> System.unsetenv leakLedgerVar)
+                |> Task.onError (\_ -> Task.succeed ())
+
+
+-- Removes every dir this process's `freshDir` has created, then the ledger
+-- that named them. Returns the dirs it reclaimed, so a caller can tell a
+-- real sweep from one with nothing to do.
+reclaimLeakedDirs : Task.Task Error (List String)
+reclaimLeakedDirs =
+    do
+        existing <- peekLedger
+        dirs <- loggedDirs
+        Task.sequence (List.map removeDirRecursive dirs)
+        clearLedger existing
+        Task.succeed dirs
+
+
+-- `path` no longer exists (a dir `removeDirRecursive` reclaimed). A path
+-- whose existence cannot even be checked counts as gone: the check this
+-- guards is "did the sweep remove it", not "is the filesystem reachable".
+isGone : String -> Task.Task Error Bool
+isGone path =
+    Task.fromResult (Path.fromString path)
+        |> Task.andThen File.exists
+        |> Task.map not
+        |> Task.onError (\_ -> Task.succeed True)
+
+
+-- The refusal test: every dir this run's `freshDir` created is gone once
+-- the suite ends, pass or fail. Requires at least one reclaimed dir first —
+-- an empty ledger would make "every reclaimed dir is gone" vacuously True
+-- without proving anything, so a run that never exercised `freshDir` fails
+-- this check instead of silently passing it.
+noLeakedTempDirs : Task.Task Error Bool
+noLeakedTempDirs =
+    reclaimLeakedDirs
+        |> Task.andThen
+            (\dirs ->
+                if List.isEmpty dirs then
+                    Task.succeed False
+
+                else
+                    Task.sequence (List.map isGone dirs)
+                        |> Task.map (List.all identity)
+            )
 
 
 -- The review database at `loc` handed to `body`, and closed once `body`

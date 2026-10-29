@@ -42,6 +42,7 @@ import RepoPathTests
 import SafeTextTests
 import SettingsTests
 import SingleFlightTests
+import TestSupport
 import TextSinkScanTests
 import TypedRowsTests
 import ViewRenderTests
@@ -114,7 +115,25 @@ finish results =
 
 -- Every check opens the stores it reads under a directory of its own
 -- (`TestSupport.freshDir`), so the run shares no database between checks.
+-- `sweepTempDirs` removes every one of them once the suite ends, on both
+-- the pass and the fail path, so a wiring bug that makes `gatherChecks`
+-- itself fail still runs the sweep before the error propagates.
 main : Task.Task Error ()
 main =
     gatherChecks
+        |> Task.andThen sweepTempDirs
+        |> Task.onError
+            (\err ->
+                TestSupport.reclaimLeakedDirs
+                    |> Task.andThen (\_ -> Task.fail err)
+            )
         |> Task.andThen finish
+
+
+-- Appends the leak-sweep refusal test to the gathered results, so a dir
+-- `freshDir` created and never reclaimed shows up as a named failure in the
+-- same report as every other check, not as a silent leftover on disk.
+sweepTempDirs : List ( String, Bool ) -> Task.Task Error (List ( String, Bool ))
+sweepTempDirs results =
+    TestSupport.noLeakedTempDirs
+        |> Task.map (\ok -> results ++ [ ( "no leaked ipe-* temp dirs", ok ) ])
