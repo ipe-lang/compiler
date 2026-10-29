@@ -10,6 +10,49 @@ Entries below the header are maintained by
 section is generated from Conventional Commit messages and prepended when the
 standing release pull request is merged.
 
+## [0.7.2](https://github.com/ipe-lang/compiler/compare/ipe-v0.7.1...ipe-v0.7.2) (2026-10-29)
+
+
+### Features
+
+* **pack:** Android shell for web solo android ([#3873](https://github.com/ipe-lang/compiler/issues/3873)) ([875dd98](https://github.com/ipe-lang/compiler/commit/875dd9823888bb6d182a6b85233e8d4fd9cbf675))
+* **pack:** typed capability table for the native shell and push axis ([#3864](https://github.com/ipe-lang/compiler/issues/3864)) ([84c1f92](https://github.com/ipe-lang/compiler/commit/84c1f9296c0abb095fabd30484c3c2ca688800b8))
+* **runtime:** the port glue ships inside the wasm solo bundle ([#3868](https://github.com/ipe-lang/compiler/issues/3868)) ([606109b](https://github.com/ipe-lang/compiler/commit/606109b646a7889c546b3b459ec10001dcefd785))
+* server origins, mobile push identifiers and the native bridge channel ([#3869](https://github.com/ipe-lang/compiler/issues/3869)) ([f0a0245](https://github.com/ipe-lang/compiler/commit/f0a0245c9f9839f2e0cb30217f857973c183a7fb))
+* **stdlib:** Ipe.Browser.Push parses keys and subscriptions once ([#3872](https://github.com/ipe-lang/compiler/issues/3872)) ([3a90926](https://github.com/ipe-lang/compiler/commit/3a909269cd20a6491e604e50852bd84f5806227f))
+* **web:** an installable served app serves its manifest and icon ([#3887](https://github.com/ipe-lang/compiler/issues/3887)) ([3011374](https://github.com/ipe-lang/compiler/commit/301137412d6460b363ef58cb758f9f8298f66572))
+
+
+### Bug Fixes
+
+* audit gate posture and policy, absolute-only tool resolver, linear Markdown, proven code-review copy ([#3834](https://github.com/ipe-lang/compiler/issues/3834)) ([1dc092c](https://github.com/ipe-lang/compiler/commit/1dc092c1cea21838789cc25fc084bb2b815899e3))
+* **ci:** cap each webview apt install at six minutes and try it twice ([#3855](https://github.com/ipe-lang/compiler/issues/3855)) ([5fe546a](https://github.com/ipe-lang/compiler/commit/5fe546a3ab0cd7d64b36e4fb3b21ce657eefc9af))
+* **cli:** the mobile shell and its bundle agree on one manifest pin ([#3871](https://github.com/ipe-lang/compiler/issues/3871)) ([8422d7c](https://github.com/ipe-lang/compiler/commit/8422d7c65e63e0b44896be779ba73644d67ef0d3))
+* **code-review:** acknowledged badges, one root parser, bounded temp-dir sweep ([#3876](https://github.com/ipe-lang/compiler/issues/3876)) ([541e175](https://github.com/ipe-lang/compiler/commit/541e175732b74ecee2cc3744d25a013415388eea))
+* **deps:** zstd 0.14.3 for the new RUSTSEC advisories ([#3839](https://github.com/ipe-lang/compiler/issues/3839)) ([e7cc513](https://github.com/ipe-lang/compiler/commit/e7cc5138743c53fc905ad09b68edb1045e652b86)), closes [#3842](https://github.com/ipe-lang/compiler/issues/3842)
+* flat statement sequences and long chains keep IR depth bounded ([#3841](https://github.com/ipe-lang/compiler/issues/3841)) ([f97b2c8](https://github.com/ipe-lang/compiler/commit/f97b2c81ca2b66d3b882be109ba898b94cf22a0c))
+* generic records that differ only in variable names share one struct ([#3847](https://github.com/ipe-lang/compiler/issues/3847)) ([921baa2](https://github.com/ipe-lang/compiler/commit/921baa27140310167c5acc9a7ae67cdb89552d4a))
+* one held project root, login at the registration cost, bounded stdin lines, one preview policy ([#3831](https://github.com/ipe-lang/compiler/issues/3831)) ([17820a1](https://github.com/ipe-lang/compiler/commit/17820a135700aeb845cb70a37c5a27958f36291c))
+* **pack:** mobile shells read their bundle through one pinned reach and the runtime's policy ([#3883](https://github.com/ipe-lang/compiler/issues/3883)) ([3a6f8f5](https://github.com/ipe-lang/compiler/commit/3a6f8f56e4c99f9d19e1fdd4ca14ba4e2ed4b2d7))
+* **pack:** stage the shell and bundle, promote them in one rename ([#3889](https://github.com/ipe-lang/compiler/issues/3889)) ([2d4d5ee](https://github.com/ipe-lang/compiler/commit/2d4d5ee9deecde4057f9858d3a5fe746a9b12959))
+* **runtime:** a cancelled pool checkout closes its connection before the pools close ([#3884](https://github.com/ipe-lang/compiler/issues/3884)) ([3a4d97c](https://github.com/ipe-lang/compiler/commit/3a4d97c59a1b0096c1d003cb2776030324559d3f)), closes [#3881](https://github.com/ipe-lang/compiler/issues/3881)
+* **runtime:** gate service worker scripts, derive connect-src from the bundle, keep focus across frames ([#3878](https://github.com/ipe-lang/compiler/issues/3878)) ([857d32e](https://github.com/ipe-lang/compiler/commit/857d32e9b32c6e92100da8e05483fe3f87ee23c2))
+* **runtime:** JSON values walk with constant stack and keep insertion order; migration status aligns by width ([#3857](https://github.com/ipe-lang/compiler/issues/3857)) ([810ec66](https://github.com/ipe-lang/compiler/commit/810ec66ac86a6b822b47bc1bc78b1264af73c87a))
+* **runtime:** lint every wasm32 build and test set with -D warnings ([#3890](https://github.com/ipe-lang/compiler/issues/3890)) ([3bfcd30](https://github.com/ipe-lang/compiler/commit/3bfcd30107ad405d7c68f876c8c69ffef69ffa0d))
+* **runtime:** session-store write outcomes, one dev-view credential rule, bounded process children, parsed transport deadlines ([#3833](https://github.com/ipe-lang/compiler/issues/3833)) ([2915fd8](https://github.com/ipe-lang/compiler/commit/2915fd8625bba64f5e47b45ce81b5d7d0d782cb7))
+* **runtime:** the wasm children swap keeps a node whose ipe-id and tag repeat ([#3886](https://github.com/ipe-lang/compiler/issues/3886)) ([f5bddee](https://github.com/ipe-lang/compiler/commit/f5bddeee1f2828383df287c49aafffd162ea2e2f)), closes [#3874](https://github.com/ipe-lang/compiler/issues/3874)
+* SQLite schema per connection, one route grammar, DOM-stored attribute keys, terminate liveness, nightly-green pages ([#3829](https://github.com/ipe-lang/compiler/issues/3829)) ([01a7f71](https://github.com/ipe-lang/compiler/commit/01a7f71b7f77380ce997ca37a30e4983cb570a30))
+* typed web mount base, verified operator Postgres TLS, parsed build-cache switches ([#3854](https://github.com/ipe-lang/compiler/issues/3854)) ([50580d4](https://github.com/ipe-lang/compiler/commit/50580d4d069a0dd5188b44b6b6054ee3dc687b56))
+* user locals can never shadow backend names; canon template coverage is exhaustive ([#3859](https://github.com/ipe-lang/compiler/issues/3859)) ([19b0727](https://github.com/ipe-lang/compiler/commit/19b0727b9aa3596b3f359060a44258f44be2db35))
+* verified Postgres TLS by default, audit gate owns its runtime, one header arity table, fixed-root doc overlay ([#3838](https://github.com/ipe-lang/compiler/issues/3838)) ([d42c7ca](https://github.com/ipe-lang/compiler/commit/d42c7ca020e76e44c248b023df731ad8d1c4f6ab))
+* **wasm:** the client gate judges what the entry reaches ([#3866](https://github.com/ipe-lang/compiler/issues/3866)) ([9509716](https://github.com/ipe-lang/compiler/commit/950971633fd4dc2ec5938451876ed06baaf48575))
+* **watch:** the dev proxy frames requests and responses as the server does ([#3835](https://github.com/ipe-lang/compiler/issues/3835)) ([0c28c2e](https://github.com/ipe-lang/compiler/commit/0c28c2e5c459fb2453c9a1600fed7d6e80e56868))
+
+
+### Performance Improvements
+
+* **runtime:** stamp ids through one buffer and inject scoped styles in one view walk ([#3852](https://github.com/ipe-lang/compiler/issues/3852)) ([4695312](https://github.com/ipe-lang/compiler/commit/469531293e96036e4d139cf6ca0ce76290a3a863))
+
 ## [0.7.1](https://github.com/ipe-lang/compiler/compare/ipe-v0.7.0...ipe-v0.7.1) (2026-10-24)
 
 
