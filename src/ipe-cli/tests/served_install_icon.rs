@@ -73,13 +73,15 @@ fn build_installable(name: &str, icon: &[u8]) -> Result<(), CliError> {
 }
 
 /// [`build_installable`], keeping the built fixture.
-#[allow(clippy::expect_used)] // test helper: a failed fixture setup IS the failure
+///
+/// The icon rule runs where the manifest is read, so an unfit icon is refused
+/// as the project resolves, before any build.
 fn build_installable_into(name: &str, icon: &[u8]) -> Result<ipe::BuiltFixture, CliError> {
     let tree = ipe::project_root::SourceTree::main(SERVED_APP)
         .field(&format!("icon = {ICON:?}"))
         .field("delivery = { browser = { installable = True } }")
         .file(ICON, icon);
-    let fixture = ipe::RootFixture::from_tree(&tree).expect("write the project fixture");
+    let fixture = ipe::RootFixture::from_tree(&tree)?;
     let out = scratch(name).join("out");
     let runtime = e2e_support::require_runtime().into_path_buf();
     ipe::build_fixture(&fixture, &out, &runtime)
