@@ -134,7 +134,7 @@ fn compile_inner(source: &str) -> Result<ipe_backend::EmittedProject, String> {
             // The browser playground is not the dev watch loop; no appearance hoist.
             hot_appearance: false,
             // The browser playground is a wasm SPA, never a webview-native delivery.
-            host: ipe_backend_rust::EmitHost::Served,
+            host: ipe_backend_rust::EmitHost::Served(ipe_backend_rust::ServedInstall::Off),
             // The browser playground is a development surface — Debug.* is allowed.
             intent: ipe_backend_rust::BuildIntent::Development,
         },

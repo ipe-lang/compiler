@@ -102,7 +102,7 @@ fn body_edit_reexecutes_only_the_edited_module_file() {
             debugger: false,
             crate_name: ipe_backend_rust::CrateName::SingleFile,
             hot_appearance: false,
-            host: ipe_backend_rust::EmitHost::Served,
+            host: ipe_backend_rust::EmitHost::Served(ipe_backend_rust::ServedInstall::Off),
             intent: ipe_backend_rust::BuildIntent::Development,
         },
     );

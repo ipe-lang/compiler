@@ -4810,6 +4810,7 @@ fn emitting_into_a_user_directory_is_refused_untouched() {
         files: BTreeMap::new(),
         cargo_toml: "[package]\nname = \"ipe-app\"\n".to_owned(),
         uses_webview: false,
+        assets: std::collections::BTreeMap::new(),
     };
     let elsewhere = dir.with_extension("project");
     fs::create_dir_all(&elsewhere).expect("project dir");
@@ -5005,6 +5006,7 @@ fn a_replaced_claimed_target_is_refused_untouched() {
         files: BTreeMap::new(),
         cargo_toml: "[package]\nname = \"ipe-app\"\n".to_owned(),
         uses_webview: false,
+        assets: std::collections::BTreeMap::new(),
     };
     let result = write_emitted_project(
         &emitted,
@@ -5043,6 +5045,7 @@ fn emitting_into_a_marked_dir_with_planted_links_is_refused() {
         files: BTreeMap::new(),
         cargo_toml: "[package]\nname = \"ipe-app\"\n".to_owned(),
         uses_webview: false,
+        assets: std::collections::BTreeMap::new(),
     };
 
     // A symlinked `src/`: pruning it would mass-delete the target.

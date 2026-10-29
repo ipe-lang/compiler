@@ -1,77 +1,32 @@
 //! The installable app icon: a PNG read beneath the project root, proven square and large enough.
 //!
-//! [`parse`] is the one constructor of [`PwaIcon`], so an icon value always
-//! holds bytes that opened as a regular file below the root (never through a
-//! symlink), fit the [`ICON_READ_CAP`], carry the PNG signature and an `IHDR`
-//! chunk, and describe a square of at least [`MIN_ICON_SIDE`] pixels. Each
-//! failure is one [`PwaIconRefusal`] variant.
+//! [`parse`] is the one file path to a [`PwaIcon`]: it opens the file as a
+//! regular file below the root (never through a symlink), reads at most
+//! [`ICON_READ_CAP`] bytes, and hands them to the backend's header parse, the
+//! icon's one constructor, which proves the PNG signature, an `IHDR` chunk and
+//! a square of at least [`MIN_ICON_SIDE`] pixels. Each failure is one
+//! [`PwaIconRefusal`] variant.
 
 use std::num::NonZeroU64;
 use std::path::Path;
 
+use ipe_backend_rust::{IconRefusal, ServedIcon};
 use ipe_fs_open::ByteCap;
-use sha2::{Digest, Sha256};
 
 use crate::CliError;
 
-/// The largest icon file read, in bytes: 2 MiB.
-pub const ICON_READ_CAP: u64 = 2 * 1024 * 1024;
+pub use ipe_backend_rust::{IconSide, MIN_ICON_SIDE};
 
-/// The smallest side an installable icon may have, in pixels.
-pub const MIN_ICON_SIDE: u32 = 192;
+/// The largest icon file read, in bytes: the backend's own ceiling.
+pub const ICON_READ_CAP: u64 = ipe_backend_rust::ICON_MAX_BYTES;
 
 /// [`ICON_READ_CAP`] as a [`ByteCap`].
 const ICON_CAP: ByteCap =
     ByteCap::from_nonzero(const { NonZeroU64::MIN.saturating_add(ICON_READ_CAP - 1) });
 
-/// The eight bytes every PNG file opens with.
-const PNG_SIGNATURE: [u8; 8] = [0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1A, b'\n'];
-
-/// The data length of an `IHDR` chunk.
-const IHDR_LEN: [u8; 4] = 13_u32.to_be_bytes();
-
-/// The type of the header chunk, which must come first.
-const IHDR_TYPE: [u8; 4] = *b"IHDR";
-
-/// The side of a square icon, at least [`MIN_ICON_SIDE`] pixels.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct IconSide(u32);
-
-impl IconSide {
-    /// The side in pixels.
-    #[must_use]
-    pub const fn get(self) -> u32 {
-        self.0
-    }
-}
-
-/// A PNG icon proven fit for a web app manifest and a home screen.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct PwaIcon {
-    png: Vec<u8>,
-    side: IconSide,
-    digest: [u8; 32],
-}
-
-impl PwaIcon {
-    /// The PNG file's bytes, exactly as read.
-    #[must_use]
-    pub fn png(&self) -> &[u8] {
-        &self.png
-    }
-
-    /// The icon's side in pixels.
-    #[must_use]
-    pub const fn side(&self) -> IconSide {
-        self.side
-    }
-
-    /// The SHA-256 digest of [`Self::png`].
-    #[must_use]
-    pub const fn digest(&self) -> &[u8; 32] {
-        &self.digest
-    }
-}
+/// A PNG icon proven fit for a web app manifest and a home screen: the
+/// backend's [`ServedIcon`], whose one constructor is the header parse.
+pub type PwaIcon = ServedIcon;
 
 /// Why an icon file is not an installable icon.
 #[derive(Debug)]
@@ -100,6 +55,19 @@ pub enum PwaIconRefusal {
     },
 }
 
+impl From<IconRefusal> for PwaIconRefusal {
+    fn from(refusal: IconRefusal) -> Self {
+        match refusal {
+            IconRefusal::TooLarge => Self::TooLarge,
+            IconRefusal::NotPng => Self::NotPng,
+            IconRefusal::TruncatedHeader => Self::TruncatedHeader,
+            IconRefusal::ZeroSide => Self::ZeroSide,
+            IconRefusal::NotSquare { width, height } => Self::NotSquare { width, height },
+            IconRefusal::TooSmall { side } => Self::TooSmall { side },
+        }
+    }
+}
+
 /// Read the icon at `path` beneath `root` and prove it an installable PNG.
 ///
 /// Every level below `root` is opened through the held level above it, so a
@@ -116,48 +84,7 @@ pub fn parse(root: &Path, path: &Path) -> Result<PwaIcon, PwaIconRefusal> {
             PwaIconRefusal::Unreadable(Box::new(error))
         }
     })?;
-    let side = png_side(&png)?;
-    let digest = Sha256::digest(&png).into();
-    Ok(PwaIcon { png, side, digest })
-}
-
-/// The square side the PNG `bytes` declare in their `IHDR` chunk.
-fn png_side(bytes: &[u8]) -> Result<IconSide, PwaIconRefusal> {
-    let Some((signature, rest)) = bytes.split_first_chunk::<8>() else {
-        return Err(PwaIconRefusal::NotPng);
-    };
-    if *signature != PNG_SIGNATURE {
-        return Err(PwaIconRefusal::NotPng);
-    }
-    let (len, rest) = rest
-        .split_first_chunk::<4>()
-        .ok_or(PwaIconRefusal::TruncatedHeader)?;
-    let (kind, rest) = rest
-        .split_first_chunk::<4>()
-        .ok_or(PwaIconRefusal::TruncatedHeader)?;
-    if *len != IHDR_LEN || *kind != IHDR_TYPE {
-        return Err(PwaIconRefusal::TruncatedHeader);
-    }
-    // The 13 data bytes and the 4-byte CRC must all be present.
-    let header = rest.get(..17).ok_or(PwaIconRefusal::TruncatedHeader)?;
-    let (width, rest) = header
-        .split_first_chunk::<4>()
-        .ok_or(PwaIconRefusal::TruncatedHeader)?;
-    let (height, _) = rest
-        .split_first_chunk::<4>()
-        .ok_or(PwaIconRefusal::TruncatedHeader)?;
-    let width = u32::from_be_bytes(*width);
-    let height = u32::from_be_bytes(*height);
-    if width == 0 || height == 0 {
-        return Err(PwaIconRefusal::ZeroSide);
-    }
-    if width != height {
-        return Err(PwaIconRefusal::NotSquare { width, height });
-    }
-    if width < MIN_ICON_SIDE {
-        return Err(PwaIconRefusal::TooSmall { side: width });
-    }
-    Ok(IconSide(width))
+    Ok(ServedIcon::from_png(png)?)
 }
 
 /// The signature and a whole `IHDR` chunk of a `width` by `height` PNG, for tests.
@@ -165,22 +92,15 @@ fn png_side(bytes: &[u8]) -> Result<IconSide, PwaIconRefusal> {
 #[cfg(not(target_arch = "wasm32"))]
 #[must_use]
 pub fn test_png(width: u32, height: u32) -> Vec<u8> {
-    let mut bytes = PNG_SIGNATURE.to_vec();
-    bytes.extend_from_slice(&IHDR_LEN);
-    bytes.extend_from_slice(&IHDR_TYPE);
-    bytes.extend_from_slice(&width.to_be_bytes());
-    bytes.extend_from_slice(&height.to_be_bytes());
-    // Bit depth, colour type, compression, filter, interlace.
-    bytes.extend_from_slice(&[8, 6, 0, 0, 0]);
-    // The chunk CRC; the icon parse reads the header, not the CRC.
-    bytes.extend_from_slice(&[0, 0, 0, 0]);
-    bytes
+    ipe_backend_rust::test_png(width, height)
 }
 
 #[cfg(test)]
 #[cfg(not(target_arch = "wasm32"))]
 mod tests {
     use std::path::PathBuf;
+
+    use sha2::Digest as _;
 
     use super::*;
 
@@ -310,7 +230,7 @@ mod tests {
             let parsed = parse_bytes("ok", &bytes).expect("a square PNG at or past the minimum");
             assert_eq!(parsed.side().get(), side);
             assert_eq!(parsed.png(), bytes.as_slice());
-            let digest: [u8; 32] = Sha256::digest(&bytes).into();
+            let digest: [u8; 32] = sha2::Sha256::digest(&bytes).into();
             assert_eq!(parsed.digest(), &digest);
         }
     }

@@ -141,18 +141,27 @@ fn manifest_value(facts: &InstallFacts, base: &MountBase, icon: &BundlePath) -> 
 /// The program's install offer; write-once, the first registration wins.
 static OFFER: OnceLock<InstallOffer> = OnceLock::new();
 
-/// Register the build's install facts. Called once by the generated `main`
-/// before the server starts; a later call is a no-op.
+/// Register the build's install facts. Called by the generated app handle
+/// before the server starts; every call of one build passes the same facts,
+/// so a later call finds the offer already set and changes nothing.
 ///
-/// # Errors
-///
-/// [`InstallRefusal`] when the facts cannot become an offer; the server must
-/// not start with an install offer it cannot serve.
-pub fn register(facts: &'static InstallFacts) -> Result<(), InstallRefusal> {
-    let offer = InstallOffer::of(facts)?;
-    // A repeat registration is ignored: the first is authoritative.
-    let _ = OFFER.set(offer);
-    Ok(())
+/// Facts that cannot become an offer stop the program with exit code 1 and
+/// the refusal on stderr: the server never starts with an install offer it
+/// cannot serve, and never silently without the one the build asked for.
+pub fn register(facts: &'static InstallFacts) {
+    match InstallOffer::of(facts) {
+        Ok(offer) => {
+            // A set offer is the build's own; the repeat call's equal offer is
+            // dropped.
+            if let Err(repeat) = OFFER.set(offer) {
+                drop(repeat);
+            }
+        }
+        Err(refusal) => {
+            crate::core::eprint_task_error(&refusal.to_string());
+            crate::system::system_exit(1);
+        }
+    }
 }
 
 /// The registered install offer, or `None` when the build offers no install.
@@ -201,7 +210,9 @@ fn asset_response(content_type: &'static str, body: axum::body::Body) -> axum::r
 ///
 /// The routes are explicit, so they never reach the page handler and never
 /// read or mint a session. The manifest body folds in `base`, so it is built
-/// once per mounted app and leaked to `'static`, a bounded allocation.
+/// once per mounted app and shared by every answer through [`Bytes`].
+///
+/// [`Bytes`]: axum::body::Bytes
 pub fn mount_routes<S>(
     router: axum::Router<S>,
     offer: Option<&'static InstallOffer>,
@@ -215,12 +226,15 @@ where
         return router;
     };
     let route_root = MountBase::root();
-    let manifest: &'static str = Box::leak(offer.manifest_json(base).into_boxed_str());
+    let manifest = axum::body::Bytes::from(offer.manifest_json(base));
     let icon = offer.icon_png();
     router
         .route(
             &route_root.url_of(offer.manifest_path()),
-            get(move || async move { asset_response(MANIFEST_CONTENT_TYPE, manifest.into()) }),
+            get(move || {
+                let manifest = manifest.clone();
+                async move { asset_response(MANIFEST_CONTENT_TYPE, manifest.into()) }
+            }),
         )
         .route(
             &route_root.url_of(offer.icon_path()),

@@ -264,7 +264,7 @@ fn loose_emit_settings(
         debugger: *debugger,
         crate_name,
         hot_appearance: *hot_appearance,
-        host: ipe_backend_rust::EmitHost::Served,
+        host: ipe_backend_rust::EmitHost::Served(ipe_backend_rust::ServedInstall::Off),
         intent: *intent,
     }
 }
@@ -311,7 +311,20 @@ fn manifest_emit_settings(
         runtime_embed::BundleRole::Scratch => ipe_backend_rust::CrateName::Test,
     };
     let host = match host {
-        crate::delivery::HostIntent::Served => ipe_backend_rust::EmitHost::Served,
+        crate::delivery::HostIntent::Served => {
+            // The test runner serves nothing, so it never offers install.
+            let install = match (role, &manifest.delivery.browser.install) {
+                (runtime_embed::BundleRole::Out, project::Install::On(icon)) => {
+                    ipe_backend_rust::ServedInstall::On {
+                        name: manifest.name.clone(),
+                        icon: icon.clone(),
+                    }
+                }
+                (runtime_embed::BundleRole::Scratch, project::Install::On(_))
+                | (_, project::Install::Off) => ipe_backend_rust::ServedInstall::Off,
+            };
+            ipe_backend_rust::EmitHost::Served(install)
+        }
         crate::delivery::HostIntent::WebView(_) => {
             let desktop = &manifest.delivery.desktop;
             ipe_backend_rust::EmitHost::WebView(ipe_backend_rust::WebViewWindow {
@@ -2362,10 +2375,11 @@ pub fn write_emitted_project(
             static_build::cargo_config(plan),
         );
     }
+    let assets = asset_manifest(emitted, &manifest)?;
     // The reconcile below prunes and overwrites, so it runs only in a directory
     // proven ipe-owned and disjoint from the project.
     let crate_dir = target.claim()?;
-    reconcile_emitted_project(&manifest, &crate_dir, role)?;
+    reconcile_emitted_project(&manifest, &assets, &crate_dir, role)?;
     if static_plan.is_none() {
         remove_stale_static_config(&crate_dir)?;
     }
@@ -2710,13 +2724,38 @@ pub fn collect_dir_text(
     Ok(())
 }
 
-/// Reconcile the owned crate directory against `manifest`.
+/// The emitted project's binary files keyed by crate-relative path, beside the
+/// text `manifest`.
+///
+/// # Errors
+/// [`CliError::Pipeline`] when an asset's path is also a text file's: the
+/// backend never emits both, so one is a backend-invariant breach.
+fn asset_manifest<'a>(
+    emitted: &'a ipe_backend::EmittedProject,
+    manifest: &BTreeMap<PathBuf, String>,
+) -> Result<BTreeMap<PathBuf, &'a [u8]>, CliError> {
+    let mut assets = BTreeMap::new();
+    for (rel, asset) in &emitted.assets {
+        let path = PathBuf::from(rel.as_str());
+        if manifest.contains_key(&path) {
+            return Err(backend_invariant_err(Diagnostic::CompilerBug {
+                detail: format!("the emitted asset {} is also a text file", rel.as_str()),
+            }));
+        }
+        assets.insert(path, asset.bytes());
+    }
+    Ok(assets)
+}
+
+/// Reconcile the owned crate directory against the text `manifest` and the
+/// binary `assets`.
 ///
 /// Only files whose content differs from what is on disk are written
 /// (content-gated, so an unchanged rebuild bumps no mtime and `cargo` keeps its
 /// cache), each through [`OwnedPath::write`]'s temp-then-rename. Then every
-/// file under `src/` that is NOT a manifest key is deleted (manifest-driven
-/// prune: a stale `.rs` from a deleted module cannot survive).
+/// file under `src/` that is NOT a key of either map is deleted
+/// (manifest-driven prune: a stale `.rs` from a deleted module cannot survive,
+/// and a kept icon is never deleted and rewritten).
 ///
 /// Scope discipline: the prune walk is confined to `src/` and never touches the
 /// crate root — `Cargo.lock`, a `target/` build-cache directory, or any other
@@ -2728,6 +2767,7 @@ pub fn collect_dir_text(
 /// any filesystem failure.
 pub fn reconcile_emitted_project(
     manifest: &BTreeMap<PathBuf, String>,
+    assets: &BTreeMap<PathBuf, &[u8]>,
     crate_dir: &OwnedDir,
     role: runtime_embed::BundleRole,
 ) -> Result<(), CliError> {
@@ -2743,7 +2783,15 @@ pub fn reconcile_emitted_project(
             write_if_changed(&target, contents)?;
         }
     }
-    prune_orphaned_files(crate_dir, manifest)
+    for (rel, bytes) in assets {
+        let target = crate_dir.path_to(rel)?;
+        if !target.holds(bytes)? {
+            target.write(bytes)?;
+        }
+    }
+    prune_orphaned_files(crate_dir, &|rel| {
+        manifest.contains_key(rel) || assets.contains_key(rel)
+    })
 }
 
 /// The directory of an emitted crate the bundled runtime is written under.
@@ -2763,7 +2811,8 @@ pub fn write_if_changed(target: &OwnedPath, contents: &str) -> Result<(), CliErr
     target.write(contents.as_bytes())
 }
 
-/// Delete every file under the crate's `src/` that is not a key of `manifest`.
+/// Delete every file under the crate's `src/` whose crate-relative path `keep`
+/// refuses.
 ///
 /// The walk starts at an [`OwnedPath`] (a symlinked `src/` is refused) and
 /// classifies entries without following links, so a symlink inside the tree is
@@ -2778,30 +2827,30 @@ pub fn write_if_changed(target: &OwnedPath, contents: &str) -> Result<(), CliErr
 /// [`MAX_PRUNE_DEPTH`]; [`CliError::Io`] on a filesystem failure.
 pub fn prune_orphaned_files(
     crate_dir: &OwnedDir,
-    manifest: &BTreeMap<PathBuf, String>,
+    keep: &dyn Fn(&Path) -> bool,
 ) -> Result<(), CliError> {
     let src = crate_dir.path_to("src")?;
-    prune_src(&src, manifest, crate_dir)
+    prune_src(&src, keep, crate_dir)
 }
 
 /// Prune `src` through held directory handles.
 #[cfg(unix)]
 fn prune_src(
     src: &OwnedPath,
-    manifest: &BTreeMap<PathBuf, String>,
+    keep: &dyn Fn(&Path) -> bool,
     _crate_dir: &OwnedDir,
 ) -> Result<(), CliError> {
-    src.prune_files(|rel| manifest.contains_key(rel), MAX_PRUNE_DEPTH)
+    src.prune_files(keep, MAX_PRUNE_DEPTH)
 }
 
 /// Prune `src` level by level.
 #[cfg(not(unix))]
 fn prune_src(
     src: &OwnedPath,
-    manifest: &BTreeMap<PathBuf, String>,
+    keep: &dyn Fn(&Path) -> bool,
     crate_dir: &OwnedDir,
 ) -> Result<(), CliError> {
-    prune_dir(&src.path(), manifest, crate_dir, 0)
+    prune_dir(&src.path(), keep, crate_dir, 0)
 }
 
 /// Deepest directory nesting under the crate's `src/` that
@@ -2813,7 +2862,7 @@ pub const MAX_PRUNE_DEPTH: usize = 128;
 #[cfg(not(unix))]
 fn prune_dir(
     dir: &Path,
-    manifest: &BTreeMap<PathBuf, String>,
+    keep: &dyn Fn(&Path) -> bool,
     crate_dir: &OwnedDir,
     depth: usize,
 ) -> Result<(), CliError> {
@@ -2848,7 +2897,7 @@ fn prune_dir(
             Err(e) => return Err(io_err(&path, e)),
         };
         if file_type.is_dir() {
-            prune_dir(&path, manifest, crate_dir, depth.saturating_add(1))?;
+            prune_dir(&path, keep, crate_dir, depth.saturating_add(1))?;
         } else {
             // `path` was built from `dir`, itself a child of the crate
             // directory by construction, so `strip_prefix` fails only when that
@@ -2857,7 +2906,7 @@ fn prune_dir(
                 continue;
             };
             // An orphan a concurrent deleter already removed counts as pruned.
-            if !manifest.contains_key(rel) {
+            if !keep(rel) {
                 crate_dir.unlink(rel)?;
             }
         }
@@ -3207,6 +3256,7 @@ mod tests {
             files,
             cargo_toml: String::new(),
             uses_webview: false,
+            assets: std::collections::BTreeMap::new(),
         };
         let manifest = BTreeMap::from([(
             "x-w\u{202E}".to_owned(),
@@ -3238,6 +3288,7 @@ mod tests {
             files: map,
             cargo_toml: String::new(),
             uses_webview: false,
+            assets: std::collections::BTreeMap::new(),
         }
     }
 
@@ -3321,7 +3372,8 @@ mod tests {
             ipe_test_temp::temp_root().join(format!("ipe_prune_depth_{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         let owned = OwnedDir::claim(&dir).expect("claim temp dir");
-        let manifest = BTreeMap::new();
+        let manifest: BTreeMap<PathBuf, String> = BTreeMap::new();
+        let keep = |rel: &Path| manifest.contains_key(rel);
 
         let mut at_ceiling = dir.join("src");
         for _ in 0..MAX_PRUNE_DEPTH {
@@ -3329,7 +3381,7 @@ mod tests {
         }
         fs::create_dir_all(&at_ceiling).expect("make tree at the ceiling");
         fs::write(at_ceiling.join("orphan.rs"), "").expect("write orphan");
-        let pruned = prune_orphaned_files(&owned, &manifest);
+        let pruned = prune_orphaned_files(&owned, &keep);
         assert!(
             pruned.is_ok(),
             "a tree at the ceiling is pruned, got {pruned:?}"
@@ -3342,7 +3394,7 @@ mod tests {
         let past = at_ceiling.join("d");
         fs::create_dir_all(&past).expect("make tree past the ceiling");
         fs::write(past.join("orphan.rs"), "").expect("write orphan");
-        let refused = prune_orphaned_files(&owned, &manifest);
+        let refused = prune_orphaned_files(&owned, &keep);
         assert!(
             matches!(
                 refused,
@@ -3878,6 +3930,90 @@ main =
                 ..BuildOptions::default()
             }
             .links_runtime_dependency()
+        );
+    }
+
+    fn project_with_asset(rel: &str, bytes: &[u8]) -> ipe_backend::EmittedProject {
+        let mut files = BTreeMap::new();
+        files.insert(
+            ipe_backend::RelPath::new("src/main.rs").expect("valid rel path"),
+            "fn main() {}\n".to_owned(),
+        );
+        let mut assets = BTreeMap::new();
+        assets.insert(
+            ipe_backend::RelPath::new(rel).expect("valid rel path"),
+            ipe_backend::Asset::new(bytes.to_vec()),
+        );
+        ipe_backend::EmittedProject {
+            files,
+            cargo_toml: String::new(),
+            uses_webview: false,
+            assets,
+        }
+    }
+
+    fn text_manifest(emitted: &ipe_backend::EmittedProject) -> BTreeMap<PathBuf, String> {
+        emitted
+            .files
+            .iter()
+            .map(|(rel, text)| (PathBuf::from(rel.as_str()), text.clone()))
+            .collect()
+    }
+
+    /// An asset is written under `src/`, survives the prune that follows, is
+    /// left untouched by a rebuild that carries the same bytes, and is pruned
+    /// once the project stops carrying it.
+    #[test]
+    fn an_asset_is_written_kept_and_not_rewritten_when_unchanged() {
+        let dir = ipe_test_temp::temp_root().join(format!(
+            "ipe_reconcile_asset_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos())
+        ));
+        let owned = OwnedDir::claim(&dir).expect("claim temp dir");
+        let emitted = project_with_asset("src/icon.png", b"\x89PNG-bytes");
+        let manifest = text_manifest(&emitted);
+        let assets = asset_manifest(&emitted, &manifest).expect("disjoint asset");
+        let out = runtime_embed::BundleRole::Out;
+        reconcile_emitted_project(&manifest, &assets, &owned, out).expect("first reconcile");
+        let icon = dir.join("src").join("icon.png");
+        assert_eq!(
+            fs::read(&icon).expect("asset written"),
+            b"\x89PNG-bytes".to_vec(),
+            "the asset lands byte-exact"
+        );
+        let mtime_before = fs::metadata(&icon)
+            .and_then(|m| m.modified())
+            .expect("mtime");
+        reconcile_emitted_project(&manifest, &assets, &owned, out).expect("second reconcile");
+        assert!(icon.is_file(), "the prune keeps an asset");
+        let mtime_after = fs::metadata(&icon)
+            .and_then(|m| m.modified())
+            .expect("mtime");
+        assert_eq!(
+            mtime_before, mtime_after,
+            "an unchanged asset is not rewritten"
+        );
+
+        let without: BTreeMap<PathBuf, &[u8]> = BTreeMap::new();
+        reconcile_emitted_project(&manifest, &without, &owned, out)
+            .expect("reconcile without the asset");
+        assert!(!icon.exists(), "a dropped asset is pruned");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// An asset whose path is also a text file's is a backend-invariant breach,
+    /// refused before anything is written.
+    #[test]
+    fn an_asset_that_collides_with_a_text_file_is_refused() {
+        let emitted = project_with_asset("src/main.rs", b"bytes");
+        let manifest = text_manifest(&emitted);
+        let refused = asset_manifest(&emitted, &manifest);
+        assert!(
+            refused.is_err(),
+            "a colliding asset is refused, got {refused:?}"
         );
     }
 }

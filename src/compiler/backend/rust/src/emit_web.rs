@@ -560,7 +560,11 @@ fn emit_routed_web_leaf(
         child,
         generics,
     )?;
-    let register = granted_web_features_register_stmt(ctx);
+    let register = format!(
+        "{}{}",
+        crate::served_install::register_stmt(&ctx.served_install),
+        granted_web_features_register_stmt(ctx)
+    );
     let handler = &update.handler;
     let args = format!(
         "{init_s}, {handler}, {view_s}, {subs_s}, {routes_s}, {not_found_s}, {set_page}, \
@@ -612,7 +616,11 @@ fn emit_single_page_web_leaf(
     // emit change) unless the `hot_appearance` dev gate is on, so a release emit is
     // byte-identical.
     let msg_set_item = msg_set_descriptor_item(ctx, update_e);
-    let register = granted_web_features_register_stmt(ctx);
+    let register = format!(
+        "{}{}",
+        crate::served_install::register_stmt(&ctx.served_install),
+        granted_web_features_register_stmt(ctx)
+    );
     format!("{{ {register}{tag_const} {msg_set_item}{handle} }}")
 }
 
