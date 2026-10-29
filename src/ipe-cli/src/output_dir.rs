@@ -1154,9 +1154,10 @@ impl OwnedPath {
 
 /// `permissions` with read and execute added for everyone.
 #[cfg(unix)]
-fn executable(permissions: std::fs::Permissions) -> std::fs::Permissions {
+fn executable(mut permissions: std::fs::Permissions) -> std::fs::Permissions {
     use std::os::unix::fs::PermissionsExt as _;
-    std::fs::Permissions::from_mode(permissions.mode() | 0o755)
+    permissions.set_mode(permissions.mode() | 0o755);
+    permissions
 }
 
 /// `permissions` as they are: this platform has no execute bit.
