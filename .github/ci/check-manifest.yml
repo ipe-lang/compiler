@@ -33,12 +33,17 @@
 #                 over changed crates + reverse deps) or `full` (the CI mirror).
 #                 `complete: true` adds the converse: every command CI runs for
 #                 the gate is one of these, so the two sets are one.
-#                 A command is a string or {cmd, env, cwd, differs}. Each must
-#                 match a command the producer job runs, token for token, with
-#                 the same env and working directory; `differs: <reason>`
-#                 waives only the token match. Placeholders: {packages} (changed
-#                 crates; `--workspace` in CI), {lib_packages} (the same, library
-#                 crates only), {repo_root}, {target_dir}.
+#                 A command is a string or {cmd, env, cwd, differs, tier,
+#                 package}. Each must match a command the producer job runs,
+#                 token for token, with the same env and working directory;
+#                 `differs: <reason>` waives only the token match. `tier` on
+#                 one command overrides the entry's tier (a command cheap
+#                 enough to run earlier than the rest of its job's mirror).
+#                 `package` skips the command unless that crate owns a changed
+#                 file (an unowned change still conservatively runs it, like an
+#                 un-prefixed {packages} word). Placeholders: {packages}
+#                 (changed crates; `--workspace` in CI), {lib_packages} (the
+#                 same, library crates only), {repo_root}, {target_dir}.
 #   covered-by    Another gate context whose local run exercises this one.
 #   ci-only       Not reproducible locally: platform | privileged | classifier |
 #                 run-history | pull-request-state | inline-script.
@@ -313,6 +318,14 @@ checks:
       run:
         - cargo nextest run -p ipe-runtime-rust --features full,dev-posture --profile ci -E 'test(dev_posture_pin_)'
         - cargo nextest run -p ipe-runtime-rust --features full,debugger,locale --profile ci
+        - cmd: cargo nextest run -p ipe-runtime-rust --features full,debugger,locale --profile ci --no-fail-fast -E 'kind(test)'
+          tier: quick
+          package: ipe-runtime-rust
+          differs: >-
+            narrows to the crate's integration-test binaries (where the
+            registry/secret/env scan tests live) and keeps running past a
+            failing one, so a runtime change fails every such scan locally
+            at `quick` instead of only in the merge queue
     guards: SEAL
     aggregates: [runtime-full-features-run]
   - context: registry-admission
