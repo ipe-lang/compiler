@@ -2331,7 +2331,7 @@ public final class MainActivity extends Activity {
 
 /// The bridge template: one message listener on the local origin, the request
 /// grammar, the outstanding ceiling, the handshake and the event channel.
-const SHELL_BRIDGE_JAVA: &str = r#"package dev.ipe.app;
+const SHELL_BRIDGE_JAVA: &str = r"package dev.ipe.app;
 
 import android.content.Intent;
 import android.net.Uri;
@@ -2607,7 +2607,7 @@ final class ShellBridge {
         }
     }
 }
-"#;
+";
 
 /// The strict JSON pre-scan and parse the bridge reads requests with.
 const SHELL_JSON_JAVA: &str = r#"package dev.ipe.app;
@@ -2926,7 +2926,7 @@ final class ShellNotifications {
 "#;
 
 /// The push capability: subscribing, the current subscription, dropping it.
-const SHELL_PUSH_JAVA: &str = r#"package dev.ipe.app;
+const SHELL_PUSH_JAVA: &str = r"package dev.ipe.app;
 
 import android.content.Context;
 import android.os.Handler;
@@ -3050,7 +3050,7 @@ final class ShellPush {
         });
     }
 }
-"#;
+";
 
 /// The push receiver keys, wrapped by a device-held key, and the opening of a
 /// sealed push message.
@@ -3526,7 +3526,7 @@ public final class PushService extends FirebaseMessagingService {
 
 /// The application class that initializes Firebase from the manifest's public
 /// client identifiers.
-const IPE_APPLICATION_JAVA: &str = r#"package dev.ipe.app;
+const IPE_APPLICATION_JAVA: &str = r"package dev.ipe.app;
 
 import android.app.Application;
 import com.google.firebase.FirebaseApp;
@@ -3547,7 +3547,7 @@ public final class IpeApplication extends Application {
         }
     }
 }
-"#;
+";
 
 /// The Android shell's build/README note.
 ///
@@ -5818,7 +5818,8 @@ mod tests {
     fn android_facilities_follow_the_accepted_axes() {
         for axis in WebCapability::ALL {
             let pin = shell_pin(&accepts(&[web(*axis)]), &MountBase::root());
-            let Ok(plan) = AndroidPlan::of(&identity(), &pin) else {
+            let identity = identity();
+            let Ok(plan) = AndroidPlan::of(&identity, &pin) else {
                 continue;
             };
             for facility in ChromeFacility::ALL {
