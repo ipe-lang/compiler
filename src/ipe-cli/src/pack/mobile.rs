@@ -24,15 +24,15 @@
 //! module never fakes a mobile toolchain invocation.
 
 use std::collections::BTreeSet;
-use std::num::{NonZeroU32, NonZeroUsize};
+use std::num::{NonZeroU32, NonZeroU64, NonZeroUsize};
 use std::path::{Path, PathBuf};
 
-use ipe_fs_open::{EntryCap, EntryName, FileId, FileKind, HeldDir, OpenRefusal};
+use ipe_fs_open::{ByteCap, EntryCap, EntryName, FileId, FileKind, HeldDir, OpenRefusal};
 use ipe_ir::{Capability, WebCapability};
 use ipe_runtime_rust::csp::{
     self, BundleHost, BundleReach, BundleWorker, ContentSecurityPolicy, ReachRefusal,
 };
-use ipe_runtime_rust::encoding::{MountBase, ServerOrigin, ServerOrigins};
+use ipe_runtime_rust::encoding::{MountBase, ServerOrigin};
 use ipe_runtime_rust::js_port_glue::native_bridge;
 
 use crate::CliError;
@@ -272,8 +272,9 @@ pub struct ManifestPin {
     /// `delivery.browser.basePath`: the mount path the bundle's URLs and the
     /// shell's handlers name.
     base: MountBase,
-    /// `delivery.servers`: the origins the bundle may reach besides its own.
-    servers: ServerOrigins,
+    /// `delivery.servers`: the origins the bundle may reach besides its own,
+    /// read only as a [`BundleReach`].
+    servers: PinnedServers,
     /// `delivery.mobile.push`: the identifiers the shell registers for push
     /// with; its `Debug` never prints an identifier.
     push: Option<PushDelivery>,
@@ -288,7 +289,7 @@ impl ManifestPin {
     pub fn of(manifest: &ProjectManifest) -> Self {
         Self {
             base: manifest.delivery.browser.base.clone(),
-            servers: manifest.delivery.servers.clone(),
+            servers: PinnedServers::new(manifest.delivery.servers.clone()),
             push: manifest.delivery.mobile.push.clone(),
             accepts: manifest.capabilities_accept.clone(),
         }
@@ -313,16 +314,20 @@ impl ManifestPin {
     /// [`MobileRefusal::AssetOriginListed`] when `host` is
     /// [`BundleHost::AndroidAssets`] and `delivery.servers` names its asset host.
     pub fn reach(&self, host: BundleHost) -> Result<BundleReach<'_>, MobileRefusal> {
-        Ok(BundleReach::new(host, &self.servers)?)
+        Ok(self.servers.reach(host)?)
     }
 
     /// The bundle policies the wasm build may have rendered for this pin.
     ///
     /// The build's worker follows the capabilities the program reaches, which
     /// the consent gate holds within the accepted ones, so a push worker is
-    /// admitted only when push is accepted.
+    /// admitted only when push is accepted. The pack never sees the reached
+    /// set, so an accepted push the program does not reach still admits the
+    /// worker-free page; the Android header then carries `worker-src 'self'`
+    /// where that page falls back to `script-src 'self'`, which admits the
+    /// same scripts, and `connect-src` is identical for both workers.
     fn served_policies(&self) -> Vec<(BundleWorker, String)> {
-        let reach = BundleReach::served(&self.servers);
+        let reach = self.servers.served();
         let push = self
             .accepts
             .contains(&Capability::JsPort(WebCapability::Push));
@@ -377,6 +382,50 @@ impl ManifestPin {
         }
     }
 }
+
+mod pinned_servers {
+    use ipe_runtime_rust::csp::{BundleHost, BundleReach, ReachRefusal};
+    use ipe_runtime_rust::encoding::ServerOrigins;
+
+    /// A pin's `delivery.servers`, readable only as a [`BundleReach`].
+    ///
+    /// Its origins are private to this module, so every confinement list a
+    /// shell renders is derived from one reach, never from the origins read
+    /// again beside it.
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub struct PinnedServers(ServerOrigins);
+
+    impl PinnedServers {
+        /// Pin `origins`.
+        #[must_use]
+        pub const fn new(origins: ServerOrigins) -> Self {
+            Self(origins)
+        }
+
+        /// What a bundle on `host` may reach.
+        ///
+        /// # Errors
+        /// The refusal of a server `host` answers locally.
+        pub fn reach(&self, host: BundleHost) -> Result<BundleReach<'_>, ReachRefusal> {
+            BundleReach::new(host, &self.0)
+        }
+
+        /// What the bundle a web server serves may reach.
+        #[must_use]
+        pub const fn served(&self) -> BundleReach<'_> {
+            BundleReach::served(&self.0)
+        }
+
+        /// The pinned origins, for a test to render what the wasm build renders.
+        #[cfg(test)]
+        #[must_use]
+        pub const fn origins(&self) -> &ServerOrigins {
+            &self.0
+        }
+    }
+}
+
+use pinned_servers::PinnedServers;
 
 /// One field of a [`ManifestPin`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -551,8 +600,19 @@ impl SpaRoot {
     /// [`BundleError::Replaced`] when `www/` is gone or now names another
     /// object; [`BundleError::Io`] when it cannot be opened or identified.
     pub fn verify_unreplaced(&self) -> Result<(), BundleError> {
-        match open_www(&self.path).and_then(|dir| dir.id()) {
-            Ok(id) if id == self.id => Ok(()),
+        self.hold().map(drop)
+    }
+
+    /// Hold `www/`, proven to be the directory the bundle was collected from.
+    ///
+    /// Every asset is read through the returned handle, so an entry swapped
+    /// for a link after the walk is refused rather than followed.
+    ///
+    /// # Errors
+    /// As [`SpaRoot::verify_unreplaced`].
+    fn hold(&self) -> Result<HeldDir, BundleError> {
+        match open_www(&self.path).and_then(|dir| dir.id().map(|id| (dir, id))) {
+            Ok((dir, id)) if id == self.id => Ok(dir),
             Ok(_) | Err(OpenRefusal::Absent | OpenRefusal::Link | OpenRefusal::NotRegular(_)) => {
                 Err(BundleError::Replaced {
                     path: self.path.clone(),
@@ -565,9 +625,20 @@ impl SpaRoot {
         }
     }
 
-    /// The path of `asset` below this root, joined from its entry names.
-    fn source_of(&self, asset: &AssetPath) -> PathBuf {
+    /// The path of `asset` below this root, joined from its entry names; for
+    /// messages only, never reopened.
+    fn shown(&self, asset: &AssetPath) -> PathBuf {
         joined(&self.path, asset.segments())
+    }
+
+    /// The bytes of `asset`, read through `www`, the handle [`SpaRoot::hold`]
+    /// proved, without following a link at any level.
+    ///
+    /// # Errors
+    /// The refusal met opening or reading it; [`OpenRefusal::TooLarge`] past `cap`.
+    fn read(www: &HeldDir, asset: &AssetPath, cap: ByteCap) -> Result<Vec<u8>, OpenRefusal> {
+        www.open_rel(asset.segments())
+            .and_then(|file| file.read_bytes(cap))
     }
 }
 
@@ -771,32 +842,38 @@ impl AssetWalk<'_> {
     /// An entry that turned into a link or another kind between its listing
     /// and its open is refused as that kind, never followed or skipped.
     fn refused(&self, path: PathBuf, refusal: OpenRefusal) -> BundleError {
-        match refusal {
-            OpenRefusal::Link => BundleError::UnplaceableAsset {
-                path,
-                reason: AssetRefusal::Kind(FileKind::Symlink),
-            },
-            OpenRefusal::NotRegular(kind) => BundleError::UnplaceableAsset {
-                path,
-                reason: AssetRefusal::Kind(kind),
-            },
-            OpenRefusal::BadName => BundleError::UnplaceableAsset {
-                path,
-                reason: AssetRefusal::BadName,
-            },
-            OpenRefusal::TooManyEntries(_) => BundleError::TooManyAssets {
-                limit: self.limits.entries,
-            },
-            OpenRefusal::Absent
-            | OpenRefusal::Denied
-            | OpenRefusal::InUse
-            | OpenRefusal::TooLarge(_)
-            | OpenRefusal::NotUtf8
-            | OpenRefusal::Io(_) => BundleError::Io {
-                path,
-                source: refusal.into_io(),
-            },
-        }
+        bundle_refusal(path, refusal, self.limits.entries)
+    }
+}
+
+/// The bundle error for `refusal` met at `path`, under an entry budget of `entries`.
+///
+/// An entry that turned into a link or another kind between its listing and
+/// its open is refused as that kind, never followed or skipped.
+fn bundle_refusal(path: PathBuf, refusal: OpenRefusal, entries: NonZeroU32) -> BundleError {
+    match refusal {
+        OpenRefusal::Link => BundleError::UnplaceableAsset {
+            path,
+            reason: AssetRefusal::Kind(FileKind::Symlink),
+        },
+        OpenRefusal::NotRegular(kind) => BundleError::UnplaceableAsset {
+            path,
+            reason: AssetRefusal::Kind(kind),
+        },
+        OpenRefusal::BadName => BundleError::UnplaceableAsset {
+            path,
+            reason: AssetRefusal::BadName,
+        },
+        OpenRefusal::TooManyEntries(_) => BundleError::TooManyAssets { limit: entries },
+        OpenRefusal::Absent
+        | OpenRefusal::Denied
+        | OpenRefusal::InUse
+        | OpenRefusal::TooLarge(_)
+        | OpenRefusal::NotUtf8
+        | OpenRefusal::Io(_) => BundleError::Io {
+            path,
+            source: refusal.into_io(),
+        },
     }
 }
 
@@ -954,6 +1031,20 @@ pub struct PolicySwap {
 /// The emitted page is under 2 KiB, so a larger file is refused unread.
 pub const MAX_INDEX_HTML_BYTES: u64 = 64 * 1024;
 
+/// [`MAX_INDEX_HTML_BYTES`] as the cap a held read takes.
+const INDEX_HTML_CAP: ByteCap =
+    ByteCap::from_nonzero(NonZeroU64::MIN.saturating_add(MAX_INDEX_HTML_BYTES.saturating_sub(1)));
+
+/// The most bytes of any one bundled asset the pack reads.
+///
+/// An emitted bundle's largest asset, its wasm module, stays far below this;
+/// a larger file is refused before it is read.
+pub const MAX_ASSET_BYTES: u64 = 256 * 1024 * 1024;
+
+/// [`MAX_ASSET_BYTES`] as the cap a held read takes.
+const ASSET_CAP: ByteCap =
+    ByteCap::from_nonzero(NonZeroU64::MIN.saturating_add(MAX_ASSET_BYTES.saturating_sub(1)));
+
 /// How a bundled asset at `asset` is laid out for a shell whose bundle has
 /// `reach`.
 ///
@@ -976,34 +1067,46 @@ fn bundle_content(asset: &AssetPath, pin: &ManifestPin, reach: &BundleReach<'_>)
     }
 }
 
-/// The `index.html` at `source` with its one policy meta swapped.
+/// The `index.html` asset `asset`, read through `www`, with its one policy
+/// meta swapped.
 ///
 /// # Errors
 /// [`BundleError::IndexTooLarge`] past [`MAX_INDEX_HTML_BYTES`];
 /// [`BundleError::PolicyMismatch`] when the page is not UTF-8, or does not
-/// hold exactly one meta of exactly one of `swaps`; [`BundleError::Io`] when
-/// it cannot be read.
-fn policed_index(source: &Path, swaps: &[PolicySwap]) -> Result<String, BundleError> {
-    use std::io::Read as _;
-
-    let io = |source_err: std::io::Error| BundleError::Io {
-        path: source.to_path_buf(),
-        source: source_err,
+/// hold exactly one meta of exactly one of `swaps`; the refusal of a link,
+/// another kind of entry, or a read failure met on the way.
+fn policed_index(
+    spa: &SpaRoot,
+    www: &HeldDir,
+    asset: &AssetPath,
+    swaps: &[PolicySwap],
+) -> Result<String, BundleError> {
+    let shown = spa.shown(asset);
+    let bytes = match SpaRoot::read(www, asset, INDEX_HTML_CAP) {
+        Ok(bytes) => bytes,
+        Err(OpenRefusal::TooLarge(_)) => {
+            return Err(BundleError::IndexTooLarge {
+                path: shown,
+                cap: MAX_INDEX_HTML_BYTES,
+            });
+        }
+        Err(refusal) => return Err(bundle_refusal(shown, refusal, MAX_ASSETS)),
     };
-    let mut bytes = Vec::new();
-    std::fs::File::open(source)
-        .map_err(io)?
-        .take(MAX_INDEX_HTML_BYTES.saturating_add(1))
-        .read_to_end(&mut bytes)
-        .map_err(io)?;
-    if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > MAX_INDEX_HTML_BYTES {
-        return Err(BundleError::IndexTooLarge {
-            path: source.to_path_buf(),
-            cap: MAX_INDEX_HTML_BYTES,
-        });
-    }
+    swapped_policy(&shown, bytes, swaps)
+}
+
+/// `bytes`, the page at `shown`, with its one policy meta swapped.
+///
+/// # Errors
+/// [`BundleError::PolicyMismatch`] when the page is not UTF-8, or does not
+/// hold exactly one meta of exactly one of `swaps`.
+fn swapped_policy(
+    shown: &Path,
+    bytes: Vec<u8>,
+    swaps: &[PolicySwap],
+) -> Result<String, BundleError> {
     let mismatch = || BundleError::PolicyMismatch {
-        path: source.to_path_buf(),
+        path: shown.to_path_buf(),
     };
     let page = String::from_utf8(bytes).map_err(|_| mismatch())?;
     let mut held = swaps.iter().filter(|swap| page.contains(&swap.served));
@@ -2111,39 +2214,60 @@ public final class MainActivity extends Activity {
 
     /**
      * The one constructor of every response the shell builds: it drops any
-     * policy header in headers and sets the bundle policy in its place.
+     * policy header in headers, and any header with no name or value, and sets
+     * the bundle policy in its place. A status and reason the constructor
+     * would throw on read 200 OK.
      */
     private static WebResourceResponse confined(String mime, String encoding, int status,
             String reason, Map<String, String> headers, InputStream data) {
         Map<String, String> policed = new HashMap<>();
         if (headers != null) {
             for (Map.Entry<String, String> header : headers.entrySet()) {
-                if (!Shell.CSP_HEADER.equalsIgnoreCase(header.getKey())) {
-                    policed.put(header.getKey(), header.getValue());
+                String name = header.getKey();
+                String value = header.getValue();
+                if (name != null && value != null && !Shell.CSP_HEADER.equalsIgnoreCase(name)) {
+                    policed.put(name, value);
                 }
             }
         }
         policed.put(Shell.CSP_HEADER, Shell.CONTENT_SECURITY_POLICY);
+        if (!settable(status, reason)) {
+            status = 200;
+            reason = "OK";
+        }
         return new WebResourceResponse(mime, encoding, status, reason, policed, data);
     }
 
     /**
+     * Whether the response constructor takes status and reason: a status in
+     * 100..299 or 400..599 and a reason of printable ASCII that is not blank.
+     */
+    private static boolean settable(int status, String reason) {
+        if (status < 100 || status > 599 || (status >= 300 && status <= 399)) {
+            return false;
+        }
+        if (reason == null || reason.trim().isEmpty()) {
+            return false;
+        }
+        for (int i = 0; i < reason.length(); i++) {
+            char c = reason.charAt(i);
+            if (c < 0x20 || c > 0x7E) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /**
      * The answer to a local request: the bundle file the loader mapped, rebuilt
-     * through confined, or a local 404 when it mapped none. A status outside
-     * 100..599 or a missing reason, which the constructor refuses, reads 200 OK.
+     * through confined, or a local 404 when it mapped none.
      */
     private static WebResourceResponse local(WebResourceResponse mapped) {
         if (mapped == null || mapped.getData() == null) {
             return localNotFound();
         }
-        int status = mapped.getStatusCode();
-        String reason = mapped.getReasonPhrase();
-        if (status < 100 || status > 599 || reason == null || reason.isEmpty()) {
-            status = 200;
-            reason = "OK";
-        }
-        return confined(mapped.getMimeType(), mapped.getEncoding(), status, reason,
-                mapped.getResponseHeaders(), mapped.getData());
+        return confined(mapped.getMimeType(), mapped.getEncoding(), mapped.getStatusCode(),
+                mapped.getReasonPhrase(), mapped.getResponseHeaders(), mapped.getData());
     }
 
     /** The answer to every local request the loader leaves unmapped: a local 404. */
@@ -4218,8 +4342,8 @@ impl std::fmt::Display for SwiftStringLiteral {
 
 /// Materialise `layout` as the shell `dist/<root_name>` inside the owned `dist`.
 ///
-/// Generated files are written verbatim, bundled SPA assets and the source icon
-/// are copied into place. A fresh, deterministic tree: an existing shell directory
+/// Generated files are written verbatim, bundled SPA assets are read through
+/// the held `www/` and written, and the source icon is copied into place. A fresh, deterministic tree: an existing shell directory
 /// of the same name is removed first so a re-pack never leaves stale files behind.
 /// Every path is a [`crate::output_dir::OwnedPath`], so a symlink planted in the
 /// owned `dist` is refused — never removed through, written through, or copied
@@ -4232,6 +4356,9 @@ impl std::fmt::Display for SwiftStringLiteral {
 /// [`CliError::Usage`] carrying [`BundleError::PolicyMismatch`] or
 /// [`BundleError::IndexTooLarge`] when the bundle's `index.html` cannot be
 /// policed, before any shell file is written;
+/// [`CliError::Usage`] carrying [`BundleError::UnplaceableAsset`] for an asset
+/// that is no longer a regular file below the held `www/` (a link, a FIFO),
+/// or [`BundleError::Io`] for one past [`MAX_ASSET_BYTES`], never read;
 /// [`CliError::Io`] naming the exact path on any filesystem failure.
 pub fn materialise(
     layout: &ShellLayout,
@@ -4239,7 +4366,9 @@ pub fn materialise(
     dist: &OwnedDir,
 ) -> Result<PathBuf, CliError> {
     let refused = |e: BundleError| CliError::Usage(crate::text::Message::relay(&e));
-    layout.spa.verify_unreplaced().map_err(refused)?;
+    // Every asset is read through this one held `www/`, proven to be the
+    // directory collected, never reopened by path.
+    let www = layout.spa.hold().map_err(refused)?;
     // Every policed page is read and proven before the shell directory is
     // touched, so a refusal lays nothing down.
     let laid = layout
@@ -4250,7 +4379,7 @@ pub fn materialise(
                 ShellContent::Generated(text) => Laid::Text(text),
                 ShellContent::Asset(asset) => Laid::Copy(asset),
                 ShellContent::PolicedIndex { asset, swaps } => {
-                    Laid::Policed(policed_index(&layout.spa.source_of(asset), swaps)?)
+                    Laid::Policed(policed_index(&layout.spa, &www, asset, swaps)?)
                 }
                 ShellContent::Icon => Laid::Icon,
             };
@@ -4268,7 +4397,12 @@ pub fn materialise(
         match bytes {
             Laid::Text(text) => out_file.write(text.as_bytes())?,
             Laid::Policed(page) => out_file.write(page.as_bytes())?,
-            Laid::Copy(asset) => out_file.copy_from(&layout.spa.source_of(asset))?,
+            Laid::Copy(asset) => {
+                let copied = SpaRoot::read(&www, asset, ASSET_CAP).map_err(|refusal| {
+                    refused(bundle_refusal(layout.spa.shown(asset), refusal, MAX_ASSETS))
+                })?;
+                out_file.write(&copied)?;
+            }
             Laid::Icon => {
                 if let Some(src) = icon {
                     out_file.copy_from(src)?;
@@ -4283,7 +4417,7 @@ pub fn materialise(
 enum Laid<'layout> {
     /// Generated text, written verbatim.
     Text(&'layout str),
-    /// A bundle asset, copied from below the emitted `www/`.
+    /// A bundle asset, read through the held `www/` as it is written.
     Copy(&'layout AssetPath),
     /// A policed `index.html`, already read and proven.
     Policed(String),
@@ -4299,6 +4433,7 @@ fn rel_to_native(rel: &str) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ipe_runtime_rust::encoding::ServerOrigins;
 
     fn accepts(items: &[Capability]) -> BTreeSet<Capability> {
         items.iter().copied().collect()
@@ -5347,10 +5482,12 @@ mod tests {
     fn pin(base: &str, servers: &[&str]) -> ManifestPin {
         ManifestPin {
             base: MountBase::parse(base).expect("a legal mount base"),
-            servers: ServerOrigins::new(servers.iter().map(|raw| {
-                ipe_runtime_rust::encoding::ServerOrigin::parse(raw).expect("a legal origin")
-            }))
-            .expect("a legal origin set"),
+            servers: PinnedServers::new(
+                ServerOrigins::new(servers.iter().map(|raw| {
+                    ipe_runtime_rust::encoding::ServerOrigin::parse(raw).expect("a legal origin")
+                }))
+                .expect("a legal origin set"),
+            ),
             push: None,
             accepts: BTreeSet::new(),
         }
@@ -5391,7 +5528,7 @@ mod tests {
     fn shell_pin(accepts: &BTreeSet<Capability>, base: &MountBase) -> ManifestPin {
         ManifestPin {
             base: base.clone(),
-            servers: ServerOrigins::none(),
+            servers: PinnedServers::new(ServerOrigins::none()),
             push: None,
             accepts: accepts.clone(),
         }
@@ -6236,11 +6373,15 @@ mod tests {
         );
         for needle in [
             "return local(loader.shouldInterceptRequest(url));",
-            "return confined(mapped.getMimeType(), mapped.getEncoding(), status, reason, \
-             mapped.getResponseHeaders(), mapped.getData());",
-            "if (!Shell.CSP_HEADER.equalsIgnoreCase(header.getKey())) {",
-            "policed.put(Shell.CSP_HEADER, Shell.CONTENT_SECURITY_POLICY);",
-            "return new WebResourceResponse(mime, encoding, status, reason, policed, data);",
+            "return confined(mapped.getMimeType(), mapped.getEncoding(), mapped.getStatusCode(), \
+             mapped.getReasonPhrase(), mapped.getResponseHeaders(), mapped.getData());",
+            "if (name != null && value != null && !Shell.CSP_HEADER.equalsIgnoreCase(name)) {",
+            "policed.put(Shell.CSP_HEADER, Shell.CONTENT_SECURITY_POLICY); \
+             if (!settable(status, reason)) { status = 200; reason = \"OK\"; } \
+             return new WebResourceResponse(mime, encoding, status, reason, policed, data);",
+            "if (status < 100 || status > 599 || (status >= 300 && status <= 399)) { return false; }",
+            "if (reason == null || reason.trim().isEmpty()) { return false; }",
+            "if (c < 0x20 || c > 0x7E) { return false; }",
             "return confined(\"text/plain\", \"utf-8\", 404, \"Not Found\",",
             "return confined(\"text/plain\", \"utf-8\", 403, \"Forbidden\",",
         ] {
@@ -6290,7 +6431,8 @@ mod tests {
             ] {
                 let shell = android(&laid);
                 let header = string_constant(&shell, "CONTENT_SECURITY_POLICY");
-                let meta = ContentSecurityPolicy::bundle(&laid.servers, worker).header_value();
+                let meta =
+                    ContentSecurityPolicy::bundle(laid.servers.origins(), worker).header_value();
                 assert_eq!(others(&header), others(&meta), "{header} / {meta}");
                 let mut admitted = connect_of(&meta);
                 assert!(admitted.remove("'self'"), "{meta}");
@@ -6303,19 +6445,38 @@ mod tests {
 
     #[test]
     fn the_pinned_servers_are_read_only_through_the_reach() {
+        // The origins are a private field of `pinned_servers::PinnedServers`,
+        // so the compiler refuses a read anywhere else; this pins what the
+        // module itself hands out.
         let source = include_str!("mobile.rs");
         let production = source
             .split_once("#[cfg(test)]\nmod tests {")
             .map_or(source, |(head, _)| head);
-        assert!(!production.contains("servers()"), "no servers accessor");
-        let readers: Vec<&str> = production
-            .match_indices("self.servers")
+        let module = production
+            .split_once("mod pinned_servers {")
+            .and_then(|(_, rest)| rest.split_once("\n}\n"))
+            .map(|(body, _)| body)
+            .expect("the pinned servers module");
+        assert!(
+            module.contains("pub struct PinnedServers(ServerOrigins);"),
+            "the origins stay a private field: {module}"
+        );
+        let readers: Vec<&str> = module
+            .match_indices("self.0")
             .filter_map(|(at, _)| {
-                let (_, signature) = production.get(..at)?.rsplit_once("fn ")?;
+                let (_, signature) = module.get(..at)?.rsplit_once("fn ")?;
                 signature.split_once('(').map(|(name, _)| name)
             })
             .collect();
-        assert_eq!(readers, ["reach", "served_policies"]);
+        assert_eq!(readers, ["reach", "served", "origins"]);
+        let fields = module.matches(".0").count();
+        assert_eq!(fields, 3, "every field read is one of the listed: {module}");
+        assert!(
+            module.contains("#[cfg(test)]\n        #[must_use]\n        pub const fn origins("),
+            "the bare origins are a test's only: {module}"
+        );
+        assert_eq!(production.matches("impl PinnedServers").count(), 1);
+        assert_eq!(production.matches("for PinnedServers").count(), 0);
     }
 
     #[test]
@@ -6425,7 +6586,7 @@ mod tests {
     #[test]
     fn a_shell_page_carries_its_host_policy() {
         let laid = pin("/", &["https://api.example"]);
-        let page = page_with(&[&served_meta(&laid.servers, BundleWorker::None)]);
+        let page = page_with(&[&served_meta(laid.servers.origins(), BundleWorker::None)]);
         for (os, rel, host) in [
             (
                 MobileOs::Android,
@@ -6454,12 +6615,12 @@ mod tests {
     fn a_page_without_the_pinned_policy_lays_nothing_down() {
         let laid = pin("/", &["https://api.example"]);
         let other = pin("/", &["https://other.example"]);
-        let meta = served_meta(&laid.servers, BundleWorker::None);
+        let meta = served_meta(laid.servers.origins(), BundleWorker::None);
         let pages = [
             page_with(&[]),
             page_with(&[&meta, &meta]),
-            page_with(&[&served_meta(&other.servers, BundleWorker::None)]),
-            page_with(&[&served_meta(&laid.servers, BundleWorker::Push)]),
+            page_with(&[&served_meta(other.servers.origins(), BundleWorker::None)]),
+            page_with(&[&served_meta(laid.servers.origins(), BundleWorker::Push)]),
         ];
         for page in &pages {
             let (base, spa) = bundle_with_page("mismatch", page);
@@ -6481,7 +6642,7 @@ mod tests {
     fn a_push_shell_admits_the_page_with_or_without_its_worker() {
         let laid = push_pin(&["https://api.example"]);
         for worker in [BundleWorker::None, BundleWorker::Push] {
-            let page = page_with(&[&served_meta(&laid.servers, worker)]);
+            let page = page_with(&[&served_meta(laid.servers.origins(), worker)]);
             let (base, spa) = bundle_with_page("push", &page);
             let (_, result) = materialised(MobileOs::Android, &laid, &base, &spa);
             let root = result.expect("a reached or unreached worker both lay out");
@@ -6496,7 +6657,7 @@ mod tests {
     #[test]
     fn a_page_past_the_cap_or_not_utf8_is_refused() {
         let laid = pin("/", &[]);
-        let mut page = page_with(&[&served_meta(&laid.servers, BundleWorker::None)]);
+        let mut page = page_with(&[&served_meta(laid.servers.origins(), BundleWorker::None)]);
         let cap = usize::try_from(MAX_INDEX_HTML_BYTES).expect("a usize cap");
         page.push_str(&" ".repeat(cap.saturating_add(1).saturating_sub(page.len())));
         let (_base, spa) = bundle_with_page("oversized", &page);
@@ -6511,8 +6672,9 @@ mod tests {
         let ShellContent::PolicedIndex { swaps, .. } = content else {
             return;
         };
-        let source = spa.source_of(&index.path);
-        let refused = policed_index(&source, &swaps);
+        let www = spa.spa.hold().expect("hold www");
+        let source = spa.spa.shown(&index.path);
+        let refused = policed_index(&spa.spa, &www, &index.path, &swaps);
         assert!(matches!(
             refused,
             Err(BundleError::IndexTooLarge {
@@ -6523,15 +6685,81 @@ mod tests {
         page.truncate(cap);
         std::fs::write(&source, &page).expect("write the page at the cap");
         assert!(
-            policed_index(&source, &swaps).is_ok(),
+            policed_index(&spa.spa, &www, &index.path, &swaps).is_ok(),
             "the cap itself is read"
         );
-        let mut bytes = vec![0xff_u8];
-        bytes.extend_from_slice(page.as_bytes());
-        std::fs::write(&source, bytes).expect("write a non-UTF-8 page");
+        let mut bytes = page.into_bytes();
+        bytes.pop();
+        bytes.insert(0, 0xff);
+        std::fs::write(&source, bytes).expect("write a non-UTF-8 page at the cap");
         assert!(matches!(
-            policed_index(&source, &swaps),
+            policed_index(&spa.spa, &www, &index.path, &swaps),
             Err(BundleError::PolicyMismatch { .. })
         ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_asset_swapped_for_a_link_after_the_walk_is_refused_not_copied() {
+        let laid = pin("/", &[]);
+        let page = page_with(&[&served_meta(laid.servers.origins(), BundleWorker::None)]);
+        for victim in ["boot.js", "index.html"] {
+            let (base, spa) = bundle_with_page("asset-link", &page);
+            // The outside file is a page the policing admits, so only the
+            // held read refuses it.
+            let outside = base.join("outside.html");
+            std::fs::write(&outside, &page).expect("write the outside file");
+            let shell = layout(
+                MobileOs::Android,
+                BundleProfile::Dev,
+                &identity(),
+                &laid,
+                &spa,
+                None,
+            )
+            .expect("layout");
+            let planted = base.join("www").join(victim);
+            std::fs::remove_file(&planted).expect("remove the collected asset");
+            std::os::unix::fs::symlink(&outside, &planted).expect("plant a link");
+            let dist = OwnedDir::claim(&base.join("dist")).expect("claim dist");
+            let err = materialise(&shell, None, &dist).expect_err("a linked asset is refused");
+            assert!(matches!(err, CliError::Usage(_)), "{victim}: {err}");
+            assert!(
+                err.to_string()
+                    .contains(text::mobile_asset_kind(&FileKind::Symlink).as_str()),
+                "{victim}: {err}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_asset_swapped_for_a_fifo_after_the_walk_is_refused_unread() {
+        let laid = pin("/", &[]);
+        let page = page_with(&[&served_meta(laid.servers.origins(), BundleWorker::None)]);
+        let (base, spa) = bundle_with_page("asset-fifo", &page);
+        let shell = layout(
+            MobileOs::Android,
+            BundleProfile::Dev,
+            &identity(),
+            &laid,
+            &spa,
+            None,
+        )
+        .expect("layout");
+        let planted = base.join("www").join("boot.js");
+        std::fs::remove_file(&planted).expect("remove the collected asset");
+        let made = std::process::Command::new("mkfifo").arg(&planted).status();
+        assert!(
+            made.is_ok_and(|status| status.success()),
+            "mkfifo plants the fixture"
+        );
+        let dist = OwnedDir::claim(&base.join("dist")).expect("claim dist");
+        let err = materialise(&shell, None, &dist).expect_err("a fifo asset is refused");
+        assert!(
+            err.to_string()
+                .contains(text::mobile_asset_kind(&FileKind::Fifo).as_str()),
+            "{err}"
+        );
     }
 }
