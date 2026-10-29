@@ -9,8 +9,9 @@ The commands are exactly the manifest's `local:` dispositions (see
 first, and a manifest whose `local:` blocks drift from CI refuses to run.
 
   quick     fmt, clippy on the changed crates and over every CI runtime
-            feature combination, workspace check, static guards, panic-scan
-            and every generated-doc drift check.
+            feature combination, workspace check, static guards, panic-scan,
+            every generated-doc drift check, and the runtime crate's own
+            scan-test suite when the change touches `src/runtime/rust/`.
   affected  quick and tests, both over the changed crates plus every crate
             that depends on one or names a path inside one in its sources,
             plus the example / admission / advisory gates.
