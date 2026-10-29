@@ -43,12 +43,6 @@ test("install-offer: the manifest, the touch icon, and Chromium's own installabi
   const ctx = await browser.newContext();
   const page = await ctx.newPage();
   try {
-    // Chromium fetches the manifest itself as soon as the <link rel="manifest">
-    // tag parses, during navigation — so the listener must be armed before
-    // `goto` resolves, or the fetch is missed entirely.
-    const manifestFetch = page.waitForResponse(
-      (resp) => MANIFEST_PATH.test(new URL(resp.url()).pathname) && resp.status() === 200,
-    );
     await page.goto(ON_BASE);
     await page.waitForSelector('html[data-ipe-live="1"]', { timeout: 15000 });
 
@@ -61,10 +55,11 @@ test("install-offer: the manifest, the touch icon, and Chromium's own installabi
     expect(manifestHref, "the page links a manifest").not.toBeNull();
     expect(touchIconHref, "the page links a touch icon").not.toBeNull();
 
-    // Wait for the browser's own manifest fetch before asking Chromium for its
-    // installability verdict: the verdict is only meaningful once the manifest
-    // it depends on has actually loaded.
-    const manifestResponse = await manifestFetch;
+    // Chromium fetches a linked manifest only when something asks for it, so
+    // the test fetches it itself and then lets CDP drive the browser's fetch.
+    expect(new URL(manifestHref, ON_BASE).pathname).toMatch(MANIFEST_PATH);
+    const manifestResponse = await page.request.get(new URL(manifestHref, ON_BASE).toString());
+    expect(manifestResponse.status()).toBe(200);
     expect(manifestResponse.headers()["content-type"]).toBe("application/manifest+json");
     const manifest = await manifestResponse.json();
     expect(manifest.icons[0].src).toBe(touchIconHref);
@@ -78,6 +73,9 @@ test("install-offer: the manifest, the touch icon, and Chromium's own installabi
 
     const cdp = await page.context().newCDPSession(page);
     await cdp.send("Page.enable");
+    const appManifest = await cdp.send("Page.getAppManifest");
+    expect(appManifest.url).toBe(new URL(manifestHref, ON_BASE).toString());
+    expect(appManifest.errors).toEqual([]);
     const { installabilityErrors } = await cdp.send("Page.getInstallabilityErrors");
     expect(installabilityErrors).toEqual([]);
   } finally {
