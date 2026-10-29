@@ -9912,7 +9912,7 @@ mod base_path_tests {
         let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
             .await
             .expect("read the console body");
-        let html = String::from_utf8_lossy(&body);
+        let html = std::str::from_utf8(&body).expect("the console page is UTF-8");
         assert!(html.contains("Ipe Console"), "the console page");
         assert!(!html.contains("rel=\"manifest\""), "no manifest link");
         assert!(!html.contains("apple-touch-icon"), "no touch-icon link");
@@ -18451,7 +18451,7 @@ mod route_entry_cmd_tests {
                     fetch_with(router_counted(memory(), Arc::clone(&sessions)), path, &[]).await;
                 assert_eq!(status, StatusCode::NOT_FOUND, "{path}");
                 assert!(
-                    !String::from_utf8_lossy(&body).contains("page-home"),
+                    !body.windows(9).any(|w| w == b"page-home"),
                     "{path} is never the page"
                 );
                 for name in ["content-security-policy", "x-content-type-options"] {
