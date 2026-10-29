@@ -982,6 +982,7 @@ mod tests {
         assert!(!ours.contains(&HANDSHAKE_CAP_NAME));
     }
 
+    #[cfg(feature = "tokio")]
     #[test]
     fn the_mirrored_ceilings_equal_the_runtime_ones() {
         assert_eq!(BRIDGE_MAX_OUTSTANDING, crate::js_port::MAX_OUTSTANDING);

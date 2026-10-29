@@ -29,6 +29,20 @@ pub mod native_bridge;
 /// automatically tightens both the typed Ipê layer and the JS defence-in-depth guard.
 pub const SHARE_SCHEMES: &[&str] = &["http", "https"];
 
+/// The byte length of a push application key, an uncompressed P-256 point.
+pub const PUSH_APPLICATION_KEY_BYTES: usize = 65;
+
+/// The byte length of a push receiver's authentication secret.
+pub const PUSH_AUTH_SECRET_BYTES: usize = 16;
+
+/// The version every canonical push subscription text carries.
+pub const PUSH_SUBSCRIPTION_VERSION: u32 = 1;
+
+/// The characters `Ipe.Json.Encode` writes as a `\uXXXX` escape where
+/// `JSON.stringify` leaves them bare. The glue escapes them in a subscription
+/// text, so the text it hands the app is the one spelling the Ipê parser accepts.
+pub const PUSH_ENCODE_ESCAPED: [char; 5] = ['&', '<', '>', '\u{2028}', '\u{2029}'];
+
 // --- port glue JS assembly ---
 //
 // The ES module is assembled from two raw-string halves; the scheme-check snippet
@@ -428,6 +442,140 @@ const PORT_GLUE_JS_HEAD: &str = r#"  var onReceive = null;
     } catch (_e) {
       reply({ tag: "notification", ok: false, error: "unavailable" }, corId);
     }
+  }
+  // Ipe.Browser.Push: `PushSubscribe key` / `PushCurrent` / `PushUnsubscribe`.
+  // A shell serving push answers over the bridge; otherwise the page's service
+  // worker registration and its PushManager. Every call answers exactly one frame:
+  // its own event or one closed refusal code, never a throw, and never a wait on
+  // a worker that is not registered.
+  function pushSink(value, corId) {
+    var isObject = value !== null && typeof value === "object" && !Array.isArray(value);
+    var op = null;
+    var key = null;
+    if (isObject && ownKey(value, "PushSubscribe")) {
+      op = OP_PUSH_SUBSCRIBE;
+      key = value.PushSubscribe;
+    } else if (value === "PushCurrent" || (isObject && ownKey(value, "PushCurrent"))) {
+      op = OP_PUSH_CURRENT;
+    } else if (value === "PushUnsubscribe" || (isObject && ownKey(value, "PushUnsubscribe"))) {
+      op = OP_PUSH_UNSUBSCRIBE;
+    }
+    if (op === null) return false;
+    var settled = false;
+    var answer = function (frame) {
+      if (settled) return;
+      settled = true;
+      frame.tag = CAP_PUSH;
+      reply(frame, corId);
+    };
+    var refuse = function (code) { answer({ ok: false, error: code }); };
+    // The key is parsed again here, so no malformed key reaches either host.
+    var keyBytes = null;
+    if (op === OP_PUSH_SUBSCRIBE) {
+      keyBytes = pushPointBytes(key);
+      if (keyBytes === null) { refuse(REJECT_REFUSED); return true; }
+    }
+    nativeRoute(CAP_PUSH,
+      function () { pushNative(op, key, answer, refuse); },
+      function () { pushWeb(op, keyBytes, answer, refuse); },
+      refuse);
+    return true;
+  }
+  // The `n` bytes `text` spells in unpadded base64url, in its one canonical
+  // spelling, or null.
+  function pushBase64UrlBytes(text, n) {
+    if (typeof text !== "string" || text.length !== Math.ceil(n * 4 / 3)) return null;
+    if (!/^[A-Za-z0-9_-]+$/.test(text)) return null;
+    var bin;
+    try { bin = atob(text.replace(/-/g, "+").replace(/_/g, "/") + "==".slice(0, (4 - text.length % 4) % 4)); }
+    catch (_e) { return null; }
+    if (bin.length !== n) return null;
+    var bytes = new Uint8Array(n);
+    for (var i = 0; i < n; i += 1) { bytes[i] = bin.charCodeAt(i); }
+    return bufToB64url(bytes.buffer) === text ? bytes : null;
+  }
+  // An uncompressed P-256 point: 65 bytes led by the tag 0x04.
+  function pushPointBytes(text) {
+    var bytes = pushBase64UrlBytes(text, PUSH_APPLICATION_KEY_BYTES);
+    return bytes !== null && bytes[0] === 4 ? bytes : null;
+  }
+  function pushNative(op, key, answer, refuse) {
+    var args = op === OP_PUSH_SUBSCRIBE ? { applicationKey: key } : {};
+    nativeSend(op, args, function (outcome) {
+      if (outcome.reject !== undefined) { refuse(outcome.reject); return; }
+      if (op === OP_PUSH_UNSUBSCRIBE) { answer({ ok: true, event: "unsubscribed" }); return; }
+      var text = ownKey(outcome.ok, "subscription") ? outcome.ok.subscription : undefined;
+      var event = op === OP_PUSH_SUBSCRIBE ? "subscribed" : "current";
+      if (typeof text === "string" || (text === null && op === OP_PUSH_CURRENT)) {
+        answer({ ok: true, event: event, subscription: text });
+      } else {
+        refuse(REJECT_REFUSED);
+      }
+    });
+  }
+  function pushWeb(op, keyBytes, answer, refuse) {
+    var workers = typeof navigator !== "undefined" ? navigator.serviceWorker : undefined;
+    if (!workers || typeof workers.getRegistration !== "function" || typeof PushManager === "undefined") {
+      refuse(REJECT_UNAVAILABLE);
+      return;
+    }
+    Promise.resolve()
+      .then(function () { return workers.getRegistration(); })
+      .then(function (registration) {
+        var manager = registration ? registration.pushManager : null;
+        if (!manager) { refuse(REJECT_UNAVAILABLE); return null; }
+        if (op === OP_PUSH_SUBSCRIBE) return pushWebSubscribe(manager, keyBytes, answer, refuse);
+        return Promise.resolve(manager.getSubscription()).then(function (subscription) {
+          if (op === OP_PUSH_CURRENT) {
+            if (!subscription) { answer({ ok: true, event: "current", subscription: null }); return null; }
+            var text = pushWebText(subscription);
+            if (text === null) { refuse(REJECT_UNAVAILABLE); } else { answer({ ok: true, event: "current", subscription: text }); }
+            return null;
+          }
+          if (!subscription) { answer({ ok: true, event: "unsubscribed" }); return null; }
+          return Promise.resolve(subscription.unsubscribe()).then(function (done) {
+            if (done === false) { refuse(REJECT_UNAVAILABLE); } else { answer({ ok: true, event: "unsubscribed" }); }
+          });
+        });
+      })
+      .then(null, function (err) { refuse(pushWebRefusal(err)); });
+  }
+  // The browser checks the point lies on the curve before the key reaches the
+  // Push API: a key it cannot import is refused.
+  function pushWebSubscribe(manager, keyBytes, answer, refuse) {
+    var subtle = typeof crypto !== "undefined" && crypto && crypto.subtle ? crypto.subtle : null;
+    if (subtle === null || typeof subtle.importKey !== "function") { refuse(REJECT_UNAVAILABLE); return null; }
+    return Promise.resolve()
+      .then(function () { return subtle.importKey("raw", keyBytes, { name: "ECDH", namedCurve: "P-256" }, false, []); })
+      .then(
+        function () {
+          return Promise.resolve(manager.subscribe({ userVisibleOnly: true, applicationServerKey: keyBytes }))
+            .then(function (subscription) {
+              var text = pushWebText(subscription);
+              if (text === null) { refuse(REJECT_UNAVAILABLE); } else { answer({ ok: true, event: "subscribed", subscription: text }); }
+            });
+        },
+        function () { refuse(REJECT_REFUSED); }
+      );
+  }
+  // The canonical text of a browser subscription, or null when its keys are not
+  // the expected sizes. It is spelled as `Ipe.Json.Encode` spells it, which
+  // escapes five characters `JSON.stringify` leaves bare: the Ipê parser accepts
+  // only the text its own encoder renders.
+  function pushWebText(subscription) {
+    if (!subscription || typeof subscription.endpoint !== "string" || typeof subscription.getKey !== "function") return null;
+    var receiver = bufToB64url(subscription.getKey("p256dh"));
+    var auth = bufToB64url(subscription.getKey("auth"));
+    if (pushPointBytes(receiver) === null || pushBase64UrlBytes(auth, PUSH_AUTH_SECRET_BYTES) === null) return null;
+    return JSON.stringify({
+      v: PUSH_SUBSCRIPTION_VERSION, kind: "web", endpoint: subscription.endpoint, p256dh: receiver, auth: auth,
+    }).replace(PUSH_ENCODE_ESCAPED, pushEncodeEscape);
+  }
+  function pushEncodeEscape(c) {
+    return "\\u" + ("000" + c.charCodeAt(0).toString(16)).slice(-4);
+  }
+  function pushWebRefusal(err) {
+    return err && err.name === "NotAllowedError" ? REJECT_DENIED : REJECT_UNAVAILABLE;
   }
   // Ipe.Browser.Storage: `Get key` / `Set { key, value }` / `Remove key` / `Clear`
   // -> localStorage.getItem / setItem / removeItem / clear. A read resolves to a
@@ -1605,6 +1753,7 @@ const PORT_GLUE_JS_TAIL: &str = r#"    try {
     if (clipboardSink(value, corId)) return true;
     if (geolocationSink(value, corId)) return true;
     if (notificationSink(value, corId)) return true;
+    if (pushSink(value, corId)) return true;
     if (storageSink(value, corId)) return true;
     if (vibrationSink(value, corId)) return true;
     if (shareSink(value, corId)) return true;
@@ -1671,6 +1820,19 @@ fn js_string(text: &str) -> String {
     format!("\"{text}\"")
 }
 
+/// The glue's pattern over [`PUSH_ENCODE_ESCAPED`], each character named by its
+/// code point so the constant holds no escape.
+fn push_encode_escaped_js() -> String {
+    let points: Vec<String> = PUSH_ENCODE_ESCAPED
+        .into_iter()
+        .map(|c| format!("0x{:x}", u32::from(c)))
+        .collect();
+    format!(
+        "var PUSH_ENCODE_ESCAPED = new RegExp(\"[\" + String.fromCodePoint({}) + \"]\", \"gu\");",
+        points.join(", ")
+    )
+}
+
 /// The bridge constants the glue reads, each rendered from its one Rust definition.
 fn bridge_constants_js() -> String {
     use native_bridge::{
@@ -1692,6 +1854,10 @@ fn bridge_constants_js() -> String {
         format!(
             "var NOTIFICATION_TAG_PATTERN = /^[A-Za-z0-9{NOTIFICATION_TAG_PUNCTUATION}]{{0,{NOTIFICATION_TAG_MAX_BYTES}}}$/;"
         ),
+        format!("var PUSH_APPLICATION_KEY_BYTES = {PUSH_APPLICATION_KEY_BYTES};"),
+        format!("var PUSH_AUTH_SECRET_BYTES = {PUSH_AUTH_SECRET_BYTES};"),
+        format!("var PUSH_SUBSCRIPTION_VERSION = {PUSH_SUBSCRIPTION_VERSION};"),
+        push_encode_escaped_js(),
     ];
     for reject in Reject::ALL {
         lines.push(format!(
@@ -2139,6 +2305,115 @@ mod tests {
         assert!(js.contains("\"denied\""));
         assert!(js.contains("\"unavailable\""));
         assert!(!js.contains("eval("));
+    }
+
+    /// The push sink parses the application key before either host sees it,
+    /// answers a page with no worker registration unavailable at once, and checks
+    /// the point on the curve before the Push API.
+    #[test]
+    fn push_sink_checks_the_key_before_any_host_and_never_waits_on_a_worker() {
+        let js = port_glue_js();
+        assert_eq!(
+            js.matches("    if (pushSink(value, corId)) return true;\n")
+                .count(),
+            1
+        );
+        let sink = js
+            .find("  function pushSink(value, corId) {")
+            .expect("the push sink is assembled");
+        let tail = js.get(sink..).expect("the sink starts on a char boundary");
+        let recheck = tail
+            .find("if (keyBytes === null) { refuse(REJECT_REFUSED); return true; }")
+            .expect("the sink re-checks the key");
+        let route = tail
+            .find("nativeRoute(CAP_PUSH,")
+            .expect("the sink routes by the push cap");
+        assert!(recheck < route, "the key is checked before routing");
+        assert!(js.contains("return bytes !== null && bytes[0] === 4 ? bytes : null;"));
+        assert!(js.contains("return bufToB64url(bytes.buffer) === text ? bytes : null;"));
+        let import = js
+            .find("subtle.importKey(\"raw\", keyBytes, { name: \"ECDH\", namedCurve: \"P-256\" }, false, [])")
+            .expect("the browser imports the key as a P-256 point");
+        let subscribe = js
+            .find("manager.subscribe({ userVisibleOnly: true, applicationServerKey: keyBytes })")
+            .expect("the browser subscribes with the parsed key");
+        assert!(
+            import < subscribe,
+            "the point is imported before it is used"
+        );
+        assert!(js.contains("workers.getRegistration()"));
+        assert!(!js.contains("serviceWorker.ready"));
+        for (name, value) in [
+            ("PUSH_APPLICATION_KEY_BYTES", PUSH_APPLICATION_KEY_BYTES),
+            ("PUSH_AUTH_SECRET_BYTES", PUSH_AUTH_SECRET_BYTES),
+        ] {
+            let binding = format!("  var {name} = {value};\n");
+            assert_eq!(js.matches(binding.as_str()).count(), 1, "{binding}");
+        }
+        let version = format!("  var PUSH_SUBSCRIPTION_VERSION = {PUSH_SUBSCRIPTION_VERSION};\n");
+        assert_eq!(js.matches(version.as_str()).count(), 1);
+    }
+
+    /// A browser subscription text is spelled as `Ipe.Json.Encode` spells it: the
+    /// characters `JSON.stringify` leaves bare are escaped before the text
+    /// reaches the app, so an endpoint carrying `&` still parses.
+    #[test]
+    fn push_web_text_escapes_what_the_ipe_encoder_escapes() {
+        let js = port_glue_js();
+        assert_eq!(
+            js.matches(
+                r#"  var PUSH_ENCODE_ESCAPED = new RegExp("[" + String.fromCodePoint(0x26, 0x3c, 0x3e, 0x2028, 0x2029) + "]", "gu");"#
+            )
+                .count(),
+            1
+        );
+        let text = js
+            .find("  function pushWebText(subscription) {")
+            .expect("the push text renderer is assembled");
+        let body = js
+            .get(text..)
+            .expect("the renderer starts on a char boundary");
+        let end = body.find("\n  }\n").expect("the renderer ends");
+        let body = body
+            .get(..end)
+            .expect("the renderer ends on a char boundary");
+        assert_eq!(body.matches("JSON.stringify(").count(), 1);
+        assert!(body.ends_with("}).replace(PUSH_ENCODE_ESCAPED, pushEncodeEscape);"));
+        assert_eq!(
+            js.matches(r#"    return "\\u" + ("000" + c.charCodeAt(0).toString(16)).slice(-4);"#)
+                .count(),
+            1
+        );
+    }
+
+    /// [`PUSH_ENCODE_ESCAPED`] is exactly the set of characters the
+    /// `Json.Encode.encode` writer escapes beyond the plain JSON writer, and each
+    /// is spelled as the glue spells it: four lowercase hex digits.
+    #[cfg(feature = "json")]
+    #[test]
+    fn push_encode_escaped_is_the_encoder_escape_set() {
+        use crate::json_val::{JsonVal, Layout, Policy, write_json};
+        let render = |c: char, policy: Policy| {
+            let mut out = String::new();
+            write_json(
+                &mut out,
+                &JsonVal::String(c.to_string()),
+                Layout::Compact,
+                policy,
+            );
+            out
+        };
+        let differing: Vec<char> = (0..=0xFFFF_u32)
+            .filter_map(char::from_u32)
+            .filter(|c| render(*c, Policy::Encode) != render(*c, Policy::Display))
+            .collect();
+        assert_eq!(differing, PUSH_ENCODE_ESCAPED.to_vec());
+        for c in PUSH_ENCODE_ESCAPED {
+            assert_eq!(
+                render(c, Policy::Encode),
+                format!("\"\\u{:04x}\"", u32::from(c))
+            );
+        }
     }
 
     #[test]
