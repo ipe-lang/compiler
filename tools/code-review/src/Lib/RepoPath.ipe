@@ -1,4 +1,4 @@
-module Lib.RepoPath exposing (PathError(..), ReposError(..), Root, RootMap, Tag, absolutize, boundRoots, describe, describeRepos, maxRoots, nestingAgrees, parseRepos, parseRoot, parseTag, repoNameByteCeiling, repoPathByteCeiling, reposByteCeiling, reposToError, resolve, rootFix, rootFixFor, rootFromCheck, rootMap, rootOrigin, rootPath, tagName, toError)
+module Lib.RepoPath exposing (PathError(..), ReposError(..), Root, RootMap, Tag, absolutize, boundRoots, describe, describeRepos, maxRoots, nestingAgrees, parseRepos, parseRoot, parseTag, repoNameByteCeiling, repoPathByteCeiling, reposByteCeiling, reposToError, resolve, rootFix, rootCheckRefusal, rootFixFor, rootMap, rootOrigin, rootPath, tagName, toError)
 
 import Ipe.Bytes as Bytes
 import Ipe.Char as Char
@@ -306,59 +306,61 @@ parseRoot raw =
     else
         do
             path <- absolutize raw
-                        |> Task.mapError (\e -> rootRefusal (Just raw) Nothing (invalidPathProblem e))
+                        |> Task.mapError (\e -> rootRefusal (Just raw) Nothing (failureProblem NotAPath e))
             checked <- File.isDir path
                            |> Task.map Ok
                            |> Task.onError (\e -> Task.succeed (Err e))
-            rootFromCheck raw path checked
+            case rootCheckRefusal raw path checked of
+                Nothing ->
+                    Task.succeed (Root IndexRootVar path)
+
+                Just refusal ->
+                    Task.fail refusal
 
 
--- `IPE_INDEX_ROOT` resolved into `Root`, given the raw value, its resolved
+-- The `IPE_INDEX_ROOT` refusal, if any, given the raw value, its resolved
 -- path, and whether that path is a directory — or why the check itself
 -- could not say. Kept apart from `parseRoot` so the IO-failure branch, one
 -- a live directory check rarely takes, can be driven directly: the two can
--- never read as the same refusal.
-rootFromCheck : String -> Path -> Result Error Bool -> Task.Task Error Root
-rootFromCheck raw path checked =
+-- never read as the same refusal. It answers only with a refusal, never a
+-- `Root`, so no caller can mint a root without `parseRoot`'s own check.
+rootCheckRefusal : String -> Path -> Result Error Bool -> Maybe Error
+rootCheckRefusal raw path checked =
     case checked of
         Ok True ->
-            Task.succeed (Root IndexRootVar path)
+            Nothing
 
         Ok False ->
-            Task.fail (rootRefusal (Just raw) (Just path) "it is not a directory")
+            Just (rootRefusal (Just raw) (Just path) "it is not a directory")
 
         Err e ->
-            Task.fail (rootRefusal (Just raw) (Just path) (ioCheckProblem e))
+            Just (rootRefusal (Just raw) (Just path) (failureProblem CheckFailed e))
 
 
--- The problem text for a configured value that is not a valid path: the
--- underlying failure's message, pre-rendered safe since it may hold the
--- operator's own (foreign) text, before it becomes this tool's `problem`
--- string.
-invalidPathProblem : Error -> String
-invalidPathProblem e =
-    SafeText.toString
-        (SafeText.concat
-            [ SafeText.literal "is not a valid path ("
-            , SafeText.render (Error.message e)
-            , SafeText.literal ")"
-            ]
-        )
+-- The two root refusals that carry an underlying failure: the value is not
+-- a valid path, or the directory check itself failed (an IO failure, named
+-- apart from the check answering "not a directory").
+type RootFailure
+    = NotAPath
+    | CheckFailed
 
 
--- The problem text when the directory check itself fails (an IO failure),
--- named apart from the check succeeding with "not a directory": the
--- failure's message is pre-rendered safe for the same reason as
--- `invalidPathProblem`.
-ioCheckProblem : Error -> String
-ioCheckProblem e =
-    SafeText.toString
-        (SafeText.concat
-            [ SafeText.literal "could not be checked for being a directory ("
-            , SafeText.render (Error.message e)
-            , SafeText.literal ")"
-            ]
-        )
+-- The problem text for `failure`, carrying the underlying error's message
+-- pre-rendered safe, since it may hold the operator's own (foreign) text,
+-- before it becomes this tool's `problem` string. The one place a root
+-- refusal turns an error into text.
+failureProblem : RootFailure -> Error -> String
+failureProblem failure e =
+    let
+        what =
+            case failure of
+                NotAPath ->
+                    SafeText.literal "is not a valid path ("
+
+                CheckFailed ->
+                    SafeText.literal "could not be checked for being a directory ("
+    in
+    SafeText.toString (SafeText.concat [ what, SafeText.render (Error.message e), SafeText.literal ")" ])
 
 
 -- The one refusal for `IPE_INDEX_ROOT`, laid out by the shared startup
