@@ -1867,7 +1867,7 @@ fn view_chain(document: &web_sys::Document, focused: web_sys::Element) -> Option
     if focused == *root || !root.contains(Some(&focused)) {
         return None;
     }
-    let upward = std::iter::successors(Some(focused), web_sys::Element::parent_element)
+    let upward = std::iter::successors(Some(focused), |el: &web_sys::Element| el.parent_element())
         .take_while(|el| el != root)
         .map(|el| (el.get_attribute(STAMPED_ID_ATTR), el.tag_name()));
     chain_from_ancestry(upward)
