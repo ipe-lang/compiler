@@ -242,18 +242,18 @@ pub fn file_rename(src: ipe_runtime::path::Path, dst: ipe_runtime::path::Path) -
     ipe_runtime::file::file_rename(src, dst)
 }
 
-pub fn main_fst<T1: Clone, T2: Clone>(arg_0: (T1, T2)) -> T1 {
+pub fn main_fst<T1: Clone, T2: Clone>(__u_arg_0: (T1, T2)) -> T1 {
     let _ipe_recursion_guard = crate::recursion_guard();
     ({
-        let (a, b) = arg_0;
+        let (a, b) = __u_arg_0;
         a
     })
 }
 
-pub fn main_snd<T1: Clone, T2: Clone>(arg_1: (T1, T2)) -> T2 {
+pub fn main_snd<T1: Clone, T2: Clone>(__u_arg_1: (T1, T2)) -> T2 {
     let _ipe_recursion_guard = crate::recursion_guard();
     ({
-        let (a, b) = arg_1;
+        let (a, b) = __u_arg_1;
         b
     })
 }

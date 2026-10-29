@@ -246,6 +246,34 @@ pub fn validate_mobile_shape(
     pack::mobile::require_web_spa(cap).map_err(|r| CliError::Usage(crate::text::Message::relay(&r)))
 }
 
+/// Every refusal [`BundleAssembler::gate_mobile`] runs before it mints a
+/// [`GatedMobile`]: the shape gate ([`validate_mobile_shape`]), then the push
+/// configuration a mobile shell needs to register when the project accepts
+/// push.
+///
+/// # Errors
+/// [`CliError::Usage`] wrapping a [`pack::mobile::MobileRefusal`] when the
+/// shape is not a wasm-enabled `Web` app, or when the project accepts push but
+/// names no `delivery.mobile.push`.
+fn validate_mobile_pack(
+    manifest: &project::ProjectManifest,
+    built: delivery::Shape,
+) -> Result<(), CliError> {
+    validate_mobile_shape(
+        manifest.default_program().and_then(|p| p.shape),
+        built,
+        &manifest.wasm,
+    )?;
+    manifest
+        .mobile_push()
+        .map_err(|project::PushUnconfigured| {
+            CliError::Usage(crate::text::Message::relay(
+                &pack::mobile::MobileRefusal::PushUnconfigured,
+            ))
+        })?;
+    Ok(())
+}
+
 // ── Assembly seam ─────────────────────────────────────────────────────────────
 //
 // `BundleAssembler` owns the cargo-spawn and filesystem I/O that must happen
@@ -373,17 +401,13 @@ impl<'a> BundleAssembler<'a> {
     ///
     /// # Errors
     /// [`CliError::Usage`] wrapping a [`pack::mobile::MobileRefusal`] when
-    /// the shape is not a wasm-enabled `Web` app.
+    /// the shape is not a wasm-enabled `Web` app, or when the project accepts
+    /// push but names no `delivery.mobile.push`.
     pub fn gate_mobile(
         held: &'a HeldBuild,
         profile: BundleProfile,
     ) -> Result<GatedMobile<'a>, CliError> {
-        let manifest = held.root().manifest();
-        validate_mobile_shape(
-            manifest.default_program().and_then(|p| p.shape),
-            held.shape(),
-            &manifest.wasm,
-        )?;
+        validate_mobile_pack(held.root().manifest(), held.shape())?;
         Ok(GatedMobile(Self::new(held, profile)))
     }
 
@@ -512,18 +536,18 @@ impl<'a> BundleAssembler<'a> {
     /// layout, and materialise the shell on disk. Private: reached only through
     /// a [`GatedMobile`] witness, so the shape gate is already proven passed.
     ///
-    /// The shell is laid out for the manifest's mount base, the one the wasm
-    /// build bakes into the bundle's URLs; a base that changes while the build
-    /// runs is refused before any shell is written.
+    /// The shell is laid out from the manifest's [`pack::mobile::ManifestPin`],
+    /// the fields the wasm build also reads into the bundle; a pinned field that
+    /// changes while the build runs is refused before any shell is written.
     ///
     /// # Errors
     /// The wasm build's own errors; [`CliError::Usage`] wrapping
-    /// [`pack::mobile::MobileRefusal::ManifestChanged`] when the manifest's mount
-    /// base changed during the build; [`CliError::Io`] on any filesystem failure
+    /// [`pack::mobile::MobileRefusal::ManifestChanged`] when a pinned manifest
+    /// field changed during the build; [`CliError::Io`] on any filesystem failure
     /// while collecting the bundle or materialising the shell.
     fn assemble_mobile(&self, os: pack::mobile::MobileOs) -> Result<(), CliError> {
         let manifest = self.manifest();
-        let base = &manifest.delivery.browser.base;
+        let pin = pack::mobile::ManifestPin::of(manifest);
         let identity = pack::desktop::BundleIdentity::new(
             &manifest.name,
             manifest
@@ -533,7 +557,6 @@ impl<'a> BundleAssembler<'a> {
                 .as_deref(),
             None,
         );
-        let accepts = &manifest.capabilities_accept;
         let icon = manifest.icon.as_deref();
 
         // Build the `--target wasm` SPA into the project's output root, then
@@ -543,7 +566,7 @@ impl<'a> BundleAssembler<'a> {
         // authoritative rather than re-implemented here.
         let output = OutputRoot::resolve(None, &ProjectPaths::from_manifest(manifest))?;
         let manifest_path = self.held.manifest_path();
-        build_under_fixed_base(manifest_path, base, || {
+        build_under_pinned_manifest(manifest_path, &pin, || {
             build_wasm_for_mobile(manifest_path, output.path(), self.profile)
         })?;
         // The SPA is read from the owned crate; a symlinked `www/` is refused so
@@ -555,8 +578,7 @@ impl<'a> BundleAssembler<'a> {
         let bundle = pack::mobile::SpaBundle::from_www_dir(&www_dir)
             .map_err(|e| CliError::Usage(crate::text::Message::relay(&e)))?;
 
-        let layout =
-            pack::mobile::layout(os, self.profile, &identity, accepts, &bundle, icon, base)?;
+        let layout = pack::mobile::layout(os, self.profile, &identity, &pin, &bundle, icon)?;
 
         let dist = self.profile.dist_dir(&output)?.child(os.as_str())?;
         let shell_root = pack::mobile::materialise(&layout, icon, &dist)?;
@@ -698,32 +720,25 @@ pub fn build_wasm_for_mobile(
 }
 
 /// Run `build`, then re-read the manifest at `manifest_path` and refuse when its
-/// mount base is no longer `planned`: the bundle the build produced and the shell
-/// laid out for `planned` must name one mount path.
+/// pin is no longer `planned`: the bundle the build produced and the shell laid
+/// out for `planned` must be built from one manifest.
 ///
 /// # Errors
 /// `build`'s own error; the manifest re-read's error; [`CliError::Usage`]
-/// wrapping [`pack::mobile::MobileRefusal::ManifestChanged`] when the base
-/// differs.
-fn build_under_fixed_base(
+/// wrapping [`pack::mobile::MobileRefusal::ManifestChanged`], naming each
+/// pinned field that differs.
+fn build_under_pinned_manifest(
     manifest_path: &Path,
-    planned: &ipe_runtime_rust::encoding::MountBase,
+    planned: &pack::mobile::ManifestPin,
     build: impl FnOnce() -> Result<(), CliError>,
 ) -> Result<(), CliError> {
     build()?;
-    let after = project::parse_manifest(manifest_path)?
-        .delivery
-        .browser
-        .base;
-    if after == *planned {
-        return Ok(());
-    }
-    Err(CliError::Usage(text::Message::relay(
-        &pack::mobile::MobileRefusal::ManifestChanged {
-            before: planned.clone(),
-            after,
-        },
-    )))
+    let after = pack::mobile::ManifestPin::of(&project::parse_manifest(manifest_path)?);
+    planned.moved_to(&after).map_or(Ok(()), |moved| {
+        Err(CliError::Usage(text::Message::relay(
+            &pack::mobile::MobileRefusal::ManifestChanged { moved },
+        )))
+    })
 }
 
 /// The verb a mobile shell's wasm bundle is built with.
@@ -3990,32 +4005,188 @@ mod mobile_base_tests {
         MountBase::parse(raw).expect("a legal mount base")
     }
 
+    /// A project's `capabilities.accepts` list and `delivery` record.
+    type Planned<'a> = (&'a str, &'a str);
+
+    /// The accepts list of a project that accepts push and nothing else.
+    const PUSH_ONLY: &str = "[ JsPort Push ]";
+
+    /// Write a project whose `capabilities.accepts` and `delivery` are
+    /// `(accepts, delivery)`.
+    fn write_delivery(manifest: &Path, (accepts, delivery): Planned<'_>) {
+        std::fs::write(
+            manifest,
+            format!(
+                "module Package exposing (package)\n\npackage =\n    {{ name = \"x\"\n    \
+                 , capabilities = {{ accepts = {accepts} }}\n    \
+                 , delivery = {delivery}\n    }}\n"
+            ),
+        )
+        .expect("write package.ipe");
+    }
+
+    /// A `delivery` record with `basePath` `base_path`, the `servers` list
+    /// `servers` and the APNs environment `apns`.
+    fn delivery_record(base_path: &str, servers: &str, apns: &str) -> String {
+        format!(
+            "{{ browser = {{ basePath = {base_path:?} }}, servers = [ {servers} ], mobile = {{ \
+             bundleId = \"com.example.app\", push = {{ apns = {apns}, fcm = {{ \
+             projectId = \"example-app\", applicationId = \"1:123:android:abc\", \
+             apiKey = \"AIza-key_1\", senderId = \"123\" }} }} }} }}"
+        )
+    }
+
+    /// The pin of the manifest at `manifest`, as the pack captures it.
+    fn pin_of(manifest: &Path) -> pack::mobile::ManifestPin {
+        pack::mobile::ManifestPin::of(&project::parse_manifest(manifest).expect("manifest"))
+    }
+
+    /// Plan the pack for `planned`, let the stub build rewrite the manifest
+    /// to `rebuilt`, and return the pack's verdict.
+    fn pack_across_edit(
+        test_name: &str,
+        planned: Planned<'_>,
+        rebuilt: Planned<'_>,
+    ) -> Result<(), CliError> {
+        let manifest = write_project(test_name, "/");
+        write_delivery(&manifest, planned);
+        let pin = pin_of(&manifest);
+        let result = build_under_pinned_manifest(&manifest, &pin, || {
+            write_delivery(&manifest, rebuilt);
+            Ok(())
+        });
+        let _ = std::fs::remove_dir_all(manifest.parent().expect("project root"));
+        result
+    }
+
+    /// Whether `result` is the manifest-changed refusal naming exactly `fields`.
+    fn refused_naming(result: &Result<(), CliError>, fields: &[pack::mobile::PinnedField]) -> bool {
+        let shown_keys = fields
+            .iter()
+            .map(|field| format!("`{}`", field.manifest_key()))
+            .collect::<Vec<_>>()
+            .join(", ");
+        matches!(result, Err(CliError::Usage(shown))
+            if shown.contains(&format!("error: {shown_keys} changed in package.ipe")))
+    }
+
     /// The stub build rewrites the manifest's base; the pack refuses, naming
-    /// both bases, before any shell is laid out.
+    /// the base, before any shell is laid out.
     #[test]
     fn mobile_pack_refuses_manifest_changed_during_build() {
         let manifest = write_project("changed", "/app");
-        let planned = project::parse_manifest(&manifest)
-            .expect("manifest")
-            .delivery
-            .browser
-            .base;
-        assert_eq!(planned, base("/app"));
+        let planned = pin_of(&manifest);
+        assert_eq!(planned.base(), &base("/app"));
 
-        let result = build_under_fixed_base(&manifest, &planned, || {
+        let result = build_under_pinned_manifest(&manifest, &planned, || {
             write_base_path(&manifest, "/v2");
             Ok(())
         });
         let _ = std::fs::remove_dir_all(manifest.parent().expect("project root"));
 
-        let refusal = text::Message::relay(&pack::mobile::MobileRefusal::ManifestChanged {
-            before: base("/app"),
-            after: base("/v2"),
-        });
         assert!(
-            matches!(&result, Err(CliError::Usage(shown)) if *shown == refusal),
+            refused_naming(&result, &[pack::mobile::PinnedField::BasePath]),
             "a base changed during the build must be refused, got {result:?}"
         );
+    }
+
+    /// A pinned field the stub build rewrites is refused by name, and only
+    /// that field is named.
+    #[test]
+    fn mobile_pack_refuses_each_pinned_field_changed_during_build() {
+        use pack::mobile::PinnedField;
+        let planned = delivery_record("/app", "\"https://api.example\"", "Production");
+        let cases = [
+            (
+                "pin_base",
+                PUSH_ONLY,
+                delivery_record("/v2", "\"https://api.example\"", "Production"),
+                PinnedField::BasePath,
+            ),
+            (
+                "pin_servers",
+                PUSH_ONLY,
+                delivery_record("/app", "\"https://other.example\"", "Production"),
+                PinnedField::Servers,
+            ),
+            (
+                "pin_push",
+                PUSH_ONLY,
+                delivery_record("/app", "\"https://api.example\"", "Development"),
+                PinnedField::Push,
+            ),
+            (
+                "pin_accepts",
+                "[ JsPort Push, JsPort Geolocation ]",
+                planned.clone(),
+                PinnedField::Accepts,
+            ),
+        ];
+        for (test_name, accepts, rebuilt, field) in cases {
+            let result = pack_across_edit(
+                test_name,
+                (PUSH_ONLY, planned.as_str()),
+                (accepts, rebuilt.as_str()),
+            );
+            assert!(
+                refused_naming(&result, &[field]),
+                "{field:?} changed during the build must be refused by name, got {result:?}"
+            );
+        }
+    }
+
+    /// A manifest rewritten with the same pinned fields passes.
+    #[test]
+    fn mobile_pack_accepts_a_rewrite_that_moves_no_pinned_field() {
+        let planned = delivery_record("/app", "\"https://api.example\"", "Production");
+        let result = pack_across_edit(
+            "pin_unmoved",
+            (PUSH_ONLY, planned.as_str()),
+            (PUSH_ONLY, planned.as_str()),
+        );
+        assert!(result.is_ok(), "{result:?}");
+    }
+
+    /// Read a wasm-solo project accepting push whose `delivery.mobile` is the
+    /// record `mobile`, through the manifest reader the pack reads.
+    fn push_project(test_name: &str, mobile: &str) -> project::ProjectManifest {
+        let manifest = write_project(test_name, "/");
+        std::fs::write(
+            &manifest,
+            format!(
+                "module Package exposing (package)\n\npackage =\n    {{ name = \"x\"\n    \
+                 , wasm = On {{ mode = Solo }}\n    \
+                 , capabilities = {{ accepts = [ JsPort Push ] }}\n    \
+                 , delivery = {{ mobile = {mobile} }}\n    }}\n"
+            ),
+        )
+        .expect("write package.ipe");
+        let parsed = project::parse_manifest(&manifest);
+        let _ = std::fs::remove_dir_all(manifest.parent().expect("project root"));
+        parsed.expect("a push-accepting manifest reads")
+    }
+
+    /// A mobile pack of a project that accepts push but names no
+    /// `delivery.mobile.push` is refused by the gate itself; the same project
+    /// with identifiers passes.
+    #[test]
+    fn mobile_gate_refuses_accepted_push_without_identifiers() {
+        let unconfigured = push_project("push_unconfigured", "{ bundleId = \"com.example.app\" }");
+        let result = validate_mobile_pack(&unconfigured, delivery::Shape::Web);
+        let refusal = text::Message::relay(&pack::mobile::MobileRefusal::PushUnconfigured);
+        assert!(
+            matches!(&result, Err(CliError::Usage(shown)) if *shown == refusal),
+            "accepted push without identifiers must be refused, got {result:?}"
+        );
+
+        let configured = push_project(
+            "push_configured",
+            "{ bundleId = \"com.example.app\", push = { apns = Development, fcm = { \
+             projectId = \"example-app\", applicationId = \"1:123:android:abc\", \
+             apiKey = \"AIza-key_1\", senderId = \"123\" } } }",
+        );
+        let result = validate_mobile_pack(&configured, delivery::Shape::Web);
+        assert!(result.is_ok(), "{result:?}");
     }
 
     /// An unchanged base passes once the build has run.
@@ -4023,7 +4194,7 @@ mod mobile_base_tests {
     fn mobile_pack_accepts_an_unchanged_base_after_the_build() {
         let manifest = write_project("unchanged", "/app");
         let built = std::cell::Cell::new(false);
-        let result = build_under_fixed_base(&manifest, &base("/app"), || {
+        let result = build_under_pinned_manifest(&manifest, &pin_of(&manifest), || {
             built.set(true);
             Ok(())
         });

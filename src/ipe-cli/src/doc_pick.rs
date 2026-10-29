@@ -135,14 +135,34 @@ pub fn human_lines(miss: &DocMiss) -> Vec<String> {
         .iter()
         .enumerate()
         .map(|(at, hit)| {
-            let index = format!("{:>index_width$}", at.saturating_add(1));
-            let term = format!("{:<term_width$}", hit.term.as_str());
+            let index = pad_left(&at.saturating_add(1).to_string(), index_width);
+            let term = pad_right(hit.term.as_str(), term_width);
             text::cli_doc_suggestion_line(&index, &term, &hit.summary, &hit.kind)
                 .to_string()
                 .trim_end()
                 .to_owned()
         })
         .collect()
+}
+
+/// `text` preceded by spaces up to `width` characters.
+///
+/// A `repeat`, never a runtime format width: a width past `u16::MAX` panics
+/// the formatter, and a term's length is author input.
+fn pad_left(text: &str, width: usize) -> String {
+    let mut out = " ".repeat(width.saturating_sub(text.chars().count()));
+    out.push_str(text);
+    out
+}
+
+/// `text` followed by spaces up to `width` characters.
+///
+/// The counterpart of [`pad_left`], with the same reason to avoid a runtime
+/// format width.
+fn pad_right(text: &str, width: usize) -> String {
+    let mut out = String::from(text);
+    out.push_str(&" ".repeat(width.saturating_sub(text.chars().count())));
+    out
 }
 
 /// The person-facing text of a miss: the not-found line, then the header,
@@ -403,6 +423,28 @@ mod tests {
             "{text:?}"
         );
         assert!(!miss_text(&miss(false)).contains("More entries"));
+    }
+
+    #[test]
+    fn a_term_past_the_formatter_width_limit_still_aligns() {
+        let long = "t".repeat(70_000);
+        let wide = DocMiss {
+            hits: vec![
+                hit(&long, DocKind::Topic, "Long"),
+                hit("Ipe.List.map", DocKind::Symbol, "Apply a function"),
+            ],
+            ..miss(false)
+        };
+        let lines = human_lines(&wide);
+        assert_eq!(lines.len(), 2);
+        let short = lines.get(1).map_or("", String::as_str);
+        let padded = format!("Ipe.List.map{}", " ".repeat(70_000 - 12));
+        assert_eq!(
+            short,
+            format!("  2. ipe doc {padded}  Apply a function (symbol)")
+        );
+        assert_eq!(pad_left("7", 3), "  7");
+        assert_eq!(pad_right("ab", 1), "ab");
     }
 
     #[test]

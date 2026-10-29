@@ -20,7 +20,7 @@ pub use builtin_type::{
 };
 
 mod capability;
-pub use capability::{Capability, ElementCapability, UnknownCapability, WebCapability};
+pub use capability::{BridgeCap, Capability, ElementCapability, UnknownCapability, WebCapability};
 
 pub mod css_value_safety;
 pub use css_value_safety::css_value_is_safe;
@@ -1414,6 +1414,54 @@ pub const fn container_first_kernels_take_a_function_first(kernels: &[StdlibKern
 const _: () = assert!(
     container_first_kernels_take_a_function_first(StdlibKernel::ALL),
     "an ArgOrder::ContainerFirst kernel must have arity 2 and an Ipê scheme `(a -> b) -> container -> r`",
+);
+
+/// Whether `name` carries an `_` followed by an ASCII letter or digit, and does not start with `__u_`.
+///
+/// The backend emits a user local with no `_` verbatim (a keyword gaining only
+/// trailing `_`s), and every other user local behind the `__u_` escape (see
+/// `naming::local_ident` in `ipe_backend_rust`). A name of this shape is outside
+/// both images, so no user binder can shadow it in the Rust value namespace.
+#[must_use]
+pub const fn outside_user_local_namespace(name: &str) -> bool {
+    if let [b'_', b'_', b'u', b'_', ..] = name.as_bytes() {
+        return false;
+    }
+    let mut rest = name.as_bytes();
+    while let Some((byte, tail)) = rest.split_first() {
+        if *byte == b'_'
+            && let Some(next) = tail.first()
+            && next.is_ascii_alphanumeric()
+        {
+            return true;
+        }
+        rest = tail;
+    }
+    false
+}
+
+/// Whether every kernel runtime name in `kernels` is [`outside_user_local_namespace`].
+///
+/// A kernel call is emitted as its bare runtime name, so a user local spelled
+/// the same would shadow it: an `E0618` at cargo time, or a silent wrong call
+/// when the local has the kernel's own type.
+#[must_use]
+pub const fn runtime_names_outside_user_locals(kernels: &[StdlibKernel]) -> bool {
+    let mut rest = kernels;
+    while let Some((kernel, tail)) = rest.split_first() {
+        if !outside_user_local_namespace(kernel.identity().emit) {
+            return false;
+        }
+        rest = tail;
+    }
+    true
+}
+
+// IPE-RUST-AUDIT:ACCEPTED (Arthur Maciel) — compile-time `const` assertion (not a runtime panic); fails the BUILD if a kernel runtime name could be spelled by an emitted user local, which would shadow the bare kernel call [ledger #boundary]
+#[allow(clippy::assertions_on_constants)] // the constant IS the tripwire
+const _: () = assert!(
+    runtime_names_outside_user_locals(StdlibKernel::ALL),
+    "a kernel runtime name must carry an `_` followed by a letter or digit and must not start with `__u_`",
 );
 
 /// Whether every `CloneOk` / `MapperFrontierOpen` tag in `kernels` agrees with [`mapper_frontier_open`].
@@ -18040,6 +18088,49 @@ mod tests {
             UNWIRED_VARIANTS.len(),
             StdlibKernel::COUNT,
         );
+    }
+
+    /// The unwired aliases are emitted bare too, so their runtime names keep
+    /// clear of the user-local images exactly as the wired rows do.
+    #[test]
+    fn unwired_runtime_names_are_outside_user_locals() {
+        for &excluded in UNWIRED_VARIANTS {
+            assert!(
+                super::outside_user_local_namespace(excluded.identity().emit),
+                "{excluded:?} has a runtime name a user local can spell"
+            );
+        }
+        assert!(super::runtime_names_outside_user_locals(StdlibKernel::ALL));
+    }
+
+    /// Each user-local image shape is refused, one step past each accepted
+    /// kernel spelling.
+    #[test]
+    fn user_local_images_are_refused_as_runtime_names() {
+        for name in [
+            "string_from_int",
+            "io_println",
+            "a_b",
+            "x_1",
+            "__ipe_bind_0",
+        ] {
+            assert!(super::outside_user_local_namespace(name), "{name}");
+        }
+        for name in [
+            "",
+            "_",
+            "curry2",
+            "count",
+            "type_",
+            "match__",
+            "x_",
+            "x__",
+            "__u_x",
+            "__u__x",
+            "__u_string_from_int",
+        ] {
+            assert!(!super::outside_user_local_namespace(name), "{name}");
+        }
     }
 
     /// Every excluded variant carries no runtime-module requirement, closing the

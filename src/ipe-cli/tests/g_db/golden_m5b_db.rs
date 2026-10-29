@@ -155,6 +155,19 @@ fn db_query_decode() {
     assert_runs_and_matches_oracle("db_query_decode");
 }
 
+// ── A flat `do` inside a transaction lambda ──────────────────────────────────
+
+/// Thirty named binds in one `do` inside `Db.withTransaction`, every bind read
+/// by the final statement, emit and build: a long sequence costs no IR depth
+/// per bind, since each continuation's capture clones are one flat node.
+/// Output: `"465"`.
+///
+/// Sanctioned divergence: Ipê emits Rust+sqlx; oracle is Ipê's own output.
+#[test]
+fn do_transaction_fan_in() {
+    assert_runs_and_matches_oracle("do_transaction_fan_in");
+}
+
 // ── Db.Decode.andThen — function-first surface, decoder-first runtime ─────────
 
 /// `Db.Decode.andThen (\n -> Db.Decode.succeed (String.toUpper n))
@@ -546,9 +559,9 @@ fn db_store_starts_with() {
 /// no I/O beyond stdout). Parses a valid Postgres DSN carrying a password and
 /// prints its `Driver`, host, default TLS mode, and REDACTED render — the
 /// password sentinel `hunter2SENTINEL` NEVER appears (it is a `Secret`, rendered
-/// as `[redacted]`). Also proves: `sslmode=disable` is a hard typed `Err`
-/// (fail-closed TLS); an omitted sslmode defaults to `require` (secure default);
-/// and `Dsn.build` from typed parts runs the same validators. This is the SEAL
+/// as `[redacted]`). Also proves: `sslmode=disable` and `sslmode=require` are
+/// hard typed `Err`s (fail-closed TLS); an omitted sslmode defaults to
+/// `verify-full` (secure default); and `Dsn.build` from typed parts runs the same validators. This is the SEAL
 /// for the reserved `Dsn` type + the `Db.Dsn.*` parse kernels: the emitted crate
 /// must build and run, and the sentinel must be absent from stdout.
 ///

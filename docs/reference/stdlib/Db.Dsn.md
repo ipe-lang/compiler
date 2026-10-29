@@ -30,9 +30,25 @@ free string.
 
 ## `TlsMode`
 
-The transport-security posture. `Require` is the secure default when a DSN
-omits an explicit mode; `Disable` is rejected by every constructor (a `Dsn` is
-never a proof of a cleartext transport).
+The transport-security posture: TLS with the server certificate verified.
+`VerifyFull` (`sslmode=verify-full`) checks that the certificate chains to a
+trusted root and names the dialled host; it is the default when a DSN names
+no `sslmode`. `VerifyCa` (`sslmode=verify-ca`) checks the chain but not the
+host name, so it is weaker: any certificate from a trusted root is accepted
+for any host. Every mode that accepts an unverified server or a cleartext
+transport (`sslmode=require`, `prefer`, `allow`, `disable`) is rejected by
+every constructor, so a `Dsn` is a proof that its connection authenticates
+the server.
+
+The server certificate must chain to a root in the Mozilla root set the
+runtime is built with, or to a root the process environment names in
+`PGSSLROOTCERT`, which the PostgreSQL driver reads; the operating system's
+certificate store is not consulted, so a certificate from any other private
+certificate authority is refused. Under the default deny-private dial policy,
+where the runtime cannot route a connection through its pinned relay (on
+platforms other than Unix), a `VerifyFull` connection to a named host is
+refused; name the server by an IP address its certificate names, or use
+`VerifyCa`.
 
 ## `parse`
 
@@ -42,8 +58,8 @@ parse : String -> Result Error Dsn
 
 `parse raw` — THE seal from a full DSN URL string. Returns `Err` on any
 invalid shape: an unparseable string, an unknown driver, a missing host for a
-network driver, an out-of-range port, an explicit `sslmode=disable`, an unknown
-`sslmode`, a smuggled/duplicated credential parameter, a control-character
+network driver, an out-of-range port, an `sslmode` that does not verify the
+server (`require`, `prefer`, `allow`, `disable`), an unknown `sslmode`, a smuggled/duplicated credential parameter, a control-character
 component, or a PostgreSQL user name or password that may run past the URL's
 authority. An `@` anywhere after the host (in the path or a query value) is
 refused the same way; write it as `%40`. The user name, password, and database
@@ -62,8 +78,7 @@ build :
 `build parts` — THE seal from typed parts, enforcing the invariants `parse`
 does on literal parts. Preferred over `parse` when the parts are already
 structured (there is no string to mis-escape). The `password` is a `Secret` on
-the way in; `Disable`
-TLS and an out-of-range port are rejected. The `database`, `user`, and
+the way in; an out-of-range port is rejected. The `database`, `user`, and
 `password` are taken literally and percent-encoded into the connection URL, so a
 `?`, `&`, `#`, `@`, `/`, or `%` in them cannot add a parameter such as `sslmode`.
 Each is capped at 512 bytes, and a `password` needs a `user`.

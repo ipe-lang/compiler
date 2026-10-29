@@ -636,22 +636,10 @@ where
         }
     };
     let status = resp.status().as_u16() as i64;
-    let mut headers = HashMap::new();
-    for (k, v) in resp.headers() {
-        if let Ok(s) = v.to_str() {
-            // MIME-case parity: reqwest's `HeaderName::as_str()`
-            // ALWAYS returns lower-case, but canonical storage expects
-            // headers canonicalised (`net/http.Header` always is) — a Ipê
-            // program's `Dict.get "Content-Type" resp.headers` must find the
-            // key. Route through the SAME `canonical_header` the Server
-            // inbound path uses (its  table is pinned by
-            // `canonical_header_matches_go_canonical_mime_key`).
-            headers.insert(
-                crate::http_header::canonical_header(k.as_str()),
-                s.to_string(),
-            );
-        }
-    }
+    let headers = match response_header_dict(&resp) {
+        Ok(headers) => headers,
+        Err(refusal) => return IpeResult::Err(refusal.response_text().to_owned().into()),
+    };
     let body = match read_body_capped::<E>(resp).await {
         IpeResult::Ok(b) => b,
         IpeResult::Err(e) => return IpeResult::Err(e),
@@ -661,6 +649,21 @@ where
         body,
         headers,
     })
+}
+
+/// The program-visible header dict of `resp`, through the shared header fold.
+///
+/// Keys take the canonical case the Server request dict uses, so
+/// `Dict.get "Content-Type" resp.headers` finds the key reqwest lower-cases.
+#[cfg(not(target_arch = "wasm32"))]
+fn response_header_dict(
+    resp: &reqwest::Response,
+) -> Result<HashMap<String, String>, crate::http_header::HeaderRefusal> {
+    crate::http_header::response_headers(
+        resp.headers()
+            .iter()
+            .map(|(name, value)| (name.as_str(), value.as_bytes())),
+    )
 }
 
 /// Default cap on a buffered HTTP response body (`Http.get`/`post`/`request`):
@@ -936,6 +939,8 @@ enum FetchFailure {
     /// The browser cannot build the `AbortController` that carries the
     /// request deadline, so the request is refused rather than sent unbounded.
     DeadlineUnavailable,
+    /// The response headers have no one program-visible reading.
+    ResponseHeaders(crate::http_header::HeaderRefusal),
 }
 
 #[cfg(any(test, all(target_arch = "wasm32", feature = "wasm-client")))]
@@ -960,6 +965,7 @@ impl std::fmt::Display for FetchFailure {
             Self::DeadlineUnavailable => {
                 f.write_str("http: the browser cannot arm the request deadline")
             }
+            Self::ResponseHeaders(refusal) => f.write_str(refusal.response_text()),
         }
     }
 }
@@ -985,7 +991,8 @@ impl FetchFailure {
             | Self::NotAResponse
             | Self::NoWindow
             | Self::HeadersUnavailable
-            | Self::DeadlineUnavailable => text.into(),
+            | Self::DeadlineUnavailable
+            | Self::ResponseHeaders(_) => text.into(),
         }
     }
 }
@@ -1074,18 +1081,28 @@ async fn do_fetch<E: From<String> + FromLimitExceeded + FromIpeError + 'static>(
 
     let status = i64::from(resp.status());
 
-    let mut out_headers = HashMap::new();
+    // The browser has already combined repeated headers, so the fold sees each
+    // name once; it still applies the arity table and the byte check.
+    let mut pairs: Vec<(String, String)> = Vec::new();
     if let Ok(Some(iter)) = js_sys::try_iter(resp.headers().as_ref()) {
         for entry in iter.flatten() {
             if let Ok(pair) = entry.dyn_into::<js_sys::Array>() {
                 let k = pair.get(0).as_string().unwrap_or_default();
                 let v = pair.get(1).as_string().unwrap_or_default();
                 if !k.is_empty() {
-                    out_headers.insert(crate::http_header::canonical_header(&k), v);
+                    pairs.push((k, v));
                 }
             }
         }
     }
+    let out_headers = match crate::http_header::response_headers(
+        pairs.iter().map(|(k, v)| (k.as_str(), v.as_bytes())),
+    ) {
+        Ok(headers) => headers,
+        Err(refusal) => {
+            return IpeResult::Err(FetchFailure::ResponseHeaders(refusal).into_error());
+        }
+    };
 
     // Stream the body incrementally with a running cap so an untrusted (or
     // upstream-controlled) response is BOUNDED BY CONSTRUCTION — never fully
@@ -1246,6 +1263,7 @@ mod tests {
             FetchFailure::NoWindow,
             FetchFailure::HeadersUnavailable,
             FetchFailure::DeadlineUnavailable,
+            FetchFailure::ResponseHeaders(crate::http_header::HeaderRefusal::DuplicateSingleton),
         ]
     }
 
@@ -1268,6 +1286,7 @@ mod tests {
             FetchFailure::NoWindow => 10,
             FetchFailure::HeadersUnavailable => 11,
             FetchFailure::DeadlineUnavailable => 12,
+            FetchFailure::ResponseHeaders(_) => 13,
         }
     }
 
@@ -1332,8 +1351,10 @@ mod tests {
     fn every_fetch_failure_text_is_fixed() {
         let failures = every_fetch_failure();
         let positions: Vec<usize> = failures.iter().map(fetch_failure_position).collect();
-        let expected: Vec<usize> =
-            (0..=fetch_failure_position(&FetchFailure::DeadlineUnavailable)).collect();
+        let expected: Vec<usize> = (0..=fetch_failure_position(&FetchFailure::ResponseHeaders(
+            crate::http_header::HeaderRefusal::DuplicateSingleton,
+        )))
+            .collect();
         assert_eq!(positions, expected, "every variant appears once, in order");
         for failure in &failures {
             let shown = failure.to_string();
@@ -1476,33 +1497,6 @@ mod tests {
             assert!(!shown.contains(planted), "{planted} leaked: {shown}");
         }
         assert!(shown.contains("status: 200"), "{shown}");
-    }
-
-    /// Wiring seal: the response-header collection loop must route
-    /// every key through `http_header::canonical_header` (reqwest's
-    /// `HeaderName::as_str()` is always lower-case;  `net/http.Header` is
-    /// always canonical — `Dict.get "Content-Type"` parity depends on it).
-    /// `do_request` needs a live round-trip to test end-to-end, so this pins
-    /// the call's PRESENCE at the source level; the transform itself is
-    /// proven by `http_header`'s own  table test.
-    #[test]
-    fn response_header_loop_canonicalises_keys() {
-        let src = include_str!("http_client.rs");
-        let loop_marker = "for (k, v) in resp.headers()";
-        let start = src.find(loop_marker);
-        assert!(start.is_some(), "response-header loop not found");
-        let Some(start) = start else { return };
-        // Window sized to comfortably cover the loop body INCLUDING its doc
-        // comment (the canonicalisation call sits ~700 bytes past the marker).
-        let window = &src[start..src.len().min(start + 1600)];
-        assert!(
-            window.contains("canonical_header(k.as_str())"),
-            "response-header keys must be canonicalised (MIME canonical case)"
-        );
-        assert!(
-            !window.contains("insert(k.as_str().to_string()"),
-            "raw lower-case header-key insert reintroduced (#33 §6.1 regression)"
-        );
     }
 
     #[test]
@@ -2058,6 +2052,65 @@ mod tests {
                 }
             });
             addr
+        }
+
+        /// The header dict `reply` reads as, through the response fold.
+        async fn headers_of(
+            reply: &'static str,
+        ) -> Result<std::collections::HashMap<String, String>, crate::http_header::HeaderRefusal>
+        {
+            let addr = fixed_reply(reply).await;
+            let client = reqwest::Client::builder()
+                .no_proxy()
+                .build()
+                .expect("client builds");
+            let resp = client
+                .get(format!("http://{addr}/"))
+                .send()
+                .await
+                .expect("loopback reply");
+            super::super::response_header_dict(&resp)
+        }
+
+        /// A response repeating `Content-Type` is refused with a fixed text that
+        /// names no header; one copy reads under its canonical key.
+        #[tokio::test]
+        async fn response_duplicate_content_type_refused() {
+            const TWICE: &str = "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Type: text/html\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+            const ONCE: &str = "HTTP/1.1 200 OK\r\ncontent-type: text/plain\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+            let refused = headers_of(TWICE).await;
+            assert_eq!(
+                refused,
+                Err(crate::http_header::HeaderRefusal::DuplicateSingleton)
+            );
+            let text = crate::http_header::HeaderRefusal::DuplicateSingleton.response_text();
+            assert!(!text.contains("Content-Type"), "refusal names no header");
+            let once = headers_of(ONCE).await.expect("one copy is admitted");
+            assert_eq!(
+                once.get("Content-Type").map(String::as_str),
+                Some("text/plain")
+            );
+        }
+
+        /// A response header value outside visible ASCII refuses the response,
+        /// never vanishes from the dict.
+        #[tokio::test]
+        async fn response_non_ascii_header_refused() {
+            const NON_ASCII: &str = "HTTP/1.1 200 OK\r\nX-Note: caf\u{e9}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+            assert_eq!(
+                headers_of(NON_ASCII).await,
+                Err(crate::http_header::HeaderRefusal::NotVisibleAscii)
+            );
+        }
+
+        /// List headers combine in arrival order; repeated `Set-Cookie` keeps
+        /// the last copy.
+        #[tokio::test]
+        async fn response_list_headers_combine_and_set_cookie_keeps_last() {
+            const REPLY: &str = "HTTP/1.1 200 OK\r\nVia: 1.1 a\r\nVia: 1.1 b\r\nSet-Cookie: a=1\r\nSet-Cookie: b=2\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+            let headers = headers_of(REPLY).await.expect("list copies are admitted");
+            assert_eq!(headers.get("Via").map(String::as_str), Some("1.1 a, 1.1 b"));
+            assert_eq!(headers.get("Set-Cookie").map(String::as_str), Some("b=2"));
         }
 
         /// The body `reply` carries, read under a `cap`-byte ceiling.

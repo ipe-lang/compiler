@@ -16,6 +16,7 @@ pub mod decoder_pipeline_gate;
 mod env;
 pub mod link;
 pub mod module_classify;
+pub mod reach;
 pub mod ref_index;
 pub mod rename;
 mod resolve;

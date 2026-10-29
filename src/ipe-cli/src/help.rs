@@ -648,11 +648,11 @@ fn render_group(g: &Group, p: &Palette) -> String {
         let pad = name_w.saturating_sub(entry.name().len());
         let _ = writeln!(
             out,
-            "  {}ipe {}{}{:pad$}  {}{}{}",
+            "  {}ipe {}{}{}  {}{}{}",
             p.yellow,
             entry.name(),
             p.reset,
-            "",
+            " ".repeat(pad),
             p.dim,
             entry.text().summary,
             p.reset,
@@ -705,11 +705,11 @@ fn render_top_level(p: &Palette) -> String {
             if find(name).is_none() && find_group(name).is_none() {
                 continue;
             }
-            let pad = name_w - name.len();
+            let pad = " ".repeat(name_w.saturating_sub(name.len()));
             let _ = writeln!(
                 out,
-                "  {}ipe {}{}{:pad$}  {}--help{}",
-                p.yellow, name, p.reset, "", p.dim, p.reset,
+                "  {}ipe {}{}{pad}  {}--help{}",
+                p.yellow, name, p.reset, p.dim, p.reset,
             );
         }
     }
@@ -878,11 +878,8 @@ fn render_command(cmd: Entry, p: &Palette) -> String {
         let _ = writeln!(out, "{}:", help_page::options_heading());
         let width = text.options.iter().map(|o| o.flag.len()).max().unwrap_or(0);
         for opt in &text.options {
-            let _ = writeln!(
-                out,
-                "  {:<width$}  {}{}{}",
-                opt.flag, p.dim, opt.desc, p.reset
-            );
+            let pad = " ".repeat(width.saturating_sub(opt.flag.chars().count()));
+            let _ = writeln!(out, "  {}{pad}  {}{}{}", opt.flag, p.dim, opt.desc, p.reset);
         }
     }
     out.push('\n');

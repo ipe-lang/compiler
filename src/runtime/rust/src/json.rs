@@ -3,9 +3,9 @@
 // Generic over E for error type.
 use super::*;
 
-pub type JsonVal = serde_json::Value;
+pub use crate::json_val::{JsonMap, JsonVal};
 
-// Compact JSON text; `to_string` on a `serde_json::Value` is infallible.
+// Compact JSON text; a `JsonVal`'s `Display` is infallible at any depth.
 crate::stringify::show_row!("Json", Value, [] JsonVal, |j| j.to_string());
 
 impl crate::retained::RetainedBytes for JsonVal {
@@ -125,296 +125,23 @@ pub fn decode_err_str<E: From<String>, T>(s: String) -> IpeResult<E, T> {
 }
 
 // --- Encode ---
+/// `Json.Encode.encode`: `indent` 0 (or below) is compact JSON, `N` is
+/// `N`-space pretty JSON with the width saturating at
+/// [`crate::json_val::MAX_JSON_INDENT`] (an input-chosen width must not size
+/// the output per line). Strings are HTML-escaped and floats take the
+/// [`crate::json_val::go_format_f64`] form. Infallible at any depth.
 pub fn json_enc_encode(indent: i64, val: JsonVal) -> String {
-    // serde_json never fails on a well-formed Value; unwrap_or_default preserves
-    // the total `encode : Int -> Value -> String` (pure, no Task wrapper).
-    // indent=0 → compact, indent=N → N-space pretty.
-    //
-    // `GoFormatter` wraps the inner formatter and overrides exactly two hooks:
-    //   * string fragments are HTML-escaped (`<`,`>`,`&`,U+2028,U+2029), which
-    //     serde_json does not do by default;
-    //   * f64 values are reshaped (decimal vs. exponent threshold, `e±NN`
-    //     exponent shape) rather than serde's Ryū form.
-    let mut buf = Vec::new();
-    if indent > 0 {
-        // PrettyFormatter::with_indent honours the exact N-space indent;
-        // `to_string_pretty` always emits 2 spaces and would diverge for indent ≠ 2.
-        //
-        // Clamp the indent width: `indent` is attacker-supplyable (e.g. a value
-        // threaded from request input), and an unbounded `str::repeat` would let
-        // a huge count blow up memory / CPU per emitted line. 16 spaces is far
-        // beyond any legitimate pretty-print width; larger requests saturate to it.
-        const MAX_JSON_INDENT: usize = 16;
-        let indent_width = (indent as usize).min(MAX_JSON_INDENT);
-        let indent_string = " ".repeat(indent_width);
-        let inner = serde_json::ser::PrettyFormatter::with_indent(indent_string.as_bytes());
-        let mut ser = serde_json::Serializer::with_formatter(&mut buf, GoFormatter(inner));
-        serde::Serialize::serialize(&val, &mut ser).ok();
+    use crate::json_val::{Layout, MAX_JSON_INDENT, Policy, write_json};
+    let layout = if indent > 0 {
+        Layout::Pretty(usize::try_from(indent).map_or(MAX_JSON_INDENT, |w| w.min(MAX_JSON_INDENT)))
     } else {
-        let mut ser = serde_json::Serializer::with_formatter(
-            &mut buf,
-            GoFormatter(serde_json::ser::CompactFormatter),
-        );
-        serde::Serialize::serialize(&val, &mut ser).ok();
-    }
-    String::from_utf8(buf).unwrap_or_default()
+        Layout::Compact
+    };
+    let mut out = String::new();
+    write_json(&mut out, &val, layout, Policy::Encode);
+    out
 }
 
-/// Format an `f64` for JSON serialisation: exponent ('e') form only when the
-/// magnitude is `< 1e-6` or `>= 1e21`; every other finite value uses plain
-/// decimal ('f') form. Both forms use the shortest round-tripping digit sequence.
-///   * 'f' form: `format!("{f}")` — Rust Display never emits an exponent.
-///   * 'e' form: reshape `format!("{f:e}")` into `e±NN` exponent (`+`/`-` sign
-///     always present; positive exponents zero-padded to ≥2 digits; negative
-///     exponents use minimum digits — `e-0N` → `e-N`).
-fn go_format_f64(f: f64) -> String {
-    if !f.is_finite() {
-        // serde_json routes NaN/∞ to `write_null` before `write_f64`, so this
-        // is unreachable on the real path; the finite fallback keeps the helper
-        // total (no panic) regardless.
-        return "0".to_string();
-    }
-    let abs = f.abs();
-    // Exponent form when `abs < 1e-6 || abs >= 1e21`; `!(1e-6..1e21).contains`
-    // is the half-open complement (clippy-preferred spelling).
-    let use_exp = abs != 0.0 && !(1e-6..1e21).contains(&abs);
-    if !use_exp {
-        return format!("{f}");
-    }
-    let rust_e = format!("{f:e}");
-    match rust_e.split_once('e') {
-        Some((mantissa, exp)) => match exp.parse::<i32>() {
-            Ok(e) if e < 0 => format!("{mantissa}e-{}", -e),
-            Ok(e) => format!("{mantissa}e+{e:02}"),
-            // Unreachable: `{:e}` always emits a parseable integer exponent.
-            Err(_) => rust_e,
-        },
-        // Unreachable: `{:e}` always contains an 'e'.
-        None => rust_e,
-    }
-}
-
-/// A [`serde_json::ser::Formatter`] that wraps an inner formatter and produces
-/// JSON byte-compatible with Ipê's JSON encoder. Every structural / scalar
-/// method delegates to the inner formatter (preserving compact-vs-pretty
-/// layout); only `write_f64` and `write_string_fragment` are overridden.
-struct GoFormatter<F>(F);
-
-impl<F: serde_json::ser::Formatter> serde_json::ser::Formatter for GoFormatter<F> {
-    fn write_f64<W>(&mut self, writer: &mut W, value: f64) -> std::io::Result<()>
-    where
-        W: ?Sized + std::io::Write,
-    {
-        writer.write_all(go_format_f64(value).as_bytes())
-    }
-
-    fn write_string_fragment<W>(&mut self, writer: &mut W, fragment: &str) -> std::io::Result<()>
-    where
-        W: ?Sized + std::io::Write,
-    {
-        // HTML-escape inside every JSON string (values AND keys):
-        // `<`→<, `>`→>, `&`→&, and the JS line/paragraph
-        // separators U+2028/U+2029. None of them can occur outside a string in
-        // valid JSON, so escaping per-fragment is sufficient and exact.
-        let bytes = fragment.as_bytes();
-        let mut start = 0usize;
-        for (i, c) in fragment.char_indices() {
-            let escaped: Option<&[u8]> = match c {
-                '<' => Some(b"\\u003c"),
-                '>' => Some(b"\\u003e"),
-                '&' => Some(b"\\u0026"),
-                '\u{2028}' => Some(b"\\u2028"),
-                '\u{2029}' => Some(b"\\u2029"),
-                _ => None,
-            };
-            if let Some(esc) = escaped {
-                if let Some(seg) = bytes.get(start..i) {
-                    writer.write_all(seg)?;
-                }
-                writer.write_all(esc)?;
-                start = i + c.len_utf8();
-            }
-        }
-        if let Some(seg) = bytes.get(start..) {
-            writer.write_all(seg)?;
-        }
-        Ok(())
-    }
-
-    // ── delegate everything else to the inner formatter ──────────────────────
-    fn write_null<W>(&mut self, writer: &mut W) -> std::io::Result<()>
-    where
-        W: ?Sized + std::io::Write,
-    {
-        self.0.write_null(writer)
-    }
-    fn write_bool<W>(&mut self, writer: &mut W, value: bool) -> std::io::Result<()>
-    where
-        W: ?Sized + std::io::Write,
-    {
-        self.0.write_bool(writer, value)
-    }
-    fn write_i8<W>(&mut self, writer: &mut W, value: i8) -> std::io::Result<()>
-    where
-        W: ?Sized + std::io::Write,
-    {
-        self.0.write_i8(writer, value)
-    }
-    fn write_i16<W>(&mut self, writer: &mut W, value: i16) -> std::io::Result<()>
-    where
-        W: ?Sized + std::io::Write,
-    {
-        self.0.write_i16(writer, value)
-    }
-    fn write_i32<W>(&mut self, writer: &mut W, value: i32) -> std::io::Result<()>
-    where
-        W: ?Sized + std::io::Write,
-    {
-        self.0.write_i32(writer, value)
-    }
-    fn write_i64<W>(&mut self, writer: &mut W, value: i64) -> std::io::Result<()>
-    where
-        W: ?Sized + std::io::Write,
-    {
-        self.0.write_i64(writer, value)
-    }
-    fn write_i128<W>(&mut self, writer: &mut W, value: i128) -> std::io::Result<()>
-    where
-        W: ?Sized + std::io::Write,
-    {
-        self.0.write_i128(writer, value)
-    }
-    fn write_u8<W>(&mut self, writer: &mut W, value: u8) -> std::io::Result<()>
-    where
-        W: ?Sized + std::io::Write,
-    {
-        self.0.write_u8(writer, value)
-    }
-    fn write_u16<W>(&mut self, writer: &mut W, value: u16) -> std::io::Result<()>
-    where
-        W: ?Sized + std::io::Write,
-    {
-        self.0.write_u16(writer, value)
-    }
-    fn write_u32<W>(&mut self, writer: &mut W, value: u32) -> std::io::Result<()>
-    where
-        W: ?Sized + std::io::Write,
-    {
-        self.0.write_u32(writer, value)
-    }
-    fn write_u64<W>(&mut self, writer: &mut W, value: u64) -> std::io::Result<()>
-    where
-        W: ?Sized + std::io::Write,
-    {
-        self.0.write_u64(writer, value)
-    }
-    fn write_u128<W>(&mut self, writer: &mut W, value: u128) -> std::io::Result<()>
-    where
-        W: ?Sized + std::io::Write,
-    {
-        self.0.write_u128(writer, value)
-    }
-    fn write_f32<W>(&mut self, writer: &mut W, value: f32) -> std::io::Result<()>
-    where
-        W: ?Sized + std::io::Write,
-    {
-        self.0.write_f32(writer, value)
-    }
-    fn write_number_str<W>(&mut self, writer: &mut W, value: &str) -> std::io::Result<()>
-    where
-        W: ?Sized + std::io::Write,
-    {
-        self.0.write_number_str(writer, value)
-    }
-    fn begin_string<W>(&mut self, writer: &mut W) -> std::io::Result<()>
-    where
-        W: ?Sized + std::io::Write,
-    {
-        self.0.begin_string(writer)
-    }
-    fn end_string<W>(&mut self, writer: &mut W) -> std::io::Result<()>
-    where
-        W: ?Sized + std::io::Write,
-    {
-        self.0.end_string(writer)
-    }
-    fn write_char_escape<W>(
-        &mut self,
-        writer: &mut W,
-        char_escape: serde_json::ser::CharEscape,
-    ) -> std::io::Result<()>
-    where
-        W: ?Sized + std::io::Write,
-    {
-        self.0.write_char_escape(writer, char_escape)
-    }
-    fn begin_array<W>(&mut self, writer: &mut W) -> std::io::Result<()>
-    where
-        W: ?Sized + std::io::Write,
-    {
-        self.0.begin_array(writer)
-    }
-    fn end_array<W>(&mut self, writer: &mut W) -> std::io::Result<()>
-    where
-        W: ?Sized + std::io::Write,
-    {
-        self.0.end_array(writer)
-    }
-    fn begin_array_value<W>(&mut self, writer: &mut W, first: bool) -> std::io::Result<()>
-    where
-        W: ?Sized + std::io::Write,
-    {
-        self.0.begin_array_value(writer, first)
-    }
-    fn end_array_value<W>(&mut self, writer: &mut W) -> std::io::Result<()>
-    where
-        W: ?Sized + std::io::Write,
-    {
-        self.0.end_array_value(writer)
-    }
-    fn begin_object<W>(&mut self, writer: &mut W) -> std::io::Result<()>
-    where
-        W: ?Sized + std::io::Write,
-    {
-        self.0.begin_object(writer)
-    }
-    fn end_object<W>(&mut self, writer: &mut W) -> std::io::Result<()>
-    where
-        W: ?Sized + std::io::Write,
-    {
-        self.0.end_object(writer)
-    }
-    fn begin_object_key<W>(&mut self, writer: &mut W, first: bool) -> std::io::Result<()>
-    where
-        W: ?Sized + std::io::Write,
-    {
-        self.0.begin_object_key(writer, first)
-    }
-    fn end_object_key<W>(&mut self, writer: &mut W) -> std::io::Result<()>
-    where
-        W: ?Sized + std::io::Write,
-    {
-        self.0.end_object_key(writer)
-    }
-    fn begin_object_value<W>(&mut self, writer: &mut W) -> std::io::Result<()>
-    where
-        W: ?Sized + std::io::Write,
-    {
-        self.0.begin_object_value(writer)
-    }
-    fn end_object_value<W>(&mut self, writer: &mut W) -> std::io::Result<()>
-    where
-        W: ?Sized + std::io::Write,
-    {
-        self.0.end_object_value(writer)
-    }
-    fn write_raw_fragment<W>(&mut self, writer: &mut W, fragment: &str) -> std::io::Result<()>
-    where
-        W: ?Sized + std::io::Write,
-    {
-        self.0.write_raw_fragment(writer, fragment)
-    }
-}
 pub fn json_enc_string(s: String) -> JsonVal {
     JsonVal::String(s)
 }
@@ -437,27 +164,6 @@ pub fn json_enc_object(pairs: Vec<(String, JsonVal)>) -> JsonVal {
     JsonVal::Object(pairs.into_iter().collect())
 }
 
-/// Recursively rebuild a value with every object's keys in ascending order,
-/// regardless of the ambient `serde_json` object-order behaviour (the
-/// `preserve_order` cargo feature makes `Value::Object` insertion-ordered, so a
-/// plain re-encode is not canonical on its own).
-fn sort_object_keys(val: &JsonVal) -> JsonVal {
-    match val {
-        JsonVal::Object(map) => {
-            let mut entries: Vec<(&String, &JsonVal)> = map.iter().collect();
-            entries.sort_by_key(|(k, _)| *k);
-            JsonVal::Object(
-                entries
-                    .into_iter()
-                    .map(|(k, v)| (k.clone(), sort_object_keys(v)))
-                    .collect(),
-            )
-        }
-        JsonVal::Array(items) => JsonVal::Array(items.iter().map(sort_object_keys).collect()),
-        other => other.clone(),
-    }
-}
-
 /// Serialize a value to deterministic sorted-key canonical JSON: object keys are
 /// sorted ascending at every nesting depth, then encoded through the standard
 /// compact encoder. Two values with the same key/value content always produce
@@ -465,7 +171,7 @@ fn sort_object_keys(val: &JsonVal) -> JsonVal {
 /// stable signature — a property proven here rather than inherited from a global
 /// encoder-ordering setting.
 pub fn json_enc_canonical(val: &JsonVal) -> String {
-    json_enc_encode(0, sort_object_keys(val))
+    json_enc_encode(0, crate::json_val::sorted_keys(val))
 }
 
 // --- Decode primitives ---
@@ -1883,6 +1589,7 @@ mod enc_tests {
 #[cfg(not(target_arch = "wasm32"))]
 mod optional_tests {
     use super::*;
+    use crate::json_val::json_val;
 
     fn build() -> Decoder<String, i64> {
         // next_decoder is the identity continuation: Decoder<.., FnOnce(i64)->i64>.
@@ -1903,7 +1610,7 @@ mod optional_tests {
         // PRESENT-but-malformed field must PROPAGATE the decode error, not fall
         // back to the default (`optional` contract).
         let dec = build();
-        let v: JsonVal = serde_json::json!({ "age": "not-an-int" });
+        let v: JsonVal = json_val!({ "age": "not-an-int" });
         assert!(
             matches!((dec.run)(&v), IpeResult::Err(_)),
             "present-but-wrong-type must yield Err"
@@ -1913,21 +1620,21 @@ mod optional_tests {
     #[test]
     fn optional_absent_uses_default() {
         let dec = build();
-        let v: JsonVal = serde_json::json!({});
+        let v: JsonVal = json_val!({});
         assert!(matches!((dec.run)(&v), IpeResult::Ok(-1)));
     }
 
     #[test]
     fn optional_null_uses_default() {
         let dec = build();
-        let v: JsonVal = serde_json::json!({ "age": null });
+        let v: JsonVal = json_val!({ "age": null });
         assert!(matches!((dec.run)(&v), IpeResult::Ok(-1)));
     }
 
     #[test]
     fn optional_present_valid_decodes() {
         let dec = build();
-        let v: JsonVal = serde_json::json!({ "age": 42 });
+        let v: JsonVal = json_val!({ "age": 42 });
         assert!(matches!((dec.run)(&v), IpeResult::Ok(42)));
     }
 }
@@ -1936,14 +1643,14 @@ mod optional_tests {
 #[cfg(not(target_arch = "wasm32"))]
 mod key_value_pairs_tests {
     use super::*;
+    use crate::json_val::json_val;
 
     #[test]
     fn decodes_object_entries() {
         let dec = decode_key_value_pairs::<String, i64>(json_decode_int());
-        let v: JsonVal = serde_json::json!({ "a": 1, "b": 2 });
+        let v: JsonVal = json_val!({ "a": 1, "b": 2 });
         match (dec.run)(&v) {
             IpeResult::Ok(mut pairs) => {
-                // serde_json's default Map is key-sorted, so the order is stable.
                 pairs.sort();
                 assert_eq!(pairs, vec![("a".to_owned(), 1), ("b".to_owned(), 2)]);
             }
@@ -1954,21 +1661,21 @@ mod key_value_pairs_tests {
     #[test]
     fn non_object_is_err() {
         let dec = decode_key_value_pairs::<String, i64>(json_decode_int());
-        let v: JsonVal = serde_json::json!([1, 2, 3]);
+        let v: JsonVal = json_val!([1, 2, 3]);
         assert!(matches!((dec.run)(&v), IpeResult::Err(_)));
     }
 
     #[test]
     fn value_decode_error_propagates() {
         let dec = decode_key_value_pairs::<String, i64>(json_decode_int());
-        let v: JsonVal = serde_json::json!({ "a": "not-an-int" });
+        let v: JsonVal = json_val!({ "a": "not-an-int" });
         assert!(matches!((dec.run)(&v), IpeResult::Err(_)));
     }
 
     #[test]
     fn empty_object_is_empty_list() {
         let dec = decode_key_value_pairs::<String, i64>(json_decode_int());
-        let v: JsonVal = serde_json::json!({});
+        let v: JsonVal = json_val!({});
         assert!(matches!((dec.run)(&v), IpeResult::Ok(ref p) if p.is_empty()));
     }
 }
@@ -1979,6 +1686,7 @@ mod key_value_pairs_tests {
 #[cfg(not(target_arch = "wasm32"))]
 mod elm_behaviour_verdicts {
     use super::*;
+    use crate::json_val::json_val;
 
     // Verdict: fix-to-most-correct. Elm's `Decode.int` rejects non-integer
     // numbers; parse-don't-validate forbids the old silent truncation. `1.5`
@@ -1986,42 +1694,27 @@ mod elm_behaviour_verdicts {
     #[test]
     fn int_decoder_accepts_plain_integer() {
         let dec = json_decode_int::<String>();
-        assert!(matches!(
-            (dec.run)(&serde_json::json!(42)),
-            IpeResult::Ok(42)
-        ));
+        assert!(matches!((dec.run)(&json_val!(42)), IpeResult::Ok(42)));
     }
     #[test]
     fn int_decoder_accepts_integral_float() {
         let dec = json_decode_int::<String>();
-        assert!(matches!(
-            (dec.run)(&serde_json::json!(1.0)),
-            IpeResult::Ok(1)
-        ));
+        assert!(matches!((dec.run)(&json_val!(1.0)), IpeResult::Ok(1)));
     }
     #[test]
     fn int_decoder_rejects_fractional() {
         let dec = json_decode_int::<String>();
-        assert!(matches!(
-            (dec.run)(&serde_json::json!(1.5)),
-            IpeResult::Err(_)
-        ));
+        assert!(matches!((dec.run)(&json_val!(1.5)), IpeResult::Err(_)));
     }
     #[test]
     fn int_decoder_rejects_out_of_range_magnitude() {
         let dec = json_decode_int::<String>();
-        assert!(matches!(
-            (dec.run)(&serde_json::json!(1e21)),
-            IpeResult::Err(_)
-        ));
+        assert!(matches!((dec.run)(&json_val!(1e21)), IpeResult::Err(_)));
     }
     #[test]
     fn int_decoder_rejects_non_number() {
         let dec = json_decode_int::<String>();
-        assert!(matches!(
-            (dec.run)(&serde_json::json!("7")),
-            IpeResult::Err(_)
-        ));
+        assert!(matches!((dec.run)(&json_val!("7")), IpeResult::Err(_)));
     }
 
     // The i64 boundary: `i64::MAX as f64` rounds up to 2^63, so a naive
@@ -2031,19 +1724,19 @@ mod elm_behaviour_verdicts {
     #[test]
     fn int_decoder_accepts_i64_max() {
         let dec = json_decode_int::<String>();
-        let v: serde_json::Value = serde_json::from_str("9223372036854775807").unwrap();
+        let v: JsonVal = serde_json::from_str("9223372036854775807").unwrap();
         assert!(matches!((dec.run)(&v), IpeResult::Ok(i64::MAX)));
     }
     #[test]
     fn int_decoder_accepts_i64_min() {
         let dec = json_decode_int::<String>();
-        let v: serde_json::Value = serde_json::from_str("-9223372036854775808").unwrap();
+        let v: JsonVal = serde_json::from_str("-9223372036854775808").unwrap();
         assert!(matches!((dec.run)(&v), IpeResult::Ok(i64::MIN)));
     }
     #[test]
     fn int_decoder_rejects_i64_max_plus_one() {
         let dec = json_decode_int::<String>();
-        let v: serde_json::Value = serde_json::from_str("9223372036854775808").unwrap();
+        let v: JsonVal = serde_json::from_str("9223372036854775808").unwrap();
         assert!(
             matches!((dec.run)(&v), IpeResult::Err(_)),
             "i64::MAX+1 must reject, not saturate to i64::MAX; got {:?}",
@@ -2053,7 +1746,7 @@ mod elm_behaviour_verdicts {
     #[test]
     fn int_decoder_rejects_i64_min_minus_one() {
         let dec = json_decode_int::<String>();
-        let v: serde_json::Value = serde_json::from_str("-9223372036854775809").unwrap();
+        let v: JsonVal = serde_json::from_str("-9223372036854775809").unwrap();
         assert!(
             matches!((dec.run)(&v), IpeResult::Err(_)),
             "i64::MIN-1 must reject, not saturate to i64::MIN; got {:?}",
@@ -2063,12 +1756,9 @@ mod elm_behaviour_verdicts {
     #[test]
     fn int_decoder_accepts_ordinary_in_range() {
         let dec = json_decode_int::<String>();
+        assert!(matches!((dec.run)(&json_val!(-7)), IpeResult::Ok(-7)));
         assert!(matches!(
-            (dec.run)(&serde_json::json!(-7)),
-            IpeResult::Ok(-7)
-        ));
-        assert!(matches!(
-            (dec.run)(&serde_json::json!(1_000_000_000_000_i64)),
+            (dec.run)(&json_val!(1_000_000_000_000_i64)),
             IpeResult::Ok(1_000_000_000_000)
         ));
     }
@@ -2111,7 +1801,7 @@ mod elm_behaviour_verdicts {
     fn nullable_null_is_nothing() {
         let dec = super::super::config_decode::config_nullable::<String, i64>(json_decode_int());
         assert!(matches!(
-            (dec.run)(&serde_json::json!(null)),
+            (dec.run)(&json_val!(null)),
             IpeResult::Ok(IpeMaybe::Nothing)
         ));
     }
@@ -2120,7 +1810,7 @@ mod elm_behaviour_verdicts {
     fn nullable_value_is_just() {
         let dec = super::super::config_decode::config_nullable::<String, i64>(json_decode_int());
         assert!(matches!(
-            (dec.run)(&serde_json::json!(5)),
+            (dec.run)(&json_val!(5)),
             IpeResult::Ok(IpeMaybe::Just(5))
         ));
     }
@@ -2128,10 +1818,7 @@ mod elm_behaviour_verdicts {
     #[test]
     fn nullable_non_null_inner_failure_propagates() {
         let dec = super::super::config_decode::config_nullable::<String, i64>(json_decode_int());
-        assert!(matches!(
-            (dec.run)(&serde_json::json!("nope")),
-            IpeResult::Err(_)
-        ));
+        assert!(matches!((dec.run)(&json_val!("nope")), IpeResult::Err(_)));
     }
 
     // `JsonDec.nullable` (backing `Decode.nullable` in the browser-sensor
@@ -2143,7 +1830,7 @@ mod elm_behaviour_verdicts {
     fn json_nullable_null_is_nothing() {
         let dec = decode_nullable::<String, f64>(json_decode_float());
         assert!(matches!(
-            (dec.run)(&serde_json::json!(null)),
+            (dec.run)(&json_val!(null)),
             IpeResult::Ok(IpeMaybe::Nothing)
         ));
     }
@@ -2151,21 +1838,15 @@ mod elm_behaviour_verdicts {
     fn json_nullable_number_is_just() {
         let dec = decode_nullable::<String, f64>(json_decode_float());
         assert!(matches!(
-            (dec.run)(&serde_json::json!(1.5)),
+            (dec.run)(&json_val!(1.5)),
             IpeResult::Ok(IpeMaybe::Just(_))
         ));
     }
     #[test]
     fn json_nullable_wrong_type_fails_closed() {
         let dec = decode_nullable::<String, f64>(json_decode_float());
-        assert!(matches!(
-            (dec.run)(&serde_json::json!("fast")),
-            IpeResult::Err(_)
-        ));
-        assert!(matches!(
-            (dec.run)(&serde_json::json!({})),
-            IpeResult::Err(_)
-        ));
+        assert!(matches!((dec.run)(&json_val!("fast")), IpeResult::Err(_)));
+        assert!(matches!((dec.run)(&json_val!({})), IpeResult::Err(_)));
     }
 
     // Verdict: keep-Elm (already matches). `oneOf` returns the first branch that
@@ -2174,24 +1855,18 @@ mod elm_behaviour_verdicts {
     fn one_of_returns_first_success() {
         let decoders = vec![json_decode_int::<String>(), json_decode_int::<String>()];
         let dec = decode_one_of(decoders);
-        assert!(matches!((dec.run)(&serde_json::json!(9)), IpeResult::Ok(9)));
+        assert!(matches!((dec.run)(&json_val!(9)), IpeResult::Ok(9)));
     }
     #[test]
     fn one_of_empty_is_err_not_panic() {
         let dec = decode_one_of::<String, i64>(vec![]);
-        assert!(matches!(
-            (dec.run)(&serde_json::json!(1)),
-            IpeResult::Err(_)
-        ));
+        assert!(matches!((dec.run)(&json_val!(1)), IpeResult::Err(_)));
     }
     #[test]
     fn one_of_all_fail_is_err() {
         let decoders = vec![json_decode_int::<String>()];
         let dec = decode_one_of(decoders);
-        assert!(matches!(
-            (dec.run)(&serde_json::json!("x")),
-            IpeResult::Err(_)
-        ));
+        assert!(matches!((dec.run)(&json_val!("x")), IpeResult::Err(_)));
     }
 
     // Verdict: keep-ours (documented divergence). JSON number rendering drops
@@ -2220,8 +1895,7 @@ mod retained_tests {
     #[test]
     fn a_json_object_counts_its_entry_and_index_tables() {
         let n = 100_usize;
-        let object: serde_json::Map<String, JsonVal> =
-            (0..n).map(|i| (format!("k{i}"), JsonVal::Null)).collect();
+        let object: JsonMap = (0..n).map(|i| (format!("k{i}"), JsonVal::Null)).collect();
         let value = JsonVal::Object(object);
         let entry = size_of::<(usize, String, JsonVal)>() + size_of::<usize>();
         let floor = (n + 1) * size_of::<JsonVal>() + n * entry;
@@ -2229,6 +1903,345 @@ mod retained_tests {
         assert!(
             measured.is_some_and(|m| m >= u64::try_from(floor).unwrap_or(u64::MAX)),
             "{measured:?} < {floor}"
+        );
+    }
+}
+
+/// The encoder as `serde_json` drives it, kept as the byte oracle the
+/// worklist writer is checked against.
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod serde_oracle {
+    use crate::json_val::go_format_f64;
+
+    /// `Json.Encode.encode` through `serde_json`'s serializer and `GoFormatter`.
+    pub(super) fn encode(indent: i64, val: &serde_json::Value) -> String {
+        let mut buf = Vec::new();
+        let written = if indent > 0 {
+            let width = usize::try_from(indent).map_or(16, |w| w.min(16));
+            let indent_string = " ".repeat(width);
+            let inner = serde_json::ser::PrettyFormatter::with_indent(indent_string.as_bytes());
+            let mut ser = serde_json::Serializer::with_formatter(&mut buf, GoFormatter(inner));
+            serde::Serialize::serialize(val, &mut ser)
+        } else {
+            let mut ser = serde_json::Serializer::with_formatter(
+                &mut buf,
+                GoFormatter(serde_json::ser::CompactFormatter),
+            );
+            serde::Serialize::serialize(val, &mut ser)
+        };
+        match (written, String::from_utf8(buf)) {
+            (Ok(()), Ok(text)) => text,
+            (written, text) => panic!("oracle encode failed: {written:?} {text:?}"),
+        }
+    }
+
+    /// A [`serde_json::ser::Formatter`] that wraps an inner formatter and produces
+    /// JSON byte-compatible with Ipê's JSON encoder. Every structural / scalar
+    /// method delegates to the inner formatter (preserving compact-vs-pretty
+    /// layout); only `write_f64` and `write_string_fragment` are overridden.
+    struct GoFormatter<F>(F);
+
+    impl<F: serde_json::ser::Formatter> serde_json::ser::Formatter for GoFormatter<F> {
+        fn write_f64<W>(&mut self, writer: &mut W, value: f64) -> std::io::Result<()>
+        where
+            W: ?Sized + std::io::Write,
+        {
+            writer.write_all(go_format_f64(value).as_bytes())
+        }
+
+        fn write_string_fragment<W>(
+            &mut self,
+            writer: &mut W,
+            fragment: &str,
+        ) -> std::io::Result<()>
+        where
+            W: ?Sized + std::io::Write,
+        {
+            // HTML-escape inside every JSON string (values AND keys):
+            // `<`→<, `>`→>, `&`→&, and the JS line/paragraph
+            // separators U+2028/U+2029. None of them can occur outside a string in
+            // valid JSON, so escaping per-fragment is sufficient and exact.
+            let bytes = fragment.as_bytes();
+            let mut start = 0usize;
+            for (i, c) in fragment.char_indices() {
+                let escaped: Option<&[u8]> = match c {
+                    '<' => Some(b"\\u003c"),
+                    '>' => Some(b"\\u003e"),
+                    '&' => Some(b"\\u0026"),
+                    '\u{2028}' => Some(b"\\u2028"),
+                    '\u{2029}' => Some(b"\\u2029"),
+                    _ => None,
+                };
+                if let Some(esc) = escaped {
+                    if let Some(seg) = bytes.get(start..i) {
+                        writer.write_all(seg)?;
+                    }
+                    writer.write_all(esc)?;
+                    start = i + c.len_utf8();
+                }
+            }
+            if let Some(seg) = bytes.get(start..) {
+                writer.write_all(seg)?;
+            }
+            Ok(())
+        }
+
+        // ── delegate everything else to the inner formatter ──────────────────────
+        fn write_null<W>(&mut self, writer: &mut W) -> std::io::Result<()>
+        where
+            W: ?Sized + std::io::Write,
+        {
+            self.0.write_null(writer)
+        }
+        fn write_bool<W>(&mut self, writer: &mut W, value: bool) -> std::io::Result<()>
+        where
+            W: ?Sized + std::io::Write,
+        {
+            self.0.write_bool(writer, value)
+        }
+        fn write_i8<W>(&mut self, writer: &mut W, value: i8) -> std::io::Result<()>
+        where
+            W: ?Sized + std::io::Write,
+        {
+            self.0.write_i8(writer, value)
+        }
+        fn write_i16<W>(&mut self, writer: &mut W, value: i16) -> std::io::Result<()>
+        where
+            W: ?Sized + std::io::Write,
+        {
+            self.0.write_i16(writer, value)
+        }
+        fn write_i32<W>(&mut self, writer: &mut W, value: i32) -> std::io::Result<()>
+        where
+            W: ?Sized + std::io::Write,
+        {
+            self.0.write_i32(writer, value)
+        }
+        fn write_i64<W>(&mut self, writer: &mut W, value: i64) -> std::io::Result<()>
+        where
+            W: ?Sized + std::io::Write,
+        {
+            self.0.write_i64(writer, value)
+        }
+        fn write_i128<W>(&mut self, writer: &mut W, value: i128) -> std::io::Result<()>
+        where
+            W: ?Sized + std::io::Write,
+        {
+            self.0.write_i128(writer, value)
+        }
+        fn write_u8<W>(&mut self, writer: &mut W, value: u8) -> std::io::Result<()>
+        where
+            W: ?Sized + std::io::Write,
+        {
+            self.0.write_u8(writer, value)
+        }
+        fn write_u16<W>(&mut self, writer: &mut W, value: u16) -> std::io::Result<()>
+        where
+            W: ?Sized + std::io::Write,
+        {
+            self.0.write_u16(writer, value)
+        }
+        fn write_u32<W>(&mut self, writer: &mut W, value: u32) -> std::io::Result<()>
+        where
+            W: ?Sized + std::io::Write,
+        {
+            self.0.write_u32(writer, value)
+        }
+        fn write_u64<W>(&mut self, writer: &mut W, value: u64) -> std::io::Result<()>
+        where
+            W: ?Sized + std::io::Write,
+        {
+            self.0.write_u64(writer, value)
+        }
+        fn write_u128<W>(&mut self, writer: &mut W, value: u128) -> std::io::Result<()>
+        where
+            W: ?Sized + std::io::Write,
+        {
+            self.0.write_u128(writer, value)
+        }
+        fn write_f32<W>(&mut self, writer: &mut W, value: f32) -> std::io::Result<()>
+        where
+            W: ?Sized + std::io::Write,
+        {
+            self.0.write_f32(writer, value)
+        }
+        fn write_number_str<W>(&mut self, writer: &mut W, value: &str) -> std::io::Result<()>
+        where
+            W: ?Sized + std::io::Write,
+        {
+            self.0.write_number_str(writer, value)
+        }
+        fn begin_string<W>(&mut self, writer: &mut W) -> std::io::Result<()>
+        where
+            W: ?Sized + std::io::Write,
+        {
+            self.0.begin_string(writer)
+        }
+        fn end_string<W>(&mut self, writer: &mut W) -> std::io::Result<()>
+        where
+            W: ?Sized + std::io::Write,
+        {
+            self.0.end_string(writer)
+        }
+        fn write_char_escape<W>(
+            &mut self,
+            writer: &mut W,
+            char_escape: serde_json::ser::CharEscape,
+        ) -> std::io::Result<()>
+        where
+            W: ?Sized + std::io::Write,
+        {
+            self.0.write_char_escape(writer, char_escape)
+        }
+        fn begin_array<W>(&mut self, writer: &mut W) -> std::io::Result<()>
+        where
+            W: ?Sized + std::io::Write,
+        {
+            self.0.begin_array(writer)
+        }
+        fn end_array<W>(&mut self, writer: &mut W) -> std::io::Result<()>
+        where
+            W: ?Sized + std::io::Write,
+        {
+            self.0.end_array(writer)
+        }
+        fn begin_array_value<W>(&mut self, writer: &mut W, first: bool) -> std::io::Result<()>
+        where
+            W: ?Sized + std::io::Write,
+        {
+            self.0.begin_array_value(writer, first)
+        }
+        fn end_array_value<W>(&mut self, writer: &mut W) -> std::io::Result<()>
+        where
+            W: ?Sized + std::io::Write,
+        {
+            self.0.end_array_value(writer)
+        }
+        fn begin_object<W>(&mut self, writer: &mut W) -> std::io::Result<()>
+        where
+            W: ?Sized + std::io::Write,
+        {
+            self.0.begin_object(writer)
+        }
+        fn end_object<W>(&mut self, writer: &mut W) -> std::io::Result<()>
+        where
+            W: ?Sized + std::io::Write,
+        {
+            self.0.end_object(writer)
+        }
+        fn begin_object_key<W>(&mut self, writer: &mut W, first: bool) -> std::io::Result<()>
+        where
+            W: ?Sized + std::io::Write,
+        {
+            self.0.begin_object_key(writer, first)
+        }
+        fn end_object_key<W>(&mut self, writer: &mut W) -> std::io::Result<()>
+        where
+            W: ?Sized + std::io::Write,
+        {
+            self.0.end_object_key(writer)
+        }
+        fn begin_object_value<W>(&mut self, writer: &mut W) -> std::io::Result<()>
+        where
+            W: ?Sized + std::io::Write,
+        {
+            self.0.begin_object_value(writer)
+        }
+        fn end_object_value<W>(&mut self, writer: &mut W) -> std::io::Result<()>
+        where
+            W: ?Sized + std::io::Write,
+        {
+            self.0.end_object_value(writer)
+        }
+        fn write_raw_fragment<W>(&mut self, writer: &mut W, fragment: &str) -> std::io::Result<()>
+        where
+            W: ?Sized + std::io::Write,
+        {
+            self.0.write_raw_fragment(writer, fragment)
+        }
+    }
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod writer_parity {
+    use super::*;
+    use proptest::prelude::*;
+
+    fn text() -> impl Strategy<Value = String> {
+        let chars = prop_oneof![
+            Just('a'),
+            Just('Z'),
+            Just(' '),
+            Just('<'),
+            Just('>'),
+            Just('&'),
+            Just('"'),
+            Just('\\'),
+            Just('/'),
+            Just('\u{2028}'),
+            Just('\u{2029}'),
+            Just('\u{7f}'),
+            Just('\u{e9}'),
+            Just('\u{1F600}'),
+            (0u32..0x20).prop_map(|c| char::from_u32(c).unwrap_or('?')),
+        ];
+        prop::collection::vec(chars, 0..8).prop_map(|cs| cs.into_iter().collect())
+    }
+
+    fn value() -> impl Strategy<Value = serde_json::Value> {
+        let leaf = prop_oneof![
+            Just(serde_json::Value::Null),
+            any::<bool>().prop_map(serde_json::Value::Bool),
+            any::<i64>().prop_map(|i| serde_json::Value::Number(i.into())),
+            any::<u64>().prop_map(|u| serde_json::Value::Number(u.into())),
+            (prop::num::f64::POSITIVE
+                | prop::num::f64::NEGATIVE
+                | prop::num::f64::NORMAL
+                | prop::num::f64::SUBNORMAL
+                | prop::num::f64::ZERO)
+                .prop_map(|f| serde_json::Number::from_f64(f)
+                    .map_or(serde_json::Value::Null, serde_json::Value::Number)),
+            text().prop_map(serde_json::Value::String),
+        ];
+        leaf.prop_recursive(64, 256, 6, |inner| {
+            prop_oneof![
+                prop::collection::vec(inner.clone(), 0..6).prop_map(serde_json::Value::Array),
+                prop::collection::vec((text(), inner), 0..6)
+                    .prop_map(|entries| serde_json::Value::Object(entries.into_iter().collect())),
+            ]
+        })
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(256))]
+
+        #[test]
+        fn encode_parity_with_serde_oracle(v in value(), indent in prop_oneof![Just(0i64), Just(4i64)]) {
+            let ours = json_enc_encode(indent, JsonVal::from_serde(v.clone()));
+            prop_assert_eq!(ours, serde_oracle::encode(indent, &v));
+        }
+
+        #[test]
+        fn display_parity_with_serde_oracle(v in value()) {
+            let ours = JsonVal::from_serde(v.clone());
+            prop_assert_eq!(ours.to_string(), v.to_string());
+            prop_assert_eq!(format!("{ours:#}"), format!("{v:#}"));
+            prop_assert_eq!(format!("{ours:?}"), format!("{v:?}"));
+        }
+    }
+
+    #[test]
+    fn object_order_is_insertion_order() {
+        let val = json_enc_object(vec![
+            ("b".to_owned(), json_enc_int(1)),
+            ("a".to_owned(), json_enc_int(2)),
+        ]);
+        assert_eq!(json_enc_encode(0, val.clone()), r#"{"b":1,"a":2}"#);
+        assert_eq!(val.to_string(), r#"{"b":1,"a":2}"#);
+        let parsed: Result<JsonVal, _> = serde_json::from_str(r#"{"b":1,"a":2}"#);
+        assert_eq!(
+            parsed.map(|v| json_enc_encode(0, v)).ok().as_deref(),
+            Some(r#"{"b":1,"a":2}"#)
         );
     }
 }

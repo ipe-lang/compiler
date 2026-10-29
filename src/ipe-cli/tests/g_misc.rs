@@ -80,6 +80,8 @@ mod golden_l0105_refutable_gates;
 mod golden_lambda_field_access_seal;
 #[path = "g_misc/golden_lazy_emit_seal.rs"]
 mod golden_lazy_emit_seal;
+#[path = "g_misc/golden_local_shadows_kernel.rs"]
+mod golden_local_shadows_kernel;
 #[path = "g_misc/golden_local_type_shadows_dep.rs"]
 mod golden_local_type_shadows_dep;
 #[path = "g_misc/golden_money_parse_currency_maybe.rs"]

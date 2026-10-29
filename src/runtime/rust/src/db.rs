@@ -214,8 +214,9 @@ fn ipe_err<E: crate::FromIpeError>(engine: DbEngine, e: &sqlx::Error) -> E {
 /// The Ipê `Error` for a refused connect.
 ///
 /// A driver failure keeps its classification; the dial-target ceiling is a
-/// `LimitExceeded` refusal; a malformed or mismatched location is
-/// `InvalidInput`, a dial policy refusal `PermissionDenied`, and a missing
+/// `LimitExceeded` refusal; a malformed or mismatched location, or one whose
+/// TLS mode does not verify a remote server, is `InvalidInput`, a dial policy
+/// refusal `PermissionDenied`, and a missing
 /// relay `Unavailable`. `context` prefixes the message.
 pub(crate) fn connect_refusal<E: crate::FromIpeError>(
     context: &str,
@@ -239,6 +240,7 @@ pub(crate) fn connect_refusal<E: crate::FromIpeError>(
         DbConnectError::InvalidUrl
         | DbConnectError::MisplacedUserinfo
         | DbConnectError::UnsupportedScheme
+        | DbConnectError::UnverifiedTls { .. }
         | DbConnectError::EngineMismatch { .. }
         | DbConnectError::EngineRefused(_) => {
             E::from_ipe_error(IpeError::invalid_input(format!("{context}{refused}")))
@@ -811,7 +813,7 @@ where
     for<'a> Option<Vec<u8>>: sqlx::Decode<'a, R::Database> + sqlx::Type<R::Database>,
 {
     let cols = row.columns();
-    let mut map = serde_json::Map::new();
+    let mut map = super::json::JsonMap::new();
     for (i, col) in cols.iter().enumerate() {
         map.insert(col.name().to_string(), read_cell(row, i)?.into_json());
     }
@@ -1694,6 +1696,16 @@ pub enum DbConnectError {
     },
     /// The SSRF gate refused a target the URL dials.
     HostRefused(crate::ssrf::SsrfRefusal),
+    /// A PostgreSQL URL names an `sslmode` that does not verify the server
+    /// while it dials a target that is not local.
+    ///
+    /// Only a loopback address, `localhost`, or a Unix socket has no on-path
+    /// party to read or alter the connection, so only there is such a mode
+    /// admitted (see `PgTransport`).
+    UnverifiedTls {
+        /// The unverified mode the URL names.
+        mode: crate::dsn::UnverifiedSslMode,
+    },
     /// The driver could not open the pool.
     Unreachable(DriverFailure),
     /// The local relay that pins a TLS dial to its vetted address could not
@@ -1729,6 +1741,14 @@ impl std::fmt::Display for DbConnectError {
                 driver.name()
             ),
             Self::HostRefused(refusal) => write!(f, "db: {refusal}"),
+            Self::UnverifiedTls { mode } => write!(
+                f,
+                "db: sslmode={} {}, so it is admitted only when every host the connection \
+                 URL names is a loopback address, `localhost` or a Unix socket; use \
+                 sslmode=verify-full (the default) or sslmode=verify-ca",
+                mode.sslmode(),
+                mode.risk()
+            ),
             Self::Unreachable(failure) | Self::VersionUnreadable(failure) => {
                 write!(f, "db: {failure}")
             }
@@ -1866,25 +1886,152 @@ pub struct SqliteUrl {
     shared_file: bool,
 }
 
-/// A PostgreSQL connection URL and every target it makes the driver dial.
+/// How a PostgreSQL connection protects its transport, read once from its URL.
+///
+/// The driver is always handed this mode explicitly, so neither `PGSSLMODE`
+/// nor the driver's own `prefer` default ever decides it. A mode that does not
+/// verify the server is representable only for a URL whose every dial target
+/// is local, where no on-path party exists.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PgTransport {
+    /// TLS that verifies the server certificate: what any URL that dials a
+    /// remote target must carry, and what an absent `sslmode` there means.
+    Verified(crate::dsn::TlsMode),
+    /// A mode that does not verify the server, on a URL that dials only a
+    /// loopback address, `localhost`, or a Unix socket. An absent `sslmode`
+    /// there means `prefer`.
+    Local(crate::dsn::UnverifiedSslMode),
+}
+
+impl PgTransport {
+    /// The posture of a URL naming `written` (its `sslmode`, if any) that dials `targets`.
+    ///
+    /// # Errors
+    ///
+    /// [`DbConnectError::UnverifiedTls`] for an unverified mode on a URL with
+    /// a target that is not local.
+    fn of(
+        written: Option<sqlx::postgres::PgSslMode>,
+        targets: &[DialTarget],
+    ) -> Result<Self, DbConnectError> {
+        use crate::dsn::{TlsMode, UnverifiedSslMode};
+        use sqlx::postgres::PgSslMode;
+        let local = !targets.is_empty() && targets.iter().all(DialTarget::is_local);
+        let unverified = match written {
+            Some(PgSslMode::VerifyFull) => return Ok(Self::Verified(TlsMode::VerifyFull)),
+            Some(PgSslMode::VerifyCa) => return Ok(Self::Verified(TlsMode::VerifyCa)),
+            None if local => return Ok(Self::Local(UnverifiedSslMode::Prefer)),
+            None => return Ok(Self::Verified(TlsMode::VerifyFull)),
+            Some(PgSslMode::Disable) => UnverifiedSslMode::Disable,
+            Some(PgSslMode::Allow) => UnverifiedSslMode::Allow,
+            Some(PgSslMode::Prefer) => UnverifiedSslMode::Prefer,
+            Some(PgSslMode::Require) => UnverifiedSslMode::Require,
+        };
+        if local {
+            Ok(Self::Local(unverified))
+        } else {
+            Err(DbConnectError::UnverifiedTls { mode: unverified })
+        }
+    }
+
+    /// Whether the driver may negotiate TLS under this posture.
+    const fn negotiates_tls(self) -> bool {
+        use crate::dsn::UnverifiedSslMode;
+        match self {
+            Self::Verified(_)
+            | Self::Local(UnverifiedSslMode::Prefer | UnverifiedSslMode::Require) => true,
+            Self::Local(UnverifiedSslMode::Disable | UnverifiedSslMode::Allow) => false,
+        }
+    }
+
+    /// The driver's mode for this posture.
+    const fn ssl_mode(self) -> sqlx::postgres::PgSslMode {
+        use crate::dsn::{TlsMode, UnverifiedSslMode};
+        use sqlx::postgres::PgSslMode;
+        match self {
+            Self::Verified(TlsMode::VerifyFull) => PgSslMode::VerifyFull,
+            Self::Verified(TlsMode::VerifyCa) => PgSslMode::VerifyCa,
+            Self::Local(UnverifiedSslMode::Disable) => PgSslMode::Disable,
+            Self::Local(UnverifiedSslMode::Allow) => PgSslMode::Allow,
+            Self::Local(UnverifiedSslMode::Prefer) => PgSslMode::Prefer,
+            Self::Local(UnverifiedSslMode::Require) => PgSslMode::Require,
+        }
+    }
+}
+
+/// The `sslmode` `url` names, read as the driver reads it, or `None` when it names none.
+///
+/// The driver reads both `sslmode` and `ssl-mode`, refuses any value it does
+/// not know, and keeps the last; so does this.
+///
+/// # Errors
+///
+/// [`DbConnectError::InvalidUrl`] for a value the driver does not know.
+fn written_ssl_mode(
+    url: &UnambiguousUrl,
+) -> Result<Option<sqlx::postgres::PgSslMode>, DbConnectError> {
+    let mut written = None;
+    for (key, value) in crate::ssrf::DriverParityQuery::of(url).pairs() {
+        if matches!(&*key, "sslmode" | "ssl-mode") {
+            written = Some(
+                value
+                    .parse::<sqlx::postgres::PgSslMode>()
+                    .map_err(|_| DbConnectError::InvalidUrl)?,
+            );
+        }
+    }
+    Ok(written)
+}
+
+impl DialTarget {
+    /// Whether this target is local: a Unix socket, a loopback IP literal, or `localhost`.
+    ///
+    /// A driver default is not local: the driver may take its host from
+    /// `PGHOST`, which can name any host.
+    fn is_local(&self) -> bool {
+        match self {
+            Self::Socket => true,
+            Self::DriverDefault => false,
+            Self::Tcp { host, .. } => {
+                let host = host.as_str();
+                host.eq_ignore_ascii_case("localhost")
+                    || crate::ssrf::strip_ipv6_brackets(host)
+                        .parse::<std::net::IpAddr>()
+                        .is_ok_and(|ip| ip.is_loopback())
+            }
+        }
+    }
+}
+
+/// A PostgreSQL connection URL, every target it makes the driver dial, and
+/// the transport its connections use.
 pub struct PostgresUrl {
     url: UnambiguousUrl,
     targets: Vec<DialTarget>,
+    transport: PgTransport,
 }
 
 impl PostgresUrl {
-    /// Read every dial target of `url`.
+    /// Read every dial target of `url` and the transport they are dialled with.
     ///
     /// # Errors
     ///
     /// [`DbConnectError::MisplacedUserinfo`] when the userinfo is ambiguous,
-    /// and [`DbConnectError::InvalidUrl`] when the targets cannot be read.
+    /// [`DbConnectError::InvalidUrl`] when the targets or the `sslmode` cannot
+    /// be read, and [`DbConnectError::UnverifiedTls`] when an unverified mode
+    /// meets a target that is not local.
     fn parse(url: &str) -> Result<Self, DbConnectError> {
         let url = UnambiguousUrl::parse(url).map_err(|unproven| match unproven {
             UrlUnproven::AmbiguousUserinfo => DbConnectError::MisplacedUserinfo,
             UrlUnproven::Invalid => DbConnectError::InvalidUrl,
         })?;
-        read_dial_targets(&url).map(|targets| Self { url, targets })
+        let targets = read_dial_targets(&url)?;
+        let transport = PgTransport::of(written_ssl_mode(&url)?, &targets)?;
+        Ok(Self {
+            url,
+            targets,
+            transport,
+        })
     }
 }
 
@@ -1909,7 +2056,9 @@ impl DbUrl {
     ///
     /// [`DbConnectError::UnsupportedScheme`] for any other scheme, and
     /// [`DbConnectError::InvalidUrl`] for a SQLite URL the driver cannot read
-    /// or a PostgreSQL URL whose dial targets cannot be read.
+    /// or a PostgreSQL URL whose dial targets or `sslmode` cannot be read,
+    /// and [`DbConnectError::UnverifiedTls`] for a PostgreSQL URL whose
+    /// `sslmode` does not verify a server it dials beyond this host.
     pub fn parse(url: &str) -> Result<Self, DbConnectError> {
         match url_scheme(url) {
             None | Some("sqlite" | "file") => Ok(Self::Sqlite(SqliteUrl {
@@ -2009,15 +2158,16 @@ async fn postgres_connect_options<R: HostResolver>(
         let dial = vet_dial_target(target, policy, resolver).await?;
         vetted.push((target.clone(), dial));
     }
-    let options: sqlx::postgres::PgConnectOptions = url
+    let options = url
         .url
         .as_str()
-        .parse()
-        .map_err(|_| DbConnectError::InvalidUrl)?;
+        .parse::<sqlx::postgres::PgConnectOptions>()
+        .map_err(|_| DbConnectError::InvalidUrl)?
+        .ssl_mode(url.transport.ssl_mode());
     match policy {
         DialPolicy::AllowAll => Ok((options, None)),
         DialPolicy::DenyPrivate => {
-            pin_postgres_options(&url.url, options, &vetted, relay, resolver, max_connections).await
+            pin_postgres_options(url, options, &vetted, relay, resolver, max_connections).await
         }
     }
 }
@@ -2044,15 +2194,16 @@ const HOST_RELAY: RelaySupport = if cfg!(unix) {
 /// host and port, so the name is resolved once; a host the target scan did not
 /// name is vetted here. A host `url` does not name is refused as unproven.
 ///
-/// An IP-literal host, or any host under a mode that never negotiates TLS, is
-/// replaced by the vetted address. A named host that may negotiate TLS keeps
-/// its name, because the driver sends it as SNI and verifies the certificate
+/// The TLS decision is read from `url`'s [`PgTransport`], the posture the
+/// options were built with. An IP-literal host, or any host under a mode that
+/// never negotiates TLS, is replaced by the vetted address. A named host that
+/// may negotiate TLS keeps its name, because the driver sends it as SNI and verifies the certificate
 /// against it; the driver instead dials the socket of a `PinnedRelay` that
 /// carries every connection to the vetted address, so no dial resolves the
 /// name again. Where `relay` is [`RelaySupport::Absent`], `verify-full` on a
 /// named host is refused rather than silently weakened.
 async fn pin_postgres_options<R: HostResolver>(
-    url: &UnambiguousUrl,
+    url: &PostgresUrl,
     options: sqlx::postgres::PgConnectOptions,
     vetted: &[(DialTarget, VettedDial)],
     relay: RelaySupport,
@@ -2063,7 +2214,7 @@ async fn pin_postgres_options<R: HostResolver>(
         return Err(DbConnectError::HostRefused(SsrfRefusal::LocalSocket));
     }
     let host = options.get_host().to_owned();
-    let Some(named) = url.named_host(&host) else {
+    let Some(named) = url.url.named_host(&host) else {
         return Err(DbConnectError::HostRefused(SsrfRefusal::UnprovenTarget));
     };
     let port = options.get_port();
@@ -2074,10 +2225,7 @@ async fn pin_postgres_options<R: HostResolver>(
     let _no_relay_to_cap = max_connections;
     if relay == RelaySupport::Absent
         && !literal
-        && matches!(
-            options.get_ssl_mode(),
-            sqlx::postgres::PgSslMode::VerifyFull
-        )
+        && url.transport == PgTransport::Verified(crate::dsn::TlsMode::VerifyFull)
     {
         return Err(DbConnectError::HostRefused(
             SsrfRefusal::UnpinnableTlsName { host: named },
@@ -2105,10 +2253,7 @@ async fn pin_postgres_options<R: HostResolver>(
     if relay == RelaySupport::Available
         && let VettedDial::Pinned(target) = dial
         && !literal
-        && !matches!(
-            options.get_ssl_mode(),
-            sqlx::postgres::PgSslMode::Disable | sqlx::postgres::PgSslMode::Allow
-        )
+        && url.transport.negotiates_tls()
     {
         let relay = crate::ssrf::PinnedRelay::open(target, port, max_connections)?;
         let relayed = options.socket(relay.socket_dir());
@@ -3321,6 +3466,65 @@ fn migrate_checksum(sql: &str) -> String {
     format!("{:x}", h.finalize())
 }
 
+/// The characters a migration name occupies on a `status` line.
+///
+/// Counted on the scrubbed text [`migration_status_line`] prints, so the
+/// column the names align to matches what reaches the terminal.
+fn migration_status_name_width(name: &str) -> usize {
+    crate::system::scrub_log_controls(name).chars().count()
+}
+
+/// One `status` report line: the mark, the name padded to `width` characters, the detail.
+///
+/// The name and the detail (which quotes the ledger's `applied_at` text) are
+/// scrubbed of terminal controls. The padding is a `repeat`, never a runtime
+/// format width: a width past `u16::MAX` panics the formatter.
+fn migration_status_line(mark: &str, name: &str, detail: &str, width: usize) -> String {
+    let name = crate::system::scrub_log_controls(name);
+    let detail = crate::system::scrub_log_controls(detail);
+    let pad = width.saturating_sub(name.chars().count());
+    let mut line = String::with_capacity(
+        mark.len()
+            .saturating_add(name.len())
+            .saturating_add(pad)
+            .saturating_add(detail.len())
+            .saturating_add(6),
+    );
+    line.push_str("  ");
+    line.push_str(mark);
+    line.push_str("  ");
+    line.push_str(&name);
+    line.push_str(&" ".repeat(pad));
+    line.push_str("  ");
+    line.push_str(&detail);
+    line
+}
+
+/// The `migrate` refusal line for a declared migration whose SQL changed after it was applied.
+///
+/// Names only the migration, scrubbed of terminal controls: never the SQL body
+/// (which may carry seed-data literals) nor its hash.
+fn migration_drift_line(name: &str) -> String {
+    format!(
+        "db: migration '{}' changed after it was applied — checksum mismatch",
+        crate::system::scrub_log_controls(name)
+    )
+}
+
+/// The `migrate` summary line naming the migrations just applied, each scrubbed of terminal controls.
+fn migration_applied_line(applied: &[String]) -> String {
+    let names: Vec<std::borrow::Cow<'_, str>> = applied
+        .iter()
+        .map(String::as_str)
+        .map(crate::system::scrub_log_controls)
+        .collect();
+    format!(
+        "db: applied {} migration(s): {}",
+        applied.len(),
+        names.join(", ")
+    )
+}
+
 /// The refusal [`db_migrate_apply`] gives a ledger row with a `NULL` `name` or `checksum`.
 const MIGRATION_LEDGER_NULL_IDENTITY: &str =
     "db.migrate: corrupt _ipe_migrations ledger: a row has a NULL name or checksum";
@@ -3464,9 +3668,13 @@ pub fn db_migrate_apply<E: Send + From<String> + crate::FromIpeError + 'static>(
             }
             crate::system::write_stdout_line(&header);
             crate::system::write_stdout_line("");
-            let width = lines.iter().map(|(_, n, _)| n.len()).max().unwrap_or(0);
+            let width = lines
+                .iter()
+                .map(|(_, n, _)| migration_status_name_width(n))
+                .max()
+                .unwrap_or(0);
             for (mark, name, detail) in &lines {
-                crate::system::write_stdout_line(&format!("  {mark}  {name:<width$}  {detail}"));
+                crate::system::write_stdout_line(&migration_status_line(mark, name, detail, width));
             }
             if lines.is_empty() {
                 crate::system::write_stdout_line("  (no migrations declared)");
@@ -3493,9 +3701,7 @@ pub fn db_migrate_apply<E: Send + From<String> + crate::FromIpeError + 'static>(
                     // Drift: error embeds only the app-authored NAME, never the
                     // SQL body (which may carry seed-data literals) nor the hash.
                     if op == "migrate" {
-                        crate::system::write_stderr_line(&format!(
-                            "db: migration '{name}' changed after it was applied — checksum mismatch"
-                        ));
+                        crate::system::write_stderr_line(&migration_drift_line(&name));
                         let _ = std::io::Write::flush(&mut std::io::stderr());
                         // `ipe db migrate` CLI-op boundary: applied migration changed (checksum mismatch), exit non-zero
                         crate::system::exit_process(1);
@@ -3558,11 +3764,7 @@ pub fn db_migrate_apply<E: Send + From<String> + crate::FromIpeError + 'static>(
                     "db: schema already up to date — 0 migrations applied",
                 );
             } else {
-                crate::system::write_stdout_line(&format!(
-                    "db: applied {} migration(s): {}",
-                    out.len(),
-                    out.join(", ")
-                ));
+                crate::system::write_stdout_line(&migration_applied_line(&out));
             }
             let _ = std::io::Write::flush(&mut std::io::stdout());
             // `ipe db migrate` CLI-op boundary: migrations applied, exit zero
@@ -7987,6 +8189,47 @@ mod tests {
         );
     }
 
+    #[test]
+    fn migration_status_line_pads_a_name_past_the_formatter_width_limit() {
+        let name = "m".repeat(70_000);
+        let width = super::migration_status_name_width(&name).saturating_add(5);
+        let line = super::migration_status_line("•", &name, "pending", width);
+        assert_eq!(
+            line.chars().count(),
+            2 + 1 + 2 + 70_005 + 2 + "pending".len()
+        );
+        assert!(line.ends_with(&format!("{}  pending", " ".repeat(5))));
+    }
+
+    #[test]
+    fn migration_drift_and_applied_lines_escape_terminal_controls() {
+        let name = "seed\u{1b}[2J";
+        assert_eq!(
+            super::migration_drift_line(name),
+            "db: migration 'seed\\u{1b}[2J' changed after it was applied — checksum mismatch"
+        );
+        assert_eq!(
+            super::migration_applied_line(&["init".to_owned(), name.to_owned()]),
+            "db: applied 2 migration(s): init, seed\\u{1b}[2J"
+        );
+    }
+
+    #[test]
+    fn migration_status_line_escapes_terminal_controls_in_name_and_detail() {
+        let name = "init\u{1b}[2J";
+        let line = super::migration_status_line(
+            "✓",
+            name,
+            "applied 2026\u{1b}]0;x\u{7}",
+            super::migration_status_name_width(name),
+        );
+        assert!(
+            !line.contains('\u{1b}') && !line.contains('\u{7}'),
+            "{line}"
+        );
+        assert_eq!(line, "  ✓  init\\u{1b}[2J  applied 2026\\u{1b}]0;x\\u{7}");
+    }
+
     #[tokio::test]
     async fn migrate_is_idempotent_and_drift_guarded() {
         let db = fresh_db().await;
@@ -10410,28 +10653,28 @@ mod tests {
         let dec = db_decode_int::<String>("n".to_string());
 
         // In-range: a decimal string truncates toward zero, still Ok.
-        let in_range = serde_json::json!({ "n": "3.7" });
+        let in_range = crate::json_val::json_val!({ "n": "3.7" });
         match (dec.run)(&in_range) {
             IpeResult::Ok(i) => assert_eq!(i, 3),
             IpeResult::Err(e) => panic!("in-range decode failed: {:?}", e),
         }
 
         // In-range: a JSON float that is integral and representable decodes.
-        let in_range_num = serde_json::json!({ "n": 42.0 });
+        let in_range_num = crate::json_val::json_val!({ "n": 42.0 });
         match (db_decode_int::<String>("n".to_string()).run)(&in_range_num) {
             IpeResult::Ok(i) => assert_eq!(i, 42),
             IpeResult::Err(e) => panic!("in-range numeric decode failed: {:?}", e),
         }
 
         // Out-of-range: `1e30` past i64::MAX must REJECT, not saturate to i64::MAX.
-        let over = serde_json::json!({ "n": 1e30 });
+        let over = crate::json_val::json_val!({ "n": 1e30 });
         match (db_decode_int::<String>("n".to_string()).run)(&over) {
             IpeResult::Ok(i) => panic!("out-of-range float saturated to {i} instead of erroring"),
             IpeResult::Err(_) => {}
         }
 
         // Out-of-range as a decimal string is rejected on the same path.
-        let over_str = serde_json::json!({ "n": "1e30" });
+        let over_str = crate::json_val::json_val!({ "n": "1e30" });
         match (db_decode_int::<String>("n".to_string()).run)(&over_str) {
             IpeResult::Ok(i) => panic!("out-of-range string saturated to {i} instead of erroring"),
             IpeResult::Err(_) => {}
@@ -10439,14 +10682,14 @@ mod tests {
 
         // i64::MIN-1 rounds to i64::MIN as f64; a non-strict lower bound would
         // admit it and saturate to i64::MIN. It must reject.
-        let under = serde_json::json!({ "n": "-9223372036854775809" });
+        let under = crate::json_val::json_val!({ "n": "-9223372036854775809" });
         match (db_decode_int::<String>("n".to_string()).run)(&under) {
             IpeResult::Ok(i) => panic!("i64::MIN-1 saturated to {i} instead of erroring"),
             IpeResult::Err(_) => {}
         }
 
         // The exact boundaries still decode through the integer path.
-        let min = serde_json::json!({ "n": "-9223372036854775808" });
+        let min = crate::json_val::json_val!({ "n": "-9223372036854775808" });
         match (db_decode_int::<String>("n".to_string()).run)(&min) {
             IpeResult::Ok(i) => assert_eq!(i, i64::MIN),
             IpeResult::Err(e) => panic!("i64::MIN decode failed: {:?}", e),
@@ -10560,7 +10803,7 @@ mod tests {
         // Verify db_decode_money parses "USD 12.34" → (Decimal(12.34), "USD").
         use rust_decimal::Decimal as RD;
         use std::str::FromStr;
-        let val = serde_json::json!({ "price": "USD 12.34" });
+        let val = crate::json_val::json_val!({ "price": "USD 12.34" });
         let result = (db_decode_money::<String>("price".to_string()).run)(&val);
         match result {
             IpeResult::Ok((amount, code)) => {
@@ -10571,14 +10814,14 @@ mod tests {
         }
 
         // NULL → Err.
-        let val_null = serde_json::json!({ "price": null });
+        let val_null = crate::json_val::json_val!({ "price": null });
         assert!(matches!(
             (db_decode_money::<String>("price".to_string()).run)(&val_null),
             IpeResult::Err(_)
         ));
 
         // Bad format → Err.
-        let val_bad = serde_json::json!({ "price": "NODECIMAL" });
+        let val_bad = crate::json_val::json_val!({ "price": "NODECIMAL" });
         assert!(matches!(
             (db_decode_money::<String>("price".to_string()).run)(&val_bad),
             IpeResult::Err(_)
@@ -10590,7 +10833,7 @@ mod tests {
         // Verify db_decode_decimal parses "3.14159" → Decimal(3.14159).
         use rust_decimal::Decimal as RD;
         use std::str::FromStr;
-        let val = serde_json::json!({ "amount": "3.14159" });
+        let val = crate::json_val::json_val!({ "amount": "3.14159" });
         let result = (db_decode_decimal::<String>("amount".to_string()).run)(&val);
         match result {
             IpeResult::Ok(d) => {
@@ -10600,21 +10843,21 @@ mod tests {
         }
 
         // NULL → Err.
-        let val_null = serde_json::json!({ "amount": null });
+        let val_null = crate::json_val::json_val!({ "amount": null });
         assert!(matches!(
             (db_decode_decimal::<String>("amount".to_string()).run)(&val_null),
             IpeResult::Err(_)
         ));
 
         // Non-numeric text → Err.
-        let val_bad = serde_json::json!({ "amount": "not-a-number" });
+        let val_bad = crate::json_val::json_val!({ "amount": "not-a-number" });
         assert!(matches!(
             (db_decode_decimal::<String>("amount".to_string()).run)(&val_bad),
             IpeResult::Err(_)
         ));
 
         // Missing column → Err.
-        let val_missing = serde_json::json!({ "other": "x" });
+        let val_missing = crate::json_val::json_val!({ "other": "x" });
         assert!(matches!(
             (db_decode_decimal::<String>("amount".to_string()).run)(&val_missing),
             IpeResult::Err(_)
@@ -10881,10 +11124,10 @@ mod tests {
             json,
             vec![
                 Some(JsonVal::Null),
-                Some(serde_json::json!("")),
-                Some(serde_json::json!(0)),
-                Some(serde_json::json!(1.5)),
-                Some(serde_json::json!("00ff")),
+                Some(crate::json_val::json_val!("")),
+                Some(crate::json_val::json_val!(0)),
+                Some(crate::json_val::json_val!(1.5)),
+                Some(crate::json_val::json_val!("00ff")),
                 Some(JsonVal::Bool(true)),
             ]
         );
@@ -10897,7 +11140,7 @@ mod tests {
             .expect("fetch finite cells");
         assert_eq!(
             row_to_json(&finite).ok(),
-            Some(serde_json::json!({
+            Some(crate::json_val::json_val!({
                 "nul": null, "empty": "", "zero": 0, "ratio": 1.5, "bytes": "00ff", "flag": true
             }))
         );
@@ -10915,11 +11158,11 @@ mod tests {
         assert!(FiniteF64::new(f64::NEG_INFINITY).is_none());
         assert_eq!(
             FiniteF64::new(-0.0).map(|f| Cell::Float(f).into_json()),
-            Some(serde_json::json!(-0.0))
+            Some(crate::json_val::json_val!(-0.0))
         );
         assert_eq!(
             FiniteF64::new(f64::MAX).map(|f| Cell::Float(f).into_json()),
-            Some(serde_json::json!(f64::MAX))
+            Some(crate::json_val::json_val!(f64::MAX))
         );
     }
 
@@ -13215,7 +13458,7 @@ mod tests {
     /// unproven target, before any lookup.
     #[tokio::test]
     async fn pin_refuses_options_for_a_host_the_url_does_not_name() {
-        let url = UnambiguousUrl::parse("postgres://8.8.8.8/x");
+        let url = PostgresUrl::parse("postgres://8.8.8.8/x");
         let options = "postgres://1.1.1.1/x".parse::<sqlx::postgres::PgConnectOptions>();
         assert!(url.is_ok() && options.is_ok());
         let (Ok(url), Ok(options)) = (url, options) else {
@@ -13281,9 +13524,9 @@ mod tests {
     #[tokio::test]
     async fn pg_gate_pins_a_named_host_against_rebinding() {
         let resolver = PublicThenPrivate::new();
-        let gated = pg_gate_with(
-            "postgres://u:p@rebind.example:5432/x?sslmode=disable",
-            DialPolicy::DenyPrivate,
+        let gated = pg_gate_relay(
+            "postgres://u:p@rebind.example:5432/x?sslmode=verify-ca",
+            RelaySupport::Absent,
             &resolver,
         )
         .await
@@ -13356,20 +13599,14 @@ mod tests {
         assert!(admitted.is_ok(), "{:?}", admitted.err());
     }
 
-    /// DNS rebinding under every mode that may negotiate TLS: the host keeps
+    /// DNS rebinding under every mode a remote host may use: the host keeps
     /// its name for SNI and certificate verification, the driver dials the
     /// relay socket, and the relay carries the dial to the address vetted by
     /// the only lookup, so the rebound (private) answer is never dialled.
     #[cfg(unix)]
     #[tokio::test]
     async fn pg_gate_relays_a_tls_named_host_to_its_vetted_address() {
-        for mode in [
-            "",
-            "?sslmode=prefer",
-            "?sslmode=require",
-            "?sslmode=verify-ca",
-            "?sslmode=verify-full",
-        ] {
+        for mode in ["", "?sslmode=verify-ca", "?sslmode=verify-full"] {
             let resolver = PublicThenPrivate::new();
             let url = format!("postgres://u:p@rebind.example:5432/x{mode}");
             let gated = pg_gate_with(&url, DialPolicy::DenyPrivate, &resolver).await;
@@ -13394,6 +13631,219 @@ mod tests {
                 "{url:?}: the name must be resolved exactly once"
             );
         }
+    }
+
+    /// The `sslmode` the gated options carry for `url` under allow-all, by its driver name.
+    async fn gated_ssl_mode(url: &str) -> Result<String, DbConnectError> {
+        pg_gate(url, DialPolicy::AllowAll)
+            .await
+            .map(|(options, _)| format!("{:?}", options.get_ssl_mode()))
+    }
+
+    /// A URL naming no `sslmode` that dials a remote host verifies the
+    /// server, whatever the driver would default to.
+    #[tokio::test]
+    async fn an_absent_sslmode_on_a_remote_host_verifies_the_server() {
+        for url in [
+            "postgres://u@db.example/x",
+            "postgres://u@1.1.1.1/x",
+            "postgres://u@127.0.0.1/x?host=db.example",
+        ] {
+            assert_eq!(
+                gated_ssl_mode(url).await,
+                Ok("VerifyFull".to_owned()),
+                "{url:?}"
+            );
+        }
+    }
+
+    /// A URL naming no host leaves the host to the driver, which may read
+    /// `PGHOST`, so it is treated as remote.
+    #[test]
+    fn a_driver_default_target_is_not_local() {
+        for url in ["postgres:///db", "postgres:db?user=admin"] {
+            let transport = PostgresUrl::parse(url).map(|url| url.transport);
+            assert_eq!(
+                transport.ok(),
+                Some(PgTransport::Verified(crate::dsn::TlsMode::VerifyFull)),
+                "{url:?}"
+            );
+        }
+        for url in [
+            "postgres:///db?sslmode=disable",
+            "postgres:db?sslmode=require",
+        ] {
+            assert!(
+                matches!(
+                    PostgresUrl::parse(url).err(),
+                    Some(DbConnectError::UnverifiedTls { .. })
+                ),
+                "{url:?}"
+            );
+        }
+    }
+
+    /// Every unverified `sslmode` spelling on a remote host is refused at
+    /// parse, naming the mode.
+    #[test]
+    fn an_unverified_sslmode_on_a_remote_host_is_refused() {
+        use crate::dsn::UnverifiedSslMode;
+        for host in [
+            "db.example",
+            "1.1.1.1",
+            "[2606:4700::1111]",
+            "localhost.db.example",
+        ] {
+            for (query, mode) in [
+                ("sslmode=disable", UnverifiedSslMode::Disable),
+                ("sslmode=allow", UnverifiedSslMode::Allow),
+                ("sslmode=prefer", UnverifiedSslMode::Prefer),
+                ("sslmode=require", UnverifiedSslMode::Require),
+                ("ssl-mode=require", UnverifiedSslMode::Require),
+                ("sslmode=REQUIRE", UnverifiedSslMode::Require),
+                (
+                    "sslmode=verify-full&sslmode=disable",
+                    UnverifiedSslMode::Disable,
+                ),
+            ] {
+                let url = format!("postgres://u:p@{host}/x?{query}");
+                assert_eq!(
+                    PostgresUrl::parse(&url).err(),
+                    Some(DbConnectError::UnverifiedTls { mode }),
+                    "{url:?}"
+                );
+                assert_eq!(
+                    DbUrl::parse(&url).err(),
+                    Some(DbConnectError::UnverifiedTls { mode }),
+                    "{url:?}"
+                );
+            }
+        }
+    }
+
+    /// An unverified `sslmode` on a URL with one remote target among local
+    /// ones is refused, since that target has an on-path party.
+    #[test]
+    fn an_unverified_sslmode_with_any_remote_target_is_refused() {
+        for url in [
+            "postgres://127.0.0.1/x?host=db.example&sslmode=disable",
+            "postgres://localhost/x?hostaddr=8.8.8.8&sslmode=disable",
+            "postgres:///x?host=/var/run/postgresql&host=db.example&sslmode=require",
+            "postgres://[::ffff:127.0.0.1]/x?sslmode=disable",
+        ] {
+            assert!(
+                matches!(
+                    PostgresUrl::parse(url).err(),
+                    Some(DbConnectError::UnverifiedTls { .. })
+                ),
+                "{url:?}"
+            );
+        }
+    }
+
+    /// On local targets an unverified `sslmode` is dialled as written, and an
+    /// absent one dials as `prefer`.
+    #[tokio::test]
+    async fn an_unverified_sslmode_on_local_targets_is_dialled_as_written() {
+        for base in [
+            "postgres://u@127.0.0.1/x",
+            "postgres://u@127.0.0.2/x",
+            "postgres://u@[::1]/x",
+            "postgres://u@LocalHost/x",
+            "postgres://u@%2Fvar%2Frun%2Fpostgresql/x",
+            "postgres:///x?host=/var/run/postgresql",
+        ] {
+            for (query, mode) in [
+                ("", "Prefer"),
+                ("sslmode=disable", "Disable"),
+                ("sslmode=allow", "Allow"),
+                ("sslmode=prefer", "Prefer"),
+                ("ssl-mode=require", "Require"),
+                ("sslmode=verify-ca", "VerifyCa"),
+            ] {
+                let url = match (query.is_empty(), base.contains('?')) {
+                    (true, _) => base.to_owned(),
+                    (false, true) => format!("{base}&{query}"),
+                    (false, false) => format!("{base}?{query}"),
+                };
+                assert_eq!(gated_ssl_mode(&url).await, Ok(mode.to_owned()), "{url:?}");
+            }
+        }
+    }
+
+    /// The refusal names the mode, its risk and the remedy, and the remedy
+    /// it names is a URL that parses.
+    #[test]
+    fn an_unverified_tls_refusal_names_a_remedy_that_parses() {
+        let refused = PostgresUrl::parse("postgres://u:s3cr3t@db.example/x?sslmode=require").err();
+        let text = refused
+            .as_ref()
+            .map(ToString::to_string)
+            .unwrap_or_default();
+        assert!(
+            matches!(refused, Some(DbConnectError::UnverifiedTls { .. })),
+            "{text}"
+        );
+        for part in [
+            "sslmode=require",
+            "does not verify the server certificate",
+            "sslmode=verify-full",
+        ] {
+            assert!(text.contains(part), "{text:?} must name {part:?}");
+        }
+        assert!(!text.contains("s3cr3t"), "{text:?}");
+        assert!(PostgresUrl::parse("postgres://u:s3cr3t@db.example/x?sslmode=verify-full").is_ok());
+    }
+
+    /// Printed by [`ambient_pgsslmode_child`] once its checks hold.
+    const AMBIENT_SSLMODE_IGNORED: &str = "ambient PGSSLMODE ignored";
+
+    /// Runs under `PGSSLMODE=disable` as a child process of
+    /// [`an_ambient_pgsslmode_never_decides_the_transport`].
+    #[ignore = "run as a child process by an_ambient_pgsslmode_never_decides_the_transport"]
+    #[tokio::test]
+    async fn ambient_pgsslmode_child() {
+        assert_eq!(
+            gated_ssl_mode("postgres://u@db.example/x").await,
+            Ok("VerifyFull".to_owned())
+        );
+        assert_eq!(
+            gated_ssl_mode("postgres://u@127.0.0.1/x").await,
+            Ok("Prefer".to_owned())
+        );
+        println!("{AMBIENT_SSLMODE_IGNORED}");
+    }
+
+    /// `PGSSLMODE` in the environment never decides an operator URL's
+    /// transport: the child holding `PGSSLMODE=disable` still verifies a
+    /// remote server.
+    #[allow(clippy::expect_used)] // test harness: a test binary that cannot re-run itself is an environment issue
+    #[test]
+    fn an_ambient_pgsslmode_never_decides_the_transport() {
+        let module = module_path!();
+        let module = module.split_once("::").map_or(module, |(_, rest)| rest);
+        let filter = format!("{module}::ambient_pgsslmode_child");
+        let exe = std::env::current_exe().expect("the test binary");
+        let out = std::process::Command::new(exe)
+            .args([
+                "--exact",
+                filter.as_str(),
+                "--ignored",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env("PGSSLMODE", "disable")
+            .stdin(std::process::Stdio::null())
+            .output()
+            .expect("run the child test");
+        let stdout = String::from_utf8(out.stdout).unwrap_or_default();
+        let stderr = String::from_utf8(out.stderr).unwrap_or_default();
+        assert!(
+            out.status.success()
+                && stdout.contains(AMBIENT_SSLMODE_IGNORED)
+                && stdout.contains("ok. 1 passed;"),
+            "the child must run its one test and pass:\n{stdout}\n{stderr}"
+        );
     }
 
     /// A relay that could not be opened refuses the dial as `RelayUnavailable`.
@@ -13537,10 +13987,22 @@ mod tests {
         })
     }
 
-    /// Dial a fake TLS PostgreSQL server as `host` under `verify-full`, only
+    /// Options naming `host` under `verify-full`.
+    #[cfg(unix)]
+    fn pg_verify_full_options(host: &str) -> sqlx::postgres::PgConnectOptions {
+        sqlx::postgres::PgConnectOptions::new()
+            .host(host)
+            .username("ipe")
+            .database("ipe")
+            .ssl_mode(sqlx::postgres::PgSslMode::VerifyFull)
+    }
+
+    /// Dial a fake TLS PostgreSQL server with `base`'s host and TLS mode, only
     /// through a relay pinned to the server's address.
     #[cfg(unix)]
-    async fn dial_pg_tls_through_relay(host: &str) -> (Result<(), DriverFailure>, Option<TlsSeen>) {
+    async fn dial_pg_tls_through_relay(
+        base: sqlx::postgres::PgConnectOptions,
+    ) -> (Result<(), DriverFailure>, Option<TlsSeen>) {
         let io_failure = || {
             DriverFailure::of(
                 DbEngine::Postgres,
@@ -13571,13 +14033,9 @@ mod tests {
         let Ok(relay) = relay else {
             return (Err(io_failure()), None);
         };
-        let options = sqlx::postgres::PgConnectOptions::new()
-            .host(host)
+        let options = base
             .port(5432)
             .socket(relay.socket_dir())
-            .username("ipe")
-            .database("ipe")
-            .ssl_mode(sqlx::postgres::PgSslMode::VerifyFull)
             .ssl_root_cert_from_pem(PG_TLS_CA_PEM.to_vec());
         let limit = std::time::Duration::from_secs(20);
         let connected = tokio::time::timeout(limit, options.connect()).await;
@@ -13603,7 +14061,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn relayed_tls_dial_sends_the_host_name_and_verifies_it() {
-        let (_outcome, seen) = dial_pg_tls_through_relay(PG_TLS_HOST).await;
+        let (_outcome, seen) = dial_pg_tls_through_relay(pg_verify_full_options(PG_TLS_HOST)).await;
         assert_eq!(
             seen,
             Some(TlsSeen {
@@ -13618,7 +14076,8 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn relayed_tls_dial_refuses_a_certificate_for_another_name() {
-        let (outcome, seen) = dial_pg_tls_through_relay("other.example.test").await;
+        let (outcome, seen) =
+            dial_pg_tls_through_relay(pg_verify_full_options("other.example.test")).await;
         assert!(
             matches!(
                 &outcome,
@@ -13630,6 +14089,52 @@ mod tests {
             seen.as_ref()
                 .is_some_and(|s| s.sni.as_deref() == Some("other.example.test") && !s.handshaken),
             "{seen:?}"
+        );
+    }
+
+    /// The driver options a `Dsn` with no `sslmode` dials as `host`.
+    #[cfg(unix)]
+    fn pg_options_of_default_dsn(host: &str) -> Option<sqlx::postgres::PgConnectOptions> {
+        match crate::dsn::dsn_parse::<String>(format!("postgres://ipe@{host}/ipe")) {
+            IpeResult::Ok(d) => d.connection_url().parse().ok(),
+            IpeResult::Err(_) => None,
+        }
+    }
+
+    /// A `Dsn` that names no `sslmode` dials verifying the server.
+    ///
+    /// A certificate for another name is refused before the handshake
+    /// completes, and one for the dialled name is accepted.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn default_dsn_refuses_a_certificate_for_another_name() {
+        let refused = pg_options_of_default_dsn("other.example.test");
+        assert!(refused.is_some(), "the default DSN does not parse");
+        let Some(refused) = refused else {
+            return;
+        };
+        let (outcome, seen) = dial_pg_tls_through_relay(refused).await;
+        assert!(
+            matches!(
+                &outcome,
+                Err(f) if f.failure() == IpeDbFailure::Unreachable
+            ),
+            "{outcome:?}"
+        );
+        assert!(
+            seen.as_ref()
+                .is_some_and(|s| s.sni.as_deref() == Some("other.example.test") && !s.handshaken),
+            "{seen:?}"
+        );
+        let accepted = pg_options_of_default_dsn(PG_TLS_HOST);
+        assert!(accepted.is_some(), "the default DSN does not parse");
+        let Some(accepted) = accepted else {
+            return;
+        };
+        let (_outcome, seen) = dial_pg_tls_through_relay(accepted).await;
+        assert!(
+            seen.is_some_and(|s| s.handshaken),
+            "the matching name was refused"
         );
     }
 

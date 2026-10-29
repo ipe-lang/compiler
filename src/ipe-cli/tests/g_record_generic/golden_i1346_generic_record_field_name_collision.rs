@@ -9,8 +9,8 @@
 //! set {q} maps to two non-alpha-equivalent generic shapes") on this well-typed
 //! source — an ICE, a Principle-3 soundness violation.
 //!
-//! The fix keys each distinct generic occurrence by its `skeleton_key` (the
-//! alpha-equivalence normal form) and emits ONE struct per skeleton, mirroring
+//! The fix groups generic occurrences by alpha-equivalence
+//! (`ipe_ir::alpha_equivalent_fields`) and emits ONE struct per class, mirroring
 //! the monomorphic-sibling path that already disambiguates concrete records
 //! sharing a field-name set. `ipe` must emit `main.rs` byte-identical to the
 //! checked-in golden — TWO generic structs `struct RecQ<T1> { q: T1 }` and

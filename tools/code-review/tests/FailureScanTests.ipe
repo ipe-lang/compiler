@@ -188,10 +188,10 @@ isConversion names at =
 
 
 -- Every site an error becomes text: the startup refusals `Main` prints, the
--- root parse that names the failed path, and the server log.
+-- root refusal's problem that names the failure, and the server log.
 admittedConversions : List String
 admittedConversions =
-    [ "Lib/RepoPath.ipe:parseRoot"
+    [ "Lib/RepoPath.ipe:failureProblem"
     , "Lib/ServerLog.ipe:logged"
     , "Main.ipe:printStartupFailure"
     ]

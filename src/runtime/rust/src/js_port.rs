@@ -143,7 +143,7 @@ pub(crate) const MAX_OUTSTANDING: usize = 256;
 /// that does not reply within this window resolves the Task with `Err`. The
 /// value is generous — it covers slow-permission-prompt flows. A per-call
 /// override is a tracked follow-up.
-const REQUEST_TIMEOUT_MS: u64 = 10_000;
+pub const REQUEST_TIMEOUT_MS: u64 = 10_000;
 
 // ─── Session-stream wire keys + bounds ──────────────────────────────────────
 
@@ -403,10 +403,10 @@ mod native {
         // session's stream/terminal BEFORE the one-shot-reply check, so a session
         // frame can never be misrouted to a `js_request` waiter or a broadcast
         // subscriber. An unknown/closed/foreign session id is dropped fail-closed.
-        if let Ok(mut value) = serde_json::from_str::<serde_json::Value>(&raw)
+        if let Ok(mut value) = serde_json::from_str::<JsonVal>(&raw)
             && let Some(sess_val) = value
                 .as_object_mut()
-                .and_then(|o| o.remove(SESSION_ID_FIELD))
+                .and_then(|o| o.swap_remove(SESSION_ID_FIELD))
             && let Some(session_id) = sess_val.as_u64()
         {
             deliver_session_frame(sid, session_id, value);
@@ -417,8 +417,10 @@ mod native {
         // Wire format: `{"__ipe_id": <u64>, "payload": <sealed_reply>}`.
         // After stripping `__ipe_id`, the remaining object's `"payload"` field is
         // the sealed reply value forwarded to the waiting decoder.
-        if let Ok(mut value) = serde_json::from_str::<serde_json::Value>(&raw)
-            && let Some(id_val) = value.as_object_mut().and_then(|o| o.remove(COR_ID_FIELD))
+        if let Ok(mut value) = serde_json::from_str::<JsonVal>(&raw)
+            && let Some(id_val) = value
+                .as_object_mut()
+                .and_then(|o| o.swap_remove(COR_ID_FIELD))
             && let Some(id) = id_val.as_u64()
         {
             // Extract the `"payload"` field from the remaining envelope,
@@ -426,7 +428,7 @@ mod native {
             // the wrapper is still decoded (fail-closed if neither decodes).
             let payload = value
                 .as_object_mut()
-                .and_then(|o| o.remove("payload"))
+                .and_then(|o| o.swap_remove("payload"))
                 .unwrap_or(value);
             let waiter = lock_sessions()
                 .get_mut(&sid.0)
@@ -461,16 +463,16 @@ mod native {
     /// The `session_id` is the registry key minted by [`next_cor_id`]; a
     /// JS-injected id cannot forge a live session because the key is never derived
     /// from an inbound frame.
-    fn deliver_session_frame(sid: &SessionId, session_id: u64, mut value: serde_json::Value) {
+    fn deliver_session_frame(sid: &SessionId, session_id: u64, mut value: JsonVal) {
         let is_terminal = value
             .as_object_mut()
-            .and_then(|o| o.remove(SESSION_TERMINAL_FIELD))
+            .and_then(|o| o.swap_remove(SESSION_TERMINAL_FIELD))
             .and_then(|t| t.as_bool())
             .unwrap_or(false);
         // Extract the inner `"payload"`, falling back to the whole remaining value.
         let payload = value
             .as_object_mut()
-            .and_then(|o| o.remove("payload"))
+            .and_then(|o| o.swap_remove("payload"))
             .unwrap_or(value);
 
         let mut g = lock_sessions();
@@ -525,7 +527,7 @@ mod native {
             // malformed wire string. The seal is not loosened either way.
             match serde_json::to_value(&payload) {
                 Ok(value) => {
-                    let encoded = seal_encode(&value);
+                    let encoded = seal_encode(&JsonVal::from_serde(value));
                     if let Some(sid) = SessionId::parse(origin) {
                         deliver_or_buffer(&sid, &encoded);
                     }
@@ -652,7 +654,7 @@ mod native {
                 COR_ID_FIELD: cor_id,
                 "payload": outbound_json,
             });
-            let encoded = seal_encode(&envelope);
+            let encoded = seal_encode(&JsonVal::from_serde(envelope));
 
             // Register the one-shot waiter.
             let (tx, rx) = oneshot::channel::<JsonVal>();
@@ -774,7 +776,7 @@ mod native {
                 SESSION_ID_FIELD: session_id,
                 "payload": outbound_json,
             });
-            let encoded = seal_encode(&envelope);
+            let encoded = seal_encode(&JsonVal::from_serde(envelope));
             deliver_or_buffer(&sid, &encoded);
             crate::core::IpeResult::Ok(session_id as i64)
         })
@@ -848,7 +850,7 @@ mod native {
                         SESSION_ID_FIELD: session_id,
                         "payload": value,
                     });
-                    let encoded = seal_encode(&envelope);
+                    let encoded = seal_encode(&JsonVal::from_serde(envelope));
                     if let Some(sid) = SessionId::parse(origin) {
                         deliver_or_buffer(&sid, &encoded);
                     }
@@ -915,7 +917,7 @@ mod native {
                         SESSION_ID_FIELD: session_id,
                         "payload": v,
                     });
-                    let encoded = seal_encode(&envelope);
+                    let encoded = seal_encode(&JsonVal::from_serde(envelope));
                     // Route through the single delivery chokepoint so a close
                     // Cmd fired during an SSE reopen window (sink not yet
                     // rebound) is buffered in the session's bounded
@@ -1048,10 +1050,10 @@ mod wasm {
     pub fn push_inbound(raw: &str) {
         // A session-tagged frame is routed to its session BEFORE the one-shot-reply
         // check, so a session frame can never be misrouted. Unknown id → dropped.
-        if let Ok(mut value) = serde_json::from_str::<serde_json::Value>(raw)
+        if let Ok(mut value) = serde_json::from_str::<JsonVal>(raw)
             && let Some(sess_val) = value
                 .as_object_mut()
-                .and_then(|o| o.remove(SESSION_ID_FIELD))
+                .and_then(|o| o.swap_remove(SESSION_ID_FIELD))
             && let Some(session_id) = sess_val.as_u64()
         {
             deliver_session_frame(session_id, value);
@@ -1059,14 +1061,16 @@ mod wasm {
         }
         // Peek for a correlation id (fail-closed: a parse error falls through).
         // Wire format: `{"__ipe_id": <u64>, "payload": <sealed_reply>}`.
-        if let Ok(mut value) = serde_json::from_str::<serde_json::Value>(raw)
-            && let Some(id_val) = value.as_object_mut().and_then(|o| o.remove(COR_ID_FIELD))
+        if let Ok(mut value) = serde_json::from_str::<JsonVal>(raw)
+            && let Some(id_val) = value
+                .as_object_mut()
+                .and_then(|o| o.swap_remove(COR_ID_FIELD))
             && let Some(id) = id_val.as_u64()
         {
             // Extract `"payload"`, falling back to the whole remaining value.
             let payload = value
                 .as_object_mut()
-                .and_then(|o| o.remove("payload"))
+                .and_then(|o| o.swap_remove("payload"))
                 .unwrap_or(value);
             let waiter = PENDING.with(|p| p.borrow_mut().remove(&id));
             if let Some(cb) = waiter {
@@ -1086,15 +1090,15 @@ mod wasm {
     /// Fail-closed: an unknown/closed session id is dropped whole; a terminal
     /// resolves the close waiter and evicts; an ordinary frame is charged against
     /// the budget and fanned to the session's drains, terminating on overflow.
-    fn deliver_session_frame(session_id: u64, mut value: serde_json::Value) {
+    fn deliver_session_frame(session_id: u64, mut value: JsonVal) {
         let is_terminal = value
             .as_object_mut()
-            .and_then(|o| o.remove(SESSION_TERMINAL_FIELD))
+            .and_then(|o| o.swap_remove(SESSION_TERMINAL_FIELD))
             .and_then(|t| t.as_bool())
             .unwrap_or(false);
         let payload = value
             .as_object_mut()
-            .and_then(|o| o.remove("payload"))
+            .and_then(|o| o.swap_remove("payload"))
             .unwrap_or(value);
 
         if is_terminal {
@@ -1130,18 +1134,63 @@ mod wasm {
         }
     }
 
-    /// Deliver one seal-encoded outbound frame to the browser by calling the
-    /// registered `window.ipeOnReceive` handler. A missing or non-callable
-    /// handler is a no-op (the page simply has not wired a receiver yet).
-    fn deliver_outbound(encoded: &str) {
+    /// What became of one outbound frame handed to the page host.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum DeliverOutcome {
+        /// The host took the frame.
+        Delivered,
+        /// No callable `window.ipeOnReceive` exists, or it answered that nothing
+        /// on the page takes the frame.
+        NoHost,
+        /// The host threw while taking the frame.
+        HostThrew,
+    }
+
+    impl DeliverOutcome {
+        /// The typed refusal a call reports when its frame found no host.
+        ///
+        /// `None` when the frame was delivered.
+        fn refusal(self, call: &str) -> Option<IpeError> {
+            match self {
+                Self::Delivered => None,
+                Self::NoHost => Some(IpeError::unavailable(format!(
+                    "{call}: no page host takes port frames"
+                ))),
+                Self::HostThrew => Some(IpeError::unavailable(format!(
+                    "{call}: the page host threw on the port frame"
+                ))),
+            }
+        }
+
+        /// Report a fire-and-forget frame no host took.
+        ///
+        /// The line names the call only, never the payload.
+        fn warn_undelivered(self, call: &str) {
+            if let Some(refusal) = self.refusal(call) {
+                crate::wasm::console_warn(&refusal.to_string());
+            }
+        }
+    }
+
+    /// Deliver one seal-encoded outbound frame to the page host.
+    ///
+    /// The host is the registered `window.ipeOnReceive` handler. A handler that
+    /// answers `false` reports that no sink or receiver on the page takes the
+    /// frame; any other answer is a delivery.
+    pub fn deliver_outbound(encoded: &str) -> DeliverOutcome {
         let Some(window) = web_sys::window() else {
-            return;
+            return DeliverOutcome::NoHost;
         };
         let Ok(handler) = js_sys::Reflect::get(&window, &JsValue::from_str("ipeOnReceive")) else {
-            return;
+            return DeliverOutcome::NoHost;
         };
-        if let Ok(func) = handler.dyn_into::<js_sys::Function>() {
-            let _ = func.call1(&JsValue::NULL, &JsValue::from_str(encoded));
+        let Ok(func) = handler.dyn_into::<js_sys::Function>() else {
+            return DeliverOutcome::NoHost;
+        };
+        match func.call1(&JsValue::NULL, &JsValue::from_str(encoded)) {
+            Ok(answer) if answer.as_bool() == Some(false) => DeliverOutcome::NoHost,
+            Ok(_) => DeliverOutcome::Delivered,
+            Err(_) => DeliverOutcome::HostThrew,
         }
     }
 
@@ -1157,7 +1206,8 @@ mod wasm {
     {
         IpeCmd::Publish(Box::new(move |_origin| {
             if let Ok(value) = serde_json::to_value(&payload) {
-                deliver_outbound(&seal_encode(&value));
+                deliver_outbound(&seal_encode(&JsonVal::from_serde(value)))
+                    .warn_undelivered("js_send");
             }
             0
         }))
@@ -1228,7 +1278,7 @@ mod wasm {
                 COR_ID_FIELD: cor_id,
                 "payload": outbound_json,
             });
-            let encoded = seal_encode(&envelope);
+            let encoded = seal_encode(&JsonVal::from_serde(envelope));
 
             // Build a Promise whose resolve/reject pair is stored as the waiter.
             // When `push_inbound` gets a correlated reply it calls the stored
@@ -1236,9 +1286,14 @@ mod wasm {
             // The `Closure`s are `forget`-ed so they live until the promise
             // settles — a bounded leak (one per outstanding request, cleaned up
             // when the promise resolves or the timeout fires).
+            // The frame is delivered inside the executor, after the waiter is
+            // registered, so no reply can arrive before the waiter exists and a
+            // frame no host takes rejects the promise at once.
+            let mut outcome = DeliverOutcome::Delivered;
             let promise = js_sys::Promise::new(&mut |resolve, reject| {
                 // `resolve` receives the reply payload JSON as a JsValue string.
-                // `reject` is called by the timeout closure.
+                // `reject` is called by the timeout closure, or at once when no
+                // host takes the frame.
                 let resolve_rc = Rc::new(resolve);
                 let reject_rc = Rc::new(reject);
 
@@ -1254,6 +1309,13 @@ mod wasm {
                     );
                 });
 
+                outcome = deliver_outbound(&encoded);
+                if outcome != DeliverOutcome::Delivered {
+                    PENDING.with(|p| p.borrow_mut().remove(&cor_id));
+                    let _ = reject_rc.call0(&JsValue::NULL);
+                    return;
+                }
+
                 // Set up the timeout to call reject.
                 let reject_cb = wasm_bindgen::closure::Closure::once(move || {
                     let _ = reject_rc.call0(&JsValue::NULL);
@@ -1268,11 +1330,8 @@ mod wasm {
                 reject_cb.forget();
             });
 
-            // Deliver outbound AFTER registering the waiter so no reply can
-            // arrive before the waiter is installed.
-            deliver_outbound(&encoded);
-
-            // Await the promise (resolve = reply arrived; reject = timeout).
+            // Await the promise (resolve = reply arrived; reject = no host or
+            // timeout).
             let js_fut = wasm_bindgen_futures::JsFuture::from(promise);
             match js_fut.await {
                 Ok(reply_js) => {
@@ -1288,9 +1347,12 @@ mod wasm {
                     }
                 }
                 Err(_) => {
-                    // Timeout (promise rejected by setTimeout) or unknown error.
                     PENDING.with(|p| p.borrow_mut().remove(&cor_id));
-                    crate::core::IpeResult::Err("js_request: timeout".to_string().into())
+                    crate::core::IpeResult::Err(
+                        outcome
+                            .refusal("js_request")
+                            .unwrap_or_else(|| "js_request: timeout".to_string().into()),
+                    )
                 }
             }
         })
@@ -1339,7 +1401,11 @@ mod wasm {
                 SESSION_ID_FIELD: session_id,
                 "payload": outbound_json,
             });
-            deliver_outbound(&seal_encode(&envelope));
+            let outcome = deliver_outbound(&seal_encode(&JsonVal::from_serde(envelope)));
+            if let Some(refusal) = outcome.refusal("js_open_session") {
+                SESSIONS.with(|s| s.borrow_mut().remove(&session_id));
+                return crate::core::IpeResult::Err(refusal);
+            }
             crate::core::IpeResult::Ok(session_id as i64)
         })
     }
@@ -1395,7 +1461,8 @@ mod wasm {
                     SESSION_ID_FIELD: session_id,
                     "payload": value,
                 });
-                deliver_outbound(&seal_encode(&envelope));
+                deliver_outbound(&seal_encode(&JsonVal::from_serde(envelope)))
+                    .warn_undelivered("js_send_to_session");
             }
             0
         }))
@@ -1430,6 +1497,14 @@ mod wasm {
                     );
                 }
             };
+            let envelope = serde_json::json!({
+                SESSION_ID_FIELD: session_id,
+                "payload": outbound_json,
+            });
+            let encoded = seal_encode(&JsonVal::from_serde(envelope));
+            // Delivered inside the executor, after the terminal waiter is
+            // installed, so a frame no host takes rejects the promise at once.
+            let mut delivered = DeliverOutcome::Delivered;
             let promise = js_sys::Promise::new(&mut |resolve, reject| {
                 let resolve_rc = Rc::new(resolve);
                 let reject_rc = Rc::new(reject);
@@ -1442,6 +1517,11 @@ mod wasm {
                         }));
                     }
                 });
+                delivered = deliver_outbound(&encoded);
+                if delivered != DeliverOutcome::Delivered {
+                    let _ = reject_rc.call0(&JsValue::NULL);
+                    return;
+                }
                 let reject_cb = wasm_bindgen::closure::Closure::once(move || {
                     let _ = reject_rc.call0(&JsValue::NULL);
                 });
@@ -1453,11 +1533,6 @@ mod wasm {
                 }
                 reject_cb.forget();
             });
-            let envelope = serde_json::json!({
-                SESSION_ID_FIELD: session_id,
-                "payload": outbound_json,
-            });
-            deliver_outbound(&seal_encode(&envelope));
 
             let js_fut = wasm_bindgen_futures::JsFuture::from(promise);
             let outcome = js_fut.await;
@@ -1473,9 +1548,11 @@ mod wasm {
                         )),
                     }
                 }
-                Err(_) => {
-                    crate::core::IpeResult::Err("js_close_session: timeout".to_string().into())
-                }
+                Err(_) => crate::core::IpeResult::Err(
+                    delivered
+                        .refusal("js_close_session")
+                        .unwrap_or_else(|| "js_close_session: timeout".to_string().into()),
+                ),
             }
         })
     }
@@ -1483,8 +1560,8 @@ mod wasm {
 
 #[cfg(all(target_arch = "wasm32", feature = "wasm-client"))]
 pub use wasm::{
-    js_close_session, js_open_session, js_request, js_send, js_send_to_session, js_session_frames,
-    js_subscribe, push_inbound,
+    DeliverOutcome, deliver_outbound, js_close_session, js_open_session, js_request, js_send,
+    js_send_to_session, js_session_frames, js_subscribe, push_inbound,
 };
 
 #[cfg(all(test, not(target_arch = "wasm32")))]
@@ -1528,7 +1605,7 @@ mod tests {
     #[test]
     fn outbound_encodes_record_canonically() {
         // A record payload seal-encodes to canonical sorted-key JSON.
-        let value: JsonVal = serde_json::json!({ "b": 2, "a": 1 });
+        let value: JsonVal = crate::json_val::json_val!({ "b": 2, "a": 1 });
         assert_eq!(seal_encode(&value), r#"{"a":1,"b":2}"#);
     }
 

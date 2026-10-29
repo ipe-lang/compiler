@@ -501,6 +501,10 @@ could not determine the per-user cache directory: neither XDG_CACHE_HOME nor the
 
 {var} is set but is not an absolute path; set it to an absolute directory or unset it to use the default location
 
+## cli-env-switch-not-recognised
+
+{var} is set to "{got}", which is not one of {admitted}; set it to one of those spellings or unset it to use the default
+
 ## cli-registry-url-not-https
 
 {var} must be an https:// URL ({reason}); set it to an https:// base URL, set it to empty to read only the local registry checkout, or unset it to use the default registry
@@ -1563,6 +1567,14 @@ ipe doc: stdlib index failed: {detail}
 ## doc-bundle-build-error
 
 ipe doc: bundle build error: {detail}
+
+## doc-overlay-name
+
+ipe doc: `{path}` in the docs directory is not a page name; name a page with lowercase letters, digits and hyphens (`my-page.md`), or move it out of the docs directory
+
+## doc-overlay-too-large
+
+ipe doc: the pages in the docs directory together pass {limit} bytes; remove pages from the docs directory
 
 ## doc-unknown-kind
 

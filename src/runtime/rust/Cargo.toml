@@ -21,6 +21,7 @@ path = "src/mod.rs"
 # whose order is part of the contract; the `Map` must keep insertion order rather
 # than sort keys, so serialization emits keys in the order given.
 serde_json = { version = "1", features = ["preserve_order"], optional = true }
+indexmap = { version = "2", optional = true }
 jsonwebtoken = { version = "9", optional = true }
 # `crypto_core.rs` (the cryptographic floor: SHA-2 hash + HMAC family + typed
 # Key/Mac + entropy pair + constant-time compare) is behind the `crypto-core`
@@ -36,7 +37,7 @@ aes-gcm = { version = "0.10", optional = true }
 chacha20poly1305 = { version = "0.10", optional = true }
 pbkdf2 = { version = "0.12", optional = true }
 flate2 = { version = "1", optional = true }
-zstd = { version = "0.13", optional = true }
+zstd = { version = "0.14", optional = true }
 csv = { version = "1", optional = true }
 toml = { version = "0.8", optional = true }
 serde-saphyr = { version = "1.3", default-features = false, features = ["deserialize"], optional = true }
@@ -402,7 +403,7 @@ serde = ["dep:serde", "rust_decimal?/serde"]
 # `serde_json::Value` stringify + every `IpeMaybe`/record round-trip need the
 # derives). It must NOT drag `jsonwebtoken` (+ ring) into a plain JSON program —
 # the JWT surface is the separate `jwt` feature.
-json = ["dep:serde_json", "serde"]
+json = ["dep:serde_json", "dep:indexmap", "serde"]
 # `sha2` (the `_ipe_migrations` ledger checksum, a cross-backend byte-exact DB
 # contract) rides the `crypto-core` feature `db` lists below. `tokio/sync`:
 # `db.rs`, `telemetry_spill.rs`, and the `tea` loop use `tokio::sync`. BOTH the
@@ -705,6 +706,9 @@ tokio = { version = "1", features = ["full", "test-util", "macros"] }
 # A fake TLS PostgreSQL server proves the pinned relay keeps SNI and
 # certificate host-name verification.
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+# `tests/per_event_render_budget.rs` counts the allocations of a render pass
+# through an instrumented global allocator, installed in that test binary only.
+stats_alloc = "0.1.10"
 
 # `pipe`: the echo-guard tests build a non-tty fd pair.
 [target.'cfg(unix)'.dev-dependencies]

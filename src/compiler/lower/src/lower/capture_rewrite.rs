@@ -1,7 +1,8 @@
 //! The shared-capture pre-clone rewrite: given a lowered IR body and a symbol
 //! that needs `Arc`/shared treatment, wrap every `Lambda`/`SharedLambda` (and
 //! synthetic `TaskSeq` continuation) that directly reads the symbol in a
-//! `let sym = sym.clone() in <node>` shadow, so a `move` closure captures the
+//! pre-clone shadow ([`Expr::pre_clone`], one [`Expr::CaptureClones`] node per
+//! closure whatever the number of symbols), so a `move` closure captures the
 //! fresh clone rather than moving the original out of an enclosing `Fn` env
 //! (E0507/E0382). The rewrite is over-inclusive by design — a spurious
 //! `Arc::clone` is a cheap pointer bump, whereas a missed wrap is a real
@@ -23,7 +24,7 @@ use super::pat_binds_symbol;
 /// (after [`force_shared_capture_clones`] has recursed into the nested
 /// lambdas), never the raw pre-recursion body. Recursion is what makes the
 /// predicate sound as a wrap decision: when the inner lambda genuinely
-/// captures `sym`, its own wrap plants a `Let { sym, CloneVar(sym), .. }`
+/// captures `sym`, its own wrap plants a `CaptureClones` listing `sym`
 /// directly in the enclosing lambda's body, turning what was an
 /// only-behind-a-nested-lambda reference into a DIRECT one this predicate
 /// now sees — so the pre-clone relays outward through every move-closure
@@ -88,6 +89,11 @@ fn sym_referenced_directly(sym: Symbol, expr: &Expr) -> bool {
         }
         Expr::TailRecur { args } => args.iter().any(|a| sym_referenced_directly(sym, a)),
         Expr::Access { record, .. } => sym_referenced_directly(sym, record),
+        // The node clones each listed symbol from the enclosing scope: listing
+        // `sym` is a direct read of it (the relay).
+        Expr::CaptureClones { syms, body } => {
+            syms.contains(&sym) || sym_referenced_directly(sym, body)
+        }
         // A further-nested closure boundary — its own captures are its own
         // concern, not a DIRECT reference of the lambda we are testing.
         Expr::Lambda { .. }
@@ -279,12 +285,22 @@ pub(super) fn force_shared_capture_clones(sym: Symbol, expr: Expr) -> Expr {
         Expr::TailRecur { args } => Expr::TailRecur {
             args: force_shared_capture_clones_all(sym, args),
         },
+        // A node that already clones `sym` shadows it over `body`, like a
+        // `Let` naming `sym`; otherwise a wrap planted at the body's head
+        // merges into this node, so pre-clones never nest.
+        Expr::CaptureClones { syms, body } => {
+            if syms.contains(&sym) {
+                Expr::CaptureClones { syms, body }
+            } else {
+                Expr::pre_clone_all(syms, force_shared_capture_clones(sym, *body))
+            }
+        }
     }
 }
 
 /// Pre-clone `sym` around an already-processed `TaskSeq` whose `rest` reads it.
 ///
-/// The node becomes `let sym = sym.clone() in <TaskSeq>`. This is the one
+/// The node becomes `let sym = sym.clone(); <TaskSeq>` ([`Expr::pre_clone`]). This is the one
 /// placement of a `CloneOk` capture's pre-clone at the entry of a `TaskSeq`
 /// continuation, the `Once` boundary `ipe_ir::once_closure::boundary_kind`
 /// names for the node. The emitter renders `TaskSeq { effect, rest }` as
@@ -301,11 +317,7 @@ fn wrap_task_seq_rest_capture(sym: Symbol, node: Expr) -> Expr {
         return node;
     };
     if sym_referenced_directly(sym, rest) {
-        Expr::Let {
-            name: sym,
-            value: Box::new(Expr::CloneVar(sym)),
-            body: Box::new(node),
-        }
+        Expr::pre_clone(sym, node)
     } else {
         node
     }
@@ -480,9 +492,5 @@ fn wrap_shared_lambda_if_needed(sym: Symbol, lambda_expr: Expr) -> Expr {
     if shadowed || !needs_wrap {
         return rebuilt;
     }
-    Expr::Let {
-        name: sym,
-        value: Box::new(Expr::CloneVar(sym)),
-        body: Box::new(rebuilt),
-    }
+    Expr::pre_clone(sym, rebuilt)
 }

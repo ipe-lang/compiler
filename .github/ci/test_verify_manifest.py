@@ -8961,8 +8961,8 @@ class TestNoForgingToken(unittest.TestCase):
 
 class TestBrowserE2eRunScriptParity(unittest.TestCase):
     """`tools/scripts/browser-e2e/run.sh` serves every app the `browser-e2e`
-    job serves, on the port the job gives it, so a local run drives every
-    spec the job runs."""
+    job serves, on the port the job gives it, and builds every browser bundle
+    the job builds, so a local run drives every spec the job runs."""
 
     REPO = os.path.dirname(os.path.dirname(HERE))
 
@@ -8999,7 +8999,7 @@ class TestBrowserE2eRunScriptParity(unittest.TestCase):
         built = set()
         for step in job["steps"]:
             built.update(re.findall(r"examples/shapes/web/([\w-]+)(?=[\s\"'])", str(step.get("run", ""))))
-        served_apps = set(re.findall(r'^serve ([\w-]+) ', run_sh, re.M))
+        served_apps = set(re.findall(r'^(?:serve|bundle_solo) ([\w-]+)\b', run_sh, re.M))
         self.assertTrue(built, "the job builds no example app")
         self.assertEqual(served_apps, built)
 

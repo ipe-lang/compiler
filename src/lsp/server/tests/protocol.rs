@@ -5,6 +5,7 @@
 //! project).
 
 use std::collections::BTreeMap;
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -274,6 +275,105 @@ fn await_diagnostics(
             return diags;
         }
     }
+}
+
+/// A `do` of as many named binds as the parser admits inside a `Task` lambda
+/// over a handle, every bind read by the final statement: the `do` atom sits
+/// at depth 13, the final statement's list element atom at `25 + 2n`.
+fn at_ceiling_fan_in() -> String {
+    let limit = usize::try_from(ipe_diagnostics::nesting::SOURCE_NESTING_LIMIT).unwrap_or(0);
+    let binds = limit.saturating_sub(25) / 2;
+    let mut src = String::from(
+        "module Main exposing (main)\n\nimport Ipe.Io as Io\nimport Ipe.List as List\n\
+         import Ipe.String as String\nimport Ipe.Task as Task\n\n\n\
+         main =\n    withHandle\n        (\\h ->\n            do\n",
+    );
+    let names: Vec<String> = (1..=binds).map(|i| format!("x{i}")).collect();
+    for name in &names {
+        let _ = writeln!(src, "                {name} <- Task.succeed h");
+    }
+    let _ = write!(
+        src,
+        "                report [ {} ]\n        )\n\n\n\
+         withHandle : (Int -> Task Error ()) -> Task Error ()\n\
+         withHandle f =\n    f 0\n\n\n\
+         report : List Int -> Task Error ()\n\
+         report xs =\n    Io.println (String.fromInt (List.length xs))\n",
+        names.join(", ")
+    );
+    src
+}
+
+/// The diagnostics worker compiles a program at the parser's ceiling on the
+/// declared compile stack and publishes its (clean) diagnostics; the server
+/// stays up to answer the shutdown that follows.
+#[test]
+fn at_ceiling_program_publishes_diagnostics_from_the_worker() {
+    let (server_side, client) = Connection::memory();
+    let server = std::thread::Builder::new()
+        .spawn(move || ipe_lsp_server::run_with_connection(&server_side, &FixtureLoader))
+        .expect("spawn test thread");
+    client
+        .sender
+        .send(Message::Request(Request::new(
+            RequestId::from(1),
+            "initialize".to_owned(),
+            serde_json::json!({ "capabilities": {} }),
+        )))
+        .expect("send initialize");
+    let _ = recv_response(&client, 1);
+    client
+        .sender
+        .send(Message::Notification(Notification::new(
+            "initialized".to_owned(),
+            serde_json::json!({}),
+        )))
+        .expect("send initialized");
+
+    let uri = format!("file://{VIRTUAL_PATH}");
+    client
+        .sender
+        .send(Message::Notification(Notification::new(
+            "textDocument/didOpen".to_owned(),
+            serde_json::json!({
+                "textDocument": {
+                    "uri": uri, "languageId": "ipe", "version": 1, "text": at_ceiling_fan_in()
+                }
+            }),
+        )))
+        .expect("send didOpen");
+    let diags = await_diagnostics(&client, &uri, |diags| {
+        diags
+            .iter()
+            .all(|d| d.get("severity") != Some(&serde_json::json!(1)))
+    });
+    assert!(
+        diags
+            .iter()
+            .all(|d| d.get("severity") != Some(&serde_json::json!(1))),
+        "the at-ceiling program has no error: {diags:?}"
+    );
+
+    client
+        .sender
+        .send(Message::Request(Request::new(
+            RequestId::from(2),
+            "shutdown".to_owned(),
+            serde_json::Value::Null,
+        )))
+        .expect("send shutdown");
+    let _ = recv_response(&client, 2);
+    client
+        .sender
+        .send(Message::Notification(Notification::new(
+            "exit".to_owned(),
+            serde_json::Value::Null,
+        )))
+        .expect("send exit");
+    server
+        .join()
+        .expect("server thread joins")
+        .expect("server exits clean");
 }
 
 #[test]

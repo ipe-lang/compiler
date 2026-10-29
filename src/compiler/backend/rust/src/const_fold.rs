@@ -360,6 +360,10 @@ fn fold_expr(expr: Expr, funcs: &BTreeMap<FuncId, &Func>, interner: &Interner) -
             effect: go_box(effect),
             rest: go_box(rest),
         },
+        Expr::CaptureClones { syms, body } => Expr::CaptureClones {
+            syms,
+            body: go_box(body),
+        },
         Expr::TailLoop { params, body } => Expr::TailLoop {
             params,
             body: go_box(body),
@@ -548,7 +552,8 @@ fn body_has_tail_construct(expr: &Expr) -> bool {
         Expr::Access { record, .. } => body_has_tail_construct(record),
         Expr::Lambda { body, .. }
         | Expr::SharedLambda { body, .. }
-        | Expr::OnceLambda { body, .. } => body_has_tail_construct(body),
+        | Expr::OnceLambda { body, .. }
+        | Expr::CaptureClones { body, .. } => body_has_tail_construct(body),
         Expr::TaskSeq { effect, rest } => {
             body_has_tail_construct(effect) || body_has_tail_construct(rest)
         }
@@ -723,6 +728,22 @@ fn substitute(expr: Expr, subst: &BTreeMap<Symbol, Expr>) -> Expr {
             effect: go_box(effect),
             rest: go_box(rest),
         },
+        // Each listed symbol rebinds itself over `body`, like a `let` of its
+        // own clone. A substituted symbol has no outer binding left to clone,
+        // so its rebinding takes the constant instead.
+        Expr::CaptureClones { syms, body } => {
+            let body = substitute_under_binders(*body, subst, &syms);
+            syms.into_iter()
+                .rev()
+                .fold(body, |body, sym| match subst.get(&sym) {
+                    Some(value) => Expr::Let {
+                        name: sym,
+                        value: Box::new(value.clone()),
+                        body: Box::new(body),
+                    },
+                    None => Expr::pre_clone(sym, body),
+                })
+        }
         Expr::TailLoop { params, body } => {
             let bound: Vec<Symbol> = params.iter().map(|(s, _)| *s).collect();
             let body = substitute_under_binders(*body, subst, &bound);
@@ -975,6 +996,14 @@ fn eval_inner(expr: &Expr, env: &FoldEnv, budget: &mut Budget) -> Option<ConstVa
         Expr::Let { name, value, body } => {
             let v = eval(value, env, budget)?;
             eval_with_local(*name, v, body, env, budget)
+        }
+
+        // Rebinding a symbol to its own clone leaves every local's value as it was.
+        Expr::CaptureClones { syms, body } => {
+            for sym in syms {
+                eval(&Expr::CloneVar(*sym), env, budget)?;
+            }
+            eval(body, env, budget)
         }
 
         Expr::Match(m) => eval_match(m, env, budget),

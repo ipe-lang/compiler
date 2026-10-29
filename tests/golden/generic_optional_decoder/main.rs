@@ -436,9 +436,9 @@ pub fn main_json_int_result(s: String) -> IpeResult<ipe_runtime::error::IpeError
     let _ipe_recursion_guard = crate::recursion_guard();
     decode_from_json_string(
         ({
-            let cap_0 = "age".to_string();
+            let __u_cap_0 = "age".to_string();
             ({
-                let cap_1 = json_decode_int::<IpeError>();
+                let __u_cap_1 = json_decode_int::<IpeError>();
                 {
                     let __ipe_fn: Box<
                         dyn Fn(Decoder<Box<dyn FnOnce(i64) -> String + Send + 'static>>) -> Decoder<String>
@@ -446,8 +446,13 @@ pub fn main_json_int_result(s: String) -> IpeResult<ipe_runtime::error::IpeError
                             + Sync
                             + 'static,
                     > = Box::new(
-                        move |eta_1: Decoder<Box<dyn FnOnce(i64) -> String + Send + 'static>>| -> Decoder<String> {
-                            crate::main_json_optional(cap_0.clone(), cap_1.clone(), 0i64, eta_1)
+                        move |__u_eta_1: Decoder<Box<dyn FnOnce(i64) -> String + Send + 'static>>| -> Decoder<String> {
+                            crate::main_json_optional(
+                                __u_cap_0.clone(),
+                                __u_cap_1.clone(),
+                                0i64,
+                                __u_eta_1,
+                            )
                         },
                     );
                     __ipe_fn
@@ -455,9 +460,9 @@ pub fn main_json_int_result(s: String) -> IpeResult<ipe_runtime::error::IpeError
             })
         })(
             ({
-                let cap_0 = "name".to_string();
+                let __u_cap_0 = "name".to_string();
                 ({
-                    let cap_1 = json_decode_string::<IpeError>();
+                    let __u_cap_1 = json_decode_string::<IpeError>();
                     {
                         let __ipe_fn: Box<
                             dyn Fn(Decoder<Box<dyn FnOnce(String) -> Box<dyn FnOnce(i64) -> String + Send + 'static> + Send + 'static>>) -> Decoder<Box<dyn FnOnce(i64) -> String + Send + 'static>>
@@ -465,14 +470,18 @@ pub fn main_json_int_result(s: String) -> IpeResult<ipe_runtime::error::IpeError
                                 + Sync
                                 + 'static,
                         > = Box::new(
-                            move |eta_0: Decoder<Box<dyn FnOnce(String) -> Box<dyn FnOnce(i64) -> String + Send + 'static> + Send + 'static>>| -> Decoder<Box<dyn FnOnce(i64) -> String + Send + 'static>> {
-                                decode_pipeline_required(cap_0.clone(), cap_1.clone(), eta_0)
+                            move |__u_eta_0: Decoder<Box<dyn FnOnce(String) -> Box<dyn FnOnce(i64) -> String + Send + 'static> + Send + 'static>>| -> Decoder<Box<dyn FnOnce(i64) -> String + Send + 'static>> {
+                                decode_pipeline_required(
+                                    __u_cap_0.clone(),
+                                    __u_cap_1.clone(),
+                                    __u_eta_0,
+                                )
                             },
                         );
                         __ipe_fn
                     }
                 })
-            })(decode_succeed(curry2(crate::main_make_label))),
+            })(decode_succeed(ipe_runtime::json::curry2(crate::main_make_label))),
         ),
         s,
     )
@@ -482,11 +491,11 @@ pub fn main_json_string_result(s: String) -> IpeResult<ipe_runtime::error::IpeEr
     let _ipe_recursion_guard = crate::recursion_guard();
     decode_from_json_string(
         ({
-            let cap_0 = "nick".to_string();
+            let __u_cap_0 = "nick".to_string();
             ({
-                let cap_1 = json_decode_string::<IpeError>();
+                let __u_cap_1 = json_decode_string::<IpeError>();
                 ({
-                    let cap_2 = "none".to_string();
+                    let __u_cap_2 = "none".to_string();
                     {
                         let __ipe_fn: Box<
                             dyn Fn(Decoder<Box<dyn FnOnce(String) -> String + Send + 'static>>) -> Decoder<String>
@@ -494,12 +503,12 @@ pub fn main_json_string_result(s: String) -> IpeResult<ipe_runtime::error::IpeEr
                                 + Sync
                                 + 'static,
                         > = Box::new(
-                            move |eta_1: Decoder<Box<dyn FnOnce(String) -> String + Send + 'static>>| -> Decoder<String> {
+                            move |__u_eta_1: Decoder<Box<dyn FnOnce(String) -> String + Send + 'static>>| -> Decoder<String> {
                                 crate::main_json_optional(
-                                    cap_0.clone(),
-                                    cap_1.clone(),
-                                    cap_2.clone(),
-                                    eta_1,
+                                    __u_cap_0.clone(),
+                                    __u_cap_1.clone(),
+                                    __u_cap_2.clone(),
+                                    __u_eta_1,
                                 )
                             },
                         );
@@ -509,9 +518,9 @@ pub fn main_json_string_result(s: String) -> IpeResult<ipe_runtime::error::IpeEr
             })
         })(
             ({
-                let cap_0 = "name".to_string();
+                let __u_cap_0 = "name".to_string();
                 ({
-                    let cap_1 = json_decode_string::<IpeError>();
+                    let __u_cap_1 = json_decode_string::<IpeError>();
                     {
                         let __ipe_fn: Box<
                             dyn Fn(Decoder<Box<dyn FnOnce(String) -> Box<dyn FnOnce(String) -> String + Send + 'static> + Send + 'static>>) -> Decoder<Box<dyn FnOnce(String) -> String + Send + 'static>>
@@ -519,14 +528,18 @@ pub fn main_json_string_result(s: String) -> IpeResult<ipe_runtime::error::IpeEr
                                 + Sync
                                 + 'static,
                         > = Box::new(
-                            move |eta_0: Decoder<Box<dyn FnOnce(String) -> Box<dyn FnOnce(String) -> String + Send + 'static> + Send + 'static>>| -> Decoder<Box<dyn FnOnce(String) -> String + Send + 'static>> {
-                                decode_pipeline_required(cap_0.clone(), cap_1.clone(), eta_0)
+                            move |__u_eta_0: Decoder<Box<dyn FnOnce(String) -> Box<dyn FnOnce(String) -> String + Send + 'static> + Send + 'static>>| -> Decoder<Box<dyn FnOnce(String) -> String + Send + 'static>> {
+                                decode_pipeline_required(
+                                    __u_cap_0.clone(),
+                                    __u_cap_1.clone(),
+                                    __u_eta_0,
+                                )
                             },
                         );
                         __ipe_fn
                     }
                 })
-            })(decode_succeed(curry2(crate::main_make_tag))),
+            })(decode_succeed(ipe_runtime::json::curry2(crate::main_make_tag))),
         ),
         s,
     )
@@ -535,9 +548,9 @@ pub fn main_json_string_result(s: String) -> IpeResult<ipe_runtime::error::IpeEr
 pub fn main_row_decoder() -> Decoder<String> {
     let _ipe_recursion_guard = crate::recursion_guard();
     ({
-        let cap_0 = "age".to_string();
+        let __u_cap_0 = "age".to_string();
         ({
-            let cap_1 = db_decode_int("age".to_string());
+            let __u_cap_1 = db_decode_int("age".to_string());
             {
                 let __ipe_fn: Box<
                     dyn Fn(Decoder<Box<dyn FnOnce(i64) -> String + Send + 'static>>) -> Decoder<String>
@@ -545,8 +558,13 @@ pub fn main_row_decoder() -> Decoder<String> {
                         + Sync
                         + 'static,
                 > = Box::new(
-                    move |eta_1: Decoder<Box<dyn FnOnce(i64) -> String + Send + 'static>>| -> Decoder<String> {
-                        crate::main_db_optional(cap_0.clone(), cap_1.clone(), 0i64, eta_1)
+                    move |__u_eta_1: Decoder<Box<dyn FnOnce(i64) -> String + Send + 'static>>| -> Decoder<String> {
+                        crate::main_db_optional(
+                            __u_cap_0.clone(),
+                            __u_cap_1.clone(),
+                            0i64,
+                            __u_eta_1,
+                        )
                     },
                 );
                 __ipe_fn
@@ -554,9 +572,9 @@ pub fn main_row_decoder() -> Decoder<String> {
         })
     })(
         ({
-            let cap_0 = "name".to_string();
+            let __u_cap_0 = "name".to_string();
             ({
-                let cap_1 = db_decode_string("name".to_string());
+                let __u_cap_1 = db_decode_string("name".to_string());
                 {
                     let __ipe_fn: Box<
                         dyn Fn(Decoder<Box<dyn FnOnce(String) -> Box<dyn FnOnce(i64) -> String + Send + 'static> + Send + 'static>>) -> Decoder<Box<dyn FnOnce(i64) -> String + Send + 'static>>
@@ -564,14 +582,14 @@ pub fn main_row_decoder() -> Decoder<String> {
                             + Sync
                             + 'static,
                     > = Box::new(
-                        move |eta_0: Decoder<Box<dyn FnOnce(String) -> Box<dyn FnOnce(i64) -> String + Send + 'static> + Send + 'static>>| -> Decoder<Box<dyn FnOnce(i64) -> String + Send + 'static>> {
-                            db_decode_required(cap_0.clone(), cap_1.clone(), eta_0)
+                        move |__u_eta_0: Decoder<Box<dyn FnOnce(String) -> Box<dyn FnOnce(i64) -> String + Send + 'static> + Send + 'static>>| -> Decoder<Box<dyn FnOnce(i64) -> String + Send + 'static>> {
+                            db_decode_required(__u_cap_0.clone(), __u_cap_1.clone(), __u_eta_0)
                         },
                     );
                     __ipe_fn
                 }
             })
-        })(decode_succeed(curry2(crate::main_make_label))),
+        })(decode_succeed(ipe_runtime::json::curry2(crate::main_make_label))),
     )
 }
 

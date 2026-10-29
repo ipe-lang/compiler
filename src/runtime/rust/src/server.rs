@@ -1520,7 +1520,9 @@ pub(crate) enum RequestRejection {
     /// The body exceeds the request-body ceiling.
     PayloadTooLarge,
     /// The path or query is not a well-formed URL (a malformed escape, decoded
-    /// bytes that are not UTF-8, an over-cap component or too many query pairs).
+    /// bytes that are not UTF-8, an over-cap component or too many query
+    /// pairs), or the headers have no one reading (a repeated singleton, a
+    /// value outside visible ASCII).
     BadRequest,
     /// The request-body ceiling's environment value is malformed.
     Unavailable,
@@ -1598,7 +1600,8 @@ pub enum Spelling {
     Respelled,
 }
 
-/// The listener's parse of one request URL, carried as a request extension.
+/// The listener's parse of one request URL and its headers, carried as a
+/// request extension.
 ///
 /// Only [`CanonicalUrl`] builds one, so a handler that finds none was reached
 /// without the listener's parse and refuses rather than parse again. Its path
@@ -1610,6 +1613,7 @@ pub(crate) struct StrictUrl {
     spelling: Spelling,
     path: crate::encoding::RequestPath,
     query: Arc<HashMap<String, String>>,
+    headers: Arc<crate::http_header::RequestHeaders>,
 }
 
 impl StrictUrl {
@@ -1635,6 +1639,11 @@ impl StrictUrl {
         &self.query
     }
 
+    /// The program-visible request headers.
+    pub(crate) fn headers(&self) -> &crate::http_header::RequestHeaders {
+        &self.headers
+    }
+
     /// This parse with its path below `base`, or `None` when `base` is not a
     /// whole-segment prefix of it.
     fn below(&self, base: &crate::encoding::DecodedPath) -> Option<Self> {
@@ -1643,6 +1652,7 @@ impl StrictUrl {
             spelling: self.spelling,
             path: self.path.below(base)?,
             query: Arc::clone(&self.query),
+            headers: Arc::clone(&self.headers),
         })
     }
 }
@@ -1861,14 +1871,17 @@ fn work_cancelled() -> axum::response::Response {
     resp
 }
 
-/// Parse `request`'s URL once, respell its path canonically and record the
-/// parse as its [`StrictUrl`] extension.
+/// Parse `request`'s URL and headers once, respell its path canonically and
+/// record the parse as its [`StrictUrl`] extension.
 ///
 /// # Errors
 ///
-/// `BadRequest` for a malformed path or query, or a path whose canonical
-/// spelling exceeds the URL component ceiling.
+/// `BadRequest` for a malformed path or query, a path whose canonical
+/// spelling exceeds the URL component ceiling, or headers with no one reading
+/// ([`crate::http_header::RequestHeaders::parse`]).
 fn canonicalise(request: &mut axum::extract::Request) -> Result<(), RequestRejection> {
+    let headers = crate::http_header::RequestHeaders::parse(request.headers())
+        .map_err(|_| RequestRejection::BadRequest)?;
     let uri = request.uri();
     let path = crate::encoding::RequestPath::parse(uri.path())
         .map_err(|_| RequestRejection::BadRequest)?;
@@ -1887,6 +1900,7 @@ fn canonicalise(request: &mut axum::extract::Request) -> Result<(), RequestRejec
         spelling,
         path,
         query: Arc::new(query),
+        headers: Arc::new(headers),
     });
     Ok(())
 }
@@ -2141,6 +2155,41 @@ pub fn request_cookie(headers: &axum::http::HeaderMap, name: &CookieName) -> Opt
     request_cookie_jar(headers).find_map(|(k, v)| (k == name.text()).then_some(v))
 }
 
+/// The client address a handler reads as `remoteAddr`.
+///
+/// The TCP peer by default. Only with `trust_proxy` (the operator declares one
+/// trusted proxy in front, `IPE_TRUSTED_PROXY`) does a forwarding header
+/// decide: the RIGHTMOST `X-Forwarded-For` entry, the one that proxy appended
+/// (every entry left of it is client-supplied), or else `X-Real-Ip`. A
+/// forwarded value that is not an IP address falls back to the peer, never
+/// to its raw text.
+fn remote_address(
+    headers: &crate::http_header::RequestHeaders,
+    peer: Option<std::net::IpAddr>,
+    trust_proxy: bool,
+) -> String {
+    let forwarded = if trust_proxy {
+        headers.get("X-Forwarded-For").map_or_else(
+            || {
+                headers
+                    .get("X-Real-Ip")
+                    .and_then(|v| v.trim().parse::<std::net::IpAddr>().ok())
+            },
+            |list| {
+                list.rsplit(',')
+                    .next()
+                    .and_then(|entry| entry.trim().parse::<std::net::IpAddr>().ok())
+            },
+        )
+    } else {
+        None
+    };
+    forwarded
+        .or(peer)
+        .map(|ip| ip.to_string())
+        .unwrap_or_default()
+}
+
 /// Build the Ipê `ServerRequest` from the axum request.
 ///
 /// Its path parameters are the decoded segments `pattern` captures from the
@@ -2174,57 +2223,26 @@ async fn build_request(
         .map(str::to_owned)
         .zip(captured.into_segments())
         .collect();
-    let mut headers = HashMap::new();
+    // The listener's one header fold, keyed by canonical MIME casing, so
+    // `server_header` (which canonicalises its lookup key) matches any caller
+    // casing and the dict agrees with `Ipe.Web`'s.
+    let headers = strict.headers().as_dict().clone();
+    let trust_proxy = crate::system::read_env_var("IPE_TRUSTED_PROXY")
+        .map(|v| !v.is_empty() && v != "0" && v != "false")
+        .unwrap_or(false);
+    let peer = req
+        .extensions()
+        .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
+        .map(|ci| ci.0.ip());
+    let remote_addr = remote_address(strict.headers(), peer, trust_proxy);
     let mut cookies = HashMap::new();
-    // Read from the raw bytes of every `Cookie` header, outside the text gate
-    // below, so one pair with a non-ASCII byte drops only itself. The first
+    // Read from the raw bytes of every `Cookie` header, outside the header
+    // fold, so one pair with a non-ASCII byte drops only itself. The first
     // value of a name wins.
     for (name, value) in request_cookie_jar(req.headers()) {
         cookies.entry(name).or_insert(value);
     }
-    for (k, v) in req.headers() {
-        if let Ok(s) = v.to_str() {
-            // Store under  canonical MIME casing (`content-type` ->
-            // `Content-Type`), aligning with  request-header storage and the
-            // Ipe.Web path, so `server_header` (which canonicalises its lookup
-            // key) matches any caller casing.
-            headers.insert(
-                crate::http_header::canonical_header(k.as_str()),
-                s.to_string(),
-            );
-        }
-    }
     let (mut parts, body) = req.into_parts();
-    // remoteAddr: trust the real TCP peer (ConnectInfo) by DEFAULT. Only honour a
-    // proxy's X-Forwarded-For / X-Real-IP when `IPE_TRUSTED_PROXY` is set — i.e.
-    // the operator declares the app sits behind a trusted proxy that sets those
-    // headers. Trusting client-supplied XFF unconditionally let ANY client spoof
-    // their IP → rate-limit bypass (the fixed-window limiter keys on remoteAddr)
-    // + forged access logs. Security-by-default: spoofable headers are opt-in.
-    let peer = parts
-        .extensions
-        .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
-        .map(|ci| ci.0.ip().to_string());
-    let trust_proxy = crate::system::read_env_var("IPE_TRUSTED_PROXY")
-        .map(|v| !v.is_empty() && v != "0" && v != "false")
-        .unwrap_or(false);
-    let remote_addr = if trust_proxy {
-        headers
-            .iter()
-            .find(|(k, _)| k.eq_ignore_ascii_case("x-forwarded-for"))
-            .map(|(_, v)| v.split(',').next().unwrap_or("").trim().to_string())
-            .filter(|s| !s.is_empty())
-            .or_else(|| {
-                headers
-                    .iter()
-                    .find(|(k, _)| k.eq_ignore_ascii_case("x-real-ip"))
-                    .map(|(_, v)| v.clone())
-            })
-            .or(peer)
-            .unwrap_or_default()
-    } else {
-        peer.unwrap_or_default()
-    };
     // Extract the WebSocket upgrader if this is an upgrade request
     // (succeeds only when the Connection/Upgrade/Sec-WebSocket-* headers are
     // present). Stashed via task-local so server_web_socket_upgrade can reach it.
@@ -2559,9 +2577,6 @@ enum ServerStartRefusal {
         earlier: RefusedText,
         later: RefusedText,
     },
-    /// A second `Server.mountApp` Web app on one server.
-    #[cfg(feature = "web")]
-    SecondMount,
     /// The router refused an insert every listen check admitted.
     RouterRejected { endpoint: RefusedText },
 }
@@ -2582,12 +2597,6 @@ impl std::fmt::Display for ServerStartRefusal {
                  mounts may not share a prefix; give each mount its own prefix (a prefix nested \
                  under another is served by the longer one)"
             ),
-            #[cfg(feature = "web")]
-            Self::SecondMount => f.write_str(
-                "Server.mountApp: at most one Web app may be mounted per server (the embedded \
-                 app's cookie/CSRF/asset paths are scoped through one process-wide base path); \
-                 mount a single Web app, or serve additional apps as separate servers",
-            ),
             Self::RouterRejected { endpoint } => write!(
                 f,
                 "Server.listen: the router refused to register endpoint `{endpoint}` beside the \
@@ -2607,8 +2616,6 @@ impl ServerStartRefusal {
             Self::Overlap { .. } | Self::SharedPrefix { .. } | Self::RouterRejected { .. } => {
                 IpeError::conflict(message)
             }
-            #[cfg(feature = "web")]
-            Self::SecondMount => IpeError::conflict(message),
         }
     }
 }
@@ -3126,13 +3133,6 @@ pub fn server_listen<E: crate::FromIpeError + Send + 'static>(
             ))));
         }
         let mut app: axum::Router = axum::Router::new();
-        // At most ONE mounted web app per server: the embedded app's cookie /
-        // CSRF / asset paths are scoped through the process-wide base path
-        // (`IPE_WEB_BASE_PATH`), so a SECOND mount at a different prefix would
-        // silently mis-scope the first. Reject the second fail-closed (before
-        // bind) rather than serve a subtly broken session/CSRF surface.
-        #[cfg(feature = "web")]
-        let mut web_mounted = false;
         let mut mounts = Vec::new();
         for r in routes {
             match r.target {
@@ -3151,22 +3151,20 @@ pub fn server_listen<E: crate::FromIpeError + Send + 'static>(
                     };
                 }
                 // `Server.mountApp`: build the embedded web app's router for its
-                // prefix and serve it below that prefix on this same listener
-                // (one port). The builder is taken once; a duplicate (a cloned
-                // route) finds `None` and is skipped — inert.
+                // parsed base and serve it below that prefix on this same
+                // listener (one port). Each app carries its own base in its
+                // state, so any number of apps mount at distinct prefixes. The
+                // builder is taken once; a duplicate (a cloned route) finds
+                // `None` and is skipped — inert.
                 #[cfg(feature = "web")]
                 ParsedTarget::MountWeb(base, cell) => {
-                    if web_mounted {
-                        return refuse(ServerStartRefusal::SecondMount);
-                    }
                     let builder = cell
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner)
                         .take();
                     if let Some(build) = builder {
-                        let sub = build(base.prefix().to_owned()).await;
+                        let sub = build(base.clone()).await;
                         mounts.push((base, sub));
-                        web_mounted = true;
                     }
                 }
             }
@@ -6373,8 +6371,6 @@ mod tests {
                 ServerStartRefusal::RouterRejected { endpoint: text() },
                 K::Conflict,
             ),
-            #[cfg(feature = "web")]
-            (ServerStartRefusal::SecondMount, K::Conflict),
         ];
         for (refusal, kind) in cases {
             let shown = refusal.to_string();
@@ -6949,6 +6945,143 @@ mod tests {
         assert_eq!(req.cookies.get("sid").map(String::as_str), Some("v"));
         assert_eq!(req.cookies.get("csrf").map(String::as_str), Some("t"));
         assert!(!req.cookies.contains_key("x"), "{:?}", req.cookies);
+        assert!(
+            !req.headers.contains_key("Cookie"),
+            "the cookie parser alone reads `Cookie`"
+        );
+    }
+
+    /// Serve one GET `/u/1` carrying `headers` through the listener to a
+    /// counting handler; returns the status, the body and the run count.
+    #[allow(clippy::expect_used)] // test: fixed requests build
+    async fn serve_with_headers(
+        headers: &[(&str, &[u8])],
+    ) -> (axum::http::StatusCode, String, usize) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tower::ServiceExt;
+        let runs = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&runs);
+        let handler: ErasedHandler = Arc::new(move |req: ServerRequest| {
+            counter.fetch_add(1, Ordering::SeqCst);
+            let resp = server_text(
+                req.headers
+                    .get("Authorization")
+                    .cloned()
+                    .unwrap_or_default(),
+            );
+            Box::pin(async move { Ok(resp) })
+                as std::pin::Pin<
+                    Box<dyn std::future::Future<Output = Result<ServerResponse, String>> + Send>,
+                >
+        });
+        let app = behind_listener(endpoint_router("/u/:id", handler));
+        let mut wire = axum::http::Request::builder().method("GET").uri("/u/1");
+        for (name, value) in headers {
+            wire = wire.header(
+                *name,
+                axum::http::HeaderValue::from_bytes(value).expect("a valid header value"),
+            );
+        }
+        let resp = match app
+            .oneshot(
+                wire.body(axum::body::Body::empty())
+                    .expect("test request builds"),
+            )
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => match e {},
+        };
+        let status = resp.status();
+        let body = axum_body_string(resp).await;
+        (status, body, runs.load(Ordering::SeqCst))
+    }
+
+    /// Prove the refusal: two `Authorization` headers, or a decodable one
+    /// beside an undecodable copy, answer the fixed 400 and never reach the
+    /// handler; the listener and the handler can never read different copies.
+    #[tokio::test]
+    async fn a_repeated_singleton_header_never_reaches_the_server_handler() {
+        for headers in [
+            [
+                ("authorization", b"Bearer a".as_slice()),
+                ("authorization", b"Bearer b".as_slice()),
+            ],
+            [
+                ("authorization", b"Bearer \xC3\xA9".as_slice()),
+                ("authorization", b"Bearer b".as_slice()),
+            ],
+            [
+                ("host", b"a.example".as_slice()),
+                ("host", b"b.example".as_slice()),
+            ],
+        ] {
+            let (status, body, runs) = serve_with_headers(&headers).await;
+            assert_eq!(status, axum::http::StatusCode::BAD_REQUEST, "{headers:?}");
+            assert_eq!(body, "Bad Request", "{headers:?} must not echo");
+            assert_eq!(runs, 0, "{headers:?} must never reach the handler");
+        }
+        let (status, body, runs) =
+            serve_with_headers(&[("authorization", b"Bearer a".as_slice())]).await;
+        assert_eq!(status, axum::http::StatusCode::OK);
+        assert_eq!(body, "Bearer a");
+        assert_eq!(runs, 1);
+    }
+
+    /// A list header's copies reach the handler combined in arrival order.
+    #[tokio::test]
+    async fn build_request_combines_a_list_header_in_order() {
+        let wire = axum::http::Request::builder()
+            .method("GET")
+            .uri("/")
+            .header(axum::http::header::ACCEPT, "text/html")
+            .header(axum::http::header::ACCEPT, "application/json")
+            .body(axum::body::Body::empty())
+            .expect("test request builds");
+        let built = routed_build("/", wire).await;
+        let Some(Ok(req)) = built else {
+            assert!(matches!(built, Some(Ok(_))), "a list header must build");
+            return;
+        };
+        assert_eq!(
+            req.headers.get("Accept").map(String::as_str),
+            Some("text/html, application/json")
+        );
+    }
+
+    /// The fold of `headers`, for the remote-address tests.
+    #[allow(clippy::expect_used)] // test: fixed names and values are valid
+    fn folded(headers: &[(&'static str, &'static str)]) -> crate::http_header::RequestHeaders {
+        let mut map = axum::http::HeaderMap::new();
+        for (name, value) in headers {
+            map.append(*name, axum::http::HeaderValue::from_static(value));
+        }
+        crate::http_header::RequestHeaders::parse(&map).expect("the headers fold")
+    }
+
+    /// Behind a trusted proxy the address is the rightmost `X-Forwarded-For`
+    /// entry, the one that proxy appended; a client-written entry left of it
+    /// never wins, and a value that is not an IP address falls back to the peer.
+    #[test]
+    fn remote_addr_takes_rightmost_xff_entry() {
+        let peer = Some(std::net::IpAddr::from([10, 0, 0, 1]));
+        let forwarded = folded(&[("x-forwarded-for", "6.6.6.6, 1.2.3.4")]);
+        assert_eq!(remote_address(&forwarded, peer, true), "1.2.3.4");
+        let split = folded(&[
+            ("x-forwarded-for", "6.6.6.6"),
+            ("x-forwarded-for", "1.2.3.4"),
+        ]);
+        assert_eq!(remote_address(&split, peer, true), "1.2.3.4");
+        for text in ["not-an-ip", "1.2.3.4, ", "1.2.3.4, evil"] {
+            let junk = folded(&[("x-forwarded-for", text)]);
+            assert_eq!(remote_address(&junk, peer, true), "10.0.0.1", "{text:?}");
+        }
+        let real = folded(&[("x-real-ip", "1.2.3.4")]);
+        assert_eq!(remote_address(&real, peer, true), "1.2.3.4");
+        let real_junk = folded(&[("x-real-ip", "spoofed text")]);
+        assert_eq!(remote_address(&real_junk, peer, true), "10.0.0.1");
+        assert_eq!(remote_address(&forwarded, peer, false), "10.0.0.1");
+        assert_eq!(remote_address(&forwarded, None, false), "");
     }
 
     /// Serve `uri` through a real `method_router` routed on `/u/:id`.
@@ -7298,6 +7431,10 @@ mod tests {
                 spelling: Spelling::Canonical,
                 path: crate::encoding::RequestPath::parse(parsed).expect("the path parses"),
                 query: Arc::new(HashMap::new()),
+                headers: Arc::new(
+                    crate::http_header::RequestHeaders::parse(&axum::http::HeaderMap::new())
+                        .expect("no headers fold"),
+                ),
             });
             wire
         };

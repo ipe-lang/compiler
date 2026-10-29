@@ -87,6 +87,14 @@ pub struct BuildOptions {
     /// `ipe dev build` / `ipe dev run` / `ipe release` entries leave it `false` so a
     /// release artifact never carries hot-swap scaffolding. Default `false`.
     pub hot_appearance: bool,
+    /// Who chooses the runtime crate the emitted project links.
+    ///
+    /// [`runtime_embed::RuntimeOrigin::Gate`] links only the compiler's embedded
+    /// copy and always selects the dependency model, whatever `runtime_dep`
+    /// says: a vendored tree would be read from a caller's `runtime_dir`, so a
+    /// gate build has no vendored shape. Default
+    /// [`runtime_embed::RuntimeOrigin::Developer`].
+    pub runtime_origin: runtime_embed::RuntimeOrigin,
 }
 
 /// Where a build writes its emitted crate.
@@ -238,6 +246,7 @@ fn loose_emit_settings(
         static_plan: _,
         runtime_dep: _,
         tree_shake_vendored: _,
+        runtime_origin: _,
     } = options;
     let crate_name = match role {
         runtime_embed::BundleRole::Out => single_file_crate_name(),
@@ -249,6 +258,7 @@ fn loose_emit_settings(
         target: *target,
         wasm_public_env: Vec::new(),
         mount_base: MountBase::root(),
+        server_origins: ipe_backend_rust::ServerOrigins::none(),
         wasm_hydrate_mode: false,
         runtime_dep: None,
         debugger: *debugger,
@@ -284,6 +294,7 @@ fn manifest_emit_settings(
         static_plan: _,
         runtime_dep: _,
         tree_shake_vendored: _,
+        runtime_origin: _,
     } = options;
     // The emitted crate identity is uniquified per project so two projects
     // that share a friendly name but live at different paths own SEPARATE
@@ -319,6 +330,7 @@ fn manifest_emit_settings(
             project::WasmConfig::On(bundle) => bundle.public_env.to_names(),
         },
         mount_base: manifest.delivery.browser.base.clone(),
+        server_origins: manifest.delivery.servers.clone(),
         wasm_hydrate_mode: matches!(
             &manifest.wasm,
             project::WasmConfig::On(bundle) if bundle.mode == project::WasmMode::Hydrate
@@ -443,11 +455,31 @@ impl Default for BuildOptions {
             tree_shake_vendored: false,
             debugger: false,
             hot_appearance: false,
+            runtime_origin: runtime_embed::RuntimeOrigin::Developer,
         }
     }
 }
 
 impl BuildOptions {
+    /// The options of a gate's build: the release, native, served emit linking
+    /// only the compiler's embedded runtime.
+    ///
+    /// Nothing here is read from the environment or the working directory.
+    #[must_use]
+    pub fn gate() -> Self {
+        Self {
+            runtime_dep: true,
+            runtime_origin: runtime_embed::RuntimeOrigin::Gate,
+            ..Self::default()
+        }
+    }
+
+    /// Whether the emitted project names the runtime as a path dependency.
+    #[must_use]
+    pub const fn links_runtime_dependency(&self) -> bool {
+        self.runtime_dep || matches!(self.runtime_origin, runtime_embed::RuntimeOrigin::Gate)
+    }
+
     /// The default build options with the emit model resolved from the
     /// environment (dependency-model by default; vendored under
     /// `IPE_RUNTIME_VENDORED=1`). The zero-configuration entrypoints
@@ -652,7 +684,7 @@ pub fn build_test_into(
     let blame_path = view
         .module(view.entry())
         .map_or_else(|| manifest_path.clone(), |held| held.path().to_path_buf());
-    let cache_site = cache::env_cache_dir(&target.path()?);
+    let cache_site = cache::env_cache_dir(&target.path()?)?;
     compile_source_set_observed(
         super::PackageSourceSet::from_test_view(view),
         view.entry(),
@@ -925,7 +957,7 @@ pub fn compile_modules(
     source: &SettingsSource<'_>,
     options: BuildOptions,
 ) -> Result<EmittedCrate, CliError> {
-    let cache_site = cache::env_cache_dir(&target.path()?);
+    let cache_site = cache::env_cache_dir(&target.path()?)?;
     compile_modules_observed(
         sources,
         discovered,
@@ -1074,8 +1106,8 @@ fn compile_source_set_here(
     // worse, a wrong — runtime. Native and wasm share the ONE dependency model
     // (the wasm emit selects the crate's `wasm-client` floor + reached surface,
     // built for `wasm32-unknown-unknown`).
-    let runtime_dep = if options.runtime_dep {
-        match runtime_embed::resolve() {
+    let runtime_dep = if options.links_runtime_dependency() {
+        match runtime_embed::resolve_for(options.runtime_origin) {
             Ok(resolved) => Some(ipe_backend_rust::RuntimeDep {
                 root: resolved.root().to_path_buf(),
             }),
@@ -1848,16 +1880,14 @@ pub fn compile_prepared(
         widget_manifest.entry(tag).or_insert(content);
     }
 
-    // Layer-2 wasm security gate (IPE-N0030, M5): the client entry's
-    // reachability closure must not transitively reach a server-classified
-    // module. Runs BEFORE Layer 1 so a reachability violation gets the
-    // friendlier exact-chain message; Layer 1 remains the flat,
-    // defense-in-depth backstop for everything this closure does not cover
-    // (e.g. a server kernel named directly in the entry's own module).
-    // `linked.name` is the client entry's module path for today's
-    // single-entry `--target wasm` build (a distinct `[wasm].entry` module
-    // takes the same role once the M6 integration wires a separate client
-    // entry through).
+    // Layer-2 wasm security gate (IPE-N0030, M5): the client entry's closure
+    // (`ipe_canon::reach::EntryClosure`, the defs the emitted crate is cut down
+    // to) must not reach a server-only def in another module. Runs BEFORE
+    // Layer 1 so a reachability violation gets the friendlier exact-chain
+    // message; Layer 1 judges the same closure at each reference (e.g. a server
+    // kernel named directly in the entry's own module). `linked.name` is the
+    // client entry's module path for today's single-entry `--target wasm`
+    // build.
     if config.settings(db).target == ipe_ir::Target::WasmClient {
         let gate_result = {
             let interner = shared_interner.lock();
@@ -1875,11 +1905,12 @@ pub fn compile_prepared(
     }
 
     // Layer-1 wasm security gate (IPE-N0029): under `--target wasm`, every
-    // kernel named anywhere in the linked program must be on the WasmClient
-    // allowlist. Runs on the LINKED module (everything linked is emitted, so
-    // a denied kernel anywhere would otherwise become a cargo failure — THE
-    // SEAL — or a secret consumer in a public bundle). Blame via the same
-    // span→file heuristic the type errors use.
+    // kernel named in a def the entry can reach must be on the WasmClient
+    // allowlist (a reached denied kernel would otherwise become a cargo
+    // failure — THE SEAL — or a secret consumer in a public bundle). A def the
+    // entry cannot reach is pruned before emit, and the emitted set is
+    // re-judged after lowering below. Blame via the same span→file heuristic
+    // the type errors use.
     if config.settings(db).target == ipe_ir::Target::WasmClient {
         let gate_result = {
             let interner = shared_interner.lock();
@@ -1897,8 +1928,8 @@ pub fn compile_prepared(
     }
 
     // Co-located WASI (`wasm32-wasip1`) sealed-floor gate: the build-boundary
-    // backstop to the delivery matrix's shape gate. Every kernel named anywhere
-    // in the linked program must be on the WASI-viable sealed floor
+    // backstop to the delivery matrix's shape gate. Every kernel named in a def
+    // the entry can reach must be on the WASI-viable sealed floor
     // (`available_on(WasmWasi)`); a kernel outside it has no wasip1 runtime
     // symbol, so this refusal replaces a `cargo build --target wasm32-wasip1`
     // failure (THE SEAL). Defense in depth: even a kernel reached through a path
@@ -1984,16 +2015,55 @@ pub fn compile_prepared(
     // would be a redundant duplicate of the SAME memoized query (its error
     // maps through the same `span_attributed_err` closure either way).
     // Demanded here, on the production path, purely as a FORWARD SEAM:
-    // nothing downstream consumes its value yet (no pruning pass exists —
-    // see the query's own doc for the honestly-recorded scope), matching the
-    // `kernel_types` precedent (materialized and proven memoized
-    // before it has a real consumer). The demand costs nothing observable in
-    // emitted bytes — the point is to put the query on the same path the
-    // clean-vs-incremental parity gate drives, so a future divergence in this
-    // analysis cannot go undetected.
+    // nothing downstream consumes its value yet (see the query's own doc for
+    // the honestly-recorded scope), matching the `kernel_types` precedent
+    // (materialized and proven memoized before it has a real consumer). The
+    // demand costs nothing observable in emitted bytes — the point is to put
+    // the query on the same path the clean-vs-incremental parity gate drives,
+    // so a future divergence in this analysis cannot go undetected.
     ipe_db::program_metadata(db, source_root, entry_file)
         .clone()
         .map_err(homed_err)?;
+
+    // Post-lowering wasm gate (IPE-N0029): re-judge every function lowering
+    // kept, the exact set the emitted crate contains, against the target's
+    // allowlist. The pre-lowering layers judge the canonical entry closure;
+    // this second, independent boundary holds even where the lowerer keeps a
+    // function that closure does not model. `folded_program` is the memoized
+    // program every emit below reads, so the demand adds no work.
+    let wasm_target = config.settings(db).target;
+    if matches!(
+        wasm_target,
+        ipe_ir::Target::WasmClient | ipe_ir::Target::WasmWasi
+    ) {
+        let program = ipe_db::folded_program(db, source_root, entry_file)
+            .clone()
+            .map_err(span_attributed_err)?;
+        let emitted: Vec<(&[ipe_intern::Symbol], ipe_intern::Symbol)> = program
+            .modules
+            .iter()
+            .flat_map(|module| module.funcs.iter())
+            .map(|func| (func.home.0.as_slice(), func.name))
+            .collect();
+        let gate_result = {
+            let interner = shared_interner.lock();
+            ipe_canon::target_gate::check_emitted_for_target(
+                linked,
+                &emitted,
+                &interner,
+                wasm_target,
+            )
+        };
+        gate_result.map_err(|diag| {
+            let span = diag_span(&diag);
+            let (file, src) = source_for_span(span);
+            CliError::Pipeline {
+                file,
+                src,
+                diag: Box::new(diag),
+            }
+        })?;
+    }
 
     // `ipe_db::emit_manifest` (design doc §4.4) — the top-level
     // emit demand, assembled from the per-`RustFileId` query graph:
@@ -2978,6 +3048,11 @@ fn refuse_webview_off_web(
 /// blame location of a diagnostic no single module owns and the seed of the
 /// crate identity.
 ///
+/// This is the gate's emit: its options are [`BuildOptions::gate`], so the
+/// crate links the compiler's embedded runtime and no caller can hand it a
+/// runtime directory or options another resolver would fill from the
+/// environment or the working directory.
+///
 /// # Errors
 /// As [`build_project_into`].
 pub fn build_from_sources(
@@ -2985,17 +3060,16 @@ pub fn build_from_sources(
     manifest_path: &Path,
     source_set: super::PackageSourceSet,
     out: OutTarget<'_>,
-    runtime_dir: &Path,
-    options: &BuildOptions,
 ) -> Result<EmittedCrate, CliError> {
-    // An audit emits the served program it judges.
+    // An audit emits the served program it judges. A gate build is always the
+    // dependency model, so the vendored-tree directory is never read.
     build_from_sources_for(
         manifest,
         manifest_path,
         source_set,
         out,
-        runtime_dir,
-        options,
+        Path::new(""),
+        &BuildOptions::gate(),
         crate::delivery::HostIntent::Served,
     )
 }
@@ -3049,7 +3123,7 @@ fn build_from_sources_for(
         options,
         target.bundle_role(),
     );
-    let cache_site = cache::env_cache_dir(&target.path()?);
+    let cache_site = cache::env_cache_dir(&target.path()?)?;
     compile_source_set_observed(
         source_set,
         &entry_path,
@@ -3775,5 +3849,35 @@ main =
         );
         assert_eq!(settings.db_driver, project::UNDECLARED_DB_DRIVER);
         assert_eq!(settings.crate_name, ipe_backend_rust::CrateName::Test);
+    }
+
+    /// A gate build links the embedded runtime as a dependency, whatever its
+    /// `runtime_dep` says; a developer build follows `runtime_dep`.
+    #[test]
+    fn a_gate_build_always_links_the_embedded_runtime_dependency() {
+        let gate = BuildOptions::gate();
+        assert_eq!(gate.runtime_origin, runtime_embed::RuntimeOrigin::Gate);
+        assert!(gate.links_runtime_dependency());
+        let vendored_gate = BuildOptions {
+            runtime_dep: false,
+            ..BuildOptions::gate()
+        };
+        assert!(
+            vendored_gate.links_runtime_dependency(),
+            "a gate build has no vendored shape"
+        );
+        let developer = BuildOptions::default();
+        assert_eq!(
+            developer.runtime_origin,
+            runtime_embed::RuntimeOrigin::Developer
+        );
+        assert!(!developer.links_runtime_dependency());
+        assert!(
+            BuildOptions {
+                runtime_dep: true,
+                ..BuildOptions::default()
+            }
+            .links_runtime_dependency()
+        );
     }
 }

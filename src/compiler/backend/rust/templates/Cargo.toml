@@ -9,14 +9,15 @@ edition = "2024"
 # server/db/… steps insert their feature, the static path splices the allocator)
 # — it must stay byte-exact, and every augmenter finds it as the line-initial
 # occurrence, so no comment here may open a bracketed list. The vendored fallback
-# keeps `encoding` ON via `json` implying it (json is always defaulted here), so
-# the vendored `encoding.rs` / `bytes.rs` `#[cfg]` gates stay satisfied without
-# perturbing the anchor. The `base64` / `hex` / `percent-encoding` deps below
-# stay non-optional in the vendored escape hatch.
+# leaves `encoding` OFF: the vendored `encoding.rs` / `bytes.rs` modules are
+# declared on demand by `ipe_runtime/mod.rs`, never through this feature, so a
+# source gate on the feature cannot name a module the program did not declare.
+# The `base64` / `hex` / `percent-encoding` deps below stay non-optional in the
+# vendored escape hatch.
 default = ["json"]
 tokio = []
 crypto = []
-json = ["encoding", "serde"]
+json = ["serde"]
 db = []
 encoding = []
 # Declared but inert in the vendored escape hatch: `zeroize` / `subtle` / `rsa`
@@ -119,7 +120,8 @@ alloc_mimalloc = ["dep:mimalloc"]
 [dependencies]
 dlmalloc = { version = "0.2", features = ["global"], optional = true }
 mimalloc = { version = "0.1", optional = true, default-features = false }
-serde_json = "1"
+serde_json = { version = "1", features = ["preserve_order"] }
+indexmap = "2"
 sha2 = "0.10"
 serde = { version = "1", features = ["derive"] }
 serde_urlencoded = "0.7"

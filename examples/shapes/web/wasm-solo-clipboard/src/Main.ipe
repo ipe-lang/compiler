@@ -1,0 +1,80 @@
+module Main exposing (main)
+
+-- | wasm-solo-clipboard — a port round-trip in the browser wasm bundle, with no
+-- server behind the page.
+--
+-- The bundle's shell loads the content-addressed port glue before the wasm
+-- boots, so `Ipe.Browser.Clipboard` reaches the page's clipboard sink: a write
+-- is taken by the host, and a read resolves as a typed `Result Error String`.
+
+import Ipe.Browser.Clipboard as Clipboard
+import Ipe.Error as Error exposing (Error)
+import Ipe.Task as Task
+import Ipe.Tea.Web as Web
+import Ipe.Tea.Web.Cmd as Cmd
+import Ipe.Tea.Web.Sub as Sub
+import Ipe.Ui as Ui
+
+
+type alias Model =
+    { clipboard : String
+    }
+
+
+type Msg
+    = Copy
+    | Paste
+    | GotClipboard (Result Error String)
+
+
+init : WebReq -> ( Model, Cmd.Cmd Msg )
+init _req =
+    ( { clipboard = "" }, Cmd.none )
+
+
+copied : String
+copied =
+    "ipe-wasm-solo"
+
+
+update : Msg -> Model -> ( Model, Cmd.Cmd Msg )
+update msg model =
+    case msg of
+        Copy ->
+            ( model, Clipboard.write copied )
+
+        Paste ->
+            ( model, Task.attempt GotClipboard Clipboard.read )
+
+        GotClipboard result ->
+            case result of
+                Ok text ->
+                    ( { model | clipboard = text }, Cmd.none )
+
+                Err error ->
+                    ( { model | clipboard = "error: " ++ Error.toString error }, Cmd.none )
+
+
+subscriptions : Model -> Sub.Sub Msg
+subscriptions _model =
+    Clipboard.contents GotClipboard
+
+
+view : Model -> Element Msg
+view model =
+    Ui.column []
+        [ Ui.button [] { onPress = Just Copy, label = Ui.text "Copy" }
+        , Ui.button [] { onPress = Just Paste, label = Ui.text "Paste" }
+        , Ui.text ("clipboard: " ++ model.clipboard)
+        ]
+
+
+main =
+    Web.tea
+        { init = init
+        , update = update
+        , view = view
+        , subscriptions = subscriptions
+        , routes = []
+        , notFound = Paste
+        }

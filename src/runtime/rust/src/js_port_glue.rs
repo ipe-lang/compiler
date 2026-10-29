@@ -21,10 +21,27 @@
 
 use sha2::{Digest, Sha256};
 
+#[path = "native_bridge.rs"]
+pub mod native_bridge;
+
 /// Schemes a shared URL may carry — the Rust SSOT mirroring `Ipe.Browser.Share.shareSchemes`.
 /// The JS `shareSink` scheme check is generated from this slice; adding a scheme here
 /// automatically tightens both the typed Ipê layer and the JS defence-in-depth guard.
 pub const SHARE_SCHEMES: &[&str] = &["http", "https"];
+
+/// The byte length of a push application key, an uncompressed P-256 point.
+pub const PUSH_APPLICATION_KEY_BYTES: usize = 65;
+
+/// The byte length of a push receiver's authentication secret.
+pub const PUSH_AUTH_SECRET_BYTES: usize = 16;
+
+/// The version every canonical push subscription text carries.
+pub const PUSH_SUBSCRIPTION_VERSION: u32 = 1;
+
+/// The characters `Ipe.Json.Encode` writes as a `\uXXXX` escape where
+/// `JSON.stringify` leaves them bare. The glue escapes them in a subscription
+/// text, so the text it hands the app is the one spelling the Ipê parser accepts.
+pub const PUSH_ENCODE_ESCAPED: [char; 5] = ['&', '<', '>', '\u{2028}', '\u{2029}'];
 
 // --- port glue JS assembly ---
 //
@@ -34,9 +51,164 @@ pub const SHARE_SCHEMES: &[&str] = &["http", "https"];
 // once per process; `digest()`/`port_glue_path()`/`port_glue_integrity()` all
 // derive from the assembled bytes.
 
-const PORT_GLUE_JS_HEAD: &str = r#"// Ipe.Ffi.Js browser port surface. Values cross as JSON strings only.
-(function () {
-  var onReceive = null;
+/// The module's first lines: its banner and the opening of its closure.
+const PORT_GLUE_JS_OPEN: &str =
+    "// Ipe.Ffi.Js browser port surface. Values cross as JSON strings only.\n(function () {\n";
+
+/// The native bridge channel: handle capture, the reply grammar, the handshake and routing.
+const PORT_GLUE_JS_BRIDGE: &str = r#"  // The native bridge to a mobile shell. The shell's handle is captured once,
+  // here, while the glue evaluates; no later code names the window slot, so page
+  // content cannot stand in for it. A capability reaches the shell only when the
+  // handle exists, the handshake answered this protocol version, and the shell
+  // advertised the capability; otherwise its sink takes the web API path.
+  var ownKey = Function.prototype.call.bind(Object.prototype.hasOwnProperty);
+  function nativeCandidate(h) {
+    if (h === null || (typeof h !== "object" && typeof h !== "function")) return null;
+    if (typeof Element !== "undefined" && h instanceof Element) return null;
+    return typeof h.postMessage === "function" ? h : null;
+  }
+  function captureNativeHandle() {
+    if (typeof window === "undefined") return null;
+    try {
+      var listener = ownKey(window, BRIDGE_CHANNEL) ? nativeCandidate(window[BRIDGE_CHANNEL]) : null;
+      if (listener !== null) {
+        return { post: listener.postMessage.bind(listener), events: listener, answers: false };
+      }
+      var kit = ownKey(window, "webkit") ? window.webkit : null;
+      var handlers = kit && typeof kit === "object" ? kit.messageHandlers : null;
+      var handler = handlers && typeof handlers === "object" ? nativeCandidate(handlers[BRIDGE_CHANNEL]) : null;
+      if (handler !== null) {
+        return { post: handler.postMessage.bind(handler), events: null, answers: true };
+      }
+    } catch (_e) { /* a slot that throws is no handle */ }
+    return null;
+  }
+  var nativeHandle = captureNativeHandle();
+  var nativeState = nativeHandle === null ? "absent" : "pending";
+  var nativeCaps = Object.create(null);
+  var nativePending = Object.create(null);
+  var nativePendingCount = 0;
+  var nativeQueue = [];
+  var nativeNextId = 1;
+  // The UTF-8 length of `s`, the unit every bridge ceiling counts in.
+  function utf8Bytes(s) {
+    var n = 0;
+    for (var i = 0; i < s.length; i++) {
+      var c = s.charCodeAt(i);
+      if (c < 0x80) { n += 1; }
+      else if (c < 0x800) { n += 2; }
+      else if (c >= 0xd800 && c <= 0xdbff && i + 1 < s.length &&
+               s.charCodeAt(i + 1) >= 0xdc00 && s.charCodeAt(i + 1) <= 0xdfff) { n += 4; i += 1; }
+      else { n += 3; }
+    }
+    return n;
+  }
+  // A reply resolves only the outstanding request it names: one JSON object of
+  // `v`, `id` and exactly one of `ok` (an object) or `reject` (one of the closed
+  // codes). Anything else is dropped, and its request settles at its deadline.
+  function parseBridgeReply(text) {
+    if (typeof text !== "string") return null;
+    var r;
+    try { r = JSON.parse(text); } catch (_e) { return null; }
+    if (r === null || typeof r !== "object" || Array.isArray(r)) return null;
+    var keys = Object.keys(r);
+    for (var i = 0; i < keys.length; i++) {
+      if (keys[i] !== "v" && keys[i] !== "id" && keys[i] !== "ok" && keys[i] !== "reject") return null;
+    }
+    if (r.v !== BRIDGE_VERSION) return null;
+    if (typeof r.id !== "string" || !ownKey(nativePending, r.id)) return null;
+    var hasOk = ownKey(r, "ok");
+    if (hasOk === ownKey(r, "reject")) return null;
+    if (hasOk) {
+      if (r.ok === null || typeof r.ok !== "object" || Array.isArray(r.ok)) return null;
+      return { id: r.id, ok: r.ok };
+    }
+    if (BRIDGE_REJECTS.indexOf(r.reject) === -1) return null;
+    return { id: r.id, reject: r.reject };
+  }
+  function nativeSettle(id, outcome) {
+    if (!ownKey(nativePending, id)) return;
+    var entry = nativePending[id];
+    delete nativePending[id];
+    nativePendingCount -= 1;
+    clearTimeout(entry.timer);
+    try { entry.settle(outcome); } catch (_e) { /* a settled sink never throws past the channel */ }
+  }
+  function nativeReceive(text) {
+    var parsed = parseBridgeReply(text);
+    if (parsed !== null) nativeSettle(parsed.id, parsed);
+  }
+  // Send one request; `settle` receives `{ ok: payload }` or `{ reject: code }`
+  // exactly once: the reply, a local refusal, or the deadline.
+  function nativeSend(op, args, settle) {
+    if (nativePendingCount >= BRIDGE_MAX_OUTSTANDING || nativeNextId >= Number.MAX_SAFE_INTEGER) {
+      settle({ reject: REJECT_LIMIT });
+      return;
+    }
+    var id = op === OP_HELLO ? BRIDGE_HELLO_ID : (nativeNextId++).toString(16);
+    var text;
+    try { text = JSON.stringify({ v: BRIDGE_VERSION, id: id, cap: op[0], op: op[1], args: args }); }
+    catch (_e) { settle({ reject: REJECT_REFUSED }); return; }
+    if (utf8Bytes(text) > BRIDGE_MAX_REQUEST_BYTES) { settle({ reject: REJECT_LIMIT }); return; }
+    var timer = setTimeout(function () { nativeSettle(id, { reject: REJECT_UNAVAILABLE }); }, BRIDGE_REPLY_DEADLINE_MS);
+    nativePending[id] = { settle: settle, timer: timer };
+    nativePendingCount += 1;
+    var answer;
+    try { answer = nativeHandle.post(text); }
+    catch (_e) { nativeSettle(id, { reject: REJECT_UNAVAILABLE }); return; }
+    if (nativeHandle.answers) {
+      Promise.resolve(answer).then(
+        function (reply) {
+          var parsed = parseBridgeReply(reply);
+          if (parsed !== null && parsed.id === id) nativeSettle(id, parsed);
+        },
+        function () { nativeSettle(id, { reject: REJECT_UNAVAILABLE }); }
+      );
+    }
+  }
+  // Run `viaNative` when the shell serves `cap`, else `viaWeb`; while the
+  // handshake is in flight the call waits in a bounded queue.
+  function nativeRoute(cap, viaNative, viaWeb, refuse) {
+    if (nativeState === "pending") {
+      if (nativeQueue.length >= BRIDGE_MAX_OUTSTANDING) { refuse(REJECT_LIMIT); return; }
+      // A queued call runs inside the handshake's settle, past `deliver`: a throw
+      // answers its own call unavailable and leaves the rest of the queue running.
+      nativeQueue.push(function () {
+        try { nativeRoute(cap, viaNative, viaWeb, refuse); } catch (_e) { refuse(REJECT_UNAVAILABLE); }
+      });
+      return;
+    }
+    if (nativeState === "ready" && nativeCaps[cap] === true) { viaNative(); } else { viaWeb(); }
+  }
+  function nativeHandshake(outcome) {
+    var ok = outcome.ok;
+    var caps = ok && ok.v === BRIDGE_VERSION && Array.isArray(ok.caps) ? ok.caps : null;
+    if (caps === null) {
+      nativeState = "absent";
+    } else {
+      for (var i = 0; i < caps.length; i++) {
+        if (BRIDGE_CAPS.indexOf(caps[i]) !== -1) nativeCaps[caps[i]] = true;
+      }
+      nativeState = "ready";
+    }
+    var queued = nativeQueue;
+    nativeQueue = [];
+    for (var j = 0; j < queued.length; j++) queued[j]();
+  }
+  if (nativeHandle !== null) {
+    if (nativeHandle.events !== null) {
+      var onNativeMessage = function (e) { nativeReceive(e ? e.data : null); };
+      if (typeof nativeHandle.events.addEventListener === "function") {
+        nativeHandle.events.addEventListener("message", onNativeMessage);
+      } else {
+        nativeHandle.events.onmessage = onNativeMessage;
+      }
+    }
+    nativeSend(OP_HELLO, {}, nativeHandshake);
+  }
+"#;
+
+const PORT_GLUE_JS_HEAD: &str = r#"  var onReceive = null;
   // The document members the sinks read, bound from the prototypes before any
   // page content is consulted: an `img`, `form`, `embed`, `object` or `iframe`
   // named after a document member shadows that member with the element. Null
@@ -184,8 +356,9 @@ const PORT_GLUE_JS_HEAD: &str = r#"// Ipe.Ffi.Js browser port surface. Values cr
     }
     return true;
   }
-  // Ipe.Browser.Notification: `RequestPermission` / `Show { title, body, tag }`
-  // -> Notification.requestPermission / new Notification. A grant resolves to a
+  // Ipe.Browser.Notification: `RequestPermission` / `Show { title, body, tag }`.
+  // A shell serving notifications answers over the bridge; otherwise
+  // Notification.requestPermission / new Notification. A grant resolves to a
   // typed `granted` frame; a denial or an absent API traps to the matching typed
   // error frame — never a throw.
   function notificationSink(value, corId) {
@@ -194,14 +367,53 @@ const PORT_GLUE_JS_HEAD: &str = r#"// Ipe.Ffi.Js browser port surface. Values cr
       (value && typeof value === "object" && value.RequestPermission !== undefined);
     var isShow = value && typeof value === "object" && value.Show !== undefined;
     if (!isRequest && !isShow) return false;
+    var refuse = function (code) {
+      reply({ tag: "notification", ok: false, error: NOTIFICATION_REJECT_FRAME[code] }, corId);
+    };
+    nativeRoute(CAP_NOTIFICATION,
+      function () { notificationNative(value, isRequest, corId, refuse); },
+      function () { notificationWeb(value, isRequest, corId); },
+      refuse);
+    return true;
+  }
+  function notificationNative(value, isRequest, corId, refuse) {
+    if (isRequest) {
+      nativeSend(OP_NOTIFICATION_REQUEST, {}, function (outcome) {
+        if (outcome.reject !== undefined) { refuse(outcome.reject); return; }
+        var state = outcome.ok.state;
+        if (state === STATE_GRANTED) {
+          reply({ tag: "notification", ok: true, event: "granted" }, corId);
+        } else if (state === STATE_DENIED) {
+          reply({ tag: "notification", ok: false, error: "denied" }, corId);
+        } else {
+          refuse(REJECT_UNAVAILABLE);
+        }
+      });
+      return;
+    }
+    var opts = (value.Show && typeof value.Show === "object") ? value.Show : {};
+    var title = String(opts.title || "");
+    var body = typeof opts.body === "string" ? opts.body : "";
+    var tag = typeof opts.tag === "string" ? opts.tag : "";
+    if (utf8Bytes(title) > NOTIFICATION_TITLE_MAX_BYTES || utf8Bytes(body) > NOTIFICATION_BODY_MAX_BYTES) {
+      refuse(REJECT_LIMIT);
+      return;
+    }
+    if (!NOTIFICATION_TAG_PATTERN.test(tag)) { refuse(REJECT_REFUSED); return; }
+    nativeSend(OP_NOTIFICATION_SHOW, { title: title, body: body, tag: tag }, function (outcome) {
+      if (outcome.reject !== undefined) { refuse(outcome.reject); return; }
+      reply({ tag: "notification", ok: true, event: "shown" }, corId);
+    });
+  }
+  function notificationWeb(value, isRequest, corId) {
     if (typeof Notification === "undefined") {
       reply({ tag: "notification", ok: false, error: "unavailable" }, corId);
-      return true;
+      return;
     }
     if (isRequest) {
       if (typeof Notification.requestPermission !== "function") {
         reply({ tag: "notification", ok: false, error: "unavailable" }, corId);
-        return true;
+        return;
       }
       Promise.resolve(Notification.requestPermission()).then(
         function (perm) {
@@ -213,14 +425,14 @@ const PORT_GLUE_JS_HEAD: &str = r#"// Ipe.Ffi.Js browser port surface. Values cr
         },
         function () { reply({ tag: "notification", ok: false, error: "denied" }, corId); }
       );
-      return true;
+      return;
     }
-    // isShow: only display when permission is already granted; otherwise a typed
+    // Show: only display when permission is already granted; otherwise a typed
     // denial, never a silent no-op and never an unsolicited permission prompt.
     var opts = (value.Show && typeof value.Show === "object") ? value.Show : {};
     if (Notification.permission !== "granted") {
       reply({ tag: "notification", ok: false, error: "denied" }, corId);
-      return true;
+      return;
     }
     try {
       var body = typeof opts.body === "string" ? opts.body : "";
@@ -230,7 +442,140 @@ const PORT_GLUE_JS_HEAD: &str = r#"// Ipe.Ffi.Js browser port surface. Values cr
     } catch (_e) {
       reply({ tag: "notification", ok: false, error: "unavailable" }, corId);
     }
+  }
+  // Ipe.Browser.Push: `PushSubscribe key` / `PushCurrent` / `PushUnsubscribe`.
+  // A shell serving push answers over the bridge; otherwise the page's service
+  // worker registration and its PushManager. Every call answers exactly one frame:
+  // its own event or one closed refusal code, never a throw, and never a wait on
+  // a worker that is not registered.
+  function pushSink(value, corId) {
+    var isObject = value !== null && typeof value === "object" && !Array.isArray(value);
+    var op = null;
+    var key = null;
+    if (isObject && ownKey(value, "PushSubscribe")) {
+      op = OP_PUSH_SUBSCRIBE;
+      key = value.PushSubscribe;
+    } else if (value === "PushCurrent" || (isObject && ownKey(value, "PushCurrent"))) {
+      op = OP_PUSH_CURRENT;
+    } else if (value === "PushUnsubscribe" || (isObject && ownKey(value, "PushUnsubscribe"))) {
+      op = OP_PUSH_UNSUBSCRIBE;
+    }
+    if (op === null) return false;
+    var settled = false;
+    var answer = function (frame) {
+      if (settled) return;
+      settled = true;
+      frame.tag = CAP_PUSH;
+      reply(frame, corId);
+    };
+    var refuse = function (code) { answer({ ok: false, error: code }); };
+    // The key is parsed again here, so no malformed key reaches either host.
+    var keyBytes = null;
+    if (op === OP_PUSH_SUBSCRIBE) {
+      keyBytes = pushPointBytes(key);
+      if (keyBytes === null) { refuse(REJECT_REFUSED); return true; }
+    }
+    nativeRoute(CAP_PUSH,
+      function () { pushNative(op, key, answer, refuse); },
+      function () { pushWeb(op, keyBytes, answer, refuse); },
+      refuse);
     return true;
+  }
+  // The `n` bytes `text` spells in unpadded base64url, in its one canonical
+  // spelling, or null.
+  function pushBase64UrlBytes(text, n) {
+    if (typeof text !== "string" || text.length !== Math.ceil(n * 4 / 3)) return null;
+    if (!/^[A-Za-z0-9_-]+$/.test(text)) return null;
+    var bin;
+    try { bin = atob(text.replace(/-/g, "+").replace(/_/g, "/") + "==".slice(0, (4 - text.length % 4) % 4)); }
+    catch (_e) { return null; }
+    if (bin.length !== n) return null;
+    var bytes = new Uint8Array(n);
+    for (var i = 0; i < n; i += 1) { bytes[i] = bin.charCodeAt(i); }
+    return bufToB64url(bytes.buffer) === text ? bytes : null;
+  }
+  // An uncompressed P-256 point: 65 bytes led by the tag 0x04.
+  function pushPointBytes(text) {
+    var bytes = pushBase64UrlBytes(text, PUSH_APPLICATION_KEY_BYTES);
+    return bytes !== null && bytes[0] === 4 ? bytes : null;
+  }
+  function pushNative(op, key, answer, refuse) {
+    var args = op === OP_PUSH_SUBSCRIBE ? { applicationKey: key } : {};
+    nativeSend(op, args, function (outcome) {
+      if (outcome.reject !== undefined) { refuse(outcome.reject); return; }
+      if (op === OP_PUSH_UNSUBSCRIBE) { answer({ ok: true, event: "unsubscribed" }); return; }
+      var text = ownKey(outcome.ok, "subscription") ? outcome.ok.subscription : undefined;
+      var event = op === OP_PUSH_SUBSCRIBE ? "subscribed" : "current";
+      if (typeof text === "string" || (text === null && op === OP_PUSH_CURRENT)) {
+        answer({ ok: true, event: event, subscription: text });
+      } else {
+        refuse(REJECT_REFUSED);
+      }
+    });
+  }
+  function pushWeb(op, keyBytes, answer, refuse) {
+    var workers = typeof navigator !== "undefined" ? navigator.serviceWorker : undefined;
+    if (!workers || typeof workers.getRegistration !== "function" || typeof PushManager === "undefined") {
+      refuse(REJECT_UNAVAILABLE);
+      return;
+    }
+    Promise.resolve()
+      .then(function () { return workers.getRegistration(); })
+      .then(function (registration) {
+        var manager = registration ? registration.pushManager : null;
+        if (!manager) { refuse(REJECT_UNAVAILABLE); return null; }
+        if (op === OP_PUSH_SUBSCRIBE) return pushWebSubscribe(manager, keyBytes, answer, refuse);
+        return Promise.resolve(manager.getSubscription()).then(function (subscription) {
+          if (op === OP_PUSH_CURRENT) {
+            if (!subscription) { answer({ ok: true, event: "current", subscription: null }); return null; }
+            var text = pushWebText(subscription);
+            if (text === null) { refuse(REJECT_UNAVAILABLE); } else { answer({ ok: true, event: "current", subscription: text }); }
+            return null;
+          }
+          if (!subscription) { answer({ ok: true, event: "unsubscribed" }); return null; }
+          return Promise.resolve(subscription.unsubscribe()).then(function (done) {
+            if (done === false) { refuse(REJECT_UNAVAILABLE); } else { answer({ ok: true, event: "unsubscribed" }); }
+          });
+        });
+      })
+      .then(null, function (err) { refuse(pushWebRefusal(err)); });
+  }
+  // The browser checks the point lies on the curve before the key reaches the
+  // Push API: a key it cannot import is refused.
+  function pushWebSubscribe(manager, keyBytes, answer, refuse) {
+    var subtle = typeof crypto !== "undefined" && crypto && crypto.subtle ? crypto.subtle : null;
+    if (subtle === null || typeof subtle.importKey !== "function") { refuse(REJECT_UNAVAILABLE); return null; }
+    return Promise.resolve()
+      .then(function () { return subtle.importKey("raw", keyBytes, { name: "ECDH", namedCurve: "P-256" }, false, []); })
+      .then(
+        function () {
+          return Promise.resolve(manager.subscribe({ userVisibleOnly: true, applicationServerKey: keyBytes }))
+            .then(function (subscription) {
+              var text = pushWebText(subscription);
+              if (text === null) { refuse(REJECT_UNAVAILABLE); } else { answer({ ok: true, event: "subscribed", subscription: text }); }
+            });
+        },
+        function () { refuse(REJECT_REFUSED); }
+      );
+  }
+  // The canonical text of a browser subscription, or null when its keys are not
+  // the expected sizes. It is spelled as `Ipe.Json.Encode` spells it, which
+  // escapes five characters `JSON.stringify` leaves bare: the Ipê parser accepts
+  // only the text its own encoder renders.
+  function pushWebText(subscription) {
+    if (!subscription || typeof subscription.endpoint !== "string" || typeof subscription.getKey !== "function") return null;
+    var receiver = bufToB64url(subscription.getKey("p256dh"));
+    var auth = bufToB64url(subscription.getKey("auth"));
+    if (pushPointBytes(receiver) === null || pushBase64UrlBytes(auth, PUSH_AUTH_SECRET_BYTES) === null) return null;
+    return JSON.stringify({
+      v: PUSH_SUBSCRIPTION_VERSION, kind: "web", endpoint: subscription.endpoint, p256dh: receiver, auth: auth,
+    }).replace(PUSH_ENCODE_ESCAPED, pushEncodeEscape);
+  }
+  function pushEncodeEscape(c) {
+    return "\\u" + ("000" + c.charCodeAt(0).toString(16)).slice(-4);
+  }
+  function pushWebRefusal(err) {
+    return err && err.name === "NotAllowedError" ? REJECT_DENIED : REJECT_UNAVAILABLE;
   }
   // Ipe.Browser.Storage: `Get key` / `Set { key, value }` / `Remove key` / `Clear`
   // -> localStorage.getItem / setItem / removeItem / clear. A read resolves to a
@@ -1408,6 +1753,7 @@ const PORT_GLUE_JS_TAIL: &str = r#"    try {
     if (clipboardSink(value, corId)) return true;
     if (geolocationSink(value, corId)) return true;
     if (notificationSink(value, corId)) return true;
+    if (pushSink(value, corId)) return true;
     if (storageSink(value, corId)) return true;
     if (vibrationSink(value, corId)) return true;
     if (shareSink(value, corId)) return true;
@@ -1431,9 +1777,12 @@ const PORT_GLUE_JS_TAIL: &str = r#"    try {
     if (webAuthnSink(value, corId)) return true;
     return false;
   }
+  // Answers whether a sink or the registered receiver took the frame: `false`
+  // tells the runtime no host exists for it, so a correlated request refuses at
+  // once instead of waiting out its deadline.
   function deliver(raw) {
     var value;
-    try { value = JSON.parse(raw); } catch (_e) { return; /* drop a malformed frame */ }
+    try { value = JSON.parse(raw); } catch (_e) { return false; /* drop a malformed frame */ }
     // If this frame carries a correlation id, it is a `js_request` envelope:
     // extract the id and the inner payload command, and pass the id through to
     // the reply so the runtime can route it to the one-shot waiter.
@@ -1444,10 +1793,11 @@ const PORT_GLUE_JS_TAIL: &str = r#"    try {
     }
     // A first-party browser-capability command is handled by its built-in sink;
     // anything else is a developer port frame routed to the registered receiver.
-    if (builtinSink(value, corId)) return;
+    if (builtinSink(value, corId)) return true;
     // For non-first-party frames, if there is a correlation id the developer JS
     // handler must echo it back; we pass it as a second argument to onReceive.
-    if (typeof onReceive === "function") { onReceive(value, corId); }
+    if (typeof onReceive === "function") { onReceive(value, corId); return true; }
+    return false;
   }
   // The runtime calls this with each outbound seal frame (a JSON string).
   window.ipeOnReceive = deliver;
@@ -1465,7 +1815,109 @@ const PORT_GLUE_JS_TAIL: &str = r#"    try {
 })();
 "#;
 
-/// Assembled ES module: HEAD + generated scheme check + TAIL.
+/// A JS string literal of `text`, which holds no quote, backslash or line break.
+fn js_string(text: &str) -> String {
+    format!("\"{text}\"")
+}
+
+/// The glue's pattern over [`PUSH_ENCODE_ESCAPED`], each character named by its
+/// code point so the constant holds no escape.
+fn push_encode_escaped_js() -> String {
+    let points: Vec<String> = PUSH_ENCODE_ESCAPED
+        .into_iter()
+        .map(|c| format!("0x{:x}", u32::from(c)))
+        .collect();
+    format!(
+        "var PUSH_ENCODE_ESCAPED = new RegExp(\"[\" + String.fromCodePoint({}) + \"]\", \"gu\");",
+        points.join(", ")
+    )
+}
+
+/// The bridge constants the glue reads, each rendered from its one Rust definition.
+fn bridge_constants_js() -> String {
+    use native_bridge::{
+        BRIDGE_CHANNEL_NAME, BRIDGE_MAX_OUTSTANDING, BRIDGE_MAX_REQUEST_BYTES,
+        BRIDGE_PROTOCOL_VERSION, BRIDGE_REPLY_DEADLINE_MS, BridgeCap, BridgeOp,
+        HANDSHAKE_CAP_GLUE_NAME, HANDSHAKE_CAP_NAME, HELLO_ID, NOTIFICATION_BODY_MAX_BYTES,
+        NOTIFICATION_TAG_MAX_BYTES, NOTIFICATION_TAG_PUNCTUATION, NOTIFICATION_TITLE_MAX_BYTES,
+        PermissionState, Reject,
+    };
+    let mut lines: Vec<String> = vec![
+        format!("var BRIDGE_VERSION = {BRIDGE_PROTOCOL_VERSION};"),
+        format!("var BRIDGE_CHANNEL = {};", js_string(BRIDGE_CHANNEL_NAME)),
+        format!("var BRIDGE_HELLO_ID = {};", js_string(HELLO_ID)),
+        format!("var BRIDGE_MAX_REQUEST_BYTES = {BRIDGE_MAX_REQUEST_BYTES};"),
+        format!("var BRIDGE_MAX_OUTSTANDING = {BRIDGE_MAX_OUTSTANDING};"),
+        format!("var BRIDGE_REPLY_DEADLINE_MS = {BRIDGE_REPLY_DEADLINE_MS};"),
+        format!("var NOTIFICATION_TITLE_MAX_BYTES = {NOTIFICATION_TITLE_MAX_BYTES};"),
+        format!("var NOTIFICATION_BODY_MAX_BYTES = {NOTIFICATION_BODY_MAX_BYTES};"),
+        format!(
+            "var NOTIFICATION_TAG_PATTERN = /^[A-Za-z0-9{NOTIFICATION_TAG_PUNCTUATION}]{{0,{NOTIFICATION_TAG_MAX_BYTES}}}$/;"
+        ),
+        format!("var PUSH_APPLICATION_KEY_BYTES = {PUSH_APPLICATION_KEY_BYTES};"),
+        format!("var PUSH_AUTH_SECRET_BYTES = {PUSH_AUTH_SECRET_BYTES};"),
+        format!("var PUSH_SUBSCRIPTION_VERSION = {PUSH_SUBSCRIPTION_VERSION};"),
+        push_encode_escaped_js(),
+    ];
+    for reject in Reject::ALL {
+        lines.push(format!(
+            "var {} = {};",
+            reject.glue_name(),
+            js_string(reject.as_str())
+        ));
+    }
+    let rejects: Vec<&str> = Reject::ALL.iter().copied().map(Reject::glue_name).collect();
+    lines.push(format!("var BRIDGE_REJECTS = [{}];", rejects.join(", ")));
+    lines.push(format!(
+        "var {HANDSHAKE_CAP_GLUE_NAME} = {};",
+        js_string(HANDSHAKE_CAP_NAME)
+    ));
+    for cap in BridgeCap::ALL {
+        lines.push(format!(
+            "var {} = {};",
+            cap.glue_name(),
+            js_string(cap.as_str())
+        ));
+    }
+    let caps: Vec<&str> = BridgeCap::ALL
+        .iter()
+        .copied()
+        .map(BridgeCap::glue_name)
+        .collect();
+    lines.push(format!("var BRIDGE_CAPS = [{}];", caps.join(", ")));
+    for op in BridgeOp::ALL {
+        lines.push(format!(
+            "var {} = [{}, {}];",
+            op.glue_name(),
+            op.cap_glue_name(),
+            js_string(op.op_name())
+        ));
+    }
+    for state in PermissionState::ALL {
+        lines.push(format!(
+            "var {} = {};",
+            state.glue_name(),
+            js_string(state.as_str())
+        ));
+    }
+    lines.push("var NOTIFICATION_REJECT_FRAME = Object.create(null);".to_owned());
+    for reject in Reject::ALL {
+        lines.push(format!(
+            "NOTIFICATION_REJECT_FRAME[{}] = {};",
+            reject.glue_name(),
+            js_string(reject.notification_frame().wire())
+        ));
+    }
+    let mut out = String::new();
+    for line in lines {
+        out.push_str("  ");
+        out.push_str(&line);
+        out.push('\n');
+    }
+    out
+}
+
+/// Assembled ES module: opener + bridge constants + bridge + HEAD + generated scheme check + TAIL.
 ///
 /// The URL scheme check inside `shareSink` is generated from `SHARE_SCHEMES`
 /// so the JS transport guard is always consistent with the Ipê typed layer.
@@ -1480,7 +1932,10 @@ static PORT_GLUE_JS: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
     let url_check = format!(
         "    if (typeof p.url === \"string\" && p.url !== \"\") {{\n      var _s = p.url.split(\":\")[0].toLowerCase();\n      if ({schemes_js}.indexOf(_s) !== -1) {{ data.url = p.url; }}\n    }}"
     );
-    format!("{PORT_GLUE_JS_HEAD}{url_check}\n{PORT_GLUE_JS_TAIL}")
+    let bridge_constants = bridge_constants_js();
+    format!(
+        "{PORT_GLUE_JS_OPEN}{bridge_constants}{PORT_GLUE_JS_BRIDGE}{PORT_GLUE_JS_HEAD}{url_check}\n{PORT_GLUE_JS_TAIL}"
+    )
 });
 
 /// The full 32-byte SHA-256 digest of the glue bytes.
@@ -1528,6 +1983,203 @@ mod tests {
         assert_eq!(js.matches("})(document);").count(), 1);
     }
 
+    /// The shell handle is named only inside `captureNativeHandle`, which runs once
+    /// while the glue evaluates; no later code can reach the window slot again.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn glue_reads_the_shell_handle_only_while_it_evaluates() {
+        use crate::js_document_scan::{bare_global_sites, name_sites};
+        let js = port_glue_js();
+        let channel = format!(
+            "var BRIDGE_CHANNEL = \"{}\";",
+            native_bridge::BRIDGE_CHANNEL_NAME
+        );
+        let listener = "var listener = ownKey(window, BRIDGE_CHANNEL) ? nativeCandidate(window[BRIDGE_CHANNEL]) : null;";
+        let kit = "var kit = ownKey(window, \"webkit\") ? window.webkit : null;";
+        let handlers =
+            "var handlers = kit && typeof kit === \"object\" ? kit.messageHandlers : null;";
+        let handler = "var handler = handlers && typeof handlers === \"object\" ? nativeCandidate(handlers[BRIDGE_CHANNEL]) : null;";
+        assert_eq!(
+            name_sites(js, native_bridge::BRIDGE_CHANNEL_NAME),
+            vec![channel.clone()]
+        );
+        assert_eq!(
+            name_sites(js, "BRIDGE_CHANNEL"),
+            vec![
+                channel,
+                listener.to_owned(),
+                listener.to_owned(),
+                handler.to_owned()
+            ]
+        );
+        assert_eq!(
+            name_sites(js, "webkit"),
+            vec![kit.to_owned(), kit.to_owned()]
+        );
+        assert_eq!(name_sites(js, "messageHandlers"), vec![handlers.to_owned()]);
+        assert_eq!(
+            name_sites(js, "captureNativeHandle"),
+            vec![
+                "function captureNativeHandle() {".to_owned(),
+                "var nativeHandle = captureNativeHandle();".to_owned(),
+            ]
+        );
+        assert_eq!(
+            bare_global_sites(
+                js,
+                &[
+                    "window",
+                    "self",
+                    "globalThis",
+                    "this",
+                    "top",
+                    "parent",
+                    "frames"
+                ]
+            ),
+            vec![listener.to_owned(), listener.to_owned(), kit.to_owned()]
+        );
+        for reflective in ["Reflect", "eval"] {
+            assert_eq!(
+                name_sites(js, reflective),
+                Vec::<String>::new(),
+                "{reflective}"
+            );
+        }
+        assert_eq!(
+            name_sites(js, "getOwnPropertyDescriptor"),
+            vec![
+                "var desc = Object.getOwnPropertyDescriptor(Document.prototype, name);".to_owned()
+            ]
+        );
+    }
+
+    /// Each bridge constant is bound once, from its Rust definition, and no
+    /// bridge wire value appears in the glue outside that binding.
+    #[test]
+    fn glue_binds_each_bridge_constant_once_from_its_definition() {
+        use native_bridge::{BridgeCap, BridgeOp, PermissionState, Reject};
+        let js = port_glue_js();
+        let constants = bridge_constants_js();
+        assert!(
+            constants
+                .chars()
+                .all(|c| c == '\n' || (c.is_ascii() && !c.is_ascii_control() && c != '\\')),
+            "a rendered constant needs no escape"
+        );
+        assert_eq!(js.matches(constants.as_str()).count(), 1);
+        let mut bindings = vec![
+            format!(
+                "  var BRIDGE_VERSION = {};\n",
+                native_bridge::BRIDGE_PROTOCOL_VERSION
+            ),
+            format!("  var BRIDGE_HELLO_ID = \"{}\";\n", native_bridge::HELLO_ID),
+            format!(
+                "  var BRIDGE_MAX_REQUEST_BYTES = {};\n",
+                native_bridge::BRIDGE_MAX_REQUEST_BYTES
+            ),
+            format!(
+                "  var BRIDGE_MAX_OUTSTANDING = {};\n",
+                native_bridge::BRIDGE_MAX_OUTSTANDING
+            ),
+            format!(
+                "  var BRIDGE_REPLY_DEADLINE_MS = {};\n",
+                native_bridge::BRIDGE_REPLY_DEADLINE_MS
+            ),
+            format!(
+                "  var NOTIFICATION_TITLE_MAX_BYTES = {};\n",
+                native_bridge::NOTIFICATION_TITLE_MAX_BYTES
+            ),
+            format!(
+                "  var NOTIFICATION_BODY_MAX_BYTES = {};\n",
+                native_bridge::NOTIFICATION_BODY_MAX_BYTES
+            ),
+            "  var NOTIFICATION_TAG_PATTERN = /^[A-Za-z0-9._-]{0,64}$/;\n".to_owned(),
+            "  var CAP_BRIDGE = \"bridge\";\n".to_owned(),
+            "  var BRIDGE_REJECTS = [REJECT_DENIED, REJECT_UNAVAILABLE, REJECT_CANCELLED, REJECT_REFUSED, REJECT_LIMIT, REJECT_VERSION];\n".to_owned(),
+            "  var BRIDGE_CAPS = [CAP_NOTIFICATION, CAP_PUSH];\n".to_owned(),
+        ];
+        for reject in Reject::ALL {
+            bindings.push(format!(
+                "  var {} = \"{}\";\n",
+                reject.glue_name(),
+                reject.as_str()
+            ));
+        }
+        for cap in BridgeCap::ALL {
+            bindings.push(format!(
+                "  var {} = \"{}\";\n",
+                cap.glue_name(),
+                cap.as_str()
+            ));
+        }
+        for op in BridgeOp::ALL {
+            bindings.push(format!(
+                "  var {} = [{}, \"{}\"];\n",
+                op.glue_name(),
+                op.cap_glue_name(),
+                op.op_name()
+            ));
+        }
+        for state in PermissionState::ALL {
+            bindings.push(format!(
+                "  var {} = \"{}\";\n",
+                state.glue_name(),
+                state.as_str()
+            ));
+        }
+        for binding in &bindings {
+            assert_eq!(js.matches(binding.as_str()).count(), 1, "{binding}");
+        }
+        for literal in [
+            "\"__ipeNative\"",
+            "\"bridge\"",
+            "\"hello\"",
+            "\"refused\"",
+            "\"limit\"",
+            "\"version\"",
+            "\"push\"",
+            "65536",
+        ] {
+            assert_eq!(js.matches(literal).count(), 1, "{literal}");
+        }
+    }
+
+    /// A call queued behind the handshake that throws answers itself unavailable,
+    /// so neither it nor the calls queued after it wait out a deadline.
+    #[test]
+    fn a_queued_call_that_throws_answers_unavailable() {
+        let js = port_glue_js();
+        let guarded = "try { nativeRoute(cap, viaNative, viaWeb, refuse); } catch (_e) { refuse(REJECT_UNAVAILABLE); }";
+        assert_eq!(js.matches(guarded).count(), 1);
+        let queue_pushes: Vec<&str> = js
+            .lines()
+            .filter(|line| line.contains("nativeQueue.push("))
+            .collect();
+        assert_eq!(queue_pushes, ["      nativeQueue.push(function () {"]);
+    }
+
+    /// A bridge refusal becomes a notification error frame, never a success.
+    #[test]
+    fn every_refusal_is_a_notification_error_frame() {
+        use native_bridge::{NotificationFrame, Reject};
+        let js = port_glue_js();
+        for reject in Reject::ALL {
+            let frame = reject.notification_frame();
+            assert_eq!(frame.field(), "error");
+            assert!(matches!(
+                frame,
+                NotificationFrame::Denied | NotificationFrame::Unavailable
+            ));
+            let binding = format!(
+                "  NOTIFICATION_REJECT_FRAME[{}] = \"{}\";\n",
+                reject.glue_name(),
+                frame.wire()
+            );
+            assert_eq!(js.matches(binding.as_str()).count(), 1, "{binding}");
+        }
+    }
+
     #[test]
     fn path_is_content_addressed_and_stable() {
         let p = port_glue_path();
@@ -1541,6 +2193,18 @@ mod tests {
         let i = port_glue_integrity();
         assert!(i.starts_with("sha256-"));
         assert_eq!(i, port_glue_integrity()); // deterministic
+    }
+
+    /// A frame no sink and no receiver takes answers `false`, the runtime's
+    /// signal that the page has no host for it.
+    #[test]
+    fn deliver_answers_whether_a_host_took_the_frame() {
+        let js = port_glue_js();
+        assert!(js.contains("if (builtinSink(value, corId)) return true;"));
+        assert!(js.contains(
+            "if (typeof onReceive === \"function\") { onReceive(value, corId); return true; }\n    return false;\n  }"
+        ));
+        assert!(js.contains("catch (_e) { return false; /* drop a malformed frame */ }"));
     }
 
     #[test]
@@ -1641,6 +2305,115 @@ mod tests {
         assert!(js.contains("\"denied\""));
         assert!(js.contains("\"unavailable\""));
         assert!(!js.contains("eval("));
+    }
+
+    /// The push sink parses the application key before either host sees it,
+    /// answers a page with no worker registration unavailable at once, and checks
+    /// the point on the curve before the Push API.
+    #[test]
+    fn push_sink_checks_the_key_before_any_host_and_never_waits_on_a_worker() {
+        let js = port_glue_js();
+        assert_eq!(
+            js.matches("    if (pushSink(value, corId)) return true;\n")
+                .count(),
+            1
+        );
+        let sink = js
+            .find("  function pushSink(value, corId) {")
+            .expect("the push sink is assembled");
+        let tail = js.get(sink..).expect("the sink starts on a char boundary");
+        let recheck = tail
+            .find("if (keyBytes === null) { refuse(REJECT_REFUSED); return true; }")
+            .expect("the sink re-checks the key");
+        let route = tail
+            .find("nativeRoute(CAP_PUSH,")
+            .expect("the sink routes by the push cap");
+        assert!(recheck < route, "the key is checked before routing");
+        assert!(js.contains("return bytes !== null && bytes[0] === 4 ? bytes : null;"));
+        assert!(js.contains("return bufToB64url(bytes.buffer) === text ? bytes : null;"));
+        let import = js
+            .find("subtle.importKey(\"raw\", keyBytes, { name: \"ECDH\", namedCurve: \"P-256\" }, false, [])")
+            .expect("the browser imports the key as a P-256 point");
+        let subscribe = js
+            .find("manager.subscribe({ userVisibleOnly: true, applicationServerKey: keyBytes })")
+            .expect("the browser subscribes with the parsed key");
+        assert!(
+            import < subscribe,
+            "the point is imported before it is used"
+        );
+        assert!(js.contains("workers.getRegistration()"));
+        assert!(!js.contains("serviceWorker.ready"));
+        for (name, value) in [
+            ("PUSH_APPLICATION_KEY_BYTES", PUSH_APPLICATION_KEY_BYTES),
+            ("PUSH_AUTH_SECRET_BYTES", PUSH_AUTH_SECRET_BYTES),
+        ] {
+            let binding = format!("  var {name} = {value};\n");
+            assert_eq!(js.matches(binding.as_str()).count(), 1, "{binding}");
+        }
+        let version = format!("  var PUSH_SUBSCRIPTION_VERSION = {PUSH_SUBSCRIPTION_VERSION};\n");
+        assert_eq!(js.matches(version.as_str()).count(), 1);
+    }
+
+    /// A browser subscription text is spelled as `Ipe.Json.Encode` spells it: the
+    /// characters `JSON.stringify` leaves bare are escaped before the text
+    /// reaches the app, so an endpoint carrying `&` still parses.
+    #[test]
+    fn push_web_text_escapes_what_the_ipe_encoder_escapes() {
+        let js = port_glue_js();
+        assert_eq!(
+            js.matches(
+                r#"  var PUSH_ENCODE_ESCAPED = new RegExp("[" + String.fromCodePoint(0x26, 0x3c, 0x3e, 0x2028, 0x2029) + "]", "gu");"#
+            )
+                .count(),
+            1
+        );
+        let text = js
+            .find("  function pushWebText(subscription) {")
+            .expect("the push text renderer is assembled");
+        let body = js
+            .get(text..)
+            .expect("the renderer starts on a char boundary");
+        let end = body.find("\n  }\n").expect("the renderer ends");
+        let body = body
+            .get(..end)
+            .expect("the renderer ends on a char boundary");
+        assert_eq!(body.matches("JSON.stringify(").count(), 1);
+        assert!(body.ends_with("}).replace(PUSH_ENCODE_ESCAPED, pushEncodeEscape);"));
+        assert_eq!(
+            js.matches(r#"    return "\\u" + ("000" + c.charCodeAt(0).toString(16)).slice(-4);"#)
+                .count(),
+            1
+        );
+    }
+
+    /// [`PUSH_ENCODE_ESCAPED`] is exactly the set of characters the
+    /// `Json.Encode.encode` writer escapes beyond the plain JSON writer, and each
+    /// is spelled as the glue spells it: four lowercase hex digits.
+    #[cfg(feature = "json")]
+    #[test]
+    fn push_encode_escaped_is_the_encoder_escape_set() {
+        use crate::json_val::{JsonVal, Layout, Policy, write_json};
+        let render = |c: char, policy: Policy| {
+            let mut out = String::new();
+            write_json(
+                &mut out,
+                &JsonVal::String(c.to_string()),
+                Layout::Compact,
+                policy,
+            );
+            out
+        };
+        let differing: Vec<char> = (0..=0xFFFF_u32)
+            .filter_map(char::from_u32)
+            .filter(|c| render(*c, Policy::Encode) != render(*c, Policy::Display))
+            .collect();
+        assert_eq!(differing, PUSH_ENCODE_ESCAPED.to_vec());
+        for c in PUSH_ENCODE_ESCAPED {
+            assert_eq!(
+                render(c, Policy::Encode),
+                format!("\"\\u{:04x}\"", u32::from(c))
+            );
+        }
     }
 
     #[test]

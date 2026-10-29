@@ -1562,6 +1562,7 @@ impl StoreOpenError {
                 | DbConnectError::MisplacedUserinfo
                 | DbConnectError::TooManyDialTargets { .. }
                 | DbConnectError::UnsupportedScheme
+                | DbConnectError::UnverifiedTls { .. }
                 | DbConnectError::EngineMismatch { .. } => true,
                 DbConnectError::HostRefused(refusal) => match refusal {
                     SsrfRefusal::Blocked { .. }
@@ -2883,6 +2884,44 @@ mod tests {
         crate::system::locked_remove_var("IPE_HTTP_DENY_PRIVATE");
     }
 
+    /// A PostgreSQL store whose URL names a remote host under an `sslmode`
+    /// that does not verify the server fails startup, whatever the dial
+    /// policy, instead of degrading to in-memory sessions.
+    #[cfg(feature = "db")]
+    #[tokio::test]
+    async fn postgres_store_with_unverified_remote_tls_refuses_startup() {
+        for (url, mode) in [
+            (
+                "postgres://admin:s3cr3t-pw@db.example/prod?sslmode=require",
+                "sslmode=require",
+            ),
+            (
+                "postgres://admin:s3cr3t-pw@1.1.1.1/prod?sslmode=disable",
+                "sslmode=disable",
+            ),
+        ] {
+            let refused =
+                choose_store::<i32, ()>("postgres", url, Duration::from_secs(60), TEST_TAG)
+                    .await
+                    .err();
+            assert!(
+                matches!(
+                    refused,
+                    Some(StoreConfigError::Refused {
+                        backend: "postgres",
+                        ..
+                    })
+                ),
+                "{url:?} must refuse startup: {refused:?}"
+            );
+            let msg = refused.map(|r| r.to_string()).unwrap_or_default();
+            assert!(msg.contains(mode), "{url:?}: {msg}");
+            assert!(msg.contains("sslmode=verify-full"), "{url:?}: {msg}");
+            assert!(!msg.contains("s3cr3t-pw"), "password leaked: {msg}");
+            assert!(!msg.contains("admin"), "user leaked: {msg}");
+        }
+    }
+
     /// A transient connect failure is not a policy refusal: it keeps the
     /// documented fallback to memory.
     #[cfg(feature = "db")]
@@ -2917,6 +2956,9 @@ mod tests {
             StoreOpenError::Connect(DbConnectError::MisplacedUserinfo),
             StoreOpenError::Connect(DbConnectError::TooManyDialTargets { limit: 8 }),
             StoreOpenError::Connect(DbConnectError::UnsupportedScheme),
+            StoreOpenError::Connect(DbConnectError::UnverifiedTls {
+                mode: crate::dsn::UnverifiedSslMode::Require,
+            }),
             StoreOpenError::Connect(DbConnectError::EngineMismatch {
                 url: DbEngine::Sqlite,
                 driver: DbEngine::Postgres,

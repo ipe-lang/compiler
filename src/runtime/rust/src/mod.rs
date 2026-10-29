@@ -305,6 +305,8 @@ pub use external_conn::*;
 // compiled in-workspace (the standalone crate uses the sqlite `config.rs`).
 #[cfg(feature = "json")]
 pub mod json;
+#[cfg(feature = "json")]
+pub mod json_val;
 #[cfg(all(test, feature = "db"))]
 mod postgres_placeholder_rewrite_test;
 // The Ipê↔JS boundary-seal codec: the total, fail-closed decode gate a generated
@@ -881,7 +883,7 @@ const _WASI_TIME_FLOOR_SEAL: () = {
     let _ = crate::time::time_sleep::<E>;
 };
 
-/// Source scan for client JavaScript that reads the global `document` directly.
+/// Source scans over client JavaScript, read through one comment-aware lexer.
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod js_document_scan {
     /// Whether `c` can continue a JavaScript identifier.
@@ -983,7 +985,133 @@ mod js_document_scan {
         found
     }
 
+    /// The byte offset of each mention of `name` in `code` as a whole identifier.
+    fn identifier_offsets<'a>(code: &'a str, name: &'a str) -> impl Iterator<Item = usize> + 'a {
+        code.match_indices(name).filter_map(move |(at, _)| {
+            let before = code.get(..at).unwrap_or_default();
+            let after = code.get(at + name.len()..).unwrap_or_default();
+            let bounded = !before.chars().next_back().is_some_and(is_ident)
+                && !after.chars().next().is_some_and(is_ident);
+            bounded.then_some(at)
+        })
+    }
+
+    /// The trimmed text of the line of `code` that holds byte offset `at`.
+    fn line_text(code: &str, at: usize) -> String {
+        let start = code
+            .get(..at)
+            .and_then(|before| before.rfind('\n'))
+            .map_or(0, |n| n + 1);
+        let end = code
+            .get(at..)
+            .and_then(|after| after.find('\n'))
+            .map_or(code.len(), |n| at + n);
+        code.get(start..end).unwrap_or_default().trim().to_owned()
+    }
+
+    /// Every code line of `js` that names `name` as a whole identifier, once per mention.
+    ///
+    /// Comments are skipped; a string literal spelling `name` counts as a mention.
+    pub(super) fn name_sites(js: &str, name: &str) -> Vec<String> {
+        let code = strip_comments(js);
+        identifier_offsets(&code, name)
+            .map(|at| line_text(&code, at))
+            .collect()
+    }
+
+    /// Every code line of `js` that uses one of `globals` other than as `typeof g` or `g.member`.
+    ///
+    /// A computed read (`g[k]`, `g?.[k]`), an alias (`var w = g`), an argument
+    /// (`f(g)`) and a comparison are each reported once per mention, in source order.
+    pub(super) fn bare_global_sites(js: &str, globals: &[&str]) -> Vec<String> {
+        let code = strip_comments(js);
+        let mut found: Vec<(usize, String)> = Vec::new();
+        for global in globals {
+            for at in identifier_offsets(&code, global) {
+                let before = code.get(..at).unwrap_or_default();
+                let after = code
+                    .get(at + global.len()..)
+                    .unwrap_or_default()
+                    .trim_start();
+                let is_member = after
+                    .strip_prefix("?.")
+                    .or_else(|| after.strip_prefix('.'))
+                    .is_some_and(|rest| rest.trim_start().chars().next().is_some_and(is_ident));
+                let is_typeof = before
+                    .trim_end()
+                    .strip_suffix("typeof")
+                    .is_some_and(|rest| !rest.chars().next_back().is_some_and(is_ident))
+                    && !after.starts_with(['.', '[', '?']);
+                if !(is_member || is_typeof) {
+                    found.push((at, line_text(&code, at)));
+                }
+            }
+        }
+        found.sort_by_key(|(at, _)| *at);
+        found.into_iter().map(|(_, line)| line).collect()
+    }
+
     mod tests {
+        use super::{bare_global_sites, name_sites};
+
+        const GLOBALS: &[&str] = &["window", "self", "globalThis", "this"];
+
+        #[test]
+        fn the_site_scans_report_every_late_handle_read() {
+            let late_dotted = "function f() { window.__ipeNative.postMessage(x); }";
+            assert_eq!(
+                name_sites(late_dotted, "__ipeNative"),
+                vec![late_dotted.to_owned()]
+            );
+            let late_computed = "function sink() { return window[BRIDGE_CHANNEL]; }";
+            assert_eq!(
+                name_sites(late_computed, "BRIDGE_CHANNEL"),
+                vec![late_computed.to_owned()]
+            );
+            assert_eq!(
+                bare_global_sites(late_computed, GLOBALS),
+                vec![late_computed.to_owned()]
+            );
+            let alias = "var ch = BRIDGE_CHANNEL;";
+            assert_eq!(name_sites(alias, "BRIDGE_CHANNEL"), vec![alias.to_owned()]);
+            let late_kit = "function g() { return window.webkit.messageHandlers; }";
+            assert_eq!(name_sites(late_kit, "webkit"), vec![late_kit.to_owned()]);
+            for computed in [
+                "var h = window[\"__ipe\" + \"Native\"];",
+                "var h = self[x];",
+                "var h = globalThis?.[x];",
+                "var h = this[x];",
+                "var w = window;",
+                "keys(window);",
+                "var h = window.self[x];",
+                "var { __ipeNative: h } = window;",
+                "with (window) { h = __x; }",
+                "var d = Object.getOwnPropertyDescriptor(window, k);",
+                "var h = Reflect.get(globalThis, k);",
+                "var h = typeof window[k];",
+            ] {
+                assert!(
+                    !bare_global_sites(computed, GLOBALS).is_empty(),
+                    "accepted: {computed}"
+                );
+            }
+        }
+
+        #[test]
+        fn the_site_scans_pass_member_reads_typeof_and_comments() {
+            let js = "if (typeof window === \"undefined\") {}\n\
+                      window.addEventListener(\"focus\", f);\n\
+                      var s = window?.speechSynthesis;\n\
+                      // window[BRIDGE_CHANNEL] and window.webkit are never read\n\
+                      var c = navigator.webkitConnection; var p = window.__ipePortSend;\n";
+            assert_eq!(bare_global_sites(js, GLOBALS), Vec::<String>::new());
+            assert_eq!(name_sites(js, "BRIDGE_CHANNEL"), Vec::<String>::new());
+            assert_eq!(name_sites(js, "webkit"), Vec::<String>::new());
+            assert_eq!(name_sites(js, "__ipeNative"), Vec::<String>::new());
+        }
+    }
+
+    mod document_tests {
         use super::unbound_document_reads;
 
         #[test]

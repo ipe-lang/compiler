@@ -325,6 +325,13 @@ pub fn build_doc(
             build_let(ctx, *name, value, body, indent, child, generics)
         }
 
+        // A pre-clone run `({ let a = a.clone(); let b = b.clone(); body })`:
+        // one block whatever the number of symbols, each clone `let` on its own
+        // line, laid out as the one-statement `let` block above.
+        Expr::CaptureClones { syms, body } => {
+            build_capture_clones(ctx, syms, body, indent, child, generics)
+        }
+
         // A `Destructure` block `({ <binding stmts> <body> })`. Like the `let`
         // block, but its binder may expand to MULTIPLE `let` statements
         // (`emit_binding_stmts`: one flat `let <pat> = <value>;` for an alias-free
@@ -1318,6 +1325,36 @@ fn build_let(
     ]))
 }
 
+/// Build the `Doc` for a pre-clone block, mirroring [`crate::emit_expr::emit_expr_at`]'s `Expr::CaptureClones` arm token-for-token.
+///
+/// Each `let <sym> = <sym>.clone();` statement is a leaf on its own
+/// `HardLine`, and the body follows on a further `HardLine`, all inside the
+/// block's sole `Nest(4)`. A single symbol renders exactly as the self-clone
+/// `let` block [`build_let`] builds.
+fn build_capture_clones(
+    ctx: &EmitCtx,
+    syms: &[Symbol],
+    body: &Expr,
+    indent: usize,
+    child: u16,
+    generics: GenericScope,
+) -> DResult<Doc> {
+    let mut inner = Vec::with_capacity(syms.len() * 2 + 2);
+    for sym in syms {
+        let name_s = ctx.emit_local_ident(*sym)?;
+        inner.push(Doc::HardLine);
+        inner.push(Doc::owned(format!("let {name_s} = {name_s}.clone();"))?);
+    }
+    inner.push(Doc::HardLine);
+    inner.push(build_doc(ctx, body, indent, child, generics)?);
+    Ok(Doc::concat(vec![
+        Doc::text(leaf!("({")),
+        Doc::nest(4, Doc::concat(inner)),
+        Doc::HardLine,
+        Doc::text(leaf!("})")),
+    ]))
+}
+
 /// Build the `Doc` for a `Destructure` block, mirroring
 /// [`crate::emit_expr::emit_expr_at`]'s `Expr::Destructure` arm token-for-token.
 ///
@@ -1898,7 +1935,7 @@ fn build_applied_lambda(
 /// brackets (keeping the comma). This mirrors `rustfmt`'s arm-body rule: a call /
 /// constructor / application / tuple / list / cons / record / `task_and_then`
 /// tail overflows into its own argument list, so no braces are synthesized; an
-/// `if` / binary-operator chain / `let` / destructure / update / sync task block
+/// `if` / binary-operator chain / `let` / pre-clone / destructure / update / sync task block
 /// is parenthesized or block-shaped and gets wrapped.
 ///
 /// A body that is not one of the structured shapes (a plain leaf) is treated as
@@ -1908,7 +1945,11 @@ fn build_applied_lambda(
 const fn arm_body_is_control(body: &Expr) -> bool {
     match body {
         // Parenthesized or block-shaped: wrapped in synthesized braces when broken.
-        Expr::If { .. } | Expr::Let { .. } | Expr::Destructure { .. } | Expr::Update { .. } => true,
+        Expr::If { .. }
+        | Expr::Let { .. }
+        | Expr::CaptureClones { .. }
+        | Expr::Destructure { .. }
+        | Expr::Update { .. } => true,
         // A chain-eligible binary operator renders `(a + b)` and wraps when broken;
         // the call-shaped `Append` / `IntDiv` are leaves (delimited-tail).
         Expr::BinOp { op, .. } => infix(*op).is_some(),
@@ -3052,7 +3093,7 @@ mod tests {
             // captured golden's origin column.
             let stmt = Doc::nest(4, Doc::concat(vec![Doc::text(leaf!("let z = ")), doc]));
             let got = render(&stmt, RenderConfig::default());
-            let expected = "let z = (if some_condition_variable {\n        first_branch_value\n    } else {\n        second_branch_value_here\n    })";
+            let expected = "let z = (if __u_some_condition_variable {\n        __u_first_branch_value\n    } else {\n        __u_second_branch_value_here\n    })";
             assert_eq!(
                 got, expected,
                 "\n--- got ---\n{got}\n--- want ---\n{expected}"
@@ -3104,7 +3145,7 @@ mod tests {
         with_ctx(&fx, |ctx| {
             let expr = Expr::Tuple(vec![var(&fx, 7), var(&fx, 8), var(&fx, 9)]);
             let got = render_let_stmt(ctx, &expr);
-            let expected = "let z = (\n        argument_that_is_quite_long_enough_to_matter_x,\n        argument_that_is_quite_long_enough_to_matter_y,\n        argument_that_is_quite_long_enough_to_matter_z,\n    )";
+            let expected = "let z = (\n        __u_argument_that_is_quite_long_enough_to_matter_x,\n        __u_argument_that_is_quite_long_enough_to_matter_y,\n        __u_argument_that_is_quite_long_enough_to_matter_z,\n    )";
             assert_eq!(
                 got, expected,
                 "\n--- got ---\n{got}\n--- want ---\n{expected}"
@@ -3124,7 +3165,7 @@ mod tests {
                 items: vec![var(&fx, 7), var(&fx, 8), var(&fx, 9)],
             };
             let got = render_let_stmt(ctx, &expr);
-            let expected = "let z = vec![\n        argument_that_is_quite_long_enough_to_matter_x,\n        argument_that_is_quite_long_enough_to_matter_y,\n        argument_that_is_quite_long_enough_to_matter_z,\n    ]";
+            let expected = "let z = vec![\n        __u_argument_that_is_quite_long_enough_to_matter_x,\n        __u_argument_that_is_quite_long_enough_to_matter_y,\n        __u_argument_that_is_quite_long_enough_to_matter_z,\n    ]";
             assert_eq!(
                 got, expected,
                 "\n--- got ---\n{got}\n--- want ---\n{expected}"
@@ -3144,7 +3185,7 @@ mod tests {
                 tail: Box::new(var(&fx, 8)),
             };
             let got = render_let_stmt(ctx, &expr);
-            let expected = "let z = ipe_runtime::list::ipe_list_cons(\n        argument_that_is_quite_long_enough_to_matter_x,\n        argument_that_is_quite_long_enough_to_matter_y,\n    )";
+            let expected = "let z = ipe_runtime::list::ipe_list_cons(\n        __u_argument_that_is_quite_long_enough_to_matter_x,\n        __u_argument_that_is_quite_long_enough_to_matter_y,\n    )";
             assert_eq!(
                 got, expected,
                 "\n--- got ---\n{got}\n--- want ---\n{expected}"
@@ -3171,7 +3212,7 @@ mod tests {
             };
             let got = render_let_stmt(ctx, &expr);
             let expected = format!(
-                "let z = {name}(\n        argument_that_is_quite_long_enough_to_matter_x,\n        argument_that_is_quite_long_enough_to_matter_y,\n        argument_that_is_quite_long_enough_to_matter_z,\n    )"
+                "let z = {name}(\n        __u_argument_that_is_quite_long_enough_to_matter_x,\n        __u_argument_that_is_quite_long_enough_to_matter_y,\n        __u_argument_that_is_quite_long_enough_to_matter_z,\n    )"
             );
             assert_eq!(
                 got, expected,
@@ -3269,7 +3310,7 @@ mod tests {
             };
             let expr = binop(BinOp::FloatAdd, wide_if, var(&fx, 3)); // + x (a placeholder tail)
             let got = render_let_stmt(ctx, &expr);
-            let expected = "let z = ((if some_condition_variable {\n        first_branch_value\n    } else {\n        second_branch_value_here\n    }) + x)";
+            let expected = "let z = ((if __u_some_condition_variable {\n        __u_first_branch_value\n    } else {\n        __u_second_branch_value_here\n    }) + x)";
             assert_eq!(
                 got, expected,
                 "\n--- got ---\n{got}\n--- want ---\n{expected}"
@@ -3320,7 +3361,7 @@ mod tests {
         with_ctx(&fx, |ctx| {
             let expr = binop(BinOp::Append, var(&fx, 7), var(&fx, 8));
             let got = render_let_stmt(ctx, &expr);
-            let expected = "let z = format!(\n        \"{}{}\",\n        argument_that_is_quite_long_enough_to_matter_x,\n        argument_that_is_quite_long_enough_to_matter_y\n    )";
+            let expected = "let z = format!(\n        \"{}{}\",\n        __u_argument_that_is_quite_long_enough_to_matter_x,\n        __u_argument_that_is_quite_long_enough_to_matter_y\n    )";
             assert_eq!(
                 got, expected,
                 "\n--- got ---\n{got}\n--- want ---\n{expected}"
@@ -3338,7 +3379,7 @@ mod tests {
         with_ctx(&fx, |ctx| {
             let expr = binop(BinOp::IntDiv, var(&fx, 7), var(&fx, 8));
             let got = render_let_stmt(ctx, &expr);
-            let expected = "let z = ipe_runtime::math::ipe_int_div(\n        argument_that_is_quite_long_enough_to_matter_x,\n        argument_that_is_quite_long_enough_to_matter_y,\n    )";
+            let expected = "let z = ipe_runtime::math::ipe_int_div(\n        __u_argument_that_is_quite_long_enough_to_matter_x,\n        __u_argument_that_is_quite_long_enough_to_matter_y,\n    )";
             assert_eq!(
                 got, expected,
                 "\n--- got ---\n{got}\n--- want ---\n{expected}"
@@ -3488,7 +3529,7 @@ mod tests {
             let prefix = flat.split_once('(').expect("ctor has an open paren").0;
             let got = render_let_stmt(ctx, &expr);
             let expected = format!(
-                "let z = {prefix}(\n        argument_that_is_quite_long_enough_to_matter_x,\n        argument_that_is_quite_long_enough_to_matter_y,\n        argument_that_is_quite_long_enough_to_matter_z,\n    )"
+                "let z = {prefix}(\n        __u_argument_that_is_quite_long_enough_to_matter_x,\n        __u_argument_that_is_quite_long_enough_to_matter_y,\n        __u_argument_that_is_quite_long_enough_to_matter_z,\n    )"
             );
             assert_eq!(
                 got, expected,
@@ -3525,7 +3566,7 @@ mod tests {
                 args: vec![var(&fx, 7), var(&fx, 8), var(&fx, 9)],
             };
             let got = render_let_stmt(ctx, &expr);
-            let expected = "let z = (a)(\n        argument_that_is_quite_long_enough_to_matter_x,\n        argument_that_is_quite_long_enough_to_matter_y,\n        argument_that_is_quite_long_enough_to_matter_z,\n    )";
+            let expected = "let z = (a)(\n        __u_argument_that_is_quite_long_enough_to_matter_x,\n        __u_argument_that_is_quite_long_enough_to_matter_y,\n        __u_argument_that_is_quite_long_enough_to_matter_z,\n    )";
             assert_eq!(
                 got, expected,
                 "\n--- got ---\n{got}\n--- want ---\n{expected}"
@@ -3638,7 +3679,7 @@ mod tests {
             body: Box::new(Expr::Var(wide)),
         };
         let got = render_fn_body(&ctx, &expr);
-        let expected = "    {\n        let __ipe_fn: Box<dyn Fn(i64) -> i64 + Send + Sync + 'static> =\n            Box::new(move |x: i64| -> i64 {\n                a_very_long_body_expression_that_definitely_exceeds_the_available_width_padding\n            });\n        __ipe_fn\n    }";
+        let expected = "    {\n        let __ipe_fn: Box<dyn Fn(i64) -> i64 + Send + Sync + 'static> =\n            Box::new(move |x: i64| -> i64 {\n                __u_a_very_long_body_expression_that_definitely_exceeds_the_available_width_padding\n            });\n        __ipe_fn\n    }";
         assert_eq!(
             got, expected,
             "\n--- got ---\n{got}\n--- want ---\n{expected}"
@@ -3865,7 +3906,7 @@ mod tests {
             let name = flat.split_once(" {").expect("record has a brace").0;
             let got = render_let_stmt(ctx, &expr);
             let expected = format!(
-                "let z = {name} {{\n        a: argument_that_is_quite_long_enough_to_matter_x,\n        b: argument_that_is_quite_long_enough_to_matter_y,\n    }}"
+                "let z = {name} {{\n        a: __u_argument_that_is_quite_long_enough_to_matter_x,\n        b: __u_argument_that_is_quite_long_enough_to_matter_y,\n    }}"
             );
             assert_eq!(
                 got, expected,
@@ -3948,7 +3989,7 @@ mod tests {
                 rest: Box::new(var(&fx, 8)),   // …_y
             };
             let got = render_let_stmt(ctx, &expr);
-            let expected = "let z = task_and_then(\n        argument_that_is_quite_long_enough_to_matter_x,\n        Box::new(move |_| argument_that_is_quite_long_enough_to_matter_y),\n    )";
+            let expected = "let z = task_and_then(\n        __u_argument_that_is_quite_long_enough_to_matter_x,\n        Box::new(move |_| __u_argument_that_is_quite_long_enough_to_matter_y),\n    )";
             assert_eq!(
                 got, expected,
                 "\n--- got ---\n{got}\n--- want ---\n{expected}"
@@ -4025,7 +4066,7 @@ mod tests {
         let doc = build_doc(&ctx, &expr, 4, 0, scope).expect("build_doc");
         let stmt = Doc::nest(4, Doc::concat(vec![Doc::text(leaf!("let z = ")), doc]));
         let got = render(&stmt, RenderConfig::default());
-        let expected = "let z = task_and_then(\n        short_eff,\n        Box::new(move |_| {\n            a_body_wide_enough_to_break_only_the_closure_body_padding_padding_padding_pad\n        }),\n    )";
+        let expected = "let z = task_and_then(\n        __u_short_eff,\n        Box::new(move |_| {\n            __u_a_body_wide_enough_to_break_only_the_closure_body_padding_padding_padding_pad\n        }),\n    )";
         assert_eq!(
             got, expected,
             "\n--- got ---\n{got}\n--- want ---\n{expected}"
@@ -4129,7 +4170,7 @@ mod tests {
             // list with the trailing comma kept; the fitting `Wrap` arm keeps its
             // comma too. Golden captured from `rustfmt --edition 2024`.
             let expected = format!(
-                "match x {{\n    MainMsg::Unit => {name}(\n        argument_that_is_quite_long_enough_to_matter_x,\n        argument_that_is_quite_long_enough_to_matter_y,\n        argument_that_is_quite_long_enough_to_matter_z,\n    ),\n    MainMsg::Wrap(a) => a,\n}}"
+                "match x {{\n    MainMsg::Unit => {name}(\n        __u_argument_that_is_quite_long_enough_to_matter_x,\n        __u_argument_that_is_quite_long_enough_to_matter_y,\n        __u_argument_that_is_quite_long_enough_to_matter_z,\n    ),\n    MainMsg::Wrap(a) => a,\n}}"
             );
             assert_eq!(
                 got, expected,
@@ -4164,7 +4205,7 @@ mod tests {
             // The chain body braces and breaks; the `Unit` arm has no trailing comma
             // (dropped by synthesized braces), while the fitting `Wrap` arm keeps its
             // comma. Golden captured from `rustfmt --edition 2024`.
-            let expected = "match x {\n    MainMsg::Unit => {\n        ((argument_that_is_quite_long_enough_to_matter_x\n            + argument_that_is_quite_long_enough_to_matter_y)\n            + argument_that_is_quite_long_enough_to_matter_z)\n    }\n    MainMsg::Wrap(a) => a,\n}";
+            let expected = "match x {\n    MainMsg::Unit => {\n        ((__u_argument_that_is_quite_long_enough_to_matter_x\n            + __u_argument_that_is_quite_long_enough_to_matter_y)\n            + __u_argument_that_is_quite_long_enough_to_matter_z)\n    }\n    MainMsg::Wrap(a) => a,\n}";
             assert_eq!(
                 got, expected,
                 "\n--- got ---\n{got}\n--- want ---\n{expected}"

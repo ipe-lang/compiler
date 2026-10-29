@@ -21,6 +21,8 @@ pub use const_fold::fold_program;
 pub use emit_expr::rust_str_lit;
 /// The typed mount base the emitted browser shell is served under.
 pub use ipe_runtime_rust::encoding::MountBase;
+/// The parsed `delivery.servers` origins a browser bundle may reach.
+pub use ipe_runtime_rust::encoding::{ServerOrigin, ServerOrigins};
 pub mod crate_specs;
 #[macro_use]
 mod doc;
@@ -518,6 +520,7 @@ impl<'a> RustBackend<'a> {
             target,
             wasm_public_env,
             mount_base,
+            server_origins,
             wasm_hydrate_mode,
             runtime_dep,
             debugger,
@@ -534,6 +537,7 @@ impl<'a> RustBackend<'a> {
                 target: *target,
                 wasm_public_env: wasm_public_env.clone(),
                 mount_base: mount_base.clone(),
+                server_origins: server_origins.clone(),
                 wasm_hydrate_mode: *wasm_hydrate_mode,
                 runtime_dep: runtime_dep.clone(),
                 debugger: *debugger,
@@ -1382,6 +1386,8 @@ pub(crate) struct EmitCtx<'a> {
     /// Where the emitted browser shell is served, threaded in via
     /// [`RustBackend::with_mount_base`]; every shell URL is built from it.
     pub(crate) mount_base: MountBase,
+    /// The `delivery.servers` origins the browser shell's policy admits.
+    pub(crate) server_origins: ServerOrigins,
     /// `true` when `[wasm] mode = "hydrate"` was set in `package.ipe`. When set,
     /// the emitted wasm epilogue includes a `#[wasm_bindgen] pub fn hydrate(…)`
     /// export in addition to the `#[wasm_bindgen(start)] ipe_start` entry —
@@ -1739,6 +1745,7 @@ impl<'a> EmitCtx<'a> {
             target,
             wasm_public_env,
             mount_base,
+            server_origins,
             wasm_hydrate_mode,
             runtime_dep,
             debugger,
@@ -2409,6 +2416,7 @@ impl<'a> EmitCtx<'a> {
             uses_async_runtime,
             wasm_public_env,
             mount_base,
+            server_origins,
             wasm_hydrate_mode,
             runtime_dep,
             debugger,
@@ -3365,10 +3373,10 @@ impl<'a> EmitCtx<'a> {
     }
 
     /// Among the candidate structs for one field-name set, the one whose field
-    /// template is ALPHA-EQUIVALENT to `shape_by_name` (identical `skeleton_key`,
-    /// the canonical normal form). Two distinct generic siblings (`{q:a}` and
-    /// `{q:(a,a)}`) both instantiation-match a generic use site, so the exact
-    /// skeleton match is what makes the resolution unambiguous. `None` when no
+    /// template is ALPHA-EQUIVALENT to `shape_by_name`
+    /// ([`ipe_ir::alpha_equivalent_fields`]). Two distinct generic siblings
+    /// (`{q:a}` and `{q:(a,a)}`) both instantiation-match a generic use site, so
+    /// the alpha-equivalence match is what makes the resolution unambiguous. `None` when no
     /// candidate is alpha-equivalent — a concrete instantiation of a lone generic
     /// template, left to the caller's instantiation scan.
     fn record_struct_alpha_equivalent(
@@ -3382,7 +3390,6 @@ impl<'a> EmitCtx<'a> {
             .map(|(n, t)| ((*n).to_owned(), (*t).clone()))
             .collect();
         named.sort_by(|a, b| a.0.cmp(&b.0));
-        let shape_skeleton = skeleton_key(&named);
         for &i in indices {
             let rec = self
                 .record_structs
@@ -3394,7 +3401,7 @@ impl<'a> EmitCtx<'a> {
                         key.join(", ")
                     ),
                 })?;
-            if skeleton_key(&rec.fields) == shape_skeleton {
+            if ipe_ir::alpha_equivalent_fields(&rec.fields, &named) {
                 return Ok(Some(rec));
             }
         }
@@ -3470,7 +3477,7 @@ impl<'a> EmitCtx<'a> {
         // use-site shape (`{q:(a,a)}`) instantiation-matches BOTH the exact struct
         // AND any strictly-more-general one (`{q:a}` binds `a := (a,a)`), which
         // would read as an ambiguous "matched more than one". The exact struct is
-        // the alpha-equivalent one: its skeleton equals the shape's. Prefer that —
+        // the alpha-equivalent one: a renaming of the shape's type variables. Prefer that —
         // it is the canonical, most-specific choice — and only fall back to the
         // instantiation scan when no candidate is alpha-equivalent (a genuine
         // monomorphic instantiation of a single generic template).
@@ -3803,7 +3810,7 @@ impl<'a> EmitCtx<'a> {
     /// deserialized cache entry, a hand-built program) is refused here.
     pub(crate) fn verify_borrows(&self, func: &ipe_ir::Func) -> DResult<()> {
         ipe_ir::borrow::verify(func, &self.passes, &self.enum_variants)
-            .map_err(|v| v.into_diagnostic("ipe_backend_rust::emit_func"))
+            .map_err(|v| v.into_diagnostic(func, self.interner, "ipe_backend_rust::emit_func"))
     }
 
     /// Was the 0-based parameter `idx` of function `id` monomorphized to an
@@ -4628,111 +4635,6 @@ fn entry_app_surface(program: &Program, webview: bool) -> ipe_ir::AppSurface {
     }
 }
 
-/// A position-canonical rendering of a field-shape: every [`IrType::Generic`]
-/// symbol is replaced by its first-occurrence index, so two alpha-equivalent
-/// templates (`{ value : a }` and `{ value : b }`) render the same string and a
-/// non-equivalent one (`{ x : a, y : a }` vs `{ x : a, y : b }`) does not. Used
-/// only for equality, never emitted.
-fn skeleton_key(fields: &[(String, IrType)]) -> String {
-    let mut idx: BTreeMap<Symbol, usize> = BTreeMap::new();
-    let mut out = String::new();
-    for (name, ty) in fields {
-        out.push_str(name);
-        out.push(':');
-        skeleton_ty(ty, &mut idx, &mut out);
-        out.push(';');
-    }
-    out
-}
-
-fn skeleton_ty(ty: &IrType, idx: &mut BTreeMap<Symbol, usize>, out: &mut String) {
-    match ty {
-        IrType::Generic(s) => {
-            let next = idx.len();
-            let n = *idx.entry(*s).or_insert(next);
-            out.push('G');
-            out.push_str(&n.to_string());
-        }
-        IrType::Tuple(elems) => {
-            out.push('(');
-            for e in elems {
-                skeleton_ty(e, idx, out);
-                out.push(',');
-            }
-            out.push(')');
-        }
-        IrType::Record(map) => {
-            out.push('{');
-            for (k, v) in map {
-                out.push_str(&k.as_raw().to_string());
-                out.push(':');
-                skeleton_ty(v, idx, out);
-                out.push(',');
-            }
-            out.push('}');
-        }
-        IrType::Fun(params, ret) => {
-            out.push_str("fn(");
-            for p in params {
-                skeleton_ty(p, idx, out);
-                out.push(',');
-            }
-            out.push_str(")->");
-            skeleton_ty(ret, idx, out);
-        }
-        IrType::Enum { home, name, args } => {
-            // Key by the enum's nominal identity (home + symbol) plus its
-            // (possibly generic) type args, so `Maybe a` and `Maybe Int`
-            // skeletonise distinctly while `Maybe a` and `Maybe b`
-            // (alpha-equivalent) coincide. Home is included so two same-short-named
-            // types from different modules do not conflate record shapes.
-            out.push('E');
-            for seg in &home.0 {
-                out.push_str(&seg.as_raw().to_string());
-                out.push('.');
-            }
-            out.push_str(&name.as_raw().to_string());
-            out.push('<');
-            for a in args {
-                skeleton_ty(a, idx, out);
-                out.push(',');
-            }
-            out.push('>');
-        }
-        IrType::Dict(k, v) => {
-            out.push_str("Dict<");
-            skeleton_ty(k, idx, out);
-            out.push(',');
-            skeleton_ty(v, idx, out);
-            out.push('>');
-        }
-        IrType::Set(a) => {
-            out.push_str("Set<");
-            skeleton_ty(a, idx, out);
-            out.push('>');
-        }
-        // `IpeCmd<M>` / `IpeSub<M>` carry a message type parameter; recurse so
-        // `IpeCmd<G0>` and `IpeCmd<G1>` (alpha-equivalent) get the same key.
-        IrType::Cmd(inner) => {
-            out.push_str("Cmd<");
-            skeleton_ty(inner, idx, out);
-            out.push('>');
-        }
-        IrType::Sub(inner) => {
-            out.push_str("Sub<");
-            skeleton_ty(inner, idx, out);
-            out.push('>');
-        }
-        // Scalar / leaf types (Int / Bool / …): their `Debug` form is a stable,
-        // generic-free discriminator — exactly what a skeleton needs.
-        other => {
-            use core::fmt::Write as _;
-            // Writing to a `String` is infallible; the `Result` is discarded.
-            let _ = write!(out, "{other:?}");
-        }
-    }
-}
-
 /// Match a struct-template type against a USE-SITE type, recording in `subst`
 /// the concrete (or generic-in-the-enclosing-function) type each template
 /// [`IrType::Generic`] binds to. A template `Generic` binds any use-site type
@@ -4927,29 +4829,15 @@ fn match_template(
 fn template_specificity(ty: &IrType) -> usize {
     match ty {
         IrType::Generic(_) | IrType::RowGeneric(_) => 0,
-        IrType::Tuple(elems) => 1 + elems.iter().map(template_specificity).sum::<usize>(),
         IrType::Record(map) => 1 + map.values().map(template_specificity).sum::<usize>(),
-        IrType::Fun(params, ret)
-        | IrType::SharedFun(params, ret)
-        | IrType::FnOnceChain(params, ret) => {
-            1 + params.iter().map(template_specificity).sum::<usize>() + template_specificity(ret)
+        // Every other node is one head plus its children, which the head-identity
+        // SSOT `paired_children` enumerates exhaustively (a node paired with
+        // itself); a leaf has none.
+        _ => {
+            1 + ipe_ir::paired_children(ty, ty).map_or(0, |children| {
+                children.map(|(child, _)| template_specificity(child)).sum()
+            })
         }
-        IrType::Enum { args, .. } => 1 + args.iter().map(template_specificity).sum::<usize>(),
-        IrType::Maybe(e)
-        | IrType::List(e)
-        | IrType::Set(e)
-        | IrType::Decoder(e)
-        | IrType::Task(e)
-        | IrType::Cmd(e)
-        | IrType::Sub(e)
-        | IrType::WebRoute(e)
-        | IrType::Ui { msg: e, .. } => 1 + template_specificity(e),
-        IrType::Result(a, b) | IrType::Dict(a, b) => {
-            1 + template_specificity(a) + template_specificity(b)
-        }
-        // Every remaining variant is a concrete leaf (`Int`, opaque handles,
-        // nullary plain types, …): it contributes 1 and has no children.
-        _ => 1,
     }
 }
 
@@ -4994,16 +4882,16 @@ fn reconcile_shapes(key: &[String], occurrences: &[RecordFields]) -> DResult<Vec
     // uniquely: body-local shape surfacing (and signatures generally) can feed
     // two GENUINELY-DISTINCT generic shapes under one set — `{ q = a }` (shape
     // `{q:a}`) in one function and `{ q = (a, a) }` (shape `{q:(a,a)}`) in
-    // another. Both are well-typed, so each synthesises its own struct, keyed by
-    // its `skeleton_key` (the alpha-equivalence normal form). Alpha-EQUIVALENT
-    // occurrences share one skeleton and fold to a single struct — no spurious
-    // duplication. This mirrors the monomorphic-sibling path below, where
+    // another. Both are well-typed, so each synthesises its own struct.
+    // Alpha-EQUIVALENT occurrences (`ipe_ir::alpha_equivalent_fields`) fold to a
+    // single struct — no spurious duplication. This mirrors the monomorphic-sibling path below, where
     // structurally-distinct concrete shapes sharing a name set each get a struct.
     let mut templates: Vec<CanonicalShape> = Vec::new();
-    let mut template_skeletons: Vec<String> = Vec::new();
     for occ in occurrences.iter().filter(|f| is_generic(f)) {
-        let sk = skeleton_key(occ);
-        if template_skeletons.contains(&sk) {
+        if templates
+            .iter()
+            .any(|(template, _)| ipe_ir::alpha_equivalent_fields(template, occ))
+        {
             // An alpha-equivalent generic occurrence: already has its struct.
             continue;
         }
@@ -5011,14 +4899,13 @@ fn reconcile_shapes(key: &[String], occurrences: &[RecordFields]) -> DResult<Vec
         for (_, ty) in occ {
             collect_generics(ty, &mut type_params);
         }
-        template_skeletons.push(sk);
         templates.push((occ.clone(), type_params));
     }
 
     let mut classes: Vec<CanonicalShape> = Vec::new();
     for occ in occurrences {
         if is_generic(occ) {
-            // Folds into its own generic struct (grouped above by skeleton).
+            // Folds into its own generic struct (grouped above by alpha-equivalence).
             continue;
         }
         // A concrete occurrence that instantiates SOME generic template belongs to
@@ -5037,8 +4924,8 @@ fn reconcile_shapes(key: &[String], occurrences: &[RecordFields]) -> DResult<Vec
         }
     }
 
-    // The generic structs lead (each template is its skeleton's first generic
-    // occurrence, in first-occurrence order); genuinely-distinct concrete
+    // The generic structs lead (each template is its alpha-equivalence class's
+    // first generic occurrence, in first-occurrence order); genuinely-distinct concrete
     // siblings follow, also in first-occurrence order.
     let mut out = Vec::with_capacity(templates.len() + classes.len());
     out.extend(templates);

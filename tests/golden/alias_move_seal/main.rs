@@ -242,10 +242,10 @@ pub fn file_rename(src: ipe_runtime::path::Path, dst: ipe_runtime::path::Path) -
     ipe_runtime::file::file_rename(src, dst)
 }
 
-pub fn main_param_pos(arg_0: (String, String)) -> String {
+pub fn main_param_pos(__u_arg_0: (String, String)) -> String {
     let _ipe_recursion_guard = crate::recursion_guard();
     ({
-        let whole = arg_0;
+        let whole = __u_arg_0;
         let (a, b) = whole.clone();
         ({
             let (x, y) = whole;
@@ -278,10 +278,10 @@ pub fn main_let_pos(pair: (String, String)) -> String {
     })
 }
 
-pub fn main_nested_pos(arg_1: (String, (String, String))) -> String {
+pub fn main_nested_pos(__u_arg_1: (String, (String, String))) -> String {
     let _ipe_recursion_guard = crate::recursion_guard();
     ({
-        let (__ipe_bind_0, __ipe_bind_1) = arg_1;
+        let (__ipe_bind_0, __ipe_bind_1) = __u_arg_1;
         let h = __ipe_bind_0;
         let inner = __ipe_bind_1;
         let (c, d) = inner.clone();

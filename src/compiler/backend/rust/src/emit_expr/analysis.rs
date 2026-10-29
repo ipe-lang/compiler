@@ -13,10 +13,10 @@ pub use ipe_ir::seq_clone::clone_targets_in_expr;
 /// operands, call arguments, match scrutinee/arm bodies). It is
 /// [`ipe_ir::MAX_IR_RENDER_DEPTH`], the compiler-wide
 /// `ipe_diagnostics::nesting::IR_NESTING_LIMIT` the parser's source ceiling
-/// derives. The parser's charge keeps the forms that module names under that
-/// ceiling. The clone `let`s a capture rewrite adds and an interpolation's
-/// `++` spine are not charged at the parser, so they may still be refused
-/// here. The declared compile stack is sized for this depth.
+/// derives. Lowering keeps every form the parser admits under that ceiling
+/// (capture clones are one flat node, an interpolation folds to logarithmic
+/// depth), so this refusal fires only on a lowering bug. The declared compile
+/// stack is sized for this depth.
 pub const MAX_EMIT_DEPTH: u16 = MAX_IR_RENDER_DEPTH;
 
 /// The refusal a body nested past [`MAX_EMIT_DEPTH`] gets.
@@ -104,6 +104,11 @@ pub fn fn_binder_used_as_value(sym: Symbol, body: &Expr) -> bool {
             fn_binder_used_as_value(sym, value)
                 || (*name != sym && fn_binder_used_as_value(sym, body))
         }
+        // Each listed symbol is a `CloneVar` read of the outer binding (a value
+        // use), then shadows it over `body`.
+        Expr::CaptureClones { syms, body } => {
+            syms.contains(&sym) || fn_binder_used_as_value(sym, body)
+        }
         Expr::Destructure {
             binder,
             value,
@@ -181,6 +186,7 @@ pub fn expr_refs_symbol(sym: Symbol, expr: &Expr) -> bool {
         Expr::Let { name, value, body } => {
             expr_refs_symbol(sym, value) || (*name != sym && expr_refs_symbol(sym, body))
         }
+        Expr::CaptureClones { syms, body } => syms.contains(&sym) || expr_refs_symbol(sym, body),
         Expr::Destructure {
             binder,
             value,

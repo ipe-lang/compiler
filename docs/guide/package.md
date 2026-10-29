@@ -103,6 +103,7 @@ delivery =
     , desktop = { title = "My App", width = 1024, height = 768 }
     , mobile = { bundleId = "com.example.myapp", orientation = Portrait }  -- Portrait | Landscape | Any
     , browser = { basePath = "/" }
+    , servers = [ "https://api.example.com" ]   -- default: [] (offline)
     }
 ```
 
@@ -111,6 +112,48 @@ host, static hosts, and mobile shells all serve the bundle under it. It is `"/"`
 (or `""`) for the root, or one or more `/segment` parts made only of
 `A-Z a-z 0-9 - . _ ~`, with no trailing `/`, no empty, `.`, or `..` segment, and
 at most 1024 bytes in all; the manifest refuses any other value.
+
+`servers` lists the origins a client bundle may reach. The bundle's
+Content-Security-Policy allows `connect-src` to `'self'` plus each listed
+origin over `https://` and `wss://`, and to nothing else; an empty or absent
+list is an offline bundle. Each entry is exactly `https://` followed by a
+host and an optional `:port`:
+
+- the host is lowercase dot-separated labels of `a-z 0-9 -`, each 1 to 63
+  bytes and not starting or ending with `-`, at most 253 bytes in all;
+- the port is 1 to 65535 with no leading zero, and never `:443` (the
+  `https` default is written without it);
+- nothing follows the authority: no path, query or fragment, not even a
+  trailing `/`;
+- an IP address, a `user@` part, a `*` wildcard, uppercase and non-ASCII are
+  refused.
+
+At most 16 origins are listed, each once; the manifest refuses any other
+value.
+
+A mobile app that accepts `JsPort Push` names its push identifiers under
+`delivery.mobile.push`:
+
+```ipe
+mobile =
+    { bundleId = "com.example.myapp"
+    , push =
+        { apns = Production                      -- Development | Production
+        , fcm =
+            { projectId = "example-app"
+            , applicationId = "1:1234567890:android:abc123"
+            , apiKey = "AIza..."
+            , senderId = "1234567890"
+            }
+        }
+    }
+```
+
+`apns` is the APNs environment the iOS shell registers in. The four `fcm`
+fields are the Firebase client identifiers the Android shell registers with;
+each is 1 to 128 bytes of `A-Z a-z 0-9 : _ . -`. Every field is required. The
+manifest refuses `push` when `capabilities.accepts` lists no `JsPort Push`, and
+an iOS or Android pack refuses an app that accepts `JsPort Push` without it.
 
 `ships` constructors: `binary`, `staticBinary`, `crossBinary "<triple>"`,
 `desktop`, `solo`, `soloDesktop`, `soloIos`, `soloAndroid`. See [Delivering an

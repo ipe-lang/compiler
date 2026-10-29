@@ -405,9 +405,9 @@ pub fn main_size_then_run(ts: Vec<IpeTask<String>>) -> IpeTask<String> {
             _ => "many ".to_string(),
         };
         ({
-            let eta_0: IpeTask<String> = crate::main_sequence(ts);
+            let __u_eta_0: IpeTask<String> = crate::main_sequence(ts);
             task_and_then(
-                eta_0,
+                __u_eta_0,
                 ({
                     let size = size.clone();
                     {
@@ -427,9 +427,9 @@ pub fn main_size_then_run(ts: Vec<IpeTask<String>>) -> IpeTask<String> {
 pub fn main_say(t: IpeTask<String>) -> IpeTask<()> {
     let _ipe_recursion_guard = crate::recursion_guard();
     ({
-        let eta_0: IpeTask<String> = t;
+        let __u_eta_0: IpeTask<String> = t;
         task_and_then(
-            eta_0,
+            __u_eta_0,
             Box::new(move |s: String| -> IpeTask<()> { io_println(s) }),
         )
     })
@@ -438,19 +438,19 @@ pub fn main_say(t: IpeTask<String>) -> IpeTask<()> {
 pub fn ipe_main() -> IpeTask<()> {
     let _ipe_recursion_guard = crate::recursion_guard();
     ({
-        let eta_12: IpeTask<()> = ({
-            let eta_11: IpeTask<()> = ({
-                let eta_10: IpeTask<()> = ({
-                    let eta_9: IpeTask<()> = ({
-                        let eta_8: IpeTask<()> = ({
-                            let eta_7: IpeTask<()> = ({
-                                let eta_6: IpeTask<()> = ({
-                                    let eta_5: IpeTask<()> = ({
-                                        let eta_4: IpeTask<()> = ({
-                                            let eta_3: IpeTask<()> = ({
-                                                let eta_2: IpeTask<()> = ({
-                                                    let eta_1: IpeTask<()> = ({
-                                                        let eta_0: IpeTask<()> =
+        let __u_eta_12: IpeTask<()> = ({
+            let __u_eta_11: IpeTask<()> = ({
+                let __u_eta_10: IpeTask<()> = ({
+                    let __u_eta_9: IpeTask<()> = ({
+                        let __u_eta_8: IpeTask<()> = ({
+                            let __u_eta_7: IpeTask<()> = ({
+                                let __u_eta_6: IpeTask<()> = ({
+                                    let __u_eta_5: IpeTask<()> = ({
+                                        let __u_eta_4: IpeTask<()> = ({
+                                            let __u_eta_3: IpeTask<()> = ({
+                                                let __u_eta_2: IpeTask<()> = ({
+                                                    let __u_eta_1: IpeTask<()> = ({
+                                                        let __u_eta_0: IpeTask<()> =
                                                             crate::main_say(
                                                                 crate::main_sequence(
                                                                     vec![
@@ -467,8 +467,8 @@ pub fn ipe_main() -> IpeTask<()> {
                                                                 ),
                                                             );
                                                         task_and_then(
-                                                            eta_0,
-                                                            Box::new(move |arg_0: ()| -> IpeTask<()> {
+                                                            __u_eta_0,
+                                                            Box::new(move |__u_arg_0: ()| -> IpeTask<()> {
                                                                 io_println(
                                                                     crate::main_describe(
                                                                         Vec::<IpeTask<String>>::new(),
@@ -478,8 +478,8 @@ pub fn ipe_main() -> IpeTask<()> {
                                                         )
                                                     });
                                                     task_and_then(
-                                                        eta_1,
-                                                        Box::new(move |arg_1: ()| -> IpeTask<()> {
+                                                        __u_eta_1,
+                                                        Box::new(move |__u_arg_1: ()| -> IpeTask<()> {
                                                             io_println(
                                                                 crate::main_describe(
                                                                     vec![
@@ -493,8 +493,8 @@ pub fn ipe_main() -> IpeTask<()> {
                                                     )
                                                 });
                                                 task_and_then(
-                                                    eta_2,
-                                                    Box::new(move |arg_2: ()| -> IpeTask<()> {
+                                                    __u_eta_2,
+                                                    Box::new(move |__u_arg_2: ()| -> IpeTask<()> {
                                                         io_println(crate::main_describe(vec![
                                                             task_succeed("x".to_string()),
                                                             task_succeed("y".to_string()),
@@ -504,8 +504,8 @@ pub fn ipe_main() -> IpeTask<()> {
                                                 )
                                             });
                                             task_and_then(
-                                                eta_3,
-                                                Box::new(move |arg_3: ()| -> IpeTask<()> {
+                                                __u_eta_3,
+                                                Box::new(move |__u_arg_3: ()| -> IpeTask<()> {
                                                     crate::main_say(
                                                         crate::main_first_two(
                                                             vec![
@@ -519,8 +519,8 @@ pub fn ipe_main() -> IpeTask<()> {
                                             )
                                         });
                                         task_and_then(
-                                            eta_4,
-                                            Box::new(move |arg_4: ()| -> IpeTask<()> {
+                                            __u_eta_4,
+                                            Box::new(move |__u_arg_4: ()| -> IpeTask<()> {
                                                 crate::main_say(
                                                     crate::main_first_two(
                                                         vec![task_succeed("p".to_string())],
@@ -530,8 +530,8 @@ pub fn ipe_main() -> IpeTask<()> {
                                         )
                                     });
                                     task_and_then(
-                                        eta_5,
-                                        Box::new(move |arg_5: ()| -> IpeTask<()> {
+                                        __u_eta_5,
+                                        Box::new(move |__u_arg_5: ()| -> IpeTask<()> {
                                             crate::main_say(crate::main_pick(
                                                 vec![
                                                     task_succeed("a".to_string()),
@@ -544,8 +544,8 @@ pub fn ipe_main() -> IpeTask<()> {
                                     )
                                 });
                                 task_and_then(
-                                    eta_6,
-                                    Box::new(move |arg_6: ()| -> IpeTask<()> {
+                                    __u_eta_6,
+                                    Box::new(move |__u_arg_6: ()| -> IpeTask<()> {
                                         crate::main_say(
                                             crate::main_pick(
                                                 vec![task_succeed("a".to_string())],
@@ -556,8 +556,8 @@ pub fn ipe_main() -> IpeTask<()> {
                                 )
                             });
                             task_and_then(
-                                eta_7,
-                                Box::new(move |arg_7: ()| -> IpeTask<()> {
+                                __u_eta_7,
+                                Box::new(move |__u_arg_7: ()| -> IpeTask<()> {
                                     crate::main_say(crate::main_gated(
                                         vec![
                                             task_succeed("x".to_string()),
@@ -569,8 +569,8 @@ pub fn ipe_main() -> IpeTask<()> {
                             )
                         });
                         task_and_then(
-                            eta_8,
-                            Box::new(move |arg_8: ()| -> IpeTask<()> {
+                            __u_eta_8,
+                            Box::new(move |__u_arg_8: ()| -> IpeTask<()> {
                                 crate::main_say(crate::main_gated(
                                     vec![
                                         task_succeed("x".to_string()),
@@ -582,8 +582,8 @@ pub fn ipe_main() -> IpeTask<()> {
                         )
                     });
                     task_and_then(
-                        eta_9,
-                        Box::new(move |arg_9: ()| -> IpeTask<()> {
+                        __u_eta_9,
+                        Box::new(move |__u_arg_9: ()| -> IpeTask<()> {
                             crate::main_say(crate::main_first_just(vec![
                                 IpeMaybe::Nothing,
                                 IpeMaybe::Just(task_succeed("j".to_string())),
@@ -593,15 +593,15 @@ pub fn ipe_main() -> IpeTask<()> {
                     )
                 });
                 task_and_then(
-                    eta_10,
-                    Box::new(move |arg_10: ()| -> IpeTask<()> {
+                    __u_eta_10,
+                    Box::new(move |__u_arg_10: ()| -> IpeTask<()> {
                         crate::main_say(crate::main_first_just(vec![IpeMaybe::Nothing]))
                     }),
                 )
             });
             task_and_then(
-                eta_11,
-                Box::new(move |arg_11: ()| -> IpeTask<()> {
+                __u_eta_11,
+                Box::new(move |__u_arg_11: ()| -> IpeTask<()> {
                     io_println(string_from_int(crate::main_count_justs(vec![
                         IpeMaybe::Just(task_succeed("a".to_string())),
                         IpeMaybe::Nothing,
@@ -611,8 +611,8 @@ pub fn ipe_main() -> IpeTask<()> {
             )
         });
         task_and_then(
-            eta_12,
-            Box::new(move |arg_12: ()| -> IpeTask<()> {
+            __u_eta_12,
+            Box::new(move |__u_arg_12: ()| -> IpeTask<()> {
                 crate::main_say(crate::main_size_then_run(vec![
                     task_succeed("a".to_string()),
                     task_succeed("b".to_string()),

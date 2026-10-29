@@ -21,10 +21,14 @@ import Lib.SafeText as SafeText exposing (SafeText)
 import Lib.SetDigest as SetDigest exposing (SetDigest)
 import Lib.Settings as Settings exposing (DbRole(..), LogBreak(..), ReviewFile)
 import Lib.Uid as Uid exposing (Uid)
-import Lib.UnitName as UnitName exposing (RecordedName)
+import Lib.UnitName as UnitName exposing (RecordedName, SignedName(..))
 import Migrations exposing (all)
 
 
+-- A decision as the reviewer gives it. `Approved` accepts the subject: a
+-- unit is approved, an unreviewable file acknowledged. Which one it is lives
+-- in the subject the row signs, so a read-back takes it from the signed name
+-- (`storedDecisionOf`), never from this word alone.
 type Decision
     = Approved
     | Refused Reason
@@ -124,12 +128,56 @@ reasonString reason =
             r
 
 
--- A decision as a review row holds it. A refusal carries its stored
--- reason; there is no third form, so a row whose decision column is neither
--- `approve` nor `refuse` is never read as either.
+-- A review row's decision column, parsed: `approve`, or `refuse` with its
+-- stored reason. There is no third form, so a row whose decision column is
+-- neither is never read as either. Read alone it is not a decision: an
+-- `approve` approves a unit and acknowledges a file.
+type StoredWord
+    = ApproveWord
+    | RefuseWord StoredReason
+
+
+-- The one parse of a decision column: Nothing for any text but `approve` or
+-- `refuse`. A refusal's reason is classified by `storedReason`, a NULL one
+-- as blank; an approval's reason column is never read.
+storedWord : String -> Maybe String -> Maybe StoredWord
+storedWord decision reason =
+    if decision == "approve" then
+        Just ApproveWord
+
+    else if decision == "refuse" then
+        Just (RefuseWord (storedReason (Maybe.withDefault "" reason)))
+
+    else
+        Nothing
+
+
+-- A decision as a verified row holds it: a unit approved, a file
+-- acknowledged, or either refused with its stored reason. Built only by
+-- `storedDecisionOf`, from the decision column and the name the same mac
+-- signs, so an acknowledgement is never read as an approval.
 type StoredDecision
     = StoredApproved
+    | StoredAcknowledged
     | StoredRefused StoredReason
+
+
+-- A signed row's decision from its decision column and the subject it
+-- signed: an `approve` of a unit is an approval, of a file an
+-- acknowledgement.
+storedDecisionOf : StoredWord -> Uid -> RecordedName -> StoredDecision
+storedDecisionOf word subject name =
+    case word of
+        RefuseWord reason ->
+            StoredRefused reason
+
+        ApproveWord ->
+            case UnitName.fromRecorded subject name of
+                UnitNamed _ ->
+                    StoredApproved
+
+                FileNamed _ ->
+                    StoredAcknowledged
 
 
 -- A review-log row whose mac verifies under the operator's key, on a chain
@@ -509,7 +557,7 @@ boundParams verify =
 type alias LegacyRow =
     { uid : Uid
     , bodyHash : String
-    , decision : StoredDecision
+    , decision : StoredWord
     , reviewedAt : Timestamp
     }
 
@@ -539,10 +587,9 @@ makeRecord uid bodyHash decision reason reviewedAt held =
 
 
 -- The one parser of a stored row. Every cell must be held, the uid a unit
--- id and the decision `approve` or `refuse`; any other row fails without
--- echoing any cell, its uid included. A refusal's reason is classified by
--- `storedReason`, a NULL one as blank, so a row breaking the reason bound
--- still reads; an approval's reason column is never read.
+-- id and the decision `approve` or `refuse` (`storedWord`); any other row
+-- fails without echoing any cell, its uid included. A row breaking the
+-- reason bound still reads.
 fromRecord : ReviewRecord -> Result Error LegacyRow
 fromRecord record =
     if not record.held then
@@ -559,16 +606,14 @@ fromRecord record =
                     (storedDecision record)
 
 
-storedDecision : ReviewRecord -> Result Error StoredDecision
+storedDecision : ReviewRecord -> Result Error StoredWord
 storedDecision record =
-    if record.decision == "approve" then
-        Ok StoredApproved
+    case storedWord record.decision record.reason of
+        Just word ->
+            Ok word
 
-    else if record.decision == "refuse" then
-        Ok (StoredRefused (storedReason (Maybe.withDefault "" record.reason)))
-
-    else
-        Err (Error.unexpected "a review row holds a decision this reviewer does not know")
+        Nothing ->
+            Err (Error.unexpected "a review row holds a decision this reviewer does not know")
 
 
 -- A one-row read's row, parsed.
@@ -1297,18 +1342,11 @@ rowVerifies key logId row =
 
 -- A row's decision column parsed: Nothing for any text but `approve` or
 -- `refuse`, which a verified row can only hold if the key signed it.
-logDecision : LogRow -> Maybe StoredDecision
+logDecision : LogRow -> Maybe StoredWord
 logDecision row =
     case row of
         LogRow r ->
-            if r.decision == "approve" then
-                Just StoredApproved
-
-            else if r.decision == "refuse" then
-                Just (StoredRefused (storedReason (Maybe.withDefault "" r.reason)))
-
-            else
-                Nothing
+            storedWord r.decision r.reason
 
 
 -- The one classifier of a review-log row: `Tampered` under any verifier
@@ -1352,10 +1390,10 @@ pairEntryOf verify pair row =
 
             else if rowVerifies key (Index.chainLogId (provenChain proven)) row then
                 case logDecision row of
-                    Just decision ->
+                    Just word ->
                         case logName row of
                             Named name ->
-                                Verified (verifiedOf pair decision name row)
+                                Verified (verifiedOf pair (storedDecisionOf word (pairUid pair) name) name row)
 
                             NameMalformed ->
                                 unverifiedOf Tampered row

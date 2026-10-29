@@ -529,7 +529,10 @@ occurrences needle text =
 -- the live environment on the native target and `Ipe.Process` can run a
 -- child that prints it, so neither is admitted anywhere. `IPE_HTTP_BIND` is
 -- read once, by `Main`, spelled once more as the name `EnvLookup` gives the
--- variable, and parsed by `Bind.parseBind` alone, called once.
+-- variable, and parsed by `Bind.parseBind` alone, called once. A root named
+-- by `IPE_INDEX_ROOT` is built only by `parseRoot` after its directory check
+-- (the two other `Root IndexRootVar` are the patterns of `rootOrigin` and
+-- `rootFixFor`), so no other code mints one unchecked.
 -- The bind proof rests on the runtime resolving the same value: no module
 -- installs a host setting (`appWith`) or writes the environment overlay
 -- (`setenv`, `unsetenv`, `loadEnv`), by any spelling of the name. The
@@ -545,7 +548,8 @@ admittedSites =
     , ( "System.", [ ( "Main.ipe", 3 ), ( "Lib/RepoPath.ipe", 1 ), ( "Lib/ReviewKey.ipe", 1 ) ] )
     , ( "getenv", [ ( "Main.ipe", 2 ), ( "Lib/ReviewKey.ipe", 1 ) ] )
     , ( "cwd", [ ( "Lib/RepoPath.ipe", 3 ) ] )
-    , ( "isDir", [ ( "Lib/RepoPath.ipe", 6 ), ( "Lib/Settings.ipe", 1 ) ] )
+    , ( "isDir", [ ( "Lib/RepoPath.ipe", 4 ), ( "Lib/Settings.ipe", 1 ) ] )
+    , ( "Root IndexRootVar", [ ( "Lib/RepoPath.ipe", 3 ) ] )
     , ( "absolute", [ ( "Lib/EnvLookup.ipe", 3 ), ( "Lib/RepoPath.ipe", 5 ), ( "Lib/Index.ipe", 1 ) ] )
     , ( "absolutize", [ ( "Lib/RepoPath.ipe", 4 ), ( "Lib/Settings.ipe", 1 ) ] )
     , ( "parseRoot", [ ( "Lib/RepoPath.ipe", 3 ), ( "Lib/Settings.ipe", 1 ) ] )
@@ -630,6 +634,7 @@ startupScanRefusesEvasions =
                 && evaded sources "Lib/ReviewKey.ipe" "again = System.getenv \"X\""
                 && evaded sources "Lib/Queue.ipe" "rekey = ReviewKey.readReviewKey"
                 && evaded sources "Lib/Index.ipe" "fresh = Path.absolute"
+                && evaded sources "Lib/RepoPath.ipe" "forge path = Root IndexRootVar path"
                 && evaded sources "Lib/Queue.ipe" "import Ipe.Env as Env\nraw = Env.public \"INDEX_DB\""
                 && evaded sources "Lib/Queue.ipe" "import Ipe.Process as Process\nraw = Process.run \"printenv\" []"
                 && evaded sources "Lib/Queue.ipe" "again = Bind.parseBind (Settings.EnvSet \"0.0.0.0\")"

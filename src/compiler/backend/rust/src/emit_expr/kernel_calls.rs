@@ -2357,10 +2357,19 @@ pub fn lookup_field<'f>(
 /// (E0382). Any other slot shape is a compiler bug, refused at ipe time.
 #[derive(Debug)]
 pub struct AdaptedHandler<'e> {
-    lets: Vec<(Symbol, &'e Expr)>,
+    lets: Vec<HandlerLet<'e>>,
     params: &'e [(Symbol, IrType)],
     ret: &'e IrType,
     body: &'e Expr,
+}
+
+/// One leading binding of an [`AdaptedHandler`].
+#[derive(Debug, Clone, Copy)]
+enum HandlerLet<'e> {
+    /// `let name = <value>;` from an [`Expr::Let`].
+    Value(Symbol, &'e Expr),
+    /// `let name = name.clone();`, one symbol of an [`Expr::CaptureClones`].
+    SelfClone(Symbol),
 }
 
 impl<'e> AdaptedHandler<'e> {
@@ -2374,9 +2383,18 @@ impl<'e> AdaptedHandler<'e> {
     pub fn from_ir(slot: &'e Expr, where_: &'static str) -> DResult<Self> {
         let mut lets = Vec::new();
         let mut core = slot;
-        while let Expr::Let { name, value, body } = core {
-            lets.push((*name, value.as_ref()));
-            core = body.as_ref();
+        loop {
+            core = match core {
+                Expr::Let { name, value, body } => {
+                    lets.push(HandlerLet::Value(*name, value.as_ref()));
+                    body.as_ref()
+                }
+                Expr::CaptureClones { syms, body } => {
+                    lets.extend(syms.iter().copied().map(HandlerLet::SelfClone));
+                    body.as_ref()
+                }
+                _ => break,
+            };
         }
         match core {
             Expr::Lambda { params, ret, body } | Expr::SharedLambda { params, ret, body } => {
@@ -2413,9 +2431,18 @@ impl<'e> AdaptedHandler<'e> {
         wrap: impl FnOnce(String) -> String,
     ) -> DResult<String> {
         let mut prefix = String::new();
-        for &(name, value) in &self.lets {
-            let name_s = ctx.emit_local_ident(name)?;
-            let value_s = emit_expr_at(ctx, value, indent, child, generics)?;
+        for binding in &self.lets {
+            let (name_s, value_s) = match *binding {
+                HandlerLet::Value(name, value) => (
+                    ctx.emit_local_ident(name)?,
+                    emit_expr_at(ctx, value, indent, child, generics)?,
+                ),
+                HandlerLet::SelfClone(name) => {
+                    let name_s = ctx.emit_local_ident(name)?;
+                    let value_s = format!("{name_s}.clone()");
+                    (name_s, value_s)
+                }
+            };
             write!(prefix, "let {name_s} = {value_s}; ").map_err(|e| Diagnostic::CompilerBug {
                 where_: "ipe_backend_rust::AdaptedHandler::emit",
                 detail: format!("fmt::Write into String failed: {e}"),
@@ -4296,6 +4323,11 @@ pub fn emit_ui_plan(
     }
 }
 
+/// `decode_succeed` over an N-ary function, curried through the runtime's qualified `curry{n}`.
+fn decode_succeed_curried(n: usize, function: &str) -> String {
+    format!("decode_succeed(ipe_runtime::json::curry{n}({function}))")
+}
+
 /// Handle JSON / Db decoder kernel calls that require custom argument wrapping.
 ///
 /// Returns `Some(emitted)` for the four special cases:
@@ -4308,8 +4340,8 @@ pub fn emit_ui_plan(
 /// * **`JsonDecSucceed | DbDecSucceed`** applied to any argument — `decode_succeed`
 ///   expects a `Box<dyn Fn() -> A + Send>` FACTORY (not a raw value).
 ///   Three sub-cases:
-///   1. Named N-arg function (`FuncValue`) → `decode_succeed(curry{n}(fn_name))`
-///   2. Lambda with N params → `decode_succeed(curry{n}(move |p1: T1, …| -> R { body }))`
+///   1. Named N-arg function (`FuncValue`) → `decode_succeed(ipe_runtime::json::curry{n}(fn_name))`
+///   2. Lambda with N params → `decode_succeed(ipe_runtime::json::curry{n}(move |p1: T1, …| -> R { body }))`
 ///   3. Any other value → `decode_succeed({ let __ipe_succeed = <arg>; Box::new(move || __ipe_succeed.clone()) })`
 ///
 ///   Cases 1+2 are fail-closed when N > 10 via [`LowerError::DecodeSucceedArityTooHigh`]
@@ -4376,7 +4408,7 @@ pub fn emit_json_decoder_call(
                     });
                 }
                 let fn_name = callee_name(ctx, fn_callee)?;
-                return Ok(Some(format!("decode_succeed(curry{n}({fn_name}))")));
+                return Ok(Some(decode_succeed_curried(n, &fn_name)));
             }
             // Case 2: lambda — curry{n}(move |params| -> ret { body })
             Expr::Lambda { params, ret, body } if !params.is_empty() => {
@@ -4388,7 +4420,7 @@ pub fn emit_json_decoder_call(
                     });
                 }
                 let closure = emit_lambda_unboxed(ctx, params, ret, body, indent, child, generics)?;
-                return Ok(Some(format!("decode_succeed(curry{n}({closure}))")));
+                return Ok(Some(decode_succeed_curried(n, &closure)));
             }
             // Case 2b: an `Arc`-carried function payload (the lowerer eta-expands
             // a non-literal function-value leaf here — a let-bound name, a field
@@ -4426,7 +4458,7 @@ pub fn emit_json_decoder_call(
                     param_decls.join(", "),
                     param_names.join(", ")
                 );
-                return Ok(Some(format!("decode_succeed(curry{n}({wrapper}))")));
+                return Ok(Some(decode_succeed_curried(n, &wrapper)));
             }
             // Case 3: any other value — factory-wrap so it is called per run.
             // Turbofish `<IpeError, _>` pins the error type when there is no

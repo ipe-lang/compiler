@@ -16,8 +16,10 @@ import Ipe.System as System
 --      REDACTED render are printed. The password sentinel NEVER appears in the
 --      output (Secret non-leak).
 --   2. `sslmode=disable` is a HARD typed Err (fail-closed TLS).
---   3. An omitted sslmode defaults to Require (secure default).
---   4. `Dsn.build` from typed parts runs the same validators.
+--   3. `sslmode=require`, which does not verify the server certificate, is a
+--      HARD typed Err.
+--   4. An omitted sslmode defaults to VerifyFull (secure default).
+--   5. `Dsn.build` from typed parts runs the same validators.
 
 
 driverName : Driver -> String
@@ -33,14 +35,11 @@ driverName d =
 tlsName : TlsMode -> String
 tlsName t =
     case t of
-        Require ->
-            "require"
+        VerifyFull ->
+            "verify-full"
 
-        Prefer ->
-            "prefer"
-
-        Disable ->
-            "disable"
+        VerifyCa ->
+            "verify-ca"
 
 
 -- Describe a parsed Dsn on one line: driver, host, tls, and the redacted render.
@@ -76,7 +75,18 @@ parseDisable =
             "disable: rejected"
 
 
--- Omitted sslmode defaults to Require.
+-- `sslmode=require` must be rejected (it does not verify the server).
+parseRequire : String
+parseRequire =
+    case Dsn.parse "postgres://u:p@h/db?sslmode=require" of
+        Ok _ ->
+            "require: UNEXPECTED-OK"
+
+        Err _ ->
+            "require: rejected"
+
+
+-- Omitted sslmode defaults to VerifyFull.
 parseDefault : String
 parseDefault =
     case Dsn.parse "postgres://u@h:5432/d" of
@@ -98,7 +108,7 @@ buildTyped =
             , database = "metrics"
             , user = "etl"
             , password = Secret.fromString (System.getenvOr "DB_PASSWORD" "hunter2SENTINEL")
-            , tls = Require
+            , tls = VerifyFull
             }
     of
         Ok dsn ->
@@ -113,6 +123,7 @@ main =
         (String.join "\n"
             [ parseValid
             , parseDisable
+            , parseRequire
             , parseDefault
             , buildTyped
             ]

@@ -933,6 +933,40 @@ pub struct Func {
 }
 
 impl Func {
+    /// The source-level name and home of this function.
+    ///
+    /// `None` when a symbol does not resolve through `interner`. Every
+    /// refusal that names a function builds its site here.
+    #[must_use]
+    pub fn emit_site(&self, interner: &ipe_intern::Interner) -> Option<ipe_diagnostics::EmitSite> {
+        let home = self
+            .home
+            .0
+            .iter()
+            .map(|segment| interner.resolve(*segment).map(Box::<str>::from))
+            .collect::<Option<Box<[Box<str>]>>>()?;
+        let name = interner.resolve(self.name)?.into();
+        Some(ipe_diagnostics::EmitSite { home, name })
+    }
+
+    /// This function's name and home as raw symbol indices, for the compiler
+    /// bug a refusal raises when [`Self::emit_site`] is `None`: the symbols do
+    /// not resolve, so their indices are the only faithful rendering.
+    #[must_use]
+    pub fn unresolved_symbols(&self) -> String {
+        let home = self
+            .home
+            .0
+            .iter()
+            .map(|segment| segment.as_raw().to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!(
+            "name symbol {} or home symbols [{home}]",
+            self.name.as_raw()
+        )
+    }
+
     /// The type parameters some parameter type names. A call's arguments let
     /// rustc infer each of them, so a pin on one renders only when it is
     /// [`UserPin::Unit`] ([`UserPin::renders`]).
@@ -3395,6 +3429,151 @@ pub enum Expr {
     TailRecur {
         args: Vec<Self>,
     },
+    /// Clone each of `syms` from its enclosing binding, shadowing it, then `body`.
+    ///
+    /// Reads as `let s0 = s0.clone(); let s1 = s1.clone(); …; body`, in
+    /// `syms` order: a `move` closure in `body` then captures the fresh clone
+    /// and leaves the enclosing binding intact. Every capture pre-clone of one
+    /// closure boundary sits in this one node, so a boundary costs one IR
+    /// level however many symbols it clones. `syms` is never empty. Built
+    /// only by [`Self::pre_clone`] and [`Self::pre_clone_all`]; a self-clone
+    /// [`Self::Let`] (`let s = s.clone()`) is refused after lowering.
+    CaptureClones {
+        syms: Vec<Symbol>,
+        body: Box<Self>,
+    },
+}
+
+impl Expr {
+    /// Pre-clone `sym` around `node`, merging into a [`Self::CaptureClones`] `node`.
+    ///
+    /// `sym` is cloned first, before any symbol `node` already clones, which
+    /// is the order the nested single-symbol form would evaluate.
+    #[must_use]
+    pub fn pre_clone(sym: Symbol, node: Self) -> Self {
+        Self::pre_clone_all(vec![sym], node)
+    }
+
+    /// Pre-clone every symbol of `syms`, in order, around `node`.
+    ///
+    /// A [`Self::CaptureClones`] `node` absorbs `syms` ahead of its own list,
+    /// so pre-clones never nest; an empty `syms` returns `node` unchanged.
+    #[must_use]
+    pub fn pre_clone_all(mut syms: Vec<Symbol>, node: Self) -> Self {
+        if syms.is_empty() {
+            return node;
+        }
+        match node {
+            Self::CaptureClones { syms: inner, body } => {
+                syms.extend(inner);
+                Self::CaptureClones { syms, body }
+            }
+            other => Self::CaptureClones {
+                syms,
+                body: Box::new(other),
+            },
+        }
+    }
+
+    /// Is this a self-clone `let s = s.clone() in ..`, the shape [`Self::pre_clone`] replaces?
+    #[must_use]
+    pub fn is_self_clone_let(&self) -> bool {
+        matches!(self, Self::Let { name, value, .. } if matches!(**value, Self::CloneVar(v) if v == *name))
+    }
+}
+
+/// Refuse a lowered program that holds a self-clone [`Expr::Let`].
+///
+/// A capture clone is one [`Expr::CaptureClones`] node built by
+/// [`Expr::pre_clone`]; a nested self-clone `let` is a builder that bypassed
+/// it and would multiply the IR depth by the number of captured symbols. The
+/// walk stops at [`crate::MAX_IR_RENDER_DEPTH`], where the emitter's own
+/// depth refusal takes over.
+///
+/// # Errors
+/// [`Diagnostic::CompilerBug`] naming the first function that holds one.
+pub fn refuse_self_clone_lets(
+    program: &Program,
+    interner: &ipe_intern::Interner,
+) -> Result<(), Diagnostic> {
+    let Some(func) = program
+        .modules
+        .iter()
+        .flat_map(|m| m.funcs.iter())
+        .find(|f| holds_self_clone_let(&f.body, 0))
+    else {
+        return Ok(());
+    };
+    let named = func.emit_site(interner).map_or_else(
+        || format!("function {}", func.id.as_raw()),
+        |site| format!("function `{}`", site.qualified()),
+    );
+    Err(Diagnostic::CompilerBug {
+        where_: "ipe_ir::refuse_self_clone_lets",
+        detail: format!(
+            "{named} binds a capture clone as a nested `let`, not through `Expr::pre_clone`"
+        ),
+    })
+}
+
+/// Does `expr` hold a self-clone [`Expr::Let`] within the IR depth ceiling?
+fn holds_self_clone_let(expr: &Expr, depth: u16) -> bool {
+    let Some(next) = depth
+        .checked_add(1)
+        .filter(|d| *d <= crate::MAX_IR_RENDER_DEPTH)
+    else {
+        return false;
+    };
+    let go = |e: &Expr| holds_self_clone_let(e, next);
+    match expr {
+        Expr::Int(_)
+        | Expr::Bool(_)
+        | Expr::Float(_)
+        | Expr::Str(_)
+        | Expr::CustomElementRef { .. }
+        | Expr::Char(_)
+        | Expr::Unit
+        | Expr::FuncValue { .. }
+        | Expr::Var(_)
+        | Expr::CloneVar(_) => false,
+        Expr::Let { value, body, .. } => expr.is_self_clone_let() || go(value) || go(body),
+        Expr::Ctor { args, .. }
+        | Expr::Call { args, .. }
+        | Expr::TailRecur { args }
+        | Expr::Tuple(args)
+        | Expr::List { items: args, .. } => args.iter().any(go),
+        Expr::BinOp { lhs, rhs, .. }
+        | Expr::Cons {
+            head: lhs,
+            tail: rhs,
+        }
+        | Expr::TaskSeq {
+            effect: lhs,
+            rest: rhs,
+        }
+        | Expr::Destructure {
+            value: lhs,
+            body: rhs,
+            ..
+        } => go(lhs) || go(rhs),
+        Expr::If { cond, then_, else_ } => go(cond) || go(then_) || go(else_),
+        Expr::Match(m) => {
+            go(m.scrutinee())
+                || m.arms()
+                    .iter()
+                    .any(|arm| go(&arm.body) || arm.guard.as_ref().is_some_and(go))
+        }
+        Expr::ListIndexClone { list, .. } | Expr::ListLenCheck { list, .. } => go(list),
+        Expr::Access { record, .. } => go(record),
+        Expr::Record { fields, .. } => fields.iter().any(|(_, e)| go(e)),
+        Expr::Update { record, fields } => go(record) || fields.iter().any(|(_, e)| go(e)),
+        Expr::Lambda { body, .. }
+        | Expr::SharedLambda { body, .. }
+        | Expr::OnceLambda { body, .. }
+        | Expr::TailLoop { body, .. }
+        | Expr::CaptureClones { body, .. } => go(body),
+        Expr::Apply { func, args } => go(func) || args.iter().any(go),
+    }
 }
 
 /// The target of a [`Expr::Call`].
@@ -6074,7 +6253,7 @@ mod serde_persistence_tests {
     // A single exhaustive `Module` struct literal (every `uses_*` gate spelled
     // out) dominates the length; splitting it would only scatter the fixture.
     #[allow(clippy::too_many_lines)]
-    fn sample_program(i: &mut Interner) -> DResult<Program> {
+    pub fn sample_program(i: &mut Interner) -> DResult<Program> {
         let msg_ty = i.intern("Msg")?;
         let inc = i.intern("Increment")?;
         let dec = i.intern("Decrement")?;
@@ -6478,6 +6657,100 @@ mod serde_persistence_tests {
         // accidental empty-string comparison).
         assert!(dump_b.contains("Increment") && dump_b.contains("Decrement"));
         assert!(dump_b.contains("main"));
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod capture_clone_tests {
+    use ipe_diagnostics::{DResult, Diagnostic};
+    use ipe_intern::Interner;
+
+    use super::serde_persistence_tests::sample_program;
+    use super::{Expr, IrType, Program, refuse_self_clone_lets};
+    use crate::pretty::pretty;
+
+    /// A closure over `captured`, returning it.
+    fn closure(captured: ipe_intern::Symbol) -> Expr {
+        Expr::Lambda {
+            params: vec![],
+            ret: IrType::Int,
+            body: Box::new(Expr::Var(captured)),
+        }
+    }
+
+    /// The sample program with its entry function's body replaced by `body`.
+    fn program_with_body(i: &mut Interner, body: Expr) -> DResult<Program> {
+        let mut program = sample_program(i)?;
+        if let Some(func) = program
+            .modules
+            .first_mut()
+            .and_then(|m| m.funcs.first_mut())
+        {
+            func.body = body;
+        }
+        Ok(program)
+    }
+
+    /// A capture clone hand-built as a nested self-clone `let` is refused at
+    /// lowering exit, naming the function; the same clone as one
+    /// `CaptureClones` node passes.
+    #[test]
+    fn self_clone_let_is_refused() -> DResult<()> {
+        let mut i = Interner::new();
+        let a = i.intern("a")?;
+        let nested = Expr::Let {
+            name: a,
+            value: Box::new(Expr::CloneVar(a)),
+            body: Box::new(closure(a)),
+        };
+        assert!(nested.is_self_clone_let());
+        let refused = refuse_self_clone_lets(&program_with_body(&mut i, nested)?, &i);
+        let Err(Diagnostic::CompilerBug { where_, detail }) = refused else {
+            assert!(
+                matches!(refused, Err(Diagnostic::CompilerBug { .. })),
+                "a self-clone `let` must be a compiler bug, got {refused:?}"
+            );
+            return Ok(());
+        };
+        assert_eq!(where_, "ipe_ir::refuse_self_clone_lets");
+        assert!(
+            detail.contains("function `main`"),
+            "the refusal names the function: {detail}"
+        );
+
+        let flat = Expr::pre_clone(a, closure(a));
+        let passed = refuse_self_clone_lets(&program_with_body(&mut i, flat)?, &i);
+        assert!(
+            passed.is_ok(),
+            "one `CaptureClones` node passes: {passed:?}"
+        );
+        Ok(())
+    }
+
+    /// Pre-cloning around a pre-clone merges into the one node, the outer
+    /// symbol first, and the node prints as one level.
+    #[test]
+    fn pre_clone_merges_into_one_node() -> DResult<()> {
+        let mut i = Interner::new();
+        let a = i.intern("a")?;
+        let b = i.intern("b")?;
+        let merged = Expr::pre_clone(b, Expr::pre_clone(a, closure(a)));
+        assert_eq!(
+            merged,
+            Expr::CaptureClones {
+                syms: vec![b, a],
+                body: Box::new(closure(a)),
+            }
+        );
+        assert_eq!(Expr::pre_clone_all(vec![], closure(a)), closure(a));
+        let text = pretty(&program_with_body(&mut i, merged)?, &i);
+        assert_eq!(
+            text.matches("CaptureClones").count(),
+            1,
+            "one node for both clones: {text}"
+        );
+        assert!(text.contains("CaptureClones b, a"), "{text}");
         Ok(())
     }
 }

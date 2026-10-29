@@ -257,7 +257,7 @@ pub fn ipe_main() -> IpeTask<()> {
                     let g = {
                         let __ipe_fn: ::std::sync::Arc<
                             dyn Fn(i64) -> i64 + Send + Sync + 'static,
-                        > = ::std::sync::Arc::new(move |eta_0: i64| -> i64 { (f)(eta_0) });
+                        > = ::std::sync::Arc::new(move |__u_eta_0: i64| -> i64 { (f)(__u_eta_0) });
                         __ipe_fn
                     };
                     ({
@@ -266,7 +266,9 @@ pub fn ipe_main() -> IpeTask<()> {
                                 let g = g.clone();
                                 {
                                     let __ipe_fn: Box<dyn Fn(i64) -> i64 + Send + Sync + 'static> =
-                                        Box::new(move |eta_0: i64| -> i64 { (g.clone())(eta_0) });
+                                        Box::new(move |__u_eta_0: i64| -> i64 {
+                                            (g.clone())(__u_eta_0)
+                                        });
                                     __ipe_fn
                                 }
                             }),
@@ -279,8 +281,8 @@ pub fn ipe_main() -> IpeTask<()> {
                                     {
                                         let __ipe_fn: ::std::sync::Arc<
                                             dyn Fn(i64) -> i64 + Send + Sync + 'static,
-                                        > = ::std::sync::Arc::new(move |eta_0: i64| -> i64 {
-                                            (g.clone())(eta_0)
+                                        > = ::std::sync::Arc::new(move |__u_eta_0: i64| -> i64 {
+                                            (g.clone())(__u_eta_0)
                                         });
                                         __ipe_fn
                                     }

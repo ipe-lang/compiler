@@ -1,0 +1,21 @@
+module Main exposing (main)
+
+import Ipe.Io as Io
+import Ipe.String as String
+
+-- A closure local spelled like the runtime name of `String.fromInt`, with the
+-- kernel's own type. The later `String.fromInt n` must still call the kernel,
+-- not the closure, so the program prints `user7/user1/7`.
+
+
+render : Int -> String
+render n =
+    let
+        string_from_int =
+            \k -> "user" ++ String.fromInt k
+    in
+    string_from_int n ++ "/" ++ string_from_int 1 ++ "/" ++ String.fromInt n
+
+
+main =
+    Io.println (render 7)

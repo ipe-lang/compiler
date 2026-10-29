@@ -1,0 +1,21 @@
+module Main exposing (main)
+
+import Ipe.Io as Io
+import Ipe.String as String
+
+-- A `let` local spelled like the runtime name of `String.fromInt`, which the
+-- backend calls bare. The local must not shadow the kernel call, so the program
+-- builds and prints `6/6`.
+
+
+bump : Int -> String
+bump n =
+    let
+        string_from_int =
+            n + 1
+    in
+    String.fromInt string_from_int ++ "/" ++ String.fromInt string_from_int
+
+
+main =
+    Io.println (bump 5)

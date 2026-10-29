@@ -851,6 +851,8 @@ messages! {
     cli_cache_home_unknown = "cli-cache-home-unknown";
     /// A directory environment variable is set to a relative path.
     cli_env_dir_not_absolute(var) = "cli-env-dir-not-absolute";
+    /// A switch environment variable is set to a value outside its spellings.
+    cli_env_switch_not_recognised(var, got: &crate::style::TerminalSafe, admitted) = "cli-env-switch-not-recognised";
     /// The registry URL environment variable is set to a value that is not an `https://` base URL.
     cli_registry_url_not_https(var, reason) = "cli-registry-url-not-https";
     /// `$IPE_RUNTIME_DIR` does not name a runtime crate root.
@@ -1321,6 +1323,10 @@ messages! {
     doc_stdlib_index_failed(detail) = "doc-stdlib-index-failed";
     /// The documentation bundle could not be built.
     doc_bundle_build_error(detail) = "doc-bundle-build-error";
+    /// A docs-directory file is not named as a page.
+    doc_overlay_name(path: &crate::style::TerminalSafe) = "doc-overlay-name";
+    /// The docs-directory pages together pass the overlay read budget.
+    doc_overlay_too_large(limit) = "doc-overlay-too-large";
     /// An `ipe doc <kind>:<key>` query named an unknown kind.
     doc_unknown_kind(prefix) = "doc-unknown-kind";
     /// An `ipe doc` term was empty or only whitespace.

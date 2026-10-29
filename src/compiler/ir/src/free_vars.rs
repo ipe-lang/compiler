@@ -144,6 +144,8 @@ enum Scope<'a> {
     Top,
     /// A `let` name.
     Name(Symbol, &'a Self),
+    /// The names a capture-clone node rebinds.
+    Names(&'a [Symbol], &'a Self),
     /// Lambda or loop parameters.
     Params(&'a [(Symbol, IrType)], &'a Self),
     /// The names a destructure or arm pattern binds.
@@ -159,6 +161,12 @@ impl Scope<'_> {
                 Self::Top => return false,
                 Self::Name(name, up) => {
                     if *name == sym {
+                        return true;
+                    }
+                    cur = up;
+                }
+                Self::Names(names, up) => {
+                    if names.contains(&sym) {
                         return true;
                     }
                     cur = up;
@@ -286,6 +294,12 @@ fn walk_free(expr: &Expr, scope: &Scope<'_>, sink: &mut Sink<'_>) -> ControlFlow
         Expr::TaskSeq { effect, rest } => {
             walk_free(effect, scope, sink)?;
             walk_free(rest, scope, sink)
+        }
+        Expr::CaptureClones { syms, body } => {
+            for s in syms {
+                sink.occur(*s, scope)?;
+            }
+            walk_free(body, &Scope::Names(syms, scope), sink)
         }
     }
 }

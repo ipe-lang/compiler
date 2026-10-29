@@ -207,6 +207,11 @@ pub enum WebCapability {
     /// never a throw. This is a crypto-credential trust boundary: the far side
     /// mints authentication material the relying party server verifies.
     WebAuthn,
+    /// A push subscription: registering the app to receive server-sent push
+    /// messages while it is not in the foreground, and reading or dropping that
+    /// registration. The subscription is an opaque, typed endpoint handed to the
+    /// app's own server — never a delivery channel the page controls directly.
+    Push,
 }
 
 impl WebCapability {
@@ -239,6 +244,7 @@ impl WebCapability {
         Self::ScreenOrientation,
         Self::WakeLock,
         Self::WebAuthn,
+        Self::Push,
     ];
 
     /// The stable lowercase wire suffix, the half after `js-port:` in the wire
@@ -272,6 +278,7 @@ impl WebCapability {
             Self::ScreenOrientation => "screen-orientation",
             Self::WakeLock => "wake-lock",
             Self::WebAuthn => "web-authn",
+            Self::Push => "push",
         }
     }
 
@@ -315,6 +322,7 @@ impl WebCapability {
             ["Ipe", "Browser", "ScreenOrientation", ..] => Some(Self::ScreenOrientation),
             ["Ipe", "Browser", "WakeLock", ..] => Some(Self::WakeLock),
             ["Ipe", "Browser", "WebAuthn", ..] => Some(Self::WebAuthn),
+            ["Ipe", "Browser", "Push", ..] => Some(Self::Push),
             _ => None,
         }
     }
@@ -354,6 +362,7 @@ impl WebCapability {
             Self::ScreenOrientation => Some(&["Ipe", "Browser", "ScreenOrientation"]),
             Self::WakeLock => Some(&["Ipe", "Browser", "WakeLock"]),
             Self::WebAuthn => Some(&["Ipe", "Browser", "WebAuthn"]),
+            Self::Push => Some(&["Ipe", "Browser", "Push"]),
             Self::Raw => None,
         }
     }
@@ -407,6 +416,7 @@ impl WebCapability {
             | Self::ScreenOrientation
             | Self::WakeLock
             | Self::WebAuthn
+            | Self::Push
             | Self::Raw => &[],
         }
     }
@@ -517,6 +527,10 @@ impl WebCapability {
                  navigator.credentials.create / navigator.credentials.get; results are \
                  opaque base64url credential envelopes verified by the relying party server."
             }
+            Self::Push => {
+                "Subscribing to server-sent push messages delivered while the app is not \
+                 in the foreground, and reading or dropping that subscription."
+            }
         }
     }
 
@@ -551,6 +565,7 @@ impl WebCapability {
             "screen-orientation" => Ok(Self::ScreenOrientation),
             "wake-lock" => Ok(Self::WakeLock),
             "web-authn" => Ok(Self::WebAuthn),
+            "push" => Ok(Self::Push),
             _ => Err(UnknownCapability(full.to_owned())),
         }
     }
@@ -589,6 +604,7 @@ impl WebCapability {
             Self::ScreenOrientation => "ScreenOrientation",
             Self::WakeLock => "WakeLock",
             Self::WebAuthn => "WebAuthn",
+            Self::Push => "Push",
         }
     }
 
@@ -600,6 +616,138 @@ impl WebCapability {
         Self::ALL.iter().copied().find(|c| c.ctor_name() == ctor)
     }
 }
+
+/// A web axis a packaged mobile shell serves natively over its bridge.
+///
+/// The bridge carries only what a web view cannot do on its own; every other
+/// axis keeps its web API. Each member names exactly one [`WebCapability`], and
+/// its wire name is that axis's wire suffix, so the shell's accepted-cap list,
+/// the page glue's cap strings, and the consent gate all spell one vocabulary.
+/// Adding a bridged axis is adding one member here and one arm to
+/// [`Self::for_axis`]; the build-time agreement check below refuses any drift
+/// between the two directions.
+#[derive(
+    Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug, Hash, serde::Serialize, serde::Deserialize,
+)]
+pub enum BridgeCap {
+    /// Local notifications: the permission state, the permission request, and
+    /// showing one notification.
+    Notification,
+    /// The push subscription: subscribing, reading the current subscription,
+    /// and dropping it.
+    Push,
+}
+
+impl BridgeCap {
+    /// Every bridged axis, in declaration order.
+    pub const ALL: &'static [Self] = &[Self::Notification, Self::Push];
+
+    /// The web axis this bridge member serves.
+    #[must_use]
+    pub const fn axis(self) -> WebCapability {
+        match self {
+            Self::Notification => WebCapability::Notification,
+            Self::Push => WebCapability::Push,
+        }
+    }
+
+    /// The wire name of this member, which is its axis's wire suffix.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        self.axis().as_str()
+    }
+
+    /// The bridge member serving `axis`, or `None` for an axis that keeps its
+    /// web API inside the shell's web view.
+    ///
+    /// Exhaustive over [`WebCapability`] with no wildcard arm, so a new web axis
+    /// does not compile until its bridge decision is written here.
+    #[must_use]
+    #[deny(clippy::wildcard_enum_match_arm)]
+    pub const fn for_axis(axis: WebCapability) -> Option<Self> {
+        match axis {
+            WebCapability::Notification => Some(Self::Notification),
+            WebCapability::Push => Some(Self::Push),
+            WebCapability::Geolocation
+            | WebCapability::Clipboard
+            | WebCapability::Storage
+            | WebCapability::Vibration
+            | WebCapability::Share
+            | WebCapability::Battery
+            | WebCapability::NetworkInfo
+            | WebCapability::File
+            | WebCapability::Camera
+            | WebCapability::Microphone
+            | WebCapability::Gamepad
+            | WebCapability::Recorder
+            | WebCapability::Visibility
+            | WebCapability::MediaQuery
+            | WebCapability::Connectivity
+            | WebCapability::Raw
+            | WebCapability::Speech
+            | WebCapability::Permission
+            | WebCapability::Orientation
+            | WebCapability::Motion
+            | WebCapability::Channel
+            | WebCapability::Fullscreen
+            | WebCapability::ScreenOrientation
+            | WebCapability::WakeLock
+            | WebCapability::WebAuthn => None,
+        }
+    }
+
+    /// Whether `self` and `other` are the same member, usable in a `const`.
+    const fn same(self, other: Self) -> bool {
+        match (self, other) {
+            (Self::Notification, Self::Notification) | (Self::Push, Self::Push) => true,
+            (Self::Notification, Self::Push) | (Self::Push, Self::Notification) => false,
+        }
+    }
+}
+
+/// Whether [`BridgeCap::for_axis`] and [`BridgeCap::axis`] are inverse over the
+/// listed members, and `members` lists each member exactly once.
+///
+/// Holds when every member maps back to itself through its axis, no member is
+/// listed twice, and the number of web axes with a bridge member equals the
+/// number of members, so no axis reaches a member other than its own.
+#[must_use]
+const fn bridge_caps_agree(members: &[BridgeCap], axes: &[WebCapability]) -> bool {
+    let mut rest = members;
+    while let Some((member, tail)) = rest.split_first() {
+        let round_trips = match BridgeCap::for_axis(member.axis()) {
+            Some(back) => back.same(*member),
+            None => false,
+        };
+        if !round_trips {
+            return false;
+        }
+        let mut others = tail;
+        while let Some((other, more)) = others.split_first() {
+            if other.same(*member) {
+                return false;
+            }
+            others = more;
+        }
+        rest = tail;
+    }
+    let mut bridged = 0_usize;
+    let mut remaining = axes;
+    while let Some((axis, tail)) = remaining.split_first() {
+        if BridgeCap::for_axis(*axis).is_some() {
+            bridged += 1;
+        }
+        remaining = tail;
+    }
+    bridged == members.len()
+}
+
+// IPE-RUST-AUDIT:ACCEPTED (Arthur Maciel) — compile-time `const` assertion (not a runtime panic); fails the BUILD if a bridge member and its web axis stop mapping to each other, so the shell's accepted-cap list can never name an axis the consent gate does not [ledger #boundary]
+#[allow(clippy::assertions_on_constants)] // the constant IS the tripwire
+const _: () = assert!(
+    bridge_caps_agree(BridgeCap::ALL, WebCapability::ALL),
+    "BridgeCap::for_axis and BridgeCap::axis disagree, or BridgeCap::ALL lists a member twice",
+);
 
 impl Capability {
     /// The trust-boundary partition this capability belongs to.
@@ -713,6 +861,7 @@ impl Capability {
         Self::JsPort(WebCapability::ScreenOrientation),
         Self::JsPort(WebCapability::WakeLock),
         Self::JsPort(WebCapability::WebAuthn),
+        Self::JsPort(WebCapability::Push),
     ];
 
     /// Whether this capability carries no OS-isolatable resource surface — the
@@ -775,6 +924,7 @@ impl Capability {
                 WebCapability::ScreenOrientation => "js-port:screen-orientation",
                 WebCapability::WakeLock => "js-port:wake-lock",
                 WebCapability::WebAuthn => "js-port:web-authn",
+                WebCapability::Push => "js-port:push",
             },
         }
     }
@@ -818,19 +968,36 @@ impl std::str::FromStr for Capability {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct UnknownCapability(pub String);
 
+/// Names every capability the parser accepts.
+///
+/// The list is read from [`Capability::ALL`] and [`WebCapability::ALL`], so a
+/// new capability or web axis appears in it without a second edit.
 impl std::fmt::Display for UnknownCapability {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "unknown capability {:?} (expected one of: network, filesystem, \
-             database, env, subprocess, clock, random, native-ffi, ffi-raw, unsafe, \
-             custom-element, js-port:<axis> where <axis> is one of geolocation, \
-             clipboard, notification, storage, vibration, share, battery, \
-             network-info, file, camera, microphone, gamepad, recorder, visibility, \
-             media-query, connectivity, raw, speech, permission, orientation, motion, \
-             channel, fullscreen, screen-orientation, wake-lock, web-authn)",
-            self.0
-        )
+        write!(f, "unknown capability {:?} (expected one of: ", self.0)?;
+        for cap in Capability::ALL {
+            match cap {
+                Capability::JsPort(_) => {}
+                Capability::Network
+                | Capability::Filesystem
+                | Capability::Database
+                | Capability::Env
+                | Capability::Subprocess
+                | Capability::Clock
+                | Capability::Random
+                | Capability::NativeFfi
+                | Capability::FfiRaw
+                | Capability::Unsafe
+                | Capability::CustomElement => write!(f, "{}, ", cap.as_str())?,
+            }
+        }
+        f.write_str("js-port:<axis> where <axis> is one of ")?;
+        let mut sep = "";
+        for axis in WebCapability::ALL {
+            write!(f, "{sep}{}", axis.as_str())?;
+            sep = ", ";
+        }
+        f.write_str(")")
     }
 }
 
@@ -907,7 +1074,7 @@ impl ElementCapability {
 
 #[cfg(test)]
 mod tests {
-    use super::{Capability, WebCapability};
+    use super::{BridgeCap, Capability, WebCapability, bridge_caps_agree};
 
     #[test]
     fn all_lists_every_variant_once() {
@@ -1143,6 +1310,113 @@ mod tests {
         assert_eq!(
             WebCapability::for_browser_module(&["Ipe", "Browser", "WebAuthn", "Internals"]),
             Some(WebCapability::WebAuthn)
+        );
+    }
+
+    #[test]
+    fn push_axis_round_trips_and_names_the_browser_module() {
+        // The push-subscription axis is its own closed vocabulary member, opens
+        // no Permissions-Policy directive, and the `Ipe.Browser.Push` module (and
+        // any submodule) discloses it via the path-prefix key.
+        use std::str::FromStr as _;
+        assert_eq!(
+            Capability::from_str("js-port:push"),
+            Ok(Capability::JsPort(WebCapability::Push))
+        );
+        assert_eq!(WebCapability::Push.as_str(), "push");
+        assert_eq!(WebCapability::Push.ctor_name(), "Push");
+        assert_eq!(WebCapability::from_ctor("Push"), Some(WebCapability::Push));
+        assert_eq!(
+            WebCapability::for_browser_module(&["Ipe", "Browser", "Push"]),
+            Some(WebCapability::Push)
+        );
+        assert_eq!(
+            WebCapability::for_browser_module(&["Ipe", "Browser", "Push", "Internals"]),
+            Some(WebCapability::Push)
+        );
+        assert!(
+            WebCapability::Push
+                .permissions_policy_directives()
+                .is_empty()
+        );
+        assert_eq!(
+            Capability::JsPort(WebCapability::Push).boundary_class(),
+            Capability::JsPort(WebCapability::Notification).boundary_class()
+        );
+    }
+
+    #[test]
+    fn bridge_caps_are_exactly_notification_and_push() {
+        // Only the axes a web view cannot serve on its own cross the native
+        // bridge; every other axis keeps its web API.
+        let bridged: Vec<WebCapability> = WebCapability::ALL
+            .iter()
+            .copied()
+            .filter(|axis| BridgeCap::for_axis(*axis).is_some())
+            .collect();
+        assert_eq!(
+            bridged,
+            vec![WebCapability::Notification, WebCapability::Push]
+        );
+        for &cap in BridgeCap::ALL {
+            assert_eq!(BridgeCap::for_axis(cap.axis()), Some(cap));
+            assert_eq!(cap.as_str(), cap.axis().as_str());
+        }
+        assert_eq!(BridgeCap::Notification.as_str(), "notification");
+        assert_eq!(BridgeCap::Push.as_str(), "push");
+    }
+
+    #[test]
+    fn the_bridge_agreement_check_refuses_a_duplicate_or_missing_member() {
+        // The build-time check is live: the real tables pass, a list naming one
+        // member twice is refused, and a list missing a member the axis table
+        // reaches is refused. The duplicate list has as many entries as there
+        // are bridged axes, so only the duplicate check can refuse it.
+        assert!(bridge_caps_agree(BridgeCap::ALL, WebCapability::ALL));
+        assert!(!bridge_caps_agree(
+            &[BridgeCap::Notification, BridgeCap::Notification],
+            WebCapability::ALL
+        ));
+        assert!(!bridge_caps_agree(
+            &[BridgeCap::Notification],
+            WebCapability::ALL
+        ));
+    }
+
+    #[test]
+    fn unknown_capability_names_every_capability_in_order() {
+        let shown = super::UnknownCapability("x".to_owned()).to_string();
+        assert_eq!(
+            shown,
+            "unknown capability \"x\" (expected one of: network, filesystem, \
+             database, env, subprocess, clock, random, native-ffi, ffi-raw, unsafe, \
+             custom-element, js-port:<axis> where <axis> is one of geolocation, \
+             clipboard, notification, storage, vibration, share, battery, \
+             network-info, file, camera, microphone, gamepad, recorder, visibility, \
+             media-query, connectivity, raw, speech, permission, orientation, motion, \
+             channel, fullscreen, screen-orientation, wake-lock, web-authn, push)"
+        );
+        for cap in Capability::ALL {
+            let name = cap.as_str();
+            let listed = name.strip_prefix("js-port:").unwrap_or(name);
+            assert!(shown.contains(listed), "{name} is not listed: {shown}");
+        }
+    }
+
+    #[test]
+    fn bridge_for_axis_has_no_wildcard_arm() {
+        // `BridgeCap::for_axis` is exhaustive over the web axes by construction;
+        // a `_` arm would let a new axis silently skip its bridge decision.
+        let source = include_str!("capability.rs");
+        let body = source
+            .split_once("pub const fn for_axis(")
+            .and_then(|(_, rest)| rest.split_once("\n    }\n"))
+            .map(|(body, _)| body);
+        assert!(body.is_some(), "for_axis found in its source");
+        let wildcard = ["_", " =>"].concat();
+        assert!(
+            body.is_some_and(|b| !b.contains(&wildcard)),
+            "BridgeCap::for_axis must not carry a wildcard arm"
         );
     }
 

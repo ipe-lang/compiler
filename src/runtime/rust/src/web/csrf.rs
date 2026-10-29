@@ -31,27 +31,23 @@ use axum::response::{IntoResponse, Response};
 /// path. Plain-HTTP dev falls back to the bare name (SameSite=Strict is still
 /// the primary guard).
 ///
-/// The app identity suffix is derived from `base` (the normalised
-/// `IPE_WEB_BASE_PATH` for this process) using the same alphanumeric-or-`_`
-/// transform the session cookie uses (`web::cookie_name_for`). Root apps
-/// (`base` is empty) get no suffix. Sub-apps get a suffix that exactly mirrors
-/// their session cookie's suffix, keeping CSRF and session identities in sync.
+/// The app identity suffix is the injective [`crate::encoding::CookieSuffix`]
+/// of `base` (the app's own mount base, carried in its state), the suffix the
+/// session cookie uses (`web::cookie_name_for`). Root apps get no suffix.
+/// Sub-apps get a suffix that exactly mirrors their session cookie's suffix,
+/// keeping CSRF and session identities in sync, and no two bases share one.
 ///
 /// Both SET and READ paths must call this with the same `base` for a given app,
 /// so a token minted by app A validates only against app A's cookie — a token
 /// set by the host app cannot satisfy a sub-app's validator, and vice-versa.
-pub fn csrf_cookie_name_for(base: &str) -> crate::server::CookieName {
+pub fn csrf_cookie_name_for(base: &crate::encoding::MountBase) -> crate::server::CookieName {
     use crate::server::{CookieName, RuntimeCookie};
     let prefix = if cookies_secure() {
         RuntimeCookie::HostCsrf
     } else {
         RuntimeCookie::WebCsrf
     };
-    let suffix: String = base
-        .chars()
-        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
-        .collect();
-    CookieName::runtime(prefix, &suffix)
+    CookieName::runtime(prefix, base.cookie_suffix().as_str())
 }
 
 /// The header the client echoes the CSRF token in (`X-Ipê-Csrf`).
@@ -155,8 +151,8 @@ pub fn cookie_value(headers: &HeaderMap, name: &crate::server::CookieName) -> Op
 
 /// Build the `Set-Cookie` value for the CSRF cookie.
 ///
-/// `base` is the normalised `IPE_WEB_BASE_PATH` for this app — threaded from
-/// `web_base_path()` by the caller so the cookie name is per-app.
+/// `base` is this app's mount base, read from its state by the caller so the
+/// cookie name is per-app.
 ///
 /// `HttpOnly`: the client reads the token from the injected page JS, not from
 /// the cookie directly, so `HttpOnly` is safe and blocks token theft via XSS.
@@ -164,7 +160,7 @@ pub fn cookie_value(headers: &HeaderMap, name: &crate::server::CookieName) -> Op
 /// `Path=/` is always `/` — the `__Host-` prefix mandates it, and keeping it
 /// constant means the browser sends the cookie on every request regardless of
 /// sub-path, so the double-submit validate path always sees it.
-pub fn csrf_set_cookie(token: &str, base: &str) -> crate::server::SetCookie {
+pub fn csrf_set_cookie(token: &str, base: &crate::encoding::MountBase) -> crate::server::SetCookie {
     use crate::server::{CookieAttributes, CookiePath, CookieValue, SameSite, SetCookie};
     // Cross-site iframe: the cookie must cross sites -> `SameSite=None`, which
     // always renders `Secure`. Production / TLS: the `__Host-` name makes
@@ -300,8 +296,10 @@ fn origin_mismatch(check: EnvFlag, framed: bool, parts: &Parts) -> bool {
 
 /// The axum middleware. Validates CSRF on mutating, non-exempt requests; passes
 /// everything else through. Reads only headers (the Ipe.Web POST body is JSON
-/// with the token in `X-Ipê-Csrf`, so no body buffering is needed).
-pub async fn csrf_middleware(
+/// with the token in `X-Ipê-Csrf`, so no body buffering is needed). The CSRF
+/// cookie it reads is the one of the app `mount` names.
+pub(crate) async fn csrf_middleware(
+    axum::extract::State(mount): axum::extract::State<std::sync::Arc<super::MountContext>>,
     req: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> Response {
@@ -328,8 +326,7 @@ pub async fn csrf_middleware(
     }
     let headers = &parts.headers;
 
-    let cookie_tok =
-        cookie_value(headers, &csrf_cookie_name_for(&super::web_base_path())).unwrap_or_default();
+    let cookie_tok = cookie_value(headers, &csrf_cookie_name_for(mount.base())).unwrap_or_default();
     let header_tok = headers
         .get(CSRF_HEADER)
         .and_then(|h| h.to_str().ok())
@@ -655,10 +652,15 @@ mod tests {
     // Per-app cookie name tests (dev mode: cookies_secure() is false in tests
     // because no production env var is set, so the prefix is `__ipe_csrf`).
 
+    /// The mount base `raw`, which every caller passes in the grammar.
+    fn mb(raw: &str) -> crate::encoding::MountBase {
+        crate::encoding::MountBase::parse(raw).unwrap()
+    }
+
     // Root app gets the bare cookie name with no suffix.
     #[test]
     fn cookie_name_for_root_has_no_suffix() {
-        let name = csrf_cookie_name_for("");
+        let name = csrf_cookie_name_for(&mb(""));
         // Prefix only — no trailing characters.
         assert!(
             name.text() == "__Host-ipe_csrf" || name.text() == "__ipe_csrf",
@@ -672,9 +674,9 @@ mod tests {
     // so a CSRF token set by one app cannot collide with the other's cookie.
     #[test]
     fn cookie_name_for_different_bases_are_distinct() {
-        let host_name = csrf_cookie_name_for("");
-        let shop_name = csrf_cookie_name_for("/shop");
-        let blog_name = csrf_cookie_name_for("/blog");
+        let host_name = csrf_cookie_name_for(&mb(""));
+        let shop_name = csrf_cookie_name_for(&mb("/shop"));
+        let blog_name = csrf_cookie_name_for(&mb("/blog"));
 
         assert_ne!(
             host_name, shop_name,
@@ -697,8 +699,8 @@ mod tests {
     // cookie_tok is empty → csrf_pair_valid fails.
     #[test]
     fn token_minted_for_app_a_does_not_satisfy_app_b_validator() {
-        let name_a = csrf_cookie_name_for("/shop");
-        let name_b = csrf_cookie_name_for("/admin");
+        let name_a = csrf_cookie_name_for(&mb("/shop"));
+        let name_b = csrf_cookie_name_for(&mb("/admin"));
         assert_ne!(name_a, name_b);
 
         let token_a = well_formed_tok();
@@ -738,9 +740,9 @@ mod tests {
         } else {
             "; Path=/; HttpOnly; SameSite=Strict"
         };
-        for base in ["", "/shop"] {
-            let expected = format!("{}={tok}{attrs}", csrf_cookie_name_for(base));
-            assert_eq!(csrf_set_cookie(&tok, base).as_str(), expected);
+        for base in [mb(""), mb("/shop")] {
+            let expected = format!("{}={tok}{attrs}", csrf_cookie_name_for(&base));
+            assert_eq!(csrf_set_cookie(&tok, &base).as_str(), expected);
         }
     }
 
@@ -748,8 +750,8 @@ mod tests {
     // so the __Host- security invariant holds for every app.
     #[test]
     fn set_cookie_always_path_root() {
-        let cookie_root = csrf_set_cookie(&well_formed_tok(), "");
-        let cookie_sub = csrf_set_cookie(&well_formed_tok(), "/shop");
+        let cookie_root = csrf_set_cookie(&well_formed_tok(), &mb(""));
+        let cookie_sub = csrf_set_cookie(&well_formed_tok(), &mb("/shop"));
 
         assert!(
             cookie_root.contains("Path=/"),
@@ -762,24 +764,45 @@ mod tests {
     }
 
     // The sub-app cookie name contains only RFC 6265-safe cookie-name characters
-    // (ASCII alphanumeric, `-`, `_`) — never a raw `/` or other separator that
-    // would break the `Set-Cookie` header syntax.
+    // — never a raw `/` or other separator that would break the `Set-Cookie`
+    // header syntax.
     #[test]
     fn cookie_name_characters_are_rfc6265_safe() {
-        for base in &["/shop", "/_ipe/console", "/a/b/c", "/foo-bar_baz"] {
-            let name = csrf_cookie_name_for(base);
+        for base in [
+            "/shop",
+            "/_ipe/console",
+            "/a/b/c",
+            "/foo-bar_baz",
+            "/v1.2~x",
+        ] {
+            let name = csrf_cookie_name_for(&mb(base));
             // RFC 6265 cookie-name: visible US-ASCII chars except delimiters.
-            // Our transform maps everything non-alphanumeric to `_`, so the name
-            // contains only alphanumerics, `_`, and `-` (from the `__Host-` prefix).
+            // The suffix keeps `A-Za-z0-9-.~` and spells `_` and `/` as `_5F`
+            // and `_2F`; the prefix adds only `_` and `-`.
             let bad: Vec<char> = name
                 .as_str()
                 .chars()
-                .filter(|&c| !c.is_ascii_alphanumeric() && c != '_' && c != '-')
+                .filter(|&c| !c.is_ascii_alphanumeric() && !matches!(c, '_' | '-' | '.' | '~'))
                 .collect();
             assert!(
                 bad.is_empty(),
                 "cookie name for base={base:?} contains unsafe chars {bad:?}: {name}"
             );
+        }
+    }
+
+    // Bases a lossy suffix map would fold together get distinct CSRF cookies,
+    // so one mount's token never satisfies a sibling mount's validator.
+    #[test]
+    fn cookie_names_are_distinct_for_bases_a_lossy_map_folds() {
+        let names: Vec<_> = ["/a-b", "/a_b", "/a/b", "/a.b", "/a~b", ""]
+            .into_iter()
+            .map(|raw| csrf_cookie_name_for(&mb(raw)))
+            .collect();
+        for (i, a) in names.iter().enumerate() {
+            for b in names.iter().skip(i + 1) {
+                assert_ne!(a, b);
+            }
         }
     }
 }
