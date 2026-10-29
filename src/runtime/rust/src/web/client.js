@@ -109,10 +109,10 @@ var __ipeNode = (function() {
   var parentElement = getter(Node.prototype, "parentElement");
   var parentNode = getter(Node.prototype, "parentNode");
   var firstChild = getter(Node.prototype, "firstChild");
+  var nextSibling = getter(Node.prototype, "nextSibling");
   var textContent = setter(Node.prototype, "textContent");
   var firstElementChild = getter(Element.prototype, "firstElementChild");
   var nextElementSibling = getter(Element.prototype, "nextElementSibling");
-  var previousElementSibling = getter(Element.prototype, "previousElementSibling");
   var tagName = getter(Element.prototype, "tagName");
   var namespaceURI = getter(Element.prototype, "namespaceURI");
   var localName = getter(Element.prototype, "localName");
@@ -132,7 +132,6 @@ var __ipeNode = (function() {
     attr: function(el, name) { return getAttribute.call(el, name); },
     setAttr: function(el, name, v) { setAttribute.call(el, name, v); },
     removeAttr: function(el, name) { removeAttribute.call(el, name); },
-    remove: function(el) { remove.call(el); },
     contains: function(el, other) { return contains.call(el, other); },
     on: function(el, type, fn) { on.call(el, type, fn); },
     // A form's controls; null for any other node.
@@ -142,6 +141,7 @@ var __ipeNode = (function() {
     parent: function(el) { return parentElement.call(el); },
     parentNode: function(el) { return parentNode.call(el); },
     firstChild: function(el) { return firstChild.call(el); },
+    nextSibling: function(el) { return nextSibling.call(el); },
     firstElement: function(el) { return firstElementChild.call(el); },
     next: function(el) { return nextElementSibling.call(el); },
     removeChild: function(el, child) { removeChild.call(el, child); },
@@ -162,36 +162,6 @@ var __ipeNode = (function() {
     },
     queryAllIn: function(tmp, sel) {
       return (tmp instanceof DocumentFragment ? fragmentQueryAll : queryAll).call(tmp, sel);
-    },
-    // The child-element indices leading from `root` down to `el`; null when
-    // `el` is not below `root`.
-    pathFrom: function(root, el) {
-      var path = [];
-      var node = el;
-      while (node && node !== root) {
-        var index = 0;
-        var sibling = previousElementSibling.call(node);
-        while (sibling) {
-          index++;
-          sibling = previousElementSibling.call(sibling);
-        }
-        path.push(index);
-        node = parentElement.call(node);
-      }
-      return node === root ? path.reverse() : null;
-    },
-    // The element below `root` at `path`, or its deepest ancestor that
-    // exists, with its depth below `root` (0 for `root` itself).
-    resolve: function(root, path) {
-      var node = root;
-      var depth = 0;
-      for (; depth < path.length; depth++) {
-        var child = firstElementChild.call(node);
-        for (var k = 0; child && k < path[depth]; k++) child = nextElementSibling.call(child);
-        if (!child) break;
-        node = child;
-      }
-      return {node: node, depth: depth};
     },
     // Removes `autofocus` from every element below the detached holder `tmp`
     // (an element or a fragment), returning them in document order.
@@ -354,9 +324,11 @@ function __ipeAdoptFullBody(token, applyFn) {
   }
   var cur = __ipeOwnEpoch(__ipeEpoch);
   if (cur && __ipeCounterOrder(next, cur) < 0) return false;
-  applyFn();
-  __ipeEpoch = token;
-  __ipeRunPaths();
+  __ipeKeepFocus(function() {
+    applyFn();
+    __ipeEpoch = token;
+    __ipeRunPaths();
+  });
   return true;
 }
 // Where the patches diffed from render `from` to render `to` stand against the
@@ -370,14 +342,17 @@ function __ipePatchStep(from, to) {
   if (!a || !b || __ipeCounterOrder(b, a) <= 0) return "foreign";
   return from === __ipeEpoch ? "next" : "behind";
 }
-// Apply `patches` and adopt `to`, only as the next step from the render on
-// screen; true when they applied. The one caller of `__ipeApplyPatches`.
-function __ipeAdoptPatches(from, to, patches) {
-  if (__ipeStale || __ipePatchStep(from, to) !== "next") return false;
-  __ipeApplyPatches(patches);
-  __ipeEpoch = to;
-  __ipeRunPaths();
-  return true;
+// Apply the patches `frame` carries and adopt its `to`, only as the next step
+// from the render on screen, then move focus as the frame addresses it. The
+// one caller of `__ipeApplyPatches`.
+function __ipeAdoptPatches(frame) {
+  if (__ipeStale || __ipePatchStep(frame.from, frame.to) !== "next") return;
+  __ipeKeepFocus(function() {
+    __ipeApplyPatches(frame.patches);
+    __ipeEpoch = frame.to;
+    __ipeRunPaths();
+    __ipeFocusAddressed(frame);
+  });
 }
 // Set once this document has refused a render of another history: from then
 // on it applies no patch and no full render.
@@ -822,33 +797,18 @@ function __ipeFramePatch(el, k, v) {
 // Replace `container`'s children with the parsed holder `tmp`'s, splicing the
 // live inputs described above into their placeholders.
 //
-// A swap never moves keyboard focus. Focus on any node inside `container` is
-// recorded as the node's child-element path and the `ipe-id` of it and of
-// each ancestor at its depth, and put back once the commit lands on the
-// nearest node on that path whose chain from `container` carries the recorded
-// `ipe-id` and tag at every depth (see `__ipeRestoreFocus`); a live field
-// keeps its own node, value and selection (below). Focus outside `container`
-// is not read or written. Every member read on `container` goes through
-// `__ipeNode`: it may be a `<form>`.
+// A focused live field keeps its own node, value and selection (below). Focus
+// the swap drops anywhere else is put back by the frame's focus keep
+// (`__ipeKeepFocus`), never here. Focus outside `container` is not read or
+// written. Every member read on `container` goes through `__ipeNode`: it may
+// be a `<form>`.
 function __ipeSwapPreservingFocus(container, tmp) {
   var focused = __ipeDoc.active();
   var inside = focused && focused !== __ipeDoc.body() &&
       __ipeNode.contains(container, focused);
-  var focusPath = inside ? __ipeNode.pathFrom(container, focused) : null;
   var focusTag = inside ? __ipeNode.tag(focused) : "";
   var focusedInside = inside &&
       (focusTag === "INPUT" || focusTag === "TEXTAREA" || focusTag === "SELECT");
-  // The focused node and each of its ancestors below `container`, by depth:
-  // entry `d - 1` holds the server identity (`ipe-id`: path, tag and key, null
-  // when absent) and the tag of the node `d` levels below `container`.
-  var focusIds = [];
-  if (focusPath) {
-    var at = focused;
-    for (var d = focusPath.length; d > 0; d--) {
-      focusIds[d - 1] = {id: __ipeNode.attr(at, "ipe-id"), tag: __ipeNode.tag(at)};
-      at = __ipeNode.parent(at);
-    }
-  }
 
   // Snapshot focused-state BEFORE any DOM mutation. Selection read
   // throws on some input types, so catch.
@@ -916,51 +876,112 @@ function __ipeSwapPreservingFocus(container, tmp) {
       try { preservedFocus.setSelectionRange(selStart, selEnd, selDir); } catch (_) {}
     }
     if (scrollTop) preservedFocus.scrollTop = scrollTop;
-  } else if (focusPath) {
-    __ipeRestoreFocus(container, focusPath, focusIds);
   }
 }
 
-// Put focus back after a swap dropped it. Focus goes to the node at `path`
-// below `container`, else to its nearest ancestor, that takes focus, walking
-// from the path's deepest surviving node upward past `container`: a key
-// handler bound on an ancestor keeps receiving keys. A node the swap created
-// is a candidate only when it and every node above it on the path, down from
-// `container`, carry the `ipe-id` and tag recorded for their own depth in
-// `ids`. One `ipe-id` alone does not name a node: a key may contain `_` and
-// spell the next segment, so a node whose chain differs higher up can carry
-// the same id at the same depth. The matched chain fixes every segment's
-// index, tag and key, so the id then names one node. Any other node at the
-// path is another control, and a node without an `ipe-id` (raw markup) is
-// never one. `container` and the nodes above it are the ones the swap kept.
-// Focus that is already somewhere is left where it is. A kept ancestor bound
-// to `onFocus` delivers that message once.
-function __ipeRestoreFocus(container, path, ids) {
+// The focus keep: focus after a frame is a function of the view, never of the
+// patch the diff chose (`dom::focus`, the rule the wasm runtime runs too).
+// Before the frame, the view chain of the focused node is recorded: the
+// `ipe-id` and tag of each element from `#ipe-root`'s child down to it, cut at
+// the first element with no `ipe-id`, and recorded only when the first one
+// carries one (focus in the debugger overlay, on the body or outside the view
+// records nothing). After the frame, when nothing holds focus, focus goes to
+// the deepest node of the chain still in the view that takes focus, else to
+// `#ipe-root`. The check runs at the end of the commit and again two animation
+// frames later, after the browser's own focus fixup for a node a patch made
+// unfocusable. Neither check moves focus the user moved since the commit, nor
+// one a newer frame owns, nor while the runtime is moving focus itself.
+var __IPE_FOCUS_CHAIN_MAX = 1024;
+// The pending deferred check: the record of the newest frame that took one.
+var __ipeFocusKeep = null;
+// The view chain of the focused node below `root`, downward; null when focus
+// is not below `root`, its first link carries no `ipe-id`, or it is nested
+// deeper than `__IPE_FOCUS_CHAIN_MAX`.
+function __ipeFocusChain(root) {
   var now = __ipeDoc.active();
-  if (now && now !== __ipeDoc.body()) return;
-  var found = __ipeNode.resolve(container, path);
-  // The resolved nodes by depth: entry `d - 1` is the node at depth `d`.
+  if (!root || !now || now === __ipeDoc.body() || !__ipeNode.contains(root, now)) return null;
+  var upward = [];
+  for (var at = now; at && at !== root; at = __ipeNode.parent(at)) {
+    if (upward.length >= __IPE_FOCUS_CHAIN_MAX) return null;
+    upward.push({id: __ipeNode.attr(at, "ipe-id"), tag: __ipeNode.tag(at)});
+  }
   var chain = [];
-  var at = found.node;
-  for (var d = found.depth; d > 0; d--) {
-    chain[d - 1] = at;
-    at = __ipeNode.parent(at);
+  for (var i = upward.length - 1; i >= 0 && upward[i].id !== null; i--) chain.push(upward[i]);
+  return chain.length > 0 ? chain : null;
+}
+// Whether the keep may put focus back for the frame `rec`: nothing holds
+// focus, the user moved none since the commit, `rec` is the newest frame, and
+// the runtime is not moving focus.
+function __ipeFocusSettleDue(rec) {
+  var now = __ipeDoc.active();
+  var held = !!now && now !== __ipeDoc.body();
+  return !held && __ipeFocusEpoch === rec.epoch && __ipeEpoch === rec.frame &&
+      !__ipeRuntimeFocusing;
+}
+// Runs `run`, the one commit of a frame, inside the focus keep.
+function __ipeKeepFocus(run) {
+  var chain = __ipeFocusChain(__ipeDoc.byId("ipe-root"));
+  var epoch = __ipeFocusEpoch;
+  run();
+  if (chain === null) {
+    __ipeFocusKeep = null;
+    return;
   }
-  // The deepest depth whose whole prefix, from depth 1, matches `ids`.
-  var matched = 0;
-  while (matched < chain.length) {
-    var was = ids[matched];
-    var node = chain[matched];
-    var own = __ipeNode.attr(node, "ipe-id");
-    if (!was || own === null || own !== was.id || __ipeNode.tag(node) !== was.tag) break;
-    matched++;
+  var rec = {chain: chain, epoch: epoch, frame: __ipeEpoch};
+  __ipeFocusKeep = rec;
+  if (__ipeFocusSettleDue(rec)) __ipeRestoreFocus(rec.chain);
+  if (typeof window.requestAnimationFrame !== "function") return;
+  window.requestAnimationFrame(function() {
+    window.requestAnimationFrame(function() {
+      if (__ipeFocusKeep !== rec) return;
+      __ipeFocusKeep = null;
+      if (__ipeFocusSettleDue(rec)) __ipeRestoreFocus(rec.chain);
+    });
+  });
+}
+// The ONE element child of `at` whose `ipe-id` and tag equal `link`; null when
+// none or several do, or when the children cannot be read. The children are
+// walked through the core node members (`firstChild`, `nextSibling`), which
+// every DOM has.
+function __ipeOnlyChild(at, link) {
+  try {
+    var only = null;
+    var count = 0;
+    for (var kid = __ipeNode.firstChild(at); kid; kid = __ipeNode.nextSibling(kid)) {
+      if (!(kid instanceof Element)) continue;
+      if (__ipeNode.attr(kid, "ipe-id") === link.id && __ipeNode.tag(kid) === link.tag) {
+        only = kid;
+        count++;
+      }
+    }
+    return count === 1 ? only : null;
+  } catch (_) {
+    return null;
   }
-  for (var m = matched; m > 0; m--) {
-    if (__ipeNode.focus(chain[m - 1])) return;
+}
+// Puts focus on the landing of `chain`: descending from `#ipe-root`, each
+// depth takes the ONE element child whose `ipe-id` and tag equal the link (none
+// or several end the descent); the matched nodes, deepest first, then
+// `#ipe-root`, are tried until one takes focus. An equal `ipe-id` under another
+// tag or another chain never matches, and a node that moved keeps its match.
+// A landing node bound to `onFocus` delivers that message once. A depth whose
+// children cannot be read (a DOM member the browser lacks) ends the descent:
+// the depths above it are proven, so focus still lands, never stops.
+function __ipeRestoreFocus(chain) {
+  var root = __ipeDoc.byId("ipe-root");
+  if (!root) return;
+  var found = [];
+  var at = root;
+  for (var d = 0; d < chain.length; d++) {
+    var only = __ipeOnlyChild(at, chain[d]);
+    if (only === null) break;
+    found.push(only);
+    at = only;
   }
-  for (var up = container; up; up = __ipeNode.parent(up)) {
-    if (__ipeNode.focus(up)) return;
+  for (var m = found.length - 1; m >= 0; m--) {
+    if (__ipeNode.focus(found[m])) return;
   }
+  __ipeNode.focus(root);
 }
 
 // The first mount of the page focuses the element the browser would have
@@ -970,9 +991,9 @@ function __ipeRestoreFocus(container, path, ids) {
 // pressed a key or a pointer, and the URL names no fragment target (the
 // browser skips autofocus for one too). No
 // `autofocus` attribute reaches the live DOM from a swap or a patch, so the
-// browser never focuses an inserted element itself. A later full frame only
-// puts lost focus back (`__ipeRestoreFocus`). A later patches frame moves focus
-// only through `__ipeFocusAddressed`: onto the element the server named as
+// browser never focuses an inserted element itself. Any frame puts lost focus
+// back through the focus keep (`__ipeKeepFocus`). A later patches frame moves
+// focus onto a new element only through `__ipeFocusAddressed`: onto the element the server named as
 // newly autofocused, when the frame answers this tab's own user act, applies
 // as the next step, and focus has not moved since that act.
 var __ipeMounted = false;
@@ -1006,6 +1027,16 @@ function __ipeAsRuntimeFocus(move) {
 ["focusin", "pointerdown", "mousedown", "touchstart"].forEach(function(type) {
   __ipeDoc.on(type, function() {
     if (!__ipeRuntimeFocusing) __ipeFocusEpoch += 1;
+  }, true);
+});
+// The window events that count a focus move when the window itself is their
+// target: focus leaving the document (`dom::focus::WINDOW_FOCUS_MOVES`). An
+// element's own `blur` crossing the capture phase is not one: the browser
+// raises it for a node a patch made unfocusable.
+var __IPE_WINDOW_FOCUS_MOVES = ["blur"];
+__IPE_WINDOW_FOCUS_MOVES.forEach(function(type) {
+  window.addEventListener(type, function(ev) {
+    if (ev.target === window && !__ipeRuntimeFocusing) __ipeFocusEpoch += 1;
   }, true);
 });
 // The event kinds that are a deliberate act of the user: a key, a click, an
@@ -1930,7 +1961,6 @@ function __ipeApplyPatches(patches) {
         if (savedScrollTop) el.scrollTop = savedScrollTop;
       }
     }
-    if (p.remove) __ipeNode.remove(el);
   }
   // Any new ipe-* attribute in the patched DOM needs a listener.
   __ipeBindEvents();
@@ -2985,7 +3015,7 @@ var __ipeLiveFrames = {
       return;
     }
     __ipeHandleResponse(frame.seq, relayed ? null : frame.ackInputs, function() {
-      if (__ipeAdoptPatches(frame.from, frame.to, frame.patches)) __ipeFocusAddressed(frame);
+      __ipeAdoptPatches(frame);
     }, frame.globalSeq);
   },
   // Dev-watch blue-green cutover cue. The watch server sends this right after
