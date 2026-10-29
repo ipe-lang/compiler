@@ -17,6 +17,7 @@ import Ipe.String as String
 import Ipe.Task as Task
 import Ipe.Tuple as Tuple
 import Lib.Drawn as Drawn exposing (DrawnSource, SourceRow(..))
+import Lib.EnvLookup as EnvLookup
 import Lib.Failure exposing (DecideRefusal(..))
 import Lib.Highlight as Highlight
 import Lib.Label as Label exposing (ColumnExtent(..), Label, LabelPiece(..))
@@ -839,8 +840,7 @@ rootMismatch sample sampled first =
                     (SafeText.concat
                         [ SafeText.literal "\" is not found under "
                         , SafeText.quoted (Path.toString sample.rootDir)
-                        , SafeText.literal "; "
-                        , sample.fix
+                        , EnvLookup.fixSuffix sample.fix
                         , SafeText.literal ", or re-run `tools/scripts/ipe-index index` if the indexed files have moved"
                         ]
                     )
