@@ -8173,39 +8173,53 @@ mod tests {
         }
     }
 
-    /// Only a `GET` yields an upgrader: an HTTP/2 extended `CONNECT` carrying
-    /// the WebSocket headers is refused before axum's own extractor, which
-    /// would accept it; the `GET` control reaches that extractor.
+    /// Only a `GET` yields an upgrader: an HTTP/2 extended `CONNECT` that
+    /// axum's own extractor accepts is refused; a `GET` handshake carrying the
+    /// same connection is admitted.
+    ///
+    /// The runtime builds hyper without `http2`, so axum compiles out its
+    /// `:protocol` check and hyper has no `ext::Protocol` to attach: the
+    /// `CONNECT` below is exactly what that extractor admits.
     #[tokio::test]
     #[allow(clippy::expect_used)] // test: fixed requests build
     async fn websocket_upgrader_refuses_a_connect() {
+        use axum::extract::FromRequestParts;
         let head = |method: axum::http::Method, version: axum::http::Version| {
-            let (parts, ()) = axum::http::Request::builder()
-                .method(method)
+            let mut builder = axum::http::Request::builder()
+                .method(method.clone())
                 .version(version)
                 .uri("/ws")
-                .header(axum::http::header::CONNECTION, "upgrade")
-                .header(axum::http::header::UPGRADE, "websocket")
-                .header(
-                    axum::http::header::SEC_WEBSOCKET_KEY,
-                    "dGhlIHNhbXBsZSBub25jZQ==",
-                )
-                .header(axum::http::header::SEC_WEBSOCKET_VERSION, "13")
-                .body(())
-                .expect("test request builds")
-                .into_parts();
+                .header(axum::http::header::SEC_WEBSOCKET_VERSION, "13");
+            if method == axum::http::Method::GET {
+                builder = builder
+                    .header(axum::http::header::CONNECTION, "upgrade")
+                    .header(axum::http::header::UPGRADE, "websocket")
+                    .header(
+                        axum::http::header::SEC_WEBSOCKET_KEY,
+                        "dGhlIHNhbXBsZSBub25jZQ==",
+                    );
+            }
+            let (mut parts, ()) = builder.body(()).expect("test request builds").into_parts();
+            // The connection's upgrade handle, as the listener attaches it.
+            let on_upgrade = hyper::upgrade::on(axum::http::Request::new(()));
+            parts.extensions.insert(on_upgrade);
             parts
         };
-        let mut connect = head(axum::http::Method::CONNECT, axum::http::Version::HTTP_2);
+        let connect = || head(axum::http::Method::CONNECT, axum::http::Version::HTTP_2);
+        assert!(
+            axum::extract::ws::WebSocketUpgrade::from_request_parts(&mut connect(), &())
+                .await
+                .is_ok(),
+            "axum's extractor admits the extended CONNECT"
+        );
         assert_eq!(
-            websocket_upgrader(&mut connect).await.err(),
+            websocket_upgrader(&mut connect()).await.err(),
             Some(NoUpgrader::NotGet)
         );
         let mut get = head(axum::http::Method::GET, axum::http::Version::HTTP_11);
-        assert_eq!(
-            websocket_upgrader(&mut get).await.err(),
-            Some(NoUpgrader::NotUpgrade),
-            "a GET reaches the extractor (no connection to upgrade in a unit test)"
+        assert!(
+            websocket_upgrader(&mut get).await.is_ok(),
+            "a GET handshake yields an upgrader"
         );
     }
 

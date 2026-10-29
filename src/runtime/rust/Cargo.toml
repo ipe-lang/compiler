@@ -706,6 +706,9 @@ tokio = { version = "1", features = ["full", "test-util", "macros"] }
 # A fake TLS PostgreSQL server proves the pinned relay keeps SNI and
 # certificate host-name verification.
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+# `websocket_upgrader_refuses_a_connect` attaches the connection's upgrade
+# handle (`hyper::upgrade::OnUpgrade`) a listener gives every request.
+hyper = { version = "1", default-features = false, features = ["http1", "server"] }
 # `tests/per_event_render_budget.rs` counts the allocations of a render pass
 # through an instrumented global allocator, installed in that test binary only.
 stats_alloc = "0.1.10"

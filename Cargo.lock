@@ -3146,6 +3146,7 @@ dependencies = [
  "gloo-timers",
  "hex",
  "hmac 0.12.1",
+ "hyper",
  "icu_casemap",
  "icu_locale_core",
  "indexmap 2.14.0",
