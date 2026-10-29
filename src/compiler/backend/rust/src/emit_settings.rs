@@ -212,30 +212,7 @@ impl EmitSettings {
 
         emit_field(sink, FieldTag::HotAppearance, &[u8::from(*hot_appearance)]);
 
-        let mut payload = Vec::new();
-        match host {
-            // `Off` keeps the payload every served key had before the offer
-            // existed; `On` takes the next free discriminant.
-            EmitHost::Served(ServedInstall::Off) => payload.push(0),
-            EmitHost::Served(ServedInstall::On { name, icon }) => {
-                payload.push(2);
-                push_framed(&mut payload, name.as_bytes());
-                payload.extend_from_slice(&icon.side().get().to_le_bytes());
-                payload.extend_from_slice(icon.digest());
-            }
-            EmitHost::WebView(window) => {
-                let WebViewWindow {
-                    title,
-                    width,
-                    height,
-                } = window;
-                payload.push(1);
-                push_framed(&mut payload, title.as_bytes());
-                payload.extend_from_slice(&width.to_le_bytes());
-                payload.extend_from_slice(&height.to_le_bytes());
-            }
-        }
-        emit_field(sink, FieldTag::Host, &payload);
+        emit_field(sink, FieldTag::Host, &host_payload(host));
 
         emit_field(
             sink,
@@ -246,6 +223,34 @@ impl EmitSettings {
             }],
         );
     }
+}
+
+/// The [`FieldTag::Host`] payload of `host`.
+fn host_payload(host: &EmitHost) -> Vec<u8> {
+    let mut payload = Vec::new();
+    match host {
+        // `Off` is the plain served payload; `On` takes the next free
+        // discriminant.
+        EmitHost::Served(ServedInstall::Off) => payload.push(0),
+        EmitHost::Served(ServedInstall::On { name, icon }) => {
+            payload.push(2);
+            push_framed(&mut payload, name.as_bytes());
+            payload.extend_from_slice(&icon.side().get().to_le_bytes());
+            payload.extend_from_slice(icon.digest());
+        }
+        EmitHost::WebView(window) => {
+            let WebViewWindow {
+                title,
+                width,
+                height,
+            } = window;
+            payload.push(1);
+            push_framed(&mut payload, title.as_bytes());
+            payload.extend_from_slice(&width.to_le_bytes());
+            payload.extend_from_slice(&height.to_le_bytes());
+        }
+    }
+    payload
 }
 
 /// The one-byte tag that opens each field's record in [`EmitSettings::fold_key`].

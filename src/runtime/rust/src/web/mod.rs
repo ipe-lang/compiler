@@ -9842,16 +9842,21 @@ mod base_path_tests {
         icon_side: 512,
     };
 
-    /// The live page under `base` with `install`, as every shell renders it.
+    /// The live page under `base` at `epoch` with `install`, as every shell
+    /// renders it.
     #[allow(clippy::expect_used)] // the default tuning resolves in a clean test env
-    fn page_with(base: &MountBase, install: Option<&super::install::InstallOffer>) -> String {
+    fn page_with(
+        base: &MountBase,
+        epoch: &RenderEpoch,
+        install: Option<&super::install::InstallOffer>,
+    ) -> String {
         super::render_live_page(
             super::client_tuning().as_ref(),
             install,
             "sid1",
             base,
             "<b>x</b>",
-            &page_epoch(),
+            epoch,
             "tok1",
             "",
         )
@@ -9867,8 +9872,9 @@ mod base_path_tests {
             MountBase::root(),
             MountBase::parse("/app").expect("a grammar base"),
         ] {
-            let off = page_with(&base, None);
-            assert_eq!(off, page("sid1", &base, &page_epoch(), "tok1"));
+            let epoch = page_epoch();
+            let off = page_with(&base, &epoch, None);
+            assert_eq!(off, page("sid1", &base, &epoch, "tok1"));
             let head_end = format!("{}</head>", super::base_meta(base.prefix()));
             assert!(off.contains(&head_end), "the head ends at the base meta");
             assert!(!off.contains("rel=\"manifest\""), "no manifest link");
@@ -9888,8 +9894,9 @@ mod base_path_tests {
         ] {
             let meta = super::base_meta(base.prefix());
             let links = super::install::head_links(Some(&offer), &base);
-            let on = page_with(&base, Some(&offer));
-            let off = page_with(&base, None);
+            let epoch = page_epoch();
+            let on = page_with(&base, &epoch, Some(&offer));
+            let off = page_with(&base, &epoch, None);
             assert_eq!(
                 on,
                 off.replacen(

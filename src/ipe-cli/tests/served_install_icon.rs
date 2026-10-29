@@ -45,6 +45,7 @@ const SERVED_APP: &str = "module Main exposing (main)\n\
          \x20       , view = view\n\
          \x20       , subscriptions = subscriptions\n\
          \x20       , routes = []\n\
+         \x20       , notFound = CounterPage\n\
          \x20       }\n";
 
 /// The project-relative icon path the fixtures declare.
@@ -76,11 +77,9 @@ fn build_installable(name: &str, icon: &[u8]) -> Result<(), CliError> {
 fn build_installable_into(name: &str, icon: &[u8]) -> Result<ipe::BuiltFixture, CliError> {
     let tree = ipe::project_root::SourceTree::main(SERVED_APP)
         .field(&format!("icon = {ICON:?}"))
-        .field("delivery = { browser = { installable = True } }");
+        .field("delivery = { browser = { installable = True } }")
+        .file(ICON, icon);
     let fixture = ipe::RootFixture::from_tree(&tree).expect("write the project fixture");
-    let assets = fixture.path().join("assets");
-    std::fs::create_dir_all(&assets).expect("create assets/");
-    std::fs::write(assets.join("icon.png"), icon).expect("write the icon");
     let out = scratch(name).join("out");
     let runtime = e2e_support::require_runtime().into_path_buf();
     ipe::build_fixture(&fixture, &out, &runtime)
@@ -208,11 +207,10 @@ fn an_installable_build_serves_its_manifest_and_icon() {
 #[test]
 #[allow(clippy::expect_used)] // the fixture build IS the subject
 fn a_build_without_install_carries_no_icon() {
-    let tree = ipe::project_root::SourceTree::main(SERVED_APP).field(&format!("icon = {ICON:?}"));
+    let tree = ipe::project_root::SourceTree::main(SERVED_APP)
+        .field(&format!("icon = {ICON:?}"))
+        .file(ICON, &png(512));
     let fixture = ipe::RootFixture::from_tree(&tree).expect("write the project fixture");
-    let assets = fixture.path().join("assets");
-    std::fs::create_dir_all(&assets).expect("create assets/");
-    std::fs::write(assets.join("icon.png"), png(512)).expect("write the icon");
     let out = scratch("served_install_icon_off").join("out");
     let runtime = e2e_support::require_runtime().into_path_buf();
     let built = ipe::build_fixture(&fixture, &out, &runtime).expect("the served app builds");

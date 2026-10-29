@@ -183,7 +183,7 @@ fn png_side(bytes: &[u8]) -> Result<IconSide, IconRefusal> {
 /// The emitted project's icon file, relative to the crate root. The project
 /// writer writes it from [`install_assets`] and the web app leaf names it in
 /// [`register_stmt`]'s `include_bytes!`: one constant, both sides.
-pub(crate) const INSTALL_ICON_FILE: &str = "src/ipe_install_icon.png";
+pub const INSTALL_ICON_FILE: &str = "src/ipe_install_icon.png";
 
 /// The binary files `install` adds to an emitted project: the icon, or none.
 ///
@@ -191,7 +191,7 @@ pub(crate) const INSTALL_ICON_FILE: &str = "src/ipe_install_icon.png";
 ///
 /// [`Diagnostic::CompilerBug`] when a text file of `files` already holds the
 /// icon's path.
-pub(crate) fn install_assets(
+pub fn install_assets(
     install: &ServedInstall,
     files: &BTreeMap<RelPath, String>,
 ) -> DResult<BTreeMap<RelPath, Asset>> {
@@ -220,7 +220,7 @@ pub(crate) fn install_assets(
 /// the offer emits byte-identical Rust.
 ///
 /// The name goes through [`rust_str_lit`]; the icon is never inlined.
-pub(crate) fn register_stmt(install: &ServedInstall) -> String {
+pub fn register_stmt(install: &ServedInstall) -> String {
     match install {
         ServedInstall::Off => String::new(),
         ServedInstall::On { name, icon } => {
