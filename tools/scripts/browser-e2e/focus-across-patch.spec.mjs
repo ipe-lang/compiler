@@ -1,15 +1,18 @@
 /**
  * Playwright refusal spec: a patch never moves keyboard focus.
  *
- * The client rewrites the children of the container a patch targets. A focused
- * node inside it is dropped by that rewrite, and focus falls to `body`, where
- * a key handler bound on an ancestor no longer receives keys. The client
- * records the focused node's position and the server identity (`ipe-id`) of
- * it and of each ancestor at its depth, puts focus back on the nearest node on
- * that path whose whole chain from the container carries the identities and
- * tags recorded for each depth once the swap lands, else on its nearest
- * focusable ancestor, and never reads or writes
- * focus that sits outside the swapped container.
+ * A patch either rewrites the children of the container it targets, dropping a
+ * focused node inside it, or writes an attribute in place that makes the
+ * focused node unfocusable, after which the browser moves focus to `body` on
+ * its own. Either way focus would sit on `body`, where a key handler bound on
+ * an ancestor no longer receives keys. Before each frame the client records
+ * the server identity (`ipe-id`) and tag of the focused node and of each
+ * ancestor below the root; when the frame leaves focus on `body`, at once or
+ * two animation frames later, it puts focus on the deepest node whose whole
+ * chain from the root still carries the recorded identities and tags and that
+ * takes focus, else on the root. Where focus ends depends on the view, never
+ * on the patch the diff chose, and focus the user moved after the frame, or
+ * that sits outside the view, is never read or written.
  *
  * The first mount focuses the root's `autofocus` only while the load's own
  * autofocus is still due; a later frame puts lost focus back, and moves focus
@@ -427,8 +430,9 @@ test("focus-across-patch: a full re-render after the user acted never autofocuse
 });
 
 test("focus-across-patch: a DOM member the browser lacks never stops the client", async ({ page }) => {
-  // The client reads `nextElementSibling` only while putting focus back, and
-  // `createRange` only to parse foreign (SVG, MathML) content.
+  // The client reads `nextElementSibling` only to find a full page's root, and
+  // `createRange` only to parse foreign (SVG, MathML) content; the first
+  // render's swap drops the root's focus, which is put back without either.
   await page.addInitScript(() => {
     delete Element.prototype.nextElementSibling;
     delete Document.prototype.createRange;
@@ -973,4 +977,158 @@ test("focus-across-patch: a key an input method takes is no act of the user's", 
   expect(await recorded(page, pressed)).toBe(true);
   expect(await focusedId(page)).toBe("root");
   events.release();
+});
+
+/** Whether `frame` writes `attr` in place and replaces no node's children. */
+const inPlace = (frame, attr) =>
+  frame.patches.every((p) => p.html === undefined) &&
+  frame.patches.some((p) => p.attrs !== undefined && attr in p.attrs);
+
+/** Whether `frame` replaces the children of the element whose `ipe-id` is `id`. */
+const swaps = (frame, id) => frame.patches.some((p) => p.id === id && typeof p.html === "string");
+
+/**
+ * Focuses `untab` by a click, then presses `key` with the frame it causes held;
+ * returns that frame, still held.
+ */
+async function untabHeld(page, key) {
+  await page.click("#untab");
+  await expect.poll(() => focusedId(page)).toBe("untab");
+  await holdPatches(page);
+  await page.keyboard.press(key);
+  return firstHeld(page);
+}
+
+/** Clicks `selector` with the frame the click causes held; returns that frame. */
+async function clickHeld(page, selector) {
+  await holdPatches(page);
+  await page.click(selector);
+  expect(await focusedId(page)).toBe(selector.slice(1));
+  return firstHeld(page);
+}
+
+/**
+ * Hands the held frames to the client while holding back every animation
+ * frame callback they request, so a test acts between a frame's commit and its
+ * deferred focus check; `runHeldAnimationFrames` lets them run.
+ */
+async function deliverHeldBeforeAnimationFrames(page) {
+  await page.evaluate(() => {
+    const request = window.requestAnimationFrame;
+    window.__testAnimationFrames = [];
+    window.requestAnimationFrame = (callback) => window.__testAnimationFrames.push(callback);
+    window.__ipeLiveFrames.patches = window.__testDeliver;
+    for (const [text, relayed] of window.__testHeld) window.__testDeliver(text, relayed);
+    window.__testHeld = [];
+    window.requestAnimationFrame = request;
+  });
+}
+
+/** Runs the animation frame callbacks held back, then waits two rendering steps. */
+async function runHeldAnimationFrames(page) {
+  await page.evaluate(() => {
+    for (const callback of window.__testAnimationFrames) callback(performance.now());
+    window.__testAnimationFrames = [];
+  });
+  await settle(page);
+}
+
+test("focus-across-patch: an in-place tabindex removal lands focus on the focusable ancestor", async ({ page }) => {
+  await open(page);
+  const frame = await untabHeld(page, "F7");
+  expect(inPlace(frame, "tabindex")).toBe(true);
+  await deliverHeld(page);
+  await expect(page.locator("#untab")).not.toHaveAttribute("tabindex");
+  await expect.poll(() => focusedId(page)).toBe("keephost");
+  await page.keyboard.press("j");
+  await expect(page.locator("#keys")).toHaveText("keys: j");
+});
+
+test("focus-across-patch: a focused button disabled in place lands on the ancestor", async ({ page }) => {
+  await open(page);
+  const frame = await clickHeld(page, "#disableself");
+  expect(inPlace(frame, "disabled")).toBe(true);
+  await deliverHeld(page);
+  await expect(page.locator("#disableself")).toBeDisabled();
+  await expect.poll(() => focusedId(page)).toBe("keephost");
+  await page.keyboard.press("j");
+  await expect(page.locator("#keys")).toHaveText("keys: j");
+});
+
+test("focus-across-patch: an attribute that hides the focused node lands on the ancestor", async ({ page }) => {
+  await open(page);
+  const frame = await clickHeld(page, "#hideself");
+  expect(inPlace(frame, "hidden")).toBe(true);
+  await deliverHeld(page);
+  await expect(page.locator("#hideself")).toBeHidden();
+  await expect.poll(() => focusedId(page)).toBe("keephost");
+  await page.keyboard.press("j");
+  await expect(page.locator("#keys")).toHaveText("keys: j");
+});
+
+test("focus-across-patch: a swap and an in-place patch of the same state end on the same node", async ({ browser }) => {
+  const ends = [];
+  for (const key of ["F7", "F6"]) {
+    // A context of its own: tabs of one context share the model.
+    const ctx = await browser.newContext();
+    const page = await ctx.newPage();
+    await open(page);
+    const host = await page.evaluate(() => document.getElementById("keephost").getAttribute("ipe-id"));
+    const frame = await untabHeld(page, key);
+    expect(key === "F7" ? inPlace(frame, "tabindex") : swaps(frame, host)).toBe(true);
+    await deliverHeld(page);
+    await expect(page.locator("#untab")).not.toHaveAttribute("tabindex");
+    await settle(page);
+    await settle(page);
+    ends.push(await focusedId(page));
+    await ctx.close();
+  }
+  expect(ends).toEqual(["keephost", "keephost"]);
+});
+
+test("focus-across-patch: a click on blank space after a frame keeps focus on the body", async ({ page }) => {
+  await open(page);
+  await page.evaluate(() => {
+    document.body.insertAdjacentHTML("beforeend", '<div id="away">away</div>');
+  });
+  // Chromium drops focus from a button disabled in place only at its next
+  // rendering step, after the commit; a node made untabbable or hidden loses
+  // focus inside the commit, where the keep's first check already lands it.
+  const frame = await clickHeld(page, "#disableself");
+  expect(inPlace(frame, "disabled")).toBe(true);
+  await deliverHeldBeforeAnimationFrames(page);
+  await expect.poll(() => onBody(page)).toBe(true);
+  await page.click("#away");
+  await runHeldAnimationFrames(page);
+  expect(await onBody(page)).toBe(true);
+});
+
+test("focus-across-patch: Tab into the browser chrome after a frame is never undone", async ({ page }) => {
+  await open(page);
+  // Chromium drops focus from a button disabled in place only at its next
+  // rendering step, after the commit; a node made untabbable or hidden loses
+  // focus inside the commit, where the keep's first check already lands it.
+  const frame = await clickHeld(page, "#disableself");
+  expect(inPlace(frame, "disabled")).toBe(true);
+  await deliverHeldBeforeAnimationFrames(page);
+  await expect.poll(() => onBody(page)).toBe(true);
+  // A headless browser has no chrome to tab into: the window's own `blur`,
+  // which focus leaving the document raises, is dispatched from the page.
+  await page.evaluate(() => window.dispatchEvent(new FocusEvent("blur")));
+  await runHeldAnimationFrames(page);
+  expect(await onBody(page)).toBe(true);
+});
+
+test("focus-across-patch: a restore leaves the autofocus spend and the epoch unchanged", async ({ page }) => {
+  await open(page);
+  const frame = await untabHeld(page, "F7");
+  expect(inPlace(frame, "tabindex")).toBe(true);
+  const read = () => page.evaluate(() => [window.__ipeAutofocusSpent, window.__ipeFocusEpoch]);
+  const before = await read();
+  await deliverHeld(page);
+  await expect.poll(() => focusedId(page)).toBe("keephost");
+  expect(await read()).toEqual(before);
+  // The user's next key still moves focus onto the autofocus field it opens.
+  await page.keyboard.press("F2");
+  await expect.poll(() => focusedId(page)).toBe("ask");
 });
