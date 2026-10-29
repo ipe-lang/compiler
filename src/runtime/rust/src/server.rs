@@ -6422,6 +6422,51 @@ mod tests {
         }
     }
 
+    /// Prove the refusals: a literal spelled like a router capture
+    /// (`{id}`, `{{id}}`, `{*rest}`) is a literal, never a capture, so it
+    /// serves only its own text and refuses every other segment.
+    #[tokio::test]
+    #[allow(clippy::expect_used)] // test: fixed patterns parse and fixed requests build
+    async fn a_brace_literal_never_routes_as_a_capture() {
+        use tower::ServiceExt;
+        let mut app = axum::Router::new();
+        for raw in ["/u/{id}", "/v/{{id}}", "/w/%7B%2Arest%7D"] {
+            let pattern = crate::encoding::ServerPattern::parse(raw).expect("well-formed");
+            let path = pattern.router_path().to_owned();
+            app = insert_endpoint(
+                app,
+                &path,
+                method_router(EndpointMethod::Get, pattern, name_echo()),
+                RefusedText::new(raw),
+            )
+            .expect("a brace literal registers as a literal");
+        }
+        let app = behind_listener(app);
+        for (uri, status) in [
+            ("/u/%7Bid%7D", axum::http::StatusCode::OK),
+            ("/u/{id}", axum::http::StatusCode::OK),
+            ("/u/bob", axum::http::StatusCode::NOT_FOUND),
+            ("/u/id", axum::http::StatusCode::NOT_FOUND),
+            ("/v/%7B%7Bid%7D%7D", axum::http::StatusCode::OK),
+            ("/v/{id}", axum::http::StatusCode::NOT_FOUND),
+            ("/v/bob", axum::http::StatusCode::NOT_FOUND),
+            ("/w/%7B*rest%7D", axum::http::StatusCode::OK),
+            ("/w/a", axum::http::StatusCode::NOT_FOUND),
+            ("/w/a/b", axum::http::StatusCode::NOT_FOUND),
+        ] {
+            let wire = axum::http::Request::builder()
+                .method("GET")
+                .uri(uri)
+                .body(axum::body::Body::empty())
+                .expect("test request builds");
+            let resp = match app.clone().oneshot(wire).await {
+                Ok(r) => r,
+                Err(e) => match e {},
+            };
+            assert_eq!(resp.status(), status, "{uri}");
+        }
+    }
+
     /// The listener refuses an `IPE_WEB_FRAME_ANCESTORS` with no
     /// `frame-ancestors` representation before it binds. The value is read
     /// once per process, so the check runs in a child holding it.
