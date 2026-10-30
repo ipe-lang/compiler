@@ -29257,7 +29257,7 @@ impl<'a> Lowerer<'a> {
             Callee::Kernel(
                 // `Ui.none : Element msg`
                 KernelFn::UiNone
-                // `UiCells.none : Cells msg`
+                // `UiCells.none : Screen msg`
                 | KernelFn::UiCellsNone
                 // `Ipe.Ui.Tui` nullary cell-native attributes.
                 | KernelFn::TuiUiAlignLeft
@@ -29408,9 +29408,9 @@ impl<'a> Lowerer<'a> {
                 | KernelFn::UiHtml
                 // `Ui.cells : List (List Char) -> Element msg`
                 | KernelFn::UiCells
-                // `UiCells.text : String -> Cells msg`
+                // `UiCells.text : String -> Screen msg`
                 | KernelFn::UiCellsText
-                // `UiCells.cells : List (List Char) -> Cells msg`
+                // `UiCells.cells : List (List Char) -> Screen msg`
                 | KernelFn::UiCellsCells
                 // `Ipe.Ui.Tui` arity-1 cell-native attributes.
                 | KernelFn::TuiUiSpacing
@@ -29682,11 +29682,11 @@ impl<'a> Lowerer<'a> {
                 // `Store.select` — arity 2 (projection lambda, joined), intercepted
                 // at lowering; this is only the defensive fallback count.
                 | KernelFn::StoreSelect
-                // `UiCells.el : List (Attribute msg) -> Cells msg -> Cells msg`
+                // `UiCells.el : List (Attribute msg) -> Screen msg -> Screen msg`
                 | KernelFn::UiCellsEl
-                // `UiCells.row : List (Attribute msg) -> List (Cells msg) -> Cells msg`
+                // `UiCells.row : List (Attribute msg) -> List (Screen msg) -> Screen msg`
                 | KernelFn::UiCellsRow
-                // `UiCells.column : List (Attribute msg) -> List (Cells msg) -> Cells msg`
+                // `UiCells.column : List (Attribute msg) -> List (Screen msg) -> Screen msg`
                 | KernelFn::UiCellsColumn
                 // `Cli.Ui.line : List (Attribute msg) -> String -> Lines msg`
                 | KernelFn::CliUiLine,
@@ -40524,7 +40524,7 @@ mod tests {
 
     /// Each value container the lowerer handles has a hardcoded `args.len() == N`
     /// guard. This test asserts those N values equal the canonical gate
-    /// `builtin_empty_home_arity`, so a future gate change that misses a lowerer
+    /// fixed arity of the row the IPE-N0031 canon gate enforces, so a future gate change that misses a lowerer
     /// arm fails here instead of silently diverging.
     #[test]
     fn lowerer_container_arities_match_gate() {
@@ -40537,11 +40537,10 @@ mod tests {
             ("Result", 2),
         ];
         for (name, lowerer_arity) in lowerer_guards {
-            let gate_arity = ipe_canon::builtin_empty_home_arity(Some(name));
-            assert!(
-                gate_arity.is_some(),
-                "{name} must have a gate arity in builtin_empty_home_arity"
-            );
+            let gate_arity = ipe_kernels::BuiltinType::of_bare_name(name)
+                .and_then(|row| row.row().fixed_arity())
+                .map(usize::from);
+            assert!(gate_arity.is_some(), "{name} must have a fixed gate arity");
             if let Some(gate_arity) = gate_arity {
                 assert_eq!(
                     gate_arity, *lowerer_arity,
@@ -40549,6 +40548,101 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The type arguments a canon use of `row` carries at its declared params;
+    /// an engine-tagged carrier (`View`, `Program`) leads with the `Web` tag,
+    /// the only first-argument shape canon admits there.
+    fn declared_args(row: &ipe_kernels::BuiltinRow, web: Symbol) -> Vec<canon::Type> {
+        let count = match row.params() {
+            ipe_kernels::TypeParams::Exact(n) => usize::from(n),
+            ipe_kernels::TypeParams::OptionalMessage | ipe_kernels::TypeParams::InferredCarrier => {
+                1
+            }
+        };
+        let mut args = vec![canon::Type::Unit; count];
+        if matches!(
+            row.tag(),
+            Some(ipe_kernels::BuiltinTag::View | ipe_kernels::BuiltinTag::Program)
+        ) && let Some(first) = args.first_mut()
+        {
+            *first = canon::Type::Con {
+                home: vec![],
+                name: web,
+                args: vec![],
+            };
+        }
+        args
+    }
+
+    /// Every user-nameable empty-home builtin row lowers from canon at its
+    /// declared params without reaching the empty-home catch-all (IPE-I0001):
+    /// canon admits each such head, so the lowerer must map it or refuse it
+    /// with a typed limit, never an internal-compiler-error.
+    #[test]
+    #[allow(clippy::panic)] // test assertion: a failed intern IS the failure
+    fn every_reserved_empty_home_row_lowers_without_a_compiler_bug() {
+        let mut interner = Interner::new();
+        let builtins = build_test_builtin_ctors(&mut interner);
+        let Ok(web) = interner.intern("Web") else {
+            panic!("interning the engine tag failed");
+        };
+        let mut heads = Vec::new();
+        for row in ipe_kernels::BUILTIN_TYPES {
+            if row.role() == ipe_kernels::BuiltinRole::Reserved
+                && row.home() == ipe_kernels::KernelHome::Builtin
+                && let Ok(sym) = interner.intern(row.name())
+            {
+                heads.push((row, sym));
+            }
+        }
+        let module = canon::Module {
+            imports_unsafe_submodule: false,
+            imported_web_capabilities: BTreeSet::new(),
+            name: vec![],
+            unions: vec![],
+            defs: vec![],
+        };
+        let types = empty_solved_types();
+        let lowerer = Lowerer::new(
+            &module,
+            &types,
+            &interner,
+            SymbolPools {
+                eta_params: vec![],
+                cap_params: vec![],
+                param_binders: vec![],
+                any_param_binders: vec![],
+                projection_decode_binders: vec![],
+                destructure_thunk_binders: vec![],
+                nested_cons_binders: vec![],
+                nested_strlit_binders: vec![],
+                tuple_elem_binders: vec![],
+                wildcard_marker: super::WildcardMarker(ipe_intern::Symbol::from_raw(u32::MAX)),
+            },
+            &builtins,
+            "",
+            "",
+        );
+        let bugs: Vec<&str> = heads
+            .iter()
+            .filter(|(row, sym)| {
+                let ty = canon::Type::Con {
+                    home: vec![],
+                    name: *sym,
+                    args: declared_args(row, web),
+                };
+                matches!(
+                    lowerer.ir_type_from_canon(&ty, &[]),
+                    Err(ipe_diagnostics::Diagnostic::CompilerBug { .. })
+                )
+            })
+            .map(|(row, _)| row.name())
+            .collect();
+        assert!(
+            bugs.is_empty(),
+            "reserved empty-home rows reach the lowerer's catch-all: {bugs:?}"
+        );
     }
 
     /// A `let` chain `x0 = 0`, `x(k+1) = \_ -> xk`, `k` bindings deep,

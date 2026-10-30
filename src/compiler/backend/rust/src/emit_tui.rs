@@ -69,7 +69,7 @@ pub fn emit_tui_call(
     match k {
         // ── Tui.tea { init, update, view, subscriptions } ─
         //
-        // view : Model -> Cells Msg
+        // view : Model -> Screen Msg
         // Runtime entry: `ipe_runtime::tui::tui_app_ui(init, update, view, subs)`
         KernelFn::TerminalAppScreen => {
             let [cfg_e] = args else {

@@ -1130,6 +1130,133 @@ fn canon_open_imports_bare_ctor_use_is_ambiguous() {
     assert_rejected("canon_open_bare_ctor_ambiguous", &src, "IPE-N0024");
 }
 
+/// Every spelling of a builtin type head reaches its row: the import that
+/// brings it in, the annotation that uses it, a legal and a mis-arity type
+/// argument list.
+const BUILTIN_WITNESS_SPELLINGS: &[(&str, &str, &str, &str, &str)] = &[
+    (
+        "exposed_ui_element",
+        "import Ipe.Ui exposing (Element)",
+        "Element",
+        "Int",
+        "Int Int",
+    ),
+    (
+        "qualified_ui_element",
+        "import Ipe.Ui as Ui",
+        "Ui.Element",
+        "Int",
+        "Int Int",
+    ),
+    (
+        "qualified_ui_attribute",
+        "import Ipe.Ui as Ui",
+        "Ui.Attribute",
+        "Int",
+        "Int Int",
+    ),
+    (
+        "qualified_html_attribute",
+        "import Ipe.Html.Attributes as Attr",
+        "Attr.Attribute",
+        "Int",
+        "Int Int",
+    ),
+    (
+        "exposed_html_attribute",
+        "import Ipe.Html.Attributes exposing (Attribute)",
+        "Attribute",
+        "Int",
+        "Int Int",
+    ),
+    (
+        "qualified_tui_screen",
+        "import Ipe.Ui.Tui as Tui",
+        "Tui.Screen",
+        "Int",
+        "Int Int",
+    ),
+    (
+        "qualified_cli_lines",
+        "import Ipe.Ui.Cli as Cli",
+        "Cli.Lines",
+        "Int",
+        "Int Int",
+    ),
+    (
+        "qualified_path",
+        "import Ipe.Path as P",
+        "P.Path",
+        "",
+        "Int",
+    ),
+    (
+        "qualified_dict",
+        "import Ipe.Dict as Dict",
+        "Dict.Dict",
+        "Int Int",
+        "Int",
+    ),
+    (
+        "exposed_dict",
+        "import Ipe.Dict exposing (Dict)",
+        "Dict",
+        "Int Int",
+        "Int",
+    ),
+    (
+        "qualified_color",
+        "import Ipe.Color as C",
+        "C.Color",
+        "",
+        "Int",
+    ),
+];
+
+/// The program annotating `f` with `head args`, behind `import`.
+fn builtin_witness_program(import: &str, head: &str, args: &str) -> String {
+    format!(
+        "{HEAD}\nimport Ipe.Io as Io\n{import}\n\n\
+         f : ({head} {args}) -> Int\nf _ =\n    0\n\n\
+         main = Io.println \"ok\"\n"
+    )
+}
+
+/// A builtin head applied to a count its row does not admit is IPE-N0031,
+/// however the head is spelled: re-exported at a module home, or qualified
+/// by a source module.
+#[test]
+fn builtin_witness_mis_arity_is_refused_under_every_spelling() {
+    for (case, import, head, _legal, wrong) in BUILTIN_WITNESS_SPELLINGS {
+        let src = builtin_witness_program(import, head, wrong);
+        assert_rejected(&format!("builtin_witness_wrong_{case}"), &src, "IPE-N0031");
+    }
+}
+
+/// The contrapositive: each spelling at its row's count compiles.
+#[test]
+fn builtin_witness_legal_arity_compiles_under_every_spelling() {
+    for (case, import, head, legal, _wrong) in BUILTIN_WITNESS_SPELLINGS {
+        let src = builtin_witness_program(import, head, legal);
+        assert_compiles(&format!("builtin_witness_legal_{case}"), &src);
+    }
+}
+
+/// `Cells` names no type: the Tui view type is `Screen`.
+#[test]
+fn builtin_witness_cells_is_not_a_type() {
+    let src = builtin_witness_program("", "Cells", "Int");
+    assert_rejected("builtin_witness_cells", &src, "IPE-N0002");
+}
+
+/// A kernel qualifier that does not export a view alias name does not alias
+/// it: `Http.Element` is IPE-N0005.
+#[test]
+fn builtin_witness_view_alias_needs_its_export() {
+    let src = builtin_witness_program("import Ipe.Http as Http", "Http.Element", "Int");
+    assert_rejected("builtin_witness_kernel_view_alias", &src, "IPE-N0005");
+}
+
 /// The open-import sweep: one program opens every compiled-source stdlib module
 /// a plain `main` may import, and compiles, so no stdlib type or constructor
 /// addition can reject an open importer that does not use the name.
@@ -1398,6 +1525,36 @@ fn canon_open_imports_tui_and_cells_share_column_and_compile() {
     assert_compiles("canon_open_tui_cells_column", &src);
 }
 
+/// `Ipe.Ui.Cells` re-exports the `Attribute` it imports from `Ipe.Ui.Tui`, so
+/// a re-export carries the definition's home: open imports of both modules
+/// bind one `Attribute`, and a bare `Attribute Msg` annotation resolves
+/// without IPE-N0024.
+#[test]
+fn canon_open_imports_tui_and_cells_share_attribute_and_compile() {
+    let mut src = HEAD.to_owned();
+    src.push_str(
+        "\nimport Ipe.Tea.Tui as Tui\n\
+         import Ipe.Ui.Tui exposing (..)\n\
+         import Ipe.Ui.Cells exposing (..)\n\
+         import Ipe.Tea.Tui.Cmd\n\
+         import Ipe.Tea.Tui.Sub\n\n\
+         type Msg = NoOp\n\n\
+         type alias Model = { count : Int }\n\n\
+         attrs : List (Attribute Msg)\n\
+         attrs =\n    []\n\n\
+         init : () -> ( Model, Cmd Msg )\n\
+         init _unit =\n    ( { count = 0 }, Cmd.none )\n\n\
+         update : Msg -> Model -> ( Model, Cmd Msg )\n\
+         update _msg model =\n    ( model, Cmd.none )\n\n\
+         view : Model -> Screen Msg\n\
+         view _model =\n    column attrs []\n\n\
+         subscriptions : Model -> Sub Msg\n\
+         subscriptions _model =\n    Sub.none\n\n\
+         main =\n    Tui.tea\n        { init = init, update = update, view = view\n        , subscriptions = subscriptions\n        }\n",
+    );
+    assert_compiles("canon_open_tui_cells_attribute", &src);
+}
+
 /// The shape app-leaf names (`WebApp` / `TuiApp` / `CliApp`) are
 /// deliberately NOT reserved — a user program may soundly declare
 /// `type WebApp = …` and use it, and the lowerer's empty-home guard keeps that
@@ -1455,12 +1612,12 @@ fn canon_custom_element_use_resolves_and_lowers() {
     assert_compiles("canon_custom_element_use", &src);
 }
 
-/// A QUALIFIED spelling of the boundary type (`D.CustomElement …` through an
-/// imported module) is checked by NAME regardless of its non-empty home: the
-/// arity + SEAL gates pass for two primitives, so it too type-RESOLVES at canon
-/// and now lowers — never slipping past a home gate into a build-time ICE.
+/// A QUALIFIED spelling of the boundary type through a module that does not
+/// export it (`D.CustomElement …` with `D` = `Ipe.Dict`) names no type: no
+/// module exports `CustomElement`, so the use is IPE-N0005, never the row
+/// minted at a home that does not declare it.
 #[test]
-fn canon_custom_element_qualified_use_resolves_and_lowers() {
+fn canon_custom_element_qualified_through_a_non_exporter_is_no_such_member() {
     let src = format!(
         "{HEAD}import Ipe.Dict as D\n\
          import Ipe.Io as Io\n\
@@ -1470,7 +1627,7 @@ fn canon_custom_element_qualified_use_resolves_and_lowers() {
          main =\n\
          \x20   Io.println \"ok\"\n"
     );
-    assert_compiles("canon_custom_element_qualified", &src);
+    assert_rejected("canon_custom_element_qualified", &src, "IPE-N0005");
 }
 
 /// The boundary SEAL accepts plain, closed, concrete value types transitively:

@@ -14,7 +14,8 @@ use ipe_diagnostics::{
 };
 use ipe_intern::{Interner, Symbol, SynthStem};
 use ipe_kernels::{
-    AppSurface, BuiltinRow, BuiltinType, SealClass, StdlibKernel, TypeParams, WebCapability,
+    AppSurface, BuiltinRow, BuiltinTag, BuiltinType, SealClass, StdlibKernel, TypeParams,
+    WebCapability,
 };
 use ipe_syntax as src;
 use ipe_syntax::BinOp;
@@ -26,8 +27,8 @@ use crate::env::{
     KernelTypeExport, ModuleIdentity, QualifierClaim, TeaShape, VarHome,
 };
 use crate::scope::{
-    AliasBody, Clash, ExprTarget, Identity, ModuleScope, Origin, Resolved, Tier,
-    TypeTarget as ScopeType, ValueIdentity,
+    AliasBody, BoundBuiltin, Clash, ExprTarget, Identity, ModuleScope, Origin, QualifiedType,
+    Resolved, Tier, TypeTarget as ScopeType, ValueIdentity,
 };
 
 /// The most `did you mean` names attached to an unresolved name, so a wall of
@@ -139,17 +140,6 @@ pub fn is_reserved_builtin_type_name(name: &str) -> bool {
 #[must_use]
 pub fn is_user_type_declaration_forbidden(name: &str) -> bool {
     bare_builtin(name).is_some_and(|row| row.role().forbids_user_declaration())
-}
-
-/// The exact type-argument count of the empty-home builtin spelled `name`, or
-/// `None` when its row takes an optional message or an inference-counted
-/// argument, or no empty-home row has the name.
-///
-/// The count is the row's [`BuiltinRow::fixed_arity`], the one the IPE-N0031
-/// canon gate enforces on every use resolved to the row.
-#[must_use]
-pub fn builtin_empty_home_arity(name: Option<&str>) -> Option<usize> {
-    bare_builtin(name?)?.fixed_arity().map(usize::from)
 }
 
 /// The boundary-seal legality check over a canonicalised type (§2.1). Returns
@@ -759,6 +749,26 @@ pub fn canonicalise_module_in_project(
         let Some(dep) = deps.get(path) else {
             continue;
         };
+        // The dep's exported types: a known export set lets a qualified
+        // reserved name the dep does not export be refused rather than minted
+        // at the qualifier's home.
+        let types: BTreeMap<Symbol, QualifiedType> = dep
+            .types
+            .iter()
+            .map(|(&name, exported)| {
+                let target = match exported {
+                    crate::ExportedType::Builtin { home, row } => {
+                        QualifiedType::Builtin(BoundBuiltin {
+                            row: *row,
+                            home: home.clone(),
+                        })
+                    }
+                    crate::ExportedType::Union { .. } => QualifiedType::Union,
+                };
+                (name, target)
+            })
+            .collect();
+        Rc::make_mut(&mut env.qualified_types).insert(qualifier, types);
         // Every exported alias of the dep registers under a synthetic
         // `Qualifier.Name` key so a qualified annotation (`Money.Price`)
         // expands the alias exactly as an `exposing`-injected one would; the
@@ -2166,7 +2176,7 @@ fn kernel_type_origin(
             span,
         ),
         KernelTypeExport::Builtin(builtin) => imported(
-            ScopeType::Builtin(*builtin),
+            ScopeType::Builtin(BoundBuiltin::at_empty_home(*builtin)),
             Identity::Type(Vec::new()),
             importer,
             span,
@@ -2528,6 +2538,12 @@ fn bind_html_type_home(
     if env.module_scope.ty.eager_bound(name) {
         return Ok(());
     }
+    let row = BuiltinType::of_bare_name(name_str(interner, name)?.as_ref()).ok_or_else(|| {
+        Diagnostic::CompilerBug {
+            where_: "ipe_canon::bind_html_type_home",
+            detail: "a home-sensitive builtin type name has no builtin row".into(),
+        }
+    })?;
     let home = vec![html_sym];
     let importers = if importer.is_empty() {
         BTreeSet::new()
@@ -2535,7 +2551,10 @@ fn bind_html_type_home(
         BTreeSet::from([importer.to_vec()])
     };
     let origin = Origin {
-        target: ScopeType::Union(home.clone()),
+        target: ScopeType::Builtin(BoundBuiltin {
+            row,
+            home: home.clone(),
+        }),
         identity: Identity::Type(home),
         importers,
         span,
@@ -4377,14 +4396,15 @@ fn bind_dep_value(
 
 /// The scope target of a type a dependency exports.
 ///
-/// A re-exported builtin at the empty home is its row, never a union: the
-/// row carries the arity gate and the empty home only a builtin mints.
+/// A re-exported builtin is its row at the home the export records, never a
+/// union: the row carries the arity gate, whatever home the use mints.
 fn dep_type_target(exported: &crate::ExportedType) -> ScopeType {
     match exported {
-        crate::ExportedType::Builtin { home, row } if home.is_empty() => ScopeType::Builtin(*row),
-        crate::ExportedType::Union { home, .. } | crate::ExportedType::Builtin { home, .. } => {
-            ScopeType::Union(home.clone())
-        }
+        crate::ExportedType::Builtin { home, row } => ScopeType::Builtin(BoundBuiltin {
+            row: *row,
+            home: home.clone(),
+        }),
+        crate::ExportedType::Union { home, .. } => ScopeType::Union(home.clone()),
     }
 }
 
@@ -4641,6 +4661,25 @@ fn inject_dep_exports(
     Ok(())
 }
 
+/// The home of the import binding `name` re-exports, when `name` is bound to
+/// `row` by an import.
+///
+/// A re-export names the definition it imported, so two modules exposing one
+/// imported row (`Ipe.Ui.Cells` re-exporting `Ipe.Ui.Tui`'s `Screen`) export
+/// one identity, and an open import of both is one binding, never an
+/// ambiguity.
+fn imported_builtin_home(env: &Env, name: Symbol, row: BuiltinType) -> Option<Vec<Symbol>> {
+    match env.module_scope.ty.resolve(name) {
+        Resolved::Found(origin, Tier::Explicit | Tier::Open) => match &origin.target {
+            ScopeType::Builtin(bound) if bound.row == row => Some(bound.home.clone()),
+            ScopeType::Builtin(_) | ScopeType::Union(_) | ScopeType::Alias(_) => None,
+        },
+        Resolved::Found(_, Tier::Local | Tier::Ambient)
+        | Resolved::Ambiguous { .. }
+        | Resolved::Missing => None,
+    }
+}
+
 /// The type home a compiled-source stdlib module records for a
 /// reserved builtin TYPE it re-exports (`Ipe.Ui exposing (Attribute)`,
 /// `Ipe.Html exposing (Attribute)`, `Ipe.Path exposing (Path)`).
@@ -4771,8 +4810,10 @@ fn build_module_exports(
                             // (Attribute)`. Record it so an importer's `exposing
                             // (T)` resolves instead of failing `NameNotExposed`; no
                             // constructors (a builtin carrier has none at source).
-                            let builtin_home =
-                                reexported_builtin_type_home(resolved, home, interner);
+                            let builtin_home = imported_builtin_home(env, *type_name, row)
+                                .unwrap_or_else(|| {
+                                    reexported_builtin_type_home(resolved, home, interner)
+                                });
                             exports.types.insert(
                                 *type_name,
                                 crate::ExportedType::Builtin {
@@ -6451,8 +6492,9 @@ enum TypeName<'a> {
     Union(Vec<Symbol>),
     /// Two open imports bring in the name from distinct homes.
     Ambiguous { modules: SortedNames },
-    /// An empty-home builtin row, bound by a kernel import or reserved.
-    Builtin(BuiltinType),
+    /// A builtin row with the home its use mints, bound by an import or
+    /// reserved.
+    Builtin(BoundBuiltin),
     /// No tier binds the name.
     Missing,
 }
@@ -6473,7 +6515,7 @@ fn resolve_unqualified_type_name<'a>(
             Resolved::Found(origin, _) => {
                 return Ok(match &origin.target {
                     ScopeType::Union(home) => TypeName::Union(home.clone()),
-                    ScopeType::Builtin(builtin) => TypeName::Builtin(*builtin),
+                    ScopeType::Builtin(builtin) => TypeName::Builtin(builtin.clone()),
                     ScopeType::Alias(AliasBody::Local { params, body }) => {
                         TypeName::Alias(ResolvedAlias::Local { params, body })
                     }
@@ -6495,7 +6537,11 @@ fn resolve_unqualified_type_name<'a>(
         name,
         "ipe_canon::resolve_unqualified_type_name",
     )?;
-    Ok(BuiltinType::of_bare_name(name_s).map_or(TypeName::Missing, TypeName::Builtin))
+    Ok(
+        BuiltinType::of_bare_name(name_s).map_or(TypeName::Missing, |row| {
+            TypeName::Builtin(BoundBuiltin::at_empty_home(row))
+        }),
+    )
 }
 
 /// The IPE-N0002 for a bare type name no tier binds, ranked over every type
@@ -6524,15 +6570,10 @@ fn type_not_found(name: Symbol, ctx: &TypeCtx) -> DResult<Diagnostic> {
 enum TypeTarget<'a> {
     /// An alias to expand, with the key a recursive use is tracked under.
     Alias(Symbol, ResolvedAlias<'a>),
-    /// A builtin row, minted at the empty home its kernel schemes use.
-    Builtin(BuiltinType),
+    /// A builtin row, minted at the home its binding carries.
+    Builtin(BoundBuiltin),
     /// A union declared at a module home.
     Union(UnionHome),
-}
-
-/// The empty home of a builtin head; only a builtin witness mints it.
-const fn builtin_home(_witness: BuiltinType) -> Vec<Symbol> {
-    Vec::new()
 }
 
 /// The home of a union: a module path, never the empty builtin home.
@@ -6606,6 +6647,67 @@ fn kernel_type_export<'a>(
             )),
         },
     })
+}
+
+/// What a source-module-qualified type reference `qualifier.name` resolves to.
+///
+/// A builtin the qualifier's dependency re-exports is its row at the export's
+/// home. Otherwise an exported alias expands through its synthetic key. A
+/// reserved builtin name the dependency does not export is IPE-N0005: it would
+/// otherwise mint the row's name at a home no module declares it under; under
+/// a qualifier whose exports are unknown (an Html fold) it is the row at the
+/// qualifier's home. Any other name is a union of the module.
+///
+/// # Errors
+/// [`NameError::NoSuchMember`] (IPE-N0005) for a reserved builtin name the
+/// dependency does not export; [`Diagnostic::CompilerBug`] when a symbol is
+/// not interned or the qualifier has no path.
+fn source_qualified_type<'a>(
+    qualifier: Symbol,
+    qualifier_str: &str,
+    name: Symbol,
+    ctx: &TypeCtx<'a>,
+    visited: &[Symbol],
+) -> DResult<TypeTarget<'a>> {
+    let exports = ctx.env.qualified_types.get(&qualifier);
+    let exported = exports.and_then(|types| types.get(&name));
+    if let Some(QualifiedType::Builtin(bound)) = exported {
+        return Ok(TypeTarget::Builtin(bound.clone()));
+    }
+    if let Some(alias_key) =
+        alias_lookup_key(qualifier_str, name, ctx.qualified_aliases, ctx.interner)?
+        && !visited.contains(&alias_key)
+        && let Some(alias) = ctx.qualified_aliases.get(&alias_key)
+    {
+        return Ok(TypeTarget::Alias(alias_key, ResolvedAlias::Imported(alias)));
+    }
+    let name_s = resolve_or_bug(ctx.interner, name, "ipe_canon::source_qualified_type")?;
+    // Only a reserved row is a builtin under every home; a row lowered below
+    // the union guard (`Basics.Order`) stays the module's union, as a user
+    // declaration of the name would be.
+    let reserved =
+        BuiltinType::of_bare_name(name_s).filter(|row| row.row().role().forbids_user_declaration());
+    match (reserved, exports, exported) {
+        (Some(_), Some(types), None) => Err(Diagnostic::Name {
+            span: ctx.ann_span,
+            msg: NameError::NoSuchMember {
+                module: name_str(ctx.interner, qualifier)?,
+                member: name_s.into(),
+                suggestions: Candidates::hints(ranked_names(
+                    name_s,
+                    Shape::Flat,
+                    types.keys().filter_map(|sym| ctx.interner.resolve(*sym)),
+                )),
+            },
+        }),
+        (Some(row), None, _) => Ok(TypeTarget::Builtin(BoundBuiltin {
+            row,
+            home: qualified_type_home(qualifier, name, ctx)?,
+        })),
+        (Some(_), Some(_), Some(_)) | (None, _, _) => Ok(TypeTarget::Union(UnionHome::of(
+            qualified_type_home(qualifier, name, ctx)?,
+        )?)),
+    }
 }
 
 /// The IPE-N0024 for a bare name two imports bring in from distinct homes.
@@ -6980,6 +7082,45 @@ fn canonicalise_type(
                     ctx.interner,
                 )?);
             }
+            // Resolve the reference once, before its arguments: an alias
+            // expands in place, a union yields its home, a builtin its row at
+            // the home its binding carries. A bare name goes through the one
+            // precedence ladder (`resolve_unqualified_type_name`). A
+            // kernel-module qualifier (`Http.HttpResponse`) reads that module's
+            // type exports, and a miss is IPE-N0005. A source-module qualifier
+            // reads its dependency's exports: a re-exported builtin is its row,
+            // a reserved name the dependency does not export is IPE-N0005, an
+            // alias expands through its synthetic key, and any other name is a
+            // union of the module.
+            let target = if qualifier_str.is_empty() {
+                match resolve_unqualified_type_name(name, ctx, visited)? {
+                    TypeName::Alias(alias) => TypeTarget::Alias(name, alias),
+                    TypeName::Union(home) => TypeTarget::Union(UnionHome::of(home)?),
+                    TypeName::Builtin(builtin) => TypeTarget::Builtin(builtin),
+                    TypeName::Ambiguous { modules } => {
+                        return Err(ambiguous_import(name, ctx.ann_span, modules, ctx.interner)?);
+                    }
+                    TypeName::Missing => return Err(type_not_found(name, ctx)?),
+                }
+            } else if let Some(module) = kernel_qualifier_owner(*qualifier, ctx.env) {
+                // A kernel alias body is a closed builtin tree, so its
+                // expansion never meets the alias again: its use-site name is
+                // a sufficient cycle key.
+                match kernel_type_export(module, *qualifier, name, ctx)? {
+                    KernelTypeExport::Alias(exported) => {
+                        TypeTarget::Alias(name, ResolvedAlias::Imported(exported))
+                    }
+                    KernelTypeExport::Builtin(builtin) => {
+                        TypeTarget::Builtin(BoundBuiltin::at_empty_home(*builtin))
+                    }
+                }
+            } else {
+                source_qualified_type(*qualifier, qualifier_str, name, ctx, visited)?
+            };
+            let tag = match &target {
+                TypeTarget::Builtin(bound) => bound.row.row().tag(),
+                TypeTarget::Union(_) | TypeTarget::Alias(..) => None,
+            };
             // `View engine msg` — the engine-tagged view carrier and SSOT view
             // surface. It canonicalises to a real 2-argument `Con(View, [engine
             // tag, msg])` that survives into inference: the engine tag is a
@@ -6995,8 +7136,7 @@ fn canonicalise_type(
             // denotation and is rejected fail-closed as an unresolved type name.
             // Only the `msg` argument is a real type, canonicalised with the
             // current parameters in scope.
-            if qualifier_str.is_empty()
-                && ctx.interner.resolve(name) == Some("View")
+            if tag == Some(BuiltinTag::View)
                 && args.len() == 2
                 && let Some(src::TypeAnnotation::TType(engine_qual, engine_segs, engine_args)) =
                     args.first()
@@ -7058,10 +7198,10 @@ fn canonicalise_type(
             // combinator schemes yield, with no parallel surface: the alias and
             // the carrier are one canonical type. The public module-qualified
             // spellings a user writes (`Ui.Element`, the terminal `Screen` /
-            // `Lines` equivalents) alias identically: each name is a RESERVED
-            // builtin no user module can declare, so the qualifier cannot name a
-            // different type, and an unknown qualifier is already turned away by
-            // the qualifier gate above. The bare arity-0 form (`view : Element`)
+            // `Lines` equivalents) alias identically: the use resolved to the
+            // row above, so only a spelling bound to the row aliases, and a
+            // qualifier whose module does not export the name was already
+            // refused. The bare arity-0 form (`view : Element`)
             // is an alias too: its implicit message parameter arity-fills with
             // the `any` wildcard right here, so it canonicalises to the same
             // `View <engine> any` carrier the arity-1 form yields — never a
@@ -7069,10 +7209,10 @@ fn canonicalise_type(
             // combinators produce. Only the arity-0 and arity-1 forms are
             // aliases; a mis-arity use falls through.
             if args.len() <= 1
-                && let Some(engine_name) = match ctx.interner.resolve(name) {
-                    Some("Element") => Some("Web"),
-                    Some("Screen") => Some("Tui"),
-                    Some("Lines") => Some("Cli"),
+                && let Some(engine_name) = match tag {
+                    Some(BuiltinTag::UiElement) => Some("Web"),
+                    Some(BuiltinTag::Cells) => Some("Tui"),
+                    Some(BuiltinTag::CliLines) => Some("Cli"),
                     _ => None,
                 }
             {
@@ -7132,49 +7272,13 @@ fn canonicalise_type(
                     depth.saturating_add(1),
                 )?);
             }
-            // Resolve the reference once: an alias expands in place, a union
-            // yields its home, a builtin the empty home. A bare name goes
-            // through the one precedence ladder (`resolve_unqualified_type_name`).
-            // A kernel-module qualifier (`Http.HttpResponse`) reads that module's
-            // type exports, and a miss is IPE-N0005. A source-module qualifier
-            // (`Money.Price`) expands the module's alias through its synthetic
-            // key, and otherwise names a union of the module.
-            let target = if qualifier_str.is_empty() {
-                match resolve_unqualified_type_name(name, ctx, visited)? {
-                    TypeName::Alias(alias) => TypeTarget::Alias(name, alias),
-                    TypeName::Union(home) => TypeTarget::Union(UnionHome::of(home)?),
-                    TypeName::Builtin(builtin) => TypeTarget::Builtin(builtin),
-                    TypeName::Ambiguous { modules } => {
-                        return Err(ambiguous_import(name, ctx.ann_span, modules, ctx.interner)?);
-                    }
-                    TypeName::Missing => return Err(type_not_found(name, ctx)?),
-                }
-            } else if let Some(module) = kernel_qualifier_owner(*qualifier, ctx.env) {
-                // A kernel alias body is a closed builtin tree, so its
-                // expansion never meets the alias again: its use-site name is
-                // a sufficient cycle key.
-                match kernel_type_export(module, *qualifier, name, ctx)? {
-                    KernelTypeExport::Alias(exported) => {
-                        TypeTarget::Alias(name, ResolvedAlias::Imported(exported))
-                    }
-                    KernelTypeExport::Builtin(builtin) => TypeTarget::Builtin(*builtin),
-                }
-            } else if let Some(alias_key) =
-                alias_lookup_key(qualifier_str, name, ctx.qualified_aliases, ctx.interner)?
-                && !visited.contains(&alias_key)
-                && let Some(exported) = ctx.qualified_aliases.get(&alias_key)
-            {
-                TypeTarget::Alias(alias_key, ResolvedAlias::Imported(exported))
-            } else {
-                TypeTarget::Union(UnionHome::of(qualified_type_home(*qualifier, name, ctx)?)?)
-            };
-            let builtin = match target {
-                TypeTarget::Builtin(builtin) => Some(builtin),
+            let builtin = match &target {
+                TypeTarget::Builtin(bound) => Some(bound.row),
                 TypeTarget::Union(_) | TypeTarget::Alias(..) => None,
             };
             let home = match target {
                 TypeTarget::Union(home) => home.into_vec(),
-                TypeTarget::Builtin(builtin) => builtin_home(builtin),
+                TypeTarget::Builtin(bound) => bound.home,
                 // An alias not already mid-expansion (cycle) is expanded. Arity
                 // must match exactly — a type alias has to be fully applied.
                 TypeTarget::Alias(alias_key, alias) => {
@@ -7317,7 +7421,7 @@ fn canonicalise_type(
             //
             // On passing both, the type resolves to a `Con` with the empty-home
             // sentinel and lowers to the opaque widget handle.
-            if ctx.interner.resolve(name) == Some("CustomElement") {
+            if tag == Some(BuiltinTag::CustomElement) {
                 for arg in &can_args {
                     if let Some(reason) = boundary_seal_rejection(arg, ctx.interner) {
                         return Err(Diagnostic::Name {
@@ -7396,8 +7500,7 @@ impl ArityGate {
 ///
 /// One rule for every non-alias head: a declared union takes its declared
 /// parameters (an over- or under-application has no emitted Rust spelling,
-/// E0107); `CustomElement` takes its down-state and up-event under any home;
-/// a builtin takes the [`TypeParams`] of the row the use resolved to, however
+/// E0107); a builtin takes the [`TypeParams`] of the row the use resolved to, however
 /// it was spelled (a mis-arity would reach the lowerer's catch-all, IPE-I0001,
 /// or an annotation no value can inhabit). `None` for the effect carriers
 /// (`Task`, `Cmd`, `Sub`), whose count inference checks (IPE-T0016). An alias
@@ -7410,9 +7513,6 @@ fn type_arity_gate(
 ) -> Option<ArityGate> {
     if let Some(params) = ctx.env.union_params.of(home, name) {
         return Some(ArityGate::Exactly(params));
-    }
-    if ctx.interner.resolve(name) == Some("CustomElement") {
-        return Some(ArityGate::Exactly(2));
     }
     match builtin?.row().params() {
         TypeParams::Exact(n) => Some(ArityGate::Exactly(usize::from(n))),
@@ -9044,9 +9144,12 @@ mod exposed_ctor_subset_tests {
 
 #[cfg(test)]
 mod seal_container_tests {
-    use ipe_kernels::{BUILTIN_TYPES, KernelHome, SealClass};
+    use ipe_kernels::{BUILTIN_TYPES, BuiltinType, KernelHome, SealClass};
 
-    use super::builtin_empty_home_arity;
+    /// The exact type-argument count of the empty-home row spelled `name`.
+    fn gate_arity(name: &str) -> Option<u8> {
+        BuiltinType::of_bare_name(name).and_then(|row| row.row().fixed_arity())
+    }
 
     /// Every value container the seal recurses into has a gate arity.
     #[test]
@@ -9059,7 +9162,7 @@ mod seal_container_tests {
         for row in containers {
             let name = row.name();
             assert!(
-                builtin_empty_home_arity(Some(name)).is_some(),
+                gate_arity(name).is_some(),
                 "`{name}` is a value container with no gate arity"
             );
             count += 1;
@@ -9071,7 +9174,7 @@ mod seal_container_tests {
     /// container the seal recurses into.
     #[test]
     fn connection_excluded_from_seal_value_containers() {
-        assert_eq!(builtin_empty_home_arity(Some("Connection")), Some(1));
+        assert_eq!(gate_arity("Connection"), Some(1));
         let connection = BUILTIN_TYPES
             .iter()
             .find(|row| row.home() == KernelHome::Builtin && row.name() == "Connection");
@@ -9920,6 +10023,138 @@ mod html_qualifier_type_home_tests {
                 applied.map(|_| ())
             );
         }
+    }
+
+    /// Canonicalise an importer against a `Dep` module that re-exports the
+    /// builtin `Dict` at the home the production producer gives it (`Dep`'s
+    /// own path) and declares nothing else.
+    fn import_against_dict_dep(importer_src: &str) -> DResult<(canon::Module, Interner)> {
+        let mut i = Interner::new();
+        let dep_path = vec![sym(&mut i, "Dep")];
+        let dict = sym(&mut i, "Dict");
+        let home = reexported_builtin_type_home("Dict", &dep_path, &i);
+        assert_eq!(home, dep_path, "a plain re-export keeps its module's home");
+        let row = BuiltinType::of_bare_name("Dict").expect("a bare row");
+        let types = BTreeMap::from([(dict, crate::ExportedType::Builtin { home, row })]);
+        let exports = crate::ModuleExports {
+            path: dep_path.clone(),
+            types,
+            ..crate::ModuleExports::default()
+        };
+        let deps = BTreeMap::from([(dep_path, exports)]);
+        let Ok(parsed_main) = ipe_parse::parse_module(importer_src, &mut i) else {
+            panic!("importer parse failed");
+        };
+        let main_path = vec![sym(&mut i, "Main")];
+        let (module, _) = canonicalise_module(&parsed_main, &main_path, &deps, &mut i)?;
+        Ok((module, i))
+    }
+
+    /// An importer whose `x` is annotated `ty -> Int` under `import_clause`.
+    fn annotated_importer(import_clause: &str, ty: &str) -> String {
+        format!(
+            "module Main exposing (x)\n\nimport {import_clause}\n\nx : {ty} -> Int\nx _ =\n    0\n"
+        )
+    }
+
+    /// A builtin re-exported at a module home binds as its row under every
+    /// spelling: exposed and qualified uses meet the row's arity gate, and a
+    /// legal use keeps the export's home.
+    #[test]
+    fn a_module_home_builtin_reexport_binds_as_its_row() {
+        for (clause, head) in [("Dep exposing (Dict)", "Dict"), ("Dep as D", "D.Dict")] {
+            let short =
+                import_against_dict_dep(&annotated_importer(clause, &format!("{head} Int")));
+            assert!(
+                matches!(
+                    &short,
+                    Err(Diagnostic::Name {
+                        msg: NameError::TypeArity {
+                            expected: 2,
+                            found: 1,
+                            ..
+                        },
+                        ..
+                    })
+                ),
+                "{head} Int: {:?}",
+                short.map(|_| ())
+            );
+            let legal =
+                import_against_dict_dep(&annotated_importer(clause, &format!("{head} Int Int")));
+            let homes: Option<Vec<Option<String>>> = legal.ok().and_then(|(module, i)| {
+                module
+                    .defs
+                    .iter()
+                    .find(|d| i.resolve(d.name().value) == Some("x"))
+                    .and_then(|d| match d {
+                        canon::Def::Typed {
+                            ty: canon::Type::Lambda(arg, _),
+                            ..
+                        } => match &**arg {
+                            canon::Type::Con { home, .. } => Some(
+                                home.iter()
+                                    .map(|s| i.resolve(*s).map(str::to_owned))
+                                    .collect(),
+                            ),
+                            _ => None,
+                        },
+                        _ => None,
+                    })
+            });
+            assert_eq!(homes, Some(vec![Some("Dep".to_owned())]), "{head} Int Int");
+        }
+    }
+
+    /// A reserved builtin name the qualifier's module does not export is
+    /// IPE-N0005, never a type minted at the qualifier's home.
+    #[test]
+    fn a_reserved_name_the_qualifier_does_not_export_is_no_such_member() {
+        for ty in ["D.Path", "D.Element Int", "D.Screen Int"] {
+            let refused = import_against_dict_dep(&annotated_importer("Dep as D", ty));
+            assert!(
+                matches!(
+                    &refused,
+                    Err(Diagnostic::Name {
+                        msg: NameError::NoSuchMember { .. },
+                        ..
+                    })
+                ),
+                "{ty}: {:?}",
+                refused.map(|_| ())
+            );
+        }
+    }
+
+    /// The Html-family `Attribute` re-export carries its row: a mis-arity
+    /// qualified use is refused.
+    #[test]
+    fn the_html_attribute_reexport_meets_its_arity_gate() {
+        let mut i = Interner::new();
+        let dep_path = vec![
+            sym(&mut i, "Ipe"),
+            sym(&mut i, "Html"),
+            sym(&mut i, "Attributes"),
+        ];
+        let exports = html_attributes_exports(&mut i, &dep_path);
+        let deps = BTreeMap::from([(dep_path, exports)]);
+        let src = annotated_importer("Ipe.Html.Attributes as Attr", "Attr.Attribute Int Int");
+        let Ok(parsed_main) = ipe_parse::parse_module(&src, &mut i) else {
+            panic!("importer parse failed");
+        };
+        let main_path = vec![sym(&mut i, "Main")];
+        let refused = canonicalise_module(&parsed_main, &main_path, &deps, &mut i);
+        assert!(
+            matches!(
+                &refused,
+                Err(Diagnostic::Name {
+                    msg: NameError::TypeArity { .. },
+                    ..
+                })
+            ),
+            "{:?}",
+            refused.map(|_| ())
+        );
     }
 }
 

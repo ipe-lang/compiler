@@ -440,7 +440,6 @@ pub const BUILTIN_TYPES: &[BuiltinRow] = &[
         .tagged(BuiltinTag::AuthError),
     bare("Bool", Reserved, Plain, Exact(0)).tagged(BuiltinTag::Bool),
     bare("Bytes", Reserved, Plain, Exact(0)).tagged(BuiltinTag::Bytes),
-    bare("Cells", Reserved, Opaque, Exact(1)),
     bare("Char", Reserved, Plain, Exact(0)).tagged(BuiltinTag::Char),
     bare("ChunkEvent", Reserved, SealedHandle, Exact(0)).via(&["HttpStream"]),
     bare("CliAttr", Reserved, Opaque, Exact(1)).tagged(BuiltinTag::CliAttr),
@@ -554,7 +553,7 @@ pub const BUILTIN_TYPES: &[BuiltinRow] = &[
     bare("Route", Reserved, Opaque, Exact(0))
         .via(&["Server"])
         .tagged(BuiltinTag::ServerRoute),
-    // `Ipe.Ui.Tui`'s view `Screen msg`; `Cells` is its rendering-model spelling.
+    // `Ipe.Ui.Tui`'s view `Screen msg`, the cell-grid rendering model.
     bare("Screen", Reserved, Opaque, OptionalMessage).tagged(BuiltinTag::Cells),
     // `Ipe.Secret`'s sealed secret string, a security-tier type.
     bare("Secret", Reserved, SecretOrSink, Exact(0))
