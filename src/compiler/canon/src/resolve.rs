@@ -4375,8 +4375,21 @@ fn bind_dep_value(
     bind_expr(env, name, tier, origin, interner)
 }
 
-/// Bind a dependency's union `type_name` and the constructors `filter` admits at
-/// `tier`.
+/// The scope target of a type a dependency exports.
+///
+/// A re-exported builtin at the empty home is its row, never a union: the
+/// row carries the arity gate and the empty home only a builtin mints.
+fn dep_type_target(exported: &crate::ExportedType) -> ScopeType {
+    match exported {
+        crate::ExportedType::Builtin { home, row } if home.is_empty() => ScopeType::Builtin(*row),
+        crate::ExportedType::Union { home, .. } | crate::ExportedType::Builtin { home, .. } => {
+            ScopeType::Union(home.clone())
+        }
+    }
+}
+
+/// Bind a dependency's exported type `type_name` and the constructors `filter`
+/// admits at `tier`.
 ///
 /// # Errors
 /// The clash [`bind_type`] or [`bind_expr`] reports.
@@ -4384,7 +4397,7 @@ fn bind_dep_value(
 fn bind_dep_union(
     dep: &crate::ModuleExports,
     type_name: Symbol,
-    home: &[Symbol],
+    exported: &crate::ExportedType,
     filter: &CtorFilter,
     tier: Tier,
     span: Span,
@@ -4392,8 +4405,8 @@ fn bind_dep_union(
     interner: &Interner,
 ) -> DResult<()> {
     let origin = imported(
-        ScopeType::Union(home.to_vec()),
-        Identity::Type(home.to_vec()),
+        dep_type_target(exported),
+        Identity::Type(exported.home().to_vec()),
         &dep.path,
         span,
     );
@@ -4481,7 +4494,7 @@ fn inject_dep_exports(
                 bind_dep_union(
                     dep,
                     type_name,
-                    exported.home(),
+                    exported,
                     &CtorFilter::All,
                     Tier::Open,
                     span,
@@ -4521,9 +4534,9 @@ fn inject_dep_exports(
                         bind_dep_value(dep, *name, Tier::Explicit, item.span, env, interner)?;
                     }
                     src::Exposed::Type(type_name, privacy) => {
-                        let union_home = dep.types.get(type_name).map(crate::ExportedType::home);
+                        let exported = dep.types.get(type_name);
                         let alias = dep.aliases.get(type_name);
-                        if union_home.is_none() && alias.is_none() {
+                        if exported.is_none() && alias.is_none() {
                             let name_s = name_str(interner, *type_name)?;
                             let module_s = path_to_dot_string(interner, dep_path);
                             let all_names = dep.types.keys().chain(dep.aliases.keys()).copied();
@@ -4540,11 +4553,11 @@ fn inject_dep_exports(
                                 },
                             });
                         }
-                        if let Some(home) = union_home {
+                        if let Some(exported) = exported {
                             bind_dep_union(
                                 dep,
                                 *type_name,
-                                home,
+                                exported,
                                 &exposed_ctor_filter(privacy),
                                 Tier::Explicit,
                                 item.span,
@@ -4747,9 +4760,9 @@ fn build_module_exports(
                                     }
                                 }
                             }
-                        } else if let Some(resolved) = interner
+                        } else if let Some((resolved, row)) = interner
                             .resolve(*type_name)
-                            .filter(|n| is_reserved_builtin_type_name(n))
+                            .and_then(|n| BuiltinType::of_bare_name(n).map(|row| (n, row)))
                         {
                             // A compiled-source stdlib module re-exports a reserved
                             // builtin TYPE it does not (and, for `Attribute` et al.,
@@ -4762,7 +4775,10 @@ fn build_module_exports(
                                 reexported_builtin_type_home(resolved, home, interner);
                             exports.types.insert(
                                 *type_name,
-                                crate::ExportedType::Builtin { home: builtin_home },
+                                crate::ExportedType::Builtin {
+                                    home: builtin_home,
+                                    row,
+                                },
                             );
                         } else if let Some(resolved) = own_aliases.get(type_name) {
                             exports.aliases.insert(*type_name, resolved.clone());
@@ -9717,7 +9733,14 @@ mod html_qualifier_type_home_tests {
                 params: 0,
             },
         );
-        types.insert(attribute, crate::ExportedType::Builtin { home: html_home });
+        let row = BuiltinType::of_bare_name("Attribute").expect("a bare row");
+        types.insert(
+            attribute,
+            crate::ExportedType::Builtin {
+                home: html_home,
+                row,
+            },
+        );
 
         let mut ctors: BTreeMap<Symbol, CtorHome> = BTreeMap::new();
         ctors.insert(
@@ -9821,6 +9844,82 @@ mod html_qualifier_type_home_tests {
             vec![Some("Html")],
             "the reserved builtin Attr.Attribute must keep the [\"Html\"] force-home"
         );
+    }
+
+    /// Canonicalise an importer against an `Ipe.Ui` export view whose
+    /// re-exported `Attribute` is built by the production producer, so its home
+    /// is the empty Ui home.
+    fn import_against_ui(importer_src: &str) -> DResult<(canon::Module, Interner)> {
+        let mut i = Interner::new();
+        let ui_path = vec![sym(&mut i, "Ipe"), sym(&mut i, "Ui")];
+        let attribute = sym(&mut i, "Attribute");
+        let home = reexported_builtin_type_home("Attribute", &ui_path, &i);
+        assert!(
+            home.is_empty(),
+            "the Ui `Attribute` re-export is the empty home"
+        );
+        let row = BuiltinType::of_bare_name("Attribute").expect("a bare row");
+        let types = BTreeMap::from([(attribute, crate::ExportedType::Builtin { home, row })]);
+        let exports = crate::ModuleExports {
+            path: ui_path.clone(),
+            types,
+            ..crate::ModuleExports::default()
+        };
+        let deps = BTreeMap::from([(ui_path, exports)]);
+        let Ok(parsed_main) = ipe_parse::parse_module(importer_src, &mut i) else {
+            panic!("importer parse failed");
+        };
+        let main_path = vec![sym(&mut i, "Main")];
+        let (module, _) = canonicalise_module(&parsed_main, &main_path, &deps, &mut i)?;
+        Ok((module, i))
+    }
+
+    /// A builtin re-exported at the empty home binds as its row, never as a
+    /// union: an open or explicit import of it canonicalises (no IPE-I0001
+    /// from the empty union home) and its uses meet the row's arity gate.
+    #[test]
+    fn an_empty_home_builtin_reexport_binds_as_its_row() {
+        for clause in ["exposing (..)", "exposing (Attribute)"] {
+            let src = |ty: &str| {
+                format!(
+                    "module Main exposing (x)\n\nimport Ipe.Ui {clause}\n\n\
+                     x : {ty} -> Int\nx _ =\n    0\n"
+                )
+            };
+            let (module, i) = match import_against_ui(&src("Attribute msg")) {
+                Ok(done) => done,
+                Err(diag) => panic!("{clause}: `Attribute msg` refused: {diag:?}"),
+            };
+            let ty = module
+                .defs
+                .iter()
+                .find(|d| i.resolve(d.name().value) == Some("x"))
+                .and_then(|d| match d {
+                    canon::Def::Typed { ty, .. } => Some(ty),
+                    canon::Def::Untyped { .. } => None,
+                });
+            assert!(
+                matches!(
+                    ty,
+                    Some(canon::Type::Lambda(arg, _))
+                        if matches!(&**arg, canon::Type::Con { home, args, .. }
+                            if home.is_empty() && args.len() == 1)
+                ),
+                "{clause}: {ty:?}"
+            );
+            let applied = import_against_ui(&src("Attribute Int Int"));
+            assert!(
+                matches!(
+                    &applied,
+                    Err(Diagnostic::Name {
+                        msg: NameError::TypeArity { .. },
+                        ..
+                    })
+                ),
+                "{clause}: {:?}",
+                applied.map(|_| ())
+            );
+        }
     }
 }
 
