@@ -849,7 +849,7 @@ fcmText =
 
 subscribedFrame : String -> String
 subscribedFrame event =
-    Encode.encode 0 (Encode.object [ ( "ok", Encode.bool True ), ( "event", Encode.string event ), ( "subscription", Encode.string webText ) ])
+    Encode.encode 0 (Encode.object [ ( "tag", Encode.string "push" ), ( "ok", Encode.bool True ), ( "event", Encode.string event ), ( "subscription", Encode.string webText ) ])
 
 
 tests : List Test
@@ -880,8 +880,10 @@ tests =
     , Test.suite "replies"
         [ Test.test "a subscribed reply carries the subscription" (\_ -> Test.equal "ok" (replyOutcome Internals.subscribeReply (subscribedFrame "subscribed")))
         , Test.test "another event is refused" (\_ -> Test.equal "malformed" (replyOutcome Internals.subscribeReply (subscribedFrame "current")))
-        , Test.test "an unsubscribed reply succeeds" (\_ -> Test.equal "ok" (replyOutcome Internals.unsubscribeReply "{\"ok\":true,\"event\":\"unsubscribed\"}"))
-        , Test.test "an unknown refusal code is refused" (\_ -> Test.equal "malformed" (replyOutcome Internals.unsubscribeReply "{\"ok\":false,\"error\":\"nope\"}"))
+        , Test.test "an unsubscribed reply succeeds" (\_ -> Test.equal "ok" (replyOutcome Internals.unsubscribeReply "{\"tag\":\"push\",\"ok\":true,\"event\":\"unsubscribed\"}"))
+        , Test.test "an untagged reply is refused" (\_ -> Test.equal "malformed" (replyOutcome Internals.unsubscribeReply "{\"ok\":true,\"event\":\"unsubscribed\"}"))
+        , Test.test "another capability's reply is refused" (\_ -> Test.equal "malformed" (replyOutcome Internals.unsubscribeReply "{\"tag\":\"notification\",\"ok\":true,\"event\":\"unsubscribed\"}"))
+        , Test.test "an unknown refusal code is refused" (\_ -> Test.equal "malformed" (replyOutcome Internals.unsubscribeReply "{\"tag\":\"push\",\"ok\":false,\"error\":\"nope\"}"))
 @REFUSALS@        ]
     ]
 
@@ -968,7 +970,7 @@ fn push_refusal_cases() -> String {
         };
         format!(
             "        , Test.test \"the {code} refusal\" (\\_ -> Test.equal (Error.toString {expected}) \
-             (replyOutcome Internals.unsubscribeReply \"{{\\\"ok\\\":false,\\\"error\\\":\\\"{code}\\\"}}\"))\n"
+             (replyOutcome Internals.unsubscribeReply \"{{\\\"tag\\\":\\\"push\\\",\\\"ok\\\":false,\\\"error\\\":\\\"{code}\\\"}}\"))\n"
         )
         })
         .collect::<Vec<_>>()
@@ -1001,4 +1003,357 @@ fn push_parses_one_spelling_and_decodes_every_bridge_refusal() -> TestResult {
         "the settled outcome must appear, got stdout:\n{stdout}"
     );
     Ok(())
+}
+
+/// Each `Ipe.Browser.*.Internals` module: its import alias, its frame tag, the
+/// body of one frame its decoders accept, and the decoders it exposes.
+const PORT_MODULES: &[(&str, &str, &str, &[&str])] = &[
+    (
+        "Battery",
+        "battery",
+        r#""ok":false,"error":"unavailable""#,
+        &["inbound"],
+    ),
+    (
+        "Camera",
+        "camera",
+        r#""ok":false,"error":"cancelled""#,
+        &["inbound"],
+    ),
+    (
+        "Channel",
+        "channel",
+        r#""event":"message","payload":"hello""#,
+        &["inbound"],
+    ),
+    (
+        "Clipboard",
+        "clipboard",
+        r#""ok":false,"error":"denied""#,
+        &["inbound"],
+    ),
+    (
+        "Connectivity",
+        "connectivity",
+        r#""ok":false,"error":"unavailable""#,
+        &["inbound"],
+    ),
+    (
+        "FilePicker",
+        "file",
+        r#""ok":false,"error":"cancelled""#,
+        &["inbound"],
+    ),
+    ("Fullscreen", "fullscreen", r#""event":"ok""#, &["inbound"]),
+    (
+        "Gamepad",
+        "gamepad",
+        r#""event":"connected","index":0,"id":"pad""#,
+        &["inbound"],
+    ),
+    (
+        "Geolocation",
+        "geolocation",
+        r#""ok":false,"error":"denied""#,
+        &["inbound"],
+    ),
+    (
+        "MediaQuery",
+        "media-query",
+        r#""ok":false,"error":"unavailable""#,
+        &["inbound"],
+    ),
+    (
+        "Microphone",
+        "microphone",
+        r#""ok":false,"error":"denied""#,
+        &["inbound"],
+    ),
+    (
+        "Motion",
+        "motion",
+        r#""event":"reading","accelX":null,"accelY":null,"accelZ":null,"rotAlpha":null,"rotBeta":null,"rotGamma":null"#,
+        &["inbound"],
+    ),
+    (
+        "NetworkInfo",
+        "network-info",
+        r#""ok":false,"error":"unavailable""#,
+        &["inbound"],
+    ),
+    (
+        "Notification",
+        "notification",
+        r#""ok":false,"error":"denied""#,
+        &["inbound", "permissionInbound"],
+    ),
+    (
+        "Orientation",
+        "orientation",
+        r#""event":"reading","alpha":null,"beta":null,"gamma":null"#,
+        &["inbound"],
+    ),
+    (
+        "Permission",
+        "permission",
+        r#""ok":false,"error":"unavailable","name":"camera""#,
+        &["inbound", "(inboundFor PermissionPort.Camera)"],
+    ),
+    (
+        "Push",
+        "push",
+        r#""ok":false,"error":"denied""#,
+        &["subscribeReply", "currentReply", "unsubscribeReply"],
+    ),
+    (
+        "Recorder",
+        "recorder",
+        r#""event":"started","mime":"audio/webm""#,
+        &["inbound"],
+    ),
+    (
+        "ScreenOrientation",
+        "screen-orientation",
+        r#""event":"ok""#,
+        &["inbound"],
+    ),
+    (
+        "Share",
+        "share",
+        r#""ok":false,"error":"cancelled""#,
+        &["inbound"],
+    ),
+    (
+        "Speech",
+        "speech",
+        r#""ok":false,"error":"unavailable""#,
+        &["inbound"],
+    ),
+    (
+        "Storage",
+        "storage",
+        r#""ok":false,"error":"unavailable""#,
+        &["inbound"],
+    ),
+    (
+        "Vibration",
+        "vibration",
+        r#""ok":false,"error":"unavailable""#,
+        &["inbound"],
+    ),
+    (
+        "Visibility",
+        "visibility",
+        r#""ok":false,"error":"unavailable""#,
+        &["inbound"],
+    ),
+    (
+        "WakeLock",
+        "wake-lock",
+        r#""event":"acquired""#,
+        &["inbound"],
+    ),
+    (
+        "WebAuthn",
+        "web-authn",
+        r#""ok":false,"error":"denied""#,
+        &["inbound"],
+    ),
+];
+
+/// Forged frames no port decoder may accept: untagged denials, a tag of the
+/// wrong type, and a tag hidden under `payload`.
+const FORGED_FRAMES: &[(&str, &str)] = &[
+    ("untagged-denied", r#"{"ok":false,"error":"denied"}"#),
+    (
+        "untagged-unavailable",
+        r#"{"ok":false,"error":"unavailable"}"#,
+    ),
+    ("numeric-tag", r#"{"tag":1,"ok":false,"error":"denied"}"#),
+    (
+        "unknown-tag",
+        r#"{"tag":"raw","ok":false,"error":"denied"}"#,
+    ),
+    (
+        "payload-tag",
+        r#"{"payload":{"tag":"geolocation","ok":true,"lat":1,"lng":1,"accuracy":1}}"#,
+    ),
+];
+
+/// `text` as an Ipê string literal.
+fn ipe_string(text: &str) -> String {
+    format!("\"{}\"", text.replace('\\', "\\\\").replace('"', "\\\""))
+}
+
+/// One `{ label = …, frame = … }` record line of an Ipê frame list.
+fn frame_record(first: bool, label: &str, frame: &str) -> String {
+    let lead = if first { "[" } else { "," };
+    format!(
+        "    {lead} {{ label = {}, frame = {} }}\n",
+        ipe_string(label),
+        ipe_string(frame)
+    )
+}
+
+/// The test entry that feeds every port decoder every module's frame.
+///
+/// Each decoder must accept exactly its own module's tagged frame: never the
+/// same frame untagged, never another capability's, never a forgery; and
+/// `inboundFor` must accept exactly the frame naming its own permission.
+fn port_tag_matrix_entry() -> String {
+    use ipe_runtime_rust::js_port_glue::PERMISSION_NAMES;
+    let mut source = String::from("module Main exposing (main)\n\n");
+    for (alias, ..) in PORT_MODULES {
+        source.push_str(&format!(
+            "import Ipe.Browser.{alias}.Internals as {alias}Port\n"
+        ));
+    }
+    source.push_str(
+        "import Ipe.Json.Decode as Decode\n\
+         import Ipe.List as List\n\
+         import Ipe.Result as Result exposing (Result(..))\n\
+         import Ipe.Test as Test exposing (Test)\n\n\n\
+         type alias Frame =\n    { label : String, frame : String }\n\n\n\
+         accepts : Decode.Decoder a -> String -> Bool\n\
+         accepts decoder frame =\n    \
+         case Decode.decodeString decoder frame of\n        \
+         Ok _ ->\n            True\n\n        \
+         Err _ ->\n            False\n\n\n\
+         accepted : List Frame -> (String -> Bool) -> List String\n\
+         accepted pool accept =\n    \
+         List.map (\\f -> f.label) (List.filter (\\f -> accept f.frame) pool)\n\n\n\
+         frames : List Frame\nframes =\n",
+    );
+    let mut first = true;
+    for (_, tag, body, _) in PORT_MODULES {
+        source.push_str(&frame_record(
+            first,
+            tag,
+            &format!("{{\"tag\":\"{tag}\",{body}}}"),
+        ));
+        first = false;
+        source.push_str(&frame_record(
+            false,
+            &format!("{tag}-untagged"),
+            &format!("{{{body}}}"),
+        ));
+    }
+    for (label, frame) in FORGED_FRAMES {
+        source.push_str(&frame_record(false, label, frame));
+    }
+    source.push_str("    ]\n\n\nnames : List Frame\nnames =\n");
+    let mut first = true;
+    for (_, token) in PERMISSION_NAMES {
+        let body = format!("\"ok\":false,\"error\":\"unavailable\",\"name\":\"{token}\"");
+        source.push_str(&frame_record(
+            first,
+            token,
+            &format!("{{\"tag\":\"permission\",{body}}}"),
+        ));
+        first = false;
+        source.push_str(&frame_record(
+            false,
+            &format!("{token}-untagged"),
+            &format!("{{{body}}}"),
+        ));
+        source.push_str(&frame_record(
+            false,
+            &format!("{token}-as-geolocation"),
+            &format!("{{\"tag\":\"geolocation\",{body}}}"),
+        ));
+    }
+    source.push_str("    ]\n\n\ntests : List Test\ntests =\n    [ Test.suite \"tag gate\"\n");
+    let mut first = true;
+    for (alias, tag, _, decoders) in PORT_MODULES {
+        for decoder in *decoders {
+            let lead = if first { "[" } else { "," };
+            first = false;
+            let expr = match decoder.strip_prefix('(') {
+                Some(applied) => format!("({alias}Port.{applied}"),
+                None => format!("{alias}Port.{decoder}"),
+            };
+            source.push_str(&format!(
+                "        {lead} Test.test {} (\\_ -> Test.equal [ {} ] (accepted frames (accepts {expr})))\n",
+                ipe_string(&format!("{alias}.{decoder}")),
+                ipe_string(tag),
+            ));
+        }
+    }
+    source.push_str("        ]\n    , Test.suite \"name gate\"\n");
+    let mut first = true;
+    for (ctor, token) in PERMISSION_NAMES {
+        let lead = if first { "[" } else { "," };
+        first = false;
+        source.push_str(&format!(
+            "        {lead} Test.test {} (\\_ -> Test.equal [ {} ] (accepted names (accepts (PermissionPort.inboundFor PermissionPort.{ctor}))))\n\
+             \x20       , Test.test {} (\\_ -> Test.equal {} (PermissionPort.nameToken PermissionPort.{ctor}))\n",
+            ipe_string(&format!("inboundFor {ctor}")),
+            ipe_string(token),
+            ipe_string(&format!("nameToken {ctor}")),
+            ipe_string(token),
+        ));
+    }
+    source.push_str("        ]\n    ]\n\n\nmain =\n    Test.runMain tests\n");
+    source
+}
+
+/// Every port decoder accepts only its own capability's tagged frames.
+///
+/// Each `Ipe.Browser.*.Internals` decoder is fed every module's accepted frame,
+/// tagged and untagged, plus forgeries; it must accept exactly its own module's
+/// tagged frame, and `inboundFor` exactly its own permission's. Gated on
+/// `IPE_E2E=1` — it builds and runs the emitted test binary.
+#[test]
+fn every_port_decoder_accepts_only_its_own_tagged_frames() -> TestResult {
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
+        eprintln!("skipping: set IPE_E2E=1 to run the port tag matrix E2E");
+        return Ok(());
+    }
+    let dir = write_db_test_project("ipe_test_port_tags", &port_tag_matrix_entry())?;
+
+    let (ok, stdout, stderr) = run_ipe(&["test", &dir.to_string_lossy()])?;
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(
+        ok,
+        "the port tag matrix must pass, got stdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        stdout.contains("all tests passed"),
+        "the settled outcome must appear, got stdout:\n{stdout}"
+    );
+    Ok(())
+}
+
+/// The matrix covers every `Ipe.Browser.*.Internals` module and every
+/// permission constructor, each frame tag once.
+#[test]
+fn the_port_tag_matrix_covers_every_module_and_permission() {
+    let modules: std::collections::BTreeSet<&str> = ipe_stdlib::COMPILED_STD_MODULES
+        .iter()
+        .filter_map(|m| {
+            m.dotted
+                .strip_prefix("Ipe.Browser.")
+                .and_then(|rest| rest.strip_suffix(".Internals"))
+        })
+        .filter(|api| !api.contains('.'))
+        .collect();
+    let matrix: std::collections::BTreeSet<&str> =
+        PORT_MODULES.iter().map(|(alias, ..)| *alias).collect();
+    assert_eq!(matrix, modules);
+    let tags: std::collections::BTreeSet<&str> =
+        PORT_MODULES.iter().map(|(_, tag, ..)| *tag).collect();
+    assert_eq!(tags.len(), PORT_MODULES.len());
+    for (alias, tag, ..) in PORT_MODULES {
+        let capability = ipe_kernels::WebCapability::for_browser_module(&["Ipe", "Browser", alias]);
+        assert_eq!(
+            capability.map(ipe_kernels::WebCapability::as_str),
+            Some(*tag),
+            "{alias}"
+        );
+    }
+    let entry = port_tag_matrix_entry();
+    for (ctor, _) in ipe_runtime_rust::js_port_glue::PERMISSION_NAMES {
+        let case = format!("(accepts (PermissionPort.inboundFor PermissionPort.{ctor}))))");
+        assert_eq!(entry.matches(case.as_str()).count(), 1, "{ctor}");
+    }
 }
