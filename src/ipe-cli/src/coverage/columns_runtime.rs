@@ -29,7 +29,14 @@ use crate::coverage::source_tree::{TreeRefusal, for_each_source};
 /// get a scratch dir cannot prove anything about the symbols it would have
 /// probed.
 fn scratch_dir() -> Result<crate::scratch::ScratchDir, CoverageError> {
-    crate::scratch::ScratchDir::new("ipe-coverage-probe").map_err(CoverageError::Scratch)
+    scratch_from(crate::scratch::ScratchDir::new("ipe-coverage-probe"))
+}
+
+/// The probe scratch dir from one creation attempt, its failure typed.
+fn scratch_from(
+    made: std::io::Result<crate::scratch::ScratchDir>,
+) -> Result<crate::scratch::ScratchDir, CoverageError> {
+    made.map_err(CoverageError::Scratch)
 }
 
 /// `name` inside `scratch`, or a hole cell when `name` is not a plain leaf name.
@@ -676,6 +683,15 @@ impl AspectCheck<StdlibSymbol> for WasmColumn {
 mod tests {
     use super::*;
     use crate::coverage::contract::{SchemeState, SymbolKind};
+
+    #[test]
+    fn a_scratch_dir_that_cannot_be_made_is_a_typed_scratch_error() {
+        let result = scratch_from(Err(std::io::Error::other("no space")));
+        assert!(
+            matches!(result, Err(CoverageError::Scratch(_))),
+            "{result:?}"
+        );
+    }
 
     fn sym(module: &[&str], name: &str) -> StdlibSymbol {
         StdlibSymbol {

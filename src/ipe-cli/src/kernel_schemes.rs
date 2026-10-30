@@ -51,6 +51,12 @@ pub enum KernelSchemeError {
         /// Whether the kernel appeared in the scheme table's output.
         in_table: bool,
     },
+    /// The scheme table carries the same kernel more than once — which entry
+    /// is the scheme is undetermined.
+    Duplicate {
+        /// The kernel the table lists twice.
+        kernel: StdlibKernel,
+    },
 }
 
 impl std::fmt::Display for KernelSchemeError {
@@ -72,6 +78,10 @@ impl std::fmt::Display for KernelSchemeError {
                  type-scheme table (in_table={in_table}) — the kernel registry \
                  and the scheme table have drifted apart"
             ),
+            Self::Duplicate { kernel } => write!(
+                f,
+                "kernel `{kernel:?}` appears more than once in the type-scheme table"
+            ),
         }
     }
 }
@@ -88,8 +98,12 @@ fn join(
     shape: impl Fn(StdlibKernel) -> bool,
 ) -> Result<Vec<(StdlibKernel, KernelScheme)>, KernelSchemeError> {
     let table = table.map_err(KernelSchemeError::Table)?;
-    let mut by_kernel: BTreeMap<usize, Ty> =
-        table.into_iter().map(|(k, ty)| (k as usize, ty)).collect();
+    let mut by_kernel: BTreeMap<usize, Ty> = BTreeMap::new();
+    for (kernel, ty) in table {
+        if by_kernel.insert(kernel as usize, ty).is_some() {
+            return Err(KernelSchemeError::Duplicate { kernel });
+        }
+    }
 
     all.iter()
         .map(|&kernel| {
@@ -169,6 +183,22 @@ mod tests {
                 shape_declared: false,
                 in_table: true,
                 ..
+            })
+        ));
+    }
+
+    #[test]
+    fn a_kernel_the_table_lists_twice_is_a_duplicate_not_last_wins() {
+        let all = [StdlibKernel::LogInfo];
+        let table = vec![
+            (StdlibKernel::LogInfo, dummy_ty()),
+            (StdlibKernel::LogInfo, dummy_ty()),
+        ];
+        let result = join(&all, Ok(table), |_| true);
+        assert!(matches!(
+            result,
+            Err(KernelSchemeError::Duplicate {
+                kernel: StdlibKernel::LogInfo
             })
         ));
     }

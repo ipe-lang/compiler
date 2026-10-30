@@ -59,39 +59,46 @@ impl Surface for EnvVarSurface {
     }
 
     fn all(&self) -> Result<Vec<EnvItem>, CoverageError> {
-        let registered: BTreeSet<&'static str> = ENV_VARS.iter().map(|v| v.name).collect();
-        let excluded: BTreeSet<&'static str> = EXCLUDED_NAMES.iter().copied().collect();
-
-        let mut items: Vec<EnvItem> = ENV_VARS.iter().map(EnvItem::Registered).collect();
-
-        // Orphan reads: a variable a Rust `read_env_var`/`env::var` call reads
-        // that neither the registry nor the exclusion list homes. Scoped to Rust
-        // read *calls* (not every `IPE_*` mention) so a doc string, a template
-        // placeholder, or a build-script variable is not a false orphan. A tree
-        // that cannot be read whole must refuse the whole surface — silently
-        // reporting zero orphans here would be a false "no orphan reads" pass
-        // over a scan that never actually ran.
-        let scan = SourceReads::scan();
-        let reads = scan.env_reads().map_err(CoverageError::EnvScan)?;
-        for name in reads {
-            if !registered.contains(name.as_str()) && !excluded.contains(name.as_str()) {
-                items.push(EnvItem::OrphanRead(name.clone()));
-            }
-        }
-
-        // Deterministic order: by name, registry entries before an orphan of the
-        // same name (an orphan never shares a registered name by construction).
-        items.sort_by(|a, b| {
-            a.name()
-                .cmp(b.name())
-                .then_with(|| kind_rank(a).cmp(&kind_rank(b)))
-        });
-        Ok(items)
+        items_from(&SourceReads::scan())
     }
 
     fn label(item: &EnvItem) -> String {
         item.name().to_owned()
     }
+}
+
+/// The env-var surface over one completed source scan.
+///
+/// # Errors
+/// [`CoverageError::EnvScan`] when `scan` could not read the tree whole.
+fn items_from(scan: &SourceReads) -> Result<Vec<EnvItem>, CoverageError> {
+    let registered: BTreeSet<&'static str> = ENV_VARS.iter().map(|v| v.name).collect();
+    let excluded: BTreeSet<&'static str> = EXCLUDED_NAMES.iter().copied().collect();
+
+    let mut items: Vec<EnvItem> = ENV_VARS.iter().map(EnvItem::Registered).collect();
+
+    // Orphan reads: a variable a Rust `read_env_var`/`env::var` call reads
+    // that neither the registry nor the exclusion list homes. Scoped to Rust
+    // read *calls* (not every `IPE_*` mention) so a doc string, a template
+    // placeholder, or a build-script variable is not a false orphan. A tree
+    // that cannot be read whole must refuse the whole surface — silently
+    // reporting zero orphans here would be a false "no orphan reads" pass
+    // over a scan that never actually ran.
+    let reads = scan.env_reads().map_err(CoverageError::EnvScan)?;
+    for name in reads {
+        if !registered.contains(name.as_str()) && !excluded.contains(name.as_str()) {
+            items.push(EnvItem::OrphanRead(name.clone()));
+        }
+    }
+
+    // Deterministic order: by name, registry entries before an orphan of the
+    // same name (an orphan never shares a registered name by construction).
+    items.sort_by(|a, b| {
+        a.name()
+            .cmp(b.name())
+            .then_with(|| kind_rank(a).cmp(&kind_rank(b)))
+    });
+    Ok(items)
 }
 
 /// Sort tie-break: a registry entry sorts before an orphan of the same name.
@@ -332,6 +339,19 @@ mod tests {
     use super::*;
     use crate::coverage::columns_env::{ReadInCodeColumn, TruthyParseColumn};
     use crate::coverage::contract::{AspectCheck, Cell};
+
+    /// A tree the scan cannot read whole refuses the whole surface, never an
+    /// enumeration that silently reports zero orphan reads.
+    #[test]
+    fn an_unreadable_tree_refuses_the_surface_as_env_scan() {
+        let missing = ipe_test_temp::temp_root()
+            .join(format!("ipe-env-surface-refuse-{}", std::process::id()));
+        let result = items_from(&SourceReads::scan_roots(&[missing]));
+        assert!(
+            matches!(result, Err(CoverageError::EnvScan(_))),
+            "{result:?}"
+        );
+    }
 
     /// A tree the scan cannot read whole holes every registered variable with the
     /// cause, never "read nowhere" and never a clean truthy check.

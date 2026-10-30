@@ -121,6 +121,7 @@ use crate::api_surface::{
     DiffError, ModuleApi, ModulePath, PublicApi, UnionApi, extract_walked, read_tree,
 };
 use crate::cli_args::OutputFormat;
+use crate::coverage::surface::KernelHome;
 use crate::doc_bundle::{
     BundleError, BundleSource, DocBundle, DocEntry, DocKind, DocsOverlay, is_qualified,
 };
@@ -1941,6 +1942,10 @@ fn build_source_only_module_doc(segments: &[String], source: &str) -> ModuleDoc 
 
 /// Resolve one schemed kernel's module path and render its [`ValueDoc`].
 ///
+/// `Ok(None)` for a kernel with no module page: a shape-scoped routing token
+/// ([`KernelHome::ShapeScoped`]) or an internal qualifier
+/// ([`KernelHome::Internal`]) — never an invented `Ipe.<qualifier>` page.
+///
 /// # Errors
 /// [`CliError::Usage`] when the kernel's qualifier does not resolve to a known
 /// module, or when `ty` fails to render through [`ty_to_doc`] (e.g. a
@@ -1954,15 +1959,18 @@ fn kernel_value_doc(
     qualifier_to_path: &crate::coverage::surface::QualifierModuleMap,
     compiled_by_dotted: &crate::coverage::surface::QualifierModuleMap,
     compiled_by_last_segment: &crate::coverage::surface::QualifierModuleMap,
-) -> Result<(String, ValueDoc), CliError> {
-    let module_path = crate::coverage::surface::kernel_module_path(
+) -> Result<Option<(String, ValueDoc)>, CliError> {
+    let home = crate::coverage::surface::kernel_module_path(
         decl.qualifier,
         qualifier_to_path,
         compiled_by_dotted,
         compiled_by_last_segment,
     )
-    .map_err(|e| CliError::Usage(text::msg::doc_kernel_table_error(&e)))?
-    .join(".");
+    .map_err(|e| CliError::Usage(text::msg::doc_kernel_table_error(&e)))?;
+    let module_path = match home {
+        KernelHome::Module(path) => path.join("."),
+        KernelHome::ShapeScoped | KernelHome::Internal => return Ok(None),
+    };
     let mut namer = VarNamer::new();
     let ty_doc = ty_to_doc(ty, interner, &mut namer).map_err(|d| {
         CliError::Usage(text::msg::doc_kernel_table_error(
@@ -1970,7 +1978,7 @@ fn kernel_value_doc(
         ))
     })?;
     let signature = render_ty(&ty_doc);
-    Ok((
+    Ok(Some((
         module_path,
         ValueDoc {
             name: decl.name.to_owned(),
@@ -1978,7 +1986,7 @@ fn kernel_value_doc(
             signature_ty: ty_doc,
             comment: String::new(),
         },
-    ))
+    )))
 }
 
 /// Build [`ModuleDoc`]s for every kernel-qualifier stdlib module.
@@ -2010,14 +2018,17 @@ fn build_kernel_module_docs() -> Result<BTreeMap<String, ModuleDoc>, CliError> {
             // page to render it on.
             crate::kernel_schemes::KernelScheme::Unschemed => continue,
         };
-        let (module_path, value_doc) = kernel_value_doc(
+        let Some((module_path, value_doc)) = kernel_value_doc(
             kernel.decl(),
             &ty,
             &interner,
             &qualifier_to_path,
             &compiled_by_dotted,
             &compiled_by_last_segment,
-        )?;
+        )?
+        else {
+            continue;
+        };
         by_module.entry(module_path).or_default().push(value_doc);
     }
 
@@ -5805,6 +5816,25 @@ mod tests {
     }
 
     #[test]
+    fn kernel_docs_render_no_page_for_a_module_that_does_not_exist() {
+        let docs = build_kernel_module_docs().expect("the live kernel docs must build");
+        let real: BTreeSet<String> = ipe_stdlib::COMPILED_STD_MODULES
+            .iter()
+            .map(|m| m.dotted.to_owned())
+            .chain(
+                ipe_canon::STDLIB_MODULE_QUALIFIERS
+                    .iter()
+                    .map(|(segs, _)| segs.join(".")),
+            )
+            .collect();
+        let invented: Vec<&String> = docs.keys().filter(|path| !real.contains(*path)).collect();
+        assert!(
+            invented.is_empty(),
+            "kernel docs must only page real stdlib modules, found {invented:?}",
+        );
+    }
+
+    #[test]
     fn a_render_failure_refuses_the_kernel_not_a_shorter_page() {
         // `bad_ty` names a module/value `Symbol` minted in `foreign_interner`, a
         // DIFFERENT interner from the one `kernel_value_doc` is given here, so
@@ -5832,8 +5862,19 @@ mod tests {
             .first()
             .expect("the kernel registry is non-empty")
             .decl();
+        // Home the qualifier so the qualifier step passes and the render step
+        // alone decides the outcome.
+        let homed: crate::coverage::surface::QualifierModuleMap = BTreeMap::from([(
+            decl.qualifier.to_owned(),
+            vec!["Ipe".to_owned(), "X".to_owned()],
+        )]);
 
-        let result = kernel_value_doc(decl, &bad_ty, &empty_interner, &empty, &empty, &empty);
+        let control = kernel_value_doc(decl, &Ty::Unit, &empty_interner, &homed, &empty, &empty);
+        assert!(
+            matches!(control, Ok(Some(_))),
+            "control: a renderable type through the same maps must page: {control:?}",
+        );
+        let result = kernel_value_doc(decl, &bad_ty, &empty_interner, &homed, &empty, &empty);
         assert!(
             matches!(result, Err(CliError::Usage(_))),
             "a type that fails to render must surface as a typed CliError, not a silently \

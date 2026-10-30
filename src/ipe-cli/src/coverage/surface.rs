@@ -348,27 +348,36 @@ const QUALIFIER_MODULE_OVERRIDES: &[(&str, &[&str])] = &[
 ///    real module lists below so a drifted override entry (renamed or
 ///    removed module) surfaces as [`CoverageError::UnknownQualifier`] rather
 ///    than silently standing in for a module that no longer exists.
-/// 5. Phantom fallback `Ipe.<qualifier>` — homed under a non-existent path so
-///    [`crate::coverage::columns_static::HomeColumn`] flags it as a named
-///    [`crate::coverage::contract::Cell::Hole`]. Reached only by qualifiers
-///    that are genuinely shape-scoped routing tokens with no standalone
-///    module by design (`Cmd`, `Sub`) — the surface's job is to name every
-///    kernel, not to judge which ones are homed, so this tier never errors.
+/// 5. [`SHAPE_SCOPED_QUALIFIERS`] — routing tokens with no standalone module
+///    by design: [`KernelHome::ShapeScoped`].
+///
+/// A `_`-prefixed qualifier is [`KernelHome::Internal`] before any tier is
+/// consulted. Any other qualifier no tier resolves is
+/// [`CoverageError::UnknownQualifier`]: a new kernel family with no module is a
+/// named refusal, never an invented `Ipe.<qualifier>` path a consumer could
+/// render as a real module.
+///
+/// # Errors
+/// [`CoverageError::UnknownQualifier`] for a qualifier no tier resolves, or an
+/// override entry naming a module absent from every real module list.
 pub(crate) fn kernel_module_path(
     qualifier: &'static str,
     qualifier_to_path: &QualifierModuleMap,
     compiled_by_dotted: &QualifierModuleMap,
     compiled_by_last_segment: &QualifierModuleMap,
-) -> Result<Vec<String>, CoverageError> {
+) -> Result<KernelHome, CoverageError> {
+    if is_internal_qualifier(qualifier) {
+        return Ok(KernelHome::Internal);
+    }
     if let Some(path) = qualifier_to_path.get(qualifier) {
-        return Ok(path.clone());
+        return Ok(KernelHome::Module(path.clone()));
     }
     let dotted = format!("Ipe.{qualifier}");
     if let Some(path) = compiled_by_dotted.get(&dotted) {
-        return Ok(path.clone());
+        return Ok(KernelHome::Module(path.clone()));
     }
     if let Some(path) = compiled_by_last_segment.get(qualifier) {
-        return Ok(path.clone());
+        return Ok(KernelHome::Module(path.clone()));
     }
     if let Some(segs) = QUALIFIER_MODULE_OVERRIDES
         .iter()
@@ -382,17 +391,38 @@ pub(crate) fn kernel_module_path(
                 .any(|known| *known == path)
             || qualifier_to_path.values().any(|known| *known == path);
         return if is_known_module {
-            Ok(path)
+            Ok(KernelHome::Module(path))
         } else {
             Err(CoverageError::UnknownQualifier { qualifier })
         };
     }
-    Ok(segments_of(&dotted))
+    if SHAPE_SCOPED_QUALIFIERS.contains(&qualifier) {
+        return Ok(KernelHome::ShapeScoped);
+    }
+    Err(CoverageError::UnknownQualifier { qualifier })
 }
 
-/// Fold the kernel registry into the reconciliation map: each wired kernel
-/// becomes a value symbol whose `has_kernel` facet is set, homed under its real
-/// module path.
+/// Kernel qualifiers that are shape-scoped routing tokens with no canonical
+/// standalone module (reached via `Ipe.Tea.<Shape>.Cmd` / `.Sub`).
+const SHAPE_SCOPED_QUALIFIERS: &[&str] = &["Cmd", "Sub"];
+
+/// Whether `qualifier` is internal or not-yet-registered (`_`-prefixed),
+/// excluded from every user-facing surface — the canon-equality tripwire's rule.
+fn is_internal_qualifier(qualifier: &str) -> bool {
+    qualifier.starts_with('_')
+}
+
+/// Where a kernel qualifier's members live.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum KernelHome {
+    /// A real stdlib module path.
+    Module(Vec<String>),
+    /// A [`SHAPE_SCOPED_QUALIFIERS`] routing token: no standalone module.
+    ShapeScoped,
+    /// A `_`-prefixed internal qualifier, on no user-facing surface.
+    Internal,
+}
+
 /// The three qualifier-resolution tables [`kernel_module_path`] joins
 /// against, built once from the canon and compiled-source registries.
 ///
@@ -416,12 +446,21 @@ pub(crate) fn qualifier_lookup_tables()
         .map(|m| (m.dotted.to_owned(), segments_of(m.dotted)))
         .collect();
 
-    let compiled_by_last_segment: QualifierModuleMap = ipe_stdlib::COMPILED_STD_MODULES
-        .iter()
-        .filter_map(|m| {
-            let segs = segments_of(m.dotted);
-            segs.last().cloned().map(|last| (last, segs))
-        })
+    // A final segment two modules share (`Internals`, `Unsafe`, `Parser`) homes
+    // no qualifier: keeping either would home a kernel by insertion order.
+    let mut by_last: BTreeMap<String, Option<Vec<String>>> = BTreeMap::new();
+    for m in ipe_stdlib::COMPILED_STD_MODULES {
+        let segs = segments_of(m.dotted);
+        if let Some(last) = segs.last().cloned() {
+            by_last
+                .entry(last)
+                .and_modify(|slot| *slot = None)
+                .or_insert(Some(segs));
+        }
+    }
+    let compiled_by_last_segment: QualifierModuleMap = by_last
+        .into_iter()
+        .filter_map(|(last, segs)| segs.map(|segs| (last, segs)))
         .collect();
 
     (
@@ -431,6 +470,13 @@ pub(crate) fn qualifier_lookup_tables()
     )
 }
 
+/// Fold the kernel registry into the reconciliation map: each wired kernel
+/// becomes a value symbol whose `has_kernel` facet is set, homed under its real
+/// module path.
+///
+/// # Errors
+/// The typed [`CoverageError`] of the kernel/scheme join, a qualifier no tier
+/// resolves, or a scheme that fails to render.
 fn merge_kernels(by_key: &mut BTreeMap<Key, StdlibSymbol>) -> Result<(), CoverageError> {
     let (qualifier_to_path, compiled_by_dotted, compiled_by_last_segment) =
         qualifier_lookup_tables();
@@ -447,42 +493,35 @@ fn merge_kernels(by_key: &mut BTreeMap<Key, StdlibSymbol>) -> Result<(), Coverag
             shape_declared,
             in_table,
         },
+        KernelSchemeError::Duplicate { kernel } => CoverageError::KernelTableDuplicate { kernel },
     })?;
 
-    let mut by_kernel_key: BTreeMap<(String, String), KernelScheme> = BTreeMap::new();
+    // `kernel_schemes` yields every kernel exactly once, so iterating it (not
+    // `StdlibKernel::ALL` plus a lookup) leaves no "absent" arm to default.
     for (kernel, scheme) in schemes {
         let def = kernel.def();
-        by_kernel_key.insert((def.qualifier.to_owned(), def.name.to_owned()), scheme);
-    }
-
-    for kernel in ipe_kernels::StdlibKernel::ALL {
-        let def = kernel.def();
-        // Internal or not-yet-registered qualifiers are excluded from the
-        // resolvable surface, matching the canon-equality tripwire's rule.
-        if def.qualifier.starts_with('_') {
-            continue;
-        }
-        let module = kernel_module_path(
+        let module = match kernel_module_path(
             def.qualifier,
             &qualifier_to_path,
             &compiled_by_dotted,
             &compiled_by_last_segment,
-        )?;
-        let (scheme, is_higher_order) =
-            match by_kernel_key.remove(&(def.qualifier.to_owned(), def.name.to_owned())) {
-                Some(KernelScheme::Schemed(ty)) => {
-                    let mut namer = VarNamer::new();
-                    let doc = ty_to_doc(&ty, &interner, &mut namer).map_err(|source| {
-                        CoverageError::RenderScheme {
-                            kernel: *kernel,
-                            source,
-                        }
-                    })?;
-                    let higher_order = scheme_is_higher_order(&doc);
-                    (SchemeState::Rendered(render_ty(&doc)), higher_order)
-                }
-                Some(KernelScheme::Unschemed) | None => (SchemeState::Unschemed, false),
-            };
+        )? {
+            KernelHome::Module(path) => path,
+            // Homed under the non-existent `Ipe.<qualifier>` so `HomeColumn`
+            // names it as a hole rather than the row vanishing.
+            KernelHome::ShapeScoped => segments_of(&format!("Ipe.{}", def.qualifier)),
+            KernelHome::Internal => continue,
+        };
+        let (scheme, is_higher_order) = match scheme {
+            KernelScheme::Schemed(ty) => {
+                let mut namer = VarNamer::new();
+                let doc = ty_to_doc(&ty, &interner, &mut namer)
+                    .map_err(|source| CoverageError::RenderScheme { kernel, source })?;
+                let higher_order = scheme_is_higher_order(&doc);
+                (SchemeState::Rendered(render_ty(&doc)), higher_order)
+            }
+            KernelScheme::Unschemed => (SchemeState::Unschemed, false),
+        };
         insert(
             by_key,
             StdlibSymbol {
@@ -622,14 +661,67 @@ mod tests {
     }
 
     #[test]
-    fn a_shape_scoped_qualifier_with_no_override_stays_a_named_phantom() {
-        // `Cmd`/`Sub` match none of tiers 1-4 (no standalone module by design,
-        // no override entry) -- tier 5 must still resolve, not error, so the
-        // row stays on the surface for `HomeColumn` to flag as a `Hole`.
+    fn a_shape_scoped_qualifier_is_shape_scoped_not_an_invented_module() {
+        // `Cmd`/`Sub` have no standalone module by design: the home says so in
+        // its type, so no consumer can page `Ipe.Cmd` as if it existed.
         let empty = BTreeMap::new();
-        let path = kernel_module_path("Cmd", &empty, &empty, &empty)
-            .expect("a qualifier with no override must fall through to the phantom path");
-        assert_eq!(path, vec!["Ipe".to_owned(), "Cmd".to_owned()]);
+        for qualifier in SHAPE_SCOPED_QUALIFIERS {
+            let home = kernel_module_path(qualifier, &empty, &empty, &empty);
+            assert!(
+                matches!(home, Ok(KernelHome::ShapeScoped)),
+                "{qualifier}: {home:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unresolved_non_shape_qualifier_is_unknown_not_a_phantom_module() {
+        // A new kernel family no tier homes must refuse by name, never fall
+        // back to an invented `Ipe.<qualifier>` path.
+        let empty = BTreeMap::new();
+        let result = kernel_module_path("NoSuchFamily", &empty, &empty, &empty);
+        assert!(matches!(
+            result,
+            Err(CoverageError::UnknownQualifier {
+                qualifier: "NoSuchFamily"
+            })
+        ));
+    }
+
+    #[test]
+    fn an_underscore_qualifier_is_internal_before_any_tier() {
+        // Even a qualifier a tier could home is internal when `_`-prefixed.
+        let homed: QualifierModuleMap =
+            BTreeMap::from([("_internal_".to_owned(), vec!["Ipe".to_owned()])]);
+        let empty = BTreeMap::new();
+        let home = kernel_module_path("_internal_", &homed, &empty, &empty);
+        assert!(matches!(home, Ok(KernelHome::Internal)), "{home:?}");
+    }
+
+    #[test]
+    fn a_final_segment_two_compiled_modules_share_homes_no_qualifier() {
+        let mut seen: BTreeMap<String, usize> = BTreeMap::new();
+        for m in ipe_stdlib::COMPILED_STD_MODULES {
+            if let Some(last) = segments_of(m.dotted).last() {
+                *seen.entry(last.clone()).or_default() += 1;
+            }
+        }
+        let shared: Vec<&String> = seen
+            .iter()
+            .filter(|(_, n)| **n > 1)
+            .map(|(last, _)| last)
+            .collect();
+        assert!(
+            !shared.is_empty(),
+            "control: the live stdlib has at least one shared final segment"
+        );
+        let (_, _, by_last) = qualifier_lookup_tables();
+        for last in shared {
+            assert!(
+                !by_last.contains_key(last),
+                "`{last}` is shared by two modules and must home no qualifier"
+            );
+        }
     }
 
     #[test]

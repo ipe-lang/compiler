@@ -58,6 +58,11 @@ pub enum CoverageError {
         /// Whether the kernel appears in `kernel_type_table`'s output.
         in_table: bool,
     },
+    /// The kernel type-scheme table lists one kernel more than once.
+    KernelTableDuplicate {
+        /// The kernel the table lists twice.
+        kernel: StdlibKernel,
+    },
     /// An interned symbol in a module's `exposing (...)` list did not resolve.
     UnresolvedSymbol {
         /// The module whose `exposing` list named the symbol.
@@ -115,6 +120,10 @@ impl fmt::Display for CoverageError {
                  type-scheme table (in_table={in_table}) — the kernel registry \
                  and the scheme table have drifted apart"
             ),
+            Self::KernelTableDuplicate { kernel } => write!(
+                f,
+                "kernel `{kernel:?}` appears more than once in the type-scheme table"
+            ),
             Self::UnresolvedSymbol { module } => write!(
                 f,
                 "module `{}` exposes a symbol that failed to resolve from the interner",
@@ -139,7 +148,14 @@ impl std::error::Error for CoverageError {
             Self::Manifest(e) | Self::Lockfile(e) => Some(&**e),
             Self::Scratch(e) | Self::RuntimeSrc(e) => Some(e),
             Self::EnvScan(e) => Some(&**e),
-            _ => None,
+            Self::Extract { source, .. } => Some(source),
+            Self::Parse { .. }
+            | Self::KernelTable(_)
+            | Self::RenderScheme { .. }
+            | Self::KernelTableDrift { .. }
+            | Self::KernelTableDuplicate { .. }
+            | Self::UnresolvedSymbol { .. }
+            | Self::UnknownQualifier { .. } => None,
         }
     }
 }
