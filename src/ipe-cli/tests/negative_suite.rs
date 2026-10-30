@@ -5004,3 +5004,87 @@ main =
     );
     assert_compiles("maybe_other_exports_compile", &src);
 }
+
+// ===========================================================================
+// `Ipe.Remote` — unschemed kernels, refused at `ipe` time (IPE-L0108)
+// ===========================================================================
+
+/// Whether `dir` holds any emitted `.rs` file, at any depth.
+fn holds_rust(dir: &std::path::Path) -> bool {
+    std::fs::read_dir(dir).is_ok_and(|entries| {
+        entries.flatten().any(|entry| {
+            let path = entry.path();
+            if path.is_dir() {
+                holds_rust(&path)
+            } else {
+                path.extension().is_some_and(|ext| ext == "rs")
+            }
+        })
+    })
+}
+
+/// Assert `source` is refused with exactly `expected` (a non-zero exit) AND
+/// that the refused build wrote no Rust into its output directory.
+#[track_caller]
+fn assert_rejected_without_emit(name: &str, source: &str, expected: &str) {
+    assert_rejected(name, source, expected);
+    let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+        .join("negsuite-out")
+        .join(name);
+    assert!(
+        !holds_rust(&out),
+        "{name}: the refused build emitted Rust under {}",
+        out.display()
+    );
+}
+
+/// Every `Ipe.Remote` kernel is unschemed until its lowering, emit arm and
+/// runtime exist, so a program that references one is refused with IPE-L0108
+/// and emits no Rust. Iterates the SSOT, so a seventh kernel is covered the
+/// moment it joins `REMOTE_INTERCEPTED`.
+#[test]
+fn remote_kernel_reference_is_refused() {
+    for kernel in ipe_kernels::StdlibKernel::REMOTE_INTERCEPTED {
+        let member = kernel.def().name;
+        let src = format!(
+            "module Main exposing (main, probe)\n\
+             import Ipe.Io as Io\n\
+             import Ipe.Remote as Remote\n\
+             probe =\n\
+             \x20   Remote.{member}\n\
+             main : Task Error ()\n\
+             main =\n\
+             \x20   Io.println \"ok\"\n"
+        );
+        assert_rejected_without_emit(&format!("remote_kernel_{member}"), &src, "IPE-L0108");
+    }
+}
+
+/// A binding annotated with `Remote Int Int`, with no kernel use, is refused
+/// with IPE-L0108 (`Unsupported(Feature::Kernels)`) — never an internal error.
+#[test]
+fn remote_annotation_is_refused() {
+    let src = "module Main exposing (main, f)\n\
+               import Ipe.Io as Io\n\
+               import Ipe.Remote exposing (Remote)\n\
+               f : Remote Int Int -> Int\n\
+               f _endpoint =\n\
+               \x20   0\n\
+               main : Task Error ()\n\
+               main =\n\
+               \x20   Io.println \"ok\"\n";
+    assert_rejected_without_emit("remote_annotation", src, "IPE-L0108");
+}
+
+/// Importing `Ipe.Remote` without using it compiles: the refusal is keyed on a
+/// use, not on the import.
+#[test]
+fn remote_import_without_use_compiles() {
+    let src = "module Main exposing (main)\n\
+               import Ipe.Io as Io\n\
+               import Ipe.Remote as Remote\n\
+               main : Task Error ()\n\
+               main =\n\
+               \x20   Io.println \"ok\"\n";
+    assert_compiles("remote_import_without_use", src);
+}

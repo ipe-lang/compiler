@@ -117,7 +117,9 @@ use ipe_runtime_rust::inbound_authority::{Authority, AuthorityRefusal, DeclaredN
 use ipe_types::{VarNamer, kernel_type_table, ty_to_doc};
 
 use crate::CliError;
-use crate::api_surface::{ModuleApi, ModulePath, PublicApi, UnionApi, extract_walked, read_tree};
+use crate::api_surface::{
+    DiffError, ModuleApi, ModulePath, PublicApi, UnionApi, extract_walked, read_tree,
+};
 use crate::cli_args::OutputFormat;
 use crate::doc_bundle::{
     BundleError, BundleSource, DocBundle, DocEntry, DocKind, DocsOverlay, is_qualified,
@@ -922,7 +924,7 @@ fn run_doc_lookup_with_fuzzy(query: &DocQuery, format: OutputFormat) -> Result<(
     }
 
     // A member of a module the index does not carry (a project module).
-    match resolve_member(key) {
+    match resolve_member(key)? {
         MemberResolution::Found(module, member) => {
             render_member(&module, &member, format);
             return Ok(());
@@ -1049,11 +1051,14 @@ fn ambiguous_module_error(query: &str, candidates: &[String], format: OutputForm
 ///
 /// Matches (`Ipe.Time.unixMillis`, `Main.helper`) when the module exists and
 /// exposes a value or type of that name.
-fn resolve_member(key: &str) -> MemberResolution {
+///
+/// # Errors
+/// [`CliError`] when the matched stdlib module cannot be documented.
+fn resolve_member(key: &str) -> Result<MemberResolution, CliError> {
     let Some((module_name, member)) = key.rsplit_once('.') else {
-        return MemberResolution::Miss;
+        return Ok(MemberResolution::Miss);
     };
-    match find_module_doc(module_name) {
+    Ok(match find_module_doc(module_name)? {
         ModuleLookup::Found(module) => {
             let exposed = module.values.iter().any(|v| v.name == member)
                 || module.unions.iter().any(|u| u.name == member);
@@ -1065,7 +1070,7 @@ fn resolve_member(key: &str) -> MemberResolution {
         }
         ModuleLookup::Ambiguous(candidates) => MemberResolution::Ambiguous(candidates),
         ModuleLookup::Miss => MemberResolution::Miss,
-    }
+    })
 }
 
 /// One module-name resolution's outcome, across project and stdlib.
@@ -1079,18 +1084,21 @@ enum ModuleLookup {
 
 /// Find a module's doc by name: a project module first (it shadows the
 /// standard library), then the standard library.
-fn find_module_doc(module_name: &str) -> ModuleLookup {
+///
+/// # Errors
+/// [`CliError`] when the matched stdlib module cannot be documented.
+fn find_module_doc(module_name: &str) -> Result<ModuleLookup, CliError> {
     if let Some(module) = query_project_modules()
         .into_iter()
         .find(|m| m.name == module_name)
     {
-        return ModuleLookup::Found(module);
+        return Ok(ModuleLookup::Found(module));
     }
-    match query_single_stdlib_module(module_name) {
+    Ok(match query_single_stdlib_module(module_name)? {
         StdlibModuleLookup::Found(module) => ModuleLookup::Found(module),
         StdlibModuleLookup::Ambiguous(candidates) => ModuleLookup::Ambiguous(candidates),
         StdlibModuleLookup::Miss => ModuleLookup::Miss,
-    }
+    })
 }
 
 /// Render one member of `module` per `format`: its signature (or type
@@ -1524,7 +1532,7 @@ fn build_docs(path: &Path) -> Result<(DocsJson, DocInputs), CliError> {
     project_modules.sort_by(|a, b| a.name.cmp(&b.name));
 
     // Collect stdlib modules (both compiled-source and kernel-backed).
-    let mut stdlib = build_stdlib_docs();
+    let mut stdlib = build_stdlib_docs()?;
     stdlib.sort_by(|a, b| a.name.cmp(&b.name));
 
     // A project module shadows a stdlib module of the same name — project wins.
@@ -1641,16 +1649,18 @@ fn stdlib_module_names() -> Vec<String> {
 /// modules (injecting each individually as a minimal package). Kernel-qualifier
 /// modules use [`kernel_type_table`] for type signatures; doc-comments are empty
 /// (signatures are the contract for kernel-backed stdlib).
-fn build_stdlib_docs() -> Vec<ModuleDoc> {
+///
+/// # Errors
+/// [`CliError`] when a shipped compiled-source module cannot be documented or
+/// the kernel type table cannot be built: a stdlib page is never silently empty.
+fn build_stdlib_docs() -> Result<Vec<ModuleDoc>, CliError> {
     let mut modules: BTreeMap<String, ModuleDoc> = BTreeMap::new();
 
     // ── Compiled-source stdlib modules ────────────────────────────────────────
     // Each compiled-source module is type-checked as embedded stdlib (so it may
     // declare the reserved `Ipe.*` namespace); signatures and unions come from the
-    // type checker, doc-comments from the embedded source. Every module yields a
-    // ModuleDoc — a type-check failure degrades to a doc-comment-only entry rather
-    // than being dropped, so every `--list` name is queryable (see the invariant
-    // enforced by `stdlib_module_names`, reconciled below).
+    // type checker, doc-comments from the embedded source. A module that cannot
+    // be documented refuses the whole build rather than shipping an empty page.
     //
     // `Ipe.Tea.Terminal` is superseded by `Ipe.Color`; its compiled-source
     // modules are skipped so the doc site does not expose retired namespace pages.
@@ -1661,7 +1671,7 @@ fn build_stdlib_docs() -> Vec<ModuleDoc> {
         let segments: Vec<String> = csm.dotted.split('.').map(str::to_owned).collect();
         modules.insert(
             csm.dotted.to_owned(),
-            build_compiled_std_module_doc(&segments, csm.source),
+            build_compiled_std_module_doc(&segments, csm.source)?,
         );
     }
 
@@ -1681,13 +1691,9 @@ fn build_stdlib_docs() -> Vec<ModuleDoc> {
 
     // ── Kernel-qualifier stdlib modules ───────────────────────────────────────
     // Signatures come from kernel_type_table; doc-comments are absent for these
-    // compiler-internal modules (signatures are the contract). If the kernel
-    // type table cannot be constructed, kernel modules are omitted (names still
-    // appear in --list via stdlib_module_names).
-    if let Ok(kernel_docs) = build_kernel_module_docs() {
-        for (name, doc) in kernel_docs {
-            modules.entry(name).or_insert(doc);
-        }
+    // compiler-internal modules (signatures are the contract).
+    for (name, doc) in build_kernel_module_docs()? {
+        modules.entry(name).or_insert(doc);
     }
 
     // ── SSOT reconciliation ───────────────────────────────────────────────────
@@ -1701,7 +1707,7 @@ fn build_stdlib_docs() -> Vec<ModuleDoc> {
             .or_insert_with(|| empty_stdlib_module_doc(&name));
     }
 
-    modules.into_values().collect()
+    Ok(modules.into_values().collect())
 }
 
 /// One stdlib module-name query's outcome, against a candidate set.
@@ -1760,11 +1766,17 @@ enum StdlibModuleLookup {
 ///    the full kernel-doc pass already costs one check; take this name's entry.
 /// 3. A listed-but-otherwise-undocumentable name — the signature-less fallback,
 ///    preserving the `--list` == queryable SSOT invariant.
-fn query_single_stdlib_module(module_name: &str) -> StdlibModuleLookup {
+///
+/// # Errors
+/// [`CliError`] when the matched module cannot be documented (see
+/// [`build_compiled_std_module_doc`]) or the kernel type table cannot be built.
+fn query_single_stdlib_module(module_name: &str) -> Result<StdlibModuleLookup, CliError> {
     let names = stdlib_module_names();
     let dotted = match resolve_stdlib_candidate(module_name, &names) {
-        StdlibCandidate::None => return StdlibModuleLookup::Miss,
-        StdlibCandidate::Ambiguous(candidates) => return StdlibModuleLookup::Ambiguous(candidates),
+        StdlibCandidate::None => return Ok(StdlibModuleLookup::Miss),
+        StdlibCandidate::Ambiguous(candidates) => {
+            return Ok(StdlibModuleLookup::Ambiguous(candidates));
+        }
         StdlibCandidate::One(dotted) => dotted,
     };
 
@@ -1772,20 +1784,20 @@ fn query_single_stdlib_module(module_name: &str) -> StdlibModuleLookup {
     for csm in ipe_stdlib::COMPILED_STD_MODULES {
         if csm.dotted == dotted {
             let segments: Vec<String> = csm.dotted.split('.').map(str::to_owned).collect();
-            return StdlibModuleLookup::Found(build_compiled_std_module_doc(&segments, csm.source));
+            return Ok(StdlibModuleLookup::Found(build_compiled_std_module_doc(
+                &segments, csm.source,
+            )?));
         }
     }
 
     // 2. Kernel-qualifier: the type table is one shared db; take this entry.
-    if let Ok(mut kernel_docs) = build_kernel_module_docs()
-        && let Some(doc) = kernel_docs.remove(&dotted)
-    {
-        return StdlibModuleLookup::Found(doc);
+    if let Some(doc) = build_kernel_module_docs()?.remove(&dotted) {
+        return Ok(StdlibModuleLookup::Found(doc));
     }
 
     // 3. Listed-name SSOT fallback: a queryable, signature-less entry. `dotted`
     // came from `stdlib_module_names()` itself, so this is always reachable.
-    StdlibModuleLookup::Found(empty_stdlib_module_doc(&dotted))
+    Ok(StdlibModuleLookup::Found(empty_stdlib_module_doc(&dotted)))
 }
 
 /// A signature-less [`ModuleDoc`] carrying only the module name — the last-resort
@@ -1807,19 +1819,89 @@ fn empty_stdlib_module_doc(name: &str) -> ModuleDoc {
 /// [`crate::api_surface::extract_stdlib_module`], which grants the reserved-`Ipe.*`
 /// declaration a project's injected closure already grants it) to recover full
 /// signatures and unions, joining them to the doc-comments scanned from the
-/// source. Always yields a [`ModuleDoc`]: if the module cannot be type-checked,
-/// the result degrades to the scanned doc-comments over an empty API rather than
-/// disappearing, so the module stays queryable and `--list`/query agree.
-fn build_compiled_std_module_doc(segments: &[String], source: &str) -> ModuleDoc {
+/// source.
+///
+/// An exported alias of an unschemed kernel has no checked signature (every
+/// use is refused with IPE-L0108); it is documented with its source annotation,
+/// whose resolved-type field is the [`TyDoc::Unit`] placeholder.
+///
+/// # Errors
+/// [`DiffError`] when the module does not type-check, projects no interface,
+/// or exports an unschemed kernel alias without an annotation: a shipped stdlib
+/// module that cannot be documented is refused, never shown as an empty page.
+fn build_compiled_std_module_doc(
+    segments: &[String],
+    source: &str,
+) -> Result<ModuleDoc, DiffError> {
     use crate::api_surface::extract_stdlib_module;
 
     let comments = scan_doc_comments(source);
-    let module_api = extract_stdlib_module(segments, source)
-        .ok()
-        .and_then(|api| api.modules.get(segments).cloned())
-        .unwrap_or_default();
+    let api = extract_stdlib_module(segments, source)?;
     let segments_vec: Vec<String> = segments.to_vec();
-    module_doc(&segments_vec, &module_api, &comments, ModuleKind::Stdlib)
+    let Some(module_api) = api.modules.get(segments) else {
+        return Err(DiffError::OpenInterface {
+            module: segments_vec,
+        });
+    };
+    let mut doc = module_doc(&segments_vec, module_api, &comments, ModuleKind::Stdlib);
+    if module_api.unbacked_kernel_aliases.is_empty() {
+        return Ok(doc);
+    }
+    let annotations = value_annotations(source).map_err(|diag| DiffError::Typecheck {
+        module: segments_vec.clone(),
+        diag: Box::new(diag),
+    })?;
+    for name in &module_api.unbacked_kernel_aliases {
+        let Some(signature) = annotations.get(name).cloned() else {
+            return Err(DiffError::Typecheck {
+                module: segments_vec,
+                diag: Box::new(ipe_diagnostics::Diagnostic::CompilerBug {
+                    where_: "doc.unbacked_kernel_alias",
+                    detail: format!("unschemed kernel alias `{name}` has no annotation"),
+                }),
+            });
+        };
+        doc.values.push(ValueDoc {
+            name: name.clone(),
+            signature,
+            signature_ty: TyDoc::Unit,
+            comment: comments.get(name).unwrap_or_default(),
+        });
+    }
+    doc.values.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(doc)
+}
+
+/// Each annotated value of `source` → its annotation's type text, whitespace
+/// runs folded to one space (an annotation may span lines).
+///
+/// # Errors
+/// The parse diagnostic when `source` does not parse.
+fn value_annotations(
+    source: &str,
+) -> Result<BTreeMap<String, String>, ipe_diagnostics::Diagnostic> {
+    let mut interner = Interner::new();
+    let parsed = ipe_parse::parse_module(source, &mut interner)?;
+    let mut annotations = BTreeMap::new();
+    for value in &parsed.values {
+        let Some(annotation) = &value.value.type_annotation else {
+            continue;
+        };
+        let (Some(name), Some(text)) = (
+            interner.resolve(value.value.name.value),
+            usize::try_from(annotation.span.lo)
+                .ok()
+                .zip(usize::try_from(annotation.span.hi).ok())
+                .and_then(|(lo, hi)| source.get(lo..hi)),
+        ) else {
+            continue;
+        };
+        annotations.insert(
+            name.to_owned(),
+            text.split_whitespace().collect::<Vec<_>>().join(" "),
+        );
+    }
+    Ok(annotations)
 }
 
 /// Build a [`ModuleDoc`] for a documentation-only reserved qualifier
@@ -2102,7 +2184,7 @@ fn query_module(term: &DocQuery, format: OutputFormat) -> Result<(), CliError> {
         return Ok(());
     }
 
-    match query_single_stdlib_module(module_name) {
+    match query_single_stdlib_module(module_name)? {
         StdlibModuleLookup::Found(module) => {
             render_query_module(&module, format);
             Ok(())
@@ -2112,7 +2194,7 @@ fn query_module(term: &DocQuery, format: OutputFormat) -> Result<(), CliError> {
         }
         // `Module.member` (a type or an uppercase-led value path) or a miss:
         // resolve the member, else suggest the closest entries of any kind.
-        StdlibModuleLookup::Miss => match resolve_member(module_name) {
+        StdlibModuleLookup::Miss => match resolve_member(module_name)? {
             MemberResolution::Found(owner, member) => {
                 render_member(&owner, &member, format);
                 Ok(())
@@ -2891,7 +2973,7 @@ fn write_format_dir(
 fn build_docs_or_stdlib(path: &Path) -> Result<(DocsJson, DocInputs), CliError> {
     build_docs(path).or_else(|err| match err {
         CliError::Diff(crate::api_surface::DiffError::Empty { .. }) => {
-            Ok((build_stdlib_only_docs(), DocInputs::StdlibOnly))
+            Ok((build_stdlib_only_docs()?, DocInputs::StdlibOnly))
         }
         other => Err(other),
     })
@@ -2902,16 +2984,20 @@ fn build_docs_or_stdlib(path: &Path) -> Result<(DocsJson, DocInputs), CliError> 
 /// Used when `ipe doc --write-format <fmt>` is invoked outside a project
 /// directory. The project extraction pipeline (`extract_tree`/`read_tree`) is
 /// not called; only stdlib modules are enumerated.
-fn build_stdlib_only_docs() -> DocsJson {
-    let mut stdlib = build_stdlib_docs();
+///
+/// # Errors
+/// [`CliError`] when a stdlib module cannot be documented
+/// ([`build_stdlib_docs`]).
+fn build_stdlib_only_docs() -> Result<DocsJson, CliError> {
+    let mut stdlib = build_stdlib_docs()?;
     stdlib.sort_by(|a, b| a.name.cmp(&b.name));
-    DocsJson {
+    Ok(DocsJson {
         version: DOCS_JSON_VERSION,
         modules: stdlib,
         // No project on disk to disclose — a stdlib-only render carries no
         // package control model or capability set.
         disclosure: None,
-    }
+    })
 }
 
 /// Verify every exposed binding in the package at `path` carries a doc-comment.
@@ -6489,7 +6575,13 @@ mod tests {
         let mut gaps = Vec::new();
         for module in ipe_stdlib::COMPILED_STD_MODULES {
             let segments: Vec<String> = module.dotted.split('.').map(str::to_owned).collect();
-            let doc = build_compiled_std_module_doc(&segments, module.source);
+            let doc = match build_compiled_std_module_doc(&segments, module.source) {
+                Ok(doc) => doc,
+                Err(e) => {
+                    gaps.push(format!("{}: not documented: {e}", module.dotted));
+                    continue;
+                }
+            };
             let shared = ipe_docs::stdlib_docs::extract_module_doc(module.dotted, module.source);
             for export in &shared.exports {
                 if !export.name.starts_with(|c: char| c.is_ascii_lowercase()) {
@@ -6515,6 +6607,69 @@ mod tests {
             "stdlib values off the doc surface:\n{}",
             gaps.join("\n")
         );
+    }
+
+    /// Refusal: a compiled-source module that does not type-check is refused,
+    /// never documented as an empty page.
+    #[test]
+    fn compiled_stdlib_module_that_fails_extraction_is_refused() {
+        let segments: Vec<String> = ["Ipe", "Broken"].map(str::to_owned).to_vec();
+        let source = "module Ipe.Broken exposing (x)\n\n\nx : Int\nx =\n    \"text\"\n";
+        assert!(matches!(
+            build_compiled_std_module_doc(&segments, source),
+            Err(DiffError::Typecheck { .. })
+        ));
+    }
+
+    /// Refusal: an exported alias of an unschemed kernel with no annotation has
+    /// no signature to document, so the module is refused rather than shown
+    /// without it.
+    #[test]
+    fn unannotated_unschemed_kernel_alias_is_refused() {
+        let segments: Vec<String> = ["Ipe", "Remote"].map(str::to_owned).to_vec();
+        let source = "module Ipe.Remote exposing (call)\n\nimport Ipe.Ffi.Kernel as Kernel\n\n\ncall =\n    Kernel.kernel \"Remote_call\"\n";
+        let refused = build_compiled_std_module_doc(&segments, source);
+        assert!(
+            matches!(
+                &refused,
+                Err(DiffError::Typecheck { diag, .. })
+                    if matches!(**diag, ipe_diagnostics::Diagnostic::CompilerBug {
+                        where_: "doc.unbacked_kernel_alias",
+                        ..
+                    })
+            ),
+            "{refused:?}"
+        );
+    }
+
+    /// An unschemed kernel alias is documented with its source annotation,
+    /// folded to one line, and its doc comment.
+    #[test]
+    fn unschemed_kernel_alias_documents_its_annotation() {
+        let module = ipe_stdlib::COMPILED_STD_MODULES
+            .iter()
+            .find(|m| m.dotted == "Ipe.Remote")
+            .expect("Ipe.Remote is a compiled-source module");
+        let segments: Vec<String> = module.dotted.split('.').map(str::to_owned).collect();
+        let doc = build_compiled_std_module_doc(&segments, module.source).expect("documented");
+        let authed = doc
+            .values
+            .iter()
+            .find(|v| v.name == "authed")
+            .expect("authed is documented");
+        assert_eq!(
+            authed.signature,
+            "RemoteAuth -> (Principal -> req -> Task Error resp) -> Remote req resp"
+        );
+        assert!(
+            authed.comment.starts_with("`authed key handler`"),
+            "{}",
+            authed.comment
+        );
+        let names: Vec<&str> = doc.values.iter().map(|v| v.name.as_str()).collect();
+        let mut sorted = names.clone();
+        sorted.sort_unstable();
+        assert_eq!(names, sorted, "values stay in name order");
     }
 
     #[test]
@@ -7102,7 +7257,7 @@ mod tests {
     /// the engine fixes both at once.
     #[test]
     fn serve_html_matches_write_format_html_byte_for_byte() {
-        let docs = build_stdlib_only_docs();
+        let docs = build_stdlib_only_docs().expect("the stdlib docs build");
         let bundle = build_doc_bundle(&repo_overlay()).expect("bundle builds");
         let (_json, _md, split_html) = render_site_split(&docs, &bundle, WriteFormat::Html);
         let serve_html = render_site_for_serve(&docs, &bundle);
@@ -7228,7 +7383,7 @@ mod tests {
 
     #[test]
     fn the_policy_names_exactly_the_scripts_a_page_carries() {
-        let docs = build_stdlib_only_docs();
+        let docs = build_stdlib_only_docs().expect("the stdlib docs build");
         let bundle = build_doc_bundle(&repo_overlay()).expect("bundle builds");
         let site = render_site_for_serve(&docs, &bundle);
         let named = csp_script_sources(&preview_headers().csp);
@@ -7563,7 +7718,7 @@ mod tests {
 
     #[test]
     fn build_stdlib_only_docs_contains_known_modules() {
-        let docs = build_stdlib_only_docs();
+        let docs = build_stdlib_only_docs().expect("the stdlib docs build");
         let names: Vec<&str> = docs.modules.iter().map(|m| m.name.as_str()).collect();
         assert!(names.contains(&"Ipe.List"), "Ipe.List in stdlib: {names:?}");
         assert!(
@@ -7575,7 +7730,7 @@ mod tests {
 
     #[test]
     fn build_stdlib_only_docs_all_modules_are_stdlib_kind() {
-        let docs = build_stdlib_only_docs();
+        let docs = build_stdlib_only_docs().expect("the stdlib docs build");
         for m in &docs.modules {
             assert_eq!(
                 m.kind,
@@ -8136,7 +8291,7 @@ mod tests {
     /// href-scheme / output-path drift from recurring.
     #[test]
     fn every_generated_href_resolves_to_a_generated_file() {
-        let docs = build_stdlib_only_docs();
+        let docs = build_stdlib_only_docs().expect("the stdlib docs build");
         let bundle = build_doc_bundle(&repo_overlay()).expect("bundle");
         let site = render_site_for_serve(&docs, &bundle);
 
@@ -8170,7 +8325,7 @@ mod tests {
     #[test]
     fn per_entry_pages_exist_for_every_linked_kind() {
         use crate::doc_bundle::DocKind;
-        let docs = build_stdlib_only_docs();
+        let docs = build_stdlib_only_docs().expect("the stdlib docs build");
         let bundle = build_doc_bundle(&repo_overlay()).expect("bundle");
         let site = render_site_for_serve(&docs, &bundle);
 
@@ -8676,7 +8831,7 @@ withBaseMs = something
     /// unrepresentable: both draw from `command_doc_markdown`.
     #[test]
     fn command_page_html_mirrors_help_ssot() {
-        let docs = build_stdlib_only_docs();
+        let docs = build_stdlib_only_docs().expect("the stdlib docs build");
         let bundle = build_doc_bundle(&repo_overlay()).expect("bundle");
         let site = render_site_for_serve(&docs, &bundle);
 
@@ -8709,7 +8864,7 @@ withBaseMs = something
     /// generated site must not emit any page referencing it.
     #[test]
     fn tea_terminal_namespace_absent_from_site() {
-        let docs = build_stdlib_only_docs();
+        let docs = build_stdlib_only_docs().expect("the stdlib docs build");
         let bundle = build_doc_bundle(&repo_overlay()).expect("bundle");
         let site = render_site_for_serve(&docs, &bundle);
 
@@ -8730,7 +8885,7 @@ withBaseMs = something
     /// html` always show the same content.
     #[test]
     fn serve_html_equals_write_format_html() {
-        let docs = build_stdlib_only_docs();
+        let docs = build_stdlib_only_docs().expect("the stdlib docs build");
         let bundle = build_doc_bundle(&repo_overlay()).expect("bundle");
 
         let serve = render_site_for_serve(&docs, &bundle);
@@ -8817,7 +8972,13 @@ withBaseMs = something
     /// candidate table rules it out before any module is built).
     #[test]
     fn find_module_doc_misses_an_unknown_module() {
-        assert!(matches!(find_module_doc("NotAModule"), ModuleLookup::Miss));
-        assert!(matches!(find_module_doc("Ipe.Nope"), ModuleLookup::Miss));
+        assert!(matches!(
+            find_module_doc("NotAModule"),
+            Ok(ModuleLookup::Miss)
+        ));
+        assert!(matches!(
+            find_module_doc("Ipe.Nope"),
+            Ok(ModuleLookup::Miss)
+        ));
     }
 }

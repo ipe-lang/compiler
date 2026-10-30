@@ -1587,7 +1587,13 @@ pub const fn appearance_literal_args(k: KernelFn) -> &'static [(usize, LitKind)]
         | KernelFn::ColorTritanopia
         | KernelFn::ColorSimulate
         // The worker app-entry carries no appearance-hoist literal position.
-        | KernelFn::TeaWorker => &[],
+        | KernelFn::TeaWorker
+        | KernelFn::RemoteAuth
+        | KernelFn::RemotePublic
+        | KernelFn::RemoteAuthed
+        | KernelFn::RemoteSignIn
+        | KernelFn::RemoteSignOut
+        | KernelFn::RemoteCall => &[],
     }
 }
 

@@ -211,3 +211,26 @@ fn source_display_name_default_is_qualifier_dot_name() {
         );
     }
 }
+
+/// `Remote.call` is the browser's call of its own backend: the client and the
+/// native served shape reach it, a WASI program has no backend to call. The
+/// endpoint constructors reach nothing and exist on every target.
+#[test]
+fn remote_call_is_not_available_on_wasi() {
+    use ipe_kernels::Target;
+
+    assert!(!StdlibKernel::RemoteCall.available_on(Target::WasmWasi));
+    assert!(StdlibKernel::RemoteCall.available_on(Target::WasmClient));
+    assert!(StdlibKernel::RemoteCall.available_on(Target::Native));
+    for kernel in StdlibKernel::REMOTE_INTERCEPTED {
+        if kernel == StdlibKernel::RemoteCall {
+            continue;
+        }
+        for target in [Target::Native, Target::WasmClient, Target::WasmWasi] {
+            assert!(
+                kernel.available_on(target),
+                "{kernel:?} must be available on {target:?}"
+            );
+        }
+    }
+}
