@@ -470,6 +470,8 @@ pub const BUILTIN_TYPES: &[BuiltinRow] = &[
     homed("Ipe.Http", "RedirectPolicy", LoweredBelowGuard, Opaque)
         .tagged(BuiltinTag::RedirectPolicy),
     homed("Ipe.Jwt", "Claims", KernelImplicit, Opaque).tagged(BuiltinTag::Claims),
+    homed("Ipe.Remote", "Remote", LoweredBelowGuard, Opaque).tagged(BuiltinTag::Remote),
+    homed("Ipe.Remote", "RemoteAuth", LoweredBelowGuard, Opaque).tagged(BuiltinTag::RemoteAuth),
     homed("Ipe.Task", "BackoffStrategy", LoweredBelowGuard, Opaque)
         .tagged(BuiltinTag::BackoffStrategy),
     homed("Ipe.Task", "Step", LoweredBelowGuard, Opaque).tagged(BuiltinTag::TaskStep),

@@ -34,6 +34,9 @@ use std::collections::HashSet;
 /// The `Store.*` accessor-intercept placeholder symbols are NOT listed here —
 /// they are derived at test time from
 /// [`ipe_kernels::StdlibKernel::ACCESSOR_INTERCEPT_PLACEHOLDERS`], the SSOT.
+/// Nor are the `Ipe.Remote` kernels' symbols: they are derived from
+/// [`ipe_kernels::StdlibKernel::REMOTE_INTERCEPTED`] (unschemed, so every
+/// reference is refused at `ipe` time and no emitted program names one).
 /// See the `every_kernel_name_resolves_to_runtime_fn` test body below.
 const KNOWN_DEAD_OR_EPILOGUE: &[&str] = &[
     // ── Build-time: env_public embeds the whitelisted public environment
@@ -171,6 +174,9 @@ fn every_kernel_name_resolves_to_runtime_fn() {
         .map(|s| s.to_string())
         .collect();
     for k in ipe_kernels::StdlibKernel::ACCESSOR_INTERCEPT_PLACEHOLDERS {
+        allowlist.insert(k.def().runtime_fn.to_string());
+    }
+    for k in ipe_kernels::StdlibKernel::REMOTE_INTERCEPTED {
         allowlist.insert(k.def().runtime_fn.to_string());
     }
 
@@ -456,7 +462,9 @@ fn declared_arg_order_matches_runtime_signature() {
     let mut failures = Vec::new();
     for kernel in StdlibKernel::ALL {
         let def = kernel.def();
-        if def.arity != 2 {
+        // The `Ipe.Remote` kernels are unschemed and refused at `ipe` time, so
+        // no emitted program calls one: there is no argument order to prove.
+        if def.arity != 2 || StdlibKernel::REMOTE_INTERCEPTED.contains(kernel) {
             continue;
         }
         let Some(shape) = def.shape else {

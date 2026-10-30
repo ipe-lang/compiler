@@ -1,0 +1,84 @@
+-- | Ipe.Remote — typed endpoints between a program's client and its server.
+--
+-- A split program declares each server endpoint once, as a `Remote req resp`
+-- value, and the client calls it with `Remote.call`. The request and response
+-- types are the endpoint's contract: the client and the server agree on them
+-- at type-check time.
+--
+-- Every use of this module's functions, and every type annotation naming
+-- `Remote` or `RemoteAuth`, is refused with IPE-L0108: the endpoints have no
+-- lowering, emitter or runtime yet. Importing the module without using it
+-- compiles.
+--
+-- The endpoint constructors:
+--   * `public`   — an endpoint any caller may reach.
+--   * `authed`   — an endpoint only a signed-in caller reaches; its handler
+--                  receives the caller's `Principal`.
+--   * `signIn`   — the endpoint that opens a session from the `Grant` its
+--                  handler returns.
+--   * `signOut`  — the endpoint that closes the caller's session.
+module Ipe.Remote exposing (Remote, RemoteAuth, Grant, auth, public, authed, signIn, signOut, call)
+
+import Ipe.Ffi.Kernel as Kernel
+import Ipe.Error exposing (Error)
+
+
+-- | A server endpoint taking a `req` and answering a `resp`. The type
+-- parameters exist only at type-check time.
+--
+-- Build one with `public`, `authed`, `signIn` or `signOut`; the single opaque
+-- constructor exists only to make this a valid type declaration.
+type Remote req resp
+    = Remote
+
+
+-- | The session signing key the authed endpoints share. Build it with `auth`.
+type RemoteAuth
+    = RemoteAuth
+
+
+-- | What a sign-in handler returns: the subject the session is minted for and
+-- its roles.
+type alias Grant =
+    { subject : String
+    , roles : List String
+    }
+
+
+-- | `auth key` — the session signing key for `authed`, `signIn` and
+-- `signOut`. The key signs the session; user code never sees a token.
+auth : Secret -> RemoteAuth
+auth =
+    Kernel.kernel "Remote_auth"
+
+
+-- | `public handler` — an endpoint any caller may reach.
+public : (req -> Task Error resp) -> Remote req resp
+public =
+    Kernel.kernel "Remote_public"
+
+
+-- | `authed key handler` — an endpoint only a signed-in caller reaches. The
+-- handler receives the caller's `Principal` and the request.
+authed : RemoteAuth -> (Principal -> req -> Task Error resp) -> Remote req resp
+authed =
+    Kernel.kernel "Remote_authed"
+
+
+-- | `signIn key handler` — the endpoint that opens a session. The handler
+-- checks the request and returns the `Grant` the session is minted from.
+signIn : RemoteAuth -> (req -> Task Error Grant) -> Remote req ()
+signIn =
+    Kernel.kernel "Remote_signIn"
+
+
+-- | `signOut key` — the endpoint that closes the caller's session.
+signOut : RemoteAuth -> Remote () ()
+signOut =
+    Kernel.kernel "Remote_signOut"
+
+
+-- | `call endpoint request` — the client's call of a server endpoint.
+call : Remote req resp -> req -> Task Error resp
+call =
+    Kernel.kernel "Remote_call"
