@@ -138,8 +138,8 @@ fn runtime_and_canon_error_kinds_agree_in_name_order_and_discriminant() {
 #[test]
 fn the_agreement_scan_refuses_a_runtime_variant_canon_lacks() {
     let drifted = drift(
-        "    LimitExceeded = 11,\n",
-        "    LimitExceeded = 11,\n    Overloaded = 12,\n",
+        "    UpdateRequired = 12,\n",
+        "    UpdateRequired = 12,\n    Overloaded = 13,\n",
     );
     let runtime = runtime_error_kinds(&drifted).expect("drifted enum still parses");
     assert_ne!(runtime, canon_error_kinds());
@@ -157,13 +157,13 @@ fn the_agreement_scan_refuses_a_renumbered_variant() {
 #[test]
 fn the_agreement_scan_reads_variants_past_a_brace_in_a_doc_comment() {
     let drifted = drift(
-        "    LimitExceeded = 11,\n",
-        "    LimitExceeded = 11,\n    /// Renders as `{}`.\n    Overloaded = 12,\n",
+        "    UpdateRequired = 12,\n",
+        "    UpdateRequired = 12,\n    /// Renders as `{}`.\n    Overloaded = 13,\n",
     );
     let runtime = runtime_error_kinds(&drifted).expect("drifted enum still parses");
     assert_eq!(
         runtime.last(),
-        Some(&("Overloaded".to_owned(), 12)),
+        Some(&("Overloaded".to_owned(), 13)),
         "the variant after the doc brace is read"
     );
     assert_ne!(runtime, canon_error_kinds());

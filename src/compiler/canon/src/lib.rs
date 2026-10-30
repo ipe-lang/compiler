@@ -32,7 +32,7 @@ use ipe_diagnostics::DResult;
 use ipe_intern::{Interner, Symbol};
 
 pub use env::{
-    CtorHome, Env, ModuleCatalog, STDLIB_MODULE_QUALIFIERS, UnionParams, VarHome,
+    CtorHome, Env, KernelTypeExport, ModuleCatalog, STDLIB_MODULE_QUALIFIERS, UnionParams, VarHome,
     bare_import_binds, const_str_eq, kernel_import_binds_last_segment, stdlib_canonical_qualifier,
 };
 pub use resolve::{
@@ -103,9 +103,12 @@ pub struct ModuleExports {
 pub enum ExportedType {
     /// A union the module declares, with its declared type-parameter count.
     Union { home: Vec<Symbol>, params: usize },
-    /// A reserved builtin carrier the module re-exports; the builtin table
-    /// owns its arity.
-    Builtin { home: Vec<Symbol> },
+    /// A reserved builtin carrier the module re-exports, with the row that owns
+    /// its arity. An empty `home` is the row's own builtin home, never a union.
+    Builtin {
+        home: Vec<Symbol>,
+        row: ipe_kernels::BuiltinType,
+    },
 }
 
 impl ExportedType {
@@ -113,7 +116,7 @@ impl ExportedType {
     #[must_use]
     pub fn home(&self) -> &[Symbol] {
         match self {
-            Self::Union { home, .. } | Self::Builtin { home } => home,
+            Self::Union { home, .. } | Self::Builtin { home, .. } => home,
         }
     }
 }
