@@ -116,6 +116,7 @@ Each module listed below links to a detail page with the full documentation and 
 - [Random](#random)
 - [Random.Generator](#randomgenerator)
 - [Regex](#regex)
+- [Remote](#remote)
 - [Result](#result)
 - [Secret.Unsafe](#secretunsafe)
 - [Set](#set)
@@ -2624,6 +2625,24 @@ Ipe.Regex — RE2 regex helpers.
 | `findAll` | `findAll re s` — every non-overlapping match in order. |
 | `replace` | `replace re replacement s` — replace every match with `replacement`. |
 | `split` | `split re s` — split on every match. |
+
+## Remote
+
+[Full reference](stdlib/Remote.md)
+
+Ipe.Remote — typed endpoints between a program's client and its server.
+
+| Export | Summary |
+|--------|----------|
+| `Remote` | A server endpoint taking a `req` and answering a `resp`. The type |
+| `RemoteAuth` | The session signing key the authed endpoints share. Build it with `auth`. |
+| `Grant` | What a sign-in handler returns: the subject the session is minted for and |
+| `auth` | `auth key` — the session signing key for `authed`, `signIn` and |
+| `public` | `public handler` — an endpoint any caller may reach. |
+| `authed` | `authed key handler` — an endpoint only a signed-in caller reaches. The |
+| `signIn` | `signIn key handler` — the endpoint that opens a session. The handler |
+| `signOut` | `signOut key` — the endpoint that closes the caller's session. |
+| `call` | `call endpoint request` — the client's call of a server endpoint. |
 
 ## Result
 

@@ -367,6 +367,15 @@ fn canon_kernel_aliases(
     dotted: &str,
     replacement: Option<&str>,
 ) -> Result<BTreeSet<String>, String> {
+    canon_kernel_alias_routes(dotted, replacement).map(|routes| routes.into_keys().collect())
+}
+
+/// The exported kernel aliases canon records for `dotted`, each with the
+/// registered kernel it routes to.
+fn canon_kernel_alias_routes(
+    dotted: &str,
+    replacement: Option<&str>,
+) -> Result<BTreeMap<String, ipe_kernels::StdlibKernel>, String> {
     let mut user = UserSources::new();
     user.insert(
         entry_path(),
@@ -390,11 +399,11 @@ fn canon_kernel_aliases(
     canon
         .exports
         .kernel_aliases
-        .keys()
-        .map(|s| {
+        .iter()
+        .map(|(s, alias)| {
             interner
                 .resolve(*s)
-                .map(str::to_owned)
+                .map(|name| (name.to_owned(), alias.id))
                 .ok_or_else(|| format!("{dotted}: a kernel-alias name is not interned"))
         })
         .collect()
@@ -999,6 +1008,97 @@ fn check_unprobeable(
     }
 }
 
+/// The `Module.member` paths of `dotted`'s kernel aliases whose kernel carries
+/// no scheme.
+///
+/// Derived from the kernel registry (`scheme_shape`), never listed: such a
+/// kernel has no enforced scheme to compare an annotation against, and every
+/// reference to it is refused. The moment its scheme lands the alias leaves
+/// this set and is probed like any other.
+fn unbacked_alias_paths(
+    dotted: &str,
+    routes: &BTreeMap<String, ipe_kernels::StdlibKernel>,
+) -> BTreeSet<String> {
+    routes
+        .iter()
+        .filter(|(_, kernel)| kernel.scheme_shape().is_none())
+        .map(|(name, _)| format!("{dotted}.{name}"))
+        .collect()
+}
+
+/// Check one alias of an unschemed kernel: its verbatim restatement must be
+/// refused with exactly IPE-L0108 (`Unsupported(Feature::Kernels)`), so the
+/// exemption holds only while the kernel is refused at `ipe` time.
+fn check_unbacked(m: &ProbeModule, member: &AliasMember) -> Result<(), String> {
+    let expected = ipe_diagnostics::IPE_L0108.as_str();
+    match run_probe(
+        m,
+        &probe_source(m, std::slice::from_ref(member), 0),
+        1,
+        &BTreeSet::new(),
+    ) {
+        Err(ProbeFailure { code: Some(c), .. }) if c == expected => Ok(()),
+        other => Err(format!(
+            "{}.{}: its kernel carries no scheme, so a reference must be refused with \
+             {expected}, but the verbatim probe gave {other:?}",
+            m.dotted, member.name
+        )),
+    }
+}
+
+/// The members of one probe module left after its unschemed aliases are
+/// driven to their refusal.
+struct BackedMembers {
+    /// The `Module.member` paths refused with exactly IPE-L0108.
+    refused: Vec<String>,
+    /// Every member whose kernel carries a scheme.
+    backed: Vec<AliasMember>,
+}
+
+/// Take `m`'s members, drive each one in `unbacked` to its IPE-L0108 refusal
+/// (pushing a failure for any other outcome, or for an `UNPROBEABLE` listing),
+/// and return the refused paths with the remaining members.
+fn split_off_unbacked(
+    m: &mut ProbeModule,
+    unbacked: &BTreeSet<String>,
+    failures: &mut Vec<String>,
+) -> BackedMembers {
+    let (unschemed, backed): (Vec<AliasMember>, Vec<AliasMember>) = std::mem::take(&mut m.members)
+        .into_iter()
+        .partition(|member| unbacked.contains(&format!("{}.{}", m.dotted, member.name)));
+    let mut refused = Vec::new();
+    for member in &unschemed {
+        let path = format!("{}.{}", m.dotted, member.name);
+        if UNPROBEABLE.iter().any(|u| u.path == path) {
+            failures.push(format!(
+                "{path}: listed UNPROBEABLE but its kernel carries no scheme"
+            ));
+            continue;
+        }
+        match check_unbacked(m, member) {
+            Ok(()) => refused.push(path),
+            Err(e) => failures.push(e),
+        }
+    }
+    BackedMembers { refused, backed }
+}
+
+/// Every still-unschemed `Ipe.Remote` kernel was driven to its refusal (or
+/// reported as a failure), so the derived exemption is never vacuous while
+/// they exist.
+fn assert_unbacked_driven(refused_unbacked: &BTreeSet<String>, failures: &[String]) {
+    for kernel in ipe_kernels::StdlibKernel::REMOTE_INTERCEPTED {
+        if kernel.scheme_shape().is_none() {
+            let path = format!("Ipe.Remote.{}", kernel.def().name);
+            assert!(
+                refused_unbacked.contains(&path) || failures.iter().any(|f| f.starts_with(&path)),
+                "`{path}` is unschemed but no alias of it was driven to IPE-L0108: \
+                 {refused_unbacked:?}"
+            );
+        }
+    }
+}
+
 /// Every exposed kernel-resolved value's annotation EQUALS the scheme the
 /// compiler enforces for `Module.member`.
 ///
@@ -1015,10 +1115,13 @@ fn kernel_alias_annotations_equal_enforced_schemes() {
         .map(|m| (m.name, m.source, AliasScope::EveryExposedValue))
         .collect();
     let mut expected: BTreeSet<String> = BTreeSet::new();
+    let mut unbacked: BTreeSet<String> = BTreeSet::new();
     for m in ipe_stdlib::COMPILED_STD_MODULES {
-        match canon_kernel_aliases(m.dotted, None) {
-            Ok(aliases) => {
-                expected.extend(aliases.iter().map(|a| format!("{}.{a}", m.dotted)));
+        match canon_kernel_alias_routes(m.dotted, None) {
+            Ok(routes) => {
+                expected.extend(routes.keys().map(|a| format!("{}.{a}", m.dotted)));
+                unbacked.extend(unbacked_alias_paths(m.dotted, &routes));
+                let aliases = routes.into_keys().collect();
                 modules.push((m.dotted, m.source, AliasScope::CanonKernelAliases(aliases)));
             }
             Err(e) => failures.push(e),
@@ -1026,11 +1129,18 @@ fn kernel_alias_annotations_equal_enforced_schemes() {
     }
     let mut probed: BTreeSet<String> = BTreeSet::new();
     let mut exempted: BTreeSet<String> = BTreeSet::new();
+    let mut refused_unbacked: BTreeSet<String> = BTreeSet::new();
     for (dotted, source, scope) in &modules {
         match alias_members(dotted, source, scope) {
             Ok(mut m) => {
+                let split = split_off_unbacked(&mut m, &unbacked, &mut failures);
+                for path in split.refused {
+                    exempted.insert(path.clone());
+                    refused_unbacked.insert(path);
+                }
+                let rest = split.backed;
                 let (exempt, checked): (Vec<AliasMember>, Vec<AliasMember>) =
-                    m.members.into_iter().partition(|member| {
+                    rest.into_iter().partition(|member| {
                         let path = format!("{}.{}", m.dotted, member.name);
                         UNPROBEABLE.iter().any(|u| u.path == path)
                     });
@@ -1063,6 +1173,7 @@ fn kernel_alias_annotations_equal_enforced_schemes() {
             veneer.name,
         );
     }
+    assert_unbacked_driven(&refused_unbacked, &failures);
     let covered: BTreeSet<String> = probed.union(&exempted).cloned().collect();
     let unprobed: Vec<&String> = expected.difference(&covered).collect();
     assert!(
@@ -1224,6 +1335,107 @@ fn alias_gate_refuses_an_unrecorded_kernel_shaped_binding() {
             .is_some_and(|e| e.contains("Ipe.Bytes.length")),
         "an unrecorded kernel-shaped binding must be refused: {:?}",
         members.as_ref().map(|m| m.members.len())
+    );
+}
+
+/// The shipped `Ipe.Remote` probe module and its `call` member.
+#[allow(clippy::panic)] // a missing shipped module or member is the test failure
+fn remote_call_member() -> (ProbeModule, AliasMember) {
+    let dotted = "Ipe.Remote";
+    let Some(module) = ipe_stdlib::COMPILED_STD_MODULES
+        .iter()
+        .find(|m| m.dotted == dotted)
+    else {
+        panic!("`{dotted}` must be a compiled-source module");
+    };
+    let aliases = match canon_kernel_aliases(dotted, None) {
+        Ok(a) if a.contains("call") => a,
+        other => panic!("canon must record `{dotted}.call` as a kernel alias: {other:?}"),
+    };
+    let mut m = match alias_members(
+        dotted,
+        module.source,
+        &AliasScope::CanonKernelAliases(aliases),
+    ) {
+        Ok(m) => m,
+        Err(e) => panic!("`{dotted}` members must select: {e:?}"),
+    };
+    let Some(member) = m
+        .members
+        .iter()
+        .position(|x| x.name == "call")
+        .map(|i| m.members.swap_remove(i))
+    else {
+        panic!("`{dotted}.call` must be selected");
+    };
+    (m, member)
+}
+
+/// Control: an alias of an unschemed kernel is refused with exactly IPE-L0108,
+/// so the derived exemption accepts it.
+#[test]
+fn unbacked_gate_accepts_an_unschemed_alias() {
+    let (m, member) = remote_call_member();
+    let checked = check_unbacked(&m, &member);
+    assert!(
+        checked.is_ok(),
+        "`Ipe.Remote.call` must be refused: {checked:?}"
+    );
+}
+
+/// Refusal: an alias the pipeline accepts fails the unbacked check instead of
+/// being counted as exempted.
+#[test]
+fn unbacked_gate_refuses_an_accepted_alias() {
+    let (m, member) = custom_element_node(NODE_ANNOTATION);
+    let bytes = ipe_stdlib::COMPILED_STD_MODULES
+        .iter()
+        .find(|x| x.dotted == "Ipe.Bytes")
+        .map(|x| x.source);
+    let aliases = canon_kernel_aliases("Ipe.Bytes", None);
+    let probe = bytes.zip(aliases.ok()).and_then(|(source, aliases)| {
+        alias_members(
+            "Ipe.Bytes",
+            source,
+            &AliasScope::CanonKernelAliases(aliases),
+        )
+        .ok()
+    });
+    let checked = probe.as_ref().and_then(|bm| {
+        bm.members
+            .iter()
+            .find(|x| x.name == "length")
+            .map(|length| check_unbacked(bm, length))
+    });
+    assert!(
+        checked
+            .as_ref()
+            .is_some_and(|c| c.as_ref().is_err_and(|e| e.contains("gave Ok("))),
+        "an accepted alias must fail the unbacked check: {checked:?}"
+    );
+    // A refusal under a different code is not the unbacked refusal either.
+    let other = check_unbacked(&m, &member);
+    assert!(
+        other.as_ref().is_err_and(|e| e.contains("IPE-N0039")),
+        "a refusal other than IPE-L0108 must fail the unbacked check: {other:?}"
+    );
+}
+
+/// Refusal: the exemption is keyed on the missing scheme, so a schemed kernel
+/// is never exempted, whatever module routes to it.
+#[test]
+fn unbacked_paths_hold_only_unschemed_kernels() {
+    use ipe_kernels::StdlibKernel;
+
+    let routes: BTreeMap<String, StdlibKernel> = [
+        ("length".to_owned(), StdlibKernel::BytesLength),
+        ("call".to_owned(), StdlibKernel::RemoteCall),
+    ]
+    .into_iter()
+    .collect();
+    assert_eq!(
+        unbacked_alias_paths("Ipe.Probe", &routes),
+        BTreeSet::from(["Ipe.Probe.call".to_owned()])
     );
 }
 

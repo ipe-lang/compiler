@@ -664,6 +664,12 @@ pub enum BuiltinTag {
     /// `Codec` — the `Ipe.Codec.Codec inner` codec ADT, the first parameter of
     /// the `*By` accessor query leaves. Homed at `Ipe.Codec`.
     Codec,
+    /// `Remote` — the `Ipe.Remote.Remote req resp` server endpoint, opaque.
+    /// Homed at `Ipe.Remote`.
+    Remote,
+    /// `RemoteAuth` — the `Ipe.Remote.RemoteAuth` session signing key,
+    /// opaque. Homed at `Ipe.Remote`.
+    RemoteAuth,
 }
 
 impl BuiltinTag {
@@ -1345,6 +1351,175 @@ pub const fn adapted_slots_fit_schemes(kernels: &[StdlibKernel]) -> bool {
 const _: () = assert!(
     adapted_slots_fit_schemes(StdlibKernel::ALL),
     "a kernel's adapted_slots entry does not fit its scheme",
+);
+
+/// The kind of server endpoint an `Ipe.Remote` constructor builds.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum EndpointKind {
+    /// `Remote.public` — reachable by any caller.
+    Public,
+    /// `Remote.authed` — reachable only with a valid session.
+    Authed,
+    /// `Remote.signIn` — opens a session from the handler's `Grant`.
+    SignIn,
+    /// `Remote.signOut` — closes the caller's session.
+    SignOut,
+}
+
+/// The role an `Ipe.Remote` kernel plays in a split program.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum RemoteRole {
+    /// `Remote.auth` — builds the session signing key; reaches nothing.
+    Key,
+    /// An endpoint constructor; describes a server endpoint, reaches nothing.
+    Endpoint(EndpointKind),
+    /// `Remote.call` — the client's outbound call of a server endpoint.
+    Call,
+}
+
+impl RemoteRole {
+    /// Whether a kernel of this role compiles for the browser client: the key,
+    /// every endpoint constructor, and the call of the client's own backend.
+    #[must_use]
+    pub const fn on_client(self) -> bool {
+        match self {
+            Self::Key | Self::Endpoint(_) | Self::Call => true,
+        }
+    }
+
+    /// Whether a kernel of this role compiles for WASI: the key and every
+    /// endpoint constructor reach nothing; a call has no backend to reach.
+    #[must_use]
+    pub const fn on_wasi(self) -> bool {
+        match self {
+            Self::Key | Self::Endpoint(_) => true,
+            Self::Call => false,
+        }
+    }
+}
+
+/// Whether `roles` names exactly `intercepted`, in order, every one qualified
+/// `Remote`, and every kernel of `kernels` qualified `Remote` has exactly one
+/// row.
+///
+/// The build-time tripwire behind [`StdlibKernel::REMOTE_ROLES`]: a new
+/// `Remote` kernel without a role fails the build instead of falling through to
+/// a default.
+#[must_use]
+pub const fn remote_roles_cover_remote_kernels(
+    roles: &[(StdlibKernel, RemoteRole)],
+    intercepted: &[StdlibKernel],
+    kernels: &[StdlibKernel],
+) -> bool {
+    if roles.len() != intercepted.len() {
+        return false;
+    }
+    let (mut r, mut i) = (roles, intercepted);
+    while let (Some(((role_kernel, _), r_tail)), Some((kernel, i_tail))) =
+        (r.split_first(), i.split_first())
+    {
+        if *role_kernel as usize != *kernel as usize
+            || !StdlibKernel::str_eq(kernel.decl().qualifier, "Remote")
+        {
+            return false;
+        }
+        r = r_tail;
+        i = i_tail;
+    }
+    let mut rest = kernels;
+    while let Some((kernel, tail)) = rest.split_first() {
+        if StdlibKernel::str_eq(kernel.decl().qualifier, "Remote") {
+            let mut hits = 0_usize;
+            let mut scan = roles;
+            while let Some(((row, _), more)) = scan.split_first() {
+                if *row as usize == *kernel as usize {
+                    hits = hits.saturating_add(1);
+                }
+                scan = more;
+            }
+            if hits != 1 {
+                return false;
+            }
+        }
+        rest = tail;
+    }
+    true
+}
+
+// IPE-RUST-AUDIT:ACCEPTED (Arthur Maciel) — compile-time `const` assertion (not a runtime panic); fails the BUILD if a `Remote` kernel has no role row or the role table drifts from `REMOTE_INTERCEPTED`, so no `Remote` kernel reaches a default role [ledger #boundary]
+#[allow(clippy::assertions_on_constants)] // the constant IS the tripwire
+const _: () = assert!(
+    remote_roles_cover_remote_kernels(
+        &StdlibKernel::REMOTE_ROLES,
+        &StdlibKernel::REMOTE_INTERCEPTED,
+        StdlibKernel::ALL,
+    ),
+    "a Remote kernel lacks a role row, or REMOTE_ROLES drifted from REMOTE_INTERCEPTED",
+);
+
+/// What a `Setting` kernel means on a split program's server.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum SplitSetting {
+    /// The setting configures the split server as it configures `Web.appWith`.
+    Applies,
+    /// The setting has no meaning on a split server; a program passing it is
+    /// refused.
+    Meaningless,
+}
+
+/// Whether `shape`'s final result, past every arrow, is a `Setting` carrier.
+#[must_use]
+pub const fn shape_yields_setting(shape: &TyShape) -> bool {
+    match shape {
+        TyShape::Fun(_, res) => shape_yields_setting(res),
+        TyShape::Con(tag, _) => matches!(tag, BuiltinTag::Setting),
+        TyShape::Var(_) | TyShape::Tuple(_) | TyShape::Record { .. } | TyShape::Unit => false,
+    }
+}
+
+/// Whether [`StdlibKernel::SPLIT_SERVER_SETTINGS`] lists exactly the schemed
+/// kernels of `kernels` whose scheme yields a `Setting`, each once.
+///
+/// One pass over `kernels` folds each setting kernel's row index into a
+/// bitmask; the mask is then compared once against every row's bit.
+#[must_use]
+pub const fn split_settings_cover_setting_kernels(kernels: &[StdlibKernel]) -> bool {
+    let rows = StdlibKernel::SPLIT_SERVER_SETTINGS.as_slice();
+    let mut seen: u32 = 0;
+    let mut rest = kernels;
+    while let Some((kernel, tail)) = rest.split_first() {
+        if let Some(shape) = kernel.scheme_shape()
+            && shape_yields_setting(shape)
+        {
+            let mut found = false;
+            let mut bit: u32 = 1;
+            let mut scan = rows;
+            while let Some(((row, _), more)) = scan.split_first() {
+                if *row as usize == *kernel as usize {
+                    if seen & bit != 0 {
+                        return false;
+                    }
+                    seen |= bit;
+                    found = true;
+                }
+                bit <<= 1;
+                scan = more;
+            }
+            if !found {
+                return false;
+            }
+        }
+        rest = tail;
+    }
+    let full: u32 = (1 << StdlibKernel::SPLIT_SERVER_SETTINGS.len()) - 1;
+    seen == full
+}
+
+// IPE-RUST-AUDIT:ACCEPTED (Arthur Maciel) — compile-time `const` assertion (not a runtime panic); fails the BUILD if a kernel building a `Setting` has no split-server row, or a row names a kernel building none, so no setting reaches a split server undecided [ledger #boundary]
+#[allow(clippy::assertions_on_constants)] // the constant IS the tripwire
+const _: () = assert!(
+    split_settings_cover_setting_kernels(StdlibKernel::ALL),
+    "a Setting kernel lacks a split-server row, or a row names a non-Setting kernel",
 );
 
 /// Whether `shape`'s final result, past every arrow, is an app carrier (a `Program` or the opaque `WebApp` leaf).
@@ -4158,6 +4333,25 @@ pub enum StdlibKernel {
     ColorTritanopia,
     /// `Color.simulate : Deficiency -> Color -> Color` — CVD preview.
     ColorSimulate,
+    // ── Ipe.Remote client/server split endpoints (unschemed: every use is refused) ──
+    /// `Remote.auth : Secret -> RemoteAuth` — the session signing key the
+    /// authed endpoints share.
+    RemoteAuth,
+    /// `Remote.public : (req -> Task Error resp) -> Remote req resp` — an
+    /// endpoint any caller may reach.
+    RemotePublic,
+    /// `Remote.authed : RemoteAuth -> (Principal -> req -> Task Error resp) -> Remote req resp`
+    /// — an endpoint reached only by an authenticated caller.
+    RemoteAuthed,
+    /// `Remote.signIn : RemoteAuth -> (req -> Task Error Grant) -> Remote req ()`
+    /// — the endpoint that opens a session from the returned `Grant`.
+    RemoteSignIn,
+    /// `Remote.signOut : RemoteAuth -> Remote () ()` — the endpoint that closes
+    /// the caller's session.
+    RemoteSignOut,
+    /// `Remote.call : Remote req resp -> req -> Task Error resp` — the client's
+    /// call of a server endpoint.
+    RemoteCall,
 }
 
 impl StdlibKernel {
@@ -6192,6 +6386,12 @@ impl StdlibKernel {
                 d("Color", "tritanopia", 0, Pure, "color_tritanopia", IpeOrder)
             }
             Self::ColorSimulate => d("Color", "simulate", 2, Pure, "color_simulate", IpeOrder),
+            Self::RemoteAuth => d("Remote", "auth", 1, Pure, "remote_auth", IpeOrder),
+            Self::RemotePublic => d("Remote", "public", 1, Pure, "remote_public", IpeOrder),
+            Self::RemoteAuthed => d("Remote", "authed", 2, Pure, "remote_authed", IpeOrder),
+            Self::RemoteSignIn => d("Remote", "signIn", 2, Pure, "remote_sign_in", IpeOrder),
+            Self::RemoteSignOut => d("Remote", "signOut", 1, Pure, "remote_sign_out", IpeOrder),
+            Self::RemoteCall => d("Remote", "call", 2, Pure, "remote_call", IpeOrder),
             Self::UiWidget => d("CustomElement", "node", 3, Ui, "ui_widget_", IpeOrder),
             Self::UiNode => d("Ui", "node", 3, Ui, "ui_node_", IpeOrder),
             Self::UiTaggedNode => d("Ui", "taggedNode", 4, Ui, "ui_tagged_node_", IpeOrder),
@@ -9061,6 +9261,13 @@ impl StdlibKernel {
         Self::LocaleToTag,
         Self::StringToUpperIn,
         Self::StringToLowerIn,
+        // ── Ipe.Remote ─────────────────────────────────────────────────
+        Self::RemoteAuth,
+        Self::RemotePublic,
+        Self::RemoteAuthed,
+        Self::RemoteSignIn,
+        Self::RemoteSignOut,
+        Self::RemoteCall,
     ];
 
     // ── Classification predicates (moved from ipe_ir::KernelFn) ─────────────
@@ -13267,12 +13474,20 @@ impl StdlibKernel {
             Self::StoreOrderByLeft => Some(&STORE_ORDER_BY_LEFT),
             Self::StoreOrderByRight => Some(&STORE_ORDER_BY_RIGHT),
 
-            // The ONLY unschemed kernel: `Web.appRouted`'s lowering
-            // (`Feature::RoutedWebApp`) is unimplemented, so it deliberately
-            // carries no scheme and its caller fails closed. An exhaustive arm (no
-            // wildcard) means any NEW kernel must declare its shape here or fail to
-            // compile — an unschemed-but-resolved kernel is unrepresentable.
-            Self::WebAppRouted => None,
+            // Unschemed kernels: each one's lowering or runtime backing does not
+            // exist, so it deliberately carries no scheme and every reference
+            // fails closed (IPE-L0108). `Web.appRouted`'s lowering
+            // (`Feature::RoutedWebApp`) is unimplemented; the `Ipe.Remote`
+            // endpoints have no lowering, emit arm or runtime fn yet. An
+            // exhaustive arm (no wildcard) means any NEW kernel must declare its
+            // shape here or fail to compile.
+            Self::WebAppRouted
+            | Self::RemoteAuth
+            | Self::RemotePublic
+            | Self::RemoteAuthed
+            | Self::RemoteSignIn
+            | Self::RemoteSignOut
+            | Self::RemoteCall => None,
         }
     }
 
@@ -13389,6 +13604,118 @@ impl StdlibKernel {
     #[must_use]
     pub fn is_accessor_intercept_placeholder(self) -> bool {
         Self::ACCESSOR_INTERCEPT_PLACEHOLDERS.contains(&self)
+    }
+
+    /// The `Ipe.Remote` kernels: the client/server split's endpoint
+    /// constructors and the client's call.
+    ///
+    /// The single source of truth for this set. None of them has a runtime fn:
+    /// each is unschemed, so every reference is refused at `ipe` time
+    /// (IPE-L0108) and no emitted program names its symbol. The runtime's
+    /// `every_kernel_name_resolves` test derives its dead-symbol allowlist from
+    /// this constant.
+    pub const REMOTE_INTERCEPTED: [Self; 6] = [
+        Self::RemoteAuth,
+        Self::RemotePublic,
+        Self::RemoteAuthed,
+        Self::RemoteSignIn,
+        Self::RemoteSignOut,
+        Self::RemoteCall,
+    ];
+
+    /// Every `Ipe.Remote` kernel paired with its role, in
+    /// [`Self::REMOTE_INTERCEPTED`] order.
+    ///
+    /// The single source of truth for what each `Remote` kernel is. The
+    /// build-time tripwire [`remote_roles_cover_remote_kernels`] fails the build
+    /// when a kernel qualified `Remote` has no row, so a new one never falls
+    /// through to a default role.
+    pub const REMOTE_ROLES: [(Self, RemoteRole); 6] = [
+        (Self::RemoteAuth, RemoteRole::Key),
+        (
+            Self::RemotePublic,
+            RemoteRole::Endpoint(EndpointKind::Public),
+        ),
+        (
+            Self::RemoteAuthed,
+            RemoteRole::Endpoint(EndpointKind::Authed),
+        ),
+        (
+            Self::RemoteSignIn,
+            RemoteRole::Endpoint(EndpointKind::SignIn),
+        ),
+        (
+            Self::RemoteSignOut,
+            RemoteRole::Endpoint(EndpointKind::SignOut),
+        ),
+        (Self::RemoteCall, RemoteRole::Call),
+    ];
+
+    /// The role of an `Ipe.Remote` kernel, or `None` for every kernel outside
+    /// `Ipe.Remote`. Read from [`Self::REMOTE_ROLES`].
+    #[must_use]
+    pub const fn remote_role(self) -> Option<RemoteRole> {
+        let mut rest = Self::REMOTE_ROLES.as_slice();
+        while let Some(((kernel, role), tail)) = rest.split_first() {
+            if *kernel as usize == self as usize {
+                return Some(*role);
+            }
+            rest = tail;
+        }
+        None
+    }
+
+    /// The endpoint kind an `Ipe.Remote` endpoint constructor builds, or `None`
+    /// for every other kernel (`Remote.auth` builds a signing key and
+    /// `Remote.call` calls an endpoint; neither builds one).
+    #[must_use]
+    pub const fn endpoint_kind(self) -> Option<EndpointKind> {
+        match self.remote_role() {
+            Some(RemoteRole::Endpoint(kind)) => Some(kind),
+            Some(RemoteRole::Key | RemoteRole::Call) | None => None,
+        }
+    }
+
+    /// Every `Setting` kernel, paired with what it means on a split program's
+    /// server.
+    ///
+    /// The split server reuses `Web.appWith`'s settings; a setting with no
+    /// meaning there is refused. Every setting kernel listed today configures
+    /// the server process (its bind, log, database, console tokens, or the web
+    /// session and CSRF policy), so each applies. The build-time tripwire
+    /// [`split_settings_cover_setting_kernels`] fails the build when a kernel
+    /// whose scheme yields a `Setting` has no row here, or a row names a kernel
+    /// that yields none.
+    pub const SPLIT_SERVER_SETTINGS: [(Self, SplitSetting); 11] = [
+        (Self::HostBind, SplitSetting::Applies),
+        (Self::LogLevelSetting, SplitSetting::Applies),
+        (Self::DbUrlSetting, SplitSetting::Applies),
+        (Self::ConsoleAdminToken, SplitSetting::Applies),
+        (Self::ConsoleIngestToken, SplitSetting::Applies),
+        (Self::ConsoleMetricsToken, SplitSetting::Applies),
+        (Self::WebCsrf, SplitSetting::Applies),
+        (Self::WebSessionTtl, SplitSetting::Applies),
+        (Self::WebAuthMaxLifetime, SplitSetting::Applies),
+        (Self::WebAuthSlideWindow, SplitSetting::Applies),
+        (Self::WebAuthRevocationMode, SplitSetting::Applies),
+    ];
+
+    /// What this `Setting` kernel means on a split program's server, or `None`
+    /// when the kernel builds no `Setting`.
+    ///
+    /// Read from [`Self::SPLIT_SERVER_SETTINGS`], whose coverage of every
+    /// setting kernel is a build-time assertion, so no setting kernel falls
+    /// through to a default.
+    #[must_use]
+    pub const fn split_server_setting(self) -> Option<SplitSetting> {
+        let mut rest = Self::SPLIT_SERVER_SETTINGS.as_slice();
+        while let Some(((kernel, setting), tail)) = rest.split_first() {
+            if *kernel as usize == self as usize {
+                return Some(*setting);
+            }
+            rest = tail;
+        }
+        None
     }
 
     /// The argument positions whose value this kernel moves into a `Send + Sync` box.
@@ -13651,7 +13978,10 @@ impl StdlibKernel {
             // (`database` semantics come from the `Db` module residency; the
             // capability model tags one enforceable axis per kernel, and the
             // external act's isolatable resource is the network host.)
-            | Self::DbConnOpen => Some(Capability::Network),
+            | Self::DbConnOpen
+            // The client's call of a server endpoint is an outbound request to
+            // the program's own backend.
+            | Self::RemoteCall => Some(Capability::Network),
             Self::SystemCwd
             | Self::SystemGetcwd
             | Self::PathAbsolute
@@ -14835,7 +15165,14 @@ impl StdlibKernel {
             // `Debug.todo` / `Debug.explain` are dev-only escape hatches;
             // no runtime capability beyond `Debug.*` dev membership.
             | Self::DebugTodo
-            | Self::DebugExplain => None,
+            | Self::DebugExplain
+            // The `Ipe.Remote` endpoint constructors describe an endpoint; they
+            // reach nothing.
+            | Self::RemoteAuth
+            | Self::RemotePublic
+            | Self::RemoteAuthed
+            | Self::RemoteSignIn
+            | Self::RemoteSignOut => None,
         }
     }
 
@@ -17268,7 +17605,13 @@ impl StdlibKernel {
             | Self::ColorProtanopia
             | Self::ColorDeuteranopia
             | Self::ColorTritanopia
-            | Self::ColorSimulate => &[],
+            | Self::ColorSimulate
+            | Self::RemoteAuth
+            | Self::RemotePublic
+            | Self::RemoteAuthed
+            | Self::RemoteSignIn
+            | Self::RemoteSignOut
+            | Self::RemoteCall => &[],
         }
     }
 
@@ -17712,6 +18055,12 @@ impl StdlibKernel {
                         | "Http"
                         | "Url"
                 ) ||
+                // `Ipe.Remote`, by role and never qualifier-wide: the roles
+                // `RemoteRole::on_client` admits (`Remote.auth`, the endpoint
+                // constructors, and `Remote.call`, the browser's call of its own
+                // backend). A `Remote` kernel gains a role only through
+                // `REMOTE_ROLES`.
+                self.remote_role().is_some_and(RemoteRole::on_client) ||
                 // Pure calendar helpers (chrono, no clock read) PLUS the M4
                 // `Date.now()`/`setTimeout` clock+sleep substitutes.
                 matches!(
@@ -17887,6 +18236,11 @@ impl StdlibKernel {
                 // PBKDF2) stays denied: the heavy crypto surface is out of the
                 // sealed floor.
                 || matches!(self, Self::CryptoRandomBytes | Self::CryptoRandomToken)
+                // `Ipe.Remote`, by role and never qualifier-wide: the roles
+                // `RemoteRole::on_wasi` admits (`Remote.auth` and the endpoint
+                // constructors, which reach nothing). `Remote.call` stays
+                // denied: a WASI program has no browser backend to call.
+                || self.remote_role().is_some_and(RemoteRole::on_wasi)
                 // `Task.*` pure future combinators — the std-only reactor spine
                 // (`block_on`/`task_run`/`task_parallel`, the LIVE wasip1 arm; no
                 // tokio) drives a `Direct` program's `main`. The tokio-bound
@@ -17921,11 +18275,196 @@ impl StdlibKernel {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn remote_intercepted_is_exactly_the_remote_qualifier() {
+        let by_qualifier: Vec<StdlibKernel> = StdlibKernel::ALL
+            .iter()
+            .copied()
+            .filter(|k| k.def().qualifier == "Remote")
+            .collect();
+        assert_eq!(by_qualifier, StdlibKernel::REMOTE_INTERCEPTED.to_vec());
+    }
+
+    #[test]
+    fn remote_kernels_are_unschemed() {
+        for kernel in StdlibKernel::REMOTE_INTERCEPTED {
+            assert!(
+                kernel.scheme_shape().is_none(),
+                "{kernel:?} must stay unschemed"
+            );
+        }
+    }
+
+    #[test]
+    fn endpoint_kind_names_each_endpoint_constructor_once() {
+        let kinds: Vec<(StdlibKernel, EndpointKind)> = StdlibKernel::ALL
+            .iter()
+            .filter_map(|k| k.endpoint_kind().map(|e| (*k, e)))
+            .collect();
+        assert_eq!(
+            kinds,
+            vec![
+                (StdlibKernel::RemotePublic, EndpointKind::Public),
+                (StdlibKernel::RemoteAuthed, EndpointKind::Authed),
+                (StdlibKernel::RemoteSignIn, EndpointKind::SignIn),
+                (StdlibKernel::RemoteSignOut, EndpointKind::SignOut),
+            ]
+        );
+    }
+
+    #[test]
+    fn split_server_setting_is_some_exactly_for_setting_kernels() {
+        for kernel in StdlibKernel::ALL {
+            let yields_setting = kernel.scheme_shape().is_some_and(shape_yields_setting);
+            assert_eq!(
+                kernel.split_server_setting().is_some(),
+                yields_setting,
+                "{kernel:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn remote_roles_tripwire_refuses_a_missing_stray_or_drifted_row() {
+        let roles = StdlibKernel::REMOTE_ROLES;
+        let intercepted = StdlibKernel::REMOTE_INTERCEPTED;
+        assert!(remote_roles_cover_remote_kernels(
+            &roles,
+            &intercepted,
+            StdlibKernel::ALL
+        ));
+        // A `Remote` kernel with no role row (the table drops `Remote.call`).
+        let (dropped, _) = roles.split_at(5);
+        let (kept, _) = intercepted.split_at(5);
+        assert!(!remote_roles_cover_remote_kernels(
+            dropped,
+            kept,
+            StdlibKernel::ALL
+        ));
+        // A row naming a kernel outside `Ipe.Remote`.
+        let mut stray = roles;
+        let mut stray_set = intercepted;
+        if let (Some(last), Some(last_k)) = (stray.last_mut(), stray_set.last_mut()) {
+            *last = (StdlibKernel::HostBind, RemoteRole::Call);
+            *last_k = StdlibKernel::HostBind;
+        }
+        assert!(!remote_roles_cover_remote_kernels(
+            &stray,
+            &stray_set,
+            StdlibKernel::ALL
+        ));
+        // The role table out of `REMOTE_INTERCEPTED` order.
+        let mut swapped = roles;
+        swapped.swap(0, 5);
+        assert!(!remote_roles_cover_remote_kernels(
+            &swapped,
+            &intercepted,
+            StdlibKernel::ALL
+        ));
+    }
+
+    #[test]
+    fn remote_kernel_availability_follows_its_role() {
+        use crate::Target;
+        for kernel in StdlibKernel::ALL {
+            let role = kernel.remote_role();
+            if kernel.def().qualifier == "Remote" {
+                assert!(role.is_some(), "{kernel:?} has no role");
+            }
+            let Some(role) = role else { continue };
+            assert_eq!(
+                kernel.available_on(Target::WasmClient),
+                role.on_client(),
+                "{kernel:?}"
+            );
+            assert_eq!(
+                kernel.available_on(Target::WasmWasi),
+                role.on_wasi(),
+                "{kernel:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn remote_role_admission_per_target() {
+        let endpoints = [
+            EndpointKind::Public,
+            EndpointKind::Authed,
+            EndpointKind::SignIn,
+            EndpointKind::SignOut,
+        ];
+        assert!(RemoteRole::Key.on_client());
+        assert!(RemoteRole::Key.on_wasi());
+        for kind in endpoints {
+            assert!(RemoteRole::Endpoint(kind).on_client(), "{kind:?}");
+            assert!(RemoteRole::Endpoint(kind).on_wasi(), "{kind:?}");
+        }
+        assert!(RemoteRole::Call.on_client());
+        assert!(!RemoteRole::Call.on_wasi());
+        assert!(!StdlibKernel::RemoteCall.available_on(crate::Target::WasmWasi));
+    }
+
+    /// The body of the `StdlibKernel` method declared by `signature`, up to its
+    /// closing brace at method indentation; empty when absent.
+    fn method_body<'a>(source: &'a str, signature: &str) -> &'a str {
+        let start = source
+            .find(signature)
+            .and_then(|at| source.get(at..))
+            .unwrap_or_default();
+        start
+            .find("\n    }\n")
+            .and_then(|end| start.get(..end))
+            .unwrap_or_default()
+    }
+
+    /// Both target allowlists admit `Ipe.Remote` through the role methods only.
+    /// A qualifier-wide `"Remote"` arm or a kernel list would admit every
+    /// present and future `Remote` kernel regardless of its role.
+    #[test]
+    fn remote_admission_reads_the_role_methods_only() {
+        let source = include_str!("lib.rs");
+        for (signature, method) in [
+            (
+                "fn wasm_client_available(self) -> bool {",
+                "RemoteRole::on_client",
+            ),
+            ("fn wasi_available(self) -> bool {", "RemoteRole::on_wasi"),
+        ] {
+            let body = method_body(source, signature);
+            assert!(!body.is_empty(), "{signature} not found");
+            assert!(
+                body.contains(&format!("is_some_and({method})")),
+                "{signature}"
+            );
+            assert!(!body.contains("\"Remote\""), "{signature}");
+            assert!(!body.contains("Self::Remote"), "{signature}");
+        }
+    }
+
+    #[test]
+    fn split_settings_tripwire_refuses_a_missing_or_stray_row() {
+        // A kernel set holding a setting kernel twice cannot fill the mask
+        // exactly once per row.
+        assert!(!split_settings_cover_setting_kernels(&[
+            StdlibKernel::HostBind,
+            StdlibKernel::HostBind,
+        ]));
+        // A kernel set missing a setting kernel leaves its row unseen.
+        assert!(!split_settings_cover_setting_kernels(&[
+            StdlibKernel::HostBind
+        ]));
+        assert!(split_settings_cover_setting_kernels(StdlibKernel::ALL));
+    }
+
     use std::collections::HashMap;
 
     use strum::EnumCount as _;
 
     use super::StdlibKernel;
+    use super::{
+        EndpointKind, RemoteRole, remote_roles_cover_remote_kernels, shape_yields_setting,
+        split_settings_cover_setting_kernels,
+    };
 
     /// The kernel variants deliberately absent from [`StdlibKernel::ALL`], each
     /// with the reason it is not a wired row.

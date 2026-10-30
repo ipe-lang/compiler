@@ -215,6 +215,8 @@ impl Builtins {
             BuiltinTag::DbSecured => self.secured_con,
             BuiltinTag::DbOrder => self.order_con,
             BuiltinTag::Codec => self.codec_con,
+            BuiltinTag::Remote => self.remote_con,
+            BuiltinTag::RemoteAuth => self.remote_auth_con,
         }
     }
 
@@ -320,7 +322,8 @@ impl Builtins {
     /// distinct from the unqualified [`BuiltinTag::UiAttribute`]),
     /// [`BuiltinTag::EmailProvider`], [`BuiltinTag::Duration`],
     /// [`BuiltinTag::TaskStep`], the
-    /// `Ipe.Db.Store` query-algebra ADTs, and [`BuiltinTag::Codec`].
+    /// `Ipe.Db.Store` query-algebra ADTs, [`BuiltinTag::Codec`],
+    /// [`BuiltinTag::Remote`] and [`BuiltinTag::RemoteAuth`].
     #[must_use]
     pub fn builtin_con_module(&self, tag: BuiltinTag) -> &[Symbol] {
         match tag {
@@ -356,6 +359,9 @@ impl Builtins {
             | BuiltinTag::DbPred
             | BuiltinTag::DbSecured => &self.db_store_home,
             BuiltinTag::Codec => &self.codec_home,
+            // `Remote` / `RemoteAuth` are compiled-source ADTs (`Ipe.Remote`),
+            // homed exactly as `Duration` is.
+            BuiltinTag::Remote | BuiltinTag::RemoteAuth => &self.remote_home,
             _ => &[],
         }
     }

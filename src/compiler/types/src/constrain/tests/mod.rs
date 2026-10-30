@@ -391,8 +391,7 @@ mod registry_phase_c_tests {
     /// - `PubSub.publish` / `PubSub.publishNoEcho`
     ///   (`String -> a -> Task Error Int`): the runtime `pubsub_publish` /
     ///   `pubsub_publish_no_echo` exist; the emit arm emits
-    ///   `pubsub_publish::<_, IpeError>(topic, payload)`. `KNOWN_UNBACKED` is
-    ///   empty.
+    ///   `pubsub_publish::<_, IpeError>(topic, payload)`.
     const FIRST_SCHEMED: &[StdlibKernel] = {
         use StdlibKernel as K;
         &[
@@ -1461,21 +1460,14 @@ mod registry_phase_c_tests {
     };
 
     /// KNOWN-UNBACKED kernels: present in `StdlibKernel::ALL` (so they carry a
-    /// registry index) but deliberately NEVER schemed. Currently **empty** —
-    /// `PubSub.publish`/`PubSub.publishNoEcho` (the only
-    /// previous occupants) were promoted to `FIRST_SCHEMED` once their runtime
-    /// functions and emit arm were confirmed present. The bucket exists
-    /// structurally so the `known_unbacked_never_schemed` gate still compiles
-    /// (it iterates the slice, which is now a vacuous pass) and future
-    /// deliberately-unschemed kernels have a named home. Do NOT scheme a kernel
-    /// into `FIRST_SCHEMED` before its runtime function and emit arm exist —
-    /// that forges an exit-0 path to an unbacked kernel (SEAL violation).
-    /// Enforced by `known_unbacked_never_schemed`.
-    const KNOWN_UNBACKED: &[StdlibKernel] = {
-        #[allow(unused_imports)]
-        use StdlibKernel as K;
-        &[]
-    };
+    /// registry index) but deliberately NEVER schemed. These are the
+    /// `Ipe.Remote` kernels, read from their SSOT
+    /// `StdlibKernel::REMOTE_INTERCEPTED`: none has a lowering, emit arm or
+    /// runtime function yet, so every reference is refused (IPE-L0108). Do NOT
+    /// scheme a kernel into `FIRST_SCHEMED` before its runtime function and emit
+    /// arm exist — that forges an exit-0 path to an unbacked kernel (SEAL
+    /// violation). Enforced by `known_unbacked_never_schemed`.
+    const KNOWN_UNBACKED: &[StdlibKernel] = &StdlibKernel::REMOTE_INTERCEPTED;
 
     /// KNOWN-UNBACKED kernels are in `ALL`, are disjoint from the migrated
     /// sets, and `stdlib_scheme` returns `None` for them. Pins the deliberate
