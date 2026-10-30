@@ -471,6 +471,7 @@ fn every_port_decoder_reads_its_tag_first() {
 /// `JS_DECODER_POSITION` names every value `Ipe.Ffi.Js` exposes, each with the
 /// one argument its annotation types as a `Decoder`.
 #[test]
+#[allow(clippy::panic)] // test assertion: a missing or glob-exposing `Ipe.Ffi.Js` IS the failure
 fn js_decoder_positions_match_the_ffi_signatures() {
     let modules = every_stdlib_module();
     let Some((_, module, interner)) = modules

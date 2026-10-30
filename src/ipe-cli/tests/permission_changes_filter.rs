@@ -171,7 +171,7 @@ fn filtered_changes_api_type_checks() {
 /// one mapping, and its tokens are pairwise distinct. A constructor, arm or glue
 /// row added on one side alone turns this red.
 #[test]
-#[allow(clippy::expect_used)] // A test: the stdlib module and its names must exist.
+#[allow(clippy::expect_used, clippy::panic)] // A test: the stdlib module and its names must exist.
 fn name_tokens_are_pairwise_distinct() {
     let source = ipe_stdlib::COMPILED_STD_MODULES
         .iter()
