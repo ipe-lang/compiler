@@ -301,9 +301,9 @@ fn release_env_wasm_is_refused_end_to_end() {
         .output();
     let wrote = out.exists();
     let _ = std::fs::remove_dir_all(&root);
-    let Ok(output) = output else {
-        assert!(output.is_ok(), "spawn `ipe release build`: {output:?}");
-        return;
+    let output = match output {
+        Ok(output) => output,
+        Err(e) => panic!("spawn `ipe release build`: {e}"),
     };
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
