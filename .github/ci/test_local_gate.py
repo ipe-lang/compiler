@@ -697,6 +697,43 @@ class RuntimeScanAtQuick(unittest.TestCase):
 
 
 
+
+class IpeScansAtQuick(unittest.TestCase):
+    """`gate quick` runs every tree-wide scan and ratchet binary of the `ipe`
+    crate on any change: the command's `--test` set is exactly the
+    `tests/*_scan.rs` and `tests/*_ratchet.rs` files, so a new scan cannot be
+    left out of `quick` and a removed one cannot linger."""
+
+    WS = RuntimeScanAtQuick.WS
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.entries = lg.load_manifest_entries()
+        errs: list[str] = []
+        cls.parsed = lg.check_local_dispositions(cls.entries, errs)
+        assert errs == [], errs
+
+    def scan_command(self) -> lg.Command:
+        disp = self.parsed["test"]
+        assert isinstance(disp, lg.RunLocal)
+        hits = [c for c in disp.commands if c.tier is lg.Tier.QUICK]
+        self.assertEqual(len(hits), 1, "the test entry has exactly one quick-tier command")
+        return hits[0]
+
+    def test_test_set_is_every_scan_and_ratchet_file(self) -> None:
+        argv = self.scan_command().argv
+        named = {argv[i + 1] for i, w in enumerate(argv[:-1]) if w == "--test"}
+        tests_dir = os.path.join(lg.REPO_ROOT, "src", "ipe-cli", "tests")
+        on_disk = {
+            f[: -len(".rs")] for f in os.listdir(tests_dir) if f.endswith(("_scan.rs", "_ratchet.rs"))
+        }
+        self.assertEqual(named, on_disk)
+
+    def test_runs_for_a_change_in_another_crate(self) -> None:
+        steps = lg.plan(lg.Tier.QUICK, self.entries, self.parsed, ["src/runtime/rust/src/lib.rs"], self.WS)
+        self.assertIn(self.scan_command().argv, [s.argv for s in steps])
+
+
 def _load_gate_runner():
     path = os.path.join(lg.REPO_ROOT, "tools", "scripts", "gate")
     loader = importlib.machinery.SourceFileLoader("gate_runner", path)
