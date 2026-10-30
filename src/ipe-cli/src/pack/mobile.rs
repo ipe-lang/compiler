@@ -5505,7 +5505,8 @@ mod tests {
             "<!-- /android-build-steps -->",
         )
         .unwrap_or_else(|e| panic!("{}: {e}", path.display()));
-        let rendered: Vec<&str> = android_build_steps().lines().collect();
+        let steps = android_build_steps();
+        let rendered: Vec<&str> = steps.lines().collect();
         let doc_lines: Vec<&str> = block.lines().collect();
         assert_eq!(
             doc_lines, rendered,
