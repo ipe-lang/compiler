@@ -211,7 +211,7 @@ pub enum TargetSource {
 impl TargetSource {
     /// The source's name as a refusal prints it.
     #[must_use]
-    pub fn spelling(self) -> &'static str {
+    pub const fn spelling(self) -> &'static str {
         match self {
             Self::Flag => text::target_source_flag(),
             Self::Env => text::target_source_env(),
