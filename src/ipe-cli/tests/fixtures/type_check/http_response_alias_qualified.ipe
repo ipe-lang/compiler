@@ -1,0 +1,24 @@
+module Main exposing (main)
+
+import Ipe.Dict as Dict
+import Ipe.Http as Http
+import Ipe.Io as Io
+import Ipe.String
+
+
+status : Http.HttpResponse -> Int
+status response =
+    response.status
+
+
+main : Task ()
+main =
+    Io.println
+        (String.fromInt
+            (status
+                { status = 200
+                , body = "ok"
+                , headers = Dict.fromList [ ( "X-Test", "1" ) ]
+                }
+            )
+        )

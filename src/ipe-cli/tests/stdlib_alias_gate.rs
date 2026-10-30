@@ -14,7 +14,7 @@
 //! kernel modules; compiled-source modules such as `Ipe.Io` are injected by
 //! the CLI project pipeline this harness does not run.
 
-use ipe_canon::{STDLIB_MODULE_QUALIFIERS, bare_import_binds};
+use ipe_canon::{KernelTypeExport, STDLIB_MODULE_QUALIFIERS, bare_import_binds};
 use ipe_diagnostics::{Diagnostic, NameError, StdlibReach};
 use ipe_intern::Interner;
 
@@ -467,5 +467,359 @@ fn interpolated_unknown_qualifier_is_refused() {
             accepted.as_ref().is_ok_and(|m| !keeps_literal(m)),
             "{body}: {accepted:?}"
         );
+    }
+}
+
+/// The annotation of `x` in `module Main exposing (x)`, `imports`, `x : ty`,
+/// canonicalised with `interner` so two calls compare symbol for symbol.
+fn annotation(
+    imports: &str,
+    ty: &str,
+    interner: &mut Interner,
+) -> Result<ipe_canon::ast::Type, Diagnostic> {
+    let src = format!("module Main exposing (x)\n{imports}\nx : {ty}\nx _ =\n    0\n");
+    let parsed = ipe_parse::parse_module(&src, interner)?;
+    let module = ipe_canon::canonicalise(&parsed, interner)?;
+    module
+        .defs
+        .iter()
+        .find_map(|def| match def {
+            ipe_canon::ast::Def::Typed { ty, .. } => Some(ty.clone()),
+            ipe_canon::ast::Def::Untyped { .. } => None,
+        })
+        .ok_or_else(|| Diagnostic::CompilerBug {
+            where_: "stdlib_alias_gate::annotation",
+            detail: "the program has no typed definition".into(),
+        })
+}
+
+/// `x : ty` under `imports`, canonicalised with a fresh interner.
+fn annotation_alone(imports: &str, ty: &str) -> Result<ipe_canon::ast::Type, Diagnostic> {
+    annotation(imports, ty, &mut Interner::new())
+}
+
+/// The diagnostic code of a refused `result`.
+fn code_of<T>(result: &Result<T, Diagnostic>) -> Option<ipe_diagnostics::Code> {
+    result.as_ref().err().map(Diagnostic::code)
+}
+
+/// `ty` with the fields of each record argument of an arrow in one order.
+fn fields_sorted(ty: ipe_canon::ast::Type) -> ipe_canon::ast::Type {
+    use ipe_canon::ast::Type;
+    match ty {
+        Type::Lambda(arg, ret) => {
+            Type::Lambda(Box::new(fields_sorted(*arg)), Box::new(fields_sorted(*ret)))
+        }
+        Type::Record(mut fields) => {
+            fields.sort_by_key(|(name, _)| *name);
+            Type::Record(fields)
+        }
+        other => other,
+    }
+}
+
+/// Every type a kernel module exports canonicalises to one value whether it is
+/// spelled through the module's qualifier or bound by an `exposing` list.
+#[test]
+fn qualified_and_exposed_kernel_types_canonicalise_identically() -> Result<(), Diagnostic> {
+    let mut interner = Interner::new();
+    let env = ipe_canon::Env::initial(Vec::new(), &mut interner)?;
+    let mut checked = 0_usize;
+    for (module, types) in env.kernel_types.iter() {
+        let canonical = interner.resolve(module.symbol()).map(str::to_owned);
+        let path = STDLIB_MODULE_QUALIFIERS
+            .iter()
+            .find(|(_, qualifier)| Some(*qualifier) == canonical.as_deref())
+            .map(|(path, _)| path.join("."));
+        let Some(path) = path else {
+            return Err(Diagnostic::CompilerBug {
+                where_: "qualified_and_exposed_kernel_types_canonicalise_identically",
+                detail: format!("{canonical:?} exports types but no import path names it"),
+            });
+        };
+        for (name, export) in types {
+            let arity = match export {
+                KernelTypeExport::Builtin(builtin) => builtin.row().params().in_schemes(),
+                KernelTypeExport::Alias(_) => 0,
+            };
+            let args = " Int".repeat(arity);
+            let qualified = annotation(
+                &format!("import {path} as K\n"),
+                &format!("K.{name}{args} -> Int"),
+                &mut interner,
+            );
+            let exposed = annotation(
+                &format!("import {path} exposing ({name})\n"),
+                &format!("{name}{args} -> Int"),
+                &mut interner,
+            );
+            assert!(
+                matches!((&qualified, &exposed), (Ok(q), Ok(e)) if q == e),
+                "{path} exports `{name}`: {qualified:?} / {exposed:?}"
+            );
+            checked += 1;
+        }
+    }
+    assert!(checked > 0, "the kernel modules export types");
+    Ok(())
+}
+
+/// The kernel `HttpResponse` alias expands to the body `Ipe.Http`'s reference
+/// source declares, so the source, the alias table and the scheme are one value.
+#[test]
+fn http_response_alias_body_matches_reference_source() -> Result<(), Diagnostic> {
+    let source = ipe_stdlib::source("Ipe.Http").unwrap_or_default();
+    let mut interner = Interner::new();
+    let parsed = ipe_parse::parse_module(source, &mut interner)?;
+    assert!(
+        parsed
+            .aliases
+            .iter()
+            .any(|alias| interner.resolve(alias.value.name.value) == Some("HttpResponse")),
+        "`Ipe.Http` declares `type alias HttpResponse`"
+    );
+    let body = source
+        .split_once("type alias HttpResponse =")
+        .and_then(|(_, rest)| rest.split_once("\n\n"))
+        .map(|(body, _)| body.trim());
+    assert!(
+        body.is_some(),
+        "the alias body is delimited by a blank line"
+    );
+    let reference = annotation(
+        "",
+        &format!("{} -> Int", body.unwrap_or_default()),
+        &mut interner,
+    )?;
+    let expanded = annotation(
+        "import Ipe.Http\n",
+        "Http.HttpResponse -> Int",
+        &mut interner,
+    )?;
+    assert_eq!(fields_sorted(reference), fields_sorted(expanded));
+    Ok(())
+}
+
+/// Every type a kernel module's reference source exposes is a type export.
+///
+/// No source-declared type of a kernel module is served by anything else.
+#[test]
+fn every_reference_source_type_is_exported() -> Result<(), Diagnostic> {
+    let mut interner = Interner::new();
+    let env = ipe_canon::Env::initial(Vec::new(), &mut interner)?;
+    for module in ipe_stdlib::MODULES {
+        let parsed = ipe_parse::parse_module(module.source, &mut interner)?;
+        let canonical = STDLIB_MODULE_QUALIFIERS
+            .iter()
+            .find(|(path, _)| path.join(".") == module.name)
+            .map(|(_, canonical)| *canonical);
+        let kernel = canonical
+            .and_then(|canonical| interner.lookup(canonical))
+            .and_then(|symbol| env.kernel_module_of(symbol));
+        let Some(kernel) = kernel else {
+            // A compiled-source module declares its own types.
+            continue;
+        };
+        let exports = env.kernel_types.get(&kernel);
+        assert!(
+            matches!(parsed.exposing.value, ipe_syntax::Exposing::List(_)),
+            "{} exposes an explicit list",
+            module.name
+        );
+        let ipe_syntax::Exposing::List(items) = &parsed.exposing.value else {
+            continue;
+        };
+        for item in items {
+            if let ipe_syntax::Exposed::Type(name, _) = &item.value {
+                let name = interner.resolve(*name).unwrap_or_default();
+                assert!(
+                    exports.is_some_and(|types| types.contains_key(name)),
+                    "{} exposes `{name}`, which its kernel module does not export",
+                    module.name
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+/// `exposing (RedirectPolicy(..))` binds the type as well as its constructors,
+/// at the head `Http.RedirectPolicy` names.
+#[test]
+fn redirect_policy_exposing_binds_the_type() -> Result<(), Diagnostic> {
+    let mut interner = Interner::new();
+    let exposed = annotation(
+        "import Ipe.Http exposing (RedirectPolicy(..))\n",
+        "RedirectPolicy -> Int",
+        &mut interner,
+    )?;
+    let qualified = annotation(
+        "import Ipe.Http\n",
+        "Http.RedirectPolicy -> Int",
+        &mut interner,
+    )?;
+    assert_eq!(exposed, qualified);
+    Ok(())
+}
+
+/// An `as` alias reaches the module's type exports, and owns the qualifier:
+/// the canonical spelling under an alias-only import is IPE-N0034.
+#[test]
+fn aliased_kernel_import_reaches_exports() {
+    let aliased = annotation_alone("import Ipe.Http as H\n", "H.HttpResponse -> Int");
+    assert!(
+        matches!(&aliased, Ok(ipe_canon::ast::Type::Lambda(arg, _))
+            if matches!(**arg, ipe_canon::ast::Type::Record(_))),
+        "{aliased:?}"
+    );
+    let canonical = canon(
+        "module Main exposing (x)\nimport Ipe.Http as H\n\nx : Http.HttpResponse -> Int\nx _ =\n    0\n",
+    );
+    assert!(
+        is_import_required(&canonical, "Http", "Ipe.Http", Some("H")),
+        "{canonical:?}"
+    );
+}
+
+/// Two kernel imports exposing the one `Cmd` row bind one definition.
+#[test]
+fn two_shape_imports_exposing_cmd_are_not_ambiguous() {
+    let both = annotation_alone(
+        "import Ipe.Tea.Web.Cmd exposing (Cmd)\nimport Ipe.Tea.Tui.Cmd exposing (Cmd)\n",
+        "Cmd Int -> Int",
+    );
+    assert!(both.is_ok(), "{both:?}");
+}
+
+/// FAIL-CLOSED: a qualified type the kernel module does not export is
+/// IPE-N0005, never an empty-home head.
+#[test]
+fn unknown_type_under_kernel_qualifier_is_no_such_member() {
+    let bogus = annotation_alone("import Ipe.Http\n", "Http.Bogus -> Int");
+    assert_eq!(
+        code_of(&bogus),
+        Some(ipe_diagnostics::IPE_N0005),
+        "{bogus:?}"
+    );
+}
+
+/// A builtin the module does not export is refused under its qualifier, even
+/// though the bare name is ambient.
+#[test]
+fn builtin_not_exported_by_qualifier_is_refused() {
+    for (import, ty) in [
+        ("import Ipe.Http\n", "Http.Int -> Int"),
+        ("import Ipe.Db\n", "Db.String -> Int"),
+    ] {
+        let refused = annotation_alone(import, ty);
+        assert_eq!(
+            code_of(&refused),
+            Some(ipe_diagnostics::IPE_N0005),
+            "{ty}: {refused:?}"
+        );
+    }
+}
+
+/// A kernel qualifier reads only its module's exports: a union an open import
+/// binds bare is not reachable as `Http.Foo`.
+#[test]
+fn qualifier_does_not_reach_an_open_import_union() -> Result<(), Diagnostic> {
+    let mut interner = Interner::new();
+    let foo_path = vec![interner.intern("Foo")?];
+    let foo_src = ipe_parse::parse_module(
+        "module Foo exposing (Foo(..))\n\ntype Foo\n    = Foo\n",
+        &mut interner,
+    )?;
+    let empty = std::collections::BTreeMap::new();
+    let (_, foo_exports) =
+        ipe_canon::canonicalise_module(&foo_src, &foo_path, &empty, &mut interner)?;
+    let mut deps = std::collections::BTreeMap::new();
+    deps.insert(foo_path, foo_exports);
+    let main_path = vec![interner.intern("Main")?];
+    let main_src = ipe_parse::parse_module(
+        "module Main exposing (x)\nimport Foo exposing (..)\nimport Ipe.Http\n\nx : Http.Foo -> Int\nx _ =\n    0\n",
+        &mut interner,
+    )?;
+    let reached = ipe_canon::canonicalise_module(&main_src, &main_path, &deps, &mut interner);
+    assert_eq!(
+        code_of(&reached),
+        Some(ipe_diagnostics::IPE_N0005),
+        "{reached:?}"
+    );
+    Ok(())
+}
+
+/// An `exposing` item the kernel module does not export is IPE-N0022, and
+/// `(..)` on a type without constructors is refused the same way.
+#[test]
+fn exposing_unknown_kernel_type_is_refused() {
+    for import in [
+        "import Ipe.Http exposing (Bogus)\n",
+        "import Ipe.Http exposing (HttpResponse(..))\n",
+    ] {
+        let refused = annotation_alone(import, "Int -> Int");
+        assert_eq!(
+            code_of(&refused),
+            Some(ipe_diagnostics::IPE_N0022),
+            "{import}: {refused:?}"
+        );
+    }
+}
+
+/// A kernel alias takes no type argument: applying one is IPE-N0013.
+#[test]
+fn kernel_alias_arity_is_checked() {
+    let applied = annotation_alone("import Ipe.Http\n", "Http.HttpResponse Int -> Int");
+    assert_eq!(
+        code_of(&applied),
+        Some(ipe_diagnostics::IPE_N0013),
+        "{applied:?}"
+    );
+}
+
+/// A builtin a kernel module exports takes the type arguments its row
+/// declares, however it is spelled: a mis-arity use is IPE-N0031, never an
+/// annotation no value inhabits nor a lowerer catch-all.
+#[test]
+fn kernel_builtin_arity_is_checked() {
+    let refused = [
+        ("import Ipe.Http\n", "Http.HttpMethod Int -> Int"),
+        ("import Ipe.Http\n", "Http.RedirectPolicy Int -> Int"),
+        ("import Ipe.Http\n", "Http.HttpRequest Int -> Int"),
+        (
+            "import Ipe.Http exposing (HttpMethod)\n",
+            "HttpMethod Int -> Int",
+        ),
+        ("import Ipe.Auth\n", "Auth.Principal Int -> Int"),
+        ("", "Order Int -> Int"),
+        ("", "Html Int Int -> Int"),
+        ("", "Attribute Int Int -> Int"),
+        ("", "Event -> Int"),
+    ];
+    for (imports, ty) in refused {
+        let applied = annotation_alone(imports, ty);
+        assert!(
+            matches!(
+                &applied,
+                Err(Diagnostic::Name {
+                    msg: NameError::TypeArity { .. },
+                    ..
+                })
+            ),
+            "{ty}: {applied:?}"
+        );
+    }
+    for (imports, ty) in [
+        ("import Ipe.Http\n", "Http.HttpMethod -> Int"),
+        (
+            "import Ipe.Http exposing (HttpMethod)\n",
+            "HttpMethod -> Int",
+        ),
+        ("", "Html -> Int"),
+        ("", "Html Int -> Int"),
+        ("", "Event Int -> Int"),
+    ] {
+        let accepted = annotation_alone(imports, ty);
+        assert!(accepted.is_ok(), "{ty}: {accepted:?}");
     }
 }

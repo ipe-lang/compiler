@@ -322,6 +322,8 @@ pub enum TypeTarget {
     Union(Vec<Symbol>),
     /// A type alias.
     Alias(AliasBody),
+    /// A builtin row a kernel module exports, minted at the empty home.
+    Builtin(ipe_kernels::BuiltinType),
 }
 
 /// The two module-level bare-name namespaces of the module being canonicalised.

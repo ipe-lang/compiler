@@ -2528,7 +2528,8 @@ fn exhaust_error_kind_missing_limit_exceeded_is_non_exhaustive() {
          Io -> \"a\"\n        Network -> \"b\"\n        Ffi -> \"c\"\n        \
          Decode -> \"d\"\n        Timeout -> \"e\"\n        NotFound -> \"f\"\n        \
          PermissionDenied -> \"g\"\n        InvalidInput -> \"h\"\n        \
-         Conflict -> \"i\"\n        Unavailable -> \"j\"\n        Unexpected -> \"k\"\n\n\
+         Conflict -> \"i\"\n        Unavailable -> \"j\"\n        Unexpected -> \"k\"\n        \
+         UpdateRequired -> \"m\"\n\n\
          main = Io.println (classify Io)\n"
     );
     assert_rejected(
@@ -2536,6 +2537,46 @@ fn exhaust_error_kind_missing_limit_exceeded_is_non_exhaustive() {
         &src,
         "IPE-T0010",
     );
+}
+
+/// A `case` over `ErrorKind` that covers every other kind but omits
+/// `UpdateRequired` is non-exhaustive (IPE-T0010).
+#[test]
+fn exhaust_error_kind_missing_update_required_is_non_exhaustive() {
+    let src = format!(
+        "{HEAD}import Ipe.Io as Io\n\
+         classify : ErrorKind -> String\n\
+         classify k =\n    case k of\n        \
+         Io -> \"a\"\n        Network -> \"b\"\n        Ffi -> \"c\"\n        \
+         Decode -> \"d\"\n        Timeout -> \"e\"\n        NotFound -> \"f\"\n        \
+         PermissionDenied -> \"g\"\n        InvalidInput -> \"h\"\n        \
+         Conflict -> \"i\"\n        Unavailable -> \"j\"\n        Unexpected -> \"k\"\n        \
+         LimitExceeded -> \"l\"\n\n\
+         main = Io.println (classify Io)\n"
+    );
+    assert_rejected(
+        "exhaust_error_kind_missing_update_required",
+        &src,
+        "IPE-T0010",
+    );
+}
+
+/// A `case` naming all thirteen kinds is exhaustive, so each refusal above
+/// comes from its one omitted kind.
+#[test]
+fn exhaust_error_kind_naming_every_kind_compiles() {
+    let src = format!(
+        "{HEAD}import Ipe.Io as Io\n\
+         classify : ErrorKind -> String\n\
+         classify k =\n    case k of\n        \
+         Io -> \"a\"\n        Network -> \"b\"\n        Ffi -> \"c\"\n        \
+         Decode -> \"d\"\n        Timeout -> \"e\"\n        NotFound -> \"f\"\n        \
+         PermissionDenied -> \"g\"\n        InvalidInput -> \"h\"\n        \
+         Conflict -> \"i\"\n        Unavailable -> \"j\"\n        Unexpected -> \"k\"\n        \
+         LimitExceeded -> \"l\"\n        UpdateRequired -> \"m\"\n\n\
+         main = Io.println (classify UpdateRequired)\n"
+    );
+    assert_compiles("exhaust_error_kind_naming_every_kind", &src);
 }
 
 /// A fold over the inbound `Ipe.Browser.Geolocation.Internals` `JsMsg` that omits
