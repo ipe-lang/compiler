@@ -204,11 +204,7 @@ fn name_tokens_are_pairwise_distinct() {
         .body
         .value;
     let ipe_syntax::Expr_::Case(_, arms) = body else {
-        assert!(
-            matches!(body, ipe_syntax::Expr_::Case(..)),
-            "nameToken is not one case over PermissionName"
-        );
-        return;
+        panic!("nameToken is not one case over PermissionName")
     };
     let mut tokens: BTreeMap<&str, &str> = BTreeMap::new();
     for (pattern, rhs) in arms {

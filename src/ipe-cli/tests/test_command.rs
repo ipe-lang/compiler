@@ -1354,7 +1354,9 @@ fn the_port_tag_matrix_covers_every_module_and_permission() {
     }
     let entry = port_tag_matrix_entry();
     for (ctor, _) in ipe_runtime_rust::js_port_glue::PERMISSION_NAMES {
-        let case = format!("(accepts (PermissionPort.inboundFor PermissionPort.{ctor}))))");
+        let case = format!(
+            "(accepted names (accepts (PermissionPort.inboundFor PermissionPort.{ctor}))))"
+        );
         assert_eq!(entry.matches(case.as_str()).count(), 1, "{ctor}");
     }
 }

@@ -473,19 +473,14 @@ fn every_port_decoder_reads_its_tag_first() {
 #[test]
 fn js_decoder_positions_match_the_ffi_signatures() {
     let modules = every_stdlib_module();
-    let js = modules
+    let Some((_, module, interner)) = modules
         .iter()
-        .find(|(dotted, _, _)| *dotted == "Ipe.Ffi.Js");
-    assert!(js.is_some(), "Ipe.Ffi.Js is not a stdlib module");
-    let Some((_, module, interner)) = js else {
-        return;
+        .find(|(dotted, _, _)| *dotted == "Ipe.Ffi.Js")
+    else {
+        panic!("Ipe.Ffi.Js is not a stdlib module")
     };
     let Exposing::List(items) = &module.exposing.value else {
-        assert!(
-            matches!(module.exposing.value, Exposing::List(_)),
-            "Ipe.Ffi.Js exposes everything"
-        );
-        return;
+        panic!("Ipe.Ffi.Js exposes everything")
     };
     let mut seen = Vec::new();
     for item in items {
