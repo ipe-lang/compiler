@@ -2420,7 +2420,7 @@ mod tests {
         );
         for argv in [
             &["web", "client", "--target", "wasm"][..],
-            &["--target", "wasm32-unknown-unknown"][..],
+            &["--target", "wasm"][..],
             &["--static", "--target", "wasm"][..],
         ] {
             let refused = parse_release_build(&s(argv));
@@ -2429,6 +2429,11 @@ mod tests {
                 "{argv:?}: {refused:?}"
             );
         }
+        let triple = parse_release_build(&s(&["--target", "wasm32-unknown-unknown"]));
+        assert!(
+            matches!(&triple, Err(CliError::Usage(m)) if m.to_string().contains("unsupported target")),
+            "{triple:?}"
+        );
     }
 
     #[test]
