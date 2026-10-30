@@ -1924,14 +1924,32 @@ mod tests {
                 shape.label()
             );
             let template = shape.package_ipe();
-            assert!(
-                !template.contains("bundleId")
-                    || (template.matches("bundleId").count() == 1
-                        && template.contains("bundleId = \"{bundle_id}\", orientation = Any")),
-                "package template for shape '{}' declares a bundleId other than the \
-                 derived `{{bundle_id}}` hole with free rotation",
-                shape.label()
-            );
+            // Exhaustive on purpose: a new shape must decide whether it ships a
+            // delivery bundle before this test compiles.
+            let delivers = match shape {
+                InitShape::Web
+                | InitShape::Tui
+                | InitShape::Cli
+                | InitShape::Server
+                | InitShape::Script => true,
+                InitShape::Worker => false,
+            };
+            if delivers {
+                assert!(
+                    template.matches("bundleId").count() == 1
+                        && template.contains("bundleId = \"{bundle_id}\", orientation = Any"),
+                    "package template for shape '{}' must declare exactly the derived \
+                     `{{bundle_id}}` hole with free rotation",
+                    shape.label()
+                );
+            } else {
+                assert!(
+                    !template.contains("bundleId"),
+                    "package template for shape '{}' has no delivery bundle, so it \
+                     declares no bundleId",
+                    shape.label()
+                );
+            }
         }
     }
 }
