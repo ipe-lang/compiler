@@ -12,6 +12,7 @@ use std::path::{Path, PathBuf};
 use ipe::pack::desktop::{
     self, AppShape, BundleContent, BundleIdentity, DesktopOs, DesktopRefusal,
 };
+use ipe::project::BundleId;
 use ipe_ir::{Capability, WebCapability};
 
 /// A trivial program whose compiled binary the E2E materialises into a Linux
@@ -34,7 +35,7 @@ fn accepts(items: &[Capability]) -> BTreeSet<Capability> {
 
 #[test]
 fn linux_layout_is_a_runnable_tarball_shape() {
-    let identity = BundleIdentity::new("Counter", Some("1.2.3"), None);
+    let identity = BundleIdentity::new("Counter", Some("1.2.3"), BundleId::derived("Counter"));
     let layout =
         desktop::layout(DesktopOs::Linux, &identity, &accepts(&[]), None).expect("linux layout");
     let paths: Vec<&str> = layout.files.iter().map(|f| f.rel_path.as_str()).collect();
@@ -57,7 +58,7 @@ fn mac_plist_permission_keys_come_only_from_the_derivation() {
     // An app accepting geolocation → the derived location usage key appears; an
     // app accepting nothing → no usage-description key at all. This is the SSOT
     // property: the desktop packager never hand-writes a permission.
-    let identity = BundleIdentity::new("Counter", Some("1.2.3"), None);
+    let identity = BundleIdentity::new("Counter", Some("1.2.3"), BundleId::derived("Counter"));
 
     let with_geo = desktop::layout(
         DesktopOs::MacOs,
@@ -120,7 +121,7 @@ fn materialise_refuses_planted_symlinks() {
     let fake_binary = dir.join("fake-binary");
     std::fs::write(&fake_binary, "binary").expect("fake binary");
 
-    let identity = BundleIdentity::new("counter", Some("1.2.3"), None);
+    let identity = BundleIdentity::new("counter", Some("1.2.3"), BundleId::derived("counter"));
     let layout =
         desktop::layout(DesktopOs::Linux, &identity, &accepts(&[]), None).expect("linux layout");
 
@@ -193,7 +194,7 @@ fn linux_bundle_is_materialised_end_to_end() {
             .expect("cargo build of the program"),
     );
 
-    let identity = BundleIdentity::new("counter", Some("1.2.3"), None);
+    let identity = BundleIdentity::new("counter", Some("1.2.3"), BundleId::derived("counter"));
     let layout =
         desktop::layout(DesktopOs::Linux, &identity, &accepts(&[]), None).expect("linux layout");
     let dist = claim_dist(&dir.join("out").join("dist").join("linux"), &src);

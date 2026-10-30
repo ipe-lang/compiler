@@ -452,7 +452,7 @@ impl<'a> BundleAssembler<'a> {
                 .as_ref()
                 .map(ToString::to_string)
                 .as_deref(),
-            None,
+            crate::project::BundleId::derived(&manifest.name),
         );
         let accepts = &manifest.capabilities_accept;
         let icon = manifest.icon.as_deref();
@@ -542,15 +542,7 @@ impl<'a> BundleAssembler<'a> {
     fn assemble_mobile(&self, os: pack::mobile::MobileOs) -> Result<(), CliError> {
         let manifest = self.manifest();
         let pin = pack::mobile::ManifestPin::of(manifest);
-        let identity = pack::desktop::BundleIdentity::new(
-            &manifest.name,
-            manifest
-                .version
-                .as_ref()
-                .map(ToString::to_string)
-                .as_deref(),
-            None,
-        );
+        let shell = pack::mobile::ShellIdentity::of(manifest);
         let icon = manifest.icon.as_deref();
 
         // Build the `web client` bundle into the project's output root, then
@@ -572,7 +564,7 @@ impl<'a> BundleAssembler<'a> {
         let bundle = pack::mobile::SpaBundle::from_www_dir(&www_dir)
             .map_err(|e| CliError::Usage(crate::text::Message::relay(&e)))?;
 
-        let layout = pack::mobile::layout(os, self.profile, &identity, &pin, &bundle, icon)?;
+        let layout = pack::mobile::layout(os, self.profile, &shell, &pin, &bundle, icon)?;
 
         let dist = self.profile.dist_dir(&output)?.child(os.as_str())?;
         let shell_root = pack::mobile::materialise(&layout, icon, &dist)?;
@@ -4162,6 +4154,105 @@ mod mobile_base_tests {
         let parsed = project::parse_manifest(&manifest);
         let _ = std::fs::remove_dir_all(manifest.parent().expect("project root"));
         parsed.expect("a push-accepting manifest reads")
+    }
+
+    /// The Android and iOS shells laid out from a project named `name` whose
+    /// `delivery` is the record `delivery`, through the manifest reader
+    /// and [`pack::mobile::ShellIdentity::of`] the pack reads.
+    fn mobile_shells(
+        test_name: &str,
+        name: &str,
+        delivery: &str,
+    ) -> (pack::mobile::ShellLayout, pack::mobile::ShellLayout) {
+        let manifest = write_project(test_name, "/");
+        let root = manifest.parent().expect("project root").to_path_buf();
+        std::fs::write(
+            &manifest,
+            format!(
+                "module Package exposing (package)\n\npackage =\n    {{ name = {name:?}\n    \
+                 , delivery = {delivery}\n    }}\n"
+            ),
+        )
+        .expect("write package.ipe");
+        let www = root.join("www");
+        std::fs::create_dir_all(&www).expect("create www/");
+        std::fs::write(www.join("index.html"), b"<html>").expect("write index.html");
+        let parsed = project::parse_manifest(&manifest).expect("the manifest reads");
+        let bundle = pack::mobile::SpaBundle::from_www_dir(&www).expect("collect the bundle");
+        let pin = pack::mobile::ManifestPin::of(&parsed);
+        let shell = pack::mobile::ShellIdentity::of(&parsed);
+        let lay = |os| {
+            pack::mobile::layout(os, BundleProfile::Dev, &shell, &pin, &bundle, None)
+                .expect("layout")
+        };
+        let shells = (
+            lay(pack::mobile::MobileOs::Android),
+            lay(pack::mobile::MobileOs::Ios),
+        );
+        let _ = std::fs::remove_dir_all(&root);
+        shells
+    }
+
+    /// A declared `bundleId` and `orientation` reach both shells verbatim.
+    #[test]
+    fn declared_bundle_id_and_orientation_reach_both_shells() {
+        let (android, ios) = mobile_shells(
+            "declared_identity",
+            "shop",
+            "{ mobile = { bundleId = \"io.acme.Shop\", orientation = Landscape } }",
+        );
+        let gradle = android.generated("app/build.gradle").unwrap_or_default();
+        assert!(gradle.contains("applicationId 'io.acme.Shop'"), "{gradle}");
+        let manifest = android
+            .generated("app/src/main/AndroidManifest.xml")
+            .unwrap_or_default();
+        assert!(
+            manifest.contains("android:screenOrientation=\"sensorLandscape\""),
+            "{manifest}"
+        );
+        let plist = ios.generated("App/Info.plist").unwrap_or_default();
+        assert!(plist.contains("<string>io.acme.Shop</string>"), "{plist}");
+        assert!(
+            plist.contains("<string>UIInterfaceOrientationLandscapeLeft</string>")
+                && !plist.contains("<string>UIInterfaceOrientationPortrait</string>"),
+            "{plist}"
+        );
+        assert!(plist.contains("<key>UIRequiresFullScreen</key>"), "{plist}");
+    }
+
+    /// An absent `bundleId` is the name's derived id, and an absent
+    /// `orientation` is free rotation, in both shells.
+    #[test]
+    fn absent_bundle_id_and_orientation_derive_in_both_shells() {
+        let (android, ios) = mobile_shells(
+            "absent_identity",
+            "My Shop",
+            "{ browser = { basePath = \"/\" } }",
+        );
+        let derived = project::BundleId::derived("My Shop");
+        assert_eq!(derived.as_str(), "com.ipe.myshop");
+        let gradle = android.generated("app/build.gradle").unwrap_or_default();
+        assert!(
+            gradle.contains("applicationId 'com.ipe.myshop'"),
+            "{gradle}"
+        );
+        let manifest = android
+            .generated("app/src/main/AndroidManifest.xml")
+            .unwrap_or_default();
+        assert!(
+            manifest.contains("android:screenOrientation=\"unspecified\""),
+            "{manifest}"
+        );
+        let plist = ios.generated("App/Info.plist").unwrap_or_default();
+        assert!(plist.contains("<string>com.ipe.myshop</string>"), "{plist}");
+        assert!(
+            plist.contains("<string>UIInterfaceOrientationPortraitUpsideDown</string>"),
+            "{plist}"
+        );
+        assert!(
+            !plist.contains("<key>UIRequiresFullScreen</key>"),
+            "{plist}"
+        );
     }
 
     /// A `Web` app passes the mobile gate whatever its `wasm` field says: the

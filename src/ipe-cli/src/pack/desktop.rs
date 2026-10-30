@@ -25,6 +25,7 @@ use ipe_ir::Capability;
 
 use crate::CliError;
 use crate::output_dir::OwnedDir;
+use crate::project::BundleId;
 
 use super::permissions::{self, Platform};
 
@@ -256,22 +257,16 @@ pub struct BundleIdentity {
     /// The app version string (the manifest `version`, or `"0.0.0"` when the
     /// manifest declares none — a bundle always carries *some* version field).
     pub version: String,
-    /// The reverse-DNS bundle identifier used on Apple platforms
-    /// (`com.ipe.<sanitised-name>` when the manifest gives none).
-    pub identifier: String,
+    /// The bundle identifier every shell writes verbatim.
+    pub identifier: BundleId,
 }
 
 impl BundleIdentity {
-    /// Build an identity from a manifest name, optional version, and optional
-    /// author-supplied identifier. A missing version defaults to `0.0.0`; a
-    /// missing identifier is synthesised from the name.
+    /// Build an identity from a manifest name, optional version, and a parsed
+    /// or derived bundle identifier. A missing version defaults to `0.0.0`.
     #[must_use]
-    pub fn new(name: &str, version: Option<&str>, identifier: Option<&str>) -> Self {
+    pub fn new(name: &str, version: Option<&str>, identifier: BundleId) -> Self {
         let version = version.unwrap_or("0.0.0").to_owned();
-        let identifier = identifier.map_or_else(
-            || format!("com.ipe.{}", sanitise_identifier(name)),
-            str::to_owned,
-        );
         Self {
             name: name.to_owned(),
             version,
@@ -280,10 +275,10 @@ impl BundleIdentity {
     }
 }
 
-/// Sanitise a name into the `[a-z0-9-]` segment an Apple reverse-DNS identifier
-/// permits: lowercase, non-alphanumeric runs collapsed to a single `-`, and no
-/// leading/trailing `-`. An empty result becomes `app` so the identifier is
-/// always a valid segment.
+/// Sanitise a name into a `[a-z0-9-]` file stem or executable name: lowercase,
+/// non-alphanumeric runs collapsed to a single `-`, and no leading/trailing
+/// `-`. An empty result becomes `app`. Bundle identifiers come from
+/// [`BundleId`], never from this.
 pub(crate) fn sanitise_identifier(name: &str) -> String {
     let mut out = String::with_capacity(name.len());
     let mut last_dash = true; // suppress a leading dash
@@ -549,7 +544,7 @@ fn render_info_plist(
     };
     pair("CFBundleName", &identity.name);
     pair("CFBundleDisplayName", &identity.name);
-    pair("CFBundleIdentifier", &identity.identifier);
+    pair("CFBundleIdentifier", identity.identifier.as_str());
     pair("CFBundleVersion", &identity.version);
     pair("CFBundleShortVersionString", &identity.version);
     pair("CFBundleExecutable", &sanitise_identifier(&identity.name));
@@ -751,7 +746,7 @@ mod tests {
     fn geolocation_yields_the_location_usage_key() {
         // An app accepting geolocation must produce a plist carrying the derived
         // location usage key with its non-empty purpose.
-        let identity = BundleIdentity::new("Geo App", Some("1.2.3"), None);
+        let identity = BundleIdentity::new("Geo App", Some("1.2.3"), BundleId::derived("Geo App"));
         let a = accepts(&[web(WebCapability::Geolocation)]);
         let layout = layout(DesktopOs::MacOs, &identity, &a, None).expect("mac layout");
         let plist = plist_text(&layout);
@@ -768,7 +763,8 @@ mod tests {
     #[test]
     fn an_app_accepting_nothing_has_no_usage_keys() {
         // deny-by-default: no accepted web axis ⇒ no NS…UsageDescription key.
-        let identity = BundleIdentity::new("Pure App", Some("0.1.0"), None);
+        let identity =
+            BundleIdentity::new("Pure App", Some("0.1.0"), BundleId::derived("Pure App"));
         let layout = layout(DesktopOs::MacOs, &identity, &accepts(&[]), None).expect("mac layout");
         let plist = plist_text(&layout);
         assert!(
@@ -784,7 +780,7 @@ mod tests {
     fn a_non_web_capability_backs_no_usage_key() {
         // A server-side capability (network) has no native-shell permission
         // surface; the plist must carry no usage key for it.
-        let identity = BundleIdentity::new("Net App", None, None);
+        let identity = BundleIdentity::new("Net App", None, BundleId::derived("Net App"));
         let a = accepts(&[Capability::Network, Capability::NativeFfi]);
         let layout = layout(DesktopOs::MacOs, &identity, &a, None).expect("mac layout");
         assert!(!plist_text(&layout).contains("UsageDescription"));
@@ -807,7 +803,7 @@ mod tests {
 
     #[test]
     fn mac_layout_places_binary_plist_and_icon() {
-        let identity = BundleIdentity::new("My App", Some("2.0.0"), None);
+        let identity = BundleIdentity::new("My App", Some("2.0.0"), BundleId::derived("My App"));
         let icon = PathBuf::from("/tmp/icon.png");
         let layout =
             layout(DesktopOs::MacOs, &identity, &accepts(&[]), Some(&icon)).expect("mac layout");
@@ -834,7 +830,7 @@ mod tests {
             "with/slash",
             "nul\0byte",
         ] {
-            let identity = BundleIdentity::new(hostile, Some("1.0.0"), None);
+            let identity = BundleIdentity::new(hostile, Some("1.0.0"), BundleId::derived(hostile));
             let result = layout(DesktopOs::MacOs, &identity, &accepts(&[]), None);
             assert!(
                 matches!(result, Err(crate::CliError::Usage(_))),
@@ -848,7 +844,7 @@ mod tests {
         // The refusal must not over-reject: a normal display name with spaces and
         // punctuation is a legal single `.app` component and must still pass.
         for ok in ["My App", "App 2.0", "café", "under_score", "Dot.In.Name"] {
-            let identity = BundleIdentity::new(ok, Some("1.0.0"), None);
+            let identity = BundleIdentity::new(ok, Some("1.0.0"), BundleId::derived(ok));
             let layout =
                 layout(DesktopOs::MacOs, &identity, &accepts(&[]), None).expect("mac layout");
             assert_eq!(layout.root_name, format!("{ok}.app"));
@@ -857,7 +853,7 @@ mod tests {
 
     #[test]
     fn linux_layout_has_binary_desktop_and_icon() {
-        let identity = BundleIdentity::new("My App", Some("2.0.0"), None);
+        let identity = BundleIdentity::new("My App", Some("2.0.0"), BundleId::derived("My App"));
         let icon = PathBuf::from("/tmp/icon.png");
         let layout =
             layout(DesktopOs::Linux, &identity, &accepts(&[]), Some(&icon)).expect("linux layout");
@@ -873,7 +869,7 @@ mod tests {
 
     #[test]
     fn windows_layout_has_exe_and_icon() {
-        let identity = BundleIdentity::new("My App", None, None);
+        let identity = BundleIdentity::new("My App", None, BundleId::derived("My App"));
         let icon = PathBuf::from("/tmp/icon.png");
         let layout = layout(DesktopOs::Windows, &identity, &accepts(&[]), Some(&icon))
             .expect("windows layout");
@@ -884,7 +880,7 @@ mod tests {
 
     #[test]
     fn a_none_icon_omits_the_icon_file() {
-        let identity = BundleIdentity::new("My App", None, None);
+        let identity = BundleIdentity::new("My App", None, BundleId::derived("My App"));
         for os in [DesktopOs::Linux, DesktopOs::MacOs, DesktopOs::Windows] {
             let layout = layout(os, &identity, &accepts(&[]), None).expect("layout");
             assert!(
@@ -901,7 +897,7 @@ mod tests {
 
     #[test]
     fn every_bundle_carries_its_webview_runtime_note() {
-        let identity = BundleIdentity::new("My App", None, None);
+        let identity = BundleIdentity::new("My App", None, BundleId::derived("My App"));
         for os in [DesktopOs::Linux, DesktopOs::MacOs, DesktopOs::Windows] {
             let layout = layout(os, &identity, &accepts(&[]), None).expect("layout");
             let note = generated_containing(&layout, "RUNTIME.txt");
@@ -932,15 +928,17 @@ mod tests {
 
     #[test]
     fn identifier_is_synthesised_from_the_name_when_absent() {
-        let id = BundleIdentity::new("My Cool App!", None, None);
-        assert_eq!(id.identifier, "com.ipe.my-cool-app");
+        let id = BundleIdentity::new("My Cool App!", None, BundleId::derived("My Cool App!"));
+        assert_eq!(id.identifier.as_str(), "com.ipe.mycoolapp");
         assert_eq!(id.version, "0.0.0");
     }
 
     #[test]
     fn an_explicit_identifier_is_kept() {
-        let id = BundleIdentity::new("X", Some("1.0.0"), Some("io.example.x"));
-        assert_eq!(id.identifier, "io.example.x");
+        let kept = BundleId::parse("io.example.x")
+            .map(|explicit| BundleIdentity::new("X", Some("1.0.0"), explicit))
+            .map(|id| id.identifier.as_str().to_owned());
+        assert_eq!(kept.as_deref(), Ok("io.example.x"));
     }
 
     /// The literal generated text of the file at `rel_path`.
@@ -972,7 +970,7 @@ mod tests {
         std::fs::create_dir_all(&base).expect("scratch");
         std::fs::write(base.join("app"), b"\x7fELF binary").expect("binary");
         std::fs::write(base.join("icon.png"), b"png").expect("icon");
-        let identity = BundleIdentity::new("My App", Some("2.0.0"), None);
+        let identity = BundleIdentity::new("My App", Some("2.0.0"), BundleId::derived("My App"));
         let bundle = layout(
             DesktopOs::Linux,
             &identity,

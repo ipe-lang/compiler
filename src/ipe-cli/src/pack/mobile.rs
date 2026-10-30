@@ -38,7 +38,7 @@ use ipe_runtime_rust::js_port_glue::native_bridge;
 use crate::CliError;
 use crate::driver::BundleProfile;
 use crate::output_dir::OwnedDir;
-use crate::project::{ProjectManifest, PushDelivery};
+use crate::project::{BundleId, MobileDelivery, ProjectManifest, PushDelivery, ScreenOrientation};
 use crate::text;
 
 use super::permissions::{self, Platform, RequestGroup, RuntimeRequestGroup};
@@ -265,6 +265,61 @@ pub struct ManifestPin {
     /// `capabilities.accepts`: the capabilities the bundle's consent gate
     /// grants and the shell's OS permissions are derived from.
     accepts: BTreeSet<Capability>,
+}
+
+/// The identity a mobile shell is laid out under: its bundle identity and its
+/// launch orientation, read once from `delivery.mobile`.
+///
+/// [`layout`] takes only this, and [`ShellIdentity::of`] is its one production
+/// constructor, so a declared `bundleId` or `orientation` cannot be dropped on
+/// the way to a shell.
+#[derive(Clone, Debug)]
+pub struct ShellIdentity {
+    /// The name, version, and bundle identifier every shell file reads.
+    identity: super::desktop::BundleIdentity,
+    /// The launch orientation the shell enforces.
+    orientation: ScreenOrientation,
+}
+
+impl ShellIdentity {
+    /// The shell identity of the parsed manifest `manifest`.
+    ///
+    /// An absent `bundleId` is [`BundleId::derived`] from the manifest name.
+    #[must_use]
+    pub fn of(manifest: &ProjectManifest) -> Self {
+        // `push` is read by `ManifestPin::of`: the shell and the bundle must
+        // agree on it.
+        let MobileDelivery {
+            bundle_id,
+            orientation,
+            push: _,
+        } = &manifest.delivery.mobile;
+        let identifier = bundle_id
+            .clone()
+            .unwrap_or_else(|| BundleId::derived(&manifest.name));
+        let version = manifest.version.as_ref().map(ToString::to_string);
+        Self {
+            identity: super::desktop::BundleIdentity::new(
+                &manifest.name,
+                version.as_deref(),
+                identifier,
+            ),
+            orientation: *orientation,
+        }
+    }
+
+    /// A shell identity built from its parts, for layout unit tests.
+    #[cfg(test)]
+    #[must_use]
+    pub const fn for_test(
+        identity: super::desktop::BundleIdentity,
+        orientation: ScreenOrientation,
+    ) -> Self {
+        Self {
+            identity,
+            orientation,
+        }
+    }
 }
 
 impl ManifestPin {
@@ -1167,14 +1222,14 @@ impl ShellLayout {
 pub fn layout(
     os: MobileOs,
     profile: BundleProfile,
-    identity: &super::desktop::BundleIdentity,
+    shell: &ShellIdentity,
     pin: &ManifestPin,
     bundle: &SpaBundle,
     icon: Option<&Path>,
 ) -> Result<ShellLayout, super::super::CliError> {
     match os {
-        MobileOs::Android => android_layout(profile, identity, pin, bundle, icon),
-        MobileOs::Ios => ios_layout(identity, pin, bundle, icon),
+        MobileOs::Android => android_layout(profile, shell, pin, bundle, icon),
+        MobileOs::Ios => ios_layout(shell, pin, bundle, icon),
     }
 }
 
@@ -1407,10 +1462,12 @@ fn capture_authority(package: &str) -> String {
 
 /// What the Android shell serves, read once from the identity and the pin.
 struct AndroidPlan<'a> {
-    /// The Android package, a valid Java package name.
-    package: String,
+    /// The Android package: the bundle identifier, verbatim.
+    package: &'a str,
     /// The app identity.
     identity: &'a super::desktop::BundleIdentity,
+    /// The launch orientation the activity declares.
+    orientation: ScreenOrientation,
     /// The manifest pin the shell is laid out from.
     pin: &'a ManifestPin,
     /// What the bundle may reach: the one input to every confinement list.
@@ -1428,11 +1485,9 @@ struct AndroidPlan<'a> {
 }
 
 impl<'a> AndroidPlan<'a> {
-    /// The plan of the shell for `identity` laid out from `pin`.
-    fn of(
-        identity: &'a super::desktop::BundleIdentity,
-        pin: &'a ManifestPin,
-    ) -> Result<Self, super::super::CliError> {
+    /// The plan of the shell for `shell` laid out from `pin`.
+    fn of(shell: &'a ShellIdentity, pin: &'a ManifestPin) -> Result<Self, super::super::CliError> {
+        let identity = &shell.identity;
         let reach = pin
             .reach(BundleHost::AndroidAssets)
             .map_err(|refusal| CliError::Usage(text::Message::relay(&refusal)))?;
@@ -1459,8 +1514,9 @@ impl<'a> AndroidPlan<'a> {
             None
         };
         Ok(Self {
-            package: android_package_id(identity),
+            package: identity.identifier.as_str(),
             identity,
+            orientation: shell.orientation,
             pin,
             reach,
             permissions,
@@ -1499,12 +1555,13 @@ impl<'a> AndroidPlan<'a> {
 /// from the permission derivation, and each is asked at the moment of use.
 fn android_layout(
     profile: BundleProfile,
-    identity: &super::desktop::BundleIdentity,
+    shell: &ShellIdentity,
     pin: &ManifestPin,
     bundle: &SpaBundle,
     icon: Option<&Path>,
 ) -> Result<ShellLayout, super::super::CliError> {
-    let plan = AndroidPlan::of(identity, pin)?;
+    let plan = AndroidPlan::of(shell, pin)?;
+    let identity = &shell.identity;
     let slug = app_slug(&identity.name);
     let root_name = format!("{slug}-android");
     let mut files = vec![
@@ -1724,10 +1781,10 @@ fn render_android_shell(plan: &AndroidPlan<'_>) -> String {
 
 /// The identity, origin and facility constants of `Shell.java`.
 fn render_shell_identity(out: &mut String, plan: &AndroidPlan<'_>) {
-    java_string(out, "PACKAGE", &plan.package);
+    java_string(out, "PACKAGE", plan.package);
     java_string(out, "APP_LABEL", &plan.identity.name);
     java_const(out, "String", "NOTIFICATION_CHANNEL", "PACKAGE");
-    java_string(out, "CAPTURE_AUTHORITY", &capture_authority(&plan.package));
+    java_string(out, "CAPTURE_AUTHORITY", &capture_authority(plan.package));
     java_string(out, "CAPTURE_DIR", CAPTURE_DIR);
     java_const(out, "int", "CHOOSER_REQUEST", &CHOOSER_REQUEST.to_string());
     java_const(
@@ -1902,18 +1959,34 @@ fn render_shell_push(out: &mut String, push: &PushDelivery) {
     }
 }
 
-/// The launcher activity element of the Android manifest.
-const ANDROID_ACTIVITY_XML: &str = r#"        <activity
+/// The `android:screenOrientation` value that enforces `orientation`.
+const fn android_screen_orientation(orientation: ScreenOrientation) -> &'static str {
+    match orientation {
+        ScreenOrientation::Portrait => "portrait",
+        ScreenOrientation::Landscape => "sensorLandscape",
+        ScreenOrientation::Any => "unspecified",
+    }
+}
+
+/// Render the launcher activity element of the Android manifest, locked to
+/// `orientation`.
+fn render_android_activity(orientation: ScreenOrientation) -> String {
+    format!(
+        r#"        <activity
             android:name="dev.ipe.app.MainActivity"
             android:exported="true"
             android:launchMode="singleTop"
+            android:screenOrientation="{screen}"
             android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboardHidden|uiMode">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
-"#;
+"#,
+        screen = android_screen_orientation(orientation),
+    )
+}
 
 /// The push elements of the Android manifest: registration waits for a
 /// subscription, and the push service is the app's own.
@@ -1967,7 +2040,7 @@ fn render_android_manifest(plan: &AndroidPlan<'_>, icon: bool) -> String {
         out.push_str("        android:icon=\"@mipmap/ic_launcher\"\n");
     }
     out.push_str("        android:usesCleartextTraffic=\"false\">\n");
-    out.push_str(ANDROID_ACTIVITY_XML);
+    out.push_str(&render_android_activity(plan.orientation));
     if plan.serves(ChromeFacility::Capture) {
         let _ = writeln!(
             out,
@@ -1980,7 +2053,7 @@ fn render_android_manifest(plan: &AndroidPlan<'_>, icon: bool) -> String {
              \x20               android:name=\"android.support.FILE_PROVIDER_PATHS\"\n\
              \x20               android:resource=\"@xml/capture_paths\" />\n\
              \x20       </provider>",
-            authority = xml_attr_escape(&capture_authority(&plan.package)),
+            authority = xml_attr_escape(&capture_authority(plan.package)),
         );
     }
     if plan.push.is_some() {
@@ -1998,44 +2071,6 @@ fn render_capture_paths() -> String {
          \x20   <cache-path name=\"{CAPTURE_DIR}\" path=\"{CAPTURE_DIR}/\" />\n\
          </paths>\n"
     )
-}
-
-/// The Android application id (reverse-DNS package), from the identity's bundle
-/// identifier so a single identity drives every OS.
-///
-/// Android package/`applicationId`/`namespace` segments are Java identifiers:
-/// each must match `[a-zA-Z_][a-zA-Z0-9_]*` (no hyphen, no leading digit). The
-/// Apple-shaped identifier permits `-` inside a segment, so each segment is
-/// coerced to a valid Java identifier here (`-` → `_`, a leading digit prefixed
-/// with `_`, an empty segment becomes `app`).
-fn android_package_id(identity: &super::desktop::BundleIdentity) -> String {
-    identity
-        .identifier
-        .split('.')
-        .map(java_identifier_segment)
-        .collect::<Vec<_>>()
-        .join(".")
-}
-
-/// Coerce one dotted segment into a valid Java identifier: keep alphanumerics and
-/// `_`, map every other character to `_`, prefix a leading digit with `_`, and
-/// map an empty result to `app`.
-fn java_identifier_segment(segment: &str) -> String {
-    let mut out = String::with_capacity(segment.len());
-    for ch in segment.chars() {
-        if ch.is_ascii_alphanumeric() || ch == '_' {
-            out.push(ch);
-        } else {
-            out.push('_');
-        }
-    }
-    if out.is_empty() {
-        return "app".to_owned();
-    }
-    if out.starts_with(|c: char| c.is_ascii_digit()) {
-        out.insert(0, '_');
-    }
-    out
 }
 
 /// The Android Gradle plugin the app module applies.
@@ -2096,7 +2131,7 @@ fn render_android_build_gradle(plan: &AndroidPlan<'_>) -> String {
          \x20   implementation 'androidx.core:core:{ANDROIDX_CORE_VERSION}'\n\
          {push}\
          }}\n",
-        ns = gradle_string_escape(&plan.package),
+        ns = gradle_string_escape(plan.package),
         version = gradle_string_escape(&plan.identity.version),
     )
 }
@@ -3934,11 +3969,12 @@ fn android_readme(root_name: &str, profile: BundleProfile, base: &MountBase) -> 
 /// never a remote URL. The `Info.plist` usage-description keys come only from the
 /// permission derivation.
 fn ios_layout(
-    identity: &super::desktop::BundleIdentity,
+    shell: &ShellIdentity,
     pin: &ManifestPin,
     bundle: &SpaBundle,
     icon: Option<&Path>,
 ) -> Result<ShellLayout, super::super::CliError> {
+    let identity = &shell.identity;
     let accepts = pin.accepts();
     let base = pin.base();
     let reach = pin
@@ -3948,7 +3984,7 @@ fn ios_layout(
     let root_name = format!("{slug}-ios");
     let mut files = Vec::new();
 
-    let plist = render_ios_info_plist(identity, accepts)?;
+    let plist = render_ios_info_plist(shell, accepts)?;
     files.push(ShellFile {
         rel_path: "App/Info.plist".to_owned(),
         content: ShellContent::Generated(plist),
@@ -3988,37 +4024,109 @@ fn ios_layout(
     })
 }
 
-/// Render the iOS `Info.plist`, assembling the fixed identity keys and the derived
-/// usage-description keys.
+/// The iPhone `UISupportedInterfaceOrientations` that enforce `orientation`.
+const fn ios_orientations(orientation: ScreenOrientation) -> &'static [&'static str] {
+    match orientation {
+        ScreenOrientation::Portrait => &["UIInterfaceOrientationPortrait"],
+        ScreenOrientation::Landscape => &[
+            "UIInterfaceOrientationLandscapeLeft",
+            "UIInterfaceOrientationLandscapeRight",
+        ],
+        ScreenOrientation::Any => &[
+            "UIInterfaceOrientationPortrait",
+            "UIInterfaceOrientationLandscapeLeft",
+            "UIInterfaceOrientationLandscapeRight",
+        ],
+    }
+}
+
+/// The iPad `UISupportedInterfaceOrientations~ipad` that enforce `orientation`.
+const fn ios_ipad_orientations(orientation: ScreenOrientation) -> &'static [&'static str] {
+    match orientation {
+        ScreenOrientation::Portrait => &["UIInterfaceOrientationPortrait"],
+        ScreenOrientation::Landscape => &[
+            "UIInterfaceOrientationLandscapeLeft",
+            "UIInterfaceOrientationLandscapeRight",
+        ],
+        ScreenOrientation::Any => &[
+            "UIInterfaceOrientationPortrait",
+            "UIInterfaceOrientationPortraitUpsideDown",
+            "UIInterfaceOrientationLandscapeLeft",
+            "UIInterfaceOrientationLandscapeRight",
+        ],
+    }
+}
+
+/// Whether `orientation` locks the app, which on iPad needs the multitasking
+/// opt-out `UIRequiresFullScreen`.
+const fn ios_requires_full_screen(orientation: ScreenOrientation) -> bool {
+    match orientation {
+        ScreenOrientation::Portrait | ScreenOrientation::Landscape => true,
+        ScreenOrientation::Any => false,
+    }
+}
+
+/// Render the iOS `Info.plist`, assembling the fixed identity keys, the
+/// orientation keys, and the derived usage-description keys.
 ///
 /// The permission keys come ONLY from [`permissions::derive_permissions`] on
 /// [`Platform::Ios`]; this function never writes an `NS…UsageDescription` key
 /// itself. An app that accepts no permission-bearing web capability yields a plist
-/// with no usage-description keys. Identity strings are XML-escaped.
+/// with no usage-description keys. Every key and string is XML-escaped.
 fn render_ios_info_plist(
-    identity: &super::desktop::BundleIdentity,
+    shell: &ShellIdentity,
     accepts: &BTreeSet<Capability>,
 ) -> Result<String, super::super::CliError> {
     use std::fmt::Write as _;
 
+    let identity = &shell.identity;
     let permission_set = permissions::derive_permissions(accepts, Platform::Ios)?;
     let usage_entries = permission_set.to_info_plist_entries();
 
     let mut body = String::new();
-    let mut pair = |key: &str, value: &str| {
+    let pair = |body: &mut String, key: &str, value: &str| {
         let _ = writeln!(body, "\t<key>{}</key>", plist_escape(key));
         let _ = writeln!(body, "\t<string>{}</string>", plist_escape(value));
     };
-    pair("CFBundleName", &identity.name);
-    pair("CFBundleDisplayName", &identity.name);
-    pair("CFBundleIdentifier", &identity.identifier);
-    pair("CFBundleVersion", &identity.version);
-    pair("CFBundleShortVersionString", &identity.version);
-    pair("CFBundleExecutable", &app_slug(&identity.name));
-    pair("CFBundlePackageType", "APPL");
+    let array = |body: &mut String, key: &str, values: &[&str]| {
+        let _ = writeln!(body, "\t<key>{}</key>", plist_escape(key));
+        body.push_str("\t<array>\n");
+        for value in values {
+            let _ = writeln!(body, "\t\t<string>{}</string>", plist_escape(value));
+        }
+        body.push_str("\t</array>\n");
+    };
+    pair(&mut body, "CFBundleName", &identity.name);
+    pair(&mut body, "CFBundleDisplayName", &identity.name);
+    pair(
+        &mut body,
+        "CFBundleIdentifier",
+        identity.identifier.as_str(),
+    );
+    pair(&mut body, "CFBundleVersion", &identity.version);
+    pair(&mut body, "CFBundleShortVersionString", &identity.version);
+    pair(&mut body, "CFBundleExecutable", &app_slug(&identity.name));
+    pair(&mut body, "CFBundlePackageType", "APPL");
+    array(
+        &mut body,
+        "UISupportedInterfaceOrientations",
+        ios_orientations(shell.orientation),
+    );
+    array(
+        &mut body,
+        "UISupportedInterfaceOrientations~ipad",
+        ios_ipad_orientations(shell.orientation),
+    );
+    if ios_requires_full_screen(shell.orientation) {
+        let _ = writeln!(
+            body,
+            "\t<key>{}</key>\n\t<true/>",
+            plist_escape("UIRequiresFullScreen")
+        );
+    }
     // The permission keys — from the permission derivation, never authored here.
     for (key, purpose) in usage_entries {
-        pair(&key, &purpose);
+        pair(&mut body, &key, &purpose);
     }
 
     Ok(format!(
@@ -4428,8 +4536,31 @@ mod tests {
         Capability::JsPort(axis)
     }
 
-    fn identity() -> super::super::desktop::BundleIdentity {
-        super::super::desktop::BundleIdentity::new("Geo App", Some("1.2.3"), None)
+    fn identity() -> ShellIdentity {
+        shell_of(
+            "Geo App",
+            BundleId::derived("Geo App"),
+            ScreenOrientation::Any,
+        )
+    }
+
+    /// The shell identity of an app named `name` with bundle id `id`, locked to
+    /// `orientation`.
+    fn shell_of(name: &str, id: BundleId, orientation: ScreenOrientation) -> ShellIdentity {
+        ShellIdentity::for_test(
+            super::super::desktop::BundleIdentity::new(name, Some("1.2.3"), id),
+            orientation,
+        )
+    }
+
+    /// A bundle id the grammar accepts.
+    fn bundle_id(text: &str) -> BundleId {
+        BundleId::parse(text).expect("a grammar-valid bundle id")
+    }
+
+    /// The `layout` of `os` for `shell` over the capture-serving pin.
+    fn layout_of(os: MobileOs, shell: &ShellIdentity) -> ShellLayout {
+        layout(os, BundleProfile::Dev, shell, &full_pin(), &bundle(), None).expect("layout")
     }
 
     /// A fresh scratch directory unique to this call.
@@ -4856,38 +4987,135 @@ mod tests {
     }
 
     #[test]
-    fn android_package_id_is_a_valid_java_identifier() {
-        // A hyphenated app name yields an Apple identifier segment with a `-`,
-        // which is illegal in an Android package/applicationId. The Gradle
-        // namespace must carry a coerced, hyphen-free package; the manifest
-        // carries no `package` attribute (Android Gradle plugin 8 refuses one).
-        let hyphenated = super::super::desktop::BundleIdentity::new("wasm-spa", None, None);
-        let layout = layout(
+    fn the_android_package_is_the_bundle_id_verbatim() {
+        let shell = layout_of(
             MobileOs::Android,
-            BundleProfile::Dev,
-            &hyphenated,
-            &shell_pin(&accepts(&[]), &MountBase::root()),
-            &bundle(),
-            None,
-        )
-        .expect("layout");
-        let manifest = layout
-            .generated("app/src/main/AndroidManifest.xml")
-            .expect("android manifest");
+            &shell_of("Shop", bundle_id("io.acme.Shop"), ScreenOrientation::Any),
+        );
+        let manifest = text_of(&shell, "app/src/main/AndroidManifest.xml");
         assert!(
             !manifest.contains("package="),
             "the package lives in the Gradle namespace only: {manifest}"
         );
-        let gradle = layout.generated("app/build.gradle").expect("build.gradle");
         assert!(
-            gradle.contains("namespace 'com.ipe.wasm_spa'"),
-            "the Android package is a hyphen-free Java identifier: {gradle}"
+            manifest.contains(&format!(
+                "android:authorities=\"io.acme.Shop.{CAPTURE_DIR}\""
+            )),
+            "the capture authority is the bundle id verbatim: {manifest}"
         );
+        let gradle = text_of(&shell, "app/build.gradle");
+        assert!(gradle.contains("namespace 'io.acme.Shop'"), "{gradle}");
+        assert!(gradle.contains("applicationId 'io.acme.Shop'"), "{gradle}");
+        assert_eq!(
+            constant(&shell, "PACKAGE"),
+            Some(quoted("io.acme.Shop")),
+            "the shell's package constant is the bundle id verbatim"
+        );
+        assert_eq!(
+            constant(&shell, "CAPTURE_AUTHORITY"),
+            Some(quoted(&format!("io.acme.Shop.{CAPTURE_DIR}")))
+        );
+    }
+
+    #[test]
+    fn the_ios_bundle_identifier_is_the_bundle_id_verbatim() {
+        let shell = layout_of(
+            MobileOs::Ios,
+            &shell_of("Shop", bundle_id("io.acme.Shop"), ScreenOrientation::Any),
+        );
+        let plist = text_of(&shell, "App/Info.plist");
         assert!(
-            gradle.contains("applicationId 'com.ipe.wasm_spa'"),
-            "{gradle}"
+            plist.contains("\t<key>CFBundleIdentifier</key>\n\t<string>io.acme.Shop</string>\n"),
+            "{plist}"
         );
-        assert!(!gradle.contains("wasm-spa"));
+    }
+
+    #[test]
+    fn the_android_activity_enforces_the_declared_orientation() {
+        for orientation in [
+            ScreenOrientation::Portrait,
+            ScreenOrientation::Landscape,
+            ScreenOrientation::Any,
+        ] {
+            let expected = match orientation {
+                ScreenOrientation::Portrait => "portrait",
+                ScreenOrientation::Landscape => "sensorLandscape",
+                ScreenOrientation::Any => "unspecified",
+            };
+            let shell = layout_of(
+                MobileOs::Android,
+                &shell_of("Geo App", BundleId::derived("Geo App"), orientation),
+            );
+            let manifest = text_of(&shell, "app/src/main/AndroidManifest.xml");
+            assert_eq!(
+                manifest.matches("android:screenOrientation=").count(),
+                1,
+                "{manifest}"
+            );
+            assert!(
+                manifest.contains(&format!("android:screenOrientation=\"{expected}\"")),
+                "{orientation:?}: {manifest}"
+            );
+        }
+    }
+
+    /// The `<array>` of `key` in `plist`, as its strings.
+    fn plist_array<'a>(plist: &'a str, key: &str) -> Option<Vec<&'a str>> {
+        let open = format!("\t<key>{key}</key>\n\t<array>\n");
+        let (_, rest) = plist.split_once(open.as_str())?;
+        let (body, _) = rest.split_once("\t</array>")?;
+        Some(
+            body.lines()
+                .filter_map(|line| {
+                    line.trim()
+                        .strip_prefix("<string>")
+                        .and_then(|l| l.strip_suffix("</string>"))
+                })
+                .collect(),
+        )
+    }
+
+    #[test]
+    fn the_ios_plist_enforces_the_declared_orientation() {
+        const PORTRAIT: &str = "UIInterfaceOrientationPortrait";
+        const UPSIDE_DOWN: &str = "UIInterfaceOrientationPortraitUpsideDown";
+        const LEFT: &str = "UIInterfaceOrientationLandscapeLeft";
+        const RIGHT: &str = "UIInterfaceOrientationLandscapeRight";
+        for orientation in [
+            ScreenOrientation::Portrait,
+            ScreenOrientation::Landscape,
+            ScreenOrientation::Any,
+        ] {
+            let (phone, pad, full_screen): (&[&str], &[&str], bool) = match orientation {
+                ScreenOrientation::Portrait => (&[PORTRAIT], &[PORTRAIT], true),
+                ScreenOrientation::Landscape => (&[LEFT, RIGHT], &[LEFT, RIGHT], true),
+                ScreenOrientation::Any => (
+                    &[PORTRAIT, LEFT, RIGHT],
+                    &[PORTRAIT, UPSIDE_DOWN, LEFT, RIGHT],
+                    false,
+                ),
+            };
+            let shell = layout_of(
+                MobileOs::Ios,
+                &shell_of("Geo App", BundleId::derived("Geo App"), orientation),
+            );
+            let plist = text_of(&shell, "App/Info.plist");
+            assert_eq!(
+                plist_array(plist, "UISupportedInterfaceOrientations").as_deref(),
+                Some(phone),
+                "{orientation:?}: {plist}"
+            );
+            assert_eq!(
+                plist_array(plist, "UISupportedInterfaceOrientations~ipad").as_deref(),
+                Some(pad),
+                "{orientation:?}: {plist}"
+            );
+            assert_eq!(
+                plist.contains("\t<key>UIRequiresFullScreen</key>\n\t<true/>"),
+                full_screen,
+                "{orientation:?}: {plist}"
+            );
+        }
     }
 
     #[test]
@@ -5017,10 +5245,10 @@ mod tests {
 
     #[test]
     fn a_hostile_app_name_is_xml_escaped_in_the_manifests() {
-        let hostile = super::super::desktop::BundleIdentity::new(
+        let hostile = shell_of(
             "Evil\"</manifest><x>",
-            Some("1.0.0"),
-            Some("com.evil.\"<x>"),
+            BundleId::derived("Evil\"</manifest><x>"),
+            ScreenOrientation::Portrait,
         );
         let a = accepts(&[]);
         let android = layout(
@@ -5061,10 +5289,10 @@ mod tests {
         // Gradle evaluates `settings.gradle` as Groovy at configuration time; in a
         // DOUBLE-quoted string `${…}` is live interpolation → code execution when
         // anyone runs `./gradlew`. A single-quoted string renders `$` literal.
-        let hostile = super::super::desktop::BundleIdentity::new(
+        let hostile = shell_of(
             "App${new ProcessBuilder('id').start()}",
-            Some("1.0.0"),
-            Some("com.evil.app"),
+            bundle_id("com.evil.app"),
+            ScreenOrientation::Any,
         );
         let android = layout(
             MobileOs::Android,
@@ -5756,10 +5984,11 @@ mod tests {
 
     #[test]
     fn android_hostile_name_stays_inside_its_literals() {
-        let hostile = super::super::desktop::BundleIdentity::new(
-            "Evil\"); x(); // \\u0022 <a href=\"&\">",
-            Some("1.0.0"),
-            None,
+        let hostile_name = "Evil\"); x(); // \\u0022 <a href=\"&\">";
+        let hostile = shell_of(
+            hostile_name,
+            BundleId::derived(hostile_name),
+            ScreenOrientation::Any,
         );
         let pin = pin("/", &[]);
         let shell = layout(
@@ -5773,14 +6002,14 @@ mod tests {
         .expect("android layout");
         assert_eq!(
             constant(&shell, "APP_LABEL"),
-            Some(quoted(&hostile.name)),
+            Some(quoted(hostile_name)),
             "the label reaches Java only as its literal"
         );
         let manifest = text_of(&shell, "app/src/main/AndroidManifest.xml");
         assert!(
             manifest.contains(&format!(
                 "android:label=\"{}\"",
-                xml_attr_escape(&hostile.name)
+                xml_attr_escape(hostile_name)
             )),
             "{manifest}"
         );

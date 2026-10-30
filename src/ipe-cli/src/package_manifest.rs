@@ -62,10 +62,10 @@ use ipe_runtime_rust::encoding::{
 use crate::CliError;
 use crate::delivery_set::{BinaryTarget, ShipEntry};
 use crate::project::{
-    ApnsEnvironment, BrowserDelivery, Capability, DeliveryConfig, DesktopDelivery, EntryShape,
-    FcmApiKey, FcmApplicationId, FcmIdentifierRefusal, FcmIdentifiers, FcmProjectId, FcmSenderId,
-    Install, IpeDep, MobileDelivery, Program, ProjectManifest, PublicEnvAllowlist, PublicEnvName,
-    PushDelivery, RustDep, ScreenOrientation, WasmBundle, WasmConfig, WasmMode,
+    ApnsEnvironment, BrowserDelivery, BundleId, Capability, DeliveryConfig, DesktopDelivery,
+    EntryShape, FcmApiKey, FcmApplicationId, FcmIdentifierRefusal, FcmIdentifiers, FcmProjectId,
+    FcmSenderId, Install, IpeDep, MobileDelivery, Program, ProjectManifest, PublicEnvAllowlist,
+    PublicEnvName, PushDelivery, RustDep, ScreenOrientation, WasmBundle, WasmConfig, WasmMode,
 };
 use crate::pwa_icon::{self, PwaIconRefusal};
 use crate::text;
@@ -1154,7 +1154,7 @@ impl Reader<'_> {
         let mut m = MobileDelivery::default();
         for (fname, value) in self.expect_record(expr)? {
             match self.text(fname.value) {
-                "bundleId" => m.bundle_id = self.expect_string(value)?,
+                "bundleId" => m.bundle_id = Some(self.bundle_id_field(value)?),
                 "orientation" => m.orientation = self.read_orientation(value)?,
                 "push" => m.push = Some(self.read_push(value)?),
                 other => {
@@ -1273,6 +1273,19 @@ impl Reader<'_> {
             self.reject(
                 value.span,
                 &format!("`delivery.mobile.push.fcm.{key}` is refused: {refusal}"),
+            )
+        })
+    }
+
+    /// Read `delivery.mobile.bundleId` through [`BundleId::parse`].
+    ///
+    /// The refusal names the grammar and never echoes the declared text.
+    fn bundle_id_field(&self, value: &Expr) -> Result<BundleId, CliError> {
+        let raw = self.expect_string(value)?;
+        BundleId::parse(&raw).map_err(|refusal| {
+            self.reject(
+                value.span,
+                &format!("`delivery.mobile.bundleId` is refused: {refusal}"),
             )
         })
     }
@@ -3415,6 +3428,60 @@ mod tests {
             .expect("an accepted, configured push is returned");
         assert_eq!(push.apns, ApnsEnvironment::Production);
         assert_eq!(push.fcm.api_key.as_str(), "AIza-key_1");
+    }
+
+    #[test]
+    fn manifest_bundle_id_outside_the_grammar_is_refused_without_echo() {
+        let refusal = refusal_text(
+            "bundle_id_hyphen_refused",
+            &delivery_manifest("{ mobile = { bundleId = \"com.my-app\" } }", ""),
+        );
+        assert!(
+            refusal.as_deref().is_some_and(|msg| {
+                msg.contains("`delivery.mobile.bundleId` is refused")
+                    && msg.contains("two or more `.`-separated labels")
+                    && !msg.contains("my-app")
+            }),
+            "a hyphenated bundleId is refused with the grammar and no echo: {refusal:?}"
+        );
+        let one_label = refusal_text(
+            "bundle_id_one_label_refused",
+            &delivery_manifest("{ mobile = { bundleId = \"myapp\" } }", ""),
+        );
+        assert!(
+            one_label.as_deref().is_some_and(
+                |msg| msg.contains(&crate::project::BundleIdRefusal::OneLabel.to_string())
+            ),
+            "a one-label bundleId is refused with the one-label text: {one_label:?}"
+        );
+    }
+
+    #[test]
+    fn manifest_bundle_id_refusal_remedy_parses() {
+        let manifest = read(
+            "bundle_id_remedy_accepted",
+            &delivery_manifest("{ mobile = { bundleId = \"com.example.myapp\" } }", ""),
+        )
+        .expect("the bundleId the refusal text advises parses");
+        assert_eq!(
+            manifest
+                .delivery
+                .mobile
+                .bundle_id
+                .as_ref()
+                .map(BundleId::as_str),
+            Some("com.example.myapp")
+        );
+        let absent = read(
+            "bundle_id_absent",
+            &delivery_manifest("{ mobile = { orientation = Landscape } }", ""),
+        )
+        .expect("a mobile record without bundleId parses");
+        assert_eq!(absent.delivery.mobile.bundle_id, None);
+        assert_eq!(
+            absent.delivery.mobile.orientation,
+            ScreenOrientation::Landscape
+        );
     }
 
     #[test]
