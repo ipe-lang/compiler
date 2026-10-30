@@ -530,7 +530,7 @@ mod tests {
         write_minimal_manifest(&root);
         std::fs::write(
             root.join(crate::lockfile::LOCKFILE_NAME),
-            "not valid ipe.lock\n",
+            "[[package]]\nname = \"left-pad\"\n",
         )
         .expect("write a malformed ipe.lock");
 

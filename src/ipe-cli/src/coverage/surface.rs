@@ -621,11 +621,23 @@ mod tests {
                 Box::new(TyDoc::Var("b".into()))
             )),
         )));
-        // `a -> (a -> b)`: a function-typed result makes it higher-order.
-        assert!(scheme_is_higher_order(&TyDoc::Fun(
+        // `a -> a -> b`: a curried result is still first-order.
+        assert!(!scheme_is_higher_order(&TyDoc::Fun(
             Box::new(TyDoc::Var("a".into())),
             Box::new(TyDoc::Fun(
                 Box::new(TyDoc::Var("a".into())),
+                Box::new(TyDoc::Var("b".into()))
+            )),
+        )));
+        // `a -> (a -> b) -> b`: a function-typed later parameter makes it
+        // higher-order.
+        assert!(scheme_is_higher_order(&TyDoc::Fun(
+            Box::new(TyDoc::Var("a".into())),
+            Box::new(TyDoc::Fun(
+                Box::new(TyDoc::Fun(
+                    Box::new(TyDoc::Var("a".into())),
+                    Box::new(TyDoc::Var("b".into()))
+                )),
                 Box::new(TyDoc::Var("b".into()))
             )),
         )));
@@ -646,8 +658,12 @@ mod tests {
     fn an_unparsable_module_is_a_typed_parse_error() {
         let mut by_key = BTreeMap::new();
         let segments = vec!["Ipe".to_owned(), "NotReal".to_owned()];
-        let result =
-            merge_one_compiled_module(&mut by_key, &segments, "module Ipe.NotReal exposing ((((");
+        let result = merge_exposing(
+            &mut by_key,
+            &segments,
+            "module Ipe.NotReal exposing ((((",
+            None,
+        );
         assert!(matches!(result, Err(CoverageError::Parse { .. })));
     }
 
