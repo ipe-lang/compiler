@@ -40,11 +40,13 @@ Modifiers and inspectors:
 * `kindName` — the variant name of an `ErrorKind`, the same prefix
   `toString` uses.
 
-`ErrorKind` has twelve variants: `Io`, `Network`, `Ffi`, `Decode`,
+`ErrorKind` has thirteen variants: `Io`, `Network`, `Ffi`, `Decode`,
 `Timeout`, `NotFound`, `PermissionDenied`, `InvalidInput`, `Conflict`,
-`Unavailable`, `Unexpected` and `LimitExceeded`. `LimitExceeded` marks an
-input refused by a declared ceiling (too large, too long, too deep or with
-too many parts for its bound); a larger bound would accept the same input.
+`Unavailable`, `Unexpected`, `LimitExceeded` and `UpdateRequired`.
+`LimitExceeded` marks an input refused by a declared ceiling (too large,
+too long, too deep or with too many parts for its bound); a larger bound
+would accept the same input. `UpdateRequired` means the client is older
+than the server it calls: the user updates the app. It is not retryable.
 
 ## `unexpected`
 
@@ -205,6 +207,6 @@ Extract the bare message string from an `Error`.
 kindName : ErrorKind -> String
 ```
 
-The variant name of an `ErrorKind` (`"Io"`, `"LimitExceeded"`, …), the
-same prefix `toString` uses.
+The variant name of an `ErrorKind` (`"Io"`, `"LimitExceeded"`,
+`"UpdateRequired"`, …), the same prefix `toString` uses.
 

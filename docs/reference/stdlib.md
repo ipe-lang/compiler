@@ -1918,7 +1918,7 @@ Ipe.Error — the structured `Error` type.
 | `withDetails` | Attach an `ErrorDetails` value to an `Error`. |
 | `kind` | Extract the `ErrorKind` classification tag from an `Error`. |
 | `message` | Extract the bare message string from an `Error`. |
-| `kindName` | The variant name of an `ErrorKind` (`"Io"`, `"LimitExceeded"`, …), the |
+| `kindName` | The variant name of an `ErrorKind` (`"Io"`, `"LimitExceeded"`, |
 
 ## Ffi.Js
 
