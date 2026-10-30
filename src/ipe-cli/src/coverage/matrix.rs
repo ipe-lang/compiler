@@ -211,7 +211,10 @@ pub fn run_static() -> Result<MatrixReport, CoverageError> {
 /// # Errors
 /// A typed [`CoverageError`] from column construction or surface enumeration.
 pub fn run_dynamic() -> Result<MatrixReport, CoverageError> {
-    run(&crate::coverage::surface::StdlibSurface, &dynamic_columns()?)
+    run(
+        &crate::coverage::surface::StdlibSurface,
+        &dynamic_columns()?,
+    )
 }
 
 /// The registered aspect columns of the env-var surface.

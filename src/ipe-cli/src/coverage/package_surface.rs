@@ -109,8 +109,8 @@ impl Surface for PackageSurface {
     }
 
     fn all(&self) -> Result<Vec<PackageItem>, CoverageError> {
-        let manifest = load_manifest(&self.project_root)
-            .map_err(|e| CoverageError::Manifest(Box::new(e)))?;
+        let manifest =
+            load_manifest(&self.project_root).map_err(|e| CoverageError::Manifest(Box::new(e)))?;
 
         let mut items: Vec<PackageItem> = Vec::new();
 
@@ -467,7 +467,8 @@ pub fn package_columns(
 mod tests {
     use super::*;
 
-    const HEADER: &str = "module Package exposing (package)\n\nimport Ipe.Package exposing (..)\n\n\n";
+    const HEADER: &str =
+        "module Package exposing (package)\n\nimport Ipe.Package exposing (..)\n\n\n";
 
     /// A fresh, empty project directory under the OS temp root, unique per test.
     fn fresh_project(tag: &str) -> PathBuf {
@@ -510,8 +511,11 @@ mod tests {
     fn a_malformed_lockfile_is_a_typed_lockfile_error_not_an_empty_lockfile() {
         let root = fresh_project("bad-lockfile");
         write_minimal_manifest(&root);
-        std::fs::write(root.join(crate::lockfile::LOCKFILE_NAME), "not valid ipe.lock\n")
-            .expect("write a malformed ipe.lock");
+        std::fs::write(
+            root.join(crate::lockfile::LOCKFILE_NAME),
+            "not valid ipe.lock\n",
+        )
+        .expect("write a malformed ipe.lock");
 
         assert!(matches!(
             PinnedAndHashedColumn::new(&root),

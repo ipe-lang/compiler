@@ -308,12 +308,13 @@ impl LayerAgreementColumn {
         let mut projected = BTreeMap::new();
         for module in modules {
             let segments: Vec<String> = module.dotted.split('.').map(str::to_owned).collect();
-            let api = api_surface::extract_stdlib_module(&segments, module.source).map_err(
-                |source| CoverageError::Extract {
-                    module: segments.clone(),
-                    source,
-                },
-            )?;
+            let api =
+                api_surface::extract_stdlib_module(&segments, module.source).map_err(|source| {
+                    CoverageError::Extract {
+                        module: segments.clone(),
+                        source,
+                    }
+                })?;
             for (path, module_api) in &api.modules {
                 for (type_name, union) in &module_api.unions {
                     // A projected union is the genuine builtin only when its

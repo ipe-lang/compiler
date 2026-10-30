@@ -1,7 +1,9 @@
-//! Every stdlib kernel joined against its HM type scheme, cross-checked
-//! against [`ipe_kernels::KernelDef::shape`] so a kernel the registry declares
-//! schemed but the scheme table omits — or declares unschemed but the table
-//! still carries — is a named drift, never a silent flexible-type fallback.
+//! Every stdlib kernel joined against its HM type scheme.
+//!
+//! The join is cross-checked against [`ipe_kernels::KernelDef::shape`] so a
+//! kernel the registry declares schemed but the scheme table omits — or
+//! declares unschemed but the table still carries — is a named drift, never
+//! a silent flexible-type fallback.
 //!
 //! This is the defend-in-depth layer, not the structural fix: the true
 //! source-of-truth join belongs in [`ipe_types::kernel_type_table`] itself
@@ -86,7 +88,8 @@ fn join(
     shape: impl Fn(StdlibKernel) -> bool,
 ) -> Result<Vec<(StdlibKernel, KernelScheme)>, KernelSchemeError> {
     let table = table.map_err(KernelSchemeError::Table)?;
-    let mut by_kernel: BTreeMap<usize, Ty> = table.into_iter().map(|(k, ty)| (k as usize, ty)).collect();
+    let mut by_kernel: BTreeMap<usize, Ty> =
+        table.into_iter().map(|(k, ty)| (k as usize, ty)).collect();
 
     all.iter()
         .map(|&kernel| {
@@ -175,17 +178,24 @@ mod tests {
         let all = [StdlibKernel::LogInfo];
         let result = join(&all, Ok(Vec::new()), |_| false);
         let rows = result.expect("no drift when shape and table presence agree");
-        assert!(matches!(rows.as_slice(), [(StdlibKernel::LogInfo, KernelScheme::Unschemed)]));
+        assert!(matches!(
+            rows.as_slice(),
+            [(StdlibKernel::LogInfo, KernelScheme::Unschemed)]
+        ));
     }
 
     #[test]
     fn every_stdlib_kernel_resolves_against_the_live_table_exactly_once() {
         let mut interner = Interner::new();
-        let rows = kernel_schemes(&mut interner).expect("the live kernel registry and scheme table must agree");
+        let rows = kernel_schemes(&mut interner)
+            .expect("the live kernel registry and scheme table must agree");
         assert_eq!(rows.len(), StdlibKernel::ALL.len());
         let mut seen: std::collections::BTreeSet<usize> = std::collections::BTreeSet::new();
         for (kernel, _) in &rows {
-            assert!(seen.insert(*kernel as usize), "kernel {kernel:?} appeared twice");
+            assert!(
+                seen.insert(*kernel as usize),
+                "kernel {kernel:?} appeared twice"
+            );
         }
     }
 }

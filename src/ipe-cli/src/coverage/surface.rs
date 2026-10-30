@@ -36,6 +36,10 @@ use crate::coverage::contract::{SchemeState, StdlibSymbol, Surface, SymbolKind};
 use crate::coverage::error::CoverageError;
 use crate::kernel_schemes::{self, KernelScheme, KernelSchemeError};
 
+/// A kernel qualifier's module path, keyed by the dotted name or qualifier a
+/// [`kernel_module_path`] lookup table joins against.
+pub(crate) type QualifierModuleMap = BTreeMap<String, Vec<String>>;
+
 /// The reconciliation key: one row per (module, name, kind).
 type Key = (Vec<String>, String, SymbolKind);
 
@@ -266,7 +270,7 @@ fn merge_projected_only(
 
 /// A compiled-source symbol seed: present in a compiled-source module and
 /// exported; kernel facet not yet known.
-fn compiled_symbol(
+const fn compiled_symbol(
     module: Vec<String>,
     name: String,
     kind: SymbolKind,
@@ -352,9 +356,9 @@ const QUALIFIER_MODULE_OVERRIDES: &[(&str, &[&str])] = &[
 ///    kernel, not to judge which ones are homed, so this tier never errors.
 pub(crate) fn kernel_module_path(
     qualifier: &'static str,
-    qualifier_to_path: &BTreeMap<String, Vec<String>>,
-    compiled_by_dotted: &BTreeMap<String, Vec<String>>,
-    compiled_by_last_segment: &BTreeMap<String, Vec<String>>,
+    qualifier_to_path: &QualifierModuleMap,
+    compiled_by_dotted: &QualifierModuleMap,
+    compiled_by_last_segment: &QualifierModuleMap,
 ) -> Result<Vec<String>, CoverageError> {
     if let Some(path) = qualifier_to_path.get(qualifier) {
         return Ok(path.clone());
@@ -395,12 +399,9 @@ pub(crate) fn kernel_module_path(
 /// Shared by `coverage::surface` and `doc`'s kernel-module renderer so the two
 /// consumers resolve a kernel qualifier's module the same way — a qualifier
 /// homed here cannot be homed differently there.
-pub(crate) fn qualifier_lookup_tables() -> (
-    BTreeMap<String, Vec<String>>,
-    BTreeMap<String, Vec<String>>,
-    BTreeMap<String, Vec<String>>,
-) {
-    let qualifier_to_path: BTreeMap<String, Vec<String>> = ipe_canon::STDLIB_MODULE_QUALIFIERS
+pub(crate) fn qualifier_lookup_tables()
+-> (QualifierModuleMap, QualifierModuleMap, QualifierModuleMap) {
+    let qualifier_to_path: QualifierModuleMap = ipe_canon::STDLIB_MODULE_QUALIFIERS
         .iter()
         .map(|(segs, qualifier)| {
             (
@@ -410,12 +411,12 @@ pub(crate) fn qualifier_lookup_tables() -> (
         })
         .collect();
 
-    let compiled_by_dotted: BTreeMap<String, Vec<String>> = ipe_stdlib::COMPILED_STD_MODULES
+    let compiled_by_dotted: QualifierModuleMap = ipe_stdlib::COMPILED_STD_MODULES
         .iter()
         .map(|m| (m.dotted.to_owned(), segments_of(m.dotted)))
         .collect();
 
-    let compiled_by_last_segment: BTreeMap<String, Vec<String>> = ipe_stdlib::COMPILED_STD_MODULES
+    let compiled_by_last_segment: QualifierModuleMap = ipe_stdlib::COMPILED_STD_MODULES
         .iter()
         .filter_map(|m| {
             let segs = segments_of(m.dotted);

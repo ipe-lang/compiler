@@ -1951,9 +1951,9 @@ fn kernel_value_doc(
     decl: ipe_kernels::StdlibDecl,
     ty: &Ty,
     interner: &Interner,
-    qualifier_to_path: &BTreeMap<String, Vec<String>>,
-    compiled_by_dotted: &BTreeMap<String, Vec<String>>,
-    compiled_by_last_segment: &BTreeMap<String, Vec<String>>,
+    qualifier_to_path: &crate::coverage::surface::QualifierModuleMap,
+    compiled_by_dotted: &crate::coverage::surface::QualifierModuleMap,
+    compiled_by_last_segment: &crate::coverage::surface::QualifierModuleMap,
 ) -> Result<(String, ValueDoc), CliError> {
     let module_path = crate::coverage::surface::kernel_module_path(
         decl.qualifier,

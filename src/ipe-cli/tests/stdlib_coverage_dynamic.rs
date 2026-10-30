@@ -86,6 +86,7 @@ fn build_run_holes(symbols: &[StdlibSymbol]) -> Vec<(String, String)> {
 
 /// Run one dynamic column over the whole surface, returning every hole as a
 /// `(dotted symbol, message)` pair.
+#[allow(clippy::expect_used)] // a failed matrix run is a harness setup failure
 fn holes_of(column: Box<dyn AspectCheck<StdlibSymbol>>) -> Vec<(String, String)> {
     let columns = vec![column];
     let report = run(&StdlibSurface, &columns).expect("the stdlib matrix run must not fail closed");
