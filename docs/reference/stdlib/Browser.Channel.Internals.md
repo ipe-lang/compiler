@@ -56,7 +56,8 @@ dropped whole. A decoded `JsMsg` is handed to `toMsg`.
 inbound : Decode.Decoder JsMsg
 ```
 
-The total, fail-closed decoder for the inbound `JsMsg`. Reads the `event`
-discriminator: `"message"` decodes a `Message`; `"unavailable"` decodes
-`Unavailable`. An unrecognised token fails the decode closed.
+The total, fail-closed decoder for a `JsMsg` frame of this capability.
+
+It first requires the frame's `tag` to be `portTag`, so a frame of another
+capability, or an untagged one, fails closed; the rest decodes as `inboundBody`.
 
