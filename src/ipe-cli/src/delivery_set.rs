@@ -25,7 +25,7 @@ use std::path::PathBuf;
 use ipe_backend_rust::static_build::StaticTriple;
 
 use crate::CliError;
-use crate::delivery::{Delivery, DeliveryError, Host, Runtime, Shape};
+use crate::delivery::{Delivery, DeliveryError, Host, RetiredRuntimeWord, Runtime, Shape};
 
 /// The third delivery axis a co-located binary carries.
 ///
@@ -48,8 +48,9 @@ pub enum BinaryTarget {
 /// program's shape is not yet known, so the web-only entries are carried
 /// unresolved and checked later against the pinned shape.
 ///
-/// Produced only by the manifest reader. The eight variants are the closed ship
-/// vocabulary, each mapping one-to-one onto the CLI delivery grammar.
+/// Produced only by the manifest reader. The variants are the closed ship
+/// vocabulary, each mapping one-to-one onto the CLI delivery grammar; a web
+/// entry's builder word is derived from its runtime and host words.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ShipEntry {
     /// The shape's own co-located artifact, on the given target. For `web` this
@@ -57,30 +58,110 @@ pub enum ShipEntry {
     Binary(BinaryTarget),
     /// `web desktop` — the webview-native desktop bundle.
     Desktop,
-    /// `web solo` — the browser wasm bundle.
-    Solo,
-    /// `web solo desktop` — the wasm bundle plus a native webview shell.
-    SoloDesktop,
-    /// `web solo ios` — the wasm bundle plus an iOS shell.
-    SoloIos,
-    /// `web solo android` — the wasm bundle plus an Android shell.
-    SoloAndroid,
+    /// `web client` — the browser wasm bundle.
+    Client,
+    /// `web client desktop` — the wasm bundle plus a native webview shell.
+    ClientDesktop,
+    /// `web client ios` — the wasm bundle plus an iOS shell.
+    ClientIos,
+    /// `web client android` — the wasm bundle plus an Android shell.
+    ClientAndroid,
 }
 
 impl ShipEntry {
-    /// The `(runtime, host)` this entry resolves through [`Delivery::resolve`],
-    /// for the web-bearing entries. The co-located `Binary` entry is shape-led
-    /// (its runtime/host follow the pinned shape), so it is not mapped here.
-    const fn web_axes(self) -> Option<(Option<Runtime>, Host)> {
+    /// Every entry that takes no argument, in builder order: the builder table
+    /// the manifest reader and writer both iterate.
+    pub const BUILDERS: [Self; 7] = [
+        Self::Binary(BinaryTarget::Host),
+        Self::Binary(BinaryTarget::Static),
+        Self::Desktop,
+        Self::Client,
+        Self::ClientDesktop,
+        Self::ClientIos,
+        Self::ClientAndroid,
+    ];
+
+    /// The `(runtime, host)` this entry resolves through [`Delivery::resolve`].
+    ///
+    /// `None` for the co-located `Binary` entry, which is shape-led: its
+    /// runtime and host follow the pinned shape.
+    #[must_use]
+    pub const fn axes(self) -> Option<(Runtime, Host)> {
         Some(match self {
             Self::Binary(_) => return None,
-            Self::Desktop => (Some(Runtime::Served), Host::Desktop),
-            Self::Solo => (Some(Runtime::Solo), Host::Default),
-            Self::SoloDesktop => (Some(Runtime::Solo), Host::Desktop),
-            Self::SoloIos => (Some(Runtime::Solo), Host::Ios),
-            Self::SoloAndroid => (Some(Runtime::Solo), Host::Android),
+            Self::Desktop => (Runtime::Served, Host::Desktop),
+            Self::Client => (Runtime::Client, Host::Default),
+            Self::ClientDesktop => (Runtime::Client, Host::Desktop),
+            Self::ClientIos => (Runtime::Client, Host::Ios),
+            Self::ClientAndroid => (Runtime::Client, Host::Android),
         })
     }
+
+    /// The `Ipe.Package` builder that writes this entry (`clientIos`).
+    ///
+    /// A web entry's builder is derived from its runtime word and its host's
+    /// camel form, so the builder vocabulary cannot drift from the delivery
+    /// grammar.
+    #[must_use]
+    pub fn builder_word(self) -> String {
+        let Self::Binary(target) = self else {
+            return self.axes().map_or_else(String::new, |(runtime, host)| {
+                spell_builder(runtime.word(), host.camel())
+            });
+        };
+        match target {
+            BinaryTarget::Host => "binary",
+            BinaryTarget::Static => "staticBinary",
+            BinaryTarget::Cross(_) => "crossBinary",
+        }
+        .to_owned()
+    }
+
+    /// The entry whose builder replaces the retired builder `name`, if `name`
+    /// is one.
+    ///
+    /// The retired builders are derived, never listed: a retired word that the
+    /// `client` runtime replaces, followed by a client host's camel form, in
+    /// its builder spelling (`soloIos`) or its constructor spelling
+    /// (`ShipSoloIos`).
+    #[must_use]
+    pub fn retired_builder(name: &str) -> Option<Self> {
+        Self::BUILDERS.into_iter().find(|entry| {
+            entry.axes().is_some_and(|(runtime, host)| {
+                runtime == Runtime::Client
+                    && RetiredRuntimeWord::ALL.into_iter().any(|word| {
+                        word.replacement() == Runtime::Client && {
+                            let builder = spell_builder(Some(word.text()), host.camel());
+                            name == builder || name == ship_constructor(&builder)
+                        }
+                    })
+            })
+        })
+    }
+}
+
+/// A builder word from a runtime word and a host camel form: the runtime word
+/// first, or the host lower-cased when the runtime is unnamed.
+fn spell_builder(runtime: Option<&str>, host: Option<&str>) -> String {
+    let host = host.unwrap_or_default();
+    runtime.map_or_else(
+        || {
+            let mut chars = host.chars();
+            chars.next().map_or_else(String::new, |first| {
+                first.to_lowercase().chain(chars).collect()
+            })
+        },
+        |word| format!("{word}{host}"),
+    )
+}
+
+/// The `Ship` constructor a builder word stands for (`clientIos` → `ShipClientIos`).
+#[must_use]
+pub fn ship_constructor(builder: &str) -> String {
+    let mut chars = builder.chars();
+    chars.next().map_or_else(String::new, |first| {
+        format!("Ship{}{}", first.to_uppercase(), chars.as_str())
+    })
 }
 
 /// A resolved delivery paired with its target axis — one member of a set.
@@ -184,11 +265,15 @@ impl DeliverySet {
                 }
                 return Ok(PlannedDelivery { delivery, target });
             }
-            ShipEntry::Desktop => (Some(Runtime::Served), Host::Desktop),
-            ShipEntry::Solo => (Some(Runtime::Solo), Host::Default),
-            ShipEntry::SoloDesktop => (Some(Runtime::Solo), Host::Desktop),
-            ShipEntry::SoloIos => (Some(Runtime::Solo), Host::Ios),
-            ShipEntry::SoloAndroid => (Some(Runtime::Solo), Host::Android),
+            ShipEntry::Desktop
+            | ShipEntry::Client
+            | ShipEntry::ClientDesktop
+            | ShipEntry::ClientIos
+            | ShipEntry::ClientAndroid => entry
+                .axes()
+                .map_or((None, Host::Default), |(runtime, host)| {
+                    (Some(runtime), host)
+                }),
         };
 
         // A web-bearing entry: reject a non-web shape first with the shape lesson,
@@ -330,25 +415,12 @@ fn describe_entry(entry: ShipEntry) -> String {
         ShipEntry::Binary(BinaryTarget::Host) => "binary".to_owned(),
         ShipEntry::Binary(BinaryTarget::Static) => "staticBinary".to_owned(),
         ShipEntry::Binary(BinaryTarget::Cross(t)) => format!("crossBinary {}", t.as_str()),
-        // A web-bearing entry reads as its resolved delivery words (`web solo ios`).
-        _ => match entry.web_axes() {
-            Some((runtime, host)) => Delivery::resolve(Shape::Web, runtime, host)
-                .map_or_else(|_| ship_builder_word(entry).to_owned(), |d| d.to_string()),
-            None => ship_builder_word(entry).to_owned(),
+        // A web-bearing entry reads as its resolved delivery words (`web client ios`).
+        _ => match entry.axes() {
+            Some((runtime, host)) => Delivery::resolve(Shape::Web, Some(runtime), host)
+                .map_or_else(|_| entry.builder_word(), |d| d.to_string()),
+            None => entry.builder_word(),
         },
-    }
-}
-
-/// The builder spelling of a web-bearing ship entry (for a message when the
-/// delivery itself cannot be resolved).
-const fn ship_builder_word(entry: ShipEntry) -> &'static str {
-    match entry {
-        ShipEntry::Binary(_) => "binary",
-        ShipEntry::Desktop => "desktop",
-        ShipEntry::Solo => "solo",
-        ShipEntry::SoloDesktop => "soloDesktop",
-        ShipEntry::SoloIos => "soloIos",
-        ShipEntry::SoloAndroid => "soloAndroid",
     }
 }
 
@@ -365,6 +437,44 @@ mod tests {
         ShipEntry::Binary(BinaryTarget::Cross(
             StaticTriple::parse(triple).expect("supported triple"),
         ))
+    }
+
+    #[test]
+    fn builder_words_derive_from_the_delivery_words() {
+        let words: Vec<String> = ShipEntry::BUILDERS
+            .into_iter()
+            .map(ShipEntry::builder_word)
+            .collect();
+        assert_eq!(
+            words,
+            [
+                "binary",
+                "staticBinary",
+                "desktop",
+                "client",
+                "clientDesktop",
+                "clientIos",
+                "clientAndroid",
+            ]
+        );
+        assert_eq!(ship_constructor("clientIos"), "ShipClientIos");
+    }
+
+    #[test]
+    fn retired_builders_map_to_their_replacement() {
+        for (name, now) in [
+            ("solo", ShipEntry::Client),
+            ("soloDesktop", ShipEntry::ClientDesktop),
+            ("soloIos", ShipEntry::ClientIos),
+            ("ShipSoloAndroid", ShipEntry::ClientAndroid),
+            ("ShipSolo", ShipEntry::Client),
+        ] {
+            assert_eq!(ShipEntry::retired_builder(name), Some(now), "{name}");
+        }
+        for current in ShipEntry::BUILDERS.map(ShipEntry::builder_word) {
+            assert_eq!(ShipEntry::retired_builder(&current), None, "{current}");
+        }
+        assert_eq!(ShipEntry::retired_builder("liveIos"), None);
     }
 
     #[test]
@@ -389,18 +499,21 @@ mod tests {
         let entries = [
             ShipEntry::Binary(BinaryTarget::Host),
             ShipEntry::Desktop,
-            ShipEntry::Solo,
-            ShipEntry::SoloIos,
+            ShipEntry::Client,
+            ShipEntry::ClientIos,
         ];
         let set = DeliverySet::resolve(Shape::Web, &entries).expect("web set resolves");
         let slugs: Vec<String> = set.planned().iter().map(|p| p.slug()).collect();
-        assert_eq!(slugs, ["web", "web-desktop", "web-solo", "web-solo-ios"]);
+        assert_eq!(
+            slugs,
+            ["web", "web-desktop", "web-client", "web-client-ios"]
+        );
     }
 
     #[test]
     fn web_entry_on_non_web_shape_is_pedagogical() {
         for shape in [Shape::Script, Shape::Tui, Shape::Cli, Shape::Worker] {
-            let err = DeliverySet::resolve(shape, &[ShipEntry::SoloIos]).unwrap_err();
+            let err = DeliverySet::resolve(shape, &[ShipEntry::ClientIos]).unwrap_err();
             let CliError::Usage(msg) = err else {
                 panic!("expected a named rejection, got {err:?}");
             };
@@ -425,7 +538,7 @@ mod tests {
     #[test]
     fn duplicate_entry_is_rejected() {
         let err =
-            DeliverySet::resolve(Shape::Web, &[ShipEntry::Solo, ShipEntry::Solo]).unwrap_err();
+            DeliverySet::resolve(Shape::Web, &[ShipEntry::Client, ShipEntry::Client]).unwrap_err();
         let CliError::Usage(msg) = err else {
             panic!("expected a named rejection, got {err:?}");
         };
@@ -450,7 +563,7 @@ mod tests {
     fn release_each_all_built_is_all_released() {
         let set = DeliverySet::resolve(
             Shape::Web,
-            &[ShipEntry::Binary(BinaryTarget::Host), ShipEntry::Solo],
+            &[ShipEntry::Binary(BinaryTarget::Host), ShipEntry::Client],
         )
         .expect("web set resolves");
         let outcome = set.release_each(|plan| Ok(PathBuf::from(plan.slug())));
@@ -467,18 +580,19 @@ mod tests {
             Shape::Web,
             &[
                 ShipEntry::Binary(BinaryTarget::Host),
-                ShipEntry::Solo,
+                ShipEntry::Client,
                 ShipEntry::Desktop,
             ],
         )
         .expect("web set resolves");
-        // Fail exactly the second delivery (solo).
+        // Fail exactly the second delivery (client).
         let outcome = set.release_each(|plan| {
-            if matches!(plan.delivery().runtime(), Some(Runtime::Solo)) && plan.slug() == "web-solo"
+            if matches!(plan.delivery().runtime(), Some(Runtime::Client))
+                && plan.slug() == "web-client"
             {
                 Err(CliError::Usage(crate::text::msg::command_refusal(
                     &"release",
-                    &"solo bundle failed",
+                    &"client bundle failed",
                 )))
             } else {
                 Ok(PathBuf::from(plan.slug()))
@@ -489,7 +603,7 @@ mod tests {
             ReleaseOutcome::Incomplete { built, failed } => {
                 assert_eq!(built.len(), 2);
                 assert_eq!(failed.len(), 1);
-                assert_eq!(failed[0].0.to_string(), "web solo");
+                assert_eq!(failed[0].0.to_string(), "web client");
             }
             other => panic!("expected Incomplete, got {other:?}"),
         }

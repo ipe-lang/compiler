@@ -610,7 +610,7 @@ impl<'a> RustBackend<'a> {
     }
 
     /// Select the compilation target the emitted project is built for
-    /// (`Native` by default; `WasmClient` under `ipe dev build --target wasm`).
+    /// (`Native` by default; `WasmClient` for the `web client` delivery).
     #[must_use]
     pub const fn with_target(mut self, target: ipe_ir::Target) -> Self {
         self.settings.target = target;

@@ -1354,7 +1354,7 @@ fn canon_open_import_per_shape_sweep_worker_compiles() {
 /// Staleness guard: the per-shape sweeps cover Script and Tui/Cli/Worker —
 /// every `Shape` with a sole
 /// `Placement`. `Shape::Web` is deliberately excluded (it admits both
-/// `Served` and `Solo` runtimes, so `sole_for` returns `None`, see
+/// `Served` and `Client` runtimes, so `sole_for` returns `None`, see
 /// `shape_runtime`'s own `sole_placement_is_none_for_web_some_otherwise`
 /// unit test). If `Web` ever gains a sole placement this assertion goes red,
 /// so the exclusion cannot go silently stale.

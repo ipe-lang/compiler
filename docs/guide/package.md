@@ -85,11 +85,11 @@ The vocabulary: `Network`, `Filesystem`, `Database`, `Env`, `Subprocess`,
 
 ## Web delivery: `wasm` and `delivery`
 
-`wasm` turns on a WebAssembly client — required for a `solo` web app (browser
+`wasm` turns on a WebAssembly client — required for a `client` web app (browser
 or mobile). Off by default:
 
 ```ipe
-wasm = On { mode = Solo }          -- a self-contained SPA
+wasm = On { mode = Render }          -- a self-contained SPA
 -- On { mode = Hydrate }            -- hydrate a server-rendered page
 -- optional: entry, mount ("#app"), publicEnv, optLevel
 ```
@@ -99,7 +99,7 @@ to its default:
 
 ```ipe
 delivery =
-    { ships = [ binary, desktop, soloAndroid ]   -- default: [ binary ]
+    { ships = [ binary, desktop, clientAndroid ]   -- default: [ binary ]
     , desktop = { title = "My App", width = 1024, height = 768 }
     , mobile = { bundleId = "com.example.myapp", orientation = Portrait }  -- Portrait | Landscape | Any
     , browser = { basePath = "/" }
@@ -107,7 +107,7 @@ delivery =
     }
 ```
 
-`basePath` is the URL path the client bundle is served at; the `web solo`
+`basePath` is the URL path the client bundle is served at; the `web client`
 host, static hosts, and mobile shells all serve the bundle under it. It is `"/"`
 (or `""`) for the root, or one or more `/segment` parts made only of
 `A-Z a-z 0-9 - . _ ~`, with no trailing `/`, no empty, `.`, or `..` segment, and
@@ -176,7 +176,7 @@ manifest refuses `push` when `capabilities.accepts` lists no `JsPort Push`, and
 an iOS or Android pack refuses an app that accepts `JsPort Push` without it.
 
 `ships` constructors: `binary`, `staticBinary`, `crossBinary "<triple>"`,
-`desktop`, `solo`, `soloDesktop`, `soloIos`, `soloAndroid`. See [Delivering an
+`desktop`, `client`, `clientDesktop`, `clientIos`, `clientAndroid`. See [Delivering an
 app](delivery.md) for the build/run/simulate grammar these feed.
 
 ## Build
@@ -209,10 +209,10 @@ package =
         { declares = [ Network, Clock ]
         , accepts = [ JsPort Geolocation ]
         }
-    , wasm = On { mode = Solo }
+    , wasm = On { mode = Render }
     , build = { database = Postgres, static = False, target = HostTarget, allocator = AutoAlloc, cFree = False }
     , delivery =
-        { ships = [ binary, soloAndroid, soloIos ]
+        { ships = [ binary, clientAndroid, clientIos ]
         , desktop = { title = "My App", width = 1200, height = 800 }
         , mobile = { bundleId = "com.example.myapp", orientation = Any }
         , browser = { basePath = "/" }

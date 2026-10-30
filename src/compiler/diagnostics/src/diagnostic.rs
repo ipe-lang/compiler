@@ -813,7 +813,7 @@ pub enum NameError {
     /// library single-source-of-truth table does not admit (spec § 5). A
     /// program's placement is fixed by two orthogonal axes — its shape (what
     /// `view` renders, pinned by `main`) and, for the Web shape, its runtime
-    /// (co-located `served` vs sandboxed `solo`). One table classifies every stdlib
+    /// (co-located `served` vs sandboxed `client`). One table classifies every stdlib
     /// module by the placements it is admissible in; an import outside that set
     /// is refused here at resolve time, before any downstream cargo build (THE
     /// SEAL) can break and before a native effect could reach a sandboxed
@@ -955,14 +955,14 @@ impl RustNameFoldKind {
 /// Boxed on the `NameError` so `Diagnostic` stays under clippy's
 /// `result_large_err` threshold. `module` is the offending import path;
 /// `placement` is the human placement phrase (`script`, `terminal`, `server`,
-/// `web served`, `web solo`); `reason` selects the kind-teacher sentence and its
+/// `web served`, `web client`); `reason` selects the kind-teacher sentence and its
 /// suggested fix (spec § 6). The prose lives with the renderer so the message
 /// set is itself a single source of truth.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct ModulePlacementRejection {
     /// The offending stdlib import path, e.g. `Ipe.Db.Store`.
     pub module: Box<str>,
-    /// The program's placement phrase, e.g. `web solo`.
+    /// The program's placement phrase, e.g. `web client`.
     pub placement: Box<str>,
     /// Why this module family is inadmissible in that placement.
     pub reason: ModulePlacementReason,
@@ -975,7 +975,7 @@ pub struct ModulePlacementRejection {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum ModulePlacementReason {
     /// A native effect (`Ipe.Db` / `Ipe.File` / `Ipe.Http.Server` / a secret) in
-    /// a sandboxed `solo` runtime — the DB/secret-to-browser leak. Move it behind
+    /// a sandboxed `client` runtime — the DB/secret-to-browser leak. Move it behind
     /// an HTTP boundary, or deliver as `web` (served).
     NativeEffectInSandbox,
     /// A `Ipe.Browser.*` host capability in a placement with no JS host

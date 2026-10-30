@@ -118,7 +118,7 @@ fn build_copies_the_artifact_into_project_out_bin() -> Result<(), BoxError> {
     let _ = fs::remove_dir_all(&shared);
 
     let project = project_of(SRC_A)?;
-    let built = build_into_shared_target("solo", &project, &shared)?;
+    let built = build_into_shared_target("single", &project, &shared)?;
     let copied = built.delivered;
     assert!(
         copied.is_file(),

@@ -5,9 +5,9 @@ import Ipe.Package exposing (..)
 
 package : Package
 package =
-    { name = "wasm-solo-clipboard"
+    { name = "wasm-client-clipboard"
     , version = "0.1.0"
-    , wasm = On { mode = Solo }
+    , wasm = On { mode = Render }
     , capabilities =
         { declares = []
         -- `Ipe.Browser.Clipboard` discloses its own port axis and the `:raw`

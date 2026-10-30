@@ -14,6 +14,7 @@ use std::fmt;
 
 use ipe_backend_rust::static_build::{CProfile, StaticAllocator, StaticPlan, StaticTriple};
 
+use crate::delivery::TargetTriple;
 use crate::remote_ingest::{LocalCeiling, LocalSource, TOOL_QUERY_LIMITS, run_local};
 use crate::text;
 
@@ -90,17 +91,40 @@ impl StaticRequestLayer {
     }
 }
 
-/// Read the env layer (`IPE_STATIC` / `IPE_TARGET` / `IPE_ALLOC`).
+/// The compile target `IPE_TARGET` names, parsed once at the boundary.
+///
+/// It accepts the `--target` words (`wasm`, `wasi`, a supported musl triple)
+/// and the rustc spellings of the two wasm triples; `None` when unset.
 ///
 /// # Errors
-/// [`Refusal::InvalidBool`] / [`Refusal::UnknownAllocator`] — a set-but-
-/// malformed variable is refused, never silently ignored.
+/// [`Refusal::UnknownStaticTarget`] for a set value outside that vocabulary.
+pub fn env_target() -> Result<Option<TargetTriple>, Refusal> {
+    ipe_env::var("IPE_TARGET").ok().map_or(Ok(None), |raw| {
+        TargetTriple::from_flag(&raw)
+            .or_else(|| TargetTriple::parse(&raw))
+            .map(Some)
+            .ok_or(Refusal::UnknownStaticTarget { got: raw })
+    })
+}
+
+/// Read the env layer (`IPE_STATIC` / `IPE_TARGET` / `IPE_ALLOC`).
+///
+/// Only a native `IPE_TARGET` triple enters the static layer; a wasm target
+/// is a compile-target axis, derived with the delivery, never a static triple.
+///
+/// # Errors
+/// [`Refusal::InvalidBool`] / [`Refusal::UnknownAllocator`] /
+/// [`Refusal::UnknownStaticTarget`] — a set-but-malformed variable is
+/// refused, never silently ignored.
 pub fn env_layer() -> Result<StaticRequestLayer, Refusal> {
     let static_build = match ipe_env::var("IPE_STATIC") {
         Ok(v) => Some(parse_bool("IPE_STATIC", &v)?),
         Err(_) => None,
     };
-    let target = ipe_env::var("IPE_TARGET").ok();
+    let target = match env_target()? {
+        Some(TargetTriple::Native(triple)) => Some(triple.as_str().to_owned()),
+        Some(TargetTriple::BrowserWasm | TargetTriple::Wasm32Wasip1) | None => None,
+    };
     let allocator = match ipe_env::var("IPE_ALLOC") {
         Ok(v) => Some(AllocatorChoice::parse(&v)?),
         Err(_) => None,

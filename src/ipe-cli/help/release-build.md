@@ -1,4 +1,4 @@
-Build the production artifact — optimised, Debug.* gated. Native-bearing apps get a jailed bundle; pure-native apps get a plain optimised binary; `web desktop|ios|android` produces a production app bundle; `--target wasm` produces a production browser bundle.
+Build the production artifact, optimised and with Debug.* gated. Native-bearing apps get a jailed bundle; pure-native apps get a plain optimised binary; `web desktop` and `web client desktop|ios|android` produce a production app bundle; `web client` produces a production browser bundle.
 
 ```
 ipe release build [<dir>] [<shape>] [<runtime>] [<host>]
@@ -11,7 +11,7 @@ A project directory (default: the current directory). shape/runtime/host are the
 ## Options
 
 - `[--out <dir>]` — put the artifact under <dir>/release/ (default: out/ in the project)
-- @--target
+- `[--target <triple>]` — a musl-static native <triple> (default: x86_64-unknown-linux-musl). The browser bundle is `web client`, never a target; a `web client` or app-bundle delivery takes no target.
 - @--static
 - @--emit-permissions
 - `[--runtime <dir>]` — vendor the Ipê runtime source from <dir>

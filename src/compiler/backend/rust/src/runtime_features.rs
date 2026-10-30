@@ -398,7 +398,7 @@ pub fn runtime_features(ctx: &EmitCtx) -> RuntimeFeatureSet {
     if ctx.target == ipe_ir::Target::WasmClient {
         let mut set = BTreeSet::new();
         set.insert(RuntimeFeature::WasmClient);
-        // `ipe dev build/run --debugger --target wasm`: the recorder rides on top of
+        // `ipe dev build/run web client --debugger`: the recorder rides on top of
         // the closed wasm floor. `debugger` implies `json`/`serde`, already in
         // the `wasm-client` floor, and its `async` implication is inert on wasm
         // (tokio is native-only) — the wasm `tea` types come from `wasm-client`.

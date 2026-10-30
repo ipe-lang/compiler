@@ -6,7 +6,7 @@ A headless, view-less TEA worker over the `Ipe.Tea.Worker.tea` surface.
 `Worker.tea` is the view-less TEA loop (Elm `Platform.worker` shape): it has an
 `init`, an `update`, and `subscriptions`, but NO `view` — its output is `Cmd msg`
 (effects) and its input is `Sub msg`. A worker is co-located and
-capability-gated; it can never reach the sandboxed Spa/wasm bundle.
+capability-gated; it can never reach the sandboxed `web client` wasm bundle.
 
 This one ticks three times. Each tick logs a line via an existing `Io.println`
 `Task` (turned into a `Cmd` with `Task.attempt`), and counts the tick. After the

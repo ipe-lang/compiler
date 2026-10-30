@@ -7,7 +7,7 @@ package : Package
 package =
     { name = "wasm-browser-session-streams"
     , version = "0.1.0"
-    , wasm = On { mode = Solo }
+    , wasm = On { mode = Render }
     , capabilities =
         { declares =
             [ JsPort Visibility

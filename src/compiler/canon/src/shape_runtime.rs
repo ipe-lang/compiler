@@ -5,7 +5,7 @@
 //! `view` renders (DOM / cells / lines / http / none), pinned by the head of
 //! `main` — and, for the Web shape, its **runtime** — whether the loop is
 //! co-located with native effects (`served`, the served/desktop default) or
-//! self-contained in a browser (`solo`). Every other shape has one runtime, so
+//! self-contained in a browser (`client`). Every other shape has one runtime, so
 //! its runtime axis is fixed.
 //!
 //! One table, [`allowed_in`], classifies the placement-constrained stdlib module
@@ -85,19 +85,89 @@ impl Shape {
     }
 }
 
-/// The effect-locality axis of a placement (spec § 0, § 2). Only the Web shape
-/// carries a genuine choice; every other shape has exactly one runtime, so its
-/// value here is fixed.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Runtime {
-    /// The loop sits *at* native effects: served/desktop `served` for Web, and
-    /// the single runtime of every non-Web shape (`terminal`, `binary`). Native
-    /// effects (`Ipe.Db`, `Ipe.File`, a `Secret`) are admissible.
-    Served,
-    /// The self-contained client loop — wasm in a browser/webview (`web solo`).
-    /// Effects reach the host only through Web-platform capabilities plus HTTP to
-    /// a backend; a native effect has no denotation here and is denied.
-    Solo,
+/// Declares [`Runtime`], its [`Runtime::ALL`], its user-facing words and its
+/// diagnostic phrases from one row list, so no runtime lacks a word or a slot.
+///
+/// A row's word is `None` for the unnamed default (served is never written) or
+/// a string literal; the Web placement phrase is derived from the same literal.
+macro_rules! closed_runtimes {
+    ($($doc:literal, $variant:ident, $word:tt;)+) => {
+        /// The effect-locality axis of a placement (spec § 0, § 2).
+        ///
+        /// Only the Web shape carries a genuine choice; every other shape has
+        /// exactly one runtime, so its value here is fixed. The set is closed:
+        /// [`Runtime::ALL`] lists each runtime once, in declaration order.
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+        pub enum Runtime {
+            $(
+                #[doc = $doc]
+                $variant,
+            )+
+        }
+
+        impl Runtime {
+            /// Every runtime, the one list every reader and writer derives from.
+            pub const ALL: [Self; Self::COUNT] = [$(Self::$variant),+];
+
+            const COUNT: usize = [$(Self::$variant),+].len();
+
+            /// The user-facing delivery word, or `None` for the unnamed default.
+            #[must_use]
+            pub const fn word(self) -> Option<&'static str> {
+                match self {
+                    $(Self::$variant => runtime_word!($word),)+
+                }
+            }
+
+            /// The Web placement phrase a diagnostic prints for this runtime.
+            const fn web_phrase(self) -> &'static str {
+                match self {
+                    $(Self::$variant => runtime_web_phrase!($word),)+
+                }
+            }
+        }
+    };
+}
+
+/// The word of one `closed_runtimes` row.
+macro_rules! runtime_word {
+    (None) => {
+        None
+    };
+    ($word:literal) => {
+        Some($word)
+    };
+}
+
+/// The Web placement phrase of one `closed_runtimes` row.
+macro_rules! runtime_web_phrase {
+    (None) => {
+        "web served"
+    };
+    ($word:literal) => {
+        concat!("web ", $word)
+    };
+}
+
+closed_runtimes! {
+    "The loop sits *at* native effects: the served default for Web (never \
+     written), and the single runtime of every non-Web shape (`terminal`, \
+     `binary`). Native effects (`Ipe.Db`, `Ipe.File`, a `Secret`) are admissible.",
+    Served, None;
+    "The self-contained client loop — wasm in a browser/webview (`web client`). \
+     Effects reach the host only through Web-platform capabilities plus HTTP to \
+     a backend; a native effect has no denotation here and is denied.",
+    Client, "client";
+}
+
+impl Runtime {
+    /// The runtime a user-facing delivery word names; only written words map.
+    #[must_use]
+    pub fn from_word(word: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|runtime| runtime.word() == Some(word))
+    }
 }
 
 /// A fully-placed program: a shape and its runtime. The runtime of every non-Web
@@ -126,15 +196,17 @@ impl Placement {
     }
 
     /// The canonical placement phrase for a diagnostic — `script`, `terminal`,
-    /// `worker`, `web served`, or `web solo`. One vocabulary with the CLI grammar.
+    /// `worker`, `web served`, or `web client`.
+    ///
+    /// The Web phrases derive from the runtime's word, one vocabulary with the
+    /// CLI grammar.
     #[must_use]
     pub const fn phrase(self) -> &'static str {
-        match (self.shape, self.runtime) {
-            (Shape::Script, _) => "script",
-            (Shape::Tui | Shape::Cli, _) => "terminal",
-            (Shape::Worker, _) => "worker",
-            (Shape::Web, Runtime::Served) => "web served",
-            (Shape::Web, Runtime::Solo) => "web solo",
+        match self.shape {
+            Shape::Script => "script",
+            Shape::Tui | Shape::Cli => "terminal",
+            Shape::Worker => "worker",
+            Shape::Web => self.runtime.web_phrase(),
         }
     }
 }
@@ -156,7 +228,7 @@ pub enum ModuleClass {
     Pure,
     /// `Ipe.Browser.*` — Web-platform host capabilities (Geolocation, Camera,
     /// Microphone, Clipboard, …). Needs a JS host: admissible in the Web shape
-    /// (served or solo, on any host). Rejected in the live-rendering terminal
+    /// (served or client, on any host). Rejected in the live-rendering terminal
     /// shapes, which have no browser and never will. The `script` shape is
     /// exempt: it renders nothing and is the build-time harness a decoder probe
     /// or an export check imports these modules from, so a browser module there
@@ -164,11 +236,11 @@ pub enum ModuleClass {
     BrowserHost,
     /// `Ipe.Db.*`, `Ipe.File.*`, the server `Ipe.Http.Server`, and `Auth` secret
     /// surfaces — direct native effects. Admissible only in a co-located runtime;
-    /// **rejected in `solo`** (the DB/secret-to-browser leak the gate exists to
+    /// **rejected in `client`** (the DB/secret-to-browser leak the gate exists to
     /// prevent).
     NativeEffect,
     /// The portable client `Ipe.Http` fetch surface — admissible in any placement
-    /// with a browser (Web live/spa) and in every co-located native placement.
+    /// with a browser (Web served or client) and in every co-located native placement.
     ClientHttp,
 }
 
@@ -191,7 +263,7 @@ pub enum Admissibility {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DenyReason {
     /// A native effect (`Ipe.Db` / `Ipe.File` / `Ipe.Http.Server` / a secret) was
-    /// reached in a sandboxed `solo` runtime. Move it behind an HTTP boundary, or
+    /// reached in a sandboxed `client` runtime. Move it behind an HTTP boundary, or
     /// deliver as `web served` where the loop runs server-side.
     NativeEffectInSandbox,
     /// A `Ipe.Browser.*` host capability was reached in a placement with no JS
@@ -409,7 +481,7 @@ pub const fn allowed_in(class: ModuleClass, placement: Placement) -> Admissibili
         ModuleClass::Pure => Allow,
 
         // Browser host capabilities: the Web shape (served on server/desktop or
-        // solo browser/ios/android/desktop) has a JS host. The live-rendering
+        // client browser/ios/android/desktop) has a JS host. The live-rendering
         // terminal shapes never do, so they are rejected. `script` renders nothing and is
         // the build-time harness (decoder probes, export checks) these modules
         // are imported from, so it is exempt — a no-render tool use, not a
@@ -424,11 +496,11 @@ pub const fn allowed_in(class: ModuleClass, placement: Placement) -> Admissibili
 
         // Native effects: co-located only. The security invariant — a native
         // effect (DB handle, secret) must never be emitted into a sandboxed
-        // browser bundle. Denied in `solo`; admissible in every co-located
+        // browser bundle. Denied in `client`; admissible in every co-located
         // runtime (served, terminal, script — a server being a `script`).
         ModuleClass::NativeEffect => match placement.runtime {
             Runtime::Served => Allow,
-            Runtime::Solo => Deny(DenyReason::NativeEffectInSandbox),
+            Runtime::Client => Deny(DenyReason::NativeEffectInSandbox),
         },
 
         // Portable client HTTP fetch: every browser placement and every
@@ -469,7 +541,7 @@ mod tests {
             co(Shape::Cli),
             co(Shape::Worker),
             web(Runtime::Served),
-            web(Runtime::Solo),
+            web(Runtime::Client),
         ] {
             assert_eq!(allowed_in(ModuleClass::Pure, p), Admissibility::Allow);
         }
@@ -497,7 +569,7 @@ mod tests {
     }
 
     #[test]
-    fn native_effect_denied_in_solo_allowed_co_located() {
+    fn native_effect_denied_in_client_allowed_co_located() {
         for path in [
             "Ipe.Db",
             "Ipe.Db.Store",
@@ -507,9 +579,9 @@ mod tests {
         ] {
             assert_eq!(classify(path), ModuleClass::NativeEffect, "{path}");
         }
-        // Denied in the sandboxed solo runtime — the DB/secret-to-browser leak.
+        // Denied in the sandboxed client runtime — the DB/secret-to-browser leak.
         assert_eq!(
-            allowed_in(ModuleClass::NativeEffect, web(Runtime::Solo)),
+            allowed_in(ModuleClass::NativeEffect, web(Runtime::Client)),
             Admissibility::Deny(DenyReason::NativeEffectInSandbox)
         );
         // Admissible in every co-located placement — including a worker, whose
@@ -593,7 +665,7 @@ mod tests {
         assert_eq!(classify("Ipe.Http.Server"), ModuleClass::NativeEffect);
         // Client fetch is admissible even in the sandbox.
         assert_eq!(
-            allowed_in(ModuleClass::ClientHttp, web(Runtime::Solo)),
+            allowed_in(ModuleClass::ClientHttp, web(Runtime::Client)),
             Admissibility::Allow
         );
     }
@@ -606,7 +678,7 @@ mod tests {
         );
         // Any Web placement has a browser; `script` is the exempt no-render
         // build-time harness.
-        for r in [Runtime::Served, Runtime::Solo] {
+        for r in [Runtime::Served, Runtime::Client] {
             assert_eq!(
                 allowed_in(ModuleClass::BrowserHost, web(r)),
                 Admissibility::Allow
@@ -640,5 +712,24 @@ mod tests {
                 })
             );
         }
+    }
+
+    /// The Web client phrase is spelled from the runtime's word, so the
+    /// diagnostic vocabulary and the CLI grammar cannot drift.
+    #[test]
+    fn placement_phrase_spells_runtime_word() {
+        assert_eq!(
+            Runtime::Client.word().map(|word| format!("web {word}")),
+            Some(web(Runtime::Client).phrase().to_owned())
+        );
+        assert_eq!(web(Runtime::Served).phrase(), "web served");
+        assert_eq!(Runtime::Served.word(), None);
+        for runtime in Runtime::ALL {
+            if let Some(word) = runtime.word() {
+                assert_eq!(Runtime::from_word(word), Some(runtime));
+            }
+        }
+        assert_eq!(Runtime::from_word("solo"), None);
+        assert_eq!(Runtime::from_word("served"), None);
     }
 }

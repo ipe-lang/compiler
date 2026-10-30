@@ -23,7 +23,7 @@ Three knots.
   `exitCode` — only a spawn failure fails the Task. Reach for `runWith` when a
   non-zero exit is expected and you want to inspect it.
 - **It is a server-only, capability-tagged effect.** Running a child process is
-  default-denied under `--target wasm` (a browser bundle has no process surface),
+  default-denied in a `web client` build (a browser bundle has no process surface),
   and a program that spawns one is tagged with the `subprocess` capability so a
   sandbox can isolate it. Both entry points return a `Task`, so a spawn is
   sequenced in the Task discipline like any other effect.

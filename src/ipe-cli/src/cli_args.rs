@@ -14,7 +14,7 @@
 //! carry are folded into these parses.
 
 use crate::build_plan::{AllocatorChoice, StaticRequestLayer};
-use crate::delivery::{DeliveryError, DeliveryTokens, Shape, TargetTriple};
+use crate::delivery::{DeliveryError, DeliveryTokens, Shape, TargetSource, TargetTriple};
 use crate::verb::Verb;
 use crate::{CliError, text};
 pub use ipe_backend_rust::static_build::StaticTriple;
@@ -41,14 +41,14 @@ pub struct DeliveryPositionals {
 ///
 /// A leading token that is a shape word (`web`/`tui`/`cli`/`worker`/`script`) is
 /// the cross-check shape; any other leading token belongs to the tail (a
-/// runtime/host/target), so a bare `ipe dev build solo` and a bare `ipe dev build web`
+/// runtime/host/target), so a bare `ipe dev build client` and a bare `ipe dev build web`
 /// both parse. `server` is NOT a shape word — a server is a `script` — so a
 /// leading `server` reads as an entry path, never a shape. The tail is parsed
 /// by [`DeliveryTokens::parse`].
 ///
 /// # Errors
 /// [`DeliveryError`] surfaced as a [`CliError::Usage`] when a tail token is
-/// neither `solo`, a host, nor a plausible target (e.g. the `served` word).
+/// neither `client`, a host, nor a plausible target (e.g. the `served` word).
 fn take_delivery_positionals(
     positionals: &[String],
     command: &str,
@@ -67,7 +67,7 @@ fn take_delivery_positionals(
 /// Render a [`DeliveryError`] as a `ipe <command>:` usage error — the delivery
 /// refusals are pedagogical lessons, carried verbatim behind the command prefix.
 #[must_use]
-fn delivery_usage(command: &str, err: &DeliveryError) -> CliError {
+pub fn delivery_usage(command: &str, err: &DeliveryError) -> CliError {
     CliError::Usage(text::msg::command_refusal(&command, err))
 }
 
@@ -374,8 +374,9 @@ fn take_leading_entry(
     }
 }
 
-/// `true` when `token` is a delivery word — a shape (`web`/`tui`/…), the `solo`
-/// runtime, the never-written `served`, or a host (`desktop`/`ios`/`android`).
+/// `true` when `token` is a delivery word — a shape (`web`/`tui`/…), a word
+/// the runtime reader judges (`client`, the never-written `served`, a retired
+/// runtime word), or a host (`desktop`/`ios`/`android`).
 /// Used to tell a leading project-directory positional from a leading delivery
 /// word so `ipe dev build web` (a delivery) and `ipe dev build app` (a directory)
 /// both parse. A target triple is deliberately excluded: a leading bare triple with
@@ -383,8 +384,7 @@ fn take_leading_entry(
 /// and the delivery parse rejects it in tail position if it slips through.
 fn is_delivery_word(token: &str) -> bool {
     Shape::from_word(token).is_some()
-        || token == "solo"
-        || token == "served"
+        || !matches!(crate::delivery::parse_runtime_word(token), Ok(None))
         || crate::delivery::Host::from_word(token).is_some()
 }
 
@@ -545,7 +545,7 @@ impl StaticFlags {
 /// cannot also apply. The two WASM flavours are kept cleanly separate at the
 /// parse boundary
 /// (parse, don't validate): `Client` is the sandboxed browser bundle
-/// (`wasm32-unknown-unknown`, `web solo`); `Wasi` is the co-located portable
+/// (`wasm32-unknown-unknown`, `web client`); `Wasi` is the co-located portable
 /// WASI target (`wasm32-wasip1`) for a `Direct`/`Script` program. `None` is the
 /// ordinary native build.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -595,10 +595,10 @@ pub enum BuildMode {
     Emit {
         /// `--out <dir>` — where to write the emitted project.
         out: Option<String>,
-        /// `--target wasm`/`--target wasi` selects a WASM target (a distinct
-        /// compilation axis), captured here so `--static` / `--allocator`
-        /// cannot also apply.
-        wasm: WasmKind,
+        /// `--target` as parsed: a WASM target (a distinct compilation axis,
+        /// so `--static` / `--allocator` cannot also apply) or a native
+        /// triple. The compile target is derived from it and the delivery.
+        target: Option<TargetTriple>,
         /// The native static-request layer (`--static` / `--target <triple>` /
         /// `--allocator`). Empty under a WASM target.
         static_layer: StaticRequestLayer,
@@ -723,13 +723,13 @@ pub fn parse_build(rest: &[String]) -> Result<BuildArgs, CliError> {
         // Clear the pseudo-triple so it never enters static resolution.
         BuildMode::Emit {
             out,
-            wasm,
+            target: static_flags.target,
             static_layer: StaticRequestLayer::default(),
         }
     } else {
         BuildMode::Emit {
             out,
-            wasm: WasmKind::None,
+            target: static_flags.target,
             static_layer: static_flags.layer(),
         }
     };
@@ -795,11 +795,11 @@ pub struct RunArgs {
     pub runtime: Option<String>,
     /// The native static-request layer.
     pub static_layer: StaticRequestLayer,
-    /// The WASM compilation target selected on the CLI. `Client` (`--target
-    /// wasm`, the browser bundle) has no executable form under `ipe dev run` and is
-    /// refused at parse; `Wasi` (`--target wasi`) routes `ipe dev run` to the
-    /// embedded-wasmtime execution path; `None` is the ordinary native run.
-    pub wasm: WasmKind,
+    /// `--target` as parsed. The browser bundle (`--target wasm`) has no
+    /// executable form under `ipe dev run` and is refused at parse; `wasi`
+    /// routes `ipe dev run` to the embedded-wasmtime execution path; a native
+    /// triple or none is the ordinary native run.
+    pub target: Option<TargetTriple>,
     /// `--debugger` — compile the development-only time-travelling debugger into
     /// the emitted runtime loop. Absent from `ipe release` so the debugger can
     /// never ship in a production artifact.
@@ -916,7 +916,8 @@ pub fn parse_run(rest: &[String]) -> Result<RunArgs, CliError> {
     // triple; clear the static-request layer so it never enters static
     // resolution (which would refuse `--target wasi` as a native triple missing
     // `--static`) — mirroring `parse_build`'s wasm arm. The wasm flavour is
-    // carried on `wasm` and routed by the compile target downstream.
+    // carried on `target` and routed by the compile target downstream.
+    let target = static_flags.target;
     let static_layer = if wasm.is_wasm() {
         StaticRequestLayer::default()
     } else {
@@ -929,7 +930,7 @@ pub fn parse_run(rest: &[String]) -> Result<RunArgs, CliError> {
         out,
         runtime,
         static_layer,
-        wasm,
+        target,
         debugger,
         session,
         bin_args,
@@ -995,38 +996,30 @@ pub fn parse_eject(rest: &[String]) -> Result<EjectArgs, CliError> {
     })
 }
 
-/// Where `ipe release` sends its output artifact: a browser bundle or a
-/// statically-linked native binary for a specific rustc target triple.
+/// The native triple a release `--target` names, or `None` for the default.
 ///
-/// Constructed exclusively through [`ReleaseTarget::from_target`] over the
-/// shared [`TargetTriple`] set, so the `"wasm"` sentinel cannot leak past the
-/// CLI boundary.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ReleaseTarget {
-    /// `--target wasm`: emit a browser/Wasm bundle.
-    Wasm,
-    /// `--target <triple>` or the default (omitted): a musl-static native binary
-    /// for the given [`ipe_backend_rust::static_build::StaticTriple`].
-    Native(ipe_backend_rust::static_build::StaticTriple),
-}
-
-impl ReleaseTarget {
-    /// The release destination for a parsed `--target` (or its absence).
-    ///
-    /// `None` → the default native triple; [`TargetTriple::BrowserWasm`] →
-    /// [`Self::Wasm`]; [`TargetTriple::Native`] → [`Self::Native`].
-    ///
-    /// # Errors
-    ///
-    /// [`CliError::Usage`] for [`TargetTriple::Wasm32Wasip1`]: a release
-    /// produces a browser bundle or a native binary, never a WASI module.
-    pub fn from_target(target: Option<TargetTriple>) -> Result<Self, CliError> {
-        match target {
-            None => Ok(Self::Native(StaticTriple::default())),
-            Some(TargetTriple::BrowserWasm) => Ok(Self::Wasm),
-            Some(TargetTriple::Native(triple)) => Ok(Self::Native(triple)),
-            Some(TargetTriple::Wasm32Wasip1) => Err(CliError::Usage(text::msg::release_no_wasi())),
-        }
+/// A release derives its browser bundle from the `web client` delivery, so the
+/// browser target is refused here rather than read as a destination, and a
+/// release never produces a WASI module.
+///
+/// # Errors
+///
+/// [`CliError::Usage`] carrying [`DeliveryError::ReleaseWasmTarget`] for the
+/// browser target, or the `release-no-wasi` refusal for WASI.
+pub fn release_target_from_flag(
+    target: Option<TargetTriple>,
+    command: &str,
+) -> Result<Option<StaticTriple>, CliError> {
+    match target {
+        None => Ok(None),
+        Some(TargetTriple::Native(triple)) => Ok(Some(triple)),
+        Some(TargetTriple::BrowserWasm) => Err(delivery_usage(
+            command,
+            &DeliveryError::ReleaseWasmTarget {
+                source: TargetSource::Flag,
+            },
+        )),
+        Some(TargetTriple::Wasm32Wasip1) => Err(CliError::Usage(text::msg::release_no_wasi())),
     }
 }
 
@@ -1057,9 +1050,10 @@ pub struct ReleaseArgs {
     pub out: Option<String>,
     /// `--runtime <dir>` — vendor the Ipê runtime from here.
     pub runtime: Option<String>,
-    /// `--target <value>` — the resolved build destination: a browser bundle
-    /// (`wasm`) or a musl-static native triple.
-    pub target: ReleaseTarget,
+    /// `--target <triple>` — a musl-static native triple, or `None` for the
+    /// default. The type holds no wasm target: the browser bundle is derived
+    /// from the `web client` delivery.
+    pub target: Option<StaticTriple>,
     /// How to package a native-bearing artifact (embed mode by default; unused
     /// for pure-native and wasm targets).
     pub mode: ReleaseMode,
@@ -1074,10 +1068,10 @@ pub struct ReleaseArgs {
 
 /// Parse `ipe release build`'s argument tail.
 ///
-/// `--out` is optional. `--target` accepts either a musl-static triple or the
-/// literal `wasm`. `--static` is accepted on a native target, which a release
-/// always links statically, and refused with `--target wasm`. Each value flag
-/// is rejected on a second occurrence.
+/// `--out` is optional. `--target` accepts a musl-static triple; the browser
+/// bundle is the `web client` delivery, never a target. `--static` is accepted,
+/// as a release always links statically. Each value flag is rejected on a
+/// second occurrence.
 ///
 /// # Errors
 ///
@@ -1095,7 +1089,6 @@ pub fn parse_release_build(rest: &[String]) -> Result<ReleaseArgs, CliError> {
     let mut emit_permissions: Option<String> = None;
     let mut saw_embed = false;
     let mut saw_bundle = false;
-    let mut saw_static = false;
 
     while let Some(flag) = it.next() {
         if consume_format_flag(&mut format, flag, LABEL)? {
@@ -1126,7 +1119,8 @@ pub fn parse_release_build(rest: &[String]) -> Result<ReleaseArgs, CliError> {
             )?,
             "--embed" => saw_embed = true,
             "--bundle" => saw_bundle = true,
-            "--static" => saw_static = true,
+            // A release always links statically; the flag restates it.
+            "--static" => {}
             other => {
                 return Err(usage_unknown_flag(LABEL, other));
             }
@@ -1143,13 +1137,7 @@ pub fn parse_release_build(rest: &[String]) -> Result<ReleaseArgs, CliError> {
         ReleaseMode::Embed
     };
 
-    if saw_static && target == Some(TargetTriple::BrowserWasm) {
-        return Err(CliError::Usage(text::msg::static_flags_with_wasm(
-            &WasmKind::Client.word(),
-        )));
-    }
-
-    let target = ReleaseTarget::from_target(target)?;
+    let target = release_target_from_flag(target, LABEL)?;
 
     Ok(ReleaseArgs {
         entry,
@@ -1167,16 +1155,13 @@ pub fn parse_release_build(rest: &[String]) -> Result<ReleaseArgs, CliError> {
 /// can execute: a browser bundle or a distributable host bundle.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NoRunTarget {
-    /// `--target wasm` (or a manifest/`IPE_TARGET` resolution to it): a
-    /// browser bundle.
-    Wasm,
-    /// `web solo`: the self-contained browser client.
-    Solo,
+    /// `web client`: the self-contained browser client.
+    Client,
     /// `web desktop`: a per-OS desktop bundle.
     Desktop,
-    /// `web solo ios`: an iOS project.
+    /// `web client ios`: an iOS project.
     Ios,
-    /// `web solo android`: an Android project.
+    /// `web client android`: an Android project.
     Android,
 }
 
@@ -1197,8 +1182,7 @@ impl NoRunTarget {
     #[must_use]
     pub const fn word(self) -> &'static str {
         match self {
-            Self::Wasm => "wasm",
-            Self::Solo => "web solo",
+            Self::Client => "web client",
             Self::Desktop => "desktop",
             Self::Ios => "ios",
             Self::Android => "android",
@@ -1209,11 +1193,10 @@ impl NoRunTarget {
     #[must_use]
     pub const fn build_form(self) -> &'static str {
         match self {
-            Self::Wasm => "--target wasm",
-            Self::Solo => "web solo",
+            Self::Client => "web client",
             Self::Desktop => "web desktop",
-            Self::Ios => "web solo ios",
-            Self::Android => "web solo android",
+            Self::Ios => "web client ios",
+            Self::Android => "web client android",
         }
     }
 }
@@ -1233,9 +1216,9 @@ pub struct ReleaseRunArgs {
 /// Parse `ipe release run`'s argument tail.
 ///
 /// Accepts `[<path>] [--out <dir>] [--runtime <dir>] [--target <triple>]
-/// [-- <args>...]`. A target with no run form — `--target wasm`, `web solo`, a
-/// desktop or mobile host — is refused here with [`CliError::NoRunForm`],
-/// before any build.
+/// [-- <args>...]`. A target with no run form — `web client`, a desktop or
+/// mobile host — is refused here with [`CliError::NoRunForm`], before any
+/// build; a wasm `--target` is refused as on `release build`.
 ///
 /// # Errors
 ///
@@ -1284,22 +1267,16 @@ pub fn parse_release_run(rest: &[String]) -> Result<ReleaseRunArgs, CliError> {
         }
     }
 
-    if target == Some(TargetTriple::BrowserWasm) {
-        return Err(CliError::NoRunForm {
-            target: NoRunTarget::Wasm,
-        });
-    }
+    let build_flags = !words.is_empty() || out.is_some() || runtime.is_some() || target.is_some();
+    let target = release_target_from_flag(target, LABEL)?;
     if let Some(no_run) = NoRunTarget::from_host(delivery.tokens.host) {
         return Err(CliError::NoRunForm { target: no_run });
     }
-    if delivery.tokens.runtime == Some(crate::delivery::Runtime::Solo) {
+    if delivery.tokens.runtime == Some(crate::delivery::Runtime::Client) {
         return Err(CliError::NoRunForm {
-            target: NoRunTarget::Solo,
+            target: NoRunTarget::Client,
         });
     }
-
-    let build_flags = !words.is_empty() || out.is_some() || runtime.is_some() || target.is_some();
-    let target = ReleaseTarget::from_target(target)?;
 
     Ok(ReleaseRunArgs {
         build: ReleaseArgs {
@@ -1623,11 +1600,11 @@ mod tests {
         match a.mode {
             BuildMode::Emit {
                 out,
-                wasm,
+                target,
                 static_layer,
             } => {
                 assert!(out.is_none());
-                assert_eq!(wasm, WasmKind::None);
+                assert_eq!(target, None);
                 assert_eq!(static_layer, StaticRequestLayer::default());
             }
             BuildMode::EmitIr => panic!("default build must emit a project"),
@@ -1657,12 +1634,12 @@ mod tests {
     }
 
     #[test]
-    fn build_web_solo_host_parses() {
-        let a = parse_build(&s(&["web", "solo", "ios"])).expect("web solo ios");
+    fn build_web_client_host_parses() {
+        let a = parse_build(&s(&["web", "client", "ios"])).expect("web client ios");
         assert_eq!(a.delivery.stated_shape, Some(Shape::Web));
         assert_eq!(
             a.delivery.tokens.runtime,
-            Some(crate::delivery::Runtime::Solo)
+            Some(crate::delivery::Runtime::Client)
         );
         assert_eq!(a.delivery.tokens.host, crate::delivery::Host::Ios);
     }
@@ -1757,9 +1734,11 @@ mod tests {
     fn build_wasm_alone_ok() {
         match parse_build(&s(&["--target", "wasm"])).expect("wasm").mode {
             BuildMode::Emit {
-                wasm, static_layer, ..
+                target,
+                static_layer,
+                ..
             } => {
-                assert_eq!(wasm, WasmKind::Client);
+                assert_eq!(target, Some(TargetTriple::BrowserWasm));
                 // The pseudo-triple must be cleared so it never reaches resolution.
                 assert_eq!(static_layer, StaticRequestLayer::default());
             }
@@ -1773,9 +1752,11 @@ mod tests {
         // static-request layer just like `--target wasm`.
         match parse_build(&s(&["--target", "wasi"])).expect("wasi").mode {
             BuildMode::Emit {
-                wasm, static_layer, ..
+                target,
+                static_layer,
+                ..
             } => {
-                assert_eq!(wasm, WasmKind::Wasi);
+                assert_eq!(target, Some(TargetTriple::Wasm32Wasip1));
                 assert_eq!(static_layer, StaticRequestLayer::default());
             }
             BuildMode::EmitIr => panic!(),
@@ -1789,9 +1770,14 @@ mod tests {
             .mode
         {
             BuildMode::Emit {
-                wasm, static_layer, ..
+                target,
+                static_layer,
+                ..
             } => {
-                assert_eq!(wasm, WasmKind::None);
+                assert_eq!(
+                    target,
+                    Some(TargetTriple::Native(StaticTriple::X8664LinuxMusl))
+                );
                 assert_eq!(static_layer.static_build, Some(true));
                 assert_eq!(
                     static_layer.target.as_deref(),
@@ -1881,8 +1867,9 @@ mod tests {
     ///
     /// An in-set value parses for all three, and an out-of-set value is refused
     /// by all three with the same message. The only per-command refusals are
-    /// semantic — `run` has no process to execute for `wasm`, and `release`
-    /// produces no `wasi` module — and each names why.
+    /// semantic — `run` has no process to execute for `wasm`, `release` builds
+    /// its browser bundle from the `web client` delivery rather than a `wasm`
+    /// target, and `release` produces no `wasi` module — and each names why.
     #[test]
     fn build_run_and_release_share_the_target_vocabulary() {
         let in_set = [
@@ -1907,6 +1894,10 @@ mod tests {
                 _ => assert!(run.is_ok(), "run {value}"),
             }
             match value {
+                "wasm" => assert!(
+                    matches!(&release, Err(e) if e.to_string().contains("ipe release build web client")),
+                    "release wasm is a semantic refusal naming the delivery: {release:?}"
+                ),
                 "wasi" => assert!(
                     matches!(&release, Err(e) if e.to_string().contains("does not produce a WASI module")),
                     "release wasi is a semantic refusal"
@@ -1941,7 +1932,7 @@ mod tests {
         // under embedded wasmtime, so the flag is accepted at parse and captured
         // as the WASI compilation target (routed to the wasmtime path downstream).
         let a = parse_run(&s(&["--target", "wasi"])).expect("wasi accepted");
-        assert_eq!(a.wasm, WasmKind::Wasi);
+        assert_eq!(a.target, Some(TargetTriple::Wasm32Wasip1));
     }
 
     #[test]
@@ -2358,24 +2349,15 @@ mod tests {
         assert_eq!(a.format, OutputFormat::Json);
     }
 
-    /// `--static` is accepted on a native release (already static) and refused
-    /// with `--target wasm`.
+    /// `--static` is accepted on a native release, which is already static.
     #[test]
     fn release_static_composes_with_native_only() {
         let a = parse_release_build(&s(&["--static"])).expect("--static");
-        assert!(matches!(a.target, ReleaseTarget::Native(_)));
+        assert_eq!(a.target, None);
         assert!(
             parse_release_build(&s(&["--static", "--target", "aarch64-unknown-linux-musl"]))
                 .is_ok()
         );
-        assert!(matches!(
-            parse_release_build(&s(&["--static", "--target", "wasm"])),
-            Err(CliError::Usage(_))
-        ));
-        assert!(matches!(
-            parse_release_build(&s(&["--target", "wasm", "--static"])),
-            Err(CliError::Usage(_))
-        ));
     }
 
     /// `--emit-permissions` belongs to `release build` only.
@@ -2418,29 +2400,64 @@ mod tests {
         assert!(parse_release_build(&s(&["--plain", "--json"])).is_err());
     }
 
+    /// The text a release wasm-target refusal from the flag prints.
+    fn release_wasm_flag_refusal(command: &str) -> String {
+        text::msg::command_refusal(
+            &command,
+            &DeliveryError::ReleaseWasmTarget {
+                source: TargetSource::Flag,
+            },
+        )
+        .to_string()
+    }
+
     #[test]
-    fn release_wasm_target_accepted() {
-        let a = parse_release_build(&s(&["--target", "wasm"])).expect("--target wasm");
-        assert_eq!(a.target, ReleaseTarget::Wasm);
+    fn release_build_refuses_wasm_flag() {
+        let expected = release_wasm_flag_refusal(Verb::RELEASE_BUILD.name());
+        assert!(
+            expected.contains("ipe release build web client"),
+            "{expected}"
+        );
+        for argv in [
+            &["web", "client", "--target", "wasm"][..],
+            &["--target", "wasm"][..],
+            &["--static", "--target", "wasm"][..],
+        ] {
+            let refused = parse_release_build(&s(argv));
+            assert!(
+                matches!(&refused, Err(CliError::Usage(m)) if *m == expected),
+                "{argv:?}: {refused:?}"
+            );
+        }
+        let triple = parse_release_build(&s(&["--target", "wasm32-unknown-unknown"]));
+        assert!(
+            matches!(&triple, Err(CliError::Usage(m)) if m.to_string().contains("unsupported target")),
+            "{triple:?}"
+        );
+    }
+
+    #[test]
+    fn release_run_refuses_wasm_flag() {
+        let expected = release_wasm_flag_refusal(Verb::RELEASE_RUN.name());
+        let refused = parse_release_run(&s(&["--target", "wasm"]));
+        assert!(
+            matches!(&refused, Err(CliError::Usage(m)) if *m == expected),
+            "{refused:?}"
+        );
     }
 
     #[test]
     fn release_target_none_defaults_to_native_x86_64() {
         let a = parse_release_build(&[]).expect("empty release");
-        assert_eq!(
-            a.target,
-            ReleaseTarget::Native(StaticTriple::X8664LinuxMusl)
-        );
+        assert_eq!(a.target, None);
+        assert_eq!(StaticTriple::default(), StaticTriple::X8664LinuxMusl);
     }
 
     #[test]
     fn release_target_valid_triple_accepted() {
         let a = parse_release_build(&s(&["--target", "aarch64-unknown-linux-musl"]))
             .expect("--target aarch64");
-        assert_eq!(
-            a.target,
-            ReleaseTarget::Native(StaticTriple::Aarch64LinuxMusl)
-        );
+        assert_eq!(a.target, Some(StaticTriple::Aarch64LinuxMusl));
     }
 
     #[test]
@@ -2483,9 +2500,14 @@ mod tests {
 
     #[test]
     fn release_out_flag_combined_with_target() {
-        let a =
-            parse_release_build(&s(&["--out", "dist", "--target", "wasm"])).expect("--out + wasm");
+        let a = parse_release_build(&s(&[
+            "--out",
+            "dist",
+            "--target",
+            "aarch64-unknown-linux-musl",
+        ]))
+        .expect("--out + target");
         assert_eq!(a.out.as_deref(), Some("dist"));
-        assert_eq!(a.target, ReleaseTarget::Wasm);
+        assert_eq!(a.target, Some(StaticTriple::Aarch64LinuxMusl));
     }
 }

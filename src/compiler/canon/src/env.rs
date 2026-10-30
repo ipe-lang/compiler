@@ -122,7 +122,7 @@ pub const STDLIB_MODULE_QUALIFIERS: &[(&[&str], &str)] = &[
     // `Ipe.Tea.Worker` — the view-less co-located worker app-entry surface:
     // `Worker.tea { init, update, subscriptions }`. No render; output is `Cmd`.
     // Importing it marks the module a TEA app (IPE-N0033). A worker classifies to
-    // the co-located Script placement and can never reach the Solo/wasm sandbox.
+    // the co-located Script placement and can never reach the client wasm sandbox.
     (&["Ipe", "Tea", "Worker"], "Worker"),
     // `Ipe.Tea.Web.PubSub` — the Web-shape-scoped TEA-side broadcast surface:
     // `publish` / `publishNoEcho` (Cmd forms, fired from `update`) and

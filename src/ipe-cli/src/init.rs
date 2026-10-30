@@ -30,6 +30,8 @@ use std::fmt::Write as _;
 use std::io::{IsTerminal as _, Write as _};
 use std::path::{Path, PathBuf};
 
+use crate::delivery::Runtime;
+use crate::delivery_set::ShipEntry;
 use crate::{CliError, health, style, text};
 
 // ── per-shape Main.ipe templates ─────────────────────────────────────────────
@@ -73,7 +75,7 @@ const AGENTS_MD: &str = include_str!("../templates/AGENTS.md.in");
 /// compiler shape.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum InitShape {
-    /// `main = Web.tea …` — DOM rendering, served or solo.
+    /// `main = Web.tea …` — DOM rendering, served or client.
     #[default]
     Web,
     /// `main = Tui.tea …` — terminal cells rendering.
@@ -150,7 +152,7 @@ impl InitShape {
     }
 
     /// Whether this shape carries a runtime choice. Only `web` is placed on both
-    /// effect-locality columns (served vs solo); every other shape has one
+    /// effect-locality columns (served vs client); every other shape has one
     /// runtime, so a `runtime` positional on it is a conflict (spec § 0, § 2).
     const fn has_runtime_choice(self) -> bool {
         matches!(self, Self::Web)
@@ -184,16 +186,14 @@ impl InitShape {
     ///
     /// The single source of truth for the text, so a new shape cannot silently
     /// inherit another shape's instructions. `web` is the one shape with a
-    /// runtime choice (spec § 0.1): `runtime` picks between its served and solo
-    /// wording; every other arm ignores it.
-    const fn open_hint(self, runtime: InitRuntime) -> &'static str {
+    /// runtime choice (spec § 0.1): `runtime` picks between its served and
+    /// client wording; every other arm ignores it.
+    const fn open_hint(self, runtime: Runtime) -> &'static str {
         match self {
             Self::Web => match runtime {
-                InitRuntime::Served => {
-                    "Then open http://localhost:8000 and click the counter buttons."
-                }
-                InitRuntime::Solo => {
-                    "This is a `solo` app: `ipe dev run` serves the wasm bundle at \
+                Runtime::Served => "Then open http://localhost:8000 and click the counter buttons.",
+                Runtime::Client => {
+                    "This is a `client` app: `ipe dev run` serves the wasm bundle at \
                      http://localhost:8000; open it and click the counter buttons."
                 }
             },
@@ -239,63 +239,27 @@ impl InitShape {
 
 // ── runtime model ──────────────────────────────────────────────────────────────
 
-/// The Web-shape runtime a `web` project's default delivery is seeded with
-/// (spec § 2). Only `web` carries this choice; the `runtime` positional is
-/// meaningful for it alone.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
-enum InitRuntime {
-    /// The co-located server loop — the unnamed default. `web` with no runtime
-    /// word means served.
-    #[default]
-    Served,
-    /// The self-contained client loop — wasm in a browser/webview.
-    Solo,
+/// The word a message prints for a runtime: its delivery word, or `served` for
+/// the unnamed default.
+fn runtime_label(runtime: Runtime) -> &'static str {
+    runtime.word().unwrap_or("served")
 }
 
-impl InitRuntime {
-    /// Parse a `runtime` positional into the runtime and whether a deprecated
-    /// alias was used. `served` is a valid init input (unlike the build grammar,
-    /// where it is the unnamed default and never written) — at `init` the
-    /// positional is an explicit wizard shortcut. The retired words `live` and
-    /// `spa` are still accepted here for one release as deprecated aliases (the
-    /// second element is `Some(alias)` then, so the caller can emit a rename
-    /// hint); the build grammar rejects them. `None` for any token outside the
-    /// closed set.
-    fn parse(s: &str) -> Option<(Self, Option<&'static str>)> {
-        match s {
-            "served" => Some((Self::Served, None)),
-            "solo" => Some((Self::Solo, None)),
-            // Deprecated aliases: accepted at `init` only, with a rename hint.
-            "live" => Some((Self::Served, Some("live"))),
-            "spa" => Some((Self::Solo, Some("spa"))),
-            _ => None,
-        }
-    }
-
-    /// The display word used in prompts and messages.
-    const fn label(self) -> &'static str {
-        match self {
-            Self::Served => "served",
-            Self::Solo => "solo",
-        }
-    }
-
-    /// The `{ships}` template fill for a web project's `package.ipe` delivery
-    /// record, so the wizard's runtime choice writes the delivery set the
-    /// `ipe release` loop actually builds (spec § delivery).
-    ///
-    /// `solo` declares an explicit `ships = [ solo ]` — the browser wasm bundle
-    /// the user asked for. `served` is the implicit `[ binary ]` singleton, so it
-    /// fills to nothing and the manifest stays minimal (a served web project *is*
-    /// a co-located binary; declaring it explicitly would be noise). The fill is
-    /// spliced before the first delivery sub-field, closing with a `, ` so the
-    /// record's existing fields follow it unchanged.
-    const fn ships_fill(self) -> &'static str {
-        match self {
-            Self::Served => "",
-            Self::Solo => "ships = [ solo ]\n        , ",
-        }
-    }
+/// The `{ships}` template fill for a web project's `package.ipe` delivery
+/// record, so the runtime choice writes the delivery set `ipe release` builds.
+///
+/// A runtime with a ship builder of its own on the default host (`client`)
+/// declares an explicit `ships = [ client ]`; served is the implicit
+/// `[ binary ]` singleton, so it fills to nothing and the manifest stays
+/// minimal. The fill is spliced before the first delivery sub-field, closing
+/// with a `, ` so the record's existing fields follow it unchanged.
+fn ships_fill(runtime: Runtime) -> String {
+    ShipEntry::BUILDERS
+        .into_iter()
+        .find(|entry| entry.axes() == Some((runtime, crate::delivery::Host::Default)))
+        .map_or_else(String::new, |entry| {
+            format!("ships = [ {} ]\n        , ", entry.builder_word())
+        })
 }
 
 // ── init args ─────────────────────────────────────────────────────────────────
@@ -311,7 +275,7 @@ struct InitArgs {
     shape: Option<InitShape>,
     /// The runtime positional, when supplied for a `web` shape — skips the wizard
     /// runtime prompt and seeds the default delivery.
-    runtime: Option<InitRuntime>,
+    runtime: Option<Runtime>,
 }
 
 // ── managed-file model ────────────────────────────────────────────────────────
@@ -386,11 +350,11 @@ fn fill_name(template: &str, project_name: &str) -> String {
 /// `{ships}` is a fixed builder expression drawn from the runtime's closed set,
 /// never user input, so it needs no literal escaping; non-web templates carry no
 /// `{ships}` hole, so the substitution is a no-op there.
-fn fill_package(template: &str, project_name: &str, runtime: InitRuntime) -> String {
+fn fill_package(template: &str, project_name: &str, runtime: Runtime) -> String {
     // `{ships}` is a template placeholder substituted by `.replace`, not a
     // `format!` argument — the formatting-args lint's heuristic misreads it.
     #[allow(clippy::literal_string_with_formatting_args)]
-    fill_name(template, project_name).replace("{ships}", runtime.ships_fill())
+    fill_name(template, project_name).replace("{ships}", &ships_fill(runtime))
 }
 
 // ── entry point ───────────────────────────────────────────────────────────────
@@ -448,10 +412,10 @@ pub fn run_init(rest: &[String]) -> Result<(), CliError> {
         match args.runtime {
             Some(rt) => rt,
             None if is_tty && !args.force => wizard_runtime()?,
-            None => InitRuntime::default(),
+            None => Runtime::Served,
         }
     } else {
-        InitRuntime::default()
+        Runtime::Served
     };
 
     // Re-run contract: an existing project whose `main` pins a different shape —
@@ -483,7 +447,7 @@ fn guard_rerun_conflict(
     target_dir: &Path,
     resolved_shape: InitShape,
     stated_shape: Option<InitShape>,
-    _stated_runtime: Option<InitRuntime>,
+    _stated_runtime: Option<Runtime>,
 ) -> Result<(), CliError> {
     let Some(stated) = stated_shape else {
         return Ok(());
@@ -581,7 +545,7 @@ const fn confidently_pinned_shape(shape: ipe_canon::shape_source::MainShape) -> 
 fn parse_init_args(rest: &[String]) -> Result<InitArgs, CliError> {
     let mut target_arg: Option<String> = None;
     let mut shape_positional: Option<InitShape> = None;
-    let mut runtime_positional: Option<InitRuntime> = None;
+    let mut runtime_positional: Option<Runtime> = None;
     let mut shape_flag: Option<InitShape> = None;
     let mut force = false;
     let mut lib = false;
@@ -631,7 +595,7 @@ fn parse_init_args(rest: &[String]) -> Result<InitArgs, CliError> {
         && !sh.has_runtime_choice()
     {
         return Err(CliError::Usage(text::msg::init_runtime_needs_web(
-            &rt.label(),
+            &runtime_label(rt),
             &sh.label(),
         )));
     }
@@ -651,30 +615,20 @@ fn parse_shape_word(word: &str) -> Result<InitShape, CliError> {
     InitShape::parse(word).ok_or_else(|| CliError::Usage(text::msg::init_unknown_shape(&word)))
 }
 
-/// Parse a runtime word positional into an [`InitRuntime`], with the one
-/// pedagogical "unknown runtime" message. A deprecated alias (`live`/`spa`) is
-/// accepted for one release and prints a rename hint to stderr — never a silent
-/// acceptance.
-fn parse_runtime_word(word: &str) -> Result<InitRuntime, CliError> {
-    let (runtime, deprecated) = InitRuntime::parse(word)
-        .ok_or_else(|| CliError::Usage(text::msg::init_unknown_runtime(&word)))?;
-    if let Some(alias) = deprecated {
-        print_runtime_rename_hint(alias, runtime);
-    }
-    Ok(runtime)
-}
-
-/// Print the one-release rename hint for a deprecated runtime alias (`live` →
-/// `served`, `spa` → `solo`) to stderr, so a user who typed the retired word
-/// learns the new one instead of the alias being silently accepted.
-fn print_runtime_rename_hint(alias: &str, runtime: InitRuntime) {
-    let _ = writeln!(
-        std::io::stderr(),
-        "ipe init: `{alias}` is renamed to `{}` — it is accepted for one release; \
-         use `{}` from now on.",
-        runtime.label(),
-        runtime.label(),
-    );
+/// Parse a runtime word positional through the delivery grammar's own reader.
+///
+/// `served` (the unnamed default) and the retired words are refused with the
+/// delivery grammar's typed refusals; any other unknown word gets the one
+/// pedagogical "unknown runtime" message.
+fn parse_runtime_word(word: &str) -> Result<Runtime, CliError> {
+    crate::delivery::parse_runtime_word(word)
+        .map_err(|err| crate::cli_args::delivery_usage("init", &err))?
+        .ok_or_else(|| {
+            CliError::Usage(text::msg::init_unknown_runtime(
+                &word,
+                &Runtime::Client.word().unwrap_or_default(),
+            ))
+        })
 }
 
 /// TTY wizard: prompt the user for shape and (for web) runtime+host.
@@ -712,38 +666,57 @@ fn wizard_shape() -> Result<InitShape, CliError> {
     Ok(shape)
 }
 
-/// TTY wizard: prompt for the `web` runtime (served vs solo). Only called for the
-/// web shape when the runtime positional was omitted on a TTY.
-fn wizard_runtime() -> Result<InitRuntime, CliError> {
-    crate::screen::prompt(
-        "How does this web app run?\n\
-             \n\
-             [1] served — a co-located server loop, streamed to the browser  (default)\n\
-             [2] solo   — a self-contained client, wasm in the browser\n\
-             \n\
-             Runtime [1]: ",
-    );
+/// The wizard's description of one runtime choice.
+const fn runtime_choice_blurb(runtime: Runtime) -> &'static str {
+    match runtime {
+        Runtime::Served => "a co-located server loop, streamed to the browser  (default)",
+        Runtime::Client => "a self-contained client, wasm in the browser",
+    }
+}
+
+/// TTY wizard: prompt for the `web` runtime (served vs client). Only called for
+/// the web shape when the runtime positional was omitted on a TTY.
+fn wizard_runtime() -> Result<Runtime, CliError> {
+    let mut menu = String::from("How does this web app run?\n\n");
+    for (index, runtime) in Runtime::ALL.into_iter().enumerate() {
+        let _ = writeln!(
+            menu,
+            "[{}] {:<6} — {}",
+            index.saturating_add(1),
+            runtime_label(runtime),
+            runtime_choice_blurb(runtime)
+        );
+    }
+    menu.push_str("\nRuntime [1]: ");
+    crate::screen::prompt(&menu);
     let _ = std::io::stdout().flush();
     let line = read_line_trimmed();
-    let runtime = match line.as_deref().unwrap_or("") {
-        "" | "1" | "served" => InitRuntime::Served,
-        "2" | "solo" => InitRuntime::Solo,
-        // Deprecated aliases: accepted for one release, with a rename hint.
-        "live" => {
-            print_runtime_rename_hint("live", InitRuntime::Served);
-            InitRuntime::Served
-        }
-        "spa" => {
-            print_runtime_rename_hint("spa", InitRuntime::Solo);
-            InitRuntime::Solo
-        }
-        other => {
-            return Err(CliError::Usage(text::msg::init_unknown_runtime_choice(
-                &other,
-            )));
-        }
-    };
-    Ok(runtime)
+    runtime_choice(line.as_deref().unwrap_or(""))
+}
+
+/// Read a wizard runtime answer: Enter for served, a menu index into
+/// [`Runtime::ALL`], or a runtime word read exactly as the delivery grammar
+/// reads it.
+fn runtime_choice(answer: &str) -> Result<Runtime, CliError> {
+    if answer.is_empty() {
+        return Ok(Runtime::Served);
+    }
+    if let Some(runtime) = answer
+        .parse::<usize>()
+        .ok()
+        .and_then(|index| index.checked_sub(1))
+        .and_then(|index| Runtime::ALL.get(index).copied())
+    {
+        return Ok(runtime);
+    }
+    crate::delivery::parse_runtime_word(answer)
+        .map_err(|err| crate::cli_args::delivery_usage("init", &err))?
+        .ok_or_else(|| {
+            CliError::Usage(text::msg::init_unknown_runtime_choice(
+                &answer,
+                &Runtime::Client.word().unwrap_or_default(),
+            ))
+        })
 }
 
 /// Read one trimmed line from stdin, or `None` on EOF / read error.
@@ -761,10 +734,7 @@ fn read_line_trimmed() -> Option<String> {
 #[derive(Clone, Copy)]
 enum ScaffoldKind {
     Library,
-    App {
-        shape: InitShape,
-        runtime: InitRuntime,
-    },
+    App { shape: InitShape, runtime: Runtime },
 }
 
 /// Run the scaffold: fresh → write all; existing → reconcile.
@@ -799,11 +769,11 @@ fn run_scaffold(
 /// The complete set of files `init` writes for an application project.
 ///
 /// `shape` selects which `Main.ipe`, `package.ipe`, and `README.md` wording are
-/// scaffolded; `runtime` fills the web `package.ipe`'s delivery set (`solo`
+/// scaffolded; `runtime` fills the web `package.ipe`'s delivery set (`client`
 /// declares an explicit `ships`, `served` stays the implicit default) and picks
 /// `README.md`'s open-hint wording. `.gitignore` and `AGENTS.md` are the only
 /// shape-independent files.
-fn managed_files(project_name: &str, shape: InitShape, runtime: InitRuntime) -> Vec<ManagedFile> {
+fn managed_files(project_name: &str, shape: InitShape, runtime: Runtime) -> Vec<ManagedFile> {
     vec![
         ManagedFile {
             rel: PathBuf::from("package.ipe"),
@@ -1085,7 +1055,7 @@ fn print_next_steps(
     project_name: &str,
     interactive: bool,
     shape: InitShape,
-    runtime: InitRuntime,
+    runtime: Runtime,
 ) {
     let run_cmd = if target_arg == "." {
         "    ipe dev run".to_owned()
@@ -1151,7 +1121,7 @@ mod tests {
 
     #[test]
     fn scaffolded_web_manifest_is_package_ipe_that_re_parses() {
-        let files = managed_files("demo-app", InitShape::Web, InitRuntime::Served);
+        let files = managed_files("demo-app", InitShape::Web, Runtime::Served);
         let manifest = files
             .iter()
             .find(|f| f.rel == Path::new("package.ipe"))
@@ -1175,35 +1145,89 @@ mod tests {
     }
 
     #[test]
-    fn solo_runtime_scaffolds_an_explicit_solo_ships_set() {
-        use crate::delivery_set::ShipEntry;
-        let files = managed_files("solo-app", InitShape::Web, InitRuntime::Solo);
+    fn client_runtime_scaffolds_an_explicit_client_ships_set() {
+        let files = managed_files("client-app", InitShape::Web, Runtime::Client);
         let manifest = files
             .iter()
             .find(|f| f.rel == Path::new("package.ipe"))
             .expect("init writes a package.ipe");
 
-        let root = ipe_test_temp::temp_root().join("ipe_init_solo_ships");
+        let root = ipe_test_temp::temp_root().join("ipe_init_client_ships");
         let _ = std::fs::remove_dir_all(&root);
         write_stub_src(&root);
         let path = root.join("package.ipe");
         std::fs::write(&path, &manifest.content).expect("write scaffolded package.ipe");
 
         let parsed =
-            crate::project::parse_manifest(&path).expect("scaffolded solo manifest re-parses");
+            crate::project::parse_manifest(&path).expect("scaffolded client manifest re-parses");
         assert_eq!(
             parsed.delivery.ships,
-            vec![ShipEntry::Solo],
-            "a wizard `web solo` choice writes an explicit `ships = [ solo ]`"
+            vec![ShipEntry::Client],
+            "a wizard `web client` choice writes an explicit `ships = [ client ]`"
         );
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Every web runtime `init` scaffolds builds for every host its runtime
+    /// carries: the scaffolded manifest passes the target derivation `dev
+    /// build` and `release build` run, and for a mobile host the packager's
+    /// admission gate too. A `web client` scaffold writes no `wasm` field, and
+    /// its mobile build is admitted all the same.
+    #[test]
+    fn every_web_scaffold_is_admitted_on_each_of_its_hosts() {
+        use crate::delivery::{Delivery, Host, Shape, TargetTriple};
+        use crate::driver::{TargetVerb, derive_target, validate_mobile_pack};
+        for runtime in Runtime::ALL {
+            let label = format!("ipe_init_admitted_{}", runtime_label(runtime));
+            let files = managed_files("admitted-app", InitShape::Web, runtime);
+            let manifest = files
+                .iter()
+                .find(|f| f.rel == Path::new("package.ipe"))
+                .expect("init writes a package.ipe");
+            let root = ipe_test_temp::temp_root().join(&label);
+            let _ = std::fs::remove_dir_all(&root);
+            write_stub_src(&root);
+            let path = root.join("package.ipe");
+            std::fs::write(&path, &manifest.content).expect("write scaffolded package.ipe");
+            let parsed = crate::project::parse_manifest(&path);
+            let _ = std::fs::remove_dir_all(&root);
+            let parsed = parsed.expect("scaffolded manifest re-parses");
+            let wasm_block = parsed.wasm.implies_wasm_target();
+            let mut admitted_hosts = 0_usize;
+            for host in [Host::Default, Host::Desktop, Host::Ios, Host::Android] {
+                let Ok(delivery) = Delivery::resolve(Shape::Web, Some(runtime), host) else {
+                    continue;
+                };
+                admitted_hosts += 1;
+                for verb in [TargetVerb::Dev, TargetVerb::Release] {
+                    let derived = derive_target(verb, delivery, None, None, wasm_block);
+                    assert!(
+                        derived.is_ok(),
+                        "{label}: {delivery} derives a target under {verb:?}: {derived:?}"
+                    );
+                    assert_eq!(
+                        derived.ok().flatten() == Some(TargetTriple::BrowserWasm),
+                        runtime == Runtime::Client,
+                        "{label}: {delivery} derives the browser triple iff it is a client"
+                    );
+                }
+                if matches!(host, Host::Ios | Host::Android) {
+                    let gated = validate_mobile_pack(&parsed, Shape::Web);
+                    assert!(
+                        gated.is_ok(),
+                        "{label}: the mobile packager admits the {delivery} scaffold: {gated:?}"
+                    );
+                }
+            }
+            assert!(admitted_hosts > 0, "{label}: some host carries the runtime");
+        }
     }
 
     #[test]
     fn served_runtime_leaves_the_delivery_set_implicit() {
         // The default `served` runtime keeps the manifest minimal: no `ships`
         // field, which reads back as the implicit `[ binary ]` singleton.
-        let files = managed_files("served-app", InitShape::Web, InitRuntime::Served);
+        let files = managed_files("served-app", InitShape::Web, Runtime::Served);
         let manifest = files
             .iter()
             .find(|f| f.rel == Path::new("package.ipe"))
@@ -1238,7 +1262,7 @@ mod tests {
             InitShape::Server,
             InitShape::Script,
         ] {
-            let files = managed_files("proj", shape, InitRuntime::Solo);
+            let files = managed_files("proj", shape, Runtime::Client);
             let manifest = files
                 .iter()
                 .find(|f| f.rel == Path::new("package.ipe"))
@@ -1258,7 +1282,7 @@ mod tests {
 
     #[test]
     fn scaffolded_tui_manifest_re_parses() {
-        let files = managed_files("tui-app", InitShape::Tui, InitRuntime::Served);
+        let files = managed_files("tui-app", InitShape::Tui, Runtime::Served);
         let manifest = files
             .iter()
             .find(|f| f.rel == Path::new("package.ipe"))
@@ -1278,7 +1302,7 @@ mod tests {
 
     #[test]
     fn scaffolded_script_manifest_re_parses() {
-        let files = managed_files("my-script", InitShape::Script, InitRuntime::Served);
+        let files = managed_files("my-script", InitShape::Script, Runtime::Served);
         let manifest = files
             .iter()
             .find(|f| f.rel == Path::new("package.ipe"))
@@ -1298,7 +1322,7 @@ mod tests {
 
     #[test]
     fn scaffolded_worker_manifest_re_parses() {
-        let files = managed_files("tick-worker", InitShape::Worker, InitRuntime::Served);
+        let files = managed_files("tick-worker", InitShape::Worker, Runtime::Served);
         let manifest = files
             .iter()
             .find(|f| f.rel == Path::new("package.ipe"))
@@ -1318,12 +1342,12 @@ mod tests {
 
     #[test]
     fn each_shape_scaffolds_a_distinct_main_ipe() {
-        let web = managed_files("x", InitShape::Web, InitRuntime::Served);
-        let tui = managed_files("x", InitShape::Tui, InitRuntime::Served);
-        let cli = managed_files("x", InitShape::Cli, InitRuntime::Served);
-        let worker = managed_files("x", InitShape::Worker, InitRuntime::Served);
-        let server = managed_files("x", InitShape::Server, InitRuntime::Served);
-        let script = managed_files("x", InitShape::Script, InitRuntime::Served);
+        let web = managed_files("x", InitShape::Web, Runtime::Served);
+        let tui = managed_files("x", InitShape::Tui, Runtime::Served);
+        let cli = managed_files("x", InitShape::Cli, Runtime::Served);
+        let worker = managed_files("x", InitShape::Worker, Runtime::Served);
+        let server = managed_files("x", InitShape::Server, Runtime::Served);
+        let script = managed_files("x", InitShape::Script, Runtime::Served);
 
         let main = |files: &[ManagedFile]| {
             files
@@ -1380,11 +1404,11 @@ mod tests {
 
     #[test]
     fn positional_shape_and_runtime_parse() {
-        let a = parse_init_args(&["my-app".to_owned(), "web".to_owned(), "solo".to_owned()])
-            .expect("web solo positionals parse");
+        let a = parse_init_args(&["my-app".to_owned(), "web".to_owned(), "client".to_owned()])
+            .expect("web client positionals parse");
         assert_eq!(a.target_arg.as_deref(), Some("my-app"));
         assert_eq!(a.shape, Some(InitShape::Web));
-        assert_eq!(a.runtime, Some(InitRuntime::Solo));
+        assert_eq!(a.runtime, Some(Runtime::Client));
     }
 
     #[test]
@@ -1400,7 +1424,7 @@ mod tests {
 
     #[test]
     fn runtime_on_non_web_shape_is_refused() {
-        let err = parse_init_args(&["app".to_owned(), "tui".to_owned(), "solo".to_owned()])
+        let err = parse_init_args(&["app".to_owned(), "tui".to_owned(), "client".to_owned()])
             .expect_err("runtime on a tui project is a conflict");
         let msg = format!("{err:?}");
         assert!(msg.contains("web runtime"), "pedagogical: {msg}");
@@ -1438,26 +1462,67 @@ mod tests {
 
     #[test]
     fn runtime_word_round_trips() {
-        // The canonical words parse with no deprecation flag.
-        assert_eq!(
-            InitRuntime::parse("served"),
-            Some((InitRuntime::Served, None))
+        assert_eq!(parse_runtime_word("client").ok(), Some(Runtime::Client));
+        for (answer, runtime) in [
+            ("", Runtime::Served),
+            ("1", Runtime::Served),
+            ("2", Runtime::Client),
+        ] {
+            assert_eq!(
+                runtime_choice(answer).ok(),
+                Some(runtime),
+                "answer `{answer}`"
+            );
+        }
+        assert_eq!(runtime_choice("client").ok(), Some(Runtime::Client));
+        let unknown = parse_runtime_word("nope");
+        assert!(
+            matches!(&unknown, Err(CliError::Usage(m)) if m.contains("unknown runtime `nope`")),
+            "{unknown:?}"
         );
-        assert_eq!(InitRuntime::parse("solo"), Some((InitRuntime::Solo, None)));
-        assert_eq!(InitRuntime::parse("nope"), None);
+        let out_of_range = runtime_choice("3");
+        assert!(
+            matches!(&out_of_range, Err(CliError::Usage(m)) if m.contains("unknown runtime `3`")),
+            "{out_of_range:?}"
+        );
     }
 
+    /// Init reads its runtime word exactly as the delivery grammar does: a
+    /// retired word and the unnamed default are refused, positional and wizard
+    /// alike, with the delivery grammar's own message.
     #[test]
-    fn deprecated_runtime_aliases_still_parse_flagged() {
-        // The retired words map to the new runtime and carry the alias so the
-        // caller can emit a rename hint — never a silent accept.
-        assert_eq!(
-            InitRuntime::parse("live"),
-            Some((InitRuntime::Served, Some("live")))
+    fn init_refuses_retired_runtime_words() {
+        use crate::delivery::{DeliveryError, RetiredRuntimeWord};
+        for retired in RetiredRuntimeWord::ALL {
+            let expected = DeliveryError::RetiredRuntimeWord { got: retired }.to_string();
+            let positional = parse_init_args(&[
+                "app".to_owned(),
+                "web".to_owned(),
+                retired.text().to_owned(),
+            ]);
+            assert!(
+                matches!(&positional, Err(CliError::Usage(m)) if m.contains(&expected)),
+                "positional `{}`: {positional:?}",
+                retired.text()
+            );
+            let wizard = runtime_choice(retired.text());
+            assert!(
+                matches!(&wizard, Err(CliError::Usage(m)) if m.contains(&expected)),
+                "wizard `{}`: {wizard:?}",
+                retired.text()
+            );
+        }
+        let served = DeliveryError::ServedNotAWord.to_string();
+        let positional =
+            parse_init_args(&["app".to_owned(), "web".to_owned(), "served".to_owned()]);
+        assert!(
+            matches!(&positional, Err(CliError::Usage(m)) if m.contains(&served)),
+            "positional `served`: {positional:?}"
         );
-        assert_eq!(
-            InitRuntime::parse("spa"),
-            Some((InitRuntime::Solo, Some("spa")))
+        let wizard = runtime_choice("served");
+        assert!(
+            matches!(&wizard, Err(CliError::Usage(m)) if m.contains(&served)),
+            "wizard `served`: {wizard:?}"
         );
     }
 
@@ -1647,7 +1712,7 @@ mod tests {
 
     #[test]
     fn delivery_defaults_in_scaffolded_manifest() {
-        let files = managed_files("proj", InitShape::Web, InitRuntime::Served);
+        let files = managed_files("proj", InitShape::Web, Runtime::Served);
         let manifest = files
             .iter()
             .find(|f| f.rel == Path::new("package.ipe"))
@@ -1728,7 +1793,7 @@ mod tests {
 
     #[test]
     fn managed_set_omits_legacy_ipe_toml() {
-        let files = managed_files("x", InitShape::default(), InitRuntime::Served);
+        let files = managed_files("x", InitShape::default(), Runtime::Served);
         assert!(
             !files.iter().any(|f| f.rel == Path::new("ipe.toml")),
             "init must not scaffold a legacy ipe.toml"
@@ -1777,7 +1842,7 @@ mod tests {
         // of the quoted `.ipe` literal without escaping. The scaffolded manifest
         // must still re-parse, and the name must round-trip exactly.
         let hostile = "evil\"\\\n }, injected = True { ";
-        let files = managed_files(hostile, InitShape::Web, InitRuntime::Served);
+        let files = managed_files(hostile, InitShape::Web, Runtime::Served);
         let manifest = files
             .iter()
             .find(|f| f.rel == Path::new("package.ipe"))
