@@ -358,11 +358,11 @@ impl BuiltinType {
             .map(Self)
     }
 
-    /// The empty-home builtin named `name`, for the unqualified type-name
-    /// resolver.
+    /// The empty-home builtin named `name`.
     ///
-    /// Only that resolver may read a head by its bare name: every other
-    /// identity question goes through [`Self::of_head`].
+    /// Only name resolution reads a head by its bare name: the unqualified
+    /// type-name resolver, the terminal-attribute binding and the re-export
+    /// home. Every other identity question goes through [`Self::of_head`].
     #[must_use]
     pub fn of_bare_name(name: &str) -> Option<Self> {
         bare_row(name).map(Self)

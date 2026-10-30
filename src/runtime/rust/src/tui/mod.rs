@@ -144,13 +144,13 @@ pub fn cells_none_<M>() -> CellsView<M> {
     CellsView::new(Element::Empty)
 }
 
-/// `Ipe.Ui.Cells.text : String -> Cells msg`
+/// `Ipe.Ui.Cells.text : String -> Screen msg`
 #[must_use]
 pub fn cells_text_<M>(s: String) -> CellsView<M> {
     CellsView::new(Element::Text(s))
 }
 
-/// `Ipe.Ui.Cells.cells : List (List Char) -> Cells msg`
+/// `Ipe.Ui.Cells.cells : List (List Char) -> Screen msg`
 #[must_use]
 pub fn cells_cells_<M>(grid: Vec<Vec<char>>) -> CellsView<M> {
     CellsView::new(Element::Cells(grid))

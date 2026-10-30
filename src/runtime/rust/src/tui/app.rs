@@ -1031,8 +1031,8 @@ where
     outcome.focusables.unwrap_or(current)
 }
 
-/// `Tui.tea` — terminal TEA driver for a `view : Model -> Cells msg`.
-/// The `Cells msg` value wraps the same structured `Element` tree that `Ipe.Web`
+/// `Tui.tea` — terminal TEA driver for a `view : Model -> Screen msg`.
+/// The `Screen msg` value wraps the same structured `Element` tree that `Ipe.Web`
 /// renders; here it is laid out to ANSI cells by walking the typed attributes
 /// (`tui::layout`), and `Ipe.Ui.Input.*` widgets become focusables. Tab /
 /// Shift-Tab cycle focus; typing edits the focused text input (dispatching its
