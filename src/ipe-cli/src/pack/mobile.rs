@@ -3909,7 +3909,7 @@ public final class IpeApplication extends Application {
 /// android`, and this README) carries verbatim, so neither can hand-write a
 /// `gradlew` line that drifts from the other.
 pub(crate) fn android_build_steps() -> crate::text::Message {
-    crate::text::android_build_steps(ANDROID_GRADLE_MIN_VERSION)
+    crate::text::android_build_steps(&ANDROID_GRADLE_MIN_VERSION)
 }
 
 /// The Android shell's build/README note.
