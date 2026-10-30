@@ -10,7 +10,10 @@ use std::rc::Rc;
 
 use ipe_diagnostics::{DResult, Diagnostic, NameError, Span};
 use ipe_intern::{Interner, Symbol};
-use ipe_kernels::{AppSurface, StdlibKernel};
+use ipe_kernels::{
+    AppSurface, BUILTIN_TYPES, BuiltinRow, BuiltinTag, BuiltinType, KERNEL_TYPE_ALIASES,
+    KernelHome, KernelTypeAlias, RowTailShape, StdlibKernel, TyShape,
+};
 
 use crate::resolve::{ModuleOrigin, QualifierForm, import_qualifier_forms};
 use crate::scope::{ExprTarget, Identity, ModuleScope, Origin, Tier, ValueIdentity};
@@ -615,6 +618,184 @@ impl std::borrow::Borrow<Symbol> for KernelModule {
     }
 }
 
+/// A type a kernel module exports.
+#[derive(Clone, Debug)]
+pub enum KernelTypeExport {
+    /// A builtin row, whose head is minted at the empty home.
+    Builtin(BuiltinType),
+    /// A type alias, its body canonical.
+    Alias(crate::ExportedAlias),
+}
+
+/// The kernel modules, by canonical qualifier text and by dotted import path.
+#[derive(Default)]
+struct KernelModuleIndex {
+    /// Canonical qualifier text → the module and its primary import path.
+    by_canonical: BTreeMap<&'static str, (KernelModule, Vec<Symbol>)>,
+    /// Dotted import path → the module it names.
+    by_path: BTreeMap<String, KernelModule>,
+}
+
+/// The `CompilerBug` for a kernel type table that disagrees with itself.
+fn kernel_types_bug(detail: String) -> Diagnostic {
+    Diagnostic::CompilerBug {
+        where_: "ipe_canon::kernel_type_exports",
+        detail,
+    }
+}
+
+/// Add `export` as `name` under `module`, refusing a second export of the name.
+///
+/// # Errors
+/// [`Diagnostic::CompilerBug`] when `module` already exports `name`.
+fn add_kernel_type(
+    table: &mut BTreeMap<KernelModule, BTreeMap<&'static str, KernelTypeExport>>,
+    module: KernelModule,
+    name: &'static str,
+    export: KernelTypeExport,
+) -> DResult<()> {
+    if table
+        .entry(module)
+        .or_default()
+        .insert(name, export)
+        .is_some()
+    {
+        return Err(kernel_types_bug(format!(
+            "a kernel module exports the type `{name}` twice"
+        )));
+    }
+    Ok(())
+}
+
+/// The builtin export of `row`, refusing a row whose scheme mints a module home.
+///
+/// Canon mints every builtin export at the empty home, so a row whose kernel
+/// schemes mint another home would split the qualified path from the scheme.
+///
+/// # Errors
+/// [`Diagnostic::CompilerBug`] for a module-homed scheme head or a row no
+/// lookup reaches.
+fn builtin_export(row: &'static BuiltinRow) -> DResult<KernelTypeExport> {
+    let scheme_home = row.tag().map_or(row.home(), BuiltinTag::scheme_home);
+    if scheme_home != KernelHome::Builtin {
+        return Err(kernel_types_bug(format!(
+            "the kernel type `{}` mints a module-homed scheme head",
+            row.name()
+        )));
+    }
+    let home: Vec<&str> = match row.home() {
+        KernelHome::Builtin => Vec::new(),
+        KernelHome::Module(path) => path.split('.').collect(),
+    };
+    BuiltinType::of_head(&home, row.name())
+        .map(KernelTypeExport::Builtin)
+        .ok_or_else(|| kernel_types_bug(format!("`{}` is not a builtin head", row.name())))
+}
+
+/// The canonical form of a kernel alias body.
+///
+/// # Errors
+/// [`Diagnostic::CompilerBug`] for a shape outside the alias grammar, which
+/// the kernels' build-time checks keep unreachable, or an exhausted interner.
+fn kernel_alias_type(shape: &TyShape, interner: &mut Interner) -> DResult<crate::ast::Type> {
+    Ok(match shape {
+        TyShape::Con(tag, args) => {
+            let mut can_args = Vec::with_capacity(args.len());
+            for arg in *args {
+                can_args.push(kernel_alias_type(arg, interner)?);
+            }
+            crate::ast::Type::Con {
+                home: Vec::new(),
+                name: interner.intern(tag.row().name())?,
+                args: can_args,
+            }
+        }
+        TyShape::Tuple(items) => {
+            let mut can_items = Vec::with_capacity(items.len());
+            for item in *items {
+                can_items.push(kernel_alias_type(item, interner)?);
+            }
+            crate::ast::Type::Tuple(can_items)
+        }
+        TyShape::Unit => crate::ast::Type::Unit,
+        TyShape::Record {
+            fields,
+            tail: RowTailShape::Closed,
+        } => {
+            let mut can_fields = Vec::with_capacity(fields.len());
+            for (tag, field) in *fields {
+                can_fields.push((
+                    interner.intern(tag.text())?,
+                    kernel_alias_type(field, interner)?,
+                ));
+            }
+            crate::ast::Type::Record(can_fields)
+        }
+        TyShape::Record { .. } | TyShape::Fun(..) | TyShape::Var(_) => {
+            return Err(kernel_types_bug(
+                "a kernel alias body is not a closed builtin tree".to_owned(),
+            ));
+        }
+    })
+}
+
+/// Every type each kernel module exports.
+///
+/// A row's qualifier spellings and module home, and an alias's module, must
+/// each name a kernel module of `index`; a typo would otherwise export nothing.
+///
+/// # Errors
+/// [`Diagnostic::CompilerBug`] for a duplicate export, a spelling or alias
+/// module naming no kernel module, a module-homed builtin scheme head, or an
+/// exhausted interner.
+fn kernel_type_exports(
+    rows: &[&'static BuiltinRow],
+    aliases: &[KernelTypeAlias],
+    index: &KernelModuleIndex,
+    interner: &mut Interner,
+) -> DResult<BTreeMap<KernelModule, BTreeMap<&'static str, KernelTypeExport>>> {
+    let mut table = BTreeMap::new();
+    for &row in rows {
+        for &spelling in row.qualified_via() {
+            let Some((module, _)) = index.by_canonical.get(spelling) else {
+                return Err(kernel_types_bug(format!(
+                    "the qualifier `{spelling}` of the type `{}` names no kernel module",
+                    row.name()
+                )));
+            };
+            add_kernel_type(&mut table, *module, row.name(), builtin_export(row)?)?;
+        }
+        if let KernelHome::Module(path) = row.home()
+            && let Some(module) = index.by_path.get(path)
+        {
+            add_kernel_type(&mut table, *module, row.name(), builtin_export(row)?)?;
+        }
+    }
+    for alias in aliases {
+        let Some((module, path)) = index.by_canonical.get(alias.module) else {
+            return Err(kernel_types_bug(format!(
+                "the alias `{}` names no kernel module `{}`",
+                alias.name, alias.module
+            )));
+        };
+        let body = kernel_alias_type(alias.body, interner)?;
+        let exported = crate::ExportedAlias {
+            home: path.clone(),
+            param_slots: Vec::new(),
+            literal_record: matches!(body, crate::ast::Type::Record(_)),
+            body,
+            free_vars: BTreeSet::new(),
+        };
+        add_kernel_type(
+            &mut table,
+            *module,
+            alias.name,
+            KernelTypeExport::Alias(exported),
+        )?;
+    }
+    Ok(table)
+}
+
 /// The module a qualifier spelling resolves into.
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug)]
 pub enum ModuleIdentity {
@@ -895,6 +1076,12 @@ pub struct Env {
     pub kernel_members: Rc<BTreeMap<KernelModule, BTreeMap<Symbol, VarHome>>>,
     /// The kernel constructor pool, the constructor half of [`Self::kernel_members`].
     pub kernel_ctors: Rc<BTreeMap<KernelModule, BTreeMap<Symbol, CtorHome>>>,
+    /// The types each kernel module exports, by name.
+    ///
+    /// Filled once by [`Env::initial`] from the `BUILTIN_TYPES` qualifier
+    /// spellings and homes and from `KERNEL_TYPE_ALIASES`; a qualified type
+    /// under a kernel qualifier resolves only through it.
+    pub kernel_types: Rc<BTreeMap<KernelModule, BTreeMap<&'static str, KernelTypeExport>>>,
     /// What this module's imports installed: the modules, the owner of each
     /// spelling, the ambiguous spellings, and the TEA shape.
     pub import_scope: Rc<ImportScope>,
@@ -1755,7 +1942,47 @@ impl Env {
         // Move every installed kernel table into the member pool and record the
         // import path of each gated canonical, before any import is processed.
         env.freeze_stdlib_import_gate(interner)?;
+        let index = env.kernel_module_index(interner);
+        let rows: Vec<&'static BuiltinRow> = BUILTIN_TYPES.iter().collect();
+        env.kernel_types = Rc::new(kernel_type_exports(
+            &rows,
+            KERNEL_TYPE_ALIASES,
+            &index,
+            interner,
+        )?);
         Ok(env)
+    }
+
+    /// Every kernel module, by canonical qualifier text and by import path.
+    fn kernel_module_index(&self, interner: &Interner) -> KernelModuleIndex {
+        let mut index = KernelModuleIndex::default();
+        for (path, canonical) in STDLIB_MODULE_QUALIFIERS {
+            let Some(module) = interner
+                .lookup(canonical)
+                .and_then(|sym| self.kernel_module_of(sym))
+            else {
+                continue;
+            };
+            let segments: Option<Vec<Symbol>> =
+                path.iter().map(|seg| interner.lookup(seg)).collect();
+            if let Some(segments) = segments {
+                index
+                    .by_canonical
+                    .entry(canonical)
+                    .or_insert((module, segments));
+            }
+            index.by_path.insert(path.join("."), module);
+        }
+        if let Some(basics) = interner
+            .lookup("Basics")
+            .and_then(|sym| self.kernel_module_of(sym))
+        {
+            index
+                .by_canonical
+                .entry("Basics")
+                .or_insert((basics, vec![basics.symbol()]));
+        }
+        index
     }
 
     /// Move the installed kernel members into the pool and freeze the gate catalog.
@@ -2689,5 +2916,87 @@ mod stdlib_module_qualifier_distinctness_tests {
                 canonical
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod kernel_type_export_tests {
+    //! The kernel type table is built once from the kernels' rows and aliases;
+    //! every disagreement between them is a `CompilerBug` at `Env::initial`.
+
+    use super::{Env, KernelModule, KernelModuleIndex, KernelTypeExport, kernel_type_exports};
+    use ipe_diagnostics::{DResult, Diagnostic};
+    use ipe_intern::Interner;
+    use ipe_kernels::{BUILTIN_TYPES, BuiltinRow, KERNEL_TYPE_ALIASES};
+
+    /// The row named `name`, as a one-row slice source.
+    fn row(name: &str) -> Vec<&'static BuiltinRow> {
+        BUILTIN_TYPES
+            .iter()
+            .filter(|row| row.name() == name)
+            .collect()
+    }
+
+    /// An index holding only the kernel module `Http`, reached by `path`.
+    fn http_index(path: &str, interner: &mut Interner) -> DResult<KernelModuleIndex> {
+        let http = interner.intern("Http")?;
+        let module = KernelModule(http);
+        let mut index = KernelModuleIndex::default();
+        index.by_canonical.insert("Http", (module, vec![http]));
+        index.by_path.insert(path.to_owned(), module);
+        Ok(index)
+    }
+
+    /// Whether `result` is the fail-closed `CompilerBug`.
+    fn is_bug<T>(result: &DResult<T>) -> bool {
+        matches!(result, Err(Diagnostic::CompilerBug { .. }))
+    }
+
+    #[test]
+    fn kernel_type_exports_refuse_a_duplicate_a_non_canonical_qualifier_and_a_homed_scheme()
+    -> DResult<()> {
+        let mut interner = Interner::new();
+        let index = http_index("Ipe.Http", &mut interner)?;
+        let method = row("HttpMethod");
+        assert_eq!(method.len(), 1, "the `HttpMethod` row exists");
+        assert!(kernel_type_exports(&method, &[], &index, &mut interner).is_ok());
+
+        let twice: Vec<&'static BuiltinRow> = method.iter().chain(method.iter()).copied().collect();
+        let duplicate = kernel_type_exports(&twice, &[], &index, &mut interner);
+        assert!(is_bug(&duplicate), "a duplicate export");
+
+        let empty = KernelModuleIndex::default();
+        let stray_spelling = kernel_type_exports(&method, &[], &empty, &mut interner);
+        assert!(
+            is_bug(&stray_spelling),
+            "a spelling naming no kernel module"
+        );
+        let stray_alias = kernel_type_exports(&[], KERNEL_TYPE_ALIASES, &empty, &mut interner);
+        assert!(is_bug(&stray_alias), "an alias naming no kernel module");
+
+        let duration_index = http_index("Ipe.Duration", &mut interner)?;
+        let duration = row("Duration");
+        assert_eq!(duration.len(), 1, "the `Duration` row exists");
+        let homed = kernel_type_exports(&duration, &[], &duration_index, &mut interner);
+        assert!(is_bug(&homed), "a row whose scheme mints a module home");
+        Ok(())
+    }
+
+    #[test]
+    fn http_exports_the_response_alias_and_its_builtin_rows() -> DResult<()> {
+        let mut interner = Interner::new();
+        let env = Env::initial(Vec::new(), &mut interner)?;
+        let http = interner.intern("Http")?;
+        let exports = env.kernel_types.get(&KernelModule(http));
+        assert!(matches!(
+            exports.and_then(|types| types.get("HttpResponse")),
+            Some(KernelTypeExport::Alias(_))
+        ));
+        assert!(matches!(
+            exports.and_then(|types| types.get("RedirectPolicy")),
+            Some(KernelTypeExport::Builtin(_))
+        ));
+        assert!(exports.and_then(|types| types.get("Int")).is_none());
+        Ok(())
     }
 }

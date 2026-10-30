@@ -143,11 +143,10 @@ impl Builder<'_> {
                     && args.is_empty()
                     && self.interner.resolve(name) == Some("HttpRequest")
                 {
-                    // `HttpRequest` is a stdlib type alias for a structural record
-                    // (`{ body, headers, method, redirects, timeout, url }`).  The Rust port has no Ipê-source stdlib
-                    // files, so the canonicaliser never registers `HttpRequest` as a
-                    // type alias — it falls through to an opaque `Con`.  Expand it
-                    // here so user annotations like `upstreamRequest : HttpRequest`
+                    // `HttpRequest` is a builtin row standing for a structural record
+                    // (`{ body, headers, method, redirects, timeout, url }`); canon
+                    // mints it as an opaque empty-home `Con`.  Expand it here so
+                    // user annotations like `upstreamRequest : HttpRequest`
                     // unify with the structural record that kernels such as
                     // `HttpStreamOpen` / `HttpGet` / `HttpPost` expect.
                     //
@@ -184,31 +183,6 @@ impl Builder<'_> {
                     Ok(Ty::Record(req_fields, RowTail::Closed))
                 } else if module.is_empty()
                     && args.is_empty()
-                    && self.interner.resolve(name) == Some("HttpResponse")
-                {
-                    // `HttpResponse` is a stdlib type alias for `{ body : String,
-                    // headers : Dict String String, status : Int }`.  Expand for the
-                    // same reason — and under the same empty-home identity guard —
-                    // as `HttpRequest` above.
-                    let mk = |n: Symbol| Ty::Con {
-                        module: Vec::new(),
-                        name: n,
-                        args: Vec::new(),
-                    };
-                    let string = || mk(self.builtins.string);
-                    let int = || mk(self.builtins.int);
-                    let dict = |k: Ty, v: Ty| Ty::Con {
-                        module: Vec::new(),
-                        name: self.builtins.dict,
-                        args: vec![k, v],
-                    };
-                    let mut resp_fields = BTreeMap::new();
-                    resp_fields.insert(self.builtins.http_f_body, string());
-                    resp_fields.insert(self.builtins.http_f_headers, dict(string(), string()));
-                    resp_fields.insert(self.builtins.http_f_status, int());
-                    Ok(Ty::Record(resp_fields, RowTail::Closed))
-                } else if module.is_empty()
-                    && args.is_empty()
                     && self.interner.resolve(name) == Some("Response")
                 {
                     // `Ipe.Http.Server.Response` is a record alias
@@ -216,7 +190,7 @@ impl Builder<'_> {
                     // String, contentType : String }` (reference
                     // `Ipê/Http/Server.ipe:66`). Expand structurally — same
                     // mechanism and same empty-home identity guard as
-                    // `HttpResponse` above — so a handler can build it as a record
+                    // `HttpRequest` above — so a handler can build it as a record
                     // literal and read fields off it. A user's own qualified
                     // `Response` (non-empty module home) is not touched.
                     let mk = |n: Symbol| Ty::Con {

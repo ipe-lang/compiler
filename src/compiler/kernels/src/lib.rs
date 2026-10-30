@@ -760,6 +760,157 @@ pub enum RowTailShape {
     Open(u8),
 }
 
+/// `Ipe.Http`'s `HttpResponse { body, headers, status }`.
+///
+/// One value is both the exported alias body and the result the `Http` request
+/// kernels return.
+pub const HTTP_RESPONSE: TyShape = TyShape::Record {
+    fields: &[
+        (FieldTag::HttpBody, &TyShape::Con(BuiltinTag::String, &[])),
+        (
+            FieldTag::HttpHeaders,
+            &TyShape::Con(
+                BuiltinTag::Dict,
+                &[
+                    TyShape::Con(BuiltinTag::String, &[]),
+                    TyShape::Con(BuiltinTag::String, &[]),
+                ],
+            ),
+        ),
+        (FieldTag::HttpStatus, &TyShape::Con(BuiltinTag::Int, &[])),
+    ],
+    tail: RowTailShape::Closed,
+};
+
+/// A type alias a stdlib kernel module exports.
+///
+/// `module` is the canonical qualifier of the exporting module (`"Http"`);
+/// the body is closed and parameterless.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct KernelTypeAlias {
+    /// The canonical qualifier of the exporting kernel module.
+    pub module: &'static str,
+    /// The alias name.
+    pub name: &'static str,
+    /// The alias body.
+    pub body: &'static TyShape,
+}
+
+/// Every type alias a stdlib kernel module exports.
+pub const KERNEL_TYPE_ALIASES: &[KernelTypeAlias] = &[KernelTypeAlias {
+    module: "Http",
+    name: "HttpResponse",
+    body: &HTTP_RESPONSE,
+}];
+
+/// Byte equality of two strings, usable in a `const` context.
+const fn alias_str_eq(a: &str, b: &str) -> bool {
+    let (mut a, mut b) = (a.as_bytes(), b.as_bytes());
+    loop {
+        match (a.split_first(), b.split_first()) {
+            (Some((x, a_rest)), Some((y, b_rest))) => {
+                if *x != *y {
+                    return false;
+                }
+                a = a_rest;
+                b = b_rest;
+            }
+            (None, None) => return true,
+            _ => return false,
+        }
+    }
+}
+
+/// Whether no two aliases share a `(module, name)` pair.
+const fn alias_pairs_unique(aliases: &[KernelTypeAlias]) -> bool {
+    let mut rest = aliases;
+    while let Some((first, more)) = rest.split_first() {
+        let mut others = more;
+        while let Some((other, tail)) = others.split_first() {
+            if alias_str_eq(first.module, other.module) && alias_str_eq(first.name, other.name) {
+                return false;
+            }
+            others = tail;
+        }
+        rest = more;
+    }
+    true
+}
+
+/// Whether `shape` is a closed tree of empty-home builtin constructors.
+///
+/// A `Con` must name a tag whose scheme home is [`KernelHome::Builtin`]; a
+/// `Var`, a `Fun` and a record are refused.
+const fn alias_tree_closed(shape: &TyShape) -> bool {
+    match shape {
+        TyShape::Con(tag, args) => {
+            if !matches!(tag.scheme_home(), KernelHome::Builtin) {
+                return false;
+            }
+            alias_trees_closed(args)
+        }
+        TyShape::Tuple(items) => alias_trees_closed(items),
+        TyShape::Unit => true,
+        TyShape::Fun(..) | TyShape::Record { .. } | TyShape::Var(_) => false,
+    }
+}
+
+/// Whether every shape in `shapes` is a closed builtin tree.
+const fn alias_trees_closed(shapes: &[TyShape]) -> bool {
+    let mut rest = shapes;
+    while let Some((first, more)) = rest.split_first() {
+        if !alias_tree_closed(first) {
+            return false;
+        }
+        rest = more;
+    }
+    true
+}
+
+/// Whether every alias body is a closed record of trees, or a tree.
+const fn alias_bodies_closed(aliases: &[KernelTypeAlias]) -> bool {
+    let mut rest = aliases;
+    while let Some((alias, more)) = rest.split_first() {
+        let closed = match alias.body {
+            TyShape::Record {
+                fields,
+                tail: RowTailShape::Closed,
+            } => {
+                let mut fs: &[(FieldTag, &TyShape)] = fields;
+                let mut ok = true;
+                while let Some(((_, field), tail)) = fs.split_first() {
+                    if !alias_tree_closed(field) {
+                        ok = false;
+                    }
+                    fs = tail;
+                }
+                ok
+            }
+            TyShape::Record { .. } => false,
+            other => alias_tree_closed(other),
+        };
+        if !closed {
+            return false;
+        }
+        rest = more;
+    }
+    true
+}
+
+// IPE-RUST-AUDIT:ACCEPTED (Arthur Maciel) — compile-time `const` assertion (not a runtime panic); fails the BUILD if two kernel aliases share a `(module, name)` pair [ledger #boundary]
+#[allow(clippy::assertions_on_constants)] // the constant IS the tripwire
+const _: () = assert!(
+    alias_pairs_unique(KERNEL_TYPE_ALIASES),
+    "two KERNEL_TYPE_ALIASES rows share a (module, name) pair",
+);
+
+// IPE-RUST-AUDIT:ACCEPTED (Arthur Maciel) — compile-time `const` assertion (not a runtime panic); fails the BUILD if a kernel alias body holds a variable, an arrow, an open row or a module-homed constructor [ledger #boundary]
+#[allow(clippy::assertions_on_constants)] // the constant IS the tripwire
+const _: () = assert!(
+    alias_bodies_closed(KERNEL_TYPE_ALIASES),
+    "a KERNEL_TYPE_ALIASES body is not a closed tree of empty-home builtins",
+);
+
 /// Whether scheme variable `var` occurs in `shape` at a position that aligns positionally with a solved type.
 ///
 /// An arrow side, a constructor argument, and a tuple element align by
@@ -1683,7 +1834,7 @@ const _: () = assert!(
 /// One variant per distinct field name a migrated record family uses; a field
 /// symbol shared across families (e.g. `label` between the `Input` config
 /// records) resolves to one tag.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, strum::EnumIter)]
 pub enum FieldTag {
     // ── Ipe.Db.Migration ──
     /// `"name"`.
@@ -1868,6 +2019,103 @@ pub enum FieldTag {
     /// `"output"` — `Process.runInPty` output: the combined stream read from the
     /// pty master until the child exits.
     ProcessOutput,
+}
+
+impl FieldTag {
+    /// The field's source spelling.
+    #[must_use]
+    pub const fn text(self) -> &'static str {
+        match self {
+            Self::MigrationName => "name",
+            Self::MigrationSql => "sql",
+            Self::HttpBody => "body",
+            Self::HttpHeaders => "headers",
+            Self::HttpStatus => "status",
+            Self::HttpMethod => "method",
+            Self::HttpUrl => "url",
+            Self::HttpTimeout => "timeout",
+            Self::HttpRedirects => "redirects",
+            Self::ServerContentType => "contentType",
+            Self::CsvHeader => "header",
+            Self::CsvRows => "rows",
+            Self::CacheMaxEntries => "maxEntries",
+            Self::CacheTtlMs => "ttlMs",
+            Self::CacheMaxBytes => "maxBytes",
+            Self::CacheHits => "hits",
+            Self::CacheMisses => "misses",
+            Self::CacheEvictions => "evictions",
+            Self::WsUrl => "url",
+            Self::WsHeaders => "headers",
+            Self::WsTimeout => "timeout",
+            Self::WsPingInterval => "pingInterval",
+            Self::EmailFrom => "from",
+            Self::EmailTo => "to",
+            Self::EmailCc => "cc",
+            Self::EmailBcc => "bcc",
+            Self::EmailSubject => "subject",
+            Self::EmailTextBody => "textBody",
+            Self::EmailHtmlBody => "htmlBody",
+            Self::EmailAttachments => "attachments",
+            Self::EmailReplyTo => "replyTo",
+            Self::EmailFilename => "filename",
+            Self::EmailMimeType => "mimeType",
+            Self::EmailContent => "content",
+            Self::RetryBaseMs => "baseMs",
+            Self::RetryMaxAttempts => "maxAttempts",
+            Self::RetryShouldRetry => "shouldRetry",
+            Self::RetryStrategy => "strategy",
+            Self::LayoutWrapperAttrs => "wrapperAttrs",
+            Self::LayoutRootAttrs => "rootAttrs",
+            Self::ButtonOnPress => "onPress",
+            Self::Label => "label",
+            Self::AppInit => "init",
+            Self::AppUpdate => "update",
+            Self::AppView => "view",
+            Self::AppSubscriptions => "subscriptions",
+            Self::AppRoutes => "routes",
+            Self::AppNotFound => "notFound",
+            Self::TerminalKeyKind => "kind",
+            Self::TerminalKeyValue => "value",
+            Self::EdgeTop => "top",
+            Self::EdgeRight => "right",
+            Self::EdgeBottom => "bottom",
+            Self::EdgeLeft => "left",
+            Self::InputOnChange => "onChange",
+            Self::InputText => "text",
+            Self::InputPlaceholder => "placeholder",
+            Self::InputIcon => "icon",
+            Self::InputChecked => "checked",
+            Self::InputSpellcheck => "spellcheck",
+            Self::InputValue => "value",
+            Self::InputMin => "min",
+            Self::InputMax => "max",
+            Self::InputStep => "step",
+            Self::InputOptions => "options",
+            Self::InputSelected => "selected",
+            Self::ShadowOffsetX => "offsetX",
+            Self::ShadowOffsetY => "offsetY",
+            Self::ShadowBlur => "blur",
+            Self::ShadowSpread => "spread",
+            Self::ShadowColor => "color",
+            Self::ImageSrc => "src",
+            Self::ImageDescription => "description",
+            Self::ProcessCommand => "command",
+            Self::ProcessArgs => "args",
+            Self::ProcessCwd => "cwd",
+            Self::ProcessEnv => "env",
+            Self::ProcessExitCode => "exitCode",
+            Self::ProcessStdout => "stdout",
+            Self::ProcessStderr => "stderr",
+            Self::ProcessCols => "cols",
+            Self::ProcessRows => "rows",
+            Self::ProcessOutput => "output",
+        }
+    }
+
+    /// Every field tag.
+    pub fn all() -> impl Iterator<Item = Self> {
+        <Self as strum::IntoEnumIterator>::iter()
+    }
 }
 
 /// The whole kernel "row" as one descriptor.
@@ -11501,15 +11749,6 @@ impl StdlibKernel {
             ],
             tail: RowTailShape::Closed,
         };
-        // `HttpResponse { body, headers, status }`.
-        const HTTP_RESPONSE: TyShape = TyShape::Record {
-            fields: &[
-                (FieldTag::HttpBody, &STRING),
-                (FieldTag::HttpHeaders, &DICT_STRING_STRING),
-                (FieldTag::HttpStatus, &INT),
-            ],
-            tail: RowTailShape::Closed,
-        };
         const REDIRECT_POLICY: TyShape = TyShape::Con(BuiltinTag::RedirectPolicy, &[]);
         const DURATION: TyShape = TyShape::Con(BuiltinTag::Duration, &[]);
         // `HttpRequest { body, headers, method, url, timeout, redirects }`.
@@ -20394,5 +20633,89 @@ mod tests {
         assert!(over.overflowed());
         assert!(!over.contains(CallbackResults::CAPACITY));
         assert_eq!(over.vars().count(), 2);
+    }
+
+    mod kernel_type_aliases {
+        use super::super::{
+            BuiltinTag, FieldTag, HTTP_RESPONSE, KERNEL_TYPE_ALIASES, KernelTypeAlias,
+            RowTailShape, TyShape, alias_bodies_closed, alias_pairs_unique,
+        };
+
+        const fn alias(
+            module: &'static str,
+            name: &'static str,
+            body: &'static TyShape,
+        ) -> KernelTypeAlias {
+            KernelTypeAlias { module, name, body }
+        }
+
+        #[test]
+        fn kernel_type_alias_table_refuses_a_duplicate_a_var_and_a_homed_tag() {
+            assert!(alias_pairs_unique(KERNEL_TYPE_ALIASES));
+            assert!(alias_bodies_closed(KERNEL_TYPE_ALIASES));
+            assert!(
+                !alias_pairs_unique(&[
+                    alias("Http", "HttpResponse", &HTTP_RESPONSE),
+                    alias("Http", "HttpResponse", &TyShape::Unit),
+                ]),
+                "a repeated (module, name) pair"
+            );
+            assert!(
+                alias_pairs_unique(&[
+                    alias("Http", "HttpResponse", &HTTP_RESPONSE),
+                    alias("Db", "HttpResponse", &HTTP_RESPONSE),
+                ]),
+                "one name under two modules"
+            );
+            let refused: [(&'static TyShape, &str); 5] = [
+                (&TyShape::Var(0), "a variable body"),
+                (
+                    &TyShape::Con(BuiltinTag::List, &[TyShape::Var(0)]),
+                    "a variable argument",
+                ),
+                (
+                    &TyShape::Fun(&TyShape::Unit, &TyShape::Unit),
+                    "an arrow body",
+                ),
+                (
+                    &TyShape::Record {
+                        fields: &[(FieldTag::HttpBody, &TyShape::Unit)],
+                        tail: RowTailShape::Open(0),
+                    },
+                    "an open record",
+                ),
+                (
+                    &TyShape::Con(BuiltinTag::Duration, &[]),
+                    "a module-homed constructor",
+                ),
+            ];
+            for (body, why) in refused {
+                assert!(!alias_bodies_closed(&[alias("Http", "Bad", body)]), "{why}");
+            }
+            assert!(alias_bodies_closed(&[alias(
+                "Http",
+                "Pair",
+                &TyShape::Tuple(&[TyShape::Unit, TyShape::Con(BuiltinTag::Int, &[])]),
+            )]));
+        }
+
+        #[test]
+        fn field_tag_text_is_total_and_well_formed() {
+            let mut count = 0_usize;
+            for tag in FieldTag::all() {
+                let text = tag.text();
+                count += 1;
+                let mut chars = text.chars();
+                assert!(
+                    chars.next().is_some_and(|c| c.is_ascii_lowercase()),
+                    "{tag:?} spells {text:?}"
+                );
+                assert!(
+                    chars.all(|c| c.is_ascii_alphanumeric() || c == '_'),
+                    "{tag:?} spells {text:?}"
+                );
+            }
+            assert!(count > 0);
+        }
     }
 }

@@ -790,6 +790,35 @@ pub struct Builtins {
     /// `Remote` and `RemoteAuth` ADTs, so a type naming either is the type
     /// `Ipe.Remote` declares (mirrors [`Self::duration_home`]).
     pub remote_home: Vec<Symbol>,
+    /// Each module scheme home a [`BuiltinTag::scheme_home`] names, keyed by its
+    /// dotted path, as interned segments.
+    pub scheme_homes: std::collections::BTreeMap<&'static str, Vec<Symbol>>,
+}
+
+/// Intern the segments of every module scheme home a builtin tag names.
+///
+/// # Errors
+///
+/// Fails when the interner refuses a segment.
+fn scheme_homes(
+    interner: &mut Interner,
+) -> DResult<std::collections::BTreeMap<&'static str, Vec<Symbol>>> {
+    let mut homes = std::collections::BTreeMap::new();
+    for row in ipe_kernels::BUILTIN_TYPES {
+        let Some(tag) = row.tag() else { continue };
+        let ipe_kernels::KernelHome::Module(path) = tag.scheme_home() else {
+            continue;
+        };
+        if homes.contains_key(path) {
+            continue;
+        }
+        let mut segments = Vec::new();
+        for segment in path.split('.') {
+            segments.push(interner.intern(segment)?);
+        }
+        homes.insert(path, segments);
+    }
+    Ok(homes)
 }
 
 impl Builtins {
@@ -1104,6 +1133,7 @@ impl Builtins {
             duration_home: vec![interner.intern("Ipe")?, interner.intern("Duration")?],
             task_home: vec![interner.intern("Ipe")?, interner.intern("Task")?],
             remote_home: vec![interner.intern("Ipe")?, interner.intern("Remote")?],
+            scheme_homes: scheme_homes(interner)?,
         })
     }
 
