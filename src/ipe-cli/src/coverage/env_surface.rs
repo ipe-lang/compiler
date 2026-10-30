@@ -19,6 +19,7 @@ use std::sync::Arc;
 use ipe_docs::env_vars::{ENV_VARS, EXCLUDED_NAMES, EnvVar};
 
 use crate::coverage::contract::Surface;
+use crate::coverage::error::CoverageError;
 use crate::coverage::source_tree::{TreeRefusal, for_each_source};
 
 /// One item of the env-var surface: a registry entry, or an orphan read.
@@ -57,40 +58,47 @@ impl Surface for EnvVarSurface {
         "env-var"
     }
 
-    fn all(&self) -> Vec<EnvItem> {
-        let registered: BTreeSet<&'static str> = ENV_VARS.iter().map(|v| v.name).collect();
-        let excluded: BTreeSet<&'static str> = EXCLUDED_NAMES.iter().copied().collect();
-
-        let mut items: Vec<EnvItem> = ENV_VARS.iter().map(EnvItem::Registered).collect();
-
-        // Orphan reads: a variable a Rust `read_env_var`/`env::var` call reads
-        // that neither the registry nor the exclusion list homes. Scoped to Rust
-        // read *calls* (not every `IPE_*` mention) so a doc string, a template
-        // placeholder, or a build-script variable is not a false orphan. A
-        // tree that cannot be read whole names no orphan; the read-in-code
-        // column then holes every registered variable with the cause.
-        let scan = SourceReads::scan();
-        if let Ok(reads) = scan.env_reads() {
-            for name in reads {
-                if !registered.contains(name.as_str()) && !excluded.contains(name.as_str()) {
-                    items.push(EnvItem::OrphanRead(name.clone()));
-                }
-            }
-        }
-
-        // Deterministic order: by name, registry entries before an orphan of the
-        // same name (an orphan never shares a registered name by construction).
-        items.sort_by(|a, b| {
-            a.name()
-                .cmp(b.name())
-                .then_with(|| kind_rank(a).cmp(&kind_rank(b)))
-        });
-        items
+    fn all(&self) -> Result<Vec<EnvItem>, CoverageError> {
+        items_from(&SourceReads::scan())
     }
 
     fn label(item: &EnvItem) -> String {
         item.name().to_owned()
     }
+}
+
+/// The env-var surface over one completed source scan.
+///
+/// # Errors
+/// [`CoverageError::EnvScan`] when `scan` could not read the tree whole.
+fn items_from(scan: &SourceReads) -> Result<Vec<EnvItem>, CoverageError> {
+    let registered: BTreeSet<&'static str> = ENV_VARS.iter().map(|v| v.name).collect();
+    let excluded: BTreeSet<&'static str> = EXCLUDED_NAMES.iter().copied().collect();
+
+    let mut items: Vec<EnvItem> = ENV_VARS.iter().map(EnvItem::Registered).collect();
+
+    // Orphan reads: a variable a Rust `read_env_var`/`env::var` call reads
+    // that neither the registry nor the exclusion list homes. Scoped to Rust
+    // read *calls* (not every `IPE_*` mention) so a doc string, a template
+    // placeholder, or a build-script variable is not a false orphan. A tree
+    // that cannot be read whole must refuse the whole surface — silently
+    // reporting zero orphans here would be a false "no orphan reads" pass
+    // over a scan that never actually ran.
+    let reads = scan.env_reads().map_err(CoverageError::EnvScan)?;
+    for name in reads {
+        if !registered.contains(name.as_str()) && !excluded.contains(name.as_str()) {
+            items.push(EnvItem::OrphanRead(name.clone()));
+        }
+    }
+
+    // Deterministic order: by name, registry entries before an orphan of the
+    // same name (an orphan never shares a registered name by construction).
+    items.sort_by(|a, b| {
+        a.name()
+            .cmp(b.name())
+            .then_with(|| kind_rank(a).cmp(&kind_rank(b)))
+    });
+    Ok(items)
 }
 
 /// Sort tie-break: a registry entry sorts before an orphan of the same name.
@@ -121,7 +129,7 @@ const fn kind_rank(item: &EnvItem) -> u8 {
 /// tree that cannot be read whole answers every question with its refusal.
 #[derive(Clone, Debug)]
 pub struct SourceReads {
-    inner: Arc<Result<SourceReadsInner, TreeRefusal>>,
+    inner: Result<Arc<SourceReadsInner>, Arc<TreeRefusal>>,
 }
 
 #[derive(Debug, Default)]
@@ -146,29 +154,30 @@ impl SourceReads {
             .try_for_each(|root| scan_tree(root, &mut acc))
             .map(|()| {
                 acc.all_reads.extend(acc.rust_literals.iter().cloned());
-                SourceReadsInner {
+                Arc::new(SourceReadsInner {
                     rust_literals: acc.rust_literals,
                     all_reads: acc.all_reads,
                     hand_rolled_truthy: acc.hand_rolled_truthy,
-                }
-            });
-        Self {
-            inner: Arc::new(scanned),
-        }
-    }
-
-    /// The scan, or the refusal that kept it from reading every source file.
-    fn scanned(&self) -> Result<&SourceReadsInner, &TreeRefusal> {
-        self.inner.as_ref().as_ref()
+                })
+            })
+            .map_err(Arc::new);
+        Self { inner: scanned }
     }
 
     /// Names read via a Rust `"IPE_…"` literal — the orphan-read scope.
     ///
+    /// The error is an owned, cheaply-cloned `Arc` so a caller (such as
+    /// [`EnvVarSurface::all`]) can propagate it as a typed [`CoverageError`]
+    /// without a second scan.
+    ///
     /// # Errors
     ///
     /// The [`TreeRefusal`] that kept the scan from reading every source file.
-    pub fn env_reads(&self) -> Result<&BTreeSet<String>, &TreeRefusal> {
-        self.scanned().map(|inner| &inner.rust_literals)
+    pub fn env_reads(&self) -> Result<&BTreeSet<String>, Arc<TreeRefusal>> {
+        match &self.inner {
+            Ok(inner) => Ok(&inner.rust_literals),
+            Err(refusal) => Err(Arc::clone(refusal)),
+        }
     }
 
     /// Names read anywhere in the tree, Rust or shell — the read-in-code scope.
@@ -176,8 +185,11 @@ impl SourceReads {
     /// # Errors
     ///
     /// The [`TreeRefusal`] that kept the scan from reading every source file.
-    pub fn all_reads(&self) -> Result<&BTreeSet<String>, &TreeRefusal> {
-        self.scanned().map(|inner| &inner.all_reads)
+    pub fn all_reads(&self) -> Result<&BTreeSet<String>, Arc<TreeRefusal>> {
+        match &self.inner {
+            Ok(inner) => Ok(&inner.all_reads),
+            Err(refusal) => Err(Arc::clone(refusal)),
+        }
     }
 
     /// Whether any read site hand-rolls a `matches!(v, "1" | "true" | …)` truthy
@@ -186,8 +198,11 @@ impl SourceReads {
     /// # Errors
     ///
     /// The [`TreeRefusal`] that kept the scan from reading every source file.
-    pub fn has_hand_rolled_truthy(&self) -> Result<bool, &TreeRefusal> {
-        self.scanned().map(|inner| inner.hand_rolled_truthy)
+    pub fn has_hand_rolled_truthy(&self) -> Result<bool, Arc<TreeRefusal>> {
+        match &self.inner {
+            Ok(inner) => Ok(inner.hand_rolled_truthy),
+            Err(refusal) => Err(Arc::clone(refusal)),
+        }
     }
 }
 
@@ -324,6 +339,19 @@ mod tests {
     use super::*;
     use crate::coverage::columns_env::{ReadInCodeColumn, TruthyParseColumn};
     use crate::coverage::contract::{AspectCheck, Cell};
+
+    /// A tree the scan cannot read whole refuses the whole surface, never an
+    /// enumeration that silently reports zero orphan reads.
+    #[test]
+    fn an_unreadable_tree_refuses_the_surface_as_env_scan() {
+        let missing = ipe_test_temp::temp_root()
+            .join(format!("ipe-env-surface-refuse-{}", std::process::id()));
+        let result = items_from(&SourceReads::scan_roots(&[missing]));
+        assert!(
+            matches!(result, Err(CoverageError::EnvScan(_))),
+            "{result:?}"
+        );
+    }
 
     /// A tree the scan cannot read whole holes every registered variable with the
     /// cause, never "read nowhere" and never a clean truthy check.

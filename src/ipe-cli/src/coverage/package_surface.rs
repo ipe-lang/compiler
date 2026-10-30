@@ -42,6 +42,7 @@ use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
 use crate::coverage::contract::{AspectCheck, Cell, Surface};
+use crate::coverage::error::CoverageError;
 use crate::lockfile::{LockedOrigin, Lockfile};
 use crate::project::{IpeDep, ProjectManifest, RustDep};
 
@@ -107,10 +108,9 @@ impl Surface for PackageSurface {
         "package"
     }
 
-    fn all(&self) -> Vec<PackageItem> {
-        let Ok(manifest) = load_manifest(&self.project_root) else {
-            return Vec::new();
-        };
+    fn all(&self) -> Result<Vec<PackageItem>, CoverageError> {
+        let manifest =
+            load_manifest(&self.project_root).map_err(|e| CoverageError::Manifest(Box::new(e)))?;
 
         let mut items: Vec<PackageItem> = Vec::new();
 
@@ -138,7 +138,7 @@ impl Surface for PackageSurface {
                 .cmp(&b.name)
                 .then_with(|| kind_rank(&a.kind).cmp(&kind_rank(&b.kind)))
         });
-        items
+        Ok(items)
     }
 
     fn label(item: &PackageItem) -> String {
@@ -163,10 +163,13 @@ fn load_manifest(project_root: &Path) -> Result<ProjectManifest, crate::CliError
     crate::package_manifest::parse_package_manifest(&manifest_path)
 }
 
-/// Load and parse `ipe.lock` for the project, returning an empty lockfile when
-/// the file does not exist (a project with no locked deps yet is valid).
-fn load_lockfile(project_root: &Path) -> Lockfile {
-    Lockfile::read(project_root).unwrap_or_default()
+/// Load and parse `ipe.lock` for the project. A missing lockfile is an empty
+/// lockfile (a project with no locked deps yet is valid, per [`Lockfile::read`]);
+/// a lockfile present but malformed is a typed [`CoverageError`], never a
+/// silent empty-lockfile fallback that would hide every dep's pin behind a
+/// clean-looking "not yet locked" row.
+fn load_lockfile(project_root: &Path) -> Result<Lockfile, CoverageError> {
+    Lockfile::read(project_root).map_err(|e| CoverageError::Lockfile(Box::new(e)))
 }
 
 /// Index the lockfile by dep name for O(log n) per-item lookup.
@@ -190,13 +193,18 @@ fn lockfile_by_name(lf: &Lockfile) -> BTreeMap<&str, &crate::lockfile::LockedDep
 /// - Index or git-escape Ipê dep absent from the lockfile, or locked with a path
 ///   origin (a `local` rev) → [`Cell::Hole`].
 pub struct PinnedAndHashedColumn {
-    project_root: PathBuf,
+    lockfile: Lockfile,
 }
 
 impl PinnedAndHashedColumn {
-    #[must_use]
-    pub const fn new(project_root: PathBuf) -> Self {
-        Self { project_root }
+    /// Construct the column, reading and parsing `ipe.lock` once.
+    ///
+    /// # Errors
+    /// [`CoverageError::Lockfile`] if the lockfile exists but fails to parse.
+    pub fn new(project_root: &Path) -> Result<Self, CoverageError> {
+        Ok(Self {
+            lockfile: load_lockfile(project_root)?,
+        })
     }
 }
 
@@ -219,8 +227,7 @@ impl AspectCheck<PackageItem> for PinnedAndHashedColumn {
             );
         }
 
-        let lf = load_lockfile(&self.project_root);
-        let index = lockfile_by_name(&lf);
+        let index = lockfile_by_name(&self.lockfile);
 
         let Some(locked) = index.get(item.name.as_str()) else {
             return Cell::Hole(format!(
@@ -251,13 +258,18 @@ impl AspectCheck<PackageItem> for PinnedAndHashedColumn {
 /// native crates hand their requirement verbatim to cargo. All three return
 /// [`Cell::NotApplicable`].
 pub struct SemverSatisfiedColumn {
-    project_root: PathBuf,
+    lockfile: Lockfile,
 }
 
 impl SemverSatisfiedColumn {
-    #[must_use]
-    pub const fn new(project_root: PathBuf) -> Self {
-        Self { project_root }
+    /// Construct the column, reading and parsing `ipe.lock` once.
+    ///
+    /// # Errors
+    /// [`CoverageError::Lockfile`] if the lockfile exists but fails to parse.
+    pub fn new(project_root: &Path) -> Result<Self, CoverageError> {
+        Ok(Self {
+            lockfile: load_lockfile(project_root)?,
+        })
     }
 }
 
@@ -274,8 +286,7 @@ impl AspectCheck<PackageItem> for SemverSatisfiedColumn {
             );
         };
 
-        let lf = load_lockfile(&self.project_root);
-        let index = lockfile_by_name(&lf);
+        let index = lockfile_by_name(&self.lockfile);
 
         let Some(locked) = index.get(item.name.as_str()) else {
             // Not in the lockfile yet — pinned-and-hashed already flags this.
@@ -369,23 +380,30 @@ impl AspectCheck<PackageItem> for CapabilityDeclaredColumn {
 ///   next fetch; a missing cache is not a tampering signal).
 pub struct ProvenanceScannedColumn {
     project_root: PathBuf,
-    /// The shared verdict of `resolve::verify_lockfile_hashes`, computed once.
-    verdict: OnceLock<Result<(), String>>,
+    lockfile: Lockfile,
+    /// The shared verdict of `resolve::verify_locked_hashes`, computed once.
+    verdict: OnceLock<Result<(), crate::CliError>>,
 }
 
 impl ProvenanceScannedColumn {
-    #[must_use]
-    pub const fn new(project_root: PathBuf) -> Self {
-        Self {
+    /// Construct the column, reading and parsing `ipe.lock` once.
+    ///
+    /// # Errors
+    /// [`CoverageError::Lockfile`] if the lockfile exists but fails to parse.
+    pub fn new(project_root: PathBuf) -> Result<Self, CoverageError> {
+        let lockfile = load_lockfile(&project_root)?;
+        Ok(Self {
             project_root,
+            lockfile,
             verdict: OnceLock::new(),
-        }
+        })
     }
 
-    /// Run (or return the cached result of) the hash re-assertion.
-    fn verdict(&self) -> &Result<(), String> {
+    /// Run (or return the cached result of) the hash re-assertion, over the
+    /// lockfile already parsed at construction rather than reading it again.
+    fn verdict(&self) -> &Result<(), crate::CliError> {
         self.verdict.get_or_init(|| {
-            crate::resolve::verify_lockfile_hashes(&self.project_root).map_err(|e| e.to_string())
+            crate::resolve::verify_locked_hashes(&self.project_root, &self.lockfile)
         })
     }
 }
@@ -407,8 +425,7 @@ impl AspectCheck<PackageItem> for ProvenanceScannedColumn {
             );
         }
 
-        let lf = load_lockfile(&self.project_root);
-        let index = lockfile_by_name(&lf);
+        let index = lockfile_by_name(&self.lockfile);
 
         // A dep not yet in the lockfile is flagged by pinned-and-hashed; skip here.
         if !index.contains_key(item.name.as_str()) {
@@ -419,9 +436,9 @@ impl AspectCheck<PackageItem> for ProvenanceScannedColumn {
 
         match self.verdict() {
             Ok(()) => Cell::Ok,
-            Err(msg) => Cell::Hole(format!(
+            Err(err) => Cell::Hole(format!(
                 "lockfile hash re-assertion failed (at least one cached dep has \
-                 drifted from its pin): {msg}"
+                 drifted from its pin): {err}"
             )),
         }
     }
@@ -431,12 +448,117 @@ impl AspectCheck<PackageItem> for ProvenanceScannedColumn {
 
 /// Build the registered aspect columns for a `PackageSurface` rooted at
 /// `project_root`.
-#[must_use]
-pub fn package_columns(project_root: PathBuf) -> Vec<Box<dyn AspectCheck<PackageItem>>> {
-    vec![
-        Box::new(PinnedAndHashedColumn::new(project_root.clone())),
-        Box::new(SemverSatisfiedColumn::new(project_root.clone())),
+///
+/// # Errors
+/// [`CoverageError::Lockfile`] if `ipe.lock` exists but fails to parse.
+pub fn package_columns(
+    project_root: PathBuf,
+) -> Result<Vec<Box<dyn AspectCheck<PackageItem>>>, CoverageError> {
+    Ok(vec![
+        Box::new(PinnedAndHashedColumn::new(&project_root)?),
+        Box::new(SemverSatisfiedColumn::new(&project_root)?),
         Box::new(CapabilityDeclaredColumn::new(project_root.clone())),
-        Box::new(ProvenanceScannedColumn::new(project_root)),
-    ]
+        Box::new(ProvenanceScannedColumn::new(project_root)?),
+    ])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const HEADER: &str =
+        "module Package exposing (package)\n\nimport Ipe.Package exposing (..)\n\n\n";
+
+    /// A fresh, empty project directory under the OS temp root, unique per
+    /// test, removed when the guard drops.
+    struct Project(PathBuf);
+
+    impl Project {
+        fn new(tag: &str) -> Self {
+            let root = ipe_test_temp::temp_root()
+                .join(format!("ipe-package-surface-{tag}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&root);
+            std::fs::create_dir_all(&root).expect("create fresh project root");
+            Self(root)
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for Project {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// A minimal, validly-parsing `package.ipe` with no declared deps.
+    fn write_minimal_manifest(root: &Path) {
+        std::fs::write(
+            root.join(crate::package_manifest::PACKAGE_IPE),
+            format!("{HEADER}package : Package\npackage =\n    {{ name = \"app\" }}\n"),
+        )
+        .expect("write package.ipe");
+    }
+
+    /// A malformed `package.ipe` must refuse the whole surface with a typed
+    /// [`CoverageError::Manifest`], never a silently empty item list (the
+    /// fail-open `let Ok(..) = .. else { return Vec::new() }` this replaced).
+    #[test]
+    fn a_malformed_manifest_is_a_typed_manifest_error() {
+        let project = Project::new("bad-manifest");
+        let root = project.path().to_path_buf();
+        std::fs::write(
+            root.join(crate::package_manifest::PACKAGE_IPE),
+            format!("{HEADER}package : Package\npackage =\n    {{ this is not valid"),
+        )
+        .expect("write a malformed package.ipe");
+
+        let surface = PackageSurface::new(root);
+        assert!(matches!(surface.all(), Err(CoverageError::Manifest(_))));
+    }
+
+    /// A malformed `ipe.lock` must refuse the lockfile-reading columns with a
+    /// typed [`CoverageError::Lockfile`], never the silent empty-lockfile
+    /// fallback that would report every dep as cleanly unpinned instead of
+    /// naming the parse failure.
+    #[test]
+    fn a_malformed_lockfile_is_a_typed_lockfile_error_not_an_empty_lockfile() {
+        let project = Project::new("bad-lockfile");
+        let root = project.path().to_path_buf();
+        write_minimal_manifest(&root);
+        std::fs::write(
+            root.join(crate::lockfile::LOCKFILE_NAME),
+            "[[package]]\nname = \"left-pad\"\n",
+        )
+        .expect("write a malformed ipe.lock");
+
+        assert!(matches!(
+            PinnedAndHashedColumn::new(&root),
+            Err(CoverageError::Lockfile(_))
+        ));
+        assert!(matches!(
+            SemverSatisfiedColumn::new(&root),
+            Err(CoverageError::Lockfile(_))
+        ));
+        assert!(matches!(
+            ProvenanceScannedColumn::new(root),
+            Err(CoverageError::Lockfile(_))
+        ));
+    }
+
+    /// A project with no `ipe.lock` at all is a valid, empty lockfile — not an
+    /// error. Confirms decision D-package: only a malformed lockfile refuses;
+    /// an absent one is the ordinary "nothing locked yet" state.
+    #[test]
+    fn a_missing_lockfile_is_not_an_error() {
+        let project = Project::new("no-lockfile");
+        let root = project.path().to_path_buf();
+        write_minimal_manifest(&root);
+
+        assert!(PinnedAndHashedColumn::new(&root).is_ok());
+        assert!(SemverSatisfiedColumn::new(&root).is_ok());
+        assert!(ProvenanceScannedColumn::new(root).is_ok());
+    }
 }

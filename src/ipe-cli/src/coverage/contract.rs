@@ -12,6 +12,11 @@
 //! stdlib surface. An [`AspectCheck`] renders one column, returning a [`Cell`]
 //! per symbol. A [`Cell::Hole`] fails the gate; a [`Cell::Warn`] is advisory
 //! debt; [`Cell::Ok`] and [`Cell::NotApplicable`] pass.
+//!
+//! [`Surface::all`] is fallible: a probe that cannot enumerate its registry
+//! (a module that fails to parse, a table that fails to materialize) must
+//! refuse with a [`crate::coverage::error::CoverageError`] rather than return
+//! an empty or partial `Vec` that the runner would read as "nothing here."
 
 /// Which namespace of the exported surface a symbol belongs to.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug, Hash)]
@@ -48,10 +53,23 @@ pub struct StdlibSymbol {
     pub has_compiled_source: bool,
     /// Listed in its module's `exposing (...)` — reachable by an importer.
     pub exported: bool,
-    /// The α-canonical typed scheme string, when the symbol is typeable.
-    pub scheme: Option<String>,
+    /// The symbol's α-canonical typed scheme, or the explicit absence a
+    /// kernel the registry declares unschemed carries.
+    pub scheme: SchemeState,
     /// The scheme takes or returns a function — drives the composition column.
     pub is_higher_order: bool,
+}
+
+/// Whether a stdlib symbol's α-canonical typed scheme is known.
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug)]
+pub enum SchemeState {
+    /// The rendered α-canonical scheme string.
+    Rendered(String),
+    /// No scheme applies or resolves — a type/constructor symbol, a
+    /// compiled-source value whose projected interface carries no signature,
+    /// or a kernel the registry declares unschemed (a routed/unlowered
+    /// bucket `IPE-L0108` refuses at its call sites).
+    Unschemed,
 }
 
 /// An enumerable registry of items.
@@ -66,7 +84,12 @@ pub trait Surface: Sync {
     /// A human name for the surface, used in the rendered matrix header.
     fn name(&self) -> &'static str;
     /// Every item of the surface, in a deterministic, sorted order.
-    fn all(&self) -> Vec<Self::Item>;
+    ///
+    /// # Errors
+    /// A [`crate::coverage::error::CoverageError`] when the surface cannot be
+    /// fully enumerated — never a partial or empty `Vec` standing in for the
+    /// failure.
+    fn all(&self) -> Result<Vec<Self::Item>, crate::coverage::error::CoverageError>;
     /// The display label of an item, naming its row in a hole coordinate (a
     /// dotted symbol path for the stdlib surface, a variable name for the
     /// env-var surface).

@@ -10,6 +10,7 @@ use ipe_canon::STDLIB_MODULE_QUALIFIERS;
 
 use crate::api_surface::{self, DiffError, PublicApi};
 use crate::coverage::contract::{AspectCheck, Cell, StdlibSymbol, SymbolKind};
+use crate::coverage::error::CoverageError;
 
 /// The set of dotted module names that are compiled-source modules.
 fn compiled_source_modules() -> BTreeSet<Vec<String>> {
@@ -84,12 +85,12 @@ struct ModuleProjections {
 
 /// Why a compiled-source module did not project — the closed-scheme-relevant
 /// distinction, reduced from [`DiffError`] to what the columns report.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 enum ProjectionFailure {
     /// The module's interface is open — a scheme reaches a residual variable.
     Open,
     /// The module did not typecheck, or another extraction error.
-    Other(String),
+    Other(DiffError),
 }
 
 impl ModuleProjections {
@@ -100,7 +101,7 @@ impl ModuleProjections {
             let outcome =
                 api_surface::extract_stdlib_module(&segments, module.source).map_err(|e| match e {
                     DiffError::OpenInterface { .. } => ProjectionFailure::Open,
-                    other => ProjectionFailure::Other(other.to_string()),
+                    other => ProjectionFailure::Other(other),
                 });
             outcomes.insert(segments, outcome);
         }
@@ -261,6 +262,7 @@ impl AspectCheck<StdlibSymbol> for ClosedSchemeColumn {
 /// payload arity matching what the projected union declares; a mismatch, or a
 /// constructor the canon table forgot for a builtin-union type, is a hole. A
 /// constructor of a user-declared (non-builtin) union is `NotApplicable`.
+#[derive(Debug)]
 pub struct LayerAgreementColumn {
     /// Canon builtin `(type name, ctor name)` → payload arity.
     canon_arities: BTreeMap<(String, String), usize>,
@@ -270,8 +272,19 @@ pub struct LayerAgreementColumn {
 }
 
 impl LayerAgreementColumn {
-    #[must_use]
-    pub fn new() -> Self {
+    /// # Errors
+    /// [`CoverageError::Extract`] if a compiled-source module fails to extract
+    /// its typed interface — a module dropped here would silently lose its
+    /// constructors from the cross-layer arity check rather than naming the
+    /// failure.
+    pub fn new() -> Result<Self, CoverageError> {
+        Self::build_from(ipe_stdlib::COMPILED_STD_MODULES)
+    }
+
+    /// The parametrized core of [`Self::new`], over an explicit module list so
+    /// a refusal test can inject one that fails to extract without touching
+    /// the real [`ipe_stdlib::COMPILED_STD_MODULES`] table.
+    fn build_from(modules: &[ipe_stdlib::CompiledStdModule]) -> Result<Self, CoverageError> {
         let mut canon_arities = BTreeMap::new();
         // The exact constructor NAME SET canon declares per builtin union — the
         // fingerprint that distinguishes the genuine builtin from a module-local
@@ -293,11 +306,15 @@ impl LayerAgreementColumn {
         }
 
         let mut projected = BTreeMap::new();
-        for module in ipe_stdlib::COMPILED_STD_MODULES {
+        for module in modules {
             let segments: Vec<String> = module.dotted.split('.').map(str::to_owned).collect();
-            let Ok(api) = api_surface::extract_stdlib_module(&segments, module.source) else {
-                continue;
-            };
+            let api =
+                api_surface::extract_stdlib_module(&segments, module.source).map_err(|source| {
+                    CoverageError::Extract {
+                        module: segments.clone(),
+                        source,
+                    }
+                })?;
             for (path, module_api) in &api.modules {
                 for (type_name, union) in &module_api.unions {
                     // A projected union is the genuine builtin only when its
@@ -322,16 +339,10 @@ impl LayerAgreementColumn {
             }
         }
 
-        Self {
+        Ok(Self {
             canon_arities,
             projected,
-        }
-    }
-}
-
-impl Default for LayerAgreementColumn {
-    fn default() -> Self {
-        Self::new()
+        })
     }
 }
 
@@ -376,5 +387,31 @@ impl AspectCheck<StdlibSymbol> for LayerAgreementColumn {
                 type_name, sym.name
             )),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A module that fails to extract must refuse the whole column with a typed
+    /// error, never silently drop the module's constructors from the
+    /// cross-layer arity check (the fail-open `let Ok(..) = .. else { continue }`
+    /// this replaced).
+    #[test]
+    fn a_module_that_fails_to_extract_is_a_typed_error_not_a_dropped_row() {
+        let modules = [ipe_stdlib::CompiledStdModule {
+            dotted: "Ipe.CoverageTestBroken",
+            source: "module Ipe.CoverageTestBroken exposing (broken)\n\nbroken : Int\nbroken = \"not an Int\"\n",
+        }];
+        let result = LayerAgreementColumn::build_from(&modules);
+        assert!(
+            matches!(
+                &result,
+                Err(CoverageError::Extract { module, .. })
+                    if module.last().map(String::as_str) == Some("CoverageTestBroken")
+            ),
+            "expected a typed CoverageError::Extract naming the broken module, got {result:?}"
+        );
     }
 }

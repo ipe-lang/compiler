@@ -19,7 +19,9 @@ use ipe_kernels::Capability;
 
 #[test]
 fn foreign_surface_is_non_empty() {
-    let items = ForeignSurface.all();
+    let items = ForeignSurface
+        .all()
+        .expect("the live foreign surface must enumerate");
     assert!(
         !items.is_empty(),
         "the foreign surface must enumerate at least one capability axis",
@@ -30,7 +32,9 @@ fn foreign_surface_is_non_empty() {
 fn foreign_surface_matches_capability_all() {
     // The surface is a direct mapping of `Capability::ALL` — the two must agree
     // so no axis can be added to the vocabulary without appearing on the surface.
-    let surface_items = ForeignSurface.all();
+    let surface_items = ForeignSurface
+        .all()
+        .expect("the live foreign surface must enumerate");
     let all_caps: Vec<Capability> = Capability::ALL.to_vec();
     assert_eq!(
         surface_items.len(),
@@ -47,7 +51,10 @@ fn foreign_surface_matches_capability_all() {
 
 #[test]
 fn foreign_surface_label_is_the_wire_name() {
-    for item in ForeignSurface.all() {
+    for item in ForeignSurface
+        .all()
+        .expect("the live foreign surface must enumerate")
+    {
         let label = ForeignSurface::label(&item);
         assert_eq!(
             label,
@@ -60,7 +67,10 @@ fn foreign_surface_label_is_the_wire_name() {
 
 #[test]
 fn every_js_port_axis_is_classified_as_js_port() {
-    for item in ForeignSurface.all() {
+    for item in ForeignSurface
+        .all()
+        .expect("the live foreign surface must enumerate")
+    {
         if let Capability::JsPort(_) = item.capability {
             assert_eq!(
                 item.boundary_class,
@@ -77,7 +87,10 @@ fn capability_declared_column_passes_over_every_axis() {
     // Every axis in `Capability::ALL` round-trips through `as_str`/`from_str`
     // by construction; this test pins that the column agrees.
     let col = CapabilityDeclaredColumn;
-    for item in ForeignSurface.all() {
+    for item in ForeignSurface
+        .all()
+        .expect("the live foreign surface must enumerate")
+    {
         assert!(
             matches!(col.check(&item), Cell::Ok),
             "capability-declared must pass for {:?} (wire: {:?})",
@@ -107,7 +120,7 @@ fn matrix_has_no_unexpected_holes() {
     // entries. Any remaining hole is an unexpected security gap.
     use std::fmt::Write as _;
 
-    let report = matrix::run_foreign();
+    let report = matrix::run_foreign().expect("the foreign matrix run must not fail closed");
 
     let mut unexpected = String::new();
     for h in report.holes.iter().filter(|h| {
@@ -135,7 +148,7 @@ fn matrix_has_no_unexpected_holes() {
 fn allowlisted_holes_are_still_real() {
     // An allowlist entry that no longer corresponds to a real hole is stale;
     // stale entries hide genuine new holes and must be removed.
-    let report = matrix::run_foreign();
+    let report = matrix::run_foreign().expect("the foreign matrix run must not fail closed");
     for (aspect, symbol, reason) in FOREIGN_ALLOWLIST {
         let present = report
             .holes
@@ -153,7 +166,10 @@ fn allowlisted_holes_are_still_real() {
 fn refusal_tested_column_marks_disclosure_axes_not_applicable() {
     use ipe::coverage::foreign_surface::RefusalTestedColumn;
     let col = RefusalTestedColumn::new();
-    for item in ForeignSurface.all() {
+    for item in ForeignSurface
+        .all()
+        .expect("the live foreign surface must enumerate")
+    {
         if item.boundary_class == BoundaryClass::Disclosure {
             assert!(
                 matches!(col.check(&item), Cell::NotApplicable { .. }),
@@ -168,7 +184,10 @@ fn refusal_tested_column_marks_disclosure_axes_not_applicable() {
 fn within_grant_column_marks_disclosure_axes_not_applicable() {
     use ipe::coverage::foreign_surface::WithinGrantColumn;
     let col = WithinGrantColumn::new();
-    for item in ForeignSurface.all() {
+    for item in ForeignSurface
+        .all()
+        .expect("the live foreign surface must enumerate")
+    {
         if item.boundary_class == BoundaryClass::Disclosure {
             assert!(
                 matches!(col.check(&item), Cell::NotApplicable { .. }),
@@ -184,7 +203,10 @@ fn within_grant_column_marks_disclosure_axes_not_applicable() {
 fn boundary_discipline_column_marks_disclosure_axes_not_applicable() {
     use ipe::coverage::foreign_surface::BoundaryDisciplineWiredColumn;
     let col = BoundaryDisciplineWiredColumn::new();
-    for item in ForeignSurface.all() {
+    for item in ForeignSurface
+        .all()
+        .expect("the live foreign surface must enumerate")
+    {
         if item.boundary_class == BoundaryClass::Disclosure {
             assert!(
                 matches!(col.check(&item), Cell::NotApplicable { .. }),
@@ -200,7 +222,10 @@ fn boundary_discipline_column_marks_disclosure_axes_not_applicable() {
 fn js_port_axes_pass_boundary_discipline() {
     use ipe::coverage::foreign_surface::BoundaryDisciplineWiredColumn;
     let col = BoundaryDisciplineWiredColumn::new();
-    for item in ForeignSurface.all() {
+    for item in ForeignSurface
+        .all()
+        .expect("the live foreign surface must enumerate")
+    {
         if item.boundary_class == BoundaryClass::JsPort {
             assert!(
                 matches!(col.check(&item), Cell::Ok),
@@ -218,6 +243,7 @@ fn native_ffi_axes_pass_boundary_discipline() {
     let col = BoundaryDisciplineWiredColumn::new();
     let items: Vec<_> = ForeignSurface
         .all()
+        .expect("the live foreign surface must enumerate")
         .into_iter()
         .filter(|i| i.boundary_class == BoundaryClass::NativeFfi)
         .collect();
@@ -239,7 +265,10 @@ fn native_ffi_axes_pass_boundary_discipline() {
 fn js_port_axes_pass_refusal_tested() {
     use ipe::coverage::foreign_surface::RefusalTestedColumn;
     let col = RefusalTestedColumn::new();
-    for item in ForeignSurface.all() {
+    for item in ForeignSurface
+        .all()
+        .expect("the live foreign surface must enumerate")
+    {
         if item.boundary_class == BoundaryClass::JsPort {
             assert!(
                 matches!(col.check(&item), Cell::Ok),
@@ -256,7 +285,10 @@ fn js_port_axes_pass_refusal_tested() {
 fn native_ffi_axes_pass_refusal_tested() {
     use ipe::coverage::foreign_surface::RefusalTestedColumn;
     let col = RefusalTestedColumn::new();
-    for item in ForeignSurface.all() {
+    for item in ForeignSurface
+        .all()
+        .expect("the live foreign surface must enumerate")
+    {
         if item.boundary_class == BoundaryClass::NativeFfi {
             assert!(
                 matches!(col.check(&item), Cell::Ok),
@@ -271,8 +303,12 @@ fn native_ffi_axes_pass_refusal_tested() {
 
 #[test]
 fn surface_is_deterministic() {
-    let first = ForeignSurface.all();
-    let second = ForeignSurface.all();
+    let first = ForeignSurface
+        .all()
+        .expect("the live foreign surface must enumerate");
+    let second = ForeignSurface
+        .all()
+        .expect("the live foreign surface must enumerate");
     assert_eq!(
         first.len(),
         second.len(),
@@ -296,11 +332,13 @@ fn network_and_filesystem_axes_pass_refusal_tested() {
 
     let network_item = ForeignSurface
         .all()
+        .expect("the live foreign surface must enumerate")
         .into_iter()
         .find(|i| i.capability == Capability::Network)
         .expect("Network must be on the surface");
     let filesystem_item = ForeignSurface
         .all()
+        .expect("the live foreign surface must enumerate")
         .into_iter()
         .find(|i| i.capability == Capability::Filesystem)
         .expect("Filesystem must be on the surface");
