@@ -176,7 +176,7 @@ fn every_kernel_name_resolves_to_runtime_fn() {
     for k in ipe_kernels::StdlibKernel::ACCESSOR_INTERCEPT_PLACEHOLDERS {
         allowlist.insert(k.def().runtime_fn.to_string());
     }
-    for k in ipe_kernels::StdlibKernel::REMOTE_INTERCEPTED {
+    for k in unbacked_remote_kernels() {
         allowlist.insert(k.def().runtime_fn.to_string());
     }
 
@@ -198,6 +198,34 @@ fn every_kernel_name_resolves_to_runtime_fn() {
          or (c) add the symbol to KNOWN_DEAD_OR_EPILOGUE with a comment explaining why \
          the generic callee_name() path never reaches it.\n\
          Unresolved: {unresolved:?}"
+    );
+}
+
+/// The `Ipe.Remote` kernels still unschemed, so refused at `ipe` time and
+/// never named by an emitted program.
+///
+/// Keyed on the missing scheme, not on `REMOTE_INTERCEPTED` membership alone: a
+/// kernel that gains its scheme leaves this set, so the runtime fn it now needs
+/// is required and its argument order proven.
+fn unbacked_remote_kernels() -> impl Iterator<Item = ipe_kernels::StdlibKernel> {
+    ipe_kernels::StdlibKernel::REMOTE_INTERCEPTED
+        .into_iter()
+        .filter(|k| k.scheme_shape().is_none())
+}
+
+#[test]
+fn a_schemed_remote_kernel_loses_its_exemption() {
+    // Every `Remote` kernel is unschemed today, so all six are exempt; the
+    // filter is what removes one the moment `scheme_shape` turns `Some`.
+    assert_eq!(
+        unbacked_remote_kernels().count(),
+        ipe_kernels::StdlibKernel::REMOTE_INTERCEPTED.len()
+    );
+    assert!(
+        ipe_kernels::StdlibKernel::ALL
+            .iter()
+            .filter(|k| k.scheme_shape().is_some())
+            .all(|k| !unbacked_remote_kernels().any(|r| r == *k))
     );
 }
 
@@ -462,9 +490,10 @@ fn declared_arg_order_matches_runtime_signature() {
     let mut failures = Vec::new();
     for kernel in StdlibKernel::ALL {
         let def = kernel.def();
-        // The `Ipe.Remote` kernels are unschemed and refused at `ipe` time, so
-        // no emitted program calls one: there is no argument order to prove.
-        if def.arity != 2 || StdlibKernel::REMOTE_INTERCEPTED.contains(kernel) {
+        // An unschemed `Ipe.Remote` kernel is refused at `ipe` time, so no
+        // emitted program calls one: there is no argument order to prove. The
+        // exemption ends the moment its scheme lands.
+        if def.arity != 2 || unbacked_remote_kernels().any(|k| k == *kernel) {
             continue;
         }
         let Some(shape) = def.shape else {

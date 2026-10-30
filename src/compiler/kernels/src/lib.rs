@@ -1366,6 +1366,76 @@ pub enum EndpointKind {
     SignOut,
 }
 
+/// The role an `Ipe.Remote` kernel plays in a split program.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum RemoteRole {
+    /// `Remote.auth` — builds the session signing key; reaches nothing.
+    Key,
+    /// An endpoint constructor; describes a server endpoint, reaches nothing.
+    Endpoint(EndpointKind),
+    /// `Remote.call` — the client's outbound call of a server endpoint.
+    Call,
+}
+
+/// Whether `roles` names exactly `intercepted`, in order, every one qualified
+/// `Remote`, and every kernel of `kernels` qualified `Remote` has exactly one
+/// row.
+///
+/// The build-time tripwire behind [`StdlibKernel::REMOTE_ROLES`]: a new
+/// `Remote` kernel without a role fails the build instead of falling through to
+/// a default.
+#[must_use]
+pub const fn remote_roles_cover_remote_kernels(
+    roles: &[(StdlibKernel, RemoteRole)],
+    intercepted: &[StdlibKernel],
+    kernels: &[StdlibKernel],
+) -> bool {
+    if roles.len() != intercepted.len() {
+        return false;
+    }
+    let (mut r, mut i) = (roles, intercepted);
+    while let (Some(((role_kernel, _), r_tail)), Some((kernel, i_tail))) =
+        (r.split_first(), i.split_first())
+    {
+        if *role_kernel as usize != *kernel as usize
+            || !StdlibKernel::str_eq(kernel.decl().qualifier, "Remote")
+        {
+            return false;
+        }
+        r = r_tail;
+        i = i_tail;
+    }
+    let mut rest = kernels;
+    while let Some((kernel, tail)) = rest.split_first() {
+        if StdlibKernel::str_eq(kernel.decl().qualifier, "Remote") {
+            let mut hits = 0_usize;
+            let mut scan = roles;
+            while let Some(((row, _), more)) = scan.split_first() {
+                if *row as usize == *kernel as usize {
+                    hits = hits.saturating_add(1);
+                }
+                scan = more;
+            }
+            if hits != 1 {
+                return false;
+            }
+        }
+        rest = tail;
+    }
+    true
+}
+
+// IPE-RUST-AUDIT:ACCEPTED (Arthur Maciel) — compile-time `const` assertion (not a runtime panic); fails the BUILD if a `Remote` kernel has no role row or the role table drifts from `REMOTE_INTERCEPTED`, so no `Remote` kernel reaches a default role [ledger #boundary]
+#[allow(clippy::assertions_on_constants)] // the constant IS the tripwire
+const _: () = assert!(
+    remote_roles_cover_remote_kernels(
+        &StdlibKernel::REMOTE_ROLES,
+        &StdlibKernel::REMOTE_INTERCEPTED,
+        StdlibKernel::ALL,
+    ),
+    "a Remote kernel lacks a role row, or REMOTE_ROLES drifted from REMOTE_INTERCEPTED",
+);
+
 /// What a `Setting` kernel means on a split program's server.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum SplitSetting {
@@ -13532,17 +13602,56 @@ impl StdlibKernel {
         Self::RemoteCall,
     ];
 
+    /// Every `Ipe.Remote` kernel paired with its role, in
+    /// [`Self::REMOTE_INTERCEPTED`] order.
+    ///
+    /// The single source of truth for what each `Remote` kernel is. The
+    /// build-time tripwire [`remote_roles_cover_remote_kernels`] fails the build
+    /// when a kernel qualified `Remote` has no row, so a new one never falls
+    /// through to a default role.
+    pub const REMOTE_ROLES: [(Self, RemoteRole); 6] = [
+        (Self::RemoteAuth, RemoteRole::Key),
+        (
+            Self::RemotePublic,
+            RemoteRole::Endpoint(EndpointKind::Public),
+        ),
+        (
+            Self::RemoteAuthed,
+            RemoteRole::Endpoint(EndpointKind::Authed),
+        ),
+        (
+            Self::RemoteSignIn,
+            RemoteRole::Endpoint(EndpointKind::SignIn),
+        ),
+        (
+            Self::RemoteSignOut,
+            RemoteRole::Endpoint(EndpointKind::SignOut),
+        ),
+        (Self::RemoteCall, RemoteRole::Call),
+    ];
+
+    /// The role of an `Ipe.Remote` kernel, or `None` for every kernel outside
+    /// `Ipe.Remote`. Read from [`Self::REMOTE_ROLES`].
+    #[must_use]
+    pub const fn remote_role(self) -> Option<RemoteRole> {
+        let mut rest = Self::REMOTE_ROLES.as_slice();
+        while let Some(((kernel, role), tail)) = rest.split_first() {
+            if *kernel as usize == self as usize {
+                return Some(*role);
+            }
+            rest = tail;
+        }
+        None
+    }
+
     /// The endpoint kind an `Ipe.Remote` endpoint constructor builds, or `None`
     /// for every other kernel (`Remote.auth` builds a signing key and
     /// `Remote.call` calls an endpoint; neither builds one).
     #[must_use]
     pub const fn endpoint_kind(self) -> Option<EndpointKind> {
-        match self {
-            Self::RemotePublic => Some(EndpointKind::Public),
-            Self::RemoteAuthed => Some(EndpointKind::Authed),
-            Self::RemoteSignIn => Some(EndpointKind::SignIn),
-            Self::RemoteSignOut => Some(EndpointKind::SignOut),
-            _ => None,
+        match self.remote_role() {
+            Some(RemoteRole::Endpoint(kind)) => Some(kind),
+            Some(RemoteRole::Key | RemoteRole::Call) | None => None,
         }
     }
 
@@ -17897,9 +18006,6 @@ impl StdlibKernel {
                 //     because `Http.get`/`post` take a typed `Url`, whose only
                 //     constructor (`Url.fromString`) must be callable on the
                 //     client for a browser fetch to build a request at all.
-                //   - `Remote` → the client half of a split program: the
-                //     endpoint constructors and `Remote.call`, the browser's
-                //     call of its own backend.
                 matches!(
                     decl.qualifier,
                     "String"
@@ -17927,7 +18033,14 @@ impl StdlibKernel {
                         | "Random"
                         | "Http"
                         | "Url"
-                        | "Remote"
+                ) ||
+                // `Ipe.Remote`, by role and never qualifier-wide: the endpoint
+                // constructors and `Remote.call` (the browser's call of its own
+                // backend) are the client half of a split program. A `Remote`
+                // kernel gains a role only through `REMOTE_ROLES`.
+                matches!(
+                    self.remote_role(),
+                    Some(RemoteRole::Key | RemoteRole::Endpoint(_) | RemoteRole::Call)
                 ) ||
                 // Pure calendar helpers (chrono, no clock read) PLUS the M4
                 // `Date.now()`/`setTimeout` clock+sleep substitutes.
@@ -18108,12 +18221,8 @@ impl StdlibKernel {
                 // reach nothing. `Remote.call` stays denied: a WASI program has
                 // no browser backend to call.
                 || matches!(
-                    self,
-                    Self::RemoteAuth
-                        | Self::RemotePublic
-                        | Self::RemoteAuthed
-                        | Self::RemoteSignIn
-                        | Self::RemoteSignOut
+                    self.remote_role(),
+                    Some(RemoteRole::Key | RemoteRole::Endpoint(_))
                 )
                 // `Task.*` pure future combinators — the std-only reactor spine
                 // (`block_on`/`task_run`/`task_parallel`, the LIVE wasip1 arm; no
@@ -18199,6 +18308,63 @@ mod tests {
     }
 
     #[test]
+    fn remote_roles_tripwire_refuses_a_missing_stray_or_drifted_row() {
+        let roles = StdlibKernel::REMOTE_ROLES;
+        let intercepted = StdlibKernel::REMOTE_INTERCEPTED;
+        assert!(remote_roles_cover_remote_kernels(
+            &roles,
+            &intercepted,
+            StdlibKernel::ALL
+        ));
+        // A `Remote` kernel with no role row (the table drops `Remote.call`).
+        let (dropped, _) = roles.split_at(5);
+        let (kept, _) = intercepted.split_at(5);
+        assert!(!remote_roles_cover_remote_kernels(
+            dropped,
+            kept,
+            StdlibKernel::ALL
+        ));
+        // A row naming a kernel outside `Ipe.Remote`.
+        let mut stray = roles;
+        let mut stray_set = intercepted;
+        if let (Some(last), Some(last_k)) = (stray.last_mut(), stray_set.last_mut()) {
+            *last = (StdlibKernel::HostBind, RemoteRole::Call);
+            *last_k = StdlibKernel::HostBind;
+        }
+        assert!(!remote_roles_cover_remote_kernels(
+            &stray,
+            &stray_set,
+            StdlibKernel::ALL
+        ));
+        // The role table out of `REMOTE_INTERCEPTED` order.
+        let mut swapped = roles;
+        swapped.swap(0, 5);
+        assert!(!remote_roles_cover_remote_kernels(
+            &swapped,
+            &intercepted,
+            StdlibKernel::ALL
+        ));
+    }
+
+    #[test]
+    fn remote_kernel_availability_follows_its_role() {
+        use crate::Target;
+        for kernel in StdlibKernel::ALL {
+            let role = kernel.remote_role();
+            if kernel.def().qualifier == "Remote" {
+                assert!(role.is_some(), "{kernel:?} has no role");
+            }
+            let Some(role) = role else { continue };
+            assert!(kernel.available_on(Target::WasmClient), "{kernel:?}");
+            assert_eq!(
+                kernel.available_on(Target::WasmWasi),
+                !matches!(role, RemoteRole::Call),
+                "{kernel:?}"
+            );
+        }
+    }
+
+    #[test]
     fn split_settings_tripwire_refuses_a_missing_or_stray_row() {
         // A kernel set holding a setting kernel twice cannot fill the mask
         // exactly once per row.
@@ -18218,7 +18384,10 @@ mod tests {
     use strum::EnumCount as _;
 
     use super::StdlibKernel;
-    use super::{EndpointKind, shape_yields_setting, split_settings_cover_setting_kernels};
+    use super::{
+        EndpointKind, RemoteRole, remote_roles_cover_remote_kernels, shape_yields_setting,
+        split_settings_cover_setting_kernels,
+    };
 
     /// The kernel variants deliberately absent from [`StdlibKernel::ALL`], each
     /// with the reason it is not a wired row.
