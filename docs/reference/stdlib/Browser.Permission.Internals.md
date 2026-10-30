@@ -94,10 +94,10 @@ caller could omit.
 inbound : Decode.Decoder JsMsg
 ```
 
-The total, fail-closed decoder for the inbound `JsMsg`. It reads the `ok`
-flag: a true flag decodes a `state` string into the closed state vocabulary;
-a false flag decodes the closed `error` vocabulary. An unrecognised token
-fails the decode closed (the frame is dropped).
+The total, fail-closed decoder for a `JsMsg` frame of this capability.
+
+It first requires the frame's `tag` to be `portTag`, so a frame of another
+capability, or an untagged one, fails closed; the rest decodes as `inboundBody`.
 
 ## `inboundFor`
 
@@ -105,11 +105,13 @@ fails the decode closed (the frame is dropped).
 inboundFor : PermissionName -> Decode.Decoder JsMsg
 ```
 
-`inboundFor name` — the name-scoped variant of `inbound`. It first reads
-the frame's `name` field and requires it to equal `name`'s canonical token;
-a mismatch fails the decode closed, so a change frame for a DIFFERENT
-permission is dropped rather than folded into this subscription. On a match
-the frame decodes exactly as `inbound` does.
+`inboundFor name` — the name-scoped variant of `inbound`.
+
+It first requires the frame's `tag` to be `portTag`, then reads the frame's
+`name` field and requires it to equal `name`'s canonical token; a mismatch
+fails the decode closed, so a change frame for a DIFFERENT permission is
+dropped rather than folded into this subscription. On a match the frame
+decodes exactly as `inbound` does.
 
 ## `nameToken`
 

@@ -123,12 +123,21 @@ subscribe toMsg =
     Js.subscribe inbound toMsg
 
 
--- | The total, fail-closed decoder for the inbound `JsMsg`. It reads `ok` first: a
+-- | The total, fail-closed decoder for a `JsMsg` frame of this capability.
+--
+-- It first requires the frame's `tag` to be `portTag`, so a frame of another
+-- capability, or an untagged one, fails closed; the rest decodes as `inboundBody`.
+inbound : Decode.Decoder JsMsg
+inbound =
+    Decode.andThen (gateTag inboundBody) (Decode.field "tag" Decode.string)
+
+
+-- | The frame body of the inbound `JsMsg`. It reads `ok` first: a
 -- true flag decodes a `permission` grant or a `shown` acknowledgement by its
 -- `event`; a false flag decodes the closed `error` vocabulary into a denial
 -- variant. An unrecognised token fails the decode closed (the frame is dropped).
-inbound : Decode.Decoder JsMsg
-inbound =
+inboundBody : Decode.Decoder JsMsg
+inboundBody =
     Decode.andThen decodeByOk (Decode.field "ok" Decode.bool)
 
 
@@ -167,13 +176,22 @@ decodeError token =
             Decode.fail ("unknown notification error variant: " ++ token)
 
 
--- | The total, fail-closed decoder for a `RequestPermission` reply. Structurally
+-- | The total, fail-closed decoder for a `PermissionReply` frame of this capability.
+--
+-- It first requires the frame's `tag` to be `portTag`, so a frame of another
+-- capability, or an untagged one, fails closed; the rest decodes as `permissionInboundBody`.
+permissionInbound : Decode.Decoder PermissionReply
+permissionInbound =
+    Decode.andThen (gateTag permissionInboundBody) (Decode.field "tag" Decode.string)
+
+
+-- | The frame body of a `RequestPermission` reply. Structurally
 -- distinct from `inbound`: its only success event is `granted`, so a `shown`
 -- display acknowledgement fails the decode closed (the frame is dropped) rather
 -- than crossing as a permission outcome. A false `ok` decodes the closed error
 -- vocabulary into a denial variant.
-permissionInbound : Decode.Decoder PermissionReply
-permissionInbound =
+permissionInboundBody : Decode.Decoder PermissionReply
+permissionInboundBody =
     Decode.andThen decodePermissionByOk (Decode.field "ok" Decode.bool)
 
 
@@ -207,3 +225,23 @@ decodePermissionError token =
 
         _ ->
             Decode.fail ("unknown notification error variant: " ++ token)
+
+
+-- | This module's frame tag: its capability's `js-port:` wire name.
+--
+-- The first-party sink stamps it on every frame it replies with.
+portTag : String
+portTag =
+    "notification"
+
+
+-- | `gateTag body tag` runs `body` only on a frame tagged with this module's `portTag`.
+--
+-- A frame of any other capability fails closed; the failure names no tag.
+gateTag : Decode.Decoder a -> String -> Decode.Decoder a
+gateTag body tag =
+    if tag == portTag then
+        body
+
+    else
+        Decode.fail "frame for another capability"

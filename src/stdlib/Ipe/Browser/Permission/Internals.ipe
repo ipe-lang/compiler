@@ -139,32 +139,43 @@ nameToken name =
             "midi"
 
 
--- | The total, fail-closed decoder for the inbound `JsMsg`. It reads the `ok`
+-- | The total, fail-closed decoder for a `JsMsg` frame of this capability.
+--
+-- It first requires the frame's `tag` to be `portTag`, so a frame of another
+-- capability, or an untagged one, fails closed; the rest decodes as `inboundBody`.
+inbound : Decode.Decoder JsMsg
+inbound =
+    Decode.andThen (gateTag inboundBody) (Decode.field "tag" Decode.string)
+
+
+-- | The frame body of the inbound `JsMsg`. It reads the `ok`
 -- flag: a true flag decodes a `state` string into the closed state vocabulary;
 -- a false flag decodes the closed `error` vocabulary. An unrecognised token
 -- fails the decode closed (the frame is dropped).
-inbound : Decode.Decoder JsMsg
-inbound =
+inboundBody : Decode.Decoder JsMsg
+inboundBody =
     Decode.andThen decodeByOk (Decode.field "ok" Decode.bool)
 
 
--- | `inboundFor name` — the name-scoped variant of `inbound`. It first reads
--- the frame's `name` field and requires it to equal `name`'s canonical token;
--- a mismatch fails the decode closed, so a change frame for a DIFFERENT
--- permission is dropped rather than folded into this subscription. On a match
--- the frame decodes exactly as `inbound` does.
+-- | `inboundFor name` — the name-scoped variant of `inbound`.
+--
+-- It first requires the frame's `tag` to be `portTag`, then reads the frame's
+-- `name` field and requires it to equal `name`'s canonical token; a mismatch
+-- fails the decode closed, so a change frame for a DIFFERENT permission is
+-- dropped rather than folded into this subscription. On a match the frame
+-- decodes exactly as `inbound` does.
 inboundFor : PermissionName -> Decode.Decoder JsMsg
 inboundFor name =
-    Decode.andThen (gateName name) (Decode.field "name" Decode.string)
+    Decode.andThen (gateTag (Decode.andThen (gateName name) (Decode.field "name" Decode.string))) (Decode.field "tag" Decode.string)
 
 
 gateName : PermissionName -> String -> Decode.Decoder JsMsg
 gateName name token =
     if token == nameToken name then
-        inbound
+        inboundBody
 
     else
-        Decode.fail ("permission change frame for other permission: " ++ token)
+        Decode.fail "permission change frame for another permission"
 
 
 decodeByOk : Bool -> Decode.Decoder JsMsg
@@ -200,3 +211,23 @@ decodeError token =
 
         _ ->
             Decode.fail ("unknown permission error variant: " ++ token)
+
+
+-- | This module's frame tag: its capability's `js-port:` wire name.
+--
+-- The first-party sink stamps it on every frame it replies with.
+portTag : String
+portTag =
+    "permission"
+
+
+-- | `gateTag body tag` runs `body` only on a frame tagged with this module's `portTag`.
+--
+-- A frame of any other capability fails closed; the failure names no tag.
+gateTag : Decode.Decoder a -> String -> Decode.Decoder a
+gateTag body tag =
+    if tag == portTag then
+        body
+
+    else
+        Decode.fail "frame for another capability"

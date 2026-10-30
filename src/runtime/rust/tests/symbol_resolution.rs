@@ -34,6 +34,9 @@ use std::collections::HashSet;
 /// The `Store.*` accessor-intercept placeholder symbols are NOT listed here —
 /// they are derived at test time from
 /// [`ipe_kernels::StdlibKernel::ACCESSOR_INTERCEPT_PLACEHOLDERS`], the SSOT.
+/// Nor are the `Ipe.Remote` kernels' symbols: they are derived from
+/// [`ipe_kernels::StdlibKernel::REMOTE_INTERCEPTED`] (unschemed, so every
+/// reference is refused at `ipe` time and no emitted program names one).
 /// See the `every_kernel_name_resolves_to_runtime_fn` test body below.
 const KNOWN_DEAD_OR_EPILOGUE: &[&str] = &[
     // ── Build-time: env_public embeds the whitelisted public environment
@@ -173,6 +176,9 @@ fn every_kernel_name_resolves_to_runtime_fn() {
     for k in ipe_kernels::StdlibKernel::ACCESSOR_INTERCEPT_PLACEHOLDERS {
         allowlist.insert(k.def().runtime_fn.to_string());
     }
+    for k in unbacked_remote_kernels() {
+        allowlist.insert(k.def().runtime_fn.to_string());
+    }
 
     // ── 4. Assert every kernel emit symbol is reachable ──────────────────────
     let mut unresolved: Vec<String> = naming_symbols
@@ -192,6 +198,39 @@ fn every_kernel_name_resolves_to_runtime_fn() {
          or (c) add the symbol to KNOWN_DEAD_OR_EPILOGUE with a comment explaining why \
          the generic callee_name() path never reaches it.\n\
          Unresolved: {unresolved:?}"
+    );
+}
+
+/// The `Ipe.Remote` kernels still unschemed, so refused at `ipe` time and
+/// never named by an emitted program.
+fn unbacked_remote_kernels() -> impl Iterator<Item = ipe_kernels::StdlibKernel> {
+    unbacked_among(&ipe_kernels::StdlibKernel::REMOTE_INTERCEPTED)
+}
+
+/// The kernels of `kernels` with no scheme.
+///
+/// Keyed on the missing scheme, not on `REMOTE_INTERCEPTED` membership alone: a
+/// kernel that gains its scheme leaves this set, so the runtime fn it now needs
+/// is required and its argument order proven.
+fn unbacked_among(
+    kernels: &[ipe_kernels::StdlibKernel],
+) -> impl Iterator<Item = ipe_kernels::StdlibKernel> {
+    kernels
+        .iter()
+        .copied()
+        .filter(|k| k.scheme_shape().is_none())
+}
+
+#[test]
+fn a_schemed_remote_kernel_loses_its_exemption() {
+    use ipe_kernels::StdlibKernel::{BytesLength, RemoteCall};
+    // A schemed kernel beside an unschemed one: only the unschemed one keeps
+    // the exemption.
+    assert!(BytesLength.scheme_shape().is_some());
+    assert!(RemoteCall.scheme_shape().is_none());
+    assert_eq!(
+        unbacked_among(&[BytesLength, RemoteCall]).collect::<Vec<_>>(),
+        vec![RemoteCall]
     );
 }
 
@@ -456,7 +495,10 @@ fn declared_arg_order_matches_runtime_signature() {
     let mut failures = Vec::new();
     for kernel in StdlibKernel::ALL {
         let def = kernel.def();
-        if def.arity != 2 {
+        // An unschemed `Ipe.Remote` kernel is refused at `ipe` time, so no
+        // emitted program calls one: there is no argument order to prove. The
+        // exemption ends the moment its scheme lands.
+        if def.arity != 2 || unbacked_remote_kernels().any(|k| k == *kernel) {
             continue;
         }
         let Some(shape) = def.shape else {

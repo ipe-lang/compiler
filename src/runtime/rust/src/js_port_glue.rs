@@ -233,8 +233,9 @@ const PORT_GLUE_JS_HEAD: &str = r#"  var onReceive = null;
   // Return an inbound typed frame to the Ipê program: a decoded intent, never a
   // thrown error, so a host permission denial is an ordinary case the program's
   // subscription decodes (parse-don't-validate at the trust boundary). Each frame
-  // carries a `tag` naming its first-party sink so a module's inbound decoder
-  // selects only its own frames; unknown tags simply fail that decoder closed.
+  // carries its sink's `TAG_*` constant; every `Ipe.Browser.*.Internals`
+  // decoder fails closed unless the tag is its own `portTag`, and `ipe.send`
+  // refuses a page value carrying a reserved tag.
   // When `corId` is non-null, the runtime-private `__ipe_id` field is added so
   // the runtime routes this reply to the matching one-shot waiter rather than
   // broadcasting it to `js_subscribe` subscribers.
@@ -257,12 +258,12 @@ const PORT_GLUE_JS_HEAD: &str = r#"  var onReceive = null;
     if (value && typeof value === "object" && typeof value.WriteText === "string") {
       var text = value.WriteText;
       if (!navigator || !navigator.clipboard || typeof navigator.clipboard.writeText !== "function") {
-        reply({ tag: "clipboard", event: "write", ok: false, error: "unavailable" }, corId);
+        reply({ tag: TAG_CLIPBOARD, event: "write", ok: false, error: "unavailable" }, corId);
         return true;
       }
       navigator.clipboard.writeText(text).then(
-        function () { reply({ tag: "clipboard", event: "write", ok: true }, corId); },
-        function () { reply({ tag: "clipboard", event: "write", ok: false, error: "denied" }, corId); }
+        function () { reply({ tag: TAG_CLIPBOARD, event: "write", ok: true }, corId); },
+        function () { reply({ tag: TAG_CLIPBOARD, event: "write", ok: false, error: "denied" }, corId); }
       );
       return true;
     }
@@ -270,12 +271,12 @@ const PORT_GLUE_JS_HEAD: &str = r#"  var onReceive = null;
     // nullary variant is externally tagged as the bare string "ReadText".
     if (value === "ReadText") {
       if (!navigator || !navigator.clipboard || typeof navigator.clipboard.readText !== "function") {
-        reply({ tag: "clipboard", event: "read", ok: false, error: "unavailable" }, corId);
+        reply({ tag: TAG_CLIPBOARD, event: "read", ok: false, error: "unavailable" }, corId);
         return true;
       }
       navigator.clipboard.readText().then(
-        function (text) { reply({ tag: "clipboard", event: "read", ok: true, text: String(text) }, corId); },
-        function () { reply({ tag: "clipboard", event: "read", ok: false, error: "denied" }, corId); }
+        function (text) { reply({ tag: TAG_CLIPBOARD, event: "read", ok: true, text: String(text) }, corId); },
+        function () { reply({ tag: TAG_CLIPBOARD, event: "read", ok: false, error: "denied" }, corId); }
       );
       return true;
     }
@@ -303,7 +304,7 @@ const PORT_GLUE_JS_HEAD: &str = r#"  var onReceive = null;
       onPosition: function(pos) {
         var c = pos && pos.coords ? pos.coords : {};
         reply({
-          tag: "geolocation", ok: true,
+          tag: TAG_GEOLOCATION, ok: true,
           lat: Number(c.latitude), lng: Number(c.longitude), accuracy: Number(c.accuracy),
         }, corId);
       },
@@ -312,7 +313,7 @@ const PORT_GLUE_JS_HEAD: &str = r#"  var onReceive = null;
         // module's closed inbound error vocabulary; anything else is unavailable.
         var code = err && typeof err.code === "number" ? err.code : 2;
         var kind = code === 1 ? "denied" : (code === 3 ? "timeout" : "unavailable");
-        reply({ tag: "geolocation", ok: false, error: kind }, corId);
+        reply({ tag: TAG_GEOLOCATION, ok: false, error: kind }, corId);
       },
     };
   }
@@ -336,20 +337,20 @@ const PORT_GLUE_JS_HEAD: &str = r#"  var onReceive = null;
       return true;
     }
     if (!navigator || !navigator.geolocation) {
-      reply({ tag: "geolocation", ok: false, error: "unavailable" }, corId);
+      reply({ tag: TAG_GEOLOCATION, ok: false, error: "unavailable" }, corId);
       return true;
     }
     var opts = geoOptions(isCurrent ? value.Current : value.Watch);
     var cbs = makeGeoCallbacks(corId);
     if (isCurrent) {
       if (typeof navigator.geolocation.getCurrentPosition !== "function") {
-        reply({ tag: "geolocation", ok: false, error: "unavailable" }, corId);
+        reply({ tag: TAG_GEOLOCATION, ok: false, error: "unavailable" }, corId);
         return true;
       }
       navigator.geolocation.getCurrentPosition(cbs.onPosition, cbs.onError, opts);
     } else {
       if (typeof navigator.geolocation.watchPosition !== "function") {
-        reply({ tag: "geolocation", ok: false, error: "unavailable" }, corId);
+        reply({ tag: TAG_GEOLOCATION, ok: false, error: "unavailable" }, corId);
         return true;
       }
       geoWatchIds.push(navigator.geolocation.watchPosition(cbs.onPosition, cbs.onError, opts));
@@ -368,7 +369,7 @@ const PORT_GLUE_JS_HEAD: &str = r#"  var onReceive = null;
     var isShow = value && typeof value === "object" && value.Show !== undefined;
     if (!isRequest && !isShow) return false;
     var refuse = function (code) {
-      reply({ tag: "notification", ok: false, error: NOTIFICATION_REJECT_FRAME[code] }, corId);
+      reply({ tag: TAG_NOTIFICATION, ok: false, error: NOTIFICATION_REJECT_FRAME[code] }, corId);
     };
     nativeRoute(CAP_NOTIFICATION,
       function () { notificationNative(value, isRequest, corId, refuse); },
@@ -382,9 +383,9 @@ const PORT_GLUE_JS_HEAD: &str = r#"  var onReceive = null;
         if (outcome.reject !== undefined) { refuse(outcome.reject); return; }
         var state = outcome.ok.state;
         if (state === STATE_GRANTED) {
-          reply({ tag: "notification", ok: true, event: "granted" }, corId);
+          reply({ tag: TAG_NOTIFICATION, ok: true, event: "granted" }, corId);
         } else if (state === STATE_DENIED) {
-          reply({ tag: "notification", ok: false, error: "denied" }, corId);
+          reply({ tag: TAG_NOTIFICATION, ok: false, error: "denied" }, corId);
         } else {
           refuse(REJECT_UNAVAILABLE);
         }
@@ -402,28 +403,28 @@ const PORT_GLUE_JS_HEAD: &str = r#"  var onReceive = null;
     if (!NOTIFICATION_TAG_PATTERN.test(tag)) { refuse(REJECT_REFUSED); return; }
     nativeSend(OP_NOTIFICATION_SHOW, { title: title, body: body, tag: tag }, function (outcome) {
       if (outcome.reject !== undefined) { refuse(outcome.reject); return; }
-      reply({ tag: "notification", ok: true, event: "shown" }, corId);
+      reply({ tag: TAG_NOTIFICATION, ok: true, event: "shown" }, corId);
     });
   }
   function notificationWeb(value, isRequest, corId) {
     if (typeof Notification === "undefined") {
-      reply({ tag: "notification", ok: false, error: "unavailable" }, corId);
+      reply({ tag: TAG_NOTIFICATION, ok: false, error: "unavailable" }, corId);
       return;
     }
     if (isRequest) {
       if (typeof Notification.requestPermission !== "function") {
-        reply({ tag: "notification", ok: false, error: "unavailable" }, corId);
+        reply({ tag: TAG_NOTIFICATION, ok: false, error: "unavailable" }, corId);
         return;
       }
       Promise.resolve(Notification.requestPermission()).then(
         function (perm) {
           if (perm === "granted") {
-            reply({ tag: "notification", ok: true, event: "granted" }, corId);
+            reply({ tag: TAG_NOTIFICATION, ok: true, event: "granted" }, corId);
           } else {
-            reply({ tag: "notification", ok: false, error: "denied" }, corId);
+            reply({ tag: TAG_NOTIFICATION, ok: false, error: "denied" }, corId);
           }
         },
-        function () { reply({ tag: "notification", ok: false, error: "denied" }, corId); }
+        function () { reply({ tag: TAG_NOTIFICATION, ok: false, error: "denied" }, corId); }
       );
       return;
     }
@@ -431,16 +432,16 @@ const PORT_GLUE_JS_HEAD: &str = r#"  var onReceive = null;
     // denial, never a silent no-op and never an unsolicited permission prompt.
     var opts = (value.Show && typeof value.Show === "object") ? value.Show : {};
     if (Notification.permission !== "granted") {
-      reply({ tag: "notification", ok: false, error: "denied" }, corId);
+      reply({ tag: TAG_NOTIFICATION, ok: false, error: "denied" }, corId);
       return;
     }
     try {
       var body = typeof opts.body === "string" ? opts.body : "";
       var tag = typeof opts.tag === "string" ? opts.tag : "";
       new Notification(String(opts.title || ""), { body: body, tag: tag });
-      reply({ tag: "notification", ok: true, event: "shown" }, corId);
+      reply({ tag: TAG_NOTIFICATION, ok: true, event: "shown" }, corId);
     } catch (_e) {
-      reply({ tag: "notification", ok: false, error: "unavailable" }, corId);
+      reply({ tag: TAG_NOTIFICATION, ok: false, error: "unavailable" }, corId);
     }
   }
   // Ipe.Browser.Push: `PushSubscribe key` / `PushCurrent` / `PushUnsubscribe`.
@@ -465,7 +466,7 @@ const PORT_GLUE_JS_HEAD: &str = r#"  var onReceive = null;
     var answer = function (frame) {
       if (settled) return;
       settled = true;
-      frame.tag = CAP_PUSH;
+      frame.tag = TAG_PUSH;
       reply(frame, corId);
     };
     var refuse = function (code) { answer({ ok: false, error: code }); };
@@ -591,30 +592,30 @@ const PORT_GLUE_JS_HEAD: &str = r#"  var onReceive = null;
     var store = null;
     try { store = window.localStorage; } catch (_e) { store = null; }
     if (!store) {
-      reply({ tag: "storage", ok: false, error: "unavailable" }, corId);
+      reply({ tag: TAG_STORAGE, ok: false, error: "unavailable" }, corId);
       return true;
     }
     try {
       if (isGet) {
         var got = store.getItem(String(value.Get));
         if (got === null || got === undefined) {
-          reply({ tag: "storage", ok: true, event: "get" }, corId);
+          reply({ tag: TAG_STORAGE, ok: true, event: "get" }, corId);
         } else {
-          reply({ tag: "storage", ok: true, event: "get", value: String(got) }, corId);
+          reply({ tag: TAG_STORAGE, ok: true, event: "get", value: String(got) }, corId);
         }
       } else if (isSet) {
         var entry = (value.Set && typeof value.Set === "object") ? value.Set : {};
         store.setItem(String(entry.key || ""), String(entry.value || ""));
-        reply({ tag: "storage", ok: true, event: "set" }, corId);
+        reply({ tag: TAG_STORAGE, ok: true, event: "set" }, corId);
       } else if (isRemove) {
         store.removeItem(String(value.Remove));
-        reply({ tag: "storage", ok: true, event: "remove" }, corId);
+        reply({ tag: TAG_STORAGE, ok: true, event: "remove" }, corId);
       } else {
         store.clear();
-        reply({ tag: "storage", ok: true, event: "clear" }, corId);
+        reply({ tag: TAG_STORAGE, ok: true, event: "clear" }, corId);
       }
     } catch (_e2) {
-      reply({ tag: "storage", ok: false, error: "unavailable" }, corId);
+      reply({ tag: TAG_STORAGE, ok: false, error: "unavailable" }, corId);
     }
     return true;
   }
@@ -628,7 +629,7 @@ const PORT_GLUE_JS_HEAD: &str = r#"  var onReceive = null;
       (value && typeof value === "object" && value.Cancel !== undefined);
     if (!isVibrate && !isPattern && !isCancel) return false;
     if (!navigator || typeof navigator.vibrate !== "function") {
-      reply({ tag: "vibration", ok: false, error: "unavailable" }, corId);
+      reply({ tag: TAG_VIBRATION, ok: false, error: "unavailable" }, corId);
       return true;
     }
     var arg;
@@ -642,9 +643,9 @@ const PORT_GLUE_JS_HEAD: &str = r#"  var onReceive = null;
     var accepted = false;
     try { accepted = navigator.vibrate(arg); } catch (_e) { accepted = false; }
     if (accepted) {
-      reply({ tag: "vibration", ok: true }, corId);
+      reply({ tag: TAG_VIBRATION, ok: true }, corId);
     } else {
-      reply({ tag: "vibration", ok: false, error: "unavailable" }, corId);
+      reply({ tag: TAG_VIBRATION, ok: false, error: "unavailable" }, corId);
     }
     return true;
   }
@@ -665,7 +666,7 @@ const PORT_GLUE_JS_HEAD: &str = r#"  var onReceive = null;
   function shareSink(value, corId) {
     if (!(value && typeof value === "object" && value.Share !== undefined)) return false;
     if (!navigator || typeof navigator.share !== "function") {
-      reply({ tag: "share", ok: false, error: "unavailable" }, corId);
+      reply({ tag: TAG_SHARE, ok: false, error: "unavailable" }, corId);
       return true;
     }
     var p = (value.Share && typeof value.Share === "object") ? value.Share : {};
@@ -678,15 +679,15 @@ const PORT_GLUE_JS_HEAD: &str = r#"  var onReceive = null;
 // generated scheme check.
 const PORT_GLUE_JS_TAIL: &str = r#"    try {
       navigator.share(data).then(
-        function () { reply({ tag: "share", ok: true }, corId); },
+        function () { reply({ tag: TAG_SHARE, ok: true }, corId); },
         function (err) {
           var name = err && err.name ? String(err.name) : "";
           var kind = name === "AbortError" ? "cancelled" : "unavailable";
-          reply({ tag: "share", ok: false, error: kind }, corId);
+          reply({ tag: TAG_SHARE, ok: false, error: kind }, corId);
         }
       );
     } catch (_e) {
-      reply({ tag: "share", ok: false, error: "unavailable" }, corId);
+      reply({ tag: TAG_SHARE, ok: false, error: "unavailable" }, corId);
     }
     return true;
   }
@@ -701,7 +702,7 @@ const PORT_GLUE_JS_TAIL: &str = r#"    try {
       return (isFinite(n)) ? n : -1;
     }
     reply({
-      tag: "battery", ok: true,
+      tag: TAG_BATTERY, ok: true,
       charging: bat.charging === true,
       level: Number(bat.level),
       chargingTime: finite(bat.chargingTime),
@@ -715,7 +716,7 @@ const PORT_GLUE_JS_TAIL: &str = r#"    try {
       (value && typeof value === "object" && value.Watch !== undefined);
     if (!isQuery && !isWatch) return false;
     if (!navigator || typeof navigator.getBattery !== "function") {
-      reply({ tag: "battery", ok: false, error: "unavailable" }, corId);
+      reply({ tag: TAG_BATTERY, ok: false, error: "unavailable" }, corId);
       return true;
     }
     navigator.getBattery().then(
@@ -731,7 +732,7 @@ const PORT_GLUE_JS_TAIL: &str = r#"    try {
           bat.addEventListener("dischargingtimechange", push);
         }
       },
-      function () { reply({ tag: "battery", ok: false, error: "unavailable" }, corId); }
+      function () { reply({ tag: TAG_BATTERY, ok: false, error: "unavailable" }, corId); }
     );
     return true;
   }
@@ -741,7 +742,7 @@ const PORT_GLUE_JS_TAIL: &str = r#"    try {
   // fresh readings.
   function networkInfoReadingFrame(conn, corId) {
     reply({
-      tag: "network-info", ok: true,
+      tag: TAG_NETWORK_INFO, ok: true,
       effectiveType: typeof conn.effectiveType === "string" ? conn.effectiveType : "",
       downlink: Number(conn.downlink) || 0,
       rtt: Number(conn.rtt) || 0,
@@ -756,7 +757,7 @@ const PORT_GLUE_JS_TAIL: &str = r#"    try {
     if (!isQuery && !isWatch) return false;
     var conn = navigator ? (navigator.connection || navigator.mozConnection || navigator.webkitConnection) : null;
     if (!conn) {
-      reply({ tag: "network-info", ok: false, error: "unavailable" }, corId);
+      reply({ tag: TAG_NETWORK_INFO, ok: false, error: "unavailable" }, corId);
       return true;
     }
     networkInfoReadingFrame(conn, corId);
@@ -780,7 +781,7 @@ const PORT_GLUE_JS_TAIL: &str = r#"    try {
       (value && typeof value === "object" && value.PickImage !== undefined);
     if (!isPickFile && !isPickImage) return false;
     if (!doc || typeof File === "undefined" || typeof FileReader === "undefined") {
-      reply({ tag: "file-picker", ok: false, error: "unavailable" }, corId);
+      reply({ tag: TAG_FILE, ok: false, error: "unavailable" }, corId);
       return true;
     }
     var input = doc.create("input");
@@ -794,20 +795,20 @@ const PORT_GLUE_JS_TAIL: &str = r#"    try {
       settled = true;
       var file = input.files && input.files[0];
       if (!file) {
-        reply({ tag: "file-picker", ok: false, error: "cancelled" }, corId);
+        reply({ tag: TAG_FILE, ok: false, error: "cancelled" }, corId);
         return;
       }
       var reader = new FileReader();
       reader.onload = function (ev) {
         reply({
-          tag: "file-picker", ok: true,
+          tag: TAG_FILE, ok: true,
           name: String(file.name),
           mime: String(file.type || "application/octet-stream"),
           dataUrl: String(ev.target.result),
         }, corId);
       };
       reader.onerror = function () {
-        reply({ tag: "file-picker", ok: false, error: "unavailable" }, corId);
+        reply({ tag: TAG_FILE, ok: false, error: "unavailable" }, corId);
       };
       reader.readAsDataURL(file);
     });
@@ -817,7 +818,7 @@ const PORT_GLUE_JS_TAIL: &str = r#"    try {
       setTimeout(function () {
         if (!settled) {
           settled = true;
-          reply({ tag: "file-picker", ok: false, error: "cancelled" }, corId);
+          reply({ tag: TAG_FILE, ok: false, error: "cancelled" }, corId);
         }
       }, 400);
     }, { once: true });
@@ -834,7 +835,7 @@ const PORT_GLUE_JS_TAIL: &str = r#"    try {
       (value && typeof value === "object" && value.CapturePhoto !== undefined);
     if (!isCapture) return false;
     if (!doc || typeof File === "undefined" || typeof FileReader === "undefined") {
-      reply({ tag: "camera", ok: false, error: "unavailable" }, corId);
+      reply({ tag: TAG_CAMERA, ok: false, error: "unavailable" }, corId);
       return true;
     }
     var input = doc.create("input");
@@ -847,20 +848,20 @@ const PORT_GLUE_JS_TAIL: &str = r#"    try {
       settled = true;
       var file = input.files && input.files[0];
       if (!file) {
-        reply({ tag: "camera", ok: false, error: "cancelled" }, corId);
+        reply({ tag: TAG_CAMERA, ok: false, error: "cancelled" }, corId);
         return;
       }
       var reader = new FileReader();
       reader.onload = function (ev) {
         reply({
-          tag: "camera", ok: true,
+          tag: TAG_CAMERA, ok: true,
           name: String(file.name),
           mime: String(file.type || "image/jpeg"),
           dataUrl: String(ev.target.result),
         }, corId);
       };
       reader.onerror = function () {
-        reply({ tag: "camera", ok: false, error: "unavailable" }, corId);
+        reply({ tag: TAG_CAMERA, ok: false, error: "unavailable" }, corId);
       };
       reader.readAsDataURL(file);
     });
@@ -869,7 +870,7 @@ const PORT_GLUE_JS_TAIL: &str = r#"    try {
       setTimeout(function () {
         if (!settled) {
           settled = true;
-          reply({ tag: "camera", ok: false, error: "cancelled" }, corId);
+          reply({ tag: TAG_CAMERA, ok: false, error: "cancelled" }, corId);
         }
       }, 400);
     }, { once: true });
@@ -900,11 +901,11 @@ const PORT_GLUE_JS_TAIL: &str = r#"    try {
       ? opts.mimeType : "";
     if (!navigator || typeof navigator.mediaDevices === "undefined" ||
         typeof navigator.mediaDevices.getUserMedia !== "function") {
-      reply({ tag: "microphone", ok: false, error: "unavailable" }, corId);
+      reply({ tag: TAG_MICROPHONE, ok: false, error: "unavailable" }, corId);
       return true;
     }
     if (typeof MediaRecorder === "undefined") {
-      reply({ tag: "microphone", ok: false, error: "unavailable" }, corId);
+      reply({ tag: TAG_MICROPHONE, ok: false, error: "unavailable" }, corId);
       return true;
     }
     navigator.mediaDevices.getUserMedia({ audio: true }).then(
@@ -920,7 +921,7 @@ const PORT_GLUE_JS_TAIL: &str = r#"    try {
           recorder = new MediaRecorder(stream, recOpts);
         } catch (_e) {
           stream.getTracks().forEach(function (t) { t.stop(); });
-          reply({ tag: "microphone", ok: false, error: "unavailable" }, corId);
+          reply({ tag: TAG_MICROPHONE, ok: false, error: "unavailable" }, corId);
           return;
         }
         var chunks = [];
@@ -936,14 +937,14 @@ const PORT_GLUE_JS_TAIL: &str = r#"    try {
           var reader = new FileReader();
           reader.onload = function (ev) {
             reply({
-              tag: "microphone", ok: true,
+              tag: TAG_MICROPHONE, ok: true,
               data: String(ev.target.result),
               mime: actualMime,
               durationMs: durationMs,
             }, corId);
           };
           reader.onerror = function () {
-            reply({ tag: "microphone", ok: false, error: "unavailable" }, corId);
+            reply({ tag: TAG_MICROPHONE, ok: false, error: "unavailable" }, corId);
           };
           reader.readAsDataURL(blob);
         }
@@ -957,14 +958,14 @@ const PORT_GLUE_JS_TAIL: &str = r#"    try {
           if (!settled) {
             settled = true;
             stream.getTracks().forEach(function (t) { t.stop(); });
-            reply({ tag: "microphone", ok: false, error: "unavailable" }, corId);
+            reply({ tag: TAG_MICROPHONE, ok: false, error: "unavailable" }, corId);
           }
         };
         try {
           recorder.start();
         } catch (_e) {
           stream.getTracks().forEach(function (t) { t.stop(); });
-          reply({ tag: "microphone", ok: false, error: "unavailable" }, corId);
+          reply({ tag: TAG_MICROPHONE, ok: false, error: "unavailable" }, corId);
           return;
         }
         setTimeout(function () {
@@ -978,7 +979,7 @@ const PORT_GLUE_JS_TAIL: &str = r#"    try {
         var name = err && err.name ? String(err.name) : "";
         var kind = name === "NotAllowedError" || name === "PermissionDeniedError"
           ? "denied" : "unavailable";
-        reply({ tag: "microphone", ok: false, error: kind }, corId);
+        reply({ tag: TAG_MICROPHONE, ok: false, error: kind }, corId);
       }
     );
     return true;
@@ -1036,7 +1037,7 @@ const PORT_GLUE_JS_TAIL: &str = r#"    try {
       // emit the single terminal `ended` frame. A no-op when nothing is active.
       var wasActive = recorderState !== null;
       recorderTeardown();
-      if (wasActive) { reply({ tag: "recorder", event: "ended" }, null); }
+      if (wasActive) { reply({ tag: TAG_RECORDER, event: "ended" }, null); }
       return true;
     }
     // isStart. Tear down any prior session so a double Start never leaves two
@@ -1052,7 +1053,7 @@ const PORT_GLUE_JS_TAIL: &str = r#"    try {
     if (!navigator || typeof navigator.mediaDevices === "undefined" ||
         typeof navigator.mediaDevices.getUserMedia !== "function" ||
         typeof MediaRecorder === "undefined") {
-      reply({ tag: "recorder", event: "unavailable" }, null);
+      reply({ tag: TAG_RECORDER, event: "unavailable" }, null);
       return true;
     }
     var constraints = wantVideo ? { audio: true, video: true } : { audio: true };
@@ -1077,7 +1078,7 @@ const PORT_GLUE_JS_TAIL: &str = r#"    try {
           recorder = new MediaRecorder(stream, recOpts);
         } catch (_e) {
           stream.getTracks().forEach(function (t) { t.stop(); });
-          reply({ tag: "recorder", event: "unavailable" }, null);
+          reply({ tag: TAG_RECORDER, event: "unavailable" }, null);
           return;
         }
         var actualMime = recorder.mimeType || (wantVideo ? "video/webm" : "audio/webm");
@@ -1093,7 +1094,7 @@ const PORT_GLUE_JS_TAIL: &str = r#"    try {
             // FileReader was decoding this chunk.
             if (!recorderState || recorderState.active !== true) return;
             reply({
-              tag: "recorder", event: "chunk",
+              tag: TAG_RECORDER, event: "chunk",
               data: String(rev.target.result),
               mime: actualMime,
             }, null);
@@ -1105,23 +1106,23 @@ const PORT_GLUE_JS_TAIL: &str = r#"    try {
           // A host-side track end (user revokes, device unplugged) also lands here.
           if (recorderState !== null) {
             recorderTeardown();
-            reply({ tag: "recorder", event: "ended" }, null);
+            reply({ tag: TAG_RECORDER, event: "ended" }, null);
           }
         };
         recorder.onerror = function () {
           if (recorderState !== null) {
             recorderTeardown();
-            reply({ tag: "recorder", event: "ended" }, null);
+            reply({ tag: TAG_RECORDER, event: "ended" }, null);
           }
         };
         try {
           recorder.start(timeslice);
         } catch (_e) {
           recorderTeardown();
-          reply({ tag: "recorder", event: "unavailable" }, null);
+          reply({ tag: TAG_RECORDER, event: "unavailable" }, null);
           return;
         }
-        reply({ tag: "recorder", event: "started", mime: actualMime }, null);
+        reply({ tag: TAG_RECORDER, event: "started", mime: actualMime }, null);
       },
       function (err) {
         // A rejection for a superseded or cancelled grant is not this session's
@@ -1130,7 +1131,7 @@ const PORT_GLUE_JS_TAIL: &str = r#"    try {
         var name = err && err.name ? String(err.name) : "";
         var kind = name === "NotAllowedError" || name === "PermissionDeniedError"
           ? "denied" : "unavailable";
-        reply({ tag: "recorder", event: kind }, null);
+        reply({ tag: TAG_RECORDER, event: kind }, null);
       }
     );
     return true;
@@ -1159,7 +1160,7 @@ const PORT_GLUE_JS_TAIL: &str = r#"    try {
     }
     if (!window.speechSynthesis || typeof window.speechSynthesis.speak !== "function" ||
         typeof SpeechSynthesisUtterance === "undefined") {
-      reply({ tag: "speech", ok: false, error: "unavailable" }, corId);
+      reply({ tag: TAG_SPEECH, ok: false, error: "unavailable" }, corId);
       return true;
     }
     var p = (value.Speak && typeof value.Speak === "object") ? value.Speak : {};
@@ -1169,7 +1170,7 @@ const PORT_GLUE_JS_TAIL: &str = r#"    try {
     try { window.speechSynthesis.cancel(); } catch (_e) { /* best-effort */ }
     var utterance;
     try { utterance = new SpeechSynthesisUtterance(text); } catch (_e) {
-      reply({ tag: "speech", ok: false, error: "unavailable" }, corId);
+      reply({ tag: TAG_SPEECH, ok: false, error: "unavailable" }, corId);
       return true;
     }
     if (typeof opts.rate === "number") { utterance.rate = opts.rate; }
@@ -1180,21 +1181,21 @@ const PORT_GLUE_JS_TAIL: &str = r#"    try {
     utterance.onend = function () {
       if (settled) return;
       settled = true;
-      reply({ tag: "speech", ok: true }, corId);
+      reply({ tag: TAG_SPEECH, ok: true }, corId);
     };
     utterance.onerror = function (ev) {
       if (settled) return;
       settled = true;
       // "interrupted" and "cancelled" mean a subsequent cancel() arrived — still
       // a typed Failed outcome, not a throw or a silent drop.
-      reply({ tag: "speech", ok: false, error: "failed" }, corId);
+      reply({ tag: TAG_SPEECH, ok: false, error: "failed" }, corId);
     };
     try {
       window.speechSynthesis.speak(utterance);
     } catch (_e) {
       if (!settled) {
         settled = true;
-        reply({ tag: "speech", ok: false, error: "unavailable" }, corId);
+        reply({ tag: TAG_SPEECH, ok: false, error: "unavailable" }, corId);
       }
     }
     return true;
@@ -1232,7 +1233,7 @@ const PORT_GLUE_JS_TAIL: &str = r#"    try {
     }
     // isWatch: check API availability before registering anything.
     if (!navigator || typeof navigator.getGamepads !== "function") {
-      reply({ tag: "gamepad", event: "unavailable" }, null);
+      reply({ tag: TAG_GAMEPAD, event: "unavailable" }, null);
       return true;
     }
     // Remove any previously registered listeners and cancel an existing poll
@@ -1248,14 +1249,14 @@ const PORT_GLUE_JS_TAIL: &str = r#"    try {
     gamepadConnectHandler = function (ev) {
       var gp = ev && ev.gamepad ? ev.gamepad : {};
       reply({
-        tag: "gamepad", event: "connected",
+        tag: TAG_GAMEPAD, event: "connected",
         index: Number(gp.index) || 0,
         id: typeof gp.id === "string" ? gp.id : "",
       }, null);
     };
     gamepadDisconnectHandler = function (ev) {
       var gp = ev && ev.gamepad ? ev.gamepad : {};
-      reply({ tag: "gamepad", event: "disconnected", index: Number(gp.index) || 0 }, null);
+      reply({ tag: TAG_GAMEPAD, event: "disconnected", index: Number(gp.index) || 0 }, null);
     };
     window.addEventListener("gamepadconnected", gamepadConnectHandler);
     window.addEventListener("gamepaddisconnected", gamepadDisconnectHandler);
@@ -1279,7 +1280,7 @@ const PORT_GLUE_JS_TAIL: &str = r#"    try {
           axes.push(Number(gp.axes[a]) || 0);
         }
         reply({
-          tag: "gamepad", event: "state",
+          tag: TAG_GAMEPAD, event: "state",
           index: Number(gp.index),
           buttons: buttons,
           axes: axes,
@@ -1301,14 +1302,14 @@ const PORT_GLUE_JS_TAIL: &str = r#"    try {
       (value && typeof value === "object" && value.Watch !== undefined);
     if (!isQuery && !isWatch) return false;
     if (!doc || typeof doc.visibility() !== "string") {
-      reply({ tag: "visibility", ok: false, error: "unavailable" }, corId);
+      reply({ tag: TAG_VISIBILITY, ok: false, error: "unavailable" }, corId);
       return true;
     }
-    reply({ tag: "visibility", ok: true, visible: doc.visibility() === "visible" }, corId);
+    reply({ tag: TAG_VISIBILITY, ok: true, visible: doc.visibility() === "visible" }, corId);
     if (isWatch && doc.on) {
       // Each change event delivers a fresh reading; no correlation id on broadcasts.
       doc.on("visibilitychange", function () {
-        reply({ tag: "visibility", ok: true, visible: doc.visibility() === "visible" }, null);
+        reply({ tag: TAG_VISIBILITY, ok: true, visible: doc.visibility() === "visible" }, null);
       });
     }
     return true;
@@ -1324,24 +1325,24 @@ const PORT_GLUE_JS_TAIL: &str = r#"    try {
     if (!isMatch && !isWatch) return false;
     var query = isMatch ? value.Match : value.Watch;
     if (typeof query !== "string") {
-      reply({ tag: "media-query", ok: false, error: "unavailable" }, corId);
+      reply({ tag: TAG_MEDIA_QUERY, ok: false, error: "unavailable" }, corId);
       return true;
     }
     if (typeof window === "undefined" || typeof window.matchMedia !== "function") {
-      reply({ tag: "media-query", ok: false, error: "unavailable" }, corId);
+      reply({ tag: TAG_MEDIA_QUERY, ok: false, error: "unavailable" }, corId);
       return true;
     }
     var mql;
     try { mql = window.matchMedia(query); } catch (_e) { mql = null; }
     if (!mql) {
-      reply({ tag: "media-query", ok: false, error: "unavailable" }, corId);
+      reply({ tag: TAG_MEDIA_QUERY, ok: false, error: "unavailable" }, corId);
       return true;
     }
-    reply({ tag: "media-query", ok: true, matches: mql.matches === true }, corId);
+    reply({ tag: TAG_MEDIA_QUERY, ok: true, matches: mql.matches === true }, corId);
     if (isWatch && typeof mql.addEventListener === "function") {
       // Each change event delivers a fresh match result; no correlation id on broadcasts.
       mql.addEventListener("change", function (ev) {
-        reply({ tag: "media-query", ok: true, matches: ev.matches === true }, null);
+        reply({ tag: TAG_MEDIA_QUERY, ok: true, matches: ev.matches === true }, null);
       });
     }
     return true;
@@ -1357,17 +1358,17 @@ const PORT_GLUE_JS_TAIL: &str = r#"    try {
       (value && typeof value === "object" && value.Watch !== undefined);
     if (!isQuery && !isWatch) return false;
     if (typeof navigator === "undefined" || typeof navigator.onLine !== "boolean") {
-      reply({ tag: "connectivity", ok: false, error: "unavailable" }, corId);
+      reply({ tag: TAG_CONNECTIVITY, ok: false, error: "unavailable" }, corId);
       return true;
     }
-    reply({ tag: "connectivity", ok: true, online: navigator.onLine === true }, corId);
+    reply({ tag: TAG_CONNECTIVITY, ok: true, online: navigator.onLine === true }, corId);
     if (isWatch && typeof window !== "undefined" && typeof window.addEventListener === "function") {
       // Each online/offline event delivers a fresh state; no correlation id on broadcasts.
       window.addEventListener("online", function () {
-        reply({ tag: "connectivity", ok: true, online: true }, null);
+        reply({ tag: TAG_CONNECTIVITY, ok: true, online: true }, null);
       });
       window.addEventListener("offline", function () {
-        reply({ tag: "connectivity", ok: true, online: false }, null);
+        reply({ tag: TAG_CONNECTIVITY, ok: true, online: false }, null);
       });
     }
     return true;
@@ -1393,7 +1394,7 @@ const PORT_GLUE_JS_TAIL: &str = r#"    try {
     }
     // isWatch
     if (typeof window === "undefined" || typeof window.addEventListener !== "function") {
-      reply({ tag: "orientation", event: "unavailable" }, null);
+      reply({ tag: TAG_ORIENTATION, event: "unavailable" }, null);
       return true;
     }
     if (orientationHandler !== null && window.removeEventListener) {
@@ -1401,7 +1402,7 @@ const PORT_GLUE_JS_TAIL: &str = r#"    try {
     }
     orientationHandler = function (ev) {
       reply({
-        tag: "orientation",
+        tag: TAG_ORIENTATION,
         event: "reading",
         alpha: (ev.alpha !== null && ev.alpha !== undefined) ? Number(ev.alpha) : null,
         beta: (ev.beta !== null && ev.beta !== undefined) ? Number(ev.beta) : null,
@@ -1433,7 +1434,7 @@ const PORT_GLUE_JS_TAIL: &str = r#"    try {
     }
     // isWatch
     if (typeof window === "undefined" || typeof window.addEventListener !== "function") {
-      reply({ tag: "motion", event: "unavailable" }, null);
+      reply({ tag: TAG_MOTION, event: "unavailable" }, null);
       return true;
     }
     if (motionHandler !== null && window.removeEventListener) {
@@ -1444,7 +1445,7 @@ const PORT_GLUE_JS_TAIL: &str = r#"    try {
       var a = (ev.acceleration && typeof ev.acceleration === "object") ? ev.acceleration : {};
       var r = (ev.rotationRate && typeof ev.rotationRate === "object") ? ev.rotationRate : {};
       reply({
-        tag: "motion",
+        tag: TAG_MOTION,
         event: "reading",
         accelX: maybeNum(a.x),
         accelY: maybeNum(a.y),
@@ -1469,7 +1470,7 @@ const PORT_GLUE_JS_TAIL: &str = r#"    try {
     var isClose = value && typeof value === "object" && value.Close !== undefined;
     if (!isOpen && !isSend && !isClose) return false;
     if (typeof BroadcastChannel === "undefined") {
-      reply({ tag: "channel", event: "unavailable" }, null);
+      reply({ tag: TAG_CHANNEL, event: "unavailable" }, null);
       return true;
     }
     if (isOpen) {
@@ -1477,12 +1478,12 @@ const PORT_GLUE_JS_TAIL: &str = r#"    try {
       if (broadcastChannels[name]) { try { broadcastChannels[name].close(); } catch (_e) {} }
       var ch;
       try { ch = new BroadcastChannel(name); } catch (_e) {
-        reply({ tag: "channel", event: "unavailable" }, null);
+        reply({ tag: TAG_CHANNEL, event: "unavailable" }, null);
         return true;
       }
       ch.onmessage = function (ev) {
         var payload = typeof ev.data === "string" ? ev.data : JSON.stringify(ev.data);
-        reply({ tag: "channel", event: "message", payload: payload }, null);
+        reply({ tag: TAG_CHANNEL, event: "message", payload: payload }, null);
       };
       broadcastChannels[name] = ch;
       return true;
@@ -1525,7 +1526,7 @@ const PORT_GLUE_JS_TAIL: &str = r#"    try {
       if (doc && doc.on) {
         doc.on("fullscreenchange", function () {
           var isFull = !!doc.fullscreenElement();
-          reply({ tag: "fullscreen", event: "changed", fullscreen: isFull }, null);
+          reply({ tag: TAG_FULLSCREEN, event: "changed", fullscreen: isFull }, null);
         });
       }
       return true;
@@ -1533,23 +1534,23 @@ const PORT_GLUE_JS_TAIL: &str = r#"    try {
     if (isRequest) {
       var root = doc ? doc.root() : null;
       if (!root || typeof root.requestFullscreen !== "function") {
-        reply({ tag: "fullscreen", event: "unavailable" }, corId);
+        reply({ tag: TAG_FULLSCREEN, event: "unavailable" }, corId);
         return true;
       }
       root.requestFullscreen().then(
-        function () { reply({ tag: "fullscreen", event: "ok" }, corId); },
-        function () { reply({ tag: "fullscreen", event: "denied" }, corId); }
+        function () { reply({ tag: TAG_FULLSCREEN, event: "ok" }, corId); },
+        function () { reply({ tag: TAG_FULLSCREEN, event: "denied" }, corId); }
       );
       return true;
     }
     // isExit
     if (!doc || !doc.exitFullscreen) {
-      reply({ tag: "fullscreen", event: "unavailable" }, corId);
+      reply({ tag: TAG_FULLSCREEN, event: "unavailable" }, corId);
       return true;
     }
     doc.exitFullscreen().then(
-      function () { reply({ tag: "fullscreen", event: "ok" }, corId); },
-      function () { reply({ tag: "fullscreen", event: "denied" }, corId); }
+      function () { reply({ tag: TAG_FULLSCREEN, event: "ok" }, corId); },
+      function () { reply({ tag: TAG_FULLSCREEN, event: "denied" }, corId); }
     );
     return true;
   }
@@ -1566,27 +1567,27 @@ const PORT_GLUE_JS_TAIL: &str = r#"    try {
     if (!isLock && !isUnlock && !isQuery) return false;
     if (typeof screen === "undefined" || !screen.orientation ||
         typeof screen.orientation.type !== "string") {
-      reply({ tag: "screen-orientation", event: "unavailable" }, corId);
+      reply({ tag: TAG_SCREEN_ORIENTATION, event: "unavailable" }, corId);
       return true;
     }
     if (isQuery) {
-      reply({ tag: "screen-orientation", event: "orientation", type: screen.orientation.type }, corId);
+      reply({ tag: TAG_SCREEN_ORIENTATION, event: "orientation", type: screen.orientation.type }, corId);
       return true;
     }
     if (isUnlock) {
       try { screen.orientation.unlock(); } catch (_e) { /* best-effort */ }
-      reply({ tag: "screen-orientation", event: "ok" }, corId);
+      reply({ tag: TAG_SCREEN_ORIENTATION, event: "ok" }, corId);
       return true;
     }
     // isLock
     var lockType = typeof value.Lock === "string" ? value.Lock : "portrait-primary";
     if (typeof screen.orientation.lock !== "function") {
-      reply({ tag: "screen-orientation", event: "unavailable" }, corId);
+      reply({ tag: TAG_SCREEN_ORIENTATION, event: "unavailable" }, corId);
       return true;
     }
     screen.orientation.lock(lockType).then(
-      function () { reply({ tag: "screen-orientation", event: "ok" }, corId); },
-      function () { reply({ tag: "screen-orientation", event: "denied" }, corId); }
+      function () { reply({ tag: TAG_SCREEN_ORIENTATION, event: "ok" }, corId); },
+      function () { reply({ tag: TAG_SCREEN_ORIENTATION, event: "denied" }, corId); }
     );
     return true;
   }
@@ -1611,15 +1612,15 @@ const PORT_GLUE_JS_TAIL: &str = r#"    try {
     // isAcquire
     if (typeof navigator === "undefined" || !navigator.wakeLock ||
         typeof navigator.wakeLock.request !== "function") {
-      reply({ tag: "wake-lock", event: "unavailable" }, corId);
+      reply({ tag: TAG_WAKE_LOCK, event: "unavailable" }, corId);
       return true;
     }
     navigator.wakeLock.request("screen").then(
       function (sentinel) {
         wakeLockSentinel = sentinel;
-        reply({ tag: "wake-lock", event: "acquired" }, corId);
+        reply({ tag: TAG_WAKE_LOCK, event: "acquired" }, corId);
       },
-      function () { reply({ tag: "wake-lock", event: "denied" }, corId); }
+      function () { reply({ tag: TAG_WAKE_LOCK, event: "denied" }, corId); }
     );
     return true;
   }
@@ -1666,7 +1667,7 @@ const PORT_GLUE_JS_TAIL: &str = r#"    try {
     var name = err && err.name ? String(err.name) : "";
     var kind = (name === "NotAllowedError" || name === "SecurityError" ||
       name === "AbortError") ? "denied" : "unavailable";
-    reply({ tag: "web-authn", ok: false, error: kind }, corId);
+    reply({ tag: TAG_WEB_AUTHN, ok: false, error: kind }, corId);
   }
   function webAuthnSink(value, corId) {
     if (!value || typeof value !== "object") { return false; }
@@ -1678,7 +1679,7 @@ const PORT_GLUE_JS_TAIL: &str = r#"    try {
       return true; // recognised but uncorrelated — swallow, never broadcast
     }
     if (webAuthnUnavailable()) {
-      reply({ tag: "web-authn", ok: false, error: "unavailable" }, corId);
+      reply({ tag: TAG_WEB_AUTHN, ok: false, error: "unavailable" }, corId);
       return true;
     }
     if (isCreate) {
@@ -1702,11 +1703,11 @@ const PORT_GLUE_JS_TAIL: &str = r#"    try {
       navigator.credentials.create(createOpts).then(
         function (cred) {
           if (!cred || !cred.response) {
-            reply({ tag: "web-authn", ok: false, error: "unavailable" }, corId);
+            reply({ tag: TAG_WEB_AUTHN, ok: false, error: "unavailable" }, corId);
             return;
           }
           reply({
-            tag: "web-authn", ok: true, event: "registered",
+            tag: TAG_WEB_AUTHN, ok: true, event: "registered",
             id: String(cred.id || ""),
             rawId: bufToB64url(cred.rawId),
             clientDataJson: bufToB64url(cred.response.clientDataJSON),
@@ -1732,11 +1733,11 @@ const PORT_GLUE_JS_TAIL: &str = r#"    try {
     navigator.credentials.get(getOpts).then(
       function (cred) {
         if (!cred || !cred.response) {
-          reply({ tag: "web-authn", ok: false, error: "unavailable" }, corId);
+          reply({ tag: TAG_WEB_AUTHN, ok: false, error: "unavailable" }, corId);
           return;
         }
         reply({
-          tag: "web-authn", ok: true, event: "asserted",
+          tag: TAG_WEB_AUTHN, ok: true, event: "asserted",
           id: String(cred.id || ""),
           rawId: bufToB64url(cred.rawId),
           clientDataJson: bufToB64url(cred.response.clientDataJSON),
@@ -1749,8 +1750,65 @@ const PORT_GLUE_JS_TAIL: &str = r#"    try {
     );
     return true;
   }
+  // Ipe.Browser.Permission: `Query name` / `Watch name` ->
+  // navigator.permissions.query({ name }). Only a constructor named in
+  // PERMISSION_NAMES matches, so a geolocation `{ Watch: opts }` record is never
+  // taken here. A `Watch` adds one `change` listener per name, broadcast.
+  var permissionWatched = Object.create(null);
+  function permissionSink(value, corId) {
+    if (!value || typeof value !== "object") return false;
+    var watch;
+    var ctor;
+    if (ownKey(value, "Query") && typeof value.Query === "string") {
+      watch = false;
+      ctor = value.Query;
+    } else if (ownKey(value, "Watch") && typeof value.Watch === "string") {
+      watch = true;
+      ctor = value.Watch;
+    } else {
+      return false;
+    }
+    var name = PERMISSION_NAMES[ctor];
+    if (typeof name !== "string") return false;
+    var unavailable = function () {
+      reply({ tag: TAG_PERMISSION, ok: false, error: "unavailable", name: name }, corId);
+    };
+    var readState = function (status) {
+      var state = status && typeof status.state === "string" ? status.state : "";
+      return state === "granted" || state === "denied" || state === "prompt" ? state : null;
+    };
+    if (!navigator || !navigator.permissions || typeof navigator.permissions.query !== "function") {
+      unavailable();
+      return true;
+    }
+    var pending;
+    try { pending = navigator.permissions.query({ name: name }); } catch (_e) { pending = null; }
+    if (!pending || typeof pending.then !== "function") {
+      unavailable();
+      return true;
+    }
+    pending.then(
+      function (status) {
+        var state = readState(status);
+        if (state === null) { unavailable(); return; }
+        reply({ tag: TAG_PERMISSION, ok: true, name: name, state: state }, corId);
+        if (!watch || permissionWatched[name] === true ||
+            typeof status.addEventListener !== "function") return;
+        permissionWatched[name] = true;
+        status.addEventListener("change", function () {
+          var changed = readState(status);
+          if (changed !== null) {
+            reply({ tag: TAG_PERMISSION, ok: true, name: name, state: changed }, null);
+          }
+        });
+      },
+      unavailable
+    );
+    return true;
+  }
   function builtinSink(value, corId) {
     if (clipboardSink(value, corId)) return true;
+    if (permissionSink(value, corId)) return true;
     if (geolocationSink(value, corId)) return true;
     if (notificationSink(value, corId)) return true;
     if (pushSink(value, corId)) return true;
@@ -1801,10 +1859,22 @@ const PORT_GLUE_JS_TAIL: &str = r#"    try {
   }
   // The runtime calls this with each outbound seal frame (a JSON string).
   window.ipeOnReceive = deliver;
+  // Whether a page value, judged on the exact JSON bytes it serialises to,
+  // carries a reserved first-party tag at its top level or in its `payload`.
+  function carriesReservedTag(raw) {
+    var value;
+    try { value = JSON.parse(raw); } catch (_e) { return true; }
+    if (!value || typeof value !== "object") return false;
+    if (ownKey(value, "tag") && RESERVED_TAGS[value.tag] === true) return true;
+    var payload = ownKey(value, "payload") ? value.payload : null;
+    return !!payload && typeof payload === "object" &&
+      ownKey(payload, "tag") && RESERVED_TAGS[payload.tag] === true;
+  }
   window.ipe = {
     send: function (value) {
       var raw;
       try { raw = JSON.stringify(value); } catch (_e) { return; }
+      if (typeof raw !== "string" || carriesReservedTag(raw)) return;
       if (typeof window.__ipePortSend === "function") {
         window.__ipePortSend(raw);
       }
@@ -1831,6 +1901,98 @@ fn push_encode_escaped_js() -> String {
         "var PUSH_ENCODE_ESCAPED = new RegExp(\"[\" + String.fromCodePoint({}) + \"]\", \"gu\");",
         points.join(", ")
     )
+}
+
+/// The frame tag of each first-party sink the native bridge does not carry.
+///
+/// Each pair is the glue constant and its wire name; the wire name is the
+/// capability's `js-port:<wire>` suffix, so an `Ipe.Browser.*.Internals`
+/// decoder's `portTag` matches the frames its own sink replies with. The bridge
+/// capabilities take their tag from [`native_bridge::BridgeCap`] instead.
+pub(crate) const FRAME_TAGS: &[(&str, &str)] = &[
+    ("TAG_GEOLOCATION", "geolocation"),
+    ("TAG_CLIPBOARD", "clipboard"),
+    ("TAG_STORAGE", "storage"),
+    ("TAG_VIBRATION", "vibration"),
+    ("TAG_SHARE", "share"),
+    ("TAG_BATTERY", "battery"),
+    ("TAG_NETWORK_INFO", "network-info"),
+    ("TAG_FILE", "file"),
+    ("TAG_CAMERA", "camera"),
+    ("TAG_MICROPHONE", "microphone"),
+    ("TAG_GAMEPAD", "gamepad"),
+    ("TAG_RECORDER", "recorder"),
+    ("TAG_VISIBILITY", "visibility"),
+    ("TAG_MEDIA_QUERY", "media-query"),
+    ("TAG_CONNECTIVITY", "connectivity"),
+    ("TAG_SPEECH", "speech"),
+    ("TAG_PERMISSION", "permission"),
+    ("TAG_ORIENTATION", "orientation"),
+    ("TAG_MOTION", "motion"),
+    ("TAG_CHANNEL", "channel"),
+    ("TAG_FULLSCREEN", "fullscreen"),
+    ("TAG_SCREEN_ORIENTATION", "screen-orientation"),
+    ("TAG_WAKE_LOCK", "wake-lock"),
+    ("TAG_WEB_AUTHN", "web-authn"),
+];
+
+/// The glue constant holding a bridge capability's frame tag.
+const fn bridge_frame_tag(cap: native_bridge::BridgeCap) -> &'static str {
+    match cap {
+        native_bridge::BridgeCap::Notification => "TAG_NOTIFICATION",
+        native_bridge::BridgeCap::Push => "TAG_PUSH",
+    }
+}
+
+/// The W3C Permissions API name of each `Ipe.Browser.Permission` constructor.
+///
+/// The permission sink accepts only these constructors and queries the paired
+/// name, which `Ipe.Browser.Permission.Internals.nameToken` also yields.
+pub const PERMISSION_NAMES: &[(&str, &str)] = &[
+    ("Camera", "camera"),
+    ("Microphone", "microphone"),
+    ("Geolocation", "geolocation"),
+    ("Notifications", "notifications"),
+    ("PersistentStorage", "persistent-storage"),
+    ("ClipboardRead", "clipboard-read"),
+    ("ClipboardWrite", "clipboard-write"),
+    ("MidiSysex", "midi"),
+];
+
+/// The frame tag constants, the reserved tag set and the permission names.
+fn frame_tags_js() -> Vec<String> {
+    let mut lines: Vec<String> = FRAME_TAGS
+        .iter()
+        .map(|(name, wire)| format!("var {name} = {};", js_string(wire)))
+        .collect();
+    for cap in native_bridge::BridgeCap::ALL {
+        lines.push(format!(
+            "var {} = {};",
+            bridge_frame_tag(*cap),
+            cap.glue_name()
+        ));
+    }
+    lines.push("var RESERVED_TAGS = Object.create(null);".to_owned());
+    let names = FRAME_TAGS.iter().map(|(name, _)| *name).chain(
+        native_bridge::BridgeCap::ALL
+            .iter()
+            .copied()
+            .map(bridge_frame_tag),
+    );
+    for name in names {
+        lines.push(format!("RESERVED_TAGS[{name}] = true;"));
+    }
+    lines.push("Object.freeze(RESERVED_TAGS);".to_owned());
+    lines.push("var PERMISSION_NAMES = Object.create(null);".to_owned());
+    for (ctor, token) in PERMISSION_NAMES {
+        lines.push(format!(
+            "PERMISSION_NAMES[{}] = {};",
+            js_string(ctor),
+            js_string(token)
+        ));
+    }
+    lines.push("Object.freeze(PERMISSION_NAMES);".to_owned());
+    lines
 }
 
 /// The bridge constants the glue reads, each rendered from its one Rust definition.
@@ -1885,6 +2047,7 @@ fn bridge_constants_js() -> String {
         .map(BridgeCap::glue_name)
         .collect();
     lines.push(format!("var BRIDGE_CAPS = [{}];", caps.join(", ")));
+    lines.extend(frame_tags_js());
     for op in BridgeOp::ALL {
         lines.push(format!(
             "var {} = [{}, {}];",
@@ -2233,7 +2396,7 @@ mod tests {
         // throw: both the denied and the unavailable branches reply, no `eval`.
         assert!(js.contains("\"denied\""));
         assert!(js.contains("\"unavailable\""));
-        assert!(js.contains("tag: \"clipboard\""));
+        assert!(js.contains("tag: TAG_CLIPBOARD"));
         assert!(js.contains("reply("));
     }
 
@@ -2248,7 +2411,7 @@ mod tests {
         // …emits the two success events…
         assert!(js.contains("event: \"registered\""));
         assert!(js.contains("event: \"asserted\""));
-        assert!(js.contains("tag: \"web-authn\""));
+        assert!(js.contains("tag: TAG_WEB_AUTHN"));
         // …carries every buffer field as base64url, never raw bytes…
         assert!(js.contains("bufToB64url"));
         assert!(js.contains("b64urlToBuf"));
@@ -2278,7 +2441,7 @@ mod tests {
         assert!(js.contains("Current"));
         assert!(js.contains("Watch"));
         // …resolves a position to a typed Coords frame…
-        assert!(js.contains("tag: \"geolocation\""));
+        assert!(js.contains("tag: TAG_GEOLOCATION"));
         assert!(js.contains("lat:"));
         assert!(js.contains("lng:"));
         assert!(js.contains("accuracy:"));
@@ -2298,7 +2461,7 @@ mod tests {
         assert!(js.contains("RequestPermission"));
         assert!(js.contains("value.Show"));
         // …resolves a grant / display to a typed frame…
-        assert!(js.contains("tag: \"notification\""));
+        assert!(js.contains("tag: TAG_NOTIFICATION"));
         assert!(js.contains("\"granted\""));
         assert!(js.contains("\"shown\""));
         // …and traps a denial / absence to a typed inbound frame, never a throw.
@@ -2428,7 +2591,7 @@ mod tests {
         assert!(js.contains("value.Get"));
         assert!(js.contains("value.Set"));
         // …resolves reads / writes to typed events…
-        assert!(js.contains("tag: \"storage\""));
+        assert!(js.contains("tag: TAG_STORAGE"));
         assert!(js.contains("event: \"get\""));
         assert!(js.contains("event: \"set\""));
         // …and traps a private-mode / absent store to a typed frame, never a throw.
@@ -2444,7 +2607,7 @@ mod tests {
         assert!(js.contains("value.Vibrate"));
         assert!(js.contains("value.Pattern"));
         // …acknowledges a supported actuator…
-        assert!(js.contains("tag: \"vibration\""));
+        assert!(js.contains("tag: TAG_VIBRATION"));
         // …and traps an absent actuator to a typed frame, never a throw.
         assert!(js.contains("\"unavailable\""));
         assert!(!js.contains("eval("));
@@ -2457,7 +2620,7 @@ mod tests {
         assert!(js.contains("navigator.share"));
         assert!(js.contains("value.Share"));
         // …acknowledges a completion…
-        assert!(js.contains("tag: \"share\""));
+        assert!(js.contains("tag: TAG_SHARE"));
         // …and enumerates the cancel + unavailable outcomes, never a throw.
         assert!(js.contains("AbortError"));
         assert!(js.contains("\"cancelled\""));
@@ -2554,7 +2717,7 @@ mod tests {
         // The first-party Ipe.Browser.Battery sink reaches navigator.getBattery…
         assert!(js.contains("navigator.getBattery"));
         // …emits a typed reading with all four status fields…
-        assert!(js.contains("tag: \"battery\""));
+        assert!(js.contains("tag: TAG_BATTERY"));
         assert!(js.contains("charging:"));
         assert!(js.contains("level:"));
         assert!(js.contains("chargingTime:"));
@@ -2570,7 +2733,7 @@ mod tests {
         // The first-party Ipe.Browser.NetworkInfo sink reaches navigator.connection…
         assert!(js.contains("navigator.connection"));
         // …emits a typed reading with all four hint fields…
-        assert!(js.contains("tag: \"network-info\""));
+        assert!(js.contains("tag: TAG_NETWORK_INFO"));
         assert!(js.contains("effectiveType:"));
         assert!(js.contains("downlink:"));
         assert!(js.contains("rtt:"));
@@ -2591,7 +2754,7 @@ mod tests {
         assert!(js.contains("FileReader"));
         assert!(js.contains("readAsDataURL"));
         // …resolves a selection to a typed frame with name / mime / dataUrl fields…
-        assert!(js.contains("tag: \"file-picker\""));
+        assert!(js.contains("tag: TAG_FILE"));
         assert!(js.contains("name:"));
         assert!(js.contains("mime:"));
         assert!(js.contains("dataUrl:"));
@@ -2613,7 +2776,7 @@ mod tests {
         assert!(js.contains("FileReader"));
         assert!(js.contains("readAsDataURL"));
         // …resolves a capture to a typed frame with name / mime / dataUrl fields…
-        assert!(js.contains("tag: \"camera\""));
+        assert!(js.contains("tag: TAG_CAMERA"));
         // …and enumerates the cancelled + unavailable outcomes, never a throw.
         assert!(js.contains("\"cancelled\""));
         assert!(js.contains("\"unavailable\""));
@@ -2635,7 +2798,7 @@ mod tests {
         assert!(js.contains("FileReader"));
         assert!(js.contains("readAsDataURL"));
         // …resolves a recording to a typed frame with data / mime / durationMs fields…
-        assert!(js.contains("tag: \"microphone\""));
+        assert!(js.contains("tag: TAG_MICROPHONE"));
         assert!(js.contains("data:"));
         assert!(js.contains("durationMs:"));
         // …and enumerates the denied + unavailable outcomes, never a throw / eval.
@@ -2659,7 +2822,7 @@ mod tests {
         assert!(js.contains("{ audio: true, video: true }"));
         assert!(js.contains("{ audio: true }"));
         // Delivers a session-stream of typed started / chunk / ended frames.
-        assert!(js.contains("tag: \"recorder\""));
+        assert!(js.contains("tag: TAG_RECORDER"));
         assert!(js.contains("event: \"started\""));
         assert!(js.contains("event: \"chunk\""));
         assert!(js.contains("event: \"ended\""));
@@ -2710,7 +2873,7 @@ mod tests {
         assert!(js.contains("utterance.volume"));
         assert!(js.contains("utterance.lang"));
         // …resolves a completed utterance to a typed Spoken frame…
-        assert!(js.contains("tag: \"speech\""));
+        assert!(js.contains("tag: TAG_SPEECH"));
         assert!(js.contains("ok: true"));
         // …and traps absence + failure to typed frames, never a throw / eval.
         assert!(js.contains("\"unavailable\""));
@@ -2726,7 +2889,7 @@ mod tests {
         assert!(js.contains("visibility: prop(\"visibilityState\")"));
         assert!(js.contains("visibilitychange"));
         // …emits a typed reading with the `visible` boolean field…
-        assert!(js.contains("tag: \"visibility\""));
+        assert!(js.contains("tag: TAG_VISIBILITY"));
         assert!(js.contains("visible:"));
         // …and traps an absent API to a typed frame, never a throw.
         assert!(js.contains("\"unavailable\""));
@@ -2741,7 +2904,7 @@ mod tests {
         assert!(js.contains("window.matchMedia"));
         assert!(js.contains("mql.matches"));
         // …emits a typed reading with the `matches` boolean field…
-        assert!(js.contains("tag: \"media-query\""));
+        assert!(js.contains("tag: TAG_MEDIA_QUERY"));
         assert!(js.contains("matches:"));
         // …and traps an absent API to a typed frame, never a throw.
         assert!(js.contains("\"unavailable\""));
@@ -2758,7 +2921,7 @@ mod tests {
         assert!(js.contains("\"online\""));
         assert!(js.contains("\"offline\""));
         // …emits a typed reading with the `online` boolean field…
-        assert!(js.contains("tag: \"connectivity\""));
+        assert!(js.contains("tag: TAG_CONNECTIVITY"));
         assert!(js.contains("online:"));
         // …and traps an absent API to a typed frame, never a throw.
         assert!(js.contains("\"unavailable\""));
@@ -2794,7 +2957,7 @@ mod tests {
         // …reaches navigator.getGamepads() for state frames…
         assert!(js.contains("navigator.getGamepads"));
         // …emits typed connect / disconnect / state frames with the right fields…
-        assert!(js.contains("tag: \"gamepad\""));
+        assert!(js.contains("tag: TAG_GAMEPAD"));
         assert!(js.contains("event: \"connected\""));
         assert!(js.contains("event: \"disconnected\""));
         assert!(js.contains("event: \"state\""));
@@ -2810,7 +2973,7 @@ mod tests {
         let js = port_glue_js();
         assert!(js.contains("orientationSink"));
         assert!(js.contains("deviceorientation"));
-        assert!(js.contains("tag: \"orientation\""));
+        assert!(js.contains("tag: TAG_ORIENTATION"));
         assert!(js.contains("event: \"reading\""));
         assert!(js.contains("alpha:"));
         assert!(js.contains("beta:"));
@@ -2824,7 +2987,7 @@ mod tests {
         let js = port_glue_js();
         assert!(js.contains("motionSink"));
         assert!(js.contains("devicemotion"));
-        assert!(js.contains("tag: \"motion\""));
+        assert!(js.contains("tag: TAG_MOTION"));
         assert!(js.contains("event: \"reading\""));
         assert!(js.contains("accelX:"));
         assert!(js.contains("rotAlpha:"));
@@ -2837,7 +3000,7 @@ mod tests {
         let js = port_glue_js();
         assert!(js.contains("channelSink"));
         assert!(js.contains("BroadcastChannel"));
-        assert!(js.contains("tag: \"channel\""));
+        assert!(js.contains("tag: TAG_CHANNEL"));
         assert!(js.contains("event: \"message\""));
         assert!(js.contains("event: \"unavailable\""));
         assert!(!js.contains("eval("));
@@ -2850,7 +3013,7 @@ mod tests {
         assert!(js.contains("requestFullscreen"));
         assert!(js.contains("exitFullscreen"));
         assert!(js.contains("fullscreenchange"));
-        assert!(js.contains("tag: \"fullscreen\""));
+        assert!(js.contains("tag: TAG_FULLSCREEN"));
         assert!(js.contains("event: \"ok\""));
         assert!(js.contains("event: \"denied\""));
         assert!(js.contains("event: \"unavailable\""));
@@ -2862,7 +3025,7 @@ mod tests {
         let js = port_glue_js();
         assert!(js.contains("screenOrientationSink"));
         assert!(js.contains("screen.orientation"));
-        assert!(js.contains("tag: \"screen-orientation\""));
+        assert!(js.contains("tag: TAG_SCREEN_ORIENTATION"));
         assert!(js.contains("event: \"orientation\""));
         assert!(js.contains("event: \"ok\""));
         assert!(js.contains("event: \"unavailable\""));
@@ -2875,10 +3038,261 @@ mod tests {
         assert!(js.contains("wakeLockSink"));
         assert!(js.contains("navigator.wakeLock"));
         assert!(js.contains("wakeLock.request"));
-        assert!(js.contains("tag: \"wake-lock\""));
+        assert!(js.contains("tag: TAG_WAKE_LOCK"));
         assert!(js.contains("event: \"acquired\""));
         assert!(js.contains("event: \"denied\""));
         assert!(js.contains("event: \"unavailable\""));
         assert!(!js.contains("eval("));
+    }
+
+    /// The frame tags are exactly the web capabilities' wire names, `raw` aside,
+    /// and the bridge capabilities' tags are their bridge wire names.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn frame_tags_are_the_web_capability_wire_names() {
+        use ipe_kernels::WebCapability;
+        use native_bridge::BridgeCap;
+        use std::collections::BTreeSet;
+        let tags: BTreeSet<&str> = FRAME_TAGS
+            .iter()
+            .map(|(_, wire)| *wire)
+            .chain(BridgeCap::ALL.iter().copied().map(BridgeCap::as_str))
+            .collect();
+        let wires: BTreeSet<&str> = WebCapability::ALL
+            .iter()
+            .copied()
+            .filter(|cap| *cap != WebCapability::Raw)
+            .map(WebCapability::as_str)
+            .collect();
+        assert_eq!(tags, wires);
+        assert_eq!(
+            FRAME_TAGS.len() + BridgeCap::ALL.len(),
+            wires.len(),
+            "no wire name is listed twice"
+        );
+        for (name, wire) in FRAME_TAGS {
+            let expected = format!("TAG_{}", wire.to_ascii_uppercase().replace('-', "_"));
+            assert_eq!(*name, expected.as_str());
+        }
+        for cap in BridgeCap::ALL {
+            let expected = format!("TAG_{}", cap.as_str().to_ascii_uppercase());
+            assert_eq!(bridge_frame_tag(*cap), expected.as_str());
+        }
+    }
+
+    /// Every frame tag reaches the glue through its one constant binding.
+    #[test]
+    fn glue_names_every_frame_tag_through_its_constant() {
+        use native_bridge::BridgeCap;
+        let js = port_glue_js();
+        for literal in ["tag: \"", "tag:\"", "tag = \"", "\"file-picker\""] {
+            assert_eq!(js.matches(literal).count(), 0, "{literal}");
+        }
+        for (name, wire) in FRAME_TAGS {
+            let binding = format!("  var {name} = \"{wire}\";\n");
+            assert_eq!(js.matches(binding.as_str()).count(), 1, "{binding}");
+            let declared = format!("var {name} ");
+            assert_eq!(js.matches(declared.as_str()).count(), 1, "{name}");
+        }
+        for cap in BridgeCap::ALL {
+            let binding = format!("  var {} = {};\n", bridge_frame_tag(*cap), cap.glue_name());
+            assert_eq!(js.matches(binding.as_str()).count(), 1, "{binding}");
+        }
+        assert_eq!(
+            js.matches("var TAG_").count(),
+            FRAME_TAGS.len() + BridgeCap::ALL.len()
+        );
+    }
+
+    /// Every reserved tag is emitted by a first-party sink, and the reserved set
+    /// is the frozen table of exactly those tags.
+    #[test]
+    fn every_reserved_tag_has_a_sink_that_replies_with_it() {
+        use native_bridge::BridgeCap;
+        let js = port_glue_js();
+        let names = FRAME_TAGS
+            .iter()
+            .map(|(name, _)| *name)
+            .chain(BridgeCap::ALL.iter().copied().map(bridge_frame_tag));
+        for name in names {
+            let field = format!("tag: {name},");
+            let assigned = format!(".tag = {name};");
+            let emitted =
+                js.matches(field.as_str()).count() + js.matches(assigned.as_str()).count();
+            assert!(emitted > 0, "{name} has no sink replying with it");
+            let reserved = format!("  RESERVED_TAGS[{name}] = true;\n");
+            assert_eq!(js.matches(reserved.as_str()).count(), 1, "{reserved}");
+        }
+        assert_eq!(
+            js.matches("  RESERVED_TAGS[").count(),
+            FRAME_TAGS.len() + BridgeCap::ALL.len()
+        );
+        assert_eq!(
+            js.matches("  var RESERVED_TAGS = Object.create(null);\n")
+                .count(),
+            1
+        );
+        assert_eq!(js.matches("  Object.freeze(RESERVED_TAGS);\n").count(), 1);
+    }
+
+    /// The arguments of the call whose opening parenthesis is at `open`, split
+    /// at top-level commas, or `None` when the parentheses never balance.
+    fn call_arguments(js: &str, open: usize) -> Option<Vec<String>> {
+        let mut depth = 0usize;
+        let mut quote: Option<char> = None;
+        let mut args = vec![String::new()];
+        for c in js.get(open..)?.chars() {
+            if let Some(q) = quote {
+                args.last_mut()?.push(c);
+                if c == q {
+                    quote = None;
+                }
+                continue;
+            }
+            match c {
+                '"' | '\'' => quote = Some(c),
+                '(' | '{' | '[' => {
+                    depth += 1;
+                    if depth == 1 {
+                        continue;
+                    }
+                }
+                ')' | '}' | ']' => {
+                    depth = depth.checked_sub(1)?;
+                    if depth == 0 {
+                        return Some(args.into_iter().map(|a| a.trim().to_owned()).collect());
+                    }
+                }
+                ',' if depth == 1 => {
+                    args.push(String::new());
+                    continue;
+                }
+                _ => {}
+            }
+            args.last_mut()?.push(c);
+        }
+        None
+    }
+
+    /// The top-level keys of an object literal.
+    fn object_keys(object: &str) -> Vec<String> {
+        let inner = object
+            .strip_prefix('{')
+            .and_then(|o| o.strip_suffix('}'))
+            .unwrap_or("");
+        let mut keys = Vec::new();
+        let mut depth = 0usize;
+        let mut quote: Option<char> = None;
+        let mut field = String::new();
+        let mut at_key = true;
+        for c in inner.chars() {
+            if let Some(q) = quote {
+                if c == q {
+                    quote = None;
+                }
+                continue;
+            }
+            match c {
+                '"' | '\'' => quote = Some(c),
+                '(' | '{' | '[' => depth += 1,
+                ')' | '}' | ']' => depth = depth.saturating_sub(1),
+                ',' if depth == 0 => {
+                    at_key = true;
+                    field.clear();
+                }
+                ':' if depth == 0 && at_key => {
+                    keys.push(field.trim().to_owned());
+                    at_key = false;
+                }
+                _ if at_key => field.push(c),
+                _ => {}
+            }
+        }
+        keys
+    }
+
+    /// No correlated reply carries a top-level `payload`, which the waiter
+    /// unwraps, so a correlated frame always reaches its decoder with its tag.
+    #[test]
+    fn no_correlated_reply_hides_its_tag_under_a_payload() {
+        let js = port_glue_js();
+        let mut literal_frames = 0usize;
+        let mut payload_frames = 0usize;
+        let mut variable_frames = Vec::new();
+        for callee in ["reply(", "answer("] {
+            for (at, _) in js.match_indices(callee) {
+                let open = at + callee.len() - 1;
+                let args = call_arguments(js, open);
+                assert!(args.is_some(), "unbalanced call at byte {at}");
+                let Some(args) = args else { continue };
+                let frame = args.first().map_or("", String::as_str);
+                if !frame.starts_with('{') {
+                    variable_frames.push(format!("{callee}{})", args.join(", ")));
+                    continue;
+                }
+                literal_frames += 1;
+                if object_keys(frame).iter().any(|key| key == "payload") {
+                    payload_frames += 1;
+                    assert_eq!(callee, "reply(", "an answer is correlated: {frame}");
+                    assert_eq!(args.get(1).map(String::as_str), Some("null"), "{frame}");
+                }
+            }
+        }
+        assert!(literal_frames > 100, "the scan reads the sinks' frames");
+        assert_eq!(
+            payload_frames, 1,
+            "the channel message is the one payload frame"
+        );
+        variable_frames.sort();
+        assert_eq!(
+            variable_frames,
+            ["reply(frame, corId)", "reply(frame, corId)"],
+            "every other frame is an object literal the scan reads"
+        );
+    }
+
+    /// `ipe.send` judges the exact bytes it would send and refuses a reserved
+    /// tag at the top level or under `payload`, read as own properties only.
+    #[test]
+    fn page_send_refuses_a_reserved_tag_before_the_port() {
+        let js = port_glue_js();
+        let send = "      try { raw = JSON.stringify(value); } catch (_e) { return; }\n      if (typeof raw !== \"string\" || carriesReservedTag(raw)) return;\n      if (typeof window.__ipePortSend === \"function\") {\n        window.__ipePortSend(raw);";
+        assert_eq!(js.matches(send).count(), 1);
+        for check in [
+            "try { value = JSON.parse(raw); } catch (_e) { return true; }",
+            "if (ownKey(value, \"tag\") && RESERVED_TAGS[value.tag] === true) return true;",
+            "var payload = ownKey(value, \"payload\") ? value.payload : null;",
+            "ownKey(payload, \"tag\") && RESERVED_TAGS[payload.tag] === true;",
+        ] {
+            assert_eq!(js.matches(check).count(), 1, "{check}");
+        }
+        assert_eq!(js.matches("carriesReservedTag(").count(), 2);
+    }
+
+    /// The permission sink reaches `navigator.permissions.query` for a known
+    /// constructor only, ahead of the geolocation sink's `Watch` shape.
+    #[test]
+    fn permission_sink_queries_only_a_known_name_and_traps_absence() {
+        let js = port_glue_js();
+        for site in [
+            "navigator.permissions.query({ name: name })",
+            "var name = PERMISSION_NAMES[ctor];\n    if (typeof name !== \"string\") return false;",
+            "reply({ tag: TAG_PERMISSION, ok: true, name: name, state: state }, corId);",
+            "reply({ tag: TAG_PERMISSION, ok: false, error: \"unavailable\", name: name }, corId);",
+            "reply({ tag: TAG_PERMISSION, ok: true, name: name, state: changed }, null);",
+        ] {
+            assert_eq!(js.matches(site).count(), 1, "{site}");
+        }
+        let permission = js.find("if (permissionSink(value, corId)) return true;");
+        let geolocation = js.find("if (geolocationSink(value, corId)) return true;");
+        assert!(matches!((permission, geolocation), (Some(p), Some(g)) if p < g));
+        for (ctor, token) in PERMISSION_NAMES {
+            let binding = format!("  PERMISSION_NAMES[\"{ctor}\"] = \"{token}\";\n");
+            assert_eq!(js.matches(binding.as_str()).count(), 1, "{binding}");
+        }
+        assert_eq!(
+            js.matches("  Object.freeze(PERMISSION_NAMES);\n").count(),
+            1
+        );
     }
 }

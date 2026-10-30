@@ -666,6 +666,12 @@ pub struct Builtins {
     /// `StoreEqBy` kernel scheme (`Codec t -> …`), so an enum/newtype column's
     /// comparison value is projected to a bound `SqlValue` through its own codec.
     pub codec_con: Symbol,
+    /// `"Remote"` — the `Ipe.Remote.Remote req resp` server-endpoint ADT, homed
+    /// via [`Self::remote_home`].
+    pub remote_con: Symbol,
+    /// `"RemoteAuth"` — the `Ipe.Remote.RemoteAuth` session signing key ADT,
+    /// homed via [`Self::remote_home`].
+    pub remote_auth_con: Symbol,
     /// `"Step"` — the `Ipe.Task.Step` loop-step ADT (`Continue s | Done a`).
     /// Consumed by the `Task.loop` kernel scheme; homed via
     /// [`Self::task_home`] so the scheme's `Step` is the compiled-module enum.
@@ -780,6 +786,10 @@ pub struct Builtins {
     /// is the same nominal type `Ipe.Task` declares, and a point-free reference
     /// lowers to that emitted enum (mirrors [`Self::duration_home`]).
     pub task_home: Vec<Symbol>,
+    /// The interned module segments `["Ipe", "Remote"]` — the real home of the
+    /// `Remote` and `RemoteAuth` ADTs, so a type naming either is the type
+    /// `Ipe.Remote` declares (mirrors [`Self::duration_home`]).
+    pub remote_home: Vec<Symbol>,
 }
 
 impl Builtins {
@@ -1062,6 +1072,8 @@ impl Builtins {
             policy_con: interner.intern("Policy")?,
             order_con: interner.intern("Order")?,
             codec_con: interner.intern("Codec")?,
+            remote_con: interner.intern("Remote")?,
+            remote_auth_con: interner.intern("RemoteAuth")?,
             task_step: interner.intern("Step")?,
             // ── ProjectionTerm / ProjectionOperand ──────────────────────────────
             projection_term: interner.intern("ProjectionTerm")?,
@@ -1091,6 +1103,7 @@ impl Builtins {
             email_home: vec![interner.intern("Ipe")?, interner.intern("Email")?],
             duration_home: vec![interner.intern("Ipe")?, interner.intern("Duration")?],
             task_home: vec![interner.intern("Ipe")?, interner.intern("Task")?],
+            remote_home: vec![interner.intern("Ipe")?, interner.intern("Remote")?],
         })
     }
 

@@ -8335,7 +8335,9 @@ const fn tag_carrier(tag: ipe_kernels::BuiltinTag) -> TagCarrier {
         | BuiltinTag::DbPred
         | BuiltinTag::DbSecured
         | BuiltinTag::DbOrder
-        | BuiltinTag::Codec => TagCarrier::Opaque,
+        | BuiltinTag::Codec
+        | BuiltinTag::Remote
+        | BuiltinTag::RemoteAuth => TagCarrier::Opaque,
     }
 }
 
@@ -19545,6 +19547,26 @@ impl<'a> Lowerer<'a> {
                 .contains_key(&(ModPath(home.to_vec()), name))
     }
 
+    /// Whether `(home, name)` is an `Ipe.Remote` endpoint type (`Remote` or
+    /// `RemoteAuth`), read by its home-keyed builtin row.
+    ///
+    /// Neither type has a lowering yet, so a program naming one is refused
+    /// with IPE-L0108 ahead of the program-union arm its compiled-source
+    /// declaration would otherwise take. A user type spelled `Remote` in
+    /// another home is not this row and lowers as itself.
+    fn is_remote_head(&self, home: &[Symbol], name: Symbol) -> DResult<bool> {
+        let segments = home
+            .iter()
+            .map(|seg| self.resolve(*seg))
+            .collect::<DResult<Vec<&str>>>()?;
+        let tag = ipe_kernels::BuiltinType::of_head(&segments, self.resolve(name)?)
+            .and_then(|head| head.row().tag());
+        Ok(matches!(
+            tag,
+            Some(ipe_kernels::BuiltinTag::Remote | ipe_kernels::BuiltinTag::RemoteAuth)
+        ))
+    }
+
     /// Lower an annotated program-union application to its `IrType::Enum`.
     fn program_enum_from_canon(
         &self,
@@ -19774,6 +19796,12 @@ impl<'a> Lowerer<'a> {
             // the same generic scope so `Opt Int` → `Enum { Opt, [Int] }` and
             // `Opt a` (inside a generic signature) → `Enum { Opt, [Generic a] }`.
             canon::Type::Con { home, name, args } => match self.resolve(*name)? {
+                // `Ipe.Remote`'s endpoint types have no lowering: an annotation
+                // naming one fails closed here, before its compiled-source union
+                // would lower as a program enum.
+                _ if self.is_remote_head(home, *name)? => {
+                    Err(unsupported(Span::DUMMY, Feature::Kernels))
+                }
                 // A program union that is NOT the builtin of its name (a user ADT,
                 // or a stdlib union listed as its own head) lowers by its
                 // `(home, name)` identity before any bare-name builtin arm below,
@@ -21813,6 +21841,11 @@ impl<'a> Lowerer<'a> {
             // matches `ir_type_from_canon`, so the inferred and annotated paths
             // agree. See `ipe_kernels::BUILTIN_TYPES` for the per-name roles.
             Ty::Con { name, args, module } => match self.resolve(*name)? {
+                // Twin of the `ir_type_from_canon` arm: `Ipe.Remote`'s endpoint
+                // types have no lowering and fail closed.
+                _ if self.is_remote_head(module, *name)? => {
+                    Err(unsupported(span, Feature::Kernels))
+                }
                 // Twin of the `ir_type_from_canon` arm: a program union that is not
                 // the builtin of its name lowers by its own identity first.
                 _ if self.is_distinct_program_union(module, *name) => {
@@ -30220,6 +30253,15 @@ impl<'a> Lowerer<'a> {
                 | KernelFn::ColorSimulate,
             ) => Ok(2),
             Callee::Kernel(KernelFn::ColorMeetsWcag) => Ok(4),
+            // ── Ipe.Remote endpoint constructors and call ────────────────────
+            // `auth` (signing key), `public` (handler), `signOut` (auth).
+            Callee::Kernel(
+                KernelFn::RemoteAuth | KernelFn::RemotePublic | KernelFn::RemoteSignOut,
+            ) => Ok(1),
+            // `authed` / `signIn` (auth + handler), `call` (endpoint + request).
+            Callee::Kernel(
+                KernelFn::RemoteAuthed | KernelFn::RemoteSignIn | KernelFn::RemoteCall,
+            ) => Ok(2),
             Callee::Func(id) => {
                 let idx = usize::try_from(id.as_raw()).unwrap_or(usize::MAX);
                 let def = self.m.defs.get(idx).ok_or_else(|| {
@@ -36612,6 +36654,13 @@ mod tests {
         KernelFn::ColorDeuteranopia,
         KernelFn::ColorTritanopia,
         KernelFn::ColorSimulate,
+        // ── Ipe.Remote — unschemed, every reference refused (IPE-L0108) ──
+        KernelFn::RemoteAuth,
+        KernelFn::RemotePublic,
+        KernelFn::RemoteAuthed,
+        KernelFn::RemoteSignIn,
+        KernelFn::RemoteSignOut,
+        KernelFn::RemoteCall,
     ];
 
     /// Verifies that for every non-excluded variant in `KernelFn::ALL`, the

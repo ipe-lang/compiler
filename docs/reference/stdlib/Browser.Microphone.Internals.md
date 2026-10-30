@@ -74,9 +74,8 @@ dropped whole.
 inbound : Decode.Decoder JsMsg
 ```
 
-The total, fail-closed decoder for the inbound `JsMsg`. It reads `ok`
-first: a true flag decodes the `data`, `mime`, and `durationMs` fields into a
-`Recorded` value; a false flag decodes the closed `error` vocabulary. An
-unrecognised token fails the decode closed (the frame is dropped, never a
-silent mis-map).
+The total, fail-closed decoder for a `JsMsg` frame of this capability.
+
+It first requires the frame's `tag` to be `portTag`, so a frame of another
+capability, or an untagged one, fails closed; the rest decodes as `inboundBody`.
 
