@@ -475,6 +475,26 @@ impl Delivery {
         }
     }
 
+    /// The `web client` delivery on the default host, the browser bundle the
+    /// mobile packager builds for its shell.
+    #[must_use]
+    pub const fn web_client() -> Self {
+        Self {
+            shape: Shape::Web,
+            runtime: Some(Runtime::Client),
+            host: Host::Default,
+        }
+    }
+
+    /// The CLI words that spell this delivery, in order: the shape, then the
+    /// written runtime, then the written host. The served runtime and the
+    /// default host are never written.
+    pub fn words(self) -> impl Iterator<Item = &'static str> {
+        core::iter::once(self.shape.word())
+            .chain(self.runtime.and_then(Runtime::word))
+            .chain(self.host.word())
+    }
+
     /// `true` when a static (musl) artifact is admissible for this delivery.
     /// Only the co-located, no-webview shapes qualify: a webview host links the
     /// system webview at runtime, and a `client`/mobile host is a wasm/bundle
@@ -617,12 +637,12 @@ impl Delivery {
             // sandbox backstops would be skipped). Otherwise the static-triple
             // gate decides which co-located triples are admissible.
             Engine::Native => {
-                if is_client {
-                    return Err(DeliveryError::ClientRequiresWasmTarget);
-                }
                 match triple {
                     Some(wasm @ (TargetTriple::BrowserWasm | TargetTriple::Wasm32Wasip1)) => {
                         Err(DeliveryError::NativeEngineRefusesWasmTriple { triple: wasm })
+                    }
+                    None | Some(TargetTriple::Native(_)) if is_client => {
+                        Err(DeliveryError::ClientRequiresBrowserTriple { triple })
                     }
                     None => Ok(()),
                     Some(TargetTriple::Native(_)) => {
@@ -687,12 +707,11 @@ impl Delivery {
 
 impl fmt::Display for Delivery {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.shape.word())?;
-        if let Some(word) = self.runtime.and_then(Runtime::word) {
-            write!(f, " {word}")?;
-        }
-        if let Some(word) = self.host.word() {
-            write!(f, " {word}")?;
+        for (at, word) in self.words().enumerate() {
+            if at > 0 {
+                f.write_str(" ")?;
+            }
+            f.write_str(word)?;
         }
         Ok(())
     }
@@ -772,6 +791,15 @@ pub enum DeliveryError {
         /// Where the target came from.
         source: TargetSource,
     },
+    /// `ipe dev run` was handed a `client` app-bundle delivery.
+    ///
+    /// A `desktop`/`ios`/`android` client bundle is laid out by `ipe dev
+    /// build`; a dev run has no route that runs it, so the delivery is refused
+    /// rather than run as the bare browser client.
+    ClientHostHasNoDevRun {
+        /// The app-bundle delivery.
+        delivery: Delivery,
+    },
     /// A runtime (`client`) or host (`desktop`/`ios`/`android`) token was given
     /// more than once. Each axis accepts exactly one value; a second token on
     /// the same axis is a conflict, not a last-wins override.
@@ -781,11 +809,6 @@ pub enum DeliveryError {
         /// The conflicting token that was seen a second time.
         got: String,
     },
-    /// A `client` delivery resolved to a native compile target. A sandboxed
-    /// client must compile to wasm — the native-deny backstops that keep native
-    /// effects out of the sandbox are keyed to the wasm target, so a native
-    /// `client` build would ship those effects into a sandboxed client.
-    ClientRequiresWasmTarget,
     /// A wasm compile target resolved without a `client` delivery. The wasm
     /// client target exists only to carry a sandboxed `client` app; a
     /// non-`client` delivery has no wasm form, so the two were derived from
@@ -957,11 +980,14 @@ impl fmt::Display for DeliveryError {
                     &source.spelling(),
                 ))
             }
+            Self::ClientHostHasNoDevRun { delivery } => {
+                f.write_str(&text::delivery_client_host_has_no_dev_run(
+                    delivery,
+                    &delivery.host().word().unwrap_or_default(),
+                ))
+            }
             Self::DuplicateToken { kind, got } => {
                 f.write_str(&text::delivery_duplicate_token(kind, got))
-            }
-            Self::ClientRequiresWasmTarget => {
-                f.write_str(text::delivery_client_requires_wasm_target())
             }
             Self::WasmTargetRequiresClient => {
                 f.write_str(text::delivery_wasm_target_requires_client())
@@ -1297,7 +1323,7 @@ mod tests {
             DeliveryError::StaticNotAllowed {
                 delivery: Delivery::resolve(Shape::Web, None, Host::Desktop).unwrap(),
             },
-            DeliveryError::ClientRequiresWasmTarget,
+            DeliveryError::ClientRequiresBrowserTriple { triple: None },
             DeliveryError::WasmTargetRequiresClient,
             DeliveryError::RetiredRuntimeWord {
                 got: RetiredRuntimeWord::Live,
@@ -1308,6 +1334,10 @@ mod tests {
             DeliveryError::BundleHostHasNoTarget {
                 delivery: Delivery::resolve(Shape::Web, Some(Runtime::Client), Host::Ios).unwrap(),
                 source: TargetSource::Flag,
+            },
+            DeliveryError::ClientHostHasNoDevRun {
+                delivery: Delivery::resolve(Shape::Web, Some(Runtime::Client), Host::Android)
+                    .unwrap(),
             },
         ];
         for c in &cases {
@@ -1521,11 +1551,18 @@ mod tests {
     fn native_engine_refuses_client_delivery() {
         // A `client` delivery must not resolve to the native engine — the
         // wasm-keyed sandbox backstops would be skipped. Subsumes the
-        // biconditional's `ClientRequiresWasmTarget` half on the triple axis.
-        assert_eq!(
-            client().admit_triple(Engine::Native, None),
-            Err(DeliveryError::ClientRequiresWasmTarget),
-        );
+        // biconditional's client-to-wasm half on the triple axis: the host's
+        // own triple and an explicit native triple are refused alike, naming
+        // the triple asked for.
+        for triple in [
+            None,
+            Some(TargetTriple::Native(StaticTriple::Aarch64LinuxMusl)),
+        ] {
+            assert_eq!(
+                client().admit_triple(Engine::Native, triple),
+                Err(DeliveryError::ClientRequiresBrowserTriple { triple }),
+            );
+        }
     }
 
     #[test]
@@ -1615,7 +1652,7 @@ mod tests {
         // skipped for a client shipped as a native binary.
         assert_eq!(
             client.admit_triple(Engine::Native, None),
-            Err(DeliveryError::ClientRequiresWasmTarget),
+            Err(DeliveryError::ClientRequiresBrowserTriple { triple: None }),
         );
         // served + wasm: refused — a non-`client` shape has no browser-wasm form.
         assert_eq!(

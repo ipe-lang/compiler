@@ -3025,29 +3025,42 @@ fn dev_compile_target_never_infers_wasi() {
     }
 }
 
-/// The derivation never produces `ClientRequiresWasmTarget`, on either verb.
+/// The derivation is the `client` IFF browser-wasm biconditional, on either verb.
 ///
-/// A client derives the browser triple itself, so the refusal a client with
-/// no wasm target used to get has no reachable cause in the table.
+/// Every target a `client` delivery derives is the browser triple, whatever
+/// the flag, the environment and the `wasm` block say; no other delivery ever
+/// derives it. A client is never handed a native or host target to refuse
+/// later, and the browser triple never reaches a delivery with no wasm form.
 #[test]
-fn derive_target_never_requires_a_wasm_flag() {
-    let refused = TargetRefusal::Delivery(crate::delivery::DeliveryError::ClientRequiresWasmTarget);
+fn derive_target_client_iff_browser_wasm() {
+    use crate::delivery::{Delivery, Host, Runtime, Shape, TargetTriple};
+    let client_hosts = [Host::Default, Host::Desktop, Host::Ios, Host::Android]
+        .map(|host| Delivery::resolve(Shape::Web, Some(Runtime::Client), host));
     for verb in [TargetVerb::Dev, TargetVerb::Release] {
-        for delivery in swept_deliveries() {
+        for delivery in swept_deliveries()
+            .into_iter()
+            .chain(client_hosts.iter().filter_map(|d| d.as_ref().ok().copied()))
+        {
+            let is_client = delivery.runtime() == Some(Runtime::Client);
             for flag in every_target_source() {
                 for env in every_target_source() {
                     for wasm_block in [false, true] {
-                        let derived = derive_target(verb, delivery, flag, env, wasm_block);
-                        assert_ne!(
-                            derived,
-                            Err(refused.clone()),
-                            "{verb:?} {delivery:?} flag={flag:?} env={env:?} wasm_block={wasm_block}"
-                        );
+                        if let Ok(derived) = derive_target(verb, delivery, flag, env, wasm_block) {
+                            assert_eq!(
+                                derived == Some(TargetTriple::BrowserWasm),
+                                is_client,
+                                "{verb:?} {delivery:?} flag={flag:?} env={env:?} wasm_block={wasm_block} derived {derived:?}"
+                            );
+                        }
                     }
                 }
             }
         }
     }
+    assert!(
+        client_hosts.iter().all(Result::is_ok),
+        "every host carries a client delivery: {client_hosts:?}"
+    );
 }
 
 /// `declared_modules` reads exactly the `pub mod X;` / `mod X;` statements a
@@ -5977,11 +5990,19 @@ fn release_flag_wasm_refused_and_artifact_engines() {
 ///
 /// The `ios` shell picks its own target, so a `--target` beside it has
 /// nothing to choose; `release build` and `dev build` refuse it alike and
-/// write no output.
+/// write no output. Each verb is handed every target its own parser and the
+/// static-link gate let through to the delivery: a native triple under
+/// `release build`; under `dev build` the wasm targets (a native triple
+/// there needs `--static`, refused earlier by the static-link gate).
 #[test]
 fn bundle_host_refuses_a_target() {
-    for verb in [Verb::RELEASE_BUILD, Verb::DEV_BUILD] {
-        let label = format!("bundle-target-{}", verb.name().replace(' ', "-"));
+    let cases = [
+        (Verb::RELEASE_BUILD, "aarch64-unknown-linux-musl"),
+        (Verb::DEV_BUILD, "wasm"),
+        (Verb::DEV_BUILD, "wasi"),
+    ];
+    for (verb, target) in cases {
+        let label = format!("bundle-target-{}-{target}", verb.name().replace(' ', "-"));
         let (tmp, package) = debug_project(&label, &named_package(&label), WEB_APP_WITH_STYLE);
         let out = tmp.join("out");
         let out_arg = out.to_string_lossy().into_owned();
@@ -5992,7 +6013,7 @@ fn bundle_host_refuses_a_target() {
             "client",
             "ios",
             "--target",
-            "aarch64-unknown-linux-musl",
+            target,
             "--out",
             out_arg.as_str(),
         ]);
@@ -6010,6 +6031,45 @@ fn bundle_host_refuses_a_target() {
             args.join(" ")
         );
         assert!(!wrote, "a refused bundle writes no output");
+    }
+}
+
+/// `ipe dev run` refuses a client app-bundle delivery before any build.
+///
+/// A `desktop`/`ios`/`android` client bundle is laid out by `ipe dev build`;
+/// a dev run that built the bare browser client in its place would run a
+/// delivery the user did not name.
+#[test]
+fn dev_run_refuses_a_client_host_bundle() {
+    for host in ["desktop", "ios", "android"] {
+        let label = format!("dev-run-client-{host}");
+        let (tmp, package) = debug_project(&label, &named_package(&label), WEB_APP_WITH_STYLE);
+        let out = tmp.join("out");
+        let out_arg = out.to_string_lossy().into_owned();
+        let args = [
+            "dev",
+            "run",
+            package.as_str(),
+            "web",
+            "client",
+            host,
+            "--out",
+            out_arg.as_str(),
+        ];
+        let result = run_argv(&args);
+        let wrote = out.exists();
+        let _ = fs::remove_dir_all(&tmp);
+        assert!(
+            matches!(
+                &result,
+                Err(CliError::CommandUsage { command, reason })
+                    if *command == Verb::DEV_RUN.name()
+                        && reason.as_str().contains(&format!("ipe dev build web client {host}"))
+            ),
+            "`ipe {}` refuses the {host} bundle: {result:?}",
+            args.join(" ")
+        );
+        assert!(!wrote, "a refused dev run writes no output");
     }
 }
 

@@ -447,10 +447,6 @@ you asked for `{stated}`, but `main` is a `{pinned}` app. A program's shape is f
 
 `{got}` repeats the {kind} — each axis takes exactly one value. Write the {kind} once: e.g. `web client` (not `web client client`) or `web desktop` (not `web desktop ios`). Drop the duplicate `{got}`.
 
-## delivery-client-requires-wasm-target
-
-a `client` delivery is a self-contained client that must compile to wasm, but the target resolved to native. The sandbox's native-deny guards are keyed to the wasm target, so a native `client` build would ship native effects into the sandbox. Drop the native target — `web client` builds for wasm by itself — or drop `client` for a co-located served delivery.
-
 ## delivery-wasm-target-requires-client
 
 a wasm compile target was requested, but the delivery is not `client`. The wasm client target exists only to carry a self-contained `client` app; every other delivery has no wasm form. Deliver `web client` to build for wasm, or drop the wasm target (`--target`/`IPE_TARGET`/the `wasm` block) for a native build.
@@ -498,6 +494,10 @@ a co-located `wasm32-wasip1` build cannot carry a `client` delivery. `client` is
 ## delivery-bundle-host-has-no-target
 
 `{delivery}` builds its app bundle for `{host}` itself, so {source} has nothing to choose. Drop {source}.
+
+## delivery-client-host-has-no-dev-run
+
+`{delivery}` is an app bundle for `{host}`, and `ipe dev run` has no way to run it. Lay the bundle out with `ipe dev build {delivery}`, or drop `{host}` to run the browser client with `ipe dev run web client`.
 
 ## delivery-wasi-requires-direct-shape
 

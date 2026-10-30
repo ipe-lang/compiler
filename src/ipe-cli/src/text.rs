@@ -825,8 +825,6 @@ messages! {
     delivery_unknown_token(got, runtime) = "delivery-unknown-token";
     /// A runtime or host token was given more than once.
     delivery_duplicate_token(kind, got) = "delivery-duplicate-token";
-    /// A `client` delivery resolved to a native compile target.
-    delivery_client_requires_wasm_target = "delivery-client-requires-wasm-target";
     /// A wasm compile target resolved without a `client` delivery.
     delivery_wasm_target_requires_client = "delivery-wasm-target-requires-client";
     /// A WASM triple was requested for the native engine.
@@ -851,6 +849,8 @@ messages! {
     delivery_release_wasm_target(source) = "delivery-release-wasm-target";
     /// An app-bundle delivery was handed a compile target.
     delivery_bundle_host_has_no_target(delivery, host, source) = "delivery-bundle-host-has-no-target";
+    /// `ipe dev run` was handed a client app-bundle delivery.
+    delivery_client_host_has_no_dev_run(delivery, host) = "delivery-client-host-has-no-dev-run";
     /// A co-located WASI build was asked for a non-`Direct` shape.
     delivery_wasi_requires_direct_shape(shape) = "delivery-wasi-requires-direct-shape";
     /// A co-located WASI engine was asked for a non-WASI triple.
@@ -1678,7 +1678,7 @@ messages! {
     release_run_bundle_incomplete(dir, missing) = "release-run-bundle-incomplete";
     /// `ipe release run <dir>` found a lone wrapper with no app and profile to verify.
     release_run_wrapper_unverifiable(dir) = "release-run-wrapper-unverifiable";
-    /// `wasm-bindgen` failed while bundling a `--target wasm` build.
+    /// `wasm-bindgen` failed while bundling a `web client` build.
     wasm_bindgen_failed(code, version) = "wasm-bindgen-failed";
     /// The `wasm32-wasip1` build reported no `.wasm` artifact.
     wasi_artifact_missing(dir) = "wasi-artifact-missing";
@@ -1708,7 +1708,7 @@ messages! {
     app_binary_missing(path) = "app-binary-missing";
     /// The `ipe` binary could not be located to build wasm.
     wasm_ipe_binary_unknown(detail) = "wasm-ipe-binary-unknown";
-    /// The mobile shell's `--target wasm` build failed.
+    /// The mobile shell's `web client` bundle build failed.
     mobile_wasm_build_failed(code) = "mobile-wasm-build-failed";
     /// `--emit-permissions` failed.
     emit_permissions_failed(verb, detail) = "emit-permissions-failed";

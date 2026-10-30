@@ -59,7 +59,7 @@ pub enum ToolIntent {
     Build,
     /// `ipe dev run` — compile and execute the program.
     Run,
-    /// `ipe dev build --target wasm` — compile and bundle the browser artifact.
+    /// `ipe dev build web client` — compile and bundle the browser artifact.
     BundleWasm,
     /// `ipe verify` — compile and run the project's test entry.
     Test,

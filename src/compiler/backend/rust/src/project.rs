@@ -103,7 +103,7 @@ fn insert_vendored_runtime_clippy_config(files: &mut BTreeMap<RelPath, String>) 
 
 // ── Browser-WASM manifest + runtime module set ─────────────────────────────
 
-/// The `--target wasm` project manifest. A fourth template beside
+/// The `WasmClient` project manifest. A fourth template beside
 /// base/db/server: `cdylib` + the wasm-bindgen glue, and — load-bearing for
 /// the security gate's dependency floor — NO tokio/axum/sqlx/reqwest/TLS and
 /// no `server`/`db`/`web` feature. Dep set = the runtime's proven wasm
@@ -239,7 +239,7 @@ strip = true
 [workspace]
 "#;
 
-/// The `--target wasm` `ipe_runtime/mod.rs`: exactly the vendored modules
+/// The `WasmClient` `ipe_runtime/mod.rs`: exactly the vendored modules
 /// that compile on `wasm32-unknown-unknown` under the wasm manifest above —
 /// the proven pure floor, the whole `Ipe.Ui` render surface, the
 /// target-neutral `dom` data path, the TEA types, the browser sink, and (M4)
@@ -601,7 +601,7 @@ fn unclassified_wrapper(path: &str) -> Diagnostic {
     }
 }
 
-/// The `--target wasm` entry: `#[wasm_bindgen(start)]` replacing `fn main`.
+/// The `WasmClient` entry: `#[wasm_bindgen(start)]` replacing `fn main`.
 /// The panic hook makes a residual trap die with a classified console error;
 /// the entry task runs on the browser microtask queue.
 const WASM_ENTRY: &str = "\
@@ -722,7 +722,7 @@ fn assert_wasm_admissible(ctx: &EmitCtx) -> DResult<()> {
                 where_: "ipe_backend_rust::project::assert_wasm_admissible",
                 detail: format!(
                     "program reached emission with server-only surface `{name}` under \
-                     --target wasm — the Layer-1 kernel gate should have rejected it"
+                     the WasmClient target — the Layer-1 kernel gate should have rejected it"
                 ),
             });
         }

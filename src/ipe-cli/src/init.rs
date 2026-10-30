@@ -1168,6 +1168,61 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// Every web runtime `init` scaffolds builds for every host its runtime
+    /// carries: the scaffolded manifest passes the target derivation `dev
+    /// build` and `release build` run, and for a mobile host the packager's
+    /// admission gate too. A `web client` scaffold writes no `wasm` field, and
+    /// its mobile build is admitted all the same.
+    #[test]
+    fn every_web_scaffold_is_admitted_on_each_of_its_hosts() {
+        use crate::delivery::{Delivery, Host, Shape, TargetTriple};
+        use crate::driver::{TargetVerb, derive_target, validate_mobile_pack};
+        for runtime in Runtime::ALL {
+            let label = format!("ipe_init_admitted_{}", runtime_label(runtime));
+            let files = managed_files("admitted-app", InitShape::Web, runtime);
+            let manifest = files
+                .iter()
+                .find(|f| f.rel == Path::new("package.ipe"))
+                .expect("init writes a package.ipe");
+            let root = ipe_test_temp::temp_root().join(&label);
+            let _ = std::fs::remove_dir_all(&root);
+            write_stub_src(&root);
+            let path = root.join("package.ipe");
+            std::fs::write(&path, &manifest.content).expect("write scaffolded package.ipe");
+            let parsed = crate::project::parse_manifest(&path);
+            let _ = std::fs::remove_dir_all(&root);
+            let parsed = parsed.expect("scaffolded manifest re-parses");
+            let wasm_block = parsed.wasm.implies_wasm_target();
+            let mut admitted_hosts = 0_usize;
+            for host in [Host::Default, Host::Desktop, Host::Ios, Host::Android] {
+                let Ok(delivery) = Delivery::resolve(Shape::Web, Some(runtime), host) else {
+                    continue;
+                };
+                admitted_hosts += 1;
+                for verb in [TargetVerb::Dev, TargetVerb::Release] {
+                    let derived = derive_target(verb, delivery, None, None, wasm_block);
+                    assert!(
+                        derived.is_ok(),
+                        "{label}: {delivery} derives a target under {verb:?}: {derived:?}"
+                    );
+                    assert_eq!(
+                        derived.ok().flatten() == Some(TargetTriple::BrowserWasm),
+                        runtime == Runtime::Client,
+                        "{label}: {delivery} derives the browser triple iff it is a client"
+                    );
+                }
+                if matches!(host, Host::Ios | Host::Android) {
+                    let gated = validate_mobile_pack(&parsed, Shape::Web);
+                    assert!(
+                        gated.is_ok(),
+                        "{label}: the mobile packager admits the {delivery} scaffold: {gated:?}"
+                    );
+                }
+            }
+            assert!(admitted_hosts > 0, "{label}: some host carries the runtime");
+        }
+    }
+
     #[test]
     fn served_runtime_leaves_the_delivery_set_implicit() {
         // The default `served` runtime keeps the manifest minimal: no `ships`

@@ -1867,8 +1867,9 @@ mod tests {
     ///
     /// An in-set value parses for all three, and an out-of-set value is refused
     /// by all three with the same message. The only per-command refusals are
-    /// semantic — `run` has no process to execute for `wasm`, and `release`
-    /// produces no `wasi` module — and each names why.
+    /// semantic — `run` has no process to execute for `wasm`, `release` builds
+    /// its browser bundle from the `web client` delivery rather than a `wasm`
+    /// target, and `release` produces no `wasi` module — and each names why.
     #[test]
     fn build_run_and_release_share_the_target_vocabulary() {
         let in_set = [
@@ -1893,6 +1894,10 @@ mod tests {
                 _ => assert!(run.is_ok(), "run {value}"),
             }
             match value {
+                "wasm" => assert!(
+                    matches!(&release, Err(e) if e.to_string().contains("ipe release build web client")),
+                    "release wasm is a semantic refusal naming the delivery: {release:?}"
+                ),
                 "wasi" => assert!(
                     matches!(&release, Err(e) if e.to_string().contains("does not produce a WASI module")),
                     "release wasi is a semantic refusal"

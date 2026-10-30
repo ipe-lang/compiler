@@ -317,8 +317,6 @@ code! {
     IPE_P0021 = "IPE-P0021", "malformed exposing list", "IPE-P0021";
     /// a mobile bundle wraps a `Web` app, and this app's shape is not `Web`
     IPE_P0022 = "IPE-P0022", "a mobile bundle needs a Web app", "IPE-P0022";
-    /// a mobile bundle wraps the wasm client, and the project's `[wasm]` mode is off
-    IPE_P0023 = "IPE-P0023", "a mobile bundle needs the wasm client", "IPE-P0023";
     /// missing `=` in definition
     IPE_P0030 = "IPE-P0030", "missing '=' in definition", "IPE-P0030";
     /// malformed type declaration

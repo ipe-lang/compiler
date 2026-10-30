@@ -1,7 +1,7 @@
 //! Mobile packaging: wrapping a built client-wasm Web SPA in a thin native
 //! system-webview shell for iOS or Android.
 //!
-//! The `--target wasm` build produces a self-contained offline SPA bundle
+//! The `web client` build produces a self-contained offline SPA bundle
 //! (`index.html` + a boot script + the `wasm-bindgen` glue + the `.wasm`). This
 //! module lays out a native shell *around* that bundle: an iOS Xcode project
 //! whose `WKWebView` serves the bundle through a `WKURLSchemeHandler` (so the
@@ -133,37 +133,31 @@ pub fn resolve_os(explicit: Option<&str>) -> Result<MobileOs, MobileRefusal> {
 
 /// The declared web-delivery capability a mobile bundle requires of the app.
 ///
-/// A mobile shell hosts the client-wasm SPA; only a `Web` app compiled for the
-/// wasm client target has such a bundle. Modelled as the two independent facts the
-/// gate reads, so the refusal can name exactly which one is missing.
+/// A mobile shell hosts the client-wasm SPA, which the `web client` delivery
+/// builds for any `Web` app: the client derives the wasm target itself, and the
+/// manifest's `wasm` field only tunes that bundle. The one fact the gate reads is
+/// whether the app is a `Web` app.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct WebSpaCapability {
     /// Whether the app's declared shape is `Web` (or unset — inference decides).
     /// A `Terminal` / `WebView` / `Program` shape has no client-wasm SPA to host.
     pub shape_is_web: bool,
-    /// Whether the project's `[wasm]` mode is active (`Render` / `Hydrate`), so a
-    /// `web client` build produces a hostable bundle.
-    pub wasm_enabled: bool,
 }
 
-/// Gate an app for mobile packaging: it must be a wasm-enabled `Web` SPA.
+/// Gate an app for mobile packaging: it must be a `Web` app, the one shape a
+/// `web client` build turns into a hostable SPA.
 ///
-/// A mobile shell has nothing to host unless the app both declares (or infers) a
-/// `Web` shape and enables the wasm client target. Either fact missing is a
-/// fail-closed, typed refusal naming exactly what is absent — never a bundle
-/// produced around an empty or non-existent SPA.
+/// A non-`Web` app is a fail-closed, typed refusal — never a bundle produced
+/// around an empty or non-existent SPA.
 ///
 /// # Errors
-/// [`MobileRefusal::NotWebShape`] when the declared shape is not `Web`;
-/// [`MobileRefusal::WasmDisabled`] when the `[wasm]` mode is off/absent.
+/// [`MobileRefusal::NotWebShape`] when the declared shape is not `Web`.
 pub const fn require_web_spa(cap: WebSpaCapability) -> Result<(), MobileRefusal> {
-    if !cap.shape_is_web {
-        return Err(MobileRefusal::NotWebShape);
+    if cap.shape_is_web {
+        Ok(())
+    } else {
+        Err(MobileRefusal::NotWebShape)
     }
-    if !cap.wasm_enabled {
-        return Err(MobileRefusal::WasmDisabled);
-    }
-    Ok(())
 }
 
 /// A typed, fail-closed refusal from the mobile packager.
@@ -181,9 +175,6 @@ pub enum MobileRefusal {
     /// The app's declared shape is not `Web`, so it has no client-wasm SPA to host
     /// in a webview.
     NotWebShape,
-    /// The app is a `Web` app but its `[wasm]` mode is off/absent, so a
-    /// `--target wasm` build produces no hostable SPA bundle.
-    WasmDisabled,
     /// The [`ManifestPin`] read after the wasm build differs from the one the
     /// shell was planned for, so the bundle and the shell would be built from
     /// two manifests.
@@ -230,13 +221,6 @@ impl std::fmt::Display for MobileRefusal {
                  = a mobile bundle hosts the app's browser SPA in a system webview; only a \
                  `Web` app compiled to wasm has such a bundle. Declare a `Web` program shape, \
                  or choose the matching host for this app."
-            ),
-            Self::WasmDisabled => write!(
-                f,
-                "error[IPE-P0023]: `web client <ios|android>` wraps the wasm client, \
-                 but this project's `[wasm]` mode is off (or absent)\n  \
-                 = enable the wasm client target so a hostable browser bundle exists: set \
-                 `wasm = On {{ mode = Render }}` (or `Hydrate`) in package.ipe."
             ),
             Self::ManifestChanged { moved } => write!(
                 f,
@@ -643,7 +627,7 @@ impl SpaRoot {
 }
 
 /// The offline SPA bundle a mobile shell hosts: the ordered set of asset files
-/// copied out of a `--target wasm` build's `www/` tree.
+/// copied out of a `web client` build's `www/` tree.
 ///
 /// Pure data derived from the emitted `www/` directory, so a test can assert the
 /// full asset set without running a device toolchain. The webview serves these
@@ -664,7 +648,7 @@ impl SpaBundle {
     /// regular file becomes one [`AssetFile`]; a link, FIFO, socket, device or
     /// other special file, or a name the shell cannot place, is refused rather
     /// than skipped. The set is sorted for determinism. An `index.html` is
-    /// required — its absence means the input was not a `--target wasm` bundle,
+    /// required — its absence means the input was not a `web client` bundle,
     /// a fail-closed error rather than an empty shell.
     ///
     /// # Errors
@@ -916,7 +900,7 @@ impl std::fmt::Display for EscapedPath<'_> {
 #[derive(Debug)]
 pub enum BundleError {
     /// The emitted `www/` directory has no `index.html` — the input was not a
-    /// `--target wasm` bundle. Carries the directory inspected.
+    /// `web client` bundle. Carries the directory inspected.
     NoIndexHtml {
         /// The `www/` directory that lacked an `index.html`.
         dir: PathBuf,
@@ -4518,34 +4502,19 @@ mod tests {
     // ── Shape/wasm refusal (fail-closed) ──────────────────────────────────────
 
     #[test]
-    fn a_wasm_web_app_is_packageable() {
-        require_web_spa(WebSpaCapability {
-            shape_is_web: true,
-            wasm_enabled: true,
-        })
-        .expect("a wasm-enabled web app packages");
+    fn a_web_app_is_packageable() {
+        require_web_spa(WebSpaCapability { shape_is_web: true })
+            .expect("a web app packages: `web client` builds its SPA");
     }
 
     #[test]
     fn a_non_web_app_is_refused() {
         let err = require_web_spa(WebSpaCapability {
             shape_is_web: false,
-            wasm_enabled: true,
         })
         .expect_err("a non-web app is refused");
         assert_eq!(err, MobileRefusal::NotWebShape);
         assert!(err.to_string().contains("IPE-P0022"), "carries the code");
-    }
-
-    #[test]
-    fn a_web_app_without_wasm_is_refused() {
-        let err = require_web_spa(WebSpaCapability {
-            shape_is_web: true,
-            wasm_enabled: false,
-        })
-        .expect_err("a web app with wasm off is refused");
-        assert_eq!(err, MobileRefusal::WasmDisabled);
-        assert!(err.to_string().contains("IPE-P0023"), "carries the code");
     }
 
     // ── SPA bundle collection ─────────────────────────────────────────────────

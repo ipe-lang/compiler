@@ -884,6 +884,27 @@ fn refuse_bundle_target(
     })
 }
 
+/// Refuse a `client` app-bundle delivery under `ipe dev run`.
+///
+/// `ipe dev build` lays out a `desktop`/`ios`/`android` client bundle; a dev
+/// run has no route that runs one, and running the bare browser client in
+/// its place would substitute a delivery the user did not name.
+///
+/// # Errors
+/// [`CliError::Usage`] carrying [`delivery::DeliveryError::ClientHostHasNoDevRun`].
+fn refuse_client_host_run(delivery: delivery::Delivery) -> Result<(), CliError> {
+    use delivery::{Host, Runtime};
+    match (delivery.runtime(), delivery.host()) {
+        (Some(Runtime::Client), Host::Desktop | Host::Ios | Host::Android) => {
+            Err(CliError::Usage(text::msg::command_refusal(
+                &Verb::DEV_RUN,
+                &delivery::DeliveryError::ClientHostHasNoDevRun { delivery },
+            )))
+        }
+        (Some(Runtime::Client), Host::Default) | (Some(Runtime::Served) | None, _) => Ok(()),
+    }
+}
+
 /// Where an admitted `ipe dev build` goes: an app bundle or a compile.
 enum DevRoute {
     /// A `desktop`/`ios`/`android` app bundle.
@@ -1494,7 +1515,8 @@ fn copy_native_artifact(
 ///     registry, which the source-only, self-contained contract forbids — so an
 ///     FFI-bearing program is a hard [`CliError::EjectUnsupported`] refusal
 ///     rather than a tree that would not resolve offline.
-///   - `--target wasm` is a distinct compilation axis with its own bundling
+///   - a wasm target (the `web client` delivery, a `wasm` block, or a wasm
+///     `IPE_TARGET`) is a distinct compilation axis with its own bundling
 ///     step; eject targets a plain-`cargo build` native crate.
 ///
 /// # Errors
@@ -1608,10 +1630,10 @@ pub(super) fn eject_options() -> BuildOptions {
     }
 }
 
-/// `ipe release build [<dir>] [--out <dir>] [--target wasm|<triple>] [--embed]` —
+/// `ipe release build [<dir>] [<delivery>] [--out <dir>] [--target <triple>] [--embed]` —
 /// build the production artifact for every app kind.
 ///
-/// The artifact kind is determined by the app and the `--target` flag:
+/// The artifact kind is determined by the app and its delivery:
 ///
 /// - **Native-bearing** (app crosses into `Rust.` / FFI): the jailed bundle —
 ///   `ipe-wrapper` (jailed launcher), `ipe-app` (statically-linked app binary),
@@ -1620,10 +1642,11 @@ pub(super) fn eject_options() -> BuildOptions {
 /// - **Pure native** (no native/FFI content): a plain optimised binary under
 ///   the release cargo profile. No jail wrapper is needed; the binary is
 ///   structurally bounded to its inferred capabilities.
-/// - **Browser/wasm** (`--target wasm`): the production browser bundle
-///   (optimised `.wasm` + generated glue + assets) exactly as `ipe dev build
-///   --target wasm` produces, but with the production flag set so the
-///   `Ipe.Debug` gate (IPE-L0140) fires.
+/// - **Browser/wasm** (the `web client` delivery): the production browser
+///   bundle (optimised `.wasm` + generated glue + assets) exactly as `ipe dev
+///   build web client` produces, but with the production flag set so the
+///   `Ipe.Debug` gate (IPE-L0140) fires. A wasm `--target` or `IPE_TARGET` is
+///   refused: the delivery, not a triple, selects the browser bundle.
 ///
 /// Every path states `BuildIntent::Release` so the `Ipe.Debug.*` gate fires
 /// for all app kinds. `ipe dev build` and `ipe dev run` state `Development`
@@ -2408,7 +2431,7 @@ pub fn format_artifact_size(bytes: u64) -> String {
 /// instant this constant drifts from it.
 const WASM_BINDGEN_VERSION: &str = "0.2.126";
 
-/// Run the three post-emit bundle steps for `--target wasm`:
+/// Run the three post-emit bundle steps for the `web client` delivery:
 /// 1. `cargo build --target wasm32-unknown-unknown --release` (THE SEAL cross-target)
 /// 2. `wasm-bindgen` CLI — emits the JS glue + `www/pkg/ipe_app_bg.wasm`
 /// 3. `wasm-opt -Oz` — optional; silently skipped when not on PATH
@@ -3111,6 +3134,7 @@ pub fn run_run_with_args(args: cli_args::RunArgs) -> Result<(), CliError> {
         wants_static,
         Verb::DEV_RUN.name(),
     )?;
+    refuse_client_host_run(delivery)?;
 
     // A Tui app with no interactive terminal is refused right here — before
     // any compile or cargo work — rather than building fully and only then
@@ -3242,7 +3266,7 @@ pub fn run_run_with_args(args: cli_args::RunArgs) -> Result<(), CliError> {
 
     // Post-emit routing per compile target:
     //   * WasmClient — a browser bundle has no executable form under `ipe dev run`;
-    //     produce the bundle (same step as `ipe dev build --target wasm`) and stop.
+    //     produce the bundle (same step as `ipe dev build web client`) and stop.
     //   * WasmWasi — build the `wasm32-wasip1` module (THE SEAL, via the SAME
     //     `bundle_wasi` build path `ipe dev build --target wasi` uses) and then
     //     EXECUTE it under embedded wasmtime with the dev ambient context.

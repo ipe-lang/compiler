@@ -1,12 +1,9 @@
 module Main exposing (main)
 
--- M4 `Ipe.WebSocket` client substitute, exercised end-to-end in a real
--- browser: connect / onOpen / send / onMessage / close / onClose against
--- `examples/33-websocket-echo`'s native server (ws://127.0.0.1:8033/ws,
--- which echoes every text frame prefixed "echo: "). The M1 target-keyed
--- gate previously rejected importing Ipe.WebSocket at all under
--- `--target wasm` (see CLAUDE.md's WASM section / ws_client.rs's module
--- doc for the fixed bug).
+-- The `Ipe.WebSocket` client in a `web client` build, exercised end-to-end
+-- in a real browser: connect / onOpen / send / onMessage / close / onClose
+-- against the native echo server `tools/scripts/wasm-test/ws_echo_server.py`
+-- (ws://127.0.0.1:8033/ws, which echoes every text frame prefixed "echo: ").
 
 import Ipe.String as String
 import Ipe.Task as Task

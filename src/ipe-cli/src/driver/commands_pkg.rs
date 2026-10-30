@@ -215,34 +215,32 @@ pub fn validate_desktop_shape(
 pub fn classify_mobile_spa_cap(
     declared: Option<project::EntryShape>,
     built: delivery::Shape,
-    wasm: &project::WasmConfig,
 ) -> pack::mobile::WebSpaCapability {
     let shape_is_web = declared.map_or_else(
         || built == delivery::Shape::Web,
         |s| s == project::EntryShape::Web,
     );
-    pack::mobile::WebSpaCapability {
-        shape_is_web,
-        wasm_enabled: wasm.implies_wasm_target(),
-    }
+    pack::mobile::WebSpaCapability { shape_is_web }
 }
 
 /// Gate the mobile bundle's web-SPA capability: refuse any shape that is not a
-/// wasm-enabled `Web` app.
+/// `Web` app.
 ///
 /// This is the principle-1 fail-closed gate that fires BEFORE any wasm build.
 /// It delegates to [`pack::mobile::require_web_spa`], the single source of
-/// truth for the web-SPA requirement.
+/// truth for the web-SPA requirement. The manifest's `wasm` field is not read:
+/// the `web client` delivery derives the wasm target by itself
+/// ([`super::derive_target`]), so a `Web` app with no `wasm` field builds the
+/// bundle the shell hosts.
 ///
 /// # Errors
 /// [`CliError::Usage`] wrapping [`pack::mobile::MobileRefusal`] when the
-/// shape is not a wasm-enabled `Web` app.
+/// shape is not a `Web` app.
 pub fn validate_mobile_shape(
     declared: Option<project::EntryShape>,
     built: delivery::Shape,
-    wasm: &project::WasmConfig,
 ) -> Result<(), CliError> {
-    let cap = classify_mobile_spa_cap(declared, built, wasm);
+    let cap = classify_mobile_spa_cap(declared, built);
     pack::mobile::require_web_spa(cap).map_err(|r| CliError::Usage(crate::text::Message::relay(&r)))
 }
 
@@ -253,17 +251,13 @@ pub fn validate_mobile_shape(
 ///
 /// # Errors
 /// [`CliError::Usage`] wrapping a [`pack::mobile::MobileRefusal`] when the
-/// shape is not a wasm-enabled `Web` app, or when the project accepts push but
+/// shape is not a `Web` app, or when the project accepts push but
 /// names no `delivery.mobile.push`.
-fn validate_mobile_pack(
+pub fn validate_mobile_pack(
     manifest: &project::ProjectManifest,
     built: delivery::Shape,
 ) -> Result<(), CliError> {
-    validate_mobile_shape(
-        manifest.default_program().and_then(|p| p.shape),
-        built,
-        &manifest.wasm,
-    )?;
+    validate_mobile_shape(manifest.default_program().and_then(|p| p.shape), built)?;
     manifest
         .mobile_push()
         .map_err(|project::PushUnconfigured| {
@@ -676,6 +670,10 @@ pub fn pack_mobile(
     BundleAssembler::gate_mobile(held, profile)?.assemble(os)
 }
 
+/// The delivery the mobile bundle build is re-invoked with: the browser
+/// `web client` bundle the shell loads. Its argv is [`delivery::Delivery::words`].
+pub const MOBILE_BUNDLE_DELIVERY: delivery::Delivery = delivery::Delivery::web_client();
+
 /// Build the hostable SPA bundle under `output_root` through this binary.
 ///
 /// `ipe dev build web client` for a dev bundle (`<root>/rust/www/`), `ipe
@@ -702,8 +700,7 @@ pub fn build_wasm_for_mobile(
     build
         .args(wasm_build_verb(profile).argv())
         .arg(project_dir)
-        .arg(delivery::Shape::Web.word())
-        .args(delivery::Runtime::Client.word())
+        .args(MOBILE_BUNDLE_DELIVERY.words())
         .arg("--out")
         .arg(output_root);
     let status =
@@ -4167,6 +4164,35 @@ mod mobile_base_tests {
         parsed.expect("a push-accepting manifest reads")
     }
 
+    /// A `Web` app passes the mobile gate whatever its `wasm` field says: the
+    /// `web client` delivery derives the wasm target, so a project with no
+    /// `wasm` field (what `ipe init <dir> web client` scaffolds) packages.
+    #[test]
+    fn mobile_gate_accepts_web_shape_whatever_the_wasm_field() {
+        let fields = [
+            ("absent", ""),
+            ("off", ", wasm = Off"),
+            ("render", ", wasm = On { mode = Render }"),
+            ("hydrate", ", wasm = On { mode = Hydrate }"),
+        ];
+        for (label, field) in fields {
+            let manifest = write_project(&format!("wasm_field_{label}"), "/");
+            std::fs::write(
+                &manifest,
+                format!("module Package exposing (package)\n\npackage =\n    {{ name = \"x\"{field} }}\n"),
+            )
+            .expect("write package.ipe");
+            let parsed = project::parse_manifest(&manifest);
+            let _ = std::fs::remove_dir_all(manifest.parent().expect("project root"));
+            let parsed = parsed.expect("the manifest reads");
+            let gated = validate_mobile_pack(&parsed, delivery::Shape::Web);
+            assert!(
+                gated.is_ok(),
+                "a `Web` app with wasm {label} packages: {gated:?}"
+            );
+        }
+    }
+
     /// A mobile pack of a project that accepts push but names no
     /// `delivery.mobile.push` is refused by the gate itself; the same project
     /// with identifiers passes.
@@ -4208,6 +4234,112 @@ mod mobile_base_tests {
 #[cfg(test)]
 mod pack_gate_tests {
     use super::*;
+
+    // ── Mobile bundle build argv ──────────────────────────────────────────────
+
+    /// The delivery a re-invoked bundle build resolves from `words`, under the
+    /// verb `profile` selects, parsed by that verb's own argument parser.
+    fn bundle_build_delivery(
+        profile: BundleProfile,
+        words: &[&str],
+    ) -> Result<delivery::Delivery, CliError> {
+        let verb = wasm_build_verb(profile);
+        let rest: Vec<String> = std::iter::once("app")
+            .chain(words.iter().copied())
+            .chain(["--out", "out"])
+            .map(str::to_owned)
+            .collect();
+        let positionals = match profile {
+            BundleProfile::Dev => cli_args::parse_build(&rest)?.delivery,
+            BundleProfile::Release => cli_args::parse_release_build(&rest)?.delivery,
+        };
+        super::super::commands::resolve_delivery(
+            delivery::Shape::Web,
+            &positionals,
+            false,
+            verb.name(),
+        )
+    }
+
+    const fn target_verb(profile: BundleProfile) -> super::super::commands::TargetVerb {
+        match profile {
+            BundleProfile::Dev => super::super::commands::TargetVerb::Dev,
+            BundleProfile::Release => super::super::commands::TargetVerb::Release,
+        }
+    }
+
+    /// The mobile bundle build re-invokes `ipe` with the `web client` delivery,
+    /// which derives the browser triple and is admitted by the wasm-client
+    /// engine under both verbs; the argv with the runtime word dropped is the
+    /// served default, which never derives the browser triple and which the
+    /// wasm-client engine refuses.
+    #[test]
+    fn mobile_bundle_argv_is_the_wasm_client_delivery() {
+        use super::super::commands::derive_target;
+        use delivery::{DeliveryError, Engine, TargetTriple};
+        let words: Vec<&str> = MOBILE_BUNDLE_DELIVERY.words().collect();
+        assert_eq!(
+            words,
+            [
+                delivery::Shape::Web.word(),
+                delivery::Runtime::Client
+                    .word()
+                    .unwrap_or("<no client word>"),
+            ],
+            "the mobile bundle argv spells `web client`"
+        );
+        let served_words: Vec<&str> = words
+            .iter()
+            .copied()
+            .filter(|w| Some(*w) != delivery::Runtime::Client.word())
+            .collect();
+        for profile in [BundleProfile::Dev, BundleProfile::Release] {
+            let verb = target_verb(profile);
+            let client = bundle_build_delivery(profile, &words);
+            assert_eq!(
+                client.as_ref().ok().copied(),
+                Some(MOBILE_BUNDLE_DELIVERY),
+                "{profile:?}: the argv resolves to the mobile bundle delivery: {client:?}"
+            );
+            let Ok(client) = client else { continue };
+            assert_eq!(
+                client.runtime(),
+                Some(delivery::Runtime::Client),
+                "{profile:?}: the mobile bundle is a client delivery"
+            );
+            for wasm_block in [false, true] {
+                assert_eq!(
+                    derive_target(verb, client, None, None, wasm_block),
+                    Ok(Some(TargetTriple::BrowserWasm)),
+                    "{profile:?}: `web client` derives the browser triple (wasm block {wasm_block})"
+                );
+            }
+            assert_eq!(
+                client.admit_triple(Engine::WasmClient, Some(TargetTriple::BrowserWasm)),
+                Ok(()),
+                "{profile:?}: the wasm-client engine admits the mobile bundle"
+            );
+
+            let served = bundle_build_delivery(profile, &served_words);
+            let Ok(served) = served else {
+                assert!(served.is_ok(), "{profile:?}: `web` resolves: {served:?}");
+                continue;
+            };
+            assert_eq!(served.runtime(), Some(delivery::Runtime::Served));
+            for wasm_block in [false, true] {
+                assert_ne!(
+                    derive_target(verb, served, None, None, wasm_block),
+                    Ok(Some(TargetTriple::BrowserWasm)),
+                    "{profile:?}: the served default never derives the browser triple"
+                );
+            }
+            assert_eq!(
+                served.admit_triple(Engine::WasmClient, Some(TargetTriple::BrowserWasm)),
+                Err(DeliveryError::WasmTargetRequiresClient),
+                "{profile:?}: the wasm-client engine refuses the served default"
+            );
+        }
+    }
 
     // ── Desktop gate refusals ─────────────────────────────────────────────────
 
@@ -4316,9 +4448,8 @@ mod pack_gate_tests {
             classify_desktop_shape(None, delivery::Shape::Web),
             pack::desktop::AppShape::WebView
         );
-        let wasm_on = project::WasmConfig::On(project::WasmBundle::new(project::WasmMode::Render));
-        assert!(classify_mobile_spa_cap(None, delivery::Shape::Web, &wasm_on).shape_is_web);
-        assert!(!classify_mobile_spa_cap(None, delivery::Shape::Script, &wasm_on).shape_is_web);
+        assert!(classify_mobile_spa_cap(None, delivery::Shape::Web).shape_is_web);
+        assert!(!classify_mobile_spa_cap(None, delivery::Shape::Script).shape_is_web);
     }
 
     /// `EntryShape::Web` classifies to `AppShape::Web`.
@@ -4334,13 +4465,9 @@ mod pack_gate_tests {
     /// mobile SPA shell only hosts `Web` apps.
     #[test]
     fn mobile_gate_refuses_terminal_shape() {
-        let wasm_on = project::WasmConfig::On(project::WasmBundle::new(project::WasmMode::Render));
-        let err = validate_mobile_shape(
-            Some(project::EntryShape::Terminal),
-            delivery::Shape::Script,
-            &wasm_on,
-        )
-        .expect_err("Terminal shape must be refused for mobile");
+        let err =
+            validate_mobile_shape(Some(project::EntryShape::Terminal), delivery::Shape::Script)
+                .expect_err("Terminal shape must be refused for mobile");
         assert!(
             matches!(&err, CliError::Usage(_)),
             "expected Usage, got {err:?}"
@@ -4357,13 +4484,9 @@ mod pack_gate_tests {
     /// A declared `Program` shape must be refused for mobile packaging.
     #[test]
     fn mobile_gate_refuses_program_shape() {
-        let wasm_on = project::WasmConfig::On(project::WasmBundle::new(project::WasmMode::Render));
-        let err = validate_mobile_shape(
-            Some(project::EntryShape::Program),
-            delivery::Shape::Script,
-            &wasm_on,
-        )
-        .expect_err("Program shape must be refused for mobile");
+        let err =
+            validate_mobile_shape(Some(project::EntryShape::Program), delivery::Shape::Script)
+                .expect_err("Program shape must be refused for mobile");
         assert!(
             matches!(&err, CliError::Usage(_)),
             "expected Usage, got {err:?}"
@@ -4377,95 +4500,24 @@ mod pack_gate_tests {
         );
     }
 
-    /// A `Web` shape with wasm mode `off` must be refused — the mobile shell
-    /// requires `[wasm] mode` set to `spa` or `hydrate`.
-    #[test]
-    fn mobile_gate_refuses_web_shape_without_wasm() {
-        let wasm_off = project::WasmConfig::Off;
-        let err = validate_mobile_shape(
-            Some(project::EntryShape::Web),
-            delivery::Shape::Script,
-            &wasm_off,
-        )
-        .expect_err("Web shape without wasm must be refused for mobile");
-        assert!(
-            matches!(&err, CliError::Usage(_)),
-            "expected Usage, got {err:?}"
-        );
-        let CliError::Usage(msg) = err else {
-            return;
-        };
-        assert!(
-            msg.contains("wasm") || msg.contains("Wasm") || msg.contains("client"),
-            "refusal names the missing wasm capability: {msg}"
-        );
-    }
-
-    /// A `Web` shape with wasm mode `spa` passes the mobile gate.
-    #[test]
-    fn mobile_gate_accepts_web_shape_with_wasm_spa() {
-        let wasm_on = project::WasmConfig::On(project::WasmBundle::new(project::WasmMode::Render));
-        validate_mobile_shape(
-            Some(project::EntryShape::Web),
-            delivery::Shape::Script,
-            &wasm_on,
-        )
-        .expect("Web + wasm=spa must pass the mobile gate");
-    }
-
-    /// A `Web` shape with wasm mode `hydrate` also passes the mobile gate.
-    #[test]
-    fn mobile_gate_accepts_web_shape_with_wasm_hydrate() {
-        let wasm_on = project::WasmConfig::On(project::WasmBundle::new(project::WasmMode::Hydrate));
-        validate_mobile_shape(
-            Some(project::EntryShape::Web),
-            delivery::Shape::Script,
-            &wasm_on,
-        )
-        .expect("Web + wasm=hydrate must pass the mobile gate");
-    }
-
     // ── Mobile capability classification ──────────────────────────────────────
 
-    /// `Web` + wasm enabled -> `shape_is_web=true`, `wasm_enabled=true`.
+    /// A declared `Web` shape classifies as a web SPA.
     #[test]
-    fn classify_mobile_cap_web_wasm_on() {
-        let wasm_on = project::WasmConfig::On(project::WasmBundle::new(project::WasmMode::Render));
-        let cap = classify_mobile_spa_cap(
-            Some(project::EntryShape::Web),
-            delivery::Shape::Script,
-            &wasm_on,
-        );
+    fn classify_mobile_cap_web() {
+        let cap = classify_mobile_spa_cap(Some(project::EntryShape::Web), delivery::Shape::Script);
         assert!(cap.shape_is_web, "Web shape must set shape_is_web");
-        assert!(cap.wasm_enabled, "spa mode must set wasm_enabled");
     }
 
-    /// `Terminal` + wasm enabled -> `shape_is_web=false`.
+    /// A declared `Terminal` shape is not a web SPA.
     #[test]
-    fn classify_mobile_cap_terminal_wasm_on() {
-        let wasm_on = project::WasmConfig::On(project::WasmBundle::new(project::WasmMode::Render));
-        let cap = classify_mobile_spa_cap(
-            Some(project::EntryShape::Terminal),
-            delivery::Shape::Script,
-            &wasm_on,
-        );
+    fn classify_mobile_cap_terminal() {
+        let cap =
+            classify_mobile_spa_cap(Some(project::EntryShape::Terminal), delivery::Shape::Script);
         assert!(
             !cap.shape_is_web,
             "Terminal shape must set shape_is_web=false"
         );
-    }
-
-    /// `Web` + wasm off -> `wasm_enabled=false`.
-    #[test]
-    fn classify_mobile_cap_web_wasm_off() {
-        let wasm_off = project::WasmConfig::Off;
-        let cap = classify_mobile_spa_cap(
-            Some(project::EntryShape::Web),
-            delivery::Shape::Script,
-            &wasm_off,
-        );
-        assert!(cap.shape_is_web, "Web shape must set shape_is_web");
-        assert!(!cap.wasm_enabled, "`Off` must set wasm_enabled=false");
     }
 }
 

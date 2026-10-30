@@ -606,8 +606,8 @@ fn has_drive_prefix(raw: &str) -> bool {
 ///             publicEnv = [ "API_BASE_URL" ], optLevel = "z" }
 /// ```
 ///
-/// `--target wasm` still works with `Off`; the setting is metadata for the
-/// SSR+hydration/SPA-shell split, not a gate on `ipe dev build --target wasm`
+/// `web client` builds the browser bundle with `Off`; the setting is metadata
+/// for the SSR+hydration/SPA-shell split, not a gate on the client build
 /// itself. A bundle always names its [`WasmMode`], so a wasm configuration
 /// without a mode has no representation.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
