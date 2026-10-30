@@ -203,29 +203,34 @@ fn every_kernel_name_resolves_to_runtime_fn() {
 
 /// The `Ipe.Remote` kernels still unschemed, so refused at `ipe` time and
 /// never named by an emitted program.
+fn unbacked_remote_kernels() -> impl Iterator<Item = ipe_kernels::StdlibKernel> {
+    unbacked_among(&ipe_kernels::StdlibKernel::REMOTE_INTERCEPTED)
+}
+
+/// The kernels of `kernels` with no scheme.
 ///
 /// Keyed on the missing scheme, not on `REMOTE_INTERCEPTED` membership alone: a
 /// kernel that gains its scheme leaves this set, so the runtime fn it now needs
 /// is required and its argument order proven.
-fn unbacked_remote_kernels() -> impl Iterator<Item = ipe_kernels::StdlibKernel> {
-    ipe_kernels::StdlibKernel::REMOTE_INTERCEPTED
-        .into_iter()
+fn unbacked_among(
+    kernels: &[ipe_kernels::StdlibKernel],
+) -> impl Iterator<Item = ipe_kernels::StdlibKernel> {
+    kernels
+        .iter()
+        .copied()
         .filter(|k| k.scheme_shape().is_none())
 }
 
 #[test]
 fn a_schemed_remote_kernel_loses_its_exemption() {
-    // Every `Remote` kernel is unschemed today, so all six are exempt; the
-    // filter is what removes one the moment `scheme_shape` turns `Some`.
+    use ipe_kernels::StdlibKernel::{BytesLength, RemoteCall};
+    // A schemed kernel beside an unschemed one: only the unschemed one keeps
+    // the exemption.
+    assert!(BytesLength.scheme_shape().is_some());
+    assert!(RemoteCall.scheme_shape().is_none());
     assert_eq!(
-        unbacked_remote_kernels().count(),
-        ipe_kernels::StdlibKernel::REMOTE_INTERCEPTED.len()
-    );
-    assert!(
-        ipe_kernels::StdlibKernel::ALL
-            .iter()
-            .filter(|k| k.scheme_shape().is_some())
-            .all(|k| !unbacked_remote_kernels().any(|r| r == *k))
+        unbacked_among(&[BytesLength, RemoteCall]).collect::<Vec<_>>(),
+        vec![RemoteCall]
     );
 }
 

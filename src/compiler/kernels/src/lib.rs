@@ -1377,6 +1377,27 @@ pub enum RemoteRole {
     Call,
 }
 
+impl RemoteRole {
+    /// Whether a kernel of this role compiles for the browser client: the key,
+    /// every endpoint constructor, and the call of the client's own backend.
+    #[must_use]
+    pub const fn on_client(self) -> bool {
+        match self {
+            Self::Key | Self::Endpoint(_) | Self::Call => true,
+        }
+    }
+
+    /// Whether a kernel of this role compiles for WASI: the key and every
+    /// endpoint constructor reach nothing; a call has no backend to reach.
+    #[must_use]
+    pub const fn on_wasi(self) -> bool {
+        match self {
+            Self::Key | Self::Endpoint(_) => true,
+            Self::Call => false,
+        }
+    }
+}
+
 /// Whether `roles` names exactly `intercepted`, in order, every one qualified
 /// `Remote`, and every kernel of `kernels` qualified `Remote` has exactly one
 /// row.
@@ -18034,14 +18055,12 @@ impl StdlibKernel {
                         | "Http"
                         | "Url"
                 ) ||
-                // `Ipe.Remote`, by role and never qualifier-wide: the endpoint
-                // constructors and `Remote.call` (the browser's call of its own
-                // backend) are the client half of a split program. A `Remote`
-                // kernel gains a role only through `REMOTE_ROLES`.
-                matches!(
-                    self.remote_role(),
-                    Some(RemoteRole::Key | RemoteRole::Endpoint(_) | RemoteRole::Call)
-                ) ||
+                // `Ipe.Remote`, by role and never qualifier-wide: the roles
+                // `RemoteRole::on_client` admits (`Remote.auth`, the endpoint
+                // constructors, and `Remote.call`, the browser's call of its own
+                // backend). A `Remote` kernel gains a role only through
+                // `REMOTE_ROLES`.
+                self.remote_role().is_some_and(RemoteRole::on_client) ||
                 // Pure calendar helpers (chrono, no clock read) PLUS the M4
                 // `Date.now()`/`setTimeout` clock+sleep substitutes.
                 matches!(
@@ -18217,13 +18236,11 @@ impl StdlibKernel {
                 // PBKDF2) stays denied: the heavy crypto surface is out of the
                 // sealed floor.
                 || matches!(self, Self::CryptoRandomBytes | Self::CryptoRandomToken)
-                // The `Ipe.Remote` endpoint constructors describe an endpoint and
-                // reach nothing. `Remote.call` stays denied: a WASI program has
-                // no browser backend to call.
-                || matches!(
-                    self.remote_role(),
-                    Some(RemoteRole::Key | RemoteRole::Endpoint(_))
-                )
+                // `Ipe.Remote`, by role and never qualifier-wide: the roles
+                // `RemoteRole::on_wasi` admits (`Remote.auth` and the endpoint
+                // constructors, which reach nothing). `Remote.call` stays
+                // denied: a WASI program has no browser backend to call.
+                || self.remote_role().is_some_and(RemoteRole::on_wasi)
                 // `Task.*` pure future combinators — the std-only reactor spine
                 // (`block_on`/`task_run`/`task_parallel`, the LIVE wasip1 arm; no
                 // tokio) drives a `Direct` program's `main`. The tokio-bound
@@ -18355,12 +18372,72 @@ mod tests {
                 assert!(role.is_some(), "{kernel:?} has no role");
             }
             let Some(role) = role else { continue };
-            assert!(kernel.available_on(Target::WasmClient), "{kernel:?}");
             assert_eq!(
-                kernel.available_on(Target::WasmWasi),
-                !matches!(role, RemoteRole::Call),
+                kernel.available_on(Target::WasmClient),
+                role.on_client(),
                 "{kernel:?}"
             );
+            assert_eq!(
+                kernel.available_on(Target::WasmWasi),
+                role.on_wasi(),
+                "{kernel:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn remote_role_admission_per_target() {
+        let endpoints = [
+            EndpointKind::Public,
+            EndpointKind::Authed,
+            EndpointKind::SignIn,
+            EndpointKind::SignOut,
+        ];
+        assert!(RemoteRole::Key.on_client());
+        assert!(RemoteRole::Key.on_wasi());
+        for kind in endpoints {
+            assert!(RemoteRole::Endpoint(kind).on_client(), "{kind:?}");
+            assert!(RemoteRole::Endpoint(kind).on_wasi(), "{kind:?}");
+        }
+        assert!(RemoteRole::Call.on_client());
+        assert!(!RemoteRole::Call.on_wasi());
+        assert!(!StdlibKernel::RemoteCall.available_on(crate::Target::WasmWasi));
+    }
+
+    /// The body of the `StdlibKernel` method declared by `signature`, up to its
+    /// closing brace at method indentation; empty when absent.
+    fn method_body<'a>(source: &'a str, signature: &str) -> &'a str {
+        let start = source
+            .find(signature)
+            .and_then(|at| source.get(at..))
+            .unwrap_or_default();
+        start
+            .find("\n    }\n")
+            .and_then(|end| start.get(..end))
+            .unwrap_or_default()
+    }
+
+    /// Both target allowlists admit `Ipe.Remote` through the role methods only.
+    /// A qualifier-wide `"Remote"` arm or a kernel list would admit every
+    /// present and future `Remote` kernel regardless of its role.
+    #[test]
+    fn remote_admission_reads_the_role_methods_only() {
+        let source = include_str!("lib.rs");
+        for (signature, method) in [
+            (
+                "fn wasm_client_available(self) -> bool {",
+                "RemoteRole::on_client",
+            ),
+            ("fn wasi_available(self) -> bool {", "RemoteRole::on_wasi"),
+        ] {
+            let body = method_body(source, signature);
+            assert!(!body.is_empty(), "{signature} not found");
+            assert!(
+                body.contains(&format!("is_some_and({method})")),
+                "{signature}"
+            );
+            assert!(!body.contains("\"Remote\""), "{signature}");
+            assert!(!body.contains("Self::Remote"), "{signature}");
         }
     }
 
