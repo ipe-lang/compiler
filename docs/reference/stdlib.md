@@ -248,7 +248,7 @@ Ipe.Browser.Battery.Internals — the low-level Battery Status port surface: the
 | `request` | `request cmd` — hand a closed outbound `JsCmd` to the raw port transport. |
 | `requestOne` | `requestOne cmd` — correlated one-shot `JsCmd` → `Task Error JsMsg`. |
 | `subscribe` | `subscribe toMsg` — the inbound subscription over the fail-closed seal |
-| `inbound` | The total, fail-closed decoder for the inbound `JsMsg`. It reads the `ok` |
+| `inbound` | The total, fail-closed decoder for a `JsMsg` frame of this capability. |
 
 ## Browser.Camera
 
@@ -275,7 +275,7 @@ Ipe.Browser.Camera.Internals — the low-level camera capture port surface:
 | `request` | `request cmd` — hand a closed outbound `JsCmd` to the raw port transport. |
 | `requestOne` | `requestOne cmd` — correlated one-shot `JsCmd` → `Task Error JsMsg`. |
 | `subscribe` | `subscribe toMsg` — the inbound subscription over the fail-closed seal |
-| `inbound` | The total, fail-closed decoder for the inbound `JsMsg`. It reads `ok` |
+| `inbound` | The total, fail-closed decoder for a `JsMsg` frame of this capability. |
 
 ## Browser.Channel
 
@@ -303,7 +303,7 @@ Ipe.Browser.Channel.Internals — the low-level BroadcastChannel port
 | `JsMsg` | The NARROW closed INBOUND port type — deliberately NOT the app's internal |
 | `request` | `request cmd` — hand a closed outbound `JsCmd` to the raw port transport. |
 | `subscribe` | `subscribe toMsg` — the inbound subscription over the fail-closed seal |
-| `inbound` | The total, fail-closed decoder for the inbound `JsMsg`. Reads the `event` |
+| `inbound` | The total, fail-closed decoder for a `JsMsg` frame of this capability. |
 
 ## Browser.Clipboard
 
@@ -330,7 +330,7 @@ Ipe.Browser.Clipboard.Internals — the low-level clipboard port surface: the
 | `request` | `request cmd` — hand a closed outbound `JsCmd` to the raw port transport. The |
 | `requestOne` | `requestOne cmd` — correlated one-shot `JsCmd` → `Task Error JsMsg`. |
 | `subscribe` | `subscribe toMsg` — the inbound subscription over the fail-closed seal |
-| `inbound` | The total, fail-closed decoder for the inbound `JsMsg`. It reads `ok` first: a |
+| `inbound` | The total, fail-closed decoder for a `JsMsg` frame of this capability. |
 
 ## Browser.Connectivity
 
@@ -357,7 +357,7 @@ Ipe.Browser.Connectivity.Internals — the low-level Connectivity port surface:
 | `request` | `request cmd` — hand a closed outbound `JsCmd` to the raw port transport. |
 | `requestOne` | `requestOne cmd` — correlated one-shot `JsCmd` → `Task Error JsMsg`. |
 | `subscribe` | `subscribe toMsg` — the inbound subscription over the fail-closed seal |
-| `inbound` | The total, fail-closed decoder for the inbound `JsMsg`. It reads the `ok` |
+| `inbound` | The total, fail-closed decoder for a `JsMsg` frame of this capability. |
 
 ## Browser.FilePicker
 
@@ -385,7 +385,7 @@ Ipe.Browser.FilePicker.Internals — the low-level file-picker port surface:
 | `request` | `request cmd` — hand a closed outbound `JsCmd` to the raw port transport. |
 | `requestOne` | `requestOne cmd` — correlated one-shot `JsCmd` → `Task Error JsMsg`. |
 | `subscribe` | `subscribe toMsg` — the inbound subscription over the fail-closed seal |
-| `inbound` | The total, fail-closed decoder for the inbound `JsMsg`. It reads `ok` |
+| `inbound` | The total, fail-closed decoder for a `JsMsg` frame of this capability. |
 
 ## Browser.Fullscreen
 
@@ -413,7 +413,7 @@ Ipe.Browser.Fullscreen.Internals — the low-level Fullscreen port surface:
 | `request` | `request cmd` — hand a closed outbound `JsCmd` to the raw port transport. |
 | `requestOne` | `requestOne cmd` — correlated one-shot `JsCmd` → `Task Error JsMsg`. |
 | `subscribe` | `subscribe toMsg` — the inbound subscription over the fail-closed seal |
-| `inbound` | The total, fail-closed decoder for the inbound `JsMsg`. Reads the `event` |
+| `inbound` | The total, fail-closed decoder for a `JsMsg` frame of this capability. |
 
 ## Browser.Gamepad
 
@@ -441,7 +441,7 @@ Ipe.Browser.Gamepad.Internals — the low-level Gamepad port surface: the
 | `request` | `request cmd` — hand a closed outbound `JsCmd` to the raw port transport. |
 | `requestOne` | `requestOne cmd` — correlated one-shot `JsCmd` → `Task Error JsMsg`. |
 | `subscribe` | `subscribe toMsg` — the inbound subscription over the fail-closed seal |
-| `inbound` | The total, fail-closed decoder for the inbound `JsMsg`. Reads the `event` |
+| `inbound` | The total, fail-closed decoder for a `JsMsg` frame of this capability. |
 
 ## Browser.Geolocation
 
@@ -472,7 +472,7 @@ Ipe.Browser.Geolocation.Internals — the full, low-level geolocation port
 | `request` | `request cmd` — hand a closed outbound `JsCmd` to the raw port transport. |
 | `requestOne` | `requestOne cmd` — correlated one-shot `JsCmd` → `Task Error JsMsg`. |
 | `subscribe` | `subscribe toMsg` — the inbound subscription over the fail-closed seal |
-| `inbound` | The total, fail-closed decoder for the inbound `JsMsg`. It reads the `ok` |
+| `inbound` | The total, fail-closed decoder for a `JsMsg` frame of this capability. |
 
 ## Browser.MediaQuery
 
@@ -499,7 +499,7 @@ Ipe.Browser.MediaQuery.Internals — the low-level MediaQuery port surface:
 | `request` | `request cmd` — hand a closed outbound `JsCmd` to the raw port transport. |
 | `requestOne` | `requestOne cmd` — correlated one-shot `JsCmd` → `Task Error JsMsg`. |
 | `subscribe` | `subscribe toMsg` — the inbound subscription over the fail-closed seal |
-| `inbound` | The total, fail-closed decoder for the inbound `JsMsg`. It reads the `ok` |
+| `inbound` | The total, fail-closed decoder for a `JsMsg` frame of this capability. |
 
 ## Browser.Microphone
 
@@ -527,7 +527,7 @@ Ipe.Browser.Microphone.Internals — the low-level microphone capture port
 | `request` | `request cmd` — hand a closed outbound `JsCmd` to the raw port transport. |
 | `requestOne` | `requestOne cmd` — correlated one-shot `JsCmd` → `Task Error JsMsg`. |
 | `subscribe` | `subscribe toMsg` — the inbound subscription over the fail-closed seal |
-| `inbound` | The total, fail-closed decoder for the inbound `JsMsg`. It reads `ok` |
+| `inbound` | The total, fail-closed decoder for a `JsMsg` frame of this capability. |
 
 ## Browser.Motion
 
@@ -554,7 +554,7 @@ Ipe.Browser.Motion.Internals — the low-level Motion port surface: the
 | `JsMsg` | The NARROW closed INBOUND port type — deliberately NOT the app's internal |
 | `request` | `request cmd` — hand a closed outbound `JsCmd` to the raw port transport. |
 | `subscribe` | `subscribe toMsg` — the inbound subscription over the fail-closed seal |
-| `inbound` | The total, fail-closed decoder for the inbound `JsMsg`. Reads the `event` |
+| `inbound` | The total, fail-closed decoder for a `JsMsg` frame of this capability. |
 
 ## Browser.NetworkInfo
 
@@ -582,7 +582,7 @@ Ipe.Browser.NetworkInfo.Internals — the low-level Network Information port
 | `request` | `request cmd` — hand a closed outbound `JsCmd` to the raw port transport. |
 | `requestOne` | `requestOne cmd` — correlated one-shot `JsCmd` → `Task Error JsMsg`. |
 | `subscribe` | `subscribe toMsg` — the inbound subscription over the fail-closed seal |
-| `inbound` | The total, fail-closed decoder for the inbound `JsMsg`. It reads the `ok` |
+| `inbound` | The total, fail-closed decoder for a `JsMsg` frame of this capability. |
 
 ## Browser.Notification
 
@@ -613,8 +613,8 @@ Ipe.Browser.Notification.Internals — the low-level notification port surface:
 | `request` | `request cmd` — hand a closed outbound `JsCmd` to the raw port transport. |
 | `requestOne` | `requestOne cmd` — correlated one-shot permission `JsCmd` → `Task Error |
 | `subscribe` | `subscribe toMsg` — the inbound subscription over the fail-closed seal |
-| `inbound` | The total, fail-closed decoder for the inbound `JsMsg`. It reads `ok` first: a |
-| `permissionInbound` | The total, fail-closed decoder for a `RequestPermission` reply. Structurally |
+| `inbound` | The total, fail-closed decoder for a `JsMsg` frame of this capability. |
+| `permissionInbound` | The total, fail-closed decoder for a `PermissionReply` frame of this capability. |
 
 ## Browser.Orientation
 
@@ -641,7 +641,7 @@ Ipe.Browser.Orientation.Internals — the low-level Orientation port surface:
 | `JsMsg` | The NARROW closed INBOUND port type — deliberately NOT the app's internal |
 | `request` | `request cmd` — hand a closed outbound `JsCmd` to the raw port transport. |
 | `subscribe` | `subscribe toMsg` — the inbound subscription over the fail-closed seal |
-| `inbound` | The total, fail-closed decoder for the inbound `JsMsg`. Reads the `event` |
+| `inbound` | The total, fail-closed decoder for a `JsMsg` frame of this capability. |
 
 ## Browser.Permission
 
@@ -672,8 +672,8 @@ Ipe.Browser.Permission.Internals — the low-level Permissions API port
 | `requestOne` | `requestOne cmd` — correlated one-shot `JsCmd` → `Task Error JsMsg`. |
 | `subscribe` | `subscribe toMsg` — the inbound subscription over the fail-closed seal |
 | `subscribeFor` | `subscribeFor name toMsg` — the inbound subscription scoped to a SINGLE |
-| `inbound` | The total, fail-closed decoder for the inbound `JsMsg`. It reads the `ok` |
-| `inboundFor` | `inboundFor name` — the name-scoped variant of `inbound`. It first reads |
+| `inbound` | The total, fail-closed decoder for a `JsMsg` frame of this capability. |
+| `inboundFor` | `inboundFor name` — the name-scoped variant of `inbound`. |
 | `nameToken` | The canonical wire token for each permission name — the single source of |
 
 ## Browser.Push
@@ -739,7 +739,7 @@ Ipe.Browser.Recorder.Internals — the low-level media-recording port surface:
 | `JsMsg` | The NARROW closed INBOUND port type — deliberately NOT the app's internal |
 | `request` | `request cmd` — hand a closed outbound `JsCmd` to the raw port transport. |
 | `subscribe` | `subscribe toMsg` — the inbound subscription over the fail-closed seal |
-| `inbound` | The total, fail-closed decoder for the inbound `JsMsg`. Reads the `event` |
+| `inbound` | The total, fail-closed decoder for a `JsMsg` frame of this capability. |
 
 ## Browser.ScreenOrientation
 
@@ -767,7 +767,7 @@ Ipe.Browser.ScreenOrientation.Internals — the low-level Screen Orientation
 | `request` | `request cmd` — hand a closed outbound `JsCmd` to the raw port transport. |
 | `requestOne` | `requestOne cmd` — correlated one-shot `JsCmd` → `Task Error JsMsg`. |
 | `subscribe` | `subscribe toMsg` — the inbound subscription over the fail-closed seal |
-| `inbound` | The total, fail-closed decoder for the inbound `JsMsg`. Reads the `event` |
+| `inbound` | The total, fail-closed decoder for a `JsMsg` frame of this capability. |
 
 ## Browser.Share
 
@@ -799,7 +799,7 @@ Ipe.Browser.Share.Internals — the low-level Web Share port surface: the closed
 | `request` | `request cmd` — hand a closed outbound `JsCmd` to the raw port transport. |
 | `requestOne` | `requestOne cmd` — correlated one-shot `JsCmd` → `Task Error JsMsg`. |
 | `subscribe` | `subscribe toMsg` — the inbound subscription over the fail-closed seal |
-| `inbound` | The total, fail-closed decoder for the inbound `JsMsg`. It reads the `ok` |
+| `inbound` | The total, fail-closed decoder for a `JsMsg` frame of this capability. |
 
 ## Browser.Speech
 
@@ -830,7 +830,7 @@ Ipe.Browser.Speech.Internals — the low-level speech synthesis port surface:
 | `request` | `request cmd` — hand a closed outbound `JsCmd` to the raw port transport. |
 | `requestOne` | `requestOne cmd` — correlated one-shot `JsCmd` → `Task Error JsMsg`. |
 | `subscribe` | `subscribe toMsg` — the inbound subscription over the fail-closed seal |
-| `inbound` | The total, fail-closed decoder for the inbound `JsMsg`. It reads `ok` |
+| `inbound` | The total, fail-closed decoder for a `JsMsg` frame of this capability. |
 
 ## Browser.Storage
 
@@ -860,7 +860,7 @@ Ipe.Browser.Storage.Internals — the low-level Web Storage port surface: the
 | `request` | `request cmd` — hand a closed outbound `JsCmd` to the raw port transport. |
 | `requestOne` | `requestOne cmd` — correlated one-shot `JsCmd` → `Task Error JsMsg`. |
 | `subscribe` | `subscribe toMsg` — the inbound subscription over the fail-closed seal |
-| `inbound` | The total, fail-closed decoder for the inbound `JsMsg`. It reads `ok` first: a |
+| `inbound` | The total, fail-closed decoder for a `JsMsg` frame of this capability. |
 
 ## Browser.Vibration
 
@@ -888,7 +888,7 @@ Ipe.Browser.Vibration.Internals — the low-level Vibration port surface: the
 | `request` | `request cmd` — hand a closed outbound `JsCmd` to the raw port transport. |
 | `requestOne` | `requestOne cmd` — correlated one-shot `JsCmd` → `Task Error JsMsg`. |
 | `subscribe` | `subscribe toMsg` — the inbound subscription over the fail-closed seal |
-| `inbound` | The total, fail-closed decoder for the inbound `JsMsg`. It reads the `ok` |
+| `inbound` | The total, fail-closed decoder for a `JsMsg` frame of this capability. |
 
 ## Browser.Visibility
 
@@ -916,7 +916,7 @@ Ipe.Browser.Visibility.Internals — the low-level Visibility port surface:
 | `request` | `request cmd` — hand a closed outbound `JsCmd` to the raw port transport. |
 | `requestOne` | `requestOne cmd` — correlated one-shot `JsCmd` → `Task Error JsMsg`. |
 | `subscribe` | `subscribe toMsg` — the inbound subscription over the fail-closed seal |
-| `inbound` | The total, fail-closed decoder for the inbound `JsMsg`. It reads the `ok` |
+| `inbound` | The total, fail-closed decoder for a `JsMsg` frame of this capability. |
 
 ## Browser.WakeLock
 
@@ -942,7 +942,7 @@ Ipe.Browser.WakeLock.Internals — the low-level Wake Lock port surface: the
 | `request` | `request cmd` — hand a closed outbound `JsCmd` to the raw port transport. |
 | `requestOne` | `requestOne cmd` — correlated one-shot `JsCmd` → `Task Error JsMsg`. |
 | `subscribe` | `subscribe toMsg` — the inbound subscription over the fail-closed seal |
-| `inbound` | The total, fail-closed decoder for the inbound `JsMsg`. Reads the `event` |
+| `inbound` | The total, fail-closed decoder for a `JsMsg` frame of this capability. |
 
 ## Browser.WebAuthn
 
@@ -978,7 +978,7 @@ Ipe.Browser.WebAuthn.Internals — the low-level Web Authentication port
 | `request` | `request cmd` — hand a closed outbound `JsCmd` to the raw port transport. |
 | `requestOne` | `requestOne cmd` — correlated one-shot `JsCmd` → `Task Error JsMsg`. Routes |
 | `subscribe` | `subscribe toMsg` — the inbound subscription over the fail-closed seal |
-| `inbound` | The total, fail-closed decoder for the inbound `JsMsg`. It reads `ok` first: |
+| `inbound` | The total, fail-closed decoder for a `JsMsg` frame of this capability. |
 
 ## ByteSize
 

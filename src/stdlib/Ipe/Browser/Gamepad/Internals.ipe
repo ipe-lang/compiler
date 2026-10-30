@@ -79,13 +79,22 @@ subscribe toMsg =
     Js.subscribe inbound toMsg
 
 
--- | The total, fail-closed decoder for the inbound `JsMsg`. Reads the `event`
+-- | The total, fail-closed decoder for a `JsMsg` frame of this capability.
+--
+-- It first requires the frame's `tag` to be `portTag`, so a frame of another
+-- capability, or an untagged one, fails closed; the rest decodes as `inboundBody`.
+inbound : Decode.Decoder JsMsg
+inbound =
+    Decode.andThen (gateTag inboundBody) (Decode.field "tag" Decode.string)
+
+
+-- | The frame body of the inbound `JsMsg`. Reads the `event`
 -- discriminator first: `"connected"` decodes `Connected`; `"disconnected"`
 -- decodes `Disconnected`; `"state"` decodes a `StateFrame`; `"unavailable"`
 -- decodes `Unavailable`. An unrecognised token fails the decode closed (the
 -- frame is dropped, never a silent mis-map).
-inbound : Decode.Decoder JsMsg
-inbound =
+inboundBody : Decode.Decoder JsMsg
+inboundBody =
     Decode.andThen decodeByEvent (Decode.field "event" Decode.string)
 
 
@@ -112,3 +121,23 @@ decodeByEvent event =
 
         _ ->
             Decode.fail ("unknown gamepad event variant: " ++ event)
+
+
+-- | This module's frame tag: its capability's `js-port:` wire name.
+--
+-- The first-party sink stamps it on every frame it replies with.
+portTag : String
+portTag =
+    "gamepad"
+
+
+-- | `gateTag body tag` runs `body` only on a frame tagged with this module's `portTag`.
+--
+-- A frame of any other capability fails closed; the failure names no tag.
+gateTag : Decode.Decoder a -> String -> Decode.Decoder a
+gateTag body tag =
+    if tag == portTag then
+        body
+
+    else
+        Decode.fail "frame for another capability"
