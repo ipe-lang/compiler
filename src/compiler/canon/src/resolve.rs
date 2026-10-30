@@ -2070,40 +2070,9 @@ fn bind_stdlib_kernel_import(
                         bind_expr(env, name, Tier::Explicit, origin, interner)?;
                     }
                     src::Exposed::Type(type_name, privacy) => {
-                        let name_s = name_str(interner, *type_name)?;
-                        let Some(export) = types.and_then(|t| t.get(&*name_s)) else {
-                            return Err(Diagnostic::Name {
-                                span: item.span,
-                                msg: NameError::NameNotExposed {
-                                    module: path_to_dot_string(interner, dep_path),
-                                    name: name_s.clone(),
-                                    suggestions: Candidates::at(
-                                        EditTarget::whole(item.span, &name_s),
-                                        ranked_names(
-                                            &name_s,
-                                            Shape::Flat,
-                                            types.into_iter().flat_map(|t| t.keys().copied()),
-                                        ),
-                                    ),
-                                },
-                            });
-                        };
-                        // A builtin union's constructors may be ambient (`RedirectPolicy`)
-                        // rather than pooled under the module, so the union table decides.
-                        let has_ctors = matches!(export, KernelTypeExport::Builtin(_))
-                            && crate::builtins::BUILTIN_UNIONS
-                                .iter()
-                                .any(|union| union.type_name == &*name_s);
-                        if !has_ctors && !matches!(privacy, src::Privacy::Private) {
-                            return Err(Diagnostic::Name {
-                                span: item.span,
-                                msg: NameError::NameNotExposed {
-                                    module: path_to_dot_string(interner, dep_path),
-                                    name: format!("{name_s}(..)").into(),
-                                    suggestions: Candidates::hints(Box::new([])),
-                                },
-                            });
-                        }
+                        let export = kernel_type_exposure(
+                            types, *type_name, privacy, item.span, dep_path, interner,
+                        )?;
                         let origin = kernel_type_origin(export, dep_path, item.span);
                         bind_type(env, *type_name, Tier::Explicit, origin, interner)?;
                         let filter = exposed_ctor_filter(privacy);
@@ -2128,6 +2097,57 @@ fn bind_stdlib_kernel_import(
         }
     }
     Ok(())
+}
+
+/// The type a kernel module exports as `type_name`, admitted by `privacy`.
+///
+/// # Errors
+/// [`NameError::NameNotExposed`] for a name the module does not export, or
+/// `T(..)` on a type without constructors; [`Diagnostic::CompilerBug`] for an
+/// unresolvable symbol.
+fn kernel_type_exposure<'a>(
+    types: Option<&'a BTreeMap<&'static str, KernelTypeExport>>,
+    type_name: Symbol,
+    privacy: &src::Privacy,
+    span: Span,
+    dep_path: &[Symbol],
+    interner: &Interner,
+) -> DResult<&'a KernelTypeExport> {
+    let name_s = name_str(interner, type_name)?;
+    let Some(export) = types.and_then(|t| t.get(&*name_s)) else {
+        return Err(Diagnostic::Name {
+            span,
+            msg: NameError::NameNotExposed {
+                module: path_to_dot_string(interner, dep_path),
+                name: name_s.clone(),
+                suggestions: Candidates::at(
+                    EditTarget::whole(span, &name_s),
+                    ranked_names(
+                        &name_s,
+                        Shape::Flat,
+                        types.into_iter().flat_map(|t| t.keys().copied()),
+                    ),
+                ),
+            },
+        });
+    };
+    // A builtin union's constructors may be ambient (`RedirectPolicy`) rather
+    // than pooled under the module, so the union table decides.
+    let has_ctors = matches!(export, KernelTypeExport::Builtin(_))
+        && crate::builtins::BUILTIN_UNIONS
+            .iter()
+            .any(|union| union.type_name == &*name_s);
+    if !has_ctors && !matches!(privacy, src::Privacy::Private) {
+        return Err(Diagnostic::Name {
+            span,
+            msg: NameError::NameNotExposed {
+                module: path_to_dot_string(interner, dep_path),
+                name: format!("{name_s}(..)").into(),
+                suggestions: Candidates::hints(Box::new([])),
+            },
+        });
+    }
+    Ok(export)
 }
 
 /// The scope binding of a type a kernel module exports, reached through `importer`.
@@ -6496,6 +6516,11 @@ enum TypeTarget<'a> {
     Union(UnionHome),
 }
 
+/// The empty home of a builtin head; only a builtin witness mints it.
+const fn builtin_home(_witness: BuiltinType) -> Vec<Symbol> {
+    Vec::new()
+}
+
 /// The home of a union: a module path, never the empty builtin home.
 #[derive(Debug, PartialEq, Eq)]
 struct UnionHome(Vec<Symbol>);
@@ -7131,7 +7156,7 @@ fn canonicalise_type(
             };
             let home = match target {
                 TypeTarget::Union(home) => home.into_vec(),
-                TypeTarget::Builtin(_) => Vec::new(),
+                TypeTarget::Builtin(builtin) => builtin_home(builtin),
                 // An alias not already mid-expansion (cycle) is expanded. Arity
                 // must match exactly — a type alias has to be fully applied.
                 TypeTarget::Alias(alias_key, alias) => {

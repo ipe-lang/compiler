@@ -49,6 +49,7 @@ impl BuiltinTag {
     /// exports under it, so the two paths name one head. A row whose
     /// [`BuiltinRow::home`] differs is listed by the divergence test below.
     #[must_use]
+    #[allow(clippy::too_many_lines)] // one exhaustive arm per tag; the match IS the table
     pub const fn scheme_home(self) -> KernelHome {
         match self {
             Self::TaskStep => KernelHome::Module("Ipe.Task"),

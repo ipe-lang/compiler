@@ -3136,7 +3136,10 @@ mod scheme_home_and_field_text_tests {
     fn every_tag_mints_its_scheme_home() {
         let mut interner = Interner::new();
         let builtins = builtins(&mut interner);
-        for tag in BUILTIN_TYPES.iter().filter_map(|row| row.tag()) {
+        for tag in BUILTIN_TYPES
+            .iter()
+            .filter_map(ipe_kernels::BuiltinRow::tag)
+        {
             let minted: Vec<&str> = builtins
                 .builtin_con_module(tag)
                 .iter()

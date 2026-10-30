@@ -637,7 +637,7 @@ struct KernelModuleIndex {
 }
 
 /// The `CompilerBug` for a kernel type table that disagrees with itself.
-fn kernel_types_bug(detail: String) -> Diagnostic {
+const fn kernel_types_bug(detail: String) -> Diagnostic {
     Diagnostic::CompilerBug {
         where_: "ipe_canon::kernel_type_exports",
         detail,
@@ -676,7 +676,9 @@ fn add_kernel_type(
 /// [`Diagnostic::CompilerBug`] for a module-homed scheme head or a row no
 /// lookup reaches.
 fn builtin_export(row: &'static BuiltinRow) -> DResult<KernelTypeExport> {
-    let scheme_home = row.tag().map_or(row.home(), BuiltinTag::scheme_home);
+    let scheme_home = row
+        .tag()
+        .map_or_else(|| row.home(), BuiltinTag::scheme_home);
     if scheme_home != KernelHome::Builtin {
         return Err(kernel_types_bug(format!(
             "the kernel type `{}` mints a module-homed scheme head",
@@ -700,13 +702,24 @@ fn builtin_export(row: &'static BuiltinRow) -> DResult<KernelTypeExport> {
 fn kernel_alias_type(shape: &TyShape, interner: &mut Interner) -> DResult<crate::ast::Type> {
     Ok(match shape {
         TyShape::Con(tag, args) => {
+            // The head is the one row carrying the tag, minted at the empty
+            // home only when the tag's scheme mints it there.
+            let row = BUILTIN_TYPES
+                .iter()
+                .find(|row| row.tag() == Some(*tag))
+                .filter(|_| matches!(tag.scheme_home(), KernelHome::Builtin))
+                .ok_or_else(|| {
+                    kernel_types_bug(format!(
+                        "the alias head `{tag:?}` is no empty-home builtin row"
+                    ))
+                })?;
             let mut can_args = Vec::with_capacity(args.len());
             for arg in *args {
                 can_args.push(kernel_alias_type(arg, interner)?);
             }
             crate::ast::Type::Con {
                 home: Vec::new(),
-                name: interner.intern(tag.row().name())?,
+                name: interner.intern(row.name())?,
                 args: can_args,
             }
         }
@@ -1980,7 +1993,7 @@ impl Env {
             index
                 .by_canonical
                 .entry("Basics")
-                .or_insert((basics, vec![basics.symbol()]));
+                .or_insert_with(|| (basics, vec![basics.symbol()]));
         }
         index
     }
