@@ -406,6 +406,11 @@ const JAVA_RESERVED_WORDS: &[&str] = &[
     "null",
 ];
 
+/// The first label no bundle id may start with: `java` names the Java
+/// platform's own packages, in which the Android dexer and class loaders refuse
+/// an app's classes (the `R` class of the `namespace` among them).
+const JAVA_PLATFORM_LABEL: &str = "java";
+
 /// The [`JAVA_RESERVED_WORDS`] entry `label` equals, if any.
 fn java_reserved_word(label: &str) -> Option<&'static str> {
     JAVA_RESERVED_WORDS
@@ -431,7 +436,8 @@ impl BundleId {
     /// # Errors
     ///
     /// In judging order: `Empty`, `TooLong`, the first refused `Byte`,
-    /// `EmptyLabel`, `LabelStartsWithDigit`, `OneLabel`, then `ReservedWord`.
+    /// `EmptyLabel`, `LabelStartsWithDigit`, `OneLabel`, `ReservedWord`, then
+    /// `JavaPlatformPackage`.
     pub fn parse(text: &str) -> Result<Self, BundleIdRefusal> {
         if text.is_empty() {
             return Err(BundleIdRefusal::Empty);
@@ -455,10 +461,13 @@ impl BundleId {
         if labels().nth(1).is_none() {
             return Err(BundleIdRefusal::OneLabel);
         }
-        labels().find_map(java_reserved_word).map_or_else(
-            || Ok(Self(text.to_owned())),
-            |word| Err(BundleIdRefusal::ReservedWord { word }),
-        )
+        if let Some(word) = labels().find_map(java_reserved_word) {
+            return Err(BundleIdRefusal::ReservedWord { word });
+        }
+        if labels().next() == Some(JAVA_PLATFORM_LABEL) {
+            return Err(BundleIdRefusal::JavaPlatformPackage);
+        }
+        Ok(Self(text.to_owned()))
     }
 
     /// The identifier of a project that declares none.
@@ -522,6 +531,8 @@ pub enum BundleIdRefusal {
         /// The reserved word, from the static table.
         word: &'static str,
     },
+    /// A first label `java`: the Java platform's own package namespace.
+    JavaPlatformPackage,
 }
 
 /// The grammar sentence every [`BundleIdRefusal`] text ends with.
@@ -552,6 +563,11 @@ impl std::fmt::Display for BundleIdRefusal {
                 f,
                 "the label `{word}` is a Java reserved word, which Android refuses as a \
                  package segment; {BUNDLE_ID_GRAMMAR}"
+            ),
+            Self::JavaPlatformPackage => write!(
+                f,
+                "the first label `{JAVA_PLATFORM_LABEL}` names the Java platform's own \
+                 packages, where Android refuses an app's classes; {BUNDLE_ID_GRAMMAR}"
             ),
         }
     }
@@ -2115,6 +2131,60 @@ mod tests {
                 BundleId::parse(text),
                 Err(BundleIdRefusal::ReservedWord { word }),
                 "{text:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn bundle_id_refuses_the_java_platform_first_label() {
+        for text in ["java.example", "java.example.app"] {
+            assert_eq!(
+                BundleId::parse(text),
+                Err(BundleIdRefusal::JavaPlatformPackage),
+                "{text:?}"
+            );
+        }
+        for text in [
+            "Java.example",
+            "com.java.app",
+            "javax.example",
+            "com.example.java",
+        ] {
+            assert_eq!(
+                BundleId::parse(text).map(|id| id.as_str().to_owned()),
+                Ok(text.to_owned()),
+                "only a first label `java` is the platform namespace: {text:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn derived_bundle_id_re_parses_over_every_reserved_word_and_byte() {
+        let long_digits = "9".repeat(300);
+        let long_letters = "a".repeat(300);
+        let mut names: Vec<String> = Vec::new();
+        for word in JAVA_RESERVED_WORDS {
+            names.push((*word).to_owned());
+            names.push(word.to_ascii_uppercase());
+            names.push(format!("9{word}"));
+        }
+        names.push(JAVA_PLATFORM_LABEL.to_owned());
+        names.extend((0u8..=0x7F).map(|byte| char::from(byte).to_string()));
+        names.extend(['\u{e4}', '\u{130}', '\u{ff0e}', '\u{212a}'].map(String::from));
+        for len in 0..=long_digits.len() {
+            names.extend(
+                [long_digits.get(..len), long_letters.get(..len)]
+                    .into_iter()
+                    .flatten()
+                    .map(str::to_owned),
+            );
+        }
+        for name in &names {
+            let derived = BundleId::derived(name);
+            assert_eq!(
+                BundleId::parse(derived.as_str()),
+                Ok(derived.clone()),
+                "the derived id of {name:?} re-parses"
             );
         }
     }

@@ -1923,12 +1923,13 @@ mod tests {
                 "package template for shape '{}' is missing the {{name}} hole",
                 shape.label()
             );
+            let template = shape.package_ipe();
             assert!(
-                shape
-                    .package_ipe()
-                    .contains("bundleId = \"{bundle_id}\", orientation = Any"),
-                "package template for shape '{}' does not scaffold the derived \
-                 bundleId and free rotation",
+                !template.contains("bundleId")
+                    || (template.matches("bundleId").count() == 1
+                        && template.contains("bundleId = \"{bundle_id}\", orientation = Any")),
+                "package template for shape '{}' declares a bundleId other than the \
+                 derived `{{bundle_id}}` hole with free rotation",
                 shape.label()
             );
         }

@@ -110,7 +110,8 @@ delivery =
 `bundleId` is the application identifier the Android and iOS shells install
 the app under, verbatim. It is two or more `.`-separated labels, each an ASCII
 letter then ASCII letters or digits, at most 128 bytes in all, with no label a
-Java reserved word (`com.example.myapp`, not `com.my-app` or `com.example.class`);
+Java reserved word and a first label other than `java` (`com.example.myapp`, not
+`com.my-app`, `com.example.class`, or `java.myapp`);
 the manifest refuses any other value. An absent `bundleId` is `com.ipe.`
 followed by the lowercased letters and digits of the package name.
 `orientation` is the orientation the app runs in, `Any` (free rotation) when
