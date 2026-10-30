@@ -34,12 +34,12 @@ pub struct Builtins {
     /// handler parameter type in `mapError` / `onError` so a bare lambda `\e ->
     /// ...` infers `e : Error` without leaving a free variable.
     pub error: Symbol,
-    /// `ErrorKind` — the 12-variant classification carried by `Error`'s first
+    /// `ErrorKind` — the 13-variant classification carried by `Error`'s first
     /// field. Registered as a Prelude built-in exactly
     /// like `Order` — see `ipe_lower`'s `enum_variants`/`ctor_arity`
     /// (E-12), which already validate `Error kind info ->` patterns.
     pub errorkind: Symbol,
-    /// The 12 `ErrorKind` nullary constructor symbols, in canon's registered
+    /// The 13 `ErrorKind` nullary constructor symbols, in canon's registered
     /// index order (`ipe_canon::builtins::BUILTIN_UNIONS`) — do not reorder.
     pub ek_io: Symbol,
     pub ek_network: Symbol,
@@ -53,6 +53,7 @@ pub struct Builtins {
     pub ek_unavailable: Symbol,
     pub ek_unexpected: Symbol,
     pub ek_limit_exceeded: Symbol,
+    pub ek_update_required: Symbol,
     /// `ErrorDetails` — the 6-variant enrichment union carried on
     /// `ErrorInfo.details`. Registered as a Prelude
     /// built-in exactly like `ErrorKind` — see `ipe_lower`'s
@@ -833,6 +834,7 @@ impl Builtins {
             ek_unavailable: interner.intern("Unavailable")?,
             ek_unexpected: interner.intern("Unexpected")?,
             ek_limit_exceeded: interner.intern("LimitExceeded")?,
+            ek_update_required: interner.intern("UpdateRequired")?,
             errordetails: interner.intern("ErrorDetails")?,
             backoffstrategy: interner.intern("BackoffStrategy")?,
             ed_ffi_panic: interner.intern("FfiPanic")?,
@@ -1222,7 +1224,8 @@ impl Builtins {
             | (
                 "ErrorKind",
                 "Io" | "Network" | "Ffi" | "Decode" | "Timeout" | "NotFound" | "PermissionDenied"
-                | "InvalidInput" | "Conflict" | "Unavailable" | "Unexpected" | "LimitExceeded",
+                | "InvalidInput" | "Conflict" | "Unavailable" | "Unexpected" | "LimitExceeded"
+                | "UpdateRequired",
             )
             | (
                 "DbFailure",

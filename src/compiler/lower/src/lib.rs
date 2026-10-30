@@ -264,6 +264,7 @@ pub fn lower(
         ek_unavailable: interner.intern("Unavailable").map_err(homeless)?,
         ek_unexpected: interner.intern("Unexpected").map_err(homeless)?,
         ek_limit_exceeded: interner.intern("LimitExceeded").map_err(homeless)?,
+        ek_update_required: interner.intern("UpdateRequired").map_err(homeless)?,
         // ── ErrorDetails ─────────────────────────────────────────────────────
         errordetails: interner.intern("ErrorDetails").map_err(homeless)?,
         ed_ffi_panic: interner.intern("FfiPanic").map_err(homeless)?,
