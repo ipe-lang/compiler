@@ -310,6 +310,7 @@ impl ShellIdentity {
 
     /// A shell identity built from its parts, for layout unit tests.
     #[cfg(test)]
+    #[must_use]
     pub const fn for_test(
         identity: super::desktop::BundleIdentity,
         orientation: ScreenOrientation,
