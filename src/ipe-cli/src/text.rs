@@ -1103,9 +1103,23 @@ messages! {
     /// An `ipe.lock` `[[package]]` table lacks a required field.
     lock_missing_field(field) = "lock-missing-field";
     /// An `ipe.lock` package carries an unrecognised `kind`.
-    lock_unknown_kind(package, kind) = "lock-unknown-kind";
+    lock_unknown_kind(package, kind, remedy) = "lock-unknown-kind";
     /// An `ipe.lock` index dependency records a `local` rev.
-    lock_index_dep_local_rev(package) = "lock-index-dep-local-rev";
+    lock_index_dep_local_rev(package, remedy) = "lock-index-dep-local-rev";
+    /// How to recover from an `ipe.lock` the reader refuses.
+    lock_remedy = "lock-remedy";
+    /// An `ipe.lock` line outside the lockfile grammar.
+    lock_unrecognised_line(line, remedy) = "lock-unrecognised-line";
+    /// An `ipe.lock` field with an unknown key.
+    lock_unknown_key(line, key: &crate::style::TerminalSafe, known, remedy) = "lock-unknown-key";
+    /// An `ipe.lock` field before the first `[[package]]`.
+    lock_key_outside_record(line, key, remedy) = "lock-key-outside-record";
+    /// An `ipe.lock` field whose value is not one quoted string.
+    lock_malformed_value(line, key, remedy) = "lock-malformed-value";
+    /// An `ipe.lock` field repeated within one record.
+    lock_duplicate_key(line, key, remedy) = "lock-duplicate-key";
+    /// An `ipe.lock` package locked by two records.
+    lock_duplicate_package(line, package, remedy) = "lock-duplicate-package";
     /// A path dependency's `source` cannot be recorded in `ipe.lock`.
     lock_unrecordable_local_source(package, max, raw) = "lock-unrecordable-local-source";
     /// A path dependency names a network share or device.
