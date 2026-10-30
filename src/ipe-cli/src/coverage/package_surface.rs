@@ -382,7 +382,7 @@ pub struct ProvenanceScannedColumn {
     project_root: PathBuf,
     lockfile: Lockfile,
     /// The shared verdict of `resolve::verify_locked_hashes`, computed once.
-    verdict: OnceLock<Result<(), String>>,
+    verdict: OnceLock<Result<(), crate::CliError>>,
 }
 
 impl ProvenanceScannedColumn {
@@ -401,10 +401,9 @@ impl ProvenanceScannedColumn {
 
     /// Run (or return the cached result of) the hash re-assertion, over the
     /// lockfile already parsed at construction rather than reading it again.
-    fn verdict(&self) -> &Result<(), String> {
+    fn verdict(&self) -> &Result<(), crate::CliError> {
         self.verdict.get_or_init(|| {
             crate::resolve::verify_locked_hashes(&self.project_root, &self.lockfile)
-                .map_err(|e| e.to_string())
         })
     }
 }
@@ -437,9 +436,9 @@ impl AspectCheck<PackageItem> for ProvenanceScannedColumn {
 
         match self.verdict() {
             Ok(()) => Cell::Ok,
-            Err(msg) => Cell::Hole(format!(
+            Err(err) => Cell::Hole(format!(
                 "lockfile hash re-assertion failed (at least one cached dep has \
-                 drifted from its pin): {msg}"
+                 drifted from its pin): {err}"
             )),
         }
     }
@@ -470,12 +469,28 @@ mod tests {
     const HEADER: &str =
         "module Package exposing (package)\n\nimport Ipe.Package exposing (..)\n\n\n";
 
-    /// A fresh, empty project directory under the OS temp root, unique per test.
-    fn fresh_project(tag: &str) -> PathBuf {
-        let root = ipe_test_temp::temp_root()
-            .join(format!("ipe-package-surface-{tag}-{}", std::process::id()));
-        std::fs::create_dir_all(&root).expect("create fresh project root");
-        root
+    /// A fresh, empty project directory under the OS temp root, unique per
+    /// test, removed when the guard drops.
+    struct Project(PathBuf);
+
+    impl Project {
+        fn new(tag: &str) -> Self {
+            let root = ipe_test_temp::temp_root()
+                .join(format!("ipe-package-surface-{tag}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&root);
+            std::fs::create_dir_all(&root).expect("create fresh project root");
+            Self(root)
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for Project {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
     }
 
     /// A minimal, validly-parsing `package.ipe` with no declared deps.
@@ -492,7 +507,8 @@ mod tests {
     /// fail-open `let Ok(..) = .. else { return Vec::new() }` this replaced).
     #[test]
     fn a_malformed_manifest_is_a_typed_manifest_error() {
-        let root = fresh_project("bad-manifest");
+        let project = Project::new("bad-manifest");
+        let root = project.path().to_path_buf();
         std::fs::write(
             root.join(crate::package_manifest::PACKAGE_IPE),
             format!("{HEADER}package : Package\npackage =\n    {{ this is not valid"),
@@ -509,7 +525,8 @@ mod tests {
     /// naming the parse failure.
     #[test]
     fn a_malformed_lockfile_is_a_typed_lockfile_error_not_an_empty_lockfile() {
-        let root = fresh_project("bad-lockfile");
+        let project = Project::new("bad-lockfile");
+        let root = project.path().to_path_buf();
         write_minimal_manifest(&root);
         std::fs::write(
             root.join(crate::lockfile::LOCKFILE_NAME),
@@ -536,7 +553,8 @@ mod tests {
     /// an absent one is the ordinary "nothing locked yet" state.
     #[test]
     fn a_missing_lockfile_is_not_an_error() {
-        let root = fresh_project("no-lockfile");
+        let project = Project::new("no-lockfile");
+        let root = project.path().to_path_buf();
         write_minimal_manifest(&root);
 
         assert!(PinnedAndHashedColumn::new(&root).is_ok());
