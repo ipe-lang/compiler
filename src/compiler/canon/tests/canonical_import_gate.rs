@@ -299,13 +299,16 @@ fn qualified_type_follows_the_qualifier_owner() {
     let shadowed = "module Main exposing (y)\n\nimport Ipe.Auth as Auth\nimport App.Auth\n\n\
                     y : Auth.T\ny =\n    App.Auth.T\n";
     let result = run_last(&[APP_AUTH_TYPE, shadowed], &catalog);
-    let home = match &result {
-        Ok(Some((module, interner))) => annotation_home(module, interner, "y"),
-        Ok(None) | Err(_) => None,
-    };
     assert!(
-        home.as_deref() != Some(&["App".to_owned(), "Auth".to_owned()][..]),
-        "`Auth.T` must not reach `App.Auth`: {home:?}"
+        matches!(
+            &result,
+            Err(Diagnostic::Name {
+                msg: NameError::NoSuchMember { module, member, .. },
+                ..
+            }) if &**module == "Auth" && &**member == "T"
+        ),
+        "`Auth.T` names `Ipe.Auth`, which exports no `T`: {:?}",
+        result.as_ref().err()
     );
     let dotted = "module Main exposing (y)\n\nimport Ipe.Auth as Auth\nimport App.Auth\n\n\
                   y : App.Auth.T\ny =\n    App.Auth.T\n";

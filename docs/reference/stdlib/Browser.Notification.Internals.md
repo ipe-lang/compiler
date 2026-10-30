@@ -108,10 +108,10 @@ dropped whole. A decoded `JsMsg` is handed to `toMsg`.
 inbound : Decode.Decoder JsMsg
 ```
 
-The total, fail-closed decoder for the inbound `JsMsg`. It reads `ok` first: a
-true flag decodes a `permission` grant or a `shown` acknowledgement by its
-`event`; a false flag decodes the closed `error` vocabulary into a denial
-variant. An unrecognised token fails the decode closed (the frame is dropped).
+The total, fail-closed decoder for a `JsMsg` frame of this capability.
+
+It first requires the frame's `tag` to be `portTag`, so a frame of another
+capability, or an untagged one, fails closed; the rest decodes as `inboundBody`.
 
 ## `permissionInbound`
 
@@ -119,9 +119,8 @@ variant. An unrecognised token fails the decode closed (the frame is dropped).
 permissionInbound : Decode.Decoder PermissionReply
 ```
 
-The total, fail-closed decoder for a `RequestPermission` reply. Structurally
-distinct from `inbound`: its only success event is `granted`, so a `shown`
-display acknowledgement fails the decode closed (the frame is dropped) rather
-than crossing as a permission outcome. A false `ok` decodes the closed error
-vocabulary into a denial variant.
+The total, fail-closed decoder for a `PermissionReply` frame of this capability.
+
+It first requires the frame's `tag` to be `portTag`, so a frame of another
+capability, or an untagged one, fails closed; the rest decodes as `permissionInboundBody`.
 

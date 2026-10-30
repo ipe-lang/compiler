@@ -461,7 +461,7 @@ fn a_grouped_verb_is_not_reported() {
         "ipe dev lint src/Helper.ipe",
         "ipe fmt src/Main.ipe",
         "ipe dev build --target wasm",
-        "ipe dev build web solo",
+        "ipe dev build web client",
         "ipe release run dist/app",
         "ipe release eject out/",
         "ipe release --help",

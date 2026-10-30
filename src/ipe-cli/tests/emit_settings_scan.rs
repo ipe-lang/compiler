@@ -1195,7 +1195,7 @@ fn an_admitted_site_is_not_refused() -> Result<(), String> {
         if let EmitHost::WebView(w) = e {} }\n\
         #[cfg(test)]\nmod tests { fn t() { RustBackend::new(&i); EmitHost::WebView(w); } }\n";
     let chains_out_of_scope = "fn other() { let WasmConfig::On(WasmBundle { public_env, .. }) = w; \
-        match mode { WasmMode::Hydrate => 1, WasmMode::Solo => 2 }; let b = &m.wasm; }\n\
+        match mode { WasmMode::Hydrate => 1, WasmMode::Render => 2 }; let b = &m.wasm; }\n\
         #[cfg(test)]\nmod tests { fn t() { m.delivery.browser.base; b.public_env; WasmMode::Hydrate; } }\n";
     assert_eq!(
         planted("src/ipe-cli/src/driver/other.rs", chains_out_of_scope)?

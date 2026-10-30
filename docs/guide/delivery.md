@@ -15,7 +15,7 @@ Two independent questions decide how a program ships:
 - **Delivery** — for a `Web` app only, *how* the DOM app runs and *where* it is
   hosted. This is two sub-axes:
   - **runtime** — `served` (a co-located server loop; the unnamed default) or
-    `solo` (a self-contained client compiled to WebAssembly).
+    `client` (a self-contained client compiled to WebAssembly).
   - **host** — where a resolved shape × runtime runs: served, `desktop`, `ios`,
     or `android`.
 
@@ -45,13 +45,13 @@ package =
     , version = "0.1.0"
     , delivery =
         { desktop = { title = "UI Layout", width = 1024, height = 768 }
-        , mobile = { bundleId = "com.example.ui-layout", orientation = Portrait }
+        , mobile = { bundleId = "com.example.uilayout", orientation = Portrait }
         , browser = { basePath = "/" }
         }
     }
 ```
 
-`basePath` is the URL path the client bundle is served at; the `web solo`
+`basePath` is the URL path the client bundle is served at; the `web client`
 host, static hosts, and mobile shells all serve the bundle under it. It is `"/"`
 (or `""`) for the root, or one or more `/segment` parts made only of
 `A-Z a-z 0-9 - . _ ~`, with no trailing `/`, no empty, `.`, or `..` segment, and
@@ -116,9 +116,9 @@ finished on that OS's own runner (cross-OS toolchains are out of scope).
 
 ## Mobile: a wasm client in a system-webview shell
 
-A mobile app is the `Web` shape delivered as a `solo` — the DOM app compiled to
+A mobile app is the `Web` shape delivered as a `client` — the DOM app compiled to
 WebAssembly and hosted offline from app assets inside a native iOS/Android
-webview. Because it is the `solo` runtime, the app must enable the wasm client in
+webview. Because it is the `client` runtime, the app must enable the wasm client in
 `package.ipe`:
 
 ```ipe
@@ -126,15 +126,15 @@ package : Package
 package =
     { name = "ui-layout"
     , version = "0.1.0"
-    , wasm = On { mode = Solo }
+    , wasm = On { mode = Render }
     }
 ```
 
-Then package for a device OS. Because mobile is the `solo` runtime, the host is
-spelled `web solo <os>`:
+Then package for a device OS. Because mobile is the `client` runtime, the host is
+spelled `web client <os>`:
 
 ```
-ipe release build web solo android
+ipe release build web client android
 ```
 
 This builds the wasm bundle and materialises a native shell:
@@ -152,11 +152,11 @@ The Android shell is a ready-to-build Gradle project; the client rides under
 there is no remote host and no `file://` access. Finish the APK with
 `./gradlew assembleDebug` where the Android SDK is present.
 
-`ipe release build web solo ios` writes the equivalent Xcode project (`WKWebView` +
+`ipe release build web client ios` writes the equivalent Xcode project (`WKWebView` +
 `WKURLSchemeHandler`). Its layout and derived-permission manifest are written for
 inspection, but a signed `.ipa` must be produced on a macOS runner with Xcode and
-a signing identity. As with desktop, `build web solo <os>` lays out the same shell
-around a fast dev client; `release web solo <os>` hosts the production client.
+a signing identity. As with desktop, `build web client <os>` lays out the same shell
+around a fast dev client; `release web client <os>` hosts the production client.
 
 ## Running and simulating each host
 
@@ -183,7 +183,7 @@ xvfb-run -a ./out/release/dist/linux/<name>/bin/<name>
 
 ### Android (emulator)
 
-`release web solo android` writes a Gradle project to
+`release web client android` writes a Gradle project to
 `out/release/dist/android/<name>-android/`. With the Android SDK on `PATH`:
 
 ```
@@ -204,7 +204,7 @@ Android SDK.
 
 ### iOS (simulator)
 
-`release web solo ios` writes an Xcode project to `out/release/dist/ios/<name>-ios/` (a
+`release web client ios` writes an Xcode project to `out/release/dist/ios/<name>-ios/` (a
 `WKWebView` plus a scheme handler serving the wasm client). Simulating needs
 **macOS + Xcode**:
 

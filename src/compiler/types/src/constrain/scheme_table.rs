@@ -215,6 +215,8 @@ impl Builtins {
             BuiltinTag::DbSecured => self.secured_con,
             BuiltinTag::DbOrder => self.order_con,
             BuiltinTag::Codec => self.codec_con,
+            BuiltinTag::Remote => self.remote_con,
+            BuiltinTag::RemoteAuth => self.remote_auth_con,
         }
     }
 
@@ -312,51 +314,17 @@ impl Builtins {
     /// The module path an interpreted [`TyShape::Con`] carries for a given
     /// [`BuiltinTag`] in the `Ty::Con { module, .. }`.
     ///
-    /// Most tags are empty-module (unqualified). The homed exceptions carry a
-    /// real module home so a point-free reference to the scheme lowers to the
-    /// emitted enum instead of missing the lowerer's home-keyed variant lookup:
-    /// [`BuiltinTag::HtmlAttribute`] (the `Html` constructor symbol, so
-    /// `ir_type_from_ty`'s disambiguation selects the `Html` attribute variant
-    /// distinct from the unqualified [`BuiltinTag::UiAttribute`]),
-    /// [`BuiltinTag::EmailProvider`], [`BuiltinTag::Duration`],
-    /// [`BuiltinTag::TaskStep`], the
-    /// `Ipe.Db.Store` query-algebra ADTs, and [`BuiltinTag::Codec`].
+    /// Read from [`BuiltinTag::scheme_home`], the one owner of the scheme-side
+    /// home: an empty-home tag is unqualified, a module-homed tag carries its
+    /// module's interned segments so a point-free reference to the scheme lowers
+    /// to the emitted enum.
     #[must_use]
     pub fn builtin_con_module(&self, tag: BuiltinTag) -> &[Symbol] {
-        match tag {
-            BuiltinTag::HtmlAttribute => std::slice::from_ref(&self.html_con),
-            // The `send` kernel takes `EmailProvider` as its first parameter.
-            // Carrying the real `Ipe.Email` home lets a point-free reference to
-            // the interpreted scheme lower to the emitted enum; without it the
-            // unhomed `Con` misses the lowerer's home-keyed variant lookup and
-            // drops into the unknown-builtin internal-compiler-error arm.
-            BuiltinTag::EmailProvider => &self.email_home,
-            // `Duration` is a compiled-source ADT (`Ipe.Duration.Duration`), not a
-            // folded builtin — its `Http.withTimeout` scheme reference must carry
-            // the real `["Ipe", "Duration"]` home so a point-free use lowers to the
-            // emitted enum, exactly as `EmailProvider` does.
-            BuiltinTag::Duration => &self.duration_home,
-            // `Step` is a compiled-source ADT (`Ipe.Task.Step`) — the `Task.loop`
-            // scheme carries the real `["Ipe", "Task"]` home so its `Step` is the
-            // type `Ipe.Task` declares and a point-free use lowers to the emitted
-            // enum, exactly as `Duration` does.
-            BuiltinTag::TaskStep => &self.task_home,
-            // The `Ipe.Db.Store` query-algebra ADTs carry the store home so a
-            // point-free reference lowers to the emitted enum, exactly as the
-            // hand-built `store` / `draft` / … helpers did. `DbOrder` carries it
-            // too: the store's `Asc | Desc` sort direction is a distinct head from
-            // the empty-home comparison `Order`, never the same type.
-            BuiltinTag::DbOrder
-            | BuiltinTag::DbStore
-            | BuiltinTag::DbDraft
-            | BuiltinTag::DbJoined
-            | BuiltinTag::DbSelect
-            | BuiltinTag::DbPolicy
-            | BuiltinTag::DbCond
-            | BuiltinTag::DbPred
-            | BuiltinTag::DbSecured => &self.db_store_home,
-            BuiltinTag::Codec => &self.codec_home,
-            _ => &[],
+        match tag.scheme_home() {
+            ipe_kernels::KernelHome::Builtin => &[],
+            ipe_kernels::KernelHome::Module(path) => {
+                self.scheme_homes.get(path).map_or(&[], Vec::as_slice)
+            }
         }
     }
 

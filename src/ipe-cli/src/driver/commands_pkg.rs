@@ -98,7 +98,7 @@ impl BundleProfile {
 pub enum BundleHost {
     /// `web desktop` — a self-contained per-OS desktop bundle for the host OS.
     Desktop,
-    /// `web solo ios` / `web solo android` — a native mobile system-webview shell.
+    /// `web client ios` / `web client android` — a native mobile system-webview shell.
     Mobile(pack::mobile::MobileOs),
 }
 
@@ -131,7 +131,7 @@ impl BundleHost {
 /// delivery — the single entry point `build`/`release` call once they know the
 /// bundle host and profile.
 ///
-/// `web desktop` lays out a webview-native desktop bundle; `web solo ios|android`
+/// `web desktop` lays out a webview-native desktop bundle; `web client ios|android`
 /// builds the client-wasm SPA and lays out a native mobile system-webview shell.
 /// The permission-manifest derivation ([`pack::permissions`]) remains the single
 /// source of truth for what each bundle may do — this routing never authors a
@@ -215,34 +215,32 @@ pub fn validate_desktop_shape(
 pub fn classify_mobile_spa_cap(
     declared: Option<project::EntryShape>,
     built: delivery::Shape,
-    wasm: &project::WasmConfig,
 ) -> pack::mobile::WebSpaCapability {
     let shape_is_web = declared.map_or_else(
         || built == delivery::Shape::Web,
         |s| s == project::EntryShape::Web,
     );
-    pack::mobile::WebSpaCapability {
-        shape_is_web,
-        wasm_enabled: wasm.implies_wasm_target(),
-    }
+    pack::mobile::WebSpaCapability { shape_is_web }
 }
 
 /// Gate the mobile bundle's web-SPA capability: refuse any shape that is not a
-/// wasm-enabled `Web` app.
+/// `Web` app.
 ///
 /// This is the principle-1 fail-closed gate that fires BEFORE any wasm build.
 /// It delegates to [`pack::mobile::require_web_spa`], the single source of
-/// truth for the web-SPA requirement.
+/// truth for the web-SPA requirement. The manifest's `wasm` field is not read:
+/// the `web client` delivery derives the wasm target by itself
+/// ([`super::derive_target`]), so a `Web` app with no `wasm` field builds the
+/// bundle the shell hosts.
 ///
 /// # Errors
 /// [`CliError::Usage`] wrapping [`pack::mobile::MobileRefusal`] when the
-/// shape is not a wasm-enabled `Web` app.
+/// shape is not a `Web` app.
 pub fn validate_mobile_shape(
     declared: Option<project::EntryShape>,
     built: delivery::Shape,
-    wasm: &project::WasmConfig,
 ) -> Result<(), CliError> {
-    let cap = classify_mobile_spa_cap(declared, built, wasm);
+    let cap = classify_mobile_spa_cap(declared, built);
     pack::mobile::require_web_spa(cap).map_err(|r| CliError::Usage(crate::text::Message::relay(&r)))
 }
 
@@ -253,17 +251,13 @@ pub fn validate_mobile_shape(
 ///
 /// # Errors
 /// [`CliError::Usage`] wrapping a [`pack::mobile::MobileRefusal`] when the
-/// shape is not a wasm-enabled `Web` app, or when the project accepts push but
+/// shape is not a `Web` app, or when the project accepts push but
 /// names no `delivery.mobile.push`.
-fn validate_mobile_pack(
+pub fn validate_mobile_pack(
     manifest: &project::ProjectManifest,
     built: delivery::Shape,
 ) -> Result<(), CliError> {
-    validate_mobile_shape(
-        manifest.default_program().and_then(|p| p.shape),
-        built,
-        &manifest.wasm,
-    )?;
+    validate_mobile_shape(manifest.default_program().and_then(|p| p.shape), built)?;
     manifest
         .mobile_push()
         .map_err(|project::PushUnconfigured| {
@@ -458,7 +452,7 @@ impl<'a> BundleAssembler<'a> {
                 .as_ref()
                 .map(ToString::to_string)
                 .as_deref(),
-            None,
+            crate::project::BundleId::derived(&manifest.name),
         );
         let accepts = &manifest.capabilities_accept;
         let icon = manifest.icon.as_deref();
@@ -548,18 +542,10 @@ impl<'a> BundleAssembler<'a> {
     fn assemble_mobile(&self, os: pack::mobile::MobileOs) -> Result<(), CliError> {
         let manifest = self.manifest();
         let pin = pack::mobile::ManifestPin::of(manifest);
-        let identity = pack::desktop::BundleIdentity::new(
-            &manifest.name,
-            manifest
-                .version
-                .as_ref()
-                .map(ToString::to_string)
-                .as_deref(),
-            None,
-        );
+        let shell = pack::mobile::ShellIdentity::of(manifest);
         let icon = manifest.icon.as_deref();
 
-        // Build the `--target wasm` SPA into the project's output root, then
+        // Build the `web client` bundle into the project's output root, then
         // collect its `www/` tree from the profile's crate. The wasm bundle
         // pipeline (emit + cargo + wasm-bindgen) is the single source of the
         // hostable bundle; invoking it through this binary keeps that pipeline
@@ -578,7 +564,7 @@ impl<'a> BundleAssembler<'a> {
         let bundle = pack::mobile::SpaBundle::from_www_dir(&www_dir)
             .map_err(|e| CliError::Usage(crate::text::Message::relay(&e)))?;
 
-        let layout = pack::mobile::layout(os, self.profile, &identity, &pin, &bundle, icon)?;
+        let layout = pack::mobile::layout(os, self.profile, &shell, &pin, &bundle, icon)?;
 
         let dist = self.profile.dist_dir(&output)?.child(os.as_str())?;
         let shell_root = pack::mobile::materialise(&layout, icon, &dist)?;
@@ -639,7 +625,7 @@ pub fn pack_desktop(finish: NativeFinish<'_>, held: &HeldBuild) -> Result<(), Cl
     BundleAssembler::gate_desktop(held, finish)?.assemble(os)
 }
 
-/// `build|release web solo <os> [<path>]` — build the client-wasm SPA and lay out
+/// `build|release web client <os> [<path>]` — build the client-wasm SPA and lay out
 /// a native mobile system-webview shell for `os` (`ios` / `android`) that hosts
 /// the SPA offline from app assets.
 ///
@@ -667,7 +653,7 @@ pub fn pack_mobile(
     // wasm-enabled `Web` SPA. A declared non-`Web` shape, or a `Web` app with the
     // `[wasm]` mode off, is refused up front (naming exactly what is missing). An
     // app that declares no shape at all is trusted to infer `Web`.
-    // The mobile packager hosts the `web solo <ios|android>` SPA: the shape is
+    // The mobile packager hosts the `web client <ios|android>` SPA: the shape is
     // pinned by `main`. Honour an explicit declared shape when present, else
     // classify `main` — a non-web `main` fails the `require_web_spa` gate by
     // name rather than silently packaging a terminal or script app as an SPA.
@@ -676,15 +662,19 @@ pub fn pack_mobile(
     BundleAssembler::gate_mobile(held, profile)?.assemble(os)
 }
 
+/// The delivery the mobile bundle build is re-invoked with: the browser
+/// `web client` bundle the shell loads. Its argv is [`delivery::Delivery::words`].
+pub const MOBILE_BUNDLE_DELIVERY: delivery::Delivery = delivery::Delivery::web_client();
+
 /// Build the hostable SPA bundle under `output_root` through this binary.
 ///
-/// `ipe dev build --target wasm` for a dev bundle (`<root>/rust/www/`), `ipe
-/// release build --target wasm` for a production one (`<root>/release/rust/www/`).
+/// `ipe dev build web client` for a dev bundle (`<root>/rust/www/`), `ipe
+/// release build web client` for a production one (`<root>/release/rust/www/`).
 ///
 /// Invoking the same binary keeps the wasm bundle pipeline (emit + cargo +
 /// wasm-bindgen) authoritative — the mobile shell hosts exactly the bundle a
 /// plain wasm build/release produces, never a re-implemented variant. The profile
-/// carries through so a `release web solo <os>` shell hosts the production SPA.
+/// carries through so a `release web client <os>` shell hosts the production SPA.
 ///
 /// # Errors
 /// [`CliError::Usage`] when this binary's path cannot be resolved or the
@@ -702,7 +692,8 @@ pub fn build_wasm_for_mobile(
     build
         .args(wasm_build_verb(profile).argv())
         .arg(project_dir)
-        .args(["--target", "wasm", "--out"])
+        .args(MOBILE_BUNDLE_DELIVERY.words())
+        .arg("--out")
         .arg(output_root);
     let status =
         run_inherited(build, InheritedRole::SelfBuild, InheritedInput::Terminal).map_err(|e| {
@@ -743,9 +734,8 @@ fn build_under_pinned_manifest(
 
 /// The verb a mobile shell's wasm bundle is built with.
 ///
-/// A dev shell hosts a `dev build --target wasm` bundle; a release shell hosts
-/// a production `release build --target wasm` bundle (Debug.* gated,
-/// optimised).
+/// A dev shell hosts a `dev build web client` bundle; a release shell hosts a
+/// production `release build web client` bundle (Debug.* gated, optimised).
 #[must_use]
 pub const fn wasm_build_verb(profile: BundleProfile) -> Verb {
     match profile {
@@ -4147,7 +4137,7 @@ mod mobile_base_tests {
         assert!(result.is_ok(), "{result:?}");
     }
 
-    /// Read a wasm-solo project accepting push whose `delivery.mobile` is the
+    /// Read a wasm-client project accepting push whose `delivery.mobile` is the
     /// record `mobile`, through the manifest reader the pack reads.
     fn push_project(test_name: &str, mobile: &str) -> project::ProjectManifest {
         let manifest = write_project(test_name, "/");
@@ -4155,7 +4145,7 @@ mod mobile_base_tests {
             &manifest,
             format!(
                 "module Package exposing (package)\n\npackage =\n    {{ name = \"x\"\n    \
-                 , wasm = On {{ mode = Solo }}\n    \
+                 , wasm = On {{ mode = Render }}\n    \
                  , capabilities = {{ accepts = [ JsPort Push ] }}\n    \
                  , delivery = {{ mobile = {mobile} }}\n    }}\n"
             ),
@@ -4164,6 +4154,134 @@ mod mobile_base_tests {
         let parsed = project::parse_manifest(&manifest);
         let _ = std::fs::remove_dir_all(manifest.parent().expect("project root"));
         parsed.expect("a push-accepting manifest reads")
+    }
+
+    /// The Android and iOS shells laid out from a project named `name` whose
+    /// `delivery` is the record `delivery`, through the manifest reader
+    /// and [`pack::mobile::ShellIdentity::of`] the pack reads.
+    fn mobile_shells(
+        test_name: &str,
+        name: &str,
+        delivery: &str,
+    ) -> (pack::mobile::ShellLayout, pack::mobile::ShellLayout) {
+        let manifest = write_project(test_name, "/");
+        let root = manifest.parent().expect("project root").to_path_buf();
+        std::fs::write(
+            &manifest,
+            format!(
+                "module Package exposing (package)\n\npackage =\n    {{ name = {name:?}\n    \
+                 , delivery = {delivery}\n    }}\n"
+            ),
+        )
+        .expect("write package.ipe");
+        let www = root.join("www");
+        std::fs::create_dir_all(&www).expect("create www/");
+        std::fs::write(www.join("index.html"), b"<html>").expect("write index.html");
+        let parsed = project::parse_manifest(&manifest).expect("the manifest reads");
+        let bundle = pack::mobile::SpaBundle::from_www_dir(&www).expect("collect the bundle");
+        let pin = pack::mobile::ManifestPin::of(&parsed);
+        let shell = pack::mobile::ShellIdentity::of(&parsed);
+        let lay = |os| {
+            pack::mobile::layout(os, BundleProfile::Dev, &shell, &pin, &bundle, None)
+                .expect("layout")
+        };
+        let shells = (
+            lay(pack::mobile::MobileOs::Android),
+            lay(pack::mobile::MobileOs::Ios),
+        );
+        let _ = std::fs::remove_dir_all(&root);
+        shells
+    }
+
+    /// A declared `bundleId` and `orientation` reach both shells verbatim.
+    #[test]
+    fn declared_bundle_id_and_orientation_reach_both_shells() {
+        let (android, ios) = mobile_shells(
+            "declared_identity",
+            "shop",
+            "{ mobile = { bundleId = \"io.acme.Shop\", orientation = Landscape } }",
+        );
+        let gradle = android.generated("app/build.gradle").unwrap_or_default();
+        assert!(gradle.contains("applicationId 'io.acme.Shop'"), "{gradle}");
+        let manifest = android
+            .generated("app/src/main/AndroidManifest.xml")
+            .unwrap_or_default();
+        assert!(
+            manifest.contains("android:screenOrientation=\"sensorLandscape\""),
+            "{manifest}"
+        );
+        let plist = ios.generated("App/Info.plist").unwrap_or_default();
+        assert!(plist.contains("<string>io.acme.Shop</string>"), "{plist}");
+        assert!(
+            plist.contains("<string>UIInterfaceOrientationLandscapeLeft</string>")
+                && !plist.contains("<string>UIInterfaceOrientationPortrait</string>"),
+            "{plist}"
+        );
+        assert!(plist.contains("<key>UIRequiresFullScreen</key>"), "{plist}");
+    }
+
+    /// An absent `bundleId` is the name's derived id, and an absent
+    /// `orientation` is free rotation, in both shells.
+    #[test]
+    fn absent_bundle_id_and_orientation_derive_in_both_shells() {
+        let (android, ios) = mobile_shells(
+            "absent_identity",
+            "My Shop",
+            "{ browser = { basePath = \"/\" } }",
+        );
+        let derived = project::BundleId::derived("My Shop");
+        assert_eq!(derived.as_str(), "com.ipe.myshop");
+        let gradle = android.generated("app/build.gradle").unwrap_or_default();
+        assert!(
+            gradle.contains("applicationId 'com.ipe.myshop'"),
+            "{gradle}"
+        );
+        let manifest = android
+            .generated("app/src/main/AndroidManifest.xml")
+            .unwrap_or_default();
+        assert!(
+            manifest.contains("android:screenOrientation=\"unspecified\""),
+            "{manifest}"
+        );
+        let plist = ios.generated("App/Info.plist").unwrap_or_default();
+        assert!(plist.contains("<string>com.ipe.myshop</string>"), "{plist}");
+        assert!(
+            plist.contains("<string>UIInterfaceOrientationPortraitUpsideDown</string>"),
+            "{plist}"
+        );
+        assert!(
+            !plist.contains("<key>UIRequiresFullScreen</key>"),
+            "{plist}"
+        );
+    }
+
+    /// A `Web` app passes the mobile gate whatever its `wasm` field says: the
+    /// `web client` delivery derives the wasm target, so a project with no
+    /// `wasm` field (what `ipe init <dir> web client` scaffolds) packages.
+    #[test]
+    fn mobile_gate_accepts_web_shape_whatever_the_wasm_field() {
+        let fields = [
+            ("absent", ""),
+            ("off", ", wasm = Off"),
+            ("render", ", wasm = On { mode = Render }"),
+            ("hydrate", ", wasm = On { mode = Hydrate }"),
+        ];
+        for (label, field) in fields {
+            let manifest = write_project(&format!("wasm_field_{label}"), "/");
+            std::fs::write(
+                &manifest,
+                format!("module Package exposing (package)\n\npackage =\n    {{ name = \"x\"{field} }}\n"),
+            )
+            .expect("write package.ipe");
+            let parsed = project::parse_manifest(&manifest);
+            let _ = std::fs::remove_dir_all(manifest.parent().expect("project root"));
+            let parsed = parsed.expect("the manifest reads");
+            let gated = validate_mobile_pack(&parsed, delivery::Shape::Web);
+            assert!(
+                gated.is_ok(),
+                "a `Web` app with wasm {label} packages: {gated:?}"
+            );
+        }
     }
 
     /// A mobile pack of a project that accepts push but names no
@@ -4207,6 +4325,112 @@ mod mobile_base_tests {
 #[cfg(test)]
 mod pack_gate_tests {
     use super::*;
+
+    // ── Mobile bundle build argv ──────────────────────────────────────────────
+
+    /// The delivery a re-invoked bundle build resolves from `words`, under the
+    /// verb `profile` selects, parsed by that verb's own argument parser.
+    fn bundle_build_delivery(
+        profile: BundleProfile,
+        words: &[&str],
+    ) -> Result<delivery::Delivery, CliError> {
+        let verb = wasm_build_verb(profile);
+        let rest: Vec<String> = std::iter::once("app")
+            .chain(words.iter().copied())
+            .chain(["--out", "out"])
+            .map(str::to_owned)
+            .collect();
+        let positionals = match profile {
+            BundleProfile::Dev => cli_args::parse_build(&rest)?.delivery,
+            BundleProfile::Release => cli_args::parse_release_build(&rest)?.delivery,
+        };
+        super::super::commands::resolve_delivery(
+            delivery::Shape::Web,
+            &positionals,
+            false,
+            verb.name(),
+        )
+    }
+
+    const fn target_verb(profile: BundleProfile) -> super::super::commands::TargetVerb {
+        match profile {
+            BundleProfile::Dev => super::super::commands::TargetVerb::Dev,
+            BundleProfile::Release => super::super::commands::TargetVerb::Release,
+        }
+    }
+
+    /// The mobile bundle build re-invokes `ipe` with the `web client` delivery,
+    /// which derives the browser triple and is admitted by the wasm-client
+    /// engine under both verbs; the argv with the runtime word dropped is the
+    /// served default, which never derives the browser triple and which the
+    /// wasm-client engine refuses.
+    #[test]
+    fn mobile_bundle_argv_is_the_wasm_client_delivery() {
+        use super::super::commands::derive_target;
+        use delivery::{DeliveryError, Engine, TargetTriple};
+        let words: Vec<&str> = MOBILE_BUNDLE_DELIVERY.words().collect();
+        assert_eq!(
+            words,
+            [
+                delivery::Shape::Web.word(),
+                delivery::Runtime::Client
+                    .word()
+                    .unwrap_or("<no client word>"),
+            ],
+            "the mobile bundle argv spells `web client`"
+        );
+        let served_words: Vec<&str> = words
+            .iter()
+            .copied()
+            .filter(|w| Some(*w) != delivery::Runtime::Client.word())
+            .collect();
+        for profile in [BundleProfile::Dev, BundleProfile::Release] {
+            let verb = target_verb(profile);
+            let client = bundle_build_delivery(profile, &words);
+            assert_eq!(
+                client.as_ref().ok().copied(),
+                Some(MOBILE_BUNDLE_DELIVERY),
+                "{profile:?}: the argv resolves to the mobile bundle delivery: {client:?}"
+            );
+            let Ok(client) = client else { continue };
+            assert_eq!(
+                client.runtime(),
+                Some(delivery::Runtime::Client),
+                "{profile:?}: the mobile bundle is a client delivery"
+            );
+            for wasm_block in [false, true] {
+                assert_eq!(
+                    derive_target(verb, client, None, None, wasm_block),
+                    Ok(Some(TargetTriple::BrowserWasm)),
+                    "{profile:?}: `web client` derives the browser triple (wasm block {wasm_block})"
+                );
+            }
+            assert_eq!(
+                client.admit_triple(Engine::WasmClient, Some(TargetTriple::BrowserWasm)),
+                Ok(()),
+                "{profile:?}: the wasm-client engine admits the mobile bundle"
+            );
+
+            let served = bundle_build_delivery(profile, &served_words);
+            let Ok(served) = served else {
+                assert!(served.is_ok(), "{profile:?}: `web` resolves: {served:?}");
+                continue;
+            };
+            assert_eq!(served.runtime(), Some(delivery::Runtime::Served));
+            for wasm_block in [false, true] {
+                assert_ne!(
+                    derive_target(verb, served, None, None, wasm_block),
+                    Ok(Some(TargetTriple::BrowserWasm)),
+                    "{profile:?}: the served default never derives the browser triple"
+                );
+            }
+            assert_eq!(
+                served.admit_triple(Engine::WasmClient, Some(TargetTriple::BrowserWasm)),
+                Err(DeliveryError::WasmTargetRequiresClient),
+                "{profile:?}: the wasm-client engine refuses the served default"
+            );
+        }
+    }
 
     // ── Desktop gate refusals ─────────────────────────────────────────────────
 
@@ -4315,9 +4539,8 @@ mod pack_gate_tests {
             classify_desktop_shape(None, delivery::Shape::Web),
             pack::desktop::AppShape::WebView
         );
-        let wasm_on = project::WasmConfig::On(project::WasmBundle::new(project::WasmMode::Solo));
-        assert!(classify_mobile_spa_cap(None, delivery::Shape::Web, &wasm_on).shape_is_web);
-        assert!(!classify_mobile_spa_cap(None, delivery::Shape::Script, &wasm_on).shape_is_web);
+        assert!(classify_mobile_spa_cap(None, delivery::Shape::Web).shape_is_web);
+        assert!(!classify_mobile_spa_cap(None, delivery::Shape::Script).shape_is_web);
     }
 
     /// `EntryShape::Web` classifies to `AppShape::Web`.
@@ -4333,13 +4556,9 @@ mod pack_gate_tests {
     /// mobile SPA shell only hosts `Web` apps.
     #[test]
     fn mobile_gate_refuses_terminal_shape() {
-        let wasm_on = project::WasmConfig::On(project::WasmBundle::new(project::WasmMode::Solo));
-        let err = validate_mobile_shape(
-            Some(project::EntryShape::Terminal),
-            delivery::Shape::Script,
-            &wasm_on,
-        )
-        .expect_err("Terminal shape must be refused for mobile");
+        let err =
+            validate_mobile_shape(Some(project::EntryShape::Terminal), delivery::Shape::Script)
+                .expect_err("Terminal shape must be refused for mobile");
         assert!(
             matches!(&err, CliError::Usage(_)),
             "expected Usage, got {err:?}"
@@ -4356,13 +4575,9 @@ mod pack_gate_tests {
     /// A declared `Program` shape must be refused for mobile packaging.
     #[test]
     fn mobile_gate_refuses_program_shape() {
-        let wasm_on = project::WasmConfig::On(project::WasmBundle::new(project::WasmMode::Solo));
-        let err = validate_mobile_shape(
-            Some(project::EntryShape::Program),
-            delivery::Shape::Script,
-            &wasm_on,
-        )
-        .expect_err("Program shape must be refused for mobile");
+        let err =
+            validate_mobile_shape(Some(project::EntryShape::Program), delivery::Shape::Script)
+                .expect_err("Program shape must be refused for mobile");
         assert!(
             matches!(&err, CliError::Usage(_)),
             "expected Usage, got {err:?}"
@@ -4376,95 +4591,24 @@ mod pack_gate_tests {
         );
     }
 
-    /// A `Web` shape with wasm mode `off` must be refused — the mobile shell
-    /// requires `[wasm] mode` set to `spa` or `hydrate`.
-    #[test]
-    fn mobile_gate_refuses_web_shape_without_wasm() {
-        let wasm_off = project::WasmConfig::Off;
-        let err = validate_mobile_shape(
-            Some(project::EntryShape::Web),
-            delivery::Shape::Script,
-            &wasm_off,
-        )
-        .expect_err("Web shape without wasm must be refused for mobile");
-        assert!(
-            matches!(&err, CliError::Usage(_)),
-            "expected Usage, got {err:?}"
-        );
-        let CliError::Usage(msg) = err else {
-            return;
-        };
-        assert!(
-            msg.contains("wasm") || msg.contains("Wasm") || msg.contains("solo"),
-            "refusal names the missing wasm capability: {msg}"
-        );
-    }
-
-    /// A `Web` shape with wasm mode `spa` passes the mobile gate.
-    #[test]
-    fn mobile_gate_accepts_web_shape_with_wasm_spa() {
-        let wasm_on = project::WasmConfig::On(project::WasmBundle::new(project::WasmMode::Solo));
-        validate_mobile_shape(
-            Some(project::EntryShape::Web),
-            delivery::Shape::Script,
-            &wasm_on,
-        )
-        .expect("Web + wasm=spa must pass the mobile gate");
-    }
-
-    /// A `Web` shape with wasm mode `hydrate` also passes the mobile gate.
-    #[test]
-    fn mobile_gate_accepts_web_shape_with_wasm_hydrate() {
-        let wasm_on = project::WasmConfig::On(project::WasmBundle::new(project::WasmMode::Hydrate));
-        validate_mobile_shape(
-            Some(project::EntryShape::Web),
-            delivery::Shape::Script,
-            &wasm_on,
-        )
-        .expect("Web + wasm=hydrate must pass the mobile gate");
-    }
-
     // ── Mobile capability classification ──────────────────────────────────────
 
-    /// `Web` + wasm enabled -> `shape_is_web=true`, `wasm_enabled=true`.
+    /// A declared `Web` shape classifies as a web SPA.
     #[test]
-    fn classify_mobile_cap_web_wasm_on() {
-        let wasm_on = project::WasmConfig::On(project::WasmBundle::new(project::WasmMode::Solo));
-        let cap = classify_mobile_spa_cap(
-            Some(project::EntryShape::Web),
-            delivery::Shape::Script,
-            &wasm_on,
-        );
+    fn classify_mobile_cap_web() {
+        let cap = classify_mobile_spa_cap(Some(project::EntryShape::Web), delivery::Shape::Script);
         assert!(cap.shape_is_web, "Web shape must set shape_is_web");
-        assert!(cap.wasm_enabled, "spa mode must set wasm_enabled");
     }
 
-    /// `Terminal` + wasm enabled -> `shape_is_web=false`.
+    /// A declared `Terminal` shape is not a web SPA.
     #[test]
-    fn classify_mobile_cap_terminal_wasm_on() {
-        let wasm_on = project::WasmConfig::On(project::WasmBundle::new(project::WasmMode::Solo));
-        let cap = classify_mobile_spa_cap(
-            Some(project::EntryShape::Terminal),
-            delivery::Shape::Script,
-            &wasm_on,
-        );
+    fn classify_mobile_cap_terminal() {
+        let cap =
+            classify_mobile_spa_cap(Some(project::EntryShape::Terminal), delivery::Shape::Script);
         assert!(
             !cap.shape_is_web,
             "Terminal shape must set shape_is_web=false"
         );
-    }
-
-    /// `Web` + wasm off -> `wasm_enabled=false`.
-    #[test]
-    fn classify_mobile_cap_web_wasm_off() {
-        let wasm_off = project::WasmConfig::Off;
-        let cap = classify_mobile_spa_cap(
-            Some(project::EntryShape::Web),
-            delivery::Shape::Script,
-            &wasm_off,
-        );
-        assert!(cap.shape_is_web, "Web shape must set shape_is_web");
-        assert!(!cap.wasm_enabled, "`Off` must set wasm_enabled=false");
     }
 }
 

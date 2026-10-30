@@ -34,25 +34,11 @@ pub struct Builtins {
     /// handler parameter type in `mapError` / `onError` so a bare lambda `\e ->
     /// ...` infers `e : Error` without leaving a free variable.
     pub error: Symbol,
-    /// `ErrorKind` — the 12-variant classification carried by `Error`'s first
-    /// field. Registered as a Prelude built-in exactly
-    /// like `Order` — see `ipe_lower`'s `enum_variants`/`ctor_arity`
-    /// (E-12), which already validate `Error kind info ->` patterns.
+    /// `ErrorKind` — the classification carried by `Error`'s first field. Its
+    /// constructors are canon's `BUILTIN_UNIONS` row, read by
+    /// [`Self::ctor_schemes`] and by `ipe_lower`'s seeded unions; no symbol of
+    /// one is held here.
     pub errorkind: Symbol,
-    /// The 12 `ErrorKind` nullary constructor symbols, in canon's registered
-    /// index order (`ipe_canon::builtins::BUILTIN_UNIONS`) — do not reorder.
-    pub ek_io: Symbol,
-    pub ek_network: Symbol,
-    pub ek_ffi: Symbol,
-    pub ek_decode: Symbol,
-    pub ek_timeout: Symbol,
-    pub ek_not_found: Symbol,
-    pub ek_permission_denied: Symbol,
-    pub ek_invalid_input: Symbol,
-    pub ek_conflict: Symbol,
-    pub ek_unavailable: Symbol,
-    pub ek_unexpected: Symbol,
-    pub ek_limit_exceeded: Symbol,
     /// `ErrorDetails` — the 6-variant enrichment union carried on
     /// `ErrorInfo.details`. Registered as a Prelude
     /// built-in exactly like `ErrorKind` — see `ipe_lower`'s
@@ -666,6 +652,12 @@ pub struct Builtins {
     /// `StoreEqBy` kernel scheme (`Codec t -> …`), so an enum/newtype column's
     /// comparison value is projected to a bound `SqlValue` through its own codec.
     pub codec_con: Symbol,
+    /// `"Remote"` — the `Ipe.Remote.Remote req resp` server-endpoint ADT, homed
+    /// via [`Self::remote_home`].
+    pub remote_con: Symbol,
+    /// `"RemoteAuth"` — the `Ipe.Remote.RemoteAuth` session signing key ADT,
+    /// homed via [`Self::remote_home`].
+    pub remote_auth_con: Symbol,
     /// `"Step"` — the `Ipe.Task.Step` loop-step ADT (`Continue s | Done a`).
     /// Consumed by the `Task.loop` kernel scheme; homed via
     /// [`Self::task_home`] so the scheme's `Step` is the compiled-module enum.
@@ -780,6 +772,39 @@ pub struct Builtins {
     /// is the same nominal type `Ipe.Task` declares, and a point-free reference
     /// lowers to that emitted enum (mirrors [`Self::duration_home`]).
     pub task_home: Vec<Symbol>,
+    /// The interned module segments `["Ipe", "Remote"]` — the real home of the
+    /// `Remote` and `RemoteAuth` ADTs, so a type naming either is the type
+    /// `Ipe.Remote` declares (mirrors [`Self::duration_home`]).
+    pub remote_home: Vec<Symbol>,
+    /// Each module scheme home a [`BuiltinTag::scheme_home`] names, keyed by its
+    /// dotted path, as interned segments.
+    pub scheme_homes: std::collections::BTreeMap<&'static str, Vec<Symbol>>,
+}
+
+/// Intern the segments of every module scheme home a builtin tag names.
+///
+/// # Errors
+///
+/// Fails when the interner refuses a segment.
+fn scheme_homes(
+    interner: &mut Interner,
+) -> DResult<std::collections::BTreeMap<&'static str, Vec<Symbol>>> {
+    let mut homes = std::collections::BTreeMap::new();
+    for row in ipe_kernels::BUILTIN_TYPES {
+        let Some(tag) = row.tag() else { continue };
+        let ipe_kernels::KernelHome::Module(path) = tag.scheme_home() else {
+            continue;
+        };
+        if homes.contains_key(path) {
+            continue;
+        }
+        let mut segments = Vec::new();
+        for segment in path.split('.') {
+            segments.push(interner.intern(segment)?);
+        }
+        homes.insert(path, segments);
+    }
+    Ok(homes)
 }
 
 impl Builtins {
@@ -811,18 +836,6 @@ impl Builtins {
             false_: interner.intern("False")?,
             error: interner.intern("Error")?,
             errorkind: interner.intern("ErrorKind")?,
-            ek_io: interner.intern("Io")?,
-            ek_network: interner.intern("Network")?,
-            ek_ffi: interner.intern("Ffi")?,
-            ek_decode: interner.intern("Decode")?,
-            ek_timeout: interner.intern("Timeout")?,
-            ek_not_found: interner.intern("NotFound")?,
-            ek_permission_denied: interner.intern("PermissionDenied")?,
-            ek_invalid_input: interner.intern("InvalidInput")?,
-            ek_conflict: interner.intern("Conflict")?,
-            ek_unavailable: interner.intern("Unavailable")?,
-            ek_unexpected: interner.intern("Unexpected")?,
-            ek_limit_exceeded: interner.intern("LimitExceeded")?,
             errordetails: interner.intern("ErrorDetails")?,
             backoffstrategy: interner.intern("BackoffStrategy")?,
             ed_ffi_panic: interner.intern("FfiPanic")?,
@@ -1062,6 +1075,8 @@ impl Builtins {
             policy_con: interner.intern("Policy")?,
             order_con: interner.intern("Order")?,
             codec_con: interner.intern("Codec")?,
+            remote_con: interner.intern("Remote")?,
+            remote_auth_con: interner.intern("RemoteAuth")?,
             task_step: interner.intern("Step")?,
             // ── ProjectionTerm / ProjectionOperand ──────────────────────────────
             projection_term: interner.intern("ProjectionTerm")?,
@@ -1091,6 +1106,8 @@ impl Builtins {
             email_home: vec![interner.intern("Ipe")?, interner.intern("Email")?],
             duration_home: vec![interner.intern("Ipe")?, interner.intern("Duration")?],
             task_home: vec![interner.intern("Ipe")?, interner.intern("Task")?],
+            remote_home: vec![interner.intern("Ipe")?, interner.intern("Remote")?],
+            scheme_homes: scheme_homes(interner)?,
         })
     }
 
@@ -1209,7 +1226,8 @@ impl Builtins {
             | (
                 "ErrorKind",
                 "Io" | "Network" | "Ffi" | "Decode" | "Timeout" | "NotFound" | "PermissionDenied"
-                | "InvalidInput" | "Conflict" | "Unavailable" | "Unexpected" | "LimitExceeded",
+                | "InvalidInput" | "Conflict" | "Unavailable" | "Unexpected" | "LimitExceeded"
+                | "UpdateRequired",
             )
             | (
                 "DbFailure",

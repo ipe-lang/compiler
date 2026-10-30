@@ -1,6 +1,6 @@
 //! Ipe.Error: the rich, typed `Error` ADT.
 //!
-//! `Error = Error ErrorKind ErrorInfo`, a 12-variant `ErrorKind`
+//! `Error = Error ErrorKind ErrorInfo`, a 13-variant `ErrorKind`
 //! classification, message-carrying `ErrorInfo`, and the 6-variant
 //! `ErrorDetails` union (`FfiPanic`/`TypeMismatch`/`HttpStatus`/`JsonDecode`/
 //! `Custom`/`Database`) carried optionally on `ErrorInfo.details : Maybe ErrorDetails`.
@@ -28,7 +28,7 @@ use std::fmt;
 
 use crate::core::IpeMaybe;
 
-/// Ipê's `ErrorKind` — 12 nullary variants.
+/// Ipê's `ErrorKind` — 13 nullary variants.
 ///
 /// Repr(u8) for a compact, sound, exhaustively-matched runtime type (mirrors
 /// `IpeOrder`'s convention). The order is append-only: each discriminant is
@@ -53,13 +53,15 @@ pub enum IpeErrorKind {
     /// A declared ceiling (a size, count or depth bound on one input) turned
     /// the input back; a larger bound would accept the same input.
     LimitExceeded = 11,
+    /// The client is older than the server it calls; the user updates the app.
+    UpdateRequired = 12,
 }
 
 crate::stringify::show_row!("ErrorKind", Value, [] IpeErrorKind, |k| k.label().to_owned());
 
 impl IpeErrorKind {
     /// Every kind, in discriminant order.
-    pub const ALL: [Self; 12] = [
+    pub const ALL: [Self; 13] = [
         Self::Io,
         Self::Network,
         Self::Ffi,
@@ -72,6 +74,7 @@ impl IpeErrorKind {
         Self::Unavailable,
         Self::Unexpected,
         Self::LimitExceeded,
+        Self::UpdateRequired,
     ];
 
     /// Renders the reference design's `"<Kind>: "` prefix (`Error.toString`,
@@ -90,6 +93,7 @@ impl IpeErrorKind {
             Self::Unavailable => "Unavailable",
             Self::Unexpected => "Unexpected",
             Self::LimitExceeded => "LimitExceeded",
+            Self::UpdateRequired => "UpdateRequired",
         }
     }
 }
@@ -449,6 +453,11 @@ impl IpeError {
     pub fn limit_exceeded(message: impl Into<String>) -> Self {
         Self::with(IpeErrorKind::LimitExceeded, message.into())
     }
+    /// The client is older than the server it calls (`ErrorKind.UpdateRequired`).
+    #[must_use]
+    pub fn update_required(message: impl Into<String>) -> Self {
+        Self::with(IpeErrorKind::UpdateRequired, message.into())
+    }
     /// Nullary in the Ipê surface — pre-built, fixed message.
     #[must_use]
     pub fn timeout() -> Self {
@@ -499,8 +508,9 @@ impl IpeError {
     /// `Network` and `Unavailable`.
     ///
     /// Those three are the kinds a caller can reasonably back off and retry.
-    /// The other nine fail again on the same input: `LimitExceeded` in
-    /// particular is a deterministic refusal of that input by its bound.
+    /// The other ten fail again on the same input: `LimitExceeded` in
+    /// particular is a deterministic refusal of that input by its bound, and
+    /// `UpdateRequired` holds until the client is updated.
     #[must_use]
     pub fn is_retryable(&self) -> bool {
         let Self::Error(kind, _) = self;
@@ -923,11 +933,12 @@ mod tests {
             assert_eq!(e.is_retryable(), expected, "{kind:?}");
         }
         assert!(!IpeError::limit_exceeded("x").is_retryable());
+        assert!(!IpeError::update_required("x").is_retryable());
     }
 
     #[test]
     fn kinds_are_append_only_with_stable_discriminants() {
-        let pinned: [(IpeErrorKind, u8, &str); 12] = [
+        let pinned: [(IpeErrorKind, u8, &str); 13] = [
             (IpeErrorKind::Io, 0, "Io"),
             (IpeErrorKind::Network, 1, "Network"),
             (IpeErrorKind::Ffi, 2, "Ffi"),
@@ -940,6 +951,7 @@ mod tests {
             (IpeErrorKind::Unavailable, 9, "Unavailable"),
             (IpeErrorKind::Unexpected, 10, "Unexpected"),
             (IpeErrorKind::LimitExceeded, 11, "LimitExceeded"),
+            (IpeErrorKind::UpdateRequired, 12, "UpdateRequired"),
         ];
         assert_eq!(IpeErrorKind::ALL.len(), pinned.len());
         for (index, (kind, discriminant, label)) in pinned.into_iter().enumerate() {
@@ -972,6 +984,18 @@ mod tests {
             ipe_error_kind(bridged),
             IpeErrorKind::Unexpected,
             "the bare-String bridge never classifies a ceiling"
+        );
+    }
+
+    #[test]
+    fn update_required_carries_its_kind_and_prefix() {
+        let e = IpeError::update_required("x");
+        assert_eq!(ipe_error_kind(e.clone()), IpeErrorKind::UpdateRequired);
+        assert_eq!(e.to_ipe_string(), "UpdateRequired: x");
+        assert!(!ipe_error_is_retryable(e));
+        assert_eq!(
+            ipe_error_kind_name(IpeErrorKind::UpdateRequired),
+            "UpdateRequired"
         );
     }
 

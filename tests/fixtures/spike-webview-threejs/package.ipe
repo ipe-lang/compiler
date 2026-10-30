@@ -9,7 +9,7 @@ package =
     , version = "0.0.0"
     , delivery =
         { desktop = { title = "three.js spike", width = 1024, height = 720 }
-        , mobile = { bundleId = "com.example.webview-threejs-spike", orientation = Portrait }
+        , mobile = { bundleId = "com.example.webviewthreejsspike", orientation = Portrait }
         , browser = { basePath = "/" }
         }
     }

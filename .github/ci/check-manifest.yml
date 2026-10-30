@@ -33,12 +33,17 @@
 #                 over changed crates + reverse deps) or `full` (the CI mirror).
 #                 `complete: true` adds the converse: every command CI runs for
 #                 the gate is one of these, so the two sets are one.
-#                 A command is a string or {cmd, env, cwd, differs}. Each must
-#                 match a command the producer job runs, token for token, with
-#                 the same env and working directory; `differs: <reason>`
-#                 waives only the token match. Placeholders: {packages} (changed
-#                 crates; `--workspace` in CI), {lib_packages} (the same, library
-#                 crates only), {repo_root}, {target_dir}.
+#                 A command is a string or {cmd, env, cwd, differs, tier,
+#                 package}. Each must match a command the producer job runs,
+#                 token for token, with the same env and working directory;
+#                 `differs: <reason>` waives only the token match. `tier` on
+#                 one command overrides the entry's tier (a command cheap
+#                 enough to run earlier than the rest of its job's mirror).
+#                 `package` skips the command unless that crate owns a changed
+#                 file (an unowned change still conservatively runs it, like an
+#                 un-prefixed {packages} word). Placeholders: {packages}
+#                 (changed crates; `--workspace` in CI), {lib_packages} (the
+#                 same, library crates only), {repo_root}, {target_dir}.
 #   covered-by    Another gate context whose local run exercises this one.
 #   ci-only       Not reproducible locally: platform | privileged | classifier |
 #                 run-history | pull-request-state | inline-script.
@@ -116,6 +121,17 @@ checks:
         - cmd: cargo nextest run --locked -p ipe --features wasi_run,signing --profile ci
           env:
             IPE_RUNTIME_DIR: "{repo_root}/src/runtime/rust/src"
+        - cmd: >-
+            cargo nextest run --locked -p ipe --features wasi_run,signing --profile ci --no-fail-fast
+            --test argv_decode_scan --test cargo_step_scan --test child_runner_scan --test e2e_scratch_dir_scan --test emit_settings_scan --test emitted_cargo_build_scan --test env_read_scan --test ffi_cache_path_scan --test format_width_scan --test home_read_scan --test html_entity_owner_scan --test lenient_decode_scan --test output_marker_scan --test package_single_read_scan --test publish_fork_write_scan --test raw_print_ratchet --test retired_delivery_words_scan --test tool_path_scan --test verb_prose_ratchet --test wildcard_spelling_scan
+          env:
+            IPE_RUNTIME_DIR: "{repo_root}/src/runtime/rust/src"
+          tier: quick
+          differs: >-
+            narrows to the crate's tree-wide source-scan and ratchet binaries
+            (every `tests/*_scan.rs` and `tests/*_ratchet.rs`, pinned by
+            test_local_gate.py), which read every crate, so any change fails
+            them at `quick` instead of first in the merge queue
         - cmd: cargo nextest run --locked -p ipe --features wasi_run --profile ci --test wasi_target_seal
           env:
             IPE_E2E: "1"
@@ -313,6 +329,14 @@ checks:
       run:
         - cargo nextest run -p ipe-runtime-rust --features full,dev-posture --profile ci -E 'test(dev_posture_pin_)'
         - cargo nextest run -p ipe-runtime-rust --features full,debugger,locale --profile ci
+        - cmd: cargo nextest run -p ipe-runtime-rust --features full,debugger,locale --profile ci --no-fail-fast -E 'kind(test)'
+          tier: quick
+          package: ipe-runtime-rust
+          differs: >-
+            narrows to the crate's integration-test binaries (where the
+            registry/secret/env scan tests live) and keeps running past a
+            failing one, so a runtime change fails every such scan locally
+            at `quick` instead of only in the merge queue
     guards: SEAL
     aggregates: [runtime-full-features-run]
   - context: registry-admission

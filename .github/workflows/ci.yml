@@ -167,7 +167,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - name: Reject committed build artifacts
         run: .github/ci/artifact-guard.sh
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: "3.13"
       - name: Install PyYAML
@@ -242,7 +242,7 @@ jobs:
       - uses: ./.github/actions/rust-toolchain-pinned
         with:
           components: clippy
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Fetch crates
@@ -323,7 +323,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: ./.github/actions/rust-toolchain-pinned
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo check --locked -p ipe -p ipe_fs_open -p ipe_sandbox --all-targets
@@ -380,7 +380,7 @@ jobs:
       # `ipe-nextest-deps` is shared by explain-examples, registry-admission-run
       # and seal-modset-vendored: each runs `cargo nextest run -p ipe` with the
       # same toolchain, RUSTFLAGS and features, so their dependencies match.
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           shared-key: ipe-nextest-deps
           save-if: ${{ github.ref == 'refs/heads/main' }}
@@ -437,7 +437,7 @@ jobs:
       # `ipe-nextest-deps` is shared by explain-examples, registry-admission-run
       # and seal-modset-vendored: each runs `cargo nextest run -p ipe` with the
       # same toolchain, RUSTFLAGS and features, so their dependencies match.
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           shared-key: ipe-nextest-deps
           save-if: ${{ github.ref == 'refs/heads/main' }}
@@ -566,7 +566,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: ./.github/actions/rust-toolchain-pinned
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Fetch crates
@@ -594,7 +594,7 @@ jobs:
       - uses: ./.github/actions/rust-toolchain-pinned
         with:
           components: clippy
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       # db WITHOUT web — the load-bearing invariant.
@@ -672,7 +672,7 @@ jobs:
         if: needs.changes.outputs.release_only != 'true'
         with:
           targets: wasm32-unknown-unknown, wasm32-wasip1
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         if: needs.changes.outputs.release_only != 'true'
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
@@ -812,7 +812,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: ./.github/actions/rust-toolchain-pinned
       - uses: ./.github/actions/mold
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - uses: taiki-e/install-action@23d41aa71228a2692ee31bb433f070fd4bdc6661 # nextest
@@ -878,7 +878,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: ./.github/actions/rust-toolchain-pinned
       - uses: ./.github/actions/mold
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - uses: taiki-e/install-action@23d41aa71228a2692ee31bb433f070fd4bdc6661 # nextest
@@ -909,7 +909,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: ./.github/actions/rust-toolchain-pinned
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - uses: taiki-e/install-action@23d41aa71228a2692ee31bb433f070fd4bdc6661 # nextest
@@ -968,7 +968,7 @@ jobs:
       # Cache the shared emitted-crate target (keyed on this job), so the
       # runtime + its deps stay warm across runs and later emitted builds are
       # incremental.
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
           cache-directories: ${{ github.workspace }}/.cache/seal-shared-target
@@ -1053,11 +1053,11 @@ jobs:
           targets: wasm32-unknown-unknown
       - uses: ./.github/actions/mold
       # The wasm-bindgen CLI, pinned to the Cargo.lock wasm-bindgen version: a
-      # shape that declares a wasm client builds as its `web solo` bundle.
+      # shape that declares a wasm client builds as its `web client` bundle.
       - uses: taiki-e/install-action@4cef1412cce204788f482e778a0b9187f9626a29 # v2
         with:
           tool: wasm-bindgen@0.2.126
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
           cache-directories: ${{ github.workspace }}/.cache/shapes-shared-target
@@ -1091,11 +1091,11 @@ jobs:
             if ! "$IPE" type-check "$dir"; then
               echo "::error::ipe type-check regressed: $dir"; fail=1; echo "::endgroup::"; continue
             fi
-            # A package that declares a wasm client builds as its `web solo`
+            # A package that declares a wasm client builds as its `web client`
             # bundle: that build compiles the wasm32 crate and runs wasm-bindgen
             # itself, and mold links host binaries only, so RUSTFLAGS is cleared.
             if grep -Eq '^[[:space:],]*wasm[[:space:]]*=[[:space:]]*On' "$toml"; then
-              if ! RUSTFLAGS="" "$IPE" dev build "$dir" web solo --out "$dir/out"; then
+              if ! RUSTFLAGS="" "$IPE" dev build "$dir" web client --out "$dir/out"; then
                 echo "::error::ipe dev build regressed: $dir"; fail=1; echo "::endgroup::"; continue
               fi
               if [ ! -f "$dir/out/rust/www/index.html" ]; then
@@ -1188,7 +1188,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: ./.github/actions/rust-toolchain-pinned
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - uses: taiki-e/install-action@23d41aa71228a2692ee31bb433f070fd4bdc6661 # nextest
@@ -1289,7 +1289,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@be39649afda95dbf70f87cce95f68b8d5797b296 # nightly
         with:
           components: rust-src
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - uses: taiki-e/install-action@23d41aa71228a2692ee31bb433f070fd4bdc6661 # nextest
@@ -1351,7 +1351,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@be39649afda95dbf70f87cce95f68b8d5797b296 # nightly
         with:
           components: rust-src
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - uses: taiki-e/install-action@23d41aa71228a2692ee31bb433f070fd4bdc6661 # nextest
@@ -1433,7 +1433,7 @@ jobs:
       # Cache the shared emitted-crate target across runs so the runtime dep tree
       # (axum/tokio/sqlx/serde) stays warm and each shard's goldens link
       # incrementally instead of cold-building it. Keyed per shard by rust-cache.
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
           cache-directories: ${{ github.workspace }}/.cache/oracle-shared-target
@@ -1625,7 +1625,7 @@ jobs:
       # `ipe-nextest-deps` is shared by explain-examples, registry-admission-run
       # and seal-modset-vendored: each runs `cargo nextest run -p ipe` with the
       # same toolchain, RUSTFLAGS and features, so their dependencies match.
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           shared-key: ipe-nextest-deps
           save-if: ${{ github.ref == 'refs/heads/main' }}
@@ -1669,7 +1669,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: ./.github/actions/rust-toolchain-pinned
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - uses: taiki-e/install-action@23d41aa71228a2692ee31bb433f070fd4bdc6661 # nextest
@@ -1757,7 +1757,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: ./.github/actions/rust-toolchain-pinned
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - uses: taiki-e/install-action@23d41aa71228a2692ee31bb433f070fd4bdc6661 # nextest
@@ -1814,7 +1814,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: ./.github/actions/rust-toolchain-pinned
       - uses: ./.github/actions/mold
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       # `-p ipe` alone first, so the compiler resolves exactly the features a
@@ -2030,7 +2030,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: ./.github/actions/rust-toolchain-pinned
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Regenerate the Markdown parity snapshot via an ipe dev run
@@ -2466,7 +2466,7 @@ jobs:
         with:
           targets: wasm32-unknown-unknown
       - uses: ./.github/actions/mold
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
           cache-directories: ${{ github.workspace }}/.cache/browser-e2e-target
@@ -2723,7 +2723,7 @@ jobs:
             exit 1
           fi
       # The wasm-bindgen CLI, pinned to the Cargo.lock wasm-bindgen version: the
-      # `web solo` bundle build below runs it, and so does the wasm test runner
+      # `web client` bundle build below runs it, and so does the wasm test runner
       # (a runner of another version refuses the test binary).
       - uses: taiki-e/install-action@4cef1412cce204788f482e778a0b9187f9626a29 # v2
         with:
@@ -2731,23 +2731,23 @@ jobs:
       # The serverless browser bundle: the spec serves its `www/` directory by
       # request interception, so no server is spawned. mold links host binaries
       # only, so the wasm32 build clears the job's RUSTFLAGS.
-      - name: Build the wasm-solo-clipboard browser bundle
+      - name: Build the wasm-client-clipboard browser bundle
         env:
           RUSTFLAGS: ""
-          CARGO_TARGET_DIR: ${{ github.workspace }}/.cache/browser-e2e-target/wasm-solo-clipboard
+          CARGO_TARGET_DIR: ${{ github.workspace }}/.cache/browser-e2e-target/wasm-client-clipboard
         run: |
           set -euo pipefail
-          OUT="$RUNNER_TEMP/wasm-solo-clipboard-emitted"
-          "$RUNNER_TEMP/ipe-release/ipe" dev build examples/shapes/web/wasm-solo-clipboard web solo --out "$OUT"
+          OUT="$RUNNER_TEMP/wasm-client-clipboard-emitted"
+          "$RUNNER_TEMP/ipe-release/ipe" dev build examples/shapes/web/wasm-client-clipboard web client --out "$OUT"
           # Fail closed: a bundle without its shell leaves the spec nothing to serve.
           if [ ! -f "$OUT/rust/www/index.html" ]; then
-            echo "wasm-solo-clipboard bundle has no www/index.html under '$OUT/rust'" >&2
+            echo "wasm-client-clipboard bundle has no www/index.html under '$OUT/rust'" >&2
             exit 1
           fi
-          bash "$GITHUB_WORKSPACE/.github/ci/github-env.sh" CI_JOB_WASM_SOLO_WWW "$OUT/rust/www"
+          bash "$GITHUB_WORKSPACE/.github/ci/github-env.sh" CI_JOB_WASM_CLIENT_WWW "$OUT/rust/www"
       - name: Run Playwright specs (geo + clipboard, layout fill, focus across patch, csp styles, install offer)
         working-directory: tools/scripts/browser-e2e
-        run: IPE_WASM_SOLO_WWW="$CI_JOB_WASM_SOLO_WWW" npx playwright test --config playwright.config.mjs
+        run: IPE_WASM_CLIENT_WWW="$CI_JOB_WASM_CLIENT_WWW" npx playwright test --config playwright.config.mjs
       - name: Kill server
         if: always()
         run: kill "$CI_JOB_GEO_SERVER_PID" "$CI_JOB_LAYOUT_SERVER_PID" "$CI_JOB_FOCUS_SERVER_PID" "$CI_JOB_CSP_STYLES_SERVER_PID" "$CI_JOB_INSTALL_OFFER_SERVER_PID" "$CI_JOB_INSTALL_OFFER_OFF_SERVER_PID" 2>/dev/null || true
@@ -2809,7 +2809,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: "3.13"
       - name: Install PyYAML

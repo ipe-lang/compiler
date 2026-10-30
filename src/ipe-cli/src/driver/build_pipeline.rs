@@ -39,8 +39,8 @@ pub struct BuildOptions {
     /// allocator feature, add the generated `.cargo/config.toml`). `None` —
     /// normal dynamic build; also removes a stale generated static config.
     pub static_plan: Option<ipe_backend_rust::static_build::StaticPlan>,
-    /// The compilation target (`Native` default; `WasmClient` under
-    /// `ipe dev build --target wasm`) — threaded into kernel resolution (the
+    /// The compilation target (`Native` default; `WasmClient` for the
+    /// `web client` delivery) — threaded into kernel resolution (the
     /// Layer-1 wasm gate), the emitted manifest, and both cache keys.
     pub target: ipe_ir::Target,
     /// The verb family this build serves, threaded into
@@ -1899,8 +1899,7 @@ pub fn compile_prepared(
     // Layer 1 so a reachability violation gets the friendlier exact-chain
     // message; Layer 1 judges the same closure at each reference (e.g. a server
     // kernel named directly in the entry's own module). `linked.name` is the
-    // client entry's module path for today's single-entry `--target wasm`
-    // build.
+    // client entry's module path for the single-entry `web client` build.
     if config.settings(db).target == ipe_ir::Target::WasmClient {
         let gate_result = {
             let interner = shared_interner.lock();
@@ -1917,7 +1916,7 @@ pub fn compile_prepared(
         })?;
     }
 
-    // Layer-1 wasm security gate (IPE-N0029): under `--target wasm`, every
+    // Layer-1 wasm security gate (IPE-N0029): on the `WasmClient` target, every
     // kernel named in a def the entry can reach must be on the WasmClient
     // allowlist (a reached denied kernel would otherwise become a cargo
     // failure — THE SEAL — or a secret consumer in a public bundle). A def the

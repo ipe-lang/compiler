@@ -1,6 +1,6 @@
 module Main exposing (main)
 
--- | wasm-solo-clipboard — a port round-trip in the browser wasm bundle, with no
+-- | wasm-client-clipboard — a port round-trip in the browser wasm bundle, with no
 -- server behind the page.
 --
 -- The bundle's shell loads the content-addressed port glue before the wasm
@@ -34,7 +34,7 @@ init _req =
 
 copied : String
 copied =
-    "ipe-wasm-solo"
+    "ipe-wasm-client"
 
 
 update : Msg -> Model -> ( Model, Cmd.Cmd Msg )

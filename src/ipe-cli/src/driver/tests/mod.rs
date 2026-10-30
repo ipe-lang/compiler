@@ -2886,123 +2886,181 @@ fn cache_dir_none_disables_caching_entirely() {
     let _ = fs::remove_dir_all(&tmp);
 }
 
-// ── wasm mode target inference ───────────────────────────────────────────
+// ── compile target derivation ──────────────────────────────────────────
 
-/// `Off` for no mode, an `On` bundle in the given mode otherwise.
-fn wasm_config(mode: Option<project::WasmMode>) -> project::WasmConfig {
-    mode.map_or(project::WasmConfig::Off, |mode| {
-        project::WasmConfig::On(project::WasmBundle::new(mode))
-    })
+/// A `web` delivery on the default host under `runtime`.
+fn web_delivery(runtime: Option<crate::delivery::Runtime>) -> crate::delivery::Delivery {
+    crate::delivery::Delivery::resolve(
+        crate::delivery::Shape::Web,
+        runtime,
+        crate::delivery::Host::Default,
+    )
+    .expect("a web delivery on the default host resolves")
 }
 
-/// `wasm = On { mode = Solo }` with no CLI flag → inferred `WasmClient`.
-#[test]
-fn wasm_mode_solo_infers_wasm_target() {
-    let cfg = wasm_config(Some(project::WasmMode::Solo));
-    assert_eq!(
-        resolve_compile_target(cli_args::WasmKind::None, Some(&cfg)),
-        CompileTarget::WasmClient,
-        "solo mode must infer the browser wasm client"
-    );
-}
-
-/// `wasm = On { mode = Hydrate }` with no CLI flag → inferred `WasmClient`.
-#[test]
-fn wasm_mode_hydrate_infers_wasm_target() {
-    let cfg = wasm_config(Some(project::WasmMode::Hydrate));
-    assert_eq!(
-        resolve_compile_target(cli_args::WasmKind::None, Some(&cfg)),
-        CompileTarget::WasmClient,
-        "hydrate mode must infer the browser wasm client"
-    );
-}
-
-/// `wasm = Off` → native (explicit opt-out).
-#[test]
-fn wasm_mode_off_does_not_infer_wasm_target() {
-    let cfg = wasm_config(None);
-    assert_eq!(
-        resolve_compile_target(cli_args::WasmKind::None, Some(&cfg)),
-        CompileTarget::Native,
-        "off mode must not infer a wasm target"
-    );
-}
-
-/// No manifest (None config) → native default.
-#[test]
-fn no_wasm_config_defaults_to_native_target() {
-    assert_eq!(
-        resolve_compile_target(cli_args::WasmKind::None, None),
-        CompileTarget::Native,
-        "absent [wasm] section must default to native"
-    );
-}
-
-/// The default config (no `wasm` field) → native.
-#[test]
-fn wasm_config_default_is_native_target() {
-    let cfg = project::WasmConfig::default();
-    assert_eq!(
-        resolve_compile_target(cli_args::WasmKind::None, Some(&cfg)),
-        CompileTarget::Native,
-        "an absent wasm field must default to native"
-    );
-}
-
-/// CLI `--target wasm` wins even when no manifest.
-#[test]
-fn cli_flag_overrides_absent_manifest_to_wasm() {
-    assert_eq!(
-        resolve_compile_target(cli_args::WasmKind::Client, None),
-        CompileTarget::WasmClient,
-        "cli flag must win over absent manifest"
-    );
-}
-
-/// CLI `--target wasm` wins even if the manifest says off (highest precedence).
-#[test]
-fn cli_flag_wins_over_mode_off() {
-    let cfg = wasm_config(None);
-    assert_eq!(
-        resolve_compile_target(cli_args::WasmKind::Client, Some(&cfg)),
-        CompileTarget::WasmClient,
-        "explicit cli --target wasm must win over mode=off"
-    );
-}
-
-/// CLI `--target wasi` selects the co-located WASI target, over any manifest.
-#[test]
-fn cli_flag_wasi_selects_colocated_wasi() {
-    let cfg = wasm_config(Some(project::WasmMode::Solo));
-    assert_eq!(
-        resolve_compile_target(cli_args::WasmKind::Wasi, None),
-        CompileTarget::WasmWasi,
-        "cli --target wasi selects the co-located WASI target"
-    );
-    assert_eq!(
-        resolve_compile_target(cli_args::WasmKind::Wasi, Some(&cfg)),
-        CompileTarget::WasmWasi,
-        "explicit cli --target wasi wins over a browser [wasm].mode",
-    );
-}
-
-/// The manifest `[wasm].mode` selects the browser client only — WASI is an
-/// explicit per-invocation target, never a project-default inferred from a
-/// manifest that only knows the browser mode words.
-#[test]
-fn manifest_never_infers_wasi() {
-    for mode in [
-        Some(project::WasmMode::Solo),
-        Some(project::WasmMode::Hydrate),
+/// A `script` delivery, which has no runtime axis.
+fn script_delivery() -> crate::delivery::Delivery {
+    crate::delivery::Delivery::resolve(
+        crate::delivery::Shape::Script,
         None,
-    ] {
-        let cfg = wasm_config(mode);
-        assert_ne!(
-            resolve_compile_target(cli_args::WasmKind::None, Some(&cfg)),
-            CompileTarget::WasmWasi,
-            "no [wasm].mode may infer the co-located WASI target",
+        crate::delivery::Host::Default,
+    )
+    .expect("a script delivery resolves")
+}
+
+/// Every target source a derivation can be handed, `None` included.
+fn every_target_source() -> [Option<crate::delivery::TargetTriple>; 4] {
+    use crate::delivery::TargetTriple;
+    [
+        None,
+        Some(TargetTriple::BrowserWasm),
+        Some(TargetTriple::Wasm32Wasip1),
+        Some(TargetTriple::Native(
+            cli_args::StaticTriple::Aarch64LinuxMusl,
+        )),
+    ]
+}
+
+/// The deliveries the derivation sweeps cover: client, served and script.
+fn swept_deliveries() -> [crate::delivery::Delivery; 3] {
+    [
+        web_delivery(Some(crate::delivery::Runtime::Client)),
+        web_delivery(None),
+        script_delivery(),
+    ]
+}
+
+/// `ipe dev build` / `ipe dev run` derive their compile target from the delivery.
+///
+/// `web client` is the browser wasm target with or without `--target wasm`;
+/// a wasm target or a `wasm` block on any other delivery is refused, and a
+/// client handed a WASI or native triple is refused naming it.
+#[test]
+fn dev_compile_target_table() {
+    use crate::delivery::{DeliveryError, Runtime, TargetTriple};
+    let client = web_delivery(Some(Runtime::Client));
+    let served = web_delivery(None);
+    let script = script_delivery();
+    let native = TargetTriple::Native(cli_args::StaticTriple::Aarch64LinuxMusl);
+    let wasm = Some(TargetTriple::BrowserWasm);
+    let wasip1 = Some(TargetTriple::Wasm32Wasip1);
+    let rows = [
+        (client, None, None, false, Ok(CompileTarget::WasmClient)),
+        (client, None, None, true, Ok(CompileTarget::WasmClient)),
+        (client, wasm, None, false, Ok(CompileTarget::WasmClient)),
+        (client, None, wasm, false, Ok(CompileTarget::WasmClient)),
+        (
+            client,
+            wasip1,
+            None,
+            false,
+            Err(TargetRefusal::Delivery(
+                DeliveryError::ClientRefusesWasiTriple,
+            )),
+        ),
+        (
+            client,
+            Some(native),
+            None,
+            false,
+            Err(TargetRefusal::Delivery(
+                DeliveryError::ClientRequiresBrowserTriple {
+                    triple: Some(native),
+                },
+            )),
+        ),
+        (served, None, None, false, Ok(CompileTarget::Native)),
+        (served, Some(native), None, false, Ok(CompileTarget::Native)),
+        (
+            served,
+            wasm,
+            None,
+            false,
+            Err(TargetRefusal::Delivery(
+                DeliveryError::WasmTargetRequiresClient,
+            )),
+        ),
+        (
+            served,
+            None,
+            wasm,
+            false,
+            Err(TargetRefusal::Delivery(
+                DeliveryError::WasmTargetRequiresClient,
+            )),
+        ),
+        (
+            served,
+            None,
+            None,
+            true,
+            Err(TargetRefusal::Delivery(
+                DeliveryError::WasmTargetRequiresClient,
+            )),
+        ),
+        (script, wasip1, None, false, Ok(CompileTarget::WasmWasi)),
+        (script, None, wasip1, false, Ok(CompileTarget::WasmWasi)),
+        (script, Some(native), None, false, Ok(CompileTarget::Native)),
+    ];
+    for (delivery, flag, env, wasm_block, expected) in rows {
+        assert_eq!(
+            dev_compile_target(delivery, flag, env, wasm_block),
+            expected,
+            "dev target for {delivery:?} flag={flag:?} env={env:?} wasm_block={wasm_block}"
         );
     }
+}
+
+/// No derivation infers the co-located WASI target: it is only ever named.
+#[test]
+fn dev_compile_target_never_infers_wasi() {
+    for delivery in swept_deliveries() {
+        for wasm_block in [false, true] {
+            assert_ne!(
+                dev_compile_target(delivery, None, None, wasm_block),
+                Ok(CompileTarget::WasmWasi),
+                "{delivery:?} with no target named must not derive WASI"
+            );
+        }
+    }
+}
+
+/// The derivation is the `client` IFF browser-wasm biconditional, on either verb.
+///
+/// Every target a `client` delivery derives is the browser triple, whatever
+/// the flag, the environment and the `wasm` block say; no other delivery ever
+/// derives it. A client is never handed a native or host target to refuse
+/// later, and the browser triple never reaches a delivery with no wasm form.
+#[test]
+fn derive_target_client_iff_browser_wasm() {
+    use crate::delivery::{Delivery, Host, Runtime, Shape, TargetTriple};
+    let client_hosts = [Host::Default, Host::Desktop, Host::Ios, Host::Android]
+        .map(|host| Delivery::resolve(Shape::Web, Some(Runtime::Client), host));
+    for verb in [TargetVerb::Dev, TargetVerb::Release] {
+        for delivery in swept_deliveries()
+            .into_iter()
+            .chain(client_hosts.iter().filter_map(|d| d.as_ref().ok().copied()))
+        {
+            let is_client = delivery.runtime() == Some(Runtime::Client);
+            for flag in every_target_source() {
+                for env in every_target_source() {
+                    for wasm_block in [false, true] {
+                        if let Ok(derived) = derive_target(verb, delivery, flag, env, wasm_block) {
+                            assert_eq!(
+                                derived == Some(TargetTriple::BrowserWasm),
+                                is_client,
+                                "{verb:?} {delivery:?} flag={flag:?} env={env:?} wasm_block={wasm_block} derived {derived:?}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+    assert!(
+        client_hosts.iter().all(Result::is_ok),
+        "every host carries a client delivery: {client_hosts:?}"
+    );
 }
 
 /// `declared_modules` reads exactly the `pub mod X;` / `mod X;` statements a
@@ -3108,7 +3166,7 @@ fn eject_refuses_a_wasm_mode_project_from_the_manifest_tier() {
     // with no `IPE_TARGET` env set — the tier the env-only check missed.
     fs::write(
         tmp.join("package.ipe"),
-        "module Package exposing (package)\n\n\npackage =\n    { name = \"w\", wasm = On { mode = Solo } }\n",
+        "module Package exposing (package)\n\n\npackage =\n    { name = \"w\", wasm = On { mode = Render } }\n",
     )
     .expect("write package.ipe");
     fs::write(
@@ -5799,47 +5857,220 @@ fn dev_desktop_bundle_admits_debug() {
     );
 }
 
-/// Every `release build` target yields an artifact or a typed refusal.
+/// Every `release build` row of the derivation yields an artifact or a typed refusal.
 ///
-/// `--target wasm` and a manifest-selected browser client are the browser
-/// bundle, a native target is the static binary, and a WASI resolution, which
-/// has no release form, refuses.
+/// A release takes no wasm target from either source, builds no WASI module,
+/// derives the browser bundle from `web client` alone, and refuses a `wasm`
+/// block on a delivery with no client form.
 #[test]
-fn release_build_wasm_produces_artifact() {
-    use cli_args::{ReleaseTarget, StaticTriple};
-    let native = ReleaseTarget::Native(StaticTriple::X8664LinuxMusl);
-    for resolved in [
-        CompileTarget::Native,
-        CompileTarget::WasmClient,
-        CompileTarget::WasmWasi,
-    ] {
-        let artifact = release_artifact(ReleaseTarget::Wasm, resolved);
-        assert!(
-            matches!(artifact, Ok(ReleaseArtifact::Browser)),
-            "--target wasm is the browser bundle whatever the environment says: {artifact:?}"
+fn release_artifact_table() {
+    use crate::delivery::{DeliveryError, Runtime, TargetSource, TargetTriple};
+    use cli_args::StaticTriple;
+    let client = web_delivery(Some(Runtime::Client));
+    let served = web_delivery(None);
+    let script = script_delivery();
+    let arm = StaticTriple::Aarch64LinuxMusl;
+    let rows = [
+        (
+            served,
+            None,
+            Some(TargetTriple::BrowserWasm),
+            false,
+            Err(TargetRefusal::Delivery(DeliveryError::ReleaseWasmTarget {
+                source: TargetSource::Env,
+            })),
+        ),
+        (
+            client,
+            None,
+            Some(TargetTriple::BrowserWasm),
+            false,
+            Err(TargetRefusal::Delivery(DeliveryError::ReleaseWasmTarget {
+                source: TargetSource::Env,
+            })),
+        ),
+        (
+            client,
+            Some(arm),
+            None,
+            false,
+            Err(TargetRefusal::Delivery(
+                DeliveryError::ClientRequiresBrowserTriple {
+                    triple: Some(TargetTriple::Native(arm)),
+                },
+            )),
+        ),
+        (
+            served,
+            None,
+            None,
+            true,
+            Err(TargetRefusal::Delivery(
+                DeliveryError::WasmTargetRequiresClient,
+            )),
+        ),
+        (client, None, None, false, Ok(ReleaseArtifact::Browser)),
+        (client, None, None, true, Ok(ReleaseArtifact::Browser)),
+        (
+            served,
+            None,
+            Some(TargetTriple::Wasm32Wasip1),
+            false,
+            Err(TargetRefusal::NoWasi),
+        ),
+        (
+            script,
+            None,
+            Some(TargetTriple::Wasm32Wasip1),
+            false,
+            Err(TargetRefusal::NoWasi),
+        ),
+        (
+            served,
+            None,
+            None,
+            false,
+            Ok(ReleaseArtifact::Native(StaticTriple::default())),
+        ),
+        (
+            served,
+            Some(arm),
+            None,
+            false,
+            Ok(ReleaseArtifact::Native(arm)),
+        ),
+        (
+            script,
+            None,
+            Some(TargetTriple::Native(arm)),
+            false,
+            Ok(ReleaseArtifact::Native(arm)),
+        ),
+    ];
+    for (delivery, flag, env, wasm_block, expected) in rows {
+        assert_eq!(
+            release_artifact(delivery, flag, env, wasm_block),
+            expected,
+            "release artifact for {delivery:?} flag={flag:?} env={env:?} wasm_block={wasm_block}"
         );
     }
-    assert!(matches!(
-        release_artifact(native.clone(), CompileTarget::WasmClient),
-        Ok(ReleaseArtifact::Browser)
-    ));
-    assert!(matches!(
-        release_artifact(native.clone(), CompileTarget::Native),
-        Ok(ReleaseArtifact::Native(StaticTriple::X8664LinuxMusl))
-    ));
-    let wasi = release_artifact(native, CompileTarget::WasmWasi);
-    assert!(
-        matches!(&wasi, Err(CliError::Usage(reason)) if reason.to_string().contains("ipe dev build --target wasi")),
-        "a WASI resolution has no release form: {wasi:?}"
-    );
+}
+
+/// A release refuses a browser target named by the flag, and each artifact
+/// compiles for its own engine.
+#[test]
+fn release_flag_wasm_refused_and_artifact_engines() {
+    use crate::delivery::{DeliveryError, Runtime, TargetSource, TargetTriple};
+    for delivery in [web_delivery(None), web_delivery(Some(Runtime::Client))] {
+        assert_eq!(
+            derive_target(
+                TargetVerb::Release,
+                delivery,
+                Some(TargetTriple::BrowserWasm),
+                None,
+                false
+            ),
+            Err(TargetRefusal::Delivery(DeliveryError::ReleaseWasmTarget {
+                source: TargetSource::Flag,
+            })),
+            "a release of {delivery:?} refuses `--target wasm` naming the flag"
+        );
+    }
     assert_eq!(
         ReleaseArtifact::Browser.compile_target(),
         CompileTarget::WasmClient
     );
     assert_eq!(
-        ReleaseArtifact::Native(StaticTriple::X8664LinuxMusl).compile_target(),
+        ReleaseArtifact::Native(cli_args::StaticTriple::Aarch64LinuxMusl).compile_target(),
         CompileTarget::Native
     );
+}
+
+/// A target handed to an app-bundle delivery is refused before any bundle.
+///
+/// The `ios` shell picks its own target, so a `--target` beside it has
+/// nothing to choose; `release build` and `dev build` refuse it alike and
+/// write no output. Each verb is handed every target its own parser and the
+/// static-link gate let through to the delivery: a native triple under
+/// `release build`; under `dev build` the wasm targets (a native triple
+/// there needs `--static`, refused earlier by the static-link gate).
+#[test]
+fn bundle_host_refuses_a_target() {
+    let cases = [
+        (Verb::RELEASE_BUILD, "aarch64-unknown-linux-musl"),
+        (Verb::DEV_BUILD, "wasm"),
+        (Verb::DEV_BUILD, "wasi"),
+    ];
+    for (verb, target) in cases {
+        let label = format!("bundle-target-{}-{target}", verb.name().replace(' ', "-"));
+        let (tmp, package) = debug_project(&label, &named_package(&label), WEB_APP_WITH_STYLE);
+        let out = tmp.join("out");
+        let out_arg = out.to_string_lossy().into_owned();
+        let mut args: Vec<&str> = verb.name().split(' ').collect();
+        args.extend([
+            package.as_str(),
+            "web",
+            "client",
+            "ios",
+            "--target",
+            target,
+            "--out",
+            out_arg.as_str(),
+        ]);
+        let result = run_argv(&args);
+        let wrote = out.exists();
+        let _ = fs::remove_dir_all(&tmp);
+        assert!(
+            matches!(
+                &result,
+                Err(CliError::CommandUsage { command, reason })
+                    if *command == verb.name() && reason.as_str().contains("`--target`")
+                        && reason.as_str().contains("ios")
+            ),
+            "`ipe {}` refuses a target on a bundle host: {result:?}",
+            args.join(" ")
+        );
+        assert!(!wrote, "a refused bundle writes no output");
+    }
+}
+
+/// `ipe dev run` refuses a client app-bundle delivery before any build.
+///
+/// A `desktop`/`ios`/`android` client bundle is laid out by `ipe dev build`;
+/// a dev run that built the bare browser client in its place would run a
+/// delivery the user did not name.
+#[test]
+fn dev_run_refuses_a_client_host_bundle() {
+    for host in ["desktop", "ios", "android"] {
+        let label = format!("dev-run-client-{host}");
+        let (tmp, package) = debug_project(&label, &named_package(&label), WEB_APP_WITH_STYLE);
+        let out = tmp.join("out");
+        let out_arg = out.to_string_lossy().into_owned();
+        let args = [
+            "dev",
+            "run",
+            package.as_str(),
+            "web",
+            "client",
+            host,
+            "--out",
+            out_arg.as_str(),
+        ];
+        let result = run_argv(&args);
+        let wrote = out.exists();
+        let _ = fs::remove_dir_all(&tmp);
+        assert!(
+            matches!(
+                &result,
+                Err(CliError::CommandUsage { command, reason })
+                    if *command == Verb::DEV_RUN.name()
+                        && reason.as_str().contains(&format!("ipe dev build web client {host}"))
+            ),
+            "`ipe {}` refuses the {host} bundle: {result:?}",
+            args.join(" ")
+        );
+        assert!(!wrote, "a refused dev run writes no output");
+    }
 }
 
 // ── `release run` and `release eject` ───────────────────────────────────────
@@ -5915,14 +6146,15 @@ fn assert_no_run_form(args: &[&str], target: cli_args::NoRunTarget) {
     );
 }
 
-/// `release run --target wasm` has no run form.
+/// `release run --target wasm` is refused: the browser bundle is `web client`.
 ///
 /// A `--target` after `--` is the program's argument, not a refusal.
 #[test]
 fn release_run_wasm_refuses() {
-    assert_no_run_form(
-        &["release", "run", "--target", "wasm"],
-        cli_args::NoRunTarget::Wasm,
+    assert_release_run_refusal(
+        &run_argv(&["release", "run", "--target", "wasm"]),
+        "web client",
+        "`release run --target wasm` refuses naming the client delivery",
     );
     let parsed = cli_args::parse_release_run(&["--".to_owned(), "--target".to_owned()]);
     assert!(
@@ -5931,7 +6163,7 @@ fn release_run_wasm_refuses() {
     );
 }
 
-/// A host or solo delivery has no run form under `release run`.
+/// A host or client delivery has no run form under `release run`.
 #[test]
 fn release_run_host_bundle_refuses() {
     use cli_args::NoRunTarget;
@@ -5941,14 +6173,17 @@ fn release_run_host_bundle_refuses() {
             NoRunTarget::Desktop,
         ),
         (
-            &["release", "run", "web", "solo", "ios"][..],
+            &["release", "run", "web", "client", "ios"][..],
             NoRunTarget::Ios,
         ),
         (
-            &["release", "run", "web", "solo", "android"][..],
+            &["release", "run", "web", "client", "android"][..],
             NoRunTarget::Android,
         ),
-        (&["release", "run", "web", "solo"][..], NoRunTarget::Solo),
+        (
+            &["release", "run", "web", "client"][..],
+            NoRunTarget::Client,
+        ),
     ] {
         assert_no_run_form(args, target);
     }

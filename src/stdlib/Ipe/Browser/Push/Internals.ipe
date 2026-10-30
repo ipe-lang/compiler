@@ -521,11 +521,14 @@ currentOutcome text =
             Ok Nothing
 
 
--- | A correlated reply: `ok` true with exactly the `expected` event, or `ok`
--- false with one of the closed refusal codes. Any other frame fails the decode.
+-- | A correlated reply: a frame tagged `portTag` whose `ok` is true with exactly
+-- the `expected` event, or false with one of the closed refusal codes.
+--
+-- Any other frame, a frame of another capability or an untagged one included,
+-- fails the decode.
 reply : String -> Decode.Decoder (Result Error a) -> Decode.Decoder (Result Error a)
 reply expected success =
-    Decode.andThen (replyByOk expected success) (Decode.field "ok" Decode.bool)
+    Decode.andThen (gateTag (Decode.andThen (replyByOk expected success) (Decode.field "ok" Decode.bool))) (Decode.field "tag" Decode.string)
 
 
 replyByOk : String -> Decode.Decoder (Result Error a) -> Bool -> Decode.Decoder (Result Error a)
@@ -571,3 +574,22 @@ refusal code =
         _ ->
             Decode.fail "unknown push refusal code"
 
+
+-- | This module's frame tag: its capability's `js-port:` wire name.
+--
+-- The first-party sink stamps it on every frame it replies with.
+portTag : String
+portTag =
+    "push"
+
+
+-- | `gateTag body tag` runs `body` only on a frame tagged with this module's `portTag`.
+--
+-- A frame of any other capability fails closed; the failure names no tag.
+gateTag : Decode.Decoder a -> String -> Decode.Decoder a
+gateTag body tag =
+    if tag == portTag then
+        body
+
+    else
+        Decode.fail "frame for another capability"

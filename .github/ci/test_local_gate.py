@@ -118,6 +118,24 @@ class ShapeRefusals(Fixture):
     def test_bad_tier(self) -> None:
         self.refuses("tier 'nightly'", gate("fmt", run("cargo fmt --all -- --check", tier="nightly")))
 
+    def test_bad_command_tier(self) -> None:
+        self.refuses("tier 'nightly'", gate("fmt", run({"cmd": "cargo fmt --all -- --check", "tier": "nightly"})))
+
+    def test_package_not_a_crate_name(self) -> None:
+        self.refuses("must be a crate name", gate("fmt", run({"cmd": "cargo fmt --all -- --check", "package": "a b"})))
+
+    def test_package_other_than_the_commands_crate(self) -> None:
+        self.refuses(
+            "must be the command's one `-p` crate",
+            gate("fmt", run({"cmd": "cargo nextest run -p core", "package": "cores", "differs": "narrowed"})),
+        )
+
+    def test_package_on_a_command_with_no_crate(self) -> None:
+        self.refuses(
+            "must be the command's one `-p` crate",
+            gate("fmt", run({"cmd": "cargo fmt --all -- --check", "package": "core"})),
+        )
+
     def test_empty_run(self) -> None:
         self.refuses("non-empty list", gate("fmt", {"tier": "quick", "run": []}))
 
@@ -612,6 +630,108 @@ class LiveManifest(unittest.TestCase):
         self.assertIn("ipe_kernels", ws.readers.get("ipe_stdlib", frozenset()))
         self.assertIn("ipe_ffi", ws.readers.get("ipe-ffi-inspector", frozenset()))
 
+
+class RuntimeScanAtQuick(unittest.TestCase):
+    """`gate quick` also runs the runtime crate's own scan tests (the
+    registry/secret/env drift suites under `src/runtime/rust/tests/`) when a
+    runtime file changed, so they fail locally instead of first in the merge
+    queue — and only then, never for an unrelated change."""
+
+    WS = lg.Workspace(
+        root=lg.REPO_ROOT,
+        target_dir="",
+        member_dirs={"ipe-runtime-rust": "src/runtime/rust", "ipe": "src/ipe-cli"},
+        doctest=frozenset(),
+        path_deps={"ipe-runtime-rust": frozenset(), "ipe": frozenset()},
+    )
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.entries = lg.load_manifest_entries()
+        errs: list[str] = []
+        cls.parsed = lg.check_local_dispositions(cls.entries, errs)
+        assert errs == [], errs
+
+    def quick_scan_command(self) -> lg.Command:
+        disp = self.parsed["runtime-full-features"]
+        assert isinstance(disp, lg.RunLocal)
+        hits = [c for c in disp.commands if c.package == "ipe-runtime-rust" and c.tier is lg.Tier.QUICK]
+        self.assertEqual(len(hits), 1, "runtime-full-features has exactly one quick-tier, package-scoped command")
+        return hits[0]
+
+    def test_command_names_the_crate_its_package_condition_names(self) -> None:
+        """`package:` names the same crate the command's own `-p` invokes —
+        catches a future rename of one without the other."""
+        cmd = self.quick_scan_command()
+        self.assertEqual(cmd.argv[cmd.argv.index("-p") + 1], cmd.package)
+
+    def test_present_when_a_runtime_file_changed(self) -> None:
+        steps = lg.plan(lg.Tier.QUICK, self.entries, self.parsed, ["src/runtime/rust/tests/sync_bound_registry.rs"], self.WS)
+        self.assertIn(self.quick_scan_command().argv, [s.argv for s in steps])
+
+    def test_absent_when_an_unrelated_crate_changed(self) -> None:
+        """Honours the runtime-change condition: a change to another crate
+        does not run the runtime crate's scan suite at `quick`."""
+        steps = lg.plan(lg.Tier.QUICK, self.entries, self.parsed, ["src/ipe-cli/x.rs"], self.WS)
+        self.assertNotIn(self.quick_scan_command().argv, [s.argv for s in steps])
+
+    def test_absent_when_nothing_changed(self) -> None:
+        steps = lg.plan(lg.Tier.QUICK, self.entries, self.parsed, [], self.WS)
+        self.assertNotIn(self.quick_scan_command().argv, [s.argv for s in steps])
+
+    def test_absent_if_the_command_is_removed_from_the_manifest(self) -> None:
+        """Pins the command's presence: deleting it from `check-manifest.yml`
+        (or dropping it from `quick` entirely) removes it from the plan,
+        catching a future edit that silently drops the step."""
+        entries = [dict(e) for e in self.entries]
+        for e in entries:
+            if e.get("context") == "runtime-full-features":
+                e["local"] = {**e["local"], "run": list(e["local"]["run"][:2])}
+        errs: list[str] = []
+        parsed = lg.check_local_dispositions(entries, errs)
+        self.assertEqual(errs, [])
+        steps = lg.plan(
+            lg.Tier.QUICK, entries, parsed, ["src/runtime/rust/tests/sync_bound_registry.rs"], self.WS
+        )
+        self.assertFalse(any("kind(test)" in s.argv for s in steps))
+
+
+
+
+class IpeScansAtQuick(unittest.TestCase):
+    """`gate quick` runs every tree-wide scan and ratchet binary of the `ipe`
+    crate on any change: the command's `--test` set is exactly the
+    `tests/*_scan.rs` and `tests/*_ratchet.rs` files, so a new scan cannot be
+    left out of `quick` and a removed one cannot linger."""
+
+    WS = RuntimeScanAtQuick.WS
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.entries = lg.load_manifest_entries()
+        errs: list[str] = []
+        cls.parsed = lg.check_local_dispositions(cls.entries, errs)
+        assert errs == [], errs
+
+    def scan_command(self) -> lg.Command:
+        disp = self.parsed["test"]
+        assert isinstance(disp, lg.RunLocal)
+        hits = [c for c in disp.commands if c.tier is lg.Tier.QUICK]
+        self.assertEqual(len(hits), 1, "the test entry has exactly one quick-tier command")
+        return hits[0]
+
+    def test_test_set_is_every_scan_and_ratchet_file(self) -> None:
+        argv = self.scan_command().argv
+        named = {argv[i + 1] for i, w in enumerate(argv[:-1]) if w == "--test"}
+        tests_dir = os.path.join(lg.REPO_ROOT, "src", "ipe-cli", "tests")
+        on_disk = {
+            f[: -len(".rs")] for f in os.listdir(tests_dir) if f.endswith(("_scan.rs", "_ratchet.rs"))
+        }
+        self.assertEqual(named, on_disk)
+
+    def test_runs_for_a_change_in_another_crate(self) -> None:
+        steps = lg.plan(lg.Tier.QUICK, self.entries, self.parsed, ["src/runtime/rust/src/lib.rs"], self.WS)
+        self.assertIn(self.scan_command().argv, [s.argv for s in steps])
 
 
 def _load_gate_runner():

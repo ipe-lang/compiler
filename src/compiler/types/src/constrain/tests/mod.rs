@@ -391,8 +391,7 @@ mod registry_phase_c_tests {
     /// - `PubSub.publish` / `PubSub.publishNoEcho`
     ///   (`String -> a -> Task Error Int`): the runtime `pubsub_publish` /
     ///   `pubsub_publish_no_echo` exist; the emit arm emits
-    ///   `pubsub_publish::<_, IpeError>(topic, payload)`. `KNOWN_UNBACKED` is
-    ///   empty.
+    ///   `pubsub_publish::<_, IpeError>(topic, payload)`.
     const FIRST_SCHEMED: &[StdlibKernel] = {
         use StdlibKernel as K;
         &[
@@ -1461,21 +1460,14 @@ mod registry_phase_c_tests {
     };
 
     /// KNOWN-UNBACKED kernels: present in `StdlibKernel::ALL` (so they carry a
-    /// registry index) but deliberately NEVER schemed. Currently **empty** —
-    /// `PubSub.publish`/`PubSub.publishNoEcho` (the only
-    /// previous occupants) were promoted to `FIRST_SCHEMED` once their runtime
-    /// functions and emit arm were confirmed present. The bucket exists
-    /// structurally so the `known_unbacked_never_schemed` gate still compiles
-    /// (it iterates the slice, which is now a vacuous pass) and future
-    /// deliberately-unschemed kernels have a named home. Do NOT scheme a kernel
-    /// into `FIRST_SCHEMED` before its runtime function and emit arm exist —
-    /// that forges an exit-0 path to an unbacked kernel (SEAL violation).
-    /// Enforced by `known_unbacked_never_schemed`.
-    const KNOWN_UNBACKED: &[StdlibKernel] = {
-        #[allow(unused_imports)]
-        use StdlibKernel as K;
-        &[]
-    };
+    /// registry index) but deliberately NEVER schemed. These are the
+    /// `Ipe.Remote` kernels, read from their SSOT
+    /// `StdlibKernel::REMOTE_INTERCEPTED`: none has a lowering, emit arm or
+    /// runtime function yet, so every reference is refused (IPE-L0108). Do NOT
+    /// scheme a kernel into `FIRST_SCHEMED` before its runtime function and emit
+    /// arm exist — that forges an exit-0 path to an unbacked kernel (SEAL
+    /// violation). Enforced by `known_unbacked_never_schemed`.
+    const KNOWN_UNBACKED: &[StdlibKernel] = &StdlibKernel::REMOTE_INTERCEPTED;
 
     /// KNOWN-UNBACKED kernels are in `ALL`, are disjoint from the migrated
     /// sets, and `stdlib_scheme` returns `None` for them. Pins the deliberate
@@ -2420,8 +2412,8 @@ mod registry_phase_c_tests {
     /// A stdlib record alias is expanded by `normalize_annotation_ty` keyed on
     /// the RESOLVED identity — the empty-home builtin sentinel — never a bare
     /// name string. Pins both directions of that gate for every stdlib record
-    /// alias the normaliser knows: `Migration`, `HttpRequest`, `HttpResponse`,
-    /// and the server `Response`.
+    /// alias the normaliser knows: `Migration`, `HttpRequest`, and the server
+    /// `Response`.
     ///
     /// * Forward: the genuine builtin (empty `module`) DOES expand to a
     ///   `Ty::Record` — the annotation stays usable.
@@ -2438,7 +2430,7 @@ mod registry_phase_c_tests {
         let builtins = make_builder(&mut interner);
         // Pre-intern each alias name and a user module segment BEFORE the
         // builder borrows the interner immutably.
-        let alias_names = ["Migration", "HttpRequest", "HttpResponse", "Response"];
+        let alias_names = ["Migration", "HttpRequest", "Response"];
         let mut name_syms = Vec::new();
         for n in alias_names {
             name_syms.push(interner.intern(n).expect("intern alias name"));
@@ -3113,5 +3105,51 @@ mod zonk_row_tail_tests {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod scheme_home_and_field_text_tests {
+    use super::super::Builtins;
+    use ipe_intern::Interner;
+    use ipe_kernels::{BUILTIN_TYPES, FieldTag, KernelHome};
+
+    #[allow(clippy::expect_used)] // a test fixture: an exhausted interner is a broken test
+    fn builtins(interner: &mut Interner) -> Builtins {
+        Builtins::new(interner).expect("Builtins::new must not fail in tests")
+    }
+
+    #[test]
+    fn field_tag_text_agrees_with_scheme_table() {
+        let mut interner = Interner::new();
+        let builtins = builtins(&mut interner);
+        for tag in FieldTag::all() {
+            assert_eq!(
+                interner.resolve(builtins.field_symbol(tag)),
+                Some(tag.text()),
+                "{tag:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn every_tag_mints_its_scheme_home() {
+        let mut interner = Interner::new();
+        let builtins = builtins(&mut interner);
+        for tag in BUILTIN_TYPES
+            .iter()
+            .filter_map(ipe_kernels::BuiltinRow::tag)
+        {
+            let minted: Vec<&str> = builtins
+                .builtin_con_module(tag)
+                .iter()
+                .filter_map(|s| interner.resolve(*s))
+                .collect();
+            let expected: Vec<&str> = match tag.scheme_home() {
+                KernelHome::Builtin => Vec::new(),
+                KernelHome::Module(path) => path.split('.').collect(),
+            };
+            assert_eq!(minted, expected, "{tag:?}");
+        }
     }
 }

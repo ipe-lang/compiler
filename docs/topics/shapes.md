@@ -15,7 +15,7 @@ Five shapes exist:
 
 | Shape | Entry | `view` renders | Scaffold |
 |-------|-------|----------------|----------|
-| **Web** *(default)* | `Web.tea` | Browser DOM (`Element`) — served SSR+SSE, or a `solo` wasm client | `ipe init app web` |
+| **Web** *(default)* | `Web.tea` | Browser DOM (`Element`) — served SSR+SSE, or a `client` wasm client | `ipe init app web` |
 | **Tui** | `Tui.tea` | Full-screen terminal cells (`Screen`) | `ipe init app tui` |
 | **Cli** | `Cli.tea` | Line-oriented terminal output (`Lines`) | `ipe init app cli` |
 | **Worker** | `Worker.tea` | *nothing* — a view-less TEA loop | `ipe init app worker` |
@@ -109,22 +109,22 @@ Web is the only shape with a **delivery** choice — two axes ([full
 guide](../guide/delivery.md)):
 
 - **runtime** — `served` (co-located SSR+SSE server; the unnamed default) or
-  `solo` (self-contained WebAssembly client).
+  `client` (self-contained WebAssembly client).
 - **host** — where it runs: a browser tab, a `desktop` system-webview window, or
   an `ios` / `android` webview shell.
 
 **Shape is not host:** desktop and mobile are the *same* `Web` app — same `main`,
 same `view` — delivered differently, so every host shows the identical DOM. One
 uniform grammar: `ipe <build|release> web <host>` (`desktop` implies `served`;
-mobile is `web solo <os>`).
+mobile is `web client <os>`).
 
 | runtime | host | command | rendered view |
 |---------|------|---------|---------------|
 | served | browser | `ipe dev run` | ![web · served · browser](../assets/shapes/web-served-browser.png) |
-| solo | browser | `ipe dev run` (wasm client) | ![web · solo · browser](../assets/shapes/web-solo-browser.png) |
+| client | browser | `ipe dev run` (wasm client) | ![web · client · browser](../assets/shapes/web-client-browser.png) |
 | served | desktop | `ipe release build web desktop` | same served view, in a WebKitGTK window ![web · served · desktop](../assets/shapes/web-served-browser.png) |
-| solo | ios | `ipe release build web solo ios` | same solo view, in a `WKWebView` ![web · solo · iOS](../assets/shapes/web-solo-browser.png) |
-| solo | android | `ipe release build web solo android` | same solo view, in an Android `WebView` ![web · solo · Android](../assets/shapes/web-solo-browser.png) |
+| client | ios | `ipe release build web client ios` | same client view, in a `WKWebView` ![web · client · iOS](../assets/shapes/web-client-browser.png) |
+| client | android | `ipe release build web client android` | same client view, in an Android `WebView` ![web · client · Android](../assets/shapes/web-client-browser.png) |
 
 The last three rows reuse the browser capture on purpose: **every host renders
 the identical DOM** — desktop/iOS/Android only wrap it in a native shell — so the
@@ -238,7 +238,7 @@ main =
 ## Glossary
 
 - **shape** — one of five `main` entry patterns: Web, Tui, Cli, Worker, Script.
-- **`Web.tea`** — browser DOM TEA entry (`Element` view; `served` or `solo`).
+- **`Web.tea`** — browser DOM TEA entry (`Element` view; `served` or `client`).
 - **`Tui.tea`** — full-screen terminal TUI entry (`Screen` view).
 - **`Tui.Sub.onKey`** — the `Tui` key-input subscription
   (`(KeyEvent -> msg) -> Sub msg`).

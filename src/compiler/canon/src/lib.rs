@@ -32,7 +32,7 @@ use ipe_diagnostics::DResult;
 use ipe_intern::{Interner, Symbol};
 
 pub use env::{
-    CtorHome, Env, ModuleCatalog, STDLIB_MODULE_QUALIFIERS, UnionParams, VarHome,
+    CtorHome, Env, KernelTypeExport, ModuleCatalog, STDLIB_MODULE_QUALIFIERS, UnionParams, VarHome,
     bare_import_binds, const_str_eq, kernel_import_binds_last_segment, stdlib_canonical_qualifier,
 };
 pub use resolve::{
@@ -103,9 +103,12 @@ pub struct ModuleExports {
 pub enum ExportedType {
     /// A union the module declares, with its declared type-parameter count.
     Union { home: Vec<Symbol>, params: usize },
-    /// A reserved builtin carrier the module re-exports; the builtin table
-    /// owns its arity.
-    Builtin { home: Vec<Symbol> },
+    /// A reserved builtin carrier the module re-exports, with the row that owns
+    /// its arity. An empty `home` is the row's own builtin home, never a union.
+    Builtin {
+        home: Vec<Symbol>,
+        row: ipe_kernels::BuiltinType,
+    },
 }
 
 impl ExportedType {
@@ -113,7 +116,7 @@ impl ExportedType {
     #[must_use]
     pub fn home(&self) -> &[Symbol] {
         match self {
-            Self::Union { home, .. } | Self::Builtin { home } => home,
+            Self::Union { home, .. } | Self::Builtin { home, .. } => home,
         }
     }
 }
@@ -3045,6 +3048,31 @@ mod tests {
             "The `PubSub` kernel qualifier must stay OUT of env.kernel_members — \
              `Ipe.PubSub` is a compiled-source module resolved via the \
              `Kernel.kernel \"PubSub_publish\"` alias, not a kernel qualifier.",
+        );
+    }
+
+    /// `Ipe.Remote` is a COMPILED-SOURCE stdlib module
+    /// (`src/stdlib/Ipe/Remote.ipe`), so the bare `"Remote"` KERNEL qualifier
+    /// must NOT be registered in `env.kernel_members` (kernel qualifier OR
+    /// compiled-source — never both). Its members resolve through the module's
+    /// `Kernel.kernel "Remote_*"` aliases, each an unschemed kernel whose use
+    /// inference refuses.
+    #[test]
+    fn remote_kernel_qualifier_absent_compiled_source() {
+        use ipe_intern::Interner;
+
+        let mut interner = Interner::new();
+        let remote = interner
+            .intern("Remote")
+            .expect("tripwire: intern Remote OOM");
+        let env = Env::initial(vec![], &mut interner)
+            .expect("Env::initial must not fail in the tripwire test");
+
+        assert!(
+            env.kernel_module_of(remote).is_none(),
+            "The `Remote` kernel qualifier must stay OUT of env.kernel_members — \
+             `Ipe.Remote` is a compiled-source module resolved via its \
+             `Kernel.kernel \"Remote_*\"` aliases, not a kernel qualifier.",
         );
     }
 

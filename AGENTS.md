@@ -50,7 +50,7 @@ Acyclic chain of crates; most changes touch one stage.
 
 ## Fast gate (a PR must pass — minutes)
 ```bash
-tools/scripts/gate quick      # fmt, clippy on changed crates, static guards, doc drift
+tools/scripts/gate quick      # fmt, clippy on changed crates, static guards, doc drift, the `ipe` crate's source scans, runtime scans when runtime changed
 tools/scripts/gate affected   # + tests over changed crates and their reverse deps
 tools/scripts/gate full       # the whole CI mirror (`IPE_E2E=1` included)
 ```

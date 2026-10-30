@@ -8335,7 +8335,9 @@ const fn tag_carrier(tag: ipe_kernels::BuiltinTag) -> TagCarrier {
         | BuiltinTag::DbPred
         | BuiltinTag::DbSecured
         | BuiltinTag::DbOrder
-        | BuiltinTag::Codec => TagCarrier::Opaque,
+        | BuiltinTag::Codec
+        | BuiltinTag::Remote
+        | BuiltinTag::RemoteAuth => TagCarrier::Opaque,
     }
 }
 
@@ -12392,44 +12394,110 @@ fn promote_fn_field_value_carrier(value: Expr) -> Expr {
     }
 }
 
-/// The `DbFailure` constructor symbols, in the shared builtin table's order.
+/// The Prelude built-in unions [`Lowerer::new`] seeds into its variant-set and
+/// payload-arity tables, each read from canon's `BUILTIN_UNIONS` row.
 ///
-/// # Errors
-/// [`Diagnostic::CompilerBug`] if the shared table has no `DbFailure` row, or
-/// the interner is exhausted.
-pub fn intern_db_failure_ctors(interner: &mut Interner) -> DResult<Vec<Symbol>> {
-    intern_builtin_union_ctors(interner, "DbFailure", "ipe_lower::intern_db_failure_ctors")
+/// Only the names live here: every constructor list and arity is canon's, so a
+/// constructor appended to one of these unions reaches lowering with no second
+/// edit. The other canon unions are not seeded here — `Bool` is judged as a
+/// literal, and the Db / stream unions are seeded from their synthesized
+/// `EnumDef`s by `Lowerer::seed_synthetic_prelude_enums`.
+pub const SEEDED_BUILTIN_UNIONS: [&str; 10] = [
+    "Maybe",
+    "Result",
+    "Order",
+    "Error",
+    "ErrorKind",
+    "ErrorDetails",
+    "DbFailure",
+    "AuthError",
+    "HttpMethod",
+    "RedirectPolicy",
+];
+
+/// One seeded Prelude built-in union: its type symbol and its
+/// `(constructor, payload arity)` pairs, in canon's declaration order.
+pub struct SeededUnion {
+    pub type_sym: Symbol,
+    pub ctors: Vec<(Symbol, usize)>,
 }
 
-/// The `AuthError` constructor symbols, in the shared builtin table's order.
+/// `true` iff every name in `names` has a canon `BUILTIN_UNIONS` row.
 ///
-/// # Errors
-/// [`Diagnostic::CompilerBug`] if the shared table has no `AuthError` row, or
-/// the interner is exhausted.
-pub fn intern_auth_error_ctors(interner: &mut Interner) -> DResult<Vec<Symbol>> {
-    intern_builtin_union_ctors(interner, "AuthError", "ipe_lower::intern_auth_error_ctors")
+/// One pass over canon's rows folds a mask with one bit per listed name; a
+/// list past 64 names has no mask and is refused.
+const fn every_union_has_a_canon_row(names: &[&str]) -> bool {
+    let mut want = 0u64;
+    let mut bit = 0u32;
+    let mut rest = names;
+    while let [_, tail @ ..] = rest {
+        match 1u64.checked_shl(bit) {
+            Some(mask) => want |= mask,
+            None => return false,
+        }
+        bit = bit.saturating_add(1);
+        rest = tail;
+    }
+    let mut seen = 0u64;
+    let mut rows = ipe_canon::builtins::BUILTIN_UNIONS;
+    while let [union, rows_tail @ ..] = rows {
+        let mut bit = 0u32;
+        let mut rest = names;
+        while let [name, tail @ ..] = rest {
+            if ipe_canon::const_str_eq(union.type_name, name)
+                && let Some(mask) = 1u64.checked_shl(bit)
+            {
+                seen |= mask;
+            }
+            bit = bit.saturating_add(1);
+            rest = tail;
+        }
+        rows = rows_tail;
+    }
+    seen == want
 }
 
-/// The constructor symbols of the shared builtin union `type_name`, in table
-/// order; `where_` names the caller in the refusal.
-fn intern_builtin_union_ctors(
-    interner: &mut Interner,
-    type_name: &str,
-    where_: &'static str,
-) -> DResult<Vec<Symbol>> {
-    let union = ipe_canon::builtins::BUILTIN_UNIONS
+// IPE-RUST-AUDIT:ACCEPTED (Arthur Maciel) — compile-time `const` assertion (not a runtime panic); fails the BUILD if a union lower seeds has no canon `BUILTIN_UNIONS` row
+const _: () = assert!(
+    every_union_has_a_canon_row(&SEEDED_BUILTIN_UNIONS),
+    "every SEEDED_BUILTIN_UNIONS name must have a canon BUILTIN_UNIONS row"
+);
+
+/// The [`SEEDED_BUILTIN_UNIONS`], interned from canon's `BUILTIN_UNIONS` rows.
+///
+/// # Errors
+/// [`Diagnostic::CompilerBug`] if the interner is exhausted (a seeded name
+/// without a canon row is refused at build time).
+pub fn intern_seeded_unions(interner: &mut Interner) -> DResult<Vec<SeededUnion>> {
+    intern_canon_unions(interner, &SEEDED_BUILTIN_UNIONS)
+}
+
+/// The canon `BUILTIN_UNIONS` rows named by `names`, interned in `names` order.
+///
+/// # Errors
+/// [`Diagnostic::CompilerBug`] if canon has no row for a name, or the interner
+/// is exhausted.
+fn intern_canon_unions(interner: &mut Interner, names: &[&str]) -> DResult<Vec<SeededUnion>> {
+    names
         .iter()
-        .find(|u| u.type_name == type_name)
-        .ok_or_else(|| {
-            bug(
-                where_,
-                format!("the shared builtin table has no `{type_name}` row"),
-            )
-        })?;
-    union
-        .ctors
-        .iter()
-        .map(|&(name, _, _)| interner.intern(name))
+        .map(|&type_name| {
+            let union = ipe_canon::builtins::BUILTIN_UNIONS
+                .iter()
+                .find(|u| u.type_name == type_name)
+                .ok_or_else(|| {
+                    bug(
+                        "ipe_lower::intern_canon_unions",
+                        format!("the shared builtin table has no `{type_name}` row"),
+                    )
+                })?;
+            let type_sym = interner.intern(type_name)?;
+            let ctors = union
+                .ctors
+                .iter()
+                .map(|&(name, _, arity)| Ok((interner.intern(name)?, arity)))
+                .collect::<DResult<Vec<_>>>()?;
+            Ok(SeededUnion { type_sym, ctors })
+        })
         .collect()
 }
 
@@ -12450,8 +12518,8 @@ fn intern_builtin_union_ctors(
 /// the concrete Rust enum and its `into_sql_param()` / `into_field_param()`
 /// boundary conversions.
 pub struct BuiltinCtors {
-    pub maybe: Symbol,
-    pub result: Symbol,
+    /// The [`SEEDED_BUILTIN_UNIONS`], read from canon's rows.
+    pub seeded_unions: Vec<SeededUnion>,
     pub just: Symbol,
     pub nothing: Symbol,
     pub ok: Symbol,
@@ -12485,71 +12553,14 @@ pub struct BuiltinCtors {
     pub arith_add: Symbol,
     pub arith_sub: Symbol,
     pub arith_mul: Symbol,
-    // ── Order ADT ─────────────────────────────────────────────────────
-    pub order: Symbol,
-    pub lt: Symbol,
-    pub eq: Symbol,
-    pub gt: Symbol,
-    // ── Error / ErrorKind ADTs ──────────────────────────────────
-    // `Error` has one constructor also named `Error` (arity 2).
-    // `ErrorKind` has 12 nullary constructors.
-    pub error: Symbol,
-    pub errorkind: Symbol,
-    pub ek_io: Symbol,
-    pub ek_network: Symbol,
-    pub ek_ffi: Symbol,
-    pub ek_decode: Symbol,
-    pub ek_timeout: Symbol,
-    pub ek_not_found: Symbol,
-    pub ek_permission_denied: Symbol,
-    pub ek_invalid_input: Symbol,
-    pub ek_conflict: Symbol,
-    pub ek_unavailable: Symbol,
-    pub ek_unexpected: Symbol,
-    pub ek_limit_exceeded: Symbol,
-    // ── ErrorDetails ADT ──────────────────────────────
-    // `ErrorDetails` has 6 constructors, each arity 1.
-    pub errordetails: Symbol,
-    pub ed_ffi_panic: Symbol,
-    pub ed_type_mismatch: Symbol,
-    pub ed_http_status: Symbol,
-    pub ed_json_decode: Symbol,
-    pub ed_custom: Symbol,
-    pub ed_database: Symbol,
-    // ── DbFailure ADT ─────────────────────────────────
-    // The closed database-failure-cause union carried by `ErrorDetails.Database`;
-    // its nullary constructors in the shared builtin table's order.
-    pub db_failure: Symbol,
-    pub db_failure_ctors: Vec<Symbol>,
-    // ── AuthError ADT ─────────────────────────────────
-    // The closed `Auth.verifyToken` refusal union; its nullary constructors in
-    // the shared builtin table's order.
-    pub auth_error: Symbol,
-    pub auth_error_ctors: Vec<Symbol>,
-    // ── HttpMethod ADT ──────────────────────────────────
-    // `HttpMethod` has 7 nullary verb constructors.
-    pub http_method: Symbol,
-    pub hm_get: Symbol,
-    pub hm_post: Symbol,
-    pub hm_put: Symbol,
-    pub hm_delete: Symbol,
-    pub hm_patch: Symbol,
-    pub hm_head: Symbol,
-    pub hm_options: Symbol,
     // ── BackoffStrategy ADT ─────────────────────────────
     // 4 nullary constructors; `Linear` / `LinearWithJitter` / `Exponential` /
-    // `ExponentialWithJitter`. Prelude built-in seeded here exactly like `Order`.
+    // `ExponentialWithJitter`. No canon row, so `Lowerer::new` seeds it by name.
     pub backoffstrategy: Symbol,
     pub bs_linear: Symbol,
     pub bs_linear_with_jitter: Symbol,
     pub bs_exponential: Symbol,
     pub bs_exponential_with_jitter: Symbol,
-    // ── RedirectPolicy ADT ─────────────────────────────
-    // `NoRedirects` (nullary) / `FollowRedirects Int`. Prelude built-in like
-    // `HttpMethod`, but destructured in user code (`case req.redirects of …`).
-    pub redirect_policy: Symbol,
-    pub no_redirects: Symbol,
-    pub follow_redirects: Symbol,
     /// The type checker's built-in symbol table, so a kernel scheme's
     /// [`ipe_kernels::BuiltinTag`] resolves to the same constructor head
     /// inference minted.
@@ -14195,7 +14206,7 @@ impl EmittedHeads for Lowerer<'_> {
 }
 
 impl<'a> Lowerer<'a> {
-    #[allow(clippy::too_many_lines)] // Error/ErrorKind ADT seeding pushes it over 100
+    #[allow(clippy::too_many_lines)] // builtin-table seeding and the lowerer state literal push it over 100
     pub fn new(
         m: &'a canon::Module,
         types: &'a SolvedTypes,
@@ -14273,145 +14284,31 @@ impl<'a> Lowerer<'a> {
                 }
             }
         }
-        // Seed the built-in `Maybe` / `Result` variant sets + payload arities so
-        // a `case m of Just x -> … ; Nothing -> …` takes the same validated
-        // `Match::new` enum-cover path a user enum does, and `Just x` / `Ok x`
-        // lower as saturated constructions.
+        // Seed the Prelude built-in unions canon owns (`Maybe`, `Result`,
+        // `Order`, `Error`, `ErrorKind`, `ErrorDetails`, `DbFailure`,
+        // `AuthError`, `HttpMethod`, `RedirectPolicy`) so a `case` over one
+        // takes the same validated `Match::new` enum-cover path a user enum
+        // does, and a saturated constructor lowers with its payload arity.
+        // The variant lists and arities are canon's `BUILTIN_UNIONS` rows,
+        // read through `BuiltinCtors::seeded_unions` — never a second copy.
         // Prelude built-ins carry the empty canon home (`home: Vec::new()` in
         // `Env`), so they key the identity map under the empty `ModPath` — the
         // same home the lowered `Expr::Ctor` / `Pat::Ctor` for `Just` / `Ok` / …
         // carry.
         let prelude_home = ModPath(Vec::new());
-        enum_variants.insert(
-            (prelude_home.clone(), builtins.maybe),
-            vec![builtins.just, builtins.nothing],
-        );
-        enum_variants.insert(
-            (prelude_home.clone(), builtins.result),
-            vec![builtins.ok, builtins.err],
-        );
-        ctor_arity.insert((prelude_home.clone(), builtins.just), 1);
-        ctor_arity.insert((prelude_home.clone(), builtins.nothing), 0);
-        ctor_arity.insert((prelude_home.clone(), builtins.ok), 1);
-        ctor_arity.insert((prelude_home.clone(), builtins.err), 1);
+        for union in &builtins.seeded_unions {
+            enum_variants.insert(
+                (prelude_home.clone(), union.type_sym),
+                union.ctors.iter().map(|&(ctor, _)| ctor).collect(),
+            );
+            for &(ctor, arity) in &union.ctors {
+                ctor_arity.insert((prelude_home.clone(), ctor), arity);
+            }
+        }
 
         // `SqlValue` / `SqlField` / `ProjectionTerm` / `ProjectionOperand` /
         // `ArithOp` are seeded from their synthesized `EnumDef`s once the
         // lowerer exists — see `Self::seed_synthetic_prelude_enums`.
-        // ── Order ADT ─────────────────────────────────────────────────
-        enum_variants.insert(
-            (prelude_home.clone(), builtins.order),
-            vec![builtins.lt, builtins.eq, builtins.gt],
-        );
-        ctor_arity.insert((prelude_home.clone(), builtins.lt), 0);
-        ctor_arity.insert((prelude_home.clone(), builtins.eq), 0);
-        ctor_arity.insert((prelude_home.clone(), builtins.gt), 0);
-        // ── Error / ErrorKind ADTs ─────────────────────────────────
-        // `Error` is a single-constructor ADT: `Error ErrorKind ErrorInfo`.
-        // `ErrorKind` has 12 nullary variants.
-        // Both are Prelude built-ins — no user `type` declaration in Ipê source.
-        // Seeding them here lets `case e of Error kind info ->` validate and lower
-        // past the `Match::new` enum-cover check, following the same pattern as
-        // `Maybe` / `Result` / `SqlValue` / `Order` above.
-        enum_variants.insert(
-            (prelude_home.clone(), builtins.error),
-            vec![builtins.error], // sole constructor has the same name as the type
-        );
-        ctor_arity.insert((prelude_home.clone(), builtins.error), 2); // Error(ErrorKind, ErrorInfo)
-        enum_variants.insert(
-            (prelude_home.clone(), builtins.errorkind),
-            vec![
-                builtins.ek_io,
-                builtins.ek_network,
-                builtins.ek_ffi,
-                builtins.ek_decode,
-                builtins.ek_timeout,
-                builtins.ek_not_found,
-                builtins.ek_permission_denied,
-                builtins.ek_invalid_input,
-                builtins.ek_conflict,
-                builtins.ek_unavailable,
-                builtins.ek_unexpected,
-                builtins.ek_limit_exceeded,
-            ],
-        );
-        ctor_arity.insert((prelude_home.clone(), builtins.ek_io), 0);
-        ctor_arity.insert((prelude_home.clone(), builtins.ek_network), 0);
-        ctor_arity.insert((prelude_home.clone(), builtins.ek_ffi), 0);
-        ctor_arity.insert((prelude_home.clone(), builtins.ek_decode), 0);
-        ctor_arity.insert((prelude_home.clone(), builtins.ek_timeout), 0);
-        ctor_arity.insert((prelude_home.clone(), builtins.ek_not_found), 0);
-        ctor_arity.insert((prelude_home.clone(), builtins.ek_permission_denied), 0);
-        ctor_arity.insert((prelude_home.clone(), builtins.ek_invalid_input), 0);
-        ctor_arity.insert((prelude_home.clone(), builtins.ek_conflict), 0);
-        ctor_arity.insert((prelude_home.clone(), builtins.ek_unavailable), 0);
-        ctor_arity.insert((prelude_home.clone(), builtins.ek_unexpected), 0);
-        ctor_arity.insert((prelude_home.clone(), builtins.ek_limit_exceeded), 0);
-        // ── ErrorDetails ADT ─────────────────────────────
-        // 6-variant enrichment union carried on `ErrorInfo.details`. Same
-        // registration recipe as `ErrorKind` above — seeding here lets
-        // `case d of FfiPanic info -> …` / `HttpStatus code -> …` validate and
-        // lower past the `Match::new` enum-cover check.
-        enum_variants.insert(
-            (prelude_home.clone(), builtins.errordetails),
-            vec![
-                builtins.ed_ffi_panic,
-                builtins.ed_type_mismatch,
-                builtins.ed_http_status,
-                builtins.ed_json_decode,
-                builtins.ed_custom,
-                builtins.ed_database,
-            ],
-        );
-        ctor_arity.insert((prelude_home.clone(), builtins.ed_ffi_panic), 1); // FfiPanic(PanicInfo)
-        ctor_arity.insert((prelude_home.clone(), builtins.ed_type_mismatch), 1); // TypeMismatch(TypeInfo)
-        ctor_arity.insert((prelude_home.clone(), builtins.ed_http_status), 1); // HttpStatus(Int)
-        ctor_arity.insert((prelude_home.clone(), builtins.ed_json_decode), 1); // JsonDecode(String)
-        ctor_arity.insert((prelude_home.clone(), builtins.ed_custom), 1); // Custom(String)
-        ctor_arity.insert((prelude_home.clone(), builtins.ed_database), 1); // Database(DbFailure)
-        // ── DbFailure ADT ──────────────────────────────────
-        // Nullary `Db.`-qualified constructors; seeding here lets
-        // `case f of Db.UniqueViolation -> …` validate and lower past the
-        // enum-cover check.
-        enum_variants.insert(
-            (prelude_home.clone(), builtins.db_failure),
-            builtins.db_failure_ctors.clone(),
-        );
-        for &ctor in &builtins.db_failure_ctors {
-            ctor_arity.insert((prelude_home.clone(), ctor), 0);
-        }
-        // ── AuthError ADT ──────────────────────────────────
-        // Nullary `Auth.`-qualified constructors, seeded like `DbFailure`.
-        enum_variants.insert(
-            (prelude_home.clone(), builtins.auth_error),
-            builtins.auth_error_ctors.clone(),
-        );
-        for &ctor in &builtins.auth_error_ctors {
-            ctor_arity.insert((prelude_home.clone(), ctor), 0);
-        }
-        // ── HttpMethod ADT ─────────────────────────────────
-        // 7 nullary HTTP-verb constructors. Prelude built-in (no user `type`),
-        // reachable through `Ipe.Http`; seeding here lets `case m of Get -> …`
-        // validate and `Http.Post` lower as a saturated nullary construction.
-        enum_variants.insert(
-            (prelude_home.clone(), builtins.http_method),
-            vec![
-                builtins.hm_get,
-                builtins.hm_post,
-                builtins.hm_put,
-                builtins.hm_delete,
-                builtins.hm_patch,
-                builtins.hm_head,
-                builtins.hm_options,
-            ],
-        );
-        ctor_arity.insert((prelude_home.clone(), builtins.hm_get), 0);
-        ctor_arity.insert((prelude_home.clone(), builtins.hm_post), 0);
-        ctor_arity.insert((prelude_home.clone(), builtins.hm_put), 0);
-        ctor_arity.insert((prelude_home.clone(), builtins.hm_delete), 0);
-        ctor_arity.insert((prelude_home.clone(), builtins.hm_patch), 0);
-        ctor_arity.insert((prelude_home.clone(), builtins.hm_head), 0);
-        ctor_arity.insert((prelude_home.clone(), builtins.hm_options), 0);
         // ── BackoffStrategy ADT ──────────────────────────────────────
         // 4 nullary constructors. Prelude built-in; seeding here lets
         // `case s of Linear -> …` validate and `Task.Linear` lower as a
@@ -14428,20 +14325,7 @@ impl<'a> Lowerer<'a> {
         ctor_arity.insert((prelude_home.clone(), builtins.bs_linear), 0);
         ctor_arity.insert((prelude_home.clone(), builtins.bs_linear_with_jitter), 0);
         ctor_arity.insert((prelude_home.clone(), builtins.bs_exponential), 0);
-        ctor_arity.insert(
-            (prelude_home.clone(), builtins.bs_exponential_with_jitter),
-            0,
-        );
-        // ── RedirectPolicy ADT ───────────────────────────────────────
-        // `NoRedirects` (nullary) / `FollowRedirects Int` — destructured in user
-        // code; seeding here lets `case req.redirects of NoRedirects -> … ;
-        // FollowRedirects n -> …` validate and lower past the enum-cover check.
-        enum_variants.insert(
-            (prelude_home.clone(), builtins.redirect_policy),
-            vec![builtins.no_redirects, builtins.follow_redirects],
-        );
-        ctor_arity.insert((prelude_home.clone(), builtins.no_redirects), 0);
-        ctor_arity.insert((prelude_home, builtins.follow_redirects), 1); // FollowRedirects(Int) — final move
+        ctor_arity.insert((prelude_home, builtins.bs_exponential_with_jitter), 0);
 
         let mut lowerer = Self {
             m,
@@ -19545,6 +19429,26 @@ impl<'a> Lowerer<'a> {
                 .contains_key(&(ModPath(home.to_vec()), name))
     }
 
+    /// Whether `(home, name)` is an `Ipe.Remote` endpoint type (`Remote` or
+    /// `RemoteAuth`), read by its home-keyed builtin row.
+    ///
+    /// Neither type has a lowering yet, so a program naming one is refused
+    /// with IPE-L0108 ahead of the program-union arm its compiled-source
+    /// declaration would otherwise take. A user type spelled `Remote` in
+    /// another home is not this row and lowers as itself.
+    fn is_remote_head(&self, home: &[Symbol], name: Symbol) -> DResult<bool> {
+        let segments = home
+            .iter()
+            .map(|seg| self.resolve(*seg))
+            .collect::<DResult<Vec<&str>>>()?;
+        let tag = ipe_kernels::BuiltinType::of_head(&segments, self.resolve(name)?)
+            .and_then(|head| head.row().tag());
+        Ok(matches!(
+            tag,
+            Some(ipe_kernels::BuiltinTag::Remote | ipe_kernels::BuiltinTag::RemoteAuth)
+        ))
+    }
+
     /// Lower an annotated program-union application to its `IrType::Enum`.
     fn program_enum_from_canon(
         &self,
@@ -19774,6 +19678,12 @@ impl<'a> Lowerer<'a> {
             // the same generic scope so `Opt Int` → `Enum { Opt, [Int] }` and
             // `Opt a` (inside a generic signature) → `Enum { Opt, [Generic a] }`.
             canon::Type::Con { home, name, args } => match self.resolve(*name)? {
+                // `Ipe.Remote`'s endpoint types have no lowering: an annotation
+                // naming one fails closed here, before its compiled-source union
+                // would lower as a program enum.
+                _ if self.is_remote_head(home, *name)? => {
+                    Err(unsupported(Span::DUMMY, Feature::Kernels))
+                }
                 // A program union that is NOT the builtin of its name (a user ADT,
                 // or a stdlib union listed as its own head) lowers by its
                 // `(home, name)` identity before any bare-name builtin arm below,
@@ -21813,6 +21723,11 @@ impl<'a> Lowerer<'a> {
             // matches `ir_type_from_canon`, so the inferred and annotated paths
             // agree. See `ipe_kernels::BUILTIN_TYPES` for the per-name roles.
             Ty::Con { name, args, module } => match self.resolve(*name)? {
+                // Twin of the `ir_type_from_canon` arm: `Ipe.Remote`'s endpoint
+                // types have no lowering and fail closed.
+                _ if self.is_remote_head(module, *name)? => {
+                    Err(unsupported(span, Feature::Kernels))
+                }
                 // Twin of the `ir_type_from_canon` arm: a program union that is not
                 // the builtin of its name lowers by its own identity first.
                 _ if self.is_distinct_program_union(module, *name) => {
@@ -30220,6 +30135,15 @@ impl<'a> Lowerer<'a> {
                 | KernelFn::ColorSimulate,
             ) => Ok(2),
             Callee::Kernel(KernelFn::ColorMeetsWcag) => Ok(4),
+            // ── Ipe.Remote endpoint constructors and call ────────────────────
+            // `auth` (signing key), `public` (handler), `signOut` (auth).
+            Callee::Kernel(
+                KernelFn::RemoteAuth | KernelFn::RemotePublic | KernelFn::RemoteSignOut,
+            ) => Ok(1),
+            // `authed` / `signIn` (auth + handler), `call` (endpoint + request).
+            Callee::Kernel(
+                KernelFn::RemoteAuthed | KernelFn::RemoteSignIn | KernelFn::RemoteCall,
+            ) => Ok(2),
             Callee::Func(id) => {
                 let idx = usize::try_from(id.as_raw()).unwrap_or(usize::MAX);
                 let def = self.m.defs.get(idx).ok_or_else(|| {
@@ -34596,8 +34520,6 @@ mod tests {
     #[allow(clippy::too_many_lines)] // straight-line interning of every built-in ctor name
     fn build_test_builtin_ctors(interner: &mut Interner) -> BuiltinCtors {
         // BuiltinCtor names (required by Lowerer::new to seed enum_variants).
-        let maybe = interner.intern("Maybe").unwrap();
-        let result = interner.intern("Result").unwrap();
         let just = interner.intern("Just").unwrap();
         let nothing = interner.intern("Nothing").unwrap();
         let ok = interner.intern("Ok").unwrap();
@@ -34630,63 +34552,14 @@ mod tests {
         let arith_add = interner.intern("ArithAdd").unwrap();
         let arith_sub = interner.intern("ArithSub").unwrap();
         let arith_mul = interner.intern("ArithMul").unwrap();
-        // ── Order ADT ─────────────────────────────────────────────────
-        let order = interner.intern("Order").unwrap();
-        let lt = interner.intern("LT").unwrap();
-        let eq = interner.intern("EQ").unwrap();
-        let gt = interner.intern("GT").unwrap();
-        // ── Error / ErrorKind ADTs ─────────────────────────────
-        let error = interner.intern("Error").unwrap();
-        let errorkind = interner.intern("ErrorKind").unwrap();
-        let ek_io = interner.intern("Io").unwrap();
-        let ek_network = interner.intern("Network").unwrap();
-        let ek_ffi = interner.intern("Ffi").unwrap();
-        let ek_decode = interner.intern("Decode").unwrap();
-        let ek_timeout = interner.intern("Timeout").unwrap();
-        let ek_not_found = interner.intern("NotFound").unwrap();
-        let ek_permission_denied = interner.intern("PermissionDenied").unwrap();
-        let ek_invalid_input = interner.intern("InvalidInput").unwrap();
-        let ek_conflict = interner.intern("Conflict").unwrap();
-        let ek_unavailable = interner.intern("Unavailable").unwrap();
-        let ek_unexpected = interner.intern("Unexpected").unwrap();
-        let ek_limit_exceeded = interner.intern("LimitExceeded").unwrap();
-        // ── ErrorDetails ADT ─────────────────────────
-        let errordetails = interner.intern("ErrorDetails").unwrap();
-        let ed_ffi_panic = interner.intern("FfiPanic").unwrap();
-        let ed_type_mismatch = interner.intern("TypeMismatch").unwrap();
-        let ed_http_status = interner.intern("HttpStatus").unwrap();
-        let ed_json_decode = interner.intern("JsonDecode").unwrap();
-        let ed_custom = interner.intern("Custom").unwrap();
-        // ── HttpMethod ADT ─────────────────────────
-        let http_method = interner.intern("HttpMethod").unwrap();
-        let hm_get = interner.intern("Get").unwrap();
-        let hm_post = interner.intern("Post").unwrap();
-        let hm_put = interner.intern("Put").unwrap();
-        let hm_delete = interner.intern("Delete").unwrap();
-        let hm_patch = interner.intern("Patch").unwrap();
-        let hm_head = interner.intern("Head").unwrap();
-        let hm_options = interner.intern("Options").unwrap();
         // ── BackoffStrategy ADT ─────────────────────────
         let backoffstrategy = interner.intern("BackoffStrategy").unwrap();
         let bs_linear = interner.intern("Linear").unwrap();
         let bs_linear_with_jitter = interner.intern("LinearWithJitter").unwrap();
         let bs_exponential = interner.intern("Exponential").unwrap();
         let bs_exponential_with_jitter = interner.intern("ExponentialWithJitter").unwrap();
-        // ── RedirectPolicy ADT ─────────────────────────
-        let redirect_policy = interner.intern("RedirectPolicy").unwrap();
-        let no_redirects = interner.intern("NoRedirects").unwrap();
-        let follow_redirects = interner.intern("FollowRedirects").unwrap();
-        // ── DbFailure ADT ──────────────────────────────
-        let ed_database = interner.intern("Database").unwrap();
-        let db_failure = interner.intern("DbFailure").unwrap();
-        let db_failure_ctors = super::intern_db_failure_ctors(interner).unwrap();
-        // ── AuthError ADT ──────────────────────────────
-        let auth_error = interner.intern("AuthError").unwrap();
-        let auth_error_ctors = super::intern_auth_error_ctors(interner).unwrap();
-
         BuiltinCtors {
-            maybe,
-            result,
+            seeded_unions: super::intern_seeded_unions(interner).unwrap(),
             just,
             nothing,
             ok,
@@ -34719,59 +34592,12 @@ mod tests {
             arith_add,
             arith_sub,
             arith_mul,
-            // ── Order ADT ─────────────────────────────────────────────
-            order,
-            lt,
-            eq,
-            gt,
-            // ── Error / ErrorKind ───────────────────────────────
-            error,
-            errorkind,
-            ek_io,
-            ek_network,
-            ek_ffi,
-            ek_decode,
-            ek_timeout,
-            ek_not_found,
-            ek_permission_denied,
-            ek_invalid_input,
-            ek_conflict,
-            ek_unavailable,
-            ek_unexpected,
-            ek_limit_exceeded,
-            // ── ErrorDetails ─────────────────────────
-            errordetails,
-            ed_ffi_panic,
-            ed_type_mismatch,
-            ed_http_status,
-            ed_json_decode,
-            ed_custom,
-            // ── HttpMethod ─────────────────────────
-            http_method,
-            hm_get,
-            hm_post,
-            hm_put,
-            hm_delete,
-            hm_patch,
-            hm_head,
-            hm_options,
             // ── BackoffStrategy ─────────────────────
             backoffstrategy,
             bs_linear,
             bs_linear_with_jitter,
             bs_exponential,
             bs_exponential_with_jitter,
-            // ── RedirectPolicy ─────────────────────
-            redirect_policy,
-            no_redirects,
-            follow_redirects,
-            // ── DbFailure ─────────────────────────
-            ed_database,
-            db_failure,
-            db_failure_ctors,
-            // ── AuthError ─────────────────────────
-            auth_error,
-            auth_error_ctors,
             kernel_types: ipe_types::Builtins::new(interner).unwrap(),
         }
     }
@@ -35392,6 +35218,96 @@ mod tests {
                 msg,
                 ipe_ir::UserPin::Instance(super::IrType::Unit)
             )]))
+        );
+    }
+
+    /// Every Prelude union the lowerer seeds carries canon's constructor list,
+    /// in canon's order, with canon's payload arities — `ErrorKind` included,
+    /// so a kind appended to canon reaches `Match::new` with no second edit.
+    #[test]
+    fn every_seeded_builtin_union_matches_its_canon_row() {
+        let mut interner = Interner::new();
+        let builtins = build_test_builtin_ctors(&mut interner);
+        let mut expected = Vec::new();
+        for type_name in super::SEEDED_BUILTIN_UNIONS {
+            let row = ipe_canon::builtins::BUILTIN_UNIONS
+                .iter()
+                .find(|u| u.type_name == type_name);
+            assert!(row.is_some(), "canon has a `{type_name}` row");
+            let Some(row) = row else { return };
+            let type_sym = interner.intern(type_name).unwrap();
+            let ctors: Vec<(Symbol, usize)> = row
+                .ctors
+                .iter()
+                .map(|&(name, _, arity)| (interner.intern(name).unwrap(), arity))
+                .collect();
+            expected.push((type_name, type_sym, ctors));
+        }
+        let module = canon::Module {
+            imports_unsafe_submodule: false,
+            imported_web_capabilities: BTreeSet::new(),
+            name: vec![],
+            unions: vec![],
+            defs: vec![],
+        };
+        let types = empty_solved_types();
+        let lowerer = Lowerer::new(
+            &module,
+            &types,
+            &interner,
+            SymbolPools {
+                eta_params: vec![],
+                cap_params: vec![],
+                param_binders: vec![],
+                any_param_binders: vec![],
+                projection_decode_binders: vec![],
+                destructure_thunk_binders: vec![],
+                nested_cons_binders: vec![],
+                nested_strlit_binders: vec![],
+                tuple_elem_binders: vec![],
+                wildcard_marker: super::WildcardMarker(ipe_intern::Symbol::from_raw(u32::MAX)),
+            },
+            &builtins,
+            "",
+            "",
+        );
+        let prelude = ipe_ir::ModPath(Vec::new());
+        for (type_name, type_sym, ctors) in expected {
+            let names: Vec<Symbol> = ctors.iter().map(|&(ctor, _)| ctor).collect();
+            assert_eq!(
+                lowerer.enum_variants.get(&(prelude.clone(), type_sym)),
+                Some(&names),
+                "`{type_name}` seeds canon's constructor list in canon's order"
+            );
+            for (ctor, arity) in ctors {
+                assert_eq!(
+                    lowerer.ctor_arity.get(&(prelude.clone(), ctor)),
+                    Some(&arity),
+                    "`{type_name}` seeds canon's payload arity for each constructor"
+                );
+            }
+        }
+    }
+
+    /// A seeded union name with no canon row is refused: at build time by the
+    /// `const` agreement check, and at intern time as a compiler bug.
+    #[test]
+    fn a_seeded_union_without_a_canon_row_is_refused() {
+        assert!(super::every_union_has_a_canon_row(
+            &super::SEEDED_BUILTIN_UNIONS
+        ));
+        assert!(!super::every_union_has_a_canon_row(&[
+            "ErrorKind",
+            "NoSuchUnion"
+        ]));
+        let mut interner = Interner::new();
+        let refused = super::intern_canon_unions(&mut interner, &["NoSuchUnion"]);
+        assert!(
+            matches!(
+                refused,
+                Err(ipe_diagnostics::Diagnostic::CompilerBug { .. })
+            ),
+            "a name with no canon row is a compiler bug"
         );
     }
 
@@ -36612,6 +36528,13 @@ mod tests {
         KernelFn::ColorDeuteranopia,
         KernelFn::ColorTritanopia,
         KernelFn::ColorSimulate,
+        // ── Ipe.Remote — unschemed, every reference refused (IPE-L0108) ──
+        KernelFn::RemoteAuth,
+        KernelFn::RemotePublic,
+        KernelFn::RemoteAuthed,
+        KernelFn::RemoteSignIn,
+        KernelFn::RemoteSignOut,
+        KernelFn::RemoteCall,
     ];
 
     /// Verifies that for every non-excluded variant in `KernelFn::ALL`, the

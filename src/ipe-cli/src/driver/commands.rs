@@ -489,7 +489,7 @@ pub fn run_watch(rest: &[String]) -> Result<(), CliError> {
     // Validate the delivery grammar against the shape `main` pins: the `[shape]`
     // cross-check and the `[runtime] [host]` tail. `ipe dev watch` is a dev
     // build-run-reload loop that serves the served runtime; it takes no `--static`.
-    // A grammar refusal (e.g. `web solo ios`, which cannot be watched — see the
+    // A grammar refusal (e.g. `web client ios`, which cannot be watched — see the
     // spec's mobile-watch note) is caught here before the loop starts.
     let delivery = resolve_delivery(held.shape(), &args.delivery, false, Verb::DEV_WATCH.name())?;
 
@@ -652,20 +652,16 @@ pub fn discover_manifest(entry_path: &Path) -> Result<Option<PathBuf>, CliError>
 /// preflight, and surface the mimalloc opt-in notice. Shared by `build` and
 /// `run`; resolved ONCE before any compilation starts.
 ///
-/// `IPE_TARGET=wasm`/`IPE_TARGET=wasi` is a wasm-target axis signal (resolved
-/// by [`resolve_compile_target`]) and is NOT a static-link triple; it is
-/// stripped here so it never reaches the musl-triple gate in
-/// [`build_plan::resolve`].
+/// A wasm `IPE_TARGET` is a compile-target axis (derived by [`derive_target`])
+/// and never a static-link triple: [`build_plan::env_layer`] keeps it out of
+/// the musl-triple gate in [`build_plan::resolve`].
 pub fn resolve_static_plan(
     cli_layer: build_plan::StaticRequestLayer,
     manifest: &project::ProjectManifest,
     output_format: cli_args::OutputFormat,
 ) -> Result<Option<ipe_backend_rust::static_build::StaticPlan>, CliError> {
     let toml_layer = manifest.static_request.clone();
-    let mut env = build_plan::env_layer()?;
-    if matches!(env.target.as_deref(), Some("wasm" | "wasi")) {
-        env.target = None;
-    }
+    let env = build_plan::env_layer()?;
     let merged = cli_layer.or(env).or(toml_layer);
     let static_plan = build_plan::resolve(&merged)?;
     if let Some(plan) = &static_plan {
@@ -687,7 +683,6 @@ pub fn resolve_static_plan(
     Ok(static_plan)
 }
 
-/// Resolve the wasm-vs-native target with the three-tier precedence chain:
 /// The compilation target a `build`/`run`/`release` invocation resolves to —
 /// the single typed successor to the old wasm-vs-native bit.
 ///
@@ -700,7 +695,7 @@ pub fn resolve_static_plan(
 pub enum CompileTarget {
     /// The native host binary (server / CLI / TUI / desktop / script).
     Native,
-    /// The sandboxed browser WASM client (`--target wasm`, `web solo`).
+    /// The sandboxed browser WASM client (`web client`).
     WasmClient,
     /// The co-located portable WASI module (`--target wasi`) — a
     /// `Direct`/`Script` program's native effect floor over `wasm32-wasip1`.
@@ -745,39 +740,183 @@ impl CompileTarget {
     }
 }
 
-/// Resolve the compilation target from the precedence chain: the CLI
-/// `--target` flavour > `IPE_TARGET` env (`wasm`/`wasi`) > `[wasm].mode` in
-/// `package.ipe` (browser client only) > default native.
+impl CompileTarget {
+    /// The compile target a derived triple emits for (`None` is the host).
+    #[must_use]
+    pub const fn of_triple(triple: Option<delivery::TargetTriple>) -> Self {
+        match triple {
+            Some(delivery::TargetTriple::BrowserWasm) => Self::WasmClient,
+            Some(delivery::TargetTriple::Wasm32Wasip1) => Self::WasmWasi,
+            Some(delivery::TargetTriple::Native(_)) | None => Self::Native,
+        }
+    }
+}
+
+/// The verb a compile target is derived for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TargetVerb {
+    /// `ipe dev build` / `ipe dev run`: a wasm target may be named, and must
+    /// agree with the delivery.
+    Dev,
+    /// `ipe release build` / `ipe release run`: the browser bundle comes from
+    /// the delivery alone, and no wasm target is accepted.
+    Release,
+}
+
+/// Why a delivery and its target sources derive no compile target.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TargetRefusal {
+    /// A delivery-grammar refusal naming the disagreeing axes.
+    Delivery(delivery::DeliveryError),
+    /// A release was asked for a WASI module, which has no release form.
+    NoWasi,
+}
+
+impl TargetRefusal {
+    /// The usage error `verb` prints for this refusal.
+    #[must_use]
+    pub fn into_cli(self, verb: Verb) -> CliError {
+        match self {
+            Self::Delivery(err) => CliError::Usage(text::msg::command_refusal(&verb, &err)),
+            Self::NoWasi => CliError::Usage(text::msg::release_no_wasi()),
+        }
+    }
+}
+
+/// The triple a delivery and its target sources derive, `None` for the host.
 ///
-/// `cli_wasm` carries the parsed CLI `--target` flavour from `BuildMode::Emit`.
-/// `wasm_config` is `None` when there is no manifest (sibling-discovery build);
-/// the manifest `[wasm].mode` selects the browser client only (WASI is an
-/// explicit per-invocation target, never a project-default).
-pub fn resolve_compile_target(
-    cli_wasm: cli_args::WasmKind,
-    wasm_config: Option<&project::WasmConfig>,
-) -> CompileTarget {
-    match cli_wasm {
-        cli_args::WasmKind::Client => return CompileTarget::WasmClient,
-        cli_args::WasmKind::Wasi => return CompileTarget::WasmWasi,
-        cli_args::WasmKind::None => {}
+/// The one table both verbs judge targets by. A `web client` delivery derives
+/// the browser triple and admits only that triple as a request; any other
+/// delivery has no wasm client form, so a browser request or a manifest
+/// `wasm` block (which configures the client bundle) is refused. A release
+/// refuses a wasm target from either source before the table: its browser
+/// bundle comes from the delivery, and it builds no WASI module. Every source
+/// is judged; none is ignored.
+///
+/// # Errors
+///
+/// [`TargetRefusal`] naming the source or the axes that disagree.
+pub fn derive_target(
+    verb: TargetVerb,
+    delivery: delivery::Delivery,
+    flag: Option<delivery::TargetTriple>,
+    env: Option<delivery::TargetTriple>,
+    wasm_block: bool,
+) -> Result<Option<delivery::TargetTriple>, TargetRefusal> {
+    use delivery::{DeliveryError, TargetSource, TargetTriple};
+    if verb == TargetVerb::Release {
+        for (source, target) in [(TargetSource::Flag, flag), (TargetSource::Env, env)] {
+            match target {
+                Some(TargetTriple::BrowserWasm) => {
+                    return Err(TargetRefusal::Delivery(DeliveryError::ReleaseWasmTarget {
+                        source,
+                    }));
+                }
+                Some(TargetTriple::Wasm32Wasip1) => return Err(TargetRefusal::NoWasi),
+                Some(TargetTriple::Native(_)) | None => {}
+            }
+        }
     }
-    match ipe_env::var("IPE_TARGET").ok().as_deref() {
-        Some("wasm") => return CompileTarget::WasmClient,
-        Some("wasi") => return CompileTarget::WasmWasi,
-        _ => {}
+    let requested = flag.or(env);
+    if delivery.runtime() == Some(delivery::Runtime::Client) {
+        return match requested {
+            None | Some(TargetTriple::BrowserWasm) => Ok(Some(TargetTriple::BrowserWasm)),
+            Some(TargetTriple::Wasm32Wasip1) => Err(TargetRefusal::Delivery(
+                DeliveryError::ClientRefusesWasiTriple,
+            )),
+            Some(native @ TargetTriple::Native(_)) => Err(TargetRefusal::Delivery(
+                DeliveryError::ClientRequiresBrowserTriple {
+                    triple: Some(native),
+                },
+            )),
+        };
     }
-    if wasm_config.is_some_and(project::WasmConfig::implies_wasm_target) {
-        return CompileTarget::WasmClient;
+    if wasm_block || requested == Some(TargetTriple::BrowserWasm) {
+        return Err(TargetRefusal::Delivery(
+            DeliveryError::WasmTargetRequiresClient,
+        ));
     }
-    CompileTarget::Native
+    Ok(requested)
+}
+
+/// The compile target `ipe dev build` / `ipe dev run` derive for `delivery`.
+///
+/// # Errors
+///
+/// [`TargetRefusal`] from [`derive_target`].
+pub fn dev_compile_target(
+    delivery: delivery::Delivery,
+    flag: Option<delivery::TargetTriple>,
+    env: Option<delivery::TargetTriple>,
+    wasm_block: bool,
+) -> Result<CompileTarget, TargetRefusal> {
+    derive_target(TargetVerb::Dev, delivery, flag, env, wasm_block).map(CompileTarget::of_triple)
+}
+
+/// The source of the target an app-bundle delivery was handed, if any.
+const fn bundle_target_source(
+    flag: Option<delivery::TargetTriple>,
+    env: Option<delivery::TargetTriple>,
+) -> Option<delivery::TargetSource> {
+    match (flag, env) {
+        (Some(_), _) => Some(delivery::TargetSource::Flag),
+        (None, Some(_)) => Some(delivery::TargetSource::Env),
+        (None, None) => None,
+    }
+}
+
+/// Refuse a target handed to an app-bundle delivery, which picks its own.
+///
+/// # Errors
+///
+/// [`CliError::Usage`] carrying [`delivery::DeliveryError::BundleHostHasNoTarget`].
+fn refuse_bundle_target(
+    verb: Verb,
+    delivery: delivery::Delivery,
+    flag: Option<delivery::TargetTriple>,
+    env: Option<delivery::TargetTriple>,
+) -> Result<(), CliError> {
+    bundle_target_source(flag, env).map_or(Ok(()), |source| {
+        Err(CliError::Usage(text::msg::command_refusal(
+            &verb,
+            &delivery::DeliveryError::BundleHostHasNoTarget { delivery, source },
+        )))
+    })
+}
+
+/// Refuse a `client` app-bundle delivery under `ipe dev run`.
+///
+/// `ipe dev build` lays out a `desktop`/`ios`/`android` client bundle; a dev
+/// run has no route that runs one, and running the bare browser client in
+/// its place would substitute a delivery the user did not name.
+///
+/// # Errors
+/// [`CliError::Usage`] carrying [`delivery::DeliveryError::ClientHostHasNoDevRun`].
+fn refuse_client_host_run(delivery: delivery::Delivery) -> Result<(), CliError> {
+    use delivery::{Host, Runtime};
+    match (delivery.runtime(), delivery.host()) {
+        (Some(Runtime::Client), Host::Desktop | Host::Ios | Host::Android) => {
+            Err(CliError::Usage(text::msg::command_refusal(
+                &Verb::DEV_RUN,
+                &delivery::DeliveryError::ClientHostHasNoDevRun { delivery },
+            )))
+        }
+        (Some(Runtime::Client), Host::Default) | (Some(Runtime::Served) | None, _) => Ok(()),
+    }
+}
+
+/// Where an admitted `ipe dev build` goes: an app bundle or a compile.
+enum DevRoute {
+    /// A `desktop`/`ios`/`android` app bundle.
+    Bundle(BundleHost),
+    /// An emitted crate built for the compile target.
+    Compile(CompileTarget),
 }
 
 /// What an `ipe dev build` of one held read is admitted to produce.
 struct DevAdmission {
     delivery: delivery::Delivery,
-    bundle_host: Option<BundleHost>,
-    compile_target: CompileTarget,
+    route: DevRoute,
 }
 
 /// Judge the delivery refusals of an `ipe dev build` of `held`.
@@ -785,24 +924,23 @@ struct DevAdmission {
 /// The delivery grammar is resolved against the shape `main` pins (the
 /// optional `[shape]` cross-check, the `[runtime] [host]` tail, the `--static`
 /// gate). A `desktop`/`ios`/`android` host is an application bundle routed
-/// through the delivery-grammar bundler and is admitted as that bundle host.
-/// Every other delivery is admitted only when it agrees with the compile
-/// target (CLI `--target wasm|wasi` > `IPE_TARGET=wasm|wasi` > `[wasm].mode`)
-/// on the `(engine, triple)` validity matrix, the single live gate: a `spa`
-/// delivery compiles to the browser wasm engine and that engine carries only a
-/// `spa` delivery, a co-located native delivery resolves to the native engine,
-/// and the co-located WASI engine admits only the sealed `Direct`/`Script`
-/// floor, so the wasm-keyed native-deny backstops stay reachable for every
-/// sandboxed client.
+/// through the delivery-grammar bundler and is admitted as that bundle host;
+/// it picks its own target, so a `--target` or `IPE_TARGET` is refused.
+/// Every other delivery derives its compile target through [`derive_target`]
+/// (a `web client` delivery compiles to the browser engine), and the
+/// `(engine, triple)` validity matrix then judges the pair as a second,
+/// independent gate, so the wasm-keyed native-deny backstops stay reachable
+/// for every sandboxed client.
 ///
 /// # Errors
 /// [`CliError::Usage`] carrying the refusal of [`resolve_delivery`],
-/// [`BundleHost::from_delivery_host`] or the triple matrix.
+/// [`BundleHost::from_delivery_host`], [`derive_target`] or the triple matrix;
+/// [`CliError::StaticRefusal`] for an unparseable `IPE_TARGET`.
 fn admit_dev_build(
     held: &HeldBuild,
     positionals: &cli_args::DeliveryPositionals,
     wants_static: bool,
-    wasm_target: cli_args::WasmKind,
+    flag: Option<delivery::TargetTriple>,
 ) -> Result<DevAdmission, CliError> {
     let delivery = resolve_delivery(
         held.shape(),
@@ -810,18 +948,28 @@ fn admit_dev_build(
         wants_static,
         Verb::DEV_BUILD.name(),
     )?;
-    let bundle_host = BundleHost::from_delivery_host(delivery.host())?;
-    let compile_target = resolve_compile_target(wasm_target, Some(&held.root().manifest().wasm));
-    if bundle_host.is_none() {
-        let (engine, triple) = compile_target.engine_triple();
-        delivery
-            .admit_triple(engine, triple)
-            .map_err(|e| CliError::Usage(text::msg::command_refusal(&Verb::DEV_BUILD, &e)))?;
+    let env = build_plan::env_target()?;
+    if let Some(host) = BundleHost::from_delivery_host(delivery.host())? {
+        refuse_bundle_target(Verb::DEV_BUILD, delivery, flag, env)?;
+        return Ok(DevAdmission {
+            delivery,
+            route: DevRoute::Bundle(host),
+        });
     }
+    let compile_target = dev_compile_target(
+        delivery,
+        flag,
+        env,
+        held.root().manifest().wasm.implies_wasm_target(),
+    )
+    .map_err(|refusal| refusal.into_cli(Verb::DEV_BUILD))?;
+    let (engine, triple) = compile_target.engine_triple();
+    delivery
+        .admit_triple(engine, triple)
+        .map_err(|e| CliError::Usage(text::msg::command_refusal(&Verb::DEV_BUILD, &e)))?;
     Ok(DevAdmission {
         delivery,
-        bundle_host,
-        compile_target,
+        route: DevRoute::Compile(compile_target),
     })
 }
 
@@ -881,7 +1029,7 @@ pub fn run_build_body(rest: &[String]) -> Result<BuildSuccess, CliError> {
 
     // Parse guaranteed `--emit-ir` composes with no emit-affecting flag, so the
     // IR-dump path carries no options to drop.
-    let (out, wasm_target, cli_layer) = match args.mode {
+    let (out, target_flag, cli_layer) = match args.mode {
         cli_args::BuildMode::EmitIr => {
             // The project is the current directory (or the directory named); a
             // file argument names one of its modules, never the default entry.
@@ -896,9 +1044,9 @@ pub fn run_build_body(rest: &[String]) -> Result<BuildSuccess, CliError> {
         }
         cli_args::BuildMode::Emit {
             out,
-            wasm,
+            target,
             static_layer,
-        } => (out, wasm, static_layer),
+        } => (out, target, static_layer),
     };
     let entry = args.entry.clone().unwrap_or_else(|| ".".to_owned());
     let root = build_root(args.entry.as_deref(), Verb::DEV_BUILD)?;
@@ -916,19 +1064,15 @@ pub fn run_build_body(rest: &[String]) -> Result<BuildSuccess, CliError> {
     // untouched; the rewritten project is then read and judged once more, and
     // that read is the one built.
     let unfixed = HeldBuild::read(root)?;
-    let admitted = admit_dev_build(&unfixed, &args.delivery, wants_static, wasm_target)?;
+    let admitted = admit_dev_build(&unfixed, &args.delivery, wants_static, target_flag)?;
     let (held, admitted) = if args.fix {
         let held = unfixed.fixed()?;
-        let admitted = admit_dev_build(&held, &args.delivery, wants_static, wasm_target)?;
+        let admitted = admit_dev_build(&held, &args.delivery, wants_static, target_flag)?;
         (held, admitted)
     } else {
         (unfixed, admitted)
     };
-    let DevAdmission {
-        delivery,
-        bundle_host,
-        compile_target,
-    } = admitted;
+    let DevAdmission { delivery, route } = admitted;
     let manifest = held.root().manifest();
 
     // Human-friendly progress: the compile+emit below is otherwise silent, so
@@ -953,13 +1097,16 @@ pub fn run_build_body(rest: &[String]) -> Result<BuildSuccess, CliError> {
         );
     }
 
-    if let Some(host) = bundle_host {
-        bundle_delivery(host, NativeFinish::Dev, &held)?;
-        return Ok(BuildSuccess {
-            entry,
-            out_dir: PathBuf::new(),
-        });
-    }
+    let compile_target = match route {
+        DevRoute::Bundle(host) => {
+            bundle_delivery(host, NativeFinish::Dev, &held)?;
+            return Ok(BuildSuccess {
+                entry,
+                out_dir: PathBuf::new(),
+            });
+        }
+        DevRoute::Compile(compile_target) => compile_target,
+    };
 
     // The dependency model (native OR wasm) needs no vendored tree — the runtime
     // is a path dependency. Only a dep-model-OFF build vendors the source subtree.
@@ -1368,7 +1515,8 @@ fn copy_native_artifact(
 ///     registry, which the source-only, self-contained contract forbids — so an
 ///     FFI-bearing program is a hard [`CliError::EjectUnsupported`] refusal
 ///     rather than a tree that would not resolve offline.
-///   - `--target wasm` is a distinct compilation axis with its own bundling
+///   - a wasm target (the `web client` delivery, a `wasm` block, or a wasm
+///     `IPE_TARGET`) is a distinct compilation axis with its own bundling
 ///     step; eject targets a plain-`cargo build` native crate.
 ///
 /// # Errors
@@ -1399,15 +1547,16 @@ pub fn run_eject(rest: &[String]) -> Result<(), CliError> {
 
     // Eject targets a plain native `cargo build`; a wasm target has its own
     // bundling step and a distinct closed vendoring template. Refuse a wasm
-    // request from ANY tier — the `IPE_TARGET=wasm|wasi` env OR a project's
-    // `[wasm].mode` — rather than silently emit a native tree for a wasm app.
-    // (`parse_eject` has no `--target` flag, so the CLI tier cannot select wasm
-    // here; `WasmKind::None` for the CLI axis is exact.)
-    if resolve_compile_target(cli_args::WasmKind::None, Some(&manifest.wasm)).is_wasm() {
+    // request from ANY source — a wasm `IPE_TARGET` OR a project's `wasm`
+    // block — rather than silently emit a native tree for a wasm app.
+    // (`parse_eject` has no `--target` flag.)
+    if manifest.wasm.implies_wasm_target()
+        || build_plan::env_target()?.is_some_and(delivery::TargetTriple::is_wasm)
+    {
         return Err(CliError::EjectUnsupported {
             reason: TerminalSafe::sanitize(
                 "eject produces a native Cargo project; a wasm target has a separate \
-                 bundling step — use `ipe release build --target wasm` (browser) or \
+                 bundling step — use `ipe release build web client` (browser) or \
                  `ipe dev build --target wasi` (wasm32-wasip1)",
             ),
         });
@@ -1481,10 +1630,10 @@ pub(super) fn eject_options() -> BuildOptions {
     }
 }
 
-/// `ipe release build [<dir>] [--out <dir>] [--target wasm|<triple>] [--embed]` —
+/// `ipe release build [<dir>] [<delivery>] [--out <dir>] [--target <triple>] [--embed]` —
 /// build the production artifact for every app kind.
 ///
-/// The artifact kind is determined by the app and the `--target` flag:
+/// The artifact kind is determined by the app and its delivery:
 ///
 /// - **Native-bearing** (app crosses into `Rust.` / FFI): the jailed bundle —
 ///   `ipe-wrapper` (jailed launcher), `ipe-app` (statically-linked app binary),
@@ -1493,10 +1642,11 @@ pub(super) fn eject_options() -> BuildOptions {
 /// - **Pure native** (no native/FFI content): a plain optimised binary under
 ///   the release cargo profile. No jail wrapper is needed; the binary is
 ///   structurally bounded to its inferred capabilities.
-/// - **Browser/wasm** (`--target wasm`): the production browser bundle
-///   (optimised `.wasm` + generated glue + assets) exactly as `ipe dev build
-///   --target wasm` produces, but with the production flag set so the
-///   `Ipe.Debug` gate (IPE-L0140) fires.
+/// - **Browser/wasm** (the `web client` delivery): the production browser
+///   bundle (optimised `.wasm` + generated glue + assets) exactly as `ipe dev
+///   build web client` produces, but with the production flag set so the
+///   `Ipe.Debug` gate (IPE-L0140) fires. A wasm `--target` or `IPE_TARGET` is
+///   refused: the delivery, not a triple, selects the browser bundle.
 ///
 /// Every path states `BuildIntent::Release` so the `Ipe.Debug.*` gate fires
 /// for all app kinds. `ipe dev build` and `ipe dev run` state `Development`
@@ -1558,28 +1708,29 @@ impl ReleaseArtifact {
     }
 }
 
-/// The artifact a `release build` with `target` produces, given the target a
-/// native `--target` resolves to through `IPE_TARGET` and `[wasm].mode`.
+/// The artifact a release produces, derived from the delivery.
+///
+/// Every target source is judged by [`derive_target`]; nothing is ignored.
+/// `flag` is the parsed native `--target`, `env` the parsed `IPE_TARGET`, and
+/// `wasm_block` whether the manifest sets `wasm = On {…}`.
 ///
 /// # Errors
 ///
-/// [`CliError::Usage`] when the resolved target is the WASI module, which has
-/// no release form.
-pub const fn release_artifact(
-    target: cli_args::ReleaseTarget,
-    resolved: CompileTarget,
-) -> Result<ReleaseArtifact, CliError> {
-    match (target, resolved) {
-        (cli_args::ReleaseTarget::Wasm, _)
-        | (cli_args::ReleaseTarget::Native(_), CompileTarget::WasmClient) => {
-            Ok(ReleaseArtifact::Browser)
-        }
-        (cli_args::ReleaseTarget::Native(triple), CompileTarget::Native) => {
-            Ok(ReleaseArtifact::Native(triple))
-        }
-        (cli_args::ReleaseTarget::Native(_), CompileTarget::WasmWasi) => {
-            Err(CliError::Usage(text::msg::release_no_wasi()))
-        }
+/// [`TargetRefusal`] from [`derive_target`] under [`TargetVerb::Release`].
+pub fn release_artifact(
+    delivery: delivery::Delivery,
+    flag: Option<ipe_backend_rust::static_build::StaticTriple>,
+    env: Option<delivery::TargetTriple>,
+    wasm_block: bool,
+) -> Result<ReleaseArtifact, TargetRefusal> {
+    let flag = flag.map(delivery::TargetTriple::Native);
+    match derive_target(TargetVerb::Release, delivery, flag, env, wasm_block)? {
+        Some(delivery::TargetTriple::BrowserWasm) => Ok(ReleaseArtifact::Browser),
+        Some(delivery::TargetTriple::Native(triple)) => Ok(ReleaseArtifact::Native(triple)),
+        None => Ok(ReleaseArtifact::Native(
+            ipe_backend_rust::static_build::StaticTriple::default(),
+        )),
+        Some(delivery::TargetTriple::Wasm32Wasip1) => Err(TargetRefusal::NoWasi),
     }
 }
 
@@ -1684,7 +1835,14 @@ pub fn release_pipeline(
     let driver =
         SettingsSource::discovered(Some((manifest, held.manifest_path())), HostIntent::Served)
             .db_driver();
+    let env = build_plan::env_target()?;
     if let Some(host) = BundleHost::from_delivery_host(bundle_delivery_resolved.host())? {
+        refuse_bundle_target(
+            verb,
+            bundle_delivery_resolved,
+            args.target.map(delivery::TargetTriple::Native),
+            env,
+        )?;
         bundle_delivery(
             host,
             NativeFinish::Release {
@@ -1696,14 +1854,15 @@ pub fn release_pipeline(
         return Ok(ReleaseOutput::Distributable);
     }
 
-    // Route on the typed artifact: the browser bundle or a static native
-    // binary. A native `--target` still yields to `IPE_TARGET` and the
-    // manifest's `[wasm].mode`; a WASI resolution has no release form and
-    // refuses.
+    // Route on the typed artifact the delivery derives: the browser bundle for
+    // `web client`, otherwise a static native binary.
     let artifact = release_artifact(
-        args.target.clone(),
-        resolve_compile_target(cli_args::WasmKind::None, Some(&manifest.wasm)),
-    )?;
+        bundle_delivery_resolved,
+        args.target,
+        env,
+        manifest.wasm.implies_wasm_target(),
+    )
+    .map_err(|refusal| refusal.into_cli(verb))?;
     let compile_target = artifact.compile_target();
 
     // Fail closed unless the delivery runtime and the compile target agree — the
@@ -1720,10 +1879,10 @@ pub fn release_pipeline(
     let triple = match artifact {
         ReleaseArtifact::Native(triple) => triple,
         ReleaseArtifact::Browser if purpose == ReleasePurpose::Run => {
-            // A manifest `[wasm].mode` or `IPE_TARGET` resolution the parse
-            // could not see: refused before anything is emitted.
+            // The parse refuses `web client` under `release run`; this arm
+            // keeps the refusal at the artifact as well, before any emit.
             return Err(CliError::NoRunForm {
-                target: cli_args::NoRunTarget::Wasm,
+                target: cli_args::NoRunTarget::Client,
             });
         }
         ReleaseArtifact::Browser => {
@@ -2272,7 +2431,7 @@ pub fn format_artifact_size(bytes: u64) -> String {
 /// instant this constant drifts from it.
 const WASM_BINDGEN_VERSION: &str = "0.2.126";
 
-/// Run the three post-emit bundle steps for `--target wasm`:
+/// Run the three post-emit bundle steps for the `web client` delivery:
 /// 1. `cargo build --target wasm32-unknown-unknown --release` (THE SEAL cross-target)
 /// 2. `wasm-bindgen` CLI — emits the JS glue + `www/pkg/ipe_app_bg.wasm`
 /// 3. `wasm-opt -Oz` — optional; silently skipped when not on PATH
@@ -2945,10 +3104,10 @@ pub fn run_run_with_args(args: cli_args::RunArgs) -> Result<(), CliError> {
     let debugger = args.debugger || !session.is_live();
     let bin_args = args.bin_args;
     let cli_layer = args.static_layer;
-    // The CLI `--target` flavour (`--target wasi` selects the co-located WASI
+    // The parsed `--target` (`--target wasi` selects the co-located WASI
     // module the embedded wasmtime path runs; `--target wasm` was refused at
-    // parse). Manifest `[wasm].mode` still selects only the browser client.
-    let cli_wasm = args.wasm;
+    // parse).
+    let target_flag = args.target;
     let entry = args.entry.clone().unwrap_or_else(|| ".".to_owned());
 
     // --- Step 1: ipe compile → emit the Rust project ---
@@ -2975,6 +3134,7 @@ pub fn run_run_with_args(args: cli_args::RunArgs) -> Result<(), CliError> {
         wants_static,
         Verb::DEV_RUN.name(),
     )?;
+    refuse_client_host_run(delivery)?;
 
     // A Tui app with no interactive terminal is refused right here — before
     // any compile or cargo work — rather than building fully and only then
@@ -3004,13 +3164,17 @@ pub fn run_run_with_args(args: cli_args::RunArgs) -> Result<(), CliError> {
         );
     }
 
-    // When the project declares [wasm].mode != "off", or IPE_TARGET=wasm is
-    // set, treat `ipe dev run` as a browser wasm build-and-bundle (no native binary
-    // to exec). `--target wasi` selects the co-located WASI module, which `ipe
-    // dev run` EXECUTES under embedded wasmtime. A plain `ipe dev run` in a non-wasm
-    // project stays native. (`--target wasm` was refused at parse: the browser
-    // bundle has no executable form.)
-    let compile_target = resolve_compile_target(cli_wasm, Some(&manifest.wasm));
+    // A `web client` delivery derives the browser target, and `ipe dev run`
+    // then builds and bundles it (no native binary to exec). `--target wasi`
+    // selects the co-located WASI module, which `ipe dev run` EXECUTES under
+    // embedded wasmtime. Any other delivery stays native.
+    let compile_target = dev_compile_target(
+        delivery,
+        target_flag,
+        build_plan::env_target()?,
+        manifest.wasm.implies_wasm_target(),
+    )
+    .map_err(|refusal| refusal.into_cli(Verb::DEV_RUN))?;
     let wasm_target = compile_target.is_wasm();
 
     // A session over a shape or target with no recordable update loop is
@@ -3102,7 +3266,7 @@ pub fn run_run_with_args(args: cli_args::RunArgs) -> Result<(), CliError> {
 
     // Post-emit routing per compile target:
     //   * WasmClient — a browser bundle has no executable form under `ipe dev run`;
-    //     produce the bundle (same step as `ipe dev build --target wasm`) and stop.
+    //     produce the bundle (same step as `ipe dev build web client`) and stop.
     //   * WasmWasi — build the `wasm32-wasip1` module (THE SEAL, via the SAME
     //     `bundle_wasi` build path `ipe dev build --target wasi` uses) and then
     //     EXECUTE it under embedded wasmtime with the dev ambient context.
@@ -3314,7 +3478,7 @@ fn run_release_output(
             // The pipeline refuses every no-run target under `Run`; a
             // distributable here has nothing to execute.
             Err(CliError::NoRunForm {
-                target: cli_args::NoRunTarget::Wasm,
+                target: cli_args::NoRunTarget::Client,
             })
         }
         ReleaseOutput::Embedded(wrapper) => exec_program(&wrapper, &wrapper_argv(app_args)),

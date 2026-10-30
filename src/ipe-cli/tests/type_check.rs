@@ -653,3 +653,72 @@ fn relative_missing_file_argument_is_refused() -> TestResult {
     );
     Ok(())
 }
+
+/// Run `ipe dev build` over a fresh project holding the fixture `name` as its
+/// `src/Main.ipe`, returning `(success, stderr, main_rs_emitted)`.
+fn build_fixture(name: &str, tag: &str) -> Result<(bool, String, bool), Box<dyn Error>> {
+    let runtime = e2e_support::require_runtime().into_path_buf();
+    let dir =
+        crate::support::scratch_root().join(format!("ipe_http_alias_{}_{tag}", std::process::id()));
+    std::fs::create_dir_all(dir.join("src"))?;
+    std::fs::write(dir.join("package.ipe"), support::package_ipe(tag))?;
+    std::fs::copy(fixture(name), dir.join("src").join("Main.ipe"))?;
+    let out_dir = dir.join("out");
+    let output = Command::new(support::ipe_bin())
+        .args(["dev", "build", &dir.to_string_lossy()])
+        .arg("--out")
+        .arg(&out_dir)
+        .env("IPE_RUNTIME_DIR", &runtime)
+        .output()?;
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    let main_rs = out_dir.join("rust").join("src").join("main.rs").exists();
+    std::fs::remove_dir_all(&dir)?;
+    Ok((output.status.success(), stderr, main_rs))
+}
+
+/// Whether the fixture `name` type-checks, then builds and emits a crate with
+/// no IPE-I0001 (an empty-home head reaching the lowerer).
+fn assert_checks_and_builds(name: &str, tag: &str) -> TestResult {
+    let (ok, stdout, stderr) = check_fixture(name)?;
+    assert!(ok, "{name} must type-check:\n{stdout}\n{stderr}");
+    let (built, stderr, main_rs) = build_fixture(name, tag)?;
+    assert!(
+        built && main_rs && !stderr.contains("IPE-I0001"),
+        "{name} must build and emit a crate, got:\n{stderr}"
+    );
+    Ok(())
+}
+
+/// A kernel type alias spelled through its module's qualifier type-checks AND
+/// builds: canon expands `Http.HttpResponse` to its record body.
+#[test]
+fn http_response_alias_qualified_builds() -> TestResult {
+    assert_checks_and_builds("http_response_alias_qualified.ipe", "http-alias-qualified")
+}
+
+/// The `exposing` spelling of the kernel alias, `import Ipe.Http exposing
+/// (HttpResponse)` then a bare `HttpResponse`, type-checks AND builds.
+#[test]
+fn http_response_alias_exposing_builds() -> TestResult {
+    assert_checks_and_builds("http_response_alias_exposing.ipe", "http-alias-exposing")
+}
+
+/// FAIL-CLOSED: a type the kernel module does not export is IPE-N0005 on both
+/// `type-check` and `dev build`, never an empty-home head the lowerer trips on.
+#[test]
+fn unknown_type_under_kernel_qualifier_is_no_such_member() -> TestResult {
+    let (ok, _, stderr) = check_fixture("http_response_alias_unknown_member.ipe")?;
+    assert!(
+        !ok && stderr.contains("IPE-N0005"),
+        "`Http.Bogus` must fail type-check with IPE-N0005, got:\n{stderr}"
+    );
+    let (built, stderr, main_rs) = build_fixture(
+        "http_response_alias_unknown_member.ipe",
+        "http-alias-unknown",
+    )?;
+    assert!(
+        !built && !main_rs && stderr.contains("IPE-N0005") && !stderr.contains("IPE-I0001"),
+        "`Http.Bogus` must fail the build with IPE-N0005 and emit no crate, got:\n{stderr}"
+    );
+    Ok(())
+}

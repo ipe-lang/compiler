@@ -1217,6 +1217,16 @@ const STD_LIVE_CONSOLE: &str = include_str!("../Ipe/Web/Console.ipe");
 /// Not in `STDLIB_MODULE_QUALIFIERS` so disjointness invariant holds.
 const STD_PUBSUB: &str = include_str!("../Ipe/PubSub.ipe");
 
+/// `Ipe.Remote` — typed endpoints between a split program's client and server
+/// (compiled source).
+///
+/// Routes through `Kernel.kernel "Remote_*"`. REFUSED (ipe non-zero): the six
+/// `Remote` kernels are unschemed, so every member use, and every annotation
+/// naming `Remote` / `RemoteAuth`, fails closed with IPE-L0108; importing the
+/// module without a use compiles. Not in `STDLIB_MODULE_QUALIFIERS` so the
+/// disjointness invariant holds.
+const STD_REMOTE: &str = include_str!("../Ipe/Remote.ipe");
+
 /// `Ipe.Trace` — opt-in distributed-tracing spans (compiled source).
 ///
 /// Members are point-free `Kernel.kernel "Trace_*"` aliases backed by the
@@ -1853,6 +1863,10 @@ pub const COMPILED_STD_MODULES: &[CompiledStdModule] = &[
     CompiledStdModule {
         dotted: "Ipe.PubSub",
         source: STD_PUBSUB,
+    },
+    CompiledStdModule {
+        dotted: "Ipe.Remote",
+        source: STD_REMOTE,
     },
     CompiledStdModule {
         dotted: "Ipe.Trace",

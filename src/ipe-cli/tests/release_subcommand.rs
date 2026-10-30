@@ -2,7 +2,9 @@
 //! checks. The full end-to-end release (compile + cargo build + bundle layout)
 //! requires the musl target installed and is gated on `IPE_E2E=1`.
 
-use ipe::cli_args::{ReleaseMode, ReleaseTarget, StaticTriple, parse_release_build};
+mod support;
+
+use ipe::cli_args::{ReleaseMode, StaticTriple, parse_release_build};
 
 // ── Argument parsing ─────────────────────────────────────────────────────────
 
@@ -14,10 +16,7 @@ fn release_no_args_defaults() {
     let parsed = parse_release_build(&args).expect("no-arg parse must succeed");
     assert!(parsed.entry.is_none());
     assert!(parsed.out.is_none());
-    assert_eq!(
-        parsed.target,
-        ReleaseTarget::Native(StaticTriple::X8664LinuxMusl)
-    );
+    assert_eq!(parsed.target, None);
     assert!(parsed.runtime.is_none());
     assert_eq!(parsed.mode, ReleaseMode::Embed);
 }
@@ -49,16 +48,13 @@ fn release_embed_and_bundle_mutually_exclusive() {
 }
 
 /// `--static` names the posture a native release build already has, so it
-/// parses to the default static musl target; `--capabilities` is no flag of
+/// parses to the default target; `--capabilities` is no flag of
 /// `release build` and refuses.
 #[test]
 fn release_build_accepts_static_and_refuses_capabilities() {
     let args: Vec<String> = vec!["--static".into()];
     let parsed = parse_release_build(&args).expect("--static parse must succeed");
-    assert_eq!(
-        parsed.target,
-        ReleaseTarget::Native(StaticTriple::X8664LinuxMusl)
-    );
+    assert_eq!(parsed.target, None);
     let caps: Vec<String> = vec!["--capabilities".into()];
     assert!(
         parse_release_build(&caps).is_err(),
@@ -79,18 +75,17 @@ fn release_out_flag() {
 fn release_target_flag_native() {
     let args: Vec<String> = vec!["--target".into(), "x86_64-unknown-linux-musl".into()];
     let parsed = parse_release_build(&args).expect("--target parse must succeed");
-    assert_eq!(
-        parsed.target,
-        ReleaseTarget::Native(StaticTriple::X8664LinuxMusl)
-    );
+    assert_eq!(parsed.target, Some(StaticTriple::X8664LinuxMusl));
 }
 
-/// `--target wasm` is accepted (browser bundle path).
+/// `--target wasm` is refused: the browser bundle is the `web client` delivery.
 #[test]
-fn release_target_flag_wasm() {
+fn release_target_flag_wasm_is_refused() {
     let args: Vec<String> = vec!["--target".into(), "wasm".into()];
-    let parsed = parse_release_build(&args).expect("--target wasm parse must succeed");
-    assert_eq!(parsed.target, ReleaseTarget::Wasm);
+    assert!(
+        parse_release_build(&args).is_err(),
+        "`release build --target wasm` must be refused"
+    );
 }
 
 /// A positional entry is captured.
@@ -229,4 +224,96 @@ fn release_unsupported_native_target_is_usage_error() {
         msg.contains("unsupported target") || msg.contains("bogus"),
         "error must mention the unsupported target, got: {msg}"
     );
+}
+
+// ── Environment target ───────────────────────────────────────────────────────
+
+/// A served `Web.tea` app: a delivery with no wasm client form.
+const SERVED_APP: &str = "module Main exposing (main)
+
+import Ipe.Tea.Web as Web
+import Ipe.Ui as Ui
+import Ipe.Tea.Web.Cmd as Cmd
+import Ipe.Tea.Web.Sub as Sub
+
+type Msg
+    = Noop
+
+type alias Model =
+    { count : Int }
+
+init : WebReq -> ( Model, Cmd Msg )
+init _req =
+    ( { count = 0 }, Cmd.none )
+
+update : Msg -> Model -> ( Model, Cmd Msg )
+update _msg model =
+    ( model, Cmd.none )
+
+view : Model -> Element Msg
+view _model =
+    Ui.text \"ok\"
+
+subscriptions : Model -> Sub Msg
+subscriptions _model =
+    Sub.none
+
+main =
+    Web.tea
+        { init = init
+        , update = update
+        , view = view
+        , subscriptions = subscriptions
+        , routes = []
+        , notFound = Noop
+        }
+";
+
+/// `IPE_TARGET=wasm` is refused by `release build`, naming the variable.
+///
+/// The variable is seeded at spawn time on the child `ipe`, the one place a
+/// test sets the environment the compiler's reader sees. A release that
+/// ignored it would build a native binary silently; the refusal fires before
+/// any emit, so no output is written.
+#[test]
+#[allow(clippy::panic)] // test assertion: an `ipe` binary that cannot spawn IS the failure
+fn release_env_wasm_is_refused_end_to_end() {
+    const NAME: &str = "release_env_wasm_refused";
+    let root = support::scratch_root().join(NAME);
+    let _ = std::fs::remove_dir_all(&root);
+    support::expect_scratch_step(NAME, std::fs::create_dir_all(root.join("src")));
+    support::expect_scratch_step(
+        NAME,
+        std::fs::write(root.join("package.ipe"), support::package_ipe("env-wasm")),
+    );
+    support::expect_scratch_step(
+        NAME,
+        std::fs::write(root.join("src").join("Main.ipe"), SERVED_APP),
+    );
+    let out = root.join("out");
+    let output = std::process::Command::new(support::ipe_bin())
+        .arg("release")
+        .arg("build")
+        .arg(&root)
+        .arg("--out")
+        .arg(&out)
+        .env("IPE_TARGET", "wasm")
+        .env("NO_COLOR", "1")
+        .output();
+    let wrote = out.exists();
+    let _ = std::fs::remove_dir_all(&root);
+    let output = match output {
+        Ok(output) => output,
+        Err(e) => panic!("spawn `ipe release build`: {e}"),
+    };
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !output.status.success(),
+        "`IPE_TARGET=wasm ipe release build` must refuse: {stderr}"
+    );
+    assert!(
+        stderr.contains("IPE_TARGET") && stderr.contains("ipe release build web client"),
+        "the refusal names `IPE_TARGET` and the client delivery: {stderr}"
+    );
+    assert!(!wrote, "a refused release writes no output");
 }

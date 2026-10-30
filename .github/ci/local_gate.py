@@ -14,16 +14,26 @@ Every `gate` entry of the manifest declares exactly one local disposition:
   local: {ci-only: <reason>}
       No local reproduction exists; the reason is one of `CI_ONLY_REASONS`.
 
-A `<command>` is a string, or a mapping with `cmd` (required), `env`, `cwd` and
-`differs`. Its text may use the closed set of `PLACEHOLDERS`. Unless the
-command carries `differs: <reason>`, it must equal, token for token (after
-the placeholders take their CI values and `CI_ONLY_FLAGS` are dropped), one
-command line of a `run:` step in the producing job (or a job it `aggregates`),
-with the same `working-directory`; every declared `env` entry must equal the
-CI value visible to that step. A `differs` command is exempt from the token
-match only; its `env` and `cwd` are still verified. So the local gate cannot
-run a command CI does not run, and CI cannot change a mirrored command without
-the manifest guard going red.
+A `<command>` is a string, or a mapping with `cmd` (required), `env`, `cwd`,
+`differs`, `tier` and `package`. Its text may use the closed set of
+`PLACEHOLDERS`. Unless the command carries `differs: <reason>`, it must equal,
+token for token (after the placeholders take their CI values and
+`CI_ONLY_FLAGS` are dropped), one command line of a `run:` step in the
+producing job (or a job it `aggregates`), with the same `working-directory`;
+every declared `env` entry must equal the CI value visible to that step. A
+`differs` command is exempt from the token match only; its `env` and `cwd` are
+still verified. So the local gate cannot run a command CI does not run, and CI
+cannot change a mirrored command without the manifest guard going red.
+
+A command's own `tier` overrides the gate's declared `tier` for that one
+command (a command cheap enough to run earlier than the rest of its job's
+mirror, e.g. a crate's own tests promoted to `quick` inside an otherwise
+`affected` gate). A command's `package` skips it unless that crate owns a
+changed file, reusing the same `Selection` the `{packages}` placeholder
+expands from — never a second, hand-rolled path matcher — so a change outside
+that crate (or outside every crate, which conservatively selects all of them)
+decides whether the command runs at all, not just which crates it is `-p`'d
+over.
 
 LIMIT: without `complete: true` the match is one-directional. A new CI step
 with no `local:` twin is not detected; the `local:` block of that gate must be
@@ -122,8 +132,9 @@ SHELL_WORD_START = frozenset("~#!")
 
 LOCAL_KEYS_RUN = frozenset({"tier", "run"})
 LOCAL_KEYS_RUN_OPTIONAL = frozenset({"complete"})
-COMMAND_KEYS = frozenset({"cmd", "env", "cwd", "differs"})
+COMMAND_KEYS = frozenset({"cmd", "env", "cwd", "differs", "tier", "package"})
 ENV_NAME_RE = re.compile(r"[A-Z_][A-Z0-9_]*\Z")
+PACKAGE_NAME_RE = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_-]*\Z")
 
 
 @dataclass(frozen=True)
@@ -134,11 +145,17 @@ class Command:
     env: tuple[tuple[str, str], ...]
     cwd: str
     differs: str | None
+    # The tier this one command runs at (defaults to its gate's declared
+    # tier) and the crate, if any, that must own a changed file for it to
+    # run at all — independent of which crates a `{packages}` word selects.
+    tier: Tier
+    package: str | None = None
 
 
 @dataclass(frozen=True)
 class RunLocal:
-    """The gate is reproduced locally by `commands` at `tier`."""
+    """The gate is reproduced locally by `commands`, each at its own `tier`
+    (defaulting to this one) and conditioned on its own `package`."""
 
     tier: Tier
     commands: tuple[Command, ...]
@@ -215,7 +232,7 @@ def shell_hazard(text: str) -> str | None:
     return None
 
 
-def _parse_command(raw: object, loc: str, errors: list[str]) -> Command | None:
+def _parse_command(raw: object, loc: str, errors: list[str], default_tier: Tier) -> Command | None:
     """Parse one `run:` item, refusing every malformed shape."""
     if isinstance(raw, str):
         raw = {"cmd": raw}
@@ -279,9 +296,28 @@ def _parse_command(raw: object, loc: str, errors: list[str]) -> Command | None:
     if "differs" in raw and (not isinstance(differs, str) or not differs.strip()):
         errors.append(f"{loc}: `differs` must state why the command differs from CI")
         ok = False
+    cmd_tier = default_tier
+    if "tier" in raw:
+        cmd_tier = TIER_NAMES.get(raw["tier"]) if isinstance(raw["tier"], str) else None
+        if cmd_tier is None:
+            errors.append(f"{loc}: tier {raw['tier']!r} is not one of {sorted(TIER_NAMES)}")
+            ok = False
+    package = raw.get("package")
+    if "package" in raw and (not isinstance(package, str) or not PACKAGE_NAME_RE.match(package)):
+        errors.append(f"{loc}: `package` must be a crate name, got {package!r}")
+        ok = False
+    elif package is not None:
+        # The condition names the crate the command itself runs over, so a
+        # misspelt condition cannot leave the command silently never planned.
+        targets = [argv[i + 1] for i, w in enumerate(argv[:-1]) if w == "-p"]
+        if targets != [package]:
+            errors.append(f"{loc}: `package` {package!r} must be the command's one `-p` crate, got {targets}")
+            ok = False
     if not ok:
         return None
-    return Command(argv, tuple(env), os.path.normpath(cwd) if cwd != "." else ".", differs)
+    return Command(
+        argv, tuple(env), os.path.normpath(cwd) if cwd != "." else ".", differs, cmd_tier, package
+    )
 
 
 def parse_local(ctx: str, raw: object, errors: list[str]) -> LocalDisposition | None:
@@ -321,7 +357,7 @@ def parse_local(ctx: str, raw: object, errors: list[str]) -> LocalDisposition | 
     if not isinstance(run, list) or not run:
         errors.append(f"{loc}: `run` must be a non-empty list of commands")
         return None
-    commands = [_parse_command(item, f"{loc} run[{i}]", errors) for i, item in enumerate(run)]
+    commands = [_parse_command(item, f"{loc} run[{i}]", errors, tier) for i, item in enumerate(run)]
     if any(c is None for c in commands):
         return None
     cmds = tuple(c for c in commands if c is not None)
@@ -715,7 +751,12 @@ class Step:
 
 
 def expand(cmd: Command, ctx: str, sel: Selection, ws: Workspace) -> Step | None:
-    """Expand placeholders to local values; None when the selection is empty."""
+    """Expand placeholders to local values; None when the selection is empty
+    or, for a `package`-conditioned command, when that crate owns no changed
+    file (an unowned change still conservatively selects every command, same
+    as an unprefixed `{packages}` word would)."""
+    if cmd.package is not None and sel.packages is not None and cmd.package not in sel.packages:
+        return None
     local = {
         "{repo_root}": ws.root,
         "{target_dir}": ws.target_dir,
@@ -760,8 +801,10 @@ def plan(
         if t > tier:
             break
         for ctx, disp in runs:
-            if isinstance(disp, RunLocal) and disp.tier is t:
-                for c in disp.commands:
+            if not isinstance(disp, RunLocal):
+                continue
+            for c in disp.commands:
+                if c.tier is t:
                     s = expand(c, ctx, sel, ws)
                     if s is not None and (s.argv, s.env, s.cwd) not in seen:
                         seen.add((s.argv, s.env, s.cwd))

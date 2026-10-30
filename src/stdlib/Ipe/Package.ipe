@@ -41,10 +41,10 @@ module Ipe.Package exposing
     , staticBinary
     , crossBinary
     , desktop
-    , solo
-    , soloDesktop
-    , soloIos
-    , soloAndroid
+    , client
+    , clientDesktop
+    , clientIos
+    , clientAndroid
     , DesktopConfig
     , MobileConfig
     , PushConfig
@@ -115,7 +115,7 @@ type alias Delivery =
 -- Every entry is one of the closed builder vocabulary — a typo is an unknown
 -- name at read time, never a string compared at build time. Each builder maps
 -- one-to-one onto the CLI delivery grammar (`binary` is the shape's co-located
--- artifact; `soloIos` is `web solo ios`), so the manifest stores the same
+-- artifact; `clientIos` is `web client ios`), so the manifest stores the same
 -- sentences the CLI accepts. An omitted `ships` field means the implicit
 -- `[ binary ]` singleton — the shape's default delivery.
 type Ship
@@ -123,10 +123,10 @@ type Ship
     | ShipStaticBinary
     | ShipCross String
     | ShipDesktop
-    | ShipSolo
-    | ShipSoloDesktop
-    | ShipSoloIos
-    | ShipSoloAndroid
+    | ShipClient
+    | ShipClientDesktop
+    | ShipClientIos
+    | ShipClientAndroid
 
 
 -- | The shape's own co-located artifact on the host triple (for `web`,
@@ -155,28 +155,28 @@ desktop =
     ShipDesktop
 
 
--- | The `web solo` browser wasm bundle. Web shape only.
-solo : Ship
-solo =
-    ShipSolo
+-- | The `web client` browser wasm bundle. Web shape only.
+client : Ship
+client =
+    ShipClient
 
 
--- | The `web solo desktop` wasm bundle plus a native webview shell.
-soloDesktop : Ship
-soloDesktop =
-    ShipSoloDesktop
+-- | The `web client desktop` wasm bundle plus a native webview shell.
+clientDesktop : Ship
+clientDesktop =
+    ShipClientDesktop
 
 
--- | The `web solo ios` wasm bundle plus an iOS shell.
-soloIos : Ship
-soloIos =
-    ShipSoloIos
+-- | The `web client ios` wasm bundle plus an iOS shell.
+clientIos : Ship
+clientIos =
+    ShipClientIos
 
 
--- | The `web solo android` wasm bundle plus an Android shell.
-soloAndroid : Ship
-soloAndroid =
-    ShipSoloAndroid
+-- | The `web client android` wasm bundle plus an Android shell.
+clientAndroid : Ship
+clientAndroid =
+    ShipClientAndroid
 
 
 -- | Configuration for the `web desktop` (webview-native) host.
@@ -190,11 +190,26 @@ type alias DesktopConfig =
     }
 
 
--- | Configuration for the `web solo ios` / `web solo android` mobile hosts.
+-- | Configuration for the `web client ios` / `web client android` mobile hosts.
 --
--- `bundleId` is the reverse-DNS application identifier required by both
--- platforms (`com.example.myapp`). `orientation` locks the device orientation
--- on launch; the host's native shell enforces it. `push` names the identifiers
+-- `bundleId` is the reverse-DNS application identifier both platforms install
+-- the app under (`com.example.myapp`): two or more `.`-separated labels, each an
+-- ASCII letter then ASCII letters or digits, at most 128 bytes in all, no
+-- label a Java reserved word, and a first label other than `java` (the Java
+-- platform's own packages); the manifest refuses any other value. Android
+-- (package and application id) and iOS (`CFBundleIdentifier`) use it verbatim.
+-- An absent `bundleId` is `com.ipe.` followed by the lowercased letters and
+-- digits of the package name.
+--
+-- `orientation` is the orientation the app runs in; an absent one is `Any`.
+-- `Portrait` locks portrait (Android `portrait`; iOS portrait only). `Landscape`
+-- locks landscape, either side up (Android `sensorLandscape`; iOS landscape left
+-- and right). `Any` rotates freely (Android `unspecified`; iOS portrait and both
+-- landscapes, plus upside down on iPad). A locked orientation also opts the iPad
+-- app out of split-screen multitasking (`UIRequiresFullScreen`). The lock is
+-- advisory where the platform overrides it: iPadOS releases that ignore
+-- `UIRequiresFullScreen` for resizable windows, and Android large screens for an
+-- app targeting API 36 or later. `push` names the identifiers
 -- the shells register for push messages with; it is refused unless
 -- `capabilities.accepts` lists `JsPort Push`, and an iOS or Android pack of an
 -- app that accepts `JsPort Push` is refused without it.
@@ -240,7 +255,7 @@ type Orientation
 
 -- | Configuration for the browser host.
 --
--- `basePath` is the URL path the client bundle is served at: the `web solo`
+-- `basePath` is the URL path the client bundle is served at: the `web client`
 -- host, static hosts, and mobile shells all serve the bundle under it. Use
 -- `"/"` (or `""`) for the root and `"/app"` when the client lives at a sub-path
 -- behind a reverse proxy. Any other value is one or more `/segment` parts, each
@@ -359,7 +374,7 @@ type WasmClient
 
 -- | The rendering strategy of a wasm client bundle.
 type WasmMode
-    = Solo
+    = Render
     | Hydrate
 
 

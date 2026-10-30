@@ -131,7 +131,7 @@ pub(crate) const SHAPE_ENTRIES: &[(&[&str], &str, MainShape)] = &[
     // of the TEA loop. It pins the first-class `MainShape::Worker`, whose control
     // model discloses as `Tea` (a managed `init`/`update`/`subscriptions` loop),
     // not `Direct`. A worker is co-located and capability-gated: its runtime is
-    // fixed to `Served` (never the sandboxed `Solo` — no view sink, no wasm
+    // fixed to `Served` (never the sandboxed `Client` — no view sink, no wasm
     // bundle path, which stays behind the closed `Ipe.Tea.Web` shape entry).
     (&["Ipe", "Tea", "Worker"], "tea", MainShape::Worker),
 ];
@@ -709,7 +709,7 @@ mod tests {
         // A `Worker.tea { … }` head pins the first-class `Worker` shape — the
         // view-less corner of the TEA loop. Its control model discloses as `Tea`
         // (a managed `init`/`update`/`subscriptions` loop), NOT `Direct`. A worker
-        // is never Web, so it can never reach the Solo/wasm sandbox path (gated
+        // is never Web, so it can never reach the Client/wasm sandbox path (gated
         // behind the closed `Ipe.Tea.Web` shape entry): NO `SHAPE_ENTRIES` row maps
         // a worker to `MainShape::Web`.
         let shape = classify(
@@ -723,12 +723,12 @@ mod tests {
             "a worker discloses as the managed TEA loop, not a run-to-completion program"
         );
         // The co-located placement is the ONLY one a worker can hold: `sole_for`
-        // fixes its runtime to `Served`, so `Runtime::Solo` — the sandbox — is
+        // fixes its runtime to `Served`, so `Runtime::Client` — the sandbox — is
         // unrepresentable for a worker (no view sink, no wasm bundle path).
         let placement = Placement::sole_for(Shape::from_main(shape))
             .expect("a worker has a sole co-located placement");
         assert_eq!(placement.runtime, Runtime::Served);
-        assert_ne!(placement.runtime, Runtime::Solo);
+        assert_ne!(placement.runtime, Runtime::Client);
     }
 
     #[test]
