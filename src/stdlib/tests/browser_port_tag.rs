@@ -20,6 +20,7 @@ struct Internals {
 }
 
 impl Internals {
+    #[allow(clippy::expect_used)] // A test helper: interning a short ASCII name cannot fail.
     fn symbol(&mut self, name: &str) -> Symbol {
         self.interner.intern(name).expect("a short name interns")
     }

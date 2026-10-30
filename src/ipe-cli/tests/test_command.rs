@@ -1202,13 +1202,13 @@ fn frame_record(first: bool, label: &str, frame: &str) -> String {
 /// `inboundFor` must accept exactly the frame naming its own permission.
 fn port_tag_matrix_entry() -> String {
     use ipe_runtime_rust::js_port_glue::PERMISSION_NAMES;
-    let mut source = String::from("module Main exposing (main)\n\n");
+    let mut source = vec![String::from("module Main exposing (main)\n\n")];
     for (alias, ..) in PORT_MODULES {
-        source.push_str(&format!(
+        source.push(format!(
             "import Ipe.Browser.{alias}.Internals as {alias}Port\n"
         ));
     }
-    source.push_str(
+    source.push(String::from(
         "import Ipe.Json.Decode as Decode\n\
          import Ipe.List as List\n\
          import Ipe.Result as Result exposing (Result(..))\n\
@@ -1223,68 +1223,69 @@ fn port_tag_matrix_entry() -> String {
          accepted pool accept =\n    \
          List.map (\\f -> f.label) (List.filter (\\f -> accept f.frame) pool)\n\n\n\
          frames : List Frame\nframes =\n",
-    );
+    ));
     let mut first = true;
     for (_, tag, body, _) in PORT_MODULES {
-        source.push_str(&frame_record(
+        source.push(frame_record(
             first,
             tag,
             &format!("{{\"tag\":\"{tag}\",{body}}}"),
         ));
         first = false;
-        source.push_str(&frame_record(
+        source.push(frame_record(
             false,
             &format!("{tag}-untagged"),
             &format!("{{{body}}}"),
         ));
     }
     for (label, frame) in FORGED_FRAMES {
-        source.push_str(&frame_record(false, label, frame));
+        source.push(frame_record(false, label, frame));
     }
-    source.push_str("    ]\n\n\nnames : List Frame\nnames =\n");
+    source.push("    ]\n\n\nnames : List Frame\nnames =\n".to_owned());
     let mut first = true;
     for (_, token) in PERMISSION_NAMES {
         let body = format!("\"ok\":false,\"error\":\"unavailable\",\"name\":\"{token}\"");
-        source.push_str(&frame_record(
+        source.push(frame_record(
             first,
             token,
             &format!("{{\"tag\":\"permission\",{body}}}"),
         ));
         first = false;
-        source.push_str(&frame_record(
+        source.push(frame_record(
             false,
             &format!("{token}-untagged"),
             &format!("{{{body}}}"),
         ));
-        source.push_str(&frame_record(
+        source.push(frame_record(
             false,
             &format!("{token}-as-geolocation"),
             &format!("{{\"tag\":\"geolocation\",{body}}}"),
         ));
     }
-    source.push_str("    ]\n\n\ntests : List Test\ntests =\n    [ Test.suite \"tag gate\"\n");
+    source
+        .push("    ]\n\n\ntests : List Test\ntests =\n    [ Test.suite \"tag gate\"\n".to_owned());
     let mut first = true;
     for (alias, tag, _, decoders) in PORT_MODULES {
         for decoder in *decoders {
             let lead = if first { "[" } else { "," };
             first = false;
-            let expr = match decoder.strip_prefix('(') {
-                Some(applied) => format!("({alias}Port.{applied}"),
-                None => format!("{alias}Port.{decoder}"),
-            };
-            source.push_str(&format!(
+            let expr = decoder.strip_prefix('(').map_or_else(
+                || format!("{alias}Port.{decoder}"),
+                |applied| format!("({alias}Port.{applied}"),
+            );
+            source.push(format!(
                 "        {lead} Test.test {} (\\_ -> Test.equal [ {} ] (accepted frames (accepts {expr})))\n",
                 ipe_string(&format!("{alias}.{decoder}")),
                 ipe_string(tag),
             ));
         }
     }
-    source.push_str("        ]\n    , Test.suite \"name gate\"\n");
+    source.push("        ]\n    , Test.suite \"name gate\"\n".to_owned());
     let mut first = true;
     for (ctor, token) in PERMISSION_NAMES {
         let lead = if first { "[" } else { "," };
         first = false;
-        source.push_str(&format!(
+        source.push(format!(
             "        {lead} Test.test {} (\\_ -> Test.equal [ {} ] (accepted names (accepts (PermissionPort.inboundFor PermissionPort.{ctor}))))\n\
              \x20       , Test.test {} (\\_ -> Test.equal {} (PermissionPort.nameToken PermissionPort.{ctor}))\n",
             ipe_string(&format!("inboundFor {ctor}")),
@@ -1293,8 +1294,8 @@ fn port_tag_matrix_entry() -> String {
             ipe_string(token),
         ));
     }
-    source.push_str("        ]\n    ]\n\n\nmain =\n    Test.runMain tests\n");
-    source
+    source.push("        ]\n    ]\n\n\nmain =\n    Test.runMain tests\n".to_owned());
+    source.concat()
 }
 
 /// Every port decoder accepts only its own capability's tagged frames.
