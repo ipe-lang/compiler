@@ -2,14 +2,17 @@
 //!
 //! The tag a module accepts is its `portTag` literal, asserted equal to the wire
 //! name of the capability its import path discloses, and every decoder the
-//! module exposes or hands to `Js.request`/`Js.subscribe` reads that tag first.
+//! module exposes or hands to any `Ipe.Ffi.Js` member reads that tag first. Only
+//! these modules reach the port, and every port use is visible to the scan.
 
 use std::collections::BTreeSet;
 
 use ipe_intern::{Interner, Symbol};
 use ipe_kernels::WebCapability;
-use ipe_stdlib::COMPILED_STD_MODULES;
-use ipe_syntax::{Exposed, Exposing, Expr, Expr_, Module, Pattern_, TypeAnnotation, Value};
+use ipe_stdlib::{COMPILED_STD_MODULES, MODULES};
+use ipe_syntax::{
+    Exposed, Exposing, Expr, Expr_, Module, Pattern, Pattern_, TypeAnnotation, Value,
+};
 
 /// One parsed `Ipe.Browser.<Api>.Internals` module and the names it is read by.
 struct Internals {
@@ -71,9 +74,14 @@ fn result_type(annotation: &TypeAnnotation) -> &TypeAnnotation {
     }
 }
 
+/// How many top-level references `gated` follows from a decoder to its gate
+/// (`subscribeReply` applies `reply`, whose body is the gate).
+const FOLLOW_DEPTH: usize = 3;
+
 /// Whether `expr` is `Decode.andThen (gateTag body) (Decode.field "tag" Decode.string)`,
-/// directly or as the body of the one local binding it names or applies.
-fn gated(internals: &mut Internals, expr: &Expr, follow: bool) -> bool {
+/// directly or as the body of a top-level value it names or applies, at most
+/// `depth` references away.
+fn gated(internals: &mut Internals, expr: &Expr, depth: usize) -> bool {
     let decode = internals.symbol("Decode");
     let and_then = internals.symbol("andThen");
     let field = internals.symbol("field");
@@ -105,9 +113,9 @@ fn gated(internals: &mut Internals, expr: &Expr, follow: bool) -> bool {
         );
         return gate_ok && read_ok;
     }
-    if !follow {
+    let Some(depth) = depth.checked_sub(1) else {
         return false;
-    }
+    };
     let target = match &expr.value {
         Expr_::VarLocal(name) => Some(*name),
         Expr_::Call(callee, _) => match &callee.value {
@@ -117,7 +125,7 @@ fn gated(internals: &mut Internals, expr: &Expr, follow: bool) -> bool {
         _ => None,
     };
     let body = target.and_then(|name| internals.value(name).map(|v| v.body.clone()));
-    body.is_some_and(|body| gated(internals, &body, false))
+    body.is_some_and(|body| gated(internals, &body, depth))
 }
 
 /// `gateTag body tag = if tag == portTag then body else Decode.fail "<constant>"`.
@@ -163,60 +171,187 @@ fn gate_tag_compares_with_port_tag(internals: &mut Internals) -> bool {
     compares && passes && refuses_without_echo
 }
 
-/// The decoder argument of every `Js.request cmd decoder` / `Js.subscribe decoder toMsg`.
-fn port_decoders(internals: &mut Internals) -> Vec<Expr> {
-    let js = internals.symbol("Js");
-    let request = internals.symbol("request");
-    let subscribe = internals.symbol("subscribe");
-    let mut found = Vec::new();
-    let mut stack: Vec<Expr> = internals
-        .module
-        .values
-        .iter()
-        .map(|v| v.value.body.clone())
-        .collect();
-    while let Some(expr) = stack.pop() {
-        match expr.value {
-            Expr_::Call(callee, args) => {
-                let position = match &callee.value {
-                    Expr_::VarQual(q, m) if *q == js && *m == request => Some(1),
-                    Expr_::VarQual(q, m) if *q == js && *m == subscribe => Some(0),
-                    _ => None,
-                };
-                if let Some(decoder) = position.and_then(|p| args.get(p)) {
-                    found.push(decoder.clone());
-                }
-                stack.push(*callee);
-                stack.extend(args);
-            }
-            Expr_::Case(scrutinee, arms) => {
-                stack.push(*scrutinee);
-                stack.extend(arms.into_iter().map(|(_, rhs)| rhs));
-            }
-            Expr_::Lambda(_, body) | Expr_::Access(body, _) => stack.push(*body),
-            Expr_::Binops(operands, last) => {
-                stack.extend(operands.into_iter().map(|(operand, _)| operand));
-                stack.push(*last);
-            }
-            Expr_::Let(bindings, body) => {
-                stack.extend(bindings.into_iter().map(|b| b.body));
-                stack.push(*body);
-            }
-            Expr_::If(branches, otherwise) => {
-                for (condition, branch) in branches {
-                    stack.push(condition);
-                    stack.push(branch);
-                }
-                stack.push(*otherwise);
-            }
-            Expr_::Tuple(items) | Expr_::List(items) => stack.extend(items),
-            Expr_::Record(fields) | Expr_::Update(_, fields) => {
-                stack.extend(fields.into_iter().map(|(_, value)| value));
-            }
-            _ => {}
+/// Which argument of each `Ipe.Ffi.Js` member is a decoder; `None` for a member
+/// that takes none.
+///
+/// `js_decoder_positions_match_the_ffi_signatures` holds it to the `Ipe.Ffi.Js`
+/// annotations, so a new member cannot reach a port call site unclassified.
+const JS_DECODER_POSITION: &[(&str, Option<usize>)] = &[
+    ("send", None),
+    ("subscribe", Some(0)),
+    ("request", Some(1)),
+    ("openSession", Some(1)),
+    ("sessionFrames", Some(1)),
+    ("sendToSession", None),
+    ("closeSession", Some(2)),
+];
+
+/// What one walk of a module finds at its port.
+#[derive(Default)]
+struct PortScan {
+    /// The decoder argument of every saturated `Js.<member>` call that takes one.
+    decoders: Vec<Expr>,
+    /// Every `Js.<member>` use whose decoder the walk cannot see.
+    unseen: Vec<String>,
+    /// Every name a parameter, lambda, `let` or `case` pattern binds.
+    binders: Vec<Symbol>,
+}
+
+/// Each name `pattern` binds.
+fn pattern_binders(pattern: &Pattern, out: &mut Vec<Symbol>) {
+    match &pattern.value {
+        Pattern_::PVar(name) => out.push(*name),
+        Pattern_::PAlias(inner, name) => {
+            out.push(name.value);
+            pattern_binders(inner, out);
         }
+        Pattern_::PRecord(fields) => out.extend(fields.iter().map(|f| f.value)),
+        Pattern_::PCtor(_, _, items)
+        | Pattern_::PTuple(items)
+        | Pattern_::PList(items)
+        | Pattern_::POr(items) => {
+            for item in items {
+                pattern_binders(item, out);
+            }
+        }
+        Pattern_::PCons(head, tail) => {
+            pattern_binders(head, out);
+            pattern_binders(tail, out);
+        }
+        Pattern_::PAnything
+        | Pattern_::PDebugAnything
+        | Pattern_::PUnit
+        | Pattern_::PInt(_)
+        | Pattern_::PBool(_)
+        | Pattern_::PChar(_)
+        | Pattern_::PStr(_) => {}
     }
-    found
+}
+
+/// The decoder position of `Js.<member>`, or `Err` naming a member the table lacks.
+fn js_member(internals: &Internals, member: Symbol) -> Result<Option<usize>, String> {
+    let text = internals.text(member);
+    JS_DECODER_POSITION
+        .iter()
+        .find(|(name, _)| *name == text)
+        .map(|(_, position)| *position)
+        .ok_or_else(|| format!("unknown member Js.{text}"))
+}
+
+/// Walks `expr`, recording port decoders, unseen port uses and local binders.
+fn scan(internals: &Internals, js: Symbol, expr: &Expr, out: &mut PortScan) {
+    match &expr.value {
+        Expr_::Call(callee, args) => {
+            if let Expr_::VarQual(q, member) = &callee.value
+                && *q == js
+            {
+                match js_member(internals, *member) {
+                    Ok(Some(position)) => match args.get(position) {
+                        Some(decoder) => out.decoders.push(decoder.clone()),
+                        None => out.unseen.push(format!(
+                            "Js.{} applied without its decoder",
+                            internals.text(*member)
+                        )),
+                    },
+                    Ok(None) => {}
+                    Err(unknown) => out.unseen.push(unknown),
+                }
+            } else {
+                scan(internals, js, callee, out);
+            }
+            for arg in args {
+                scan(internals, js, arg, out);
+            }
+        }
+        Expr_::VarQual(q, member) if *q == js => match js_member(internals, *member) {
+            Ok(None) => {}
+            Ok(Some(_)) => out
+                .unseen
+                .push(format!("Js.{} passed as a value", internals.text(*member))),
+            Err(unknown) => out.unseen.push(unknown),
+        },
+        Expr_::Case(scrutinee, arms) => {
+            scan(internals, js, scrutinee, out);
+            for (pattern, rhs) in arms {
+                pattern_binders(pattern, &mut out.binders);
+                scan(internals, js, rhs, out);
+            }
+        }
+        Expr_::Lambda(patterns, body) => {
+            for pattern in patterns {
+                pattern_binders(pattern, &mut out.binders);
+            }
+            scan(internals, js, body, out);
+        }
+        Expr_::Access(body, _) => scan(internals, js, body, out),
+        Expr_::Binops(operands, last) => {
+            for (operand, _) in operands {
+                scan(internals, js, operand, out);
+            }
+            scan(internals, js, last, out);
+        }
+        Expr_::Let(bindings, body) => {
+            for binding in bindings {
+                pattern_binders(&binding.pat, &mut out.binders);
+                scan(internals, js, &binding.body, out);
+            }
+            scan(internals, js, body, out);
+        }
+        Expr_::If(branches, otherwise) => {
+            for (condition, branch) in branches {
+                scan(internals, js, condition, out);
+                scan(internals, js, branch, out);
+            }
+            scan(internals, js, otherwise, out);
+        }
+        Expr_::Tuple(items) | Expr_::List(items) => {
+            for item in items {
+                scan(internals, js, item, out);
+            }
+        }
+        Expr_::Record(fields) | Expr_::Update(_, fields) => {
+            for (_, value) in fields {
+                scan(internals, js, value, out);
+            }
+        }
+        Expr_::VarLocal(_)
+        | Expr_::VarQual(..)
+        | Expr_::TaskAndThen
+        | Expr_::Int(_)
+        | Expr_::Float(_)
+        | Expr_::Str(_)
+        | Expr_::MultilineStr { .. }
+        | Expr_::Char(_)
+        | Expr_::Unit => {}
+    }
+}
+
+/// One walk over every top-level value of the module.
+fn port_scan(internals: &mut Internals) -> PortScan {
+    let js = internals.symbol("Js");
+    let mut out = PortScan::default();
+    for value in &internals.module.values {
+        for pattern in &value.value.patterns {
+            pattern_binders(pattern, &mut out.binders);
+        }
+        scan(internals, js, &value.value.body, &mut out);
+    }
+    out
+}
+
+/// Every stdlib module, embedded or compiled, parsed with its dotted name.
+fn every_stdlib_module() -> Vec<(&'static str, Module, Interner)> {
+    let compiled = COMPILED_STD_MODULES.iter().map(|m| (m.dotted, m.source));
+    let embedded = MODULES.iter().map(|m| (m.name, m.source));
+    compiled
+        .chain(embedded)
+        .filter_map(|(dotted, source)| {
+            let mut interner = Interner::new();
+            let module = ipe_parse::parse_module(source, &mut interner);
+            assert!(module.is_ok(), "{dotted} does not parse");
+            Some((dotted, module.ok()?, interner))
+        })
+        .collect()
 }
 
 /// Each module's `portTag` is the wire name of the capability its path discloses,
@@ -296,18 +431,152 @@ fn every_port_decoder_reads_its_tag_first() {
             exposed_decoders += 1;
             let text = internals.text(name).to_owned();
             assert!(
-                gated(&mut internals, &value.body, true),
+                gated(&mut internals, &value.body, FOLLOW_DEPTH),
                 "{dotted}.{text} decodes a frame without reading its tag first"
             );
         }
         assert!(exposed_decoders > 0, "{dotted} exposes no decoder");
-        let decoders = port_decoders(&mut internals);
-        assert!(!decoders.is_empty(), "{dotted} has no port call site");
-        for decoder in decoders {
+        let scan = port_scan(&mut internals);
+        assert!(
+            scan.unseen.is_empty(),
+            "{dotted} reaches the port where its decoder cannot be judged: {:?}",
+            scan.unseen
+        );
+        let shadowing: Vec<&str> = scan
+            .binders
+            .iter()
+            .filter(|binder| {
+                internals
+                    .module
+                    .values
+                    .iter()
+                    .any(|v| v.value.name.value == **binder)
+            })
+            .map(|binder| internals.text(*binder))
+            .collect();
+        assert!(
+            shadowing.is_empty(),
+            "{dotted} binds a local over a top-level name the gate reads: {shadowing:?}"
+        );
+        assert!(!scan.decoders.is_empty(), "{dotted} has no port call site");
+        for decoder in scan.decoders {
             assert!(
-                gated(&mut internals, &decoder, true),
+                gated(&mut internals, &decoder, FOLLOW_DEPTH),
                 "{dotted} hands the port a decoder that does not read its tag first"
             );
+        }
+    }
+}
+
+/// `JS_DECODER_POSITION` names every value `Ipe.Ffi.Js` exposes, each with the
+/// one argument its annotation types as a `Decoder`.
+#[test]
+fn js_decoder_positions_match_the_ffi_signatures() {
+    let modules = every_stdlib_module();
+    let js = modules
+        .iter()
+        .find(|(dotted, _, _)| *dotted == "Ipe.Ffi.Js");
+    assert!(js.is_some(), "Ipe.Ffi.Js is not a stdlib module");
+    let Some((_, module, interner)) = js else {
+        return;
+    };
+    let Exposing::List(items) = &module.exposing.value else {
+        assert!(
+            matches!(module.exposing.value, Exposing::List(_)),
+            "Ipe.Ffi.Js exposes everything"
+        );
+        return;
+    };
+    let mut seen = Vec::new();
+    for item in items {
+        let Exposed::Value(name) = &item.value else {
+            continue;
+        };
+        let text = interner.resolve(*name).unwrap_or_default();
+        let value = module.values.iter().find(|v| v.value.name.value == *name);
+        let annotation = value.and_then(|v| v.value.type_annotation.as_ref());
+        assert!(annotation.is_some(), "Js.{text} has no annotation");
+        let mut positions = Vec::new();
+        let mut cursor = annotation.map(|a| &a.value);
+        let mut index = 0usize;
+        while let Some(TypeAnnotation::TLambda(argument, result)) = cursor {
+            if matches!(
+                argument.as_ref(),
+                TypeAnnotation::TType(_, segments, _)
+                    if segments.last().and_then(|s| interner.resolve(*s)) == Some("Decoder")
+            ) {
+                positions.push(index);
+            }
+            index += 1;
+            cursor = Some(result.as_ref());
+        }
+        let expected = JS_DECODER_POSITION
+            .iter()
+            .find(|(member, _)| *member == text)
+            .map(|(_, position)| *position);
+        assert!(
+            positions.len() <= 1,
+            "Js.{text} takes more than one decoder"
+        );
+        assert_eq!(
+            expected,
+            Some(positions.first().copied()),
+            "Js.{text}'s decoder position is not the one JS_DECODER_POSITION lists"
+        );
+        seen.push(text.to_owned());
+    }
+    let mut listed: Vec<&str> = JS_DECODER_POSITION.iter().map(|(m, _)| *m).collect();
+    listed.sort_unstable();
+    seen.sort_unstable();
+    assert_eq!(
+        seen, listed,
+        "JS_DECODER_POSITION and Ipe.Ffi.Js's values differ"
+    );
+}
+
+/// Only an `Ipe.Browser.<Api>.Internals` module reaches the port, through
+/// `import Ipe.Ffi.Js as Js` with no exposing list, and its `Decode` qualifier
+/// is `Ipe.Json.Decode`; no module but `Ipe.Ffi.Js` names a `Js_` kernel.
+#[test]
+fn only_browser_internals_reach_the_port_through_the_js_qualifier() {
+    for (dotted, module, interner) in every_stdlib_module() {
+        let source = COMPILED_STD_MODULES
+            .iter()
+            .map(|m| (m.dotted, m.source))
+            .chain(MODULES.iter().map(|m| (m.name, m.source)))
+            .find(|(name, _)| *name == dotted)
+            .map(|(_, source)| source)
+            .unwrap_or_default();
+        if dotted != "Ipe.Ffi.Js" {
+            assert!(
+                !source.contains("\"Js_"),
+                "{dotted} names a Js_ kernel outside Ipe.Ffi.Js"
+            );
+        }
+        let segments: Vec<&str> = dotted.split('.').collect();
+        let internals = matches!(segments.as_slice(), ["Ipe", "Browser", _, "Internals"]);
+        for import in &module.imports {
+            let name: Vec<&str> = import
+                .name
+                .value
+                .iter()
+                .map(|s| interner.resolve(*s).unwrap_or_default())
+                .collect();
+            let alias = import.alias.and_then(|a| interner.resolve(a));
+            let bare = matches!(&import.exposing.value, Exposing::List(items) if items.is_empty());
+            if name == ["Ipe", "Ffi", "Js"] {
+                assert!(internals, "{dotted} imports Ipe.Ffi.Js");
+                assert!(
+                    alias == Some("Js") && bare,
+                    "{dotted} imports Ipe.Ffi.Js other than `as Js` with no exposing list"
+                );
+            } else if internals {
+                assert!(alias != Some("Js"), "{dotted} aliases another module as Js");
+                assert!(
+                    alias != Some("Decode") || name == ["Ipe", "Json", "Decode"],
+                    "{dotted} aliases another module as Decode"
+                );
+            }
         }
     }
 }

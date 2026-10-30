@@ -163,74 +163,89 @@ fn filtered_changes_api_type_checks() {
 /// maps to a distinct wire token.
 ///
 /// The gate in `inboundFor name` accepts a frame iff its `name` field equals
-/// `nameToken name`. If two permissions shared a token, one permission's frames
-/// would pass the other's gate — reintroducing the very cross-talk this fix
-/// removes. This gate compiles a helper that lists every name's token as a
-/// distinct top-level binding (totality is proven by the exhaustive Ipê `case`)
-/// and asserts, over the SSOT mirrored here, that the tokens are pairwise
-/// distinct. The mirror is checked against the module source so the two cannot
-/// drift silently.
+/// `nameToken name`, so two permissions sharing a token would let one's frames
+/// pass the other's gate.
+///
+/// The parsed `PermissionName` constructors, the parsed `nameToken` arms and the
+/// glue's `PERMISSION_NAMES` (the token table the first-party sink queries) are
+/// one mapping, and its tokens are pairwise distinct. A constructor, arm or glue
+/// row added on one side alone turns this red.
 #[test]
+#[allow(clippy::expect_used)] // A test: the stdlib module and its names must exist.
 fn name_tokens_are_pairwise_distinct() {
-    // Mirror of `Ipe.Browser.Permission.Internals.nameToken`. Kept honest by the
-    // source-equality check below: if the module gains, drops, or renames a name
-    // or token, this test's own source scan fails until the mirror is updated.
-    let expected: &[(&str, &str)] = &[
-        ("Camera", "camera"),
-        ("Microphone", "microphone"),
-        ("Geolocation", "geolocation"),
-        ("Notifications", "notifications"),
-        ("PersistentStorage", "persistent-storage"),
-        ("ClipboardRead", "clipboard-read"),
-        ("ClipboardWrite", "clipboard-write"),
-        ("MidiSysex", "midi"),
-    ];
-
-    // Injectivity: no two names share a token.
-    let mut seen = BTreeSet::new();
-    for (name, token) in expected {
-        assert!(
-            seen.insert(*token),
-            "permission name `{name}` reuses wire token `{token}` — a per-name \
-             filter gate is only sound if every permission's token is distinct",
-        );
-    }
-
-    // SSOT anti-drift: every mirrored (name, token) pair appears verbatim in the
-    // module source, and the source lists no other `PermissionName` constructor
-    // in `nameToken`. A rename/add/drop breaks this before it can desync the gate.
-    let src = ipe_stdlib::COMPILED_STD_MODULES
+    let source = ipe_stdlib::COMPILED_STD_MODULES
         .iter()
         .find(|m| m.dotted == "Ipe.Browser.Permission.Internals")
         .map(|m| m.source)
         .expect("Permission.Internals is a compiled-source stdlib module");
-    for (name, token) in expected {
+    let mut interner = ipe_intern::Interner::new();
+    let module =
+        ipe_parse::parse_module(source, &mut interner).expect("Permission.Internals parses");
+    let permission_name = interner.intern("PermissionName").expect("a name interns");
+    let name_token = interner.intern("nameToken").expect("a name interns");
+
+    let ctors: BTreeSet<&str> = module
+        .unions
+        .iter()
+        .find(|u| u.value.name.value == permission_name)
+        .expect("Permission.Internals declares PermissionName")
+        .value
+        .ctors
+        .iter()
+        .filter_map(|c| interner.resolve(c.value.name))
+        .collect();
+
+    let body = &module
+        .values
+        .iter()
+        .find(|v| v.value.name.value == name_token)
+        .expect("Permission.Internals defines nameToken")
+        .value
+        .body
+        .value;
+    let ipe_syntax::Expr_::Case(_, arms) = body else {
         assert!(
-            src.contains(&format!("\"{token}\"")),
-            "wire token `{token}` (for `{name}`) is absent from \
-             Permission.Internals source — the mirror has drifted from the SSOT",
+            matches!(body, ipe_syntax::Expr_::Case(..)),
+            "nameToken is not one case over PermissionName"
         );
+        return;
+    };
+    let mut tokens: BTreeMap<&str, &str> = BTreeMap::new();
+    for (pattern, rhs) in arms {
+        let arm = match (&pattern.value, &rhs.value) {
+            (ipe_syntax::Pattern_::PCtor(ctor, _, args), ipe_syntax::Expr_::Str(token))
+                if args.is_empty() =>
+            {
+                interner.resolve(*ctor).map(|ctor| (ctor, token.as_str()))
+            }
+            _ => None,
+        };
+        assert!(arm.is_some(), "a nameToken arm is not `Ctor -> \"token\"`");
+        if let Some((ctor, token)) = arm {
+            assert!(
+                tokens.insert(ctor, token).is_none(),
+                "nameToken repeats {ctor}"
+            );
+        }
     }
-    // The `PermissionName` type declares exactly these eight constructors; assert
-    // the count so a ninth name added without a token (or a token without a name)
-    // trips here rather than silently escaping the gate.
-    let ctor_count = [
-        "Camera",
-        "Microphone",
-        "Geolocation",
-        "Notifications",
-        "PersistentStorage",
-        "ClipboardRead",
-        "ClipboardWrite",
-        "MidiSysex",
-    ]
-    .iter()
-    .filter(|c| src.contains(&format!("| {c}")) || src.contains(&format!("= {c}")))
-    .count();
+
+    let glue: BTreeMap<&str, &str> = ipe_runtime_rust::js_port_glue::PERMISSION_NAMES
+        .iter()
+        .copied()
+        .collect();
     assert_eq!(
-        ctor_count,
-        expected.len(),
-        "the `PermissionName` constructor set drifted from the token mirror; every \
-         permission name needs a distinct `nameToken` arm for the filter to hold",
+        tokens, glue,
+        "nameToken and the glue's PERMISSION_NAMES name different tokens"
+    );
+    assert_eq!(
+        ctors,
+        tokens.keys().copied().collect::<BTreeSet<_>>(),
+        "PermissionName and nameToken name different permissions"
+    );
+    let distinct: BTreeSet<&str> = tokens.values().copied().collect();
+    assert_eq!(
+        distinct.len(),
+        tokens.len(),
+        "two permission names share a wire token"
     );
 }
