@@ -4702,11 +4702,12 @@ fn imported_builtin_home(env: &Env, name: Symbol, row: BuiltinType) -> Option<Ve
 /// the exporting module's own path.
 fn reexported_builtin_type_home(
     resolved: &str,
+    row: BuiltinType,
     home: &[Symbol],
     interner: &Interner,
 ) -> Vec<Symbol> {
     if !HOME_SENSITIVE_BUILTIN_TYPES.contains(&resolved)
-        || terminal_attribute_builtin(home, resolved, interner).is_some()
+        || terminal_attribute_builtin(home, row, interner).is_some()
     {
         return home.to_owned();
     }
@@ -4812,7 +4813,7 @@ fn build_module_exports(
                             // constructors (a builtin carrier has none at source).
                             let builtin_home = imported_builtin_home(env, *type_name, row)
                                 .unwrap_or_else(|| {
-                                    reexported_builtin_type_home(resolved, home, interner)
+                                    reexported_builtin_type_home(resolved, row, home, interner)
                                 });
                             exports.types.insert(
                                 *type_name,
@@ -6700,12 +6701,9 @@ fn source_qualified_type<'a>(
                 )),
             },
         }),
-        (Some(row), None, _) => Ok(TypeTarget::Builtin(BoundBuiltin {
-            row,
-            home: qualified_type_home(qualifier, name, ctx)?,
-        })),
+        (Some(row), None, _) => Ok(TypeTarget::Builtin(qualified_builtin(qualifier, row, ctx)?)),
         (Some(_), Some(_), Some(_)) | (None, _, _) => Ok(TypeTarget::Union(UnionHome::of(
-            qualified_type_home(qualifier, name, ctx)?,
+            qualifier_home(qualifier, ctx)?,
         )?)),
     }
 }
@@ -6729,50 +6727,50 @@ fn ambiguous_import(
     })
 }
 
-/// The home of a qualified union reference `qualifier.name` that names no alias.
+/// The module path a source qualifier denotes: the home of a union its
+/// module declares.
 ///
 /// `qualifier` is owned by a source module, so it has a path in
 /// `qualifier_paths`; a kernel-module qualifier never reaches here.
 ///
-/// Html-family builtin force-home: `fold_html_stdlib_qualifier_homes` registers
-/// an Html-family stdlib qualifier's real dep path, but the reserved builtin
-/// VIEW-TYPE names (`Attribute`/`Html`) must lower to the `["Html"]` carrier the
-/// HM constrainer and the lowerer's `is_html` check both expect. So a
-/// reserved-builtin name under an Html-family qualifier force-homes to
-/// `["Html"]`. A compiled-source ADT declared in `Ipe.Html.Attributes` (e.g.
-/// `Attr.LinkTarget`) is NOT a reserved builtin, so it keeps its real module
-/// home; homing it to `["Html"]` would mint a phantom `html::LinkTarget` the
-/// runtime has no type for. `Ui.Attribute` (a non-Html qualifier) is untouched
-/// — it falls through to the empty Ui sentinel.
-///
 /// # Errors
 /// [`Diagnostic::CompilerBug`] for a qualifier with no path.
-fn qualified_type_home(qualifier: Symbol, name: Symbol, ctx: &TypeCtx) -> DResult<Vec<Symbol>> {
-    let qualifier_home = ctx
-        .qualifier_paths
+fn qualifier_home(qualifier: Symbol, ctx: &TypeCtx) -> DResult<Vec<Symbol>> {
+    ctx.qualifier_paths
         .get(&qualifier)
         .cloned()
         .ok_or_else(|| Diagnostic::CompilerBug {
-            where_: "ipe_canon::qualified_type_home",
+            where_: "ipe_canon::qualifier_home",
             detail: "a source qualifier with no path".into(),
-        })?;
+        })
+}
+
+/// The binding of the builtin `row` spelled under a source qualifier whose
+/// dependency's exports are unknown (an Html-family stdlib fold).
+///
+/// Only a row reaches here, so the Html force-home acts on a witness, never on
+/// a spelling: `fold_html_stdlib_qualifier_homes` registers an Html-family
+/// qualifier's real dep path, and a builtin row under it mints the `["Html"]`
+/// carrier the HM constrainer and the lowerer's `is_html` check both expect. A
+/// union the module declares takes [`qualifier_home`], so a union named like a
+/// non-reserved row (`type Order` in a `*.Html.*` module) keeps its module's
+/// home.
+///
+/// # Errors
+/// [`Diagnostic::CompilerBug`] for a qualifier with no path.
+fn qualified_builtin(qualifier: Symbol, row: BuiltinType, ctx: &TypeCtx) -> DResult<BoundBuiltin> {
+    let qualifier_home = qualifier_home(qualifier, ctx)?;
     let qualifier_is_html_family = qualifier_home
         .iter()
         .any(|s| ctx.interner.resolve(*s) == Some("Html"));
-    let name_is_reserved_builtin = ctx
-        .interner
-        .resolve(name)
-        .is_some_and(is_reserved_builtin_type_name);
-    if qualifier_is_html_family && name_is_reserved_builtin {
-        // `Html` is interned by `fold_html_stdlib_qualifier_homes` whenever any
-        // Html-family import exists, so a hit here is the norm; the qualifier's
-        // own home is the fail-closed fallback.
-        return Ok(ctx
-            .interner
-            .lookup("Html")
-            .map_or(qualifier_home, |html| vec![html]));
-    }
-    Ok(qualifier_home)
+    // `Html` is interned by `fold_html_stdlib_qualifier_homes` whenever any
+    // Html-family import exists, so a hit is the norm; the qualifier's own home
+    // is the fail-closed fallback.
+    let home = match ctx.interner.lookup("Html") {
+        Some(html) if qualifier_is_html_family => vec![html],
+        Some(_) | None => qualifier_home,
+    };
+    Ok(BoundBuiltin { row, home })
 }
 
 /// Spend one node of a type expansion against its depth and node ceilings.
@@ -7364,19 +7362,16 @@ fn canonicalise_type(
             // canonicalises to that same builtin, so the documented type is
             // nameable. The bare form arity-fills its message parameter exactly
             // as the DOM `Attribute` does.
-            if let Some(builtin) = ctx
-                .interner
-                .resolve(name)
-                .and_then(|n| terminal_attribute_builtin(&home, n, ctx.interner))
+            if let Some(terminal) =
+                builtin.and_then(|row| terminal_attribute_builtin(&home, row, ctx.interner))
                 && can_args.len() <= 1
             {
-                let name = ctx
-                    .interner
-                    .lookup(builtin)
-                    .ok_or_else(|| Diagnostic::CompilerBug {
+                let name = ctx.interner.lookup(terminal.row().name()).ok_or_else(|| {
+                    Diagnostic::CompilerBug {
                         where_: "ipe_canon::canonicalise_type::terminal_attribute",
                         detail: "a terminal attribute builtin name is not interned".into(),
-                    })?;
+                    }
+                })?;
                 let args = if can_args.is_empty() {
                     vec![canon::Type::Wildcard]
                 } else {
@@ -7521,23 +7516,28 @@ fn type_arity_gate(
     }
 }
 
-/// The reserved builtin a terminal engine's `Attribute` resolves to:
+/// The reserved builtin a terminal engine's `Attribute` row resolves to:
 /// `Ipe.Ui.Tui.Attribute` (re-exposed by `Ipe.Ui.Cells`) is `TuiAttr`,
 /// `Ipe.Ui.Cli.Attribute` is `CliAttr`.
+///
+/// Keyed on the row witness (`BuiltinTag::UiAttribute`), so only a use bound
+/// to the `Attribute` row, never another type spelled `Attribute`, is a
+/// terminal attribute.
 fn terminal_attribute_builtin(
     home: &[Symbol],
-    name: &str,
+    row: BuiltinType,
     interner: &Interner,
-) -> Option<&'static str> {
-    if name != "Attribute" {
+) -> Option<BuiltinType> {
+    if row.row().tag() != Some(BuiltinTag::UiAttribute) {
         return None;
     }
     let segments: Vec<&str> = home.iter().filter_map(|s| interner.resolve(*s)).collect();
-    match segments.as_slice() {
-        ["Ipe", "Ui", "Tui" | "Cells"] => Some("TuiAttr"),
-        ["Ipe", "Ui", "Cli"] => Some("CliAttr"),
-        _ => None,
-    }
+    let terminal = match segments.as_slice() {
+        ["Ipe", "Ui", "Tui" | "Cells"] => "TuiAttr",
+        ["Ipe", "Ui", "Cli"] => "CliAttr",
+        _ => return None,
+    };
+    BuiltinType::of_bare_name(terminal)
 }
 
 /// Resolve a symbol to an owned name for a diagnostic payload.
@@ -9956,12 +9956,12 @@ mod html_qualifier_type_home_tests {
         let mut i = Interner::new();
         let ui_path = vec![sym(&mut i, "Ipe"), sym(&mut i, "Ui")];
         let attribute = sym(&mut i, "Attribute");
-        let home = reexported_builtin_type_home("Attribute", &ui_path, &i);
+        let row = BuiltinType::of_bare_name("Attribute").expect("a bare row");
+        let home = reexported_builtin_type_home("Attribute", row, &ui_path, &i);
         assert!(
             home.is_empty(),
             "the Ui `Attribute` re-export is the empty home"
         );
-        let row = BuiltinType::of_bare_name("Attribute").expect("a bare row");
         let types = BTreeMap::from([(attribute, crate::ExportedType::Builtin { home, row })]);
         let exports = crate::ModuleExports {
             path: ui_path.clone(),
@@ -10032,9 +10032,9 @@ mod html_qualifier_type_home_tests {
         let mut i = Interner::new();
         let dep_path = vec![sym(&mut i, "Dep")];
         let dict = sym(&mut i, "Dict");
-        let home = reexported_builtin_type_home("Dict", &dep_path, &i);
-        assert_eq!(home, dep_path, "a plain re-export keeps its module's home");
         let row = BuiltinType::of_bare_name("Dict").expect("a bare row");
+        let home = reexported_builtin_type_home("Dict", row, &dep_path, &i);
+        assert_eq!(home, dep_path, "a plain re-export keeps its module's home");
         let types = BTreeMap::from([(dict, crate::ExportedType::Builtin { home, row })]);
         let exports = crate::ModuleExports {
             path: dep_path.clone(),
@@ -10122,6 +10122,94 @@ mod html_qualifier_type_home_tests {
                 ),
                 "{ty}: {:?}",
                 refused.map(|_| ())
+            );
+        }
+    }
+
+    /// A union a `*.Html.*` source module declares under the name of a
+    /// non-reserved builtin row (`type Order`) keeps its module's home when
+    /// spelled through the module's qualifier: only a builtin row takes the
+    /// `["Html"]` carrier home, never a declared union.
+    #[test]
+    fn an_html_family_module_union_named_like_a_row_keeps_its_home() {
+        let mut i = Interner::new();
+        let dep_path = vec![
+            sym(&mut i, "App"),
+            sym(&mut i, "Html"),
+            sym(&mut i, "Widgets"),
+        ];
+        let order = sym(&mut i, "Order");
+        let types = BTreeMap::from([(
+            order,
+            crate::ExportedType::Union {
+                home: dep_path.clone(),
+                params: 0,
+            },
+        )]);
+        let exports = crate::ModuleExports {
+            path: dep_path.clone(),
+            types,
+            ..crate::ModuleExports::default()
+        };
+        let deps = BTreeMap::from([(dep_path, exports)]);
+        let src = "module Main exposing (x)\n\nimport App.Html.Widgets as W\n\n\
+                   x : W.Order\nx =\n    x\n";
+        let Ok(parsed_main) = ipe_parse::parse_module(src, &mut i) else {
+            panic!("importer parse failed");
+        };
+        let main_path = vec![sym(&mut i, "Main")];
+        let (module, _) = canonicalise_module(&parsed_main, &main_path, &deps, &mut i)
+            .expect("importer must canonicalise");
+        let home = annotation_con_home(&module, &i, "x");
+        let dotted: Vec<_> = home.iter().map(|s| i.resolve(*s)).collect();
+        assert_eq!(
+            dotted,
+            vec![Some("App"), Some("Html"), Some("Widgets")],
+            "W.Order is the module's union, not a builtin minted at [\"Html\"]"
+        );
+    }
+
+    /// The terminal attribute keys on the `Attribute` row: each terminal home
+    /// maps it to the row tagged `TuiAttr` / `CliAttr`, and no other row
+    /// (the view alias `Screen`, the `Html` view) is a terminal attribute.
+    #[test]
+    fn the_terminal_attribute_keys_on_the_attribute_row() {
+        let mut i = Interner::new();
+        let attribute = BuiltinType::of_bare_name("Attribute").expect("a bare row");
+        for (engine, tag) in [
+            ("Tui", BuiltinTag::TuiAttr),
+            ("Cells", BuiltinTag::TuiAttr),
+            ("Cli", BuiltinTag::CliAttr),
+        ] {
+            let home = vec![sym(&mut i, "Ipe"), sym(&mut i, "Ui"), sym(&mut i, engine)];
+            let terminal = terminal_attribute_builtin(&home, attribute, &i);
+            assert_eq!(
+                terminal.and_then(|row| row.row().tag()),
+                Some(tag),
+                "Ipe.Ui.{engine}.Attribute"
+            );
+            for other in ["Screen", "Html", "Element"] {
+                let row = BuiltinType::of_bare_name(other).expect("a bare row");
+                assert_eq!(
+                    terminal_attribute_builtin(&home, row, &i),
+                    None,
+                    "Ipe.Ui.{engine}.{other}"
+                );
+            }
+        }
+        let ui = vec![sym(&mut i, "Ipe"), sym(&mut i, "Ui")];
+        assert_eq!(terminal_attribute_builtin(&ui, attribute, &i), None);
+    }
+
+    /// Every home-sensitive name is a reserved bare row, so the row lookup in
+    /// [`bind_html_type_home`] never takes its `CompilerBug` arm.
+    #[test]
+    fn every_home_sensitive_name_is_a_reserved_bare_row() {
+        for name in HOME_SENSITIVE_BUILTIN_TYPES {
+            let row = BuiltinType::of_bare_name(name);
+            assert!(
+                row.is_some_and(|row| row.row().role().forbids_user_declaration()),
+                "`{name}` is home-sensitive but no reserved bare row"
             );
         }
     }
