@@ -106,14 +106,14 @@ impl Surface for ForeignSurface {
         "foreign"
     }
 
-    fn all(&self) -> Vec<ForeignItem> {
-        Capability::ALL
+    fn all(&self) -> Result<Vec<ForeignItem>, crate::coverage::error::CoverageError> {
+        Ok(Capability::ALL
             .iter()
             .map(|&cap| ForeignItem {
                 capability: cap,
                 boundary_class: ForeignItem::class_of(cap),
             })
-            .collect()
+            .collect())
     }
 
     fn label(item: &ForeignItem) -> String {

@@ -47,7 +47,8 @@ fn build_run_jobs() -> usize {
 /// clobbers another's snippet.
 #[allow(clippy::expect_used)] // a refused worker thread is a harness setup failure
 fn build_run_holes(symbols: &[StdlibSymbol]) -> Vec<(String, String)> {
-    let column = ipe::coverage::columns_runtime::BuildRunColumn::new();
+    let column = ipe::coverage::columns_runtime::BuildRunColumn::new()
+        .expect("the build+run column's scratch directory must be creatable");
     let cursor = AtomicUsize::new(0);
     let holes: Mutex<Vec<(String, String)>> = Mutex::new(Vec::new());
     let jobs = build_run_jobs().min(symbols.len().max(1));
@@ -87,7 +88,7 @@ fn build_run_holes(symbols: &[StdlibSymbol]) -> Vec<(String, String)> {
 /// `(dotted symbol, message)` pair.
 fn holes_of(column: Box<dyn AspectCheck<StdlibSymbol>>) -> Vec<(String, String)> {
     let columns = vec![column];
-    let report = run(&StdlibSurface, &columns);
+    let report = run(&StdlibSurface, &columns).expect("the stdlib matrix run must not fail closed");
     report
         .holes
         .into_iter()
@@ -125,7 +126,8 @@ fn composes_column_passes_over_every_higher_order_symbol() {
     use std::fmt::Write as _;
     if e2e_support::e2e_tier() == e2e_support::Tier::E2e {
         let holes = holes_of(Box::new(
-            ipe::coverage::columns_runtime::ComposesColumn::new(),
+            ipe::coverage::columns_runtime::ComposesColumn::new()
+                .expect("the composes column's scratch directory must be creatable"),
         ));
 
         let mut unexpected = String::new();
@@ -150,7 +152,10 @@ fn composes_column_passes_over_every_higher_order_symbol() {
 fn lowers_column_passes_over_the_surface() {
     use std::fmt::Write as _;
     if e2e_support::e2e_tier() == e2e_support::Tier::E2e {
-        let holes = holes_of(Box::new(ipe::coverage::columns_runtime::LowersColumn::new()));
+        let holes = holes_of(Box::new(
+            ipe::coverage::columns_runtime::LowersColumn::new()
+                .expect("the lowers column's scratch directory must be creatable"),
+        ));
 
         let mut unexpected = String::new();
         for (symbol, message) in holes {
@@ -213,6 +218,7 @@ fn build_run_column_over_a_representative_slice() {
     if e2e_support::e2e_tier() == e2e_support::Tier::E2e {
         let symbols: Vec<StdlibSymbol> = StdlibSurface
             .all()
+            .expect("the live stdlib surface must enumerate")
             .into_iter()
             .filter(|s| s.is_higher_order)
             .collect();
@@ -268,7 +274,8 @@ fn dynamic_columns_pass_over_the_whole_surface() {
                     as Box<dyn AspectCheck<StdlibSymbol>>,
                 Box::new(ipe::coverage::columns_runtime::WasmColumn),
             ],
-        );
+        )
+        .expect("the stdlib matrix run must not fail closed");
         let mut unexpected = String::new();
         for h in &report.holes {
             if !allowlisted(h.aspect, &h.symbol) {
@@ -285,6 +292,7 @@ fn dynamic_columns_pass_over_the_whole_surface() {
         // NotApplicable, not a dropped symbol.
         let ho_symbols: Vec<StdlibSymbol> = StdlibSurface
             .all()
+            .expect("the live stdlib surface must enumerate")
             .into_iter()
             .filter(|s| s.is_higher_order)
             .collect();

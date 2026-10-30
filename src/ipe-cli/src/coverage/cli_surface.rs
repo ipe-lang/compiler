@@ -84,7 +84,7 @@ impl Surface for CliSurface {
         "cli"
     }
 
-    fn all(&self) -> Vec<CliItem> {
+    fn all(&self) -> Result<Vec<CliItem>, crate::coverage::error::CoverageError> {
         let mut items = Vec::new();
         for spec in crate::help::all_command_specs() {
             // One row for the subcommand itself.
@@ -97,7 +97,7 @@ impl Surface for CliSurface {
         // Deterministic: the help table is in declaration order, which is
         // stable across runs. No further sort needed — order is owned by the
         // SSOT.
-        items
+        Ok(items)
     }
 
     fn label(item: &CliItem) -> String {

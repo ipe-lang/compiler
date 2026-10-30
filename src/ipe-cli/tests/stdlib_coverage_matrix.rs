@@ -8,7 +8,7 @@
 //! named at its coordinate. A1 pins the surface's facets on a known symbol; A2
 //! runs the four static columns over the WHOLE current surface.
 
-use ipe::coverage::contract::{StdlibSymbol, Surface, SymbolKind};
+use ipe::coverage::contract::{SchemeState, StdlibSymbol, Surface, SymbolKind};
 use ipe::coverage::matrix;
 use ipe::coverage::surface::StdlibSurface;
 
@@ -29,7 +29,9 @@ fn find<'a>(
 
 #[test]
 fn surface_is_non_empty() {
-    let symbols = StdlibSurface.all();
+    let symbols = StdlibSurface
+        .all()
+        .expect("the live stdlib surface must enumerate");
     assert!(
         !symbols.is_empty(),
         "the reconciled stdlib surface must enumerate at least one symbol",
@@ -38,8 +40,12 @@ fn surface_is_non_empty() {
 
 #[test]
 fn surface_is_deterministic_and_sorted() {
-    let first = StdlibSurface.all();
-    let second = StdlibSurface.all();
+    let first = StdlibSurface
+        .all()
+        .expect("the live stdlib surface must enumerate");
+    let second = StdlibSurface
+        .all()
+        .expect("the live stdlib surface must enumerate");
     assert_eq!(
         first, second,
         "the surface enumeration must be deterministic across calls",
@@ -55,7 +61,9 @@ fn surface_is_deterministic_and_sorted() {
 
 #[test]
 fn list_map_has_the_right_facets() {
-    let symbols = StdlibSurface.all();
+    let symbols = StdlibSurface
+        .all()
+        .expect("the live stdlib surface must enumerate");
     let map = find(&symbols, &["Ipe", "List"], "map", SymbolKind::Value)
         .expect("Ipe.List.map must be on the surface");
 
@@ -70,7 +78,7 @@ fn list_map_has_the_right_facets() {
         "List.map takes a function `(a -> b)` — it is higher-order",
     );
     assert!(
-        map.scheme.is_some(),
+        matches!(map.scheme, SchemeState::Rendered(_)),
         "List.map's scheme projects through the typed interface",
     );
 }
@@ -162,7 +170,7 @@ const ALLOWLIST: &[(&str, &str, &str)] = &[
 fn static_columns_pass_over_the_whole_surface() {
     use std::fmt::Write as _;
 
-    let report = matrix::run_static();
+    let report = matrix::run_static().expect("the stdlib matrix run must not fail closed");
 
     let mut unexpected = String::new();
     for h in report.holes.iter().filter(|h| {
@@ -191,7 +199,7 @@ fn allowlisted_holes_are_still_real() {
     // Guard against a stale allowlist: every allowlisted coordinate must still be
     // a hole the run reports. A removed hole must be removed from the allowlist,
     // not left to rot.
-    let report = matrix::run_static();
+    let report = matrix::run_static().expect("the stdlib matrix run must not fail closed");
     for (aspect, symbol, reason) in ALLOWLIST {
         let present = report
             .holes

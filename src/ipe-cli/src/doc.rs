@@ -95,8 +95,8 @@
 //!   doc-comments are scanned from the embedded source.
 //! * **Kernel-qualifier** (`ipe_canon::STDLIB_MODULE_QUALIFIERS`): modules backed by the
 //!   kernel registry (e.g. `Ipe.List`, `Ipe.String`). Type signatures come from
-//!   [`ipe_types::kernel_type_table`]; doc-comments are absent (signatures are the
-//!   contract).
+//!   [`crate::kernel_schemes::kernel_schemes`]; doc-comments are absent (signatures
+//!   are the contract).
 //!
 //! `ipe doc check` exempts stdlib modules from the coverage gate — signatures are
 //! sufficient; prose is optional for compiler-internal stdlib.
@@ -114,7 +114,7 @@ use ipe_diagnostics::{TyDoc, render_ty};
 use ipe_docs::{CommandInfo, Index, html};
 use ipe_intern::Interner;
 use ipe_runtime_rust::inbound_authority::{Authority, AuthorityRefusal, DeclaredNames};
-use ipe_types::{VarNamer, kernel_type_table, ty_to_doc};
+use ipe_types::{Ty, VarNamer, ty_to_doc};
 
 use crate::CliError;
 use crate::api_surface::{
@@ -1505,7 +1505,8 @@ struct Undocumented {
 ///
 /// Project modules go through one `read_tree` walk + `extract_walked`.
 /// Compiled-source stdlib modules go through the same type-checker path.
-/// Kernel-qualifier stdlib modules use [`kernel_type_table`] for signatures.
+/// Kernel-qualifier stdlib modules use [`crate::kernel_schemes::kernel_schemes`]
+/// for signatures.
 ///
 /// Modules are listed in name order: stdlib first (alphabetically), then project.
 /// The API and the doc comments come from ONE walk, whose root is returned as
@@ -1647,7 +1648,8 @@ fn stdlib_module_names() -> Vec<String> {
 ///
 /// Compiled-source modules are type-checked using the same pipeline as project
 /// modules (injecting each individually as a minimal package). Kernel-qualifier
-/// modules use [`kernel_type_table`] for type signatures; doc-comments are empty
+/// modules use [`crate::kernel_schemes::kernel_schemes`] for type signatures;
+/// doc-comments are empty
 /// (signatures are the contract for kernel-backed stdlib).
 ///
 /// # Errors
@@ -1690,7 +1692,7 @@ fn build_stdlib_docs() -> Result<Vec<ModuleDoc>, CliError> {
     }
 
     // ── Kernel-qualifier stdlib modules ───────────────────────────────────────
-    // Signatures come from kernel_type_table; doc-comments are absent for these
+    // Signatures come from `kernel_schemes`; doc-comments are absent for these
     // compiler-internal modules (signatures are the contract).
     for (name, doc) in build_kernel_module_docs()? {
         modules.entry(name).or_insert(doc);
@@ -1937,46 +1939,86 @@ fn build_source_only_module_doc(segments: &[String], source: &str) -> ModuleDoc 
     }
 }
 
+/// Resolve one schemed kernel's module path and render its [`ValueDoc`].
+///
+/// # Errors
+/// [`CliError::Usage`] when the kernel's qualifier does not resolve to a known
+/// module, or when `ty` fails to render through [`ty_to_doc`] (e.g. a
+/// `Ty::Con` naming a [`ipe_intern::Symbol`] `interner` never interned) — both
+/// propagate here rather than silently skipping the kernel, so a render
+/// failure never shrinks the page by one row.
+fn kernel_value_doc(
+    decl: ipe_kernels::StdlibDecl,
+    ty: &Ty,
+    interner: &Interner,
+    qualifier_to_path: &BTreeMap<String, Vec<String>>,
+    compiled_by_dotted: &BTreeMap<String, Vec<String>>,
+    compiled_by_last_segment: &BTreeMap<String, Vec<String>>,
+) -> Result<(String, ValueDoc), CliError> {
+    let module_path = crate::coverage::surface::kernel_module_path(
+        decl.qualifier,
+        qualifier_to_path,
+        compiled_by_dotted,
+        compiled_by_last_segment,
+    )
+    .map_err(|e| CliError::Usage(text::msg::doc_kernel_table_error(&e)))?
+    .join(".");
+    let mut namer = VarNamer::new();
+    let ty_doc = ty_to_doc(ty, interner, &mut namer).map_err(|d| {
+        CliError::Usage(text::msg::doc_kernel_table_error(
+            &ipe_diagnostics::plain_message(&d, ""),
+        ))
+    })?;
+    let signature = render_ty(&ty_doc);
+    Ok((
+        module_path,
+        ValueDoc {
+            name: decl.name.to_owned(),
+            signature,
+            signature_ty: ty_doc,
+            comment: String::new(),
+        },
+    ))
+}
+
 /// Build [`ModuleDoc`]s for every kernel-qualifier stdlib module.
 ///
-/// The canonical qualifier table ([`ipe_canon::STDLIB_MODULE_QUALIFIERS`]) maps
-/// import path → short qualifier. The kernel type table maps
-/// [`ipe_kernels::StdlibKernel`] → Ipê type; each kernel's [`StdlibDecl`] gives
-/// the qualifier and member name. These three tables are joined here to produce
-/// per-module value lists with checker-inferred type signatures.
+/// Each [`ipe_kernels::StdlibKernel`] is joined against its HM type scheme through
+/// [`crate::kernel_schemes::kernel_schemes`] — the one ipe-cli helper
+/// [`crate::coverage::surface`] also reads, so this page and the coverage
+/// matrix cannot disagree about which kernel is schemed. A kernel the
+/// registry declares [`crate::kernel_schemes::KernelScheme::Unschemed`] is not
+/// callable from well-typed Ipê (`IPE-L0108` refuses it at its call sites), so
+/// it is skipped here rather than rendered. The module each kernel's
+/// qualifier resolves to is read through
+/// [`crate::coverage::surface::kernel_module_path`], the same qualifier
+/// resolution the coverage surface uses.
 fn build_kernel_module_docs() -> Result<BTreeMap<String, ModuleDoc>, CliError> {
-    // Build a reverse map from qualifier short name → full dotted module path.
-    let qualifier_to_path: BTreeMap<String, String> = ipe_canon::STDLIB_MODULE_QUALIFIERS
-        .iter()
-        .map(|(segments, qualifier)| ((*qualifier).to_owned(), segments.join(".")))
-        .collect();
+    let (qualifier_to_path, compiled_by_dotted, compiled_by_last_segment) =
+        crate::coverage::surface::qualifier_lookup_tables();
 
-    // Get the full type table for all kernel functions.
     let mut interner = Interner::new();
-    let type_table = kernel_type_table(&mut interner)
-        .map_err(|d| CliError::Usage(text::msg::doc_kernel_table_error(&format!("{d:?}"))))?;
+    let schemes = crate::kernel_schemes::kernel_schemes(&mut interner)
+        .map_err(|e| CliError::Usage(text::msg::doc_kernel_table_error(&e)))?;
 
-    // Group by module path and build ValueDoc for each kernel.
+    // Group by module path and build ValueDoc for each schemed kernel.
     let mut by_module: BTreeMap<String, Vec<ValueDoc>> = BTreeMap::new();
-    for (kernel, ty) in type_table {
-        let decl = kernel.decl();
-        let Some(module_path) = qualifier_to_path.get(decl.qualifier) else {
-            continue;
+    for (kernel, scheme) in schemes {
+        let ty = match scheme {
+            crate::kernel_schemes::KernelScheme::Schemed(ty) => ty,
+            // Not callable from well-typed Ipê (IPE-L0108 refuses it); no
+            // page to render it on.
+            crate::kernel_schemes::KernelScheme::Unschemed => continue,
         };
-        let mut namer = VarNamer::new();
-        let Ok(ty_doc) = ty_to_doc(&ty, &interner, &mut namer) else {
-            continue; // skip kernels whose type fails to render
-        };
-        let signature = render_ty(&ty_doc);
-        by_module
-            .entry(module_path.clone())
-            .or_default()
-            .push(ValueDoc {
-                name: decl.name.to_owned(),
-                signature,
-                signature_ty: ty_doc,
-                comment: String::new(),
-            });
+        let (module_path, value_doc) = kernel_value_doc(
+            kernel.decl(),
+            &ty,
+            &interner,
+            &qualifier_to_path,
+            &compiled_by_dotted,
+            &compiled_by_last_segment,
+        )?;
+        by_module.entry(module_path).or_default().push(value_doc);
     }
 
     // Assemble ModuleDoc for each module, values in name order.
@@ -5749,6 +5791,55 @@ fn http_response(headers: &PreviewHeaders, status: &str, content_type: &str, bod
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn build_kernel_module_docs_is_non_vacuous_over_the_live_registry() {
+        let docs = build_kernel_module_docs().expect(
+            "the live kernel registry must join against its scheme table and every qualifier \
+             must resolve to a known module",
+        );
+        assert!(
+            !docs.is_empty(),
+            "kernel-qualifier stdlib modules must not vanish"
+        );
+    }
+
+    #[test]
+    fn a_render_failure_refuses_the_kernel_not_a_shorter_page() {
+        // `bad_ty` names a module/value `Symbol` minted in `foreign_interner`, a
+        // DIFFERENT interner from the one `kernel_value_doc` is given here, so
+        // `ty_to_doc`'s `resolve_module` must fail to back it with a string.
+        // `kernel_value_doc` must propagate that as a typed `Err`, never
+        // silently drop the kernel and shrink the page by one row.
+        let mut foreign_interner = Interner::new();
+        let foreign_module = foreign_interner
+            .intern("Foreign")
+            .expect("interning a fresh string must not fail");
+        let foreign_name = foreign_interner
+            .intern("phantom")
+            .expect("interning a fresh string must not fail");
+        let bad_ty = Ty::Con {
+            module: vec![foreign_module],
+            name: foreign_name,
+            args: Vec::new(),
+        };
+
+        // Never interned `foreign_module`/`foreign_name` — any symbol id this
+        // interner is asked to resolve has no backing string.
+        let empty_interner = Interner::new();
+        let empty = BTreeMap::new();
+        let decl = ipe_kernels::StdlibKernel::ALL
+            .first()
+            .expect("the kernel registry is non-empty")
+            .decl();
+
+        let result = kernel_value_doc(decl, &bad_ty, &empty_interner, &empty, &empty, &empty);
+        assert!(
+            matches!(result, Err(CliError::Usage(_))),
+            "a type that fails to render must surface as a typed CliError, not a silently \
+             skipped row: {result:?}",
+        );
+    }
 
     #[test]
     fn a_construct_page_the_corpus_cannot_hold_refuses_the_index() {

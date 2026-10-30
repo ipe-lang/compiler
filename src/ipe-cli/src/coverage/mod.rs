@@ -18,6 +18,7 @@ pub mod compiler_surface;
 pub mod contract;
 pub mod diagnostic_surface;
 pub mod env_surface;
+pub mod error;
 pub mod foreign_surface;
 pub mod matrix;
 pub mod package_surface;

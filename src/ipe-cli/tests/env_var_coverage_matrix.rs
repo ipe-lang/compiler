@@ -23,7 +23,9 @@ const ALLOWLIST: &[(&str, &str, &str)] = &[];
 
 #[test]
 fn env_surface_is_non_empty() {
-    let items = EnvVarSurface.all();
+    let items = EnvVarSurface
+        .all()
+        .expect("the live env-var surface must enumerate");
     assert!(
         !items.is_empty(),
         "the env-var surface must enumerate at least one variable",
@@ -32,8 +34,12 @@ fn env_surface_is_non_empty() {
 
 #[test]
 fn env_surface_is_deterministic_and_sorted() {
-    let first = EnvVarSurface.all();
-    let second = EnvVarSurface.all();
+    let first = EnvVarSurface
+        .all()
+        .expect("the live env-var surface must enumerate");
+    let second = EnvVarSurface
+        .all()
+        .expect("the live env-var surface must enumerate");
     let names_first: Vec<String> = first.iter().map(|i| i.name().to_owned()).collect();
     let names_second: Vec<String> = second.iter().map(|i| i.name().to_owned()).collect();
     assert_eq!(
@@ -47,7 +53,9 @@ fn env_surface_is_deterministic_and_sorted() {
 
 #[test]
 fn a_known_variable_is_registered_on_the_surface() {
-    let items = EnvVarSurface.all();
+    let items = EnvVarSurface
+        .all()
+        .expect("the live env-var surface must enumerate");
     let known = items
         .iter()
         .find(|i| i.name() == "IPE_WEB_PORT")
@@ -62,7 +70,7 @@ fn a_known_variable_is_registered_on_the_surface() {
 fn env_columns_pass_over_the_whole_surface() {
     use std::fmt::Write as _;
 
-    let report = matrix::run_env();
+    let report = matrix::run_env().expect("the env-var matrix run must not fail closed");
 
     let mut unexpected = String::new();
     for h in report.holes.iter().filter(|h| {
@@ -88,7 +96,7 @@ fn env_columns_pass_over_the_whole_surface() {
 
 #[test]
 fn allowlisted_holes_are_still_real() {
-    let report = matrix::run_env();
+    let report = matrix::run_env().expect("the env-var matrix run must not fail closed");
     for (aspect, symbol, reason) in ALLOWLIST {
         let present = report
             .holes
@@ -107,7 +115,7 @@ fn advisories_are_reported_not_failing() {
     // The truthy-parse and prod-safety columns emit advisories (Warn), which the
     // runner collects without failing the gate. This pins that a Warn never
     // becomes a hole and that at least the dev-only vars surface as advisories.
-    let report = matrix::run_env();
+    let report = matrix::run_env().expect("the env-var matrix run must not fail closed");
     assert!(
         report.passed(),
         "advisories must not fail the gate: {}",
@@ -197,7 +205,7 @@ fn every_excluded_name_is_read_in_the_source() {
     let reads = SourceReads::scan();
     let all_reads = reads
         .all_reads()
-        .map_err(ToString::to_string)
+        .map_err(|refusal| refusal.to_string())
         .expect("the source tree is read whole");
     let unread = unread_exclusions(EXCLUDED_NAMES, all_reads);
     assert!(

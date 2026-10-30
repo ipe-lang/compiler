@@ -18,16 +18,23 @@
 //! A member present in one enumeration but forgotten in another appears once,
 //! with the missing facet visibly `false`, so the aspect columns judge a single
 //! reconciled surface.
+//!
+//! Every fold step is fallible: a module that fails to parse or extract, an
+//! unresolved `exposing` symbol, or a kernel/scheme-table drift returns a typed
+//! [`CoverageError`] rather than silently dropping its contribution to the
+//! surface.
 
 use std::collections::BTreeMap;
 
 use ipe_diagnostics::{TyDoc, render_ty};
 use ipe_intern::Interner;
 use ipe_syntax::{Exposed, Exposing};
-use ipe_types::{VarNamer, kernel_type_table, ty_to_doc};
+use ipe_types::{VarNamer, ty_to_doc};
 
 use crate::api_surface::{self, ModuleApi};
-use crate::coverage::contract::{StdlibSymbol, Surface, SymbolKind};
+use crate::coverage::contract::{SchemeState, StdlibSymbol, Surface, SymbolKind};
+use crate::coverage::error::CoverageError;
+use crate::kernel_schemes::{self, KernelScheme, KernelSchemeError};
 
 /// The reconciliation key: one row per (module, name, kind).
 type Key = (Vec<String>, String, SymbolKind);
@@ -46,15 +53,15 @@ impl Surface for StdlibSurface {
         "stdlib"
     }
 
-    fn all(&self) -> Vec<StdlibSymbol> {
+    fn all(&self) -> Result<Vec<StdlibSymbol>, CoverageError> {
         let mut by_key: BTreeMap<Key, StdlibSymbol> = BTreeMap::new();
 
-        merge_compiled_source(&mut by_key);
-        merge_kernels(&mut by_key);
+        merge_compiled_source(&mut by_key)?;
+        merge_kernels(&mut by_key)?;
 
         // `BTreeMap` iteration is sorted by the (module, name, kind) key, so the
         // result is deterministic without an explicit sort.
-        by_key.into_values().collect()
+        Ok(by_key.into_values().collect())
     }
 
     fn label(item: &StdlibSymbol) -> String {
@@ -81,15 +88,32 @@ fn segments_of(dotted: &str) -> Vec<String> {
 /// the `Ffi.kernel` point-free aliases whose scheme lives in the kernel table
 /// rather than the module's own typed interface. Schemes and union constructors
 /// come from the projected typed interface where available.
-fn merge_compiled_source(by_key: &mut BTreeMap<Key, StdlibSymbol>) {
+fn merge_compiled_source(by_key: &mut BTreeMap<Key, StdlibSymbol>) -> Result<(), CoverageError> {
     for module in ipe_stdlib::COMPILED_STD_MODULES {
         let segments = segments_of(module.dotted);
-        let projected = api_surface::extract_stdlib_module(&segments, module.source)
-            .ok()
-            .and_then(|api| api.modules.get(&segments).cloned());
-
-        merge_exposing(by_key, &segments, module.source, projected.as_ref());
+        merge_one_compiled_module(by_key, &segments, module.source)?;
     }
+    Ok(())
+}
+
+/// Fold one compiled-source module (by its already-split segments and source
+/// text) into the reconciliation map. Separated from [`merge_compiled_source`]'s
+/// registry loop so a refusal test can inject a module that fails to extract or
+/// parse without touching the real [`ipe_stdlib::COMPILED_STD_MODULES`] table.
+fn merge_one_compiled_module(
+    by_key: &mut BTreeMap<Key, StdlibSymbol>,
+    segments: &[String],
+    source: &str,
+) -> Result<(), CoverageError> {
+    let api = api_surface::extract_stdlib_module(segments, source).map_err(|err| {
+        CoverageError::Extract {
+            module: segments.to_vec(),
+            source: err,
+        }
+    })?;
+    let projected = api.modules.get(segments).cloned();
+
+    merge_exposing(by_key, segments, source, projected.as_ref())
 }
 
 /// Fold one compiled-source module's `exposing (...)` members into the map,
@@ -99,13 +123,14 @@ fn merge_exposing(
     segments: &[String],
     source: &str,
     projected: Option<&ModuleApi>,
-) {
+) -> Result<(), CoverageError> {
     let mut interner = Interner::new();
-    let Ok(parsed) = ipe_parse::parse_module(source, &mut interner) else {
-        // A module that does not parse contributes nothing; the parse floor gate
-        // owns that failure.
-        return;
-    };
+    let parsed = ipe_parse::parse_module(source, &mut interner).map_err(|diagnostic| {
+        CoverageError::Parse {
+            module: segments.to_vec(),
+            diagnostic,
+        }
+    })?;
 
     let exposed = match &parsed.exposing.value {
         // `exposing (..)` re-exports everything; fall back to the projected
@@ -115,7 +140,7 @@ fn merge_exposing(
             if let Some(api) = projected {
                 merge_projected_only(by_key, segments, api);
             }
-            return;
+            return Ok(());
         }
         Exposing::List(items) => items,
     };
@@ -123,9 +148,12 @@ fn merge_exposing(
     for item in exposed {
         match &item.value {
             Exposed::Value(sym) => {
-                let Some(name) = interner.resolve(*sym) else {
-                    continue;
-                };
+                let name =
+                    interner
+                        .resolve(*sym)
+                        .ok_or_else(|| CoverageError::UnresolvedSymbol {
+                            module: segments.to_vec(),
+                        })?;
                 let (scheme, higher_order) = projected
                     .and_then(|api| {
                         let sig = api.values.get(name)?;
@@ -133,9 +161,9 @@ fn merge_exposing(
                             .value_types
                             .get(name)
                             .is_some_and(scheme_is_higher_order);
-                        Some((Some(sig.clone()), ho))
+                        Some((SchemeState::Rendered(sig.clone()), ho))
                     })
-                    .unwrap_or((None, false));
+                    .unwrap_or((SchemeState::Unschemed, false));
                 insert(
                     by_key,
                     compiled_symbol(
@@ -148,16 +176,19 @@ fn merge_exposing(
                 );
             }
             Exposed::Type(sym, _privacy) => {
-                let Some(name) = interner.resolve(*sym) else {
-                    continue;
-                };
+                let name =
+                    interner
+                        .resolve(*sym)
+                        .ok_or_else(|| CoverageError::UnresolvedSymbol {
+                            module: segments.to_vec(),
+                        })?;
                 insert(
                     by_key,
                     compiled_symbol(
                         segments.to_vec(),
                         name.to_owned(),
                         SymbolKind::Type,
-                        None,
+                        SchemeState::Unschemed,
                         false,
                     ),
                 );
@@ -172,7 +203,7 @@ fn merge_exposing(
                                 segments.to_vec(),
                                 ctor_name.clone(),
                                 SymbolKind::Ctor,
-                                None,
+                                SchemeState::Unschemed,
                                 false,
                             ),
                         );
@@ -181,6 +212,7 @@ fn merge_exposing(
             }
         }
     }
+    Ok(())
 }
 
 /// Fold a projected interface's values and unions directly (the `exposing (..)`
@@ -201,7 +233,7 @@ fn merge_projected_only(
                 segments.to_vec(),
                 name.clone(),
                 SymbolKind::Value,
-                Some(signature.clone()),
+                SchemeState::Rendered(signature.clone()),
                 higher_order,
             ),
         );
@@ -213,7 +245,7 @@ fn merge_projected_only(
                 segments.to_vec(),
                 type_name.clone(),
                 SymbolKind::Type,
-                None,
+                SchemeState::Unschemed,
                 false,
             ),
         );
@@ -224,7 +256,7 @@ fn merge_projected_only(
                     segments.to_vec(),
                     ctor_name.clone(),
                     SymbolKind::Ctor,
-                    None,
+                    SchemeState::Unschemed,
                     false,
                 ),
             );
@@ -234,11 +266,11 @@ fn merge_projected_only(
 
 /// A compiled-source symbol seed: present in a compiled-source module and
 /// exported; kernel facet not yet known.
-const fn compiled_symbol(
+fn compiled_symbol(
     module: Vec<String>,
     name: String,
     kind: SymbolKind,
-    scheme: Option<String>,
+    scheme: SchemeState,
     is_higher_order: bool,
 ) -> StdlibSymbol {
     StdlibSymbol {
@@ -261,9 +293,10 @@ const fn compiled_symbol(
 /// The general heuristics in [`kernel_module_path`] resolve most qualifiers
 /// (`"List"` → `Ipe.List`, `"Store"` → `Ipe.Db.Store`), but a handful use a
 /// short internal tag that differs from the module name. This table is the
-/// single source of truth for those mismatches; it is consulted before the
-/// phantom fallback so the home column sees the real module rather than an
-/// invented `Ipe.<qualifier>` path.
+/// single source of truth for those mismatches; its entries are cross-checked
+/// against the real module lists rather than trusted blindly, so a drifted
+/// entry surfaces as [`CoverageError::UnknownQualifier`] instead of silently
+/// homing a kernel under an invented `Ipe.<qualifier>` path.
 ///
 /// `Cmd` / `Sub` are intentionally absent — they are shape-scoped and have no
 /// canonical standalone module (reached via `Ipe.Tea.<Shape>.Cmd` / `.Sub`).
@@ -307,39 +340,66 @@ const QUALIFIER_MODULE_OVERRIDES: &[(&str, &[&str])] = &[
 /// 3. The compiled-source module whose final segment equals the qualifier
 ///    (`"Store"` → `Ipe.Db.Store`).
 /// 4. [`QUALIFIER_MODULE_OVERRIDES`] — short internal tags that differ from
-///    their module's dotted name or final segment.
-/// 5. Phantom fallback `Ipe.<qualifier>` — homed under a non-existent path
-///    so the home column flags it as unhomed.
-fn kernel_module_path(
-    qualifier: &str,
+///    their module's dotted name or final segment, cross-checked against the
+///    real module lists below so a drifted override entry (renamed or
+///    removed module) surfaces as [`CoverageError::UnknownQualifier`] rather
+///    than silently standing in for a module that no longer exists.
+/// 5. Phantom fallback `Ipe.<qualifier>` — homed under a non-existent path so
+///    [`crate::coverage::columns_static::HomeColumn`] flags it as a named
+///    [`crate::coverage::contract::Cell::Hole`]. Reached only by qualifiers
+///    that are genuinely shape-scoped routing tokens with no standalone
+///    module by design (`Cmd`, `Sub`) — the surface's job is to name every
+///    kernel, not to judge which ones are homed, so this tier never errors.
+pub(crate) fn kernel_module_path(
+    qualifier: &'static str,
     qualifier_to_path: &BTreeMap<String, Vec<String>>,
     compiled_by_dotted: &BTreeMap<String, Vec<String>>,
     compiled_by_last_segment: &BTreeMap<String, Vec<String>>,
-) -> Vec<String> {
+) -> Result<Vec<String>, CoverageError> {
     if let Some(path) = qualifier_to_path.get(qualifier) {
-        return path.clone();
+        return Ok(path.clone());
     }
     let dotted = format!("Ipe.{qualifier}");
     if let Some(path) = compiled_by_dotted.get(&dotted) {
-        return path.clone();
+        return Ok(path.clone());
     }
     if let Some(path) = compiled_by_last_segment.get(qualifier) {
-        return path.clone();
+        return Ok(path.clone());
     }
     if let Some(segs) = QUALIFIER_MODULE_OVERRIDES
         .iter()
         .find(|(q, _)| *q == qualifier)
         .map(|(_, segs)| segs)
     {
-        return segs.iter().map(|s| (*s).to_owned()).collect();
+        let path: Vec<String> = segs.iter().map(|s| (*s).to_owned()).collect();
+        let is_known_module = compiled_by_dotted.values().any(|known| *known == path)
+            || compiled_by_last_segment
+                .values()
+                .any(|known| *known == path)
+            || qualifier_to_path.values().any(|known| *known == path);
+        return if is_known_module {
+            Ok(path)
+        } else {
+            Err(CoverageError::UnknownQualifier { qualifier })
+        };
     }
-    segments_of(&dotted)
+    Ok(segments_of(&dotted))
 }
 
 /// Fold the kernel registry into the reconciliation map: each wired kernel
 /// becomes a value symbol whose `has_kernel` facet is set, homed under its real
 /// module path.
-fn merge_kernels(by_key: &mut BTreeMap<Key, StdlibSymbol>) {
+/// The three qualifier-resolution tables [`kernel_module_path`] joins
+/// against, built once from the canon and compiled-source registries.
+///
+/// Shared by `coverage::surface` and `doc`'s kernel-module renderer so the two
+/// consumers resolve a kernel qualifier's module the same way — a qualifier
+/// homed here cannot be homed differently there.
+pub(crate) fn qualifier_lookup_tables() -> (
+    BTreeMap<String, Vec<String>>,
+    BTreeMap<String, Vec<String>>,
+    BTreeMap<String, Vec<String>>,
+) {
     let qualifier_to_path: BTreeMap<String, Vec<String>> = ipe_canon::STDLIB_MODULE_QUALIFIERS
         .iter()
         .map(|(segs, qualifier)| {
@@ -363,7 +423,36 @@ fn merge_kernels(by_key: &mut BTreeMap<Key, StdlibSymbol>) {
         })
         .collect();
 
-    let schemes = kernel_schemes();
+    (
+        qualifier_to_path,
+        compiled_by_dotted,
+        compiled_by_last_segment,
+    )
+}
+
+fn merge_kernels(by_key: &mut BTreeMap<Key, StdlibSymbol>) -> Result<(), CoverageError> {
+    let (qualifier_to_path, compiled_by_dotted, compiled_by_last_segment) =
+        qualifier_lookup_tables();
+
+    let mut interner = Interner::new();
+    let schemes = kernel_schemes::kernel_schemes(&mut interner).map_err(|e| match e {
+        KernelSchemeError::Table(d) => CoverageError::KernelTable(d),
+        KernelSchemeError::Drift {
+            kernel,
+            shape_declared,
+            in_table,
+        } => CoverageError::KernelTableDrift {
+            kernel,
+            shape_declared,
+            in_table,
+        },
+    })?;
+
+    let mut by_kernel_key: BTreeMap<(String, String), KernelScheme> = BTreeMap::new();
+    for (kernel, scheme) in schemes {
+        let def = kernel.def();
+        by_kernel_key.insert((def.qualifier.to_owned(), def.name.to_owned()), scheme);
+    }
 
     for kernel in ipe_kernels::StdlibKernel::ALL {
         let def = kernel.def();
@@ -377,11 +466,22 @@ fn merge_kernels(by_key: &mut BTreeMap<Key, StdlibSymbol>) {
             &qualifier_to_path,
             &compiled_by_dotted,
             &compiled_by_last_segment,
-        );
-        let (scheme, is_higher_order) = schemes
-            .get(&(def.qualifier.to_owned(), def.name.to_owned()))
-            .cloned()
-            .unwrap_or((None, false));
+        )?;
+        let (scheme, is_higher_order) =
+            match by_kernel_key.remove(&(def.qualifier.to_owned(), def.name.to_owned())) {
+                Some(KernelScheme::Schemed(ty)) => {
+                    let mut namer = VarNamer::new();
+                    let doc = ty_to_doc(&ty, &interner, &mut namer).map_err(|source| {
+                        CoverageError::RenderScheme {
+                            kernel: *kernel,
+                            source,
+                        }
+                    })?;
+                    let higher_order = scheme_is_higher_order(&doc);
+                    (SchemeState::Rendered(render_ty(&doc)), higher_order)
+                }
+                Some(KernelScheme::Unschemed) | None => (SchemeState::Unschemed, false),
+            };
         insert(
             by_key,
             StdlibSymbol {
@@ -400,33 +500,7 @@ fn merge_kernels(by_key: &mut BTreeMap<Key, StdlibSymbol>) {
             },
         );
     }
-}
-
-/// Every kernel's rendered α-canonical scheme and higher-order flag, keyed by
-/// `(qualifier, name)`.
-///
-/// Reads the same scheme table inference and `ipe doc` read, so a kernel-alias
-/// member (`Ipe.List.map`, whose scheme lives in the kernel table rather than the
-/// aliasing module's typed interface) carries its real signature on the surface.
-fn kernel_schemes() -> BTreeMap<(String, String), (Option<String>, bool)> {
-    let mut interner = Interner::new();
-    let Ok(table) = kernel_type_table(&mut interner) else {
-        return BTreeMap::new();
-    };
-    let mut out = BTreeMap::new();
-    for (kernel, ty) in table {
-        let def = kernel.def();
-        let mut namer = VarNamer::new();
-        let Ok(doc) = ty_to_doc(&ty, &interner, &mut namer) else {
-            continue;
-        };
-        let higher_order = scheme_is_higher_order(&doc);
-        out.insert(
-            (def.qualifier.to_owned(), def.name.to_owned()),
-            (Some(render_ty(&doc)), higher_order),
-        );
-    }
-    out
+    Ok(())
 }
 
 // ── reconciliation ────────────────────────────────────────────────────────────
@@ -445,8 +519,8 @@ fn insert(by_key: &mut BTreeMap<Key, StdlibSymbol>, sym: StdlibSymbol) {
             existing.is_higher_order |= sym.is_higher_order;
             // Prefer a present scheme; the typed-interface projection carries it,
             // the kernel seed does not.
-            if existing.scheme.is_none() {
-                existing.scheme.clone_from(&sym.scheme);
+            if matches!(existing.scheme, SchemeState::Unschemed) {
+                existing.scheme = sym.scheme.clone();
             }
         })
         .or_insert(sym);
@@ -456,12 +530,118 @@ fn insert(by_key: &mut BTreeMap<Key, StdlibSymbol>, sym: StdlibSymbol) {
 ///
 /// Walks the top-level arrow spine: a parameter that is itself a function, or a
 /// function-typed final result, makes the symbol higher-order — the property the
-/// composition column probes (`map`/`andThen`/`map2` and friends).
+/// composition column probes (`map`/`andThen`/`map2` and friends). Exhaustive
+/// over every `TyDoc` variant so a new shape added there must be classified
+/// here rather than silently falling through a wildcard arm.
 fn scheme_is_higher_order(ty: &TyDoc) -> bool {
     match ty {
         TyDoc::Fun(param, result) => {
             matches!(param.as_ref(), TyDoc::Fun(..)) || scheme_is_higher_order(result)
         }
-        _ => false,
+        TyDoc::Con { .. } | TyDoc::Var(_) | TyDoc::Unit | TyDoc::Tuple(_) | TyDoc::Record(_) => {
+            false
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn every_tydoc_variant_is_classified_without_a_wildcard() {
+        assert!(!scheme_is_higher_order(&TyDoc::Unit));
+        assert!(!scheme_is_higher_order(&TyDoc::Var("a".into())));
+        assert!(!scheme_is_higher_order(&TyDoc::Con {
+            module: "".into(),
+            name: "Int".into(),
+            args: Box::new([]),
+        }));
+        assert!(!scheme_is_higher_order(&TyDoc::Tuple(Box::new([
+            TyDoc::Unit,
+            TyDoc::Unit
+        ]))));
+        assert!(!scheme_is_higher_order(&TyDoc::Record(Box::new([(
+            "x".into(),
+            TyDoc::Unit
+        )]))));
+        // `a -> b`: first-order (neither side is itself a function).
+        assert!(!scheme_is_higher_order(&TyDoc::Fun(
+            Box::new(TyDoc::Var("a".into())),
+            Box::new(TyDoc::Var("b".into())),
+        )));
+        // `(a -> b) -> a -> b`: a function-typed parameter makes it higher-order.
+        assert!(scheme_is_higher_order(&TyDoc::Fun(
+            Box::new(TyDoc::Fun(
+                Box::new(TyDoc::Var("a".into())),
+                Box::new(TyDoc::Var("b".into()))
+            )),
+            Box::new(TyDoc::Fun(
+                Box::new(TyDoc::Var("a".into())),
+                Box::new(TyDoc::Var("b".into()))
+            )),
+        )));
+        // `a -> (a -> b)`: a function-typed result makes it higher-order.
+        assert!(scheme_is_higher_order(&TyDoc::Fun(
+            Box::new(TyDoc::Var("a".into())),
+            Box::new(TyDoc::Fun(
+                Box::new(TyDoc::Var("a".into())),
+                Box::new(TyDoc::Var("b".into()))
+            )),
+        )));
+    }
+
+    #[test]
+    fn the_live_stdlib_surface_enumerates_a_non_vacuous_row_set() {
+        let rows = StdlibSurface
+            .all()
+            .expect("the live stdlib surface must enumerate");
+        assert!(
+            !rows.is_empty(),
+            "the stdlib surface must not be vacuously empty"
+        );
+    }
+
+    #[test]
+    fn an_unparsable_module_is_a_typed_parse_error() {
+        let mut by_key = BTreeMap::new();
+        let segments = vec!["Ipe".to_owned(), "NotReal".to_owned()];
+        let result =
+            merge_one_compiled_module(&mut by_key, &segments, "module Ipe.NotReal exposing ((((");
+        assert!(matches!(result, Err(CoverageError::Parse { .. })));
+    }
+
+    #[test]
+    fn a_module_that_fails_to_typecheck_is_a_typed_extract_error() {
+        let mut by_key = BTreeMap::new();
+        let segments = vec!["Ipe".to_owned(), "NotReal".to_owned()];
+        let source = "module Ipe.NotReal exposing (bad)\n\nbad : Int\nbad = \"not an Int\"\n";
+        let result = merge_one_compiled_module(&mut by_key, &segments, source);
+        assert!(matches!(result, Err(CoverageError::Extract { .. })));
+    }
+
+    #[test]
+    fn a_shape_scoped_qualifier_with_no_override_stays_a_named_phantom() {
+        // `Cmd`/`Sub` match none of tiers 1-4 (no standalone module by design,
+        // no override entry) -- tier 5 must still resolve, not error, so the
+        // row stays on the surface for `HomeColumn` to flag as a `Hole`.
+        let empty = BTreeMap::new();
+        let path = kernel_module_path("Cmd", &empty, &empty, &empty)
+            .expect("a qualifier with no override must fall through to the phantom path");
+        assert_eq!(path, vec!["Ipe".to_owned(), "Cmd".to_owned()]);
+    }
+
+    #[test]
+    fn an_override_entry_whose_module_is_unknown_is_a_typed_drift_error() {
+        // `Key` has a real `QUALIFIER_MODULE_OVERRIDES` entry (`Ipe.Crypto`),
+        // but with every real-module source empty, that entry cannot be
+        // cross-checked against anything -- the override has drifted from the
+        // module lists, and that must surface, not silently stand in.
+        let empty = BTreeMap::new();
+        let result = kernel_module_path("Key", &empty, &empty, &empty);
+        assert!(matches!(
+            result,
+            Err(CoverageError::UnknownQualifier { qualifier: "Key" })
+        ));
     }
 }

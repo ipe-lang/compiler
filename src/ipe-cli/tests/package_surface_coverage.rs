@@ -32,7 +32,9 @@ fn fixture_root() -> PathBuf {
 #[test]
 fn surface_enumerates_all_dep_kinds() {
     let surface = PackageSurface::new(fixture_root());
-    let items = surface.all();
+    let items = surface
+        .all()
+        .expect("the live package surface must enumerate");
 
     // The fixture declares: http (index), local (path), mylib (git) as Ipe deps
     // and stripe, uuid as native Rust deps.
@@ -72,8 +74,12 @@ fn surface_enumerates_all_dep_kinds() {
 #[test]
 fn surface_is_deterministic_and_sorted() {
     let surface = PackageSurface::new(fixture_root());
-    let first = surface.all();
-    let second = surface.all();
+    let first = surface
+        .all()
+        .expect("the live package surface must enumerate");
+    let second = surface
+        .all()
+        .expect("the live package surface must enumerate");
 
     let names_first: Vec<&str> = first.iter().map(|i| i.name.as_str()).collect();
     let names_second: Vec<&str> = second.iter().map(|i| i.name.as_str()).collect();
@@ -91,7 +97,8 @@ fn surface_is_deterministic_and_sorted() {
 
 #[test]
 fn pinned_and_hashed_is_not_applicable_for_path_dep() {
-    let col = PinnedAndHashedColumn::new(fixture_root());
+    let col = PinnedAndHashedColumn::new(&fixture_root())
+        .expect("the column must construct over the fixture project root");
     let path_item = PackageItem {
         name: "local".to_owned(),
         kind: DepKindLabel::Ipe,
@@ -106,7 +113,8 @@ fn pinned_and_hashed_is_not_applicable_for_path_dep() {
 
 #[test]
 fn pinned_and_hashed_is_not_applicable_for_native_dep() {
-    let col = PinnedAndHashedColumn::new(fixture_root());
+    let col = PinnedAndHashedColumn::new(&fixture_root())
+        .expect("the column must construct over the fixture project root");
     let native_item = PackageItem {
         name: "stripe".to_owned(),
         kind: DepKindLabel::Native,
@@ -125,7 +133,8 @@ fn pinned_and_hashed_is_not_applicable_for_native_dep() {
 #[test]
 fn pinned_and_hashed_holes_an_unlocked_index_dep() {
     // The fixture has no ipe.lock, so http is not pinned.
-    let col = PinnedAndHashedColumn::new(fixture_root());
+    let col = PinnedAndHashedColumn::new(&fixture_root())
+        .expect("the column must construct over the fixture project root");
     let http_item = PackageItem {
         name: "http".to_owned(),
         kind: DepKindLabel::Ipe,
@@ -142,7 +151,8 @@ fn pinned_and_hashed_holes_an_unlocked_index_dep() {
 
 #[test]
 fn semver_satisfied_is_not_applicable_for_path_dep() {
-    let col = SemverSatisfiedColumn::new(fixture_root());
+    let col = SemverSatisfiedColumn::new(&fixture_root())
+        .expect("the column must construct over the fixture project root");
     let path_item = PackageItem {
         name: "local".to_owned(),
         kind: DepKindLabel::Ipe,
@@ -157,7 +167,8 @@ fn semver_satisfied_is_not_applicable_for_path_dep() {
 
 #[test]
 fn semver_satisfied_is_not_applicable_for_git_dep() {
-    let col = SemverSatisfiedColumn::new(fixture_root());
+    let col = SemverSatisfiedColumn::new(&fixture_root())
+        .expect("the column must construct over the fixture project root");
     let git_item = PackageItem {
         name: "mylib".to_owned(),
         kind: DepKindLabel::Ipe,
@@ -175,7 +186,8 @@ fn semver_satisfied_is_not_applicable_for_git_dep() {
 
 #[test]
 fn semver_satisfied_is_not_applicable_for_native_dep() {
-    let col = SemverSatisfiedColumn::new(fixture_root());
+    let col = SemverSatisfiedColumn::new(&fixture_root())
+        .expect("the column must construct over the fixture project root");
     let native_item = PackageItem {
         name: "uuid".to_owned(),
         kind: DepKindLabel::Native,
@@ -231,7 +243,8 @@ fn capability_declared_is_ok_when_manifest_declares_capabilities() {
 
 #[test]
 fn provenance_scanned_is_not_applicable_for_path_dep() {
-    let col = ProvenanceScannedColumn::new(fixture_root());
+    let col = ProvenanceScannedColumn::new(fixture_root())
+        .expect("the column must construct over the fixture project root");
     let path_item = PackageItem {
         name: "local".to_owned(),
         kind: DepKindLabel::Ipe,
@@ -246,7 +259,8 @@ fn provenance_scanned_is_not_applicable_for_path_dep() {
 
 #[test]
 fn provenance_scanned_is_not_applicable_for_native_dep() {
-    let col = ProvenanceScannedColumn::new(fixture_root());
+    let col = ProvenanceScannedColumn::new(fixture_root())
+        .expect("the column must construct over the fixture project root");
     let native_item = PackageItem {
         name: "uuid".to_owned(),
         kind: DepKindLabel::Native,
@@ -266,7 +280,8 @@ fn provenance_scanned_is_not_applicable_for_native_dep() {
 fn provenance_scanned_is_not_applicable_when_dep_not_in_lockfile() {
     // The fixture has no ipe.lock, so any dep absent from the lockfile is N/A
     // here (pinned-and-hashed owns that gap).
-    let col = ProvenanceScannedColumn::new(fixture_root());
+    let col = ProvenanceScannedColumn::new(fixture_root())
+        .expect("the column must construct over the fixture project root");
     let http_item = PackageItem {
         name: "http".to_owned(),
         kind: DepKindLabel::Ipe,
@@ -301,7 +316,8 @@ const ALLOWLIST: &[(&str, &str, &str)] = &[
 fn package_surface_matrix_passes_over_fixture_or_matches_allowlist() {
     use std::fmt::Write as _;
 
-    let report = matrix::run_package(fixture_root());
+    let report =
+        matrix::run_package(fixture_root()).expect("the package matrix run must not fail closed");
 
     let mut unexpected = String::new();
     for h in report.holes.iter().filter(|h| {
@@ -327,7 +343,8 @@ fn package_surface_matrix_passes_over_fixture_or_matches_allowlist() {
 
 #[test]
 fn allowlisted_holes_are_still_real() {
-    let report = matrix::run_package(fixture_root());
+    let report =
+        matrix::run_package(fixture_root()).expect("the package matrix run must not fail closed");
     for (aspect, symbol, reason) in ALLOWLIST {
         let present = report
             .holes

@@ -19,6 +19,7 @@ use std::sync::Arc;
 use ipe_docs::env_vars::{ENV_VARS, EXCLUDED_NAMES, EnvVar};
 
 use crate::coverage::contract::Surface;
+use crate::coverage::error::CoverageError;
 use crate::coverage::source_tree::{TreeRefusal, for_each_source};
 
 /// One item of the env-var surface: a registry entry, or an orphan read.
@@ -57,7 +58,7 @@ impl Surface for EnvVarSurface {
         "env-var"
     }
 
-    fn all(&self) -> Vec<EnvItem> {
+    fn all(&self) -> Result<Vec<EnvItem>, CoverageError> {
         let registered: BTreeSet<&'static str> = ENV_VARS.iter().map(|v| v.name).collect();
         let excluded: BTreeSet<&'static str> = EXCLUDED_NAMES.iter().copied().collect();
 
@@ -66,15 +67,15 @@ impl Surface for EnvVarSurface {
         // Orphan reads: a variable a Rust `read_env_var`/`env::var` call reads
         // that neither the registry nor the exclusion list homes. Scoped to Rust
         // read *calls* (not every `IPE_*` mention) so a doc string, a template
-        // placeholder, or a build-script variable is not a false orphan. A
-        // tree that cannot be read whole names no orphan; the read-in-code
-        // column then holes every registered variable with the cause.
+        // placeholder, or a build-script variable is not a false orphan. A tree
+        // that cannot be read whole must refuse the whole surface — silently
+        // reporting zero orphans here would be a false "no orphan reads" pass
+        // over a scan that never actually ran.
         let scan = SourceReads::scan();
-        if let Ok(reads) = scan.env_reads() {
-            for name in reads {
-                if !registered.contains(name.as_str()) && !excluded.contains(name.as_str()) {
-                    items.push(EnvItem::OrphanRead(name.clone()));
-                }
+        let reads = scan.env_reads().map_err(CoverageError::EnvScan)?;
+        for name in reads {
+            if !registered.contains(name.as_str()) && !excluded.contains(name.as_str()) {
+                items.push(EnvItem::OrphanRead(name.clone()));
             }
         }
 
@@ -85,7 +86,7 @@ impl Surface for EnvVarSurface {
                 .cmp(b.name())
                 .then_with(|| kind_rank(a).cmp(&kind_rank(b)))
         });
-        items
+        Ok(items)
     }
 
     fn label(item: &EnvItem) -> String {
@@ -121,7 +122,7 @@ const fn kind_rank(item: &EnvItem) -> u8 {
 /// tree that cannot be read whole answers every question with its refusal.
 #[derive(Clone, Debug)]
 pub struct SourceReads {
-    inner: Arc<Result<SourceReadsInner, TreeRefusal>>,
+    inner: Result<Arc<SourceReadsInner>, Arc<TreeRefusal>>,
 }
 
 #[derive(Debug, Default)]
@@ -146,29 +147,30 @@ impl SourceReads {
             .try_for_each(|root| scan_tree(root, &mut acc))
             .map(|()| {
                 acc.all_reads.extend(acc.rust_literals.iter().cloned());
-                SourceReadsInner {
+                Arc::new(SourceReadsInner {
                     rust_literals: acc.rust_literals,
                     all_reads: acc.all_reads,
                     hand_rolled_truthy: acc.hand_rolled_truthy,
-                }
-            });
-        Self {
-            inner: Arc::new(scanned),
-        }
-    }
-
-    /// The scan, or the refusal that kept it from reading every source file.
-    fn scanned(&self) -> Result<&SourceReadsInner, &TreeRefusal> {
-        self.inner.as_ref().as_ref()
+                })
+            })
+            .map_err(Arc::new);
+        Self { inner: scanned }
     }
 
     /// Names read via a Rust `"IPE_…"` literal — the orphan-read scope.
     ///
+    /// The error is an owned, cheaply-cloned `Arc` so a caller (such as
+    /// [`EnvVarSurface::all`]) can propagate it as a typed [`CoverageError`]
+    /// without a second scan.
+    ///
     /// # Errors
     ///
     /// The [`TreeRefusal`] that kept the scan from reading every source file.
-    pub fn env_reads(&self) -> Result<&BTreeSet<String>, &TreeRefusal> {
-        self.scanned().map(|inner| &inner.rust_literals)
+    pub fn env_reads(&self) -> Result<&BTreeSet<String>, Arc<TreeRefusal>> {
+        match &self.inner {
+            Ok(inner) => Ok(&inner.rust_literals),
+            Err(refusal) => Err(Arc::clone(refusal)),
+        }
     }
 
     /// Names read anywhere in the tree, Rust or shell — the read-in-code scope.
@@ -176,8 +178,11 @@ impl SourceReads {
     /// # Errors
     ///
     /// The [`TreeRefusal`] that kept the scan from reading every source file.
-    pub fn all_reads(&self) -> Result<&BTreeSet<String>, &TreeRefusal> {
-        self.scanned().map(|inner| &inner.all_reads)
+    pub fn all_reads(&self) -> Result<&BTreeSet<String>, Arc<TreeRefusal>> {
+        match &self.inner {
+            Ok(inner) => Ok(&inner.all_reads),
+            Err(refusal) => Err(Arc::clone(refusal)),
+        }
     }
 
     /// Whether any read site hand-rolls a `matches!(v, "1" | "true" | …)` truthy
@@ -186,8 +191,11 @@ impl SourceReads {
     /// # Errors
     ///
     /// The [`TreeRefusal`] that kept the scan from reading every source file.
-    pub fn has_hand_rolled_truthy(&self) -> Result<bool, &TreeRefusal> {
-        self.scanned().map(|inner| inner.hand_rolled_truthy)
+    pub fn has_hand_rolled_truthy(&self) -> Result<bool, Arc<TreeRefusal>> {
+        match &self.inner {
+            Ok(inner) => Ok(inner.hand_rolled_truthy),
+            Err(refusal) => Err(Arc::clone(refusal)),
+        }
     }
 }
 

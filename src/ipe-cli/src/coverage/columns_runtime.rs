@@ -16,13 +16,20 @@ use std::path::{Path, PathBuf};
 use ipe_kernels::{StdlibKernel, Target};
 
 use crate::coverage::contract::{AspectCheck, Cell, StdlibSymbol, SymbolKind};
+use crate::coverage::error::CoverageError;
 use crate::coverage::probe::{self, ProbeUnavailable, StageOutcome};
 use crate::coverage::source_tree::{TreeRefusal, for_each_source};
 
 /// A scratch dir shared by a program-running column across a whole run, so the
 /// per-symbol probes do not each pay a temp-dir setup. RAII-cleaned on drop.
-fn scratch_dir() -> Result<crate::scratch::ScratchDir, String> {
-    crate::scratch::ScratchDir::new("ipe-coverage-probe").map_err(|e| e.to_string())
+///
+/// # Errors
+/// [`CoverageError::Scratch`] if the scratch directory cannot be created — a
+/// hard error, never a silent "probe skipped" advisory: a column that cannot
+/// get a scratch dir cannot prove anything about the symbols it would have
+/// probed.
+fn scratch_dir() -> Result<crate::scratch::ScratchDir, CoverageError> {
+    crate::scratch::ScratchDir::new("ipe-coverage-probe").map_err(CoverageError::Scratch)
 }
 
 /// `name` inside `scratch`, or a hole cell when `name` is not a plain leaf name.
@@ -91,21 +98,17 @@ fn unavailable_cell(reason: &ProbeUnavailable) -> Cell {
 /// combinator bug fell into, an internal-compiler-error in the lowerer included. A
 /// non-value symbol is `NotApplicable`.
 pub struct LowersColumn {
-    scratch: Option<crate::scratch::ScratchDir>,
+    scratch: crate::scratch::ScratchDir,
 }
 
 impl LowersColumn {
-    #[must_use]
-    pub fn new() -> Self {
-        Self {
-            scratch: scratch_dir().ok(),
-        }
-    }
-}
-
-impl Default for LowersColumn {
-    fn default() -> Self {
-        Self::new()
+    /// # Errors
+    /// [`CoverageError::Scratch`] if the shared probe scratch directory cannot
+    /// be created.
+    pub fn new() -> Result<Self, CoverageError> {
+        Ok(Self {
+            scratch: scratch_dir()?,
+        })
     }
 }
 
@@ -115,9 +118,7 @@ impl AspectCheck<StdlibSymbol> for LowersColumn {
     }
 
     fn check(&self, sym: &StdlibSymbol) -> Cell {
-        let Some(scratch) = &self.scratch else {
-            return Cell::Warn("no scratch dir; lowers probe skipped".to_owned());
-        };
+        let scratch = &self.scratch;
         let source = match probe::reference_program(sym) {
             Ok(s) => s,
             Err(reason) => return unavailable_cell(&reason),
@@ -194,21 +195,17 @@ fn classify_lower_outcome(sym: &StdlibSymbol, outcome: StageOutcome, seam: &str)
 /// nested probe that does not even type-check is `NotApplicable` — the generator,
 /// not the symbol, is at fault, so it is not reported as a false lowering hole.
 pub struct ComposesColumn {
-    scratch: Option<crate::scratch::ScratchDir>,
+    scratch: crate::scratch::ScratchDir,
 }
 
 impl ComposesColumn {
-    #[must_use]
-    pub fn new() -> Self {
-        Self {
-            scratch: scratch_dir().ok(),
-        }
-    }
-}
-
-impl Default for ComposesColumn {
-    fn default() -> Self {
-        Self::new()
+    /// # Errors
+    /// [`CoverageError::Scratch`] if the shared probe scratch directory cannot
+    /// be created.
+    pub fn new() -> Result<Self, CoverageError> {
+        Ok(Self {
+            scratch: scratch_dir()?,
+        })
     }
 }
 
@@ -221,9 +218,7 @@ impl AspectCheck<StdlibSymbol> for ComposesColumn {
         if !sym.is_higher_order {
             return Cell::not_applicable("first-order symbol — composition does not apply");
         }
-        let Some(scratch) = &self.scratch else {
-            return Cell::Warn("no scratch dir; composes probe skipped".to_owned());
-        };
+        let scratch = &self.scratch;
         let source = match probe::nested_program(sym) {
             Ok(s) => s,
             Err(reason) => return unavailable_cell(&reason),
@@ -280,21 +275,17 @@ impl AspectCheck<StdlibSymbol> for ComposesColumn {
 ///   longer arises: the probe binds every module under a fixed reserved alias that
 ///   cannot collide with a real qualifier.)
 pub struct BuildRunColumn {
-    scratch: Option<crate::scratch::ScratchDir>,
+    scratch: crate::scratch::ScratchDir,
 }
 
 impl BuildRunColumn {
-    #[must_use]
-    pub fn new() -> Self {
-        Self {
-            scratch: scratch_dir().ok(),
-        }
-    }
-}
-
-impl Default for BuildRunColumn {
-    fn default() -> Self {
-        Self::new()
+    /// # Errors
+    /// [`CoverageError::Scratch`] if the shared probe scratch directory cannot
+    /// be created.
+    pub fn new() -> Result<Self, CoverageError> {
+        Ok(Self {
+            scratch: scratch_dir()?,
+        })
     }
 }
 
@@ -321,9 +312,7 @@ impl AspectCheck<StdlibSymbol> for BuildRunColumn {
                 ),
             };
         }
-        let Some(scratch) = &self.scratch else {
-            return Cell::Warn("no scratch dir; build+run probe skipped".to_owned());
-        };
+        let scratch = &self.scratch;
         let source = match probe::reference_program(sym) {
             Ok(s) => s,
             Err(reason) => return unavailable_cell(&reason),
@@ -686,7 +675,7 @@ impl AspectCheck<StdlibSymbol> for WasmColumn {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::coverage::contract::SymbolKind;
+    use crate::coverage::contract::{SchemeState, SymbolKind};
 
     fn sym(module: &[&str], name: &str) -> StdlibSymbol {
         StdlibSymbol {
@@ -696,7 +685,7 @@ mod tests {
             has_kernel: false,
             has_compiled_source: false,
             exported: true,
-            scheme: None,
+            scheme: SchemeState::Unschemed,
             is_higher_order: false,
         }
     }

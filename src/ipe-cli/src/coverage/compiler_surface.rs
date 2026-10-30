@@ -80,9 +80,9 @@ impl Surface for CompilerSurface {
         "compiler"
     }
 
-    fn all(&self) -> Vec<CompilerCrate> {
+    fn all(&self) -> Result<Vec<CompilerCrate>, crate::coverage::error::CoverageError> {
         let compiler_root = compiler_root();
-        COMPILER_CRATES
+        Ok(COMPILER_CRATES
             .iter()
             .map(|(name, dir)| {
                 let crate_root = compiler_root.join(dir);
@@ -95,7 +95,7 @@ impl Surface for CompilerSurface {
                     crate_path,
                 }
             })
-            .collect()
+            .collect())
     }
 
     fn label(item: &CompilerCrate) -> String {

@@ -32,7 +32,9 @@ const ALLOWLIST: &[(&str, &str, &str)] = &[
 
 #[test]
 fn compiler_surface_is_non_empty() {
-    let items = CompilerSurface.all();
+    let items = CompilerSurface
+        .all()
+        .expect("the live compiler surface must enumerate");
     assert!(
         !items.is_empty(),
         "the compiler surface must enumerate at least one crate",
@@ -41,8 +43,12 @@ fn compiler_surface_is_non_empty() {
 
 #[test]
 fn compiler_surface_is_deterministic_and_sorted() {
-    let first = CompilerSurface.all();
-    let second = CompilerSurface.all();
+    let first = CompilerSurface
+        .all()
+        .expect("the live compiler surface must enumerate");
+    let second = CompilerSurface
+        .all()
+        .expect("the live compiler surface must enumerate");
     let names_first: Vec<&str> = first.iter().map(|c| c.name).collect();
     let names_second: Vec<&str> = second.iter().map(|c| c.name).collect();
     assert_eq!(
@@ -59,7 +65,9 @@ fn compiler_surface_is_deterministic_and_sorted() {
 
 #[test]
 fn a_known_crate_appears_on_the_surface() {
-    let items = CompilerSurface.all();
+    let items = CompilerSurface
+        .all()
+        .expect("the live compiler surface must enumerate");
     assert!(
         items.iter().any(|c| c.name == "ipe_parse"),
         "ipe_parse must appear on the compiler surface",
@@ -70,7 +78,7 @@ fn a_known_crate_appears_on_the_surface() {
 fn compiler_columns_pass_over_the_whole_surface() {
     use std::fmt::Write as _;
 
-    let report = matrix::run_compiler();
+    let report = matrix::run_compiler().expect("the compiler matrix run must not fail closed");
 
     let mut unexpected = String::new();
     for h in report.holes.iter().filter(|h| {
@@ -96,7 +104,7 @@ fn compiler_columns_pass_over_the_whole_surface() {
 
 #[test]
 fn allowlisted_holes_are_still_real() {
-    let report = matrix::run_compiler();
+    let report = matrix::run_compiler().expect("the compiler matrix run must not fail closed");
     for (aspect, symbol, reason) in ALLOWLIST {
         let present = report
             .holes
