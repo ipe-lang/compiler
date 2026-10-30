@@ -585,6 +585,37 @@ const fn shape_canonicals_exist() -> bool {
     true
 }
 
+/// Every [`BUILTIN_TYPES`] qualifier spelling and every
+/// [`KERNEL_TYPE_ALIASES`] module is a [`STDLIB_MODULE_QUALIFIERS`] canonical.
+#[allow(clippy::indexing_slicing)] // every index is guarded by its `while` bound
+const fn kernel_type_qualifiers_exist() -> bool {
+    let mut i = 0;
+    while i < BUILTIN_TYPES.len() {
+        let spellings = BUILTIN_TYPES[i].qualified_via();
+        let mut j = 0;
+        while j < spellings.len() {
+            if !is_stdlib_canonical_const(spellings[j]) {
+                return false;
+            }
+            j += 1;
+        }
+        i += 1;
+    }
+    let mut k = 0;
+    while k < KERNEL_TYPE_ALIASES.len() {
+        if !is_stdlib_canonical_const(KERNEL_TYPE_ALIASES[k].module) {
+            return false;
+        }
+        k += 1;
+    }
+    true
+}
+
+// IPE-RUST-AUDIT:ACCEPTED (Arthur Maciel) — compile-time `const` assertion (not a runtime panic); fails the BUILD if a builtin row's qualifier or a kernel alias's module names no stdlib kernel canonical [ledger #boundary]
+const _: () = assert!(
+    kernel_type_qualifiers_exist(),
+    "a BUILTIN_TYPES qualifier spelling or KERNEL_TYPE_ALIASES module is absent from STDLIB_MODULE_QUALIFIERS",
+);
 // IPE-RUST-AUDIT:ACCEPTED (Arthur Maciel) — compile-time `const` assertion (not a runtime panic); fails the BUILD if a dotted qualifier spelling drifts from the stdlib module table [ledger #boundary]
 const _: () = assert!(
     dotted_spellings_are_paths(),
@@ -1985,15 +2016,6 @@ impl Env {
                     .or_insert((module, segments));
             }
             index.by_path.insert(path.join("."), module);
-        }
-        if let Some(basics) = interner
-            .lookup("Basics")
-            .and_then(|sym| self.kernel_module_of(sym))
-        {
-            index
-                .by_canonical
-                .entry("Basics")
-                .or_insert_with(|| (basics, vec![basics.symbol()]));
         }
         index
     }

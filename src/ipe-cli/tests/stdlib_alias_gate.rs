@@ -532,13 +532,10 @@ fn qualified_and_exposed_kernel_types_canonicalise_identically() -> Result<(), D
             .find(|(_, qualifier)| Some(*qualifier) == canonical.as_deref())
             .map(|(path, _)| path.join("."));
         let Some(path) = path else {
-            // `Basics` is the implicit prelude: no import path names it.
-            assert_eq!(
-                canonical.as_deref(),
-                Some("Basics"),
-                "an unimportable module"
-            );
-            continue;
+            return Err(Diagnostic::CompilerBug {
+                where_: "qualified_and_exposed_kernel_types_canonicalise_identically",
+                detail: format!("{canonical:?} exports types but no import path names it"),
+            });
         };
         for name in types.keys() {
             let args = " Int".repeat(builtin_empty_home_arity(Some(*name)).unwrap_or(0));

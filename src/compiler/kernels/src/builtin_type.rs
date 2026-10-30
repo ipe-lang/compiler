@@ -507,10 +507,9 @@ pub const BUILTIN_TYPES: &[BuiltinRow] = &[
         .tagged(BuiltinTag::Maybe),
     bare("Middleware", KernelImplicit, Opaque),
     bare("Migration", LoweredBelowGuard, Opaque).via(&["Db"]),
-    // `compare : a -> a -> Order` makes `Basics.Order` a spelling of this row.
-    bare("Order", LoweredBelowGuard, Opaque)
-        .via(&["Basics"])
-        .tagged(BuiltinTag::Order),
+    // `Basics.Order` names this row through the compiled-source `Ipe.Basics`
+    // home, not a kernel qualifier, so the row carries no `via`.
+    bare("Order", LoweredBelowGuard, Opaque).tagged(BuiltinTag::Order),
     bare("PanicInfo", LoweredBelowGuard, Opaque),
     // `Ipe.Path`'s validated path: the traversal and NUL refusal boundary.
     bare("Path", Reserved, SecretOrSink).tagged(BuiltinTag::Path),
