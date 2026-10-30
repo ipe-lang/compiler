@@ -53,6 +53,21 @@ pub struct ModuleApi {
     pub value_types: BTreeMap<String, TyDoc>,
     /// Exported union type name → its exported shape.
     pub unions: BTreeMap<String, UnionApi>,
+    /// Exported kernel aliases whose kernel carries no scheme.
+    ///
+    /// Every use of such a kernel is refused (IPE-L0108), so the type checker
+    /// holds no signature for it and it is absent from [`Self::values`]; it is
+    /// listed here so a consumer that documents the module accounts for it
+    /// rather than losing it.
+    pub unbacked_kernel_aliases: BTreeSet<String>,
+}
+
+/// The scheme an exported kernel alias carries.
+enum AliasScheme {
+    /// The kernel's registered scheme, from the kernel type table.
+    Kernel(Ty),
+    /// The kernel carries no scheme: every use is refused (IPE-L0108).
+    Unbacked,
 }
 
 /// One exported union type's diff-relevant shape: its type-parameter arity and
@@ -244,7 +259,7 @@ fn signature_doc(ty: &Ty, interner: &ipe_intern::Interner) -> Result<TyDoc, Diag
 /// reaches the surface whichever way it is bound.
 fn project_interface(
     interface: &TypedInterface,
-    kernel_aliases: &[(ipe_intern::Symbol, Ty)],
+    kernel_aliases: &[(ipe_intern::Symbol, AliasScheme)],
     interner: &ipe_intern::Interner,
     module: &ModulePath,
 ) -> Result<ModuleApi, DiffError> {
@@ -263,13 +278,21 @@ fn project_interface(
         values.insert(name.to_owned(), render_ty(&doc));
         value_types.insert(name.to_owned(), doc);
     }
-    for (name, ty) in kernel_aliases {
+    let mut unbacked_kernel_aliases = BTreeSet::new();
+    for (name, scheme) in kernel_aliases {
         let Some(name) = interner.resolve(*name) else {
             continue;
         };
         if values.contains_key(name) {
             continue;
         }
+        let ty = match scheme {
+            AliasScheme::Kernel(ty) => ty,
+            AliasScheme::Unbacked => {
+                unbacked_kernel_aliases.insert(name.to_owned());
+                continue;
+            }
+        };
         let doc = signature_doc(ty, interner).map_err(typecheck_err)?;
         values.insert(name.to_owned(), render_ty(&doc));
         value_types.insert(name.to_owned(), doc);
@@ -309,6 +332,7 @@ fn project_interface(
         values,
         value_types,
         unions,
+        unbacked_kernel_aliases,
     })
 }
 
@@ -590,7 +614,7 @@ fn exported_kernel_aliases(
     source_root: ipe_db::SourceRoot,
     file: ipe_db::SourceFile,
     path: &[String],
-) -> Result<Vec<(ipe_intern::Symbol, Ty)>, DiffError> {
+) -> Result<Vec<(ipe_intern::Symbol, AliasScheme)>, DiffError> {
     let typecheck_err = |diag: Diagnostic| DiffError::Typecheck {
         module: path.to_vec(),
         diag: Box::new(diag),
@@ -604,17 +628,29 @@ fn exported_kernel_aliases(
     let table = ipe_db::kernel_types(db, source_root)
         .clone()
         .map_err(typecheck_err)?;
-    Ok(canonical
+    canonical
         .exports
         .kernel_aliases
         .iter()
-        .filter_map(|(name, alias)| {
+        .map(|(name, alias)| {
+            if alias.id.scheme_shape().is_none() {
+                return Ok((*name, AliasScheme::Unbacked));
+            }
             table
                 .iter()
                 .find(|(kernel, _)| *kernel == alias.id)
-                .map(|(_, ty)| (*name, ty.clone()))
+                .map(|(_, ty)| (*name, AliasScheme::Kernel(ty.clone())))
+                .ok_or_else(|| {
+                    typecheck_err(Diagnostic::CompilerBug {
+                        where_: "api_surface.kernel_alias",
+                        detail: format!(
+                            "kernel {:?} has a scheme shape but no kernel type table row",
+                            alias.id
+                        ),
+                    })
+                })
         })
-        .collect())
+        .collect()
 }
 
 /// Why a module has no typed interface: a red program or an open one.
