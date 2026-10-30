@@ -2453,9 +2453,16 @@ released → {path} (single self-jailing binary; run `--capabilities` to audit)
 
 released (bundle) → {path} (run `./ipe-wrapper -- <args>`; WARNING: ipe-app can be run directly, bypassing the sandbox — prefer embed mode for production)
 
+## android-build-steps
+
+1. `gradle wrapper` once with Gradle {gradle} or newer — the project ships no wrapper.
+2. `./gradlew assembleDebug` (Android SDK, API 34) builds an APK signed with the SDK's debug key, for local install only.
+3. `./gradlew installDebug` installs it onto a running emulator or device.
+4. Store build: add a `signingConfig` for your keystore to `app/build.gradle`, then run `./gradlew assembleRelease`.
+
 ## mobile-android-note
 
-note: an unsigned Android Gradle project is written here. `./gradlew assembleDebug` (with the Android SDK) builds an APK signed with the SDK's debug key, for local install only; a store build needs your own keystore — add a `signingConfig` for it to `app/build.gradle`, then run `./gradlew assembleRelease`.
+note: an unsigned Android Gradle project is written here. To build it:
 
 ## mobile-ios-note
 

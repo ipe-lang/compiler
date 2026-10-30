@@ -3903,6 +3903,15 @@ public final class IpeApplication extends Application {
 }
 ";
 
+/// The Android build steps: wrapper bootstrap, debug build, install, store build.
+///
+/// The one rendering every producer (the release-note under `pack web client
+/// android`, and this README) carries verbatim, so neither can hand-write a
+/// `gradlew` line that drifts from the other.
+pub(crate) fn android_build_steps() -> crate::text::Message {
+    crate::text::android_build_steps(ANDROID_GRADLE_MIN_VERSION)
+}
+
 /// The Android shell's build/README note.
 ///
 /// The Gradle project carries no `signingConfig`, so the note states that it is
@@ -3941,20 +3950,15 @@ fn android_readme(root_name: &str, profile: BundleProfile, base: &MountBase) -> 
          Not checked without a device: the permission prompts, the camera capture,\n\
          notification taps and push delivery. Check them on a device before release.\n\
          \n\
-         Gradle: no wrapper ships with the project. Run `gradle wrapper` once with\n\
-         Gradle {gradle} or newer, then use ./gradlew.\n\
+         Signing: this Gradle project is unsigned by default.\n\
          \n\
-         Signing: this Gradle project is unsigned.\n\
-         - ./gradlew assembleDebug (requires the Android SDK; API 34) builds an APK\n\
-         \x20 signed with the SDK's debug key, for local install only.\n\
-         - A store build needs your own keystore: add a signingConfig for it to\n\
-         \x20 app/build.gradle, then run ./gradlew assembleRelease.\n",
-        gradle = ANDROID_GRADLE_MIN_VERSION,
+         {steps}\n",
         entry = android_entry_url(base),
         header = BLOCKED_HEADER.0,
         value = BLOCKED_HEADER.1,
         csp_header = csp::HEADER_NAME,
         local = csp::ANDROID_ASSET_ORIGIN,
+        steps = android_build_steps(),
     )
 }
 
@@ -5425,6 +5429,237 @@ mod tests {
         assert!(dev.contains("a dev bundle"), "{dev}");
         assert!(release.contains("a production bundle"), "{release}");
         assert_ne!(dev, release);
+    }
+
+    /// The README carries the one rendered `android_build_steps()` block
+    /// verbatim, not a paraphrase or a hand-written subset of it.
+    #[test]
+    fn android_readme_carries_build_steps() {
+        let readme = android_readme("app-android", BundleProfile::Dev, &MountBase::root());
+        assert!(
+            readme.contains(android_build_steps().as_str()),
+            "README must carry the rendered android_build_steps() block verbatim: {readme}"
+        );
+    }
+
+    // ── Android build steps: one source for every surface ──────────────────────
+
+    /// The text strictly between one `open`/`close` marker pair in `doc`, or why
+    /// there is not exactly one pair: no `open`, a second `open` before the
+    /// first `close`, or an `open` with no matching `close`.
+    fn marked_block<'a>(doc: &'a str, open: &str, close: &str) -> Result<&'a str, String> {
+        let Some(start) = doc.find(open) else {
+            return Err(format!("no `{open}` marker"));
+        };
+        let after_open = &doc[start.saturating_add(open.len())..];
+        if after_open.find(open).is_some() {
+            return Err(format!("more than one `{open}` marker"));
+        }
+        let Some(end) = after_open.find(close) else {
+            return Err(format!("`{open}` marker has no matching `{close}`"));
+        };
+        Ok(after_open[..end].trim())
+    }
+
+    /// [`marked_block`] refuses a missing, doubled, or unterminated marker, and
+    /// extracts the trimmed interior on a clean fixture — so a test that reads
+    /// `marked_block`'s `Ok` cannot be fooled by a scanner that always succeeds.
+    #[test]
+    fn marked_block_refuses_a_missing_doubled_or_unterminated_marker() {
+        const OPEN: &str = "<!-- m -->";
+        const CLOSE: &str = "<!-- /m -->";
+        assert!(marked_block("no marker here", OPEN, CLOSE).is_err());
+        assert!(
+            marked_block(&format!("{OPEN}a{CLOSE}...{OPEN}b{CLOSE}"), OPEN, CLOSE).is_err(),
+            "a second open marker must be refused, not silently paired with the first close"
+        );
+        assert!(
+            marked_block(&format!("{OPEN}a, no close"), OPEN, CLOSE).is_err(),
+            "an unterminated marker must be refused"
+        );
+        assert_eq!(
+            marked_block(&format!("before{OPEN}  x  {CLOSE}after"), OPEN, CLOSE),
+            Ok("x")
+        );
+    }
+
+    /// The repository root this `ipe-cli` crate was built from.
+    fn repo_root_for_tests() -> &'static Path {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .ancestors()
+            .nth(2)
+            .expect("src/ipe-cli has a repo root two levels up")
+    }
+
+    /// The doc guide's one `android-build-steps` block is line-for-line equal
+    /// to the catalog's own rendering, so the guide cannot hand-drift from the
+    /// fn every other producer calls.
+    #[test]
+    fn android_build_steps_docs_block_is_rendered_block() {
+        let path = repo_root_for_tests().join("docs/guide/delivery.md");
+        let doc = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("{} reads: {e}", path.display()));
+        let block = marked_block(
+            &doc,
+            "<!-- android-build-steps -->",
+            "<!-- /android-build-steps -->",
+        )
+        .unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+        let rendered: Vec<&str> = android_build_steps().lines().collect();
+        let doc_lines: Vec<&str> = block.lines().collect();
+        assert_eq!(
+            doc_lines, rendered,
+            "docs/guide/delivery.md's android-build-steps block drifted from \
+             android_build_steps() — regenerate it, never hand-edit"
+        );
+    }
+
+    /// One file:line naming a hand-written Gradle wrapper/build command outside
+    /// its one sanctioned home: the `## android-build-steps` catalog section,
+    /// or a `<!-- android-build-steps -->` marked doc block.
+    #[derive(Debug, PartialEq, Eq)]
+    struct StrayGradleLine {
+        file: String,
+        line: usize,
+    }
+
+    impl std::fmt::Display for StrayGradleLine {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "{}:{}", self.file, self.line)
+        }
+    }
+
+    /// Every line of `text` naming `gradlew`/`gradle wrapper` outside the
+    /// catalog section or a marked doc block, labelled `file` for the report.
+    fn stray_gradle_lines(file: &str, text: &str) -> Vec<StrayGradleLine> {
+        let mut inside = false;
+        let mut hits = Vec::new();
+        for (idx, line) in text.lines().enumerate() {
+            let trimmed = line.trim();
+            if trimmed == "## android-build-steps" || trimmed == "<!-- android-build-steps -->" {
+                inside = true;
+                continue;
+            }
+            if inside
+                && (trimmed.starts_with("## ")
+                    || trimmed.starts_with("# ")
+                    || trimmed == "<!-- /android-build-steps -->")
+            {
+                inside = false;
+            }
+            if inside {
+                continue;
+            }
+            if line.contains("gradlew") || line.contains("gradle wrapper") {
+                hits.push(StrayGradleLine {
+                    file: file.to_owned(),
+                    line: idx.saturating_add(1),
+                });
+            }
+        }
+        hits
+    }
+
+    /// `.md` files under `root` (or `root` itself, when it is already a file),
+    /// walked to a depth and count ceiling so a cyclic or runaway tree cannot
+    /// hang the scan.
+    fn markdown_files_under(root: &Path) -> Vec<PathBuf> {
+        const MAX_DEPTH: usize = 12;
+        const MAX_FILES: usize = 4096;
+
+        fn walk(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) {
+            assert!(
+                depth <= MAX_DEPTH,
+                "android-build-steps scan: depth ceiling exceeded under {}",
+                dir.display()
+            );
+            let Ok(entries) = std::fs::read_dir(dir) else {
+                return;
+            };
+            for entry in entries.flatten() {
+                assert!(
+                    out.len() <= MAX_FILES,
+                    "android-build-steps scan: file-count ceiling exceeded under {}",
+                    dir.display()
+                );
+                let path = entry.path();
+                if path.is_dir() {
+                    walk(&path, depth.saturating_add(1), out);
+                } else if path.extension().is_some_and(|ext| ext == "md") {
+                    out.push(path);
+                }
+            }
+        }
+
+        if root.is_file() {
+            return vec![root.to_path_buf()];
+        }
+        let mut out = Vec::new();
+        walk(root, 0, &mut out);
+        out
+    }
+
+    /// Every file the hand-written-Gradle scan walks: the whole `docs/` tree,
+    /// the README, the CLI help pages, and the message catalog — every surface
+    /// a build procedure could be hand-copied into.
+    fn gradle_scan_targets(repo_root: &Path, cli_manifest_dir: &Path) -> Vec<PathBuf> {
+        let mut files = markdown_files_under(&repo_root.join("docs"));
+        files.push(repo_root.join("README.md"));
+        files.extend(markdown_files_under(&cli_manifest_dir.join("help")));
+        files.push(cli_manifest_dir.join("text/messages.md"));
+        files
+    }
+
+    /// No file under `docs/`, `README.md`, the CLI help pages, or the message
+    /// catalog hand-writes a `gradlew`/`gradle wrapper` line outside the one
+    /// catalog section or the one marked doc block: every other mention must
+    /// come from rendering [`android_build_steps`], never from a second,
+    /// independently drifting copy.
+    #[test]
+    fn no_hand_written_gradle_commands() {
+        let cli_manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let repo_root = repo_root_for_tests();
+        let mut hits = Vec::new();
+        for file in gradle_scan_targets(repo_root, cli_manifest_dir) {
+            let Ok(text) = std::fs::read_to_string(&file) else {
+                continue;
+            };
+            let label = file
+                .strip_prefix(repo_root)
+                .unwrap_or(&file)
+                .display()
+                .to_string();
+            hits.extend(stray_gradle_lines(&label, &text));
+        }
+        assert!(
+            hits.is_empty(),
+            "hand-written gradlew/gradle-wrapper line(s) outside android-build-steps: {}",
+            hits.iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+
+    /// [`stray_gradle_lines`] finds a stray `./gradlew` line outside the
+    /// sanctioned sections, and finds nothing on a clean fixture — so
+    /// `no_hand_written_gradle_commands` above cannot pass vacuously on a
+    /// scanner that never actually looks.
+    #[test]
+    fn stray_gradle_lines_finds_the_offender_and_nothing_on_a_clean_fixture() {
+        let dirty = "intro\n./gradlew build\nmore text\n";
+        let hits = stray_gradle_lines("fixture.md", dirty);
+        assert_eq!(
+            hits,
+            vec![StrayGradleLine {
+                file: "fixture.md".to_owned(),
+                line: 2,
+            }]
+        );
+
+        let clean =
+            "## android-build-steps\n\n1. `gradlew assembleDebug`\n\n## next\n\nno gradle here\n";
+        assert!(stray_gradle_lines("fixture.md", clean).is_empty());
     }
 
     // ── Mount base: every shell URL and handler boundary derives from it ──────
