@@ -34,26 +34,11 @@ pub struct Builtins {
     /// handler parameter type in `mapError` / `onError` so a bare lambda `\e ->
     /// ...` infers `e : Error` without leaving a free variable.
     pub error: Symbol,
-    /// `ErrorKind` — the 13-variant classification carried by `Error`'s first
-    /// field. Registered as a Prelude built-in exactly
-    /// like `Order` — see `ipe_lower`'s `enum_variants`/`ctor_arity`
-    /// (E-12), which already validate `Error kind info ->` patterns.
+    /// `ErrorKind` — the classification carried by `Error`'s first field. Its
+    /// constructors are canon's `BUILTIN_UNIONS` row, read by
+    /// [`Self::ctor_schemes`] and by `ipe_lower`'s seeded unions; no symbol of
+    /// one is held here.
     pub errorkind: Symbol,
-    /// The 13 `ErrorKind` nullary constructor symbols, in canon's registered
-    /// index order (`ipe_canon::builtins::BUILTIN_UNIONS`) — do not reorder.
-    pub ek_io: Symbol,
-    pub ek_network: Symbol,
-    pub ek_ffi: Symbol,
-    pub ek_decode: Symbol,
-    pub ek_timeout: Symbol,
-    pub ek_not_found: Symbol,
-    pub ek_permission_denied: Symbol,
-    pub ek_invalid_input: Symbol,
-    pub ek_conflict: Symbol,
-    pub ek_unavailable: Symbol,
-    pub ek_unexpected: Symbol,
-    pub ek_limit_exceeded: Symbol,
-    pub ek_update_required: Symbol,
     /// `ErrorDetails` — the 6-variant enrichment union carried on
     /// `ErrorInfo.details`. Registered as a Prelude
     /// built-in exactly like `ErrorKind` — see `ipe_lower`'s
@@ -822,19 +807,6 @@ impl Builtins {
             false_: interner.intern("False")?,
             error: interner.intern("Error")?,
             errorkind: interner.intern("ErrorKind")?,
-            ek_io: interner.intern("Io")?,
-            ek_network: interner.intern("Network")?,
-            ek_ffi: interner.intern("Ffi")?,
-            ek_decode: interner.intern("Decode")?,
-            ek_timeout: interner.intern("Timeout")?,
-            ek_not_found: interner.intern("NotFound")?,
-            ek_permission_denied: interner.intern("PermissionDenied")?,
-            ek_invalid_input: interner.intern("InvalidInput")?,
-            ek_conflict: interner.intern("Conflict")?,
-            ek_unavailable: interner.intern("Unavailable")?,
-            ek_unexpected: interner.intern("Unexpected")?,
-            ek_limit_exceeded: interner.intern("LimitExceeded")?,
-            ek_update_required: interner.intern("UpdateRequired")?,
             errordetails: interner.intern("ErrorDetails")?,
             backoffstrategy: interner.intern("BackoffStrategy")?,
             ed_ffi_panic: interner.intern("FfiPanic")?,

@@ -208,8 +208,7 @@ pub fn lower(
     // `type` declaration in any Ipê source file — the compiler synthesises their
     // `EnumDef`s at lowering time when a Db kernel call is detected.
     let builtins = lower::BuiltinCtors {
-        maybe: interner.intern("Maybe").map_err(homeless)?,
-        result: interner.intern("Result").map_err(homeless)?,
+        seeded_unions: lower::intern_seeded_unions(interner).map_err(homeless)?,
         just: interner.intern("Just").map_err(homeless)?,
         nothing: interner.intern("Nothing").map_err(homeless)?,
         ok: interner.intern("Ok").map_err(homeless)?,
@@ -244,59 +243,12 @@ pub fn lower(
         arith_add: interner.intern("ArithAdd").map_err(homeless)?,
         arith_sub: interner.intern("ArithSub").map_err(homeless)?,
         arith_mul: interner.intern("ArithMul").map_err(homeless)?,
-        // ── Order ADT ─────────────────────────────────────────────────
-        order: interner.intern("Order").map_err(homeless)?,
-        lt: interner.intern("LT").map_err(homeless)?,
-        eq: interner.intern("EQ").map_err(homeless)?,
-        gt: interner.intern("GT").map_err(homeless)?,
-        // ── Error / ErrorKind ────────────────────────────────────
-        error: interner.intern("Error").map_err(homeless)?,
-        errorkind: interner.intern("ErrorKind").map_err(homeless)?,
-        ek_io: interner.intern("Io").map_err(homeless)?,
-        ek_network: interner.intern("Network").map_err(homeless)?,
-        ek_ffi: interner.intern("Ffi").map_err(homeless)?,
-        ek_decode: interner.intern("Decode").map_err(homeless)?,
-        ek_timeout: interner.intern("Timeout").map_err(homeless)?,
-        ek_not_found: interner.intern("NotFound").map_err(homeless)?,
-        ek_permission_denied: interner.intern("PermissionDenied").map_err(homeless)?,
-        ek_invalid_input: interner.intern("InvalidInput").map_err(homeless)?,
-        ek_conflict: interner.intern("Conflict").map_err(homeless)?,
-        ek_unavailable: interner.intern("Unavailable").map_err(homeless)?,
-        ek_unexpected: interner.intern("Unexpected").map_err(homeless)?,
-        ek_limit_exceeded: interner.intern("LimitExceeded").map_err(homeless)?,
-        ek_update_required: interner.intern("UpdateRequired").map_err(homeless)?,
-        // ── ErrorDetails ─────────────────────────────────────────────────────
-        errordetails: interner.intern("ErrorDetails").map_err(homeless)?,
-        ed_ffi_panic: interner.intern("FfiPanic").map_err(homeless)?,
-        ed_type_mismatch: interner.intern("TypeMismatch").map_err(homeless)?,
-        ed_http_status: interner.intern("HttpStatus").map_err(homeless)?,
-        ed_json_decode: interner.intern("JsonDecode").map_err(homeless)?,
-        ed_custom: interner.intern("Custom").map_err(homeless)?,
-        ed_database: interner.intern("Database").map_err(homeless)?,
-        // ── DbFailure ADT ────────────────────────────────────────────────────
-        db_failure: interner.intern("DbFailure").map_err(homeless)?,
-        db_failure_ctors: lower::intern_db_failure_ctors(interner).map_err(homeless)?,
-        // ── AuthError ADT ────────────────────────────────────────────────────
-        auth_error: interner.intern("AuthError").map_err(homeless)?,
-        auth_error_ctors: lower::intern_auth_error_ctors(interner).map_err(homeless)?,
-        http_method: interner.intern("HttpMethod").map_err(homeless)?,
-        hm_get: interner.intern("Get").map_err(homeless)?,
-        hm_post: interner.intern("Post").map_err(homeless)?,
-        hm_put: interner.intern("Put").map_err(homeless)?,
-        hm_delete: interner.intern("Delete").map_err(homeless)?,
-        hm_patch: interner.intern("Patch").map_err(homeless)?,
-        hm_head: interner.intern("Head").map_err(homeless)?,
-        hm_options: interner.intern("Options").map_err(homeless)?,
         // ── BackoffStrategy ADT ─────────────────────────────────
         backoffstrategy: interner.intern("BackoffStrategy").map_err(homeless)?,
         bs_linear: interner.intern("Linear").map_err(homeless)?,
         bs_linear_with_jitter: interner.intern("LinearWithJitter").map_err(homeless)?,
         bs_exponential: interner.intern("Exponential").map_err(homeless)?,
         bs_exponential_with_jitter: interner.intern("ExponentialWithJitter").map_err(homeless)?,
-        // ── RedirectPolicy ADT ─────────────────────────────────
-        redirect_policy: interner.intern("RedirectPolicy").map_err(homeless)?,
-        no_redirects: interner.intern("NoRedirects").map_err(homeless)?,
-        follow_redirects: interner.intern("FollowRedirects").map_err(homeless)?,
         kernel_types: ipe_types::Builtins::new(interner).map_err(homeless)?,
     };
     lower::Lowerer::new(
