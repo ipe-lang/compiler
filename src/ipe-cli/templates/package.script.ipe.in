@@ -9,7 +9,7 @@ package =
     , version = "0.1.0"
     , delivery =
         { desktop = { title = "{name}", width = 1024, height = 768 }
-        , mobile = { bundleId = "com.example.{name}", orientation = Portrait }
+        , mobile = { bundleId = "{bundle_id}", orientation = Any }
         , browser = { basePath = "/" }
         }
     }

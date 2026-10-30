@@ -32,6 +32,7 @@ use std::path::{Path, PathBuf};
 
 use crate::delivery::Runtime;
 use crate::delivery_set::ShipEntry;
+use crate::project::BundleId;
 use crate::{CliError, health, style, text};
 
 // ── per-shape Main.ipe templates ─────────────────────────────────────────────
@@ -345,16 +346,24 @@ fn fill_name(template: &str, project_name: &str) -> String {
     template.replace("{name}", escaped.as_str())
 }
 
-/// Fill a `package.ipe` template's `{name}` and (web-only) `{ships}` holes.
+/// Fill a `package.ipe` template's `{bundle_id}`, (web-only) `{ships}`, and
+/// `{name}` holes.
 ///
 /// `{ships}` is a fixed builder expression drawn from the runtime's closed set,
 /// never user input, so it needs no literal escaping; non-web templates carry no
-/// `{ships}` hole, so the substitution is a no-op there.
+/// `{ships}` hole, so the substitution is a no-op there. `{bundle_id}` is
+/// [`BundleId::derived`] from the name, escaped as the second layer. The fixed
+/// holes fill before `{name}`, so a name that spells a hole stays literal text.
 fn fill_package(template: &str, project_name: &str, runtime: Runtime) -> String {
-    // `{ships}` is a template placeholder substituted by `.replace`, not a
-    // `format!` argument — the formatting-args lint's heuristic misreads it.
+    let bundle_id = IpeStringLiteral::escaped(BundleId::derived(project_name).as_str());
+    // `{bundle_id}` and `{ships}` are template placeholders substituted by
+    // `.replace`, not `format!` arguments — the formatting-args lint's
+    // heuristic misreads them.
     #[allow(clippy::literal_string_with_formatting_args)]
-    fill_name(template, project_name).replace("{ships}", &ships_fill(runtime))
+    let filled = template
+        .replace("{bundle_id}", bundle_id.as_str())
+        .replace("{ships}", &ships_fill(runtime));
+    fill_name(&filled, project_name)
 }
 
 // ── entry point ───────────────────────────────────────────────────────────────
@@ -1734,10 +1743,10 @@ mod tests {
             parsed.delivery.browser.base,
             ipe_runtime_rust::encoding::MountBase::root()
         );
-        // mobile default orientation
+        // mobile default orientation: free rotation
         assert_eq!(
             parsed.delivery.mobile.orientation,
-            crate::project::ScreenOrientation::Portrait
+            crate::project::ScreenOrientation::Any
         );
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -1860,7 +1869,43 @@ mod tests {
             parsed.name, hostile,
             "the hostile name round-trips through the escaped literal unchanged"
         );
+        assert_eq!(
+            parsed.delivery.mobile.bundle_id,
+            Some(BundleId::derived(hostile)),
+            "the scaffolded bundleId is the name's derived id"
+        );
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn scaffolded_bundle_id_is_the_derived_id_and_re_parses() {
+        for (index, name) in ["my-app", "9lives", "class", "{bundle_id}", "{ships}"]
+            .into_iter()
+            .enumerate()
+        {
+            let files = managed_files(name, InitShape::Web, Runtime::Served);
+            let manifest = files
+                .iter()
+                .find(|f| f.rel == Path::new("package.ipe"))
+                .expect("init writes a package.ipe");
+
+            let root =
+                ipe_test_temp::temp_root().join(format!("ipe_init_derived_bundle_id_{index}"));
+            let _ = std::fs::remove_dir_all(&root);
+            write_stub_src(&root);
+            let path = root.join("package.ipe");
+            std::fs::write(&path, &manifest.content).expect("write scaffolded package.ipe");
+
+            let parsed = crate::project::parse_manifest(&path)
+                .expect("scaffolded manifest re-parses under the bundle-id grammar");
+            assert_eq!(parsed.name, name, "a name spelling a hole stays literal");
+            assert_eq!(
+                parsed.delivery.mobile.bundle_id,
+                Some(BundleId::derived(name)),
+                "the scaffolded bundleId for `{name}` is its derived id"
+            );
+            let _ = std::fs::remove_dir_all(&root);
+        }
     }
 
     #[test]
@@ -1876,6 +1921,14 @@ mod tests {
             assert!(
                 shape.package_ipe().contains("{name}"),
                 "package template for shape '{}' is missing the {{name}} hole",
+                shape.label()
+            );
+            assert!(
+                shape
+                    .package_ipe()
+                    .contains("bundleId = \"{bundle_id}\", orientation = Any"),
+                "package template for shape '{}' does not scaffold the derived \
+                 bundleId and free rotation",
                 shape.label()
             );
         }

@@ -192,9 +192,23 @@ type alias DesktopConfig =
 
 -- | Configuration for the `web client ios` / `web client android` mobile hosts.
 --
--- `bundleId` is the reverse-DNS application identifier required by both
--- platforms (`com.example.myapp`). `orientation` locks the device orientation
--- on launch; the host's native shell enforces it. `push` names the identifiers
+-- `bundleId` is the reverse-DNS application identifier both platforms install
+-- the app under (`com.example.myapp`): two or more `.`-separated labels, each an
+-- ASCII letter then ASCII letters or digits, at most 128 bytes in all, and no
+-- label a Java reserved word; the manifest refuses any other value. Android
+-- (package and application id) and iOS (`CFBundleIdentifier`) use it verbatim.
+-- An absent `bundleId` is `com.ipe.` followed by the lowercased letters and
+-- digits of the package name.
+--
+-- `orientation` is the orientation the app runs in; an absent one is `Any`.
+-- `Portrait` locks portrait (Android `portrait`; iOS portrait only). `Landscape`
+-- locks landscape, either side up (Android `sensorLandscape`; iOS landscape left
+-- and right). `Any` rotates freely (Android `unspecified`; iOS portrait and both
+-- landscapes, plus upside down on iPad). A locked orientation also opts the iPad
+-- app out of split-screen multitasking (`UIRequiresFullScreen`). The lock is
+-- advisory where the platform overrides it: iPadOS releases that ignore
+-- `UIRequiresFullScreen` for resizable windows, and Android large screens for an
+-- app targeting API 36 or later. `push` names the identifiers
 -- the shells register for push messages with; it is refused unless
 -- `capabilities.accepts` lists `JsPort Push`, and an iOS or Android pack of an
 -- app that accepts `JsPort Push` is refused without it.

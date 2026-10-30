@@ -186,9 +186,10 @@ impl Default for DesktopDelivery {
 /// `delivery.mobile` — mobile-host shell settings.
 #[derive(Clone, Debug, Default)]
 pub struct MobileDelivery {
-    /// Reverse-DNS application identifier (`com.example.myapp`).
-    pub bundle_id: String,
-    /// Locked launch orientation.
+    /// The declared `bundleId`; `None` when the field is absent, resolved to
+    /// [`BundleId::derived`] by the mobile shell's identity.
+    pub bundle_id: Option<BundleId>,
+    /// The launch orientation the shell enforces.
     pub orientation: ScreenOrientation,
     /// The push registration identifiers; `None` when the field is absent.
     pub push: Option<PushDelivery>,
@@ -331,20 +332,247 @@ fcm_identifier! {
     FcmSenderId,
 }
 
+/// The longest bundle identifier [`BundleId::parse`] admits, in bytes.
+pub const MAX_BUNDLE_ID_LEN: usize = 128;
+
+/// The prefix of every [`BundleId::derived`] identifier.
+const DERIVED_PREFIX: &str = "com.ipe.";
+
+/// The bytes a [`BundleId::derived`] label may fill after [`DERIVED_PREFIX`].
+const DERIVED_LABEL_ROOM: usize = MAX_BUNDLE_ID_LEN - DERIVED_PREFIX.len();
+
+/// The fallback label `app` plus one name byte fits: the subtraction
+/// underflows, failing the build, if the prefix ever leaves less room.
+const _: usize = DERIVED_LABEL_ROOM - 4;
+
+/// The Java reserved keywords and literals, which no bundle-id label may be.
+///
+/// The Android `namespace` is the package of the generated `R` class, so each
+/// label must be a legal Java package segment. The comparison is case-sensitive.
+const JAVA_RESERVED_WORDS: &[&str] = &[
+    "abstract",
+    "assert",
+    "boolean",
+    "break",
+    "byte",
+    "case",
+    "catch",
+    "char",
+    "class",
+    "const",
+    "continue",
+    "default",
+    "do",
+    "double",
+    "else",
+    "enum",
+    "extends",
+    "final",
+    "finally",
+    "float",
+    "for",
+    "goto",
+    "if",
+    "implements",
+    "import",
+    "instanceof",
+    "int",
+    "interface",
+    "long",
+    "native",
+    "new",
+    "package",
+    "private",
+    "protected",
+    "public",
+    "return",
+    "short",
+    "static",
+    "strictfp",
+    "super",
+    "switch",
+    "synchronized",
+    "this",
+    "throw",
+    "throws",
+    "transient",
+    "try",
+    "void",
+    "volatile",
+    "while",
+    "_",
+    "true",
+    "false",
+    "null",
+];
+
+/// The [`JAVA_RESERVED_WORDS`] entry `label` equals, if any.
+fn java_reserved_word(label: &str) -> Option<&'static str> {
+    JAVA_RESERVED_WORDS
+        .iter()
+        .copied()
+        .find(|word| *word == label)
+}
+
+/// A bundle identifier every mobile shell reads verbatim.
+///
+/// The grammar is the intersection of the Android `applicationId` and the Apple
+/// `CFBundleIdentifier` grammars: two or more `.`-separated labels, each an
+/// ASCII letter followed by ASCII letters or digits, at most
+/// [`MAX_BUNDLE_ID_LEN`] bytes, and no label a Java reserved word. The field is
+/// private, so every value went through [`BundleId::parse`] or
+/// [`BundleId::derived`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BundleId(String);
+
+impl BundleId {
+    /// Parse `text` against the bundle-id grammar.
+    ///
+    /// # Errors
+    ///
+    /// In judging order: `Empty`, `TooLong`, the first refused `Byte`,
+    /// `EmptyLabel`, `LabelStartsWithDigit`, `OneLabel`, then `ReservedWord`.
+    pub fn parse(text: &str) -> Result<Self, BundleIdRefusal> {
+        if text.is_empty() {
+            return Err(BundleIdRefusal::Empty);
+        }
+        if text.len() > MAX_BUNDLE_ID_LEN {
+            return Err(BundleIdRefusal::TooLong { len: text.len() });
+        }
+        if let Some(byte) = text
+            .bytes()
+            .find(|b| !(b.is_ascii_alphanumeric() || *b == b'.'))
+        {
+            return Err(BundleIdRefusal::Byte { byte });
+        }
+        let labels = || text.split('.');
+        if labels().any(str::is_empty) {
+            return Err(BundleIdRefusal::EmptyLabel);
+        }
+        if labels().any(|label| label.as_bytes().first().is_some_and(u8::is_ascii_digit)) {
+            return Err(BundleIdRefusal::LabelStartsWithDigit);
+        }
+        if labels().nth(1).is_none() {
+            return Err(BundleIdRefusal::OneLabel);
+        }
+        labels().find_map(java_reserved_word).map_or_else(
+            || Ok(Self(text.to_owned())),
+            |word| Err(BundleIdRefusal::ReservedWord { word }),
+        )
+    }
+
+    /// The identifier of a project that declares none.
+    ///
+    /// The result is [`DERIVED_PREFIX`] plus the lowercased ASCII letters and
+    /// digits of `name`, cut to fit [`MAX_BUNDLE_ID_LEN`]; a label that is
+    /// empty, starts with a digit, or is a Java reserved word gets the prefix
+    /// `app`. Total: every output re-parses through [`BundleId::parse`].
+    #[must_use]
+    pub fn derived(name: &str) -> Self {
+        let letters = || {
+            name.chars()
+                .filter(char::is_ascii_alphanumeric)
+                .map(|c| c.to_ascii_lowercase())
+        };
+        let bare: String = letters().take(DERIVED_LABEL_ROOM).collect();
+        let needs_app = bare.as_bytes().first().is_none_or(u8::is_ascii_digit)
+            || java_reserved_word(&bare).is_some();
+        let label: String = if needs_app {
+            "app"
+                .chars()
+                .chain(letters())
+                .take(DERIVED_LABEL_ROOM)
+                .collect()
+        } else {
+            bare
+        };
+        Self(format!("{DERIVED_PREFIX}{label}"))
+    }
+
+    /// The identifier's text.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// Why a text is not a [`BundleId`]. No variant carries the refused text.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BundleIdRefusal {
+    /// The empty string.
+    Empty,
+    /// Longer than [`MAX_BUNDLE_ID_LEN`].
+    TooLong {
+        /// The refused length, in bytes.
+        len: usize,
+    },
+    /// A byte outside `[A-Za-z0-9.]`.
+    Byte {
+        /// The first refused byte.
+        byte: u8,
+    },
+    /// An empty label: a leading or trailing `.`, or `..`.
+    EmptyLabel,
+    /// A label whose first byte is a digit.
+    LabelStartsWithDigit,
+    /// A single label, with no `.`.
+    OneLabel,
+    /// A label that is a Java reserved word.
+    ReservedWord {
+        /// The reserved word, from the static table.
+        word: &'static str,
+    },
+}
+
+/// The grammar sentence every [`BundleIdRefusal`] text ends with.
+const BUNDLE_ID_GRAMMAR: &str = "a bundle id is two or more `.`-separated labels, each an ASCII \
+                                 letter then ASCII letters or digits, like `com.example.myapp`";
+
+impl std::fmt::Display for BundleIdRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Empty => write!(f, "it is empty; {BUNDLE_ID_GRAMMAR}"),
+            Self::TooLong { len } => write!(
+                f,
+                "it is {len} bytes, over the {MAX_BUNDLE_ID_LEN}-byte ceiling; {BUNDLE_ID_GRAMMAR}"
+            ),
+            Self::Byte { byte } => write!(
+                f,
+                "it holds byte 0x{byte:02X}, outside A-Z a-z 0-9 and `.`; {BUNDLE_ID_GRAMMAR}"
+            ),
+            Self::EmptyLabel => write!(
+                f,
+                "it has an empty label (a leading or trailing `.`, or `..`); {BUNDLE_ID_GRAMMAR}"
+            ),
+            Self::LabelStartsWithDigit => {
+                write!(f, "a label starts with a digit; {BUNDLE_ID_GRAMMAR}")
+            }
+            Self::OneLabel => write!(f, "it has a single label; {BUNDLE_ID_GRAMMAR}"),
+            Self::ReservedWord { word } => write!(
+                f,
+                "the label `{word}` is a Java reserved word, which Android refuses as a \
+                 package segment; {BUNDLE_ID_GRAMMAR}"
+            ),
+        }
+    }
+}
+
 /// A mobile pack of a program that accepts push, with no
 /// `delivery.mobile.push` to register it with.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PushUnconfigured;
 
 /// The allowed screen orientations for a mobile host launch.
+///
+/// An absent `orientation` is [`ScreenOrientation::Any`]: free rotation.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum ScreenOrientation {
     /// Portrait-only; the shell refuses landscape rotation.
-    #[default]
     Portrait,
     /// Landscape-only; the shell refuses portrait rotation.
     Landscape,
     /// Unrestricted: the shell follows the device sensor.
+    #[default]
     Any,
 }
 
@@ -1768,6 +1996,191 @@ pub use ipe_db::extract_imports_from_source;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bundle_id_refuses_empty_and_one_label() {
+        assert_eq!(BundleId::parse(""), Err(BundleIdRefusal::Empty));
+        assert_eq!(BundleId::parse("myapp"), Err(BundleIdRefusal::OneLabel));
+    }
+
+    #[test]
+    fn bundle_id_refuses_quote_and_newline_bytes() {
+        assert_eq!(
+            BundleId::parse("com.ex\"ample.app"),
+            Err(BundleIdRefusal::Byte { byte: b'"' })
+        );
+        for text in ["com.example.app\n", "com.exa\nmple.app"] {
+            assert_eq!(
+                BundleId::parse(text),
+                Err(BundleIdRefusal::Byte { byte: b'\n' }),
+                "{text:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn bundle_id_refuses_empty_labels_and_leading_digits() {
+        for text in ["com..example", ".com.example", "com.example."] {
+            assert_eq!(
+                BundleId::parse(text),
+                Err(BundleIdRefusal::EmptyLabel),
+                "{text:?}"
+            );
+        }
+        for text in ["com.1example.app", "1com.example"] {
+            assert_eq!(
+                BundleId::parse(text),
+                Err(BundleIdRefusal::LabelStartsWithDigit),
+                "{text:?}"
+            );
+        }
+    }
+
+    /// A grammar-valid id of exactly `len` bytes (`len >= 3`).
+    fn bundle_id_of_len(len: usize) -> String {
+        format!("a.{}", "b".repeat(len.saturating_sub(2)))
+    }
+
+    #[test]
+    fn bundle_id_length_ceiling_is_exact() {
+        let at_ceiling = bundle_id_of_len(MAX_BUNDLE_ID_LEN);
+        assert_eq!(at_ceiling.len(), MAX_BUNDLE_ID_LEN);
+        assert_eq!(
+            BundleId::parse(&at_ceiling).map(|id| id.as_str().len()),
+            Ok(MAX_BUNDLE_ID_LEN),
+            "the last legal length is accepted"
+        );
+        let past = bundle_id_of_len(MAX_BUNDLE_ID_LEN + 1);
+        assert_eq!(
+            BundleId::parse(&past),
+            Err(BundleIdRefusal::TooLong {
+                len: MAX_BUNDLE_ID_LEN + 1
+            })
+        );
+    }
+
+    #[test]
+    fn bundle_id_refuses_non_ascii_by_its_first_byte() {
+        assert_eq!(
+            BundleId::parse("com.ex\u{e4}mple.app"),
+            Err(BundleIdRefusal::Byte { byte: 0xC3 })
+        );
+        assert_eq!(
+            BundleId::parse("com\u{ff0e}example"),
+            Err(BundleIdRefusal::Byte { byte: 0xEF })
+        );
+    }
+
+    /// Inputs each refused for one byte, paired with the label around it.
+    const HOSTILE_BYTE_IDS: &[(&str, u8, &str)] = &[
+        ("com.my-app.x", b'-', "my-app"),
+        ("com.my_app.x", b'_', "my_app"),
+        ("com.e$x.app", b'$', "e$x"),
+        ("com.e\\x.app", b'\\', "e\\x"),
+        ("com.e x.app", b' ', "e x"),
+        ("com.e\0x.app", b'\0', "e\0x"),
+        ("com.e<x.app", b'<', "e<x"),
+    ];
+
+    #[test]
+    fn bundle_id_refuses_hostile_bytes() {
+        for (text, byte, _) in HOSTILE_BYTE_IDS {
+            assert_eq!(
+                BundleId::parse(text),
+                Err(BundleIdRefusal::Byte { byte: *byte }),
+                "{text:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn bundle_id_refusal_text_never_echoes_the_input() {
+        for (text, byte, label) in HOSTILE_BYTE_IDS {
+            let shown = BundleIdRefusal::Byte { byte: *byte }.to_string();
+            assert!(
+                !shown.contains(text) && !shown.contains(label),
+                "the refusal for {text:?} echoes it: {shown}"
+            );
+        }
+    }
+
+    #[test]
+    fn bundle_id_refuses_java_reserved_labels() {
+        for (text, word) in [
+            ("com.example.class", "class"),
+            ("com.true.app", "true"),
+            ("int.example", "int"),
+        ] {
+            assert_eq!(
+                BundleId::parse(text),
+                Err(BundleIdRefusal::ReservedWord { word }),
+                "{text:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn bundle_id_accepts_uppercase_interior_digits_and_cased_reserved_words() {
+        for text in [
+            "Com.Example.MyApp2",
+            "com.example.Class",
+            "com.example.myapp",
+        ] {
+            assert_eq!(
+                BundleId::parse(text).map(|id| id.as_str().to_owned()),
+                Ok(text.to_owned()),
+                "{text:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn derived_bundle_id_always_re_parses() {
+        let long = "x".repeat(300);
+        for name in [
+            "",
+            "My Cool App!",
+            "9lives",
+            "class",
+            "app",
+            "\u{c4}\u{d6}\u{dc}",
+            "a-b_c",
+            long.as_str(),
+            "\"<x>${}",
+            "../..",
+            "IF",
+        ] {
+            let derived = BundleId::derived(name);
+            assert_eq!(
+                BundleId::parse(derived.as_str()),
+                Ok(derived.clone()),
+                "the derived id of {name:?} re-parses"
+            );
+        }
+    }
+
+    #[test]
+    fn derived_bundle_id_shapes() {
+        for (name, expected) in [
+            ("My Cool App!", "com.ipe.mycoolapp"),
+            ("", "com.ipe.app"),
+            ("9lives", "com.ipe.app9lives"),
+            ("class", "com.ipe.appclass"),
+            ("IF", "com.ipe.appif"),
+        ] {
+            assert_eq!(BundleId::derived(name).as_str(), expected, "{name:?}");
+        }
+        assert_eq!(
+            BundleId::derived(&"x".repeat(300)).as_str().len(),
+            MAX_BUNDLE_ID_LEN
+        );
+    }
+
+    #[test]
+    fn absent_orientation_is_free_rotation() {
+        assert_eq!(ScreenOrientation::default(), ScreenOrientation::Any);
+        assert_eq!(MobileDelivery::default().bundle_id, None);
+    }
 
     #[test]
     fn fcm_identifier_debug_never_prints_the_text() {
