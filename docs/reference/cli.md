@@ -23,7 +23,7 @@ Scaffold a new Ipê project.
 ipe init [<directory>] [<shape>] [<runtime>]
 ```
 
-**Arguments:** directory: where to scaffold (`.` or omitted → the current directory). shape: script | tui | cli | server | web (default web) — picks the template. runtime (web only): served (default) | solo — seeds the default delivery. Host and target are delivery choices, chosen later at build/release. On a TTY an omitted positional is prompted; a re-run reconciles (creates only missing files) and refuses a shape that conflicts with the existing `main`.
+**Arguments:** directory: where to scaffold (`.` or omitted → the current directory). shape: script | tui | cli | server | web (default web) — picks the template. runtime (web only): `client` for the self-contained client; omit it for served (the default, never written) — seeds the default delivery. Host and target are delivery choices, chosen later at build/release. On a TTY an omitted positional is prompted; a re-run reconciles (creates only missing files) and refuses a shape that conflicts with the existing `main`.
 
 **Flags:**
 
@@ -326,7 +326,7 @@ Compile a program to a native or WebAssembly development artifact, with Debug.* 
 ipe dev build [<dir>] [<shape>] [<runtime>] [<host>] [<target>]
 ```
 
-**Arguments:** dir: a project directory (default: the current directory). shape is derived from `main` and, if written, only cross-checked. runtime/host apply to `web` only: `web` = served (served is the unnamed default, never written), `web solo` = self-contained browser client, and a host is desktop/ios/android. A `desktop`/`ios`/`android` host lays out the app bundle for that host (a fast dev bundle; `release build web <host>` produces the production distributable). With no delivery args, `dev build` builds the default delivery — the fast one-artifact inner loop; `release build` builds every declared delivery. Delivery args select a subset or override for this invocation only and never edit package.ipe.
+**Arguments:** dir: a project directory (default: the current directory). shape is derived from `main` and, if written, only cross-checked. runtime/host apply to `web` only: `web` = served (served is the unnamed default, never written), `web client` = self-contained browser client (it derives the wasm target), and a host is desktop/ios/android. A `desktop`/`ios`/`android` host lays out the app bundle for that host (a fast dev bundle; `release build` with the same delivery words produces the production distributable). With no delivery args, `dev build` builds the default delivery — the fast one-artifact inner loop; `release build` builds every declared delivery. Delivery args select a subset or override for this invocation only and never edit package.ipe.
 
 **Output:** a native build lands the runnable binary at `out/bin/<project-name>` under the project (copied there within the build), so it is findable even when a shared `CARGO_TARGET_DIR` places cargo's own output outside the project.
 
@@ -337,7 +337,7 @@ ipe dev build [<dir>] [<shape>] [<runtime>] [<host>] [<target>]
 - `[--emit-ir]` — also emit the intermediate representation
 - `[--fix]` — apply machine-applicable fixes before building
 - `[--static]` — produce a statically linked binary
-- `[--target <wasm|wasi|triple>]` — compile for `wasm` (a browser bundle), `wasi` (a wasm32-wasip1 module), or a musl-static native <triple>; a native triple needs --static on `dev build` and `dev run`, `release build` is always static (default: x86_64-unknown-linux-musl); `dev run` cannot execute `wasm`, and `release build` does not produce `wasi`
+- `[--target <wasm|wasi|triple>]` — compile for `wasm` (the browser bundle, which `web client` already derives; any other delivery refuses it), `wasi` (a wasm32-wasip1 module), or a musl-static native <triple>; a native triple needs --static on `dev build` and `dev run`; `dev run` cannot execute `wasm`
 - `[--allocator <auto|system|dlmalloc|talc|mimalloc>]` — select the global allocator (default: auto); `system` is the target libc's malloc, which on musl is several times slower than the default on allocation-heavy work
 - `[--cfree]` — build without linking any C code (incompatible with allocators that require C, e.g. mimalloc)
 - `[--debugger]` — compile the in-app time-travelling debugger overlay into the built app
@@ -359,7 +359,7 @@ ipe dev run [<dir>]
 - `[--out <dir>]` — put build output under <dir> (default: out/ in the project); on Windows a drive or `\\server\share` path is accepted, a device (`\\.\pipe`), object-namespace (`\\?\GLOBALROOT`), or volume-GUID (`\\?\Volume{..}`) path is not
 - `[--runtime <dir>]` — vendor the Ipê runtime from <dir>
 - `[--static]` — produce a statically linked binary
-- `[--target <wasm|wasi|triple>]` — compile for `wasm` (a browser bundle), `wasi` (a wasm32-wasip1 module), or a musl-static native <triple>; a native triple needs --static on `dev build` and `dev run`, `release build` is always static (default: x86_64-unknown-linux-musl); `dev run` cannot execute `wasm`, and `release build` does not produce `wasi`
+- `[--target <wasm|wasi|triple>]` — compile for `wasm` (the browser bundle, which `web client` already derives; any other delivery refuses it), `wasi` (a wasm32-wasip1 module), or a musl-static native <triple>; a native triple needs --static on `dev build` and `dev run`; `dev run` cannot execute `wasm`
 - `[--allocator <auto|system|dlmalloc|talc|mimalloc>]` — select the global allocator (default: auto); `system` is the target libc's malloc, which on musl is several times slower than the default on allocation-heavy work
 - `[--cfree]` — build without linking any C code (incompatible with allocators that require C, e.g. mimalloc)
 - `[--debugger]` — compile the in-app time-travelling debugger overlay into the run app
@@ -392,7 +392,7 @@ ipe dev watch [<dir>]
 
 ### `ipe release build`
 
-Build the production artifact — optimised, Debug.* gated. Native-bearing apps get a jailed bundle; pure-native apps get a plain optimised binary; `web desktop|ios|android` produces a production app bundle; `--target wasm` produces a production browser bundle.
+Build the production artifact, optimised and with Debug.* gated. Native-bearing apps get a jailed bundle; pure-native apps get a plain optimised binary; `web desktop` and `web client desktop|ios|android` produce a production app bundle; `web client` produces a production browser bundle.
 
 ```
 ipe release build [<dir>] [<shape>] [<runtime>] [<host>]
@@ -403,7 +403,7 @@ ipe release build [<dir>] [<shape>] [<runtime>] [<host>]
 **Flags:**
 
 - `[--out <dir>]` — put the artifact under <dir>/release/ (default: out/ in the project)
-- `[--target <wasm|wasi|triple>]` — compile for `wasm` (a browser bundle), `wasi` (a wasm32-wasip1 module), or a musl-static native <triple>; a native triple needs --static on `dev build` and `dev run`, `release build` is always static (default: x86_64-unknown-linux-musl); `dev run` cannot execute `wasm`, and `release build` does not produce `wasi`
+- `[--target <triple>]` — a musl-static native <triple> (default: x86_64-unknown-linux-musl). The browser bundle is `web client`, never a target; a `web client` or app-bundle delivery takes no target.
 - `[--static]` — produce a statically linked binary
 - `[--emit-permissions <ios|macos|android>]` — read-only: print the OS-permission declarations the app's accepted web capabilities derive on the platform, and build nothing
 - `[--runtime <dir>]` — vendor the Ipê runtime source from <dir>
@@ -419,12 +419,12 @@ Build the production artifact (cached), then run exactly that artifact, jailed t
 ipe release run [<dir>|<artifact-dir>]
 ```
 
-**Arguments:** A project directory (default: the current directory), or a built artifact directory holding `ipe-wrapper`. Every run is confined: the default single binary jails itself, a bundle is verified against the floor embedded in its app and then jailed, and a pure-native binary runs jailed to its consented capabilities. An artifact directory runs as built, so it takes no build options. A `--target wasm` or `web solo|desktop|ios|android` build has no run form and is refused: build it with `ipe release build`.
+**Arguments:** A project directory (default: the current directory), or a built artifact directory holding `ipe-wrapper`. Every run is confined: the default single binary jails itself, a bundle is verified against the floor embedded in its app and then jailed, and a pure-native binary runs jailed to its consented capabilities. An artifact directory runs as built, so it takes no build options. A `web client` build (with or without `desktop`/`ios`/`android`) or a served `web desktop` bundle has no run form and is refused: build it with `ipe release build`.
 
 **Flags:**
 
 - `[--out <dir>]` — put the artifact under <dir>/release/ (default: out/ in the project)
-- `[--target <wasm|wasi|triple>]` — compile for `wasm` (a browser bundle), `wasi` (a wasm32-wasip1 module), or a musl-static native <triple>; a native triple needs --static on `dev build` and `dev run`, `release build` is always static (default: x86_64-unknown-linux-musl); `dev run` cannot execute `wasm`, and `release build` does not produce `wasi`
+- `[--target <triple>]` — a musl-static native <triple> (default: x86_64-unknown-linux-musl). The browser bundle is `web client`, never a target; a `web client` or app-bundle delivery takes no target.
 - `[--runtime <dir>]` — vendor the Ipê runtime source from <dir>
 - `[-- <args>...]` — forward <args> to the artifact
 
