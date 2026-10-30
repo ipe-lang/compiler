@@ -79,7 +79,7 @@ definitive `NotFound` do not. Neither does `LimitExceeded`, an input a declared
 ceiling turned back (too large, too long, too deep or with too many parts for
 its bound): the same input fails again against the same bound.
 
-`ErrorKind` has twelve variants:
+`ErrorKind` has thirteen variants:
 
 | Kind | Retryable | Meaning |
 |------|-----------|---------|
@@ -95,6 +95,7 @@ its bound): the same input fails again against the same bound.
 | `Unavailable` | yes | the service is temporarily not serving |
 | `Unexpected` | no | an internal failure with no better class |
 | `LimitExceeded` | no | a declared ceiling refused the input |
+| `UpdateRequired` | no | the client is older than the server; update the app |
 
 ## The why
 
