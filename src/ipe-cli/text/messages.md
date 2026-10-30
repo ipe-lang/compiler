@@ -82,7 +82,7 @@ ipe release eject: --out <dir> is required (the directory to write the standalon
 
 ## release-no-wasi
 
-ipe release build produces a browser bundle (`--target wasm`) or a native binary; it does not produce a WASI module — build one with `ipe dev build --target wasi`
+ipe release build produces a browser bundle (`web client`) or a native binary; it does not produce a WASI module. Build one with `ipe dev build --target wasi`.
 
 ## release-embed-bundle-exclusive
 
@@ -417,11 +417,11 @@ you asked for `{stated}`, but `main` is a `{pinned}` app. A program's shape is f
 
 ## delivery-served-not-a-word
 
-`served` is the default runtime, so it is never written. The web shape runs served (a co-located server loop) unless you opt into `solo` (a self-contained client). Write `web` for served, or `web desktop` for served on the desktop.
+`served` is the default runtime, so it is never written. The web shape runs served (a co-located server loop) unless you opt into `client` (a self-contained client). Write `web` for served, or `web desktop` for served on the desktop.
 
 ## delivery-runtime-on-non-web
 
-`solo` is a web runtime, but this is a `{shape}` app. Only the `web` shape has a runtime choice (served vs solo) — every other shape runs one way. Drop the runtime word.
+`client` is a web runtime, but this is a `{shape}` app. Only the `web` shape has a runtime choice (served vs client) — every other shape runs one way. Drop the runtime word.
 
 ## delivery-host-on-non-web
 
@@ -429,7 +429,7 @@ you asked for `{stated}`, but `main` is a `{pinned}` app. A program's shape is f
 
 ## delivery-served-host-not-mobile
 
-`{host}` is a `solo` host, not a served host. Mobile ships a self-contained client (`web solo {host}`); served is the co-located server loop (served or `web desktop`). Write `web solo {host}` for mobile.
+`{host}` is a `client` host, not a served host. Mobile ships a self-contained client (`web client {host}`); served is the co-located server loop (served or `web desktop`). Write `web client {host}` for mobile.
 
 ## delivery-static-not-allowed-webview
 
@@ -441,39 +441,55 @@ you asked for `{stated}`, but `main` is a `{pinned}` app. A program's shape is f
 
 ## delivery-unknown-token
 
-`{got}` is not a runtime or host word. The web runtime word is `solo` (served is the default). Hosts are `desktop`, `ios`, `android`. Use `--static` for a musl binary or `--target` for a cross-compile triple.
+`{got}` is not a runtime or host word. The web runtime word is `{runtime}` (served is the default). Hosts are `desktop`, `ios`, `android`. Use `--static` for a musl binary or `--target` for a cross-compile triple.
 
 ## delivery-duplicate-token
 
-`{got}` repeats the {kind} — each axis takes exactly one value. Write the {kind} once: e.g. `web solo` (not `web solo solo`) or `web desktop` (not `web desktop ios`). Drop the duplicate `{got}`.
+`{got}` repeats the {kind} — each axis takes exactly one value. Write the {kind} once: e.g. `web client` (not `web client client`) or `web desktop` (not `web desktop ios`). Drop the duplicate `{got}`.
 
-## delivery-solo-requires-wasm-target
+## delivery-client-requires-wasm-target
 
-a `solo` delivery is a self-contained client that must compile to wasm, but the target resolved to native. The sandbox's native-deny guards are keyed to the wasm target, so a native `solo` build would ship native effects into the sandbox. Build for wasm — pass `--target wasm`, set `IPE_TARGET=wasm`, or set `[wasm] mode` in `package.ipe` — or drop `solo` for a co-located served delivery.
+a `client` delivery is a self-contained client that must compile to wasm, but the target resolved to native. The sandbox's native-deny guards are keyed to the wasm target, so a native `client` build would ship native effects into the sandbox. Drop the native target — `web client` builds for wasm by itself — or drop `client` for a co-located served delivery.
 
-## delivery-wasm-target-requires-solo
+## delivery-wasm-target-requires-client
 
-a wasm compile target was requested, but the delivery is not `solo`. The wasm client target exists only to carry a self-contained `solo` app; every other shape has no wasm form. Deliver `web solo` to build for wasm, or drop the wasm target (`--target`/`IPE_TARGET`/`[wasm] mode`) for a native build.
+a wasm compile target was requested, but the delivery is not `client`. The wasm client target exists only to carry a self-contained `client` app; every other delivery has no wasm form. Deliver `web client` to build for wasm, or drop the wasm target (`--target`/`IPE_TARGET`/the `wasm` block) for a native build.
 
 ## delivery-native-engine-refuses-wasm-triple
 
-`{triple}` is a WebAssembly triple, but this build targets the native binary, which has no WASM form. The browser client compiles to `wasm32-unknown-unknown` (deliver `web solo`); the co-located WASI target compiles to `wasm32-wasip1`. Drop the WASM triple for a native build, or pick the delivery that carries it.
+`{triple}` is a WebAssembly triple, but this build targets the native binary, which has no WASM form. The browser client compiles to `wasm32-unknown-unknown` (deliver `web client`); the co-located WASI target compiles to `wasm32-wasip1`. Drop the WASM triple for a native build, or pick the delivery that carries it.
 
-## delivery-solo-requires-browser-triple
+## delivery-client-requires-browser-triple
 
-a `web solo` client compiles only to `wasm32-unknown-unknown`, but `{triple}` was requested. The sandboxed browser client has exactly one triple — its wasm sandbox. Drop the triple (it is implied by `solo`), or drop `solo` for the delivery that carries `{triple}`.
+a `web client` app compiles only to `wasm32-unknown-unknown`, but `{triple}` was requested. The sandboxed browser client has exactly one triple — its wasm sandbox. Drop the triple (it is implied by `client`), or drop `client` for the delivery that carries `{triple}`.
 
-## delivery-solo-refuses-wasi-triple
+## delivery-client-refuses-wasi-triple
 
-a `web solo` client cannot target `wasm32-wasip1`. The browser sandbox denies native effects and reaches the world only through Web-API capabilities; WASI is the co-located, native-ish target for a `tui`/`cli`/`script`/served-`web` program, never the browser sandbox. Deliver `web solo` to `wasm32-unknown-unknown`, or use a co-located shape for a WASI build.
+a `web client` app cannot target `wasm32-wasip1`. The browser sandbox denies native effects and reaches the world only through Web-API capabilities; WASI is the co-located, native-ish target for a `tui`/`cli`/`script`/served-`web` program, never the browser sandbox. Deliver `web client` to `wasm32-unknown-unknown`, or use a co-located shape for a WASI build.
 
 ## delivery-webview-has-no-static-triple
 
 `{delivery}` links the system webview at runtime, so it has no static (musl) triple. Use `web` (served-live), `tui`, `cli`, or `script` for a static musl binary, or ship the desktop app bundle.
 
-## delivery-wasi-refuses-solo-delivery
+## delivery-wasi-refuses-client-delivery
 
-a co-located `wasm32-wasip1` build cannot carry a `solo` delivery. `solo` is the browser sandbox (`wasm32-unknown-unknown`), which denies native effects; WASI is the co-located, native-ish target that runs a script's own effect floor. Drop `solo` for a WASI build, or deliver `web solo` to the browser triple.
+a co-located `wasm32-wasip1` build cannot carry a `client` delivery. `client` is the browser sandbox (`wasm32-unknown-unknown`), which denies native effects; WASI is the co-located, native-ish target that runs a script's own effect floor. Drop `client` for a WASI build, or deliver `web client` to the browser triple.
+
+## delivery-retired-client-word
+
+`{got}` is no longer a delivery word: the self-contained browser client is written `client`. Write `web client` (add `desktop`, `ios` or `android` for an app shell). There is no alias, so `{got}` is refused everywhere.
+
+## delivery-retired-served-word
+
+`{got}` is no longer a delivery word: served is the default web runtime, so it is never written. Write `web` alone (or `web desktop`).
+
+## delivery-release-wasm-target
+
+`ipe release build` builds the browser bundle from the delivery, so a wasm target from {source} is not accepted. Write `ipe release build web client` (add `desktop`, `ios` or `android` for an app shell) and drop the wasm target from {source}.
+
+## delivery-bundle-host-has-no-target
+
+`{delivery}` builds its app bundle for `{host}` itself, so {source} has nothing to choose. Drop {source}.
 
 ## delivery-wasi-requires-direct-shape
 
@@ -1432,13 +1448,17 @@ watch: cannot bind the blue-green proxy on port {port}: {detail}
 
 # Manifest refusals
 
+## ship-retired-builder
+
+`{got}` was renamed `{now}`: the self-contained browser client is the `client` delivery. Write `{now}` in `ships`. There is no alias.
+
 ## ships-repeated
 
 package.ipe declares `{delivery}` twice in `ships`. A delivery is shipped once; a repeated entry is a confused manifest, not a request for two copies. Remove the duplicate.
 
 ## ships-shape-mismatch
 
-package.ipe declares `{delivery}`, but `main` is a `{shape}` app. The web hosts (desktop, solo, solo ios, …) carry a self-contained web client; a `{shape}` app ships as a binary. Remove the entry, or change `main` to a `Web.tea` entry.
+package.ipe declares `{delivery}`, but `main` is a `{shape}` app. The web hosts (desktop, client, client ios, …) carry a self-contained web client; a `{shape}` app ships as a binary. Remove the entry, or change `main` to a `Web.tea` entry.
 
 ## pkg-add-escape-dependency
 
@@ -1848,7 +1868,7 @@ ipe init: shape positional `{positional}` and `--shape {flag}` disagree — writ
 
 ## init-runtime-needs-web
 
-ipe init: `{runtime}` is a web runtime, but you asked for a `{shape}` project. Only the `web` shape has a runtime choice (served vs solo) — every other shape runs one way. Drop the runtime word.
+ipe init: `{runtime}` is a web runtime, but you asked for a `{shape}` project. Only the `web` shape has a runtime choice (served vs client) — every other shape runs one way. Drop the runtime word.
 
 ## init-unknown-shape
 
@@ -1856,7 +1876,7 @@ ipe init: unknown shape `{word}` — expected: script, tui, cli, worker, server,
 
 ## init-unknown-runtime
 
-ipe init: unknown runtime `{word}` — the web runtimes are: served (the default), solo
+ipe init: unknown runtime `{word}` — the web runtime word is `{runtime}`; served is the default and is never written
 
 ## init-unknown-shape-choice
 
@@ -1864,7 +1884,7 @@ ipe init: unknown shape `{word}` — expected 1-6 or one of: web, tui, cli, work
 
 ## init-unknown-runtime-choice
 
-ipe init: unknown runtime `{word}` — expected 1-2 or one of: served, solo
+ipe init: unknown runtime `{word}` — expected 1-2, or `{runtime}` (press Enter for served, the default)
 
 ## init-no-project-name
 

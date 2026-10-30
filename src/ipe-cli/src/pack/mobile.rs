@@ -58,7 +58,7 @@ pub enum MobileOs {
 }
 
 impl MobileOs {
-    /// The lowercase wire name of this OS — the `web solo <os>` delivery host word
+    /// The lowercase wire name of this OS — the `web client <os>` delivery host word
     /// and the `dist/<os>/` bundle directory.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
@@ -115,7 +115,7 @@ impl std::fmt::Display for UnknownMobileOs {
 
 impl std::error::Error for UnknownMobileOs {}
 
-/// Resolve the mobile OS a `web solo <os>` delivery host names.
+/// Resolve the mobile OS a `web client <os>` delivery host names.
 ///
 /// The mobile host word is always explicit — this host is not a mobile device, so
 /// there is no host default. An absent word is a typed refusal, an unrecognised
@@ -141,8 +141,8 @@ pub struct WebSpaCapability {
     /// Whether the app's declared shape is `Web` (or unset — inference decides).
     /// A `Terminal` / `WebView` / `Program` shape has no client-wasm SPA to host.
     pub shape_is_web: bool,
-    /// Whether the project's `[wasm]` mode is active (`solo` / `hydrate`), so a
-    /// `--target wasm` build produces a hostable bundle.
+    /// Whether the project's `[wasm]` mode is active (`Render` / `Hydrate`), so a
+    /// `web client` build produces a hostable bundle.
     pub wasm_enabled: bool,
 }
 
@@ -216,16 +216,16 @@ impl std::fmt::Display for MobileRefusal {
             Self::MissingOs => write!(
                 f,
                 "error[IPE-P0020]: a mobile bundle needs an OS — \
-                 name one: `ipe dev build web solo <ios|android>`"
+                 name one: `ipe dev build web client <ios|android>`"
             ),
             Self::UnknownOs(got) => write!(
                 f,
                 "error[IPE-P0021]: unknown mobile OS {got:?} \
-                 (expected `ipe dev build web solo <ios|android>`)"
+                 (expected `ipe dev build web client <ios|android>`)"
             ),
             Self::NotWebShape => write!(
                 f,
-                "error[IPE-P0022]: `web solo <ios|android>` wraps a client-wasm `Web` SPA, \
+                "error[IPE-P0022]: `web client <ios|android>` wraps a client-wasm `Web` SPA, \
                  but this app's shape is not `Web`\n  \
                  = a mobile bundle hosts the app's browser SPA in a system webview; only a \
                  `Web` app compiled to wasm has such a bundle. Declare a `Web` program shape, \
@@ -233,10 +233,10 @@ impl std::fmt::Display for MobileRefusal {
             ),
             Self::WasmDisabled => write!(
                 f,
-                "error[IPE-P0023]: `web solo <ios|android>` wraps the wasm client, \
+                "error[IPE-P0023]: `web client <ios|android>` wraps the wasm client, \
                  but this project's `[wasm]` mode is off (or absent)\n  \
                  = enable the wasm client target so a hostable browser bundle exists: set \
-                 `[wasm] mode = Solo` (or `Hydrate`) in package.ipe."
+                 `wasm = On { mode = Render }` (or `Hydrate`) in package.ipe."
             ),
             Self::ManifestChanged { moved } => write!(
                 f,

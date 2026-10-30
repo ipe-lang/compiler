@@ -22,7 +22,7 @@
 //! The manifest is a `{ name = "…", version = "…", …, build = { … } }` record
 //! typed by the `Ipe.Package` stdlib schema. Every finite choice — the database
 //! driver, a program's shape, the allocator, the wasm mode, a capability — is a
-//! closed-union constructor (`Sqlite`, `Web`, `Dlmalloc`, `Solo`, `Network`), so
+//! closed-union constructor (`Sqlite`, `Web`, `Dlmalloc`, `Render`, `Network`), so
 //! a typo is a name that does not exist rather than a live-with-it string. Open
 //! text (`version`, an `entry` file, a `Cross` triple) is a `String`, parsed at
 //! this read boundary. No field can hold a function or an effect — the record is
@@ -217,7 +217,7 @@ fn icon_refusal(raw: &str, refusal: &PwaIconRefusal) -> text::Message {
 /// One field of the `delivery.browser` record.
 #[derive(Clone, Copy)]
 enum BrowserField {
-    /// `basePath`: the URL path a `web solo` bundle is served at.
+    /// `basePath`: the URL path a `web client` bundle is served at.
     BasePath,
     /// `installable`: whether a `web served` app offers browser install.
     Installable,
@@ -1016,8 +1016,8 @@ impl Reader<'_> {
 
     /// Read the `delivery.ships = [ … ]` list into the typed [`ShipEntry`]
     /// vector: which deliveries the project releases. Each element is one of the
-    /// closed ship builder vocabulary; an unknown builder, a duplicate, or an
-    /// empty list is a read-time rejection, so the resolved set is non-empty and
+    /// closed ship builder vocabulary; an unknown or retired builder, a
+    /// duplicate, or an empty list is a read-time rejection, so the resolved set is non-empty and
     /// duplicate-free by parse.
     fn read_ships(&self, expr: &Expr) -> Result<Vec<ShipEntry>, CliError> {
         let items = self.expect_list(expr)?;
@@ -1049,8 +1049,6 @@ impl Reader<'_> {
     fn read_one_ship(&self, expr: &Expr) -> Result<ShipEntry, CliError> {
         let (builder, args) = self.expect_ctor_app(expr, "a ship builder")?;
         match builder {
-            "binary" => Ok(ShipEntry::Binary(BinaryTarget::Host)),
-            "staticBinary" => Ok(ShipEntry::Binary(BinaryTarget::Static)),
             "crossBinary" => {
                 let raw = self.expect_string(self.nth_arg(expr.span, builder, args, 0)?)?;
                 let triple = StaticTriple::parse(&raw).ok_or_else(|| {
@@ -1065,19 +1063,31 @@ impl Reader<'_> {
                 })?;
                 Ok(ShipEntry::Binary(BinaryTarget::Cross(triple)))
             }
-            "desktop" => Ok(ShipEntry::Desktop),
-            "solo" => Ok(ShipEntry::Solo),
-            "soloDesktop" => Ok(ShipEntry::SoloDesktop),
-            "soloIos" => Ok(ShipEntry::SoloIos),
-            "soloAndroid" => Ok(ShipEntry::SoloAndroid),
-            other => Err(self.reject(
-                expr.span,
-                &format!(
-                    "`{other}` is not a ship builder — use `binary`, `staticBinary`, \
-                     `crossBinary \"<triple>\"`, `desktop`, `solo`, `soloDesktop`, `soloIos`, or \
-                     `soloAndroid`"
-                ),
-            )),
+            other => {
+                if let Some(entry) = ShipEntry::BUILDERS
+                    .into_iter()
+                    .find(|entry| entry.builder_word() == other)
+                {
+                    return Ok(entry);
+                }
+                if let Some(now) = ShipEntry::retired_builder(other) {
+                    let retired = RetiredShipBuilder {
+                        got: other.to_owned(),
+                        now,
+                    };
+                    return Err(self.reject(expr.span, &retired.to_string()));
+                }
+                let known = ShipEntry::BUILDERS
+                    .into_iter()
+                    .map(|entry| format!("`{}`", entry.builder_word()))
+                    .chain(std::iter::once("`crossBinary \"<triple>\"`".to_owned()))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                Err(self.reject(
+                    expr.span,
+                    &format!("`{other}` is not a ship builder — use one of {known}"),
+                ))
+            }
         }
     }
 
@@ -1388,7 +1398,7 @@ impl Reader<'_> {
         let Some(mode) = mode else {
             return Err(self.reject(
                 expr.span,
-                "an `On { … }` wasm bundle must set `mode = Solo` or `mode = Hydrate`",
+                "an `On { … }` wasm bundle must set `mode = Render` or `mode = Hydrate`",
             ));
         };
         Ok(WasmConfig::On(WasmBundle {
@@ -1400,14 +1410,22 @@ impl Reader<'_> {
         }))
     }
 
-    /// Read a `wasm` `mode` field: `Solo` / `Hydrate`.
+    /// Read a `wasm` `mode` field: `Render` / `Hydrate`.
+    ///
+    /// The retired `Solo` is refused with its replacement named; there is no
+    /// alias.
     fn read_wasm_mode(&self, expr: &Expr) -> Result<WasmMode, CliError> {
         match self.expect_ctor(expr, "a wasm mode")? {
-            "Solo" => Ok(WasmMode::Solo),
+            "Render" => Ok(WasmMode::Render),
             "Hydrate" => Ok(WasmMode::Hydrate),
+            "Solo" => Err(self.reject(
+                expr.span,
+                "`Solo` was renamed `Render`: the client renders everything. Write \
+                 `mode = Render`. There is no alias.",
+            )),
             other => Err(self.reject(
                 expr.span,
-                &format!("`{other}` is not a wasm mode — use `Solo` or `Hydrate`"),
+                &format!("`{other}` is not a wasm mode — use `Render` or `Hydrate`"),
             )),
         }
     }
@@ -1961,7 +1979,7 @@ fn render_wasm(wasm: &WasmConfig) -> Option<String> {
         return None;
     };
     let mode = match bundle.mode {
-        WasmMode::Solo => "Solo",
+        WasmMode::Render => "Render",
         WasmMode::Hydrate => "Hydrate",
     };
     let mut parts = vec![format!("mode = {mode}")];
@@ -2006,19 +2024,34 @@ fn render_delivery(delivery: &DeliveryConfig) -> Option<String> {
 }
 
 /// The `Ipe.Package` ship builder expression for a [`ShipEntry`] — the inverse
-/// of the manifest reader.
+/// of the manifest reader, spelled through the same builder table.
 fn ship_builder_expr(entry: ShipEntry) -> String {
     match entry {
-        ShipEntry::Binary(BinaryTarget::Host) => "binary".to_owned(),
-        ShipEntry::Binary(BinaryTarget::Static) => "staticBinary".to_owned(),
         ShipEntry::Binary(BinaryTarget::Cross(triple)) => {
-            format!("crossBinary {}", quote(triple.as_str()))
+            format!("{} {}", entry.builder_word(), quote(triple.as_str()))
         }
-        ShipEntry::Desktop => "desktop".to_owned(),
-        ShipEntry::Solo => "solo".to_owned(),
-        ShipEntry::SoloDesktop => "soloDesktop".to_owned(),
-        ShipEntry::SoloIos => "soloIos".to_owned(),
-        ShipEntry::SoloAndroid => "soloAndroid".to_owned(),
+        _ => entry.builder_word(),
+    }
+}
+
+/// A retired ship builder written in `ships`, with the entry whose builder
+/// replaces it.
+///
+/// `got` is the manifest's own spelling, printed in code style.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RetiredShipBuilder {
+    /// The retired builder as written.
+    pub got: String,
+    /// The entry whose builder replaces it.
+    pub now: ShipEntry,
+}
+
+impl std::fmt::Display for RetiredShipBuilder {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&text::ship_retired_builder(
+            &self.got,
+            &self.now.builder_word(),
+        ))
     }
 }
 
@@ -2542,7 +2575,7 @@ mod tests {
              \x20       }}\n\
              \x20   , wasm =\n\
              \x20       On\n\
-             \x20           {{ mode = Solo\n\
+             \x20           {{ mode = Render\n\
              \x20           , entry = \"src/Client.ipe\"\n\
              \x20           , mount = \"#app\"\n\
              \x20           , publicEnv = [ \"API_BASE_URL\", \"APP_VERSION\" ]\n\
@@ -2606,7 +2639,7 @@ mod tests {
         assert_eq!(accept_names, vec!["unsafe"]);
 
         let bundle = bundle_of(&m);
-        assert_eq!(bundle.mode, WasmMode::Solo);
+        assert_eq!(bundle.mode, WasmMode::Render);
         assert_eq!(bundle.entry.as_deref(), Some("src/Client.ipe"));
         assert_eq!(bundle.mount.as_deref(), Some("#app"));
         assert_eq!(
@@ -2692,7 +2725,7 @@ mod tests {
         let r = read(
             "reject_secret_env",
             &format!(
-                "{HEADER}package =\n    {{ name = \"x\", wasm = On {{ mode = Solo, publicEnv = [ \"DATABASE_URL\" ] }} }}\n"
+                "{HEADER}package =\n    {{ name = \"x\", wasm = On {{ mode = Render, publicEnv = [ \"DATABASE_URL\" ] }} }}\n"
             ),
         );
         assert_rejected(&r);
@@ -3070,7 +3103,7 @@ mod tests {
         read(
             test_name,
             &format!(
-                "{HEADER}package =\n    {{ name = \"x\", wasm = On {{ mode = Solo, publicEnv = [ {list} ] }} }}\n"
+                "{HEADER}package =\n    {{ name = \"x\", wasm = On {{ mode = Render, publicEnv = [ {list} ] }} }}\n"
             ),
         )
     }
@@ -3598,7 +3631,7 @@ mod tests {
         let r = read(
             "ok_env",
             &format!(
-                "{HEADER}package =\n    {{ name = \"x\", wasm = On {{ mode = Solo, publicEnv = [ \"API_BASE_URL\" ] }} }}\n"
+                "{HEADER}package =\n    {{ name = \"x\", wasm = On {{ mode = Render, publicEnv = [ \"API_BASE_URL\" ] }} }}\n"
             ),
         );
         let m = r.expect("allowed env must parse");
@@ -3636,9 +3669,26 @@ mod tests {
             matches!(
                 &r,
                 Err(CliError::Usage(message))
-                    if message.contains("must set `mode = Solo` or `mode = Hydrate`")
+                    if message.contains("must set `mode = Render` or `mode = Hydrate`")
             ),
             "a bundle without a mode keeps its refusal: {r:?}"
+        );
+    }
+
+    #[test]
+    fn reject_retired_wasm_mode_solo_naming_render() {
+        let r = read(
+            "reject_wasm_solo_mode",
+            &format!("{HEADER}package =\n    {{ name = \"x\", wasm = On {{ mode = Solo }} }}\n"),
+        );
+        assert!(
+            matches!(
+                &r,
+                Err(CliError::Usage(message))
+                    if message.contains("`Solo` was renamed `Render`")
+                        && message.contains("`mode = Render`")
+            ),
+            "the retired mode is refused naming its replacement: {r:?}"
         );
     }
 
@@ -3656,7 +3706,7 @@ mod tests {
                     &r,
                     Err(CliError::Usage(message))
                         if message.contains(&format!(
-                            "`{mode}` is not a wasm mode — use `Solo` or `Hydrate`"
+                            "`{mode}` is not a wasm mode — use `Render` or `Hydrate`"
                         ))
                 ),
                 "mode `{mode}` is refused with the mode diagnostic: {r:?}"
@@ -3666,7 +3716,7 @@ mod tests {
 
     #[test]
     fn wasm_render_round_trips_both_modes() {
-        for (name, mode) in [("Solo", WasmMode::Solo), ("Hydrate", WasmMode::Hydrate)] {
+        for (name, mode) in [("Render", WasmMode::Render), ("Hydrate", WasmMode::Hydrate)] {
             let m = read(
                 "wasm_render_in",
                 &format!(
@@ -3929,7 +3979,7 @@ mod tests {
         let m = read(
             "ships_all",
             &format!(
-                "{HEADER}package =\n    {{ name = \"x\", delivery = {{ ships =\n        [ binary\n        , staticBinary\n        , crossBinary \"aarch64-unknown-linux-musl\"\n        , desktop\n        , solo\n        , soloDesktop\n        , soloIos\n        , soloAndroid\n        ] }} }}\n"
+                "{HEADER}package =\n    {{ name = \"x\", delivery = {{ ships =\n        [ binary\n        , staticBinary\n        , crossBinary \"aarch64-unknown-linux-musl\"\n        , desktop\n        , client\n        , clientDesktop\n        , clientIos\n        , clientAndroid\n        ] }} }}\n"
             ),
         )
         .expect("every ship builder must parse");
@@ -3940,11 +3990,130 @@ mod tests {
                 ShipEntry::Binary(BinaryTarget::Static),
                 ShipEntry::Binary(BinaryTarget::Cross(StaticTriple::Aarch64LinuxMusl)),
                 ShipEntry::Desktop,
-                ShipEntry::Solo,
-                ShipEntry::SoloDesktop,
-                ShipEntry::SoloIos,
-                ShipEntry::SoloAndroid,
+                ShipEntry::Client,
+                ShipEntry::ClientDesktop,
+                ShipEntry::ClientIos,
+                ShipEntry::ClientAndroid,
             ]
+        );
+    }
+
+    /// The `ships` refusal text for a one-entry list, or `None` when accepted.
+    fn ships_refusal(test_name: &str, entry: &str) -> Option<String> {
+        match read(
+            test_name,
+            &format!(
+                "{HEADER}package =\n    {{ name = \"x\", delivery = {{ ships = [ {entry} ] }} }}\n"
+            ),
+        ) {
+            Err(CliError::Usage(message)) => Some(message.to_string()),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn ships_refuses_retired_solo_builders() {
+        for (got, now) in [
+            ("soloIos", ShipEntry::ClientIos),
+            ("solo", ShipEntry::Client),
+        ] {
+            let message = ships_refusal("ships_retired_builder", got);
+            let expected = RetiredShipBuilder {
+                got: got.to_owned(),
+                now,
+            }
+            .to_string();
+            assert_eq!(
+                message.as_deref().map(|m| m.contains(&expected)),
+                Some(true),
+                "{got}: {message:?}"
+            );
+            assert!(
+                expected.contains(&format!("`{}`", now.builder_word())),
+                "{expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn ships_refuses_retired_ship_constructor() {
+        for (got, now) in [("ShipSolo", "client"), ("ShipSoloAndroid", "clientAndroid")] {
+            let message = ships_refusal("ships_retired_ctor", got);
+            assert_eq!(
+                message
+                    .as_deref()
+                    .map(|m| m.contains(&format!("`{got}` was renamed `{now}`"))),
+                Some(true),
+                "{got}: {message:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn ships_builder_round_trip_over_table() {
+        let entries: Vec<ShipEntry> = ShipEntry::BUILDERS
+            .into_iter()
+            .chain(std::iter::once(ShipEntry::Binary(BinaryTarget::Cross(
+                StaticTriple::Aarch64LinuxMusl,
+            ))))
+            .collect();
+        let items: Vec<String> = entries.iter().map(|e| ship_builder_expr(*e)).collect();
+        let m = read(
+            "ships_table_round_trip",
+            &format!(
+                "{HEADER}package =\n    {{ name = \"x\", delivery = {{ ships = [ {} ] }} }}\n",
+                items.join(", ")
+            ),
+        )
+        .expect("every builder the writer spells must parse");
+        assert_eq!(m.delivery.ships, entries);
+    }
+
+    /// The `Ipe.Package` schema's exposed ship builders and `Ship` constructors
+    /// are the builder table's, so the schema cannot drift from the reader.
+    #[test]
+    fn package_ipe_ships_match_the_builder_table() {
+        let schema_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../stdlib/Ipe/Package.ipe");
+        let schema = std::fs::read_to_string(&schema_path).expect("read Ipe.Package schema");
+        let mut builders: Vec<String> = ShipEntry::BUILDERS
+            .into_iter()
+            .map(ShipEntry::builder_word)
+            .collect();
+        builders.push(
+            ShipEntry::Binary(BinaryTarget::Cross(StaticTriple::Aarch64LinuxMusl)).builder_word(),
+        );
+        let mut constructors: Vec<String> = ShipEntry::BUILDERS
+            .into_iter()
+            .map(|entry| crate::delivery_set::ship_constructor(&entry.builder_word()))
+            .collect();
+        constructors.push("ShipCross".to_owned());
+        let (exposing, _) = schema.split_once("    , DesktopConfig").unwrap_or_default();
+        let (_, exposed) = exposing.split_once("    , Ship\n").unwrap_or_default();
+        let mut exposed: Vec<String> = exposed
+            .lines()
+            .map(|line| line.trim_start_matches([' ', ',']).trim().to_owned())
+            .filter(|word| !word.is_empty())
+            .collect();
+        let (_, ship_type) = schema.split_once("type Ship\n").unwrap_or_default();
+        let (ship_type, _) = ship_type.split_once("\n\n").unwrap_or_default();
+        let mut declared: Vec<String> = ship_type
+            .lines()
+            .filter_map(|line| line.trim().strip_prefix(['=', '|']))
+            .filter_map(|ctor| ctor.split_whitespace().next())
+            .map(str::to_owned)
+            .collect();
+        for list in [
+            &mut builders,
+            &mut constructors,
+            &mut exposed,
+            &mut declared,
+        ] {
+            list.sort();
+        }
+        assert_eq!(exposed, builders, "the exposed builders are the table's");
+        assert_eq!(
+            declared, constructors,
+            "the `Ship` constructors are the table's"
         );
     }
 
@@ -3985,7 +4154,7 @@ mod tests {
         let r = read(
             "ships_dup",
             &format!(
-                "{HEADER}package =\n    {{ name = \"x\", delivery = {{ ships = [ solo, solo ] }} }}\n"
+                "{HEADER}package =\n    {{ name = \"x\", delivery = {{ ships = [ client, client ] }} }}\n"
             ),
         );
         assert_rejected(&r);
@@ -4003,7 +4172,7 @@ mod tests {
     #[test]
     fn ships_render_round_trips() {
         let source = format!(
-            "{HEADER}package =\n    {{ name = \"x\", delivery = {{ ships = [ binary, soloIos ] }} }}\n"
+            "{HEADER}package =\n    {{ name = \"x\", delivery = {{ ships = [ binary, clientIos ] }} }}\n"
         );
         let m = read("ships_render_in", &source).expect("parse");
         let rendered = render_manifest_record(&m);
@@ -4176,10 +4345,10 @@ mod tests {
              \x20   , dependencies = []\n    }}\n"
         );
         let (text, reparsed) = write_and_read_manifest("writer_empty_list", &source, |p| {
-            upsert_index_dependency(p, "solo", &req("^1"))
+            upsert_index_dependency(p, "client-dep", &req("^1"))
         });
         assert!(
-            text.contains("dep \"solo\""),
+            text.contains("dep \"client-dep\""),
             "entry added into empty list: {text}"
         );
         let m = reparsed.expect("re-parses");

@@ -98,7 +98,7 @@ impl BundleProfile {
 pub enum BundleHost {
     /// `web desktop` — a self-contained per-OS desktop bundle for the host OS.
     Desktop,
-    /// `web solo ios` / `web solo android` — a native mobile system-webview shell.
+    /// `web client ios` / `web client android` — a native mobile system-webview shell.
     Mobile(pack::mobile::MobileOs),
 }
 
@@ -131,7 +131,7 @@ impl BundleHost {
 /// delivery — the single entry point `build`/`release` call once they know the
 /// bundle host and profile.
 ///
-/// `web desktop` lays out a webview-native desktop bundle; `web solo ios|android`
+/// `web desktop` lays out a webview-native desktop bundle; `web client ios|android`
 /// builds the client-wasm SPA and lays out a native mobile system-webview shell.
 /// The permission-manifest derivation ([`pack::permissions`]) remains the single
 /// source of truth for what each bundle may do — this routing never authors a
@@ -639,7 +639,7 @@ pub fn pack_desktop(finish: NativeFinish<'_>, held: &HeldBuild) -> Result<(), Cl
     BundleAssembler::gate_desktop(held, finish)?.assemble(os)
 }
 
-/// `build|release web solo <os> [<path>]` — build the client-wasm SPA and lay out
+/// `build|release web client <os> [<path>]` — build the client-wasm SPA and lay out
 /// a native mobile system-webview shell for `os` (`ios` / `android`) that hosts
 /// the SPA offline from app assets.
 ///
@@ -667,7 +667,7 @@ pub fn pack_mobile(
     // wasm-enabled `Web` SPA. A declared non-`Web` shape, or a `Web` app with the
     // `[wasm]` mode off, is refused up front (naming exactly what is missing). An
     // app that declares no shape at all is trusted to infer `Web`.
-    // The mobile packager hosts the `web solo <ios|android>` SPA: the shape is
+    // The mobile packager hosts the `web client <ios|android>` SPA: the shape is
     // pinned by `main`. Honour an explicit declared shape when present, else
     // classify `main` — a non-web `main` fails the `require_web_spa` gate by
     // name rather than silently packaging a terminal or script app as an SPA.
@@ -684,7 +684,7 @@ pub fn pack_mobile(
 /// Invoking the same binary keeps the wasm bundle pipeline (emit + cargo +
 /// wasm-bindgen) authoritative — the mobile shell hosts exactly the bundle a
 /// plain wasm build/release produces, never a re-implemented variant. The profile
-/// carries through so a `release web solo <os>` shell hosts the production SPA.
+/// carries through so a `release web client <os>` shell hosts the production SPA.
 ///
 /// # Errors
 /// [`CliError::Usage`] when this binary's path cannot be resolved or the
@@ -4147,7 +4147,7 @@ mod mobile_base_tests {
         assert!(result.is_ok(), "{result:?}");
     }
 
-    /// Read a wasm-solo project accepting push whose `delivery.mobile` is the
+    /// Read a wasm-client project accepting push whose `delivery.mobile` is the
     /// record `mobile`, through the manifest reader the pack reads.
     fn push_project(test_name: &str, mobile: &str) -> project::ProjectManifest {
         let manifest = write_project(test_name, "/");
@@ -4155,7 +4155,7 @@ mod mobile_base_tests {
             &manifest,
             format!(
                 "module Package exposing (package)\n\npackage =\n    {{ name = \"x\"\n    \
-                 , wasm = On {{ mode = Solo }}\n    \
+                 , wasm = On {{ mode = Render }}\n    \
                  , capabilities = {{ accepts = [ JsPort Push ] }}\n    \
                  , delivery = {{ mobile = {mobile} }}\n    }}\n"
             ),
@@ -4315,7 +4315,7 @@ mod pack_gate_tests {
             classify_desktop_shape(None, delivery::Shape::Web),
             pack::desktop::AppShape::WebView
         );
-        let wasm_on = project::WasmConfig::On(project::WasmBundle::new(project::WasmMode::Solo));
+        let wasm_on = project::WasmConfig::On(project::WasmBundle::new(project::WasmMode::Render));
         assert!(classify_mobile_spa_cap(None, delivery::Shape::Web, &wasm_on).shape_is_web);
         assert!(!classify_mobile_spa_cap(None, delivery::Shape::Script, &wasm_on).shape_is_web);
     }
@@ -4333,7 +4333,7 @@ mod pack_gate_tests {
     /// mobile SPA shell only hosts `Web` apps.
     #[test]
     fn mobile_gate_refuses_terminal_shape() {
-        let wasm_on = project::WasmConfig::On(project::WasmBundle::new(project::WasmMode::Solo));
+        let wasm_on = project::WasmConfig::On(project::WasmBundle::new(project::WasmMode::Render));
         let err = validate_mobile_shape(
             Some(project::EntryShape::Terminal),
             delivery::Shape::Script,
@@ -4356,7 +4356,7 @@ mod pack_gate_tests {
     /// A declared `Program` shape must be refused for mobile packaging.
     #[test]
     fn mobile_gate_refuses_program_shape() {
-        let wasm_on = project::WasmConfig::On(project::WasmBundle::new(project::WasmMode::Solo));
+        let wasm_on = project::WasmConfig::On(project::WasmBundle::new(project::WasmMode::Render));
         let err = validate_mobile_shape(
             Some(project::EntryShape::Program),
             delivery::Shape::Script,
@@ -4395,7 +4395,7 @@ mod pack_gate_tests {
             return;
         };
         assert!(
-            msg.contains("wasm") || msg.contains("Wasm") || msg.contains("solo"),
+            msg.contains("wasm") || msg.contains("Wasm") || msg.contains("client"),
             "refusal names the missing wasm capability: {msg}"
         );
     }
@@ -4403,7 +4403,7 @@ mod pack_gate_tests {
     /// A `Web` shape with wasm mode `spa` passes the mobile gate.
     #[test]
     fn mobile_gate_accepts_web_shape_with_wasm_spa() {
-        let wasm_on = project::WasmConfig::On(project::WasmBundle::new(project::WasmMode::Solo));
+        let wasm_on = project::WasmConfig::On(project::WasmBundle::new(project::WasmMode::Render));
         validate_mobile_shape(
             Some(project::EntryShape::Web),
             delivery::Shape::Script,
@@ -4429,7 +4429,7 @@ mod pack_gate_tests {
     /// `Web` + wasm enabled -> `shape_is_web=true`, `wasm_enabled=true`.
     #[test]
     fn classify_mobile_cap_web_wasm_on() {
-        let wasm_on = project::WasmConfig::On(project::WasmBundle::new(project::WasmMode::Solo));
+        let wasm_on = project::WasmConfig::On(project::WasmBundle::new(project::WasmMode::Render));
         let cap = classify_mobile_spa_cap(
             Some(project::EntryShape::Web),
             delivery::Shape::Script,
@@ -4442,7 +4442,7 @@ mod pack_gate_tests {
     /// `Terminal` + wasm enabled -> `shape_is_web=false`.
     #[test]
     fn classify_mobile_cap_terminal_wasm_on() {
-        let wasm_on = project::WasmConfig::On(project::WasmBundle::new(project::WasmMode::Solo));
+        let wasm_on = project::WasmConfig::On(project::WasmBundle::new(project::WasmMode::Render));
         let cap = classify_mobile_spa_cap(
             Some(project::EntryShape::Terminal),
             delivery::Shape::Script,

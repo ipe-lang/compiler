@@ -141,9 +141,9 @@ pub struct DeliveryConfig {
     /// Window title, width, and height for the `web desktop`
     /// (webview-native) host.
     pub desktop: DesktopDelivery,
-    /// Bundle identifier and orientation for `web solo ios` / `web solo android`.
+    /// Bundle identifier and orientation for `web client ios` / `web client android`.
     pub mobile: MobileDelivery,
-    /// The `web solo` base path and the `web served` install offer.
+    /// The `web client` base path and the `web served` install offer.
     pub browser: BrowserDelivery,
     /// The `https` origins the browser bundle may reach besides its own;
     /// empty for an offline bundle.
@@ -602,7 +602,7 @@ fn has_drive_prefix(raw: &str) -> bool {
 /// `On` bundle.
 ///
 /// ```text
-/// wasm = On { mode = Solo, entry = "src/Client.ipe", mount = "#app",
+/// wasm = On { mode = Render, entry = "src/Client.ipe", mount = "#app",
 ///             publicEnv = [ "API_BASE_URL" ], optLevel = "z" }
 /// ```
 ///
@@ -656,8 +656,8 @@ impl WasmBundle {
 /// How a wasm bundle renders.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WasmMode {
-    /// A single-page app: the client renders everything.
-    Solo,
+    /// The client renders everything.
+    Render,
     /// The server renders first and the client hydrates the markup.
     Hydrate,
 }
@@ -2451,8 +2451,8 @@ import String
     // ── WasmConfig::implies_wasm_target ──────────────────────────────────────
 
     #[test]
-    fn implies_wasm_target_solo_and_hydrate_are_on() {
-        for mode in [WasmMode::Solo, WasmMode::Hydrate] {
+    fn implies_wasm_target_render_and_hydrate_are_on() {
+        for mode in [WasmMode::Render, WasmMode::Hydrate] {
             assert!(
                 WasmConfig::On(WasmBundle::new(mode)).implies_wasm_target(),
                 "{mode:?} must imply wasm target"
@@ -2639,7 +2639,7 @@ import String
             Some(
                 "module Package exposing (package)\n\n\
                  package =\n    \
-                 { name = \"solo\"\n    \
+                 { name = \"single\"\n    \
                  , programs = [ { name = \"app\", entry = \"Main.ipe\" } ]\n    \
                  }\n",
             ),
@@ -2695,7 +2695,7 @@ import String
                 Some(&format!(
                     "module Package exposing (package)\n\n\
                      package =\n    \
-                     {{ name = \"solo\"\n    \
+                     {{ name = \"single\"\n    \
                      , programs = [ {{ name = \"app\", entry = \"{entry}\" }} ]\n    \
                      }}\n"
                 )),

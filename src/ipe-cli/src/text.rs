@@ -822,23 +822,31 @@ messages! {
     /// `--static` was requested for a delivery with no static form.
     delivery_static_not_allowed(delivery) = "delivery-static-not-allowed";
     /// An unknown token appeared where a runtime or host was expected.
-    delivery_unknown_token(got) = "delivery-unknown-token";
+    delivery_unknown_token(got, runtime) = "delivery-unknown-token";
     /// A runtime or host token was given more than once.
     delivery_duplicate_token(kind, got) = "delivery-duplicate-token";
-    /// A `solo` delivery resolved to a native compile target.
-    delivery_solo_requires_wasm_target = "delivery-solo-requires-wasm-target";
-    /// A wasm compile target resolved without a `solo` delivery.
-    delivery_wasm_target_requires_solo = "delivery-wasm-target-requires-solo";
+    /// A `client` delivery resolved to a native compile target.
+    delivery_client_requires_wasm_target = "delivery-client-requires-wasm-target";
+    /// A wasm compile target resolved without a `client` delivery.
+    delivery_wasm_target_requires_client = "delivery-wasm-target-requires-client";
     /// A WASM triple was requested for the native engine.
     delivery_native_engine_refuses_wasm_triple(triple) = "delivery-native-engine-refuses-wasm-triple";
-    /// A `web solo` client asked for a non-browser triple.
-    delivery_solo_requires_browser_triple(triple) = "delivery-solo-requires-browser-triple";
-    /// A `web solo` client asked for the WASI triple.
-    delivery_solo_refuses_wasi_triple = "delivery-solo-refuses-wasi-triple";
+    /// A `web client` app asked for a non-browser triple.
+    delivery_client_requires_browser_triple(triple) = "delivery-client-requires-browser-triple";
+    /// A `web client` app asked for the WASI triple.
+    delivery_client_refuses_wasi_triple = "delivery-client-refuses-wasi-triple";
     /// A musl static triple was requested for a webview-native delivery.
     delivery_webview_has_no_static_triple(delivery) = "delivery-webview-has-no-static-triple";
-    /// A co-located WASI build was asked to carry a `solo` delivery.
-    delivery_wasi_refuses_solo_delivery = "delivery-wasi-refuses-solo-delivery";
+    /// A co-located WASI build was asked to carry a `client` delivery.
+    delivery_wasi_refuses_client_delivery = "delivery-wasi-refuses-client-delivery";
+    /// A retired word whose replacement is the `client` runtime was written.
+    delivery_retired_client_word(got) = "delivery-retired-client-word";
+    /// A retired word whose replacement is the served default was written.
+    delivery_retired_served_word(got) = "delivery-retired-served-word";
+    /// A release was handed a wasm compile target.
+    delivery_release_wasm_target(source) = "delivery-release-wasm-target";
+    /// An app-bundle delivery was handed a compile target.
+    delivery_bundle_host_has_no_target(delivery, host, source) = "delivery-bundle-host-has-no-target";
     /// A co-located WASI build was asked for a non-`Direct` shape.
     delivery_wasi_requires_direct_shape(shape) = "delivery-wasi-requires-direct-shape";
     /// A co-located WASI engine was asked for a non-WASI triple.
@@ -1261,6 +1269,8 @@ messages! {
     ships_repeated(delivery) = "ships-repeated";
     /// A `ships` delivery does not fit the shape of `main`.
     ships_shape_mismatch(delivery, shape) = "ships-shape-mismatch";
+    /// A retired ship builder is written in `ships`.
+    ship_retired_builder(got, now) = "ship-retired-builder";
     /// `ipe add` found the package already declared as an escape dependency.
     pkg_add_escape_dependency(name) = "pkg-add-escape-dependency";
     /// A `package.ipe` program entry has an empty path segment.
@@ -1458,11 +1468,11 @@ messages! {
     /// `ipe init` was given an unknown shape word.
     init_unknown_shape(word) = "init-unknown-shape";
     /// `ipe init` was given an unknown runtime word.
-    init_unknown_runtime(word) = "init-unknown-runtime";
+    init_unknown_runtime(word, runtime) = "init-unknown-runtime";
     /// `ipe init`'s shape prompt was answered with an unknown choice.
     init_unknown_shape_choice(word) = "init-unknown-shape-choice";
     /// `ipe init`'s runtime prompt was answered with an unknown choice.
-    init_unknown_runtime_choice(word) = "init-unknown-runtime-choice";
+    init_unknown_runtime_choice(word, runtime) = "init-unknown-runtime-choice";
     /// `ipe init` could not derive a project name.
     init_no_project_name(target) = "init-no-project-name";
     /// GitHub returned a verification URL off `https://github.com`.

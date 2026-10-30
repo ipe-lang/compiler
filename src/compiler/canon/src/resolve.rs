@@ -1672,11 +1672,11 @@ fn check_library_ssot_import_gate(m: &src::Module, interner: &Interner) -> DResu
 
     let shape = Shape::from_main(crate::shape_source::classify_main_shape(m, interner));
 
-    // The runtimes this shape can carry: Web admits both served and solo, every
+    // The runtimes this shape can carry: Web admits both served and client, every
     // other shape has its one co-located runtime. A row is enforced here only
     // when it denies in ALL of them (a shape-fixed rejection).
     let runtimes: &[Runtime] = match shape {
-        Shape::Web => &[Runtime::Served, Runtime::Solo],
+        Shape::Web => &[Runtime::Served, Runtime::Client],
         _ => &[Runtime::Served],
     };
 

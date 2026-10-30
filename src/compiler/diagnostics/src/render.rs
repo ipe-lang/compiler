@@ -1878,7 +1878,7 @@ fn name_label(msg: &NameError) -> Option<String> {
             let why_and_fix = match r.reason {
                 ModulePlacementReason::NativeEffectInSandbox => {
                     "it is a native effect (a direct database, file, server, or secret), and a \
-                     `solo` app runs sandboxed in the browser — there is no native effect there. \
+                     `client` app runs sandboxed in the browser — there is no native effect there. \
                      Move it behind an HTTP boundary (`Ipe.Http` to your backend), or deliver \
                      the app as `web` (served, the co-located default), where the loop runs \
                      server-side"
@@ -1886,7 +1886,7 @@ fn name_label(msg: &NameError) -> Option<String> {
                 }
                 ModulePlacementReason::BrowserOutsideBrowserHost => format!(
                     "it is a browser host capability, and a `{placement}` app has no browser to \
-                     host it. Use a web app (`web` or `web solo`) for browser capabilities, or \
+                     host it. Use a web app (`web` or `web client`) for browser capabilities, or \
                      reach the equivalent effect through a native module in this shape"
                 ),
             };
