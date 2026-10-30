@@ -276,6 +276,7 @@ main =
 /// ignored it would build a native binary silently; the refusal fires before
 /// any emit, so no output is written.
 #[test]
+#[allow(clippy::panic)] // test assertion: an `ipe` binary that cannot spawn IS the failure
 fn release_env_wasm_is_refused_end_to_end() {
     const NAME: &str = "release_env_wasm_refused";
     let root = support::scratch_root().join(NAME);
