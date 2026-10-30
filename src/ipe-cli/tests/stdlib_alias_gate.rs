@@ -14,7 +14,7 @@
 //! kernel modules; compiled-source modules such as `Ipe.Io` are injected by
 //! the CLI project pipeline this harness does not run.
 
-use ipe_canon::{STDLIB_MODULE_QUALIFIERS, bare_import_binds, builtin_empty_home_arity};
+use ipe_canon::{KernelTypeExport, STDLIB_MODULE_QUALIFIERS, bare_import_binds};
 use ipe_diagnostics::{Diagnostic, NameError, StdlibReach};
 use ipe_intern::Interner;
 
@@ -537,8 +537,12 @@ fn qualified_and_exposed_kernel_types_canonicalise_identically() -> Result<(), D
                 detail: format!("{canonical:?} exports types but no import path names it"),
             });
         };
-        for name in types.keys() {
-            let args = " Int".repeat(builtin_empty_home_arity(Some(*name)).unwrap_or(0));
+        for (name, export) in types {
+            let arity = match export {
+                KernelTypeExport::Builtin(builtin) => builtin.row().params().in_schemes(),
+                KernelTypeExport::Alias(_) => 0,
+            };
+            let args = " Int".repeat(arity);
             let qualified = annotation(
                 &format!("import {path} as K\n"),
                 &format!("K.{name}{args} -> Int"),
@@ -771,4 +775,51 @@ fn kernel_alias_arity_is_checked() {
         Some(ipe_diagnostics::IPE_N0013),
         "{applied:?}"
     );
+}
+
+/// A builtin a kernel module exports takes the type arguments its row
+/// declares, however it is spelled: a mis-arity use is IPE-N0031, never an
+/// annotation no value inhabits nor a lowerer catch-all.
+#[test]
+fn kernel_builtin_arity_is_checked() {
+    let refused = [
+        ("import Ipe.Http\n", "Http.HttpMethod Int -> Int"),
+        ("import Ipe.Http\n", "Http.RedirectPolicy Int -> Int"),
+        ("import Ipe.Http\n", "Http.HttpRequest Int -> Int"),
+        (
+            "import Ipe.Http exposing (HttpMethod)\n",
+            "HttpMethod Int -> Int",
+        ),
+        ("import Ipe.Auth\n", "Auth.Principal Int -> Int"),
+        ("", "Order Int -> Int"),
+        ("", "Html Int Int -> Int"),
+        ("", "Attribute Int Int -> Int"),
+        ("", "Event -> Int"),
+    ];
+    for (imports, ty) in refused {
+        let applied = annotation_alone(imports, ty);
+        assert!(
+            matches!(
+                &applied,
+                Err(Diagnostic::Name {
+                    msg: NameError::TypeArity { .. },
+                    ..
+                })
+            ),
+            "{ty}: {applied:?}"
+        );
+    }
+    for (imports, ty) in [
+        ("import Ipe.Http\n", "Http.HttpMethod -> Int"),
+        (
+            "import Ipe.Http exposing (HttpMethod)\n",
+            "HttpMethod -> Int",
+        ),
+        ("", "Html -> Int"),
+        ("", "Html Int -> Int"),
+        ("", "Event Int -> Int"),
+    ] {
+        let accepted = annotation_alone(imports, ty);
+        assert!(accepted.is_ok(), "{ty}: {accepted:?}");
+    }
 }

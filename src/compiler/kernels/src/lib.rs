@@ -16,7 +16,7 @@
 
 mod builtin_type;
 pub use builtin_type::{
-    BUILTIN_TYPES, BuiltinRole, BuiltinRow, BuiltinType, KernelHome, SealClass,
+    BUILTIN_TYPES, BuiltinRole, BuiltinRow, BuiltinType, KernelHome, SealClass, TypeParams,
 };
 
 mod capability;

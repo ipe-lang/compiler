@@ -13,7 +13,9 @@ use ipe_diagnostics::{
     TypeError,
 };
 use ipe_intern::{Interner, Symbol, SynthStem};
-use ipe_kernels::{AppSurface, BuiltinRow, BuiltinType, SealClass, StdlibKernel, WebCapability};
+use ipe_kernels::{
+    AppSurface, BuiltinRow, BuiltinType, SealClass, StdlibKernel, TypeParams, WebCapability,
+};
 use ipe_syntax as src;
 use ipe_syntax::BinOp;
 use ipe_syntax::fixity::{OperatorModule, PARSER_OPERATOR_MODULE};
@@ -139,16 +141,12 @@ pub fn is_user_type_declaration_forbidden(name: &str) -> bool {
     bare_builtin(name).is_some_and(|row| row.role().forbids_user_declaration())
 }
 
-/// Fixed type-argument arity for empty-home builtins, or `None`.
+/// The exact type-argument count of the empty-home builtin spelled `name`, or
+/// `None` when its row takes an optional message or an inference-counted
+/// argument, or no empty-home row has the name.
 ///
-/// Feeds the IPE-N0031 canon gate: a mis-arity application would otherwise
-/// fall through to the lowerer's empty-home ICE catch-all (IPE-I0001). The
-/// arity is the row's [`BuiltinRow::fixed_arity`] column, which the kernels
-/// table proves reserved, so a fixed-arity head can never be user-shadowed.
-///
-/// `Task`/`Cmd`/`Sub` carry no arity here (their gate is in
-/// `ipe_types::constrain`); `CustomElement` carries none either (the gate
-/// checks it by name under any home).
+/// The count is the row's [`BuiltinRow::fixed_arity`], the one the IPE-N0031
+/// canon gate enforces on every use resolved to the row.
 #[must_use]
 pub fn builtin_empty_home_arity(name: Option<&str>) -> Option<usize> {
     bare_builtin(name?)?.fixed_arity().map(usize::from)
@@ -7154,6 +7152,10 @@ fn canonicalise_type(
             } else {
                 TypeTarget::Union(UnionHome::of(qualified_type_home(*qualifier, name, ctx)?)?)
             };
+            let builtin = match target {
+                TypeTarget::Builtin(builtin) => Some(builtin),
+                TypeTarget::Union(_) | TypeTarget::Alias(..) => None,
+            };
             let home = match target {
                 TypeTarget::Union(home) => home.into_vec(),
                 TypeTarget::Builtin(builtin) => builtin_home(builtin),
@@ -7266,16 +7268,16 @@ fn canonicalise_type(
                     args,
                 });
             }
-            // Every type constructor with a fixed arity is applied to exactly
-            // that many arguments (IPE-N0031); see [`fixed_type_arity`].
-            if let Some(expected) = fixed_type_arity(&home, name, ctx)
-                && can_args.len() != expected
+            // Every type constructor canon counts is applied to a count it
+            // admits (IPE-N0031); see [`type_arity_gate`].
+            if let Some(gate) = type_arity_gate(&home, name, builtin, ctx)
+                && !gate.admits(can_args.len())
             {
                 return Err(Diagnostic::Name {
                     span: ctx.ann_span,
                     msg: NameError::TypeArity {
                         name: name_str(ctx.interner, name)?,
-                        expected,
+                        expected: gate.expected(),
                         found: can_args.len(),
                     },
                 });
@@ -7289,7 +7291,7 @@ fn canonicalise_type(
             // DEFINITION of the name is already rejected earlier (IPE-N0026).
             //
             //   (a) ARITY: exactly two type arguments — the sealed down-state and
-            //       the up-event, refused above by [`fixed_type_arity`] on the
+            //       the up-event, refused above by [`type_arity_gate`] on the
             //       NAME, so the qualified spelling is gated too.
             //   (b) SEAL: each of the two parameters must be a plain, closed,
             //       concrete value type (§2.1). A function, an effect carrier, a
@@ -7317,24 +7319,23 @@ fn canonicalise_type(
                     args: can_args,
                 });
             }
-            // A bare builtin parametric UI constructor (`Html` / `Attribute`)
-            // carries one implicit message parameter — `view : Html`
+            // A builtin UI constructor whose row takes an optional message
+            // (`Html` / `Attribute`) carries one implicit message parameter — `view : Html`
             // means `view : Html any`, with the message type inferred from the
             // body's `Ui.layout …`. Arity-fill the missing parameter here, at the
             // single canon source of truth, so BOTH the type checker (via
             // `from_canon`, whose `any`-wildcard machinery gives each occurrence a
             // fresh flex variable) AND the lowerer see `Html any` rather than a
             // zero-arg `Html` that reaches the lowerer's empty-home catch-all ICE
-            // (IPE-I0001). The fill is gated on the empty-home sentinel, so a user
-            // `type Html a` (real home) is never touched; the synthetic `any` var
+            // (IPE-I0001). The fill is gated on the resolved builtin row, so a
+            // user `type Html a` (a union) is never touched; the synthetic `any` var
             // is NOT collected into `free_vars`, keeping it a per-occurrence
             // wildcard the solver resolves rather than a quantified type parameter.
             // The view aliases (`Element` / `Screen` / `Lines`) are NOT filled
             // here — their bare form already canonicalised to the `View <engine>
             // any` carrier above, so a fill here would forge a stray `Element any`.
-            let can_args = if home.is_empty()
-                && can_args.is_empty()
-                && matches!(ctx.interner.resolve(name), Some("Html" | "Attribute"))
+            let can_args = if can_args.is_empty()
+                && builtin.is_some_and(|b| b.row().params() == TypeParams::OptionalMessage)
             {
                 vec![canon::Type::Wildcard]
             } else {
@@ -7349,28 +7350,59 @@ fn canonicalise_type(
     }
 }
 
-/// The type-argument count the type constructor `name` at `home` takes, when
-/// it is fixed.
+/// The type-argument counts a type constructor admits.
+#[derive(Clone, Copy)]
+enum ArityGate {
+    /// Exactly this many.
+    Exactly(usize),
+    /// None, or one message parameter canon fills when omitted.
+    OptionalMessage,
+}
+
+impl ArityGate {
+    const fn admits(self, found: usize) -> bool {
+        match self {
+            Self::Exactly(n) => found == n,
+            Self::OptionalMessage => found <= 1,
+        }
+    }
+
+    const fn expected(self) -> usize {
+        match self {
+            Self::Exactly(n) => n,
+            Self::OptionalMessage => 1,
+        }
+    }
+}
+
+/// The type-argument counts the type constructor `name` at `home` admits, or
+/// `None` when inference counts them.
 ///
 /// One rule for every non-alias head: a declared union takes its declared
 /// parameters (an over- or under-application has no emitted Rust spelling,
 /// E0107); `CustomElement` takes its down-state and up-event under any home;
-/// an empty-home builtin takes its [`builtin_empty_home_arity`] (a mis-arity
-/// would reach the lowerer's empty-home catch-all, IPE-I0001). `None` for a
-/// head the lowerer arity-fills (`Html`, `Attribute`) or whose gate lives in
-/// inference (`Task`, `Cmd`, `Sub`). An alias is checked where it expands.
-fn fixed_type_arity(home: &[Symbol], name: Symbol, ctx: &TypeCtx) -> Option<usize> {
+/// a builtin takes the [`TypeParams`] of the row the use resolved to, however
+/// it was spelled (a mis-arity would reach the lowerer's catch-all, IPE-I0001,
+/// or an annotation no value can inhabit). `None` for the effect carriers
+/// (`Task`, `Cmd`, `Sub`), whose count inference checks (IPE-T0016). An alias
+/// is checked where it expands.
+fn type_arity_gate(
+    home: &[Symbol],
+    name: Symbol,
+    builtin: Option<BuiltinType>,
+    ctx: &TypeCtx,
+) -> Option<ArityGate> {
     if let Some(params) = ctx.env.union_params.of(home, name) {
-        return Some(params);
+        return Some(ArityGate::Exactly(params));
     }
-    let spelled = ctx.interner.resolve(name);
-    if spelled == Some("CustomElement") {
-        return Some(2);
+    if ctx.interner.resolve(name) == Some("CustomElement") {
+        return Some(ArityGate::Exactly(2));
     }
-    if home.is_empty() {
-        return builtin_empty_home_arity(spelled);
+    match builtin?.row().params() {
+        TypeParams::Exact(n) => Some(ArityGate::Exactly(usize::from(n))),
+        TypeParams::OptionalMessage => Some(ArityGate::OptionalMessage),
+        TypeParams::InferredCarrier => None,
     }
-    None
 }
 
 /// The reserved builtin a terminal engine's `Attribute` resolves to:
