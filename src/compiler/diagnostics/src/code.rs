@@ -594,7 +594,7 @@ code! {
     /// Rust-level runtime dispatch (a nested constructor / literal / list pattern)
     IPE_L0128 = "IPE-L0128", "alias over a dispatch-needing nested pattern not supported yet", "IPE-L0128";
     /// A routed `Web.tea` under `--target wasm` (client router not yet built).
-    IPE_L0129 = "IPE-L0129", "routed Web.tea not supported under --target wasm yet", "IPE-L0129";
+    IPE_L0129 = "IPE-L0129", "routed Web.tea not supported in a web client build yet", "IPE-L0129";
     /// a foreign opaque FFI handle (possibly non-`Clone`) is used more than once
     IPE_L0130 = "IPE-L0130", "a foreign opaque FFI handle is used more than once", "IPE-L0130";
     /// a row-polymorphic record annotation `{ r | f : T }` reached the backend

@@ -559,7 +559,7 @@ impl<'a> BundleAssembler<'a> {
         );
         let icon = manifest.icon.as_deref();
 
-        // Build the `--target wasm` SPA into the project's output root, then
+        // Build the `web client` bundle into the project's output root, then
         // collect its `www/` tree from the profile's crate. The wasm bundle
         // pipeline (emit + cargo + wasm-bindgen) is the single source of the
         // hostable bundle; invoking it through this binary keeps that pipeline
@@ -678,8 +678,8 @@ pub fn pack_mobile(
 
 /// Build the hostable SPA bundle under `output_root` through this binary.
 ///
-/// `ipe dev build --target wasm` for a dev bundle (`<root>/rust/www/`), `ipe
-/// release build --target wasm` for a production one (`<root>/release/rust/www/`).
+/// `ipe dev build web client` for a dev bundle (`<root>/rust/www/`), `ipe
+/// release build web client` for a production one (`<root>/release/rust/www/`).
 ///
 /// Invoking the same binary keeps the wasm bundle pipeline (emit + cargo +
 /// wasm-bindgen) authoritative — the mobile shell hosts exactly the bundle a
@@ -702,7 +702,9 @@ pub fn build_wasm_for_mobile(
     build
         .args(wasm_build_verb(profile).argv())
         .arg(project_dir)
-        .args(["--target", "wasm", "--out"])
+        .arg(delivery::Shape::Web.word())
+        .args(delivery::Runtime::Client.word())
+        .arg("--out")
         .arg(output_root);
     let status =
         run_inherited(build, InheritedRole::SelfBuild, InheritedInput::Terminal).map_err(|e| {
@@ -743,9 +745,8 @@ fn build_under_pinned_manifest(
 
 /// The verb a mobile shell's wasm bundle is built with.
 ///
-/// A dev shell hosts a `dev build --target wasm` bundle; a release shell hosts
-/// a production `release build --target wasm` bundle (Debug.* gated,
-/// optimised).
+/// A dev shell hosts a `dev build web client` bundle; a release shell hosts a
+/// production `release build web client` bundle (Debug.* gated, optimised).
 #[must_use]
 pub const fn wasm_build_verb(profile: BundleProfile) -> Verb {
     match profile {

@@ -1418,10 +1418,13 @@ impl Reader<'_> {
         match self.expect_ctor(expr, "a wasm mode")? {
             "Render" => Ok(WasmMode::Render),
             "Hydrate" => Ok(WasmMode::Hydrate),
-            "Solo" => Err(self.reject(
+            WasmMode::RETIRED_RENDER => Err(self.reject(
                 expr.span,
-                "`Solo` was renamed `Render`: the client renders everything. Write \
-                 `mode = Render`. There is no alias.",
+                &format!(
+                    "`{}` was renamed `Render`: the client renders everything. Write \
+                     `mode = Render`. There is no alias.",
+                    WasmMode::RETIRED_RENDER
+                ),
             )),
             other => Err(self.reject(
                 expr.span,

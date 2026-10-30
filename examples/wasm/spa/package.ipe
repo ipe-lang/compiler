@@ -7,5 +7,5 @@ package : Package
 package =
     { name = "wasm-spa"
     , version = "0.1.0"
-    , wasm = On { mode = Solo, mount = "#app" }
+    , wasm = On { mode = Render, mount = "#app" }
     }

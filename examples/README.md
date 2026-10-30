@@ -8,11 +8,11 @@ that builds with `ipe dev build` and targets the Rust backend.
 
 | Directory | Shape | What it demonstrates |
 |-----------|-------|----------------------|
-| `wasm/counter` | wasm/live | Basic TEA counter compiled to WebAssembly via `--target wasm`. The canonical "hello WASM" starting point. |
+| `wasm/counter` | wasm/live | Basic TEA counter compiled to WebAssembly as `web client`. The canonical "hello WASM" starting point. |
 | `wasm/effects` | wasm/live | `Sub.every` timer and `Cmd.perform` side-effects exercised end-to-end in a browser via the Cmd/Sub bridge (gloo-timers). |
 | `wasm/websocket` | wasm/live | `Ipe.WebSocket` client substitute: connect / onOpen / send / onMessage / close / onClose against a real WebSocket server in-browser. |
 | `wasm/env-public` | wasm/live | `Ipe.Env.public` build-time config embedding: an allowlisted `API_BASE_URL` variable injected at compile time and readable in WASM at run time. |
-| `wasm/spa` | wasm | SPA target: a pure-client single-page application with full TEA loop running in the browser. Uses `Web.tea` which emits `wasm_app` under `--target wasm`. |
+| `wasm/spa` | wasm | SPA target: a pure-client single-page application with full TEA loop running in the browser. Uses `Web.tea` which emits `wasm_app` in a `web client` build. |
 | `wasm/hydration` | wasm | SSR hydration: server-side initial render (paint) followed by WASM client takeover. |
 | `wasm/language-playground` | n/a (`ipe-wasm`) | The Ipê compiler frontend (parse → typecheck → lower → emit) compiled to WebAssembly: an ACE editor whose contents are compiled to Rust in the browser as you type, showing the emitted Rust or the diagnostics. A companion `Ipe.Http.Server` app (`server/`) plus a bwrap-jailed `jail-runner` workspace member add a sandboxed `POST /run` that builds and executes the emitted Rust. Built via the Ipê build program under `build/` (`cd build && ipe dev run`). See its `README.md`. |
 
@@ -49,5 +49,5 @@ Each example is a self-contained Ipê project. Build it with
 `cargo build --release -p ipe`), then run the emitted crate with
 `cargo run --manifest-path out/rust/Cargo.toml`.
 
-For a WASM example, pass `--target wasm` to `ipe dev build` and serve
+For a WASM example, run `ipe dev build <dir> web client` and serve
 `out/rust/www/` with any HTTP server.

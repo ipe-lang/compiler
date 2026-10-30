@@ -327,9 +327,9 @@ static HAND_TABLE: &[EnvVar] = &[
     EnvVar {
         name: "IPE_TARGET",
         default: Cow::Borrowed("unset (native)"),
-        purpose: "Cross-compilation target triple, e.g. `wasm32-unknown-unknown` or \
-                  `aarch64-unknown-linux-musl`. Set to `wasm` as a shorthand for \
-                  `wasm32-unknown-unknown`.",
+        purpose: "Cross-compilation target for `ipe dev build`/`dev run`: a triple, or \
+                  `wasm`/`wasi` as shorthands. `ipe release build` accepts only a native \
+                  triple here; its browser bundle is `web client`.",
         subsystem: Subsystem::Build,
         class: Class::Tunable,
     },

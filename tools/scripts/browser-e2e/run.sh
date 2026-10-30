@@ -13,7 +13,7 @@
 #      csp-styles, install-offer, install-offer-off) via `ipe dev build`.
 #   3. Cargo-builds each emitted Rust project.
 #   4. Spawns each binary on its port.
-#   5. Builds the wasm-solo-clipboard browser bundle (`ipe dev build … web solo`),
+#   5. Builds the wasm-client-clipboard browser bundle (`ipe dev build … web client`),
 #      which the spec serves from its `www/` directory with no server.
 #   6. Runs the Playwright specs.
 #   7. Kills the binaries on exit.
@@ -96,24 +96,24 @@ serve csp-styles "$CSP_STYLES_PORT"
 serve install-offer "$INSTALL_OFFER_PORT"
 serve install-offer-off "$INSTALL_OFFER_OFF_PORT"
 
-# bundle_solo NAME — build examples/shapes/web/NAME as the `web solo` browser
+# bundle_client NAME — build examples/shapes/web/NAME as the `web client` browser
 # bundle and export its `www/` directory, which the spec serves with no server.
-bundle_solo() {
+bundle_client() {
   local name="$1"
   local out="${TMPDIR:-/tmp}/$name-browser-e2e"
 
   echo "==> Building the $name browser bundle..."
   rm -rf "$out"
-  "$IPE" dev build "$REPO_ROOT/examples/shapes/web/$name" web solo --out "$out"
+  "$IPE" dev build "$REPO_ROOT/examples/shapes/web/$name" web client --out "$out"
   # Fail closed: a bundle without its shell leaves the spec nothing to serve.
   if [ ! -f "$out/rust/www/index.html" ]; then
     echo "   $name bundle has no www/index.html under '$out/rust'" >&2
     exit 1
   fi
-  export IPE_WASM_SOLO_WWW="$out/rust/www"
+  export IPE_WASM_CLIENT_WWW="$out/rust/www"
 }
 
-bundle_solo wasm-solo-clipboard
+bundle_client wasm-client-clipboard
 
 echo "==> Installing Playwright + Chromium (if not cached)..."
 cd "$SPEC_DIR"

@@ -70,7 +70,7 @@ unsupported target `{target}` — supported: wasm, wasi, {supported}
 
 ## run-wasm-target
 
-ipe dev run builds and executes a native binary; --target wasm has no native artifact to run — use `ipe dev build --target wasm` to produce a browser bundle
+ipe dev run builds and executes a native binary; --target wasm has no native artifact to run — use `ipe dev build web client` to produce a browser bundle
 
 ## run-wasi-native-flags
 
@@ -1560,7 +1560,7 @@ package.ipe: name `{name}` cannot be a macOS bundle directory — a bundle root 
 
 ## mobile-bundle-no-index
 
-no index.html in the emitted wasm bundle at {dir} — expected a `--target wasm` SPA (index.html + boot script + pkg/*.wasm)
+no index.html in the emitted wasm bundle at {dir} — expected a `web client` bundle (index.html + boot script + pkg/*.wasm)
 
 ## mobile-bundle-unplaceable
 
@@ -2376,7 +2376,7 @@ cannot locate the ipe binary to build wasm: {detail}
 
 ## mobile-wasm-build-failed
 
-the `--target wasm` build failed (exit {code}) — the mobile shell hosts that bundle, so it must build first
+the `web client` build failed (exit {code}) — the mobile shell hosts that bundle, so it must build first
 
 ## emit-permissions-failed
 

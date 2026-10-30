@@ -26,7 +26,7 @@ at the top and follow the links; each page assumes only the ones before it.
   how to apply each step manually.
 - [Delivering an app](delivery.md) — shape vs delivery, then packaging a `Web`
   app into a desktop bundle (`ipe release build web desktop`) and a mobile
-  system-webview shell (`ipe release build web solo ios|android`) through the one
+  system-webview shell (`ipe release build web client ios|android`) through the one
   delivery grammar.
 - [Publishing a package](publishing.md) — turn a library into a package other
   developers can `ipe add`: how the curated registry works, the one-time

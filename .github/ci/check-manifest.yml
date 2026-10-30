@@ -123,7 +123,7 @@ checks:
             IPE_RUNTIME_DIR: "{repo_root}/src/runtime/rust/src"
         - cmd: >-
             cargo nextest run --locked -p ipe --features wasi_run,signing --profile ci --no-fail-fast
-            --test argv_decode_scan --test cargo_step_scan --test child_runner_scan --test e2e_scratch_dir_scan --test emit_settings_scan --test emitted_cargo_build_scan --test env_read_scan --test ffi_cache_path_scan --test format_width_scan --test home_read_scan --test html_entity_owner_scan --test lenient_decode_scan --test output_marker_scan --test package_single_read_scan --test publish_fork_write_scan --test raw_print_ratchet --test tool_path_scan --test verb_prose_ratchet --test wildcard_spelling_scan
+            --test argv_decode_scan --test cargo_step_scan --test child_runner_scan --test e2e_scratch_dir_scan --test emit_settings_scan --test emitted_cargo_build_scan --test env_read_scan --test ffi_cache_path_scan --test format_width_scan --test home_read_scan --test html_entity_owner_scan --test lenient_decode_scan --test output_marker_scan --test package_single_read_scan --test publish_fork_write_scan --test raw_print_ratchet --test retired_delivery_words_scan --test tool_path_scan --test verb_prose_ratchet --test wildcard_spelling_scan
           env:
             IPE_RUNTIME_DIR: "{repo_root}/src/runtime/rust/src"
           tier: quick

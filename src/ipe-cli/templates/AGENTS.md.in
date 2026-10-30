@@ -107,7 +107,7 @@ Production-grade code no survive guesswork.
    `Ipe.Tea.Web`=web UI (`Web.tea`), `Ipe.Tea.Tui`=terminal UI (`Tui.tea`),
    `Ipe.Tea.Cli`=line-oriented REPL (`Cli.tea`), `Ipe.Tea.Worker`=view-less
    managed loop (`Worker.tea`). A desktop or mobile app is the `web` shape
-   delivered to a host (`web desktop` / `web solo ios` / `web solo android`),
+   delivered to a host (`web desktop` / `web client ios` / `web client android`),
    not a separate shape. A plain `main : Task Error ()` is the **script** (direct)
    shape — a batch tool, cron job, or HTTP server (`Server.listen`) alike.
    Importing anything under `Ipe.Tea.*` marks a module a TEA app; a plain-`main`
@@ -131,7 +131,7 @@ Ask one focused question per ambiguity; no guess heroically.
 | Web app (forms, real-time, UI state)     | **Ipe.Tea.Web**        | `Web.tea cfg`                      | HTTP-first; SSE patches; sessions + cookies + routing built in. |
 | Multi-tenant SaaS / dashboard            | **Ipe.Tea.Web + auth-app gate** | `Web.tea { consoleAuth = … }` | Tenant scope enforced at SQL layer. |
 | Desktop app                              | **Ipe.Tea.Web** (host=desktop) | `Web.tea cfg` + `ipe dev build web desktop` | Same `web` shape; desktop is a delivery host. |
-| Mobile app (iOS / Android)               | **Ipe.Tea.Web** (solo runtime) | `Web.tea cfg` + `ipe release build web solo ios\|android` | `wasm = On { mode = Solo }` in `package.ipe`. |
+| Mobile app (iOS / Android)               | **Ipe.Tea.Web** (client runtime) | `Web.tea cfg` + `ipe release build web client ios\|android` | `wasm = On { mode = Render }` in `package.ipe`. |
 | View-less background TEA worker          | **Ipe.Tea.Worker**     | `Worker.tea cfg`                   | Managed `init`/`update`/`subscriptions` loop, no view sink. |
 | Line-oriented interactive tool           | **Ipe.Tea.Cli**        | `Cli.tea cfg`                      | Managed stdin-driven TEA loop (init/update/view/subscriptions); lines via `Sub.onLine`. |
 | Terminal UI (TUI)                        | **Ipe.Tea.Tui**        | `Tui.tea cfg`                      | `Screen` view (`Ipe.Ui.Tui`), a terminal-only view type; keys via `Sub.onKey`. |
@@ -260,7 +260,7 @@ inward as a plain value.
 direct `argv` vector, never `sh -c`, so no argument can be reinterpreted as
 shell syntax (no command injection). It succeeds with the child's captured
 stdout and fails with a typed `Error` on a non-zero exit or spawn failure.
-Server-only (`subprocess` capability): default-denied under `--target wasm`.
+Server-only (`subprocess` capability): default-denied in a `web client` build.
 
 ```elm
 main : Task Error ()
@@ -1070,9 +1070,9 @@ so the view returns the raw `Element` with no wrap. `Ipe.Tea.Tui`
 supported first. For direct DOM control, drop raw `Ipe.Html` into the view
 through the `Ui.html : Html msg -> Element msg` node.
 
-## Browser-WASM target (`--target wasm`)
+## Browser-WASM client (`web client`)
 
-`ipe dev build --target wasm` compiles single-page `Web.tea` program to
+`ipe dev build web client` compiles single-page `Web.tea` program to
 browser bundle: emitted project = `cdylib` crate (wasm-bindgen glue, no
 tokio/axum/sqlx) plus static `www/` shell (CSP `script-src 'self'
 'wasm-unsafe-eval'` — no JS eval). Bundle w/
@@ -1124,20 +1124,22 @@ package =
     { name = "<project>"
     , wasm =
         On                                     -- Off (absent = native) | On { … }
-            { mode = Solo                       -- Solo | Hydrate
+            { mode = Render                       -- Render | Hydrate
             , entry = "src/Client.ipe"          -- client entry file (defaults to the build's own entry)
-            , mount = "#app"                    -- solo mount selector
+            , mount = "#app"                    -- client mount selector
             , publicEnv = [ "API_BASE_URL" ]    -- default-deny allowlist; rejects IPE_*/secret/temp-root/home names
             , optLevel = "z"
             }
     }
 ```
 
-When `wasm = On { mode = Solo }` (or `Hydrate`), the compiler infers the wasm
-target: `ipe dev build` is equivalent to `ipe dev build --target wasm` without an
-explicit flag. Precedence (highest first): `--target wasm` CLI flag >
-`IPE_TARGET=wasm` env > the manifest's `wasm` mode > default native. An
-absent `wasm` field (or `wasm = Off`) keeps the native default.
+The `web client` delivery derives the wasm target; the `wasm` block configures
+the bundle it builds (`mode = Render` or `Hydrate`, entry, public env) and never
+picks the target. A project with a `wasm` block is built as `ipe dev build web
+client`; any other delivery is refused. On `ipe dev build`, `--target wasm` and
+`IPE_TARGET=wasm` must agree with `web client`; `ipe release build` refuses both
+and names `web client`. An absent `wasm` field (or `wasm = Off`) keeps the
+native default.
 
 `Wasm.publicEnv` is a default-deny allowlist gated by a secret-name denylist
 (any `_`-delimited component that is a secret word — `SECRET`/`TOKEN`/`KEY`/
@@ -1215,7 +1217,7 @@ ipe init [name]                    # new project
 # not expressible. A `build` / `run` with no group in front is refused: the
 # group names the posture.
 ipe dev build                      # compile the project here → out/app
-ipe dev build --target wasm        # browser-WASM project (cdylib + www/ shell)
+ipe dev build web client          # browser-WASM project (cdylib + www/ shell)
 ipe dev run                        # build + run
 ipe release build                  # PRODUCTION build; rejects any Debug.* use
                                    #  (IPE-L0140)

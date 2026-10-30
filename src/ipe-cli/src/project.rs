@@ -662,6 +662,11 @@ pub enum WasmMode {
     Hydrate,
 }
 
+impl WasmMode {
+    /// The retired constructor [`WasmMode::Render`] replaced, refused by name.
+    pub const RETIRED_RENDER: &'static str = "Solo";
+}
+
 impl WasmConfig {
     /// Whether this config implies the `WasmClient` compilation target: any
     /// active bundle does, `Off` does not.

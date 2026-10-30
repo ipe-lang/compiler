@@ -41,19 +41,19 @@ ipe dev run             # serves at http://localhost:8000 (server-rendered HTML 
 ```
 
 On a TTY `ipe init` asks the shape (`web` / `tui` / `cli` / `worker` / `server` / `script`) and, for the web shape, 
-asks which runtime — `served` (a co-located SSR + SSE server) or `solo` (a wasm client).
+asks which runtime — `served` (a co-located SSR + SSE server) or `client` (a wasm client).
 
 
 Name the positionals to skip the wizard — `ipe init <dir> [shape] [runtime]` (host is a build-time choice, not an `init` arg): 
 ```sh
-ipe init myapp web solo     # <dir>=myapp  <shape>=web  <runtime>=solo
+ipe init myapp web client     # <dir>=myapp  <shape>=web  <runtime>=client
 ```
 
 See [Shapes](#shapes) below and the [getting started](docs/guide/getting-started.md) guide.
 
 The first build of a new project on a fresh machine also compiles the Rust
 dependencies of the runtime, so it takes minutes rather than seconds (longer for a
-`solo` wasm client). That cost is paid once; later builds reuse the compiled
+`client` wasm client). That cost is paid once; later builds reuse the compiled
 dependencies — see [Performance](#performance-dev-loop).
 
 ## Discover the language
@@ -92,7 +92,7 @@ terminal. → **[full shapes guide](docs/topics/shapes.md)**
 
 | Shape | Entry | For |
 |---|---|---|
-| **Web** *(default)* | `Web.tea` | Browser DOM — served SSR+SSE, or a `solo` wasm client (browser / desktop / iOS / Android hosts) |
+| **Web** *(default)* | `Web.tea` | Browser DOM — served SSR+SSE, or a `client` wasm client (browser / desktop / iOS / Android hosts) |
 | **Tui** | `Tui.tea` | Full-screen terminal UIs |
 | **Cli** | `Cli.tea` | Line-oriented CLIs and REPLs |
 | **Worker** | `Worker.tea` | A view-less TEA loop (background jobs, timers) |

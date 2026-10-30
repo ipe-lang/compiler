@@ -1053,7 +1053,7 @@ jobs:
           targets: wasm32-unknown-unknown
       - uses: ./.github/actions/mold
       # The wasm-bindgen CLI, pinned to the Cargo.lock wasm-bindgen version: a
-      # shape that declares a wasm client builds as its `web solo` bundle.
+      # shape that declares a wasm client builds as its `web client` bundle.
       - uses: taiki-e/install-action@4cef1412cce204788f482e778a0b9187f9626a29 # v2
         with:
           tool: wasm-bindgen@0.2.126
@@ -1091,11 +1091,11 @@ jobs:
             if ! "$IPE" type-check "$dir"; then
               echo "::error::ipe type-check regressed: $dir"; fail=1; echo "::endgroup::"; continue
             fi
-            # A package that declares a wasm client builds as its `web solo`
+            # A package that declares a wasm client builds as its `web client`
             # bundle: that build compiles the wasm32 crate and runs wasm-bindgen
             # itself, and mold links host binaries only, so RUSTFLAGS is cleared.
             if grep -Eq '^[[:space:],]*wasm[[:space:]]*=[[:space:]]*On' "$toml"; then
-              if ! RUSTFLAGS="" "$IPE" dev build "$dir" web solo --out "$dir/out"; then
+              if ! RUSTFLAGS="" "$IPE" dev build "$dir" web client --out "$dir/out"; then
                 echo "::error::ipe dev build regressed: $dir"; fail=1; echo "::endgroup::"; continue
               fi
               if [ ! -f "$dir/out/rust/www/index.html" ]; then
@@ -2723,7 +2723,7 @@ jobs:
             exit 1
           fi
       # The wasm-bindgen CLI, pinned to the Cargo.lock wasm-bindgen version: the
-      # `web solo` bundle build below runs it, and so does the wasm test runner
+      # `web client` bundle build below runs it, and so does the wasm test runner
       # (a runner of another version refuses the test binary).
       - uses: taiki-e/install-action@4cef1412cce204788f482e778a0b9187f9626a29 # v2
         with:
@@ -2731,23 +2731,23 @@ jobs:
       # The serverless browser bundle: the spec serves its `www/` directory by
       # request interception, so no server is spawned. mold links host binaries
       # only, so the wasm32 build clears the job's RUSTFLAGS.
-      - name: Build the wasm-solo-clipboard browser bundle
+      - name: Build the wasm-client-clipboard browser bundle
         env:
           RUSTFLAGS: ""
-          CARGO_TARGET_DIR: ${{ github.workspace }}/.cache/browser-e2e-target/wasm-solo-clipboard
+          CARGO_TARGET_DIR: ${{ github.workspace }}/.cache/browser-e2e-target/wasm-client-clipboard
         run: |
           set -euo pipefail
-          OUT="$RUNNER_TEMP/wasm-solo-clipboard-emitted"
-          "$RUNNER_TEMP/ipe-release/ipe" dev build examples/shapes/web/wasm-solo-clipboard web solo --out "$OUT"
+          OUT="$RUNNER_TEMP/wasm-client-clipboard-emitted"
+          "$RUNNER_TEMP/ipe-release/ipe" dev build examples/shapes/web/wasm-client-clipboard web client --out "$OUT"
           # Fail closed: a bundle without its shell leaves the spec nothing to serve.
           if [ ! -f "$OUT/rust/www/index.html" ]; then
-            echo "wasm-solo-clipboard bundle has no www/index.html under '$OUT/rust'" >&2
+            echo "wasm-client-clipboard bundle has no www/index.html under '$OUT/rust'" >&2
             exit 1
           fi
-          bash "$GITHUB_WORKSPACE/.github/ci/github-env.sh" CI_JOB_WASM_SOLO_WWW "$OUT/rust/www"
+          bash "$GITHUB_WORKSPACE/.github/ci/github-env.sh" CI_JOB_WASM_CLIENT_WWW "$OUT/rust/www"
       - name: Run Playwright specs (geo + clipboard, layout fill, focus across patch, csp styles, install offer)
         working-directory: tools/scripts/browser-e2e
-        run: IPE_WASM_SOLO_WWW="$CI_JOB_WASM_SOLO_WWW" npx playwright test --config playwright.config.mjs
+        run: IPE_WASM_CLIENT_WWW="$CI_JOB_WASM_CLIENT_WWW" npx playwright test --config playwright.config.mjs
       - name: Kill server
         if: always()
         run: kill "$CI_JOB_GEO_SERVER_PID" "$CI_JOB_LAYOUT_SERVER_PID" "$CI_JOB_FOCUS_SERVER_PID" "$CI_JOB_CSP_STYLES_SERVER_PID" "$CI_JOB_INSTALL_OFFER_SERVER_PID" "$CI_JOB_INSTALL_OFFER_OFF_SERVER_PID" 2>/dev/null || true

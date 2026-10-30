@@ -9002,7 +9002,7 @@ class TestBrowserE2eRunScriptParity(unittest.TestCase):
         built = set()
         for step in job["steps"]:
             built.update(re.findall(r"examples/shapes/web/([\w-]+)(?=[\s\"'])", str(step.get("run", ""))))
-        served_apps = set(re.findall(r'^(?:serve|bundle_solo) ([\w-]+)\b', run_sh, re.M))
+        served_apps = set(re.findall(r'^(?:serve|bundle_client) ([\w-]+)\b', run_sh, re.M))
         self.assertTrue(built, "the job builds no example app")
         self.assertEqual(served_apps, built)
 

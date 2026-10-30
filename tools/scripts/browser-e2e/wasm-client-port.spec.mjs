@@ -1,5 +1,5 @@
 /**
- * Playwright behaviour spec for the wasm-solo-clipboard example: the port
+ * Playwright behaviour spec for the wasm-client-clipboard example: the port
  * round-trip in the browser wasm bundle, with no server behind the page.
  *
  *   1. Round-trip — the bundle's shell loads the SRI-pinned port glue before
@@ -14,7 +14,7 @@
  * as on a static host.
  *
  * Prerequisites (satisfied by the CI `browser-e2e` job setup):
- *   - IPE_WASM_SOLO_WWW env var naming the built bundle's `www/` directory
+ *   - IPE_WASM_CLIENT_WWW env var naming the built bundle's `www/` directory
  *   - Playwright and Chromium installed
  *
  * Run locally after building:
@@ -31,15 +31,15 @@ const ARTIFACTS = path.join(__dirname, "artifacts");
 fs.mkdirSync(ARTIFACTS, { recursive: true });
 
 // Fail closed: without the bundle directory there is nothing to serve.
-const WWW = process.env.IPE_WASM_SOLO_WWW;
+const WWW = process.env.IPE_WASM_CLIENT_WWW;
 if (!WWW || !fs.existsSync(path.join(WWW, "index.html"))) {
   throw new Error(
-    `IPE_WASM_SOLO_WWW must name a built wasm bundle www/ directory (got '${WWW ?? ""}')`,
+    `IPE_WASM_CLIENT_WWW must name a built wasm bundle www/ directory (got '${WWW ?? ""}')`,
   );
 }
 const ROOT = path.resolve(WWW);
 const ORIGIN = "http://127.0.0.1:18090";
-const COPIED = "ipe-wasm-solo";
+const COPIED = "ipe-wasm-client";
 // Well under the runtime's request deadline: a refusal that waited it out
 // fails this bound.
 const REFUSAL_BOUND_MS = 5000;
@@ -104,7 +104,7 @@ async function waitBooted(page) {
   await expect(page.getByRole("button", { name: "Paste" })).toBeVisible({ timeout: 15000 });
 }
 
-test("wasm solo: the pinned glue carries a clipboard round-trip", async ({ browser }) => {
+test("wasm client: the pinned glue carries a clipboard round-trip", async ({ browser }) => {
   const { ctx, glueRequests } = await bundleContext(browser, "serve");
   const page = await ctx.newPage();
   const refused = [];
@@ -126,12 +126,12 @@ test("wasm solo: the pinned glue carries a clipboard round-trip", async ({ brows
   await expect(page.getByText(`clipboard: ${COPIED}`)).toBeVisible({ timeout: 5000 });
   expect(refused, "no integrity or CSP refusal on the shipped bundle").toEqual([]);
 
-  await page.screenshot({ path: path.join(ARTIFACTS, "wasm-solo-roundtrip.png") });
+  await page.screenshot({ path: path.join(ARTIFACTS, "wasm-client-roundtrip.png") });
   await ctx.close();
 });
 
 for (const glue of ["absent", "tampered"]) {
-  test(`wasm solo: a ${glue} glue refuses the request at once`, async ({ browser }) => {
+  test(`wasm client: a ${glue} glue refuses the request at once`, async ({ browser }) => {
     const { ctx, glueRequests } = await bundleContext(browser, glue);
     const page = await ctx.newPage();
     await page.goto(ORIGIN + "/");
@@ -145,7 +145,7 @@ for (const glue of ["absent", "tampered"]) {
     await expect(page.getByText(/clipboard: error:/)).toBeVisible({ timeout: REFUSAL_BOUND_MS });
     expect(Date.now() - started).toBeLessThan(REFUSAL_BOUND_MS);
 
-    await page.screenshot({ path: path.join(ARTIFACTS, `wasm-solo-${glue}-glue.png`) });
+    await page.screenshot({ path: path.join(ARTIFACTS, `wasm-client-${glue}-glue.png`) });
     await ctx.close();
   });
 }

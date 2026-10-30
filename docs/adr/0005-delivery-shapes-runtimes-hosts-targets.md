@@ -245,3 +245,5 @@ arena requires emitted `unsafe` and a hard heap cap, both of which the
 generated-code soundness posture forbids — with a message naming `dlmalloc` as
 the alternative. Static linking freezes every dependency into the artifact, so
 the CI `cargo audit` over the emitted lockfile is load-bearing.
+
+Superseded in part: the self-contained runtime word is `client`; `solo`, `spa` and `live` are refused.

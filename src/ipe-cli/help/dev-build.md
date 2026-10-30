@@ -6,7 +6,7 @@ ipe dev build [<dir>] [<shape>] [<runtime>] [<host>] [<target>]
 
 ## Arguments
 
-dir: a project directory (default: the current directory). shape is derived from `main` and, if written, only cross-checked. runtime/host apply to `web` only: `web` = served (served is the unnamed default, never written), `web solo` = self-contained browser client, and a host is desktop/ios/android. A `desktop`/`ios`/`android` host lays out the app bundle for that host (a fast dev bundle; `release build web <host>` produces the production distributable). With no delivery args, `dev build` builds the default delivery — the fast one-artifact inner loop; `release build` builds every declared delivery. Delivery args select a subset or override for this invocation only and never edit package.ipe.
+dir: a project directory (default: the current directory). shape is derived from `main` and, if written, only cross-checked. runtime/host apply to `web` only: `web` = served (served is the unnamed default, never written), `web client` = self-contained browser client (it derives the wasm target), and a host is desktop/ios/android. A `desktop`/`ios`/`android` host lays out the app bundle for that host (a fast dev bundle; `release build` with the same delivery words produces the production distributable). With no delivery args, `dev build` builds the default delivery — the fast one-artifact inner loop; `release build` builds every declared delivery. Delivery args select a subset or override for this invocation only and never edit package.ipe.
 
 ## Options
 
