@@ -2943,7 +2943,7 @@ fn dev_compile_target_table() {
     let script = script_delivery();
     let native = TargetTriple::Native(cli_args::StaticTriple::Aarch64LinuxMusl);
     let wasm = Some(TargetTriple::BrowserWasm);
-    let wasi = Some(TargetTriple::Wasm32Wasip1);
+    let wasip1 = Some(TargetTriple::Wasm32Wasip1);
     let rows = [
         (client, None, None, false, Ok(CompileTarget::WasmClient)),
         (client, None, None, true, Ok(CompileTarget::WasmClient)),
@@ -2951,7 +2951,7 @@ fn dev_compile_target_table() {
         (client, None, wasm, false, Ok(CompileTarget::WasmClient)),
         (
             client,
-            wasi,
+            wasip1,
             None,
             false,
             Err(TargetRefusal::Delivery(
@@ -2998,8 +2998,8 @@ fn dev_compile_target_table() {
                 DeliveryError::WasmTargetRequiresClient,
             )),
         ),
-        (script, wasi, None, false, Ok(CompileTarget::WasmWasi)),
-        (script, None, wasi, false, Ok(CompileTarget::WasmWasi)),
+        (script, wasip1, None, false, Ok(CompileTarget::WasmWasi)),
+        (script, None, wasip1, false, Ok(CompileTarget::WasmWasi)),
         (script, Some(native), None, false, Ok(CompileTarget::Native)),
     ];
     for (delivery, flag, env, wasm_block, expected) in rows {
@@ -5941,25 +5941,34 @@ fn release_artifact_table() {
             "release artifact for {delivery:?} flag={flag:?} env={env:?} wasm_block={wasm_block}"
         );
     }
-    assert_eq!(
-        derive_target(
-            TargetVerb::Release,
-            served,
-            Some(TargetTriple::BrowserWasm),
-            None,
-            false
-        ),
-        Err(TargetRefusal::Delivery(DeliveryError::ReleaseWasmTarget {
-            source: TargetSource::Flag,
-        })),
-        "a release refuses `--target wasm` naming the flag"
-    );
+}
+
+/// A release refuses a browser target named by the flag, and each artifact
+/// compiles for its own engine.
+#[test]
+fn release_flag_wasm_refused_and_artifact_engines() {
+    use crate::delivery::{DeliveryError, Runtime, TargetSource, TargetTriple};
+    for delivery in [web_delivery(None), web_delivery(Some(Runtime::Client))] {
+        assert_eq!(
+            derive_target(
+                TargetVerb::Release,
+                delivery,
+                Some(TargetTriple::BrowserWasm),
+                None,
+                false
+            ),
+            Err(TargetRefusal::Delivery(DeliveryError::ReleaseWasmTarget {
+                source: TargetSource::Flag,
+            })),
+            "a release of {delivery:?} refuses `--target wasm` naming the flag"
+        );
+    }
     assert_eq!(
         ReleaseArtifact::Browser.compile_target(),
         CompileTarget::WasmClient
     );
     assert_eq!(
-        ReleaseArtifact::Native(arm).compile_target(),
+        ReleaseArtifact::Native(cli_args::StaticTriple::Aarch64LinuxMusl).compile_target(),
         CompileTarget::Native
     );
 }

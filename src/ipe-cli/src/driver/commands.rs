@@ -775,9 +775,9 @@ pub enum TargetRefusal {
 impl TargetRefusal {
     /// The usage error `verb` prints for this refusal.
     #[must_use]
-    pub fn into_cli(self, verb: &Verb) -> CliError {
+    pub fn into_cli(self, verb: Verb) -> CliError {
         match self {
-            Self::Delivery(err) => CliError::Usage(text::msg::command_refusal(verb, &err)),
+            Self::Delivery(err) => CliError::Usage(text::msg::command_refusal(&verb, &err)),
             Self::NoWasi => CliError::Usage(text::msg::release_no_wasi()),
         }
     }
@@ -871,14 +871,14 @@ const fn bundle_target_source(
 ///
 /// [`CliError::Usage`] carrying [`delivery::DeliveryError::BundleHostHasNoTarget`].
 fn refuse_bundle_target(
-    verb: &Verb,
+    verb: Verb,
     delivery: delivery::Delivery,
     flag: Option<delivery::TargetTriple>,
     env: Option<delivery::TargetTriple>,
 ) -> Result<(), CliError> {
     bundle_target_source(flag, env).map_or(Ok(()), |source| {
         Err(CliError::Usage(text::msg::command_refusal(
-            verb,
+            &verb,
             &delivery::DeliveryError::BundleHostHasNoTarget { delivery, source },
         )))
     })
@@ -929,7 +929,7 @@ fn admit_dev_build(
     )?;
     let env = build_plan::env_target()?;
     if let Some(host) = BundleHost::from_delivery_host(delivery.host())? {
-        refuse_bundle_target(&Verb::DEV_BUILD, delivery, flag, env)?;
+        refuse_bundle_target(Verb::DEV_BUILD, delivery, flag, env)?;
         return Ok(DevAdmission {
             delivery,
             route: DevRoute::Bundle(host),
@@ -941,7 +941,7 @@ fn admit_dev_build(
         env,
         held.root().manifest().wasm.implies_wasm_target(),
     )
-    .map_err(|refusal| refusal.into_cli(&Verb::DEV_BUILD))?;
+    .map_err(|refusal| refusal.into_cli(Verb::DEV_BUILD))?;
     let (engine, triple) = compile_target.engine_triple();
     delivery
         .admit_triple(engine, triple)
@@ -1815,7 +1815,7 @@ pub fn release_pipeline(
     let env = build_plan::env_target()?;
     if let Some(host) = BundleHost::from_delivery_host(bundle_delivery_resolved.host())? {
         refuse_bundle_target(
-            &verb,
+            verb,
             bundle_delivery_resolved,
             args.target.map(delivery::TargetTriple::Native),
             env,
@@ -1839,7 +1839,7 @@ pub fn release_pipeline(
         env,
         manifest.wasm.implies_wasm_target(),
     )
-    .map_err(|refusal| refusal.into_cli(&verb))?;
+    .map_err(|refusal| refusal.into_cli(verb))?;
     let compile_target = artifact.compile_target();
 
     // Fail closed unless the delivery runtime and the compile target agree — the
@@ -3150,7 +3150,7 @@ pub fn run_run_with_args(args: cli_args::RunArgs) -> Result<(), CliError> {
         build_plan::env_target()?,
         manifest.wasm.implies_wasm_target(),
     )
-    .map_err(|refusal| refusal.into_cli(&Verb::DEV_RUN))?;
+    .map_err(|refusal| refusal.into_cli(Verb::DEV_RUN))?;
     let wasm_target = compile_target.is_wasm();
 
     // A session over a shape or target with no recordable update loop is

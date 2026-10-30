@@ -483,6 +483,14 @@ a co-located `wasm32-wasip1` build cannot carry a `client` delivery. `client` is
 
 `{got}` is no longer a delivery word: served is the default web runtime, so it is never written. Write `web` alone (or `web desktop`).
 
+## target-source-flag
+
+`--target`
+
+## target-source-env
+
+`IPE_TARGET`
+
 ## delivery-release-wasm-target
 
 `ipe release build` builds the browser bundle from the delivery, so a wasm target from {source} is not accepted. Write `ipe release build web client` (add `desktop`, `ios` or `android` for an app shell) and drop the wasm target from {source}.

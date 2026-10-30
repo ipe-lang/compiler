@@ -236,7 +236,7 @@ impl std::fmt::Display for MobileRefusal {
                 "error[IPE-P0023]: `web client <ios|android>` wraps the wasm client, \
                  but this project's `[wasm]` mode is off (or absent)\n  \
                  = enable the wasm client target so a hostable browser bundle exists: set \
-                 `wasm = On { mode = Render }` (or `Hydrate`) in package.ipe."
+                 `wasm = On {{ mode = Render }}` (or `Hydrate`) in package.ipe."
             ),
             Self::ManifestChanged { moved } => write!(
                 f,

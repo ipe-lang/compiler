@@ -2420,7 +2420,7 @@ mod tests {
         ] {
             let refused = parse_release_build(&s(argv));
             assert!(
-                matches!(&refused, Err(CliError::Usage(m)) if m.to_string() == expected),
+                matches!(&refused, Err(CliError::Usage(m)) if *m == expected),
                 "{argv:?}: {refused:?}"
             );
         }
@@ -2431,7 +2431,7 @@ mod tests {
         let expected = release_wasm_flag_refusal(Verb::RELEASE_RUN.name());
         let refused = parse_release_run(&s(&["--target", "wasm"]));
         assert!(
-            matches!(&refused, Err(CliError::Usage(m)) if m.to_string() == expected),
+            matches!(&refused, Err(CliError::Usage(m)) if *m == expected),
             "{refused:?}"
         );
     }

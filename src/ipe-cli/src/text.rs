@@ -843,6 +843,10 @@ messages! {
     delivery_retired_client_word(got) = "delivery-retired-client-word";
     /// A retired word whose replacement is the served default was written.
     delivery_retired_served_word(got) = "delivery-retired-served-word";
+    /// The `--target` flag, as a target refusal names its source.
+    target_source_flag = "target-source-flag";
+    /// The `IPE_TARGET` variable, as a target refusal names its source.
+    target_source_env = "target-source-env";
     /// A release was handed a wasm compile target.
     delivery_release_wasm_target(source) = "delivery-release-wasm-target";
     /// An app-bundle delivery was handed a compile target.

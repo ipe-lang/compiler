@@ -162,15 +162,15 @@ macro_rules! closed_retired_runtime_words {
         impl RetiredRuntimeWord {
             /// Every retired word, the one list the refusals and the scan derive
             /// from.
-            pub const ALL: [Self; Self::COUNT] = [$(Self::$variant),+];
+            pub const ALL: [Self; Self::COUNT] = [$(RetiredRuntimeWord::$variant),+];
 
-            const COUNT: usize = [$(Self::$variant),+].len();
+            const COUNT: usize = [$(RetiredRuntimeWord::$variant),+].len();
 
             /// The retired spelling.
             #[must_use]
             pub const fn text(self) -> &'static str {
                 match self {
-                    $(Self::$variant => $text,)+
+                    $(RetiredRuntimeWord::$variant => $text,)+
                 }
             }
 
@@ -178,7 +178,7 @@ macro_rules! closed_retired_runtime_words {
             #[must_use]
             pub const fn replacement(self) -> Runtime {
                 match self {
-                    $(Self::$variant => Runtime::$now,)+
+                    $(RetiredRuntimeWord::$variant => Runtime::$now,)+
                 }
             }
         }
@@ -211,10 +211,10 @@ pub enum TargetSource {
 impl TargetSource {
     /// The source's name as a refusal prints it.
     #[must_use]
-    pub const fn spelling(self) -> &'static str {
+    pub fn spelling(self) -> &'static str {
         match self {
-            Self::Flag => "`--target`",
-            Self::Env => "`IPE_TARGET`",
+            Self::Flag => text::target_source_flag(),
+            Self::Env => text::target_source_env(),
         }
     }
 }
