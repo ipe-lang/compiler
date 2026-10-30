@@ -4147,7 +4147,7 @@ mod mobile_base_tests {
                 "module Package exposing (package)\n\npackage =\n    {{ name = \"x\"\n    \
                  , wasm = On {{ mode = Render }}\n    \
                  , capabilities = {{ accepts = [ JsPort Push ] }}\n    \
-                 , delivery = {delivery}\n    }}\n"
+                 , delivery = {{ mobile = {mobile} }}\n    }}\n"
             ),
         )
         .expect("write package.ipe");
