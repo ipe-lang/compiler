@@ -1024,11 +1024,43 @@ ipe.lock: a `[[package]]` is missing `{field}`
 
 ## lock-unknown-kind
 
-ipe.lock: package `{package}` has an unrecognised `kind` value "{kind}" — re-run `ipe add` to regenerate
+ipe.lock: package `{package}` has an unrecognised `kind` value "{kind}" — {remedy}
 
 ## lock-index-dep-local-rev
 
-ipe.lock: package `{package}` is an index dependency but records a `local` rev — an index dependency is always pinned to a commit; re-run `ipe add`
+ipe.lock: package `{package}` is an index dependency but records a `local` rev — an index dependency is always pinned to a commit; {remedy}
+
+## lock-remedy
+
+restore ipe.lock from version control, or delete it and run `ipe add <package>@<requirement>` for each dependency, with the requirement package.ipe declares for it
+
+## lock-unrecognised-line
+
+ipe.lock line {line}: not a comment, a `[[package]]` header, or a `key = "value"` field — {remedy}
+
+## lock-unknown-key
+
+ipe.lock line {line}: unknown field "{key}" — a `[[package]]` holds only {known}; {remedy}
+
+## lock-key-outside-record
+
+ipe.lock line {line}: field `{key}` comes before any `[[package]]` header — {remedy}
+
+## lock-malformed-value
+
+ipe.lock line {line}: field `{key}` must be one double-quoted value with nothing after it — {remedy}
+
+## lock-duplicate-key
+
+ipe.lock line {line}: field `{key}` appears twice in one `[[package]]` — {remedy}
+
+## lock-duplicate-package
+
+ipe.lock line {line}: package `{package}` is locked twice — {remedy}
+
+## lock-hidden-character
+
+ipe.lock line {line}: character {column} of the comment is U+{code}, a control or invisible character a viewer shows differently from what ipe reads — {remedy}
 
 ## lock-unrecordable-local-source
 
