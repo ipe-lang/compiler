@@ -661,6 +661,12 @@ const ALLOWED_SITES: &[(&str, &str, Stack, &str)] = &[
         "looks up one column of a row",
     ),
     (
+        "db.rs",
+        "json_shape",
+        Stack::OneLevel,
+        "names the root's variant and never reads a child",
+    ),
+    (
         "email.rs",
         "json_obj_set",
         Stack::OneLevel,
