@@ -11,6 +11,7 @@ members with ordering or numeric obligations (`clamp`, `min`, `max`,
 `negate`, `abs`, `compare`) carry the bound implicitly — the type-checker's
 `Comparable`/`Number` obligation rejects a function, record, list, or tuple
 argument before it monomorphises. `sqrt` is monomorphically `Float -> Float`.
+The builtin `Order` is exposed so `Basics.Order` names it.
 
 ## `identity`
 

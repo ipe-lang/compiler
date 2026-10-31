@@ -85,6 +85,10 @@ pub struct ModuleExports {
     pub ctors: BTreeMap<Symbol, CtorHome>,
     /// Exported type aliases by name.
     pub aliases: BTreeMap<Symbol, ExportedAlias>,
+    /// Every union and alias the module declares but does not export: disjoint
+    /// from `types` and `aliases` by construction. A qualified use of one is
+    /// refused as not exposed rather than reported missing.
+    pub private_types: BTreeSet<Symbol>,
     /// Exported Stage-4 kernel aliases: value names whose binding is
     /// `f = Kernel.kernel "Module_function"`, mapped to the resolved kernel target
     /// `(StdlibKernel, module, function)`.
