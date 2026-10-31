@@ -8,7 +8,8 @@
 /// A decoded key. `kind` values: `enter` / `tab` / `space` / `backspace` /
 /// `escape` / `up` / `down` / `left` / `right` / `home` / `end` / `delete` /
 /// `pageup` / `pagedown` / `fn` (value = number) / `mouse` / `paste-start` /
-/// `paste-end` / `ctrl` (value = letter) / `char` (value = the character) /
+/// `paste-end` / `ctrl` (value = letter; Ctrl-C is the terminal interrupt, see
+/// [`TuiKey::is_interrupt`]) / `char` (value = the character) /
 /// `other` (value = raw bytes lossily).
 #[derive(Clone, Debug, PartialEq, Default)]
 pub struct TuiKey {
@@ -20,6 +21,15 @@ pub struct TuiKey {
 }
 
 impl TuiKey {
+    /// Whether this key is the terminal interrupt (Ctrl-C).
+    ///
+    /// Raw mode delivers Ctrl-C as a byte instead of a signal, so the key
+    /// reader ends the app on it; it never reaches an `onKey` handler.
+    #[must_use]
+    pub fn is_interrupt(&self) -> bool {
+        self.kind == "ctrl" && self.value == "c"
+    }
+
     fn of(kind: &str) -> Self {
         TuiKey {
             kind: kind.to_string(),

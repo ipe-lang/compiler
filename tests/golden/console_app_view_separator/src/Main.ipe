@@ -1,9 +1,8 @@
 module Main exposing (main)
 
--- View-separator fixture: `view` deliberately supplies no trailing newline of
--- its own, so consecutive renders glue together on stdout
--- ("lines: 0lines: 1lines: 2") with exactly one trailing newline at exit. An
--- app that wants each render on its own line appends "\n" itself.
+-- View-separator fixture: `view` supplies no trailing newline of its own. On
+-- a terminal consecutive renders glue together (a prompt keeps the cursor);
+-- into a pipe each render is its own plain line ("lines: 0\nlines: 1\n...").
 
 import Ipe.Tea.Cli as Cli
 import Ipe.Ui.Cli as Ui

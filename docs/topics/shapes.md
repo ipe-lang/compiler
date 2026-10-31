@@ -158,6 +158,9 @@ Combine keys with other events through `Sub.batch` (e.g.
 `onKey` subscription is ignored. Passing `onKey` as a `Tui.tea` config field is
 **IPE-N0052**.
 
+An app ends itself through `System.exit` from `update`. Ctrl-C always ends it
+too, with the terminal restored and exit status 130; it never reaches `onKey`.
+
 The scaffolded counter (`Up` +, `Down` -, `q` quit) renders as:
 
 ```
@@ -189,6 +192,10 @@ main =
 
 A line with no active `onLine` subscription is ignored. Passing `onLine` as a
 `Cli.tea` config field is **IPE-N0052**.
+
+On a terminal each render is styled and a prompt keeps the cursor on its line.
+When stdout is a pipe or a file, each render is written as plain lines (no
+escape sequences) ending in a newline, so scripts can read the output.
 
 The scaffolded echo REPL (type text, `q` quits):
 

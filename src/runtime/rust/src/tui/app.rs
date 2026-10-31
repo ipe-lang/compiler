@@ -4,7 +4,9 @@
 //! (so `Sub.every` → Tick works) and `cli_run_cmd` (so `Cmd.perform` works) — but
 //! reads RAW key bytes (raw mode + `decode_key`) instead of stdin lines, and
 //! paints into the alternate screen. A Ipe.Tui app quits by calling `System.exit`
-//! from `update` (the `Quit` Msg) or by stdin EOF.
+//! from `update` (the `Quit` Msg), by stdin EOF, or by the terminal interrupt:
+//! raw mode delivers Ctrl-C as a key, so the key reader ends the app on it with
+//! the terminal restored and exit status 130, before any `onKey` handler sees it.
 //!
 //! No panic vectors: a `TuiGuard` restores the TTY (cooked mode, cursor, main
 //! screen) on Drop — normal exit AND panic unwind — so no path leaves the
@@ -17,7 +19,8 @@ use super::super::core::{IpeResult, IpeTask, ok_res};
 use super::super::debugger::tui::TuiDebugger;
 use super::super::stringify::IpeStringify;
 use super::super::tea::{
-    CliEvent, InputBudget, IpeCmd, IpeSub, MAX_QUEUED_INPUT, SubManager, cli_run_cmd,
+    CliEvent, INTERRUPT_EXIT_CODE, InputBudget, IpeCmd, IpeSub, MAX_QUEUED_INPUT, SubManager,
+    cli_run_cmd,
 };
 use super::CellsView;
 use super::focus::{
@@ -242,7 +245,49 @@ fn tail_maybe_truncated(tail: &[u8]) -> bool {
     }
 }
 
-/// Blocking raw-key reader: decodes stdin bytes into `CliEvent::Key(kind, value)`
+/// Blocking raw-key reader over the process's stdin; see [`read_keys_from`].
+fn read_keys_loop<Msg, FMap>(tx: &tokio::sync::mpsc::UnboundedSender<CliEvent<Msg>>, map_kind: FMap)
+where
+    FMap: Fn(TuiKey) -> (String, String),
+{
+    read_keys_from(std::io::stdin(), tx, map_kind);
+}
+
+/// Whether the key reader keeps reading after one decoded key.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum KeyFlow {
+    Continue,
+    Stop,
+}
+
+/// Queue one decoded key, or end the reader on the terminal interrupt.
+///
+/// The interrupt is the reader's last event: it is never mapped or handed to
+/// `onKey`, and no key read after it is queued.
+fn deliver_key<Msg, FMap>(
+    k: TuiKey,
+    budget: &InputBudget,
+    tx: &tokio::sync::mpsc::UnboundedSender<CliEvent<Msg>>,
+    map_kind: &FMap,
+) -> KeyFlow
+where
+    FMap: Fn(TuiKey) -> (String, String),
+{
+    if k.is_interrupt() {
+        let _ = tx.send(CliEvent::Interrupt);
+        return KeyFlow::Stop;
+    }
+    let (kind, value) = map_kind(k);
+    let Some(permit) = budget.acquire(|| tx.is_closed()) else {
+        return KeyFlow::Stop;
+    };
+    if tx.send(CliEvent::Key(kind, value, permit)).is_err() {
+        return KeyFlow::Stop;
+    }
+    KeyFlow::Continue
+}
+
+/// Blocking raw-key reader: decodes `input` bytes into `CliEvent::Key(kind, value)`
 /// events via `decode_key`, then a final `Eof`. Reassembles escape / UTF-8 key
 /// sequences that straddle the fixed 64-byte read boundary by carrying the
 /// unconsumed tail into the next read — a fixed-buffer decode would otherwise
@@ -252,17 +297,21 @@ fn tail_maybe_truncated(tail: &[u8]) -> bool {
 /// the input editor's word-jumps; `tui_app` passes it through). Runs on its own
 /// blocking thread so the key handlers stay off it. Each key is queued only with
 /// an [`InputBudget`] permit, so at most [`MAX_QUEUED_INPUT`] keys wait for the
-/// loop; past that the reader blocks until the loop catches up.
-fn read_keys_loop<Msg, FMap>(tx: &tokio::sync::mpsc::UnboundedSender<CliEvent<Msg>>, map_kind: FMap)
-where
+/// loop; past that the reader blocks until the loop catches up. The terminal
+/// interrupt (Ctrl-C) ends the reader with `CliEvent::Interrupt` instead.
+fn read_keys_from<R, Msg, FMap>(
+    mut input: R,
+    tx: &tokio::sync::mpsc::UnboundedSender<CliEvent<Msg>>,
+    map_kind: FMap,
+) where
+    R: Read,
     FMap: Fn(TuiKey) -> (String, String),
 {
     let budget = InputBudget::new(MAX_QUEUED_INPUT);
-    let mut stdin = std::io::stdin();
     let mut buf = [0u8; 64];
     let mut carry: Vec<u8> = Vec::new();
     loop {
-        let n = match stdin.read(&mut buf) {
+        let n = match input.read(&mut buf) {
             Ok(0) | Err(_) => break,
             Ok(n) => n,
         };
@@ -283,11 +332,7 @@ where
                 break;
             }
             i += consumed;
-            let (kind, value) = map_kind(k);
-            let Some(permit) = budget.acquire(|| tx.is_closed()) else {
-                return;
-            };
-            if tx.send(CliEvent::Key(kind, value, permit)).is_err() {
+            if deliver_key(k, &budget, tx, &map_kind) == KeyFlow::Stop {
                 return;
             }
         }
@@ -301,11 +346,7 @@ where
             break;
         }
         i += consumed;
-        let (kind, value) = map_kind(k);
-        let Some(permit) = budget.acquire(|| tx.is_closed()) else {
-            return;
-        };
-        if tx.send(CliEvent::Key(kind, value, permit)).is_err() {
+        if deliver_key(k, &budget, tx, &map_kind) == KeyFlow::Stop {
             return;
         }
     }
@@ -538,6 +579,10 @@ where
                         }
                     }
                     submgr.key_msgs(&kind, &value)
+                }
+                CliEvent::Interrupt => {
+                    submgr.stop_all();
+                    crate::system::exit_process(INTERRUPT_EXIT_CODE)
                 }
                 CliEvent::Msg(m) | CliEvent::PerformDone(m) => vec![m],
                 CliEvent::Line(..) => continue,
@@ -1221,6 +1266,10 @@ where
                 CliEvent::Msg(m) | CliEvent::PerformDone(m) => produced = Some(m),
                 CliEvent::Eof => break,
                 CliEvent::Line(..) => continue,
+                CliEvent::Interrupt => {
+                    submgr.stop_all();
+                    crate::system::exit_process(INTERRUPT_EXIT_CODE)
+                }
                 // The permit returns to the reader's budget as the key is taken.
                 CliEvent::Key(kind, value, _permit) => {
                     // Debugger key intercept — must come before any app key handling.
@@ -2185,5 +2234,76 @@ mod tui_enter_error_tests {
             classify_raw_mode_error(io_err),
             TuiEnterError::NoTerminal(NoTerminal::NoControllingTerminal)
         ));
+    }
+}
+
+#[cfg(test)]
+mod key_reader_tests {
+    use super::{CliEvent, TuiKey, decode_key, read_keys_from};
+
+    /// The `(kind, value)` events one byte stream yields, in order, with
+    /// `"interrupt"` / `"eof"` standing for the two terminal events.
+    fn read_events(input: &[u8]) -> Vec<(String, String)> {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<CliEvent<()>>();
+        read_keys_from(input, &tx, |k: TuiKey| (k.kind, k.value));
+        drop(tx);
+        let mut events = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            events.push(match ev {
+                CliEvent::Key(kind, value, _permit) => (kind, value),
+                CliEvent::Interrupt => ("interrupt".to_owned(), String::new()),
+                CliEvent::Eof => ("eof".to_owned(), String::new()),
+                CliEvent::Line(..) | CliEvent::Msg(()) | CliEvent::PerformDone(()) => {
+                    ("other".to_owned(), String::new())
+                }
+            });
+        }
+        events
+    }
+
+    fn ev(kind: &str, value: &str) -> (String, String) {
+        (kind.to_owned(), value.to_owned())
+    }
+
+    // Raw mode delivers Ctrl-C as byte 0x03: it ends the reader with the
+    // interrupt, never reaches `onKey`, and no key typed after it is queued.
+    #[test]
+    fn ctrl_c_ends_the_reader_with_the_interrupt() {
+        assert_eq!(
+            read_events(b"a\x03b"),
+            vec![ev("char", "a"), ev("interrupt", "")]
+        );
+    }
+
+    // The interrupt, not `Eof`, is the last event even when the stream ends
+    // right after it.
+    #[test]
+    fn a_trailing_ctrl_c_is_the_last_event() {
+        assert_eq!(read_events(b"\x03"), vec![ev("interrupt", "")]);
+    }
+
+    // Other control keys stay ordinary keys an app maps itself.
+    #[test]
+    fn other_ctrl_keys_reach_the_app() {
+        assert_eq!(
+            read_events(b"\x04q"),
+            vec![ev("ctrl", "d"), ev("char", "q"), ev("eof", "")]
+        );
+    }
+
+    // A stream with no interrupt ends in `Eof`.
+    #[test]
+    fn a_stream_without_ctrl_c_ends_in_eof() {
+        assert_eq!(read_events(b"q"), vec![ev("char", "q"), ev("eof", "")]);
+    }
+
+    #[test]
+    fn only_ctrl_c_is_the_interrupt() {
+        let (ctrl_c, _) = decode_key(b"\x03");
+        let (ctrl_d, _) = decode_key(b"\x04");
+        let (c, _) = decode_key(b"c");
+        assert!(ctrl_c.is_interrupt());
+        assert!(!ctrl_d.is_interrupt());
+        assert!(!c.is_interrupt());
     }
 }

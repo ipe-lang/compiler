@@ -221,7 +221,7 @@ impl InitShape {
             }
             Self::Tui => {
                 "a small `Ipe.Tea.Tui` counter — a Model holding a count, updated by the \
-                 Up/Down arrow keys and rendered to the terminal screen."
+                 Up/Down arrow keys and rendered to the terminal screen; `q` quits."
             }
             Self::Cli => {
                 "a small `Ipe.Tea.Cli` line-echo app — each line you type bumps a counter \
@@ -1905,6 +1905,45 @@ mod tests {
                 "the scaffolded bundleId for `{name}` is its derived id"
             );
             let _ = std::fs::remove_dir_all(&root);
+        }
+    }
+
+    // Every quit key a shape's hint advertises is one its `Main.ipe` handles:
+    // the key maps to `Quit`, and `Quit` ends the program through `System.exit`.
+    #[test]
+    fn advertised_quit_key_is_handled_by_the_template() {
+        for shape in [
+            InitShape::Web,
+            InitShape::Tui,
+            InitShape::Cli,
+            InitShape::Worker,
+            InitShape::Server,
+            InitShape::Script,
+        ] {
+            let hint = shape.open_hint(Runtime::Served);
+            let main = shape.main_ipe();
+            let advertises_q = hint.contains("q to quit");
+            let handles_q = main.contains("key.value == \"q\" then\n        Quit")
+                || main.contains("\"q\" ->\n            Quit");
+            let quit_exits =
+                main.contains("Quit ->\n            ( model, Cmd.perform (System.exit 0)");
+            assert_eq!(
+                advertises_q,
+                handles_q,
+                "shape '{}': the hint's `q` quit and the template's `q` handler must agree",
+                shape.label()
+            );
+            assert!(
+                !handles_q || quit_exits,
+                "shape '{}': `Quit` must end the program through `System.exit`",
+                shape.label()
+            );
+            assert_eq!(
+                advertises_q,
+                shape.readme_description().contains("`q` quits"),
+                "shape '{}': the README must advertise the same quit key as the hint",
+                shape.label()
+            );
         }
     }
 

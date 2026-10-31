@@ -504,33 +504,155 @@ pub fn cli_bg_<M>(c: AnsiColor) -> CliAttr<M> {
     CliAttr::BgColor(c)
 }
 
-/// Render a `Lines` view to the styled terminal string a line-oriented `Cli.tea`
-/// writes to stdout.
+/// The layout width of a plain frame.
+///
+/// Fixed, so piped output never depends on whether a controlling terminal
+/// exists or how wide it is; a plain line is never clipped to it.
+const PLAIN_LAYOUT_COLS: usize = 80;
+
+/// How a line-oriented `Cli.tea` program writes its frames to stdout.
+///
+/// Chosen once per run by [`LineOutput::of_stdout`]; every frame and the closing
+/// bytes go through the one value, so a run never mixes terminal and plain
+/// output.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LineOutput {
+    /// Stdout is a terminal: styled frames (SGR, `\r\n` between lines) sized to
+    /// the window, written back to back with no forced newline, so a view ending
+    /// in a prompt keeps the cursor on the prompt line; one newline at exit.
+    Terminal,
+    /// Stdout is a pipe or a file: plain lines (no escape sequence, `\n`, no
+    /// trailing blanks), each non-empty frame terminated by its own newline.
+    Plain,
+}
+
+impl LineOutput {
+    /// The output mode for this process's stdout.
+    #[must_use]
+    pub fn of_stdout() -> Self {
+        use std::io::IsTerminal;
+        if std::io::stdout().is_terminal() {
+            Self::Terminal
+        } else {
+            Self::Plain
+        }
+    }
+
+    /// The bytes written once after the event loop ends.
+    #[must_use]
+    pub const fn closing(self) -> &'static str {
+        match self {
+            Self::Terminal => "\n",
+            Self::Plain => "",
+        }
+    }
+}
+
+/// Render a `Lines` view to the frame a line-oriented `Cli.tea` writes to stdout.
 ///
 /// A line-oriented surface occupies exactly the height of its own stacked lines,
 /// so the frame is sized to the view's content height rather than the full
-/// terminal window — a `Screen` paints a fixed rectangle, a `Lines` view paints
-/// only its lines. Width still comes from the terminal so styled runs reflow to
-/// the visible columns. The returned string carries no forced trailing newline:
-/// the console loop owns the single terminating newline, matching the
-/// no-trailing-newline write contract of the string-returning view it replaces.
+/// terminal window. Under [`LineOutput::Terminal`] the width comes from the
+/// terminal so styled runs reflow to the visible columns, and the frame carries
+/// no trailing newline (the view's prompt formatting decides). Under
+/// [`LineOutput::Plain`] each line is plain text and a frame with any line ends
+/// in `\n`; a view with no line renders nothing.
 #[must_use]
-pub fn render_lines_view<M: Clone>(view: LinesView<M>) -> String {
+pub fn render_lines_view<M: Clone>(view: LinesView<M>, output: LineOutput) -> String {
     let element = view.into_element();
-    let cols = match crossterm::terminal::size() {
-        Ok((w, _)) if w > 0 => w as usize,
-        _ => 80,
+    let (cols, encoding) = match output {
+        LineOutput::Terminal => {
+            let cols = match crossterm::terminal::size() {
+                Ok((w, _)) if w > 0 => w as usize,
+                _ => 80,
+            };
+            let profile = crate::color::resolve_term_profile();
+            (cols, layout::FrameEncoding::Ansi(profile))
+        }
+        LineOutput::Plain => (PLAIN_LAYOUT_COLS, layout::FrameEncoding::Plain),
     };
     // Probe pass measures the content height; the paint pass sizes the frame to
     // exactly that height so no blank padding rows follow the last line.
     let content_h = layout::element_to_cells_height(&element, cols);
-    let frame = layout::element_to_cells(&element, cols, content_h);
-    frame.trim_end_matches('\n').to_owned()
+    let frame = layout::element_to_frame(&element, cols, content_h, encoding);
+    let frame = frame.trim_end_matches(['\r', '\n']);
+    match output {
+        LineOutput::Terminal => frame.to_owned(),
+        LineOutput::Plain if content_h == 0 => String::new(),
+        LineOutput::Plain => format!("{frame}\n"),
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn render_lines_view_terminal(view: LinesView<()>) -> String {
+        render_lines_view(view, LineOutput::Terminal)
+    }
+
+    fn plain(view: LinesView<()>) -> String {
+        render_lines_view(view, LineOutput::Plain)
+    }
+
+    // A piped run writes no escape sequence, whatever the view styles.
+    #[test]
+    fn plain_frame_carries_no_escape_sequence() {
+        let out = plain(cli_lines_(vec![
+            cli_line_(vec![CliAttr::Bold], "b".to_owned()),
+            cli_line_(vec![CliAttr::Dim, CliAttr::Reverse], "d".to_owned()),
+            cli_line_(vec![CliAttr::FgColor(term_color_red_())], "c".to_owned()),
+            cli_line_(
+                vec![CliAttr::BgColor(term_color_rgb_(1, 2, 3))],
+                "g".to_owned(),
+            ),
+        ]));
+        assert_eq!(out, "b\nd\nc\ng\n");
+    }
+
+    // Lines are `\n`-separated, carry no layout padding, and the frame ends in
+    // its own newline so the next frame starts on a fresh line.
+    #[test]
+    fn plain_frame_is_newline_terminated_unpadded_lines() {
+        let out = plain(cli_lines_(vec![
+            cli_text_("-- a longer header line".to_owned()),
+            cli_text_("[ ] 1. a".to_owned()),
+        ]));
+        assert_eq!(out, "-- a longer header line\n[ ] 1. a\n");
+        assert!(!out.contains('\r'), "no CR in plain output: {out:?}");
+    }
+
+    // A single text line renders to its bytes plus the frame's newline; a
+    // trailing prompt blank is layout-indistinguishable padding and is dropped.
+    #[test]
+    fn plain_text_frame_is_the_text_and_a_newline() {
+        assert_eq!(plain(cli_text_("lines: 0".to_owned())), "lines: 0\n");
+        assert_eq!(
+            plain(cli_text_("echoed 0 [] > ".to_owned())),
+            "echoed 0 [] >\n"
+        );
+    }
+
+    // A plain line is never clipped to a terminal width.
+    #[test]
+    fn plain_line_is_never_clipped() {
+        let long = "x".repeat(PLAIN_LAYOUT_COLS * 3);
+        assert_eq!(plain(cli_text_(long.clone())), format!("{long}\n"));
+    }
+
+    // A view with no line writes nothing, not a blank line.
+    #[test]
+    fn plain_empty_view_writes_nothing() {
+        assert_eq!(plain(cli_none_()), "");
+    }
+
+    // Each mode owns its closing bytes: the terminal's one newline at exit, and
+    // nothing after plain frames that already end their lines.
+    #[test]
+    fn closing_bytes_follow_the_mode() {
+        assert_eq!(LineOutput::Terminal.closing(), "\n");
+        assert_eq!(LineOutput::Plain.closing(), "");
+    }
 
     #[test]
     fn dim_and_reverse_translate_to_decoration_attributes() {
@@ -619,7 +741,7 @@ mod tests {
 
     #[test]
     fn render_lines_view_emits_plain_text() {
-        let out = render_lines_view(cli_text_::<()>("hello".to_owned()));
+        let out = render_lines_view_terminal(cli_text_::<()>("hello".to_owned()));
         assert!(out.contains("hello"));
     }
 
@@ -630,20 +752,20 @@ mod tests {
     #[test]
     fn render_lines_view_text_is_byte_exact() {
         assert_eq!(
-            render_lines_view(cli_text_::<()>("lines: 0".to_owned())),
+            render_lines_view_terminal(cli_text_::<()>("lines: 0".to_owned())),
             "lines: 0"
         );
     }
 
     #[test]
     fn render_lines_view_has_no_trailing_newline() {
-        let out = render_lines_view(cli_text_::<()>("prompt > ".to_owned()));
+        let out = render_lines_view_terminal(cli_text_::<()>("prompt > ".to_owned()));
         assert!(!out.ends_with('\n'));
     }
 
     #[test]
     fn render_lines_view_stacks_lines_top_to_bottom() {
-        let out = render_lines_view(cli_lines_::<()>(vec![
+        let out = render_lines_view_terminal(cli_lines_::<()>(vec![
             cli_text_("first".to_owned()),
             cli_text_("second".to_owned()),
         ]));
@@ -654,17 +776,18 @@ mod tests {
 
     #[test]
     fn render_lines_view_carries_line_styling() {
-        let bold = render_lines_view(cli_line_::<()>(vec![CliAttr::Bold], "b".to_owned()));
+        let bold = render_lines_view_terminal(cli_line_::<()>(vec![CliAttr::Bold], "b".to_owned()));
         assert!(bold.contains("\u{1b}[") && bold.contains('1'));
-        let dim = render_lines_view(cli_line_::<()>(vec![CliAttr::Dim], "d".to_owned()));
+        let dim = render_lines_view_terminal(cli_line_::<()>(vec![CliAttr::Dim], "d".to_owned()));
         assert!(dim.contains('2'));
-        let reverse = render_lines_view(cli_line_::<()>(vec![CliAttr::Reverse], "r".to_owned()));
+        let reverse =
+            render_lines_view_terminal(cli_line_::<()>(vec![CliAttr::Reverse], "r".to_owned()));
         assert!(reverse.contains('7'));
     }
 
     #[test]
     fn render_lines_view_carries_palette_color() {
-        let out = render_lines_view(cli_line_::<()>(
+        let out = render_lines_view_terminal(cli_line_::<()>(
             vec![CliAttr::FgColor(term_color_red_())],
             "c".to_owned(),
         ));

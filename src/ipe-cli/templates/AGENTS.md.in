@@ -1036,6 +1036,11 @@ events via `Sub.batch`; input with no active subscription is ignored. An
 input subscription in the other terminal shape (IPE-N0035) — `Tui.Sub` and
 `Cli.Sub` are not interchangeable.
 
+A `Tui.tea` app ends itself with `Cmd.perform (System.exit 0) (\_ -> NoOp)`
+from `update`. Ctrl-C always ends it too, with the terminal restored and exit
+status 130; it never reaches `onKey`, so do not map it. A `Cli.tea` app whose
+stdout is a pipe or a file writes plain lines (no colour, one line per render).
+
 **Cell-native attributes** — `Ipe.Ui.Tui` carries its OWN `Attribute msg`,
 exposing only what a terminal cell grid honours: `spacing`/`padding` in whole
 cells, `alignLeft`/`alignRight`/`center`, `bold`/`underline`, and terminal-
