@@ -2115,7 +2115,7 @@ pub fn write_patched_attr(el: &web_sys::Element, key: &str, value: Option<&str>)
     match attr_write(&el.local_name(), key, value, sandboxed) {
         AttrWrite::Set(v) => {
             let _ = el.set_attribute(key, &v);
-            sync_dom_property(el, key, &v);
+            sync_dom_property(el, key, Some(&*v));
         }
         AttrWrite::SandboxThenSet(v) => {
             if el.set_attribute(SANDBOX_ATTR, "").is_ok() {
@@ -2124,46 +2124,33 @@ pub fn write_patched_attr(el: &web_sys::Element, key: &str, value: Option<&str>)
         }
         AttrWrite::Remove => {
             let _ = el.remove_attribute(key);
-            clear_dom_property(el, key);
+            sync_dom_property(el, key, None);
         }
         AttrWrite::Keep => {}
     }
 }
 
-/// Attributes whose DOM *property* does not reflect from the attribute —
-/// mirror `client.js`'s value/checked/selected/disabled sync: a set property
-/// follows its value unless the value spells `false`, the empty value
-/// included, as the attribute `checked=""` checks.
-fn sync_dom_property(el: &web_sys::Element, key: &str, val: &str) {
-    let truthy = val != "false";
-    match key {
-        "value" => {
-            if let Some(input) = el.dyn_ref::<web_sys::HtmlInputElement>() {
-                input.set_value(val);
-            } else if let Some(ta) = el.dyn_ref::<web_sys::HtmlTextAreaElement>() {
-                ta.set_value(val);
-            } else if let Some(sel) = el.dyn_ref::<web_sys::HtmlSelectElement>() {
-                sel.set_value(val);
-            }
+/// Mirror a patched attribute onto the DOM property it drives.
+///
+/// A set `value` becomes the field's value, and a live attribute of
+/// [`crate::dom::live_prop::LIVE_PROPS`] turns its property on when set, off
+/// when removed, by presence alone, as first paint renders it and as
+/// `client.js` writes it.
+fn sync_dom_property(el: &web_sys::Element, key: &str, val: Option<&str>) {
+    if let Some(v) = val
+        && key.eq_ignore_ascii_case("value")
+    {
+        if let Some(input) = el.dyn_ref::<web_sys::HtmlInputElement>() {
+            input.set_value(v);
+        } else if let Some(ta) = el.dyn_ref::<web_sys::HtmlTextAreaElement>() {
+            ta.set_value(v);
+        } else if let Some(sel) = el.dyn_ref::<web_sys::HtmlSelectElement>() {
+            sel.set_value(v);
         }
-        "checked" => {
-            if let Some(input) = el.dyn_ref::<web_sys::HtmlInputElement>() {
-                input.set_checked(truthy);
-            }
-        }
-        "disabled" => {
-            if let Some(input) = el.dyn_ref::<web_sys::HtmlInputElement>() {
-                input.set_disabled(truthy);
-            }
-        }
-        _ => {}
     }
-}
-
-/// A removed attribute clears the property it mirrors, as `client.js`.
-fn clear_dom_property(el: &web_sys::Element, key: &str) {
-    if key == "checked" || key == "disabled" {
-        sync_dom_property(el, key, "false");
+    if let Some(prop) = crate::dom::live_prop::live_prop(key) {
+        let on = crate::dom::live_prop::live_prop_state(val);
+        let _ = js_sys::Reflect::set(el, &JsValue::from_str(prop), &JsValue::from_bool(on));
     }
 }
 

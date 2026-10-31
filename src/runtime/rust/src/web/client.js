@@ -1844,10 +1844,13 @@ function __ipeDrainQueue() {
 // input (same DOM node, same .value, same IME/composition state)
 // through the new HTML so it's never destroyed. Per-attr and
 // textContent updates are fine as-is — they don't regenerate nodes.
-// Attributes a patch mirrors onto a live property, by attribute name. Once the
-// user or the client sets `checked` or `selected` the property stops following
-// its attribute, so a patch writes the property beside the attribute on every
-// set and every removal: a removed attribute clears its property.
+// Attributes a patch mirrors onto a live property, by lowercase attribute name
+// (the runtime's `dom::live_prop::LIVE_PROPS`; a test pins this mirror). Once
+// the user or the client sets `checked` or `selected` the property stops
+// following its attribute, so a patch writes the property beside the attribute
+// on every set and every removal. Presence is the state, as first paint renders
+// it: a set attribute turns the property on whatever its text, a removed one
+// turns it off.
 var __IPE_LIVE_PROPS = Object.freeze({
   checked: "checked",
   selected: "selected",
@@ -1928,8 +1931,9 @@ function __ipeApplyPatches(patches) {
         if (dirty && (k === "value" || k === "checked" || k === "selected")) {
           continue;
         }
-        var prop = Object.prototype.hasOwnProperty.call(__IPE_LIVE_PROPS, k)
-            ? __IPE_LIVE_PROPS[k] : null;
+        var lk = String(k).toLowerCase();
+        var prop = Object.prototype.hasOwnProperty.call(__IPE_LIVE_PROPS, lk)
+            ? __IPE_LIVE_PROPS[lk] : null;
         // A removal crosses as null; a set as a string, the empty string
         // included. Any other shape is refused.
         if (v === null) {
@@ -1944,7 +1948,7 @@ function __ipeApplyPatches(patches) {
             el.value = v;
             valueChanged = true;
           }
-          if (prop !== null) el[prop] = v !== "false";
+          if (prop !== null) el[prop] = true;
         }
       }
       // Restore selection on focused input/textarea after a value

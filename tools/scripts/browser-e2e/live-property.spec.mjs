@@ -10,6 +10,8 @@
  *      render drops its `checked` attribute.
  *   2. Option — an option a script selected is deselected when the server's
  *      render drops its `selected` attribute.
+ *   3. Presence — a set attribute turns its property on whatever its text,
+ *      `"false"` included, as first paint renders it.
  *
  * The patches frames are dispatched on the client's own `EventSource`, diffed
  * from the epoch on screen, onto controls added to the app's root.
@@ -97,6 +99,22 @@ test("checkbox: an attribute set to the empty value is present, never removed", 
     "",
     "",
   ]);
+  expect(errors.map(String)).toEqual([]);
+});
+
+test("checkbox: a set attribute checks whatever its text, as first paint does", async ({ page }) => {
+  const errors = [];
+  page.on("pageerror", (e) => errors.push(e));
+  await load(page);
+  await addToRoot(page, '<input type="checkbox" id="ipe-e2e-text" ipe-id="e2e-text">');
+  const box = page.locator("#ipe-e2e-text");
+  await expect(box).not.toBeChecked();
+  // First paint of `checked="false"` is a checked box; the patch path agrees,
+  // and the property table is looked up case folded.
+  await pushPatches(page, [{ id: "e2e-text", attrs: { Checked: "false" } }]);
+  await expect(box).toBeChecked();
+  await pushPatches(page, [{ id: "e2e-text", attrs: { Checked: null } }]);
+  await expect(box).not.toBeChecked();
   expect(errors.map(String)).toEqual([]);
 });
 

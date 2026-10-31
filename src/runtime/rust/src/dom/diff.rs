@@ -860,6 +860,39 @@ mod tests {
         assert_eq!(p[0].attrs.get("disabled").map(Option::as_deref), Some(None));
     }
 
+    /// A boolean attribute turned false is removed, never patched to `"false"`.
+    ///
+    /// Red if a held `BoolAttr` that turns false crosses the wire as text, which
+    /// the browser would read as present.
+    #[test]
+    fn diff_bool_attr_true_to_false_patches_a_removal() {
+        let input = |on: bool| -> Html<()> {
+            Html::HElement(
+                "input".into(),
+                vec![
+                    Attribute::Attr("type".into(), "checkbox".into()),
+                    Attribute::BoolAttr("checked".into(), on),
+                ],
+                vec![],
+            )
+        };
+        let mut a = input(true);
+        let mut b = input(false);
+        ids(&mut a);
+        ids(&mut b);
+        let p = plain(&a, &b);
+        assert_eq!(p.len(), 1);
+        assert_eq!(p[0].attrs.get("checked").map(Option::as_deref), Some(None));
+        let mut back = input(true);
+        ids(&mut back);
+        let q = plain(&b, &back);
+        assert_eq!(q.len(), 1);
+        assert_eq!(
+            q[0].attrs.get("checked").map(Option::as_deref),
+            Some(Some("true"))
+        );
+    }
+
     // RT-UI-001: depth cap — diff must return (not abort/stack-overflow) when
     // diffing two trees that are deeper than MAX_HTML_DEPTH (1024). We build
     // chains of depth 5000 and assert diff completes.
