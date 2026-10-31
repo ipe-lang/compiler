@@ -31,13 +31,10 @@ fn mod_by_positive_divisor_is_always_nonnegative() {
 }
 
 #[test]
-fn mod_by_negative_divisor_matches_go() {
-    // Basics_modByT(divisor, n): `r := n % divisor; if r < 0 { r += divisor }`.
-    // basics_mod_by(-3, 7): 7 % -3 = 1 (Rust % takes the dividend's sign);
-    //   r=1 not < 0 ⇒ 1.
-    assert_eq!(ipe_runtime_rust::basics::basics_mod_by(-3, 7), 1);
-    // basics_mod_by(-3, -7): -7 % -3 = -1; r<0 ⇒ -1 + (-3) = -4.
-    assert_eq!(ipe_runtime_rust::basics::basics_mod_by(-3, -7), -4);
+fn mod_by_negative_divisor_takes_divisor_sign() {
+    // Floored modulo: 7 = (-3)(-3) + (-2), and -7 = (-3)(2) + (-1).
+    assert_eq!(ipe_runtime_rust::basics::basics_mod_by(-3, 7), -2);
+    assert_eq!(ipe_runtime_rust::basics::basics_mod_by(-3, -7), -1);
 }
 
 #[test]

@@ -46,10 +46,12 @@ pub fn math_is_nan(x: f64) -> bool {
     x.is_nan()
 }
 
-/// Saturates `i64::MIN` to `i64::MAX` (no-panic rule: `-i64::MIN` is not representable).
+/// Ipê `Math.abs : Int -> Int`, a delegate of the one `abs` definition `basics_abs`.
+///
+/// Saturates `i64::MIN` to `i64::MAX`, exactly as `Basics.abs` does.
 #[must_use]
 pub fn math_abs(x: i64) -> i64 {
-    x.checked_abs().unwrap_or(i64::MAX)
+    crate::basics::basics_abs(x)
 }
 
 /// Integer addition for Ipê's `+` operator on `Int` operands.
@@ -340,6 +342,35 @@ mod tests {
         assert_eq!(ipe_int_mul(i64::MAX, 2), -2);
         assert_eq!(ipe_int_mul(3, 4), 12);
         assert_eq!(ipe_int_mul(0, i64::MAX), 0);
+    }
+
+    // The `IpeWrapping*` trait impls (generic `Number a` bodies) and the
+    // `ipe_int_*` operators (monomorphic `Int` bodies) must agree at every edge.
+    #[test]
+    fn int_wrap_single_definition() {
+        use crate::basics::{IpeWrappingAdd, IpeWrappingMul, IpeWrappingSub};
+        let edges = [i64::MIN, -1, 0, 1, i64::MAX];
+        for a in edges {
+            for b in edges {
+                assert_eq!(a.ipe_wrapping_add(b), ipe_int_add(a, b), "{a} + {b}");
+                assert_eq!(a.ipe_wrapping_sub(b), ipe_int_sub(a, b), "{a} - {b}");
+                assert_eq!(a.ipe_wrapping_mul(b), ipe_int_mul(a, b), "{a} * {b}");
+            }
+        }
+        assert_eq!(ipe_int_add(i64::MAX, 1), i64::MIN);
+        assert_eq!(ipe_int_sub(i64::MIN, 1), i64::MAX);
+        assert_eq!(ipe_int_mul(i64::MIN, -1), i64::MIN);
+    }
+
+    // `Math.abs` and `Basics.abs` share one definition: `abs MIN` saturates to
+    // `MAX` while `negate MIN` wraps to `MIN`.
+    #[test]
+    fn abs_kernels_agree_on_min() {
+        for x in [i64::MIN, i64::MIN + 1, -7, -1, 0, 1, 7, i64::MAX] {
+            assert_eq!(math_abs(x), crate::basics::basics_abs(x), "abs {x}");
+        }
+        assert_eq!(math_abs(i64::MIN), i64::MAX);
+        assert_eq!(crate::basics::basics_negate(i64::MIN), i64::MIN);
     }
 
     #[test]
