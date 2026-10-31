@@ -5657,7 +5657,7 @@ mod handlers {
             // connection: every `js_send` whose origin is this sid is forwarded to
             // the browser as an `event: port` frame over the same stream that
             // carries DOM patches (mirroring how the custom-element served-widget
-            // transport delivers per-session). The sink is keyed by sid in the port
+            // transport delivers per-session). The sink is keyed by (sid, life) in the port
             // registry, so a frame can only ever reach the session that produced it
             // — never another session's stream. `try_send` is non-blocking (this
             // sink runs on the synchronous Cmd-dispatch path): a full SSE buffer
