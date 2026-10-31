@@ -14,8 +14,9 @@
 //! ```
 
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
+use e2e_support::target::{BuildTarget, IsolationReason};
 use ipe::RootFixture;
 
 type BoxError = Box<dyn std::error::Error + Send + Sync + 'static>;
@@ -49,14 +50,16 @@ fn project_of(src: &str) -> Result<RootFixture, BoxError> {
     RootFixture::main(src).map_err(|e| -> BoxError { format!("write the project: {e:?}").into() })
 }
 
-/// Run `ipe dev build <project> --out <out>/out` against a shared target.
+/// Run `ipe dev build <project> --out <out>/out` against `target`.
 ///
-/// `CARGO_TARGET_DIR` is forced to a SHARED directory OUTSIDE the project, so
-/// every project builds into the same `<shared-target>/debug/`.
+/// `target` is a directory OUTSIDE the project that every call for one test
+/// shares, so every project builds into the same `<target>/debug/` — the
+/// exact Ipê-recommended setup that leaves the binary unfindable without the
+/// out/bin copy.
 fn build_into_shared_target(
     tag: &str,
     project: &RootFixture,
-    shared_target: &Path,
+    target: &BuildTarget,
 ) -> Result<SharedBuild, BoxError> {
     let ipe_bin = e2e_support::cargo_bin!("ipe");
     let runtime_dir = e2e_support::require_runtime().into_path_buf();
@@ -67,14 +70,11 @@ fn build_into_shared_target(
     fs::create_dir_all(&scratch)?;
     let out_dir = scratch.join("out");
 
-    let status = std::process::Command::new(ipe_bin)
+    let status = e2e_support::target::ipe_command(ipe_bin.path(), target)
         .args(["dev", "build"])
         .arg(project.path())
         .arg("--out")
         .arg(&out_dir)
-        // The shared cache lives OUTSIDE the project — the exact Ipê-recommended
-        // setup that leaves the binary unfindable without the out/bin copy.
-        .env("CARGO_TARGET_DIR", shared_target)
         .env("IPE_RUNTIME_DIR", &runtime_dir)
         .env("NO_COLOR", "1")
         .status()
@@ -98,7 +98,8 @@ fn build_into_shared_target(
     let friendly = ipe_backend_rust::sanitize_cargo_name(ipe::project_root::DEFAULT_NAME);
     Ok(SharedBuild {
         delivered: out_dir.join("bin").join(friendly),
-        in_target: shared_target
+        in_target: target
+            .path()
             .join("debug")
             .join(format!("{identity}{}", std::env::consts::EXE_SUFFIX)),
         identity,
@@ -113,12 +114,15 @@ fn build_copies_the_artifact_into_project_out_bin() -> Result<(), BoxError> {
         eprintln!("skipping (set IPE_E2E=1 to run)");
         return Ok(());
     }
-    let shared = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
-        .join("ipe_build_artifact_copy_sharedA");
-    let _ = fs::remove_dir_all(&shared);
+    // An exclusive private tree: the test forces `ipe dev build` to write
+    // into one directory it fully controls, outside the project, to prove
+    // the out/bin copy (not the shared target's own bookkeeping).
+    let isolated = e2e_support::target::isolated(IsolationReason::ColdBuildUnderTest)
+        .map_err(|e| -> BoxError { format!("isolated build target: {e}").into() })?;
+    let target = BuildTarget::Isolated(isolated);
 
     let project = project_of(SRC_A)?;
-    let built = build_into_shared_target("single", &project, &shared)?;
+    let built = build_into_shared_target("single", &project, &target)?;
     let copied = built.delivered;
     assert!(
         copied.is_file(),
@@ -156,19 +160,22 @@ fn a_second_same_named_project_does_not_clobber_the_first_out_bin() -> Result<()
         eprintln!("skipping (set IPE_E2E=1 to run)");
         return Ok(());
     }
-    let shared = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
-        .join("ipe_build_artifact_copy_sharedAB");
-    let _ = fs::remove_dir_all(&shared);
+    // An exclusive private tree, shared across projects A and B within this
+    // one test, to reproduce the exact Ipê-recommended setup of two projects
+    // building into one shared target.
+    let isolated = e2e_support::target::isolated(IsolationReason::ColdBuildUnderTest)
+        .map_err(|e| -> BoxError { format!("isolated build target: {e}").into() })?;
+    let target = BuildTarget::Isolated(isolated);
 
     // Project A → out/bin/ipe-app is A's binary.
     let project_a = project_of(SRC_A)?;
-    let a = build_into_shared_target("clobberA", &project_a, &shared)?;
+    let a = build_into_shared_target("clobberA", &project_a, &target)?;
     let a_before = fs::read(&a.delivered)?;
     let a_in_target_before = fs::read(&a.in_target)?;
 
     // Project B, same package name, same shared target.
     let project_b = project_of(SRC_B)?;
-    let b = build_into_shared_target("clobberB", &project_b, &shared)?;
+    let b = build_into_shared_target("clobberB", &project_b, &target)?;
     let b_after = fs::read(&b.delivered)?;
 
     assert_ne!(

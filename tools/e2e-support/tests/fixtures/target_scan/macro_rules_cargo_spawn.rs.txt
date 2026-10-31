@@ -1,0 +1,5 @@
+macro_rules! spawn_cargo {
+    () => {
+        std::process::Command::new("cargo")
+    };
+}

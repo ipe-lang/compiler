@@ -31,8 +31,8 @@
 //! standing check that the sealed-floor gate stays real.
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
+use e2e_support::target::BuildTarget;
 use ipe::{BuildOptions, CliError};
 
 /// A fresh, pid-isolated scratch dir under the test tempdir (concurrent runs
@@ -48,10 +48,21 @@ fn scratch(name: &str) -> PathBuf {
 /// environment was fixed at spawn.
 const SEAL_CHILD_MARKER: &str = "IPE_WASI_SEAL_CHILD";
 
-/// Run `test` in a re-exec of this binary whose environment pins
-/// `CARGO_TARGET_DIR` to `target_dir` and clears `RUSTFLAGS` and
-/// `CARGO_ENCODED_RUSTFLAGS`; `true` means the caller IS that child and runs the
-/// body, `false` means the parent, whose child has already passed.
+/// Whether this process IS a WASI seal test's re-exec of this binary, whose
+/// cargo environment was fixed at spawn by [`rerun_in_target`]. The caller
+/// branches on this BEFORE allocating a build target: only the parent needs
+/// one (to forward into the child's environment), and the child must never
+/// allocate its own — it was handed the parent's already, and a second
+/// `target::isolated` call in the same process tree would nest a fresh
+/// isolated tree under the one the parent is still holding.
+fn is_seal_child() -> bool {
+    ipe_env::var_os(SEAL_CHILD_MARKER).is_some()
+}
+
+/// Re-exec this binary running exactly `test`, with its environment pinned to
+/// `target`'s path and `RUSTFLAGS`/`CARGO_ENCODED_RUSTFLAGS` cleared — the
+/// parent side of the self-rerun seal check [`is_seal_child`] detects in the
+/// child.
 ///
 /// The cargo `run_cli` spawns inherits this process's environment, and a global
 /// `RUSTFLAGS`/`CARGO_ENCODED_RUSTFLAGS` outranks the emitter's own
@@ -59,22 +70,17 @@ const SEAL_CHILD_MARKER: &str = "IPE_WASI_SEAL_CHILD";
 /// the build sees exactly the emitted config — set at spawn, never mutated
 /// in-process. The child must actually run and pass `test`: a name matching
 /// nothing is refused, never a vacuous green.
-fn in_seal_child(test: &str, target_dir: &Path) -> bool {
-    if ipe_env::var_os(SEAL_CHILD_MARKER).is_some() {
-        return true;
-    }
+fn rerun_in_target(test: &str, target: &BuildTarget) {
     let rerun = e2e_support::rerun_this_test_exact(test, |cmd| {
-        cmd.arg("--nocapture")
-            .env(SEAL_CHILD_MARKER, "1")
-            .env("CARGO_TARGET_DIR", target_dir)
-            .env_remove("RUSTFLAGS")
+        cmd.arg("--nocapture").env(SEAL_CHILD_MARKER, "1");
+        e2e_support::target::set_target_dir_env(cmd, target.path());
+        cmd.env_remove("RUSTFLAGS")
             .env_remove("CARGO_ENCODED_RUSTFLAGS");
     });
     assert!(
         rerun.is_ok(),
         "{test}: the cargo-env re-exec did not pass: {rerun:?}"
     );
-    false
 }
 
 fn wasi_options() -> BuildOptions {
@@ -192,6 +198,7 @@ const SERVER_SHAPE_SOURCE: &str = "module Main exposing (main)\n\
 /// THE SEAL: a sealed-floor `Direct` program emits a project that
 /// `cargo build --target wasm32-wasip1` accepts. `ipe`-accepts ⇒ cargo-builds.
 #[test]
+#[allow(clippy::panic)] // a test-environment setup failure fails the test with its cause
 fn wasi_direct_floor_program_cargo_builds_for_wasip1() {
     if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
         return;
@@ -204,16 +211,19 @@ fn wasi_direct_floor_program_cargo_builds_for_wasip1() {
     // ipe accepts the sealed-floor program for the WASI target and emits it.
     emit_wasi(&fixture, &out).expect("sealed-floor Direct program must ipe-accept for WASI");
 
-    // Forward CI's warm shared target when present so the emitted crate's deps
-    // reuse compiled artifacts; else isolate a per-slot target.
-    let target_dir = e2e_support::child_shared_target_from_env()
-        .map_or_else(|| out.join("target"), PathBuf::from);
-    let mut cargo = Command::new("cargo");
+    // The wasm32-wasip1 dependency tree is not the shared target's: an
+    // exclusive private tree.
+    let isolated =
+        e2e_support::target::isolated(e2e_support::target::IsolationReason::ForeignTriple);
+    let Ok(isolated) = isolated else {
+        panic!("isolated build target: {isolated:?}")
+    };
+    let target = BuildTarget::Isolated(isolated);
+    let mut cargo = e2e_support::target::cargo_command(&target);
     cargo
         .arg("build")
         .args(["--target", "wasm32-wasip1"])
         .current_dir(&out)
-        .env("CARGO_TARGET_DIR", &target_dir)
         // Drop any ambient `RUSTFLAGS` / `CARGO_ENCODED_RUSTFLAGS` a dev host or
         // CI runner exports (e.g. `-C link-arg=-fuse-ld=mold`): a global
         // `RUSTFLAGS` OUTRANKS every `[target.<triple>] rustflags` config (cargo
@@ -239,9 +249,6 @@ fn wasi_direct_floor_program_cargo_builds_for_wasip1() {
             Err(e) => format!("cargo failed to spawn: {e}"),
         },
     );
-    if e2e_support::child_shared_target_from_env().is_none() {
-        let _ = std::fs::remove_dir_all(&target_dir);
-    }
 }
 
 /// The refusal: a `Direct` program reaching a non-viable family (`Ipe.Http`) is
@@ -277,6 +284,7 @@ fn wasi_http_shape_is_refused_fail_closed() {
 /// wasip1 cross-compile — not the emit helper directly. `ipe`-accepts (exit 0)
 /// ⇒ cargo-builds. Gated on `IPE_E2E=1`.
 #[test]
+#[allow(clippy::panic)] // a test-environment setup failure fails the test with its cause
 fn ipe_build_target_wasi_user_path_cargo_builds() {
     if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
         return;
@@ -286,12 +294,7 @@ fn ipe_build_target_wasi_user_path_cargo_builds() {
     let fixture = wasi_fixture(DIRECT_FLOOR_SOURCE);
     let out = dir.join("out");
 
-    // Forward CI's warm shared target so the emitted crate's deps reuse
-    // compiled artifacts; else isolate a per-slot target. The wasip1 link is
-    // governed by the emitter's own `.cargo/config.toml` (see `in_seal_child`).
-    let target_dir = e2e_support::child_shared_target_from_env()
-        .map_or_else(|| out.join("target"), PathBuf::from);
-    if in_seal_child("ipe_build_target_wasi_user_path_cargo_builds", &target_dir) {
+    if is_seal_child() {
         let args = vec![
             "dev".to_owned(),
             "build".to_owned(),
@@ -313,8 +316,18 @@ fn ipe_build_target_wasi_user_path_cargo_builds() {
             "THE SEAL (user path): `ipe dev build --target wasi` on a sealed-floor Direct \
              program must succeed (ipe-accepts ⇒ cargo-builds for wasm32-wasip1); got {result:?}",
         );
-    } else if e2e_support::child_shared_target_from_env().is_none() {
-        let _ = std::fs::remove_dir_all(&target_dir);
+    } else {
+        // The wasm32-wasip1 dependency tree is not the shared target's: an
+        // exclusive private tree, forwarded to the re-exec'd child's environment.
+        // The wasip1 link is governed by the emitter's own `.cargo/config.toml`
+        // (see `rerun_in_target`).
+        let isolated =
+            e2e_support::target::isolated(e2e_support::target::IsolationReason::ForeignTriple);
+        let Ok(isolated) = isolated else {
+            panic!("isolated build target: {isolated:?}")
+        };
+        let target = BuildTarget::Isolated(isolated);
+        rerun_in_target("ipe_build_target_wasi_user_path_cargo_builds", &target);
     }
 }
 
@@ -367,6 +380,7 @@ fn ipe_build_target_wasi_refuses_non_viable_shape_fail_closed() {
 /// stays fast + offline) AND on the `wasi_run` feature (the embedded engine).
 #[cfg(feature = "wasi_run")]
 #[test]
+#[allow(clippy::panic)] // a test-environment setup failure fails the test with its cause
 fn ipe_run_target_wasi_executes_under_wasmtime() {
     if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
         return;
@@ -376,9 +390,7 @@ fn ipe_run_target_wasi_executes_under_wasmtime() {
     let fixture = wasi_fixture(DIRECT_FLOOR_SOURCE);
     let out = dir.join("out");
 
-    let target_dir = e2e_support::child_shared_target_from_env()
-        .map_or_else(|| out.join("target"), PathBuf::from);
-    if in_seal_child("ipe_run_target_wasi_executes_under_wasmtime", &target_dir) {
+    if is_seal_child() {
         let args = vec![
             "dev".to_owned(),
             "run".to_owned(),
@@ -395,8 +407,16 @@ fn ipe_run_target_wasi_executes_under_wasmtime() {
              program must build the wasm32-wasip1 module and run it to a clean exit \
              under embedded wasmtime; got {result:?}",
         );
-    } else if e2e_support::child_shared_target_from_env().is_none() {
-        let _ = std::fs::remove_dir_all(&target_dir);
+    } else {
+        // The wasm32-wasip1 dependency tree is not the shared target's: an
+        // exclusive private tree, forwarded to the re-exec'd child's environment.
+        let isolated =
+            e2e_support::target::isolated(e2e_support::target::IsolationReason::ForeignTriple);
+        let Ok(isolated) = isolated else {
+            panic!("isolated build target: {isolated:?}")
+        };
+        let target = BuildTarget::Isolated(isolated);
+        rerun_in_target("ipe_run_target_wasi_executes_under_wasmtime", &target);
     }
 }
 

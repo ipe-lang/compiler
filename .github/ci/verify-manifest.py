@@ -2261,6 +2261,7 @@ MIRRORED_STEP_ENV: dict[str, frozenset[str]] = {
     "CARGO_TERM_COLOR": frozenset({"always"}),
     "IPE_BIN": frozenset({"${{ runner.temp }}/ipe-release/ipe"}),
     "IPE_E2E": frozenset({"1"}),
+    "IPE_ORACLE_SHARED_TARGET": frozenset({"${{ github.workspace }}/.cache/oracle-shared-target"}),
     "IPE_RUNTIME_DIR": frozenset({"${{ github.workspace }}/src/runtime/rust/src"}),
     "RUSTFLAGS": frozenset({"-C link-arg=-fuse-ld=mold"}),
 }

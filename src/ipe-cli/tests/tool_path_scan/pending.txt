@@ -9,7 +9,7 @@ src/ipe-cli/src/health.rs 2
 src/ipe-cli/src/remote_ingest.rs 2
 src/ipe-cli/src/toolchain.rs 3
 src/ipe-cli/src/watch.rs 1
-tools/e2e-support/src/lib.rs 2
+tools/e2e-support/src/target.rs 1
 tools/ipe-ffi-inspector/src/main.rs 6
 tools/ipe-index/src/walk.rs 1
 tools/regen-cli-transcripts/src/main.rs 1

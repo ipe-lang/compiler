@@ -1,0 +1,5 @@
+const TARGET_VAR: &str = "CARGO_TARGET_DIR";
+
+fn build(cmd: &mut std::process::Command, d: &std::path::Path) {
+    cmd.env(TARGET_VAR, d);
+}

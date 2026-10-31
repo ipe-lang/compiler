@@ -186,7 +186,10 @@ fn emitted_source(out_dir: &std::path::Path) -> std::io::Result<String> {
 
 /// Compile a `Web.tea` program string under a webview host, build the emitted
 /// Rust project, and return the path to the compiled binary.
-fn compile_and_build(test_name: &str, ipe_source: &str) -> Result<std::path::PathBuf, BoxError> {
+fn compile_and_build(
+    test_name: &str,
+    ipe_source: &str,
+) -> Result<e2e_support::SharedBuild, BoxError> {
     compile_and_build_with_files(test_name, ipe_source, &[])
 }
 
@@ -197,7 +200,7 @@ fn compile_and_build_with_files(
     test_name: &str,
     ipe_source: &str,
     extra: &[(&str, &str)],
-) -> Result<std::path::PathBuf, BoxError> {
+) -> Result<e2e_support::SharedBuild, BoxError> {
     let tree = ipe::project_root::SourceTree::main(ipe_source).field(DESKTOP_WINDOW);
     let fixture = ipe::RootFixture::from_tree(&tree)
         .map_err(|e| -> BoxError { format!("{test_name}: fixture: {e}").into() })?;
@@ -243,7 +246,7 @@ fn compile_and_build_with_files(
     let exe = e2e_support::build_rust_binary(test_name, &out_dir)
         .map_err(|e| -> BoxError { format!("{test_name}: cargo build failed: {e}").into() })?;
 
-    Ok(std::path::PathBuf::from(exe))
+    Ok(exe)
 }
 
 /// Whether a `compile_and_build` failure is the Linux `wry`/`tao` link gap —

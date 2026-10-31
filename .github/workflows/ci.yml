@@ -385,6 +385,8 @@ jobs:
           shared-key: ipe-nextest-deps
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - uses: taiki-e/install-action@23d41aa71228a2692ee31bb433f070fd4bdc6661 # nextest
+        with:
+          tool: nextest@0.9.146
       - name: Judge every explain-page and docs-page example
         run: cargo nextest run -p ipe --test explain_examples --profile ci
 
@@ -442,6 +444,8 @@ jobs:
           shared-key: ipe-nextest-deps
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - uses: taiki-e/install-action@23d41aa71228a2692ee31bb433f070fd4bdc6661 # nextest
+        with:
+          tool: nextest@0.9.146
       # The fixtures shell out to `git init/commit/push`; give the runner an
       # identity so those commands do not fail on a fresh machine.
       - name: Configure git identity for fixtures
@@ -451,6 +455,7 @@ jobs:
       - name: Registry publish + admission gate
         env:
           IPE_E2E: "1"
+          IPE_ORACLE_SHARED_TARGET: ${{ github.workspace }}/.cache/oracle-shared-target
         run: cargo nextest run -p ipe --test registry_admission --profile ci
 
   # Required context for `registry-admission-run`: the phase verdict (see the header).
@@ -816,6 +821,8 @@ jobs:
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - uses: taiki-e/install-action@23d41aa71228a2692ee31bb433f070fd4bdc6661 # nextest
+        with:
+          tool: nextest@0.9.146
       # Compile every test binary ONCE into a self-contained archive.
       - run: cargo nextest archive --workspace --archive-file nextest.tar.zst
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
@@ -842,6 +849,8 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: ./.github/actions/rust-toolchain-pinned
       - uses: taiki-e/install-action@23d41aa71228a2692ee31bb433f070fd4bdc6661 # nextest
+        with:
+          tool: nextest@0.9.146
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: nextest-archive
@@ -882,6 +891,8 @@ jobs:
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - uses: taiki-e/install-action@23d41aa71228a2692ee31bb433f070fd4bdc6661 # nextest
+        with:
+          tool: nextest@0.9.146
       - name: Lint ipe with the optional features on
         run: cargo clippy --locked -p ipe --features wasi_run,signing --all-targets -- -D warnings
       - name: Test ipe with the optional features on
@@ -889,6 +900,7 @@ jobs:
       - name: Run the WASI seal end to end
         env:
           IPE_E2E: "1"
+          IPE_ORACLE_SHARED_TARGET: ${{ github.workspace }}/.cache/oracle-shared-target
         run: cargo nextest run --locked -p ipe --features wasi_run --profile ci --test wasi_target_seal
 
   # A Git or Curl transfer on Windows runs in its own kill-on-close job object
@@ -913,6 +925,8 @@ jobs:
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - uses: taiki-e/install-action@23d41aa71228a2692ee31bb433f070fd4bdc6661 # nextest
+        with:
+          tool: nextest@0.9.146
       - name: Test the transfer containment and linkable build directory on Windows
         shell: bash
         run: cargo nextest run --locked -p ipe --lib --profile ci -E 'test(remote_ingest::) | test(target_dir::) | test(driver_error::link_failure) | test(compile_stack::)'
@@ -1192,6 +1206,8 @@ jobs:
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - uses: taiki-e/install-action@23d41aa71228a2692ee31bb433f070fd4bdc6661 # nextest
+        with:
+          tool: nextest@0.9.146
       # `dev-posture` is the dev-intent build outside `full`; its pins prove a
       # dev build on a loopback listener opens each dev-only surface.
       - run: cargo nextest run -p ipe-runtime-rust --features full,dev-posture --profile ci -E 'test(dev_posture_pin_)'
@@ -1293,6 +1309,8 @@ jobs:
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - uses: taiki-e/install-action@23d41aa71228a2692ee31bb433f070fd4bdc6661 # nextest
+        with:
+          tool: nextest@0.9.146
       - name: ASAN shard ${{ matrix.shard }}/6 (build-std, instrumented std)
         env:
           SHARD: ${{ matrix.shard }}
@@ -1355,6 +1373,8 @@ jobs:
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - uses: taiki-e/install-action@23d41aa71228a2692ee31bb433f070fd4bdc6661 # nextest
+        with:
+          tool: nextest@0.9.146
       - name: TSAN (build-std, concurrency-bearing crates)
         run: |
           cargo +nightly nextest run \
@@ -1427,9 +1447,24 @@ jobs:
       # The shard driver is `cargo nextest run`; the runner has no nextest unless
       # this installs it (every other nextest-driven job installs it too).
       - uses: taiki-e/install-action@23d41aa71228a2692ee31bb433f070fd4bdc6661 # nextest
+        with:
+          tool: nextest@0.9.146
+      # The runner image ships toolchains no e2e step uses (Android SDK, .NET,
+      # GHC, CodeQL, cached docker images); removing them raises the disk
+      # ceiling the shard's bounded peak must fit under.
+      - name: Free the runner's unused preinstalled toolchains
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /opt/hostedtoolcache/CodeQL
+          docker image prune -af
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: nextest-archive
+      # Unpack the archive once and delete it, so the shard holds the unpacked
+      # binaries only, never both copies (`e2e_shard.py` `EXTRACT_RUN`).
+      - name: Unpack the test archive and delete it
+        run: |
+          cargo nextest list --archive-file nextest.tar.zst --workspace-remap . --extract-to "$RUNNER_TEMP/nextest-x" --extract-overwrite -E 'none()'
+          rm -- nextest.tar.zst
       # Cache the shared emitted-crate target across runs so the runtime dep tree
       # (axum/tokio/sqlx/serde) stays warm and each shard's goldens link
       # incrementally instead of cold-building it. Keyed per shard by rust-cache.
@@ -1476,19 +1511,19 @@ jobs:
         with:
           path: ${{ runner.temp }}/apt-archives
           key: ${{ steps.apt-cache.outputs.cache-primary-key }}
+      # Refuse a runner that cannot hold the shard's bounded peak before any
+      # test runs (`e2e_shard.py` `DISK_FLOOR_BYTES`, summed from its terms).
+      - name: Check the shard's disk floor
+        run: python3 tools/scripts/e2e-disk.py --disk-floor
       - name: E2E shard ${{ matrix.shard }}/14 (THE SEAL — build+run emitted Rust)
         env:
           IPE_E2E: "1"
           IPE_RUNTIME_DIR: ${{ github.workspace }}/src/runtime/rust/src
-          # Without this, `tools/oracle`'s `resolve_emitted_target` fail-safe
-          # default (isolate) means EVERY golden's emitted crate builds into its
-          # own throwaway `target/` under `CARGO_TARGET_TMPDIR`, each compiling
-          # the full runtime dep tree (tokio/hyper/rsa/chrono/…) from scratch —
-          # the per-golden trees accumulate unbounded across a shard's ~100+
-          # goldens and exhaust runner disk (regex-automata/zerocopy ENOSPC).
-          # An absolute path here opts every emitted build in this shard into
-          # ONE target, so the dep tree compiles once and every later golden
-          # only links its own `main.rs`.
+          # Every emitted build in this shard links its dependency tree from
+          # ONE target, so the tree compiles once and each golden adds only its
+          # own app crate. Under IPE_E2E=1, `e2e_support::target` refuses a
+          # build without it rather than isolating into a private tree, and
+          # `e2e_shard.py --lint` requires it on every IPE_E2E step.
           IPE_ORACLE_SHARED_TARGET: ${{ github.workspace }}/.cache/oracle-shared-target
           # This shard's entry of the `changes` job's `e2e_plan`, whose SSOT is
           # `.github/ci/e2e_shard.py`: its ordered shard groups spread the
@@ -1499,13 +1534,21 @@ jobs:
           # (`e2e_shard.py --lint`) pins this matrix and this wiring.
           SHARD_FILTER: ${{ fromJSON(needs.changes.outputs.e2e_plan)[matrix.shard].filter }}
           SHARD_PARTITION: ${{ fromJSON(needs.changes.outputs.e2e_plan)[matrix.shard].partition }}
-        run: cargo nextest run --archive-file nextest.tar.zst --workspace-remap . --profile ci --no-fail-fast --test-threads=2 --no-tests=fail -E "$SHARD_FILTER" --partition "$SHARD_PARTITION"
+        run: cargo nextest run --binaries-metadata "$RUNNER_TEMP/nextest-x/target/nextest/binaries-metadata.json" --cargo-metadata "$RUNNER_TEMP/nextest-x/target/nextest/cargo-metadata.json" --target-dir-remap "$RUNNER_TEMP/nextest-x/target" --workspace-remap . --profile ci --no-fail-fast --test-threads=2 --no-tests=fail -E "$SHARD_FILTER" --partition "$SHARD_PARTITION"
+      # Evidence only: the disk left after the shard and the largest trees.
+      - name: Report the shard's disk use
+        if: always()
+        run: |
+          df -h "$GITHUB_WORKSPACE" "${TMPDIR:-/tmp}" "$RUNNER_TEMP"
+          du -sh "$GITHUB_WORKSPACE/target/tmp" "$GITHUB_WORKSPACE/.cache/oracle-shared-target" "$RUNNER_TEMP/nextest-x" 2>/dev/null || true
       - name: Upload JUnit results
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: junit-e2e-${{ matrix.shard }}
-          path: target/nextest/ci/junit.xml
+          path: |
+            target/nextest/ci/junit.xml
+            ${{ runner.temp }}/nextest-x/target/nextest/ci/junit.xml
           if-no-files-found: error
           retention-days: 14
 
@@ -1560,6 +1603,8 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: ./.github/actions/rust-toolchain-pinned
       - uses: taiki-e/install-action@23d41aa71228a2692ee31bb433f070fd4bdc6661 # nextest
+        with:
+          tool: nextest@0.9.146
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: nextest-archive
@@ -1617,6 +1662,7 @@ jobs:
       RUSTFLAGS: -C link-arg=-fuse-ld=mold
       IPE_RUNTIME_DIR: ${{ github.workspace }}/src/runtime/rust/src
       IPE_E2E: "1"
+      IPE_ORACLE_SHARED_TARGET: ${{ github.workspace }}/.cache/oracle-shared-target
       IPE_RUNTIME_VENDORED: "1"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -1630,6 +1676,8 @@ jobs:
           shared-key: ipe-nextest-deps
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - uses: taiki-e/install-action@23d41aa71228a2692ee31bb433f070fd4bdc6661 # nextest
+        with:
+          tool: nextest@0.9.146
       - name: Run seal_modset under the vendored emit model
         run: |
           cargo nextest run -p ipe \
@@ -1673,6 +1721,8 @@ jobs:
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - uses: taiki-e/install-action@23d41aa71228a2692ee31bb433f070fd4bdc6661 # nextest
+        with:
+          tool: nextest@0.9.146
 
       - name: Install the Linux jail primitives (bubblewrap + python3)
         run: |
@@ -1722,6 +1772,7 @@ jobs:
         env:
           IPE_E2E: "1"
           IPE_RUNTIME_DIR: ${{ github.workspace }}/src/runtime/rust/src
+          IPE_ORACLE_SHARED_TARGET: ${{ github.workspace }}/.cache/oracle-shared-target
         run: cargo nextest run -p ipe --test audit_native --profile ci
 
   # ── Linux arm64 Tier-2 (the fifth shipped platform) ────────────────────────
@@ -1761,6 +1812,8 @@ jobs:
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - uses: taiki-e/install-action@23d41aa71228a2692ee31bb433f070fd4bdc6661 # nextest
+        with:
+          tool: nextest@0.9.146
 
       # Assert we really are on aarch64 — the whole point is proving the UNWIRED
       # arch's fail-closed path, so a silent runner-arch drift to x86_64 (where a

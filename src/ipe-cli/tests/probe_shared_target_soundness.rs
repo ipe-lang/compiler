@@ -23,8 +23,8 @@
 
 use std::fs;
 use std::path::Path;
-use std::process::Command;
 
+use e2e_support::target::BuildTarget;
 use ipe::RootFixture;
 
 /// A minimal Ipê program that emits, builds, and runs.
@@ -59,17 +59,16 @@ fn ipe_build_into_shared(
     ipe: &Path,
     project: &RootFixture,
     dir: &Path,
-    shared_target: &Path,
+    target: &BuildTarget,
 ) -> (std::path::PathBuf, bool) {
     let out_dir = dir.join("out");
 
-    let status = Command::new(ipe)
+    let status = e2e_support::target::ipe_command(ipe, target)
         .arg("dev")
         .arg("build")
         .arg(project.path())
         .arg("--out")
         .arg(&out_dir)
-        .env("CARGO_TARGET_DIR", shared_target)
         .env("CARGO_BUILD_RUSTC_WRAPPER", "")
         .env("RUSTC_WRAPPER", "")
         .env("NO_COLOR", "1")
@@ -79,15 +78,12 @@ fn ipe_build_into_shared(
     (out_dir.join("rust"), status.success())
 }
 
-/// Re-run `cargo build` on an already-emitted project into `shared_target`,
-/// returning cargo's success plus its stderr.
-fn cargo_build_into_shared(out_dir: &Path, shared_target: &Path) -> (bool, String) {
-    let out = Command::new("cargo")
+/// Re-run `cargo build` on an already-emitted project into `target`, returning
+/// cargo's success plus its stderr.
+fn cargo_build_into_shared(out_dir: &Path, target: &BuildTarget) -> (bool, String) {
+    let out = e2e_support::target::cargo_command(target)
         .arg("build")
         .current_dir(out_dir)
-        .env("CARGO_TARGET_DIR", shared_target)
-        .env("CARGO_BUILD_RUSTC_WRAPPER", "")
-        .env("RUSTC_WRAPPER", "")
         .output()
         .expect("cargo must spawn");
     (
@@ -112,12 +108,21 @@ fn probe_shared_target_never_masks_a_broken_emit() {
     let root = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
         .join(format!("ipe_probe_soundness_{}", std::process::id()));
     let _ = fs::remove_dir_all(&root);
-    let shared_target = root.join("shared-target");
+
+    // ONE exclusive tree, reused by every build below — the test's whole point
+    // is proving that two app crates sharing this one warm target still
+    // fingerprint independently, so a fresh tree per call would defeat it.
+    let isolated =
+        e2e_support::target::isolated(e2e_support::target::IsolationReason::ColdBuildUnderTest);
+    let Ok(isolated) = isolated else {
+        panic!("isolated build target: {isolated:?}")
+    };
+    let target = BuildTarget::Isolated(isolated);
 
     // 1. Well-typed emit → warms the shared target and builds under its own name.
     let good_project = project();
     let (good_out, good_ok) =
-        ipe_build_into_shared(&ipe, &good_project, &root.join("good"), &shared_target);
+        ipe_build_into_shared(&ipe, &good_project, &root.join("good"), &target);
     assert!(
         good_ok,
         "the well-typed emit must build into the shared target"
@@ -133,8 +138,7 @@ fn probe_shared_target_never_masks_a_broken_emit() {
     // 2. Second emit under its OWN unique name → warms/builds, then corrupt its
     //    emitted `main.rs` and rebuild into the warm target: it MUST fail.
     let bad_project = project();
-    let (bad_out, bad_ok) =
-        ipe_build_into_shared(&ipe, &bad_project, &root.join("bad"), &shared_target);
+    let (bad_out, bad_ok) = ipe_build_into_shared(&ipe, &bad_project, &root.join("bad"), &target);
     assert!(bad_ok, "the second emit must build clean before corruption");
     let bad_identity = identity_of(&bad_project);
     assert_ne!(
@@ -152,7 +156,7 @@ fn probe_shared_target_never_masks_a_broken_emit() {
     source.push_str("\nconst _IPE_PROBE_SOUNDNESS_BREAK: u32 = \"not a number\";\n");
     fs::write(&main_rs, source).expect("inject type error into emitted main.rs");
 
-    let (rebuilt_ok, rebuilt_err) = cargo_build_into_shared(&bad_out, &shared_target);
+    let (rebuilt_ok, rebuilt_err) = cargo_build_into_shared(&bad_out, &target);
     assert!(
         !rebuilt_ok,
         "SOUNDNESS BREACH: a probe crate with an injected type error built successfully into the \

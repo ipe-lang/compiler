@@ -427,7 +427,7 @@ main =
 /// # Errors
 ///
 /// Returns an error on any pipeline or Cargo build failure.
-fn compile_and_build(test_name: &str) -> Result<PathBuf, BoxError> {
+fn compile_and_build(test_name: &str) -> Result<e2e_support::SharedBuild, BoxError> {
     let scratch = PathBuf::from(env!("CARGO_TARGET_TMPDIR"));
     let fixture = ipe::RootFixture::main(PROGRAM).map_err(|e| -> BoxError {
         format!("{test_name}: cannot write the fixture: {e}").into()
@@ -444,7 +444,7 @@ fn compile_and_build(test_name: &str) -> Result<PathBuf, BoxError> {
         .map_err(|e| -> BoxError { format!("{test_name}: ipe dev build failed: {e}").into() })?;
     let exe = e2e_support::build_rust_binary(test_name, &out_dir)
         .map_err(|e| -> BoxError { format!("{test_name}: cargo build failed: {e}").into() })?;
-    Ok(PathBuf::from(exe))
+    Ok(exe)
 }
 
 /// A fresh, empty directory for the test's SQLite file.

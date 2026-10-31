@@ -1,0 +1,6 @@
+macro_rules! run_ipe {
+    () => {{
+        let bin = env!("CARGO_BIN_EXE_ipe");
+        std::process::Command::new(bin).arg("run")
+    }};
+}

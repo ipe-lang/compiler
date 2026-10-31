@@ -310,10 +310,8 @@ fn fixture_project(name: &str, tests_fixture: &str) -> Result<PathBuf, Box<dyn E
 /// An `ipe test` of `project` with no build-directory pin and `cache` as the per-user cache base.
 fn ipe_test_command(project: &Path, cache: &Path) -> Command {
     let mut cmd = Command::new(support::ipe_bin());
-    cmd.arg("test")
-        .arg(project)
-        .env_remove("CARGO_TARGET_DIR")
-        .env("XDG_CACHE_HOME", cache);
+    cmd.arg("test").arg(project).env("XDG_CACHE_HOME", cache);
+    e2e_support::target::clear_target_dir_env(&mut cmd);
     cmd
 }
 
@@ -473,7 +471,6 @@ fn build_metadata_alone_keeps_two_path_dependency_units_apart() -> TestResult {
         crate::support::scratch_root().join(format!("ipe_test_identity_{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&base);
     let target = base.join("target");
-    let cargo = ipe_env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
     for tag in ["a", "b"] {
         let root = base.join(format!("root_{tag}"));
         let dep = root.join("dep");
@@ -495,12 +492,10 @@ fn build_metadata_alone_keeps_two_path_dependency_units_apart() -> TestResult {
             root.join("src").join("main.rs"),
             "fn main() { std::process::exit(i32::from(dep::one()) - 1); }\n",
         )?;
-        let out = Command::new(&cargo)
-            .arg("build")
-            .arg("--offline")
-            .current_dir(&root)
-            .env("CARGO_TARGET_DIR", &target)
-            .output()?;
+        let mut cmd = Command::new(e2e_support::target::cargo_program());
+        cmd.arg("build").arg("--offline").current_dir(&root);
+        e2e_support::target::set_target_dir_env(&mut cmd, &target);
+        let out = cmd.output()?;
         assert!(
             out.status.success(),
             "root_{tag} must build, got stderr:\n{}",
@@ -663,12 +658,10 @@ fn a_hand_edited_out_build_never_replaces_the_test_runtime_unit() -> TestResult 
     source.push_str("\n// edited by hand\n");
     std::fs::write(&mod_rs, source)?;
     std::fs::copy(target.join("ipe-test.Cargo.lock"), out.join("Cargo.lock"))?;
-    let cargo = ipe_env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
-    let hand = Command::new(&cargo)
-        .arg("build")
-        .current_dir(&out)
-        .env("CARGO_TARGET_DIR", &target)
-        .output()?;
+    let mut hand_cmd = Command::new(e2e_support::target::cargo_program());
+    hand_cmd.arg("build").current_dir(&out);
+    e2e_support::target::set_target_dir_env(&mut hand_cmd, &target);
+    let hand = hand_cmd.output()?;
     assert!(
         hand.status.success(),
         "the hand-edited out/ must build, got stderr:\n{}",

@@ -298,48 +298,14 @@ fn end_to_end_hazard_value_builds_and_prints() -> DResult<()> {
     let runtime = e2e_support::require_runtime().into_path_buf();
     let (emitted, _) = emit_hazard_program()?;
 
-    let out = ipe_test_temp::temp_root().join("ipe_backend_lexable_seal_e2e");
-    let _ = std::fs::remove_dir_all(&out);
-    let src = out.join("src");
-    std::fs::create_dir_all(&src).map_err(|e| seal_e2e::io_bug(&src, &e))?;
-    seal_e2e::copy_dir(&runtime, &src.join("ipe_runtime"))?;
-
-    let cargo_toml = out.join("Cargo.toml");
-    std::fs::write(&cargo_toml, &emitted.cargo_toml)
-        .map_err(|e| seal_e2e::io_bug(&cargo_toml, &e))?;
-    for (rel, contents) in &emitted.files {
-        let path = out.join(rel.as_str());
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| seal_e2e::io_bug(parent, &e))?;
-        }
-        std::fs::write(&path, contents).map_err(|e| seal_e2e::io_bug(&path, &e))?;
-    }
-
-    let target_dir = seal_e2e::emitted_run_target_dir(&out);
-    let status = std::process::Command::new("cargo")
-        .arg("build")
-        .current_dir(&out)
-        .env("CARGO_TARGET_DIR", &target_dir)
-        .status();
-    assert!(
-        matches!(&status, Ok(s) if s.success()),
-        "the emitted project must build with the hazard value in every literal \
-         position: {status:?}"
-    );
-
-    let bin = target_dir.join("debug").join("ipe-app");
-    let output = std::process::Command::new(&bin)
-        .output()
-        .map_err(|e| seal_e2e::io_bug(&bin, &e))?;
+    let run = seal_e2e::build_and_run_emitted(&emitted, &runtime, "ipe_backend_lexable_seal_e2e")?
+        .map_err(seal_e2e::build_bug)?;
+    assert_eq!(run.exit_code, Some(0), "exit 0");
     assert_eq!(
-        String::from_utf8_lossy(&output.stdout),
+        run.stdout,
         format!("{HAZARD_VALUE}\n"),
         "the program must print the exact hazard value"
     );
-    assert!(output.status.success(), "exit 0");
-    if target_dir == out.join("target") {
-        let _ = std::fs::remove_dir_all(&target_dir);
-    }
     Ok(())
 }
 

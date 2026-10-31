@@ -125,8 +125,8 @@ error: could not compile `app` (bin \"app\") due to 1 previous error
                 .env("IPE_HOME", &self.home)
                 .env("XDG_CACHE_HOME", &self.cache)
                 .env("HOME", &self.root)
-                .env_remove("CARGO_TARGET_DIR")
                 .env("NO_COLOR", "1");
+            e2e_support::target::clear_target_dir_env(&mut cmd);
             for (key, value) in extra {
                 cmd.env(key, value);
             }

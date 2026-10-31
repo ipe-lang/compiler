@@ -1,0 +1,11 @@
+const RUN: &str = "run";
+
+#[test]
+fn builds_and_runs() {
+    let bin = e2e_support::cargo_bin!("ipe");
+    let out = std::process::Command::new(bin.into_path_buf())
+        .arg(RUN)
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+}

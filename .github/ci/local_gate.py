@@ -96,6 +96,9 @@ PLACEHOLDERS = {
     "{lib_packages}": "--workspace",
     "{repo_root}": "${{ github.workspace }}",
     "{target_dir}": "${{ github.workspace }}/target",
+    # The warm target every IPE_E2E emitted build links from; locally, the
+    # lane's own target dir.
+    "{oracle_target}": "${{ github.workspace }}/.cache/oracle-shared-target",
     # The release `ipe` build-tools compiles once and ships to its consumers;
     # locally, the one `cargo build --release -p ipe` in the target dir.
     "{ipe_bin}": "${{ runner.temp }}/ipe-release/ipe",
@@ -760,6 +763,7 @@ def expand(cmd: Command, ctx: str, sel: Selection, ws: Workspace) -> Step | None
     local = {
         "{repo_root}": ws.root,
         "{target_dir}": ws.target_dir,
+        "{oracle_target}": ws.target_dir,
         "{ipe_bin}": os.path.join(ws.target_dir, "release", "ipe"),
     }
     argv: list[str] = []

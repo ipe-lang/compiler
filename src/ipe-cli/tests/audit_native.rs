@@ -1769,7 +1769,7 @@ mod real_jail {
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     fn dev_run_binary(out: &std::path::Path) -> PathBuf {
         let crate_dir = out.join("rust");
-        let mut cmd = std::process::Command::new("cargo");
+        let mut cmd = std::process::Command::new(e2e_support::target::cargo_program());
         cmd.args([
             "metadata",
             "--no-deps",

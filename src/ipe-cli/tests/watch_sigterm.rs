@@ -20,9 +20,10 @@ use std::net::TcpStream;
 #[cfg(target_os = "linux")]
 use std::path::Path;
 use std::path::PathBuf;
-#[cfg(target_os = "linux")]
-use std::process::Command;
 use std::time::{Duration, Instant};
+
+#[cfg(target_os = "linux")]
+use e2e_support::target::{self, BuildTarget};
 
 mod support;
 
@@ -98,10 +99,16 @@ fn project_fixture(source: &str) -> Result<ipe::RootFixture, BoxError> {
 /// points to. After this returns, `ipe dev watch`'s own build only needs to link —
 /// seconds, not minutes.
 ///
-/// `RUSTC_WRAPPER` is cleared so sccache does not interfere with the warm-up
-/// build; the shared target's object cache is all that matters here.
+/// `RUSTC_WRAPPER` is left exactly as inherited so sccache behaves identically
+/// here and in the watch's own build; the shared target's object cache is all
+/// that matters here.
+///
+/// `target_dir` is an owned path (not a borrowed [`BuildTarget`]) because
+/// [`try_warm`] runs this on a detached background thread under a timeout: a
+/// [`BuildTarget`] is not `Clone` (its `Drop` removes the tree it names), so
+/// the caller resolves it once and hands this only the path it names.
 #[cfg(target_os = "linux")]
-fn warm_server_fixture_deps() -> Result<(), BoxError> {
+fn warm_server_fixture_deps(target_dir: &Path) -> Result<(), BoxError> {
     let warm_dir = crate::support::scratch_root().join(format!(
         "watch_sigterm_warm_{}_{}",
         std::process::id(),
@@ -125,14 +132,12 @@ fn warm_server_fixture_deps() -> Result<(), BoxError> {
     // RUSTC_WRAPPER override): cargo fingerprints include the wrapper, so a
     // warm built without sccache produces artifacts with a different fingerprint
     // than the watch's sccache-enabled build, forcing a full recompile and
-    // defeating the warm-up entirely. Pin the SAME shared target the watch's
-    // build is forwarded (IPE_ORACLE_SHARED_TARGET in CI), so the deps land where
-    // the watch links them instead of in a throwaway per-dir target.
-    let mut cargo = Command::new("cargo");
+    // defeating the warm-up entirely. Pin the SAME target `spawn_ipe_watch`
+    // builds into (`target_dir`), so the deps land where the watch links them
+    // instead of a second, separately-warmed tree.
+    let mut cargo = std::process::Command::new(target::cargo_program());
     cargo.arg("build").current_dir(&out_dir);
-    if let Some(target) = e2e_support::child_shared_target_from_env() {
-        cargo.env("CARGO_TARGET_DIR", target);
-    }
+    target::set_target_dir_env(&mut cargo, target_dir);
     let _cargo_status = cargo
         .status()
         .map_err(|e| -> BoxError { format!("warm: cargo build spawn: {e}").into() })?;
@@ -145,12 +150,14 @@ fn warm_server_fixture_deps() -> Result<(), BoxError> {
 /// Returns `Ok(())` whether warming succeeded or not — a warm-up failure is
 /// not fatal; the E2E test just pays the full cold build time itself.
 #[cfg(target_os = "linux")]
-fn try_warm(timeout: Duration) -> Result<(), BoxError> {
+fn try_warm(timeout: Duration, build_target: &BuildTarget) -> Result<(), BoxError> {
     // Run the warm-up on a background thread so we can enforce the timeout
-    // without blocking the test process indefinitely.
+    // without blocking the test process indefinitely. The thread needs an
+    // owned, `'static` path, not a borrow of `build_target`.
+    let target_dir = build_target.path().to_path_buf();
     let (tx, rx) = std::sync::mpsc::channel::<Result<(), BoxError>>();
     std::thread::Builder::new().spawn(move || {
-        let _ = tx.send(warm_server_fixture_deps());
+        let _ = tx.send(warm_server_fixture_deps(&target_dir));
     })?;
     rx.recv_timeout(timeout).unwrap_or_else(|_| Ok(()))
 }
@@ -257,9 +264,12 @@ fn spawn_ipe_watch(
     out_dir: &Path,
     port: u16,
     capture_stderr: bool,
+    build_target: &BuildTarget,
 ) -> Result<std::process::Child, BoxError> {
     let runtime_dir = e2e_support::require_runtime().into_path_buf();
-    let mut cmd = std::process::Command::new(support::ipe_bin());
+    // The child's rebuild links against the SAME tree `warm_server_fixture_deps`
+    // warms (the caller's one `build_target`), so it pays only a link step.
+    let mut cmd = target::ipe_command(&support::ipe_bin(), build_target);
     cmd.arg("dev")
         .arg("watch")
         .arg(project_dir)
@@ -275,13 +285,6 @@ fn spawn_ipe_watch(
         } else {
             std::process::Stdio::null()
         });
-    // Forward CI's warm shared target (exported ONLY as IPE_ORACLE_SHARED_TARGET)
-    // as the child `ipe dev watch`'s CARGO_TARGET_DIR, so its rebuild links against a
-    // pre-compiled dep tree — the SAME target `warm_server_fixture_deps` warms.
-    // Absent (a bare local run) the child stays isolated exactly as before.
-    if let Some(target) = e2e_support::child_shared_target_from_env() {
-        cmd.env("CARGO_TARGET_DIR", target);
-    }
     cmd.spawn()
         .map_err(|e| -> BoxError { format!("ipe dev watch must spawn: {e}").into() })
 }
@@ -354,6 +357,7 @@ fn wait_for_exit(
 /// child is gone (killed and reaped), never an orphan holding the port.
 #[cfg(target_os = "linux")]
 #[test]
+#[allow(clippy::panic)] // a test-environment setup failure fails the test with its cause
 fn watch_shuts_down_the_supervised_child_on_sigterm_to_only_the_ipe_process() -> Result<(), BoxError>
 {
     if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
@@ -361,16 +365,27 @@ fn watch_shuts_down_the_supervised_child_on_sigterm_to_only_the_ipe_process() ->
         return Ok(());
     }
 
+    // `ipe dev watch` emits the fixed package `ipe-app`: an exclusive tree
+    // avoids colliding with a concurrent same-shaped test over the same
+    // package name in the shared target. Held for the warm-up and the watch
+    // subprocess's whole lifetime.
+    let isolated =
+        e2e_support::target::isolated(e2e_support::target::IsolationReason::FixedPackageName);
+    let Ok(isolated) = isolated else {
+        panic!("isolated build target: {isolated:?}")
+    };
+    let build_target = BuildTarget::Isolated(isolated);
+
     // Pre-warm the shared cargo target so the watch's own build pays only a
     // link step. Best-effort: if warm-up fails or times out the test still
     // runs; it just takes longer.
-    let _ = try_warm(DEP_WARM_BUDGET);
+    let _ = try_warm(DEP_WARM_BUDGET, &build_target);
 
     let out_dir = fresh_out_dir("term_reaps_child")?;
     let fixture = project_fixture(&server_fixture("v1"))?;
 
     let port = 19159;
-    let mut ipe_proc = spawn_ipe_watch(fixture.path(), &out_dir, port, false)?;
+    let mut ipe_proc = spawn_ipe_watch(fixture.path(), &out_dir, port, false, &build_target)?;
 
     if !wait_for_body(port, "v1", WATCH_SERVE_BUDGET) {
         let _ = ipe_proc.kill();
@@ -483,6 +498,7 @@ fn spawn_never_installs_a_sigterm_forwarder() -> Result<(), BoxError> {
 /// termination owner's own unit test.
 #[cfg(target_os = "linux")]
 #[test]
+#[allow(clippy::panic)] // a test-environment setup failure fails the test with its cause
 fn double_sigterm_during_teardown_ends_the_process_and_every_transfer_group() -> Result<(), BoxError>
 {
     if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
@@ -490,16 +506,27 @@ fn double_sigterm_during_teardown_ends_the_process_and_every_transfer_group() ->
         return Ok(());
     }
 
+    // `ipe dev watch` emits the fixed package `ipe-app`: an exclusive tree
+    // avoids colliding with a concurrent same-shaped test over the same
+    // package name in the shared target. Held for the warm-up and the watch
+    // subprocess's whole lifetime.
+    let isolated =
+        e2e_support::target::isolated(e2e_support::target::IsolationReason::FixedPackageName);
+    let Ok(isolated) = isolated else {
+        panic!("isolated build target: {isolated:?}")
+    };
+    let build_target = BuildTarget::Isolated(isolated);
+
     // Pre-warm the shared cargo target so the watch's own build pays only a
     // link step. Best-effort: if warm-up fails or times out the test still
     // runs; it just takes longer.
-    let _ = try_warm(DEP_WARM_BUDGET);
+    let _ = try_warm(DEP_WARM_BUDGET, &build_target);
 
     let out_dir = fresh_out_dir("double_term")?;
     let fixture = project_fixture(&server_fixture("v1"))?;
 
     let port = 19158;
-    let mut ipe_proc = spawn_ipe_watch(fixture.path(), &out_dir, port, true)?;
+    let mut ipe_proc = spawn_ipe_watch(fixture.path(), &out_dir, port, true, &build_target)?;
 
     if !wait_for_body(port, "v1", WATCH_SERVE_BUDGET) {
         let _ = ipe_proc.kill();

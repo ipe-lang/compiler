@@ -190,7 +190,19 @@ const BUILD_BOUNDS: e2e_support::BoundedRun = e2e_support::BoundedRun {
 /// Run `ipe <mode> build <project> --out <project>/out` with stdin
 /// closed (never a terminal), returning (success, stderr).
 fn spawn_build(mode: &str, dir: &std::path::Path) -> Result<(bool, String), Box<dyn Error>> {
-    let mut cmd = std::process::Command::new(e2e_support::cargo_bin!("ipe").into_path_buf());
+    // `ipe dev build` emits the fixed package `ipe-app`: an exclusive tree
+    // avoids colliding with a concurrent `ipe dev build`/`ipe dev run` test
+    // over the same package name in the shared target. `ipe release build`
+    // does not share that risk, but this helper serves both modes, so it
+    // takes the same conservative tree either way.
+    let isolated =
+        e2e_support::target::isolated(e2e_support::target::IsolationReason::FixedPackageName);
+    let Ok(isolated) = isolated else {
+        return Err(format!("isolated build target: {isolated:?}").into());
+    };
+    let target = e2e_support::target::BuildTarget::Isolated(isolated);
+    let ipe_bin = e2e_support::cargo_bin!("ipe").into_path_buf();
+    let mut cmd = e2e_support::target::ipe_command(&ipe_bin, &target);
     cmd.args([mode, "build"])
         .arg(dir)
         .arg("--out")

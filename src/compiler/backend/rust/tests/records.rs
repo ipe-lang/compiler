@@ -544,15 +544,11 @@ fn end_to_end_distinct_shapes_cargo_check() -> DResult<()> {
     let emitted = RustBackend::new(&interner).emit(&prog)?;
 
     let runtime = e2e_support::require_runtime().into_path_buf();
-    let status = seal_e2e::vendor_and_run(
-        &emitted,
-        &runtime,
-        "ipe_backend_distinct_shapes_e2e",
-        "check",
-    )?;
+    let built = seal_e2e::build_emitted(&emitted, &runtime, "ipe_backend_distinct_shapes_e2e")?;
     assert!(
-        matches!(&status, Ok(s) if s.success()),
-        "emitted two-shape project must type-check (no CompilerBug, no E0308): {status:?}"
+        built.is_ok(),
+        "emitted two-shape project must type-check (no CompilerBug, no E0308): {:?}",
+        built.err()
     );
     Ok(())
 }
@@ -572,46 +568,9 @@ fn end_to_end_builds_and_prints_five() -> DResult<()> {
     let prog = record_trio(&mut interner)?;
     let emitted = RustBackend::new(&interner).emit(&prog)?;
 
-    let out = ipe_test_temp::temp_root().join("ipe_backend_records_e2e");
-    let _ = std::fs::remove_dir_all(&out);
-    let src = out.join("src");
-    std::fs::create_dir_all(&src).map_err(|e| seal_e2e::io_bug(&src, &e))?;
-    seal_e2e::copy_dir(&runtime, &src.join("ipe_runtime"))?;
-
-    let cargo_toml = out.join("Cargo.toml");
-    std::fs::write(&cargo_toml, &emitted.cargo_toml)
-        .map_err(|e| seal_e2e::io_bug(&cargo_toml, &e))?;
-    for (rel, contents) in &emitted.files {
-        let path = out.join(rel.as_str());
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| seal_e2e::io_bug(parent, &e))?;
-        }
-        std::fs::write(&path, contents).map_err(|e| seal_e2e::io_bug(&path, &e))?;
-    }
-
-    let target_dir = seal_e2e::emitted_run_target_dir(&out);
-    let status = std::process::Command::new("cargo")
-        .arg("build")
-        .current_dir(&out)
-        .env("CARGO_TARGET_DIR", &target_dir)
-        .status();
-    assert!(
-        matches!(&status, Ok(s) if s.success()),
-        "emitted record project must build: {status:?}"
-    );
-
-    let bin = target_dir.join("debug").join("ipe-app");
-    let output = std::process::Command::new(&bin)
-        .output()
-        .map_err(|e| seal_e2e::io_bug(&bin, &e))?;
-    assert_eq!(
-        String::from_utf8_lossy(&output.stdout),
-        "5\n",
-        "record program prints 5"
-    );
-    assert!(output.status.success(), "exit 0");
-    if target_dir == out.join("target") {
-        let _ = std::fs::remove_dir_all(&target_dir);
-    }
+    let run = seal_e2e::build_and_run_emitted(&emitted, &runtime, "ipe_backend_records_e2e")?
+        .map_err(seal_e2e::build_bug)?;
+    assert_eq!(run.exit_code, Some(0), "exit 0");
+    assert_eq!(run.stdout, "5\n", "record program prints 5");
     Ok(())
 }

@@ -39,11 +39,13 @@
 //!   (`#[wasm_bindgen_test]`, `#[rstest]`, `#[test_case(..)]`).
 
 use std::collections::BTreeSet;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::str::FromStr;
 
 use proc_macro2::{TokenStream, TokenTree};
 use syn::visit::Visit;
+
+mod common;
 
 /// The skip-scan fixtures, relative to this crate's manifest directory.
 const FIXTURES: &str = "tests/fixtures/skip_scan";
@@ -681,156 +683,6 @@ fn path_ends(expr: &syn::Expr, tail: &[&str]) -> bool {
             .all(|(seg, want)| seg == want)
 }
 
-/// The workspace root and every test target's source files, relative to it.
-#[allow(clippy::expect_used)] // an unreadable workspace manifest fails the scan: the designed outcome
-fn test_target_files() -> (PathBuf, BTreeSet<PathBuf>) {
-    let manifest = e2e_support::manifest_dir!().join("../../Cargo.toml");
-    let cargo = ipe_env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
-    let out = std::process::Command::new(cargo)
-        .args([
-            "metadata",
-            "--no-deps",
-            "--offline",
-            "--format-version",
-            "1",
-        ])
-        .arg("--manifest-path")
-        .arg(&manifest)
-        .output()
-        .expect("`cargo metadata` must run");
-    assert!(
-        out.status.success(),
-        "`cargo metadata` failed: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    let meta: serde_json::Value =
-        serde_json::from_slice(&out.stdout).expect("`cargo metadata` must print JSON");
-    let root = PathBuf::from(
-        meta.get("workspace_root")
-            .and_then(serde_json::Value::as_str)
-            .expect("metadata names the workspace root"),
-    );
-    let roots: Vec<PathBuf> = meta
-        .get("packages")
-        .and_then(serde_json::Value::as_array)
-        .expect("metadata lists the packages")
-        .iter()
-        .filter_map(|p| p.get("targets").and_then(serde_json::Value::as_array))
-        .flatten()
-        .filter(|t| {
-            t.get("kind")
-                .and_then(serde_json::Value::as_array)
-                .is_some_and(|k| k.iter().any(|k| k == "test"))
-        })
-        .map(|t| {
-            t.get("src_path")
-                .and_then(serde_json::Value::as_str)
-                .map(PathBuf::from)
-                .expect("every metadata target names its source path")
-        })
-        .collect();
-    assert!(!roots.is_empty(), "the workspace must declare test targets");
-    let mut walk = ModWalk::default();
-    for target in roots {
-        walk.visit(&target, true);
-    }
-    assert!(
-        walk.unresolved.is_empty(),
-        "unresolvable `mod` declarations in test targets:\n{}",
-        walk.unresolved.join("\n")
-    );
-    let files = walk
-        .seen
-        .iter()
-        .map(|f| {
-            f.strip_prefix(&root)
-                .map_or_else(|_| f.clone(), Path::to_path_buf)
-        })
-        .collect();
-    (root, files)
-}
-
-/// Follows every out-of-line `mod` declaration from the test-target roots.
-#[derive(Default)]
-struct ModWalk {
-    seen: BTreeSet<PathBuf>,
-    unresolved: Vec<String>,
-}
-
-impl ModWalk {
-    /// Visit `file`; `mod_rs` when it is a crate root, a `mod.rs`, or a
-    /// `#[path]` target, whose child modules live beside it.
-    fn visit(&mut self, file: &Path, mod_rs: bool) {
-        if !self.seen.insert(file.to_path_buf()) {
-            return;
-        }
-        // An unreadable or unparsable file is refused by the per-file scan.
-        let Some(parsed) = std::fs::read_to_string(file)
-            .ok()
-            .and_then(|text| syn::parse_file(&text).ok())
-        else {
-            return;
-        };
-        let dir = file.parent().map(Path::to_path_buf).unwrap_or_default();
-        let base = if mod_rs {
-            dir.clone()
-        } else {
-            file.file_stem()
-                .map_or_else(|| dir.clone(), |stem| dir.join(stem))
-        };
-        self.items(file, &parsed.items, &dir, &base, false);
-    }
-
-    fn items(&mut self, file: &Path, items: &[syn::Item], dir: &Path, base: &Path, inline: bool) {
-        for item in items {
-            let syn::Item::Mod(m) = item else {
-                continue;
-            };
-            let path_attr = path_attr(&m.attrs);
-            if let Some((_, inner)) = &m.content {
-                let nested =
-                    path_attr.map_or_else(|| base.join(m.ident.to_string()), |p| base.join(p));
-                self.items(file, inner, dir, &nested, true);
-                continue;
-            }
-            let candidates = path_attr.as_deref().map_or_else(
-                || {
-                    let name = m.ident.to_string();
-                    vec![
-                        base.join(format!("{name}.rs")),
-                        base.join(&name).join("mod.rs"),
-                    ]
-                },
-                |p| vec![if inline { base.join(p) } else { dir.join(p) }],
-            );
-            if let Some(hit) = candidates.iter().find(|c| c.is_file()) {
-                let mod_rs = path_attr.is_some() || hit.file_name().is_some_and(|n| n == "mod.rs");
-                self.visit(hit, mod_rs);
-                continue;
-            }
-            self.unresolved.push(format!(
-                "{}: `mod {}` (tried {candidates:?})",
-                file.display(),
-                m.ident
-            ));
-        }
-    }
-}
-
-/// The value of a `#[path = "…"]` attribute.
-fn path_attr(attrs: &[syn::Attribute]) -> Option<String> {
-    attrs.iter().find_map(|attr| match &attr.meta {
-        syn::Meta::NameValue(nv) if nv.path.is_ident("path") => match &nv.value {
-            syn::Expr::Lit(syn::ExprLit {
-                lit: syn::Lit::Str(s),
-                ..
-            }) => Some(s.value()),
-            _ => None,
-        },
-        _ => None,
-    })
-}
-
 /// A fixture's findings, reading it from [`FIXTURES`].
 #[allow(clippy::expect_used)] // a missing fixture fails the test: the designed outcome
 fn fixture(name: &str) -> Vec<Finding> {
@@ -930,7 +782,7 @@ fn a_return_err_and_a_closure_return_are_not_skips() {
 
 #[test]
 fn no_test_target_skips_silently() {
-    let (root, files) = test_target_files();
+    let (root, files) = common::test_target_files();
     for pinned in [
         "tools/e2e-support/tests/skip_scan.rs",
         "src/ipe-cli/tests/support/mod.rs",

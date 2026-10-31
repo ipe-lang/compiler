@@ -93,6 +93,7 @@ fn run_no_arg_empty_dir_is_refused_as_no_manifest() {
 ///
 /// Gated on `IPE_E2E=1` — requires a working cargo and `IPE_RUNTIME_DIR`.
 #[test]
+#[allow(clippy::panic)] // a test-environment setup failure fails the test with its cause
 fn build_no_arg_in_project_dir_succeeds() {
     if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
         return;
@@ -119,11 +120,17 @@ fn build_no_arg_in_project_dir_succeeds() {
         "`ipe dev build` (no positional) in project dir must succeed: {build_result:?}"
     );
 
-    // THE SEAL: emitted Rust must compile with cargo.
-    let cargo_status = std::process::Command::new("cargo")
+    // THE SEAL: emitted Rust must compile with cargo. A private isolated
+    // tree: the test asserts this cold build, not the shared target's reuse.
+    let isolated =
+        e2e_support::target::isolated(e2e_support::target::IsolationReason::ColdBuildUnderTest);
+    let Ok(isolated) = isolated else {
+        panic!("isolated build target: {isolated:?}")
+    };
+    let target = e2e_support::target::BuildTarget::Isolated(isolated);
+    let cargo_status = e2e_support::target::cargo_command(&target)
         .arg("build")
         .current_dir(&out_dir)
-        .env("CARGO_TARGET_DIR", out_dir.join("target"))
         .env("IPE_RUNTIME_DIR", &runtime_dir)
         .status();
     assert!(
@@ -131,7 +138,6 @@ fn build_no_arg_in_project_dir_succeeds() {
         "cargo build on the emitted project must succeed: {cargo_status:?}"
     );
 
-    let _ = fs::remove_dir_all(out_dir.join("target"));
     let _ = fs::remove_dir_all(&dir);
 }
 
@@ -140,6 +146,7 @@ fn build_no_arg_in_project_dir_succeeds() {
 ///
 /// Gated on `IPE_E2E=1`.
 #[test]
+#[allow(clippy::panic)] // a test-environment setup failure fails the test with its cause
 fn build_flag_first_no_entry_resolves_default() {
     if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
         return;
@@ -172,10 +179,17 @@ fn build_flag_first_no_entry_resolves_default() {
     // THE SEAL. `--out` names the output root; the emitted crate is its
     // `rust/` area.
     let crate_dir = out_dir.join("rust");
-    let cargo_status = std::process::Command::new("cargo")
+    // A private isolated tree: the test asserts this cold build, not the
+    // shared target's reuse.
+    let isolated =
+        e2e_support::target::isolated(e2e_support::target::IsolationReason::ColdBuildUnderTest);
+    let Ok(isolated) = isolated else {
+        panic!("isolated build target: {isolated:?}")
+    };
+    let target = e2e_support::target::BuildTarget::Isolated(isolated);
+    let cargo_status = e2e_support::target::cargo_command(&target)
         .arg("build")
         .current_dir(&crate_dir)
-        .env("CARGO_TARGET_DIR", crate_dir.join("target"))
         .env("IPE_RUNTIME_DIR", &runtime_dir)
         .status();
     assert!(
@@ -183,6 +197,5 @@ fn build_flag_first_no_entry_resolves_default() {
         "cargo build on the emitted project must succeed: {cargo_status:?}"
     );
 
-    let _ = fs::remove_dir_all(crate_dir.join("target"));
     let _ = fs::remove_dir_all(&dir);
 }

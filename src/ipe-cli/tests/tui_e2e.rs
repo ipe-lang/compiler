@@ -115,7 +115,10 @@ type BoxError = Box<dyn std::error::Error + Send + Sync + 'static>;
 
 /// Compile a Ipê program string, build the emitted Rust project, and return
 /// the path to the compiled binary.
-fn compile_and_build(test_name: &str, ipe_source: &str) -> Result<std::path::PathBuf, BoxError> {
+fn compile_and_build(
+    test_name: &str,
+    ipe_source: &str,
+) -> Result<e2e_support::SharedBuild, BoxError> {
     let fixture = ipe::RootFixture::main(ipe_source).map_err(|e| -> BoxError {
         format!("{test_name}: cannot write the fixture: {e}").into()
     })?;
@@ -132,7 +135,7 @@ fn compile_and_build(test_name: &str, ipe_source: &str) -> Result<std::path::Pat
     let exe = e2e_support::build_rust_binary(test_name, &out_dir)
         .map_err(|e| -> BoxError { format!("{test_name}: cargo build failed: {e}").into() })?;
 
-    Ok(std::path::PathBuf::from(exe))
+    Ok(exe)
 }
 
 /// **Regression for T0001**: `Tui.Sub.onKey` accepts a record-typed key handler.

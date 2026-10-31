@@ -16,8 +16,7 @@ src/ipe-cli/src/build_plan.rs 12
 src/ipe-cli/src/cache.rs 4
 src/ipe-cli/src/cargo_step.rs 2
 src/ipe-cli/src/coverage/columns_runtime.rs 2
-src/ipe-cli/src/coverage/probe.rs 1
-src/ipe-cli/src/doc.rs 4
+src/ipe-cli/src/doc.rs 3
 src/ipe-cli/src/driver/build_pipeline.rs 15
 src/ipe-cli/src/env_dir.rs 1
 src/ipe-cli/src/ffi.rs 12
@@ -65,5 +64,6 @@ src/runtime/rust/src/web/sse.rs 1
 src/runtime/rust/src/web/store.rs 2
 src/runtime/rust/src/ws_client.rs 2
 tools/e2e-support/src/bin.rs 3
-tools/e2e-support/src/lib.rs 5
+tools/e2e-support/src/lib.rs 3
+tools/e2e-support/src/target.rs 2
 tools/ipe-ffi-inspector/src/main.rs 24

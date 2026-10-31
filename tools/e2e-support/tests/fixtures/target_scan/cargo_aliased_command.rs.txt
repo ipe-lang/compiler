@@ -1,0 +1,5 @@
+use std::process::Command as C;
+
+fn build() -> C {
+    C::new("cargo")
+}

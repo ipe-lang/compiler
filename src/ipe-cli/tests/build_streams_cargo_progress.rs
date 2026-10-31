@@ -96,8 +96,19 @@ fn assert_relays_cargo_progress(subcommand: &str) {
     let fake_cargo = write_progress_cargo(&bin_dir);
     assert!(fake_cargo.is_ok(), "write fake cargo: {fake_cargo:?}");
 
+    // `ipe dev build`/`ipe dev run` emit the fixed package `ipe-app`: an
+    // exclusive tree avoids colliding with a concurrent same-shaped test over
+    // the same package name in the shared target.
+    let isolated =
+        e2e_support::target::isolated(e2e_support::target::IsolationReason::FixedPackageName);
+    let Ok(isolated) = isolated else {
+        assert!(false_marker(), "isolated build target: {isolated:?}");
+        return;
+    };
+    let target = e2e_support::target::BuildTarget::Isolated(isolated);
+
     // PATH holds ONLY the fake-bin dir, so the fake `cargo` is the one resolved.
-    let out = std::process::Command::new(ipe_bin)
+    let out = e2e_support::target::ipe_command(ipe_bin.path(), &target)
         .args([
             "dev",
             subcommand,

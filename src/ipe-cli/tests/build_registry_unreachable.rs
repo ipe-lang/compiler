@@ -62,7 +62,17 @@ fn build_registry_unreachable_renders_ipe_e0001_not_ice() {
     let fake_cargo = write_offline_cargo(&bin_dir);
     assert!(fake_cargo.is_ok(), "write fake cargo: {fake_cargo:?}");
 
-    let out = std::process::Command::new(ipe_bin)
+    // `ipe dev build` emits the fixed package `ipe-app`: an exclusive tree
+    // avoids colliding with a concurrent `ipe dev build`/`ipe dev run` test
+    // over the same package name in the shared target.
+    let isolated =
+        e2e_support::target::isolated(e2e_support::target::IsolationReason::FixedPackageName);
+    let Ok(isolated) = isolated else {
+        panic!("isolated build target: {isolated:?}")
+    };
+    let target = e2e_support::target::BuildTarget::Isolated(isolated);
+
+    let out = e2e_support::target::ipe_command(ipe_bin.path(), &target)
         .args(["dev", "build", &fixture.path().to_string_lossy(), "--out"])
         .arg(&out_dir)
         .env("PATH", &bin_dir)
