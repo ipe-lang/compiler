@@ -1126,12 +1126,11 @@ pub struct Env {
     /// spellings and homes and from `KERNEL_TYPE_ALIASES`; a qualified type
     /// under a kernel qualifier resolves only through it.
     pub kernel_types: Rc<BTreeMap<KernelModule, BTreeMap<&'static str, KernelTypeExport>>>,
-    /// The types each source-module qualifier's dependency exports:
-    /// qualifier spelling -> (type name -> exported type).
+    /// The types each source-module qualifier's dependency declares:
+    /// qualifier spelling -> (type name -> exported or private type).
     ///
-    /// A qualifier holds an entry exactly when its dependency's exports are
-    /// known; a qualified builtin name under such a qualifier resolves only
-    /// through it.
+    /// Every spelling a source module owns holds an entry; a qualified type
+    /// under it resolves only through that entry, never from its spelling.
     pub qualified_types: Rc<BTreeMap<Symbol, BTreeMap<Symbol, crate::scope::QualifiedType>>>,
     /// What this module's imports installed: the modules, the owner of each
     /// spelling, the ambiguous spellings, and the TEA shape.

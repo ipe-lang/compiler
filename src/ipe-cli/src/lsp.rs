@@ -101,6 +101,7 @@ fn load_error(err: &CliError) -> LoadError {
         | CliError::CapabilityMismatch { .. }
         | CliError::Resolve(_)
         | CliError::LockRefused(_)
+        | CliError::IndexEntryRefused(_)
         | CliError::HashMismatch { .. }
         | CliError::Diff(_)
         | CliError::SemverRejected { .. }

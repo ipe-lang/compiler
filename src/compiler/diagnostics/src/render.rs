@@ -597,7 +597,7 @@ fn name_prose(msg: &NameError) -> String {
                 .to_string()
         }
         NameError::NameNotExposed { module, name, .. } => {
-            format!("`{module}` doesn't expose `{name}`, so you can't import it.")
+            format!("`{module}` doesn't expose `{name}`, so no other module can use it.")
         }
         NameError::ModulePathMismatch { .. } => {
             "This module's declared name doesn't match its path on disk.".to_string()
@@ -3126,6 +3126,26 @@ mod tests {
             msg,
         };
         assert_eq!(diag.code(), crate::code::IPE_N0034);
+    }
+
+    /// IPE-N0022 refuses both an `exposing (name)` import and a qualified
+    /// `Q.Name` use, so its prose names the privacy, never an import alone.
+    #[test]
+    fn name_not_exposed_prose_fits_an_import_and_a_qualified_use() {
+        let msg = NameError::NameNotExposed {
+            module: "Lib.Utils".into(),
+            name: "Helper".into(),
+            suggestions: Candidates::hints(Box::new([])),
+        };
+        assert_eq!(
+            name_prose(&msg),
+            "`Lib.Utils` doesn't expose `Helper`, so no other module can use it."
+        );
+        let diag = Diagnostic::Name {
+            span: Span::new(0, 6),
+            msg,
+        };
+        assert_eq!(diag.code(), crate::code::IPE_N0022);
     }
 
     fn con(name: &str) -> TyDoc {

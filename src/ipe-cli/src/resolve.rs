@@ -742,7 +742,11 @@ impl CheckedOutCommit {
         let args = ["rev-parse", "--verify", "--quiet", "HEAD^{commit}"];
         let head =
             git_step(&args, dest, transfer).map_err(|failed| failed.into_cli(name, &args))?;
-        let served = PinnedRev::from_full_sha(name, String::from_utf8_lossy(&head.stdout).trim())?;
+        let served = PinnedRev::from_full_sha(
+            name,
+            String::from_utf8_lossy(&head.stdout).trim(),
+            crate::index::RevSite::GitHead,
+        )?;
         Self::check(name, wanted, served)
     }
 
@@ -1694,7 +1698,9 @@ mod tests {
 
         // An escape dep: version 0.0.0 + 40-hex rev.
         let sha = "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2";
-        let pinned_sha = PinnedRev::from_full_sha(&pn("myescape"), sha).expect("valid sha");
+        let pinned_sha =
+            PinnedRev::from_full_sha(&pn("myescape"), sha, crate::index::RevSite::IndexEntry)
+                .expect("valid sha");
         let digest = Sha256Hex::parse(&pn("p"), &"0".repeat(64)).expect("valid digest");
         let escape_dep = LockedDep {
             name: PackageName::parse("myescape").expect("valid name"),
@@ -1714,7 +1720,8 @@ mod tests {
             origin: LockedOrigin::Index {
                 source: SourceUrl::parse(&pn("mypkg"), "https://example.invalid/mypkg")
                     .expect("valid url"),
-                rev: PinnedRev::from_full_sha(&pn("mypkg"), sha).expect("valid sha"),
+                rev: PinnedRev::from_full_sha(&pn("mypkg"), sha, crate::index::RevSite::IndexEntry)
+                    .expect("valid sha"),
             },
             sha256: digest,
         };

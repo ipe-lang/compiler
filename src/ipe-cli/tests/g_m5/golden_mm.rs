@@ -96,10 +96,10 @@ fn mm_diamond_emits_byte_identical_main_rs() {
 
 // ---------------------------------------------------------------------------
 // Positive: mm_qualtype_local_shadow — Main defines local `type Msg` AND
-// references `Counter.Msg` in a qualified annotation.  Exercises the
-// `qualifier_paths` fix: without it the canonicaliser resolved `Counter.Msg`
-// to Main's home (`["Main"]`) instead of Counter's (`["Counter"]`), causing
-// a IPE-T0001 type-mismatch at the unification site.
+// references `Counter.Msg` in a qualified annotation.  A qualified type
+// resolves through its dependency's export table, so `Counter.Msg` takes
+// Counter's home (`["Counter"]`), never Main's (`["Main"]`), which would be an
+// IPE-T0001 type-mismatch at the unification site.
 // ---------------------------------------------------------------------------
 
 #[test]

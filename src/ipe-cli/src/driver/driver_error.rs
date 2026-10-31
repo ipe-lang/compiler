@@ -241,6 +241,11 @@ pub enum CliError {
     /// path dependency that cannot be written into the lockfile. Boxed to keep
     /// `CliError` within its size ceiling.
     LockRefused(Box<crate::lockfile::LockRefusal>),
+    /// A registry index entry outside the closed entry grammar: a line that is
+    /// no field, an unknown or misplaced key, a malformed or repeated value, a
+    /// version listed twice, or a `name` naming another package. Boxed to keep
+    /// `CliError` within its size ceiling.
+    IndexEntryRefused(Box<crate::index::EntryRefusal>),
     /// A fetched package's content hash did not equal the hash the index pinned.
     /// This is the verify-before-trust boundary: a mismatch is always a hard,
     /// typed error — never a warning — because the source that was fetched is not
@@ -802,6 +807,7 @@ impl CliError {
             Self::CapabilityMismatch { .. } => "capability-mismatch",
             Self::Resolve(_) => "resolve",
             Self::LockRefused(_) => "lock-refused",
+            Self::IndexEntryRefused(_) => "index-entry-refused",
             Self::HashMismatch { .. } => "hash-mismatch",
             Self::Diff(_) => "diff",
             Self::SemverRejected { .. } => "semver-rejected",
@@ -902,6 +908,7 @@ impl CliError {
             | Self::CapabilityMismatch { .. }
             | Self::Resolve(_)
             | Self::LockRefused(_)
+            | Self::IndexEntryRefused(_)
             | Self::HashMismatch { .. }
             | Self::Diff(_)
             | Self::SemverRejected { .. }
@@ -1057,6 +1064,7 @@ impl std::fmt::Display for CliError {
             }
             Self::Resolve(message) => f.write_str(message),
             Self::LockRefused(refusal) => write!(f, "{refusal}"),
+            Self::IndexEntryRefused(refusal) => write!(f, "{refusal}"),
             Self::HashMismatch {
                 package,
                 expected,
