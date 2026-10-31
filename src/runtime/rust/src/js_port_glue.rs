@@ -236,12 +236,12 @@ const PORT_GLUE_JS_HEAD: &str = r#"  var onReceive = null;
   // carries its sink's `TAG_*` constant; every `Ipe.Browser.*.Internals`
   // decoder fails closed unless the tag is its own `portTag`, and `ipe.send`
   // refuses a page value carrying a reserved tag.
-  // When `corId` is non-null, the runtime-private `__ipe_id` field is added so
-  // the runtime routes this reply to the matching one-shot waiter rather than
+  // When `corId` is non-null, it is echoed untouched under `COR_ID_FIELD` so
+  // the runtime routes this reply to the waiter that minted it rather than
   // broadcasting it to `js_subscribe` subscribers.
   function reply(frame, corId) {
     if (corId !== null && corId !== undefined) {
-      frame.__ipe_id = corId;
+      frame[COR_ID_FIELD] = corId;
     }
     if (typeof window.__ipePortSend === "function") {
       try { window.__ipePortSend(JSON.stringify(frame)); }
@@ -1841,12 +1841,12 @@ const PORT_GLUE_JS_TAIL: &str = r#"    try {
   function deliver(raw) {
     var value;
     try { value = JSON.parse(raw); } catch (_e) { return false; /* drop a malformed frame */ }
-    // If this frame carries a correlation id, it is a `js_request` envelope:
-    // extract the id and the inner payload command, and pass the id through to
-    // the reply so the runtime can route it to the one-shot waiter.
+    // If this frame carries its own correlation token, it is a `js_request`
+    // envelope: extract the token and the inner payload command, and pass the
+    // token through to the reply so the runtime can route it to its waiter.
     var corId = null;
-    if (value && typeof value === "object" && "__ipe_id" in value) {
-      corId = value.__ipe_id;
+    if (value && typeof value === "object" && ownKey(value, COR_ID_FIELD)) {
+      corId = value[COR_ID_FIELD];
       value = value.payload !== undefined ? value.payload : value;
     }
     // A first-party browser-capability command is handled by its built-in sink;
@@ -1959,12 +1959,32 @@ pub const PERMISSION_NAMES: &[(&str, &str)] = &[
     ("MidiSysex", "midi"),
 ];
 
-/// The frame tag constants, the reserved tag set and the permission names.
+/// The reply-correlation key the glue reads and writes. It mirrors
+/// `js_port::COR_ID_FIELD`; the build-time check below pins the two wherever
+/// both modules compile (the build-time glue generator links no `js_port`).
+const COR_ID_FIELD: &str = "__ipe_id";
+
+#[cfg(all(
+    feature = "json",
+    any(
+        feature = "tokio",
+        all(target_arch = "wasm32", feature = "wasm-client")
+    )
+))]
+// IPE-RUST-AUDIT:ACCEPTED (Arthur Maciel) — compile-time `const` assertion (not a runtime panic); fails the BUILD if the glue's correlation key drifts from the one the runtime routes on [ledger #boundary]
+const _: () = assert!(crate::stringify::str_eq(
+    COR_ID_FIELD,
+    crate::js_port::COR_ID_FIELD
+));
+
+/// The frame tag constants, the correlation key, the reserved tag set and the
+/// permission names.
 fn frame_tags_js() -> Vec<String> {
     let mut lines: Vec<String> = FRAME_TAGS
         .iter()
         .map(|(name, wire)| format!("var {name} = {};", js_string(wire)))
         .collect();
+    lines.push(format!("var COR_ID_FIELD = {};", js_string(COR_ID_FIELD)));
     for cap in native_bridge::BridgeCap::ALL {
         lines.push(format!(
             "var {} = {};",
@@ -3102,6 +3122,34 @@ mod tests {
             js.matches("var TAG_").count(),
             FRAME_TAGS.len() + BridgeCap::ALL.len()
         );
+    }
+
+    /// The correlation key reaches the glue through its one constant binding,
+    /// read as an own property, never as a literal or a prototype-walking `in`.
+    #[test]
+    fn glue_reads_the_correlation_key_from_its_constant() {
+        let js = port_glue_js();
+        let binding = format!("  var COR_ID_FIELD = {};\n", js_string(COR_ID_FIELD));
+        assert_eq!(js.matches(binding.as_str()).count(), 1, "{binding}");
+        assert_eq!(js.matches("var COR_ID_FIELD ").count(), 1);
+        #[cfg(all(
+            feature = "json",
+            any(
+                feature = "tokio",
+                all(target_arch = "wasm32", feature = "wasm-client")
+            )
+        ))]
+        assert_eq!(COR_ID_FIELD, crate::js_port::COR_ID_FIELD);
+        assert_eq!(
+            js.matches("\"__ipe_id\"").count(),
+            1,
+            "only the binding names the key"
+        );
+        for literal in [".__ipe_id", "\" in value", "' in value"] {
+            assert_eq!(js.matches(literal).count(), 0, "{literal}");
+        }
+        assert_eq!(js.matches("ownKey(value, COR_ID_FIELD)").count(), 1);
+        assert_eq!(js.matches("frame[COR_ID_FIELD] = corId;").count(), 1);
     }
 
     /// Every reserved tag is emitted by a first-party sink, and the reserved set
