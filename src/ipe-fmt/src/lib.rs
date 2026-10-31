@@ -5001,16 +5001,16 @@ mod tests {
         );
     }
 
-    /// An end-of-line comment may move above its next code, never above any
-    /// other code.
+    /// An end-of-line comment may move onto its own line inside its
+    /// declaration, never into the run above the declaration's head.
     #[test]
-    fn verify_accepts_only_a_demotion_above_the_next_code() {
+    fn verify_accepts_only_a_demotion_inside_its_declaration() {
         let demoted = "module M exposing (x)\n\n\nx =\n    [ 1\n    -- one\n    , 2\n    ]\n";
         assert!(verify_rewrite(TRAILS_ONE, demoted).is_ok());
         let hoisted = "module M exposing (x)\n\n\n-- one\nx =\n    [ 1\n    , 2\n    ]\n";
         assert_eq!(
             rewrite_fault(TRAILS_ONE, hoisted),
-            Some((Owner::Decl(0), RunFault::Attachment))
+            Some((Owner::Decl(0), RunFault::HeadRun))
         );
     }
 

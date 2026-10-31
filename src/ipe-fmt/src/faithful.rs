@@ -121,23 +121,19 @@ struct Sides<'a> {
     output: Placement<'a>,
 }
 
-/// The text of `code`'s token starting at `lo` in `src`.
-fn token_text<'s>(code: &[CodeToken], src: &'s str, lo: usize) -> Option<&'s str> {
-    let i = code.partition_point(|t| t.lo < lo);
-    code.get(i)
-        .filter(|t| t.lo == lo)
-        .and_then(|t| src.get(t.lo..t.hi))
-}
-
 /// An end-of-line comment's identity: its owner token's text and its text.
 type TrailKey<'a> = (&'a str, CommentKey<'a>);
 
-/// A leading comment's identity: its anchor token's text and its text.
-type LeadKey<'a> = (Option<&'a str>, CommentKey<'a>);
-
 /// C4: every end-of-line comment of the output trails a token of the text its
 /// input owner had, and every input end-of-line comment the output does not
-/// keep prints above the code its input anchor names.
+/// keep prints as a leading comment.
+///
+/// A demoted comment prints where its layout's leading comments go (above
+/// its next code, or for a head position above or below the head), so C4
+/// matches it by text alone and C1–C3 then judge it as a leading comment of
+/// the input: it stays with its declaration, its neighbours and off any head
+/// run it did not start in. A comment that joins the end of any line it did
+/// not end is refused here.
 ///
 /// Both sides are classified by the same rule, from their text alone, so the
 /// check needs nothing from the printer and judges a caller's splice too.
@@ -182,12 +178,9 @@ fn attachment_kept<'a>(
         sides.input.kept.push(source);
         sides.output.kept.push(c);
     }
-    let mut leading_out: BTreeMap<LeadKey<'a>, usize> = BTreeMap::new();
+    let mut leading_out: BTreeMap<CommentKey<'a>, usize> = BTreeMap::new();
     for c in &sides.output.leading {
-        let anchor = c
-            .anchor()
-            .and_then(|a| token_text(&output.code, printed.output_src, a));
-        let count = leading_out.entry((anchor, c.key())).or_default();
+        let count = leading_out.entry(c.key()).or_default();
         *count = count.saturating_add(1);
     }
     kept_ords.sort_unstable();
@@ -196,12 +189,7 @@ fn attachment_kept<'a>(
             continue;
         }
         if c.owner().is_some() {
-            let anchor = c
-                .anchor()
-                .and_then(|a| token_text(&input.code, printed.input_src, a));
-            let demoted = leading_out
-                .get_mut(&(anchor, c.key()))
-                .filter(|count| **count > 0);
+            let demoted = leading_out.get_mut(&c.key()).filter(|count| **count > 0);
             let Some(count) = demoted else {
                 return Err(refuse(before.owner(c.anchor())));
             };
