@@ -1128,6 +1128,107 @@ mod tests {
         .expect("write Main.ipe");
     }
 
+    // Every `.ipe` file `ipe init` writes is an `ipe fmt` fixed point:
+    // `ipe verify` opens with `ipe fmt --check`, so a scaffold the formatter
+    // would rewrite fails verification before its author touches it. Each shape,
+    // runtime and the library scaffold renders through the same file builders
+    // `init` writes from, and each `.ipe` file is compared with the formatter's
+    // output, so a template edit or a formatter change that splits the two fails.
+
+    /// Project names reaching every hole fill.
+    ///
+    /// A plain name, one long enough to push the desktop title line past the
+    /// formatter's width, and names whose quote, backslash and non-ASCII letter the
+    /// literal escapes or the module name drops.
+    const FMT_SCAFFOLD_NAMES: [&str; 4] = [
+        "demo-app",
+        "a-project-name-long-enough-to-push-the-desktop-title-line-past-eighty-columns",
+        "we\"ird\\name",
+        "café",
+    ];
+
+    /// Whether `file` is one `ipe fmt` reads.
+    fn is_ipe(file: &ManagedFile) -> bool {
+        file.rel.extension().is_some_and(|ext| ext == "ipe")
+    }
+
+    /// Each `.ipe` file among `files` that is not its own formatted form, labelled
+    /// with `context`.
+    fn unformatted(context: &str, files: &[ManagedFile]) -> Vec<String> {
+        files
+            .iter()
+            .filter(|file| is_ipe(file))
+            .filter_map(|file| {
+                let rel = file.rel.display();
+                match crate::fmt::format_source(&file.content) {
+                    Ok(formatted) if formatted == file.content => None,
+                    Ok(formatted) => Some(format!(
+                        "{context} {rel}: `ipe fmt` rewrites it to:\n{formatted}"
+                    )),
+                    Err(e) => Some(format!("{context} {rel}: `ipe fmt` refuses it: {e:?}")),
+                }
+            })
+            .collect()
+    }
+
+    /// Assert `files` holds exactly the manifest and one `src` module.
+    ///
+    /// This keeps the fixed-point check from passing over a set it never read.
+    fn assert_two_ipe_files(context: &str, files: &[ManagedFile]) {
+        let ipe: Vec<&Path> = files
+            .iter()
+            .filter(|file| is_ipe(file))
+            .map(|file| file.rel.as_path())
+            .collect();
+        assert!(
+            matches!(ipe.as_slice(), [manifest, module]
+                if *manifest == Path::new("package.ipe") && module.starts_with("src")),
+            "{context}: expected package.ipe and one src module, got {ipe:?}"
+        );
+    }
+
+    #[test]
+    fn every_scaffolded_ipe_file_is_a_fmt_fixed_point() {
+        let mut failures = Vec::new();
+        for name in FMT_SCAFFOLD_NAMES {
+            for shape in InitShape::ALL {
+                for runtime in Runtime::ALL {
+                    let context = format!("{shape:?}/{runtime:?} `{name}`");
+                    let files = managed_files(name, shape, runtime);
+                    assert_two_ipe_files(&context, &files);
+                    failures.extend(unformatted(&context, &files));
+                }
+            }
+            let context = format!("--lib `{name}`");
+            let files = library_files(name);
+            assert_two_ipe_files(&context, &files);
+            failures.extend(unformatted(&context, &files));
+        }
+        assert!(
+            failures.is_empty(),
+            "scaffolded files `ipe fmt --check` rejects:\n\n{}",
+            failures.join("\n\n")
+        );
+    }
+
+    #[test]
+    fn an_unformatted_scaffold_file_is_reported() {
+        let files = [ManagedFile {
+            rel: Path::new("src").join("Main.ipe"),
+            content: "module Main exposing (main)\n\nimport Ipe.Task as Task\nimport Ipe.Io as Io\n\n\nmain : Task Error ()\nmain =\n    Io.println \"Hello, world!\"\n".to_owned(),
+        }];
+        assert_eq!(unformatted("refusal", &files).len(), 1);
+    }
+
+    #[test]
+    fn a_scaffold_file_fmt_refuses_is_reported() {
+        let files = [ManagedFile {
+            rel: PathBuf::from("package.ipe"),
+            content: "module Package exposing (package)\n\npackage =\n    {\n".to_owned(),
+        }];
+        assert_eq!(unformatted("refusal", &files).len(), 1);
+    }
+
     #[test]
     fn scaffolded_web_manifest_is_package_ipe_that_re_parses() {
         let files = managed_files("demo-app", InitShape::Web, Runtime::Served);
