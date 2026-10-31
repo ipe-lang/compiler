@@ -29,12 +29,11 @@ use std::collections::BTreeMap;
 use ipe_diagnostics::{TyDoc, render_ty};
 use ipe_intern::Interner;
 use ipe_syntax::{Exposed, Exposing};
-use ipe_types::{VarNamer, ty_to_doc};
+use ipe_types::{KernelScheme, VarNamer, kernel_type_table, ty_to_doc};
 
 use crate::api_surface::{self, ModuleApi};
 use crate::coverage::contract::{SchemeState, StdlibSymbol, Surface, SymbolKind};
 use crate::coverage::error::CoverageError;
-use crate::kernel_schemes::{self, KernelScheme, KernelSchemeError};
 
 /// A kernel qualifier's module path, keyed by the dotted name or qualifier a
 /// [`kernel_module_path`] lookup table joins against.
@@ -482,23 +481,11 @@ fn merge_kernels(by_key: &mut BTreeMap<Key, StdlibSymbol>) -> Result<(), Coverag
         qualifier_lookup_tables();
 
     let mut interner = Interner::new();
-    let schemes = kernel_schemes::kernel_schemes(&mut interner).map_err(|e| match e {
-        KernelSchemeError::Table(d) => CoverageError::KernelTable(d),
-        KernelSchemeError::Drift {
-            kernel,
-            shape_declared,
-            in_table,
-        } => CoverageError::KernelTableDrift {
-            kernel,
-            shape_declared,
-            in_table,
-        },
-        KernelSchemeError::Duplicate { kernel } => CoverageError::KernelTableDuplicate { kernel },
-    })?;
+    let table = kernel_type_table(&mut interner).map_err(CoverageError::KernelTable)?;
 
-    // `kernel_schemes` yields every kernel exactly once, so iterating it (not
+    // The table holds one row per wired kernel, so iterating its rows (not
     // `StdlibKernel::ALL` plus a lookup) leaves no "absent" arm to default.
-    for (kernel, scheme) in schemes {
+    for (kernel, scheme) in table.rows() {
         let def = kernel.def();
         let module = match kernel_module_path(
             def.qualifier,
@@ -515,7 +502,7 @@ fn merge_kernels(by_key: &mut BTreeMap<Key, StdlibSymbol>) -> Result<(), Coverag
         let (scheme, is_higher_order) = match scheme {
             KernelScheme::Schemed(ty) => {
                 let mut namer = VarNamer::new();
-                let doc = ty_to_doc(&ty, &interner, &mut namer)
+                let doc = ty_to_doc(ty, &interner, &mut namer)
                     .map_err(|source| CoverageError::RenderScheme { kernel, source })?;
                 let higher_order = scheme_is_higher_order(&doc);
                 (SchemeState::Rendered(render_ty(&doc)), higher_order)

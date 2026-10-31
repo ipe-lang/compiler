@@ -271,18 +271,14 @@ fn project_interface(
     let mut values = BTreeMap::new();
     let mut value_types = BTreeMap::new();
     for (name, scheme) in &interface.values {
-        let Some(name) = interner.resolve(*name) else {
-            continue;
-        };
+        let name = interface_name(interner, *name, module)?;
         let doc = signature_doc(&scheme.ty, interner).map_err(typecheck_err)?;
         values.insert(name.to_owned(), render_ty(&doc));
         value_types.insert(name.to_owned(), doc);
     }
     let mut unbacked_kernel_aliases = BTreeSet::new();
     for (name, scheme) in kernel_aliases {
-        let Some(name) = interner.resolve(*name) else {
-            continue;
-        };
+        let name = interface_name(interner, *name, module)?;
         if values.contains_key(name) {
             continue;
         }
@@ -300,15 +296,11 @@ fn project_interface(
 
     let mut unions = BTreeMap::new();
     for union in &interface.unions {
-        let Some(name) = interner.resolve(union.name) else {
-            continue;
-        };
+        let name = interface_name(interner, union.name, module)?;
         let mut ctors = BTreeMap::new();
         let mut ctor_types = BTreeMap::new();
         for ctor in &union.ctors {
-            let Some(ctor_name) = interner.resolve(ctor.name) else {
-                continue;
-            };
+            let ctor_name = interface_name(interner, ctor.name, module)?;
             let mut args = Vec::with_capacity(ctor.args.len());
             let mut arg_docs = Vec::with_capacity(ctor.args.len());
             for arg in &ctor.args {
@@ -333,6 +325,28 @@ fn project_interface(
         value_types,
         unions,
         unbacked_kernel_aliases,
+    })
+}
+
+/// The spelling of an exported name, refusing a symbol the interner lacks.
+///
+/// A name that does not resolve is never skipped: a dropped export is absent
+/// on both sides of an API comparison, so its removal would read as no change.
+fn interface_name<'i>(
+    interner: &'i ipe_intern::Interner,
+    name: ipe_intern::Symbol,
+    module: &ModulePath,
+) -> Result<&'i str, DiffError> {
+    interner.resolve(name).ok_or_else(|| DiffError::Typecheck {
+        module: module.clone(),
+        diag: Box::new(Diagnostic::CompilerBug {
+            where_: "api_surface.interface_name",
+            detail: format!(
+                "exported name symbol {} of module `{}` is not in the interner",
+                name.as_raw(),
+                module.join(".")
+            ),
+        }),
     })
 }
 
@@ -607,8 +621,9 @@ fn extract_from_db(
 
 /// The exported kernel aliases of `file`, each paired with its kernel's scheme.
 ///
-/// An alias whose kernel has no scheme in the table is left out: it is not
-/// callable, and the surface carries only values with a checker signature.
+/// Each alias's scheme is its kernel's table row, read through
+/// [`alias_scheme`]: an unschemed kernel is [`AliasScheme::Unbacked`] (not
+/// callable, so the surface carries no checker signature for it).
 fn exported_kernel_aliases(
     db: &ipe_db::IpeDatabase,
     source_root: ipe_db::SourceRoot,
@@ -633,24 +648,29 @@ fn exported_kernel_aliases(
         .kernel_aliases
         .iter()
         .map(|(name, alias)| {
-            if alias.id.scheme_shape().is_none() {
-                return Ok((*name, AliasScheme::Unbacked));
-            }
-            table
-                .iter()
-                .find(|(kernel, _)| *kernel == alias.id)
-                .map(|(_, ty)| (*name, AliasScheme::Kernel(ty.clone())))
-                .ok_or_else(|| {
-                    typecheck_err(Diagnostic::CompilerBug {
-                        where_: "api_surface.kernel_alias",
-                        detail: format!(
-                            "kernel {:?} has a scheme shape but no kernel type table row",
-                            alias.id
-                        ),
-                    })
-                })
+            alias_scheme(&table, alias.id)
+                .map(|scheme| (*name, scheme))
+                .map_err(typecheck_err)
         })
         .collect()
+}
+
+/// An exported kernel alias's scheme, read from its kernel's table row.
+///
+/// A kernel with no row is not wired, so an alias naming it is a compiler bug,
+/// never a silently unbacked value.
+fn alias_scheme(
+    table: &ipe_types::KernelSchemeTable,
+    kernel: ipe_kernels::StdlibKernel,
+) -> Result<AliasScheme, Diagnostic> {
+    match table.scheme(kernel) {
+        Some(ipe_types::KernelScheme::Schemed(ty)) => Ok(AliasScheme::Kernel(ty.clone())),
+        Some(ipe_types::KernelScheme::Unschemed) => Ok(AliasScheme::Unbacked),
+        None => Err(Diagnostic::CompilerBug {
+            where_: "api_surface.kernel_alias",
+            detail: format!("kernel {kernel:?} has no kernel type table row"),
+        }),
+    }
 }
 
 /// Why a module has no typed interface: a red program or an open one.
@@ -823,5 +843,142 @@ mod tests {
         let walked = extract_walked(&tree).expect("walked api");
         let sources = extract_sources(&tree.modules).expect("sources api");
         assert_eq!(walked, sources);
+    }
+
+    /// Every kernel-table state maps to its own alias scheme: an unschemed row
+    /// is unbacked, a schemed row carries its scheme, and an unwired kernel
+    /// (no row) is a compiler bug rather than a silently unbacked value.
+    #[test]
+    fn alias_scheme_names_every_table_state() {
+        let mut interner = ipe_intern::Interner::new();
+        let table = ipe_types::kernel_type_table(&mut interner).expect("the kernel table derives");
+        let unschemed = table.rows().find_map(|(kernel, scheme)| {
+            matches!(scheme, ipe_types::KernelScheme::Unschemed).then_some(kernel)
+        });
+        let schemed = table.schemed().next().map(|(kernel, _)| kernel);
+        assert!(
+            unschemed.is_some() && schemed.is_some(),
+            "the live table must carry both an unschemed and a schemed row"
+        );
+        let (Some(unschemed), Some(schemed)) = (unschemed, schemed) else {
+            return;
+        };
+        assert!(matches!(
+            alias_scheme(&table, unschemed),
+            Ok(AliasScheme::Unbacked)
+        ));
+        assert!(matches!(
+            alias_scheme(&table, schemed),
+            Ok(AliasScheme::Kernel(_))
+        ));
+        assert!(matches!(
+            alias_scheme(&table, ipe_kernels::StdlibKernel::TaskRun),
+            Err(Diagnostic::CompilerBug {
+                where_: "api_surface.kernel_alias",
+                ..
+            })
+        ));
+    }
+
+    /// An exported value or kernel alias whose name the interner cannot
+    /// resolve refuses the projection instead of vanishing from the surface.
+    #[test]
+    fn project_interface_refuses_an_uninterned_export_name() {
+        let interner = ipe_intern::Interner::new();
+        let mut foreign_interner = ipe_intern::Interner::new();
+        let foreign = foreign_interner
+            .intern("internedElsewhere")
+            .expect("intern a foreign name");
+        let module: ModulePath = vec!["Lib".to_owned()];
+        let empty = TypedInterface {
+            values: BTreeMap::new(),
+            unions: Vec::new(),
+            reachable_unions: Vec::new(),
+        };
+        let with_value = TypedInterface {
+            values: std::iter::once((
+                foreign,
+                ipe_types::TypedScheme {
+                    ty: Ty::Unit,
+                    bounds: BTreeMap::new(),
+                    wildcard_pins: BTreeMap::new(),
+                },
+            ))
+            .collect(),
+            ..empty.clone()
+        };
+        let refused = |result: &Result<ModuleApi, DiffError>| {
+            matches!(
+                result,
+                Err(DiffError::Typecheck { diag, .. })
+                    if matches!(
+                        **diag,
+                        Diagnostic::CompilerBug {
+                            where_: "api_surface.interface_name",
+                            ..
+                        }
+                    )
+            )
+        };
+        let value = project_interface(&with_value, &[], &interner, &module);
+        assert!(refused(&value), "an uninterned value name: {value:?}");
+        let alias = project_interface(
+            &empty,
+            &[(foreign, AliasScheme::Unbacked)],
+            &interner,
+            &module,
+        );
+        assert!(
+            refused(&alias),
+            "an uninterned kernel alias name: {alias:?}"
+        );
+
+        let union_of = |name, ctor| ipe_canon::ast::Union {
+            home: Vec::new(),
+            name,
+            name_span: ipe_diagnostics::Span::DUMMY,
+            vars: Vec::new(),
+            ctors: vec![ipe_canon::ast::Ctor {
+                name: ctor,
+                index: 0,
+                arity: 0,
+                args: Vec::new(),
+                span: ipe_diagnostics::Span::DUMMY,
+            }],
+        };
+        let with_union = |def| TypedInterface {
+            unions: vec![def],
+            ..empty.clone()
+        };
+        let union_name = project_interface(
+            &with_union(union_of(foreign, foreign)),
+            &[],
+            &interner,
+            &module,
+        );
+        assert!(
+            refused(&union_name),
+            "an uninterned union name: {union_name:?}"
+        );
+
+        let mut named = ipe_intern::Interner::new();
+        let color = named.intern("Color").expect("intern the union name");
+        let uninterned_ctor = foreign_interner
+            .intern("Red")
+            .expect("intern a second foreign name");
+        assert!(
+            named.resolve(uninterned_ctor).is_none(),
+            "the constructor symbol must be foreign to `named`"
+        );
+        let ctor_name = project_interface(
+            &with_union(union_of(color, uninterned_ctor)),
+            &[],
+            &named,
+            &module,
+        );
+        assert!(
+            refused(&ctor_name),
+            "an uninterned constructor name: {ctor_name:?}"
+        );
     }
 }
