@@ -109,6 +109,11 @@ ed25519-dalek = { version = "2", default-features = false, features = ["zeroize"
 base64 = "0.22"
 zeroize = "1"
 serde_json = "1"
+# The registry JSON mirror decodes through a strict `serde::de::Visitor`
+# (`index.rs`) that refuses a repeated object key `serde_json::Value` would
+# read last-wins. `serde_json` already links this exact crate, so naming it
+# adds nothing to the vetted dependency graph.
+serde = "1"
 # `[dependencies]` version requirements in `ipe.toml` are parsed into typed
 # `semver::VersionReq` at manifest-parse time (parse, don't validate).
 semver = "1"
