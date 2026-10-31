@@ -1248,12 +1248,11 @@ fn builtin_witness_legal_arity_compiles_under_every_spelling() {
 const UNRELATED_MODULE: &str = "Ipe.Length";
 
 /// `Int` once per type argument a legal use of `row` takes; an effect carrier
-/// takes its error and its value.
+/// takes its one value argument.
 fn legal_int_args(row: &ipe_kernels::BuiltinRow) -> String {
     let count = match row.params() {
         ipe_kernels::TypeParams::Exact(n) => usize::from(n),
-        ipe_kernels::TypeParams::OptionalMessage => 1,
-        ipe_kernels::TypeParams::InferredCarrier => 2,
+        ipe_kernels::TypeParams::OptionalMessage | ipe_kernels::TypeParams::InferredCarrier => 1,
     };
     vec!["Int"; count].join(" ")
 }
