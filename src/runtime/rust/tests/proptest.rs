@@ -268,6 +268,68 @@ mod json_tests {
         let decoded = ipe_runtime_rust::json::decode_from_json_string(decoder, encoded);
         assert_eq!(decoded, IpeResult::Ok(true));
     }
+
+    /// A malformed (not just wrong-shaped) JSON string must fail `Decode`,
+    /// never the generic `Unexpected` the bare `From<String>` bridge would
+    /// otherwise yield — regression for #3949 (a client's bad input was
+    /// surfacing as a server-side `Unexpected`, so a 400-mapping handler
+    /// answered 500 instead).
+    fn assert_decode_kind(source: &str) {
+        let decoder: Decoder<IpeError, i64> = ipe_runtime_rust::json::json_decode_int();
+        let decoded = ipe_runtime_rust::json::decode_from_json_string(decoder, source.to_string());
+        match decoded {
+            IpeResult::Err(e) => {
+                assert_eq!(
+                    ipe_error_kind(e.clone()),
+                    IpeErrorKind::Decode,
+                    "source {source:?} gave {e:?}, not the Decode kind"
+                );
+                let message = ipe_error_message(e);
+                assert!(
+                    message.starts_with("json parse:"),
+                    "source {source:?} gave message {message:?}"
+                );
+            }
+            IpeResult::Ok(v) => panic!("source {source:?} should not decode, got {v:?}"),
+        }
+    }
+
+    #[test]
+    fn json_truncated_object_is_decode_not_unexpected() {
+        // Cut off right after the opening brace — no value at all.
+        assert_decode_kind("{");
+    }
+
+    #[test]
+    fn json_unterminated_string_is_decode_not_unexpected() {
+        assert_decode_kind("\"unterminated");
+    }
+
+    #[test]
+    fn json_trailing_comma_is_decode_not_unexpected() {
+        assert_decode_kind("[1, 2,]");
+    }
+
+    #[test]
+    fn json_empty_input_is_decode_not_unexpected() {
+        assert_decode_kind("");
+    }
+
+    #[test]
+    fn json_garbage_token_is_decode_not_unexpected() {
+        // The exact #3949 repro: a POST body that is not JSON at all.
+        assert_decode_kind("garbage");
+    }
+
+    /// Well-formed JSON must keep decoding cleanly after the fix — same
+    /// decoder, a value this time, same assertion shape as the roundtrip
+    /// tests above.
+    #[test]
+    fn json_well_formed_still_decodes_ok() {
+        let decoder: Decoder<IpeError, i64> = ipe_runtime_rust::json::json_decode_int();
+        let decoded = ipe_runtime_rust::json::decode_from_json_string(decoder, "42".to_string());
+        assert_eq!(decoded, IpeResult::Ok(42));
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════

@@ -833,13 +833,19 @@ pub fn decode_key_value_pairs<E: From<String> + 'static, T: 'static + Send>(
         vec![],
     )
 }
-pub fn decode_from_json_string<E: From<String> + 'static, T>(
+pub fn decode_from_json_string<E: FromDecodeError + 'static, T>(
     decoder: Decoder<E, T>,
     json: String,
 ) -> IpeResult<E, T> {
     match serde_json::from_str(&json) {
         Ok(val) => (decoder.run)(&val),
-        Err(e) => decode_err_str(format!("json parse: {}", e)),
+        // A syntax failure (truncated input, an unterminated string, a
+        // trailing comma, …) never reaches the decoder at all — it is
+        // malformed before shape is even checked. Classify it `Decode`
+        // directly instead of the `From<String>` bridge's `Unexpected`, so a
+        // caller's `Error.kind` distinguishes bad client input from a
+        // server-side fault the same way a shape mismatch already does.
+        Err(e) => IpeResult::Err(E::from_decode_error(format!("json parse: {}", e))),
     }
 }
 

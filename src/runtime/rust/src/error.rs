@@ -730,6 +730,37 @@ impl FromLimitExceeded for String {
     }
 }
 
+/// A generic `E: From<String>` error sink that can classify a refusal as
+/// `Decode`.
+///
+/// The blanket `From<String>` bridge yields `Unexpected`; a decode-boundary
+/// failure — a value that is the wrong shape, or text that does not even
+/// parse as the wire format it claims to be (malformed JSON, an unterminated
+/// string, a trailing comma) — reaching such a sink goes through this trait
+/// instead, so it keeps the `Decode` kind a caller can distinguish from a
+/// server-side fault. Implemented for `IpeError`, as `FromLimitExceeded` is
+/// (unit tests add the bare `String` sink below).
+pub trait FromDecodeError {
+    fn from_decode_error(message: String) -> Self;
+}
+
+impl FromDecodeError for IpeError {
+    fn from_decode_error(message: String) -> Self {
+        Self::decode(message)
+    }
+}
+
+/// A unit test's bare-`String` error sink keeps only the message.
+///
+/// Kind assertions in tests use an `IpeError` sink, so a `String` sink can
+/// never be mistaken for one that proves the `Decode` kind.
+#[cfg(all(test, not(target_arch = "wasm32")))]
+impl FromDecodeError for String {
+    fn from_decode_error(message: String) -> Self {
+        message
+    }
+}
+
 /// A declared ceiling turned the input back.
 ///
 /// The message names the ceiling and, when one exists, the setting that
