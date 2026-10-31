@@ -810,12 +810,11 @@ pub fn linked_program(db: &dyn Db, root: SourceRoot, entry: SourceFile) -> Linke
 }
 
 /// The memoized kernel type-scheme table.
-pub type KernelTypesResult =
-    Result<Arc<Vec<(ipe_kernels::StdlibKernel, ipe_types::Ty)>>, Diagnostic>;
+pub type KernelTypesResult = Result<Arc<ipe_types::KernelSchemeTable>, Diagnostic>;
 
-/// The kernel type-scheme table: every schemed
-/// [`ipe_kernels::StdlibKernel`] paired with the inference scheme
-/// constraint generation applies at its call sites, materialized once per
+/// The kernel type-scheme table: every wired [`ipe_kernels::StdlibKernel`],
+/// schemed or explicitly unschemed, with the inference scheme constraint
+/// generation applies at its call sites, materialized once per
 /// database via [`ipe_types::kernel_type_table`] (the same code path
 /// inference reads — no second scheme table to drift).
 ///
