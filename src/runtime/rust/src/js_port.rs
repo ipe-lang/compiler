@@ -1286,7 +1286,7 @@ pub use native::{
 // Consumed only by the `web`-gated `per_session` test submodule below; gate the
 // re-export to match so a `db`-without-`web` test build has no unused import.
 #[cfg(all(not(target_arch = "wasm32"), test, feature = "web"))]
-pub(crate) use native::{SessionPorts, lock_sessions, open_session_with_mint, request_with_mint};
+pub(crate) use native::{lock_sessions, open_session_with_mint, request_with_mint};
 
 // ─── Wasm (browser) transport ──────────────────────────────────────────────
 //
