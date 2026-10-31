@@ -381,6 +381,36 @@ fn write_frozen_memfd(
 /// Some(argv.args().len())
 /// # }
 /// ```
+///
+/// And a payload argv cannot be built without one — no filter, no argv:
+///
+/// ```compile_fail,E0308
+/// # use std::ffi::OsString;
+/// # use std::path::Path;
+/// # use ipe_sandbox::run_jail::{BwrapTools, RunJailTools, SandboxProfile, prove, run_jail_argv};
+/// # use ipe_sandbox::{CanonicalPath, HostTool, JailMounts, host_tool};
+/// # fn unfiltered() -> Option<usize> {
+/// # let tools = RunJailTools::Bwrap(BwrapTools {
+/// #     bwrap: host_tool::resolve(HostTool::Bwrap).ok()?,
+/// #     prlimit: host_tool::resolve(HostTool::Prlimit).ok()?,
+/// #     timeout: None,
+/// # });
+/// # let scope = prove(&tools).ok()?;
+/// # let root = CanonicalPath::resolve(Path::new("/")).ok()?;
+/// # let mounts = JailMounts::of_invoker(root.clone(), root, Vec::new()).ok()?;
+/// # let no_env = |_: &str| None;
+/// let argv = run_jail_argv(
+///     &scope,
+///     &SandboxProfile::maximally_isolated(),
+///     &mounts,
+///     None,
+///     &no_env,
+///     &[OsString::from("app")],
+/// )
+/// .ok()?;
+/// Some(argv.args().len())
+/// # }
+/// ```
 pub struct SealedSeccompFd {
     fd: OwnedFd,
 }

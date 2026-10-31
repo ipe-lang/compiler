@@ -628,7 +628,11 @@ fn the_inspection_jail_refuses_unshare() {
         rustup_home: None,
         limits: ipe_sandbox::ResourceLimits::default(),
     };
-    let (control, refused) = {
+    // `clone3` answers `EINVAL` unfiltered (a zero-size `clone_args`) whatever
+    // the host's user-namespace policy, so this probe goes red without the
+    // filter even where the host itself already refuses a nested namespace.
+    let clone3 = python3().map(|py| errno_probe(py, NR_CLONE3, "0,0", ENOSYS));
+    let (control, refused, clone3) = {
         let _guard = JAIL_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let control = ipe_sandbox::run_in_bwrap_jail(&caps, &spec, &[OsString::from("/bin/true")]);
         let refused = ipe_sandbox::run_in_bwrap_jail(
@@ -636,7 +640,8 @@ fn the_inspection_jail_refuses_unshare() {
             &spec,
             &[unshare, "-U", "/bin/true"].map(OsString::from),
         );
-        (control, refused)
+        let clone3 = clone3.map(|probe| ipe_sandbox::run_in_bwrap_jail(&caps, &spec, &probe));
+        (control, refused, clone3)
     };
     let _ = std::fs::remove_dir_all(&scoped);
     // Control: the inspection jail runs a payload, so the refusal below is the
@@ -647,12 +652,20 @@ fn the_inspection_jail_refuses_unshare() {
         "the inspection jail must run a no-op payload: {control:?}"
     );
     let refused = refused.expect("the inspection jail runs");
-    assert_ne!(
-        refused.status,
-        Some(0),
-        "`unshare -U` must be refused inside the inspection jail: {}",
-        String::from_utf8_lossy(&refused.stderr)
+    let stderr = String::from_utf8_lossy(&refused.stderr);
+    assert!(
+        refused.status != Some(0) && stderr.contains("Operation not permitted"),
+        "`unshare -U` must be refused with EPERM inside the inspection jail \
+         (status {:?}): {stderr}",
+        refused.status
     );
+    if let Some(clone3) = clone3 {
+        assert_eq!(
+            clone3.as_ref().map(|out| out.status),
+            Ok(Some(0)),
+            "clone3 must fail ENOSYS inside the inspection jail: {clone3:?}"
+        );
+    }
 }
 
 /// The skip gate itself, tested without needing a broken environment: only a

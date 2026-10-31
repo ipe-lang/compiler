@@ -622,7 +622,7 @@ fn run_in_filtered_bwrap_jail(
 /// sealed fd and has already made it inheritable, so bwrap reads the filter
 /// from it across the exec.
 // Reached only through the seccomp-carrying jail, which exists only where a
-// filter can be compiled; elsewhere the fd type is uninhabited.
+// filter can be compiled; elsewhere nothing calls it.
 #[cfg_attr(
     not(all(
         target_os = "linux",

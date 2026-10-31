@@ -727,7 +727,11 @@ mod tests {
         assert_eq!(folded, CLONE_NEW_MASK);
         assert_eq!(CLONE_NEW_MASK, 0x7E02_0000);
         assert_eq!(
-            NAMESPACE_FLAGS.iter().copied().map(u32::count_ones).sum::<u32>(),
+            NAMESPACE_FLAGS
+                .iter()
+                .copied()
+                .map(u32::count_ones)
+                .sum::<u32>(),
             CLONE_NEW_MASK.count_ones(),
             "each namespace flag is one distinct bit"
         );

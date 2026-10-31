@@ -416,15 +416,14 @@ fn a_spawned_subprocess_cannot_escape_the_jail() {
     if jail_or_skip("a_spawned_subprocess_cannot_escape_the_jail").is_none() {
         return;
     }
-    // The honest guarantee (see docs/topics/playground.md threat model): the run jail's
-    // seccomp filter denies the legacy `fork`/`vfork`/`clone` subprocess paths but
-    // NOT `clone3` — which `posix_spawn` uses on modern glibc — because the tokio
-    // runtime creates its threads via `clone3` and seccomp cannot inspect its
-    // pointer-borne flags. So a subprocess CAN start, but it inherits the SAME
-    // bubblewrap namespace: it is net-denied, filesystem-jailed to the scratch
-    // bind, and bounded by the same `prlimit` caps — it gains NO capability the
-    // parent lacked. This probe spawns a child that tries to read a host file
-    // OUTSIDE the jail; the child must be denied exactly as the parent would be.
+    // The run jail's seccomp filter denies the `fork`/`vfork`/process-`clone`
+    // paths and answers `clone3` with `ENOSYS`, so glibc's `posix_spawn` falls
+    // back to a process `clone` and is refused: the spawn is expected to fail.
+    // Should any child start anyway, it inherits the SAME bubblewrap namespace:
+    // it is net-denied, filesystem-jailed to the scratch bind, and bounded by
+    // the same `prlimit` caps — it gains NO capability the parent lacked. This
+    // probe spawns a child that tries to read a host file OUTSIDE the jail; the
+    // child must be denied exactly as the parent would be.
     let secret = repo_root().join("PRINCIPLES.md");
     let probe = format!(
         r#"
