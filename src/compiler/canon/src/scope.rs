@@ -350,13 +350,31 @@ impl BoundBuiltin {
     }
 }
 
-/// A type a source-module dependency exports, as a qualified use reads it.
+/// A type name a source-module dependency declares, as a qualified use reads it.
+///
+/// A name absent from the table is one the dependency neither declares nor
+/// exports.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum QualifiedType {
-    /// A builtin row the dependency re-exports.
+    /// A builtin row the dependency exports, at the export's home.
     Builtin(BoundBuiltin),
-    /// A union the dependency declares.
-    Union,
+    /// A union the dependency exports, at the export's home.
+    Union(Vec<Symbol>),
+    /// An alias the dependency exports, under its synthetic `Q.Name` key.
+    Alias,
+    /// A union or alias the dependency declares and does not export.
+    Private,
+}
+
+impl QualifiedType {
+    /// Whether a qualified use may name this type.
+    #[must_use]
+    pub const fn is_exported(&self) -> bool {
+        match self {
+            Self::Builtin(_) | Self::Union(_) | Self::Alias => true,
+            Self::Private => false,
+        }
+    }
 }
 
 /// The two module-level bare-name namespaces of the module being canonicalised.

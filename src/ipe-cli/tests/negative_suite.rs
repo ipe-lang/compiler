@@ -2271,6 +2271,108 @@ fn canon_duplicate_qualifier() {
     }
 }
 
+/// A dependency that exports the union `Box` and declares the private union
+/// `Hidden` and the private alias `Tally`.
+const QUALIFIED_DEP: &str = "module Dep exposing (Box, box)\n\n\
+                             type Box = Box Int\n\n\
+                             type Hidden = Hidden Int\n\n\
+                             type alias Tally = Int\n\n\
+                             box : Box\nbox =\n    Box 1\n";
+
+/// A `Main` whose `f` takes a `ty` under `import Dep as D`.
+fn qualified_type_main(ty: &str) -> String {
+    format!(
+        "{HEAD}\nimport Dep as D\nimport Ipe.Io as Io\n\n\
+         f : {ty} -> Int\nf _ =\n    0\n\n\
+         main = Io.println \"ok\"\n"
+    )
+}
+
+/// Compile `QUALIFIED_DEP` plus a `Main` naming `ty`; the outcome.
+fn compile_qualified_type(name: &str, ty: &str) -> Outcome {
+    compile_project(
+        name,
+        &[
+            ("Dep.ipe", QUALIFIED_DEP),
+            ("Main.ipe", &qualified_type_main(ty)),
+        ],
+    )
+}
+
+/// Assert `ty` under `import Dep as D` is refused with `expected`.
+#[track_caller]
+fn assert_qualified_type_rejected(name: &str, ty: &str, expected: &str) {
+    match compile_qualified_type(name, ty) {
+        Outcome::Rejected(got) => assert_eq!(
+            got, expected,
+            "{name}: expected {expected}, got {got} — WRONG reason"
+        ),
+        Outcome::Accepted(how) => fail_accepted(name, expected, &how),
+    }
+}
+
+/// A qualified type the dependency does not declare is IPE-N0005, never a
+/// union minted at the dependency's home.
+#[test]
+fn canon_qualified_undeclared_type_is_no_such_member() {
+    assert_qualified_type_rejected("canon_qualified_undeclared", "D.Nope", "IPE-N0005");
+}
+
+/// A union the dependency declares and does not expose is IPE-N0022.
+#[test]
+fn canon_qualified_private_union_is_not_exposed() {
+    assert_qualified_type_rejected("canon_qualified_private_union", "D.Hidden", "IPE-N0022");
+}
+
+/// An alias the dependency declares and does not expose is IPE-N0022.
+#[test]
+fn canon_qualified_private_alias_is_not_exposed() {
+    assert_qualified_type_rejected("canon_qualified_private_alias", "D.Tally", "IPE-N0022");
+}
+
+/// A builtin row name the dependency neither declares nor exports is
+/// IPE-N0005 whatever the row's role: a non-reserved row (`Value`, `Order`)
+/// is never minted as the dependency's union.
+#[test]
+fn canon_qualified_unexported_row_name_is_no_such_member() {
+    for ty in ["D.Value", "D.Order", "D.Algorithm"] {
+        assert_qualified_type_rejected(
+            &format!("canon_qualified_row_{}", ty.trim_start_matches("D.")),
+            ty,
+            "IPE-N0005",
+        );
+    }
+}
+
+/// The exported union resolves through its qualifier.
+#[test]
+fn canon_qualified_exported_union_compiles() {
+    match compile_qualified_type("canon_qualified_exported_union", "D.Box") {
+        Outcome::Accepted(how) => assert!(
+            how.starts_with("compiled successfully"),
+            "canon_qualified_exported_union: a non-pipeline failure ({how})"
+        ),
+        Outcome::Rejected(got) => assert!(
+            false_marker(),
+            "canon_qualified_exported_union: `D.Box` is exported, but ipe REJECTED it with {got}"
+        ),
+    }
+}
+
+/// `Basics.Order` names the builtin `Ipe.Basics` exposes, and its
+/// constructors match it exhaustively.
+#[test]
+fn canon_qualified_basics_order_compiles() {
+    let src = format!(
+        "{HEAD}\nimport Ipe.Basics as Basics\nimport Ipe.Io as Io\nimport Ipe.String as String\n\n\
+         rank : Basics.Order -> Int\nrank o =\n    case o of\n        \
+         LT ->\n            0\n\n        EQ ->\n            1\n\n        \
+         GT ->\n            2\n\n\
+         main = Io.println (String.fromInt (rank (compare 1 2)))\n"
+    );
+    assert_compiles("canon_qualified_basics_order", &src);
+}
+
 /// An `Kernel.kernel "Name"` alias in USER source — minting a kernel is reserved to
 /// the vouched stdlib / FFI interface, so it is rejected by the origin gate
 /// (IPE-N0042) before the registry is consulted, whether or not the named kernel

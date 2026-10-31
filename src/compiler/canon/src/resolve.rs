@@ -401,16 +401,6 @@ struct TypeCtx<'a> {
     /// The module environment; a bare type name resolves through its
     /// [`ModuleScope`] type namespace.
     env: &'a Env,
-    /// Maps each import qualifier (the short name used in `Q.TypeName` type
-    /// annotations) to the full dep-module path.  Built from the module's
-    /// `import` declarations in [`canonicalise_module_with_origin`].
-    ///
-    /// A `TType(qualifier, segments, args)` node whose qualifier a source
-    /// module owns takes its `home` from this map, so `Counter.Msg` gets
-    /// `home = ["Counter"]` regardless of whether the current module also
-    /// defines a local `type Msg`. A kernel-module qualifier reads
-    /// [`Env::kernel_types`] instead.
-    qualifier_paths: &'a BTreeMap<Symbol, Vec<Symbol>>,
     /// The dependency aliases reachable as `Q.Name`.
     qualified_aliases: &'a QualifiedAliases,
     interner: &'a Interner,
@@ -462,12 +452,6 @@ pub fn canonicalise(m: &src::Module, interner: &mut Interner) -> DResult<canon::
     for import in &m.imports {
         bind_stdlib_kernel_import(import, &mut env, interner)?;
     }
-    // Single-module has no deps, so no user qualifiers to map — but a Html-family
-    // STDLIB import qualifier (`import Ipe.Html.Attributes as Attr`) still needs
-    // its `["Html"]` type home folded so a qualified `Attr.Attribute` lowers to
-    // `html::Attribute`.
-    let mut qualifier_paths: BTreeMap<Symbol, Vec<Symbol>> = BTreeMap::new();
-    fold_html_stdlib_qualifier_homes(&m.imports, &env, &mut qualifier_paths, interner)?;
     // The bare single-module entry is always ordinary USER source: the trust tag
     // can only be raised via `canonicalise_module_with_origin`.
     // The single-module entry does not build a `ModuleExports`, so the kernel-
@@ -475,7 +459,6 @@ pub fn canonicalise(m: &src::Module, interner: &mut Interner) -> DResult<canon::
     canonicalise_with_env(
         m,
         &mut env,
-        &qualifier_paths,
         &QualifiedAliases::new(),
         ModuleOrigin::User,
         interner,
@@ -744,15 +727,15 @@ pub fn canonicalise_module_in_project(
     // The type home and dependency aliases of each qualifier, read from the
     // owner `Env::install_import` decided for it, so a qualified type reaches
     // exactly the module its qualified values reach.
-    let mut qualifier_paths = source_qualifier_homes(&env);
-    for (&qualifier, path) in &qualifier_paths {
+    for (&qualifier, path) in &source_qualifier_homes(&env) {
         let Some(dep) = deps.get(path) else {
             continue;
         };
-        // The dep's exported types: a known export set lets a qualified
-        // reserved name the dep does not export be refused rather than minted
-        // at the qualifier's home.
-        let types: BTreeMap<Symbol, QualifiedType> = dep
+        // The dep's declared type names: a qualified type resolves only through
+        // this table, so a name the dep does not export is refused, never
+        // minted at the qualifier's home. An exported builtin keeps precedence
+        // over a same-named alias.
+        let mut types: BTreeMap<Symbol, QualifiedType> = dep
             .types
             .iter()
             .map(|(&name, exported)| {
@@ -763,11 +746,17 @@ pub fn canonicalise_module_in_project(
                             home: home.clone(),
                         })
                     }
-                    crate::ExportedType::Union { .. } => QualifiedType::Union,
+                    crate::ExportedType::Union { home, .. } => QualifiedType::Union(home.clone()),
                 };
                 (name, target)
             })
             .collect();
+        for &alias_name in dep.aliases.keys() {
+            types.entry(alias_name).or_insert(QualifiedType::Alias);
+        }
+        for &private in &dep.private_types {
+            types.entry(private).or_insert(QualifiedType::Private);
+        }
         Rc::make_mut(&mut env.qualified_types).insert(qualifier, types);
         // Every exported alias of the dep registers under a synthetic
         // `Qualifier.Name` key so a qualified annotation (`Money.Price`)
@@ -781,16 +770,9 @@ pub fn canonicalise_module_in_project(
             qualified_aliases.entry(key).or_insert_with(|| ea.clone());
         }
     }
-    fold_html_stdlib_qualifier_homes(&m.imports, &env, &mut qualifier_paths, interner)?;
 
-    let (mut canon_mod, kernel_aliases, own_aliases) = canonicalise_with_env(
-        m,
-        &mut env,
-        &qualifier_paths,
-        &qualified_aliases,
-        origin,
-        interner,
-    )?;
+    let (mut canon_mod, kernel_aliases, own_aliases) =
+        canonicalise_with_env(m, &mut env, &qualified_aliases, origin, interner)?;
     // The record-alias auto-constructors that were actually synthesized:
     // exactly the defs whose name is an alias name. A function-field alias is
     // gated out of synthesis, so it is absent here and must NOT be exported as a
@@ -2404,8 +2386,8 @@ const HOME_SENSITIVE_BUILTIN_TYPES: &[&str] = &["Attribute", "Event"];
 /// * Only names in [`HOME_SENSITIVE_BUILTIN_TYPES`] are touched — a no-op for
 ///   every home-insensitive builtin.
 /// * The QUALIFIED `Attr.Attribute` / `Ui.Attribute` case is handled separately
-///   by [`fold_html_stdlib_qualifier_homes`] (keyed on the QUALIFIER, so the two
-///   stay distinct); this pass must touch ONLY names exposed UNQUALIFIED, or it
+///   by the qualifier's own export table ([`source_qualified_type`],
+///   [`kernel_type_export`]), so the two stay distinct; this pass must touch ONLY names exposed UNQUALIFIED, or it
 ///   would also hijack a qualified `Ui.Attribute` in the same module (whose
 ///   fallback also reads the bare type namespace) — the exact regression in
 ///   `26-ui-showcase/RegressionGates.testId : Ui.Attribute msg`.
@@ -2562,93 +2544,6 @@ fn bind_html_type_home(
     bind_type(env, name, Tier::Explicit, origin, interner)
 }
 
-/// Fold each Html-family STDLIB import qualifier into `qualifier_paths`, mapping
-/// it to the canonical `["Html"]` type home.
-///
-/// Stdlib kernel imports are skipped by the ordinary `qualifier_paths`
-/// construction (they carry no `deps` entry), so a QUALIFIED `Attr.Attribute`
-/// (from `import Ipe.Html.Attributes as Attr`) would fall through to the
-/// bare `Attribute` type binding — a single binding that cannot tell
-/// `Attr.Attribute` (Html) from `Ui.Attribute` (Ui), so both mis-lowered to the
-/// same newtype. Registering the qualifier here — `Attr` (and the canonical
-/// `Html`) → `["Html"]` — makes the `TType` arm resolve `Attr.Attribute` to the
-/// `html::Attribute` home directly, while `Ui.Attribute` (Ui-family qualifier,
-/// deliberately NOT folded) keeps falling through to the empty Ui sentinel.
-///
-/// The `["Html"]` value is the SAME single-segment home the HM constrainer uses
-/// for the Ipe.Html attribute type (`constrain.rs` `html_attr`), so the emitted
-/// type unifies with `Html.node`'s parameter rather than minting a distinct
-/// `Ipe.Html.Attributes.Attribute`.
-///
-/// An Html-family qualifier resolves to `["Html"]` even when the same qualifier
-/// was already bound to the compiled-source `Ipe.Html.Attributes` dep path: a
-/// qualified `Attr.Attribute` type ref must lower to the `html::Attribute` home
-/// the HM constrainer and the lowerer's `is_html` check both expect. Forcing
-/// `["Html"]` here (over the just-inserted `["Ipe","Html","Attributes"]` dep
-/// path) is the qualified-type counterpart of the `["Html"]` builtin home
-/// recorded in `build_module_exports`.
-///
-/// The force-home is a per-qualifier sentinel, but its authority is name-scoped
-/// at the `TType` consumer: it homes only the reserved builtin view-type NAMES
-/// (`Attribute`/`Html`). A compiled-source ADT declared in `Ipe.Html.Attributes`
-/// (e.g. `Attr.LinkTarget`) is not a reserved builtin, so the consumer keeps its
-/// real `["Ipe","Html","Attributes"]` home rather than this
-/// `["Html"]` sentinel. Value members are likewise unaffected — they resolve
-/// through the compiled-source module, not `qualifier_paths`.
-///
-/// # Errors
-/// [`Diagnostic::CompilerBug`] if interning `Html` exhausts the interner.
-fn fold_html_stdlib_qualifier_homes(
-    imports: &[src::Import],
-    env: &Env,
-    qualifier_paths: &mut BTreeMap<Symbol, Vec<Symbol>>,
-    interner: &mut Interner,
-) -> DResult<()> {
-    let html_sym = interner.intern("Html")?;
-    for import in imports {
-        let dep_path = &import.name.value;
-        let is_html_family = dep_path
-            .iter()
-            .any(|s| interner.resolve(*s) == Some("Html"));
-        if !is_html_family {
-            continue;
-        }
-        // Effective qualifier: explicit `as Alias`, else the Elm last-segment
-        // default (`import Ipe.Html.Attributes` → `Attributes`).
-        let qualifier = import
-            .alias
-            .unwrap_or_else(|| dep_path.last().copied().unwrap_or_else(name_zero));
-        // The spelling must denote this import's module: one another import
-        // owns, or one left ambiguous, takes no home from this import.
-        if !owned_by_import(env, qualifier, dep_path, interner)? {
-            continue;
-        }
-        // Register the qualifier's REAL dep path (or the bare `["Html"]` builtin
-        // home for a builtin-only module such as `Ipe.Html` that carries no
-        // compiled source). The `TType` consumer force-homes the builtin
-        // view-type NAMES (`Attribute`/`Html`) to `["Html"]` when the qualifier
-        // is Html-family, so `Attr.Attribute` lowers to `html::Attribute` while a
-        // compiled-source ADT (`Attr.LinkTarget`) keeps this real module home. A
-        // stdlib kernel import carries no user-dep `qualifier_paths` entry, so
-        // this fill is what makes an Html-family qualifier resolvable at all.
-        let is_stdlib_html = matches!(
-            dep_path.first().and_then(|s| interner.resolve(*s)),
-            Some("Ipe")
-        );
-        let home = if dep_path.len() > 1 {
-            dep_path.clone()
-        } else {
-            vec![html_sym]
-        };
-        if is_stdlib_html {
-            qualifier_paths.insert(qualifier, home);
-        } else {
-            qualifier_paths.entry(qualifier).or_insert(home);
-        }
-    }
-    Ok(())
-}
-
 /// The dependency path of every spelling a source module owns in `env`'s scope.
 ///
 /// Read from [`crate::env::ImportScope::qualifier_owner`], the one record of
@@ -2663,25 +2558,6 @@ fn source_qualifier_homes(env: &Env) -> BTreeMap<Symbol, Vec<Symbol>> {
             ModuleIdentity::Kernel(_) => None,
         })
         .collect()
-}
-
-/// Whether `spelling` is owned in `env`'s scope by the module `dep_path` names.
-///
-/// # Errors
-/// [`Diagnostic::CompilerBug`] if interning a canonical exhausts the interner.
-fn owned_by_import(
-    env: &Env,
-    spelling: Symbol,
-    dep_path: &[Symbol],
-    interner: &mut Interner,
-) -> DResult<bool> {
-    let Some(claim) = env.import_scope.qualifier_owner.get(&spelling) else {
-        return Ok(false);
-    };
-    Ok(match &claim.owner {
-        ModuleIdentity::Source(path) => path.as_slice() == dep_path,
-        ModuleIdentity::Kernel(module) => env.kernel_module(dep_path, interner)? == Some(*module),
-    })
 }
 
 /// The canonical module, its kernel aliases, and its own aliases resolved in its scope.
@@ -2718,7 +2594,6 @@ type CanonicalisedModule = (
 fn canonicalise_with_env(
     m: &src::Module,
     env: &mut Env,
-    qualifier_paths: &BTreeMap<Symbol, Vec<Symbol>>,
     qualified_aliases: &QualifiedAliases,
     origin: ModuleOrigin,
     interner: &mut Interner,
@@ -2794,8 +2669,7 @@ fn canonicalise_with_env(
 
     // Each own alias body resolved once, in this module's scope: the form an
     // importer receives through `ModuleExports::aliases`.
-    let own_aliases =
-        resolve_own_aliases(m, &slots, env, qualifier_paths, qualified_aliases, interner)?;
+    let own_aliases = resolve_own_aliases(m, &slots, env, qualified_aliases, interner)?;
 
     // Second union pass: now that aliases are collected, canonicalise every
     // constructor's payload field types (a field may reference an alias or
@@ -2805,7 +2679,6 @@ fn canonicalise_with_env(
         unions.push(canonicalise_union(
             &u.value,
             env,
-            qualifier_paths,
             qualified_aliases,
             interner,
         )?);
@@ -2828,7 +2701,6 @@ fn canonicalise_with_env(
         m,
         &home,
         env,
-        qualifier_paths,
         qualified_aliases,
         &user_value_names,
         interner,
@@ -2884,8 +2756,7 @@ fn canonicalise_with_env(
     // witness's fields at its call site by lookup alone. Built here — the single
     // point where the module's values, aliases, imports, and type context all
     // coexist — and stored on the env, which every value body's resolution clones.
-    let codec_auto =
-        build_codec_auto_context(m, env, qualifier_paths, qualified_aliases, interner)?;
+    let codec_auto = build_codec_auto_context(m, env, qualified_aliases, interner)?;
     env.codec_auto = Rc::new(codec_auto);
 
     // Canonicalise each value declaration. A kernel alias has no runtime body —
@@ -2899,7 +2770,6 @@ fn canonicalise_with_env(
         defs.push(canonicalise_value(
             &v.value,
             env,
-            qualifier_paths,
             qualified_aliases,
             interner,
         )?);
@@ -2938,7 +2808,6 @@ fn resolve_own_aliases(
     m: &src::Module,
     slots: &[Symbol],
     env: &Env,
-    qualifier_paths: &BTreeMap<Symbol, Vec<Symbol>>,
     qualified_aliases: &QualifiedAliases,
     interner: &Interner,
 ) -> DResult<BTreeMap<Symbol, crate::ExportedAlias>> {
@@ -2950,7 +2819,6 @@ fn resolve_own_aliases(
         let params = alias_params(decl, slots);
         let ctx = TypeCtx {
             env,
-            qualifier_paths,
             qualified_aliases,
             interner,
             ann_span: decl.body.span,
@@ -3457,18 +3325,17 @@ fn field_type_nonderivable(interner: &Interner, t: &canon::Type) -> bool {
 fn build_codec_auto_context(
     m: &src::Module,
     env: &Env,
-    qualifier_paths: &BTreeMap<Symbol, Vec<Symbol>>,
     qualified_aliases: &QualifiedAliases,
     interner: &mut Interner,
 ) -> DResult<crate::env::CodecAutoContext> {
-    // Qualifiers bound to `Ipe.Codec`: any import qualifier whose resolved path
-    // is exactly `["Ipe", "Codec"]`. A compiled-source stdlib module is a build
-    // dep, so its import registers in `qualifier_paths` like a user module.
+    // Qualifiers bound to `Ipe.Codec`: any spelling a source module owns whose
+    // path is exactly `["Ipe", "Codec"]`. A compiled-source stdlib module is a
+    // build dep, so its import owns its spellings like a user module.
     let ipe_seg = interner.intern("Ipe")?;
     let codec_seg = interner.intern("Codec")?;
     let codec_path = [ipe_seg, codec_seg];
     let mut qualifiers: BTreeSet<Symbol> = BTreeSet::new();
-    for (&qual, path) in qualifier_paths {
+    for (qual, path) in source_qualifier_homes(env) {
         if path.as_slice() == codec_path {
             qualifiers.insert(qual);
         }
@@ -3483,14 +3350,9 @@ fn build_codec_auto_context(
         let Some(ann) = &v.value.type_annotation else {
             continue;
         };
-        if let Some(fields) = witness_record_fields(
-            &ann.value,
-            env,
-            qualifier_paths,
-            qualified_aliases,
-            interner,
-            ann.span,
-        )? {
+        if let Some(fields) =
+            witness_record_fields(&ann.value, env, qualified_aliases, interner, ann.span)?
+        {
             witness_records.insert(v.value.name.value, fields);
         }
     }
@@ -3510,14 +3372,12 @@ fn build_codec_auto_context(
 fn witness_record_fields(
     ann: &src::TypeAnnotation,
     env: &Env,
-    qualifier_paths: &BTreeMap<Symbol, Vec<Symbol>>,
     qualified_aliases: &QualifiedAliases,
     interner: &Interner,
     ann_span: Span,
 ) -> DResult<Option<Vec<(Symbol, canon::Type)>>> {
     let ctx = TypeCtx {
         env,
-        qualifier_paths,
         qualified_aliases,
         interner,
         ann_span,
@@ -4214,7 +4074,6 @@ fn synthesize_record_alias_ctors(
     m: &src::Module,
     home: &[Symbol],
     env: &Env,
-    qualifier_paths: &BTreeMap<Symbol, Vec<Symbol>>,
     qualified_aliases: &QualifiedAliases,
     user_value_names: &BTreeSet<Symbol>,
     interner: &Interner,
@@ -4246,7 +4105,6 @@ fn synthesize_record_alias_ctors(
         // return record is byte-identical to the annotation expansion.
         let ctx = TypeCtx {
             env,
-            qualifier_paths,
             qualified_aliases,
             interner,
             ann_span: a.value.body.span,
@@ -4879,6 +4737,14 @@ fn build_module_exports(
         }
     }
     export_declared_builtins(&mut exports.types, home, env, interner);
+    // Every declared type name the export lists leave out, so a qualified use
+    // of one is refused as private, never resolved.
+    exports.private_types = own_types
+        .keys()
+        .copied()
+        .chain(m.aliases.iter().map(|a| a.value.name.value))
+        .filter(|name| !exports.types.contains_key(name) && !exports.aliases.contains_key(name))
+        .collect();
 
     // Record every EXPORTED kernel alias so importers register `Alias.f` as the
     // kernel rather than a `TopLevel` reference. A kernel alias is an ordinary
@@ -5026,7 +4892,6 @@ fn register_union(
 fn canonicalise_union(
     u: &src::Union,
     env: &Env,
-    qualifier_paths: &BTreeMap<Symbol, Vec<Symbol>>,
     qualified_aliases: &QualifiedAliases,
     interner: &Interner,
 ) -> DResult<canon::Union> {
@@ -5042,7 +4907,6 @@ fn canonicalise_union(
         let arity = c.value.args.len();
         let ctx = TypeCtx {
             env,
-            qualifier_paths,
             qualified_aliases,
             interner,
             ann_span: c.span,
@@ -5088,7 +4952,6 @@ fn canonicalise_union(
 fn canonicalise_value(
     val: &src::Value,
     env: &Env,
-    qualifier_paths: &BTreeMap<Symbol, Vec<Symbol>>,
     qualified_aliases: &QualifiedAliases,
     interner: &mut Interner,
 ) -> DResult<canon::Def> {
@@ -5097,9 +4960,7 @@ fn canonicalise_value(
     // and only this position (the whole body of a `CustomElement`-annotated
     // binding) is legal. A malformed use fails closed here (IPE-N0044); any other
     // appearance of the qualified name is rejected downstream by `resolve_qual_var`.
-    if let Some(def) =
-        detect_custom_element_constructor(val, env, qualifier_paths, qualified_aliases, interner)?
-    {
+    if let Some(def) = detect_custom_element_constructor(val, env, qualified_aliases, interner)? {
         return Ok(def);
     }
 
@@ -5128,7 +4989,6 @@ fn canonicalise_value(
             let mut visited = Vec::new();
             let ctx = TypeCtx {
                 env,
-                qualifier_paths,
                 qualified_aliases,
                 interner,
                 ann_span: ann.span,
@@ -6695,61 +6555,127 @@ fn kernel_type_export<'a>(
 
 /// What a source-module-qualified type reference `qualifier.name` resolves to.
 ///
-/// A builtin the qualifier's dependency re-exports or declares as its own
-/// ([`export_declared_builtins`]) is its row at the export's home. Otherwise an
-/// exported alias expands through its synthetic key. A reserved builtin name
-/// the dependency does not export is IPE-N0005: it would otherwise mint the
-/// row's name at a home no module declares it under; under
-/// a qualifier whose exports are unknown (an Html fold) it is the row at the
-/// qualifier's home. Any other name is a union of the module.
+/// The qualifier's dependency export table is the only authority: an exported
+/// builtin is its row at the export's home (a declared row included, see
+/// [`export_declared_builtins`]), an exported union its home, an exported
+/// alias expands through its synthetic key. No target is built from the
+/// spelling.
 ///
 /// # Errors
-/// [`NameError::NoSuchMember`] (IPE-N0005) for a reserved builtin name the
-/// dependency does not export; [`Diagnostic::CompilerBug`] when a symbol is
-/// not interned or the qualifier has no path.
+/// [`NameError::NameNotExposed`] (IPE-N0022) for a type the dependency declares
+/// and does not export; [`NameError::NoSuchMember`] (IPE-N0005) for any other
+/// name the dependency does not export, both ranked over the names it does;
+/// [`Diagnostic::CompilerBug`] when a symbol is not interned, the qualifier has
+/// no export table, or an exported alias has no qualified key.
 fn source_qualified_type<'a>(
     qualifier: Symbol,
     qualifier_str: &str,
     name: Symbol,
     ctx: &TypeCtx<'a>,
-    visited: &[Symbol],
 ) -> DResult<TypeTarget<'a>> {
-    let exports = ctx.env.qualified_types.get(&qualifier);
-    let exported = exports.and_then(|types| types.get(&name));
-    if let Some(QualifiedType::Builtin(bound)) = exported {
-        return Ok(TypeTarget::Builtin(bound.clone()));
+    let Some(types) = ctx.env.qualified_types.get(&qualifier) else {
+        return Err(Diagnostic::CompilerBug {
+            where_: "ipe_canon::source_qualified_type",
+            detail: "a source qualifier with no export table".into(),
+        });
+    };
+    match types.get(&name) {
+        Some(QualifiedType::Builtin(bound)) => Ok(TypeTarget::Builtin(bound.clone())),
+        Some(QualifiedType::Union(home)) => Ok(TypeTarget::Union(UnionHome::of(home.clone())?)),
+        Some(QualifiedType::Alias) => {
+            let alias_key =
+                alias_lookup_key(qualifier_str, name, ctx.qualified_aliases, ctx.interner)?;
+            match alias_key
+                .and_then(|key| ctx.qualified_aliases.get(&key).map(|alias| (key, alias)))
+            {
+                Some((key, alias)) => Ok(TypeTarget::Alias(key, ResolvedAlias::Imported(alias))),
+                None => Err(Diagnostic::CompilerBug {
+                    where_: "ipe_canon::source_qualified_type",
+                    detail: "an exported alias with no qualified key".into(),
+                }),
+            }
+        }
+        Some(QualifiedType::Private) => Err(unexported_qualified_type(
+            Unexported::Private,
+            qualifier,
+            name,
+            types,
+            ctx,
+        )?),
+        None => Err(unexported_qualified_type(
+            Unexported::Undeclared,
+            qualifier,
+            name,
+            types,
+            ctx,
+        )?),
     }
-    if let Some(alias_key) =
-        alias_lookup_key(qualifier_str, name, ctx.qualified_aliases, ctx.interner)?
-        && !visited.contains(&alias_key)
-        && let Some(alias) = ctx.qualified_aliases.get(&alias_key)
+}
+
+/// Why a source qualifier's dependency does not export a type name.
+#[derive(Clone, Copy)]
+enum Unexported {
+    /// The dependency declares the name and does not expose it.
+    Private,
+    /// The dependency declares no type of the name.
+    Undeclared,
+}
+
+/// The refusal of `qualifier.name`, a type its dependency does not export:
+/// IPE-N0022 for a private declaration, IPE-N0005 otherwise, both naming the
+/// dependency's module path (the module whose `exposing` list decides, not the
+/// importer's spelling of it) and ranked over the exported names of `types`.
+///
+/// # Errors
+/// [`Diagnostic::CompilerBug`] when a symbol is not interned or no source
+/// module owns `qualifier`.
+fn unexported_qualified_type(
+    why: Unexported,
+    qualifier: Symbol,
+    name: Symbol,
+    types: &BTreeMap<Symbol, QualifiedType>,
+    ctx: &TypeCtx,
+) -> DResult<Diagnostic> {
+    let name_s = resolve_or_bug(ctx.interner, name, "ipe_canon::unexported_qualified_type")?;
+    let module = match ctx
+        .env
+        .import_scope
+        .qualifier_owner
+        .get(&qualifier)
+        .map(|claim| &claim.owner)
     {
-        return Ok(TypeTarget::Alias(alias_key, ResolvedAlias::Imported(alias)));
-    }
-    let name_s = resolve_or_bug(ctx.interner, name, "ipe_canon::source_qualified_type")?;
-    // Only a reserved row is a builtin under every home; a row lowered below
-    // the union guard (`Basics.Order`) stays the module's union, as a user
-    // declaration of the name would be.
-    let reserved =
-        BuiltinType::of_bare_name(name_s).filter(|row| row.row().role().forbids_user_declaration());
-    match (reserved, exports, exported) {
-        (Some(_), Some(types), None) => Err(Diagnostic::Name {
-            span: ctx.ann_span,
-            msg: NameError::NoSuchMember {
-                module: name_str(ctx.interner, qualifier)?,
-                member: name_s.into(),
-                suggestions: Candidates::hints(ranked_names(
-                    name_s,
-                    Shape::Flat,
-                    types.keys().filter_map(|sym| ctx.interner.resolve(*sym)),
-                )),
-            },
-        }),
-        (Some(row), None, _) => Ok(TypeTarget::Builtin(qualified_builtin(qualifier, row, ctx)?)),
-        (Some(_), Some(_), Some(_)) | (None, _, _) => Ok(TypeTarget::Union(UnionHome::of(
-            qualifier_home(qualifier, ctx)?,
-        )?)),
-    }
+        Some(ModuleIdentity::Source(path)) => path_to_dot_string(ctx.interner, path),
+        Some(ModuleIdentity::Kernel(_)) | None => {
+            return Err(Diagnostic::CompilerBug {
+                where_: "ipe_canon::unexported_qualified_type",
+                detail: "a source qualifier no source module owns".into(),
+            });
+        }
+    };
+    let suggestions = Candidates::hints(ranked_names(
+        name_s,
+        Shape::Flat,
+        types
+            .iter()
+            .filter(|(_, target)| target.is_exported())
+            .filter_map(|(sym, _)| ctx.interner.resolve(*sym)),
+    ));
+    let msg = match why {
+        Unexported::Private => NameError::NameNotExposed {
+            module,
+            name: name_s.into(),
+            suggestions,
+        },
+        Unexported::Undeclared => NameError::NoSuchMember {
+            module,
+            member: name_s.into(),
+            suggestions,
+        },
+    };
+    Ok(Diagnostic::Name {
+        span: ctx.ann_span,
+        msg,
+    })
 }
 
 /// The IPE-N0024 for a bare name two imports bring in from distinct homes.
@@ -6769,52 +6695,6 @@ fn ambiguous_import(
             modules,
         },
     })
-}
-
-/// The module path a source qualifier denotes: the home of a union its
-/// module declares.
-///
-/// `qualifier` is owned by a source module, so it has a path in
-/// `qualifier_paths`; a kernel-module qualifier never reaches here.
-///
-/// # Errors
-/// [`Diagnostic::CompilerBug`] for a qualifier with no path.
-fn qualifier_home(qualifier: Symbol, ctx: &TypeCtx) -> DResult<Vec<Symbol>> {
-    ctx.qualifier_paths
-        .get(&qualifier)
-        .cloned()
-        .ok_or_else(|| Diagnostic::CompilerBug {
-            where_: "ipe_canon::qualifier_home",
-            detail: "a source qualifier with no path".into(),
-        })
-}
-
-/// The binding of the builtin `row` spelled under a source qualifier whose
-/// dependency's exports are unknown (an Html-family stdlib fold).
-///
-/// Only a row reaches here, so the Html force-home acts on a witness, never on
-/// a spelling: `fold_html_stdlib_qualifier_homes` registers an Html-family
-/// qualifier's real dep path, and a builtin row under it mints the `["Html"]`
-/// carrier the HM constrainer and the lowerer's `is_html` check both expect. A
-/// union the module declares takes [`qualifier_home`], so a union named like a
-/// non-reserved row (`type Order` in a `*.Html.*` module) keeps its module's
-/// home.
-///
-/// # Errors
-/// [`Diagnostic::CompilerBug`] for a qualifier with no path.
-fn qualified_builtin(qualifier: Symbol, row: BuiltinType, ctx: &TypeCtx) -> DResult<BoundBuiltin> {
-    let qualifier_home = qualifier_home(qualifier, ctx)?;
-    let qualifier_is_html_family = qualifier_home
-        .iter()
-        .any(|s| ctx.interner.resolve(*s) == Some("Html"));
-    // `Html` is interned by `fold_html_stdlib_qualifier_homes` whenever any
-    // Html-family import exists, so a hit is the norm; the qualifier's own home
-    // is the fail-closed fallback.
-    let home = match ctx.interner.lookup("Html") {
-        Some(html) if qualifier_is_html_family => vec![html],
-        Some(_) | None => qualifier_home,
-    };
-    Ok(BoundBuiltin { row, home })
 }
 
 /// Spend one node of a type expansion against its depth and node ceilings.
@@ -7130,10 +7010,9 @@ fn canonicalise_type(
             // precedence ladder (`resolve_unqualified_type_name`). A
             // kernel-module qualifier (`Http.HttpResponse`) reads that module's
             // type exports, and a miss is IPE-N0005. A source-module qualifier
-            // reads its dependency's exports: a re-exported builtin is its row,
-            // a reserved name the dependency does not export is IPE-N0005, an
-            // alias expands through its synthetic key, and any other name is a
-            // union of the module.
+            // reads its dependency's export table only: an exported builtin,
+            // union or alias resolves, a private one is IPE-N0022, and any
+            // other name is IPE-N0005.
             let target = if qualifier_str.is_empty() {
                 match resolve_unqualified_type_name(name, ctx, visited)? {
                     TypeName::Alias(alias) => TypeTarget::Alias(name, alias),
@@ -7157,7 +7036,7 @@ fn canonicalise_type(
                     }
                 }
             } else {
-                source_qualified_type(*qualifier, qualifier_str, name, ctx, visited)?
+                source_qualified_type(*qualifier, qualifier_str, name, ctx)?
             };
             let tag = match &target {
                 TypeTarget::Builtin(bound) => bound.row.row().tag(),
@@ -7899,7 +7778,6 @@ fn annotation_head_name<'a>(ann: &src::TypeAnnotation, interner: &'a Interner) -
 fn detect_custom_element_constructor(
     val: &src::Value,
     env: &Env,
-    qualifier_paths: &BTreeMap<Symbol, Vec<Symbol>>,
     qualified_aliases: &QualifiedAliases,
     interner: &Interner,
 ) -> DResult<Option<canon::Def>> {
@@ -7967,7 +7845,6 @@ fn detect_custom_element_constructor(
     let mut visited = Vec::new();
     let ctx = TypeCtx {
         env,
-        qualifier_paths,
         qualified_aliases,
         interner,
         ann_span: ann.span,
@@ -9561,6 +9438,7 @@ mod rust_ffi_auto_inject_tests {
             types: BTreeMap::default(),
             ctors: BTreeMap::default(),
             aliases: BTreeMap::default(),
+            private_types: std::collections::BTreeSet::default(),
             kernel_aliases: BTreeMap::default(),
         }
     }
@@ -10167,6 +10045,91 @@ mod html_qualifier_type_home_tests {
                 "{ty}: {:?}",
                 refused.map(|_| ())
             );
+        }
+    }
+
+    /// The outcome a qualified type use reaches against a canonicalised `Dep`.
+    #[derive(Debug, PartialEq, Eq)]
+    enum QualifiedOutcome {
+        Resolved,
+        /// IPE-N0022, naming the module it reports.
+        NotExposed(String),
+        /// IPE-N0005, naming the module it reports.
+        NoSuchMember(String),
+        Other,
+        /// Building the dependency failed; the failure's rendering.
+        Setup(String),
+    }
+
+    /// Canonicalise `Dep` from source, then an importer annotating `x` with
+    /// `ty` under `import Dep as D`; returns `Dep`'s private type names and the
+    /// importer's outcome.
+    fn qualified_use_against_dep(ty: &str) -> (Vec<String>, QualifiedOutcome) {
+        let dep_src = "module Dep exposing (Box, Count, box)\n\n\
+                       type Box = Box Int\n\n\
+                       type Hidden = Hidden Int\n\n\
+                       type alias Count = Int\n\n\
+                       type alias Tally = Int\n\n\
+                       box : Box\nbox =\n    Box 1\n";
+        let mut i = Interner::new();
+        let dep_path = vec![sym(&mut i, "Dep")];
+        let parsed_dep = match ipe_parse::parse_module(dep_src, &mut i) {
+            Ok(parsed) => parsed,
+            Err(e) => return (Vec::new(), QualifiedOutcome::Setup(format!("{e:?}"))),
+        };
+        let exports = match canonicalise_module(&parsed_dep, &dep_path, &BTreeMap::new(), &mut i) {
+            Ok((_, exports)) => exports,
+            Err(e) => return (Vec::new(), QualifiedOutcome::Setup(format!("{e:?}"))),
+        };
+        let mut private: Vec<String> = exports
+            .private_types
+            .iter()
+            .filter_map(|name| i.resolve(*name).map(str::to_owned))
+            .collect();
+        private.sort();
+        let deps = BTreeMap::from([(dep_path, exports)]);
+        let Ok(parsed_main) = ipe_parse::parse_module(&annotated_importer("Dep as D", ty), &mut i)
+        else {
+            return (private, QualifiedOutcome::Other);
+        };
+        let main_path = vec![sym(&mut i, "Main")];
+        let outcome = match canonicalise_module(&parsed_main, &main_path, &deps, &mut i) {
+            Ok(_) => QualifiedOutcome::Resolved,
+            Err(Diagnostic::Name {
+                msg: NameError::NameNotExposed { module, .. },
+                ..
+            }) => QualifiedOutcome::NotExposed(module.into()),
+            Err(Diagnostic::Name {
+                msg: NameError::NoSuchMember { module, .. },
+                ..
+            }) => QualifiedOutcome::NoSuchMember(module.into()),
+            Err(_) => QualifiedOutcome::Other,
+        };
+        (private, outcome)
+    }
+
+    /// A qualified type resolves only through its dependency's export table:
+    /// a declared union or alias the dependency does not expose is IPE-N0022,
+    /// and any other unexported name, a non-reserved builtin row name included,
+    /// is IPE-N0005. Neither is minted at the qualifier's home. Both name the
+    /// dependency's module (`Dep`), whose `exposing` list decides, never the
+    /// importer's alias (`D`).
+    #[test]
+    fn a_qualified_name_the_dependency_does_not_export_is_refused() {
+        let not_exposed = || QualifiedOutcome::NotExposed("Dep".to_owned());
+        let no_such_member = || QualifiedOutcome::NoSuchMember("Dep".to_owned());
+        for (ty, expected) in [
+            ("D.Box", QualifiedOutcome::Resolved),
+            ("D.Count", QualifiedOutcome::Resolved),
+            ("D.Hidden", not_exposed()),
+            ("D.Tally", not_exposed()),
+            ("D.Nope", no_such_member()),
+            ("D.Value", no_such_member()),
+            ("D.Order", no_such_member()),
+        ] {
+            let (private, outcome) = qualified_use_against_dep(ty);
+            assert_eq!(outcome, expected, "{ty}");
+            assert_eq!(private, ["Hidden", "Tally"], "{ty}: private types");
         }
     }
 
