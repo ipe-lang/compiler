@@ -551,6 +551,7 @@ fn dirty_module(name: &str) -> String {
 }
 
 /// A fresh, empty scratch directory for one test.
+#[allow(clippy::unwrap_used)] // test helper, not itself a #[test] fn: a failed mkdir fails the test loudly
 fn scratch(name: &str) -> PathBuf {
     let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(name);
     let _ = fs::remove_dir_all(&dir);
