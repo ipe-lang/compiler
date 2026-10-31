@@ -301,9 +301,9 @@ pub fn typechecks(source: &str, base: &Path) -> StageOutcome {
         Ok(scratch) => scratch,
         Err(outcome) => return outcome,
     };
-    stage_outcome(crate::driver::typecheck_target(&AnalysisTarget::Project(
-        scratch.root(),
-    )))
+    stage_outcome(crate::driver::typecheck_stage_target(
+        &AnalysisTarget::Project(scratch.root()),
+    ))
 }
 
 /// The probe program `source` as the `Main` module of a one-module project in
@@ -590,7 +590,7 @@ mod root_tests {
             .module("Helper", HELPER)
             .resolve_under(base.path())
             .expect("project with its own Helper");
-        crate::driver::typecheck_target(&AnalysisTarget::Project(inside.root()))
+        crate::driver::typecheck_stage_target(&AnalysisTarget::Project(inside.root()))
             .expect("a module of the project resolves");
     }
 

@@ -121,6 +121,40 @@ fn field_mismatch_attributes_to_owning_module() {
     );
 }
 
+/// A well-typed entry whose decoder pipeline is hand-nested in reverse order.
+const ENTRY_NESTED_DECODER: &str = "module Main exposing (main)\n\n\
+    import Ipe.Json.Decode as Decode\n\
+    import Ipe.Json.Decode.Pipeline as Pipeline\n\
+    import Ipe.System as System\n\n\
+    userDecoder =\n    \
+    Pipeline.required \"name\" Decode.string\n        \
+    (Pipeline.required \"email\" Decode.string\n            \
+    (Decode.succeed (\\name email -> { name = name, email = email })))\n\n\
+    main : Task Error ()\n\
+    main =\n    \
+    let\n        \
+    _unused = userDecoder\n    \
+    in\n    \
+    System.setenv \"KEY\" \"x\"\n";
+
+/// The editor refuses a hand-nested decoder pipeline with IPE-N0040, the code
+/// `ipe type-check` and `ipe dev build` refuse it with.
+#[test]
+fn nested_decoder_pipeline_publishes_n0040() {
+    let db = IpeDatabase::new();
+    let entry = file(&db, &["Main"], ENTRY_NESTED_DECODER);
+    let root = root_of(&db, &[(&["Main"], entry)]);
+
+    let all = collect(&db, root, entry);
+    assert!(
+        diags_for(&all, &["Main"])
+            .diagnostics
+            .iter()
+            .any(|d| d.code().as_str() == "IPE-N0040"),
+        "the hand-nested decoder must publish IPE-N0040, got {all:?}"
+    );
+}
+
 #[test]
 fn dep_parse_error_is_blamed_on_the_dep_not_the_importer() {
     let db = IpeDatabase::new();

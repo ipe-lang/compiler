@@ -2373,6 +2373,169 @@ fn canon_qualified_basics_order_compiles() {
     assert_compiles("canon_qualified_basics_order", &src);
 }
 
+/// The type names an `exposing (…)` list names, constructors aside.
+fn exposed_type_names<'a>(
+    items: impl Iterator<Item = &'a ipe_syntax::Exposed>,
+) -> Vec<ipe_intern::Symbol> {
+    items
+        .filter_map(|item| match item {
+            ipe_syntax::Exposed::Type(name, _) => Some(*name),
+            ipe_syntax::Exposed::Value(_) => None,
+        })
+        .collect()
+}
+
+/// Every `(module, type)` pair where a stdlib module brings the type into its
+/// own scope through an `import … exposing (N)` and does not export it.
+///
+/// Read through the language's own parser. A module exporting `(..)` and a
+/// type the module itself declares are left out, so each pair names a type in
+/// the module's scope by import alone.
+fn stdlib_reimported_unexported_types() -> Vec<(&'static str, String)> {
+    use ipe_syntax::Exposing;
+
+    let mut pairs = Vec::new();
+    for module in ipe_stdlib::MODULES {
+        let mut interner = ipe_intern::Interner::new();
+        let Ok(parsed) = ipe_parse::parse_module(module.source, &mut interner) else {
+            continue;
+        };
+        let Exposing::List(exports) = &parsed.exposing.value else {
+            continue;
+        };
+        let exported = exposed_type_names(exports.iter().map(|item| &item.value));
+        let declared: Vec<ipe_intern::Symbol> = parsed
+            .unions
+            .iter()
+            .map(|union| union.value.name.value)
+            .chain(parsed.aliases.iter().map(|alias| alias.value.name.value))
+            .collect();
+        for import in &parsed.imports {
+            let Exposing::List(items) = &import.exposing.value else {
+                continue;
+            };
+            for name in exposed_type_names(items.iter().map(|item| &item.value)) {
+                if exported.contains(&name) || declared.contains(&name) {
+                    continue;
+                }
+                if let Some(text) = interner.resolve(name) {
+                    pairs.push((module.name, text.to_owned()));
+                }
+            }
+        }
+    }
+    pairs.sort();
+    pairs.dedup();
+    pairs
+}
+
+/// `Main` naming `Q.{ty}` in a signature under `import {module} as Q`.
+fn reimport_main(module: &str, ty: Option<&str>) -> String {
+    let signature = ty.map_or_else(String::new, |ty| {
+        format!("f : Q.{ty} -> Int\nf _ =\n    0\n\n")
+    });
+    format!(
+        "{HEAD}\nimport {module} as Q\nimport Ipe.Io as Io\n\n\
+         {signature}main = Io.println \"ok\"\n"
+    )
+}
+
+/// A type a stdlib module imports into its scope but does not re-export is
+/// IPE-N0005 through that module's qualifier, never a resolved type.
+///
+/// A refusal under another code is checked against a bare import of the same
+/// module: a module the user may not import is refused before any type is
+/// named, so it proves nothing here and is skipped; any other code is a failure.
+#[test]
+fn a_type_imported_but_not_reexported_is_no_such_member() {
+    let pairs = stdlib_reimported_unexported_types();
+    let mut seen = 0_usize;
+    let mut failures = Vec::new();
+    for (module, ty) in &pairs {
+        let slug = format!("reimport_{}_{ty}", module.replace('.', "_"));
+        match compile(&slug, &reimport_main(module, Some(ty)), Target::Native) {
+            Outcome::Rejected("IPE-N0005") => seen += 1,
+            Outcome::Rejected(got) => {
+                let control = compile(
+                    &format!("{slug}_control"),
+                    &reimport_main(module, None),
+                    Target::Native,
+                );
+                if !matches!(control, Outcome::Rejected(code) if code == got) {
+                    failures.push(format!("{module}.{ty}: refused with {got}"));
+                }
+            }
+            Outcome::Accepted(how) => failures.push(format!("{module}.{ty}: accepted ({how})")),
+        }
+    }
+    assert!(
+        seen > 0,
+        "no stdlib re-imported type was refused with IPE-N0005: the enumeration \
+         found {} pairs",
+        pairs.len()
+    );
+    assert!(
+        failures.is_empty(),
+        "a type in a module's scope by import alone must be IPE-N0005 through its \
+         qualifier:\n{}",
+        failures.join("\n")
+    );
+}
+
+/// A source dependency `A` declaring `T`, `B` importing `T` from it without
+/// exporting it, and a `Main` naming `{ty}` under `import A` and `import B`.
+fn reimport_project(name: &str, ty: &str) -> Outcome {
+    let main = format!(
+        "{HEAD}\nimport A\nimport B\nimport Ipe.Io as Io\n\n\
+         f : {ty} -> Int\nf _ =\n    0\n\n\
+         main = Io.println B.label\n"
+    );
+    compile_project(
+        name,
+        &[
+            ("A.ipe", "module A exposing (T(..))\n\ntype T = T\n"),
+            (
+                "B.ipe",
+                "module B exposing (label)\n\nimport A exposing (T(..))\n\n\
+                 make : T\nmake =\n    T\n\n\
+                 label : String\nlabel =\n    \"ok\"\n",
+            ),
+            ("Main.ipe", &main),
+        ],
+    )
+}
+
+/// `B.T` is IPE-N0005 when `B` imports `T` from `A` without exporting it.
+#[test]
+fn a_source_dependency_reimport_is_no_such_member() {
+    match reimport_project("source_dep_reimport_unexported", "B.T") {
+        Outcome::Rejected(got) => assert_eq!(
+            got, "IPE-N0005",
+            "source_dep_reimport_unexported: expected IPE-N0005, got {got} — WRONG reason"
+        ),
+        Outcome::Accepted(how) => {
+            fail_accepted("source_dep_reimport_unexported", "IPE-N0005", &how);
+        }
+    }
+}
+
+/// The companion acceptance: the same project naming `A.T`, through the module
+/// that exports it, compiles, so the refusal above is `B`'s missing export and
+/// nothing broader.
+#[test]
+fn a_source_dependency_type_resolves_through_its_exporter() {
+    match reimport_project("source_dep_reimport_exporter", "A.T") {
+        Outcome::Accepted(how) => assert!(
+            how.starts_with("compiled successfully"),
+            "source_dep_reimport_exporter: a non-pipeline failure ({how})"
+        ),
+        Outcome::Rejected(got) => assert!(
+            false_marker(),
+            "source_dep_reimport_exporter: `A` exports `T`, but ipe REJECTED `A.T` with {got}"
+        ),
+    }
+}
+
 /// An `Kernel.kernel "Name"` alias in USER source — minting a kernel is reserved to
 /// the vouched stdlib / FFI interface, so it is rejected by the origin gate
 /// (IPE-N0042) before the registry is consulted, whether or not the named kernel

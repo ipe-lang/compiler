@@ -1,4 +1,4 @@
-Type-check a program without building or running it.
+Check a program through type inference and lowering, without building or running it.
 
 ```
 ipe type-check [<path>]

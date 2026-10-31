@@ -4131,8 +4131,8 @@ pub fn own_sources(held: &HeldBuild) -> Vec<(String, &str)> {
         .collect()
 }
 
-/// The type-check every analysis surface demands of a source graph: link, HM
-/// type-check, then the IPE-N0040 decoder-direction gate the build path runs.
+/// The type-check stage of a source graph: link, HM type-check, then the
+/// IPE-N0040 decoder-direction gate the build path runs.
 ///
 /// Type-checking comes first so an ordinary type error surfaces ahead of the
 /// decoder-direction gate; the gate runs over the linked module, so a
@@ -4154,7 +4154,11 @@ pub fn typecheck_query(
     gate_decoder_pipelines(&linked.module)
 }
 
-/// [`typecheck_query`], then lowering: the build front end short of emit.
+/// The build front end short of emit, through the one lowering query.
+///
+/// [`ipe_db::lower_program`] admits in build order (link, type-check, the
+/// IPE-N0040 decoder-direction gate, lowering), so its first refusal is the
+/// first refusal `ipe dev build` reports for the same source graph.
 ///
 /// # Errors
 /// The first stage's [`ipe_db::PipelineError`].
@@ -4163,7 +4167,6 @@ pub fn lowering_check_query(
     root: ipe_db::SourceRoot,
     file: ipe_db::SourceFile,
 ) -> Result<(), ipe_db::PipelineError> {
-    typecheck_query(db, root, file)?;
     ipe_db::lower_program(db, root, file).clone().map(|_| ())
 }
 
@@ -4352,15 +4355,44 @@ pub fn graph_over(
     })
 }
 
-/// Type-check every entry `target` names, stopping at the first refusal.
+/// Run only the type-check stage over every entry `target` names.
+///
+/// A stage probe, not an admission judge: it stops after [`typecheck_query`],
+/// so a program lowering refuses still passes. A caller deciding whether a
+/// program is accepted runs [`lowering_check_target`].
 ///
 /// # Errors
 /// [`CliError::Pipeline`] carrying the first compiler diagnostic; every
 /// refusal of [`analysis_graphs`].
-pub fn typecheck_target(target: &AnalysisTarget<'_>) -> Result<(), CliError> {
+pub fn typecheck_stage_target(target: &AnalysisTarget<'_>) -> Result<(), CliError> {
+    run_each_graph(target, typecheck_query)
+}
+
+/// Judge every entry `target` names through the build front end short of emit.
+///
+/// Each graph runs [`lowering_check_query`], so a program this accepts has
+/// passed every settings-free stage `ipe dev build` runs: link, type-check,
+/// the decoder-direction gate and lowering. Libraries are judged the same way.
+///
+/// # Errors
+/// [`CliError::Pipeline`] carrying the first compiler diagnostic; every
+/// refusal of [`analysis_graphs`].
+pub fn lowering_check_target(target: &AnalysisTarget<'_>) -> Result<(), CliError> {
+    run_each_graph(target, lowering_check_query)
+}
+
+/// A whole-graph admission query: [`typecheck_query`] or [`lowering_check_query`].
+type GraphQuery = fn(
+    &ipe_db::IpeDatabase,
+    ipe_db::SourceRoot,
+    ipe_db::SourceFile,
+) -> Result<(), ipe_db::PipelineError>;
+
+/// Run `query` over every entry graph of `target`, stopping at the first refusal.
+fn run_each_graph(target: &AnalysisTarget<'_>, query: GraphQuery) -> Result<(), CliError> {
     crate::threads::run_compile(|| {
         for graph in analysis_graphs(target)? {
-            graph.run_attributed(graph.entry_path(), typecheck_query)?;
+            graph.run_attributed(graph.entry_path(), query)?;
         }
         Ok(())
     })?

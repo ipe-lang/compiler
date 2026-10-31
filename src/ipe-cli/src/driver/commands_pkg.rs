@@ -4,9 +4,8 @@ use super::{
     attribute_post_link_error, build_root_into, build_test_into,
     capabilities_including_served_widgets, create_source_root, emit_machine_error,
     emitted_bin_filename, entry_modules, frame_infer_error, home_to_source_map,
-    lowering_check_query, program_constructs_a_widget, resolve_runtime,
-    resolve_vendored_runtime_dir, run_build, runtime_context_for_message, typecheck_target,
-    working_dir,
+    lowering_check_query, lowering_check_target, program_constructs_a_widget, resolve_runtime,
+    resolve_vendored_runtime_dir, run_build, runtime_context_for_message, working_dir,
 };
 use crate::cargo_step::{CargoOutput, CargoTarget, Verbosity};
 use crate::output_dir::{EmitTarget, OutputArea, OutputRoot, OwnedDir, ProjectPaths};
@@ -1224,11 +1223,13 @@ pub fn parse_audit_entry_args(rest: &[String]) -> Result<AuditEntryArgs, CliErro
     })
 }
 
-/// `ipe type-check [<path>]` — type-check a program and stop. Runs the same
-/// injection-aware source graph `ipe dev build` uses, but demands only the
-/// `typecheck` query: no IR lowering, no Rust emission, nothing written. Exits
-/// 0 with a friendly framed success line when the program type-checks, or
-/// non-zero carrying the first rendered diagnostic when it does not.
+/// `ipe type-check [<path>]` — check a program and stop short of emitting it.
+///
+/// Runs the same injection-aware source graph `ipe dev build` uses through
+/// type inference, the decoder-direction gate and IR lowering: no Rust
+/// emission, nothing written. Exits 0 with a friendly framed success line when
+/// the program passes, or non-zero carrying the first rendered diagnostic when
+/// it does not.
 ///
 /// With `--json`, each diagnostic is a JSON object on stderr, and success is the
 /// shared machine envelope (`ipe.cli.type-check/1`, `status:ok`, empty payload)
@@ -1257,7 +1258,7 @@ pub fn run_type_check_body(rest: &[String]) -> Result<(), CliError> {
 ///
 /// # Errors
 /// Every refusal of [`analysis_root`], [`analysis_target`] and
-/// [`typecheck_target`].
+/// [`lowering_check_target`].
 pub fn run_type_check_in(cwd: &Path, rest: &[String]) -> Result<(), CliError> {
     let args = cli_args::parse_type_check(rest)?;
     // Propagate any diagnostic raw; `run_type_check` routes it through the
@@ -1858,14 +1859,18 @@ pub fn verify_check_quiet(path: Option<&str>) -> Result<(), CliError> {
     typecheck_in(&working_dir()?, path)
 }
 
-/// Type-check what `arg` names in the project at `cwd`: every entry when there is none.
+/// Judge what `arg` names in the project at `cwd`: every entry when there is none.
+///
+/// The judge is [`lowering_check_target`]: type inference and lowering, the
+/// settings-free stages `ipe dev build` runs, so a program lowering refuses is
+/// refused here too, under the same diagnostic code.
 ///
 /// # Errors
 /// Every refusal of [`analysis_root`], [`analysis_target`] and
-/// [`typecheck_target`].
+/// [`lowering_check_target`].
 pub fn typecheck_in(cwd: &Path, arg: Option<&str>) -> Result<(), CliError> {
     let (root, file) = analysis_root(cwd, arg.map(Path::new))?;
-    typecheck_target(&analysis_target(&root, file.as_ref())?)
+    lowering_check_target(&analysis_target(&root, file.as_ref())?)
 }
 
 /// The test stage in machine-quiet form: the shared runner with the test

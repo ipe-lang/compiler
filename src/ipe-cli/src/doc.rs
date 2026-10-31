@@ -3523,9 +3523,9 @@ fn check_examples() -> Result<(), CliError> {
             let scratch = crate::project_root::ProjectRoot::scratch(&module_src)?;
 
             // Tier 1: type-check the example (always).
-            match crate::driver::typecheck_target(&crate::project_root::AnalysisTarget::Project(
-                scratch.root(),
-            )) {
+            match crate::driver::typecheck_stage_target(
+                &crate::project_root::AnalysisTarget::Project(scratch.root()),
+            ) {
                 Ok(()) => {
                     crate::screen::chatter(
                         crate::screen::Stream::Stderr,
