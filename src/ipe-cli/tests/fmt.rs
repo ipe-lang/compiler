@@ -707,3 +707,28 @@ fn stdin_with_paths_is_refused() {
     let res = fmt::run_fmt(&["--stdin".to_owned(), "A.ipe".to_owned(), "B.ipe".to_owned()]);
     assert!(matches!(res, Err(CliError::Usage(_))), "{res:?}");
 }
+
+/// Under `--check --json` / `--check --plain` every refusal, a parse refusal
+/// and a missing path alike, is a machine envelope: the run returns the
+/// already-emitted sentinel, never a human screen.
+#[test]
+fn check_in_a_machine_form_refuses_through_the_machine_stream() {
+    let dir = scratch("fmt_check_machine_refusal");
+    let bad = dir.join("Bad.ipe");
+    fs::write(&bad, "module Bad exposing (x)\n\nx = = =\n").unwrap();
+    let missing = dir.join("NoSuch.ipe");
+
+    for form in ["--json", "--plain"] {
+        for target in [&bad, &missing] {
+            let res = fmt::run_fmt(&["--check".to_owned(), form.to_owned(), arg(target)]);
+            assert!(
+                matches!(res, Err(CliError::DiagnosticJsonEmitted)),
+                "{form} {}: {res:?}",
+                target.display()
+            );
+        }
+    }
+    // The human form keeps the framed refusal.
+    let res = fmt::run_fmt(&["--check".to_owned(), arg(&bad)]);
+    assert!(matches!(res, Err(CliError::Pipeline { .. })), "{res:?}");
+}

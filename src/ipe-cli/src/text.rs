@@ -1267,6 +1267,14 @@ messages! {
     fmt_changed_while_formatting(list: &crate::text::TerminalBlock) = "fmt-changed-while-formatting";
     /// `ipe fmt` would hold more rewrite text than its ceiling.
     fmt_held_bytes_limit(cap, file) = "fmt-held-bytes-limit";
+    /// `ipe fmt` rewrote one file.
+    fmt_formatted(file) = "fmt-formatted";
+    /// `ipe fmt` reached a directory past its walk's depth ceiling.
+    fmt_walk_too_deep(cap, dir) = "fmt-walk-too-deep";
+    /// `ipe fmt` examined more named paths and entries than its walk's ceiling.
+    fmt_walk_too_many_entries(cap, dir) = "fmt-walk-too-many-entries";
+    /// `ipe fmt` found more files than its walk's ceiling.
+    fmt_walk_too_many_files(cap, dir) = "fmt-walk-too-many-files";
     /// `ipe fmt` refused a file whose formatted output would pass its cap.
     fmt_output_too_large(file, cap) = "fmt-output-too-large";
     /// `ipe health` could not locate the home directory.

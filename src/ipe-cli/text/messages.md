@@ -1443,6 +1443,22 @@ these files changed while `ipe fmt` ran and were left as they are (run `ipe fmt`
 
 fmt: the files to rewrite hold more than {cap} bytes of source and formatted text at `{file}`; nothing was written. Format fewer paths at a time.
 
+## fmt-formatted
+
+formatted {file}
+
+## fmt-walk-too-deep
+
+the paths to format pass the {cap}-level directory depth ceiling at `{dir}`; nothing was formatted
+
+## fmt-walk-too-many-entries
+
+the paths to format hold more than {cap} entries at `{dir}`; nothing was formatted
+
+## fmt-walk-too-many-files
+
+the paths to format hold more than {cap} `.ipe` files at `{dir}`; nothing was formatted
+
 ## fmt-output-too-large
 
 formatted output of `{file}` would exceed {cap} bytes; the file is left unchanged. Split it into smaller modules.
