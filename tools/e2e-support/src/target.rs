@@ -127,7 +127,7 @@ impl std::error::Error for TargetError {}
 pub enum IsolationReason {
     /// The test asserts `ipe`'s own default target resolution.
     DefaultResolutionUnderTest,
-    /// The test drives `ipe run`/`ipe build`, which emits the fixed package
+    /// The test drives `ipe dev run`/`ipe dev build`, which emits the fixed package
     /// `ipe-app`; two such builds in one shared target overwrite each other's
     /// binary.
     FixedPackageName,
