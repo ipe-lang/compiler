@@ -605,7 +605,7 @@ pub enum NameError {
     CtorNotExposed {
         module: Box<str>,
         type_name: Box<str>,
-        why: CtorWithheld,
+        why: Box<CtorWithheld>,
     },
     /// The `module` declaration at the top of a `.ipe` file does not match the
     /// path I derived from the file's location under `source_root`. [IPE-N0023]
@@ -3964,15 +3964,6 @@ const fn consent_code(msg: &ConsentError) -> Code {
     }
 }
 
-// --- did_you_mean ------------------------------------------------------------
-
-/// Turns ranked candidates into help lines.
-///
-/// A single candidate with a proven [`EditTarget`] becomes a [`Suggestion`]
-/// over exactly that region, applicable unprompted only when the ranker found
-/// it unambiguous ([`sole_applicability`]); any other shape
-/// (several candidates, or no provable region) stays a non-committal "did you
-/// mean" line per name, in the ranker's order.
 /// The remedy for an import constructor clause `module` withholds under `type_name`.
 fn ctor_not_exposed_help(module: &str, type_name: &str, why: &CtorWithheld) -> Vec<HelpLine> {
     let note = |text: String| vec![HelpLine::Note(text.into_boxed_str())];
@@ -4015,6 +4006,15 @@ fn is_stdlib_module(module: &str) -> bool {
     })
 }
 
+// --- did_you_mean ------------------------------------------------------------
+
+/// Turns ranked candidates into help lines.
+///
+/// A single candidate with a proven [`EditTarget`] becomes a [`Suggestion`]
+/// over exactly that region, applicable unprompted only when the ranker found
+/// it unambiguous ([`sole_applicability`]); any other shape
+/// (several candidates, or no provable region) stays a non-committal "did you
+/// mean" line per name, in the ranker's order.
 fn did_you_mean(candidates: &Candidates) -> Vec<HelpLine> {
     match (&*candidates.hits, &candidates.region) {
         ([only], Some(target)) => vec![HelpLine::Suggest(Suggestion {
