@@ -307,6 +307,19 @@ fn find_executable(json_stdout: &str, unique_pkg: &str) -> Option<String> {
 /// shared target and the returned [`SharedBuild`] removes only its own
 /// artifacts.
 fn build_emitted_binary(golden_name: &str, emitted_dir: &Path) -> Result<SharedBuild, String> {
+    build_emitted_binary_with_env(golden_name, emitted_dir, &[])
+}
+
+/// [`build_emitted_binary`], with `envs` additionally set on the `cargo build`
+/// invocation (e.g. `RUSTFLAGS` for an overflow-checks SEAL). The lockfile
+/// resolve step never takes `envs` — it never needs to see them, and keeping
+/// them off it means a build-only env var cannot accidentally perturb
+/// resolution.
+fn build_emitted_binary_with_env(
+    golden_name: &str,
+    emitted_dir: &Path,
+    envs: &[(&str, &str)],
+) -> Result<SharedBuild, String> {
     let unique_pkg = rewrite_package_name(emitted_dir, golden_name)?;
     let refused = |e: target::TargetError| format!("{golden_name}: {e}");
     let build_target = match target::shared().map_err(refused)? {
@@ -328,7 +341,8 @@ fn build_emitted_binary(golden_name: &str, emitted_dir: &Path) -> Result<SharedB
     cmd.arg("build")
         .arg("--locked")
         .arg("--message-format=json")
-        .current_dir(emitted_dir);
+        .current_dir(emitted_dir)
+        .envs(envs.iter().copied());
     let build = run_bounded_build(
         cmd,
         golden_name,
@@ -689,7 +703,21 @@ fn drain_stream(
 /// (the message carries cargo's stderr), the binary cannot be located in the
 /// JSON output, or the binary cannot be executed.
 pub fn build_and_run_rust(golden_name: &str, emitted_dir: &Path) -> Result<RunResult, String> {
-    let exe = build_emitted_binary(golden_name, emitted_dir)?;
+    build_and_run_rust_with_env(golden_name, emitted_dir, &[])
+}
+
+/// [`build_and_run_rust`], with `envs` additionally set on the `cargo build`
+/// invocation (never on the run of the already-built binary — a build-time
+/// flag like `RUSTFLAGS` has nothing to say to the finished executable).
+///
+/// # Errors
+/// Same as [`build_and_run_rust`].
+pub fn build_and_run_rust_with_env(
+    golden_name: &str,
+    emitted_dir: &Path,
+    envs: &[(&str, &str)],
+) -> Result<RunResult, String> {
+    let exe = build_emitted_binary_with_env(golden_name, emitted_dir, envs)?;
 
     let run = Command::new(&exe)
         .output()

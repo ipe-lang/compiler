@@ -119,9 +119,22 @@ fn sanitized_name_project_cargo_builds() -> DResult<()> {
         );
 
         // Full build gate: the renamed crate must cargo build without error.
+        // Vendored and built directly against an EXCLUSIVE isolated target
+        // (`FixedPackageName`) rather than `seal_e2e::build_emitted` — that
+        // helper renames the package per golden to share the warm target, which
+        // would mask exactly the sanitized name this test proves is
+        // cargo-acceptable.
         let runtime = e2e_support::require_runtime().into_path_buf();
         let slot = format!("ipe_cargo_name_seal_{expected_cargo_name}");
-        let status = seal_e2e::vendor_and_run(&emitted, &runtime, &slot, "build")?;
+        let out = seal_e2e::vendor_into(&emitted, &runtime, &slot)?;
+        let isolated =
+            e2e_support::target::isolated(e2e_support::target::IsolationReason::FixedPackageName)
+                .map_err(|e| seal_e2e::build_bug(format!("{slot}: {e}")))?;
+        let build_target = e2e_support::target::BuildTarget::Isolated(isolated);
+        let status = e2e_support::target::cargo_command(&build_target)
+            .arg("build")
+            .current_dir(&out)
+            .status();
         assert!(
             matches!(&status, Ok(s) if s.success()),
             "sanitized name {expected_cargo_name:?} (from {raw_name:?}): \
