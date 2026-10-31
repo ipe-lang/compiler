@@ -38,14 +38,14 @@ fn seed_ffi_cache(project_root: &Path) -> bool {
         "functions": [
             {
                 "name": "shift",
-                "params": [{"name": "n", "type": "i64"}],
-                "results": [{"name": "", "type": "i64"}],
+                "params": [{"name": "n", "type": "Int", "ipeType": "Int", "rustType": "i64"}],
+                "results": [{"name": "", "type": "Int", "rustType": "i64"}],
                 "effect": "pure"
             },
             {
                 "name": "clamped",
-                "params": [{"name": "n", "type": "u32"}],
-                "results": [{"name": "", "type": "u32"}],
+                "params": [{"name": "n", "type": "Int", "ipeType": "Int", "rustType": "u32"}],
+                "results": [{"name": "", "type": "Int", "rustType": "u32"}],
                 "effect": "pure"
             }
         ],

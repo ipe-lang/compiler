@@ -31,8 +31,8 @@ use ipe_kernels::{BuiltinTag, BuiltinType};
 use ipe_syntax::TypeAnnotation;
 
 use crate::carrier::ScalarCarrier;
-use crate::diag::{AssertedCompilerBug, AssertedDefect, Diagnostic};
-use crate::driver::InstalledCrate;
+use crate::diag::{AssertedCompilerBug, AssertedDefect, Diagnostic, InspectedShapeReason};
+use crate::driver::{InspectedSig, InstalledCrate};
 use crate::pkginfo::Effect;
 use crate::unify::UnifyReport;
 
@@ -645,7 +645,7 @@ pub fn validate(
     if path.is_crate_top_level()
         && let Some(fact) = target.inspected_free_fns.get(path.fn_name())
     {
-        check_against_inspection(&path, &sig, fact, scope, target).map_err(&refused)?;
+        check_against_inspection(&path, &sig, fact).map_err(&refused)?;
     }
 
     Ok(AssertedSpec {
@@ -664,39 +664,38 @@ fn check_against_inspection(
     path: &AssertedPath,
     sig: &AssertedSig,
     fact: &crate::driver::InspectedFnFact,
-    scope: &CarrierScope<'_>,
-    target: &InstalledCrate,
 ) -> Result<(), AssertedDefect> {
-    let unsupported = |reason: &str| AssertedDefect::InspectedShapeUnsupported {
-        reason: reason.to_owned(),
-    };
+    let unsupported = |reason| AssertedDefect::InspectedShapeUnsupported { reason };
     if fact.effect != Effect::Pure {
-        return Err(unsupported(
-            "its effect is not a plain synchronous return — the fallible/async \
-             folding lives on the inspected path",
-        ));
+        return Err(unsupported(InspectedShapeReason::NotPure));
     }
-    let Some(result_ty) = &fact.result else {
-        return Err(unsupported("it returns no value"));
+    let (params, result) = match &fact.signature {
+        InspectedSig::Declared { params, result } => (params, result),
+        InspectedSig::Undeclared => {
+            return Err(unsupported(InspectedShapeReason::UndeclaredRustType));
+        }
+    };
+    let Some(result_ty) = result else {
+        return Err(unsupported(InspectedShapeReason::NoReturnValue));
     };
     let expected = || AssertedDefect::InspectedMismatch {
         expected: format!(
             "fn {}({}) -> {}",
             path.fn_name(),
-            fact.params.join(", "),
+            params.join(", "),
             result_ty
         ),
     };
     let declared_params: &[AssertedCarrier] = if sig.unit_param { &[] } else { &sig.params };
-    if declared_params.len() != fact.params.len() {
+    if declared_params.len() != params.len() {
         return Err(expected());
     }
-    for (carrier, foreign) in declared_params.iter().zip(&fact.params) {
-        if !exact_carrier_match(carrier, foreign, scope, target) {
+    for (carrier, foreign) in declared_params.iter().zip(params) {
+        if !exact_carrier_match(carrier, foreign) {
             return Err(expected());
         }
     }
-    if !exact_carrier_match(&sig.result, result_ty, scope, target) {
+    if !exact_carrier_match(&sig.result, result_ty) {
         return Err(expected());
     }
     Ok(())
@@ -711,28 +710,16 @@ fn normalized_rust(ty: &str) -> String {
 /// Whether an asserted carrier is EXACTLY the inspected Rust type.
 ///
 /// A scalar matches its one owned spelling byte-for-byte (whitespace-
-/// normalized). An opaque matches on the FULL resolved Rust path, never a last
-/// segment: an inspected path spelling is compared as written, and a bare
-/// inspected name is first resolved through the same crate maps the carrier
-/// came from. No clamp, no widening — identity only.
-fn exact_carrier_match(
-    carrier: &AssertedCarrier,
-    foreign_ty: &str,
-    scope: &CarrierScope<'_>,
-    target: &InstalledCrate,
-) -> bool {
+/// normalized). An opaque matches on the FULL Rust path, never a last segment:
+/// the inspected spelling is compared as written, and a bare (unqualified)
+/// inspected spelling never matches an opaque — the inspector qualifies every
+/// nameable foreign type. No clamp, no widening — identity only.
+fn exact_carrier_match(carrier: &AssertedCarrier, foreign_ty: &str) -> bool {
     let foreign = normalized_rust(foreign_ty);
     match carrier {
         AssertedCarrier::Scalar(scalar) => foreign == normalized_rust(scalar.rust_owned()),
         AssertedCarrier::Opaque(opaque) => {
-            let foreign_path = if foreign.contains("::") {
-                Some(foreign)
-            } else {
-                scope
-                    .resolve_opaque(target, &foreign)
-                    .map(|resolved| normalized_rust(resolved.rust_path()))
-            };
-            foreign_path.is_some_and(|p| p == normalized_rust(opaque.rust_path()))
+            foreign.contains("::") && foreign == normalized_rust(opaque.rust_path())
         }
     }
 }
@@ -1172,20 +1159,21 @@ mod tests {
             "functions": [
                 {
                     "name": "frobnicate",
-                    "params": [{"name": "n", "type": "i64"}],
-                    "results": [{"name": "", "type": "i64"}],
+                    "params": [{"name": "n", "type": "Int", "ipeType": "Int", "rustType": "i64"}],
+                    "results": [{"name": "", "type": "Int", "rustType": "i64"}],
                     "effect": "pure"
                 },
                 {
                     "name": "clamped",
-                    "params": [{"name": "n", "type": "u32"}],
-                    "results": [{"name": "", "type": "u32"}],
+                    "params": [{"name": "n", "type": "Int", "ipeType": "Int", "rustType": "u32"}],
+                    "results": [{"name": "", "type": "Int", "rustType": "u32"}],
                     "effect": "pure"
                 },
                 {
                     "name": "parse",
-                    "params": [{"name": "text", "type": "&str", "ipeType": "String"}],
-                    "results": [{"name": "", "type": "Result<Version, Error>",
+                    "params": [{"name": "text", "type": "String", "ipeType": "String",
+                                "rustType": "&str"}],
+                    "results": [{"name": "", "type": "Result Error Version",
                                  "rustType": "Result<semver::Version, semver::Error>"}],
                     "effect": "fallible"
                 }
@@ -1780,8 +1768,10 @@ mod tests {
     #[test]
     fn exact_match_compares_full_path() {
         let fact = |param: &str| crate::driver::InspectedFnFact {
-            params: vec![param.to_owned()],
-            result: Some("i64".to_owned()),
+            signature: InspectedSig::Declared {
+                params: vec![param.to_owned()],
+                result: Some("i64".to_owned()),
+            },
             effect: Effect::Pure,
         };
         let check = |param: &str| {
@@ -1803,9 +1793,46 @@ mod tests {
             matches!(defect, Some(AssertedDefect::InspectedMismatch { .. })),
             "{defect:?}"
         );
-        // The inspected spelling resolves to the carrier's own full path.
+        // The inspected full path is the carrier's own full path.
         assert!(check("semver::Version").is_ok());
-        assert!(check("Version").is_ok());
+        assert!(check("::semver::Version").is_ok());
+    }
+
+    #[test]
+    fn a_bare_inspected_opaque_spelling_is_refused() {
+        // The inspector qualifies every nameable foreign type, so a bare
+        // spelling names no identity — even one that resolves to the carrier's
+        // own nominal through the crate's maps. A recorded opaque path that is
+        // itself one bare segment (`::Version`) must not make it match either.
+        for recorded in [None, Some("Version")] {
+            let mut semver = semver_crate();
+            if let Some(path) = recorded {
+                semver
+                    .opaque_types
+                    .insert("Version".to_owned(), path.to_owned());
+            }
+            semver.inspected_free_fns.insert(
+                "takes_version".to_owned(),
+                crate::driver::InspectedFnFact {
+                    signature: InspectedSig::Declared {
+                        params: vec!["Version".to_owned()],
+                        result: Some("i64".to_owned()),
+                    },
+                    effect: Effect::Pure,
+                },
+            );
+            let defect = refused_with(validated_in(
+                &["Version", "Result Error Int"],
+                "semver::takes_version",
+                &[semver],
+                &UnifyReport::default(),
+                &LocalTypeNames::default(),
+            ));
+            assert!(
+                matches!(defect, Some(AssertedDefect::InspectedMismatch { .. })),
+                "recorded {recorded:?}: {defect:?}"
+            );
+        }
     }
 
     /// An installed crate whose inspection has the inspector's own shape:
@@ -1868,6 +1895,54 @@ mod tests {
     }
 
     #[test]
+    fn an_undeclared_rust_type_is_refused_not_read_from_the_ipe_view() {
+        // The inspector omits `rustType` for a type it cannot render while the
+        // Ipê view still reads `String`; the fact must not fall back to it.
+        let ta = inspector_shaped_crate(
+            "ta",
+            &serde_json::json!([
+                {
+                    "name": "takes_callback",
+                    "params": [{"name": "cb", "type": "String", "ipeType": "String"}],
+                    "results": [{"name": "", "type": "Int", "rustType": "i64"}],
+                    "effect": "pure"
+                },
+                {
+                    "name": "yields_callback",
+                    "params": [{"name": "n", "type": "Int", "ipeType": "Int", "rustType": "i64"}],
+                    "results": [{"name": "", "type": "String"}],
+                    "effect": "pure"
+                }
+            ]),
+        );
+        assert_eq!(
+            ta.inspected_free_fns
+                .get("takes_callback")
+                .map(|fact| &fact.signature),
+            Some(&InspectedSig::Undeclared)
+        );
+        for (sig, path) in [
+            (["String", "Result Error Int"], "ta::takes_callback"),
+            (["Int", "Result Error String"], "ta::yields_callback"),
+        ] {
+            let defect = refused_with(validated_in(
+                &sig,
+                path,
+                std::slice::from_ref(&ta),
+                &UnifyReport::default(),
+                &LocalTypeNames::default(),
+            ));
+            assert_eq!(
+                defect,
+                Some(AssertedDefect::InspectedShapeUnsupported {
+                    reason: InspectedShapeReason::UndeclaredRustType,
+                }),
+                "{path}"
+            );
+        }
+    }
+
+    #[test]
     fn an_ipe_view_match_over_a_different_rust_type_is_refused() {
         for (sig, path) in [
             (["Int", "Result Error Int"], "ta::narrow"),
@@ -1892,8 +1967,10 @@ mod tests {
         ta.inspected_free_fns.insert(
             "open_client".to_owned(),
             crate::driver::InspectedFnFact {
-                params: vec!["i64".to_owned()],
-                result: Some("tb::Client".to_owned()),
+                signature: InspectedSig::Declared {
+                    params: vec!["i64".to_owned()],
+                    result: Some("tb::Client".to_owned()),
+                },
                 effect: Effect::Pure,
             },
         );

@@ -208,7 +208,7 @@ pub enum AssertedDefect {
     /// call (non-pure effect, no return value, or a receiver).
     InspectedShapeUnsupported {
         /// The unsupported aspect.
-        reason: String,
+        reason: InspectedShapeReason,
     },
     /// The target is inspected and the assertion does not match it under the
     /// exact-carrier rule (identity, never a clamp or widening).
@@ -254,6 +254,33 @@ pub enum AssertedDefect {
     },
     /// An internal invariant of the asserted-call boundary failed.
     CompilerBug(AssertedCompilerBug),
+}
+
+/// Why an inspected target cannot carry an asserted call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InspectedShapeReason {
+    /// The effect is not a plain synchronous return.
+    NotPure,
+    /// The target returns no value.
+    NoReturnValue,
+    /// The inspection declares no Rust type for a parameter or the result.
+    UndeclaredRustType,
+}
+
+impl fmt::Display for InspectedShapeReason {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NotPure => f.write_str(
+                "its effect is not a plain synchronous return — the fallible/async \
+                 folding lives on the inspected path",
+            ),
+            Self::NoReturnValue => f.write_str("it returns no value"),
+            Self::UndeclaredRustType => f.write_str(
+                "the inspection declares no Rust type for a parameter or the result, \
+                 so the assertion cannot be checked against it",
+            ),
+        }
+    }
 }
 
 /// The closed set of internal invariants the asserted-call boundary checks.

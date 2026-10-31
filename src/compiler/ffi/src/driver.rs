@@ -1377,13 +1377,48 @@ pub struct InstalledCrate {
 /// exact-carrier cross-check.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InspectedFnFact {
-    /// Parameter Rust types as the signature declares them
-    /// ([`crate::pkginfo::Param::signature_rust_type`]), never the Ipê view.
-    pub params: Vec<String>,
-    /// The result Rust type, same derivation, or `None` for a unit return.
-    pub result: Option<String>,
+    /// The declared Rust signature, or the record that the inspection
+    /// declares none.
+    pub signature: InspectedSig,
     /// The inspector's effect classification.
     pub effect: crate::pkginfo::Effect,
+}
+
+/// An inspected function's Rust signature as the inspection declares it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InspectedSig {
+    /// Every parameter and the result carry a declared Rust type
+    /// ([`crate::pkginfo::Param::signature_rust_type`]), never the Ipê view.
+    Declared {
+        /// Parameter Rust types, in order.
+        params: Vec<String>,
+        /// The result Rust type, or `None` for a unit return.
+        result: Option<String>,
+    },
+    /// Some parameter or the result carries no declared Rust type. The
+    /// function is still recorded, so an assertion over it is refused rather
+    /// than left unchecked.
+    Undeclared,
+}
+
+impl InspectedSig {
+    /// The declared signature of `params` and `result`, or
+    /// [`InspectedSig::Undeclared`] when any of them lacks a declared Rust type.
+    #[must_use]
+    pub fn of(params: &[crate::pkginfo::Param], result: Option<&crate::pkginfo::Param>) -> Self {
+        let declared_params: Option<Vec<String>> = params
+            .iter()
+            .map(|p| p.signature_rust_type().map(str::to_owned))
+            .collect();
+        // `Some(None)`: no result to declare; `None`: a result with no `rustType`.
+        let declared_result = result.map_or(Some(None), |r| {
+            r.signature_rust_type().map(|ty| Some(ty.to_owned()))
+        });
+        match (declared_params, declared_result) {
+            (Some(params), Some(result)) => Self::Declared { params, result },
+            (None, _) | (_, None) => Self::Undeclared,
+        }
+    }
 }
 
 /// One inspected public constant's declared Rust surface, for the `Rust.const`
@@ -1829,15 +1864,7 @@ pub fn installed_crate_from_pkg(
             inspected_free_fns.insert(
                 f.name().to_owned(),
                 InspectedFnFact {
-                    params: f
-                        .params()
-                        .iter()
-                        .map(|p| p.signature_rust_type().to_owned())
-                        .collect(),
-                    result: f
-                        .results()
-                        .first()
-                        .map(|r| r.signature_rust_type().to_owned()),
+                    signature: InspectedSig::of(f.params(), f.results().first()),
                     effect: f.effect(),
                 },
             );
@@ -3051,7 +3078,7 @@ mod tests {
             "functions": [{
                 "name": "parse",
                 "params": [{"name": "text", "type": "String", "rustType": "&str; std::process::exit(1)"}],
-                "results": [{"name": "", "type": "u64"}],
+                "results": [{"name": "", "type": "Int", "rustType": "u64"}],
                 "effect": "pure"
             }],
             "errors": []

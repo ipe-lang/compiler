@@ -182,16 +182,14 @@ impl Param {
         self.rust_type.as_ref().map_or("", RustTypeExpr::as_str)
     }
 
-    /// The Rust type the inspected signature declares: the inspector's
-    /// `rustType` when present, else the `type` spelling (a document with no
-    /// `rustType` spells the Rust type there). Never the Ipê surface type —
-    /// an exact-carrier comparison against `Int` or a bare `Client` would
-    /// compare the Ipê view, not the foreign identity.
+    /// The Rust type the inspected signature declares — the inspector's
+    /// `rustType`, or `None` when the document declares none. Never the `type`
+    /// spelling: the inspector writes the Ipê surface view there, so an
+    /// exact-carrier comparison against it would compare the Ipê view, not the
+    /// foreign identity.
     #[must_use]
-    pub fn signature_rust_type(&self) -> &str {
-        self.rust_type
-            .as_ref()
-            .map_or(self.foreign_ty.as_str(), RustTypeExpr::as_str)
+    pub fn signature_rust_type(&self) -> Option<&str> {
+        self.rust_type.as_ref().map(RustTypeExpr::as_str)
     }
 }
 
