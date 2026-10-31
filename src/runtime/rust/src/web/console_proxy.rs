@@ -544,7 +544,7 @@ pub(crate) async fn ensure_console_proxy(mount: &super::MountContext) -> bool {
     true
 }
 
-/// Add the reverse-proxy routes (`/_ipe/console` + `/_ipe/console/*rest`) to a
+/// Add the reverse-proxy routes (`/_ipe/console` + `/_ipe/console/{*rest}`) to a
 /// router. Generic over the app state `S` because `proxy_entry` is state-free —
 /// so this composes into the main `Router<WebState<…>>` before `with_state`,
 /// keeping the proxy under the same `track` middleware as every other route.
@@ -556,12 +556,48 @@ where
     use axum::routing::any;
     router
         .route(CONSOLE_BASE, any(proxy_entry))
-        .route(&format!("{CONSOLE_BASE}/*rest"), any(proxy_entry))
+        .route(&format!("{CONSOLE_BASE}/{{*rest}}"), any(proxy_entry))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The proxy routes spell their catch-all in the router's syntax: the base
+    /// and every path beneath it reach the proxy entry; a sibling prefix does
+    /// not, nor the base with only a trailing slash (`{*rest}` matches no
+    /// empty rest).
+    #[tokio::test]
+    #[allow(clippy::expect_used)] // test: fixed requests build
+    async fn proxy_routes_cover_the_console_base_and_beneath_it() {
+        use tower::ServiceExt;
+        let app = crate::server::behind_listener(proxy_routes(axum::Router::new()));
+        for (path, routed) in [
+            ("/_ipe/console", true),
+            ("/_ipe/console/api/x", true),
+            ("/_ipe/console/", false),
+            ("/_ipe/consolex", false),
+            ("/_ipe", false),
+        ] {
+            let wire = axum::http::Request::builder()
+                .uri(path)
+                .header(axum::http::header::HOST, "localhost:8000")
+                .body(axum::body::Body::empty())
+                .expect("test request builds");
+            let status = app
+                .clone()
+                .oneshot(wire)
+                .await
+                .map_or(axum::http::StatusCode::INTERNAL_SERVER_ERROR, |r| {
+                    r.status()
+                });
+            assert_eq!(
+                status != axum::http::StatusCode::NOT_FOUND,
+                routed,
+                "{path} answered {status}"
+            );
+        }
+    }
 
     #[test]
     fn a_forced_exit_removes_the_zero_config_console_store() {

@@ -1618,7 +1618,8 @@ impl ServerPattern {
 
     /// The spelling the router registers: `/`, or `/seg/...` with each
     /// literal canonical and the parameter numbered `n` in pattern order
-    /// spelled `:pn`.
+    /// spelled `{pn}`. A literal's `{`, `}`, `:` and `*` are percent-escaped
+    /// by [`canonical_segment`], so no literal can read as a capture.
     ///
     /// Two patterns have one spelling exactly when they have one shape: the
     /// same trailing slash and, position by position, the same decoded
@@ -1656,8 +1657,9 @@ fn router_spelling(
         match seg {
             PatternSeg::Literal(lit) => push(&canonical_segment(lit))?,
             PatternSeg::Param(_) => {
-                push(":p")?;
+                push("{p")?;
                 push(&ordinal.to_string())?;
+                push("}")?;
                 ordinal = ordinal.saturating_add(1);
             }
         }
@@ -2959,8 +2961,11 @@ mod server_pattern_tests {
         for (raw, rendered) in [
             ("/", "/"),
             ("//", "/"),
-            ("/greet/:name", "/greet/:p0"),
-            ("/:a/x/:b/", "/:p0/x/:p1/"),
+            ("/greet/:name", "/greet/{p0}"),
+            ("/:a/x/:b/", "/{p0}/x/{p1}/"),
+            ("/{id}", "/%7Bid%7D"),
+            ("/a/{{b}}", "/a/%7B%7Bb%7D%7D"),
+            ("/a%7Bb%7D", "/a%7Bb%7D"),
             ("/café", "/caf%C3%A9"),
             ("/caf%C3%A9", "/caf%C3%A9"),
             ("/%61pi", "/api"),
@@ -2971,7 +2976,7 @@ mod server_pattern_tests {
             ("/a/%3Ax", "/a/%3Ax"),
             ("/a/%2A", "/a/%2A"),
             ("/a%2Fb", "/a%2Fb"),
-            ("/%2E/:_x1", "/%2E/:p0"),
+            ("/%2E/:_x1", "/%2E/{p0}"),
         ] {
             let pattern = ServerPattern::parse(raw).expect("well-formed pattern");
             assert_eq!(pattern.router_path(), rendered, "{raw:?}");

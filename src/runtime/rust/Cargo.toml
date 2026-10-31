@@ -41,7 +41,7 @@ zstd = { version = "0.14", optional = true }
 csv = { version = "1", optional = true }
 toml = { version = "0.8", optional = true }
 serde-saphyr = { version = "1.3", default-features = false, features = ["deserialize"], optional = true }
-axum = { version = "0.7", features = ["ws"], optional = true }
+axum = { version = "0.8", features = ["ws"], optional = true }
 tower-http = { version = "0.5", features = ["fs", "catch-panic", "timeout"], optional = true }
 # `tower` (limit + util) backs the server front-door DoS ceilings:
 # `GlobalConcurrencyLimitLayer` (in-flight cap) needs `limit`; `ServiceExt`
@@ -706,6 +706,9 @@ tokio = { version = "1", features = ["full", "test-util", "macros"] }
 # A fake TLS PostgreSQL server proves the pinned relay keeps SNI and
 # certificate host-name verification.
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+# `websocket_upgrader_refuses_a_connect` attaches the connection's upgrade
+# handle (`hyper::upgrade::OnUpgrade`) a listener gives every request.
+hyper = { version = "1", default-features = false, features = ["http1", "server"] }
 # `tests/per_event_render_budget.rs` counts the allocations of a render pass
 # through an instrumented global allocator, installed in that test binary only.
 stats_alloc = "0.1.10"

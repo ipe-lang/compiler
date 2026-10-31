@@ -267,32 +267,156 @@ fn strip_default_port<'a>(authority: &'a str, scheme: &str) -> &'a str {
     authority.strip_suffix(suffix).unwrap_or(authority)
 }
 
-/// Whether an `Origin` header's host disagrees with a `Host` header, once
-/// each side's scheme-implied default port is normalized away. Returns
-/// `true` when they are CROSS-origin (a mismatch); `false` when same-origin
-/// OR when `host` is empty (nothing to compare against — every existing call
-/// site treats an empty `Host` as "don't reject").
+/// The authority a request was addressed to, as the app listener's Host
+/// admission parses it: the target URI's (absolute-form, HTTP/2 `:authority`),
+/// else the one `Host` header.
 ///
-/// Shared by every "compare Origin's host against Host" call site in the
-/// runtime (`live/csrf.rs::origin_mismatch`, `live/console.rs::
-/// is_cross_origin_ingest`, `server.rs::ws_cross_origin`) so the three never
-/// drift to different normalization behavior. Browsers omit the default
-/// port from BOTH the `Origin` and `Host` headers they send, so a raw string
-/// compare is right in the overwhelming common case — but a reverse proxy or
-/// non-browser client that sets an EXPLICIT `:443`/`:80` (e.g. `Origin:
-/// https://example.com` vs `Host: example.com:443`) would otherwise trip a
-/// false-positive cross-origin rejection. This is an availability nit (every
-/// caller fails CLOSED on a mismatch — over-rejecting, never under-
-/// rejecting), not a vulnerability; still worth normalizing correctly rather
-/// than leaving three copies of the same raw-string-compare gap.
+/// Never empty and never ambiguous, so a comparison against it can never pass
+/// vacuously or against one of two disagreeing authorities.
 #[cfg(feature = "server")]
-pub(crate) fn origin_host_mismatch(origin: &str, host: &str) -> bool {
-    if host.is_empty() {
-        return false;
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RequestAuthority<'a>(&'a str);
+
+#[cfg(feature = "server")]
+impl<'a> RequestAuthority<'a> {
+    /// The authority `parts` names, if the listener's parse admits one.
+    ///
+    /// `None` when [`crate::inbound_authority::Authority::from_request`]
+    /// refuses it: no authority, two `Host` headers, a `Host` disagreeing with
+    /// the target URI, or a malformed one.
+    #[must_use]
+    pub fn of(parts: &'a axum::http::request::Parts) -> Option<Self> {
+        if crate::inbound_authority::Authority::from_request(parts).is_err() {
+            return None;
+        }
+        parts
+            .uri
+            .authority()
+            .map(axum::http::uri::Authority::as_str)
+            .or_else(|| {
+                parts
+                    .headers
+                    .get(axum::http::header::HOST)
+                    .and_then(|host| host.to_str().ok())
+            })
+            .map(Self)
     }
+
+    /// The authority text.
+    #[must_use]
+    pub const fn as_str(self) -> &'a str {
+        self.0
+    }
+
+    /// The authority, held past the request head it was read from.
+    #[must_use]
+    pub fn hold(self) -> HeldAuthority {
+        HeldAuthority(self.0.into())
+    }
+}
+
+/// A [`RequestAuthority`] that outlives the request head it was read from.
+///
+/// Minted only by [`RequestAuthority::hold`], so it carries the same proof.
+#[cfg(feature = "server")]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HeldAuthority(Box<str>);
+
+#[cfg(feature = "server")]
+impl HeldAuthority {
+    /// The held authority, borrowed back.
+    #[must_use]
+    pub fn get(&self) -> RequestAuthority<'_> {
+        RequestAuthority(&self.0)
+    }
+}
+
+/// A request's `Origin` header, read once.
+///
+/// The one reader behind every `Origin` site (`csrf.rs::origin_mismatch`,
+/// `console.rs::is_cross_origin_ingest`, `server.rs::ws_cross_origin`, the
+/// WebSocket allowlist and `Middleware.withCors`), so a repeated or
+/// undecodable `Origin` reads the same everywhere.
+#[cfg(feature = "server")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum OriginHeader<'a> {
+    /// The request carries no `Origin`.
+    Absent,
+    /// The request's one `Origin`, visible ASCII, space or tab.
+    One(&'a str),
+    /// Two `Origin` headers, or one that is not visible ASCII: no one reading.
+    Refused,
+}
+
+#[cfg(feature = "server")]
+impl<'a> OriginHeader<'a> {
+    /// The `Origin` of a request head's raw header map.
+    pub(crate) fn of(headers: &'a axum::http::HeaderMap) -> Self {
+        Self::read(
+            headers
+                .get_all(axum::http::header::ORIGIN)
+                .iter()
+                .map(axum::http::HeaderValue::as_bytes),
+        )
+    }
+
+    /// The `Origin` of a program-visible header dict, its name matched in any
+    /// case: two spellings of the name are two copies.
+    pub(crate) fn of_dict(headers: &'a crate::dict::IpeDict<String>) -> Self {
+        Self::read(
+            headers
+                .iter()
+                .filter(|(name, _)| name.eq_ignore_ascii_case("origin"))
+                .map(|(_, value)| value.as_bytes()),
+        )
+    }
+
+    fn read(mut copies: impl Iterator<Item = &'a [u8]>) -> Self {
+        let Some(first) = copies.next() else {
+            return Self::Absent;
+        };
+        if copies.next().is_some() {
+            return Self::Refused;
+        }
+        header_text(first).map_or(Self::Refused, Self::One)
+    }
+
+    /// The one `Origin`, when the request carries exactly one readable copy.
+    pub(crate) const fn single(self) -> Option<&'a str> {
+        match self {
+            Self::One(origin) => Some(origin),
+            Self::Absent | Self::Refused => None,
+        }
+    }
+
+    /// Whether this `Origin` makes a request addressed to `authority`
+    /// cross-origin: an absent one never does, a refused one always does.
+    pub(crate) fn is_cross_origin(self, authority: Option<RequestAuthority<'_>>) -> bool {
+        match self {
+            Self::Absent => false,
+            Self::Refused => true,
+            Self::One(origin) => origin_host_mismatch(origin, authority),
+        }
+    }
+}
+
+/// Whether an `Origin` disagrees with the request's authority.
+///
+/// Each side's scheme-implied default port is normalized away first. A request
+/// naming no single authority (`None`) is a mismatch: with nothing to compare
+/// the `Origin` against, the check fails closed. Reached only through
+/// [`OriginHeader::is_cross_origin`]. Browsers omit the default port from both
+/// `Origin` and `Host`, but a proxy or non-browser client may send an explicit
+/// `:443`/`:80` (`Origin: https://example.com` against `Host: example.com:443`),
+/// which is the same origin.
+#[cfg(feature = "server")]
+fn origin_host_mismatch(origin: &str, authority: Option<RequestAuthority<'_>>) -> bool {
+    let Some(authority) = authority else {
+        return true;
+    };
     let (scheme, origin_authority) = origin.split_once("://").unwrap_or(("", origin));
     let origin_host = strip_default_port(origin_authority, scheme);
-    let host_host = strip_default_port(host, scheme);
+    let host_host = strip_default_port(authority.as_str(), scheme);
     origin_host != host_host
 }
 
@@ -716,69 +840,119 @@ mod tests {
         assert_eq!(canonical_header("über-key"), "über-Key");
     }
 
+    /// The one `Origin` reading: absent, one visible-ASCII copy, or refused
+    /// when repeated (in the raw map or as two spellings in a dict) or not
+    /// visible ASCII.
+    #[test]
+    fn origin_header_reads_one_copy_or_refuses() {
+        use super::OriginHeader;
+        use axum::http::{HeaderMap, HeaderValue, header::ORIGIN};
+        let map = |copies: &[&[u8]]| {
+            let mut h = HeaderMap::new();
+            for copy in copies {
+                if let Ok(value) = HeaderValue::from_bytes(copy) {
+                    h.append(ORIGIN, value);
+                }
+            }
+            h
+        };
+        let one = map(&[b"https://a.example"]);
+        assert_eq!(
+            OriginHeader::of(&one),
+            OriginHeader::One("https://a.example")
+        );
+        assert_eq!(OriginHeader::of(&map(&[])), OriginHeader::Absent);
+        let two = map(&[b"https://a.example", b"https://a.example"]);
+        assert_eq!(OriginHeader::of(&two), OriginHeader::Refused);
+        let obs = map(&[b"https://a.example\xe9"]);
+        assert_eq!(OriginHeader::of(&obs), OriginHeader::Refused);
+        let dict = |pairs: &[(&str, &str)]| -> crate::dict::IpeDict<String> {
+            pairs
+                .iter()
+                .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+                .collect()
+        };
+        let one = dict(&[("ORIGIN", "https://a.example")]);
+        assert_eq!(
+            OriginHeader::of_dict(&one),
+            OriginHeader::One("https://a.example")
+        );
+        let two = dict(&[
+            ("Origin", "https://a.example"),
+            ("origin", "https://a.example"),
+        ]);
+        assert_eq!(OriginHeader::of_dict(&two), OriginHeader::Refused);
+        let ctl = dict(&[("Origin", "https://a.example\u{7f}")]);
+        assert_eq!(OriginHeader::of_dict(&ctl), OriginHeader::Refused);
+        assert!(OriginHeader::Refused.is_cross_origin(None));
+        assert!(!OriginHeader::Absent.is_cross_origin(None));
+    }
+
+    /// Whether `origin` mismatches the authority of a request whose one
+    /// `Host` header is `host` (`None`: no `Host` header).
+    #[cfg(feature = "server")]
+    #[allow(clippy::expect_used)] // test: fixed requests build
+    fn mismatch(origin: &str, host: Option<&str>) -> bool {
+        let mut wire = axum::http::Request::builder().uri("/");
+        if let Some(host) = host {
+            wire = wire.header(axum::http::header::HOST, host);
+        }
+        let (parts, ()) = wire.body(()).expect("test request builds").into_parts();
+        origin_host_mismatch(origin, super::RequestAuthority::of(&parts))
+    }
+
     /// Baseline: same host, no port anywhere — same-origin (browsers'
     /// common case for both headers).
     #[cfg(feature = "server")]
     #[test]
     fn origin_host_mismatch_same_origin_no_ports() {
-        assert!(!origin_host_mismatch("https://example.com", "example.com"));
+        assert!(!mismatch("https://example.com", Some("example.com")));
     }
 
-    /// Cross-origin host — must still be flagged regardless of the port
-    /// normalization added by this fix.
+    /// Cross-origin host — flagged regardless of the port normalization.
     #[cfg(feature = "server")]
     #[test]
     fn origin_host_mismatch_different_host_is_flagged() {
-        assert!(origin_host_mismatch(
-            "https://evil.example",
-            "victim.example"
-        ));
+        assert!(mismatch("https://evil.example", Some("victim.example")));
     }
 
-    /// The bug this fix closes: `https://example.com` (implicit :443) vs
-    /// `Host: example.com:443` (explicit) is the SAME origin. Pre-fix (raw
-    /// string compare) this was a false-positive mismatch.
+    /// `https://example.com` (implicit :443) vs `Host: example.com:443`
+    /// (explicit) is the same origin.
     #[cfg(feature = "server")]
     #[test]
     fn origin_host_mismatch_normalizes_explicit_default_https_port() {
-        assert!(!origin_host_mismatch(
-            "https://example.com",
-            "example.com:443"
-        ));
+        assert!(!mismatch("https://example.com", Some("example.com:443")));
     }
 
-    /// Same bug, `http`/`:80` side.
+    /// The `http`/`:80` side.
     #[cfg(feature = "server")]
     #[test]
     fn origin_host_mismatch_normalizes_explicit_default_http_port() {
-        assert!(!origin_host_mismatch(
-            "http://example.com",
-            "example.com:80"
-        ));
+        assert!(!mismatch("http://example.com", Some("example.com:80")));
     }
 
-    /// A NON-default explicit port must still compare as a mismatch when the
-    /// other side omits it — normalization only strips the SCHEME-IMPLIED
-    /// default port, not arbitrary ports.
+    /// A non-default explicit port still compares as a mismatch when the other
+    /// side omits it — normalization strips only the scheme-implied default.
     #[cfg(feature = "server")]
     #[test]
     fn origin_host_mismatch_nondefault_port_still_flagged() {
-        assert!(origin_host_mismatch(
-            "https://example.com",
-            "example.com:8443"
-        ));
-        assert!(!origin_host_mismatch(
+        assert!(mismatch("https://example.com", Some("example.com:8443")));
+        assert!(!mismatch(
             "https://example.com:8443",
-            "example.com:8443"
+            Some("example.com:8443")
         ));
     }
 
-    /// Empty Host header → never a mismatch (matches every call site's own
-    /// pre-existing `!host.is_empty()` guard — nothing to compare against).
+    /// A request naming no authority, or an empty or malformed one, is a
+    /// mismatch: the comparison fails closed, never passes for want of an
+    /// authority to compare against.
     #[cfg(feature = "server")]
     #[test]
-    fn origin_host_mismatch_empty_host_is_never_flagged() {
-        assert!(!origin_host_mismatch("https://evil.example", ""));
+    fn origin_host_mismatch_without_an_authority_is_flagged() {
+        assert!(mismatch("https://evil.example", None));
+        assert!(mismatch("https://evil.example", Some("")));
+        assert!(mismatch("https://victim.example", Some("victim.example:0")));
+        assert!(origin_host_mismatch("https://victim.example", None));
     }
 
     /// The request fold of `entries`, appended in order.

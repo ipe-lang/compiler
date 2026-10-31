@@ -7557,7 +7557,7 @@ where
     // changes, making `Cache-Control: immutable` safe. This route is CSRF-
     // exempt (GET; the CSRF middleware only checks mutating verbs) and open
     // to all (it's a static public asset). It is registered BEFORE the
-    // catch-all `/*path` route so it is matched first.
+    // catch-all `/{*path}` route so it is matched first.
     let client_js_route_path = client_js_path(); // e.g. "/_ipe/client.a1b2c3d4e5f6a7b8.js"
     async fn serve_client_js() -> impl axum::response::IntoResponse {
         use axum::http::header;
@@ -7835,7 +7835,7 @@ where
     // registered author module + one for the generated registration glue.
     // Each serves a `&'static str` (the bytes interned in the process-global
     // registry at startup) with the same `immutable` discipline as the client
-    // asset. Registered BEFORE the `/*path` page catch-all so a widget URL
+    // asset. Registered BEFORE the `/{*path}` page catch-all so a widget URL
     // hits its static handler, not the page handler. The routes are static
     // public GETs (CSRF-exempt, open) — the served bytes are the exact bytes
     // the page's SRI pins, so a tampered asset makes the browser refuse the
@@ -7874,7 +7874,7 @@ where
     router = install::mount_routes(router, install::registered(), mount.base());
 
     // `IPE_WEB_STATIC_DIR`, set by whoever runs the app → serve files at
-    // /static/* via ServeDir. The nest outranks the `/*path` page catch-all, so
+    // /static/* via ServeDir. The nest outranks the `/{*path}` page catch-all, so
     // a /static/<file> request hits ServeDir, not the page handler (which
     // would return HTML). Inside the nest a `MountTable` re-bases the
     // listener's parse and the URI below `/static` exactly as a `Server.static`
@@ -7899,7 +7899,7 @@ where
             get(handlers::page::<Model, Msg, FInit, FUpdate, FView, FSubs>),
         )
         .route(
-            "/*path",
+            "/{*path}",
             get(handlers::page::<Model, Msg, FInit, FUpdate, FView, FSubs>),
         )
         // Layer order (axum: last `.layer` = outermost): CSRF is INNER of
@@ -18621,7 +18621,7 @@ mod route_entry_cmd_tests {
                 let page_hits = Arc::new(AtomicUsize::new(0));
                 let hits = Arc::clone(&page_hits);
                 let catch_all = axum::Router::new().route(
-                    "/*path",
+                    "/{*path}",
                     axum::routing::get(move || {
                         let hits = Arc::clone(&hits);
                         async move {
