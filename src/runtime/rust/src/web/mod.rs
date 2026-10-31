@@ -13055,9 +13055,13 @@ mod bind_error_tests {
             BuildPosture::Release,
             ErrorKind::ConnectionReset,
         );
-        assert_eq!(other_kind, crate::IpeErrorKind::Io, "{other}");
+        let expected = crate::io_error_kind(ErrorKind::ConnectionReset);
+        assert_eq!(other_kind, expected, "{other}");
         assert!(
-            other.starts_with("Io: Web.tea: bind 127.0.0.1:8000: "),
+            other.starts_with(&format!(
+                "{}: Web.tea: bind 127.0.0.1:8000: ",
+                crate::ipe_error_kind_name(expected)
+            )),
             "{other}"
         );
     }
