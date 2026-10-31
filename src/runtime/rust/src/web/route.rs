@@ -29,8 +29,8 @@
 use std::sync::Arc;
 
 use crate::encoding::{
-    DecodeRefusal, EncodeRefusal, MAX_URL_COMPONENT_LEN, MountBase, MountBaseRefusal,
-    encode_path_segment,
+    CanonicalPath, DecodeRefusal, EncodeRefusal, MAX_URL_COMPONENT_LEN, MountBase,
+    MountBaseRefusal, RequestPath, encode_path_segment,
 };
 pub use crate::encoding::{
     DecodedPath, PatternSeg, RouteParams, RoutePattern, RoutePatternRefusal, RouteSegmentRefusal,
@@ -160,6 +160,75 @@ pub fn located(raw: Option<&str>, base: &DecodedPath) -> LocatedPath {
 /// [`MountRefusal::BasePath`] carrying the [`MountBase::parse`] refusal.
 pub fn mount_base(raw: &str) -> Result<MountBase, MountRefusal> {
     MountBase::parse(raw).map_err(MountRefusal::BasePath)
+}
+
+/// The `req.path` the app's own server hands `init` for the client path
+/// `raw` below `base`: the canonical spelling of the path below the base, its
+/// trailing slash kept.
+///
+/// The listener parses a request path once ([`RequestPath::parse`]); a mount
+/// below a non-root base re-bases it ([`RequestPath::below`]) and the page
+/// reads its canonical spelling ([`RequestPath::canonical`]). This is that
+/// chain over the same three routines, so a browser client's `req.path` and
+/// the server's never differ by the base.
+///
+/// `None` when no request below `base` names `raw`: an unreported path, text
+/// that is not a bare absolute path, a segment that does not decode, a path
+/// outside `base`, or a spelling over the URL ceiling. The server answers each
+/// of those before any `init` runs.
+#[must_use]
+pub fn req_path(raw: Option<&str>, base: &MountBase) -> Option<CanonicalPath> {
+    let raw = raw?;
+    if !raw.starts_with('/') || raw.contains('?') || raw.contains('#') {
+        return None;
+    }
+    let path = RequestPath::parse(raw).ok()?;
+    let below = if base.to_decoded().is_root() {
+        path
+    } else {
+        path.below(base.to_decoded())?
+    };
+    below.canonical().ok()
+}
+
+/// What a browser client's router and `req` read of its address-bar path,
+/// located once below the build's base exactly as the app's own server reads
+/// the same request.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ClientPath {
+    /// The path below the base the router enters ([`located`]).
+    located: LocatedPath,
+    /// `req.path`: the server's spelling ([`req_path`]), or the empty text
+    /// when no request below the base names the path.
+    req_path: String,
+    /// `req.params`: the params of the route that builds the located page
+    /// ([`match_params`], the server's resolver), empty for an unrouted path.
+    params: crate::dict::IpeDict<String>,
+}
+
+impl ClientPath {
+    /// Locate the platform's report `raw` (`None` when it could not report
+    /// one) below `base` against `routes` (empty for an unrouted app).
+    #[must_use]
+    pub fn locate<Page>(raw: Option<&str>, base: &MountBase, routes: &[Route<Page>]) -> Self {
+        let located = located(raw, base.to_decoded());
+        let params = located.as_ref().map_or_else(
+            |_| crate::dict::IpeDict::new(),
+            |path| match_params(routes, path),
+        );
+        let req_path = req_path(raw, base).map_or_else(String::new, |p| p.as_str().to_owned());
+        Self {
+            located,
+            req_path,
+            params,
+        }
+    }
+
+    /// The located path, `req.path` and `req.params`, in that order.
+    #[must_use]
+    pub fn into_parts(self) -> (LocatedPath, String, crate::dict::IpeDict<String>) {
+        (self.located, self.req_path, self.params)
+    }
 }
 
 /// Enter the page a mount's located path names: a miss enters `not_found`.
@@ -1443,6 +1512,62 @@ mod tests {
             render_slug,
         );
         assert_eq!(below.cmd, Page::App("post".into()));
+    }
+
+    /// A client's `req.path` is the path below the build's base, exactly the
+    /// server's spelling; a path outside the base names no request.
+    #[test]
+    fn client_req_path_is_the_path_below_the_base() {
+        let app = match mount_base("/app") {
+            Ok(b) => b,
+            Err(e) => panic!("/app must be a mount base: {e:?}"),
+        };
+        let root = MountBase::root();
+        let cases: [(Option<&str>, &MountBase, &str); 12] = [
+            (Some("/app/x"), &app, "/x"),
+            (Some("/app"), &app, "/"),
+            (Some("/app/"), &app, "/"),
+            (Some("/app/x/"), &app, "/x/"),
+            (Some("/app/a%20b"), &app, "/a%20b"),
+            (Some("/app//x"), &app, ""),
+            (Some("/apple"), &app, ""),
+            (Some("/x"), &app, ""),
+            (Some("/app?q"), &app, ""),
+            (None, &app, ""),
+            (Some("/x"), &root, "/x"),
+            (Some("/app/x"), &root, "/app/x"),
+        ];
+        for (raw, base, want) in cases {
+            let (_, req_path, _) = ClientPath::locate::<Page>(raw, base, &routes()).into_parts();
+            assert_eq!(req_path, want, "{raw:?} below {:?}", base.prefix());
+            let direct = req_path_text(raw, base);
+            assert_eq!(direct, want, "{raw:?} below {:?}", base.prefix());
+        }
+    }
+
+    /// [`req_path`]'s text, the empty text when it names no request.
+    fn req_path_text(raw: Option<&str>, base: &MountBase) -> String {
+        req_path(raw, base).map_or_else(String::new, |p| p.as_str().to_owned())
+    }
+
+    /// A client's `req.params` are the server's: the params of the route that
+    /// builds the page located below the base, empty for an unrouted app.
+    #[test]
+    fn client_req_params_are_the_located_routes() {
+        let app = match mount_base("/app") {
+            Ok(b) => b,
+            Err(e) => panic!("/app must be a mount base: {e:?}"),
+        };
+        let (located, _, params) =
+            ClientPath::locate(Some("/app/apps/x"), &app, &routes()).into_parts();
+        assert_eq!(located, Ok(dp("/apps/x")));
+        assert_eq!(params.get("slug").map(String::as_str), Some("x"));
+        assert_eq!(params, match_params(&routes(), &dp("/apps/x")));
+        let (_, _, outside) = ClientPath::locate(Some("/apps/x"), &app, &routes()).into_parts();
+        assert!(outside.is_empty());
+        let unrouted: &[Route<Page>] = &[];
+        let (_, _, none) = ClientPath::locate(Some("/app/apps/x"), &app, unrouted).into_parts();
+        assert!(none.is_empty());
     }
 
     /// A text that is not a mount base refuses the mount with its typed

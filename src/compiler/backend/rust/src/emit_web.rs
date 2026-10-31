@@ -435,6 +435,10 @@ fn emit_web_app_inner(
     // Browser target: the same cfg drives the client sink. No session store
     // (the model lives in the tab), so no store args and no schema tag.
     if ctx.target == ipe_ir::Target::WasmClient {
+        // Both client sinks take the build's mount base as their last
+        // argument: the routed client locates every path below it, and both
+        // hand `init` the path below it, as the app's own server does.
+        let base_s = rust_str_lit(ctx.mount_base.prefix());
         if let Some((model_ty, page_ty)) = routed_page_field(ctx, view_e) {
             // Routed app: emit `wasm_app_routed` with routes, notFound, a
             // generated `set_page` closure, and the build's mount base, so the
@@ -460,7 +464,6 @@ fn emit_web_app_inner(
                 generics,
             )?;
             let handler = &update.handler;
-            let base_s = rust_str_lit(ctx.mount_base.prefix());
             let call = format!(
                 "ipe_runtime::wasm::wasm_app_routed(\
                  {init_s}, \
@@ -483,7 +486,7 @@ fn emit_web_app_inner(
             }));
         }
         return Ok(Some(format!(
-            "ipe_runtime::wasm::wasm_app({init_s}, {update_s}, {view_s}, {subs_s})"
+            "ipe_runtime::wasm::wasm_app({init_s}, {update_s}, {view_s}, {subs_s}, {base_s})"
         )));
     }
 

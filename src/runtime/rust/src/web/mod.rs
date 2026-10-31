@@ -15702,6 +15702,65 @@ mod emitted_router_behavior_tests {
         });
     }
 
+    /// The `req.path` an embedded app's `init` reads is the path below its
+    /// base, and it is exactly what a browser client built for that base
+    /// hands its own `init` ([`crate::web::route::req_path`]).
+    #[test]
+    fn embedded_init_req_path_agrees_with_the_client() {
+        let seen: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let record = Arc::clone(&seen);
+        let builder = web_embed_router(
+            move |req: WebReq| {
+                record.lock().expect("record lock").push(req.path.clone());
+                init(req)
+            },
+            update,
+            view,
+            subs,
+            "memory".to_string(),
+            String::new(),
+            [0u8; 32],
+        );
+        let base = crate::encoding::MountBase::parse("/billing").expect("the prefix parses");
+        let uris = ["/billing", "/billing/x", "/billing/x/", "/billing/a%20b"];
+        let served = block_on({
+            let base = base.clone();
+            async move {
+                let sub = builder(base.clone()).await;
+                let app = crate::server::behind_listener(
+                    crate::server::MountTable::new(vec![(base, sub)]).below(axum::Router::new()),
+                );
+                let mut statuses = Vec::new();
+                for uri in uris {
+                    let status = app
+                        .clone()
+                        .oneshot(
+                            Request::builder()
+                                .method("GET")
+                                .uri(uri)
+                                .body(Body::empty())
+                                .expect("build GET"),
+                        )
+                        .await
+                        .expect("router responds")
+                        .status();
+                    statuses.push(status);
+                }
+                statuses
+            }
+        });
+        assert!(served.iter().all(|s| *s == StatusCode::OK), "{served:?}");
+        let client: Vec<String> = uris
+            .into_iter()
+            .map(|uri| {
+                crate::web::route::req_path(Some(uri), &base)
+                    .map_or_else(String::new, |p| p.as_str().to_owned())
+            })
+            .collect();
+        assert_eq!(client, ["/", "/x", "/x/", "/a%20b"]);
+        assert_eq!(*seen.lock().expect("record lock"), client);
+    }
+
     /// Two `Web.embed` apps on one listener each serve below their own prefix
     /// and scope their session cookie to it, whichever was built first.
     #[test]

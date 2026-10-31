@@ -254,6 +254,42 @@ fn pure_ui_app_emits_wasm_project() {
     );
 }
 
+/// An unrouted `Web.tea`: `routes` is empty.
+const UNROUTED_APP: &str = "module Main exposing (main)\n\
+     import Ipe.String as String\n\
+     import Ipe.Tea.Web exposing (tea)\n\
+     import Ipe.Tea.Web.Cmd as Cmd\n\
+     import Ipe.Tea.Web.Sub as Sub\n\
+     import Ipe.Ui as Ui\n\
+     \n\
+     type Msg = Increment\n\
+     type alias Model = { count : Int }\n\
+     \n\
+     init : WebReq -> ( Model, Cmd Msg )\n\
+     init _req = ( { count = 0 }, Cmd.none )\n\
+     \n\
+     update : Msg -> Model -> ( Model, Cmd Msg )\n\
+     update msg model =\n\
+     \x20   case msg of\n\
+     \x20       Increment -> ( { model | count = model.count + 1 }, Cmd.none )\n\
+     \n\
+     subscriptions : Model -> Sub Msg\n\
+     subscriptions _model = Sub.none\n\
+     \n\
+     view : Model -> Element Msg\n\
+     view model =\n\
+     \x20   Ui.button [] { onPress = Just Increment, label = Ui.text (String.fromInt model.count) }\n\
+     \n\
+     main =\n\
+     \x20   tea\n\
+     \x20       { init = init\n\
+     \x20       , update = update\n\
+     \x20       , view = view\n\
+     \x20       , subscriptions = subscriptions\n\
+     \x20       , routes = []\n\
+     \x20       , notFound = Increment\n\
+     \x20       }\n";
+
 /// The `ipe_main` return type under `--target wasm` renders as `IpeTask<()>`,
 /// not `ipe_runtime::tea::WebApp`.
 ///
@@ -266,42 +302,7 @@ fn pure_ui_app_emits_wasm_project() {
 #[test]
 fn wasm_web_app_ipe_main_return_type_is_ipe_task() {
     let dir = scratch("wasm_gate_ipe_main_ret");
-    let fixture = write_fixture(
-        "module Main exposing (main)\n\
-         import Ipe.String as String\n\
-         import Ipe.Tea.Web exposing (tea)\n\
-         import Ipe.Tea.Web.Cmd as Cmd\n\
-         import Ipe.Tea.Web.Sub as Sub\n\
-         import Ipe.Ui as Ui\n\
-         \n\
-         type Msg = Increment\n\
-         type alias Model = { count : Int }\n\
-         \n\
-         init : WebReq -> ( Model, Cmd Msg )\n\
-         init _req = ( { count = 0 }, Cmd.none )\n\
-         \n\
-         update : Msg -> Model -> ( Model, Cmd Msg )\n\
-         update msg model =\n\
-         \x20   case msg of\n\
-         \x20       Increment -> ( { model | count = model.count + 1 }, Cmd.none )\n\
-         \n\
-         subscriptions : Model -> Sub Msg\n\
-         subscriptions _model = Sub.none\n\
-         \n\
-         view : Model -> Element Msg\n\
-         view model =\n\
-         \x20   Ui.button [] { onPress = Just Increment, label = Ui.text (String.fromInt model.count) }\n\
-         \n\
-         main =\n\
-         \x20   tea\n\
-         \x20       { init = init\n\
-         \x20       , update = update\n\
-         \x20       , view = view\n\
-         \x20       , subscriptions = subscriptions\n\
-         \x20       , routes = []\n\
-         \x20       , notFound = Increment\n\
-         \x20       }\n",
-    );
+    let fixture = write_fixture(UNROUTED_APP);
     let out = dir.join("out");
     build_wasm(&fixture, &out).expect("Web.tea must emit under --target wasm");
 
@@ -487,6 +488,35 @@ fn routed_web_app_mounts_under_the_build_base() {
     }
 }
 
+/// An unrouted wasm client hands `init` the path below the build's base too:
+/// the emitted `wasm_app` call carries the manifest's `basePath` as its last
+/// argument, the root build the root's `""`.
+#[test]
+#[allow(clippy::expect_used)] // test setup: a failed emit IS the failure
+fn unrouted_web_app_mounts_under_the_build_base() {
+    for (name, base) in [
+        ("wasm_gate_unrouted_base_app", "/app"),
+        ("wasm_gate_unrouted_base_root", ""),
+    ] {
+        let out = scratch(name).join("out");
+        build_wasm_at_base(UNROUTED_APP, base, &out).expect("an unrouted Web.tea must emit");
+        let main_rs = std::fs::read_to_string(out.join("src/main.rs")).expect("emitted main.rs");
+        // Layout-blind: the renderer may break the call across lines.
+        let call: String = main_rs
+            .split("wasm_app(")
+            .nth(1)
+            .expect("an unrouted wasm app calls `wasm_app`")
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        let tail = format!(",{base:?}");
+        assert!(
+            call.contains(&format!("{tail})")) || call.contains(&format!("{tail},)")),
+            "base {base:?}: the unrouted call must end with the base literal {base:?}, got:\n{main_rs}"
+        );
+    }
+}
+
 /// A `basePath` that is not a mount base never reaches the routed client: the
 /// build refuses it, so no emitted bundle can mount from a malformed base.
 #[test]
@@ -534,7 +564,8 @@ fn routed_web_app_with_on_navigate_emits_update_once() {
 /// and `render` closures) by hand, so an emitter/runtime drift is an
 /// ipe-exit-0-then-cargo-fail only this build can see. Both `set_page` shapes
 /// are built: the record update, and the shared `update` an `onNavigate`
-/// routes through.
+/// routes through. An unrouted app under a non-root base is built too: its
+/// `wasm_app` call carries the base the same way.
 ///
 /// Gated on `IPE_E2E=1` (needs a working cargo) AND the wasm target.
 #[test]
@@ -551,6 +582,7 @@ fn routed_web_app_compiles_for_wasm() {
         ("wasm_routed_seal", ROUTED_APP, ""),
         ("wasm_routed_on_navigate_seal", ROUTED_ON_NAVIGATE_APP, ""),
         ("wasm_routed_base_seal", ROUTED_APP, "/app"),
+        ("wasm_unrouted_base_seal", UNROUTED_APP, "/app"),
     ] {
         let out = scratch_isolated(name).join("out");
         build_wasm_at_base(source, base, &out)
@@ -559,7 +591,7 @@ fn routed_web_app_compiles_for_wasm() {
         assert!(
             status.success(),
             "the emitted routed wasm crate `{name}` must `cargo check` for \
-             wasm32-unknown-unknown (the emitted `wasm_app_routed` call must match \
+             wasm32-unknown-unknown (the emitted `wasm_app` or `wasm_app_routed` call must match \
              the runtime signature)"
         );
     }

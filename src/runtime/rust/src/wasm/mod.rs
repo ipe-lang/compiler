@@ -121,11 +121,16 @@ pub fn run_start<E: std::fmt::Display + 'static>(task: IpeTask<E, ()>) {
 ///
 /// For routed apps (`Web.tea { …, routes, notFound }` with a `page` field in
 /// the Model) see [`wasm_app_routed`].
+///
+/// `base` is the build's mount base prefix (`""` for the root): `req.path` is
+/// the address-bar path below it, as the app's own server spells it. A `base`
+/// that is not a mount base refuses the mount.
 pub fn wasm_app<E, Model, Msg, FInit, FUpdate, FView, FSubs>(
     init: FInit,
     update: FUpdate,
     view: FView,
     subscriptions: FSubs,
+    base: &'static str,
 ) -> IpeTask<E, ()>
 where
     E: crate::FromIpeError + 'static,
@@ -137,7 +142,7 @@ where
     FSubs: Fn(Model) -> IpeSub<Msg> + 'static,
 {
     Box::pin(async move {
-        match mount_app(init, update, view, subscriptions) {
+        match mount_app(init, update, view, subscriptions, base) {
             Ok(()) => IpeResult::Ok(()),
             Err(e) => {
                 console_fatal_refusal("MountFailed", &e);
@@ -573,6 +578,7 @@ fn mount_app<Model, Msg, FInit, FUpdate, FView, FSubs>(
     update: FUpdate,
     view: FView,
     subscriptions: FSubs,
+    base: &str,
 ) -> Result<(), MountRefusal>
 where
     Model: Clone + 'static,
@@ -582,10 +588,14 @@ where
     FView: Fn(Model) -> Html<Msg> + 'static,
     FSubs: Fn(Model) -> IpeSub<Msg> + 'static,
 {
+    // The build's base, refused whole when malformed: never a root fallback.
+    let base = crate::web::route::mount_base(base)?;
     let document = document()?;
     let body: web_sys::HtmlElement = document.body().ok_or(MountRefusal::NoBody)?;
 
-    let (req, _pathname) = synthesize_req(&document)?;
+    // No route table: `req.params` is empty, as the server's unrouted resolver.
+    let unrouted: &[crate::web::route::Route<()>] = &[];
+    let (req, _located) = synthesize_req(&document, &base, unrouted)?;
     let (model, cmd0) = init(req);
 
     let mut tree = view(model.clone());
@@ -786,8 +796,7 @@ where
     let document = document()?;
     let body: web_sys::HtmlElement = document.body().ok_or(MountRefusal::NoBody)?;
 
-    let (req, pathname) = synthesize_req(&document)?;
-    let initial = crate::web::route::located(pathname.as_deref(), base.to_decoded());
+    let (req, initial) = synthesize_req(&document, &base, &routes)?;
 
     // Seed the model from `init`, then enter the current URL so the `page`
     // field reflects the browser's address bar before the first render. This
@@ -958,16 +967,24 @@ fn listener_refusal(event: &'static str, error: &JsValue) -> MountRefusal {
 }
 
 /// Rebuild the row-poly `req` record from the browser environment, beside the
-/// address bar's pathname, `None` when the platform cannot report it.
+/// address bar's path located below `base`.
 ///
-/// A router locates that report through [`crate::web::route::located`], so an
-/// unreported pathname is `Unreadable` and never enters the root page; the
-/// `req` then carries the empty path.
-fn synthesize_req(document: &web_sys::Document) -> Result<(WebReq, Option<String>), MountRefusal> {
+/// The pathname is read once and located through
+/// [`crate::web::route::ClientPath::locate`]: `req.path` and `req.params` are
+/// what the app's own server hands `init` for the same request below `base`,
+/// never the pathname with the base still on it. An unreported pathname is
+/// `Unreadable` and never enters the root page; the `req` then carries the
+/// empty path.
+fn synthesize_req<Page>(
+    document: &web_sys::Document,
+    base: &crate::encoding::MountBase,
+    routes: &[crate::web::route::Route<Page>],
+) -> Result<(WebReq, crate::web::route::LocatedPath), MountRefusal> {
     let window = web_sys::window().ok_or(MountRefusal::NoWindow)?;
     let loc = window.location();
     let pathname = loc.pathname().ok();
-    let path = pathname.clone().unwrap_or_default();
+    let (located, path, params) =
+        crate::web::route::ClientPath::locate(pathname.as_deref(), base, routes).into_parts();
     let query = loc.search().unwrap_or_default();
     let raw_query = query.strip_prefix('?').unwrap_or(&query).to_owned();
 
@@ -986,11 +1003,11 @@ fn synthesize_req(document: &web_sys::Document) -> Result<(WebReq, Option<String
         path,
         query: raw_query,
         method: "GET".to_owned(),
-        params: crate::dict::IpeDict::new(),
+        params,
         headers: crate::dict::IpeDict::new(),
         cookies,
     };
-    Ok((req, pathname))
+    Ok((req, located))
 }
 
 /// What a trusted delegated event says of the user.
