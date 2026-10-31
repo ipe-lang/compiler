@@ -494,15 +494,13 @@ fn emit_bounds_program(slug: &str) -> Option<PathBuf> {
     Some(out)
 }
 
-/// The built bounds binary, `None` only after a failed assertion; the caller
-/// has already gated the unit tier.
-fn bounds_binary(slug: &str) -> Option<e2e_support::SharedBuild> {
-    let dir = emit_bounds_program(slug);
-    assert!(dir.is_some(), "the bounds program must emit for `{slug}`");
-    let exe =
-        dir.and_then(|dir| build_emitted_binary_checked(&format!("markdown_bounds_{slug}"), &dir));
-    assert!(exe.is_some(), "the bounds program must build for `{slug}`");
-    exe
+/// The built bounds binary for `slug`, or a panic naming which stage (emit or
+/// build) failed — the caller has already gated the unit tier.
+fn bounds_binary(slug: &str) -> e2e_support::SharedBuild {
+    let dir = emit_bounds_program(slug)
+        .unwrap_or_else(|| panic!("the bounds program must emit for `{slug}`"));
+    build_emitted_binary_checked(&format!("markdown_bounds_{slug}"), &dir)
+        .unwrap_or_else(|| panic!("the bounds program must build for `{slug}`"))
 }
 
 fn run_case(exe: &Path, case: Case, n: usize) -> TimedRunOutcome {
@@ -543,9 +541,7 @@ fn every_block_run_does_not_trip_guard() {
     if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
         return;
     }
-    let Some(exe) = bounds_binary("blocks") else {
-        return;
-    };
+    let exe = bounds_binary("blocks");
     let lines = PAST_GUARD.to_string();
     let lines = lines.as_str();
     // (case, block count, first tag, last tag, last block's size where the rule fixes it)
@@ -585,9 +581,7 @@ fn quote_depth_ceiling() {
     if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
         return;
     }
-    let Some(exe) = bounds_binary("quote") else {
-        return;
-    };
+    let exe = bounds_binary("quote");
     let ceiling = MAX_BLOCKQUOTE_DEPTH.to_string();
     for n in [MAX_BLOCKQUOTE_DEPTH + 1, PAST_GUARD] {
         let got = digest_of(&exe, Case::Quote, n);
@@ -614,9 +608,7 @@ fn span_runs_finish_in_deadline() {
     if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
         return;
     }
-    let Some(exe) = bounds_binary("spans") else {
-        return;
-    };
+    let exe = bounds_binary("spans");
     let rows = [
         (Case::Stars, 100_000),
         (Case::Brackets, 100_000),
@@ -672,9 +664,7 @@ fn doubling_is_linear() {
     if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
         return;
     }
-    let Some(exe) = bounds_binary("doubling") else {
-        return;
-    };
+    let exe = bounds_binary("doubling");
     let startup = parse_work(&exe, Case::Brackets, 0);
     let work = |case: Case, n: usize| {
         parse_work(&exe, case, n)
