@@ -722,3 +722,196 @@ fn unknown_type_under_kernel_qualifier_is_no_such_member() -> TestResult {
     );
     Ok(())
 }
+
+/// A program every stage before lowering accepts and lowering refuses with
+/// IPE-L0116: a string literal two constructor levels deep in a pattern.
+const LOWERING_REFUSAL: &str = "module Main exposing (main)
+
+import Ipe.Io as Io
+
+
+f : Maybe (Maybe String) -> String
+f nested =
+    case nested of
+        Just (Just \"x\") ->
+            \"matched\"
+
+        Nothing ->
+            \"other\"
+
+        Just _ ->
+            \"other\"
+
+
+main : Task Error ()
+main =
+    Io.println (f (Just (Just \"x\")))
+";
+
+/// The first `IPE-<letter><4 digits>` code in a rendered report.
+fn first_code(report: &str) -> Option<&str> {
+    report.match_indices("IPE-").find_map(|(at, _)| {
+        let code = report.get(at..at.checked_add(9)?)?;
+        let mut tail = code.get(4..)?.chars();
+        let letter = tail.next().is_some_and(|c| c.is_ascii_uppercase());
+        (letter && tail.all(|c| c.is_ascii_digit())).then_some(code)
+    })
+}
+
+/// `ipe type-check` refuses a program lowering refuses, under lowering's own
+/// code, so it never reports a program `ipe dev build` refuses as clean.
+#[test]
+fn type_check_refuses_a_lowering_refusal() -> TestResult {
+    let project = SourceTree::main(LOWERING_REFUSAL).resolve()?;
+    let (ok, stdout, stderr) = type_check_in(&project_dir(&project)?)?;
+    assert!(
+        !ok,
+        "a program lowering refuses must fail type-check, got:\n{stdout}"
+    );
+    assert_eq!(
+        first_code(&stderr),
+        Some("IPE-L0116"),
+        "the refusal must carry lowering's code, got:\n{stderr}"
+    );
+    Ok(())
+}
+
+/// A library module with the lowering refusal of [`LOWERING_REFUSAL`].
+const LIBRARY_LOWERING_REFUSAL: &str = "module Lib exposing (f)
+
+
+f : Maybe (Maybe String) -> String
+f nested =
+    case nested of
+        Just (Just \"x\") ->
+            \"matched\"
+
+        Nothing ->
+            \"other\"
+
+        Just _ ->
+            \"other\"
+";
+
+/// A library package is judged through lowering too: a library module lowering
+/// refuses fails type-check with IPE-L0116.
+#[test]
+fn type_check_library_runs_lowering() -> TestResult {
+    let project = SourceTree::new()
+        .module("Lib", LIBRARY_LOWERING_REFUSAL)
+        .field("exposedModules = [ \"Lib\" ]")
+        .resolve()?;
+    let (ok, stdout, stderr) = type_check_in(&project_dir(&project)?)?;
+    assert!(
+        !ok,
+        "a library lowering refuses must fail type-check, got:\n{stdout}"
+    );
+    assert_eq!(
+        first_code(&stderr),
+        Some("IPE-L0116"),
+        "the library refusal must carry lowering's code, got:\n{stderr}"
+    );
+    Ok(())
+}
+
+/// `ipe type-check` and the build front end give one verdict.
+///
+/// For each program, the first code `ipe type-check` reports equals the one
+/// [`ipe::front_check`] (the `ipe dev build` pipeline short of cargo) reports,
+/// and both accept the same programs.
+#[test]
+fn type_check_and_build_agree() -> TestResult {
+    let programs = [
+        ("lowering refusal", LOWERING_REFUSAL.to_owned()),
+        (
+            "hand-nested decoder",
+            std::fs::read_to_string(fixture("decoder_nested_direct.ipe"))?,
+        ),
+        (
+            "well-typed",
+            std::fs::read_to_string(fixture("well_typed.ipe"))?,
+        ),
+        (
+            "decoder pipe",
+            std::fs::read_to_string(fixture("decoder_pipe_clean.ipe"))?,
+        ),
+    ];
+    for (label, source) in &programs {
+        let project = SourceTree::main(source).resolve()?;
+        let (ok, _, stderr) = type_check_in(&project_dir(&project)?)?;
+        assert!(
+            ok || first_code(&stderr).is_some(),
+            "{label}: a failed type-check must name a code, got:\n{stderr}"
+        );
+        let checked = if ok { None } else { first_code(&stderr) };
+        let built = match ipe::front_check(project.root()) {
+            Ok(()) => None,
+            Err(ipe::CliError::Pipeline { diag, .. }) => Some(diag.code().as_str()),
+            Err(other) => {
+                return Err(format!("{label}: the front check could not run: {other}").into());
+            }
+        };
+        assert_eq!(
+            checked, built,
+            "{label}: `ipe type-check` and the build front end disagree, type-check stderr:\n{stderr}"
+        );
+    }
+    Ok(())
+}
+
+/// `ipe verify` stops at its type-check stage on a program lowering refuses,
+/// never reaching the build stage.
+#[test]
+fn verify_fails_at_type_check_on_a_lowering_refusal() -> TestResult {
+    let project = SourceTree::main(LOWERING_REFUSAL).resolve()?;
+    let out = Command::new(support::ipe_bin())
+        .args(["verify", "--json", "src/Main.ipe"])
+        .current_dir(project_dir(&project)?)
+        .output()?;
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        !out.status.success(),
+        "verify must fail on a program lowering refuses, got:\n{stdout}"
+    );
+    assert!(
+        stdout.contains(r#""stage":"type-check""#),
+        "verify must fail at the type-check stage, got:\n{stdout}\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    Ok(())
+}
+
+/// The F18 shape: `Ipe.Time` imports `Timestamp` into its scope without
+/// exporting it.
+const REIMPORTED_TYPE: &str = "module Main exposing (main)
+
+import Ipe.Io as Io
+import Ipe.Time as Time
+
+
+f : Time.Timestamp -> String
+f _ =
+    \"t\"
+
+
+main : Task Error ()
+main =
+    Io.println \"x\"
+";
+
+/// A type a module imports into its scope but does not re-export is IPE-N0005
+/// at type-check through that module's qualifier, never an internal error.
+#[test]
+fn qualified_reimported_type_is_refused_at_type_check() -> TestResult {
+    let project = SourceTree::main(REIMPORTED_TYPE).resolve()?;
+    let (ok, stdout, stderr) = type_check_in(&project_dir(&project)?)?;
+    assert!(
+        !ok,
+        "`Time.Timestamp` is not exported by `Ipe.Time` and must fail type-check, got:\n{stdout}"
+    );
+    assert!(
+        stderr.contains("IPE-N0005") && !stderr.contains("IPE-I0001"),
+        "the refusal must be IPE-N0005 and never an internal error, got:\n{stderr}"
+    );
+    Ok(())
+}
