@@ -674,27 +674,39 @@ const ALLOWED_SITES: &[(&str, &str, Stack, &str)] = &[
     ),
     (
         "js_port.rs",
-        "native::deliver_inbound_for",
+        "classify_inbound",
         Stack::OneLevel,
-        "reads one envelope's fields",
+        "reads one frame's reserved fields",
     ),
     (
         "js_port.rs",
         "native::deliver_session_frame",
         Stack::OneLevel,
-        "reads one frame's fields",
+        "looks up one session stream",
     ),
     (
         "js_port.rs",
-        "native::js_request",
+        "native::deliver_session_terminal",
+        Stack::OneLevel,
+        "looks up one session stream",
+    ),
+    (
+        "js_port.rs",
+        "native::request_with_mint",
         Stack::OneLevel,
         "reads one reply's fields",
     ),
     (
         "js_port.rs",
-        "native::js_open_session",
+        "native::open_session_with_mint",
         Stack::OneLevel,
-        "reads one reply's fields",
+        "looks up one session stream",
+    ),
+    (
+        "js_port.rs",
+        "native::js_send_to_session",
+        Stack::OneLevel,
+        "looks up one session stream",
     ),
     (
         "js_port.rs",
@@ -704,15 +716,9 @@ const ALLOWED_SITES: &[(&str, &str, Stack, &str)] = &[
     ),
     (
         "js_port.rs",
-        "wasm::push_inbound",
-        Stack::OneLevel,
-        "reads one envelope's fields",
-    ),
-    (
-        "js_port.rs",
         "wasm::deliver_session_frame",
         Stack::OneLevel,
-        "reads one frame's fields",
+        "looks up one session stream",
     ),
     (
         "js_port.rs",
