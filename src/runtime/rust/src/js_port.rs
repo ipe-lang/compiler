@@ -246,10 +246,8 @@ impl PortToken {
             return None;
         }
         let mut bytes = [0_u8; PORT_TOKEN_BYTES];
-        for (slot, pair) in bytes.iter_mut().zip(digits.chunks_exact(2)) {
-            let [high, low] = pair else {
-                return None;
-            };
+        let (pairs, _) = digits.as_chunks::<2>();
+        for (slot, [high, low]) in bytes.iter_mut().zip(pairs) {
             *slot = (hex_digit_value(*high)? << 4) | hex_digit_value(*low)?;
         }
         Some(Self(bytes))
@@ -2028,6 +2026,7 @@ mod tests {
     mod per_session {
         use super::super::native::MAX_OUT_PENDING;
         use super::super::*;
+        use super::UNMINTED_TOKEN;
         use crate::IpeResult;
         use crate::error::IpeError;
         use crate::json::{Decoder, JsonVal, json_decode_int};
