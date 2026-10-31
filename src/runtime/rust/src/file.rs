@@ -69,8 +69,8 @@ const FILE_READ_CEILING: crate::system::EnvCeiling = crate::system::EnvCeiling::
 /// The ceiling bounds an attacker-controlled path pointing at an unbounded
 /// source (`/dev/zero`, a named pipe, a multi-GiB file) so it cannot exhaust
 /// memory. A malformed setting fails the read closed rather than falling back.
-fn file_read_ceiling() -> Result<u64, String> {
-    FILE_READ_CEILING.read().map_err(String::from)
+fn file_read_ceiling() -> Result<u64, crate::system::EnvCeilingRefusal> {
+    FILE_READ_CEILING.read()
 }
 
 fn file_read_file_sync(path: &str, cap: u64) -> Result<String, KernelFailure> {
@@ -101,7 +101,7 @@ pub fn file_read_file<E: Send + crate::KernelErrorSink + 'static>(
     Box::pin(async move {
         let cap = match file_read_ceiling() {
             Ok(cap) => cap,
-            Err(e) => return IpeResult::Err(E::from_ipe_error(IpeError::invalid_input(e))),
+            Err(e) => return IpeResult::Err(E::from_ipe_error(IpeError::from(e))),
         };
         match run_blocking::<_, KernelFailure, KernelFailure, _>(move || {
             file_read_file_sync(&path, cap)
@@ -306,7 +306,7 @@ pub fn file_read_file_beneath(root: Path, rel: Path, limit: i64) -> IpeTask<IpeE
         let effective = requested.and_then(|cap| {
             file_read_ceiling()
                 .map(|ceiling| cap.min(ceiling))
-                .map_err(IpeError::invalid_input)
+                .map_err(IpeError::from)
         });
         let cap = match effective {
             Ok(cap) => cap,

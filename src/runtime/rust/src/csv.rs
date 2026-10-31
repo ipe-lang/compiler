@@ -69,8 +69,8 @@ const CSV_ROWS_CEILING: crate::system::EnvCeiling = crate::system::EnvCeiling::n
 );
 
 /// Resolves [`CSV_ROWS_CEILING`]; a malformed setting fails the parse closed.
-fn csv_max_rows() -> Result<usize, String> {
-    CSV_ROWS_CEILING.read().map_err(String::from)
+fn csv_max_rows() -> Result<usize, crate::system::EnvCeilingRefusal> {
+    CSV_ROWS_CEILING.read()
 }
 
 /// Total-decoded-bytes ceiling (default 512 MiB, the same default as `File.readFile`'s
@@ -88,8 +88,8 @@ const CSV_BYTES_CEILING: crate::system::EnvCeiling = crate::system::EnvCeiling::
 );
 
 /// Resolves [`CSV_BYTES_CEILING`]; a malformed setting fails the parse closed.
-fn csv_max_bytes() -> Result<u64, String> {
-    CSV_BYTES_CEILING.read().map_err(String::from)
+fn csv_max_bytes() -> Result<u64, crate::system::EnvCeilingRefusal> {
+    CSV_BYTES_CEILING.read()
 }
 
 /// Add this record's decoded field bytes to `seen`, returning `Err` when the
@@ -119,7 +119,10 @@ fn row_cap_refusal(max_rows: usize) -> LimitRefusal {
     ))
 }
 
-fn parse_delim<E: From<String> + FromLimitExceeded>(text: &str, delim: u8) -> IpeResult<E, CsvDoc> {
+fn parse_delim<E: From<String> + FromLimitExceeded + FromIpeError>(
+    text: &str,
+    delim: u8,
+) -> IpeResult<E, CsvDoc> {
     let mut rdr = ::csv::ReaderBuilder::new()
         .delimiter(delim)
         .has_headers(true)
@@ -129,9 +132,15 @@ fn parse_delim<E: From<String> + FromLimitExceeded>(text: &str, delim: u8) -> Ip
     // unbounded into `rows` — either by row COUNT (many small rows) or by decoded
     // BYTES (one huge record / oversized fields that slips under any row count).
     // Bound both → Err rather than OOM. Mirrors csv_parse_stream_from_file's caps.
+    //
+    // A malformed ceiling variable lands typed through `IpeError::from` (never
+    // folded into a `String` first) so it reaches the sink as `InvalidInput`
+    // naming the variable, not `Unexpected`.
     let (max_rows, max_bytes) = match (csv_max_rows(), csv_max_bytes()) {
         (Ok(rows), Ok(bytes)) => (rows, bytes),
-        (Err(e), _) | (_, Err(e)) => return IpeResult::Err(format!("Csv.parse: {e}").into()),
+        (Err(e), _) | (_, Err(e)) => {
+            return IpeResult::Err(E::from_ipe_error(IpeError::from(e)));
+        }
     };
     let mut seen_bytes: u64 = 0;
     let header: Vec<String> = match rdr.headers() {
@@ -212,12 +221,14 @@ fn encode_delim(doc: &CsvDoc, delim: u8) -> String {
 }
 
 /// Csv.parse : String -> Result Error Csv
-pub fn csv_parse<E: From<String> + FromLimitExceeded>(text: String) -> IpeResult<E, CsvDoc> {
+pub fn csv_parse<E: From<String> + FromLimitExceeded + FromIpeError>(
+    text: String,
+) -> IpeResult<E, CsvDoc> {
     parse_delim(&text, b',')
 }
 
 /// Csv.parseWithDelimiter : String -> String -> Result Error Csv
-pub fn csv_parse_with_delimiter<E: From<String> + FromLimitExceeded>(
+pub fn csv_parse_with_delimiter<E: From<String> + FromLimitExceeded + FromIpeError>(
     delim: String,
     text: String,
 ) -> IpeResult<E, CsvDoc> {
@@ -321,6 +332,29 @@ mod tests {
     fn env_ceilings_honour_the_shared_contract() {
         crate::system::assert_env_ceiling_contract(CSV_ROWS_CEILING);
         crate::system::assert_env_ceiling_contract(CSV_BYTES_CEILING);
+    }
+
+    /// A malformed `IPE_CSV_MAX_ROWS` or `IPE_CSV_MAX_BYTES` is the operator's
+    /// `InvalidInput` naming the variable, never an `Unexpected` failure.
+    #[test]
+    fn malformed_csv_ceiling_is_invalid_input() {
+        crate::system::locked_set_var("IPE_CSV_MAX_ROWS", "abc");
+        let rows_bad: IpeResult<IpeError, CsvDoc> = csv_parse("h\n1\n".to_owned());
+        crate::system::locked_remove_var("IPE_CSV_MAX_ROWS");
+        assert!(
+            matches!(&rows_bad, IpeResult::Err(IpeError::Error(IpeErrorKind::InvalidInput, info))
+                if info.message.contains("IPE_CSV_MAX_ROWS")),
+            "a malformed IPE_CSV_MAX_ROWS must be InvalidInput: {rows_bad:?}"
+        );
+
+        crate::system::locked_set_var("IPE_CSV_MAX_BYTES", "abc");
+        let bytes_bad: IpeResult<IpeError, CsvDoc> = csv_parse("h\n1\n".to_owned());
+        crate::system::locked_remove_var("IPE_CSV_MAX_BYTES");
+        assert!(
+            matches!(&bytes_bad, IpeResult::Err(IpeError::Error(IpeErrorKind::InvalidInput, info))
+                if info.message.contains("IPE_CSV_MAX_BYTES")),
+            "a malformed IPE_CSV_MAX_BYTES must be InvalidInput: {bytes_bad:?}"
+        );
     }
 
     #[test]

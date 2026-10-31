@@ -459,8 +459,8 @@ fn config_read_capped(path: &str, cap: u64) -> Result<String, KernelFailure> {
     }
     if meta.len() > cap {
         return Err(LimitRefusal::new(format!(
-            "config file {:?} is {} bytes, over the {} byte cap (IPE_CONFIG_MAX_BYTES)",
-            path,
+            "config file {} is {} bytes, over the {} byte cap (IPE_CONFIG_MAX_BYTES)",
+            crate::error::shown_path(path),
             meta.len(),
             cap
         ))
@@ -474,8 +474,9 @@ fn config_read_capped(path: &str, cap: u64) -> Result<String, KernelFailure> {
         .map_err(failed)?;
     if contents.len() as u64 > cap {
         return Err(LimitRefusal::new(format!(
-            "config file {:?} exceeds the {} byte cap (IPE_CONFIG_MAX_BYTES)",
-            path, cap
+            "config file {} exceeds the {} byte cap (IPE_CONFIG_MAX_BYTES)",
+            crate::error::shown_path(path),
+            cap
         ))
         .into());
     }

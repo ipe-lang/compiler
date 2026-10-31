@@ -590,6 +590,12 @@ impl From<EnvCeilingRefusal> for IpeError {
     }
 }
 
+impl From<EnvCeilingRefusal> for KernelFailure {
+    fn from(refusal: EnvCeilingRefusal) -> Self {
+        Self::InvalidInput(refusal.to_string())
+    }
+}
+
 /// A present environment value outside its variable's grammar, naming the variable.
 ///
 /// The echoed value is truncated and escaped as an [`EnvCeilingRefusal`]'s is,

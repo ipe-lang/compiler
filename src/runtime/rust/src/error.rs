@@ -1024,15 +1024,18 @@ pub enum KernelFailure {
     Io(IoFailure),
     /// Malformed input a parser refused.
     Decode(String),
+    /// An operator-tunable ceiling setting the environment could not parse.
+    InvalidInput(String),
 }
 
 impl KernelFailure {
     #[must_use]
     pub fn message(&self) -> &str {
         match self {
-            Self::Unexpected(message) | Self::Unavailable(message) | Self::Decode(message) => {
-                message
-            }
+            Self::Unexpected(message)
+            | Self::Unavailable(message)
+            | Self::Decode(message)
+            | Self::InvalidInput(message) => message,
             Self::LimitExceeded(refusal) => refusal.message(),
             Self::TimedOut(refusal) => refusal.message(),
             Self::Io(failure) => failure.message(),
@@ -1049,6 +1052,7 @@ impl KernelFailure {
             Self::Unavailable(message) => Self::Unavailable(format!("{operation}: {message}")),
             Self::Io(failure) => Self::Io(failure.context(operation)),
             Self::Decode(message) => Self::Decode(format!("{operation}: {message}")),
+            Self::InvalidInput(message) => Self::InvalidInput(format!("{operation}: {message}")),
         }
     }
 
@@ -1062,6 +1066,7 @@ impl KernelFailure {
             Self::Unavailable(message) => E::from_unavailable(message),
             Self::Io(failure) => failure.into_error(),
             Self::Decode(message) => E::from_ipe_error(IpeError::decode(message)),
+            Self::InvalidInput(message) => E::from_ipe_error(IpeError::invalid_input(message)),
         }
     }
 }
