@@ -590,6 +590,12 @@ impl From<EnvCeilingRefusal> for IpeError {
     }
 }
 
+impl From<EnvCeilingRefusal> for KernelFailure {
+    fn from(refusal: EnvCeilingRefusal) -> Self {
+        Self::InvalidInput(refusal.to_string())
+    }
+}
+
 /// A present environment value outside its variable's grammar, naming the variable.
 ///
 /// The echoed value is truncated and escaped as an [`EnvCeilingRefusal`]'s is,
@@ -824,10 +830,6 @@ pub(crate) const SCRUB_TRUNCATED: &str = "\\…";
 /// most `max_bytes + SCRUB_TRUNCATED.len()` bytes, and an uncut result decodes
 /// to its input, so a hazard in a remote request path or an ingested record
 /// shows as a visible escape and two distinct inputs never record alike.
-#[cfg_attr(
-    not(feature = "web"),
-    allow(dead_code) // only the served request log and console ingest call it
-)]
 pub(crate) fn scrub_log_controls_capped(s: &str, max_bytes: usize) -> String {
     let mut out = String::with_capacity(s.len().min(max_bytes));
     for c in s.chars() {
@@ -1100,8 +1102,9 @@ impl ResolvedPort {
     /// The typed refusal for a bind of `addr` that failed with `error`.
     ///
     /// An operator-fixable kind ([`BindRefusal`]) gets its own error kind and a
-    /// fix line chosen by how this binary was built; any other kind is an `Io`
-    /// error naming `surface` and the address.
+    /// fix line chosen by how this binary was built; any other kind is an
+    /// [`crate::IoFailure`] naming `surface` and the address. Both read their
+    /// error kind from [`crate::io_error_kind`].
     pub(crate) fn bind_refusal(
         &self,
         surface: &str,
@@ -1125,14 +1128,11 @@ impl ResolvedPort {
         error: &std::io::Error,
     ) -> IpeError {
         let Some(refusal) = BindRefusal::classify(error.kind()) else {
-            return IpeError::io(format!("{surface}: bind {addr}: {error}"));
+            return crate::IoFailure::without_path(&format!("{surface}: bind {addr}"), error)
+                .into();
         };
         let message = self.refusal_message(posture, refusal, addr.ip());
-        match refusal {
-            BindRefusal::PortInUse => IpeError::conflict(message),
-            BindRefusal::PortRefused => IpeError::permission_denied().with_message(message),
-            BindRefusal::AddressNotLocal => IpeError::invalid_input(message),
-        }
+        IpeError::from_io_kind(error.kind(), message)
     }
 
     /// The text of `refusal`: what failed, then the fix line.
@@ -5947,6 +5947,40 @@ mod listen_port_tests {
             ));
             assert_eq!(compiled, in_use_message(r, BuildPosture::COMPILED));
         }
+    }
+
+    /// Every bind refusal reads its kind from the one host-category table, and
+    /// an unclassified host reason shows scrubbed.
+    #[test]
+    fn bind_refusal_kinds_come_from_the_io_table() {
+        let addr = std::net::SocketAddr::from(([127, 0, 0, 1], 8000));
+        for key in OPERATOR_KEYS {
+            bind_refusal_kinds_for(resolve(None, key, None), addr);
+        }
+    }
+
+    fn bind_refusal_kinds_for(r: ResolvedPort, addr: std::net::SocketAddr) {
+        for host in [
+            std::io::ErrorKind::AddrInUse,
+            std::io::ErrorKind::PermissionDenied,
+            std::io::ErrorKind::AddrNotAvailable,
+            std::io::ErrorKind::InvalidInput,
+            std::io::ErrorKind::TimedOut,
+            std::io::ErrorKind::Other,
+        ] {
+            let crate::IpeError::Error(kind, _) =
+                r.bind_refusal("listen", addr, &std::io::Error::from(host));
+            assert_eq!(kind, crate::io_error_kind(host), "{host:?}");
+        }
+        let forged = std::io::Error::other("refused\n[INFO] forged \u{1b}[2J");
+        let refused = r.bind_refusal("listen", addr, &forged);
+        let crate::IpeError::Error(kind, ref info) = refused;
+        assert_eq!(kind, crate::IpeErrorKind::Unexpected);
+        assert!(
+            !info.message.contains('\n') && !info.message.contains('\u{1b}'),
+            "{:?}",
+            info.message
+        );
     }
 }
 
