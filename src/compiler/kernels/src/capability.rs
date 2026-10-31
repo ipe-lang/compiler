@@ -795,7 +795,11 @@ impl Capability {
             }
             Self::Database => "Structured database access (SQL queries, migrations, row decoders).",
             Self::Env => "Reading or writing process environment variables and argv.",
-            Self::Subprocess => "Spawning or controlling a child process.",
+            Self::Subprocess => {
+                "Spawning or controlling a child process; inside the jail, no spawned process can \
+                 create or join its own namespace, so a tool's own namespace sandbox (Chromium, \
+                 nested bwrap/podman) must run with it disabled."
+            }
             Self::Clock => "Reading wall-clock or monotonic time, or sleeping / firing on a timer.",
             Self::Random => "Drawing non-deterministic randomness (RNG, random tokens, UUIDs).",
             Self::NativeFfi => {
