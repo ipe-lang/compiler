@@ -242,6 +242,38 @@ pub enum AssertedDefect {
         /// The exact Rust type the inspection records for the constant.
         expected: String,
     },
+    /// A signature names a type the calling module declares itself.
+    ///
+    /// A local union or alias is never a foreign carrier, even when it shares
+    /// a name with a builtin or with a crate's opaque type.
+    LocalTypeNotACarrier {
+        /// The local type, as written.
+        ty: String,
+        /// Whether the local declaration is a `type alias`.
+        alias: bool,
+    },
+    /// An internal invariant of the asserted-call boundary failed.
+    CompilerBug(AssertedCompilerBug),
+}
+
+/// The closed set of internal invariants the asserted-call boundary checks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AssertedCompilerBug {
+    /// An annotation type name is missing from the interner that parsed it.
+    TypeNameNotInterned,
+    /// An annotation type reference has no name segment.
+    EmptyTypeName,
+}
+
+impl fmt::Display for AssertedCompilerBug {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::TypeNameNotInterned => {
+                f.write_str("a type name in the annotation is missing from the interner")
+            }
+            Self::EmptyTypeName => f.write_str("a type reference in the annotation has no name"),
+        }
+    }
 }
 
 impl fmt::Display for AssertedDefect {
@@ -310,6 +342,18 @@ impl fmt::Display for AssertedDefect {
                 f,
                 "the asserted type does not match the inspected constant type \
                  `{expected}` under the exact-carrier rule — fix the annotation"
+            ),
+            Self::LocalTypeNotACarrier { ty, alias } => write!(
+                f,
+                "`{ty}` is a {} this module declares, not a foreign carrier — an \
+                 asserted signature names only Int, Float, Bool, Char, String, \
+                 Bytes, or an opaque type the target crate declares",
+                if *alias { "type alias" } else { "type" }
+            ),
+            Self::CompilerBug(bug) => write!(
+                f,
+                "internal compiler error in the asserted-call boundary ({bug}) — \
+                 please report this bug"
             ),
         }
     }
