@@ -497,6 +497,23 @@ pub enum HazardRefusal {
     UnopenedIsolate,
 }
 
+/// Why an import's constructor clause `T(..)` or `T(C)` delivers nothing it asks for.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum CtorWithheld {
+    /// `T` is exported without any of its constructors.
+    Abstract,
+    /// `ctor` is not among the constructors `T` exports; `suggestions` ranks the
+    /// ones it does.
+    Unknown {
+        ctor: Box<str>,
+        suggestions: Candidates,
+    },
+    /// `T` is a type alias, which has no constructors.
+    Alias,
+    /// `T` is an opaque builtin type, which has no constructors.
+    Opaque,
+}
+
 /// Errors raised during name resolution / canonicalisation.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum NameError {
@@ -582,6 +599,13 @@ pub enum NameError {
         module: Box<str>,
         name: Box<str>,
         suggestions: Candidates,
+    },
+    /// An `import M exposing (T(..))` or `T(C)` asks for constructors `M` does
+    /// not expose under `T`; `why` says which. [IPE-N0022]
+    CtorNotExposed {
+        module: Box<str>,
+        type_name: Box<str>,
+        why: CtorWithheld,
     },
     /// The `module` declaration at the top of a `.ipe` file does not match the
     /// path I derived from the file's location under `source_root`. [IPE-N0023]
@@ -2848,7 +2872,7 @@ const fn name_code(msg: &NameError) -> Code {
         NameError::AliasArity { .. } => IPE_N0013,
         NameError::ModuleNotFound { .. } => IPE_N0020,
         NameError::ImportCycle { .. } => IPE_N0021,
-        NameError::NameNotExposed { .. } => IPE_N0022,
+        NameError::NameNotExposed { .. } | NameError::CtorNotExposed { .. } => IPE_N0022,
         NameError::ModulePathMismatch { .. } => IPE_N0023,
         NameError::AmbiguousImport { .. } => IPE_N0024,
         NameError::ReservedNamespace { .. } => IPE_N0025,
@@ -3059,6 +3083,11 @@ fn name_help(msg: &NameError) -> Vec<HelpLine> {
         | NameError::NoSuchMember { suggestions, .. }
         | NameError::ModuleNotFound { suggestions, .. }
         | NameError::NameNotExposed { suggestions, .. } => did_you_mean(suggestions),
+        NameError::CtorNotExposed {
+            module,
+            type_name,
+            why,
+        } => ctor_not_exposed_help(module, type_name, why),
         NameError::DuplicateValue { first, .. }
         | NameError::DuplicateConstructor { first, .. }
         | NameError::DuplicateType { first, .. }
@@ -3944,6 +3973,48 @@ const fn consent_code(msg: &ConsentError) -> Code {
 /// it unambiguous ([`sole_applicability`]); any other shape
 /// (several candidates, or no provable region) stays a non-committal "did you
 /// mean" line per name, in the ranker's order.
+/// The remedy for an import constructor clause `module` withholds under `type_name`.
+fn ctor_not_exposed_help(module: &str, type_name: &str, why: &CtorWithheld) -> Vec<HelpLine> {
+    let note = |text: String| vec![HelpLine::Note(text.into_boxed_str())];
+    match why {
+        CtorWithheld::Abstract => {
+            let alone = format!(
+                "Import the type alone, `{type_name}`, and build values through the functions \
+                 `{module}` exposes."
+            );
+            if is_stdlib_module(module) {
+                note(alone)
+            } else {
+                note(format!(
+                    "{alone} If you own `{module}`, export `{type_name}(..)` in its `module` line."
+                ))
+            }
+        }
+        CtorWithheld::Unknown { suggestions, .. } => {
+            if suggestions.names().next().is_none() {
+                note(format!(
+                    "`{type_name}(..)` imports every constructor `{module}` exposes under \
+                     `{type_name}`."
+                ))
+            } else {
+                did_you_mean(suggestions)
+            }
+        }
+        CtorWithheld::Alias | CtorWithheld::Opaque => {
+            note(format!("Write `{type_name}` without `(…)`."))
+        }
+    }
+}
+
+/// Whether `module` is a standard-library path, which no user edits.
+fn is_stdlib_module(module: &str) -> bool {
+    ["Ipe", "Ipê"].iter().any(|root| {
+        module
+            .strip_prefix(root)
+            .is_some_and(|rest| rest.is_empty() || rest.starts_with('.'))
+    })
+}
+
 fn did_you_mean(candidates: &Candidates) -> Vec<HelpLine> {
     match (&*candidates.hits, &candidates.region) {
         ([only], Some(target)) => vec![HelpLine::Suggest(Suggestion {
