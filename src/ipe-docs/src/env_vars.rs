@@ -959,16 +959,20 @@ static HAND_TABLE: &[EnvVar] = &[
     EnvVar {
         name: "IPE_RUNTIME_DIR",
         default: Cow::Borrowed("unset (embedded / in-repo)"),
-        purpose: "Explicit path to the runtime crate source directory. Overrides the \
-                  embedded fallback. Used in tests and in-repo development.",
+        purpose: "Explicit path to the runtime. A vendored build \
+                  (`IPE_RUNTIME_VENDORED=1`) copies the module tree at exactly this \
+                  path. A linked build only checks that the runtime crate root at or \
+                  above it declares the compiler's version; the emitted project bundles \
+                  the compiler's own runtime.",
         subsystem: Subsystem::Runtime,
         class: Class::Tunable,
     },
     EnvVar {
         name: "IPE_RUNTIME_VENDORED",
         default: Cow::Borrowed("unset (false)"),
-        purpose: "Set to `1` to declare that the runtime is vendored (already present \
-                  on disk) and skip materialization. Used during packaging.",
+        purpose: "Set to `1` to emit the vendored shape: the runtime module tree is \
+                  copied into the emitted project's `src/ipe_runtime/` instead of linked \
+                  as a path dependency. Any other value keeps the linked shape.",
         subsystem: Subsystem::Runtime,
         class: Class::Tunable,
     },

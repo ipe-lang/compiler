@@ -278,9 +278,11 @@ impl<'ast> Visit<'ast> for Scan {
     }
 
     fn visit_use_rename(&mut self, rename: &'ast syn::UseRename) {
+        // `runtime_embed::{self as e}` names the module itself under `e`.
         let guarded = rename.ident == EMBED
             || BARE.iter().any(|name| rename.ident == name)
-            || (self.under_embed() && EMBED_RESOLVERS.iter().any(|r| rename.ident == r));
+            || (self.under_embed()
+                && (rename.ident == "self" || EMBED_RESOLVERS.iter().any(|r| rename.ident == r)));
         if guarded {
             self.alias(format!("use {} as {}", rename.ident, rename.rename));
         }
@@ -445,9 +447,13 @@ fn a_planted_resolver_site_is_refused() -> Result<(), String> {
             pkg,
             "fn other() { ipe_env::artifact::resolve_runtime_src(o, c); }\n",
         ),
+        // The admitted pipeline shape with one lookup too many: only the
+        // count can refuse it, so the case is not met by a missing site.
         (
             pipeline,
-            "fn resolve_runtime() { resolve_runtime_src(a, b); resolve_runtime_src(a, b); }\n",
+            "fn resolve_runtime() { resolve_runtime_src(a, b); resolve_runtime_src(a, b); }\n\
+             fn resolve_vendored_runtime_dir() { resolve_runtime(); }\n\
+             fn compile_source_set_here() { runtime_embed::resolve_for(o); }\n",
         ),
         // A second linked-runtime caller.
         (pkg, "fn other() { crate::runtime_embed::resolve(); }\n"),
@@ -455,6 +461,7 @@ fn a_planted_resolver_site_is_refused() -> Result<(), String> {
         (pkg, "fn other() { m!(crate::runtime_embed::resolve()); }\n"),
         // Second names.
         (pkg, "use crate::runtime_embed as embedded;\n"),
+        (pkg, "use crate::runtime_embed::{self as embedded};\n"),
         (pkg, "use crate::runtime_embed::{resolve};\n"),
         (pkg, "use crate::runtime_embed::resolve_for as linked;\n"),
         (pkg, "use crate::runtime_embed::*;\n"),
