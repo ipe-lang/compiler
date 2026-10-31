@@ -9569,6 +9569,29 @@ mod exposed_ctor_subset_tests {
         );
     }
 
+    /// A union a compiled-source stdlib module declares is judged by its
+    /// source offer, never refused by the kernel path as an opaque carrier.
+    #[test]
+    fn source_owned_stdlib_unions_are_not_judged_by_the_kernel_path() {
+        for clause in [
+            "Ipe.Db.Store exposing (Cond(..), Order(..))",
+            "Ipe.Codec exposing (Codec(..))",
+        ] {
+            let result = kernel_import(&importer(clause, "0"));
+            assert!(ctor_refusal(&result).is_none(), "{clause}: {result:?}");
+            assert!(
+                !matches!(
+                    &result,
+                    Err(Diagnostic::Name {
+                        msg: NameError::NameNotExposed { .. },
+                        ..
+                    })
+                ),
+                "{clause}: {result:?}"
+            );
+        }
+    }
+
     /// R12: every (ask x offer) cell of the judge.
     #[test]
     fn judge_table_covers_every_cell() {
