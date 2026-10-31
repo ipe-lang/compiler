@@ -812,12 +812,12 @@ fn ambient_union_unknown_ctor_is_refused() {
         matches!(
             &refused,
             Err(Diagnostic::Name {
-                msg: NameError::CtorNotExposed {
-                    why: ipe_diagnostics::CtorWithheld::Unknown { ctor, .. },
-                    ..
-                },
+                msg: NameError::CtorNotExposed { why, .. },
                 ..
-            }) if &**ctor == "Some"
+            }) if matches!(
+                &**why,
+                ipe_diagnostics::CtorWithheld::Unknown { ctor, .. } if &**ctor == "Some"
+            )
         ),
         "{refused:?}"
     );

@@ -2468,7 +2468,7 @@ fn judge_import_ctors(
         msg: NameError::CtorNotExposed {
             module: path_to_dot_string(interner, module),
             type_name: name_str(interner, type_name)?,
-            why,
+            why: Box::new(why),
         },
     })
 }
@@ -9326,7 +9326,7 @@ mod exposed_ctor_subset_tests {
             Err(Diagnostic::Name {
                 span,
                 msg: NameError::CtorNotExposed { type_name, why, .. },
-            }) => Some((*span, &**type_name, why)),
+            }) => Some((*span, &**type_name, &**why)),
             _ => None,
         }
     }

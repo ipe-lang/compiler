@@ -603,7 +603,7 @@ fn name_prose(msg: &NameError) -> String {
             module,
             type_name,
             why,
-        } => match why {
+        } => match &**why {
             CtorWithheld::Abstract => format!(
                 "`{module}` exports the type `{type_name}` but keeps its constructors private, \
                  so you can't import them."
@@ -1716,7 +1716,7 @@ fn name_label(msg: &NameError) -> Option<String> {
             module,
             type_name,
             why,
-        } => Some(match why {
+        } => Some(match &**why {
             CtorWithheld::Abstract => {
                 format!("`{module}` exposes `{type_name}` without its constructors")
             }
@@ -3188,7 +3188,7 @@ mod tests {
             msg: NameError::CtorNotExposed {
                 module: module.into(),
                 type_name: type_name.into(),
-                why,
+                why: Box::new(why),
             },
         }
     }
