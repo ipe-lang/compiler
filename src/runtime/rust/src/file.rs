@@ -85,7 +85,8 @@ fn file_read_file_sync(path: &str, cap: u64) -> Result<String, KernelFailure> {
         .map_err(|e| IoFailure::on_path("read file", path, &e))?;
     if read as u64 > cap {
         return Err(LimitRefusal::new(format!(
-            "file exceeds read ceiling of {cap} bytes (raise IPE_FILE_READ_MAX or use File.readFileLimit): {path}"
+            "file exceeds read ceiling of {cap} bytes (raise IPE_FILE_READ_MAX or use File.readFileLimit): {}",
+            crate::error::shown_path(path)
         ))
         .into());
     }
@@ -222,7 +223,8 @@ fn file_read_file_limit_sync(path: &str, cap: u64) -> Result<String, KernelFailu
         .map_err(|e| IoFailure::on_path("read file", path, &e))?;
     if read as u64 > cap {
         return Err(LimitRefusal::new(format!(
-            "file exceeds {cap}-byte limit (stopped reading at the limit — actual size not reported to bound memory use): {path}"
+            "file exceeds {cap}-byte limit (stopped reading at the limit — actual size not reported to bound memory use): {}",
+            crate::error::shown_path(path)
         ))
         .into());
     }
@@ -674,7 +676,8 @@ fn file_read_file_bytes_sync(path: &str) -> Result<Vec<i64>, KernelFailure> {
         .map_err(|e| IoFailure::on_path("read file", path, &e))?;
     if read as u64 > READ_FILE_BYTES_CEILING {
         return Err(LimitRefusal::new(format!(
-            "file exceeds {READ_FILE_BYTES_CEILING}-byte limit (stopped reading at the limit — actual size not reported to bound memory use): {path}"
+            "file exceeds {READ_FILE_BYTES_CEILING}-byte limit (stopped reading at the limit — actual size not reported to bound memory use): {}",
+            crate::error::shown_path(path)
         ))
         .into());
     }
@@ -1012,19 +1015,23 @@ fn walk_dir(
     Ok(())
 }
 
-/// The refusal of a walk whose `root` is not a directory.
-fn not_a_walk_root(root: &Path) -> IpeError {
-    IpeError::from(IoFailure::on_path(
-        "walk",
-        root.as_str(),
-        &std::io::Error::from(std::io::ErrorKind::NotADirectory),
-    ))
+/// Admits `root` as a walk root, or refuses it under the host's own kind.
+///
+/// A root the host cannot stat (absent, denied) keeps that category; a root
+/// that stats as anything but a directory is `NotADirectory`.
+fn walk_root(root: &Path) -> Result<(), IpeError> {
+    let refused = |e: &std::io::Error| IpeError::from(IoFailure::on_path("walk", root.as_str(), e));
+    match std::fs::metadata(root.as_str()) {
+        Ok(meta) if meta.is_dir() => Ok(()),
+        Ok(_) => Err(refused(&std::io::Error::from(
+            std::io::ErrorKind::NotADirectory,
+        ))),
+        Err(e) => Err(refused(&e)),
+    }
 }
 
 fn file_walk_sync(root: &Path) -> Result<Vec<Path>, IpeError> {
-    if !std::path::Path::new(root.as_str()).is_dir() {
-        return Err(not_a_walk_root(root));
-    }
+    walk_root(root)?;
     let mut visited = std::collections::HashSet::new();
     let mut out = Vec::new();
     walk_dir(root, &mut visited, None, &mut out)?;
@@ -1036,9 +1043,7 @@ fn file_walk_matching_sync(
     root: &Path,
     pred: &dyn Fn(&Path) -> bool,
 ) -> Result<Vec<Path>, IpeError> {
-    if !std::path::Path::new(root.as_str()).is_dir() {
-        return Err(not_a_walk_root(root));
-    }
+    walk_root(root)?;
     let mut visited = std::collections::HashSet::new();
     let mut out = Vec::new();
     walk_dir(root, &mut visited, Some(pred), &mut out)?;
@@ -1140,7 +1145,6 @@ mod read_ceiling_tests {
         );
     }
 
-    /// A malformed ceiling fails the read closed and names the variable.
     /// Reading a missing file is `NotFound` and names the quoted path.
     #[test]
     fn read_missing_file_is_not_found() {
@@ -1156,6 +1160,7 @@ mod read_ceiling_tests {
         );
     }
 
+    /// A malformed ceiling fails the read closed and names the variable.
     #[test]
     fn read_file_refuses_a_malformed_ceiling() {
         let p = crate::scratch_core::test_temp_root()
@@ -1337,6 +1342,29 @@ mod read_file_limit_tests {
                 if info.message.starts_with("file exceeds 16-byte limit (stopped reading at the limit")),
             "17 bytes under a 16-byte limit must be a LimitExceeded refusal: {res:?}"
         );
+    }
+
+    /// An over-limit refusal shows a hazardous path escaped, never raw.
+    #[cfg(unix)]
+    #[test]
+    fn over_limit_refusal_escapes_the_path() {
+        let p = crate::scratch_core::test_temp_root().join(format!(
+            "ipe_rfl_esc_{}_\u{1b}[2J\"x.txt",
+            std::process::id()
+        ));
+        std::fs::write(&p, vec![b'a'; 17]).unwrap();
+        let res = file_read_file_limit_sync(&p.to_string_lossy(), 16);
+        let _ = std::fs::remove_file(&p);
+        let message = match res {
+            Err(KernelFailure::LimitExceeded(refusal)) => refusal.message().to_owned(),
+            other => format!("not a LimitExceeded refusal: {other:?}"),
+        };
+        assert!(
+            message.starts_with("file exceeds 16-byte limit"),
+            "{message:?}"
+        );
+        assert!(!message.contains('\u{1b}'), "{message:?}");
+        assert!(message.contains("\\u{1b}[2J\\\"x.txt\""), "{message:?}");
     }
 
     fn limit_read(name: &str, content: &[u8], limit: i64) -> IpeResult<String, String> {
@@ -1670,6 +1698,28 @@ mod walk_tests {
 
     #[test]
     fn walk_on_nonexistent_root_errs() {
+        let absent = crate::scratch_core::test_temp_root().join("ipe_walk_nonexistent_kind_38291");
+        let res: IpeResult<IpeError, Vec<Path>> = block(file_walk(tp(&absent)));
+        assert!(
+            matches!(
+                &res,
+                IpeResult::Err(IpeError::Error(crate::IpeErrorKind::NotFound, _))
+            ),
+            "a missing walk root must be NotFound, not a non-directory: {res:?}"
+        );
+        let file = crate::scratch_core::test_temp_root()
+            .join(format!("ipe_walk_file_root_{}.txt", std::process::id()));
+        std::fs::write(&file, b"x").unwrap();
+        let res: IpeResult<IpeError, Vec<Path>> = block(file_walk(tp(&file)));
+        let _ = std::fs::remove_file(&file);
+        assert!(
+            matches!(
+                &res,
+                IpeResult::Err(IpeError::Error(crate::IpeErrorKind::InvalidInput, _))
+            ),
+            "a file walk root must be InvalidInput (NotADirectory): {res:?}"
+        );
+
         let root = crate::scratch_core::test_temp_root().join("ipe_walk_nonexistent_38291");
         let res: IpeResult<IpeError, Vec<Path>> = block(file_walk(tp(&root)));
         assert!(

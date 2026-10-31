@@ -980,7 +980,7 @@ impl From<IoFailure> for IpeError {
 ///
 /// The scrub never writes `\"`, so escaping the quote keeps the quoted span
 /// unambiguous: a path cannot close its own quotes and spell a forged reason.
-fn shown_path(path: &str) -> String {
+pub(crate) fn shown_path(path: &str) -> String {
     let scrubbed = crate::system::scrub_log_controls_capped(path, IO_FAILURE_PATH_MAX_BYTES);
     format!("\"{}\"", scrubbed.replace('"', "\\\""))
 }

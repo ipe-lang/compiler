@@ -882,6 +882,21 @@ where
 // versa) is still well-formed (the types match); it just may produce parse
 // errors on format mismatches, which is the expected behaviour.
 
+/// The shape of a column value as a decode refusal names it.
+///
+/// A refusal names what the column held, never the value: a row value may be a
+/// secret or personal data, and the message reaches logs and the program.
+const fn json_shape(v: &JsonVal) -> &'static str {
+    match v {
+        JsonVal::Null => "NULL",
+        JsonVal::Bool(_) => "a boolean",
+        JsonVal::Number(_) => "a number",
+        JsonVal::String(_) => "a string",
+        JsonVal::Array(_) => "an array",
+        JsonVal::Object(_) => "an object",
+    }
+}
+
 /// `DbDec.string col` — read column `col` as a String.
 /// Fails with Err when the column is missing OR its value is NULL.
 pub fn db_decode_string<E: crate::DecodeErrorSink + 'static>(col: String) -> Decoder<E, String> {
@@ -894,9 +909,9 @@ pub fn db_decode_string<E: crate::DecodeErrorSink + 'static>(col: String) -> Dec
                     decode_err_str(format!("column {}: expected String, got NULL", col))
                 }
                 _ => decode_err_str(format!(
-                    "column {}: expected String, got {:?}",
+                    "column {}: expected String, got {}",
                     col,
-                    v.to_string()
+                    json_shape(v)
                 )),
             }),
             vec![],
@@ -926,8 +941,8 @@ pub fn db_decode_int<E: crate::DecodeErrorSink + 'static>(col: String) -> Decode
             decode_ok(truncated as i64)
         } else {
             decode_err_str(format!(
-                "column {}: expected Int, {} is out of range for a 64-bit integer",
-                col, f
+                "column {}: expected Int, the value is out of range for a 64-bit integer",
+                col
             ))
         }
     }
@@ -953,7 +968,10 @@ pub fn db_decode_int<E: crate::DecodeErrorSink + 'static>(col: String) -> Decode
                     if let Ok(f) = s.parse::<f64>() {
                         return float_to_i64_checked(&col, f);
                     }
-                    decode_err_str(format!("column {}: expected Int, got {:?}", col, s))
+                    decode_err_str(format!(
+                        "column {}: expected Int, got a non-integer string",
+                        col
+                    ))
                 }
                 JsonVal::Null => decode_err_str(format!("column {}: expected Int, got NULL", col)),
                 _ => decode_err_str(format!("column {}: expected Int, got unexpected type", col)),
@@ -979,9 +997,10 @@ pub fn db_decode_float<E: crate::DecodeErrorSink + 'static>(col: String) -> Deco
                 },
                 JsonVal::String(s) => match s.parse::<f64>() {
                     Ok(f) => decode_ok(f),
-                    Err(_) => {
-                        decode_err_str(format!("column {}: expected Float, got {:?}", col, s))
-                    }
+                    Err(_) => decode_err_str(format!(
+                        "column {}: expected Float, got a non-numeric string",
+                        col
+                    )),
                 },
                 JsonVal::Null => {
                     decode_err_str(format!("column {}: expected Float, got NULL", col))
@@ -1017,7 +1036,10 @@ pub fn db_decode_bool<E: crate::DecodeErrorSink + 'static>(col: String) -> Decod
                 JsonVal::String(s) => match s.as_str() {
                     "true" | "TRUE" | "True" | "t" | "T" | "1" => decode_ok(true),
                     "false" | "FALSE" | "False" | "f" | "F" | "0" => decode_ok(false),
-                    _ => decode_err_str(format!("column {}: expected Bool, got {:?}", col, s)),
+                    _ => decode_err_str(format!(
+                        "column {}: expected Bool, got an unrecognised string",
+                        col
+                    )),
                 },
                 JsonVal::Null => decode_err_str(format!("column {}: expected Bool, got NULL", col)),
                 _ => decode_err_str(format!(
@@ -1082,15 +1104,15 @@ pub fn db_decode_money<E: crate::DecodeErrorSink + 'static>(
                         use std::str::FromStr;
                         match RD::from_str(amount_str) {
                             Ok(d) => decode_ok((Decimal(d), code.to_string())),
-                            Err(e) => decode_err_str(format!(
-                                "column {}: Money amount parse error for {:?}: {}",
-                                col, amount_str, e
+                            Err(_) => decode_err_str(format!(
+                                "column {}: expected Money 'CODE AMOUNT', the amount is not a decimal",
+                                col
                             )),
                         }
                     }
                     _ => decode_err_str(format!(
-                        "column {}: expected Money 'CODE AMOUNT', got {:?}",
-                        col, s
+                        "column {}: expected Money 'CODE AMOUNT', got a string of another shape",
+                        col
                     )),
                 }
             }),
@@ -1131,9 +1153,9 @@ pub fn db_decode_decimal<E: crate::DecodeErrorSink + 'static>(col: String) -> De
                 use std::str::FromStr;
                 match RD::from_str(&s) {
                     Ok(d) => decode_ok(Decimal(d)),
-                    Err(e) => decode_err_str(format!(
-                        "column {}: could not decode decimal column {:?}: {}",
-                        col, s, e
+                    Err(_) => decode_err_str(format!(
+                        "column {}: expected Decimal string, got a non-decimal string",
+                        col
                     )),
                 }
             }),
@@ -1156,18 +1178,18 @@ pub fn db_decode_bytes<E: crate::DecodeErrorSink + 'static>(col: String) -> Deco
             Box::new(move |v| match v {
                 JsonVal::String(s) => match hex::decode(s) {
                     Ok(b) => decode_ok(b),
-                    Err(e) => decode_err_str(format!(
-                        "column {}: expected hex-encoded bytes, got {:?}: {}",
-                        col, s, e
+                    Err(_) => decode_err_str(format!(
+                        "column {}: expected hex-encoded bytes, got a non-hex string",
+                        col
                     )),
                 },
                 JsonVal::Null => {
                     decode_err_str(format!("column {}: expected bytes, got NULL", col))
                 }
                 _ => decode_err_str(format!(
-                    "column {}: expected hex-encoded bytes, got {:?}",
+                    "column {}: expected hex-encoded bytes, got {}",
                     col,
-                    v.to_string()
+                    json_shape(v)
                 )),
             }),
             vec![],
@@ -3486,8 +3508,9 @@ fn float_to_i64_or_default(field: &str, f: f64) -> i64 {
         truncated as i64
     } else {
         crate::system::write_stderr_line(&format!(
-            "db: unsafeGetInt(\"{field}\"): {f} is out of range for a 64-bit integer; \
-             returning 0 (default) instead of a saturated value"
+            "db: unsafeGetInt(\"{}\"): the value is out of range for a 64-bit integer; \
+             returning 0 (default) instead of a saturated value",
+            crate::system::scrub_log_controls(field)
         ));
         let _ = std::io::Write::flush(&mut std::io::stderr());
         0
@@ -10915,6 +10938,56 @@ mod tests {
         )
         .await;
         assert!(matches!(not_found, IpeResult::Ok(IpeMaybe::Nothing)));
+    }
+
+    /// A refused column value never appears in the refusal: the message names
+    /// the column and the value's shape, and the kind is `Decode`.
+    #[test]
+    fn db_decoder_refusals_never_echo_the_value() {
+        const SECRET: &str = "s3cr3t-Tok\u{1b}en";
+        let row = crate::json_val::json_val!({
+            "c": SECRET,
+            "money": format!("USD {SECRET}"),
+            "shape": format!("{SECRET}{SECRET}"),
+            "arr": [SECRET],
+            "big": 1e30,
+        });
+        let outcomes: Vec<IpeResult<IpeError, ()>> = vec![
+            unit((db_decode_int::<IpeError>("c".into()).run)(&row)),
+            unit((db_decode_int::<IpeError>("big".into()).run)(&row)),
+            unit((db_decode_float::<IpeError>("c".into()).run)(&row)),
+            unit((db_decode_bool::<IpeError>("c".into()).run)(&row)),
+            unit((db_decode_money::<IpeError>("money".into()).run)(&row)),
+            unit((db_decode_money::<IpeError>("shape".into()).run)(&row)),
+            unit((db_decode_decimal::<IpeError>("c".into()).run)(&row)),
+            unit((db_decode_bytes::<IpeError>("c".into()).run)(&row)),
+            unit((db_decode_bytes::<IpeError>("arr".into()).run)(&row)),
+            unit((db_decode_string::<IpeError>("arr".into()).run)(&row)),
+        ];
+        fn unit<T>(r: IpeResult<IpeError, T>) -> IpeResult<IpeError, ()> {
+            match r {
+                IpeResult::Ok(_) => IpeResult::Ok(()),
+                IpeResult::Err(e) => IpeResult::Err(e),
+            }
+        }
+        for outcome in outcomes {
+            let shown = format!("{outcome:?}");
+            assert!(
+                matches!(
+                    &outcome,
+                    IpeResult::Err(IpeError::Error(crate::IpeErrorKind::Decode, _))
+                ),
+                "{shown}"
+            );
+            assert!(
+                !shown.contains("s3cr3t"),
+                "the refusal echoed the value: {shown}"
+            );
+            assert!(
+                !shown.contains("1e30") && !shown.contains("1000000000000000000000000000000"),
+                "{shown}"
+            );
+        }
     }
 
     #[tokio::test]

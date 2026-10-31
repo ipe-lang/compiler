@@ -118,7 +118,7 @@ const CONFIG_FILE_CEILING: crate::system::EnvCeiling = crate::system::EnvCeiling
 );
 
 // Config.decodeYaml : String -> Decoder a -> Result Error a
-pub fn config_decode_yaml<E: DecodeErrorSink + FromLimitExceeded + 'static, T>(
+pub fn config_decode_yaml<E: DecodeErrorSink + FromLimitExceeded + FromIpeError + 'static, T>(
     s: String,
     decoder: Decoder<E, T>,
 ) -> IpeResult<E, T> {
@@ -127,7 +127,11 @@ pub fn config_decode_yaml<E: DecodeErrorSink + FromLimitExceeded + 'static, T>(
     // expand into (aliases, events, nodes, depth, documents).
     let cap: usize = match YAML_SOURCE_CEILING.read() {
         Ok(cap) => cap,
-        Err(refusal) => return IpeResult::Err(str_err(&format!("yaml parse: {refusal}"))),
+        Err(refusal) => {
+            return IpeResult::Err(E::from_ipe_error(IpeError::invalid_input(format!(
+                "yaml parse: {refusal}"
+            ))));
+        }
     };
     if s.len() > cap {
         return IpeResult::Err(
@@ -503,7 +507,11 @@ pub fn config_load_from_file<
         // (memory DoS). Default 16 MiB; override via IPE_CONFIG_MAX_BYTES.
         let cap: u64 = match CONFIG_FILE_CEILING.read() {
             Ok(cap) => cap,
-            Err(refusal) => return IpeResult::Err(str_err(&refusal.to_string())),
+            Err(refusal) => {
+                return IpeResult::Err(E::from_ipe_error(IpeError::invalid_input(
+                    refusal.to_string(),
+                )));
+            }
         };
         let contents = match crate::threads::join_blocking("Config.loadFromFile", {
             let path = path.clone();
@@ -636,6 +644,41 @@ mod load_from_file_tests {
             IpeResult::Err(crate::IpeError::limit_exceeded(
                 "yaml parse: input is 14 bytes, over the 13 byte cap (IPE_YAML_MAX_BYTES)"
             ))
+        );
+    }
+
+    /// A malformed `IPE_CONFIG_MAX_BYTES` is the operator's `InvalidInput`
+    /// naming the variable, never an `Unexpected` failure.
+    #[test]
+    fn malformed_config_ceiling_is_invalid_input() {
+        let p = crate::scratch_core::test_temp_root()
+            .join(format!("ipe_cfg_bad_cap_{}.json", std::process::id()));
+        std::fs::write(&p, r#"{"name": "ipe"}"#).unwrap();
+        crate::system::locked_set_var("IPE_CONFIG_MAX_BYTES", "abc");
+        let res: IpeResult<crate::IpeError, String> = block(config_load_from_file(
+            make_path(&p.to_string_lossy()),
+            kinded_name_decoder(),
+        ));
+        crate::system::locked_remove_var("IPE_CONFIG_MAX_BYTES");
+        let _ = std::fs::remove_file(&p);
+        assert!(
+            matches!(&res, IpeResult::Err(crate::IpeError::Error(crate::IpeErrorKind::InvalidInput, info))
+                if info.message.contains("IPE_CONFIG_MAX_BYTES")),
+            "a malformed config ceiling must be InvalidInput: {res:?}"
+        );
+    }
+
+    /// A malformed `IPE_YAML_MAX_BYTES` is `InvalidInput`, never `Unexpected`.
+    #[test]
+    fn malformed_yaml_ceiling_is_invalid_input() {
+        crate::system::locked_set_var("IPE_YAML_MAX_BYTES", "abc");
+        let res: IpeResult<crate::IpeError, String> =
+            config_decode_yaml("name: ipe".to_string(), kinded_name_decoder());
+        crate::system::locked_remove_var("IPE_YAML_MAX_BYTES");
+        assert!(
+            matches!(&res, IpeResult::Err(crate::IpeError::Error(crate::IpeErrorKind::InvalidInput, info))
+                if info.message.starts_with("yaml parse: ") && info.message.contains("IPE_YAML_MAX_BYTES")),
+            "a malformed YAML ceiling must be InvalidInput: {res:?}"
         );
     }
 
